@@ -1,0 +1,477 @@
+//! Window-level commands: undo/redo, copy/paste of items, window state, ribbon display, Quick Access Toolbar,
+//! Close All Items.
+
+use serde_json::{Value, json};
+
+use crate::cmd::util::{dialog, mail_targets, opt_folder};
+use crate::compose::ComposeKind;
+use crate::queries;
+use crate::{CmdError, CmdResult, CommandSpec, Session, always};
+use mailcraft_mime::{Address, AttachmentSpec, MessageBuilder};
+use mailcraft_model::{BodyFormat, FolderKind, FolderRole, Importance, ItemId, MailItem};
+
+/// Longest text accepted by Copy (characters); longer text is truncated.
+const MAX_CLIPBOARD_CHARS: usize = 1_000_000;
+
+pub fn specs() -> Vec<CommandSpec> {
+    vec![
+        CommandSpec {
+            id: "app.closeAllItems",
+            label: "Close All Items",
+            location: "View › Window",
+            shortcut: "",
+            params: r#"{"save"?: bool}  (absent: unsaved drafts stay open and a save prompt is requested)"#,
+            mutates: true,
+            enabled: always,
+            run: close_all_items,
+        },
+        CommandSpec {
+            id: "app.copy",
+            label: "Copy",
+            location: "Message list context menu / group header context menu",
+            shortcut: "Mod+C",
+            params: r#"{"ids"?: [number], "group"?: string, "text"?: string}"#,
+            mutates: false,
+            enabled: always,
+            run: copy,
+        },
+        CommandSpec {
+            id: "app.paste",
+            label: "Paste",
+            location: "Message list",
+            shortcut: "",
+            params: r#"{"folder"?: number}"#,
+            mutates: true,
+            enabled: |s| if s.clipboard.is_empty() { Some("nothing to paste") } else { None },
+            run: paste,
+        },
+        CommandSpec {
+            id: "app.minimize",
+            label: "Minimize",
+            location: "Window caption",
+            shortcut: "",
+            params: "",
+            mutates: false,
+            enabled: always,
+            run: minimize,
+        },
+        CommandSpec {
+            id: "app.quickAccess",
+            label: "Customize Quick Access Toolbar",
+            location: "Quick Access Toolbar",
+            shortcut: "",
+            params: r#"{"add"?: string (command id), "remove"?: string (command id)}"#,
+            mutates: false,
+            enabled: always,
+            run: quick_access,
+        },
+        CommandSpec {
+            id: "app.toggleMaximize",
+            label: "Restore Down / Maximize",
+            location: "Window caption",
+            shortcut: "",
+            params: "",
+            mutates: false,
+            enabled: always,
+            run: toggle_maximize,
+        },
+        CommandSpec {
+            id: "app.toggleRibbonMode",
+            label: "Ribbon Display Options",
+            location: "Ribbon bottom-right corner",
+            shortcut: "",
+            params: r#"{"mode": "classic"|"simplified"|"tabsOnly"|"autoHide"|"always"}"#,
+            mutates: false,
+            enabled: always,
+            run: ribbon_mode,
+        },
+        CommandSpec {
+            id: "app.undo",
+            label: "Undo",
+            location: "Quick Access Toolbar",
+            shortcut: "Mod+Z",
+            params: "",
+            mutates: true,
+            enabled: |s| if s.undo.can_undo() { None } else { Some("nothing to undo") },
+            run: undo,
+        },
+        CommandSpec {
+            id: "app.redo",
+            label: "Redo",
+            location: "Quick Access Toolbar",
+            shortcut: "",
+            params: "",
+            mutates: true,
+            enabled: |s| if s.undo.can_redo() { None } else { Some("nothing to redo") },
+            run: redo,
+        },
+    ]
+}
+
+fn undo(s: &mut Session, _: &Value) -> CmdResult {
+    match s.undo_last() {
+        Some(label) => Ok(json!({"undone": label})),
+        None => Err(CmdError::Disabled("nothing to undo".into())),
+    }
+}
+
+fn redo(s: &mut Session, _: &Value) -> CmdResult {
+    match s.redo_last() {
+        Some(label) => Ok(json!({"redone": label})),
+        None => Err(CmdError::Disabled("nothing to redo".into())),
+    }
+}
+
+fn minimize(s: &mut Session, _: &Value) -> CmdResult {
+    s.view.minimized = true;
+    Ok(json!({"minimized": true}))
+}
+
+fn toggle_maximize(s: &mut Session, _: &Value) -> CmdResult {
+    s.view.minimized = false;
+    s.view.maximized = !s.view.maximized;
+    Ok(json!({"maximized": s.view.maximized}))
+}
+
+fn ribbon_state(s: &Session) -> Value {
+    let display = if s.view.ribbon_auto_hide {
+        "autoHide"
+    } else if s.view.ribbon_collapsed {
+        "tabsOnly"
+    } else {
+        "always"
+    };
+    json!({
+        "style": if s.view.simplified_ribbon { "simplified" } else { "classic" },
+        "display": display,
+    })
+}
+
+fn ribbon_mode(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(mode) = p.get("mode").filter(|v| !v.is_null()) else {
+        let state = ribbon_state(s);
+        return dialog(s, "ribbonDisplayOptions", state);
+    };
+    let mode = mode.as_str().ok_or_else(|| CmdError::Params("`mode` must be a string".into()))?;
+    match mode {
+        "classic" => s.view.simplified_ribbon = false,
+        "simplified" => s.view.simplified_ribbon = true,
+        "tabsOnly" => {
+            s.view.ribbon_collapsed = true;
+            s.view.ribbon_auto_hide = false;
+        }
+        "autoHide" | "fullScreen" => {
+            s.view.ribbon_auto_hide = true;
+            s.view.ribbon_collapsed = false;
+        }
+        "always" => {
+            s.view.ribbon_auto_hide = false;
+            s.view.ribbon_collapsed = false;
+        }
+        other => {
+            let shown: String = other.chars().take(40).collect();
+            return Err(CmdError::Params(format!(
+                "unknown ribbon mode `{shown}` (classic, simplified, tabsOnly, autoHide, always)"
+            )));
+        }
+    }
+    Ok(ribbon_state(s))
+}
+
+fn quick_access(s: &mut Session, p: &Value) -> CmdResult {
+    let add = p.get("add").filter(|v| !v.is_null());
+    let remove = p.get("remove").filter(|v| !v.is_null());
+    if add.is_none() && remove.is_none() {
+        let items = s.view.quick_access.clone();
+        s.notify(crate::Notice::OpenDialog("quickAccess".into(), json!({"items": items})));
+        return Ok(json!({"dialog": "quickAccess", "items": items}));
+    }
+    // Validate both before changing anything.
+    let add = match add {
+        Some(v) => {
+            let id =
+                v.as_str().ok_or_else(|| CmdError::Params("`add` must be a command id string".into()))?;
+            if s.registry.get(id).is_none() {
+                let shown: String = id.chars().take(60).collect();
+                return Err(CmdError::Params(format!("unknown command `{shown}`")));
+            }
+            Some(id.to_owned())
+        }
+        None => None,
+    };
+    let remove = match remove {
+        Some(v) => {
+            Some(v.as_str().ok_or_else(|| CmdError::Params("`remove` must be a command id string".into()))?)
+        }
+        None => None,
+    };
+    let mut removed = false;
+    if let Some(id) = remove {
+        let before = s.view.quick_access.len();
+        s.view.quick_access.retain(|q| q != id);
+        removed = s.view.quick_access.len() != before;
+    }
+    let mut added = false;
+    if let Some(id) = add
+        && !s.view.quick_access.contains(&id)
+    {
+        s.view.quick_access.push(id);
+        added = true;
+    }
+    Ok(json!({"items": s.view.quick_access, "added": added, "removed": removed}))
+}
+
+fn copy(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(text) = p.get("text").filter(|v| !v.is_null()) {
+        let text = text.as_str().ok_or_else(|| CmdError::Params("`text` must be a string".into()))?;
+        let text: String = text.chars().take(MAX_CLIPBOARD_CHARS).collect();
+        let chars = text.chars().count();
+        s.clipboard_text = Some(text);
+        return Ok(json!({"copied_text": chars}));
+    }
+    let ids: Vec<ItemId> = if let Some(group) = p.get("group").filter(|v| !v.is_null()) {
+        let label = group.as_str().ok_or_else(|| CmdError::Params("`group` must be a group label".into()))?;
+        queries::group_items(s, label)
+    } else {
+        mail_targets(s, p)
+    };
+    if ids.is_empty() {
+        return Err(CmdError::Disabled("nothing selected to copy".into()));
+    }
+    s.clipboard = ids;
+    let ids: Vec<u64> = s.clipboard.iter().map(|i| i.0).collect();
+    Ok(json!({"copied": ids.len(), "ids": ids}))
+}
+
+fn paste(s: &mut Session, p: &Value) -> CmdResult {
+    let folder = opt_folder(p).unwrap_or(s.selection.folder);
+    let target = s
+        .mailbox
+        .folder(folder)
+        .ok_or_else(|| CmdError::Params(format!("no folder with id {}", folder.0)))?;
+    if target.kind != FolderKind::Mail {
+        return Err(CmdError::Failed(format!("messages cannot be pasted into \"{}\"", target.name)));
+    }
+    let sources: Vec<MailItem> =
+        s.clipboard.iter().filter_map(|id| s.mailbox.mail.get(id).cloned()).collect();
+    if sources.is_empty() {
+        return Err(CmdError::Disabled("nothing to paste".into()));
+    }
+    let mut new_ids = Vec::new();
+    for mut item in sources {
+        item.folder = folder;
+        item.remote_id = None;
+        new_ids.push(s.mailbox.add_mail(item).0);
+    }
+    Ok(json!({"pasted": new_ids.len(), "ids": new_ids, "folder": folder.0}))
+}
+
+/// Saves a compose window as a draft in the account's Drafts folder (updating its existing draft).
+fn save_compose(s: &mut Session, cid: u64) -> Option<ItemId> {
+    let c = s.composes.get(&cid)?.clone();
+    let account = s.current_account()?;
+    let drafts = s.mailbox.role_folder(account, FolderRole::Drafts)?;
+    let me =
+        s.mailbox.account(account).map(|a| mailcraft_mime::Mailbox::new(Some(&a.sender_name), &a.address));
+    let parse = |t: &str| -> Vec<Address> { mailcraft_mime::parse_address_list(&t.replace(';', ",")) };
+    let now = s.now();
+    let mut b = MessageBuilder::new();
+    b.from = me.filter(|m| !m.addr.is_empty());
+    b.to = parse(&c.to);
+    b.cc = parse(&c.cc);
+    b.bcc = parse(&c.bcc);
+    b.keep_bcc = true;
+    b.subject = c.subject.clone();
+    b.date = Some(now);
+    b.text = Some(c.body.to_plain_text());
+    if c.format != BodyFormat::PlainText {
+        b.html = Some(mailcraft_html::doc_to_html(&c.body));
+    }
+    b.importance = match c.importance {
+        Importance::High => Some("high".into()),
+        Importance::Low => Some("low".into()),
+        Importance::Normal => None,
+    };
+    if let Some(src) = c.source.and_then(|id| s.mailbox.mail.get(&id))
+        && matches!(c.kind, ComposeKind::Reply | ComposeKind::ReplyAll | ComposeKind::Forward)
+        && let Some(mid) = &src.message_id
+    {
+        b.in_reply_to = vec![mid.clone()];
+        let mut refs = src.references.clone();
+        refs.push(mid.clone());
+        b.references = refs;
+    }
+    b.attachments = c
+        .attachments
+        .iter()
+        .map(|a| AttachmentSpec {
+            filename: a.filename.clone(),
+            mime_type: a.mime_type.clone(),
+            data: a.data.clone(),
+            content_id: None,
+        })
+        .collect();
+    b.extra_headers.push(("X-Unsent".into(), "1".into()));
+    let raw = b.build();
+    let mut item = match mailcraft_mime::parse(&raw) {
+        Ok(msg) => MailItem::from_message(&msg, &raw, now),
+        Err(_) => MailItem { subject: c.subject.clone(), ..Default::default() },
+    };
+    item.folder = drafts;
+    item.received = now;
+    item.read = true;
+    item.is_draft = true;
+    item.sent = None;
+    item.body.format = c.format;
+    let id = match c.draft.filter(|d| s.mailbox.mail.contains_key(d)) {
+        Some(existing) => {
+            item.id = existing;
+            s.mailbox.mail.insert(existing, item);
+            existing
+        }
+        None => s.mailbox.add_mail(item),
+    };
+    if let Some(c) = s.composes.get_mut(&cid) {
+        c.draft = Some(id);
+        c.dirty = false;
+    }
+    Some(id)
+}
+
+fn close_all_items(s: &mut Session, p: &Value) -> CmdResult {
+    let save = match p.get("save").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => Some(v.as_bool().ok_or_else(|| CmdError::Params("`save` must be true or false".into()))?),
+    };
+    let dirty: Vec<u64> = s.composes.values().filter(|c| c.dirty).map(|c| c.id).collect();
+    let mut saved = Vec::new();
+    match save {
+        None if !dirty.is_empty() => {
+            // Close the clean windows; ask about the rest.
+            let before = s.composes.len();
+            s.composes.retain(|_, c| c.dirty);
+            let closed = before.saturating_sub(s.composes.len());
+            s.notify(crate::Notice::OpenDialog("saveChanges".into(), json!({"composes": dirty})));
+            return Ok(json!({"closed": closed, "pending": dirty, "dialog": "saveChanges"}));
+        }
+        Some(true) => {
+            for cid in &dirty {
+                match save_compose(s, *cid) {
+                    Some(id) => saved.push(id.0),
+                    None => {
+                        return Err(CmdError::Failed(
+                            "the draft could not be saved: there is no Drafts folder".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let closed = s.composes.len();
+    s.composes.clear();
+    Ok(json!({"closed": closed, "saved": saved}))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::compose::ComposeState;
+    use crate::sample::sample_session;
+    use serde_json::json;
+
+    #[test]
+    fn window_and_ribbon_state() {
+        let mut s = sample_session();
+        assert!(s.view.maximized);
+        s.run("app.toggleMaximize", &json!({})).unwrap();
+        assert!(!s.view.maximized);
+        s.run("app.minimize", &json!(null)).unwrap();
+        assert!(s.view.minimized);
+        s.run("app.toggleMaximize", &json!({})).unwrap();
+        assert!(s.view.maximized && !s.view.minimized);
+        s.run("app.toggleRibbonMode", &json!({"mode": "classic"})).unwrap();
+        assert!(!s.view.simplified_ribbon);
+        s.run("app.toggleRibbonMode", &json!({"mode": "tabsOnly"})).unwrap();
+        assert!(s.view.ribbon_collapsed);
+        s.run("app.toggleRibbonMode", &json!({"mode": "autoHide"})).unwrap();
+        assert!(s.view.ribbon_auto_hide && !s.view.ribbon_collapsed);
+        assert!(s.run("app.toggleRibbonMode", &json!({"mode": "sideways"})).is_err());
+        let r = s.run("app.toggleRibbonMode", &json!({})).unwrap();
+        assert_eq!(r["dialog"], "ribbonDisplayOptions");
+    }
+
+    #[test]
+    fn quick_access_add_remove() {
+        let mut s = sample_session();
+        s.run("app.quickAccess", &json!({"add": "app.copy"})).unwrap();
+        assert!(s.view.quick_access.iter().any(|q| q == "app.copy"));
+        s.run("app.quickAccess", &json!({"remove": "app.undo"})).unwrap();
+        assert!(!s.view.quick_access.iter().any(|q| q == "app.undo"));
+        assert!(s.run("app.quickAccess", &json!({"add": "no.such"})).is_err());
+        let r = s.run("app.quickAccess", &json!({})).unwrap();
+        assert_eq!(r["dialog"], "quickAccess");
+    }
+
+    #[test]
+    fn copy_and_paste_items() {
+        let mut s = sample_session();
+        let first = *s.mailbox.items_in(s.selection.folder).first().map(|m| &m.id).unwrap();
+        s.selection.items = vec![first];
+        let r = s.run("app.copy", &json!({})).unwrap();
+        assert_eq!(r["copied"], 1);
+        let before = s.mailbox.mail.len();
+        let archive = s.mailbox.folders.values().find(|f| f.name == "Archive").map(|f| f.id.0).unwrap();
+        s.run("app.paste", &json!({"folder": archive})).unwrap();
+        assert_eq!(s.mailbox.mail.len(), before + 1);
+        s.run("app.undo", &json!({})).unwrap();
+        assert_eq!(s.mailbox.mail.len(), before);
+        let r = s.run("app.copy", &json!({"text": "hello"})).unwrap();
+        assert_eq!(r["copied_text"], 5);
+        assert_eq!(s.clipboard_text.as_deref(), Some("hello"));
+        let r = s.run("app.copy", &json!({"group": "Today"})).unwrap();
+        assert!(r["copied"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn close_all_items_prompts_then_saves() {
+        let mut s = sample_session();
+        let clean = s.open_compose(ComposeState::default());
+        let dirty = s.open_compose(ComposeState {
+            subject: "Unsaved".into(),
+            to: "Alice Rivera <alice@example.com>".into(),
+            dirty: true,
+            ..Default::default()
+        });
+        let r = s.run("app.closeAllItems", &json!({})).unwrap();
+        assert_eq!(r["dialog"], "saveChanges");
+        assert!(!s.composes.contains_key(&clean));
+        assert!(s.composes.contains_key(&dirty));
+        let drafts_before = s.mailbox.mail.values().filter(|m| m.is_draft).count();
+        s.run("app.closeAllItems", &json!({"save": true})).unwrap();
+        assert!(s.composes.is_empty());
+        let drafts: Vec<_> = s.mailbox.mail.values().filter(|m| m.is_draft).collect();
+        assert_eq!(drafts.len(), drafts_before + 1);
+        assert!(
+            drafts.iter().any(
+                |m| m.subject == "Unsaved" && m.to.first().is_some_and(|a| a.addr == "alice@example.com")
+            )
+        );
+    }
+
+    #[test]
+    fn undo_redo_roundtrip() {
+        let mut s = sample_session();
+        assert!(s.run("app.undo", &json!({})).is_err());
+        let first = *s.mailbox.items_in(s.selection.folder).first().map(|m| &m.id).unwrap();
+        s.clipboard = vec![first];
+        let before = s.mailbox.clone();
+        s.run("app.paste", &json!({})).unwrap();
+        let after = s.mailbox.clone();
+        assert_ne!(before, after);
+        s.run("app.undo", &json!({})).unwrap();
+        assert_eq!(s.mailbox, before);
+        s.run("app.redo", &json!({})).unwrap();
+        assert_eq!(s.mailbox, after);
+        assert!(s.run("app.redo", &json!({})).is_err());
+    }
+}

@@ -1,0 +1,89 @@
+Read|Message › Move & Delete|Delete|mail.delete
+Read|Message › Move & Delete|Archive...|mail.archive
+Read|Message › Move & Delete|Move|mail.move
+Read|Message › Respond|Reply|mail.reply
+Read|Message › Respond|Reply All|mail.replyAll
+Read|Message › Respond|Forward|mail.forward
+Read|Message › Apps|All Apps|-|Microsoft add-in/app store (All Apps) is a cloud service
+Read|Message › Quick Steps|Move to: ?|quicksteps.run
+Read|Message › Quick Steps|To Manager|quicksteps.run
+Read|Message › Quick Steps|Team Email|quicksteps.run
+Read|Message › Quick Steps|Done|quicksteps.run
+Read|Message › Quick Steps|Reply & Delete|quicksteps.run
+Read|Message › Quick Steps|Create New|quicksteps.new
+Read|Message › Quick Steps|Quick Steps|quicksteps.run
+Read|Message › Tags|Mark Unread|mail.toggleRead
+Read|Message › Tags|Categorize|mail.categorize
+Read|Message › Tags|Follow Up|mail.flag
+Read|Message › Tags|Message Options...|mail.messageOptions
+Read|Message › Editing|Find...|format.find
+Read|Message › Editing|Smart Lookup|-|Smart Lookup is an online web search service
+Read|Message › Immersive|Read Aloud|review.readAloud
+Read|Message › Immersive|Immersive Reader|-|Immersive Reader is a Microsoft cloud reading service
+Read|Message › Language|Translate|review.translate
+Read|Message › Zoom|Zoom...|view.zoom
+Read|Message › Zoom|More Commands, Message|mail.junk
+Read|Message > More Options|Clean Up Conversation|mail.cleanUpConversation
+Read|Message > More Options|Clean Up Folder|mail.cleanUpFolder
+Read|Message > More Options|Clean Up Folder & Subfolders|mail.cleanUpSubfolders
+Read|Message > Move|Other Folder...|mail.move
+Read|Message > Move|Copy to Folder...|mail.copy
+Read|Message > Move|Always Move Messages in This Conversation...|mail.alwaysMoveConversation
+Read|Message >|Move to: ?|quicksteps.run
+Read|Message >|To Manager|quicksteps.run
+Read|Message >|Team Email|quicksteps.run
+Read|Message >|Done|quicksteps.run
+Read|Message >|Reply & Delete|quicksteps.run
+Read|Message >|Create New|quicksteps.new
+Read|Message >|New Quick Step|quicksteps.new
+Read|Message >|Manage Quick Steps...|quicksteps.manage
+Read|Message >  > New Quick Step|Move to Folder...|quicksteps.new
+Read|Message >  > New Quick Step|Categorize & Move...|quicksteps.new
+Read|Message >  > New Quick Step|Flag & Move...|quicksteps.new
+Read|Message >  > New Quick Step|Custom...|quicksteps.new
+Read|Message > Quick Steps|Move to: ?|quicksteps.run
+Read|Message > Quick Steps|To Manager|quicksteps.run
+Read|Message > Quick Steps|Team Email|quicksteps.run
+Read|Message > Quick Steps|Done|quicksteps.run
+Read|Message > Quick Steps|Reply & Delete|quicksteps.run
+Read|Message > Quick Steps|Create New|quicksteps.new
+Read|Message > Quick Steps|New Quick Step|quicksteps.new
+Read|Message > Quick Steps|Manage Quick Steps...|quicksteps.manage
+Read|Message > Quick Steps > New Quick Step|Move to Folder...|quicksteps.new
+Read|Message > Quick Steps > New Quick Step|Categorize & Move...|quicksteps.new
+Read|Message > Quick Steps > New Quick Step|Flag & Move...|quicksteps.new
+Read|Message > Quick Steps > New Quick Step|Custom...|quicksteps.new
+Read|Message > Categorize|Clear All Categories|mail.clearCategories
+Read|Message > Categorize|Blue Category|mail.categorize
+Read|Message > Categorize|Green Category|mail.categorize
+Read|Message > Categorize|Orange Category|mail.categorize
+Read|Message > Categorize|Purple Category|mail.categorize
+Read|Message > Categorize|Red Category|mail.categorize
+Read|Message > Categorize|Yellow Category|mail.categorize
+Read|Message > Categorize|All Categories...|mail.allCategories
+Read|Message > Follow Up|Today|mail.flag
+Read|Message > Follow Up|Tomorrow|mail.flag
+Read|Message > Follow Up|This Week|mail.flag
+Read|Message > Follow Up|Next Week|mail.flag
+Read|Message > Follow Up|No Date|mail.flag
+Read|Message > Follow Up|Custom...|mail.flagCustom
+Read|Message > Follow Up|Add Reminder...|mail.flagCustom
+Read|Message > Follow Up|Mark Complete|mail.markComplete
+Read|Message > Translate|Translate Message|review.translate
+Read|Message > Translate|Translation Preferences...|options.open
+Read|Message > More Commands, Message|Junk|mail.junk
+Read|Message > More Commands, Message|Send to OneNote|-|Send to OneNote requires Microsoft OneNote
+Read|Message > More Commands, Message|Meeting|mail.replyWithMeeting
+Read|Message > More Commands, Message|Actions|mail.resend
+Read|Message > More Commands, Message|Related|mail.findRelated
+Read|Message > More Commands, Message|Select|format.selectAll
+Read|Message > More Commands, Message > Actions|Edit Message|mail.editMessage
+Read|Message > More Commands, Message > Actions|Recall This Message...|mail.recall
+Read|Message > More Commands, Message > Actions|Resend This Message...|mail.resend
+Read|Message > More Commands, Message > Actions|Other Actions|mail.viewSource
+Read|Message > More Commands, Message > Related|Messages in this Conversation|mail.findRelated
+Read|Message > More Commands, Message > Related|Messages from Sender|mail.findRelated
+Read|Message > More Commands, Message > Select|Select All|format.selectAll
+Read|Message > More Commands, Message > Select|Select Objects|format.selectObjects
+Read|Message > More Commands, Message > Select|Select All Text With Similar Formatting (No Data)|format.selectSimilar
+Read|Message > More Commands, Message > Select|Selection Pane...|format.selectionPane

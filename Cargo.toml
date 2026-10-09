@@ -19,6 +19,7 @@ mailcraft-store = { path = "crates/store" }
 mailcraft-html = { path = "crates/html" }
 mailcraft-layout = { path = "crates/layout" }
 mailcraft-render = { path = "crates/render" }
+mailcraft-engine = { path = "crates/engine" }
 
 # foundation
 thiserror = "2"

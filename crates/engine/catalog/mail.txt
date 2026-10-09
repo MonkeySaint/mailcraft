@@ -1,0 +1,286 @@
+Mail|Home › New|New Email|mail.newEmail
+Mail|Home › New|New Items|mail.newItem
+Mail|Home › Delete|Ignore|mail.ignore
+Mail|Home › Delete|Clean Up|mail.cleanUpConversation
+Mail|Home › Delete|Block|mail.block
+Mail|Home › Delete|Delete|mail.delete
+Mail|Home › Delete|Archive...|mail.archive
+Mail|Home › Report|Report|mail.report
+Mail|Home › Respond|Reply|mail.reply
+Mail|Home › Respond|Reply All|mail.replyAll
+Mail|Home › Respond|Forward|mail.forward
+Mail|Home › Respond|Meeting|mail.replyWithMeeting
+Mail|Home › Respond|More|mail.forwardAsAttachment
+Mail|Home › Teams|Share to Teams|-|Microsoft Teams integration; cloud service not provided by MailCraft
+Mail|Home › Quick Steps|Move to: ?|quicksteps.run
+Mail|Home › Quick Steps|To Manager|quicksteps.run
+Mail|Home › Quick Steps|Team Email|quicksteps.run
+Mail|Home › Quick Steps|Done|quicksteps.run
+Mail|Home › Quick Steps|Reply & Delete|quicksteps.run
+Mail|Home › Quick Steps|Create New|quicksteps.new
+Mail|Home › Quick Steps|Quick Steps|quicksteps.run
+Mail|Home › Quick Steps|Manage Quick Steps...|quicksteps.manage
+Mail|Home › Move|Move|mail.move
+Mail|Home › Move|Rules|rules.createFromMessage
+Mail|Home › Move|Send to OneNote|-|OneNote integration; Microsoft service not provided by MailCraft
+Mail|Home › Tags|Assign Policy|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Home › Tags|Unread/ Read|mail.toggleRead
+Mail|Home › Tags|Categorize|mail.categorize
+Mail|Home › Tags|Follow Up|mail.flag
+Mail|Home › Groups|New Group|-|Microsoft 365 Groups is a cloud-only service
+Mail|Home › Groups|Browse Groups|-|Microsoft 365 Groups is a cloud-only service
+Mail|Home › Find|Search People|people.search
+Mail|Home › Find|Address Book...|compose.addressBook
+Mail|Home › Find|Filter Email|view.filter
+Mail|Home › Speech|Read Aloud|review.readAloud
+Mail|Home › Apps|All Apps|-|Add-in/app store is a Microsoft cloud service
+Mail|Home › Add-in|Viva Insights|-|Viva Insights add-in is a Microsoft cloud service
+Mail|Home > New Items|E-mail Message|mail.newEmail
+Mail|Home > New Items|Storyline Post|-|Storyline (Viva Engage) is a Microsoft cloud service
+Mail|Home > New Items|Desk|-|Desk booking (Microsoft Places) is a Microsoft cloud service
+Mail|Home > New Items|Appointment|mail.newItem
+Mail|Home > New Items|Meeting|mail.newItem
+Mail|Home > New Items|Group|-|Microsoft 365 Groups is a cloud-only service
+Mail|Home > New Items|Contact|mail.newItem
+Mail|Home > New Items|Task|mail.newItem
+Mail|Home > New Items|E-mail Message Using|mail.newEmail
+Mail|Home > New Items|More Items|mail.newItem
+Mail|Home > New Items > E-mail Message Using|More Stationery...|mail.newEmail
+Mail|Home > New Items > E-mail Message Using|Plain Text|mail.newEmail
+Mail|Home > New Items > E-mail Message Using|Rich Text|mail.newEmail
+Mail|Home > New Items > E-mail Message Using|HTML|mail.newEmail
+Mail|Home > New Items > More Items|Post in This Folder|mail.newItem
+Mail|Home > New Items > More Items|Contact Group|mail.newItem
+Mail|Home > New Items > More Items|Task Request|mail.newItem
+Mail|Home > New Items > More Items|Internet Fax|-|Internet Fax requires a third-party online fax service
+Mail|Home > New Items > More Items|Choose Form...|mail.newItem
+Mail|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+Mail|Home > Clean Up|Clean Up Conversation|mail.cleanUpConversation
+Mail|Home > Clean Up|Clean Up Folder|mail.cleanUpFolder
+Mail|Home > Clean Up|Clean Up Folder & Subfolders|mail.cleanUpSubfolders
+Mail|Home > Block|Block Sender|mail.block
+Mail|Home > Block|Never Block Sender|mail.block
+Mail|Home > Block|Never Block Sender's Domain (@example.com)|mail.block
+Mail|Home > Block|Never Block this Group or Mailing List|mail.block
+Mail|Home > Block|Junk E-mail Options...|mail.junk
+Mail|Home > More Options|Report Phishing|mail.report
+Mail|Home > More Options|Report Junk|mail.report
+Mail|Home > More|Forward as Attachment|mail.forwardAsAttachment
+Mail|Home >|Move to: ?|quicksteps.run
+Mail|Home >|To Manager|quicksteps.run
+Mail|Home >|Team Email|quicksteps.run
+Mail|Home >|Done|quicksteps.run
+Mail|Home >|Reply & Delete|quicksteps.run
+Mail|Home >|Create New|quicksteps.new
+Mail|Home >|New Quick Step|quicksteps.new
+Mail|Home >|Manage Quick Steps...|quicksteps.manage
+Mail|Home >  > New Quick Step|Move to Folder...|quicksteps.new
+Mail|Home >  > New Quick Step|Categorize & Move...|quicksteps.new
+Mail|Home >  > New Quick Step|Flag & Move...|quicksteps.new
+Mail|Home >  > New Quick Step|New E-mail To...|quicksteps.new
+Mail|Home >  > New Quick Step|Forward To...|quicksteps.new
+Mail|Home >  > New Quick Step|New Meeting...|quicksteps.new
+Mail|Home >  > New Quick Step|Custom...|quicksteps.new
+Mail|Home > Quick Steps|Move to: ?|quicksteps.run
+Mail|Home > Quick Steps|To Manager|quicksteps.run
+Mail|Home > Quick Steps|Team Email|quicksteps.run
+Mail|Home > Quick Steps|Done|quicksteps.run
+Mail|Home > Quick Steps|Reply & Delete|quicksteps.run
+Mail|Home > Quick Steps|Create New|quicksteps.new
+Mail|Home > Quick Steps|New Quick Step|quicksteps.new
+Mail|Home > Quick Steps|Manage Quick Steps...|quicksteps.manage
+Mail|Home > Quick Steps > New Quick Step|Move to Folder...|quicksteps.new
+Mail|Home > Quick Steps > New Quick Step|Categorize & Move...|quicksteps.new
+Mail|Home > Quick Steps > New Quick Step|Flag & Move...|quicksteps.new
+Mail|Home > Quick Steps > New Quick Step|New E-mail To...|quicksteps.new
+Mail|Home > Quick Steps > New Quick Step|Forward To...|quicksteps.new
+Mail|Home > Quick Steps > New Quick Step|New Meeting...|quicksteps.new
+Mail|Home > Quick Steps > New Quick Step|Custom...|quicksteps.new
+Mail|Home > Move|Other Folder...|mail.move
+Mail|Home > Move|Copy to Folder...|mail.copy
+Mail|Home > Move|Always Move Messages in This Conversation...|mail.alwaysMoveConversation
+Mail|Home > Rules|Create Rule...|rules.createFromMessage
+Mail|Home > Rules|Manage Rules & Alerts...|rules.manage
+Mail|Home > Assign Policy|1 Month Delete (30 days)|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Home > Assign Policy|1 Week Delete (1 week)|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Home > Assign Policy|1 Year Delete (1 year)|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Home > Assign Policy|5 Year Delete (5 years)|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Home > Assign Policy|6 Month Delete (6 months)|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Home > Assign Policy|Never Delete (Never)|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Home > Assign Policy|Use Folder Policy|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Home > Categorize|Clear All Categories|mail.clearCategories
+Mail|Home > Categorize|Blue category|mail.categorize
+Mail|Home > Categorize|Green category|mail.categorize
+Mail|Home > Categorize|Orange category|mail.categorize
+Mail|Home > Categorize|Purple category|mail.categorize
+Mail|Home > Categorize|Red category|mail.categorize
+Mail|Home > Categorize|Yellow category|mail.categorize
+Mail|Home > Categorize|All Categories...|mail.allCategories
+Mail|Home > Categorize|Set Quick Click...|categories.setQuickClick
+Mail|Home > Follow Up|Today|mail.flag
+Mail|Home > Follow Up|Tomorrow|mail.flag
+Mail|Home > Follow Up|This Week|mail.flag
+Mail|Home > Follow Up|Next Week|mail.flag
+Mail|Home > Follow Up|No Date|mail.flag
+Mail|Home > Follow Up|Custom...|mail.flagCustom
+Mail|Home > Follow Up|Add Reminder...|mail.flagCustom
+Mail|Home > Follow Up|Mark Complete|mail.markComplete
+Mail|Home > Follow Up|Clear Flag|mail.clearFlag
+Mail|Home > Follow Up|Set Quick Click...|mail.setQuickClickFlag
+Mail|Home > Follow Up|Set Quick Actions...|view.quickActions
+Mail|Home > Filter Email|Unread|view.filter
+Mail|Home > Filter Email|Has Attachments|view.filter
+Mail|Home > Filter Email|Categorized|view.filter
+Mail|Home > Filter Email|Flagged|view.filter
+Mail|Home > Filter Email|Important|view.filter
+Mail|Home > Filter Email|Sent To: Me or CC: Me|view.filter
+Mail|Home > Filter Email|View Items Expiring Soon|view.filter
+Mail|Home > Filter Email|More Filters...|search.refine
+Mail|Home > Filter Email > Categorized|Blue category|view.filter
+Mail|Home > Filter Email > Categorized|Green category|view.filter
+Mail|Home > Filter Email > Categorized|Orange category|view.filter
+Mail|Home > Filter Email > Categorized|Purple category|view.filter
+Mail|Home > Filter Email > Categorized|Red category|view.filter
+Mail|Home > Filter Email > Categorized|Yellow category|view.filter
+Mail|Home > Filter Email > Categorized|Any Category|view.filter
+Mail|Home > Filter Email > Categorized|No Categories|view.filter
+Mail|Send / Receive › Send & Receive|Send/Receive All Folders|sendReceive.all
+Mail|Send / Receive › Send & Receive|Update Folder|sendReceive.folder
+Mail|Send / Receive › Send & Receive|Send All|sendReceive.sendAll
+Mail|Send / Receive › Send & Receive|Send/Receive Groups|sendReceive.group
+Mail|Send / Receive › Download|Show Progress...|sendReceive.showProgress
+Mail|Send / Receive › Download|Cancel All|sendReceive.cancelAll
+Mail|Send / Receive › Server|Download Headers|sendReceive.downloadHeaders
+Mail|Send / Receive › Server|Mark to Download|sendReceive.markToDownload
+Mail|Send / Receive › Server|Unmark to Download|sendReceive.unmarkToDownload
+Mail|Send / Receive › Server|Process Marked Headers|sendReceive.processMarked
+Mail|Send / Receive › Preferences|Download Preferences|sendReceive.preferences
+Mail|Send / Receive › Preferences|Work Offline|sendReceive.workOffline
+Mail|Send / Receive > Send/Receive Groups|0|sendReceive.group
+Mail|Send / Receive > Send/Receive Groups|Inbox|sendReceive.group
+Mail|Send / Receive > More Options|Mark to Download|sendReceive.markToDownload
+Mail|Send / Receive > More Options|Mark to Download Message Copy|sendReceive.markToDownload
+Mail|Send / Receive > More Options|Unmark to Download|sendReceive.unmarkToDownload
+Mail|Send / Receive > More Options|Unmark All to Download|sendReceive.unmarkToDownload
+Mail|Send / Receive > More Options|Process Marked Headers|sendReceive.processMarked
+Mail|Send / Receive > More Options|Process Marked Headers in All Folders|sendReceive.processMarked
+Mail|Send / Receive > Download Preferences|Download Full Items|sendReceive.preferences
+Mail|Send / Receive > Download Preferences|Download Headers and Then Full Items|sendReceive.preferences
+Mail|Send / Receive > Download Preferences|Download Headers|sendReceive.preferences
+Mail|Send / Receive > Download Preferences|On Slow Connections Download Only Headers|sendReceive.preferences
+Mail|Folder › New|New Folder...|folder.new
+Mail|Folder › New|New Search Folder...|folder.newSearchFolder
+Mail|Folder › Actions|Rename Folder|folder.rename
+Mail|Folder › Actions|Copy Folder|folder.copy
+Mail|Folder › Actions|Move Folder|folder.move
+Mail|Folder › Actions|Delete Folder|folder.delete
+Mail|Folder › Clean Up|Mark All as Read|folder.markAllRead
+Mail|Folder › Clean Up|Run Rules Now...|folder.runRulesNow
+Mail|Folder › Clean Up|Show All Folders A to Z|folder.showAllAZ
+Mail|Folder › Clean Up|Clean Up Folder|mail.cleanUpFolder
+Mail|Folder › Clean Up|Delete All|folder.deleteAll
+Mail|Folder › Clean Up|Recover Deleted Items...|folder.recoverDeleted
+Mail|Folder › Favorites|Add to Favorites|folder.addFavorite
+Mail|Folder › Online View|View on Server|-|Exchange cached-mode online view of a server mailbox; MailCraft keeps a local store
+Mail|Folder › Properties|Policy|-|Retention policies require a Microsoft 365/Exchange tenant
+Mail|Folder › Properties|AutoArchive Settings|folder.autoArchiveSettings
+Mail|Folder › Properties|Folder Permissions|-|Exchange folder delegate permissions require an Exchange server
+Mail|Folder › Properties|Folder Properties|folder.properties
+Mail|Folder > Clean Up Folder|Clean Up Folder|mail.cleanUpFolder
+Mail|Folder > Clean Up Folder|Clean Up Folder & Subfolders|mail.cleanUpSubfolders
+Mail|View › Current View|Change View|view.changeView
+Mail|View › Current View|View Settings...|view.viewSettings
+Mail|View › Current View|Reset View|view.resetView
+Mail|View › Messages|Show as Conversations|view.conversations
+Mail|View › Messages|Conversation Settings|view.conversationSettings
+Mail|View › Focused Inbox|Show Focused Inbox|view.focusedInbox
+Mail|View › Arrangement|Message Preview|view.messagePreview
+Mail|View › Arrangement|Date|view.arrangeBy
+Mail|View › Arrangement|From|view.arrangeBy
+Mail|View › Arrangement|To|view.arrangeBy
+Mail|View › Arrangement|Categories|view.arrangeBy
+Mail|View › Arrangement|Flag Status|view.arrangeBy
+Mail|View › Arrangement|Flag: Start Date|view.arrangeBy
+Mail|View › Arrangement|Flag: Due Date|view.arrangeBy
+Mail|View › Arrangement|Size|view.arrangeBy
+Mail|View › Arrangement|Subject|view.arrangeBy
+Mail|View › Arrangement|Type|view.arrangeBy
+Mail|View › Arrangement|Attachments|view.arrangeBy
+Mail|View › Arrangement|Account|view.arrangeBy
+Mail|View › Arrangement|Importance|view.arrangeBy
+Mail|View › Arrangement|Arrange By|view.arrangeBy
+Mail|View › Arrangement|Reverse Sort|view.reverseSort
+Mail|View › Arrangement|Add Columns|view.addColumns
+Mail|View › Arrangement|Expand/Collapse|view.collapseGroup
+Mail|View › Layout|Use Tighter Spacing|view.tighterSpacing
+Mail|View › Layout|Folder Pane|view.folderPane
+Mail|View › Layout|Reading Pane|view.readingPane
+Mail|View › Layout|To-Do Bar|view.todoBar
+Mail|View › Window|Reminders Window|view.reminderWindow
+Mail|View › Window|Open in New Window|folder.openInNewWindow
+Mail|View › Window|Close All Items|app.closeAllItems
+Mail|View › Immersive Reader|Immersive Reader|-|Immersive Reader relies on Microsoft cloud Learning Tools
+Mail|View > Change View|Compact|view.changeView
+Mail|View > Change View|Single|view.changeView
+Mail|View > Change View|Preview|view.changeView
+Mail|View > Change View|Manage Views...|view.manageViews
+Mail|View > Change View|Save Current View As a New View...|view.saveViewAs
+Mail|View > Change View|Apply Current View to Other Mail Folders...|view.applyViewTo
+Mail|View > Message Preview|Off|view.messagePreview
+Mail|View > Message Preview|1 Line|view.messagePreview
+Mail|View > Message Preview|2 Lines|view.messagePreview
+Mail|View > Message Preview|3 Lines|view.messagePreview
+Mail|View >|Date|view.arrangeBy
+Mail|View >|From|view.arrangeBy
+Mail|View >|To|view.arrangeBy
+Mail|View >|Categories|view.arrangeBy
+Mail|View >|Flag Status|view.arrangeBy
+Mail|View >|Flag: Start Date|view.arrangeBy
+Mail|View >|Flag: Due Date|view.arrangeBy
+Mail|View >|Size|view.arrangeBy
+Mail|View >|Subject|view.arrangeBy
+Mail|View >|Type|view.arrangeBy
+Mail|View >|Attachments|view.arrangeBy
+Mail|View >|Account|view.arrangeBy
+Mail|View >|Importance|view.arrangeBy
+Mail|View >|Show in Groups|view.showInGroups
+Mail|View >|View Settings...|view.viewSettings
+Mail|View > Arrange By|Date|view.arrangeBy
+Mail|View > Arrange By|From|view.arrangeBy
+Mail|View > Arrange By|To|view.arrangeBy
+Mail|View > Arrange By|Categories|view.arrangeBy
+Mail|View > Arrange By|Flag Status|view.arrangeBy
+Mail|View > Arrange By|Flag: Start Date|view.arrangeBy
+Mail|View > Arrange By|Flag: Due Date|view.arrangeBy
+Mail|View > Arrange By|Size|view.arrangeBy
+Mail|View > Arrange By|Subject|view.arrangeBy
+Mail|View > Arrange By|Type|view.arrangeBy
+Mail|View > Arrange By|Attachments|view.arrangeBy
+Mail|View > Arrange By|Account|view.arrangeBy
+Mail|View > Arrange By|Importance|view.arrangeBy
+Mail|View > Arrange By|Show in Groups|view.showInGroups
+Mail|View > Arrange By|View Settings...|view.viewSettings
+Mail|View > Expand/Collapse|Collapse This Group|view.collapseGroup
+Mail|View > Expand/Collapse|Expand This Group|view.expandGroup
+Mail|View > Expand/Collapse|Collapse All Groups|view.collapseAll
+Mail|View > Expand/Collapse|Expand All Groups|view.expandAll
+Mail|View > Folder Pane|Normal|view.folderPane
+Mail|View > Folder Pane|Minimized|view.folderPane
+Mail|View > Folder Pane|Off|view.folderPane
+Mail|View > Folder Pane|Favorites|view.favorites
+Mail|View > Reading Pane|Right|view.readingPane
+Mail|View > Reading Pane|Bottom|view.readingPane
+Mail|View > Reading Pane|Off|view.readingPane
+Mail|View > Reading Pane|Options...|view.readingPaneOptions
+Mail|View > To-Do Bar|Calendar|view.todoBar
+Mail|View > To-Do Bar|People|view.todoBar
+Mail|View > To-Do Bar|Tasks|view.todoBar
+Mail|View > To-Do Bar|Off|view.todoBar
+Mail|Help › Help|Help|help.help
+Mail|Help › Help|Contact Support...|help.contactSupport
+Mail|Help › Help|Feedback|help.feedback
+Mail|Help › Help|Suggest a Feature|help.feedback
+Mail|Help › Help|Show Training|help.showTraining
+Mail|Help › Help|What's New|help.whatsNew
+Mail|Help › Help|Support Tool|-|Downloads Microsoft's support and recovery tool; Microsoft service
+Mail|Help › Tools|Get Diagnostics|-|Runs Microsoft online diagnostics; cloud service

@@ -1,0 +1,40 @@
+Search|Search › Refine|From|search.refine
+Search|Search › Refine|Subject|search.refine
+Search|Search › Refine|Has Attachments|search.refine
+Search|Search › Refine|Categorized|search.refine
+Search|Search › Refine|Sent To|search.refine
+Search|Search › Refine|Unread|search.refine
+Search|Search › Refine|Flagged|search.refine
+Search|Search › Refine|Important|search.refine
+Search|Search › Refine|More|search.refine
+Search|Search › Scope|All Mailboxes|search.scope
+Search|Search › Scope|Current Mailbox|search.scope
+Search|Search › Scope|Current Folder|search.scope
+Search|Search › Scope|Subfolders|search.scope
+Search|Search › Scope|All Outlook Items|search.scope
+Search|Search › Results|Include Deleted Items|search.scope
+Search|Search › Options|Recent Searches|search.recent
+Search|Search › Options|Search Tools|search.searchTools
+Search|Search › Close|Close Search|search.close
+Search|Search > Categorized|Blue category|search.refine
+Search|Search > Categorized|Green category|search.refine
+Search|Search > Categorized|Orange category|search.refine
+Search|Search > Categorized|Purple category|search.refine
+Search|Search > Categorized|Red category|search.refine
+Search|Search > Categorized|Yellow category|search.refine
+Search|Search > Categorized|Any Category|search.refine
+Search|Search > Categorized|No Categories|search.refine
+Search|Search > Sent To|Sent To: Me or CC: Me|search.refine
+Search|Search > Sent To|Not Sent Directly to Me|search.refine
+Search|Search > Sent To|Sent to Another Recipient|search.refine
+Search|Search > More|View Items Expiring Soon|search.refine
+Search|Search > More|Add Form Field...|search.refine
+Search|Search > Recent Searches|No Recent Searches|search.recent
+Search|Search > Search Tools|Include Older Results|search.includeOlderResults
+Search|Search > Search Tools|Indexing Status...|search.searchTools
+Search|Search > Search Tools|Locations to Search|search.scope
+Search|Search > Search Tools|Advanced Find...|search.advancedFind
+Search|Search > Search Tools|Search Options...|options.open
+Search|Search > Search Tools > Locations to Search|user@example.com|search.scope
+Search|Search > Search Tools > Locations to Search|Shared mailbox|search.scope
+Search|Search > Search Tools > Locations to Search|Blake Carey|search.scope

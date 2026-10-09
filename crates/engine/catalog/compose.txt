@@ -1,0 +1,476 @@
+Compose|Message › Clipboard|Paste|format.paste
+Compose|Message › Clipboard|Cut|format.cut
+Compose|Message › Clipboard|Copy|format.copy
+Compose|Message › Clipboard|Format Painter|format.formatPainter
+Compose|Message › Clipboard|Office Clipboard...|format.clipboardPane
+Compose|Message › Basic Text|Font|format.font
+Compose|Message › Basic Text|Font Size|format.fontSize
+Compose|Message › Basic Text|Grow Font|format.growFont
+Compose|Message › Basic Text|Shrink Font|format.shrinkFont
+Compose|Message › Basic Text|Bullets|format.bullets
+Compose|Message › Basic Text|Numbering|format.numbering
+Compose|Message › Basic Text|Clear Formatting|format.clearFormatting
+Compose|Message › Basic Text|Bold|format.bold
+Compose|Message › Basic Text|Italic|format.italic
+Compose|Message › Basic Text|Underline|format.underline
+Compose|Message › Basic Text|Text Highlight Color|format.highlight
+Compose|Message › Basic Text|Text Highlight Color Yellow|format.highlight
+Compose|Message › Basic Text|Font Color|format.color
+Compose|Message › Basic Text|Font Color Red|format.color
+Compose|Message › Basic Text|Align Left|format.align
+Compose|Message › Basic Text|Center|format.align
+Compose|Message › Basic Text|Align Right|format.align
+Compose|Message › Basic Text|Decrease Indent|format.outdent
+Compose|Message › Basic Text|Increase Indent|format.indent
+Compose|Message › Basic Text|Font...|format.fontDialog
+Compose|Message › Names|Address Book...|compose.addressBook
+Compose|Message › Names|Check Names|compose.checkNames
+Compose|Message › Include|Attach File...|compose.attachFile
+Compose|Message › Include|Link|insert.link
+Compose|Message › Include|Signature|compose.signature
+Compose|Message › Collaborate|Loop Components|-|Loop components are a Microsoft 365 cloud service
+Compose|Message › Tags|Assign Policy|-|retention policies come from an Exchange/Microsoft 365 tenant
+Compose|Message › Tags|Follow Up|compose.followUp
+Compose|Message › Tags|High Importance|compose.importance
+Compose|Message › Tags|Low Importance|compose.importance
+Compose|Message › Tags|Message Options...|compose.messageOptions
+Compose|Message › Voice|Dictate|-|Dictate is cloud speech recognition (Microsoft speech service)
+Compose|Message › Apps|All Apps|-|All Apps opens the Office add-ins store
+Compose|Message › Sensitivity|Sensitivity|-|sensitivity labels require a Microsoft Purview tenant policy
+Compose|Message › Editor|Editor|review.spelling
+Compose|Message › Dark Mode|Switch Background|compose.switchBackground
+Compose|Message › Immersive|Immersive Reader|-|Immersive Reader is a Microsoft cloud reading service
+Compose|Message › Add-in|Viva Insights|-|Viva Insights is a Microsoft 365 cloud add-in
+Compose|Message › My Templates|View Templates|-|My Templates is a web add-in stored in the Exchange mailbox; Quick Parts covers local templates
+Compose|Message > More Options|(gallery of 122 items, e.g. Paste, None, Bulleted, Solid Circle)|format.paste
+Compose|Message > More Options|Paste Special...|format.pasteSpecial
+Compose|Message > More Options|Set Default Paste...|options.open
+Compose|Message > Font|(gallery of 532 items, e.g. Aptos Display (Headings), Aptos (Body), Abadi, select to download)|format.font
+Compose|Message > Font Size|8|format.fontSize
+Compose|Message > Font Size|9|format.fontSize
+Compose|Message > Font Size|10|format.fontSize
+Compose|Message > Font Size|11|format.fontSize
+Compose|Message > Font Size|12|format.fontSize
+Compose|Message > Font Size|14|format.fontSize
+Compose|Message > Font Size|16|format.fontSize
+Compose|Message > Font Size|18|format.fontSize
+Compose|Message > Font Size|20|format.fontSize
+Compose|Message > Font Size|22|format.fontSize
+Compose|Message > Font Size|24|format.fontSize
+Compose|Message > Font Size|26|format.fontSize
+Compose|Message > Font Size|28|format.fontSize
+Compose|Message > Font Size|36|format.fontSize
+Compose|Message > Font Size|48|format.fontSize
+Compose|Message > Font Size|72|format.fontSize
+Compose|Message > More Options|Change List Level|format.indent
+Compose|Message > More Options|Define New Bullet...|format.bullets
+Compose|Message > More Options|Define New Number Format...|format.numbering
+Compose|Message > More Options|Set Numbering Value...|format.numbering
+Compose|Message > More Options|High-contrast only|format.highlight
+Compose|Message > More Options|Stop Highlighting|format.highlight
+Compose|Message > More Options|More Colors...|format.color
+Compose|Message > Attach File...|Attach Item|compose.attachItem
+Compose|Message > Attach File...|Browse Web Locations|-|Browse Web Locations lists OneDrive/SharePoint cloud storage
+Compose|Message > Attach File...|Browse This PC...|compose.attachFile
+Compose|Message > Attach File... > Attach Item|Business Card|insert.businessCard
+Compose|Message > Attach File... > Attach Item|Outlook Item|compose.attachItem
+Compose|Message > Attach File... > Browse Web Locations|OneDrive - Organization|-|OneDrive is Microsoft cloud storage
+Compose|Message > More Options|Insert Link...|insert.link
+Compose|Message > Signature|Signatures...|options.open
+Compose|Message > Assign Policy|1 Month Delete (30 days)|-|retention policies come from an Exchange/Microsoft 365 tenant
+Compose|Message > Assign Policy|1 Week Delete (1 week)|-|retention policies come from an Exchange/Microsoft 365 tenant
+Compose|Message > Assign Policy|1 Year Delete (1 year)|-|retention policies come from an Exchange/Microsoft 365 tenant
+Compose|Message > Assign Policy|5 Year Delete (5 years)|-|retention policies come from an Exchange/Microsoft 365 tenant
+Compose|Message > Assign Policy|6 Month Delete (6 months)|-|retention policies come from an Exchange/Microsoft 365 tenant
+Compose|Message > Assign Policy|Never Delete (Never)|-|retention policies come from an Exchange/Microsoft 365 tenant
+Compose|Message > Assign Policy|Use Folder Policy|-|retention policies come from an Exchange/Microsoft 365 tenant
+Compose|Message > Follow Up|Today|compose.followUp
+Compose|Message > Follow Up|Tomorrow|compose.followUp
+Compose|Message > Follow Up|This Week|compose.followUp
+Compose|Message > Follow Up|Next Week|compose.followUp
+Compose|Message > Follow Up|No Date|compose.followUp
+Compose|Message > Follow Up|Custom...|compose.followUp
+Compose|Message > Follow Up|Add Reminder...|compose.followUp
+Compose|Message > Follow Up|Clear Flag|compose.followUp
+Compose|Insert › Include|Attach File...|compose.attachFile
+Compose|Insert › Include|Outlook Item|compose.attachItem
+Compose|Insert › Include|Business Card|insert.businessCard
+Compose|Insert › Include|Calendar...|insert.calendar
+Compose|Insert › Include|Signature|compose.signature
+Compose|Insert › Collaborate|Loop Components|-|Loop components are a Microsoft 365 cloud service
+Compose|Insert › Tables|Table|insert.table
+Compose|Insert › Illustrations|Pictures|insert.picture
+Compose|Insert › Illustrations|Shapes|insert.shape
+Compose|Insert › Illustrations|Icons|insert.icon
+Compose|Insert › Illustrations|3D Models|insert.model3d
+Compose|Insert › Illustrations|SmartArt...|insert.smartArt
+Compose|Insert › Illustrations|Chart...|insert.chart
+Compose|Insert › Illustrations|Screenshot|insert.screenshot
+Compose|Insert › Links|Link|insert.link
+Compose|Insert › Links|Bookmark...|insert.bookmark
+Compose|Insert › Text|Text Box|insert.textBox
+Compose|Insert › Text|Quick Parts|insert.quickPart
+Compose|Insert › Text|WordArt|insert.wordArt
+Compose|Insert › Text|Drop Cap|insert.dropCap
+Compose|Insert › Text|Date & Time...|insert.dateTime
+Compose|Insert › Text|Object...|insert.object
+Compose|Insert › Symbols|Equation|insert.equation
+Compose|Insert › Symbols|Symbol|insert.symbol
+Compose|Insert › Symbols|Horizontal Line|insert.horizontalLine
+Compose|Insert > Attach File...|Browse Web Locations|-|Browse Web Locations lists OneDrive/SharePoint cloud storage
+Compose|Insert > Attach File...|Browse This PC...|compose.attachFile
+Compose|Insert > Attach File... > Browse Web Locations|OneDrive - Organization|-|OneDrive is Microsoft cloud storage
+Compose|Insert > Business Card|Other Business Cards...|insert.businessCard
+Compose|Insert > Signature|Signatures...|options.open
+Compose|Insert > Table|(gallery of 42 items, e.g. 1x1 Table, 2x1 Table, 3x1 Table)|insert.table
+Compose|Insert > Table|Insert Table...|insert.table
+Compose|Insert > Table|Draw Table|insert.table
+Compose|Insert > Table|Convert Text to Table...|insert.table
+Compose|Insert > Table|Excel Spreadsheet|-|embeds a Microsoft Excel OLE worksheet, needs Excel installed; Insert Table covers tables
+Compose|Insert > Table|Quick Tables|insert.table
+Compose|Insert > Table > Quick Tables|Save Selection to Quick Tables Gallery...|insert.saveToGallery
+Compose|Insert > Pictures|This Device...|insert.picture
+Compose|Insert > Pictures|Stock Images...|-|Stock Images is an online Microsoft content service
+Compose|Insert > Pictures|Online Pictures...|-|Online Pictures is a Bing web image search service
+Compose|Insert > Shapes|(gallery of 159 items, e.g. Text Box, Line, Line Arrow)|insert.shape
+Compose|Insert > Shapes|New Drawing Canvas|insert.shape
+Compose|Insert > More Options|This Device...|insert.model3d
+Compose|Insert > More Options|Stock 3D Models...|-|Stock 3D Models is an online Microsoft content service
+Compose|Insert > Screenshot|Inbox - user@example.com - Outlook|insert.screenshot
+Compose|Insert > Screenshot|13 Reminder(s)|insert.screenshot
+Compose|Insert > Screenshot|Downloads|insert.screenshot
+Compose|Insert > Screenshot|Download Microsoft Office 365 for Windows and Mac \/Microsoft 365 — Mozilla Firefox|insert.screenshot
+Compose|Insert > Screenshot|Screen Clipping|insert.screenshot
+Compose|Insert > More Options|(gallery of 25 items, e.g. Country vs Rock.pptx, How do media texts communicate meaning.docx, What are media texts saying.docx)|insert.link
+Compose|Insert > More Options|Insert Link...|insert.link
+Compose|Insert > Text Box|Draw Text Box|insert.textBox
+Compose|Insert > Text Box|Save Selection to Text Box Gallery|insert.saveToGallery
+Compose|Insert > Quick Parts|AutoText|insert.quickPart
+Compose|Insert > Quick Parts|Save Selection to Quick Part Gallery...|insert.saveToGallery
+Compose|Insert > Quick Parts > AutoText|U|insert.quickPart
+Compose|Insert > Quick Parts > AutoText|User|insert.quickPart
+Compose|Insert > Quick Parts > AutoText|Save Selection to AutoText Gallery|insert.saveToGallery
+Compose|Insert > WordArt|Fill: Black, Text color 1; Shadow|insert.wordArt
+Compose|Insert > WordArt|Fill: Dark Teal, Accent color 1; Shadow|insert.wordArt
+Compose|Insert > WordArt|Fill: Orange, Accent color 2; Outline: Orange, Accent color 2|insert.wordArt
+Compose|Insert > WordArt|Fill: White; Outline: Plum, Accent color 5; Shadow|insert.wordArt
+Compose|Insert > WordArt|Fill: Turquoise, Accent color 4; Soft Bevel|insert.wordArt
+Compose|Insert > WordArt|Gradient Fill, Gray|insert.wordArt
+Compose|Insert > WordArt|Gradient Fill: Plum, Accent color 5; Reflection|insert.wordArt
+Compose|Insert > WordArt|Gradient Fill: Turquoise, Accent color 4; Outline: Turquoise, Accent color 4|insert.wordArt
+Compose|Insert > WordArt|Fill: White; Outline: Dark Teal, Accent color 1; Glow: Dark Teal, Accent color 1|insert.wordArt
+Compose|Insert > WordArt|Fill: Dark Green, Accent color 3; Sharp Bevel|insert.wordArt
+Compose|Insert > WordArt|Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: White, Background color 1|insert.wordArt
+Compose|Insert > WordArt|Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5|insert.wordArt
+Compose|Insert > WordArt|Fill: Plum, Accent color 5; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5|insert.wordArt
+Compose|Insert > WordArt|Fill: White; Outline: Orange, Accent color 2; Hard Shadow: Orange, Accent color 2|insert.wordArt
+Compose|Insert > WordArt|Fill: Light Gray, Background color 2; Inner Shadow|insert.wordArt
+Compose|Insert > More Options|Insert New Equation|insert.equation
+Compose|Insert > More Options|Save Selection to Equation Gallery...|insert.saveToGallery
+Compose|Insert > Symbol|Euro Sign|insert.symbol
+Compose|Insert > Symbol|Pound Sign|insert.symbol
+Compose|Insert > Symbol|Yen Sign|insert.symbol
+Compose|Insert > Symbol|Copyright Sign|insert.symbol
+Compose|Insert > Symbol|Registered Sign|insert.symbol
+Compose|Insert > Symbol|Trade Mark Sign|insert.symbol
+Compose|Insert > Symbol|Plus-Minus Sign|insert.symbol
+Compose|Insert > Symbol|Not Equal To|insert.symbol
+Compose|Insert > Symbol|Less-Than Or Equal To|insert.symbol
+Compose|Insert > Symbol|Greater-Than Or Equal To|insert.symbol
+Compose|Insert > Symbol|Division Sign|insert.symbol
+Compose|Insert > Symbol|Multiplication Sign|insert.symbol
+Compose|Insert > Symbol|Infinity|insert.symbol
+Compose|Insert > Symbol|Micro Sign|insert.symbol
+Compose|Insert > Symbol|Greek Small Letter Alpha|insert.symbol
+Compose|Insert > Symbol|Greek Small Letter Beta|insert.symbol
+Compose|Insert > Symbol|Greek Small Letter Pi|insert.symbol
+Compose|Insert > Symbol|Ohm Sign|insert.symbol
+Compose|Insert > Symbol|N-Ary Summation|insert.symbol
+Compose|Insert > Symbol|Wingdings: 74|insert.symbol
+Compose|Insert > Symbol|More Symbols...|insert.symbol
+Compose|Options › Themes|Themes|compose.theme
+Compose|Options › Themes|Colors|compose.theme
+Compose|Options › Themes|Fonts|compose.theme
+Compose|Options › Themes|Effects|compose.theme
+Compose|Options › Themes|Page Color|compose.pageColor
+Compose|Options › Show Fields|Bcc|compose.showBcc
+Compose|Options › Show Fields|From|compose.showFrom
+Compose|Options › Encrypt|Encrypt|compose.encrypt
+Compose|Options › Tracking|Use Voting Buttons|compose.votingButtons
+Compose|Options › Tracking|Request a Delivery Receipt|compose.deliveryReceipt
+Compose|Options › Tracking|Request a Read Receipt|compose.readReceipt
+Compose|Options › Tracking|Message Options...|compose.messageOptions
+Compose|Options › Tracking|Save Sent Item To|compose.saveSentItemTo
+Compose|Options › Tracking|Delay Delivery|compose.delayDelivery
+Compose|Options › Tracking|Direct Replies To|compose.directRepliesTo
+Compose|Options > Themes|Office|compose.theme
+Compose|Options > Themes|Office 2013 - 2022 Theme|compose.theme
+Compose|Options > Themes|Facet|compose.theme
+Compose|Options > Themes|Gallery|compose.theme
+Compose|Options > Themes|Integral|compose.theme
+Compose|Options > Themes|Ion|compose.theme
+Compose|Options > Themes|Ion Boardroom|compose.theme
+Compose|Options > Themes|Organic|compose.theme
+Compose|Options > Themes|Retrospect|compose.theme
+Compose|Options > Themes|Slice|compose.theme
+Compose|Options > Themes|Wisp|compose.theme
+Compose|Options > Themes|Reset to Theme from Template|compose.theme
+Compose|Options > Themes|Browse for Themes...|compose.theme
+Compose|Options > Themes|Save Current Theme...|compose.theme
+Compose|Options > Colors|(gallery of 24 items, e.g. Office, Office 2013 - 2022, Office 2007 - 2010)|compose.theme
+Compose|Options > Colors|Customize Colors...|compose.theme
+Compose|Options > Fonts|(gallery of 26 items, e.g. Office, Heading Font: Aptos Display, Body Font: Aptos, Office 2013 - 2022, Heading Font: Calibri Light, Body Font: Calibri, Office 2007 - 2010, Heading Font: Cambria, Body Font: Calibri)|compose.theme
+Compose|Options > Fonts|Customize Fonts...|compose.theme
+Compose|Options > Effects|Office|compose.theme
+Compose|Options > Effects|Office 2007 - 2010|compose.theme
+Compose|Options > Effects|Subtle Solids|compose.theme
+Compose|Options > Effects|Banded Edge|compose.theme
+Compose|Options > Effects|Smokey Glass|compose.theme
+Compose|Options > Effects|Glow Edge|compose.theme
+Compose|Options > Effects|Grunge Texture|compose.theme
+Compose|Options > Effects|Frosted Glass|compose.theme
+Compose|Options > Effects|Top Shadow|compose.theme
+Compose|Options > Effects|Inset|compose.theme
+Compose|Options > Effects|Milk Glass|compose.theme
+Compose|Options > Effects|Riblet|compose.theme
+Compose|Options > Effects|Reflection|compose.theme
+Compose|Options > Effects|Extreme Shadow|compose.theme
+Compose|Options > Effects|Glossy|compose.theme
+Compose|Options > More Options|Connect to Rights Management Servers and get templates|-|Rights Management (IRM) templates come from an Azure RMS / Microsoft 365 tenant
+Compose|Options > Use Voting Buttons|Approve;Reject|compose.votingButtons
+Compose|Options > Use Voting Buttons|Yes;No|compose.votingButtons
+Compose|Options > Use Voting Buttons|Yes;No;Maybe|compose.votingButtons
+Compose|Options > Use Voting Buttons|Custom...|compose.votingButtons
+Compose|Options > Save Sent Item To|Other Folder...|compose.saveSentItemTo
+Compose|Options > Save Sent Item To|Use Default Folder|compose.saveSentItemTo
+Compose|Options > Save Sent Item To|Do Not Save|compose.saveSentItemTo
+Compose|Format Text › Clipboard|Paste|format.paste
+Compose|Format Text › Clipboard|Cut|format.cut
+Compose|Format Text › Clipboard|Copy|format.copy
+Compose|Format Text › Clipboard|Format Painter|format.formatPainter
+Compose|Format Text › Clipboard|Office Clipboard...|format.clipboardPane
+Compose|Format Text › Format|HTML|compose.format
+Compose|Format Text › Format|Plain Text|compose.format
+Compose|Format Text › Format|Rich Text|compose.format
+Compose|Format Text › Font|Font|format.font
+Compose|Format Text › Font|Font Size|format.fontSize
+Compose|Format Text › Font|Grow Font|format.growFont
+Compose|Format Text › Font|Shrink Font|format.shrinkFont
+Compose|Format Text › Font|Change Case|format.changeCase
+Compose|Format Text › Font|Clear Formatting|format.clearFormatting
+Compose|Format Text › Font|Bold|format.bold
+Compose|Format Text › Font|Italic|format.italic
+Compose|Format Text › Font|Underline|format.underline
+Compose|Format Text › Font|Strikethrough|format.strike
+Compose|Format Text › Font|Subscript|format.sub
+Compose|Format Text › Font|Superscript|format.sup
+Compose|Format Text › Font|Text Highlight Color|format.highlight
+Compose|Format Text › Font|Text Highlight Color Yellow|format.highlight
+Compose|Format Text › Font|Font Color|format.color
+Compose|Format Text › Font|Font Color Red|format.color
+Compose|Format Text › Font|Font...|format.fontDialog
+Compose|Format Text › Paragraph|Bullets|format.bullets
+Compose|Format Text › Paragraph|Numbering|format.numbering
+Compose|Format Text › Paragraph|Multilevel List|format.multilevel
+Compose|Format Text › Paragraph|Decrease Indent|format.outdent
+Compose|Format Text › Paragraph|Increase Indent|format.indent
+Compose|Format Text › Paragraph|Sort...|format.sort
+Compose|Format Text › Paragraph|Show All|format.showMarks
+Compose|Format Text › Paragraph|Align Left|format.align
+Compose|Format Text › Paragraph|Center|format.align
+Compose|Format Text › Paragraph|Align Right|format.align
+Compose|Format Text › Paragraph|Justify|format.align
+Compose|Format Text › Paragraph|Line and Paragraph Spacing|format.lineSpacing
+Compose|Format Text › Paragraph|Shading|format.shading
+Compose|Format Text › Paragraph|Shading RGB(0, 0, 0)|format.shading
+Compose|Format Text › Paragraph|Borders|format.borders
+Compose|Format Text › Paragraph|Paragraph...|format.paragraphDialog
+Compose|Format Text › Styles|¶ Normal|format.style
+Compose|Format Text › Styles|¶ No Spacing|format.style
+Compose|Format Text › Styles|Heading 1|format.style
+Compose|Format Text › Styles|Heading 2|format.style
+Compose|Format Text › Styles|Title|format.style
+Compose|Format Text › Styles|Subtitle|format.style
+Compose|Format Text › Styles|Subtle Emphasis|format.style
+Compose|Format Text › Styles|Emphasis|format.style
+Compose|Format Text › Styles|Intense Emphasis|format.style
+Compose|Format Text › Styles|Strong|format.style
+Compose|Format Text › Styles|Quote|format.style
+Compose|Format Text › Styles|Intense Quote|format.style
+Compose|Format Text › Styles|Subtle Reference|format.style
+Compose|Format Text › Styles|Intense Reference|format.style
+Compose|Format Text › Styles|Book Title|format.style
+Compose|Format Text › Styles|¶ List Paragraph|format.style
+Compose|Format Text › Styles|Styles|format.style
+Compose|Format Text › Styles|Change Styles|format.styleSet
+Compose|Format Text › Styles|Styles...|format.stylesPane
+Compose|Format Text › Editing|Find...|format.find
+Compose|Format Text › Editing|Replace...|format.replace
+Compose|Format Text › Editing|Select|format.selectAll
+Compose|Format Text › Zoom|Zoom...|format.zoom
+Compose|Format Text > More Options|(gallery of 109 items, e.g. Paste, Yellow, Bright Green)|format.paste
+Compose|Format Text > More Options|Paste Special...|format.pasteSpecial
+Compose|Format Text > More Options|Set Default Paste...|options.open
+Compose|Format Text > Font|(gallery of 532 items, e.g. Aptos Display (Headings), Aptos (Body), Abadi, select to download)|format.font
+Compose|Format Text > Font Size|8|format.fontSize
+Compose|Format Text > Font Size|9|format.fontSize
+Compose|Format Text > Font Size|10|format.fontSize
+Compose|Format Text > Font Size|11|format.fontSize
+Compose|Format Text > Font Size|12|format.fontSize
+Compose|Format Text > Font Size|14|format.fontSize
+Compose|Format Text > Font Size|16|format.fontSize
+Compose|Format Text > Font Size|18|format.fontSize
+Compose|Format Text > Font Size|20|format.fontSize
+Compose|Format Text > Font Size|22|format.fontSize
+Compose|Format Text > Font Size|24|format.fontSize
+Compose|Format Text > Font Size|26|format.fontSize
+Compose|Format Text > Font Size|28|format.fontSize
+Compose|Format Text > Font Size|36|format.fontSize
+Compose|Format Text > Font Size|48|format.fontSize
+Compose|Format Text > Font Size|72|format.fontSize
+Compose|Format Text > Change Case|Sentence case.|format.changeCase
+Compose|Format Text > Change Case|lowercase|format.changeCase
+Compose|Format Text > Change Case|UPPERCASE|format.changeCase
+Compose|Format Text > Change Case|Capitalize Each Word|format.changeCase
+Compose|Format Text > Change Case|tOGGLE cASE|format.changeCase
+Compose|Format Text > More Options|High-contrast only|format.highlight
+Compose|Format Text > More Options|Stop Highlighting|format.highlight
+Compose|Format Text > More Options|More Colors...|format.color
+Compose|Format Text > More Options|Change List Level|format.indent
+Compose|Format Text > More Options|Define New Bullet...|format.bullets
+Compose|Format Text > More Options|Define New Number Format...|format.numbering
+Compose|Format Text > More Options|Set Numbering Value...|format.numbering
+Compose|Format Text > Multilevel List|All|format.multilevel
+Compose|Format Text > Multilevel List|Gallery Filter|format.multilevel
+Compose|Format Text > Multilevel List|Outline numbered: L1: Numbered, 1, 2, 3, …, ALIGNMENT Left, Number Format: 1., Aligned at:  0.25|format.multilevel
+Compose|Format Text > Multilevel List|None|format.multilevel
+Compose|Format Text > Multilevel List|Outline numbered: L1: Numbered, 1, 2, 3, …, ALIGNMENT Left, Number Format: 1), Aligned at:  0|format.multilevel
+Compose|Format Text > Multilevel List|Outline numbered: L1: Numbered, 1, 2, 3, …, ALIGNMENT Left, Number Format: 1., Aligned at:  0|format.multilevel
+Compose|Format Text > Multilevel List|Outline numbered: L1: Bulleted, Four Small Diamonds, Aligned at:  0|format.multilevel
+Compose|Format Text > Multilevel List|Outline numbered: L1: Numbered, I, II, III, …, ALIGNMENT Left, Number Format: Article I., Aligned at:  0|format.multilevel
+Compose|Format Text > Multilevel List|Outline numbered: L1: Numbered, 1, 2, 3, …, ALIGNMENT Left, Number Format: 1, Aligned at:  0|format.multilevel
+Compose|Format Text > Multilevel List|Outline numbered: L1: Numbered, I, II, III, …, ALIGNMENT Left, Number Format: I., Aligned at:  0|format.multilevel
+Compose|Format Text > Multilevel List|Outline numbered: L1: Numbered, 1, 2, 3, …, ALIGNMENT Left, Number Format: Chapter 1, Aligned at:  0|format.multilevel
+Compose|Format Text > Multilevel List|Change List Level|format.indent
+Compose|Format Text > Multilevel List|Define New Multilevel List...|format.multilevel
+Compose|Format Text > Multilevel List|Define New List Style...|format.multilevel
+Compose|Format Text > Multilevel List > All|All|format.multilevel
+Compose|Format Text > Multilevel List > All|Current List|format.multilevel
+Compose|Format Text > Multilevel List > All|List Library|format.multilevel
+Compose|Format Text > Multilevel List > Gallery Filter|All|format.multilevel
+Compose|Format Text > Multilevel List > Gallery Filter|Current List|format.multilevel
+Compose|Format Text > Multilevel List > Gallery Filter|List Library|format.multilevel
+Compose|Format Text > Line and Paragraph Spacing|1.0|format.lineSpacing
+Compose|Format Text > Line and Paragraph Spacing|1.15|format.lineSpacing
+Compose|Format Text > Line and Paragraph Spacing|1.5|format.lineSpacing
+Compose|Format Text > Line and Paragraph Spacing|2.0|format.lineSpacing
+Compose|Format Text > Line and Paragraph Spacing|2.5|format.lineSpacing
+Compose|Format Text > Line and Paragraph Spacing|3.0|format.lineSpacing
+Compose|Format Text > Line and Paragraph Spacing|Line Spacing Options…|format.paragraphDialog
+Compose|Format Text > Line and Paragraph Spacing|Add Space Before Paragraph|format.paragraphSpacing
+Compose|Format Text > Line and Paragraph Spacing|Add Space After Paragraph|format.paragraphSpacing
+Compose|Format Text > More Options|Horizontal Line|insert.horizontalLine
+Compose|Format Text > More Options|Draw Table|insert.table
+Compose|Format Text > More Options|View Gridlines|format.showGridlines
+Compose|Format Text > More Options|Borders and Shading...|format.borders
+Compose|Format Text >|¶ Normal|format.style
+Compose|Format Text >|¶ No Spacing|format.style
+Compose|Format Text >|Heading 1|format.style
+Compose|Format Text >|Heading 2|format.style
+Compose|Format Text >|Title|format.style
+Compose|Format Text >|Subtitle|format.style
+Compose|Format Text >|Subtle Emphasis|format.style
+Compose|Format Text >|Emphasis|format.style
+Compose|Format Text >|Intense Emphasis|format.style
+Compose|Format Text >|Strong|format.style
+Compose|Format Text >|Quote|format.style
+Compose|Format Text >|Intense Quote|format.style
+Compose|Format Text >|Subtle Reference|format.style
+Compose|Format Text >|Intense Reference|format.style
+Compose|Format Text >|Book Title|format.style
+Compose|Format Text >|¶ List Paragraph|format.style
+Compose|Format Text >|Create a Style|format.style
+Compose|Format Text >|Clear Formatting|format.clearFormatting
+Compose|Format Text >|Apply Styles...|format.stylesPane
+Compose|Format Text > Styles|¶ Normal|format.style
+Compose|Format Text > Styles|¶ No Spacing|format.style
+Compose|Format Text > Styles|Heading 1|format.style
+Compose|Format Text > Styles|Heading 2|format.style
+Compose|Format Text > Styles|Title|format.style
+Compose|Format Text > Styles|Subtitle|format.style
+Compose|Format Text > Styles|Subtle Emphasis|format.style
+Compose|Format Text > Styles|Emphasis|format.style
+Compose|Format Text > Styles|Intense Emphasis|format.style
+Compose|Format Text > Styles|Strong|format.style
+Compose|Format Text > Styles|Quote|format.style
+Compose|Format Text > Styles|Intense Quote|format.style
+Compose|Format Text > Styles|Subtle Reference|format.style
+Compose|Format Text > Styles|Intense Reference|format.style
+Compose|Format Text > Styles|Book Title|format.style
+Compose|Format Text > Styles|¶ List Paragraph|format.style
+Compose|Format Text > Styles|Create a Style|format.style
+Compose|Format Text > Styles|Clear Formatting|format.clearFormatting
+Compose|Format Text > Styles|Apply Styles...|format.stylesPane
+Compose|Format Text > Change Styles|Style Set|format.styleSet
+Compose|Format Text > Change Styles|Colors|compose.theme
+Compose|Format Text > Change Styles|Fonts|compose.theme
+Compose|Format Text > Change Styles|Paragraph Spacing|format.styleSet
+Compose|Format Text > Change Styles|Set as Default|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Document|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Basic (Elegant)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Basic (Simple)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Basic (Stylish)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Black & White (Capitalized)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Black & White (Classic)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Black & White (Numbered)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Black & White (Word 2013)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Casual|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Centered|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Lines (Distinctive)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Lines (Simple)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Lines (Stylish)|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Minimalist|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Shaded|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Word|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Word 2003|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Word 2010|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Word 2013|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Reset to the Default Style Set|format.styleSet
+Compose|Format Text > Change Styles > Style Set|Save as a New Style Set...|format.styleSet
+Compose|Format Text > Change Styles > Colors|(gallery of 24 items, e.g. Office, Office 2013 - 2022, Office 2007 - 2010)|compose.theme
+Compose|Format Text > Change Styles > Colors|Customize Colors...|compose.theme
+Compose|Format Text > Change Styles > Fonts|(gallery of 26 items, e.g. Office, Heading Font: Aptos Display, Body Font: Aptos, Office 2013 - 2022, Heading Font: Calibri Light, Body Font: Calibri, Office 2007 - 2010, Heading Font: Cambria, Body Font: Calibri)|compose.theme
+Compose|Format Text > Change Styles > Fonts|Customize Fonts...|compose.theme
+Compose|Format Text > Change Styles > Paragraph Spacing|Default|format.styleSet
+Compose|Format Text > Change Styles > Paragraph Spacing|No Paragraph Space|format.styleSet
+Compose|Format Text > Change Styles > Paragraph Spacing|Compact|format.styleSet
+Compose|Format Text > Change Styles > Paragraph Spacing|Tight|format.styleSet
+Compose|Format Text > Change Styles > Paragraph Spacing|Relaxed|format.styleSet
+Compose|Format Text > Change Styles > Paragraph Spacing|Double|format.styleSet
+Compose|Format Text > Change Styles > Paragraph Spacing|Custom Paragraph Spacing...|format.styleSet
+Compose|Format Text > More Options|Find...|format.find
+Compose|Format Text > More Options|Go To...|format.goTo
+Compose|Format Text > Select|Select All|format.selectAll
+Compose|Format Text > Select|Select Objects|format.selectObjects
+Compose|Format Text > Select|Select All Text With Similar Formatting (No Data)|format.selectSimilar
+Compose|Format Text > Select|Selection Pane...|format.selectionPane
+Compose|Review › Editor|Spelling and Grammar|review.spelling
+Compose|Review › Editor|Editor|review.spelling
+Compose|Review › Editor|Thesaurus...|review.thesaurus
+Compose|Review › Editor|Word Count|review.wordCount
+Compose|Review › Speech|Read Aloud|review.readAloud
+Compose|Review › Accessibility|Check Accessibility|review.accessibility
+Compose|Review › Insights|Smart Lookup|-|Smart Lookup is a Bing-powered online search service
+Compose|Review › Language|Language|review.language
+Compose|Review > More Options|Spelling|review.spelling
+Compose|Review > More Options|Spelling and Grammar|review.spelling
+Compose|Review > Language|Set Proofing Language...|review.language
+Compose|Review > Language|Language Preferences...|options.open
+Compose|Help › Help|Help|help.help
+Compose|Help › Help|Contact Support...|help.contactSupport
+Compose|Help › Help|Feedback|help.feedback
+Compose|Help › Help|Suggest a Feature|help.feedback
+Compose|Help › Help|Show Training|help.showTraining
+Compose|Help › Help|What's New|help.whatsNew
+Compose|Help › Help|Support Tool|-|Support Tool launches the Microsoft Support and Recovery Assistant cloud service
+Compose|Help › Tools|Get Diagnostics|-|Get Diagnostics runs Microsoft online diagnostics for Microsoft 365 accounts

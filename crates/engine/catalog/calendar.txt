@@ -1,0 +1,139 @@
+Calendar|Home › New|New Appointment|mail.newItem
+Calendar|Home › New|New Meeting|mail.newItem
+Calendar|Home › New|Add Focus Time|-|Viva Insights focus-time service (cloud-only)
+Calendar|Home › New|New Items|mail.newItem
+Calendar|Home › Go To|Today|calendar.today
+Calendar|Home › Go To|Next 7 Days|calendar.next7Days
+Calendar|Home › Go To|Go to Date...|calendar.goToDate
+Calendar|Home › Arrange|Day|calendar.arrange
+Calendar|Home › Arrange|Work Week|calendar.arrange
+Calendar|Home › Arrange|Week|calendar.arrange
+Calendar|Home › Arrange|Month|calendar.arrange
+Calendar|Home › Arrange|Schedule View|calendar.arrange
+Calendar|Home › Arrange|Calendar Options...|options.open
+Calendar|Home › Work Location|Work Location|-|Microsoft 365 work location service (tenant-only)
+Calendar|Home › Work Location|Work Hours and Location Settings|options.open
+Calendar|Home › Manage Calendars|Add Calendar|calendar.addCalendar
+Calendar|Home › Manage Calendars|Share Calendar|calendar.share
+Calendar|Home › Groups|New Group|-|Microsoft 365 Groups (cloud-only)
+Calendar|Home › Groups|Browse Groups|-|Microsoft 365 Groups (cloud-only)
+Calendar|Home › Find|Search People|people.search
+Calendar|Home › Find|Address Book...|compose.addressBook
+Calendar|Home > New Items|E-mail Message|mail.newEmail
+Calendar|Home > New Items|Storyline Post|-|Viva Engage storyline (cloud-only)
+Calendar|Home > New Items|Desk|-|Microsoft Places desk booking (cloud-only)
+Calendar|Home > New Items|Appointment|mail.newItem
+Calendar|Home > New Items|Meeting|mail.newItem
+Calendar|Home > New Items|Group|-|Microsoft 365 Groups (cloud-only)
+Calendar|Home > New Items|Contact|mail.newItem
+Calendar|Home > New Items|Task|mail.newItem
+Calendar|Home > New Items|All Day Event|mail.newItem
+Calendar|Home > New Items|Meeting with All|mail.replyWithMeeting
+Calendar|Home > New Items|More Items|mail.newItem
+Calendar|Home > New Items > More Items|Recurring Appointment|mail.newItem
+Calendar|Home > New Items > More Items|Recurring Meeting|mail.newItem
+Calendar|Home > New Items > More Items|Recurring Event|mail.newItem
+Calendar|Home > New Items > More Items|Contact Group|mail.newItem
+Calendar|Home > New Items > More Items|Task Request|mail.newItem
+Calendar|Home > New Items > More Items|Internet Fax|-|requires a third-party internet fax service provider
+Calendar|Home > New Items > More Items|Choose Form...|mail.newItem
+Calendar|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+Calendar|Home > Add Calendar|From Address Book...|calendar.addCalendar
+Calendar|Home > Add Calendar|From Room List...|calendar.addCalendar
+Calendar|Home > Add Calendar|From Internet...|calendar.addCalendar
+Calendar|Home > Add Calendar|Create New Blank Calendar...|folder.new
+Calendar|Home > Add Calendar|Open Shared Calendar...|calendar.addCalendar
+Calendar|Home > Share Calendar|Calendar|calendar.share
+Calendar|Send / Receive › Send & Receive|Send/Receive All Folders|sendReceive.all
+Calendar|Send / Receive › Send & Receive|Update Folder|sendReceive.folder
+Calendar|Send / Receive › Send & Receive|Send All|sendReceive.sendAll
+Calendar|Send / Receive › Send & Receive|Send/Receive Groups|sendReceive.group
+Calendar|Send / Receive › Download|Show Progress...|sendReceive.showProgress
+Calendar|Send / Receive › Download|Cancel All|sendReceive.cancelAll
+Calendar|Send / Receive › Preferences|Download Preferences|sendReceive.preferences
+Calendar|Send / Receive › Preferences|Work Offline|sendReceive.workOffline
+Calendar|Send / Receive > Send/Receive Groups|0|sendReceive.group
+Calendar|Send / Receive > Send/Receive Groups|Inbox|sendReceive.group
+Calendar|Send / Receive > Download Preferences|Download Full Items|sendReceive.preferences
+Calendar|Send / Receive > Download Preferences|Download Headers and Then Full Items|sendReceive.preferences
+Calendar|Send / Receive > Download Preferences|Download Headers|sendReceive.preferences
+Calendar|Send / Receive > Download Preferences|On Slow Connections Download Only Headers|sendReceive.preferences
+Calendar|Folder › New|New Calendar...|folder.new
+Calendar|Folder › Actions|Rename Calendar|folder.rename
+Calendar|Folder › Actions|Copy Calendar|folder.copy
+Calendar|Folder › Actions|Move Calendar|folder.move
+Calendar|Folder › Actions|Delete Calendar|folder.delete
+Calendar|Folder › Share|Add Calendar|calendar.addCalendar
+Calendar|Folder › Share|Share Calendar|calendar.share
+Calendar|Folder › Properties|Calendar Properties|folder.properties
+Calendar|Folder > Add Calendar|From Address Book...|calendar.addCalendar
+Calendar|Folder > Add Calendar|From Room List...|calendar.addCalendar
+Calendar|Folder > Add Calendar|From Internet...|calendar.addCalendar
+Calendar|Folder > Add Calendar|Create New Blank Calendar...|folder.new
+Calendar|Folder > Add Calendar|Open Shared Calendar...|calendar.addCalendar
+Calendar|Folder > Share Calendar|Calendar|calendar.share
+Calendar|View › Current View|Change View|view.changeView
+Calendar|View › Current View|View Settings...|view.viewSettings
+Calendar|View › Current View|Reset View|view.resetView
+Calendar|View › Arrangement|Day|calendar.arrange
+Calendar|View › Arrangement|Work Week|calendar.arrange
+Calendar|View › Arrangement|Week|calendar.arrange
+Calendar|View › Arrangement|Month|calendar.arrange
+Calendar|View › Arrangement|Schedule View|calendar.arrange
+Calendar|View › Arrangement|Time Scale|calendar.timeScale
+Calendar|View › Arrangement|Overlay|calendar.overlay
+Calendar|View › Arrangement|Working Hours|calendar.workingHours
+Calendar|View › Arrangement|Calendar Options...|options.open
+Calendar|View › Color|Color|calendar.color
+Calendar|View › Layout|Use Tighter Spacing|view.tighterSpacing
+Calendar|View › Layout|Daily Task List|calendar.dailyTaskList
+Calendar|View › Layout|Folder Pane|view.folderPane
+Calendar|View › Layout|Reading Pane|view.readingPane
+Calendar|View › Layout|To-Do Bar|view.todoBar
+Calendar|View › Window|Reminders Window|view.reminderWindow
+Calendar|View › Window|Open in New Window|folder.openInNewWindow
+Calendar|View › Window|Close All Items|app.closeAllItems
+Calendar|View › Immersive Reader|Immersive Reader|-|Immersive Reader is a Microsoft cloud reading service
+Calendar|View > Change View|Calendar|view.changeView
+Calendar|View > Change View|Preview|view.changeView
+Calendar|View > Change View|List|view.changeView
+Calendar|View > Change View|Active|view.changeView
+Calendar|View > Change View|Manage Views...|view.manageViews
+Calendar|View > Change View|Save Current View As a New View...|view.saveViewAs
+Calendar|View > Change View|Apply Current View to Other Calendar Folders...|view.applyViewTo
+Calendar|View > Time Scale|60 Minutes - Least Space for Details|calendar.timeScale
+Calendar|View > Time Scale|30 Minutes|calendar.timeScale
+Calendar|View > Time Scale|15 Minutes|calendar.timeScale
+Calendar|View > Time Scale|10 Minutes|calendar.timeScale
+Calendar|View > Time Scale|6 Minutes|calendar.timeScale
+Calendar|View > Time Scale|5 Minutes - Most Space for Details|calendar.timeScale
+Calendar|View > Time Scale|Change Time Zone...|calendar.changeTimeZone
+Calendar|View > Color|Automatic|calendar.color
+Calendar|View > Color|Blue|calendar.color
+Calendar|View > Color|Green|calendar.color
+Calendar|View > Color|Orange|calendar.color
+Calendar|View > Color|Navy Blue|calendar.color
+Calendar|View > Color|Yellow|calendar.color
+Calendar|View > Color|Teal|calendar.color
+Calendar|View > Color|Magenta|calendar.color
+Calendar|View > Color|Brown|calendar.color
+Calendar|View > Color|Dark Red|calendar.color
+Calendar|View > Folder Pane|Normal|view.folderPane
+Calendar|View > Folder Pane|Minimized|view.folderPane
+Calendar|View > Folder Pane|Off|view.folderPane
+Calendar|View > Reading Pane|Right|view.readingPane
+Calendar|View > Reading Pane|Bottom|view.readingPane
+Calendar|View > Reading Pane|Off|view.readingPane
+Calendar|View > Reading Pane|Options...|options.open
+Calendar|View > To-Do Bar|Calendar|view.todoBar
+Calendar|View > To-Do Bar|People|view.todoBar
+Calendar|View > To-Do Bar|Tasks|view.todoBar
+Calendar|View > To-Do Bar|Off|view.todoBar
+Calendar|Help › Help|Help|help.help
+Calendar|Help › Help|Contact Support...|help.contactSupport
+Calendar|Help › Help|Feedback|help.feedback
+Calendar|Help › Help|Suggest a Feature|help.feedback
+Calendar|Help › Help|Show Training|help.showTraining
+Calendar|Help › Help|What's New|help.whatsNew
+Calendar|Help › Help|Support Tool|-|launches the Microsoft support and recovery service tool
+Calendar|Help › Tools|Get Diagnostics|-|Microsoft cloud diagnostics service

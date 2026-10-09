@@ -1,0 +1,27 @@
+[package]
+name = "mailcraft-engine"
+description = "MailCraft engine: session, undo, command registry, Outlook feature catalog, sample mailbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-geom.workspace = true
+mailcraft-mime.workspace = true
+mailcraft-model.workspace = true
+mailcraft-store.workspace = true
+mailcraft-html.workspace = true
+mailcraft-layout.workspace = true
+mailcraft-fonts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

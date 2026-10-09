@@ -1,0 +1,150 @@
+Tasks|Home › New|New Task|tasks.new
+Tasks|Home › New|New Email|mail.newEmail
+Tasks|Home › New|New Items|mail.newItem
+Tasks|Home › Delete|Delete|mail.delete
+Tasks|Home › Respond|Reply|mail.reply
+Tasks|Home › Respond|Reply All|mail.replyAll
+Tasks|Home › Respond|Forward|mail.forward
+Tasks|Home › Respond|Meeting|mail.replyWithMeeting
+Tasks|Home › Respond|More|mail.forwardAsAttachment
+Tasks|Home › Manage Task|Mark Complete|mail.markComplete
+Tasks|Home › Manage Task|Remove from List|tasks.removeFromList
+Tasks|Home › Follow Up|Today|mail.flag
+Tasks|Home › Follow Up|Tomorrow|mail.flag
+Tasks|Home › Follow Up|This Week|mail.flag
+Tasks|Home › Follow Up|Next Week|mail.flag
+Tasks|Home › Follow Up|No Date|mail.flag
+Tasks|Home › Follow Up|Custom...|mail.flagCustom
+Tasks|Home › Current View|Detailed|view.changeView
+Tasks|Home › Current View|Simple List|view.changeView
+Tasks|Home › Current View|To-Do List|view.changeView
+Tasks|Home › Current View|Prioritized|view.changeView
+Tasks|Home › Current View|Active|view.changeView
+Tasks|Home › Current View|Completed|view.changeView
+Tasks|Home › Current View|Today|view.changeView
+Tasks|Home › Current View|Next 7 Days|view.changeView
+Tasks|Home › Current View|Overdue|view.changeView
+Tasks|Home › Current View|Assigned|view.changeView
+Tasks|Home › Current View|Server Tasks|view.changeView
+Tasks|Home › Current View|Change View|view.changeView
+Tasks|Home › Actions|Move|mail.move
+Tasks|Home › Actions|Send to OneNote|-|OneNote is a separate Microsoft app; no local equivalent
+Tasks|Home › Tags|Categorize|mail.categorize
+Tasks|Home › Tags|Private|mail.private
+Tasks|Home › Tags|High Importance|mail.importance
+Tasks|Home › Tags|Low Importance|mail.importance
+Tasks|Home › Groups|New Group|-|Microsoft 365 Groups are a cloud tenant service
+Tasks|Home › Groups|Browse Groups|-|Microsoft 365 Groups are a cloud tenant service
+Tasks|Home › Find|Search People|people.search
+Tasks|Home › Find|Address Book...|compose.addressBook
+Tasks|Home > New Items|E-mail Message|mail.newEmail
+Tasks|Home > New Items|Appointment|mail.newItem
+Tasks|Home > New Items|Meeting|mail.newItem
+Tasks|Home > New Items|Group|-|Microsoft 365 Groups are a cloud tenant service
+Tasks|Home > New Items|Contact|mail.newItem
+Tasks|Home > New Items|Task|tasks.new
+Tasks|Home > New Items|Task Request|mail.newItem
+Tasks|Home > New Items|More Items|mail.newItem
+Tasks|Home > New Items > More Items|Contact Group|mail.newItem
+Tasks|Home > New Items > More Items|Internet Fax|-|needs a third-party online fax service provider
+Tasks|Home > New Items > More Items|Choose Form...|mail.newItem
+Tasks|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+Tasks|Home >|Detailed|view.changeView
+Tasks|Home >|Simple List|view.changeView
+Tasks|Home >|To-Do List|view.changeView
+Tasks|Home >|Prioritized|view.changeView
+Tasks|Home >|Active|view.changeView
+Tasks|Home >|Completed|view.changeView
+Tasks|Home >|Today|view.changeView
+Tasks|Home >|Next 7 Days|view.changeView
+Tasks|Home >|Overdue|view.changeView
+Tasks|Home >|Assigned|view.changeView
+Tasks|Home >|Server Tasks|view.changeView
+Tasks|Home >|Manage Views...|view.manageViews
+Tasks|Home >|Save Current View As a New View...|view.saveViewAs
+Tasks|Home >|Apply Current View to Other Task Folders...|view.applyViewTo
+Tasks|Home > Change View|Detailed|view.changeView
+Tasks|Home > Change View|Simple List|view.changeView
+Tasks|Home > Change View|To-Do List|view.changeView
+Tasks|Home > Change View|Prioritized|view.changeView
+Tasks|Home > Change View|Active|view.changeView
+Tasks|Home > Change View|Completed|view.changeView
+Tasks|Home > Change View|Today|view.changeView
+Tasks|Home > Change View|Next 7 Days|view.changeView
+Tasks|Home > Change View|Overdue|view.changeView
+Tasks|Home > Change View|Assigned|view.changeView
+Tasks|Home > Change View|Server Tasks|view.changeView
+Tasks|Home > Change View|Manage Views...|view.manageViews
+Tasks|Home > Change View|Save Current View As a New View...|view.saveViewAs
+Tasks|Home > Change View|Apply Current View to Other Task Folders...|view.applyViewTo
+Tasks|View › Current View|Change View|view.changeView
+Tasks|View › Current View|View Settings...|view.viewSettings
+Tasks|View › Current View|Reset View|view.resetView
+Tasks|View › Arrangement|Message Preview|view.messagePreview
+Tasks|View › Arrangement|Categories|view.arrangeBy
+Tasks|View › Arrangement|Start Date|view.arrangeBy
+Tasks|View › Arrangement|Due Date|view.arrangeBy
+Tasks|View › Arrangement|Folder|view.arrangeBy
+Tasks|View › Arrangement|Type|view.arrangeBy
+Tasks|View › Arrangement|Importance|view.arrangeBy
+Tasks|View › Arrangement|Arrange By|view.arrangeBy
+Tasks|View › Arrangement|Reverse Sort|view.reverseSort
+Tasks|View › Arrangement|Add Columns|view.addColumns
+Tasks|View › Arrangement|Expand/Collapse|view.collapseGroup
+Tasks|View › Layout|Use Tighter Spacing|view.tighterSpacing
+Tasks|View › Layout|Folder Pane|view.folderPane
+Tasks|View › Layout|Reading Pane|view.readingPane
+Tasks|View › Layout|To-Do Bar|view.todoBar
+Tasks|View › Window|Reminders Window|view.reminderWindow
+Tasks|View › Window|Open in New Window|folder.openInNewWindow
+Tasks|View › Window|Close All Items|app.closeAllItems
+Tasks|View › Immersive Reader|Immersive Reader|-|Immersive Reader is a cloud Microsoft service
+Tasks|View > Change View|Detailed|view.changeView
+Tasks|View > Change View|Simple List|view.changeView
+Tasks|View > Change View|To-Do List|view.changeView
+Tasks|View > Change View|Prioritized|view.changeView
+Tasks|View > Change View|Active|view.changeView
+Tasks|View > Change View|Completed|view.changeView
+Tasks|View > Change View|Today|view.changeView
+Tasks|View > Change View|Next 7 Days|view.changeView
+Tasks|View > Change View|Overdue|view.changeView
+Tasks|View > Change View|Assigned|view.changeView
+Tasks|View > Change View|Server Tasks|view.changeView
+Tasks|View > Change View|Manage Views...|view.manageViews
+Tasks|View > Change View|Save Current View As a New View...|view.saveViewAs
+Tasks|View > Change View|Apply Current View to Other Task Folders...|view.applyViewTo
+Tasks|View > Message Preview|Off|view.messagePreview
+Tasks|View > Message Preview|1 Line|view.messagePreview
+Tasks|View > Message Preview|2 Lines|view.messagePreview
+Tasks|View > Message Preview|3 Lines|view.messagePreview
+Tasks|View >|Categories|view.arrangeBy
+Tasks|View >|Start Date|view.arrangeBy
+Tasks|View >|Due Date|view.arrangeBy
+Tasks|View >|Folder|view.arrangeBy
+Tasks|View >|Type|view.arrangeBy
+Tasks|View >|Importance|view.arrangeBy
+Tasks|View >|Show in Groups|view.showInGroups
+Tasks|View >|View Settings...|view.viewSettings
+Tasks|View > Arrange By|Categories|view.arrangeBy
+Tasks|View > Arrange By|Start Date|view.arrangeBy
+Tasks|View > Arrange By|Due Date|view.arrangeBy
+Tasks|View > Arrange By|Folder|view.arrangeBy
+Tasks|View > Arrange By|Type|view.arrangeBy
+Tasks|View > Arrange By|Importance|view.arrangeBy
+Tasks|View > Arrange By|Show in Groups|view.showInGroups
+Tasks|View > Arrange By|View Settings...|view.viewSettings
+Tasks|View > Expand/Collapse|Collapse This Group|view.collapseGroup
+Tasks|View > Expand/Collapse|Expand This Group|view.expandGroup
+Tasks|View > Expand/Collapse|Collapse All Groups|view.collapseAll
+Tasks|View > Expand/Collapse|Expand All Groups|view.expandAll
+Tasks|View > Folder Pane|Normal|view.folderPane
+Tasks|View > Folder Pane|Minimized|view.folderPane
+Tasks|View > Folder Pane|Off|view.folderPane
+Tasks|View > Reading Pane|Right|view.readingPane
+Tasks|View > Reading Pane|Bottom|view.readingPane
+Tasks|View > Reading Pane|Off|view.readingPane
+Tasks|View > Reading Pane|Options...|options.open
+Tasks|View > To-Do Bar|Calendar|view.todoBar
+Tasks|View > To-Do Bar|People|view.todoBar
+Tasks|View > To-Do Bar|Tasks|view.todoBar
+Tasks|View > To-Do Bar|Off|view.todoBar

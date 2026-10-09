@@ -1,0 +1,70 @@
+Notes|Home › New|New Note|notes.new
+Notes|Home › New|New Items|mail.newItem
+Notes|Home › Delete|Delete|mail.delete
+Notes|Home › Current View|Icon|view.changeView
+Notes|Home › Current View|Notes List|view.changeView
+Notes|Home › Current View|Last 7 Days|view.changeView
+Notes|Home › Current View|Change View|view.changeView
+Notes|Home › Actions|Forward|mail.forward
+Notes|Home › Actions|Move|mail.move
+Notes|Home › Tags|Categorize|mail.categorize
+Notes|Home › Groups|New Group|-|Microsoft 365 Groups are a cloud-only service
+Notes|Home › Groups|Browse Groups|-|Microsoft 365 Groups are a cloud-only service
+Notes|Home › Find|Search People|people.search
+Notes|Home › Find|Address Book...|compose.addressBook
+Notes|Home > New Items|E-mail Message|mail.newEmail
+Notes|Home > New Items|Appointment|mail.newItem
+Notes|Home > New Items|Meeting|mail.newItem
+Notes|Home > New Items|Group|-|Microsoft 365 Groups are a cloud-only service
+Notes|Home > New Items|Contact|mail.newItem
+Notes|Home > New Items|Task|mail.newItem
+Notes|Home > New Items|More Items|mail.newItem
+Notes|Home > New Items > More Items|Contact Group|mail.newItem
+Notes|Home > New Items > More Items|Task Request|mail.newItem
+Notes|Home > New Items > More Items|Internet Fax|-|Hands off to a third-party internet fax service; no local behaviour
+Notes|Home > New Items > More Items|Choose Form...|-|Custom Outlook form libraries (MAPI/Exchange forms) have no equivalent in MailCraft
+Notes|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+Notes|Home >|Icon|view.changeView
+Notes|Home >|Notes List|view.changeView
+Notes|Home >|Last 7 Days|view.changeView
+Notes|Home >|Manage Views...|view.manageViews
+Notes|Home >|Save Current View As a New View...|view.saveViewAs
+Notes|Home >|Apply Current View to Other Note Folders...|view.applyViewTo
+Notes|Home > Change View|Icon|view.changeView
+Notes|Home > Change View|Notes List|view.changeView
+Notes|Home > Change View|Last 7 Days|view.changeView
+Notes|Home > Change View|Manage Views...|view.manageViews
+Notes|Home > Change View|Save Current View As a New View...|view.saveViewAs
+Notes|Home > Change View|Apply Current View to Other Note Folders...|view.applyViewTo
+Notes|View › Current View|Change View|view.changeView
+Notes|View › Current View|View Settings...|view.viewSettings
+Notes|View › Current View|Reset View|view.resetView
+Notes|View › Arrangement|Large Icons|notes.iconView
+Notes|View › Arrangement|Small Icons|notes.iconView
+Notes|View › Arrangement|List|notes.iconView
+Notes|View › Arrangement|Line Up Icons|notes.lineUpIcons
+Notes|View › Layout|Use Tighter Spacing|view.tighterSpacing
+Notes|View › Layout|Folder Pane|view.folderPane
+Notes|View › Layout|Reading Pane|view.readingPane
+Notes|View › Layout|To-Do Bar|view.todoBar
+Notes|View › Window|Reminders Window|view.reminderWindow
+Notes|View › Window|Open in New Window|folder.openInNewWindow
+Notes|View › Window|Close All Items|app.closeAllItems
+Notes|View › Immersive Reader|Immersive Reader|-|Immersive Reader is a Microsoft cloud reading service
+Notes|View > Change View|Icon|view.changeView
+Notes|View > Change View|Notes List|view.changeView
+Notes|View > Change View|Last 7 Days|view.changeView
+Notes|View > Change View|Manage Views...|view.manageViews
+Notes|View > Change View|Save Current View As a New View...|view.saveViewAs
+Notes|View > Change View|Apply Current View to Other Note Folders...|view.applyViewTo
+Notes|View > Folder Pane|Normal|view.folderPane
+Notes|View > Folder Pane|Minimized|view.folderPane
+Notes|View > Folder Pane|Off|view.folderPane
+Notes|View > Reading Pane|Right|view.readingPane
+Notes|View > Reading Pane|Bottom|view.readingPane
+Notes|View > Reading Pane|Off|view.readingPane
+Notes|View > Reading Pane|Options...|options.open
+Notes|View > To-Do Bar|Calendar|view.todoBar
+Notes|View > To-Do Bar|People|view.todoBar
+Notes|View > To-Do Bar|Tasks|view.todoBar
+Notes|View > To-Do Bar|Off|view.todoBar

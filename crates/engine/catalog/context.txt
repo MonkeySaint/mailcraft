@@ -1,0 +1,237 @@
+Context|folder-Inbox|Open in New Window|folder.openInNewWindow
+Context|folder-Inbox|New Folder...|folder.new
+Context|folder-Inbox|Rename Folder|folder.rename
+Context|folder-Inbox|Copy Folder|folder.copy
+Context|folder-Inbox|Move Folder|folder.move
+Context|folder-Inbox|Delete Folder|folder.delete
+Context|folder-Inbox|Mark All as Read|folder.markAllRead
+Context|folder-Inbox|Clean Up Folder|mail.cleanUpFolder
+Context|folder-Inbox|Delete All|folder.deleteAll
+Context|folder-Inbox|Remove from Favorites|folder.removeFavorite
+Context|folder-Inbox|Sort Subfolders A to Z|folder.sortAZ
+Context|folder-Inbox|Move Up|folder.moveUp
+Context|folder-Inbox|Move Down|folder.moveDown
+Context|folder-Inbox|Properties...|folder.properties
+Context|account-root|Open in New Window|folder.openInNewWindow
+Context|account-root|Open File Location|file.openFileLocation
+Context|account-root|Remove|file.closeDataFile
+Context|account-root|New Folder...|folder.new
+Context|account-root|Manage All Site Mailboxes...|-|SharePoint site mailboxes need an Exchange/Microsoft 365 tenant
+Context|account-root|Add to Favorites|folder.addFavorite
+Context|account-root|Sort Subfolders A to Z|folder.sortAZ
+Context|account-root|Account Properties...|file.accountSettings
+Context|account-root|Folder Permissions|-|Exchange server folder delegation permissions; no server-side permission model locally
+Context|account-root|Data File Properties...|folder.properties
+Context|favorites-root|Mail|nav.mail
+Context|favorites-root|Calendar|nav.calendar
+Context|favorites-root|Copilot|-|Copilot is a Microsoft cloud AI service
+Context|favorites-root|People|nav.people
+Context|favorites-root|To Do|nav.tasks
+Context|favorites-root|Org Explorer|-|Org Explorer is a Microsoft 365 cloud service
+Context|favorites-root|More Apps|nav.folders
+Context|favorites-root|Focused|view.focusedTab
+Context|favorites-root|Other|view.focusedTab
+Context|favorites-root|Sort, arrange or filter messages|view.arrangeBy
+Context|favorites-root|Sort messages|view.reverseSort
+Context|favorites-root|Send/Receive All Folders|sendReceive.all
+Context|favorites-root|Undo|app.undo
+Context|favorites-root|Customize Quick Access Toolbar|app.quickAccess
+Context|favorites-root|Type to search and use the up and down arrow keys to navigate|search.focus
+Context|favorites-root|Search|search.focus
+Context|favorites-root|Account owner|-|Microsoft account sign-in/profile menu (cloud identity)
+Context|favorites-root|Your organization's administrator turned off the service required to use this feature.|-|tenant-controlled cloud service toggle, disabled by the organisation
+Context|favorites-root|Minimize|app.minimize
+Context|favorites-root|Restore Down|app.toggleMaximize
+Context|favorites-root|Close|file.exit
+Context|favorites-root|File Tab|file.info
+Context|favorites-root|Try the new Outlook|-|product upsell to switch to the new Outlook
+Context|favorites-root|New Email|mail.newEmail
+Context|favorites-root|New Items|mail.newItem
+Context|favorites-root|Ignore|mail.ignore
+Context|favorites-root|Clean Up|mail.cleanUpConversation
+Context|favorites-root|Block|mail.block
+Context|favorites-root|Delete|mail.delete
+Context|favorites-root|Archive...|mail.archive
+Context|favorites-root|Report|mail.report
+Context|favorites-root|Reply|mail.reply
+Context|favorites-root|Reply All|mail.replyAll
+Context|favorites-root|Forward|mail.forward
+Context|favorites-root|Meeting|mail.replyWithMeeting
+Context|favorites-root|More|mail.forwardAsAttachment
+Context|favorites-root|Share to Teams|-|Microsoft Teams integration
+Context|favorites-root|Manage Quick Steps...|quicksteps.manage
+Context|favorites-root|Move|mail.move
+Context|favorites-root|Rules|rules.createFromMessage
+Context|favorites-root|Send to OneNote|-|OneNote integration
+Context|favorites-root|Assign Policy|-|Exchange retention policies require a Microsoft 365 tenant
+Context|favorites-root|Unread/ Read|mail.toggleRead
+Context|favorites-root|Categorize|mail.categorize
+Context|favorites-root|Follow Up|mail.flag
+Context|favorites-root|New Group|-|Microsoft 365 Groups cloud service
+Context|favorites-root|Browse Groups|-|Microsoft 365 Groups cloud service
+Context|favorites-root|Search People|people.search
+Context|favorites-root|Address Book...|compose.addressBook
+Context|favorites-root|Filter Email|view.filter
+Context|favorites-root|Read Aloud|review.readAloud
+Context|favorites-root|All Apps|-|Office add-ins (Apps) store
+Context|favorites-root|Viva Insights|-|Viva Insights cloud add-in
+Context|favorites-root|Ribbon Display Options|app.toggleRibbonMode
+Context|favorites-root|Reminders 13|view.reminderWindow
+Context|favorites-root|Normal View. Show All Pinned Panes.|view.normalView
+Context|favorites-root|Reading View. Hide All Pinned Panes.|view.readingView
+Context|favorites-root|Click here to view more on Microsoft Exchange|-|link to Microsoft Exchange server web content
+Context|message-row|Copy|app.copy
+Context|message-row|Quick Print|mail.quickPrint
+Context|message-row|Reply|mail.reply
+Context|message-row|Reply All|mail.replyAll
+Context|message-row|Forward|mail.forward
+Context|message-row|Mark as Unread|mail.markUnread
+Context|message-row|Categorize|mail.categorize
+Context|message-row|Follow Up|mail.flag
+Context|message-row|Assign Policy|-|Exchange retention policies require a Microsoft 365 tenant
+Context|message-row|Find Related|mail.findRelated
+Context|message-row|Quick Steps|quicksteps.run
+Context|message-row|Set Quick Actions...|options.open
+Context|message-row|Rules|rules.createFromMessage
+Context|message-row|Move|mail.move
+Context|message-row|Send to OneNote|-|OneNote integration
+Context|message-row|Move to Other|mail.moveToOther
+Context|message-row|Always Move to Other|mail.alwaysMoveToOther
+Context|message-row|Ignore|mail.ignore
+Context|message-row|Report|mail.report
+Context|message-row|Block|mail.block
+Context|message-row|Delete|mail.delete
+Context|message-row|Archive...|mail.archive
+Context|ctx message-row > Categorize|Clear All Categories|mail.clearCategories
+Context|ctx message-row > Categorize|Blue category|mail.categorize
+Context|ctx message-row > Categorize|Green category|mail.categorize
+Context|ctx message-row > Categorize|Orange category|mail.categorize
+Context|ctx message-row > Categorize|Purple category|mail.categorize
+Context|ctx message-row > Categorize|Red category|mail.categorize
+Context|ctx message-row > Categorize|Yellow category|mail.categorize
+Context|ctx message-row > Categorize|All Categories...|mail.allCategories
+Context|ctx message-row > Categorize|Set Quick Click...|options.open
+Context|ctx message-row > Follow Up|Today|mail.flag
+Context|ctx message-row > Follow Up|Tomorrow|mail.flag
+Context|ctx message-row > Follow Up|This Week|mail.flag
+Context|ctx message-row > Follow Up|Next Week|mail.flag
+Context|ctx message-row > Follow Up|No Date|mail.flag
+Context|ctx message-row > Follow Up|Custom...|mail.flagCustom
+Context|ctx message-row > Follow Up|Add Reminder...|mail.flagCustom
+Context|ctx message-row > Follow Up|Mark Complete|mail.markComplete
+Context|ctx message-row > Follow Up|Clear Flag|mail.clearFlag
+Context|ctx message-row > Follow Up|Set Quick Click...|options.open
+Context|ctx message-row > Follow Up|Set Quick Actions...|options.open
+Context|ctx message-row > Assign Policy|1 Month Delete (30 days)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx message-row > Assign Policy|1 Week Delete (1 week)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx message-row > Assign Policy|1 Year Delete (1 year)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx message-row > Assign Policy|5 Year Delete (5 years)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx message-row > Assign Policy|6 Month Delete (6 months)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx message-row > Assign Policy|Never Delete (Never)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx message-row > Assign Policy|Use Folder Policy|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx message-row > Find Related|Messages in this Conversation|mail.findRelated
+Context|ctx message-row > Find Related|Messages from Sender|mail.findRelated
+Context|ctx message-row > Quick Steps|Move to: ?|quicksteps.run
+Context|ctx message-row > Quick Steps|To Manager|quicksteps.run
+Context|ctx message-row > Quick Steps|Team Email|quicksteps.run
+Context|ctx message-row > Quick Steps|Done|quicksteps.run
+Context|ctx message-row > Quick Steps|Reply & Delete|quicksteps.run
+Context|ctx message-row > Quick Steps|Create New|quicksteps.new
+Context|ctx message-row > Quick Steps|New Quick Step|quicksteps.new
+Context|ctx message-row > Quick Steps|Manage Quick Steps...|quicksteps.manage
+Context|ctx message-row > Rules|Create Rule...|rules.createFromMessage
+Context|ctx message-row > Rules|Manage Rules & Alerts...|rules.manage
+Context|ctx message-row > Move|Other Folder...|mail.move
+Context|ctx message-row > Move|Copy to Folder...|mail.copy
+Context|ctx message-row > Move|Always Move Messages in This Conversation...|mail.alwaysMoveConversation
+Context|ctx message-row > Report|Report Phishing|mail.report
+Context|ctx message-row > Report|Report Junk|mail.report
+Context|ctx message-row > Block|Block Sender|mail.block
+Context|ctx message-row > Block|Never Block Sender|mail.block
+Context|ctx message-row > Block|Never Block Sender's Domain (@example.com)|mail.block
+Context|ctx message-row > Block|Never Block this Group or Mailing List|mail.block
+Context|ctx message-row > Block|Junk E-mail Options...|mail.junk
+Context|status-bar|Quota Information Off|view.statusBar
+Context|status-bar|Filter|view.statusBar
+Context|status-bar|Items in View 7,219|view.statusBar
+Context|status-bar|Header Items in View|view.statusBar
+Context|status-bar|Unread Items in View 777|view.statusBar
+Context|status-bar|Unseen Items in View|view.statusBar
+Context|status-bar|Reminders 13|view.statusBar
+Context|status-bar|Group Notifications|view.statusBar
+Context|status-bar|View Shortcuts|view.statusBar
+Context|status-bar|Zoom Slider|view.statusBar
+Context|status-bar|Zoom 10%|view.statusBar
+Context|group-header|Collapse All Groups|view.collapseAll
+Context|group-header|Expand All Groups|view.expandAll
+Context|group-header|Copy|app.copy
+Context|group-header|Mark as Read|mail.markRead
+Context|group-header|Mark as Unread|mail.markUnread
+Context|group-header|Categorize|mail.categorize
+Context|group-header|Follow Up|mail.flag
+Context|group-header|Assign Policy|-|Exchange retention policies require a Microsoft 365 tenant
+Context|group-header|Quick Steps|quicksteps.run
+Context|group-header|Set Quick Actions...|options.open
+Context|group-header|Rules|rules.createFromMessage
+Context|group-header|Move|mail.move
+Context|group-header|Delete|mail.delete
+Context|ctx group-header > Categorize|Clear All Categories|mail.clearCategories
+Context|ctx group-header > Categorize|Blue category|mail.categorize
+Context|ctx group-header > Categorize|Green category|mail.categorize
+Context|ctx group-header > Categorize|Orange category|mail.categorize
+Context|ctx group-header > Categorize|Purple category|mail.categorize
+Context|ctx group-header > Categorize|Red category|mail.categorize
+Context|ctx group-header > Categorize|Yellow category|mail.categorize
+Context|ctx group-header > Categorize|All Categories...|mail.allCategories
+Context|ctx group-header > Categorize|Set Quick Click...|options.open
+Context|ctx group-header > Follow Up|Today|mail.flag
+Context|ctx group-header > Follow Up|Tomorrow|mail.flag
+Context|ctx group-header > Follow Up|This Week|mail.flag
+Context|ctx group-header > Follow Up|Next Week|mail.flag
+Context|ctx group-header > Follow Up|No Date|mail.flag
+Context|ctx group-header > Follow Up|Custom...|mail.flagCustom
+Context|ctx group-header > Follow Up|Add Reminder...|mail.flagCustom
+Context|ctx group-header > Follow Up|Mark Complete|mail.markComplete
+Context|ctx group-header > Follow Up|Clear Flag|mail.clearFlag
+Context|ctx group-header > Follow Up|Set Quick Click...|options.open
+Context|ctx group-header > Follow Up|Set Quick Actions...|options.open
+Context|ctx group-header > Assign Policy|1 Month Delete (30 days)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx group-header > Assign Policy|1 Week Delete (1 week)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx group-header > Assign Policy|1 Year Delete (1 year)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx group-header > Assign Policy|5 Year Delete (5 years)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx group-header > Assign Policy|6 Month Delete (6 months)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx group-header > Assign Policy|Never Delete (Never)|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx group-header > Assign Policy|Use Folder Policy|-|Exchange retention policies require a Microsoft 365 tenant
+Context|ctx group-header > Quick Steps|Move to: ?|quicksteps.run
+Context|ctx group-header > Quick Steps|To Manager|quicksteps.run
+Context|ctx group-header > Quick Steps|Team Email|quicksteps.run
+Context|ctx group-header > Quick Steps|Done|quicksteps.run
+Context|ctx group-header > Quick Steps|Reply & Delete|quicksteps.run
+Context|ctx group-header > Quick Steps|Create New|quicksteps.new
+Context|ctx group-header > Quick Steps|New Quick Step|quicksteps.new
+Context|ctx group-header > Quick Steps|Manage Quick Steps...|quicksteps.manage
+Context|ctx group-header > Rules|Create Rule...|rules.createFromMessage
+Context|ctx group-header > Rules|Manage Rules & Alerts...|rules.manage
+Context|ctx group-header > Move|Other Folder...|mail.move
+Context|ctx group-header > Move|Copy to Folder...|mail.copy
+Context|ctx group-header > Move|Always Move Messages in This Conversation...|mail.alwaysMoveConversation
+Context|sort menu|All Mail|view.filter
+Context|sort menu|Unread Mail|view.filter
+Context|sort menu|Flagged Mail|view.filter
+Context|sort menu|Mentioned Mail|view.filter
+Context|sort menu|Date|view.arrangeBy
+Context|sort menu|From|view.arrangeBy
+Context|sort menu|To|view.arrangeBy
+Context|sort menu|Categories|view.arrangeBy
+Context|sort menu|Flag Status|view.arrangeBy
+Context|sort menu|Flag: Start Date|view.arrangeBy
+Context|sort menu|Flag: Due Date|view.arrangeBy
+Context|sort menu|Size|view.arrangeBy
+Context|sort menu|Subject|view.arrangeBy
+Context|sort menu|Type|view.arrangeBy
+Context|sort menu|Attachments|view.arrangeBy
+Context|sort menu|Account|view.arrangeBy
+Context|sort menu|Importance|view.arrangeBy
+Context|sort menu|Newest on Top|view.sortOrder
+Context|sort menu|Oldest on Top|view.sortOrder
+Context|sort menu|Show Focused Inbox|view.focusedInbox
