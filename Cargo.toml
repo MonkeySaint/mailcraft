@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+description = "A clean-room, open-source desktop mail client modelled on the classic Outlook workflow"
+
+[workspace.dependencies]
+# internal
+mailcraft-geom = { path = "crates/geom" }
+mailcraft-mime = { path = "crates/mime" }
+mailcraft-model = { path = "crates/model" }
+mailcraft-fonts = { path = "crates/fonts" }
+mailcraft-store = { path = "crates/store" }
+mailcraft-html = { path = "crates/html" }
+mailcraft-layout = { path = "crates/layout" }
+mailcraft-render = { path = "crates/render" }
+
+# foundation
+thiserror = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+log = "0.4"
+proptest = "1"
+tempfile = "3"
+base64 = "0.23"
+encoding_rs = "0.8"
+unicode-segmentation = "1"
+unicode-linebreak = "0.1"
+unicode-width = "0.2"
+
+# text / rendering
+skrifa = "0.48"
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = 0

@@ -1,0 +1,17 @@
+[package]
+name = "mailcraft-html"
+description = "Tolerant HTML parsing and sanitising into MailCraft's rich-text model, and back"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-geom.workspace = true
+mailcraft-model.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

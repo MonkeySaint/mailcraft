@@ -1,0 +1,17 @@
+[package]
+name = "mailcraft-fonts"
+description = "Bundled open fonts (OFL), family matching and metrics for MailCraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-geom.workspace = true
+skrifa.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

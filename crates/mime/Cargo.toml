@@ -1,0 +1,19 @@
+[package]
+name = "mailcraft-mime"
+description = "Internet message parsing and building: RFC 5322, MIME (RFC 2045-2049), RFC 2047, RFC 2231"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+base64.workspace = true
+encoding_rs.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

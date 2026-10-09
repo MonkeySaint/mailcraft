@@ -1,0 +1,13 @@
+[package]
+name = "mailcraft-geom"
+description = "Units, points, sizes, rectangles and colours shared by every MailCraft crate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

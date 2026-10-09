@@ -1,0 +1,20 @@
+[package]
+name = "mailcraft-model"
+description = "MailCraft data model: accounts, folders, mail items, rich text, calendar, contacts, tasks, notes, rules, views"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-geom.workspace = true
+mailcraft-mime.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

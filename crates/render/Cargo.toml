@@ -1,0 +1,19 @@
+[package]
+name = "mailcraft-render"
+description = "Offscreen rasteriser for MailCraft display lists (screenshots, thumbnails, print preview)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-geom.workspace = true
+mailcraft-fonts.workspace = true
+mailcraft-layout.workspace = true
+tiny-skia.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

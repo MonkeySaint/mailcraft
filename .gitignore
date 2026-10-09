@@ -4,3 +4,4 @@ plan/
 /dist
 .DS_Store
 /.claude/
+/target-*/
