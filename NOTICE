@@ -1,0 +1,29 @@
+MailCraft
+Copyright (c) 2026 the MailCraft contributors.
+Licensed under the MIT License or the Apache License, Version 2.0, at your option
+(LICENSE-MIT, LICENSE-APACHE).
+
+MailCraft is an independent, clean-room project. It is not affiliated with, endorsed by or
+sponsored by Microsoft. "Outlook" is a trademark of Microsoft Corporation and is used here only
+to describe the workflow MailCraft is modelled on.
+
+Third-party material
+
+This product bundles third-party material under its own licenses, listed below. The per-file
+list (author, source, license) is in ATTRIBUTION.md.
+
+- Inter (assets/fonts/Inter-*.ttf): SIL Open Font License 1.1, see assets/fonts/OFL-Inter.txt.
+- Liberation Sans, Serif and Mono (assets/fonts/Liberation*.ttf): SIL Open Font License 1.1,
+  see assets/fonts/OFL-Liberation.txt.
+- Carlito (assets/fonts/Carlito-*.ttf): SIL Open Font License 1.1, see assets/fonts/OFL-Carlito.txt.
+- The app icon (assets/app-icon/) and all UI icons (assets/icons/) are original MailCraft artwork,
+  MIT OR Apache-2.0.
+
+egui's built-in fallback fonts (via the epaint_default_fonts crate: Ubuntu-Light under the Ubuntu Font
+Licence 1.0, Noto Emoji and emoji-icon-font under the SIL OFL 1.1) are compiled into the app for
+symbols and emoji.
+
+Rust dependencies (egui, eframe, skrifa, tiny-skia, encoding_rs, serde, …) are permissively
+licensed (MIT/Apache-2.0/BSD/ISC/Zlib/Unicode) and fetched through crates.io.
+
+No Microsoft icons, images, templates, fonts or other artwork are included.

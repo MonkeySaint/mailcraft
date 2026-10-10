@@ -1,0 +1,39 @@
+# Continuous integration on GitHub Actions.
+# Runs on the default `docker` runner label with a pinned Rust image.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  ci:
+    runs-on: docker
+    container:
+      image: rust:1.99-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages (egui/wgpu headless tests)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libgl1-mesa-dev mesa-vulkan-drivers
+      - name: Toolchain components
+        run: |
+          rustup component add rustfmt clippy
+          rustup target add wasm32-unknown-unknown
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+      - name: cargo xtask ci
+        run: cargo xtask ci

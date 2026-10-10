@@ -1,0 +1,7 @@
+# actionlint config for the GitHub workflows (run: actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml).
+self-hosted-runner:
+  labels:
+    - docker
+    - windows
+    - macos
+    - freebsd

@@ -1,0 +1,22 @@
+[package]
+name = "mailcraft-cli"
+description = "MailCraft command-line tool: commands, parity, run, show, import/export, MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mailcraft-cli"
+path = "src/main.rs"
+
+[dependencies]
+mailcraft-engine.workspace = true
+mailcraft-mcp.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

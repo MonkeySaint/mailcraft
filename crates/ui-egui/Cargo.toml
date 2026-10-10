@@ -20,10 +20,11 @@ serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
 # SVG rasterising for the app icon (Apache-2.0 OR MIT; same version egui_extras' svg loader uses).
-resvg = { version = "0.45.1", default-features = false }
+resvg.workspace = true
 
 [dev-dependencies]
-egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+egui_kittest = { workspace = true, features = ["wgpu"] }
+image.workspace = true
 
 [lints]
 workspace = true
