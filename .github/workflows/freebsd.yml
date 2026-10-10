@@ -1,0 +1,37 @@
+# FreeBSD build on demand: runs on a self-hosted runner with the `freebsd` label (a FreeBSD machine or VM
+# running github-runner in host mode; see docs/releasing.md for what it needs installed). Produces the same
+# files as the release job: mailcraft-VERSION-freebsd-ARCH.tar.gz and mailcraft-VERSION.pkg.
+name: freebsd
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Cargo profile (release or debug)
+        type: choice
+        options: [release, debug]
+        default: release
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  freebsd:
+    runs-on: freebsd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          uname -a
+          rustc --version
+          cargo --version
+      - name: Tests (engine and CLI)
+        run: cargo test --locked -p mailcraft-engine -p mailcraft-cli
+      - name: Build and package
+        run: bash packaging/freebsd/package.sh --build --profile "${{ inputs.profile }}" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-${{ inputs.profile }}
+          path: dist/
+          if-no-files-found: error
