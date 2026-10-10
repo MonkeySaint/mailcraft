@@ -1,0 +1,570 @@
+# Compose window ribbon (plan/outlook/ribbon-compose.md, responsive.md "Compose window"). Only the Classic
+# ribbon was observed; the Simplified ribbon is derived from it (every control small, one row). Grammar: see
+# main.ribbon. Commands get {"compose": <id>} added by the ribbon.
+
+surface compose
+mode classic
+
+tab Message | H
+group Clipboard | ZL | c1440=nolabel launch=format.clipboardPane
+split L | Paste | paste | format.paste | | V | menu=paste
+button S | Cut | cut | format.cut | | X
+button S | Copy | copy | format.copy | | C1
+toggle S | Format Painter | format-painter | format.formatPainter | | FP | on=painter
+group Basic Text | ZB | c900=collapse rows launch=format.fontDialog
+combo S | Font | | format.font | {"family":"$value"} | FF | menu=fonts w=118 on=value:font
+combo S | Font Size | | format.fontSize | {"pt":"$value"} | FS | menu=fontSizes w=44 on=value:size
+button I | Grow Font | zoom-in | format.growFont | | FG
+button I | Shrink Font | zoom-out | format.shrinkFont | | FK
+split I | Bullets | bullets | format.bullets | | U | menu=bullets on=bullets
+split I | Numbering | numbering | format.numbering | | N | menu=numbering on=numbering
+button I | Clear Formatting | format-painter | format.clearFormatting | | E
+br
+toggle I | Bold | bold | format.bold | | 1 | on=bold
+toggle I | Italic | italic | format.italic | | 2 | on=italic
+toggle I | Underline | underline | format.underline | | 3 | on=underline
+split I | Text Highlight Color | highlight | format.highlight | | I1 | menu=highlight
+split I | Font Color | font-color | format.color | | FC | menu=fontColor
+toggle I | Align Left | align-left | format.align | {"kind":"left"} | AL | on=align:left
+toggle I | Center | align-center | format.align | {"kind":"center"} | AC | on=align:center
+toggle I | Align Right | align-right | format.align | {"kind":"right"} | AR | on=align:right
+button I | Decrease Indent | outdent | format.outdent | | AO
+button I | Increase Indent | indent | format.indent | | AI
+group Names | ZN | c1100=collapse
+button L | Address Book... | address-book | compose.addressBook | | AB
+button L | Check Names | check-names | compose.checkNames | | M1
+group Include | ZC | c1420=small c1100=collapse
+drop L | Attach File... | attach | | | AF | menu=attachFile
+split L | Link | link | insert.link | | I2 | menu=link
+drop L | Signature | signature | | | AS | menu=signature
+group Tags | ZO | c1420=nolabel c1100=collapse launch=compose.messageOptions
+drop S | Follow Up | flag | | | W | menu=composeFollowUp
+toggle S | High Importance | importance-high | compose.importance | {"level":"high"} | H | on=imp:high oncmd=compose.importance{"level":"normal"}
+toggle S | Low Importance | importance-low | compose.importance | {"level":"low"} | L1 | on=imp:low oncmd=compose.importance{"level":"normal"}
+group Editor | Z5
+button L | Editor | spelling | review.spelling | | C2
+group Dark Mode | Z6
+toggle L | Switch Background | view | compose.switchBackground | | B | on=lightcanvas
+
+tab Insert | N
+group Include | ZC
+drop L | Attach File... | attach | | | AF | menu=attachFileInsert
+button L | Outlook Item | email | compose.attachItem | | AM
+drop L | Business Card | contact-group | | | AA | menu=businessCard
+button L | Calendar... | calendar | insert.calendar | | OC
+drop L | Signature | signature | | | AS | menu=signature
+group Tables | ZB
+drop L | Table | table | | | T | menu=table
+group Illustrations | ZI
+drop L | Pictures | picture | | | P | menu=pictures
+drop L | Shapes | new-items | | | SH | menu=shapes
+button L | Icons | categorize | insert.icon | | NS
+split L | 3D Models | picture | insert.model3d | | S3 | menu=models3d
+button L | SmartArt... | quick-steps | insert.smartArt | | M
+button L | Chart... | table | insert.chart | | C
+drop L | Screenshot | picture | | | SC | menu=screenshot
+group Links | ZL
+split L | Link | link | insert.link | | I | menu=link
+button L | Bookmark... | pin | insert.bookmark | | K
+group Text | ZT
+drop L | Text Box | note | | | X | menu=textBox
+drop L | Quick Parts | quick-steps | | | Q | menu=quickParts
+drop L | WordArt | font-color | | | W | menu=wordArt
+drop L | Drop Cap | bold | | | RC | menu=dropCap
+button S | Date & Time... | today | insert.dateTime | | D
+button S | Object... | new-items | insert.object | | J
+group Symbols | ZS
+split L | Equation | plus | insert.equation | | E | menu=equation
+drop L | Symbol | info | | | U | menu=symbol
+button L | Horizontal Line | minus | insert.horizontalLine | | H
+
+tab Options | P
+group Themes | ZT
+drop L | Themes | view | | | TH | menu=themes
+drop S | Colors | font-color | | | TC | menu=themeColors
+drop S | Fonts | bold | | | TF | menu=themeFonts
+drop S | Effects | highlight | | | TE | menu=themeEffects
+drop L | Page Color | font-color | | | PC | menu=pageColor
+group Show Fields | ZF
+toggle L | Bcc | person | compose.showBcc | {"on":"$!on"} | B | on=bcc
+toggle L | From | account | compose.showFrom | {"on":"$!on"} | F | on=from
+group Encrypt | ZP1
+toggle L | Encrypt | private | compose.encrypt | {"on":"$!on"} | PM | on=encrypt
+group Tracking | ZK | launch=compose.messageOptions
+drop L | Use Voting Buttons | check | | | V | menu=voting
+check S | Request a Delivery Receipt | check | compose.deliveryReceipt | {"on":"$!on"} | U | on=dr
+check S | Request a Read Receipt | read | compose.readReceipt | {"on":"$!on"} | Q | on=rr
+group More Options | ZP2 | launch=compose.messageOptions
+drop L | Save Sent Item To | sent | | | S | menu=saveSentTo
+toggle L | Delay Delivery | schedule | compose.delayDelivery | | D | on=delay oncmd=compose.delayDelivery{"at":null}
+toggle L | Direct Replies To | reply | compose.directRepliesTo | | I | on=replyto oncmd=compose.directRepliesTo{"addresses":""}
+
+tab Format Text | O
+group Clipboard | ZL | c1440=nolabel launch=format.clipboardPane
+split L | Paste | paste | format.paste | | V | menu=paste
+button S | Cut | cut | format.cut | | X
+button S | Copy | copy | format.copy | | C
+toggle S | Format Painter | format-painter | format.formatPainter | | FP | on=painter
+group Format | ZO
+toggle S | HTML | email | compose.format | {"kind":"html"} | TH | on=fmt:html
+toggle S | Plain Text | note | compose.format | {"kind":"plain"} | TP | on=fmt:plain
+toggle S | Rich Text | font-color | compose.format | {"kind":"rich"} | TR | on=fmt:rich
+group Font | ZF | rows c900=collapse launch=format.fontDialog
+combo S | Font | | format.font | {"family":"$value"} | FF | menu=fonts w=118 on=value:font
+combo S | Font Size | | format.fontSize | {"pt":"$value"} | FS | menu=fontSizes w=44 on=value:size
+button I | Grow Font | zoom-in | format.growFont | | FG
+button I | Shrink Font | zoom-out | format.shrinkFont | | FK
+drop I | Change Case | font-color | | | 7 | menu=changeCase
+button I | Clear Formatting | format-painter | format.clearFormatting | | E
+br
+toggle I | Bold | bold | format.bold | | 1 | on=bold
+toggle I | Italic | italic | format.italic | | 2 | on=italic
+toggle I | Underline | underline | format.underline | | 3 | on=underline
+toggle I | Strikethrough | strike | format.strike | | 4 | on=strike
+toggle I | Subscript | chevron-down | format.sub | | 5 | on=sub
+toggle I | Superscript | chevron-up | format.sup | | 6 | on=sup
+split I | Text Highlight Color | highlight | format.highlight | | I | menu=highlight
+split I | Font Color | font-color | format.color | | FC | menu=fontColor
+group Paragraph | ZP | rows c1100=collapse launch=format.paragraphDialog
+split I | Bullets | bullets | format.bullets | | U | menu=bullets on=bullets
+split I | Numbering | numbering | format.numbering | | N | menu=numbering on=numbering
+drop I | Multilevel List | numbering | | | M | menu=multilevel
+button I | Decrease Indent | outdent | format.outdent | | AO
+button I | Increase Indent | indent | format.indent | | AI
+button I | Sort... | sort | format.sort | | SO
+toggle I | Show All | view | format.showMarks | | 8 | on=marks
+br
+toggle I | Align Left | align-left | format.align | {"kind":"left"} | AL | on=align:left
+toggle I | Center | align-center | format.align | {"kind":"center"} | AC | on=align:center
+toggle I | Align Right | align-right | format.align | {"kind":"right"} | AR | on=align:right
+toggle I | Justify | justify | format.align | {"kind":"justify"} | AJ | on=align:justify
+drop I | Line and Paragraph Spacing | numbering | | | K | menu=lineSpacing
+split I | Shading | highlight | format.shading | | H | menu=shading
+split I | Borders | table | format.borders | {"kind":"bottom"} | B | menu=borders
+group Styles | ZS | c1100=collapse launch=format.stylesPane
+gallery L | Styles | font-color | | | L | dyn=styles menu=styles w=460
+drop L | Change Styles | view | | | G | menu=changeStyles
+group Editing | ZN | c1100=collapse
+split S | Find... | search | format.find | | FD | menu=find
+button S | Replace... | sort | format.replace | | R
+drop S | Select | check | | | SL | menu=select
+group Zoom | ZZ
+button L | Zoom... | zoom-in | format.zoom | | Q
+
+tab Review | V
+group Editor | ZP
+split L | Spelling and Grammar | spelling | review.spelling | | Q | menu=spelling
+button L | Editor | spelling | review.spelling | {"grammar":true} | C
+button L | Thesaurus... | address-book | review.thesaurus | | E
+button L | Word Count | numbering | review.wordCount | | W
+group Speech | Z1
+button L | Read Aloud | conversation | review.readAloud | | R1
+group Accessibility | ZA
+button L | Check Accessibility | person | review.accessibility | | A
+group Language | ZL
+drop L | Language | email | | | U | menu=language
+
+# ------------------------------------------------------------------------------------------------------------
+# Menus
+
+menu paste
+item | Keep Source Formatting | paste | format.paste | {"mode":"keepSource"} | K
+item | Merge Formatting | paste | format.paste | {"mode":"merge"} | M
+item | Keep Text Only | paste | format.paste | {"mode":"textOnly"} | T
+sep
+item | Paste Special... | paste | format.pasteSpecial | | S
+item | Set Default Paste... | settings | options.open | {"page":"mail"} | A
+
+menu fonts
+item | Aptos | | format.font | {"family":"Aptos"} |
+item | Inter | | format.font | {"family":"Inter"} |
+item | Carlito | | format.font | {"family":"Carlito"} |
+item | Liberation Sans | | format.font | {"family":"Liberation Sans"} |
+item | Liberation Serif | | format.font | {"family":"Liberation Serif"} |
+item | Liberation Mono | | format.font | {"family":"Liberation Mono"} |
+sep
+item | Font... | settings | format.fontDialog | | N
+
+menu fontSizes
+item | 8 | | format.fontSize | {"pt":8} |
+item | 9 | | format.fontSize | {"pt":9} |
+item | 10 | | format.fontSize | {"pt":10} |
+item | 11 | | format.fontSize | {"pt":11} |
+item | 12 | | format.fontSize | {"pt":12} |
+item | 14 | | format.fontSize | {"pt":14} |
+item | 16 | | format.fontSize | {"pt":16} |
+item | 18 | | format.fontSize | {"pt":18} |
+item | 20 | | format.fontSize | {"pt":20} |
+item | 22 | | format.fontSize | {"pt":22} |
+item | 24 | | format.fontSize | {"pt":24} |
+item | 26 | | format.fontSize | {"pt":26} |
+item | 28 | | format.fontSize | {"pt":28} |
+item | 36 | | format.fontSize | {"pt":36} |
+item | 48 | | format.fontSize | {"pt":48} |
+item | 72 | | format.fontSize | {"pt":72} |
+
+menu bullets
+item | None | | format.bullets | {"style":"none"} |
+item | Solid Circle | bullets | format.bullets | {"style":"disc"} |
+item | Hollow Circle | bullets | format.bullets | {"style":"circle"} |
+item | Solid Square | bullets | format.bullets | {"style":"square"} |
+item | Arrow | bullets | format.bullets | {"style":"arrow"} |
+item | Check Mark | check | format.bullets | {"style":"check"} |
+sep
+item | Change List Level | indent | format.indent | | L
+item | Define New Bullet... | | format.bullets | {"style":"define"} | D
+
+menu numbering
+item | None | | format.numbering | {"style":"none"} |
+item | 1. 2. 3. | numbering | format.numbering | {"style":"decimal"} |
+item | 1) 2) 3) | numbering | format.numbering | {"style":"decimalParen"} |
+item | I. II. III. | numbering | format.numbering | {"style":"upperRoman"} |
+item | A. B. C. | numbering | format.numbering | {"style":"upperAlpha"} |
+item | a) b) c) | numbering | format.numbering | {"style":"lowerAlphaParen"} |
+item | i. ii. iii. | numbering | format.numbering | {"style":"lowerRoman"} |
+sep
+item | Change List Level | indent | format.indent | | L
+item | Define New Number Format... | | format.numbering | {"style":"define"} | D
+item | Set Numbering Value... | | format.numbering | {"style":"setValue"} | V
+
+menu multilevel
+item | None | | format.multilevel | {"style":"none"} |
+item | 1. 1.1. 1.1.1. | numbering | format.multilevel | {"style":"outline"} |
+item | Article / Section | numbering | format.multilevel | {"style":"article"} |
+item | Chapter headings | numbering | format.multilevel | {"style":"chapter"} |
+sep
+item | Change List Level | indent | format.indent | | L
+item | Define New Multilevel List... | | format.multilevel | {"style":"define"} | D
+item | Define New List Style... | | format.multilevel | {"style":"defineStyle"} | L
+
+menu highlight
+item | High-contrast only | | format.highlight | {"highContrastOnly":"$!on"} | H | on=hc
+sep
+item | Yellow | | format.highlight | {"color":"#ffff00"} | | swatch=#ffff00
+item | Bright Green | | format.highlight | {"color":"#00ff00"} | | swatch=#00ff00
+item | Turquoise | | format.highlight | {"color":"#00ffff"} | | swatch=#00ffff
+item | Pink | | format.highlight | {"color":"#ff00ff"} | | swatch=#ff00ff
+item | Blue | | format.highlight | {"color":"#0000ff"} | | swatch=#0000ff
+item | Red | | format.highlight | {"color":"#ff0000"} | | swatch=#ff0000
+item | Dark Blue | | format.highlight | {"color":"#000080"} | | swatch=#000080
+item | Teal | | format.highlight | {"color":"#008080"} | | swatch=#008080
+item | Green | | format.highlight | {"color":"#008000"} | | swatch=#008000
+item | Violet | | format.highlight | {"color":"#800080"} | | swatch=#800080
+item | Dark Red | | format.highlight | {"color":"#800000"} | | swatch=#800000
+item | Dark Yellow | | format.highlight | {"color":"#808000"} | | swatch=#808000
+item | Gray 50% | | format.highlight | {"color":"#808080"} | | swatch=#808080
+item | Gray 25% | | format.highlight | {"color":"#c0c0c0"} | | swatch=#c0c0c0
+item | Black | | format.highlight | {"color":"#000000"} | | swatch=#000000
+sep
+item | No Color | | format.highlight | {"color":null} | N
+
+menu fontColor
+item | Automatic | font-color | format.color | {"color":"automatic"} | A
+sep
+item | Dark Red | | format.color | {"color":"#a01c1c"} | | swatch=#a01c1c
+item | Red | | format.color | {"color":"#e02424"} | | swatch=#e02424
+item | Orange | | format.color | {"color":"#ef8a17"} | | swatch=#ef8a17
+item | Yellow | | format.color | {"color":"#f2c94c"} | | swatch=#f2c94c
+item | Light Green | | format.color | {"color":"#7ac74f"} | | swatch=#7ac74f
+item | Green | | format.color | {"color":"#2e8b46"} | | swatch=#2e8b46
+item | Light Blue | | format.color | {"color":"#3fa7d6"} | | swatch=#3fa7d6
+item | Blue | | format.color | {"color":"#1f5fbf"} | | swatch=#1f5fbf
+item | Dark Blue | | format.color | {"color":"#14286b"} | | swatch=#14286b
+item | Purple | | format.color | {"color":"#6b3fa0"} | | swatch=#6b3fa0
+item | Gray | | format.color | {"color":"#6b7078"} | | swatch=#6b7078
+item | Black | | format.color | {"color":"#000000"} | | swatch=#000000
+sep
+item | More Colors... | font-color | format.color | {"custom":true} | M
+
+menu shading
+item | No Color | | format.shading | {"color":null} | N
+item | Light Gray | | format.shading | {"color":"#e6e6e6"} | | swatch=#e6e6e6
+item | Light Yellow | | format.shading | {"color":"#fff4c2"} | | swatch=#fff4c2
+item | Light Green | | format.shading | {"color":"#dff3d8"} | | swatch=#dff3d8
+item | Light Blue | | format.shading | {"color":"#dcebf7"} | | swatch=#dcebf7
+item | Light Red | | format.shading | {"color":"#f8dcdc"} | | swatch=#f8dcdc
+
+menu borders
+item | Bottom Border | | format.borders | {"kind":"bottom"} | B
+item | Top Border | | format.borders | {"kind":"top"} | P
+item | Left Border | | format.borders | {"kind":"left"} | L
+item | Right Border | | format.borders | {"kind":"right"} | R
+item | No Border | | format.borders | {"kind":"none"} | N
+item | All Borders | table | format.borders | {"kind":"all"} | A
+item | Outside Borders | | format.borders | {"kind":"outside"} | S
+item | Inside Borders | | format.borders | {"kind":"inside"} | I
+item | Inside Horizontal Border | | format.borders | {"kind":"insideH"} | H
+item | Inside Vertical Border | | format.borders | {"kind":"insideV"} | V
+sep
+item | Horizontal Line | minus | insert.horizontalLine | | Z
+item | Draw Table | table | insert.table | {"mode":"draw"} | D
+item | View Gridlines | table | format.showGridlines | | G | on=gridlines
+item | Borders and Shading... | settings | format.borders | {"dialog":true} | O
+
+menu changeCase
+item | Sentence case. | | format.changeCase | {"kind":"sentence"} | S
+item | lowercase | | format.changeCase | {"kind":"lower"} | L
+item | UPPERCASE | | format.changeCase | {"kind":"upper"} | U
+item | Capitalize Each Word | | format.changeCase | {"kind":"title"} | C
+item | tOGGLE cASE | | format.changeCase | {"kind":"toggle"} | T
+
+menu lineSpacing
+item | 1.0 | | format.lineSpacing | {"multiple":1.0} |
+item | 1.15 | | format.lineSpacing | {"multiple":1.15} |
+item | 1.5 | | format.lineSpacing | {"multiple":1.5} |
+item | 2.0 | | format.lineSpacing | {"multiple":2.0} |
+item | 2.5 | | format.lineSpacing | {"multiple":2.5} |
+item | 3.0 | | format.lineSpacing | {"multiple":3.0} |
+sep
+item | Line Spacing Options... | settings | format.paragraphDialog | |
+item | Add Space Before Paragraph | | format.paragraphSpacing | {"before":12} | B
+item | Add Space After Paragraph | | format.paragraphSpacing | {"after":12} | A
+
+menu styles
+dyn | styles | format.style | {"name":"$name"}
+sep
+item | Create a Style | plus | format.style | {"name":"New Style","action":"create"} | S
+item | Clear Formatting | format-painter | format.clearFormatting | | C
+item | Apply Styles... | settings | format.stylesPane | {"apply":true} | A
+
+menu changeStyles
+sub | Style Set | view | styleSet | | Y
+sub | Paragraph Spacing | numbering | paragraphSpacingPreset | | P
+sep
+item | Set as Default | check | format.styleSet | {"action":"setDefault"} | D
+
+menu styleSet
+item | Document | | format.styleSet | {"name":"Document"} |
+item | Basic (Elegant) | | format.styleSet | {"name":"Basic (Elegant)"} |
+item | Basic (Simple) | | format.styleSet | {"name":"Basic (Simple)"} |
+item | Basic (Stylish) | | format.styleSet | {"name":"Basic (Stylish)"} |
+item | Casual | | format.styleSet | {"name":"Casual"} |
+item | Centered | | format.styleSet | {"name":"Centered"} |
+item | Lines (Simple) | | format.styleSet | {"name":"Lines (Simple)"} |
+item | Minimalist | | format.styleSet | {"name":"Minimalist"} |
+item | Shaded | | format.styleSet | {"name":"Shaded"} |
+sep
+item | Reset to the Default Style Set | undo | format.styleSet | {"action":"reset"} | R
+item | Save as a New Style Set... | save | format.styleSet | {"action":"save"} | S
+
+menu paragraphSpacingPreset
+item | Default | | format.styleSet | {"paragraphSpacing":"default"} |
+item | No Paragraph Space | | format.styleSet | {"paragraphSpacing":"noParagraphSpace"} |
+item | Compact | | format.styleSet | {"paragraphSpacing":"compact"} |
+item | Tight | | format.styleSet | {"paragraphSpacing":"tight"} |
+item | Open | | format.styleSet | {"paragraphSpacing":"open"} |
+item | Relaxed | | format.styleSet | {"paragraphSpacing":"relaxed"} |
+item | Double | | format.styleSet | {"paragraphSpacing":"double"} |
+sep
+item | Custom Paragraph Spacing... | settings | format.paragraphDialog | | C
+
+menu find
+item | Find... | search | format.find | | F
+item | Go To... | chevron-right | format.goTo | | G
+
+menu select
+item | Select All | check | format.selectAll | | A
+item | Select Objects | | format.selectObjects | | O | on=selobj
+item | Select All Text With Similar Formatting | | format.selectSimilar | | S
+item | Selection Pane... | | format.selectionPane | | P | on=selpane
+
+menu attachFile
+sub | Attach Item | email | attachItem | | I
+item | Browse This PC... | attach | compose.attachFile | | B
+
+menu attachFileInsert
+item | Browse This PC... | attach | compose.attachFile | | B
+
+menu attachItem
+item | Business Card | contact-group | insert.businessCard | | B
+item | Outlook Item | email | compose.attachItem | | I
+
+menu businessCard
+item | Other Business Cards... | contact-group | insert.businessCard | | B
+
+menu link
+item | Insert Link... | link | insert.link | | I
+item | Remove Link | | insert.link | {"url":""} | R
+
+menu signature
+item | None | | compose.signature | {"name":"none"} | N
+sep
+item | Signatures... | signature | options.open | {"page":"signatures"} | S
+
+menu composeFollowUp
+item | Today | flag | compose.followUp | {"kind":"today"} | T
+item | Tomorrow | flag | compose.followUp | {"kind":"tomorrow"} | O
+item | This Week | flag | compose.followUp | {"kind":"thisWeek"} | W
+item | Next Week | flag | compose.followUp | {"kind":"nextWeek"} | N
+item | No Date | flag | compose.followUp | {"kind":"noDate"} | A
+item | Custom... | flag | compose.followUp | {"kind":"custom"} | C
+sep
+item | Add Reminder... | bell | compose.followUp | {"kind":"reminder"} | R
+item | Clear Flag | | compose.followUp | {"kind":"clear"} | E
+
+menu table
+item | 2 x 2 Table | table | insert.table | {"rows":2,"cols":2} |
+item | 3 x 3 Table | table | insert.table | {"rows":3,"cols":3} |
+item | 4 x 4 Table | table | insert.table | {"rows":4,"cols":4} |
+item | 5 x 3 Table | table | insert.table | {"rows":3,"cols":5} |
+sep
+item | Insert Table... | table | insert.table | {"mode":"dialog"} | I
+item | Draw Table | format-painter | insert.table | {"mode":"draw"} | D
+item | Convert Text to Table... | | insert.table | {"mode":"fromText"} | V
+sub | Quick Tables | table | quickTables | | T
+
+menu quickTables
+item | Quick Tables... | table | insert.table | {"mode":"quick"} | Q
+item | Save Selection to Quick Tables Gallery... | save | insert.saveToGallery | {"gallery":"quickTables"} | S
+
+menu pictures
+item | This Device... | picture | insert.picture | | D
+
+menu shapes
+item | Line | minus | insert.shape | {"kind":"line"} |
+item | Arrow | chevron-right | insert.shape | {"kind":"rightArrow"} |
+item | Left Arrow | chevron-left | insert.shape | {"kind":"leftArrow"} |
+item | Rectangle | table | insert.shape | {"kind":"rectangle"} |
+item | Rounded Rectangle | | insert.shape | {"kind":"roundedRectangle"} |
+item | Oval | | insert.shape | {"kind":"oval"} |
+item | Triangle | | insert.shape | {"kind":"triangle"} |
+item | Diamond | | insert.shape | {"kind":"diamond"} |
+item | Star | | insert.shape | {"kind":"star"} |
+item | Heart | | insert.shape | {"kind":"heart"} |
+item | Callout | conversation | insert.shape | {"kind":"callout"} |
+sep
+item | New Drawing Canvas | picture | insert.shape | {"kind":"canvas"} | N
+
+menu models3d
+item | This Device... | picture | insert.model3d | | D
+
+menu screenshot
+item | Screen Clipping | picture | insert.screenshot | {"clip":true} | C
+
+menu textBox
+item | Simple Text Box | note | insert.textBox | {"preset":"simple"} |
+item | Sidebar | note | insert.textBox | {"preset":"sidebar"} |
+sep
+item | Draw Text Box | format-painter | insert.textBox | {"preset":"draw"} | D
+item | Save Selection to Text Box Gallery | save | insert.saveToGallery | {"gallery":"textBoxes"} | S
+
+menu quickParts
+sub | AutoText | quick-steps | autoText | | A
+item | Insert Quick Part... | quick-steps | insert.quickPart | | Q
+sep
+item | Save Selection to Quick Part Gallery... | save | insert.saveToGallery | {"gallery":"quickParts"} | S
+
+menu autoText
+item | Insert AutoText... | quick-steps | insert.quickPart | {"gallery":"autoText"} | A
+item | Save Selection to AutoText Gallery | save | insert.saveToGallery | {"gallery":"autoText"} | S
+
+menu wordArt
+item | Fill: Black, Shadow | font-color | insert.wordArt | {"style":"fillBlackShadow"} |
+item | Fill: Accent, Shadow | font-color | insert.wordArt | {"style":"fillAccentShadow"} |
+item | Fill: White, Outline | font-color | insert.wordArt | {"style":"fillWhiteOutline"} |
+item | Gradient Fill | font-color | insert.wordArt | {"style":"gradient"} |
+
+menu dropCap
+item | None | | insert.dropCap | {"kind":"none"} | N
+item | Dropped | bold | insert.dropCap | {"kind":"dropped"} | D
+item | In Margin | bold | insert.dropCap | {"kind":"inMargin"} | M
+
+menu equation
+item | Insert New Equation | plus | insert.equation | | I
+item | Save Selection to Equation Gallery... | save | insert.saveToGallery | {"gallery":"equations"} | S
+
+menu symbol
+item | Euro Sign | | insert.symbol | {"char":"€"} |
+item | Pound Sign | | insert.symbol | {"char":"£"} |
+item | Yen Sign | | insert.symbol | {"char":"¥"} |
+item | Copyright Sign | | insert.symbol | {"char":"©"} |
+item | Registered Sign | | insert.symbol | {"char":"®"} |
+item | Trade Mark Sign | | insert.symbol | {"char":"™"} |
+item | Plus-Minus Sign | | insert.symbol | {"char":"±"} |
+item | Not Equal To | | insert.symbol | {"char":"≠"} |
+item | Less-Than Or Equal To | | insert.symbol | {"char":"≤"} |
+item | Greater-Than Or Equal To | | insert.symbol | {"char":"≥"} |
+item | Division Sign | | insert.symbol | {"char":"÷"} |
+item | Multiplication Sign | | insert.symbol | {"char":"×"} |
+item | Infinity | | insert.symbol | {"char":"∞"} |
+item | Micro Sign | | insert.symbol | {"char":"µ"} |
+item | Greek Small Letter Alpha | | insert.symbol | {"char":"α"} |
+item | Greek Small Letter Beta | | insert.symbol | {"char":"β"} |
+item | Greek Small Letter Pi | | insert.symbol | {"char":"π"} |
+item | Ohm Sign | | insert.symbol | {"char":"Ω"} |
+item | N-Ary Summation | | insert.symbol | {"char":"∑"} |
+sep
+item | More Symbols... | info | insert.symbol | | M
+
+menu themes
+item | Default | view | compose.theme | {"name":"Default"} |
+item | Facet | view | compose.theme | {"name":"Facet"} |
+item | Gallery | view | compose.theme | {"name":"Gallery"} |
+item | Integral | view | compose.theme | {"name":"Integral"} |
+item | Ion | view | compose.theme | {"name":"Ion"} |
+item | Organic | view | compose.theme | {"name":"Organic"} |
+item | Retrospect | view | compose.theme | {"name":"Retrospect"} |
+item | Slice | view | compose.theme | {"name":"Slice"} |
+item | Wisp | view | compose.theme | {"name":"Wisp"} |
+sep
+item | Reset to Theme from Template | undo | compose.theme | {"action":"reset"} | R
+item | Browse for Themes... | folder-open | compose.theme | {"action":"browse"} | B
+item | Save Current Theme... | save | compose.theme | {"action":"save"} | A
+
+menu themeColors
+item | Default | | compose.theme | {"part":"colors","name":"Default"} |
+item | Grayscale | | compose.theme | {"part":"colors","name":"Grayscale"} |
+item | Blue Warm | | compose.theme | {"part":"colors","name":"Blue Warm"} |
+item | Blue | | compose.theme | {"part":"colors","name":"Blue"} |
+item | Blue Green | | compose.theme | {"part":"colors","name":"Blue Green"} |
+item | Green | | compose.theme | {"part":"colors","name":"Green"} |
+item | Orange | | compose.theme | {"part":"colors","name":"Orange"} |
+item | Red | | compose.theme | {"part":"colors","name":"Red"} |
+sep
+item | Customize Colors... | settings | compose.theme | {"part":"colors","action":"customize"} | C
+
+menu themeFonts
+item | Default | | compose.theme | {"part":"fonts","name":"Default"} |
+item | Inter | | compose.theme | {"part":"fonts","name":"Inter"} |
+item | Liberation Sans | | compose.theme | {"part":"fonts","name":"Liberation Sans"} |
+item | Liberation Serif | | compose.theme | {"part":"fonts","name":"Liberation Serif"} |
+sep
+item | Customize Fonts... | settings | compose.theme | {"part":"fonts","action":"customize"} | C
+
+menu themeEffects
+item | Default | | compose.theme | {"part":"effects","name":"Default"} |
+item | Subtle Solids | | compose.theme | {"part":"effects","name":"Subtle Solids"} |
+item | Banded Edge | | compose.theme | {"part":"effects","name":"Banded Edge"} |
+item | Glow Edge | | compose.theme | {"part":"effects","name":"Glow Edge"} |
+item | Top Shadow | | compose.theme | {"part":"effects","name":"Top Shadow"} |
+item | Inset | | compose.theme | {"part":"effects","name":"Inset"} |
+
+menu pageColor
+item | No Color | | compose.pageColor | {"color":null} | N
+item | Light Gray | | compose.pageColor | {"color":"#f2f2f2"} | | swatch=#f2f2f2
+item | Light Yellow | | compose.pageColor | {"color":"#fff8dc"} | | swatch=#fff8dc
+item | Light Green | | compose.pageColor | {"color":"#eaf6e4"} | | swatch=#eaf6e4
+item | Light Blue | | compose.pageColor | {"color":"#e6f0fa"} | | swatch=#e6f0fa
+item | Light Pink | | compose.pageColor | {"color":"#fbe9ef"} | | swatch=#fbe9ef
+sep
+item | More Colors... | font-color | compose.pageColor | | M
+
+menu voting
+item | Approve;Reject | check | compose.votingButtons | {"choices":"Approve;Reject"} | | on=vote:Approve;Reject
+item | Yes;No | check | compose.votingButtons | {"choices":"Yes;No"} | | on=vote:Yes;No
+item | Yes;No;Maybe | check | compose.votingButtons | {"choices":"Yes;No;Maybe"} | | on=vote:Yes;No;Maybe
+sep
+item | Custom... | settings | compose.messageOptions | | C
+
+menu saveSentTo
+item | Other Folder... | folder | compose.saveSentItemTo | {"mode":"other"} | O
+item | Use Default Folder | sent | compose.saveSentItemTo | {"mode":"default"} | U | on=save:default
+item | Do Not Save | | compose.saveSentItemTo | {"mode":"none"} | D | on=save:none
+
+menu spelling
+item | Spelling | spelling | review.spelling | {"grammar":false} | S
+item | Spelling and Grammar | spelling | review.spelling | {"grammar":true} | G
+
+menu language
+item | Set Proofing Language... | email | review.language | | L
+item | Language Preferences... | settings | options.open | {"page":"language"} | P

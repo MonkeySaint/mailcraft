@@ -1,0 +1,576 @@
+//! Shared helpers for the module views: UI state in egui memory, local dates, colours and pane drawing.
+
+use std::collections::BTreeSet;
+
+use egui::{
+    Align, Align2, Color32, CornerRadius, FontId, Id, Layout, Rect, Response, Sense, Stroke, StrokeKind, Ui,
+    UiBuilder, Vec2, WidgetInfo, WidgetType, pos2, vec2,
+};
+use mailcraft_engine::cmd::calendar::CalendarViewState;
+use mailcraft_engine::cmd::notes::NotesViewState;
+use mailcraft_model::{DateTime, FolderId, FolderKind, FolderPaneState, NoteColor, dates};
+
+use super::editors::Editors;
+use crate::App;
+use crate::theme::size;
+
+/// Seconds per day.
+pub(crate) const DAY: i64 = 86_400;
+
+/// Everything the module views keep between frames (egui memory, one entry).
+#[derive(Clone, Default)]
+pub(crate) struct ModState {
+    /// Calendar view state the engine's view commands take and return.
+    pub cal: CalendarViewState,
+    /// Date navigator month (year, month) when the user paged it away from the selected date.
+    pub nav_month: Option<(i64, u8)>,
+    /// Calendar folders shown (checked in My Calendars); empty = the current calendar.
+    pub cal_shown: BTreeSet<u64>,
+    /// "My Calendars" group collapsed.
+    pub cal_group_collapsed: bool,
+    /// Selected time slot (local day, minute of day) in day/week views.
+    pub cal_slot: Option<(i64, i64)>,
+    /// Key of the last view the grid scrolled to the start of the working day for.
+    pub cal_scroll_key: String,
+    /// People: business-card grid instead of the list + contact card.
+    pub people_cards: bool,
+    pub people_search: String,
+    /// Letter-index jump requested ('#' = digits).
+    pub people_jump: Option<char>,
+    /// Tasks: show the selected tasks folder instead of the To-Do List.
+    pub tasks_folder_view: bool,
+    /// "Type a new task" text.
+    pub new_task: String,
+    pub notes_view: NotesViewState,
+    /// Note being edited in place: (id, text).
+    pub note_edit: Option<(u64, String)>,
+    /// Note whose edit box should take focus.
+    pub note_focus: bool,
+    pub editors: Editors,
+    /// Last egui pass the item windows were drawn in.
+    pub windows_pass: Option<u64>,
+}
+
+fn state_id() -> Id {
+    Id::new("mailcraft.modules.state")
+}
+
+pub(crate) fn load(ctx: &egui::Context) -> ModState {
+    ctx.data_mut(|d| d.get_temp::<ModState>(state_id())).unwrap_or_default()
+}
+
+pub(crate) fn store(ctx: &egui::Context, st: ModState) {
+    ctx.data_mut(|d| d.insert_temp(state_id(), st));
+}
+
+/// Runs a command and returns its error text (from the toast) on failure.
+pub(crate) fn run_checked(
+    app: &mut App,
+    id: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match app.run(id, params) {
+        Some(v) => Ok(v),
+        None => Err(app.ui.toast.as_ref().map(|t| t.0.clone()).unwrap_or_else(|| format!("{id} failed"))),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Dates (local day numbers = days since 1970-01-01 in the session's display offset)
+// ---------------------------------------------------------------------------------------------------------
+
+pub(crate) fn tz(app: &App) -> i32 {
+    app.s.tz_offset_min
+}
+
+/// Local seconds since the epoch of `t`.
+pub(crate) fn local_secs(t: DateTime, tz: i32) -> i64 {
+    t.unix.saturating_add(i64::from(tz).saturating_mul(60))
+}
+
+pub(crate) fn today(app: &App) -> i64 {
+    local_secs(app.s.now(), tz(app)).div_euclid(DAY)
+}
+
+/// Minute of the day now.
+pub(crate) fn now_minute(app: &App) -> i64 {
+    local_secs(app.s.now(), tz(app)).rem_euclid(DAY) / 60
+}
+
+pub(crate) fn ymd(day: i64) -> (i64, u8, u8) {
+    dates::civil_from_days(day)
+}
+
+pub(crate) fn day_of(y: i64, m: u8, d: u8) -> Option<i64> {
+    dates::days_from_civil(y, m, d)
+}
+
+/// "YYYY-MM-DD" → day number.
+pub(crate) fn parse_day(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let date = s.split(['T', ' ']).next().unwrap_or("");
+    let mut p = date.split('-');
+    let y: i64 = p.next()?.trim().parse().ok()?;
+    let m: u8 = p.next()?.trim().parse().ok()?;
+    let d: u8 = p.next()?.trim().parse().ok()?;
+    if p.next().is_some() || !(1..=9999).contains(&y) {
+        return None;
+    }
+    day_of(y, m, d)
+}
+
+/// "YYYY-MM-DDTHH:MM" → (day, minute of day).
+pub(crate) fn parse_day_time(s: &str) -> Option<(i64, i64)> {
+    let day = parse_day(s)?;
+    let minute = match s.trim().split_once(['T', ' ']) {
+        Some((_, t)) => parse_clock(t)?,
+        None => 0,
+    };
+    Some((day, minute))
+}
+
+/// "HH:MM" (24 h) or "h:mm AM/PM" → minute of day.
+pub(crate) fn parse_clock(s: &str) -> Option<i64> {
+    let s = s.trim().to_ascii_uppercase();
+    let (body, pm) = if let Some(b) = s.strip_suffix("PM") {
+        (b.trim().to_owned(), Some(true))
+    } else if let Some(b) = s.strip_suffix("AM") {
+        (b.trim().to_owned(), Some(false))
+    } else {
+        (s.clone(), None)
+    };
+    let (h, m) = match body.split_once(':') {
+        Some((h, m)) => {
+            (h.trim().parse::<i64>().ok()?, m.trim().get(..2).unwrap_or(m.trim()).parse::<i64>().ok()?)
+        }
+        None => (body.trim().parse::<i64>().ok()?, 0),
+    };
+    if !(0..60).contains(&m) {
+        return None;
+    }
+    let h = match pm {
+        Some(pm) => {
+            if !(1..=12).contains(&h) {
+                return None;
+            }
+            (h % 12) + if pm { 12 } else { 0 }
+        }
+        None => h,
+    };
+    if !(0..24).contains(&h) {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+pub(crate) fn day_string(day: i64) -> String {
+    let (y, m, d) = ymd(day);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+pub(crate) fn day_time_string(day: i64, minute: i64) -> String {
+    let minute = minute.clamp(0, 24 * 60 - 1);
+    format!("{}T{:02}:{:02}", day_string(day), minute / 60, minute % 60)
+}
+
+/// Sunday = 0.
+pub(crate) fn weekday(day: i64) -> u8 {
+    dates::weekday_of_day(day).0
+}
+
+/// Sunday starting the week of `day`.
+pub(crate) fn week_start(day: i64) -> i64 {
+    day.saturating_sub(i64::from(weekday(day)))
+}
+
+pub(crate) const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+pub(crate) const WEEKDAYS: [&str; 7] =
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+pub(crate) fn month_name(m: u8) -> &'static str {
+    MONTHS.get(usize::from(m).saturating_sub(1)).copied().unwrap_or("")
+}
+
+pub(crate) fn weekday_name(day: i64) -> &'static str {
+    WEEKDAYS.get(usize::from(weekday(day))).copied().unwrap_or("")
+}
+
+pub(crate) fn weekday_short(day: i64) -> &'static str {
+    weekday_name(day).get(..3).unwrap_or("")
+}
+
+/// (year, month) moved by `delta` months.
+pub(crate) fn add_months(y: i64, m: u8, delta: i64) -> (i64, u8) {
+    let idx = y.saturating_mul(12).saturating_add(i64::from(m) - 1).saturating_add(delta);
+    (idx.div_euclid(12), u8::try_from(idx.rem_euclid(12) + 1).unwrap_or(1))
+}
+
+/// `day` moved by `delta` months, clamping the day of month.
+pub(crate) fn shift_month(day: i64, delta: i64) -> i64 {
+    let (y, m, d) = ymd(day);
+    let (ny, nm) = add_months(y, m, delta);
+    let d = d.min(dates::days_in_month(ny, nm)).max(1);
+    day_of(ny, nm, d).unwrap_or(day)
+}
+
+/// "9:30 AM".
+pub(crate) fn clock(minute: i64) -> String {
+    let minute = minute.rem_euclid(24 * 60);
+    let (h, m) = (minute / 60, minute % 60);
+    let (h12, ap) = match h {
+        0 => (12, "AM"),
+        1..=11 => (h, "AM"),
+        12 => (12, "PM"),
+        _ => (h - 12, "PM"),
+    };
+    format!("{h12}:{m:02} {ap}")
+}
+
+/// "9 AM" for the time ruler.
+pub(crate) fn hour_label(hour: i64) -> String {
+    match hour.rem_euclid(24) {
+        0 => "12 AM".to_owned(),
+        h @ 1..=11 => format!("{h} AM"),
+        12 => "12 PM".to_owned(),
+        h => format!("{} PM", h - 12),
+    }
+}
+
+/// "10/9/2026".
+pub(crate) fn short_date(day: i64) -> String {
+    let (y, m, d) = ymd(day);
+    format!("{m}/{d}/{y}")
+}
+
+/// "Friday, October 9, 2026".
+pub(crate) fn long_date(day: i64) -> String {
+    let (y, m, d) = ymd(day);
+    format!("{}, {} {d}, {y}", weekday_name(day), month_name(m))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Colours (our own palette)
+// ---------------------------------------------------------------------------------------------------------
+
+pub(crate) fn geom_color(c: mailcraft_geom::Color) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+/// Linear blend of two opaque colours (`t` = share of `b`).
+pub(crate) fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 {
+        let v = f32::from(x) * (1.0 - t) + f32::from(y) * t;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+/// Colour of the first category (of `names`) that has one.
+pub(crate) fn category_color(app: &App, names: &[String]) -> Option<Color32> {
+    names.iter().find_map(|n| {
+        mailcraft_model::Category::find(&app.s.mailbox.categories, n)
+            .map(|c| c.color)
+            .filter(|c| *c != mailcraft_model::CategoryColor::None)
+            .map(|c| geom_color(c.rgb()))
+    })
+}
+
+/// Sticky-note fill.
+pub(crate) fn note_fill(color: NoteColor, dark: bool) -> Color32 {
+    match (color, dark) {
+        (NoteColor::Yellow, false) => Color32::from_rgb(0xfb, 0xee, 0xa6),
+        (NoteColor::Blue, false) => Color32::from_rgb(0xcd, 0xe4, 0xf7),
+        (NoteColor::Green, false) => Color32::from_rgb(0xd3, 0xee, 0xc6),
+        (NoteColor::Pink, false) => Color32::from_rgb(0xf6, 0xd0, 0xe1),
+        (NoteColor::White, false) => Color32::from_rgb(0xfd, 0xfd, 0xfb),
+        (NoteColor::Yellow, true) => Color32::from_rgb(0x5a, 0x50, 0x24),
+        (NoteColor::Blue, true) => Color32::from_rgb(0x24, 0x41, 0x5a),
+        (NoteColor::Green, true) => Color32::from_rgb(0x2c, 0x4b, 0x2a),
+        (NoteColor::Pink, true) => Color32::from_rgb(0x58, 0x2d, 0x43),
+        (NoteColor::White, true) => Color32::from_rgb(0x3a, 0x3d, 0x41),
+    }
+}
+
+/// Persona circle colours (index from `queries::persona_color`).
+pub(crate) fn persona_fill(idx: u8) -> Color32 {
+    const P: [(u8, u8, u8); 16] = [
+        (0x1f, 0x77, 0x8c),
+        (0x8c, 0x4a, 0x1f),
+        (0x4a, 0x6b, 0x1f),
+        (0x6b, 0x2f, 0x8c),
+        (0x2f, 0x52, 0x9e),
+        (0x9e, 0x2f, 0x52),
+        (0x2f, 0x7d, 0x5a),
+        (0x7d, 0x6a, 0x1f),
+        (0x5a, 0x3d, 0x9e),
+        (0x1f, 0x5f, 0x5f),
+        (0x8c, 0x3a, 0x3a),
+        (0x3a, 0x5f, 0x8c),
+        (0x5f, 0x7d, 0x2f),
+        (0x8c, 0x2f, 0x7d),
+        (0x2f, 0x6b, 0x8c),
+        (0x6b, 0x4f, 0x2f),
+    ];
+    let (r, g, b) = P.get(usize::from(idx % 16)).copied().unwrap_or((0x1f, 0x77, 0x8c));
+    Color32::from_rgb(r, g, b)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Panes
+// ---------------------------------------------------------------------------------------------------------
+
+pub(crate) const GAP: f32 = 6.0;
+pub(crate) const RADIUS: u8 = 6;
+
+/// Splits the module area into the folder pane (when shown) and the content.
+pub(crate) fn split_folder_pane(ui: &Ui, app: &App) -> (Option<Rect>, Rect) {
+    let full = ui.max_rect();
+    let window_w = ui.ctx().content_rect().width();
+    let show = app.s.view.folder_pane == FolderPaneState::Normal
+        && !app.s.view.reading_view
+        && window_w > size::AUTO_MINIMIZE_W
+        && full.width() > size::FOLDER_PANE + 200.0;
+    if !show {
+        return (None, full);
+    }
+    let pane = Rect::from_min_size(full.min, vec2(size::FOLDER_PANE, full.height()));
+    let main = Rect::from_min_max(pos2(pane.max.x + GAP, full.min.y), full.max);
+    (Some(pane), main)
+}
+
+/// Fills a rounded pane background.
+pub(crate) fn pane_bg(ui: &Ui, rect: Rect, fill: Color32) {
+    ui.painter().rect_filled(rect, CornerRadius::same(RADIUS), fill);
+}
+
+/// Runs `add` in a child Ui confined to `rect`.
+pub(crate) fn child<R>(ui: &mut Ui, rect: Rect, salt: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let builder = UiBuilder::new().max_rect(rect).id_salt(salt).layout(Layout::top_down(Align::Min));
+    let clip = ui.clip_rect().intersect(rect);
+    ui.scope_builder(builder, |ui| {
+        ui.set_clip_rect(clip);
+        add(ui)
+    })
+    .inner
+}
+
+/// Adds an accessible name to a painted control.
+pub(crate) fn a11y(resp: &Response, typ: WidgetType, label: &str) {
+    let label = label.to_owned();
+    resp.widget_info(move || WidgetInfo::labeled(typ, true, label.clone()));
+}
+
+/// Folder-pane group header ("My Calendars") with an expand chevron; returns true when clicked.
+pub(crate) fn group_header(ui: &mut Ui, app: &mut App, text: &str, collapsed: bool, id: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+    a11y(&resp, WidgetType::Button, text);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(4), app.theme.hover);
+    }
+    let chev = Rect::from_center_size(pos2(rect.min.x + 12.0, rect.center().y), Vec2::splat(12.0));
+    let icon = if collapsed { "chevron-right" } else { "chevron-down" };
+    app.icons.paint(ui, chev, icon, app.theme.text_muted);
+    ui.painter().text(
+        pos2(rect.min.x + 24.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(14.0),
+        app.theme.text,
+    );
+    let _ = id;
+    resp.clicked()
+}
+
+/// Folder rows of `kind` (Outlook: "Calendar - account" when several accounts). Returns the clicked folder.
+pub(crate) fn folder_rows(
+    ui: &mut Ui,
+    app: &mut App,
+    kind: FolderKind,
+    selected: Option<FolderId>,
+    checks: Option<&BTreeSet<u64>>,
+) -> (Option<FolderId>, Option<FolderId>) {
+    let mut clicked = None;
+    let mut toggled = None;
+    let multi = app.s.mailbox.accounts.len() > 1;
+    let mut folders: Vec<(String, FolderId)> = app
+        .s
+        .mailbox
+        .folders
+        .values()
+        .filter(|f| f.kind == kind)
+        .map(|f| {
+            let label = if multi {
+                let acct =
+                    app.s.mailbox.account(f.account).map(|a| a.display_name.clone()).unwrap_or_default();
+                format!("{} - {acct}", f.name)
+            } else {
+                f.name.clone()
+            };
+            (label, f.id)
+        })
+        .collect();
+    folders.sort_by_key(|(name, id)| (app.s.mailbox.folder(*id).map(|f| f.sort_key()), name.clone()));
+    for (label, id) in folders {
+        let (rect, resp) =
+            ui.allocate_exact_size(vec2(ui.available_width(), size::FOLDER_ROW), Sense::click());
+        a11y(&resp, WidgetType::Button, &label);
+        let is_sel = selected == Some(id);
+        if is_sel {
+            ui.painter().rect_filled(rect, CornerRadius::same(4), app.theme.selected_folder);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, CornerRadius::same(4), app.theme.hover);
+        }
+        let mut x = rect.min.x + 16.0;
+        if let Some(checks) = checks {
+            let on = checks.contains(&id.0);
+            let b = Rect::from_center_size(pos2(x + 7.0, rect.center().y), Vec2::splat(13.0));
+            let bresp = ui.interact(b.expand(3.0), Id::new(("mc-folder-check", id.0)), Sense::click());
+            a11y(&bresp, WidgetType::Checkbox, &format!("Show {label}"));
+            draw_check(ui, b, on, app.theme.accent, app.theme.text_muted);
+            if bresp.clicked() {
+                toggled = Some(id);
+            }
+            x += 22.0;
+        }
+        let font = FontId::proportional(13.0);
+        let galley =
+            ui.painter().layout(label.clone(), font, app.theme.text, (rect.max.x - x - 6.0).max(10.0));
+        let y = rect.center().y - galley.size().y / 2.0;
+        ui.painter().with_clip_rect(rect).galley(pos2(x, y), galley, app.theme.text);
+        if resp.clicked() && toggled.is_none() {
+            clicked = Some(id);
+        }
+    }
+    (clicked, toggled)
+}
+
+/// Paints a checkbox square.
+pub(crate) fn draw_check(ui: &Ui, b: Rect, on: bool, accent: Color32, border: Color32) {
+    let p = ui.painter();
+    if on {
+        p.rect_filled(b, CornerRadius::same(2), accent);
+        let s = Stroke::new(1.6, Color32::WHITE);
+        p.line_segment([pos2(b.min.x + 3.0, b.center().y), pos2(b.min.x + 5.5, b.max.y - 3.5)], s);
+        p.line_segment([pos2(b.min.x + 5.5, b.max.y - 3.5), pos2(b.max.x - 3.0, b.min.y + 3.5)], s);
+    } else {
+        p.rect_stroke(b, CornerRadius::same(2), Stroke::new(1.0, border), StrokeKind::Inside);
+    }
+}
+
+/// Text truncated to one line within `width` (painted).
+pub(crate) fn paint_text_clipped(
+    ui: &Ui,
+    pos: egui::Pos2,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    width: f32,
+) -> Rect {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat { font_id: font, color, ..Default::default() },
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(4.0));
+    let galley = ui.painter().layout_job(job);
+    let rect = Rect::from_min_size(pos, galley.size());
+    ui.painter().galley(pos, galley, color);
+    rect
+}
+
+/// A centred, muted "empty" message.
+pub(crate) fn empty_message(ui: &Ui, rect: Rect, app: &App, title: &str, hint: &str) {
+    let c = rect.center();
+    ui.painter().text(
+        pos2(c.x, c.y - 10.0),
+        Align2::CENTER_CENTER,
+        title,
+        FontId::proportional(14.0),
+        app.theme.text,
+    );
+    ui.painter().text(
+        pos2(c.x, c.y + 10.0),
+        Align2::CENTER_CENTER,
+        hint,
+        FontId::proportional(12.0),
+        app.theme.text_muted,
+    );
+}
+
+/// The current folder of a module kind (selected folder when it holds that kind, else the default).
+pub(crate) fn current_folder(
+    app: &App,
+    kind: mailcraft_engine::cmd::calendar::pim::Kind,
+) -> Option<FolderId> {
+    mailcraft_engine::cmd::calendar::pim::current_folder(&app.s, kind)
+}
+
+/// Selects a folder through the engine (`nav.selectFolder`).
+pub(crate) fn select_folder(app: &mut App, folder: FolderId) {
+    app.run("nav.selectFolder", serde_json::json!({ "folder": folder.0 }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_round_trip() {
+        let d = parse_day("2026-10-09").unwrap();
+        assert_eq!(day_string(d), "2026-10-09");
+        assert_eq!(weekday(d), 5);
+        assert_eq!(weekday_name(d), "Friday");
+        assert_eq!(week_start(d), d - 5);
+        assert_eq!(long_date(d), "Friday, October 9, 2026");
+        assert_eq!(short_date(d), "10/9/2026");
+        assert_eq!(parse_day("2026-02-30"), None);
+        assert_eq!(parse_day("junk"), None);
+        assert_eq!(parse_day_time("2026-10-09T14:30"), Some((d, 870)));
+        assert_eq!(day_time_string(d, 870), "2026-10-09T14:30");
+    }
+
+    #[test]
+    fn clocks() {
+        assert_eq!(clock(0), "12:00 AM");
+        assert_eq!(clock(9 * 60 + 30), "9:30 AM");
+        assert_eq!(clock(12 * 60), "12:00 PM");
+        assert_eq!(clock(23 * 60 + 5), "11:05 PM");
+        assert_eq!(parse_clock("9:30 AM"), Some(570));
+        assert_eq!(parse_clock("12:00 AM"), Some(0));
+        assert_eq!(parse_clock("12:15 pm"), Some(735));
+        assert_eq!(parse_clock("17:45"), Some(1065));
+        assert_eq!(parse_clock("25:00"), None);
+        assert_eq!(parse_clock("13:00 PM"), None);
+        assert_eq!(hour_label(0), "12 AM");
+        assert_eq!(hour_label(15), "3 PM");
+    }
+
+    #[test]
+    fn months() {
+        assert_eq!(add_months(2026, 12, 1), (2027, 1));
+        assert_eq!(add_months(2026, 1, -1), (2025, 12));
+        let jan31 = parse_day("2026-01-31").unwrap();
+        assert_eq!(day_string(shift_month(jan31, 1)), "2026-02-28");
+        assert_eq!(month_name(13), "");
+    }
+
+    #[test]
+    fn blend_mixes() {
+        let c = blend(Color32::BLACK, Color32::WHITE, 0.5);
+        assert!(c.r() > 120 && c.r() < 135);
+    }
+}

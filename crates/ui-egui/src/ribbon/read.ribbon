@@ -1,0 +1,107 @@
+# Opened-message (read) window ribbon: Message tab (plan/outlook/read-window.md, responsive.md "Read window").
+# Commands get {"ids": [<item>]} / {"id": <item>} added by the ribbon. Help falls back to the main window's.
+
+surface read
+mode simplified
+
+tab Message | H | more=moreRead
+group Move & Delete | ZA | s1366=nolabel1
+split S | Delete | delete | mail.delete | | D | menu=readDeleteMore
+button S | Archive... | archive | mail.archive | | O1
+drop S | Move | move | | | MV | menu=move s500=overflow
+group Respond | ZR | s1280=nolabel
+button S | Reply | reply | mail.reply | {"window":true} | RP
+button S | Reply All | reply-all | mail.replyAll | {"window":true} | RA
+button S | Forward | forward | mail.forward | {"window":true} | FW
+group Quick Steps | ZQ | s1600=narrow s1024=overflow
+gallery S | Quick Steps | quick-steps | | | QS | dyn=quicksteps menu=quickSteps w=240
+group Tags | ZO | s600=overflow
+button S | Mark Unread | unread | mail.toggleRead | | U
+drop S | Categorize | categorize | | | G | menu=categorize s700=overflow
+drop S | Follow Up | flag | | | W | menu=followUp s700=overflow
+button S | Message Options... | settings | mail.messageOptions | | OP | s900=overflow
+group Editing | ZE | s900=overflow
+button S | Find... | search | format.find | | FD
+group Immersive | I | s1100=overflow
+button S | Read Aloud | conversation | review.readAloud | | R1
+group Language | ZL | s1100=overflow
+drop S | Translate | email | | | T | menu=translate
+group Zoom | ZZ | s1366=overflow
+button S | Zoom... | zoom-in | view.zoom | | Q1
+
+mode classic
+
+tab Message | H
+group Delete | ZD | c1366=nolabel c700=collapse
+toggle S | Ignore | ignore | mail.ignore | | X | on=ignored
+drop S | Clean Up | clean-up | | | C | menu=cleanUp
+drop S | Junk | junk | | | J | menu=readJunk
+button L | Delete | delete | mail.delete | | D
+button L | Archive... | archive | mail.archive | | O1
+group Respond | ZR | c1366=nolabel c1024=iconly c700=collapse
+button L | Reply | reply | mail.reply | {"window":true} | RP
+button L | Reply All | reply-all | mail.replyAll | {"window":true} | RA
+button L | Forward | forward | mail.forward | {"window":true} | FW
+button S | Meeting | meeting | mail.replyWithMeeting | | MR
+drop S | More | more | | | ME | menu=respondMore
+group Quick Steps | ZQ | c900=collapse launch=quicksteps.manage
+gallery L | Quick Steps | quick-steps | | | QS | dyn=quicksteps menu=quickSteps w=210
+group Move | ZM | c1024=collapse
+drop L | Move | move | | | MV | menu=move
+drop S | Rules | rules | | | RR | menu=rules
+drop S | Actions | more | | | AC | menu=readActions
+group Tags | ZT | c1024=collapse launch=mail.messageOptions
+button S | Mark Unread | unread | mail.toggleRead | | U
+drop S | Categorize | categorize | | | G | menu=categorize
+drop S | Follow Up | flag | | | W | menu=followUp
+group Editing | ZE | c900=collapse
+button S | Find... | search | format.find | | FD
+drop S | Related | conversation | | | RL | menu=readRelated
+drop S | Select | check | | | SL | menu=readSelect
+group Immersive | ZI | c800=collapse
+button L | Read Aloud | conversation | review.readAloud | | R1
+group Language | ZL | c800=collapse
+drop L | Translate | email | | | T | menu=translate
+group Zoom | ZZ | c800=collapse
+button L | Zoom... | zoom-in | view.zoom | | Q
+
+menu readDeleteMore
+item | Clean Up Conversation | clean-up | mail.cleanUpConversation | | C
+item | Clean Up Folder | | mail.cleanUpFolder | | L
+item | Clean Up Folder & Subfolders | | mail.cleanUpSubfolders | | E
+
+menu readJunk
+item | Block Sender | block | mail.block | {"kind":"sender"} | B
+item | Never Block Sender | | mail.block | {"kind":"neverSender"} | S
+item | Never Block Sender's Domain | | mail.block | {"kind":"neverDomain"} | D
+item | Never Block this Group or Mailing List | | mail.block | {"kind":"neverList"} | M
+item | Not Junk | check | mail.junk | {"action":"notJunk"} | N
+sep
+item | Junk E-mail Options... | junk | mail.junk | {"action":"options"} | O
+
+menu translate
+item | Translate Message | email | review.translate | | T
+item | Show Original | undo | review.translate | {"showOriginal":true} | S
+sep
+item | Translation Preferences... | settings | options.open | {"page":"language"} | P
+
+menu readActions
+item | Edit Message | draft | mail.editMessage | | E
+item | Recall This Message... | undo | mail.recall | | T
+item | Resend This Message... | send | mail.resend | | S
+sep
+item | View Source | info | mail.viewSource | | V
+
+menu readRelated
+item | Messages in this Conversation | conversation | mail.findRelated | {"kind":"conversation"} | C
+item | Messages from Sender | person | mail.findRelated | {"kind":"sender"} | S
+
+menu readSelect
+item | Select All | check | format.selectAll | | A
+
+menu moreRead
+sub | Junk | junk | readJunk | | J
+item | Meeting | meeting | mail.replyWithMeeting | | M
+sub | Actions | more | readActions | | A
+sub | Related | conversation | readRelated | | R
+sub | Select | check | readSelect | | S

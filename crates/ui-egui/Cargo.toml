@@ -1,0 +1,29 @@
+[package]
+name = "mailcraft-ui-egui"
+description = "MailCraft's Outlook-style user interface on egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-geom.workspace = true
+mailcraft-model.workspace = true
+mailcraft-mime.workspace = true
+mailcraft-fonts.workspace = true
+mailcraft-html.workspace = true
+mailcraft-layout.workspace = true
+mailcraft-engine.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+# SVG rasterising for the app icon (Apache-2.0 OR MIT; same version egui_extras' svg loader uses).
+resvg = { version = "0.45.1", default-features = false }
+
+[dev-dependencies]
+egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+
+[lints]
+workspace = true

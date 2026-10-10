@@ -1,0 +1,495 @@
+# MailCraft ribbon definitions: main window, Mail module (plus the Search contextual tab).
+#
+# Behaviour, group/control order, feature names and keytips follow plan/outlook/ribbon-mail.md, search.md and
+# responsive.md; icons and wording beyond feature names are our own. Grammar (see ribbon/defs.rs):
+#
+#   surface <name>                      main | search | compose | read | calendar | people | tasks | notes
+#   mode simplified|classic|both
+#   tab <Name> | <keytip> | <opts>      opts: more=<menu> (the "…" menu, Simplified)
+#   group <Name> | <keytip> | <opts>    opts: s<W>=<act> c<W>=<act> (width rules), icon=, launch=<cmd>{json}, rows
+#   <kind> <size> | <label> | <icon> | <cmd> | <params> | <keytip> | <opts>
+#        kind: button split drop toggle check gallery combo edit;  size: L large, S small, I small icon-only
+#        opts: menu=<name> on=<state> dyn=<source> w=<px> s<W>=<act> c<W>=<act>
+#   br                                  next row (groups with the `rows` option, Classic)
+#   menu <name>                         then: item | label | icon | cmd | params | keytip | opts
+#                                             sub | label | icon | <menu> | | keytip
+#                                             dyn | <source> | cmd | params template
+#                                             sep
+#
+# Width rules apply when the effective window width is at or below W. Simplified actions: nolabel, nolabel1
+# (all but the first control lose labels), narrow (galleries), overflow (into the "…" menu). Classic actions:
+# nolabel (small buttons lose labels), small (large → small), iconly (everything icon-only), narrow (galleries
+# show one column), collapse (the group becomes one dropdown button).
+
+surface main
+mode simplified
+
+tab Home | H | more=moreHome
+group New | ZW
+split S | New Email | new-mail | mail.newEmail | | N | menu=newItems
+group Move & Delete | ZA | s1366=nolabel1
+split S | Delete | delete | mail.delete | | D | menu=deleteMore
+button S | Archive... | archive | mail.archive | | O
+drop S | Move | move | | | MV | menu=move s400=overflow
+group Report | R | s1280=nolabel s900=overflow
+split S | Report | junk | mail.report | {"kind":"junk"} | R1 | menu=report
+group Respond | ZR | s1280=nolabel
+button S | Reply | reply | mail.reply | | RP
+button S | Reply All | reply-all | mail.replyAll | | RA
+button S | Forward | forward | mail.forward | | FW
+group Quick Steps | ZQ | s1600=narrow s1024=overflow
+gallery S | Quick Steps | quick-steps | | | QS | dyn=quicksteps menu=quickSteps w=359
+group Tags | ZT | s600=overflow
+button S | Unread/Read | envelope-open | mail.toggleRead | | W
+drop I | Categorize | categorize | | | G | menu=categorize s700=overflow
+drop I | Follow Up | flag | | | U | menu=followUp s700=overflow
+group Find | ZN | s900=overflow
+edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=130
+button I | Address Book... | address-book | compose.addressBook | | AB
+drop I | Filter Email | filter | | | L | menu=filterEmail
+group Speech | Z4 | s1366=overflow
+button S | Read Aloud | conversation | review.readAloud | | R2
+
+tab Send / Receive | JS | more=moreSendReceive
+group Send & Receive | ZS
+button S | Send/Receive All Folders | sync | sendReceive.all | | S
+button S | Send All | send | sendReceive.sendAll | | A
+button S | Update Folder | folder-open | sendReceive.folder | | D
+drop S | Send/Receive Groups | sync | | | G | menu=sendReceiveGroups
+group Download | ZD
+button S | Show Progress... | info | sendReceive.showProgress | | P
+button S | Cancel All | close | sendReceive.cancelAll | | C
+group Preferences | ZP
+toggle S | Work Offline | warning | sendReceive.workOffline | {"offline":"$on"} | W | on=mem:offline
+
+tab View | V | more=moreView
+group Focused Inbox | C
+toggle S | Show Focused Inbox | inbox | view.focusedInbox | | W | on=focused
+group Current View | ZV
+drop S | Change View | view | | | CV | menu=changeView
+drop S | Current View | conversation | | | Y1 | menu=currentView
+group Arrangement | ZM
+drop S | Arrange By | sort | | | AB | menu=arrangeBy
+toggle S | Reverse Sort | sort-up | view.reverseSort | | RS | on=reverse
+group Layout | ZS
+toggle S | Use Tighter Spacing | view | view.tighterSpacing | | U | on=tighter
+drop S | Layout | reading-pane | | | Y2 | menu=layout
+
+tab Help | E | more=moreHelp
+group Help | H
+button S | Help | help | help.help | | H
+button S | Contact Support... | person | help.contactSupport | | C
+button S | Feedback | email | help.feedback | | F
+button S | Suggest a Feature | info | help.feedback | {"kind":"suggestion"} | S1
+button S | Show Training | today | help.showTraining | | S2
+button S | What's New | bell | help.whatsNew | | W
+
+mode classic
+
+tab Home | H
+group New | ZW
+button L | New Email | new-mail | mail.newEmail | | N1
+drop L | New Items | new-items | | | I | menu=newItems
+group Delete | ZD | c1366=nolabel
+toggle S | Ignore | ignore | mail.ignore | | X | on=ignored
+drop S | Clean Up | clean-up | | | C | menu=cleanUp
+drop S | Block | block | | | J | menu=block
+button L | Delete | delete | mail.delete | | D
+button L | Archive... | archive | mail.archive | | O1
+group Report | Z1 | c1024=collapse
+split L | Report | junk | mail.report | {"kind":"junk"} | R1 | menu=report
+group Respond | ZR | c1024=small
+button L | Reply | reply | mail.reply | | RP
+button L | Reply All | reply-all | mail.replyAll | | RA
+button L | Forward | forward | mail.forward | | FW
+button S | Meeting | meeting | mail.replyWithMeeting | | MR | c1366=nolabel
+drop S | More | more | | | ME | menu=respondMore
+group Quick Steps | ZQ | c1366=narrow c900=collapse launch=quicksteps.manage
+gallery L | Quick Steps | quick-steps | | | QS | dyn=quicksteps menu=quickSteps w=270
+group Move | ZA | c1024=collapse
+drop L | Move | move | | | MV | menu=move c1366=small
+drop L | Rules | rules | | | RR | menu=rules c1366=small
+group Tags | ZT | c1024=collapse
+button L | Unread/Read | envelope-open | mail.toggleRead | | W
+drop L | Categorize | categorize | | | G | menu=categorize c1366=small
+drop L | Follow Up | flag | | | U | menu=followUp c1366=small
+group Find | ZN | c800=collapse
+edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=140
+button S | Address Book... | address-book | compose.addressBook | | AB
+drop S | Filter Email | filter | | | L | menu=filterEmail
+group Speech | Z4
+button L | Read Aloud | conversation | review.readAloud | | R2
+
+tab Send / Receive | JS
+group Send & Receive | ZS1
+button L | Send/Receive All Folders | sync | sendReceive.all | | S
+button S | Update Folder | folder-open | sendReceive.folder | | D
+button S | Send All | send | sendReceive.sendAll | | A
+drop S | Send/Receive Groups | sync | | | G | menu=sendReceiveGroups
+group Download | ZD
+button L | Show Progress... | info | sendReceive.showProgress | | P
+button L | Cancel All | close | sendReceive.cancelAll | | C
+group Server | ZS2
+button L | Download Headers | envelope-open | sendReceive.downloadHeaders | | H
+split S | Mark to Download | check | sendReceive.markToDownload | | M | menu=markToDownload
+split S | Unmark to Download | minus | sendReceive.unmarkToDownload | | U | menu=unmarkToDownload
+split S | Process Marked Headers | sync | sendReceive.processMarked | | R | menu=processMarked
+group Preferences | ZP
+drop L | Download Preferences | settings | | | L | menu=downloadPreferences
+toggle L | Work Offline | warning | sendReceive.workOffline | {"offline":"$on"} | W | on=mem:offline
+
+tab Folder | O
+group New | ZN
+button L | New Folder... | folder | folder.new | | N
+button L | New Search Folder... | search-folder | folder.newSearchFolder | | SF
+group Actions | ZA
+button L | Rename Folder | folder | folder.rename | | RN
+button S | Copy Folder | copy | folder.copy | | CF
+button S | Move Folder | move | folder.move | | MF
+button S | Delete Folder | delete | folder.delete | | DF
+group Clean Up | ZC
+button L | Mark All as Read | read | folder.markAllRead | | MA
+button L | Run Rules Now... | rules | folder.runRulesNow | | RR
+toggle L | Show All Folders A to Z | sort | folder.showAllAZ | {"on":"$!on"} | H | on=mem:allaz
+drop S | Clean Up Folder | clean-up | | | CU | menu=cleanUpFolder
+button S | Delete All | delete | folder.deleteAll | | DA
+button S | Recover Deleted Items... | undo | folder.recoverDeleted | | RD
+group Favorites | ZF
+toggle L | Add to Favorites | favorites | folder.addFavorite | | FA | on=favorite oncmd=folder.removeFavorite{"folder":"$folder"}
+group Properties | ZP
+button L | AutoArchive Settings | archive-folder | folder.autoArchiveSettings | | A
+button L | Folder Properties | settings | folder.properties | | P
+
+tab View | V
+group Current View | ZV1
+drop L | Change View | view | | | CV | menu=changeView
+button L | View Settings... | settings | view.viewSettings | | V
+button L | Reset View | undo | view.resetView | | X
+group Messages | ZC
+check S | Show as Conversations | conversation | view.conversations | | GC | on=conversations
+drop S | Conversation Settings | settings | | | CS | menu=conversationSettings
+group Focused Inbox | Z1
+toggle L | Show Focused Inbox | inbox | view.focusedInbox | | W | on=focused
+group Arrangement | ZM
+drop L | Message Preview | view | | | PL | menu=messagePreview
+gallery L | Arrange By | sort | | | AB | dyn=arrange menu=arrangeBy w=440
+toggle S | Reverse Sort | sort-up | view.reverseSort | | RS | on=reverse
+button S | Add Columns | table | view.addColumns | | AC
+drop S | Expand/Collapse | collapse-ribbon | | | E | menu=expandCollapse
+group Layout | ZS
+toggle L | Use Tighter Spacing | view | view.tighterSpacing | | U | on=tighter
+drop L | Folder Pane | folder-pane | | | F | menu=folderPane
+drop L | Reading Pane | reading-pane | | | PN | menu=readingPane
+drop L | To-Do Bar | tasks | | | B | menu=todoBar
+group Window | ZW
+button L | Reminders Window | bell | view.reminderWindow | | M
+button L | Open in New Window | folder-open | folder.openInNewWindow | | ON
+button L | Close All Items | close | app.closeAllItems | | CA
+
+tab Help | E
+group Help | Z1
+button L | Help | help | help.help | | H
+button L | Contact Support... | person | help.contactSupport | | C
+button L | Feedback | email | help.feedback | | F
+button L | Suggest a Feature | info | help.feedback | {"kind":"suggestion"} | S1
+button L | Show Training | today | help.showTraining | | S2
+button L | What's New | bell | help.whatsNew | | W
+
+# ------------------------------------------------------------------------------------------------------------
+# Search contextual tab (shown while the search box is active). One definition for both ribbon modes.
+
+surface search
+mode both
+
+tab Search | JS2 | more=moreSearch
+group Refine | ZR
+button S | From | person | search.refine | {"kind":"from"} | OM
+button S | Subject | email | search.refine | {"kind":"subject"} | B
+toggle S | Has Attachments | attach | search.refine | {"kind":"hasAttachments"} | H | on=tok:hasattachments:yes
+drop S | Categorized | categorize | | | G | menu=searchCategorized
+drop S | Sent To | person | | | ST | menu=searchSentTo
+toggle S | Unread | unread | search.refine | {"kind":"unread"} | U | on=tok:isread:no
+toggle S | Flagged | flag | search.refine | {"kind":"flagged"} | F | on=tok:isflagged:yes
+toggle S | Important | importance-high | search.refine | {"kind":"important"} | I1 | on=tok:importance:high
+drop S | More | more | | | MR | menu=searchMore
+group Scope | ZS
+toggle S | All Mailboxes | account | search.scope | {"scope":"allMailboxes"} | A | on=scope:allMailboxes
+toggle S | Current Mailbox | inbox | search.scope | {"scope":"currentMailbox"} | C1 | on=scope:currentMailbox
+toggle S | Current Folder | folder | search.scope | {"scope":"currentFolder"} | CF | on=scope:currentFolder
+toggle S | Subfolders | folder-open | search.scope | {"scope":"subfolders"} | SU | on=scope:subfolders
+toggle S | All Outlook Items | search | search.scope | {"scope":"allItems"} | OL | on=scope:allItems
+group Results | ZE
+toggle S | Include Deleted Items | deleted | search.scope | {"includeDeleted":"$!on"} | I2 | on=mem:includeDeleted
+group Options | ZO
+drop S | Recent Searches | search | | | N | menu=recentSearches
+drop S | Search Tools | settings | | | SS | menu=searchTools
+group Close | ZC
+button L | Close Search | close | search.close | | CS
+
+# ------------------------------------------------------------------------------------------------------------
+# Menus
+
+menu newItems
+item | E-mail Message | mail | mail.newEmail | | M
+item | Appointment | appointment | mail.newItem | {"kind":"appointment"} | A
+item | Meeting | meeting | mail.newItem | {"kind":"meeting"} | E
+item | Contact | person | mail.newItem | {"kind":"contact"} | C
+item | Task | task | mail.newItem | {"kind":"task"} | T
+sep
+sub | E-mail Message Using | mail | emailUsing | | U
+sub | More Items | new-items | moreItems | | I
+
+menu emailUsing
+item | More Stationery... | | mail.newEmail | {"pickStationery":true} | M
+sep
+item | Plain Text | | mail.newEmail | {"format":"plain"} | P
+item | Rich Text | | mail.newEmail | {"format":"rich"} | R
+item | HTML | | mail.newEmail | {"format":"html"} | H
+
+menu moreItems
+item | Post in This Folder | | mail.newItem | {"kind":"post"} | P
+item | Contact Group | contact-group | mail.newItem | {"kind":"contactGroup"} | G
+item | Task Request | task | mail.newItem | {"kind":"taskRequest"} | Q
+item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
+item | Outlook Data File... | | file.newDataFile | | F
+
+menu deleteMore
+item | Ignore | ignore | mail.ignore | | I | on=ignored
+item | Clean Up Conversation | clean-up | mail.cleanUpConversation | | C
+item | Clean Up Folder | | mail.cleanUpFolder | | L
+item | Clean Up Folder & Subfolders | | mail.cleanUpSubfolders | | E
+
+menu cleanUp
+item | Clean Up Conversation | clean-up | mail.cleanUpConversation | | C
+item | Clean Up Folder | | mail.cleanUpFolder | | L
+item | Clean Up Folder & Subfolders | | mail.cleanUpSubfolders | | E
+
+menu cleanUpFolder
+item | Clean Up Folder | clean-up | mail.cleanUpFolder | | L
+item | Clean Up Folder & Subfolders | | mail.cleanUpSubfolders | | E
+
+menu block
+item | Block Sender | block | mail.block | {"kind":"sender"} | B
+item | Never Block Sender | | mail.block | {"kind":"neverSender"} | S
+item | Never Block Sender's Domain | | mail.block | {"kind":"neverDomain"} | D
+item | Never Block this Group or Mailing List | | mail.block | {"kind":"neverList"} | M
+sep
+item | Junk E-mail Options... | junk | mail.junk | {"action":"options"} | O
+
+menu report
+item | Report Phishing | warning | mail.report | {"kind":"phishing"} | P
+item | Report Junk | junk | mail.report | {"kind":"junk"} | J
+
+menu respondMore
+item | Forward as Attachment | forward | mail.forwardAsAttachment | | F
+
+menu move
+item | Other Folder... | folder | mail.move | | O
+item | Copy to Folder... | copy | mail.copy | | C
+sep
+item | Always Move Messages in This Conversation... | | mail.alwaysMoveConversation | | A
+
+menu rules
+item | Always Move Messages From Sender... | | rules.alwaysMoveFrom | | M
+sep
+item | Create Rule... | rules | rules.createFromMessage | | U
+item | Manage Rules & Alerts... | settings | rules.manage | | L
+
+menu quickSteps
+dyn | quicksteps | quicksteps.run | {"id":"$id"}
+sep
+sub | New Quick Step | plus | newQuickStep | | N
+item | Manage Quick Steps... | settings | quicksteps.manage | | M
+
+menu newQuickStep
+item | Move to Folder... | move | quicksteps.new | {"template":"moveToFolder"} | M
+item | Categorize & Move... | categorize | quicksteps.new | {"template":"categorizeMove"} | T
+item | Flag & Move... | flag | quicksteps.new | {"template":"flagMove"} | G
+item | New E-mail To... | new-mail | quicksteps.new | {"template":"newEmailTo"} | N
+item | Forward To... | forward | quicksteps.new | {"template":"forwardTo"} | F
+item | New Meeting... | meeting | quicksteps.new | {"template":"newMeeting"} | W
+sep
+item | Custom... | | quicksteps.new | {"template":"custom"} | C
+
+menu categorize
+item | Clear All Categories | | mail.clearCategories | | C
+sep
+dyn | categories | mail.categorize | {"name":"$name"}
+sep
+item | All Categories... | category-tag | mail.allCategories | | A
+item | Set Quick Click... | | categories.setQuickClick | | Q
+
+menu followUp
+item | Today | flag | mail.flag | {"kind":"today"} | T
+item | Tomorrow | flag | mail.flag | {"kind":"tomorrow"} | O
+item | This Week | flag | mail.flag | {"kind":"thisWeek"} | W
+item | Next Week | flag | mail.flag | {"kind":"nextWeek"} | N
+item | No Date | flag | mail.flag | {"kind":"noDate"} | A
+item | Custom... | flag | mail.flagCustom | | C
+sep
+item | Add Reminder... | bell | mail.addReminder | | R
+item | Mark Complete | flag-complete | mail.markComplete | | M
+item | Clear Flag | | mail.clearFlag | | E
+sep
+item | Set Quick Click... | | mail.setQuickClickFlag | | Q
+item | Set Quick Actions... | | view.quickActions | | S
+
+menu filterEmail
+item | Unread | unread | view.filter | {"kind":"unread"} | U | on=filter:unread
+item | Has Attachments | attach | view.filter | {"kind":"hasAttachments"} | H | on=tok:hasattachments:yes
+sub | Categorized | categorize | filterCategorized | | C
+item | Flagged | flag | view.filter | {"kind":"flagged"} | F | on=filter:flagged
+item | Important | importance-high | view.filter | {"kind":"important"} | I | on=tok:importance:high
+item | Sent To: Me or CC: Me | person | view.filter | {"kind":"toOrCcMe"} | S | on=tok:tocc:me
+item | View Items Expiring Soon | | view.filter | {"kind":"expiringSoon"} | V | on=tok:expires:soon
+sep
+item | More Filters... | filter | search.refine | | M
+
+menu filterCategorized
+dyn | categories | view.filter | {"kind":"category","name":"$name"}
+sep
+item | Any Category | | view.filter | {"kind":"anyCategory"} | A | on=tok:category:any
+item | No Categories | | view.filter | {"kind":"noCategory"} | N | on=tok:category:none
+
+menu moreHome
+sub | Block | block | block | | B
+sub | Rules | rules | rules | | S
+item | Meeting | meeting | mail.replyWithMeeting | | M
+item | Forward as Attachment | forward | mail.forwardAsAttachment | | F
+
+menu sendReceiveGroups
+item | All Accounts | sync | sendReceive.all | | 0
+dyn | accounts | sendReceive.group | {"name":"$name"}
+
+menu markToDownload
+item | Mark to Download | check | sendReceive.markToDownload | | T
+item | Mark to Download Message Copy | copy | sendReceive.markToDownload | {"copy":true} | C
+
+menu unmarkToDownload
+item | Unmark to Download | minus | sendReceive.unmarkToDownload | | U
+item | Unmark All to Download | | sendReceive.unmarkToDownload | {"all":true} | K
+
+menu processMarked
+item | Process Marked Headers | sync | sendReceive.processMarked | | P
+item | Process Marked Headers in All Folders | | sendReceive.processMarked | {"allFolders":true} | O
+
+menu downloadPreferences
+item | Download Full Items | | sendReceive.preferences | {"mode":"full"} | F
+item | Download Headers and Then Full Items | | sendReceive.preferences | {"mode":"headersThenFull"} | D
+item | Download Headers | | sendReceive.preferences | {"mode":"headers"} | H
+sep
+item | On Slow Connections Download Only Headers | | sendReceive.preferences | {"slowHeadersOnly":true} | S
+
+menu moreSendReceive
+item | Download Headers | envelope-open | sendReceive.downloadHeaders | | H
+sub | Mark to Download | check | markToDownload | | T
+sub | Unmark to Download | minus | unmarkToDownload | | U
+sub | Process Marked Headers | sync | processMarked | | P
+sub | Download Preferences | settings | downloadPreferences | | D
+
+menu changeView
+item | Compact | view | view.changeView | {"name":"Compact"} | C | on=layout:compact
+item | Single | view | view.changeView | {"name":"Single"} | S | on=layout:single
+item | Preview | view | view.changeView | {"name":"Preview"} | P | on=layout:preview
+sep
+item | Manage Views... | settings | view.manageViews | | M
+item | Save Current View As a New View... | save | view.saveViewAs | | S
+item | Apply Current View to Other Mail Folders... | | view.applyViewTo | | A
+
+menu currentView
+item | Show as Conversations | conversation | view.conversations | | H | on=conversations
+sub | Conversation Settings | settings | conversationSettings | | C
+sub | Message Preview | view | messagePreview | | M
+sep
+item | View Settings... | settings | view.viewSettings | | V
+item | Reset View | undo | view.resetView | | R
+
+menu conversationSettings
+item | Show Messages from Other Folders | | view.conversationSettings | {"setting":"fromOtherFolders","on":"$!on"} | O | on=mem:convOtherFolders=1
+item | Show Senders Above the Subject | | view.conversationSettings | {"setting":"sendersAboveSubject","on":"$!on"} | S | on=mem:convSendersAbove=1
+item | Always Expand Selected Conversation | | view.conversationSettings | {"setting":"alwaysExpand","on":"$!on"} | A | on=mem:convAlwaysExpand
+item | Use Classic Indented View | | view.conversationSettings | {"setting":"classicIndent","on":"$!on"} | U | on=mem:convClassicIndent
+
+menu messagePreview
+item | Off | | view.messagePreview | {"lines":0} | O | on=preview:0
+item | 1 Line | | view.messagePreview | {"lines":1} | 1 | on=preview:1
+item | 2 Lines | | view.messagePreview | {"lines":2} | 2 | on=preview:2
+item | 3 Lines | | view.messagePreview | {"lines":3} | 3 | on=preview:3
+
+menu arrangeBy
+dyn | arrange | view.arrangeBy | {"key":"$key"}
+sep
+item | Show in Groups | | view.showInGroups | | W | on=groups
+item | View Settings... | settings | view.viewSettings | | V
+
+menu expandCollapse
+item | Collapse This Group | chevron-up | view.collapseGroup | | C
+item | Expand This Group | chevron-down | view.expandGroup | | E
+item | Collapse All Groups | | view.collapseAll | | G
+item | Expand All Groups | | view.expandAll | | X
+
+menu layout
+sub | Folder Pane | folder-pane | folderPane | | F
+sub | Reading Pane | reading-pane | readingPane | | R
+sub | To-Do Bar | tasks | todoBar | | B
+
+menu folderPane
+item | Normal | | view.folderPane | {"mode":"normal"} | N | on=fp:normal
+item | Minimized | | view.folderPane | {"mode":"minimized"} | M | on=fp:minimized
+item | Off | | view.folderPane | {"mode":"off"} | O | on=fp:off
+sep
+item | Favorites | favorites | view.favorites | | F | on=favorites
+
+menu readingPane
+item | Right | | view.readingPane | {"position":"right"} | R | on=rp:right
+item | Bottom | | view.readingPane | {"position":"bottom"} | B | on=rp:bottom
+item | Off | | view.readingPane | {"position":"off"} | O | on=rp:off
+sep
+item | Options... | settings | view.readingPaneOptions | | N
+
+menu todoBar
+item | Calendar | calendar | view.todoBar | {"part":"calendar"} | C
+item | People | people | view.todoBar | {"part":"people"} | P
+item | Tasks | tasks | view.todoBar | {"part":"tasks"} | T
+item | Off | | view.todoBar | {"part":"off"} | O
+
+menu moreView
+item | Add Columns | table | view.addColumns | | C
+sub | Expand/Collapse | collapse-ribbon | expandCollapse | | X
+item | Reminders Window | bell | view.reminderWindow | | I
+item | Open in New Window | folder-open | folder.openInNewWindow | | W
+item | Close All Items | close | app.closeAllItems | | E
+
+menu moreHelp
+item | About MailCraft | info | help.about | | A
+
+menu searchCategorized
+dyn | categories | search.refine | {"kind":"categorized","value":"$name"}
+sep
+item | Any Category | | search.refine | {"kind":"categorized","value":"any"} | A | on=tok:category:any
+item | No Categories | | search.refine | {"kind":"categorized","value":"none"} | N | on=tok:category:none
+
+menu searchSentTo
+item | Sent To: Me or CC: Me | person | search.refine | {"kind":"sentTo","value":"me"} | S | on=tok:tocc:me
+item | Not Sent Directly to Me | | search.refine | {"kind":"sentTo","value":"notMe"} | N | on=tok:-to:me
+item | Sent to Another Recipient | | search.refine | {"kind":"sentTo","value":"other"} | A
+
+menu searchMore
+item | View Items Expiring Soon | | search.refine | {"kind":"expiringSoon"} | V | on=tok:expires:soon
+item | Add Form Field... | plus | search.refine | | A
+
+menu recentSearches
+item | Recent Searches... | search | search.recent | | R
+
+menu searchTools
+item | Include Older Results | | search.includeOlderResults | {"on":"$!on"} | I | on=mem:olderResults
+item | Indexing Status... | info | search.searchTools | {"tool":"indexingStatus"} | N
+sub | Locations to Search | account | searchLocations | | L
+item | Advanced Find... | search | search.advancedFind | | F
+item | Search Options... | settings | options.open | {"page":"search"} | O
+
+menu searchLocations
+dyn | accounts | search.scope | {"store":"$name","on":true}
+
+menu moreSearch
+item | Advanced Find... | search | search.advancedFind | | F

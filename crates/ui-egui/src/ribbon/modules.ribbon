@@ -1,0 +1,346 @@
+# Module ribbons (plan/outlook/modules.md): Home tabs for Calendar, People, Tasks and Notes, plus the module
+# View tabs that differ from Mail (Calendar, Notes) and the Calendar Folder tab. Only the Classic ribbon was
+# observed; the Simplified ribbon is derived. Tabs a module does not define fall back to the Mail ones.
+
+surface calendar
+mode classic
+
+tab Home | H
+group New | ZW
+button L | New Appointment | appointment | mail.newItem | {"kind":"appointment"} | N1
+button L | New Meeting | meeting | mail.newItem | {"kind":"meeting"} | MR
+drop L | New Items | new-items | | | I | menu=calendarNewItems
+group Go To | ZG | launch=calendar.goToDate
+button L | Today | today | calendar.today | | OD
+button L | Next 7 Days | week | calendar.next7Days | | X
+group Arrange | ZR | c1024=collapse launch=options.open{"page":"calendar"}
+toggle L | Day | day | calendar.arrange | {"mode":"day"} | R | on=cal:day
+toggle L | Work Week | work-week | calendar.arrange | {"mode":"workWeek"} | K | on=cal:workWeek
+toggle L | Week | week | calendar.arrange | {"mode":"week"} | W | on=cal:week
+toggle L | Month | month | calendar.arrange | {"mode":"month"} | T | on=cal:month
+toggle L | Schedule View | schedule | calendar.arrange | {"mode":"schedule"} | SV | on=cal:schedule
+group Manage Calendars | ZC | c900=collapse
+drop L | Add Calendar | plus | | | OC | menu=addCalendar
+drop L | Share Calendar | calendar | | | SC | menu=shareCalendar
+group Find | ZN | c800=collapse
+edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=140
+button S | Address Book... | address-book | compose.addressBook | | AB
+
+tab Folder | O
+group New | ZN
+button L | New Calendar... | calendar | folder.new | | N
+group Actions | ZA
+button L | Rename Calendar | calendar | folder.rename | | RN
+button S | Copy Calendar | copy | folder.copy | | CF
+button S | Move Calendar | move | folder.move | | MF
+button S | Delete Calendar | delete | folder.delete | | DF
+group Share | ZS
+drop L | Add Calendar | plus | | | OC | menu=addCalendar
+drop L | Share Calendar | calendar | | | SC | menu=shareCalendar
+group Properties | ZP
+button L | Calendar Properties | settings | folder.properties | | P
+
+tab View | V
+group Current View | ZV1
+drop L | Change View | view | | | CV | menu=calendarChangeView
+button S | View Settings... | settings | view.viewSettings | | V
+button S | Reset View | undo | view.resetView | | X
+group Arrangement | ZM | launch=options.open{"page":"calendar"}
+toggle L | Day | day | calendar.arrange | {"mode":"day"} | R | on=cal:day
+toggle L | Work Week | work-week | calendar.arrange | {"mode":"workWeek"} | K | on=cal:workWeek
+toggle L | Week | week | calendar.arrange | {"mode":"week"} | W1 | on=cal:week
+toggle L | Month | month | calendar.arrange | {"mode":"month"} | T | on=cal:month
+toggle L | Schedule View | schedule | calendar.arrange | {"mode":"schedule"} | SV | on=cal:schedule
+drop S | Time Scale | schedule | | | SC | menu=timeScale
+toggle S | Overlay | calendar | calendar.overlay | {"on":"$!on"} | OL | on=mem:calOverlay
+toggle S | Working Hours | work-week | calendar.workingHours | {"on":"$!on"} | WH | on=mem:calWorkingHours
+group Color | ZC
+drop L | Color | font-color | | | CR | menu=calendarColor
+group Layout | ZS
+drop L | Daily Task List | tasks | | | D | menu=dailyTaskList
+drop L | Folder Pane | folder-pane | | | F | menu=folderPane
+drop L | Reading Pane | reading-pane | | | PN | menu=readingPane
+drop L | To-Do Bar | tasks | | | B | menu=todoBar
+group Window | ZW
+button L | Reminders Window | bell | view.reminderWindow | | M
+button L | Open in New Window | folder-open | folder.openInNewWindow | | ON
+button L | Close All Items | close | app.closeAllItems | | CA
+
+surface people
+mode classic
+
+tab Home | H
+group New | ZW
+button L | New Contact | person | people.new | | N1
+button L | New Contact Group | contact-group | people.newGroup | | CG
+drop L | New Items | new-items | | | I | menu=peopleNewItems
+group Delete | ZD
+button L | Delete | delete | people.delete | | D
+group Communicate | ZC | c1024=collapse
+button L | Meeting | meeting | people.meeting | | TI
+drop L | More | more | | | J | menu=peopleMore
+group Current View | ZV | c900=collapse
+gallery L | Current View | view | | | CV | dyn=views:people menu=peopleChangeView w=220
+group Actions | ZA | c1024=collapse
+drop L | Move | move | | | MV | menu=peopleMove
+button L | Mail Merge... | email | people.mailMerge | {"contacts":"all","output":"letters"} | RG
+group Share | ZS | c1024=collapse
+drop L | Forward Contact | forward | | | FW | menu=forwardContact
+group Tags | ZT | c1024=collapse
+drop S | Categorize | categorize | | | G | menu=peopleCategorize
+drop S | Follow Up | flag | | | U | menu=followUp
+button S | Private | private | mail.togglePrivate | | V
+group Find | ZN | c800=collapse
+edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=140
+button S | Address Book... | address-book | compose.addressBook | | AB
+
+surface tasks
+mode classic
+
+tab Home | H
+group New | ZW
+button L | New Task | task | tasks.new | | N1
+button L | New Email | new-mail | mail.newEmail | | E
+drop L | New Items | new-items | | | I | menu=tasksNewItems
+group Delete | ZD
+button L | Delete | delete | tasks.delete | | D
+group Respond | ZR | c1366=nolabel c1024=collapse
+button L | Reply | reply | mail.reply | | RP
+button L | Reply All | reply-all | mail.replyAll | | RA
+button L | Forward | forward | mail.forward | | FW
+button S | Meeting | meeting | mail.replyWithMeeting | | MR
+drop S | More | more | | | ME | menu=respondMore
+group Manage Task | ZG
+button L | Mark Complete | flag-complete | tasks.markComplete | | C1
+button L | Remove from List | close | tasks.removeFromList | | RL
+group Follow Up | ZF | c1024=collapse
+button S | Today | flag | mail.flag | {"kind":"today"} | T
+button S | Tomorrow | flag | mail.flag | {"kind":"tomorrow"} | S
+button S | This Week | flag | mail.flag | {"kind":"thisWeek"} | K
+button S | Next Week | flag | mail.flag | {"kind":"nextWeek"} | W
+button S | No Date | flag | mail.flag | {"kind":"noDate"} | N2
+button S | Custom... | flag | mail.flagCustom | | Q
+group Current View | ZV | c900=collapse
+gallery L | Current View | view | | | CV | dyn=views:tasks menu=tasksChangeView w=220
+group Actions | ZA | c1024=collapse
+drop L | Move | move | | | MV | menu=tasksMove
+group Tags | ZT | c1024=collapse
+drop S | Categorize | categorize | | | G | menu=tasksCategorize
+button S | Private | private | mail.private | | V
+button S | High Importance | importance-high | mail.importance | {"level":"high"} | H
+button S | Low Importance | importance-low | mail.importance | {"level":"low"} | L
+group Find | ZN | c800=collapse
+edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=140
+button S | Address Book... | address-book | compose.addressBook | | AB
+
+surface notes
+mode classic
+
+tab Home | H
+group New | ZW
+button L | New Note | note | notes.new | | N1
+drop L | New Items | new-items | | | I | menu=notesNewItems
+group Delete | ZD
+button L | Delete | delete | notes.delete | | D
+group Current View | ZV | c900=collapse
+gallery L | Current View | view | | | CV | dyn=views:notes menu=notesChangeView w=200
+group Actions | ZA | c1024=collapse
+button L | Forward | forward | mail.forward | | FW
+drop L | Move | move | | | MV | menu=notesMove
+group Tags | ZT
+drop L | Categorize | categorize | | | G | menu=notesCategorize
+group Find | ZN | c800=collapse
+edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=140
+button S | Address Book... | address-book | compose.addressBook | | AB
+
+tab View | V
+group Current View | ZV1
+drop L | Change View | view | | | CV | menu=notesChangeView
+button S | View Settings... | settings | view.viewSettings | | V
+button S | Reset View | undo | view.resetView | | X
+group Arrangement | ZM
+toggle L | Large Icons | note | notes.iconView | {"mode":"large"} | L1 | on=mem:notesView.large=1
+toggle L | Small Icons | note | notes.iconView | {"mode":"small"} | S | on=mem:notesView.small
+toggle L | List | bullets | notes.iconView | {"mode":"list"} | T | on=mem:notesView.list
+button L | Line Up Icons | align-left | notes.lineUpIcons | | I
+group Layout | ZS
+toggle L | Use Tighter Spacing | view | view.tighterSpacing | | U | on=tighter
+drop L | Folder Pane | folder-pane | | | F | menu=folderPane
+drop L | Reading Pane | reading-pane | | | PN | menu=readingPane
+drop L | To-Do Bar | tasks | | | B | menu=todoBar
+group Window | ZW
+button L | Reminders Window | bell | view.reminderWindow | | M
+button L | Open in New Window | folder-open | folder.openInNewWindow | | ON
+button L | Close All Items | close | app.closeAllItems | | CA
+
+# ------------------------------------------------------------------------------------------------------------
+# Menus
+
+menu calendarNewItems
+item | E-mail Message | mail | mail.newEmail | | M
+item | Appointment | appointment | mail.newItem | {"kind":"appointment"} | A
+item | Meeting | meeting | mail.newItem | {"kind":"meeting"} | E
+item | Contact | person | mail.newItem | {"kind":"contact"} | C
+item | Task | task | mail.newItem | {"kind":"task"} | T
+item | All Day Event | appointment | mail.newItem | {"kind":"appointment"} | V
+sep
+sub | More Items | new-items | calendarMoreItems | | I
+
+menu calendarMoreItems
+item | Recurring Appointment | recurrence | mail.newItem | {"kind":"appointment"} | A
+item | Recurring Meeting | recurrence | mail.newItem | {"kind":"meeting"} | C
+item | Contact Group | contact-group | mail.newItem | {"kind":"contactGroup"} | G
+item | Task Request | task | mail.newItem | {"kind":"taskRequest"} | Q
+item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
+item | Outlook Data File... | | file.newDataFile | | F
+
+menu addCalendar
+item | From Address Book... | address-book | calendar.addCalendar | {"source":"addressBook"} | A
+item | From Room List... | location | calendar.addCalendar | {"source":"roomList"} | R
+item | From Internet... | link | calendar.addCalendar | {"source":"internet"} | I
+item | Create New Blank Calendar... | plus | folder.new | | B
+item | Open Shared Calendar... | calendar | calendar.addCalendar | {"source":"shared"} | O
+
+menu shareCalendar
+item | Calendar | calendar | calendar.share | | C
+
+menu calendarChangeView
+item | Calendar | calendar | view.changeView | {"name":"Calendar"} | C
+item | Preview | view | view.changeView | {"name":"Preview"} | P
+item | List | bullets | view.changeView | {"name":"List"} | L
+item | Active | check | view.changeView | {"name":"Active"} | A
+sep
+item | Manage Views... | settings | view.manageViews | | M
+item | Save Current View As a New View... | save | view.saveViewAs | | S
+item | Apply Current View to Other Calendar Folders... | | view.applyViewTo | | A
+
+menu timeScale
+item | 60 Minutes | | calendar.timeScale | {"minutes":60} | 6 | on=mem:timeScale.60
+item | 30 Minutes | | calendar.timeScale | {"minutes":30} | 3 | on=mem:timeScale.30=1
+item | 15 Minutes | | calendar.timeScale | {"minutes":15} | 1 | on=mem:timeScale.15
+item | 10 Minutes | | calendar.timeScale | {"minutes":10} | 0 | on=mem:timeScale.10
+item | 6 Minutes | | calendar.timeScale | {"minutes":6} | M | on=mem:timeScale.6
+item | 5 Minutes | | calendar.timeScale | {"minutes":5} | 5 | on=mem:timeScale.5
+sep
+item | Change Time Zone... | location | calendar.changeTimeZone | | Z
+
+menu calendarColor
+item | Automatic | | calendar.color | {"color":"Automatic"} | A
+item | Blue | | calendar.color | {"color":"Blue"} | | swatch=#3b78c2
+item | Green | | calendar.color | {"color":"Green"} | | swatch=#4f9a4a
+item | Orange | | calendar.color | {"color":"Orange"} | | swatch=#e0883a
+item | Navy Blue | | calendar.color | {"color":"Navy Blue"} | | swatch=#2b3f7a
+item | Yellow | | calendar.color | {"color":"Yellow"} | | swatch=#e6c339
+item | Teal | | calendar.color | {"color":"Teal"} | | swatch=#2a8c8c
+item | Magenta | | calendar.color | {"color":"Magenta"} | | swatch=#b44b9a
+item | Brown | | calendar.color | {"color":"Brown"} | | swatch=#8a5a3a
+item | Dark Red | | calendar.color | {"color":"Dark Red"} | | swatch=#9a2a2a
+
+menu dailyTaskList
+item | Normal | | calendar.dailyTaskList | {"mode":"normal"} | N
+item | Minimized | | calendar.dailyTaskList | {"mode":"minimized"} | M
+item | Off | | calendar.dailyTaskList | {"mode":"off"} | O
+
+menu peopleNewItems
+item | E-mail Message | mail | mail.newEmail | | M
+item | Appointment | appointment | mail.newItem | {"kind":"appointment"} | A
+item | Meeting | meeting | mail.newItem | {"kind":"meeting"} | E
+item | Contact | person | people.new | | C
+item | Task | task | mail.newItem | {"kind":"task"} | T
+item | Contact Group | contact-group | people.newGroup | | G
+item | Contact from the Same Company | person | people.newFromSameCompany | | S
+sep
+sub | More Items | new-items | peopleMoreItems | | I
+
+menu peopleMoreItems
+item | Task Request | task | mail.newItem | {"kind":"taskRequest"} | Q
+item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
+item | Outlook Data File... | | file.newDataFile | | F
+
+menu peopleMore
+item | Assign Task | task | people.assignTask | | T
+
+menu peopleChangeView
+dyn | views:people | view.changeView | {"name":"$name"}
+sep
+item | Manage Views... | settings | view.manageViews | | M
+item | Save Current View As a New View... | save | view.saveViewAs | | S
+item | Apply Current View to Other Contact Folders... | | view.applyViewTo | | A
+
+menu peopleMove
+item | Other Folder... | folder | mail.move | | O
+item | Copy to Folder... | copy | mail.copy | | C
+
+menu forwardContact
+item | As a Business Card | contact-group | people.forward | {"as":"businessCard"} | B
+item | As an Outlook Contact | person | people.forward | {"as":"contact"} | O
+
+menu peopleCategorize
+dyn | categories | people.categorize | {"name":"$name"}
+sep
+item | Clear All Categories | | people.categorize | {"name":"","clear":true} | C
+item | All Categories... | category-tag | mail.allCategories | | A
+item | Set Quick Click... | | categories.setQuickClick | | Q
+
+menu tasksNewItems
+item | E-mail Message | mail | mail.newEmail | | M
+item | Appointment | appointment | mail.newItem | {"kind":"appointment"} | A
+item | Meeting | meeting | mail.newItem | {"kind":"meeting"} | E
+item | Contact | person | mail.newItem | {"kind":"contact"} | C
+item | Task | task | tasks.new | | T
+item | Task Request | task | mail.newItem | {"kind":"taskRequest"} | Q
+sep
+sub | More Items | new-items | tasksMoreItems | | I
+
+menu tasksMoreItems
+item | Contact Group | contact-group | mail.newItem | {"kind":"contactGroup"} | G
+item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
+item | Outlook Data File... | | file.newDataFile | | F
+
+menu tasksChangeView
+dyn | views:tasks | view.changeView | {"name":"$name"}
+sep
+item | Manage Views... | settings | view.manageViews | | M
+item | Save Current View As a New View... | save | view.saveViewAs | | S
+item | Apply Current View to Other Task Folders... | | view.applyViewTo | | A
+
+menu tasksMove
+item | Other Folder... | folder | mail.move | | O
+item | Copy to Folder... | copy | mail.copy | | C
+
+menu tasksCategorize
+dyn | categories | tasks.categorize | {"name":"$name"}
+sep
+item | Clear All Categories | | tasks.categorize | {"name":"","clear":true} | C
+item | All Categories... | category-tag | mail.allCategories | | A
+
+menu notesNewItems
+item | E-mail Message | mail | mail.newEmail | | M
+item | Appointment | appointment | mail.newItem | {"kind":"appointment"} | A
+item | Meeting | meeting | mail.newItem | {"kind":"meeting"} | E
+item | Contact | person | mail.newItem | {"kind":"contact"} | C
+item | Task | task | mail.newItem | {"kind":"task"} | T
+sep
+sub | More Items | new-items | notesMoreItems | | I
+
+menu notesMoreItems
+item | Contact Group | contact-group | mail.newItem | {"kind":"contactGroup"} | G
+item | Task Request | task | mail.newItem | {"kind":"taskRequest"} | Q
+item | Outlook Data File... | | file.newDataFile | | F
+
+menu notesChangeView
+dyn | views:notes | view.changeView | {"name":"$name"}
+sep
+item | Manage Views... | settings | view.manageViews | | M
+item | Save Current View As a New View... | save | view.saveViewAs | | S
+item | Apply Current View to Other Note Folders... | | view.applyViewTo | | A
+
+menu notesMove
+item | Other Folder... | folder | mail.move | | O
+item | Copy to Folder... | copy | mail.copy | | C
+
+menu notesCategorize
+dyn | categories | notes.categorize | {"name":"$name"}
+sep
+item | Clear All Categories | | notes.categorize | {"name":"","clear":true} | C
+item | All Categories... | category-tag | mail.allCategories | | A
