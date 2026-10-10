@@ -174,6 +174,8 @@ pub struct Session {
     pub secrets: Box<dyn crate::accounts::SecretStore>,
     /// Send/receive workers, queued results and the status bar state (see `sync.rs`).
     pub sync: crate::sync::SyncState,
+    /// Search index, recent searches and search toggles (see `search_index.rs`).
+    pub search: crate::search_index::SearchState,
 }
 
 /// Most ops kept in `pending_ops` while no store is attached; beyond that they collapse into one `Replace`.
@@ -210,6 +212,7 @@ impl Session {
             run_depth: 0,
             secrets: Box::new(crate::accounts::MemorySecretStore::default()),
             sync: crate::sync::SyncState::default(),
+            search: crate::search_index::SearchState::default(),
         };
         s.refresh_me();
         s.select_default_folder();
@@ -332,7 +335,11 @@ impl Session {
             self.refresh_me();
         }
         if self.pending_ops.len() > pending_before {
-            // Ops a command queued directly (without a mailbox diff, e.g. view-only changes).
+            // Ops a command queued directly (without a mailbox diff, e.g. view-only changes, or Open marking
+            // the message read): the search index must hear of them like journaled ones.
+            if let Some(direct) = self.pending_ops.get(pending_before..) {
+                self.search.note_ops(direct);
+            }
             self.flush_pending();
         }
         self.tidy_selection();
@@ -346,6 +353,7 @@ impl Session {
             return;
         }
         self.journal_calls = self.journal_calls.wrapping_add(1);
+        self.search.note_ops(&ops);
         self.pending_ops.extend(ops);
         self.flush_pending();
     }

@@ -5,12 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::cmd::view::{conversation_state, is_group_label};
-use crate::{Module, SearchScope, Session};
+use crate::{Module, Session};
 use mailcraft_model::{
     ArrangeBy, Category, DateGroup, DateTime, FlagState, FocusClass, FolderId, FolderKind, FolderRole,
     Importance, ItemId, ListFilter, ListTime, MailItem, ResponseState, SortOrder, ViewSettings,
     subject::{conversation_topic, strip_prefixes},
-    text::contains_ci,
     thread::{ConversationSettings, norm_id, reply_tree},
 };
 
@@ -124,6 +123,17 @@ fn folder_row(
     has_children: bool,
 ) -> Option<FolderRow> {
     let f = s.mailbox.folder(id)?;
+    let (badge, accessible) = if f.kind == FolderKind::Search {
+        // Search folders count their live results (unread), not the items filed in them (none).
+        let unread = crate::search_index::search_folder_counts(s, id).unread;
+        match unread {
+            0 => (String::new(), f.name.clone()),
+            1 => ("1".to_owned(), format!("{}: 1 unread message", f.name)),
+            n => (n.to_string(), format!("{}: {n} unread messages", f.name)),
+        }
+    } else {
+        (s.mailbox.badge(id).unwrap_or_default(), s.mailbox.folder_accessible_name(id))
+    };
     Some(FolderRow {
         id: Some(id),
         kind,
@@ -131,10 +141,10 @@ fn folder_row(
         depth,
         has_children,
         expanded: f.expanded,
-        badge: s.mailbox.badge(id).unwrap_or_default(),
+        badge,
         badge_total: f.role.is_some_and(FolderRole::shows_total_count),
         selected: s.selection.folder == id,
-        accessible: s.mailbox.folder_accessible_name(id),
+        accessible,
     })
 }
 
@@ -220,86 +230,6 @@ pub fn view_settings(s: &Session, folder: FolderId) -> ViewSettings {
     s.mailbox.views.get(&folder).cloned().unwrap_or_default()
 }
 
-/// One parsed search term.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Term {
-    Any(String),
-    From(String),
-    To(String),
-    Subject(String),
-    HasAttachments(bool),
-}
-
-/// Splits a query into terms (double quotes group words; `from:`, `to:`, `subject:`, `hasattachments:`
-/// prefixes are recognised case-insensitively).
-fn parse_query(q: &str) -> Vec<Term> {
-    let mut words: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
-    for c in q.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            c if c.is_whitespace() && !quoted => {
-                if !cur.is_empty() {
-                    words.push(std::mem::take(&mut cur));
-                }
-            }
-            c => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        words.push(cur);
-    }
-    words
-        .into_iter()
-        .filter_map(|w| {
-            let (key, value) = match w.split_once(':') {
-                Some((k, v)) => (k.to_lowercase(), v.to_owned()),
-                None => (String::new(), w.clone()),
-            };
-            let term = match key.as_str() {
-                "from" => Term::From(value),
-                "to" => Term::To(value),
-                "subject" => Term::Subject(value),
-                "hasattachments" | "hasattachment" => {
-                    Term::HasAttachments(!matches!(value.to_lowercase().as_str(), "no" | "false" | "0"))
-                }
-                _ => Term::Any(w),
-            };
-            match &term {
-                Term::Any(v) | Term::From(v) | Term::To(v) | Term::Subject(v) if v.trim().is_empty() => None,
-                _ => Some(term),
-            }
-        })
-        .collect()
-}
-
-fn people_match(list: &[mailcraft_model::Address], needle: &str) -> bool {
-    list.iter()
-        .any(|m| contains_ci(&m.addr, needle) || m.name.as_deref().is_some_and(|n| contains_ci(n, needle)))
-}
-
-/// Simple search: every term must match. Plain words match the subject, sender, recipients or body text
-/// (case-insensitive substring); `from:`, `to:`, `subject:` restrict the field; `hasattachments:yes|no`.
-/// An empty query matches everything.
-pub fn search_matches(item: &MailItem, query: &str) -> bool {
-    let terms = parse_query(query);
-    let mut body: Option<String> = None;
-    terms.iter().all(|t| match t {
-        Term::From(v) => people_match(item.from.as_slice(), v),
-        Term::To(v) => people_match(&item.to, v) || people_match(&item.cc, v),
-        Term::Subject(v) => contains_ci(&item.subject, v),
-        Term::HasAttachments(want) => item.has_attachments() == *want,
-        Term::Any(v) => {
-            contains_ci(&item.subject, v)
-                || people_match(item.from.as_slice(), v)
-                || people_match(&item.to, v)
-                || people_match(&item.cc, v)
-                || contains_ci(body.get_or_insert_with(|| item.body_text()), v)
-        }
-    })
-}
-
 /// Lower-case strings whose presence in a body means "I was mentioned": my addresses, "@" + their local part
 /// and "@" + each account's sender name.
 fn mention_needles(s: &Session) -> Vec<String> {
@@ -328,52 +258,6 @@ pub fn mentions_me(s: &Session, item: &MailItem) -> bool {
     needles.iter().any(|n| body.contains(n.as_str()))
 }
 
-/// Mail folders the active search covers (`None` when no search is active).
-fn search_folders(s: &Session) -> Option<Vec<FolderId>> {
-    if s.view.search.trim().is_empty() {
-        return None;
-    }
-    let mb = &s.mailbox;
-    let mail_kind = |id: &FolderId| mb.folder(*id).is_some_and(|f| f.kind == FolderKind::Mail);
-    let folders: Vec<FolderId> = match s.view.search_scope {
-        SearchScope::CurrentFolder => vec![s.selection.folder],
-        SearchScope::Subfolders => mb.subtree(s.selection.folder),
-        SearchScope::CurrentMailbox => {
-            let account = mb.folder_account(s.selection.folder).or_else(|| s.current_account());
-            mb.folders
-                .values()
-                .filter(|f| Some(f.account) == account)
-                .map(|f| f.id)
-                .filter(mail_kind)
-                .collect()
-        }
-        SearchScope::AllMailboxes | SearchScope::AllOutlookItems => {
-            mb.folders.keys().copied().filter(mail_kind).collect()
-        }
-    };
-    Some(folders)
-}
-
-/// Items of a search folder: its query over the account's mail folders except Deleted Items and Junk Email.
-fn search_folder_items<'a>(s: &'a Session, folder: FolderId, query: &str) -> Vec<&'a MailItem> {
-    let mb = &s.mailbox;
-    let Some(account) = mb.folder_account(folder) else {
-        return Vec::new();
-    };
-    let excluded: Vec<FolderId> = [FolderRole::DeletedItems, FolderRole::JunkEmail]
-        .into_iter()
-        .filter_map(|r| mb.role_folder(account, r))
-        .collect();
-    let included: BTreeSet<FolderId> = mb
-        .folders
-        .values()
-        .filter(|f| f.account == account && f.kind == FolderKind::Mail)
-        .filter(|f| !excluded.iter().any(|x| mb.is_in_subtree(f.id, *x)))
-        .map(|f| f.id)
-        .collect();
-    mb.mail.values().filter(|m| included.contains(&m.folder) && search_matches(m, query)).collect()
-}
-
 /// Items the message list shows for the selected folder after search, Focused/Other and the filter, sorted
 /// (not yet grouped), plus the view settings used.
 fn view_items(s: &Session) -> (ViewSettings, Vec<&MailItem>) {
@@ -383,12 +267,11 @@ fn view_items(s: &Session) -> (ViewSettings, Vec<&MailItem>) {
     let Some(f) = mb.folder(folder) else {
         return (vs, Vec::new());
     };
-    let mut items: Vec<&MailItem> = if let Some(folders) = search_folders(s) {
-        let set: BTreeSet<FolderId> = folders.into_iter().collect();
-        let q = s.view.search.as_str();
-        mb.mail.values().filter(|m| set.contains(&m.folder) && search_matches(m, q)).collect()
+    // Searches and search folders go through the search index (`search_index`); results are mail only here.
+    let mut items: Vec<&MailItem> = if !s.view.search.trim().is_empty() {
+        crate::search_index::results(s).iter().filter_map(|id| mb.mail.get(id)).collect()
     } else if f.kind == FolderKind::Search {
-        search_folder_items(s, folder, f.search_query.as_deref().unwrap_or(""))
+        crate::search_index::search_folder_items(s, folder).iter().filter_map(|id| mb.mail.get(id)).collect()
     } else {
         let mut v = mb.items_in(folder);
         if f.role == Some(FolderRole::Inbox) && vs.focused_inbox {
@@ -1571,7 +1454,7 @@ mod tests {
         s.view.search = "kickoff".into();
         let n_folder = items(&list_rows(&s)).len();
         assert!(n_folder >= 2, "search ignores Focused/Other and finds the thread");
-        s.view.search_scope = SearchScope::AllMailboxes;
+        s.view.search_scope = crate::SearchScope::AllMailboxes;
         assert!(items(&list_rows(&s)).len() > n_folder, "Sent Items reply found across folders");
         s.view.search = "from:alice subject:budget".into();
         let r = list_rows(&s);
@@ -1582,9 +1465,6 @@ mod tests {
         assert_eq!(items(&list_rows(&s)).len(), 1);
         s.view.search = "zzzz-nothing".into();
         assert!(list_rows(&s).is_empty());
-        let m = s.mailbox.mail.values().next().unwrap();
-        assert!(search_matches(m, ""));
-        assert!(search_matches(m, "   "));
     }
 
     #[test]
@@ -1915,5 +1795,27 @@ mod tests {
             assert_eq!(r[0].id, fx.b1);
             assert_eq!(r[0].conversation.as_ref().unwrap().count, 2, "only the Sent Items reply joins");
         }
+    }
+
+    #[test]
+    fn search_folders_list_and_count_their_live_results() {
+        let mut s = sample_session();
+        let r = s.run("folder.newSearchFolder", &serde_json::json!({"template": "unread"})).unwrap();
+        let folder = FolderId(r["folder"].as_u64().unwrap());
+        let counts = crate::search_index::search_folder_counts(&s, folder);
+        assert!(counts.unread > 0 && counts.unread == counts.total, "{counts:?}");
+        let row = folder_row(&s, folder, FolderRowKind::Folder, 1, false).unwrap();
+        assert_eq!(row.badge, counts.unread.to_string());
+        assert!(row.accessible.contains("unread"), "{}", row.accessible);
+        s.selection.folder = folder;
+        let rows = list_rows(&s);
+        let shown: Vec<_> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ListRow::Item(i) => Some(i),
+                ListRow::Group { .. } => None,
+            })
+            .collect();
+        assert!(!shown.is_empty() && shown.iter().all(|i| i.unread));
     }
 }

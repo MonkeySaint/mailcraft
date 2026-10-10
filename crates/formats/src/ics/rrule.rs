@@ -11,6 +11,8 @@ use super::value::{self, DAY, MAX_YEAR, MIN_YEAR};
 
 /// Most recurrence periods examined by one expansion.
 pub const MAX_PERIODS: usize = 200_000;
+/// Most periods [`Rrule::first_day_from`] looks through (a yearly February 29 needs eight).
+pub const MAX_SYNC_PERIODS: i64 = 1_000;
 /// Default most occurrences returned by one expansion.
 pub const MAX_OCCURRENCES: usize = 10_000;
 
@@ -496,6 +498,20 @@ impl Rrule {
             out = picked;
         }
         Some((first_day, out))
+    }
+
+    /// The first day on or after `start_day` (a local day number) that the rule produces with its periods
+    /// counted from `start_day`: where DTSTART belongs, since RFC 5545 §3.8.5.3 wants DTSTART to be the
+    /// first instance of the set. Ignores COUNT and UNTIL. `None` when nothing comes up within
+    /// [`MAX_SYNC_PERIODS`] periods (e.g. `BYMONTH=2;BYMONTHDAY=30`).
+    pub fn first_day_from(&self, start_day: i64) -> Option<i64> {
+        for k in 0..MAX_SYNC_PERIODS {
+            let (_, days) = self.period(k, start_day)?;
+            if let Some(d) = days.into_iter().find(|d| *d >= start_day) {
+                return Some(d);
+            }
+        }
+        None
     }
 
     /// Periods from DTSTART's period to the period containing `day` (0 when `day` is earlier).

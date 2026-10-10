@@ -783,13 +783,17 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     s.composes.remove(&cid);
+    // Rules for sent messages (Cc, defer delivery, sensitivity…) edit the Outbox copy before it goes out.
+    crate::rules_exec::on_send(s, &[id]);
+    // Delay Delivery or a deferring rule: the message waits in the Outbox until its send time.
+    let deferred = s.mailbox.mail.get(&id).and_then(|m| m.sent).filter(|t| t.unix > now.unix);
     // "Send immediately when connected": the account's worker submits the Outbox now (deferred messages
     // wait); otherwise the next send/receive does.
-    if c.delay_until.is_none_or(|d| d.unix <= now.unix) {
+    if deferred.is_none() {
         crate::sync::send_now(s, account.id);
     }
     Ok(
-        json!({"sent": true, "item": id.0, "outbox": outbox.0, "deferredUntil": c.delay_until.map(|d| d.to_rfc3339())}),
+        json!({"sent": true, "item": id.0, "outbox": outbox.0, "deferredUntil": deferred.map(|d| d.to_rfc3339())}),
     )
 }
 

@@ -1,6 +1,9 @@
 //! `rules.*`: CRUD over [`Mailbox::rules`](mailcraft_model::Mailbox) (`plan/outlook/rules.md`), the one-click
-//! "Always Move Messages From" rule, Create Rule from a message, Run Rules Now, and JSON export/import.
+//! "Always Move Messages From" rule, Create Rule from a message, rule templates (Rules Wizard "Start from a
+//! template"), Change Rule quick actions, Copy to other accounts, Run Rules Now, rules for sent and arriving
+//! messages, and `.mcrules` export/import (JSON, folders written as paths so files move between mailboxes).
 //!
+//! The executor is [`exec`] (`src/rules_exec.rs`).
 //! Also hosts small helpers shared by the admin command files (dialogs, selection, parsing, files). Changes are
 //! journaled by `Session::run` (it diffs the mailbox around every mutating command).
 
@@ -10,8 +13,11 @@ use serde_json::{Value, json};
 
 use crate::cmd::util::{ok, opt_bool, opt_folder, opt_str, req_str};
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Session, always};
-use mailcraft_model::rule::RuleContext;
+use mailcraft_model::rule::{ActionScope, RuleContext};
 use mailcraft_model::{FolderId, FolderKind, ItemId, Rule, RuleAction, RuleCondition};
+
+/// The rule executor (`crate::rules_exec`).
+pub use crate::rules_exec as exec;
 
 // ---------------------------------------------------------------------------------------------------------
 // Shared helpers for the admin command files (rules, quicksteps, categories, sendReceive, file, options, help).
@@ -187,12 +193,57 @@ pub fn specs() -> Vec<CommandSpec> {
             "rules.runNow",
             "Run Rules Now",
             M,
-            r#"{"ids"?: [rule id], "folder"?: number, "subfolders"?: bool} (no ids = all enabled rules)"#,
+            r#"{"ids"?: [rule id], "folder"?: number, "subfolders"?: bool, "which"?: "all"|"read"|"unread"} (no ids = all enabled rules)"#,
             true,
             has_rules,
             run_now,
         ),
-        spec("rules.export", "Export Rules", M, r#"{"path": string}"#, false, has_rules, export),
+        spec(
+            "rules.fromTemplate",
+            "New Rule from Template",
+            "Rules Wizard › Start from a template",
+            r#"{"template": "moveFromSender"|"moveWithWords"|"moveSentToGroup"|"flagFromSender"|"moveRss"|"alertFromSender"|"soundFromSender"|"blankReceive"|"blankSend", "people"?: [string], "words"?: [string], "folder"?: number, "sound"?: string, "flag"?: string, "name"?: string}"#,
+            true,
+            always,
+            from_template,
+        ),
+        spec(
+            "rules.addAction",
+            "Change Rule",
+            "Rules and Alerts › Change Rule",
+            r#"{"id": number|string, "action": RuleAction} (replaces an action of the same kind)"#,
+            true,
+            has_rules,
+            add_action,
+        ),
+        spec(
+            "rules.copyToAccounts",
+            "Copy Rules To",
+            M,
+            r#"{"id": number|string, "accounts": [account id|address]} (folders map by path)"#,
+            true,
+            has_rules,
+            copy_to_accounts,
+        ),
+        spec(
+            "rules.applyToNewMail",
+            "Run Rules on Arrived Mail",
+            "Send/Receive",
+            r#"{"ids": [number]} (local delivery: the enabled rules for received messages)"#,
+            true,
+            always,
+            apply_to_new_mail,
+        ),
+        spec(
+            "rules.applyOutgoing",
+            "Run Rules on Sent Mail",
+            "Compose › Send",
+            r#"{"ids": [number]} (Outbox items: the enabled rules for sent messages)"#,
+            true,
+            always,
+            apply_outgoing,
+        ),
+        spec("rules.export", "Export Rules", M, r#"{"path": string} (.mcrules)"#, false, has_rules, export),
         spec(
             "rules.import",
             "Import Rules",
@@ -233,6 +284,44 @@ fn next_rule_id(s: &Session) -> Result<u64, CmdError> {
     }
 }
 
+/// Folders named by actions must exist and hold mail; send-only actions need a rule for sent messages and
+/// receive-only ones a rule for received messages; values stay in range.
+fn check_rule(s: &Session, rule: &Rule) -> Result<(), CmdError> {
+    let outgoing = rule.is_outgoing();
+    for a in &rule.actions {
+        match (a.scope(), outgoing) {
+            (ActionScope::Outgoing, false) => {
+                return Err(CmdError::Params(format!(
+                    "\"{}\" works only in a rule for messages you send",
+                    a.describe(&|_| String::new())
+                )));
+            }
+            (ActionScope::Incoming, true) => {
+                return Err(CmdError::Params(format!(
+                    "\"{}\" works only in a rule for messages you receive",
+                    a.describe(&|_| String::new())
+                )));
+            }
+            _ => {}
+        }
+        if let RuleAction::DeferDelivery(n) = a
+            && (*n == 0 || *n > exec::MAX_DEFER_MINUTES)
+        {
+            return Err(CmdError::Params(format!(
+                "defer delivery by 1 to {} minutes",
+                exec::MAX_DEFER_MINUTES
+            )));
+        }
+    }
+    if outgoing && let Some(c) = rule.conditions.iter().find(|c| c.incoming_only()) {
+        return Err(CmdError::Params(format!(
+            "\"{}\" works only in a rule for messages you receive",
+            c.describe()
+        )));
+    }
+    check_actions(s, &rule.actions)
+}
+
 /// Folders named by actions must exist and hold mail.
 fn check_actions(s: &Session, actions: &[RuleAction]) -> Result<(), CmdError> {
     for a in actions {
@@ -258,6 +347,9 @@ fn rule_json(s: &Session, r: &Rule) -> Value {
         "label": r.list_label(),
         "enabled": r.enabled,
         "clientOnly": r.is_client_only(),
+        "outgoing": r.is_outgoing(),
+        "account": r.account(),
+        "alert": r.has_alert(),
         "conditions": r.conditions,
         "actions": r.actions,
         "exceptions": r.exceptions,
@@ -286,24 +378,23 @@ fn items_in_scope(s: &Session, folder: FolderId, subfolders: bool) -> Vec<ItemId
         .collect()
 }
 
-/// Runs the rules with ids `only` (all enabled rules when `None`, disabled ones included when named) over
-/// `items` through the shared rule engine.
+/// The rules with ids `only` (in list order; disabled ones included when named), or every enabled rule.
+fn chosen_rules(s: &Session, only: Option<&[u64]>) -> Vec<Rule> {
+    s.mailbox
+        .rules
+        .iter()
+        .filter(|r| match only {
+            Some(only) => only.contains(&r.id),
+            None => r.enabled,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Runs the rules with ids `only` (all enabled rules when `None`) over `items`.
 fn run_rules_on(s: &mut Session, only: Option<&[u64]>, items: &[ItemId]) -> usize {
-    let saved = s.mailbox.rules.clone();
-    if let Some(only) = only {
-        s.mailbox.rules = saved
-            .iter()
-            .filter(|r| only.contains(&r.id))
-            .cloned()
-            .map(|mut r| {
-                r.enabled = true;
-                r
-            })
-            .collect();
-    }
-    let n = crate::cmd::folder::apply_rules(s, items);
-    s.mailbox.rules = saved;
-    n
+    let rules = chosen_rules(s, only);
+    exec::apply_rule_list(s, items, &rules)
 }
 
 fn rule_from_params(s: &Session, p: &Value, require_name: bool) -> Result<Rule, CmdError> {
@@ -318,8 +409,44 @@ fn rule_from_params(s: &Session, p: &Value, require_name: bool) -> Result<Rule, 
     if actions.is_empty() {
         return Err(CmdError::Params("a rule needs at least one action".into()));
     }
-    check_actions(s, &actions)?;
-    Ok(Rule { id: 0, name, enabled: opt_bool(p, "enabled").unwrap_or(true), conditions, actions, exceptions })
+    let mut rule = Rule {
+        id: 0,
+        name,
+        enabled: opt_bool(p, "enabled").unwrap_or(true),
+        conditions,
+        actions,
+        exceptions,
+    };
+    if let Some(out) = opt_bool(p, "outgoing") {
+        rule.set_outgoing(out);
+    }
+    if let Some(acct) = opt_str(p, "account") {
+        let addr = account_address(s, acct)?;
+        rule = rule.for_account(&addr);
+    }
+    check_rule(s, &rule)?;
+    Ok(rule)
+}
+
+/// Address of the account named by id, address or display name.
+fn account_address(s: &Session, key: &str) -> Result<String, CmdError> {
+    let key = key.trim();
+    s.mailbox
+        .accounts
+        .iter()
+        .find(|a| {
+            a.id.0.to_string() == key
+                || (!a.address.is_empty() && a.address.eq_ignore_ascii_case(key))
+                || a.display_name.trim().eq_ignore_ascii_case(key)
+        })
+        .map(|a| {
+            if a.address.trim().is_empty() {
+                a.display_name.trim().to_owned()
+            } else {
+                a.address.trim().to_owned()
+            }
+        })
+        .ok_or_else(|| CmdError::Params(format!("no such account {key}")))
 }
 
 fn finish_create(s: &mut Session, rule: Rule, p: &Value) -> CmdResult {
@@ -458,7 +585,7 @@ fn list(s: &mut Session, _: &Value) -> CmdResult {
 
 fn edit(s: &mut Session, p: &Value) -> CmdResult {
     let i = find_rule(s, p)?;
-    let fields = ["name", "conditions", "actions", "exceptions", "enabled"];
+    let fields = ["name", "conditions", "actions", "exceptions", "enabled", "outgoing"];
     if !fields.iter().any(|k| p.get(*k).is_some()) {
         let rule = s.mailbox.rules.get(i).map(|r| rule_json(s, r)).unwrap_or(Value::Null);
         return dialog(s, "rulesWizard", json!({"rule": rule}));
@@ -467,20 +594,25 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     let conditions: Option<Vec<RuleCondition>> = parse_field(p, "conditions")?;
     let actions: Option<Vec<RuleAction>> = parse_field(p, "actions")?;
     let exceptions: Option<Vec<RuleCondition>> = parse_field(p, "exceptions")?;
-    if let Some(a) = &actions {
-        if a.is_empty() {
-            return Err(CmdError::Params("a rule needs at least one action".into()));
-        }
-        check_actions(s, a)?;
+    if actions.as_ref().is_some_and(Vec::is_empty) {
+        return Err(CmdError::Params("a rule needs at least one action".into()));
     }
-    let Some(r) = s.mailbox.rules.get_mut(i) else {
+    let Some(mut r) = s.mailbox.rules.get(i).cloned() else {
         return Err(CmdError::Params("no such rule".into()));
     };
+    let was_outgoing = r.is_outgoing();
     if let Some(n) = name {
         r.name = n;
     }
     if let Some(c) = conditions {
+        // Conditions sent without the marker keep the rule's direction; with it, the rule applies to sent
+        // messages. `outgoing` overrides both.
+        let outgoing = was_outgoing || c.contains(&RuleCondition::AfterSending);
         r.conditions = c;
+        r.set_outgoing(outgoing);
+    }
+    if let Some(out) = opt_bool(p, "outgoing") {
+        r.set_outgoing(out);
     }
     if let Some(a) = actions {
         r.actions = a;
@@ -491,7 +623,11 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(en) = opt_bool(p, "enabled") {
         r.enabled = en;
     }
+    check_rule(s, &r)?;
     let id = r.id;
+    if let Some(slot) = s.mailbox.rules.get_mut(i) {
+        *slot = r;
+    }
     Ok(json!({"id": id}))
 }
 
@@ -579,29 +715,95 @@ fn run_now(s: &mut Session, p: &Value) -> CmdResult {
     if s.mailbox.folder(folder).is_none() {
         return Err(CmdError::Params(format!("no such folder {}", folder.0)));
     }
-    let items = items_in_scope(s, folder, opt_bool(p, "subfolders").unwrap_or(false));
-    let applied = run_rules_on(s, only.as_deref(), &items);
-    Ok(json!({"applied": applied, "scanned": items.len()}))
+    let which = opt_str(p, "which").unwrap_or("all");
+    let Some(which) = exec::Which::parse(which) else {
+        return Err(CmdError::Params(format!("`which` must be all, read or unread, not {which}")));
+    };
+    let rules = chosen_rules(s, only.as_deref());
+    let (scanned, report) =
+        exec::run_now(s, &rules, folder, opt_bool(p, "subfolders").unwrap_or(false), which);
+    Ok(json!({"applied": report.matched, "scanned": scanned, "report": report.to_json()}))
+}
+
+/// File extension of exported rules.
+pub const RULES_EXTENSION: &str = "mcrules";
+
+/// Folder ids named by an action list.
+fn action_folders(actions: &[RuleAction]) -> Vec<FolderId> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            RuleAction::MoveTo(f) | RuleAction::CopyTo(f) => Some(*f),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Rewrites the folder ids of an action list through `map`; false when one has no mapping.
+fn remap_actions(actions: &mut [RuleAction], map: &dyn Fn(FolderId) -> Option<FolderId>) -> bool {
+    let mut all = true;
+    for a in actions.iter_mut() {
+        if let RuleAction::MoveTo(f) | RuleAction::CopyTo(f) = a {
+            match map(*f) {
+                Some(n) => *f = n,
+                None => all = false,
+            }
+        }
+    }
+    all
+}
+
+/// Mail folder of `account` (any account when `None`) whose path is `path`.
+fn folder_by_path(s: &Session, account: Option<mailcraft_model::AccountId>, path: &str) -> Option<FolderId> {
+    let want = path.trim().trim_matches('\\').to_lowercase();
+    let mut cands: Vec<&mailcraft_model::Folder> = s
+        .mailbox
+        .folders
+        .values()
+        .filter(|f| f.kind == FolderKind::Mail && s.mailbox.folder_path(f.id).to_lowercase() == want)
+        .collect();
+    if let Some(a) = account {
+        cands.retain(|f| f.account == a);
+    } else if let Some(cur) = s.current_account() {
+        cands.sort_by_key(|f| f.account != cur);
+    }
+    cands.first().map(|f| f.id)
 }
 
 fn export(s: &mut Session, p: &Value) -> CmdResult {
-    let path = Path::new(req_str(p, "path")?);
-    let doc = json!({"mailcraft_rules": 1, "rules": s.mailbox.rules});
+    let mut path = std::path::PathBuf::from(req_str(p, "path")?.trim());
+    if path.extension().is_none() {
+        path.set_extension(RULES_EXTENSION);
+    }
+    let mut folders = serde_json::Map::new();
+    for r in &s.mailbox.rules {
+        for f in action_folders(&r.actions) {
+            if s.mailbox.folder(f).is_some() {
+                folders.insert(f.0.to_string(), json!(s.mailbox.folder_path(f)));
+            }
+        }
+    }
+    let doc = json!({"mailcraft_rules": 2, "format": RULES_EXTENSION, "rules": s.mailbox.rules, "folders": folders});
     let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| CmdError::Failed(e.to_string()))?;
-    write_file(path, &bytes)?;
+    write_file(&path, &bytes)?;
     Ok(json!({"exported": s.mailbox.rules.len(), "path": path.display().to_string()}))
 }
 
 fn import(s: &mut Session, p: &Value) -> CmdResult {
-    let path = Path::new(req_str(p, "path")?);
-    let bytes = read_file_capped(path, MAX_IMPORT_BYTES)?;
+    let mut path = std::path::PathBuf::from(req_str(p, "path")?.trim());
+    // "my-rules" finds "my-rules.mcrules", as export names it.
+    if path.extension().is_none() && !path.exists() {
+        path.set_extension(RULES_EXTENSION);
+    }
+    let bytes = read_file_capped(&path, MAX_IMPORT_BYTES)?;
     let doc: Value =
         serde_json::from_slice(&bytes).map_err(|e| CmdError::Failed(format!("not a rules file: {e}")))?;
-    let list = match &doc {
-        Value::Array(_) => doc.clone(),
-        Value::Object(o) => {
-            o.get("rules").cloned().ok_or_else(|| CmdError::Failed("not a rules file".into()))?
-        }
+    let (list, folders) = match &doc {
+        Value::Array(_) => (doc.clone(), serde_json::Map::new()),
+        Value::Object(o) => (
+            o.get("rules").cloned().ok_or_else(|| CmdError::Failed("not a rules file".into()))?,
+            o.get("folders").and_then(Value::as_object).cloned().unwrap_or_default(),
+        ),
         _ => return Err(CmdError::Failed("not a rules file".into())),
     };
     let rules: Vec<Rule> =
@@ -616,8 +818,14 @@ fn import(s: &mut Session, p: &Value) -> CmdResult {
             break;
         }
         r.name = clean_name(&r.name).unwrap_or_else(|_| "Imported rule".into());
-        // A rule pointing at a folder this mailbox does not have is kept but turned off.
-        if r.enabled && check_actions(s, &r.actions).is_err() {
+        // Folders travel as paths; ids from the file are used only when the file has no path for them.
+        let mapped =
+            remap_actions(&mut r.actions, &|f| match folders.get(&f.0.to_string()).and_then(Value::as_str) {
+                Some(path) => folder_by_path(s, None, path),
+                None => s.mailbox.folder(f).map(|_| f),
+            });
+        // A rule pointing at a folder this mailbox does not have, or otherwise invalid here, is kept but off.
+        if r.enabled && (!mapped || check_rule(s, &r).is_err()) {
             r.enabled = false;
             disabled = disabled.saturating_add(1);
         }
@@ -626,6 +834,219 @@ fn import(s: &mut Session, p: &Value) -> CmdResult {
         imported = imported.saturating_add(1);
     }
     Ok(json!({"imported": imported, "disabled": disabled}))
+}
+
+/// Rules Wizard templates: (key, label, group).
+pub const TEMPLATES: [(&str, &str, &str); 10] = [
+    ("moveFromSender", "Move messages from someone to a folder", "Stay Organized"),
+    ("moveWithWords", "Move messages with specific words in the subject to a folder", "Stay Organized"),
+    ("moveSentToGroup", "Move messages sent to a public group to a folder", "Stay Organized"),
+    ("flagFromSender", "Flag messages from someone for follow-up", "Stay Organized"),
+    ("moveRss", "Move RSS items from a specific RSS Feed to a folder", "Stay Organized"),
+    ("alertFromSender", "Display mail from someone in the New Item Alert window", "Stay Up to Date"),
+    ("soundFromSender", "Play a sound when I get messages from someone", "Stay Up to Date"),
+    ("mobileAlert", "Send an alert to my mobile device when I get messages from someone", "Stay Up to Date"),
+    ("blankReceive", "Apply rule on messages I receive", "Start from a blank rule"),
+    ("blankSend", "Apply rule on messages I send", "Start from a blank rule"),
+];
+
+fn str_list(p: &Value, key: &str) -> Vec<String> {
+    match p.get(key) {
+        Some(Value::String(t)) => {
+            t.split([';', ',']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()
+        }
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The conditions and actions a template starts with, from the given values.
+fn template_rule(s: &Session, key: &str, p: &Value) -> Result<Rule, CmdError> {
+    let people = str_list(p, "people");
+    let words = str_list(p, "words");
+    let need = |what: &str, ok: bool| -> Result<(), CmdError> {
+        if ok { Ok(()) } else { Err(CmdError::Params(format!("this template needs `{what}`"))) }
+    };
+    let folder = || opt_folder(p).ok_or_else(|| CmdError::Params("this template needs `folder`".into()));
+    let mut rule = Rule { enabled: true, ..Default::default() };
+    match key {
+        "moveFromSender" => {
+            need("people", !people.is_empty())?;
+            rule.conditions = vec![RuleCondition::From(people)];
+            rule.actions = vec![RuleAction::MoveTo(folder()?)];
+        }
+        "moveWithWords" => {
+            need("words", !words.is_empty())?;
+            rule.conditions = vec![RuleCondition::SubjectContains(words)];
+            rule.actions = vec![RuleAction::MoveTo(folder()?)];
+        }
+        "moveSentToGroup" => {
+            need("people", !people.is_empty())?;
+            rule.conditions = vec![RuleCondition::SentTo(people)];
+            rule.actions = vec![RuleAction::MoveTo(folder()?)];
+        }
+        "flagFromSender" => {
+            need("people", !people.is_empty())?;
+            let label = opt_str(p, "flag").map(str::trim).filter(|l| !l.is_empty()).unwrap_or("Follow up");
+            rule.conditions = vec![RuleCondition::From(people)];
+            rule.actions = vec![RuleAction::FlagForFollowUp(label.to_owned(), 0)];
+        }
+        "moveRss" => {
+            rule.conditions = vec![if words.is_empty() {
+                RuleCondition::FromAnyRssFeed
+            } else {
+                RuleCondition::FromRssFeedWithText(words)
+            }];
+            rule.actions = vec![RuleAction::MoveTo(folder()?)];
+        }
+        "alertFromSender" => {
+            need("people", !people.is_empty())?;
+            rule.conditions = vec![RuleCondition::From(people)];
+            rule.actions = vec![RuleAction::NewItemAlert(opt_str(p, "text").unwrap_or("").trim().to_owned())];
+        }
+        "soundFromSender" => {
+            need("people", !people.is_empty())?;
+            let sound = opt_str(p, "sound").map(str::trim).unwrap_or("");
+            need("sound", !sound.is_empty())?;
+            rule.conditions = vec![RuleCondition::From(people)];
+            rule.actions = vec![RuleAction::PlaySound(sound.to_owned())];
+        }
+        "mobileAlert" => {
+            return Err(CmdError::Disabled(
+                "alerts to a mobile device need a text messaging service, which MailCraft does not have"
+                    .into(),
+            ));
+        }
+        "blankReceive" | "blankSend" => {
+            rule.conditions = parse_field(p, "conditions")?.unwrap_or_default();
+            rule.actions = parse_field(p, "actions")?.unwrap_or_default();
+            rule.exceptions = parse_field(p, "exceptions")?.unwrap_or_default();
+            rule.set_outgoing(key == "blankSend");
+            if rule.actions.is_empty() {
+                return Err(CmdError::Params("a rule needs at least one action".into()));
+            }
+        }
+        other => return Err(CmdError::Params(format!("unknown template `{other}`"))),
+    }
+    check_rule(s, &rule)?;
+    Ok(rule)
+}
+
+fn from_template(s: &mut Session, p: &Value) -> CmdResult {
+    let key = req_str(p, "template")?.trim().to_owned();
+    let mut rule = template_rule(s, &key, p)?;
+    let name_of =
+        |f: FolderId| s.mailbox.folder(f).map(|x| x.name.clone()).unwrap_or_else(|| "specified".into());
+    let default_name = rule
+        .conditions
+        .iter()
+        .find(|c| **c != RuleCondition::AfterSending)
+        .map(RuleCondition::describe)
+        .or_else(|| rule.actions.first().map(|a| a.describe(&name_of)))
+        .unwrap_or_else(|| "New rule".into());
+    rule.name = match opt_str(p, "name") {
+        Some(n) => clean_name(n)?,
+        None => clean_name(&default_name).unwrap_or_else(|_| "New rule".into()),
+    };
+    finish_create(s, rule, p)
+}
+
+/// Change Rule quick actions: adds `action`, replacing one of the same kind.
+fn add_action(s: &mut Session, p: &Value) -> CmdResult {
+    let i = find_rule(s, p)?;
+    let Some(action) = parse_field::<RuleAction>(p, "action")? else {
+        return Err(CmdError::Params("`action` (RuleAction) required".into()));
+    };
+    let Some(mut r) = s.mailbox.rules.get(i).cloned() else {
+        return Err(CmdError::Params("no such rule".into()));
+    };
+    r.actions.retain(|a| std::mem::discriminant(a) != std::mem::discriminant(&action));
+    // Stop Processing More Rules stays last.
+    let at =
+        r.actions.iter().position(|a| *a == RuleAction::StopProcessingMoreRules).unwrap_or(r.actions.len());
+    r.actions.insert(at, action);
+    check_rule(s, &r)?;
+    let id = r.id;
+    if let Some(slot) = s.mailbox.rules.get_mut(i) {
+        *slot = r;
+    }
+    Ok(json!({"id": id}))
+}
+
+/// Copy… to other accounts: one copy per account, limited to it, with its folders mapped by path (a copy
+/// whose folder the account lacks is turned off).
+fn copy_to_accounts(s: &mut Session, p: &Value) -> CmdResult {
+    let i = find_rule(s, p)?;
+    let Some(rule) = s.mailbox.rules.get(i).cloned() else {
+        return Err(CmdError::Params("no such rule".into()));
+    };
+    let targets = match p.get("accounts") {
+        Some(Value::Array(a)) if !a.is_empty() => a.clone(),
+        _ => return Err(CmdError::Params("`accounts` (non-empty array) required".into())),
+    };
+    let mut created = Vec::new();
+    let mut disabled = 0usize;
+    for t in targets {
+        let key = match &t {
+            Value::Number(n) => n.to_string(),
+            Value::String(x) => x.clone(),
+            _ => return Err(CmdError::Params(format!("not an account: {t}"))),
+        };
+        let addr = account_address(s, &key)?;
+        let Some(account) = s
+            .mailbox
+            .accounts
+            .iter()
+            .find(|a| a.address.trim().eq_ignore_ascii_case(&addr) || a.display_name.trim() == addr)
+            .map(|a| a.id)
+        else {
+            return Err(CmdError::Params(format!("no such account {key}")));
+        };
+        if s.mailbox.rules.len() >= MAX_RULES {
+            return Err(CmdError::Failed(format!("at most {MAX_RULES} rules")));
+        }
+        let mut copy = rule.for_account(&addr);
+        let paths: Vec<(FolderId, String)> =
+            action_folders(&copy.actions).into_iter().map(|f| (f, s.mailbox.folder_path(f))).collect();
+        let mapped = remap_actions(&mut copy.actions, &|f| {
+            let path = paths.iter().find(|(id, _)| *id == f).map(|(_, p)| p.as_str())?;
+            folder_by_path(s, Some(account), path)
+        });
+        if !mapped || check_rule(s, &copy).is_err() {
+            copy.enabled = false;
+            disabled = disabled.saturating_add(1);
+        }
+        let base = rule.name.trim();
+        copy.name = clean_name(&format!("{base} ({addr})")).unwrap_or_else(|_| base.to_owned());
+        created.push(insert_rule(s, copy)?);
+    }
+    Ok(json!({"created": created, "disabled": disabled}))
+}
+
+fn ids_param(s: &Session, p: &Value) -> Vec<ItemId> {
+    crate::cmd::util::opt_ids(p)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| s.mailbox.mail.contains_key(id))
+        .collect()
+}
+
+fn apply_to_new_mail(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = ids_param(s, p);
+    let report = exec::on_new_mail(s, &ids);
+    Ok(report.to_json())
+}
+
+fn apply_outgoing(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = ids_param(s, p);
+    let report = exec::on_send(s, &ids);
+    Ok(report.to_json())
 }
 
 #[cfg(test)]
@@ -816,5 +1237,207 @@ pub(crate) mod tests {
         s.run("rules.edit", &json!({"id": "N", "conditions": ["HasAttachment"]})).unwrap();
         assert_eq!(s.mailbox.rules[0].conditions, vec![RuleCondition::HasAttachment]);
         assert_eq!(s.run("rules.list", &json!({})).unwrap()["rules"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn templates_create_rules() {
+        let (mut s, inbox, proj) = session();
+        let r = s
+            .run(
+                "rules.fromTemplate",
+                &json!({"template": "moveFromSender", "people": "alice@example.com", "folder": proj.0}),
+            )
+            .unwrap();
+        assert_eq!(r["rule"]["name"], "from alice@example.com");
+        assert_eq!(s.mailbox.rules[0].actions, vec![RuleAction::MoveTo(proj)]);
+        s.run(
+            "rules.fromTemplate",
+            &json!({"template": "flagFromSender", "people": ["bob@example.org"], "flag": "Reply"}),
+        )
+        .unwrap();
+        assert_eq!(s.mailbox.rules[1].actions, vec![RuleAction::FlagForFollowUp("Reply".into(), 0)]);
+        s.run("rules.fromTemplate", &json!({"template": "moveRss", "folder": proj.0})).unwrap();
+        assert_eq!(s.mailbox.rules[2].conditions, vec![RuleCondition::FromAnyRssFeed]);
+        s.run("rules.fromTemplate", &json!({"template": "alertFromSender", "people": "x@example.org"}))
+            .unwrap();
+        assert!(s.mailbox.rules[3].is_client_only());
+        let r = s
+            .run(
+                "rules.fromTemplate",
+                &json!({"template": "blankSend", "name": "Hold", "actions": [{"DeferDelivery": 5}]}),
+            )
+            .unwrap();
+        assert_eq!(r["rule"]["outgoing"], true);
+        assert_eq!(r["rule"]["description"][0], "Apply this rule after I send the message");
+        // Values each template needs, and the one that is not available here.
+        for p in [
+            json!({"template": "moveFromSender", "folder": proj.0}),
+            json!({"template": "moveWithWords", "words": "x"}),
+            json!({"template": "soundFromSender", "people": "a@example.org"}),
+            json!({"template": "blankReceive"}),
+            json!({"template": "nope"}),
+        ] {
+            assert!(matches!(s.run("rules.fromTemplate", &p), Err(CmdError::Params(_))), "{p}");
+        }
+        assert!(matches!(
+            s.run("rules.fromTemplate", &json!({"template": "mobileAlert", "people": "a@example.org"})),
+            Err(CmdError::Disabled(_))
+        ));
+        assert_eq!(s.mailbox.total_count(inbox), 3);
+    }
+
+    #[test]
+    fn direction_rules_validate_actions_and_conditions() {
+        let (mut s, _, proj) = session();
+        // Send-only actions need a rule for sent messages and the other way round.
+        assert!(matches!(
+            s.run("rules.create", &json!({"name": "x", "actions": [{"DeferDelivery": 5}]})),
+            Err(CmdError::Params(_))
+        ));
+        assert!(matches!(
+            s.run("rules.create", &json!({"name": "x", "outgoing": true, "actions": [{"NewItemAlert": ""}]})),
+            Err(CmdError::Params(_))
+        ));
+        assert!(matches!(
+            s.run("rules.create", &json!({"name": "x", "outgoing": true, "conditions": ["SentOnlyToMe"], "actions": ["NotifyWhenRead"]})),
+            Err(CmdError::Params(_))
+        ));
+        assert!(matches!(
+            s.run("rules.create", &json!({"name": "x", "outgoing": true, "actions": [{"DeferDelivery": 0}]})),
+            Err(CmdError::Params(_))
+        ));
+        let r = s
+            .run("rules.create", &json!({"name": "Hold", "outgoing": true, "actions": [{"DeferDelivery": 30}, {"CopyTo": proj.0}]}))
+            .unwrap();
+        let id = r["id"].as_u64().unwrap();
+        assert!(s.mailbox.rules[0].is_outgoing());
+        // Editing the conditions keeps the direction.
+        s.run("rules.edit", &json!({"id": id, "conditions": [{"SubjectContains": ["x"]}]})).unwrap();
+        assert!(s.mailbox.rules[0].is_outgoing());
+        assert!(matches!(
+            s.run("rules.edit", &json!({"id": id, "outgoing": false})),
+            Err(CmdError::Params(_))
+        ));
+        assert!(s.mailbox.rules[0].is_outgoing(), "a refused edit changes nothing");
+        // Conditions that carry the "after I send" marker make a receive rule a send rule.
+        let r = s.run("rules.create", &json!({"name": "In", "actions": [{"CopyTo": proj.0}]})).unwrap();
+        let rid = r["id"].as_u64().unwrap();
+        s.run("rules.edit", &json!({"id": rid, "conditions": ["AfterSending", {"SubjectContains": ["y"]}]}))
+            .unwrap();
+        let edited = s.mailbox.rules.iter().find(|r| r.id == rid).unwrap();
+        assert!(edited.is_outgoing(), "{:?}", edited.conditions);
+        assert_eq!(edited.conditions.iter().filter(|c| **c == RuleCondition::AfterSending).count(), 1);
+        assert!(matches!(
+            s.run(
+                "rules.create",
+                &json!({"name": "x", "account": "nobody@example.org", "actions": ["MarkAsRead"]})
+            ),
+            Err(CmdError::Params(_))
+        ));
+    }
+
+    #[test]
+    fn change_rule_quick_actions_replace_the_same_kind() {
+        let (mut s, _, proj) = session();
+        let r = s
+            .run(
+                "rules.create",
+                &json!({"name": "A", "actions": [{"MarkImportance": "Low"}, "StopProcessingMoreRules"]}),
+            )
+            .unwrap();
+        let id = r["id"].as_u64().unwrap();
+        s.run("rules.addAction", &json!({"id": id, "action": {"MarkImportance": "High"}})).unwrap();
+        s.run("rules.addAction", &json!({"id": id, "action": {"MoveTo": proj.0}})).unwrap();
+        assert_eq!(
+            s.mailbox.rules[0].actions,
+            vec![
+                RuleAction::MarkImportance(mailcraft_model::Importance::High),
+                RuleAction::MoveTo(proj),
+                RuleAction::StopProcessingMoreRules
+            ]
+        );
+        assert!(s.run("rules.addAction", &json!({"id": id})).is_err());
+        assert!(s.run("rules.addAction", &json!({"id": id, "action": {"MoveTo": 999_999}})).is_err());
+        assert!(s.run("rules.addAction", &json!({"id": id, "action": {"DeferDelivery": 3}})).is_err());
+    }
+
+    #[test]
+    fn copy_to_other_accounts_maps_folders_by_path() {
+        let (mut s, _, proj) = session();
+        let other = s.mailbox.add_account(mailcraft_model::Account {
+            kind: mailcraft_model::AccountKind::Imap,
+            display_name: "Work".into(),
+            address: "work@example.com".into(),
+            ..Default::default()
+        });
+        s.mailbox.create_default_folders(other);
+        let r = s
+            .run("rules.create", &json!({"name": "Budget", "conditions": [{"SubjectContains": ["budget"]}], "actions": [{"MoveTo": proj.0}]}))
+            .unwrap();
+        let id = r["id"].as_u64().unwrap();
+        // The other account has no Inbox\Projects: the copy is kept but off.
+        let c = s.run("rules.copyToAccounts", &json!({"id": id, "accounts": ["work@example.com"]})).unwrap();
+        assert_eq!(c["disabled"], 1);
+        let copy = s.mailbox.rules.last().unwrap();
+        assert_eq!(copy.account(), Some("work@example.com"));
+        assert!(!copy.enabled);
+        assert_eq!(copy.name, "Budget (work@example.com)");
+        let work_inbox = s.mailbox.role_folder(other, mailcraft_model::FolderRole::Inbox).unwrap();
+        let work_proj = s.mailbox.create_folder(work_inbox, "Projects").unwrap();
+        let c = s.run("rules.copyToAccounts", &json!({"id": id, "accounts": [other.0]})).unwrap();
+        assert_eq!(c["disabled"], 0);
+        let copy = s.mailbox.rules.last().unwrap();
+        assert!(copy.enabled);
+        assert_eq!(copy.actions, vec![RuleAction::MoveTo(work_proj)]);
+        assert!(s.run("rules.copyToAccounts", &json!({"id": id, "accounts": []})).is_err());
+        assert!(s.run("rules.copyToAccounts", &json!({"id": id, "accounts": ["x@example.org"]})).is_err());
+    }
+
+    #[test]
+    fn mcrules_export_maps_folders_by_path() {
+        let (mut s, _, proj) = session();
+        s.run("rules.create", &json!({"name": "R1", "actions": [{"MoveTo": proj.0}]})).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let r = s.run("rules.export", &json!({"path": dir.path().join("mine").to_str().unwrap()})).unwrap();
+        let path = r["path"].as_str().unwrap().to_owned();
+        assert!(path.ends_with("mine.mcrules"), "{path}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Inbox\\\\Projects"), "{text}");
+        // Another mailbox whose Projects folder has a different id gets it remapped.
+        let mut t = Session::new(mailcraft_model::Mailbox::new_local("Other"));
+        let acct = t.mailbox.accounts[0].id;
+        let inbox = t.mailbox.role_folder(acct, mailcraft_model::FolderRole::Inbox).unwrap();
+        t.mailbox.create_folder(inbox, "Filler").unwrap();
+        let tproj = t.mailbox.create_folder(inbox, "Projects").unwrap();
+        assert_ne!(tproj, proj);
+        let r = t.run("rules.import", &json!({"path": path})).unwrap();
+        assert_eq!(r["disabled"], 0);
+        assert_eq!(t.mailbox.rules[0].actions, vec![RuleAction::MoveTo(tproj)]);
+    }
+
+    #[test]
+    fn apply_commands_run_the_right_direction() {
+        let (mut s, inbox, _) = session();
+        s.run("rules.create", &json!({"name": "In", "actions": [{"AssignCategory": "Red category"}]}))
+            .unwrap();
+        let ids: Vec<u64> = s.mailbox.items_in(inbox).iter().map(|m| m.id.0).collect();
+        let r = s.run("rules.applyToNewMail", &json!({"ids": ids})).unwrap();
+        assert_eq!(r["matched"], 3);
+        let r = s.run("rules.applyOutgoing", &json!({"ids": ids})).unwrap();
+        assert_eq!(r["matched"], 0, "not in an Outbox");
+        let r = s.run("rules.applyToNewMail", &json!({"ids": [u64::MAX]})).unwrap();
+        assert_eq!(r["matched"], 0);
+    }
+
+    #[test]
+    fn run_now_which() {
+        let (mut s, inbox, _) = session();
+        s.run("rules.create", &json!({"name": "All", "actions": [{"AssignCategory": "Red category"}]}))
+            .unwrap();
+        let first = s.mailbox.items_in(inbox)[0].id;
+        s.mailbox.set_read(&[first], true);
+        let r = s.run("rules.runNow", &json!({"folder": inbox.0, "which": "read"})).unwrap();
+        assert_eq!((r["scanned"].as_u64(), r["applied"].as_u64()), (Some(1), Some(1)));
+        assert!(matches!(s.run("rules.runNow", &json!({"which": "some"})), Err(CmdError::Params(_))));
     }
 }

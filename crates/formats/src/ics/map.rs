@@ -256,8 +256,12 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
         .map(|u| u.trim().to_owned())
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| format!("{:016x}@mailcraft.import", content_hash(c)));
+    let recurrence_id = ctx.time(c, "RECURRENCE-ID").map(|(_, t)| t);
     let appointment = Appointment {
         uid,
+        // An override replaces one instance; it never carries its own rule.
+        recurrence: if recurrence_id.is_some() { None } else { recurrence },
+        recurrence_id,
         subject: text_or_empty(c, "SUMMARY"),
         location: text_or_empty(c, "LOCATION"),
         start,
@@ -268,7 +272,6 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
         is_meeting: !attendees.is_empty(),
         organizer,
         attendees,
-        recurrence,
         categories: categories_of(c),
         private: class == "PRIVATE" || class == "CONFIDENTIAL",
         body: text_or_empty(c, "DESCRIPTION"),
@@ -280,7 +283,7 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
         start_local,
         sequence: c.text("SEQUENCE").and_then(|s| s.trim().parse().ok()).unwrap_or(0),
         status: (!status.is_empty()).then_some(status),
-        recurrence_id: ctx.time(c, "RECURRENCE-ID").map(|(_, t)| t),
+        recurrence_id,
         rdates: ctx.time_list(c, "RDATE"),
     })
 }
@@ -514,6 +517,9 @@ pub(crate) fn event_component(
                 c.props.push(attendee_line(att, o.rsvp));
             }
         }
+    }
+    if let Some(rid) = a.recurrence_id.filter(|_| a.recurrence.is_none()) {
+        c.props.push(time_line("RECURRENCE-ID", rid, a.all_day, off, offsets));
     }
     if let Some(rec) = &a.recurrence
         && Rrule::parse(&rec.rrule).is_ok()

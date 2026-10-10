@@ -581,7 +581,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Print",
             "Message context menu; File › Print",
             "",
-            r#"{"ids"?:[number]}"#,
+            r#"{"ids"?:[number], (with "style", "printer" or "path": as print.print)}"#,
             false,
             need_items,
             print,
@@ -591,7 +591,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Quick Print",
             "Message context menu",
             "",
-            r#"{"ids"?:[number]}"#,
+            r#"{"ids"?:[number], "printer"?: string, "path"?: string (PDF)}"#,
             false,
             need_items,
             quick_print,
@@ -1553,11 +1553,26 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
 
 fn print(s: &mut Session, p: &Value) -> CmdResult {
     let ids = mail_targets(s, p);
+    let raw: Vec<u64> = ids.iter().map(|i| i.0).collect();
+    if let Some(done) = crate::cmd::print::forward(s, p, &raw) {
+        return done;
+    }
     open_dialog(s, "print", json!({"ids": ids_json(&ids), "quick": false}))
 }
 
+/// Quick Print: Memo Style straight to `printer` (or a PDF `path`) when given; otherwise the Print page with
+/// Memo Style picked (there is no silent default printer: Save as PDF needs a file name).
 fn quick_print(s: &mut Session, p: &Value) -> CmdResult {
     let ids = mail_targets(s, p);
+    let raw: Vec<u64> = ids.iter().map(|i| i.0).collect();
+    if ["printer", "path", "pdf_path"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        let mut params = p.as_object().cloned().unwrap_or_default();
+        params.entry("style").or_insert_with(|| json!("memo"));
+        let params = Value::Object(params);
+        if let Some(done) = crate::cmd::print::forward(s, &params, &raw) {
+            return done;
+        }
+    }
     open_dialog(s, "print", json!({"ids": ids_json(&ids), "quick": true, "style": "memo"}))
 }
 

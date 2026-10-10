@@ -207,6 +207,7 @@ button S | From | person | search.refine | {"kind":"from"} | OM
 button S | Subject | email | search.refine | {"kind":"subject"} | B
 toggle S | Has Attachments | attach | search.refine | {"kind":"hasAttachments"} | H | on=tok:hasattachments:yes
 drop S | Categorized | categorize | | | G | menu=searchCategorized
+drop S | This Week | week | | | W | menu=searchThisWeek
 drop S | Sent To | person | | | ST | menu=searchSentTo
 toggle S | Unread | unread | search.refine | {"kind":"unread"} | U | on=tok:isread:no
 toggle S | Flagged | flag | search.refine | {"kind":"flagged"} | F | on=tok:isflagged:yes
@@ -219,7 +220,7 @@ toggle S | Current Folder | folder | search.scope | {"scope":"currentFolder"} | 
 toggle S | Subfolders | folder-open | search.scope | {"scope":"subfolders"} | SU | on=scope:subfolders
 toggle S | All Outlook Items | search | search.scope | {"scope":"allItems"} | OL | on=scope:allItems
 group Results | ZE
-toggle S | Include Deleted Items | deleted | search.scope | {"includeDeleted":"$!on"} | I2 | on=mem:includeDeleted
+toggle S | Include Deleted Items | deleted | search.scope | {"includeDeleted":"$!on"} | I2 | on=searchDeleted
 group Options | ZO
 drop S | Recent Searches | search | | | N | menu=recentSearches
 drop S | Search Tools | settings | | | SS | menu=searchTools
@@ -448,10 +449,10 @@ sep
 item | Options... | settings | view.readingPaneOptions | | N
 
 menu todoBar
-item | Calendar | calendar | view.todoBar | {"part":"calendar"} | C
-item | People | people | view.todoBar | {"part":"people"} | P
-item | Tasks | tasks | view.todoBar | {"part":"tasks"} | T
-item | Off | | view.todoBar | {"part":"off"} | O
+item | Calendar | calendar | view.todoBar | {"part":"calendar"} | C | on=todo:calendar
+item | People | people | view.todoBar | {"part":"people"} | P | on=todo:people
+item | Tasks | tasks | view.todoBar | {"part":"tasks"} | T | on=todo:tasks
+item | Off | | view.todoBar | {"part":"off"} | O | on=todo:off
 
 menu moreView
 item | Add Columns | table | view.addColumns | | C
@@ -474,12 +475,41 @@ item | Sent To: Me or CC: Me | person | search.refine | {"kind":"sentTo","value"
 item | Not Sent Directly to Me | | search.refine | {"kind":"sentTo","value":"notMe"} | N | on=tok:-to:me
 item | Sent to Another Recipient | | search.refine | {"kind":"sentTo","value":"other"} | A
 
+menu searchThisWeek
+item | Today | today | search.refine | {"kind":"received","value":"today"} | T | on=tok:received:today
+item | Yesterday | | search.refine | {"kind":"received","value":"yesterday"} | Y | on=tok:received:yesterday
+item | This Week | week | search.refine | {"kind":"received","value":"this week"} | W
+item | Last Week | | search.refine | {"kind":"received","value":"last week"} | L
+item | This Month | month | search.refine | {"kind":"received","value":"this month"} | M
+item | Last Month | | search.refine | {"kind":"received","value":"last month"} | O
+item | This Year | | search.refine | {"kind":"received","value":"this year"} | E
+
 menu searchMore
+item | To | person | search.refine | {"kind":"to"} | T
+item | Cc | person | search.refine | {"kind":"cc"} | C
+item | Body | email | search.refine | {"kind":"body"} | B
+item | Attachments | attach | search.refine | {"kind":"attachments"} | H
+item | Categories | categorize | search.refine | {"kind":"categorized"} | G | on=tok:category:any
+item | Importance | importance-high | search.refine | {"kind":"importance"} | I | on=tok:importance:high
+item | Read | read | search.refine | {"kind":"read"} | R | on=tok:isread:yes
+item | Received | calendar | search.refine | {"kind":"received"} | E
+item | Sent | sent | search.refine | {"kind":"sent"} | S
+sub | Size | | searchSize | | Z
+item | Folder | folder | search.refine | {"kind":"folder"} | O
+sep
 item | View Items Expiring Soon | | search.refine | {"kind":"expiringSoon"} | V | on=tok:expires:soon
 item | Add Form Field... | plus | search.refine | | A
 
+menu searchSize
+item | Tiny | | search.refine | {"kind":"size","value":"tiny"} | T | on=tok:size:tiny
+item | Small | | search.refine | {"kind":"size","value":"small"} | S | on=tok:size:small
+item | Medium | | search.refine | {"kind":"size","value":"medium"} | M | on=tok:size:medium
+item | Large | | search.refine | {"kind":"size","value":"large"} | L | on=tok:size:large
+item | Very Large | | search.refine | {"kind":"size","value":"verylarge"} | V | on=tok:size:verylarge
+item | Huge | | search.refine | {"kind":"size","value":"huge"} | H | on=tok:size:huge
+
 menu recentSearches
-item | Recent Searches... | search | search.recent | | R
+dyn | recentSearches | search.recent | {"index":"$id"}
 
 menu searchTools
 item | Include Older Results | | search.includeOlderResults | {"on":"$!on"} | I | on=mem:olderResults

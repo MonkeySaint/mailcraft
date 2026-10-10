@@ -1,6 +1,10 @@
 //! Rules (plan/outlook/rules.md): the quick Create Rule dialog and its Success box, Rules and Alerts (Email
-//! Rules list, toolbar, Change Rule menu, description pane), the four-page Rules Wizard with condition /
-//! action / exception checklists and underlined editable values, Run Rules Now, Rename Rule and Options.
+//! Rules list, toolbar, Change Rule menu, Copy to other accounts, description pane, Manage Alerts tab), the
+//! Rules Wizard (start from a template or a blank rule for received or sent messages, then condition /
+//! action / exception checklists with underlined editable values), Run Rules Now, Rename Rule and Options
+//! (`.mcrules` import/export).
+//!
+//! Also routes the Quick Steps dialogs (`quicksteps.rs`) and the New Item Alert window (`alerts.rs`).
 
 use egui::{Context, RichText, Sense, Ui};
 use serde_json::{Value, json};
@@ -13,8 +17,13 @@ use super::folders::last_error;
 use crate::App;
 use mailcraft_model::{FolderId, Importance, Rule, RuleAction, RuleCondition, Sensitivity};
 
+#[cfg(test)]
+#[path = "rules_tests.rs"]
+mod tests;
+
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
+        "copyRule" => copy_rule(ctx, app, d),
         "createRule" => create_rule(ctx, app, d),
         "ruleCreated" => rule_created(ctx, app, d),
         "rulesAndAlerts" => rules_and_alerts(ctx, app, d),
@@ -45,6 +54,18 @@ enum Val {
     Folder,
     Text,
     Flag,
+    /// A form display name (Message, Meeting Request, …).
+    Form,
+    /// A message class prefix.
+    FormType,
+    /// Minutes (defer delivery).
+    Minutes,
+    /// A reply template file (.eml).
+    Template,
+    /// A sound file.
+    Sound,
+    /// Reply text (several lines).
+    Reply,
 }
 
 /// One checklist entry: text before the underlined value, the value placeholder, text after.
@@ -63,7 +84,7 @@ const fn plain(text: &'static str) -> Def {
     Def { before: text, placeholder: "", after: "", val: Val::None }
 }
 
-const CONDS: [Def; 21] = [
+const CONDS: [Def; 30] = [
     def("with ", "specific words", " in the subject", Val::Words),
     def("from ", "people or public group", "", Val::People),
     def("through the ", "specified", " account", Val::Account),
@@ -85,9 +106,21 @@ const CONDS: [Def; 21] = [
     plain("which has an attachment"),
     def("with a size ", "in a specific range", "", Val::Size),
     def("received ", "in a specific date span", "", Val::Dates),
+    plain("which is an automatic reply"),
+    plain("which is a meeting invitation or update"),
+    def("uses the ", "form name", " form", Val::Form),
+    def("of the ", "specific", " form type", Val::FormType),
+    def("from RSS Feeds with ", "specified text", " in the title", Val::Words),
+    plain("from any RSS Feed"),
+    plain("suspected to be junk or from Junk Senders"),
+    plain("sender is in my Contacts"),
+    plain("on this computer only"),
 ];
 
-const ACTS: [Def; 19] = [
+/// Conditions that make sense only for received messages (hidden in a rule for sent messages).
+const COND_INCOMING_ONLY: [usize; 11] = [3, 4, 8, 9, 10, 20, 21, 25, 26, 27, 28];
+
+const ACTS: [Def; 25] = [
     def("display ", "a specific message", " in the New Item Alert window", Val::Text),
     def("move it to the ", "specified", " folder", Val::Folder),
     def("assign it to the ", "category", " category", Val::Category),
@@ -97,17 +130,36 @@ const ACTS: [Def; 19] = [
     def("forward it to ", "people or public group", "", Val::People),
     def("forward it to ", "people or public group", " as an attachment", Val::People),
     def("redirect it to ", "people or public group", "", Val::People),
-    def("reply using ", "a specific template", "", Val::Text),
+    def("reply using ", "a specific template", "", Val::Template),
     def("flag message for ", "follow up at this time", "", Val::Flag),
     plain("clear the Message Flag"),
     plain("clear message's categories"),
     def("mark it as ", "importance", "", Val::Importance),
     plain("print it"),
-    def("play ", "a sound", "", Val::Text),
+    def("play ", "a sound", "", Val::Sound),
     plain("mark it as read"),
     plain("stop processing more rules"),
     plain("display a Desktop Alert"),
+    def("defer delivery by ", "a number of", " minutes", Val::Minutes),
+    def("Cc the message to ", "people or public group", "", Val::People),
+    def("mark it as ", "sensitivity", "", Val::Sensitivity),
+    plain("notify me when it is read"),
+    plain("notify me when it is delivered"),
+    def("have server reply using ", "a specific message", "", Val::Reply),
 ];
+
+/// Actions for received messages only, and for sent messages only (hidden in the other kind of rule).
+const ACT_INCOMING_ONLY: [usize; 13] = [0, 1, 3, 4, 6, 7, 8, 9, 14, 15, 16, 18, 24];
+const ACT_OUTGOING_ONLY: [usize; 4] = [19, 20, 22, 23];
+
+/// Whether catalog entry `i` of `sec` is offered in a rule for sent (`outgoing`) or received messages.
+fn offered(sec: Sec, i: usize, outgoing: bool) -> bool {
+    match sec {
+        Sec::Act if outgoing => !ACT_INCOMING_ONLY.contains(&i),
+        Sec::Act => !ACT_OUTGOING_ONLY.contains(&i),
+        _ => !outgoing || !COND_INCOMING_ONLY.contains(&i),
+    }
+}
 
 const IMPORTANCE: [&str; 3] = ["low", "normal", "high"];
 const SENSITIVITY: [&str; 4] = ["normal", "personal", "private", "confidential"];
@@ -139,6 +191,8 @@ struct Draft {
     conds: Vec<Slot>,
     acts: Vec<Slot>,
     excs: Vec<Slot>,
+    /// "Apply rule on messages I send".
+    outgoing: bool,
 }
 
 impl Default for Draft {
@@ -146,12 +200,19 @@ impl Default for Draft {
         let mk = |n: usize| -> Vec<Slot> {
             (0..n).map(|_| Slot { choice: 2, n2: 1024, ..Default::default() }).collect()
         };
-        let mut d = Draft { conds: mk(CONDS.len()), acts: mk(ACTS.len()), excs: mk(CONDS.len()) };
+        let mut d =
+            Draft { conds: mk(CONDS.len()), acts: mk(ACTS.len()), excs: mk(CONDS.len()), outgoing: false };
         // Condition values default to "high" importance / "private" sensitivity; actions to the first choice.
         for s in &mut d.acts {
             s.choice = 0;
         }
         if let Some(s) = d.acts.get_mut(13) {
+            s.choice = 2;
+        }
+        if let Some(s) = d.acts.get_mut(19) {
+            s.n1 = 5;
+        }
+        if let Some(s) = d.acts.get_mut(21) {
             s.choice = 2;
         }
         d
@@ -238,6 +299,20 @@ impl Draft {
                     s.d2 = d2;
                 });
             }
+            RuleCondition::AutomaticReply => self.set(sec, 21, |_| {}),
+            RuleCondition::MeetingInvitationOrUpdate => self.set(sec, 22, |_| {}),
+            RuleCondition::UsesForm(f) => self.set(sec, 23, |s| s.text = f.clone()),
+            RuleCondition::FormType(t) => self.set(sec, 24, |s| s.text = t.clone()),
+            RuleCondition::FromRssFeedWithText(l) => self.set(sec, 25, |s| s.text = words(l)),
+            RuleCondition::FromAnyRssFeed => self.set(sec, 26, |_| {}),
+            RuleCondition::SuspectedJunk => self.set(sec, 27, |_| {}),
+            RuleCondition::SenderInContacts => self.set(sec, 28, |_| {}),
+            RuleCondition::OnThisComputerOnly => self.set(sec, 29, |_| {}),
+            RuleCondition::AfterSending => {
+                if sec == Sec::Cond {
+                    self.outgoing = true;
+                }
+            }
         }
     }
 
@@ -267,15 +342,28 @@ impl Draft {
             RuleAction::MarkAsRead => self.set(sec, 16, |_| {}),
             RuleAction::StopProcessingMoreRules => self.set(sec, 17, |_| {}),
             RuleAction::DesktopAlert => self.set(sec, 18, |_| {}),
+            RuleAction::DeferDelivery(n) => self.set(sec, 19, |s| s.n1 = u64::from(*n)),
+            RuleAction::CcTo(l) => self.set(sec, 20, |s| s.text = words(l)),
+            RuleAction::MarkSensitivity(x) => self.set(sec, 21, |s| s.choice = sens_idx(*x)),
+            RuleAction::NotifyWhenRead => self.set(sec, 22, |_| {}),
+            RuleAction::NotifyWhenDelivered => self.set(sec, 23, |_| {}),
+            RuleAction::ServerReply(t) => self.set(sec, 24, |s| s.text = t.clone()),
         }
     }
 
     fn conditions(&self, app: &App, sec: Sec) -> Result<Vec<RuleCondition>, String> {
         let mut out = Vec::new();
+        if sec == Sec::Cond && self.outgoing {
+            out.push(RuleCondition::AfterSending);
+        }
         for (i, s) in self.slots(sec).iter().enumerate() {
-            if !s.on {
+            if !s.on || !offered(sec, i, self.outgoing) {
                 continue;
             }
+            let text = || -> Result<String, String> {
+                let t = s.text.trim();
+                if t.is_empty() { Err(missing(sec, i)) } else { Ok(t.to_owned()) }
+            };
             let list = || -> Result<Vec<String>, String> {
                 let l = common::split_list(&s.text);
                 if l.is_empty() { Err(missing(sec, i)) } else { Ok(l) }
@@ -319,6 +407,15 @@ impl Draft {
                         _ => return Err(missing(sec, i)),
                     }
                 }
+                21 => RuleCondition::AutomaticReply,
+                22 => RuleCondition::MeetingInvitationOrUpdate,
+                23 => RuleCondition::UsesForm(text()?),
+                24 => RuleCondition::FormType(text()?),
+                25 => RuleCondition::FromRssFeedWithText(list()?),
+                26 => RuleCondition::FromAnyRssFeed,
+                27 => RuleCondition::SuspectedJunk,
+                28 => RuleCondition::SenderInContacts,
+                29 => RuleCondition::OnThisComputerOnly,
                 _ => continue,
             });
         }
@@ -328,7 +425,7 @@ impl Draft {
     fn actions(&self) -> Result<Vec<RuleAction>, String> {
         let mut out = Vec::new();
         for (i, s) in self.acts.iter().enumerate() {
-            if !s.on {
+            if !s.on || !offered(Sec::Act, i, self.outgoing) {
                 continue;
             }
             let list = || -> Result<Vec<String>, String> {
@@ -363,8 +460,19 @@ impl Draft {
                 16 => RuleAction::MarkAsRead,
                 17 => RuleAction::StopProcessingMoreRules,
                 18 => RuleAction::DesktopAlert,
+                19 => RuleAction::DeferDelivery(u32::try_from(s.n1.clamp(1, 40_320)).unwrap_or(1)),
+                20 => RuleAction::CcTo(list()?),
+                21 => RuleAction::MarkSensitivity(sens(s.choice)),
+                22 => RuleAction::NotifyWhenRead,
+                23 => RuleAction::NotifyWhenDelivered,
+                24 => RuleAction::ServerReply(text()?),
                 _ => continue,
             });
+        }
+        // Stop Processing More Rules reads last in the description.
+        if let Some(pos) = out.iter().position(|a| *a == RuleAction::StopProcessingMoreRules) {
+            let stop = out.remove(pos);
+            out.push(stop);
         }
         Ok(out)
     }
@@ -378,7 +486,31 @@ impl Draft {
             Val::None => return None,
             Val::People => set(common::split_list(&s.text).join(" or ")),
             Val::Words => set(common::split_list(&s.text).join(" or ")),
-            Val::Account | Val::Category | Val::Text => set(s.text.trim().to_owned()),
+            Val::Account | Val::Category | Val::Text | Val::Form | Val::FormType => {
+                set(s.text.trim().to_owned())
+            }
+            Val::Template | Val::Sound => {
+                let t = s.text.trim();
+                let name = std::path::Path::new(t).file_name().map(|n| n.to_string_lossy().into_owned());
+                set(name.unwrap_or_else(|| t.to_owned()))
+            }
+            Val::Reply => {
+                let first = s.text.trim().lines().next().unwrap_or_default().trim().to_owned();
+                set(if first.chars().count() > 40 {
+                    format!("\"{}…\"", first.chars().take(40).collect::<String>())
+                } else if first.is_empty() {
+                    first
+                } else {
+                    format!("\"{first}\"")
+                })
+            }
+            Val::Minutes => {
+                if s.on {
+                    s.n1.to_string()
+                } else {
+                    def.placeholder.to_owned()
+                }
+            }
             Val::Importance => {
                 format!("{} importance", IMPORTANCE.get(s.choice).copied().unwrap_or("normal"))
             }
@@ -422,6 +554,7 @@ impl Draft {
     fn default_name(&self, app: &App) -> String {
         for (i, s) in self.conds.iter().enumerate() {
             if s.on
+                && offered(Sec::Cond, i, self.outgoing)
                 && let Some(v) = self.value_text(app, Sec::Cond, i)
                 && !v.is_empty()
                 && CONDS.get(i).is_some_and(|d| d.placeholder != v)
@@ -536,11 +669,15 @@ fn description(
             .min_scrolled_height(height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.label("Apply this rule after the message arrives");
+                ui.label(if draft.outgoing {
+                    "Apply this rule after I send the message"
+                } else {
+                    "Apply this rule after the message arrives"
+                });
                 for sec in [Sec::Cond, Sec::Act, Sec::Exc] {
                     let mut first = true;
                     for (i, s) in draft.slots(sec).iter().enumerate() {
-                        if !s.on {
+                        if !s.on || !offered(sec, i, draft.outgoing) {
                             continue;
                         }
                         let prefix = match (sec, first) {
@@ -578,6 +715,11 @@ fn action_icon(a: &RuleAction) -> &'static str {
         RuleAction::Print => "print",
         RuleAction::MarkAsRead => "read",
         RuleAction::StopProcessingMoreRules => "block",
+        RuleAction::DeferDelivery(_) => "calendar-reminder",
+        RuleAction::CcTo(_) => "forward",
+        RuleAction::MarkSensitivity(_) => "private",
+        RuleAction::NotifyWhenRead | RuleAction::NotifyWhenDelivered => "read",
+        RuleAction::ServerReply(_) => "reply",
     }
 }
 
@@ -617,8 +759,67 @@ fn value_editor(
                 ui.add(egui::TextEdit::singleline(&mut s.text).desired_width(f32::INFINITY));
             }
             Val::Text => {
-                let hint = if i == 0 { "Message to show" } else { "File path" };
-                ui.add(egui::TextEdit::singleline(&mut s.text).hint_text(hint).desired_width(f32::INFINITY));
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.text)
+                        .hint_text("Message to show")
+                        .desired_width(f32::INFINITY),
+                );
+            }
+            Val::Form => {
+                let forms: Vec<&str> = mailcraft_model::rule::FORMS.iter().map(|(n, _)| *n).collect();
+                if s.text.trim().is_empty() {
+                    s.text = "Message".into();
+                }
+                common::combo(ui, ("rform", uid, i), &mut s.text, &forms, 260.0);
+            }
+            Val::FormType => {
+                ui.label("Message class (for example IPM.Schedule.Meeting):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.text)
+                        .hint_text("IPM.Note")
+                        .desired_width(f32::INFINITY),
+                );
+            }
+            Val::Minutes => {
+                ui.horizontal(|ui| {
+                    ui.label("Defer delivery by");
+                    ui.add(egui::DragValue::new(&mut s.n1).range(1..=40_320));
+                    ui.label("minutes");
+                });
+            }
+            Val::Template | Val::Sound => {
+                let (hint, title, filter) = if def.val == Val::Template {
+                    (
+                        "Reply template (.eml)",
+                        "Select a Reply Template",
+                        crate::FileFilter::new("Templates", &["eml"]),
+                    )
+                } else {
+                    (
+                        "Sound file",
+                        "Select a Sound",
+                        crate::FileFilter::new("Sounds", &["wav", "ogg", "mp3", "flac"]),
+                    )
+                };
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut s.text).hint_text(hint).desired_width(300.0));
+                    if common::browse_button(ui, app)
+                        && let Some(path) = common::browse_open(app, title, &[filter], &s.text)
+                    {
+                        s.text = path;
+                    }
+                });
+                if def.val == Val::Template {
+                    muted(
+                        ui,
+                        app,
+                        "Save a message with File › Save As (.eml) to use it as a reply template.",
+                    );
+                }
+            }
+            Val::Reply => {
+                ui.label("Text of the reply:");
+                ui.add(egui::TextEdit::multiline(&mut s.text).desired_rows(4).desired_width(f32::INFINITY));
             }
             Val::Account => {
                 let choices: Vec<&str> = accounts.iter().map(String::as_str).collect();
@@ -768,6 +969,10 @@ fn create_rule(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                             .hint_text("Sound file path")
                             .desired_width(220.0),
                     );
+                    if let Some(p) = browse_sound(ui, app, &st.sound) {
+                        st.sound = p;
+                        st.sound_on = true;
+                    }
                 });
                 let mut out = Out::Keep;
                 ui.horizontal(|ui| {
@@ -914,11 +1119,14 @@ fn rule_created(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 struct RulesState {
     tab: usize,
     selected: Option<u64>,
+    /// Selected row of the Manage Alerts tab.
+    alert: Option<u64>,
 }
 
 fn rules_and_alerts(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let init = |app: &App| RulesState { tab: 0, selected: app.s.mailbox.rules.first().map(|r| r.id) };
+    let init =
+        |app: &App| RulesState { tab: 0, selected: app.s.mailbox.rules.first().map(|r| r.id), alert: None };
     with_state(ctx, app, uid, init, |st, app| {
         for (k, v) in take_replies(ctx, uid) {
             let Some(f) = v.as_u64() else { continue };
@@ -945,9 +1153,10 @@ fn rules_and_alerts(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             });
             ui.separator();
             if st.tab == 1 {
-                muted(ui, app, "Alerts watch web pages and services; MailCraft has none to manage yet.");
-                ui.add_enabled(false, egui::Button::new("New Alert..."));
-                ui.add_space(200.0);
+                let out = manage_alerts(ui, app, uid, st);
+                if !matches!(out, Out::Keep) {
+                    return out;
+                }
                 return ok_cancel(ui, app, true).map_or(Out::Keep, |_| Out::Close);
             }
             let rules = app.s.mailbox.rules.clone();
@@ -965,8 +1174,10 @@ fn rules_and_alerts(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         }
                     });
                 });
-                if ui.add_enabled(sel_rule.is_some(), egui::Button::new("Copy...")).clicked() && let Some(r) = &sel_rule && let Some(v) = app.run("rules.copy", json!({"id": r.id})) {
-                    st.selected = v.get("id").and_then(Value::as_u64);
+                if ui.add_enabled(sel_rule.is_some(), egui::Button::new("Copy...")).clicked()
+                    && let Some(r) = &sel_rule
+                {
+                    out = Out::open("copyRule", json!({"id": r.id, "name": r.name}));
                 }
                 if ui.add_enabled(sel_rule.is_some(), egui::Button::new("Delete")).clicked()
                     && let Some(r) = &sel_rule
@@ -1079,16 +1290,157 @@ fn rules_and_alerts(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
+/// A Browse... button for a sound file (shown when the app has file dialogs); the chosen path.
+fn browse_sound(ui: &mut Ui, app: &App, current: &str) -> Option<String> {
+    if !common::browse_button(ui, app) {
+        return None;
+    }
+    let filter = crate::FileFilter::new("Sounds", &["wav", "ogg", "mp3", "flac"]);
+    common::browse_open(app, "Select a Sound", &[filter], current)
+}
+
+/// Change Rule quick action: adds `action` (replacing one of the same kind).
 fn add_action(app: &mut App, id: u64, action: RuleAction) {
-    let Some(r) = app.s.mailbox.rules.iter().find(|r| r.id == id) else { return };
-    let mut actions: Vec<RuleAction> = r
-        .actions
-        .iter()
-        .filter(|a| std::mem::discriminant(*a) != std::mem::discriminant(&action))
-        .cloned()
-        .collect();
-    actions.push(action);
-    app.run("rules.edit", json!({"id": id, "actions": actions}));
+    app.run("rules.addAction", json!({"id": id, "action": action}));
+}
+
+/// Manage Alerts tab: the rules that show alerts (New Item Alert window, Desktop Alert, sound), with New
+/// Alert (a rule from the alert template) and Alert Rules (back to the rules list on that rule).
+fn manage_alerts(ui: &mut Ui, app: &mut App, uid: u64, st: &mut RulesState) -> Out {
+    let mut out = Out::Keep;
+    ui.horizontal(|ui| {
+        if ui.button("New Alert...").clicked() {
+            out = Out::open("rulesWizard", json!({"template": TEMPLATE_ALERT}));
+        }
+        let alert_rules: Vec<u64> = app.s.mailbox.rules.iter().filter(|r| r.has_alert()).map(|r| r.id).collect();
+        if ui.add_enabled(!alert_rules.is_empty(), egui::Button::new("Alert Rules...")).clicked() {
+            st.tab = 0;
+            st.selected = st.alert.filter(|id| alert_rules.contains(id)).or(alert_rules.first().copied());
+        }
+        if ui.add_enabled(st.alert.is_some(), egui::Button::new("Delete")).clicked()
+            && let Some(id) = st.alert
+            && let Some(r) = app.s.mailbox.rules.iter().find(|r| r.id == id)
+        {
+            out = Out::open(
+                "confirm",
+                json!({"title": "Rules and Alerts", "text": format!("Delete rule \"{}\"?", r.name), "command": "rules.delete", "params": {"id": id}}),
+            );
+        }
+    });
+    ui.add_space(4.0);
+    let frame = egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).inner_margin(4.0);
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Alert source").strong());
+            ui.add_space(160.0);
+            ui.label(RichText::new("Alert shown").strong());
+        });
+        egui::ScrollArea::vertical()
+            .id_salt(("alerts", uid))
+            .max_height(220.0)
+            .min_scrolled_height(220.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let rules: Vec<Rule> = app.s.mailbox.rules.iter().filter(|r| r.has_alert()).cloned().collect();
+                if rules.is_empty() {
+                    muted(
+                        ui,
+                        app,
+                        "No alerts. Choose New Alert... to show messages from someone in the New Item Alert window.",
+                    );
+                }
+                for r in &rules {
+                    let shown: Vec<&str> = r
+                        .actions
+                        .iter()
+                        .filter_map(|a| match a {
+                            RuleAction::NewItemAlert(_) => Some("New Item Alert window"),
+                            RuleAction::DesktopAlert => Some("Desktop Alert"),
+                            RuleAction::PlaySound(_) => Some("Sound"),
+                            _ => None,
+                        })
+                        .collect();
+                    let label = format!("{}{}  —  {}", r.name, if r.enabled { "" } else { " (off)" }, shown.join(", "));
+                    if ui.selectable_label(st.alert == Some(r.id), label).clicked() {
+                        st.alert = Some(r.id);
+                    }
+                }
+            });
+    });
+    muted(ui, app, "Alerts come from rules; RSS and web alerts are not available.");
+    out
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Copy rule (to other accounts)
+
+#[derive(Clone, Default)]
+struct CopyState {
+    picked: Vec<u64>,
+    error: String,
+}
+
+fn copy_rule(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let id = d.u64("id");
+    let name = d.str("name");
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| CopyState::default(),
+        |st, app| {
+            window(ctx, app, d, "Copy Rule", 420.0, |ui, app| {
+                ui.label(format!("Copy the rule \"{name}\" to:"));
+                let accounts: Vec<(u64, String, bool)> = app
+                    .s
+                    .mailbox
+                    .accounts
+                    .iter()
+                    .map(|a| (u64::from(a.id.0), common::account_title(a), !a.address.trim().is_empty()))
+                    .collect();
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, app.theme.separator))
+                    .inner_margin(4.0)
+                    .show(ui, |ui| {
+                        ui.set_min_height(90.0);
+                        for (aid, title, has_addr) in &accounts {
+                            let mut on = st.picked.contains(aid);
+                            if ui.add_enabled(*has_addr, egui::Checkbox::new(&mut on, title)).changed() {
+                                if on {
+                                    st.picked.push(*aid);
+                                } else {
+                                    st.picked.retain(|x| x != aid);
+                                }
+                            }
+                        }
+                    });
+                muted(ui, app, "Each copy runs only on mail of its account; folders are matched by name.");
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                let mut out = Out::Keep;
+                footer(ui, |ui| {
+                    if btn(ui, "Cancel") {
+                        out = Out::Close;
+                    }
+                    if primary(ui, app, !st.picked.is_empty(), "OK") {
+                        match app.run("rules.copyToAccounts", json!({"id": id, "accounts": st.picked})) {
+                            Some(_) => out = Out::Close,
+                            None => st.error = last_error(app),
+                        }
+                    }
+                    if btn_en(ui, id.is_some(), "Duplicate Here") {
+                        match app.run("rules.copy", json!({"id": id})) {
+                            Some(_) => out = Out::Close,
+                            None => st.error = last_error(app),
+                        }
+                    }
+                });
+                out
+            })
+        },
+    )
 }
 
 fn change_rule_menu(ui: &mut Ui, app: &mut App, uid: u64, r: &Rule) -> Out {
@@ -1180,11 +1532,16 @@ fn rule_prompt(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         |st, app| {
             window(ctx, app, d, "Play a Sound", 380.0, |ui, app| {
                 ui.label("Sound file to play when the rule runs:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut st.text)
-                        .hint_text("/path/to/sound.wav")
-                        .desired_width(f32::INFINITY),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut st.text)
+                            .hint_text("/path/to/sound.wav")
+                            .desired_width(300.0),
+                    );
+                    if let Some(p) = browse_sound(ui, app, &st.text) {
+                        st.text = p;
+                    }
+                });
                 match ok_cancel(ui, app, !st.text.trim().is_empty()) {
                     Some(true) => {
                         if let Some(id) = d.u64("id") {
@@ -1215,14 +1572,27 @@ fn rules_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         uid,
         |_: &App| OptState::default(),
         |st, app| {
-            window(ctx, app, d, "Options", 420.0, |ui, app| {
+            window(ctx, app, d, "Options", 440.0, |ui, app| {
                 common::heading(ui, app, "Import and export");
-                ui.label("Rules file:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut st.path)
-                        .hint_text("/path/to/rules.json")
-                        .desired_width(f32::INFINITY),
-                );
+                ui.label("Rules file (.mcrules):");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut st.path)
+                            .hint_text("/path/to/my-rules.mcrules")
+                            .desired_width(330.0),
+                    );
+                    let filter = crate::FileFilter::new("MailCraft rules", &["mcrules", "json"]);
+                    if common::browse_button(ui, app) {
+                        let picked = if app.s.mailbox.rules.is_empty() {
+                            common::browse_open(app, "Import Rules", &[filter], &st.path)
+                        } else {
+                            common::browse_save(app, "Rules File", &[filter], &st.path)
+                        };
+                        if let Some(p) = picked {
+                            st.path = p;
+                        }
+                    }
+                });
                 ui.checkbox(&mut st.replace, "Replace my rules when importing");
                 ui.horizontal(|ui| {
                     let has = !st.path.trim().is_empty();
@@ -1391,20 +1761,35 @@ struct Wizard {
     error: String,
 }
 
-/// Templates on the first page: (label, conditions ticked, actions ticked).
-const TEMPLATES: [(&str, &[usize], &[usize]); 7] = [
-    ("Move messages from someone to a folder", &[1], &[1]),
-    ("Move messages with specific words in the subject to a folder", &[0], &[1]),
-    ("Move messages sent to a public group to a folder", &[11], &[1]),
-    ("Flag messages from someone for follow-up", &[1], &[10]),
-    ("Display mail from someone in the New Item Alert window", &[1], &[0]),
-    ("Play a sound when I get messages from someone", &[1], &[15]),
-    ("Apply rule on messages I receive", &[], &[]),
+/// Templates on the first page: (group, label, conditions ticked, actions ticked, for sent messages).
+const TEMPLATES: [(&str, &str, &[usize], &[usize], bool); 10] = [
+    ("Stay Organized", "Move messages from someone to a folder", &[1], &[1], false),
+    ("Stay Organized", "Move messages with specific words in the subject to a folder", &[0], &[1], false),
+    ("Stay Organized", "Move messages sent to a public group to a folder", &[11], &[1], false),
+    ("Stay Organized", "Flag messages from someone for follow-up", &[1], &[10], false),
+    ("Stay Organized", "Move RSS items from a specific RSS Feed to a folder", &[25], &[1], false),
+    ("Stay Up to Date", "Display mail from someone in the New Item Alert window", &[1], &[0], false),
+    ("Stay Up to Date", "Play a sound when I get messages from someone", &[1], &[15], false),
+    (
+        "Stay Up to Date",
+        "Send an alert to my mobile device when I get messages from someone",
+        &[1],
+        &[],
+        false,
+    ),
+    ("Start from a blank rule", "Apply rule on messages I receive", &[], &[], false),
+    ("Start from a blank rule", "Apply rule on messages I send", &[], &[], true),
 ];
+
+/// The New Item Alert template (Manage Alerts › New Alert).
+const TEMPLATE_ALERT: usize = 5;
+/// Not available here (no text messaging service).
+const TEMPLATE_MOBILE: usize = 7;
 
 fn template_draft(t: usize) -> Draft {
     let mut d = Draft::default();
-    if let Some((_, c, a)) = TEMPLATES.get(t) {
+    if let Some((_, _, c, a, outgoing)) = TEMPLATES.get(t) {
+        d.outgoing = *outgoing;
         for i in c.iter() {
             d.set(Sec::Cond, *i, |_| {});
         }
@@ -1456,10 +1841,15 @@ fn wizard(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 error: String::new(),
             }
         } else {
+            let template = d
+                .u64("template")
+                .and_then(|t| usize::try_from(t).ok())
+                .filter(|t| *t < TEMPLATES.len() && *t != TEMPLATE_MOBILE)
+                .unwrap_or(0);
             Wizard {
                 page: 0,
-                template: 0,
-                draft: template_draft(0),
+                template,
+                draft: template_draft(template),
                 rule_id: None,
                 name: String::new(),
                 run_now: false,
@@ -1487,11 +1877,18 @@ fn wizard_body(ctx: &Context, ui: &mut Ui, app: &mut App, uid: u64, w: &mut Wiza
             egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).inner_margin(4.0).show(
                 ui,
                 |ui| {
-                    ui.set_min_height(180.0);
-                    ui.label(RichText::new("Stay Organized").color(app.theme.text_muted));
-                    for (i, (label, _, _)) in TEMPLATES.iter().enumerate() {
-                        if i == 6 {
-                            ui.label(RichText::new("Start from a blank rule").color(app.theme.text_muted));
+                    ui.set_min_height(200.0);
+                    let mut group = "";
+                    for (i, (g, label, _, _, _)) in TEMPLATES.iter().enumerate() {
+                        if *g != group {
+                            group = g;
+                            ui.label(RichText::new(*g).color(app.theme.text_muted));
+                        }
+                        if i == TEMPLATE_MOBILE {
+                            ui.add_enabled(false, egui::Button::selectable(false, *label)).on_disabled_hover_text(
+                                "Alerts to a mobile device need a text messaging service, which MailCraft does not have.",
+                            );
+                            continue;
                         }
                         if ui.selectable_label(w.template == i, *label).clicked() {
                             w.template = i;
@@ -1528,6 +1925,9 @@ fn wizard_body(ctx: &Context, ui: &mut Ui, app: &mut App, uid: u64, w: &mut Wiza
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for i in 0..defs(sec).len() {
+                                if !offered(sec, i, w.draft.outgoing) {
+                                    continue;
+                                }
                                 ui.horizontal(|ui| {
                                     let mut on = w.draft.slots(sec).get(i).is_some_and(|s| s.on);
                                     if ui.add(egui::Checkbox::without_text(&mut on)).changed()
@@ -1560,7 +1960,10 @@ fn wizard_body(ctx: &Context, ui: &mut Ui, app: &mut App, uid: u64, w: &mut Wiza
                 app.s.mailbox.folder(app.s.selection.folder).map(|f| f.name.clone()).unwrap_or_default();
             ui.checkbox(&mut w.run_now, format!("Run this rule now on messages already in \"{fname}\""));
             ui.checkbox(&mut w.enabled, "Turn on this rule");
-            ui.add_enabled(false, egui::Checkbox::new(&mut false, "Create this rule on all accounts"));
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, "Create this rule on all accounts"))
+                .on_disabled_hover_text(
+                    "Rules apply to every account unless limited with \"through the specified account\"; use Copy... to make a copy for another account.",
+                );
             ui.label("Step 3: Review rule description (click an underlined value to edit)");
             click = description(ui, app, &w.draft, ("wd4", uid), 120.0);
         }
@@ -1667,10 +2070,10 @@ fn finish_wizard(ctx: &Context, app: &mut App, w: &mut Wizard) -> Out {
         return Out::Keep;
     }
     let _ = ctx;
-    if w.draft.is_client_only() {
+    if w.draft.is_client_only() || w.draft.conds.get(29).is_some_and(|s| s.on) {
         Out::close_open(
             "message",
-            json!({"title": "Rules Wizard", "text": "This rule runs only while MailCraft is open: some of its actions happen in this app, not on the mail server."}),
+            json!({"title": "Rules Wizard", "text": "MailCraft carries out this rule itself, so it acts only on mail that arrives while MailCraft is running."}),
         )
     } else {
         Out::Close

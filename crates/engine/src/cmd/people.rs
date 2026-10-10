@@ -435,6 +435,54 @@ fn run_categorize(s: &mut Session, p: &Value) -> CmdResult {
     pim::run_categorize(s, p, Kind::Contact)
 }
 
+/// Business card text: name, job title, company, addresses, phones, web page (what the card view and a
+/// forwarded card's message body show).
+pub fn business_card_lines(c: &Contact) -> Vec<String> {
+    let mut lines = Vec::new();
+    let name = display_name(c);
+    let full = c.full_name();
+    lines.push(if full.is_empty() { name } else { full });
+    for v in [&c.job_title, &c.department, &c.company] {
+        if !v.trim().is_empty() {
+            lines.push(v.trim().to_owned());
+        }
+    }
+    for (kind, number) in &c.phones {
+        if !number.trim().is_empty() {
+            lines.push(format!("{} {}", number.trim(), kind.trim()));
+        }
+    }
+    for e in c.emails.iter().filter(|e| !e.trim().is_empty()) {
+        lines.push(e.trim().to_owned());
+    }
+    for a in &c.addresses {
+        let street = a.street.trim();
+        let city_line = [a.city.trim(), a.region.trim(), a.postal_code.trim()]
+            .iter()
+            .filter(|x| !x.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for l in [street, city_line.as_str(), a.country.trim()] {
+            if !l.is_empty() {
+                lines.push(l.to_owned());
+            }
+        }
+    }
+    if !c.web_page.trim().is_empty() {
+        lines.push(c.web_page.trim().to_owned());
+    }
+    lines
+}
+
+/// File name for a contact's vCard ("Ann Lee.vcf").
+fn vcard_name(c: &Contact) -> String {
+    crate::compose::clean_attachment_name(&format!("{}.vcf", display_name(c)), "contact.vcf")
+}
+
+/// Forward Contact › As a Business Card / As an Outlook Contact: a new message with each contact attached as
+/// a vCard (`text/vcard`, RFC 6350 via `mailcraft-formats`); a business card also puts the card text in the
+/// body. Contact groups are skipped (a vCard has no member list).
 fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
     let as_kind = match opt_str(p, "as") {
         None | Some("contact") => "contact",
@@ -442,7 +490,41 @@ fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
         Some(_) => return Err(CmdError::Params("`as` must be businessCard|contact".into())),
     };
     let ids = pim::require_targets(s, p, Kind::Contact)?;
-    pim::dialog(s, "forwardContact", json!({ "ids": pim::ids_json(&ids), "as": as_kind }))
+    let contacts: Vec<Contact> =
+        ids.iter().filter_map(|i| s.mailbox.contacts.get(i)).filter(|c| !is_group(c)).cloned().collect();
+    if contacts.is_empty() {
+        return Err(CmdError::Params("contact groups cannot be forwarded as business cards".into()));
+    }
+    let names: Vec<String> = contacts.iter().map(display_name).collect();
+    let subject = match names.as_slice() {
+        [one] => one.clone(),
+        [first, rest @ ..] => format!("{first} and {} more", rest.len()),
+        [] => String::new(),
+    };
+    let body = if as_kind == "businessCard" {
+        contacts.iter().map(|c| business_card_lines(c).join("\n")).collect::<Vec<_>>().join("\n\n")
+    } else {
+        String::new()
+    };
+    let attachments = contacts
+        .iter()
+        .map(|c| crate::compose::ComposeAttachment {
+            filename: vcard_name(c),
+            mime_type: "text/vcard".into(),
+            data: mailcraft_formats::vcf::write(std::slice::from_ref(c), mailcraft_formats::vcf::Version::V3)
+                .into_bytes(),
+        })
+        .collect();
+    let mut compose = crate::compose::ComposeState {
+        subject,
+        body: mailcraft_model::Doc::from_plain_text(&body),
+        attachments,
+        dirty: true,
+        ..Default::default()
+    };
+    crate::compose::insert_default_signature(&s.mailbox, &mut compose);
+    let cid = s.open_compose(compose);
+    Ok(json!({ "compose": cid, "as": as_kind, "contacts": contacts.len() }))
 }
 
 fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
@@ -657,7 +739,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mod+F",
             r#"{"as": "businessCard|contact", "ids"?: [number]}"#,
             false,
-            contact_selected,
+            always,
             run_forward,
         ),
         spec(
@@ -879,13 +961,49 @@ mod tests {
         let mut s = session();
         let a = add(&mut s, json!({"fullName": "Ann A"}));
         select(&mut s, &[a]);
-        let r = s.run("people.forward", &json!({"as": "businessCard"})).unwrap();
-        assert_eq!(r["dialog"], "forwardContact");
-        assert!(matches!(s.run("people.forward", &json!({"as": "fax"})), Err(CmdError::Params(_))));
+        let r = s.run("people.forward", &json!({"as": "fax"}));
+        assert!(matches!(r, Err(CmdError::Params(_))));
         let r = s.run("people.mailMerge", &json!({"contacts": "all", "output": "labels"})).unwrap();
         assert_eq!(r["dialog"], "mailMerge");
         assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(_, p)) if p["ids"] == json!([a])));
         assert!(matches!(s.run("people.mailMerge", &json!({"output": "fax"})), Err(CmdError::Params(_))));
+    }
+
+    #[test]
+    fn forward_attaches_vcards() {
+        let mut s = session();
+        let a = add(
+            &mut s,
+            json!({"fullName": "Ann Lee", "email": "ann@example.com", "company": "Example Co.", "jobTitle": "Editor",
+                   "phones": {"Mobile": "+1 555 0100"}}),
+        );
+        let g =
+            s.run("people.newGroup", &json!({"name": "Team", "members": ["x@example.com"]})).unwrap()["id"]
+                .as_u64()
+                .unwrap();
+        select(&mut s, &[a, g]);
+        let r = s.run("people.forward", &json!({"as": "businessCard"})).unwrap();
+        assert_eq!(r["contacts"], 1, "the group is skipped");
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.subject, "Lee, Ann");
+        assert_eq!(c.attachments.len(), 1);
+        assert_eq!(c.attachments[0].filename, "Lee, Ann.vcf");
+        assert_eq!(c.attachments[0].mime_type, "text/vcard");
+        let card = String::from_utf8(c.attachments[0].data.clone()).unwrap();
+        assert!(card.starts_with("BEGIN:VCARD"), "{card}");
+        assert!(card.contains("ann@example.com"));
+        let back = mailcraft_formats::vcf::read_str(&card);
+        assert_eq!(back[0].emails, vec!["ann@example.com".to_string()]);
+        let text = c.body.to_plain_text();
+        assert!(
+            text.contains("Ann Lee") && text.contains("Editor") && text.contains("+1 555 0100 Mobile"),
+            "{text}"
+        );
+        // As an Outlook contact: the vCard alone.
+        let r = s.run("people.forward", &json!({"as": "contact", "ids": [a]})).unwrap();
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert!(c.body.to_plain_text().trim().is_empty());
+        assert!(matches!(s.run("people.forward", &json!({"ids": [g]})), Err(CmdError::Params(_))));
     }
 
     #[test]

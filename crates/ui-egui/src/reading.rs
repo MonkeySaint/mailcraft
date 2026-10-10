@@ -324,12 +324,28 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
     let theme = app.theme.clone();
     // 1. Subject.
     let subject = if h.subject.trim().is_empty() { "(no subject)" } else { h.subject.as_str() };
-    ui.add(
-        egui::Label::new(
-            RichText::new(subject).size(if in_window { 18.0 } else { 20.0 }).strong().color(theme.text),
+    let subject_size = if in_window { 18.0 } else { 20.0 };
+    // Search words in the subject on the highlight background (File › Options › Search).
+    let hits = if crate::dialogs::search_highlight_on(ui.ctx()) {
+        mailcraft_engine::search_index::highlights(
+            &app.s,
+            mailcraft_engine::search_index::Field::Subject,
+            subject,
         )
-        .wrap(),
-    );
+    } else {
+        Vec::new()
+    };
+    if hits.is_empty() {
+        ui.add(egui::Label::new(RichText::new(subject).size(subject_size).strong().color(theme.text)).wrap());
+    } else {
+        let format = egui::TextFormat {
+            font_id: FontId::proportional(subject_size),
+            color: theme.text,
+            ..Default::default()
+        };
+        let job = crate::list::highlight_job(subject.to_owned(), &format, &hits, theme.search_hit);
+        ui.add(egui::Label::new(job).wrap());
+    }
     ui.add_space(10.0);
 
     // 2. Persona + addresses (left) and actions + date (right).
@@ -399,6 +415,8 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
         ui.add_space(6.0);
         info_bar(ui, app, "info", line, None);
     }
+    // 6. Meeting requests, responses, cancellations and proposals (nothing for ordinary mail).
+    crate::modules::meeting_bar(ui, app, id);
 }
 
 fn recipients_line(ui: &mut Ui, label: &str, names: &str, theme: &crate::theme::Theme) {

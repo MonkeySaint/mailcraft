@@ -1,9 +1,8 @@
 //! File-side dialogs: Mailbox Cleanup, the Import and Export Wizard (EML, MSG, MBOX, Maildir, iCalendar,
-//! vCard, CSV), Save As (EML, MSG, text, HTML), Save Attachments and Print (with a preview shared by the
-//! backstage Print page). Path fields get a Browse... button when the app installed file dialogs
+//! vCard, CSV), Save As (EML, MSG, text, HTML) and Save Attachments (Print: `print.rs`). Path fields get a Browse... button when the app installed file dialogs
 //! ([`crate::FileDialogs`]). Account dialogs live in `accounts`.
 
-use egui::{Context, Id, RichText, Ui};
+use egui::{Context, RichText, Ui};
 use serde_json::{Value, json};
 
 use super::common::{
@@ -12,7 +11,7 @@ use super::common::{
 };
 use super::folders::last_error;
 use crate::App;
-use mailcraft_model::{Doc, FolderId, FolderKind, FolderRole, ItemId, MailItem};
+use mailcraft_model::{FolderId, FolderKind, FolderRole};
 
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
@@ -20,7 +19,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "importExport" => import_export(ctx, app, d),
         "saveAs" => save_as(ctx, app, d),
         "saveAttachments" => save_attachments(ctx, app, d),
-        "print" => print(ctx, app, d),
         _ => return None,
     })
 }
@@ -648,257 +646,4 @@ fn save_attachments(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             })
         },
     )
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// Print
-
-#[derive(Clone, Default)]
-struct PrintState {
-    style: usize,
-    copies: u32,
-    path: String,
-    page: usize,
-    error: String,
-}
-
-pub(crate) const STYLES: [&str; 2] = ["Memo Style", "Table Style"];
-
-fn print(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let ids = d.ids();
-    let table = d.str("style") == "table";
-    let init = |_: &App| PrintState {
-        style: usize::from(table),
-        copies: 1,
-        path: format!("{}/print.html", home()),
-        ..Default::default()
-    };
-    with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Print", 720.0, |ui, app| {
-            let mut out = Out::Keep;
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(240.0);
-                    common::heading(ui, app, "Printer");
-                    ui.label("Save as HTML file (open it in a browser to print)");
-                    ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(230.0));
-                    common::heading(ui, app, "Print style");
-                    for (i, s) in STYLES.iter().enumerate() {
-                        ui.radio_value(&mut st.style, i, *s);
-                    }
-                    common::heading(ui, app, "Copies");
-                    ui.horizontal(|ui| {
-                        ui.label("Number of copies:");
-                        ui.add(egui::DragValue::new(&mut st.copies).range(1..=99));
-                    });
-                    muted(ui, app, &format!("{} item(s) selected.", ids.len()));
-                    if !st.error.is_empty() {
-                        ui.colored_label(app.theme.danger, &st.error);
-                    }
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    print_preview(ui, app, &ids, st.style == 1, &mut st.page, ("pp", uid), 380.0);
-                });
-            });
-            footer(ui, |ui| {
-                if btn(ui, "Cancel") {
-                    out = Out::Close;
-                }
-                if primary(ui, app, !ids.is_empty(), "Print") {
-                    match print_to_file(app, &ids, st.style == 1, st.copies, st.path.trim()) {
-                        Ok(path) => {
-                            out = Out::close_open(
-                                "message",
-                                json!({"title": "Print", "text": format!("Saved the printout to {path}.")}),
-                            )
-                        }
-                        Err(e) => st.error = e,
-                    }
-                }
-            });
-            out
-        })
-    })
-}
-
-/// Cached doc + layout for the preview of one item.
-#[derive(Clone, Default)]
-struct PreviewCache {
-    id: u64,
-    doc: Doc,
-    view: crate::body::BodyView,
-}
-
-pub(crate) fn item_doc(m: &MailItem) -> Doc {
-    match (&m.body.html, &m.body.text) {
-        (Some(h), _) => mailcraft_html::html_to_doc(h),
-        (None, Some(t)) => Doc::from_plain_text(t),
-        (None, None) => Doc::from_plain_text(&m.preview),
-    }
-}
-
-fn header_rows(app: &App, m: &MailItem) -> Vec<(&'static str, String)> {
-    let people = |l: &[mailcraft_model::Address]| {
-        l.iter().map(mailcraft_model::Address::to_display_string).collect::<Vec<_>>().join("; ")
-    };
-    let when = m.sent.unwrap_or(m.received);
-    let mut rows = vec![
-        ("From", m.from.as_ref().map(mailcraft_model::Address::to_display_string).unwrap_or_default()),
-        ("Sent", mailcraft_model::ListTime::long(when, app.s.tz_offset_min)),
-        ("To", people(&m.to)),
-    ];
-    if !m.cc.is_empty() {
-        rows.push(("Cc", people(&m.cc)));
-    }
-    rows.push(("Subject", m.subject.clone()));
-    if !m.attachments.is_empty() {
-        rows.push((
-            "Attachments",
-            m.attachments.iter().map(|a| a.filename.clone()).collect::<Vec<_>>().join("; "),
-        ));
-    }
-    rows
-}
-
-/// Print preview of `ids` (one page per item in Memo style; a single table in Table style).
-pub(crate) fn print_preview(
-    ui: &mut Ui,
-    app: &App,
-    ids: &[u64],
-    table: bool,
-    page: &mut usize,
-    salt: impl std::hash::Hash + std::fmt::Debug + Copy,
-    height: f32,
-) {
-    let items: Vec<&MailItem> = ids.iter().filter_map(|i| app.s.mailbox.mail.get(&ItemId(*i))).collect();
-    if items.is_empty() {
-        muted(ui, app, "Select a message to see a preview.");
-        return;
-    }
-    let pages = if table { 1 } else { items.len() };
-    *page = (*page).min(pages.saturating_sub(1));
-    ui.horizontal(|ui| {
-        if ui.add_enabled(*page > 0, egui::Button::new("◀")).on_hover_text("Previous Page").clicked() {
-            *page = page.saturating_sub(1);
-        }
-        ui.label(format!("Page {} of {pages}", *page + 1));
-        if ui.add_enabled(*page + 1 < pages, egui::Button::new("▶")).on_hover_text("Next Page").clicked() {
-            *page += 1;
-        }
-    });
-    let paper = egui::Color32::WHITE;
-    let ink = egui::Color32::from_rgb(0x20, 0x20, 0x20);
-    egui::Frame::new()
-        .fill(paper)
-        .stroke(egui::Stroke::new(1.0, app.theme.separator))
-        .inner_margin(18.0)
-        .show(ui, |ui| {
-            ui.visuals_mut().override_text_color = Some(ink);
-            egui::ScrollArea::vertical()
-                .id_salt(salt)
-                .max_height(height)
-                .min_scrolled_height(height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let me =
-                        app.s.mailbox.accounts.first().map(|a| a.display_name.clone()).unwrap_or_default();
-                    ui.label(RichText::new(me).strong().size(15.0).color(ink));
-                    ui.separator();
-                    if table {
-                        egui::Grid::new((salt, "t")).num_columns(4).striped(true).show(ui, |ui| {
-                            for h in ["From", "Subject", "Received", "Size"] {
-                                ui.label(RichText::new(h).strong().color(ink));
-                            }
-                            ui.end_row();
-                            for m in &items {
-                                ui.label(m.from.as_ref().map(|f| f.display().to_owned()).unwrap_or_default());
-                                ui.label(&m.subject);
-                                ui.label(mailcraft_model::ListTime::short_date_time(
-                                    m.received,
-                                    app.s.tz_offset_min,
-                                ));
-                                ui.label(common::size_text(m.size));
-                                ui.end_row();
-                            }
-                        });
-                        return;
-                    }
-                    let Some(m) = items.get(*page) else { return };
-                    egui::Grid::new((salt, "h")).num_columns(2).show(ui, |ui| {
-                        for (k, v) in header_rows(app, m) {
-                            ui.label(RichText::new(format!("{k}:")).strong().color(ink));
-                            ui.label(RichText::new(v).color(ink));
-                            ui.end_row();
-                        }
-                    });
-                    ui.add_space(8.0);
-                    let id = Id::new(("mc-print-preview", salt));
-                    let mut cache = ui.ctx().data_mut(|d| d.get_temp::<PreviewCache>(id)).unwrap_or_default();
-                    if cache.id != m.id.0 {
-                        cache = PreviewCache {
-                            id: m.id.0,
-                            doc: item_doc(m),
-                            view: crate::body::BodyView::default(),
-                        };
-                    }
-                    crate::body::show_doc(ui, &mut cache.view, &cache.doc, false);
-                    ui.ctx().data_mut(|d| d.insert_temp(id, cache));
-                });
-        });
-}
-
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
-
-/// Writes a printable HTML file for `ids`; returns the path written.
-pub(crate) fn print_to_file(
-    app: &App,
-    ids: &[u64],
-    table: bool,
-    copies: u32,
-    path: &str,
-) -> Result<String, String> {
-    let items: Vec<&MailItem> = ids.iter().filter_map(|i| app.s.mailbox.mail.get(&ItemId(*i))).collect();
-    if items.is_empty() {
-        return Err("Nothing to print: select a message first.".into());
-    }
-    if path.is_empty() {
-        return Err("Enter a file name for the printout.".into());
-    }
-    let mut html = String::from(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>MailCraft print</title><style>body{font-family:sans-serif;margin:2em}table.h td{padding:2px 8px 2px 0;vertical-align:top}th,td{text-align:left}.page{page-break-after:always}</style></head><body>",
-    );
-    for _ in 0..copies.clamp(1, 99) {
-        if table {
-            html.push_str(
-                "<table class=\"page\"><tr><th>From</th><th>Subject</th><th>Received</th><th>Size</th></tr>",
-            );
-            for m in &items {
-                html.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    esc(m.from.as_ref().map(|f| f.display().to_owned()).unwrap_or_default().as_str()),
-                    esc(&m.subject),
-                    esc(&mailcraft_model::ListTime::short_date_time(m.received, app.s.tz_offset_min)),
-                    esc(&common::size_text(m.size)),
-                ));
-            }
-            html.push_str("</table>");
-        } else {
-            for m in &items {
-                html.push_str("<div class=\"page\"><table class=\"h\">");
-                for (k, v) in header_rows(app, m) {
-                    html.push_str(&format!("<tr><td><b>{k}:</b></td><td>{}</td></tr>", esc(&v)));
-                }
-                html.push_str("</table><hr>");
-                html.push_str(&mailcraft_html::doc_to_html(&item_doc(m)));
-                html.push_str("</div>");
-            }
-        }
-    }
-    html.push_str("</body></html>");
-    std::fs::write(path, html).map_err(|e| format!("Could not write {path}: {e}"))?;
-    Ok(path.to_owned())
 }

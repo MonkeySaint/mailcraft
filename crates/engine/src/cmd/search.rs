@@ -1,24 +1,20 @@
-//! Search commands (`search.*`): the query in `ViewState::search`, its scope, refine tokens, and the search
-//! tools. Also the in-memory query matcher ([`item_matches`], [`results`]) the list and search folders use
-//! until the dedicated search crate lands.
+//! Search commands (`search.*`): the query in `ViewState::search`, its scope, the Search tab refiners,
+//! Recent Searches, Search Tools (Indexing Status, Advanced Find) and match highlights.
 //!
-//! Query syntax: whitespace-separated terms, all of which must match. A term is free text (matched in
-//! subject, people, preview and body) or `key:value` with `value` optionally in double quotes; a leading
-//! `-` negates a term. Keys: `from`, `to`, `cc`, `tocc` (value `me` = one of the user's addresses),
-//! `subject`, `body`, `category` (`any` / `none` / a name), `hasattachments`, `isflagged`, `isread`
-//! (`yes` / `no`), `importance` (`high` / `normal` / `low`), `received` (`today`, `yesterday`,
-//! `this week`, `last week`, `this month`, `last month`), `expires` (items carry no expiry yet: matches
-//! nothing). A key with an empty value (`from:""`) is a placeholder being filled in and matches everything.
-
-use std::collections::BTreeSet;
+//! Queries use the `mailcraft-search` language (free text, `from:`, `to:`, `cc:`, `subject:`, `body:`,
+//! `attachments:`, `hasattachments:`, `isread:`, `isflagged:`, `importance:`, `category:`, `folder:`,
+//! `received:`/`sent:` with relative dates, dates and ranges, `size:`, `kind:`, AND/OR/NOT, parentheses,
+//! quoted phrases; prefix matching, case and diacritics ignored). Evaluation goes through the session's
+//! index ([`crate::search_index`]); [`item_matches`] evaluates one item directly.
 
 use serde_json::{Value, json};
 
 use super::folder::{current_folder, dialog};
-use super::util::{opt_bool, opt_str};
+use super::util::{opt_bool, opt_str, opt_u64};
+use crate::search_index::{self, MAX_RECENT};
 use crate::{CmdError, CmdResult, CommandSpec, SearchScope, Session, always};
-use mailcraft_model::dates::{LocalTime, local_day, weekday_of_day};
-use mailcraft_model::{FolderId, FolderKind, FolderRole, Importance, ItemId, MailItem};
+use mailcraft_model::{FolderId, ItemId, MailItem};
+use mailcraft_search::Field;
 
 #[allow(clippy::too_many_arguments)]
 fn spec(
@@ -41,13 +37,23 @@ pub fn specs() -> Vec<CommandSpec> {
             "Advanced Find",
             "Search › Options › Search Tools",
             "Mod+Shift+F",
-            "",
+            r#"{"words"?:string,"in"?:"subject|subjectBody|all","from"?:string,"sentTo"?:string,"time"?:"today|yesterday|this week|last week|this month|last month|this year","timeField"?:"received|sent","query"?:string,"folder"?:number,"subfolders"?:bool,"limit"?:number}"#,
             false,
             always,
             advanced_find,
         ),
         spec("search.close", "Close Search", "Search › Close", "", "", false, always, close),
         spec("search.focus", "Search", "Title bar search box", "F3 / Mod+E", "", false, always, focus),
+        spec(
+            "search.highlights",
+            "Search Highlights",
+            "Message list / Reading pane",
+            "",
+            r#"{"text"?:string,"id"?:number,"field"?:"subject|from|to|cc|body|attachments","query"?:string}"#,
+            false,
+            always,
+            highlights,
+        ),
         spec(
             "search.includeOlderResults",
             "Include Older Results",
@@ -63,7 +69,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Search",
             "Title bar search box",
             "",
-            r#"{"text":string}"#,
+            r#"{"text":string,"commit"?:bool}"#,
             false,
             always,
             query,
@@ -73,7 +79,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Recent Searches",
             "Search › Options",
             "",
-            r#"{"index"?:number}"#,
+            r#"{"index"?:number,"clear"?:bool}"#,
             false,
             always,
             recent,
@@ -83,10 +89,20 @@ pub fn specs() -> Vec<CommandSpec> {
             "More Filters",
             "Home › Find › Filter Email",
             "",
-            r#"{"kind"?:"from|to|cc|subject|body|hasAttachments|categorized|sentTo|unread|flagged|important|expiringSoon|received","value"?:string}"#,
+            r#"{"kind"?:"from|to|cc|subject|body|attachments|hasAttachments|categorized|sentTo|unread|read|flagged|important|importance|thisWeek|received|sent|size|folder|expiringSoon","value"?:string}"#,
             false,
             always,
             refine,
+        ),
+        spec(
+            "search.results",
+            "Search Results",
+            "Title bar search box",
+            "",
+            r#"{"limit"?:number,"query"?:string}"#,
+            false,
+            always,
+            results_cmd,
         ),
         spec(
             "search.scope",
@@ -112,7 +128,7 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Query terms
+// Query text helpers (shared with the View tab's filters and the Find dialog)
 
 /// `key:value`, quoting the value when it contains spaces or is empty.
 pub fn token(key: &str, value: &str) -> String {
@@ -123,7 +139,8 @@ pub fn token(key: &str, value: &str) -> String {
     }
 }
 
-/// Splits a query into terms, keeping double-quoted runs (with their quotes) inside one term.
+/// Splits a query into whitespace-separated terms, keeping double-quoted runs (with their quotes) inside one
+/// term.
 pub fn terms(query: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -159,186 +176,19 @@ pub fn toggle_token(query: &str, term: &str) -> (String, bool) {
     (list.join(" "), on)
 }
 
-/// One parsed term.
-struct Term {
-    negated: bool,
-    key: Option<String>,
-    value: String,
-}
-
-const KEYS: [&str; 14] = [
-    "from",
-    "to",
-    "cc",
-    "tocc",
-    "subject",
-    "body",
-    "category",
-    "hasattachments",
-    "isflagged",
-    "isread",
-    "importance",
-    "received",
-    "expires",
-    "attachments",
-];
-
-fn parse_term(raw: &str) -> Term {
-    let (negated, rest) = match raw.strip_prefix('-') {
-        Some(r) if !r.is_empty() => (true, r),
-        _ => (false, raw),
-    };
-    if let Some((k, v)) = rest.split_once(':') {
-        let k = k.to_ascii_lowercase();
-        if KEYS.contains(&k.as_str()) {
-            return Term { negated, key: Some(k), value: v.trim_matches('"').trim().to_lowercase() };
-        }
-    }
-    Term { negated, key: None, value: rest.trim_matches('"').trim().to_lowercase() }
-}
-
-fn yes(v: &str) -> Option<bool> {
-    match v {
-        "yes" | "true" | "1" => Some(true),
-        "no" | "false" | "0" => Some(false),
-        _ => None,
-    }
-}
-
-fn person_text(a: &mailcraft_model::Address) -> String {
-    match &a.name {
-        Some(n) => format!("{n} <{}>", a.addr).to_lowercase(),
-        None => a.addr.to_lowercase(),
-    }
-}
-
-fn people_match(s: &Session, list: &[&mailcraft_model::Address], value: &str) -> bool {
-    if value == "me" {
-        return list.iter().any(|a| s.me.iter().any(|m| m.trim().eq_ignore_ascii_case(a.addr.trim())));
-    }
-    list.iter().any(|a| person_text(a).contains(value))
-}
-
-fn received_match(s: &Session, m: &MailItem, value: &str) -> bool {
-    let tz = s.tz_offset_min;
-    let now = s.now();
-    let day = local_day(m.received, tz);
-    let today = local_day(now, tz);
-    let week_start = today.saturating_sub(i64::from(weekday_of_day(today).0));
-    let (ly, lm) = {
-        let l = LocalTime::of(m.received, tz);
-        (l.year, l.month)
-    };
-    let (ny, nm) = {
-        let l = LocalTime::of(now, tz);
-        (l.year, l.month)
-    };
-    let (py, pm) = if nm <= 1 { (ny.saturating_sub(1), 12) } else { (ny, nm.saturating_sub(1)) };
-    match value {
-        "today" => day == today,
-        "yesterday" => day == today.saturating_sub(1),
-        "this week" => day >= week_start && day <= today,
-        "last week" => day >= week_start.saturating_sub(7) && day < week_start,
-        "this month" => (ly, lm) == (ny, nm),
-        "last month" => (ly, lm) == (py, pm),
-        _ => false,
-    }
-}
-
-fn term_matches(s: &Session, m: &MailItem, t: &Term) -> bool {
-    let v = t.value.as_str();
-    let Some(key) = t.key.as_deref() else {
-        if v.is_empty() {
-            return true;
-        }
-        return m.subject.to_lowercase().contains(v)
-            || m.from.iter().chain(&m.to).chain(&m.cc).any(|a| person_text(a).contains(v))
-            || m.preview.to_lowercase().contains(v)
-            || m.body_text().to_lowercase().contains(v);
-    };
-    if v.is_empty() {
-        return true;
-    }
-    match key {
-        "from" => people_match(s, &m.from.iter().chain(m.sender.iter()).collect::<Vec<_>>(), v),
-        "to" => people_match(s, &m.to.iter().collect::<Vec<_>>(), v),
-        "cc" => people_match(s, &m.cc.iter().collect::<Vec<_>>(), v),
-        "tocc" => people_match(s, &m.to.iter().chain(&m.cc).collect::<Vec<_>>(), v),
-        "subject" => m.subject.to_lowercase().contains(v),
-        "body" => m.body_text().to_lowercase().contains(v),
-        "category" => match v {
-            "any" => !m.categories.is_empty(),
-            "none" => m.categories.is_empty(),
-            _ => m.categories.iter().any(|c| c.trim().to_lowercase() == v),
-        },
-        "hasattachments" | "attachments" => yes(v).is_some_and(|y| y == m.has_attachments()),
-        "isflagged" => yes(v).is_some_and(|y| y == m.is_flagged()),
-        "isread" => yes(v).is_some_and(|y| y == m.read),
-        "importance" => match v {
-            "high" => m.importance == Importance::High,
-            "normal" => m.importance == Importance::Normal,
-            "low" => m.importance == Importance::Low,
-            _ => false,
-        },
-        "received" => received_match(s, m, v),
-        _ => false,
-    }
-}
-
-/// True when `m` matches every term of `query` (an empty query matches everything).
+/// True when `m` matches `query` (an empty query matches everything).
 pub fn item_matches(s: &Session, m: &MailItem, query: &str) -> bool {
-    terms(query)
-        .iter()
-        .filter(|t| !matches!(t.as_str(), "AND" | "OR"))
-        .map(|t| parse_term(t))
-        .all(|t| term_matches(s, m, &t) != t.negated)
+    search_index::item_matches(s, m, query)
 }
 
-/// Folders the current scope searches. Mailbox-wide scopes leave out Deleted Items (and its subfolders)
-/// and non-mail folders, except All Outlook Items, which covers every folder.
+/// Folders the current scope searches (see [`search_index::scope_folders`]).
 pub fn scope_folders(s: &Session) -> Vec<FolderId> {
-    let sel = s.selection.folder;
-    if !s.mailbox.folders.contains_key(&sel) {
-        return Vec::new();
-    }
-    let deleted: BTreeSet<FolderId> = s
-        .mailbox
-        .accounts
-        .iter()
-        .filter_map(|a| s.mailbox.role_folder(a.id, FolderRole::DeletedItems))
-        .flat_map(|d| s.mailbox.subtree(d))
-        .collect();
-    let mail_like = |f: &mailcraft_model::Folder| f.kind == FolderKind::Mail && !deleted.contains(&f.id);
-    match s.view.search_scope {
-        SearchScope::CurrentFolder => vec![sel],
-        SearchScope::Subfolders => s.mailbox.subtree(sel),
-        SearchScope::CurrentMailbox => {
-            let account = s.mailbox.folder_account(sel);
-            s.mailbox
-                .folders
-                .values()
-                .filter(|f| Some(f.account) == account && mail_like(f))
-                .map(|f| f.id)
-                .collect()
-        }
-        SearchScope::AllMailboxes => {
-            s.mailbox.folders.values().filter(|f| mail_like(f)).map(|f| f.id).collect()
-        }
-        SearchScope::AllOutlookItems => s.mailbox.folders.keys().copied().collect(),
-    }
+    search_index::scope_folders(s)
 }
 
-/// Mail items matching the current query in the current scope (newest first).
+/// Items matching the current query in the current scope, best first (empty when no search is active).
 pub fn results(s: &Session) -> Vec<ItemId> {
-    let folders: BTreeSet<FolderId> = scope_folders(s).into_iter().collect();
-    let mut hits: Vec<&MailItem> = s
-        .mailbox
-        .mail
-        .values()
-        .filter(|m| folders.contains(&m.folder) && item_matches(s, m, &s.view.search))
-        .collect();
-    hits.sort_by_key(|m| std::cmp::Reverse((m.received.unix, m.id)));
-    hits.into_iter().map(|m| m.id).collect()
+    search_index::results(s)
 }
 
 fn scope_name(sc: SearchScope) -> &'static str {
@@ -351,11 +201,27 @@ fn scope_name(sc: SearchScope) -> &'static str {
     }
 }
 
+/// Hits shown in command results.
+const SUMMARY_HITS: usize = 50;
+
 fn summary(s: &Session) -> Value {
+    let hits = if s.view.search.trim().is_empty() {
+        Vec::new()
+    } else {
+        search_index::hits(s, &s.view.search, &search_index::scope_filter(s))
+    };
+    let top: Vec<Value> = hits
+        .iter()
+        .take(SUMMARY_HITS)
+        .map(|h| json!({"id": h.id, "score": (h.score * 100.0).round() / 100.0}))
+        .collect();
     json!({
         "query": s.view.search,
+        "parsed": mailcraft_search::parse(&s.view.search).to_string(),
         "scope": scope_name(s.view.search_scope),
-        "results": if s.view.search.trim().is_empty() { 0 } else { results(s).len() },
+        "includeDeleted": s.search.include_deleted,
+        "results": hits.len(),
+        "hits": top,
     })
 }
 
@@ -370,34 +236,49 @@ fn all_local(_s: &Session) -> Option<&'static str> {
 // ---------------------------------------------------------------------------------------------------------
 // Commands
 
+/// Longest query accepted from the search box (chars).
+const MAX_QUERY_CHARS: usize = 4_000;
+
 fn query(s: &mut Session, p: &Value) -> CmdResult {
     let text = opt_str(p, "text").ok_or_else(|| CmdError::Params("`text` (string) required".into()))?;
-    s.view.search = text.trim().to_owned();
+    s.view.search = text.trim().chars().take(MAX_QUERY_CHARS).collect();
+    if opt_bool(p, "commit").unwrap_or(false) {
+        let q = s.view.search.clone();
+        s.search.remember(&q);
+    }
     Ok(summary(s))
 }
 
 fn focus(s: &mut Session, _p: &Value) -> CmdResult {
-    let params = json!({ "query": s.view.search, "scope": scope_name(s.view.search_scope), "recent": [] });
+    let params = json!({ "query": s.view.search, "scope": scope_name(s.view.search_scope), "recent": s.search.recent });
     Ok(dialog(s, "searchBox", params))
 }
 
 fn close(s: &mut Session, _p: &Value) -> CmdResult {
-    s.view.search.clear();
+    let q = std::mem::take(&mut s.view.search);
+    s.search.remember(&q);
     Ok(json!({ "query": "" }))
 }
 
-fn advanced_find(s: &mut Session, _p: &Value) -> CmdResult {
-    let folder = s.selection.folder.0;
-    Ok(dialog(s, "advancedFind", json!({ "focus": "words", "folder": folder })))
-}
-
-/// Recent searches are not kept by the session yet, so the list is always the empty placeholder.
-fn recent(_s: &mut Session, p: &Value) -> CmdResult {
-    let items: Vec<String> = Vec::new();
-    if let Some(i) = p.get("index").filter(|v| !v.is_null()) {
-        return Err(CmdError::Params(format!("no recent search at index {i}")));
+fn recent(s: &mut Session, p: &Value) -> CmdResult {
+    if opt_bool(p, "clear") == Some(true) {
+        s.search.recent.clear();
+        return Ok(json!({ "items": [], "placeholder": "No Recent Searches" }));
     }
-    Ok(json!({ "items": items, "placeholder": "No Recent Searches" }))
+    if let Some(v) = p.get("index").filter(|v| !v.is_null()) {
+        let q = v
+            .as_u64()
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| s.search.recent.get(i))
+            .cloned()
+            .ok_or_else(|| CmdError::Params(format!("no recent search at index {v}")))?;
+        s.view.search = q.clone();
+        s.search.remember(&q);
+        return Ok(summary(s));
+    }
+    let items = &s.search.recent;
+    let placeholder = if items.is_empty() { "No Recent Searches" } else { "" };
+    Ok(json!({ "items": items, "placeholder": placeholder, "max": MAX_RECENT }))
 }
 
 fn include_older_results(_s: &mut Session, _p: &Value) -> CmdResult {
@@ -408,10 +289,16 @@ fn search_tools(s: &mut Session, p: &Value) -> CmdResult {
     match opt_str(p, "tool") {
         None => Ok(dialog(s, "searchTools", json!({}))),
         Some("indexingStatus") => {
-            // Search runs over the in-memory mailbox, so nothing is ever waiting to be indexed.
-            let mut v = dialog(s, "indexingStatus", json!({ "remaining": 0 }));
+            let remaining = s.search.pending(&s.mailbox);
+            let stats = s.search.stats(&s.mailbox);
+            let params =
+                json!({ "remaining": 0, "items": stats.items, "terms": stats.terms, "before": remaining });
+            let mut v = dialog(s, "indexingStatus", params);
             if let Some(o) = v.as_object_mut() {
+                // `stats` indexed everything that was waiting.
                 o.insert("remaining".into(), json!(0));
+                o.insert("items".into(), json!(stats.items));
+                o.insert("terms".into(), json!(stats.terms));
             }
             Ok(v)
         }
@@ -447,15 +334,15 @@ fn scope(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(sc) = sc {
         s.view.search_scope = sc;
     }
+    if let Some(d) = include_deleted {
+        s.search.include_deleted = d;
+    }
     let mut out = summary(s);
-    if let Some(o) = out.as_object_mut() {
-        if let Some(d) = include_deleted {
-            o.insert("includeDeleted".into(), json!(d));
-        }
-        if let Some(name) = store {
-            o.insert("store".into(), json!(name));
-            o.insert("on".into(), json!(opt_bool(p, "on").unwrap_or(true)));
-        }
+    if let Some(o) = out.as_object_mut()
+        && let Some(name) = store
+    {
+        o.insert("store".into(), json!(name));
+        o.insert("on".into(), json!(opt_bool(p, "on").unwrap_or(true)));
     }
     Ok(out)
 }
@@ -469,14 +356,21 @@ fn refine(s: &mut Session, p: &Value) -> CmdResult {
             "cc",
             "subject",
             "body",
+            "attachments",
             "hasAttachments",
             "categorized",
             "sentTo",
             "unread",
+            "read",
             "flagged",
             "important",
-            "expiringSoon",
+            "importance",
+            "thisWeek",
             "received",
+            "sent",
+            "size",
+            "folder",
+            "expiringSoon",
         ];
         return Ok(dialog(
             s,
@@ -485,12 +379,26 @@ fn refine(s: &mut Session, p: &Value) -> CmdResult {
         ));
     };
     let value = opt_str(p, "value").map(str::trim).unwrap_or_default();
+    let date = |key: &str, default: &str| -> Result<String, CmdError> {
+        let when = if value.is_empty() { default } else { value };
+        let parsed = mailcraft_search::parse(&token(key, when));
+        if matches!(parsed, mailcraft_search::Query::Term(mailcraft_search::Term::Invalid(..))) {
+            return Err(CmdError::Params(format!("unknown date or range `{when}`")));
+        }
+        Ok(token(key, when))
+    };
     let term = match kind {
-        "from" | "to" | "cc" | "subject" | "body" => token(kind, value),
+        "from" | "to" | "cc" | "subject" | "body" | "attachments" | "folder" => token(kind, value),
         "hasAttachments" => "hasattachments:yes".to_owned(),
         "unread" => "isread:no".to_owned(),
+        "read" => "isread:yes".to_owned(),
         "flagged" => "isflagged:yes".to_owned(),
         "important" => "importance:high".to_owned(),
+        "importance" => match value {
+            "" | "high" => "importance:high".to_owned(),
+            "normal" | "low" => format!("importance:{value}"),
+            other => return Err(CmdError::Params(format!("unknown importance `{other}`"))),
+        },
         "expiringSoon" => "expires:soon".to_owned(),
         "categorized" => match value {
             "" | "any" => "category:any".to_owned(),
@@ -503,12 +411,16 @@ fn refine(s: &mut Session, p: &Value) -> CmdResult {
             "other" => token("to", ""),
             addr => token("to", addr),
         },
-        "received" => {
-            let when = if value.is_empty() { "this week" } else { value };
-            if !["today", "yesterday", "this week", "last week", "this month", "last month"].contains(&when) {
-                return Err(CmdError::Params(format!("unknown received range `{when}`")));
+        "thisWeek" => token("received", "this week"),
+        "received" => date("received", "this week")?,
+        "sent" => date("sent", "this week")?,
+        "size" => {
+            let v = if value.is_empty() { "large" } else { value };
+            let parsed = mailcraft_search::parse(&token("size", v));
+            if !matches!(parsed, mailcraft_search::Query::Term(mailcraft_search::Term::Size(_))) {
+                return Err(CmdError::Params(format!("unknown size `{v}`")));
             }
-            token("received", when)
+            token("size", v)
         }
         other => return Err(CmdError::Params(format!("unknown refine kind `{other}`"))),
     };
@@ -521,13 +433,171 @@ fn refine(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
+/// Builds the query an Advanced Find form describes.
+pub fn advanced_query(p: &Value) -> Result<String, CmdError> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(q) = opt_str(p, "query").map(str::trim).filter(|q| !q.is_empty()) {
+        parts.push(format!("({q})"));
+    }
+    if let Some(words) = opt_str(p, "words").map(str::trim).filter(|w| !w.is_empty()) {
+        let quoted = format!("\"{}\"", words.replace('"', ""));
+        match opt_str(p, "in").unwrap_or("subjectBody") {
+            "subject" => parts.push(format!("subject:{quoted}")),
+            "subjectBody" => parts.push(format!("(subject:{quoted} OR body:{quoted})")),
+            "all" => parts.push(quoted),
+            other => return Err(CmdError::Params(format!("unknown `in` value `{other}`"))),
+        }
+    }
+    if let Some(from) = opt_str(p, "from").map(str::trim).filter(|v| !v.is_empty()) {
+        parts.push(token("from", from));
+    }
+    if let Some(to) = opt_str(p, "sentTo").map(str::trim).filter(|v| !v.is_empty()) {
+        parts.push(token("tocc", to));
+    }
+    if let Some(when) = opt_str(p, "time").map(str::trim).filter(|v| !v.is_empty() && *v != "anytime") {
+        let key = match opt_str(p, "timeField").unwrap_or("received") {
+            "received" => "received",
+            "sent" => "sent",
+            other => return Err(CmdError::Params(format!("unknown `timeField` `{other}`"))),
+        };
+        let t = token(key, when);
+        if matches!(
+            mailcraft_search::parse(&t),
+            mailcraft_search::Query::Term(mailcraft_search::Term::Invalid(..))
+        ) {
+            return Err(CmdError::Params(format!("unknown time `{when}`")));
+        }
+        parts.push(t);
+    }
+    Ok(parts.join(" "))
+}
+
+/// Advanced Find: without criteria opens the dialog; with criteria runs them over the folder (and its
+/// subfolders) with the same query engine as the search box, leaving the main search alone.
+fn advanced_find(s: &mut Session, p: &Value) -> CmdResult {
+    let q = advanced_query(p)?;
+    let folder = current_folder(s, p)?;
+    if q.is_empty() {
+        let params = json!({ "focus": "words", "folder": folder.0, "recent": s.search.recent });
+        return Ok(dialog(s, "advancedFind", params));
+    }
+    let folders: Vec<u64> = if opt_bool(p, "subfolders").unwrap_or(true) {
+        s.mailbox.subtree(folder).into_iter().map(|f| f.0).collect()
+    } else {
+        vec![folder.0]
+    };
+    let filter = mailcraft_search::Filter::mail_in(folders);
+    let hits = search_index::hits(s, &q, &filter);
+    let limit = opt_u64(p, "limit").and_then(|n| usize::try_from(n).ok()).unwrap_or(500).min(5_000);
+    let rows: Vec<Value> = hits.iter().take(limit).filter_map(|h| row(s, ItemId(h.id))).collect();
+    Ok(json!({ "query": q, "folder": folder.0, "results": hits.len(), "items": rows }))
+}
+
+/// One result row: id, subject, from, received, folder.
+fn row(s: &Session, id: ItemId) -> Option<Value> {
+    let mb = &s.mailbox;
+    if let Some(m) = mb.mail.get(&id) {
+        let from =
+            m.from.as_ref().map(|a| a.name.clone().unwrap_or_else(|| a.addr.clone())).unwrap_or_default();
+        return Some(json!({
+            "id": id.0,
+            "kind": "email",
+            "subject": m.subject,
+            "from": from,
+            "received": m.received.unix,
+            "folder": m.folder.0,
+            "read": m.read,
+        }));
+    }
+    let (kind, subject, folder) = if let Some(a) = mb.appointments.get(&id) {
+        ("meeting", a.subject.clone(), a.folder)
+    } else if let Some(c) = mb.contacts.get(&id) {
+        ("contact", format!("{} {}", c.first_name, c.last_name).trim().to_owned(), c.folder)
+    } else if let Some(t) = mb.tasks.get(&id) {
+        ("task", t.subject.clone(), t.folder)
+    } else {
+        let n = mb.notes.get(&id)?;
+        ("note", n.text.lines().next().unwrap_or_default().to_owned(), n.folder)
+    };
+    Some(json!({ "id": id.0, "kind": kind, "subject": subject, "folder": folder.0 }))
+}
+
+/// Ranked results of the active search (or `query`) with row details, for the CLI, MCP and control channel.
+fn results_cmd(s: &mut Session, p: &Value) -> CmdResult {
+    let q = opt_str(p, "query").map(str::to_owned).unwrap_or_else(|| s.view.search.clone());
+    let hits = if q.trim().is_empty() {
+        Vec::new()
+    } else {
+        search_index::hits(s, &q, &search_index::scope_filter(s))
+    };
+    let limit = opt_u64(p, "limit").and_then(|n| usize::try_from(n).ok()).unwrap_or(100).min(5_000);
+    let rows: Vec<Value> = hits.iter().take(limit).filter_map(|h| row(s, ItemId(h.id))).collect();
+    Ok(json!({ "query": q, "scope": scope_name(s.view.search_scope), "results": hits.len(), "items": rows }))
+}
+
+fn field_of(name: &str) -> Result<Field, CmdError> {
+    Ok(match name {
+        "subject" => Field::Subject,
+        "from" => Field::From,
+        "to" => Field::To,
+        "cc" => Field::Cc,
+        "body" => Field::Body,
+        "attachments" => Field::Attachments,
+        other => return Err(CmdError::Params(format!("unknown field `{other}`"))),
+    })
+}
+
+/// Match ranges of the active search (or `query`) in `text`, or in a field of message `id`. Ranges are
+/// byte offsets plus char offsets (for UIs that index by char).
+fn highlights(s: &mut Session, p: &Value) -> CmdResult {
+    let field = field_of(opt_str(p, "field").unwrap_or("subject"))?;
+    let text = match (opt_str(p, "text"), opt_u64(p, "id")) {
+        (Some(t), _) => t.to_owned(),
+        (None, Some(id)) => {
+            let m = s
+                .mailbox
+                .mail
+                .get(&ItemId(id))
+                .ok_or_else(|| CmdError::Params(format!("no message with id {id}")))?;
+            let people = |list: &[mailcraft_model::Address]| {
+                list.iter()
+                    .map(|a| match &a.name {
+                        Some(n) => format!("{n} <{}>", a.addr),
+                        None => a.addr.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            match field {
+                Field::Subject => m.subject.clone(),
+                Field::From => people(m.from.as_slice()),
+                Field::To => people(&m.to),
+                Field::Cc => people(&m.cc),
+                Field::Body => m.body_text(),
+                Field::Attachments => {
+                    m.attachments.iter().map(|a| a.filename.as_str()).collect::<Vec<_>>().join("; ")
+                }
+            }
+        }
+        (None, None) => return Err(CmdError::Params("`text` (string) or `id` (number) required".into())),
+    };
+    let q = opt_str(p, "query").map(str::to_owned).unwrap_or_else(|| s.view.search.clone());
+    let ranges = mailcraft_search::highlights(&mailcraft_search::parse(&q), field, &text);
+    let chars = |b: usize| text.get(..b).map_or(0, |t| t.chars().count());
+    let out: Vec<Value> = ranges
+        .iter()
+        .map(|(a, b)| json!({ "start": a, "end": b, "charStart": chars(*a), "charEnd": chars(*b) }))
+        .collect();
+    Ok(json!({ "ranges": out }))
+}
+
 // ---------------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Notice;
-    use mailcraft_model::{Address, AttachmentMeta, DateTime, FlagState, Mailbox};
+    use mailcraft_model::{Address, AttachmentMeta, DateTime, FlagState, FolderRole, Importance, Mailbox};
 
     const NOW: i64 = 1_791_000_000;
 
@@ -560,9 +630,11 @@ mod tests {
             "search.advancedFind",
             "search.close",
             "search.focus",
+            "search.highlights",
             "search.includeOlderResults",
             "search.recent",
             "search.refine",
+            "search.results",
             "search.scope",
             "search.searchTools",
             "search.query",
@@ -609,6 +681,7 @@ mod tests {
         for q in [
             "",
             "budget",
+            "BUDG",
             "from:ann",
             "from:\"Ann Boss\"",
             "to:me",
@@ -617,6 +690,7 @@ mod tests {
             "category:\"red category\"",
             "category:any",
             "hasattachments:yes",
+            "attachments:pdf",
             "isflagged:yes",
             "isread:no",
             "importance:high",
@@ -626,6 +700,8 @@ mod tests {
             "-cc:me",
             "from:\"\"",
             "budget AND from:ann",
+            "lunch OR budget",
+            "(lunch OR budget) NOT from:bob",
         ] {
             assert!(item_matches(&s, &m, q), "{q} should match");
         }
@@ -665,6 +741,7 @@ mod tests {
         assert_eq!(s.view.search_scope, SearchScope::AllMailboxes);
         let r = run(&mut s, "search.scope", json!({"includeDeleted": true}));
         assert_eq!(r["includeDeleted"], true);
+        assert!(s.search.include_deleted);
         assert_eq!(s.view.search_scope, SearchScope::AllMailboxes);
         run(&mut s, "search.scope", json!({"store": "Test", "on": false}));
         assert!(s.run("search.scope", &json!({"store": "Nobody"})).is_err());
@@ -672,6 +749,7 @@ mod tests {
         assert_eq!(results(&s).len(), 2);
         run(&mut s, "search.close", json!({}));
         assert!(s.view.search.is_empty());
+        assert_eq!(s.search.recent, ["budget"]);
         assert!(s.run("search.query", &json!({})).is_err());
     }
 
@@ -695,6 +773,9 @@ mod tests {
         assert!(results(&s).is_empty());
         s.view.search_scope = SearchScope::AllOutlookItems;
         assert_eq!(results(&s).len(), 1);
+        s.view.search_scope = SearchScope::CurrentMailbox;
+        run(&mut s, "search.scope", json!({"includeDeleted": true, "scope": "currentMailbox"}));
+        assert_eq!(results(&s).len(), 1);
     }
 
     #[test]
@@ -714,24 +795,96 @@ mod tests {
         );
         let r = run(&mut s, "search.refine", json!({"kind": "unread"}));
         assert_eq!(r["on"], false);
+        run(&mut s, "search.refine", json!({"kind": "thisWeek"}));
+        assert!(s.view.search.ends_with("from:\"\""));
+        run(&mut s, "search.refine", json!({"kind": "size", "value": "huge"}));
+        assert!(s.view.search.ends_with("size:huge"));
+        run(&mut s, "search.refine", json!({"kind": "received", "value": ">=2026-01-01"}));
         assert!(s.run("search.refine", &json!({"kind": "received", "value": "someday"})).is_err());
+        assert!(s.run("search.refine", &json!({"kind": "size", "value": "enormous"})).is_err());
+        assert!(s.run("search.refine", &json!({"kind": "importance", "value": "urgent"})).is_err());
         assert!(s.run("search.refine", &json!({"kind": "zzz"})).is_err());
         assert_eq!(run(&mut s, "search.refine", json!({}))["dialog"], "searchRefine");
     }
 
     #[test]
-    fn tools_recent_and_dialogs() {
+    fn recent_searches() {
         let mut s = session();
-        assert_eq!(run(&mut s, "search.focus", json!({}))["dialog"], "searchBox");
-        assert_eq!(run(&mut s, "search.advancedFind", json!({}))["dialog"], "advancedFind");
-        assert_eq!(run(&mut s, "search.searchTools", json!({}))["dialog"], "searchTools");
-        let r = run(&mut s, "search.searchTools", json!({"tool": "indexingStatus"}));
-        assert_eq!(r["remaining"], 0);
-        assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(n, _)) if n == "indexingStatus"));
-        assert!(s.run("search.searchTools", &json!({"tool": "x"})).is_err());
+        add(&mut s, MailItem { subject: "Budget".into(), ..Default::default() });
         let r = run(&mut s, "search.recent", json!({}));
         assert_eq!(r["placeholder"], "No Recent Searches");
         assert!(s.run("search.recent", &json!({"index": 0})).is_err());
+        run(&mut s, "search.query", json!({"text": "bud"}));
+        run(&mut s, "search.query", json!({"text": "budget", "commit": true}));
+        run(&mut s, "search.query", json!({"text": "lunch", "commit": true}));
+        assert_eq!(s.search.recent, ["lunch", "budget"]);
+        let r = run(&mut s, "search.recent", json!({"index": 1}));
+        assert_eq!(r["query"], "budget");
+        assert_eq!(r["results"], 1);
+        assert_eq!(s.search.recent, ["budget", "lunch"]);
+        assert_eq!(run(&mut s, "search.recent", json!({}))["items"][0], "budget");
+        run(&mut s, "search.recent", json!({"clear": true}));
+        assert!(s.search.recent.is_empty());
+        assert!(s.run("search.recent", &json!({"index": "x"})).is_err());
+    }
+
+    #[test]
+    fn advanced_find_uses_the_query_engine() {
+        let mut s = session();
+        let a = add(
+            &mut s,
+            MailItem {
+                subject: "Budget plan".into(),
+                from: Some(addr("ann@example.com")),
+                to: vec![addr("bob@example.org")],
+                ..Default::default()
+            },
+        );
+        add(&mut s, MailItem { subject: "Lunch".into(), body: Default::default(), ..Default::default() });
+        assert_eq!(run(&mut s, "search.advancedFind", json!({}))["dialog"], "advancedFind");
+        let r =
+            run(&mut s, "search.advancedFind", json!({"words": "budget", "in": "subject", "from": "ann"}));
+        assert_eq!(r["results"], 1);
+        assert_eq!(r["items"][0]["id"], a.0);
+        let r = run(&mut s, "search.advancedFind", json!({"sentTo": "bob", "time": "today"}));
+        assert_eq!(r["results"], 1);
+        let r = run(&mut s, "search.advancedFind", json!({"words": "budget", "time": "yesterday"}));
+        assert_eq!(r["results"], 0);
+        assert!(s.view.search.is_empty());
+        assert!(s.run("search.advancedFind", &json!({"words": "x", "in": "nowhere"})).is_err());
+        assert!(s.run("search.advancedFind", &json!({"time": "someday"})).is_err());
+    }
+
+    #[test]
+    fn results_and_highlights() {
+        let mut s = session();
+        let a = add(&mut s, MailItem { subject: "Budget review".into(), ..Default::default() });
+        run(&mut s, "search.query", json!({"text": "bud"}));
+        let r = run(&mut s, "search.results", json!({}));
+        assert_eq!(r["items"][0]["id"], a.0);
+        assert_eq!(r["items"][0]["subject"], "Budget review");
+        let r = run(&mut s, "search.highlights", json!({"id": a.0, "field": "subject"}));
+        assert_eq!(r["ranges"][0]["start"], 0);
+        assert_eq!(r["ranges"][0]["end"], 6);
+        let r = run(&mut s, "search.highlights", json!({"text": "Café budget", "query": "budget"}));
+        assert_eq!(r["ranges"][0]["start"], 6);
+        assert_eq!(r["ranges"][0]["charStart"], 5);
+        assert!(s.run("search.highlights", &json!({})).is_err());
+        assert!(s.run("search.highlights", &json!({"text": "x", "field": "nope"})).is_err());
+        assert!(s.run("search.highlights", &json!({"id": 999_999})).is_err());
+    }
+
+    #[test]
+    fn tools_and_dialogs() {
+        let mut s = session();
+        add(&mut s, MailItem { subject: "x".into(), ..Default::default() });
+        assert_eq!(run(&mut s, "search.focus", json!({}))["dialog"], "searchBox");
+        assert_eq!(run(&mut s, "search.searchTools", json!({}))["dialog"], "searchTools");
+        let r = run(&mut s, "search.searchTools", json!({"tool": "indexingStatus"}));
+        assert_eq!(r["remaining"], 0);
+        assert_eq!(r["items"], 1);
+        assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(n, _)) if n == "indexingStatus"));
+        assert!(s.run("search.searchTools", &json!({"tool": "x"})).is_err());
         assert!(matches!(s.run("search.includeOlderResults", &json!({})), Err(CmdError::Disabled(_))));
         assert_eq!(s.registry.by_shortcut("Mod+E").map(|c| c.id), Some("search.focus"));
     }

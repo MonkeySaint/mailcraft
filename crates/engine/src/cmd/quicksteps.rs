@@ -1,5 +1,10 @@
 //! `quicksteps.*`: run a Quick Step's action list over the selection, and manage the steps (new, edit, delete,
 //! duplicate, reorder, reset to defaults).
+//!
+//! A step whose folder or recipients are not chosen yet ("Move to: ?", "To Manager") asks for them on first use
+//! (`quickStepFirstUse`); running it again with `folder` / `to` (and optionally a new `name`) completes the
+//! setup. `Flag` actions take the Follow Up menu's keys ("today", "tomorrow", "thisWeek", "nextWeek",
+//! "noDate"), which set the flag's dates; any other text is the flag's label.
 
 use serde_json::{Value, json};
 
@@ -35,7 +40,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "quicksteps.run",
             "Run Quick Step",
             Q,
-            r#"{"id": number|string, "folder"?: number, "to"?: [string]} (folder/to complete a first-use setup)"#,
+            r#"{"id": number|string, "folder"?: number, "to"?: [string], "name"?: string} (folder/to/name complete a first-use setup)"#,
             true,
             has_steps,
             run,
@@ -50,6 +55,7 @@ pub fn specs() -> Vec<CommandSpec> {
             new_step,
         ),
         spec("quicksteps.manage", "Manage Quick Steps", Q, "", false, always, manage),
+        spec("quicksteps.list", "List Quick Steps", M, "", false, always, list),
         spec(
             "quicksteps.edit",
             "Edit",
@@ -263,6 +269,9 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
     }
     if step.needs_setup() && complete_setup(&mut step, p) {
         check_actions(s, &step.actions)?;
+        if let Some(n) = opt_str(p, "name") {
+            step.name = clean_name(n)?;
+        }
         if !step.needs_setup()
             && let Some(q) = s.mailbox.quick_steps.get_mut(idx)
         {
@@ -345,16 +354,10 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
             QuickStepAction::Flag(label) => {
-                let label =
-                    if label.trim().is_empty() { "Follow up".to_owned() } else { label.trim().to_owned() };
+                let (label, start, due) = flag_of(s, label);
                 for id in &live {
                     if let Some(m) = s.mailbox.mail.get_mut(id) {
-                        m.flag = FlagState::Flagged {
-                            label: label.clone(),
-                            start: None,
-                            due: None,
-                            reminder: None,
-                        };
+                        m.flag = FlagState::Flagged { label: label.clone(), start, due, reminder: None };
                         touched.push(*id);
                     }
                 }
@@ -409,6 +412,42 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"step": step.id, "items": touched.len(), "composes": composes, "errors": errors}))
 }
 
+/// Follow Up keys a `Flag` action may hold, with their menu labels.
+pub const FLAG_KEYS: [(&str, &str); 5] = [
+    ("today", "Today"),
+    ("tomorrow", "Tomorrow"),
+    ("thisWeek", "This Week"),
+    ("nextWeek", "Next Week"),
+    ("noDate", "No Date"),
+];
+
+/// Label and dates for a `Flag` action: a Follow Up key sets the dates (label "Follow up"), other text is
+/// the label of a flag without dates.
+fn flag_of(
+    s: &Session,
+    key: &str,
+) -> (String, Option<mailcraft_model::DateTime>, Option<mailcraft_model::DateTime>) {
+    use crate::cmd::mail::{FlagKind, flag_dates};
+    let kind = match key.trim() {
+        "today" => Some(FlagKind::Today),
+        "tomorrow" => Some(FlagKind::Tomorrow),
+        "thisWeek" => Some(FlagKind::ThisWeek),
+        "nextWeek" => Some(FlagKind::NextWeek),
+        "noDate" => Some(FlagKind::NoDate),
+        _ => None,
+    };
+    match kind {
+        Some(k) => {
+            let (start, due) = flag_dates(s, k);
+            ("Follow up".to_owned(), start, due)
+        }
+        None => {
+            let label = if key.trim().is_empty() { "Follow up".to_owned() } else { key.trim().to_owned() };
+            (label, None, None)
+        }
+    }
+}
+
 /// Action list and name for a New Quick Step template.
 fn template(s: &Session, name: &str) -> Result<(&'static str, Vec<QuickStepAction>), CmdError> {
     let first_category = s.mailbox.categories.first().map(|c| c.name.clone()).unwrap_or_default();
@@ -419,7 +458,7 @@ fn template(s: &Session, name: &str) -> Result<(&'static str, Vec<QuickStepActio
             vec![QuickStepAction::Categorize(first_category), QuickStepAction::MoveTo(None)],
         ),
         "flagMove" => {
-            ("Flag & Move", vec![QuickStepAction::Flag("Follow up".into()), QuickStepAction::MoveTo(None)])
+            ("Flag & Move", vec![QuickStepAction::Flag("today".into()), QuickStepAction::MoveTo(None)])
         }
         "newEmailTo" => ("New email to", vec![QuickStepAction::NewMessageTo(Vec::new())]),
         "forwardTo" => ("Forward to", vec![QuickStepAction::Forward(Vec::new())]),
@@ -452,6 +491,11 @@ fn new_step(s: &mut Session, p: &Value) -> CmdResult {
     let idx = s.mailbox.quick_steps.len().saturating_sub(1);
     set_shortcut(s, idx, shortcut);
     Ok(json!({"id": id}))
+}
+
+fn list(s: &mut Session, _: &Value) -> CmdResult {
+    let steps: Vec<Value> = s.mailbox.quick_steps.iter().map(step_json).collect();
+    Ok(json!({"steps": steps}))
 }
 
 fn manage(s: &mut Session, _: &Value) -> CmdResult {
@@ -706,5 +750,38 @@ mod tests {
         let (mut s, _, _) = session();
         let r = s.run("quicksteps.run", &json!({"id": "Create New"})).unwrap();
         assert_eq!(r["dialog"], "editQuickStep");
+    }
+
+    #[test]
+    fn first_use_setup_can_rename_the_step() {
+        let (mut s, _, proj) = session();
+        s.run("quicksteps.run", &json!({"id": 1, "folder": proj.0, "name": "Projects"})).unwrap();
+        assert_eq!(s.mailbox.quick_steps[0].name, "Projects");
+        assert_eq!(s.mailbox.quick_steps[0].actions[0], QuickStepAction::MoveTo(Some(proj)));
+        // A bad name leaves the step as it was.
+        s.run("quicksteps.reset", &json!({})).unwrap();
+        assert!(s.run("quicksteps.run", &json!({"id": 1, "folder": proj.0, "name": "  "})).is_err());
+        assert!(s.mailbox.quick_steps[0].needs_setup());
+    }
+
+    #[test]
+    fn flag_keys_set_follow_up_dates() {
+        let (mut s, inbox, _) = session();
+        s.fixed_now = mailcraft_model::DateTime::from_civil(2026, 10, 7, 9, 0, 0, 0); // a Wednesday
+        s.run("quicksteps.new", &json!({"name": "Tomorrow", "actions": [{"Flag": "tomorrow"}]})).unwrap();
+        s.run("quicksteps.new", &json!({"name": "Undated", "actions": [{"Flag": "noDate"}]})).unwrap();
+        s.selection.items = s.mailbox.items_in(inbox).iter().map(|m| m.id).take(1).collect();
+        let id = s.selection.items[0];
+        s.run("quicksteps.run", &json!({"id": "Tomorrow"})).unwrap();
+        match &s.mailbox.mail[&id].flag {
+            FlagState::Flagged { label, due: Some(due), .. } => {
+                assert_eq!(label, "Follow up");
+                assert_eq!(mailcraft_model::ListTime::date(*due, 0), "10/8/2026");
+            }
+            other => panic!("{other:?}"),
+        }
+        s.run("quicksteps.run", &json!({"id": "Undated"})).unwrap();
+        assert!(matches!(&s.mailbox.mail[&id].flag, FlagState::Flagged { due: None, start: None, .. }));
+        assert_eq!(s.run("quicksteps.list", &json!({})).unwrap()["steps"].as_array().unwrap().len(), 8);
     }
 }

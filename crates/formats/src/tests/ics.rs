@@ -138,6 +138,28 @@ fn dates(rule: &str, start: &str) -> Vec<String> {
 }
 
 #[test]
+fn first_day_from_finds_where_the_series_starts() {
+    let first = |rule: &str, start: &str| {
+        let (s, _) = value::parse_date_time(start).unwrap();
+        Rrule::parse(rule)
+            .unwrap()
+            .first_day_from(s.div_euclid(value::DAY))
+            .map(|d| value::format_date(d * value::DAY))
+    };
+    // 2026-10-14 is a Wednesday.
+    assert_eq!(first("FREQ=WEEKLY;BYDAY=MO", "20261014T090000").as_deref(), Some("20261019"));
+    assert_eq!(first("FREQ=WEEKLY;BYDAY=WE,FR", "20261014T090000").as_deref(), Some("20261014"));
+    assert_eq!(first("FREQ=WEEKLY", "20261014T090000").as_deref(), Some("20261014"));
+    assert_eq!(first("FREQ=MONTHLY;BYMONTHDAY=31", "20261012T090000").as_deref(), Some("20261031"));
+    assert_eq!(first("FREQ=MONTHLY;BYMONTHDAY=31", "20261101T090000").as_deref(), Some("20261231"));
+    assert_eq!(first("FREQ=MONTHLY;BYDAY=-1FR", "20261031T090000").as_deref(), Some("20261127"));
+    assert_eq!(first("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29", "20260301T090000").as_deref(), Some("20280229"));
+    assert_eq!(first("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", "20261010T090000").as_deref(), Some("20261012"));
+    // Impossible rules give up instead of looping.
+    assert_eq!(first("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30", "20260101T090000"), None);
+}
+
+#[test]
 fn rrule_expansion() {
     assert_eq!(dates("FREQ=DAILY;COUNT=3", "20261030T090000"), ["20261030", "20261031", "20261101"]);
     assert_eq!(
@@ -333,6 +355,47 @@ SUMMARY:moved\nEND:VEVENT\nEND:VCALENDAR\n";
     let occ = ics::expand_appointment(master, utc(2026, 10, 1, 0, 0), utc(2026, 11, 1, 0, 0), 10);
     assert_eq!(occ.len(), 4);
     assert_eq!(cal.events[1].recurrence_id, Some(utc(2026, 10, 7, 15, 0)));
+}
+
+#[test]
+fn overrides_keep_their_recurrence_id_and_round_trip() {
+    let text = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:s\nDTSTART:20261005T150000Z\nDTEND:20261005T160000Z\nRRULE:FREQ=DAILY;COUNT=5\n\
+END:VEVENT\nBEGIN:VEVENT\nUID:s\nRECURRENCE-ID:20261007T150000Z\nDTSTART:20261007T170000Z\nDTEND:20261007T180000Z\n\
+SUMMARY:moved\nEND:VEVENT\nEND:VCALENDAR\n";
+    let cal = ics::read_str(text, ImportOptions::default()).unwrap();
+    let moved = &cal.events[1].appointment;
+    assert_eq!(moved.recurrence_id, Some(utc(2026, 10, 7, 15, 0)));
+    assert!(moved.recurrence.is_none());
+    assert_eq!(cal.events[0].appointment.recurrence_id, None);
+    // Written back, the override still names the instance it replaces.
+    let master = &cal.events[0].appointment;
+    let out = ics::write(&[master, moved], &[], None, utc(2026, 10, 1, 0, 0));
+    assert!(out.contains("RECURRENCE-ID:20261007T150000Z"), "{out}");
+    let again = ics::read_str(&out, ImportOptions::default()).unwrap();
+    assert_eq!(again.events[1].appointment.recurrence_id, Some(utc(2026, 10, 7, 15, 0)));
+    assert_eq!(
+        again.events[0].appointment.recurrence.as_ref().unwrap().exdates,
+        vec![utc(2026, 10, 7, 15, 0)]
+    );
+}
+
+#[test]
+fn itip_message_prefers_the_series_over_an_override_listed_first() {
+    let text = "BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\nUID:s\nRECURRENCE-ID:20261007T150000Z\n\
+DTSTART:20261007T170000Z\nDTEND:20261007T180000Z\nSUMMARY:moved\nEND:VEVENT\nBEGIN:VEVENT\nUID:s\n\
+DTSTART:20261005T150000Z\nDTEND:20261005T160000Z\nRRULE:FREQ=DAILY;COUNT=5\nSUMMARY:series\nEND:VEVENT\n\
+END:VCALENDAR\n";
+    let msg = itip::read(text.as_bytes(), ImportOptions::default()).unwrap();
+    assert_eq!(msg.event.appointment.subject, "series");
+    assert!(msg.event.recurrence_id.is_none());
+    assert_eq!(msg.overrides.len(), 1);
+    assert_eq!(msg.overrides[0].appointment.subject, "moved");
+    // A message about one instance only: that instance is the event.
+    let one = "BEGIN:VCALENDAR\nMETHOD:CANCEL\nBEGIN:VEVENT\nUID:s\nRECURRENCE-ID:20261007T150000Z\n\
+DTSTART:20261007T150000Z\nDTEND:20261007T160000Z\nEND:VEVENT\nEND:VCALENDAR\n";
+    let msg = itip::read(one.as_bytes(), ImportOptions::default()).unwrap();
+    assert_eq!(msg.event.recurrence_id, Some(utc(2026, 10, 7, 15, 0)));
+    assert!(msg.overrides.is_empty());
 }
 
 #[test]

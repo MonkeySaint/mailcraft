@@ -75,6 +75,10 @@ pub struct UiState {
     /// Local control-channel port requested on the command line (`--control-port N`) or through
     /// `MAILCRAFT_CONTROL_PORT`; `None` = control channel off. Read by `control` (native builds only).
     pub control_port: Option<u16>,
+    /// A `view.todoBar` part waiting to be applied to the To-Do Bar (egui memory) at the next frame boundary.
+    pub todo_bar_request: Option<String>,
+    /// To-Do Bar parts shown (calendar, people, tasks), mirrored each frame for the ribbon's check marks.
+    pub todo_bar_parts: (bool, bool, bool),
 }
 
 impl Surface {
@@ -186,7 +190,7 @@ pub(crate) struct ShellState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ShellLayout {
     /// Panes drawn in the content area, left to right / top to bottom: "folders", "list", "reading",
-    /// "calendar", "people", "tasks", "notes".
+    /// "todoBar", "calendar", "people", "tasks", "notes".
     pub panes: Vec<&'static str>,
     /// Pane rectangles in the same order.
     pub rects: Vec<egui::Rect>,
@@ -298,7 +302,15 @@ impl App {
     /// Runs a command; errors become a toast (never panics).
     pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
         match self.s.run(id, &params) {
-            Ok(v) => Some(v),
+            Ok(v) => {
+                // The session keeps no To-Do Bar state: the UI applies the part (see `apply_todo_bar`).
+                if id == "view.todoBar"
+                    && let Some(part) = v.get("todoBar").and_then(Value::as_str)
+                {
+                    self.ui.todo_bar_request = Some(part.to_owned());
+                }
+                Some(v)
+            }
             Err(e) => {
                 self.ui.toast = Some((e.to_string(), 0.0));
                 None
@@ -349,6 +361,7 @@ impl App {
         keys::handle(&ctx, self, Surface::Main);
         self.drain_notices(&ctx);
         self.sync_window(&ctx);
+        self.apply_todo_bar(&ctx);
 
         // The whole viewport, whatever margins the host ui carries (test harnesses wrap it in a panel frame).
         let rect = ctx.content_rect();
@@ -367,7 +380,18 @@ impl App {
         dialogs::dialogs(&ctx, self);
 
         self.drain_notices(&ctx);
+        if self.ui.todo_bar_request.is_some() {
+            ctx.request_repaint();
+        }
         self.draw_toasts(&ctx);
+    }
+
+    /// Applies a pending `view.todoBar` part and mirrors the parts shown into [`UiState::todo_bar_parts`].
+    fn apply_todo_bar(&mut self, ctx: &egui::Context) {
+        if let Some(part) = self.ui.todo_bar_request.take() {
+            modules::set_todo_bar(ctx, &part);
+        }
+        self.ui.todo_bar_parts = modules::todo_bar_parts(ctx);
     }
 
     /// Installs bundled fonts into egui (Inter for UI; all bundled faces as named families for message bodies).
@@ -456,7 +480,10 @@ impl App {
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context, id: String, params: Value) {
-        if id == "searchBox" {
+        if id == "reminders" {
+            // View › Reminders Window: the modules area's Reminders window (it scans for due reminders itself).
+            modules::open_reminders(ctx, self);
+        } else if id == "searchBox" {
             // `search.focus` (Ctrl+E / F3): focus the title-bar search box and bring up the Search tab.
             self.ui.search_active = true;
             self.ui.set_tab(Surface::Main, "Search");

@@ -1,0 +1,16 @@
+[package]
+name = "mailcraft-search"
+description = "MailCraft instant search: query language, Unicode folding, inverted index, ranking and highlights"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-model.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

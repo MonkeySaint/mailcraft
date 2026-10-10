@@ -166,7 +166,9 @@ fn notices_become_dialogs_and_toasts() {
     h.run_steps(2);
     let app = h.state();
     assert!(app.s.notices.is_empty());
-    assert!(app.ui.dialogs.iter().any(|(id, _)| id == "reminders"), "{:?}", app.ui.dialogs);
+    // The Reminders window is the modules area's own window, not a queued dialog.
+    assert!(!app.ui.dialogs.iter().any(|(id, _)| id == "reminders"), "{:?}", app.ui.dialogs);
+    assert!(has_label(&h, "Dismiss All"));
     assert!(has_label(&h, "Hello from a test"));
 
     // Search focus opens the Search tab instead of a dialog (with no dialog holding the keyboard focus).
@@ -190,4 +192,20 @@ fn tiny_window_does_not_panic() {
     h.run_steps(2);
     h.set_size(egui::vec2(1.0, 1.0));
     h.run_steps(2);
+}
+
+#[test]
+fn todo_bar_follows_the_view_command() {
+    let mut h = harness(1600.0, 900.0);
+    assert!(!App::shell_layout(&h.ctx).panes.contains(&"todoBar"));
+    h.state_mut().run("view.todoBar", json!({"part": "calendar"})).unwrap();
+    h.run_steps(3);
+    let l = App::shell_layout(&h.ctx);
+    assert!(l.panes.contains(&"todoBar"), "{:?}", l.panes);
+    assert!(l.panes.contains(&"list"), "the mail panes stay beside the bar");
+    assert_eq!(h.state().ui.todo_bar_parts, (true, false, false));
+    h.state_mut().run("view.todoBar", json!({"part": "off"})).unwrap();
+    h.run_steps(3);
+    assert!(!App::shell_layout(&h.ctx).panes.contains(&"todoBar"));
+    assert_eq!(h.state().ui.todo_bar_parts, (false, false, false));
 }

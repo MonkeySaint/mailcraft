@@ -10,6 +10,7 @@ use super::common::{
     send_reply, take_replies, window, with_state,
 };
 use crate::App;
+use mailcraft_engine::search_index::SEARCH_FOLDER_TEMPLATES;
 use mailcraft_model::FolderId;
 
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
@@ -409,24 +410,6 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 
 // ---------------------------------------------------------------------------------------------------------
 
-/// New Search Folder templates: (group, label, query prefix, needs text, supported).
-const SEARCH_TEMPLATES: &[(&str, &str, &str, bool, bool)] = &[
-    ("Reading Mail", "Unread mail", "isread:no", false, true),
-    ("Reading Mail", "Mail flagged for follow up", "isflagged:yes", false, true),
-    ("Reading Mail", "Mail either unread or flagged for follow up", "", false, false),
-    ("Reading Mail", "Important mail", "importance:high", false, true),
-    ("Mail from People and Lists", "Mail from and to specific people", "tocc:", true, true),
-    ("Mail from People and Lists", "Mail from specific people", "from:", true, true),
-    ("Mail from People and Lists", "Mail sent directly to me", "to:me", false, true),
-    ("Mail from People and Lists", "Mail sent to public groups", "", false, false),
-    ("Organizing Mail", "Categorized mail", "category:any", false, true),
-    ("Organizing Mail", "Large mail", "", false, false),
-    ("Organizing Mail", "Old mail", "", false, false),
-    ("Organizing Mail", "Mail with attachments", "hasattachments:yes", false, true),
-    ("Organizing Mail", "Mail with specific words", "", true, true),
-    ("Custom", "Create a custom Search Folder", "", true, true),
-];
-
 #[derive(Clone, Default)]
 struct SearchFolderState {
     pick: usize,
@@ -454,35 +437,46 @@ fn new_search_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             let mut group = "";
-                            for (i, (g, label, _, _, ok)) in SEARCH_TEMPLATES.iter().enumerate() {
+                            for (i, (_, g, label, _)) in SEARCH_FOLDER_TEMPLATES.iter().enumerate() {
                                 if *g != group {
                                     group = g;
                                     ui.label(RichText::new(*g).strong());
                                 }
-                                let r = ui.add_enabled(
-                                    *ok,
+                                let r = ui.add(
                                     egui::Button::selectable(st.pick == i, format!("    {label}"))
                                         .frame_when_inactive(false),
                                 );
-                                if r.clicked() {
+                                if r.clicked() && st.pick != i {
                                     st.pick = i;
+                                    st.text.clear();
+                                    st.error.clear();
                                 }
-                                r.on_disabled_hover_text("Not supported yet");
                             }
                         });
                 });
-                let Some((_, label, prefix, needs_text, _)) = SEARCH_TEMPLATES.get(st.pick).copied() else {
+                let Some((template, _, _, needs)) = SEARCH_FOLDER_TEMPLATES.get(st.pick).copied() else {
                     return Out::Close;
                 };
                 ui.label("Customize Search Folder:");
-                let custom = label.starts_with("Create");
+                let custom = template == "custom";
+                // The template's option: (label, hint); `?` marks an optional one.
+                let optional = needs.ends_with('?');
+                let option = match needs.trim_end_matches('?') {
+                    "people" => Some(("People:", "Names or addresses, separated by ;")),
+                    "group" => Some(("Group:", "Group addresses, separated by ;")),
+                    "category" => Some(("Category:", "Leave empty for any category")),
+                    "kb" => Some(("Larger than (KB):", "Default 100 KB")),
+                    "days" => Some(("Older than (days):", "Default 7 days")),
+                    "words" => Some(("Words:", "Words in the subject or body, separated by ;")),
+                    _ => None,
+                };
                 if custom {
                     common::field(ui, "Name:", &mut st.name, 260.0);
                     common::field(ui, "Criteria:", &mut st.text, 260.0);
                     muted(ui, app, "Criteria use the search box syntax, e.g. from:ann hasattachments:yes");
-                } else if needs_text {
-                    let what = if label.contains("words") { "Words:" } else { "People:" };
-                    common::field(ui, what, &mut st.text, 260.0);
+                } else if let Some((label, hint)) = option {
+                    common::field(ui, label, &mut st.text, 260.0);
+                    muted(ui, app, hint);
                 } else {
                     muted(ui, app, "No options to set.");
                 }
@@ -500,28 +494,16 @@ fn new_search_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 let ready = if custom {
                     !st.name.trim().is_empty() && !text.is_empty()
                 } else {
-                    !needs_text || !text.is_empty()
+                    option.is_none() || optional || !text.is_empty()
                 };
                 match ok_cancel(ui, app, ready) {
                     Some(true) => {
-                        let query = if custom || prefix.is_empty() {
-                            text.clone()
-                        } else if needs_text {
-                            let quoted =
-                                if text.contains(' ') { format!("\"{text}\"") } else { text.clone() };
-                            format!("{prefix}{quoted}")
+                        let params = if custom {
+                            json!({"template": template, "value": text, "name": st.name.trim()})
                         } else {
-                            prefix.to_owned()
+                            json!({"template": template, "value": text})
                         };
-                        let name = if custom {
-                            st.name.trim().to_owned()
-                        } else if needs_text {
-                            format!("{label} ({text})")
-                        } else {
-                            label.to_owned()
-                        };
-                        if app.run("folder.newSearchFolder", json!({"name": name, "query": query})).is_some()
-                        {
+                        if app.run("folder.newSearchFolder", params).is_some() {
                             Out::Close
                         } else {
                             st.error = last_error(app);

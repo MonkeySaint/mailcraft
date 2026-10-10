@@ -14,8 +14,8 @@ use egui::{
 use serde_json::{Value, json};
 
 use mailcraft_engine::cmd::calendar::pim::Kind;
-use mailcraft_engine::cmd::calendar::{CalendarMode, CalendarViewState};
-use mailcraft_model::{Appointment, BusyStatus, FolderId, FolderKind, ItemId, dates};
+use mailcraft_engine::cmd::calendar::{CalendarMode, CalendarViewState, occurrences};
+use mailcraft_model::{Appointment, BusyStatus, DateTime, FolderId, FolderKind, ItemId, dates};
 
 use super::common::{
     DAY, ModState, a11y, add_months, blend, category_color, child, clock, current_folder, day_of, day_string,
@@ -218,203 +218,21 @@ impl Occ {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Freq {
-    Daily,
-    Weekly,
-    Monthly,
-    Yearly,
-}
-
-#[derive(Clone, Debug)]
-struct Rule {
-    freq: Freq,
-    interval: i64,
-    count: Option<u32>,
-    until: Option<i64>,
-    /// (ordinal, weekday Sunday = 0).
-    byday: Vec<(Option<i64>, u8)>,
-    bymonthday: Vec<i64>,
-    bymonth: Vec<u8>,
-}
-
-fn weekday_code(s: &str) -> Option<u8> {
-    match s {
-        "SU" => Some(0),
-        "MO" => Some(1),
-        "TU" => Some(2),
-        "WE" => Some(3),
-        "TH" => Some(4),
-        "FR" => Some(5),
-        "SA" => Some(6),
-        _ => None,
-    }
-}
-
-/// Parses the RRULE subset the views expand (FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH).
-fn parse_rule(text: &str) -> Option<Rule> {
-    let mut r = Rule {
-        freq: Freq::Daily,
-        interval: 1,
-        count: None,
-        until: None,
-        byday: Vec::new(),
-        bymonthday: Vec::new(),
-        bymonth: Vec::new(),
-    };
-    let mut freq = None;
-    for part in text.trim().trim_start_matches("RRULE:").split(';') {
-        let Some((k, v)) = part.split_once('=') else { continue };
-        let v = v.trim().to_ascii_uppercase();
-        match k.trim().to_ascii_uppercase().as_str() {
-            "FREQ" => {
-                freq = match v.as_str() {
-                    "DAILY" => Some(Freq::Daily),
-                    "WEEKLY" => Some(Freq::Weekly),
-                    "MONTHLY" => Some(Freq::Monthly),
-                    "YEARLY" => Some(Freq::Yearly),
-                    _ => None,
-                }
-            }
-            "INTERVAL" => r.interval = v.parse::<i64>().ok().filter(|i| (1..=1000).contains(i)).unwrap_or(1),
-            "COUNT" => r.count = v.parse::<u32>().ok().map(|c| c.min(5000)),
-            "UNTIL" => {
-                let d = v.get(..8).unwrap_or("");
-                let y = d.get(..4).and_then(|x| x.parse::<i64>().ok());
-                let m = d.get(4..6).and_then(|x| x.parse::<u8>().ok());
-                let dd = d.get(6..8).and_then(|x| x.parse::<u8>().ok());
-                if let (Some(y), Some(m), Some(dd)) = (y, m, dd) {
-                    r.until = day_of(y, m, dd);
-                }
-            }
-            "BYDAY" => {
-                for item in v.split(',') {
-                    let item = item.trim();
-                    let code = item.get(item.len().saturating_sub(2)..).unwrap_or("");
-                    let ord = item.get(..item.len().saturating_sub(2)).unwrap_or("");
-                    if let Some(w) = weekday_code(code) {
-                        let n = if ord.is_empty() {
-                            None
-                        } else {
-                            ord.trim_start_matches('+').parse::<i64>().ok()
-                        };
-                        r.byday.push((n, w));
-                    }
-                }
-            }
-            "BYMONTHDAY" => {
-                r.bymonthday = v.split(',').filter_map(|x| x.trim().parse::<i64>().ok()).collect();
-            }
-            "BYMONTH" => r.bymonth = v.split(',').filter_map(|x| x.trim().parse::<u8>().ok()).collect(),
-            _ => {}
-        }
-    }
-    r.freq = freq?;
-    Some(r)
-}
-
-/// Day-of-month rule for monthly/yearly recurrences.
-fn month_day_ok(r: &Rule, d: i64, start_dom: u8) -> bool {
-    let (y, m, dd) = ymd(d);
-    let dd = i64::from(dd);
-    let dim = i64::from(dates::days_in_month(y, m));
-    if !r.bymonthday.is_empty() {
-        return r.bymonthday.iter().any(|&n| if n > 0 { n == dd } else { dim + n + 1 == dd });
-    }
-    if !r.byday.is_empty() {
-        let wd = weekday(d);
-        return r.byday.iter().any(|&(n, w)| {
-            w == wd
-                && match n {
-                    None => true,
-                    Some(n) if n > 0 => (dd - 1) / 7 + 1 == n,
-                    Some(n) => (dim - dd) / 7 + 1 == -n,
-                }
-        });
-    }
-    dd == i64::from(start_dom)
-}
-
-fn rule_matches(r: &Rule, sd: i64, d: i64) -> bool {
-    if d < sd || r.until.is_some_and(|u| d > u) {
-        return false;
-    }
-    if d == sd {
-        return true;
-    }
-    let (y, m, _) = ymd(d);
-    let (sy, sm, sdom) = ymd(sd);
-    if !r.bymonth.is_empty() && !r.bymonth.contains(&m) {
-        return false;
-    }
-    let wd = weekday(d);
-    match r.freq {
-        Freq::Daily => {
-            (d - sd) % r.interval == 0 && (r.byday.is_empty() || r.byday.iter().any(|(_, w)| *w == wd))
-        }
-        Freq::Weekly => {
-            // Weeks start on Monday (RFC 5545 default WKST).
-            let monday = |x: i64| x - i64::from((weekday(x) + 6) % 7);
-            let weeks = (monday(d) - monday(sd)) / 7;
-            weeks % r.interval == 0
-                && if r.byday.is_empty() { wd == weekday(sd) } else { r.byday.iter().any(|(_, w)| *w == wd) }
-        }
-        Freq::Monthly => {
-            let months = (y * 12 + i64::from(m)) - (sy * 12 + i64::from(sm));
-            months % r.interval == 0 && month_day_ok(r, d, sdom)
-        }
-        Freq::Yearly => {
-            (y - sy) % r.interval == 0 && (!r.bymonth.is_empty() || m == sm) && month_day_ok(r, d, sdom)
-        }
-    }
-}
-
-/// Occurrence spans (local seconds) of `a` overlapping days `[from, to)`.
+/// Occurrence spans (local seconds) of `a` overlapping days `[from, to)`, expanded by the engine
+/// (`calendar::occurrences`, i.e. the formats crate's RFC 5545 expansion with EXDATEs).
 pub(super) fn expand(a: &Appointment, tz: i32, from: i64, to: i64) -> Vec<(i64, i64)> {
-    let s = local_secs(a.start, tz);
-    let e = local_secs(a.end, tz).max(s);
-    let dur = e - s;
-    let (rs, re) = (from.saturating_mul(DAY), to.saturating_mul(DAY));
-    let overlaps = |os: i64, oe: i64| (oe > rs && os < re) || (os == oe && os >= rs && os < re);
-    let Some(rule) = a.recurrence.as_ref().and_then(|r| parse_rule(&r.rrule)) else {
-        return if overlaps(s, e) { vec![(s, e)] } else { Vec::new() };
-    };
-    let sd = s.div_euclid(DAY);
-    let tod = s.rem_euclid(DAY);
-    let span_days = dur / DAY + 1;
-    let exdates: BTreeSet<i64> = a
-        .recurrence
-        .iter()
-        .flat_map(|r| r.exdates.iter())
-        .map(|x| local_secs(*x, tz).div_euclid(DAY))
-        .collect();
-    let begin = if rule.count.is_some() { sd } else { sd.max(from.saturating_sub(span_days)) };
-    if to.saturating_sub(begin) > 200_000 {
+    let shift = i64::from(tz).saturating_mul(60);
+    let at = |day: i64| DateTime::from_unix(day.saturating_mul(DAY).saturating_sub(shift), tz);
+    if to <= from {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    let mut n: u32 = 0;
-    for d in begin..to {
-        if !rule_matches(&rule, sd, d) {
-            continue;
-        }
-        n = n.saturating_add(1);
-        if rule.count.is_some_and(|c| n > c) {
-            break;
-        }
-        if exdates.contains(&d) {
-            continue;
-        }
-        let os = d.saturating_mul(DAY).saturating_add(tod);
-        let oe = os.saturating_add(dur);
-        if overlaps(os, oe) {
-            out.push((os, oe));
-            if out.len() >= 1000 {
-                break;
-            }
-        }
-    }
-    out
+    occurrences(a, at(from), at(to), 1000)
+        .into_iter()
+        .map(|(s, e)| {
+            let ls = local_secs(s, tz);
+            (ls, local_secs(e, tz).max(ls))
+        })
+        .collect()
 }
 
 /// Occurrences of appointments in `calendars` over days `[from, to)`, sorted by start.
@@ -480,14 +298,26 @@ fn occ_interact(app: &mut App, st: &mut ModState, resp: &egui::Response, o: &Occ
         app.ui.module_selection = Some(o.id.0);
         st.cal_slot = None;
     }
-    if resp.double_clicked() {
-        editors::open_appointment(app, st, o.id);
-    }
     let id = o.id;
+    let occ_unix = o.start.saturating_sub(i64::from(tz(app)).saturating_mul(60));
+    if resp.double_clicked() {
+        editors::open_occurrence(app, st, id, occ_unix);
+    }
+    let recurring = o.recurring;
     resp.context_menu(|ui| {
         if ui.button("Open").clicked() {
-            editors::open_appointment(app, st, id);
+            editors::open_occurrence(app, st, id, occ_unix);
             ui.close();
+        }
+        if recurring {
+            if ui.button("Open Series").clicked() {
+                editors::open_appointment(app, st, id);
+                ui.close();
+            }
+            if ui.button("Delete Occurrence").clicked() {
+                app.run("calendar.deleteOccurrence", json!({ "id": id.0, "occurrence": occ_unix }));
+                ui.close();
+            }
         }
         ui.menu_button("Categorize", |ui| {
             let cats: Vec<String> = app.s.mailbox.categories.iter().map(|c| c.name.clone()).collect();
@@ -502,7 +332,7 @@ fn occ_interact(app: &mut App, st: &mut ModState, resp: &egui::Response, o: &Occ
                 ui.close();
             }
         });
-        if ui.button("Delete").clicked() {
+        if ui.button(if recurring { "Delete Series" } else { "Delete" }).clicked() {
             app.run("calendar.delete", json!({ "id": id.0 }));
             if app.ui.module_selection == Some(id.0) {
                 app.ui.module_selection = None;
@@ -1410,7 +1240,10 @@ mod tests {
     fn count_until_interval_monthly() {
         let a = appt("2026-10-01T09:00", "2026-10-01T10:00", Some("FREQ=DAILY;COUNT=3"));
         assert_eq!(expand(&a, 0, day("2026-10-01"), day("2026-11-01")).len(), 3);
+        // UNTIL is an instant: 00:00 on the 5th ends the series before that day's 09:00 (RFC 5545).
         let b = appt("2026-10-01T09:00", "2026-10-01T10:00", Some("FREQ=DAILY;UNTIL=20261005T000000Z"));
+        assert_eq!(expand(&b, 0, day("2026-10-01"), day("2026-11-01")).len(), 4);
+        let b = appt("2026-10-01T09:00", "2026-10-01T10:00", Some("FREQ=DAILY;UNTIL=20261005T235959Z"));
         assert_eq!(expand(&b, 0, day("2026-10-01"), day("2026-11-01")).len(), 5);
         let c = appt("2026-10-01T09:00", "2026-10-01T10:00", Some("FREQ=DAILY;INTERVAL=2"));
         assert_eq!(expand(&c, 0, day("2026-10-01"), day("2026-10-08")).len(), 4);

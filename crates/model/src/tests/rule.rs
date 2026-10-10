@@ -100,6 +100,43 @@ fn people_conditions() {
     assert!(!cond(RuleCondition::SenderAddressContains(words(&["Rivera"]))));
 }
 
+/// "from people or public group" / "sent to people or public group" name people: a full address matches
+/// that address only (the substring search is "with specific words in the sender's/recipient's address").
+#[test]
+fn people_entries_with_a_full_address_match_exactly() {
+    let from = |a: &str, entry: &str| {
+        let item = MailItem { from: Some(addr("Ann", a)), ..mail("x") };
+        Rule { conditions: vec![RuleCondition::From(words(&[entry]))], ..Default::default() }
+            .matches(&item, &ctx())
+    };
+    assert!(from("ann@example.org", "ann@example.org"));
+    assert!(from("Ann@Example.org", " ANN@example.org "));
+    assert!(from("ann@example.org", "Ann Example <ann@example.org>"));
+    assert!(!from("joann@example.org", "ann@example.org"), "another person whose address ends the same");
+    assert!(!from("ann@example.org.attacker.example", "ann@example.org"), "look-alike domain");
+    assert!(!from("ann@example.org", "Ann <joann@example.org>"));
+    // Names and partial entries still match as text.
+    assert!(from("ann@example.org", "ann"));
+    assert!(from("ann@example.org", "ann@"));
+    let to = |a: &str, entry: &str| {
+        let item = MailItem { to: vec![addr("", a)], ..mail("x") };
+        Rule { conditions: vec![RuleCondition::SentTo(words(&[entry]))], ..Default::default() }
+            .matches(&item, &ctx())
+    };
+    assert!(to("team@example.org", "team@example.org"));
+    assert!(!to("dreamteam@example.org", "team@example.org"));
+}
+
+#[test]
+fn assign_category_description_has_a_placeholder() {
+    let names = |_: FolderId| String::new();
+    assert_eq!(RuleAction::AssignCategory(" ".into()).describe(&names), "assign it to the category category");
+    assert_eq!(
+        RuleAction::AssignCategory("Red category".into()).describe(&names),
+        "assign it to the Red category category"
+    );
+}
+
 #[test]
 fn sender_header_counts_as_from() {
     let item = MailItem { sender: Some(addr("Assistant", "pa@example.com")), ..sample() };

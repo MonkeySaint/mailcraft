@@ -13,6 +13,7 @@
 #[cfg(test)]
 mod account_tests;
 mod accounts;
+mod alerts;
 mod categories;
 mod common;
 mod compose_dlg;
@@ -23,6 +24,8 @@ mod general;
 mod items;
 mod mailopts;
 mod options;
+mod print;
+mod quicksteps;
 mod rules;
 mod views;
 
@@ -128,6 +131,11 @@ pub fn account_label(a: &mailcraft_model::Account) -> String {
     common::account_title(a)
 }
 
+/// File › Options › Search › "Highlight search terms in the results" (on unless turned off).
+pub fn search_highlight_on(ctx: &Context) -> bool {
+    common::pref(ctx, "options.search.highlight").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
 /// Dialog ids with a dedicated renderer (everything the engine emits, plus the UI's own).
 pub const KNOWN: &[&str] = &[
     // folders / pickers
@@ -164,6 +172,9 @@ pub const KNOWN: &[&str] = &[
     "renameRule",
     "rulesOptions",
     "rulePrompt",
+    "copyRule",
+    "newItemAlerts",
+    "ruleSound",
     // options
     "options",
     // general
@@ -182,6 +193,7 @@ pub const KNOWN: &[&str] = &[
     "saveAttachments",
     "revealPath",
     "print",
+    "pageSetup",
     "advancedFind",
     "addressBook",
     "checkNames",
@@ -293,10 +305,21 @@ pub const KNOWN: &[&str] = &[
 ];
 
 fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    if d.name == "reminders" {
+        // The Reminders window is the modules area's own window (it also pops up when reminders come due).
+        crate::modules::open_reminders(ctx, app);
+        return Out::Close;
+    }
     if let Some(out) = folders::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = categories::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = quicksteps::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = alerts::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = rules::show(ctx, app, d) {
@@ -309,6 +332,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return out;
     }
     if let Some(out) = general::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = print::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = files::show(ctx, app, d) {

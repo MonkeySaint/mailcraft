@@ -60,6 +60,10 @@ pub struct Appointment {
     pub organizer: Option<Mailbox>,
     pub attendees: Vec<Attendee>,
     pub recurrence: Option<Recurrence>,
+    /// Set on an exception: this appointment replaces the occurrence of the series (same UID) that started
+    /// at this time (RFC 5545 RECURRENCE-ID). The series lists that time in its EXDATEs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence_id: Option<DateTime>,
     pub categories: Vec<String>,
     pub private: bool,
     pub body: String,

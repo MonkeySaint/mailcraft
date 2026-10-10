@@ -650,3 +650,38 @@ fn conversation_settings_menu_follows_the_engine() {
     assert_eq!(classic.params["on"], serde_json::json!(false));
     assert_eq!(classic.flip, None);
 }
+
+#[test]
+fn search_tab_recent_searches_and_toggles() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let items = state::dyn_items(&app, Surface::Main, "recentSearches");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].label, "No Recent Searches");
+    app.run("search.query", serde_json::json!({"text": "budget", "commit": true}));
+    app.run("search.query", serde_json::json!({"text": "from:alice", "commit": true}));
+    let items = state::dyn_items(&app, Surface::Main, "recentSearches");
+    let labels: Vec<&str> = items.iter().map(|d| d.label.as_str()).collect();
+    assert_eq!(labels, ["from:alice", "budget"]);
+    assert!(items[0].on, "the active search is checked");
+    let menu = &defs().menus["recentSearches"];
+    let resolved = state::expand_items(&app, Surface::Main, &state::Mem::default(), menu);
+    let Some(state::Resolved::Cmd { action, .. }) = resolved.get(1) else { panic!("{resolved:?}") };
+    assert_eq!(action.params["index"], 1);
+    assert!(app.run(&action.cmd, action.params.clone()).is_some());
+    assert_eq!(app.s.view.search, "budget");
+    // Include Deleted Items follows the engine.
+    assert!(!state::is_on(&app, Surface::Main, &state::Mem::default(), "searchDeleted"));
+    app.run("search.scope", serde_json::json!({"includeDeleted": true}));
+    assert!(state::is_on(&app, Surface::Main, &state::Mem::default(), "searchDeleted"));
+    // Every Search tab refiner command is accepted by the engine.
+    for name in ["searchThisWeek", "searchMore", "searchSize", "searchCategorized", "searchSentTo"] {
+        for it in &defs().menus[name] {
+            if it.kind == ItemKind::Cmd && !it.cmd.id.is_empty() && it.cmd.params.trim() != "" {
+                let p: serde_json::Value = serde_json::from_str(&it.cmd.params).unwrap();
+                let before = app.s.view.search.clone();
+                assert!(app.s.run(&it.cmd.id, &p).is_ok(), "{name}: {} {p}", it.label);
+                app.s.view.search = before;
+            }
+        }
+    }
+}

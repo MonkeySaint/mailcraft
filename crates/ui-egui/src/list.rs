@@ -26,6 +26,7 @@ use egui::{
 };
 use mailcraft_engine::Session;
 use mailcraft_engine::queries::{self, ConversationRow, ItemRow, ListRow};
+use mailcraft_engine::search_index::{self, Field};
 use mailcraft_model::{
     ArrangeBy, FlagState, FocusClass, FolderRole, ListFilter, ReadingPanePos, SortOrder, ViewLayout,
     ViewSettings,
@@ -85,6 +86,42 @@ pub(crate) fn bold_family(ctx: &egui::Context) -> Option<FontFamily> {
     })
 }
 
+/// A layout job for `text` with the byte `ranges` (sorted or not, possibly overlapping, possibly off char
+/// boundaries) drawn on `bg`; invalid ranges are skipped.
+pub(crate) fn highlight_job(
+    text: String,
+    format: &TextFormat,
+    ranges: &[(usize, usize)],
+    bg: Color32,
+) -> LayoutJob {
+    let mut spans: Vec<(usize, usize)> = ranges
+        .iter()
+        .copied()
+        .filter(|&(a, b)| a < b && b <= text.len() && text.is_char_boundary(a) && text.is_char_boundary(b))
+        .collect();
+    spans.sort_unstable();
+    let mut job = LayoutJob::default();
+    let mut at = 0usize;
+    let hit = TextFormat { background: bg, ..format.clone() };
+    for (a, b) in spans {
+        let a = a.max(at);
+        if a >= b {
+            continue;
+        }
+        if let Some(plain) = text.get(at..a) {
+            job.append(plain, 0.0, format.clone());
+        }
+        if let Some(word) = text.get(a..b) {
+            job.append(word, 0.0, hit.clone());
+        }
+        at = b;
+    }
+    if let Some(rest) = text.get(at..) {
+        job.append(rest, 0.0, format.clone());
+    }
+    job
+}
+
 impl Text {
     /// Lays out `text` within `max_w`, at most `rows` lines, elided with "…".
     pub(crate) fn new(
@@ -96,6 +133,21 @@ impl Text {
         max_w: f32,
         rows: usize,
     ) -> Text {
+        Text::highlighted(ui, text, size, bold, color, max_w, rows, None)
+    }
+
+    /// [`Text::new`] with search words (the active search's hits in `field`) on a highlight background.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn highlighted(
+        ui: &Ui,
+        text: &str,
+        size: f32,
+        bold: bool,
+        color: Color32,
+        max_w: f32,
+        rows: usize,
+        hits: Option<(&Session, Field, Color32)>,
+    ) -> Text {
         let (family, faux_bold) = if bold {
             match bold_family(ui.ctx()) {
                 Some(f) => (f, false),
@@ -106,10 +158,15 @@ impl Text {
         };
         // Line breaks in one-line fields (subjects, previews) would push text out of the row.
         let clean: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-        let mut job = LayoutJob::single_section(
-            clean,
-            TextFormat { font_id: FontId::new(size, family), color, ..Default::default() },
-        );
+        let format = TextFormat { font_id: FontId::new(size, family), color, ..Default::default() };
+        let ranges = match hits {
+            Some((s, field, _)) => search_index::highlights(s, field, &clean),
+            None => Vec::new(),
+        };
+        let mut job = match hits {
+            Some((_, _, bg)) if !ranges.is_empty() => highlight_job(clean, &format, &ranges, bg),
+            _ => LayoutJob::single_section(clean, format),
+        };
         job.wrap = TextWrapping {
             max_width: max_w.max(1.0),
             max_rows: rows.max(1),
@@ -1367,7 +1424,18 @@ fn paint_compact(
         let t = Text::new(ui, "[Draft]", 14.0, false, th.draft, 60.0, 1);
         x = t.paint_left(&painter, line1, x) + 5.0;
     }
-    let who = Text::new(ui, &row.who, 14.5, false, th.text, (icons_left - x - 6.0).max(1.0), 1);
+    let searching = !app.s.view.search.trim().is_empty() && crate::dialogs::search_highlight_on(ui.ctx());
+    let hl = |field: Field| searching.then_some((&app.s, field, th.search_hit));
+    let who = Text::highlighted(
+        ui,
+        &row.who,
+        14.5,
+        false,
+        th.text,
+        (icons_left - x - 6.0).max(1.0),
+        1,
+        hl(Field::From),
+    );
     who.paint_left(&painter, line1, x);
 
     // Line 2: subject … reply/forward state, time.
@@ -1386,14 +1454,31 @@ fn paint_compact(
         sub_right -= 18.0;
     }
     let subject_color = if row.unread { th.unread } else { th.text };
-    let subject =
-        Text::new(ui, &row.subject, 13.0, row.unread, subject_color, (sub_right - left).max(1.0), 1);
+    let subject = Text::highlighted(
+        ui,
+        &row.subject,
+        13.0,
+        row.unread,
+        subject_color,
+        (sub_right - left).max(1.0),
+        1,
+        hl(Field::Subject),
+    );
     subject.paint_left(&painter, line2, left);
 
     // Lines 3..: preview.
     let lines = usize::from(preview_lines.min(3));
     if lines > 0 && !row.preview.trim().is_empty() {
-        let t = Text::new(ui, row.preview.trim(), 12.5, false, th.text_muted, (right - left).max(1.0), lines);
+        let t = Text::highlighted(
+            ui,
+            row.preview.trim(),
+            12.5,
+            false,
+            th.text_muted,
+            (right - left).max(1.0),
+            lines,
+            hl(Field::Body),
+        );
         t.paint(&painter, pos2(left, line2.bottom() + 1.0));
     }
     Slots { flag, delete }
@@ -1605,6 +1690,23 @@ mod tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn highlight_job_marks_hits_and_skips_bad_ranges() {
+        let format = TextFormat::default();
+        let bg = Color32::YELLOW;
+        let text = "Café budget review".to_owned();
+        // "budget" (6..12), a range inside "é" (off a char boundary), an overlap and one past the end.
+        let job = highlight_job(text.clone(), &format, &[(6, 12), (4, 5), (8, 10), (15, 99)], bg);
+        assert_eq!(job.text, text);
+        let marked: Vec<&str> = job
+            .sections
+            .iter()
+            .filter(|s| s.format.background == bg)
+            .filter_map(|s| job.text.get(s.byte_range.start.0..s.byte_range.end.0))
+            .collect();
+        assert_eq!(marked, vec!["budget"]);
+    }
     use mailcraft_engine::sample::sample_session;
 
     fn harness(app: App, size: egui::Vec2) -> Harness<'static, App> {

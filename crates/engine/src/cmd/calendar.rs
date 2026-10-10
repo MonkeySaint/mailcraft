@@ -22,11 +22,17 @@ use self::pim::Kind;
 use crate::cmd::util::{opt_str, opt_u64};
 use crate::compose::{ComposeAttachment, ComposeState};
 use crate::{CmdError, CmdResult, CommandSpec, Module, Session, always};
+pub use mailcraft_formats::ics::itip::ItipMessage;
+use mailcraft_formats::ics::itip::{self, Method};
+use mailcraft_formats::ics::{ImportOptions, rrule};
 use mailcraft_model::calendar::{AttendeeRole, ResponseStatus};
 use mailcraft_model::{
-    Address, Appointment, Attendee, BusyStatus, DateTime, Doc, FolderId, FolderKind, ItemId, ListTime,
-    Recurrence,
+    Address, Appointment, Attendee, BusyStatus, DateTime, Doc, FolderId, FolderKind, FolderRole, ItemId,
+    ListTime, MailItem, Recurrence,
 };
+
+/// The reminders scanner (`crate::reminders`).
+pub use crate::reminders;
 
 /// Shared helpers for PIM items (appointments, contacts, tasks, notes).
 pub mod pim {
@@ -275,13 +281,16 @@ pub mod pim {
                 continue;
             }
             let new = ItemId(s.mailbox.alloc_id());
+            let uid = super::new_uid(s, new, stamp);
             let mb = &mut s.mailbox;
             match kind {
                 Kind::Appointment => {
                     if let Some(mut a) = mb.appointments.get(&id).cloned() {
                         a.id = new;
                         a.folder = folder;
-                        a.uid = super::new_uid(new, stamp);
+                        a.uid = uid.clone();
+                        // A copied exception stands alone (it has a new UID, so no series).
+                        a.recurrence_id = None;
                         mb.appointments.insert(new, a);
                     }
                 }
@@ -851,11 +860,10 @@ fn run_add_calendar(s: &mut Session, p: &Value) -> CmdResult {
 fn run_share(s: &mut Session, p: &Value) -> CmdResult {
     let folder = target_calendar(s, p)?;
     let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
-    let tz = s.tz_offset_min;
     let mut appts: Vec<&Appointment> =
         s.mailbox.appointments.values().filter(|a| a.folder == folder).collect();
     appts.sort_by_key(|a| (a.start.unix, a.id));
-    let ics = ics_calendar(Some("PUBLISH"), &appts, tz, s.now());
+    let ics = ics_calendar(Some("PUBLISH"), &appts, s.now());
     let events = appts.len();
     let calendars: Vec<Value> = s
         .mailbox
@@ -923,9 +931,23 @@ pub fn next_half_hour(now: DateTime, tz: i32) -> DateTime {
     DateTime::from_unix(slot.saturating_sub(shift), tz)
 }
 
-/// UID for a new appointment.
-pub(crate) fn new_uid(id: ItemId, stamp: i64) -> String {
-    format!("mailcraft-{}-{}@localhost", id.0, stamp)
+/// UID for a new appointment: the item id and time plus a hash of the user's addresses, so meetings from
+/// different people (whose mailboxes number items alike) never share a UID (RFC 5545 §3.8.4.7).
+pub(crate) fn new_uid(s: &Session, id: ItemId, stamp: i64) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for a in &s.mailbox.accounts {
+        feed(a.address.trim().to_ascii_lowercase().as_bytes());
+        feed(&[0]);
+    }
+    feed(&id.0.to_be_bytes());
+    feed(&stamp.to_be_bytes());
+    format!("mailcraft-{}-{}-{:016x}@localhost", id.0, stamp, h)
 }
 
 /// A new appointment with the defaults (next half hour, 30 minutes, Busy, reminder 15).
@@ -1082,22 +1104,70 @@ pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> 
             a.is_meeting = true;
         }
     }
-    match p.get("recurrence") {
-        None => {}
-        Some(Value::Null) => a.recurrence = None,
-        Some(Value::String(r)) if r.trim().is_empty() => a.recurrence = None,
+    let rule = match p.get("recurrence") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(r)) if r.trim().is_empty() => Some(None),
         Some(Value::String(r)) => {
-            let r = r.trim().trim_start_matches("RRULE:");
-            if r.len() > 1000 || !r.to_ascii_uppercase().contains("FREQ=") {
-                return Err(CmdError::Params(
-                    "`recurrence` must be an RRULE value such as FREQ=WEEKLY".into(),
-                ));
+            let r = r.trim().trim_start_matches("RRULE:").trim();
+            if r.len() > 1000 {
+                return Err(CmdError::Params("`recurrence` is too long".into()));
             }
-            a.recurrence = Some(Recurrence { rrule: r.to_owned(), exdates: Vec::new() });
+            rrule::Rrule::parse(r).map_err(|e| {
+                CmdError::Params(format!("`recurrence` must be an RRULE value such as FREQ=WEEKLY ({e})"))
+            })?;
+            Some(Some(r.to_owned()))
         }
-        Some(_) => return Err(CmdError::Params("`recurrence` must be a string".into())),
+        Some(v @ Value::Object(_)) => {
+            let form: recurrence::RecurrenceForm = serde_json::from_value(v.clone())
+                .map_err(|e| CmdError::Params(format!("`recurrence`: {e}")))?;
+            Some(Some(form.to_rrule(a.all_day, tz).map_err(CmdError::Params)?))
+        }
+        Some(_) => return Err(CmdError::Params("`recurrence` must be an RRULE string or a pattern".into())),
+    };
+    match rule {
+        None => {}
+        Some(None) => a.recurrence = None,
+        // The same rule keeps its exceptions (deleted / edited occurrences).
+        Some(Some(r)) => {
+            match a.recurrence.as_mut() {
+                Some(old) if old.rrule.eq_ignore_ascii_case(&r) => {}
+                _ => a.recurrence = Some(Recurrence { rrule: r, exdates: Vec::new() }),
+            }
+            sync_series_start(a);
+        }
     }
     Ok(())
+}
+
+/// Moves a series' start (and end) forward to the first day its pattern produces, so the series starts on
+/// one of its occurrences: RFC 5545 §3.8.5.3 wants DTSTART to be the first instance, and an unsynchronised
+/// DTSTART (a "every Monday" series saved on a Wednesday) would add a stray occurrence. Leaves the series
+/// alone when the pattern produces nothing before its end. Returns true when it moved.
+pub fn sync_series_start(a: &mut Appointment) -> bool {
+    let Some(rec) = &a.recurrence else { return false };
+    let Ok(rule) = rrule::Rrule::parse(&rec.rrule) else { return false };
+    let off = i64::from(a.start.offset_min).saturating_mul(60);
+    let local = a.start.unix.saturating_add(off);
+    let day = local.div_euclid(pim::DAY_SECS);
+    let Some(first) = rule.first_day_from(day) else { return false };
+    let shift = first.saturating_sub(day).saturating_mul(pim::DAY_SECS);
+    if shift <= 0 {
+        return false;
+    }
+    let (new_local, new_unix) = (local.saturating_add(shift), a.start.unix.saturating_add(shift));
+    let past_end = match rule.until {
+        Some(rrule::Until::Date(d)) => new_local.div_euclid(pim::DAY_SECS) > d.div_euclid(pim::DAY_SECS),
+        Some(rrule::Until::Local(l)) => new_local > l,
+        Some(rrule::Until::Utc(u)) => new_unix > u,
+        None => false,
+    };
+    if past_end {
+        return false;
+    }
+    a.start = DateTime::from_unix(new_unix, a.start.offset_min);
+    a.end = DateTime::from_unix(a.end.unix.saturating_add(shift), a.end.offset_min);
+    true
 }
 
 /// Summary of an appointment for results.
@@ -1115,6 +1185,10 @@ pub fn appointment_json(a: &Appointment, tz: i32) -> Value {
         "meeting": a.is_meeting,
         "attendees": a.attendees.iter().map(|x| x.mailbox.to_display_string()).collect::<Vec<_>>(),
         "categories": a.categories,
+        "recurrence": a.recurrence.as_ref().map(|r| r.rrule.clone()),
+        "recurrenceText": describe_recurrence(a, tz),
+        "organizer": a.organizer.as_ref().map(Address::to_display_string),
+        "tracking": tracking_json(a),
     })
 }
 
@@ -1135,7 +1209,7 @@ pub fn create_appointment(
     }
     let id = ItemId(s.mailbox.alloc_id());
     a.id = id;
-    a.uid = new_uid(id, s.now().unix);
+    a.uid = new_uid(s, id, s.now().unix);
     s.mailbox.appointments.insert(id, a);
     Ok(id)
 }
@@ -1180,6 +1254,12 @@ fn run_new_meeting(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Opens a compose carrying the meeting invitation for appointment `id`.
 pub fn meeting_compose(s: &mut Session, id: ItemId) -> Option<u64> {
+    meeting_compose_seq(s, id, 0)
+}
+
+/// Opens a compose carrying the invitation (iTIP REQUEST, written by `mailcraft-formats`) for appointment
+/// `id` with SEQUENCE `sequence` (0 for a new meeting, higher for updates).
+pub fn meeting_compose_seq(s: &mut Session, id: ItemId, sequence: u32) -> Option<u64> {
     let a = s.mailbox.appointments.get(&id)?.clone();
     let tz = s.tz_offset_min;
     let join = |roles: &[AttendeeRole]| {
@@ -1192,7 +1272,8 @@ pub fn meeting_compose(s: &mut Session, id: ItemId) -> Option<u64> {
     };
     let to = join(&[AttendeeRole::Required, AttendeeRole::Resource]);
     let cc = join(&[AttendeeRole::Optional]);
-    let mut text = format!("When: {}\n", when_text(&a, tz));
+    let when = describe_recurrence(&a, tz).unwrap_or_else(|| when_text(&a, tz));
+    let mut text = format!("When: {when}\n");
     if !a.location.trim().is_empty() {
         text.push_str(&format!("Where: {}\n", a.location.trim()));
     }
@@ -1200,7 +1281,7 @@ pub fn meeting_compose(s: &mut Session, id: ItemId) -> Option<u64> {
         text.push('\n');
         text.push_str(&a.body);
     }
-    let ics = ics_calendar(Some("REQUEST"), &[&a], tz, s.now());
+    let ics = itip::request(&a, sequence, s.now());
     let mut compose = ComposeState {
         to,
         cc,
@@ -1267,8 +1348,40 @@ fn run_update(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "updated": out }))
 }
 
+/// Deleting a recurring series deletes its exceptions (edited occurrences, same UID) with it.
 fn run_delete(s: &mut Session, p: &Value) -> CmdResult {
-    pim::run_delete(s, p, Kind::Appointment)
+    let mut ids = pim::require_targets(s, p, Kind::Appointment)?;
+    let mut extra = Vec::new();
+    for id in &ids {
+        if let Some(a) = s.mailbox.appointments.get(id).filter(|a| a.recurrence.is_some()) {
+            extra.extend(exceptions_of(s, a));
+        }
+    }
+    for x in extra {
+        if !ids.contains(&x) {
+            ids.push(x);
+        }
+    }
+    let done = pim::delete(s, &ids);
+    Ok(json!({ "deleted": pim::ids_json(&done) }))
+}
+
+/// The exceptions of series `a`: appointments in its folder with its UID and a RECURRENCE-ID.
+fn exceptions_of(s: &Session, a: &Appointment) -> Vec<ItemId> {
+    if a.uid.trim().is_empty() {
+        return Vec::new();
+    }
+    s.mailbox
+        .appointments
+        .values()
+        .filter(|x| {
+            x.id != a.id
+                && x.folder == a.folder
+                && x.recurrence_id.is_some()
+                && x.uid.eq_ignore_ascii_case(&a.uid)
+        })
+        .map(|x| x.id)
+        .collect()
 }
 fn run_copy(s: &mut Session, p: &Value) -> CmdResult {
     pim::run_copy(s, p, Kind::Appointment)
@@ -1301,114 +1414,1335 @@ pub fn ics_escape(s: &str) -> String {
     out
 }
 
-/// Parameter value: quoted when it holds `:`, `;` or `,` (DQUOTE itself is dropped).
-fn ics_param(s: &str) -> String {
-    let v: String = s.chars().filter(|c| *c != '"' && !c.is_control()).collect();
-    if v.contains([':', ';', ',']) { format!("\"{v}\"") } else { v }
+/// A VCALENDAR object holding `appts` (`method` e.g. "REQUEST", "PUBLISH"), written by `mailcraft-formats`
+/// (recurrence exceptions as EXDATE, exceptions with RECURRENCE-ID, reminders as VALARM).
+pub fn ics_calendar(method: Option<&str>, appts: &[&Appointment], stamp: DateTime) -> String {
+    let method = method.map(Method::parse);
+    mailcraft_formats::ics::write(appts, &[], method.as_ref(), stamp)
 }
 
-/// Folds a content line at 75 octets (continuations start with a space), CRLF-terminated.
-fn ics_fold(line: &str, out: &mut String) {
-    let mut width = 0usize;
-    for c in line.chars() {
-        let w = c.len_utf8();
-        if width.saturating_add(w) > 75 {
-            out.push_str("\r\n ");
-            width = 1;
+// ---------------------------------------------------------------------------------------------------------
+// Occurrences and recurrence
+// ---------------------------------------------------------------------------------------------------------
+
+/// Occurrences (start, end) of `a` overlapping `[from, to)`, expanded by `mailcraft-formats` (RRULE with
+/// EXDATEs, in the appointment's own UTC offset). At most `max` (capped by the formats limit).
+pub fn occurrences(a: &Appointment, from: DateTime, to: DateTime, max: usize) -> Vec<(DateTime, DateTime)> {
+    mailcraft_formats::ics::expand_appointment(a, from, to, max.min(rrule::MAX_OCCURRENCES))
+}
+
+/// The Appointment Recurrence dialog's model and its RRULE mapping (RFC 5545 §3.3.10).
+pub mod recurrence {
+    use serde::{Deserialize, Serialize};
+
+    use super::pim;
+    use mailcraft_formats::ics::rrule::{self, Freq, Rrule, Until};
+    use mailcraft_model::{DateTime, dates};
+
+    /// Recurrence pattern (left column of the dialog).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Pattern {
+        Daily,
+        #[default]
+        Weekly,
+        Monthly,
+        Yearly,
+    }
+
+    /// Range of recurrence: No end date, End after N occurrences, End by a date.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum RangeEnd {
+        #[default]
+        NoEnd,
+        After,
+        By,
+    }
+
+    /// Weekday names, Monday = 0 (the formats crate's numbering).
+    pub const WEEKDAYS: [&str; 7] =
+        ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+    /// Ordinals for "The second Tuesday": 1..=4 and -1 = last.
+    pub const ORDINALS: [(i8, &str); 5] =
+        [(1, "first"), (2, "second"), (3, "third"), (4, "fourth"), (-1, "last")];
+    /// Longest interval accepted.
+    pub const MAX_INTERVAL: u32 = 999;
+    /// Most occurrences accepted for "End after".
+    pub const MAX_COUNT: u32 = 999;
+
+    /// The dialog's fields.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    pub struct RecurrenceForm {
+        pub pattern: Pattern,
+        /// Every N days / weeks / months / years.
+        pub interval: u32,
+        /// Daily: "Every weekday" instead of every N days.
+        pub every_weekday: bool,
+        /// Weekly: the days (Monday = 0 … Sunday = 6).
+        pub weekdays: Vec<u8>,
+        /// Monthly / yearly: "The second Tuesday" (true) or "Day 12" (false).
+        pub by_weekday: bool,
+        /// Day of the month, 1..=31.
+        pub day: u8,
+        /// 1..=4, or -1 for "last".
+        pub ordinal: i8,
+        /// Monday = 0.
+        pub weekday: u8,
+        /// Yearly: month 1..=12.
+        pub month: u8,
+        pub end: RangeEnd,
+        /// End after N occurrences.
+        pub count: u32,
+        /// End by "YYYY-MM-DD" (local date, inclusive).
+        pub until: String,
+    }
+
+    impl Default for RecurrenceForm {
+        fn default() -> Self {
+            RecurrenceForm {
+                pattern: Pattern::Weekly,
+                interval: 1,
+                every_weekday: false,
+                weekdays: vec![0],
+                by_weekday: false,
+                day: 1,
+                ordinal: 1,
+                weekday: 0,
+                month: 1,
+                end: RangeEnd::NoEnd,
+                count: 10,
+                until: String::new(),
+            }
         }
-        out.push(c);
-        width = width.saturating_add(w);
     }
-    out.push_str("\r\n");
-}
 
-fn ics_utc(t: DateTime) -> String {
-    let c = t.civil(0);
-    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", c.year, c.month, c.day, c.hour, c.minute, c.second)
-}
+    /// (local day number, Monday-based weekday, year, month, day of month) of `t`.
+    fn local_parts(t: DateTime, tz: i32) -> (i64, u8, i64, u8, u8) {
+        let day = t.day_number(tz);
+        let (y, m, d) = dates::civil_from_days(day);
+        (day, rrule::weekday(day), y, m, d)
+    }
 
-fn ics_date(t: DateTime, tz: i32) -> String {
-    let c = t.civil(tz);
-    format!("{:04}{:02}{:02}", c.year, c.month, c.day)
-}
+    /// "The fourth/last Friday" ordinal of a date (5th weeks count as last).
+    fn ordinal_of(y: i64, m: u8, d: u8) -> i8 {
+        let n = (d.saturating_sub(1) / 7).saturating_add(1);
+        if d.saturating_add(7) > dates::days_in_month(y, m) { -1 } else { i8::try_from(n).unwrap_or(1) }
+    }
 
-fn vevent_lines(a: &Appointment, tz: i32, stamp: DateTime, lines: &mut Vec<String>) {
-    lines.push("BEGIN:VEVENT".into());
-    lines.push(format!("UID:{}", ics_escape(&a.uid)));
-    lines.push(format!("DTSTAMP:{}", ics_utc(stamp)));
-    if a.all_day {
-        lines.push(format!("DTSTART;VALUE=DATE:{}", ics_date(a.start, tz)));
-        lines.push(format!("DTEND;VALUE=DATE:{}", ics_date(a.end, tz)));
-    } else {
-        lines.push(format!("DTSTART:{}", ics_utc(a.start)));
-        lines.push(format!("DTEND:{}", ics_utc(a.end)));
+    impl RecurrenceForm {
+        /// The dialog's defaults for an appointment starting at `start`: weekly on its weekday, ending after
+        /// 10 occurrences when switched to "End after", and by three months later when switched to "End by".
+        pub fn for_start(start: DateTime, tz: i32) -> RecurrenceForm {
+            let (day, wd, y, m, d) = local_parts(start, tz);
+            let (ey, em, ed) = dates::civil_from_days(day.saturating_add(91));
+            RecurrenceForm {
+                pattern: Pattern::Weekly,
+                weekdays: vec![wd],
+                day: d,
+                ordinal: ordinal_of(y, m, d),
+                weekday: wd,
+                month: m,
+                until: format!("{ey:04}-{em:02}-{ed:02}"),
+                ..RecurrenceForm::default()
+            }
+        }
+
+        /// Reads an RRULE back into the dialog (fields the dialog cannot show keep the defaults of
+        /// [`RecurrenceForm::for_start`]).
+        pub fn from_rrule(text: &str, start: DateTime, tz: i32) -> RecurrenceForm {
+            let mut f = RecurrenceForm::for_start(start, tz);
+            let Ok(r) = Rrule::parse(text) else { return f };
+            f.interval = r.interval.clamp(1, MAX_INTERVAL);
+            let weekdays_only = {
+                let mut d: Vec<u8> = r.by_day.iter().filter(|(o, _)| *o == 0).map(|(_, w)| *w).collect();
+                d.sort_unstable();
+                d == [0, 1, 2, 3, 4] && r.by_day.len() == 5
+            };
+            match r.freq {
+                Freq::Daily => {
+                    f.pattern = Pattern::Daily;
+                    f.every_weekday = weekdays_only;
+                }
+                Freq::Weekly if weekdays_only && r.interval == 1 => {
+                    f.pattern = Pattern::Daily;
+                    f.every_weekday = true;
+                }
+                Freq::Weekly => {
+                    f.pattern = Pattern::Weekly;
+                    let mut d: Vec<u8> = r.by_day.iter().map(|(_, w)| *w).filter(|w| *w < 7).collect();
+                    d.sort_unstable();
+                    d.dedup();
+                    if !d.is_empty() {
+                        f.weekdays = d;
+                    }
+                }
+                Freq::Monthly | Freq::Yearly => {
+                    f.pattern = if r.freq == Freq::Monthly { Pattern::Monthly } else { Pattern::Yearly };
+                    if let Some(m) = r.by_month.first() {
+                        f.month = *m;
+                    }
+                    if let Some(d) = r.by_month_day.first() {
+                        f.by_weekday = false;
+                        f.day = u8::try_from(*d).ok().filter(|d| (1..=31).contains(d)).unwrap_or(f.day);
+                    } else if let Some((o, w)) = r.by_day.first() {
+                        let ord = if *o != 0 { *o } else { r.by_set_pos.first().copied().unwrap_or(1) };
+                        f.by_weekday = true;
+                        f.weekday = (*w).min(6);
+                        f.ordinal = if ord < 0 { -1 } else { i8::try_from(ord.clamp(1, 4)).unwrap_or(1) };
+                    }
+                }
+            }
+            if let Some(c) = r.count {
+                f.end = RangeEnd::After;
+                f.count = c.clamp(1, MAX_COUNT);
+            } else if let Some(u) = r.until {
+                f.end = RangeEnd::By;
+                let day = match u {
+                    Until::Date(d) | Until::Local(d) => d.div_euclid(rrule_day()),
+                    Until::Utc(u) => {
+                        u.saturating_add(i64::from(tz).saturating_mul(60)).div_euclid(rrule_day())
+                    }
+                };
+                let (y, m, d) = dates::civil_from_days(day);
+                f.until = format!("{y:04}-{m:02}-{d:02}");
+            }
+            f
+        }
+
+        /// The RRULE value for this form. `all_day` and `tz` decide how "End by" is written (a DATE for
+        /// all-day events, else the end of that local day in UTC).
+        pub fn to_rrule(&self, all_day: bool, tz: i32) -> Result<String, String> {
+            let interval = self.interval.clamp(1, MAX_INTERVAL);
+            let mut r = Rrule { interval, ..Rrule::default() };
+            match self.pattern {
+                Pattern::Daily if self.every_weekday => {
+                    r.freq = Freq::Weekly;
+                    r.interval = 1;
+                    r.by_day = (0..5).map(|d| (0, d)).collect();
+                }
+                Pattern::Daily => r.freq = Freq::Daily,
+                Pattern::Weekly => {
+                    r.freq = Freq::Weekly;
+                    let mut d: Vec<u8> = self.weekdays.iter().copied().filter(|w| *w < 7).collect();
+                    d.sort_unstable();
+                    d.dedup();
+                    if d.is_empty() {
+                        return Err("Choose at least one day of the week.".into());
+                    }
+                    r.by_day = d.into_iter().map(|w| (0, w)).collect();
+                }
+                Pattern::Monthly | Pattern::Yearly => {
+                    r.freq = if self.pattern == Pattern::Monthly { Freq::Monthly } else { Freq::Yearly };
+                    if self.pattern == Pattern::Yearly {
+                        if !(1..=12).contains(&self.month) {
+                            return Err("Choose a month.".into());
+                        }
+                        r.by_month = vec![self.month];
+                    }
+                    if self.by_weekday {
+                        if self.weekday > 6 || !(self.ordinal == -1 || (1..=4).contains(&self.ordinal)) {
+                            return Err("Choose which weekday of the month.".into());
+                        }
+                        r.by_day = vec![(i32::from(self.ordinal), self.weekday)];
+                    } else {
+                        if !(1..=31).contains(&self.day) {
+                            return Err("The day of the month must be between 1 and 31.".into());
+                        }
+                        r.by_month_day = vec![i32::from(self.day)];
+                    }
+                }
+            }
+            match self.end {
+                RangeEnd::NoEnd => {}
+                RangeEnd::After => {
+                    if !(1..=MAX_COUNT).contains(&self.count) {
+                        return Err(format!("The number of occurrences must be between 1 and {MAX_COUNT}."));
+                    }
+                    r.count = Some(self.count);
+                }
+                RangeEnd::By => {
+                    let t = pim::parse_local(&self.until, 0).ok_or("Enter the end date as YYYY-MM-DD.")?;
+                    let day = t.unix.div_euclid(rrule_day());
+                    r.until = Some(if all_day {
+                        Until::Date(day.saturating_mul(rrule_day()))
+                    } else {
+                        let next_local = day.saturating_add(1).saturating_mul(rrule_day());
+                        Until::Utc(
+                            next_local.saturating_sub(i64::from(tz).saturating_mul(60)).saturating_sub(1),
+                        )
+                    });
+                }
+            }
+            Ok(r.to_value())
+        }
     }
-    lines.push(format!("SUMMARY:{}", ics_escape(&a.subject)));
-    if !a.location.is_empty() {
-        lines.push(format!("LOCATION:{}", ics_escape(&a.location)));
+
+    fn rrule_day() -> i64 {
+        86_400
     }
-    if !a.body.is_empty() {
-        lines.push(format!("DESCRIPTION:{}", ics_escape(&a.body)));
+
+    fn weekday_list(days: &[String]) -> String {
+        match days {
+            [] => String::new(),
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        }
     }
-    if let Some(r) = &a.recurrence {
-        lines.push(format!("RRULE:{}", r.rrule.chars().filter(|c| !c.is_control()).collect::<String>()));
+
+    fn ordinal_name(o: i32) -> &'static str {
+        let o = if o < 0 { -1 } else { o };
+        ORDINALS.iter().find(|(n, _)| i32::from(*n) == o).map(|(_, s)| *s).unwrap_or("first")
     }
-    if let Some(o) = &a.organizer {
-        let cn = o.name.as_deref().map(|n| format!(";CN={}", ics_param(n))).unwrap_or_default();
-        lines.push(format!("ORGANIZER{cn}:mailto:{}", ics_param(&o.addr)));
-    }
-    for at in &a.attendees {
-        let role = match at.role {
-            AttendeeRole::Required => "ROLE=REQ-PARTICIPANT",
-            AttendeeRole::Optional => "ROLE=OPT-PARTICIPANT",
-            AttendeeRole::Resource => "CUTYPE=RESOURCE;ROLE=NON-PARTICIPANT",
+
+    /// "every Monday and Wednesday", "every 2 days", "day 12 of every month", "the last Friday of every 3
+    /// months", "every October 9" — the pattern phrase of [`describe`].
+    pub fn pattern_text(text: &str) -> Option<String> {
+        let r = Rrule::parse(text).ok()?;
+        let every = |unit: &str, units: &str| {
+            if r.interval <= 1 { format!("every {unit}") } else { format!("every {} {units}", r.interval) }
         };
-        let partstat = match at.response {
-            ResponseStatus::None => "NEEDS-ACTION",
-            ResponseStatus::Accepted => "ACCEPTED",
-            ResponseStatus::Tentative => "TENTATIVE",
-            ResponseStatus::Declined => "DECLINED",
-        };
-        let cn = at.mailbox.name.as_deref().map(|n| format!(";CN={}", ics_param(n))).unwrap_or_default();
-        lines.push(format!(
-            "ATTENDEE;{role};PARTSTAT={partstat};RSVP=TRUE{cn}:mailto:{}",
-            ics_param(&at.mailbox.addr)
-        ));
+        let names: Vec<String> = r
+            .by_day
+            .iter()
+            .filter_map(|(_, w)| WEEKDAYS.get(usize::from(*w)).map(|s| (*s).to_owned()))
+            .collect();
+        let months = super::recurrence_month_names();
+        Some(match r.freq {
+            Freq::Daily => every("day", "days"),
+            Freq::Weekly => {
+                let mut sorted: Vec<u8> = r.by_day.iter().map(|(_, w)| *w).collect();
+                sorted.sort_unstable();
+                if sorted == [0, 1, 2, 3, 4] && r.interval <= 1 {
+                    "every weekday".to_owned()
+                } else if names.is_empty() {
+                    every("week", "weeks")
+                } else if r.interval <= 1 {
+                    format!("every {}", weekday_list(&names))
+                } else {
+                    format!("every {} weeks on {}", r.interval, weekday_list(&names))
+                }
+            }
+            Freq::Monthly => {
+                let period = if r.interval <= 1 {
+                    "every month".to_owned()
+                } else {
+                    format!("every {} months", r.interval)
+                };
+                if let Some(d) = r.by_month_day.first() {
+                    format!("day {d} of {period}")
+                } else if let Some((o, w)) = r.by_day.first() {
+                    let o = if *o != 0 { *o } else { r.by_set_pos.first().copied().unwrap_or(1) };
+                    let day = WEEKDAYS.get(usize::from(*w)).copied().unwrap_or("Monday");
+                    format!("the {} {day} of {period}", ordinal_name(o))
+                } else {
+                    period
+                }
+            }
+            Freq::Yearly => {
+                let month = r
+                    .by_month
+                    .first()
+                    .and_then(|m| months.get(usize::from(*m).saturating_sub(1)))
+                    .copied()
+                    .unwrap_or("");
+                if let Some(d) = r.by_month_day.first() {
+                    if r.interval <= 1 {
+                        format!("every {month} {d}")
+                    } else {
+                        format!("every {} years on {month} {d}", r.interval)
+                    }
+                } else if let Some((o, w)) = r.by_day.first() {
+                    let o = if *o != 0 { *o } else { r.by_set_pos.first().copied().unwrap_or(1) };
+                    let day = WEEKDAYS.get(usize::from(*w)).copied().unwrap_or("Monday");
+                    let period = if r.interval <= 1 {
+                        "every year".to_owned()
+                    } else {
+                        format!("every {} years", r.interval)
+                    };
+                    format!("the {} {day} of {month} {period}", ordinal_name(o))
+                } else {
+                    every("year", "years")
+                }
+            }
+        })
     }
-    if !a.categories.is_empty() {
-        let cats: Vec<String> = a.categories.iter().map(|c| ics_escape(c)).collect();
-        lines.push(format!("CATEGORIES:{}", cats.join(",")));
-    }
-    if a.private {
-        lines.push("CLASS:PRIVATE".into());
-    }
-    lines.push(format!("TRANSP:{}", if a.show_as == BusyStatus::Free { "TRANSPARENT" } else { "OPAQUE" }));
-    if let Some(m) = a.reminder_min {
-        lines.push("BEGIN:VALARM".into());
-        lines.push("ACTION:DISPLAY".into());
-        lines.push(format!("TRIGGER:-PT{m}M"));
-        lines.push(format!("DESCRIPTION:{}", ics_escape(&a.subject)));
-        lines.push("END:VALARM".into());
-    }
-    lines.push("END:VEVENT".into());
 }
 
-/// A VCALENDAR object holding `appts` (`method` e.g. "REQUEST", "PUBLISH").
-pub fn ics_calendar(method: Option<&str>, appts: &[&Appointment], tz: i32, stamp: DateTime) -> String {
-    let mut lines =
-        vec!["BEGIN:VCALENDAR".to_owned(), "VERSION:2.0".into(), "PRODID:-//MailCraft//MailCraft//EN".into()];
-    if let Some(m) = method {
-        lines.push(format!("METHOD:{m}"));
+/// Month names (shared with [`recurrence::pattern_text`]).
+pub(crate) fn recurrence_month_names() -> [&'static str; 12] {
+    [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ]
+}
+
+/// "Occurs every Monday effective 10/12/2026 until 12/14/2026 from 9:00 AM to 9:30 AM." for a recurring
+/// appointment; `None` when it does not recur.
+pub fn describe_recurrence(a: &Appointment, tz: i32) -> Option<String> {
+    let rec = a.recurrence.as_ref()?;
+    let pattern = recurrence::pattern_text(&rec.rrule)?;
+    let rule = rrule::Rrule::parse(&rec.rrule).ok()?;
+    let short = |t: DateTime| {
+        let c = t.civil(tz);
+        format!("{}/{}/{}", c.month, c.day, c.year)
+    };
+    let mut text = format!("Occurs {pattern} effective {}", short(a.start));
+    if let Some(c) = rule.count {
+        text.push_str(&format!(" for {c} occurrence{}", if c == 1 { "" } else { "s" }));
+    } else if let Some(u) = rule.until {
+        let unix = match u {
+            rrule::Until::Utc(u) => u,
+            rrule::Until::Date(d) | rrule::Until::Local(d) => {
+                d.saturating_sub(i64::from(tz).saturating_mul(60))
+            }
+        };
+        text.push_str(&format!(" until {}", short(DateTime::from_unix(unix, tz))));
     }
-    for a in appts {
-        vevent_lines(a, tz, stamp, &mut lines);
+    if !a.all_day {
+        text.push_str(&format!(" from {} to {}", ListTime::clock(a.start, tz), ListTime::clock(a.end, tz)));
     }
-    lines.push("END:VCALENDAR".into());
-    let mut out = String::new();
-    for l in &lines {
-        ics_fold(l, &mut out);
+    text.push('.');
+    Some(text)
+}
+
+/// Parses an `occurrence` param (local "YYYY-MM-DDTHH:MM" or unix seconds) and checks that the series has an
+/// occurrence starting then. Returns (start, end).
+fn occurrence_param(s: &Session, a: &Appointment, p: &Value) -> Result<(DateTime, DateTime), CmdError> {
+    if a.recurrence.is_none() {
+        return Err(CmdError::Params("the appointment does not recur".into()));
     }
+    let t = match pim::date(p, "occurrence", s.tz_offset_min)? {
+        Some(Some(t)) => t,
+        _ => return Err(CmdError::Params("`occurrence` (the occurrence's start) is required".into())),
+    };
+    // Long events of a frequent series overlap: look at every occurrence running then.
+    occurrences(a, t, pim::add_secs(t, 1), rrule::MAX_OCCURRENCES)
+        .into_iter()
+        .find(|(st, _)| st.unix == t.unix)
+        .ok_or_else(|| CmdError::Params("the series has no occurrence starting then".into()))
+}
+
+fn series(s: &Session, p: &Value) -> Result<Appointment, CmdError> {
+    let id = pim::require_targets(s, p, Kind::Appointment)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CmdError::Params("no appointment".into()))?;
+    s.mailbox.appointments.get(&id).cloned().ok_or_else(|| CmdError::Params("no appointment".into()))
+}
+
+fn run_occurrences(s: &mut Session, p: &Value) -> CmdResult {
+    let a = series(s, p)?;
+    let tz = s.tz_offset_min;
+    let from = pim::date(p, "from", tz)?.flatten().unwrap_or(a.start);
+    let to = pim::date(p, "to", tz)?.flatten().unwrap_or_else(|| pim::add_secs(from, 366 * pim::DAY_SECS));
+    if to.unix < from.unix {
+        return Err(CmdError::Params("`to` is before `from`".into()));
+    }
+    let max = opt_u64(p, "max").map_or(50, |m| usize::try_from(m).unwrap_or(50)).clamp(1, 1000);
+    let list: Vec<Value> = occurrences(&a, from, to, max)
+        .into_iter()
+        .map(|(st, en)| json!({ "start": pim::datetime_string(st, tz), "end": pim::datetime_string(en, tz) }))
+        .collect();
+    Ok(json!({ "id": a.id.0, "occurrences": list, "text": describe_recurrence(&a, tz) }))
+}
+
+/// Edits one occurrence: the series gets an exception date and the occurrence becomes its own appointment.
+fn run_edit_occurrence(s: &mut Session, p: &Value) -> CmdResult {
+    let mut a = series(s, p)?;
+    if p.get("recurrence").is_some() {
+        return Err(CmdError::Params("an occurrence cannot have its own recurrence; edit the series".into()));
+    }
+    let (start, end) = occurrence_param(s, &a, p)?;
+    let mut ex = a.clone();
+    ex.recurrence = None;
+    ex.start = start;
+    ex.end = end;
+    apply_appointment_fields(s, &mut ex, p)?;
+    if let Some(r) = a.recurrence.as_mut() {
+        if r.exdates.len() >= pim::MAX_LIST {
+            return Err(CmdError::Failed("the series has too many exceptions".into()));
+        }
+        r.exdates.push(start);
+    }
+    let id = ItemId(s.mailbox.alloc_id());
+    ex.id = id;
+    // An exception keeps the series' UID and names the occurrence it replaces (RFC 5545 RECURRENCE-ID).
+    if ex.uid.trim().is_empty() {
+        ex.uid = new_uid(s, a.id, s.now().unix);
+        a.uid = ex.uid.clone();
+    }
+    ex.recurrence_id = Some(start);
+    let series_id = a.id;
+    s.mailbox.appointments.insert(series_id, a);
+    s.mailbox.appointments.insert(id, ex);
+    let tz = s.tz_offset_min;
+    let mut out =
+        s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |x| appointment_json(x, tz));
+    if let Some(o) = out.as_object_mut() {
+        o.insert("series".into(), json!(series_id.0));
+    }
+    Ok(out)
+}
+
+/// Makes the occurrence of series `series` that starts at `rid` an exception (a copy with RECURRENCE-ID, the
+/// series' UID and an EXDATE on the series). `None` when the series has no occurrence then.
+fn split_occurrence(s: &mut Session, series: ItemId, rid: DateTime) -> Option<ItemId> {
+    let a = s.mailbox.appointments.get(&series)?.clone();
+    a.recurrence.as_ref()?;
+    let (start, end) = occurrences(&a, rid, pim::add_secs(rid, 1), rrule::MAX_OCCURRENCES)
+        .into_iter()
+        .find(|(st, _)| st.unix == rid.unix)?;
+    let id = ItemId(s.mailbox.alloc_id());
+    let mut ex = a.clone();
+    ex.id = id;
+    ex.recurrence = None;
+    ex.recurrence_id = Some(start);
+    ex.start = start;
+    ex.end = end;
+    if let Some(r) = s.mailbox.appointments.get_mut(&series).and_then(|x| x.recurrence.as_mut()) {
+        if r.exdates.len() >= pim::MAX_LIST {
+            return None;
+        }
+        r.exdates.push(start);
+    }
+    s.mailbox.appointments.insert(id, ex);
+    Some(id)
+}
+
+/// Deletes one occurrence (adds an exception date to the series).
+fn run_delete_occurrence(s: &mut Session, p: &Value) -> CmdResult {
+    let mut a = series(s, p)?;
+    let (start, _) = occurrence_param(s, &a, p)?;
+    if let Some(r) = a.recurrence.as_mut() {
+        if r.exdates.len() >= pim::MAX_LIST {
+            return Err(CmdError::Failed("the series has too many exceptions".into()));
+        }
+        r.exdates.push(start);
+    }
+    let id = a.id;
+    s.mailbox.appointments.insert(id, a);
+    Ok(json!({ "series": id.0, "deleted": pim::datetime_string(start, s.tz_offset_min) }))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Free/busy (Scheduling Assistant, conflicts)
+// ---------------------------------------------------------------------------------------------------------
+
+/// A busy block from the user's own calendars.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusySlot {
+    pub id: u64,
+    pub start: i64,
+    pub end: i64,
+    /// "busy", "tentative", "outOfOffice", "workingElsewhere".
+    pub show_as: String,
+    pub subject: String,
+    pub private: bool,
+}
+
+/// Most busy blocks returned by one query.
+pub const MAX_BUSY: usize = 2_000;
+
+/// Non-free time on the user's calendars overlapping `[from, to)`, sorted by start. `exclude` leaves out one
+/// appointment (the one being edited), `exclude_uid` every appointment with that UID (a meeting being
+/// answered).
+pub fn free_busy(
+    s: &Session,
+    from: DateTime,
+    to: DateTime,
+    exclude: Option<ItemId>,
+    exclude_uid: Option<&str>,
+) -> Vec<BusySlot> {
+    let mb = &s.mailbox;
+    let mut out = Vec::new();
+    for a in mb.appointments.values() {
+        if a.show_as == BusyStatus::Free
+            || Some(a.id) == exclude
+            || exclude_uid.is_some_and(|u| !u.is_empty() && a.uid.eq_ignore_ascii_case(u))
+            || !mb.folder(a.folder).is_some_and(|f| f.kind == FolderKind::Calendar)
+        {
+            continue;
+        }
+        for (st, en) in occurrences(a, from, to, MAX_BUSY) {
+            out.push(BusySlot {
+                id: a.id.0,
+                start: st.unix,
+                end: en.unix,
+                show_as: show_as_name(a.show_as).to_owned(),
+                subject: a.subject.clone(),
+                private: a.private,
+            });
+            if out.len() >= MAX_BUSY {
+                break;
+            }
+        }
+    }
+    out.sort_by_key(|b| (b.start, b.end, b.id));
+    out.truncate(MAX_BUSY);
     out
+}
+
+fn run_free_busy(s: &mut Session, p: &Value) -> CmdResult {
+    let tz = s.tz_offset_min;
+    let from = pim::date(p, "start", tz)?.flatten().unwrap_or_else(|| pim::local_midnight(s.now(), tz));
+    let to = pim::date(p, "end", tz)?.flatten().unwrap_or_else(|| pim::add_secs(from, pim::DAY_SECS));
+    if to.unix < from.unix || to.unix.saturating_sub(from.unix) > MAX_SPAN_SECS {
+        return Err(CmdError::Params("`end` must follow `start` within ten years".into()));
+    }
+    let exclude = opt_u64(p, "exclude").map(ItemId);
+    let busy = free_busy(s, from, to, exclude, None);
+    Ok(json!({ "busy": busy }))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Meeting requests and responses (iTIP, RFC 5546)
+// ---------------------------------------------------------------------------------------------------------
+
+/// SEQUENCE for updates and cancellations: minutes since 2020-01-01, so it grows without being stored.
+fn update_sequence(now: DateTime) -> u32 {
+    u32::try_from(now.unix.saturating_sub(1_577_836_800).max(0) / 60).unwrap_or(u32::MAX)
+}
+
+fn is_calendar_type(mime: &str) -> bool {
+    let m = mime.trim().to_ascii_lowercase();
+    m.starts_with("text/calendar") || m.starts_with("application/ics")
+}
+
+fn is_ics_name(name: &str) -> bool {
+    name.trim().to_ascii_lowercase().ends_with(".ics")
+}
+
+/// The iCalendar data of a message: its `text/calendar` part (else an attached `.ics` file). `None` when the
+/// message carries none or its source is not available.
+pub fn calendar_data(s: &Session, m: &MailItem) -> Option<Vec<u8>> {
+    if !m.attachments.iter().any(|a| is_calendar_type(&a.mime_type) || is_ics_name(&a.filename)) {
+        return None;
+    }
+    let raw = match &m.raw {
+        Some(r) => r.clone(),
+        None => s.store.as_ref().and_then(|st| st.raw_of(m).ok().flatten())?,
+    };
+    let msg = mailcraft_mime::parse(&raw).ok()?;
+    let parts = msg.parts();
+    let pick = parts
+        .iter()
+        .find(|p| is_calendar_type(p.mime_type()))
+        .or_else(|| parts.iter().find(|p| p.filename.as_deref().is_some_and(is_ics_name)))?;
+    pick.data().map(<[u8]>::to_vec)
+}
+
+/// The scheduling message carried by mail item `mail` (METHOD and first VEVENT).
+pub fn read_itip(s: &Session, mail: ItemId) -> Option<ItipMessage> {
+    let m = s.mailbox.mail.get(&mail)?;
+    let data = calendar_data(s, m)?;
+    itip::read(&data, ImportOptions { local_offset_min: s.tz_offset_min }).ok()
+}
+
+fn response_name(r: ResponseStatus) -> &'static str {
+    match r {
+        ResponseStatus::None => "none",
+        ResponseStatus::Accepted => "accepted",
+        ResponseStatus::Tentative => "tentative",
+        ResponseStatus::Declined => "declined",
+    }
+}
+
+fn is_me(s: &Session, addr: &str) -> bool {
+    let a = addr.trim().to_ascii_lowercase();
+    !a.is_empty()
+        && (s.me.contains(&a)
+            || s.mailbox.accounts.iter().any(|acc| acc.address.trim().eq_ignore_ascii_case(&a)))
+}
+
+/// The user's address for answering `event`: an attendee that is one of the user's addresses, else the
+/// account that received `mail`, else the default account.
+fn my_address(s: &Session, mail: Option<ItemId>, event: &Appointment) -> Option<Address> {
+    if let Some(a) = event.attendees.iter().find(|x| is_me(s, &x.mailbox.addr)) {
+        return Some(a.mailbox.clone());
+    }
+    let account = mail
+        .and_then(|m| s.mailbox.mail.get(&m))
+        .and_then(|m| s.mailbox.folder_account(m.folder))
+        .and_then(|a| s.mailbox.account(a))
+        .or_else(|| s.mailbox.default_account())?;
+    if account.address.trim().is_empty() {
+        return None;
+    }
+    let name = if account.sender_name.trim().is_empty() { None } else { Some(account.sender_name.trim()) };
+    Some(Address::new(name, account.address.trim()))
+}
+
+/// The user's calendar copy of the meeting with `uid` (calendar folders only).
+pub fn find_by_uid(s: &Session, uid: &str) -> Option<ItemId> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    let mb = &s.mailbox;
+    let mut hits: Vec<&Appointment> = mb
+        .appointments
+        .values()
+        .filter(|a| {
+            a.uid.trim().eq_ignore_ascii_case(uid)
+                && mb.folder(a.folder).is_some_and(|f| f.kind == FolderKind::Calendar)
+        })
+        .collect();
+    // The series (recurring) first, then single meetings, then exceptions; oldest first.
+    hits.sort_by_key(|a| (a.recurrence.is_none(), a.recurrence_id.is_some(), a.id));
+    hits.first().map(|a| a.id)
+}
+
+/// What the reading pane shows for a meeting message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingMessage {
+    pub mail: u64,
+    /// "REQUEST", "REPLY", "CANCEL", "COUNTER", "PUBLISH", …
+    pub method: String,
+    pub uid: String,
+    pub subject: String,
+    pub location: String,
+    pub start: i64,
+    pub end: i64,
+    pub all_day: bool,
+    /// "Friday, October 9, 2026 10:00 AM-10:30 AM".
+    pub when: String,
+    pub organizer: String,
+    /// "Occurs every Monday …" for a recurring meeting.
+    pub recurrence: Option<String>,
+    /// The meeting in the user's calendar.
+    pub appointment: Option<u64>,
+    /// The user's response recorded on that copy ("accepted", "tentative", "declined", "none").
+    pub my_response: Option<String>,
+    pub i_am_organizer: bool,
+    /// REPLY / COUNTER: (attendee, response) as sent.
+    pub replies: Vec<(String, String)>,
+    /// Other appointments on the user's calendar at that time.
+    pub conflicts: Vec<String>,
+    /// Accept / Tentative / Decline / Propose New Time apply.
+    pub can_respond: bool,
+    /// The info-bar line.
+    pub info: String,
+}
+
+/// Summary of the scheduling message `msg` (carried by `mail`) against the user's calendar.
+pub fn meeting_message_from(s: &Session, mail: ItemId, msg: &ItipMessage) -> MeetingMessage {
+    let tz = s.tz_offset_min;
+    let ev = &msg.event.appointment;
+    // For one occurrence: its exception, else the series while it still has that occurrence.
+    let mine = match msg.event.recurrence_id {
+        Some(rid) => find_instance(s, &ev.uid, rid).or_else(|| {
+            find_by_uid(s, &ev.uid).filter(|id| {
+                s.mailbox.appointments.get(id).is_some_and(|a| {
+                    a.recurrence.as_ref().is_some_and(|r| !r.exdates.iter().any(|x| x.unix == rid.unix))
+                })
+            })
+        }),
+        None => find_by_uid(s, &ev.uid),
+    }
+    .and_then(|id| s.mailbox.appointments.get(&id));
+    let me = my_address(s, Some(mail), ev);
+    let my_response = mine.map(|a| {
+        let r = me
+            .as_ref()
+            .and_then(|m| a.attendees.iter().find(|x| x.mailbox.same_address(m)))
+            .map_or(ResponseStatus::None, |x| x.response);
+        response_name(r).to_owned()
+    });
+    let i_am_organizer = ev.organizer.as_ref().is_some_and(|o| is_me(s, &o.addr));
+    let replies: Vec<(String, String)> = match msg.method {
+        Method::Reply | Method::Counter => ev
+            .attendees
+            .iter()
+            .map(|x| (x.mailbox.display().to_owned(), response_name(x.response).to_owned()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let conflicts: Vec<String> = if msg.method == Method::Request {
+        free_busy(s, ev.start, ev.end.max(pim::add_secs(ev.start, 1)), None, Some(&ev.uid))
+            .into_iter()
+            .map(|b| if b.subject.trim().is_empty() { "(No subject)".to_owned() } else { b.subject })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let who = |name: &str| if name.trim().is_empty() { "An attendee".to_owned() } else { name.to_owned() };
+    let info = match &msg.method {
+        Method::Request | Method::Add => match my_response.as_deref() {
+            Some("accepted") => "You accepted this meeting.".to_owned(),
+            Some("tentative") => "You tentatively accepted this meeting.".to_owned(),
+            Some("declined") => "You declined this meeting.".to_owned(),
+            _ if !conflicts.is_empty() => {
+                format!("Conflicts with another appointment on your Calendar: {}.", conflicts.join("; "))
+            }
+            Some(_) => "Please respond. This meeting is already on your Calendar.".to_owned(),
+            None => "Please respond.".to_owned(),
+        },
+        Method::Reply => match replies.first() {
+            Some((name, r)) => match r.as_str() {
+                "accepted" => format!("{} has accepted this meeting.", who(name)),
+                "tentative" => format!("{} has tentatively accepted this meeting.", who(name)),
+                "declined" => format!("{} has declined this meeting.", who(name)),
+                _ => format!("{} has not responded yet.", who(name)),
+            },
+            None => "Meeting response.".to_owned(),
+        },
+        Method::Cancel => {
+            if mine.is_some() {
+                "This meeting has been canceled. Remove it from your Calendar.".to_owned()
+            } else {
+                "This meeting has been canceled and is not on your Calendar.".to_owned()
+            }
+        }
+        Method::Counter => {
+            let name = replies.first().map(|(n, _)| who(n)).unwrap_or_else(|| who(""));
+            format!("{name} proposed a new time: {}.", when_text(ev, tz))
+        }
+        Method::Publish => "This is a calendar item. Add it to your Calendar.".to_owned(),
+        other => format!("Calendar message ({}).", other.as_str()),
+    };
+    MeetingMessage {
+        mail: mail.0,
+        method: msg.method.as_str().to_owned(),
+        uid: ev.uid.clone(),
+        subject: ev.subject.clone(),
+        location: ev.location.clone(),
+        start: ev.start.unix,
+        end: ev.end.unix,
+        all_day: ev.all_day,
+        when: when_text(ev, tz),
+        organizer: ev.organizer.as_ref().map(Address::to_display_string).unwrap_or_default(),
+        recurrence: describe_recurrence(ev, tz),
+        appointment: mine.map(|a| a.id.0),
+        my_response,
+        i_am_organizer,
+        replies,
+        conflicts,
+        can_respond: matches!(msg.method, Method::Request | Method::Add) && !i_am_organizer,
+        info,
+    }
+}
+
+/// [`meeting_message_from`] for mail item `mail` (reads and parses its calendar part).
+pub fn meeting_message(s: &Session, mail: ItemId) -> Option<MeetingMessage> {
+    let msg = read_itip(s, mail)?;
+    Some(meeting_message_from(s, mail, &msg))
+}
+
+fn req_meeting_mail(s: &Session, p: &Value) -> Result<(ItemId, ItipMessage), CmdError> {
+    let id = opt_u64(p, "id")
+        .map(ItemId)
+        .or(s.selection.focus)
+        .ok_or_else(|| CmdError::Params("`id` (the meeting message) is required".into()))?;
+    if !s.mailbox.mail.contains_key(&id) {
+        return Err(CmdError::Params(format!("no message {}", id.0)));
+    }
+    let msg =
+        read_itip(s, id).ok_or_else(|| CmdError::Params("the message has no meeting information".into()))?;
+    Ok((id, msg))
+}
+
+fn run_meeting_info(s: &mut Session, p: &Value) -> CmdResult {
+    let (id, msg) = req_meeting_mail(s, p)?;
+    serde_json::to_value(meeting_message_from(s, id, &msg)).map_err(|e| CmdError::Failed(e.to_string()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendMode {
+    Now,
+    Edit,
+    None,
+}
+
+fn send_mode(p: &Value, default: SendMode) -> Result<SendMode, CmdError> {
+    match opt_str(p, "send") {
+        None => Ok(default),
+        Some("now") => Ok(SendMode::Now),
+        Some("edit") => Ok(SendMode::Edit),
+        Some("none") => Ok(SendMode::None),
+        Some(_) => Err(CmdError::Params("`send` must be now|edit|none".into())),
+    }
+}
+
+/// Opens a compose with a `text/calendar` part; sends it straight away for [`SendMode::Now`]. Returns
+/// (compose id, sent).
+fn itip_compose(
+    s: &mut Session,
+    to: String,
+    subject: String,
+    body: &str,
+    method: &str,
+    ics: String,
+    mode: SendMode,
+) -> Result<(Option<u64>, bool), CmdError> {
+    if mode == SendMode::None {
+        return Ok((None, false));
+    }
+    let compose = ComposeState {
+        to,
+        subject,
+        body: Doc::from_plain_text(body),
+        attachments: vec![ComposeAttachment {
+            filename: if method == "CANCEL" { "cancel.ics".into() } else { "invite.ics".into() },
+            mime_type: format!("text/calendar; method={method}"),
+            data: ics.into_bytes(),
+        }],
+        dirty: true,
+        ..Default::default()
+    };
+    let cid = s.open_compose(compose);
+    if mode == SendMode::Now {
+        let r = s.run("compose.send", &json!({ "compose": cid }))?;
+        return Ok((Some(cid), r.get("sent").and_then(Value::as_bool).unwrap_or(false)));
+    }
+    Ok((Some(cid), false))
+}
+
+fn parse_response(p: &Value) -> Result<ResponseStatus, CmdError> {
+    match opt_str(p, "response") {
+        Some("accept" | "accepted") => Ok(ResponseStatus::Accepted),
+        Some("tentative") => Ok(ResponseStatus::Tentative),
+        Some("decline" | "declined") => Ok(ResponseStatus::Declined),
+        _ => Err(CmdError::Params("`response` must be accept|tentative|decline".into())),
+    }
+}
+
+/// Records `response` as `me`'s answer on `a` (adding `me` as a required attendee when missing).
+fn set_my_response(a: &mut Appointment, me: &Address, response: ResponseStatus) {
+    let room = a.attendees.len() < pim::MAX_LIST;
+    match a.attendees.iter_mut().find(|x| x.mailbox.same_address(me)) {
+        Some(x) => x.response = response,
+        None if room => {
+            a.attendees.push(Attendee { mailbox: me.clone(), role: AttendeeRole::Required, response });
+        }
+        None => {}
+    }
+    a.is_meeting = true;
+    if response == ResponseStatus::Tentative {
+        a.show_as = BusyStatus::Tentative;
+    } else if a.show_as == BusyStatus::Tentative {
+        a.show_as = BusyStatus::Busy;
+    }
+}
+
+/// Keeps what the user set on their copy `old` (folder, reminder, categories, private) on the update `a`.
+fn keep_local(a: &mut Appointment, old: &Appointment) {
+    a.id = old.id;
+    a.folder = old.folder;
+    a.reminder_min = old.reminder_min;
+    a.categories = old.categories.clone();
+    a.private = old.private || a.private;
+}
+
+/// The calendar a new meeting from `mail` goes to: its account's Calendar, else the default one.
+fn meeting_folder(s: &Session, mail: ItemId) -> Result<FolderId, CmdError> {
+    let account = s.mailbox.mail.get(&mail).and_then(|m| s.mailbox.folder_account(m.folder));
+    account
+        .and_then(|acc| s.mailbox.role_folder(acc, FolderRole::Calendar))
+        .or_else(|| pim::default_folder(s, Kind::Appointment))
+        .ok_or_else(|| CmdError::Failed("there is no calendar folder".into()))
+}
+
+/// The user's calendar exception for the occurrence of `uid` that started at `rid` (calendar folders only).
+pub fn find_instance(s: &Session, uid: &str, rid: DateTime) -> Option<ItemId> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    let mb = &s.mailbox;
+    mb.appointments
+        .values()
+        .filter(|a| {
+            a.recurrence_id.is_some_and(|r| r.unix == rid.unix)
+                && a.uid.trim().eq_ignore_ascii_case(uid)
+                && mb.folder(a.folder).is_some_and(|f| f.kind == FolderKind::Calendar)
+        })
+        .map(|a| a.id)
+        .min()
+}
+
+/// Stores the exception `a` (its `recurrence_id` set) on the user's calendar, replacing an earlier copy of
+/// the same instance; `series` (the user's copy of the series, if any) loses that occurrence and lends the
+/// exception its folder and reminder. Returns the exception's id.
+fn store_instance(
+    s: &mut Session,
+    mail: ItemId,
+    mut a: Appointment,
+    rid: DateTime,
+    series: Option<ItemId>,
+) -> Result<ItemId, CmdError> {
+    a.recurrence = None;
+    a.recurrence_id = Some(rid);
+    let series_copy = series.and_then(|id| s.mailbox.appointments.get(&id)).cloned();
+    if let Some(sid) = series
+        && let Some(r) = s.mailbox.appointments.get_mut(&sid).and_then(|x| x.recurrence.as_mut())
+        && !r.exdates.iter().any(|x| x.unix == rid.unix)
+        && r.exdates.len() < pim::MAX_LIST
+    {
+        r.exdates.push(rid);
+    }
+    let existing = find_instance(s, &a.uid, rid).and_then(|id| s.mailbox.appointments.get(&id)).cloned();
+    let id = match (existing, series_copy) {
+        (Some(old), _) => {
+            keep_local(&mut a, &old);
+            old.id
+        }
+        (None, Some(series)) => {
+            keep_local(&mut a, &series);
+            ItemId(s.mailbox.alloc_id())
+        }
+        (None, None) => {
+            a.folder = meeting_folder(s, mail)?;
+            a.reminder_min = a.reminder_min.or(Some(DEFAULT_REMINDER_MIN));
+            ItemId(s.mailbox.alloc_id())
+        }
+    };
+    a.id = id;
+    s.mailbox.appointments.insert(id, a);
+    Ok(id)
+}
+
+/// Puts the user's answer to `msg` on the calendar: accepted/tentative meetings are added or updated (local
+/// reminder and categories kept), a declined one is removed. A message about one occurrence of a series
+/// (RECURRENCE-ID) changes only that occurrence; overridden occurrences sent with a series become its
+/// exceptions. Returns (calendar item, the copy answered, the address answered from).
+fn apply_response(
+    s: &mut Session,
+    mail: ItemId,
+    msg: &ItipMessage,
+    response: ResponseStatus,
+) -> Result<(Option<ItemId>, Appointment, Address), CmdError> {
+    let mut a = msg.event.appointment.clone();
+    let me = my_address(s, Some(mail), &a)
+        .ok_or_else(|| CmdError::Failed("there is no account address to answer from".into()))?;
+    set_my_response(&mut a, &me, response);
+    let sender = s.mailbox.mail.get(&mail).and_then(|m| m.from.clone());
+    if a.organizer.is_none() {
+        a.organizer = sender.clone();
+    }
+    if a.uid.trim().is_empty() {
+        let seed = ItemId(s.mailbox.alloc_id());
+        a.uid = new_uid(s, seed, s.now().unix);
+    }
+    let existing = find_by_uid(s, &a.uid);
+    let series = existing.filter(|id| s.mailbox.appointments.get(id).is_some_and(|x| x.recurrence.is_some()));
+    if let Some(rid) = msg.event.recurrence_id {
+        // One occurrence: the series stays; this occurrence becomes (or stops being) an exception.
+        let item = if response == ResponseStatus::Declined {
+            if let Some(sid) = series
+                && let Some(r) = s.mailbox.appointments.get_mut(&sid).and_then(|x| x.recurrence.as_mut())
+                && !r.exdates.iter().any(|x| x.unix == rid.unix)
+                && r.exdates.len() < pim::MAX_LIST
+            {
+                r.exdates.push(rid);
+            }
+            if let Some(old) = find_instance(s, &a.uid, rid) {
+                pim::delete(s, &[old]);
+            }
+            None
+        } else {
+            Some(store_instance(s, mail, a.clone(), rid, series)?)
+        };
+        mark_read(s, mail);
+        return Ok((item, a, me));
+    }
+    if response == ResponseStatus::Declined {
+        if let Some(id) = existing {
+            let mut gone = vec![id];
+            if let Some(x) = s.mailbox.appointments.get(&id) {
+                gone.extend(exceptions_of(s, x));
+            }
+            pim::delete(s, &gone);
+        }
+        mark_read(s, mail);
+        return Ok((None, a, me));
+    }
+    let old = existing.and_then(|id| s.mailbox.appointments.get(&id)).cloned();
+    let id = match old {
+        Some(old) => {
+            keep_local(&mut a, &old);
+            old.id
+        }
+        None => {
+            a.folder = meeting_folder(s, mail)?;
+            a.reminder_min = a.reminder_min.or(Some(DEFAULT_REMINDER_MIN));
+            ItemId(s.mailbox.alloc_id())
+        }
+    };
+    a.id = id;
+    a.recurrence_id = None;
+    s.mailbox.appointments.insert(id, a.clone());
+    if a.recurrence.is_some() {
+        for o in &msg.overrides {
+            let Some(rid) = o.recurrence_id else { continue };
+            let mut x = o.appointment.clone();
+            set_my_response(&mut x, &me, response);
+            if x.organizer.is_none() {
+                x.organizer = a.organizer.clone();
+            }
+            x.uid = a.uid.clone();
+            store_instance(s, mail, x, rid, Some(id))?;
+        }
+    }
+    mark_read(s, mail);
+    Ok((Some(id), a, me))
+}
+
+fn mark_read(s: &mut Session, mail: ItemId) {
+    if let Some(m) = s.mailbox.mail.get_mut(&mail) {
+        m.read = true;
+    }
+}
+
+fn response_subject(r: ResponseStatus, subject: &str) -> String {
+    let prefix = match r {
+        ResponseStatus::Accepted => "Accepted",
+        ResponseStatus::Tentative => "Tentative",
+        ResponseStatus::Declined => "Declined",
+        ResponseStatus::None => "Response",
+    };
+    format!("{prefix}: {subject}")
+}
+
+/// `calendar.respond {id, response, send?, comment?}`: Accept / Tentative / Decline a meeting request.
+fn run_respond(s: &mut Session, p: &Value) -> CmdResult {
+    let (mail, msg) = req_meeting_mail(s, p)?;
+    if !matches!(msg.method, Method::Request | Method::Add) {
+        return Err(CmdError::Params("only meeting requests can be answered".into()));
+    }
+    let response = parse_response(p)?;
+    let mode = send_mode(p, SendMode::Now)?;
+    let comment = pim::text(p, "comment")?.unwrap_or_default();
+    let (item, answered, me) = apply_response(s, mail, &msg, response)?;
+    let organizer = answered.organizer.clone();
+    let mut compose = None;
+    let mut sent = false;
+    if let Some(org) = organizer.filter(|_| mode != SendMode::None) {
+        let ics = itip::reply(&answered, &me, response, msg.event.sequence, s.now());
+        let subject = response_subject(response, &answered.subject);
+        (compose, sent) = itip_compose(s, org.to_display_string(), subject, &comment, "REPLY", ics, mode)?;
+    }
+    Ok(json!({
+        "appointment": item.map(|i| i.0),
+        "response": response_name(response),
+        "compose": compose,
+        "sent": sent,
+    }))
+}
+
+/// `calendar.proposeNewTime {id, start, end, response?: tentative|decline, send?, comment?}`: answers the
+/// request (Tentative by default) and sends the organizer a COUNTER with the proposed time.
+fn run_propose_new_time(s: &mut Session, p: &Value) -> CmdResult {
+    let (mail, msg) = req_meeting_mail(s, p)?;
+    if !matches!(msg.method, Method::Request | Method::Add) {
+        return Err(CmdError::Params("only meeting requests can be answered".into()));
+    }
+    let response = match opt_str(p, "response") {
+        None => ResponseStatus::Tentative,
+        Some(_) => match parse_response(p)? {
+            ResponseStatus::Accepted => {
+                return Err(CmdError::Params("propose a new time with tentative or decline".into()));
+            }
+            r => r,
+        },
+    };
+    let tz = s.tz_offset_min;
+    let start =
+        pim::date(p, "start", tz)?.flatten().ok_or_else(|| CmdError::Params("`start` is required".into()))?;
+    let end =
+        pim::date(p, "end", tz)?.flatten().ok_or_else(|| CmdError::Params("`end` is required".into()))?;
+    if end.unix < start.unix || end.unix.saturating_sub(start.unix) > MAX_SPAN_SECS {
+        return Err(CmdError::Params("the proposed end is before the start".into()));
+    }
+    let mode = send_mode(p, SendMode::Edit)?;
+    let comment = pim::text(p, "comment")?.unwrap_or_default();
+    let (item, answered, me) = apply_response(s, mail, &msg, response)?;
+    let mut proposal = answered.clone();
+    proposal.start = DateTime::from_unix(start.unix, answered.start.offset_min);
+    proposal.end = DateTime::from_unix(end.unix, answered.start.offset_min);
+    proposal.reminder_min = None;
+    proposal.attendees.retain(|x| x.mailbox.same_address(&me));
+    let mut compose = None;
+    let mut sent = false;
+    if let Some(org) = answered.organizer.clone().filter(|_| mode != SendMode::None) {
+        let ics = mailcraft_formats::ics::write(&[&proposal], &[], Some(&Method::Counter), s.now());
+        let body = if comment.trim().is_empty() {
+            format!("Proposed new time: {}", when_text(&proposal, tz))
+        } else {
+            format!("Proposed new time: {}\n\n{comment}", when_text(&proposal, tz))
+        };
+        let subject = format!("New Time Proposed: {}", answered.subject);
+        (compose, sent) = itip_compose(s, org.to_display_string(), subject, &body, "COUNTER", ics, mode)?;
+    }
+    Ok(json!({
+        "appointment": item.map(|i| i.0),
+        "response": response_name(response),
+        "proposed": { "start": pim::datetime_string(start, tz), "end": pim::datetime_string(end, tz) },
+        "compose": compose,
+        "sent": sent,
+    }))
+}
+
+/// `calendar.processReply {id}`: records an attendee's REPLY on the organizer's meeting (tracking).
+fn run_process_reply(s: &mut Session, p: &Value) -> CmdResult {
+    let (_, msg) = req_meeting_mail(s, p)?;
+    if msg.method != Method::Reply {
+        return Err(CmdError::Params("the message is not a meeting response".into()));
+    }
+    // A reply about one occurrence goes on its exception when there is one.
+    let uid = &msg.event.appointment.uid;
+    let id = msg
+        .event
+        .recurrence_id
+        .and_then(|rid| find_instance(s, uid, rid))
+        .or_else(|| find_by_uid(s, uid))
+        .ok_or_else(|| CmdError::Params("the meeting is not on your Calendar".into()))?;
+    let mut a =
+        s.mailbox.appointments.get(&id).cloned().ok_or_else(|| CmdError::Failed("no meeting".into()))?;
+    let n = itip::apply_reply(&mut a, &msg);
+    let tracking = tracking_json(&a);
+    s.mailbox.appointments.insert(id, a);
+    Ok(json!({ "appointment": id.0, "updated": n, "tracking": tracking }))
+}
+
+/// `calendar.removeFromCalendar {id}`: applies a CANCEL (the meeting, or the one canceled occurrence).
+fn run_remove_canceled(s: &mut Session, p: &Value) -> CmdResult {
+    let (_, msg) = req_meeting_mail(s, p)?;
+    if msg.method != Method::Cancel {
+        return Err(CmdError::Params("the message is not a meeting cancellation".into()));
+    }
+    let uid = msg.event.appointment.uid.clone();
+    let id =
+        find_by_uid(s, &uid).ok_or_else(|| CmdError::Params("the meeting is not on your Calendar".into()))?;
+    if let Some(occ) = msg.event.recurrence_id {
+        // One occurrence: the series loses it, and an exception for it goes.
+        let mut series = false;
+        if let Some(r) = s.mailbox.appointments.get_mut(&id).and_then(|a| a.recurrence.as_mut()) {
+            series = true;
+            if r.exdates.len() < pim::MAX_LIST && !r.exdates.iter().any(|x| x.unix == occ.unix) {
+                r.exdates.push(occ);
+            }
+        }
+        let instance = find_instance(s, &uid, occ);
+        let removed = instance.map(|x| pim::delete(s, &[x])).unwrap_or_default();
+        if series || !removed.is_empty() {
+            return Ok(json!({
+                "appointment": id.0,
+                "occurrence": pim::datetime_string(occ, s.tz_offset_min),
+                "removed": pim::ids_json(&removed),
+            }));
+        }
+    }
+    let mut gone = vec![id];
+    if let Some(a) = s.mailbox.appointments.get(&id) {
+        gone.extend(exceptions_of(s, a));
+    }
+    let removed = pim::delete(s, &gone);
+    Ok(json!({ "removed": pim::ids_json(&removed) }))
+}
+
+/// `calendar.acceptProposal {id}`: the organizer takes a COUNTER's time and sends the update.
+fn run_accept_proposal(s: &mut Session, p: &Value) -> CmdResult {
+    let (_, msg) = req_meeting_mail(s, p)?;
+    if msg.method != Method::Counter {
+        return Err(CmdError::Params("the message does not propose a new time".into()));
+    }
+    let uid = msg.event.appointment.uid.clone();
+    let found =
+        find_by_uid(s, &uid).ok_or_else(|| CmdError::Params("the meeting is not on your Calendar".into()))?;
+    // A proposal for one occurrence moves only that occurrence (its exception, made here if need be).
+    let id = match msg.event.recurrence_id {
+        Some(rid) => match find_instance(s, &uid, rid) {
+            Some(x) => x,
+            None => split_occurrence(s, found, rid)
+                .ok_or_else(|| CmdError::Params("the series has no occurrence at that time".into()))?,
+        },
+        None => found,
+    };
+    let ev = &msg.event.appointment;
+    if let Some(a) = s.mailbox.appointments.get_mut(&id) {
+        a.start = ev.start;
+        a.end = if ev.end.unix < ev.start.unix { ev.start } else { ev.end };
+        a.all_day = ev.all_day;
+    }
+    let compose = meeting_compose_seq(s, id, update_sequence(s.now()));
+    Ok(json!({ "appointment": id.0, "compose": compose }))
+}
+
+fn tracking_json(a: &Appointment) -> Value {
+    Value::Array(
+        a.attendees
+            .iter()
+            .map(|x| {
+                json!({
+                    "name": x.mailbox.name.clone().unwrap_or_default(),
+                    "address": x.mailbox.addr,
+                    "role": match x.role {
+                        AttendeeRole::Required => "required",
+                        AttendeeRole::Optional => "optional",
+                        AttendeeRole::Resource => "resource",
+                    },
+                    "response": response_name(x.response),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// `calendar.tracking {id}`: attendee responses of a meeting.
+fn run_tracking(s: &mut Session, p: &Value) -> CmdResult {
+    let a = series(s, p)?;
+    let count = |r: ResponseStatus| a.attendees.iter().filter(|x| x.response == r).count();
+    Ok(json!({
+        "id": a.id.0,
+        "organizer": a.organizer.as_ref().map(Address::to_display_string),
+        "attendees": tracking_json(&a),
+        "accepted": count(ResponseStatus::Accepted),
+        "tentative": count(ResponseStatus::Tentative),
+        "declined": count(ResponseStatus::Declined),
+        "none": count(ResponseStatus::None),
+    }))
+}
+
+/// `calendar.sendUpdate {id}`: opens the updated invitation for a meeting the user organizes.
+fn run_send_update(s: &mut Session, p: &Value) -> CmdResult {
+    let a = series(s, p)?;
+    if a.attendees.is_empty() {
+        return Err(CmdError::Params("the appointment has no attendees".into()));
+    }
+    let compose = meeting_compose_seq(s, a.id, update_sequence(s.now()))
+        .ok_or_else(|| CmdError::Failed("the update could not be created".into()))?;
+    Ok(json!({ "id": a.id.0, "compose": compose }))
+}
+
+/// `calendar.cancelMeeting {id, send?, comment?}`: the organizer cancels a meeting: a CANCEL goes to the
+/// attendees and the meeting leaves the calendar.
+fn run_cancel_meeting(s: &mut Session, p: &Value) -> CmdResult {
+    let a = series(s, p)?;
+    if a.attendees.is_empty() {
+        return Err(CmdError::Params("the appointment has no attendees".into()));
+    }
+    let mode = send_mode(p, SendMode::Edit)?;
+    let comment = pim::text(p, "comment")?.unwrap_or_default();
+    let to = a.attendees.iter().map(|x| x.mailbox.to_display_string()).collect::<Vec<_>>().join("; ");
+    let ics = itip::cancel(&a, update_sequence(s.now()), s.now());
+    let (compose, sent) =
+        itip_compose(s, to, format!("Canceled: {}", a.subject), &comment, "CANCEL", ics, mode)?;
+    let removed = pim::delete(s, &[a.id]);
+    Ok(json!({ "removed": pim::ids_json(&removed), "compose": compose, "sent": sent }))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1598,6 +2932,154 @@ pub fn specs() -> Vec<CommandSpec> {
             r#"{"name": string, "on"?: bool, "clear"?: bool, "id"?: number, "ids"?: [number]}"#,
             true,
             run_categorize,
+        ),
+        // Recurrence
+        spec(
+            "calendar.occurrences",
+            "Show Occurrences",
+            "Calendar › Item › Recurrence",
+            "",
+            r#"{"id": number, "from"?: "YYYY-MM-DDTHH:MM", "to"?: "YYYY-MM-DDTHH:MM", "max"?: number}"#,
+            false,
+            run_occurrences,
+        ),
+        spec(
+            "calendar.editOccurrence",
+            "Open This Occurrence",
+            "Calendar › Item › Recurrence",
+            "",
+            r#"{"id": number, "occurrence": "YYYY-MM-DDTHH:MM" | unix, ...appointment fields except recurrence}"#,
+            true,
+            run_edit_occurrence,
+        ),
+        spec(
+            "calendar.deleteOccurrence",
+            "Delete Occurrence",
+            "Calendar › Item › Delete",
+            "",
+            r#"{"id": number, "occurrence": "YYYY-MM-DDTHH:MM" | unix}"#,
+            true,
+            run_delete_occurrence,
+        ),
+        spec(
+            "calendar.freeBusy",
+            "Scheduling Assistant",
+            "Meeting › Show",
+            "",
+            r#"{"start"?: "YYYY-MM-DDTHH:MM", "end"?: "YYYY-MM-DDTHH:MM", "exclude"?: number}"#,
+            false,
+            run_free_busy,
+        ),
+        // Meetings (iTIP)
+        spec(
+            "calendar.meetingInfo",
+            "Meeting Information",
+            "Reading Pane › Meeting",
+            "",
+            r#"{"id": number (meeting message)}"#,
+            false,
+            run_meeting_info,
+        ),
+        spec(
+            "calendar.respond",
+            "Respond to Meeting",
+            "Reading Pane › Meeting › Accept / Tentative / Decline",
+            "",
+            r#"{"id": number, "response": "accept|tentative|decline", "send"?: "now|edit|none", "comment"?: string}"#,
+            true,
+            run_respond,
+        ),
+        spec(
+            "calendar.proposeNewTime",
+            "Propose New Time",
+            "Reading Pane › Meeting › Propose New Time",
+            "",
+            r#"{"id": number, "start": "YYYY-MM-DDTHH:MM", "end": "YYYY-MM-DDTHH:MM", "response"?: "tentative|decline", "send"?: "now|edit|none", "comment"?: string}"#,
+            true,
+            run_propose_new_time,
+        ),
+        spec(
+            "calendar.processReply",
+            "Record Meeting Response",
+            "Reading Pane › Meeting",
+            "",
+            r#"{"id": number (meeting response message)}"#,
+            true,
+            run_process_reply,
+        ),
+        spec(
+            "calendar.removeFromCalendar",
+            "Remove from Calendar",
+            "Reading Pane › Meeting",
+            "",
+            r#"{"id": number (meeting cancellation message)}"#,
+            true,
+            run_remove_canceled,
+        ),
+        spec(
+            "calendar.acceptProposal",
+            "Accept Proposal",
+            "Reading Pane › Meeting",
+            "",
+            r#"{"id": number (new time proposal message)}"#,
+            true,
+            run_accept_proposal,
+        ),
+        spec("calendar.tracking", "Tracking", "Meeting › Show", "", r#"{"id": number}"#, false, run_tracking),
+        spec(
+            "calendar.sendUpdate",
+            "Send Update",
+            "Meeting › Actions",
+            "",
+            r#"{"id": number}"#,
+            false,
+            run_send_update,
+        ),
+        spec(
+            "calendar.cancelMeeting",
+            "Cancel Meeting",
+            "Meeting › Actions",
+            "",
+            r#"{"id": number, "send"?: "now|edit|none", "comment"?: string}"#,
+            true,
+            run_cancel_meeting,
+        ),
+        // Reminders (View › Window › Reminders Window)
+        spec(
+            "calendar.reminders",
+            "Reminders",
+            "View › Window › Reminders Window",
+            "",
+            r#"{"state"?: ReminderState}"#,
+            false,
+            reminders::run_list,
+        ),
+        spec(
+            "calendar.dismissReminder",
+            "Dismiss",
+            "Reminders Window",
+            "",
+            r#"{"keys"?: [string], "all"?: bool, "state"?: ReminderState}"#,
+            true,
+            reminders::run_dismiss,
+        ),
+        spec(
+            "calendar.snoozeReminder",
+            "Snooze",
+            "Reminders Window",
+            "",
+            r#"{"keys"?: [string], "all"?: bool, "minutes"?: number, "state"?: ReminderState}"#,
+            true,
+            reminders::run_snooze,
+        ),
+        spec(
+            "calendar.openReminderItem",
+            "Open Item",
+            "Reminders Window",
+            "",
+            r#"{"key": string}"#,
+            false,
+            reminders::run_open,
         ),
     ]
 }
@@ -1993,15 +3475,812 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ics_lines_fold_at_75_octets() {
-        let mut out = String::new();
-        let long = "DESCRIPTION:".to_owned() + &"é".repeat(100);
-        ics_fold(&long, &mut out);
-        for line in out.split("\r\n") {
-            assert!(line.len() <= 75, "{}", line.len());
-        }
-        assert_eq!(out.replace("\r\n ", ""), long + "\r\n");
+    fn ics_escape_escapes_text() {
         assert_eq!(ics_escape("a;b,c\\d\ne"), "a\\;b\\,c\\\\d\\ne");
+    }
+
+    // -----------------------------------------------------------------------------------------------------
+    // Recurrence
+    // -----------------------------------------------------------------------------------------------------
+
+    use recurrence::{Pattern, RangeEnd, RecurrenceForm};
+
+    fn t(text: &str) -> DateTime {
+        pim::parse_local(text, 0).unwrap()
+    }
+
+    #[test]
+    fn recurrence_form_writes_and_reads_rrules() {
+        let start = t("2026-10-12T09:00"); // a Monday
+        let base = RecurrenceForm::for_start(start, 0);
+        assert_eq!(base.pattern, Pattern::Weekly);
+        assert_eq!(base.weekdays, vec![0]);
+        assert_eq!(base.day, 12);
+        assert_eq!(base.ordinal, 2);
+        assert_eq!(base.month, 10);
+        let cases: Vec<(RecurrenceForm, &str)> = vec![
+            (
+                RecurrenceForm {
+                    weekdays: vec![2, 0],
+                    interval: 2,
+                    end: RangeEnd::After,
+                    count: 5,
+                    ..base.clone()
+                },
+                "FREQ=WEEKLY;INTERVAL=2;COUNT=5;BYDAY=MO,WE",
+            ),
+            (
+                RecurrenceForm { pattern: Pattern::Daily, every_weekday: true, ..base.clone() },
+                "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            ),
+            (
+                RecurrenceForm { pattern: Pattern::Daily, interval: 3, ..base.clone() },
+                "FREQ=DAILY;INTERVAL=3",
+            ),
+            (RecurrenceForm { pattern: Pattern::Monthly, ..base.clone() }, "FREQ=MONTHLY;BYMONTHDAY=12"),
+            (
+                RecurrenceForm {
+                    pattern: Pattern::Monthly,
+                    by_weekday: true,
+                    ordinal: -1,
+                    weekday: 4,
+                    ..base.clone()
+                },
+                "FREQ=MONTHLY;BYDAY=-1FR",
+            ),
+            (
+                RecurrenceForm { pattern: Pattern::Yearly, ..base.clone() },
+                "FREQ=YEARLY;BYMONTHDAY=12;BYMONTH=10",
+            ),
+            (
+                RecurrenceForm {
+                    pattern: Pattern::Yearly,
+                    by_weekday: true,
+                    ordinal: 2,
+                    weekday: 1,
+                    month: 3,
+                    ..base.clone()
+                },
+                "FREQ=YEARLY;BYDAY=2TU;BYMONTH=3",
+            ),
+            (
+                RecurrenceForm { end: RangeEnd::By, until: "2026-12-14".into(), ..base.clone() },
+                "FREQ=WEEKLY;UNTIL=20261214T235959Z;BYDAY=MO",
+            ),
+        ];
+        for (form, want) in cases {
+            let rule = form.to_rrule(false, 0).unwrap();
+            assert_eq!(rule, want);
+            let back = RecurrenceForm::from_rrule(&rule, start, 0);
+            assert_eq!(back.to_rrule(false, 0).unwrap(), want, "{back:?}");
+        }
+        // All-day events end on a DATE; a UTC offset moves the timed UNTIL to the local day's end.
+        let by = RecurrenceForm { end: RangeEnd::By, until: "2026-12-14".into(), ..base.clone() };
+        assert_eq!(by.to_rrule(true, 0).unwrap(), "FREQ=WEEKLY;UNTIL=20261214;BYDAY=MO");
+        assert_eq!(by.to_rrule(false, -300).unwrap(), "FREQ=WEEKLY;UNTIL=20261215T045959Z;BYDAY=MO");
+        assert_eq!(
+            RecurrenceForm::from_rrule("FREQ=WEEKLY;UNTIL=20261215T045959Z;BYDAY=MO", start, -300).until,
+            "2026-12-14"
+        );
+        // Bad forms are refused.
+        assert!(RecurrenceForm { weekdays: vec![], ..base.clone() }.to_rrule(false, 0).is_err());
+        assert!(
+            RecurrenceForm { pattern: Pattern::Monthly, day: 32, ..base.clone() }.to_rrule(false, 0).is_err()
+        );
+        assert!(
+            RecurrenceForm { end: RangeEnd::After, count: 0, ..base.clone() }.to_rrule(false, 0).is_err()
+        );
+        assert!(
+            RecurrenceForm { end: RangeEnd::By, until: "soon".into(), ..base.clone() }
+                .to_rrule(false, 0)
+                .is_err()
+        );
+        // Junk rules fall back to the defaults.
+        assert_eq!(RecurrenceForm::from_rrule("FREQ=NEVER", start, 0), base);
+    }
+
+    #[test]
+    fn recurrence_text() {
+        let mut s = session();
+        let r = s
+            .run(
+                "calendar.newAppointment",
+                &json!({"subject": "1:1", "start": "2026-10-12T09:00", "durationMin": 30,
+                        "recurrence": {"pattern": "weekly", "weekdays": [0, 2], "end": "by", "until": "2026-12-14"}}),
+            )
+            .unwrap();
+        assert_eq!(
+            r["recurrenceText"],
+            "Occurs every Monday and Wednesday effective 10/12/2026 until 12/14/2026 from 9:00 AM to 9:30 AM."
+        );
+        for (rule, want) in [
+            ("FREQ=DAILY;INTERVAL=2", "every 2 days"),
+            ("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", "every weekday"),
+            ("FREQ=MONTHLY;BYMONTHDAY=12", "day 12 of every month"),
+            ("FREQ=MONTHLY;INTERVAL=3;BYDAY=-1FR", "the last Friday of every 3 months"),
+            ("FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=9", "every October 9"),
+            ("FREQ=YEARLY;BYMONTH=3;BYDAY=2TU", "the second Tuesday of March every year"),
+        ] {
+            assert_eq!(recurrence::pattern_text(rule).as_deref(), Some(want), "{rule}");
+        }
+        assert!(recurrence::pattern_text("junk").is_none());
+    }
+
+    #[test]
+    fn recurrence_param_validates_and_keeps_exceptions() {
+        let mut s = session();
+        let id = s
+            .run(
+                "calendar.newAppointment",
+                &json!({"subject": "S", "start": "2026-10-12T09:00", "recurrence": "FREQ=DAILY;COUNT=5"}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        assert!(matches!(
+            s.run("calendar.update", &json!({"id": id, "recurrence": "FREQ=HOURLY"})),
+            Err(CmdError::Params(_))
+        ));
+        assert!(matches!(
+            s.run("calendar.update", &json!({"id": id, "recurrence": {"pattern": "weekly", "weekdays": []}})),
+            Err(CmdError::Params(_))
+        ));
+        s.run("calendar.deleteOccurrence", &json!({"id": id, "occurrence": "2026-10-13T09:00"})).unwrap();
+        // Saving the same rule again (the editor does) keeps the deleted occurrence deleted.
+        s.run("calendar.update", &json!({"id": id, "subject": "S2", "recurrence": "FREQ=DAILY;COUNT=5"}))
+            .unwrap();
+        let r = s.run("calendar.occurrences", &json!({"id": id})).unwrap();
+        let starts: Vec<&str> =
+            r["occurrences"].as_array().unwrap().iter().map(|o| o["start"].as_str().unwrap()).collect();
+        assert_eq!(starts, ["2026-10-12T09:00", "2026-10-14T09:00", "2026-10-15T09:00", "2026-10-16T09:00"]);
+        // A new rule starts over.
+        s.run("calendar.update", &json!({"id": id, "recurrence": "FREQ=DAILY;COUNT=2"})).unwrap();
+        assert!(s.mailbox.appointments[&ItemId(id)].recurrence.as_ref().unwrap().exdates.is_empty());
+    }
+
+    #[test]
+    fn edit_and_delete_one_occurrence() {
+        let mut s = session();
+        let id = s
+            .run("calendar.newAppointment", &json!({"subject": "Standup", "start": "2026-10-12T09:00", "durationMin": 15, "recurrence": "FREQ=WEEKLY;BYDAY=MO,WE,FR"}))
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let r = s
+            .run("calendar.editOccurrence", &json!({"id": id, "occurrence": "2026-10-14T09:00", "start": "2026-10-14T11:00", "location": "Café"}))
+            .unwrap();
+        assert_eq!(r["series"], id);
+        assert_eq!(r["start"], "2026-10-14T11:00");
+        assert_eq!(r["end"], "2026-10-14T11:15");
+        assert_eq!(r["recurrence"], Value::Null);
+        let ex = ItemId(r["id"].as_u64().unwrap());
+        assert_eq!(s.mailbox.appointments[&ex].location, "Café");
+        let week = json!({"id": id, "from": "2026-10-12", "to": "2026-10-19"});
+        let r = s.run("calendar.occurrences", &week).unwrap();
+        assert_eq!(r["occurrences"].as_array().unwrap().len(), 2, "{r}");
+        s.run("calendar.deleteOccurrence", &json!({"id": id, "occurrence": "2026-10-16T09:00"})).unwrap();
+        let r = s.run("calendar.occurrences", &week).unwrap();
+        assert_eq!(r["occurrences"].as_array().unwrap().len(), 1);
+        // Not an occurrence / not recurring / recurrence on an occurrence.
+        for bad in [
+            json!({"id": id, "occurrence": "2026-10-13T09:00"}),
+            json!({"id": id}),
+            json!({"id": ex.0, "occurrence": "2026-10-14T11:00"}),
+        ] {
+            assert!(matches!(s.run("calendar.deleteOccurrence", &bad), Err(CmdError::Params(_))), "{bad}");
+        }
+        assert!(matches!(
+            s.run(
+                "calendar.editOccurrence",
+                &json!({"id": id, "occurrence": "2026-10-19T09:00", "recurrence": "FREQ=DAILY"})
+            ),
+            Err(CmdError::Params(_))
+        ));
+        assert!(s.mailbox.validate().is_empty());
+    }
+
+    #[test]
+    fn series_starts_on_its_first_occurrence() {
+        let mut s = session();
+        // Saved on a Wednesday with an every-Monday pattern: the series starts the next Monday.
+        let r = s
+            .run(
+                "calendar.newAppointment",
+                &json!({"subject": "1:1", "start": "2026-10-14T09:00", "durationMin": 30,
+                        "recurrence": {"pattern": "weekly", "weekdays": [0], "end": "after", "count": 3}}),
+            )
+            .unwrap();
+        assert_eq!(r["start"], "2026-10-19T09:00");
+        assert_eq!(r["end"], "2026-10-19T09:30");
+        let id = ItemId(r["id"].as_u64().unwrap());
+        let got = s.run("calendar.occurrences", &json!({"id": id.0})).unwrap();
+        let list: Vec<&str> =
+            got["occurrences"].as_array().unwrap().iter().map(|o| o["start"].as_str().unwrap()).collect();
+        assert_eq!(list, ["2026-10-19T09:00", "2026-10-26T09:00", "2026-11-02T09:00"]);
+        // Day 31 of every month from the 12th: first on the 31st, then months that have one.
+        let r = s
+            .run("calendar.newAppointment", &json!({"subject": "Close books", "start": "2026-10-12T16:00", "recurrence": "FREQ=MONTHLY;BYMONTHDAY=31"}))
+            .unwrap();
+        assert_eq!(r["start"], "2026-10-31T16:00");
+        let got = s.run("calendar.occurrences", &json!({"id": r["id"], "max": 3})).unwrap();
+        let list: Vec<&str> =
+            got["occurrences"].as_array().unwrap().iter().map(|o| o["start"].as_str().unwrap()).collect();
+        assert_eq!(list, ["2026-10-31T16:00", "2026-12-31T16:00", "2027-01-31T16:00"]);
+        // A start already on the pattern stays; a pattern ending before its first day leaves the start alone.
+        let r = s
+            .run(
+                "calendar.newAppointment",
+                &json!({"subject": "Fri", "start": "2026-10-16T09:00", "recurrence": "FREQ=WEEKLY;BYDAY=FR"}),
+            )
+            .unwrap();
+        assert_eq!(r["start"], "2026-10-16T09:00");
+        let r = s
+            .run("calendar.newAppointment", &json!({"subject": "Never", "start": "2026-10-14T09:00", "recurrence": "FREQ=WEEKLY;BYDAY=MO;UNTIL=20261016T000000Z"}))
+            .unwrap();
+        assert_eq!(r["start"], "2026-10-14T09:00");
+    }
+
+    #[test]
+    fn long_occurrences_that_overlap_can_be_deleted() {
+        let mut s = session();
+        let id = s
+            .run("calendar.newAppointment", &json!({"subject": "Shift", "start": "2026-10-12T09:00", "durationMin": 6 * 24 * 60, "recurrence": "FREQ=DAILY;COUNT=10"}))
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        // Five earlier occurrences are still running when the 10/17 one starts.
+        s.run("calendar.deleteOccurrence", &json!({"id": id, "occurrence": "2026-10-17T09:00"})).unwrap();
+        let r = s
+            .run("calendar.occurrences", &json!({"id": id, "from": "2026-10-01", "to": "2026-11-01"}))
+            .unwrap();
+        assert_eq!(r["occurrences"].as_array().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn exceptions_keep_the_series_uid_and_go_with_it() {
+        let mut s = session();
+        let id = s
+            .run("calendar.newAppointment", &json!({"subject": "Standup", "start": "2026-10-12T09:00", "durationMin": 15, "recurrence": "FREQ=DAILY;COUNT=5"}))
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let r = s
+            .run(
+                "calendar.editOccurrence",
+                &json!({"id": id, "occurrence": "2026-10-13T09:00", "start": "2026-10-13T10:00"}),
+            )
+            .unwrap();
+        let ex = ItemId(r["id"].as_u64().unwrap());
+        let series = &s.mailbox.appointments[&ItemId(id)];
+        let x = &s.mailbox.appointments[&ex];
+        assert_eq!(x.uid, series.uid);
+        assert_eq!(x.recurrence_id.map(|t| pim::datetime_string(t, 0)).as_deref(), Some("2026-10-13T09:00"));
+        s.run("calendar.deleteOccurrence", &json!({"id": id, "occurrence": "2026-10-14T09:00"})).unwrap();
+        // Shared as iCalendar, the deleted occurrence stays deleted and the moved one stays moved.
+        let r = s.run("calendar.share", &json!({"calendar": "calendar"})).unwrap();
+        let data = s.composes[&r["compose"].as_u64().unwrap()].attachments[0].data.clone();
+        let cal = mailcraft_formats::ics::read(&data, ImportOptions::default()).unwrap();
+        let master = cal.events.iter().find(|e| e.appointment.recurrence.is_some()).unwrap();
+        let back = mailcraft_formats::ics::expand_appointment(
+            &master.appointment,
+            t("2026-10-01T00:00"),
+            t("2026-11-01T00:00"),
+            20,
+        );
+        let back: Vec<String> = back.iter().map(|(st, _)| pim::datetime_string(*st, 0)).collect();
+        assert_eq!(back, ["2026-10-12T09:00", "2026-10-15T09:00", "2026-10-16T09:00"]);
+        let moved = cal.events.iter().find(|e| e.recurrence_id.is_some()).unwrap();
+        assert_eq!(pim::datetime_string(moved.appointment.start, 0), "2026-10-13T10:00");
+        // Deleting the series deletes its exception too.
+        s.run("calendar.delete", &json!({"id": id})).unwrap();
+        let cal_folder = role(&s, FolderRole::Calendar);
+        assert_ne!(s.mailbox.appointments[&ex].folder, cal_folder);
+        // A copy of an exception stands alone.
+        let copy = s.run("calendar.copy", &json!({"id": ex.0, "folder": cal_folder.0})).unwrap();
+        let _ = copy;
+        assert!(
+            s.mailbox
+                .appointments
+                .values()
+                .filter(|a| a.folder == cal_folder)
+                .all(|a| a.recurrence_id.is_none())
+        );
+    }
+
+    #[test]
+    fn free_busy_lists_own_busy_time() {
+        let mut s = session();
+        s.run(
+            "calendar.newAppointment",
+            &json!({"subject": "A", "start": "2026-10-12T09:00", "durationMin": 60}),
+        )
+        .unwrap();
+        s.run(
+            "calendar.newAppointment",
+            &json!({"subject": "Free", "start": "2026-10-12T10:00", "showAs": "free"}),
+        )
+        .unwrap();
+        s.run("calendar.newAppointment", &json!({"subject": "Daily", "start": "2026-10-01T13:00", "recurrence": "FREQ=DAILY", "showAs": "tentative"})).unwrap();
+        let r = s.run("calendar.freeBusy", &json!({"start": "2026-10-12", "end": "2026-10-13"})).unwrap();
+        let busy = r["busy"].as_array().unwrap();
+        assert_eq!(busy.len(), 2, "{r}");
+        assert_eq!(busy[0]["subject"], "A");
+        assert_eq!(busy[1]["showAs"], "tentative");
+        assert!(matches!(
+            s.run("calendar.freeBusy", &json!({"start": "2026-10-13", "end": "2026-10-12"})),
+            Err(CmdError::Params(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------------------------------------
+    // Meeting requests (iTIP)
+    // -----------------------------------------------------------------------------------------------------
+
+    /// A session for `addr` (same fixed clock).
+    fn person(addr: &str, name: &str) -> Session {
+        let mut s = session();
+        if let Some(a) = s.mailbox.accounts.first_mut() {
+            a.address = addr.into();
+            a.sender_name = name.into();
+        }
+        s.refresh_me();
+        s
+    }
+
+    /// Delivers compose `cid` of `from` into `to`'s Inbox (built like a sent message).
+    fn deliver(from: &Session, cid: u64, to: &mut Session) -> ItemId {
+        let c = &from.composes[&cid];
+        let mut b = mailcraft_mime::MessageBuilder::new();
+        let acc = from.mailbox.default_account().unwrap();
+        b.from = Some(Address::new(Some(&acc.sender_name), &acc.address));
+        b.to = mailcraft_mime::parse_address_list(&c.to);
+        b.subject = c.subject.clone();
+        b.text = Some(c.body.to_plain_text());
+        b.attachments = c
+            .attachments
+            .iter()
+            .map(|a| mailcraft_mime::AttachmentSpec {
+                filename: a.filename.clone(),
+                mime_type: a.mime_type.clone(),
+                data: a.data.clone(),
+                content_id: None,
+            })
+            .collect();
+        let raw = b.build();
+        let msg = mailcraft_mime::parse(&raw).unwrap();
+        let mut item = MailItem::from_message(&msg, &raw, to.now());
+        item.folder = role(to, FolderRole::Inbox);
+        to.mailbox.add_mail(item)
+    }
+
+    fn invite(org: &mut Session) -> (ItemId, u64) {
+        let r = org
+            .run(
+                "calendar.newMeeting",
+                &json!({"subject": "Design review", "start": "2026-10-13T15:00", "durationMin": 60, "location": "Room 4",
+                        "attendees": ["Ann Lee <ann@example.com>", "bob@example.org"]}),
+            )
+            .unwrap();
+        (ItemId(r["id"].as_u64().unwrap()), r["compose"].as_u64().unwrap())
+    }
+
+    #[test]
+    fn invitation_is_an_itip_request_from_formats() {
+        let mut org = session();
+        let (_, cid) = invite(&mut org);
+        let att = &org.composes[&cid].attachments[0];
+        assert_eq!(att.mime_type, "text/calendar; method=REQUEST");
+        let msg = itip::read(&att.data, ImportOptions::default()).unwrap();
+        assert_eq!(msg.method, Method::Request);
+        assert_eq!(msg.event.appointment.subject, "Design review");
+        assert_eq!(msg.event.appointment.attendees.len(), 2);
+        assert_eq!(msg.event.appointment.organizer.as_ref().unwrap().addr, "me@example.com");
+        let ics = String::from_utf8(att.data.clone()).unwrap().replace("\r\n ", "");
+        assert!(ics.contains("RSVP=TRUE"), "{ics}");
+    }
+
+    #[test]
+    fn accept_adds_to_calendar_and_replies_to_the_organizer() {
+        let mut org = session();
+        let (meeting, cid) = invite(&mut org);
+        let mut ann = person("ann@example.com", "Ann Lee");
+        // Ann has something else at that time.
+        ann.run("calendar.newAppointment", &json!({"subject": "Dentist", "start": "2026-10-13T15:30"}))
+            .unwrap();
+        let mail = deliver(&org, cid, &mut ann);
+        let info = ann.run("calendar.meetingInfo", &json!({"id": mail.0})).unwrap();
+        assert_eq!(info["method"], "REQUEST");
+        assert_eq!(info["canRespond"], true);
+        assert_eq!(info["appointment"], Value::Null);
+        assert_eq!(info["conflicts"], json!(["Dentist"]));
+        assert!(info["info"].as_str().unwrap().starts_with("Conflicts with another appointment"), "{info}");
+        assert_eq!(info["when"], "Tuesday, October 13, 2026 3:00 PM-4:00 PM");
+
+        let r = ann
+            .run(
+                "calendar.respond",
+                &json!({"id": mail.0, "response": "accept", "send": "edit", "comment": "See you"}),
+            )
+            .unwrap();
+        let appt = ItemId(r["appointment"].as_u64().unwrap());
+        let a = &ann.mailbox.appointments[&appt];
+        assert_eq!(a.subject, "Design review");
+        assert_eq!(a.folder, role(&ann, FolderRole::Calendar));
+        assert!(a.is_meeting);
+        assert_eq!(a.reminder_min, Some(DEFAULT_REMINDER_MIN));
+        let me = a.attendees.iter().find(|x| x.mailbox.addr == "ann@example.com").unwrap();
+        assert_eq!(me.response, ResponseStatus::Accepted);
+        let info = ann.run("calendar.meetingInfo", &json!({"id": mail.0})).unwrap();
+        assert_eq!(info["myResponse"], "accepted");
+        assert_eq!(info["info"], "You accepted this meeting.");
+        let rc = r["compose"].as_u64().unwrap();
+        let c = &ann.composes[&rc];
+        assert_eq!(c.subject, "Accepted: Design review");
+        assert!(c.to.contains("me@example.com"));
+        assert_eq!(c.attachments[0].mime_type, "text/calendar; method=REPLY");
+
+        // The organizer records the response.
+        let reply = deliver(&ann, rc, &mut org);
+        let info = org.run("calendar.meetingInfo", &json!({"id": reply.0})).unwrap();
+        assert_eq!(info["method"], "REPLY");
+        assert_eq!(info["info"], "Ann Lee has accepted this meeting.");
+        assert_eq!(info["canRespond"], false);
+        let r = org.run("calendar.processReply", &json!({"id": reply.0})).unwrap();
+        assert_eq!(r["updated"], 1);
+        let t = org.run("calendar.tracking", &json!({"id": meeting.0})).unwrap();
+        assert_eq!(t["accepted"], 1);
+        assert_eq!(t["none"], 1);
+        assert_eq!(t["attendees"][0]["response"], "accepted");
+        // Answering twice updates the same calendar item; declining removes it.
+        let r = ann
+            .run("calendar.respond", &json!({"id": mail.0, "response": "tentative", "send": "none"}))
+            .unwrap();
+        assert_eq!(r["appointment"].as_u64(), Some(appt.0));
+        assert_eq!(r["compose"], Value::Null);
+        assert_eq!(ann.mailbox.appointments[&appt].show_as, BusyStatus::Tentative);
+        ann.run("calendar.respond", &json!({"id": mail.0, "response": "decline", "send": "none"})).unwrap();
+        assert_ne!(ann.mailbox.appointments[&appt].folder, role(&ann, FolderRole::Calendar));
+        assert!(ann.mailbox.validate().is_empty());
+    }
+
+    #[test]
+    fn propose_new_time_and_accept_the_proposal() {
+        let mut org = session();
+        let (meeting, cid) = invite(&mut org);
+        let mut bob = person("bob@example.org", "Bob");
+        let mail = deliver(&org, cid, &mut bob);
+        let r = bob
+            .run(
+                "calendar.proposeNewTime",
+                &json!({"id": mail.0, "start": "2026-10-14T10:00", "end": "2026-10-14T11:00"}),
+            )
+            .unwrap();
+        assert_eq!(r["response"], "tentative");
+        let pc = r["compose"].as_u64().unwrap();
+        assert_eq!(bob.composes[&pc].subject, "New Time Proposed: Design review");
+        assert_eq!(bob.composes[&pc].attachments[0].mime_type, "text/calendar; method=COUNTER");
+        let counter = deliver(&bob, pc, &mut org);
+        let info = org.run("calendar.meetingInfo", &json!({"id": counter.0})).unwrap();
+        assert_eq!(info["method"], "COUNTER");
+        assert!(
+            info["info"]
+                .as_str()
+                .unwrap()
+                .contains("proposed a new time: Wednesday, October 14, 2026 10:00 AM"),
+            "{info}"
+        );
+        let r = org.run("calendar.acceptProposal", &json!({"id": counter.0})).unwrap();
+        assert!(r["compose"].as_u64().is_some());
+        let a = &org.mailbox.appointments[&meeting];
+        assert_eq!(pim::datetime_string(a.start, 0), "2026-10-14T10:00");
+        assert_eq!(pim::datetime_string(a.end, 0), "2026-10-14T11:00");
+        assert!(matches!(
+            bob.run(
+                "calendar.proposeNewTime",
+                &json!({"id": mail.0, "start": "2026-10-14T10:00", "end": "2026-10-14T09:00"})
+            ),
+            Err(CmdError::Params(_))
+        ));
+        assert!(matches!(
+            bob.run("calendar.proposeNewTime", &json!({"id": mail.0, "start": "2026-10-14T10:00", "end": "2026-10-14T11:00", "response": "accept"})),
+            Err(CmdError::Params(_))
+        ));
+    }
+
+    #[test]
+    fn cancellation_removes_the_meeting() {
+        let mut org = session();
+        let (meeting, cid) = invite(&mut org);
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let mail = deliver(&org, cid, &mut ann);
+        let appt = ann
+            .run("calendar.respond", &json!({"id": mail.0, "response": "accept", "send": "none"}))
+            .unwrap()["appointment"]
+            .as_u64()
+            .unwrap();
+        let r = org.run("calendar.cancelMeeting", &json!({"id": meeting.0, "comment": "Sorry"})).unwrap();
+        let cc = r["compose"].as_u64().unwrap();
+        assert_eq!(org.composes[&cc].subject, "Canceled: Design review");
+        assert!(
+            org.composes[&cc].to.contains("ann@example.com")
+                && org.composes[&cc].to.contains("bob@example.org")
+        );
+        assert_ne!(org.mailbox.appointments[&meeting].folder, role(&org, FolderRole::Calendar));
+        let cancel = deliver(&org, cc, &mut ann);
+        let info = ann.run("calendar.meetingInfo", &json!({"id": cancel.0})).unwrap();
+        assert_eq!(info["method"], "CANCEL");
+        assert_eq!(info["info"], "This meeting has been canceled. Remove it from your Calendar.");
+        ann.run("calendar.removeFromCalendar", &json!({"id": cancel.0})).unwrap();
+        assert_ne!(ann.mailbox.appointments[&ItemId(appt)].folder, role(&ann, FolderRole::Calendar));
+        let info = ann.run("calendar.meetingInfo", &json!({"id": cancel.0})).unwrap();
+        assert_eq!(info["info"], "This meeting has been canceled and is not on your Calendar.");
+        assert!(matches!(
+            ann.run("calendar.removeFromCalendar", &json!({"id": cancel.0})),
+            Err(CmdError::Params(_))
+        ));
+        // A cancellation is not a request.
+        assert!(matches!(
+            ann.run("calendar.respond", &json!({"id": cancel.0, "response": "accept"})),
+            Err(CmdError::Params(_))
+        ));
+    }
+
+    /// Delivers a scheduling message written by "Org" into `to`'s Inbox.
+    fn deliver_ics(to: &mut Session, method: &str, ics: &str) -> ItemId {
+        let mut b = mailcraft_mime::MessageBuilder::new();
+        b.from = Some(Address::new(Some("Org"), "org@example.com"));
+        b.to = mailcraft_mime::parse_address_list("ann@example.com");
+        b.subject = "Weekly sync".into();
+        b.text = Some("See invite".into());
+        b.attachments = vec![mailcraft_mime::AttachmentSpec {
+            filename: "invite.ics".into(),
+            mime_type: format!("text/calendar; method={method}"),
+            data: ics.replace('\n', "\r\n").into_bytes(),
+            content_id: None,
+        }];
+        let raw = b.build();
+        let msg = mailcraft_mime::parse(&raw).unwrap();
+        let mut item = MailItem::from_message(&msg, &raw, to.now());
+        item.folder = role(to, FolderRole::Inbox);
+        to.mailbox.add_mail(item)
+    }
+
+    const SERIES: &str = "BEGIN:VEVENT\nUID:sync-1@example.com\nSEQUENCE:0\nDTSTART:20261012T150000Z\n\
+DTEND:20261012T153000Z\nSUMMARY:Weekly sync\nRRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=6\n\
+ORGANIZER;CN=Org:mailto:org@example.com\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.com\n\
+END:VEVENT\n";
+
+    fn instance(method: &str, rid: &str, start: &str, end: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:{method}\nBEGIN:VEVENT\nUID:sync-1@example.com\nSEQUENCE:1\n\
+RECURRENCE-ID:{rid}\nDTSTART:{start}\nDTEND:{end}\nSUMMARY:Weekly sync (moved)\n\
+ORGANIZER;CN=Org:mailto:org@example.com\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:ann@example.com\n\
+END:VEVENT\nEND:VCALENDAR\n"
+        )
+    }
+
+    fn starts(s: &mut Session, id: ItemId) -> Vec<String> {
+        let r = s
+            .run("calendar.occurrences", &json!({"id": id.0, "from": "2026-10-01", "to": "2026-12-01"}))
+            .unwrap();
+        r["occurrences"].as_array().unwrap().iter().map(|o| o["start"].as_str().unwrap().to_owned()).collect()
+    }
+
+    #[test]
+    fn answering_one_occurrence_keeps_the_series() {
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let req = deliver_ics(
+            &mut ann,
+            "REQUEST",
+            &format!("BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:REQUEST\n{SERIES}END:VCALENDAR\n"),
+        );
+        let series = ItemId(
+            ann.run("calendar.respond", &json!({"id": req.0, "response": "accept", "send": "none"})).unwrap()
+                ["appointment"]
+                .as_u64()
+                .unwrap(),
+        );
+        assert_eq!(starts(&mut ann, series).len(), 6);
+        // The organizer moves the 10/19 occurrence to 17:00; Ann accepts the update.
+        let upd = deliver_ics(
+            &mut ann,
+            "REQUEST",
+            &instance("REQUEST", "20261019T150000Z", "20261019T170000Z", "20261019T173000Z"),
+        );
+        let info = ann.run("calendar.meetingInfo", &json!({"id": upd.0})).unwrap();
+        assert_eq!(info["appointment"], series.0, "the occurrence is still on the series: {info}");
+        let r =
+            ann.run("calendar.respond", &json!({"id": upd.0, "response": "accept", "send": "none"})).unwrap();
+        let ex = ItemId(r["appointment"].as_u64().unwrap());
+        assert_ne!(ex, series);
+        let a = &ann.mailbox.appointments[&series];
+        assert!(a.recurrence.is_some(), "the series survives");
+        assert_eq!(a.subject, "Weekly sync");
+        let x = &ann.mailbox.appointments[&ex];
+        assert_eq!(x.uid, "sync-1@example.com");
+        assert_eq!(x.recurrence_id.map(|t| pim::datetime_string(t, 0)).as_deref(), Some("2026-10-19T15:00"));
+        assert_eq!(pim::datetime_string(x.start, 0), "2026-10-19T17:00");
+        assert_eq!(x.reminder_min, a.reminder_min);
+        assert!(!starts(&mut ann, series).contains(&"2026-10-19T15:00".to_owned()));
+        assert_eq!(starts(&mut ann, series).len(), 5);
+        // A second move of the same occurrence updates that exception, not a new one.
+        let upd2 = deliver_ics(
+            &mut ann,
+            "REQUEST",
+            &instance("REQUEST", "20261019T150000Z", "20261019T180000Z", "20261019T183000Z"),
+        );
+        let r = ann
+            .run("calendar.respond", &json!({"id": upd2.0, "response": "tentative", "send": "none"}))
+            .unwrap();
+        assert_eq!(r["appointment"].as_u64(), Some(ex.0));
+        assert_eq!(pim::datetime_string(ann.mailbox.appointments[&ex].start, 0), "2026-10-19T18:00");
+        let copies = ann
+            .mailbox
+            .appointments
+            .values()
+            .filter(|x| x.uid == "sync-1@example.com" && x.folder == role(&ann, FolderRole::Calendar))
+            .count();
+        assert_eq!(copies, 2);
+        // Declining another occurrence takes only that one off the calendar.
+        let other = deliver_ics(
+            &mut ann,
+            "REQUEST",
+            &instance("REQUEST", "20261026T150000Z", "20261026T150000Z", "20261026T153000Z"),
+        );
+        let r = ann
+            .run("calendar.respond", &json!({"id": other.0, "response": "decline", "send": "none"}))
+            .unwrap();
+        assert_eq!(r["appointment"], Value::Null);
+        assert!(ann.mailbox.appointments[&series].recurrence.is_some());
+        assert_eq!(starts(&mut ann, series).len(), 4);
+        // Canceling one occurrence removes its exception; canceling the meeting removes everything.
+        let c1 = deliver_ics(
+            &mut ann,
+            "CANCEL",
+            &instance("CANCEL", "20261019T150000Z", "20261019T180000Z", "20261019T183000Z"),
+        );
+        ann.run("calendar.removeFromCalendar", &json!({"id": c1.0})).unwrap();
+        assert_ne!(ann.mailbox.appointments[&ex].folder, role(&ann, FolderRole::Calendar));
+        assert_eq!(ann.mailbox.appointments[&series].folder, role(&ann, FolderRole::Calendar));
+        let info = ann.run("calendar.meetingInfo", &json!({"id": c1.0})).unwrap();
+        assert_eq!(info["appointment"], Value::Null, "{info}");
+        assert!(ann.mailbox.validate().is_empty());
+    }
+
+    #[test]
+    fn organizer_updates_one_occurrence_end_to_end() {
+        let mut org = session();
+        let r = org
+            .run(
+                "calendar.newMeeting",
+                &json!({"subject": "Weekly", "start": "2026-10-12T15:00", "durationMin": 30,
+                        "attendees": ["Ann Lee <ann@example.com>"], "recurrence": "FREQ=WEEKLY;BYDAY=MO;COUNT=4"}),
+            )
+            .unwrap();
+        let (series, cid) = (r["id"].as_u64().unwrap(), r["compose"].as_u64().unwrap());
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let mail = deliver(&org, cid, &mut ann);
+        let ann_series = ItemId(
+            ann.run("calendar.respond", &json!({"id": mail.0, "response": "accept", "send": "none"}))
+                .unwrap()["appointment"]
+                .as_u64()
+                .unwrap(),
+        );
+        // The organizer moves one occurrence and sends the update for it.
+        let ex = org
+            .run(
+                "calendar.editOccurrence",
+                &json!({"id": series, "occurrence": "2026-10-19T15:00", "start": "2026-10-20T15:00"}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let up = org.run("calendar.sendUpdate", &json!({"id": ex})).unwrap()["compose"].as_u64().unwrap();
+        let ics =
+            String::from_utf8(org.composes[&up].attachments[0].data.clone()).unwrap().replace("\r\n ", "");
+        assert!(ics.contains("RECURRENCE-ID:20261019T150000Z"), "{ics}");
+        assert!(!ics.contains("RRULE"), "{ics}");
+        let upd = deliver(&org, up, &mut ann);
+        ann.run("calendar.respond", &json!({"id": upd.0, "response": "accept", "send": "none"})).unwrap();
+        assert!(ann.mailbox.appointments[&ann_series].recurrence.is_some(), "Ann keeps the series");
+        let got = starts(&mut ann, ann_series);
+        assert_eq!(got, ["2026-10-12T15:00", "2026-10-26T15:00", "2026-11-02T15:00"]);
+        let moved: Vec<&Appointment> =
+            ann.mailbox.appointments.values().filter(|a| a.recurrence_id.is_some()).collect();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(pim::datetime_string(moved[0].start, 0), "2026-10-20T15:00");
+    }
+
+    #[test]
+    fn proposal_for_one_occurrence_moves_only_that_occurrence() {
+        let mut org = session();
+        let r = org
+            .run(
+                "calendar.newMeeting",
+                &json!({"subject": "Weekly", "start": "2026-10-12T15:00", "durationMin": 30,
+                        "attendees": ["ann@example.com"], "recurrence": "FREQ=WEEKLY;BYDAY=MO;COUNT=4"}),
+            )
+            .unwrap();
+        let series = ItemId(r["id"].as_u64().unwrap());
+        let uid = org.mailbox.appointments[&series].uid.clone();
+        let counter = format!(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:COUNTER\nBEGIN:VEVENT\nUID:{uid}\nRECURRENCE-ID:20261019T150000Z\n\
+DTSTART:20261020T150000Z\nDTEND:20261020T153000Z\nSUMMARY:Weekly\nORGANIZER:mailto:me@example.com\n\
+ATTENDEE;PARTSTAT=TENTATIVE:mailto:ann@example.com\nEND:VEVENT\nEND:VCALENDAR\n"
+        );
+        let mail = deliver_ics(&mut org, "COUNTER", &counter);
+        let r = org.run("calendar.acceptProposal", &json!({"id": mail.0})).unwrap();
+        let ex = ItemId(r["appointment"].as_u64().unwrap());
+        assert_ne!(ex, series);
+        let a = &org.mailbox.appointments[&series];
+        assert_eq!(pim::datetime_string(a.start, 0), "2026-10-12T15:00", "the series keeps its time");
+        assert_eq!(starts(&mut org, series), ["2026-10-12T15:00", "2026-10-26T15:00", "2026-11-02T15:00"]);
+        assert_eq!(pim::datetime_string(org.mailbox.appointments[&ex].start, 0), "2026-10-20T15:00");
+        let cid = r["compose"].as_u64().unwrap();
+        let ics =
+            String::from_utf8(org.composes[&cid].attachments[0].data.clone()).unwrap().replace("\r\n ", "");
+        assert!(ics.contains("RECURRENCE-ID:20261019T150000Z"), "{ics}");
+    }
+
+    #[test]
+    fn series_with_overrides_and_whole_cancel() {
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let moved = "BEGIN:VEVENT\nUID:sync-1@example.com\nRECURRENCE-ID:20261026T150000Z\nDTSTART:20261027T090000Z\n\
+DTEND:20261027T093000Z\nSUMMARY:Weekly sync (Tuesday)\nORGANIZER;CN=Org:mailto:org@example.com\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:ann@example.com\nEND:VEVENT\n";
+        // The override comes first; the series is still what gets answered.
+        let req = deliver_ics(
+            &mut ann,
+            "REQUEST",
+            &format!("BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:REQUEST\n{moved}{SERIES}END:VCALENDAR\n"),
+        );
+        let series = ItemId(
+            ann.run("calendar.respond", &json!({"id": req.0, "response": "accept", "send": "none"})).unwrap()
+                ["appointment"]
+                .as_u64()
+                .unwrap(),
+        );
+        assert!(ann.mailbox.appointments[&series].recurrence.is_some());
+        let got = starts(&mut ann, series);
+        assert_eq!(got.len(), 5);
+        assert!(!got.contains(&"2026-10-26T15:00".to_owned()));
+        let cal = role(&ann, FolderRole::Calendar);
+        let ex: Vec<&Appointment> = ann
+            .mailbox
+            .appointments
+            .values()
+            .filter(|x| x.recurrence_id.is_some() && x.folder == cal)
+            .collect();
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].subject, "Weekly sync (Tuesday)");
+        let me = ex[0].attendees.iter().find(|x| x.mailbox.addr == "ann@example.com").unwrap();
+        assert_eq!(me.response, ResponseStatus::Accepted);
+        let cancel = deliver_ics(
+            &mut ann,
+            "CANCEL",
+            &format!("BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:CANCEL\n{SERIES}END:VCALENDAR\n"),
+        );
+        ann.run("calendar.removeFromCalendar", &json!({"id": cancel.0})).unwrap();
+        assert!(ann.mailbox.appointments.values().all(|x| x.folder != cal), "series and exception both go");
+    }
+
+    #[test]
+    fn plain_mail_has_no_meeting() {
+        let mut s = session();
+        let inbox = role(&s, FolderRole::Inbox);
+        let id = s.mailbox.add_mail(MailItem { folder: inbox, subject: "Hi".into(), ..Default::default() });
+        assert!(meeting_message(&s, id).is_none());
+        assert!(matches!(s.run("calendar.meetingInfo", &json!({"id": id.0})), Err(CmdError::Params(_))));
+        assert!(matches!(s.run("calendar.meetingInfo", &json!({"id": 999_999})), Err(CmdError::Params(_))));
+        assert!(matches!(
+            s.run("calendar.respond", &json!({"id": id.0, "response": "maybe"})),
+            Err(CmdError::Params(_))
+        ));
+        // A meeting without attendees has nothing to cancel or update.
+        let a =
+            s.run("calendar.newAppointment", &json!({"subject": "Solo"})).unwrap()["id"].as_u64().unwrap();
+        assert!(matches!(s.run("calendar.cancelMeeting", &json!({"id": a})), Err(CmdError::Params(_))));
+        assert!(matches!(s.run("calendar.sendUpdate", &json!({"id": a})), Err(CmdError::Params(_))));
     }
 
     #[test]

@@ -320,6 +320,64 @@ const SCOPES: [(SearchScope, &str); 5] = [
     (SearchScope::AllOutlookItems, "allItems"),
 ];
 
+/// Keyboard shortcut shown next to a scope in the dropdown (`plan/outlook/keyboard.md`).
+fn scope_shortcut(scope: SearchScope) -> &'static str {
+    match scope {
+        SearchScope::AllMailboxes => "Ctrl+Alt+A",
+        SearchScope::CurrentFolder => "Ctrl+Alt+K",
+        SearchScope::Subfolders => "Ctrl+Alt+Z",
+        SearchScope::CurrentMailbox | SearchScope::AllOutlookItems => "",
+    }
+}
+
+/// Recent Searches under the focused, empty search box: shown on focus, closed by a pick, typing, Escape or
+/// a click elsewhere. A pick runs `search.recent` (which also moves it to the top of the list).
+fn recent_searches_popup(ctx: &egui::Context, app: &mut App, edit: &egui::Response, rect: Rect) {
+    let id = egui::Id::new("mailcraft_search_recent");
+    let mut open = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    if edit.gained_focus() && app.ui.search_text.is_empty() && !app.s.search.recent.is_empty() {
+        open = true;
+    }
+    if !app.ui.search_text.is_empty() || app.s.search.recent.is_empty() {
+        open = false;
+    }
+    if open {
+        let shown = egui::Area::new(id.with("area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos2(rect.left(), rect.bottom() + 2.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_min_width(rect.width());
+                        ui.label(egui::RichText::new("Recent Searches").weak());
+                        let mut picked = None;
+                        for (i, q) in app.s.search.recent.iter().enumerate() {
+                            let label: String = q.chars().take(80).collect();
+                            if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                                picked = Some(i);
+                            }
+                        }
+                        picked
+                    })
+                    .inner
+            });
+        if let Some(i) = shown.inner {
+            app.run("search.recent", json!({ "index": i }));
+            app.ui.search_text = app.s.view.search.clone();
+            app.ui.search_active = true;
+            open = false;
+        } else {
+            let clicked_out = ctx.input(|i| i.pointer.any_click())
+                && !shown.response.contains_pointer()
+                && !edit.contains_pointer();
+            if clicked_out || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                open = false;
+            }
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(id, open));
+}
+
 /// Leaves search: clears the query, drops the Search tab.
 fn close_search(app: &mut App) {
     app.run("search.close", json!({}));
@@ -402,6 +460,12 @@ fn search_box(ui: &mut Ui, app: &mut App, _frame: &Frame, bar: Rect, qat_end: f3
         let text = app.ui.search_text.clone();
         app.run("search.query", json!({ "text": text }));
     }
+    // Enter runs the search for good: it goes into Recent Searches.
+    if edit.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        let text = app.ui.search_text.clone();
+        app.run("search.query", json!({ "text": text, "commit": true }));
+    }
+    recent_searches_popup(&ctx, app, &edit, rect);
     if edit.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         close_search(app);
         edit.surrender_focus();
@@ -414,10 +478,18 @@ fn search_box(ui: &mut Ui, app: &mut App, _frame: &Frame, bar: Rect, qat_end: f3
         let popup = egui::Popup::menu(&r).show(|ui| {
             for (scope, key) in SCOPES {
                 let on = app.s.view.search_scope == scope;
-                if ui.add(egui::Button::new(scope_label(scope)).selected(on)).clicked() {
+                let button =
+                    egui::Button::new(scope_label(scope)).selected(on).shortcut_text(scope_shortcut(scope));
+                if ui.add(button).clicked() {
                     app.run("search.scope", json!({ "scope": key }));
                     ui.close();
                 }
+            }
+            ui.separator();
+            let deleted = app.s.search.include_deleted;
+            if ui.add(egui::Button::new("Include Deleted Items").selected(deleted)).clicked() {
+                app.run("search.scope", json!({ "includeDeleted": !deleted }));
+                ui.close();
             }
         });
         scope_open = popup.is_some();
@@ -717,7 +789,8 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
             ui.label("Filter applied");
         }
     }
-    let due = reminders_due(app);
+    // The Reminders window's last scan (also counts flagged mail); before its first scan, a direct count.
+    let due = reminders_due(app).max(crate::modules::reminders_due(ui.ctx()));
     if due > 0 {
         let r = widgets::icon_button(ui, app, "bell", &format!("Reminders: {due}"), true);
         if r.clicked() {
@@ -938,7 +1011,19 @@ fn content_area(ui: &mut Ui, app: &mut App, frame: &Frame) {
     }
     let fill = app.theme.pane;
     match app.s.view.module {
-        Module::Mail | Module::Folders | Module::Shortcuts => mail_panes(ui, app, frame, inner),
+        Module::Mail | Module::Folders | Module::Shortcuts => {
+            // To-Do Bar (View › Layout › To-Do Bar) on the right of the mail panes, when there is room.
+            let bar_w = crate::modules::TODO_BAR_WIDTH;
+            if crate::modules::todo_bar_shown(ui.ctx()) && inner.width() >= bar_w + size::TODO_BAR_MIN_MAIL {
+                let split_x = inner.right() - bar_w;
+                let mail = Rect::from_min_max(inner.min, pos2(split_x - gap, inner.bottom()));
+                let bar = Rect::from_min_max(pos2(split_x, inner.top()), inner.max);
+                mail_panes(ui, app, frame, mail);
+                pane(ui, app, bar, "todoBar", fill, crate::modules::todo_bar);
+            } else {
+                mail_panes(ui, app, frame, inner);
+            }
+        }
         Module::Calendar => pane(ui, app, inner, "calendar", fill, crate::modules::calendar),
         Module::People => pane(ui, app, inner, "people", fill, crate::modules::people),
         Module::Tasks => pane(ui, app, inner, "tasks", fill, crate::modules::tasks),

@@ -289,8 +289,6 @@ struct PageState {
     path: String,
     action: usize,
     message: String,
-    print_page: usize,
-    table: bool,
     /// Save As type (index into `files::SAVE_TYPES`).
     kind: usize,
 }
@@ -899,16 +897,274 @@ fn save_attachments(ui: &mut Ui, app: &mut App, surface: Surface, st: &mut PageS
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Print (plan/outlook/backstage.md "PAGE Print"): Print, Which Printer, Print Options..., Settings gallery,
+// and the preview with Previous Page / Current Page / Next Page / Actual Size / One Page / Multiple Pages.
+// Everything goes through the engine's `print.*` commands; the preview pages are rendered by the engine
+// (`print.preview`) and shown as textures.
+
+/// Paper names offered by Page Setup (engine `setup.paper`).
+pub const PAPERS: [&str; 4] = ["Letter", "Legal", "A4", "A5"];
+/// The built-in printer that writes a PDF file (engine `print::SAVE_AS_PDF`).
+pub const SAVE_AS_PDF: &str = "Save as PDF";
+/// Header / footer fields (engine `print::FIELDS`).
+pub const PRINT_FIELDS: [&str; 5] =
+    ["[Page #]", "[Total Pages]", "[Date Printed]", "[Time Printed]", "[User Name]"];
+
+/// How the preview fits pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreviewZoom {
+    #[default]
+    OnePage,
+    ActualSize,
+    MultiplePages,
+}
+
+/// Print choices shared by the backstage Print page and the Print / Page Setup dialogs (kept for the session).
+#[derive(Clone, Debug)]
+pub struct PrintSettings {
+    /// Style id ("" = the default for what is printed).
+    pub style: String,
+    pub printer: String,
+    /// Printers offered (fetched once).
+    pub printers: Vec<String>,
+    /// PDF file for Save as PDF.
+    pub path: String,
+    pub copies: u32,
+    /// Page range ("" = all pages), e.g. "1-3,5".
+    pub pages: String,
+    /// Index into [`PAPERS`]; `None` = the style default.
+    pub paper: Option<usize>,
+    /// `None` = the style default (Monthly prints landscape).
+    pub landscape: Option<bool>,
+    /// Inches: top, bottom, left, right.
+    pub margins: [f32; 4],
+    pub header: [String; 3],
+    pub footer: [String; 3],
+    pub new_page_per_item: bool,
+    pub zoom: PreviewZoom,
+    /// Preview page (0-based).
+    pub page: usize,
+}
+
+impl Default for PrintSettings {
+    fn default() -> Self {
+        PrintSettings {
+            style: String::new(),
+            printer: SAVE_AS_PDF.to_owned(),
+            printers: Vec::new(),
+            path: String::new(),
+            copies: 1,
+            pages: String::new(),
+            paper: None,
+            landscape: None,
+            margins: [0.5; 4],
+            header: Default::default(),
+            footer: [String::new(), "[Page #]".to_owned(), String::new()],
+            new_page_per_item: true,
+            zoom: PreviewZoom::OnePage,
+            page: 0,
+        }
+    }
+}
+
+impl PrintSettings {
+    /// The `setup` object of the `print.*` commands.
+    pub fn setup_json(&self) -> Value {
+        let mut o = json!({
+            "margins": {
+                "top": self.margins[0],
+                "bottom": self.margins[1],
+                "left": self.margins[2],
+                "right": self.margins[3],
+            },
+            "header": self.header,
+            "footer": self.footer,
+            "newPagePerItem": self.new_page_per_item,
+        });
+        if let Some(obj) = o.as_object_mut() {
+            if let Some(p) = self.paper.and_then(|i| PAPERS.get(i)) {
+                obj.insert("paper".into(), json!(p));
+            }
+            if let Some(l) = self.landscape {
+                obj.insert("orientation".into(), json!(if l { "landscape" } else { "portrait" }));
+            }
+        }
+        o
+    }
+
+    /// Parameters describing the job (what `print.preview` and `print.print` share).
+    pub fn job(&self, ids: &[u64]) -> Value {
+        let mut p = json!({"ids": ids, "setup": self.setup_json()});
+        if !self.style.is_empty()
+            && let Some(obj) = p.as_object_mut()
+        {
+            obj.insert("style".into(), json!(self.style));
+        }
+        p
+    }
+
+    /// Takes a Page Setup result (`setup` JSON as the engine writes it).
+    pub fn apply_setup(&mut self, v: &Value) {
+        if let Some(p) = v.get("paper").and_then(Value::as_str) {
+            self.paper = PAPERS.iter().position(|x| x.eq_ignore_ascii_case(p));
+        }
+        if let Some(o) = v.get("orientation").and_then(Value::as_str) {
+            self.landscape = Some(o == "landscape");
+        }
+        if let Some(m) = v.get("margins") {
+            for (i, k) in ["top", "bottom", "left", "right"].iter().enumerate() {
+                if let (Some(x), Some(slot)) = (m.get(*k).and_then(Value::as_f64), self.margins.get_mut(i))
+                    && x.is_finite()
+                {
+                    *slot = (x as f32).clamp(0.0, 4.0);
+                }
+            }
+        }
+        let slots = |v: Option<&Value>, d: &mut [String; 3]| {
+            if let Some(a) = v.and_then(Value::as_array) {
+                for (i, slot) in d.iter_mut().enumerate() {
+                    *slot = a.get(i).and_then(Value::as_str).unwrap_or_default().to_owned();
+                }
+            }
+        };
+        slots(v.get("header"), &mut self.header);
+        slots(v.get("footer"), &mut self.footer);
+        if let Some(b) = v.get("newPagePerItem").and_then(Value::as_bool) {
+            self.new_page_per_item = b;
+        }
+    }
+}
+
+fn print_settings_id() -> Id {
+    Id::new("mc-print-settings")
+}
+
+/// The session's print settings (printers fetched on first use).
+pub fn print_settings(ctx: &Context, app: &mut App) -> PrintSettings {
+    let mut st = ctx.data_mut(|d| d.get_temp::<PrintSettings>(print_settings_id())).unwrap_or_default();
+    if st.printers.is_empty() {
+        st.printers = app
+            .s
+            .run("print.printers", &json!({}))
+            .ok()
+            .and_then(|v| v.get("printers").and_then(Value::as_array).cloned())
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .unwrap_or_else(|| vec![SAVE_AS_PDF.to_owned()]);
+    }
+    st
+}
+
+pub fn set_print_settings(ctx: &Context, st: PrintSettings) {
+    ctx.data_mut(|d| d.insert_temp(print_settings_id(), st));
+}
+
+/// Items a print job acts on: a read window's message, a compose window's saved draft, else the main
+/// window's selection (any item kind) or its focused item.
+fn print_ids(app: &App, surface: Surface) -> Vec<u64> {
+    match surface {
+        Surface::Read(id) => vec![id],
+        Surface::Compose(c) => {
+            app.s.composes.get(&c).and_then(|c| c.draft).map(|d| vec![d.0]).unwrap_or_default()
+        }
+        Surface::Main => {
+            let mut ids: Vec<u64> = app.s.selection.items.iter().map(|i| i.0).collect();
+            if ids.is_empty()
+                && let Some(f) = app.s.selection.focus
+            {
+                ids.push(f.0);
+            }
+            ids
+        }
+    }
+}
+
+/// Styles offered for `ids`: (id, label), and the default style id.
+pub fn print_styles(app: &mut App, ids: &[u64]) -> (Vec<(String, String)>, String) {
+    let Ok(v) = app.s.run("print.styles", &json!({"ids": ids})) else { return (Vec::new(), String::new()) };
+    let styles = v
+        .get("styles")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| {
+                    Some((s.get("id")?.as_str()?.to_owned(), s.get("label")?.as_str()?.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let default = v.get("default").and_then(Value::as_str).unwrap_or_default().to_owned();
+    (styles, default)
+}
+
+/// A file name for the PDF from the first item's subject (or "Print").
+fn pdf_name(app: &App, ids: &[u64]) -> String {
+    let subject = ids
+        .first()
+        .and_then(|i| app.s.mailbox.mail.get(&ItemId(*i)).map(|m| m.subject.clone()))
+        .unwrap_or_default();
+    let clean: String = subject
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+        .take(60)
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_owned();
+    format!("{}.pdf", if clean.is_empty() { "Print" } else { &clean })
+}
+
+/// Runs the job on the chosen printer. A message for the page, or the error.
+pub fn run_print(app: &mut App, st: &mut PrintSettings, ids: &[u64]) -> Result<String, String> {
+    let mut p = st.job(ids);
+    let pdf = st.printer == SAVE_AS_PDF;
+    if pdf && st.path.trim().is_empty() {
+        let start = format!("{}/{}", home(), pdf_name(app, ids));
+        match crate::dialogs::browse_save(
+            app,
+            "Save as PDF",
+            &[crate::FileFilter::new("PDF", &["pdf"])],
+            &start,
+        ) {
+            Some(path) => st.path = path,
+            None if app.files.is_some() => return Err(String::new()),
+            None => st.path = start,
+        }
+    }
+    if let Some(obj) = p.as_object_mut() {
+        obj.insert("printer".into(), json!(st.printer));
+        obj.insert("copies".into(), json!(st.copies.clamp(1, 99)));
+        obj.insert("pages".into(), json!(st.pages.trim()));
+        if pdf {
+            obj.insert("path".into(), json!(st.path.trim()));
+        }
+    }
+    match app.s.run("print.print", &p) {
+        Ok(v) => {
+            let n = v.get("pages").and_then(Value::as_u64).unwrap_or(0);
+            Ok(match v.get("path").and_then(Value::as_str) {
+                Some(path) => format!("Saved {n} page(s) to {path}."),
+                None => format!("Sent {n} page(s) to {}.", st.printer),
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn print(ui: &mut Ui, app: &mut App, surface: Surface, st: &mut PageState) {
     title(ui, app, "Print");
+    let ctx = ui.ctx().clone();
+    let mut ps = print_settings(&ctx, app);
     let compose = match surface {
         Surface::Compose(c) => Some(c),
         _ => None,
     };
-    let ids = match compose {
-        Some(c) => app.s.composes.get(&c).and_then(|c| c.draft).map(|d| vec![d.0]).unwrap_or_default(),
-        None => selected_ids(app, surface),
-    };
+    let ids = print_ids(app, surface);
+    let (styles, default_style) = print_styles(app, &ids);
+    if !ps.style.is_empty() && !styles.iter().any(|(i, _)| *i == ps.style) {
+        ps.style.clear();
+    }
     let avail = ui.available_width();
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
@@ -936,33 +1192,100 @@ fn print(ui: &mut Ui, app: &mut App, surface: Surface, st: &mut PageState) {
                 app.theme.text,
             );
             if resp.clicked() {
-                if let Some(c) = compose {
-                    app.run("compose.saveDraft", json!({"compose": c}));
-                    let ids: Vec<u64> =
-                        app.s.composes.get(&c).and_then(|c| c.draft).map(|d| vec![d.0]).unwrap_or_default();
-                    app.run("file.print", json!({"ids": ids}));
-                } else {
-                    app.run("file.print", json!({"ids": ids}));
-                }
+                let ids = match compose {
+                    Some(c) => {
+                        app.run("compose.saveDraft", json!({"compose": c}));
+                        print_ids(app, surface)
+                    }
+                    None => ids.clone(),
+                };
+                st.message = match run_print(app, &mut ps, &ids) {
+                    Ok(m) | Err(m) => m,
+                };
             }
             ui.add_space(10.0);
             ui.label(RichText::new("Printer").strong());
-            muted(ui, app, "Save as HTML file");
+            printer_combo(ui, "mc-bs-printer", &mut ps, 240.0);
+            if ps.printer == SAVE_AS_PDF {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ps.path).hint_text("File name").desired_width(170.0),
+                    );
+                    if app.files.is_some() && ui.button("Browse...").clicked() {
+                        let start = if ps.path.trim().is_empty() {
+                            format!("{}/{}", home(), pdf_name(app, &ids))
+                        } else {
+                            ps.path.clone()
+                        };
+                        let filters = [crate::FileFilter::new("PDF", &["pdf"])];
+                        if let Some(p) = crate::dialogs::browse_save(app, "Save as PDF", &filters, &start) {
+                            ps.path = p;
+                        }
+                    }
+                });
+            }
             if ui.button("Print Options...").clicked() {
-                app.run("file.print", json!({"ids": ids}));
+                let mut p = ps.job(&ids);
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert("style".into(), json!(ps.style));
+                }
+                crate::dialogs::open(app, "print", p);
             }
             ui.add_space(10.0);
             ui.label(RichText::new("Settings").strong());
-            for (i, s) in files::STYLES.iter().enumerate() {
-                if ui.selectable_label(st.table == (i == 1), *s).clicked() {
-                    st.table = i == 1;
+            for (id, label) in &styles {
+                let on = if ps.style.is_empty() { *id == default_style } else { *id == ps.style };
+                if ui.selectable_label(on, label.as_str()).clicked() {
+                    ps.style = id.clone();
+                    ps.page = 0;
                 }
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let mut paper = ps.paper.unwrap_or(0);
+                if egui::ComboBox::from_id_salt("mc-bs-paper")
+                    .width(90.0)
+                    .selected_text(PAPERS.get(paper).copied().unwrap_or("Letter"))
+                    .show_index(ui, &mut paper, PAPERS.len(), |i| PAPERS.get(i).copied().unwrap_or(""))
+                    .changed()
+                {
+                    ps.paper = Some(paper);
+                }
+                let mut land = ps
+                    .landscape
+                    .unwrap_or(ps.style == "monthly" || (ps.style.is_empty() && default_style == "monthly"));
+                let labels = ["Portrait", "Landscape"];
+                let mut idx = usize::from(land);
+                if egui::ComboBox::from_id_salt("mc-bs-orient")
+                    .width(100.0)
+                    .selected_text(labels.get(idx).copied().unwrap_or("Portrait"))
+                    .show_index(ui, &mut idx, 2, |i| labels.get(i).copied().unwrap_or(""))
+                    .changed()
+                {
+                    land = idx == 1;
+                    ps.landscape = Some(land);
+                }
+            });
+            if ui.button("Page Setup...").clicked() {
+                let mut p = ps.job(&ids);
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert(
+                        "style".into(),
+                        json!(if ps.style.is_empty() { &default_style } else { &ps.style }),
+                    );
+                }
+                app.run("print.pageSetup", p);
+            }
+            if !st.message.is_empty() {
+                ui.add_space(8.0);
+                muted(ui, app, &st.message);
             }
         });
         ui.vertical(|ui| {
             ui.set_width((avail - 290.0).max(240.0));
             match compose.and_then(|c| app.s.composes.get(&c)).cloned() {
                 Some(c) if c.draft.is_none() => {
+                    muted(ui, app, "The preview appears once the message is saved as a draft.");
                     egui::Frame::new().fill(Color32::WHITE).inner_margin(18.0).show(ui, |ui| {
                         ui.visuals_mut().override_text_color = Some(Color32::from_rgb(0x20, 0x20, 0x20));
                         ui.label(RichText::new(&c.subject).strong());
@@ -976,11 +1299,227 @@ fn print(ui: &mut Ui, app: &mut App, surface: Surface, st: &mut PageState) {
                     });
                 }
                 _ => {
-                    files::print_preview(ui, app, &ids, st.table, &mut st.print_page, "mc-bs-preview", 520.0)
+                    let job = ps.job(&ids);
+                    let h = (ui.available_height() - 8.0).max(240.0);
+                    print_preview(ui, app, &job, &mut ps, "mc-bs-preview", h);
                 }
             }
         });
     });
+    set_print_settings(&ctx, ps);
+}
+
+/// Which Printer: Save as PDF and the system printers.
+pub fn printer_combo(
+    ui: &mut Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    ps: &mut PrintSettings,
+    width: f32,
+) {
+    let printers = ps.printers.clone();
+    egui::ComboBox::from_id_salt(salt).width(width).selected_text(ps.printer.as_str()).show_ui(ui, |ui| {
+        for p in &printers {
+            if ui.selectable_label(ps.printer == *p, p.as_str()).clicked() {
+                ps.printer = p.clone();
+            }
+        }
+    });
+}
+
+/// One cached preview page texture.
+#[derive(Clone, Default)]
+struct PreviewTex {
+    key: u64,
+    tex: Option<egui::TextureHandle>,
+    pages: usize,
+    /// Logical page size (px), for fitting.
+    page_size: (f32, f32),
+    error: String,
+}
+
+/// Something that changes when the mailbox does (cheap; cache key for preview textures).
+fn mailbox_stamp(app: &App) -> u64 {
+    let mb = &app.s.mailbox;
+    mb.next_id
+        ^ ((mb.mail.len() as u64) << 20)
+        ^ ((mb.appointments.len() as u64) << 32)
+        ^ ((mb.contacts.len() as u64) << 44)
+        ^ app.s.composes.len() as u64
+}
+
+/// Decodes standard base64 (padding optional); `None` on bad input.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => u32::from(c - b'a') + 26,
+            b'0'..=b'9' => u32::from(c - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let bytes = s.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 3);
+    for chunk in bytes.chunks(4) {
+        let mut acc = 0u32;
+        for &c in chunk {
+            acc = (acc << 6) | val(c)?;
+        }
+        match chunk.len() {
+            4 => out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]),
+            3 => out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]),
+            2 => out.push((acc >> 4) as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The texture of page `page` rendered at `scale` device px per logical px (cached per slot).
+fn page_texture(
+    ui: &Ui,
+    app: &mut App,
+    job: &Value,
+    page: usize,
+    scale: f32,
+    salt: &str,
+    slot: usize,
+) -> PreviewTex {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    job.to_string().hash(&mut h);
+    page.hash(&mut h);
+    ((scale * 100.0).round() as i64).hash(&mut h);
+    mailbox_stamp(app).hash(&mut h);
+    let key = h.finish();
+    let id = Id::new((salt, "tex", slot));
+    if let Some(t) = ui.ctx().data_mut(|d| d.get_temp::<PreviewTex>(id))
+        && t.key == key
+    {
+        return t;
+    }
+    let mut p = job.clone();
+    if let Some(obj) = p.as_object_mut() {
+        obj.insert("page".into(), json!(page));
+        obj.insert("scale".into(), json!(scale));
+        obj.insert("rgba".into(), json!(true));
+    }
+    let mut t = PreviewTex { key, ..PreviewTex::default() };
+    match app.s.run("print.preview", &p) {
+        Ok(v) => {
+            let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let f = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            t.pages = usize::try_from(n("pages")).unwrap_or(0);
+            t.page_size = (f("pageWidth"), f("pageHeight"));
+            let (w, hgt) =
+                (usize::try_from(n("width")).unwrap_or(0), usize::try_from(n("height")).unwrap_or(0));
+            let rgba = v.get("rgba").and_then(Value::as_str).and_then(decode_base64).unwrap_or_default();
+            if w > 0 && hgt > 0 && w.checked_mul(hgt).and_then(|p| p.checked_mul(4)) == Some(rgba.len()) {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w, hgt], &rgba);
+                t.tex =
+                    Some(ui.ctx().load_texture(format!("{salt}-{slot}"), img, egui::TextureOptions::LINEAR));
+            }
+        }
+        Err(e) => t.error = e.to_string(),
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(id, t.clone()));
+    t
+}
+
+/// Print preview of `job` with the page controls (Previous Page, Current Page, Next Page, Actual Size,
+/// One Page, Multiple Pages). Pages are rendered by the engine at the size they are shown.
+pub fn print_preview(
+    ui: &mut Ui,
+    app: &mut App,
+    job: &Value,
+    ps: &mut PrintSettings,
+    salt: &str,
+    height: f32,
+) {
+    // Page count and size from the cached first slot (or Letter before the first render).
+    let first =
+        ui.ctx().data_mut(|d| d.get_temp::<PreviewTex>(Id::new((salt, "tex", 0usize)))).unwrap_or_default();
+    let pages = first.pages.max(1);
+    ps.page = ps.page.min(pages - 1);
+    ui.horizontal(|ui| {
+        let prev = ui.add_enabled(ps.page > 0, egui::Button::new("◀")).on_hover_text("Previous Page");
+        if prev.clicked() {
+            ps.page = ps.page.saturating_sub(1);
+        }
+        let mut cur = ps.page + 1;
+        let r = ui.add(egui::DragValue::new(&mut cur).range(1..=pages).speed(0.1));
+        r.widget_info(|| WidgetInfo::labeled(WidgetType::DragValue, true, "Current Page"));
+        ps.page = cur.clamp(1, pages) - 1;
+        ui.label(format!("of {pages}"));
+        let next = ui.add_enabled(ps.page + 1 < pages, egui::Button::new("▶")).on_hover_text("Next Page");
+        if next.clicked() {
+            ps.page += 1;
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            for (z, label) in [
+                (PreviewZoom::MultiplePages, "Multiple Pages"),
+                (PreviewZoom::OnePage, "One Page"),
+                (PreviewZoom::ActualSize, "Actual Size"),
+            ] {
+                if ui.selectable_label(ps.zoom == z, label).clicked() {
+                    ps.zoom = z;
+                }
+            }
+        });
+    });
+    if !first.error.is_empty() {
+        muted(ui, app, &first.error);
+    }
+    let (pw, ph) =
+        if first.page_size.0 > 0.0 && first.page_size.1 > 0.0 { first.page_size } else { (816.0, 1056.0) };
+    let w = ui.available_width().max(100.0);
+    let h = (height - 36.0).min(ui.available_height() - 4.0).max(100.0);
+    let gap = 12.0;
+    let count = match ps.zoom {
+        PreviewZoom::MultiplePages => (pages - ps.page).min(4),
+        _ => 1,
+    };
+    let fit = match ps.zoom {
+        PreviewZoom::ActualSize => 1.0,
+        _ => ((w - gap * (count as f32 - 1.0)) / (pw * count as f32)).min(h / ph).clamp(0.05, 4.0),
+    };
+    let ppp = ui.ctx().pixels_per_point();
+    let scale = ((fit * ppp * 20.0).round() / 20.0).clamp(0.05, 4.0);
+    let show = |ui: &mut Ui, app: &mut App, ps: &PrintSettings| {
+        ui.horizontal_top(|ui| {
+            for k in 0..count {
+                let t = page_texture(ui, app, job, ps.page + k, scale, salt, k);
+                let size = Vec2::new(pw * fit, ph * fit);
+                match &t.tex {
+                    Some(tex) => {
+                        let img = egui::Image::new(egui::load::SizedTexture::new(tex.id(), size));
+                        let r = ui.add(img);
+                        ui.painter().rect_stroke(
+                            r.rect,
+                            0.0,
+                            egui::Stroke::new(1.0, app.theme.separator),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    None => {
+                        let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+                        ui.painter().rect_filled(r, 0.0, Color32::WHITE);
+                    }
+                }
+                ui.add_space(gap - ui.spacing().item_spacing.x);
+            }
+        });
+    };
+    if ps.zoom == PreviewZoom::ActualSize {
+        egui::ScrollArea::both()
+            .id_salt((salt, "scroll"))
+            .max_height(h)
+            .auto_shrink([false, false])
+            .show(ui, |ui| show(ui, app, ps));
+    } else {
+        show(ui, app, ps);
+    }
 }
 
 fn account(ui: &mut Ui, app: &mut App) {

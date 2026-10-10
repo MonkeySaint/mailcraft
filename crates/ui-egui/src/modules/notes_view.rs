@@ -17,7 +17,7 @@ use super::common::{
 };
 use crate::App;
 
-const COLORS: [(NoteColor, &str, &str); 5] = [
+pub(super) const COLORS: [(NoteColor, &str, &str); 5] = [
     (NoteColor::Yellow, "yellow", "Yellow"),
     (NoteColor::Blue, "blue", "Blue"),
     (NoteColor::Green, "green", "Green"),
@@ -159,6 +159,11 @@ fn content(ui: &mut Ui, app: &mut App, st: &mut ModState) {
 }
 
 fn note_menu(ui: &mut Ui, app: &mut App, st: &mut ModState, id: ItemId) {
+    if ui.button("Open").clicked() {
+        commit_edit(app, st);
+        super::editors::open_note(app, st, id);
+        ui.close();
+    }
     if ui.button("Edit").clicked() {
         start_edit(app, st, id);
         ui.close();

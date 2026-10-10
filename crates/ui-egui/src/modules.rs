@@ -9,16 +9,25 @@
 //! UI-only state (the calendar view state the engine's view commands take and return, the selected day,
 //! search text, open editors…) lives in egui memory under one id (see `common::ModState`).
 //!
-//! Item windows (appointment, contact, contact group, task, Go to Date) are local egui windows drawn by
-//! [`pim_windows`]. Commands that ask the UI to open one of them (`Notice::OpenDialog` with an id in
+//! Item windows (appointment, contact, contact group, task, note, Go to Date) and the Reminders window are
+//! local egui windows drawn by [`pim_windows`]. [`meeting_bar`] is the reading pane's meeting area and
+//! [`todo_bar`] the To-Do Bar. Commands that ask the UI to open one of them (`Notice::OpenDialog` with an id in
 //! [`HANDLED_DIALOGS`], forwarded by the shell into `app.ui.dialogs`) are picked up from there.
 
 mod calendar_view;
 mod common;
 mod editors;
+mod meeting_bar;
 mod notes_view;
 mod people_view;
+mod recurrence;
+mod reminders;
+mod scheduling;
 mod tasks_view;
+mod todo_bar;
+
+pub use meeting_bar::meeting_bar;
+pub use todo_bar::{TODO_BAR_WIDTH, set_todo_bar, todo_bar, todo_bar_parts, todo_bar_shown};
 
 use serde_json::Value;
 
@@ -45,11 +54,27 @@ pub fn notes(ui: &mut egui::Ui, app: &mut App) {
     pim_windows(ui.ctx(), app);
 }
 
-/// Item windows (appointment / contact / contact group / task editors, Go to Date). Safe to call more than
-/// once per frame (only the first call in a pass draws). The shell should call it every frame so windows
-/// requested from other modules (New Items › Appointment in Mail, Ctrl+G) appear too.
+/// Item windows (appointment / contact / contact group / task / note editors, Go to Date) and the Reminders
+/// window (which also polls for due reminders once a minute). Safe to call more than once per frame (only
+/// the first call in a pass draws). The shell should call it every frame so windows requested from other
+/// modules (New Items › Appointment in Mail, Ctrl+G) appear and reminders pop up anywhere.
 pub fn pim_windows(ctx: &egui::Context, app: &mut App) {
+    let pass = ctx.cumulative_pass_nr();
+    let first = common::load(ctx).windows_pass != Some(pass);
     editors::show(ctx, app);
+    if first {
+        reminders::show(ctx, app);
+    }
+}
+
+/// Opens the Reminders window (View › Window › Reminders Window, the status bar's reminder button).
+pub fn open_reminders(ctx: &egui::Context, app: &App) {
+    reminders::open(ctx, app);
+}
+
+/// Reminders due at the last scan (for the status bar).
+pub fn reminders_due(ctx: &egui::Context) -> usize {
+    reminders::due_count(ctx)
 }
 
 /// Runs a calendar view command (`calendar.today`, `calendar.next7Days`, `calendar.goToDate`,

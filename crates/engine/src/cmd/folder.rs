@@ -11,13 +11,7 @@ use serde_json::{Value, json};
 
 use super::util::{opt_bool, opt_str};
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Selection, Session, always};
-use mailcraft_model::rule::RuleContext;
-use mailcraft_model::{
-    DateTime, FlagState, Folder, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox, Rule,
-    RuleAction,
-};
-
-const DAY_SECS: i64 = 86_400;
+use mailcraft_model::{Folder, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox, Rule};
 
 #[allow(clippy::too_many_arguments)]
 fn spec(
@@ -161,7 +155,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Search Folder",
             "Folder › New",
             "Mod+Shift+P",
-            r#"{"name"?:string,"query"?:string}"#,
+            r#"{"name"?:string,"query"?:string,"template"?:"unread|flagged|unreadOrFlagged|important|fromAndTo|from|toMe|toGroup|categorized|large|old|attachments|words|custom","value"?:string}"#,
             true,
             always,
             new_search_folder,
@@ -817,11 +811,29 @@ fn show_all_az(s: &mut Session, p: &Value) -> CmdResult {
 // ---------------------------------------------------------------------------------------------------------
 // Search folders
 
+/// New Search Folder: `{"name", "query"}` saves a query; `{"template", "value"?, "name"?}` builds one from
+/// a New Search Folder template (`search_index::SEARCH_FOLDER_TEMPLATES`); no params opens the dialog.
+/// The folder's items are evaluated live (`search_index::search_folder_items` / `search_folder_counts`).
 fn new_search_folder(s: &mut Session, p: &Value) -> CmdResult {
+    let from_template = match opt_str(p, "template") {
+        Some(t) => Some(
+            crate::search_index::search_folder_template(t, opt_str(p, "value").unwrap_or(""))
+                .map_err(CmdError::Params)?,
+        ),
+        None => None,
+    };
     let name = opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty());
     let query = opt_str(p, "query").map(str::trim).filter(|q| !q.is_empty());
-    let (Some(name), Some(query)) = (name, query) else {
-        return Ok(dialog(s, "newSearchFolder", json!({})));
+    let (name, query) = match (&from_template, name, query) {
+        (Some((tn, tq)), n, _) => (n.unwrap_or(tn.as_str()), tq.as_str()),
+        (None, Some(n), Some(q)) => (n, q),
+        _ => {
+            let templates: Vec<Value> = crate::search_index::SEARCH_FOLDER_TEMPLATES
+                .iter()
+                .map(|(id, group, label, value)| json!({"id": id, "group": group, "label": label, "value": value}))
+                .collect();
+            return Ok(dialog(s, "newSearchFolder", json!({ "templates": templates })));
+        }
     };
     let account = s.current_account().ok_or_else(|| CmdError::Disabled("no account".into()))?;
     let root = s
@@ -867,132 +879,8 @@ fn open_in_new_window(s: &mut Session, p: &Value) -> CmdResult {
 // ---------------------------------------------------------------------------------------------------------
 // Rules
 
-/// Rule context for an item: the user's addresses and the address of the account it lives in.
-fn rule_context(s: &Session, item: &MailItem) -> RuleContext {
-    let account_address = s
-        .mailbox
-        .folder_account(item.folder)
-        .and_then(|a| s.mailbox.account(a))
-        .map(|a| a.address.to_lowercase())
-        .unwrap_or_default();
-    RuleContext { my_addresses: s.me.clone(), account_address }
-}
-
-/// Runs `actions` on item `id`; returns true when no further rules should run for it (Stop Processing More
-/// Rules, or the item was deleted). Actions that need the network or the UI (forward, redirect, reply,
-/// print, sound, desktop alert) are skipped here.
-fn execute_actions(s: &mut Session, id: ItemId, actions: &[RuleAction]) -> bool {
-    let mut stop = false;
-    for action in actions {
-        if !s.mailbox.mail.contains_key(&id) {
-            return true;
-        }
-        match action {
-            RuleAction::MoveTo(f) => {
-                if s.mailbox.folder(*f).is_some_and(|t| t.kind == FolderKind::Mail) {
-                    let _ = s.mailbox.move_items(&[id], *f);
-                }
-            }
-            RuleAction::CopyTo(f) => {
-                if s.mailbox.folder(*f).is_some_and(|t| t.kind == FolderKind::Mail)
-                    && let Some(mut copy) = s.mailbox.mail.get(&id).cloned()
-                {
-                    copy.folder = *f;
-                    copy.remote_id = None;
-                    s.mailbox.add_mail(copy);
-                }
-            }
-            RuleAction::AssignCategory(c) => {
-                let c = c.trim();
-                if let Some(m) = s.mailbox.mail.get_mut(&id)
-                    && !c.is_empty()
-                    && !m.categories.iter().any(|x| x.eq_ignore_ascii_case(c))
-                {
-                    m.categories.push(c.to_owned());
-                }
-            }
-            RuleAction::Delete => {
-                let _ = s.mailbox.delete_items(&[id]);
-                stop = true;
-            }
-            RuleAction::PermanentlyDelete => {
-                s.mailbox.mail.remove(&id);
-                return true;
-            }
-            RuleAction::MarkAsRead => {
-                s.mailbox.set_read(&[id], true);
-            }
-            RuleAction::FlagForFollowUp(label, days) => {
-                let now = s.now();
-                let due = i64::from(*days)
-                    .checked_mul(DAY_SECS)
-                    .and_then(|d| now.unix.checked_add(d))
-                    .map(|unix| DateTime { unix, offset_min: now.offset_min });
-                let label =
-                    if label.trim().is_empty() { "Follow up".to_owned() } else { label.trim().to_owned() };
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
-                    m.flag = FlagState::Flagged { label, start: Some(now), due, reminder: None };
-                }
-            }
-            RuleAction::ClearFlag => {
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
-                    m.flag = FlagState::None;
-                }
-            }
-            RuleAction::ClearCategories => {
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
-                    m.categories.clear();
-                }
-            }
-            RuleAction::MarkImportance(i) => {
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
-                    m.importance = *i;
-                }
-            }
-            RuleAction::StopProcessingMoreRules => stop = true,
-            RuleAction::NewItemAlert(msg) => s.notify(Notice::NewItemAlert(msg.clone(), id)),
-            RuleAction::ForwardTo(_)
-            | RuleAction::ForwardAsAttachment(_)
-            | RuleAction::RedirectTo(_)
-            | RuleAction::ReplyWithTemplate(_)
-            | RuleAction::Print
-            | RuleAction::PlaySound(_)
-            | RuleAction::DesktopAlert => {}
-        }
-    }
-    stop
-}
-
-/// Applies `rules` in order to the mail items `ids`; returns how many items matched at least one rule.
-pub fn apply_rule_list(s: &mut Session, ids: &[ItemId], rules: &[Rule]) -> usize {
-    let mut acted = 0usize;
-    for &id in ids {
-        let mut hit = false;
-        for rule in rules {
-            let Some(item) = s.mailbox.mail.get(&id) else { break };
-            let ctx = rule_context(s, item);
-            if !rule.matches(item, &ctx) {
-                continue;
-            }
-            hit = true;
-            if execute_actions(s, id, &rule.actions) {
-                break;
-            }
-        }
-        if hit {
-            acted = acted.saturating_add(1);
-        }
-    }
-    prune_selection(s);
-    acted
-}
-
-/// Applies every enabled rule (in list order) to the mail items `ids`, executing their actions; returns how
-/// many items matched at least one rule.
-pub fn apply_rules(s: &mut Session, ids: &[ItemId]) -> usize {
-    let rules: Vec<Rule> = s.mailbox.rules.iter().filter(|r| r.enabled).cloned().collect();
-    apply_rule_list(s, ids, &rules)
-}
+/// The rule executor lives in `rules_exec` (shared with send/receive and the `rules.*` commands).
+pub use crate::cmd::rules::exec::{apply_rule_list, apply_rules};
 
 fn run_rules_now(s: &mut Session, p: &Value) -> CmdResult {
     let folder = current_folder(s, p)?;
@@ -1025,22 +913,13 @@ fn run_rules_now(s: &mut Session, p: &Value) -> CmdResult {
     } else {
         s.mailbox.rules.iter().filter(|r| r.enabled).cloned().collect()
     };
-    let folders: BTreeSet<FolderId> = if opt_bool(p, "subfolders").unwrap_or(false) {
-        s.mailbox.subtree(folder).into_iter().collect()
-    } else {
-        [folder].into_iter().collect()
-    };
     let which = opt_str(p, "which").unwrap_or("all");
-    let want: fn(&MailItem) -> bool = match which {
-        "all" => |_| true,
-        "read" => |m| m.read,
-        "unread" => |m| !m.read,
-        other => return Err(CmdError::Params(format!("`which` must be all, read or unread, not {other}"))),
+    let Some(which) = crate::cmd::rules::exec::Which::parse(which) else {
+        return Err(CmdError::Params(format!("`which` must be all, read or unread, not {which}")));
     };
-    let ids: Vec<ItemId> =
-        s.mailbox.mail.values().filter(|m| folders.contains(&m.folder) && want(m)).map(|m| m.id).collect();
-    let matched = apply_rule_list(s, &ids, &rules);
-    Ok(json!({ "rules": rules.len(), "items": ids.len(), "matched": matched }))
+    let subfolders = opt_bool(p, "subfolders").unwrap_or(false);
+    let (items, report) = crate::cmd::rules::exec::run_now(s, &rules, folder, subfolders, which);
+    Ok(json!({ "rules": rules.len(), "items": items, "matched": report.matched, "report": report.to_json() }))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1048,7 +927,7 @@ fn run_rules_now(s: &mut Session, p: &Value) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mailcraft_model::{Address, Importance, RuleCondition};
+    use mailcraft_model::{Address, Importance, RuleAction, RuleCondition};
 
     fn session() -> Session {
         let mb = Mailbox::new_local("Test");

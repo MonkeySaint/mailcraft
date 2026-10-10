@@ -18,6 +18,7 @@ pub mod nav;
 pub mod notes;
 pub mod options;
 pub mod people;
+pub mod print;
 pub mod quicksteps;
 pub mod respond;
 pub mod review;
@@ -54,6 +55,7 @@ pub fn all_specs() -> Vec<crate::CommandSpec> {
     v.extend(categories::specs());
     v.extend(send_receive::specs());
     v.extend(file::specs());
+    v.extend(print::specs());
     v.extend(options::specs());
     v.extend(help::specs());
     v

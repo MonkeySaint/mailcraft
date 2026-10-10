@@ -25,6 +25,7 @@ mailcraft-mcp = { path = "crates/mcp" }
 mailcraft-proof = { path = "crates/proof" }
 mailcraft-net = { path = "crates/net" }
 mailcraft-formats = { path = "crates/formats" }
+mailcraft-search = { path = "crates/search" }
 mailcraft-testmail = { path = "crates/testmail" }
 mailcraft-web = { path = "apps/mailcraft-web" }
 
@@ -72,6 +73,9 @@ resvg = { version = "0.45.1", default-features = false }
 # text / rendering
 skrifa = "0.48"
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }
+# PDF writer (print, Save as PDF): MIT OR Apache-2.0. No default features: we place glyphs ourselves (no
+# rustybuzz) and print images as placeholders (no image decoders).
+krilla = { version = "0.8.2", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

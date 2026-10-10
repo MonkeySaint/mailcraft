@@ -54,11 +54,18 @@ impl Method {
     }
 }
 
-/// A scheduling message: its method and (first) event.
+/// Most overridden instances kept from one scheduling message.
+pub const MAX_OVERRIDES: usize = 2_000;
+
+/// A scheduling message: its method, its main event and the overridden instances sent with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItipMessage {
     pub method: Method,
+    /// The series (the first VEVENT without RECURRENCE-ID), else the first instance when the message is
+    /// about single instances only (`event.recurrence_id` is then set).
     pub event: Event,
+    /// Other VEVENTs with the same UID that override one instance each (RFC 5546 §3.2.2, RECURRENCE-ID).
+    pub overrides: Vec<Event>,
 }
 
 /// Parses a scheduling message (requires METHOD and a VEVENT).
@@ -67,12 +74,20 @@ pub fn read(data: &[u8], opts: ImportOptions) -> Result<ItipMessage> {
     let method = cal
         .method
         .ok_or_else(|| crate::FormatError::malformed("ics", "no METHOD (not a scheduling message)"))?;
-    let event = cal
-        .events
+    let mut events = cal.events;
+    let main = events.iter().position(|e| e.recurrence_id.is_none()).unwrap_or(0);
+    if main >= events.len() {
+        return Err(crate::FormatError::malformed("ics", "scheduling message without a VEVENT"));
+    }
+    let event = events.remove(main);
+    let overrides = events
         .into_iter()
-        .next()
-        .ok_or_else(|| crate::FormatError::malformed("ics", "scheduling message without a VEVENT"))?;
-    Ok(ItipMessage { method, event })
+        .filter(|e| {
+            e.recurrence_id.is_some() && e.appointment.uid.eq_ignore_ascii_case(&event.appointment.uid)
+        })
+        .take(MAX_OVERRIDES)
+        .collect();
+    Ok(ItipMessage { method, event, overrides })
 }
 
 fn one_event(a: &Appointment, method: Method, o: &EventOut<'_>, now: DateTime) -> String {

@@ -63,7 +63,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_attachments,
             save_attachments,
         ),
-        spec("file.print", "Print", "File › Print", r#"{"ids"?: [number]}"#, false, need_selection, print),
+        spec(
+            "file.print",
+            "Print",
+            "File › Print",
+            r#"{"ids"?: [number], (with "style", "printer" or "path": as print.print)}"#,
+            false,
+            need_selection,
+            print,
+        ),
         spec("file.options", "Options", "File › Options", r#"{"page"?: string}"#, false, always, options),
         spec(
             "file.accountSettings",
@@ -575,6 +583,9 @@ fn save_attachments(s: &mut Session, p: &Value) -> CmdResult {
 
 fn print(s: &mut Session, p: &Value) -> CmdResult {
     let ids: Vec<u64> = s.target_ids(p).iter().map(|i| i.0).collect();
+    if let Some(done) = crate::cmd::print::forward(s, p, &ids) {
+        return done;
+    }
     dialog(s, "print", json!({"ids": ids}))
 }
 

@@ -143,6 +143,17 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
         ),
         "tok" => token_on(&v.search, arg),
         "scope" => scope_name(v.search_scope) == arg,
+        "searchDeleted" => app.s.search.include_deleted,
+        "todo" => {
+            let (cal, people, tasks) = app.ui.todo_bar_parts;
+            match arg {
+                "calendar" => cal,
+                "people" => people,
+                "tasks" => tasks,
+                "off" => !(cal || people || tasks),
+                _ => false,
+            }
+        }
         "ignored" => focused_mail(app, surface).is_some_and(|m| m.ignored),
         "cat" => focused_mail(app, surface)
             .is_some_and(|m| m.categories.iter().any(|c| c.eq_ignore_ascii_case(arg))),
@@ -374,7 +385,8 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 10] = [
+pub const SOURCES: [&str; 11] = [
+    "recentSearches",
     "signatures",
     "recentFiles",
     "quicksteps",
@@ -397,6 +409,31 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
         on: false,
     };
     match source {
+        // Search › Recent Searches: the last searches, newest first (runs `search.recent {"index"}`).
+        "recentSearches" => {
+            if app.s.search.recent.is_empty() {
+                return vec![DynItem {
+                    label: "No Recent Searches".into(),
+                    icon: "",
+                    swatch: None,
+                    vars: vec![("$id", Value::Null)],
+                    on: false,
+                }];
+            }
+            app.s
+                .search
+                .recent
+                .iter()
+                .enumerate()
+                .map(|(i, q)| DynItem {
+                    label: q.chars().take(60).collect(),
+                    icon: "search",
+                    swatch: None,
+                    vars: vec![("$id", json!(i))],
+                    on: q == &app.s.view.search,
+                })
+                .collect()
+        }
         "quicksteps" => app
             .s
             .mailbox

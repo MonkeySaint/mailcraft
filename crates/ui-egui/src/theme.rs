@@ -32,6 +32,8 @@ pub struct Theme {
     pub link: Color32,
     pub danger: Color32,
     pub info_bar: Color32,
+    /// Background behind search words in the message list and reading pane.
+    pub search_hit: Color32,
 }
 
 /// Fixed geometry (logical px) from the observations.
@@ -48,6 +50,8 @@ pub mod size {
     pub const FOLDER_ROW: f32 = 24.0;
     pub const ACCOUNT_ROW: f32 = 34.0;
     pub const LIST: f32 = 300.0;
+    /// Narrowest mail area kept beside the To-Do Bar (below it the bar hides).
+    pub const TODO_BAR_MIN_MAIL: f32 = 560.0;
     pub const LIST_HEADER: f32 = 97.0;
     pub const ROW_COMPACT: f32 = 72.0;
     pub const GROUP_HEADER: f32 = 24.0;
@@ -183,6 +187,7 @@ impl Theme {
             link: Color32::from_rgb(0x0b, 0x6a, 0xb8),
             danger: Color32::from_rgb(0xb0, 0x22, 0x22),
             info_bar: Color32::from_rgb(0xf1, 0xf3, 0xf6),
+            search_hit: Color32::from_rgb(0xff, 0xf1, 0x9e),
         }
     }
     pub fn dark() -> Theme {
@@ -212,6 +217,7 @@ impl Theme {
             link: Color32::from_rgb(0x6c, 0xb8, 0xf6),
             danger: Color32::from_rgb(0xe5, 0x5b, 0x58),
             info_bar: Color32::from_rgb(0x2a, 0x2e, 0x33),
+            search_hit: Color32::from_rgb(0x6b, 0x5a, 0x12),
         }
     }
 }

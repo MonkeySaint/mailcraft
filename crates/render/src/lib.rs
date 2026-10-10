@@ -4,6 +4,10 @@
 //!
 //! Interface (frozen for commit 2): [`Canvas`], [`render`], [`Canvas::to_png`].
 //!
+//! Printing: [`print`] lays print jobs out into pages (Memo, Table, Calendar and contact styles; page setup,
+//! header and footer), [`print::render_page`] rasterises a page for the print preview, and [`pdf`] writes pages
+//! to PDF with the bundled fonts embedded (subset).
+//!
 //! Conventions:
 //! - `width`×`height` is the canvas size in device pixels; display-list coordinates are logical px and are
 //!   multiplied by `scale` before painting.
@@ -16,6 +20,8 @@
 //! - Non-finite or absurd coordinates are skipped or clipped; rendering never panics.
 
 mod paint;
+pub mod pdf;
+pub mod print;
 #[cfg(test)]
 mod tests;
 

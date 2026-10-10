@@ -1900,7 +1900,8 @@ mod native {
             if !new_inbox.is_empty() {
                 let ids: Vec<ItemId> =
                     new_inbox.into_iter().filter(|i| s.mailbox.mail.contains_key(i)).collect();
-                crate::cmd::folder::apply_rules(s, &ids);
+                // Rules for received messages (client-side, like every rule here).
+                crate::cmd::rules::exec::on_new_mail(s, &ids);
             }
             queue_local_changes(s, &mid);
         }
