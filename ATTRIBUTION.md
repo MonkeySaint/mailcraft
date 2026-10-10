@@ -35,3 +35,4 @@ that each file under `assets/` has a row here.
 | assets/dictionaries/en-US-freq.txt | Grady Ward (Moby Project) | https://www.gutenberg.org/ebooks/3201 (Moby Words II freq-int.txt, freq.txt) | Public domain |
 | assets/dictionaries/en-US-supplement.txt | MailCraft contributors | original | MIT OR Apache-2.0 |
 | assets/dictionaries/README.md | MailCraft contributors | original | MIT OR Apache-2.0 |
+| docs/images/*.png | MailCraft contributors | screenshots of MailCraft with its synthetic sample mailbox (`ui_shot`) | MIT OR Apache-2.0 |
