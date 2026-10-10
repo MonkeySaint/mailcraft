@@ -1,0 +1,16 @@
+[package]
+name = "mailcraft-proof"
+description = "Spelling and simple grammar checks for the MailCraft compose editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

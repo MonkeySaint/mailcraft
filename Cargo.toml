@@ -22,6 +22,11 @@ mailcraft-render = { path = "crates/render" }
 mailcraft-engine = { path = "crates/engine" }
 mailcraft-ui-egui = { path = "crates/ui-egui" }
 mailcraft-mcp = { path = "crates/mcp" }
+mailcraft-proof = { path = "crates/proof" }
+mailcraft-net = { path = "crates/net" }
+mailcraft-formats = { path = "crates/formats" }
+mailcraft-testmail = { path = "crates/testmail" }
+mailcraft-web = { path = "apps/mailcraft-web" }
 
 # foundation
 thiserror = "2"
@@ -43,6 +48,23 @@ eframe = { version = "0.36", default-features = false, features = ["default_font
 egui_kittest = "0.36"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.17"
+
+# web (wasm32 only; all MIT OR Apache-2.0)
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3.103"
+web-sys = "0.3.103"
+
+# network: rustls with the ring provider only. Never enable rustls' default features: they pull in
+# aws-lc-sys, whose licence carries OpenSSL terms that are not on the allowlist.
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8.1"
+ring = "0.17.14"
+# test servers: self-signed certificates (ring backend)
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
+# file formats: Compound File Binary container ([MS-CFB]) for .msg (MIT)
+cfb = "0.14"
 
 # tooling (xtask ico): SVG rasterising
 resvg = { version = "0.45.1", default-features = false }

@@ -541,10 +541,9 @@ fn apply_names(app: &mut App, compose: u64, unresolved: &[Value], picks: &[usize
             continue;
         };
         for f in &mut fields {
-            let parts: Vec<String> = f
-                .split(';')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
+            // Split like the recipient fields do (a quoted "Last; First" name is one entry).
+            let parts: Vec<String> = crate::compose::split_recipients(f)
+                .into_iter()
                 .map(|p| if p == name { choice.to_owned() } else { p.to_owned() })
                 .collect();
             *f = parts.join("; ");

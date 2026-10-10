@@ -28,6 +28,14 @@ const DEFAULT_HIGHLIGHT: Color = Color::rgb(0xff, 0xff, 0x00);
 /// Accent used by the built-in emphasis / reference styles.
 const ACCENT: Color = Color::rgb(0x0f, 0x47, 0x61);
 const SUBTLE: Color = Color::rgb(0x40, 0x40, 0x40);
+/// Subtitle / subtle reference greys.
+const SUBTITLE: Color = Color::rgb(0x59, 0x59, 0x59);
+const SUBTLE_REF: Color = Color::rgb(0x5a, 0x5a, 0x5a);
+/// Colours the built-in styles set (Normal removes them).
+const STYLE_COLORS: [Color; 4] = [ACCENT, SUBTLE, SUBTITLE, SUBTLE_REF];
+/// Code style: monospace family and a light grey paragraph background.
+const CODE_FONT: &str = "Consolas";
+const CODE_BACKGROUND: Color = Color::rgb(0xf2, 0xf2, 0xf2);
 
 fn pt_to_px(pt: f32) -> f32 {
     pt * 4.0 / 3.0
@@ -507,6 +515,35 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
         "normal" => {
             c.set_heading(None);
             c.set_para_style(|ps| *ps = ParaStyle::default());
+            // Drop what the paragraph styles set (Title size, Quote colours, Code font), keep the rest.
+            c.with_whole_paragraphs(|c| {
+                c.apply_text_style(|st| {
+                    st.size_pt = None;
+                    st.monospace = None;
+                    if st.font_family.as_deref() == Some(CODE_FONT) {
+                        st.font_family = None;
+                    }
+                    if st.color.is_some_and(|col| STYLE_COLORS.contains(&col)) {
+                        st.color = None;
+                        st.italic = None;
+                    }
+                });
+            });
+        }
+        "code" => {
+            c.set_heading(None);
+            c.set_para_style(|ps| {
+                ps.space_before_px = 0.0;
+                ps.space_after_px = 0.0;
+                ps.line_height = Some(1.0);
+                ps.background = Some(CODE_BACKGROUND);
+            });
+            c.with_whole_paragraphs(|c| {
+                c.apply_text_style(|st| {
+                    st.monospace = Some(true);
+                    st.font_family = Some(CODE_FONT.to_owned());
+                });
+            });
         }
         "no spacing" => {
             c.set_heading(None);
@@ -525,7 +562,7 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
             c.with_whole_paragraphs(|c| {
                 c.apply_text_style(|st| {
                     st.size_pt = Some(14.0);
-                    st.color = Some(Color::rgb(0x59, 0x59, 0x59));
+                    st.color = Some(SUBTITLE);
                 });
             });
         }
@@ -566,7 +603,7 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
             st.color = Some(ACCENT);
         }),
         "strong" => char_style(c, &|st| st.bold = Some(true)),
-        "subtle reference" => char_style(c, &|st| st.color = Some(Color::rgb(0x5a, 0x5a, 0x5a))),
+        "subtle reference" => char_style(c, &|st| st.color = Some(SUBTLE_REF)),
         "intense reference" => char_style(c, &|st| {
             st.bold = Some(true);
             st.color = Some(ACCENT);
@@ -1633,5 +1670,303 @@ mod tests {
         assert!(matches!(s.run("format.bold", &json!({})), Err(CmdError::Disabled(_))));
         s.run("format.selectAll", &json!({})).unwrap();
         s.run("format.copy", &json!({})).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    //! Every formatting command on a selection that spans paragraphs, plus undo/redo of each.
+
+    use super::super::compose::tests::{open, session};
+    use super::*;
+    use mailcraft_model::rich::Align;
+    use mailcraft_model::{Block, Inline};
+
+    const LINES: &str = "alpha beta\ngamma\ndelta epsilon";
+
+    /// Session with three paragraphs and "beta … delta" selected (spanning all three).
+    fn spanning() -> (Session, u64) {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": LINES})).unwrap();
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": [0], "offset": 6}, "focus": {"path": [2], "offset": 5}}),
+        )
+        .unwrap();
+        (s, id)
+    }
+
+    /// (char, style) of every char of top-level block `i`.
+    fn chars(s: &Session, id: u64, i: usize) -> Vec<(char, TextStyle)> {
+        let mut out = Vec::new();
+        let inlines = match &s.composes[&id].body.blocks[i] {
+            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => inlines.clone(),
+            other => panic!("{other:?}"),
+        };
+        fn walk(inlines: &[Inline], out: &mut Vec<(char, TextStyle)>) {
+            for x in inlines {
+                match x {
+                    Inline::Text { text, style } => out.extend(text.chars().map(|c| (c, style.clone()))),
+                    Inline::Link { children, .. } => walk(children, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(&inlines, &mut out);
+        out
+    }
+
+    /// Checks `pred` on the selected chars and its negation on "alpha " and " epsilon".
+    fn check_range(s: &Session, id: u64, what: &str, pred: impl Fn(&TextStyle) -> bool) {
+        let p0 = chars(s, id, 0);
+        let p1 = chars(s, id, 1);
+        let p2 = chars(s, id, 2);
+        for (k, (c, st)) in p0.iter().enumerate() {
+            assert_eq!(pred(st), k >= 6, "{what}: para 0 char {k} {c:?}");
+        }
+        assert!(p1.iter().all(|(_, st)| pred(st)), "{what}: para 1");
+        for (k, (c, st)) in p2.iter().enumerate() {
+            assert_eq!(pred(st), k < 5, "{what}: para 2 char {k} {c:?}");
+        }
+    }
+
+    fn undo_redo_round_trip(s: &mut Session, id: u64) {
+        let after = s.composes[&id].body.clone();
+        assert_eq!(s.run("compose.editUndo", &json!({})).unwrap()["undone"], true);
+        assert_ne!(s.composes[&id].body, after, "undo restores");
+        assert_eq!(s.run("compose.editRedo", &json!({})).unwrap()["redone"], true);
+        assert_eq!(s.composes[&id].body, after, "redo reapplies");
+    }
+
+    #[test]
+    fn character_formatting_spans_paragraphs() {
+        type Case = (&'static str, Value, fn(&TextStyle) -> bool);
+        let cases: Vec<Case> = vec![
+            ("format.bold", json!({}), |st| st.bold == Some(true)),
+            ("format.italic", json!({}), |st| st.italic == Some(true)),
+            ("format.underline", json!({}), |st| st.underline == Some(true)),
+            ("format.strike", json!({}), |st| st.strike == Some(true)),
+            ("format.sub", json!({}), |st| st.subscript == Some(true)),
+            ("format.sup", json!({}), |st| st.superscript == Some(true)),
+            ("format.font", json!({"family": "Georgia"}), |st| st.font_family.as_deref() == Some("Georgia")),
+            ("format.fontSize", json!({"pt": 18}), |st| st.size_pt == Some(18.0)),
+            ("format.growFont", json!({}), |st| st.size_pt == Some(14.0)),
+            ("format.shrinkFont", json!({}), |st| st.size_pt == Some(11.0)),
+            ("format.color", json!({"color": "#336699"}), |st| {
+                st.color == Some(Color::rgb(0x33, 0x66, 0x99))
+            }),
+            ("format.highlight", json!({"color": "yellow"}), |st| st.highlight.is_some()),
+        ];
+        for (id_, params, pred) in cases {
+            let (mut s, id) = spanning();
+            s.run(id_, &params).unwrap();
+            check_range(&s, id, id_, pred);
+            undo_redo_round_trip(&mut s, id);
+            // The selection is kept, so the toggles turn off again over the same range.
+            if params == json!({}) && !id_.contains("Font") {
+                s.run(id_, &params).unwrap();
+                for i in 0..3 {
+                    assert!(chars(&s, id, i).iter().all(|(_, st)| !pred(st)), "{id_} off again: {i}");
+                }
+            }
+        }
+        // Clear Formatting removes everything from the range only.
+        let (mut s, id) = spanning();
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("format.bold", &json!({})).unwrap();
+        s.run("format.color", &json!({"color": "red"})).unwrap();
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": [0], "offset": 6}, "focus": {"path": [2], "offset": 5}}),
+        )
+        .unwrap();
+        s.run("format.clearFormatting", &json!({})).unwrap();
+        check_range(&s, id, "clear", |st| *st == TextStyle::default());
+        undo_redo_round_trip(&mut s, id);
+    }
+
+    fn para(s: &Session, id: u64, i: usize) -> ParaStyle {
+        match &s.composes[&id].body.blocks[i] {
+            Block::Paragraph { style, .. } | Block::Heading { style, .. } => style.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn paragraph_formatting_spans_paragraphs() {
+        let (mut s, id) = spanning();
+        s.run("format.align", &json!({"kind": "center"})).unwrap();
+        assert!((0..3).all(|i| para(&s, id, i).align == Align::Center));
+        undo_redo_round_trip(&mut s, id);
+        s.run("format.indent", &json!({})).unwrap();
+        assert!((0..3).all(|i| para(&s, id, i).indent_px == crate::compose::INDENT_STEP_PX));
+        s.run("format.outdent", &json!({})).unwrap();
+        assert!((0..3).all(|i| para(&s, id, i).indent_px == 0.0));
+        s.run("format.lineSpacing", &json!({"multiple": 1.5})).unwrap();
+        assert!((0..3).all(|i| para(&s, id, i).line_height == Some(1.5)));
+        s.run("format.paragraphSpacing", &json!({"before": 6, "after": 12})).unwrap();
+        assert!(
+            (0..3).all(|i| para(&s, id, i).space_after_px == 16.0 && para(&s, id, i).space_before_px == 8.0)
+        );
+        undo_redo_round_trip(&mut s, id);
+    }
+
+    fn list_items(s: &Session, id: u64) -> Option<(bool, usize)> {
+        s.composes[&id].body.blocks.iter().find_map(|b| match b {
+            Block::List { kind, items } => Some((matches!(kind, ListKind::Bullet), items.len())),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn lists_span_paragraphs() {
+        let (mut s, id) = spanning();
+        s.run("format.bullets", &json!({})).unwrap();
+        assert_eq!(list_items(&s, id), Some((true, 3)));
+        s.run("format.numbering", &json!({})).unwrap();
+        assert_eq!(list_items(&s, id), Some((false, 3)), "switches the kind");
+        undo_redo_round_trip(&mut s, id);
+        // Multilevel: second and third item one level down.
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": [0, 1, 0], "offset": 0}, "focus": {"path": [0, 2, 0], "offset": 2}}),
+        )
+        .unwrap();
+        s.run("format.indent", &json!({})).unwrap();
+        match &s.composes[&id].body.blocks[0] {
+            Block::List { items, .. } => {
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0].last(), Some(Block::List { items, .. }) if items.len() == 2));
+            }
+            other => panic!("{other:?}"),
+        }
+        s.run("format.outdent", &json!({})).unwrap();
+        assert_eq!(list_items(&s, id), Some((false, 3)));
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("format.numbering", &json!({})).unwrap();
+        assert_eq!(list_items(&s, id), None, "same kind again removes the list");
+        s.run("format.multilevel", &json!({})).unwrap();
+        assert_eq!(list_items(&s, id), Some((false, 3)));
+    }
+
+    #[test]
+    fn paragraph_styles_span_paragraphs() {
+        for (name, level) in [("Heading 1", 1u8), ("Heading 2", 2), ("Heading 3", 3)] {
+            let (mut s, id) = spanning();
+            s.run("format.style", &json!({"name": name})).unwrap();
+            for i in 0..3 {
+                assert!(
+                    matches!(s.composes[&id].body.blocks[i], Block::Heading { level: l, .. } if l == level),
+                    "{name} {i}"
+                );
+            }
+            undo_redo_round_trip(&mut s, id);
+            s.run("format.style", &json!({"name": "Normal"})).unwrap();
+            assert!((0..3).all(|i| matches!(s.composes[&id].body.blocks[i], Block::Paragraph { .. })));
+        }
+        // Title / Quote / Code apply to whole paragraphs; Normal takes their formatting off again.
+        let (mut s, id) = spanning();
+        s.run("format.style", &json!({"name": "Title"})).unwrap();
+        assert!(chars(&s, id, 0).iter().all(|(_, st)| st.size_pt == Some(28.0)), "whole first paragraph");
+        s.run("format.style", &json!({"name": "Quote"})).unwrap();
+        assert!(chars(&s, id, 2).iter().all(|(_, st)| st.italic == Some(true)));
+        assert_eq!(para(&s, id, 1).align, Align::Center);
+        s.run("format.style", &json!({"name": "Code"})).unwrap();
+        assert!((0..3).all(|i| chars(&s, id, i).iter().all(|(_, st)| st.monospace == Some(true))));
+        assert!(para(&s, id, 1).background.is_some());
+        s.run("format.style", &json!({"name": "Normal"})).unwrap();
+        for i in 0..3 {
+            assert_eq!(para(&s, id, i), ParaStyle::default());
+            assert!(
+                chars(&s, id, i).iter().all(|(_, st)| st.size_pt.is_none()
+                    && st.monospace.is_none()
+                    && st.font_family.is_none()
+                    && st.color.is_none()),
+                "{i}: {:?}",
+                chars(&s, id, i)
+            );
+        }
+        assert!(s.run("format.style", &json!({"name": "No Such Style"})).is_err());
+    }
+
+    #[test]
+    fn insert_operations() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "See "})).unwrap();
+        s.run("insert.link", &json!({"url": "example.com", "text": "the site"})).unwrap();
+        let c = &s.composes[&id];
+        assert!(
+            matches!(&c.body.blocks[0], Block::Paragraph { inlines, .. }
+                if inlines.iter().any(|i| matches!(i, Inline::Link { href, children }
+                    if href.ends_with("://example.com")
+                        && matches!(&children[0], Inline::Text { text, .. } if text == "the site")))),
+            "{:?}",
+            c.body.blocks[0]
+        );
+        // Picture from bytes: embedded as a cid: inline image.
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let r =
+            s.run("insert.picture", &json!({"name": "dot.png", "data_base64": png, "alt": "dot"})).unwrap();
+        let cid = r["cid"].as_str().unwrap().to_owned();
+        let c = &s.composes[&id];
+        assert_eq!(c.inline_images.len(), 1);
+        assert_eq!(c.inline_images[0].mime_type, "image/png");
+        assert!(c.images().iter().any(|(src, alt)| *src == format!("cid:{cid}") && alt == "dot"));
+        assert!(
+            s.run("insert.picture", &json!({"name": "x.bin", "data_base64": "AAAA"})).is_err(),
+            "not a picture"
+        );
+        // Picture from a file path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.png");
+        std::fs::write(&path, mailcraft_mime::transfer::decode_base64(png.as_bytes())).unwrap();
+        s.run("insert.picture", &json!({"path": path.to_string_lossy()})).unwrap();
+        assert_eq!(s.composes[&id].inline_images.len(), 2);
+        // Table 2x3, horizontal line, symbol, date & time.
+        s.run("insert.table", &json!({"rows": 2, "cols": 3})).unwrap();
+        assert!(s.composes[&id].cell_at_caret().is_some());
+        s.run("compose.tableCell", &json!({"direction": "down"})).unwrap();
+        let end = s.run("compose.select", &json!({"all": true})).unwrap()["focus"].clone();
+        s.run("compose.select", &json!({"anchor": end})).unwrap();
+        s.run("insert.horizontalLine", &json!({})).unwrap();
+        assert!(s.composes[&id].body.blocks.iter().any(|b| matches!(b, Block::Rule)));
+        s.run("insert.symbol", &json!({"char": "U+00A9"})).unwrap();
+        s.run("insert.dateTime", &json!({"format": "yyyy-MM-dd"})).unwrap();
+        let text = s.composes[&id].body.to_plain_text();
+        assert!(text.contains("©2026-10-09"), "{text}");
+        for _ in 0..6 {
+            s.run("compose.editUndo", &json!({})).unwrap();
+        }
+        assert!(!s.composes[&id].body.blocks.iter().any(|b| matches!(b, Block::Table { .. })));
+    }
+
+    #[test]
+    fn find_replace_word_count_and_paste() {
+        let (mut s, id) = spanning();
+        let r = s.run("format.find", &json!({"text": "TA"})).unwrap();
+        assert_eq!(r["found"], true);
+        assert_eq!(s.composes[&id].selected_text(), "ta", "beta (case-insensitive)");
+        let r = s.run("format.find", &json!({"text": "TA", "matchCase": true})).unwrap();
+        assert_eq!(r["found"], false);
+        let r = s
+            .run("format.replace", &json!({"find": "a", "replace": "A", "all": true, "matchCase": true}))
+            .unwrap();
+        assert_eq!(r["replaced"], 6);
+        assert_eq!(s.composes[&id].body.to_plain_text(), "AlphA betA\ngAmmA\ndeltA epsilon");
+        undo_redo_round_trip(&mut s, id);
+        s.run("compose.select", &json!({"anchor": {"path": [0], "offset": 0}})).unwrap();
+        let r = s.run("review.wordCount", &json!({})).unwrap();
+        assert_eq!((r["words"].as_u64(), r["paragraphs"].as_u64()), (Some(5), Some(3)));
+        // Paste HTML / plain text at the caret.
+        s.run("compose.select", &json!({"anchor": {"path": [1], "offset": 5}})).unwrap();
+        s.run("format.paste", &json!({"html": "<p> one</p><ul><li>two</li></ul><p>three </p>"})).unwrap();
+        let t = s.composes[&id].body.to_plain_text();
+        assert!(t.starts_with("AlphA betA\ngAmmAone\n"), "{t}");
+        assert!(t.contains("two") && t.contains("three"), "{t}");
+        s.run("compose.editUndo", &json!({})).unwrap();
+        s.run("format.pasteText", &json!({"text": "X\nY"})).unwrap();
+        assert_eq!(s.composes[&id].body.to_plain_text(), "AlphA betA\ngAmmAX\nY\ndeltA epsilon");
     }
 }

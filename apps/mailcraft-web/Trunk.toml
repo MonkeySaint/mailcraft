@@ -1,0 +1,11 @@
+# Trunk build for the browser app: `trunk serve` (development) or `trunk build --release` (see README.md).
+
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+# Local only.
+addresses = ["127.0.0.1"]
+port = 8080
+open = false

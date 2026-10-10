@@ -19,8 +19,9 @@ const USAGE: &str = "\
 Usage: cargo xtask [--root DIR] <task> [options]
 
 Tasks:
-  ci                         fmt, clippy, tests, layers, assets, licences, parity --check, wasm check
-  layers                     crates depend only on lower layers; nothing below L6 pulls in GUI crates
+  ci                         fmt, clippy, tests, layers, assets, licences, parity --check, wasm build
+  layers                     crates depend only on lower layers; nothing below L6 pulls in GUI crates;
+                             test-support crates only as dev-dependencies or from apps
   assets                     every file under assets/ has an ATTRIBUTION.md row; icon SVGs are self-contained
   licences                   every dependency's licence is on the allowlist
   parity [--out FILE] [--check]

@@ -49,10 +49,10 @@ pub fn run(root: &Path) -> TaskResult {
     step("parity --check", || parity::check(&root.join("docs").join("parity.md")))?;
     const WASM: &str = "wasm32-unknown-unknown";
     if target_installed(WASM) {
-        cargo_step(root, "wasm check", &["check", "-p", "mailcraft-engine", "--target", WASM])?;
+        cargo_step(root, "wasm build", &["build", "-p", "mailcraft-web", "--target", WASM])?;
     } else {
         println!(
-            "==> wasm check: skipped (warning: target {WASM} is not installed; `rustup target add {WASM}`)"
+            "==> wasm build: skipped (warning: target {WASM} is not installed; `rustup target add {WASM}`)"
         );
     }
     println!("ci: all checks passed");

@@ -15,7 +15,7 @@ commit 23.
 | M0.7 | Engine: session, undo/redo, command registry (370 commands), Outlook feature catalog (1,643 rows), sample mailbox, fuzzing | ✅ done (commit 3) |
 | M0.8 | Outlook-style egui UI: title bar + search, module rail, ribbon (Simplified + Classic), folder pane, message list, reading pane, compose window, backstage, options, dialogs, calendar/people/tasks/notes views, original icon set; desktop app | ✅ done (commit 4) |
 | M0.9–M0.12 | CLI, MCP server, `cargo xtask` (ci, layers, assets, parity, stats, version, licences, ico), app icon, AGENTS/ATTRIBUTION/NOTICE, docs/mcp.md | ✅ done (commit 5) |
-| M4.1 | Compose depth: rich-text editing, spelling, signatures, attachments, address auto-complete; web app | next (commit 6) |
+| M4.1 | Compose depth: rich-text editing, spelling, signatures, attachments, address auto-complete; web app | ✅ done (commit 6) |
 | M5.1 | Conversation view in the list (header + child rows) | planned (commit 7) |
 | M1 | Protocols: IMAP sync, SMTP send, Outbox/Sent flow, OAuth2, account setup; MSG/EML/MBOX | planned (commit 8) |
 | M3/M6/M12 | Calendar (iCalendar), contacts (vCard), tasks, notes, rules engine + Rules Wizard, quick steps, search folders, PDF/print, import/export | planned (commit 9) |
@@ -44,12 +44,12 @@ Two numbers, kept separate on purpose:
 | Mail commands (engine) | ~60 % | reply/forward format as observed, delete/move/flag/categorize/read state, drafts; no sending yet |
 | Message list and folders (UI) | ~55 % | folder pane with badges/favourites, compact rows, date groups, unread/flag styling, Focused/Other, arrange menu, Bottom-pane columns; drag-and-drop and conversations later |
 | Reading pane / HTML display | ~50 % | header, persona, info bars, attachment chips, body rendering, read windows; remote-image prompt basic |
-| Compose | ~35 % | compose window + inline responses, header fields, basic rich-text editor; depth in commit 6 |
+| Compose | ~60 % | rich-text editing, spelling with suggestions, signatures, address auto-complete, Check Names, attachments; web build |
 | Ribbon / menus / shortcuts | ~50 % | Simplified + Classic ribbons for every tab with width degradation, context menus, shortcuts, keytips; many dialogs still basic |
 | Rules and quick steps | ~35 % | model + engine (conditions, actions, run now); dialogs in commit 4, wizard depth later |
 | Search | ~20 % | simple query prefixes; indexed search in commit 9 |
 | Calendar / People / Tasks / Notes | ~30 % | day/week/month/schedule views, contact cards, task list, notes grid; iCalendar/vCard in commit 9 |
-| Accounts / sync (IMAP, SMTP, JMAP) | 0 % | commit 8 |
+| Accounts / sync (IMAP, SMTP, JMAP) | ~25 % | protocol clients + local test servers done; account wiring, sync and sending in commit 8 |
 | Packaging / releases | 0 % | commits 12–13 |
 
 ## Needs the owner

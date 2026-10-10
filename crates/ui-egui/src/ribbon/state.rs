@@ -151,15 +151,19 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
 }
 
 fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str) -> bool {
-    let st = c.style_at_caret();
-    let on = |b: Option<bool>| b.unwrap_or(false);
+    // Character toggles are on when every selected character has the format (the typing style at a caret);
+    // heading text counts as bold unless it was made plain.
+    let all = |f: fn(&mailcraft_model::TextStyle) -> Option<bool>| c.selection_all(|s, _| f(s) == Some(true));
     match name {
-        "bold" => on(st.bold),
-        "italic" => on(st.italic),
-        "underline" => on(st.underline),
-        "strike" => on(st.strike),
-        "sub" => on(st.subscript),
-        "sup" => on(st.superscript),
+        "bold" => c.selection_all(|s, heading| s.bold == Some(true) || (heading && s.bold != Some(false))),
+        "italic" => all(|s| s.italic),
+        "underline" => all(|s| s.underline),
+        "strike" => all(|s| s.strike),
+        "sub" => all(|s| s.subscript),
+        "sup" => all(|s| s.superscript),
+        "link" => c.link_at_caret().is_some(),
+        "table" => c.cell_at_caret().is_some(),
+        "signature" => c.signature.as_ref().is_some_and(|s| s.name.eq_ignore_ascii_case(arg)),
         "align" => {
             use mailcraft_model::rich::Align;
             matches!(
@@ -209,18 +213,49 @@ pub fn combo_value(app: &App, surface: Surface, spec: Option<&str>) -> String {
     let Some(c) = compose(app, surface) else {
         return String::new();
     };
-    let st = c.style_at_caret();
-    match spec {
-        Some("value:font") => st
-            .font_family
+    let font = |s: &mailcraft_model::TextStyle| {
+        s.font_family
             .clone()
             .or_else(|| c.body.base.font_family.clone())
-            .unwrap_or_else(|| mailcraft_fonts::BODY_FAMILY.to_owned()),
-        Some("value:size") => {
-            let pt = st.size_pt.or(c.body.base.size_pt).unwrap_or(mailcraft_fonts::BODY_SIZE_PT);
-            if (pt.fract()).abs() < 0.01 { format!("{pt:.0}") } else { format!("{pt:.1}") }
-        }
+            .unwrap_or_else(|| mailcraft_fonts::BODY_FAMILY.to_owned())
+    };
+    let size = |s: &mailcraft_model::TextStyle| {
+        let pt = s.size_pt.or(c.body.base.size_pt).unwrap_or(mailcraft_fonts::BODY_SIZE_PT);
+        if (pt.fract()).abs() < 0.01 { format!("{pt:.0}") } else { format!("{pt:.1}") }
+    };
+    match spec {
+        Some("value:font") => selection_value(c, font),
+        Some("value:size") => selection_value(c, size),
         _ => String::new(),
+    }
+}
+
+/// What a font / size box shows: the value of the first selected char, or blank when the selection mixes
+/// values (like word processors); the caret's typing style when nothing is selected.
+fn selection_value(
+    c: &mailcraft_engine::compose::ComposeState,
+    value: impl Fn(&mailcraft_model::TextStyle) -> String,
+) -> String {
+    if c.selection.is_collapsed() {
+        return value(&c.style_at_caret());
+    }
+    let first: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    let uniform = c.selection_all(|s, _| {
+        let v = value(s);
+        let mut f = first.borrow_mut();
+        match f.as_ref() {
+            Some(prev) => prev.eq_ignore_ascii_case(&v),
+            None => {
+                *f = Some(v);
+                true
+            }
+        }
+    });
+    match first.into_inner() {
+        Some(v) if uniform => v,
+        Some(_) => String::new(),
+        // Only spaces selected: the caret's style.
+        None => value(&c.style_at_caret()),
     }
 }
 
@@ -250,6 +285,54 @@ fn scope_name(sc: mailcraft_engine::SearchScope) -> &'static str {
         S::CurrentFolder => "currentFolder",
         S::Subfolders => "subfolders",
         S::AllOutlookItems => "allItems",
+    }
+}
+
+/// Name of the Styles gallery entry matching the paragraph at the caret ("Normal", "Heading 1"…).
+fn current_style(c: &mailcraft_engine::compose::ComposeState) -> String {
+    let path = &c.selection.focus.path;
+    let mut blocks = &c.body.blocks;
+    let mut block = None;
+    let mut rest: &[usize] = path;
+    // Walk the caret's block path (lists add [item, block], tables [row, cell, block]).
+    for _ in 0..64 {
+        let Some((&first, tail)) = rest.split_first() else { break };
+        let Some(b) = blocks.get(first) else { break };
+        block = Some(b);
+        match (b, tail) {
+            (
+                mailcraft_model::Block::Quote { blocks: inner }
+                | mailcraft_model::Block::Container { blocks: inner, .. },
+                t,
+            ) if !t.is_empty() => {
+                blocks = inner;
+                rest = t;
+            }
+            (mailcraft_model::Block::List { items, .. }, [item, t @ ..]) if !t.is_empty() => {
+                match items.get(*item) {
+                    Some(inner) => {
+                        blocks = inner;
+                        rest = t;
+                    }
+                    None => break,
+                }
+            }
+            (mailcraft_model::Block::Table { rows, .. }, [row, cell, t @ ..]) if !t.is_empty() => {
+                match rows.get(*row).and_then(|r| r.get(*cell)) {
+                    Some(cell) => {
+                        blocks = &cell.blocks;
+                        rest = t;
+                    }
+                    None => break,
+                }
+            }
+            _ => break,
+        }
+    }
+    match block {
+        Some(mailcraft_model::Block::Heading { level, .. }) => format!("Heading {level}"),
+        Some(mailcraft_model::Block::Paragraph { .. }) => "Normal".to_owned(),
+        _ => String::new(),
     }
 }
 
@@ -287,7 +370,9 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 8] = [
+pub const SOURCES: [&str; 10] = [
+    "signatures",
+    "recentFiles",
     "quicksteps",
     "categories",
     "accounts",
@@ -372,7 +457,37 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 })
                 .collect()
         }
-        "styles" => STYLES.iter().map(|s| plain(s, "font-color")).collect(),
+        "styles" => {
+            let current = compose(app, surface).map(current_style).unwrap_or_default();
+            STYLES
+                .iter()
+                .map(|s| DynItem { on: current.eq_ignore_ascii_case(s), ..plain(s, "font-color") })
+                .collect()
+        }
+        // Signature ▾: the saved signatures (checked: the one in this message).
+        "signatures" => {
+            let current = compose(app, surface).and_then(|c| c.signature.as_ref()).map(|s| s.name.clone());
+            app.s
+                .mailbox
+                .signatures
+                .iter()
+                .map(|g| DynItem {
+                    on: current.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&g.name)),
+                    ..plain(&g.name, "signature")
+                })
+                .collect()
+        }
+        // Attach File ▾: files attached recently, newest first.
+        "recentFiles" => crate::compose::recent_files()
+            .into_iter()
+            .map(|p| DynItem {
+                label: crate::compose::recent_label(&p),
+                icon: "attach",
+                swatch: None,
+                vars: vec![("$path", json!(p))],
+                on: false,
+            })
+            .collect(),
         "views:people" => {
             ["People", "Business Card", "Card", "Phone", "List"].iter().map(|s| plain(s, "people")).collect()
         }
@@ -549,6 +664,12 @@ pub fn run(ctx: &egui::Context, app: &mut App, surface: Surface, mem: &mut Mem, 
         }
     }
     let params = with_context(app, surface, &act.cmd, act.params.clone());
+    // A few compose commands open the compose window's own UI (file picker, Signatures, Spelling dialog).
+    if let Surface::Compose(cid) = surface
+        && crate::compose::ribbon_command(ctx, app, cid, &act.cmd, &params)
+    {
+        return;
+    }
     // Calendar commands go through the modules area so the calendar's view state goes in and comes back.
     let result = if surface == Surface::Main && act.cmd.starts_with("calendar.") {
         crate::modules::calendar_command(ctx, app, &act.cmd, params)
@@ -651,4 +772,107 @@ pub enum Resolved {
         key: String,
     },
     Sep,
+}
+
+#[cfg(test)]
+mod compose_state_tests {
+    use super::*;
+    use mailcraft_engine::compose::{ComposeKind, ComposeState, DocPos};
+    use mailcraft_engine::{Session, model::Mailbox};
+
+    fn app_with(body: mailcraft_model::Doc) -> (App, u64) {
+        let mut mb = Mailbox::new_local("Local");
+        mb.add_signature("Formal", mailcraft_model::Doc::from_plain_text("Regards")).unwrap();
+        let mut s = Session::new(mb);
+        let cid = s.open_compose(ComposeState { kind: ComposeKind::New, body, ..ComposeState::default() });
+        (App::new(s), cid)
+    }
+
+    fn select(app: &mut App, cid: u64, a: (Vec<usize>, usize), b: (Vec<usize>, usize)) {
+        if let Some(c) = app.s.composes.get_mut(&cid) {
+            c.set_selection(DocPos::new(a.0, a.1), DocPos::new(b.0, b.1));
+        }
+    }
+
+    #[test]
+    fn character_toggles_follow_the_whole_selection() {
+        use mailcraft_model::{Block, Inline, TextStyle};
+        let bold = TextStyle { bold: Some(true), ..TextStyle::default() };
+        let body = mailcraft_model::Doc {
+            blocks: vec![
+                Block::Paragraph {
+                    style: Default::default(),
+                    inlines: vec![
+                        Inline::Text { text: "ab".into(), style: bold.clone() },
+                        Inline::Text { text: "cd".into(), style: TextStyle::default() },
+                    ],
+                },
+                Block::Heading {
+                    level: 1,
+                    style: Default::default(),
+                    inlines: vec![Inline::Text { text: "Title".into(), style: TextStyle::default() }],
+                },
+            ],
+            ..Default::default()
+        };
+        let (mut app, cid) = app_with(body);
+        let s = Surface::Compose(cid);
+        let mem = Mem::default();
+        select(&mut app, cid, (vec![0], 0), (vec![0], 2));
+        assert!(is_on(&app, s, &mem, "bold"), "all selected chars are bold");
+        select(&mut app, cid, (vec![0], 0), (vec![0], 4));
+        assert!(!is_on(&app, s, &mem, "bold"), "mixed selection");
+        assert!(!is_on(&app, s, &mem, "italic"));
+        select(&mut app, cid, (vec![1], 1), (vec![1], 1));
+        assert!(is_on(&app, s, &mem, "bold"), "heading text counts as bold");
+        let styles = dyn_items(&app, s, "styles");
+        assert!(styles.iter().any(|d| d.label == "Heading 1" && d.on));
+        select(&mut app, cid, (vec![0], 1), (vec![0], 1));
+        assert!(dyn_items(&app, s, "styles").iter().any(|d| d.label == "Normal" && d.on));
+    }
+
+    #[test]
+    fn font_boxes_go_blank_on_a_mixed_selection() {
+        use mailcraft_model::{Block, Inline, TextStyle};
+        let big =
+            TextStyle { size_pt: Some(20.0), font_family: Some("Carlito".into()), ..TextStyle::default() };
+        let body = mailcraft_model::Doc {
+            blocks: vec![Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![
+                    Inline::Text { text: "ab".into(), style: big.clone() },
+                    Inline::Text { text: "cd".into(), style: TextStyle::default() },
+                ],
+            }],
+            ..Default::default()
+        };
+        let (mut app, cid) = app_with(body);
+        let s = Surface::Compose(cid);
+        // Backward selection over the big chars: the first selected char decides, not the char before the caret.
+        select(&mut app, cid, (vec![0], 2), (vec![0], 0));
+        assert_eq!(combo_value(&app, s, Some("value:size")), "20");
+        assert_eq!(combo_value(&app, s, Some("value:font")), "Carlito");
+        select(&mut app, cid, (vec![0], 1), (vec![0], 3));
+        assert_eq!(combo_value(&app, s, Some("value:size")), "");
+        assert_eq!(combo_value(&app, s, Some("value:font")), "");
+        select(&mut app, cid, (vec![0], 4), (vec![0], 4));
+        assert_eq!(combo_value(&app, s, Some("value:size")), "12");
+    }
+
+    #[test]
+    fn signature_and_recent_file_sources() {
+        let (mut app, cid) = app_with(mailcraft_model::Doc::from_plain_text("x"));
+        let s = Surface::Compose(cid);
+        let sigs = dyn_items(&app, s, "signatures");
+        assert_eq!(sigs.len(), 1);
+        assert!(!sigs[0].on);
+        app.run("compose.signature", json!({"compose": cid, "name": "Formal"}));
+        assert!(dyn_items(&app, s, "signatures")[0].on);
+        assert!(is_on(&app, s, &Mem::default(), "signature:Formal"));
+        let path = format!("/home/user/Documents/mailcraft-state-test-{}/notes.txt", std::process::id());
+        crate::compose::remember_file(&path);
+        let recent = dyn_items(&app, s, "recentFiles");
+        let item = recent.iter().find(|d| d.label == "notes.txt").unwrap();
+        assert_eq!(item.vars, vec![("$path", json!(path))]);
+    }
 }

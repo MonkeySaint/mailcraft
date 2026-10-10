@@ -1,16 +1,23 @@
-//! `review.*`: proofing and reading tools. Spelling/grammar is a stub until the proofing engine lands
-//! (commit 6) and reports no issues; Word Count, Accessibility, Thesaurus (small bundled list) and Language
-//! work on the compose body. Read Aloud and Translate need platform services (speech, a translator backend):
+//! `review.*`: proofing and reading tools. Spelling and Grammar checks the compose body with
+//! `mailcraft-proof` (bundled US English plus the user's dictionary); issues are cached on the compose and
+//! refreshed when the body changed (edit counter), positions are body [`DocPos`]es. Word Count,
+//! Accessibility, Thesaurus (small bundled list) and Language work on the compose body. Read Aloud and Translate need platform services (speech, a translator backend):
 //! the engine gathers the text and hands it to the UI through a dialog notice; a translator calls back with
 //! `{"to", "text"}` to apply the translation.
 
 use serde_json::{Value, json};
 
-use super::compose::{compose_id, compose_mut, has_compose, rich_compose, spec};
+use std::sync::OnceLock;
+
+use super::compose::{
+    commit_extras, compose_id, compose_mut, has_compose, pos_json, pos_param, rich_compose, spec,
+};
 use crate::cmd::util::{dialog, opt_bool, opt_str};
+use crate::compose::{ComposeState, DocPos, SpellIssue, TextIssue};
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_geom::Color;
 use mailcraft_model::{Doc, ItemId};
+use mailcraft_proof::{IssueKind, Speller};
 
 /// Minimum contrast ratio for body text (WCAG 2.x AA, normal text).
 const MIN_CONTRAST: f32 = 4.5;
@@ -46,11 +53,196 @@ fn target_text(s: &Session, p: &Value) -> Result<(Value, String), CmdError> {
     Ok((json!({"item": id.0}), m.body_text()))
 }
 
+/// Suggestions computed per spelling issue.
+const SUGGESTIONS: usize = 5;
+/// Issues that get suggestions in one `review.spelling` result (the rest get them when asked).
+const SUGGEST_FIRST: usize = 50;
+
+static BASE_SPELLER: OnceLock<Speller> = OnceLock::new();
+
+/// The session's speller: bundled US English plus the custom dictionary (File › Options › Mail › Editor
+/// Options › Custom Dictionaries).
+pub fn speller(s: &Session) -> Speller {
+    let mut sp = BASE_SPELLER.get_or_init(Speller::bundled_en_us).clone();
+    sp.set_user_words(s.mailbox.custom_dictionary.iter());
+    sp
+}
+
+fn kind_label(k: IssueKind) -> &'static str {
+    match k {
+        IssueKind::Spelling => "spelling",
+        IssueKind::RepeatedWord => "repeated",
+        IssueKind::Capitalization => "capitalization",
+        IssueKind::DoubleSpace => "doubleSpace",
+    }
+}
+
+/// Issues in one paragraph's text as char ranges (the checker reports byte ranges).
+pub fn text_issues(sp: &Speller, text: &str) -> Vec<TextIssue> {
+    let starts: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+    let char_of = |byte: usize| -> Option<usize> {
+        if byte == text.len() { Some(starts.len()) } else { starts.binary_search(&byte).ok() }
+    };
+    sp.check_text(text)
+        .into_iter()
+        .filter_map(|i| {
+            Some(TextIssue {
+                start: char_of(i.start)?,
+                end: char_of(i.end)?,
+                kind: kind_label(i.kind).to_owned(),
+                suggestions: i.suggestions,
+            })
+        })
+        .collect()
+}
+
+/// Re-checks a compose's body when it changed since the last check (or with `force`); `min_edits` debounces
+/// checking while typing (re-check only after that many edits; 0 or 1 = after every edit). Returns whether
+/// it re-checked.
+pub fn spell_check(sp: &Speller, c: &mut ComposeState, force: bool, min_edits: u64) -> bool {
+    let due = force
+        || match c.spell_rev {
+            None => true,
+            Some(r) => c.edit_rev.wrapping_sub(r) >= min_edits.max(1),
+        };
+    if !due {
+        return false;
+    }
+    c.refresh_spelling(true, &mut |t: &str| text_issues(sp, t))
+}
+
+/// Fills in suggestions for the first `n` spelling issues that have none.
+fn fill_suggestions(sp: &Speller, c: &mut ComposeState, n: usize) {
+    for issue in c.spell_issues.iter_mut().filter(|i| i.kind == "spelling").take(n) {
+        if issue.suggestions.is_empty() {
+            issue.suggestions = sp.suggest(&issue.word, SUGGESTIONS);
+        }
+    }
+}
+
+fn issue_json(i: &SpellIssue) -> Value {
+    json!({"start": pos_json(&i.start), "end": pos_json(&i.end), "word": i.word, "kind": i.kind, "suggestions": i.suggestions})
+}
+
+/// Checks the target compose (when stale) and returns it.
+fn checked<'a>(s: &'a mut Session, p: &Value) -> Result<(&'a mut ComposeState, Speller), CmdError> {
+    let sp = speller(s);
+    let force = opt_bool(p, "force") == Some(true);
+    let c = compose_mut(s, p)?;
+    spell_check(&sp, c, force, 1);
+    Ok((c, sp))
+}
+
 fn spelling(s: &mut Session, p: &Value) -> CmdResult {
     let grammar = opt_bool(p, "grammar").unwrap_or(true);
-    let c = compose_mut(s, p)?;
+    let next = opt_bool(p, "next") == Some(true);
+    let (c, sp) = checked(s, p)?;
+    fill_suggestions(&sp, c, SUGGEST_FIRST);
     let words = c.word_count().words;
-    Ok(json!({"issues": [], "count": 0, "grammar": grammar, "wordsChecked": words, "language": c.language}))
+    let shown: Vec<&SpellIssue> =
+        c.spell_issues.iter().filter(|i| grammar || i.kind == "spelling" || i.kind == "repeated").collect();
+    let issues: Vec<Value> = shown.iter().map(|i| issue_json(i)).collect();
+    let count = issues.len();
+    // F7: select the next issue after the selection.
+    let current = if next {
+        let from = c.selection.end().clone();
+        let pick = shown.iter().find(|i| i.start >= from).or_else(|| shown.first()).map(|i| (*i).clone());
+        if let Some(i) = &pick {
+            if i.suggestions.is_empty() && i.kind == "spelling" {
+                // Suggestions beyond the first batch.
+                let sugg = sp.suggest(&i.word, SUGGESTIONS);
+                if let Some(cached) = c.spell_issues.iter_mut().find(|x| x.start == i.start) {
+                    cached.suggestions = sugg;
+                }
+            }
+            c.selection = crate::compose::BodySelection { anchor: i.start.clone(), focus: i.end.clone() };
+            c.pending_style = None;
+        }
+        pick.and_then(|i| c.spell_issues.iter().find(|x| x.start == i.start).map(issue_json))
+    } else {
+        None
+    };
+    Ok(json!({
+        "compose": c.id,
+        "issues": issues,
+        "count": count,
+        "current": current,
+        "grammar": grammar,
+        "wordsChecked": words,
+        "language": c.language.clone().unwrap_or_else(|| "en-US".into()),
+    }))
+}
+
+/// `{"at": {path, offset}}` when given.
+fn at_param(p: &Value) -> Result<Option<DocPos>, CmdError> {
+    match p.get("at") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => pos_param(v).map(Some),
+    }
+}
+
+fn ignore(s: &mut Session, p: &Value) -> CmdResult {
+    let all = opt_bool(p, "all") == Some(true);
+    let word = opt_str(p, "word").map(str::to_owned);
+    let at = at_param(p)?;
+    let (c, _) = checked(s, p)?;
+    if !all && word.is_none() && c.spell_issue_at(at.as_ref().unwrap_or(c.selection.start())).is_none() {
+        return Err(CmdError::Failed("there is no spelling issue there".into()));
+    }
+    if all && word.is_none() && c.spell_issue_at(at.as_ref().unwrap_or(c.selection.start())).is_none() {
+        return Err(CmdError::Params("`word` required (no spelling issue at the cursor)".into()));
+    }
+    let dropped = c.ignore_spelling(word.as_deref(), all, at.as_ref());
+    Ok(json!({"ignored": dropped, "all": all, "remaining": c.spell_issues.len()}))
+}
+
+fn add_to_dictionary(s: &mut Session, p: &Value) -> CmdResult {
+    let at = at_param(p)?;
+    let word = match opt_str(p, "word") {
+        Some(w) => w.trim().to_owned(),
+        None => {
+            let (c, _) = checked(s, p)?;
+            let pos = at.unwrap_or_else(|| c.selection.start().clone());
+            c.spell_issue_at(&pos).filter(|i| i.kind == "spelling").map(|i| i.word.clone()).ok_or_else(
+                || CmdError::Params("`word` required (no misspelled word at the cursor)".into()),
+            )?
+        }
+    };
+    let before = s.mailbox.clone();
+    let added = s.mailbox.add_to_dictionary(&word);
+    if !added && !s.mailbox.in_dictionary(&word) {
+        return Err(CmdError::Params(format!("`{word}` cannot be added to the dictionary")));
+    }
+    commit_extras(s, before, "Add to Dictionary");
+    let mut dropped = 0usize;
+    for c in s.composes.values_mut() {
+        dropped = dropped.saturating_add(c.forget_spelling_word(&word));
+    }
+    Ok(json!({"word": word, "added": added, "dropped": dropped}))
+}
+
+fn correct(s: &mut Session, p: &Value) -> CmdResult {
+    let replacement = opt_str(p, "replacement").map(str::to_owned);
+    let all = opt_bool(p, "all") == Some(true);
+    let at = at_param(p)?;
+    let (c, sp) = checked(s, p)?;
+    let pos = at.unwrap_or_else(|| c.selection.start().clone());
+    let Some(issue) = c.spell_issue_at(&pos).cloned() else {
+        return Err(CmdError::Failed("there is no spelling issue there".into()));
+    };
+    let replacement = match replacement {
+        Some(r) => r,
+        None => {
+            let sugg = if issue.suggestions.is_empty() && issue.kind == "spelling" {
+                sp.suggest(&issue.word, 1)
+            } else {
+                issue.suggestions.clone()
+            };
+            sugg.into_iter().next().ok_or_else(|| CmdError::Failed("there are no suggestions".into()))?
+        }
+    };
+    let n = c.correct_spelling(&replacement, Some(&issue.start), all);
+    Ok(json!({"replaced": n, "with": replacement, "caret": pos_json(&c.selection.focus)}))
 }
 
 fn word_count(s: &mut Session, p: &Value) -> CmdResult {
@@ -303,7 +495,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Spelling and Grammar",
             "Review › Editor; Message › Editor",
             "F7",
-            r#"{"grammar"?:bool}"#,
+            r#"{"grammar"?:bool,"next"?:bool,"force"?:bool}"#,
             false,
             has_compose,
             spelling,
@@ -329,6 +521,36 @@ pub fn specs() -> Vec<CommandSpec> {
             translate,
         ),
         spec("review.wordCount", "Word Count", "Review › Editor", "", "", false, has_compose, word_count),
+        spec(
+            "review.ignore",
+            "Ignore",
+            "Review › Editor › Spelling and Grammar; Context › Spelling",
+            "",
+            r#"{"word"?:string,"all"?:bool,"at"?:{"path":[number],"offset":number}}"#,
+            false,
+            has_compose,
+            ignore,
+        ),
+        spec(
+            "review.addToDictionary",
+            "Add to Dictionary",
+            "Review › Editor › Spelling and Grammar; Context › Spelling",
+            "",
+            r#"{"word"?:string,"at"?:{"path":[number],"offset":number}}"#,
+            true,
+            crate::always,
+            add_to_dictionary,
+        ),
+        spec(
+            "review.correct",
+            "Change",
+            "Review › Editor › Spelling and Grammar; Context › Spelling",
+            "",
+            r#"{"replacement"?:string,"all"?:bool,"at"?:{"path":[number],"offset":number}}"#,
+            false,
+            has_compose,
+            correct,
+        ),
     ]
 }
 
@@ -362,15 +584,110 @@ mod tests {
     }
 
     #[test]
-    fn spelling_stub_and_language() {
+    fn spelling_and_language() {
         let mut s = session();
-        open(&mut s);
-        s.run("compose.insertText", &json!({"text": "teh cat"})).unwrap();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "The cat sat on teh mat."})).unwrap();
         let r = s.run("review.spelling", &json!({})).unwrap();
-        assert_eq!(r["count"], 0);
+        assert_eq!(r["count"], 1, "{r}");
+        let issue = &r["issues"][0];
+        assert_eq!(issue["word"], "teh");
+        assert_eq!(issue["start"], json!({"path": [0], "offset": 15}));
+        assert_eq!(issue["end"], json!({"path": [0], "offset": 18}));
+        assert!(issue["suggestions"].as_array().unwrap().iter().any(|v| v == "the"), "{issue}");
+        assert_eq!(r["language"], "en-US");
         s.run("review.language", &json!({"lang": "fr-CA"})).unwrap();
         assert!(s.run("review.language", &json!({"lang": "not a tag"})).is_err());
         assert_eq!(s.run("review.language", &json!({})).unwrap()["dialog"], "language");
+        // F7 selects the next issue; Change applies the first suggestion.
+        let r = s.run("review.spelling", &json!({"next": true})).unwrap();
+        assert_eq!(r["current"]["word"], "teh");
+        assert_eq!(s.composes[&id].selected_text(), "teh");
+        let r = s.run("review.correct", &json!({})).unwrap();
+        assert_eq!(r["with"], "the");
+        assert_eq!(s.composes[&id].body.to_plain_text(), "The cat sat on the mat.");
+        assert_eq!(s.run("review.spelling", &json!({})).unwrap()["count"], 0);
+        assert!(s.run("review.correct", &json!({})).is_err(), "nothing to change");
+    }
+
+    #[test]
+    fn spelling_grammar_ignore_and_dictionary() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "this is is Zorbleflax.\nZorbleflax again"})).unwrap();
+        let r = s.run("review.spelling", &json!({})).unwrap();
+        let kinds: Vec<&str> =
+            r["issues"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"capitalization") && kinds.contains(&"repeated"), "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|k| **k == "spelling").count(), 2);
+        let r = s.run("review.spelling", &json!({"grammar": false})).unwrap();
+        assert!(r["issues"].as_array().unwrap().iter().all(|i| i["kind"] != "capitalization"));
+        // Ignore once at a position, then the other occurrence is still flagged.
+        s.run("review.ignore", &json!({"at": {"path": [0], "offset": 12}})).unwrap();
+        let r = s.run("review.spelling", &json!({"grammar": false})).unwrap();
+        assert_eq!(r["issues"].as_array().unwrap().iter().filter(|i| i["kind"] == "spelling").count(), 1);
+        assert!(s.run("review.ignore", &json!({"at": {"path": [0], "offset": 6}})).is_err());
+        // Add to Dictionary: persisted in the mailbox, journaled, gone from every compose.
+        let r = s.run("review.addToDictionary", &json!({"at": {"path": [1], "offset": 2}})).unwrap();
+        assert_eq!(r["word"], "Zorbleflax");
+        assert!(s.mailbox.in_dictionary("zorbleflax"));
+        assert!(s.pending_ops.iter().any(|o| matches!(o, mailcraft_store::Op::Replace(_))));
+        s.run("compose.insertText", &json!({"text": " Zorbleflax"})).unwrap();
+        let r = s.run("review.spelling", &json!({"grammar": false})).unwrap();
+        assert_eq!(
+            r["issues"].as_array().unwrap().iter().filter(|i| i["kind"] == "spelling").count(),
+            0,
+            "{r}"
+        );
+        assert!(s.run("review.addToDictionary", &json!({"word": "two words"})).is_err());
+        // Ignore All for this message.
+        s.run("compose.insertText", &json!({"text": " Qwzzrt Qwzzrt."})).unwrap();
+        s.run("review.ignore", &json!({"word": "qwzzrt", "all": true})).unwrap();
+        let r = s.run("review.spelling", &json!({"grammar": false})).unwrap();
+        assert!(r["issues"].as_array().unwrap().iter().all(|i| i["word"] != "Qwzzrt"), "{r}");
+        assert!(s.composes[&id].ignored_words.contains(&"qwzzrt".to_owned()));
+        // Undo of the dictionary addition.
+        s.run("app.undo", &json!({})).unwrap();
+        assert!(!s.mailbox.in_dictionary("zorbleflax"));
+    }
+
+    #[test]
+    fn spelling_cache_follows_edits_and_debounce() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "Hello wrold"})).unwrap();
+        let sp = speller(&s);
+        let c = s.composes.get_mut(&id).unwrap();
+        assert!(spell_check(&sp, c, false, 3));
+        assert_eq!(c.spell_issues.len(), 1);
+        c.insert_text(" mroe");
+        assert!(!spell_check(&sp, c, false, 3), "debounced: one edit < 3");
+        c.insert_text(" x");
+        c.insert_text(" y");
+        assert!(spell_check(&sp, c, false, 3));
+        assert_eq!(c.spell_issues.len(), 2);
+        assert!(spell_check(&sp, c, true, 3), "forced");
+        assert!(!spell_check(&sp, c, false, 1), "nothing changed");
+        // Byte → char mapping with multi-byte text before the word.
+        let issues = text_issues(&sp, "Ünïcødé wrold \u{FFFC} ok");
+        assert!(issues.iter().any(|i| (i.start, i.end) == (8, 13)), "{issues:?}");
+    }
+
+    #[test]
+    fn spelling_in_a_reply_skips_the_original() {
+        let mut s = session();
+        open(&mut s);
+        let c = s.composes.values_mut().next_back().unwrap();
+        c.kind = crate::compose::ComposeKind::Reply;
+        c.body = mailcraft_model::Doc::from_plain_text(
+            "Thanks, wrold\n\n-----Original Message-----\nFrom: x\nmispeled text",
+        );
+        c.ensure_body();
+        c.mark_edited();
+        let r = s.run("review.spelling", &json!({"grammar": false})).unwrap();
+        let words: Vec<&str> =
+            r["issues"].as_array().unwrap().iter().map(|i| i["word"].as_str().unwrap()).collect();
+        assert_eq!(words, ["wrold"]);
     }
 
     #[test]

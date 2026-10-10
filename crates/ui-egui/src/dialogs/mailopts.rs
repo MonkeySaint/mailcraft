@@ -1,10 +1,12 @@
 //! Mail option dialogs: Reading Pane options, Junk Email Options, Message Options / Properties, and
-//! Signatures and Stationery.
+//! Signatures and Stationery (`signatures`).
+
+mod signatures;
 
 use egui::{Context, RichText};
 use serde_json::{Value, json};
 
-use super::common::{self, Dlg, Out, btn, btn_en, muted, ok_cancel, window, with_state};
+use super::common::{self, Dlg, Out, btn_en, muted, ok_cancel, window, with_state};
 use crate::App;
 use mailcraft_model::{Importance, ItemId, Sensitivity};
 
@@ -13,7 +15,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "readingPaneOptions" => reading_pane(ctx, app, d),
         "junkOptions" => junk(ctx, app, d),
         "messageOptions" => message_options(ctx, app, d),
-        "stationery" | "signatures" => signatures(ctx, app, d),
+        "stationery" | "signatures" => signatures::show(ctx, app, d),
         _ => return None,
     })
 }
@@ -404,155 +406,3 @@ fn apply_compose(app: &mut App, c: u64, st: &MsgOpts, imp: &str, sens: &str) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-
-#[derive(Clone, Default)]
-struct SigState {
-    tab: usize,
-    sigs: Vec<(String, String)>,
-    selected: Option<usize>,
-    new_name: String,
-    default_new: String,
-    default_reply: String,
-    font: String,
-}
-
-fn signatures(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let compose = d.u64("compose");
-    let init = |_: &App| {
-        let sigs: Vec<(String, String)> = common::pref(ctx, "signatures")
-            .and_then(|v| v.as_array().cloned())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| {
-                        Some((s.get("name")?.as_str()?.to_owned(), s.get("text")?.as_str()?.to_owned()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let s = |k: &str| {
-            common::pref(ctx, k)
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "(none)".into())
-        };
-        SigState {
-            tab: usize::from(d.name == "stationery" && compose.is_none() && d.get("tab").is_some()),
-            selected: if sigs.is_empty() { None } else { Some(0) },
-            sigs,
-            default_new: s("signatures.defaultNew"),
-            default_reply: s("signatures.defaultReply"),
-            font: common::pref(ctx, "stationery.font")
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "Inter 11pt".into()),
-            ..Default::default()
-        }
-    };
-    with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Signatures and Stationery", 640.0, |ui, app| {
-            ui.horizontal(|ui| {
-                for (i, t) in ["Email Signature", "Personal Stationery"].iter().enumerate() {
-                    if ui.selectable_label(st.tab == i, *t).clicked() {
-                        st.tab = i;
-                    }
-                }
-            });
-            ui.separator();
-            if st.tab == 0 {
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(220.0);
-                        ui.label("Select signature to edit");
-                        egui::Frame::new()
-                            .stroke(egui::Stroke::new(1.0, app.theme.separator))
-                            .inner_margin(4.0)
-                            .show(ui, |ui| {
-                                ui.set_min_height(130.0);
-                                ui.set_width(210.0);
-                                for (i, (n, _)) in st.sigs.iter().enumerate() {
-                                    if ui.selectable_label(st.selected == Some(i), n).clicked() {
-                                        st.selected = Some(i);
-                                    }
-                                }
-                            });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut st.new_name)
-                                    .hint_text("Name")
-                                    .desired_width(90.0),
-                            );
-                            if ui
-                                .add_enabled(!st.new_name.trim().is_empty(), egui::Button::new("New"))
-                                .clicked()
-                            {
-                                st.sigs.push((st.new_name.trim().to_owned(), String::new()));
-                                st.selected = Some(st.sigs.len() - 1);
-                                st.new_name.clear();
-                            }
-                            if ui.add_enabled(st.selected.is_some(), egui::Button::new("Delete")).clicked()
-                                && let Some(i) = st.selected.take()
-                                && i < st.sigs.len()
-                            {
-                                st.sigs.remove(i);
-                            }
-                        });
-                    });
-                    ui.vertical(|ui| {
-                        ui.label("Choose default signature");
-                        let mut names: Vec<&str> = vec!["(none)"];
-                        names.extend(st.sigs.iter().map(|s| s.0.as_str()));
-                        ui.horizontal(|ui| {
-                            ui.label("New messages:");
-                            common::combo(ui, ("signew", uid), &mut st.default_new, &names, 160.0);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Replies/forwards:");
-                            common::combo(ui, ("sigrep", uid), &mut st.default_reply, &names, 160.0);
-                        });
-                    });
-                });
-                ui.label("Edit signature");
-                if let Some((name, text)) = st.selected.and_then(|i| st.sigs.get_mut(i)) {
-                    ui.add(egui::TextEdit::multiline(text).desired_rows(6).desired_width(f32::INFINITY));
-                    if let Some(c) = compose
-                        && btn(ui, "Insert in Message")
-                    {
-                        app.run("compose.signature", json!({"compose": c, "name": name, "text": text}));
-                    }
-                } else {
-                    muted(ui, app, "Create a signature with New.");
-                }
-            } else {
-                common::heading(ui, app, "New mail messages");
-                ui.horizontal(|ui| {
-                    ui.label("Font:");
-                    common::combo(
-                        ui,
-                        ("sfont", uid),
-                        &mut st.font,
-                        &["Inter 11pt", "Carlito 11pt", "Liberation Serif 12pt", "Liberation Mono 10pt"],
-                        200.0,
-                    );
-                });
-                if let Some(c) = compose
-                    && btn(ui, "Theme...")
-                {
-                    app.run("compose.theme", json!({"compose": c, "action": "browse"}));
-                }
-                muted(ui, app, "The font applies to new messages you write.");
-            }
-            match ok_cancel(ui, app, true) {
-                Some(true) => {
-                    let list: Vec<Value> =
-                        st.sigs.iter().map(|(n, t)| json!({"name": n, "text": t})).collect();
-                    common::set_pref(ctx, "signatures", json!(list));
-                    common::set_pref(ctx, "signatures.defaultNew", json!(st.default_new));
-                    common::set_pref(ctx, "signatures.defaultReply", json!(st.default_reply));
-                    common::set_pref(ctx, "stationery.font", json!(st.font));
-                    Out::Close
-                }
-                Some(false) => Out::Close,
-                None => Out::Keep,
-            }
-        })
-    })
-}

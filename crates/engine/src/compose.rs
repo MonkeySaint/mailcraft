@@ -197,9 +197,12 @@ pub struct EditorFlags {
 
 /// One editor undo step.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EditSnapshot {
     pub body: Doc,
     pub selection: BodySelection,
+    /// The signature block the body held (so Undo of a signature change restores which one it is).
+    pub signature: Option<SignatureBlock>,
 }
 
 /// Letter-case rewrite kinds (Change Case).
@@ -305,7 +308,86 @@ pub struct ComposeState {
     pub edit_undo: Vec<EditSnapshot>,
     #[serde(skip)]
     pub edit_redo: Vec<EditSnapshot>,
+
+    // --- added in commit 6 (compose depth: spelling) ---
+    /// Body edit counter (bumped by every checkpointed edit, typing and undo/redo); the spelling cache is
+    /// refreshed when it moves.
+    #[serde(skip)]
+    pub edit_rev: u64,
+    /// Cached spelling issues, valid while `spell_rev == Some(edit_rev)`.
+    #[serde(skip)]
+    pub spell_issues: Vec<SpellIssue>,
+    #[serde(skip)]
+    pub spell_rev: Option<u64>,
+    /// Words ignored in this message (Ignore All), compared case-insensitively.
+    pub ignored_words: Vec<String>,
+    /// Single occurrences ignored (Ignore Once): where the word starts and the word.
+    pub ignored_once: Vec<(DocPos, String)>,
+
+    // --- added in the commit 6 review ---
+    /// The last coalescing edit (see [`ComposeState::run_edit`]): its kind, the caret it left and the edit
+    /// counter after it.
+    #[serde(skip)]
+    pub edit_run: Option<(EditRun, DocPos, u64)>,
 }
+
+/// Edits that share one undo step while they follow each other at the caret (typing a word, holding
+/// Backspace), the way the classic editor undoes "Typing" as one action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditRun {
+    Typing,
+    DeleteBackward,
+    DeleteForward,
+}
+
+/// One spelling issue in the compose body (char range of a leaf, see [`DocPos`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpellIssue {
+    pub start: DocPos,
+    pub end: DocPos,
+    pub word: String,
+    /// "spelling" or "repeated" (a doubled word).
+    pub kind: String,
+    /// Replacement suggestions (best first; may be empty, filled lazily by the checker).
+    pub suggestions: Vec<String>,
+}
+
+/// One issue a spelling checker reports for a text: char range `[start, end)` and kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextIssue {
+    pub start: usize,
+    pub end: usize,
+    pub kind: String,
+    pub suggestions: Vec<String>,
+}
+
+/// Table cell navigation (Tab / Shift+Tab / arrow keys between rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellMove {
+    Next,
+    Previous,
+    Up,
+    Down,
+}
+
+/// Table structure edits (Table Layout › Rows & Columns, Delete).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableEdit {
+    InsertRowAbove,
+    InsertRowBelow,
+    InsertColumnLeft,
+    InsertColumnRight,
+    DeleteRow,
+    DeleteColumn,
+    DeleteTable,
+}
+
+/// Most attachments on one compose.
+pub const MAX_COMPOSE_ATTACHMENTS: usize = 500;
+/// Longest attachment file name (chars).
+pub const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
+/// Most spelling issues kept per check.
+pub const MAX_SPELL_ISSUES: usize = 5_000;
 
 impl ComposeState {
     /// Window title: "Untitled - Message (HTML)" / "<subject> - Message (Plain Text)".
@@ -413,13 +495,64 @@ impl ComposeState {
     // Undo
     // ---------------------------------------------------------------------------------------------------
 
+    /// The state an undo step brings back.
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            body: self.body.clone(),
+            selection: self.selection.clone(),
+            signature: self.signature.clone(),
+        }
+    }
+
+    /// Puts `snap` in place and returns the state it replaced.
+    fn restore(&mut self, snap: EditSnapshot) -> EditSnapshot {
+        EditSnapshot {
+            body: std::mem::replace(&mut self.body, snap.body),
+            selection: std::mem::replace(&mut self.selection, snap.selection),
+            signature: std::mem::replace(&mut self.signature, snap.signature),
+        }
+    }
+
     /// Records an editor undo step (call before changing the body).
     pub fn checkpoint(&mut self) {
-        self.edit_undo.push(EditSnapshot { body: self.body.clone(), selection: self.selection.clone() });
+        self.mark_edited();
+        self.edit_undo.push(self.snapshot());
         if self.edit_undo.len() > MAX_EDIT_UNDO {
             self.edit_undo.remove(0);
         }
         self.edit_redo.clear();
+    }
+
+    /// Runs one editor action `f` as an undo step. With `run`, the action joins the previous step when that
+    /// was the same kind of edit and nothing happened since (no other edit, caret where it was left, nothing
+    /// selected). An action that leaves the body unchanged records no step and keeps the redo history.
+    pub fn run_edit(&mut self, run: Option<EditRun>, f: impl FnOnce(&mut Self)) {
+        let joins = run.is_some()
+            && self.selection.is_collapsed()
+            && !self.edit_undo.is_empty()
+            && self.edit_run.as_ref().is_some_and(|(k, at, rev)| {
+                Some(*k) == run && *at == self.selection.focus && *rev == self.edit_rev
+            });
+        let before = self.snapshot();
+        let dirty = self.dirty;
+        f(self);
+        if self.body == before.body {
+            self.dirty = dirty;
+            if self.selection != before.selection {
+                self.edit_run = None;
+            }
+            return;
+        }
+        if !joins {
+            self.edit_undo.push(before);
+            if self.edit_undo.len() > MAX_EDIT_UNDO {
+                self.edit_undo.remove(0);
+            }
+        }
+        self.edit_redo.clear();
+        self.dirty = true;
+        self.mark_edited();
+        self.edit_run = run.map(|k| (k, self.selection.focus.clone(), self.edit_rev));
     }
 
     /// Undoes the last body edit; false when there is nothing to undo.
@@ -427,12 +560,10 @@ impl ComposeState {
         let Some(snap) = self.edit_undo.pop() else {
             return false;
         };
-        let cur = EditSnapshot {
-            body: std::mem::replace(&mut self.body, snap.body),
-            selection: std::mem::replace(&mut self.selection, snap.selection),
-        };
+        let cur = self.restore(snap);
         self.edit_redo.push(cur);
         self.dirty = true;
+        self.mark_edited();
         self.ensure_body();
         true
     }
@@ -442,12 +573,10 @@ impl ComposeState {
         let Some(snap) = self.edit_redo.pop() else {
             return false;
         };
-        let cur = EditSnapshot {
-            body: std::mem::replace(&mut self.body, snap.body),
-            selection: std::mem::replace(&mut self.selection, snap.selection),
-        };
+        let cur = self.restore(snap);
         self.edit_undo.push(cur);
         self.dirty = true;
+        self.mark_edited();
         self.ensure_body();
         true
     }
@@ -475,6 +604,7 @@ impl ComposeState {
         self.selection = BodySelection::caret(normalize(&self.body, &pos));
         self.extra_ranges.clear();
         self.dirty = true;
+        self.mark_edited();
     }
 
     /// Deletes the selected text; false when the selection is collapsed.
@@ -488,6 +618,7 @@ impl ComposeState {
         self.selection = BodySelection::caret(normalize(&self.body, &pos));
         self.extra_ranges.clear();
         self.dirty = true;
+        self.mark_edited();
         true
     }
 
@@ -499,6 +630,7 @@ impl ComposeState {
         let pos = delete_range(&mut self.body, &a, &b);
         self.selection = BodySelection::caret(normalize(&self.body, &pos));
         self.dirty = true;
+        self.mark_edited();
     }
 
     /// Backspace.
@@ -530,7 +662,27 @@ impl ComposeState {
         };
         let prev_len = leaf_len(&self.body.blocks, prev);
         let start = DocPos::new(prev.clone(), prev_len);
+        // Never merge across a table cell boundary: the caret moves into the previous cell / out of the table,
+        // and an empty paragraph after a table goes away (not the last one, so text can follow the table).
+        if cell_of(&self.body.blocks, prev) != cell_of(&self.body.blocks, &pos.path) {
+            if leaves.get(k.saturating_add(1)).is_some() && self.removable_empty_leaf(&pos.path) {
+                remove_block(&mut self.body.blocks, &pos.path);
+                self.dirty = true;
+                self.mark_edited();
+            }
+            self.selection = BodySelection::caret(normalize(&self.body, &start));
+            self.extra_ranges.clear();
+            return;
+        }
         self.delete_range(&start, &pos);
+    }
+
+    /// Whether the leaf at `path` is an empty paragraph outside any table cell (Backspace / Delete next to a
+    /// table may remove it).
+    fn removable_empty_leaf(&self, path: &[usize]) -> bool {
+        matches!(block_at(&self.body.blocks, path), Some(Block::Paragraph { .. }))
+            && leaf_len(&self.body.blocks, path) == 0
+            && cell_of(&self.body.blocks, path).is_none()
     }
 
     /// Delete key.
@@ -553,6 +705,16 @@ impl ComposeState {
         let Some(next) = leaves.get(k.saturating_add(1)) else {
             return;
         };
+        // Never merge across a table cell boundary; an empty paragraph before a table goes away.
+        if cell_of(&self.body.blocks, next) != cell_of(&self.body.blocks, &pos.path) {
+            if self.removable_empty_leaf(&pos.path) {
+                remove_block(&mut self.body.blocks, &pos.path);
+                self.restore_caret_ord(k, 0);
+                self.dirty = true;
+                self.mark_edited();
+            }
+            return;
+        }
         let end = DocPos::new(next.clone(), 0);
         self.delete_range(&pos, &end);
     }
@@ -1100,6 +1262,10 @@ impl ComposeState {
             idx
         } else if pos.offset >= len {
             idx.saturating_add(1)
+        } else if kind == Some(LeafKind::Pre) {
+            // Enter in preformatted text adds a line break; here the block really splits in two.
+            split_pre(&mut self.body, &pos);
+            idx.saturating_add(1)
         } else {
             split_at(&mut self.body, &pos, false);
             idx.saturating_add(1)
@@ -1174,7 +1340,9 @@ impl ComposeState {
             return;
         }
         let Some(inlines) = single else {
-            self.insert_blocks(frag.blocks.clone());
+            if !self.merge_paste(&frag.blocks) {
+                self.insert_blocks(frag.blocks.clone());
+            }
             return;
         };
         self.delete_selection();
@@ -1625,6 +1793,799 @@ impl ComposeState {
     fn restore_caret_ord(&mut self, ord: usize, off: usize) {
         self.restore_ords(((ord, off), (ord, off)));
     }
+}
+
+// =======================================================================================================
+// Compose depth (commit 6): paste merging, attachments, table navigation, spelling cache, signatures
+// =======================================================================================================
+
+impl ComposeState {
+    /// Records that the body changed (the spelling cache goes stale).
+    pub fn mark_edited(&mut self) {
+        self.edit_rev = self.edit_rev.wrapping_add(1);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Paste
+    // ---------------------------------------------------------------------------------------------------
+
+    /// Pastes plain text at the caret, replacing the selection (one editor undo step).
+    pub fn paste_plain(&mut self, text: &str) {
+        self.ensure_body();
+        self.checkpoint();
+        self.insert_text(text);
+    }
+
+    /// Pastes HTML at the caret, replacing the selection: sanitised through `mailcraft_html::html_to_doc`;
+    /// a plain-text body gets the text only (one editor undo step).
+    pub fn paste_html(&mut self, html: &str) {
+        let doc = mailcraft_html::html_to_doc(html);
+        self.ensure_body();
+        self.checkpoint();
+        let mode =
+            if self.format == BodyFormat::PlainText { PasteMode::TextOnly } else { PasteMode::KeepSource };
+        self.insert_fragment(&doc, mode);
+    }
+
+    /// Multi-block paste the way word processors do it: the first pasted paragraph joins the text before the
+    /// caret, the last one joins the text after it, the blocks in between go between them. False (nothing
+    /// changed) when the shapes do not allow it (the caller then inserts the blocks whole).
+    fn merge_paste(&mut self, blocks: &[Block]) -> bool {
+        let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
+            return false;
+        };
+        let text_block = |b: &Block| matches!(b, Block::Paragraph { .. } | Block::Heading { .. });
+        if blocks.len() < 2 || !text_block(first) || !text_block(last) {
+            return false;
+        }
+        self.delete_selection();
+        let pos = self.selection.focus.clone();
+        if !matches!(leaf(&self.body.blocks, &pos.path), Some((LeafKind::Para | LeafKind::Heading, _))) {
+            return false;
+        }
+        let Some((&idx, prefix)) = pos.path.split_last() else {
+            return false;
+        };
+        let prefix = prefix.to_vec();
+        if seq_mut(&mut self.body.blocks, &prefix).is_none() {
+            return false;
+        }
+        let inlines_of = |b: &Block| match b {
+            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => inlines.clone(),
+            _ => Vec::new(),
+        };
+        // Split at the caret: the left part stays at `pos.path`, the right part becomes its next sibling.
+        split_at(&mut self.body, &pos, false);
+        if let Some((_, mut flat)) = leaf(&self.body.blocks, &pos.path) {
+            let add = Flat::from_inlines(&inlines_of(first));
+            let n = flat.len();
+            flat.insert_flat(n, &add);
+            store_leaf(&mut self.body.blocks, &pos.path, &flat);
+        }
+        let middle: Vec<Block> =
+            blocks.get(1..blocks.len().saturating_sub(1)).map(<[Block]>::to_vec).unwrap_or_default();
+        let m = middle.len();
+        if let Some(seq) = seq_mut(&mut self.body.blocks, &prefix) {
+            let at = idx.saturating_add(1).min(seq.len());
+            seq.splice(at..at, middle);
+        }
+        let mut right = prefix;
+        right.push(idx.saturating_add(1).saturating_add(m));
+        let add = Flat::from_inlines(&inlines_of(last));
+        let n = add.len();
+        if let Some((_, mut flat)) = leaf(&self.body.blocks, &right) {
+            flat.insert_flat(0, &add);
+            store_leaf(&mut self.body.blocks, &right, &flat);
+        }
+        self.selection = BodySelection::caret(normalize(&self.body, &DocPos::new(right, n)));
+        self.extra_ranges.clear();
+        self.dirty = true;
+        self.mark_edited();
+        true
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Attachments
+    // ---------------------------------------------------------------------------------------------------
+
+    /// Adds an attachment (name cleaned, MIME type given or guessed from the extension); returns its index.
+    pub fn attach_bytes(&mut self, name: &str, mime: Option<&str>, data: Vec<u8>) -> Result<usize, String> {
+        if self.attachments.len() >= MAX_COMPOSE_ATTACHMENTS {
+            return Err("too many attachments".into());
+        }
+        let filename = clean_attachment_name(name, "attachment");
+        let mime_type = mime
+            .map(str::trim)
+            .filter(|m| valid_mime_type(m))
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| mime_for_name(&filename).to_owned());
+        self.attachments.push(ComposeAttachment { filename, mime_type, data });
+        self.dirty = true;
+        Ok(self.attachments.len().saturating_sub(1))
+    }
+
+    /// Attaches a stored message as an item attachment (`message/rfc822`, "<subject>.eml").
+    pub fn attach_message(&mut self, m: &mailcraft_model::MailItem) -> Result<usize, String> {
+        // Slashes in a subject are not paths here.
+        let subject: String =
+            m.subject.trim().chars().map(|c| if matches!(c, '/' | '\\') { '_' } else { c }).collect();
+        let name = clean_attachment_name(&format!("{subject}.eml"), "message.eml");
+        let name = if name.eq_ignore_ascii_case(".eml") { "message.eml".to_owned() } else { name };
+        self.attach_bytes(&name, Some("message/rfc822"), crate::cmd::compose::message_source(m))
+    }
+
+    /// Renames attachment `index`; the MIME type follows a changed extension when it is a known one.
+    pub fn rename_attachment(&mut self, index: usize, new_name: &str) -> Result<String, String> {
+        if new_name.trim().is_empty() {
+            return Err("the new name is empty".into());
+        }
+        let name = clean_attachment_name(new_name, "attachment");
+        let Some(a) = self.attachments.get_mut(index) else {
+            return Err("no such attachment".into());
+        };
+        let guessed = mime_for_name(&name);
+        if guessed != "application/octet-stream" {
+            a.mime_type = guessed.to_owned();
+        }
+        a.filename = name.clone();
+        self.dirty = true;
+        Ok(name)
+    }
+
+    /// Removes attachment `index`.
+    pub fn remove_attachment(&mut self, index: usize) -> Option<ComposeAttachment> {
+        if index >= self.attachments.len() {
+            return None;
+        }
+        self.dirty = true;
+        Some(self.attachments.remove(index))
+    }
+
+    /// Total attachment bytes.
+    pub fn attachments_size(&self) -> u64 {
+        self.attachments
+            .iter()
+            .fold(0u64, |n, a| n.saturating_add(u64::try_from(a.data.len()).unwrap_or(u64::MAX)))
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Tables
+    // ---------------------------------------------------------------------------------------------------
+
+    /// The innermost table cell holding the caret: (table path, row, column).
+    pub fn cell_at_caret(&self) -> Option<(Vec<usize>, usize, usize)> {
+        cell_of(&self.body.blocks, &self.selection.focus.path)
+    }
+
+    /// Moves to another cell of the table holding the caret and selects its content (Tab / Shift+Tab /
+    /// row up/down). Next in the last cell adds a row first. False when the caret is not in a table or there
+    /// is no cell in that direction.
+    pub fn move_to_cell(&mut self, dir: CellMove) -> bool {
+        self.ensure_body();
+        let Some((table, row, col)) = self.cell_at_caret() else {
+            return false;
+        };
+        let widths: Vec<usize> = match block_at(&self.body.blocks, &table) {
+            Some(Block::Table { rows, .. }) => rows.iter().map(Vec::len).collect(),
+            _ => return false,
+        };
+        let width = |r: usize| widths.get(r).copied().unwrap_or(0);
+        let last_col = |r: usize| width(r).saturating_sub(1);
+        let n = widths.len();
+        let target = match dir {
+            CellMove::Next if col.saturating_add(1) < width(row) => Some((row, col.saturating_add(1))),
+            CellMove::Next => (row.saturating_add(1)..n).find(|r| width(*r) > 0).map(|r| (r, 0)),
+            CellMove::Previous if col > 0 => Some((row, col.saturating_sub(1).min(last_col(row)))),
+            CellMove::Previous => match (0..row).rev().find(|r| width(*r) > 0) {
+                Some(r) => Some((r, last_col(r))),
+                None => return false,
+            },
+            CellMove::Up => match (0..row).rev().find(|r| width(*r) > 0) {
+                Some(r) => Some((r, col.min(last_col(r)))),
+                None => return false,
+            },
+            CellMove::Down => match (row.saturating_add(1)..n).find(|r| width(*r) > 0) {
+                Some(r) => Some((r, col.min(last_col(r)))),
+                None => return false,
+            },
+        };
+        let (r, c) = match target {
+            Some(t) => t,
+            None => {
+                // Tab in the last cell adds a row like the current one.
+                if n >= MAX_TABLE_ROWS_EDIT {
+                    return false;
+                }
+                self.checkpoint();
+                if let Some(Block::Table { rows, .. }) = block_at_mut(&mut self.body.blocks, &table) {
+                    rows.push((0..width(row).max(1)).map(|_| table_cell("")).collect());
+                }
+                self.dirty = true;
+                (n, 0)
+            }
+        };
+        self.select_cell(&table, r, c)
+    }
+
+    /// Selects the content of cell (`r`, `c`) of the table at `table` (caret in it when empty).
+    fn select_cell(&mut self, table: &[usize], r: usize, c: usize) -> bool {
+        if let Some(Block::Table { rows, .. }) = block_at_mut(&mut self.body.blocks, table)
+            && let Some(cell) = rows.get_mut(r).and_then(|row| row.get_mut(c))
+            && leaves(&cell.blocks).is_empty()
+        {
+            cell.blocks.push(Block::text_paragraph(""));
+        }
+        let mut prefix = table.to_vec();
+        prefix.push(r);
+        prefix.push(c);
+        let inside: Vec<Vec<usize>> = leaves(&self.body.blocks)
+            .into_iter()
+            .filter(|p| p.len() > prefix.len() && p.starts_with(&prefix))
+            .collect();
+        let (Some(first), Some(last)) = (inside.first(), inside.last()) else {
+            return false;
+        };
+        let len = leaf_len(&self.body.blocks, last);
+        self.selection =
+            BodySelection { anchor: DocPos::new(first.clone(), 0), focus: DocPos::new(last.clone(), len) };
+        self.pending_style = None;
+        self.extra_ranges.clear();
+        true
+    }
+
+    /// Row / column / table edits on the table holding the caret (one editor undo step). False when the
+    /// caret is not in a table or the table is at its size limit.
+    pub fn table_edit(&mut self, op: TableEdit) -> bool {
+        self.ensure_body();
+        let Some((table, row, col)) = self.cell_at_caret() else {
+            return false;
+        };
+        let (nrows, width, max_width) = match block_at(&self.body.blocks, &table) {
+            Some(Block::Table { rows, .. }) => (
+                rows.len(),
+                rows.get(row).map_or(1, Vec::len).max(1),
+                rows.iter().map(Vec::len).max().unwrap_or(0),
+            ),
+            _ => return false,
+        };
+        let grows_rows = matches!(op, TableEdit::InsertRowAbove | TableEdit::InsertRowBelow);
+        let grows_cols = matches!(op, TableEdit::InsertColumnLeft | TableEdit::InsertColumnRight);
+        if (grows_rows && nrows >= MAX_TABLE_ROWS_EDIT) || (grows_cols && max_width >= MAX_TABLE_COLS_EDIT) {
+            return false;
+        }
+        self.checkpoint();
+        let mut target: Option<(usize, usize)> = None;
+        let mut remove_table = false;
+        if let Some(Block::Table { rows, .. }) = block_at_mut(&mut self.body.blocks, &table) {
+            let new_row = |w: usize| -> Vec<TableCell> { (0..w).map(|_| table_cell("")).collect() };
+            match op {
+                TableEdit::InsertRowAbove => {
+                    rows.insert(row.min(rows.len()), new_row(width));
+                    target = Some((row, col));
+                }
+                TableEdit::InsertRowBelow => {
+                    let at = row.saturating_add(1).min(rows.len());
+                    rows.insert(at, new_row(width));
+                    target = Some((at, col));
+                }
+                TableEdit::InsertColumnLeft | TableEdit::InsertColumnRight => {
+                    let at = if op == TableEdit::InsertColumnLeft { col } else { col.saturating_add(1) };
+                    for r in rows.iter_mut() {
+                        let i = at.min(r.len());
+                        r.insert(i, table_cell(""));
+                    }
+                    target = Some((row, at));
+                }
+                TableEdit::DeleteRow => {
+                    if row < rows.len() {
+                        rows.remove(row);
+                    }
+                    if rows.is_empty() {
+                        remove_table = true;
+                    } else {
+                        target = Some((row.min(rows.len().saturating_sub(1)), col));
+                    }
+                }
+                TableEdit::DeleteColumn => {
+                    for r in rows.iter_mut() {
+                        if col < r.len() {
+                            r.remove(col);
+                        }
+                    }
+                    rows.retain(|r| !r.is_empty());
+                    if rows.is_empty() {
+                        remove_table = true;
+                    } else {
+                        target = Some((row.min(rows.len().saturating_sub(1)), col.saturating_sub(1)));
+                    }
+                }
+                TableEdit::DeleteTable => remove_table = true,
+            }
+        }
+        if remove_table {
+            remove_block(&mut self.body.blocks, &table);
+            ensure_leaf(&mut self.body);
+            let pos = normalize(&self.body, &DocPos::new(table, 0));
+            self.selection = BodySelection::caret(pos);
+        } else if let Some((r, c)) = target {
+            let width = match block_at(&self.body.blocks, &table) {
+                Some(Block::Table { rows, .. }) => rows.get(r).map_or(0, Vec::len),
+                _ => 0,
+            };
+            if self.select_cell(&table, r, c.min(width.saturating_sub(1))) {
+                let start = self.selection.start().clone();
+                self.selection = BodySelection::caret(start);
+            }
+        }
+        self.extra_ranges.clear();
+        self.dirty = true;
+        self.ensure_body();
+        true
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Spelling
+    // ---------------------------------------------------------------------------------------------------
+
+    /// Whether the body changed since the last spelling check.
+    pub fn spelling_stale(&self) -> bool {
+        self.spell_rev != Some(self.edit_rev)
+    }
+
+    /// First top-level block of the quoted original in a reply/forward (proofing skips it, Outlook's
+    /// "Ignore original message text in reply or forward").
+    pub fn quoted_start(&self) -> Option<usize> {
+        if !matches!(self.kind, ComposeKind::Reply | ComposeKind::ReplyAll | ComposeKind::Forward) {
+            return None;
+        }
+        let blocks = &self.body.blocks;
+        blocks.iter().enumerate().skip(1).find_map(|(i, b)| {
+            let is_header = match b {
+                // The HTML header: a rule, then "From: …" (a rule the user drew above it is their text).
+                Block::Rule => blocks.get(i.saturating_add(1)).is_some_and(|n| {
+                    matches!(n, Block::Paragraph { .. })
+                        && blocks_text(std::slice::from_ref(n)).trim_start().starts_with("From:")
+                }),
+                Block::Paragraph { .. } => {
+                    blocks_text(std::slice::from_ref(b)).trim() == "-----Original Message-----"
+                }
+                _ => false,
+            };
+            is_header.then_some(i)
+        })
+    }
+
+    /// Re-checks the body when it changed since the last check (or with `force`): `check` gets the text of
+    /// one paragraph (one char per position; a line break is '\n', a picture U+FFFC) and returns issues as
+    /// char ranges. Linked and monospace (code) text, the quoted original of a reply/forward, ignored words
+    /// and ignored occurrences are skipped. Returns whether it re-checked.
+    pub fn refresh_spelling(&mut self, force: bool, check: &mut dyn FnMut(&str) -> Vec<TextIssue>) -> bool {
+        if !force && !self.spelling_stale() {
+            return false;
+        }
+        let stop = self.quoted_start().map(|i| vec![i]);
+        let mut out: Vec<SpellIssue> = Vec::new();
+        'leaves: for path in leaves(&self.body.blocks) {
+            if stop.as_ref().is_some_and(|s| path >= *s) {
+                break;
+            }
+            let Some((kind, flat)) = leaf(&self.body.blocks, &path) else {
+                continue;
+            };
+            if matches!(kind, LeafKind::Rule | LeafKind::Pre) {
+                continue;
+            }
+            let text = flat.text();
+            for ti in check(&text) {
+                if ti.end <= ti.start || ti.end > flat.len() {
+                    continue;
+                }
+                let skip = (ti.start..ti.end).any(|i| {
+                    flat.atoms.get(i).and_then(|a| flat.attrs.get(a.attr)).is_some_and(|r| {
+                        r.link.is_some()
+                            || r.style.monospace == Some(true)
+                            || r.style
+                                .font_family
+                                .as_deref()
+                                .is_some_and(|f| CODE_FONTS.iter().any(|c| f.eq_ignore_ascii_case(c)))
+                    })
+                });
+                if skip {
+                    continue;
+                }
+                let word: String =
+                    text.chars().skip(ti.start).take(ti.end.saturating_sub(ti.start)).collect();
+                let start = DocPos::new(path.clone(), ti.start);
+                if self.ignored_words.iter().any(|w| w.eq_ignore_ascii_case(&word))
+                    || self.ignored_once.iter().any(|(p, w)| *p == start && *w == word)
+                {
+                    continue;
+                }
+                out.push(SpellIssue {
+                    start,
+                    end: DocPos::new(path.clone(), ti.end),
+                    word,
+                    kind: if ti.kind.is_empty() { "spelling".into() } else { ti.kind },
+                    suggestions: ti.suggestions,
+                });
+                if out.len() >= MAX_SPELL_ISSUES {
+                    break 'leaves;
+                }
+            }
+        }
+        self.spell_issues = out;
+        self.spell_rev = Some(self.edit_rev);
+        true
+    }
+
+    /// The cached issue at `pos` (inside or at either end of its range).
+    pub fn spell_issue_at(&self, pos: &DocPos) -> Option<&SpellIssue> {
+        self.spell_issues
+            .iter()
+            .find(|i| i.start.path == pos.path && i.start.offset <= pos.offset && pos.offset <= i.end.offset)
+    }
+
+    /// The first cached issue after the selection, wrapping to the first one (F7 / Next).
+    pub fn next_spell_issue(&self) -> Option<&SpellIssue> {
+        let from = self.selection.end();
+        self.spell_issues.iter().find(|i| i.start >= *from).or_else(|| self.spell_issues.first())
+    }
+
+    /// Ignore (`all == false`: the occurrence at `at` or under the selection; `all`: every occurrence of
+    /// `word` in this message). Returns the number of cached issues dropped.
+    pub fn ignore_spelling(&mut self, word: Option<&str>, all: bool, at: Option<&DocPos>) -> usize {
+        let pos = at.cloned().unwrap_or_else(|| self.selection.start().clone());
+        let issue = self.spell_issue_at(&pos).cloned();
+        let word = word.map(str::to_owned).or_else(|| issue.as_ref().map(|i| i.word.clone()));
+        // Grammar issues on spaces ("More than one space") have a whitespace-only word; only "" is refused.
+        let Some(word) = word.filter(|w| !w.is_empty()) else {
+            return 0;
+        };
+        let before = self.spell_issues.len();
+        if all {
+            if !self.ignored_words.iter().any(|w| w.eq_ignore_ascii_case(&word))
+                && self.ignored_words.len() < 10_000
+            {
+                self.ignored_words.push(word.clone());
+            }
+            self.spell_issues.retain(|i| !i.word.eq_ignore_ascii_case(&word));
+        } else {
+            let Some(issue) = issue.filter(|i| i.word == word) else {
+                return 0;
+            };
+            if self.ignored_once.len() < 10_000 {
+                self.ignored_once.push((issue.start.clone(), issue.word.clone()));
+            }
+            self.spell_issues.retain(|i| i.start != issue.start);
+        }
+        before.saturating_sub(self.spell_issues.len())
+    }
+
+    /// Drops cached issues for a word the dictionary now knows.
+    pub fn forget_spelling_word(&mut self, word: &str) -> usize {
+        let before = self.spell_issues.len();
+        self.spell_issues.retain(|i| !i.word.eq_ignore_ascii_case(word));
+        before.saturating_sub(self.spell_issues.len())
+    }
+
+    /// Replaces the issue at `at` (or under the selection) with `replacement`; with `all`, every cached issue
+    /// for the same word (Change All). Issues whose text no longer matches are skipped. Returns the count.
+    pub fn correct_spelling(&mut self, replacement: &str, at: Option<&DocPos>, all: bool) -> usize {
+        self.ensure_body();
+        let pos = at.cloned().unwrap_or_else(|| self.selection.start().clone());
+        let Some(issue) = self.spell_issue_at(&pos).cloned() else {
+            return 0;
+        };
+        let mut targets: Vec<SpellIssue> = if all {
+            self.spell_issues.iter().filter(|i| i.word.eq_ignore_ascii_case(&issue.word)).cloned().collect()
+        } else {
+            vec![issue]
+        };
+        // Issues whose text no longer matches (edited since the check) are left alone.
+        targets.retain(|t| range_text(&self.body, &t.start, &t.end) == t.word);
+        if targets.is_empty() {
+            return 0;
+        }
+        // Back to front so earlier positions stay valid.
+        targets.sort_by(|a, b| b.start.cmp(&a.start));
+        let replacement = clean_text(replacement).replace('\n', " ");
+        self.checkpoint();
+        let mut n = 0usize;
+        for t in &targets {
+            self.selection = BodySelection { anchor: t.start.clone(), focus: t.end.clone() };
+            self.pending_style = None;
+            self.insert_text(&replacement);
+            n = n.saturating_add(1);
+        }
+        let done: Vec<DocPos> = targets.iter().map(|t| t.start.clone()).collect();
+        self.spell_issues.retain(|i| !done.contains(&i.start));
+        n
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Recipients
+    // ---------------------------------------------------------------------------------------------------
+
+    /// (display name, address) of every valid recipient in To, Cc and Bcc, in field order.
+    pub fn recipients(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for field in [&self.to, &self.cc, &self.bcc] {
+            for piece in crate::cmd::compose::split_recipients(field) {
+                if let Ok(list) = crate::cmd::compose::parse_recipients(piece) {
+                    for a in list {
+                        for m in a.mailboxes() {
+                            out.push((m.name.clone().unwrap_or_default(), m.addr.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Font families treated as code (not spell-checked).
+const CODE_FONTS: [&str; 6] =
+    ["Consolas", "Courier New", "Courier", "monospace", "Liberation Mono", "Cascadia Code"];
+/// Most rows / columns a table grows to through Tab and Insert Row/Column.
+pub const MAX_TABLE_ROWS_EDIT: usize = 1000;
+pub const MAX_TABLE_COLS_EDIT: usize = 63;
+
+/// The innermost table cell holding the block at `path`: (table path, row, column).
+fn cell_of(blocks: &[Block], path: &[usize]) -> Option<(Vec<usize>, usize, usize)> {
+    let mut p = path.to_vec();
+    for _ in 0..MAX_WALK_DEPTH {
+        match parent_of(blocks, &p)? {
+            (Owner::Cell { table, row, col }, _) => return Some((table, row, col)),
+            (Owner::ListItem { list, .. }, _) => p = list,
+            (Owner::Box(b), _) => p = b,
+            (Owner::Root, _) => return None,
+        }
+    }
+    None
+}
+
+/// An attachment file name made safe: path separators and control chars replaced, trimmed, capped.
+pub fn clean_attachment_name(name: &str, fallback: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let clean: String = base
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let clean = clean.trim().trim_end_matches('.').trim();
+    if clean.is_empty() {
+        return fallback.to_owned();
+    }
+    let n = clean.chars().count();
+    if n <= MAX_ATTACHMENT_NAME_CHARS {
+        return clean.to_owned();
+    }
+    // Keep the extension when shortening.
+    let ext: String =
+        clean.rsplit_once('.').map(|(_, e)| e).filter(|e| e.chars().count() <= 16).unwrap_or("").to_owned();
+    let keep = MAX_ATTACHMENT_NAME_CHARS.saturating_sub(ext.chars().count().saturating_add(1));
+    let stem: String = clean.chars().take(keep).collect();
+    if ext.is_empty() { stem } else { format!("{stem}.{ext}") }
+}
+
+/// Whether `m` looks like `type/subtype` (RFC 2045 tokens).
+fn valid_mime_type(m: &str) -> bool {
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 127
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || "!#$&-^_.+".contains(c))
+    };
+    m.split_once('/').is_some_and(|(t, s)| token(t) && token(s))
+}
+
+/// MIME type for a file name, by extension (case-insensitive); `application/octet-stream` when unknown.
+pub fn mime_for_name(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    MIME_TABLE.iter().find(|(e, _)| *e == ext).map_or("application/octet-stream", |(_, m)| m)
+}
+
+/// Extension → MIME type (IANA media types registry names).
+const MIME_TABLE: &[(&str, &str)] = &[
+    // text
+    ("txt", "text/plain"),
+    ("text", "text/plain"),
+    ("log", "text/plain"),
+    ("md", "text/markdown"),
+    ("markdown", "text/markdown"),
+    ("htm", "text/html"),
+    ("html", "text/html"),
+    ("css", "text/css"),
+    ("csv", "text/csv"),
+    ("tsv", "text/tab-separated-values"),
+    ("ics", "text/calendar"),
+    ("ical", "text/calendar"),
+    ("vcf", "text/vcard"),
+    ("vcard", "text/vcard"),
+    ("rtf", "application/rtf"),
+    ("xml", "application/xml"),
+    ("json", "application/json"),
+    ("yaml", "application/yaml"),
+    ("yml", "application/yaml"),
+    ("toml", "application/toml"),
+    ("js", "text/javascript"),
+    ("mjs", "text/javascript"),
+    ("ts", "text/plain"),
+    ("py", "text/x-python"),
+    ("rs", "text/plain"),
+    ("c", "text/plain"),
+    ("h", "text/plain"),
+    ("cpp", "text/plain"),
+    ("java", "text/plain"),
+    ("sh", "application/x-sh"),
+    ("sql", "application/sql"),
+    // images
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("jpe", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("bmp", "image/bmp"),
+    ("webp", "image/webp"),
+    ("svg", "image/svg+xml"),
+    ("ico", "image/x-icon"),
+    ("tif", "image/tiff"),
+    ("tiff", "image/tiff"),
+    ("heic", "image/heic"),
+    ("heif", "image/heif"),
+    ("avif", "image/avif"),
+    ("emf", "image/emf"),
+    ("wmf", "image/wmf"),
+    // documents
+    ("pdf", "application/pdf"),
+    ("doc", "application/msword"),
+    ("dot", "application/msword"),
+    ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ("dotx", "application/vnd.openxmlformats-officedocument.wordprocessingml.template"),
+    ("xls", "application/vnd.ms-excel"),
+    ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ("xlsm", "application/vnd.ms-excel.sheet.macroenabled.12"),
+    ("ppt", "application/vnd.ms-powerpoint"),
+    ("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+    ("odt", "application/vnd.oasis.opendocument.text"),
+    ("ods", "application/vnd.oasis.opendocument.spreadsheet"),
+    ("odp", "application/vnd.oasis.opendocument.presentation"),
+    ("epub", "application/epub+zip"),
+    ("msg", "application/vnd.ms-outlook"),
+    ("eml", "message/rfc822"),
+    ("mht", "message/rfc822"),
+    ("mhtml", "message/rfc822"),
+    // archives
+    ("zip", "application/zip"),
+    ("gz", "application/gzip"),
+    ("tgz", "application/gzip"),
+    ("tar", "application/x-tar"),
+    ("bz2", "application/x-bzip2"),
+    ("xz", "application/x-xz"),
+    ("zst", "application/zstd"),
+    ("7z", "application/x-7z-compressed"),
+    ("rar", "application/vnd.rar"),
+    // audio / video
+    ("mp3", "audio/mpeg"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/aac"),
+    ("wav", "audio/wav"),
+    ("ogg", "audio/ogg"),
+    ("oga", "audio/ogg"),
+    ("opus", "audio/opus"),
+    ("flac", "audio/flac"),
+    ("mid", "audio/midi"),
+    ("midi", "audio/midi"),
+    ("mp4", "video/mp4"),
+    ("m4v", "video/mp4"),
+    ("mov", "video/quicktime"),
+    ("avi", "video/x-msvideo"),
+    ("mkv", "video/x-matroska"),
+    ("webm", "video/webm"),
+    ("ogv", "video/ogg"),
+    ("mpeg", "video/mpeg"),
+    ("mpg", "video/mpeg"),
+    // fonts, 3D, keys
+    ("ttf", "font/ttf"),
+    ("otf", "font/otf"),
+    ("woff", "font/woff"),
+    ("woff2", "font/woff2"),
+    ("obj", "model/obj"),
+    ("stl", "model/stl"),
+    ("glb", "model/gltf-binary"),
+    ("gltf", "model/gltf+json"),
+    ("3mf", "model/3mf"),
+    ("asc", "application/pgp-keys"),
+    ("pgp", "application/pgp-encrypted"),
+    ("p7s", "application/pkcs7-signature"),
+    ("p7m", "application/pkcs7-mime"),
+    ("cer", "application/pkix-cert"),
+    ("crt", "application/x-x509-ca-cert"),
+];
+
+// ---------------------------------------------------------------------------------------------------------
+// Default signatures
+// ---------------------------------------------------------------------------------------------------------
+
+/// Signature blocks for a body format: a plain-text body gets the text only.
+pub fn signature_blocks(body: &Doc, format: BodyFormat) -> Vec<Block> {
+    if format == BodyFormat::PlainText {
+        Doc::from_plain_text(&body.to_plain_text()).blocks
+    } else {
+        body.blocks.clone()
+    }
+}
+
+/// The account a compose sends from: the one whose address is in its From field, else the default account.
+pub fn compose_account(mb: &mailcraft_model::Mailbox, from: &str) -> Option<mailcraft_model::AccountId> {
+    let addr = crate::cmd::compose::parse_field_mailbox(from).map(|m| m.addr);
+    addr.and_then(|a| {
+        mb.accounts.iter().find(|x| !x.address.trim().is_empty() && x.address.trim().eq_ignore_ascii_case(&a))
+    })
+    .or_else(|| mb.default_account())
+    .map(|a| a.id)
+}
+
+/// Inserts the sending account's default signature into a freshly opened compose (Options › Mail ›
+/// Signatures: one for new messages, one for replies/forwards). New message: after an empty first
+/// paragraph. Reply / forward: between the caret paragraph and the quoted header. The caret goes to the
+/// start of the body. Does nothing (false) for drafts, when the compose already has a signature or no
+/// default applies.
+pub fn insert_default_signature(mb: &mailcraft_model::Mailbox, c: &mut ComposeState) -> bool {
+    if c.signature.is_some() {
+        return false;
+    }
+    let reply = match c.kind {
+        ComposeKind::New => false,
+        ComposeKind::Reply | ComposeKind::ReplyAll | ComposeKind::Forward => true,
+        ComposeKind::Draft => return false,
+    };
+    let account = compose_account(mb, &c.from);
+    let Some(sig) = mb.default_signature(account, reply) else {
+        return false;
+    };
+    let name = sig.name.clone();
+    let blocks = signature_blocks(&sig.body, c.format);
+    if blocks.is_empty() {
+        return false;
+    }
+    let container = Block::Container { style: ParaStyle::default(), blocks: blocks.clone() };
+    let empty_para = |b: &Block| match b {
+        Block::Paragraph { inlines, .. } => {
+            inlines.iter().all(|i| matches!(i, Inline::Text { text, .. } if text.is_empty()))
+        }
+        _ => false,
+    };
+    let body = &mut c.body.blocks;
+    if !reply {
+        if body.iter().all(empty_para) {
+            *body = vec![Block::text_paragraph(""), container];
+        } else {
+            body.push(Block::text_paragraph(""));
+            body.push(container);
+        }
+    } else {
+        let lead = body.iter().take_while(|b| empty_para(b)).count();
+        match lead {
+            0 => {
+                body.splice(0..0, [Block::text_paragraph(""), container, Block::text_paragraph("")]);
+            }
+            1 => {
+                body.splice(1..1, [container, Block::text_paragraph("")]);
+            }
+            _ => body.insert(1, container),
+        }
+    }
+    c.signature = Some(SignatureBlock { name, blocks });
+    ensure_leaf(&mut c.body);
+    c.selection = BodySelection::caret(normalize(&c.body, &DocPos::new(vec![0], 0)));
+    c.extra_ranges.clear();
+    true
+}
+
+/// [`insert_default_signature`] by value (for builders that return a fresh [`ComposeState`]).
+pub fn with_default_signature(mb: &mailcraft_model::Mailbox, mut c: ComposeState) -> ComposeState {
+    insert_default_signature(mb, &mut c);
+    c
 }
 
 // =======================================================================================================
@@ -2447,8 +3408,11 @@ fn split_at(doc: &mut Doc, pos: &DocPos, list_aware: bool) -> DocPos {
         && let Some(Block::List { items, .. }) = block_at(&doc.blocks, list)
         && items.get(*item).is_some_and(|it| it.len() == 1)
     {
+        // A nested item moves up a level (a new item of the outer list); a top-level one leaves the list.
         let ord = leaf_ordinal(&doc.blocks, &pos.path);
-        unwrap_items(&mut doc.blocks, list, *item, *item);
+        if !promote(&mut doc.blocks, &pos.path) {
+            unwrap_items(&mut doc.blocks, list, *item, *item);
+        }
         let p = leaves(&doc.blocks).get(ord).cloned().unwrap_or_default();
         return DocPos::new(p, 0);
     }
@@ -2490,6 +3454,26 @@ fn split_at(doc: &mut Doc, pos: &DocPos, list_aware: bool) -> DocPos {
     DocPos::new(p, 0)
 }
 
+/// Splits the preformatted block at `pos` into two preformatted blocks.
+fn split_pre(doc: &mut Doc, pos: &DocPos) {
+    let Some((LeafKind::Pre, mut flat)) = leaf(&doc.blocks, &pos.path) else {
+        return;
+    };
+    let Some((&idx, prefix)) = pos.path.split_last() else {
+        return;
+    };
+    let mut right = flat.split_off(pos.offset.min(flat.len()));
+    // The line break at the split point goes with the split.
+    if right.atoms.first().is_some_and(|a| a.kind == AtomKind::Break) {
+        right.atoms.remove(0);
+    }
+    store_leaf(&mut doc.blocks, &pos.path, &flat);
+    if let Some(seq) = seq_mut(&mut doc.blocks, prefix) {
+        let at = idx.saturating_add(1).min(seq.len());
+        seq.insert(at, Block::Pre { text: right.plain() });
+    }
+}
+
 /// Deletes `start..end` (ordered, normalised). Returns the caret (`start`).
 fn delete_range(doc: &mut Doc, start: &DocPos, end: &DocPos) -> DocPos {
     if start >= end {
@@ -2501,6 +3485,9 @@ fn delete_range(doc: &mut Doc, start: &DocPos, end: &DocPos) -> DocPos {
             store_leaf(&mut doc.blocks, &start.path, &flat);
         }
         return start.clone();
+    }
+    if cell_of(&doc.blocks, &start.path) != cell_of(&doc.blocks, &end.path) {
+        return delete_across_cells(doc, start, end);
     }
     let tail = leaf(&doc.blocks, &end.path).map(|(_, mut f)| f.split_off(end.offset)).unwrap_or_default();
     // Remove every block whose leaves all lie in (start, end], largest first.
@@ -2519,6 +3506,43 @@ fn delete_range(doc: &mut Doc, start: &DocPos, end: &DocPos) -> DocPos {
         Some((_, mut flat)) => {
             flat.atoms.truncate(start.offset.min(flat.len()));
             flat.insert_flat(flat.len(), &tail);
+            store_leaf(&mut doc.blocks, &start.path, &flat);
+            start.clone()
+        }
+        None => start.clone(),
+    }
+}
+
+/// [`delete_range`] when `start` and `end` lie in different table cells (or one in a cell, one outside):
+/// nothing merges across the cell boundary. The start leaf keeps its text before `start`, the end leaf its
+/// text after `end`, and everything between goes (cells in between are emptied, their table stays).
+fn delete_across_cells(doc: &mut Doc, start: &DocPos, end: &DocPos) -> DocPos {
+    let all = leaves(&doc.blocks);
+    let Some(k) = all.iter().position(|p| *p == end.path) else {
+        return start.clone();
+    };
+    let before_end = k.checked_sub(1).and_then(|j| all.get(j)).cloned().unwrap_or_else(|| start.path.clone());
+    // The end leaf first: removing blocks before it may shift its path.
+    if let Some((_, mut flat)) = leaf(&doc.blocks, &end.path) {
+        flat.remove(0, end.offset.min(flat.len()));
+        store_leaf(&mut doc.blocks, &end.path, &flat);
+    }
+    let mut covered = Vec::new();
+    if before_end > start.path {
+        collect_covered(&doc.blocks, &mut Vec::new(), &start.path, &before_end, &mut covered, 0);
+    }
+    for p in covered.iter().rev() {
+        remove_block(&mut doc.blocks, p);
+    }
+    match leaf(&doc.blocks, &start.path) {
+        Some((LeafKind::Rule, _)) => {
+            if let Some(b) = block_at_mut(&mut doc.blocks, &start.path) {
+                *b = Block::text_paragraph("");
+            }
+            DocPos::new(start.path.clone(), 0)
+        }
+        Some((_, mut flat)) => {
+            flat.atoms.truncate(start.offset.min(flat.len()));
             store_leaf(&mut doc.blocks, &start.path, &flat);
             start.clone()
         }
@@ -3047,5 +4071,728 @@ mod tests {
         c.set_caret(c.body_end());
         c.insert_fragment(&frag, PasteMode::KeepSource);
         assert_eq!(c.body.to_plain_text(), "see docssee docs");
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+    use mailcraft_model::{Account, AccountKind, Mailbox};
+
+    fn doc(lines: &[&str]) -> ComposeState {
+        let mut c = ComposeState {
+            body: Doc {
+                blocks: lines.iter().map(|l| Block::text_paragraph(l)).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        c.ensure_body();
+        c
+    }
+
+    fn p(path: &[usize], off: usize) -> DocPos {
+        DocPos::new(path.to_vec(), off)
+    }
+
+    fn texts(c: &ComposeState) -> Vec<String> {
+        c.leaf_paths()
+            .iter()
+            .map(|l| leaf(&c.body.blocks, l).map(|(_, f)| f.plain()).unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn paste_html_merges_first_and_last_paragraphs() {
+        let mut c = doc(&["Hello world"]);
+        c.set_caret(p(&[0], 6));
+        c.paste_html("<p>big <b>bold</b></p><h2>Middle</h2><p>end</p>");
+        assert_eq!(texts(&c), ["Hello big bold", "Middle", "endworld"]);
+        assert!(matches!(c.body.blocks[1], Block::Heading { level: 2, .. }));
+        assert_eq!(c.selection.focus, p(&[2], 3));
+        // Bold survived the merge.
+        let bold = c.body.blocks[0]
+            == Block::Paragraph {
+                style: ParaStyle::default(),
+                inlines: vec![
+                    Inline::Text { text: "Hello big ".into(), style: TextStyle::default() },
+                    Inline::Text {
+                        text: "bold".into(),
+                        style: TextStyle { bold: Some(true), ..Default::default() },
+                    },
+                ],
+            };
+        assert!(bold, "{:?}", c.body.blocks[0]);
+        assert!(c.undo_edit());
+        assert_eq!(texts(&c), ["Hello world"]);
+        // Plain text paste splits paragraphs at line ends.
+        c.set_caret(p(&[0], 5));
+        c.paste_plain(" one\ntwo\nthree");
+        assert_eq!(texts(&c), ["Hello one", "two", "three world"]);
+        // A plain-text body takes only the text of pasted HTML.
+        let mut t = doc(&["x"]);
+        t.format = BodyFormat::PlainText;
+        t.set_caret(p(&[0], 1));
+        t.paste_html("<p><b>A</b></p><p>B</p>");
+        assert_eq!(texts(&t), ["xA", "B"]);
+        // Hostile HTML never breaks the body.
+        let mut h = doc(&["a", "b"]);
+        h.select_all();
+        h.paste_html(&"<table><tr><td><ul><li>".repeat(200));
+        h.ensure_body();
+        assert!(!h.leaf_paths().is_empty());
+    }
+
+    #[test]
+    fn table_navigation_and_layout_edits() {
+        let mut c = doc(&["before"]);
+        c.set_caret(p(&[0], 6));
+        c.insert_blocks(vec![empty_table(2, 2)]);
+        assert_eq!(c.cell_at_caret(), Some((vec![1], 0, 0)));
+        c.insert_text("a");
+        assert!(c.move_to_cell(CellMove::Next));
+        assert_eq!(c.cell_at_caret(), Some((vec![1], 0, 1)));
+        c.insert_text("b");
+        assert!(c.move_to_cell(CellMove::Previous));
+        assert_eq!(c.selected_text(), "a", "moving selects the cell content");
+        assert!(!c.move_to_cell(CellMove::Up));
+        assert!(c.move_to_cell(CellMove::Down));
+        assert_eq!(c.cell_at_caret(), Some((vec![1], 1, 0)));
+        assert!(c.move_to_cell(CellMove::Next));
+        // Tab in the last cell adds a row.
+        assert!(c.move_to_cell(CellMove::Next));
+        assert_eq!(c.cell_at_caret(), Some((vec![1], 2, 0)));
+        let rows = |c: &ComposeState| match &c.body.blocks[1] {
+            Block::Table { rows, .. } => (rows.len(), rows[0].len()),
+            _ => (0, 0),
+        };
+        assert_eq!(rows(&c), (3, 2));
+        assert!(c.table_edit(TableEdit::InsertColumnRight));
+        assert_eq!(rows(&c), (3, 3));
+        assert_eq!(c.cell_at_caret(), Some((vec![1], 2, 1)));
+        assert!(c.table_edit(TableEdit::InsertRowAbove));
+        assert_eq!(rows(&c), (4, 3));
+        assert!(c.table_edit(TableEdit::DeleteColumn));
+        assert!(c.table_edit(TableEdit::DeleteRow));
+        assert_eq!(rows(&c), (3, 2));
+        assert!(c.table_edit(TableEdit::DeleteTable));
+        assert!(!matches!(c.body.blocks.get(1), Some(Block::Table { .. })));
+        assert!(c.cell_at_caret().is_none());
+        assert!(!c.move_to_cell(CellMove::Next), "not in a table");
+        assert!(!c.table_edit(TableEdit::DeleteRow));
+        // Undo brings the table back.
+        assert!(c.undo_edit());
+        assert!(matches!(c.body.blocks.get(1), Some(Block::Table { .. })));
+        // A list inside a cell still finds its cell; a 1x1 table deletes away by rows.
+        let mut n = doc(&["x"]);
+        n.insert_blocks(vec![empty_table(1, 1)]);
+        n.toggle_list(Some(ListKind::Bullet));
+        assert_eq!(n.cell_at_caret().map(|(_, r, c)| (r, c)), Some((0, 0)));
+        assert!(n.table_edit(TableEdit::DeleteRow));
+        assert!(n.cell_at_caret().is_none());
+    }
+
+    #[test]
+    fn attachments_names_types_and_items() {
+        let mut c = ComposeState::default();
+        assert_eq!(c.attach_bytes("../../etc/report.PDF", None, vec![1, 2]).unwrap(), 0);
+        assert_eq!(c.attachments[0].filename, "report.PDF");
+        assert_eq!(c.attachments[0].mime_type, "application/pdf");
+        c.attach_bytes("notes", Some("not a type"), vec![]).unwrap();
+        assert_eq!(c.attachments[1].mime_type, "application/octet-stream");
+        c.attach_bytes("x.bin", Some("Application/X-Custom"), vec![]).unwrap();
+        assert_eq!(c.attachments[2].mime_type, "application/x-custom");
+        assert_eq!(c.rename_attachment(1, "notes.md").unwrap(), "notes.md");
+        assert_eq!(c.attachments[1].mime_type, "text/markdown");
+        assert!(c.rename_attachment(9, "a").is_err());
+        assert!(c.rename_attachment(0, "  ").is_err());
+        assert_eq!(c.remove_attachment(2).map(|a| a.filename), Some("x.bin".into()));
+        assert!(c.remove_attachment(2).is_none());
+        assert_eq!(c.attachments_size(), 2);
+        let m = mailcraft_model::MailItem { subject: "Q3: plan / budget?".into(), ..Default::default() };
+        let i = c.attach_message(&m).unwrap();
+        assert_eq!(c.attachments[i].filename, "Q3_ plan _ budget_.eml");
+        assert_eq!(c.attachments[i].mime_type, "message/rfc822");
+        assert!(!c.attachments[i].data.is_empty());
+        assert_eq!(clean_attachment_name("", "x"), "x");
+        assert_eq!(clean_attachment_name("a\u{0}b.txt", "x"), "a_b.txt");
+        let long = format!("{}.docx", "n".repeat(400));
+        let short = clean_attachment_name(&long, "x");
+        assert!(short.ends_with(".docx") && short.chars().count() <= MAX_ATTACHMENT_NAME_CHARS);
+        for (name, mime) in [
+            ("a.JPG", "image/jpeg"),
+            ("b.tar.gz", "application/gzip"),
+            ("c.eml", "message/rfc822"),
+            ("d.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            ("noext", "application/octet-stream"),
+            ("e.", "application/octet-stream"),
+        ] {
+            assert_eq!(mime_for_name(name), mime, "{name}");
+        }
+    }
+
+    fn sig_mailbox() -> (Mailbox, mailcraft_model::AccountId, mailcraft_model::AccountId) {
+        let mut mb = Mailbox::new_local("Local");
+        let work = mb.add_account(Account {
+            kind: AccountKind::Imap,
+            address: "me@work.example".into(),
+            is_default: true,
+            ..Default::default()
+        });
+        let home = mb.add_account(Account {
+            kind: AccountKind::Imap,
+            address: "me@home.example".into(),
+            ..Default::default()
+        });
+        mb.add_signature("Work", mailcraft_html::html_to_doc("<p><b>Me</b><br>Work Inc.</p>")).unwrap();
+        mb.add_signature("Short", Doc::from_plain_text("-- me")).unwrap();
+        mb.set_signature_defaults(None, Some(Some("Work")), Some(Some("Short"))).unwrap();
+        mb.set_signature_defaults(Some(home), Some(None), Some(None)).unwrap();
+        (mb, work, home)
+    }
+
+    #[test]
+    fn default_signature_for_new_messages() {
+        let (mb, _, _) = sig_mailbox();
+        let mut c = ComposeState {
+            kind: ComposeKind::New,
+            from: "Me <me@work.example>".into(),
+            ..Default::default()
+        };
+        assert!(insert_default_signature(&mb, &mut c));
+        assert_eq!(c.body.blocks.len(), 2);
+        assert_eq!(c.body.blocks[0], Block::text_paragraph(""));
+        assert!(matches!(&c.body.blocks[1], Block::Container { blocks, .. } if blocks.len() == 1));
+        assert_eq!(c.selection.focus, p(&[0], 0));
+        assert_eq!(c.signature.as_ref().map(|s| s.name.as_str()), Some("Work"));
+        assert!(!c.dirty, "an automatic signature is not an unsaved change");
+        assert!(!insert_default_signature(&mb, &mut c), "only once");
+        assert!(c.body.to_plain_text().contains("Work Inc."));
+        // The home account chose "(none)".
+        let mut h =
+            ComposeState { kind: ComposeKind::New, from: "me@home.example".into(), ..Default::default() };
+        assert!(!insert_default_signature(&mb, &mut h));
+        // Unknown From → the default account; drafts never get one.
+        let mut u = ComposeState { kind: ComposeKind::New, ..Default::default() };
+        assert!(insert_default_signature(&mb, &mut u));
+        let mut d = ComposeState { kind: ComposeKind::Draft, ..Default::default() };
+        assert!(!insert_default_signature(&mb, &mut d));
+        // Plain text bodies get the text of the signature.
+        let mut t =
+            ComposeState { kind: ComposeKind::New, format: BodyFormat::PlainText, ..Default::default() };
+        assert!(insert_default_signature(&mb, &mut t));
+        assert!(matches!(&t.body.blocks[1], Block::Container { blocks, .. } if blocks.len() == 2));
+        // A prefilled new message gets it at the end.
+        let mut f = doc(&["Prefilled"]);
+        assert!(insert_default_signature(&mb, &mut f));
+        assert_eq!(f.body.blocks.len(), 3);
+        assert!(matches!(f.body.blocks[2], Block::Container { .. }));
+    }
+
+    #[test]
+    fn default_signature_for_replies_sits_above_the_quote() {
+        let (mb, _, _) = sig_mailbox();
+        let quoted = vec![
+            Block::text_paragraph(""),
+            Block::text_paragraph(""),
+            Block::text_paragraph("-----Original Message-----"),
+            Block::text_paragraph("From: A"),
+        ];
+        let mut c = ComposeState {
+            kind: ComposeKind::Reply,
+            body: Doc { blocks: quoted.clone(), ..Default::default() },
+            ..Default::default()
+        };
+        assert!(insert_default_signature(&mb, &mut c));
+        assert_eq!(c.signature.as_ref().map(|s| s.name.as_str()), Some("Short"));
+        assert_eq!(c.body.blocks[0], Block::text_paragraph(""));
+        assert!(matches!(c.body.blocks[1], Block::Container { .. }));
+        assert_eq!(c.body.blocks[2], Block::text_paragraph(""));
+        assert_eq!(c.body.blocks[3], Block::text_paragraph("-----Original Message-----"));
+        assert_eq!(c.selection.focus, p(&[0], 0));
+        // No leading empty paragraph: one is added for the caret.
+        let mut f = ComposeState {
+            kind: ComposeKind::Forward,
+            body: Doc { blocks: quoted[2..].to_vec(), ..Default::default() },
+            ..Default::default()
+        };
+        assert!(insert_default_signature(&mb, &mut f));
+        assert_eq!(f.body.blocks.len(), 5);
+        assert!(matches!(f.body.blocks[1], Block::Container { .. }));
+        // The existing Signature command replaces the auto-inserted block (same container).
+        let sig = f.signature.clone().unwrap();
+        assert!(
+            f.body
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::Container { blocks, .. } if *blocks == sig.blocks))
+        );
+    }
+
+    fn fake_check(text: &str) -> Vec<TextIssue> {
+        // Flags every "teh" (char ranges).
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 3 <= chars.len() {
+            if chars[i..i + 3] == ['t', 'e', 'h'] {
+                out.push(TextIssue {
+                    start: i,
+                    end: i + 3,
+                    kind: String::new(),
+                    suggestions: vec!["the".into()],
+                });
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn spelling_cache_ignore_and_correct() {
+        let mut c = doc(&["teh cat and teh dog", "more teh"]);
+        assert!(c.spelling_stale());
+        assert!(c.refresh_spelling(false, &mut fake_check));
+        assert_eq!(c.spell_issues.len(), 3);
+        assert_eq!(c.spell_issues[0].kind, "spelling");
+        assert_eq!(
+            (c.spell_issues[1].start.clone(), c.spell_issues[1].end.clone()),
+            (p(&[0], 12), p(&[0], 15))
+        );
+        assert!(!c.refresh_spelling(false, &mut fake_check), "cached until the body changes");
+        c.set_caret(p(&[0], 1));
+        assert_eq!(c.next_spell_issue().map(|i| i.start.clone()), Some(p(&[0], 12)));
+        // Ignore once.
+        assert_eq!(c.ignore_spelling(None, false, Some(&p(&[0], 13))), 1);
+        assert!(c.refresh_spelling(true, &mut fake_check));
+        assert_eq!(c.spell_issues.len(), 2);
+        // Correct one; positions after it in the same paragraph stay right.
+        assert_eq!(c.correct_spelling("the", Some(&p(&[0], 0)), false), 1);
+        assert_eq!(texts(&c)[0], "the cat and teh dog");
+        assert!(c.spelling_stale());
+        c.refresh_spelling(false, &mut fake_check);
+        assert_eq!(c.spell_issues.len(), 1, "ignored-once occurrence stays ignored");
+        // Change All, then Ignore All.
+        let mut d = doc(&["teh teh", "teh"]);
+        d.refresh_spelling(false, &mut fake_check);
+        assert_eq!(d.correct_spelling("the", Some(&p(&[1], 0)), true), 3);
+        assert_eq!(texts(&d), ["the the", "the"]);
+        let mut e = doc(&["teh", "x teh"]);
+        e.refresh_spelling(false, &mut fake_check);
+        assert_eq!(e.ignore_spelling(Some("TEH"), true, None), 2);
+        e.mark_edited();
+        e.refresh_spelling(false, &mut fake_check);
+        assert!(e.spell_issues.is_empty());
+        assert_eq!(e.ignore_spelling(None, false, Some(&p(&[0], 0))), 0);
+        // Stale cache entries never corrupt text.
+        let mut f = doc(&["teh"]);
+        f.refresh_spelling(false, &mut fake_check);
+        f.body.blocks[0] = Block::text_paragraph("abc");
+        assert_eq!(f.correct_spelling("the", Some(&p(&[0], 0)), false), 0);
+        assert_eq!(texts(&f), ["abc"]);
+        // Hostile checker output is ignored.
+        let mut g = doc(&["abc"]);
+        g.refresh_spelling(true, &mut |_| {
+            vec![
+                TextIssue { start: 2, end: 99, ..Default::default() },
+                TextIssue { start: 2, end: 1, ..Default::default() },
+            ]
+        });
+        assert!(g.spell_issues.is_empty());
+    }
+
+    #[test]
+    fn spelling_skips_links_code_and_quoted_text() {
+        let mut c = doc(&["teh", "", "-----Original Message-----", "teh"]);
+        c.kind = ComposeKind::Reply;
+        c.set_selection(p(&[1], 0), p(&[1], 0));
+        c.insert_text("teh link");
+        c.set_selection(p(&[1], 0), p(&[1], 8));
+        c.set_link(Some("https://example.com/teh"), None);
+        c.refresh_spelling(true, &mut fake_check);
+        assert_eq!(c.spell_issues.len(), 1);
+        assert_eq!(c.spell_issues[0].start, p(&[0], 0));
+        let mut code = doc(&["teh"]);
+        code.select_all();
+        code.apply_text_style(|s| s.font_family = Some("Consolas".into()));
+        code.refresh_spelling(true, &mut fake_check);
+        assert!(code.spell_issues.is_empty());
+    }
+
+    #[test]
+    fn recipients_from_fields() {
+        let c = ComposeState {
+            to: "Ann Lee <ann@example.org>; bad entry".into(),
+            cc: "bo@example.net".into(),
+            bcc: "\"Rivera, Al\" <al@example.com>".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.recipients(),
+            [
+                ("Ann Lee".to_owned(), "ann@example.org".to_owned()),
+                (String::new(), "bo@example.net".to_owned()),
+                ("Rivera, Al".to_owned(), "al@example.com".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn edit_counter_moves_with_every_edit() {
+        let mut c = doc(&["a"]);
+        let r0 = c.edit_rev;
+        c.insert_text("b");
+        let r1 = c.edit_rev;
+        assert_ne!(r0, r1);
+        c.checkpoint();
+        c.select_all();
+        c.delete_selection();
+        assert_ne!(c.edit_rev, r1);
+        let r2 = c.edit_rev;
+        c.undo_edit();
+        assert_ne!(c.edit_rev, r2);
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    fn para(t: &str) -> Block {
+        Block::text_paragraph(t)
+    }
+
+    fn state(blocks: Vec<Block>) -> ComposeState {
+        let mut c = ComposeState { body: Doc { blocks, ..Default::default() }, ..Default::default() };
+        c.ensure_body();
+        c
+    }
+
+    fn p(path: &[usize], off: usize) -> DocPos {
+        DocPos::new(path.to_vec(), off)
+    }
+
+    /// A body mixing paragraphs, a heading, nested lists, a quote and a rule.
+    fn mixed() -> ComposeState {
+        state(vec![
+            para("alpha beta"),
+            Block::Heading {
+                level: 2,
+                style: ParaStyle::default(),
+                inlines: vec![Inline::Text { text: "Head line".into(), style: TextStyle::default() }],
+            },
+            Block::List {
+                kind: ListKind::Bullet,
+                items: vec![
+                    vec![
+                        para("one"),
+                        Block::List { kind: ListKind::Bullet, items: vec![vec![para("one.a")]] },
+                    ],
+                    vec![para("two")],
+                    vec![para("three"), para("three more")],
+                ],
+            },
+            Block::Quote { blocks: vec![para("quoted one"), para("quoted two")] },
+            para("gamma"),
+            Block::Rule,
+            para("delta epsilon"),
+        ])
+    }
+
+    fn all_text(c: &ComposeState) -> String {
+        range_text(&c.body, &c.body_start(), &c.body_end())
+    }
+
+    proptest::proptest! {
+        /// Deleting any selection removes exactly the selected text: the text before the selection and the
+        /// text after it join at the caret, and one undo brings the body back.
+        #[test]
+        fn delete_selection_removes_exactly_the_selection(a in 0usize..14, ao in 0usize..14, b in 0usize..14, bo in 0usize..14) {
+            let mut c = mixed();
+            let leaves = c.leaf_paths();
+            let pa = leaves[a % leaves.len()].clone();
+            let pb = leaves[b % leaves.len()].clone();
+            let la = leaf_len(&c.body.blocks, &pa);
+            let lb = leaf_len(&c.body.blocks, &pb);
+            let x = DocPos::new(pa, ao.min(la));
+            let y = DocPos::new(pb, bo.min(lb));
+            c.set_selection(x, y);
+            let (s, e) = (c.selection.start().clone(), c.selection.end().clone());
+            let before = c.body.clone();
+            let pre = range_text(&c.body, &c.body_start(), &s);
+            let post = range_text(&c.body, &e, &c.body_end());
+            c.checkpoint();
+            c.delete_selection();
+            c.ensure_body();
+            proptest::prop_assert_eq!(all_text(&c), format!("{pre}{post}"));
+            proptest::prop_assert_eq!(range_text(&c.body, &c.body_start(), &c.selection.focus), pre);
+            proptest::prop_assert!(c.undo_edit());
+            proptest::prop_assert_eq!(&c.body, &before);
+        }
+    }
+
+    #[test]
+    fn inserting_a_table_inside_preformatted_text_splits_it() {
+        let mut c = state(vec![Block::Pre { text: "line one\nline two".into() }]);
+        c.set_caret(p(&[0], 8));
+        c.insert_blocks(vec![empty_table(1, 1)]);
+        assert!(
+            matches!(&c.body.blocks[0], Block::Pre { text } if text == "line one"),
+            "{:?}",
+            c.body.blocks
+        );
+        assert!(matches!(c.body.blocks[1], Block::Table { .. }));
+        assert!(matches!(&c.body.blocks[2], Block::Pre { text } if text == "line two"));
+    }
+
+    #[test]
+    fn backspace_after_a_table_does_not_pull_text_into_a_cell() {
+        let mut c = state(vec![para("before"), empty_table(1, 2), para("after")]);
+        c.set_caret(p(&[2], 0));
+        c.delete_backward();
+        assert!(matches!(c.body.blocks.get(2), Some(Block::Paragraph { .. })), "{:?}", c.body.blocks);
+        assert_eq!(blocks_text(std::slice::from_ref(&c.body.blocks[2])), "after");
+        assert_eq!(
+            c.cell_at_caret().map(|(_, r, col)| (r, col)),
+            Some((0, 1)),
+            "caret moves into the last cell"
+        );
+        // An empty paragraph after a table goes away instead.
+        let mut e = state(vec![empty_table(1, 1), para(""), para("x")]);
+        e.set_caret(p(&[1], 0));
+        e.delete_backward();
+        assert_eq!(e.body.blocks.len(), 2);
+        assert!(e.cell_at_caret().is_some());
+    }
+
+    #[test]
+    fn delete_before_a_table_does_not_pull_text_out_of_a_cell() {
+        let mut c = state(vec![para("before"), empty_table(1, 1), para("after")]);
+        c.set_caret(p(&[1, 0, 0, 0], 0));
+        c.insert_text("cell");
+        c.set_caret(p(&[0], 6));
+        c.delete_forward();
+        assert_eq!(c.body.to_plain_text().lines().next(), Some("before"));
+        assert_eq!(leaf_len(&c.body.blocks, &[1, 0, 0, 0]), 4, "{:?}", c.body.blocks);
+        // Delete at the end of the last cell does not swallow the paragraph after the table.
+        c.set_caret(p(&[1, 0, 0, 0], 4));
+        c.delete_forward();
+        assert_eq!(leaf_len(&c.body.blocks, &[2]), 5, "{:?}", c.body.blocks);
+        // Backspace at the start of a cell stays in the table too.
+        let mut t = state(vec![empty_table(1, 2)]);
+        t.set_caret(p(&[0, 0, 0, 0], 0));
+        t.insert_text("a");
+        t.set_caret(p(&[0, 0, 1, 0], 0));
+        t.insert_text("b");
+        t.set_caret(p(&[0, 0, 1, 0], 0));
+        t.delete_backward();
+        assert_eq!(leaf_len(&t.body.blocks, &[0, 0, 0, 0]), 1);
+        assert_eq!(leaf_len(&t.body.blocks, &[0, 0, 1, 0]), 1);
+    }
+
+    fn cell_text(c: &ComposeState, path: &[usize]) -> String {
+        leaf(&c.body.blocks, path).map(|(_, f)| f.plain()).unwrap_or_default()
+    }
+
+    #[test]
+    fn deleting_a_selection_across_table_cells_keeps_the_cells() {
+        let mut t = state(vec![para("before"), empty_table(1, 2), para("after")]);
+        t.set_caret(p(&[1, 0, 0, 0], 0));
+        t.insert_text("abc");
+        t.set_caret(p(&[1, 0, 1, 0], 0));
+        t.insert_text("def");
+        // Inside the table: the cells stay, each loses its selected part.
+        let mut c = t.clone();
+        c.set_selection(p(&[1, 0, 0, 0], 1), p(&[1, 0, 1, 0], 2));
+        c.delete_selection();
+        assert_eq!(cell_text(&c, &[1, 0, 0, 0]), "a", "{:?}", c.body.blocks);
+        assert_eq!(cell_text(&c, &[1, 0, 1, 0]), "f", "{:?}", c.body.blocks);
+        assert_eq!(c.selection.focus, p(&[1, 0, 0, 0], 1));
+        // From the paragraph before the table into the second cell: the first cell is emptied, the text
+        // after the selection stays in its cell.
+        let mut c = t.clone();
+        c.set_selection(p(&[0], 3), p(&[1, 0, 1, 0], 1));
+        c.delete_selection();
+        assert_eq!(cell_text(&c, &[0]), "bef");
+        assert_eq!(cell_text(&c, &[1, 0, 0, 0]), "");
+        assert_eq!(cell_text(&c, &[1, 0, 1, 0]), "ef");
+        // From a cell to the paragraph after the table: the rest of the cells are emptied, the paragraph
+        // keeps its unselected text and stays outside the table.
+        let mut c = t.clone();
+        c.set_selection(p(&[1, 0, 0, 0], 2), p(&[2], 2));
+        c.delete_selection();
+        assert_eq!(cell_text(&c, &[1, 0, 0, 0]), "ab");
+        assert_eq!(cell_text(&c, &[1, 0, 1, 0]), "");
+        assert_eq!(cell_text(&c, &[2]), "ter");
+        // Typing over a selection that spans cells replaces it in the first cell.
+        let mut c = t.clone();
+        c.set_selection(p(&[1, 0, 0, 0], 0), p(&[1, 0, 1, 0], 3));
+        c.insert_text("x");
+        assert_eq!(cell_text(&c, &[1, 0, 0, 0]), "x");
+        assert_eq!(cell_text(&c, &[1, 0, 1, 0]), "");
+        // A whole table inside the selection still goes away.
+        let mut c = t.clone();
+        c.set_selection(p(&[0], 3), p(&[2], 2));
+        c.delete_selection();
+        assert_eq!(c.body.blocks.len(), 1);
+        assert_eq!(cell_text(&c, &[0]), "befter");
+    }
+
+    #[test]
+    fn a_spelling_change_that_finds_nothing_records_no_undo_step() {
+        let mut c = state(vec![para("teh cat")]);
+        c.refresh_spelling(true, &mut |t: &str| {
+            if t.starts_with("teh") {
+                vec![TextIssue { start: 0, end: 3, kind: "spelling".into(), suggestions: vec![] }]
+            } else {
+                Vec::new()
+            }
+        });
+        assert_eq!(c.spell_issues.len(), 1);
+        // The text changed under the cached issue (no re-check yet).
+        c.set_caret(p(&[0], 0));
+        c.insert_text("x");
+        c.dirty = false;
+        let undo = c.edit_undo.len();
+        assert_eq!(c.correct_spelling("the", Some(&p(&[0], 1)), false), 0);
+        assert_eq!(c.edit_undo.len(), undo, "no empty undo step");
+        assert!(!c.dirty);
+        assert_eq!(cell_text(&c, &[0]), "xteh cat");
+    }
+
+    #[test]
+    fn a_rule_typed_above_the_quote_does_not_hide_the_reply_from_spelling() {
+        let mut c = state(vec![
+            para("teh reply"),
+            Block::Rule,
+            para("teh more"),
+            Block::Rule,
+            para("From: A <a@example.com>"),
+            para("teh quoted"),
+        ]);
+        c.kind = ComposeKind::Reply;
+        assert_eq!(c.quoted_start(), Some(3));
+        c.refresh_spelling(true, &mut |t: &str| {
+            if t.starts_with("teh") {
+                vec![TextIssue { start: 0, end: 3, kind: "spelling".into(), suggestions: vec![] }]
+            } else {
+                Vec::new()
+            }
+        });
+        let paths: Vec<Vec<usize>> = c.spell_issues.iter().map(|i| i.start.path.clone()).collect();
+        assert_eq!(paths, [vec![0], vec![2]]);
+    }
+
+    #[test]
+    fn enter_on_an_empty_nested_item_moves_it_up_a_level() {
+        let nested = Block::List { kind: ListKind::Bullet, items: vec![vec![para("a")]] };
+        let mut c =
+            state(vec![Block::List { kind: ListKind::Bullet, items: vec![vec![para("one"), nested]] }]);
+        c.set_caret(p(&[0, 0, 1, 0, 0], 1));
+        c.insert_text("\n");
+        assert_eq!(list_depth(&c.body.blocks, &c.selection.focus.path), 2, "a new nested item");
+        c.insert_text("\n");
+        assert_eq!(list_depth(&c.body.blocks, &c.selection.focus.path), 1, "{:?}", c.body.blocks);
+        assert!(
+            matches!(
+                parent_of(&c.body.blocks, &c.selection.focus.path),
+                Some((Owner::ListItem { item: 1, .. }, 0))
+            ),
+            "a new item of the outer list: {:?}",
+            c.selection.focus
+        );
+        c.insert_text("two");
+        assert!(
+            matches!(&c.body.blocks[0], Block::List { items, .. } if items.len() == 2 && items[0].len() == 2),
+            "{:?}",
+            c.body.blocks
+        );
+        // Enter on the now empty outer item leaves the list.
+        c.insert_text("\n\n");
+        assert_eq!(list_depth(&c.body.blocks, &c.selection.focus.path), 0);
+    }
+
+    fn with_table() -> ComposeState {
+        let mut t = empty_table(2, 2);
+        if let Block::Table { rows, .. } = &mut t {
+            for (r, row) in rows.iter_mut().enumerate() {
+                for (k, cell) in row.iter_mut().enumerate() {
+                    *cell = table_cell(&format!("cell{r}{k}"));
+                }
+            }
+        }
+        state(vec![
+            para("alpha"),
+            t,
+            Block::List { kind: ListKind::Bullet, items: vec![vec![para("item")]] },
+            para("omega"),
+        ])
+    }
+
+    proptest::proptest! {
+        /// Deleting any selection in a body with a table removes exactly the selected text (paragraph breaks
+        /// aside: cells are emptied, not merged), keeps the table unless all of it was selected, and one undo
+        /// brings the body back.
+        #[test]
+        fn delete_selection_with_tables_removes_exactly_the_selection(a in 0usize..10, ao in 0usize..8, b in 0usize..10, bo in 0usize..8) {
+            let mut c = with_table();
+            let leaves = c.leaf_paths();
+            let pa = leaves[a % leaves.len()].clone();
+            let pb = leaves[b % leaves.len()].clone();
+            let x = DocPos::new(pa.clone(), ao.min(leaf_len(&c.body.blocks, &pa)));
+            let y = DocPos::new(pb.clone(), bo.min(leaf_len(&c.body.blocks, &pb)));
+            c.set_selection(x, y);
+            let (s, e) = (c.selection.start().clone(), c.selection.end().clone());
+            let whole_table = s.path < vec![1] && e.path >= vec![2];
+            let before = c.body.clone();
+            let pre = range_text(&c.body, &c.body_start(), &s);
+            let post = range_text(&c.body, &e, &c.body_end());
+            c.checkpoint();
+            c.delete_selection();
+            c.ensure_body();
+            let flat = |t: String| t.replace('\n', "");
+            proptest::prop_assert_eq!(flat(all_text(&c)), flat(format!("{pre}{post}")));
+            let tables = c.body.blocks.iter().filter(|b| matches!(b, Block::Table { .. })).count();
+            proptest::prop_assert_eq!(tables, usize::from(!whole_table));
+            proptest::prop_assert!(c.leaf_paths().contains(&c.selection.focus.path));
+            proptest::prop_assert!(c.undo_edit());
+            proptest::prop_assert_eq!(&c.body, &before);
+        }
+    }
+
+    #[test]
+    fn extra_spaces_can_be_ignored_once_or_everywhere() {
+        // A grammar issue on whitespace only ("More than one space"): its "word" is the spaces.
+        let spaces = |t: &str| -> Vec<TextIssue> {
+            let chars: Vec<char> = t.chars().collect();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i + 1 < chars.len() {
+                if chars[i] == ' ' && chars[i + 1] == ' ' {
+                    out.push(TextIssue {
+                        start: i,
+                        end: i + 2,
+                        kind: "doubleSpace".into(),
+                        suggestions: vec![" ".into()],
+                    });
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        };
+        let mut c = state(vec![para("a  b  c")]);
+        c.refresh_spelling(true, &mut |t: &str| spaces(t));
+        assert_eq!(c.spell_issues.len(), 2);
+        assert_eq!(c.ignore_spelling(None, false, Some(&p(&[0], 1))), 1, "Ignore Once");
+        c.refresh_spelling(true, &mut |t: &str| spaces(t));
+        assert_eq!(c.spell_issues.len(), 1, "the ignored occurrence stays ignored");
+        assert_eq!(c.ignore_spelling(None, true, Some(&p(&[0], 4))), 1, "Ignore All");
+        c.refresh_spelling(true, &mut |t: &str| spaces(t));
+        assert!(c.spell_issues.is_empty());
+        assert_eq!(c.ignore_spelling(Some(""), true, None), 0, "an empty word is never ignored");
     }
 }

@@ -12,6 +12,8 @@ pub mod backstage;
 pub mod body;
 pub mod chrome;
 pub mod compose;
+// The control channel listens on a local TCP socket from background threads; browsers have neither.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod control;
 pub mod dialogs;
 pub mod folders;
@@ -71,7 +73,7 @@ pub struct UiState {
     /// Selected item ids in non-mail modules.
     pub module_selection: Option<u64>,
     /// Local control-channel port requested on the command line (`--control-port N`) or through
-    /// `MAILCRAFT_CONTROL_PORT`; `None` = control channel off. Read by [`control`].
+    /// `MAILCRAFT_CONTROL_PORT`; `None` = control channel off. Read by `control` (native builds only).
     pub control_port: Option<u16>,
 }
 
@@ -278,6 +280,7 @@ impl App {
         egui_extras::install_image_loaders(&ctx);
         self.sync_theme(&ctx);
         // Control-channel requests (when `--control-port` asked for one) apply before drawing.
+        #[cfg(not(target_arch = "wasm32"))]
         control::frame(&ctx, self);
         keys::handle(&ctx, self, Surface::Main);
         self.drain_notices(&ctx);

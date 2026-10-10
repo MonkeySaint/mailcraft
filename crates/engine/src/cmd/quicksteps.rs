@@ -379,11 +379,8 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
             QuickStepAction::NewMessageTo(to) => {
-                let cid = s.open_compose(ComposeState {
-                    kind: ComposeKind::New,
-                    to: to.join("; "),
-                    ..Default::default()
-                });
+                let c = ComposeState { kind: ComposeKind::New, to: to.join("; "), ..Default::default() };
+                let cid = s.open_compose(crate::compose::with_default_signature(&s.mailbox, c));
                 composes.push(cid);
             }
             QuickStepAction::Reply | QuickStepAction::ReplyAll | QuickStepAction::Forward(_) => {

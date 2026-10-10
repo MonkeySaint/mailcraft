@@ -845,6 +845,209 @@ pub fn size_text(bytes: u64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Recipient Auto-Complete (added in commit 6)
+// ---------------------------------------------------------------------------------------------------------
+
+/// Where an Auto-Complete suggestion comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SuggestionSource {
+    /// A contact in People.
+    Contact,
+    /// The Auto-Complete list (recipients of sent mail).
+    Recent,
+    /// The user's own accounts (the local directory).
+    Directory,
+}
+
+impl SuggestionSource {
+    /// Lower-case name ("contact", "recent", "directory").
+    pub fn label(self) -> &'static str {
+        match self {
+            SuggestionSource::Contact => "contact",
+            SuggestionSource::Recent => "recent",
+            SuggestionSource::Directory => "directory",
+        }
+    }
+}
+
+/// One Auto-Complete suggestion for a recipient field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Suggestion {
+    /// Display name (the address when there is none).
+    pub display: String,
+    pub address: String,
+    pub source: SuggestionSource,
+}
+
+impl Suggestion {
+    /// The entry written into the field when the suggestion is picked ("Name <address>").
+    pub fn entry(&self) -> String {
+        let name = (!self.display.is_empty() && !self.display.eq_ignore_ascii_case(&self.address))
+            .then_some(self.display.as_str());
+        crate::cmd::compose::field_mailbox(&mailcraft_model::Address::new(name, &self.address))
+    }
+}
+
+/// Whether `text` or one of its words starts with `prefix` (both compared lower-case).
+fn word_prefix(text: &str, prefix: &str) -> bool {
+    let t = text.to_lowercase();
+    t.starts_with(prefix)
+        || t.split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | '.' | '-' | '_' | '@' | '(' | ')' | '"' | '\'')
+        })
+        .any(|w| !w.is_empty() && w.starts_with(prefix))
+}
+
+/// Auto-Complete suggestions for what is typed in a recipient field: the Auto-Complete list first (most
+/// recently used first), then contacts (every address of a contact whose name, file-as, company or address
+/// matches; by name), then the user's own accounts. Matching is a case-insensitive prefix of the whole
+/// name/address or of any word in it. Only the entry after the last `;` counts. One row per address.
+pub fn address_suggestions(s: &Session, prefix: &str, limit: usize) -> Vec<Suggestion> {
+    let typed = prefix.rsplit(';').next().unwrap_or(prefix).trim().to_lowercase();
+    if typed.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let typed: String = typed.chars().take(256).collect();
+    let mut out: Vec<Suggestion> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut push = |out: &mut Vec<Suggestion>, display: &str, address: &str, source: SuggestionSource| {
+        let address = address.trim();
+        if address.is_empty() || !seen.insert(address.to_lowercase()) {
+            return;
+        }
+        let display = if display.trim().is_empty() { address } else { display.trim() };
+        out.push(Suggestion { display: display.to_owned(), address: address.to_owned(), source });
+    };
+    // Contact names by address: a recent recipient written without a name shows its contact's name.
+    let mut contact_names: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if s.mailbox.recent_recipients.iter().any(|r| r.name.trim().is_empty()) {
+        for c in s.mailbox.contacts.values() {
+            let full = c.full_name();
+            let shown = if full.trim().is_empty() { c.file_as.trim().to_owned() } else { full };
+            if shown.trim().is_empty() {
+                continue;
+            }
+            for e in &c.emails {
+                contact_names.entry(e.trim().to_lowercase()).or_insert_with(|| shown.clone());
+            }
+        }
+    }
+    for r in &s.mailbox.recent_recipients {
+        if out.len() >= limit {
+            return out;
+        }
+        let name = match r.name.trim() {
+            "" => contact_names.get(&r.address.trim().to_lowercase()).cloned().unwrap_or_default(),
+            n => n.to_owned(),
+        };
+        if word_prefix(&name, &typed) || word_prefix(&r.address, &typed) {
+            push(&mut out, &name, &r.address, SuggestionSource::Recent);
+        }
+    }
+    let mut contacts: Vec<(String, String)> = Vec::new();
+    for c in s.mailbox.contacts.values() {
+        let full = c.full_name();
+        let shown = if full.trim().is_empty() { c.file_as.trim().to_owned() } else { full.clone() };
+        let name_hit = [&full, &c.file_as, &c.first_name, &c.last_name, &c.company]
+            .iter()
+            .any(|n| !n.trim().is_empty() && word_prefix(n, &typed));
+        for e in c.emails.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+            if name_hit || word_prefix(e, &typed) {
+                contacts.push((shown.clone(), e.to_owned()));
+            }
+        }
+    }
+    contacts.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.1.cmp(&b.1)));
+    for (name, addr) in &contacts {
+        if out.len() >= limit {
+            return out;
+        }
+        push(&mut out, name, addr, SuggestionSource::Contact);
+    }
+    for a in &s.mailbox.accounts {
+        if out.len() >= limit {
+            return out;
+        }
+        let name =
+            if a.sender_name.trim().is_empty() { a.display_name.as_str() } else { a.sender_name.as_str() };
+        if !a.address.trim().is_empty() && (word_prefix(name, &typed) || word_prefix(&a.address, &typed)) {
+            push(&mut out, name, &a.address, SuggestionSource::Directory);
+        }
+    }
+    out.truncate(limit);
+    out
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+    use mailcraft_model::{Contact, ItemId, Mailbox};
+
+    #[test]
+    fn suggestions_from_recent_contacts_and_accounts() {
+        let mut mb = Mailbox::new_local("Local");
+        mb.add_account(mailcraft_model::Account {
+            kind: mailcraft_model::AccountKind::Imap,
+            address: "me@example.com".into(),
+            sender_name: "Me Example".into(),
+            ..Default::default()
+        });
+        let id = mb.alloc_id();
+        mb.contacts.insert(
+            ItemId(id),
+            Contact {
+                id: ItemId(id),
+                first_name: "Alice".into(),
+                last_name: "Rivera".into(),
+                company: "Contoso Labs".into(),
+                emails: vec!["alice@example.com".into(), "a.rivera@example.org".into()],
+                ..Default::default()
+            },
+        );
+        let now = mailcraft_model::DateTime::from_civil(2026, 10, 9, 12, 0, 0, 0).unwrap();
+        mb.record_recipients(&[("Alan Ng".into(), "alan@example.net".into())], now);
+        let s = Session::new(mb);
+        let got = address_suggestions(&s, "al", 10);
+        let addrs: Vec<&str> = got.iter().map(|g| g.address.as_str()).collect();
+        assert_eq!(addrs, ["alan@example.net", "a.rivera@example.org", "alice@example.com"]);
+        assert_eq!(got[0].source, SuggestionSource::Recent);
+        assert_eq!(got[1].source, SuggestionSource::Contact);
+        assert_eq!(got[1].entry(), "Alice Rivera <a.rivera@example.org>");
+        // Company and surname words match; only the entry after the last ';' counts.
+        assert_eq!(address_suggestions(&s, "bob@x.org; conto", 10).len(), 2);
+        assert_eq!(address_suggestions(&s, "RIVERA", 10).len(), 2);
+        assert_eq!(address_suggestions(&s, "me", 10)[0].source, SuggestionSource::Directory);
+        assert_eq!(address_suggestions(&s, "al", 1).len(), 1);
+        assert!(address_suggestions(&s, "  ", 10).is_empty());
+        assert!(address_suggestions(&s, "zzz", 10).is_empty());
+        assert!(address_suggestions(&s, &"\u{1F600}".repeat(10_000), 10).is_empty());
+    }
+
+    #[test]
+    fn recent_recipients_without_a_name_take_the_contact_name() {
+        let mut mb = Mailbox::new_local("Local");
+        let id = mb.alloc_id();
+        mb.contacts.insert(
+            ItemId(id),
+            Contact {
+                id: ItemId(id),
+                first_name: "Alice".into(),
+                last_name: "Rivera".into(),
+                emails: vec!["alice@example.com".into()],
+                ..Default::default()
+            },
+        );
+        let now = mailcraft_model::DateTime::from_civil(2026, 10, 9, 12, 0, 0, 0).unwrap();
+        mb.record_recipients(&[(String::new(), "ALICE@example.com".into())], now);
+        let s = Session::new(mb);
+        let got = address_suggestions(&s, "riv", 10);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].source, SuggestionSource::Recent);
+        assert_eq!(got[0].entry(), "Alice Rivera <ALICE@example.com>");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

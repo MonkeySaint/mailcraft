@@ -1,0 +1,19 @@
+[package]
+name = "mailcraft-testmail"
+description = "Local in-process IMAP4rev1/rev2 and SMTP submission test servers for MailCraft tests (dev/test only; never contacts real servers)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+base64.workspace = true
+# TLS server side with the pure `ring` provider (no aws-lc / OpenSSL licence terms).
+rustls.workspace = true
+# Self-signed certificate generated at start.
+rcgen.workspace = true
+
+[lints]
+workspace = true

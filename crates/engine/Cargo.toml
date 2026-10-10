@@ -14,6 +14,7 @@ mailcraft-store.workspace = true
 mailcraft-html.workspace = true
 mailcraft-layout.workspace = true
 mailcraft-fonts.workspace = true
+mailcraft-proof.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

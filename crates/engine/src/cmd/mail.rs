@@ -724,6 +724,7 @@ fn new_email(s: &mut Session, p: &Value) -> CmdResult {
         inline: false,
         ..Default::default()
     };
+    let c = crate::compose::with_default_signature(&s.mailbox, c);
     let id = s.open_compose(c);
     Ok(json!({"compose": id}))
 }

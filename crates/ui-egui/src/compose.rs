@@ -14,8 +14,15 @@
 //!
 //! Every change goes through `App::run` (`compose.*`, `format.*`, `nav.*`); header fields run their `compose.set*`
 //! command once per frame when the text changed.
+//!
+//! Submodules: `editor` (the body editor), `recipients` (To / Cc / Bcc: Auto-Complete, resolved names, Ctrl+K
+//! Check Names), `attach` (attachments well, Browse This PC…, recent files, drag and drop, file hooks) and
+//! `spelling` (the F7 Spelling and Grammar dialog).
 
+mod attach;
 mod editor;
+mod recipients;
+mod spelling;
 #[cfg(test)]
 mod tests;
 
@@ -30,7 +37,16 @@ use mailcraft_engine::compose::{ComposeKind, ComposeState};
 use crate::responsive::Frame;
 use crate::{App, Surface};
 
-pub use editor::{BODY_LABEL, body_focused, editor_id};
+pub use attach::{
+    DROP_HINT, FileHooks, MAX_RECENT, SAVE_TITLE, file_hooks, file_name as recent_label, recent_files,
+    remember_file, set_file_hooks, size_text,
+};
+pub use editor::{BODY_LABEL, NO_SUGGESTIONS, body_focused, editor_id};
+pub(crate) use editor::{EditorHost, body_editor_in};
+pub use recipients::{
+    Entry as RecipientEntry, entries as recipient_entries, split_entries as split_recipients,
+};
+pub use spelling::{COMPLETE as SPELLING_COMPLETE, TITLE as SPELLING_TITLE, is_open as spelling_open};
 
 /// Default compose window size (compose.md).
 pub const DEFAULT_SIZE: [f32; 2] = [1440.0, 780.0];
@@ -47,6 +63,8 @@ const MARGIN: f32 = 16.0;
 const GAP: f32 = 12.0;
 const QAT_H: f32 = 30.0;
 const TAB_H: f32 = 30.0;
+/// Left inset of the attachments well (lines the chips up with the address buttons).
+const WELL_INDENT: f32 = MARGIN + SEND_SIZE.x + MARGIN;
 
 /// Compose tabs used when the ribbon area does not list any (compose.md).
 const FALLBACK_TABS: [&str; 6] = ["Message", "Insert", "Options", "Format Text", "Review", "Help"];
@@ -197,6 +215,7 @@ pub fn inline_compose(ui: &mut Ui, app: &mut App, id: u64) {
     }
     let ctx = ui.ctx().clone();
     initial_focus(&ctx, app, id);
+    attach::take_dropped_files(&ctx, app, id, Some(ui.max_rect()));
     ui.push_id(("mailcraft-inline-compose", id), |ui| {
         // Discard / Pop Out at the top right.
         ui.allocate_ui_with_layout(
@@ -216,12 +235,14 @@ pub fn inline_compose(ui: &mut Ui, app: &mut App, id: u64) {
             return;
         }
         header(ui, app, id);
-        attachments(ui, app, id);
+        attach::well(ui, app, id, WELL_INDENT);
         separator(ui, app);
         let h = ui.available_height();
         let min_h = if h.is_finite() && h < 4000.0 { h.max(160.0) } else { 240.0 };
         editor::body_editor(ui, app, id, min_h);
     });
+    spelling::dialog(&ctx, app, id);
+    attach::save_as_dialog(&ctx, app, id);
 }
 
 // =======================================================================================================
@@ -244,9 +265,9 @@ fn compose_viewport(ui: &mut Ui, app: &mut App, cid: u64, class: ViewportClass) 
             return;
         }
     }
-    if !embedded {
-        attach_dropped_files(&ctx, app, cid);
-    }
+    // Files dropped from the OS become attachments (an embedded window shares the main window's input: only
+    // drops over the window count).
+    attach::take_dropped_files(&ctx, app, cid, embedded.then(|| ui.max_rect()));
     initial_focus(&ctx, app, cid);
 
     let size = if embedded { ui.available_size() } else { ctx.content_rect().size() };
@@ -271,7 +292,7 @@ fn compose_viewport(ui: &mut Ui, app: &mut App, cid: u64, class: ViewportClass) 
         }
         ui.add_space(8.0);
         header(ui, app, cid);
-        attachments(ui, app, cid);
+        attach::well(ui, app, cid, WELL_INDENT);
         separator(ui, app);
         let h = ui.available_height().max(40.0);
         egui::ScrollArea::vertical()
@@ -283,6 +304,14 @@ fn compose_viewport(ui: &mut Ui, app: &mut App, cid: u64, class: ViewportClass) 
     });
 
     save_prompt(&ctx, app, cid);
+    spelling::dialog(&ctx, app, cid);
+    attach::save_as_dialog(&ctx, app, cid);
+
+    // F7 anywhere in the window (the body editor already took it when it has focus).
+    let f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F7));
+    if f7 && app.s.composes.contains_key(&cid) {
+        spelling::open(&ctx, app, cid);
+    }
 
     // Compose-surface shortcuts (Ctrl+S, Ctrl+Enter, Alt keytips…) on this window's own input. The body editor
     // already took the keys it handles out of it. An embedded window shares the main viewport's input, which
@@ -317,21 +346,6 @@ pub(crate) fn claim_initial_focus(ui: &Ui, cid: u64, resp: &egui::Response) {
     resp.request_focus();
     st.pending_focus = None;
     set_win_state(ctx, cid, st);
-}
-
-/// Files dropped onto the window become attachments.
-fn attach_dropped_files(ctx: &egui::Context, app: &mut App, cid: u64) {
-    let paths: Vec<String> = ctx.input(|i| {
-        i.raw
-            .dropped_files
-            .iter()
-            .map(|f| f.path().to_string_lossy().into_owned())
-            .filter(|p| !p.is_empty())
-            .collect()
-    });
-    for p in paths {
-        app.run("compose.attachFile", json!({"compose": cid, "path": p}));
-    }
 }
 
 /// Quick Access row: Save, Undo, Redo, Previous Item, Next Item (plus Close when embedded).
@@ -537,6 +551,58 @@ fn field_edit(ui: &mut Ui, app: &mut App, cid: u64, f: Field, rect: Rect, label_
     }
 }
 
+/// F7 on a compose surface: opens the Spelling and Grammar dialog (for the keyboard handler; compose windows
+/// and the body editor catch F7 themselves).
+pub fn open_spelling_dialog(ctx: &egui::Context, app: &mut App, cid: u64) {
+    spelling::open(ctx, app, cid);
+}
+
+/// The compose whose To, Cc or Bcc field has keyboard focus (Ctrl+K there is Check Names, not Insert Link).
+pub fn focused_recipient_field(ctx: &egui::Context, app: &App) -> Option<u64> {
+    let focus = ctx.memory(|m| m.focused())?;
+    app.s
+        .composes
+        .keys()
+        .copied()
+        .find(|&cid| [Field::To, Field::Cc, Field::Bcc].iter().any(|f| focus == field_id(cid, *f)))
+}
+
+/// Ribbon commands the compose window handles itself (called by the ribbon before running a command on a
+/// compose surface). Returns true when handled:
+/// - `compose.attachFile` without a file (Browse This PC…) runs the platform's file picker when installed;
+///   with a `path` it attaches and remembers the file for the recent list;
+/// - `options.open {"page": "signatures"}` (Signature ▾ › Signatures…) opens Signatures and Stationery itself
+///   rather than the Options dialog;
+/// - `review.spelling` opens the Spelling and Grammar dialog.
+pub(crate) fn ribbon_command(
+    ctx: &egui::Context,
+    app: &mut App,
+    cid: u64,
+    cmd: &str,
+    params: &serde_json::Value,
+) -> bool {
+    match cmd {
+        "compose.attachFile" if attach::names_no_file(params) => attach::browse(app, cid),
+        "compose.attachFile" => match params.get("path").and_then(serde_json::Value::as_str) {
+            Some(p) => {
+                attach::attach_path(app, cid, p);
+                true
+            }
+            None => false,
+        },
+        "options.open" if params.get("page").and_then(serde_json::Value::as_str) == Some("signatures") => {
+            crate::dialogs::open(app, "signatures", json!({"compose": cid}));
+            true
+        }
+        "review.spelling" => {
+            let grammar = params.get("grammar").and_then(serde_json::Value::as_bool).unwrap_or(true);
+            spelling::open_with(ctx, app, cid, grammar);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Send + address rows + Subject (shared by windows and inline responses).
 fn header(ui: &mut Ui, app: &mut App, cid: u64) {
     let Some(c) = app.s.composes.get(&cid) else {
@@ -606,58 +672,9 @@ fn header(ui: &mut Ui, app: &mut App, cid: u64) {
                 Some(r.id)
             }
         };
-        field_edit(ui, app, cid, f, field, label_id);
-    }
-}
-
-/// Attachment chips (paperclip, name, size, remove).
-fn attachments(ui: &mut Ui, app: &mut App, cid: u64) {
-    let Some(c) = app.s.composes.get(&cid) else {
-        return;
-    };
-    if c.attachments.is_empty() {
-        return;
-    }
-    let items: Vec<(String, usize)> =
-        c.attachments.iter().map(|a| (a.filename.clone(), a.data.len())).collect();
-    let mut remove = None;
-    ui.add_space(4.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(MARGIN + SEND_SIZE.x + MARGIN);
-        for (i, (name, len)) in items.iter().enumerate() {
-            egui::Frame::new()
-                .stroke(Stroke::new(1.0, app.theme.separator))
-                .corner_radius(CornerRadius::same(4))
-                .inner_margin(egui::Margin::symmetric(6, 3))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                        app.icons.paint(ui, ir, "paperclip", app.theme.text_muted);
-                        ui.label(egui::RichText::new(name).color(app.theme.text));
-                        ui.label(egui::RichText::new(size_text(*len)).color(app.theme.text_muted).small());
-                        if ui
-                            .add(egui::Button::new("×").frame(false).small())
-                            .on_hover_text(format!("Remove {name}"))
-                            .clicked()
-                        {
-                            remove = Some(i);
-                        }
-                    });
-                });
+        match f {
+            Field::To | Field::Cc | Field::Bcc => recipients::address_field(ui, app, cid, f, field, label_id),
+            Field::From | Field::Subject => field_edit(ui, app, cid, f, field, label_id),
         }
-    });
-    ui.add_space(4.0);
-    if let Some(i) = remove {
-        app.run("compose.removeAttachment", json!({"compose": cid, "index": i}));
-    }
-}
-
-/// "12 KB" / "1.2 MB".
-pub fn size_text(bytes: usize) -> String {
-    let b = bytes as f64;
-    if b < 1024.0 * 1024.0 {
-        format!("{} KB", ((b / 1024.0).ceil() as u64).max(1))
-    } else {
-        format!("{:.1} MB", b / (1024.0 * 1024.0))
     }
 }

@@ -369,10 +369,14 @@ item | Select All Text With Similar Formatting | | format.selectSimilar | | S
 item | Selection Pane... | | format.selectionPane | | P | on=selpane
 
 menu attachFile
+dyn | recentFiles | compose.attachFile | {"path":"$path"}
+sep
 sub | Attach Item | email | attachItem | | I
 item | Browse This PC... | attach | compose.attachFile | | B
 
 menu attachFileInsert
+dyn | recentFiles | compose.attachFile | {"path":"$path"}
+sep
 item | Browse This PC... | attach | compose.attachFile | | B
 
 menu attachItem
@@ -387,6 +391,8 @@ item | Insert Link... | link | insert.link | | I
 item | Remove Link | | insert.link | {"url":""} | R
 
 menu signature
+dyn | signatures | compose.signature | {"name":"$name"}
+sep
 item | None | | compose.signature | {"name":"none"} | N
 sep
 item | Signatures... | signature | options.open | {"page":"signatures"} | S

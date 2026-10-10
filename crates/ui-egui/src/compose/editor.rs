@@ -6,21 +6,37 @@
 //! ([`mailcraft_layout::Layout::caret_rect`]) and caret movement over the line boxes. The editor's own
 //! interaction sits on top of the painted body, so the body's read-only selection handling never runs here.
 //!
-//! Every change goes through `App::run`: typing → `compose.insertText`, Backspace / Delete →
-//! `compose.deleteText`, caret moves and selections → `compose.select`, clipboard → `format.copy` /
-//! `format.cut` / `format.paste`, Ctrl+B/I/U → `format.bold` / `format.italic` / `format.underline`, Ctrl+L/E/R/J →
-//! `format.align`, Ctrl+Z / Ctrl+Y → `compose.editUndo` / `compose.editRedo`, Tab / Shift+Tab in a list →
-//! `format.indent` / `format.outdent`. Keys the editor handles are removed from the frame's input so the
-//! compose-surface shortcut handler (`crate::keys::handle`) does not run them a second time.
+//! Every change goes through the host's command runner (`App::run` for compose windows): typing →
+//! `compose.insertText`, Backspace / Delete → `compose.deleteText`, caret moves and selections →
+//! `compose.select`, clipboard → `format.copy` / `format.cut` / `format.paste`, Ctrl+B/I/U → `format.bold` /
+//! `format.italic` / `format.underline`, Ctrl+L/E/R/J → `format.align`, Ctrl+Z / Ctrl+Y → `compose.editUndo` /
+//! `compose.editRedo`, Tab / Shift+Tab → next / previous table cell (`compose.tableCell`) or, in a list,
+//! `format.indent` / `format.outdent`; F7 opens the spelling dialog. Keys the editor handles are removed from
+//! the frame's input so the compose-surface shortcut handler (`crate::keys::handle`) does not run them a
+//! second time.
+//!
+//! On top of the painted body the editor draws:
+//! - red wavy underlines under misspelled words and blue double underlines under grammar issues, from the
+//!   compose's cached spelling issues (re-checked when the body changed and the user paused typing);
+//! - inline pictures (`cid:` parts of the compose and `data:` URIs) through egui's image loaders, over the
+//!   body painter's placeholder (the placeholder stays when no loader decodes the format);
+//! - the caret.
+//!
+//! Right-click opens the context menu: spelling suggestions, Ignore All and Add to Dictionary on a flagged
+//! word; Open / Copy / Remove Link on a link; table rows and columns in a table; Cut / Copy / Paste. Ctrl+click
+//! follows a link (http, https, mailto; `#bookmark` jumps inside the message).
+//!
+//! The editor works through [`EditorHost`], so the same widget edits a signature in Signatures and Stationery
+//! (a private session) as well as a compose window body.
 
 use egui::{
-    CursorIcon, Event, EventFilter, Id, Key, Modifiers, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, WidgetInfo,
-    WidgetType, pos2, vec2,
+    Color32, CursorIcon, Event, EventFilter, Id, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Ui,
+    UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
 };
 use serde_json::{Value, json};
 
-use mailcraft_engine::compose::{ComposeState, DocPos};
-use mailcraft_layout::{Layout, LayoutOptions, LineBox, TextPos, layout_doc};
+use mailcraft_engine::compose::{ComposeState, DocPos, SpellIssue};
+use mailcraft_layout::{DisplayItem, Layout, LayoutOptions, LineBox, TextPos, layout_doc};
 use mailcraft_model::{Block, Doc, Inline};
 
 use crate::App;
@@ -36,8 +52,14 @@ const EMPTY_LINE_H: f32 = 20.0;
 const MAX_DEPTH: usize = 64;
 /// Most chars of a leaf read for word movement.
 const MAX_LEAF_CHARS: usize = 1 << 20;
+/// Most spelling issues underlined in one frame.
+const MAX_SQUIGGLES: usize = 2_000;
+/// Most suggestions offered in the context menu.
+const MENU_SUGGESTIONS: usize = 5;
 /// Accessible name of the body editor.
 pub const BODY_LABEL: &str = "Message body";
+/// Context-menu label when the speller has nothing to offer.
+pub const NO_SUGGESTIONS: &str = "(No spelling suggestions)";
 
 /// The egui id of the body editor of compose `cid` (focus target; also used by `keys` to tell whether the body
 /// has keyboard focus).
@@ -48,6 +70,63 @@ pub fn editor_id(cid: u64) -> Id {
 /// Whether the body editor of compose `cid` has keyboard focus.
 pub fn body_focused(ctx: &egui::Context, cid: u64) -> bool {
     ctx.memory(|m| m.has_focus(editor_id(cid)))
+}
+
+// =======================================================================================================
+// Host
+// =======================================================================================================
+
+/// What the body editor edits through: the app session (compose windows, inline responses) or a private
+/// session (the signature editor in Signatures and Stationery).
+pub(crate) trait EditorHost {
+    /// The compose being edited.
+    fn compose(&self, cid: u64) -> Option<&ComposeState>;
+    /// Runs a command (errors are reported by the host; `None` = failed).
+    fn run(&mut self, id: &str, params: Value) -> Option<Value>;
+    /// Colours.
+    fn theme(&self) -> &crate::theme::Theme;
+    /// Spell checking as you type (squiggles, the spelling context menu, F7).
+    fn proofing(&self) -> bool {
+        false
+    }
+    /// Re-checks the spelling of compose `cid` when its body changed since the last check.
+    fn refresh_spelling(&mut self, _cid: u64) {}
+    /// Spelling suggestions for `word`.
+    fn suggest(&self, _word: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// F7 in the body.
+    fn open_spelling(&mut self, _ctx: &egui::Context, _cid: u64) {}
+}
+
+impl EditorHost for App {
+    fn compose(&self, cid: u64) -> Option<&ComposeState> {
+        self.s.composes.get(&cid)
+    }
+    fn run(&mut self, id: &str, params: Value) -> Option<Value> {
+        App::run(self, id, params)
+    }
+    fn theme(&self) -> &crate::theme::Theme {
+        &self.theme
+    }
+    fn proofing(&self) -> bool {
+        true
+    }
+    fn refresh_spelling(&mut self, cid: u64) {
+        if !self.s.composes.get(&cid).is_some_and(ComposeState::spelling_stale) {
+            return;
+        }
+        let sp = mailcraft_engine::cmd::review::speller(&self.s);
+        if let Some(c) = self.s.composes.get_mut(&cid) {
+            mailcraft_engine::cmd::review::spell_check(&sp, c, false, 1);
+        }
+    }
+    fn suggest(&self, word: &str) -> Vec<String> {
+        mailcraft_engine::cmd::review::speller(&self.s).suggest(word, MENU_SUGGESTIONS)
+    }
+    fn open_spelling(&mut self, ctx: &egui::Context, cid: u64) {
+        super::spelling::open(ctx, self, cid);
+    }
 }
 
 /// Per-editor state kept in egui temp memory (taken out for the frame, put back at the end).
@@ -64,6 +143,19 @@ struct Mem {
     drag_anchor: Option<DocPos>,
     /// Scroll the caret into view on the next paint.
     reveal: bool,
+    /// Where the context menu was opened, and the menu's spelling suggestions.
+    menu: Option<MenuAt>,
+    /// Image URIs already handed to egui's loaders.
+    images: Vec<String>,
+}
+
+/// Context-menu target.
+#[derive(Clone, Debug, Default)]
+struct MenuAt {
+    issue: Option<SpellIssue>,
+    suggestions: Vec<String>,
+    link: Option<String>,
+    in_table: bool,
 }
 
 /// A layout of `doc` with the options the body painter uses (for moves right after an edit in the same frame).
@@ -198,7 +290,7 @@ fn block_at<'a>(blocks: &'a [Block], path: &[usize]) -> Option<&'a Block> {
 }
 
 /// Flattened chars of the leaf at `path`.
-fn leaf_chars(doc: &Doc, path: &[usize]) -> Vec<char> {
+pub(crate) fn leaf_chars(doc: &Doc, path: &[usize]) -> Vec<char> {
     if path.len() > MAX_DEPTH {
         return Vec::new();
     }
@@ -468,6 +560,7 @@ enum Act {
     Undo,
     Redo,
     Tab { back: bool },
+    Spelling,
     Cmd(&'static str, Value),
 }
 
@@ -497,6 +590,7 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::Delete if !m.shift => Some(Act::Delete { back: false, word }),
         Key::Enter if !cmd && !m.alt => Some(Act::Text("\n".into())),
         Key::Tab if !cmd && !m.alt => Some(Act::Tab { back: m.shift }),
+        Key::F7 if !cmd && !m.alt && !m.shift => Some(Act::Spelling),
         Key::A if cmd && !m.shift && !m.alt => Some(Act::SelectAll),
         Key::Z if cmd && m.shift => Some(Act::Redo),
         Key::Z if cmd && !m.alt => Some(Act::Undo),
@@ -560,14 +654,11 @@ fn with_compose(cid: u64, mut v: Value) -> Value {
 }
 
 /// Runs `compose.select` when the selection differs.
-fn select(app: &mut App, cid: u64, anchor: &DocPos, focus: &DocPos) {
-    let same = app
-        .s
-        .composes
-        .get(&cid)
-        .is_some_and(|c| c.selection.anchor == *anchor && c.selection.focus == *focus);
+fn select(host: &mut dyn EditorHost, cid: u64, anchor: &DocPos, focus: &DocPos) {
+    let same =
+        host.compose(cid).is_some_and(|c| c.selection.anchor == *anchor && c.selection.focus == *focus);
     if !same {
-        app.run(
+        host.run(
             "compose.select",
             json!({"compose": cid, "anchor": pos_json(anchor), "focus": pos_json(focus)}),
         );
@@ -585,14 +676,21 @@ struct Geo<'a> {
 }
 
 /// Applies the frame's actions. Returns whether anything ran.
-fn apply(ui: &Ui, app: &mut App, cid: u64, geo: &Geo<'_>, px: &mut Option<f32>, acts: Vec<Act>) -> bool {
+fn apply(
+    ui: &Ui,
+    host: &mut dyn EditorHost,
+    cid: u64,
+    geo: &Geo<'_>,
+    px: &mut Option<f32>,
+    acts: Vec<Act>,
+) -> bool {
     let ctx = ui.ctx().clone();
     let mut any = false;
     // Layout of the current doc once an action changed it (moves after typing in the same frame).
     let mut fresh: Option<Layout> = None;
     let mut edited = false;
     for act in acts {
-        let Some(c) = app.s.composes.get(&cid) else {
+        let Some(c) = host.compose(cid) else {
             break;
         };
         if !matches!(act, Act::Move(Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown, _)) {
@@ -606,17 +704,17 @@ fn apply(ui: &Ui, app: &mut App, cid: u64, geo: &Geo<'_>, px: &mut Option<f32>, 
         let layout = fresh.as_ref().or(geo.painted);
         match act {
             Act::Text(t) => {
-                app.run("compose.insertText", json!({"compose": cid, "text": t}));
+                host.run("compose.insertText", json!({"compose": cid, "text": t}));
             }
             Act::Paste(t) => {
-                app.run("format.paste", json!({"compose": cid, "text": t}));
+                host.run("format.paste", json!({"compose": cid, "text": t}));
             }
             Act::Copy | Act::Cut => {
                 if c.selection.is_collapsed() {
                     continue;
                 }
                 let id = if act == Act::Copy { "format.copy" } else { "format.cut" };
-                if let Some(r) = app.run(id, json!({"compose": cid}))
+                if let Some(r) = host.run(id, json!({"compose": cid}))
                     && let Some(t) = r.get("text").and_then(Value::as_str)
                 {
                     ctx.copy_text(t.to_owned());
@@ -630,11 +728,18 @@ fn apply(ui: &Ui, app: &mut App, cid: u64, geo: &Geo<'_>, px: &mut Option<f32>, 
                     let from = c.selection.focus.clone();
                     let motion = if back { Motion::WordLeft } else { Motion::WordRight };
                     let to = motion_target(layout, &c.body, c, &from, motion, &mut None, geo.page);
-                    select(app, cid, &from, &to);
-                    app.run("compose.deleteText", json!({"compose": cid, "direction": "selection"}));
+                    if to.path != from.path {
+                        // At a block boundary Ctrl+Backspace / Ctrl+Delete act like Backspace / Delete
+                        // (leave a list item, stay inside table cells, drop an empty paragraph by a table).
+                        let dir = if back { "backward" } else { "forward" };
+                        host.run("compose.deleteText", json!({"compose": cid, "direction": dir}));
+                    } else {
+                        select(host, cid, &from, &to);
+                        host.run("compose.deleteText", json!({"compose": cid, "direction": "selection"}));
+                    }
                 } else {
                     let dir = if back { "backward" } else { "forward" };
-                    app.run("compose.deleteText", json!({"compose": cid, "direction": dir}));
+                    host.run("compose.deleteText", json!({"compose": cid, "direction": dir}));
                 }
             }
             Act::Move(motion, extend) => {
@@ -650,34 +755,44 @@ fn apply(ui: &Ui, app: &mut App, cid: u64, geo: &Geo<'_>, px: &mut Option<f32>, 
                         motion_target(layout, &c.body, c, &sel.focus, motion, px, geo.page)
                     };
                 let anchor = if extend { sel.anchor.clone() } else { target.clone() };
-                select(app, cid, &anchor, &target);
+                select(host, cid, &anchor, &target);
                 continue;
             }
             Act::SelectAll => {
-                app.run("compose.select", json!({"compose": cid, "all": true}));
+                host.run("compose.select", json!({"compose": cid, "all": true}));
                 continue;
             }
             Act::Undo => {
-                app.run("compose.editUndo", json!({"compose": cid}));
+                host.run("compose.editUndo", json!({"compose": cid}));
             }
             Act::Redo => {
-                app.run("compose.editRedo", json!({"compose": cid}));
+                host.run("compose.editRedo", json!({"compose": cid}));
             }
             Act::Tab { back } => {
-                let listed = in_list(&c.body, &c.selection.focus.path);
-                if back {
-                    if listed {
-                        app.run("format.outdent", json!({"compose": cid}));
-                    }
-                } else if listed {
-                    app.run("format.indent", json!({"compose": cid}));
+                // In a table Tab moves between cells (and adds a row after the last cell).
+                if c.cell_at_caret().is_some() {
+                    let dir = if back { "previous" } else { "next" };
+                    host.run("compose.tableCell", json!({"compose": cid, "direction": dir}));
                 } else {
-                    app.run("compose.insertText", json!({"compose": cid, "text": "\t"}));
+                    let listed = in_list(&c.body, &c.selection.focus.path);
+                    if back {
+                        if listed {
+                            host.run("format.outdent", json!({"compose": cid}));
+                        }
+                    } else if listed {
+                        host.run("format.indent", json!({"compose": cid}));
+                    } else {
+                        host.run("compose.insertText", json!({"compose": cid, "text": "\t"}));
+                    }
                 }
+            }
+            Act::Spelling => {
+                host.open_spelling(&ctx, cid);
+                continue;
             }
             Act::Cmd(id, params) => {
                 if !id.is_empty() {
-                    app.run(id, with_compose(cid, params));
+                    host.run(id, with_compose(cid, params));
                 }
             }
         }
@@ -688,16 +803,343 @@ fn apply(ui: &Ui, app: &mut App, cid: u64, geo: &Geo<'_>, px: &mut Option<f32>, 
 }
 
 // =======================================================================================================
+// Links, pictures, squiggles
+// =======================================================================================================
+
+/// Follows a link: web and mail links open outside (`mailto:` in the system's handler), `#name` jumps to a
+/// bookmark of compose `cid`. Other schemes (`javascript:`, `file:`…) are ignored. Returns whether it acted.
+pub(crate) fn follow_link(ctx: &egui::Context, host: &mut dyn EditorHost, cid: u64, href: &str) -> bool {
+    let h = href.trim();
+    if let Some(name) = h.strip_prefix('#') {
+        let pos = host.compose(cid).and_then(|c| {
+            c.bookmarks.iter().find(|b| b.name.eq_ignore_ascii_case(name)).map(|b| b.pos.clone())
+        });
+        return match pos {
+            Some(p) => {
+                select(host, cid, &p, &p);
+                true
+            }
+            None => false,
+        };
+    }
+    if is_followable(h) {
+        ctx.open_url(egui::OpenUrl::new_tab(h));
+        return true;
+    }
+    false
+}
+
+/// Whether a link target may be opened outside the app.
+pub(crate) fn is_followable(href: &str) -> bool {
+    let lower = href.trim().to_ascii_lowercase();
+    ["http://", "https://", "mailto:"].iter().any(|s| lower.starts_with(s) && lower.len() > s.len())
+}
+
+/// egui image URI and bytes of a body picture: `cid:` parts of the compose, `data:…;base64,` URIs.
+fn image_source(c: &ComposeState, cid: u64, src: &str) -> Option<(String, Vec<u8>)> {
+    let s = src.trim();
+    if let Some(content_id) = s.strip_prefix("cid:") {
+        let img = c.inline_images.iter().find(|i| i.content_id.eq_ignore_ascii_case(content_id))?;
+        if img.data.is_empty() {
+            return None;
+        }
+        let ext = img.filename.rsplit('.').next().unwrap_or("bin").to_ascii_lowercase();
+        return Some((format!("bytes://mailcraft/compose-{cid}/{content_id}.{ext}"), img.data.clone()));
+    }
+    let rest = s.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.to_ascii_lowercase().ends_with(";base64") || payload.len() > 32 * 1024 * 1024 {
+        return None;
+    }
+    let data = mailcraft_mime::transfer::decode_base64(payload.as_bytes());
+    if data.is_empty() {
+        return None;
+    }
+    let ext = meta.split(';').next().and_then(|m| m.rsplit('/').next()).unwrap_or("bin").to_ascii_lowercase();
+    let key = crate::body::doc_hash(&Doc::from_plain_text(&payload.chars().take(4096).collect::<String>()));
+    Some((format!("bytes://mailcraft/data-{key:016x}-{}.{ext}", payload.len()), data))
+}
+
+/// Paints the compose's pictures over the body painter's placeholders where an egui image loader decodes
+/// them (SVG always; PNG / JPEG / GIF when the app installs those loaders).
+fn paint_images(ui: &Ui, layout: &Layout, c: &ComposeState, cid: u64, origin: Pos2, seen: &mut Vec<String>) {
+    let ctx = ui.ctx();
+    let clip = ui.clip_rect();
+    let painter = ui.painter().with_clip_rect(clip);
+    for item in &layout.display.items {
+        let DisplayItem::Image { rect, src, .. } = item else {
+            continue;
+        };
+        let r = Rect::from_min_size(pos2(origin.x + rect.x, origin.y + rect.y), vec2(rect.w, rect.h));
+        if !r.intersects(clip) || !r.is_finite() || r.width() < 1.0 || r.height() < 1.0 {
+            continue;
+        }
+        let Some((uri, data)) = image_source(c, cid, src) else {
+            continue;
+        };
+        if !seen.contains(&uri) {
+            ctx.include_bytes(uri.clone(), data);
+            if seen.len() < 512 {
+                seen.push(uri.clone());
+            }
+        }
+        match ctx.try_load_texture(&uri, egui::TextureOptions::LINEAR, egui::SizeHint::default()) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => {
+                painter.image(
+                    texture.id,
+                    r,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            Ok(egui::load::TexturePoll::Pending { .. }) => ctx.request_repaint(),
+            Err(_) => {}
+        }
+    }
+}
+
+/// Spelling squiggle colour.
+const SPELLING_INK: Color32 = Color32::from_rgb(0xd8, 0x2c, 0x2c);
+/// Grammar underline colour.
+const GRAMMAR_INK: Color32 = Color32::from_rgb(0x2b, 0x5c, 0xd6);
+
+/// x of char offset `off` on `line`, or the line's right end when `off` is past its last stop.
+fn x_end(line: &LineBox, off: usize) -> f32 {
+    match line.stops.iter().find(|s| s.offset == off) {
+        Some(s) => s.x,
+        None => line.stops.iter().map(|s| s.x).fold(line.rect.x, f32::max),
+    }
+}
+
+/// Screen spans `(x0, x1, baseline_y)` of the issues, per line, in layout coordinates.
+fn issue_spans(layout: &Layout, issues: &[SpellIssue]) -> Vec<(f32, f32, f32, bool)> {
+    let mut out = Vec::new();
+    for issue in issues.iter().take(MAX_SQUIGGLES) {
+        if issue.start.path != issue.end.path {
+            continue;
+        }
+        let spelling = issue.kind == "spelling";
+        for line in layout.index.lines.iter().filter(|l| l.block_path == issue.start.path) {
+            // The last line of a block also holds the block-end position.
+            let line_end = if is_last_line(layout, line) { usize::MAX } else { line.end };
+            let s = issue.start.offset.max(line.start);
+            let e = issue.end.offset.min(line_end);
+            if e <= s {
+                continue;
+            }
+            let x0 = x_at(line, s);
+            let x1 = x_end(line, e);
+            if x1 > x0 + 0.5 {
+                out.push((x0, x1, line.baseline, spelling));
+            }
+        }
+    }
+    out
+}
+
+/// Red wavy underlines (spelling) and blue double underlines (grammar).
+fn paint_squiggles(ui: &Ui, layout: &Layout, issues: &[SpellIssue], origin: Pos2, zoom: f32) {
+    let clip = ui.clip_rect();
+    let painter = ui.painter().with_clip_rect(clip);
+    let amp = (1.2 * zoom).clamp(0.8, 3.0);
+    let step = (2.0 * zoom).clamp(1.5, 6.0);
+    for (x0, x1, base, spelling) in issue_spans(layout, issues) {
+        let y = origin.y + base + (2.5 * zoom).max(2.0);
+        let (x0, x1) = (origin.x + x0, origin.x + x1);
+        if y < clip.top() - 4.0 || y > clip.bottom() + 4.0 {
+            continue;
+        }
+        if spelling {
+            let mut pts = Vec::new();
+            let mut x = x0;
+            let mut up = true;
+            while x <= x1 && pts.len() < 4096 {
+                pts.push(pos2(x, if up { y - amp } else { y + amp }));
+                up = !up;
+                x += step;
+            }
+            if pts.len() >= 2 {
+                painter.add(Shape::line(pts, Stroke::new(1.0, SPELLING_INK)));
+            }
+        } else {
+            for dy in [0.0, 2.0] {
+                painter.line_segment([pos2(x0, y + dy), pos2(x1, y + dy)], Stroke::new(1.0, GRAMMAR_INK));
+            }
+        }
+    }
+}
+
+// =======================================================================================================
+// Context menu
+// =======================================================================================================
+
+/// What the context menu picked.
+#[derive(Clone, Debug, PartialEq)]
+enum Pick {
+    Correct(String, DocPos),
+    IgnoreAll(DocPos),
+    AddToDictionary(DocPos),
+    Cut,
+    Copy,
+    Paste,
+    OpenLink(String),
+    CopyLink(String),
+    RemoveLink,
+    Table(&'static str),
+}
+
+/// Context-menu target at `pos`: the spelling issue (with suggestions), the link and whether it is in a table.
+fn menu_target(host: &dyn EditorHost, cid: u64, pos: &DocPos, link: Option<String>) -> MenuAt {
+    let Some(c) = host.compose(cid) else {
+        return MenuAt::default();
+    };
+    let issue = if host.proofing() { c.spell_issue_at(pos).cloned() } else { None };
+    let mut suggestions = issue.as_ref().map(|i| i.suggestions.clone()).unwrap_or_default();
+    if let Some(i) = &issue
+        && suggestions.is_empty()
+        && i.kind == "spelling"
+    {
+        suggestions = host.suggest(&i.word);
+    }
+    suggestions.truncate(MENU_SUGGESTIONS);
+    MenuAt { issue, suggestions, link, in_table: c.cell_at_caret().is_some() }
+}
+
+fn menu_ui(ui: &mut Ui, at: &MenuAt, has_selection: bool) -> Option<Pick> {
+    let mut pick = None;
+    ui.set_min_width(200.0);
+    if let Some(issue) = &at.issue {
+        if at.suggestions.is_empty() {
+            ui.add_enabled(false, egui::Button::new(NO_SUGGESTIONS));
+        }
+        for s in &at.suggestions {
+            let label = if s.is_empty() { "(delete)".to_owned() } else { s.clone() };
+            if ui.button(egui::RichText::new(label).strong()).clicked() {
+                pick = Some(Pick::Correct(s.clone(), issue.start.clone()));
+            }
+        }
+        ui.separator();
+        if ui.button("Ignore All").clicked() {
+            pick = Some(Pick::IgnoreAll(issue.start.clone()));
+        }
+        if issue.kind == "spelling" && ui.button("Add to Dictionary").clicked() {
+            pick = Some(Pick::AddToDictionary(issue.start.clone()));
+        }
+        ui.separator();
+    }
+    if ui.add_enabled(has_selection, egui::Button::new("Cut")).clicked() {
+        pick = Some(Pick::Cut);
+    }
+    if ui.add_enabled(has_selection, egui::Button::new("Copy")).clicked() {
+        pick = Some(Pick::Copy);
+    }
+    if ui.button("Paste").clicked() {
+        pick = Some(Pick::Paste);
+    }
+    if let Some(href) = &at.link {
+        ui.separator();
+        if ui.button("Open Link").clicked() {
+            pick = Some(Pick::OpenLink(href.clone()));
+        }
+        if ui.button("Copy Link").clicked() {
+            pick = Some(Pick::CopyLink(href.clone()));
+        }
+        if ui.button("Remove Link").clicked() {
+            pick = Some(Pick::RemoveLink);
+        }
+    }
+    if at.in_table {
+        ui.separator();
+        ui.menu_button("Insert", |ui| {
+            for (label, action) in [
+                ("Insert Rows Above", "insertRowAbove"),
+                ("Insert Rows Below", "insertRowBelow"),
+                ("Insert Columns to the Left", "insertColumnLeft"),
+                ("Insert Columns to the Right", "insertColumnRight"),
+            ] {
+                if ui.button(label).clicked() {
+                    pick = Some(Pick::Table(action));
+                }
+            }
+        });
+        ui.menu_button("Delete", |ui| {
+            for (label, action) in [
+                ("Delete Rows", "deleteRow"),
+                ("Delete Columns", "deleteColumn"),
+                ("Delete Table", "deleteTable"),
+            ] {
+                if ui.button(label).clicked() {
+                    pick = Some(Pick::Table(action));
+                }
+            }
+        });
+    }
+    if pick.is_some() {
+        ui.close();
+    }
+    pick
+}
+
+fn apply_pick(ctx: &egui::Context, host: &mut dyn EditorHost, cid: u64, pick: Pick) {
+    match pick {
+        Pick::Correct(r, at) => {
+            host.run("review.correct", json!({"compose": cid, "replacement": r, "at": pos_json(&at)}));
+        }
+        Pick::IgnoreAll(at) => {
+            host.run("review.ignore", json!({"compose": cid, "all": true, "at": pos_json(&at)}));
+        }
+        Pick::AddToDictionary(at) => {
+            host.run("review.addToDictionary", json!({"compose": cid, "at": pos_json(&at)}));
+        }
+        Pick::Cut | Pick::Copy => {
+            let id = if pick == Pick::Copy { "format.copy" } else { "format.cut" };
+            if let Some(r) = host.run(id, json!({"compose": cid}))
+                && let Some(t) = r.get("text").and_then(Value::as_str)
+            {
+                ctx.copy_text(t.to_owned());
+            }
+        }
+        Pick::Paste => {
+            // The platform answers with a Paste event, which the focused editor takes next frame.
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        }
+        Pick::OpenLink(h) => {
+            follow_link(ctx, host, cid, &h);
+        }
+        Pick::CopyLink(h) => ctx.copy_text(h),
+        Pick::RemoveLink => {
+            host.run("insert.link", json!({"compose": cid, "url": ""}));
+        }
+        Pick::Table(action) => {
+            host.run("compose.tableEdit", json!({"compose": cid, "action": action}));
+        }
+    }
+    ctx.memory_mut(|m| m.request_focus(editor_id(cid)));
+}
+
+// =======================================================================================================
 // The widget
 // =======================================================================================================
 
 /// The body editor of compose `cid`, filling the available width and at least `min_height` tall. Place it in
 /// a vertical scroll area; it scrolls the caret into view itself.
 pub fn body_editor(ui: &mut Ui, app: &mut App, cid: u64, min_height: f32) -> Option<egui::Response> {
+    body_editor_in(ui, app, cid, min_height)
+}
+
+/// [`body_editor`] over any [`EditorHost`].
+pub(crate) fn body_editor_in(
+    ui: &mut Ui,
+    host: &mut dyn EditorHost,
+    cid: u64,
+    min_height: f32,
+) -> Option<egui::Response> {
     let ctx = ui.ctx().clone();
     let id = editor_id(cid);
-    let c = app.s.composes.get(&cid)?;
-    let dark = app.theme.dark && !c.light_canvas;
+    let c = host.compose(cid)?;
+    let theme_dark = host.theme().dark;
+    let theme_text = host.theme().text;
+    let dark = theme_dark && !c.light_canvas;
     let zoom = f32::from(c.zoom_pct().clamp(10, 500)) / 100.0;
     let avail = ui.available_width();
     let width = if avail.is_finite() { avail.max(MIN_TEXT_W + 2.0 * PAD) } else { 800.0 };
@@ -707,6 +1149,7 @@ pub fn body_editor(ui: &mut Ui, app: &mut App, cid: u64, min_height: f32) -> Opt
         mem.doc_key = crate::body::doc_hash(&c.body);
         mem.doc = Some(c.body.clone());
     }
+    let painted_rev = c.edit_rev;
     let line_h = EMPTY_LINE_H * zoom;
     let min_height = if min_height.is_finite() { min_height } else { 0.0 };
     let est_h = mem.view.layout.as_ref().map(|l| l.height).filter(|h| h.is_finite()).unwrap_or(line_h);
@@ -734,30 +1177,41 @@ pub fn body_editor(ui: &mut Ui, app: &mut App, cid: u64, min_height: f32) -> Opt
         };
         let _link = crate::body::show_doc_with(&mut child, &mut mem.view, &c.body, &opts);
     }
+    if let Some(layout) = mem.view.layout.as_ref() {
+        paint_images(ui, layout, c, cid, origin, &mut mem.images);
+    }
 
     // The editor's interaction, on top of the painted body.
     let resp = ui.interact(rect, id, Sense::click_and_drag());
     resp.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, BODY_LABEL));
+    let body_start = c.body_start();
+    let Mem { view, doc, preferred_x, drag_anchor, reveal, menu, .. } = &mut mem;
+    let layout = view.layout.as_ref();
+    let local = |p: Pos2| mailcraft_geom::Point { x: p.x - origin.x, y: p.y - origin.y };
+    let hit = |p: Pos2| -> DocPos {
+        layout.and_then(|l| l.hit_pos(local(p))).map(to_doc).unwrap_or_else(|| body_start.clone())
+    };
+    let link_under = |p: Pos2| -> Option<String> { layout.and_then(|l| l.hit(local(p))).map(str::to_owned) };
+    let (pressed, down, mods) =
+        ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers));
+    let hover_link = resp.hover_pos().and_then(link_under);
     if resp.hovered() {
-        ctx.set_cursor_icon(CursorIcon::Text);
+        let icon =
+            if hover_link.is_some() && mods.command { CursorIcon::PointingHand } else { CursorIcon::Text };
+        ctx.set_cursor_icon(icon);
     }
     super::claim_initial_focus(ui, cid, &resp);
-    let body_start = c.body_start();
-    let Mem { view, doc, preferred_x, drag_anchor, reveal, .. } = &mut mem;
-    let layout = view.layout.as_ref();
-    let hit = |p: Pos2| -> DocPos {
-        let local = p - origin;
-        layout
-            .and_then(|l| l.hit_pos(mailcraft_geom::Point { x: local.x, y: local.y }))
-            .map(to_doc)
-            .unwrap_or_else(|| body_start.clone())
-    };
     let mut changed = false;
-    let (pressed, down, shift) =
-        ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers.shift));
     if let Some(p) = resp.interact_pointer_pos() {
         let at = hit(p);
-        if resp.double_clicked() || resp.triple_clicked() {
+        let link = if mods.command { link_under(p) } else { None };
+        if let (true, Some(href)) = (pressed, link) {
+            // Ctrl+click follows the link instead of placing the caret.
+            resp.request_focus();
+            *drag_anchor = None;
+            follow_link(&ctx, host, cid, &href);
+            changed = true;
+        } else if resp.double_clicked() || resp.triple_clicked() {
             let (a, b) = if resp.triple_clicked() {
                 let end = layout.map(|l| block_end(l, &at.path)).unwrap_or(0);
                 (0, end)
@@ -766,17 +1220,17 @@ pub fn body_editor(ui: &mut Ui, app: &mut App, cid: u64, min_height: f32) -> Opt
                 word_at(&chars, at.offset)
             };
             *drag_anchor = None;
-            select(app, cid, &DocPos::new(at.path.clone(), a), &DocPos::new(at.path.clone(), b));
+            select(host, cid, &DocPos::new(at.path.clone(), a), &DocPos::new(at.path.clone(), b));
             changed = true;
         } else if pressed {
             resp.request_focus();
-            let anchor = if shift { sel.anchor.clone() } else { at.clone() };
-            select(app, cid, &anchor, &at);
+            let anchor = if mods.shift { sel.anchor.clone() } else { at.clone() };
+            select(host, cid, &anchor, &at);
             *drag_anchor = Some(anchor);
             *preferred_x = None;
             changed = true;
         } else if down && let Some(anchor) = drag_anchor.clone() {
-            select(app, cid, &anchor, &at);
+            select(host, cid, &anchor, &at);
             changed = true;
             let clip = ui.clip_rect();
             if p.y > clip.bottom() - 8.0 || p.y < clip.top() + 8.0 {
@@ -790,8 +1244,46 @@ pub fn body_editor(ui: &mut Ui, app: &mut App, cid: u64, min_height: f32) -> Opt
     if resp.clicked() && !resp.has_focus() {
         resp.request_focus();
     }
+    if let Some(href) = &hover_link
+        && !mods.command
+        && resp.hovered()
+        && !resp.context_menu_opened()
+    {
+        resp.clone().on_hover_text_at_pointer(format!("{href}\nCtrl+click to follow the link"));
+    }
+
+    // Right-click: the caret moves to the click unless it falls inside the selection; the menu works on that
+    // spot (spelling issue, link, table).
+    if resp.secondary_clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let at = hit(p);
+        let inside = !sel.is_collapsed() && *sel.start() <= at && at <= *sel.end();
+        if !inside {
+            select(host, cid, &at, &at);
+        }
+        resp.request_focus();
+        *menu = Some(menu_target(&*host, cid, &at, link_under(p)));
+    }
+    let mut pick = None;
+    if let Some(at) = menu.clone() {
+        let has_selection = host.compose(cid).is_some_and(ComposeState::has_selection);
+        resp.context_menu(|ui| {
+            pick = menu_ui(ui, &at, has_selection);
+        });
+        if !resp.secondary_clicked() && !resp.context_menu_opened() {
+            *menu = None;
+        }
+    }
+    if let Some(p) = pick {
+        *menu = None;
+        apply_pick(&ctx, host, cid, p);
+        changed = true;
+        *reveal = true;
+    }
 
     let focused = resp.has_focus();
+    let mut acted = false;
     if focused {
         ctx.memory_mut(|m| {
             m.set_focus_lock_filter(
@@ -802,9 +1294,25 @@ pub fn body_editor(ui: &mut Ui, app: &mut App, cid: u64, min_height: f32) -> Opt
         let acts = take_actions(ui);
         let page = (ui.clip_rect().height() - 2.0 * line_h).max(line_h);
         let geo = Geo { painted: layout, text_w, zoom, page };
-        if apply(ui, app, cid, &geo, preferred_x, acts) {
+        if apply(ui, host, cid, &geo, preferred_x, acts) {
             changed = true;
+            acted = true;
             *reveal = true;
+        }
+    }
+
+    // Spelling: re-check once typing pauses (a frame without edits), then underline what the check found
+    // when it matches the painted text.
+    if host.proofing() {
+        if !acted {
+            host.refresh_spelling(cid);
+        }
+        if let (Some(layout), Some(c)) = (layout, host.compose(cid))
+            && c.edit_rev == painted_rev
+            && c.spell_rev == Some(c.edit_rev)
+            && !c.spell_issues.is_empty()
+        {
+            paint_squiggles(ui, layout, &c.spell_issues, origin, zoom);
         }
     }
 
@@ -815,7 +1323,7 @@ pub fn body_editor(ui: &mut Ui, app: &mut App, cid: u64, min_height: f32) -> Opt
             .map(|r| Rect::from_min_size(pos2(r.x, r.y), vec2(1.0, r.h)))
             .unwrap_or_else(|| Rect::from_min_size(Pos2::ZERO, vec2(1.0, line_h)))
             .translate(origin.to_vec2());
-        let col = if dark { app.theme.text } else { egui::Color32::BLACK };
+        let col = if dark { theme_text } else { Color32::BLACK };
         ui.painter().line_segment([caret.center_top(), caret.center_bottom()], Stroke::new(1.5, col));
         if *reveal {
             ui.scroll_to_rect(caret.expand2(vec2(4.0, 8.0)), None);
@@ -885,5 +1393,61 @@ mod tests {
         assert!(leaf_chars(&doc, &[5]).is_empty());
         assert!(in_list(&doc, &[1, 0, 0]));
         assert!(!in_list(&doc, &[0]));
+    }
+
+    #[test]
+    fn followable_links_and_hostile_ones() {
+        assert!(is_followable("https://example.com/a"));
+        assert!(is_followable(" HTTP://example.org "));
+        assert!(is_followable("mailto:ann@example.com"));
+        assert!(!is_followable("javascript:alert(1)"));
+        assert!(!is_followable("file:///etc/passwd"));
+        assert!(!is_followable("https://"));
+        assert!(!is_followable(""));
+    }
+
+    #[test]
+    fn squiggles_span_the_flagged_word() {
+        let doc = Doc::from_plain_text("Helo world\nfine wrld");
+        let db = mailcraft_fonts::FontDb::bundled();
+        let layout = layout_doc(&doc, &db, &LayoutOptions { width: 400.0, ..LayoutOptions::default() });
+        let issue = |path: usize, a: usize, b: usize| SpellIssue {
+            start: DocPos::new(vec![path], a),
+            end: DocPos::new(vec![path], b),
+            word: String::new(),
+            kind: "spelling".into(),
+            suggestions: Vec::new(),
+        };
+        let spans = issue_spans(&layout, &[issue(0, 0, 4), issue(1, 5, 9)]);
+        assert_eq!(spans.len(), 2);
+        let (x0, x1, base0, spelling) = spans[0];
+        assert!(spelling && x0 < 1.0 && x1 > 15.0 && x1 < 60.0, "{spans:?}");
+        let (x2, x3, base1, _) = spans[1];
+        assert!(base1 > base0 && x2 > 20.0 && x3 > x2, "{spans:?}");
+        // Stale / hostile positions draw nothing.
+        assert!(issue_spans(&layout, &[issue(7, 0, 4), issue(0, 4, 2)]).is_empty());
+        let mut grammar = issue(0, 5, 10);
+        grammar.kind = "repeated".into();
+        assert!(!issue_spans(&layout, &[grammar])[0].3);
+    }
+
+    #[test]
+    fn picture_sources_resolve_cid_and_data_uris() {
+        let mut c = ComposeState::default();
+        c.inline_images.push(mailcraft_engine::compose::InlineImage {
+            content_id: "image001@x".into(),
+            filename: "dot.svg".into(),
+            mime_type: "image/svg+xml".into(),
+            data: b"<svg/>".to_vec(),
+        });
+        let (uri, data) = image_source(&c, 3, "cid:image001@x").unwrap();
+        assert!(uri.starts_with("bytes://mailcraft/compose-3/") && uri.ends_with(".svg"), "{uri}");
+        assert_eq!(data, b"<svg/>");
+        assert!(image_source(&c, 3, "cid:missing").is_none());
+        let (uri, data) = image_source(&c, 3, "data:image/png;base64,aGVsbG8=").unwrap();
+        assert!(uri.ends_with(".png"));
+        assert_eq!(data, b"hello");
+        assert!(image_source(&c, 3, "data:text/plain,hello").is_none());
+        assert!(image_source(&c, 3, "https://example.com/a.png").is_none());
     }
 }

@@ -1,0 +1,29 @@
+[package]
+name = "mailcraft-net"
+description = "MailCraft protocol clients: IMAP, SMTP submission, JMAP, OAuth 2.0 and folder sync (blocking, rustls)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-model.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+# TLS: rustls with the ring provider (Apache-2.0 OR ISC OR MIT; ring is Apache-2.0 AND ISC); system roots from
+# rustls-native-certs (Apache-2.0 OR ISC OR MIT). No webpki-roots (CDLA/MPL data).
+rustls.workspace = true
+rustls-native-certs.workspace = true
+ring.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+mailcraft-testmail.workspace = true
+# Self-signed certificates for scripted TLS servers in tests.
+rcgen.workspace = true
+
+[lints]
+workspace = true

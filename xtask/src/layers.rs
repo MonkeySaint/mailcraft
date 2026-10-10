@@ -1,5 +1,6 @@
 //! `cargo xtask layers`: each crate depends only on strictly lower layers, and nothing below the UI layer
-//! (L6) pulls in a GUI toolkit, directly or transitively.
+//! (L6) pulls in a GUI toolkit, directly or transitively. Test-support crates (local test servers) may be
+//! used only as dev-dependencies, or by apps and tooling.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -7,7 +8,7 @@ use std::path::Path;
 use crate::TaskResult;
 use crate::metadata::{self, Metadata};
 
-/// Package → layer. Apps sit on L7, repository tooling on L8.
+/// Package → layer. Apps sit on L7, repository tooling on L8, test support on [`TEST_LAYER`].
 pub const LAYERS: &[(&str, u8)] = &[
     ("mailcraft-geom", 0),
     ("mailcraft-mime", 0),
@@ -27,8 +28,17 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("mailcraft", 7),
     ("mailcraft-cli", 7),
     ("mailcraft-web", 7),
+    ("mailcraft-testmail-app", 7),
     ("xtask", 8),
+    ("mailcraft-testmail", TEST_LAYER),
 ];
+
+/// Test-support layer: crates on it may depend on L0–L6, and only dev-dependencies, apps (L7) and tooling
+/// (L8) may depend on them. Shipped library code must never link a test server.
+pub const TEST_LAYER: u8 = 9;
+
+/// The apps layer: the lowest layer allowed a normal dependency on a test-support crate.
+pub const APPS_LAYER: u8 = 7;
 
 /// Same-layer dependencies that are allowed: (from, to). None so far.
 pub const SAME_LAYER_EXCEPTIONS: &[(&str, &str)] = &[];
@@ -45,6 +55,7 @@ fn layer_name(l: u8) -> String {
     match l {
         7 => "apps".to_owned(),
         8 => "tools".to_owned(),
+        TEST_LAYER => "test".to_owned(),
         n => format!("L{n}"),
     }
 }
@@ -67,9 +78,22 @@ pub fn check(meta: &Metadata) -> Vec<String> {
                 continue;
             }
             let Some(dep_layer) = layer_of(dep) else { continue };
-            let allowed = dep_layer < layer
-                || (dep_layer == layer && SAME_LAYER_EXCEPTIONS.contains(&(p.name.as_str(), dep.as_str())));
-            if !allowed {
+            let allowed = if dep_layer == TEST_LAYER {
+                (APPS_LAYER..TEST_LAYER).contains(&layer)
+            } else if layer == TEST_LAYER {
+                dep_layer < APPS_LAYER
+            } else {
+                dep_layer < layer
+                    || (dep_layer == layer
+                        && SAME_LAYER_EXCEPTIONS.contains(&(p.name.as_str(), dep.as_str())))
+            };
+            if !allowed && dep_layer == TEST_LAYER {
+                problems.push(format!(
+                    "`{}` ({}) depends on the test-support crate `{dep}`: use it as a dev-dependency only",
+                    p.name,
+                    layer_name(layer)
+                ));
+            } else if !allowed {
                 problems.push(format!(
                     "`{}` ({}) depends on `{dep}` ({}): a crate may depend only on lower layers",
                     p.name,
@@ -95,7 +119,7 @@ fn gui_leaks(meta: &Metadata) -> Vec<String> {
     let name = |id: &str| meta.package(id).map(|p| p.name.clone()).unwrap_or_else(|| id.to_owned());
     let mut out = Vec::new();
     for p in meta.members() {
-        if layer_of(&p.name).is_none_or(|l| l >= UI_LAYER) {
+        if layer_of(&p.name).is_none_or(|l| l >= UI_LAYER && l != TEST_LAYER) {
             continue;
         }
         // Breadth-first search keeps the shortest path to each package.
@@ -147,7 +171,7 @@ pub fn run(root: &Path) -> TaskResult {
             .into_iter()
             .collect();
         let layer = layer_of(&p.name).map(layer_name).unwrap_or_else(|| "??".to_owned());
-        println!("{layer:>5}  {:<20} {}", p.name, deps.join(", "));
+        println!("{layer:>5}  {:<24} {}", p.name, deps.join(", "));
     }
     let problems = check(&meta);
     if problems.is_empty() {
@@ -218,6 +242,42 @@ mod tests {
         assert!(p.iter().any(|s| s.contains("`mailcraft-geom` (L0) depends on `mailcraft-model` (L1)")));
         assert!(p.iter().any(|s| s.contains("`mailcraft-model` (L1) depends on `mailcraft-fonts`")));
         assert!(p.iter().any(|s| s.contains("`mailcraft-new` has no layer")));
+    }
+
+    #[test]
+    fn test_support_only_as_dev_dependency_or_from_apps() {
+        let m = meta(
+            vec![
+                pkg("mailcraft-testmail", &["mailcraft-model"]),
+                pkg("mailcraft-model", &[]),
+                pkg("mailcraft-testmail-app", &["mailcraft-testmail"]),
+                pkg("mailcraft-net", &["mailcraft-testmail"]),
+                pkg("mailcraft-engine", &[]),
+            ],
+            &[
+                "mailcraft-testmail",
+                "mailcraft-model",
+                "mailcraft-testmail-app",
+                "mailcraft-net",
+                "mailcraft-engine",
+            ],
+            &[],
+        );
+        let p = check(&m);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("`mailcraft-net` (L3) depends on the test-support crate"), "{p:?}");
+
+        let mut dev = pkg("mailcraft-net", &[]);
+        dev.dependencies = vec![("mailcraft-testmail".to_owned(), Some("dev".to_owned()))];
+        let upward = pkg("mailcraft-testmail", &["mailcraft-engine", "mailcraft-cli"]);
+        let m = meta(
+            vec![dev, upward, pkg("mailcraft-engine", &[]), pkg("mailcraft-cli", &[])],
+            &["mailcraft-net", "mailcraft-testmail", "mailcraft-engine", "mailcraft-cli"],
+            &[],
+        );
+        let p = check(&m);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("`mailcraft-testmail` (test) depends on `mailcraft-cli` (apps)"), "{p:?}");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::cmd::mail::{FlagKind, flag_dates};
 use crate::cmd::util::{dialog, opt_bool, opt_str, opt_u64, req_str};
 use crate::compose::{
-    Bookmark, ComposeAttachment, ComposeKind, ComposeState, DocPos, SaveSentTo, SignatureBlock,
+    Bookmark, ComposeAttachment, ComposeKind, ComposeState, DocPos, EditRun, SaveSentTo, SignatureBlock,
 };
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Session};
 use mailcraft_mime::{Address, AttachmentSpec, MessageBuilder, parse_address_list};
@@ -318,47 +318,9 @@ pub(crate) fn parse_recipients(field: &str) -> Result<Vec<Address>, Vec<String>>
     if bad.is_empty() { Ok(out) } else { Err(bad) }
 }
 
-/// MIME type guessed from a file name's extension.
+/// MIME type guessed from a file name's extension (table in [`crate::compose::mime_for_name`]).
 pub(crate) fn mime_for(name: &str) -> &'static str {
-    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-    match ext.as_str() {
-        "txt" | "log" | "md" => "text/plain",
-        "htm" | "html" => "text/html",
-        "csv" => "text/csv",
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "bmp" => "image/bmp",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "tif" | "tiff" => "image/tiff",
-        "zip" => "application/zip",
-        "gz" => "application/gzip",
-        "7z" => "application/x-7z-compressed",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "eml" => "message/rfc822",
-        "ics" => "text/calendar",
-        "vcf" => "text/vcard",
-        "doc" => "application/msword",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xls" => "application/vnd.ms-excel",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "ppt" => "application/vnd.ms-powerpoint",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "odt" => "application/vnd.oasis.opendocument.text",
-        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "mp4" => "video/mp4",
-        "obj" => "model/obj",
-        "stl" => "model/stl",
-        "glb" => "model/gltf-binary",
-        "gltf" => "model/gltf+json",
-        _ => "application/octet-stream",
-    }
+    crate::compose::mime_for_name(name)
 }
 
 /// Reads a local file for attaching / inserting (size-capped). Returns (file name, bytes).
@@ -807,6 +769,8 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     item.sensitivity = c.sensitivity;
     item.flag = c.flag.clone();
     let id = s.mailbox.add_mail(item);
+    // Auto-Complete list (most recently used first).
+    s.mailbox.record_recipients(&c.recipients(), now);
     if let Some(d) = c.draft {
         s.mailbox.mail.remove(&d);
     }
@@ -997,36 +961,69 @@ fn check_names(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"resolved": resolved, "unresolved": unresolved}))
 }
 
-/// "Name <email>" lines of contacts whose name, file-as or email matches `query` (case-insensitive).
+/// Check Names candidates ("Name <address>") for a typed recipient: contacts whose name, file-as, company or
+/// any address matches (case-insensitive; exact matches win over partial ones; a contact with several
+/// addresses gives one candidate per address, so it stays ambiguous), then Auto-Complete entries.
 fn lookup_contacts(s: &Session, query: &str) -> Vec<String> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return Vec::new();
     }
-    let mut exact = Vec::new();
-    let mut partial = Vec::new();
+    let mut exact: Vec<(String, String)> = Vec::new();
+    let mut partial: Vec<(String, String)> = Vec::new();
+    let push = |v: &mut Vec<(String, String)>, name: &str, addr: &str| {
+        if !v.iter().any(|(_, a)| a.eq_ignore_ascii_case(addr)) {
+            let line = field_mailbox(&mailcraft_mime::Mailbox::new((!name.is_empty()).then_some(name), addr));
+            v.push((line, addr.to_owned()));
+        }
+    };
     for c in s.mailbox.contacts.values() {
-        let Some(email) = c.emails.iter().find(|e| !e.trim().is_empty()) else {
+        let emails: Vec<&str> = c.emails.iter().map(|e| e.trim()).filter(|e| !e.is_empty()).collect();
+        if emails.is_empty() {
             continue;
-        };
+        }
         let full = c.full_name();
+        let shown = if full.is_empty() { c.file_as.trim().to_owned() } else { full.clone() };
+        if let Some(e) = emails.iter().find(|e| e.to_lowercase() == q) {
+            push(&mut exact, &shown, e);
+            continue;
+        }
         let names = [
             full.to_lowercase(),
-            c.file_as.to_lowercase(),
-            c.first_name.to_lowercase(),
-            c.last_name.to_lowercase(),
+            c.file_as.trim().to_lowercase(),
+            c.first_name.trim().to_lowercase(),
+            c.last_name.trim().to_lowercase(),
+            c.company.trim().to_lowercase(),
         ];
-        let line = field_mailbox(&mailcraft_mime::Mailbox::new(
-            Some(if full.is_empty() { &c.file_as } else { &full }),
-            email.trim(),
-        ));
-        if names.contains(&q) || email.to_lowercase() == q {
-            exact.push(line);
-        } else if names.iter().any(|n| !n.is_empty() && n.contains(&q)) {
-            partial.push(line);
+        let target = if names.iter().any(|n| !n.is_empty() && *n == q) {
+            Some(&mut exact)
+        } else if names.iter().any(|n| !n.is_empty() && n.contains(&q))
+            || emails.iter().any(|e| e.to_lowercase().starts_with(&q))
+        {
+            Some(&mut partial)
+        } else {
+            None
+        };
+        if let Some(v) = target {
+            for e in &emails {
+                push(v, &shown, e);
+            }
         }
     }
-    if exact.is_empty() { partial } else { exact }
+    for r in &s.mailbox.recent_recipients {
+        let name = r.name.trim().to_lowercase();
+        let addr = r.address.trim().to_lowercase();
+        if addr.is_empty() {
+            continue;
+        }
+        if name == q || addr == q {
+            push(&mut exact, r.name.trim(), r.address.trim());
+        } else if (!name.is_empty() && name.contains(&q)) || addr.starts_with(&q) {
+            push(&mut partial, r.name.trim(), r.address.trim());
+        }
+    }
+    let pick = if exact.is_empty() { partial } else { exact };
+    pick.into_iter().map(|(line, _)| line).collect()
 }
 
 // =======================================================================================================
@@ -1037,15 +1034,16 @@ fn attach_file(s: &mut Session, p: &Value) -> CmdResult {
     let Some((name, data)) = file_param(p, MAX_ATTACHMENT_BYTES)? else {
         return dialog(s, "attachFile", json!({"compose": compose_id(s, p)?}));
     };
+    let mime = opt_str(p, "mime_type").map(str::to_owned);
     let c = compose_mut(s, p)?;
     if c.attachments.len() >= MAX_ATTACHMENTS {
         return Err(CmdError::Failed("too many attachments".into()));
     }
     let size = data.len();
-    let mime = opt_str(p, "mime_type").map(str::to_owned).unwrap_or_else(|| mime_for(&name).to_owned());
-    c.attachments.push(ComposeAttachment { filename: name.clone(), mime_type: mime, data });
-    c.dirty = true;
-    Ok(json!({"attached": name, "size": size, "count": c.attachments.len()}))
+    let i = c.attach_bytes(&name, mime.as_deref(), data).map_err(CmdError::Failed)?;
+    let (name, mime) =
+        c.attachments.get(i).map(|a| (a.filename.clone(), a.mime_type.clone())).unwrap_or_default();
+    Ok(json!({"attached": name, "mimeType": mime, "index": i, "size": size, "count": c.attachments.len()}))
 }
 
 /// Parses `itemId` (number or numeric string).
@@ -1104,39 +1102,73 @@ fn attach_item(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"attached": name, "count": c.attachments.len()}))
 }
 
-fn remove_attachment(s: &mut Session, p: &Value) -> CmdResult {
-    let c = compose_mut(s, p)?;
+/// The attachment a command names: `{"index": n}` or `{"name": "file.txt"}`.
+fn attachment_index(c: &ComposeState, p: &Value) -> Result<usize, CmdError> {
     let idx = match (opt_u64(p, "index"), opt_str(p, "name")) {
         (Some(i), _) => usize::try_from(i).ok().filter(|i| *i < c.attachments.len()),
         (None, Some(n)) => c.attachments.iter().position(|a| a.filename == n),
         (None, None) => return Err(CmdError::Params("`index` (number) or `name` (string) required".into())),
     };
-    let Some(i) = idx else {
-        return Err(CmdError::Params("no such attachment".into()));
-    };
-    let removed = c.attachments.remove(i);
-    c.dirty = true;
+    idx.ok_or_else(|| CmdError::Params("no such attachment".into()))
+}
+
+fn remove_attachment(s: &mut Session, p: &Value) -> CmdResult {
+    let c = compose_mut(s, p)?;
+    let i = attachment_index(c, p)?;
+    let removed = c.remove_attachment(i).ok_or_else(|| CmdError::Params("no such attachment".into()))?;
     Ok(json!({"removed": removed.filename, "count": c.attachments.len()}))
+}
+
+fn rename_attachment(s: &mut Session, p: &Value) -> CmdResult {
+    let new_name = req_str(p, "newName")?.to_owned();
+    let c = compose_mut(s, p)?;
+    let i = attachment_index(c, p)?;
+    let name = c.rename_attachment(i, &new_name).map_err(CmdError::Params)?;
+    let mime = c.attachments.get(i).map(|a| a.mime_type.clone()).unwrap_or_default();
+    Ok(json!({"index": i, "name": name, "mimeType": mime}))
 }
 
 fn signature(s: &mut Session, p: &Value) -> CmdResult {
     let name = req_str(p, "name")?.trim().to_owned();
     let html = opt_str(p, "html");
     let text = opt_str(p, "text");
+    let format = {
+        let cid = compose_id(s, p)?;
+        s.composes.get(&cid).map(|c| c.format).unwrap_or_default()
+    };
+    // A saved signature (File › Options › Mail › Signatures) by name.
+    let saved = s.mailbox.signature(&name).map(|sig| crate::compose::signature_blocks(&sig.body, format));
+    let name = s.mailbox.signature(&name).map_or(name, |sig| sig.name.clone());
     let c = compose_mut(s, p)?;
     c.checkpoint();
     let new_blocks: Option<Vec<Block>> = match (html, text) {
         (Some(h), _) => Some(mailcraft_html::html_to_doc(h).blocks),
         (None, Some(t)) => Some(Doc::from_plain_text(t).blocks),
-        (None, None) if name.is_empty() || name.eq_ignore_ascii_case("none") => None,
-        (None, None) => return Err(CmdError::Params("`text` or `html` of the signature is required".into())),
+        (None, None) if name.is_empty() || name.eq_ignore_ascii_case("none") || name == "(none)" => None,
+        (None, None) => match saved {
+            Some(blocks) => Some(blocks),
+            None => return Err(CmdError::Params(format!("no signature named \"{name}\""))),
+        },
     };
-    // Find the current signature block (a container holding exactly the blocks inserted last time).
+    // Find the current signature block: a container holding exactly the blocks inserted last time, else (the
+    // user edited the signature in the message) the first container still holding one of its non-empty
+    // paragraphs.
     let existing = c.signature.as_ref().and_then(|sig| {
-        c.body
+        let exact = c
+            .body
             .blocks
             .iter()
-            .position(|b| matches!(b, Block::Container { blocks, .. } if *blocks == sig.blocks))
+            .position(|b| matches!(b, Block::Container { blocks, .. } if *blocks == sig.blocks));
+        exact.or_else(|| {
+            let kept = |b: &Block| {
+                !Doc { blocks: vec![b.clone()], ..Default::default() }.to_plain_text().trim().is_empty()
+                    && sig.blocks.contains(b)
+            };
+            c.body
+                .blocks
+                .iter()
+                .position(|b| matches!(b, Block::Container { blocks, .. } if blocks.iter().any(kept)))
+        })
     });
     match (existing, new_blocks) {
         (Some(i), Some(blocks)) => {
@@ -1534,21 +1566,21 @@ fn select(s: &mut Session, p: &Value) -> CmdResult {
 fn insert_text(s: &mut Session, p: &Value) -> CmdResult {
     let text = req_str(p, "text")?.to_owned();
     let c = compose_mut(s, p)?;
-    c.checkpoint();
-    c.insert_text(&text);
+    // Typing is one undo step until the caret moves or another edit runs; Enter starts a new one.
+    let run = (!text.contains(['\n', '\r'])).then_some(EditRun::Typing);
+    c.run_edit(run, |c| c.insert_text(&text));
     Ok(json!({"caret": pos_json(&c.selection.focus)}))
 }
 
 fn delete_text(s: &mut Session, p: &Value) -> CmdResult {
     let dir = opt_str(p, "direction").unwrap_or("backward");
     let c = compose_mut(s, p)?;
-    c.checkpoint();
     match dir {
-        "backward" => c.delete_backward(),
-        "forward" => c.delete_forward(),
-        "selection" => {
+        "backward" => c.run_edit(Some(EditRun::DeleteBackward), ComposeState::delete_backward),
+        "forward" => c.run_edit(Some(EditRun::DeleteForward), ComposeState::delete_forward),
+        "selection" => c.run_edit(None, |c| {
             c.delete_selection();
-        }
+        }),
         other => return Err(CmdError::Params(format!("unknown direction `{other}`"))),
     }
     Ok(json!({"caret": pos_json(&c.selection.focus)}))
@@ -1569,6 +1601,208 @@ pub(crate) fn add_bookmark(c: &mut ComposeState, name: &str) {
     let pos = c.selection.focus.clone();
     c.bookmarks.retain(|b| b.name != name);
     c.bookmarks.push(Bookmark { name: name.to_owned(), pos });
+}
+
+// =======================================================================================================
+// Signatures (File › Options › Mail › Signatures), Auto-Complete list, tables
+// =======================================================================================================
+
+/// Largest signature body accepted (bytes of HTML or text).
+const MAX_SIGNATURE_SOURCE: usize = 1024 * 1024;
+
+/// Records mailbox changes the session's store diff does not cover (signatures, Auto-Complete list,
+/// dictionary) as one undo step plus a journal write; does nothing when the diff already sees them.
+pub(crate) fn commit_extras(s: &mut Session, before: mailcraft_model::Mailbox, label: &str) {
+    if before == s.mailbox || !crate::session::diff_ops(&before, &s.mailbox).is_empty() {
+        return;
+    }
+    s.undo.push(crate::undo::UndoEntry { label: label.to_owned(), before: Box::new(before) });
+    s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
+}
+
+/// A rich body from `{"html"}` or `{"text"}`.
+fn doc_param(p: &Value) -> Result<Option<Doc>, CmdError> {
+    let (src, html) = match (opt_str(p, "html"), opt_str(p, "text")) {
+        (Some(h), _) => (h, true),
+        (None, Some(t)) => (t, false),
+        (None, None) => return Ok(None),
+    };
+    if src.len() > MAX_SIGNATURE_SOURCE {
+        return Err(CmdError::Params("the signature is too large".into()));
+    }
+    Ok(Some(if html { mailcraft_html::html_to_doc(src) } else { Doc::from_plain_text(src) }))
+}
+
+/// `{"key": "name"}` → Some(Some(name)), `{"key": null}` → Some(None), absent → None.
+fn choice_param<'a>(p: &'a Value, key: &str) -> Result<Option<Option<&'a str>>, CmdError> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(t)) => Ok(Some(Some(t.as_str()))),
+        Some(_) => Err(CmdError::Params(format!("`{key}` must be a signature name or null"))),
+    }
+}
+
+fn signature_json(s: &Session) -> Value {
+    let sigs: Vec<Value> = s
+        .mailbox
+        .signatures
+        .iter()
+        .map(|g| {
+            json!({
+                "name": g.name,
+                "defaultNew": g.default_new,
+                "defaultReply": g.default_reply,
+                "text": g.body.to_plain_text(),
+                "html": mailcraft_html::doc_to_html(&g.body),
+            })
+        })
+        .collect();
+    let accounts: Vec<Value> = s
+        .mailbox
+        .accounts
+        .iter()
+        .map(|a| {
+            json!({
+                "account": a.id.0,
+                "address": a.address,
+                "newMessages": s.mailbox.default_signature(Some(a.id), false).map(|g| g.name.clone()),
+                "replies": s.mailbox.default_signature(Some(a.id), true).map(|g| g.name.clone()),
+            })
+        })
+        .collect();
+    json!({"signatures": sigs, "accounts": accounts})
+}
+
+fn signature_list(s: &mut Session, _p: &Value) -> CmdResult {
+    Ok(signature_json(s))
+}
+
+fn signature_create(s: &mut Session, p: &Value) -> CmdResult {
+    let name = req_str(p, "name")?.to_owned();
+    let body = doc_param(p)?.unwrap_or_default();
+    let before = s.mailbox.clone();
+    let name = s.mailbox.add_signature(&name, body)?;
+    let new_default = opt_bool(p, "defaultNew") == Some(true);
+    let reply_default = opt_bool(p, "defaultReply") == Some(true);
+    if new_default || reply_default {
+        s.mailbox.set_signature_defaults(
+            None,
+            new_default.then_some(Some(name.as_str())),
+            reply_default.then_some(Some(name.as_str())),
+        )?;
+    }
+    commit_extras(s, before, "New Signature");
+    Ok(json!({"created": name, "count": s.mailbox.signatures.len()}))
+}
+
+fn signature_edit(s: &mut Session, p: &Value) -> CmdResult {
+    let name = req_str(p, "name")?.to_owned();
+    let new_name = opt_str(p, "newName").map(str::to_owned);
+    let body = doc_param(p)?;
+    let before = s.mailbox.clone();
+    let final_name = s.mailbox.edit_signature(&name, new_name.as_deref(), body)?;
+    commit_extras(s, before, "Edit Signature");
+    Ok(json!({"name": final_name}))
+}
+
+fn signature_delete(s: &mut Session, p: &Value) -> CmdResult {
+    let name = req_str(p, "name")?.to_owned();
+    let before = s.mailbox.clone();
+    let removed = s.mailbox.delete_signature(&name)?;
+    commit_extras(s, before, "Delete Signature");
+    Ok(json!({"deleted": removed.name, "count": s.mailbox.signatures.len()}))
+}
+
+fn signature_defaults(s: &mut Session, p: &Value) -> CmdResult {
+    let account = match p.get("account") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .or_else(|| v.as_str().and_then(|t| t.trim().parse().ok()))
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| CmdError::Params("`account` must be an account id".into()))?;
+            Some(mailcraft_model::AccountId(n))
+        }
+    };
+    let new_messages = choice_param(p, "newMessages")?;
+    let replies = choice_param(p, "replies")?;
+    if new_messages.is_none() && replies.is_none() {
+        return Err(CmdError::Params("`newMessages` and/or `replies` (name or null) required".into()));
+    }
+    let before = s.mailbox.clone();
+    s.mailbox.set_signature_defaults(account, new_messages, replies)?;
+    commit_extras(s, before, "Default Signature");
+    Ok(json!({
+        "account": account.map(|a| a.0),
+        "newMessages": s.mailbox.default_signature(account, false).map(|g| g.name.clone()),
+        "replies": s.mailbox.default_signature(account, true).map(|g| g.name.clone()),
+    }))
+}
+
+fn suggest_recipients(s: &mut Session, p: &Value) -> CmdResult {
+    let prefix = opt_str(p, "prefix").or_else(|| opt_str(p, "text")).unwrap_or("");
+    let limit = opt_u64(p, "limit").and_then(|n| usize::try_from(n).ok()).unwrap_or(10).min(100);
+    let list = crate::queries::address_suggestions(s, prefix, limit);
+    let rows: Vec<Value> = list
+        .iter()
+        .map(|g| json!({"display": g.display, "address": g.address, "source": g.source.label(), "entry": g.entry()}))
+        .collect();
+    Ok(json!({"suggestions": rows}))
+}
+
+fn forget_recipient(s: &mut Session, p: &Value) -> CmdResult {
+    let addr = req_str(p, "address")?.to_owned();
+    let before = s.mailbox.clone();
+    let removed = s.mailbox.forget_recipient(&addr);
+    commit_extras(s, before, "Remove From Auto-Complete List");
+    Ok(json!({"removed": removed}))
+}
+
+fn empty_auto_complete(s: &mut Session, _p: &Value) -> CmdResult {
+    let before = s.mailbox.clone();
+    let n = s.mailbox.recent_recipients.len();
+    s.mailbox.recent_recipients.clear();
+    commit_extras(s, before, "Empty Auto-Complete List");
+    Ok(json!({"removed": n}))
+}
+
+fn table_cell(s: &mut Session, p: &Value) -> CmdResult {
+    let dir = match opt_str(p, "direction").unwrap_or("next") {
+        "next" => crate::compose::CellMove::Next,
+        "previous" | "prev" => crate::compose::CellMove::Previous,
+        "up" => crate::compose::CellMove::Up,
+        "down" => crate::compose::CellMove::Down,
+        other => return Err(CmdError::Params(format!("unknown direction `{other}`"))),
+    };
+    let c = compose_mut(s, p)?;
+    let moved = c.move_to_cell(dir);
+    let cell = c.cell_at_caret().map(|(t, r, col)| json!({"table": t, "row": r, "col": col}));
+    Ok(
+        json!({"moved": moved, "cell": cell, "anchor": pos_json(&c.selection.anchor), "focus": pos_json(&c.selection.focus)}),
+    )
+}
+
+fn table_edit(s: &mut Session, p: &Value) -> CmdResult {
+    use crate::compose::TableEdit;
+    let action = req_str(p, "action")?;
+    let op = match action {
+        "insertRowAbove" => TableEdit::InsertRowAbove,
+        "insertRowBelow" => TableEdit::InsertRowBelow,
+        "insertColumnLeft" => TableEdit::InsertColumnLeft,
+        "insertColumnRight" => TableEdit::InsertColumnRight,
+        "deleteRow" => TableEdit::DeleteRow,
+        "deleteColumn" => TableEdit::DeleteColumn,
+        "deleteTable" => TableEdit::DeleteTable,
+        other => return Err(CmdError::Params(format!("unknown table action `{other}`"))),
+    };
+    let c = compose_mut(s, p)?;
+    if c.cell_at_caret().is_none() {
+        return Err(CmdError::Failed("put the cursor in a table first".into()));
+    }
+    let changed = c.table_edit(op);
+    Ok(json!({"changed": changed, "caret": pos_json(&c.selection.focus)}))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -1900,6 +2134,116 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec("compose.editUndo", "Undo Typing", "Compose › Body", "", "", false, has_compose, edit_undo),
         spec("compose.editRedo", "Redo Typing", "Compose › Body", "", "", false, has_compose, edit_redo),
+        spec(
+            "compose.renameAttachment",
+            "Rename Attachment",
+            "Compose › Attachments",
+            "",
+            r#"{"index"?:number,"name"?:string,"newName":string}"#,
+            false,
+            has_compose,
+            rename_attachment,
+        ),
+        spec(
+            "compose.signatureList",
+            "Signatures",
+            "File › Options › Mail › Signatures",
+            "",
+            "",
+            false,
+            crate::always,
+            signature_list,
+        ),
+        spec(
+            "compose.signatureCreate",
+            "New Signature",
+            "File › Options › Mail › Signatures",
+            "",
+            r#"{"name":string,"html"?:string,"text"?:string,"defaultNew"?:bool,"defaultReply"?:bool}"#,
+            true,
+            crate::always,
+            signature_create,
+        ),
+        spec(
+            "compose.signatureEdit",
+            "Edit Signature",
+            "File › Options › Mail › Signatures",
+            "",
+            r#"{"name":string,"newName"?:string,"html"?:string,"text"?:string}"#,
+            true,
+            crate::always,
+            signature_edit,
+        ),
+        spec(
+            "compose.signatureDelete",
+            "Delete Signature",
+            "File › Options › Mail › Signatures",
+            "",
+            r#"{"name":string}"#,
+            true,
+            crate::always,
+            signature_delete,
+        ),
+        spec(
+            "compose.signatureDefaults",
+            "Choose Default Signature",
+            "File › Options › Mail › Signatures",
+            "",
+            r#"{"account"?:number,"newMessages"?:string|null,"replies"?:string|null}"#,
+            true,
+            crate::always,
+            signature_defaults,
+        ),
+        spec(
+            "compose.suggestRecipients",
+            "Auto-Complete",
+            "Compose › Header",
+            "",
+            r#"{"prefix":string,"limit"?:number}"#,
+            false,
+            crate::always,
+            suggest_recipients,
+        ),
+        spec(
+            "compose.forgetRecipient",
+            "Remove From Auto-Complete List",
+            "Compose › Header",
+            "",
+            r#"{"address":string}"#,
+            true,
+            crate::always,
+            forget_recipient,
+        ),
+        spec(
+            "compose.emptyAutoComplete",
+            "Empty Auto-Complete List",
+            "File › Options › Mail › Send messages",
+            "",
+            "",
+            true,
+            crate::always,
+            empty_auto_complete,
+        ),
+        spec(
+            "compose.tableCell",
+            "Move Between Cells",
+            "Compose › Body › Table",
+            "",
+            r#"{"direction"?:"next"|"previous"|"up"|"down"}"#,
+            false,
+            has_compose,
+            table_cell,
+        ),
+        spec(
+            "compose.tableEdit",
+            "Rows & Columns",
+            "Table Layout › Rows & Columns; Table Layout › Delete",
+            "",
+            r#"{"action":"insertRowAbove"|"insertRowBelow"|"insertColumnLeft"|"insertColumnRight"|"deleteRow"|"deleteColumn"|"deleteTable"}"#,
+            false,
+            has_compose,
+            table_edit,
+        ),
     ]
 }
 
@@ -2266,5 +2610,319 @@ pub(crate) mod tests {
         assert_eq!(s.composes[&id].body.to_plain_text(), "ac");
         assert!(s.run("compose.select", &json!({"anchor": {"path": "x"}})).is_err());
         assert!(s.run("compose.select", &json!({"compose": 999, "all": true})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::tests::{open, session};
+    use super::*;
+    use mailcraft_model::{Contact, MailItem};
+
+    fn add_contact(s: &mut Session, first: &str, last: &str, emails: &[&str]) {
+        let id = s.mailbox.alloc_id();
+        s.mailbox.contacts.insert(
+            ItemId(id),
+            Contact {
+                id: ItemId(id),
+                first_name: first.into(),
+                last_name: last.into(),
+                emails: emails.iter().map(|e| (*e).to_owned()).collect(),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn signature_commands_persist_and_undo() {
+        let mut s = session();
+        let r = s
+            .run(
+                "compose.signatureCreate",
+                &json!({"name": "Work", "html": "<p><b>Me</b></p>", "defaultNew": true}),
+            )
+            .unwrap();
+        assert_eq!(r["created"], "Work");
+        assert!(s.run("compose.signatureCreate", &json!({"name": "work"})).is_err(), "duplicate name");
+        assert!(s.run("compose.signatureCreate", &json!({"name": ""})).is_err());
+        s.run("compose.signatureCreate", &json!({"name": "Reply", "text": "-- me"})).unwrap();
+        assert_eq!(s.mailbox.signatures.len(), 2);
+        assert!(s.mailbox.signatures[0].default_new);
+        // Journaled (the store diff does not cover signatures) and undoable.
+        assert!(s.pending_ops.iter().any(|o| matches!(o, mailcraft_store::Op::Replace(_))));
+        assert_eq!(s.undo.undo.last().map(|e| e.label.as_str()), Some("New Signature"));
+        let acc = s.mailbox.default_account().map(|a| a.id.0).unwrap();
+        let r = s.run("compose.signatureDefaults", &json!({"account": acc, "replies": "Reply"})).unwrap();
+        assert_eq!(r["newMessages"], "Work");
+        assert_eq!(r["replies"], "Reply");
+        assert!(s.run("compose.signatureDefaults", &json!({"replies": "nope"})).is_err());
+        assert!(s.run("compose.signatureDefaults", &json!({})).is_err());
+        s.run(
+            "compose.signatureEdit",
+            &json!({"name": "reply", "newName": "Replies", "text": "-- me again"}),
+        )
+        .unwrap();
+        let list = s.run("compose.signatureList", &json!({})).unwrap();
+        assert_eq!(list["signatures"][1]["name"], "Replies");
+        assert_eq!(list["signatures"][1]["text"], "-- me again");
+        let me = list["accounts"].as_array().unwrap().iter().find(|a| a["account"] == acc).unwrap().clone();
+        assert_eq!(me["replies"], "Replies");
+        s.run("compose.signatureDelete", &json!({"name": "Replies"})).unwrap();
+        assert_eq!(s.mailbox.signatures.len(), 1);
+        s.run("app.undo", &json!({})).unwrap();
+        assert_eq!(s.mailbox.signatures.len(), 2);
+        assert!(s.run("compose.signatureDelete", &json!({"name": "ghost"})).is_err());
+        // Insert a saved signature by name into a compose.
+        let id = open(&mut s);
+        s.run("compose.signature", &json!({"name": "work"})).unwrap();
+        assert_eq!(s.composes[&id].signature.as_ref().map(|g| g.name.as_str()), Some("Work"));
+        assert!(s.composes[&id].body.to_plain_text().contains("Me"));
+        assert!(s.run("compose.signature", &json!({"name": "ghost"})).is_err());
+    }
+
+    #[test]
+    fn reply_gets_the_reply_signature() {
+        let mut s = session();
+        let acc = s.mailbox.default_account().map(|a| a.id).unwrap();
+        let inbox = s.mailbox.role_folder(acc, FolderRole::Inbox).unwrap();
+        let mid = s.mailbox.add_mail(MailItem {
+            folder: inbox,
+            subject: "Hello".into(),
+            from: Some(mailcraft_mime::Mailbox::new(Some("Ann"), "ann@example.org")),
+            received: s.now(),
+            ..Default::default()
+        });
+        s.run("compose.signatureCreate", &json!({"name": "R", "text": "-- R sig", "defaultReply": true}))
+            .unwrap();
+        s.selection.items = vec![mid];
+        s.selection.focus = Some(mid);
+        let r = s.run("mail.reply", &json!({})).unwrap();
+        let cid = r["compose"].as_u64().unwrap();
+        let c = &s.composes[&cid];
+        assert!(matches!(c.body.blocks[1], Block::Container { .. }), "{:?}", c.body.blocks);
+        let text = c.body.to_plain_text();
+        let sig_at = text.find("-- R sig").unwrap();
+        let header_at = text.find("From:").unwrap();
+        assert!(sig_at < header_at, "{text}");
+    }
+
+    #[test]
+    fn send_feeds_auto_complete() {
+        let mut s = session();
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "Ann Lee <ann@example.org>; bo@example.net"})).unwrap();
+        s.run("compose.setCc", &json!({"value": "Cy <cy@example.com>"})).unwrap();
+        assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
+        let addrs: Vec<&str> = s.mailbox.recent_recipients.iter().map(|r| r.address.as_str()).collect();
+        assert_eq!(addrs, ["ann@example.org", "bo@example.net", "cy@example.com"]);
+        let r = s.run("compose.suggestRecipients", &json!({"prefix": "an"})).unwrap();
+        assert_eq!(r["suggestions"][0]["entry"], "Ann Lee <ann@example.org>");
+        assert_eq!(r["suggestions"][0]["source"], "recent");
+        add_contact(&mut s, "Andrea", "Ng", &["andrea@example.com"]);
+        let r = s.run("compose.suggestRecipients", &json!({"prefix": "x@y.z; AN", "limit": 5})).unwrap();
+        let got: Vec<&str> =
+            r["suggestions"].as_array().unwrap().iter().map(|v| v["address"].as_str().unwrap()).collect();
+        assert_eq!(got, ["ann@example.org", "andrea@example.com"]);
+        assert_eq!(
+            s.run("compose.forgetRecipient", &json!({"address": "ANN@example.org"})).unwrap()["removed"],
+            true
+        );
+        assert_eq!(s.mailbox.recent_recipients.len(), 2);
+        assert_eq!(s.run("compose.emptyAutoComplete", &json!({})).unwrap()["removed"], 2);
+        assert!(s.mailbox.recent_recipients.is_empty());
+        s.run("app.undo", &json!({})).unwrap();
+        assert_eq!(s.mailbox.recent_recipients.len(), 2);
+    }
+
+    #[test]
+    fn check_names_ambiguity_and_auto_complete() {
+        let mut s = session();
+        let id = open(&mut s);
+        add_contact(&mut s, "Ann", "Lee", &["ann@example.org", "ann.lee@example.com"]);
+        add_contact(&mut s, "Bob", "Chen", &["bob@example.org"]);
+        s.mailbox.record_recipients(&[("Zed Zulu".into(), "zed@example.net".into())], s.now());
+        s.run("compose.setTo", &json!({"value": "Ann Lee; bob; Zed Zulu; nobody"})).unwrap();
+        let r = s.run("compose.checkNames", &json!({})).unwrap();
+        assert_eq!(r["resolved"], 2, "{r}");
+        let unresolved = r["unresolved"].as_array().unwrap();
+        assert_eq!(unresolved.len(), 2);
+        assert_eq!(unresolved[0]["name"], "Ann Lee");
+        assert_eq!(unresolved[0]["candidates"].as_array().unwrap().len(), 2, "two addresses = ambiguous");
+        assert_eq!(unresolved[1]["candidates"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            s.composes[&id].to,
+            "Ann Lee; Bob Chen <bob@example.org>; Zed Zulu <zed@example.net>; nobody"
+        );
+        // An exact address picks that address of the contact.
+        s.run("compose.setTo", &json!({"value": "ANN.LEE@example.com"})).unwrap();
+        assert_eq!(s.run("compose.checkNames", &json!({})).unwrap()["resolved"], 1);
+    }
+
+    #[test]
+    fn attachment_rename_types_and_forward_as_item() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.attachFile", &json!({"name": "photo.JPEG", "data_base64": "/9j/"})).unwrap();
+        assert_eq!(s.composes[&id].attachments[0].mime_type, "image/jpeg");
+        let r = s.run("compose.renameAttachment", &json!({"index": 0, "newName": "scan.pdf"})).unwrap();
+        assert_eq!(r["mimeType"], "application/pdf");
+        assert!(s.run("compose.renameAttachment", &json!({"index": 5, "newName": "x"})).is_err());
+        assert!(s.run("compose.renameAttachment", &json!({"name": "scan.pdf"})).is_err(), "newName required");
+        let acc = s.mailbox.default_account().map(|a| a.id).unwrap();
+        let inbox = s.mailbox.role_folder(acc, FolderRole::Inbox).unwrap();
+        let mid = s.mailbox.add_mail(MailItem {
+            folder: inbox,
+            subject: "Report".into(),
+            from: Some(mailcraft_mime::Mailbox::new(Some("Ann"), "ann@example.org")),
+            body: mailcraft_model::Body { text: Some("Numbers inside.".into()), ..Default::default() },
+            received: s.now(),
+            ..Default::default()
+        });
+        s.run("compose.attachItem", &json!({"itemId": mid.0})).unwrap();
+        let c = s.composes[&id].clone();
+        assert_eq!(c.attachments[1].mime_type, "message/rfc822");
+        assert_eq!(c.attachments[1].filename, "Report.eml");
+        // The item travels as message/rfc822, not base64 (RFC 2046 §5.2.1).
+        let raw = String::from_utf8_lossy(&build_message(&s, &c, None, false).build()).into_owned();
+        let part = raw.find("Content-Type: message/rfc822").unwrap();
+        assert!(!raw[part..].lines().take(4).any(|l| l.contains("base64")), "{raw}");
+        assert!(raw.contains("Numbers inside."));
+    }
+
+    #[test]
+    fn table_commands() {
+        let mut s = session();
+        let id = open(&mut s);
+        assert!(s.run("compose.tableEdit", &json!({"action": "deleteRow"})).is_err(), "not in a table");
+        s.run("insert.table", &json!({"rows": 1, "cols": 2})).unwrap();
+        s.run("compose.insertText", &json!({"text": "a"})).unwrap();
+        assert_eq!(s.run("compose.tableCell", &json!({})).unwrap()["cell"]["col"], 1);
+        assert_eq!(s.run("compose.tableCell", &json!({"direction": "next"})).unwrap()["cell"]["row"], 1);
+        assert!(s.run("compose.tableCell", &json!({"direction": "sideways"})).is_err());
+        let r = s.run("compose.tableCell", &json!({"direction": "up"})).unwrap();
+        assert_eq!(r["moved"], true);
+        s.run("compose.tableEdit", &json!({"action": "insertColumnLeft"})).unwrap();
+        match s.composes[&id].body.blocks.iter().find(|b| matches!(b, Block::Table { .. })) {
+            Some(Block::Table { rows, .. }) => assert_eq!((rows.len(), rows[0].len()), (2, 3)),
+            other => panic!("{other:?}"),
+        }
+        assert!(s.run("compose.tableEdit", &json!({"action": "explode"})).is_err());
+        s.run("compose.tableEdit", &json!({"action": "deleteTable"})).unwrap();
+        assert!(!s.composes[&id].body.blocks.iter().any(|b| matches!(b, Block::Table { .. })));
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert!(s.composes[&id].body.blocks.iter().any(|b| matches!(b, Block::Table { .. })));
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::tests::{open, session};
+    use super::*;
+
+    fn text(s: &Session, id: u64) -> String {
+        s.composes[&id].body.to_plain_text()
+    }
+
+    #[test]
+    fn new_email_gets_the_default_signature() {
+        let mut s = session();
+        s.run("compose.signatureCreate", &json!({"name": "Work", "text": "Me Example", "defaultNew": true}))
+            .unwrap();
+        let r = s.run("mail.newEmail", &json!({})).unwrap();
+        let id = r["compose"].as_u64().unwrap();
+        let c = &s.composes[&id];
+        assert_eq!(c.signature.as_ref().map(|g| g.name.as_str()), Some("Work"));
+        assert_eq!(text(&s, id), "\nMe Example");
+        assert_eq!(c.selection.focus, DocPos::new(vec![0], 0), "caret on the empty first line");
+        assert!(!c.dirty, "an untouched new message closes without a save prompt");
+    }
+
+    #[test]
+    fn switching_signature_after_editing_it_replaces_it() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "Body"})).unwrap();
+        s.run("compose.signature", &json!({"name": "Work", "text": "Me Example\nSales"})).unwrap();
+        // Fix a word in the signature's second line, then pick another signature.
+        assert!(
+            matches!(&s.composes[&id].body.blocks[1], Block::Container { blocks, .. } if blocks.len() == 2)
+        );
+        s.run("compose.select", &json!({"anchor": {"path": [1, 1], "offset": 5}})).unwrap();
+        s.run("compose.insertText", &json!({"text": " team"})).unwrap();
+        assert!(text(&s, id).contains("Sales team"));
+        s.run("compose.signature", &json!({"name": "Home", "text": "Cheers"})).unwrap();
+        let t = text(&s, id);
+        assert!(t.contains("Cheers") && !t.contains("Me Example") && !t.contains("Sales"), "{t}");
+    }
+
+    #[test]
+    fn undoing_a_signature_switch_then_switching_again_keeps_one_signature() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "Body"})).unwrap();
+        s.run("compose.signature", &json!({"name": "Work", "text": "Me Example"})).unwrap();
+        s.run("compose.signature", &json!({"name": "Home", "text": "Cheers"})).unwrap();
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(text(&s, id).trim_end(), "Body\nMe Example");
+        assert_eq!(s.composes[&id].signature.as_ref().map(|g| g.name.as_str()), Some("Work"));
+        s.run("compose.signature", &json!({"name": "Short", "text": "-- me"})).unwrap();
+        assert_eq!(text(&s, id).trim_end(), "Body\n-- me", "the Work signature is replaced, not kept");
+        // Redo after undo brings the later choice back with its name.
+        s.run("compose.editUndo", &json!({})).unwrap();
+        s.run("compose.editRedo", &json!({})).unwrap();
+        assert_eq!(s.composes[&id].signature.as_ref().map(|g| g.name.as_str()), Some("Short"));
+    }
+
+    #[test]
+    fn typing_is_one_undo_step_until_the_caret_moves() {
+        let mut s = session();
+        let id = open(&mut s);
+        for ch in ["H", "e", "l", "l", "o"] {
+            s.run("compose.insertText", &json!({"text": ch})).unwrap();
+        }
+        s.run("compose.insertText", &json!({"text": "\n"})).unwrap();
+        for ch in ["W", "o"] {
+            s.run("compose.insertText", &json!({"text": ch})).unwrap();
+        }
+        assert_eq!(text(&s, id), "Hello\nWo");
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(text(&s, id), "Hello\n", "Enter starts a new typing step");
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(text(&s, id), "Hello");
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(text(&s, id), "");
+        s.run("compose.editRedo", &json!({})).unwrap();
+        assert_eq!(text(&s, id), "Hello");
+        // Moving the caret ends the step.
+        s.run("compose.select", &json!({"anchor": {"path": [0], "offset": 0}})).unwrap();
+        s.run("compose.insertText", &json!({"text": ">"})).unwrap();
+        s.run("compose.select", &json!({"anchor": {"path": [0], "offset": 6}})).unwrap();
+        s.run("compose.insertText", &json!({"text": "!"})).unwrap();
+        assert_eq!(text(&s, id), ">Hello!");
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(text(&s, id), ">Hello");
+        // Backspaces in a row are one step too.
+        for _ in 0..3 {
+            s.run("compose.deleteText", &json!({"direction": "backward"})).unwrap();
+        }
+        assert_eq!(text(&s, id), ">He");
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(text(&s, id), ">Hello");
+    }
+
+    #[test]
+    fn edits_that_change_nothing_leave_no_undo_step() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "ab"})).unwrap();
+        s.run("compose.select", &json!({"anchor": {"path": [0], "offset": 0}})).unwrap();
+        // Backspace at the start of the body does nothing.
+        s.run("compose.deleteText", &json!({"direction": "backward"})).unwrap();
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(text(&s, id), "");
+        // ...and does not throw away the redo history.
+        s.run("compose.deleteText", &json!({"direction": "backward"})).unwrap();
+        assert_eq!(s.run("compose.editRedo", &json!({})).unwrap()["redone"], true);
+        assert_eq!(text(&s, id), "ab");
     }
 }

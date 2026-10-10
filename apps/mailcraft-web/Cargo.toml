@@ -1,0 +1,29 @@
+[package]
+name = "mailcraft-web"
+description = "MailCraft in the browser (WebAssembly, built with Trunk)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+mailcraft-engine.workspace = true
+mailcraft-ui-egui.workspace = true
+eframe.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Browser glue (all MIT OR Apache-2.0).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["Document", "Element", "HtmlCanvasElement", "Location", "Storage", "Window"] }
+
+[dev-dependencies]
+mailcraft-store.workspace = true
+
+[lints]
+workspace = true

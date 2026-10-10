@@ -26,6 +26,18 @@ pub struct Mailbox {
     /// Per-folder view settings (missing = default).
     pub views: BTreeMap<FolderId, ViewSettings>,
     pub next_id: u64,
+    /// Saved signatures (`signature.rs`).
+    #[serde(default)]
+    pub signatures: Vec<crate::signature::Signature>,
+    /// Per-account default signature choices.
+    #[serde(default)]
+    pub signature_defaults: Vec<crate::signature::AccountSignatures>,
+    /// Auto-Complete list: recently used recipients, most recent first.
+    #[serde(default)]
+    pub recent_recipients: Vec<crate::signature::RecentRecipient>,
+    /// Words added to the spelling dictionary.
+    #[serde(default)]
+    pub custom_dictionary: Vec<String>,
 }
 
 /// Longest folder name accepted.

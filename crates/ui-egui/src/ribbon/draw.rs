@@ -640,7 +640,8 @@ fn combo(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, id: Id, rect: Rect) {
     let border = if resp.hovered() { t.accent } else { t.separator };
     ui.painter().rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, border), StrokeKind::Inside);
     let mut value = state::combo_value(app, cx.surface, c.on.as_deref());
-    if value.is_empty() {
+    // A box that shows a value stays blank when the selection mixes values; others show their label.
+    if value.is_empty() && c.on.as_deref().is_none_or(|on| !on.starts_with("value:")) {
         value.clone_from(&c.label);
     }
     let clip = ui.painter().with_clip_rect(r.shrink2(Vec2::new(4.0, 1.0)));

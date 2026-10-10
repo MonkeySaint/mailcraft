@@ -1,0 +1,18 @@
+[package]
+name = "mailcraft-testmail-app"
+description = "Runs the MailCraft local IMAP/SMTP test servers on 127.0.0.1 for manual end-to-end checks (dev tool, not shipped)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "mailcraft-testmail"
+path = "src/main.rs"
+
+[dependencies]
+mailcraft-testmail.workspace = true
+
+[lints]
+workspace = true

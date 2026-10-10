@@ -1,0 +1,115 @@
+use mailcraft_model::Contact;
+use proptest::prelude::*;
+
+use crate::vcf::{self, Version};
+
+#[test]
+fn reads_vcard_4() {
+    let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Dr. Ann B. Lee Jr.\r\nN:Lee;Ann;B.;Dr.;Jr.\r\n\
+ORG:Example\\, Inc.;Research\r\nTITLE:Director\r\nEMAIL;TYPE=work:ann@example.com\r\nEMAIL;PREF=1:first@example.com\r\n\
+TEL;VALUE=uri;TYPE=\"work,voice\":tel:+1-555-0100\r\nTEL;TYPE=cell:+1 555 0101\r\n\
+ADR;TYPE=home:;;1 Main St;Springfield;ON;K1A 0B1;Canada\r\nURL:https://example.com\r\nBDAY:19800229\r\n\
+NOTE:Line one\\nLine two\\, with comma\r\nCATEGORIES:Clients,VIP\r\nEND:VCARD\r\n";
+    let cs = vcf::read(text.as_bytes()).unwrap();
+    assert_eq!(cs.len(), 1);
+    let c = &cs[0];
+    assert_eq!((c.title.as_str(), c.first_name.as_str(), c.middle_name.as_str()), ("Dr.", "Ann", "B."));
+    assert_eq!((c.last_name.as_str(), c.suffix.as_str()), ("Lee", "Jr."));
+    assert_eq!(c.company, "Example, Inc.");
+    assert_eq!(c.department, "Research");
+    assert_eq!(c.emails, vec!["first@example.com", "ann@example.com"]);
+    assert_eq!(
+        c.phones,
+        vec![("Business".into(), "+1-555-0100".into()), ("Mobile".into(), "+1 555 0101".into())]
+    );
+    assert_eq!(c.addresses[0].kind, "Home");
+    assert_eq!(c.addresses[0].postal_code, "K1A 0B1");
+    assert_eq!(c.birthday.as_deref(), Some("1980-02-29"));
+    assert_eq!(c.notes, "Line one\nLine two, with comma");
+    assert_eq!(c.categories, vec!["Clients", "VIP"]);
+    assert_eq!(c.file_as, "Lee, Ann");
+}
+
+#[test]
+fn reads_vcard_3_and_2_1() {
+    let text = "BEGIN:VCARD\nVERSION:3.0\nN:Stone;Bob;;;\nFN:Bob Stone\nitem1.EMAIL;type=INTERNET;type=pref:bob@example.org\n\
+TEL;TYPE=HOME,FAX:111\nTEL;type=WORK:222\nBDAY:1990-01-31\nEND:VCARD\n\
+BEGIN:VCARD\nVERSION:2.1\nN;CHARSET=ISO-8859-1;ENCODING=QUOTED-PRINTABLE:M=FCller;J=\n=FCrgen\nTEL;WORK;VOICE:333\n\
+NOTE;ENCODING=QUOTED-PRINTABLE;CHARSET=UTF-8:caf=C3=A9\nEND:VCARD\n\
+BEGIN:VCARD\nVERSION:4.0\nFN:Just A Name\nEND:VCARD\n";
+    let cs = vcf::read(text.as_bytes()).unwrap();
+    assert_eq!(cs.len(), 3);
+    assert_eq!(cs[0].emails, vec!["bob@example.org"]);
+    assert_eq!(cs[0].phones, vec![("Home Fax".into(), "111".into()), ("Business".into(), "222".into())]);
+    assert_eq!(cs[0].birthday.as_deref(), Some("1990-01-31"));
+    assert_eq!(cs[1].last_name, "M\u{fc}ller");
+    assert_eq!(cs[1].first_name, "J\u{fc}rgen");
+    assert_eq!(cs[1].phones, vec![("Business".into(), "333".into())]);
+    assert_eq!(cs[1].notes, "caf\u{e9}");
+    assert_eq!(
+        (cs[2].first_name.as_str(), cs[2].middle_name.as_str(), cs[2].last_name.as_str()),
+        ("Just", "A", "Name")
+    );
+}
+
+#[test]
+fn writes_and_reads_back_both_versions() {
+    let mut c = super::csv::sample_contact();
+    c.phones.push(("Assistant".into(), "+1 555 0109".into()));
+    c.addresses.push(mailcraft_model::contact::PostalAddress {
+        kind: "Other".into(),
+        city: "Paris".into(),
+        ..Default::default()
+    });
+    for v in [Version::V3, Version::V4] {
+        let text = vcf::write(std::slice::from_ref(&c), v);
+        for line in text.split("\r\n") {
+            assert!(line.len() <= 75, "unfolded line: {line:?}");
+        }
+        assert!(text.starts_with("BEGIN:VCARD\r\nVERSION:"));
+        let back = vcf::read(text.as_bytes()).unwrap();
+        assert_eq!(back, vec![c.clone()], "version {v:?}:\n{text}");
+    }
+}
+
+#[test]
+fn custom_file_as_survives() {
+    let c = Contact {
+        first_name: "Ann".into(),
+        last_name: "Lee".into(),
+        file_as: "Annie".into(),
+        ..Default::default()
+    };
+    let back = vcf::read(vcf::write(std::slice::from_ref(&c), Version::V4).as_bytes()).unwrap();
+    assert_eq!(back[0].file_as, "Annie");
+}
+
+proptest! {
+    #[test]
+    fn vcf_never_panics(data in proptest::collection::vec(any::<u8>(), 0..1024)) {
+        let _ = vcf::read(&data);
+    }
+
+    #[test]
+    fn vcf_lines_never_panic(lines in proptest::collection::vec("[A-Z;=:,.\"\\\\a-z0-9 -]{0,40}", 0..12)) {
+        let text = format!("BEGIN:VCARD\n{}\nEND:VCARD\n", lines.join("\n"));
+        let _ = vcf::read_str(&text);
+    }
+
+    #[test]
+    fn contact_round_trips(first in "[a-zA-Z\u{e9}\u{4e2d},;\\\\:]{1,12}", last in "[a-zA-Z ]{0,8}x", note in "[ -~\n\u{1F600}]{0,120}", company in "[a-zA-Z,; ]{0,10}") {
+        let mut c = Contact {
+            first_name: first,
+            last_name: last.trim().to_owned(),
+            notes: note,
+            company: company.trim().to_owned(),
+            emails: vec!["x@example.com".into()],
+            ..Default::default()
+        };
+        c.file_as = crate::csv::default_file_as(&c);
+        for v in [Version::V3, Version::V4] {
+            let back = vcf::read_str(&vcf::write(std::slice::from_ref(&c), v));
+            prop_assert_eq!(&back, &vec![c.clone()]);
+        }
+    }
+}

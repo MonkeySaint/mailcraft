@@ -100,6 +100,7 @@ fn respond(s: &mut Session, p: &Value, kind: ComposeKind) -> CmdResult {
     let Some(c) = build_response(s, id, kind, inline) else {
         return Err(CmdError::Failed("message not found".into()));
     };
+    let c = crate::compose::with_default_signature(&s.mailbox, c);
     let compose = s.open_compose(c);
     Ok(json!({"compose": compose, "inline": inline}))
 }
@@ -310,6 +311,8 @@ fn forward_as_attachment(s: &mut Session, p: &Value) -> CmdResult {
         attachments,
         ..Default::default()
     };
+    // Options › Mail › Signatures: the replies/forwards signature, as for a forward with the text included.
+    let c = crate::compose::with_default_signature(&s.mailbox, c);
     let compose = s.open_compose(c);
     Ok(json!({"compose": compose, "attached": ids.len()}))
 }
@@ -592,6 +595,18 @@ The badge reader is down. Please use the side door today.";
         let parsed = mailcraft_mime::parse(&c.attachments[0].data).unwrap();
         assert_eq!(parsed.subject(), "URGENT: server room access");
         assert_eq!(eml_name("  "), "message.eml");
+    }
+
+    #[test]
+    fn forward_as_attachment_gets_the_reply_signature() {
+        let mut f = fx();
+        f.s.mailbox.add_signature("Short", mailcraft_model::Doc::from_plain_text("-- T")).unwrap();
+        f.s.mailbox.set_signature_defaults(None, None, Some(Some("Short"))).unwrap();
+        let r = forward_as_attachment(&mut f.s, &Value::Null).unwrap();
+        let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.signature.as_ref().map(|s| s.name.as_str()), Some("Short"));
+        assert!(matches!(c.body.blocks.get(1), Some(Block::Container { .. })), "{:?}", c.body.blocks);
+        assert_eq!(c.selection.focus.path, vec![0], "the caret sits above the signature");
     }
 
     #[test]

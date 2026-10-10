@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <meta name="color-scheme" content="light dark">
+  <title>MailCraft</title>
+
+  <!-- The Rust app (this crate's binary), compiled to wasm by Trunk. -->
+  <link data-trunk rel="rust" data-bin="mailcraft-web">
+  <!-- Our own app icon (assets/app-icon, see ATTRIBUTION.md): favicon and loading screen. -->
+  <link data-trunk rel="copy-file" href="../../assets/app-icon/hicolor/128x128/apps/mailcraft.png">
+  <link rel="icon" type="image/png" href="mailcraft.png">
+
+  <style>
+    :root { --bg: #eceef1; --fg: #2b2f36; --muted: #626a75; --bad: #b3261e; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #15171a; --fg: #e6e8eb; --muted: #9aa3ad; --bad: #f2b8b5; }
+    }
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: var(--bg); }
+    body { font: 15px/1.4 system-ui, sans-serif; color: var(--fg); }
+    canvas#mailcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #mailcraft_loading {
+      position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 16px; text-align: center; padding: 0 16px; color: var(--muted);
+      pointer-events: none;
+    }
+    #mailcraft_loading img { width: 96px; height: 96px; }
+    #mailcraft_loading.failed { color: var(--bad); background: var(--bg); pointer-events: auto; }
+    #mailcraft_loading .spinner {
+      width: 22px; height: 22px; border-radius: 50%; border: 3px solid currentColor;
+      border-right-color: transparent; animation: spin 0.9s linear infinite;
+    }
+    #mailcraft_loading.failed .spinner { display: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { #mailcraft_loading .spinner { animation: none; } }
+  </style>
+</head>
+<body>
+  <canvas id="mailcraft_canvas"></canvas>
+  <div id="mailcraft_loading" role="status" aria-live="polite">
+    <img src="mailcraft.png" alt="">
+    <div class="spinner" aria-hidden="true"></div>
+    <div class="text">Loading MailCraft…</div>
+  </div>
+  <noscript>MailCraft needs JavaScript and WebAssembly.</noscript>
+  <script>
+    // If the app stops (a WebAssembly trap), say so instead of leaving a frozen canvas.
+    window.addEventListener("error", function (ev) {
+      var msg = String((ev && ev.message) || "");
+      if (!/RuntimeError|unreachable|wasm/i.test(msg)) return;
+      var el = document.getElementById("mailcraft_loading");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "mailcraft_loading";
+        el.setAttribute("role", "alert");
+        document.body.appendChild(el);
+      }
+      el.className = "failed";
+      el.textContent = "MailCraft stopped unexpectedly. Reload the page to continue; " +
+        "changes are saved in this browser a few seconds after they are made.";
+    });
+  </script>
+</body>
+</html>

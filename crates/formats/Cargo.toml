@@ -1,0 +1,24 @@
+[package]
+name = "mailcraft-formats"
+description = "MailCraft file formats: EML, MBOX, Outlook item (.msg, MS-OXMSG over MS-CFB), iCalendar (RFC 5545), vCard (RFC 6350/2426), CSV contacts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mailcraft-mime.workspace = true
+mailcraft-model.workspace = true
+mailcraft-store.workspace = true
+thiserror.workspace = true
+log.workspace = true
+encoding_rs.workspace = true
+# MIT: Compound File Binary container ([MS-CFB]) for .msg.
+cfb.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

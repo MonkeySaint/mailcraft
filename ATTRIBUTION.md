@@ -30,3 +30,8 @@ that each file under `assets/` has a row here.
 | assets/app-icon/mailcraft.ico | MailCraft contributors | rendered from assets/app-icon/mailcraft.svg by `cargo xtask ico` | MIT OR Apache-2.0 |
 | assets/app-icon/mailcraft.icns | MailCraft contributors | rendered from assets/app-icon/mailcraft.svg by `cargo xtask ico` | MIT OR Apache-2.0 |
 | assets/icons/README.md | MailCraft contributors | original | MIT OR Apache-2.0 |
+| assets/dictionaries/en-US.txt | Grady Ward (Moby Project); supplement by MailCraft contributors | https://www.gutenberg.org/ebooks/3201 (Moby Words II, filtered and merged by `crates/proof/examples/build_dictionary.rs`) | Public domain (supplement words MIT OR Apache-2.0) |
+| assets/dictionaries/en-US-proper.txt | Grady Ward (Moby Project); supplement by MailCraft contributors | https://www.gutenberg.org/ebooks/3201 (Moby Words II names, places, common) | Public domain (supplement words MIT OR Apache-2.0) |
+| assets/dictionaries/en-US-freq.txt | Grady Ward (Moby Project) | https://www.gutenberg.org/ebooks/3201 (Moby Words II freq-int.txt, freq.txt) | Public domain |
+| assets/dictionaries/en-US-supplement.txt | MailCraft contributors | original | MIT OR Apache-2.0 |
+| assets/dictionaries/README.md | MailCraft contributors | original | MIT OR Apache-2.0 |
