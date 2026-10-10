@@ -48,6 +48,12 @@ pub fn render(p: &Value, commands: usize) -> String {
     );
     let _ = writeln!(
         md,
+        "This is **catalog coverage**: it proves each observed feature maps to a command that exists, not that the \
+         command does everything the feature does. The honest, audited parity per area is in \
+         [ROADMAP.md](../ROADMAP.md#parity).\n"
+    );
+    let _ = writeln!(
+        md,
         "**{implemented} of {mapped}** mapped Outlook features have a registered command (**{}**). The catalog \
          has {total} rows; {na} are not applicable to MailCraft. The registry has {commands} commands.\n",
         pct(implemented, mapped)

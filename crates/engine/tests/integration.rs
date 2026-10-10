@@ -214,3 +214,23 @@ fn module_rail_and_selection_flow() {
     assert_eq!(s.registry.by_shortcut("Mod+2").map(|c| c.id), Some("nav.calendar"));
     assert_eq!(s.registry.by_shortcut("mod+z").map(|c| c.id), Some("app.undo"));
 }
+
+/// Regression (honest-parity audit, commit 10): New Appointment/Contact/Task from the Mail module used to pass the
+/// selected mail folder, which the item dialogs reject; only a post belongs in the mail folder.
+#[test]
+fn new_items_from_mail_do_not_pass_the_mail_folder() {
+    let mut s = sample_session();
+    for kind in ["appointment", "meeting", "contact", "task", "contactGroup"] {
+        s.notices.clear();
+        s.run("mail.newItem", &json!({"kind": kind})).unwrap();
+        let params = s.notices.iter().find_map(|n| match n {
+            Notice::OpenDialog(_, p) => Some(p.clone()),
+            _ => None,
+        });
+        let params = params.expect("dialog opened");
+        assert!(params.get("folder").is_none(), "{kind}: {params}");
+    }
+    s.notices.clear();
+    s.run("mail.newItem", &json!({"kind": "post"})).unwrap();
+    assert!(s.notices.iter().any(|n| matches!(n, Notice::OpenDialog(_, p) if p.get("folder").is_some())));
+}

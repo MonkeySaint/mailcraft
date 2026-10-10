@@ -743,8 +743,14 @@ fn new_item(s: &mut Session, p: &Value) -> CmdResult {
         "email" | "message" => return new_email(s, p),
         other => return Err(CmdError::Params(format!("unknown item kind `{other}`"))),
     };
-    let folder = s.selection.folder.0;
-    open_dialog(s, dialog, json!({"kind": kind, "folder": folder}))
+    // Only a post goes into the selected (mail) folder; appointments, contacts and tasks go to their own
+    // module's current or default folder, so no mail folder is passed for them.
+    let params = if kind == "post" {
+        json!({"kind": kind, "folder": s.selection.folder.0})
+    } else {
+        json!({"kind": kind})
+    };
+    open_dialog(s, dialog, params)
 }
 
 // ---------------------------------------------------------------------------------------------------------

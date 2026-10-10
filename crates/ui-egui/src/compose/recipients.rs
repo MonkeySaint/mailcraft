@@ -141,7 +141,7 @@ fn ac_id(cid: u64, f: Field) -> Id {
 }
 
 fn auto_complete_on(ctx: &egui::Context) -> bool {
-    crate::dialogs::ui_pref(ctx, "mail.autoComplete").and_then(|v| v.as_bool()).unwrap_or(true)
+    crate::dialogs::ui_pref(ctx, "options.mail.autoComplete").and_then(|v| v.as_bool()).unwrap_or(true)
 }
 
 /// Text of an Auto-Complete row.
