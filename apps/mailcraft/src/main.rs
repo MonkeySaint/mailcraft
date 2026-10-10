@@ -29,6 +29,14 @@ Options:
   -h, --help            Print this help and exit
 ";
 
+/// `git <hash>, <date>` from `build.rs` (`unknown` when the build had neither git nor the variables).
+const BUILD_INFO: &str = concat!("git ", env!("MAILCRAFT_GIT_HASH"), ", ", env!("MAILCRAFT_BUILD_DATE"));
+
+/// `--version` output: `mailcraft X.Y.Z (git <hash>, <date>)`.
+fn version_line() -> String {
+    format!("mailcraft {} ({BUILD_INFO})", env!("CARGO_PKG_VERSION"))
+}
+
 /// Parsed command line.
 #[derive(Debug, Default, PartialEq)]
 struct Args {
@@ -154,9 +162,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.version {
-        println!("MailCraft {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", version_line());
         return ExitCode::SUCCESS;
     }
+    mailcraft_ui_egui::backstage::set_build_info(BUILD_INFO);
 
     let session = open_session(&args);
     let mut app = App::new(session);
@@ -170,7 +179,7 @@ fn main() -> ExitCode {
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("MailCraft")
-        .with_app_id("mailcraft")
+        .with_app_id("saint.dev.MailCraft")
         .with_inner_size([1440.0, 900.0])
         .with_min_inner_size(mailcraft_ui_egui::theme::size::MIN_WINDOW)
         .with_decorations(true);
@@ -216,6 +225,13 @@ mod tests {
         assert!(parse(&["--control-port", "x"]).is_err());
         assert!(parse(&["--profile"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn version_line_names_version_and_build() {
+        let v = version_line();
+        assert!(v.starts_with(&format!("mailcraft {} (git ", env!("CARGO_PKG_VERSION"))), "{v}");
+        assert!(v.ends_with(')'), "{v}");
     }
 
     #[test]

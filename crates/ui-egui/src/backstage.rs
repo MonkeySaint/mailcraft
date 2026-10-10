@@ -1547,7 +1547,7 @@ fn account(ui: &mut Ui, app: &mut App) {
     rule(ui, app);
     ui.label(RichText::new("Product Information").strong().size(15.0));
     ui.label(RichText::new("MailCraft").size(20.0));
-    muted(ui, app, &format!("Version {}", mailcraft_engine::cmd::help::VERSION));
+    muted(ui, app, &version_line());
     muted(ui, app, "Open source: MIT or Apache-2.0.");
     ui.add_space(6.0);
     if tile(ui, app, "info", "About MailCraft", "Version, license and system details.") {
@@ -1555,5 +1555,30 @@ fn account(ui: &mut Ui, app: &mut App) {
     }
     if tile(ui, app, "help", "What's New", "See what changed in this version.") {
         app.run("help.whatsNew", json!({}));
+    }
+}
+
+static BUILD_INFO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the build details the Account page shows after the version (`git <hash>, <date>`). The desktop app
+/// calls this at start-up with the values from its build script, so the page matches `mailcraft --version`.
+pub fn set_build_info(info: &str) {
+    let _ = BUILD_INFO.set(info.to_owned());
+}
+
+/// `Version X.Y.Z (git <hash>, <date>)`; without build details (web, tests) just `Version X.Y.Z`, unless
+/// `MAILCRAFT_GIT_HASH` / `MAILCRAFT_BUILD_DATE` were in this crate's build environment.
+pub fn version_line() -> String {
+    let version = mailcraft_engine::cmd::help::VERSION;
+    let info = BUILD_INFO.get().cloned().or_else(|| {
+        let hash = option_env!("MAILCRAFT_GIT_HASH").filter(|h| !h.is_empty())?;
+        Some(match option_env!("MAILCRAFT_BUILD_DATE") {
+            Some(date) => format!("git {hash}, {date}"),
+            None => format!("git {hash}"),
+        })
+    });
+    match info {
+        Some(info) => format!("Version {version} ({info})"),
+        None => format!("Version {version}"),
     }
 }

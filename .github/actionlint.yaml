@@ -1,7 +1,24 @@
-# actionlint config for the GitHub workflows (run: actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml).
+# actionlint settings for the GitHub workflows in .github/workflows (run by packaging-lint.yml):
+#
+#     actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
+#
+# Runner labels are the ones registered on github.com (see docs/releasing.md); actionlint only knows
+# GitHub's hosted labels otherwise.
 self-hosted-runner:
   labels:
     - docker
+    - docker-arm64
     - windows
     - macos
     - freebsd
+    - windows-arm64
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      # GitHub's own `forge` context (same fields as `github`, which GitHub also accepts) is unknown to
+      # actionlint, which checks against GitHub's contexts.
+      - 'undefined variable "forge"'
+      - 'property "forge" is not defined'
+      # GitHub accepts a full URL in `uses:` (actions outside the default action mirror); actionlint only
+      # knows GitHub's owner/repo@ref form. Only code.github.org is allowed this way.
+      - 'specifying action "https://code\.github\.org/[^"]+" in invalid format'

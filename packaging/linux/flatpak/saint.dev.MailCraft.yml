@@ -1,0 +1,25 @@
+# Flatpak manifest. packaging/linux/flatpak/flatpak-bundle.sh copies it next to a staged build (`stage/`,
+# made by packaging/stage-unix.sh from the release binaries) and runs flatpak-builder; this manifest does
+# not compile Rust itself. The id must equal APP_ID in packaging/env.sh (the script checks).
+id: saint.dev.MailCraft
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: mailcraft
+finish-args:
+  # Mail servers (IMAP, SMTP).
+  - --share=network
+  # Window: Wayland, with X11 when there is no Wayland session; GPU for OpenGL.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Open/save dialogs go through the desktop portal, so no broad filesystem access is requested.
+modules:
+  - name: mailcraft
+    buildsystem: simple
+    build-commands:
+      - cp -a bin share /app/
+    sources:
+      - type: dir
+        path: stage

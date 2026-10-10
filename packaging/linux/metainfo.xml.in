@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata (installed as share/metainfo/@APP_ID@.metainfo.xml by packaging/stage-unix.sh).
+     @NAME@ placeholders are filled from packaging/env.sh. The text is our own. -->
+<component type="desktop-application">
+  <id>@APP_ID@</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>@LICENSE@</project_license>
+  <name>MailCraft</name>
+  <summary>@SUMMARY@</summary>
+  <developer id="saint.dev">
+    <name>MailCraft contributors</name>
+  </developer>
+  <description>
+    <p>
+      MailCraft is an open-source mail client written in Rust for people who like the classic desktop mail
+      layout: a module rail, a ribbon, the folder pane, a message list and a reading pane side by side.
+      Mail, calendar, people, tasks and notes live in one window.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>IMAP and SMTP accounts with offline sync, plus local folders</li>
+      <li>Conversations, search folders, flags, categories and date-grouped lists</li>
+      <li>Rules and quick steps to file and answer mail in one click</li>
+      <li>Calendar with day, week and month views, and a contacts book</li>
+      <li>Print and save as PDF; import and export of standard mail, calendar and contact files</li>
+      <li>Light and dark themes, a simplified or classic ribbon, and a layout that adapts to narrow windows</li>
+      <li>A command-line tool and an MCP server for scripting and automation</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">@APP_ID@.desktop</launchable>
+  <icon type="stock">@APP_ID@</icon>
+  <url type="homepage">@HOMEPAGE@</url>
+  <url type="bugtracker">@HOMEPAGE@/issues</url>
+  <url type="vcs-browser">@HOMEPAGE@</url>
+  <provides>
+    <binary>mailcraft</binary>
+    <binary>mailcraft-cli</binary>
+    <mediatype>message/rfc822</mediatype>
+    <mediatype>application/mbox</mediatype>
+    <mediatype>text/calendar</mediatype>
+    <mediatype>text/vcard</mediatype>
+  </provides>
+  <categories>
+    <category>Network</category>
+    <category>Email</category>
+    <category>Office</category>
+  </categories>
+  <keywords>
+    <keyword>mail</keyword>
+    <keyword>email</keyword>
+    <keyword>calendar</keyword>
+    <keyword>contacts</keyword>
+    <keyword>imap</keyword>
+  </keywords>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The main window: folders, message list and reading pane</caption>
+      <image type="source" width="1600" height="900">@RAW_URL@/docs/images/hero.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Dark theme</caption>
+      <image type="source" width="1600" height="900">@RAW_URL@/docs/images/dark.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Classic ribbon</caption>
+      <image type="source" width="1600" height="900">@RAW_URL@/docs/images/classic-ribbon.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Calendar month view</caption>
+      <image type="source" width="1600" height="900">@RAW_URL@/docs/images/calendar.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>A narrow window shows one pane at a time</caption>
+      <image type="source" width="700" height="700">@RAW_URL@/docs/images/narrow.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>

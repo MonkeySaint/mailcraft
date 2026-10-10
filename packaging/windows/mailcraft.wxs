@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX Toolset v4 source for the MailCraft MSI. Built by packaging/windows/package.ps1:
+
+      wix build -arch x64 -d Version=X.Y.Z -d BinDir=<folder with the .exe files> -d RepoDir=<repo root>
+                -o mailcraft-X.Y.Z-windows-x86_64.msi mailcraft.wxs
+
+  Per-machine install into Program Files\MailCraft with a Start menu shortcut; mailcraft-cli.exe is put on the
+  system PATH. The UpgradeCode never changes: it is how a newer MSI finds and replaces an older one.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="MailCraft"
+           Manufacturer="MailCraft contributors"
+           Version="$(var.Version)"
+           UpgradeCode="67A0B8A2-55E8-4873-9223-ABACD1EE743F"
+           Scope="perMachine"
+           Compressed="yes"
+           Language="1033">
+    <SummaryInformation Description="MailCraft $(var.Version) installer" Manufacturer="MailCraft contributors" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of MailCraft is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="MailCraftIcon" SourceFile="$(var.RepoDir)\assets\app-icon\mailcraft.ico" />
+    <Property Id="ARPPRODUCTICON" Value="MailCraftIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/MonkeySaint/mailcraft" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/MonkeySaint/mailcraft/issues" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="MailCraft">
+        <Directory Id="LicencesFolder" Name="licences" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="MailCraft" Level="1">
+      <ComponentGroupRef Id="Programs" />
+      <ComponentGroupRef Id="Licences" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="Programs" Directory="INSTALLFOLDER">
+      <Component>
+        <File Id="MailCraftExe" Source="$(var.BinDir)\mailcraft.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="ProgramMenuFolder"
+                    Name="MailCraft"
+                    Description="Mail, calendar, people, tasks and notes"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="MailCraftIcon"
+                    Advertise="yes" />
+        </File>
+      </Component>
+      <Component>
+        <File Id="MailCraftCliExe" Source="$(var.BinDir)\mailcraft-cli.exe" KeyPath="yes" />
+        <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last"
+                     Action="set" System="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Licences" Directory="LicencesFolder">
+      <Component><File Source="$(var.RepoDir)\README.md" /></Component>
+      <Component><File Source="$(var.RepoDir)\LICENSE-MIT" /></Component>
+      <Component><File Source="$(var.RepoDir)\LICENSE-APACHE" /></Component>
+      <Component><File Source="$(var.RepoDir)\NOTICE" /></Component>
+      <Component><File Source="$(var.RepoDir)\ATTRIBUTION.md" /></Component>
+      <Component><File Source="$(var.RepoDir)\assets\fonts\OFL-Inter.txt" /></Component>
+      <Component><File Source="$(var.RepoDir)\assets\fonts\OFL-Liberation.txt" /></Component>
+      <Component><File Source="$(var.RepoDir)\assets\fonts\OFL-Carlito.txt" /></Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

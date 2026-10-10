@@ -101,3 +101,4 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 0
+strip = "symbols"

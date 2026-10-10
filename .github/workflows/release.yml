@@ -1,0 +1,282 @@
+# Release builds on GitHub Actions. See docs/releasing.md for how to cut a release, the runner labels and
+# the secrets.
+#
+# A pushed tag vX.Y.Z builds every package and publishes a GitHub release with them and SHA256SUMS.
+# Run by hand (workflow_dispatch) it builds the same packages as run artifacts and publishes nothing.
+#
+# Always on (runner label `docker`): version check, Linux x86_64 + aarch64 (tar.gz, deb, rpm, AppImage),
+# Flatpak (x86_64), web. Opt-in per platform with repository variables, because a job whose runner label
+# has no runner waits forever and would hold the release back:
+#   RELEASE_WINDOWS=true   runner label `windows`  (MSI + zip)
+#   RELEASE_MACOS=true     runner label `macos`    (universal DMG)
+#   RELEASE_FREEBSD=true   runner label `freebsd`  (tar.gz + pkg)
+#   LINUX_ARM64_LABEL=docker-arm64   build aarch64 Linux natively on that label instead of cross-compiling
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  version-check:
+    runs-on: docker
+    container:
+      image: rust:1.99-bookworm
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Node for the JavaScript actions
+        run: command -v node || { apt-get update -q && apt-get install -y -q --no-install-recommends nodejs; }
+      - uses: actions/checkout@v4
+      - name: Tag matches the workspace version
+        # xtask reads the tag from GITHUB_REF / GITHUB_REF (refs/tags/vX.Y.Z); not a tag: nothing to check.
+        env:
+          GITHUB_REF: ${{ forge.ref }}
+        run: cargo xtask version check
+      - name: Version
+        id: version
+        run: |
+          v="$(cargo xtask version show)"
+          case "$v" in *-*) pre=true ;; *) pre=false ;; esac
+          out="${GITHUB_OUTPUT:-$GITHUB_OUTPUT}"
+          echo "version=$v" >>"$out"
+          echo "prerelease=$pre" >>"$out"
+          echo "MailCraft $v (prerelease: $pre)"
+
+  linux:
+    needs: version-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.arch == 'aarch64' && vars.LINUX_ARM64_LABEL || 'docker' }}
+    container:
+      image: rust:1.99-bookworm
+    env:
+      MC_REQUIRE_NFPM: "1"
+      MC_DOWNLOAD_TOOLS: "1"
+    steps:
+      - name: Node for the JavaScript actions
+        run: command -v node || { apt-get update -q && apt-get install -y -q --no-install-recommends nodejs; }
+      - uses: actions/checkout@v4
+      - name: Cache cargo and packaging tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/mailcraft-packaging
+            target
+          key: release-linux-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Packaging tools (apt, nfpm, cross compiler)
+        run: |
+          packaging/linux/ci-deps.sh "${{ matrix.target }}"
+          rustup target add "${{ matrix.target }}"
+      - name: Build, tar.gz, deb, rpm
+        run: packaging/linux/package.sh --build --target "${{ matrix.target }}" --out dist
+      - name: AppImage
+        run: packaging/linux/appimage.sh --target "${{ matrix.target }}" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  flatpak:
+    needs: linux
+    runs-on: docker
+    container:
+      image: debian:bookworm
+      # flatpak-builder sandboxes every build step with bubblewrap, which needs a privileged container
+      # (the runner must allow it: `container.privileged: true` in its config).
+      options: --privileged
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends nodejs git ca-certificates curl flatpak flatpak-builder
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/linux
+      - name: Cache Flatpak runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-freedesktop-25.08
+      - name: Flatpak bundle
+        run: |
+          tarball="$(ls dist/linux/mailcraft-*-linux-x86_64.tar.gz)"
+          packaging/linux/flatpak/flatpak-bundle.sh --tarball "$tarball" --arch x86_64 --out dist/flatpak
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-x86_64
+          path: dist/flatpak/
+          if-no-files-found: error
+
+  web:
+    needs: version-check
+    runs-on: docker
+    container:
+      image: rust:1.99-bookworm
+    env:
+      TRUNK_VERSION: "0.21.14"
+    steps:
+      - name: Node for the JavaScript actions
+        run: command -v node || { apt-get update -q && apt-get install -y -q --no-install-recommends nodejs; }
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: release-web-${{ hashFiles('Cargo.lock') }}
+      - name: Tools (zip, Trunk)
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends zip
+          rustup target add wasm32-unknown-unknown
+          # Trunk (MIT OR Apache-2.0) release binary; without it package.sh uses cargo + wasm-bindgen-cli.
+          url="https://github.com/trunk-rs/trunk/releases/download/v$TRUNK_VERSION/trunk-x86_64-unknown-linux-gnu.tar.gz"
+          if curl -fsSL --retry 3 "$url" | tar -xz -C /usr/local/bin trunk; then
+            trunk --version
+          else
+            echo "Trunk download failed; packaging/web/package.sh falls back to wasm-bindgen-cli"
+          fi
+      - name: Web build
+        run: packaging/web/package.sh --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: dist/
+          if-no-files-found: error
+
+  windows:
+    needs: version-check
+    if: vars.RELEASE_WINDOWS == 'true'
+    runs-on: windows
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, sign (when the certificate secrets exist), MSI and zip
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./packaging/windows/package.ps1 -Target x86_64-pc-windows-msvc -OutDir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  macos:
+    needs: version-check
+    if: vars.RELEASE_MACOS == 'true'
+    runs-on: macos
+    steps:
+      - uses: actions/checkout@v4
+      - name: Universal app, sign and notarise (when the Apple secrets exist), DMG
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: packaging/macos/package.sh --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/
+          if-no-files-found: error
+
+  freebsd:
+    needs: version-check
+    if: vars.RELEASE_FREEBSD == 'true'
+    runs-on: freebsd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, tar.gz and pkg
+        run: bash packaging/freebsd/package.sh --build --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [version-check, linux, flatpak, web, windows, macos, freebsd]
+    # Tag pushes only; skipped (opt-in) platforms are fine, a failed one stops the release.
+    if: >-
+      ${{ !cancelled() && startsWith(forge.ref, 'refs/tags/v')
+      && needs.version-check.result == 'success' && needs.linux.result == 'success'
+      && needs.flatpak.result == 'success' && needs.web.result == 'success'
+      && !contains(needs.*.result, 'failure') }}
+    runs-on: docker
+    container:
+      image: node:22-bookworm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tools for github-release
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends jq curl ca-certificates
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+      - name: Collect the packages and write SHA256SUMS
+        run: |
+          mkdir -p dist/release
+          find dist/artifacts -type f -exec cp {} dist/release/ \;
+          cd dist/release
+          sha256sum -- * >SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes
+        id: notes
+        run: |
+          tag="${{ forge.ref_name }}"
+          prev="$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)"
+          range="$tag"
+          [ -n "$prev" ] && range="$prev..$tag"
+          out="${GITHUB_OUTPUT:-$GITHUB_OUTPUT}"
+          {
+            echo "notes<<MAILCRAFT_NOTES_EOF"
+            echo "MailCraft ${{ needs.version-check.outputs.version }}."
+            echo
+            echo "Downloads: Linux (tar.gz, .deb, .rpm, AppImage, Flatpak), web (zip) and, when built, Windows (MSI, zip), macOS (DMG) and FreeBSD. Check them against SHA256SUMS."
+            echo
+            echo "Changes${prev:+ since $prev}:"
+            git log --no-merges --format='- %s' "$range"
+            echo "MAILCRAFT_NOTES_EOF"
+          } >>"$out"
+      - name: Publish the release
+        uses: https://code.github.org/actions/github-release@v2
+        with:
+          direction: upload
+          url: ${{ forge.server_url }}
+          repo: ${{ forge.repository }}
+          tag: ${{ forge.ref_name }}
+          sha: ${{ forge.sha }}
+          title: MailCraft ${{ needs.version-check.outputs.version }}
+          release-dir: dist/release
+          release-notes: ${{ steps.notes.outputs.notes }}
+          prerelease: ${{ needs.version-check.outputs.prerelease }}
+          # A token with write:repository; the job token works when the repository allows it to write releases.
+          token: ${{ secrets.GITHUB_TOKEN || github.token }}

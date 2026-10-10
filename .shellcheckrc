@@ -1,0 +1,5 @@
+# ShellCheck settings for packaging/**/*.sh (run from the repository root, see
+# .github/workflows/packaging-lint.yml). Follow `source` lines; their paths are relative to the root.
+external-sources=true
+source-path=SCRIPTDIR
+source-path=.

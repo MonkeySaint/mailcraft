@@ -1,0 +1,35 @@
+# Windows on Arm build on demand: cross-compiles aarch64-pc-windows-msvc on a self-hosted `windows` runner
+# (x64 host with the MSVC ARM64 build tools and LLVM/clang for the ring crate), or builds natively when
+# the runner label given below is an Arm machine. Produces mailcraft-VERSION-windows-aarch64.msi and .zip,
+# signed when WINDOWS_CERT_PFX / WINDOWS_CERT_PASSWORD are set.
+name: windows-arm64
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label
+        type: choice
+        options: [windows, windows-arm64]
+        default: windows
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  windows-arm64:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, sign (when the certificate secrets exist), MSI and zip
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./packaging/windows/package.ps1 -Target aarch64-pc-windows-msvc -OutDir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-aarch64
+          path: dist/
+          if-no-files-found: error

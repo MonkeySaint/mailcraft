@@ -1,0 +1,76 @@
+# nfpm (https://nfpm.goreleaser.com, MIT) config for the .deb and .rpm packages.
+# Run by packaging/linux/package.sh inside its work folder, next to `stage/usr/` (packaging/stage-unix.sh
+# output) and a copy of postinst.sh; nfpm does not expand variables in `src`, hence the fixed relative paths.
+# package.sh exports the values used below:
+#   MC_VERSION   workspace version (packaging/env.sh)
+#   NFPM_ARCH    Go-style architecture: amd64 or arm64 (nfpm maps it to amd64/x86_64, arm64/aarch64)
+#   MC_MAINTAINER, MC_HOMEPAGE, MC_SUMMARY  from packaging/env.sh
+name: mailcraft
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${MC_VERSION}
+version_schema: semver
+release: "1"
+section: mail
+priority: optional
+maintainer: ${MC_MAINTAINER}
+vendor: MailCraft contributors
+homepage: ${MC_HOMEPAGE}
+# nfpm does not expand variables here; packaging/check.sh keeps it equal to LICENSE_SPDX in env.sh.
+license: MIT OR Apache-2.0
+description: |
+  ${MC_SUMMARY}.
+  MailCraft is an open-source desktop mail client written in Rust: module rail, ribbon, folder pane,
+  message list and reading pane, with calendar, people, tasks and notes. Includes mailcraft-cli, a
+  command-line tool and MCP server.
+
+scripts:
+  postinstall: ./postinst.sh
+  postremove: ./postinst.sh
+
+# The window is drawn with OpenGL (glow) on Wayland or X11; the libraries are loaded at run time, so the
+# dependencies are the runtime packages, not -dev ones.
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.36)
+      - libgcc-s1
+      - libgl1
+      - libegl1
+      - libxkbcommon0
+      - libwayland-client0 | libx11-6
+    recommends:
+      - libxkbcommon-x11-0
+      - libxcursor1
+      - libxi6
+      - libxrandr2
+      - desktop-file-utils
+      - xdg-desktop-portal
+  rpm:
+    depends:
+      - glibc
+      - libgcc
+      - libglvnd-glx
+      - libglvnd-egl
+      - libxkbcommon
+    recommends:
+      - libwayland-client
+      - libxkbcommon-x11
+      - libXcursor
+      - libXi
+      - libXrandr
+      - desktop-file-utils
+      - xdg-desktop-portal
+
+deb:
+  fields:
+    Bugs: ${MC_HOMEPAGE}/issues
+rpm:
+  group: Applications/Internet
+  summary: ${MC_SUMMARY}
+  packager: ${MC_MAINTAINER}
+
+# Only our own files, one entry each: no entries for shared folders like /usr/bin or the hicolor size
+# folders, which belong to the base system and the icon theme. package.sh appends one entry per file of
+# stage/usr below (an nfpm glob would flatten the icon sizes into one folder).
+contents:

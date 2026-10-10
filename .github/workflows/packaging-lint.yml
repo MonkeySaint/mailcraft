@@ -1,0 +1,68 @@
+# Lints the release machinery: ShellCheck on packaging/**/*.sh, actionlint on these workflows (which also
+# runs ShellCheck on every `run:` block), and packaging/check.sh (desktop file, AppStream, ids, icons).
+# Both linters are pinned release binaries checked against their published SHA-256 sums.
+name: packaging-lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/**"
+      - ".github/**"
+      - ".shellcheckrc"
+      - "assets/app-icon/**"
+  pull_request:
+    paths:
+      - "packaging/**"
+      - ".github/**"
+      - ".shellcheckrc"
+      - "assets/app-icon/**"
+  workflow_dispatch:
+
+env:
+  SHELLCHECK_VERSION: "0.10.0"
+  ACTIONLINT_VERSION: "1.7.7"
+
+jobs:
+  lint:
+    runs-on: docker
+    container:
+      image: node:22-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools (desktop-file-utils, appstream, xmllint)
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends desktop-file-utils appstream libxml2-utils xz-utils
+      - name: Cache linters
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mailcraft-lint
+          key: lint-shellcheck-${{ env.SHELLCHECK_VERSION }}-actionlint-${{ env.ACTIONLINT_VERSION }}
+      - name: Install ShellCheck and actionlint
+        run: |
+          bin="$HOME/.cache/mailcraft-lint/bin"
+          mkdir -p "$bin"
+          cd "$HOME/.cache/mailcraft-lint"
+          if [ ! -x "$bin/shellcheck" ]; then
+            f="shellcheck-v$SHELLCHECK_VERSION.linux.x86_64.tar.xz"
+            curl -fsSLO --retry 3 "https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_VERSION/$f"
+            echo "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87  $f" | sha256sum -c -
+            tar -xJf "$f" --strip-components=1 -C "$bin" "shellcheck-v$SHELLCHECK_VERSION/shellcheck"
+          fi
+          if [ ! -x "$bin/actionlint" ]; then
+            f="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+            base="https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION"
+            curl -fsSLO --retry 3 "$base/$f"
+            curl -fsSL --retry 3 "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt" | grep " $f\$" | sha256sum -c -
+            tar -xzf "$f" -C "$bin" actionlint
+          fi
+          echo "$bin" >>"${GITHUB_PATH:-$GITHUB_PATH}"
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          find packaging -name '*.sh' -print0 | xargs -0 shellcheck
+      - name: actionlint
+        run: actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
+      - name: Packaging checks
+        run: packaging/check.sh

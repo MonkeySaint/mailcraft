@@ -31,6 +31,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--version` output: `mailcraft-cli X.Y.Z (git <hash>, <date>)`. The hash and date come from
+/// `MAILCRAFT_GIT_HASH` / `MAILCRAFT_BUILD_DATE` in the build environment (`packaging/env.sh` exports them for
+/// release builds); a plain `cargo build` without them prints just the version.
+fn version_line() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match (option_env!("MAILCRAFT_GIT_HASH"), option_env!("MAILCRAFT_BUILD_DATE")) {
+        (Some(hash), Some(date)) if !hash.is_empty() => {
+            format!("mailcraft-cli {version} (git {hash}, {date})")
+        }
+        (Some(hash), None) if !hash.is_empty() => format!("mailcraft-cli {version} (git {hash})"),
+        _ => format!("mailcraft-cli {version}"),
+    }
+}
+
 /// Prints to stdout; a closed pipe (`| head`) ends quietly instead of failing.
 fn out(text: &str) -> Result<(), String> {
     let mut stdout = std::io::stdout().lock();
@@ -64,7 +78,7 @@ fn folder_id(s: &Session, folder: Option<&str>) -> Result<u64, String> {
 fn run(cli: Cli) -> Result<(), String> {
     match cli {
         Cli::Help => out(args::USAGE),
-        Cli::Version => out(&format!("mailcraft-cli {}\n", env!("CARGO_PKG_VERSION"))),
+        Cli::Version => out(&format!("{}\n", version_line())),
         Cli::Commands { json, filter } => commands(json, filter.as_deref()),
         Cli::Parity { json } => parity(json),
         Cli::Run { source, cmds, queries } => {
