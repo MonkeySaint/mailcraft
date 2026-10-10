@@ -489,17 +489,13 @@ struct ConvState {
 fn conversation(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = folder_of(app, d);
-    let init = |a: &App| ConvState {
-        on: CONV
-            .iter()
-            .map(|(k, _)| {
-                common::pref(ctx, &format!("conversation.{k}"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(*k == "fromOtherFolders")
-            })
-            .collect(),
-        conversations: view_settings(&a.s, folder).conversations,
+    // The folder's settings as the engine keeps them (`view.conversationSettings`).
+    let current = |a: &App| -> Vec<bool> {
+        let cs = mailcraft_engine::queries::conversation_settings(&a.s, folder);
+        CONV.iter().map(|(k, _)| cs.get(k).unwrap_or(false)).collect()
     };
+    let init =
+        |a: &App| ConvState { on: current(a), conversations: view_settings(&a.s, folder).conversations };
     with_state(ctx, app, uid, init, |st, app| {
         window(ctx, app, d, "Conversation Settings", 380.0, |ui, app| {
             ui.checkbox(&mut st.conversations, "Show as Conversations");
@@ -510,15 +506,21 @@ fn conversation(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             });
             match ok_cancel(ui, app, true) {
                 Some(true) => {
-                    if view_settings(&app.s, folder).conversations != st.conversations {
-                        app.run("view.conversations", json!({}));
+                    let was_on = view_settings(&app.s, folder).conversations;
+                    // Settings change only while the view is on (the engine refuses them otherwise).
+                    if st.conversations && !was_on {
+                        app.run("view.conversations", json!({"on": true}));
                     }
-                    for ((k, _), on) in CONV.iter().zip(st.on.iter()) {
-                        let key = format!("conversation.{k}");
-                        if common::pref(ctx, &key).and_then(|v| v.as_bool()) != Some(*on) {
-                            app.run("view.conversationSettings", json!({"setting": k, "on": on}));
-                            common::set_pref(ctx, &key, json!(on));
+                    if st.conversations || was_on {
+                        let now = current(app);
+                        for (((k, _), on), cur) in CONV.iter().zip(st.on.iter()).zip(now.iter()) {
+                            if on != cur {
+                                app.run("view.conversationSettings", json!({"setting": k, "on": on}));
+                            }
                         }
+                    }
+                    if !st.conversations && was_on {
+                        app.run("view.conversations", json!({"on": false}));
                     }
                     Out::Close
                 }

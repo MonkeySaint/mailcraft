@@ -13,10 +13,12 @@ use super::search::toggle_token;
 use super::util::{opt_bool, opt_str, req_str};
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
 use mailcraft_model::dates::DateGroup;
+use mailcraft_model::thread::ConversationSettings;
 use mailcraft_model::{
-    ArrangeBy, FlagState, FolderId, FolderKind, FolderPaneState, FolderRole, Importance, ListFilter,
+    ArrangeBy, FlagState, FolderId, FolderKind, FolderPaneState, FolderRole, Importance, ItemId, ListFilter,
     MailItem, ReadingPanePos, SortOrder, ViewLayout, ViewSettings,
 };
+use std::collections::BTreeSet;
 
 /// Zoom limits, percent.
 pub const ZOOM_MIN: u16 = 10;
@@ -84,9 +86,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Collapse This Group",
             "View › Arrangement › Expand/Collapse",
             "",
-            "",
+            r#"{"conversation"?:bool,"id"?:number}"#,
             false,
-            group_selected,
+            group_or_conversation_selected,
             collapse_group,
         ),
         spec(
@@ -94,7 +96,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Conversation Settings",
             "View › Messages",
             "",
-            r#"{"setting":"fromOtherFolders|sendersAboveSubject|alwaysExpand|classicIndent","on":bool}"#,
+            r#"{"setting":"fromOtherFolders|sendersAboveSubject|alwaysExpand|classicIndent","on"?:bool}"#,
             true,
             conversations_on,
             conversation_settings,
@@ -104,7 +106,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Show as Conversations",
             "View › Messages",
             "",
-            "",
+            r#"{"on"?:bool,"scope"?:"folder"|"all"}"#,
             true,
             has_folder,
             conversations,
@@ -124,9 +126,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Expand This Group",
             "View › Arrangement › Expand/Collapse",
             "",
-            "",
+            r#"{"conversation"?:bool,"id"?:number}"#,
             false,
-            group_selected,
+            group_or_conversation_selected,
             expand_group,
         ),
         spec("view.favorites", "Favorites", "View › Layout › Folder Pane", "", "", false, always, favorites),
@@ -466,11 +468,19 @@ pub fn group_label(s: &Session, m: &MailItem, by: ArrangeBy) -> String {
     }
 }
 
-/// Group label of the focused (else first selected) item in the selected folder.
+/// Group label of the focused (else first selected) item in the selected folder. In conversation view the
+/// item's conversation decides (it sits in the group of its sort item).
 fn selected_group(s: &Session) -> Option<String> {
     let id = s.selection.focus.or_else(|| s.selection.items.first().copied())?;
+    let by = settings(s, s.selection.folder).arrange_by;
+    if settings(s, s.selection.folder).conversations
+        && let Some(c) = crate::queries::conversation_of(s, id)
+        && let Some(m) = s.mailbox.mail.get(&c.sort_item)
+    {
+        return Some(group_label(s, m, by));
+    }
     let m = s.mailbox.mail.get(&id)?;
-    Some(group_label(s, m, settings(s, s.selection.folder).arrange_by))
+    Some(group_label(s, m, by))
 }
 
 fn inbox_of_current_account(s: &Session) -> Option<FolderId> {
@@ -514,6 +524,14 @@ fn group_selected(s: &Session) -> Option<&'static str> {
     if selected_group(s).is_some() { None } else { Some("no item is selected") }
 }
 
+/// Expand/Collapse This Group, or (in conversation view, `{"conversation": true}`) the selected
+/// conversation.
+fn group_or_conversation_selected(s: &Session) -> Option<&'static str> {
+    let why = group_selected(s)?;
+    // The conversation form names its message (`id`) or falls back to the selection when run.
+    if conversations_on(s).is_none() { None } else { Some(why) }
+}
+
 fn conversations_on(s: &Session) -> Option<&'static str> {
     if let Some(why) = has_folder(s) {
         return Some(why);
@@ -538,8 +556,12 @@ fn view_customized(s: &Session) -> Option<&'static str> {
         return Some(why);
     }
     let f = s.selection.folder;
+    // Conversation expansion is not a view customisation; collapsed groups and Conversation Settings are.
     let custom = s.mailbox.views.get(&f).is_some_and(|v| *v != ViewSettings::default())
-        || s.view.collapsed_groups.get(&f).is_some_and(|g| !g.is_empty());
+        || s.view
+            .collapsed_groups
+            .get(&f)
+            .is_some_and(|g| g.iter().any(|e| is_group_label(e) || is_setting(e)));
     if custom { None } else { Some("the view already has its default settings") }
 }
 
@@ -679,7 +701,13 @@ fn show_in_groups(s: &mut Session, _p: &Value) -> CmdResult {
     })
 }
 
-fn set_group(s: &mut Session, collapsed: bool) -> CmdResult {
+fn set_group(s: &mut Session, p: &Value, collapsed: bool) -> CmdResult {
+    if opt_bool(p, "conversation").unwrap_or(false) {
+        return set_conversation(s, p, collapsed);
+    }
+    if let Some(why) = group_selected(s) {
+        return Err(CmdError::Disabled(why.into()));
+    }
     let label = selected_group(s).ok_or_else(|| CmdError::Disabled("no item is selected".into()))?;
     let list = s.view.collapsed_groups.entry(s.selection.folder).or_default();
     list.retain(|g| *g != label);
@@ -689,48 +717,223 @@ fn set_group(s: &mut Session, collapsed: bool) -> CmdResult {
     Ok(json!({ "group": label, "collapsed": collapsed }))
 }
 
-fn collapse_group(s: &mut Session, _p: &Value) -> CmdResult {
-    set_group(s, true)
+fn collapse_group(s: &mut Session, p: &Value) -> CmdResult {
+    set_group(s, p, true)
 }
 
-fn expand_group(s: &mut Session, _p: &Value) -> CmdResult {
-    set_group(s, false)
+fn expand_group(s: &mut Session, p: &Value) -> CmdResult {
+    set_group(s, p, false)
 }
 
 fn collapse_all(s: &mut Session, _p: &Value) -> CmdResult {
     let folder = current_folder(s, &Value::Null)?;
     let by = settings(s, folder).arrange_by;
     let mut labels: Vec<String> = s.mailbox.items_in(folder).iter().map(|m| group_label(s, m, by)).collect();
+    // Conversations group by their sort item, which may be a message from another folder.
+    for c in crate::queries::list_conversations(s) {
+        if let Some(m) = s.mailbox.mail.get(&c.sort_item) {
+            labels.push(group_label(s, m, by));
+        }
+    }
     labels.sort();
     labels.dedup();
     let n = labels.len();
+    let kept: Vec<String> = s
+        .view
+        .collapsed_groups
+        .get(&folder)
+        .map(|v| v.iter().filter(|e| !is_group_label(e)).cloned().collect())
+        .unwrap_or_default();
+    labels.extend(kept);
     s.view.collapsed_groups.insert(folder, labels);
     Ok(json!({ "collapsed": n }))
 }
 
 fn expand_all(s: &mut Session, _p: &Value) -> CmdResult {
     let folder = current_folder(s, &Value::Null)?;
-    s.view.collapsed_groups.remove(&folder);
+    if let Some(list) = s.view.collapsed_groups.get_mut(&folder) {
+        list.retain(|e| !is_group_label(e));
+        if list.is_empty() {
+            s.view.collapsed_groups.remove(&folder);
+        }
+    }
     Ok(json!({ "collapsed": 0 }))
 }
 
-fn conversations(s: &mut Session, _p: &Value) -> CmdResult {
-    update(s, |v| {
-        v.conversations = !v.conversations;
-        json!({ "on": v.conversations })
-    })
+/// Show as Conversations. `on` sets the state (default: toggles the selected folder's); `scope` is the
+/// answer to the "This folder / All mailboxes" question: `folder` (default) or `all` (every mail folder of
+/// every account, plus the selected folder).
+fn conversations(s: &mut Session, p: &Value) -> CmdResult {
+    let folder = current_folder(s, &Value::Null)?;
+    let on = match p.get("on") {
+        None | Some(Value::Null) => !settings(s, folder).conversations,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(CmdError::Params("`on` must be true or false".into())),
+    };
+    let scope = opt_str(p, "scope").map(|v| v.trim().to_ascii_lowercase()).unwrap_or_default();
+    match scope.as_str() {
+        "" | "folder" | "thisfolder" | "this folder" => update(s, |v| {
+            v.conversations = on;
+            json!({ "on": on, "scope": "folder", "folders": 1 })
+        }),
+        "all" | "allmailboxes" | "all mailboxes" => {
+            let mut ids: Vec<FolderId> =
+                s.mailbox.folders.values().filter(|f| f.kind == FolderKind::Mail).map(|f| f.id).collect();
+            if !ids.contains(&folder) {
+                ids.push(folder);
+            }
+            for id in &ids {
+                s.mailbox.views.entry(*id).or_default().conversations = on;
+            }
+            s.mailbox.views.retain(|_, v| *v != ViewSettings::default());
+            Ok(json!({ "on": on, "scope": "all", "folders": ids.len() }))
+        }
+        other => Err(CmdError::Params(format!("`scope` must be folder or all, not `{other}`"))),
+    }
 }
 
-/// Conversation options. The session stores no per-option flags yet, so the command validates and reports
-/// the requested state for the UI to apply.
-fn conversation_settings(_s: &mut Session, p: &Value) -> CmdResult {
+/// Conversation Settings of the selected folder: sets `setting` to `on` (default: toggles it).
+fn conversation_settings(s: &mut Session, p: &Value) -> CmdResult {
     let setting = req_str(p, "setting")?;
-    const SETTINGS: [&str; 4] = ["fromOtherFolders", "sendersAboveSubject", "alwaysExpand", "classicIndent"];
-    let Some(name) = SETTINGS.iter().find(|n| n.eq_ignore_ascii_case(setting.trim())) else {
+    let Some(name) = ConversationSettings::canonical(setting) else {
         return Err(CmdError::Params(format!("unknown conversation setting `{setting}`")));
     };
-    let on = opt_bool(p, "on").ok_or_else(|| CmdError::Params("`on` (bool) required".into()))?;
-    Ok(json!({ "setting": name, "on": on }))
+    let folder = current_folder(s, &Value::Null)?;
+    let mut st = conversation_state(s, folder);
+    let on = match p.get("on") {
+        None | Some(Value::Null) => !st.settings.get(name).unwrap_or(false),
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(CmdError::Params("`on` must be true or false".into())),
+    };
+    st.settings.set(name, on);
+    store_conversation_state(s, folder, &st);
+    Ok(json!({ "setting": name, "on": on, "settings": st.settings }))
+}
+
+/// Expands or collapses the conversation of message `id` (default: the focused, else first selected
+/// message). Collapsing the selected conversation moves the focus to its header message and keeps it
+/// collapsed while that message keeps the focus; expanding a conversation that is not selected keeps it
+/// open after the selection leaves.
+fn set_conversation(s: &mut Session, p: &Value, collapse: bool) -> CmdResult {
+    let folder = current_folder(s, &Value::Null)?;
+    if !settings(s, folder).conversations {
+        return Err(CmdError::Disabled("Show as Conversations is off".into()));
+    }
+    let target = match p.get("id").filter(|v| !v.is_null()) {
+        Some(v) => ItemId(
+            v.as_u64()
+                .ok_or_else(|| CmdError::Params("`id` must be a message id (non-negative integer)".into()))?,
+        ),
+        None => s
+            .selection
+            .focus
+            .or_else(|| s.selection.items.first().copied())
+            .ok_or_else(|| CmdError::Disabled("no conversation is selected".into()))?,
+    };
+    let conv = crate::queries::conversation_of(s, target)
+        .ok_or_else(|| CmdError::Params(format!("message {} is not in this view", target.0)))?;
+    let key = format!("{:016x}", conv.key);
+    if !conv.is_thread() {
+        return Ok(json!({ "conversation": key, "expanded": false, "messages": 1 }));
+    }
+    let mut st = conversation_state(s, folder);
+    let focus_in = s.selection.focus.is_some_and(|f| conv.contains(f));
+    if collapse {
+        st.expanded.remove(&conv.key);
+        if focus_in {
+            if s.selection.focus != Some(conv.header) {
+                s.selection.items = vec![conv.header];
+                s.selection.focus = Some(conv.header);
+            }
+            st.collapsed = Some((conv.key, conv.header));
+        }
+    } else {
+        if st.collapsed.is_some_and(|(k, _)| k == conv.key) {
+            st.collapsed = None;
+        }
+        if !focus_in {
+            st.expanded.insert(conv.key);
+        }
+    }
+    store_conversation_state(s, folder, &st);
+    let expanded = crate::queries::conversation_of(s, conv.header).is_some_and(|c| c.expanded);
+    Ok(json!({
+        "conversation": key,
+        "expanded": expanded,
+        "messages": conv.items.len(),
+        "header": conv.header.0,
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Conversation view state
+//
+// Interim storage until `ViewSettings` carries the Conversation Settings and `ViewState` the per-folder
+// expansion state: both live in `ViewState::collapsed_groups` as reserved entries starting with
+// `CONV_MARK` (a control character no group label produced by the list starts with). Group code skips
+// them through [`is_group_label`].
+
+const CONV_MARK: &str = "\u{1}conv.";
+/// Most conversations remembered as expanded by hand per folder.
+const MAX_EXPANDED: usize = 1_000;
+
+/// Conversation view state of one folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConversationState {
+    pub settings: ConversationSettings,
+    /// Conversations expanded by hand (they stay expanded when the selection leaves them).
+    pub expanded: BTreeSet<u64>,
+    /// The selected conversation collapsed by hand: (conversation key, message focused then). It stays
+    /// collapsed while that message keeps the focus.
+    pub collapsed: Option<(u64, ItemId)>,
+}
+
+/// True for real group labels in `ViewState::collapsed_groups` (false for conversation state entries).
+pub fn is_group_label(entry: &str) -> bool {
+    !entry.starts_with(CONV_MARK)
+}
+
+fn is_setting(entry: &str) -> bool {
+    entry.strip_prefix(CONV_MARK).is_some_and(|r| r.starts_with("set:"))
+}
+
+/// Conversation Settings and expansion state of `folder`.
+pub fn conversation_state(s: &Session, folder: FolderId) -> ConversationState {
+    let mut st = ConversationState::default();
+    for e in s.view.collapsed_groups.get(&folder).into_iter().flatten() {
+        let Some(rest) = e.strip_prefix(CONV_MARK) else { continue };
+        if let Some((name, value)) = rest.strip_prefix("set:").and_then(|kv| kv.split_once('=')) {
+            st.settings.set(name, value == "1");
+        } else if let Some(k) = rest.strip_prefix("open:").and_then(|k| u64::from_str_radix(k, 16).ok()) {
+            st.expanded.insert(k);
+        } else if let Some((k, i)) = rest.strip_prefix("shut:").and_then(|kv| kv.split_once(':'))
+            && let (Ok(k), Ok(i)) = (u64::from_str_radix(k, 16), i.parse::<u64>())
+        {
+            st.collapsed = Some((k, ItemId(i)));
+        }
+    }
+    st
+}
+
+fn store_conversation_state(s: &mut Session, folder: FolderId, st: &ConversationState) {
+    let defaults = ConversationSettings::default();
+    let list = s.view.collapsed_groups.entry(folder).or_default();
+    list.retain(|e| is_group_label(e));
+    for name in ConversationSettings::NAMES {
+        if let Some(on) = st.settings.get(name).filter(|on| Some(*on) != defaults.get(name)) {
+            list.push(format!("{CONV_MARK}set:{name}={}", u8::from(on)));
+        }
+    }
+    // Newest keys are not known; keep the largest set allowed (BTreeSet order) when over the cap.
+    for k in st.expanded.iter().take(MAX_EXPANDED) {
+        list.push(format!("{CONV_MARK}open:{k:016x}"));
+    }
+    if let Some((k, i)) = st.collapsed {
+        list.push(format!("{CONV_MARK}shut:{k:016x}:{}", i.0));
+    }
+    if list.is_empty() {
+        s.view.collapsed_groups.remove(&folder);
+    }
 }
 
 fn message_preview(s: &mut Session, p: &Value) -> CmdResult {

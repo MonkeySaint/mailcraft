@@ -97,7 +97,7 @@ impl Dsu {
 
 /// Message ids are compared without brackets and surrounding whitespace (case kept: the local part is
 /// case-sensitive).
-fn norm_id(id: &str) -> &str {
+pub fn norm_id(id: &str) -> &str {
     id.trim().trim_start_matches('<').trim_end_matches('>').trim()
 }
 
@@ -180,4 +180,173 @@ pub fn thread(items: &[&MailItem]) -> Vec<Conversation> {
         .collect();
     out.sort_by(|a, b| b.latest.unix.cmp(&a.latest.unix).then_with(|| b.items.first().cmp(&a.items.first())));
     out
+}
+
+/// Conversation Settings of a folder view (View › Messages › Conversation Settings). Defaults: messages
+/// from other folders and senders above the subject on, the other two off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConversationSettings {
+    /// Show Messages from Other Folders (e.g. your replies in Sent Items) inside the conversation.
+    pub from_other_folders: bool,
+    /// Show Senders Above the Subject on the conversation header.
+    pub senders_above_subject: bool,
+    /// Always Expand Selected Conversation (the selected conversation cannot be collapsed).
+    pub always_expand: bool,
+    /// Use Classic Indented View (children oldest first, indented by reply depth).
+    pub classic_indent: bool,
+}
+
+impl Default for ConversationSettings {
+    fn default() -> Self {
+        ConversationSettings {
+            from_other_folders: true,
+            senders_above_subject: true,
+            always_expand: false,
+            classic_indent: false,
+        }
+    }
+}
+
+impl ConversationSettings {
+    /// Setting names as the `view.conversationSettings` command takes them.
+    pub const NAMES: [&'static str; 4] =
+        ["fromOtherFolders", "sendersAboveSubject", "alwaysExpand", "classicIndent"];
+
+    /// Canonical name for `name` (case-insensitive), if it is a setting.
+    pub fn canonical(name: &str) -> Option<&'static str> {
+        Self::NAMES.iter().copied().find(|n| n.eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// Value of the setting `name` (any case).
+    pub fn get(&self, name: &str) -> Option<bool> {
+        Some(match Self::canonical(name)? {
+            "fromOtherFolders" => self.from_other_folders,
+            "sendersAboveSubject" => self.senders_above_subject,
+            "alwaysExpand" => self.always_expand,
+            _ => self.classic_indent,
+        })
+    }
+
+    /// Sets the setting `name` (any case); false when the name is unknown.
+    pub fn set(&mut self, name: &str, on: bool) -> bool {
+        let slot = match Self::canonical(name) {
+            Some("fromOtherFolders") => &mut self.from_other_folders,
+            Some("sendersAboveSubject") => &mut self.senders_above_subject,
+            Some("alwaysExpand") => &mut self.always_expand,
+            Some(_) => &mut self.classic_indent,
+            None => return false,
+        };
+        *slot = on;
+        true
+    }
+}
+
+/// Deepest indent the reply tree reports (deeper replies stay at this level).
+pub const MAX_REPLY_DEPTH: usize = 32;
+
+/// Classic indented order of one conversation's `items`: a reply sits under the message it answers
+/// (In-Reply-To, else the nearest References entry that is a member), siblings and roots oldest first.
+/// Returns `(item, depth)` in display order; roots have depth 0. A parent must be older than its reply
+/// (ties broken by id), so loops in hostile headers cannot form.
+pub fn reply_tree(items: &[&MailItem]) -> Vec<(ItemId, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut items: Vec<&MailItem> = items.iter().copied().filter(|m| seen.insert(m.id)).collect();
+    // Oldest first: the order roots and siblings take.
+    items.sort_by(|a, b| a.received.unix.cmp(&b.received.unix).then(a.id.cmp(&b.id)));
+    let mut by_id: HashMap<&str, usize> = HashMap::new();
+    for (i, m) in items.iter().enumerate() {
+        if let Some(id) = m.message_id.as_deref().map(norm_id).filter(|s| !s.is_empty()) {
+            by_id.entry(id).or_insert(i);
+        }
+    }
+    let n = items.len();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, m) in items.iter().enumerate() {
+        let parent = m
+            .in_reply_to
+            .iter()
+            .rev()
+            .chain(m.references.iter().rev())
+            .filter_map(|r| by_id.get(norm_id(r)).copied())
+            // Sorted oldest first, so an older parent has a smaller index.
+            .find(|&j| j < i);
+        match parent.and_then(|j| children.get_mut(j)) {
+            Some(list) => list.push(i),
+            None => roots.push(i),
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut stack: Vec<(usize, usize)> = roots.into_iter().rev().map(|r| (r, 0)).collect();
+    while let Some((i, depth)) = stack.pop() {
+        let Some(m) = items.get(i) else { continue };
+        out.push((m.id, depth.min(MAX_REPLY_DEPTH)));
+        if let Some(kids) = children.get(i) {
+            let next = depth.saturating_add(1);
+            stack.extend(kids.iter().rev().map(|&k| (k, next)));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod conversation_view_tests {
+    use super::*;
+    use crate::DateTime;
+
+    fn msg(id: u64, subject: &str, mid: &str, parent: &[&str], t: i64) -> MailItem {
+        MailItem {
+            id: ItemId(id),
+            subject: subject.into(),
+            message_id: (!mid.is_empty()).then(|| mid.to_string()),
+            in_reply_to: parent.last().map(|p| vec![p.to_string()]).unwrap_or_default(),
+            references: parent.iter().map(|p| p.to_string()).collect(),
+            received: DateTime { unix: t, offset_min: 0 },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reply_tree_indents_by_reply_depth() {
+        let a = msg(1, "Plan", "a@x", &[], 100);
+        let b = msg(2, "RE: Plan", "b@x", &["a@x"], 200);
+        let c = msg(3, "RE: Plan", "c@x", &["a@x", "b@x"], 300);
+        let d = msg(4, "FW: Plan", "d@x", &["a@x"], 250);
+        let lone = msg(5, "FW: Plan", "", &[], 400);
+        let tree = reply_tree(&[&c, &lone, &b, &d, &a]);
+        let ids: Vec<(u64, usize)> = tree.iter().map(|(i, d)| (i.0, *d)).collect();
+        assert_eq!(ids, vec![(1, 0), (2, 1), (3, 2), (4, 1), (5, 0)]);
+    }
+
+    #[test]
+    fn reply_tree_survives_loops_and_duplicates() {
+        // Each claims to answer the other: the older one becomes the root.
+        let a = msg(1, "x", "a@x", &["b@x"], 100);
+        let b = msg(2, "x", "b@x", &["a@x"], 200);
+        let tree = reply_tree(&[&a, &b, &a]);
+        assert_eq!(tree, vec![(ItemId(1), 0), (ItemId(2), 1)]);
+        assert!(reply_tree(&[]).is_empty());
+    }
+
+    #[test]
+    fn forward_without_references_joins_original() {
+        let a = msg(1, "Budget", "a@x", &[], 100);
+        let fw = msg(2, "FW: budget", "", &[], 200);
+        let convs = thread(&[&a, &fw]);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs.first().map(|c| c.topic.as_str()), Some("Budget"));
+    }
+
+    #[test]
+    fn settings_by_name() {
+        let mut s = ConversationSettings::default();
+        assert_eq!(s.get("FromOtherFolders"), Some(true));
+        assert_eq!(s.get("classicIndent"), Some(false));
+        assert!(s.set("alwaysexpand", true));
+        assert!(s.always_expand);
+        assert!(!s.set("nope", true));
+        assert_eq!(s.get("nope"), None);
+        assert_eq!(ConversationSettings::canonical(" CLASSICINDENT "), Some("classicIndent"));
+    }
 }

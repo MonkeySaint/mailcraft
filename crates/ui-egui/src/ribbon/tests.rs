@@ -580,3 +580,73 @@ fn compose_read_search_and_module_ribbons_render() {
         }
     }
 }
+
+/// View › Show as Conversations asks This folder / All mailboxes before it changes anything
+/// (`plan/outlook/reply-forward.md` › Conversation view), like the list's Current View menu.
+#[test]
+fn show_as_conversations_asks_for_the_scope() {
+    use egui_kittest::kittest::Queryable;
+    for simplified in [false, true] {
+        let mut app = App::new(mailcraft_engine::sample::sample_session());
+        app.s.view.simplified_ribbon = simplified;
+        app.ui.ribbon_tab.insert("main".into(), "View".into());
+        let folder = app.s.selection.folder;
+        let before = mailcraft_engine::queries::view_settings(&app.s, folder).conversations;
+        let mut h = harness(app, Surface::Main, 1920.0);
+        h.run();
+        if simplified {
+            // Simplified: View › Current View ▾ › Show as Conversations.
+            h.get_by_label("Current View").click();
+            h.run();
+        }
+        h.get_by_label("Show as Conversations").click();
+        h.run();
+        let app = h.state();
+        assert_eq!(
+            mailcraft_engine::queries::view_settings(&app.s, folder).conversations,
+            before,
+            "nothing changes before the answer (simplified={simplified})"
+        );
+        assert!(crate::list::conversation_scope_pending(&h.ctx), "the scope question is up ({simplified})");
+    }
+}
+
+/// View › Conversation Settings shows the selected folder's settings as the engine keeps them (also after
+/// they change elsewhere, e.g. from the list's context menu or in another folder), not remembered clicks.
+#[test]
+fn conversation_settings_menu_follows_the_engine() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    app.run("view.conversations", serde_json::json!({"on": true, "scope": "all"}));
+    let mem = state::Mem::default();
+    let items = defs().menu("conversationSettings").unwrap();
+    let checks = |app: &App| -> Vec<(String, Option<bool>)> {
+        state::expand_items(app, Surface::Main, &mem, items)
+            .into_iter()
+            .filter_map(|r| match r {
+                state::Resolved::Cmd { label, on, .. } => Some((label, on)),
+                _ => None,
+            })
+            .collect()
+    };
+    let on_of = |app: &App, label: &str| checks(app).into_iter().find(|(l, _)| l == label).and_then(|c| c.1);
+    assert_eq!(on_of(&app, "Show Messages from Other Folders"), Some(true));
+    assert_eq!(on_of(&app, "Use Classic Indented View"), Some(false));
+    // Changed outside the ribbon: the menu follows.
+    app.run("view.conversationSettings", serde_json::json!({"setting": "classicIndent", "on": true}));
+    app.run("view.conversationSettings", serde_json::json!({"setting": "fromOtherFolders", "on": false}));
+    assert_eq!(on_of(&app, "Use Classic Indented View"), Some(true));
+    assert_eq!(on_of(&app, "Show Messages from Other Folders"), Some(false));
+    assert!(state::is_on(&app, Surface::Main, &mem, "conv:classicIndent"));
+    // The click sends the opposite of what the engine has.
+    let classic = state::expand_items(&app, Surface::Main, &mem, items)
+        .into_iter()
+        .find_map(|r| match r {
+            state::Resolved::Cmd { label, action, .. } if label == "Use Classic Indented View" => {
+                Some(action)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(classic.params["on"], serde_json::json!(false));
+    assert_eq!(classic.flip, None);
+}

@@ -7,6 +7,12 @@
 //! list). Rows are virtualised: only the rows inside the viewport are laid out and painted, and the row
 //! model from `queries::list_rows` is cached until the session changes, so thousands of items scroll
 //! smoothly. All changes go through [`App::run`].
+//!
+//! Conversation view (`plan/outlook/reply-forward.md` › Conversation view): a conversation is a header row
+//! (◢ expanded / ▷ collapsed glyph, senders, subject without prefixes, unread count, latest time) followed,
+//! when expanded, by indented compact child rows (sender + time, preview below); messages from other
+//! folders are dimmed with their folder name in italics. Left / Right collapse / expand the focused
+//! conversation. Turning Show as Conversations on or off asks for the scope ([`ask_conversation_scope`]).
 
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
@@ -19,7 +25,7 @@ use egui::{
     Ui, UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
 };
 use mailcraft_engine::Session;
-use mailcraft_engine::queries::{self, ItemRow, ListRow};
+use mailcraft_engine::queries::{self, ConversationRow, ItemRow, ListRow};
 use mailcraft_model::{
     ArrangeBy, FlagState, FocusClass, FolderRole, ListFilter, ReadingPanePos, SortOrder, ViewLayout,
     ViewSettings,
@@ -111,6 +117,22 @@ impl Text {
             overflow_character: Some('…'),
         };
         Text { galley: ui.painter().layout_job(job), faux_bold }
+    }
+
+    /// One line of italic text within `max_w`, elided with "…".
+    pub(crate) fn italic(ui: &Ui, text: &str, size: f32, color: Color32, max_w: f32) -> Text {
+        let clean: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let mut job = LayoutJob::single_section(
+            clean,
+            TextFormat { font_id: FontId::proportional(size), color, italics: true, ..Default::default() },
+        );
+        job.wrap = TextWrapping {
+            max_width: max_w.max(1.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        Text { galley: ui.painter().layout_job(job), faux_bold: false }
     }
 
     pub(crate) fn width(&self) -> f32 {
@@ -316,6 +338,24 @@ fn item_height(mode: Mode, preview_lines: u8, tighter: bool) -> f32 {
     }
 }
 
+/// Width of the conversation glyph column (◢ / ▷) in compact rows.
+const GLYPH_W: f32 = 14.0;
+/// Extra indent per reply level of a conversation child row (Classic Indented View), up to `MAX_INDENT`.
+const INDENT: f32 = 14.0;
+const MAX_INDENT: u8 = 6;
+
+/// Height of a conversation child row: compact rows put sender and time on one line with the preview
+/// below; the column layout keeps its usual rows.
+fn child_height(mode: Mode, preview_lines: u8, tighter: bool) -> f32 {
+    match mode {
+        Mode::Compact => {
+            let pad = if tighter { 6.0 } else { 12.0 };
+            pad + LINE1 + LINE * f32::from(preview_lines.min(3))
+        }
+        Mode::Columns { .. } => item_height(mode, preview_lines, tighter),
+    }
+}
+
 /// Message list columns (column layout).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Col {
@@ -460,6 +500,73 @@ pub fn message_list(ui: &mut Ui, app: &mut App, frame: &Frame) {
     drag_preview(ui, app);
     ui.advance_cursor_after_rect(full);
     ctx.data_mut(|d| d.insert_temp(state_id(), st));
+    conversation_scope_prompt(&ctx, app);
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// Show as Conversations: scope question.
+
+/// Pending scope question: the Show as Conversations state the answer switches to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScopePrompt {
+    on: bool,
+}
+
+fn scope_prompt_id() -> Id {
+    Id::new("mailcraft.list.convscope")
+}
+
+/// Asks whether Show as Conversations changes for this folder or for all mailboxes before toggling it
+/// (`plan/outlook/reply-forward.md` › Conversation view). The answer runs `view.conversations` with
+/// `{"on", "scope": "folder" | "all"}`; Cancel changes nothing. Surfaces offering Show as Conversations
+/// call this instead of running the command directly.
+pub fn ask_conversation_scope(ctx: &egui::Context, app: &App) {
+    let on = !queries::view_settings(&app.s, app.s.selection.folder).conversations;
+    ctx.data_mut(|d| d.insert_temp(scope_prompt_id(), ScopePrompt { on }));
+    ctx.request_repaint();
+}
+
+/// The scope question is showing.
+pub fn conversation_scope_pending(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<ScopePrompt>(scope_prompt_id())).is_some()
+}
+
+/// Draws the scope question while it is pending ([`message_list`] calls this every frame).
+pub fn conversation_scope_prompt(ctx: &egui::Context, app: &mut App) {
+    let Some(p) = ctx.data(|d| d.get_temp::<ScopePrompt>(scope_prompt_id())) else { return };
+    // Some(Some(scope)) = answered, Some(None) = cancelled.
+    let mut choice: Option<Option<&str>> = None;
+    let modal = egui::Modal::new(Id::new("mailcraft.list.convscope.modal")).show(ctx, |ui| {
+        ui.set_max_width(360.0);
+        let text = if p.on {
+            "Arrange messages by conversation in:"
+        } else {
+            "Stop arranging messages by conversation in:"
+        };
+        ui.label(text);
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button("This folder").clicked() {
+                choice = Some(Some("folder"));
+            }
+            if ui.button("All mailboxes").clicked() {
+                choice = Some(Some("all"));
+            }
+            if ui.button("Cancel").clicked() {
+                choice = Some(None);
+            }
+        });
+    });
+    if choice.is_none() && modal.should_close() {
+        choice = Some(None);
+    }
+    if let Some(answer) = choice {
+        ctx.data_mut(|d| d.remove::<ScopePrompt>(scope_prompt_id()));
+        if let Some(scope) = answer {
+            app.run("view.conversations", json!({ "on": p.on, "scope": scope }));
+        }
+        ctx.request_repaint();
+    }
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -691,20 +798,20 @@ fn body(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode, st: &mut
     bg.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, "Message list"));
 
     let item_h = item_height(mode, c.vs.preview_lines, c.vs.tighter_spacing);
+    let child_h = child_height(mode, c.vs.preview_lines, c.vs.tighter_spacing);
+    let row_h = |r: &ListRow| match r {
+        ListRow::Group { .. } => size::GROUP_HEADER,
+        ListRow::Item(it) if it.conversation.as_ref().is_some_and(|c| !c.header) => child_h,
+        ListRow::Item(_) => item_h,
+    };
     let mut starts: Vec<f32> = Vec::with_capacity(rows.len());
     let mut y = 0.0_f32;
     for r in rows.iter() {
         starts.push(y);
-        y += match r {
-            ListRow::Group { .. } => size::GROUP_HEADER,
-            ListRow::Item(_) => item_h,
-        };
+        y += row_h(r);
     }
     let total = y;
-    let height_of = |i: usize| match rows.get(i) {
-        Some(ListRow::Group { .. }) => size::GROUP_HEADER,
-        _ => item_h,
-    };
+    let height_of = |i: usize| rows.get(i).map_or(item_h, row_h);
 
     // Keyboard (before drawing so the scroll-into-view below sees the new focus next frame).
     if focused {
@@ -759,6 +866,8 @@ fn keyboard(ui: &mut Ui, app: &mut App, c: &Cached, st: &ListState) {
         PageDown,
         PageUp,
         Open,
+        Collapse,
+        Expand,
     }
     let mut keys: Vec<(K, bool)> = Vec::new();
     ui.input_mut(|i| {
@@ -780,6 +889,14 @@ fn keyboard(ui: &mut Ui, app: &mut App, c: &Cached, st: &ListState) {
         if i.consume_key(Modifiers::NONE, Key::Enter) {
             keys.push((K::Open, false));
         }
+        if c.vs.conversations {
+            if i.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+                keys.push((K::Collapse, false));
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowRight) {
+                keys.push((K::Expand, false));
+            }
+        }
     });
     for (k, shift) in keys {
         match k {
@@ -796,6 +913,17 @@ fn keyboard(ui: &mut Ui, app: &mut App, c: &Cached, st: &ListState) {
                     run(ui, app, "mail.open", json!({}));
                 }
             }
+            K::Collapse | K::Expand => {
+                let collapse = matches!(k, K::Collapse);
+                let target = app.s.selection.focus.and_then(|f| queries::conversation_of(&app.s, f));
+                if let Some(conv) = target
+                    && conv.is_thread()
+                    && conv.expanded == collapse
+                {
+                    let id = if collapse { "view.collapseGroup" } else { "view.expandGroup" };
+                    run(ui, app, id, json!({ "conversation": true }));
+                }
+            }
         }
     }
 }
@@ -810,6 +938,9 @@ fn page(ui: &Ui, app: &mut App, c: &Cached, delta: isize, extend: bool) {
             ListRow::Group { .. } => None,
         })
         .collect();
+    // A conversation header and its first child are the same message.
+    let mut seen = std::collections::BTreeSet::new();
+    let ids: Vec<u64> = ids.into_iter().filter(|i| seen.insert(*i)).collect();
     if ids.is_empty() {
         return;
     }
@@ -878,18 +1009,27 @@ fn item_row(
 ) {
     let th = app.theme.clone();
     let id = row.id.0;
-    let resp = ui.interact(r, Id::new(("mailcraft.list.row", id)), Sense::click_and_drag());
+    // A conversation header shows the same message as its first child row: give it its own widget ids.
+    let part: u8 = if row.conversation.as_ref().is_some_and(|c| c.header) { 1 } else { 0 };
+    let resp = ui.interact(r, Id::new(("mailcraft.list.row", id, part)), Sense::click_and_drag());
     let hovered = resp.contains_pointer() && !egui::DragAndDrop::has_any_payload(ui.ctx());
-    if hovered {
-        app.ui.hover_row = Some(id);
-    } else if app.ui.hover_row == Some(id) {
-        app.ui.hover_row = None;
+    // The hovered message for hover shortcuts; header rows leave it to the message's own (child) row.
+    if part == 0 {
+        if hovered {
+            app.ui.hover_row = Some(id);
+        } else if app.ui.hover_row == Some(id) {
+            app.ui.hover_row = None;
+        }
     }
     let painter = ui.painter().clone();
+    let conv = row.conversation.as_ref();
     let fill = if row.selected {
         Some(th.selected)
     } else if hovered {
         Some(th.hover)
+    } else if conv.is_some_and(|c| c.header && c.contains_selection) {
+        // Expanded selected conversation: the child row carries the selection, the header a light tint.
+        Some(th.selected.gamma_multiply(0.45))
     } else if row.flagged {
         Some(th.flagged_row)
     } else {
@@ -902,9 +1042,16 @@ fn item_row(
         let bar = Rect::from_min_size(r.min + vec2(0.0, 1.0), vec2(size::UNREAD_BAR, r.height() - 2.0));
         painter.rect_filled(bar, 0.0, th.unread);
     }
-    let slots = match mode {
-        Mode::Compact => paint_compact(ui, app, r, row, hovered, c.vs.preview_lines, c.vs.tighter_spacing),
-        Mode::Columns { preview } => paint_columns(ui, app, c, r, row, hovered, preview, st),
+    let (preview_lines, tighter) = (c.vs.preview_lines, c.vs.tighter_spacing);
+    let (slots, glyph) = match (mode, conv) {
+        (Mode::Compact, Some(cv)) if cv.header => {
+            paint_conversation_header(ui, app, r, row, cv, hovered, preview_lines, tighter)
+        }
+        (Mode::Compact, Some(cv)) => {
+            (paint_child(ui, app, r, row, cv, hovered, preview_lines, tighter), None)
+        }
+        (Mode::Compact, None) => (paint_compact(ui, app, r, row, hovered, preview_lines, tighter, 0.0), None),
+        (Mode::Columns { preview }, _) => paint_columns(ui, app, c, r, row, hovered, preview, st),
     };
     painter.line_segment(
         [pos2(r.left() + 8.0, r.bottom() - 0.5), pos2(r.right(), r.bottom() - 0.5)],
@@ -912,7 +1059,10 @@ fn item_row(
     );
 
     // Quick actions sit on top of the row (added after it, so they take the click).
-    let flag_resp = ui.interact(slots.flag, Id::new(("mailcraft.list.flag", id)), Sense::click());
+    if let (Some(g), Some(cv)) = (glyph, conv) {
+        conversation_glyph(ui, app, g, row, cv);
+    }
+    let flag_resp = ui.interact(slots.flag, Id::new(("mailcraft.list.flag", id, part)), Sense::click());
     let flag_tip = if row.flag_complete {
         "Clear flag"
     } else if row.flagged {
@@ -934,7 +1084,7 @@ fn item_row(
         run_on_items(ui, app, "mail.flag", &[id], params);
     }
     if let Some(del) = slots.delete {
-        let del_resp = ui.interact(del, Id::new(("mailcraft.list.delete", id)), Sense::click());
+        let del_resp = ui.interact(del, Id::new(("mailcraft.list.delete", id, part)), Sense::click());
         if del_resp.hovered() {
             painter.rect_stroke(
                 del.shrink(1.0),
@@ -968,6 +1118,15 @@ fn item_row(
             "nav.selectItem",
             json!({ "id": id, "toggle": m.command, "extend": m.shift && !m.command }),
         );
+        // Clicking a conversation header selects the conversation, which shows it expanded (also after it
+        // was collapsed by hand while selected).
+        if conv.is_some_and(|cv| cv.header)
+            && !m.command
+            && !m.shift
+            && queries::conversation_of(&app.s, row.id).is_some_and(|cv| cv.is_thread() && !cv.expanded)
+        {
+            run(ui, app, "view.expandGroup", json!({ "conversation": true, "id": id }));
+        }
         if frame.single_pane && !m.command && !m.shift {
             app.ui.single_pane_reading = true;
         }
@@ -977,7 +1136,146 @@ fn item_row(
     }
     let accessible = row.accessible.trim_end_matches([',', ' ']).to_owned();
     resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, row.selected, &accessible));
-    resp.context_menu(|ui| crate::menus::message_row_menu(ui, app, id));
+    if conv.is_some_and(|cv| cv.header) {
+        resp.context_menu(|ui| crate::menus::conversation_menu(ui, app, id));
+    } else {
+        resp.context_menu(|ui| crate::menus::message_row_menu(ui, app, id));
+    }
+}
+
+/// ◢ (expanded) or ▷ (collapsed) conversation glyph centred at `c`.
+fn paint_conversation_glyph(painter: &Painter, c: Pos2, expanded: bool, color: Color32) {
+    let h = 4.0;
+    if expanded {
+        let pts = vec![pos2(c.x + h, c.y - h), pos2(c.x + h, c.y + h), pos2(c.x - h, c.y + h)];
+        painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+    } else {
+        let pts = vec![
+            pos2(c.x - h * 0.7, c.y - h * 1.1),
+            pos2(c.x + h * 0.9, c.y),
+            pos2(c.x - h * 0.7, c.y + h * 1.1),
+        ];
+        painter.add(egui::Shape::convex_polygon(pts, Color32::TRANSPARENT, Stroke::new(1.0, color)));
+    }
+}
+
+/// The glyph of a header row toggles the conversation without changing the selection.
+fn conversation_glyph(ui: &Ui, app: &mut App, g: Rect, row: &ItemRow, cv: &ConversationRow) {
+    let resp = ui.interact(g, Id::new(("mailcraft.list.convglyph", row.id.0)), Sense::click());
+    let label = if cv.expanded { "Collapse conversation" } else { "Expand conversation" };
+    if resp.hovered() {
+        ui.painter().rect_stroke(
+            g.shrink(1.0),
+            3.0,
+            Stroke::new(1.0, app.theme.separator),
+            egui::StrokeKind::Inside,
+        );
+    }
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    if resp.on_hover_text(label).clicked() {
+        let id = if cv.expanded { "view.collapseGroup" } else { "view.expandGroup" };
+        run(ui, app, id, json!({ "conversation": true, "id": row.id.0 }));
+    }
+}
+
+/// Compact conversation header: glyph column, then the usual three lines with the senders on line 1 and
+/// the subject (with the unread count) on line 2, or the other way round when Show Senders Above the
+/// Subject is off. Returns the slots and the glyph's rect.
+#[allow(clippy::too_many_arguments)]
+fn paint_conversation_header(
+    ui: &Ui,
+    app: &mut App,
+    r: Rect,
+    row: &ItemRow,
+    cv: &ConversationRow,
+    hovered: bool,
+    preview_lines: u8,
+    tighter: bool,
+) -> (Slots, Option<Rect>) {
+    let mut shown = row.clone();
+    if cv.unread > 0 {
+        shown.subject = format!("{} ({})", row.subject, cv.unread);
+    }
+    if !cv.senders_above_subject {
+        std::mem::swap(&mut shown.who, &mut shown.subject);
+    }
+    let slots = paint_compact(ui, app, r, &shown, hovered, preview_lines, tighter, GLYPH_W);
+    let pad = if tighter { 4.0 } else { 8.0 };
+    let center = pos2(r.left() + 12.0 + GLYPH_W / 2.0 - 2.0, r.top() + pad + LINE1 / 2.0);
+    paint_conversation_glyph(ui.painter(), center, cv.expanded, app.theme.text_muted);
+    (slots, Some(Rect::from_center_size(center, vec2(18.0, 20.0))))
+}
+
+/// Compact child row of a conversation: sender (dimmed, with the folder name in italics, for messages
+/// from other folders) and time on one line, the preview below; indented under the header.
+#[allow(clippy::too_many_arguments)]
+fn paint_child(
+    ui: &Ui,
+    app: &mut App,
+    r: Rect,
+    row: &ItemRow,
+    cv: &ConversationRow,
+    hovered: bool,
+    preview_lines: u8,
+    tighter: bool,
+) -> Slots {
+    let th = app.theme.clone();
+    let painter = ui.painter().clone();
+    let pad = if tighter { 3.0 } else { 6.0 };
+    let depth = row.conversation_depth.clamp(1, MAX_INDENT);
+    let left = r.left() + 12.0 + GLYPH_W + INDENT * f32::from(depth);
+    let right = r.right() - 8.0;
+    let line1 = Rect::from_min_max(pos2(left, r.top() + pad), pos2(right, r.top() + pad + LINE1));
+    let other = cv.other_folder.as_deref();
+    let flag = Rect::from_min_size(pos2(right - 19.0, line1.center().y - 10.0), vec2(19.0, 20.0));
+    paint_flag(ui, &mut app.icons, &th, row, flag, hovered);
+    let mut icons_left = flag.left();
+    let delete = if hovered {
+        let d = Rect::from_min_size(pos2(icons_left - 21.0, flag.top()), vec2(19.0, 20.0));
+        app.icons.paint(ui, icon_rect(d.center(), 14.0), "delete", th.text_muted);
+        icons_left = d.left();
+        Some(d)
+    } else {
+        None
+    };
+    icons_left = paint_status_icons(ui, app, row, line1, icons_left - 2.0);
+    let time_color = if row.unread { th.unread } else { th.text_muted };
+    let time = Text::new(ui, &row.time, 12.0, row.unread, time_color, 120.0, 1);
+    let time_left = time.paint_right(&painter, line1, icons_left - 4.0);
+    let who_color = if other.is_some() {
+        th.text_muted
+    } else if row.unread {
+        th.unread
+    } else {
+        th.text
+    };
+    let mut x = left;
+    if row.draft_marker {
+        let t = Text::new(ui, "[Draft]", 13.5, false, th.draft, 60.0, 1);
+        x = t.paint_left(&painter, line1, x) + 5.0;
+    }
+    let room = (time_left - x - 8.0).max(1.0);
+    let who = Text::new(
+        ui,
+        &row.who,
+        13.5,
+        row.unread,
+        who_color,
+        room * if other.is_some() { 0.6 } else { 1.0 },
+        1,
+    );
+    let end = who.paint_left(&painter, line1, x);
+    if let Some(folder) = other {
+        let t = Text::italic(ui, folder, 12.0, th.text_muted, (time_left - end - 14.0).max(1.0));
+        t.paint_left(&painter, line1, end + 8.0);
+    }
+    let lines = usize::from(preview_lines.min(3));
+    if lines > 0 && !row.preview.trim().is_empty() {
+        let color = if other.is_some() { th.text_muted.gamma_multiply(0.8) } else { th.text_muted };
+        let t = Text::new(ui, row.preview.trim(), 12.5, false, color, (right - left).max(1.0), lines);
+        t.paint(&painter, pos2(left, line1.bottom() + 1.0));
+    }
+    Slots { flag, delete }
 }
 
 /// Line-1 status icons (right to left after the flag slot): categories, importance, attachment.
@@ -1032,6 +1330,7 @@ fn paint_flag(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_compact(
     ui: &Ui,
     app: &mut App,
@@ -1040,11 +1339,12 @@ fn paint_compact(
     hovered: bool,
     preview_lines: u8,
     tighter: bool,
+    extra_left: f32,
 ) -> Slots {
     let th = app.theme.clone();
     let painter = ui.painter().clone();
     let pad = if tighter { 4.0 } else { 8.0 };
-    let left = r.left() + 12.0 + 16.0 * f32::from(row.conversation_depth.min(4));
+    let left = r.left() + 12.0 + extra_left;
     let right = r.right() - 8.0;
     let line1 = Rect::from_min_max(pos2(left, r.top() + pad), pos2(right, r.top() + pad + LINE1));
     let line2 = Rect::from_min_max(pos2(left, line1.bottom()), pos2(right, line1.bottom() + LINE));
@@ -1108,19 +1408,37 @@ fn paint_columns(
     hovered: bool,
     preview: u8,
     st: &mut ListState,
-) -> Slots {
+) -> (Slots, Option<Rect>) {
     let th = app.theme.clone();
     let painter = ui.painter().clone();
     let line_h = if c.vs.tighter_spacing { COL_ROW - 4.0 } else { COL_ROW };
     let line = Rect::from_min_size(r.min, vec2(r.width(), line_h));
     let mail = app.s.mailbox.mail.get(&row.id);
-    let text_color = if row.unread { th.unread } else { th.text };
+    let conv = row.conversation.as_ref();
+    let header = conv.is_some_and(|cv| cv.header);
+    let other = conv.is_some_and(|cv| cv.other_folder.is_some());
+    let indent = conv
+        .filter(|cv| !cv.header)
+        .map_or(0.0, |_| INDENT * f32::from(row.conversation_depth.clamp(1, MAX_INDENT)));
+    let mut glyph = None;
+    let text_color = if other {
+        th.text_muted
+    } else if row.unread {
+        th.unread
+    } else {
+        th.text
+    };
     let mut flag = Rect::from_min_size(pos2(r.right() - 22.0, line.top()), vec2(19.0, line_h));
     let mut delete = None;
     for (col, x, w) in columns(r.width()) {
         let cell = Rect::from_min_size(pos2(r.left() + x, line.top()), vec2(w, line_h));
         let inner_w = (w - 10.0).max(1.0);
         match col {
+            Col::Importance if header => {
+                let center = cell.center();
+                paint_conversation_glyph(&painter, center, conv.is_some_and(|cv| cv.expanded), th.text_muted);
+                glyph = Some(Rect::from_center_size(center, vec2(18.0, line_h)));
+            }
             Col::Importance => {
                 if row.importance_high {
                     app.icons.paint(
@@ -1160,13 +1478,14 @@ fn paint_columns(
                 }
             }
             Col::From => {
-                let mut x = cell.left() + 6.0;
+                let mut x = cell.left() + 6.0 + indent;
                 if row.draft_marker {
                     let t = Text::new(ui, "[Draft]", 13.0, false, th.draft, inner_w, 1);
                     x = t.paint_left(&painter, cell, x) + 4.0;
                 }
+                let color = if other { th.text_muted } else { th.text };
                 let t =
-                    Text::new(ui, &row.who, 13.0, row.unread, th.text, (cell.right() - x - 4.0).max(1.0), 1);
+                    Text::new(ui, &row.who, 13.0, row.unread, color, (cell.right() - x - 4.0).max(1.0), 1);
                 t.paint_left(&painter, cell, x);
             }
             Col::Subject => {
@@ -1177,16 +1496,20 @@ fn paint_columns(
                     right = d.left() - 2.0;
                     delete = Some(d);
                 }
-                let t = Text::new(
-                    ui,
-                    &row.subject,
-                    13.0,
-                    row.unread,
-                    text_color,
-                    (right - cell.left() - 6.0).max(1.0),
-                    1,
+                let subject = match conv {
+                    Some(cv) if cv.header && cv.unread > 0 => format!("{} ({})", row.subject, cv.unread),
+                    _ => row.subject.clone(),
+                };
+                let room = (right - cell.left() - 6.0).max(1.0);
+                let end = Text::new(ui, &subject, 13.0, row.unread, text_color, room, 1).paint_left(
+                    &painter,
+                    cell,
+                    cell.left() + 6.0,
                 );
-                t.paint_left(&painter, cell, cell.left() + 6.0);
+                if let Some(folder) = conv.and_then(|cv| cv.other_folder.as_deref()) {
+                    let t = Text::italic(ui, folder, 12.0, th.text_muted, (right - end - 10.0).max(1.0));
+                    t.paint_left(&painter, cell, end + 8.0);
+                }
             }
             Col::Received => {
                 let color = if row.unread { th.unread } else { th.text_muted };
@@ -1256,7 +1579,7 @@ fn paint_columns(
         );
         t.paint(&painter, pos2(left, line.bottom() + 1.0));
     }
-    Slots { flag, delete }
+    (Slots { flag, delete }, glyph)
 }
 
 /// "Move N items" chip under the pointer while rows are dragged.
@@ -1472,5 +1795,168 @@ mod tests {
         assert_eq!(columns(400.0).len(), 7);
         assert_eq!(hex_color("#ff0000"), Color32::from_rgb(255, 0, 0));
         assert_eq!(hex_color("junk"), Color32::GRAY);
+    }
+
+    // ---- Conversation view ---------------------------------------------------------------------------------
+
+    /// Inbox with a four-message conversation (one reply in Sent Items, one forward) and two single messages,
+    /// conversations on. Returns the session and the ids (lone, reply b1, forward f1, sent s1, original a1).
+    fn conv_session() -> (Session, [u64; 5]) {
+        use mailcraft_model::{Address, DateTime, MailItem, Mailbox};
+        let now = 1_791_000_000;
+        let mut s = Session::new(Mailbox::new_local("Test"));
+        let acct = s.mailbox.accounts.first().map(|a| a.id).unwrap();
+        let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
+        let sent = s.mailbox.role_folder(acct, FolderRole::SentItems).unwrap();
+        s.selection.folder = inbox;
+        s.fixed_now = Some(DateTime { unix: now, offset_min: 0 });
+        let mut add = |folder, subject: &str, from: &str, mid: &str, refs: &[&str], ago: i64, read: bool| {
+            s.mailbox
+                .add_mail(MailItem {
+                    folder,
+                    subject: subject.into(),
+                    from: Some(Address {
+                        name: Some(from.into()),
+                        addr: format!("{}@example.com", from.to_lowercase()),
+                    }),
+                    message_id: Some(mid.into()),
+                    in_reply_to: refs.last().map(|r| vec![(*r).to_owned()]).unwrap_or_default(),
+                    references: refs.iter().map(|r| (*r).to_owned()).collect(),
+                    received: DateTime { unix: now - ago, offset_min: 0 },
+                    read,
+                    preview: format!("{subject} preview"),
+                    ..Default::default()
+                })
+                .0
+        };
+        let a1 = add(inbox, "Budget plan", "Alice", "a1@x", &[], 3 * 86_400, true);
+        let s1 = add(sent, "RE: Budget plan", "Me", "s1@x", &["a1@x"], 2 * 86_400, true);
+        let f1 = add(inbox, "FW: budget plan", "Carol", "f1@x", &[], 86_400, true);
+        let b1 = add(inbox, "RE: Budget plan", "Bob", "b1@x", &["a1@x", "s1@x"], 3_600, false);
+        let lone = add(inbox, "Lunch", "Dave", "l1@x", &[], 1_800, true);
+        add(inbox, "Old thing", "Eve", "o1@x", &[], 10 * 86_400, true);
+        s.run("view.conversations", &json!({})).unwrap();
+        (s, [lone, b1, f1, s1, a1])
+    }
+
+    #[test]
+    fn conversation_header_glyph_and_children() {
+        let (s, [_, b1, f1, s1, _]) = conv_session();
+        let mut h = harness(App::new(s), vec2(420.0, 900.0));
+        h.run();
+        let header = "Conversation, From Bob; Carol; Me; Alice, Subject Budget plan";
+        assert!(h.query_all_by_label_contains(header).next().is_some(), "ThreadHeader accessible name");
+        assert!(h.query_all_by_label_contains("Collapsed").next().is_some());
+        assert!(h.query_all_by_label_contains("Subject FW: budget plan").next().is_none(), "children hidden");
+        // The glyph expands without selecting.
+        h.get_by_label("Expand conversation").click();
+        h.run();
+        assert!(h.state().s.selection.focus.is_none());
+        assert!(h.query_all_by_label_contains("Subject FW: budget plan").next().is_some());
+        assert!(
+            h.query_all_by_label_contains("Folder Sent Items").next().is_some(),
+            "Sent Items reply shown"
+        );
+        h.get_by_label("Collapse conversation").click();
+        h.run();
+        assert!(h.query_all_by_label_contains("Subject FW: budget plan").next().is_none());
+        // Clicking the header selects the conversation's newest message and shows its children.
+        h.query_all_by_label_contains(header).next().unwrap().click();
+        h.run();
+        assert_eq!(h.state().s.selection.focus.map(|f| f.0), Some(b1));
+        assert!(h.query_all_by_label_contains("Expanded").next().is_some());
+        // Keyboard: Down walks the children, Left collapses (focus back on the header), Right expands.
+        h.key_press(Key::ArrowDown);
+        h.run();
+        assert_eq!(h.state().s.selection.focus.map(|f| f.0), Some(f1));
+        h.key_press(Key::ArrowDown);
+        h.run();
+        assert_eq!(h.state().s.selection.focus.map(|f| f.0), Some(s1), "the Sent Items child");
+        assert_eq!(h.state().s.mailbox.mail.get(&mailcraft_model::ItemId(s1)).map(|m| m.folder), {
+            let st = &h.state().s;
+            st.mailbox.role_folder(st.current_account().unwrap(), FolderRole::SentItems)
+        });
+        h.key_press(Key::ArrowLeft);
+        h.run();
+        assert_eq!(h.state().s.selection.focus.map(|f| f.0), Some(b1));
+        assert!(h.query_all_by_label_contains("Subject FW: budget plan").next().is_none(), "collapsed");
+        h.key_press(Key::ArrowRight);
+        h.run();
+        assert!(h.query_all_by_label_contains("Subject FW: budget plan").next().is_some(), "expanded");
+    }
+
+    #[test]
+    fn conversation_rows_in_column_layout() {
+        let (mut s, [_, b1, ..]) = conv_session();
+        s.run("view.readingPane", &json!({"position": "bottom"})).unwrap();
+        s.run("nav.selectItem", &json!({"id": b1})).unwrap();
+        let mut h = harness(App::new(s), vec2(900.0, 900.0));
+        h.run();
+        assert!(h.query_all_by_label_contains("Conversation, From Bob").next().is_some());
+        assert!(h.query_by_label("Collapse conversation").is_some());
+        assert!(h.query_all_by_label_contains("Folder Sent Items").next().is_some());
+        h.get_by_label("Collapse conversation").click();
+        h.run();
+        assert!(h.query_by_label("Expand conversation").is_some());
+    }
+
+    #[test]
+    fn child_rows_are_compact() {
+        let c = build(&conv_session().0, 0);
+        assert_eq!(c.vs.preview_lines, 1);
+        assert!(child_height(Mode::Compact, 1, false) < item_height(Mode::Compact, 1, false));
+        assert_eq!(child_height(Mode::Compact, 1, false), 12.0 + LINE1 + LINE);
+        assert_eq!(child_height(Mode::Columns { preview: 0 }, 1, false), COL_ROW);
+    }
+
+    #[test]
+    fn scope_question_on_toggle() {
+        let (s, _) = conv_session();
+        let sent = s.mailbox.role_folder(s.current_account().unwrap(), FolderRole::SentItems).unwrap();
+        let mut h = harness(App::new(s), vec2(600.0, 700.0));
+        h.run();
+        // Turning off: Cancel keeps it on.
+        ask_conversation_scope(&h.ctx.clone(), h.state());
+        h.run();
+        assert!(conversation_scope_pending(&h.ctx));
+        assert!(h.query_by_label("Stop arranging messages by conversation in:").is_some());
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert!(!conversation_scope_pending(&h.ctx));
+        let folder = h.state().s.selection.folder;
+        assert!(queries::view_settings(&h.state().s, folder).conversations);
+        // This folder: off here only.
+        ask_conversation_scope(&h.ctx.clone(), h.state());
+        h.run();
+        h.get_by_label("This folder").click();
+        h.run();
+        assert!(!queries::view_settings(&h.state().s, folder).conversations);
+        assert!(!queries::view_settings(&h.state().s, sent).conversations);
+        // All mailboxes: on everywhere.
+        ask_conversation_scope(&h.ctx.clone(), h.state());
+        h.run();
+        assert!(h.query_by_label("Arrange messages by conversation in:").is_some());
+        h.get_by_label("All mailboxes").click();
+        h.run();
+        assert!(queries::view_settings(&h.state().s, folder).conversations);
+        assert!(queries::view_settings(&h.state().s, sent).conversations);
+    }
+
+    #[test]
+    fn conversation_settings_menu_reflects_engine_state() {
+        let (s, _) = conv_session();
+        let mut h = Harness::builder().with_size(vec2(400.0, 300.0)).build_ui_state(
+            |ui, app: &mut App| crate::menus::conversation_settings_menu(ui, app),
+            App::new(s),
+        );
+        h.run();
+        h.get_by_label("Use Classic Indented View").click();
+        h.run();
+        let st = &h.state().s;
+        assert!(queries::conversation_settings(st, st.selection.folder).classic_indent);
+        h.get_by_label("Show Messages from Other Folders").click();
+        h.run();
+        let st = &h.state().s;
+        assert!(!queries::conversation_settings(st, st.selection.folder).from_other_folders);
     }
 }

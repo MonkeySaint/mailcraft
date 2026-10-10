@@ -421,6 +421,75 @@ pub fn message_row_menu(ui: &mut Ui, app: &mut App, item: u64) {
     cmd(ui, app, "archive", "Archive...", "mail.archive", t.params());
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Conversations
+
+/// Context menu of a conversation header row (conversation view): acts on the conversation's messages in
+/// this folder; Reply / Forward answer its newest message. The header becomes the selection.
+pub fn conversation_menu(ui: &mut Ui, app: &mut App, header: u64) {
+    let id = ItemId(header);
+    let Some(conv) = queries::conversation_of(&app.s, id).filter(|c| c.is_thread()) else {
+        message_row_menu(ui, app, header);
+        return;
+    };
+    let ignored = app.s.mailbox.mail.get(&id).is_some_and(|m| m.ignored);
+    ensure_selected(app, &[id]);
+    let t = Targets::of(app, conv.view_members());
+    let one = json!({"ids": [header]});
+    let any_unread = t.ids.iter().any(|i| app.s.mailbox.mail.get(i).is_some_and(|m| !m.read));
+    let any_read = t.ids.iter().any(|i| app.s.mailbox.mail.get(i).is_some_and(|m| m.read));
+
+    let toggle = json!({"conversation": true, "id": header});
+    // The engine state after selecting (the selected conversation shows expanded).
+    let expanded = queries::conversation_of(&app.s, id).is_some_and(|c| c.expanded);
+    if expanded {
+        cmd(ui, app, "chevron-up", "Collapse Conversation", "view.collapseGroup", toggle);
+    } else {
+        cmd(ui, app, "chevron-down", "Expand Conversation", "view.expandGroup", toggle);
+    }
+    ui.separator();
+    cmd(ui, app, "reply", "Reply", "mail.reply", one.clone());
+    cmd(ui, app, "reply-all", "Reply All", "mail.replyAll", one.clone());
+    cmd(ui, app, "forward", "Forward", "mail.forward", one.clone());
+    ui.separator();
+    cmd_if(ui, app, "read", "Mark as Read", any_unread, "mail.markRead", t.params());
+    cmd_if(ui, app, "unread", "Mark as Unread", any_read, "mail.markUnread", t.params());
+    sub(ui, app, "categorize", "Categorize", true, |ui, app| categorize_menu(ui, app, &t));
+    sub(ui, app, "flag", "Follow Up", true, |ui, app| follow_up_menu(ui, app, &t));
+    ui.separator();
+    cmd(ui, app, "clean-up", "Clean Up Conversation", "mail.cleanUpConversation", one.clone());
+    check_cmd(ui, app, ignored, "Ignore", "mail.ignore", one);
+    sub(ui, app, "move", "Move", true, |ui, app| move_menu(ui, app, &t, true));
+    ui.separator();
+    cmd(ui, app, "delete", "Delete", "mail.delete", t.params());
+}
+
+/// Conversation Settings ▸ items with the selected folder's state (View › Messages › Conversation
+/// Settings).
+pub fn conversation_settings_menu(ui: &mut Ui, app: &mut App) {
+    let cs = queries::conversation_settings(&app.s, app.s.selection.folder);
+    for (name, label) in [
+        ("fromOtherFolders", "Show Messages from Other Folders"),
+        ("sendersAboveSubject", "Show Senders Above the Subject"),
+        ("alwaysExpand", "Always Expand Selected Conversation"),
+        ("classicIndent", "Use Classic Indented View"),
+    ] {
+        let on = cs.get(name).unwrap_or(false);
+        check_cmd(ui, app, on, label, "view.conversationSettings", json!({"setting": name, "on": !on}));
+    }
+}
+
+/// Show as Conversations (asks This folder / All mailboxes first) and Conversation Settings ▸, for menus
+/// that offer the conversation view.
+pub fn conversation_view_menu(ui: &mut Ui, app: &mut App) {
+    let on = queries::view_settings(&app.s, app.s.selection.folder).conversations;
+    let enabled = app.s.enabled("view.conversations").is_none();
+    if row(ui, app, Glyph::Check(on), "Show as Conversations", enabled) {
+        crate::list::ask_conversation_scope(ui.ctx(), app);
+    }
+    sub(ui, app, "settings", "Conversation Settings", on, conversation_settings_menu);
+}
+
 /// The folder is an Inbox showing Focused / Other.
 fn focused_inbox_active(app: &App, folder: FolderId) -> bool {
     let is_inbox = app.s.mailbox.folder(folder).is_some_and(|f| f.role == Some(FolderRole::Inbox));

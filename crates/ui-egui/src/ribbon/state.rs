@@ -119,6 +119,10 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
             app.s.mailbox.folders.get(&app.s.selection.folder).is_some_and(|f| f.favorite_pos.is_some())
         }
         "conversations" => current_view(app).conversations,
+        // Conversation Settings of the selected folder, as the engine keeps them.
+        "conv" => mailcraft_engine::queries::conversation_settings(&app.s, app.s.selection.folder)
+            .get(arg)
+            .unwrap_or(false),
         "focused" => current_view(app).focused_inbox,
         "reverse" => current_view(app).order == mailcraft_model::SortOrder::Ascending,
         "tighter" => current_view(app).tighter_spacing,
@@ -662,6 +666,14 @@ pub fn run(ctx: &egui::Context, app: &mut App, surface: Surface, mem: &mut Mem, 
         if (!takes_ids || blocked) && !selected && exists && act.cmd.starts_with("mail.") {
             let _ = app.run("nav.selectItem", json!({"id": item}));
         }
+    }
+    // Show as Conversations first asks whether it changes for this folder or all mailboxes
+    // (`plan/outlook/reply-forward.md` › Conversation view); the answer runs the command with a scope.
+    if surface == Surface::Main && act.cmd == "view.conversations" && act.params.get("scope").is_none() {
+        if app.s.enabled(&act.cmd).is_none() {
+            crate::list::ask_conversation_scope(ctx, app);
+        }
+        return;
     }
     let params = with_context(app, surface, &act.cmd, act.params.clone());
     // A few compose commands open the compose window's own UI (file picker, Signatures, Spelling dialog).

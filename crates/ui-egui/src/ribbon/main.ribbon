@@ -405,10 +405,10 @@ item | View Settings... | settings | view.viewSettings | | V
 item | Reset View | undo | view.resetView | | R
 
 menu conversationSettings
-item | Show Messages from Other Folders | | view.conversationSettings | {"setting":"fromOtherFolders","on":"$!on"} | O | on=mem:convOtherFolders=1
-item | Show Senders Above the Subject | | view.conversationSettings | {"setting":"sendersAboveSubject","on":"$!on"} | S | on=mem:convSendersAbove=1
-item | Always Expand Selected Conversation | | view.conversationSettings | {"setting":"alwaysExpand","on":"$!on"} | A | on=mem:convAlwaysExpand
-item | Use Classic Indented View | | view.conversationSettings | {"setting":"classicIndent","on":"$!on"} | U | on=mem:convClassicIndent
+item | Show Messages from Other Folders | | view.conversationSettings | {"setting":"fromOtherFolders","on":"$!on"} | O | on=conv:fromOtherFolders
+item | Show Senders Above the Subject | | view.conversationSettings | {"setting":"sendersAboveSubject","on":"$!on"} | S | on=conv:sendersAboveSubject
+item | Always Expand Selected Conversation | | view.conversationSettings | {"setting":"alwaysExpand","on":"$!on"} | A | on=conv:alwaysExpand
+item | Use Classic Indented View | | view.conversationSettings | {"setting":"classicIndent","on":"$!on"} | U | on=conv:classicIndent
 
 menu messagePreview
 item | Off | | view.messagePreview | {"lines":0} | O | on=preview:0

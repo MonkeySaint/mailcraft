@@ -2,14 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::cmd::view::{conversation_state, is_group_label};
 use crate::{Module, SearchScope, Session};
 use mailcraft_model::{
-    ArrangeBy, Category, DateGroup, FlagState, FocusClass, FolderId, FolderKind, FolderRole, Importance,
-    ItemId, ListFilter, ListTime, MailItem, ResponseState, SortOrder, ViewSettings,
+    ArrangeBy, Category, DateGroup, DateTime, FlagState, FocusClass, FolderId, FolderKind, FolderRole,
+    Importance, ItemId, ListFilter, ListTime, MailItem, ResponseState, SortOrder, ViewSettings,
     subject::{conversation_topic, strip_prefixes},
     text::contains_ci,
+    thread::{ConversationSettings, norm_id, reply_tree},
 };
 
 /// One row of the folder pane.
@@ -67,10 +69,37 @@ pub struct ItemRow {
     pub categories: Vec<String>,
     pub replied: bool,
     pub forwarded: bool,
-    /// Conversation header/child rows (commit 7).
+    /// Indent level of a conversation child row (1 = directly under the header; deeper in the Classic
+    /// Indented View). 0 for header rows and plain rows.
     pub conversation_depth: u8,
-    /// Accessible name as documented in plan/outlook/reading-pane.md.
+    /// Accessible name as documented in plan/outlook/reading-pane.md (conversation headers:
+    /// "Conversation, From …, Subject …", `plan/outlook/reply-forward.md` › Conversation view).
     pub accessible: String,
+    /// Conversation view: what this row is within its conversation (`None` for plain rows, including
+    /// conversations of a single message).
+    #[serde(default)]
+    pub conversation: Option<ConversationRow>,
+}
+
+/// Conversation part of a message-list row (Show as Conversations).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRow {
+    /// Conversation key (`mailcraft_model::thread::Conversation::key`).
+    pub key: u64,
+    /// Header row (true) or child row (false).
+    pub header: bool,
+    /// The conversation shows its child rows (◢); collapsed headers show ▷.
+    pub expanded: bool,
+    /// Messages shown in the conversation (this folder plus other folders when that setting is on).
+    pub count: usize,
+    /// Unread messages among them.
+    pub unread: usize,
+    /// Child rows of a message from another folder (Show Messages from Other Folders): that folder's name.
+    pub other_folder: Option<String>,
+    /// Show Senders Above the Subject (header rows put the senders on line 1, else the subject).
+    pub senders_above_subject: bool,
+    /// The selection is inside this conversation.
+    pub contains_selection: bool,
 }
 
 /// Folder kinds shown in the folder pane of `module`.
@@ -544,24 +573,44 @@ fn grouped<'a>(
     out.into_iter().map(|(_, label, list)| (label, list)).collect()
 }
 
-/// Header label of the group `item` falls in under the selected folder's arrangement.
-pub fn group_label(s: &Session, item: &MailItem) -> String {
+/// List groups in list order: `(header label, item ids)`. In conversation view a group holds the view's
+/// messages of its conversations (header message first).
+fn group_ids(s: &Session) -> Vec<(String, Vec<ItemId>)> {
     let (vs, items) = view_items(s);
+    if vs.conversations {
+        let convs = build_conversations(s, &vs, items);
+        let by_sort: HashMap<ItemId, &ListConversation> = convs.iter().map(|c| (c.sort_item, c)).collect();
+        let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
+        return grouped(s, vs.arrange_by, reps)
+            .into_iter()
+            .map(|(label, list)| {
+                let ids = list
+                    .iter()
+                    .filter_map(|m| by_sort.get(&m.id))
+                    .flat_map(|c| c.view_members())
+                    .collect::<Vec<ItemId>>();
+                (label, ids)
+            })
+            .collect();
+    }
     grouped(s, vs.arrange_by, items)
         .into_iter()
-        .find(|(_, list)| list.iter().any(|m| m.id == item.id))
+        .map(|(label, list)| (label, list.into_iter().map(|m| m.id).collect()))
+        .collect()
+}
+
+/// Header label of the group `item` falls in under the selected folder's arrangement.
+pub fn group_label(s: &Session, item: &MailItem) -> String {
+    group_ids(s)
+        .into_iter()
+        .find(|(_, list)| list.contains(&item.id))
         .map(|(label, _)| label)
-        .unwrap_or_else(|| group_of(s, item, vs.arrange_by).1)
+        .unwrap_or_else(|| group_of(s, item, view_settings(s, s.selection.folder).arrange_by).1)
 }
 
 /// Item ids in a list group (by header label), in list order, including collapsed groups.
 pub fn group_items(s: &Session, label: &str) -> Vec<ItemId> {
-    let (vs, items) = view_items(s);
-    grouped(s, vs.arrange_by, items)
-        .into_iter()
-        .filter(|(l, _)| l == label)
-        .flat_map(|(_, list)| list.into_iter().map(|m| m.id))
-        .collect()
+    group_ids(s).into_iter().filter(|(l, _)| l == label).flat_map(|(_, list)| list).collect()
 }
 
 /// Every item id in the current view, in list order (items inside collapsed groups included).
@@ -569,14 +618,18 @@ pub fn view_item_ids(s: &Session) -> Vec<ItemId> {
     view_items(s).1.into_iter().map(|m| m.id).collect()
 }
 
-/// All item ids the list shows, in order (collapsed groups excluded).
+/// All item ids the list shows, in order (collapsed groups and collapsed conversations excluded). A
+/// conversation header stands for its newest message in the folder, which is also its first child row, so
+/// each id is listed once (at its first row).
 pub fn visible_item_ids(s: &Session) -> Vec<ItemId> {
+    let mut seen = HashSet::new();
     list_rows(s)
         .into_iter()
         .filter_map(|r| match r {
             ListRow::Item(i) => Some(i.id),
             ListRow::Group { .. } => None,
         })
+        .filter(|id| seen.insert(*id))
         .collect()
 }
 
@@ -672,34 +725,370 @@ fn item_row(s: &Session, m: &MailItem) -> ItemRow {
         forwarded: matches!(m.response, ResponseState::Forwarded(_)),
         conversation_depth: 0,
         accessible,
+        conversation: None,
     }
 }
 
 /// Message list rows for the selected folder with the folder's view settings (filter, Focused/Other,
-/// search, arrange/sort, groups and collapsed groups).
+/// search, arrange/sort, groups and collapsed groups, conversations).
 pub fn list_rows(s: &Session) -> Vec<ListRow> {
     let (vs, items) = view_items(s);
+    if vs.conversations {
+        return conversation_rows(s, &vs, items);
+    }
     if !vs.show_in_groups {
         return items.into_iter().map(|m| ListRow::Item(item_row(s, m))).collect();
     }
-    let collapsed: &[String] =
-        s.view.collapsed_groups.get(&s.selection.folder).map(Vec::as_slice).unwrap_or(&[]);
+    let collapsed = collapsed_labels(s);
     let mut rows = Vec::new();
     for (label, list) in grouped(s, vs.arrange_by, items) {
-        // Collapse state is stored by header label; the View commands (Collapse This Group / Collapse All
-        // Groups) store their own per-item labels, so honour those too.
-        let is_collapsed = !collapsed.is_empty()
-            && (collapsed.contains(&label)
-                || list.iter().any(|m| {
-                    let other = crate::cmd::view::group_label(s, m, vs.arrange_by);
-                    collapsed.contains(&other)
-                }));
+        let is_collapsed = group_collapsed(s, &vs, &collapsed, &label, &list);
         rows.push(ListRow::Group { label, count: list.len(), collapsed: is_collapsed });
         if !is_collapsed {
             rows.extend(list.into_iter().map(|m| ListRow::Item(item_row(s, m))));
         }
     }
     rows
+}
+
+/// Collapsed group labels of the selected folder (conversation state entries left out).
+fn collapsed_labels(s: &Session) -> Vec<String> {
+    s.view
+        .collapsed_groups
+        .get(&s.selection.folder)
+        .map(|v| v.iter().filter(|l| is_group_label(l)).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Collapse state is stored by header label; the View commands (Collapse This Group / Collapse All Groups)
+/// store their own per-item labels, so honour those too.
+fn group_collapsed(
+    s: &Session,
+    vs: &ViewSettings,
+    collapsed: &[String],
+    label: &str,
+    list: &[&MailItem],
+) -> bool {
+    !collapsed.is_empty()
+        && (collapsed.iter().any(|c| c == label)
+            || list.iter().any(|m| {
+                let other = crate::cmd::view::group_label(s, m, vs.arrange_by);
+                collapsed.contains(&other)
+            }))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Conversation view (`plan/outlook/reply-forward.md` › Conversation view, `message-list.md` › Views)
+
+/// One conversation of the message list in conversation view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListConversation {
+    /// Conversation key (`thread::Conversation::key`).
+    pub key: u64,
+    /// Subject without RE:/FW: prefixes.
+    pub topic: String,
+    /// Header message: the newest member in the view (selecting the header selects it).
+    pub header: ItemId,
+    /// Member the conversation sorts and groups by: the newest member overall when arranged by date (the
+    /// conversation sorts by its newest message), else the header message.
+    pub sort_item: ItemId,
+    /// Members in display order with their indent depth (1 = directly under the header): newest first, or
+    /// the reply tree in the Classic Indented View.
+    pub items: Vec<(ItemId, usize)>,
+    /// Members from other folders (Show Messages from Other Folders).
+    pub other: BTreeSet<ItemId>,
+    /// Time of the newest member.
+    pub latest: DateTime,
+    pub unread: usize,
+    /// The child rows are shown.
+    pub expanded: bool,
+    /// The focus or a selected item is in this conversation.
+    pub selected: bool,
+}
+
+impl ListConversation {
+    /// Members that belong to the view (header first, then list order), i.e. not from other folders.
+    pub fn view_members(&self) -> Vec<ItemId> {
+        let mut out = vec![self.header];
+        out.extend(
+            self.items.iter().map(|(i, _)| *i).filter(|i| *i != self.header && !self.other.contains(i)),
+        );
+        out
+    }
+
+    pub fn contains(&self, id: ItemId) -> bool {
+        self.items.iter().any(|(i, _)| *i == id)
+    }
+
+    /// More than one message: drawn as a header row with child rows (a single message is a plain row).
+    pub fn is_thread(&self) -> bool {
+        self.items.len() > 1
+    }
+}
+
+/// Conversation Settings of `folder`.
+pub fn conversation_settings(s: &Session, folder: FolderId) -> ConversationSettings {
+    conversation_state(s, folder).settings
+}
+
+/// Conversations of the selected folder's list in list order (empty when Show as Conversations is off).
+pub fn list_conversations(s: &Session) -> Vec<ListConversation> {
+    let (vs, items) = view_items(s);
+    if !vs.conversations {
+        return Vec::new();
+    }
+    build_conversations(s, &vs, items)
+}
+
+/// The list conversation holding message `id` (conversation view only).
+pub fn conversation_of(s: &Session, id: ItemId) -> Option<ListConversation> {
+    list_conversations(s).into_iter().find(|c| c.contains(id))
+}
+
+/// Messages of other mail folders of the selected folder's account (Deleted Items and Junk Email left out)
+/// that may join a conversation of `items`: same topic, or linked through a message id.
+fn other_folder_items<'a>(s: &'a Session, items: &[&MailItem]) -> Vec<&'a MailItem> {
+    let mb = &s.mailbox;
+    let folder = s.selection.folder;
+    let Some(account) = mb.folder_account(folder) else {
+        return Vec::new();
+    };
+    let topics: HashSet<String> =
+        items.iter().map(|m| conversation_topic(&m.subject)).filter(|t| !t.is_empty()).collect();
+    let ids: HashSet<&str> = items
+        .iter()
+        .flat_map(|m| m.message_id.iter().chain(m.in_reply_to.iter()).chain(m.references.iter()))
+        .map(|i| norm_id(i))
+        .filter(|i| !i.is_empty())
+        .collect();
+    if topics.is_empty() && ids.is_empty() {
+        return Vec::new();
+    }
+    let excluded: Vec<FolderId> = [FolderRole::DeletedItems, FolderRole::JunkEmail]
+        .into_iter()
+        .filter_map(|r| mb.role_folder(account, r))
+        .collect();
+    let allowed: BTreeSet<FolderId> = mb
+        .folders
+        .values()
+        .filter(|f| f.account == account && f.kind == FolderKind::Mail && f.id != folder)
+        .filter(|f| !excluded.iter().any(|x| mb.is_in_subtree(f.id, *x)))
+        .map(|f| f.id)
+        .collect();
+    mb.mail
+        .values()
+        .filter(|m| allowed.contains(&m.folder))
+        .filter(|m| {
+            m.message_id
+                .iter()
+                .chain(m.in_reply_to.iter())
+                .chain(m.references.iter())
+                .any(|i| ids.contains(norm_id(i)))
+                || topics.contains(&conversation_topic(&m.subject))
+        })
+        .collect()
+}
+
+/// Threads the view's `items` (plus messages from other folders when that setting is on and no search is
+/// active) into list conversations, ordered by the view's sort applied to each conversation's sort item.
+fn build_conversations(s: &Session, vs: &ViewSettings, items: Vec<&MailItem>) -> Vec<ListConversation> {
+    let folder = s.selection.folder;
+    let state = conversation_state(s, folder);
+    let in_view: HashSet<ItemId> = items.iter().map(|m| m.id).collect();
+    let mut pool = items;
+    if state.settings.from_other_folders && s.view.search.trim().is_empty() {
+        let extra = other_folder_items(s, &pool);
+        pool.extend(extra);
+    }
+    let focus = s.selection.focus;
+    let mut out: Vec<ListConversation> = Vec::new();
+    for t in mailcraft_model::thread::thread(&pool) {
+        let Some(header) = t.items.iter().copied().find(|i| in_view.contains(i)) else { continue };
+        let sort_item = if vs.arrange_by == ArrangeBy::Date {
+            t.items.first().copied().unwrap_or(header)
+        } else {
+            header
+        };
+        let items: Vec<(ItemId, usize)> = if state.settings.classic_indent {
+            let members: Vec<&MailItem> = t.items.iter().filter_map(|i| s.mailbox.mail.get(i)).collect();
+            reply_tree(&members).into_iter().map(|(i, d)| (i, d.saturating_add(1))).collect()
+        } else {
+            t.items.iter().map(|i| (*i, 1)).collect()
+        };
+        let other: BTreeSet<ItemId> = t.items.iter().copied().filter(|i| !in_view.contains(i)).collect();
+        let focus_in = focus.is_some_and(|f| t.items.contains(&f));
+        let selected = focus_in || s.selection.items.iter().any(|i| t.items.contains(i));
+        // The selected conversation expands by itself (unless collapsed by hand while its message kept the
+        // focus); conversations expanded by hand stay open; Always Expand Selected Conversation overrides a
+        // manual collapse of the selected conversation.
+        let expanded = if focus_in && state.settings.always_expand {
+            true
+        } else if state.collapsed.is_some_and(|(k, i)| k == t.key && focus == Some(i)) {
+            false
+        } else {
+            state.expanded.contains(&t.key) || selected
+        };
+        out.push(ListConversation {
+            key: t.key,
+            topic: t.topic,
+            header,
+            sort_item,
+            items,
+            other,
+            latest: t.latest,
+            unread: t.unread,
+            expanded,
+            selected,
+        });
+    }
+    let mut reps: Vec<&MailItem> = out.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
+    sort_items(s, vs, &mut reps);
+    let pos: HashMap<ItemId, usize> = reps.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
+    out.sort_by_key(|c| pos.get(&c.sort_item).copied().unwrap_or(usize::MAX));
+    out
+}
+
+/// Rows of the conversation view: (date) groups of conversations, each a header row followed by its child
+/// rows when expanded; a conversation of one message is a plain row.
+fn conversation_rows(s: &Session, vs: &ViewSettings, items: Vec<&MailItem>) -> Vec<ListRow> {
+    let settings = conversation_state(s, s.selection.folder).settings;
+    let convs = build_conversations(s, vs, items);
+    let mut rows = Vec::new();
+    if !vs.show_in_groups {
+        for c in &convs {
+            push_conversation(&mut rows, s, c, &settings);
+        }
+        return rows;
+    }
+    let by_sort: HashMap<ItemId, &ListConversation> = convs.iter().map(|c| (c.sort_item, c)).collect();
+    let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
+    let collapsed = collapsed_labels(s);
+    for (label, list) in grouped(s, vs.arrange_by, reps) {
+        let group: Vec<&ListConversation> = list.iter().filter_map(|m| by_sort.get(&m.id).copied()).collect();
+        let is_collapsed = group_collapsed(s, vs, &collapsed, &label, &list);
+        let count = group.iter().map(|c| c.items.len().saturating_sub(c.other.len())).sum();
+        rows.push(ListRow::Group { label, count, collapsed: is_collapsed });
+        if !is_collapsed {
+            for c in group {
+                push_conversation(&mut rows, s, c, &settings);
+            }
+        }
+    }
+    rows
+}
+
+fn push_conversation(
+    rows: &mut Vec<ListRow>,
+    s: &Session,
+    c: &ListConversation,
+    settings: &ConversationSettings,
+) {
+    let Some(head) = s.mailbox.mail.get(&c.header) else { return };
+    if !c.is_thread() {
+        rows.push(ListRow::Item(item_row(s, head)));
+        return;
+    }
+    rows.push(ListRow::Item(conversation_header_row(s, c, head, settings)));
+    if !c.expanded {
+        return;
+    }
+    for (id, depth) in &c.items {
+        let Some(m) = s.mailbox.mail.get(id) else { continue };
+        let mut row = item_row(s, m);
+        // Child rows name the sender, also for your own replies from Sent Items.
+        let sender = sender_name(m);
+        if !sender.is_empty() {
+            row.who = sender;
+        }
+        row.conversation_depth = u8::try_from(*depth).unwrap_or(u8::MAX);
+        let other_folder = if c.other.contains(id) {
+            Some(s.mailbox.folder(m.folder).map(|f| f.name.clone()).unwrap_or_default())
+        } else {
+            None
+        };
+        if let Some(name) = &other_folder {
+            row.accessible.push_str(&format!("Folder {name}, "));
+        }
+        row.conversation = Some(ConversationRow {
+            key: c.key,
+            header: false,
+            expanded: true,
+            count: c.items.len(),
+            unread: c.unread,
+            other_folder,
+            senders_above_subject: settings.senders_above_subject,
+            contains_selection: c.selected,
+        });
+        rows.push(ListRow::Item(row));
+    }
+}
+
+/// Header row of a conversation: subject without prefixes, senders (newest first), latest time, unread
+/// count, and attachments / flags / categories / importance rolled up from the members.
+fn conversation_header_row(
+    s: &Session,
+    c: &ListConversation,
+    head: &MailItem,
+    settings: &ConversationSettings,
+) -> ItemRow {
+    let mut members: Vec<&MailItem> = c.items.iter().filter_map(|(i, _)| s.mailbox.mail.get(i)).collect();
+    members.sort_by(|a, b| b.received.unix.cmp(&a.received.unix).then(b.id.cmp(&a.id)));
+    let mut senders: Vec<String> = Vec::new();
+    for m in &members {
+        let n = sender_name(m);
+        if !n.is_empty() && !senders.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+            senders.push(n);
+        }
+    }
+    let mut categories: Vec<String> = Vec::new();
+    for m in &members {
+        for cat in &m.categories {
+            if !categories.iter().any(|x| x.eq_ignore_ascii_case(cat)) {
+                categories.push(cat.clone());
+            }
+        }
+    }
+    let mut row = item_row(s, head);
+    row.who = if senders.is_empty() { "(unknown sender)".to_owned() } else { senders.join("; ") };
+    let topic = c.topic.trim();
+    row.subject = if topic.is_empty() { "(no subject)".to_owned() } else { topic.to_owned() };
+    row.time = ListTime::format(c.latest, s.now(), s.tz_offset_min);
+    row.unread = c.unread > 0;
+    row.selected = c.selected && !c.expanded;
+    row.draft_marker = members.iter().any(|m| s.composes.values().any(|cm| cm.source == Some(m.id)));
+    row.has_attachments = members.iter().any(|m| m.has_attachments());
+    row.importance_high = members.iter().any(|m| m.importance == Importance::High);
+    row.importance_low = !row.importance_high && members.iter().all(|m| m.importance == Importance::Low);
+    row.flagged = members.iter().any(|m| m.is_flagged());
+    row.flag_complete = !row.flagged && members.iter().any(|m| matches!(m.flag, FlagState::Complete { .. }));
+    row.categories = categories.iter().map(|n| category_hex(s, n)).collect();
+    row.conversation_depth = 0;
+    let n = c.items.len();
+    let state = if c.expanded { "Expanded" } else { "Collapsed" };
+    let mut acc = format!("Conversation, From {}, Subject {}, Received {}, ", row.who, row.subject, row.time);
+    acc.push_str(&format!("{n} messages, {} unread, ", c.unread));
+    if row.has_attachments {
+        acc.push_str("With Attachments, ");
+    }
+    if row.flagged {
+        acc.push_str("Flagged, ");
+    }
+    if !categories.is_empty() {
+        acc.push_str(&format!("Categories {}, ", categories.join(", ")));
+    }
+    acc.push_str(&format!("{state}, "));
+    row.accessible = acc;
+    row.conversation = Some(ConversationRow {
+        key: c.key,
+        header: true,
+        expanded: c.expanded,
+        count: n,
+        unread: c.unread,
+        other_folder: None,
+        senders_above_subject: settings.senders_above_subject,
+        contains_selection: c.selected,
+    });
+    row
 }
 
 /// Status bar counts: (items in view, unread in view).
@@ -1286,5 +1675,245 @@ mod tests {
         assert_eq!(size_text(1_572_864), "1.5 MB");
         assert_eq!(size_bucket(5).1, "Tiny (< 10 KB)");
         assert_eq!(size_bucket(2 * 1024 * 1024).1, "Huge (> 1 MB)");
+    }
+
+    // ---- Conversation view -------------------------------------------------------------------------------
+
+    mod conversations {
+        use super::*;
+        use mailcraft_model::{Address, Mailbox};
+        use serde_json::json;
+
+        const NOW: i64 = 1_791_000_000; // 04:00 UTC
+
+        struct Fx {
+            s: Session,
+            lone: ItemId,
+            a1: ItemId,
+            s1: ItemId,
+            f1: ItemId,
+            b1: ItemId,
+            old: ItemId,
+        }
+
+        fn who(name: &str) -> Option<Address> {
+            Some(Address { name: Some(name.into()), addr: format!("{}@example.com", name.to_lowercase()) })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn add(
+            s: &mut Session,
+            folder: FolderId,
+            subject: &str,
+            from: &str,
+            mid: &str,
+            refs: &[&str],
+            ago: i64,
+            read: bool,
+        ) -> ItemId {
+            s.mailbox.add_mail(MailItem {
+                folder,
+                subject: subject.into(),
+                from: who(from),
+                message_id: (!mid.is_empty()).then(|| mid.to_owned()),
+                in_reply_to: refs.last().map(|r| vec![(*r).to_owned()]).unwrap_or_default(),
+                references: refs.iter().map(|r| (*r).to_owned()).collect(),
+                received: DateTime { unix: NOW - ago, offset_min: 0 },
+                read,
+                preview: format!("{subject} preview"),
+                ..Default::default()
+            })
+        }
+
+        fn fixture() -> Fx {
+            let mut s = Session::new(Mailbox::new_local("Test"));
+            let acct = s.mailbox.accounts.first().map(|a| a.id).unwrap();
+            let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
+            let sent = s.mailbox.role_folder(acct, FolderRole::SentItems).unwrap();
+            s.selection.folder = inbox;
+            s.fixed_now = Some(DateTime { unix: NOW, offset_min: 0 });
+            let a1 = add(&mut s, inbox, "Budget plan", "Alice", "a1@x", &[], 3 * 86_400, true);
+            let s1 = add(&mut s, sent, "RE: Budget plan", "Me", "s1@x", &["a1@x"], 2 * 86_400, true);
+            let f1 = add(&mut s, inbox, "FW: budget plan", "Carol", "f1@x", &[], 86_400, true);
+            let b1 = add(&mut s, inbox, "RE: Budget plan", "Bob", "b1@x", &["a1@x", "s1@x"], 3_600, false);
+            let lone = add(&mut s, inbox, "Lunch", "Dave", "l1@x", &[], 1_800, true);
+            let old = add(&mut s, inbox, "Old thing", "Eve", "o1@x", &[], 10 * 86_400, true);
+            if let Some(m) = s.mailbox.mail.get_mut(&a1) {
+                m.flag =
+                    FlagState::Flagged { label: "Follow up".into(), start: None, due: None, reminder: None };
+                m.categories = vec!["Red category".into()];
+            }
+            s.run("view.conversations", &json!({})).unwrap();
+            Fx { s, lone, a1, s1, f1, b1, old }
+        }
+
+        fn rows(s: &Session) -> Vec<ItemRow> {
+            items(&list_rows(s)).into_iter().cloned().collect()
+        }
+
+        fn select(s: &mut Session, id: ItemId) {
+            s.run("nav.selectItem", &json!({"id": id.0})).unwrap();
+        }
+
+        #[test]
+        fn header_rows_roll_up_the_conversation() {
+            let fx = fixture();
+            let r = rows(&fx.s);
+            let ids: Vec<ItemId> = r.iter().map(|i| i.id).collect();
+            assert_eq!(
+                ids,
+                vec![fx.lone, fx.b1, fx.old],
+                "collapsed: one row per conversation, newest first"
+            );
+            let lone = &r[0];
+            assert!(lone.conversation.is_none(), "a single message is a plain row");
+            let h = &r[1];
+            let c = h.conversation.as_ref().unwrap();
+            assert!(c.header && !c.expanded);
+            assert_eq!(c.count, 4, "the forward and the Sent Items reply join");
+            assert_eq!(c.unread, 1);
+            assert_eq!(h.subject, "Budget plan");
+            assert_eq!(h.who, "Bob; Carol; Me; Alice");
+            assert!(h.unread && h.flagged && !h.selected);
+            assert_eq!(h.categories.len(), 1);
+            assert!(
+                h.accessible.starts_with("Conversation, From Bob; Carol; Me; Alice, Subject Budget plan, ")
+            );
+            assert!(h.accessible.contains("Collapsed"));
+            assert_eq!(visible_item_ids(&fx.s), vec![fx.lone, fx.b1, fx.old]);
+            let g = groups(&list_rows(&fx.s));
+            assert_eq!(g.first().map(String::as_str), Some("Today"));
+        }
+
+        #[test]
+        fn selected_conversation_expands_with_children() {
+            let mut fx = fixture();
+            select(&mut fx.s, fx.b1);
+            let r = rows(&fx.s);
+            let ids: Vec<ItemId> = r.iter().map(|i| i.id).collect();
+            assert_eq!(ids, vec![fx.lone, fx.b1, fx.b1, fx.f1, fx.s1, fx.a1, fx.old]);
+            let header = &r[1];
+            assert!(header.conversation.as_ref().unwrap().expanded);
+            assert!(header.accessible.contains("Expanded"));
+            assert!(!header.selected, "the selected child row carries the highlight");
+            assert!(header.conversation.as_ref().unwrap().contains_selection);
+            let first_child = &r[2];
+            assert!(first_child.selected && first_child.conversation_depth == 1);
+            assert_eq!(first_child.who, "Bob");
+            let sent = r.iter().find(|i| i.id == fx.s1).unwrap();
+            assert_eq!(sent.conversation.as_ref().unwrap().other_folder.as_deref(), Some("Sent Items"));
+            assert_eq!(sent.who, "Me", "children name the sender");
+            assert!(sent.accessible.contains("Folder Sent Items"));
+            assert_eq!(visible_item_ids(&fx.s), vec![fx.lone, fx.b1, fx.f1, fx.s1, fx.a1, fx.old]);
+            // Down walks the children (also the Sent Items one) without leaving the folder.
+            let inbox = fx.s.selection.folder;
+            for want in [fx.f1, fx.s1, fx.a1, fx.old] {
+                fx.s.run("nav.nextItem", &json!({})).unwrap();
+                assert_eq!(fx.s.selection.focus, Some(want));
+                assert_eq!(fx.s.selection.folder, inbox);
+            }
+            // Selection left: the conversation collapses again.
+            assert_eq!(visible_item_ids(&fx.s), vec![fx.lone, fx.b1, fx.old]);
+        }
+
+        #[test]
+        fn settings_other_folders_and_classic_indent() {
+            let mut fx = fixture();
+            select(&mut fx.s, fx.b1);
+            fx.s.run("view.conversationSettings", &json!({"setting": "fromOtherFolders", "on": false}))
+                .unwrap();
+            let r = rows(&fx.s);
+            assert!(!r.iter().any(|i| i.id == fx.s1), "Sent Items reply hidden");
+            assert_eq!(r[1].conversation.as_ref().unwrap().count, 3);
+            fx.s.run("view.conversationSettings", &json!({"setting": "fromOtherFolders"})).unwrap();
+            assert!(conversation_settings(&fx.s, fx.s.selection.folder).from_other_folders, "toggled back");
+            fx.s.run("view.conversationSettings", &json!({"setting": "classicIndent", "on": true})).unwrap();
+            let r = rows(&fx.s);
+            let kids: Vec<(ItemId, u8)> = r[2..6].iter().map(|i| (i.id, i.conversation_depth)).collect();
+            assert_eq!(kids, vec![(fx.a1, 1), (fx.s1, 2), (fx.b1, 3), (fx.f1, 1)]);
+            fx.s.run("view.conversationSettings", &json!({"setting": "sendersAboveSubject", "on": false}))
+                .unwrap();
+            assert!(!rows(&fx.s)[1].conversation.as_ref().unwrap().senders_above_subject);
+            assert!(fx.s.run("view.conversationSettings", &json!({"setting": "x"})).is_err());
+            assert!(
+                fx.s.run("view.conversationSettings", &json!({"setting": "classicIndent", "on": 3})).is_err()
+            );
+        }
+
+        #[test]
+        fn expand_and_collapse_commands() {
+            let mut fx = fixture();
+            let expanded = |s: &Session| conversation_of(s, fx.b1).unwrap().expanded;
+            // Expanding a conversation that is not selected keeps it open.
+            select(&mut fx.s, fx.lone);
+            let r = fx.s.run("view.expandGroup", &json!({"conversation": true, "id": fx.a1.0})).unwrap();
+            assert_eq!(r["expanded"], true);
+            assert!(expanded(&fx.s));
+            fx.s.run("view.collapseGroup", &json!({"conversation": true, "id": fx.b1.0})).unwrap();
+            assert!(!expanded(&fx.s));
+            // Collapsing the selected conversation from a child moves the focus to the header message.
+            select(&mut fx.s, fx.f1);
+            assert!(expanded(&fx.s));
+            let r = fx.s.run("view.collapseGroup", &json!({"conversation": true})).unwrap();
+            assert_eq!(r["expanded"], false);
+            assert_eq!(fx.s.selection.focus, Some(fx.b1));
+            assert_eq!(visible_item_ids(&fx.s), vec![fx.lone, fx.b1, fx.old]);
+            fx.s.run("view.expandGroup", &json!({"conversation": true})).unwrap();
+            assert!(expanded(&fx.s));
+            // Always Expand Selected Conversation: a manual collapse does not stick.
+            fx.s.run("view.conversationSettings", &json!({"setting": "alwaysExpand", "on": true})).unwrap();
+            let r = fx.s.run("view.collapseGroup", &json!({"conversation": true})).unwrap();
+            assert_eq!(r["expanded"], true);
+            // Group commands still work and keep the conversation state.
+            fx.s.run("view.collapseAll", &json!({})).unwrap();
+            assert!(items(&list_rows(&fx.s)).is_empty());
+            fx.s.run("view.expandAll", &json!({})).unwrap();
+            assert!(conversation_settings(&fx.s, fx.s.selection.folder).always_expand);
+            // Junk params.
+            assert!(fx.s.run("view.expandGroup", &json!({"conversation": true, "id": "x"})).is_err());
+            assert!(fx.s.run("view.expandGroup", &json!({"conversation": true, "id": 999_999})).is_err());
+        }
+
+        #[test]
+        fn group_items_follow_conversations() {
+            let mut fx = fixture();
+            let today = group_items(&fx.s, "Today");
+            assert_eq!(today, vec![fx.lone, fx.b1, fx.f1, fx.a1], "view members only, header first");
+            let a1 = fx.s.mailbox.mail.get(&fx.a1).cloned().unwrap();
+            assert_eq!(group_label(&fx.s, &a1), "Today", "an old member sits in its conversation's group");
+            select(&mut fx.s, fx.a1);
+            fx.s.run("view.collapseGroup", &json!({})).unwrap();
+            assert_eq!(groups(&list_rows(&fx.s)).len(), 2);
+            assert!(!visible_item_ids(&fx.s).contains(&fx.b1), "Today collapsed");
+        }
+
+        #[test]
+        fn toggle_scope_and_flat_list() {
+            let mut fx = fixture();
+            let sent = {
+                let acct = fx.s.current_account().unwrap();
+                fx.s.mailbox.role_folder(acct, FolderRole::SentItems).unwrap()
+            };
+            assert!(!view_settings(&fx.s, sent).conversations);
+            let r = fx.s.run("view.conversations", &json!({"scope": "all", "on": true})).unwrap();
+            assert_eq!(r["scope"], "all");
+            assert!(view_settings(&fx.s, sent).conversations);
+            assert!(fx.s.run("view.conversations", &json!({"scope": "galaxy"})).is_err());
+            let r = fx.s.run("view.conversations", &json!({"scope": "folder"})).unwrap();
+            assert_eq!(r["on"], false);
+            assert!(list_conversations(&fx.s).is_empty());
+            assert!(view_settings(&fx.s, sent).conversations, "this folder only");
+            fx.s.run("view.conversations", &json!({"on": true})).unwrap();
+            fx.s.run("view.showInGroups", &json!({})).unwrap();
+            let r = list_rows(&fx.s);
+            assert!(groups(&r).is_empty());
+            assert_eq!(items(&r).len(), 3);
+            // Unread filter: only the unread reply stays in the view, its conversation still shows the rest.
+            fx.s.run("view.filter", &json!({"kind": "unread"})).unwrap();
+            let r = rows(&fx.s);
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0].id, fx.b1);
+            assert_eq!(r[0].conversation.as_ref().unwrap().count, 2, "only the Sent Items reply joins");
+        }
     }
 }
