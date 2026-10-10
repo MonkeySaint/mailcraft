@@ -22,6 +22,27 @@ fn harness(app: App) -> Harness<'static, App> {
     h
 }
 
+/// A fresh scratch directory under the cargo target dir (never the system temp dir, which may be RAM).
+/// Unit tests get no `CARGO_TARGET_TMPDIR`, so it is `<target>/tmp`, found from the test binary's path
+/// (`<target>/<profile>/deps/<binary>`).
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let base = option_env!("CARGO_TARGET_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok()?.ancestors().nth(3).map(|t| t.join("tmp")))
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
+    let dir = base.join(format!("mc-dlg-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+#[test]
+fn scratch_dir_is_inside_the_target_dir() {
+    let dir = scratch_dir("probe");
+    let exe = std::env::current_exe().unwrap();
+    let target = exe.ancestors().nth(3).unwrap();
+    assert!(dir.starts_with(target) || option_env!("CARGO_TARGET_TMPDIR").is_some(), "{}", dir.display());
+}
+
 fn sample_app() -> App {
     App::new(sample_session())
 }
@@ -351,7 +372,7 @@ fn unknown_dialog_shows_not_available() {
 
 #[test]
 fn import_export_wizard_exports_mbox() {
-    let dir = std::env::temp_dir().join(format!("mc-dlg-test-{}", std::process::id()));
+    let dir = scratch_dir("export");
     std::fs::create_dir_all(&dir).unwrap();
     let out = dir.join("inbox.mbox");
     let mut app = sample_app();
@@ -470,4 +491,36 @@ fn read_window_backstage_acts_on_its_own_message() {
     let h = harness(app);
     assert!(h.query_by_label(&format!("•  {file}")).is_some(), "lists the read window's attachment");
     assert!(h.query_by_label("The selected message has no attachments.").is_none());
+}
+
+/// Conversation Settings shows the folder's settings as the engine keeps them; OK without changes changes
+/// nothing, and a change is applied (also while turning the conversation view off).
+#[test]
+fn conversation_settings_dialog_follows_the_engine() {
+    use mailcraft_engine::queries::{conversation_settings, view_settings};
+    let mut app = sample_app();
+    app.run("view.conversations", json!({"on": true}));
+    let folder = app.s.selection.folder;
+    let before = conversation_settings(&app.s, folder);
+    assert!(before.senders_above_subject, "engine default");
+    crate::dialogs::open(&mut app, "conversationSettings", json!({}));
+    let mut h = harness(app);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert_eq!(conversation_settings(&h.state().s, folder), before, "OK without changes changes nothing");
+    assert!(h.state().ui.toast.is_none(), "{:?}", h.state().ui.toast);
+    // Tick Classic Indented View and turn conversations off in one go.
+    crate::dialogs::open(h.state_mut(), "conversationSettings", json!({}));
+    step(&mut h);
+    h.get_by_label("Use Classic Indented View").click();
+    step(&mut h);
+    h.get_by_label("Show as Conversations").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    let s = &h.state().s;
+    assert!(conversation_settings(s, folder).classic_indent);
+    assert!(!view_settings(s, folder).conversations);
+    assert!(h.state().ui.toast.is_none(), "{:?}", h.state().ui.toast);
 }

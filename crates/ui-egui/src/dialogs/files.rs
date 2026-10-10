@@ -1,5 +1,7 @@
-//! File-side dialogs: Account Settings (+ Add Account form), Mailbox Cleanup, the Import and Export Wizard,
-//! Save As, Save Attachments and Print (with a preview shared by the backstage Print page).
+//! File-side dialogs: Mailbox Cleanup, the Import and Export Wizard (EML, MSG, MBOX, Maildir, iCalendar,
+//! vCard, CSV), Save As (EML, MSG, text, HTML), Save Attachments and Print (with a preview shared by the
+//! backstage Print page). Path fields get a Browse... button when the app installed file dialogs
+//! ([`crate::FileDialogs`]). Account dialogs live in `accounts`.
 
 use egui::{Context, Id, RichText, Ui};
 use serde_json::{Value, json};
@@ -10,12 +12,10 @@ use super::common::{
 };
 use super::folders::last_error;
 use crate::App;
-use mailcraft_model::{AccountKind, Doc, FolderId, ItemId, MailItem};
+use mailcraft_model::{Doc, FolderId, FolderKind, FolderRole, ItemId, MailItem};
 
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
-        "accountSettings" => account_settings(ctx, app, d),
-        "addAccount" => add_account(ctx, app, d),
         "mailboxCleanup" => cleanup(ctx, app, d),
         "importExport" => import_export(ctx, app, d),
         "saveAs" => save_as(ctx, app, d),
@@ -27,276 +27,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
 
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| ".".into())
-}
-
-fn kind_label(k: AccountKind) -> &'static str {
-    match k {
-        AccountKind::Local => "Data file (local)",
-        AccountKind::Imap => "IMAP/SMTP",
-        AccountKind::Jmap => "JMAP",
-        AccountKind::Exchange => "Exchange",
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// Account Settings
-
-#[derive(Clone, Default)]
-struct AcctState {
-    tab: usize,
-    selected: Option<u32>,
-    data_name: String,
-}
-
-const ACCT_TABS: [&str; 4] = ["Email", "Data Files", "RSS Feeds", "Address Books"];
-
-fn account_settings(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let first = d
-        .get("account")
-        .and_then(|a| a.get("id"))
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok());
-    with_state(
-        ctx,
-        app,
-        uid,
-        |_: &App| AcctState { selected: first, ..Default::default() },
-        |st, app| {
-            window(ctx, app, d, "Account Settings", 640.0, |ui, app| {
-                ui.horizontal(|ui| {
-                    for (i, t) in ACCT_TABS.iter().enumerate() {
-                        if ui.selectable_label(st.tab == i, *t).clicked() {
-                            st.tab = i;
-                        }
-                    }
-                });
-                ui.separator();
-                let accounts = app.s.mailbox.accounts.clone();
-                let pending: Vec<Value> = common::pref(ctx, "accounts.pending")
-                    .and_then(|v| v.as_array().cloned())
-                    .unwrap_or_default();
-                let sel = st.selected.and_then(|id| accounts.iter().find(|a| a.id.0 == id)).cloned();
-                let mut out = Out::Keep;
-                match st.tab {
-                    0 => {
-                        muted(
-                            ui,
-                            app,
-                            "Add, change or remove the accounts MailCraft reads and sends mail with.",
-                        );
-                        ui.horizontal(|ui| {
-                        if ui.button("New...").clicked() {
-                            out = Out::open("addAccount", json!({}));
-                        }
-                        if ui.add_enabled(sel.is_some(), egui::Button::new("Change...")).clicked()
-                            && let Some(a) = &sel
-                        {
-                            out = Out::open("addAccount", json!({"name": a.sender_name, "address": a.address, "change": a.id.0}));
-                        }
-                        ui.add_enabled(false, egui::Button::new("Set as Default"))
-                            .on_disabled_hover_text("The default account is the first data file.");
-                        let removable = sel.as_ref().is_some_and(|a| !a.is_default);
-                        if ui.add_enabled(removable, egui::Button::new("Remove")).clicked()
-                            && let Some(a) = &sel
-                        {
-                            out = Out::open("confirm", json!({"title": "Account Settings", "text": format!("Remove \"{}\" and everything stored in it from this profile?", a.display_name), "command": "file.closeDataFile", "params": {"store": a.id.0}}));
-                        }
-                    });
-                        account_list(ui, app, st, &accounts, &pending, true);
-                    }
-                    1 => {
-                        muted(ui, app, "Data files hold your folders and items on this computer.");
-                        ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut st.data_name).hint_text("New data file name").desired_width(180.0));
-                        if ui.button("Add...").clicked() {
-                            let name = st.data_name.trim().to_owned();
-                            app.run("file.newDataFile", if name.is_empty() { json!({}) } else { json!({"name": name}) });
-                            st.data_name.clear();
-                        }
-                        let removable = sel.as_ref().is_some_and(|a| !a.is_default);
-                        if ui.add_enabled(removable, egui::Button::new("Remove")).clicked()
-                            && let Some(a) = &sel
-                        {
-                            out = Out::open("confirm", json!({"title": "Account Settings", "text": format!("Close the data file \"{}\"?", a.display_name), "command": "file.closeDataFile", "params": {"store": a.id.0}}));
-                        }
-                        if ui.add_enabled(app.s.store.is_some(), egui::Button::new("Open File Location...")).clicked() {
-                            app.run("file.openFileLocation", json!({}));
-                        }
-                    });
-                        account_list(ui, app, st, &accounts, &[], false);
-                        if let Some(st) = &app.s.store {
-                            muted(ui, app, &format!("Location: {}", st.dir.display()));
-                        }
-                    }
-                    _ => {
-                        muted(ui, app, "Nothing is set up here yet.");
-                        ui.add_space(160.0);
-                    }
-                }
-                if !matches!(out, Out::Keep) {
-                    return out;
-                }
-                footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
-            })
-        },
-    )
-}
-
-fn account_list(
-    ui: &mut Ui,
-    app: &App,
-    st: &mut AcctState,
-    accounts: &[mailcraft_model::Account],
-    pending: &[Value],
-    email: bool,
-) {
-    egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).inner_margin(4.0).show(ui, |ui| {
-        ui.set_min_height(200.0);
-        egui::Grid::new(("accts", email)).num_columns(3).striped(true).spacing([16.0, 4.0]).show(ui, |ui| {
-            ui.label(RichText::new("Name").strong());
-            ui.label(RichText::new("Type").strong());
-            ui.label(RichText::new("").strong());
-            ui.end_row();
-            for a in accounts {
-                let title = if email { common::account_title(a) } else { a.display_name.clone() };
-                if ui.selectable_label(st.selected == Some(a.id.0), title).clicked() {
-                    st.selected = Some(a.id.0);
-                }
-                ui.label(kind_label(a.kind));
-                ui.label(if a.is_default { "Default" } else { "" });
-                ui.end_row();
-            }
-            for p in pending {
-                ui.label(p.get("address").and_then(Value::as_str).unwrap_or_default());
-                ui.label("IMAP/SMTP (not connected)");
-                ui.label("");
-                ui.end_row();
-            }
-        });
-    });
-}
-
-#[derive(Clone, Default)]
-struct NewAcct {
-    name: String,
-    address: String,
-    kind: usize,
-    in_host: String,
-    in_port: u16,
-    in_sec: usize,
-    out_host: String,
-    out_port: u16,
-    out_sec: usize,
-    user: String,
-    password: String,
-    smtp_auth: bool,
-    error: String,
-}
-
-const SECURITY: [&str; 3] = ["SSL/TLS", "STARTTLS", "None"];
-
-fn add_account(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let init = |_: &App| NewAcct {
-        name: d.str("name"),
-        address: d.str("address"),
-        in_port: 993,
-        out_port: 587,
-        out_sec: 1,
-        smtp_auth: true,
-        ..Default::default()
-    };
-    with_state(ctx, app, uid, init, |st, app| {
-        let title = if d.get("change").is_some() { "Change Account" } else { "Add Account" };
-        window(ctx, app, d, title, 520.0, |ui, app| {
-            common::heading(ui, app, "User Information");
-            egui::Grid::new(("na1", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Your Name:");
-                ui.add(egui::TextEdit::singleline(&mut st.name).desired_width(300.0));
-                ui.end_row();
-                ui.label("Email Address:");
-                if ui.add(egui::TextEdit::singleline(&mut st.address).desired_width(300.0)).changed()
-                    && st.user.is_empty()
-                {
-                    st.user.clone_from(&st.address);
-                }
-                ui.end_row();
-            });
-            common::heading(ui, app, "Server Information");
-            egui::Grid::new(("na2", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Account Type:");
-                common::combo_idx(ui, ("natype", uid), &mut st.kind, &["IMAP", "POP3"], 120.0);
-                ui.end_row();
-                ui.label("Incoming mail server:");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut st.in_host)
-                            .hint_text("imap.example.com")
-                            .desired_width(200.0),
-                    );
-                    ui.add(egui::DragValue::new(&mut st.in_port).range(1..=65535));
-                    common::combo_idx(ui, ("nainsec", uid), &mut st.in_sec, &SECURITY, 90.0);
-                });
-                ui.end_row();
-                ui.label("Outgoing mail server (SMTP):");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut st.out_host)
-                            .hint_text("smtp.example.com")
-                            .desired_width(200.0),
-                    );
-                    ui.add(egui::DragValue::new(&mut st.out_port).range(1..=65535));
-                    common::combo_idx(ui, ("naoutsec", uid), &mut st.out_sec, &SECURITY, 90.0);
-                });
-                ui.end_row();
-            });
-            common::heading(ui, app, "Logon Information");
-            egui::Grid::new(("na3", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("User Name:");
-                ui.add(egui::TextEdit::singleline(&mut st.user).desired_width(300.0));
-                ui.end_row();
-                ui.label("Password:");
-                ui.add(egui::TextEdit::singleline(&mut st.password).password(true).desired_width(300.0));
-                ui.end_row();
-            });
-            ui.checkbox(&mut st.smtp_auth, "My outgoing server (SMTP) requires authentication");
-            muted(
-                ui,
-                app,
-                "Network accounts connect once MailCraft's sync engine is available; until then the settings are kept for this session.",
-            );
-            if !st.error.is_empty() {
-                ui.colored_label(app.theme.danger, &st.error);
-            }
-            let valid =
-                st.address.contains('@') && !st.in_host.trim().is_empty() && !st.out_host.trim().is_empty();
-            match ok_cancel(ui, app, valid) {
-                Some(true) => {
-                    // No engine command adds network accounts yet: keep the settings (never the password) in
-                    // UI state so Account Settings lists them.
-                    let mut prefs = common::prefs(ctx);
-                    let list = prefs.values.entry("accounts.pending").or_insert_with(|| json!([]));
-                    let kind = ["imap", "pop3"].get(st.kind).copied().unwrap_or("imap");
-                    let in_sec = SECURITY.get(st.in_sec).copied().unwrap_or("");
-                    let out_sec = SECURITY.get(st.out_sec).copied().unwrap_or("");
-                    if let Some(a) = list.as_array_mut() {
-                        a.retain(|x| x.get("address").and_then(Value::as_str) != Some(st.address.trim()));
-                        a.push(json!({
-                            "name": st.name.trim(), "address": st.address.trim(), "type": kind,
-                            "incoming": {"host": st.in_host.trim(), "port": st.in_port, "security": in_sec},
-                            "outgoing": {"host": st.out_host.trim(), "port": st.out_port, "security": out_sec, "auth": st.smtp_auth},
-                            "user": st.user.trim(),
-                        }));
-                    }
-                    common::set_prefs(ctx, prefs);
-                    Out::Close
-                }
-                Some(false) => Out::Close,
-                None => Out::Keep,
-            }
-        })
-    })
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -415,28 +145,208 @@ fn folder_sizes(ui: &mut Ui, app: &App, uid: u64) {
 // ---------------------------------------------------------------------------------------------------------
 // Import and Export Wizard
 
-const IE_ACTIONS: [(&str, &str, &str); 4] = [
-    (
-        "importEml",
-        "Import an Internet message file (.eml)",
-        "Adds one message saved as an .eml file to a folder.",
-    ),
-    (
-        "importMbox",
-        "Import an MBOX mailbox file",
-        "Adds every message in an MBOX file (Thunderbird, Apple Mail, mutt…) to a folder.",
-    ),
-    (
-        "importMaildir",
-        "Import a Maildir folder",
-        "Adds the messages in a Maildir directory (cur/ and new/) to a folder.",
-    ),
-    (
-        "exportMbox",
-        "Export a folder to an MBOX file",
-        "Writes every message in a folder to one MBOX file other mail programs can open.",
-    ),
+/// One Import and Export Wizard action (`file.openExport` `action`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IeAction {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub desc: &'static str,
+    /// Folders the action reads from or files into.
+    pub pick: Pick,
+    /// File type for the file dialogs: name and extensions (empty = a folder, Maildir).
+    pub filter: (&'static str, &'static [&'static str]),
+    /// File name suggested for exports.
+    pub suggested: &'static str,
+}
+
+impl IeAction {
+    pub(crate) fn export(&self) -> bool {
+        self.key.starts_with("export")
+    }
+    pub(crate) fn folder_input(&self) -> bool {
+        self.filter.1.is_empty()
+    }
+    pub(crate) fn filters(&self) -> Vec<crate::FileFilter> {
+        if self.folder_input() {
+            return Vec::new();
+        }
+        vec![
+            crate::FileFilter::new(self.filter.0, self.filter.1),
+            crate::FileFilter::new("All files", &["*"]),
+        ]
+    }
+    /// What the folder list is called on the second page.
+    pub(crate) fn folder_prompt(&self) -> &'static str {
+        match (self.export(), self.pick) {
+            (true, _) => "Select the folder to export from:",
+            (false, Pick::Kinds(k)) if k.contains(&FolderKind::Calendar) => "Import into this calendar:",
+            (false, Pick::Kinds(_)) => "Import into this contacts folder:",
+            (false, _) => "Import into this folder:",
+        }
+    }
+}
+
+const MAIL: Pick = Pick::Mail;
+const CALENDAR: Pick = Pick::Kinds(&[FolderKind::Calendar]);
+const CALENDAR_OR_TASKS: Pick = Pick::Kinds(&[FolderKind::Calendar, FolderKind::Tasks]);
+const CONTACTS: Pick = Pick::Kinds(&[FolderKind::Contacts]);
+
+/// Wizard actions, imports first (labels name the file types; formats from public specs).
+pub(crate) const IE_ACTIONS: [IeAction; 11] = [
+    IeAction {
+        key: "importEml",
+        label: "Import an Internet message file (.eml)",
+        desc: "Adds one message saved as an .eml file (RFC 5322) to a folder.",
+        pick: MAIL,
+        filter: ("Internet message", &["eml"]),
+        suggested: "",
+    },
+    IeAction {
+        key: "importMsg",
+        label: "Import a .msg message file",
+        desc: "Adds one message saved as a .msg file to a folder.",
+        pick: MAIL,
+        filter: ("Message file", &["msg"]),
+        suggested: "",
+    },
+    IeAction {
+        key: "importMbox",
+        label: "Import an MBOX mailbox file",
+        desc: "Adds every message in an MBOX file (Thunderbird, Apple Mail, mutt…) to a folder.",
+        pick: MAIL,
+        filter: ("MBOX mailbox", &["mbox", "mbx"]),
+        suggested: "",
+    },
+    IeAction {
+        key: "importMaildir",
+        label: "Import a Maildir folder",
+        desc: "Adds the messages in a Maildir directory (cur/ and new/) to a folder.",
+        pick: MAIL,
+        filter: ("", &[]),
+        suggested: "",
+    },
+    IeAction {
+        key: "importIcs",
+        label: "Import an iCalendar (.ics) file",
+        desc: "Adds the events (and tasks) of an iCalendar file (RFC 5545) to a calendar.",
+        pick: CALENDAR,
+        filter: ("iCalendar", &["ics", "ical", "ifb", "vcs"]),
+        suggested: "",
+    },
+    IeAction {
+        key: "importVcf",
+        label: "Import a vCard file (.vcf)",
+        desc: "Adds the contacts of a vCard file (RFC 6350) to a contacts folder.",
+        pick: CONTACTS,
+        filter: ("vCard", &["vcf", "vcard"]),
+        suggested: "",
+    },
+    IeAction {
+        key: "importCsv",
+        label: "Import contacts from a CSV file",
+        desc: "Adds contacts from a comma-separated values file; columns are matched by their names.",
+        pick: CONTACTS,
+        filter: ("Comma-separated values", &["csv"]),
+        suggested: "",
+    },
+    IeAction {
+        key: "exportMbox",
+        label: "Export a folder to an MBOX file",
+        desc: "Writes every message in a folder to one MBOX file other mail programs can open.",
+        pick: MAIL,
+        filter: ("MBOX mailbox", &["mbox"]),
+        suggested: "export.mbox",
+    },
+    IeAction {
+        key: "exportIcs",
+        label: "Export a calendar to an iCalendar (.ics) file",
+        desc: "Writes the events of a calendar (or the tasks of a task list) to an iCalendar file.",
+        pick: CALENDAR_OR_TASKS,
+        filter: ("iCalendar", &["ics"]),
+        suggested: "calendar.ics",
+    },
+    IeAction {
+        key: "exportVcf",
+        label: "Export contacts to a vCard file (.vcf)",
+        desc: "Writes the contacts of a folder to one vCard 4.0 file.",
+        pick: CONTACTS,
+        filter: ("vCard", &["vcf"]),
+        suggested: "contacts.vcf",
+    },
+    IeAction {
+        key: "exportCsv",
+        label: "Export contacts to a CSV file",
+        desc: "Writes the contacts of a folder to a comma-separated values file spreadsheets can open.",
+        pick: CONTACTS,
+        filter: ("Comma-separated values", &["csv"]),
+        suggested: "contacts.csv",
+    },
 ];
+
+/// A folder the action can use: `current` when it fits, else the current account's folder of the right
+/// kind (Calendar, Contacts), else the first one that fits.
+pub(crate) fn ie_folder(app: &App, action: &IeAction, current: Option<u64>) -> Option<u64> {
+    let fits = |f: &mailcraft_model::Folder| match action.pick {
+        Pick::Mail => f.kind == FolderKind::Mail,
+        Pick::Kinds(k) => k.contains(&f.kind),
+        Pick::Parent | Pick::Any => true,
+    };
+    let mb = &app.s.mailbox;
+    if let Some(f) = current.and_then(|c| mb.folder(FolderId(c))).filter(|f| fits(f)) {
+        return Some(f.id.0);
+    }
+    let role = match action.pick {
+        Pick::Kinds(k) if k.contains(&FolderKind::Calendar) => Some(FolderRole::Calendar),
+        Pick::Kinds(k) if k.contains(&FolderKind::Contacts) => Some(FolderRole::Contacts),
+        _ => Some(FolderRole::Inbox),
+    };
+    app.s
+        .current_account()
+        .zip(role)
+        .and_then(|(a, r)| mb.role_folder(a, r))
+        .filter(|f| mb.folder(*f).is_some_and(fits))
+        .or_else(|| mb.folders.values().find(|f| fits(f)).map(|f| f.id))
+        .map(|f| f.0)
+}
+
+/// Path of a folder for labels ("Mailbox › Inbox"; empty when none).
+pub(crate) fn folder_label(app: &App, id: Option<u64>) -> String {
+    folder_path(app, id)
+}
+
+/// What an import or export did, for the closing message.
+pub(crate) fn ie_result_text(
+    app: &App,
+    action: &IeAction,
+    v: &Value,
+    path: &str,
+    folder: Option<u64>,
+) -> String {
+    let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let what = match action.pick {
+        Pick::Kinds(k) if k.contains(&FolderKind::Contacts) => "contact(s)",
+        Pick::Kinds(_) => "item(s)",
+        _ => "message(s)",
+    };
+    if action.export() {
+        return format!("Exported {} {what} to {path}.", n("exported"));
+    }
+    let into = folder_path(app, v.get("folder").and_then(Value::as_u64).or(folder));
+    let mut text = if action.key == "importIcs" {
+        format!("Imported {} appointment(s) and {} task(s) into {into}.", n("appointments"), n("tasks"))
+    } else {
+        format!("Imported {} {what} into {into}.", n("imported"))
+    };
+    let unmapped: Vec<&str> = v
+        .get("unmappedColumns")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).take(20).collect())
+        .unwrap_or_default();
+    if !unmapped.is_empty() {
+        text.push_str(&format!(" Columns not imported: {}.", unmapped.join(", ")));
+    }
+    text
+}
 
 #[derive(Clone, Default)]
 struct IeState {
@@ -451,9 +361,9 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let init = |a: &App| IeState { folder: Some(a.s.selection.folder.0), ..Default::default() };
     with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Import and Export Wizard", 480.0, |ui, app| {
-            let Some((key, label, desc)) = IE_ACTIONS.get(st.action).copied() else { return Out::Close };
-            let export = key.starts_with("export");
+        window(ctx, app, d, "Import and Export Wizard", 520.0, |ui, app| {
+            let Some(action) = IE_ACTIONS.get(st.action).copied() else { return Out::Close };
+            let export = action.export();
             if st.page == 0 {
                 ui.label("Choose an action to perform:");
                 egui::Frame::new()
@@ -461,33 +371,58 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     .inner_margin(4.0)
                     .show(ui, |ui| {
                         ui.set_min_height(120.0);
-                        for (i, (_, l, _)) in IE_ACTIONS.iter().enumerate() {
-                            if ui.selectable_label(st.action == i, *l).clicked() {
-                                st.action = i;
-                            }
-                        }
+                        ui.set_min_width(ui.available_width());
+                        egui::ScrollArea::vertical().id_salt(("ie-actions", uid)).max_height(240.0).show(
+                            ui,
+                            |ui| {
+                                for (i, a) in IE_ACTIONS.iter().enumerate() {
+                                    if ui.selectable_label(st.action == i, a.label).clicked()
+                                        && st.action != i
+                                    {
+                                        st.action = i;
+                                        st.path.clear();
+                                    }
+                                }
+                            },
+                        );
                     });
                 ui.label(RichText::new("Description").strong());
-                muted(ui, app, desc);
+                muted(ui, app, action.desc);
             } else {
-                ui.label(RichText::new(label).strong());
+                ui.label(RichText::new(action.label).strong());
                 ui.label(if export {
                     "Save exported file as:"
-                } else if key == "importMaildir" {
+                } else if action.folder_input() {
                     "Maildir folder to import:"
                 } else {
                     "File to import:"
                 });
                 if st.path.is_empty() {
-                    st.path = if export { format!("{}/export.mbox", home()) } else { format!("{}/", home()) };
+                    st.path = if export {
+                        format!("{}/{}", home(), action.suggested)
+                    } else {
+                        format!("{}/", home())
+                    };
                 }
-                ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(f32::INFINITY));
-                ui.label(if export {
-                    "Select the folder to export from:"
-                } else {
-                    "Import into this folder:"
+                ui.horizontal(|ui| {
+                    let browse = common::browse_button(ui, app);
+                    ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(ui.available_width()));
+                    if browse {
+                        let title = action.label;
+                        let picked = if export {
+                            common::browse_save(app, title, &action.filters(), &st.path)
+                        } else if action.folder_input() {
+                            common::browse_folder(app, title, &st.path)
+                        } else {
+                            common::browse_open(app, title, &action.filters(), &st.path)
+                        };
+                        if let Some(p) = picked {
+                            st.path = p;
+                        }
+                    }
                 });
-                folder_tree(ui, app, &mut st.folder, Pick::Mail, ("ie", uid), 180.0);
+                ui.label(action.folder_prompt());
+                folder_tree(ui, app, &mut st.folder, action.pick, ("ie", uid), 180.0);
             }
             if !st.error.is_empty() {
                 ui.colored_label(app.theme.danger, &st.error);
@@ -499,6 +434,7 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 }
                 if st.page == 0 {
                     if primary(ui, app, true, "Next >") {
+                        st.folder = ie_folder(app, &action, st.folder);
                         st.page = 1;
                     }
                 } else {
@@ -506,23 +442,11 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     if primary(ui, app, ready, "Finish") {
                         let res = app.run(
                             "file.openExport",
-                            json!({"action": key, "path": st.path.trim(), "folder": st.folder}),
+                            json!({"action": action.key, "path": st.path.trim(), "folder": st.folder}),
                         );
                         match res {
                             Some(v) => {
-                                let text = if export {
-                                    format!(
-                                        "Exported {} message(s) to {}.",
-                                        v.get("exported").and_then(Value::as_u64).unwrap_or(0),
-                                        st.path.trim()
-                                    )
-                                } else {
-                                    format!(
-                                        "Imported {} message(s) into {}.",
-                                        v.get("imported").and_then(Value::as_u64).unwrap_or(0),
-                                        folder_path(app, st.folder)
-                                    )
-                                };
+                                let text = ie_result_text(app, &action, &v, st.path.trim(), st.folder);
                                 out = Out::close_open(
                                     "message",
                                     json!({"title": "Import and Export", "text": text}),
@@ -545,9 +469,52 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 // ---------------------------------------------------------------------------------------------------------
 // Save As / Save Attachments
 
+/// Save As file types: engine type, label, extensions.
+pub(crate) const SAVE_TYPES: [(&str, &str, &[&str]); 4] = [
+    ("eml", "Internet message (*.eml)", &["eml"]),
+    ("msg", "Message file (*.msg)", &["msg"]),
+    ("txt", "Text only (*.txt)", &["txt"]),
+    ("html", "HTML (*.htm; *.html)", &["html", "htm"]),
+];
+
+/// Index of the Save As type a path's extension names (default: .eml).
+pub(crate) fn save_type_of(path: &str) -> usize {
+    let ext = std::path::Path::new(path.trim())
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    SAVE_TYPES.iter().position(|(_, _, exts)| exts.contains(&ext.as_str())).unwrap_or(0)
+}
+
+/// `path` with its extension replaced by the first one of Save As type `idx` (folders are left alone).
+pub(crate) fn with_save_ext(path: &str, idx: usize) -> String {
+    let p = std::path::Path::new(path.trim());
+    let Some(ext) = SAVE_TYPES.get(idx).and_then(|t| t.2.first()) else { return path.to_owned() };
+    if path.trim().is_empty() || p.is_dir() || path.ends_with('/') || path.ends_with('\\') {
+        return path.to_owned();
+    }
+    p.with_extension(ext).display().to_string()
+}
+
+/// File type filters for a Save As dialog: the chosen type first, then the others.
+pub(crate) fn save_filters(idx: usize) -> Vec<crate::FileFilter> {
+    let mut out = Vec::new();
+    if let Some((_, label, exts)) = SAVE_TYPES.get(idx) {
+        out.push(crate::FileFilter::new(label, exts));
+    }
+    for (i, (_, label, exts)) in SAVE_TYPES.iter().enumerate() {
+        if i != idx {
+            out.push(crate::FileFilter::new(label, exts));
+        }
+    }
+    out
+}
+
 #[derive(Clone, Default)]
 struct PathState {
     path: String,
+    kind: usize,
     error: String,
 }
 
@@ -558,16 +525,33 @@ fn save_as(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         ctx,
         app,
         uid,
-        |_: &App| PathState { path: format!("{}/{suggested}", home()), ..Default::default() },
+        |_: &App| PathState {
+            path: format!("{}/{suggested}", home()),
+            kind: save_type_of(&suggested),
+            ..Default::default()
+        },
         |st, app| {
-            window(ctx, app, d, "Save As", 480.0, |ui, app| {
-                ui.label("File name:");
-                ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(f32::INFINITY));
-                muted(
-                    ui,
-                    app,
-                    "Save as type: Internet message (*.eml). A folder path saves under the message subject.",
-                );
+            window(ctx, app, d, "Save As", 520.0, |ui, app| {
+                let l = ui.label("File name:");
+                ui.horizontal(|ui| {
+                    let browse = common::browse_button(ui, app);
+                    ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(ui.available_width()))
+                        .labelled_by(l.id);
+                    if browse
+                        && let Some(p) = common::browse_save(app, "Save As", &save_filters(st.kind), &st.path)
+                    {
+                        st.kind = save_type_of(&p);
+                        st.path = p;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Save as type:");
+                    let labels: Vec<&str> = SAVE_TYPES.iter().map(|t| t.1).collect();
+                    if common::combo_idx(ui, ("saveas-type", uid), &mut st.kind, &labels, 240.0) {
+                        st.path = with_save_ext(&st.path, st.kind);
+                    }
+                });
+                muted(ui, app, "A folder path saves the message there under its subject.");
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
                 }
@@ -577,7 +561,9 @@ fn save_as(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     }
                     if primary(ui, app, !st.path.trim().is_empty(), "Save") {
                         let ids: Vec<u64> = d.u64("item").into_iter().collect();
-                        if app.run("file.saveAs", json!({"path": st.path.trim(), "ids": ids})).is_some() {
+                        let kind = SAVE_TYPES.get(st.kind).map_or("eml", |t| t.0);
+                        let p = json!({"path": st.path.trim(), "ids": ids, "type": kind});
+                        if app.run("file.saveAs", p).is_some() {
                             return Out::Close;
                         }
                         st.error = last_error(app);
@@ -621,7 +607,13 @@ fn save_attachments(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         });
                     });
                 ui.label("Save in folder:");
-                ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(f32::INFINITY));
+                ui.horizontal(|ui| {
+                    let browse = common::browse_button(ui, app);
+                    ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(ui.available_width()));
+                    if browse && let Some(p) = common::browse_folder(app, "Save All Attachments", &st.path) {
+                        st.path = p;
+                    }
+                });
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
                 }

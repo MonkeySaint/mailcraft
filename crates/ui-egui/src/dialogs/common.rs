@@ -392,6 +392,8 @@ pub(crate) enum Pick {
     Parent,
     /// Every folder.
     Any,
+    /// Folders of these kinds (calendars and task lists for iCalendar, contacts for vCard/CSV).
+    Kinds(&'static [FolderKind]),
 }
 
 fn pickable(f: &Folder, pick: Pick) -> bool {
@@ -399,6 +401,7 @@ fn pickable(f: &Folder, pick: Pick) -> bool {
         Pick::Mail => f.kind == FolderKind::Mail,
         Pick::Parent => f.kind != FolderKind::Search,
         Pick::Any => true,
+        Pick::Kinds(k) => k.contains(&f.kind),
     }
 }
 
@@ -592,4 +595,62 @@ pub(crate) fn split_list(s: &str) -> Vec<String> {
 /// Bytes as "12 KB" / "3.4 MB".
 pub(crate) fn size_text(bytes: u64) -> String {
     mailcraft_engine::queries::size_text(bytes)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// File dialogs (Browse...)
+
+/// Folder to start a file dialog in: `path` itself when it is a folder, else its parent when that exists.
+fn start_dir(path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(path.trim());
+    if path.trim().is_empty() {
+        return None;
+    }
+    if p.is_dir() {
+        return Some(p.to_path_buf());
+    }
+    p.parent().filter(|d| d.is_dir()).map(std::path::Path::to_path_buf)
+}
+
+/// A Browse... button shown when the app installed file dialogs; returns true when clicked.
+pub(crate) fn browse_button(ui: &mut Ui, app: &App) -> bool {
+    app.files.is_some() && ui.button("Browse...").clicked()
+}
+
+/// Runs the platform's open-file dialog; the chosen file as a string.
+pub(crate) fn browse_open(
+    app: &App,
+    title: &str,
+    filters: &[crate::FileFilter],
+    current: &str,
+) -> Option<String> {
+    let files = app.files.clone()?;
+    let start = start_dir(current);
+    let picked = files.open_files(title, filters, false, start.as_deref())?;
+    picked.into_iter().next().map(|p| p.display().to_string())
+}
+
+/// Runs the platform's save dialog, suggesting the file name of `current`.
+pub(crate) fn browse_save(
+    app: &App,
+    title: &str,
+    filters: &[crate::FileFilter],
+    current: &str,
+) -> Option<String> {
+    let files = app.files.clone()?;
+    let path = std::path::Path::new(current.trim());
+    let name = if path.is_dir() {
+        String::new()
+    } else {
+        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    };
+    let start = start_dir(current);
+    files.save_file(title, &name, filters, start.as_deref()).map(|p| p.display().to_string())
+}
+
+/// Runs the platform's folder picker.
+pub(crate) fn browse_folder(app: &App, title: &str, current: &str) -> Option<String> {
+    let files = app.files.clone()?;
+    let start = start_dir(current);
+    files.pick_folder(title, start.as_deref()).map(|p| p.display().to_string())
 }

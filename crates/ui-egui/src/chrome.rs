@@ -724,8 +724,10 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
             app.run("view.reminderWindow", json!({}));
         }
     }
+    sync_status(ui, app, frame);
 
-    // Right side: view buttons and zoom (the zoom group is dropped first on very narrow windows).
+    // Right side: view buttons and zoom (the zoom group is dropped first on very narrow windows), then the
+    // connection state.
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.add_space(8.0);
@@ -767,7 +769,108 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
         if widgets::icon_toggle(ui, app, "folder-pane", "Normal", !reading, 20.0).clicked() && reading {
             app.run("view.normalView", json!({}));
         }
+        connection_state(ui, app, frame);
     });
+}
+
+/// Total messages waiting in the Outboxes of server accounts, and the first account with any.
+fn outbox_waiting(app: &App) -> (usize, Option<u32>) {
+    let st = app.s.sync_status();
+    let total = st.accounts.iter().fold(0usize, |n, a| n.saturating_add(a.outbox));
+    (total, st.accounts.iter().find(|a| a.outbox > 0).map(|a| a.account))
+}
+
+/// Left side of the status bar, after the item counts: what send/receive is doing ("Updating Inbox…", "All
+/// folders are up to date.") or its error with a Retry button, and the Outbox badge. Clicking the text opens
+/// Send/Receive Progress; the badge opens the Outbox.
+fn sync_status(ui: &mut Ui, app: &mut App, frame: &Frame) {
+    let st = app.s.sync_status().clone();
+    if st.accounts.is_empty() {
+        return;
+    }
+    let theme = app.theme.clone();
+    let (outbox, outbox_account) = outbox_waiting(app);
+    let error = st.accounts.iter().find_map(|a| a.error.clone());
+    if st.busy {
+        ui.add(egui::Spinner::new().size(12.0).color(theme.text_muted));
+    }
+    if !st.text.is_empty() && !st.busy && error.is_some() && !app.s.view.work_offline {
+        let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+        app.icons.paint(ui, r, "error", theme.danger);
+        // A failed send leaves the message in the Outbox: Retry sends again, otherwise it runs a full
+        // send/receive.
+        let (label, retry) = if outbox > 0 {
+            (format!("{outbox} message(s) in the Outbox could not be sent"), "sendReceive.sendAll")
+        } else {
+            (st.text.clone(), "sendReceive.all")
+        };
+        let text = egui::RichText::new(truncate_status(&label, frame.width)).color(theme.danger);
+        let r = ui.add(egui::Label::new(text).sense(Sense::click())).on_hover_text(st.text.as_str());
+        if r.clicked() {
+            app.run("sendReceive.showProgress", json!({}));
+        }
+        if ui.add(egui::Button::new("Retry").small()).on_hover_text("Try send/receive again").clicked() {
+            app.run(retry, json!({}));
+        }
+    } else if !st.text.is_empty() {
+        let r = ui
+            .add(egui::Label::new(truncate_status(&st.text, frame.width)).sense(Sense::click()))
+            .on_hover_text("Send/Receive Progress");
+        if r.clicked() {
+            app.run("sendReceive.showProgress", json!({}));
+        }
+    }
+    if outbox > 0 && error.is_none() {
+        let r = widgets::icon_button(ui, app, "outbox", &format!("Outbox: {outbox}"), true)
+            .on_hover_text("Messages waiting to be sent");
+        if r.clicked()
+            && let Some(folder) = outbox_account.and_then(|a| {
+                app.s.mailbox.role_folder(mailcraft_model::AccountId(a), mailcraft_model::FolderRole::Outbox)
+            })
+        {
+            app.run("nav.selectFolder", json!({"folder": folder.0}));
+        }
+    }
+}
+
+/// Status text cut to fit narrow windows (char-safe).
+fn truncate_status(text: &str, width: f32) -> String {
+    let max = if width < 700.0 {
+        28
+    } else if width < 1000.0 {
+        60
+    } else {
+        120
+    };
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Right side of the status bar: "Connected", "Disconnected" or "Working offline". Clicking it toggles Work
+/// Offline (the same command as Send / Receive › Work Offline).
+fn connection_state(ui: &mut Ui, app: &mut App, frame: &Frame) {
+    let st = app.s.sync_status();
+    if st.accounts.is_empty() || frame.width < 600.0 {
+        return;
+    }
+    let offline = app.s.view.work_offline;
+    let text = if offline {
+        "Working offline".to_owned()
+    } else if st.connection_text.is_empty() {
+        "Online".to_owned()
+    } else {
+        st.connection_text.clone()
+    };
+    ui.add_space(12.0);
+    let tip = if offline { "Work Offline is on. Click to go online." } else { "Click to work offline." };
+    let r = ui.add(egui::Button::new(text).frame(false).selected(offline)).on_hover_text(tip);
+    if r.clicked() {
+        app.run("sendReceive.workOffline", json!({"offline": offline}));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------

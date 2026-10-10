@@ -72,6 +72,12 @@ pub struct ViewState {
     pub quick_access: Vec<String>,
     /// The last app opened from More Apps, pinned to the module rail above More Apps.
     pub pinned_app: Option<Module>,
+    /// Send / Receive › Work Offline: no server connections; Outbox messages wait.
+    pub work_offline: bool,
+    /// Options › Advanced › Send/Receive: automatic send/receive every N minutes (0 = off).
+    pub auto_send_receive_minutes: u32,
+    /// Options › Advanced › "Send immediately when connected".
+    pub send_immediately: bool,
 }
 
 /// Default Quick Access Toolbar: Send/Receive All Folders, Undo (`plan/outlook/layout.md`).
@@ -109,6 +115,9 @@ impl Default for ViewState {
             ribbon_auto_hide: false,
             quick_access: DEFAULT_QUICK_ACCESS.iter().map(|s| (*s).to_owned()).collect(),
             pinned_app: None,
+            work_offline: false,
+            auto_send_receive_minutes: crate::sync::DEFAULT_AUTO_MINUTES,
+            send_immediately: true,
         }
     }
 }
@@ -159,6 +168,12 @@ pub struct Session {
     pub checkpoint_bytes: u64,
     /// Number of [`Session::journal`] calls so far (lets `run` tell whether a failed command journaled).
     journal_calls: u64,
+    /// Mutating commands running (one may run others); server changes are queued by the outermost one.
+    run_depth: u32,
+    /// Account passwords and tokens (never in the mailbox or its journal; see `accounts.rs`).
+    pub secrets: Box<dyn crate::accounts::SecretStore>,
+    /// Send/receive workers, queued results and the status bar state (see `sync.rs`).
+    pub sync: crate::sync::SyncState,
 }
 
 /// Most ops kept in `pending_ops` while no store is attached; beyond that they collapse into one `Replace`.
@@ -192,6 +207,9 @@ impl Session {
             module_folders: Vec::new(),
             checkpoint_bytes: mailcraft_store::Autosave::DEFAULT_CHECKPOINT_BYTES,
             journal_calls: 0,
+            run_depth: 0,
+            secrets: Box::new(crate::accounts::MemorySecretStore::default()),
+            sync: crate::sync::SyncState::default(),
         };
         s.refresh_me();
         s.select_default_folder();
@@ -214,6 +232,16 @@ impl Session {
         }
         let mut s = Session::new(mailbox);
         s.store = Some(store);
+        // Secrets live next to the data file, outside the mailbox snapshot and journal.
+        match crate::accounts::FileSecretStore::open(dir) {
+            Ok(st) => s.secrets = Box::new(st),
+            Err(e) => {
+                log::error!("account secrets unavailable: {e}");
+                s.notify(Notice::Error(format!(
+                    "Saved account passwords could not be read ({e}). Enter them again in Account Settings."
+                )));
+            }
+        }
         Ok(s)
     }
 
@@ -266,7 +294,11 @@ impl Session {
         let snapshot = (spec.mutates && !self_journaling).then(|| self.mailbox.clone());
         let pending_before = self.pending_ops.len();
         let journal_calls_before = self.journal_calls;
-        let result = match catch_unwind(AssertUnwindSafe(|| (spec.run)(self, params))) {
+        let counted = u32::from(snapshot.is_some());
+        self.run_depth = self.run_depth.saturating_add(counted);
+        let result = catch_unwind(AssertUnwindSafe(|| (spec.run)(self, params)));
+        self.run_depth = self.run_depth.saturating_sub(counted);
+        let result = match result {
             Ok(r) => r,
             Err(payload) => {
                 let msg = panic_text(payload.as_ref());
@@ -286,6 +318,11 @@ impl Session {
                     self.pending_ops.truncate(pending_before);
                 }
             } else {
+                // Local changes to synchronised folders become queued server changes (adjusting the
+                // mailbox, so this comes before the diff that journals it).
+                if self.run_depth == 0 {
+                    crate::sync::queue_local_changes(self, &before);
+                }
                 let ops = diff_ops(&before, &self.mailbox);
                 if !ops.is_empty() {
                     self.undo.push(UndoEntry { label: spec.label.to_owned(), before: Box::new(before) });
@@ -345,6 +382,7 @@ impl Session {
     pub fn undo_last(&mut self) -> Option<String> {
         let entry = self.undo.undo.pop()?;
         let after = std::mem::replace(&mut self.mailbox, *entry.before);
+        crate::sync::after_restore(self, &after);
         self.undo.push_redo(UndoEntry { label: entry.label.clone(), before: Box::new(after) });
         self.after_restore();
         Some(entry.label)
@@ -354,6 +392,7 @@ impl Session {
     pub fn redo_last(&mut self) -> Option<String> {
         let entry = self.undo.redo.pop()?;
         let before = std::mem::replace(&mut self.mailbox, *entry.before);
+        crate::sync::after_restore(self, &before);
         self.undo.push_keep_redo(UndoEntry { label: entry.label.clone(), before: Box::new(before) });
         self.after_restore();
         Some(entry.label)
@@ -446,17 +485,41 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Store ops turning `before` into `after`: per-item and per-folder upserts/removals, or one `Replace` when
-/// anything else changed (accounts, rules, categories, views, quick steps, calendar/contacts/tasks/notes).
+/// anything else changed (accounts and their sync queues, rules, categories, views, quick steps,
+/// calendar/contacts/tasks/notes, signatures, Auto-Complete, the dictionary).
 pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
-    let other_changed = before.accounts != after.accounts
-        || before.categories != after.categories
-        || before.rules != after.rules
-        || before.quick_steps != after.quick_steps
-        || before.views != after.views
-        || before.appointments != after.appointments
-        || before.contacts != after.contacts
-        || before.tasks != after.tasks
-        || before.notes != after.notes;
+    // Exhaustive on purpose: a new Mailbox field fails to compile here until it is journaled.
+    let Mailbox {
+        accounts,
+        folders: _,
+        mail: _,
+        appointments,
+        contacts,
+        tasks,
+        notes,
+        categories,
+        rules,
+        quick_steps,
+        views,
+        next_id: _,
+        signatures,
+        signature_defaults,
+        recent_recipients,
+        custom_dictionary,
+    } = after;
+    let other_changed = before.accounts != *accounts
+        || before.categories != *categories
+        || before.rules != *rules
+        || before.quick_steps != *quick_steps
+        || before.views != *views
+        || before.appointments != *appointments
+        || before.contacts != *contacts
+        || before.tasks != *tasks
+        || before.notes != *notes
+        || before.signatures != *signatures
+        || before.signature_defaults != *signature_defaults
+        || before.recent_recipients != *recent_recipients
+        || before.custom_dictionary != *custom_dictionary;
     if other_changed {
         return vec![Op::Replace(Box::new(after.clone()))];
     }
@@ -482,4 +545,24 @@ pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
         }
     }
     ops
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_journals_signatures_and_auto_complete() {
+        let mb = Mailbox::new_local("Local");
+        let mut after = mb.clone();
+        after.custom_dictionary.push("mailcraft".into());
+        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::Replace(_)]));
+        let mut after = mb.clone();
+        after.recent_recipients.push(Default::default());
+        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::Replace(_)]));
+        let mut after = mb.clone();
+        after.signatures.push(Default::default());
+        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::Replace(_)]));
+        assert!(diff_ops(&mb, &mb.clone()).is_empty());
+    }
 }

@@ -24,6 +24,7 @@ resvg.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
+mailcraft-testmail.workspace = true
 image.workspace = true
 
 [lints]

@@ -783,6 +783,11 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     s.composes.remove(&cid);
+    // "Send immediately when connected": the account's worker submits the Outbox now (deferred messages
+    // wait); otherwise the next send/receive does.
+    if c.delay_until.is_none_or(|d| d.unix <= now.unix) {
+        crate::sync::send_now(s, account.id);
+    }
     Ok(
         json!({"sent": true, "item": id.0, "outbox": outbox.0, "deferredUntil": c.delay_until.map(|d| d.to_rfc3339())}),
     )

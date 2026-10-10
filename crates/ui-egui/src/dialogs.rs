@@ -10,6 +10,9 @@
 //! [`confirm`] (Yes/No box that runs a command), [`take_notices`] (moves `Notice::OpenDialog` from the
 //! session into `app.ui.dialogs`; [`dialogs`] calls it every frame).
 
+#[cfg(test)]
+mod account_tests;
+mod accounts;
 mod categories;
 mod common;
 mod compose_dlg;
@@ -31,6 +34,7 @@ use serde_json::{Value, json};
 
 use crate::{App, Surface};
 use common::{Dlg, Out};
+pub(crate) use common::{browse_folder, browse_open, browse_save};
 
 pub fn dialogs(ctx: &egui::Context, app: &mut App) {
     take_notices(app);
@@ -170,6 +174,8 @@ pub const KNOWN: &[&str] = &[
     "contactSupport",
     "accountSettings",
     "addAccount",
+    "testAccount",
+    "confirmRemoveAccount",
     "mailboxCleanup",
     "importExport",
     "saveAs",
@@ -298,6 +304,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     }
     if d.name == "options" {
         return options::show(ctx, app, d);
+    }
+    if let Some(out) = accounts::show(ctx, app, d) {
+        return out;
     }
     if let Some(out) = general::show(ctx, app, d) {
         return out;

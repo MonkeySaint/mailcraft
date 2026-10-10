@@ -171,6 +171,34 @@ pub fn weekday_from_days(days: i64) -> Weekday {
     Weekday::from_monday_index(days.rem_euclid(7) + 3)
 }
 
+/// A source of the current time: seconds since the Unix epoch (UTC).
+pub type ClockFn = fn() -> i64;
+
+/// The clock [`DateTime::now_utc`] reads on targets without a system clock (see [`set_clock`]).
+static CLOCK: std::sync::RwLock<Option<ClockFn>> = std::sync::RwLock::new(None);
+
+/// Installs (or with `None` removes) the clock [`DateTime::now_utc`] reads on `wasm32-unknown-unknown`,
+/// where the standard library has no clock. The web app installs one backed by JavaScript `Date.now()`.
+/// Native targets keep reading the system clock and ignore it.
+pub fn set_clock(f: Option<ClockFn>) {
+    // A poisoned lock only means a writer panicked mid-assignment of a `Copy` value: take it over.
+    let mut slot = CLOCK.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = f;
+}
+
+/// The clock installed with [`set_clock`], if any.
+pub fn clock() -> Option<ClockFn> {
+    *CLOCK.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Seconds since the epoch from `clock`, or the epoch when there is none. A reading outside years
+/// 0000–9999 (a broken host clock) is treated as the epoch too.
+pub fn clock_now(clock: Option<ClockFn>) -> i64 {
+    /// 0000-01-01T00:00:00Z and 9999-12-31T23:59:59Z.
+    const RANGE: std::ops::RangeInclusive<i64> = -62_167_219_200..=253_402_300_799;
+    clock.map(|f| f()).filter(|t| RANGE.contains(t)).unwrap_or(0)
+}
+
 impl DateTime {
     pub fn from_unix(unix: i64, offset_min: i32) -> Self {
         Self { unix, offset_min }
@@ -226,7 +254,14 @@ impl DateTime {
         self.unix.saturating_add(i64::from(offset_min) * 60).div_euclid(86_400)
     }
     /// The current time (UTC offset 0). Returns the epoch if the system clock is before 1970.
+    ///
+    /// On `wasm32-unknown-unknown` there is no system clock (`SystemTime::now` panics there), so the time
+    /// comes from the function installed with [`set_clock`] (the web app passes one backed by JavaScript
+    /// `Date.now()`), or is the epoch when none is installed.
     pub fn now_utc() -> Self {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let unix = clock_now(clock());
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -703,5 +738,32 @@ mod tests {
         fn parse_never_panics_datelike(s in "[A-Za-z]{0,4},? [0-9]{0,3} [A-Za-z]{0,9} [0-9]{0,5} [0-9:]{0,9} [+-]?[0-9A-Z]{0,5}") {
             let _ = DateTime::parse_rfc5322(&s);
         }
+    }
+
+    #[test]
+    fn installed_clock_drives_now_without_a_system_clock() {
+        fn fixed() -> i64 {
+            1_791_536_400 // 2026-10-09T09:00:00Z
+        }
+        fn broken() -> i64 {
+            i64::MAX
+        }
+        fn before_year_zero() -> i64 {
+            i64::MIN
+        }
+        assert_eq!(clock_now(None), 0, "no clock: the epoch");
+        assert_eq!(clock_now(Some(fixed)), 1_791_536_400);
+        assert_eq!(clock_now(Some(broken)), 0);
+        assert_eq!(clock_now(Some(before_year_zero)), 0);
+        assert_eq!(clock_now(Some(|| 253_402_300_799)), 253_402_300_799);
+        // The only test that touches the global clock (tests run in parallel).
+        set_clock(Some(fixed));
+        assert_eq!(clock().map(|f| f()), Some(1_791_536_400));
+        let now = DateTime::now_utc();
+        assert_eq!(now.offset_min, 0);
+        // Native targets keep reading the system clock (any time after 2020-01-01).
+        assert!(now.unix > 1_577_836_800, "{now:?}");
+        set_clock(None);
+        assert!(clock().is_none());
     }
 }

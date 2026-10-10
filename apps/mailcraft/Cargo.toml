@@ -11,6 +11,8 @@ mailcraft-engine.workspace = true
 mailcraft-ui-egui.workspace = true
 eframe.workspace = true
 log.workspace = true
+# Native open/save/folder dialogs (MIT).
+rfd.workspace = true
 serde_json.workspace = true
 
 [lints]

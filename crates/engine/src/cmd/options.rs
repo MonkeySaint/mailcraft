@@ -35,7 +35,7 @@ const ALIASES: [(&str, &str, &str); 4] = [
 ];
 
 /// Option keys `options.set` / `options.get` understand.
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 12] = [
     "view.darkMode",
     "view.zoom",
     "view.statusBar",
@@ -45,6 +45,9 @@ pub const KEYS: [&str; 9] = [
     "view.readingPane",
     "view.folderPane",
     "search.scope",
+    "sendReceive.autoMinutes",
+    "sendReceive.sendImmediately",
+    "sendReceive.workOffline",
 ];
 
 fn spec(
@@ -131,6 +134,9 @@ fn value_of(s: &Session, key: &str) -> Option<Value> {
         "view.favorites" => json!(v.favorites_visible),
         "view.readingPane" => json!(reading_pane_name(v.reading_pane)),
         "view.folderPane" => json!(folder_pane_name(v.folder_pane)),
+        "sendReceive.autoMinutes" => json!(v.auto_send_receive_minutes),
+        "sendReceive.sendImmediately" => json!(v.send_immediately),
+        "sendReceive.workOffline" => json!(v.work_offline),
         "search.scope" => {
             json!(SCOPES.iter().find(|(sc, _)| *sc == v.search_scope).map_or("currentFolder", |(_, n)| *n))
         }
@@ -180,6 +186,14 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
                 o => return Err(CmdError::Params(format!("`view.folderPane`: unknown value `{o}`"))),
             };
         }
+        "sendReceive.autoMinutes" => {
+            s.view.auto_send_receive_minutes =
+                v.as_u64().filter(|m| *m <= 1440).and_then(|m| u32::try_from(m).ok()).ok_or_else(|| {
+                    CmdError::Params("`sendReceive.autoMinutes` takes minutes from 0 (off) to 1440".into())
+                })?;
+        }
+        "sendReceive.sendImmediately" => s.view.send_immediately = want_bool(key, v)?,
+        "sendReceive.workOffline" => s.view.work_offline = want_bool(key, v)?,
         "search.scope" => {
             let name = want_str(key, v)?;
             s.view.search_scope = SCOPES
@@ -257,5 +271,15 @@ mod tests {
         assert_eq!(s.run("options.get", &json!({"key": "view.readingPane"})).unwrap()["value"], "bottom");
         let all = s.run("options.get", &json!({})).unwrap();
         assert_eq!(all.as_object().unwrap().len(), KEYS.len());
+        s.run("options.set", &json!({"key": "sendReceive.autoMinutes", "value": 5})).unwrap();
+        assert_eq!(s.view.auto_send_receive_minutes, 5);
+        assert!(matches!(
+            s.run("options.set", &json!({"key": "sendReceive.autoMinutes", "value": 99_999})),
+            Err(CmdError::Params(_))
+        ));
+        assert_eq!(
+            s.run("options.get", &json!({"key": "sendReceive.sendImmediately"})).unwrap()["value"],
+            true
+        );
     }
 }

@@ -864,7 +864,7 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
         .filter(|f| f.kind == FolderKind::Calendar)
         .map(|f| json!({ "id": f.id.0, "name": f.name }))
         .collect();
-    let compose = ComposeState {
+    let mut compose = ComposeState {
         subject: name.clone(),
         attachments: vec![ComposeAttachment {
             filename: format!("{}.ics", file_safe(&name)),
@@ -874,6 +874,8 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
         dirty: true,
         ..Default::default()
     };
+    // Options › Mail › Signatures: the new-messages signature.
+    crate::compose::insert_default_signature(&s.mailbox, &mut compose);
     let id = s.open_compose(compose);
     Ok(json!({ "compose": id, "calendar": folder.0, "events": events, "calendars": calendars }))
 }
@@ -1199,7 +1201,7 @@ pub fn meeting_compose(s: &mut Session, id: ItemId) -> Option<u64> {
         text.push_str(&a.body);
     }
     let ics = ics_calendar(Some("REQUEST"), &[&a], tz, s.now());
-    let compose = ComposeState {
+    let mut compose = ComposeState {
         to,
         cc,
         from: a.organizer.as_ref().map(Address::to_display_string).unwrap_or_default(),
@@ -1213,6 +1215,8 @@ pub fn meeting_compose(s: &mut Session, id: ItemId) -> Option<u64> {
         dirty: true,
         ..Default::default()
     };
+    // Options › Mail › Signatures: the new-messages signature, below the When/Where text.
+    crate::compose::insert_default_signature(&s.mailbox, &mut compose);
     Some(s.open_compose(compose))
 }
 
@@ -1951,6 +1955,41 @@ pub(crate) mod tests {
         let ics = String::from_utf8(c.attachments[0].data.clone()).unwrap();
         assert!(ics.contains("METHOD:PUBLISH"));
         assert!(ics.contains("SUMMARY:Standup\\, daily"));
+    }
+
+    #[test]
+    fn meeting_and_share_messages_get_the_new_message_signature() {
+        let mut s = session();
+        s.mailbox.add_signature("New", Doc::from_plain_text("-- New sig")).unwrap();
+        s.mailbox.add_signature("Re", Doc::from_plain_text("-- Re sig")).unwrap();
+        s.mailbox.set_signature_defaults(None, Some(Some("New")), Some(Some("Re"))).unwrap();
+        let r = s
+            .run("calendar.newMeeting", &json!({"subject": "Plan", "attendees": ["ann@example.com"]}))
+            .unwrap();
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.signature.as_ref().map(|g| g.name.as_str()), Some("New"));
+        let text = c.body.to_plain_text();
+        let when = text.find("When:").unwrap();
+        let sig = text.find("-- New sig").unwrap();
+        assert!(when < sig, "the signature follows the meeting details: {text}");
+        assert_eq!(text.matches("-- New sig").count(), 1);
+        assert_eq!(c.attachments.len(), 1, "the invitation stays attached");
+
+        let r = s.run("calendar.share", &json!({"calendar": "calendar"})).unwrap();
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.signature.as_ref().map(|g| g.name.as_str()), Some("New"));
+    }
+
+    #[test]
+    fn meeting_without_a_default_signature_is_unchanged() {
+        let mut s = session();
+        s.mailbox.add_signature("Unused", Doc::from_plain_text("-- unused")).unwrap();
+        let r = s
+            .run("calendar.newMeeting", &json!({"subject": "Plan", "attendees": ["ann@example.com"]}))
+            .unwrap();
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert!(c.signature.is_none());
+        assert!(!c.body.to_plain_text().contains("unused"));
     }
 
     #[test]

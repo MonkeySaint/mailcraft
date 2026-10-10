@@ -106,7 +106,51 @@ pub struct App {
     pub ui: UiState,
     pub theme: theme::Theme,
     pub icons: icons::Icons,
+    /// The platform's file dialogs (installed by the desktop app); `None` = dialogs show a path box instead.
+    pub files: Option<Arc<dyn FileDialogs>>,
 }
+
+/// A file type offered by a file dialog: a name ("MBOX mailbox") and its extensions without the dot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileFilter {
+    pub name: String,
+    pub extensions: Vec<String>,
+}
+
+impl FileFilter {
+    pub fn new(name: &str, extensions: &[&str]) -> FileFilter {
+        FileFilter { name: name.to_owned(), extensions: extensions.iter().map(|e| (*e).to_owned()).collect() }
+    }
+}
+
+/// Native file dialogs (Browse…, Save As…, Import/Export file pickers). The desktop app installs one in
+/// [`App::files`]; tests install fakes; the web build has none, so dialogs fall back to typed paths. Every
+/// method returns `None` when the person cancels. Implementations must not panic.
+pub trait FileDialogs: Send + Sync {
+    /// Open-file dialog: one file, or several when `multiple`. `start` = folder to show first.
+    fn open_files(
+        &self,
+        title: &str,
+        filters: &[FileFilter],
+        multiple: bool,
+        start: Option<&std::path::Path>,
+    ) -> Option<Vec<std::path::PathBuf>>;
+    /// Save dialog with `suggested` as the file name.
+    fn save_file(
+        &self,
+        title: &str,
+        suggested: &str,
+        filters: &[FileFilter],
+        start: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf>;
+    /// Folder picker.
+    fn pick_folder(&self, title: &str, start: Option<&std::path::Path>) -> Option<std::path::PathBuf>;
+}
+
+/// Repaint interval while a send/receive worker is busy (progress text, results).
+const SYNC_BUSY_REPAINT_MS: u64 = 150;
+/// Repaint interval with server accounts and nothing running (automatic send/receive, queued changes).
+const SYNC_IDLE_REPAINT_SECS: u64 = 5;
 
 /// Shell bookkeeping kept in egui temp memory (per context), never in the session.
 #[derive(Clone, Default)]
@@ -229,7 +273,26 @@ pub fn ui_semibold() -> egui::FontFamily {
 impl App {
     pub fn new(s: Session) -> App {
         let theme = theme::Theme::for_dark(s.view.dark);
-        App { s, ui: UiState::default(), theme, icons: icons::Icons::default() }
+        App { s, ui: UiState::default(), theme, icons: icons::Icons::default(), files: None }
+    }
+
+    /// Installs the platform's file dialogs.
+    pub fn set_file_dialogs(&mut self, files: Arc<dyn FileDialogs>) {
+        self.files = Some(files);
+    }
+
+    /// Applies finished send/receive work and keeps frames coming while it runs: every frame calls
+    /// `Session::poll_sync`; a busy worker repaints often, and with server accounts the automatic
+    /// send/receive timer and queued server changes are checked every few seconds.
+    pub fn poll_sync(&mut self, ctx: &egui::Context) {
+        if self.s.poll_sync() {
+            ctx.request_repaint();
+        }
+        if self.s.sync_busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(SYNC_BUSY_REPAINT_MS));
+        } else if !self.s.sync_status().accounts.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(SYNC_IDLE_REPAINT_SECS));
+        }
     }
 
     /// Runs a command; errors become a toast (never panics).
@@ -282,6 +345,7 @@ impl App {
         // Control-channel requests (when `--control-port` asked for one) apply before drawing.
         #[cfg(not(target_arch = "wasm32"))]
         control::frame(&ctx, self);
+        self.poll_sync(&ctx);
         keys::handle(&ctx, self, Surface::Main);
         self.drain_notices(&ctx);
         self.sync_window(&ctx);

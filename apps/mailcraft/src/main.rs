@@ -16,6 +16,8 @@ use std::process::ExitCode;
 use mailcraft_engine::Session;
 use mailcraft_ui_egui::App;
 
+mod file_dialogs;
+
 const USAGE: &str = "\
 Usage: mailcraft [OPTIONS]
 
@@ -158,6 +160,7 @@ fn main() -> ExitCode {
 
     let session = open_session(&args);
     let mut app = App::new(session);
+    file_dialogs::install(&mut app);
     app.ui.control_port = args.control_port.or_else(|| {
         std::env::var("MAILCRAFT_CONTROL_PORT")
             .ok()

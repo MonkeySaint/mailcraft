@@ -9,18 +9,22 @@
 //! Interface (frozen for commit 3; add, don't rename): [`CommandSpec`], [`Registry`], [`CmdError`],
 //! [`CmdResult`], [`Session`] (see session.rs), [`queries`] (read-only views the UI renders), [`catalog`].
 
+pub mod accounts;
 pub mod catalog;
 pub mod cmd;
 pub mod compose;
 pub mod queries;
 pub mod sample;
 mod session;
+pub mod sync;
 pub mod undo;
 
 use serde_json::Value;
 
+pub use accounts::{FileSecretStore, MemorySecretStore, SecretStore};
 pub use mailcraft_model as model;
 pub use session::{DEFAULT_QUICK_ACCESS, Module, Notice, SearchScope, Selection, Session, ViewState};
+pub use sync::{Connection, Plan, SyncStatus, TestReport};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CmdError {

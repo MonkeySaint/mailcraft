@@ -1,11 +1,13 @@
-//! `sendReceive.*`. No network yet (commit 8): send/receive reports what is queued in each account's Outbox
-//! and which accounts cannot send at all; nothing is transmitted. Offline mode and download preferences have no
-//! session field yet, so those commands return their new state for the caller to keep.
+//! `sendReceive.*` (`plan/outlook/ribbon-mail.md`, Send / Receive tab): start send/receive runs on the
+//! accounts' worker threads (`crate::sync`), report each account's Outbox, cancel runs, show progress, and
+//! toggle Work Offline (kept in the session's view state). Results arrive through `Session::poll_sync`.
+//! Download preferences have no session field yet, so that command returns the chosen state.
 
 use serde_json::{Value, json};
 
 use crate::cmd::rules::{dialog, need_selection};
 use crate::cmd::util::{opt_bool, opt_str, req_str};
+use crate::sync::Plan;
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Session, always};
 use mailcraft_model::{AccountId, FolderRole, ItemId, MailItem};
 
@@ -56,6 +58,7 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec("sendReceive.sendAll", "Send All", SR, "", r#"{"offline"?: bool}"#, has_accounts, send_all),
         spec("sendReceive.cancelAll", "Cancel All", DL, "", "", always, cancel_all),
+        spec("sendReceive.status", "Send/Receive Status", "Status bar", "", "", always, status),
         spec("sendReceive.showProgress", "Show Progress", DL, "", "", always, show_progress),
         spec(
             "sendReceive.downloadHeaders",
@@ -107,7 +110,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Work Offline",
             PR,
             "",
-            r#"{"offline"?: bool (current state; toggled)}"#,
+            r#"{"offline"?: bool (current state; toggled; default: the session's state)}"#,
             always,
             work_offline,
         ),
@@ -127,8 +130,8 @@ fn server_account(s: &Session) -> Option<&'static str> {
     }
 }
 
-/// Per-account Outbox report. Nothing is sent before the network layer exists: messages stay queued, and those
-/// of accounts that cannot send at all are reported as such.
+/// Per-account Outbox report: messages waiting to be sent (by the run this command starts), and those of
+/// accounts that cannot send at all.
 fn outbox_report(s: &mut Session, accounts: &[AccountId], offline: bool) -> Value {
     let mut rows = Vec::new();
     let mut queued = 0usize;
@@ -173,14 +176,34 @@ fn all_account_ids(s: &Session) -> Vec<AccountId> {
     s.mailbox.accounts.iter().map(|a| a.id).collect()
 }
 
+fn offline(s: &Session, p: &Value) -> bool {
+    opt_bool(p, "offline").unwrap_or(false) || s.view.work_offline
+}
+
+/// Starts runs (errors were already reported as notices and in the status) and adds the outcome to `report`.
+fn start(s: &mut Session, accounts: &[AccountId], plan: Plan, offline: bool, mut report: Value) -> CmdResult {
+    let servers: Vec<AccountId> =
+        crate::sync::server_accounts(s).into_iter().filter(|a| accounts.contains(a)).collect();
+    let started = if offline || servers.is_empty() { 0 } else { s.send_receive(&servers, plan).unwrap_or(0) };
+    if let Some(o) = report.as_object_mut() {
+        o.insert("started".into(), json!(started));
+        o.insert("status".into(), serde_json::to_value(s.sync_status()).unwrap_or(Value::Null));
+    }
+    Ok(report)
+}
+
 fn all(s: &mut Session, p: &Value) -> CmdResult {
     let ids = all_account_ids(s);
-    Ok(outbox_report(s, &ids, opt_bool(p, "offline").unwrap_or(false)))
+    let off = offline(s, p);
+    let report = outbox_report(s, &ids, off);
+    start(s, &ids, Plan::all(), off, report)
 }
 
 fn send_all(s: &mut Session, p: &Value) -> CmdResult {
     let ids = all_account_ids(s);
-    Ok(outbox_report(s, &ids, opt_bool(p, "offline").unwrap_or(false)))
+    let off = offline(s, p);
+    let report = outbox_report(s, &ids, off);
+    start(s, &ids, Plan { send: true, receive: false, folders: None, user: true }, off, report)
 }
 
 fn folder(s: &mut Session, p: &Value) -> CmdResult {
@@ -190,19 +213,28 @@ fn folder(s: &mut Session, p: &Value) -> CmdResult {
     };
     let name = folder.name.clone();
     let account = folder.account;
-    let remote = s.mailbox.account(account).is_some_and(|a| a.incoming.is_some());
+    let mapped = folder.remote_name.is_some();
+    let off = offline(s, p);
+    let remote = crate::sync::server_accounts(s).contains(&account);
+    let mut started = 0;
+    if remote && !off {
+        // A folder not on the server yet is found by a full update of its account.
+        let folders = mapped.then(|| vec![f]);
+        let plan = Plan { send: false, receive: true, folders, user: true };
+        started = s.send_receive(&[account], plan).unwrap_or(0);
+    }
     Ok(json!({
         "folder": f.0,
         "name": name,
-        "received": 0,
-        "offline": opt_bool(p, "offline").unwrap_or(false),
-        "status": if remote { "up to date" } else { "local folder" },
+        "started": started,
+        "offline": off,
+        "status": if !remote { "local folder" } else if off { "offline" } else { "updating" },
     }))
 }
 
 fn group(s: &mut Session, p: &Value) -> CmdResult {
     let name = req_str(p, "name")?.trim().to_owned();
-    let offline = opt_bool(p, "offline").unwrap_or(false);
+    let off = offline(s, p);
     if name.eq_ignore_ascii_case("All Accounts") {
         return all(s, p);
     }
@@ -213,20 +245,49 @@ fn group(s: &mut Session, p: &Value) -> CmdResult {
         .find(|a| a.address.eq_ignore_ascii_case(&name) || a.display_name.eq_ignore_ascii_case(&name))
     {
         let id = a.id;
-        return Ok(outbox_report(s, &[id], offline));
+        let report = outbox_report(s, &[id], off);
+        return start(s, &[id], Plan::all(), off, report);
     }
     if let Some(f) = s.mailbox.folders.values().find(|f| f.name.eq_ignore_ascii_case(&name)).map(|f| f.id) {
-        return folder(s, &json!({"folder": f.0, "offline": offline}));
+        return folder(s, &json!({"folder": f.0, "offline": off}));
     }
     Err(CmdError::Params(format!("no account, group or folder named \"{name}\"")))
 }
 
-fn cancel_all(_: &mut Session, _: &Value) -> CmdResult {
-    Ok(json!({"cancelled": 0}))
+fn cancel_all(s: &mut Session, _: &Value) -> CmdResult {
+    let n = s.cancel_sync();
+    Ok(json!({"cancelled": n}))
+}
+
+fn status(s: &mut Session, _: &Value) -> CmdResult {
+    let mut v = serde_json::to_value(s.sync_status()).unwrap_or(Value::Null);
+    let tests: Vec<Value> = s.sync.tests.values().map(crate::sync::TestReport::to_json).collect();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("workOffline".into(), json!(s.view.work_offline));
+        o.insert("tests".into(), json!(tests));
+    }
+    Ok(v)
 }
 
 fn show_progress(s: &mut Session, _: &Value) -> CmdResult {
-    dialog(s, "sendReceiveProgress", json!({"tasks": []}))
+    let tasks: Vec<Value> = s
+        .sync_status()
+        .accounts
+        .iter()
+        .map(|a| {
+            let st = if a.busy {
+                a.progress.clone()
+            } else if let Some(e) = &a.error {
+                format!("Error: {e}")
+            } else if a.last_sync.is_some() {
+                "Completed".to_owned()
+            } else {
+                "Not started".to_owned()
+            };
+            json!({"name": a.name, "status": st, "busy": a.busy})
+        })
+        .collect();
+    dialog(s, "sendReceiveProgress", json!({"tasks": tasks}))
 }
 
 fn download_headers(s: &mut Session, p: &Value) -> CmdResult {
@@ -275,7 +336,12 @@ fn preferences(_: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn work_offline(s: &mut Session, p: &Value) -> CmdResult {
-    let offline = !opt_bool(p, "offline").unwrap_or(false);
+    let offline = !opt_bool(p, "offline").unwrap_or(s.view.work_offline);
+    s.view.work_offline = offline;
+    if offline {
+        s.cancel_sync();
+    }
+    s.poll_sync();
     s.notify(Notice::Info(if offline { "Working offline.".into() } else { "Working online.".into() }));
     Ok(json!({"offline": offline}))
 }
@@ -339,7 +405,12 @@ mod tests {
     fn offline_toggle_and_preferences() {
         let (mut s, _, _) = session();
         assert_eq!(s.run("sendReceive.workOffline", &json!({})).unwrap()["offline"], true);
+        assert!(s.view.work_offline);
+        assert_eq!(s.run("sendReceive.workOffline", &json!({})).unwrap()["offline"], false);
+        assert_eq!(s.run("sendReceive.workOffline", &json!({"offline": false})).unwrap()["offline"], true);
         assert_eq!(s.run("sendReceive.workOffline", &json!({"offline": true})).unwrap()["offline"], false);
+        assert!(!s.view.work_offline);
+        assert_eq!(s.run("sendReceive.status", &json!({})).unwrap()["workOffline"], false);
         let r =
             s.run("sendReceive.preferences", &json!({"mode": "headers", "slowHeadersOnly": true})).unwrap();
         assert_eq!(r["mode"], "headers");

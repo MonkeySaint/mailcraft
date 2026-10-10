@@ -233,13 +233,10 @@ fn respond(
                 ComposeKind::Forward => (forward_subject(&m.subject), String::new()),
                 _ => (reply_subject(&m.subject), sender),
             };
-            s.open_compose(ComposeState {
-                kind,
-                source: Some(id),
-                to: to_line,
-                subject,
-                ..Default::default()
-            });
+            let mut c = ComposeState { kind, source: Some(id), to: to_line, subject, ..Default::default() };
+            // Options › Mail › Signatures: the replies/forwards signature, as the mail commands add it.
+            crate::compose::insert_default_signature(&s.mailbox, &mut c);
+            s.open_compose(c);
         }
         Err(e) => return Err(e),
     }
@@ -634,6 +631,45 @@ mod tests {
         let cid = r["composes"][0].as_u64().unwrap();
         assert_eq!(s.composes[&cid].to, "a@example.com; b@example.com");
         assert!(s.run("quicksteps.run", &json!({"id": "Done", "folder": 1})).is_err());
+    }
+
+    /// A session whose mailbox has a "New" signature for new messages and a "Re" one for replies/forwards.
+    fn signed_session() -> (Session, mailcraft_model::FolderId, mailcraft_model::FolderId) {
+        let (mut s, inbox, proj) = session();
+        s.mailbox.add_signature("New", mailcraft_model::Doc::from_plain_text("-- New")).unwrap();
+        s.mailbox.add_signature("Re", mailcraft_model::Doc::from_plain_text("-- Re")).unwrap();
+        s.mailbox.set_signature_defaults(None, Some(Some("New")), Some(Some("Re"))).unwrap();
+        (s, inbox, proj)
+    }
+
+    fn signature_name(s: &Session, cid: &Value) -> Option<String> {
+        s.composes.get(&cid.as_u64().unwrap()).and_then(|c| c.signature.as_ref()).map(|g| g.name.clone())
+    }
+
+    #[test]
+    fn created_messages_get_the_default_signature() {
+        let (mut s, _, _) = signed_session();
+        let r = s.run("quicksteps.run", &json!({"id": "Team Email", "to": "a@example.com"})).unwrap();
+        assert_eq!(signature_name(&s, &r["composes"][0]).as_deref(), Some("New"));
+        let r = s.run("quicksteps.run", &json!({"id": "Reply & Delete"})).unwrap();
+        assert_eq!(signature_name(&s, &r["composes"][0]).as_deref(), Some("Re"));
+        // Exactly one signature block, even though the reply passed through two builders.
+        let c = &s.composes[&r["composes"][0].as_u64().unwrap()];
+        let text = c.body.to_plain_text();
+        assert_eq!(text.matches("-- Re").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn fallback_reply_gets_the_reply_signature() {
+        let (mut s, _, _) = signed_session();
+        // Without the mail commands the quick step builds the reply itself.
+        s.registry.specs.retain(|c| c.id != "mail.reply");
+        let target = s.selection.items[0];
+        let cid = respond(&mut s, "mail.reply", ComposeKind::Reply, target, &[]).unwrap().unwrap();
+        let c = &s.composes[&cid];
+        assert_eq!(c.source, Some(target));
+        assert_eq!(c.signature.as_ref().map(|g| g.name.as_str()), Some("Re"));
+        assert_eq!(c.selection.focus.path, vec![0], "the caret sits above the signature");
     }
 
     #[test]

@@ -1,5 +1,7 @@
-//! `file.*`: the File backstage — Info (account summary), Open & Export (import/export through
-//! `mailcraft-store`), Save As (.eml), Save Attachments, data files (new / close / reveal), Options, Exit.
+//! `file.*`: the File backstage — Info (account summary), Account Settings (`accounts.*`, see
+//! `crate::accounts`), Open & Export (import/export through `mailcraft-store` and `mailcraft-formats`: EML,
+//! MSG, MBOX, Maildir, iCalendar, vCard, CSV), Save As (.eml, .msg, .txt, .html), Save Attachments, data files
+//! (new / close / reveal), Options, Exit.
 
 use std::path::{Path, PathBuf};
 
@@ -9,15 +11,14 @@ use crate::cmd::rules::{dialog, focused_item, need_selection, write_file};
 use crate::cmd::util::{opt_str, req_str};
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Session, always};
 use mailcraft_model::mailbox::LOCAL_ACCOUNT_FALLBACK_NAME;
-use mailcraft_model::{
-    Account, AccountId, AccountKind, FolderId, FolderKind, FolderRole, ItemId, MailItem, QuickStepAction,
-    RuleAction,
-};
+use mailcraft_model::{Account, AccountId, AccountKind, FolderId, FolderKind, FolderRole, ItemId, MailItem};
 
 /// Most attachments written by one Save Attachments run.
 const MAX_SAVED_ATTACHMENTS: usize = 10_000;
 /// Most data files (accounts) in one profile.
 const MAX_ACCOUNTS: usize = 256;
+/// Largest file read by an import (each format applies its own, smaller cap).
+const MAX_IMPORT_FILE: u64 = 100 * 1024 * 1024;
 
 fn spec(
     id: &'static str,
@@ -39,7 +40,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.openExport",
             "Import/Export",
             "File › Open & Export",
-            r#"{"action"?: "importEml"|"importMbox"|"importMaildir"|"exportMbox", "path"?: string, "folder"?: number} (no action = open the wizard)"#,
+            r#"{"action"?: "import" (by file type)|"importEml"|"importMsg"|"importMbox"|"importMaildir"|"importIcs"|"importVcf"|"importCsv"|"exportMbox"|"exportIcs"|"exportVcf"|"exportCsv", "path"?: string, "folder"?: number} (no action = open the wizard)"#,
             true,
             always,
             open_export,
@@ -48,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.saveAs",
             "Save As",
             "File › Save As",
-            r#"{"path"?: string (file or directory), "ids"?: [number]}"#,
+            r#"{"path"?: string (file or directory), "type"?: "eml"|"msg"|"txt"|"html" (default: from the extension, else eml), "ids"?: [number]}"#,
             false,
             need_selection,
             save_as,
@@ -104,6 +105,9 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec("file.exit", "Close", "Window caption", "", false, always, exit),
     ]
+    .into_iter()
+    .chain(crate::accounts::specs())
+    .collect()
 }
 
 fn has_accounts(s: &Session) -> Option<&'static str> {
@@ -207,14 +211,55 @@ fn store_err(e: mailcraft_store::StoreError) -> CmdError {
     CmdError::Failed(e.to_string())
 }
 
+/// A folder of `kind` for imports/exports: `p.folder` when it is one, else the current account's default
+/// folder of `role`, else any folder of that kind.
+fn kind_folder(s: &Session, p: &Value, kind: FolderKind, role: FolderRole) -> Result<FolderId, CmdError> {
+    if let Some(f) = crate::cmd::util::opt_folder(p) {
+        return match s.mailbox.folder(f) {
+            Some(folder) if folder.kind == kind => Ok(f),
+            Some(folder) => Err(CmdError::Params(format!("\"{}\" cannot hold these items", folder.name))),
+            None => Err(CmdError::Params(format!("no such folder {}", f.0))),
+        };
+    }
+    s.current_account()
+        .and_then(|a| s.mailbox.role_folder(a, role))
+        .or_else(|| s.mailbox.folders.values().find(|f| f.kind == kind).map(|f| f.id))
+        .ok_or_else(|| CmdError::Failed(format!("there is no {} folder", role.default_name())))
+}
+
+fn format_err(e: mailcraft_formats::FormatError) -> CmdError {
+    CmdError::Failed(e.to_string())
+}
+
+/// Action for `import` from the file's extension, else its first bytes.
+fn detect_import(path: &Path) -> Result<&'static str, CmdError> {
+    use mailcraft_formats::Format;
+    let fmt = Format::from_path(path).or_else(|| {
+        let head = crate::cmd::rules::read_file_capped(path, 64 * 1024).ok()?;
+        Format::sniff(&head)
+    });
+    Ok(match fmt {
+        Some(Format::Eml) => "importEml",
+        Some(Format::Msg) => "importMsg",
+        Some(Format::Mbox) => "importMbox",
+        Some(Format::Ics) => "importIcs",
+        Some(Format::Vcf) => "importVcf",
+        Some(Format::Csv) => "importCsv",
+        None if path.is_dir() => "importMaildir",
+        None => return Err(CmdError::Params(format!("{}: unknown file type", path.display()))),
+    })
+}
+
 fn open_export(s: &mut Session, p: &Value) -> CmdResult {
     let Some(action) = opt_str(p, "action") else {
         return dialog(s, "importExport", json!({}));
     };
     let path = PathBuf::from(req_str(p, "path")?);
-    let folder = mail_folder(s, p)?;
+    let action = if action == "import" { detect_import(&path)? } else { action };
+    let now = s.now();
     match action {
         "importEml" => {
+            let folder = mail_folder(s, p)?;
             let id = match s.store.as_mut() {
                 Some(st) => st.import_eml(&mut s.mailbox, &path, folder).map_err(store_err)?,
                 None => {
@@ -224,7 +269,15 @@ fn open_export(s: &mut Session, p: &Value) -> CmdResult {
             };
             Ok(json!({"imported": 1, "ids": [id.0], "folder": folder.0}))
         }
+        "importMsg" => {
+            let folder = mail_folder(s, p)?;
+            let data = crate::cmd::rules::read_file_capped(&path, MAX_IMPORT_FILE)?;
+            let item = mailcraft_formats::msg::read_item(&data, folder, now).map_err(format_err)?;
+            let id = mailcraft_store::import::insert_item(&mut s.mailbox, item).map_err(store_err)?;
+            Ok(json!({"imported": 1, "ids": [id.0], "folder": folder.0}))
+        }
         "importMbox" | "importMaildir" => {
+            let folder = mail_folder(s, p)?;
             let ids = if action == "importMbox" {
                 mailcraft_store::import_mbox(&mut s.mailbox, &path, folder)
             } else {
@@ -233,7 +286,57 @@ fn open_export(s: &mut Session, p: &Value) -> CmdResult {
             .map_err(store_err)?;
             Ok(json!({"imported": ids.len(), "folder": folder.0}))
         }
+        "importIcs" => {
+            let calendar = kind_folder(s, p, FolderKind::Calendar, FolderRole::Calendar)?;
+            let data = crate::cmd::rules::read_file_capped(&path, MAX_IMPORT_FILE)?;
+            let opts = mailcraft_formats::ics::ImportOptions { local_offset_min: s.tz_offset_min };
+            let cal = mailcraft_formats::ics::read(&data, opts).map_err(format_err)?;
+            let account = s.mailbox.folder_account(calendar);
+            let tasks_folder = account.and_then(|a| s.mailbox.role_folder(a, FolderRole::Tasks));
+            let mb = &mut s.mailbox;
+            let mut events = 0usize;
+            for mut a in cal.appointments() {
+                let id = mailcraft_model::ItemId(mb.alloc_id());
+                a.id = id;
+                a.folder = calendar;
+                mb.appointments.insert(id, a);
+                events = events.saturating_add(1);
+            }
+            let mut tasks = 0usize;
+            if let Some(tf) = tasks_folder {
+                for mut t in cal.tasks {
+                    let id = mailcraft_model::ItemId(mb.alloc_id());
+                    t.id = id;
+                    t.folder = tf;
+                    mb.tasks.insert(id, t);
+                    tasks = tasks.saturating_add(1);
+                }
+            }
+            Ok(
+                json!({"imported": events.saturating_add(tasks), "appointments": events, "tasks": tasks, "folder": calendar.0}),
+            )
+        }
+        "importVcf" | "importCsv" => {
+            let contacts_folder = kind_folder(s, p, FolderKind::Contacts, FolderRole::Contacts)?;
+            let data = crate::cmd::rules::read_file_capped(&path, MAX_IMPORT_FILE)?;
+            let (list, unmapped) = if action == "importVcf" {
+                (mailcraft_formats::vcf::read(&data).map_err(format_err)?, Vec::new())
+            } else {
+                let r = mailcraft_formats::csv::import_contacts(&data).map_err(format_err)?;
+                (r.contacts, r.unmapped_columns)
+            };
+            let mb = &mut s.mailbox;
+            let n = list.len();
+            for mut c in list {
+                let id = mailcraft_model::ItemId(mb.alloc_id());
+                c.id = id;
+                c.folder = contacts_folder;
+                mb.contacts.insert(id, c);
+            }
+            Ok(json!({"imported": n, "folder": contacts_folder.0, "unmappedColumns": unmapped}))
+        }
         "exportMbox" => {
+            let folder = mail_folder(s, p)?;
             let mut items: Vec<&MailItem> = s.mailbox.items_in(folder);
             items.sort_by_key(|m| (m.received.unix, m.id));
             let n = items.len();
@@ -242,6 +345,35 @@ fn open_export(s: &mut Session, p: &Value) -> CmdResult {
                 None => mailcraft_store::export_mbox(&items, &path).map_err(store_err)?,
             }
             Ok(json!({"exported": n, "path": path.display().to_string()}))
+        }
+        "exportIcs" => {
+            let folder = match crate::cmd::util::opt_folder(p).and_then(|f| s.mailbox.folder(f)) {
+                Some(f) if f.kind == FolderKind::Tasks => f.id,
+                _ => kind_folder(s, p, FolderKind::Calendar, FolderRole::Calendar)?,
+            };
+            let mut appts: Vec<&mailcraft_model::Appointment> =
+                s.mailbox.appointments.values().filter(|a| a.folder == folder).collect();
+            appts.sort_by_key(|a| (a.start.unix, a.id));
+            let tasks: Vec<&mailcraft_model::Task> =
+                s.mailbox.tasks.values().filter(|t| t.folder == folder).collect();
+            let text = mailcraft_formats::ics::write(&appts, &tasks, None, now);
+            write_file(&path, text.as_bytes())?;
+            Ok(
+                json!({"exported": appts.len().saturating_add(tasks.len()), "path": path.display().to_string()}),
+            )
+        }
+        "exportVcf" | "exportCsv" => {
+            let folder = kind_folder(s, p, FolderKind::Contacts, FolderRole::Contacts)?;
+            let mut contacts: Vec<mailcraft_model::Contact> =
+                s.mailbox.contacts.values().filter(|c| c.folder == folder).cloned().collect();
+            contacts.sort_by(|a, b| a.file_as.cmp(&b.file_as).then(a.id.cmp(&b.id)));
+            let text = if action == "exportVcf" {
+                mailcraft_formats::vcf::write(&contacts, mailcraft_formats::vcf::Version::V4)
+            } else {
+                mailcraft_formats::csv::export_contacts(&contacts)
+            };
+            write_file(&path, text.as_bytes())?;
+            Ok(json!({"exported": contacts.len(), "path": path.display().to_string()}))
         }
         other => Err(CmdError::Params(format!("unknown action `{other}`"))),
     }
@@ -287,22 +419,103 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{stem} (copy){ext}"))
 }
 
+/// Save As file types: (id, extension).
+const SAVE_TYPES: [&str; 4] = ["eml", "msg", "txt", "html"];
+
+fn escape_html(t: &str) -> String {
+    t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Header lines shown above the body in text and HTML saves: (label, value).
+fn save_headers(m: &MailItem) -> Vec<(&'static str, String)> {
+    let list = |v: &[mailcraft_model::Address]| {
+        v.iter().map(|a| a.to_display_string()).collect::<Vec<_>>().join("; ")
+    };
+    let mut h = vec![
+        ("From", m.from.as_ref().map(|a| a.to_display_string()).unwrap_or_default()),
+        ("Sent", m.sent.unwrap_or(m.received).to_rfc5322()),
+        ("To", list(&m.to)),
+    ];
+    if !m.cc.is_empty() {
+        h.push(("Cc", list(&m.cc)));
+    }
+    h.push(("Subject", m.subject.clone()));
+    h
+}
+
+fn save_bytes(s: &Session, m: &MailItem, kind: &str) -> Result<Vec<u8>, CmdError> {
+    Ok(match kind {
+        "msg" => {
+            let mut item = m.clone();
+            if item.raw.is_none() {
+                item.raw = Some(raw_source(s, m));
+            }
+            mailcraft_formats::msg::write_item(&item).map_err(format_err)?
+        }
+        "txt" => {
+            let mut out = String::new();
+            for (k, v) in save_headers(m) {
+                out.push_str(&format!("{k}:\t{v}\r\n"));
+            }
+            out.push_str("\r\n");
+            out.push_str(&m.body_text().replace("\r\n", "\n").replace('\n', "\r\n"));
+            out.into_bytes()
+        }
+        "html" => {
+            let body = match &m.body.html {
+                Some(h) => mailcraft_html::doc_to_html(&mailcraft_html::html_to_doc(h)),
+                None => mailcraft_html::text_to_html(&m.body_text()),
+            };
+            let mut out = format!(
+                "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>{}</title></head><body>\n<table>\n",
+                escape_html(&m.subject)
+            );
+            for (k, v) in save_headers(m) {
+                out.push_str(&format!("<tr><th align=\"left\">{k}:</th><td>{}</td></tr>\n", escape_html(&v)));
+            }
+            out.push_str("</table>\n<hr>\n");
+            out.push_str(&body);
+            out.push_str("\n</body></html>\n");
+            out.into_bytes()
+        }
+        _ => raw_source(s, m),
+    })
+}
+
 fn save_as(s: &mut Session, p: &Value) -> CmdResult {
     let id = focused_item(s, p).ok_or_else(|| CmdError::Disabled("no message selected".into()))?;
     let Some(m) = s.mailbox.mail.get(&id) else {
         return Err(CmdError::Disabled("no message selected".into()));
     };
+    let wanted = opt_str(p, "type").map(|t| t.trim().trim_start_matches('.').to_ascii_lowercase());
+    if let Some(t) = &wanted
+        && !SAVE_TYPES.contains(&(if t == "htm" { "html" } else { t.as_str() }))
+    {
+        return Err(CmdError::Params(format!("unknown file type `{t}` (eml, msg, txt or html)")));
+    }
     let Some(path) = opt_str(p, "path") else {
-        let name = format!("{}.eml", file_stem(&m.subject));
-        return dialog(s, "saveAs", json!({"item": id.0, "suggested": name}));
+        let ext = wanted.as_deref().unwrap_or("eml");
+        let name = format!("{}.{ext}", file_stem(&m.subject));
+        return dialog(s, "saveAs", json!({"item": id.0, "suggested": name, "types": SAVE_TYPES}));
     };
     let mut path = PathBuf::from(path);
+    let from_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|e| SAVE_TYPES.contains(&e.as_str()) || e == "htm");
+    let kind = match (wanted, from_ext, path.is_dir()) {
+        (Some(t), _, _) => t,
+        (None, Some(e), false) => e,
+        _ => "eml".to_owned(),
+    };
+    let kind = if kind == "htm" { "html".to_owned() } else { kind };
     if path.is_dir() {
-        path = unique_path(&path, &format!("{}.eml", file_stem(&m.subject)));
+        path = unique_path(&path, &format!("{}.{kind}", file_stem(&m.subject)));
     }
-    let data = raw_source(s, m);
+    let data = save_bytes(s, m, &kind)?;
     write_file(&path, &data)?;
-    Ok(json!({"path": path.display().to_string(), "bytes": data.len()}))
+    Ok(json!({"path": path.display().to_string(), "bytes": data.len(), "type": kind}))
 }
 
 fn save_attachments(s: &mut Session, p: &Value) -> CmdResult {
@@ -373,7 +586,10 @@ fn options(s: &mut Session, p: &Value) -> CmdResult {
 fn account_settings(s: &mut Session, p: &Value) -> CmdResult {
     let id = find_account(s, p, "account")?;
     let acct = s.mailbox.account(id).map(|a| account_json(s, a)).unwrap_or(Value::Null);
-    dialog(s, "accountSettings", json!({"account": acct}))
+    // Server settings for the Change Account page (never the password, only whether one is stored).
+    let settings =
+        s.mailbox.account(id).map(|a| crate::accounts::account_settings_json(s, a)).unwrap_or(Value::Null);
+    dialog(s, "accountSettings", json!({"account": acct, "settings": settings}))
 }
 
 fn manage_rules(s: &mut Session, p: &Value) -> CmdResult {
@@ -422,47 +638,9 @@ fn close_data_file(s: &mut Session, p: &Value) -> CmdResult {
     if is_primary {
         return Err(CmdError::Disabled("the primary data file cannot be removed".into()));
     }
-    let folders: Vec<FolderId> =
-        s.mailbox.folders.values().filter(|f| f.account == id).map(|f| f.id).collect();
-    let mb = &mut s.mailbox;
-    mb.mail.retain(|_, m| !folders.contains(&m.folder));
-    mb.appointments.retain(|_, x| !folders.contains(&x.folder));
-    mb.contacts.retain(|_, x| !folders.contains(&x.folder));
-    mb.tasks.retain(|_, x| !folders.contains(&x.folder));
-    mb.notes.retain(|_, x| !folders.contains(&x.folder));
-    for f in &folders {
-        mb.folders.remove(f);
-        mb.views.remove(f);
-    }
-    mb.accounts.retain(|a| a.id != id);
-    // Rules that file into the removed data file are turned off; quick steps that do ask for a folder again.
-    let gone = |f: &FolderId| folders.contains(f);
-    for rule in &mut mb.rules {
-        if rule.actions.iter().any(|a| matches!(a, RuleAction::MoveTo(f) | RuleAction::CopyTo(f) if gone(f)))
-        {
-            rule.enabled = false;
-        }
-    }
-    for step in &mut mb.quick_steps {
-        for action in &mut step.actions {
-            if let QuickStepAction::MoveTo(target) | QuickStepAction::CopyTo(target) = action
-                && target.as_ref().is_some_and(gone)
-            {
-                *target = None;
-            }
-        }
-    }
-    s.view.collapsed_groups.retain(|f, _| !folders.contains(f));
-    if folders.contains(&s.selection.folder) {
-        let fallback = s
-            .mailbox
-            .default_account()
-            .map(|a| a.id)
-            .and_then(|a| s.mailbox.role_folder(a, FolderRole::Inbox))
-            .unwrap_or_default();
-        s.selection = crate::Selection { folder: fallback, items: Vec::new(), focus: None };
-    }
-    Ok(json!({"removed": id.0, "folders": folders.len()}))
+    crate::sync::forget_account(s, id);
+    let folders = crate::accounts::remove_account_data(s, id);
+    Ok(json!({"removed": id.0, "folders": folders}))
 }
 
 fn open_file_location(s: &mut Session, p: &Value) -> CmdResult {
@@ -624,6 +802,111 @@ mod tests {
         assert!(!s.mailbox.rules[0].enabled, "a rule moving into a removed data file must be turned off");
         assert!(s.mailbox.quick_steps[0].needs_setup(), "the quick step must ask for a folder again");
         assert!(!s.mailbox.favorites().contains(&target));
+    }
+
+    #[test]
+    fn contacts_and_calendar_round_trip_through_files() {
+        let (mut s, _, _) = session();
+        let acct = s.mailbox.accounts[0].id;
+        let contacts = s.mailbox.role_folder(acct, FolderRole::Contacts).unwrap();
+        let calendar = s.mailbox.role_folder(acct, FolderRole::Calendar).unwrap();
+        let cid = mailcraft_model::ItemId(s.mailbox.alloc_id());
+        s.mailbox.contacts.insert(
+            cid,
+            mailcraft_model::Contact {
+                id: cid,
+                folder: contacts,
+                first_name: "Ann".into(),
+                last_name: "Lee".into(),
+                file_as: "Lee, Ann".into(),
+                emails: vec!["ann@example.com".into()],
+                ..Default::default()
+            },
+        );
+        let aid = mailcraft_model::ItemId(s.mailbox.alloc_id());
+        let start = mailcraft_model::DateTime::from_unix(1_791_100_800, 0);
+        s.mailbox.appointments.insert(
+            aid,
+            mailcraft_model::Appointment {
+                id: aid,
+                folder: calendar,
+                uid: "a1@example.com".into(),
+                subject: "Planning".into(),
+                start,
+                end: mailcraft_model::DateTime::from_unix(start.unix + 3600, 0),
+                ..Default::default()
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
+        for (export, file) in [("exportVcf", "c.vcf"), ("exportCsv", "c.csv"), ("exportIcs", "cal.ics")] {
+            let r = s.run("file.openExport", &json!({"action": export, "path": p(file)})).unwrap();
+            assert_eq!(r["exported"], 1, "{export}");
+        }
+        for file in ["c.vcf", "c.csv"] {
+            let r = s.run("file.openExport", &json!({"action": "import", "path": p(file)})).unwrap();
+            assert_eq!(r["imported"], 1, "{file}");
+        }
+        assert_eq!(s.mailbox.contacts.values().filter(|c| c.emails == ["ann@example.com"]).count(), 3);
+        let r = s.run("file.openExport", &json!({"action": "import", "path": p("cal.ics")})).unwrap();
+        assert_eq!(r["appointments"], 1);
+        let copies: Vec<_> = s.mailbox.appointments.values().filter(|a| a.subject == "Planning").collect();
+        assert_eq!(copies.len(), 2);
+        assert!(copies.iter().all(|a| a.start.unix == start.unix && a.folder == calendar));
+        assert!(matches!(
+            s.run(
+                "file.openExport",
+                &json!({"action": "importVcf", "path": p("c.vcf"), "folder": calendar.0})
+            ),
+            Err(CmdError::Params(_))
+        ));
+        assert!(s.mailbox.validate().is_empty());
+    }
+
+    #[test]
+    fn save_as_text_html_and_msg() {
+        let (mut s, inbox, _) = session();
+        let dir = tempfile::tempdir().unwrap();
+        let eml = dir.path().join("in.eml");
+        std::fs::write(&eml, EML).unwrap();
+        let r = s
+            .run(
+                "file.openExport",
+                &json!({"action": "import", "path": eml.to_str().unwrap(), "folder": inbox.0}),
+            )
+            .unwrap();
+        let id = ItemId(r["ids"][0].as_u64().unwrap());
+        s.selection.items = vec![id];
+        s.selection.focus = Some(id);
+        let txt = dir.path().join("m.txt");
+        let r = s.run("file.saveAs", &json!({"path": txt.to_str().unwrap()})).unwrap();
+        assert_eq!(r["type"], "txt");
+        let text = std::fs::read_to_string(&txt).unwrap();
+        assert!(
+            text.starts_with("From:\tAnn <ann@example.com>\r\n") && text.contains("Subject:\tReport: Q3/Q4")
+        );
+        assert!(text.contains("See attached."));
+        let html = dir.path().join("m.htm");
+        s.run("file.saveAs", &json!({"path": html.to_str().unwrap()})).unwrap();
+        let page = std::fs::read_to_string(&html).unwrap();
+        assert!(page.contains("<title>Report: Q3/Q4</title>") && page.contains("ann@example.com"));
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let r = s.run("file.saveAs", &json!({"path": out.to_str().unwrap(), "type": "msg"})).unwrap();
+        let msg = PathBuf::from(r["path"].as_str().unwrap());
+        assert_eq!(msg.extension().unwrap(), "msg");
+        let r = s
+            .run(
+                "file.openExport",
+                &json!({"action": "import", "path": msg.to_str().unwrap(), "folder": inbox.0}),
+            )
+            .unwrap();
+        let back = ItemId(r["ids"][0].as_u64().unwrap());
+        assert_eq!(s.mailbox.mail[&back].subject, "Report: Q3/Q4");
+        assert!(matches!(
+            s.run("file.saveAs", &json!({"path": out.to_str().unwrap(), "type": "pdf"})),
+            Err(CmdError::Params(_))
+        ));
     }
 
     #[test]

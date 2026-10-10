@@ -34,7 +34,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "searchTools" => search_tools(ctx, app, d),
         "indexingStatus" => indexing(ctx, app, d),
         "reminders" => reminders(ctx, app, d),
-        "sendReceiveProgress" => send_receive(ctx, app, d),
         "recallMessage" => recall(ctx, app, d),
         "ribbonDisplayOptions" => ribbon_display(ctx, app, d),
         "quickAccess" => quick_access(ctx, app, d),
@@ -520,37 +519,6 @@ fn reminders(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             })
         },
     )
-}
-
-fn send_receive(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    window(ctx, app, d, "Send/Receive Progress", 460.0, |ui, app| {
-        let tasks = d.arr("tasks");
-        if tasks.is_empty() {
-            ui.label("Send/Receive is complete.");
-        }
-        for t in &tasks {
-            let name = t.get("name").and_then(Value::as_str).unwrap_or("Task");
-            let status = t.get("status").and_then(Value::as_str).unwrap_or("Completed");
-            ui.horizontal(|ui| {
-                ui.label(name);
-                ui.label(RichText::new(status).color(app.theme.text_muted));
-            });
-        }
-        let mut hide =
-            common::pref(ui.ctx(), "sendReceive.hideProgress").and_then(|v| v.as_bool()).unwrap_or(false);
-        if ui.checkbox(&mut hide, "Don't show this dialog box during Send/Receive").changed() {
-            common::set_pref(ui.ctx(), "sendReceive.hideProgress", json!(hide));
-        }
-        footer(ui, |ui| {
-            if btn(ui, "Close") {
-                return Out::Close;
-            }
-            if btn(ui, "Cancel All") {
-                app.run("sendReceive.cancelAll", json!({}));
-            }
-            Out::Keep
-        })
-    })
 }
 
 #[derive(Clone, Default)]
