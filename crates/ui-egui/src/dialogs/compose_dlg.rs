@@ -213,7 +213,11 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             )
             .init("color", json!("#000000")),
             |app, v| {
-                let target = if d.str("target") == "highlight" { "format.highlight" } else { "format.color" };
+                let target = match d.str("target").as_str() {
+                    "highlight" => "format.highlight",
+                    "shading" => "format.shading",
+                    _ => "format.color",
+                };
                 cmd(app, target, with(json!({"color": v.s("color")}))).map(|_| None)
             },
         ),
@@ -328,29 +332,34 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             )
         }
         "defineNewMultilevelList" | "defineNewListStyle" => {
-            let title = if d.name == "defineNewListStyle" {
-                "Define New List Style"
-            } else {
-                "Define New Multilevel List"
-            };
+            let style_form = d.name == "defineNewListStyle";
+            let title = if style_form { "Define New List Style" } else { "Define New Multilevel List" };
             let labels: Vec<String> = MULTILEVEL.iter().map(|(_, l)| (*l).to_owned()).collect();
+            let mut fields = Vec::new();
+            if style_form {
+                fields.push(f("name", "Name:", Kind::Text));
+            }
             run_form(
                 ctx,
                 app,
                 d,
                 Form::new(
                     title,
-                    vec![
+                    fields.into_iter().chain([
                         f("start", "Start from:", Kind::Combo(labels)),
                         f("l1", "Level 1 format:", Kind::Text),
                         f("l2", "Level 2 format:", Kind::Text),
                         f("l3", "Level 3 format:", Kind::Text),
                         f("chain", "Include the numbers of the levels above (1.1, 1.1.1)", Kind::Check),
                         f("n", "", Kind::Note("Leave the levels empty to use the list chosen above. A format with no number (\u{2022}, \u{2013}) is a bullet.".into())),
-                    ],
+                    ]).collect(),
                 )
                 .width(480.0),
-                |app, v| {
+                move |app, v| {
+                    let name = v.s("name");
+                    if style_form && name.is_empty() {
+                        return Err("Type a name for the list style.".to_owned());
+                    }
                     let levels: Vec<Value> = ["l1", "l2", "l3"]
                         .iter()
                         .map(|k| v.s(k))
@@ -365,13 +374,17 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                             }
                         })
                         .collect();
-                    if levels.is_empty() {
+                    let mut p = if levels.is_empty() {
                         let label = v.s("start");
                         let key = MULTILEVEL.iter().find(|(_, l)| *l == label).map_or("numbered", |(k, _)| *k);
-                        cmd(app, "format.multilevel", with(json!({"style": key}))).map(|_| None)
+                        json!({"style": key})
                     } else {
-                        cmd(app, "format.multilevel", with(json!({"levels": levels}))).map(|_| None)
+                        json!({"levels": levels})
+                    };
+                    if style_form && let Some(o) = p.as_object_mut() {
+                        o.insert("name".into(), json!(name));
                     }
+                    cmd(app, "format.multilevel", with(p)).map(|_| None)
                 },
             )
         }
@@ -430,22 +443,20 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             Form::new(
                 "Apply Styles",
                 vec![
-                    f(
-                        "name",
-                        "Style Name:",
-                        combo(&[
-                            "Normal",
-                            "No Spacing",
-                            "Heading 1",
-                            "Heading 2",
-                            "Heading 3",
-                            "Title",
-                            "Subtitle",
-                            "Quote",
-                            "Intense Quote",
-                            "List Paragraph",
-                        ]),
-                    ),
+                    f("name", "Style Name:", {
+                        let listed: Vec<String> =
+                            d.arr("styles").iter().filter_map(Value::as_str).map(str::to_owned).collect();
+                        if listed.is_empty() {
+                            Kind::Combo(
+                                mailcraft_engine::cmd::format::BUILTIN_STYLES
+                                    .iter()
+                                    .map(|s| (*s).to_owned())
+                                    .collect(),
+                            )
+                        } else {
+                            Kind::Combo(listed)
+                        }
+                    }),
                     f("create", "Create a new style from the selection with this name", Kind::Check),
                 ],
             )
@@ -458,7 +469,20 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "pasteSpecial" => {
             let html = crate::compose::clipboard_html();
             let text = crate::compose::clipboard_text();
+            // Whether the clipboard holds a picture (asked once per dialog: reading it can be slow).
+            let probe = egui::Id::new(("mc-paste-special-picture", d.uid));
+            let has_picture = match ctx.data(|m| m.get_temp::<bool>(probe)) {
+                Some(b) => b,
+                None => {
+                    let b = crate::compose::clipboard_image().is_some();
+                    ctx.data_mut(|m| m.insert_temp(probe, b));
+                    b
+                }
+            };
             let mut kinds: Vec<&str> = Vec::new();
+            if has_picture {
+                kinds.push("Picture");
+            }
             if html.is_some() {
                 kinds.push("HTML Format");
             }
@@ -475,7 +499,9 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                         f(
                             "n",
                             "",
-                            Kind::Note(if html.is_some() {
+                            Kind::Note(if has_picture {
+                                "The clipboard holds a picture.".into()
+                            } else if html.is_some() {
                                 "The clipboard holds formatted (HTML) content.".into()
                             } else {
                                 "The clipboard holds text only.".into()
@@ -484,6 +510,14 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                     ],
                 ),
                 move |app, v| {
+                    if v.s("as") == "Picture" {
+                        let Some(data) = crate::compose::clipboard_image() else {
+                            return Err("The clipboard no longer holds a picture.".to_owned());
+                        };
+                        let b64 = mailcraft_mime::transfer::encode_base64_flat(&data);
+                        return cmd(app, "format.pasteSpecial", with(json!({"as": "image", "image": b64})))
+                            .map(|_| None);
+                    }
                     let as_html = v.s("as") == "HTML Format";
                     let mut p = json!({"as": if as_html { "html" } else { "text" }});
                     if let Some(o) = p.as_object_mut() {
@@ -499,6 +533,47 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             )
         }
         "find" | "replace" => find_replace(ctx, app, d),
+        // Find / Select in a received message: handled by the message view (reading pane or read window).
+        "messageFind" => {
+            if let Some(id) = d.u64("id") {
+                let r =
+                    crate::reading::Request::Find { text: d.str("text"), match_case: d.bool("matchCase") };
+                crate::reading::request(ctx, app, id, r);
+            }
+            Out::Close
+        }
+        "messageSelect" => {
+            if let Some(id) = d.u64("id") {
+                let r = if d.str("what") == "similar" {
+                    crate::reading::Request::SelectSimilar
+                } else {
+                    crate::reading::Request::SelectAll
+                };
+                crate::reading::request(ctx, app, id, r);
+            }
+            Out::Close
+        }
+        "multilevelGallery" => multilevel_gallery(ctx, app, d),
+        "insert3dModel" => run_form(
+            ctx,
+            app,
+            d,
+            Form::new(
+                "Insert 3D Model",
+                vec![
+                    f("path", "File name:", Kind::Text),
+                    f(
+                        "n",
+                        "",
+                        Kind::Note("OBJ and STL models are inserted as a picture of the model.".into()),
+                    ),
+                ],
+            )
+            .init("path", json!(format!("{}/", std::env::var("HOME").unwrap_or_default())))
+            .width(460.0)
+            .ok("Insert"),
+            |app, v| cmd(app, "insert.model3d", with(json!({"path": v.s("path")}))).map(|_| None),
+        ),
         "goTo" => run_form(
             ctx,
             app,
@@ -1556,6 +1631,59 @@ fn translate(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             })
         },
     )
+}
+
+/// Multilevel List › Gallery Filter: the gallery's sections the filter shows (Current List, List Library,
+/// List Styles); clicking one applies it.
+fn multilevel_gallery(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let filter = d.str("filter");
+    let title = match filter.as_str() {
+        "current" => "Multilevel List: Current List",
+        "library" => "Multilevel List: List Library",
+        _ => "Multilevel List: All",
+    };
+    let shown: Vec<String> = d.arr("shown").iter().filter_map(Value::as_str).map(str::to_owned).collect();
+    let current = d.get("current").cloned();
+    let library = d.arr("library");
+    let styles = d.arr("styles");
+    let compose = d.u64("compose");
+    window(ctx, app, d, title, 360.0, |ui, app| {
+        let mut pick: Option<Value> = None;
+        if shown.is_empty() {
+            muted(ui, app, "The text at the cursor is not in a list.");
+        }
+        if shown.iter().any(|s| s == "current") {
+            common::heading(ui, app, "Current List");
+            let sample = current
+                .as_ref()
+                .and_then(|c| c.get("sample").or_else(|| c.get("glyph")))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            ui.label(format!("{sample}  (the list at the cursor)"));
+        }
+        for (key, heading, list) in
+            [("library", "List Library", &library), ("styles", "List Styles", &styles)]
+        {
+            if !shown.iter().any(|s| s == key) {
+                continue;
+            }
+            common::heading(ui, app, heading);
+            for item in list {
+                let label = item.get("label").and_then(Value::as_str).unwrap_or_default();
+                let sample = item.get("sample").and_then(Value::as_str).unwrap_or_default();
+                let text = if sample.is_empty() { label.to_owned() } else { format!("{sample}  {label}") };
+                if ui.button(text).clicked() {
+                    pick = item.get("style").cloned();
+                }
+            }
+        }
+        if let Some(style) = pick {
+            let _ = app.run("format.multilevel", json!({"compose": compose, "style": style}));
+            return Out::Close;
+        }
+        footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
+    })
 }
 
 fn word_count(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {

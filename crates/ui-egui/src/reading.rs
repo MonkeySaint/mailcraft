@@ -10,6 +10,11 @@
 //! Local UI state (not in the Session): which items show the light background in dark mode, which items may
 //! load remote pictures, and per-surface parsed-body caches (egui temp data).
 //!
+//! Find and Select in the received message: Message › Find… (read windows) and the body's right-click
+//! menu open a find bar above the message (matches highlighted, Next / Previous, match case, "n of m");
+//! Select › Select All and Select Text With Similar Formatting select in the body for copying. The engine
+//! asks for these with `messageFind` / `messageSelect` notices, which land in [`request`].
+//!
 //! Options that act here (engine settings): Reading Pane options (mark as read after N seconds, Space-bar
 //! reading through [`space_read`]), General › "Never change the message background color", Search ›
 //! highlight, Trust Center › pictures / plain text / link warning, Mail › "Close original message window when
@@ -323,6 +328,201 @@ fn body_doc(b: &mailcraft_model::Body, plain: bool) -> Doc {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Find bar and selection requests
+
+/// What the engine asked a message view to do (Find…, Select All, Select Text With Similar Formatting).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Request {
+    Find { text: String, match_case: bool },
+    SelectAll,
+    SelectSimilar,
+}
+
+/// Accessible names of the find bar's controls.
+pub const FIND_LABEL: &str = "Find in message";
+pub const FIND_NEXT: &str = "Next";
+pub const FIND_PREVIOUS: &str = "Previous";
+pub const FIND_CLOSE: &str = "Close find";
+/// Shown when nothing matches.
+pub const NO_MATCHES: &str = "No results";
+
+fn request_id(surface: Surface) -> Id {
+    Id::new(("mailcraft.reading.request", surface))
+}
+
+fn find_id(surface: Surface) -> Id {
+    Id::new(("mailcraft.reading.find", surface))
+}
+
+fn find_field_id(surface: Surface) -> Id {
+    Id::new(("mailcraft.reading.find-field", surface))
+}
+
+/// Hands a Find / Select request for message `item` to the view showing it: its read window when one is
+/// open, else the reading pane.
+pub fn request(ctx: &egui::Context, app: &App, item: u64, r: Request) {
+    let surface = if app.ui.read_windows.contains(&item) { Surface::Read(item) } else { Surface::Main };
+    ctx.data_mut(|d| d.insert_temp(request_id(surface), (item, r)));
+    ctx.request_repaint();
+}
+
+/// The find bar of one message view.
+#[derive(Clone, Debug, Default)]
+struct FindBar {
+    open: bool,
+    text: String,
+    match_case: bool,
+    /// Matches of `text` in the body (document order) and what they were found for.
+    hits: Vec<(mailcraft_layout::TextPos, mailcraft_layout::TextPos)>,
+    hits_for: Option<(u64, String, bool)>,
+    /// The match shown as the selection.
+    current: usize,
+    /// Scroll the current match into view after the next paint.
+    reveal: bool,
+    /// Put keyboard focus in the text field.
+    focus: bool,
+}
+
+fn find_bar_state(ctx: &egui::Context, surface: Surface) -> FindBar {
+    ctx.data(|d| d.get_temp::<FindBar>(find_id(surface))).unwrap_or_default()
+}
+
+/// Recomputes the matches when the text, case or message changed; keeps the current match in range.
+fn refresh_hits(bar: &mut FindBar, cache: &MsgCache) {
+    let key = (cache.doc_key, bar.text.clone(), bar.match_case);
+    if bar.hits_for.as_ref() != Some(&key) {
+        bar.hits = body::find_all(&cache.doc, &bar.text, bar.match_case);
+        bar.hits_for = Some(key);
+        bar.current = 0;
+        bar.reveal = !bar.hits.is_empty();
+    }
+    if bar.current >= bar.hits.len() {
+        bar.current = 0;
+    }
+}
+
+/// Moves to the next (`back`: previous) match, wrapping around.
+fn step(bar: &mut FindBar, back: bool) {
+    let n = bar.hits.len();
+    if n == 0 {
+        return;
+    }
+    bar.current = if back { bar.current.checked_sub(1).unwrap_or(n - 1) } else { (bar.current + 1) % n };
+    bar.reveal = true;
+}
+
+/// "3 of 12" / "No results".
+pub fn match_label(current: usize, total: usize) -> String {
+    if total == 0 { NO_MATCHES.to_owned() } else { format!("{} of {total}", current.min(total - 1) + 1) }
+}
+
+/// Applies a pending request to the message view, and the body menu's Find….
+fn take_request(ctx: &egui::Context, surface: Surface, id: u64, bar: &mut FindBar, cache: &mut MsgCache) {
+    if std::mem::take(&mut cache.view.find_requested) {
+        bar.open = true;
+        bar.focus = true;
+        if let Some(t) = body::selected_text(&cache.view, &cache.doc).filter(|t| !t.contains('\n')) {
+            bar.text = t.chars().take(200).collect();
+        }
+    }
+    let Some((item, r)) = ctx.data(|d| d.get_temp::<(u64, Request)>(request_id(surface))) else {
+        return;
+    };
+    if item != id {
+        return;
+    }
+    ctx.data_mut(|d| d.remove::<(u64, Request)>(request_id(surface)));
+    match r {
+        Request::Find { text, match_case } => {
+            bar.open = true;
+            bar.focus = true;
+            if !text.is_empty() {
+                bar.text = text;
+                bar.match_case = match_case;
+            }
+        }
+        Request::SelectAll => {
+            body::select_all(&mut cache.view);
+            focus_body(ctx, &cache.view);
+        }
+        Request::SelectSimilar => {
+            let at = cache.view.ordered_selection().map(|(a, _)| a).or_else(|| {
+                body::leaf_paths(&cache.doc)
+                    .into_iter()
+                    .next()
+                    .map(|p| mailcraft_layout::TextPos { block_path: p, offset: 0 })
+            });
+            if let Some(at) = at {
+                body::select_similar_at(&mut cache.view, &cache.doc, &at);
+            }
+            focus_body(ctx, &cache.view);
+        }
+    }
+}
+
+/// Gives the body keyboard focus (so Ctrl+C copies what was selected).
+fn focus_body(ctx: &egui::Context, view: &BodyView) {
+    if let Some(w) = view.widget {
+        ctx.memory_mut(|m| m.request_focus(w));
+    }
+}
+
+/// The find bar row: text field, match count, Previous / Next, Match case, close.
+fn find_bar(ui: &mut Ui, app: &App, surface: Surface, bar: &mut FindBar) {
+    let theme = app.theme.clone();
+    let mut close = false;
+    egui::Frame::new().fill(theme.info_bar).inner_margin(egui::Margin::symmetric(PAD as i8, 4)).show(
+        ui,
+        |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let field_w = (ui.available_width() - 260.0).clamp(80.0, 320.0);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut bar.text)
+                        .id(find_field_id(surface))
+                        .hint_text("Find")
+                        .desired_width(field_w),
+                );
+                let r = r.on_hover_text(FIND_LABEL);
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, FIND_LABEL));
+                if std::mem::take(&mut bar.focus) {
+                    r.request_focus();
+                }
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if enter {
+                    let back = ui.input(|i| i.modifiers.shift);
+                    step(bar, back);
+                    r.request_focus();
+                }
+                let label = if bar.text.is_empty() {
+                    String::new()
+                } else {
+                    match_label(bar.current, bar.hits.len())
+                };
+                ui.label(RichText::new(label).size(12.0).color(theme.text_muted));
+                let any = !bar.hits.is_empty();
+                if ui.add_enabled(any, egui::Button::new(FIND_PREVIOUS)).clicked() {
+                    step(bar, true);
+                }
+                if ui.add_enabled(any, egui::Button::new(FIND_NEXT)).clicked() {
+                    step(bar, false);
+                }
+                ui.checkbox(&mut bar.match_case, "Match case");
+                let x = ui.button("\u{2715}").on_hover_text(FIND_CLOSE);
+                x.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, FIND_CLOSE));
+                if x.clicked() {
+                    close = true;
+                }
+            });
+        },
+    );
+    if close {
+        bar.open = false;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Pieces
 
 fn focused_mail(app: &App) -> Option<u64> {
@@ -405,6 +605,34 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     };
     let in_window = matches!(surface, Surface::Read(_));
 
+    // Find bar and Select requests (Message › Find…, Select, the body's right-click menu).
+    cache.view.context_menu = true;
+    // The view belongs to this doc (a new doc gets a new cache), so marks set below survive its first paint.
+    cache.view.doc_key = cache.doc_key;
+    let mut bar = find_bar_state(&ctx, surface);
+    take_request(&ctx, surface, id, &mut bar, &mut cache);
+    if bar.open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        bar.open = false;
+    }
+    if bar.open {
+        find_bar(ui, app, surface, &mut bar);
+    }
+    if bar.open {
+        refresh_hits(&mut bar, &cache);
+        cache.view.marks = bar.hits.clone();
+        if bar.reveal
+            && let Some(h) = bar.hits.get(bar.current)
+        {
+            cache.view.selection = Some(h.clone());
+            cache.view.extra.clear();
+        }
+    } else if !cache.view.marks.is_empty() || bar.hits_for.is_some() {
+        cache.view.marks.clear();
+        bar.hits.clear();
+        bar.hits_for = None;
+    }
+    let reveal = bar.open && std::mem::take(&mut bar.reveal);
+
     let mut clicked_link = None;
     let mut area = egui::ScrollArea::vertical()
         .id_salt(("mailcraft.reading.scroll", surface, id))
@@ -433,6 +661,12 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             };
             let doc = Arc::clone(&cache.doc);
             clicked_link = body::show_doc_with(ui, &mut cache.view, &doc, &opts);
+            if reveal
+                && let Some(h) = bar.hits.get(bar.current)
+                && let Some(r) = body::range_rect(&cache.view, h)
+            {
+                ui.scroll_to_rect(r.expand(24.0), Some(Align::Center));
+            }
         });
         ui.add_space(PAD);
     });
@@ -445,6 +679,11 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
         };
         ctx.data_mut(|d| d.insert_temp(scroll_id(), m));
     }
+    // The body's Find… (right-click) opens the bar on the next frame.
+    if cache.view.find_requested {
+        ctx.request_repaint();
+    }
+    ctx.data_mut(|d| d.insert_temp(find_id(surface), bar));
     ctx.data_mut(|d| d.insert_temp(key, cache));
     if let Some(href) = clicked_link
         && !links_off
@@ -1038,6 +1277,101 @@ mod tests {
         let mut h = harness(app);
         h.run_steps(2);
         assert!(h.query_by_label(mailcraft_engine::junk::JUNK_INFOBAR).is_some());
+    }
+
+    fn app_with_text(text: &str) -> (App, u64) {
+        let mut s = sample_session();
+        let id = s.mailbox.mail.values().find(|m| m.body.html.is_some()).map(|m| m.id).unwrap();
+        if let Some(m) = s.mailbox.mail.get_mut(&id) {
+            m.body.html = None;
+            m.body.format = BodyFormat::PlainText;
+            m.body.text = Some(text.to_owned());
+        }
+        s.selection.items = vec![id];
+        s.selection.focus = Some(id);
+        (App::new(s), id.0)
+    }
+
+    #[test]
+    fn find_bar_highlights_steps_and_closes() {
+        let (app, id) = app_with_text("apple pie and apple tart\nno more Apple");
+        let mut h = harness(app);
+        h.run();
+        let ctx = h.ctx.clone();
+        request(&ctx, h.state(), id, Request::Find { text: "apple".into(), match_case: false });
+        h.run();
+        h.run();
+        h.get_by_label(FIND_LABEL);
+        h.get_by_label("1 of 3");
+        h.get_by_label(FIND_NEXT).click();
+        h.run();
+        h.get_by_label("2 of 3");
+        h.get_by_label(FIND_PREVIOUS).click();
+        h.run();
+        h.get_by_label(FIND_PREVIOUS).click();
+        h.run();
+        h.get_by_label("3 of 3");
+        h.get_by_label("Match case").click();
+        h.run();
+        h.run();
+        h.get_by_label("1 of 2");
+        h.get_by_label(FIND_CLOSE).click();
+        h.run();
+        assert!(h.query_by_label(FIND_LABEL).is_none());
+        let bar = find_bar_state(&ctx, Surface::Main);
+        assert!(!bar.open && bar.hits.is_empty());
+        assert_eq!(match_label(0, 0), NO_MATCHES);
+        assert_eq!(match_label(7, 3), "3 of 3");
+    }
+
+    #[test]
+    fn select_requests_select_the_body_for_copying() {
+        let (app, id) = app_with_text("first line\nsecond line");
+        let mut h = harness(app);
+        h.run();
+        let ctx = h.ctx.clone();
+        request(&ctx, h.state(), id, Request::SelectAll);
+        h.run();
+        let cache = ctx.data(|d| d.get_temp::<MsgCache>(cache_id(Surface::Main))).unwrap();
+        assert_eq!(body::selected_text(&cache.view, &cache.doc).as_deref(), Some("first line\nsecond line"));
+        request(&ctx, h.state(), id, Request::SelectSimilar);
+        h.run();
+        let cache = ctx.data(|d| d.get_temp::<MsgCache>(cache_id(Surface::Main))).unwrap();
+        assert!(cache.view.ordered_selection().is_some());
+        // A request for another message is left alone.
+        request(&ctx, h.state(), id + 999, Request::SelectAll);
+        h.run();
+        assert!(ctx.data(|d| d.get_temp::<(u64, Request)>(request_id(Surface::Main))).is_some());
+    }
+
+    #[test]
+    fn read_window_find_runs_end_to_end() {
+        let (mut app, id) = app_with_text("pear and pear");
+        app.ui.read_windows.push(id);
+        let mut h = Harness::builder().with_size(Vec2::new(1200.0, 900.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                app.ui_root(ui);
+            },
+            app,
+        );
+        h.run();
+        // Message › Find… in the read window passes the window's item (the ribbon adds `ids` to commands
+        // that take them).
+        for cmd in ["format.find", "format.selectAll", "format.selectSimilar"] {
+            assert!(h.state().s.registry.get(cmd).unwrap().params.contains("\"ids\""), "{cmd}");
+        }
+        h.state_mut().run("format.find", json!({"ids": [id], "text": "pear"}));
+        for _ in 0..4 {
+            h.run();
+        }
+        h.get_by_label("1 of 2");
+        h.state_mut().run("format.selectAll", json!({"ids": [id]}));
+        for _ in 0..3 {
+            h.run();
+        }
+        let cache = h.ctx.data(|d| d.get_temp::<MsgCache>(cache_id(Surface::Read(id)))).unwrap();
+        assert_eq!(body::selected_text(&cache.view, &cache.doc).as_deref(), Some("pear and pear"));
     }
 
     #[test]

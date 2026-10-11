@@ -20,7 +20,16 @@
 //!   compose's cached spelling issues (re-checked when the body changed and the user paused typing);
 //! - inline pictures (`cid:` parts of the compose and `data:` URIs) through egui's image loaders, over the
 //!   body painter's placeholder (the placeholder stays when no loader decodes the format);
-//! - the caret.
+//! - the caret;
+//! - with Show All (`format.showMarks`): formatting marks (¶ at each paragraph end, · for spaces, → for tabs,
+//!   ↵ for line breaks);
+//! - with View Gridlines (`format.showGridlines`): dashed cell boundaries of tables that have no borders;
+//! - Select Text With Similar Formatting: the extra selected ranges;
+//! - pictures hidden in the Selection pane are covered (view only).
+//!
+//! Select Objects mode (`format.selectObjects`): a click selects the picture under the pointer and text is not
+//! selected. Ctrl+V with only a picture on the clipboard pastes the picture (when the platform installed a
+//! picture reader, see `compose::set_clipboard_image_reader`).
 //!
 //! Right-click opens the context menu: spelling suggestions, Ignore All and Add to Dictionary on a flagged
 //! word; Open / Copy / Remove Link on a link; table rows and columns in a table; Cut / Copy / Paste. Ctrl+click
@@ -165,6 +174,8 @@ struct Mem {
     images: Vec<String>,
     /// List markers patched into the cached layout (see [`patch_markers`]).
     markers: Vec<(Vec<usize>, usize, String, String)>,
+    /// View Gridlines: cell rectangles of borderless tables, for (doc key, width, zoom).
+    grid: Option<(u64, u32, u32, Vec<mailcraft_geom::Rect>)>,
 }
 
 /// A paste the Paste Options button can redo in another mode.
@@ -203,6 +214,11 @@ fn patch_markers(
 ) -> bool {
     let mut changed = false;
     for (list, item, text, default) in markers {
+        // A formatted marker that reads like the default one needs no patch (patching it would report a
+        // change, and ask for a repaint, on every frame).
+        if text == default {
+            continue;
+        }
         let mut item_path = list.clone();
         item_path.push(*item);
         let Some(line) = layout.index.lines.iter().find(|l| l.block_path.starts_with(&item_path)) else {
@@ -633,13 +649,20 @@ enum Act {
     Paste(String),
     Copy,
     Cut,
-    Delete { back: bool, word: bool },
+    Delete {
+        back: bool,
+        word: bool,
+    },
     Move(Motion, bool),
     SelectAll,
     Undo,
     Redo,
-    Tab { back: bool },
+    Tab {
+        back: bool,
+    },
     Spelling,
+    /// Ctrl+V: a paste event carries text; with none, a picture on the clipboard is pasted.
+    PasteKey,
     Cmd(&'static str, Value),
 }
 
@@ -682,7 +705,8 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::R if cmd && !m.shift && !m.alt => Some(Act::Cmd("format.align", json!({"kind": "right"}))),
         Key::J if cmd && !m.shift && !m.alt => Some(Act::Cmd("format.align", json!({"kind": "justify"}))),
         // Clipboard keys arrive as Copy / Cut / Paste events; swallow the key so it is not run twice.
-        Key::C | Key::X | Key::V if cmd && !m.shift && !m.alt => Some(Act::Cmd("", Value::Null)),
+        Key::V if cmd && !m.shift && !m.alt => Some(Act::PasteKey),
+        Key::C | Key::X if cmd && !m.shift && !m.alt => Some(Act::Cmd("", Value::Null)),
         _ => None,
     }
 }
@@ -769,6 +793,7 @@ fn apply(
 ) -> bool {
     let ctx = ui.ctx().clone();
     let mut any = false;
+    let text_paste = acts.iter().any(|a| matches!(a, Act::Paste(_)));
     // Layout of the current doc once an action changed it (moves after typing in the same frame).
     let mut fresh: Option<Layout> = None;
     let mut edited = false;
@@ -892,6 +917,15 @@ fn apply(
                 host.open_spelling(&ctx, cid);
                 continue;
             }
+            Act::PasteKey => {
+                // Only a picture on the clipboard (no text came with the key): paste the picture.
+                let picture = if text_paste { None } else { super::clipboard::clipboard_image() };
+                let Some(data) = picture else {
+                    continue;
+                };
+                let b64 = mailcraft_mime::transfer::encode_base64_flat(&data);
+                host.run("format.paste", json!({"compose": cid, "image": b64}));
+            }
             Act::Cmd(id, params) => {
                 if !id.is_empty() {
                     host.run(id, with_compose(cid, params));
@@ -964,7 +998,15 @@ fn image_source(c: &ComposeState, cid: u64, src: &str) -> Option<(String, Vec<u8
 
 /// Paints the compose's pictures over the body painter's placeholders where an egui image loader decodes
 /// them (SVG always; PNG / JPEG / GIF when the app installs those loaders).
-fn paint_images(ui: &Ui, layout: &Layout, c: &ComposeState, cid: u64, origin: Pos2, seen: &mut Vec<String>) {
+fn paint_images(
+    ui: &Ui,
+    layout: &Layout,
+    c: &ComposeState,
+    cid: u64,
+    origin: Pos2,
+    seen: &mut Vec<String>,
+    hidden: (&[String], Color32),
+) {
     let ctx = ui.ctx();
     let clip = ui.clip_rect();
     let painter = ui.painter().with_clip_rect(clip);
@@ -974,6 +1016,11 @@ fn paint_images(ui: &Ui, layout: &Layout, c: &ComposeState, cid: u64, origin: Po
         };
         let r = Rect::from_min_size(pos2(origin.x + rect.x, origin.y + rect.y), vec2(rect.w, rect.h));
         if !r.intersects(clip) || !r.is_finite() || r.width() < 1.0 || r.height() < 1.0 {
+            continue;
+        }
+        // Hidden in the Selection pane: covered with the page colour (still in the message).
+        if hidden.0.contains(src) {
+            painter.rect_filled(r.expand(1.0), 0.0, hidden.1);
             continue;
         }
         let Some((uri, data)) = image_source(c, cid, src) else {
@@ -998,6 +1045,177 @@ fn paint_images(ui: &Ui, layout: &Layout, c: &ComposeState, cid: u64, origin: Po
             Err(_) => {}
         }
     }
+}
+
+// =======================================================================================================
+// Formatting marks, gridlines, objects
+// =======================================================================================================
+
+/// Formatting-mark colour (Show All).
+const MARKS_INK: Color32 = Color32::from_rgb(0x4a, 0x7a, 0xb8);
+/// Gridline colour (View Gridlines).
+const GRID_INK: Color32 = Color32::from_rgb(0x8c, 0xb4, 0xe0);
+
+/// Formatting marks of the visible lines: (glyph, x, baseline) in layout coordinates.
+pub(crate) fn mark_glyphs(layout: &Layout, doc: &Doc, top: f32, bottom: f32) -> Vec<(char, f32, f32)> {
+    let mut out = Vec::new();
+    let mut cache: Option<(Vec<usize>, Vec<char>)> = None;
+    for line in &layout.index.lines {
+        if line.rect.y + line.rect.h < top || line.rect.y > bottom {
+            continue;
+        }
+        if cache.as_ref().is_none_or(|(p, _)| *p != line.block_path) {
+            cache = Some((line.block_path.clone(), leaf_chars(doc, &line.block_path)));
+        }
+        let Some((_, chars)) = cache.as_ref() else {
+            continue;
+        };
+        for off in line.start..line.end.min(chars.len()) {
+            let glyph = match chars.get(off) {
+                Some(' ') => '\u{b7}',
+                Some('\t') => '\u{2192}',
+                Some('\n') => '\u{21b5}',
+                Some('\u{a0}') => '\u{b0}',
+                _ => continue,
+            };
+            let x0 = x_at(line, off);
+            let x1 = line.stops.iter().find(|s| s.offset == off.saturating_add(1)).map_or(x0 + 4.0, |s| s.x);
+            out.push((glyph, (x0 + x1) / 2.0, line.baseline));
+            if out.len() > 20_000 {
+                return out;
+            }
+        }
+        if is_last_line(layout, line) {
+            let end = line.stops.iter().map(|s| s.x).fold(line.rect.x, f32::max);
+            out.push(('\u{b6}', end + 1.0, line.baseline));
+        }
+    }
+    out
+}
+
+/// Show All: draws the formatting marks.
+fn paint_marks(ui: &Ui, layout: &Layout, doc: &Doc, origin: Pos2, zoom: f32) {
+    let clip = ui.clip_rect();
+    let painter = ui.painter().with_clip_rect(clip);
+    let size = (13.0 * zoom).clamp(6.0, 60.0);
+    let font = egui::FontId::proportional(size);
+    for (glyph, x, base) in
+        mark_glyphs(layout, doc, clip.top() - origin.y - 40.0, clip.bottom() - origin.y + 40.0)
+    {
+        let (align, x) = match glyph {
+            '\u{b6}' | '\u{21b5}' => (egui::Align2::LEFT_BOTTOM, x),
+            _ => (egui::Align2::CENTER_BOTTOM, x),
+        };
+        painter.text(pos2(origin.x + x, origin.y + base + size * 0.2), align, glyph, font.clone(), MARKS_INK);
+    }
+}
+
+/// Deepest nesting walked when turning table borders on for the gridline layout.
+const MAX_GRID_DEPTH: usize = 32;
+
+/// `doc` with every table bordered; whether any table had no border.
+fn bordered(doc: &Doc) -> (Doc, bool) {
+    fn walk(blocks: &mut [Block], any: &mut bool, depth: usize) {
+        if depth > MAX_GRID_DEPTH {
+            return;
+        }
+        for b in blocks {
+            match b {
+                Block::Table { rows, border, .. } => {
+                    if !*border {
+                        *border = true;
+                        *any = true;
+                    }
+                    for cell in rows.iter_mut().flatten() {
+                        walk(&mut cell.blocks, any, depth + 1);
+                    }
+                }
+                Block::List { items, .. } => {
+                    for item in items {
+                        walk(item, any, depth + 1);
+                    }
+                }
+                Block::Quote { blocks } | Block::Container { blocks, .. } => walk(blocks, any, depth + 1),
+                _ => {}
+            }
+        }
+    }
+    let mut d = doc.clone();
+    let mut any = false;
+    walk(&mut d.blocks, &mut any, 0);
+    (d, any)
+}
+
+/// View Gridlines: the cell rectangles of tables that have no borders (layout coordinates).
+pub(crate) fn gridlines(
+    db: &mailcraft_fonts::FontDb,
+    doc: &Doc,
+    width: f32,
+    zoom: f32,
+) -> Vec<mailcraft_geom::Rect> {
+    let (with_borders, any) = bordered(doc);
+    if !any {
+        return Vec::new();
+    }
+    let opts = LayoutOptions { width, zoom, ..LayoutOptions::default() };
+    let plain = layout_doc(doc, db, &opts);
+    let shown: Vec<mailcraft_geom::Rect> = plain
+        .display
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            DisplayItem::StrokeRect { rect, .. } => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    layout_doc(&with_borders, db, &opts)
+        .display
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            DisplayItem::StrokeRect { rect, .. } if !shown.contains(rect) => Some(*rect),
+            _ => None,
+        })
+        .take(20_000)
+        .collect()
+}
+
+/// Dashed gridlines.
+fn paint_gridlines(ui: &Ui, rects: &[mailcraft_geom::Rect], origin: Pos2) {
+    let clip = ui.clip_rect();
+    let painter = ui.painter().with_clip_rect(clip);
+    for r in rects {
+        let rr = Rect::from_min_size(pos2(origin.x + r.x, origin.y + r.y), vec2(r.w.max(0.0), r.h.max(0.0)));
+        if !rr.is_finite() || !rr.expand(2.0).intersects(clip) {
+            continue;
+        }
+        let corners = [rr.left_top(), rr.right_top(), rr.right_bottom(), rr.left_bottom(), rr.left_top()];
+        for w in corners.windows(2) {
+            if let [a, b] = w {
+                painter.extend(Shape::dashed_line(&[*a, *b], Stroke::new(1.0, GRID_INK), 3.0, 3.0));
+            }
+        }
+    }
+}
+
+/// The picture under `p` (layout coordinates) as the char range it occupies, from the body's objects
+/// (the k-th display of a source is its k-th occurrence in the body).
+fn object_at(layout: &Layout, c: &ComposeState, p: mailcraft_geom::Point) -> Option<(DocPos, DocPos)> {
+    let mut seen: Vec<&str> = Vec::new();
+    for item in &layout.display.items {
+        let DisplayItem::Image { rect, src, .. } = item else {
+            continue;
+        };
+        let k = seen.iter().filter(|s| **s == src.as_str()).count();
+        seen.push(src);
+        if p.x >= rect.x && p.x <= rect.x + rect.w && p.y >= rect.y && p.y <= rect.y + rect.h {
+            let objects = mailcraft_engine::cmd::format::body_objects(c);
+            let obj = objects.iter().filter(|o| o.src == *src).nth(k)?;
+            let end = DocPos::new(obj.at.path.clone(), obj.at.offset.saturating_add(1));
+            return Some((obj.at.clone(), end));
+        }
+    }
+    None
 }
 
 /// Spelling squiggle colour.
@@ -1269,6 +1487,9 @@ pub(crate) fn body_editor_in(
     let sel = c.selection.clone();
     mem.view.doc_key = mem.doc_key;
     mem.view.selection = Some((to_text(&sel.anchor), to_text(&sel.focus)));
+    // Select Text With Similar Formatting: the other selected ranges.
+    mem.view.extra =
+        c.extra_ranges.iter().take(10_000).map(|r| (to_text(r.start()), to_text(r.end()))).collect();
     // Formatted list markers: a new set of markers needs a fresh layout to patch.
     let markers = if c.list_formats.is_empty() { Vec::new() } else { c.list_markers() };
     if markers != mem.markers {
@@ -1295,9 +1516,26 @@ pub(crate) fn body_editor_in(
         // Painted with the default markers this frame; the patched layout shows from the next one.
         ctx.request_repaint();
     }
+    let hidden = super::panes::hidden_objects(&ctx, cid);
     if let Some(layout) = mem.view.layout.as_ref() {
-        paint_images(ui, layout, c, cid, origin, &mut mem.images);
+        paint_images(ui, layout, c, cid, origin, &mut mem.images, (&hidden, bg));
     }
+    if c.editor.show_gridlines {
+        let key = (mem.doc_key, text_w.to_bits(), zoom.to_bits());
+        if mem.grid.as_ref().is_none_or(|g| (g.0, g.1, g.2) != key) {
+            let rects = gridlines(&crate::body::font_db(&ctx), &c.body, text_w, zoom);
+            mem.grid = Some((key.0, key.1, key.2, rects));
+        }
+        if let Some((.., rects)) = mem.grid.as_ref() {
+            paint_gridlines(ui, rects, origin);
+        }
+    }
+    if c.editor.show_marks
+        && let Some(layout) = mem.view.layout.as_ref()
+    {
+        paint_marks(ui, layout, &c.body, origin, zoom);
+    }
+    let select_objects = c.editor.select_objects;
 
     // The editor's interaction, on top of the painted body.
     let resp = ui.interact(rect, id, Sense::click_and_drag());
@@ -1314,13 +1552,29 @@ pub(crate) fn body_editor_in(
         ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers));
     let hover_link = resp.hover_pos().and_then(link_under);
     if resp.hovered() {
-        let icon =
-            if hover_link.is_some() && mods.command { CursorIcon::PointingHand } else { CursorIcon::Text };
+        let icon = if select_objects {
+            CursorIcon::Default
+        } else if hover_link.is_some() && mods.command {
+            CursorIcon::PointingHand
+        } else {
+            CursorIcon::Text
+        };
         ctx.set_cursor_icon(icon);
     }
     super::claim_initial_focus(ui, cid, &resp);
     let mut changed = false;
-    if let Some(p) = resp.interact_pointer_pos() {
+    if select_objects {
+        // Select Objects: a click picks the picture under the pointer; text is not selected.
+        if pressed && let Some(p) = resp.interact_pointer_pos() {
+            resp.request_focus();
+            *drag_anchor = None;
+            let picked = layout.zip(host.compose(cid)).and_then(|(l, c)| object_at(l, c, local(p)));
+            if let Some((a, b)) = picked {
+                select(host, cid, &a, &b);
+                changed = true;
+            }
+        }
+    } else if let Some(p) = resp.interact_pointer_pos() {
         let at = hit(p);
         let link = if mods.command { link_under(p) } else { None };
         if let (true, Some(href)) = (pressed, link) {
@@ -1535,6 +1789,10 @@ mod tests {
             "{t:?}"
         );
         assert!(!patch_markers(&mut layout, &markers, &db), "patching twice changes nothing");
+        // Markers that equal the default ones are left alone.
+        let same: Vec<_> = markers.iter().map(|(l, i, _, d)| (l.clone(), *i, d.clone(), d.clone())).collect();
+        let mut fresh = layout_doc(&c.body, &db, &LayoutOptions { width: 400.0, ..LayoutOptions::default() });
+        assert!(!patch_markers(&mut fresh, &same, &db));
     }
 
     fn chars(s: &str) -> Vec<char> {
@@ -1617,6 +1875,77 @@ mod tests {
         let mut grammar = issue(0, 5, 10);
         grammar.kind = "repeated".into();
         assert!(!issue_spans(&layout, &[grammar])[0].3);
+    }
+
+    #[test]
+    fn formatting_marks_sit_at_spaces_tabs_breaks_and_paragraph_ends() {
+        let text = |t: &str| Inline::Text { text: t.into(), style: Default::default() };
+        let doc = Doc {
+            blocks: vec![
+                Block::Paragraph {
+                    style: Default::default(),
+                    inlines: vec![text("a b\tc"), Inline::LineBreak, text("d")],
+                },
+                Block::Paragraph { style: Default::default(), inlines: vec![text("next")] },
+            ],
+            ..Doc::default()
+        };
+        let db = mailcraft_fonts::FontDb::bundled();
+        let layout = layout_doc(&doc, &db, &LayoutOptions { width: 400.0, ..LayoutOptions::default() });
+        let marks = mark_glyphs(&layout, &doc, -1.0, 1.0e6);
+        let glyphs: String = marks.iter().map(|m| m.0).collect();
+        assert_eq!(glyphs, "\u{b7}\u{2192}\u{21b5}\u{b6}\u{b6}", "{glyphs:?}");
+        let space_x = marks[0].1;
+        assert!(space_x > 2.0 && space_x < 40.0, "{marks:?}");
+        // Off-screen lines draw nothing.
+        assert!(mark_glyphs(&layout, &doc, 5000.0, 6000.0).is_empty());
+    }
+
+    #[test]
+    fn gridlines_only_for_tables_without_borders() {
+        let db = mailcraft_fonts::FontDb::bundled();
+        let open = mailcraft_html::html_to_doc(
+            "<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>",
+        );
+        let rects = gridlines(&db, &open, 400.0, 1.0);
+        assert!(rects.len() >= 4, "{rects:?}");
+        let boxed = mailcraft_html::html_to_doc("<table border=\"1\"><tr><td>a</td></tr></table>");
+        assert!(matches!(boxed.blocks.first(), Some(Block::Table { border: true, .. })), "{boxed:?}");
+        assert!(gridlines(&db, &boxed, 400.0, 1.0).is_empty());
+        assert!(gridlines(&db, &Doc::from_plain_text("no table"), 400.0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn select_objects_hits_the_picture_under_the_pointer() {
+        let mut c = ComposeState::default();
+        c.insert_text("ab");
+        c.insert_image(
+            mailcraft_engine::compose::InlineImage {
+                content_id: "p1@x".into(),
+                filename: "p.png".into(),
+                mime_type: "image/png".into(),
+                data: vec![1, 2, 3],
+            },
+            "Pic",
+            Some(40.0),
+            Some(30.0),
+        );
+        let db = mailcraft_fonts::FontDb::bundled();
+        let layout = layout_doc(&c.body, &db, &LayoutOptions { width: 400.0, ..LayoutOptions::default() });
+        let r = layout
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        let hit =
+            object_at(&layout, &c, mailcraft_geom::Point { x: r.x + r.w / 2.0, y: r.y + r.h / 2.0 }).unwrap();
+        assert_eq!(hit.1.offset, hit.0.offset + 1);
+        assert_eq!(leaf_chars(&c.body, &hit.0.path).get(hit.0.offset), Some(&'\u{fffc}'));
+        assert!(object_at(&layout, &c, mailcraft_geom::Point { x: r.x - 30.0, y: r.y - 30.0 }).is_none());
     }
 
     #[test]

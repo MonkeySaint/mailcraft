@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::compose::{
     compose_id, compose_mut, has_body_selection, has_compose, pos_json, rich_compose, spec,
 };
-use crate::cmd::util::{dialog, opt_bool, opt_str, req_str};
+use crate::cmd::util::{dialog, opt_bool, opt_i64, opt_str, opt_u64, req_str};
 use crate::compose::{
     BodySelection, CaseKind, ClipEntry, ComposeState, DocPos, ListFormat, NamedStyle, NumberStyle,
     PainterState, PasteMode, align_of, multilevel_formats,
@@ -179,14 +179,134 @@ fn parse_color(t: &str) -> Result<Color, CmdError> {
     mailcraft_html::parse_css_color(t).ok_or_else(|| CmdError::Params(format!("unknown colour `{t}`")))
 }
 
+/// Theme colour columns of the Font Color and Shading galleries (plan/outlook/ribbon-compose.md): key, palette
+/// slot ([`crate::compose::THEME_COLOR_SLOTS`]), name in the default theme, and the five shade rows under
+/// the base colour (positive: lighter by that %, negative: darker).
+pub const THEME_COLUMNS: [(&str, usize, &str, [i8; 5]); 10] = [
+    ("bg1", 1, "White, Background 1", [-5, -15, -25, -35, -50]),
+    ("tx1", 0, "Black, Text 1", [50, 35, 25, 15, 5]),
+    ("bg2", 3, "Light Gray, Background 2", [-10, -25, -50, -75, -90]),
+    ("tx2", 2, "Dark Blue, Text 2", [90, 75, 50, 25, 10]),
+    ("accent1", 4, "Dark Teal, Accent 1", [80, 60, 40, -25, -50]),
+    ("accent2", 5, "Orange, Accent 2", [80, 60, 40, -25, -50]),
+    ("accent3", 6, "Dark Green, Accent 3", [80, 60, 40, -25, -50]),
+    ("accent4", 7, "Turquoise, Accent 4", [80, 60, 40, -25, -50]),
+    ("accent5", 8, "Plum, Accent 5", [80, 60, 40, -25, -50]),
+    ("accent6", 9, "Green, Accent 6", [80, 60, 40, -25, -50]),
+];
+
+/// The Standard Colors row of the Font Color and Shading galleries (names as observed, our own values).
+pub const STANDARD_COLORS: [(&str, &str); 10] = [
+    ("Dark Red", "#a01c1c"),
+    ("Red", "#e02424"),
+    ("Orange", "#ef8a17"),
+    ("Yellow", "#f2c94c"),
+    ("Light Green", "#7ac74f"),
+    ("Green", "#2e8b46"),
+    ("Light Blue", "#3fa7d6"),
+    ("Blue", "#1f5fbf"),
+    ("Dark Blue", "#14286b"),
+    ("Purple", "#6b3fa0"),
+];
+
+/// Text Highlight Color pens, in gallery order.
+pub const HIGHLIGHT_COLORS: [(&str, &str); 15] = [
+    ("Yellow", "#ffff00"),
+    ("Bright Green", "#00ff00"),
+    ("Turquoise", "#00ffff"),
+    ("Pink", "#ff00ff"),
+    ("Blue", "#0000ff"),
+    ("Red", "#ff0000"),
+    ("Dark Blue", "#000080"),
+    ("Teal", "#008080"),
+    ("Green", "#008000"),
+    ("Violet", "#800080"),
+    ("Dark Red", "#800000"),
+    ("Dark Yellow", "#808000"),
+    ("Gray-50%", "#808080"),
+    ("Gray-25%", "#c0c0c0"),
+    ("Black", "#000000"),
+];
+
+/// Contrast ratio a highlight needs with black or white text to stay in the High-contrast only palette.
+const HIGH_CONTRAST: f32 = 7.0;
+
+/// Whether highlight colour `c` keeps text readable (black or white text, whichever reads better, at the
+/// AAA contrast ratio).
+pub fn is_high_contrast(c: Color) -> bool {
+    c.contrast(&Color::BLACK).max(c.contrast(&Color::WHITE)) >= HIGH_CONTRAST
+}
+
+/// A theme colour of compose `c`'s active theme: `key` from [`THEME_COLUMNS`], `tint` percent (positive
+/// lighter, negative darker, 0 = the base colour).
+pub fn theme_color(c: &ComposeState, key: &str, tint: i64) -> Option<Color> {
+    let (_, slot, _, _) = THEME_COLUMNS.iter().find(|(k, ..)| k.eq_ignore_ascii_case(key))?;
+    let base = c.theme_resolved().color(*slot);
+    let t = (tint.clamp(-100, 100) as f32 / 100.0).abs();
+    Some(match tint.signum() {
+        1 => base.lerp(Color::WHITE, t),
+        -1 => base.lerp(Color::BLACK, t),
+        _ => base,
+    })
+}
+
+/// Gallery name of a theme colour: "Orange, Accent 2, Lighter 80%".
+fn theme_color_name(name: &str, tint: i8) -> String {
+    match tint.signum() {
+        1 => format!("{name}, Lighter {tint}%"),
+        -1 => format!("{name}, Darker {}%", tint.unsigned_abs()),
+        _ => name.to_owned(),
+    }
+}
+
+/// The Font Color / Shading gallery of compose `c`: the theme colours (base row, then the shade rows, as
+/// drawn) from its active theme, and the standard colours.
+pub fn color_gallery(c: &ComposeState) -> Value {
+    let mut theme = Vec::new();
+    for row in 0..6usize {
+        for (key, _, name, tints) in THEME_COLUMNS {
+            let tint = row.checked_sub(1).and_then(|r| tints.get(r).copied()).unwrap_or(0);
+            let col = theme_color(c, key, i64::from(tint)).unwrap_or(Color::BLACK);
+            theme.push(json!({"name": theme_color_name(name, tint), "theme": key, "tint": tint, "color": col.to_hex()}));
+        }
+    }
+    let standard: Vec<Value> = STANDARD_COLORS.iter().map(|(n, h)| json!({"name": n, "color": h})).collect();
+    json!({"theme": theme, "standard": standard})
+}
+
+/// The colour a Font Color / Shading call names: `{"theme": key, "tint": n}` (from the compose's theme) or
+/// `{"color": …}` (`Ok(None)` when neither is given).
+fn requested_theme_color(s: &Session, p: &Value) -> Result<Option<Color>, CmdError> {
+    let Some(key) = opt_str(p, "theme") else {
+        return Ok(None);
+    };
+    let tint = opt_i64(p, "tint").unwrap_or(0);
+    let cid = compose_id(s, p)?;
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    theme_color(c, key, tint)
+        .map(Some)
+        .ok_or_else(|| CmdError::Params(format!("unknown theme colour `{key}`")))
+}
+
 fn color(s: &mut Session, p: &Value) -> CmdResult {
     if opt_bool(p, "custom") == Some(true) {
         return dialog(s, "colors", json!({"compose": compose_id(s, p)?, "target": "font"}));
     }
-    let chosen: Option<Option<Color>> = match opt_str(p, "color") {
-        Some(t) if t.eq_ignore_ascii_case("automatic") || t.eq_ignore_ascii_case("auto") => Some(None),
-        Some(t) => Some(Some(parse_color(t)?)),
-        None => None,
+    if opt_bool(p, "list") == Some(true) {
+        let cid = compose_id(s, p)?;
+        return s
+            .composes
+            .get(&cid)
+            .map(color_gallery)
+            .ok_or_else(|| CmdError::Disabled("no compose".into()));
+    }
+    let chosen: Option<Option<Color>> = match (requested_theme_color(s, p)?, opt_str(p, "color")) {
+        (Some(col), _) => Some(Some(col)),
+        (None, Some(t)) if t.eq_ignore_ascii_case("automatic") || t.eq_ignore_ascii_case("auto") => {
+            Some(None)
+        }
+        (None, Some(t)) => Some(Some(parse_color(t)?)),
+        (None, None) => None,
     };
     let c = compose_mut(s, p)?;
     let col = match chosen {
@@ -213,23 +333,50 @@ fn highlight(s: &mut Session, p: &Value) -> CmdResult {
         }
         None => None,
     };
+    let list = opt_bool(p, "list") == Some(true);
     let c = compose_mut(s, p)?;
     if let Some(v) = hc {
         c.editor.high_contrast_only = v;
-        if chosen.is_none() {
-            return Ok(json!({"highContrastOnly": v}));
+        if chosen.is_none() && !list {
+            return Ok(json!({"highContrastOnly": v, "colors": highlight_palette(v)}));
         }
+    }
+    if list {
+        let hc = c.editor.high_contrast_only;
+        return Ok(json!({"highContrastOnly": hc, "colors": highlight_palette(hc)}));
     }
     let col = match chosen {
         Some(v) => v,
         None => Some(c.last_highlight.unwrap_or(DEFAULT_HIGHLIGHT)),
     };
+    // High-contrast only: the pens that would leave text hard to read are not offered.
+    if let Some(v) = col
+        && c.editor.high_contrast_only
+        && !is_high_contrast(v)
+    {
+        let name = HIGHLIGHT_COLORS
+            .iter()
+            .find(|(_, h)| parse_color(h).ok() == Some(v))
+            .map_or_else(|| v.to_hex(), |(n, _)| (*n).to_owned());
+        return Err(CmdError::Disabled(format!(
+            "{name} is not a high-contrast highlight; turn off High-contrast only to use it"
+        )));
+    }
     if let Some(v) = col {
         c.last_highlight = Some(v);
     }
     c.checkpoint();
     c.apply_text_style(|st| st.highlight = col);
     Ok(json!({"highlight": col.map(|x| x.to_hex())}))
+}
+
+/// The highlighter pens offered (all, or the high-contrast ones).
+fn highlight_palette(high_contrast_only: bool) -> Vec<Value> {
+    HIGHLIGHT_COLORS
+        .iter()
+        .filter(|(_, h)| !high_contrast_only || parse_color(h).is_ok_and(is_high_contrast))
+        .map(|(n, h)| json!({"name": n, "color": h}))
+        .collect()
 }
 
 fn clear_formatting(s: &mut Session, p: &Value) -> CmdResult {
@@ -332,7 +479,12 @@ fn paragraph_spacing(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn shading(s: &mut Session, p: &Value) -> CmdResult {
+    if opt_bool(p, "custom") == Some(true) {
+        return dialog(s, "colors", json!({"compose": compose_id(s, p)?, "target": "shading"}));
+    }
+    let themed = requested_theme_color(s, p)?;
     let col = match p.get("color") {
+        _ if themed.is_some() => themed,
         None => {
             return dialog(s, "bordersAndShading", json!({"compose": compose_id(s, p)?, "tab": "shading"}));
         }
@@ -546,6 +698,61 @@ fn level_param(v: &Value) -> Result<ListFormat, CmdError> {
     Ok(f)
 }
 
+/// The List Library of the Multilevel List gallery: (key, label).
+pub const MULTILEVEL_LIBRARY: [(&str, &str); 8] = [
+    ("numbered", "1. a. i."),
+    ("numberedParen", "1) a) i)"),
+    ("outline", "1. 1.1. 1.1.1."),
+    ("outlineRoman", "I. A. 1. a)"),
+    ("article", "Article I. / Section 1.01"),
+    ("chapter", "Chapter 1 / 1.1"),
+    ("bullets", "Bullets by level"),
+    ("diamonds", "Four Small Diamonds"),
+];
+
+/// Gallery Filter (All / Current List / List Library): the sections the Multilevel List gallery shows, as
+/// a picker window. "Current List" is the list at the caret, "List Library" the built-in definitions, "All"
+/// both plus the named list styles.
+fn multilevel_gallery(s: &mut Session, p: &Value, filter: &str) -> CmdResult {
+    let cid = compose_id(s, p)?;
+    let current = s.composes.get(&cid).and_then(ComposeState::list_format_at_caret);
+    let library: Vec<Value> =
+        MULTILEVEL_LIBRARY.iter().map(|(k, l)| json!({"style": k, "label": l})).collect();
+    let styles: Vec<Value> = super::insert::list_styles(s, cid)
+        .into_iter()
+        .map(|(name, levels)| {
+            let sample = levels.first().map(|f| f.marker(1, &[1])).unwrap_or_default();
+            json!({"style": name, "label": name, "sample": sample})
+        })
+        .collect();
+    let shown: Vec<&str> = match filter {
+        "current" if current.is_none() => Vec::new(),
+        "current" => vec!["current"],
+        "library" => vec!["library"],
+        _ => {
+            let mut v = Vec::new();
+            if current.is_some() {
+                v.push("current");
+            }
+            v.push("library");
+            if !styles.is_empty() {
+                v.push("styles");
+            }
+            v
+        }
+    };
+    let out = json!({
+        "compose": cid,
+        "filter": filter,
+        "shown": shown,
+        "current": format_json(current.as_ref()),
+        "library": if shown.contains(&"library") { library } else { Vec::new() },
+        "styles": if shown.contains(&"styles") { styles } else { Vec::new() },
+    });
+    s.notify(crate::Notice::OpenDialog("multilevelGallery".into(), out.clone()));
+    Ok(out)
+}
+
 fn multilevel(s: &mut Session, p: &Value) -> CmdResult {
     let style = opt_str(p, "style");
     if let Some(f) = opt_str(p, "filter") {
@@ -553,25 +760,25 @@ fn multilevel(s: &mut Session, p: &Value) -> CmdResult {
             return Err(CmdError::Params(format!("unknown gallery filter `{f}`")));
         }
         if style.is_none() && p.get("levels").is_none() {
-            // Gallery filter: which definitions the gallery shows.
-            let cid = compose_id(s, p)?;
-            let current = s.composes.get(&cid).and_then(ComposeState::list_format_at_caret);
-            let library = [
-                "numbered",
-                "numberedParen",
-                "outline",
-                "article",
-                "chapter",
-                "outlineRoman",
-                "bullets",
-                "diamonds",
-            ];
-            let shown: Vec<&str> = match f {
-                "current" if current.is_none() => Vec::new(),
-                "current" => vec!["current"],
-                _ => library.to_vec(),
-            };
-            return Ok(json!({"filter": f, "shown": shown, "current": format_json(current.as_ref())}));
+            return multilevel_gallery(s, p, f);
+        }
+    }
+    // A named list style (Define New List Style) is applied by its name.
+    if let Some(name) = style.filter(|n| !matches!(*n, "none" | "None" | "define" | "defineStyle"))
+        && p.get("levels").is_none()
+        && p.get("name").is_none()
+    {
+        let cid = compose_id(s, p)?;
+        let named = super::insert::list_styles(s, cid)
+            .into_iter()
+            .rev()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name.trim()));
+        if let Some((n, levels)) = named {
+            let mut r = apply_multilevel(s, p, levels)?;
+            if let Some(o) = r.as_object_mut() {
+                o.insert("listStyle".into(), json!(n));
+            }
+            return Ok(r);
         }
     }
     let levels: Option<Vec<ListFormat>> = match (p.get("levels"), style) {
@@ -599,6 +806,24 @@ fn multilevel(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     let levels = levels.unwrap_or_default();
+    // Define New List Style: the definition is kept under its name for later lists.
+    let saved = match opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => {
+            let persisted = super::insert::save_list_style(s, name, &levels)?;
+            Some((name.to_owned(), persisted))
+        }
+        _ => None,
+    };
+    let mut r = apply_multilevel(s, p, levels)?;
+    if let (Some((name, persisted)), Some(o)) = (saved, r.as_object_mut()) {
+        o.insert("listStyle".into(), json!(name));
+        o.insert("persisted".into(), json!(persisted));
+    }
+    Ok(r)
+}
+
+/// Turns the paragraphs at the caret into a list with `levels` (the whole list takes the definition).
+fn apply_multilevel(s: &mut Session, p: &Value, levels: Vec<ListFormat>) -> CmdResult {
     let numbered = levels.first().is_none_or(ListFormat::is_number);
     let kind = if numbered { ListKind::Numbered { start: 1 } } else { ListKind::Bullet };
     let c = compose_mut(s, p)?;
@@ -818,20 +1043,142 @@ fn accent(c: &ComposeState) -> Color {
     if c.theme == Default::default() { ACCENT } else { c.theme_resolved().color(crate::compose::ACCENT1) }
 }
 
+/// Built-in styles, in the order the Styles pane lists them (names as in the Styles gallery).
+pub const BUILTIN_STYLES: [&str; 20] = [
+    "Normal",
+    "No Spacing",
+    "Heading 1",
+    "Heading 2",
+    "Heading 3",
+    "Title",
+    "Subtitle",
+    "Subtle Emphasis",
+    "Emphasis",
+    "Intense Emphasis",
+    "Strong",
+    "Quote",
+    "Intense Quote",
+    "Subtle Reference",
+    "Intense Reference",
+    "Book Title",
+    "List Paragraph",
+    "Code",
+    "Heading 4",
+    "Heading 5",
+];
+
+/// Longest style name accepted.
+const MAX_STYLE_NAME: usize = 100;
+/// Most styles created in one message.
+const MAX_CUSTOM_STYLES: usize = 200;
+
+/// The style the caret's paragraph looks like: a created style with exactly its formatting, else its
+/// heading level, else Normal.
+pub fn current_style(c: &ComposeState) -> String {
+    let (st, para) = (c.style_at_caret(), c.para_at_caret());
+    if let Some(x) = c.custom_styles.iter().rev().find(|x| x.style == st && x.para == para) {
+        return x.name.clone();
+    }
+    let path = &c.selection.focus.path;
+    match block_at(&c.body.blocks, path) {
+        Some(mailcraft_model::Block::Heading { level, .. }) => format!("Heading {level}"),
+        _ => "Normal".to_owned(),
+    }
+}
+
+/// The Styles pane list: built-in styles (a created style of the same name replaces one), then the
+/// created ones; `current` marks the caret's style.
+pub fn styles_list(c: &ComposeState) -> Vec<Value> {
+    let current = current_style(c);
+    let custom = |n: &str| c.custom_styles.iter().any(|x| x.name.eq_ignore_ascii_case(n));
+    let mut out: Vec<Value> = BUILTIN_STYLES
+        .iter()
+        .map(|n| json!({"name": n, "builtin": true, "modified": custom(n), "current": current.eq_ignore_ascii_case(n)}))
+        .collect();
+    for x in &c.custom_styles {
+        if BUILTIN_STYLES.iter().any(|b| b.eq_ignore_ascii_case(&x.name)) {
+            continue;
+        }
+        out.push(json!({"name": x.name, "builtin": false, "modified": false, "current": current == x.name}));
+    }
+    out
+}
+
 fn style(s: &mut Session, p: &Value) -> CmdResult {
     let raw = req_str(p, "name")?;
-    let name = raw.trim_start_matches('¶').trim().to_owned();
+    let name: String = raw.trim_start_matches('¶').trim().chars().take(MAX_STYLE_NAME).collect();
     if name.is_empty() {
         return Err(CmdError::Params("`name` must name a style".into()));
     }
     let action = opt_str(p, "action").unwrap_or("apply");
+    let new_name: Option<String> = opt_str(p, "newName")
+        .map(|n| n.trim_start_matches('¶').trim().chars().take(MAX_STYLE_NAME).collect::<String>())
+        .filter(|n| !n.is_empty());
     let c = compose_mut(s, p)?;
+    let is_builtin = |n: &str| BUILTIN_STYLES.iter().any(|b| b.eq_ignore_ascii_case(n));
     match action {
         "create" => {
-            let st = NamedStyle { name: name.clone(), style: c.style_at_caret(), para: c.para_at_caret() };
-            c.custom_styles.retain(|x| !x.name.eq_ignore_ascii_case(&name));
+            if c.custom_styles.len() >= MAX_CUSTOM_STYLES {
+                return Err(CmdError::Failed("this message has too many styles".into()));
+            }
+            // A new style never silently replaces another one: "Style1" → "Style1 2" when taken.
+            let taken =
+                |n: &str| is_builtin(n) || c.custom_styles.iter().any(|x| x.name.eq_ignore_ascii_case(n));
+            let mut unique = name.clone();
+            let mut k = 2u32;
+            while taken(&unique) && k < 10_000 {
+                unique = format!("{name} {k}");
+                k += 1;
+            }
+            let st = NamedStyle { name: unique.clone(), style: c.style_at_caret(), para: c.para_at_caret() };
             c.custom_styles.push(st);
-            Ok(json!({"created": name}))
+            Ok(json!({"created": unique}))
+        }
+        // Modify: the style takes the formatting at the caret (Update to Match Selection), optionally under a
+        // new name. A built-in style modified here keeps its name and wins over the built-in look.
+        "modify" => {
+            let target = match &new_name {
+                Some(n) if !is_builtin(&name) => n.clone(),
+                _ => name.clone(),
+            };
+            if c.custom_styles.len() >= MAX_CUSTOM_STYLES
+                && !c.custom_styles.iter().any(|x| x.name.eq_ignore_ascii_case(&name))
+            {
+                return Err(CmdError::Failed("this message has too many styles".into()));
+            }
+            let st = NamedStyle { name: target.clone(), style: c.style_at_caret(), para: c.para_at_caret() };
+            c.custom_styles
+                .retain(|x| !x.name.eq_ignore_ascii_case(&name) && !x.name.eq_ignore_ascii_case(&target));
+            c.custom_styles.push(st);
+            Ok(json!({"modified": target}))
+        }
+        "rename" => {
+            let Some(to) = new_name else {
+                return Err(CmdError::Params("`newName` required".into()));
+            };
+            if is_builtin(&name) || is_builtin(&to) {
+                return Err(CmdError::Failed("built-in styles cannot be renamed".into()));
+            }
+            if c.custom_styles
+                .iter()
+                .any(|x| x.name.eq_ignore_ascii_case(&to) && !x.name.eq_ignore_ascii_case(&name))
+            {
+                return Err(CmdError::Failed(format!("a style named `{to}` already exists")));
+            }
+            let Some(x) = c.custom_styles.iter_mut().find(|x| x.name.eq_ignore_ascii_case(&name)) else {
+                return Err(CmdError::Params(format!("no style named `{name}`")));
+            };
+            x.name = to.clone();
+            Ok(json!({"renamed": to}))
+        }
+        // Delete a created style (or a built-in style's changes: it looks built-in again).
+        "delete" => {
+            let before = c.custom_styles.len();
+            c.custom_styles.retain(|x| !x.name.eq_ignore_ascii_case(&name));
+            if c.custom_styles.len() == before {
+                return Err(CmdError::Params(format!("no created style named `{name}`")));
+            }
+            Ok(json!({"deleted": name}))
         }
         "apply" => {
             c.checkpoint();
@@ -921,13 +1268,25 @@ fn style_set(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"styleSet": c.style_set, "paragraphSpacing": c.paragraph_spacing_preset}))
 }
 
+/// Styles pane: toggles (or `show`s) the pane; `list` only reports the styles; `apply` opens Apply Styles.
 fn styles_pane(s: &mut Session, p: &Value) -> CmdResult {
     if opt_bool(p, "apply") == Some(true) {
-        return dialog(s, "applyStyles", json!({"compose": compose_id(s, p)?}));
+        let cid = compose_id(s, p)?;
+        let names: Vec<Value> = s
+            .composes
+            .get(&cid)
+            .map(styles_list)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.get("name").cloned())
+            .collect();
+        return dialog(s, "applyStyles", json!({"compose": cid, "styles": names}));
     }
     let c = compose_mut(s, p)?;
-    c.editor.styles_pane = !c.editor.styles_pane;
-    Ok(json!({"stylesPane": c.editor.styles_pane}))
+    if opt_bool(p, "list") != Some(true) {
+        c.editor.styles_pane = opt_bool(p, "show").unwrap_or(!c.editor.styles_pane);
+    }
+    Ok(json!({"stylesPane": c.editor.styles_pane, "styles": styles_list(c)}))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1124,8 +1483,17 @@ fn embed_pasted_images(doc: &mut Doc, c: &mut ComposeState, others: &[crate::com
 }
 
 fn do_paste(s: &mut Session, p: &Value, mode: PasteMode) -> CmdResult {
+    if opt_str(p, "image").is_some() && mode != PasteMode::TextOnly {
+        return paste_image(s, p);
+    }
     let cid = compose_id(s, p)?;
-    let mut doc = paste_source(s, p, cid)?;
+    let doc = paste_source(s, p, cid)?;
+    paste_doc(s, p, doc, mode)
+}
+
+/// Inserts `doc` at the caret of the target compose (pictures carrying their data are embedded).
+fn paste_doc(s: &mut Session, p: &Value, mut doc: Doc, mode: PasteMode) -> CmdResult {
+    let cid = compose_id(s, p)?;
     let others: Vec<crate::compose::InlineImage> = s
         .composes
         .iter()
@@ -1143,6 +1511,27 @@ fn do_paste(s: &mut Session, p: &Value, mode: PasteMode) -> CmdResult {
     Ok(json!({"pasted": true, "caret": pos_json(&c.selection.focus)}))
 }
 
+/// A picture from the clipboard: `image` holds its bytes in base64 (PNG, JPEG, GIF, BMP or WebP).
+fn paste_image(s: &mut Session, p: &Value) -> CmdResult {
+    use base64::Engine as _;
+    let b64 =
+        opt_str(p, "image").ok_or_else(|| CmdError::Params("`image` must be base64 picture data".into()))?;
+    if b64.len() / 4 * 3 > MAX_PASTED_IMAGE_BYTES {
+        return Err(CmdError::Params("the picture is too large".into()));
+    }
+    let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(clean.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(clean.as_bytes()))
+        .map_err(|_| CmdError::Params("`image` is not valid base64".into()))?;
+    let c = compose_mut(s, p)?;
+    if c.format == mailcraft_model::BodyFormat::PlainText {
+        return Err(CmdError::Disabled("pictures cannot be pasted into a plain-text message".into()));
+    }
+    let cid = super::insert::paste_picture(c, data)?;
+    Ok(json!({"pasted": true, "picture": cid, "caret": pos_json(&c.selection.focus)}))
+}
+
 fn paste(s: &mut Session, p: &Value) -> CmdResult {
     let mode = paste_mode(opt_str(p, "mode"))?;
     do_paste(s, p, mode)
@@ -1157,23 +1546,160 @@ fn paste_special(s: &mut Session, p: &Value) -> CmdResult {
         None => dialog(s, "pasteSpecial", json!({"compose": compose_id(s, p)?})),
         Some("html" | "rtf") => do_paste(s, p, PasteMode::KeepSource),
         Some("text") => do_paste(s, p, PasteMode::TextOnly),
-        Some("image") => Err(CmdError::Failed("the clipboard holds no picture".into())),
+        Some("image" | "picture") if opt_str(p, "image").is_some() => paste_image(s, p),
+        Some("image" | "picture") => Err(CmdError::Failed("the clipboard holds no picture".into())),
         Some(other) => Err(CmdError::Params(format!("unknown paste format `{other}`"))),
     }
 }
 
+/// Longest clipboard item preview (chars).
+const CLIP_PREVIEW_CHARS: usize = 300;
+
+/// Clipboard pane items, newest first: preview text (whitespace collapsed) and how many pictures the item
+/// holds.
+fn clip_entries(c: &ComposeState) -> Vec<Value> {
+    c.clipboard
+        .iter()
+        .rev()
+        .map(|e| {
+            let text: String = e.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let preview: String = text.chars().take(CLIP_PREVIEW_CHARS).collect();
+            let pictures = mailcraft_html::doc_to_html(&e.doc).matches("<img").count();
+            json!({"text": preview, "pictures": pictures})
+        })
+        .collect()
+}
+
+/// Office Clipboard pane: the last [`crate::compose::MAX_CLIPBOARD`] items copied or cut in MailCraft,
+/// newest first. No params toggles the pane (`show` sets it); `paste: n` pastes item n, `pasteAll` pastes
+/// every item (oldest first), `delete: n` removes item n, `clear` empties the history.
 fn clipboard_pane(s: &mut Session, p: &Value) -> CmdResult {
-    let c = compose_mut(s, p)?;
-    c.editor.clipboard_pane = !c.editor.clipboard_pane;
+    let cid = compose_id(s, p)?;
+    // The history is shared by every open message; a message opened after the copies picks it up.
+    if s.composes.get(&cid).is_some_and(|c| c.clipboard.is_empty()) {
+        let shared = s
+            .composes
+            .iter()
+            .rev()
+            .find(|(k, c)| **k != cid && !c.clipboard.is_empty())
+            .map(|(_, c)| c.clipboard.clone());
+        if let (Some(h), Some(c)) = (shared, s.composes.get_mut(&cid)) {
+            c.clipboard = h;
+        }
+    }
+    let nth = |s: &Session, n: u64| -> Result<ClipEntry, CmdError> {
+        let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+        usize::try_from(n)
+            .ok()
+            .and_then(|n| c.clipboard.len().checked_sub(1).and_then(|last| last.checked_sub(n)))
+            .and_then(|i| c.clipboard.get(i))
+            .cloned()
+            .ok_or_else(|| CmdError::Params(format!("no clipboard item {n}")))
+    };
+    let mut pasted = Value::Null;
+    if opt_bool(p, "clear") == Some(true) {
+        for c in s.composes.values_mut() {
+            c.clipboard.clear();
+        }
+    } else if let Some(n) = opt_u64(p, "delete") {
+        let entry = nth(s, n)?;
+        for c in s.composes.values_mut() {
+            if let Some(i) = c.clipboard.iter().rposition(|e| *e == entry) {
+                c.clipboard.remove(i);
+            }
+        }
+    } else if let Some(n) = opt_u64(p, "paste") {
+        let entry = nth(s, n)?;
+        pasted = paste_doc(s, p, entry.doc, PasteMode::KeepSource)?;
+    } else if opt_bool(p, "pasteAll") == Some(true) {
+        let all: Vec<ClipEntry> = s.composes.get(&cid).map(|c| c.clipboard.clone()).unwrap_or_default();
+        if all.is_empty() {
+            return Err(CmdError::Failed("the clipboard is empty".into()));
+        }
+        let mut doc = Doc::default();
+        for e in all {
+            doc.blocks.extend(e.doc.blocks);
+        }
+        pasted = paste_doc(s, p, doc, PasteMode::KeepSource)?;
+    } else if opt_bool(p, "list") != Some(true) {
+        let c = compose_mut(s, p)?;
+        c.editor.clipboard_pane = opt_bool(p, "show").unwrap_or(!c.editor.clipboard_pane);
+    }
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
     let entries: Vec<&str> = c.clipboard.iter().rev().map(|e| e.text.as_str()).collect();
-    Ok(json!({"clipboardPane": c.editor.clipboard_pane, "entries": entries}))
+    Ok(json!({
+        "clipboardPane": c.editor.clipboard_pane,
+        "entries": entries,
+        "items": clip_entries(c),
+        "pasted": pasted,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------------------
 // Editing: find, replace, go to, select
 // ---------------------------------------------------------------------------------------------------------
 
+/// The received message a Find / Select call targets: `ids` / `id` from a read window, when no `compose`
+/// is named.
+fn message_target(s: &Session, p: &Value) -> Result<Option<u64>, CmdError> {
+    if p.get("compose").is_some_and(|v| !v.is_null()) {
+        return Ok(None);
+    }
+    let id = match (p.get("ids"), p.get("id")) {
+        (Some(v), _) if !v.is_null() => v
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(Value::as_u64)
+            .ok_or_else(|| CmdError::Params("`ids` must be a list of item ids".into()))?,
+        (_, Some(v)) if !v.is_null() => {
+            v.as_u64().ok_or_else(|| CmdError::Params("`id` must be an item id".into()))?
+        }
+        _ => return Ok(None),
+    };
+    if !s.mailbox.mail.contains_key(&mailcraft_model::ItemId(id)) {
+        return Err(CmdError::Params(format!("no message with id {id}")));
+    }
+    Ok(Some(id))
+}
+
+/// How often `needle` occurs in message `id`'s text.
+fn message_matches(s: &Session, id: u64, needle: &str, match_case: bool) -> usize {
+    const MAX_TEXT: usize = 4 * 1024 * 1024;
+    let Some(m) = s.mailbox.mail.get(&mailcraft_model::ItemId(id)) else {
+        return 0;
+    };
+    if needle.is_empty() {
+        return 0;
+    }
+    let text = match (&m.body.html, &m.body.text) {
+        (Some(h), _) if h.len() <= MAX_TEXT => mailcraft_html::html_to_text(h),
+        (_, Some(t)) => t.chars().take(MAX_TEXT).collect(),
+        _ => String::new(),
+    };
+    if match_case {
+        text.matches(needle).count()
+    } else {
+        text.to_lowercase().matches(&needle.to_lowercase()).count()
+    }
+}
+
+/// Enabled: a compose is open, or there is a message to search (read windows pass its id).
+fn compose_or_message(s: &Session) -> Option<&'static str> {
+    if s.composes.is_empty() && s.mailbox.mail.is_empty() { Some("open a message first") } else { None }
+}
+
 fn find(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(id) = message_target(s, p)? {
+        // Find in a received message: the message's find bar (highlights, next / previous).
+        let text = opt_str(p, "text").unwrap_or("").to_owned();
+        let case = opt_bool(p, "matchCase").unwrap_or(false);
+        let n = message_matches(s, id, &text, case);
+        s.notify(crate::Notice::OpenDialog(
+            "messageFind".into(),
+            json!({"id": id, "text": text, "matchCase": case}),
+        ));
+        return Ok(json!({"dialog": "messageFind", "id": id, "matches": n}));
+    }
     let Some(text) = opt_str(p, "text").map(str::to_owned) else {
         return dialog(s, "find", json!({"compose": compose_id(s, p)?}));
     };
@@ -1227,13 +1753,25 @@ fn go_to(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"caret": pos_json(&c.selection.focus)}))
 }
 
+/// Select All / Select Similar Formatting in a received message (its body selection, for copying).
+fn message_select(s: &mut Session, id: u64, what: &str) -> CmdResult {
+    s.notify(crate::Notice::OpenDialog("messageSelect".into(), json!({"id": id, "what": what})));
+    Ok(json!({"dialog": "messageSelect", "id": id, "select": what}))
+}
+
 fn select_all(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(id) = message_target(s, p)? {
+        return message_select(s, id, "all");
+    }
     let c = compose_mut(s, p)?;
     c.select_all();
     Ok(json!({"anchor": pos_json(&c.selection.anchor), "focus": pos_json(&c.selection.focus)}))
 }
 
 fn select_similar(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(id) = message_target(s, p)? {
+        return message_select(s, id, "similar");
+    }
     let c = compose_mut(s, p)?;
     let n = c.select_similar();
     let ranges: Vec<Value> = std::iter::once(&c.selection)
@@ -1246,14 +1784,120 @@ fn select_similar(s: &mut Session, p: &Value) -> CmdResult {
 
 fn select_objects(s: &mut Session, p: &Value) -> CmdResult {
     let c = compose_mut(s, p)?;
-    c.editor.select_objects = !c.editor.select_objects;
+    c.editor.select_objects = opt_bool(p, "on").unwrap_or(!c.editor.select_objects);
     Ok(json!({"selectObjects": c.editor.select_objects}))
 }
 
+/// Deepest block path walked for objects.
+const MAX_OBJECT_DEPTH: usize = 64;
+/// Most objects listed.
+const MAX_OBJECTS: usize = 2_000;
+
+/// The block at a leaf path (lists `[item, block]`, quotes / containers `[child]`, tables
+/// `[row, cell, block]` under their block index).
+fn block_at<'a>(blocks: &'a [mailcraft_model::Block], path: &[usize]) -> Option<&'a mailcraft_model::Block> {
+    use mailcraft_model::Block;
+    if path.len() > MAX_OBJECT_DEPTH {
+        return None;
+    }
+    let (&first, rest) = path.split_first()?;
+    let b = blocks.get(first)?;
+    if rest.is_empty() {
+        return Some(b);
+    }
+    match b {
+        Block::List { items, .. } => {
+            let (&item, rest) = rest.split_first()?;
+            block_at(items.get(item)?, rest)
+        }
+        Block::Quote { blocks } | Block::Container { blocks, .. } => block_at(blocks, rest),
+        Block::Table { rows, .. } => {
+            let (&row, rest) = rest.split_first()?;
+            let (&cell, rest) = rest.split_first()?;
+            block_at(&rows.get(row)?.get(cell)?.blocks, rest)
+        }
+        _ => None,
+    }
+}
+
+/// Pictures of a run of inlines with their char offsets (text chars, a line break and a picture count one
+/// each, as the editor counts them).
+fn inline_pictures(
+    inlines: &[mailcraft_model::Inline],
+    at: &mut usize,
+    out: &mut Vec<(usize, String, String)>,
+    depth: usize,
+) {
+    use mailcraft_model::Inline;
+    if depth > MAX_OBJECT_DEPTH {
+        return;
+    }
+    for i in inlines {
+        match i {
+            Inline::Text { text, .. } => *at = at.saturating_add(text.chars().count()),
+            Inline::LineBreak => *at = at.saturating_add(1),
+            Inline::Image { src, alt, .. } => {
+                out.push((*at, src.clone(), alt.clone()));
+                *at = at.saturating_add(1);
+            }
+            Inline::Link { children, .. } => inline_pictures(children, at, out, depth + 1),
+        }
+    }
+}
+
+/// One object of the body (Selection pane): pictures, shapes, charts, SmartArt, WordArt and icons, which the
+/// editor holds as inline pictures.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BodyObject {
+    /// "Picture 1", or the picture's alt text.
+    pub name: String,
+    /// Where it sits: the picture is the char at `at`.
+    pub at: DocPos,
+    /// The picture's source (`cid:…`), which identifies it across edits.
+    pub src: String,
+}
+
+/// The objects of a compose body, in document order.
+pub fn body_objects(c: &ComposeState) -> Vec<BodyObject> {
+    use mailcraft_model::Block;
+    let mut out = Vec::new();
+    for path in c.leaf_paths() {
+        let mut found = Vec::new();
+        if let Some(Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. }) =
+            block_at(&c.body.blocks, &path)
+        {
+            inline_pictures(inlines, &mut 0, &mut found, 0);
+        }
+        for (off, src, alt) in found {
+            if out.len() >= MAX_OBJECTS {
+                return out;
+            }
+            let n = out.len().saturating_add(1);
+            let alt = alt.trim();
+            let name = if alt.is_empty() { format!("Picture {n}") } else { alt.chars().take(80).collect() };
+            out.push(BodyObject { name, at: DocPos::new(path.clone(), off), src });
+        }
+    }
+    out
+}
+
+/// Selection pane: toggles (or `show`s) the pane; `list` only reports the objects; `select: n` selects
+/// object n (its picture, for copy, cut, delete or formatting).
 fn selection_pane(s: &mut Session, p: &Value) -> CmdResult {
     let c = compose_mut(s, p)?;
-    c.editor.selection_pane = !c.editor.selection_pane;
-    Ok(json!({"selectionPane": c.editor.selection_pane}))
+    let objects = body_objects(c);
+    if let Some(n) = opt_u64(p, "select") {
+        let obj = usize::try_from(n)
+            .ok()
+            .and_then(|i| objects.get(i))
+            .ok_or_else(|| CmdError::Params(format!("no object {n}")))?;
+        let end = DocPos::new(obj.at.path.clone(), obj.at.offset.saturating_add(1));
+        c.set_selection(obj.at.clone(), end);
+    } else if opt_bool(p, "list") != Some(true) {
+        c.editor.selection_pane = opt_bool(p, "show").unwrap_or(!c.editor.selection_pane);
+    }
+    let list: Vec<Value> = objects.iter().map(|o| json!({"name": o.name, "at": pos_json(&o.at)})).collect();
+    Ok(json!({"selectionPane": c.editor.selection_pane, "objects": list}))
 }
 
 fn show_gridlines(s: &mut Session, p: &Value) -> CmdResult {
@@ -1349,7 +1993,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Clipboard History",
             "Message › Clipboard; Format Text › Clipboard",
             "",
-            "",
+            r#"{"show"?:bool,"list"?:bool,"paste"?:number,"pasteAll"?:bool,"delete"?:number,"clear"?:bool}  (items newest first)"#,
             false,
             has_compose,
             clipboard_pane,
@@ -1359,7 +2003,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Font Color",
             "Message › Basic Text; Format Text › Font",
             "",
-            r#"{"color"?:string,"custom"?:bool}  ("automatic" clears)"#,
+            r#"{"color"?:string,"theme"?:"bg1"|"tx1"|"bg2"|"tx2"|"accent1".."accent6","tint"?:number,"custom"?:bool,"list"?:bool}  ("automatic" clears; tint: + lighter %, - darker %)"#,
             false,
             rich_compose,
             color,
@@ -1389,9 +2033,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Find",
             "Format Text › Editing",
             "",
-            r#"{"text"?:string,"matchCase"?:bool}"#,
+            r#"{"text"?:string,"matchCase"?:bool,"ids"?:[number]}  (ids: find in that received message)"#,
             false,
-            has_compose,
+            compose_or_message,
             find,
         ),
         spec(
@@ -1459,7 +2103,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Highlight Color",
             "Message › Basic Text; Format Text › Font",
             "",
-            r#"{"color"?:string|null,"highContrastOnly"?:bool}"#,
+            r#"{"color"?:string|null,"highContrastOnly"?:bool,"list"?:bool}"#,
             false,
             rich_compose,
             highlight,
@@ -1499,7 +2143,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Multilevel List",
             "Format Text › Paragraph",
             "",
-            r#"{"style"?:string,"filter"?:"all"|"current"|"library"}"#,
+            r#"{"style"?:string,"filter"?:"all"|"current"|"library","levels"?:[{"glyph"|"pattern","numberStyle"?,"chain"?}],"name"?:string}  (name + levels: Define New List Style)"#,
             false,
             rich_compose,
             multilevel,
@@ -1549,7 +2193,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paste",
             "Message › Clipboard; Format Text › Clipboard",
             "Mod+V",
-            r#"{"mode"?:"keepSource"|"merge"|"textOnly","text"?:string,"html"?:string}"#,
+            r#"{"mode"?:"keepSource"|"merge"|"textOnly","text"?:string,"html"?:string,"image"?:string}  (image: base64 picture)"#,
             false,
             has_compose,
             paste,
@@ -1569,7 +2213,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paste Special",
             "Message › Clipboard › Paste; Format Text › Clipboard › Paste",
             "Mod+Alt+V",
-            r#"{"as"?:"html"|"rtf"|"text"|"image"}"#,
+            r#"{"as"?:"html"|"rtf"|"text"|"image","image"?:string}"#,
             false,
             has_compose,
             paste_special,
@@ -1589,9 +2233,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select All",
             "Format Text › Editing › Select",
             "Mod+A",
-            "",
+            r#"{"ids"?:[number]}  (ids: the received message's body)"#,
             false,
-            has_compose,
+            compose_or_message,
             select_all,
         ),
         spec(
@@ -1599,7 +2243,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select Objects",
             "Format Text › Editing › Select",
             "",
-            "",
+            r#"{"on"?:bool}"#,
             false,
             has_compose,
             select_objects,
@@ -1609,9 +2253,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select Similar Formatting",
             "Format Text › Editing › Select",
             "",
-            "",
+            r#"{"ids"?:[number]}  (ids: the received message's body)"#,
             false,
-            has_compose,
+            compose_or_message,
             select_similar,
         ),
         spec(
@@ -1619,7 +2263,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Selection Pane",
             "Format Text › Editing › Select",
             "",
-            "",
+            r#"{"show"?:bool,"list"?:bool,"select"?:number}"#,
             false,
             has_compose,
             selection_pane,
@@ -1629,7 +2273,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shading",
             "Format Text › Paragraph",
             "",
-            r#"{"color"?:string|null}"#,
+            r#"{"color"?:string|null,"theme"?:string,"tint"?:number,"custom"?:bool}"#,
             false,
             rich_compose,
             shading,
@@ -1680,7 +2324,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Styles",
             "Format Text › Styles",
             "",
-            r#"{"name":string,"action"?:"apply"|"create"}"#,
+            r#"{"name":string,"action"?:"apply"|"create"|"modify"|"rename"|"delete","newName"?:string}"#,
             false,
             rich_compose,
             style,
@@ -1700,7 +2344,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Styles Pane",
             "Format Text › Styles",
             "Mod+Alt+Shift+S",
-            r#"{"apply"?:bool}"#,
+            r#"{"apply"?:bool,"show"?:bool,"list"?:bool}"#,
             false,
             rich_compose,
             styles_pane,
@@ -2555,5 +3199,341 @@ mod range_tests {
         s.run("compose.editUndo", &json!({})).unwrap();
         s.run("format.pasteText", &json!({"text": "X\nY"})).unwrap();
         assert_eq!(s.composes[&id].body.to_plain_text(), "AlphA betA\ngAmmAX\nY\ndeltA epsilon");
+    }
+}
+
+#[cfg(test)]
+mod pane_tests {
+    //! Panes (Clipboard, Styles, Selection), theme colours, highlighter pens, list styles, picture paste and
+    //! Find / Select in received messages.
+
+    use super::super::compose::tests::{open, session};
+    use super::*;
+    use crate::Notice;
+    use mailcraft_model::{Block, Inline};
+
+    fn with_text(text: &str) -> (Session, u64) {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": text})).unwrap();
+        (s, id)
+    }
+
+    fn sel(s: &mut Session, a: (&[usize], usize), b: (&[usize], usize)) {
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": a.0, "offset": a.1}, "focus": {"path": b.0, "offset": b.1}}),
+        )
+        .unwrap();
+    }
+
+    fn first_style(s: &Session, id: u64) -> TextStyle {
+        match &s.composes[&id].body.blocks[0] {
+            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => match &inlines[0] {
+                Inline::Text { style, .. } => style.clone(),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A 1×1 PNG.
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00,
+        0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05,
+        0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+        0x60, 0x82,
+    ];
+
+    fn b64(d: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(d)
+    }
+
+    #[test]
+    fn clipboard_pane_lists_pastes_deletes_and_clears() {
+        let (mut s, id) = with_text("one two three");
+        for (a, b) in [(0, 3), (4, 7), (8, 13)] {
+            sel(&mut s, (&[0], a), (&[0], b));
+            s.run("format.copy", &json!({})).unwrap();
+        }
+        let r = s.run("format.clipboardPane", &json!({})).unwrap();
+        assert_eq!(r["clipboardPane"], true);
+        let texts: Vec<&str> =
+            r["items"].as_array().unwrap().iter().map(|e| e["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["three", "two", "one"], "newest first");
+        assert_eq!(r["entries"][0], "three");
+        // Paste item 1 ("two") at the end.
+        sel(&mut s, (&[0], 13), (&[0], 13));
+        s.run("format.clipboardPane", &json!({"paste": 1})).unwrap();
+        assert_eq!(s.composes[&id].body.to_plain_text().trim_end(), "one two threetwo");
+        assert!(s.composes[&id].editor.clipboard_pane, "pasting keeps the pane open");
+        // Delete item 0 ("three"), then paste all (oldest first).
+        let r = s.run("format.clipboardPane", &json!({"delete": 0})).unwrap();
+        assert_eq!(r["entries"].as_array().unwrap().len(), 2);
+        s.run("format.clipboardPane", &json!({"pasteAll": true})).unwrap();
+        assert!(
+            s.composes[&id].body.to_plain_text().contains("one\ntwo"),
+            "{}",
+            s.composes[&id].body.to_plain_text()
+        );
+        assert!(s.run("format.clipboardPane", &json!({"paste": 9})).is_err());
+        let r = s.run("format.clipboardPane", &json!({"clear": true})).unwrap();
+        assert!(r["entries"].as_array().unwrap().is_empty());
+        assert!(s.run("format.clipboardPane", &json!({"pasteAll": true})).is_err());
+        assert_eq!(s.run("format.clipboardPane", &json!({"show": false})).unwrap()["clipboardPane"], false);
+    }
+
+    #[test]
+    fn clipboard_history_reaches_a_later_message_and_is_capped() {
+        let (mut s, first) = with_text("abcdefghijklmnopqrstuvwxyz0123456789");
+        for i in 0..30 {
+            sel(&mut s, (&[0], i), (&[0], i + 2));
+            s.run("format.copy", &json!({"compose": first})).unwrap();
+        }
+        assert_eq!(s.composes[&first].clipboard.len(), crate::compose::MAX_CLIPBOARD);
+        let second = open(&mut s);
+        assert!(s.composes[&second].clipboard.is_empty());
+        let r = s.run("format.clipboardPane", &json!({"compose": second, "list": true})).unwrap();
+        assert_eq!(r["entries"].as_array().unwrap().len(), 24);
+        assert_eq!(r["clipboardPane"], false, "listing does not open the pane");
+    }
+
+    #[test]
+    fn styles_pane_lists_creates_modifies_renames_and_deletes() {
+        let (mut s, id) = with_text("Heading text\nbody text");
+        let r = s.run("format.stylesPane", &json!({"list": true})).unwrap();
+        assert_eq!(r["stylesPane"], false);
+        let names = |r: &Value| -> Vec<String> {
+            r["styles"].as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap().to_owned()).collect()
+        };
+        assert_eq!(names(&r).len(), BUILTIN_STYLES.len());
+        let current: Vec<&Value> =
+            r["styles"].as_array().unwrap().iter().filter(|v| v["current"] == true).collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0]["name"], "Normal");
+        // New Style from bold text, twice: the second gets a unique name.
+        sel(&mut s, (&[1], 0), (&[1], 4));
+        s.run("format.bold", &json!({})).unwrap();
+        assert_eq!(
+            s.run("format.style", &json!({"name": "Mine", "action": "create"})).unwrap()["created"],
+            "Mine"
+        );
+        assert_eq!(
+            s.run("format.style", &json!({"name": "Mine", "action": "create"})).unwrap()["created"],
+            "Mine 2"
+        );
+        let r = s.run("format.stylesPane", &json!({"show": true})).unwrap();
+        assert_eq!(r["stylesPane"], true);
+        assert!(names(&r).contains(&"Mine".to_owned()));
+        // Rename and delete a created style; built-ins cannot be renamed.
+        s.run("format.style", &json!({"name": "Mine 2", "action": "rename", "newName": "Other"})).unwrap();
+        assert!(
+            s.run("format.style", &json!({"name": "Mine", "action": "rename", "newName": "Other"})).is_err()
+        );
+        assert!(
+            s.run("format.style", &json!({"name": "Normal", "action": "rename", "newName": "X"})).is_err()
+        );
+        s.run("format.style", &json!({"name": "Other", "action": "delete"})).unwrap();
+        assert!(s.run("format.style", &json!({"name": "Other", "action": "delete"})).is_err());
+        // Modify a built-in style to match the selection: applying it then gives that look.
+        sel(&mut s, (&[1], 1), (&[1], 1));
+        s.run("format.style", &json!({"name": "Heading 2", "action": "modify"})).unwrap();
+        let r = s.run("format.stylesPane", &json!({"list": true})).unwrap();
+        let h2 = r["styles"].as_array().unwrap().iter().find(|v| v["name"] == "Heading 2").unwrap().clone();
+        assert_eq!(h2["modified"], true);
+        sel(&mut s, (&[0], 0), (&[0], 7));
+        s.run("format.style", &json!({"name": "Heading 2"})).unwrap();
+        assert_eq!(first_style(&s, id).bold, Some(true));
+        // Deleting the change reverts it to the built-in look.
+        s.run("format.style", &json!({"name": "Heading 2", "action": "delete"})).unwrap();
+        s.run("format.style", &json!({"name": "Heading 2"})).unwrap();
+        assert!(matches!(s.composes[&id].body.blocks[0], Block::Heading { level: 2, .. }));
+        let r = s.run("format.stylesPane", &json!({"apply": true})).unwrap();
+        assert_eq!(r["dialog"], "applyStyles");
+    }
+
+    #[test]
+    fn theme_colors_follow_the_active_theme() {
+        let (mut s, id) = with_text("hello");
+        sel(&mut s, (&[0], 0), (&[0], 5));
+        let office = theme_color(&s.composes[&id], "accent1", 0).unwrap();
+        s.run("format.color", &json!({"theme": "accent1", "tint": 0})).unwrap();
+        assert_eq!(first_style(&s, id).color, Some(office));
+        s.run("format.color", &json!({"theme": "accent1", "tint": 80})).unwrap();
+        let light = first_style(&s, id).color.unwrap();
+        assert!(light.luminance() > office.luminance());
+        s.run("format.color", &json!({"theme": "accent1", "tint": -50})).unwrap();
+        assert!(first_style(&s, id).color.unwrap().luminance() < office.luminance());
+        assert!(s.run("format.color", &json!({"theme": "accent9"})).is_err());
+        // Another colour set: the same gallery entry gives that theme's accent.
+        s.composes.get_mut(&id).unwrap().theme.colors = Some("Grayscale".into());
+        let gray = theme_color(&s.composes[&id], "accent1", 0).unwrap();
+        assert_ne!(gray, office);
+        s.run("format.color", &json!({"theme": "accent1"})).unwrap();
+        assert_eq!(first_style(&s, id).color, Some(gray));
+        let g = s.run("format.color", &json!({"list": true})).unwrap();
+        assert_eq!(g["theme"].as_array().unwrap().len(), 60);
+        assert_eq!(g["standard"].as_array().unwrap().len(), 10);
+        assert_eq!(g["theme"][14]["name"], "Dark Teal, Accent 1, Lighter 80%");
+        assert_eq!(g["theme"][4]["color"], gray.to_hex());
+        // Shading takes theme colours too, and More Colors opens the colour picker for shading.
+        s.run("format.shading", &json!({"theme": "bg2", "tint": -10})).unwrap();
+        let bg = s.composes[&id].para_at_caret().background.unwrap();
+        assert_eq!(Some(bg), theme_color(&s.composes[&id], "bg2", -10));
+        assert_eq!(s.run("format.shading", &json!({"custom": true})).unwrap()["dialog"], "colors");
+        let tint = |t: i64| theme_color(&s.composes[&id], "tx1", t).unwrap();
+        assert_eq!(tint(0), Color::BLACK);
+        assert_eq!(tint(200), Color::WHITE, "tints are clamped");
+    }
+
+    #[test]
+    fn highlighter_pens_and_high_contrast_only() {
+        let (mut s, id) = with_text("hello");
+        sel(&mut s, (&[0], 0), (&[0], 5));
+        let all = s.run("format.highlight", &json!({"list": true})).unwrap();
+        assert_eq!(all["colors"].as_array().unwrap().len(), 15);
+        let r = s.run("format.highlight", &json!({"highContrastOnly": true})).unwrap();
+        let pens: Vec<&str> =
+            r["colors"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert!(
+            pens.contains(&"Yellow") && pens.contains(&"Dark Blue") && !pens.contains(&"Pink"),
+            "{pens:?}"
+        );
+        assert!(pens.len() < 15);
+        assert!(matches!(
+            s.run("format.highlight", &json!({"color": "#ff00ff"})),
+            Err(CmdError::Disabled(m)) if m.contains("Pink")
+        ));
+        s.run("format.highlight", &json!({"color": "#ffff00"})).unwrap();
+        assert_eq!(first_style(&s, id).highlight, Some(Color::rgb(0xff, 0xff, 0)));
+        s.run("format.highlight", &json!({"color": null})).unwrap();
+        assert_eq!(first_style(&s, id).highlight, None, "No Color always works");
+        s.run("format.highlight", &json!({"highContrastOnly": false})).unwrap();
+        s.run("format.highlight", &json!({"color": "#ff00ff"})).unwrap();
+        for (_, h) in HIGHLIGHT_COLORS {
+            parse_color(h).unwrap();
+        }
+    }
+
+    #[test]
+    fn multilevel_gallery_filter_and_named_list_styles() {
+        let (mut s, id) = with_text("one\ntwo");
+        s.run("format.selectAll", &json!({})).unwrap();
+        s.notices.clear();
+        let r = s.run("format.multilevel", &json!({"filter": "current"})).unwrap();
+        assert!(r["shown"].as_array().unwrap().is_empty(), "not in a list yet");
+        assert!(s.notices.iter().any(|n| matches!(n, Notice::OpenDialog(d, _) if d == "multilevelGallery")));
+        let r = s.run("format.multilevel", &json!({"filter": "library"})).unwrap();
+        assert_eq!(r["library"].as_array().unwrap().len(), MULTILEVEL_LIBRARY.len());
+        // Define New List Style: saved under its name, applied, then listed and reusable by name.
+        let r = s
+            .run(
+                "format.multilevel",
+                &json!({"name": "Steps", "levels": [{"pattern": "Step 1:"}, {"pattern": "a)"}]}),
+            )
+            .unwrap();
+        assert_eq!(r["listStyle"], "Steps");
+        assert!(s.composes[&id].list_at_caret().is_some());
+        let r = s.run("format.multilevel", &json!({"filter": "all"})).unwrap();
+        let shown: Vec<&str> = r["shown"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(shown, ["current", "library", "styles"]);
+        assert_eq!(r["styles"][0]["label"], "Steps");
+        assert_eq!(r["styles"][0]["sample"], "Step 1:");
+        let r = s.run("format.multilevel", &json!({"filter": "current"})).unwrap();
+        assert_eq!(r["shown"][0], "current");
+        s.run("format.multilevel", &json!({"style": "none"})).unwrap();
+        assert!(s.composes[&id].list_at_caret().is_none());
+        let r = s.run("format.multilevel", &json!({"style": "steps"})).unwrap();
+        assert_eq!(r["listStyle"], "Steps");
+        assert_eq!(r["format"]["prefix"], "Step ");
+        // A style named from a library list keeps that list's levels; built-in keys still work.
+        s.run("format.multilevel", &json!({"name": "Legal", "style": "outline"})).unwrap();
+        assert!(s.run("format.multilevel", &json!({"name": "  "})).is_ok(), "a blank name only applies");
+        assert!(s.run("format.multilevel", &json!({"filter": "odd"})).is_err());
+        // List styles never show up as Quick Parts.
+        let q = s.run("insert.quickPart", &json!({})).unwrap();
+        assert_eq!(q["dialog"], "quickParts");
+        let listed = s.notices.iter().rev().find_map(|n| match n {
+            Notice::OpenDialog(d, p) if d == "quickParts" => Some(p.clone()),
+            _ => None,
+        });
+        assert!(listed.unwrap()["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn selection_pane_lists_and_selects_pictures() {
+        let (mut s, id) = with_text("ab");
+        sel(&mut s, (&[0], 1), (&[0], 1));
+        s.run("format.paste", &json!({"image": b64(PNG)})).unwrap();
+        let c = &s.composes[&id];
+        assert_eq!(c.inline_images.len(), 1);
+        assert_eq!(c.inline_images[0].mime_type, "image/png");
+        let r = s.run("format.selectionPane", &json!({"list": true})).unwrap();
+        assert_eq!(r["selectionPane"], false);
+        let objects = r["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["name"], "Picture");
+        s.run("format.selectionPane", &json!({"select": 0})).unwrap();
+        let c = &s.composes[&id];
+        assert_eq!(*c.selection.start(), DocPos::new(vec![0], 1));
+        assert_eq!(*c.selection.end(), DocPos::new(vec![0], 2));
+        assert_eq!(body_objects(c)[0].src, format!("cid:{}", c.inline_images[0].content_id));
+        assert!(s.run("format.selectionPane", &json!({"select": 3})).is_err());
+        assert_eq!(s.run("format.selectionPane", &json!({})).unwrap()["selectionPane"], true);
+        assert_eq!(s.run("format.selectObjects", &json!({"on": true})).unwrap()["selectObjects"], true);
+        assert_eq!(s.run("format.selectObjects", &json!({"on": true})).unwrap()["selectObjects"], true);
+    }
+
+    #[test]
+    fn picture_paste_takes_real_pictures_only() {
+        let (mut s, id) = with_text("x");
+        let r = s.run("format.pasteSpecial", &json!({"as": "image", "image": b64(PNG)})).unwrap();
+        assert_eq!(r["pasted"], true);
+        assert!(s.run("format.pasteSpecial", &json!({"as": "image"})).is_err());
+        assert!(s.run("format.paste", &json!({"image": "%%%"})).is_err());
+        assert!(s.run("format.paste", &json!({"image": b64(b"<svg onload='x'/>")})).is_err());
+        assert!(s.run("format.paste", &json!({"image": b64(b"plain text")})).is_err());
+        assert!(s.run("format.paste", &json!({"image": ""})).is_err());
+        // Keep Text Only ignores the picture and pastes the text.
+        s.run("format.paste", &json!({"image": b64(PNG), "mode": "textOnly", "text": "T"})).unwrap();
+        assert!(s.composes[&id].body.to_plain_text().contains('T'));
+        s.run("compose.format", &json!({"kind": "plain"})).unwrap();
+        assert!(s.run("format.paste", &json!({"image": b64(PNG)})).is_err());
+    }
+
+    #[test]
+    fn find_and_select_in_a_received_message() {
+        let mut s = crate::sample::sample_session();
+        let (id, needle) = s
+            .mailbox
+            .mail
+            .values()
+            .find_map(|m| {
+                let t = m.body.text.clone()?;
+                let w = t
+                    .split_whitespace()
+                    .find(|w| w.len() > 4 && w.chars().all(char::is_alphabetic))?
+                    .to_owned();
+                Some((m.id.0, w))
+            })
+            .unwrap();
+        s.notices.clear();
+        let r = s.run("format.find", &json!({"ids": [id], "text": needle})).unwrap();
+        assert_eq!(r["dialog"], "messageFind");
+        assert!(r["matches"].as_u64().unwrap() >= 1);
+        assert!(
+            s.notices
+                .iter()
+                .any(|n| matches!(n, Notice::OpenDialog(d, p) if d == "messageFind" && p["id"] == id))
+        );
+        let r = s.run("format.selectAll", &json!({"ids": [id]})).unwrap();
+        assert_eq!(r["select"], "all");
+        let r = s.run("format.selectSimilar", &json!({"id": id})).unwrap();
+        assert_eq!(r["select"], "similar");
+        assert!(s.run("format.find", &json!({"ids": [999_999_999]})).is_err());
+        assert!(s.run("format.find", &json!({"ids": "x"})).is_err());
+        assert!(s.composes.is_empty(), "no compose involved");
     }
 }

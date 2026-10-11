@@ -37,6 +37,10 @@ pub const MAX_TABLE_ROWS: usize = 1000;
 const MAX_TABLE_CELLS: usize = 20_000;
 /// Galleries building blocks can be saved to.
 pub const GALLERIES: [&str; 5] = ["quickParts", "autoText", "textBoxes", "quickTables", "equations"];
+/// Gallery that keeps named list styles (Define New List Style), stored with the building blocks.
+pub const LIST_STYLES_GALLERY: &str = "listStyles";
+/// Most named list styles kept.
+const MAX_LIST_STYLES: usize = 100;
 const PALETTE: [&str; 6] = ["#156082", "#e97132", "#196b24", "#0f9ed5", "#a02b93", "#4ea72e"];
 
 fn edit(s: &mut Session, p: &Value, f: impl FnOnce(&mut ComposeState)) -> Result<(), CmdError> {
@@ -170,6 +174,30 @@ fn put_image(
         size.1,
     );
     cid
+}
+
+/// Embeds picture bytes from the clipboard (Paste / Paste Special › Picture) at the caret, sized like
+/// Insert Picture. Only real pictures are taken (by signature, not by a claimed type; SVG is refused because
+/// a pasted SVG can carry script and remote references). Returns the content id.
+pub(crate) fn paste_picture(c: &mut ComposeState, data: Vec<u8>) -> Result<String, CmdError> {
+    if data.is_empty() || data.len() as u64 > MAX_PICTURE_BYTES {
+        return Err(CmdError::Params("the picture is empty or too large".into()));
+    }
+    let mime = match sniff_image(&data, "") {
+        Some(m) if m != "image/svg+xml" => m,
+        _ => {
+            return Err(CmdError::Params(
+                "the clipboard data is not a PNG, JPEG, GIF, BMP or WebP picture".into(),
+            ));
+        }
+    };
+    let ext = match mime {
+        "image/jpeg" => "jpg",
+        other => other.strip_prefix("image/").unwrap_or("img"),
+    };
+    let filename = format!("image{:03}.{ext}", c.inline_images.len().saturating_add(1));
+    let size = display_size(image_size(&data));
+    Ok(put_image(c, &filename, mime, data, "Picture", size))
 }
 
 /// Embeds generated SVG at the caret.
@@ -1998,7 +2026,7 @@ pub fn load_building_blocks(s: &Session) -> Vec<BuildingBlock> {
         .map(|f| {
             f.entries
                 .into_iter()
-                .filter(|b| GALLERIES.contains(&b.gallery.as_str()))
+                .filter(|b| GALLERIES.contains(&b.gallery.as_str()) || b.gallery == LIST_STYLES_GALLERY)
                 .take(MAX_BUILDING_BLOCKS)
                 .collect()
         })
@@ -2022,6 +2050,13 @@ fn save_building_blocks(s: &Session, entries: &[BuildingBlock]) -> Result<(), Cm
 /// Every building block: the profile's, then entries only on open composes (newer entries of the same
 /// gallery and name win).
 fn all_blocks(s: &Session, cid: u64) -> Vec<BuildingBlock> {
+    let mut out = every_block(s, cid);
+    out.retain(|b| b.gallery != LIST_STYLES_GALLERY);
+    out
+}
+
+/// [`all_blocks`] including the named list styles.
+fn every_block(s: &Session, cid: u64) -> Vec<BuildingBlock> {
     let mut out = load_building_blocks(s);
     let own = s.composes.get(&cid).into_iter();
     let others = s.composes.iter().filter(|(k, _)| **k != cid).map(|(_, c)| c);
@@ -2030,6 +2065,72 @@ fn all_blocks(s: &Session, cid: u64) -> Vec<BuildingBlock> {
         out.push(b.clone());
     }
     out
+}
+
+/// Named list styles (Define New List Style): name and level formats, oldest first. Entries that do not
+/// decode are skipped.
+pub(crate) fn list_styles(s: &Session, cid: u64) -> Vec<(String, Vec<crate::compose::ListFormat>)> {
+    let mut out: Vec<(String, Vec<crate::compose::ListFormat>)> = every_block(s, cid)
+        .into_iter()
+        .filter(|b| b.gallery == LIST_STYLES_GALLERY)
+        .filter_map(|b| {
+            let text = match b.blocks.first() {
+                Some(Block::Pre { text }) => text.clone(),
+                _ => return None,
+            };
+            let levels: Vec<crate::compose::ListFormat> = serde_json::from_str(&text).ok()?;
+            (!levels.is_empty() && levels.len() <= crate::compose::MAX_LIST_LEVEL).then_some((b.name, levels))
+        })
+        .collect();
+    // The newest ones when there are too many.
+    let extra = out.len().saturating_sub(MAX_LIST_STYLES);
+    out.drain(..extra);
+    out
+}
+
+/// Saves a named list style for every open compose and in the profile (replacing one of the same name).
+/// Returns whether it was written to the profile.
+pub(crate) fn save_list_style(
+    s: &mut Session,
+    name: &str,
+    levels: &[crate::compose::ListFormat],
+) -> Result<bool, CmdError> {
+    let name: String = name.trim().chars().take(64).collect();
+    if name.is_empty() {
+        return Err(CmdError::Params("a list style needs a name".into()));
+    }
+    let text = serde_json::to_string(levels).map_err(|e| CmdError::Failed(e.to_string()))?;
+    let entry = BuildingBlock {
+        gallery: LIST_STYLES_GALLERY.to_owned(),
+        name: name.clone(),
+        blocks: vec![Block::Pre { text }],
+    };
+    let same = |b: &BuildingBlock| b.gallery == LIST_STYLES_GALLERY && b.name.eq_ignore_ascii_case(&name);
+    for c in s.composes.values_mut() {
+        c.building_blocks.retain(|b| !same(b));
+        c.building_blocks.push(entry.clone());
+        let styles = c.building_blocks.iter().filter(|b| b.gallery == LIST_STYLES_GALLERY).count();
+        if styles > MAX_LIST_STYLES
+            && let Some(i) = c.building_blocks.iter().position(|b| b.gallery == LIST_STYLES_GALLERY)
+        {
+            c.building_blocks.remove(i);
+        }
+    }
+    let mut saved = load_building_blocks(s);
+    saved.retain(|b| !same(b));
+    saved.push(entry);
+    let styles = saved.iter().filter(|b| b.gallery == LIST_STYLES_GALLERY).count();
+    if styles > MAX_LIST_STYLES
+        && let Some(i) = saved.iter().position(|b| b.gallery == LIST_STYLES_GALLERY)
+    {
+        saved.remove(i);
+    }
+    if saved.len() > MAX_BUILDING_BLOCKS {
+        let extra = saved.len() - MAX_BUILDING_BLOCKS;
+        saved.drain(..extra);
+    }
+    save_building_blocks(s, &saved)?;
+    Ok(blocks_path(s).is_some())
 }
 
 fn find_block(s: &Session, cid: u64, gallery: Option<&str>, name: &str) -> Option<BuildingBlock> {
@@ -2074,8 +2175,11 @@ fn quick_part(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
     if opt_str(p, "action") == Some("delete") {
         // Building Blocks Organizer › Delete.
-        let matches =
-            |b: &BuildingBlock| b.name.eq_ignore_ascii_case(&name) && gallery.is_none_or(|g| b.gallery == g);
+        let matches = |b: &BuildingBlock| {
+            b.gallery != LIST_STYLES_GALLERY
+                && b.name.eq_ignore_ascii_case(&name)
+                && gallery.is_none_or(|g| b.gallery == g)
+        };
         let mut saved = load_building_blocks(s);
         let before = saved.len();
         saved.retain(|b| !matches(b));

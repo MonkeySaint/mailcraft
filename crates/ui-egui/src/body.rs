@@ -7,7 +7,11 @@
 //! - Only items inside the clip rect are painted, so long bodies in a scroll area stay cheap.
 //! - Links: pointing-hand cursor and the target as a tooltip; a click returns the target.
 //! - Selection: drag to select (by [`mailcraft_layout::Layout::hit_pos`]), double-click selects a word, Ctrl+A
-//!   selects all while the body has focus, Ctrl+C copies the selected text.
+//!   selects all while the body has focus, Ctrl+C copies the selected text. Extra ranges
+//!   ([`BodyView::extra`], Select Text With Similar Formatting) are painted and copied with the selection;
+//!   find hits ([`BodyView::marks`], from [`find_all`]) are painted on a highlight colour.
+//! - Where [`BodyView::context_menu`] is on (reading pane, read windows), right-click offers Copy, Select All,
+//!   Select Text With Similar Formatting and Find… (reported in [`BodyView::find_requested`]).
 //! - Images: no image decoder is bundled in this crate, so `data:` and `cid:` images show a framed placeholder
 //!   with their alt text; `http(s):` images are blocked (placeholder) unless [`BodyOptions::allow_remote`].
 //! - Dark mode: colours are re-mapped by lightness (dark text becomes light, white backgrounds become dark) so
@@ -34,6 +38,20 @@ pub struct BodyView {
     pub doc_key: u64,
     /// Selection as (anchor, focus); either order.
     pub selection: Option<(TextPos, TextPos)>,
+    /// More selected ranges (Select Text With Similar Formatting), each in document order.
+    pub extra: Vec<(TextPos, TextPos)>,
+    /// Find hits, painted on the highlight colour (document order).
+    pub marks: Vec<(TextPos, TextPos)>,
+    /// Top-left corner of the body as last painted (screen coordinates).
+    pub origin: Option<Pos2>,
+    /// The body widget's id as last painted (to give it keyboard focus for Ctrl+C).
+    pub widget: Option<Id>,
+    /// Offer the right-click menu (Copy, Select All, Select Text With Similar Formatting, Find…).
+    pub context_menu: bool,
+    /// Find… was picked from the right-click menu (the owner opens its find bar and clears this).
+    pub find_requested: bool,
+    /// Where the right-click menu was opened.
+    menu_at: Option<TextPos>,
 }
 
 impl BodyView {
@@ -89,6 +107,8 @@ pub fn show_doc_with(ui: &mut Ui, view: &mut BodyView, doc: &Doc, opts: &BodyOpt
     };
     if view.doc_key != doc_key {
         view.selection = None;
+        view.extra.clear();
+        view.marks.clear();
         view.doc_key = doc_key;
     }
     let db = font_db(ui.ctx());
@@ -127,6 +147,25 @@ pub fn doc_hash(doc: &Doc) -> u64 {
 /// Plain text of the current selection (blocks joined by line breaks), if any.
 pub fn selected_text(view: &BodyView, doc: &Doc) -> Option<String> {
     let (a, b) = view.ordered_selection()?;
+    range_text(view, doc, &a, &b)
+}
+
+/// Text of the selection and the extra ranges, in document order, one range per line.
+pub fn selected_text_all(view: &BodyView, doc: &Doc) -> Option<String> {
+    if view.extra.is_empty() {
+        return selected_text(view, doc);
+    }
+    let mut ranges: Vec<(TextPos, TextPos)> = view.ordered_selection().into_iter().collect();
+    ranges.extend(view.extra.iter().cloned());
+    ranges.sort();
+    ranges.dedup();
+    let parts: Vec<String> = ranges.iter().filter_map(|(a, b)| range_text(view, doc, a, b)).collect();
+    if parts.is_empty() { None } else { Some(parts.join("\n")) }
+}
+
+/// Plain text between `a` and `b` (document order) over the laid-out lines.
+fn range_text(view: &BodyView, doc: &Doc, a: &TextPos, b: &TextPos) -> Option<String> {
+    let (a, b) = (a.clone(), b.clone());
     let layout = view.layout.as_ref()?;
     let mut out = String::new();
     let mut prev_path: Option<&Vec<usize>> = None;
@@ -168,6 +207,8 @@ fn paint_and_interact(
     let height = if layout.height.is_finite() { layout.height.max(1.0) } else { 1.0 };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(view.width, height), Sense::click_and_drag());
     let origin = rect.min;
+    view.origin = Some(origin);
+    view.widget = Some(resp.id);
     let to_doc = |p: Pos2| mailcraft_geom::Point::new(p.x - origin.x, p.y - origin.y);
 
     // --- interaction -------------------------------------------------------------------------------
@@ -185,6 +226,7 @@ fn paint_and_interact(
     {
         let start = ui.input(|i| i.pointer.press_origin()).unwrap_or(p);
         view.selection = layout.hit_pos(to_doc(start)).map(|t| (t.clone(), t));
+        view.extra.clear();
         resp.request_focus();
     }
     if resp.dragged()
@@ -203,6 +245,7 @@ fn paint_and_interact(
             && let Some(t) = layout.hit_pos(to_doc(p))
         {
             view.selection = word_at(doc, &t);
+            view.extra.clear();
         }
     } else if resp.clicked() {
         resp.request_focus();
@@ -210,7 +253,11 @@ fn paint_and_interact(
             clicked_link = Some(href.clone());
         } else {
             view.selection = None;
+            view.extra.clear();
         }
+    }
+    if view.context_menu {
+        context_menu(ui, view, layout, doc, &resp, origin);
     }
     if resp.has_focus() {
         let (copy, select_all) = ui.input(|i| {
@@ -226,8 +273,9 @@ fn paint_and_interact(
         });
         if select_all {
             view.selection = select_all_range(layout);
+            view.extra.clear();
         }
-        if copy && let Some(text) = selected_text(view, doc) {
+        if copy && let Some(text) = selected_text_all(view, doc) {
             ui.ctx().copy_text(text);
         }
     }
@@ -254,7 +302,9 @@ fn paint_and_interact(
         let bg = map_color(doc.background.unwrap_or(Color::WHITE), dark);
         painter.rect_filled(rect, 0.0, bg);
     }
+    paint_ranges(&painter, layout, &view.marks, origin, clip, mark_fill(dark));
     paint_selection(&painter, layout, view, origin, clip, dark);
+    paint_ranges(&painter, layout, &view.extra, origin, clip, selection_fill(dark));
     let ctx = ui.ctx().clone();
     let mut families = FamilyCache::default();
     let rect_of = |r: &mailcraft_geom::Rect| {
@@ -396,6 +446,45 @@ fn paint_image_placeholder(
     }
 }
 
+/// Selection colour.
+fn selection_fill(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgba_unmultiplied(0x4a, 0x8f, 0xd8, 110)
+    } else {
+        Color32::from_rgba_unmultiplied(0x3a, 0x86, 0xd6, 80)
+    }
+}
+
+/// Find-hit colour (a highlighter yellow).
+fn mark_fill(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgba_unmultiplied(0xc8, 0xa0, 0x00, 120)
+    } else {
+        Color32::from_rgba_unmultiplied(0xff, 0xd5, 0x00, 140)
+    }
+}
+
+/// Most ranges painted per frame.
+const MAX_PAINTED_RANGES: usize = 5_000;
+
+/// Paints document-order ranges (find hits, extra selections) under the text.
+fn paint_ranges(
+    painter: &egui::Painter,
+    layout: &Layout,
+    ranges: &[(TextPos, TextPos)],
+    origin: Pos2,
+    clip: Rect,
+    fill: Color32,
+) {
+    for (a, b) in ranges.iter().take(MAX_PAINTED_RANGES) {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        if a == b {
+            continue;
+        }
+        paint_range(painter, layout, a, b, origin, clip, fill);
+    }
+}
+
 fn paint_selection(
     painter: &egui::Painter,
     layout: &Layout,
@@ -405,13 +494,20 @@ fn paint_selection(
     dark: bool,
 ) {
     let Some((a, b)) = view.ordered_selection() else { return };
-    let fill = if dark {
-        Color32::from_rgba_unmultiplied(0x4a, 0x8f, 0xd8, 110)
-    } else {
-        Color32::from_rgba_unmultiplied(0x3a, 0x86, 0xd6, 80)
-    };
+    paint_range(painter, layout, &a, &b, origin, clip, selection_fill(dark));
+}
+
+fn paint_range(
+    painter: &egui::Painter,
+    layout: &Layout,
+    a: &TextPos,
+    b: &TextPos,
+    origin: Pos2,
+    clip: Rect,
+    fill: Color32,
+) {
     for line in &layout.index.lines {
-        let Some((s, e)) = line_selection(line, &a, &b) else { continue };
+        let Some((s, e)) = line_selection(line, a, b) else { continue };
         let x0 = x_of(line, s);
         let x1 =
             if e >= line.end && e > s { line_right(layout, line).max(x_of(line, e)) } else { x_of(line, e) };
@@ -499,6 +595,305 @@ fn word_at(doc: &Doc, pos: &TextPos) -> Option<(TextPos, TextPos)> {
         TextPos { block_path: pos.block_path.clone(), offset: s },
         TextPos { block_path: pos.block_path.clone(), offset: e },
     ))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Select, find and the right-click menu
+
+/// Context-menu labels of the read-only body.
+pub const MENU_COPY: &str = "Copy";
+pub const MENU_SELECT_ALL: &str = "Select All";
+pub const MENU_SIMILAR: &str = "Select Text With Similar Formatting";
+pub const MENU_FIND: &str = "Find...";
+
+fn context_menu(
+    ui: &Ui,
+    view: &mut BodyView,
+    layout: &Layout,
+    doc: &Doc,
+    resp: &egui::Response,
+    origin: Pos2,
+) {
+    if resp.secondary_clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let at = layout.hit_pos(mailcraft_geom::Point::new(p.x - origin.x, p.y - origin.y));
+        // A right-click outside the selection drops it (the menu then works on the clicked spot).
+        let inside = match (view.ordered_selection(), &at) {
+            (Some((a, b)), Some(t)) => a <= *t && *t <= b,
+            _ => false,
+        };
+        if !inside {
+            view.selection = None;
+            view.extra.clear();
+        }
+        view.menu_at = at;
+        resp.request_focus();
+    }
+    let has_selection = view.ordered_selection().is_some();
+    let mut pick: Option<&'static str> = None;
+    resp.context_menu(|ui| {
+        ui.set_min_width(220.0);
+        if ui.add_enabled(has_selection, egui::Button::new(MENU_COPY)).clicked() {
+            pick = Some(MENU_COPY);
+        }
+        if ui.button(MENU_SELECT_ALL).clicked() {
+            pick = Some(MENU_SELECT_ALL);
+        }
+        if ui.button(MENU_SIMILAR).clicked() {
+            pick = Some(MENU_SIMILAR);
+        }
+        ui.separator();
+        if ui.button(MENU_FIND).clicked() {
+            pick = Some(MENU_FIND);
+        }
+        if pick.is_some() {
+            ui.close();
+        }
+    });
+    match pick {
+        Some(MENU_COPY) => {
+            if let Some(text) = selected_text_all(view, doc) {
+                ui.ctx().copy_text(text);
+            }
+        }
+        Some(MENU_SELECT_ALL) => {
+            view.selection = select_all_range(layout);
+            view.extra.clear();
+        }
+        Some(MENU_SIMILAR) => {
+            let at = view.ordered_selection().map(|(a, _)| a).or_else(|| view.menu_at.clone());
+            if let Some(at) = at {
+                select_similar_at(view, doc, &at);
+            }
+        }
+        Some(MENU_FIND) => view.find_requested = true,
+        _ => {}
+    }
+}
+
+/// Selects the whole body (Select All).
+pub fn select_all(view: &mut BodyView) {
+    view.selection = view.layout.as_ref().and_then(select_all_range);
+    view.extra.clear();
+}
+
+/// Select Text With Similar Formatting from `at`: every run formatted like the text there becomes selected
+/// (the first as the selection, the rest as extra ranges). Returns how many ranges were selected.
+pub fn select_similar_at(view: &mut BodyView, doc: &Doc, at: &TextPos) -> usize {
+    let mut ranges = similar_ranges(doc, at);
+    let n = ranges.len();
+    if ranges.is_empty() {
+        return 0;
+    }
+    let first = ranges.remove(0);
+    view.selection = Some(first);
+    view.extra = ranges;
+    n
+}
+
+/// Most find hits / similar ranges collected.
+pub const MAX_RANGES: usize = 10_000;
+/// Deepest block nesting walked for leaves.
+const MAX_LEAF_DEPTH: usize = 64;
+
+/// Leaf block paths of a doc in document order (paragraphs, headings and preformatted blocks), using the
+/// layout's path scheme.
+pub fn leaf_paths(doc: &Doc) -> Vec<Vec<usize>> {
+    fn walk(blocks: &[Block], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if prefix.len() > MAX_LEAF_DEPTH || out.len() >= 1_000_000 {
+            return;
+        }
+        for (i, b) in blocks.iter().enumerate() {
+            prefix.push(i);
+            match b {
+                Block::Paragraph { .. } | Block::Heading { .. } | Block::Pre { .. } => {
+                    out.push(prefix.clone())
+                }
+                Block::List { items, .. } => {
+                    for (k, item) in items.iter().enumerate() {
+                        prefix.push(k);
+                        walk(item, prefix, out);
+                        prefix.pop();
+                    }
+                }
+                Block::Quote { blocks } | Block::Container { blocks, .. } => walk(blocks, prefix, out),
+                Block::Table { rows, .. } => {
+                    for (r, row) in rows.iter().enumerate() {
+                        for (c, cell) in row.iter().enumerate() {
+                            prefix.push(r);
+                            prefix.push(c);
+                            walk(&cell.blocks, prefix, out);
+                            prefix.pop();
+                            prefix.pop();
+                        }
+                    }
+                }
+                Block::Rule => {}
+            }
+            prefix.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(&doc.blocks, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Simple per-char case folding that keeps char offsets (one char in, one char out).
+fn fold(c: char, match_case: bool) -> char {
+    if match_case { c } else { c.to_lowercase().next().unwrap_or(c) }
+}
+
+/// Every occurrence of `needle` in the doc's text (within one paragraph each), in document order.
+pub fn find_all(doc: &Doc, needle: &str, match_case: bool) -> Vec<(TextPos, TextPos)> {
+    let pat: Vec<char> = needle.chars().map(|c| fold(c, match_case)).collect();
+    let mut out = Vec::new();
+    if pat.is_empty() || pat.len() > 1000 {
+        return out;
+    }
+    for path in leaf_paths(doc) {
+        let Some(text) = block_text(doc, &path) else { continue };
+        let hay: Vec<char> = text.chars().map(|c| fold(c, match_case)).collect();
+        let mut i = 0usize;
+        while i + pat.len() <= hay.len() {
+            if hay.get(i..i + pat.len()) == Some(pat.as_slice()) {
+                out.push((
+                    TextPos { block_path: path.clone(), offset: i },
+                    TextPos { block_path: path.clone(), offset: i + pat.len() },
+                ));
+                if out.len() >= MAX_RANGES {
+                    return out;
+                }
+                i += pat.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Character runs of a leaf: `(start, end, style, in a link)`; line breaks and pictures are left out.
+fn leaf_runs(doc: &Doc, path: &[usize]) -> Vec<(usize, usize, mailcraft_model::TextStyle, bool)> {
+    fn walk(
+        inlines: &[Inline],
+        link: bool,
+        at: &mut usize,
+        out: &mut Vec<(usize, usize, mailcraft_model::TextStyle, bool)>,
+        depth: usize,
+    ) {
+        if depth > MAX_LEAF_DEPTH {
+            return;
+        }
+        for i in inlines {
+            match i {
+                Inline::Text { text, style } => {
+                    let n = text.chars().count();
+                    if n > 0 {
+                        out.push((*at, at.saturating_add(n), style.clone(), link));
+                    }
+                    *at = at.saturating_add(n);
+                }
+                Inline::LineBreak | Inline::Image { .. } => *at = at.saturating_add(1),
+                Inline::Link { children, .. } => walk(children, true, at, out, depth + 1),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    match block_at(&doc.blocks, path) {
+        Some(Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. }) => {
+            walk(inlines, false, &mut 0, &mut out, 0);
+        }
+        Some(Block::Pre { text }) => {
+            let n = text.chars().count();
+            if n > 0 {
+                let mono = mailcraft_model::TextStyle { monospace: Some(true), ..Default::default() };
+                out.push((0, n, mono, false));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The formatting at `at` (of the char after it, or before it at the end of a paragraph): its style, link
+/// state and heading level.
+fn format_at(doc: &Doc, at: &TextPos) -> Option<(mailcraft_model::TextStyle, bool, u8)> {
+    let runs = leaf_runs(doc, &at.block_path);
+    let run = runs
+        .iter()
+        .find(|(a, b, ..)| *a <= at.offset && at.offset < *b)
+        .or_else(|| runs.iter().rev().find(|(_, b, ..)| *b <= at.offset))
+        .or_else(|| runs.first())?;
+    Some((run.2.clone(), run.3, heading_level(doc, &at.block_path)))
+}
+
+fn heading_level(doc: &Doc, path: &[usize]) -> u8 {
+    match block_at(&doc.blocks, path) {
+        Some(Block::Heading { level, .. }) => *level,
+        _ => 0,
+    }
+}
+
+/// Ranges formatted like the text at `at` (same character style, link state and heading level), merged
+/// within each paragraph, in document order.
+pub fn similar_ranges(doc: &Doc, at: &TextPos) -> Vec<(TextPos, TextPos)> {
+    let Some(want) = format_at(doc, at) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(TextPos, TextPos)> = Vec::new();
+    for path in leaf_paths(doc) {
+        let level = heading_level(doc, &path);
+        if level != want.2 {
+            continue;
+        }
+        let mut open: Option<(usize, usize)> = None;
+        for (a, b, style, link) in leaf_runs(doc, &path) {
+            if style == want.0 && link == want.1 {
+                open = match open {
+                    // Runs split only by a line break or picture still read as one stretch.
+                    Some((s, e)) if a <= e.saturating_add(1) => Some((s, b)),
+                    Some((s, e)) => {
+                        out.push((
+                            TextPos { block_path: path.clone(), offset: s },
+                            TextPos { block_path: path.clone(), offset: e },
+                        ));
+                        Some((a, b))
+                    }
+                    None => Some((a, b)),
+                };
+            } else if let Some((s, e)) = open.take() {
+                out.push((
+                    TextPos { block_path: path.clone(), offset: s },
+                    TextPos { block_path: path.clone(), offset: e },
+                ));
+            }
+            if out.len() >= MAX_RANGES {
+                return out;
+            }
+        }
+        if let Some((s, e)) = open {
+            out.push((
+                TextPos { block_path: path.clone(), offset: s },
+                TextPos { block_path: path.clone(), offset: e },
+            ));
+        }
+    }
+    out
+}
+
+/// Screen rectangle of a range's first line as last painted (to scroll a find hit into view).
+pub fn range_rect(view: &BodyView, range: &(TextPos, TextPos)) -> Option<Rect> {
+    let origin = view.origin?;
+    let layout = view.layout.as_ref()?;
+    let a = layout.caret_rect(&range.0)?;
+    let b = layout.caret_rect(&range.1).filter(|b| (b.y - a.y).abs() < 0.5);
+    let right = b.map_or(a.x + 8.0, |b| b.x.max(a.x + 1.0));
+    let r = Rect::from_min_max(
+        Pos2::new(origin.x + a.x, origin.y + a.y),
+        Pos2::new(origin.x + right, origin.y + a.y + a.h),
+    );
+    r.is_finite().then_some(r)
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -774,6 +1169,64 @@ mod tests {
         let w = word_at(&doc, &TextPos { block_path: vec![0], offset: 7 }).unwrap();
         assert_eq!((w.0.offset, w.1.offset), (6, 9));
         assert_ne!(doc_hash(&doc), doc_hash(&Doc::default()));
+    }
+
+    fn tp(path: &[usize], offset: usize) -> TextPos {
+        TextPos { block_path: path.to_vec(), offset }
+    }
+
+    #[test]
+    fn find_all_matches_across_nested_blocks() {
+        let doc = mailcraft_html::html_to_doc(
+            "<p>Apple pie, apple tart</p><ul><li>green APPLE</li></ul><table><tr><td>apple</td></tr></table>",
+        );
+        let paths = leaf_paths(&doc);
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        let hits = find_all(&doc, "apple", false);
+        assert_eq!(hits.len(), 4, "{hits:?}");
+        assert_eq!(hits[0], (tp(&[0], 0), tp(&[0], 5)));
+        assert_eq!(hits[1], (tp(&[0], 11), tp(&[0], 16)));
+        assert_eq!(hits[2].0.block_path, paths[1]);
+        assert_eq!(find_all(&doc, "apple", true).len(), 2);
+        assert!(find_all(&doc, "", false).is_empty());
+        assert!(find_all(&doc, "zebra", false).is_empty());
+        // Case folding keeps char offsets for wide characters.
+        let doc = Doc::from_plain_text("ÄÖ straße STRASSE");
+        let hits = find_all(&doc, "ö", false);
+        assert_eq!(hits, vec![(tp(&[0], 1), tp(&[0], 2))]);
+    }
+
+    #[test]
+    fn similar_formatting_selects_matching_runs() {
+        let doc = mailcraft_html::html_to_doc(
+            "<p>plain <b>bold one</b> plain <b>bold two</b></p><p><b>bold three</b> end</p><h1>head <b>bold</b></h1>",
+        );
+        let ranges = similar_ranges(&doc, &tp(&[0], 7));
+        assert_eq!(ranges.len(), 3, "{ranges:?}");
+        assert_eq!(ranges[0], (tp(&[0], 6), tp(&[0], 14)));
+        assert_eq!(ranges[2].0.block_path, vec![1]);
+        let mut view = BodyView::default();
+        assert_eq!(
+            select_similar_at(&mut view, &doc, &tp(&[0], 0)),
+            3,
+            "plain runs: two in the first paragraph, one in the second"
+        );
+        assert_eq!(view.extra.len(), 2);
+        assert!(similar_ranges(&doc, &tp(&[9], 0)).is_empty());
+    }
+
+    #[test]
+    fn select_all_and_copy_of_extra_ranges() {
+        let doc = Doc::from_plain_text("one two\nthree");
+        let db = FontDb::bundled();
+        let layout = layout_doc(&doc, &db, &LayoutOptions::default());
+        let mut view = BodyView { layout: Some(layout), ..Default::default() };
+        select_all(&mut view);
+        assert_eq!(selected_text_all(&view, &doc).as_deref(), Some("one two\nthree"));
+        view.selection = Some((tp(&[1], 0), tp(&[1], 5)));
+        view.extra = vec![(tp(&[0], 0), tp(&[0], 3))];
+        assert_eq!(selected_text_all(&view, &doc).as_deref(), Some("one\nthree"));
+        assert!(range_rect(&view, &(tp(&[0], 0), tp(&[0], 3))).is_none(), "not painted yet");
     }
 
     #[test]

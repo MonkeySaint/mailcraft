@@ -18,11 +18,13 @@
 //! Submodules: `editor` (the body editor), `recipients` (To / Cc / Bcc: Auto-Complete, resolved names, Ctrl+K
 //! Check Names), `attach` (attachments well, Browse This PC…, recent files, drag and drop, file hooks),
 //! `spelling` (the F7 Spelling and Grammar dialog), `clipboard` (the system clipboard's HTML flavour for rich
-//! paste and copy) and `voting` (reading-pane voting, read-receipt and tracking bars).
+//! paste and copy, and a picture reader for picture paste), `voting` (reading-pane voting, read-receipt and
+//! tracking bars) and `panes` (the Clipboard, Styles and Selection panes beside the body).
 
 mod attach;
 mod clipboard;
 mod editor;
+mod panes;
 mod recipients;
 mod spelling;
 #[cfg(test)]
@@ -45,11 +47,15 @@ pub use attach::{
     remember_file, set_file_hooks, size_text,
 };
 pub use clipboard::{
-    ClipboardHooks, clipboard_hooks, clipboard_html, clipboard_text, copy_html, html_for_paste,
-    set_clipboard_hooks,
+    ClipboardHooks, clipboard_hooks, clipboard_html, clipboard_image, clipboard_text, copy_html,
+    html_for_paste, set_clipboard_hooks, set_clipboard_image_reader,
 };
 pub use editor::{BODY_LABEL, NO_SUGGESTIONS, PASTE_MODES, body_focused, editor_id, request_paste};
 pub(crate) use editor::{EditorHost, body_editor_in};
+pub use panes::{
+    CLIPBOARD_EMPTY, CLIPBOARD_TITLE, NO_OBJECTS, PANE_W, SELECTION_TITLE, STYLES_TITLE, clip_label,
+    hidden_objects,
+};
 pub use recipients::{
     Entry as RecipientEntry, entries as recipient_entries, split_entries as split_recipients,
 };
@@ -247,7 +253,7 @@ pub fn inline_compose(ui: &mut Ui, app: &mut App, id: u64) {
         separator(ui, app);
         let h = ui.available_height();
         let min_h = if h.is_finite() && h < 4000.0 { h.max(160.0) } else { 240.0 };
-        editor::body_editor(ui, app, id, min_h);
+        panes::body_with_panes(ui, app, id, min_h, false);
     });
     spelling::dialog(&ctx, app, id);
     attach::save_as_dialog(&ctx, app, id);
@@ -302,13 +308,7 @@ fn compose_viewport(ui: &mut Ui, app: &mut App, cid: u64, class: ViewportClass) 
         header(ui, app, cid);
         attach::well(ui, app, cid, WELL_INDENT);
         separator(ui, app);
-        let h = ui.available_height().max(40.0);
-        egui::ScrollArea::vertical()
-            .id_salt(("mailcraft-compose-scroll", cid))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                editor::body_editor(ui, app, cid, h);
-            });
+        panes::body_with_panes(ui, app, cid, 0.0, true);
     });
 
     save_prompt(&ctx, app, cid);

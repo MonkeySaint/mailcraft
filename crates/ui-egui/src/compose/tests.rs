@@ -971,3 +971,189 @@ fn ribbon_paste_modes_paste_the_system_clipboard() {
     assert!(!ribbon_command(&ctx, &mut app, cid, "format.paste", &json!({"mode": "merge", "text": "x"})));
     assert!(!ribbon_command(&ctx, &mut app, cid, "format.paste", &json!({})));
 }
+
+/// A 1×1 PNG, base64.
+const PNG_B64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+fn select_range(app: &mut App, cid: u64, a: usize, b: usize) {
+    app.run(
+        "compose.select",
+        json!({"compose": cid, "anchor": {"path": [0], "offset": a}, "focus": {"path": [0], "offset": b}}),
+    )
+    .unwrap();
+}
+
+#[test]
+fn compose_panes_paste_apply_styles_and_hide_pictures() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "alpha beta"})).unwrap();
+    select_range(&mut app, cid, 0, 5);
+    app.run("format.copy", json!({"compose": cid})).unwrap();
+    select_range(&mut app, cid, 10, 10);
+    app.run("format.paste", json!({"compose": cid, "image": PNG_B64})).unwrap();
+    for c in ["format.clipboardPane", "format.stylesPane", "format.selectionPane"] {
+        app.run(c, json!({"compose": cid})).unwrap();
+    }
+    select_range(&mut app, cid, 0, 0);
+    let mut h = window_harness(app);
+    h.run();
+    for t in [CLIPBOARD_TITLE, STYLES_TITLE, SELECTION_TITLE] {
+        h.get_by_label(&format!("Close {t} pane"));
+    }
+    // Clipboard: clicking an item pastes it at the caret.
+    h.get_by_label("alpha").click();
+    h.run();
+    assert!(
+        compose(&h, cid).body.to_plain_text().starts_with("alphaalpha beta"),
+        "{}",
+        compose(&h, cid).body.to_plain_text()
+    );
+    // Styles: clicking a style applies it.
+    h.get_by_label("Heading 1").click();
+    h.run();
+    assert!(matches!(compose(&h, cid).body.blocks[0], mailcraft_model::Block::Heading { level: 1, .. }));
+    // Selection: hide / show the picture (view only), select it by name.
+    h.get_by_label("Hide Picture").click();
+    h.run();
+    let src = format!("cid:{}", compose(&h, cid).inline_images[0].content_id);
+    assert_eq!(hidden_objects(&h.ctx, cid), vec![src]);
+    h.get_by_label("Show All").click();
+    h.run();
+    assert!(hidden_objects(&h.ctx, cid).is_empty());
+    h.get_by_label("Hide All").click();
+    h.run();
+    assert_eq!(hidden_objects(&h.ctx, cid).len(), 1);
+    h.get_by_label("Picture").click();
+    h.run();
+    let c = compose(&h, cid);
+    assert_eq!(c.selection.end().offset, c.selection.start().offset + 1, "the picture is selected");
+    // Closing a pane turns it off.
+    h.get_by_label("Close Styles pane").click();
+    h.run();
+    assert!(!compose(&h, cid).editor.styles_pane);
+    h.get_by_label("Close Clipboard pane").click();
+    h.run();
+    assert!(!compose(&h, cid).editor.clipboard_pane);
+    h.get_by_label("Close Selection pane").click();
+    h.run();
+    assert!(!compose(&h, cid).editor.selection_pane);
+}
+
+#[test]
+fn styles_pane_creates_a_style_from_the_selection() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "plain words"})).unwrap();
+    select_range(&mut app, cid, 0, 5);
+    app.run("format.bold", json!({"compose": cid})).unwrap();
+    app.run("format.stylesPane", json!({"compose": cid})).unwrap();
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label("New Style...").click();
+    h.run();
+    h.get_by_label(panes::NEW_STYLE_NAME).click();
+    h.run();
+    h.get_by_label(panes::NEW_STYLE_NAME).type_text("Loud");
+    h.run();
+    h.get_by_label("Create").click();
+    h.run();
+    let c = compose(&h, cid);
+    assert!(
+        c.custom_styles.iter().any(|x| x.name == "Loud" && x.style.bold == Some(true)),
+        "{:?}",
+        c.custom_styles
+    );
+    h.get_by_label("Loud");
+}
+
+#[test]
+fn panes_leave_a_usable_body_in_narrow_windows() {
+    let c = ComposeState {
+        editor: mailcraft_engine::compose::EditorFlags {
+            clipboard_pane: true,
+            styles_pane: true,
+            ..Default::default()
+        },
+        ..ComposeState::default()
+    };
+    assert_eq!(panes::widths(&c, 1200.0), (PANE_W, PANE_W));
+    assert_eq!(panes::widths(&c, 600.0), (0.0, PANE_W), "the right column stays when one fits");
+    assert_eq!(panes::widths(&c, 400.0), (0.0, 0.0));
+    assert_eq!(panes::widths(&c, f32::NAN), (0.0, 0.0));
+    assert_eq!(panes::widths(&ComposeState::default(), 1200.0), (0.0, 0.0));
+    assert_eq!(clip_label("a\n  b", 0), "a b");
+    assert_eq!(clip_label("", 2), "[2 pictures]");
+    assert_eq!(clip_label("x", 1), "x  [1 picture]");
+    assert_eq!(clip_label("", 0), "(empty)");
+    assert!(clip_label(&"w ".repeat(200), 0).ends_with('\u{2026}'));
+}
+
+fn png_reader() -> Option<Vec<u8>> {
+    Some(mailcraft_mime::transfer::decode_base64(PNG_B64.as_bytes()))
+}
+
+#[test]
+fn ctrl_v_with_only_a_picture_pastes_the_picture() {
+    let (app, cid) = app_with_compose(false);
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    set_clipboard_image_reader(Some(png_reader));
+    h.key_press_modifiers(Modifiers::COMMAND, Key::V);
+    h.run();
+    set_clipboard_image_reader(None);
+    let c = compose(&h, cid);
+    assert_eq!(c.inline_images.len(), 1, "{:?}", h.state().ui.toast);
+    assert_eq!(c.inline_images[0].mime_type, "image/png");
+    // Without a picture reader Ctrl+V does nothing by itself (text arrives as a paste event).
+    h.key_press_modifiers(Modifiers::COMMAND, Key::V);
+    h.run();
+    assert_eq!(compose(&h, cid).inline_images.len(), 1);
+}
+
+#[test]
+fn show_marks_gridlines_and_select_objects_draw_without_trouble() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "a b\tc"})).unwrap();
+    app.run("insert.table", json!({"compose": cid, "rows": 2, "cols": 2})).unwrap();
+    app.run("format.borders", json!({"compose": cid, "kind": "none"})).unwrap();
+    for c in ["format.showMarks", "format.showGridlines", "format.selectObjects"] {
+        app.run(c, json!({"compose": cid})).unwrap();
+    }
+    let mut h = window_harness(app);
+    h.run();
+    h.run();
+    let c = compose(&h, cid);
+    assert!(c.editor.show_marks && c.editor.show_gridlines && c.editor.select_objects);
+    // Select Objects: a click on text does not move the caret.
+    let before = c.selection.clone();
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    assert_eq!(compose(&h, cid).selection, before);
+}
+
+#[test]
+fn insert_3d_model_and_gallery_filter_open_their_windows() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("insert.model3d", json!({"compose": cid})).unwrap();
+    crate::dialogs::take_notices(&mut app);
+    let mut h = full_harness(app);
+    h.run();
+    h.get_by_label("Insert 3D Model");
+    h.get_by_label("OBJ and STL models are inserted as a picture of the model.");
+    h.get_by_label("Cancel").click();
+    h.run();
+    assert!(h.state().ui.dialogs.is_empty());
+    // Multilevel List › Gallery Filter › List Library: the library as a picker; a pick applies it.
+    let app = h.state_mut();
+    app.run("compose.insertText", json!({"compose": cid, "text": "item"})).unwrap();
+    app.run("format.multilevel", json!({"compose": cid, "filter": "library"})).unwrap();
+    crate::dialogs::take_notices(app);
+    h.run();
+    h.get_by_label("Multilevel List: List Library");
+    h.get_by_label("1. 1.1. 1.1.1.").click();
+    h.run();
+    assert!(compose(&h, cid).list_at_caret().is_some());
+    assert!(h.state().ui.dialogs.is_empty());
+}

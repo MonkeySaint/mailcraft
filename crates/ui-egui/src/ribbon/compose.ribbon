@@ -277,14 +277,26 @@ item | Green | | format.highlight | {"color":"#008000"} | | swatch=#008000
 item | Violet | | format.highlight | {"color":"#800080"} | | swatch=#800080
 item | Dark Red | | format.highlight | {"color":"#800000"} | | swatch=#800000
 item | Dark Yellow | | format.highlight | {"color":"#808000"} | | swatch=#808000
-item | Gray 50% | | format.highlight | {"color":"#808080"} | | swatch=#808080
-item | Gray 25% | | format.highlight | {"color":"#c0c0c0"} | | swatch=#c0c0c0
+item | Gray-50% | | format.highlight | {"color":"#808080"} | | swatch=#808080
+item | Gray-25% | | format.highlight | {"color":"#c0c0c0"} | | swatch=#c0c0c0
 item | Black | | format.highlight | {"color":"#000000"} | | swatch=#000000
 sep
 item | No Color | | format.highlight | {"color":null} | N
 
 menu fontColor
 item | Automatic | font-color | format.color | {"color":"automatic"} | A
+sep
+item | White, Background 1 | | format.color | {"theme":"bg1","tint":0} | | swatch=#ffffff
+item | Black, Text 1 | | format.color | {"theme":"tx1","tint":0} | | swatch=#000000
+item | Light Gray, Background 2 | | format.color | {"theme":"bg2","tint":0} | | swatch=#e8edf1
+item | Dark Blue, Text 2 | | format.color | {"theme":"tx2","tint":0} | | swatch=#14324a
+item | Dark Teal, Accent 1 | | format.color | {"theme":"accent1","tint":0} | | swatch=#1a6894
+item | Orange, Accent 2 | | format.color | {"theme":"accent2","tint":0} | | swatch=#d8742a
+item | Dark Green, Accent 3 | | format.color | {"theme":"accent3","tint":0} | | swatch=#2f8a46
+item | Turquoise, Accent 4 | | format.color | {"theme":"accent4","tint":0} | | swatch=#2a9ad4
+item | Plum, Accent 5 | | format.color | {"theme":"accent5","tint":0} | | swatch=#93398b
+item | Green, Accent 6 | | format.color | {"theme":"accent6","tint":0} | | swatch=#5a9e38
+sub | Theme Color Shades | font-color | fontColorShades | | T
 sep
 item | Dark Red | | format.color | {"color":"#a01c1c"} | | swatch=#a01c1c
 item | Red | | format.color | {"color":"#e02424"} | | swatch=#e02424
@@ -296,18 +308,200 @@ item | Light Blue | | format.color | {"color":"#3fa7d6"} | | swatch=#3fa7d6
 item | Blue | | format.color | {"color":"#1f5fbf"} | | swatch=#1f5fbf
 item | Dark Blue | | format.color | {"color":"#14286b"} | | swatch=#14286b
 item | Purple | | format.color | {"color":"#6b3fa0"} | | swatch=#6b3fa0
-item | Gray | | format.color | {"color":"#6b7078"} | | swatch=#6b7078
-item | Black | | format.color | {"color":"#000000"} | | swatch=#000000
 sep
 item | More Colors... | font-color | format.color | {"custom":true} | M
 
+menu fontColorShades
+sub | White, Background 1 | | fontColorShades1 |
+sub | Black, Text 1 | | fontColorShades2 |
+sub | Light Gray, Background 2 | | fontColorShades3 |
+sub | Dark Blue, Text 2 | | fontColorShades4 |
+sub | Dark Teal, Accent 1 | | fontColorShades5 |
+sub | Orange, Accent 2 | | fontColorShades6 |
+sub | Dark Green, Accent 3 | | fontColorShades7 |
+sub | Turquoise, Accent 4 | | fontColorShades8 |
+sub | Plum, Accent 5 | | fontColorShades9 |
+sub | Green, Accent 6 | | fontColorShades10 |
+
+menu fontColorShades1
+item | White, Background 1, Darker 5% | | format.color | {"theme":"bg1","tint":-5} | | swatch=#f2f2f2
+item | White, Background 1, Darker 15% | | format.color | {"theme":"bg1","tint":-15} | | swatch=#d9d9d9
+item | White, Background 1, Darker 25% | | format.color | {"theme":"bg1","tint":-25} | | swatch=#bfbfbf
+item | White, Background 1, Darker 35% | | format.color | {"theme":"bg1","tint":-35} | | swatch=#a6a6a6
+item | White, Background 1, Darker 50% | | format.color | {"theme":"bg1","tint":-50} | | swatch=#808080
+
+menu fontColorShades2
+item | Black, Text 1, Lighter 50% | | format.color | {"theme":"tx1","tint":50} | | swatch=#808080
+item | Black, Text 1, Lighter 35% | | format.color | {"theme":"tx1","tint":35} | | swatch=#595959
+item | Black, Text 1, Lighter 25% | | format.color | {"theme":"tx1","tint":25} | | swatch=#404040
+item | Black, Text 1, Lighter 15% | | format.color | {"theme":"tx1","tint":15} | | swatch=#262626
+item | Black, Text 1, Lighter 5% | | format.color | {"theme":"tx1","tint":5} | | swatch=#0d0d0d
+
+menu fontColorShades3
+item | Light Gray, Background 2, Darker 10% | | format.color | {"theme":"bg2","tint":-10} | | swatch=#d1d5d9
+item | Light Gray, Background 2, Darker 25% | | format.color | {"theme":"bg2","tint":-25} | | swatch=#aeb2b5
+item | Light Gray, Background 2, Darker 50% | | format.color | {"theme":"bg2","tint":-50} | | swatch=#747779
+item | Light Gray, Background 2, Darker 75% | | format.color | {"theme":"bg2","tint":-75} | | swatch=#3a3b3c
+item | Light Gray, Background 2, Darker 90% | | format.color | {"theme":"bg2","tint":-90} | | swatch=#171818
+
+menu fontColorShades4
+item | Dark Blue, Text 2, Lighter 90% | | format.color | {"theme":"tx2","tint":90} | | swatch=#e8ebed
+item | Dark Blue, Text 2, Lighter 75% | | format.color | {"theme":"tx2","tint":75} | | swatch=#c4ccd2
+item | Dark Blue, Text 2, Lighter 50% | | format.color | {"theme":"tx2","tint":50} | | swatch=#8a99a5
+item | Dark Blue, Text 2, Lighter 25% | | format.color | {"theme":"tx2","tint":25} | | swatch=#4f6577
+item | Dark Blue, Text 2, Lighter 10% | | format.color | {"theme":"tx2","tint":10} | | swatch=#2c475c
+
+menu fontColorShades5
+item | Dark Teal, Accent 1, Lighter 80% | | format.color | {"theme":"accent1","tint":80} | | swatch=#d1e1ea
+item | Dark Teal, Accent 1, Lighter 60% | | format.color | {"theme":"accent1","tint":60} | | swatch=#a3c3d4
+item | Dark Teal, Accent 1, Lighter 40% | | format.color | {"theme":"accent1","tint":40} | | swatch=#76a4bf
+item | Dark Teal, Accent 1, Darker 25% | | format.color | {"theme":"accent1","tint":-25} | | swatch=#144e6f
+item | Dark Teal, Accent 1, Darker 50% | | format.color | {"theme":"accent1","tint":-50} | | swatch=#0d344a
+
+menu fontColorShades6
+item | Orange, Accent 2, Lighter 80% | | format.color | {"theme":"accent2","tint":80} | | swatch=#f7e3d4
+item | Orange, Accent 2, Lighter 60% | | format.color | {"theme":"accent2","tint":60} | | swatch=#efc7aa
+item | Orange, Accent 2, Lighter 40% | | format.color | {"theme":"accent2","tint":40} | | swatch=#e8ac7f
+item | Orange, Accent 2, Darker 25% | | format.color | {"theme":"accent2","tint":-25} | | swatch=#a25720
+item | Orange, Accent 2, Darker 50% | | format.color | {"theme":"accent2","tint":-50} | | swatch=#6c3a15
+
+menu fontColorShades7
+item | Dark Green, Accent 3, Lighter 80% | | format.color | {"theme":"accent3","tint":80} | | swatch=#d5e8da
+item | Dark Green, Accent 3, Lighter 60% | | format.color | {"theme":"accent3","tint":60} | | swatch=#acd0b5
+item | Dark Green, Accent 3, Lighter 40% | | format.color | {"theme":"accent3","tint":40} | | swatch=#82b990
+item | Dark Green, Accent 3, Darker 25% | | format.color | {"theme":"accent3","tint":-25} | | swatch=#236835
+item | Dark Green, Accent 3, Darker 50% | | format.color | {"theme":"accent3","tint":-50} | | swatch=#184523
+
+menu fontColorShades8
+item | Turquoise, Accent 4, Lighter 80% | | format.color | {"theme":"accent4","tint":80} | | swatch=#d4ebf6
+item | Turquoise, Accent 4, Lighter 60% | | format.color | {"theme":"accent4","tint":60} | | swatch=#aad7ee
+item | Turquoise, Accent 4, Lighter 40% | | format.color | {"theme":"accent4","tint":40} | | swatch=#7fc2e5
+item | Turquoise, Accent 4, Darker 25% | | format.color | {"theme":"accent4","tint":-25} | | swatch=#20749f
+item | Turquoise, Accent 4, Darker 50% | | format.color | {"theme":"accent4","tint":-50} | | swatch=#154d6a
+
+menu fontColorShades9
+item | Plum, Accent 5, Lighter 80% | | format.color | {"theme":"accent5","tint":80} | | swatch=#e9d7e8
+item | Plum, Accent 5, Lighter 60% | | format.color | {"theme":"accent5","tint":60} | | swatch=#d4b0d1
+item | Plum, Accent 5, Lighter 40% | | format.color | {"theme":"accent5","tint":40} | | swatch=#be88b9
+item | Plum, Accent 5, Darker 25% | | format.color | {"theme":"accent5","tint":-25} | | swatch=#6e2b68
+item | Plum, Accent 5, Darker 50% | | format.color | {"theme":"accent5","tint":-50} | | swatch=#4a1d46
+
+menu fontColorShades10
+item | Green, Accent 6, Lighter 80% | | format.color | {"theme":"accent6","tint":80} | | swatch=#deecd7
+item | Green, Accent 6, Lighter 60% | | format.color | {"theme":"accent6","tint":60} | | swatch=#bdd8af
+item | Green, Accent 6, Lighter 40% | | format.color | {"theme":"accent6","tint":40} | | swatch=#9cc588
+item | Green, Accent 6, Darker 25% | | format.color | {"theme":"accent6","tint":-25} | | swatch=#44772a
+item | Green, Accent 6, Darker 50% | | format.color | {"theme":"accent6","tint":-50} | | swatch=#2d4f1c
+
 menu shading
 item | No Color | | format.shading | {"color":null} | N
-item | Light Gray | | format.shading | {"color":"#e6e6e6"} | | swatch=#e6e6e6
-item | Light Yellow | | format.shading | {"color":"#fff4c2"} | | swatch=#fff4c2
-item | Light Green | | format.shading | {"color":"#dff3d8"} | | swatch=#dff3d8
-item | Light Blue | | format.shading | {"color":"#dcebf7"} | | swatch=#dcebf7
-item | Light Red | | format.shading | {"color":"#f8dcdc"} | | swatch=#f8dcdc
+sep
+item | White, Background 1 | | format.shading | {"theme":"bg1","tint":0} | | swatch=#ffffff
+item | Black, Text 1 | | format.shading | {"theme":"tx1","tint":0} | | swatch=#000000
+item | Light Gray, Background 2 | | format.shading | {"theme":"bg2","tint":0} | | swatch=#e8edf1
+item | Dark Blue, Text 2 | | format.shading | {"theme":"tx2","tint":0} | | swatch=#14324a
+item | Dark Teal, Accent 1 | | format.shading | {"theme":"accent1","tint":0} | | swatch=#1a6894
+item | Orange, Accent 2 | | format.shading | {"theme":"accent2","tint":0} | | swatch=#d8742a
+item | Dark Green, Accent 3 | | format.shading | {"theme":"accent3","tint":0} | | swatch=#2f8a46
+item | Turquoise, Accent 4 | | format.shading | {"theme":"accent4","tint":0} | | swatch=#2a9ad4
+item | Plum, Accent 5 | | format.shading | {"theme":"accent5","tint":0} | | swatch=#93398b
+item | Green, Accent 6 | | format.shading | {"theme":"accent6","tint":0} | | swatch=#5a9e38
+sub | Theme Color Shades | font-color | shadingShades | | T
+sep
+item | Dark Red | | format.shading | {"color":"#a01c1c"} | | swatch=#a01c1c
+item | Red | | format.shading | {"color":"#e02424"} | | swatch=#e02424
+item | Orange | | format.shading | {"color":"#ef8a17"} | | swatch=#ef8a17
+item | Yellow | | format.shading | {"color":"#f2c94c"} | | swatch=#f2c94c
+item | Light Green | | format.shading | {"color":"#7ac74f"} | | swatch=#7ac74f
+item | Green | | format.shading | {"color":"#2e8b46"} | | swatch=#2e8b46
+item | Light Blue | | format.shading | {"color":"#3fa7d6"} | | swatch=#3fa7d6
+item | Blue | | format.shading | {"color":"#1f5fbf"} | | swatch=#1f5fbf
+item | Dark Blue | | format.shading | {"color":"#14286b"} | | swatch=#14286b
+item | Purple | | format.shading | {"color":"#6b3fa0"} | | swatch=#6b3fa0
+sep
+item | More Colors... | highlight | format.shading | {"custom":true} | M
+
+menu shadingShades
+sub | White, Background 1 | | shadingShades1 |
+sub | Black, Text 1 | | shadingShades2 |
+sub | Light Gray, Background 2 | | shadingShades3 |
+sub | Dark Blue, Text 2 | | shadingShades4 |
+sub | Dark Teal, Accent 1 | | shadingShades5 |
+sub | Orange, Accent 2 | | shadingShades6 |
+sub | Dark Green, Accent 3 | | shadingShades7 |
+sub | Turquoise, Accent 4 | | shadingShades8 |
+sub | Plum, Accent 5 | | shadingShades9 |
+sub | Green, Accent 6 | | shadingShades10 |
+
+menu shadingShades1
+item | White, Background 1, Darker 5% | | format.shading | {"theme":"bg1","tint":-5} | | swatch=#f2f2f2
+item | White, Background 1, Darker 15% | | format.shading | {"theme":"bg1","tint":-15} | | swatch=#d9d9d9
+item | White, Background 1, Darker 25% | | format.shading | {"theme":"bg1","tint":-25} | | swatch=#bfbfbf
+item | White, Background 1, Darker 35% | | format.shading | {"theme":"bg1","tint":-35} | | swatch=#a6a6a6
+item | White, Background 1, Darker 50% | | format.shading | {"theme":"bg1","tint":-50} | | swatch=#808080
+
+menu shadingShades2
+item | Black, Text 1, Lighter 50% | | format.shading | {"theme":"tx1","tint":50} | | swatch=#808080
+item | Black, Text 1, Lighter 35% | | format.shading | {"theme":"tx1","tint":35} | | swatch=#595959
+item | Black, Text 1, Lighter 25% | | format.shading | {"theme":"tx1","tint":25} | | swatch=#404040
+item | Black, Text 1, Lighter 15% | | format.shading | {"theme":"tx1","tint":15} | | swatch=#262626
+item | Black, Text 1, Lighter 5% | | format.shading | {"theme":"tx1","tint":5} | | swatch=#0d0d0d
+
+menu shadingShades3
+item | Light Gray, Background 2, Darker 10% | | format.shading | {"theme":"bg2","tint":-10} | | swatch=#d1d5d9
+item | Light Gray, Background 2, Darker 25% | | format.shading | {"theme":"bg2","tint":-25} | | swatch=#aeb2b5
+item | Light Gray, Background 2, Darker 50% | | format.shading | {"theme":"bg2","tint":-50} | | swatch=#747779
+item | Light Gray, Background 2, Darker 75% | | format.shading | {"theme":"bg2","tint":-75} | | swatch=#3a3b3c
+item | Light Gray, Background 2, Darker 90% | | format.shading | {"theme":"bg2","tint":-90} | | swatch=#171818
+
+menu shadingShades4
+item | Dark Blue, Text 2, Lighter 90% | | format.shading | {"theme":"tx2","tint":90} | | swatch=#e8ebed
+item | Dark Blue, Text 2, Lighter 75% | | format.shading | {"theme":"tx2","tint":75} | | swatch=#c4ccd2
+item | Dark Blue, Text 2, Lighter 50% | | format.shading | {"theme":"tx2","tint":50} | | swatch=#8a99a5
+item | Dark Blue, Text 2, Lighter 25% | | format.shading | {"theme":"tx2","tint":25} | | swatch=#4f6577
+item | Dark Blue, Text 2, Lighter 10% | | format.shading | {"theme":"tx2","tint":10} | | swatch=#2c475c
+
+menu shadingShades5
+item | Dark Teal, Accent 1, Lighter 80% | | format.shading | {"theme":"accent1","tint":80} | | swatch=#d1e1ea
+item | Dark Teal, Accent 1, Lighter 60% | | format.shading | {"theme":"accent1","tint":60} | | swatch=#a3c3d4
+item | Dark Teal, Accent 1, Lighter 40% | | format.shading | {"theme":"accent1","tint":40} | | swatch=#76a4bf
+item | Dark Teal, Accent 1, Darker 25% | | format.shading | {"theme":"accent1","tint":-25} | | swatch=#144e6f
+item | Dark Teal, Accent 1, Darker 50% | | format.shading | {"theme":"accent1","tint":-50} | | swatch=#0d344a
+
+menu shadingShades6
+item | Orange, Accent 2, Lighter 80% | | format.shading | {"theme":"accent2","tint":80} | | swatch=#f7e3d4
+item | Orange, Accent 2, Lighter 60% | | format.shading | {"theme":"accent2","tint":60} | | swatch=#efc7aa
+item | Orange, Accent 2, Lighter 40% | | format.shading | {"theme":"accent2","tint":40} | | swatch=#e8ac7f
+item | Orange, Accent 2, Darker 25% | | format.shading | {"theme":"accent2","tint":-25} | | swatch=#a25720
+item | Orange, Accent 2, Darker 50% | | format.shading | {"theme":"accent2","tint":-50} | | swatch=#6c3a15
+
+menu shadingShades7
+item | Dark Green, Accent 3, Lighter 80% | | format.shading | {"theme":"accent3","tint":80} | | swatch=#d5e8da
+item | Dark Green, Accent 3, Lighter 60% | | format.shading | {"theme":"accent3","tint":60} | | swatch=#acd0b5
+item | Dark Green, Accent 3, Lighter 40% | | format.shading | {"theme":"accent3","tint":40} | | swatch=#82b990
+item | Dark Green, Accent 3, Darker 25% | | format.shading | {"theme":"accent3","tint":-25} | | swatch=#236835
+item | Dark Green, Accent 3, Darker 50% | | format.shading | {"theme":"accent3","tint":-50} | | swatch=#184523
+
+menu shadingShades8
+item | Turquoise, Accent 4, Lighter 80% | | format.shading | {"theme":"accent4","tint":80} | | swatch=#d4ebf6
+item | Turquoise, Accent 4, Lighter 60% | | format.shading | {"theme":"accent4","tint":60} | | swatch=#aad7ee
+item | Turquoise, Accent 4, Lighter 40% | | format.shading | {"theme":"accent4","tint":40} | | swatch=#7fc2e5
+item | Turquoise, Accent 4, Darker 25% | | format.shading | {"theme":"accent4","tint":-25} | | swatch=#20749f
+item | Turquoise, Accent 4, Darker 50% | | format.shading | {"theme":"accent4","tint":-50} | | swatch=#154d6a
+
+menu shadingShades9
+item | Plum, Accent 5, Lighter 80% | | format.shading | {"theme":"accent5","tint":80} | | swatch=#e9d7e8
+item | Plum, Accent 5, Lighter 60% | | format.shading | {"theme":"accent5","tint":60} | | swatch=#d4b0d1
+item | Plum, Accent 5, Lighter 40% | | format.shading | {"theme":"accent5","tint":40} | | swatch=#be88b9
+item | Plum, Accent 5, Darker 25% | | format.shading | {"theme":"accent5","tint":-25} | | swatch=#6e2b68
+item | Plum, Accent 5, Darker 50% | | format.shading | {"theme":"accent5","tint":-50} | | swatch=#4a1d46
+
+menu shadingShades10
+item | Green, Accent 6, Lighter 80% | | format.shading | {"theme":"accent6","tint":80} | | swatch=#deecd7
+item | Green, Accent 6, Lighter 60% | | format.shading | {"theme":"accent6","tint":60} | | swatch=#bdd8af
+item | Green, Accent 6, Lighter 40% | | format.shading | {"theme":"accent6","tint":40} | | swatch=#9cc588
+item | Green, Accent 6, Darker 25% | | format.shading | {"theme":"accent6","tint":-25} | | swatch=#44772a
+item | Green, Accent 6, Darker 50% | | format.shading | {"theme":"accent6","tint":-50} | | swatch=#2d4f1c
 
 menu borders
 item | Bottom Border | | format.borders | {"kind":"bottom"} | B

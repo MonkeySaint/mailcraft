@@ -6,6 +6,12 @@
 //! `mailcraft_html::html_to_doc` (`format.paste {"html": …}`) instead of the text. Copy and Cut put the
 //! selection on the clipboard as HTML with a plain-text alternative. Without hooks (web, tests) everything
 //! stays plain text, as before.
+//!
+//! Pictures: a platform that can read a picture from the clipboard installs a reader with
+//! [`set_clipboard_image_reader`] (encoded PNG / JPEG / GIF / BMP / WebP bytes). Ctrl+V with only a picture
+//! on the clipboard then pastes it (`format.paste {"image": …}`), and Paste Special offers it. HTML that
+//! carries its pictures (`data:` URIs, as browsers and office programs copy them) is pasted with its
+//! pictures either way.
 
 use std::sync::RwLock;
 
@@ -23,6 +29,27 @@ pub struct ClipboardHooks {
 
 static HOOKS: RwLock<ClipboardHooks> =
     RwLock::new(ClipboardHooks { read_html: None, read_text: None, write_html: None });
+
+/// Reads the clipboard's picture as encoded image bytes, when it holds one.
+pub type ImageReader = fn() -> Option<Vec<u8>>;
+
+static IMAGE_READER: RwLock<Option<ImageReader>> = RwLock::new(None);
+
+/// Biggest clipboard picture pasted.
+pub const MAX_CLIPBOARD_IMAGE: usize = 25 * 1024 * 1024;
+
+/// Installs (or removes) the platform's clipboard picture reader.
+pub fn set_clipboard_image_reader(reader: Option<ImageReader>) {
+    if let Ok(mut g) = IMAGE_READER.write() {
+        *g = reader;
+    }
+}
+
+/// The clipboard's picture (encoded bytes), when a reader is installed and it holds one within the size cap.
+pub fn clipboard_image() -> Option<Vec<u8>> {
+    let reader = IMAGE_READER.read().ok().and_then(|g| *g)?;
+    reader().filter(|d| !d.is_empty() && d.len() <= MAX_CLIPBOARD_IMAGE)
+}
 
 /// Most HTML read from the clipboard (bigger content is pasted as text).
 pub const MAX_CLIPBOARD_HTML: usize = 8 * 1024 * 1024;
@@ -91,5 +118,24 @@ mod tests {
         set_clipboard_hooks(ClipboardHooks::default());
         assert!(html_for_paste("Hello big world").is_none());
         assert!(!copy_html("<b>x</b>", "x"));
+    }
+
+    fn png() -> Option<Vec<u8>> {
+        Some(b"\x89PNG\r\n\x1a\n....".to_vec())
+    }
+
+    fn huge() -> Option<Vec<u8>> {
+        Some(vec![0u8; MAX_CLIPBOARD_IMAGE + 1])
+    }
+
+    #[test]
+    fn picture_reader_is_optional_and_capped() {
+        assert!(clipboard_image().is_none());
+        set_clipboard_image_reader(Some(png));
+        assert_eq!(clipboard_image().map(|d| d.len()), Some(12));
+        set_clipboard_image_reader(Some(huge));
+        assert!(clipboard_image().is_none());
+        set_clipboard_image_reader(None);
+        assert!(clipboard_image().is_none());
     }
 }
