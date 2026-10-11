@@ -48,7 +48,7 @@ tags.
 |---|---|---|
 | `version-check` | `ubuntu-latest` (`rust:1.99-bookworm` container) | (fails when the tag and `Cargo.toml` disagree) |
 | `linux` (x86_64, aarch64) | `ubuntu-latest`, `ubuntu-24.04-arm` (`rust:1.99-bookworm` container) | `mailcraft-VERSION-linux-ARCH.tar.gz`, `mailcraft_VERSION-1_ARCH.deb`, `mailcraft-VERSION-1.ARCH.rpm`, `MailCraft-ARCH.AppImage` + `.zsync` |
-| `flatpak` | `ubuntu-latest` (privileged `debian:bookworm` container) | `mailcraft-VERSION-x86_64.flatpak` |
+| `flatpak` | `ubuntu-latest` (privileged `debian:trixie` container) | `mailcraft-VERSION-x86_64.flatpak` |
 | `web` | `ubuntu-latest` (`rust:1.99-bookworm` container) | `mailcraft-VERSION-web.zip` |
 | `windows` | `windows-latest` | `mailcraft-VERSION-windows-x86_64.msi`, `mailcraft-VERSION-windows-x86_64.zip` |
 | `macos` | `macos-latest` | `MailCraft-VERSION-macos-universal.dmg` |

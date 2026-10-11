@@ -98,14 +98,15 @@ jobs:
     needs: linux
     runs-on: ubuntu-latest
     container:
-      image: debian:bookworm
+      # trixie: bookworm's flatpak-builder 1.2 calls appstream-compose, which the 25.08 SDK no longer has.
+      image: debian:trixie
       # flatpak-builder sandboxes every build step with bubblewrap, which needs a privileged container.
       options: --privileged
     steps:
       - name: Tools
         run: |
           apt-get update -q
-          apt-get install -y -q --no-install-recommends git ca-certificates curl flatpak flatpak-builder
+          apt-get install -y -q --no-install-recommends git ca-certificates curl flatpak flatpak-builder librsvg2-common
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:

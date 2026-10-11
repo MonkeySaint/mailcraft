@@ -7,7 +7,8 @@
   <title>MailCraft</title>
 
   <!-- The Rust app (this crate's binary), compiled to wasm by Trunk. -->
-  <link data-trunk rel="rust" data-bin="mailcraft-web">
+  <!-- Rust 1.87+ emits bulk-memory, sign-ext and the other post-MVP features by default; wasm-opt must accept them. -->
+  <link data-trunk rel="rust" data-bin="mailcraft-web" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue">
   <!-- Our own app icon (assets/app-icon, see ATTRIBUTION.md): favicon and loading screen. -->
   <link data-trunk rel="copy-file" href="../../assets/app-icon/hicolor/128x128/apps/mailcraft.png">
   <link rel="icon" type="image/png" href="mailcraft.png">

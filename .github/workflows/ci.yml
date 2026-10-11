@@ -36,13 +36,14 @@ jobs:
         run: |
           rustup component add rustfmt clippy
           rustup target add wasm32-unknown-unknown
+      # Registry and git checkouts only: the debug `target` folder is many GB, and saving it took longer than
+      # the build it saves (and runs into the repository's cache quota).
       - name: Cache cargo (CARGO_HOME is /usr/local/cargo in the rust image)
         uses: actions/cache@v4
         with:
           path: |
             /usr/local/cargo/registry
             /usr/local/cargo/git
-            target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: cargo xtask ci
