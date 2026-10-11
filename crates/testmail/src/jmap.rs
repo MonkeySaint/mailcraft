@@ -131,20 +131,20 @@ fn snapshot(store: &Store, user: &str) -> Snapshot {
     s
 }
 
-struct Request {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Request {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 }
 
-fn read_request(conn: &mut Conn, max_body: usize) -> io::Result<Option<Request>> {
+pub(crate) fn read_request(conn: &mut Conn, max_body: usize) -> io::Result<Option<Request>> {
     let Some(line) = conn.read_line(MAX_HEADER_LINE)? else { return Ok(None) };
     let line = String::from_utf8_lossy(&line).trim_end().to_owned();
     let mut parts = line.split_whitespace();
@@ -183,7 +183,7 @@ fn read_request(conn: &mut Conn, max_body: usize) -> io::Result<Option<Request>>
     Ok(Some(Request { method, path, headers, body }))
 }
 
-fn respond(conn: &mut Conn, status: &str, ctype: &str, body: &[u8]) -> io::Result<()> {
+pub(crate) fn respond(conn: &mut Conn, status: &str, ctype: &str, body: &[u8]) -> io::Result<()> {
     let mut out = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -208,7 +208,7 @@ fn authenticate(ctx: &Ctx, req: &Request) -> Option<String> {
     }
     if let Some(token) = h.strip_prefix("Bearer ") {
         let store = ctx.shared.lock();
-        return store.user_by_password(token.trim());
+        return store.oauth.user_of(token.trim()).or_else(|| store.user_by_password(token.trim()));
     }
     None
 }
@@ -228,6 +228,11 @@ fn handle(conn: &mut Conn, ctx: &Ctx, jmap: &SharedJmap, req: &Request) -> io::R
     let path = req.path.split('?').next().unwrap_or("");
     match (req.method.as_str(), path) {
         ("GET", "/.well-known/jmap") | ("GET", "/jmap/session") => {
+            let events = if ctx.config.jmap_push {
+                "/jmap/eventsource?types={types}&closeafter={closeafter}&ping={ping}"
+            } else {
+                ""
+            };
             let v = json!({
                 "capabilities": {
                     "urn:ietf:params:jmap:core": {
@@ -245,11 +250,12 @@ fn handle(conn: &mut Conn, ctx: &Ctx, jmap: &SharedJmap, req: &Request) -> io::R
                 "apiUrl": "/jmap/api",
                 "downloadUrl": "/jmap/download/{accountId}/{blobId}/{name}?type={type}",
                 "uploadUrl": "/jmap/upload/{accountId}/",
-                "eventSourceUrl": "/jmap/eventsource",
+                "eventSourceUrl": events,
                 "state": "s0",
             });
             respond_json(conn, "200 OK", &v)
         }
+        ("GET", "/jmap/eventsource") if ctx.config.jmap_push => event_source(conn, ctx, jmap, &user, req),
         ("POST", "/jmap/api") => {
             let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
                 return respond_json(
@@ -287,6 +293,50 @@ fn handle(conn: &mut Conn, ctx: &Ctx, jmap: &SharedJmap, req: &Request) -> io::R
             }
         }
         _ => respond(conn, "404 Not Found", "text/plain", b"not found"),
+    }
+}
+
+/// Push (RFC 8620 §7.3): a `text/event-stream` with a `state` event now and whenever the user's mail
+/// changes, and `ping` events at the asked interval. Runs until the client goes away or the servers stop.
+fn event_source(conn: &mut Conn, ctx: &Ctx, jmap: &SharedJmap, user: &str, req: &Request) -> io::Result<()> {
+    let query = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let q = crate::oauth::parse_form(query);
+    let ping = q.get("ping").and_then(|p| p.parse::<u64>().ok()).unwrap_or(0).min(3600);
+    let close_after_state = q.get("closeafter").is_some_and(|c| c == "state");
+    conn.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    )?;
+    let chunk = |conn: &mut Conn, text: &str| -> io::Result<()> {
+        conn.write_all(format!("{:x}\r\n{text}\r\n", text.len()).as_bytes())
+    };
+    let mut last_state = String::new();
+    let mut last_gen = None;
+    let mut last_write = std::time::Instant::now();
+    loop {
+        if ctx.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let generation = ctx.shared.generation();
+        if last_gen != Some(generation) {
+            last_gen = Some(generation);
+            let (state, _) = current_state(ctx, jmap, user);
+            if state != last_state {
+                last_state.clone_from(&state);
+                let data =
+                    json!({"@type": "StateChange", "changed": {ACCOUNT: {"Email": state, "Mailbox": state}}});
+                chunk(conn, &format!("event: state\ndata: {data}\n\n"))?;
+                last_write = std::time::Instant::now();
+                if close_after_state {
+                    return conn.write_all(b"0\r\n\r\n");
+                }
+            }
+        }
+        if ping > 0 && last_write.elapsed() >= std::time::Duration::from_secs(ping) {
+            chunk(conn, &format!("event: ping\ndata: {{\"interval\":{ping}}}\n\n"))?;
+            last_write = std::time::Instant::now();
+        }
+        std::thread::sleep(crate::conn::POLL);
     }
 }
 
@@ -436,6 +486,14 @@ fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value 
     let _ = current_state(ctx, jmap, user);
     let in_mailbox =
         args.get("filter").and_then(|f| f.get("inMailbox")).and_then(Value::as_str).map(str::to_owned);
+    // RFC 8621 §4.4.1: `after` (receivedAt >= date) and `before` (receivedAt < date).
+    let date =
+        |k: &str| args.get("filter").and_then(|f| f.get(k)).and_then(Value::as_str).map(parse_utc_date);
+    let (after, before) = (date("after"), date("before"));
+    if after.is_some_and(|a| a.is_none()) || before.is_some_and(|b| b.is_none()) {
+        return json!({"__error": "invalidArguments"});
+    }
+    let (after, before) = (after.flatten(), before.flatten());
     let store = ctx.shared.lock();
     let mut all: Vec<(i64, String)> = Vec::new();
     let mut seen = BTreeSet::new();
@@ -445,6 +503,10 @@ fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value 
                 continue;
             }
             for m in &mb.messages {
+                let t = m.internal_date.unix;
+                if after.is_some_and(|a| t < a) || before.is_some_and(|b| t >= b) {
+                    continue;
+                }
                 let id = email_id(&m.raw, &m.internal_date);
                 if seen.insert(id.clone()) {
                     all.push((m.internal_date.unix, id));
@@ -469,6 +531,22 @@ fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value 
     let ids: Vec<String> = all.into_iter().skip(pos).take(limit).map(|(_, i)| i).collect();
     json!({"accountId": ACCOUNT, "queryState": "q0", "canCalculateChanges": false, "position": pos,
         "ids": ids, "total": total})
+}
+
+/// A JMAP `UTCDate` (`2026-10-05T00:00:00Z`) as Unix seconds.
+fn parse_utc_date(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 20 || b.get(10) != Some(&b'T') || b.get(19) != Some(&b'Z') {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, se) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let days = crate::date::days_from_civil(y, u32::try_from(mo).ok()?, u32::try_from(d).ok()?);
+    Some(days * 86_400 + h * 3600 + mi * 60 + se)
 }
 
 fn email_get(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value {
@@ -793,5 +871,16 @@ mod tests {
             &BTreeMap::from([("b".to_owned(), 3), ("c".to_owned(), 4)]),
         );
         assert_eq!((c, u, d), (vec!["c".to_owned()], vec!["b".to_owned()], vec!["a".to_owned()]));
+    }
+
+    #[test]
+    fn utc_dates() {
+        assert_eq!(parse_utc_date("1970-01-02T00:00:01Z"), Some(86_401));
+        assert_eq!(parse_utc_date("2026-10-10T12:00:00Z"), Some(1_791_633_600));
+        for bad in
+            ["", "2026-10-10", "2026-13-01T00:00:00Z", "2026-10-10T12:00:00+01:00", "x026-10-10T12:00:00Z"]
+        {
+            assert_eq!(parse_utc_date(bad), None, "{bad}");
+        }
     }
 }

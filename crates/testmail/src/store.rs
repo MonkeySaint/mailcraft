@@ -214,6 +214,8 @@ pub struct Store {
     users: BTreeMap<String, User>,
     next_uidvalidity: u32,
     pub submissions: Vec<Submission>,
+    /// Grants and tokens of the OAuth test server (see `oauth.rs`).
+    pub oauth: crate::oauth::OAuthState,
 }
 
 /// The store plus a change counter (for IDLE).
@@ -245,7 +247,12 @@ impl Shared {
 
 impl Store {
     pub fn new(uidvalidity_seed: u32) -> Store {
-        Store { users: BTreeMap::new(), next_uidvalidity: uidvalidity_seed.max(1), submissions: Vec::new() }
+        Store {
+            users: BTreeMap::new(),
+            next_uidvalidity: uidvalidity_seed.max(1),
+            submissions: Vec::new(),
+            oauth: Default::default(),
+        }
     }
 
     fn key(address: &str) -> String {

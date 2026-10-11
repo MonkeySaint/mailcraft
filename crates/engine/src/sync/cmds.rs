@@ -21,7 +21,7 @@ use crate::{CmdError, CmdResult, Session};
 use mailcraft_model::{AccountId, AccountKind, FolderId, ItemId, MailItem};
 
 /// Parameters of `sendReceive.preferences`.
-pub const PREFERENCES_PARAMS: &str = r#"{"account"?: number|string (default: every account, the All Accounts group), "mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool, "include"?: bool (member of All Accounts: F9 and scheduled runs), "intervalMinutes"?: number|null (scheduled send/receive; null = Options › Advanced), "push"?: bool (new mail pushed with IMAP IDLE), "pollMinutes"?: number}"#;
+pub const PREFERENCES_PARAMS: &str = r#"{"account"?: number|string (default: every account, the All Accounts group), "mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool|"toggle" (on slow connections download only headers), "downloadMonths"?: number|null (first download: mail from the past N months; null = all), "include"?: bool (member of All Accounts: F9 and scheduled runs), "intervalMinutes"?: number|null (scheduled send/receive; null = Options › Advanced), "push"?: bool (new mail pushed with IMAP IDLE), "pollMinutes"?: number}"#;
 
 /// No body, no source, no stored blob: only the header was downloaded.
 fn bodyless(m: &MailItem) -> bool {
@@ -178,19 +178,40 @@ pub fn preferences(s: &mut Session, p: &Value) -> CmdResult {
     } else {
         s.mailbox.accounts.iter().filter(|a| a.kind != AccountKind::Local).map(|a| a.id).collect()
     };
-    // Validate once against the defaults, then apply everywhere.
-    let mut defaults = s.sync.prefs.data.defaults.clone();
-    let changed = apply_option_params(&mut defaults, p)?;
-    if changed {
-        if p.get("account").is_none_or(Value::is_null) {
-            prefs(s).defaults = defaults.clone();
+    // The menu's On Slow Connections Download Only Headers flips what is shown (one value for every target).
+    let mut owned;
+    let p = if p.get("slowHeadersOnly").and_then(Value::as_str) == Some("toggle") {
+        let current = match targets.first() {
+            Some(id) if targets.len() == 1 => account_options(s, *id).slow_headers_only,
+            _ => s.current_account().map_or(s.sync.prefs.data.defaults.slow_headers_only, |a| {
+                account_options(s, a).slow_headers_only
+            }),
+        };
+        owned = p.clone();
+        if let Some(o) = owned.as_object_mut() {
+            o.insert("slowHeadersOnly".into(), json!(!current));
         }
-        for id in &targets {
-            let mut o = account_options(s, *id);
-            apply_option_params(&mut o, p)?;
+        &owned
+    } else {
+        p
+    };
+    // Validate once against the defaults, then apply everywhere (each account compared with its own options).
+    let mut defaults = s.sync.prefs.data.defaults.clone();
+    let defaults_changed = apply_option_params(&mut defaults, p)?;
+    let mut changed = false;
+    if defaults_changed && p.get("account").is_none_or(Value::is_null) {
+        prefs(s).defaults = defaults.clone();
+        changed = true;
+    }
+    for id in &targets {
+        let mut o = account_options(s, *id);
+        if apply_option_params(&mut o, p)? {
             crate::accounts::update_options(s, *id, |x| *x = o);
             crate::sync::options_changed(s, *id);
+            changed = true;
         }
+    }
+    if changed {
         save_prefs(s);
     }
     let shown = match targets.first() {
@@ -200,6 +221,7 @@ pub fn preferences(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({
         "mode": shown.download.name(),
         "slowHeadersOnly": shown.slow_headers_only,
+        "downloadMonths": shown.download_months,
         "include": shown.include_in_send_receive,
         "intervalMinutes": shown.interval_minutes,
         "push": shown.push,
@@ -260,6 +282,22 @@ mod tests {
         assert!(matches!(preferences(&mut s, &json!({"intervalMinutes": 99_999})), Err(CmdError::Params(_))));
         // Unchanged state is reported.
         assert_eq!(preferences(&mut s, &json!({"account": a.0})).unwrap()["changed"], false);
+        // On Slow Connections Download Only Headers toggles; the first download window is kept per account.
+        let r = preferences(&mut s, &json!({"account": a.0, "slowHeadersOnly": "toggle"})).unwrap();
+        assert_eq!(r["slowHeadersOnly"], true);
+        assert!(account_options(&s, a).slow_headers_only);
+        let r = preferences(&mut s, &json!({"account": a.0, "slowHeadersOnly": "toggle"})).unwrap();
+        assert_eq!(r["slowHeadersOnly"], false);
+        assert!(matches!(
+            preferences(&mut s, &json!({"slowHeadersOnly": "maybe"})),
+            Err(CmdError::Params(_))
+        ));
+        let r = preferences(&mut s, &json!({"account": a.0, "downloadMonths": 3})).unwrap();
+        assert_eq!(r["downloadMonths"], 3);
+        assert_eq!(account_options(&s, a).download_months, Some(3));
+        preferences(&mut s, &json!({"account": a.0, "downloadMonths": null})).unwrap();
+        assert_eq!(account_options(&s, a).download_months, None, "null = all mail");
+        assert!(matches!(preferences(&mut s, &json!({"downloadMonths": 5000})), Err(CmdError::Params(_))));
         assert_eq!(download_mode(&s), DownloadMode::Headers);
     }
 

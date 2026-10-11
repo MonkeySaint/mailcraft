@@ -1,6 +1,8 @@
 //! A small blocking HTTP/1.1 client (RFC 9110/9112) for JMAP and OAuth: one request per connection,
 //! Content-Length and chunked bodies, redirects, size caps. TLS via the shared transport.
 
+use std::time::Duration;
+
 use crate::error::{NetError, Result};
 use crate::transport::{Conn, ConnectOptions};
 
@@ -314,13 +316,8 @@ impl HttpClient {
         }
     }
 
-    fn once(
-        &self,
-        method: &str,
-        url: &Url,
-        headers: &[(&str, &str)],
-        body: Option<&[u8]>,
-    ) -> Result<HttpResponse> {
+    /// Connects and sends one request; returns the connection with the response unread.
+    fn send(&self, method: &str, url: &Url, headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<Conn> {
         if !method.bytes().all(|b| b.is_ascii_uppercase()) || method.is_empty() {
             return Err(NetError::Invalid(format!("HTTP method `{method}`")));
         }
@@ -358,67 +355,77 @@ impl HttpClient {
         }
         let mut conn = Conn::connect(&url.host, url.port, url.https, &self.options)?;
         conn.write_all(&data)?;
+        Ok(conn)
+    }
+
+    fn once(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse> {
+        let mut conn = self.send(method, url, headers, body)?;
         let resp = self.read_response(&mut conn, method == "HEAD", url);
         conn.shutdown();
         resp
     }
 
-    fn read_response(&self, conn: &mut Conn, head: bool, url: &Url) -> Result<HttpResponse> {
-        let mut interim = 0usize;
-        loop {
-            let line = conn.read_line(MAX_HEADER_LINE)?;
-            let line = String::from_utf8_lossy(&line).into_owned();
-            let mut parts = line.splitn(3, ' ');
-            let version = parts.next().unwrap_or_default();
-            if !version.starts_with("HTTP/1.") {
-                return Err(NetError::Protocol(format!("not an HTTP/1.x response: `{line}`")));
-            }
-            let status: u16 = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .filter(|s| (100..600).contains(s))
-                .ok_or_else(|| NetError::Protocol(format!("bad status line `{line}`")))?;
-            let mut headers = Vec::new();
-            loop {
-                let h = conn.read_line(MAX_HEADER_LINE)?;
-                if h.is_empty() {
-                    break;
-                }
-                if headers.len() >= MAX_HEADERS {
-                    return Err(NetError::TooLarge("too many HTTP headers".into()));
-                }
-                let h = String::from_utf8_lossy(&h).into_owned();
-                if let Some((k, v)) = h.split_once(':') {
-                    headers.push((k.trim().to_owned(), v.trim().to_owned()));
-                }
-            }
-            if (100..200).contains(&status) {
-                interim += 1;
-                if interim > MAX_INTERIM {
-                    return Err(NetError::Protocol("too many interim (1xx) HTTP responses".into()));
-                }
-                continue;
-            }
-            let get =
-                |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
-            let body = if head || status == 204 || status == 304 {
-                Vec::new()
-            } else if get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
-                self.read_chunked(conn)?
-            } else if let Some(len) = get("content-length") {
-                let n: usize = len
-                    .trim()
-                    .parse()
-                    .map_err(|_| NetError::Protocol(format!("bad Content-Length `{len}`")))?;
-                if n > self.max_body {
-                    return Err(NetError::TooLarge(format!("HTTP body of {n} bytes")));
-                }
-                conn.read_exact(n)?
+    /// Opens a GET whose body is read as it arrives (`text/event-stream`). No redirects are followed. A
+    /// non-2xx answer is an error ([`NetError::Auth`] for 401/403, else [`NetError::Http`]).
+    pub fn open_stream(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpStream> {
+        let u = Url::parse(url)?;
+        let mut conn = self.send("GET", &u, headers, None)?;
+        let (status, hdrs) = read_head(&mut conn)?;
+        let get = |n: &str| hdrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
+        let chunked = get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
+        if !(200..300).contains(&status) {
+            let body = if chunked {
+                self.read_chunked(&mut conn).unwrap_or_default()
             } else {
-                conn.read_to_end(self.max_body)?
+                let n = get("content-length").and_then(|l| l.trim().parse::<usize>().ok()).unwrap_or(0);
+                conn.read_exact(n.min(64 * 1024)).unwrap_or_default()
             };
-            return Ok(HttpResponse { status, headers, body, url: url.to_string() });
+            conn.shutdown();
+            let text: String = String::from_utf8_lossy(&body).chars().take(500).collect();
+            return Err(if status == 401 || status == 403 {
+                NetError::Auth(format!("HTTP {status}: {text}"))
+            } else {
+                NetError::Http { status, body: text }
+            });
         }
+        let empty = get("content-length").is_some_and(|l| l.trim() == "0");
+        Ok(HttpStream {
+            status,
+            headers: hdrs,
+            conn,
+            chunked,
+            chunk_left: 0,
+            need_crlf: false,
+            pending: Vec::new(),
+            ended: empty,
+            max_line: MAX_HEADER_LINE,
+        })
+    }
+
+    fn read_response(&self, conn: &mut Conn, head: bool, url: &Url) -> Result<HttpResponse> {
+        let (status, headers) = read_head(conn)?;
+        let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
+        let body = if head || status == 204 || status == 304 {
+            Vec::new()
+        } else if get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
+            self.read_chunked(conn)?
+        } else if let Some(len) = get("content-length") {
+            let n: usize =
+                len.trim().parse().map_err(|_| NetError::Protocol(format!("bad Content-Length `{len}`")))?;
+            if n > self.max_body {
+                return Err(NetError::TooLarge(format!("HTTP body of {n} bytes")));
+            }
+            conn.read_exact(n)?
+        } else {
+            conn.read_to_end(self.max_body)?
+        };
+        Ok(HttpResponse { status, headers, body, url: url.to_string() })
     }
 
     fn read_chunked(&self, conn: &mut Conn) -> Result<Vec<u8>> {
@@ -450,6 +457,153 @@ impl HttpClient {
                 return Err(NetError::Protocol("missing CRLF after chunk".into()));
             }
         }
+    }
+}
+
+/// Reads a status line and headers, skipping interim (1xx) responses.
+fn read_head(conn: &mut Conn) -> Result<(u16, Vec<(String, String)>)> {
+    let mut interim = 0usize;
+    loop {
+        let line = conn.read_line(MAX_HEADER_LINE)?;
+        let line = String::from_utf8_lossy(&line).into_owned();
+        let mut parts = line.splitn(3, ' ');
+        let version = parts.next().unwrap_or_default();
+        if !version.starts_with("HTTP/1.") {
+            return Err(NetError::Protocol(format!("not an HTTP/1.x response: `{line}`")));
+        }
+        let status: u16 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .filter(|s| (100..600).contains(s))
+            .ok_or_else(|| NetError::Protocol(format!("bad status line `{line}`")))?;
+        let mut headers = Vec::new();
+        loop {
+            let h = conn.read_line(MAX_HEADER_LINE)?;
+            if h.is_empty() {
+                break;
+            }
+            if headers.len() >= MAX_HEADERS {
+                return Err(NetError::TooLarge("too many HTTP headers".into()));
+            }
+            let h = String::from_utf8_lossy(&h).into_owned();
+            if let Some((k, v)) = h.split_once(':') {
+                headers.push((k.trim().to_owned(), v.trim().to_owned()));
+            }
+        }
+        if (100..200).contains(&status) {
+            interim += 1;
+            if interim > MAX_INTERIM {
+                return Err(NetError::Protocol("too many interim (1xx) HTTP responses".into()));
+            }
+            continue;
+        }
+        return Ok((status, headers));
+    }
+}
+
+/// Largest chunk of a streamed body accepted at once.
+const MAX_STREAM_CHUNK: usize = 1024 * 1024;
+
+/// A response body read line by line as it arrives (see [`HttpClient::open_stream`]). Reads wait at most the
+/// given time; a read that times out loses nothing and can be repeated.
+#[derive(Debug)]
+pub struct HttpStream {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    conn: Conn,
+    chunked: bool,
+    /// Bytes of the current chunk not read yet.
+    chunk_left: usize,
+    /// The CRLF after a chunk's data is still unread.
+    need_crlf: bool,
+    /// Decoded body bytes not returned yet (chunked bodies).
+    pending: Vec<u8>,
+    ended: bool,
+    /// Longest line accepted.
+    pub max_line: usize,
+}
+
+impl HttpStream {
+    /// First header named `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    /// The next body line (without CR/LF), waiting at most `wait`: `Ok(None)` when none arrived in time,
+    /// [`NetError::Closed`] at the end of the body.
+    pub fn read_line(&mut self, wait: Duration) -> Result<Option<Vec<u8>>> {
+        self.conn.set_read_timeout(Some(wait))?;
+        match self.next_line() {
+            Ok(l) => Ok(Some(l)),
+            Err(NetError::Timeout(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn take_pending_line(&mut self) -> Result<Option<Vec<u8>>> {
+        if let Some(i) = self.pending.iter().position(|&b| b == b'\n') {
+            let rest = self.pending.split_off(i + 1);
+            let mut line = std::mem::replace(&mut self.pending, rest);
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+        if self.pending.len() > self.max_line {
+            return Err(NetError::TooLarge(format!("line longer than {} bytes", self.max_line)));
+        }
+        Ok(None)
+    }
+
+    fn next_line(&mut self) -> Result<Vec<u8>> {
+        if !self.chunked {
+            if self.ended {
+                return Err(NetError::Closed);
+            }
+            return self.conn.read_line(self.max_line);
+        }
+        loop {
+            if let Some(l) = self.take_pending_line()? {
+                return Ok(l);
+            }
+            if self.ended {
+                return Err(NetError::Closed);
+            }
+            if self.need_crlf {
+                if !self.conn.read_line(2)?.is_empty() {
+                    return Err(NetError::Protocol("missing CRLF after chunk".into()));
+                }
+                self.need_crlf = false;
+            }
+            if self.chunk_left == 0 {
+                let line = self.conn.read_line(MAX_HEADER_LINE)?;
+                let line = String::from_utf8_lossy(&line);
+                let hex = line.split(';').next().unwrap_or_default().trim();
+                let n = Some(hex)
+                    .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|h| usize::from_str_radix(h, 16).ok())
+                    .ok_or_else(|| NetError::Protocol(format!("bad chunk size `{hex}`")))?;
+                if n == 0 {
+                    self.ended = true;
+                    continue;
+                }
+                if n > MAX_STREAM_CHUNK {
+                    return Err(NetError::TooLarge(format!("chunk of {n} bytes")));
+                }
+                self.chunk_left = n;
+            }
+            let data = self.conn.read_exact(self.chunk_left)?;
+            self.chunk_left = 0;
+            self.need_crlf = true;
+            self.pending.extend_from_slice(&data);
+        }
+    }
+
+    /// Closes the connection.
+    pub fn close(&mut self) {
+        self.conn.shutdown();
+        self.ended = true;
     }
 }
 

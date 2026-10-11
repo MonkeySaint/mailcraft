@@ -1,6 +1,6 @@
 //! Listener and connection threads.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -10,7 +10,7 @@ use rustls::ServerConfig;
 
 use crate::conn::Conn;
 use crate::store::Shared;
-use crate::{Config, Result, imap, jmap, pop3, smtp};
+use crate::{Config, Result, dns, imap, jmap, pop3, smtp, web};
 
 /// Maximum simultaneous connections per listener.
 const MAX_CONNECTIONS: usize = 256;
@@ -21,6 +21,7 @@ enum Kind {
     Smtp { tls: bool },
     Pop3 { tls: bool },
     Jmap { tls: bool },
+    Web { tls: bool },
 }
 
 /// Everything a connection handler needs.
@@ -30,6 +31,10 @@ pub struct Ctx {
     pub stop: Arc<AtomicBool>,
     pub tls: Arc<ServerConfig>,
     pub jmap: jmap::SharedJmap,
+    /// Autoconfig documents and the web request log.
+    pub web: web::SharedWeb,
+    /// SRV records of the fake DNS responder.
+    pub dns: dns::Zone,
 }
 
 pub struct Running {
@@ -41,6 +46,10 @@ pub struct Running {
     pub pop3s: SocketAddr,
     pub jmap: SocketAddr,
     pub jmaps: SocketAddr,
+    pub web: SocketAddr,
+    pub webs: SocketAddr,
+    pub dns: SocketAddr,
+    pub ctx: Arc<Ctx>,
     stop: Arc<AtomicBool>,
     accept_threads: Vec<JoinHandle<()>>,
     conn_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -61,13 +70,25 @@ impl Running {
             (bind(config.pop3s_port)?, Kind::Pop3 { tls: true }),
             (bind(config.jmap_port)?, Kind::Jmap { tls: false }),
             (bind(config.jmaps_port)?, Kind::Jmap { tls: true }),
+            (bind(config.web_port)?, Kind::Web { tls: false }),
+            (bind(config.webs_port)?, Kind::Web { tls: true }),
         ];
+        let udp = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.dns_port))?;
+        let dns_addr = udp.local_addr()?;
         let mut addrs = Vec::new();
         for (l, _) in &listeners {
             addrs.push(l.local_addr()?);
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let ctx = Arc::new(Ctx { config, shared, stop: Arc::clone(&stop), tls, jmap: Default::default() });
+        let ctx = Arc::new(Ctx {
+            config,
+            shared,
+            stop: Arc::clone(&stop),
+            tls,
+            jmap: Default::default(),
+            web: Default::default(),
+            dns: Default::default(),
+        });
         let conn_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let mut accept_threads = Vec::new();
         for (listener, kind) in listeners {
@@ -78,6 +99,10 @@ impl Running {
                 .spawn(move || accept_loop(listener, kind, ctx, threads))?;
             accept_threads.push(h);
         }
+        let dctx = Arc::clone(&ctx);
+        accept_threads.push(
+            std::thread::Builder::new().name("testmail-dns".into()).spawn(move || dns::serve(udp, dctx))?,
+        );
         let addr = |i: usize| {
             addrs.get(i).copied().unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
         };
@@ -90,6 +115,10 @@ impl Running {
             pop3s: addr(5),
             jmap: addr(6),
             jmaps: addr(7),
+            web: addr(8),
+            webs: addr(9),
+            dns: dns_addr,
+            ctx,
             stop,
             accept_threads,
             conn_threads,
@@ -121,7 +150,11 @@ fn accept_loop(listener: TcpListener, kind: Kind, ctx: Arc<Ctx>, threads: Arc<Mu
 
 fn handle(stream: TcpStream, kind: Kind, ctx: Arc<Ctx>) {
     let tls = match kind {
-        Kind::Imap { tls } | Kind::Smtp { tls } | Kind::Pop3 { tls } | Kind::Jmap { tls } => tls,
+        Kind::Imap { tls }
+        | Kind::Smtp { tls }
+        | Kind::Pop3 { tls }
+        | Kind::Jmap { tls }
+        | Kind::Web { tls } => tls,
     };
     let Ok(conn) =
         Conn::new(stream, Arc::clone(&ctx.stop), Arc::clone(&ctx.tls), tls, ctx.config.idle_timeout)
@@ -133,6 +166,7 @@ fn handle(stream: TcpStream, kind: Kind, ctx: Arc<Ctx>) {
         Kind::Smtp { .. } => smtp::serve(conn, &ctx),
         Kind::Pop3 { .. } => pop3::serve(conn, &ctx),
         Kind::Jmap { .. } => jmap::serve(conn, &ctx, &ctx.jmap),
+        Kind::Web { .. } => web::serve(conn, &ctx),
     }
 }
 
@@ -140,9 +174,10 @@ impl Drop for Running {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         // Wake the blocking accept() calls.
-        for addr in
-            [self.imap, self.imaps, self.smtp, self.smtps, self.pop3, self.pop3s, self.jmap, self.jmaps]
-        {
+        for addr in [
+            self.imap, self.imaps, self.smtp, self.smtps, self.pop3, self.pop3s, self.jmap, self.jmaps,
+            self.web, self.webs,
+        ] {
             let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
         }
         for h in self.accept_threads.drain(..) {

@@ -434,6 +434,10 @@ const MAX_OPTIONS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INTERVAL_MINUTES: u64 = 1440;
 /// Longest "remove from server after" period accepted.
 const MAX_KEEP_DAYS: u64 = 3650;
+/// Longest "download mail from the past N months" period accepted (100 years; `null` = all mail).
+const MAX_DOWNLOAD_MONTHS: u64 = 1200;
+/// "Download mail from the past N months" for new accounts.
+pub const DEFAULT_DOWNLOAD_MONTHS: u32 = 12;
 
 /// Send / Receive › Download Preferences.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,7 +500,12 @@ pub struct AccountOptions {
     /// Incoming mail over POP3 (the account's kind is `Imap` until the model has a POP3 kind).
     pub pop3: bool,
     pub download: DownloadMode,
+    /// On slow connections download only headers (Download Preferences): while the last measured transfer
+    /// rate is below the slow-connection threshold, new mail arrives as headers (see `sync::slow_connection`).
     pub slow_headers_only: bool,
+    /// The first download of a folder takes mail from the past N months only (`None` = all mail). Later
+    /// send/receives download every new message.
+    pub download_months: Option<u32>,
     /// Member of the "All Accounts" Send/Receive group (F9 and scheduled runs).
     pub include_in_send_receive: bool,
     /// Scheduled send/receive every N minutes (`None` = Options › Advanced; 0 = never).
@@ -521,6 +530,7 @@ impl Default for AccountOptions {
             pop3: false,
             download: DownloadMode::Full,
             slow_headers_only: true,
+            download_months: Some(DEFAULT_DOWNLOAD_MONTHS),
             include_in_send_receive: true,
             interval_minutes: None,
             push: true,
@@ -688,6 +698,7 @@ fn options_json(o: &AccountOptions) -> Value {
         "pop3": o.pop3,
         "download": o.download.name(),
         "slowHeadersOnly": o.slow_headers_only,
+        "downloadMonths": o.download_months,
         "include": o.include_in_send_receive,
         "intervalMinutes": o.interval_minutes,
         "push": o.push,
@@ -717,9 +728,9 @@ fn opt_minutes(p: &Value, key: &str, max: u64) -> Result<Option<Option<u32>>, Cm
     }
 }
 
-/// Applies option params (`download`, `slowHeadersOnly`, `include`, `intervalMinutes`, `push`,
-/// `pollMinutes`, `leaveOnServer`, `removeAfterDays`, `removeWhenDeleted`) to `o`. Validates everything
-/// before changing anything.
+/// Applies option params (`download`, `slowHeadersOnly`, `downloadMonths`, `include`, `intervalMinutes`,
+/// `push`, `pollMinutes`, `leaveOnServer`, `removeAfterDays`, `removeWhenDeleted`) to `o`. Validates
+/// everything before changing anything.
 pub(crate) fn apply_option_params(o: &mut AccountOptions, p: &Value) -> Result<bool, CmdError> {
     let download = match p.get("download").or_else(|| p.get("mode")) {
         None | Some(Value::Null) => None,
@@ -734,6 +745,7 @@ pub(crate) fn apply_option_params(o: &mut AccountOptions, p: &Value) -> Result<b
         return Err(CmdError::Params("`pollMinutes` must be from 1 to 1440".into()));
     }
     let keep = opt_minutes(p, "removeAfterDays", MAX_KEEP_DAYS)?;
+    let months = opt_minutes(p, "downloadMonths", MAX_DOWNLOAD_MONTHS)?;
     let bools = ["slowHeadersOnly", "include", "push", "leaveOnServer", "removeWhenDeleted"];
     for b in bools {
         if p.get(b).is_some_and(|v| !v.is_boolean() && !v.is_null()) {
@@ -752,6 +764,9 @@ pub(crate) fn apply_option_params(o: &mut AccountOptions, p: &Value) -> Result<b
     }
     if let Some(k) = keep {
         o.remove_after_days = k.filter(|d| *d > 0);
+    }
+    if let Some(m) = months {
+        o.download_months = m.filter(|m| *m > 0);
     }
     if let Some(b) = opt_bool(p, "slowHeadersOnly") {
         o.slow_headers_only = b;
@@ -841,7 +856,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.options",
             "More Settings",
-            r#"{"account"?: number|string, "mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool, "include"?: bool (in the All Accounts Send/Receive group), "intervalMinutes"?: number|null (null = Options › Advanced), "push"?: bool, "pollMinutes"?: number, "leaveOnServer"?: bool, "removeAfterDays"?: number|null, "removeWhenDeleted"?: bool} (no option given: returns the options)"#,
+            r#"{"account"?: number|string, "mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool, "downloadMonths"?: number|null (first download: mail from the past N months; null or 0 = all), "include"?: bool (in the All Accounts Send/Receive group), "intervalMinutes"?: number|null (null = Options › Advanced), "push"?: bool, "pollMinutes"?: number, "leaveOnServer"?: bool, "removeAfterDays"?: number|null, "removeWhenDeleted"?: bool} (no option given: returns the options)"#,
             false,
             has_server_account,
             options_cmd,
@@ -853,6 +868,14 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             always,
             use_keyring,
+        ),
+        spec(
+            "accounts.discover",
+            "Find server settings",
+            r#"{"address": string, "wait"?: bool (block until done), "refresh"?: bool (look up again)} → {"status": "running"|"done", "found", "sources", "imap"?, "pop3"?, "smtp"?, "jmap"?, "notes"} (autoconfig on the mail domain, then DNS SRV records, RFC 6186)"#,
+            false,
+            always,
+            discover,
         ),
         spec("accounts.oauthProviders", "Sign in with OAuth (providers)", "", false, always, oauth_providers),
         spec(
@@ -1594,6 +1617,18 @@ fn oauth_status(s: &mut Session, p: &Value) -> CmdResult {
     let id = find_account(s, p, "account")?;
     s.poll_sync();
     Ok(crate::sync::oauth_status(s, id))
+}
+
+/// Looks up an address's server settings (see `sync::discover`): autoconfig, then DNS SRV. Without `wait`
+/// the lookup runs in the background; call again with the same address for the result.
+fn discover(s: &mut Session, p: &Value) -> CmdResult {
+    let address = clean_line("the email address", str_field(p, &["address", "email"])?.unwrap_or(""))?;
+    if !valid_address(&address) {
+        return Err(CmdError::Params("`address` must be an email address (name@example.com)".into()));
+    }
+    let wait = opt_bool(p, "wait").unwrap_or(false);
+    let refresh = opt_bool(p, "refresh").unwrap_or(false);
+    crate::sync::discover(s, &address, wait, refresh)
 }
 
 fn oauth_cancel(s: &mut Session, p: &Value) -> CmdResult {

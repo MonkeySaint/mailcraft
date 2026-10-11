@@ -181,7 +181,11 @@ impl Session<'_> {
             c.push("STARTTLS");
         }
         if self.user.is_none() {
-            c.push(if self.auth_allowed() { "AUTH=PLAIN" } else { "LOGINDISABLED" });
+            if self.auth_allowed() {
+                c.extend(["AUTH=PLAIN", "AUTH=XOAUTH2", "AUTH=OAUTHBEARER"]);
+            } else {
+                c.push("LOGINDISABLED");
+            }
         }
         let mut s = c.join(" ");
         s.push_str(&format!(" APPENDLIMIT={}", self.ctx.config.max_message_size));
@@ -469,7 +473,8 @@ impl Session<'_> {
         let mech = p.atom()?.to_ascii_uppercase();
         let initial = if p.eat(b' ') { Some(p.astring()?) } else { None };
         p.end()?;
-        if mech != b"PLAIN" {
+        let oauth = mech == b"XOAUTH2" || mech == b"OAUTHBEARER";
+        if mech != b"PLAIN" && !oauth {
             return Err(no("[CANNOT] Unsupported authentication mechanism"));
         }
         if !self.auth_allowed() {
@@ -491,6 +496,27 @@ impl Session<'_> {
         } else {
             base64::engine::general_purpose::STANDARD.decode(&resp).map_err(|_| bad("Invalid base64"))?
         };
+        if oauth {
+            let mech = String::from_utf8_lossy(&mech).into_owned();
+            let found = crate::oauth::sasl_bearer(&mech, &decoded).and_then(|(user, token)| {
+                let owner = self.shared().lock().oauth.user_of(&token)?;
+                owner.eq_ignore_ascii_case(&user).then_some(owner)
+            });
+            return match found {
+                Some(addr) => {
+                    self.user = Some(addr);
+                    Ok(format!("[CAPABILITY {}] Logged in", self.capabilities()))
+                }
+                None => {
+                    // RFC 7628 section 3.2.2: an error challenge, the client's dummy answer, then NO.
+                    let err = base64::engine::general_purpose::STANDARD
+                        .encode(br#"{"status":"invalid_token","schemes":"bearer","scope":"mail"}"#);
+                    self.conn.write_all(format!("+ {err}\r\n").as_bytes())?;
+                    let _ = self.conn.read_line(MAX_LINE)?.ok_or(Fail::Bye)?;
+                    Err(no("[AUTHENTICATIONFAILED] Invalid or expired token"))
+                }
+            };
+        }
         let mut parts = decoded.split(|&b| b == 0);
         let (Some(authz), Some(authc), Some(pass), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())

@@ -40,6 +40,11 @@ use mailcraft_model::account::{PendingOp, RemoteOp};
 use mailcraft_model::{
     AccountId, AccountKind, FlagState, Folder, FolderId, FolderKind, ItemId, MailItem, Mailbox, ResponseState,
 };
+/// Settings for `accounts.discover` and the server connections (for front ends and tests that configure them).
+#[cfg(not(target_arch = "wasm32"))]
+pub use mailcraft_net::ConnectOptions;
+#[cfg(not(target_arch = "wasm32"))]
+pub use mailcraft_net::discover::{DiscoverOptions, ResolverChoice};
 
 /// Default automatic send/receive interval (Options › Advanced › Send/Receive: every 30 minutes).
 pub const DEFAULT_AUTO_MINUTES: u32 = 30;
@@ -52,6 +57,14 @@ const BACKOFF_MAX_SECS: i64 = 3600;
 const BLOCKED_RETRY_SECS: i64 = 300;
 /// Most queued server changes kept per account (oldest dropped beyond it).
 const MAX_PENDING: usize = 50_000;
+/// Below this measured transfer rate (bytes per second; 128 kbit/s) a connection counts as slow for
+/// Download Preferences › On Slow Connections Download Only Headers.
+pub const SLOW_LINK_BYTES_PER_SEC: u64 = 16_000;
+/// How long a transfer-rate measurement counts. A link found slow downloads headers only, which rarely
+/// measures it again; after this long the next run downloads normally and measures afresh.
+const LINK_SPEED_TTL_SECS: i64 = 3600;
+/// Address lookups (`accounts.discover`) remembered per session.
+const MAX_DISCOVERIES: usize = 16;
 
 // =======================================================================================================
 // Status
@@ -97,11 +110,13 @@ pub struct AccountStatus {
     pub last_sync: Option<i64>,
     pub pending_changes: usize,
     pub outbox: usize,
-    /// New-mail push (IMAP IDLE) state.
+    /// New-mail push (IMAP IDLE, JMAP event source) state.
     pub push: PushMode,
+    /// The last measured transfer rate was below the slow-connection threshold.
+    pub slow_connection: bool,
 }
 
-/// Whether new mail is pushed to an account (IMAP IDLE) or found by polling.
+/// Whether new mail is pushed to an account (IMAP IDLE, JMAP event source) or found by polling.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PushMode {
@@ -273,6 +288,9 @@ struct AccountRun {
     last_auto: Option<i64>,
     /// Last fallback Inbox check (push not available).
     last_poll: Option<i64>,
+    /// Transfer rate measured by the last run that downloaded enough to tell (bytes per second), and when
+    /// (Unix time).
+    link_speed: Option<(u64, i64)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -304,9 +322,18 @@ pub struct SyncState {
     pub(crate) jmap_dirty: BTreeSet<AccountId>,
     /// OAuth sign-ins started in this session.
     pub oauth: BTreeMap<AccountId, OAuthFlow>,
-    /// Test hook: HTTP options for OAuth endpoints (allows a local plain-HTTP token server).
+    /// HTTP options for OAuth endpoints (`None` = defaults). Tests use it to trust a local server.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) oauth_http: Option<mailcraft_net::ConnectOptions>,
+    pub oauth_http: Option<mailcraft_net::ConnectOptions>,
+    /// How `accounts.discover` looks addresses up (system resolver and the autoconfig locations by
+    /// default; tests point it at local servers).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub discovery: mailcraft_net::discover::DiscoverOptions,
+    /// Address lookups started by `accounts.discover`.
+    #[cfg(not(target_arch = "wasm32"))]
+    discoveries: BTreeMap<String, Discovering>,
+    /// The slow-connection threshold in bytes per second (`None` = [`SLOW_LINK_BYTES_PER_SEC`]).
+    pub slow_link_threshold: Option<u64>,
     #[cfg(not(target_arch = "wasm32"))]
     rt: native::Runtime,
 }
@@ -470,6 +497,24 @@ impl Session {
     }
 }
 
+/// The transfer rate last measured for an account (bytes per second), if a run in the last hour downloaded
+/// enough to tell.
+pub fn link_speed(s: &Session, id: AccountId) -> Option<u64> {
+    let (rate, at) = s.sync.runs.get(&id).and_then(|r| r.link_speed)?;
+    (s.now().unix.saturating_sub(at) < LINK_SPEED_TTL_SECS).then_some(rate)
+}
+
+/// True when the account's last measured transfer rate is below the slow-connection threshold.
+pub fn slow_connection(s: &Session, id: AccountId) -> bool {
+    let threshold = s.sync.slow_link_threshold.unwrap_or(SLOW_LINK_BYTES_PER_SEC);
+    link_speed(s, id).is_some_and(|b| b < threshold)
+}
+
+/// Download Preferences › On Slow Connections Download Only Headers applies to the account's next run.
+pub(crate) fn slow_headers_only(s: &Session, id: AccountId) -> bool {
+    crate::accounts::account_options(s, id).slow_headers_only && slow_connection(s, id)
+}
+
 /// Server accounts that take part in send/receive.
 pub(crate) fn server_accounts(s: &Session) -> Vec<AccountId> {
     s.mailbox.accounts.iter().filter(|a| is_server_account(a.kind)).map(|a| a.id).collect()
@@ -583,6 +628,7 @@ fn refresh_status(s: &mut Session) {
             pending_changes: a.sync.pending.len(),
             outbox,
             push: run.map(|r| r.push).unwrap_or_default(),
+            slow_connection: slow_connection(s, a.id),
         };
         if busy && busy_text.is_none() {
             busy_text = Some(row.progress.clone());
@@ -714,12 +760,12 @@ fn tick(s: &mut Session) {
     }
 }
 
-/// Starts push (IDLE on the Inbox) on IMAP accounts that want it and have connected once, and stops it when
-/// offline or no longer wanted.
+/// Starts push (IDLE on the Inbox for IMAP, the event source for JMAP) on accounts that want it and have
+/// connected once, and stops it when offline or no longer wanted.
 fn manage_push(s: &mut Session) {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        // JMAP push (EventSource) is not implemented: accounts that want push have their Inbox polled.
+        // JMAP: the worker listens on the server's event source (RFC 8620 section 7.3) between jobs.
         let jmap: Vec<AccountId> = s
             .mailbox
             .accounts
@@ -728,14 +774,29 @@ fn manage_push(s: &mut Session) {
             .map(|a| a.id)
             .collect();
         for id in jmap {
-            let want = !s.view.work_offline && crate::accounts::account_options(s, id).push;
-            if let Some(run) = s.sync.runs.get_mut(&id) {
-                let mode = if want && run.last_sync.is_some() { PushMode::Polling } else { PushMode::Off };
-                if run.push != mode {
-                    run.push = mode;
-                    s.sync.dirty = true;
+            let opts = crate::accounts::account_options(s, id);
+            let has_worker = s.sync.rt.has_worker(id);
+            let Some(run) = s.sync.runs.get(&id) else { continue };
+            let want = !s.view.work_offline
+                && opts.push
+                && has_worker
+                && run.last_sync.is_some()
+                && run.error.is_none();
+            if want == run.push_on {
+                continue;
+            }
+            let target = if want { native::jmap_push_target(s, id) } else { None };
+            if want && target.is_none() {
+                continue;
+            }
+            let sent = s.sync.rt.push(id, target);
+            if let Some(r) = s.sync.runs.get_mut(&id) {
+                r.push_on = want && sent;
+                if !want {
+                    r.push = PushMode::Off;
                 }
             }
+            s.sync.dirty = true;
         }
         let ids: Vec<AccountId> = s
             .mailbox
@@ -755,8 +816,8 @@ fn manage_push(s: &mut Session) {
                 && run.last_sync.is_some()
                 && run.error.is_none();
             if want != run.push_on {
-                let folder = want.then(|| "INBOX".to_owned());
-                let sent = s.sync.rt.push(id, folder);
+                let target = want.then(|| native::PushTarget::Imap("INBOX".to_owned()));
+                let sent = s.sync.rt.push(id, target);
                 if let Some(r) = s.sync.runs.get_mut(&id) {
                     r.push_on = want && sent;
                     if !want {
@@ -1441,6 +1502,133 @@ pub(crate) fn cancel_oauth(s: &mut Session, id: AccountId) -> bool {
     }
 }
 
+// =======================================================================================================
+// Server settings lookup (accounts.discover)
+// =======================================================================================================
+
+/// One address lookup.
+#[cfg(not(target_arch = "wasm32"))]
+enum Discovering {
+    Running(std::sync::mpsc::Receiver<Value>),
+    Done(Value),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn discovery_json(d: &mailcraft_net::discover::Discovery) -> Value {
+    use mailcraft_net::autoconfig::ServerConfig;
+    let server = |c: &Option<ServerConfig>| {
+        c.as_ref().map(|c| {
+            json!({
+                "host": c.host,
+                "port": c.port,
+                "security": match c.security {
+                    mailcraft_model::Security::None => "none",
+                    mailcraft_model::Security::StartTls => "starttls",
+                    mailcraft_model::Security::Tls => "tls",
+                },
+                "username": c.username,
+                "verified": c.verified,
+                "auth": c.auth,
+                "oauth": c.offers_oauth(),
+                "oauthOnly": c.oauth_only(),
+            })
+        })
+    };
+    json!({
+        "status": "done",
+        "address": d.address,
+        "domain": d.domain,
+        "found": d.found_anything(),
+        "sources": d.sources,
+        "displayName": d.display_name,
+        "imap": server(&d.imap),
+        "pop3": server(&d.pop3),
+        "smtp": server(&d.smtp),
+        "jmap": d.jmap.as_ref().map(|j| json!({"url": j.host, "verified": j.verified})),
+        "notes": d.notes,
+    })
+}
+
+/// Finds the server settings of `address` (autoconfig on the mail domain, then DNS SRV records; see
+/// `mailcraft_net::discover`). The lookup runs on its own thread: the first call starts it and reports
+/// `"status": "running"`, later calls with the same address report the result (`wait` blocks for it, at most
+/// a minute). Results are remembered for the session; `refresh` looks up again. Lookups that need no network
+/// (reserved example domains) finish at once.
+pub(crate) fn discover(s: &mut Session, address: &str, wait: bool, refresh: bool) -> Result<Value, CmdError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use mailcraft_net::discover::{self as nd, ResolverChoice};
+        let key = address.trim().to_ascii_lowercase();
+        let domain = nd::address_domain(&key).map_err(|e| CmdError::Params(e.to_string()))?;
+        if refresh {
+            s.sync.discoveries.remove(&key);
+        }
+        if !s.sync.discoveries.contains_key(&key) {
+            let opts = s.sync.discovery.clone();
+            let offline = (nd::is_reserved_domain(&domain) && !opts.allow_reserved)
+                || (opts.resolver == ResolverChoice::Off && opts.autoconfig_urls.is_empty());
+            let slot = if offline {
+                let d = nd::discover(address, &opts).map_err(|e| CmdError::Params(e.to_string()))?;
+                Discovering::Done(discovery_json(&d))
+            } else {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let addr = address.trim().to_owned();
+                std::thread::Builder::new()
+                    .name("mailcraft-discover".into())
+                    .spawn(move || {
+                        let r = std::panic::catch_unwind(|| nd::discover(&addr, &opts));
+                        let v = match r {
+                            Ok(Ok(d)) => discovery_json(&d),
+                            Ok(Err(e)) => json!({"status": "done", "found": false, "error": e.to_string()}),
+                            Err(_) => json!({"status": "done", "found": false, "error": "internal error"}),
+                        };
+                        let _ = tx.send(v);
+                    })
+                    .map_err(|e| CmdError::Failed(format!("cannot start the lookup: {e}")))?;
+                Discovering::Running(rx)
+            };
+            while s.sync.discoveries.len() >= MAX_DISCOVERIES {
+                let Some(k) = s.sync.discoveries.keys().next().cloned() else { break };
+                s.sync.discoveries.remove(&k);
+            }
+            s.sync.discoveries.insert(key.clone(), slot);
+        }
+        let Some(slot) = s.sync.discoveries.get_mut(&key) else {
+            return Err(CmdError::Failed("the lookup was lost".into()));
+        };
+        if let Discovering::Running(rx) = slot {
+            let got = if wait {
+                rx.recv_timeout(std::time::Duration::from_secs(60)).ok()
+            } else {
+                rx.try_recv().ok()
+            };
+            match got {
+                Some(v) => *slot = Discovering::Done(v),
+                None if wait => {
+                    s.sync.discoveries.remove(&key);
+                    return Err(CmdError::Failed("the lookup did not finish in time".into()));
+                }
+                None => {
+                    // A thread that died without answering leaves a disconnected channel: report nothing found.
+                    if matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)) {
+                        *slot = Discovering::Done(json!({"status": "done", "found": false}));
+                    }
+                }
+            }
+        }
+        Ok(match slot {
+            Discovering::Done(v) => v.clone(),
+            Discovering::Running(_) => json!({"status": "running", "address": address.trim()}),
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, wait, refresh);
+        Ok(json!({"status": "done", "address": address.trim(), "found": false,
+            "notes": ["Server settings cannot be looked up in the browser."]}))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1767,5 +1955,46 @@ mod tests {
         assert!(apply_server_flags(&mut m, &["\\Flagged".into(), "\\Answered".into()], now));
         assert!(!m.read && m.is_flagged() && matches!(m.response, ResponseState::Replied(_)));
         assert!(!apply_server_flags(&mut m, &["\\Flagged".into()], now));
+    }
+
+    #[test]
+    fn discover_without_network_finishes_at_once_and_is_bounded() {
+        let mut s = Session::new(Mailbox::new_local("Data"));
+        // Reserved example domains never reach the network, whatever the options.
+        let v = discover(&mut s, "kim@example.com", false, false).unwrap();
+        assert_eq!((v["status"].as_str(), v["found"].as_bool()), (Some("done"), Some(false)));
+        assert!(v["notes"][0].as_str().unwrap().contains("reserved"));
+        s.sync.discovery = mailcraft_net::discover::DiscoverOptions {
+            allow_reserved: true,
+            ..mailcraft_net::discover::DiscoverOptions::offline()
+        };
+        for i in 0..(MAX_DISCOVERIES + 5) {
+            let v = discover(&mut s, &format!("u{i}@x{i}.example"), false, true).unwrap();
+            assert_eq!(v["status"], "done");
+        }
+        assert_eq!(s.sync.discoveries.len(), MAX_DISCOVERIES);
+        assert!(matches!(discover(&mut s, "no-domain", false, false), Err(CmdError::Params(_))));
+    }
+
+    #[test]
+    fn slow_connection_follows_the_measurement_and_the_option() {
+        let (mb, a, _, _) = imap_mailbox();
+        let mut s = Session::new(mb);
+        assert!(!slow_connection(&s, a), "nothing measured yet");
+        let now = s.now().unix;
+        s.sync.runs.entry(a).or_default().link_speed = Some((SLOW_LINK_BYTES_PER_SEC - 1, now));
+        assert!(slow_connection(&s, a));
+        assert!(slow_headers_only(&s, a), "on by default");
+        crate::accounts::update_options(&mut s, a, |o| o.slow_headers_only = false);
+        assert!(!slow_headers_only(&s, a));
+        s.sync.runs.entry(a).or_default().link_speed = Some((SLOW_LINK_BYTES_PER_SEC, now));
+        assert!(!slow_connection(&s, a));
+        s.sync.slow_link_threshold = Some(u64::MAX);
+        assert!(slow_connection(&s, a));
+        refresh_status(&mut s);
+        assert!(s.sync.status.accounts.iter().any(|r| r.slow_connection));
+        // An old measurement no longer counts: the next run downloads normally and measures again.
+        s.sync.runs.entry(a).or_default().link_speed = Some((1, now - LINK_SPEED_TTL_SECS));
+        assert!(!slow_connection(&s, a) && link_speed(&s, a).is_none());
     }
 }

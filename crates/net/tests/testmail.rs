@@ -92,10 +92,10 @@ fn bad_password_and_untrusted_certificate() {
         ..ConnectOptions::default()
     };
     ImapClient::connect("127.0.0.1", s.imaps_port, Security::Tls, &lax).unwrap();
-    // OAuth tokens need XOAUTH2/OAUTHBEARER, which the test server does not offer.
+    // A token the server never issued is refused (XOAUTH2 error challenge, then NO).
     let mut c = ImapClient::connect("127.0.0.1", s.imap_port, Security::StartTls, &opts(&s)).unwrap();
     let e = c.login_with(&Credentials::oauth2(USER, "token"), "").unwrap_err();
-    assert!(matches!(e, NetError::Unsupported(_)), "{e:?}");
+    assert!(matches!(e, NetError::Auth(_)), "{e:?}");
 }
 
 #[test]
@@ -364,10 +364,10 @@ fn smtp_auth_modes_and_limits() {
     let mut anon = SmtpClient::connect(&smtp_settings(&s, Security::StartTls, None)).unwrap();
     let e = anon.send(USER, &["bob@example.org"], b"x\r\n").unwrap_err();
     assert!(!e.partially_sent());
-    // OAuth tokens: the server offers no XOAUTH2.
+    // A token the server never issued is refused.
     let e = SmtpClient::connect(&smtp_settings(&s, Security::StartTls, Some(Credentials::oauth2(USER, "t"))))
         .unwrap_err();
-    assert!(matches!(e, NetError::Unsupported(_)), "{e:?}");
+    assert!(matches!(e, NetError::Auth(_)), "{e:?}");
 }
 
 #[test]

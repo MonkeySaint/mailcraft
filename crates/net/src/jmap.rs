@@ -547,6 +547,28 @@ impl JmapClient {
         s
     }
 
+    /// The push URL (RFC 8620 §7.3) for `types` ("*" = all) with a ping every `ping_secs` seconds, or `None`
+    /// when the server offers no event source.
+    pub fn event_source_url(&self, types: &[&str], ping_secs: u32) -> Option<String> {
+        let t = &self.session.event_source_url;
+        if t.trim().is_empty() {
+            return None;
+        }
+        let types = if types.is_empty() { "*".to_owned() } else { types.join(",") };
+        let ping = ping_secs.to_string();
+        Some(self.expand(t, &[("types", &types), ("closeafter", "no"), ("ping", &ping)]))
+    }
+
+    /// Opens the push event stream (see [`Self::event_source_url`]); [`NetError::Unsupported`] when the
+    /// server has none.
+    pub fn open_events(&self, types: &[&str], ping_secs: u32) -> Result<crate::eventsource::EventStream> {
+        let url = self
+            .event_source_url(types, ping_secs)
+            .ok_or_else(|| NetError::Unsupported("JMAP push (no eventSourceUrl)".into()))?;
+        let auth = self.auth.header();
+        crate::eventsource::EventStream::open(&self.http, &url, &[("Authorization", &auth)])
+    }
+
     /// Uploads a blob; returns its id.
     pub fn upload(&self, data: &[u8], content_type: &str) -> Result<String> {
         let url = self.expand(&self.session.upload_url, &[("accountId", &self.session.account_id)]);
@@ -728,6 +750,35 @@ impl JmapClient {
         let sub =
             self.submit_with(identity_id, &email, envelope, dsn.as_ref(), Some((drafts_id, sent_id)))?;
         Ok((email, sub))
+    }
+}
+
+/// A push `StateChange` (RFC 8620 §7.1): per account id, the new state of each changed type.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StateChange {
+    pub changed: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl StateChange {
+    /// Parses the `data` of a `state` event. `None` for anything else.
+    pub fn parse(data: &str) -> Option<StateChange> {
+        let v: Value = serde_json::from_str(data).ok()?;
+        if v.get("@type").and_then(Value::as_str).is_some_and(|t| t != "StateChange") {
+            return None;
+        }
+        let mut changed = BTreeMap::new();
+        for (acct, types) in v.get("changed")?.as_object()? {
+            let Some(types) = types.as_object() else { continue };
+            let m: BTreeMap<String, String> =
+                types.iter().filter_map(|(k, st)| Some((k.clone(), st.as_str()?.to_owned()))).collect();
+            changed.insert(acct.clone(), m);
+        }
+        Some(StateChange { changed })
+    }
+
+    /// The new state of `kind` ("Email", "Mailbox", …) in `account`, if it changed.
+    pub fn state_of(&self, account: &str, kind: &str) -> Option<&str> {
+        self.changed.get(account)?.get(kind).map(String::as_str)
     }
 }
 
@@ -985,5 +1036,28 @@ X-MailCraft-Submit-DSN: NOTIFY=SUCCESS,FAILURE; RET=HDRS\r\nX-MailCraft-Submit-S
         assert_eq!(role_to_folder("junk"), Some(FolderRole::JunkEmail));
         assert_eq!(role_to_folder("all"), None);
         assert_eq!(pointer_escape("a/b~c"), "a~1b~0c");
+    }
+
+    #[test]
+    fn push_url_and_state_changes() {
+        let (base, t, _rx) = serve(1, |s| {
+            let port = s.header("host").unwrap().to_owned();
+            let mut doc: Value = serde_json::from_str(&session_json(&format!("http://{port}"))).unwrap();
+            doc["eventSourceUrl"] = json!("/jmap/events?types={types}&closeafter={closeafter}&ping={ping}");
+            json_resp(200, &doc.to_string())
+        });
+        let c = JmapClient::connect(&base, JmapAuth::Bearer("t".into()), plaintext_ok()).unwrap();
+        t.join().unwrap();
+        let url = c.event_source_url(&["Email", "Mailbox"], 60).unwrap();
+        assert!(url.ends_with("/jmap/events?types=Email%2CMailbox&closeafter=no&ping=60"), "{url}");
+        let sc = StateChange::parse(
+            r#"{"@type":"StateChange","changed":{"A1":{"Email":"e9","Mailbox":"m3"},"A2":{"Email":"x"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(sc.state_of("A1", "Email"), Some("e9"));
+        assert_eq!(sc.state_of("A1", "Thread"), None);
+        assert!(StateChange::parse(r#"{"@type":"Other","changed":{}}"#).is_none());
+        assert!(StateChange::parse("not json").is_none());
+        assert!(StateChange::parse(r#"{"changed":{"A":5}}"#).unwrap().changed.is_empty());
     }
 }

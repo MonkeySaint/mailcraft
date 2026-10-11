@@ -33,6 +33,9 @@ pub struct ImapSettings {
     /// Most new messages one [`ImapAccount::sync_folder`] call downloads (oldest first); the rest are
     /// reported through [`SyncDelta::more`].
     pub max_new_per_sync: usize,
+    /// The first download of a folder only takes messages that arrived on or after this day (UTC year,
+    /// month, day; IMAP `SEARCH SINCE` on the internal date). `None` downloads everything.
+    pub first_sync_since: Option<(i64, u8, u8)>,
 }
 
 impl ImapSettings {
@@ -46,6 +49,7 @@ impl ImapSettings {
             options: ConnectOptions::default(),
             fetch_batch: 50,
             max_new_per_sync: 500,
+            first_sync_since: None,
         }
     }
 
@@ -259,7 +263,8 @@ impl ImapAccount {
     pub fn sync_folder(&mut self, name: &str, since: &FolderState) -> Result<SyncDelta> {
         let batch = self.settings.fetch_batch.max(1);
         let cap = self.settings.max_new_per_sync.max(1);
-        self.with_client(true, |c| sync_once(c, name, since, batch, cap, false))
+        let window = self.settings.first_sync_since;
+        self.with_client(true, |c| sync_once(c, name, since, batch, cap, false, window))
     }
 
     /// [`Self::sync_folder`], but new messages come with their header only (`BODY.PEEK[HEADER]`, marked
@@ -267,7 +272,8 @@ impl ImapAccount {
     pub fn sync_folder_headers(&mut self, name: &str, since: &FolderState) -> Result<SyncDelta> {
         let batch = self.settings.fetch_batch.max(1);
         let cap = self.settings.max_new_per_sync.max(1);
-        self.with_client(true, |c| sync_once(c, name, since, batch, cap, true))
+        let window = self.settings.first_sync_since;
+        self.with_client(true, |c| sync_once(c, name, since, batch, cap, true, window))
     }
 
     /// Downloads whole messages by UID (for messages first downloaded as headers). UIDs no longer on the
@@ -448,6 +454,28 @@ impl ImapAccount {
     }
 }
 
+/// An IMAP `date` (RFC 3501 `date-text`, e.g. `5-Oct-2026`); `None` for an impossible date.
+pub fn imap_date(year: i64, month: u8, day: u8) -> Option<String> {
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let name = MONTHS.get(usize::from(month).checked_sub(1)?)?;
+    if !(1..=9999).contains(&year) || day == 0 || day > mailcraft_model::dates::days_in_month(year, month) {
+        return None;
+    }
+    Some(format!("{day}-{name}-{year}"))
+}
+
+/// The UTC day `months` calendar months before the Unix time `now` (the day of month is clamped to the
+/// target month's length): the start of a "download mail from the past N months" window.
+pub fn months_before(now: i64, months: u32) -> (i64, u8, u8) {
+    let (y, m, d) = mailcraft_model::dates::civil_from_days(now.div_euclid(86_400));
+    let total = y.saturating_mul(12).saturating_add(i64::from(m) - 1).saturating_sub(i64::from(months));
+    let year = total.div_euclid(12);
+    let month = u8::try_from(total.rem_euclid(12) + 1).unwrap_or(1);
+    let day = d.min(mailcraft_model::dates::days_in_month(year, month));
+    (year, month, day)
+}
+
 fn sync_once(
     c: &mut ImapClient,
     name: &str,
@@ -455,6 +483,7 @@ fn sync_once(
     batch: usize,
     cap: usize,
     headers_only: bool,
+    window: Option<(i64, u8, u8)>,
 ) -> Result<SyncDelta> {
     let info = c.select(name)?;
     let mut delta = SyncDelta::default();
@@ -469,13 +498,21 @@ fn sync_once(
     let known_set: HashSet<u32> = known.iter().copied().collect();
     let max_known = known.last().copied().unwrap_or(0);
     let server_modseq = info.highest_modseq.unwrap_or(0);
+    // The very first download of the folder may be limited to recent mail.
+    let first = known.is_empty() && since.uidnext == 0;
+    let since_key =
+        window.filter(|_| first).and_then(|(y, m, d)| imap_date(y, m, d)).map(|d| format!(" SINCE {d}"));
 
     // New UIDs (UIDs only grow, so anything above the highest known one is new).
     let mut new_uids: Vec<u32> = if info.exists == 0 {
         Vec::new()
     } else {
         let from = max_known.saturating_add(1).max(1);
-        c.uid_search(&format!("UID {}", SeqSet::from(from)))?.into_iter().filter(|&u| u > max_known).collect()
+        let key = since_key.unwrap_or_default();
+        c.uid_search(&format!("UID {}{key}", SeqSet::from(from)))?
+            .into_iter()
+            .filter(|&u| u > max_known)
+            .collect()
     };
     new_uids.sort_unstable();
     if new_uids.len() > cap {
@@ -567,4 +604,29 @@ fn sync_once(
         uids,
     };
     Ok(delta)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn date_window() {
+        assert_eq!(imap_date(2026, 10, 5).as_deref(), Some("5-Oct-2026"));
+        assert_eq!(imap_date(2026, 2, 29), None);
+        assert_eq!(imap_date(2026, 13, 1), None);
+        assert_eq!(imap_date(2026, 0, 1), None);
+        // 2026-10-10 12:00 UTC.
+        let now = 1_791_633_600;
+        assert_eq!(months_before(now, 0), (2026, 10, 10));
+        assert_eq!(months_before(now, 12), (2025, 10, 10));
+        assert_eq!(months_before(now, 10), (2025, 12, 10));
+        assert_eq!(months_before(now, 11), (2025, 11, 10));
+        // 31 March minus one month is the end of February.
+        let mar31 = 1_774_958_400; // 2026-03-31 12:00 UTC
+        assert_eq!(months_before(mar31, 1), (2026, 2, 28));
+        let (y, m, _) = months_before(0, u32::MAX);
+        assert!(y < 0 && (1..=12).contains(&m) && imap_date(y, m, 1).is_none());
+    }
 }

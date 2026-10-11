@@ -1,5 +1,6 @@
 //! JMAP accounts (RFC 8620 core, RFC 8621 mail): folders from Mailbox/get and Mailbox/changes, mail from
-//! Email/query + Email/get on the first run and Email/changes afterwards (whole messages downloaded as blobs),
+//! Email/query + Email/get on the first run (mail received in the account's "download mail from the past N
+//! months" window, newest first) and Email/changes afterwards (whole messages downloaded as blobs),
 //! local changes written back with Email/set (keywords, mailbox, destroy) and Email/import, and the Outbox
 //! sent with EmailSubmission/set (filed in Sent by the server).
 //!
@@ -20,8 +21,11 @@ use super::*;
 use crate::accounts::{JmapShadow, prefs};
 use mailcraft_model::{Account, FolderRole};
 
-/// Most emails downloaded by the first run (newest first); older mail stays on the server.
-const MAX_INITIAL: u64 = 2_000;
+/// Emails asked for per Email/query page of the first run.
+const QUERY_PAGE: u64 = 500;
+/// Safety bound on the emails one first run downloads (the date window is the real limit); older mail stays
+/// on the server.
+const MAX_INITIAL: u64 = 200_000;
 /// Most changes asked for per Email/changes call.
 const MAX_CHANGES: u64 = 500;
 /// Emails per Email/get.
@@ -67,6 +71,8 @@ pub(crate) struct JmapJob {
     receive: bool,
     email_state: String,
     mailbox_state: String,
+    /// First run: only mail received on or after this UTC time (RFC 3339), `None` = all mail.
+    received_after: Option<String>,
     /// (email id, patch, shadow after it).
     updates: Vec<(String, Value, JmapShadow)>,
     destroy: Vec<String>,
@@ -145,13 +151,22 @@ fn kw_object(k: &[String]) -> Value {
     Value::Object(k.iter().map(|w| (w.clone(), json!(true))).collect())
 }
 
-pub(crate) fn build_job(s: &Session, a: &Account, plan: &Plan) -> Option<JmapJob> {
+/// The local changes and receive state of one run. `window` is the first day (UTC) of the first download.
+pub(crate) fn build_job(
+    s: &Session,
+    a: &Account,
+    plan: &Plan,
+    window: Option<(i64, u8, u8)>,
+) -> Option<JmapJob> {
     let st = s.sync.prefs.data.jmap.get(&a.id.0).cloned().unwrap_or_default();
     let outbox = s.mailbox.role_folder(a.id, FolderRole::Outbox);
     let mut job = JmapJob {
         receive: plan.receive,
         email_state: st.email_state.clone(),
         mailbox_state: st.mailbox_state.clone(),
+        received_after: window
+            .filter(|(y, _, _)| (1..=9999).contains(y))
+            .map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}T00:00:00Z")),
         ..Default::default()
     };
     let mut here: BTreeSet<&str> = BTreeSet::new();
@@ -394,21 +409,38 @@ pub(crate) fn run(
             }
         }
         if since.is_empty() {
-            // First run (or a reset): the newest mail, then the state to continue from.
+            // First run (or a reset): mail of the download window, newest first, then the state to continue
+            // from (taken first, so nothing arriving meanwhile is missed).
             let (_, state) = c.get_emails_with_state(&[], &PROPS)?;
-            let q = c.query_emails(
-                json!({}),
-                json!([{ "property": "receivedAt", "isAscending": false }]),
-                0,
-                MAX_INITIAL,
-            )?;
-            let all: BTreeSet<String> = q.ids.iter().cloned().collect();
-            for chunk in q.ids.chunks(GET_BATCH) {
+            let filter = match &j.received_after {
+                Some(after) => json!({ "after": after }),
+                None => json!({}),
+            };
+            let sort = json!([{ "property": "receivedAt", "isAscending": false }]);
+            let mut position = 0u64;
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            while position < MAX_INITIAL {
                 if cancelled() {
                     return Ok(());
                 }
-                let (list, _) = get_emails(&c, chunk, &all, cancel)?;
-                send(events, cancel, account, JmapEvent::Emails { list });
+                let q = c.query_emails(filter.clone(), sort.clone(), position, QUERY_PAGE)?;
+                let page: Vec<String> = q.ids.into_iter().filter(|id| seen.insert(id.clone())).collect();
+                if page.is_empty() {
+                    break;
+                }
+                progress(&format!("Downloading messages ({} so far)…", seen.len()));
+                let all: BTreeSet<String> = page.iter().cloned().collect();
+                for chunk in page.chunks(GET_BATCH) {
+                    if cancelled() {
+                        return Ok(());
+                    }
+                    let (list, _) = get_emails(&c, chunk, &all, cancel)?;
+                    send(events, cancel, account, JmapEvent::Emails { list });
+                }
+                position = position.saturating_add(QUERY_PAGE);
+                if q.total.is_some_and(|t| position >= t) {
+                    break;
+                }
             }
             send(events, cancel, account, JmapEvent::EmailState { state });
         }

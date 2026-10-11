@@ -802,3 +802,135 @@ fn change_account_starts_and_cancels_an_oauth_sign_in() {
     assert_eq!(h.state().s.sync.oauth.get(&AccountId(id)).unwrap().status, "cancelled");
     assert!(h.query_by_label_contains("Sign-in was cancelled").is_some());
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Server lookup in the Add Account wizard
+
+/// Points the session's server lookup at the local test servers (autoconfig over HTTPS, fake DNS).
+fn local_lookup(app: &mut App, servers: &mailcraft_testmail::TestServers) {
+    use mailcraft_engine::sync::{ConnectOptions, DiscoverOptions, ResolverChoice};
+    app.s.sync.discovery = DiscoverOptions {
+        resolver: ResolverChoice::Fixed(servers.dns_addr()),
+        dns_timeout: std::time::Duration::from_secs(2),
+        autoconfig_urls: servers.autoconfig_url_templates(),
+        http: ConnectOptions::trusting(servers.cert_der.clone()),
+        allow_reserved: true,
+    };
+}
+
+/// Steps until the settings page shows (the lookup runs in the background).
+fn wait_for_settings(h: &mut Harness<'_, App>, title: &str) {
+    for _ in 0..400 {
+        step(h);
+        if h.query_by_label(title).is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the settings page did not appear");
+}
+
+#[test]
+fn add_account_uses_the_providers_autoconfig_before_guessing() {
+    let servers = mailcraft_testmail::TestServers::start(mailcraft_testmail::Config::default()).unwrap();
+    servers.set_autoconfig(
+        "example.net",
+        Some(
+            "<clientConfig version='1.1'><emailProvider id='example.net'>\
+             <incomingServer type='imap'><hostname>mail.example.net</hostname><port>143</port>\
+             <socketType>STARTTLS</socketType><username>%EMAILLOCALPART%</username></incomingServer>\
+             <outgoingServer type='smtp'><hostname>mail.example.net</hostname><port>465</port>\
+             <socketType>SSL</socketType><username>%EMAILLOCALPART%</username></outgoingServer>\
+             </emailProvider></clientConfig>",
+        ),
+    );
+    let mut app = sample_app();
+    app.s.view.work_offline = true;
+    local_lookup(&mut app, &servers);
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    let mut h = harness(app);
+    set_text(&mut h, "Email address:", "robin@example.net");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    assert!(h.query_by_label_contains("your email provider's configuration").is_some());
+    assert_eq!(field_value(&h, "Server:"), "mail.example.net");
+    assert_eq!(field_value(&h, "Port:"), "143");
+    assert!(combo_shows(&h, "STARTTLS"));
+    assert_eq!(field_value(&h, "User name:"), "robin");
+    assert_eq!(field_value(&h, "Outgoing server:"), "mail.example.net");
+    assert_eq!(field_value(&h, "Outgoing port:"), "465");
+    // More Settings: how far back the first download goes, and headers only on slow connections.
+    h.get_by_label("More Settings").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("More Settings").click();
+    step(&mut h);
+    h.get_by_label("On slow connections download only headers").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("On slow connections download only headers").click();
+    step(&mut h);
+    assert!(combo_shows(&h, "12 months"));
+    h.get_by_label("Download mail from the past:").scroll_to_me();
+    step(&mut h);
+    let combo = h
+        .query_all_by_role(egui::accesskit::Role::ComboBox)
+        .find(|n| n.value().as_deref() == Some("12 months"));
+    combo.unwrap().click();
+    step(&mut h);
+    h.get_by_label("3 months").click();
+    step(&mut h);
+    set_text(&mut h, "Password:", "pw");
+    h.get_by_label("Connect").click();
+    step(&mut h);
+    assert!(h.query_by_label("Account successfully added").is_some(), "{:?}", h.state().ui.toast);
+    let app = h.state();
+    let a = app.s.mailbox.accounts.iter().find(|a| a.address == "robin@example.net").unwrap();
+    let inc = a.incoming.as_ref().unwrap();
+    assert_eq!(
+        (inc.host.as_str(), inc.port, inc.security, inc.username.as_str()),
+        ("mail.example.net", 143, Security::StartTls, "robin")
+    );
+    let out = a.outgoing.as_ref().unwrap();
+    assert_eq!((out.port, out.security), (465, Security::Tls));
+    let o = mailcraft_engine::accounts::account_options(&app.s, a.id);
+    assert_eq!(o.download_months, Some(3));
+    assert!(!o.slow_headers_only, "the box was on by default and was cleared");
+}
+
+#[test]
+fn add_account_points_out_servers_outside_the_domain_found_in_dns() {
+    let servers = mailcraft_testmail::TestServers::start(mailcraft_testmail::Config::default()).unwrap();
+    let srv = |port: u16, target: &str| {
+        vec![mailcraft_testmail::Srv { priority: 0, weight: 0, port, target: target.into() }]
+    };
+    servers.set_srv("_imaps._tcp.example.org", srv(993, "imap.example.org"));
+    servers.set_srv("_submission._tcp.example.org", srv(587, "smtp.hosting.example"));
+    let mut app = sample_app();
+    app.s.view.work_offline = true;
+    local_lookup(&mut app, &servers);
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    let mut h = harness(app);
+    set_text(&mut h, "Email address:", "lou@example.org");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    assert!(h.query_by_label_contains("your domain's DNS records").is_some());
+    assert_eq!(field_value(&h, "Server:"), "imap.example.org");
+    assert_eq!(field_value(&h, "Outgoing server:"), "smtp.hosting.example");
+    assert!(h.query_by_label_contains("smtp.hosting.example is not part of example.org").is_some());
+    // Back, manual setup, POP: nothing found for POP, so the guess.
+    h.get_by_label("< Back").click();
+    step(&mut h);
+    h.get_by_label("Let me set up my account manually").click();
+    step(&mut h);
+    h.get_by_label("Connect").click();
+    for _ in 0..400 {
+        step(&mut h);
+        if h.query_by_label("Advanced setup").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.get_by_label("POP").click();
+    step(&mut h);
+    assert_eq!(field_value(&h, "Server:"), "pop.example.org");
+    assert!(h.query_by_label_contains("guessed from your address").is_some());
+}

@@ -8,6 +8,14 @@
 //! When the server reports a change the worker tells the session, which starts an Inbox update. A lost
 //! connection is retried with exponential backoff; a server without IDLE is reported as `Polling`, and the
 //! session then checks the Inbox every few minutes instead.
+//!
+//! JMAP accounts push the same way through the server's event source (RFC 8620 section 7.3): the worker keeps
+//! the `text/event-stream` open between jobs and reports a change when a `StateChange` names a new Email or
+//! Mailbox state. A server without an event source is reported as `Polling`.
+//!
+//! **Slow connections.** Runs measure the transfer rate of the mail they download; when it is below the
+//! session's threshold and the account asks for headers only on slow connections, new mail arrives as
+//! headers until a later run measures a faster link.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -44,6 +52,12 @@ const MAX_POP3_PER_RUN: usize = 500;
 const TOKEN_REFRESH_SKEW: u64 = 120;
 /// Prefix of the `remote_id` of POP3 items: `pop3:<unique id>`.
 pub(super) const POP3_PREFIX: &str = "pop3:";
+/// Ping interval asked of a JMAP event source; the stream counts as lost after twice this plus a margin.
+const JMAP_PING: Duration = Duration::from_secs(60);
+/// How long one wait for JMAP push events lasts before the worker looks at its messages again.
+const JMAP_PUSH_SLICE: Duration = Duration::from_millis(250);
+/// Bytes a run must download before its transfer rate counts (smaller downloads mostly measure latency).
+const MIN_RATE_SAMPLE: u64 = 32 * 1024;
 
 /// How an account's incoming server is reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,11 +140,20 @@ struct Job {
     jmap: Option<super::jmap::JmapJob>,
 }
 
+/// What a worker listens to between jobs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PushTarget {
+    /// IMAP IDLE on this server folder.
+    Imap(String),
+    /// The JMAP event source, with the Email and Mailbox states the session last saw.
+    Jmap { conn: super::jmap::JmapConn, email_state: String, mailbox_state: String },
+}
+
 /// What the session sends a worker.
 enum Msg {
     Run(Box<Job>),
-    /// IDLE on this server folder between jobs (`None` stops push).
-    Push(Option<String>),
+    /// Listen for new mail between jobs (`None` stops push).
+    Push(Option<PushTarget>),
 }
 
 pub(super) enum OpOutcome {
@@ -191,9 +214,14 @@ pub(super) enum Event {
         mode: PushMode,
         error: Option<String>,
     },
-    /// The server reported a change in the folder the worker IDLEs on.
+    /// The server reported a change in the folder the worker IDLEs on (JMAP: a new Email or Mailbox state).
     PushChanged {
         account: AccountId,
+    },
+    /// The transfer rate a run measured (bytes per second).
+    LinkSpeed {
+        account: AccountId,
+        bytes_per_sec: u64,
     },
     Pop3New {
         account: AccountId,
@@ -246,6 +274,7 @@ impl Event {
             | Event::Test { account, .. }
             | Event::Push { account, .. }
             | Event::PushChanged { account }
+            | Event::LinkSpeed { account, .. }
             | Event::Pop3New { account, .. }
             | Event::Pop3Full { account, .. }
             | Event::Pop3Server { account, .. }
@@ -336,11 +365,11 @@ impl Runtime {
         self.workers.contains_key(&id)
     }
 
-    /// Starts or stops IDLE on an existing worker. False when the account has no worker.
-    pub(super) fn push(&mut self, id: AccountId, folder: Option<String>) -> bool {
+    /// Starts or stops push on an existing worker. False when the account has no worker.
+    pub(super) fn push(&mut self, id: AccountId, target: Option<PushTarget>) -> bool {
         let Some(w) = self.workers.get(&id) else { return false };
         w.wake.store(true, Ordering::SeqCst);
-        if w.jobs.send(Msg::Push(folder)).is_err() {
+        if w.jobs.send(Msg::Push(target)).is_err() {
             self.workers.remove(&id);
             return false;
         }
@@ -484,6 +513,15 @@ pub(super) fn conn_settings(s: &Session, a: &Account) -> Result<Conn, String> {
         None
     };
     Ok(Conn { incoming, smtp, oauth })
+}
+
+/// What a JMAP account's worker listens to for push (`None` when the account cannot connect: no password).
+pub(super) fn jmap_push_target(s: &Session, id: AccountId) -> Option<PushTarget> {
+    let a = s.mailbox.account(id)?;
+    let conn = conn_settings(s, a).ok()?;
+    let Incoming::Jmap(conn) = conn.incoming else { return None };
+    let st = s.sync.prefs.data.jmap.get(&id.0).cloned().unwrap_or_default();
+    Some(PushTarget::Jmap { conn, email_state: st.email_state, mailbox_state: st.mailbox_state })
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -688,6 +726,9 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
     let now = s.now().unix;
     let fetch_items: Vec<ItemId> = s.sync.fetch.get(&id).cloned().unwrap_or_default();
     let force_headers = s.sync.force_headers.contains(&id);
+    // On Slow Connections Download Only Headers: like Download Headers, without the bodies following.
+    let slow = super::slow_headers_only(s, id);
+    let window = opts.download_months.map(|m| mailcraft_net::sync::months_before(now, m));
     let outgoing = outgoing_items(s, &a, &plan, now);
     let mut job = Job {
         conn,
@@ -700,17 +741,21 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         pop3: None,
         jmap: None,
     };
-    match &job.conn.incoming {
-        Incoming::Imap(_) => {
+    match &mut job.conn.incoming {
+        Incoming::Imap(settings) => {
+            settings.first_sync_since = window;
             job.ops = job_ops(s, &a, &plan, now);
             job.receive = imap_receive(s, &a, &plan, !job.outgoing.is_empty());
-            job.headers_only = job.receive.is_some() && (force_headers || opts.download.headers_first());
+            job.headers_only =
+                job.receive.is_some() && (force_headers || slow || opts.download.headers_first());
             job.then_full =
-                job.headers_only && !force_headers && opts.download == DownloadMode::HeadersThenFull;
+                job.headers_only && !force_headers && !slow && opts.download == DownloadMode::HeadersThenFull;
             job.fetch = imap_fetch_list(s, id, &fetch_items);
         }
-        Incoming::Pop3(_) => job.pop3 = pop3_job(s, &a, plan.receive, force_headers, &fetch_items, now),
-        Incoming::Jmap(_) => job.jmap = super::jmap::build_job(s, &a, &plan),
+        Incoming::Pop3(_) => {
+            job.pop3 = pop3_job(s, &a, plan.receive, force_headers || slow, &fetch_items, now);
+        }
+        Incoming::Jmap(_) => job.jmap = super::jmap::build_job(s, &a, &plan, window),
     }
     if job.ops.is_empty()
         && job.outgoing.is_empty()
@@ -743,12 +788,23 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
 // Worker thread
 // ---------------------------------------------------------------------------------------------------
 
-/// Push (IDLE) state kept by a worker between jobs.
+/// Push state kept by a worker between jobs.
 struct PushLoop {
-    folder: Option<String>,
+    target: Option<PushTarget>,
+    /// The open JMAP event stream.
+    jmap: Option<JmapPush>,
     failures: u32,
     retry_at: Option<Instant>,
     reported: Option<PushMode>,
+}
+
+/// An open JMAP event source and what it last reported.
+struct JmapPush {
+    stream: mailcraft_net::eventsource::EventStream,
+    account_id: String,
+    email_state: String,
+    mailbox_state: String,
+    last_data: Instant,
 }
 
 impl PushLoop {
@@ -756,6 +812,22 @@ impl PushLoop {
         if self.reported != Some(mode) || error.is_some() {
             self.reported = Some(mode);
             events.send(Event::Push { account, mode, error });
+        }
+    }
+
+    /// The push connection failed: try again after a growing delay.
+    fn lost(&mut self, account: AccountId, events: &Events, e: &NetError) {
+        if let Some(mut j) = self.jmap.take() {
+            j.stream.close();
+        }
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(mailcraft_net::transport::deadline_after(push_backoff(self.failures)));
+        if matches!(e, NetError::Auth(_)) {
+            // A password or token problem will not fix itself: the next run reports it.
+            self.target = None;
+            self.report(account, events, PushMode::Off, Some(e.to_string()));
+        } else {
+            self.report(account, events, PushMode::Reconnecting, Some(e.to_string()));
         }
     }
 }
@@ -773,9 +845,13 @@ fn worker_main(
     wake: Arc<AtomicBool>,
 ) {
     let mut imap: Option<ImapAccount> = None;
-    let mut push = PushLoop { folder: None, failures: 0, retry_at: None, reported: None };
+    let mut push = PushLoop { target: None, jmap: None, failures: 0, retry_at: None, reported: None };
     loop {
-        let idling = push.folder.is_some() && imap.is_some();
+        let idling = match &push.target {
+            Some(PushTarget::Imap(_)) => imap.is_some(),
+            Some(PushTarget::Jmap { .. }) => true,
+            None => false,
+        };
         let msg = if idling {
             match jobs.try_recv() {
                 Ok(m) => Some(m),
@@ -789,12 +865,17 @@ fn worker_main(
             }
         };
         match msg {
-            Some(Msg::Push(folder)) => {
+            Some(Msg::Push(target)) => {
                 wake.store(false, Ordering::SeqCst);
-                if folder.is_none() {
+                if target.is_none() {
                     push.report(account, &events, PushMode::Off, None);
                 }
-                push.folder = folder;
+                if push.target != target
+                    && let Some(mut j) = push.jmap.take()
+                {
+                    j.stream.close();
+                }
+                push.target = target;
                 push.failures = 0;
                 push.retry_at = None;
                 continue;
@@ -820,7 +901,7 @@ fn worker_main(
             }
             None => {}
         }
-        // Idle step: wait out a reconnect delay, or IDLE until a change, a message or the slice ends.
+        // Idle step: wait out a reconnect delay, or listen until a change, a message or the slice ends.
         if let Some(t) = push.retry_at {
             if Instant::now() < t {
                 let until = t.min(mailcraft_net::transport::deadline_after(Duration::from_millis(200)));
@@ -831,61 +912,191 @@ fn worker_main(
             }
             push.retry_at = None;
         }
-        let (Some(folder), Some(acc)) = (push.folder.clone(), imap.as_mut()) else { continue };
-        // Connected already: say what happens next before the (long) IDLE starts.
-        match acc.client().map(|c| c.has_capability("IDLE") || c.has_capability("IMAP4rev2")) {
-            Some(true) => push.report(account, &events, PushMode::Idle, None),
-            Some(false) => {
-                push.report(account, &events, PushMode::Polling, None);
-                push.folder = None;
-                continue;
+        match push.target.clone() {
+            Some(PushTarget::Imap(folder)) => {
+                let Some(acc) = imap.as_mut() else { continue };
+                if !imap_push_step(account, acc, &folder, &mut push, &events, &wake) {
+                    imap = None;
+                }
+            }
+            Some(PushTarget::Jmap { conn, email_state, mailbox_state }) => {
+                let res = catch_unwind(AssertUnwindSafe(|| {
+                    jmap_push_step(account, &conn, (&email_state, &mailbox_state), &mut push, &events, &wake)
+                }));
+                if res.is_err() {
+                    push.jmap = None;
+                    push.target = None;
+                    push.report(
+                        account,
+                        &events,
+                        PushMode::Off,
+                        Some("internal error while waiting for mail".into()),
+                    );
+                }
             }
             None => {}
         }
-        let started = Instant::now();
-        let res = catch_unwind(AssertUnwindSafe(|| acc.idle_once(&folder, IDLE_SLICE, Some(&wake))));
-        match res {
-            Ok(Ok(changed)) => {
-                push.failures = 0;
-                push.report(account, &events, PushMode::Idle, None);
-                if changed && !events.send(Event::PushChanged { account }) {
-                    break;
-                }
-                // A server that ends IDLE at once must not turn this loop into a busy one.
-                if !changed && !wake.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(1) {
-                    push.retry_at = Some(mailcraft_net::transport::deadline_after(Duration::from_secs(1)));
-                }
-            }
-            Ok(Err(NetError::Unsupported(_))) => {
-                push.report(account, &events, PushMode::Polling, None);
-                push.folder = None;
-            }
-            Ok(Err(e)) => {
-                push.failures = push.failures.saturating_add(1);
-                push.retry_at = Some(mailcraft_net::transport::deadline_after(push_backoff(push.failures)));
-                if matches!(e, NetError::Auth(_)) {
-                    // A password or token problem will not fix itself: the next run reports it.
-                    push.folder = None;
-                    push.report(account, &events, PushMode::Off, Some(e.to_string()));
-                } else {
-                    push.report(account, &events, PushMode::Reconnecting, Some(e.to_string()));
-                }
-            }
-            Err(_) => {
-                imap = None;
-                push.folder = None;
-                push.report(
-                    account,
-                    &events,
-                    PushMode::Off,
-                    Some("internal error while waiting for mail".into()),
-                );
-            }
-        }
+    }
+    if let Some(mut j) = push.jmap.take() {
+        j.stream.close();
     }
     if let Some(mut a) = imap {
         a.disconnect();
     }
+}
+
+/// One IMAP IDLE (until a change, a message or the slice ends). False when the connection must be dropped.
+fn imap_push_step(
+    account: AccountId,
+    acc: &mut ImapAccount,
+    folder: &str,
+    push: &mut PushLoop,
+    events: &Events,
+    wake: &AtomicBool,
+) -> bool {
+    // Connected already: say what happens next before the (long) IDLE starts.
+    match acc.client().map(|c| c.has_capability("IDLE") || c.has_capability("IMAP4rev2")) {
+        Some(true) => push.report(account, events, PushMode::Idle, None),
+        Some(false) => {
+            push.report(account, events, PushMode::Polling, None);
+            push.target = None;
+            return true;
+        }
+        None => {}
+    }
+    let started = Instant::now();
+    let res = catch_unwind(AssertUnwindSafe(|| acc.idle_once(folder, IDLE_SLICE, Some(wake))));
+    match res {
+        Ok(Ok(changed)) => {
+            push.failures = 0;
+            push.report(account, events, PushMode::Idle, None);
+            if changed {
+                events.send(Event::PushChanged { account });
+            }
+            // A server that ends IDLE at once must not turn this loop into a busy one.
+            if !changed && !wake.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(1) {
+                push.retry_at = Some(mailcraft_net::transport::deadline_after(Duration::from_secs(1)));
+            }
+            true
+        }
+        Ok(Err(NetError::Unsupported(_))) => {
+            push.report(account, events, PushMode::Polling, None);
+            push.target = None;
+            true
+        }
+        Ok(Err(e)) => {
+            push.lost(account, events, &e);
+            true
+        }
+        Err(_) => {
+            push.target = None;
+            push.report(account, events, PushMode::Off, Some("internal error while waiting for mail".into()));
+            false
+        }
+    }
+}
+
+/// One JMAP push step: opens the event source when needed, then waits up to [`JMAP_PUSH_SLICE`] for an
+/// event. A `StateChange` naming a new Email or Mailbox state of the account is reported as new mail.
+fn jmap_push_step(
+    account: AccountId,
+    conn: &super::jmap::JmapConn,
+    known: (&str, &str),
+    push: &mut PushLoop,
+    events: &Events,
+    wake: &AtomicBool,
+) {
+    if push.jmap.is_none() {
+        let opened = conn.connect().and_then(|c| {
+            let stream =
+                c.open_events(&["Email", "Mailbox"], u32::try_from(JMAP_PING.as_secs()).unwrap_or(60))?;
+            Ok((stream, c.account_id().to_owned()))
+        });
+        match opened {
+            Ok((stream, account_id)) => {
+                push.failures = 0;
+                push.jmap = Some(JmapPush {
+                    stream,
+                    account_id,
+                    email_state: known.0.to_owned(),
+                    mailbox_state: known.1.to_owned(),
+                    last_data: Instant::now(),
+                });
+                push.report(account, events, PushMode::Idle, None);
+            }
+            Err(NetError::Unsupported(_)) => {
+                push.report(account, events, PushMode::Polling, None);
+                push.target = None;
+            }
+            Err(e) => push.lost(account, events, &e),
+        }
+        return;
+    }
+    let Some(j) = push.jmap.as_mut() else { return };
+    if wake.load(Ordering::SeqCst) {
+        return;
+    }
+    match j.stream.next_event(JMAP_PUSH_SLICE) {
+        Ok(Some(ev)) => {
+            j.last_data = Instant::now();
+            if ev.event != "state" {
+                return;
+            }
+            let Some(sc) = mailcraft_net::jmap::StateChange::parse(&ev.data) else { return };
+            let mut changed = false;
+            if let Some(st) = sc.state_of(&j.account_id, "Email")
+                && st != j.email_state
+            {
+                st.clone_into(&mut j.email_state);
+                changed = true;
+            }
+            if let Some(st) = sc.state_of(&j.account_id, "Mailbox")
+                && st != j.mailbox_state
+            {
+                st.clone_into(&mut j.mailbox_state);
+                changed = true;
+            }
+            if changed {
+                events.send(Event::PushChanged { account });
+            }
+        }
+        Ok(None) => {
+            // The server pings at least every JMAP_PING: silence for much longer means a dead connection.
+            if j.last_data.elapsed() > JMAP_PING.saturating_mul(2).saturating_add(Duration::from_secs(30)) {
+                push.lost(account, events, &NetError::Timeout("no events from the JMAP server".into()));
+            }
+        }
+        Err(e) => push.lost(account, events, &e),
+    }
+}
+
+/// Bytes downloaded and time spent downloading them, for the slow-connection check.
+#[derive(Default)]
+struct RateMeter {
+    bytes: u64,
+    time: Duration,
+}
+
+impl RateMeter {
+    fn add(&mut self, bytes: usize, time: Duration) {
+        if bytes > 0 {
+            self.bytes = self.bytes.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+            self.time = self.time.saturating_add(time);
+        }
+    }
+    /// Reports the rate when enough was downloaded to tell.
+    fn report(&self, account: AccountId, events: &Events) {
+        if self.bytes < MIN_RATE_SAMPLE {
+            return;
+        }
+        let ms = u64::try_from(self.time.as_millis()).unwrap_or(u64::MAX).max(1);
+        let bytes_per_sec = self.bytes.saturating_mul(1000) / ms;
+        events.send(Event::LinkSpeed { account, bytes_per_sec });
+    }
+}
+
+fn raw_len(msgs: &[NewMessage]) -> usize {
+    msgs.iter().map(|m| m.raw.len()).fold(0usize, usize::saturating_add)
 }
 
 fn transient(e: &NetError) -> bool {
@@ -950,13 +1161,14 @@ fn run_job(
     if let Err(e) = refresh_token(account, &mut job.conn, events, false) {
         return Some(e);
     }
-    match job.conn.incoming.clone() {
-        Incoming::Imap(settings) => run_imap(account, slot, settings, job, events, cancel),
+    let mut meter = RateMeter::default();
+    let res = match job.conn.incoming.clone() {
+        Incoming::Imap(settings) => run_imap(account, slot, settings, job, events, cancel, &mut meter),
         Incoming::Pop3(settings) => {
             if let Some(mut old) = slot.take() {
                 old.disconnect();
             }
-            run_pop3(account, &settings, job, events, cancel)
+            run_pop3(account, &settings, job, events, cancel, &mut meter)
         }
         Incoming::Jmap(conn) => {
             if let Some(mut old) = slot.take() {
@@ -964,7 +1176,9 @@ fn run_job(
             }
             super::jmap::run(account, &conn, job.jmap.as_ref(), &job.outgoing, events, cancel)
         }
-    }
+    };
+    meter.report(account, events);
+    res
 }
 
 fn run_imap(
@@ -974,6 +1188,7 @@ fn run_imap(
     job: &mut Job,
     events: &Events,
     cancel: &AtomicBool,
+    meter: &mut RateMeter,
 ) -> Option<String> {
     let send = |e: Event| {
         if !events.send(e) {
@@ -1061,8 +1276,12 @@ fn run_imap(
             return Some("Send/Receive was cancelled.".into());
         }
         progress(&format!("Downloading {} marked message(s)…", uids.len()));
+        let t0 = Instant::now();
         match imap.fetch_messages(name, uids) {
-            Ok(msgs) => send(Event::Bodies { account, name: name.clone(), msgs }),
+            Ok(msgs) => {
+                meter.add(raw_len(&msgs), t0.elapsed());
+                send(Event::Bodies { account, name: name.clone(), msgs });
+            }
             Err(e) => {
                 let lost = e.is_connection_lost();
                 send(Event::FolderFailed { account, name: name.clone(), error: e.to_string() });
@@ -1081,6 +1300,7 @@ fn run_imap(
         progress(&format!("Updating {display}…"));
         let mut since = rcv.states.get(&name).cloned().unwrap_or_default();
         for _ in 0..MAX_ROUNDS_PER_FOLDER {
+            let t0 = Instant::now();
             let res = if job.headers_only {
                 imap.sync_folder_headers(&name, &since)
             } else {
@@ -1088,14 +1308,19 @@ fn run_imap(
             };
             match res {
                 Ok(delta) => {
+                    meter.add(raw_len(&delta.new), t0.elapsed());
                     let more = delta.more;
                     since = delta.state.clone();
                     let fresh: Vec<u32> = delta.new.iter().map(|m| m.uid).collect();
                     send(Event::Delta { account, name: name.clone(), delta });
                     // Download Headers and Then Full Items: the bodies follow the headers.
                     if job.then_full && !fresh.is_empty() && !cancelled() {
+                        let t1 = Instant::now();
                         match imap.fetch_messages(&name, &fresh) {
-                            Ok(msgs) => send(Event::Bodies { account, name: name.clone(), msgs }),
+                            Ok(msgs) => {
+                                meter.add(raw_len(&msgs), t1.elapsed());
+                                send(Event::Bodies { account, name: name.clone(), msgs });
+                            }
                             Err(e) => {
                                 send(Event::FolderFailed {
                                     account,
@@ -1132,6 +1357,7 @@ fn run_pop3(
     job: &mut Job,
     events: &Events,
     cancel: &AtomicBool,
+    meter: &mut RateMeter,
 ) -> Option<String> {
     let send = |e: Event| {
         if !events.send(e) {
@@ -1150,7 +1376,11 @@ fn run_pop3(
         return Some("Send/Receive was cancelled.".into());
     }
     progress("Checking for new messages…");
-    let mut settings = settings.clone();
+    // Sending may have renewed the OAuth token: use the job's current settings.
+    let mut settings = match &job.conn.incoming {
+        Incoming::Pop3(current) => current.clone(),
+        _ => settings.clone(),
+    };
     let mut client = match Pop3Client::connect(&settings) {
         Ok(c) => c,
         Err(NetError::Auth(_)) if job.conn.oauth.is_some() => {
@@ -1185,7 +1415,9 @@ fn run_pop3(
                 return Err(NetError::Invalid("Send/Receive was cancelled.".into()));
             }
             progress(&format!("Downloading marked message {} of {}…", i.saturating_add(1), wanted.len()));
+            let t0 = Instant::now();
             let raw = client.retr(*n)?;
+            meter.add(raw.len(), t0.elapsed());
             send(Event::Pop3Full { account, uidl: u.clone(), raw });
         }
         if p.receive {
@@ -1199,7 +1431,9 @@ fn run_pop3(
                     return Err(NetError::Invalid("Send/Receive was cancelled.".into()));
                 }
                 progress(&format!("Receiving message {} of {}…", i.saturating_add(1), fresh.len()));
+                let t0 = Instant::now();
                 let raw = if p.headers_only { client.top(*n, 0)? } else { client.retr(*n)? };
+                meter.add(raw.len(), t0.elapsed());
                 send(Event::Pop3New {
                     account,
                     uidl: u.clone(),
@@ -1226,7 +1460,7 @@ fn run_pop3(
 
 fn send_outgoing(
     account: AccountId,
-    job: &Job,
+    job: &mut Job,
     events: &Events,
     cancel: &AtomicBool,
     error: &mut Option<String>,
@@ -1236,7 +1470,7 @@ fn send_outgoing(
             cancel.store(true, Ordering::SeqCst);
         }
     };
-    let Some(set) = &job.conn.smtp else {
+    let Some(set) = job.conn.smtp.clone() else {
         for m in &job.outgoing {
             send(Event::Sent {
                 account,
@@ -1247,7 +1481,19 @@ fn send_outgoing(
         return;
     };
     send(Event::Progress { account, text: "Sending…".into() });
-    match SmtpClient::connect(set) {
+    let mut connected = SmtpClient::connect(&set);
+    // An expired OAuth token shows as a sign-in failure: renew it once and sign in again.
+    if job.conn.oauth.is_some() && matches!(connected, Err(NetError::Auth(_))) {
+        match refresh_token(account, &mut job.conn, events, true) {
+            Ok(_) => {
+                if let Some(set) = &job.conn.smtp {
+                    connected = SmtpClient::connect(set);
+                }
+            }
+            Err(e) => connected = Err(NetError::Auth(e)),
+        }
+    }
+    match connected {
         Err(e) => {
             let msg = e.to_string();
             for m in &job.outgoing {
@@ -1609,6 +1855,10 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
                     }
                 }
                 run.push_error = error;
+            }
+            Event::LinkSpeed { account, bytes_per_sec } => {
+                let now = s.now().unix;
+                s.sync.runs.entry(account).or_default().link_speed = Some((bytes_per_sec, now));
             }
             Event::PushChanged { account } => {
                 if !s.view.work_offline {

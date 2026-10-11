@@ -18,7 +18,13 @@
 //!   POP3 accounts can be tested against the same mail (deletions at QUIT reach IMAP sessions too).
 //!
 //! - a JMAP server (RFC 8620/8621 over HTTP/1.1: session, Mailbox/Email get/changes/query/set/import,
-//!   Identity/get, EmailSubmission/set, blob upload and download) on the same mail, for JMAP accounts.
+//!   Identity/get, EmailSubmission/set, blob upload and download, push over an event source) on the same
+//!   mail, for JMAP accounts.
+//!
+//! - an OAuth 2.0 authorization server (device grant, authorization code with PKCE, refresh tokens) whose
+//!   access tokens sign in to IMAP and SMTP (XOAUTH2, OAUTHBEARER) and JMAP (Bearer), plus autoconfig
+//!   documents, both on a small web server (HTTP and HTTPS); and a fake DNS responder (UDP) answering SRV
+//!   questions from records the test sets. Nothing is ever forwarded to a real server.
 //!
 //! Each protocol listens on a plain port (with STARTTLS) and an implicit-TLS port. TLS uses a self-signed
 //! certificate for `localhost`/`127.0.0.1` generated at start; [`TestServers::cert_pem`] /
@@ -27,20 +33,24 @@
 
 mod conn;
 mod date;
+mod dns;
 mod imap;
 mod jmap;
 mod mime;
+mod oauth;
 mod pop3;
 mod server;
 mod smtp;
 mod store;
 mod tls;
+mod web;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use date::DateTime;
+pub use dns::Srv;
 /// The rustls version the servers use, for building test clients.
 pub use rustls;
 pub use store::{SpecialUse, StoredMessage, Submission};
@@ -104,6 +114,18 @@ pub struct Config {
     pub imap_idle: bool,
     /// Users created at start: (address, password).
     pub users: Vec<(String, String)>,
+    /// The web server (autoconfig, OAuth) over plain HTTP.
+    pub web_port: u16,
+    /// The web server over HTTPS.
+    pub webs_port: u16,
+    /// The fake DNS responder (UDP).
+    pub dns_port: u16,
+    /// OAuth client ids the authorization server accepts (public clients, no secret).
+    pub oauth_clients: Vec<String>,
+    /// Lifetime of issued access tokens.
+    pub oauth_token_lifetime: Duration,
+    /// JMAP offers push (an `eventSourceUrl`). Off to test clients falling back to polling.
+    pub jmap_push: bool,
 }
 
 impl Default for Config {
@@ -126,9 +148,18 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(30 * 60),
             imap_idle: true,
             users: Vec::new(),
+            web_port: 0,
+            webs_port: 0,
+            dns_port: 0,
+            oauth_clients: vec![OAUTH_TEST_CLIENT.to_owned()],
+            oauth_token_lifetime: Duration::from_secs(3600),
+            jmap_push: true,
         }
     }
 }
+
+/// The client id the OAuth test server accepts by default.
+pub const OAUTH_TEST_CLIENT: &str = "mailcraft-test-client";
 
 /// Running test servers. Stops all listener and connection threads on drop.
 pub struct TestServers {
@@ -148,6 +179,12 @@ pub struct TestServers {
     pub jmap_port: u16,
     /// JMAP HTTPS port.
     pub jmaps_port: u16,
+    /// Web server (autoconfig, OAuth) plain HTTP port.
+    pub web_port: u16,
+    /// Web server HTTPS port.
+    pub webs_port: u16,
+    /// Fake DNS responder (UDP) port.
+    pub dns_port: u16,
     /// Self-signed server certificate (PEM) for `localhost` and `127.0.0.1`.
     pub cert_pem: String,
     /// The same certificate, DER-encoded.
@@ -164,6 +201,8 @@ impl TestServers {
         for (addr, pw) in &config.users {
             shared.lock().add_user(addr, pw)?;
         }
+        let lifetime = i64::try_from(config.oauth_token_lifetime.as_secs()).unwrap_or(i64::MAX);
+        shared.lock().oauth = oauth::OAuthState::new(config.oauth_clients.clone(), lifetime);
         let running = server::Running::start(config, Arc::clone(&shared), identity.server_config()?)?;
         Ok(TestServers {
             imap_port: running.imap.port(),
@@ -174,6 +213,9 @@ impl TestServers {
             pop3s_port: running.pop3s.port(),
             jmap_port: running.jmap.port(),
             jmaps_port: running.jmaps.port(),
+            web_port: running.web.port(),
+            webs_port: running.webs.port(),
+            dns_port: running.dns.port(),
             cert_pem: identity.cert_pem,
             cert_der: identity.cert_der,
             inner: running,
@@ -210,6 +252,102 @@ impl TestServers {
     /// The JMAP session URL over HTTPS (`https://127.0.0.1:<jmaps_port>/.well-known/jmap`).
     pub fn jmap_url(&self) -> String {
         format!("https://127.0.0.1:{}/.well-known/jmap", self.jmaps_port)
+    }
+
+    /// The web server's HTTPS base URL (`https://127.0.0.1:<webs_port>`).
+    pub fn web_url(&self) -> String {
+        format!("https://127.0.0.1:{}", self.webs_port)
+    }
+
+    /// The fake DNS responder's address (UDP).
+    pub fn dns_addr(&self) -> SocketAddr {
+        self.inner.dns
+    }
+
+    /// Autoconfig URL templates (`{domain}`, `{address}` placeholders) pointing at this server, in the order a
+    /// client tries the real locations: the `autoconfig.<domain>` host, then the domain's well-known path.
+    pub fn autoconfig_url_templates(&self) -> Vec<String> {
+        let base = self.web_url();
+        vec![
+            format!("{base}/autoconfig/{{domain}}/mail/config-v1.1.xml?emailaddress={{address}}"),
+            format!("{base}/{{domain}}/.well-known/autoconfig/mail/config-v1.1.xml"),
+        ]
+    }
+
+    /// Serves `xml` as the autoconfig document of `domain` at both locations (`None` removes it).
+    pub fn set_autoconfig(&self, domain: &str, xml: Option<&str>) {
+        self.put_autoconfig(domain, xml, true);
+    }
+
+    /// Serves `xml` as the autoconfig document of `domain` only at the domain's well-known location.
+    pub fn set_autoconfig_well_known(&self, domain: &str, xml: &str) {
+        self.put_autoconfig(domain, Some(xml), false);
+    }
+
+    fn put_autoconfig(&self, domain: &str, xml: Option<&str>, both: bool) {
+        let mut w = self.inner.ctx.web.lock().unwrap_or_else(|e| e.into_inner());
+        let key = domain.trim().to_ascii_lowercase();
+        match xml {
+            Some(x) => w.autoconfig.insert(key, (x.to_owned(), both)),
+            None => w.autoconfig.remove(&key),
+        };
+    }
+
+    /// Requests the web server received ("GET /path?query"), oldest first.
+    pub fn web_requests(&self) -> Vec<String> {
+        self.inner.ctx.web.lock().unwrap_or_else(|e| e.into_inner()).requests.clone()
+    }
+
+    /// Sets the SRV records the fake DNS responder answers for `name` (e.g. `_imaps._tcp.example.com`).
+    pub fn set_srv(&self, name: &str, records: Vec<Srv>) {
+        let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        self.inner.ctx.dns.lock().unwrap_or_else(|e| e.into_inner()).insert(key, Some(records));
+    }
+
+    /// Makes the fake DNS responder answer `name` with a truncated (TC) empty message.
+    pub fn set_srv_truncated(&self, name: &str) {
+        let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        self.inner.ctx.dns.lock().unwrap_or_else(|e| e.into_inner()).insert(key, None);
+    }
+
+    /// OAuth endpoints of the test authorization server: (authorization, token, device authorization).
+    pub fn oauth_endpoints(&self) -> (String, String, String) {
+        let base = self.web_url();
+        (format!("{base}/oauth/authorize"), format!("{base}/oauth/token"), format!("{base}/oauth/device"))
+    }
+
+    /// The user at the verification page approves the device code `user_code` for `user`. Errors when no
+    /// sign-in is waiting for that code.
+    pub fn oauth_approve(&self, user_code: &str, user: &str) -> Result<()> {
+        let mut store = self.shared.lock();
+        if store.user(user).is_none() {
+            return Err(Error::UnknownUser(user.to_owned()));
+        }
+        if store.oauth.decide(user_code, Some(user)) {
+            Ok(())
+        } else {
+            Err(Error::Invalid(format!("no sign-in waits for code {user_code}")))
+        }
+    }
+
+    /// The user denies the device code `user_code`.
+    pub fn oauth_deny(&self, user_code: &str) -> bool {
+        self.shared.lock().oauth.decide(user_code, None)
+    }
+
+    /// Device codes waiting for the user.
+    pub fn oauth_pending_codes(&self) -> Vec<String> {
+        self.shared.lock().oauth.pending_user_codes()
+    }
+
+    /// Expires every issued access token (refresh tokens keep working).
+    pub fn oauth_expire_access_tokens(&self) {
+        self.shared.lock().oauth.expire_access_tokens();
+    }
+
+    /// Grant types redeemed at the token endpoint so far, oldest first.
+    pub fn oauth_grants(&self) -> Vec<String> {
+        self.shared.lock().oauth.grants.clone()
     }
 
     /// A rustls client configuration (ring provider) that trusts only this server's certificate.

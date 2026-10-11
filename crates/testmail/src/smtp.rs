@@ -155,7 +155,7 @@ impl Session<'_> {
             lines.push("STARTTLS".to_owned());
         }
         if self.auth_allowed() {
-            lines.push("AUTH PLAIN LOGIN".to_owned());
+            lines.push("AUTH PLAIN LOGIN XOAUTH2 OAUTHBEARER".to_owned());
         }
         let n = lines.len();
         let mut out = String::new();
@@ -235,6 +235,28 @@ impl Session<'_> {
                     return self.reply("501 5.5.2 Invalid base64");
                 };
                 (String::from_utf8_lossy(&u).into_owned(), String::from_utf8_lossy(&p).into_owned())
+            }
+            "XOAUTH2" | "OAUTHBEARER" => {
+                let resp = match initial {
+                    Some(r) => r,
+                    None => match self.sasl_line("")? {
+                        Some(r) => r,
+                        None => return self.reply("501 5.7.0 Authentication cancelled"),
+                    },
+                };
+                let found =
+                    decode(&resp).and_then(|d| crate::oauth::sasl_bearer(&mech, &d)).and_then(|(u, t)| {
+                        let owner = self.ctx.shared.lock().oauth.user_of(&t)?;
+                        owner.eq_ignore_ascii_case(&u).then_some(owner)
+                    });
+                if let Some(addr) = found {
+                    self.auth = Some(addr);
+                    return self.reply("235 2.7.0 Authentication successful");
+                }
+                // RFC 7628 section 3.2.2: an error challenge, the client's dummy answer, then the failure.
+                let err = b64.encode(br#"{"status":"invalid_token","schemes":"bearer","scope":"mail"}"#);
+                let _ = self.sasl_line(&err)?;
+                return self.reply("535 5.7.8 Authentication credentials invalid");
             }
             _ => return self.reply("504 5.5.4 Unrecognized authentication type"),
         };

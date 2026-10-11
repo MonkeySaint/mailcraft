@@ -6,11 +6,15 @@
 //! straight into the command params (the engine keeps them in its secret store) and are dropped with the
 //! dialog state; nothing here prints or stores them.
 //!
-//! The wizard guesses `imap.<domain>` (or `pop.<domain>`) / `smtp.<domain>` with the standard ports (no provider
-//! tables, no network lookups) and always shows the settings page so they can be checked. Its More Settings
-//! section holds the per-account options (POP3 server copies, download mode, Send/Receive group membership and
-//! interval, push), and Sign in with OAuth 2.0 runs `accounts.oauthSignIn` with a client id the user registered
-//! (MailCraft ships none; see `crates/net/data/README.md`). **Test Account Settings**
+//! Connect first looks the address up with `accounts.discover` (the provider's autoconfig document over
+//! HTTPS, then DNS SRV records, RFC 6186; it runs in the background while the page says so, and Skip stops
+//! waiting). Only when that finds nothing does the wizard guess `imap.<domain>` (or `pop.<domain>`) /
+//! `smtp.<domain>` with the standard ports. Either way the settings page is shown so they can be checked;
+//! servers found outside the address's domain are pointed out. Its More Settings section holds the
+//! per-account options (POP3 server copies, download mode, how far back the first download goes, headers only
+//! on slow connections, Send/Receive group membership and interval, push), and Sign in with OAuth 2.0 runs
+//! `accounts.oauthSignIn` with a client id the user registered (MailCraft ships none; see
+//! `crates/net/data/README.md`). **Test Account Settings**
 //! needs an account to test: in the Add wizard the first test adds the account, later tests update it, and
 //! Cancel removes it again.
 
@@ -327,6 +331,24 @@ const DOWNLOAD: [(&str, &str); 3] = [
     ("Download headers only", "headers"),
 ];
 
+/// "Download mail from the past" choices: label, months (`None` = all mail).
+const PAST: [(&str, Option<u32>); 7] = [
+    ("1 month", Some(1)),
+    ("3 months", Some(3)),
+    ("6 months", Some(6)),
+    ("12 months", Some(12)),
+    ("24 months", Some(24)),
+    ("5 years", Some(60)),
+    ("All", None),
+];
+
+fn past_index(months: Option<u32>) -> usize {
+    PAST.iter().position(|(_, m)| *m == months).unwrap_or(match months {
+        None => PAST.len().saturating_sub(1),
+        Some(_) => 3,
+    })
+}
+
 fn download_index(m: DownloadMode) -> usize {
     match m {
         DownloadMode::Full => 0,
@@ -347,6 +369,9 @@ struct Extra {
     interval: u32,
     push: bool,
     download: usize,
+    /// Index into [`PAST`].
+    past: usize,
+    slow_headers_only: bool,
     oauth_open: bool,
     providers: Vec<(String, String, bool)>,
     provider: usize,
@@ -375,6 +400,8 @@ impl Extra {
             interval: o.interval_minutes.unwrap_or(30),
             push: o.push,
             download: download_index(o.download),
+            past: past_index(o.download_months),
+            slow_headers_only: o.slow_headers_only,
             oauth_open: false,
             providers: Vec::new(),
             provider: 0,
@@ -420,6 +447,14 @@ struct Wizard {
     in_port_set: bool,
     out_port_set: bool,
     guessed: bool,
+    /// `accounts.discover` is running for the address.
+    discovering: bool,
+    /// What `accounts.discover` found (`None` before a lookup or when it found nothing).
+    discovered: Option<Value>,
+    /// Where the shown settings came from, for the settings page ("your provider's configuration", "DNS").
+    found_in: String,
+    /// Servers found outside the address's domain (to be confirmed).
+    unverified: Vec<String>,
     error: String,
 }
 
@@ -451,7 +486,101 @@ impl Wizard {
         self.in_port_set = false;
         self.out_port_set = false;
         self.in_user = self.address.trim().to_owned();
+        self.out_separate = false;
+        self.out_user.clear();
         self.guessed = true;
+        self.found_in.clear();
+        self.unverified.clear();
+        if let Some(d) = self.discovered.clone() {
+            self.apply_discovered(&d);
+        }
+    }
+
+    /// Fills in what `accounts.discover` found for the chosen account type (over the guesses).
+    fn apply_discovered(&mut self, d: &Value) {
+        let incoming = if self.jmap {
+            "jmap"
+        } else if self.pop3 {
+            "pop3"
+        } else {
+            "imap"
+        };
+        let Some(inc) = d.get(incoming).filter(|v| v.is_object()) else { return };
+        let address = self.address.trim().to_owned();
+        let user = |v: &Value| {
+            v.get("username").and_then(Value::as_str).filter(|u| !u.is_empty()).unwrap_or(&address).to_owned()
+        };
+        let sec = |v: &Value| {
+            let name = v.get("security").and_then(Value::as_str).unwrap_or("tls");
+            SECURITY.iter().position(|(_, n)| *n == name).unwrap_or(0)
+        };
+        let port = |v: &Value| v.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+        let mut unverified = Vec::new();
+        let mut note = |v: &Value, host: &str| {
+            if v.get("verified").and_then(Value::as_bool) == Some(false) {
+                unverified.push(host.to_owned());
+            }
+        };
+        if self.jmap {
+            let Some(url) = inc.get("url").and_then(Value::as_str) else { return };
+            self.in_host = url.to_owned();
+            note(inc, url);
+        } else {
+            let Some(host) = inc.get("host").and_then(Value::as_str) else { return };
+            self.in_host = host.to_owned();
+            self.in_sec = sec(inc);
+            self.in_port = port(inc).unwrap_or_else(|| self.in_default_port(self.in_sec));
+            self.in_user = user(inc);
+            note(inc, host);
+            if let Some(out) = d.get("smtp").filter(|v| v.is_object())
+                && let Some(host) = out.get("host").and_then(Value::as_str)
+            {
+                self.out_host = host.to_owned();
+                self.out_sec = sec(out);
+                self.out_port = port(out).unwrap_or_else(|| default_port(true, self.out_sec));
+                let out_user = user(out);
+                if out_user != self.in_user {
+                    self.out_separate = true;
+                    self.out_user = out_user;
+                }
+                note(out, host);
+            }
+            if inc.get("oauthOnly").and_then(Value::as_bool) == Some(true) {
+                self.extra.oauth_open = true;
+            }
+        }
+        self.unverified = unverified;
+        self.guessed = false;
+        let sources: Vec<&str> = d
+            .get("sources")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        self.found_in = if sources.first() == Some(&"autoconfig") {
+            "These settings come from your email provider's configuration.".into()
+        } else {
+            "These settings come from your domain's DNS records.".into()
+        };
+    }
+
+    /// The account type to start with when the lookup found something: IMAP, else POP, else JMAP.
+    fn kind_from_discovery(&mut self) {
+        let has = |k: &str| self.discovered.as_ref().is_some_and(|d| d.get(k).is_some_and(Value::is_object));
+        self.jmap = false;
+        self.pop3 = false;
+        if !has("imap") {
+            if has("pop3") {
+                self.pop3 = true;
+            } else if has("jmap") {
+                self.jmap = true;
+            }
+        }
+    }
+
+    /// Takes a finished `accounts.discover` answer (nothing found counts as no discovery).
+    fn take_discovery(&mut self, v: Value) {
+        self.discovering = false;
+        self.discovered = v.get("found").and_then(Value::as_bool).unwrap_or(false).then_some(v);
     }
 
     /// Standard incoming port: IMAP 993/143, POP3 995/110.
@@ -530,6 +659,11 @@ impl Wizard {
     fn option_params(&self, o: &mut serde_json::Map<String, Value>) {
         let e = &self.extra;
         o.insert("mode".into(), json!(DOWNLOAD.get(e.download).map_or("full", |d| d.1)));
+        o.insert("slowHeadersOnly".into(), json!(e.slow_headers_only));
+        if !self.pop3 {
+            let months = PAST.get(e.past).and_then(|p| p.1);
+            o.insert("downloadMonths".into(), months.map_or(Value::Null, |m| json!(m)));
+        }
         o.insert("include".into(), json!(e.include));
         o.insert("intervalMinutes".into(), if e.interval_own { json!(e.interval) } else { Value::Null });
         if self.pop3 {
@@ -539,7 +673,7 @@ impl Wizard {
                 if e.remove_days_on { json!(e.remove_days.max(1)) } else { Value::Null },
             );
             o.insert("removeWhenDeleted".into(), json!(e.remove_when_deleted));
-        } else if !self.jmap {
+        } else {
             o.insert("push".into(), json!(e.push));
         }
     }
@@ -662,6 +796,9 @@ fn wizard(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 
 fn page_email(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
     heading(ui, app, "Add an email account");
+    if st.discovering {
+        return page_looking_up(ui, app, st);
+    }
     let mut enter = false;
     egui::Grid::new("mc-wiz-email").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
         let r = grid_edit(ui, "Email address:", &mut st.address, "name@example.com", false);
@@ -672,7 +809,8 @@ fn page_email(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
     muted(
         ui,
         app,
-        "MailCraft suggests server settings from your address; you can check and change them on the next page.",
+        "MailCraft looks up your provider's server settings (or suggests some from your address); you can check \
+         and change them on the next page.",
     );
     if !st.error.is_empty() {
         ui.colored_label(app.theme.danger, &st.error);
@@ -684,14 +822,63 @@ fn page_email(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
         }
         if primary(ui, app, ok, "Connect") || (ok && enter) {
             st.error.clear();
-            if st.manual {
-                st.page = PAGE_TYPE;
-            } else {
-                st.jmap = false;
-                st.pop3 = false;
-                st.guess();
-                st.page = PAGE_SETTINGS;
+            st.discovered = None;
+            match try_run(app, "accounts.discover", json!({"address": st.address.trim(), "refresh": true})) {
+                Ok(v) if v.get("status").and_then(Value::as_str) == Some("running") => st.discovering = true,
+                Ok(v) => {
+                    st.take_discovery(v);
+                    after_lookup(st);
+                }
+                Err(e) => {
+                    // A lookup that cannot even start must not block setting up the account.
+                    log::info!("server settings lookup: {e}");
+                    after_lookup(st);
+                }
             }
+        }
+        Out::Keep
+    })
+}
+
+/// The lookup is done (or skipped): the account type page, or the settings page.
+fn after_lookup(st: &mut Wizard) {
+    st.discovering = false;
+    if st.manual {
+        st.page = PAGE_TYPE;
+    } else {
+        st.kind_from_discovery();
+        st.guess();
+        st.page = PAGE_SETTINGS;
+    }
+}
+
+/// While `accounts.discover` runs: polls it each frame; Skip goes on without it.
+fn page_looking_up(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
+    match try_run(app, "accounts.discover", json!({"address": st.address.trim()})) {
+        Ok(v) if v.get("status").and_then(Value::as_str) == Some("running") => {}
+        Ok(v) => {
+            st.take_discovery(v);
+            after_lookup(st);
+            return Out::Keep;
+        }
+        Err(_) => {
+            after_lookup(st);
+            return Out::Keep;
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(format!("Looking up the server settings for {}…", st.domain()));
+    });
+    muted(ui, app, "MailCraft asks your provider's configuration page and your domain's DNS records.");
+    ctx_repaint(ui);
+    footer(ui, |ui| {
+        if btn(ui, "Cancel") {
+            return Out::Close;
+        }
+        if btn(ui, "Skip") {
+            st.discovered = None;
+            after_lookup(st);
         }
         Out::Keep
     })
@@ -756,8 +943,22 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
             st.page = PAGE_EMAIL;
         }
     });
-    if st.guessed && st.change.is_none() {
-        muted(ui, app, "These settings were guessed from your address. Check them with your email provider.");
+    if st.change.is_none() {
+        if !st.found_in.is_empty() {
+            muted(ui, app, &format!("{} Check them before you connect.", st.found_in));
+        } else if st.guessed {
+            muted(
+                ui,
+                app,
+                "These settings were guessed from your address. Check them with your email provider.",
+            );
+        }
+        for host in &st.unverified {
+            ui.colored_label(
+                app.theme.danger,
+                format!("{host} is not part of {}: use it only if your provider told you to.", st.domain()),
+            );
+        }
     }
     egui::ScrollArea::vertical().id_salt(("mc-wiz-settings", uid)).max_height(420.0).show(ui, |ui| {
         if st.change.is_some() {
@@ -881,6 +1082,16 @@ fn more_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
             let r = ui.scope(|ui| common::combo_idx(ui, ("mc-wiz-dl", uid), &mut e.download, &names, 260.0));
             let _ = r.response.labelled_by(l.id);
         });
+        ui.checkbox(&mut e.slow_headers_only, "On slow connections download only headers");
+        if !st.pop3 {
+            ui.horizontal(|ui| {
+                let l = ui.label("Download mail from the past:");
+                let names: Vec<&str> = PAST.iter().map(|d| d.0).collect();
+                let r =
+                    ui.scope(|ui| common::combo_idx(ui, ("mc-wiz-past", uid), &mut e.past, &names, 120.0));
+                let _ = r.response.labelled_by(l.id);
+            });
+        }
         ui.checkbox(
             &mut e.include,
             "Include this account in Send/Receive All Folders (F9) and scheduled send/receive",
@@ -890,8 +1101,8 @@ fn more_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
             ui.add_enabled(e.interval_own, egui::DragValue::new(&mut e.interval).range(1..=1440));
             ui.label("minutes");
         });
-        if !st.pop3 && !st.jmap {
-            ui.checkbox(&mut e.push, "Show new mail as soon as it arrives (push with IMAP IDLE)");
+        if !st.pop3 {
+            ui.checkbox(&mut e.push, "Show new mail as soon as it arrives (push)");
         }
         let _ = app;
     });

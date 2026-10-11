@@ -1,0 +1,121 @@
+//! A small web server for discovery and sign-in tests (HTTP and HTTPS on 127.0.0.1):
+//!
+//! - autoconfig documents set with [`crate::TestServers::set_autoconfig`], at
+//!   `/autoconfig/<domain>/mail/config-v1.1.xml` (standing in for `https://autoconfig.<domain>/…`) and
+//!   `/<domain>/.well-known/autoconfig/mail/config-v1.1.xml`;
+//! - the OAuth 2.0 authorization server of [`crate::oauth`]: `POST /oauth/device` (device authorization),
+//!   `POST /oauth/token`, `GET /oauth/authorize` (answers with a redirect at once) and `GET /oauth/verify`.
+//!
+//! Every request path is logged ([`crate::TestServers::web_requests`]). One request per connection.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::sync::{Arc, Mutex};
+
+use serde_json::Value;
+
+use crate::conn::Conn;
+use crate::jmap::{Request, read_request, respond};
+use crate::server::Ctx;
+
+/// Documents and the request log.
+#[derive(Debug, Default)]
+pub struct WebState {
+    /// Documents by (domain, served at the `autoconfig.<domain>` location too).
+    pub autoconfig: BTreeMap<String, (String, bool)>,
+    pub requests: Vec<String>,
+}
+
+pub type SharedWeb = Arc<Mutex<WebState>>;
+
+/// Most requests kept in the log.
+const MAX_LOG: usize = 1000;
+
+pub fn serve(mut conn: Conn, ctx: &Ctx) {
+    if let Ok(Some(req)) = read_request(&mut conn, 64 * 1024) {
+        let _ = handle(&mut conn, ctx, &req);
+    }
+    conn.close();
+}
+
+fn json(conn: &mut Conn, status: u16, v: &Value) -> io::Result<()> {
+    let line = match status {
+        200 => "200 OK",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        _ => "500 Internal Server Error",
+    };
+    let body = v.to_string();
+    let out = format!(
+        "HTTP/1.1 {line}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    conn.write_all(out.as_bytes())
+}
+
+fn handle(conn: &mut Conn, ctx: &Ctx, req: &Request) -> io::Result<()> {
+    {
+        let mut w = ctx.web.lock().unwrap_or_else(|e| e.into_inner());
+        if w.requests.len() < MAX_LOG {
+            w.requests.push(format!("{} {}", req.method, req.path));
+        }
+    }
+    let (path, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
+    let scheme = if conn.is_tls() { "https" } else { "http" };
+    let base = format!("{scheme}://{}", req.header("host").unwrap_or("127.0.0.1"));
+    match (req.method.as_str(), path) {
+        ("POST", "/oauth/device") => {
+            let form = crate::oauth::parse_form(&String::from_utf8_lossy(&req.body));
+            let (st, v) = ctx.shared.lock().oauth.device_authorization(&form, &base);
+            json(conn, st, &v)
+        }
+        ("POST", "/oauth/token") => {
+            let form = crate::oauth::parse_form(&String::from_utf8_lossy(&req.body));
+            let (st, v) = ctx.shared.lock().oauth.token_endpoint(&form);
+            json(conn, st, &v)
+        }
+        ("GET", "/oauth/authorize") => {
+            let q = crate::oauth::parse_form(query);
+            let res = {
+                let mut store = ctx.shared.lock();
+                let users: Vec<String> =
+                    q.get("login_hint").filter(|u| store.user(u).is_some()).cloned().into_iter().collect();
+                store.oauth.authorize(&q, |u| users.iter().any(|x| x == u))
+            };
+            match res {
+                Ok(loc) => conn.write_all(
+                    format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                ),
+                Err(e) => respond(conn, "400 Bad Request", "text/plain", e.as_bytes()),
+            }
+        }
+        ("GET", "/oauth/verify") => respond(
+            conn,
+            "200 OK",
+            "text/plain",
+            b"Test sign-in page: tests approve codes through TestServers.",
+        ),
+        ("GET", p) => {
+            let sub = p.strip_prefix("/autoconfig/").and_then(|r| r.strip_suffix("/mail/config-v1.1.xml"));
+            let well_known = p
+                .strip_prefix('/')
+                .and_then(|r| r.strip_suffix("/.well-known/autoconfig/mail/config-v1.1.xml"));
+            let doc = {
+                let w = ctx.web.lock().unwrap_or_else(|e| e.into_inner());
+                match (sub, well_known) {
+                    (Some(d), _) => w.autoconfig.get(&d.to_ascii_lowercase()).filter(|(_, both)| *both),
+                    (None, Some(d)) => w.autoconfig.get(&d.to_ascii_lowercase()),
+                    (None, None) => None,
+                }
+                .map(|(x, _)| x.clone())
+            };
+            match doc {
+                Some(xml) => respond(conn, "200 OK", "application/xml", xml.as_bytes()),
+                None => respond(conn, "404 Not Found", "text/plain", b"not found"),
+            }
+        }
+        _ => respond(conn, "404 Not Found", "text/plain", b"not found"),
+    }
+}
