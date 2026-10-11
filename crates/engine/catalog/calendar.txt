@@ -1,5 +1,5 @@
-Calendar|Home › New|New Appointment|mail.newItem
-Calendar|Home › New|New Meeting|mail.newItem
+Calendar|Home › New|New Appointment|calendar.newAppointment
+Calendar|Home › New|New Meeting|calendar.newMeeting
 Calendar|Home › New|Add Focus Time|-|Viva Insights focus-time service (cloud-only)
 Calendar|Home › New|New Items|mail.newItem
 Calendar|Home › Go To|Today|calendar.today
@@ -22,19 +22,19 @@ Calendar|Home › Find|Address Book...|compose.addressBook
 Calendar|Home > New Items|E-mail Message|mail.newEmail
 Calendar|Home > New Items|Storyline Post|-|Viva Engage storyline (cloud-only)
 Calendar|Home > New Items|Desk|-|Microsoft Places desk booking (cloud-only)
-Calendar|Home > New Items|Appointment|mail.newItem
-Calendar|Home > New Items|Meeting|mail.newItem
+Calendar|Home > New Items|Appointment|calendar.newAppointment
+Calendar|Home > New Items|Meeting|calendar.newMeeting
 Calendar|Home > New Items|Group|-|Microsoft 365 Groups (cloud-only)
-Calendar|Home > New Items|Contact|mail.newItem
-Calendar|Home > New Items|Task|mail.newItem
-Calendar|Home > New Items|All Day Event|mail.newItem
+Calendar|Home > New Items|Contact|people.new
+Calendar|Home > New Items|Task|tasks.new
+Calendar|Home > New Items|All Day Event|calendar.newAppointment
 Calendar|Home > New Items|Meeting with All|mail.replyWithMeeting
 Calendar|Home > New Items|More Items|mail.newItem
-Calendar|Home > New Items > More Items|Recurring Appointment|mail.newItem
-Calendar|Home > New Items > More Items|Recurring Meeting|mail.newItem
-Calendar|Home > New Items > More Items|Recurring Event|mail.newItem
-Calendar|Home > New Items > More Items|Contact Group|mail.newItem
-Calendar|Home > New Items > More Items|Task Request|mail.newItem
+Calendar|Home > New Items > More Items|Recurring Appointment|calendar.newAppointment
+Calendar|Home > New Items > More Items|Recurring Meeting|calendar.newMeeting
+Calendar|Home > New Items > More Items|Recurring Event|calendar.newAppointment
+Calendar|Home > New Items > More Items|Contact Group|people.newGroup
+Calendar|Home > New Items > More Items|Task Request|tasks.assign
 Calendar|Home > New Items > More Items|Internet Fax|-|requires a third-party internet fax service provider
 Calendar|Home > New Items > More Items|Choose Form...|mail.newItem
 Calendar|Home > New Items > More Items|Outlook Data File...|file.newDataFile

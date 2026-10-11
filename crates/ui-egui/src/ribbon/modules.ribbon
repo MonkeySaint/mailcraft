@@ -7,8 +7,8 @@ mode classic
 
 tab Home | H
 group New | ZW
-button L | New Appointment | appointment | mail.newItem | {"kind":"appointment"} | N1
-button L | New Meeting | meeting | mail.newItem | {"kind":"meeting"} | MR
+button L | New Appointment | appointment | calendar.newAppointment | | N1
+button L | New Meeting | meeting | calendar.newMeeting | | MR
 drop L | New Items | new-items | | | I | menu=calendarNewItems
 group Go To | ZG | launch=calendar.goToDate
 button L | Today | today | calendar.today | | OD
@@ -19,6 +19,8 @@ toggle L | Work Week | work-week | calendar.arrange | {"mode":"workWeek"} | K | 
 toggle L | Week | week | calendar.arrange | {"mode":"week"} | W | on=cal:week
 toggle L | Month | month | calendar.arrange | {"mode":"month"} | T | on=cal:month
 toggle L | Schedule View | schedule | calendar.arrange | {"mode":"schedule"} | SV | on=cal:schedule
+group Work Location | Z1 | c1180=collapse
+button L | Work Hours and Location Settings | work-week | options.open | {"page":"calendar"} | CS
 group Manage Calendars | ZC | c900=collapse
 drop L | Add Calendar | plus | | | OC | menu=addCalendar
 drop L | Share Calendar | calendar | | | SC | menu=shareCalendar
@@ -221,19 +223,20 @@ button L | Close All Items | close | app.closeAllItems | | CA
 
 menu calendarNewItems
 item | E-mail Message | mail | mail.newEmail | | M
-item | Appointment | appointment | mail.newItem | {"kind":"appointment"} | A
-item | Meeting | meeting | mail.newItem | {"kind":"meeting"} | E
-item | Contact | person | mail.newItem | {"kind":"contact"} | C
-item | Task | task | mail.newItem | {"kind":"task"} | T
-item | All Day Event | appointment | mail.newItem | {"kind":"appointment"} | V
+item | Appointment | appointment | calendar.newAppointment | | A
+item | Meeting | meeting | calendar.newMeeting | | E
+item | Contact | person | people.new | | C
+item | Task | task | tasks.new | | T
+item | All Day Event | appointment | calendar.newAppointment | {"form":true,"allDay":true} | V
 sep
 sub | More Items | new-items | calendarMoreItems | | I
 
 menu calendarMoreItems
-item | Recurring Appointment | recurrence | mail.newItem | {"kind":"appointment"} | A
-item | Recurring Meeting | recurrence | mail.newItem | {"kind":"meeting"} | C
-item | Contact Group | contact-group | mail.newItem | {"kind":"contactGroup"} | G
-item | Task Request | task | mail.newItem | {"kind":"taskRequest"} | Q
+item | Recurring Appointment | recurrence | calendar.newAppointment | {"form":true,"recurring":true} | A
+item | Recurring Meeting | recurrence | calendar.newMeeting | {"form":true,"recurring":true} | C
+item | Recurring Event | recurrence | calendar.newAppointment | {"form":true,"allDay":true,"recurring":true} | V
+item | Contact Group | contact-group | people.newGroup | | G
+item | Task Request | task | tasks.assign | | Q
 item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
 item | Outlook Data File... | | file.newDataFile | | F
 

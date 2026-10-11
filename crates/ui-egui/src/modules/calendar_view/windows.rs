@@ -1,10 +1,12 @@
 //! Windows the calendar draws itself: Change Time Zone (named zones, a second zone), Add Calendar › From
-//! Internet, From File and Create New Blank Calendar, and the calendar's View Settings; plus the internet
-//! calendar refresh workers and the strip that shows a subscription's state.
+//! Internet, From File and Create New Blank Calendar, the calendar's View Settings, Share Calendar (calendar,
+//! date range, detail), and Change View › Manage Views, Save Current View As a New View and Apply Current
+//! View to Other Calendar Folders (the calendar's own views, not the mail ones); plus the internet calendar
+//! refresh workers and the strip that shows a subscription's state.
 //!
 //! Requests arrive as entries in `app.ui.dialogs` named `calendar:*` (and the generic `timeZone` /
-//! `addCalendar` requests while the calendar is showing); [`take_requests`] takes them out before the
-//! dialogs area draws. Internet calendars are fetched on worker threads ([`Fetches`]); the results go back
+//! `addCalendar` requests, and new appointment / meeting windows, while the calendar is showing);
+//! [`take_requests`] takes them out before the dialogs area draws. Internet calendars are fetched on worker threads ([`Fetches`]); the results go back
 //! to the engine through `calendar.refreshCalendar`.
 
 use std::collections::BTreeSet;
@@ -15,15 +17,21 @@ use serde_json::{Value, json};
 
 use mailcraft_engine::cmd::calendar::subscribe::{self, Due, Fetched};
 use mailcraft_engine::cmd::calendar::{
-    CalendarColumn, DailyTaskList, Subscription, TIME_SCALES, props, tz, views,
+    CalendarColumn, CalendarCurrentView, DailyTaskList, Subscription, TIME_SCALES, props, tz, views,
 };
 use mailcraft_model::{FolderId, ReadingPanePos};
 
-use super::super::common::{DAY, ModState, clock, local_secs, short_date};
-use super::{CalUi, run_view_cmd};
+use mailcraft_engine::cmd::calendar::pim::{self, Kind};
+use mailcraft_model::FolderKind;
+
+use super::super::common::{
+    DAY, ModState, clock, current_folder, day_string, local_secs, parse_day, short_date, today,
+};
+use super::{CalUi, forms, run_view_cmd};
 use crate::App;
 
 pub(super) const TZ_DIALOG: &str = "calendar:timeZone";
+pub(super) const SHARE_DIALOG: &str = "calendar:share";
 pub(super) const INTERNET_DIALOG: &str = "calendar:internet";
 pub(super) const BLANK_DIALOG: &str = "calendar:blank";
 pub(super) const FILE_DIALOG: &str = "calendar:file";
@@ -38,6 +46,56 @@ pub(super) struct Windows {
     settings: Option<SettingsForm>,
     /// View Settings was asked for (the form is filled from the view when drawn).
     settings_requested: bool,
+    share: Option<ShareForm>,
+    manage: Option<ManageForm>,
+    save_view: Option<NameForm>,
+    apply_view: Option<ApplyForm>,
+}
+
+/// Share Calendar: which calendar, which days, how much detail.
+#[derive(Clone, Default)]
+struct ShareForm {
+    folder: u64,
+    /// `today`, `tomorrow`, `next7`, `next30`, `all` or `custom`.
+    range: String,
+    from: String,
+    to: String,
+    /// `availability`, `limited` or `full`.
+    detail: String,
+    include_private: bool,
+    error: String,
+}
+
+/// Date ranges Share Calendar offers (engine id, label).
+const SHARE_RANGES: [(&str, &str); 6] = [
+    ("today", "Today"),
+    ("tomorrow", "Tomorrow"),
+    ("next7", "Next 7 days"),
+    ("next30", "Next 30 days"),
+    ("all", "Whole calendar"),
+    ("custom", "Custom dates"),
+];
+
+/// Detail levels Share Calendar offers (engine id, label, what it shares).
+const SHARE_DETAILS: [(&str, &str, &str); 3] = [
+    ("availability", "Availability only", "Free and busy times only, without subjects."),
+    ("limited", "Limited details", "Times and subjects."),
+    ("full", "Full details", "Times, subjects, locations, notes and attendees."),
+];
+
+/// Manage Views: the selected view and the name typed for Copy / Rename.
+#[derive(Clone, Default)]
+struct ManageForm {
+    selected: String,
+    new_name: String,
+    error: String,
+}
+
+/// Apply Current View to Other Calendar Folders: the calendars ticked.
+#[derive(Clone, Default)]
+struct ApplyForm {
+    folders: BTreeSet<u64>,
+    error: String,
 }
 
 #[derive(Clone, Default)]
@@ -86,10 +144,11 @@ pub(crate) fn is_request(name: &str, p: &Value) -> bool {
         || name == "timeZone"
         || (name == "addCalendar"
             && matches!(p.get("source").and_then(Value::as_str), Some("internet" | "blank" | "file")))
+        || forms::is_form(name, p)
 }
 
 /// Takes the calendar's window requests out of `app.ui.dialogs` and opens the windows.
-pub(super) fn take_requests(app: &mut App, cu: &mut CalUi) {
+pub(super) fn take_requests(app: &mut App, st: &mut ModState, cu: &mut CalUi) {
     let mut taken: Vec<(String, Value)> = Vec::new();
     app.ui.dialogs.retain(|(name, p)| {
         let ours = is_request(name, p);
@@ -99,7 +158,11 @@ pub(super) fn take_requests(app: &mut App, cu: &mut CalUi) {
         !ours
     });
     for (name, p) in taken {
-        open(app, cu, &name, &p);
+        if forms::is_form(&name, &p) {
+            forms::open(app, st, &name, &p);
+        } else {
+            open(app, cu, &name, &p);
+        }
     }
 }
 
@@ -133,6 +196,27 @@ fn open(app: &mut App, cu: &mut CalUi, name: &str, p: &Value) {
             }
         }
         (views::VIEW_SETTINGS_DIALOG, _) => cu.windows.settings_requested = true,
+        (SHARE_DIALOG, _) => {
+            let folder = p
+                .get("folder")
+                .and_then(Value::as_u64)
+                .map(FolderId)
+                .or_else(|| current_folder(app, Kind::Appointment))
+                .or_else(|| pim::default_folder(&app.s, Kind::Appointment))
+                .map_or(0, |f| f.0);
+            let day = day_string(today(app));
+            cu.windows.share = Some(ShareForm {
+                folder,
+                range: "next7".into(),
+                from: day.clone(),
+                to: day,
+                detail: "availability".into(),
+                ..Default::default()
+            });
+        }
+        (views::MANAGE_VIEWS_DIALOG, _) => cu.windows.manage = Some(ManageForm::default()),
+        (views::SAVE_VIEW_DIALOG, _) => cu.windows.save_view = Some(NameForm::default()),
+        (views::APPLY_VIEW_DIALOG, _) => cu.windows.apply_view = Some(ApplyForm::default()),
         _ => {}
     }
 }
@@ -512,6 +596,279 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
         if open && keep {
             cu.windows.settings = Some(f);
         }
+    }
+    share_window(ctx, app, cu);
+    manage_window(ctx, app, st, cu);
+    save_view_window(ctx, app, st, cu);
+    apply_view_window(ctx, app, st, cu);
+}
+
+/// Calendar folders (id, name), the default calendar first.
+fn calendars(app: &App) -> Vec<(u64, String)> {
+    let mut v: Vec<(bool, String, u64)> = app
+        .s
+        .mailbox
+        .folders
+        .values()
+        .filter(|f| f.kind == FolderKind::Calendar)
+        .map(|f| (f.role.is_none(), f.name.clone(), f.id.0))
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, n, id)| (id, n)).collect()
+}
+
+/// Share Calendar: the calendar, a date range and a detail level; OK writes the message with the calendar
+/// as an iCalendar attachment (`calendar.share`).
+fn share_window(ctx: &egui::Context, app: &mut App, cu: &mut CalUi) {
+    let Some(mut f) = cu.windows.share.take() else { return };
+    let center = ctx.content_rect().center();
+    let mut open = true;
+    let mut keep = true;
+    window("Share Calendar", "mc-cal-share-window").default_pos(center).open(&mut open).show(ctx, |ui| {
+        crate::dialogs::form_visuals(ui, &app.theme);
+        let cals = calendars(app);
+        egui::Grid::new("mc-cal-share-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("Calendar:");
+            let name =
+                cals.iter().find(|(id, _)| *id == f.folder).map(|(_, n)| n.clone()).unwrap_or_default();
+            ComboBox::from_id_salt("mc-cal-share-cal").selected_text(name).width(240.0).show_ui(ui, |ui| {
+                for (id, n) in &cals {
+                    ui.selectable_value(&mut f.folder, *id, n);
+                }
+            });
+            ui.end_row();
+            ui.label("Date Range:");
+            let label = SHARE_RANGES.iter().find(|(k, _)| *k == f.range).map_or("", |(_, l)| *l);
+            ComboBox::from_id_salt("mc-cal-share-range").selected_text(label).width(240.0).show_ui(
+                ui,
+                |ui| {
+                    for (k, l) in SHARE_RANGES {
+                        ui.selectable_value(&mut f.range, k.to_owned(), l);
+                    }
+                },
+            );
+            ui.end_row();
+            if f.range == "custom" {
+                ui.label("Start:");
+                ui.add(TextEdit::singleline(&mut f.from).hint_text("YYYY-MM-DD").desired_width(120.0));
+                ui.end_row();
+                ui.label("End:");
+                ui.add(TextEdit::singleline(&mut f.to).hint_text("YYYY-MM-DD").desired_width(120.0));
+                ui.end_row();
+            }
+            ui.label("Detail:");
+            let label = SHARE_DETAILS.iter().find(|(k, _, _)| *k == f.detail).map_or("", |(_, l, _)| *l);
+            ComboBox::from_id_salt("mc-cal-share-detail").selected_text(label).width(240.0).show_ui(
+                ui,
+                |ui| {
+                    for (k, l, _) in SHARE_DETAILS {
+                        ui.selectable_value(&mut f.detail, k.to_owned(), l);
+                    }
+                },
+            );
+            ui.end_row();
+            ui.label("");
+            let hint = SHARE_DETAILS.iter().find(|(k, _, _)| *k == f.detail).map_or("", |(_, _, h)| *h);
+            ui.label(RichText::new(hint).color(app.theme.text_muted));
+            ui.end_row();
+            ui.label("");
+            ui.add_enabled(
+                f.detail != "availability",
+                egui::Checkbox::new(&mut f.include_private, "Share private items in detail too"),
+            );
+            ui.end_row();
+        });
+        error_line(ui, app, &f.error);
+        ui.add_space(6.0);
+        let (ok, cancel) = ok_cancel(ui, "OK");
+        if cancel {
+            keep = false;
+        }
+        if ok {
+            let mut p = json!({
+                "folder": f.folder,
+                "range": f.range,
+                "detail": f.detail,
+                "includePrivate": f.include_private && f.detail != "availability",
+            });
+            if f.range == "custom" {
+                if parse_day(&f.from).is_none() || parse_day(&f.to).is_none() {
+                    f.error = "Enter the start and end dates as YYYY-MM-DD.".into();
+                    return;
+                }
+                put(&mut p, "from", json!(f.from.trim()));
+                put(&mut p, "to", json!(f.to.trim()));
+            }
+            if app.run("calendar.share", p).is_some() {
+                keep = false;
+            } else {
+                f.error = take_error(app);
+            }
+        }
+    });
+    if open && keep {
+        cu.windows.share = Some(f);
+    }
+}
+
+/// Change View › Manage Views: the standard calendar views and those saved by name; Apply View, Copy,
+/// Rename, Delete (saved views) and Reset (standard views).
+fn manage_window(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &mut CalUi) {
+    let Some(mut f) = cu.windows.manage.take() else { return };
+    let center = ctx.content_rect().center();
+    let mut open = true;
+    let mut keep = true;
+    let names = views::view_names(&app.s);
+    if !names.iter().any(|n| n == &f.selected) {
+        f.selected = st.cal.current.label().to_owned();
+    }
+    let standard = CalendarCurrentView::parse(&f.selected).is_some();
+    window("Manage Views", "mc-cal-manage-window").default_pos(center).open(&mut open).show(ctx, |ui| {
+        crate::dialogs::form_visuals(ui, &app.theme);
+        ui.label("Calendar views:");
+        egui::ScrollArea::vertical().id_salt("mc-cal-manage-list").max_height(180.0).show(ui, |ui| {
+            for n in &names {
+                let label = if CalendarCurrentView::parse(n).is_some() {
+                    format!("{n}  (standard)")
+                } else {
+                    n.clone()
+                };
+                if ui.selectable_label(&f.selected == n, label).clicked() {
+                    f.selected = n.clone();
+                    f.error.clear();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("New name (Copy, Rename):");
+            ui.add(TextEdit::singleline(&mut f.new_name).desired_width(180.0));
+        });
+        error_line(ui, app, &f.error);
+        ui.add_space(4.0);
+        let mut action: Option<&str> = None;
+        ui.horizontal(|ui| {
+            if ui.button("Apply View").clicked() {
+                action = Some("apply");
+            }
+            if ui.button("Copy...").clicked() {
+                action = Some("copy");
+            }
+            if ui.add_enabled(!standard, egui::Button::new("Rename...")).clicked() {
+                action = Some("rename");
+            }
+            if ui.add_enabled(!standard, egui::Button::new("Delete")).clicked() {
+                action = Some("delete");
+            }
+            if ui.add_enabled(standard, egui::Button::new("Reset")).clicked() {
+                action = Some("reset");
+            }
+            if ui.button("Close").clicked() {
+                keep = false;
+            }
+        });
+        if let Some(a) = action {
+            if matches!(a, "copy" | "rename") && f.new_name.trim().is_empty() {
+                f.error = "Type a name for the view.".into();
+                return;
+            }
+            let p = json!({ "action": a, "name": f.selected, "newName": f.new_name.trim() });
+            if run_view_cmd(app, st, "view.manageViews", p).is_some() {
+                f.error.clear();
+                if matches!(a, "copy" | "rename") {
+                    f.selected = f.new_name.trim().to_owned();
+                    f.new_name.clear();
+                }
+                if a == "apply" {
+                    keep = false;
+                }
+            } else {
+                f.error = take_error(app);
+            }
+        }
+    });
+    if open && keep {
+        cu.windows.manage = Some(f);
+    }
+}
+
+/// Save Current View As a New View: a name for the current calendar view.
+fn save_view_window(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &mut CalUi) {
+    let Some(mut f) = cu.windows.save_view.take() else { return };
+    let center = ctx.content_rect().center();
+    let mut open = true;
+    let mut keep = true;
+    window("Save View As", "mc-cal-save-view-window").default_pos(center).open(&mut open).show(ctx, |ui| {
+        crate::dialogs::form_visuals(ui, &app.theme);
+        ui.label("View name:");
+        let r = ui.add(TextEdit::singleline(&mut f.name).desired_width(f32::INFINITY));
+        if !r.has_focus() && f.name.is_empty() {
+            r.request_focus();
+        }
+        ui.label(RichText::new("Saved views can be used on every calendar.").color(app.theme.text_muted));
+        error_line(ui, app, &f.error);
+        let (ok, cancel) = ok_cancel(ui, "OK");
+        if cancel {
+            keep = false;
+        }
+        if ok {
+            if f.name.trim().is_empty() {
+                f.error = "Type a name for the view.".into();
+            } else if run_view_cmd(app, st, "view.saveViewAs", json!({ "name": f.name.trim() })).is_some() {
+                keep = false;
+            } else {
+                f.error = take_error(app);
+            }
+        }
+    });
+    if open && keep {
+        cu.windows.save_view = Some(f);
+    }
+}
+
+/// Apply Current View to Other Calendar Folders: the calendars that take the current view.
+fn apply_view_window(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &mut CalUi) {
+    let Some(mut f) = cu.windows.apply_view.take() else { return };
+    let center = ctx.content_rect().center();
+    let mut open = true;
+    let mut keep = true;
+    let current = current_folder(app, Kind::Appointment).map(|x| x.0);
+    let others: Vec<(u64, String)> =
+        calendars(app).into_iter().filter(|(id, _)| Some(*id) != current).collect();
+    window("Apply View", "mc-cal-apply-view-window").default_pos(center).open(&mut open).show(ctx, |ui| {
+        crate::dialogs::form_visuals(ui, &app.theme);
+        ui.label("Show these calendars with the current view:");
+        if others.is_empty() {
+            ui.label(RichText::new("There are no other calendars.").color(app.theme.text_muted));
+        }
+        for (id, name) in &others {
+            let mut on = f.folders.contains(id);
+            if ui.checkbox(&mut on, name).changed() {
+                if on {
+                    f.folders.insert(*id);
+                } else {
+                    f.folders.remove(id);
+                }
+            }
+        }
+        error_line(ui, app, &f.error);
+        let (ok, cancel) = ok_cancel(ui, "OK");
+        if cancel {
+            keep = false;
+        }
+        if ok {
+            let ids: Vec<u64> =
+                f.folders.iter().copied().filter(|id| others.iter().any(|(o, _)| o == id)).collect();
+            if ids.is_empty() {
+                f.error = "Tick at least one calendar.".into();
+            } else if run_view_cmd(app, st, "view.applyViewTo", json!({ "folders": ids })).is_some() {
+                keep = false;
+            } else {
+                f.error = take_error(app);
+            }
+        }
+    });
+    if open && keep {
+        cu.windows.apply_view = Some(f);
     }
 }
 

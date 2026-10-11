@@ -6,9 +6,29 @@
 //! properties persist and undo with the mailbox. A plain `internet:<url>` (written by earlier builds) reads as
 //! an internet subscription. Moving the table to a `Mailbox` field later only needs [`read`] and [`write`]
 //! changed.
+//!
+//! The same JSON object also carries the calendar views the user saved by name (View › Change View › Save
+//! Current View As a New View, [`named_views`]) under [`NAMED_VIEWS`]; [`write`] keeps them.
 
-use mailcraft_model::calendar::{CalendarProps, CalendarSource, Subscription};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use mailcraft_model::calendar::{CalendarProps, CalendarSource, CalendarViewState, Subscription};
 use mailcraft_model::{FolderId, FolderKind, Mailbox};
+
+/// Key of the saved named views inside the stored JSON.
+pub const NAMED_VIEWS: &str = "namedViews";
+/// Most named views kept per calendar.
+pub const MAX_NAMED_VIEWS: usize = 50;
+/// Longest view name (characters).
+pub const MAX_VIEW_NAME: usize = 64;
+
+/// A calendar view saved by name (its date left out).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedView {
+    pub name: String,
+    pub view: CalendarViewState,
+}
 
 /// Marks a `remote_name` holding calendar properties.
 pub const PREFIX: &str = "mailcraft-calendar:";
@@ -60,13 +80,72 @@ pub fn read(mb: &Mailbox, folder: FolderId) -> CalendarProps {
     }
 }
 
-/// Stores `props` on calendar folder `folder`. Returns true when the folder changed.
+/// The stored JSON object of `remote` (`None` when it holds no calendar properties).
+fn stored_object(remote: Option<&str>) -> Option<serde_json::Map<String, Value>> {
+    let json = remote?.strip_prefix(PREFIX)?;
+    if json.len() > MAX_BYTES {
+        return None;
+    }
+    match serde_json::from_str::<Value>(json).ok()? {
+        Value::Object(o) => Some(o),
+        _ => None,
+    }
+}
+
+/// Encodes `props` with the named views `extra` (`None` when there is nothing to keep).
+fn encode_with(props: &CalendarProps, named: Option<Value>) -> Option<String> {
+    let named = named.filter(|v| v.as_array().is_some_and(|a| !a.is_empty()));
+    let Some(named) = named else { return encode(props) };
+    let mut obj = match serde_json::to_value(props).ok()? {
+        Value::Object(o) => o,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert(NAMED_VIEWS.into(), named);
+    serde_json::to_string(&obj).ok().map(|j| format!("{PREFIX}{j}"))
+}
+
+/// Stores `props` on calendar folder `folder` (keeping its named views). Returns true when the folder
+/// changed.
 pub fn write(mb: &mut Mailbox, folder: FolderId, props: &CalendarProps) -> bool {
     let Some(f) = mb.folders.get_mut(&folder) else { return false };
     if f.kind != FolderKind::Calendar {
         return false;
     }
-    let new = encode(props);
+    let named = stored_object(f.remote_name.as_deref()).and_then(|mut o| o.remove(NAMED_VIEWS));
+    let new = encode_with(props, named);
+    if f.remote_name == new {
+        return false;
+    }
+    f.remote_name = new;
+    true
+}
+
+/// The views saved by name on calendar `folder` (damaged entries skipped).
+pub fn named_views(mb: &Mailbox, folder: FolderId) -> Vec<NamedView> {
+    let Some(f) = mb.folder(folder).filter(|f| f.kind == FolderKind::Calendar) else { return Vec::new() };
+    let Some(Value::Array(list)) =
+        stored_object(f.remote_name.as_deref()).and_then(|mut o| o.remove(NAMED_VIEWS))
+    else {
+        return Vec::new();
+    };
+    list.into_iter()
+        .filter_map(|v| serde_json::from_value::<NamedView>(v).ok())
+        .filter(|v| !v.name.trim().is_empty())
+        .take(MAX_NAMED_VIEWS)
+        .collect()
+}
+
+/// Replaces the named views of calendar `folder` (at most [`MAX_NAMED_VIEWS`]). Returns true when the
+/// folder changed.
+pub fn set_named_views(mb: &mut Mailbox, folder: FolderId, views: &[NamedView]) -> bool {
+    let props = read(mb, folder);
+    let Some(f) = mb.folders.get_mut(&folder) else { return false };
+    if f.kind != FolderKind::Calendar {
+        return false;
+    }
+    let list: Vec<Value> =
+        views.iter().take(MAX_NAMED_VIEWS).filter_map(|v| serde_json::to_value(v).ok()).collect();
+    let new = encode_with(&props, Some(Value::Array(list)));
     if f.remote_name == new {
         return false;
     }
@@ -136,6 +215,29 @@ mod tests {
         assert_eq!(decode(Some("INBOX")), CalendarProps::default());
         let huge = format!("{PREFIX}{}", "x".repeat(MAX_BYTES + 1));
         assert_eq!(decode(Some(&huge)), CalendarProps::default());
+    }
+
+    #[test]
+    fn named_views_survive_property_writes() {
+        let mut mb = Mailbox::new_local("T");
+        let acc = mb.default_account().unwrap().id;
+        let cal = mb.role_folder(acc, mailcraft_model::FolderRole::Calendar).unwrap();
+        assert!(named_views(&mb, cal).is_empty());
+        let v = NamedView { name: "Weekly".into(), view: CalendarViewState::default() };
+        assert!(set_named_views(&mut mb, cal, std::slice::from_ref(&v)));
+        assert!(update(&mut mb, cal, |p| p.color = Some("Teal".into())));
+        assert_eq!(named_views(&mb, cal), vec![v]);
+        assert_eq!(read(&mb, cal).color.as_deref(), Some("Teal"));
+        // Clearing the views and the colour leaves nothing stored.
+        assert!(set_named_views(&mut mb, cal, &[]));
+        assert!(update(&mut mb, cal, |p| p.color = None));
+        assert_eq!(mb.folder(cal).unwrap().remote_name, None);
+        // Damaged entries are skipped; a mail folder never takes views.
+        let inbox = mb.role_folder(acc, mailcraft_model::FolderRole::Inbox).unwrap();
+        assert!(!set_named_views(&mut mb, inbox, &[]));
+        mb.folders.get_mut(&cal).unwrap().remote_name =
+            Some(format!("{PREFIX}{{\"namedViews\":[1,{{\"name\":\"\"}},null]}}"));
+        assert!(named_views(&mb, cal).is_empty());
     }
 
     #[test]

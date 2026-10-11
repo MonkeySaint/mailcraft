@@ -654,14 +654,21 @@ mod tests {
     }
 
     #[test]
-    fn new_meeting_step_is_one_undo_step() {
+    fn new_meeting_step_opens_the_meeting_form() {
         let (mut s, _, _) = session();
         s.run("quicksteps.new", &json!({"name": "Meet", "actions": ["NewMeeting"]})).unwrap();
         let undo_before = s.undo.undo.len();
+        let appointments_before = s.mailbox.appointments.len();
         let r = s.run("quicksteps.run", &json!({"id": "Meet"})).unwrap();
         assert_eq!(r["errors"], json!([]), "{r}");
-        assert_eq!(s.mailbox.appointments.len(), 1);
-        assert_eq!(s.undo.undo.len(), undo_before + 1);
+        // New Meeting opens the meeting form; nothing is saved (and nothing to undo) until it is sent.
+        assert!(
+            s.notices.iter().any(|n| matches!(n, crate::Notice::OpenDialog(_, p) if p["meeting"] == true)),
+            "{:?}",
+            s.notices
+        );
+        assert_eq!(s.mailbox.appointments.len(), appointments_before);
+        assert_eq!(s.undo.undo.len(), undo_before);
     }
 
     #[test]

@@ -15,8 +15,19 @@
 //! exception). Day and week views show the second time zone (Change Time Zone) in a second ruler.
 //!
 //! Windows the calendar draws itself (Change Time Zone, Add Calendar From Internet / From File / Create New
-//! Blank Calendar, View Settings) and the internet calendar refresh workers live in [`windows`].
+//! Blank Calendar, View Settings, Share Calendar, Manage Views, Save View As, Apply View) and the internet
+//! calendar refresh workers live in [`windows`]; new appointment and meeting windows asked for by commands
+//! (prefilled, nothing saved until Save or Send) open through [`forms`].
+//!
+//! File › Options › Calendar applies here: the first day of the week (week, work week and month grids, the
+//! Date Navigator), week numbers (month view and Date Navigator, by the "first week of year" rule), working
+//! hours and days (shading, Work Week, Schedule View), the default duration and reminder of new items, the
+//! bell icon on items with reminders, free items in Schedule View, the default calendar colour, the
+//! time-zone label over the ruler and the automatic switch between the vertical layout and Schedule View.
+//! Meeting requests are answered automatically when Auto Accept/Decline asks for it (`calendar.autoRespond`,
+//! checked while the calendar shows).
 
+mod forms;
 mod table;
 #[cfg(test)]
 mod ui_tests;
@@ -43,7 +54,7 @@ use super::common::{
     DAY, ModState, a11y, add_months, blend, category_color, child, clock, current_folder, day_of, day_string,
     empty_message, folder_rows, group_header, hour_label, load, long_date, month_name, now_minute,
     paint_text_clipped, pane_bg, parse_day, select_folder, shift_month, split_folder_pane, store, today, tz,
-    week_start, weekday, weekday_name, ymd,
+    weekday, weekday_name, ymd,
 };
 use super::editors;
 use crate::App;
@@ -72,6 +83,10 @@ const MAX_SIDE_BY_SIDE: usize = 6;
 const EDGE: f32 = 5.0;
 /// Seconds between checks for internet calendars due a refresh (a new subscription is fetched soon after).
 const POLL_SECS: f64 = 5.0;
+/// Seconds between automatic accept / decline passes over new meeting requests.
+const AUTO_RESPOND_SECS: f64 = 30.0;
+/// Width of the week-number column (month view, Date Navigator).
+const WEEK_NO_W: f32 = 24.0;
 
 const VIEW_COMMANDS: [&str; 8] = [
     "calendar.today",
@@ -101,6 +116,9 @@ struct CalUi {
     fetches: windows::Fetches,
     /// `ctx.input().time` of the last check for internet calendars due a refresh.
     last_poll: Option<f64>,
+    /// `ctx.input().time` of the last automatic accept / decline pass, and the messages it looked at.
+    last_auto: Option<f64>,
+    auto_seen: BTreeSet<u64>,
 }
 
 fn ui_id() -> Id {
@@ -151,6 +169,13 @@ struct Look {
     primary_off: i32,
     primary_label: String,
     preview: bool,
+    /// First day of the week, 0 = Sunday.
+    first_day: u8,
+    /// Week numbers in the month view and Date Navigator, and the "first week of year" rule.
+    week_numbers: bool,
+    week_rule: String,
+    /// Schedule View shows free items.
+    schedule_free: bool,
 }
 
 impl Look {
@@ -174,6 +199,10 @@ impl Look {
             primary_off,
             primary_label: views::primary_zone_label(&app.s),
             preview: st.cal.current == CalendarCurrentView::Preview,
+            first_day: views::first_day_of_week(&app.s),
+            week_numbers: app.s.settings.bool("calendar.weekNumbers"),
+            week_rule: views::first_week_rule(&app.s),
+            schedule_free: app.s.settings.bool("calendar.scheduleShowFree"),
         }
     }
 }
@@ -232,6 +261,7 @@ fn own_window(id: &str, p: &Value) -> Option<&'static str> {
         {
             Some(windows::TZ_DIALOG)
         }
+        "calendar.share" if !["range", "detail"].iter().any(|k| has(k)) => Some(windows::SHARE_DIALOG),
         "calendar.addCalendar" => match p.get("source").and_then(Value::as_str) {
             Some("internet") if !has("url") => Some(windows::INTERNET_DIALOG),
             Some("blank") if !has("name") => Some(windows::BLANK_DIALOG),
@@ -274,6 +304,8 @@ pub(super) fn run_view_cmd(app: &mut App, st: &mut ModState, id: &str, params: V
     } else {
         app.run(id, params)?
     };
+    // A new appointment or meeting window asked for (prefilled; nothing is saved before Save or Send).
+    forms::take_notices(app, st);
     if let Some(v) = out.get("view").and_then(|v| serde_json::from_value::<CalendarViewState>(v.clone()).ok())
     {
         st.cal = v;
@@ -316,42 +348,73 @@ fn ordered(app: &App, cals: &BTreeSet<FolderId>) -> Vec<FolderId> {
     v.into_iter().map(|(_, _, f)| f).collect()
 }
 
-/// The colour calendar `folder` is drawn in.
+/// "#rrggbb" → colour.
+fn hex_color(text: &str) -> Option<Color32> {
+    let h = text.trim().strip_prefix('#')?;
+    if h.len() != 6 || !h.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| h.get(i..i + 2).and_then(|x| u8::from_str_radix(x, 16).ok());
+    Some(Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?))
+}
+
+/// The colour calendar `folder` is drawn in: its View › Color, else File › Options › Calendar › Default
+/// calendar color (on every calendar with "Use this color on all calendars"), else its automatic colour.
 pub(super) fn calendar_color32(app: &App, folder: FolderId) -> Color32 {
+    let default = hex_color(&app.s.settings.text("calendar.defaultColor"));
+    if let Some(c) = default.filter(|_| app.s.settings.bool("calendar.useColorOnAll")) {
+        return c;
+    }
+    if let Some(c) = default
+        && props::read(&app.s.mailbox, folder).color.is_none()
+    {
+        return c;
+    }
     let (_, [r, g, b]) = engine_cal::calendar_color(&app.s.mailbox, folder);
     Color32::from_rgb(r, g, b)
 }
 
-/// Days shown by the current view (Month: the whole 5–6 week grid). `work` = working days, 0 = Sunday.
-fn visible_days(st: &ModState, sel: i64, work: &[u8]) -> Vec<i64> {
+/// The first day of the week containing `day`, weeks starting on `first` (0 = Sunday).
+fn week_start(day: i64, first: u8) -> i64 {
+    views::week_start_on(day, first)
+}
+
+/// Days shown by the current view (Month: the whole 5–6 week grid). `work` = working days, 0 = Sunday;
+/// weeks start on `first`.
+fn visible_days(st: &ModState, sel: i64, work: &[u8], first: u8) -> Vec<i64> {
+    let ws = week_start(sel, first);
     match st.cal.mode {
         CalendarMode::Day => (0..i64::from(st.cal.days.clamp(1, 14))).map(|i| sel + i).collect(),
         CalendarMode::WorkWeek => {
-            let days: Vec<i64> =
-                work.iter().filter(|d| **d < 7).map(|d| week_start(sel) + i64::from(*d)).collect();
-            if days.is_empty() { (1..=5).map(|i| week_start(sel) + i).collect() } else { days }
+            // The working days in week order (from the first day of the week).
+            let days: Vec<i64> = (0..7).map(|i| ws + i).filter(|d| work.contains(&weekday(*d))).collect();
+            if days.is_empty() {
+                (0..7).map(|i| ws + i).filter(|d| (1..=5).contains(&weekday(*d))).collect()
+            } else {
+                days
+            }
         }
-        CalendarMode::Week => (0..7).map(|i| week_start(sel) + i).collect(),
+        CalendarMode::Week => (0..7).map(|i| ws + i).collect(),
         CalendarMode::Month => {
-            let (start, weeks) = month_grid(sel);
+            let (start, weeks) = month_grid(sel, first);
             (0..weeks * 7).map(|i| start + i).collect()
         }
         CalendarMode::Schedule => vec![sel],
     }
 }
 
-/// First cell and number of weeks of the month grid containing `day`.
-fn month_grid(day: i64) -> (i64, i64) {
+/// First cell and number of weeks of the month grid containing `day` (weeks starting on `first`).
+fn month_grid(day: i64, first_day: u8) -> (i64, i64) {
     let (y, m, _) = ymd(day);
     let first = day_of(y, m, 1).unwrap_or(day);
-    let start = week_start(first);
+    let start = week_start(first, first_day);
     let dim = i64::from(dates::days_in_month(y, m));
     let weeks = ((first - start) + dim + 6) / 7;
     (start, weeks.max(4))
 }
 
 /// Folder-bar title for the view.
-fn title(st: &ModState, sel: i64, work: &[u8]) -> String {
+fn title(st: &ModState, sel: i64, work: &[u8], first: u8) -> String {
     let span = |a: i64, b: i64| {
         let (ya, ma, da) = ymd(a);
         let (yb, mb, db) = ymd(b);
@@ -371,7 +434,7 @@ fn title(st: &ModState, sel: i64, work: &[u8]) -> String {
         CalendarMode::Day if st.cal.days <= 1 => long_date(sel),
         CalendarMode::Schedule => long_date(sel),
         _ => {
-            let days = visible_days(st, sel, work);
+            let days = visible_days(st, sel, work, first);
             match (days.first(), days.last()) {
                 (Some(a), Some(b)) => span(*a, *b),
                 _ => long_date(sel),
@@ -414,6 +477,8 @@ pub(super) struct Occ {
     pub private: bool,
     pub recurring: bool,
     pub meeting: bool,
+    /// Has a reminder (the bell icon, when File › Options › Calendar shows it).
+    pub reminder: bool,
     /// In a read-only (internet) calendar.
     pub read_only: bool,
 }
@@ -508,6 +573,7 @@ pub(super) fn gather(app: &App, calendars: &BTreeSet<FolderId>, from: i64, to: i
                 private: a.private,
                 recurring: a.recurrence.is_some(),
                 meeting: a.is_meeting,
+                reminder: a.reminder_min.is_some(),
                 read_only,
             });
         }
@@ -615,7 +681,10 @@ fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool, prev
         return;
     }
     let mut x = inner.min.x;
-    for (on, icon) in [(o.recurring, "recurrence"), (o.private, "private"), (o.meeting, "people")] {
+    let bell = o.reminder && app.s.settings.bool("calendar.bellIcon");
+    for (on, icon) in
+        [(o.recurring, "recurrence"), (o.private, "private"), (o.meeting, "people"), (bell, "bell")]
+    {
         if on && inner.width() > 60.0 {
             let r = Rect::from_min_size(pos2(x, inner.min.y + 1.0), Vec2::splat(12.0));
             app.icons.paint(ui, r, icon, app.theme.text_muted);
@@ -676,13 +745,17 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
     adopt_saved(app, &mut st, &mut cu);
     // Dialog requests from commands (the calendar's own windows among them) before the dialogs area draws.
     crate::dialogs::take_notices(app);
-    windows::take_requests(app, &mut cu);
+    windows::take_requests(app, &mut st, &mut cu);
     windows::poll_fetches(&ctx, app, &mut cu);
     let now = ctx.input(|i| i.time);
     if cu.last_poll.is_none_or(|t| now - t >= POLL_SECS || now < t) {
         cu.last_poll = Some(now);
         windows::refresh_due(&ctx, app, &mut cu);
         views::refresh_time_zone(&mut app.s);
+    }
+    if cu.last_auto.is_none_or(|t| now - t >= AUTO_RESPOND_SECS || now < t) {
+        cu.last_auto = Some(now);
+        auto_respond(app, &mut cu);
     }
     let look = Look::of(app, &st);
     let full = ui.max_rect();
@@ -705,6 +778,29 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
     ui.expand_to_include_rect(full);
     store(&ctx, st);
     store_ui(&ctx, cu);
+}
+
+/// File › Options › Calendar › Automatic accept or decline: answers new meeting requests (each message is
+/// looked at once per session; `calendar.autoRespond` skips those already answered).
+fn auto_respond(app: &mut App, cu: &mut CalUi) {
+    let ids: Vec<u64> = engine_cal::auto_respond_candidates(&app.s)
+        .into_iter()
+        .map(|i| i.0)
+        .filter(|i| !cu.auto_seen.contains(i))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    if cu.auto_seen.len() > 10_000 {
+        cu.auto_seen.clear();
+    }
+    cu.auto_seen.extend(ids.iter().copied());
+    if let Some(out) = app.run("calendar.autoRespond", json!({ "ids": ids }))
+        && let Some(n) = out.get("handled").and_then(Value::as_array).map(Vec::len).filter(|n| *n > 0)
+    {
+        let s = if n == 1 { "" } else { "s" };
+        app.ui.toast = Some((format!("Answered {n} meeting request{s} automatically."), 0.0));
+    }
 }
 
 fn keyboard(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
@@ -752,7 +848,9 @@ fn folder_pane(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look) {
                 if !set.remove(&f.0) {
                     set.insert(f.0);
                 }
+                let count = set.len();
                 st.cal_shown = set;
+                auto_layout(app, st, shown.len(), count);
             }
             if let Some(f) = clicked {
                 let mut set = shown;
@@ -777,10 +875,38 @@ fn folder_pane(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look) {
     });
 }
 
-/// Date navigator month.
+/// File › Options › Calendar › Display options: checking calendars until `calendar.autoScheduleViewAt` show
+/// switches a vertical layout (day, work week, week) to Schedule View; unchecking them down to
+/// `calendar.autoVerticalLayoutAt` switches Schedule View back to Day.
+fn auto_layout(app: &mut App, st: &mut ModState, before: usize, after: usize) {
+    let set = &app.s.settings;
+    let at_most = |key: &str| usize::try_from(set.int(key)).unwrap_or(usize::MAX);
+    let vertical = matches!(st.cal.mode, CalendarMode::Day | CalendarMode::WorkWeek | CalendarMode::Week);
+    let to = if after > before
+        && vertical
+        && set.bool("calendar.autoScheduleView")
+        && after >= at_most("calendar.autoScheduleViewAt")
+    {
+        Some(CalendarMode::Schedule)
+    } else if after < before
+        && st.cal.mode == CalendarMode::Schedule
+        && set.bool("calendar.autoVerticalLayout")
+        && after <= at_most("calendar.autoVerticalLayoutAt")
+    {
+        Some(CalendarMode::Day)
+    } else {
+        None
+    };
+    if let Some(mode) = to {
+        run_view_cmd(app, st, "calendar.arrange", json!({ "mode": mode.name() }));
+    }
+}
+
+/// Date navigator month (weeks from the first day of the week; week numbers on the left when shown).
 fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64, m: u8, arrows: bool) {
     let w = ui.available_width().min(240.0);
-    let cell = (w / 7.0).floor();
+    let num_w = if look.week_numbers { WEEK_NO_W.min(w / 8.0) } else { 0.0 };
+    let cell = ((w - num_w) / 7.0).floor();
     let (head, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
     let text = format!("{} {y}", month_name(m));
     ui.painter().text(
@@ -808,8 +934,8 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64
     }
     let (row, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
     for c in 0..7 {
-        let x = row.min.x + cell * (c as f32) + cell / 2.0;
-        let name = WEEK_INITIALS.get(c).copied().unwrap_or("");
+        let x = row.min.x + num_w + cell * (c as f32) + cell / 2.0;
+        let name = WEEK_INITIALS.get((c + usize::from(look.first_day)) % 7).copied().unwrap_or("");
         ui.painter().text(
             pos2(x, row.center().y),
             Align2::CENTER_CENTER,
@@ -819,14 +945,14 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64
         );
     }
     let first = day_of(y, m, 1).unwrap_or_else(|| today(app));
-    let start = week_start(first);
+    let start = week_start(first, look.first_day);
     let dim = i64::from(dates::days_in_month(y, m));
     let weeks = ((first - start) + dim + 6) / 7;
     let sel = selected_day(app, st);
     let visible: BTreeSet<i64> = if st.cal.mode == CalendarMode::Month {
         [sel].into_iter().collect()
     } else {
-        visible_days(st, sel, &look.work_days).into_iter().collect()
+        visible_days(st, sel, &look.work_days, look.first_day).into_iter().collect()
     };
     let busy: BTreeSet<i64> = gather(app, &shown_calendars(app, st), start, start + weeks * 7)
         .iter()
@@ -835,11 +961,23 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64
     let now = today(app);
     let (grid, _) = ui.allocate_exact_size(vec2(w, cell.min(24.0) * weeks as f32), Sense::hover());
     let ch = cell.min(24.0);
+    if look.week_numbers {
+        for r in 0..weeks {
+            let n = views::week_number(start + r * 7, look.first_day, &look.week_rule);
+            ui.painter().text(
+                pos2(grid.min.x + num_w / 2.0, grid.min.y + ch * r as f32 + ch / 2.0),
+                Align2::CENTER_CENTER,
+                n.to_string(),
+                FontId::proportional(10.0),
+                app.theme.text_muted,
+            );
+        }
+    }
     for i in 0..weeks * 7 {
         let d = start + i;
         let (r, c) = (i / 7, i % 7);
         let rect = Rect::from_min_size(
-            pos2(grid.min.x + cell * c as f32, grid.min.y + ch * r as f32),
+            pos2(grid.min.x + num_w + cell * c as f32, grid.min.y + ch * r as f32),
             vec2(cell, ch),
         );
         let resp = ui.interact(rect, Id::new(("mc-nav-day", y, m, d)), Sense::click());
@@ -920,7 +1058,7 @@ fn content(ui: &mut Ui, app: &mut App, st: &mut ModState, cu: &mut CalUi, look: 
         child(ui, view, "mc-cal-table", |ui| table::table_view(ui, app, st, &cals, view));
     } else {
         match st.cal.mode {
-            CalendarMode::Schedule => schedule_view(ui, app, st, view),
+            CalendarMode::Schedule => schedule_view(ui, app, st, look, view),
             mode => panes(ui, app, st, cu, look, view, &cals, mode == CalendarMode::Month),
         }
     }
@@ -975,7 +1113,7 @@ fn panes(
             continue;
         }
         if month {
-            month_view(ui, app, st, &pane, body);
+            month_view(ui, app, st, look, &pane, body);
         } else {
             time_grid_view(ui, app, st, cu, look, &pane, body);
         }
@@ -1038,7 +1176,7 @@ fn folder_bar(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look) {
         let text = if st.cal.current.is_table() {
             st.cal.current.label().to_owned()
         } else {
-            title(st, sel, &look.work_days)
+            title(st, sel, &look.work_days, look.first_day)
         };
         ui.label(RichText::new(text).size(19.0).color(app.theme.text));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1163,20 +1301,38 @@ fn pane_folder(app: &App, pane: &Pane) -> Option<FolderId> {
     writable(app, f)
 }
 
-fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, pane: &Pane, rect: Rect) {
+fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: &Pane, rect: Rect) {
     let sel = selected_day(app, st);
-    let (start, weeks) = month_grid(sel);
+    let (start, weeks) = month_grid(sel, look.first_day);
     let (_, month, _) = ymd(sel);
     let now = today(app);
     let head_h = 26.0;
+    let p = ui.painter().clone();
+    // Week numbers in a column on the left.
+    let rect = if look.week_numbers && rect.width() > 7.0 * 40.0 {
+        let cell_h = ((rect.height() - head_h) / weeks as f32).max(30.0);
+        for r in 0..weeks {
+            let n = views::week_number(start + r * 7, look.first_day, &look.week_rule);
+            p.text(
+                pos2(rect.min.x + WEEK_NO_W / 2.0, rect.min.y + head_h + cell_h * r as f32 + 8.0),
+                Align2::CENTER_TOP,
+                n.to_string(),
+                FontId::proportional(11.0),
+                app.theme.text_muted,
+            );
+        }
+        Rect::from_min_max(pos2(rect.min.x + WEEK_NO_W, rect.min.y), rect.max)
+    } else {
+        rect
+    };
     let cell_w = rect.width() / 7.0;
     let cell_h = ((rect.height() - head_h) / weeks as f32).max(30.0);
-    let p = ui.painter().clone();
     let k = pane.key;
     for c in 0..7 {
         let r = Rect::from_min_size(pos2(rect.min.x + cell_w * c as f32, rect.min.y), vec2(cell_w, head_h));
-        let strong = weekday(now) == c as u8;
-        let name = super::common::WEEKDAYS.get(c).copied().unwrap_or("");
+        let wd = (c + usize::from(look.first_day)) % 7;
+        let strong = usize::from(weekday(now)) == wd;
+        let name = super::common::WEEKDAYS.get(wd).copied().unwrap_or("");
         let name = if cell_w < 70.0 { name.get(..3).unwrap_or(name) } else { name };
         p.text(
             pos2(r.min.x + 8.0, r.center().y),
@@ -1241,7 +1397,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, pane: &Pane, rect: 
         }
         if resp.double_clicked() {
             let folder = pane_folder(app, pane);
-            editors::new_appointment(app, st, folder, d, 0, 0, true);
+            forms::new_at(app, st, folder, d, 0, true);
         }
         // Items
         let line_h = 19.0;
@@ -1492,7 +1648,7 @@ fn time_grid_view(
     rect: Rect,
 ) {
     let sel = selected_day(app, st);
-    let days = visible_days(st, sel, &look.work_days);
+    let days = visible_days(st, sel, &look.work_days, look.first_day);
     let (Some(&first), Some(&last)) = (days.first(), days.last()) else { return };
     let n = days.len() as f32;
     let now = today(app);
@@ -1507,6 +1663,17 @@ fn time_grid_view(
 
     // Day headers (and the zone labels over the rulers).
     let head_h = 44.0;
+    if look.second.is_none() && !look.primary_label.is_empty() {
+        // File › Options › Calendar › Time zones › Label, over the ruler.
+        paint_text_clipped(
+            ui,
+            pos2(rect.min.x + 4.0, rect.min.y + head_h - 16.0),
+            &look.primary_label,
+            FontId::proportional(10.5),
+            app.theme.text_muted,
+            RULER_W - 8.0,
+        );
+    }
     if let Some((label2, _)) = &look.second {
         let primary =
             if look.primary_label.is_empty() { "Local".to_owned() } else { look.primary_label.clone() };
@@ -1582,7 +1749,7 @@ fn time_grid_view(
         p.vline(r.min.x, r.y_range(), line);
         if resp.double_clicked() {
             let folder = pane_folder(app, pane);
-            editors::new_appointment(app, st, folder, d, 0, 0, true);
+            forms::new_at(app, st, folder, d, 0, true);
         }
     }
     for &(i, lane) in &lanes {
@@ -1729,7 +1896,7 @@ fn time_grid_view(
                 app.ui.module_selection = None;
                 if resp.double_clicked() {
                     let folder = pane_folder(app, pane);
-                    editors::new_appointment(app, st, folder, d, minute, slot.max(30), false);
+                    forms::new_at(app, st, folder, d, minute, false);
                 }
             }
             // Appointments.
@@ -1975,7 +2142,7 @@ fn task_strip(
 // Schedule view
 // ---------------------------------------------------------------------------------------------------------
 
-fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
+fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rect: Rect) {
     let sel = selected_day(app, st);
     let label_w = 190.0_f32.min(rect.width() / 3.0);
     let hour_w = 80.0;
@@ -1992,7 +2159,11 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
     }
     let p = ui.painter().clone();
     let line = Stroke::new(1.0, app.theme.separator);
-    let occs = gather(app, &shown, sel, sel + 1);
+    // Free items show only when File › Options › Calendar asks for them.
+    let mut occs = gather(app, &shown, sel, sel + 1);
+    if !look.schedule_free {
+        occs.retain(|o| o.show_as != BusyStatus::Free);
+    }
     // Calendar names.
     let labels = Rect::from_min_size(rect.min, vec2(label_w, rect.height()));
     p.rect_filled(labels, CornerRadius::ZERO, blend(app.theme.reading, app.theme.backdrop, 0.3));
@@ -2034,7 +2205,8 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
             let p = ui.painter().clone();
             for h in 0..24 {
                 let x = area_rect.min.x + hour_w * h as f32;
-                let work = (8..17).contains(&h) && (1..=5).contains(&weekday(sel));
+                let work = (look.work.0..look.work.1).contains(&(h * 60 + 30))
+                    && look.work_days.contains(&weekday(sel));
                 let col = Rect::from_min_size(
                     pos2(x, area_rect.min.y + head_h),
                     vec2(hour_w, row_h * rows.len() as f32),
@@ -2068,7 +2240,7 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
                     app.ui.module_selection = None;
                     if resp.double_clicked() {
                         let f = writable(app, Some(*folder));
-                        editors::new_appointment(app, st, f, sel, minute, 30, false);
+                        forms::new_at(app, st, f, sel, minute, false);
                     }
                 }
             }
@@ -2186,15 +2358,21 @@ mod tests {
         let mut st = ModState::default();
         let sel = day("2026-10-09");
         st.cal.mode = CalendarMode::Month;
-        assert_eq!(title(&st, sel, &MON_FRI), "October 2026");
+        assert_eq!(title(&st, sel, &MON_FRI, 0), "October 2026");
         assert_eq!(day_string(step(&st, sel, 1)), "2026-11-09");
         st.cal.mode = CalendarMode::Week;
-        assert_eq!(title(&st, sel, &MON_FRI), "October 4 – 10, 2026");
+        assert_eq!(title(&st, sel, &MON_FRI, 0), "October 4 – 10, 2026");
+        // First day of week Monday (File › Options › Calendar).
+        assert_eq!(title(&st, sel, &MON_FRI, 1), "October 5 – 11, 2026");
         st.cal.mode = CalendarMode::WorkWeek;
-        assert_eq!(visible_days(&st, sel, &MON_FRI).len(), 5);
+        assert_eq!(visible_days(&st, sel, &MON_FRI, 0).len(), 5);
         st.cal.mode = CalendarMode::Day;
-        assert_eq!(title(&st, sel, &MON_FRI), "Friday, October 9, 2026");
-        assert_eq!(month_grid(sel), (day("2026-09-27"), 5));
+        assert_eq!(title(&st, sel, &MON_FRI, 0), "Friday, October 9, 2026");
+        assert_eq!(month_grid(sel, 0), (day("2026-09-27"), 5));
+        assert_eq!(month_grid(sel, 1), (day("2026-09-28"), 5));
+        // A month starting on the first day of the week starts the grid with it.
+        assert_eq!(month_grid(day("2026-11-15"), 0), (day("2026-11-01"), 5));
+        assert_eq!(month_grid(day("2026-11-15"), 1), (day("2026-10-26"), 6));
     }
 
     #[test]
@@ -2203,12 +2381,26 @@ mod tests {
         st.cal.mode = CalendarMode::WorkWeek;
         let sel = day("2026-10-09");
         // Sunday to Thursday.
-        let days = visible_days(&st, sel, &[0, 1, 2, 3, 4]);
+        let days = visible_days(&st, sel, &[0, 1, 2, 3, 4], 0);
         assert_eq!(days.first().copied(), Some(day("2026-10-04")));
         assert_eq!(days.len(), 5);
-        assert_eq!(title(&st, sel, &[0, 1, 2, 3, 4]), "October 4 – 8, 2026");
+        assert_eq!(title(&st, sel, &[0, 1, 2, 3, 4], 0), "October 4 – 8, 2026");
+        // Weeks from Monday: the working days in that week's order (Sunday comes last).
+        let days = visible_days(&st, sel, &[0, 1, 2, 3, 4], 1);
+        assert_eq!(days.first().copied(), Some(day("2026-10-05")));
+        assert_eq!(days.last().copied(), Some(day("2026-10-11")));
         // Junk days fall back to Monday to Friday.
-        assert_eq!(visible_days(&st, sel, &[9]).len(), 5);
+        assert_eq!(visible_days(&st, sel, &[9], 0).len(), 5);
+        assert_eq!(visible_days(&st, sel, &[9], 3).len(), 5);
+    }
+
+    #[test]
+    fn default_calendar_colors() {
+        assert_eq!(hex_color("#3b78c2"), Some(Color32::from_rgb(0x3b, 0x78, 0xc2)));
+        assert_eq!(hex_color(" #FFFFFF "), Some(Color32::WHITE));
+        for bad in ["", "#", "#12345", "#1234567", "123456", "#ééé", "#gg0000"] {
+            assert_eq!(hex_color(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -2240,6 +2432,8 @@ mod tests {
     #[test]
     fn own_windows_for_commands_without_details() {
         assert_eq!(own_window("calendar.changeTimeZone", &json!({})), Some(windows::TZ_DIALOG));
+        assert_eq!(own_window("calendar.share", &json!({})), Some(windows::SHARE_DIALOG));
+        assert_eq!(own_window("calendar.share", &json!({"range": "today"})), None);
         assert_eq!(own_window("calendar.changeTimeZone", &json!({"zone": "UTC"})), None);
         assert_eq!(
             own_window("calendar.addCalendar", &json!({"source": "internet"})),

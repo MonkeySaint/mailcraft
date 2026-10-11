@@ -271,3 +271,117 @@ fn a_named_calendar_zone_shows_and_drags_times_across_dst() {
     let ed = st.editors.appt.as_ref().unwrap();
     assert_eq!((ed.start_date.as_str(), ed.start_min), ("2026-11-16", 14 * 60));
 }
+
+#[test]
+fn new_meeting_opens_a_prefilled_window_and_saves_nothing() {
+    let a = app();
+    let before = a.s.mailbox.appointments.len();
+    let mut h = harness(a);
+    // Home › New Meeting (the ribbon runs it through the calendar).
+    let mut st = load(&h.ctx);
+    let out = super::run_view_cmd(
+        h.state_mut(),
+        &mut st,
+        "calendar.newMeeting",
+        json!({"subject": "Kickoff", "attendees": ["Ann Lee <ann@example.com>"], "body": "Agenda"}),
+    );
+    store(&h.ctx, st);
+    assert_eq!(out.unwrap()["dialog"], "newMeeting");
+    let ed = load(&h.ctx).editors.appt.unwrap();
+    assert!(ed.meeting && ed.id.is_none());
+    assert_eq!(
+        (ed.subject.as_str(), ed.attendees.as_str(), ed.body.as_str()),
+        ("Kickoff", "Ann Lee <ann@example.com>", "Agenda")
+    );
+    assert!(h.state().s.notices.iter().all(|n| !matches!(n, mailcraft_engine::Notice::OpenDialog(..))));
+    h.run_ok();
+    assert!(has_part(&h, "Kickoff - Meeting"));
+    assert_eq!(h.state().s.mailbox.appointments.len(), before);
+    assert!(h.state().s.composes.is_empty());
+    // A request made elsewhere (People › Meeting, a quick step) opens the same window here.
+    h.state_mut()
+        .run("calendar.newMeeting", json!({"subject": "Elsewhere", "optional": ["bob@example.org"]}));
+    h.run_ok();
+    let ed = load(&h.ctx).editors.appt.unwrap();
+    assert_eq!((ed.subject.as_str(), ed.optional.as_str()), ("Elsewhere", "bob@example.org"));
+    assert!(h.state().ui.dialogs.is_empty(), "the calendar took the request");
+    assert_eq!(h.state().s.mailbox.appointments.len(), before);
+}
+
+#[test]
+fn new_items_presets_and_option_defaults() {
+    let mut a = app();
+    a.s.settings.set("calendar.defaultDuration", &json!(45)).unwrap();
+    a.s.settings.set("calendar.reminderMinutes", &json!(10)).unwrap();
+    let before = a.s.mailbox.appointments.len();
+    let mut h = harness(a);
+    let mut st = load(&h.ctx);
+    // New Items › More Items › Recurring Appointment: the window with the Recurrence dialog over it.
+    super::run_view_cmd(
+        h.state_mut(),
+        &mut st,
+        "calendar.newAppointment",
+        json!({"form": true, "recurring": true}),
+    );
+    let ed = st.editors.appt.clone().unwrap();
+    assert!(ed.recurrence_dlg.is_some() && !ed.meeting && !ed.all_day);
+    assert_eq!(ed.reminder, Some(10));
+    assert_eq!(ed.end_min - ed.start_min, 45);
+    // New Items › All Day Event.
+    super::run_view_cmd(
+        h.state_mut(),
+        &mut st,
+        "calendar.newAppointment",
+        json!({"form": true, "allDay": true}),
+    );
+    let ed = st.editors.appt.clone().unwrap();
+    assert!(ed.all_day && ed.recurrence_dlg.is_none());
+    assert_eq!(ed.start_date, ed.end_date);
+    assert_eq!(ed.reminder, Some(engine_cal::ALL_DAY_REMINDER_MIN));
+    // Double-clicking a slot takes the defaults too.
+    super::forms::new_at(h.state(), &mut st, None, 20_000, 9 * 60, false);
+    let ed = st.editors.appt.clone().unwrap();
+    assert_eq!((ed.start_min, ed.end_min, ed.reminder), (540, 585, Some(10)));
+    h.state_mut().s.settings.set("calendar.defaultReminders", &json!(false)).unwrap();
+    super::forms::new_at(h.state(), &mut st, None, 20_000, 0, true);
+    assert_eq!(st.editors.appt.clone().unwrap().reminder, None);
+    store(&h.ctx, st);
+    h.run_ok();
+    assert_eq!(h.state().s.mailbox.appointments.len(), before, "nothing saved");
+}
+
+#[test]
+fn share_and_view_windows_are_the_calendars_own() {
+    let mut h = harness(app());
+    for (id, title) in [
+        ("calendar.share", "Share Calendar"),
+        ("view.manageViews", "Manage Views"),
+        ("view.saveViewAs", "Save View As"),
+        ("view.applyViewTo", "Apply View"),
+    ] {
+        let mut st = load(&h.ctx);
+        let out = super::run_view_cmd(h.state_mut(), &mut st, id, json!({}));
+        store(&h.ctx, st);
+        assert!(out.is_some(), "{id}");
+        h.run_ok();
+        assert!(has(&h, title), "{id} opens {title}");
+        assert!(h.state().ui.dialogs.is_empty(), "{id}: no generic window");
+    }
+    assert!(has_part(&h, "Free and busy times only"), "the share window's detail note");
+    assert!(has_part(&h, "Calendar  (standard)"));
+}
+
+#[test]
+fn saved_view_from_the_save_window_is_listed() {
+    let mut h = harness(app());
+    let mut st = load(&h.ctx);
+    super::run_view_cmd(h.state_mut(), &mut st, "view.saveViewAs", json!({"name": "Planning"}));
+    store(&h.ctx, st);
+    let names = engine_cal::views::view_names(&h.state().s);
+    assert_eq!(names.last().map(String::as_str), Some("Planning"));
+    let mut st = load(&h.ctx);
+    super::run_view_cmd(h.state_mut(), &mut st, "view.manageViews", json!({}));
+    store(&h.ctx, st);
+    h.run_ok();
+    assert!(has(&h, "Planning"));
+}

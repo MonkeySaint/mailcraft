@@ -19,11 +19,11 @@ use crate::{CmdError, CmdResult, Module, Session};
 use mailcraft_model::calendar::{
     CalendarColumn, CalendarCurrentView, CalendarMode, CalendarTimeZones, CalendarViewState,
 };
-use mailcraft_model::{FolderId, ReadingPanePos};
+use mailcraft_model::{FolderId, FolderKind, ReadingPanePos, dates};
 use mailcraft_store::Op;
 
 /// View commands [`module_view`] answers in the Calendar module.
-pub const MODULE_VIEW_IDS: [&str; 7] = [
+pub const MODULE_VIEW_IDS: [&str; 10] = [
     "view.changeView",
     "view.arrangeBy",
     "view.readingPane",
@@ -31,10 +31,18 @@ pub const MODULE_VIEW_IDS: [&str; 7] = [
     "view.viewSettings",
     "view.resetView",
     "view.tighterSpacing",
+    "view.manageViews",
+    "view.saveViewAs",
+    "view.applyViewTo",
 ];
 
 /// Dialog id of the calendar's View Settings window.
 pub const VIEW_SETTINGS_DIALOG: &str = "calendar:viewSettings";
+/// Dialog ids of the calendar's Manage Views, Save Current View As a New View and Apply Current View to
+/// Other Calendar Folders windows.
+pub const MANAGE_VIEWS_DIALOG: &str = "calendar:manageViews";
+pub const SAVE_VIEW_DIALOG: &str = "calendar:saveView";
+pub const APPLY_VIEW_DIALOG: &str = "calendar:applyView";
 
 /// Runs a View-tab command for the Calendar module. `None` when `id` is not one of [`MODULE_VIEW_IDS`] or the
 /// Calendar module is not showing (the generic mail behaviour applies).
@@ -51,10 +59,103 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
     match id {
         "view.changeView" => {
             let name = opt_str(p, "name").or_else(|| opt_str(p, "view")).unwrap_or("");
-            v.current = CalendarCurrentView::parse(name).ok_or_else(|| {
-                CmdError::Params(format!("`name` must be Calendar, Preview, List or Active, not `{name}`"))
-            })?;
+            v = apply_named(s, &v, name)?;
         }
+        "view.saveViewAs" => {
+            let name = opt_str(p, "name").unwrap_or("").trim().to_owned();
+            if name.is_empty() {
+                s.notify(crate::Notice::OpenDialog(SAVE_VIEW_DIALOG.into(), json!({})));
+                extra.insert("dialog".into(), json!(SAVE_VIEW_DIALOG));
+            } else {
+                store_named(s, &name, &v, None)?;
+                extra.insert("saved".into(), json!(name));
+            }
+        }
+        "view.manageViews" => match opt_str(p, "action") {
+            None => {
+                let names = view_names(s);
+                s.notify(crate::Notice::OpenDialog(MANAGE_VIEWS_DIALOG.into(), json!({ "views": names })));
+                extra.insert("dialog".into(), json!(MANAGE_VIEWS_DIALOG));
+                extra.insert("views".into(), json!(names));
+            }
+            Some(action) => {
+                let name = opt_str(p, "name").unwrap_or("").trim().to_owned();
+                let new_name = opt_str(p, "newName").unwrap_or("").trim().to_owned();
+                match action {
+                    "apply" => v = apply_named(s, &v, &name)?,
+                    "copy" => {
+                        let source = apply_named(s, &v, &name)?;
+                        store_named(s, &new_name, &source, None)?;
+                    }
+                    "rename" => {
+                        let source = apply_named(s, &v, &name)?;
+                        if CalendarCurrentView::parse(&name).is_some() {
+                            return Err(CmdError::Params(format!(
+                                "the standard view `{name}` cannot be renamed"
+                            )));
+                        }
+                        store_named(s, &new_name, &source, Some(&name))?;
+                    }
+                    "delete" => {
+                        if CalendarCurrentView::parse(&name).is_some() {
+                            return Err(CmdError::Params(format!(
+                                "the standard view `{name}` cannot be deleted"
+                            )));
+                        }
+                        let folder = views_folder(s)?;
+                        let mut list = props::named_views(&s.mailbox, folder);
+                        let before = list.len();
+                        list.retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                        if list.len() == before {
+                            return Err(CmdError::Params(format!("no view named `{name}`")));
+                        }
+                        if props::set_named_views(&mut s.mailbox, folder, &list) {
+                            journal_folder(s, folder);
+                        }
+                    }
+                    "reset" => {
+                        let current = CalendarCurrentView::parse(&name).ok_or_else(|| {
+                            CmdError::Params(format!("only standard views can be reset, not `{name}`"))
+                        })?;
+                        let keep = (v.date.clone(), v.days);
+                        v = CalendarViewState { current, ..CalendarViewState::default() };
+                        (v.date, v.days) = keep;
+                    }
+                    a => {
+                        return Err(CmdError::Params(format!(
+                            "`action` must be apply, copy, rename, delete or reset, not `{a}`"
+                        )));
+                    }
+                }
+                extra.insert("views".into(), json!(view_names(s)));
+            }
+        },
+        "view.applyViewTo" => match p.get("folders") {
+            None | Some(Value::Null) => {
+                s.notify(crate::Notice::OpenDialog(APPLY_VIEW_DIALOG.into(), json!({})));
+                extra.insert("dialog".into(), json!(APPLY_VIEW_DIALOG));
+            }
+            Some(list) => {
+                let targets = calendar_targets(s, list)?;
+                let current = pim::current_folder(s, Kind::Appointment);
+                let mut saved = v.clone();
+                saved.date.clear();
+                saved.days = 1;
+                let now_seq = u64::try_from(s.now().unix).unwrap_or(0).saturating_mul(1000);
+                let mut applied = Vec::new();
+                for f in targets.into_iter().filter(|f| Some(*f) != current) {
+                    let view = saved.clone();
+                    if props::update(&mut s.mailbox, f, |p| {
+                        p.view_seq = p.view_seq.saturating_add(1).max(now_seq);
+                        p.view = Some(view);
+                    }) {
+                        journal_folder(s, f);
+                    }
+                    applied.push(f.0);
+                }
+                extra.insert("applied".into(), json!(applied));
+            }
+        },
         "view.arrangeBy" => {
             let key = opt_str(p, "key").unwrap_or("").trim();
             if let Some(mode) = CalendarMode::parse(key)
@@ -131,6 +232,121 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
     let mut out = super::view_result(s, &v)?;
     if let Some(o) = out.as_object_mut() {
         o.extend(extra);
+    }
+    Ok(out)
+}
+
+/// The calendar that keeps the named views (the default calendar).
+fn views_folder(s: &Session) -> Result<FolderId, CmdError> {
+    pim::default_folder(s, Kind::Appointment).ok_or_else(|| CmdError::Failed("there is no calendar".into()))
+}
+
+/// The views Change View offers: the standard ones, then those saved by name.
+pub fn view_names(s: &Session) -> Vec<String> {
+    let mut out: Vec<String> = CalendarCurrentView::ALL.iter().map(|v| v.label().to_owned()).collect();
+    if let Ok(f) = views_folder(s) {
+        out.extend(props::named_views(&s.mailbox, f).into_iter().map(|v| v.name));
+    }
+    out
+}
+
+/// `v` switched to the view named `name`: a standard view (Calendar, Preview, List, Active) or one saved by
+/// name (its settings, keeping the date shown).
+fn apply_named(s: &Session, v: &CalendarViewState, name: &str) -> Result<CalendarViewState, CmdError> {
+    let name = name.trim();
+    if let Some(current) = CalendarCurrentView::parse(name) {
+        return Ok(CalendarViewState { current, ..v.clone() });
+    }
+    let saved = views_folder(s)
+        .ok()
+        .and_then(|f| {
+            props::named_views(&s.mailbox, f).into_iter().find(|x| x.name.eq_ignore_ascii_case(name))
+        })
+        .ok_or_else(|| {
+            CmdError::Params(format!(
+                "`name` must be Calendar, Preview, List, Active or a saved view, not `{name}`"
+            ))
+        })?;
+    let mut out = saved.view;
+    (out.date, out.days) = (v.date.clone(), v.days);
+    Ok(out)
+}
+
+/// Saves `v` as the view `name` (replacing a view of that name, or `replacing` when renaming).
+fn store_named(
+    s: &mut Session,
+    name: &str,
+    v: &CalendarViewState,
+    replacing: Option<&str>,
+) -> Result<(), CmdError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CmdError::Params("enter a name for the view".into()));
+    }
+    if name.chars().count() > props::MAX_VIEW_NAME || name.chars().any(char::is_control) {
+        return Err(CmdError::Params(format!(
+            "a view name is at most {} characters, without control characters",
+            props::MAX_VIEW_NAME
+        )));
+    }
+    if CalendarCurrentView::parse(name).is_some() {
+        return Err(CmdError::Params(format!("`{name}` is the name of a standard view")));
+    }
+    let folder = views_folder(s)?;
+    let mut list = props::named_views(&s.mailbox, folder);
+    if let Some(old) = replacing {
+        let pos = list
+            .iter()
+            .position(|x| x.name.eq_ignore_ascii_case(old))
+            .ok_or_else(|| CmdError::Params(format!("no view named `{old}`")))?;
+        if !old.eq_ignore_ascii_case(name) && list.iter().any(|x| x.name.eq_ignore_ascii_case(name)) {
+            return Err(CmdError::Params(format!("there is already a view named `{name}`")));
+        }
+        if let Some(x) = list.get_mut(pos) {
+            x.name = name.to_owned();
+        }
+    } else {
+        let mut view = v.clone();
+        view.date.clear();
+        view.days = 1;
+        list.retain(|x| !x.name.eq_ignore_ascii_case(name));
+        if list.len() >= props::MAX_NAMED_VIEWS {
+            return Err(CmdError::Params(format!("at most {} views can be saved", props::MAX_NAMED_VIEWS)));
+        }
+        list.push(props::NamedView { name: name.to_owned(), view });
+    }
+    if props::set_named_views(&mut s.mailbox, folder, &list) {
+        journal_folder(s, folder);
+    }
+    Ok(())
+}
+
+/// Calendar folders named by `list` (ids or names; at least one).
+fn calendar_targets(s: &Session, list: &Value) -> Result<Vec<FolderId>, CmdError> {
+    let items: Vec<&Value> = match list {
+        Value::Array(a) => a.iter().take(500).collect(),
+        one => vec![one],
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let f = match item {
+            Value::Number(n) => n.as_u64().map(FolderId),
+            Value::String(name) => s
+                .mailbox
+                .folders
+                .values()
+                .find(|f| f.kind == FolderKind::Calendar && f.name.eq_ignore_ascii_case(name.trim()))
+                .map(|f| f.id),
+            _ => None,
+        }
+        .filter(|f| s.mailbox.folder(*f).is_some_and(|x| x.kind == FolderKind::Calendar))
+        .ok_or_else(|| CmdError::Params(format!("`folders`: {item} is not a calendar")))?;
+        if !out.contains(&f) {
+            out.push(f);
+        }
+    }
+    if out.is_empty() {
+        return Err(CmdError::Params("`folders` must name at least one calendar".into()));
     }
     Ok(out)
 }
@@ -269,28 +485,69 @@ pub fn parse_work_week(v: &Value) -> Option<Vec<u8>> {
     (!days.is_empty()).then_some(days)
 }
 
-/// Working days (0 = Sunday): option `calendar.workWeek`, else Monday to Friday.
+/// Working days (0 = Sunday): File › Options › Calendar › Work week (Monday to Friday out of the box).
 pub fn work_week(s: &mut Session) -> Vec<u8> {
-    option(s, "calendar.workWeek").as_ref().and_then(parse_work_week).unwrap_or_else(|| vec![1, 2, 3, 4, 5])
+    let days: Vec<u8> = s
+        .settings
+        .work_week()
+        .iter()
+        .enumerate()
+        .filter(|(_, on)| **on)
+        .filter_map(|(i, _)| u8::try_from(i).ok())
+        .collect();
+    if days.is_empty() { vec![1, 2, 3, 4, 5] } else { days }
 }
 
-/// "HH:MM" → minutes after midnight.
-fn clock_min(t: &str) -> Option<i64> {
-    let (h, m) = t.trim().split_once(':')?;
-    let (h, m): (i64, i64) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
-    ((0..24).contains(&h) && (0..60).contains(&m)).then_some(h * 60 + m)
-}
-
-/// Working hours as minutes after midnight: option `calendar.workHours` ("08:00-17:00"), else 8:00–17:00.
+/// Working hours as minutes after midnight: File › Options › Calendar › Work hours (8:00–17:00 out of the
+/// box), start before end.
 pub fn work_hours(s: &mut Session) -> (i64, i64) {
-    option(s, "calendar.workHours")
-        .and_then(|v| {
-            let t = v.as_str()?.to_owned();
-            let (a, b) = t.split_once('-')?;
-            let (a, b) = (clock_min(a)?, clock_min(b)?);
-            (a < b).then_some((a, b))
-        })
-        .unwrap_or((8 * 60, 17 * 60))
+    let (a, b) = s.settings.work_hours();
+    let (a, b) = (i64::from(a).clamp(0, 24 * 60), i64::from(b).clamp(0, 24 * 60));
+    if a < b { (a, b) } else { (8 * 60, 17 * 60) }
+}
+
+/// First day of the week, 0 = Sunday (File › Options › Calendar › First day of week).
+pub fn first_day_of_week(s: &Session) -> u8 {
+    s.settings.first_day_of_week().min(6)
+}
+
+/// "First week of year" rules (File › Options › Calendar): `jan1` (the week with January 1), `first4` (the
+/// first week with four days in the year) or `firstFull` (the first whole week).
+pub fn first_week_rule(s: &Session) -> String {
+    s.settings.text("calendar.firstWeekOfYear")
+}
+
+/// The day (days since 1970-01-01) starting the week of `day` when weeks start on `first` (0 = Sunday).
+pub fn week_start_on(day: i64, first: u8) -> i64 {
+    let wd = i64::from(dates::weekday_of_day(day).0);
+    day.saturating_sub((wd - i64::from(first.min(6))).rem_euclid(7))
+}
+
+/// First day of week 1 of `year` under `rule` (see [`first_week_rule`]).
+fn week_one(year: i64, first: u8, rule: &str) -> i64 {
+    let jan1 = dates::days_from_civil(year, 1, 1).unwrap_or(0);
+    let ws = week_start_on(jan1, first);
+    match rule {
+        "firstFull" if ws != jan1 => ws.saturating_add(7),
+        // Week 1 needs four of its days in the new year.
+        "first4" if jan1.saturating_sub(ws) > 3 => ws.saturating_add(7),
+        _ => ws,
+    }
+}
+
+/// Week number of `day` (shown in the month view and the Date Navigator when File › Options › Calendar ›
+/// Show week numbers is on), with weeks starting on `first` and week 1 chosen by `rule`.
+pub fn week_number(day: i64, first: u8, rule: &str) -> u32 {
+    let (y, _, _) = dates::civil_from_days(day);
+    let ws = week_start_on(day, first);
+    let start = if ws >= week_one(y.saturating_add(1), first, rule) {
+        week_one(y.saturating_add(1), first, rule)
+    } else if ws < week_one(y, first, rule) {
+        week_one(y.saturating_sub(1), first, rule)
+    } else {
+        week_one(y, first, rule)
+    };
+    u32::try_from(ws.saturating_sub(start).div_euclid(7).saturating_add(1)).unwrap_or(1).clamp(1, 53)
 }
 
 /// The calendar's time zones (kept on the default calendar).
@@ -328,11 +585,15 @@ pub fn short_zone_name(id: &str) -> String {
     id.rsplit('/').next().unwrap_or(id).replace('_', " ")
 }
 
-/// Label of the primary zone for the ruler (the zone's label, else its city, else empty).
+/// Label of the primary zone for the ruler (the Change Time Zone label, else File › Options › Calendar ›
+/// Time zones › Label, else the zone's city while a second zone shows, else empty).
 pub fn primary_zone_label(s: &Session) -> String {
     let z = time_zones(s);
+    let option = s.settings.text("calendar.timeZoneLabel");
     if !z.label.trim().is_empty() {
         z.label
+    } else if !option.trim().is_empty() {
+        option.trim().to_owned()
     } else if tz::known(&z.zone) && z.show_second {
         short_zone_name(&z.zone)
     } else {

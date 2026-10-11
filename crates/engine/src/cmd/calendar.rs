@@ -17,10 +17,13 @@
 //! by `calendar.refreshCalendar`), copies an .ics file into a new calendar, or makes a blank one.
 //!
 //! **Items.** Appointments live in calendar folders (`Mailbox.appointments`). `calendar.newAppointment`
-//! creates one when field params are given (defaults: starts at the next half hour, lasts 30 minutes,
-//! reminder 15 minutes before) and otherwise asks the UI to open a blank appointment window.
-//! `calendar.newMeeting` creates a meeting (an appointment with attendees) and opens a compose with the
-//! invitation (plain-text summary plus an RFC 5545 `text/calendar` attachment). `calendar.moveItem` and
+//! creates one when field params are given (defaults from File › Options › Calendar: the next half hour,
+//! the default duration, the default reminder) and otherwise (or with `form: true`) asks the UI for the
+//! appointment window, prefilled. `calendar.newMeeting` asks for the meeting window prefilled with the given
+//! fields (People › Meeting and Tasks › Meeting too) and saves nothing until it is sent: with a `start` (the
+//! window's Send) it creates the meeting and opens a compose with the invitation (plain-text summary plus
+//! an RFC 5545 `text/calendar` attachment). `calendar.autoRespond` applies the automatic accept / decline
+//! options to meeting messages. `calendar.moveItem` and
 //! `calendar.resize` are the day/week views' drag and edge-drag. An appointment may name an IANA time zone
 //! ([`tz`]); its times are then entered in that zone and its recurrences expand in that zone's wall-clock
 //! time across daylight-saving changes.
@@ -1147,23 +1150,43 @@ fn run_refresh_calendar(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Share Calendar › E-mail Calendar: a message with the calendar as an iCalendar attachment. `range`: `all`
-/// (default), `today`, `tomorrow`, `next7`, `next30`; `detail`: `full` (default), `limited` (subject and time)
-/// or `availability` (busy/free blocks only).
+/// (default), `today`, `tomorrow`, `next7`, `next30` or `custom` (`from` to `to`, whole days, "YYYY-MM-DD");
+/// `detail`: `full` (default), `limited` (subject and time) or `availability` (busy/free blocks only).
+/// Private items are shared as their free/busy time only unless `includePrivate` is true (then like any
+/// other item). Reminders are left out.
 fn run_share(s: &mut Session, p: &Value) -> CmdResult {
     let folder = target_calendar(s, p)?;
     let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
-    let tz = s.tz_offset_min;
-    let today = pim::local_midnight(s.now(), tz);
+    let clock = tz::Clock::of(s);
+    let today = clock.midnight(s.now());
+    let day_after = |t: DateTime, days: i64| {
+        clock.from_local(clock.day(t).saturating_add(days).saturating_mul(pim::DAY_SECS))
+    };
     let range = opt_str(p, "range").unwrap_or("all");
     let window = match range {
         "all" => None,
-        "today" => Some((today, pim::add_secs(today, pim::DAY_SECS))),
-        "tomorrow" => Some((pim::add_secs(today, pim::DAY_SECS), pim::add_secs(today, 2 * pim::DAY_SECS))),
-        "next7" => Some((today, pim::add_secs(today, 7 * pim::DAY_SECS))),
-        "next30" => Some((today, pim::add_secs(today, 30 * pim::DAY_SECS))),
+        "today" => Some((today, day_after(today, 1))),
+        "tomorrow" => Some((day_after(today, 1), day_after(today, 2))),
+        "next7" => Some((today, day_after(today, 7))),
+        "next30" => Some((today, day_after(today, 30))),
+        "custom" => {
+            let day = |key: &str| -> Result<DateTime, CmdError> {
+                clock.date_param(p, key)?.flatten().map(|t| clock.midnight(t)).ok_or_else(|| {
+                    CmdError::Params(format!("`{key}` (YYYY-MM-DD) is required for a custom range"))
+                })
+            };
+            let (from, to) = (day("from")?, day("to")?);
+            if to.unix < from.unix {
+                return Err(CmdError::Params("the end date is before the start date".into()));
+            }
+            if to.unix.saturating_sub(from.unix) > MAX_SPAN_SECS {
+                return Err(CmdError::Params("the date range is too long".into()));
+            }
+            Some((from, day_after(to, 1)))
+        }
         r => {
             return Err(CmdError::Params(format!(
-                "`range` must be all|today|tomorrow|next7|next30, not `{r}`"
+                "`range` must be all|today|tomorrow|next7|next30|custom, not `{r}`"
             )));
         }
     };
@@ -1171,6 +1194,7 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
     if !["full", "limited", "availability"].contains(&detail) {
         return Err(CmdError::Params(format!("`detail` must be full|limited|availability, not `{detail}`")));
     }
+    let include_private = pim::flag(p, "includePrivate")?.unwrap_or(false);
     let mut appts: Vec<Appointment> = s
         .mailbox
         .appointments
@@ -1184,16 +1208,19 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
         .collect();
     appts.sort_by_key(|a| (a.start.unix, a.id));
     for a in &mut appts {
-        if detail != "full" || a.private {
+        let hidden = a.private && !include_private;
+        if detail != "full" || hidden {
             a.body.clear();
             a.attendees.clear();
             a.organizer = None;
             a.categories.clear();
         }
-        if detail == "availability" || (a.private && detail != "full") {
+        if detail == "availability" || hidden {
             a.subject = show_as_label(a.show_as).to_owned();
             a.location.clear();
         }
+        // The copy is not the user's item: no alarms go out with it.
+        a.reminder_min = None;
     }
     let refs: Vec<&Appointment> = appts.iter().collect();
     let ics = ics_calendar(Some("PUBLISH"), &refs, s.now());
@@ -1218,9 +1245,16 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
     // Options › Mail › Signatures: the new-messages signature.
     crate::compose::insert_default_signature(&s.mailbox, &mut compose);
     let id = s.open_compose(compose);
-    Ok(
-        json!({ "compose": id, "calendar": folder.0, "events": events, "calendars": calendars, "range": range, "detail": detail }),
-    )
+    Ok(json!({
+        "compose": id,
+        "calendar": folder.0,
+        "events": events,
+        "calendars": calendars,
+        "range": range,
+        "detail": detail,
+        "from": window.map(|(f, _)| clock.datetime_string(f)),
+        "to": window.map(|(_, t)| clock.datetime_string(t)),
+    }))
 }
 
 /// "Busy", "Free"… for availability-only sharing.
@@ -1244,9 +1278,10 @@ fn file_safe(name: &str) -> String {
 // Appointments
 // ---------------------------------------------------------------------------------------------------------
 
-/// Default appointment length (minutes).
+/// Default appointment length out of the box (minutes; File › Options › Calendar changes it,
+/// [`default_duration_min`]).
 pub const DEFAULT_DURATION_MIN: i64 = 30;
-/// Default reminder (minutes before start).
+/// Default reminder out of the box (minutes before start; [`default_reminder_min`]).
 pub const DEFAULT_REMINDER_MIN: u32 = 15;
 /// Longest appointment accepted (seconds; ten years).
 const MAX_SPAN_SECS: i64 = 10 * 366 * pim::DAY_SECS;
@@ -1297,15 +1332,38 @@ pub(crate) fn new_uid(s: &Session, id: ItemId, stamp: i64) -> String {
     format!("mailcraft-{}-{}-{:016x}@localhost", id.0, stamp, h)
 }
 
-/// A new appointment with the defaults (next half hour, 30 minutes, Busy, reminder 15).
+/// Length of a new appointment or meeting in minutes: File › Options › Calendar › Default duration, less the
+/// "Shorten appointments and meetings" minutes when that is on (never below 5 minutes).
+pub fn default_duration_min(s: &Session) -> i64 {
+    let full = i64::from(s.settings.default_duration_minutes()).clamp(1, 24 * 60);
+    if !s.settings.bool("calendar.shorten") {
+        return full;
+    }
+    let by = if full < 60 {
+        s.settings.int("calendar.shortenUnderHour")
+    } else {
+        s.settings.int("calendar.shortenHourOrLonger")
+    };
+    let short = full.saturating_sub(by.clamp(0, 60));
+    if short >= 5 { short } else { full }
+}
+
+/// Reminder of a new timed appointment or meeting (minutes before the start): File › Options › Calendar ›
+/// Default reminders, `None` when that is off.
+pub fn default_reminder_min(s: &Session) -> Option<u32> {
+    s.settings.default_reminder_minutes().map(|m| m.min(60 * 24 * 7 * 52))
+}
+
+/// A new appointment with the defaults: the next half hour, the default duration and reminder from
+/// File › Options › Calendar (30 minutes and 15 minutes before out of the box), Busy.
 pub fn default_appointment(s: &Session, folder: FolderId) -> Appointment {
     let start = next_half_hour(s.now(), s.tz_offset_min);
     Appointment {
         folder,
         start,
-        end: pim::add_secs(start, DEFAULT_DURATION_MIN.saturating_mul(60)),
+        end: pim::add_secs(start, default_duration_min(s).saturating_mul(60)),
         show_as: BusyStatus::Busy,
-        reminder_min: Some(DEFAULT_REMINDER_MIN),
+        reminder_min: default_reminder_min(s),
         ..Default::default()
     }
 }
@@ -1596,20 +1654,7 @@ pub fn create_appointment(
     p: &Value,
     meeting: bool,
 ) -> Result<ItemId, CmdError> {
-    let mut a = default_appointment(s, folder);
-    // A timed appointment is entered in the calendar's time zone (when it names one), so a series keeps its
-    // wall-clock time across daylight-saving changes; `timeZone` overrides it.
-    a.tz = tz::Clock::of(s).zone_id().map(str::to_owned);
-    apply_appointment_fields(s, &mut a, p)?;
-    if a.all_day {
-        a.tz = None;
-    }
-    if meeting {
-        a.is_meeting = true;
-    }
-    if a.is_meeting && a.organizer.is_none() {
-        a.organizer = organizer(s);
-    }
+    let mut a = draft_appointment(s, folder, p, meeting)?;
     let id = ItemId(s.mailbox.alloc_id());
     a.id = id;
     a.uid = new_uid(s, id, s.now().unix);
@@ -1617,27 +1662,115 @@ pub fn create_appointment(
     Ok(id)
 }
 
+/// The appointment `create_appointment` would store (validated, not stored, no id or UID yet).
+fn draft_appointment(
+    s: &Session,
+    folder: FolderId,
+    p: &Value,
+    meeting: bool,
+) -> Result<Appointment, CmdError> {
+    let mut a = default_appointment(s, folder);
+    // A timed appointment is entered in the calendar's time zone (when it names one), so a series keeps its
+    // wall-clock time across daylight-saving changes; `timeZone` overrides it.
+    a.tz = tz::Clock::of(s).zone_id().map(str::to_owned);
+    apply_appointment_fields(s, &mut a, p)?;
+    if a.all_day {
+        a.tz = None;
+        // An all-day event's default reminder is the evening before (18 hours ahead), as the window offers.
+        if p.get("reminderMin").is_none() && a.reminder_min.is_some() {
+            a.reminder_min = Some(ALL_DAY_REMINDER_MIN);
+        }
+    }
+    if meeting {
+        a.is_meeting = true;
+    }
+    if a.is_meeting && a.organizer.is_none() {
+        a.organizer = organizer(s);
+    }
+    Ok(a)
+}
+
+/// Default reminder of an all-day event (minutes before its midnight start).
+pub const ALL_DAY_REMINDER_MIN: u32 = 18 * 60;
+
+/// `form`: `Some(true)` = always open the window, `Some(false)` = never; else `default`.
+fn wants_form(p: &Value, default: bool) -> Result<bool, CmdError> {
+    Ok(pim::flag(p, "form")?.unwrap_or(default))
+}
+
+/// Asks the UI for an appointment or meeting window prefilled from field params, without saving anything
+/// (cancelling the window leaves nothing behind). The draft is validated first, so bad fields are refused
+/// here. Dialog `appointment` (a meeting: `newMeeting`, the dialog the meeting form answers to) with
+/// `folder`, `start`/`end` on the calendar's clock (all-day: the end falls on the last day), `reminderMin`,
+/// `subject`,
+/// `location`, `body`, `allDay`, `showAs`, `private`, `categories`, `recurrence` (RRULE), `recurring`
+/// (open the Recurrence dialog), `meeting`, `attendees` / `optional` / `resources` (lists) and `to` (the
+/// required attendees as one string).
+fn open_item_form(s: &mut Session, folder: FolderId, p: &Value, meeting: bool) -> CmdResult {
+    let a = draft_appointment(s, folder, p, meeting)?;
+    let clock = tz::Clock::of(s);
+    let (start, end) = if a.all_day {
+        // The window shows an all-day event's inclusive last day.
+        let last = pim::add_secs(a.end, -1).unix.max(a.start.unix);
+        (clock.datetime_string(a.start), clock.datetime_string(DateTime::from_unix(last, a.end.offset_min)))
+    } else {
+        (clock.datetime_string(a.start), clock.datetime_string(a.end))
+    };
+    let names = |role: AttendeeRole| -> Vec<String> {
+        a.attendees.iter().filter(|x| x.role == role).map(|x| x.mailbox.to_display_string()).collect()
+    };
+    let required = names(AttendeeRole::Required);
+    let params = json!({
+        "folder": folder.0,
+        "start": start,
+        "end": end,
+        "allDay": a.all_day,
+        "reminderMin": a.reminder_min,
+        "showAs": show_as_name(a.show_as),
+        "private": a.private,
+        "categories": a.categories,
+        "subject": a.subject,
+        "location": a.location,
+        "body": a.body,
+        "recurrence": a.recurrence.as_ref().map(|r| r.rrule.clone()),
+        "recurring": pim::flag(p, "recurring")?.unwrap_or(false),
+        "meeting": a.is_meeting,
+        "to": required.join("; "),
+        "attendees": required,
+        "optional": names(AttendeeRole::Optional),
+        "resources": names(AttendeeRole::Resource),
+        "timeZone": if a.all_day { None } else { a.tz.clone() },
+        "focus": if a.subject.trim().is_empty() { "subject" } else { "body" },
+    });
+    pim::dialog(s, if a.is_meeting { MEETING_FORM } else { APPOINTMENT_FORM }, params)
+}
+
+/// Dialog id of the appointment window.
+pub const APPOINTMENT_FORM: &str = "appointment";
+/// Dialog id of the meeting window (a new meeting request, not yet saved).
+pub const MEETING_FORM: &str = "newMeeting";
+
+/// `calendar.newAppointment`: with field params creates the appointment; without (or with `form: true`)
+/// opens the appointment window prefilled with them.
 fn run_new_appointment(s: &mut Session, p: &Value) -> CmdResult {
     let folder = new_appointment_folder(s, p)?;
-    if !pim::has_any(p, &APPT_FIELDS) {
-        let d = default_appointment(s, folder);
-        let clock = tz::Clock::of(s);
-        let params = json!({
-            "folder": folder.0,
-            "start": clock.datetime_string(d.start),
-            "end": clock.datetime_string(d.end),
-            "reminderMin": d.reminder_min,
-            "focus": "subject",
-        });
-        return pim::dialog(s, "appointment", params);
+    if wants_form(p, !pim::has_any(p, &APPT_FIELDS))? {
+        return open_item_form(s, folder, p, false);
     }
     let id = create_appointment(s, folder, p, false)?;
     Ok(s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |a| appointment_summary(s, a)))
 }
 
-/// Creates a meeting and opens a compose with the invitation. Returns `{"id", "compose", ...}`.
+/// New Meeting: a meeting request starts as a form. With a `start` (a fully specified request) or
+/// `form: false` the meeting is created and its invitation opens in a compose (`{"id", "compose", ...}`);
+/// otherwise the meeting window opens prefilled with the given fields (`{"dialog": "newMeeting"}`) and
+/// nothing is saved until it is sent. People › Meeting and Tasks › Meeting come through here too.
 pub fn create_meeting(s: &mut Session, p: &Value) -> CmdResult {
     let folder = new_appointment_folder(s, p)?;
+    let explicit = p.get("start").is_some_and(|v| !v.is_null());
+    if wants_form(p, !explicit)? {
+        return open_item_form(s, folder, p, true);
+    }
     let id = create_appointment(s, folder, p, true)?;
     let compose =
         meeting_compose(s, id).ok_or_else(|| CmdError::Failed("the meeting could not be created".into()))?;
@@ -1683,7 +1816,12 @@ pub fn meeting_compose_seq(s: &mut Session, id: ItemId, sequence: u32) -> Option
         text.push('\n');
         text.push_str(&a.body);
     }
-    let ics = itip::request(&a, sequence, s.now());
+    let mut ics = itip::request(&a, sequence, s.now());
+    // Options › Calendar › "Allow attendees to propose new times for meetings" off: the request says so
+    // with the X-MICROSOFT-DISALLOW-COUNTER property of [MS-OXCICAL].
+    if !s.settings.bool("calendar.allowProposeNewTime") {
+        ics = ics.replace("END:VEVENT\r\n", "X-MICROSOFT-DISALLOW-COUNTER:TRUE\r\nEND:VEVENT\r\n");
+    }
     let mut compose = ComposeState {
         to,
         cc,
@@ -2979,7 +3117,7 @@ fn store_instance(
         }
         (None, None) => {
             a.folder = meeting_folder(s, mail)?;
-            a.reminder_min = a.reminder_min.or(Some(DEFAULT_REMINDER_MIN));
+            a.reminder_min = a.reminder_min.or_else(|| default_reminder_min(s));
             ItemId(s.mailbox.alloc_id())
         }
     };
@@ -3051,7 +3189,7 @@ fn apply_response(
         }
         None => {
             a.folder = meeting_folder(s, mail)?;
-            a.reminder_min = a.reminder_min.or(Some(DEFAULT_REMINDER_MIN));
+            a.reminder_min = a.reminder_min.or_else(|| default_reminder_min(s));
             ItemId(s.mailbox.alloc_id())
         }
     };
@@ -3124,7 +3262,12 @@ fn run_propose_new_time(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params("only meeting requests can be answered".into()));
     }
     let response = match opt_str(p, "response") {
-        None => ResponseStatus::Tentative,
+        // Options › Calendar › "Use this response when proposing a new meeting time".
+        None => match s.settings.text("calendar.proposeResponse").as_str() {
+            "accept" => ResponseStatus::Accepted,
+            "decline" => ResponseStatus::Declined,
+            _ => ResponseStatus::Tentative,
+        },
         Some(_) => match parse_response(p)? {
             ResponseStatus::Accepted => {
                 return Err(CmdError::Params("propose a new time with tentative or decline".into()));
@@ -3228,6 +3371,118 @@ fn run_remove_canceled(s: &mut Session, p: &Value) -> CmdResult {
     }
     let removed = pim::delete(s, &gone);
     Ok(json!({ "removed": pim::ids_json(&removed) }))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Automatic accept or decline (File › Options › Calendar › Auto Accept/Decline)
+// ---------------------------------------------------------------------------------------------------------
+
+/// Most messages one automatic pass looks at.
+pub const MAX_AUTO_SCAN: usize = 50;
+
+/// True when one of the automatic accept / decline options is on.
+pub fn auto_respond_on(s: &Session) -> bool {
+    ["calendar.autoAccept", "calendar.declineConflicts", "calendar.declineRecurring"]
+        .iter()
+        .any(|k| s.settings.bool(k))
+}
+
+/// Unread messages in mail folders (not Sent Items, Drafts, Outbox, Deleted Items or Junk) that carry
+/// calendar data: what an automatic pass would look at, newest first, at most [`MAX_AUTO_SCAN`]. Empty
+/// when the options are off. Cheap (no message is parsed).
+pub fn auto_respond_candidates(s: &Session) -> Vec<ItemId> {
+    if !auto_respond_on(s) {
+        return Vec::new();
+    }
+    let skip = [
+        FolderRole::SentItems,
+        FolderRole::Drafts,
+        FolderRole::Outbox,
+        FolderRole::DeletedItems,
+        FolderRole::JunkEmail,
+    ];
+    let mut hits: Vec<(i64, ItemId)> = s
+        .mailbox
+        .mail
+        .values()
+        .filter(|m| !m.read)
+        .filter(|m| m.attachments.iter().any(|a| is_calendar_type(&a.mime_type) || is_ics_name(&a.filename)))
+        .filter(|m| {
+            s.mailbox
+                .folder(m.folder)
+                .is_some_and(|f| f.kind == FolderKind::Mail && !f.role.is_some_and(|r| skip.contains(&r)))
+        })
+        .map(|m| (m.received.unix, m.id))
+        .collect();
+    hits.sort_by_key(|(t, id)| (std::cmp::Reverse(*t), std::cmp::Reverse(*id)));
+    hits.into_iter().take(MAX_AUTO_SCAN).map(|(_, id)| id).collect()
+}
+
+/// What the automatic options do with a scheduling message (`None` = leave it to the user).
+fn auto_decision(s: &Session, mail: ItemId, msg: &ItipMessage) -> Option<&'static str> {
+    let info = meeting_message_from(s, mail, msg);
+    match msg.method {
+        Method::Request | Method::Add => {
+            if !info.can_respond {
+                return None;
+            }
+            // Already answered (accepted, tentative or declined) on the user's calendar.
+            if info.my_response.as_deref().is_some_and(|r| r != "none") {
+                return None;
+            }
+            let recurring = msg.event.appointment.recurrence.is_some();
+            if (s.settings.bool("calendar.declineRecurring") && recurring)
+                || (s.settings.bool("calendar.declineConflicts") && !info.conflicts.is_empty())
+            {
+                Some("decline")
+            } else if s.settings.bool("calendar.autoAccept") {
+                Some("accept")
+            } else {
+                None
+            }
+        }
+        Method::Cancel if s.settings.bool("calendar.autoAccept") && info.appointment.is_some() => {
+            Some("remove")
+        }
+        _ => None,
+    }
+}
+
+/// `calendar.autoRespond {ids?}`: applies File › Options › Calendar › Automatic accept or decline to meeting
+/// messages (`ids`, else [`auto_respond_candidates`]): requests are accepted (or declined when they are
+/// recurring / conflict with the calendar and those options are on) and the response is sent; with
+/// automatic accept on, canceled meetings are removed from the calendar. Messages already answered, from the
+/// user, or not about meetings are left alone. Returns `{"handled": [{"id", "action", ...}]}`.
+fn run_auto_respond(s: &mut Session, p: &Value) -> CmdResult {
+    let ids: Vec<ItemId> = match p.get("ids") {
+        None | Some(Value::Null) => auto_respond_candidates(s),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).map(ItemId).take(MAX_AUTO_SCAN).collect(),
+        Some(_) => return Err(CmdError::Params("`ids` must be a list of message ids".into())),
+    };
+    let mut handled = Vec::new();
+    if !auto_respond_on(s) {
+        return Ok(json!({ "handled": handled }));
+    }
+    for mail in ids {
+        if !s.mailbox.mail.contains_key(&mail) {
+            continue;
+        }
+        let Some(msg) = read_itip(s, mail) else { continue };
+        let Some(action) = auto_decision(s, mail, &msg) else { continue };
+        let out = match action {
+            "remove" => {
+                let r = run_remove_canceled(s, &json!({ "id": mail.0 }));
+                mark_read(s, mail);
+                r
+            }
+            response => run_respond(s, &json!({ "id": mail.0, "response": response, "send": "now" })),
+        };
+        match out {
+            Ok(v) => handled.push(json!({ "id": mail.0, "action": action, "result": v })),
+            Err(e) => handled.push(json!({ "id": mail.0, "action": action, "error": e.to_string() })),
+        }
+    }
+    Ok(json!({ "handled": handled }))
 }
 
 /// `calendar.acceptProposal {id}`: the organizer takes a COUNTER's time and sends the update.
@@ -3415,7 +3670,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Share Calendar",
             "Home › Manage Calendars; Folder › Share",
             "",
-            r#"{"calendar"?: "<calendar name>", "folder"?: number, "range"?: "all|today|tomorrow|next7|next30", "detail"?: "full|limited|availability"}"#,
+            r#"{"calendar"?: "<calendar name>", "folder"?: number, "range"?: "all|today|tomorrow|next7|next30|custom", "from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD" (custom), "detail"?: "full|limited|availability", "includePrivate"?: bool}"#,
             false,
             run_share,
         ),
@@ -3474,11 +3729,20 @@ pub fn specs() -> Vec<CommandSpec> {
             run_working_hours,
         ),
         spec(
+            "calendar.autoRespond",
+            "Automatic Accept or Decline",
+            "File › Options › Calendar › Automatic accept or decline",
+            "",
+            r#"{"ids"?: [number] (meeting messages; default: unread ones)}"#,
+            true,
+            run_auto_respond,
+        ),
+        spec(
             "calendar.newAppointment",
             "New Appointment",
             "Calendar › Home › New",
             "",
-            r#"{"subject"?, "location"?, "body"?, "start"?: "YYYY-MM-DDTHH:MM", "end"?, "durationMin"?, "timeZone"?: "IANA id", "allDay"?: bool, "showAs"?: "free|workingElsewhere|tentative|busy|outOfOffice", "reminderMin"?: number|null, "private"?: bool, "categories"?: [string], "recurrence"?: "RRULE", "folder"?: number} (no fields = open a blank appointment window)"#,
+            r#"{"subject"?, "location"?, "body"?, "start"?: "YYYY-MM-DDTHH:MM", "end"?, "durationMin"?, "timeZone"?: "IANA id", "allDay"?: bool, "showAs"?: "free|workingElsewhere|tentative|busy|outOfOffice", "reminderMin"?: number|null, "private"?: bool, "categories"?: [string], "recurrence"?: "RRULE", "folder"?: number, "form"?: bool, "recurring"?: bool} (no fields or form: true = open the appointment window prefilled; recurring: with the Recurrence dialog)"#,
             true,
             run_new_appointment,
         ),
@@ -3487,7 +3751,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Meeting",
             "Calendar › Home › New",
             "",
-            r#"{"attendees"?: [string], "optional"?: [string], "resources"?: [string], ...appointment fields}"#,
+            r#"{"attendees"?: [string], "optional"?: [string], "resources"?: [string], ...appointment fields, "form"?: bool, "recurring"?: bool} (no start = open the meeting window prefilled; nothing is saved until it is sent)"#,
             true,
             run_new_meeting,
         ),
@@ -3689,6 +3953,8 @@ pub fn specs() -> Vec<CommandSpec> {
 
 #[cfg(test)]
 mod depth_tests;
+#[cfg(test)]
+mod settings_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -3823,7 +4089,7 @@ pub(crate) mod tests {
         let r = s
             .run(
                 "calendar.newMeeting",
-                &json!({"subject": "Plan", "attendees": ["Ann Lee <ann@example.com>", "bob@example.org"], "optional": "cy@example.net", "location": "Room 4"}),
+                &json!({"subject": "Plan", "attendees": ["Ann Lee <ann@example.com>", "bob@example.org"], "optional": "cy@example.net", "location": "Room 4", "start": "2026-10-09T10:30"}),
             )
             .unwrap();
         let id = ItemId(r["id"].as_u64().unwrap());
@@ -4057,7 +4323,10 @@ pub(crate) mod tests {
         s.mailbox.add_signature("Re", Doc::from_plain_text("-- Re sig")).unwrap();
         s.mailbox.set_signature_defaults(None, Some(Some("New")), Some(Some("Re"))).unwrap();
         let r = s
-            .run("calendar.newMeeting", &json!({"subject": "Plan", "attendees": ["ann@example.com"]}))
+            .run(
+                "calendar.newMeeting",
+                &json!({"subject": "Plan", "attendees": ["ann@example.com"], "form": false}),
+            )
             .unwrap();
         let c = &s.composes[&r["compose"].as_u64().unwrap()];
         assert_eq!(c.signature.as_ref().map(|g| g.name.as_str()), Some("New"));
@@ -4078,7 +4347,10 @@ pub(crate) mod tests {
         let mut s = session();
         s.mailbox.add_signature("Unused", Doc::from_plain_text("-- unused")).unwrap();
         let r = s
-            .run("calendar.newMeeting", &json!({"subject": "Plan", "attendees": ["ann@example.com"]}))
+            .run(
+                "calendar.newMeeting",
+                &json!({"subject": "Plan", "attendees": ["ann@example.com"], "form": false}),
+            )
             .unwrap();
         let c = &s.composes[&r["compose"].as_u64().unwrap()];
         assert!(c.signature.is_none());
@@ -4428,7 +4700,7 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------------------------------------------
 
     /// A session for `addr` (same fixed clock).
-    fn person(addr: &str, name: &str) -> Session {
+    pub(crate) fn person(addr: &str, name: &str) -> Session {
         let mut s = session();
         if let Some(a) = s.mailbox.accounts.first_mut() {
             a.address = addr.into();
@@ -4439,7 +4711,7 @@ pub(crate) mod tests {
     }
 
     /// Delivers compose `cid` of `from` into `to`'s Inbox (built like a sent message).
-    fn deliver(from: &Session, cid: u64, to: &mut Session) -> ItemId {
+    pub(crate) fn deliver(from: &Session, cid: u64, to: &mut Session) -> ItemId {
         let c = &from.composes[&cid];
         let mut b = mailcraft_mime::MessageBuilder::new();
         let acc = from.mailbox.default_account().unwrap();
@@ -4464,7 +4736,7 @@ pub(crate) mod tests {
         to.mailbox.add_mail(item)
     }
 
-    fn invite(org: &mut Session) -> (ItemId, u64) {
+    pub(crate) fn invite(org: &mut Session) -> (ItemId, u64) {
         let r = org
             .run(
                 "calendar.newMeeting",
