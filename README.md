@@ -21,7 +21,6 @@
   <a href="#for-agents-cli-and-mcp">For agents</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#roadmap">Roadmap</a> ·
-  <a href="#crafting-apps">Crafting Apps</a> ·
   <a href="#license">License</a>
 </p>
 
@@ -119,15 +118,6 @@ floor and the wasm build. CI runs on GitHub Actions (`.github/workflows/`).
 
 [ROADMAP.md](ROADMAP.md) lists milestones, honest parity per area and what needs the project owner. Bugs and
 ideas go to the [issue tracker](https://github.com/MonkeySaint/mailcraft/issues).
-
-## Crafting Apps
-
-MailCraft follows the process and conventions of its sibling project:
-
-| App | Modelled on | Repository |
-|---|---|---|
-| WordCraft | Word processing | [github.com/storytold/wordcraft](https://github.com/storytold/wordcraft) |
-| MailCraft | Mail, calendar and contacts | this repository |
 
 ## License
 

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Version=1.5
+Version=1.4
 Name=MailCraft
 GenericName=Mail Client
 Comment=Read and write mail, and manage your calendar, contacts, tasks and notes
@@ -8,9 +8,8 @@ Exec=mailcraft
 TryExec=mailcraft
 Icon=saint.dev.MailCraft
 Terminal=false
-Categories=Network;Email;Calendar;ContactManagement;
+Categories=Office;Email;Calendar;ContactManagement;
 MimeType=message/rfc822;application/mbox;text/calendar;text/vcard;x-scheme-handler/mailto;
 Keywords=mail;email;e-mail;inbox;imap;smtp;calendar;contacts;tasks;notes;
 StartupNotify=true
 StartupWMClass=saint.dev.MailCraft
-SingleMainWindow=true
