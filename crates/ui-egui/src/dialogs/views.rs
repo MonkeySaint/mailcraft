@@ -1,14 +1,19 @@
-//! View dialogs: Advanced View Settings (with Sort, Group By, Filter, Other Settings, Columns and Conditional
-//! Formatting), Conversation Settings, Zoom, Manage All Views, Save View As, Apply View, Quick Actions.
+//! View dialogs: Advanced View Settings (with Sort, Group By, Filter, Other Settings, Columns, Conditional
+//! Formatting and Format Columns), Conversation Settings, Zoom, Manage All Views, Save View As, Apply View,
+//! Quick Actions.
+//!
+//! The mail view state they edit lives in the engine (`mailcraft_engine::cmd::view::mail`): each dialog reads
+//! it when it opens and applies its changes with the `view.*` commands on OK.
 
 use egui::{Context, RichText};
 use serde_json::{Value, json};
 
 use super::common::{self, Dlg, Out, btn, btn_en, footer, muted, ok_cancel, primary, window, with_state};
 use crate::App;
+use mailcraft_engine::cmd::view::mail::{self as mailview, CustomFilter, FormatRule, RuleFont};
 use mailcraft_engine::queries::view_settings;
 use mailcraft_model::FolderId;
-use mailcraft_model::view::{ArrangeBy, ListFilter, ReadingPanePos, SortOrder, ViewLayout};
+use mailcraft_model::view::{ArrangeBy, ReadingPanePos, SortOrder, ViewLayout};
 
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
@@ -17,10 +22,12 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "viewGroupBy" => group_by(ctx, app, d),
         "viewFilter" => filter(ctx, app, d),
         "viewOtherSettings" => other(ctx, app, d),
-        "viewFormat" => format(ctx, app, d),
+        "viewFormat" if d.str("kind") == "columns" => format_columns(ctx, app, d),
+        "viewFormat" => rules(ctx, app, d),
         "showColumns" => columns(ctx, app, d),
         "conversationSettings" => conversation(ctx, app, d),
         "zoom" => zoom(ctx, app, d),
+        "manageViews" if d.bool("mail") => manage_mail_views(ctx, app, d),
         "manageViews" => manage_views(ctx, app, d),
         "saveViewAs" => save_view_as(ctx, app, d),
         "applyView" => apply_view(ctx, app, d),
@@ -57,56 +64,76 @@ const ARRANGE_KEYS: [&str; 13] = [
     "importance",
 ];
 
-fn filter_label(f: ListFilter) -> &'static str {
-    match f {
-        ListFilter::All => "Off",
-        ListFilter::Unread => "Unread",
-        ListFilter::Flagged => "Flagged",
-        ListFilter::Mentioned => "Mentioned",
-    }
-}
-
+/// Advanced View Settings (`plan/outlook/dialogs.md` › view-settings): a button per part with what it is set
+/// to. Opened from Manage Views › Modify (`savedView`), OK stores the folder's view into that saved view.
 fn advanced(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let folder = folder_of(app, d);
+    let folder = app.s.selection.folder;
     let v = view_settings(&app.s, folder);
-    let title = format!("Advanced View Settings: {}", layout_name(v.layout));
-    let p = json!({"folder": folder.0});
+    let mail = mailview::mail_list_folder(&app.s, folder);
+    let view_name =
+        if mail { mailview::current_view_name(&app.s, folder) } else { layout_name(v.layout).to_owned() };
+    let title = format!("Advanced View Settings: {view_name}");
+    let saved_view = d.str("savedView");
     window(ctx, app, d, &title, 520.0, |ui, app| {
         let mut out = Out::Keep;
-        let cols =
-            common::pref(ctx, &format!("columns.{}", folder.0)).and_then(|v| v.as_array().map(Vec::len));
         let order = match v.order {
             SortOrder::Descending => "Descending",
             SortOrder::Ascending => "Ascending",
         };
-        let rows: [(&str, &str, String); 7] = [
-            ("Columns...", "showColumns", match cols {
-                Some(n) => format!("{n} columns"),
-                None => "Importance, Reminder, Icon, Flag Status, Attachment, From, Subject, Received, Size, Categories".into(),
-            }),
-            ("Group By...", "viewGroupBy", if v.show_in_groups { format!("{} (automatic)", v.arrange_by.label()) } else { "Off".into() }),
-            ("Sort...", "viewSort", format!("{} ({order})", v.arrange_by.label())),
-            ("Filter...", "viewFilter", filter_label(v.filter).into()),
-            ("Other Settings...", "viewOtherSettings", "Fonts and other Table View settings".into()),
-            ("Conditional Formatting...", "viewFormat", "User defined fonts on each message".into()),
-            ("Format Columns...", "viewFormat", "Specify the display formats for each field".into()),
+        let (cols, filter, rules, formats) = if mail {
+            let cols: Vec<String> = mailview::columns(&app.s, folder).into_iter().map(|c| c.label).collect();
+            let filter = mailview::custom_filter(&app.s, folder).unwrap_or_default().describe();
+            let rules = mailview::rules(&app.s, folder);
+            let on = rules.iter().filter(|r| r.on).count();
+            let n = mailview::mail_view(&app.s, folder).formats.len();
+            (
+                cols.join(", "),
+                filter,
+                format!("{on} of {} rules on", rules.len()),
+                if n == 0 { "Default formats".to_owned() } else { format!("{n} columns formatted") },
+            )
+        } else {
+            let fixed = "Not available in this view".to_owned();
+            (fixed.clone(), fixed.clone(), fixed.clone(), fixed)
+        };
+        let rows: [(&str, &str, &str, String, bool); 7] = [
+            ("Columns...", "showColumns", "", cols, mail),
+            (
+                "Group By...",
+                "viewGroupBy",
+                "",
+                if v.show_in_groups { format!("{} (automatic)", v.arrange_by.label()) } else { "Off".into() },
+                true,
+            ),
+            ("Sort...", "viewSort", "", format!("{} ({order})", v.arrange_by.label()), true),
+            ("Filter...", "viewFilter", "", filter, mail),
+            (
+                "Other Settings...",
+                "viewOtherSettings",
+                "",
+                "Fonts and other Table View settings".into(),
+                true,
+            ),
+            ("Conditional Formatting...", "viewFormat", "rules", rules, mail),
+            ("Format Columns...", "viewFormat", "columns", formats, mail),
         ];
         egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).inner_margin(8.0).show(
             ui,
             |ui| {
                 ui.label(RichText::new("Description").strong());
                 egui::Grid::new(("avs", d.uid)).num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
-                    for (label, dlg, desc) in &rows {
-                        if ui.add(egui::Button::new(*label).min_size(egui::vec2(170.0, 24.0))).clicked() {
-                            let mut params = p.clone();
-                            if *label == "Format Columns..."
+                    for (label, dlg, kind, desc, enabled) in &rows {
+                        let b = egui::Button::new(*label).min_size(egui::vec2(170.0, 24.0));
+                        if ui.add_enabled(*enabled, b).clicked() {
+                            let mut params = json!({"folder": folder.0});
+                            if !kind.is_empty()
                                 && let Some(o) = params.as_object_mut()
                             {
-                                o.insert("kind".into(), json!("columns"));
+                                o.insert("kind".into(), json!(kind));
                             }
                             out = Out::open(dlg, params);
                         }
-                        ui.label(RichText::new(desc).color(app.theme.text_muted));
+                        ui.add(egui::Label::new(RichText::new(desc).color(app.theme.text_muted)).truncate());
                         ui.end_row();
                     }
                 });
@@ -118,7 +145,16 @@ fn advanced(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         if !matches!(out, Out::Keep) {
             return out;
         }
-        ok_cancel(ui, app, true).map_or(Out::Keep, |_| Out::Close)
+        match ok_cancel(ui, app, true) {
+            Some(true) => {
+                if !saved_view.is_empty() {
+                    app.run("view.manageViews", json!({"op": "update", "name": saved_view}));
+                }
+                Out::Close
+            }
+            Some(false) => Out::Close,
+            None => Out::Keep,
+        }
     })
 }
 
@@ -202,43 +238,91 @@ fn group_by(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     )
 }
 
-const FILTERS: [(&str, &str); 7] = [
-    ("all", "All items (no filter)"),
-    ("unread", "Unread"),
-    ("hasAttachments", "Has attachments"),
-    ("flagged", "Flagged"),
-    ("mentioned", "Mentioned"),
-    ("important", "Important"),
-    ("toOrCcMe", "Sent to me (To or Cc)"),
-];
-
 #[derive(Clone, Default)]
 struct FilterState {
-    pick: usize,
+    f: CustomFilter,
+    days: String,
 }
 
+const READ_CHOICES: [(&str, &str); 3] = [("", "Any"), ("unread", "Unread"), ("read", "Read")];
+const IMPORTANCE_CHOICES: [(&str, &str); 4] =
+    [("", "Any"), ("high", "High"), ("normal", "Normal"), ("low", "Low")];
+
+/// View Settings › Filter: the conditions an item must meet to show in this view (`view.customFilter`).
 fn filter(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let folder = folder_of(app, d);
+    let folder = app.s.selection.folder;
     let init = |a: &App| {
-        let key = match view_settings(&a.s, folder).filter {
-            ListFilter::All => "all",
-            ListFilter::Unread => "unread",
-            ListFilter::Flagged => "flagged",
-            ListFilter::Mentioned => "mentioned",
-        };
-        FilterState { pick: FILTERS.iter().position(|f| f.0 == key).unwrap_or(0) }
+        let f = mailview::custom_filter(&a.s, folder).unwrap_or_default();
+        let days = if f.days == 0 { String::new() } else { f.days.to_string() };
+        FilterState { f, days }
     };
     with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Filter", 360.0, |ui, app| {
-            ui.label("Show only:");
-            for (i, (_, l)) in FILTERS.iter().enumerate() {
-                ui.radio_value(&mut st.pick, i, *l);
+        window(ctx, app, d, "Filter", 460.0, |ui, app| {
+            common::heading(ui, app, "Messages");
+            common::field(ui, "Search for the word(s):", &mut st.f.words, 240.0);
+            ui.horizontal(|ui| {
+                ui.label("In:");
+                ui.radio_value(&mut st.f.in_body, false, "subject field only");
+                ui.radio_value(&mut st.f.in_body, true, "subject field and message body");
+            });
+            common::field(ui, "From:", &mut st.f.from, 280.0);
+            common::field(ui, "Sent To:", &mut st.f.sent_to, 270.0);
+            ui.horizontal(|ui| {
+                ui.label("Received in the last");
+                ui.add(egui::TextEdit::singleline(&mut st.days).desired_width(50.0));
+                ui.label("days (empty: any time)");
+            });
+            common::heading(ui, app, "More Choices");
+            ui.horizontal(|ui| {
+                ui.label("Only items that are:");
+                let mut idx = READ_CHOICES.iter().position(|(k, _)| *k == st.f.read).unwrap_or(0);
+                let labels: Vec<&str> = READ_CHOICES.iter().map(|x| x.1).collect();
+                if common::combo_idx(ui, ("vf-read", uid), &mut idx, &labels, 120.0) {
+                    st.f.read = READ_CHOICES.get(idx).map_or("", |x| x.0).to_owned();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Whose importance is:");
+                let mut idx = IMPORTANCE_CHOICES.iter().position(|(k, _)| *k == st.f.importance).unwrap_or(0);
+                let labels: Vec<&str> = IMPORTANCE_CHOICES.iter().map(|x| x.1).collect();
+                if common::combo_idx(ui, ("vf-imp", uid), &mut idx, &labels, 120.0) {
+                    st.f.importance = IMPORTANCE_CHOICES.get(idx).map_or("", |x| x.0).to_owned();
+                }
+            });
+            ui.checkbox(&mut st.f.has_attachments, "Only items with one or more attachments");
+            ui.checkbox(&mut st.f.flagged, "Only items that are flagged");
+            common::field(ui, "Category:", &mut st.f.category, 200.0);
+            let days_ok = st.days.trim().is_empty() || st.days.trim().parse::<u32>().is_ok();
+            if !days_ok {
+                ui.colored_label(app.theme.danger, "Enter a number of days.");
             }
-            match ok_cancel(ui, app, true) {
+            let mut clear = false;
+            let r = footer(ui, |ui| {
+                if btn(ui, "Cancel") {
+                    return Some(false);
+                }
+                if primary(ui, app, days_ok, "OK") {
+                    return Some(true);
+                }
+                if btn(ui, "Clear All") {
+                    clear = true;
+                }
+                None
+            });
+            if clear {
+                *st = FilterState::default();
+            }
+            match r {
                 Some(true) => {
-                    let kind = FILTERS.get(st.pick).map_or("all", |f| f.0);
-                    app.run("view.filter", json!({"kind": kind}));
+                    let mut f = st.f.clone();
+                    f.days = st.days.trim().parse().unwrap_or(0);
+                    let v = if f.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::to_value(&f).unwrap_or(Value::Null)
+                    };
+                    app.run("view.customFilter", json!({"filter": v}));
                     Out::Close
                 }
                 Some(false) => Out::Close,
@@ -329,43 +413,266 @@ fn other(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
-const FORMAT_RULES: [&str; 5] =
-    ["Unread messages", "Unread group messages", "Expired email", "Overdue email", "Messages from me"];
+/// Colours offered for Conditional Formatting fonts: (label, "#rrggbb"; empty = the list's own).
+const RULE_COLORS: [(&str, &str); 9] = [
+    ("Automatic", ""),
+    ("Red", "#c42b1c"),
+    ("Orange", "#ca5010"),
+    ("Green", "#107c10"),
+    ("Blue", "#0f6cbd"),
+    ("Purple", "#8764b8"),
+    ("Teal", "#038387"),
+    ("Gray", "#8a8886"),
+    ("Brown", "#8e562e"),
+];
+
+#[derive(Clone, Default)]
+struct RulesState {
+    rules: Vec<FormatRule>,
+    pick: Option<usize>,
+}
+
+fn rule_condition_text(r: &FormatRule) -> String {
+    match r.kind.as_str() {
+        "unread" => "Unread messages".into(),
+        "overdue" => "The follow-up due date has passed".into(),
+        "expired" => "The message's expiry date has passed".into(),
+        _ => r.condition.describe(),
+    }
+}
+
+/// Conditional Formatting: rules that change the font of matching rows, applied top to bottom
+/// (`view.conditionalFormatting`). The built-in rules can be turned off but not removed.
+fn rules(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let folder = app.s.selection.folder;
+    let init = |a: &App| RulesState { rules: mailview::rules(&a.s, folder), pick: Some(0) };
+    with_state(ctx, app, uid, init, |st, app| {
+        window(ctx, app, d, "Conditional Formatting", 520.0, |ui, app| {
+            ui.label("Rules for this view:");
+            egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).inner_margin(4.0).show(
+                ui,
+                |ui| {
+                    ui.set_min_height(120.0);
+                    ui.set_width(ui.available_width());
+                    for (i, r) in st.rules.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut r.on, "");
+                            if ui.selectable_label(st.pick == Some(i), r.name.as_str()).clicked() {
+                                st.pick = Some(i);
+                            }
+                        });
+                    }
+                },
+            );
+            let n = st.rules.len();
+            let custom = st.pick.and_then(|i| st.rules.get(i)).is_some_and(|r| r.kind == "custom");
+            ui.horizontal(|ui| {
+                if btn_en(ui, n < mailview::MAX_RULES, "Add") {
+                    st.rules.push(FormatRule {
+                        name: "Untitled".into(),
+                        on: true,
+                        kind: "custom".into(),
+                        condition: CustomFilter::default(),
+                        font: RuleFont { bold: true, ..Default::default() },
+                    });
+                    st.pick = Some(st.rules.len().saturating_sub(1));
+                }
+                if btn_en(ui, custom, "Delete")
+                    && let Some(i) = st.pick
+                    && i < st.rules.len()
+                {
+                    st.rules.remove(i);
+                    st.pick = None;
+                }
+                if btn_en(ui, st.pick.is_some_and(|i| i > 0), "Move Up")
+                    && let Some(i) = st.pick
+                    && i > 0
+                    && i < n
+                {
+                    st.rules.swap(i, i - 1);
+                    st.pick = Some(i - 1);
+                }
+                if btn_en(ui, st.pick.is_some_and(|i| i + 1 < n), "Move Down")
+                    && let Some(i) = st.pick
+                    && i + 1 < n
+                {
+                    st.rules.swap(i, i + 1);
+                    st.pick = Some(i + 1);
+                }
+            });
+            if let Some(r) = st.pick.and_then(|i| st.rules.get_mut(i)) {
+                common::heading(ui, app, "Properties of selected rule");
+                ui.add_enabled_ui(r.kind == "custom", |ui| {
+                    common::field(ui, "Name:", &mut r.name, 260.0);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Font:");
+                    ui.checkbox(&mut r.font.bold, "Bold");
+                    ui.checkbox(&mut r.font.italic, "Italic");
+                    ui.checkbox(&mut r.font.underline, "Underline");
+                    ui.checkbox(&mut r.font.strike, "Strikethrough");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Color:");
+                    let mut idx = RULE_COLORS
+                        .iter()
+                        .position(|(_, h)| h.eq_ignore_ascii_case(&r.font.color))
+                        .unwrap_or(0);
+                    let labels: Vec<&str> = RULE_COLORS.iter().map(|x| x.0).collect();
+                    if common::combo_idx(ui, ("cf-color", uid), &mut idx, &labels, 140.0) {
+                        r.font.color = RULE_COLORS.get(idx).map_or("", |x| x.1).to_owned();
+                    }
+                });
+                if r.kind == "custom" {
+                    ui.label("Condition (the row matches every part that is filled in):");
+                    common::field(ui, "Words in the subject:", &mut r.condition.words, 220.0);
+                    common::field(ui, "From:", &mut r.condition.from, 280.0);
+                    common::field(ui, "Sent To:", &mut r.condition.sent_to, 270.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Importance:");
+                        let mut idx = IMPORTANCE_CHOICES
+                            .iter()
+                            .position(|(k, _)| *k == r.condition.importance)
+                            .unwrap_or(0);
+                        let labels: Vec<&str> = IMPORTANCE_CHOICES.iter().map(|x| x.1).collect();
+                        if common::combo_idx(ui, ("cf-imp", uid), &mut idx, &labels, 120.0) {
+                            r.condition.importance =
+                                IMPORTANCE_CHOICES.get(idx).map_or("", |x| x.0).to_owned();
+                        }
+                    });
+                    ui.checkbox(&mut r.condition.has_attachments, "With attachments");
+                } else {
+                    muted(ui, app, &format!("Condition: {}", rule_condition_text(r)));
+                }
+            }
+            let mut reset = false;
+            let res = footer(ui, |ui| {
+                if btn(ui, "Cancel") {
+                    return Some(false);
+                }
+                if primary(ui, app, true, "OK") {
+                    return Some(true);
+                }
+                if btn(ui, "Reset") {
+                    reset = true;
+                }
+                None
+            });
+            if reset {
+                st.rules = mailview::default_rules();
+                st.pick = Some(0);
+            }
+            match res {
+                Some(true) => {
+                    let rules = serde_json::to_value(&st.rules).unwrap_or(Value::Null);
+                    if app.run("view.conditionalFormatting", json!({"rules": rules})).is_some() {
+                        Out::Close
+                    } else {
+                        Out::Keep
+                    }
+                }
+                Some(false) => Out::Close,
+                None => Out::Keep,
+            }
+        })
+    })
+}
+
+/// One column in the Format Columns dialog.
+#[derive(Clone, Default)]
+struct ColFormat {
+    id: String,
+    label: String,
+    default_label: String,
+    format: String,
+    formats: Vec<(String, String)>,
+    align: String,
+    start: (String, String, String),
+}
 
 #[derive(Clone, Default)]
 struct FormatState {
-    on: Vec<bool>,
+    cols: Vec<ColFormat>,
+    pick: usize,
 }
 
-fn format(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+/// Format Columns: a column's label, display format and alignment (`view.formatColumns`).
+fn format_columns(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let columns = d.str("kind") == "columns";
-    let init = |_: &App| FormatState {
-        on: FORMAT_RULES
-            .iter()
-            .map(|r| common::pref(ctx, &format!("format.{r}")).and_then(|v| v.as_bool()).unwrap_or(true))
+    let folder = app.s.selection.folder;
+    let init = |a: &App| FormatState {
+        cols: mailview::columns(&a.s, folder)
+            .into_iter()
+            .map(|c| {
+                let def = mailview::column(c.id);
+                ColFormat {
+                    id: c.id.to_owned(),
+                    default_label: def.map_or_else(String::new, |x| x.label.to_owned()),
+                    formats: c
+                        .kind
+                        .formats()
+                        .iter()
+                        .map(|(i, l)| ((*i).to_owned(), (*l).to_owned()))
+                        .collect(),
+                    start: (c.label.clone(), c.format.to_owned(), c.align.to_owned()),
+                    label: c.label,
+                    format: c.format.to_owned(),
+                    align: c.align.to_owned(),
+                }
+            })
             .collect(),
+        pick: 0,
     };
     with_state(ctx, app, uid, init, |st, app| {
-        let title = if columns { "Format Columns" } else { "Conditional Formatting" };
-        window(ctx, app, d, title, 400.0, |ui, app| {
-            if columns {
-                muted(
-                    ui,
-                    app,
-                    "Columns use their default formats: dates as short date and time, sizes in KB.",
-                );
-                return ok_cancel(ui, app, true).map_or(Out::Keep, |_| Out::Close);
-            }
-            ui.label("Rules for this view:");
-            for (r, on) in FORMAT_RULES.iter().zip(st.on.iter_mut()) {
-                ui.checkbox(on, *r);
-            }
-            muted(ui, app, "Unread messages show in bold with an accent bar.");
+        window(ctx, app, d, "Format Columns", 460.0, |ui, app| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(150.0);
+                    ui.label("Available columns:");
+                    for (i, c) in st.cols.iter().enumerate() {
+                        if ui.selectable_label(st.pick == i, c.label.as_str()).clicked() {
+                            st.pick = i;
+                        }
+                    }
+                });
+                ui.vertical(|ui| {
+                    if let Some(c) = st.cols.get_mut(st.pick) {
+                        ui.label(
+                            RichText::new(format!("Field: {}", c.default_label)).color(app.theme.text_muted),
+                        );
+                        common::field(ui, "Label:", &mut c.label, 180.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Format:");
+                            let labels: Vec<&str> = c.formats.iter().map(|x| x.1.as_str()).collect();
+                            let mut idx = c.formats.iter().position(|x| x.0 == c.format).unwrap_or(0);
+                            if common::combo_idx(ui, ("fc-format", uid, st.pick), &mut idx, &labels, 170.0) {
+                                c.format = c.formats.get(idx).map(|x| x.0.clone()).unwrap_or_default();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Alignment:");
+                            for (v, l) in [("left", "Left"), ("center", "Center"), ("right", "Right")] {
+                                if ui.radio(c.align == v, l).clicked() {
+                                    c.align = v.to_owned();
+                                }
+                            }
+                        });
+                    }
+                });
+            });
             match ok_cancel(ui, app, true) {
                 Some(true) => {
-                    for (r, on) in FORMAT_RULES.iter().zip(st.on.iter()) {
-                        common::set_pref(ctx, &format!("format.{r}"), json!(on));
+                    for c in &st.cols {
+                        if (c.label.clone(), c.format.clone(), c.align.clone()) == c.start {
+                            continue;
+                        }
+                        let label =
+                            if c.label.trim().is_empty() { c.default_label.clone() } else { c.label.clone() };
+                        app.run(
+                            "view.formatColumns",
+                            json!({"column": c.id, "label": label, "format": c.format, "align": c.align}),
+                        );
                     }
                     Out::Close
                 }
@@ -376,95 +683,125 @@ fn format(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
-const ALL_COLUMNS: [&str; 16] = [
-    "Importance",
-    "Reminder",
-    "Icon",
-    "Flag Status",
-    "Attachment",
-    "From",
-    "Subject",
-    "Received",
-    "Size",
-    "Categories",
-    "To",
-    "Cc",
-    "Sent",
-    "Mention",
-    "Sensitivity",
-    "In Folder",
-];
-
 #[derive(Clone, Default)]
 struct ColState {
+    /// Shown column ids in order.
     shown: Vec<String>,
+    /// Width per shown column (0 = automatic).
+    widths: Vec<u16>,
+    start_widths: Vec<(String, u16)>,
     pick_avail: Option<String>,
     pick_shown: Option<usize>,
 }
 
+fn col_label(id: &str) -> &'static str {
+    mailview::column(id).map_or("", |c| c.label)
+}
+
+/// Show Columns (Add Columns, View Settings › Columns): which columns the column layout shows, in what order
+/// and how wide (`view.columns`). Module tables keep their own columns.
 fn columns(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let folder = folder_of(app, d);
-    let key = format!("columns.{}", folder.0);
-    let init = |_: &App| ColState {
-        shown: common::pref(ctx, &key)
-            .and_then(|v| v.as_array().cloned())
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-            .unwrap_or_else(|| ALL_COLUMNS.iter().take(10).map(|s| (*s).to_owned()).collect()),
-        ..Default::default()
+    let folder = app.s.selection.folder;
+    if !mailview::mail_list_folder(&app.s, folder) {
+        return window(ctx, app, d, "Show Columns", 360.0, |ui, app| {
+            muted(ui, app, "The columns of this view are fixed.");
+            ok_cancel(ui, app, true).map_or(Out::Keep, |_| Out::Close)
+        });
+    }
+    let init = |a: &App| {
+        let cols = mailview::columns(&a.s, folder);
+        let start_widths: Vec<(String, u16)> =
+            cols.iter().map(|c| (c.id.to_owned(), c.width.unwrap_or(0))).collect();
+        ColState {
+            shown: cols.iter().map(|c| c.id.to_owned()).collect(),
+            widths: cols.iter().map(|c| c.width.unwrap_or(0)).collect(),
+            start_widths,
+            ..Default::default()
+        }
     };
     with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Show Columns", 520.0, |ui, app| {
+        window(ctx, app, d, "Show Columns", 560.0, |ui, app| {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(180.0);
+                    ui.set_width(170.0);
                     ui.label("Available columns:");
-                    for c in ALL_COLUMNS.iter().filter(|c| !st.shown.iter().any(|s| s == *c)) {
-                        if ui.selectable_label(st.pick_avail.as_deref() == Some(*c), *c).clicked() {
-                            st.pick_avail = Some((*c).to_owned());
+                    for c in mailview::COLUMNS.iter().filter(|c| !st.shown.iter().any(|s| s == c.id)) {
+                        if ui.selectable_label(st.pick_avail.as_deref() == Some(c.id), c.label).clicked() {
+                            st.pick_avail = Some(c.id.to_owned());
                         }
                     }
                 });
                 ui.vertical(|ui| {
-                    if btn_en(ui, st.pick_avail.is_some(), "Add ->")
+                    if btn_en(ui, st.pick_avail.is_some() && st.shown.len() < mailview::MAX_COLUMNS, "Add ->")
                         && let Some(c) = st.pick_avail.take()
                     {
                         st.shown.push(c);
+                        st.widths.push(0);
                     }
-                    if btn_en(ui, st.pick_shown.is_some(), "<- Remove")
+                    if btn_en(ui, st.pick_shown.is_some() && st.shown.len() > 1, "<- Remove")
                         && let Some(i) = st.pick_shown.take()
                         && i < st.shown.len()
                     {
                         st.shown.remove(i);
+                        if i < st.widths.len() {
+                            st.widths.remove(i);
+                        }
                     }
                 });
                 ui.vertical(|ui| {
                     ui.label("Show these columns in this order:");
                     for (i, c) in st.shown.iter().enumerate() {
-                        if ui.selectable_label(st.pick_shown == Some(i), c).clicked() {
+                        if ui.selectable_label(st.pick_shown == Some(i), col_label(c)).clicked() {
                             st.pick_shown = Some(i);
                         }
                     }
                     ui.horizontal(|ui| {
                         if btn_en(ui, st.pick_shown.is_some_and(|i| i > 0), "Move Up")
                             && let Some(i) = st.pick_shown
+                            && i > 0
+                            && i < st.shown.len()
                         {
                             st.shown.swap(i, i - 1);
+                            if i < st.widths.len() {
+                                st.widths.swap(i, i - 1);
+                            }
                             st.pick_shown = Some(i - 1);
                         }
                         if btn_en(ui, st.pick_shown.is_some_and(|i| i + 1 < st.shown.len()), "Move Down")
                             && let Some(i) = st.pick_shown
+                            && i + 1 < st.shown.len()
                         {
                             st.shown.swap(i, i + 1);
+                            if i + 1 < st.widths.len() {
+                                st.widths.swap(i, i + 1);
+                            }
                             st.pick_shown = Some(i + 1);
                         }
                     });
+                    if let Some(i) = st.pick_shown
+                        && let Some(w) = st.widths.get_mut(i)
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label("Width:");
+                            ui.add(egui::DragValue::new(w).range(0..=mailview::MAX_WIDTH).suffix(" px"));
+                            ui.label(RichText::new("(0: automatic)").color(app.theme.text_muted));
+                        });
+                    }
                 });
             });
             match ok_cancel(ui, app, !st.shown.is_empty()) {
                 Some(true) => {
-                    common::set_pref(ctx, &key, json!(st.shown));
-                    Out::Close
+                    let mut widths = serde_json::Map::new();
+                    for (id, w) in st.shown.iter().zip(st.widths.iter()) {
+                        let before = st.start_widths.iter().find(|(k, _)| k == id).map_or(0, |(_, w)| *w);
+                        if *w != before {
+                            widths.insert(id.clone(), if *w == 0 { Value::Null } else { json!(w) });
+                        }
+                    }
+                    let ok =
+                        app.run("view.columns", json!({"columns": st.shown, "widths": widths})).is_some();
+                    if ok { Out::Close } else { Out::Keep }
                 }
                 Some(false) => Out::Close,
                 None => Out::Keep,
@@ -572,6 +909,192 @@ fn zoom(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
+/// What the Manage All Views dialog is asking for below its list.
+#[derive(Clone, Default, PartialEq)]
+enum ViewPrompt {
+    #[default]
+    None,
+    New,
+    Copy,
+    Rename,
+}
+
+#[derive(Clone, Default)]
+struct MailViewsState {
+    selected: String,
+    this_folder: bool,
+    prompt: ViewPrompt,
+    name: String,
+    /// "folder" or "all".
+    scope: String,
+    base: usize,
+}
+
+/// Manage All Views in a mail folder (`plan/outlook/dialogs.md` › manage-views): the built-in views and the
+/// saved ones with where they can be used; New, Copy, Modify, Rename, Reset, Delete and Apply View
+/// (`view.manageViews`).
+fn manage_mail_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let folder = app.s.selection.folder;
+    let current = mailview::current_view_name(&app.s, folder);
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| MailViewsState { selected: current.clone(), scope: "all".into(), ..Default::default() },
+        |st, app| {
+            window(ctx, app, d, "Manage All Views", 520.0, |ui, app| {
+                let saved = mailview::saved_views(&app.s);
+                let mut out = Out::Keep;
+                let built_in = mailview::BUILT_IN.iter().any(|b| b.eq_ignore_ascii_case(&st.selected));
+                let is_saved = saved.iter().any(|v| v.name.eq_ignore_ascii_case(&st.selected));
+                ui.horizontal_top(|ui| {
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, app.theme.separator))
+                        .inner_margin(4.0)
+                        .show(ui, |ui| {
+                            ui.set_width(320.0);
+                            ui.set_min_height(200.0);
+                            egui::Grid::new(("mmv", uid)).num_columns(2).show(ui, |ui| {
+                                ui.label(RichText::new("View Name").strong());
+                                ui.label(RichText::new("Can Be Used On").strong());
+                                ui.end_row();
+                                if !st.this_folder {
+                                    for v in mailview::BUILT_IN {
+                                        if ui
+                                            .selectable_label(st.selected.eq_ignore_ascii_case(v), v)
+                                            .clicked()
+                                        {
+                                            st.selected = v.to_owned();
+                                        }
+                                        ui.label(mailview::ALL_FOLDERS);
+                                        ui.end_row();
+                                    }
+                                }
+                                for v in &saved {
+                                    if st.this_folder && v.folder != Some(folder.0) {
+                                        continue;
+                                    }
+                                    if ui
+                                        .selectable_label(st.selected.eq_ignore_ascii_case(&v.name), &v.name)
+                                        .clicked()
+                                    {
+                                        st.selected = v.name.clone();
+                                    }
+                                    let used = match v.folder {
+                                        None => mailview::ALL_FOLDERS.to_owned(),
+                                        Some(f) => app.s.mailbox.folder(FolderId(f)).map_or_else(
+                                            || "(deleted folder)".to_owned(),
+                                            |x| x.name.clone(),
+                                        ),
+                                    };
+                                    ui.label(used);
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    ui.vertical(|ui| {
+                        if btn(ui, "New...") {
+                            st.prompt = ViewPrompt::New;
+                            st.name = String::new();
+                        }
+                        if btn_en(ui, built_in || is_saved, "Copy...") {
+                            st.prompt = ViewPrompt::Copy;
+                            st.name = format!("Copy of {}", st.selected);
+                        }
+                        if btn_en(ui, built_in || is_saved, "Modify...") {
+                            // Show the view, then edit it; OK in View Settings stores a saved view.
+                            app.run("view.manageViews", json!({"op": "apply", "name": st.selected}));
+                            let mut p = json!({"folder": folder.0});
+                            if is_saved && let Some(o) = p.as_object_mut() {
+                                o.insert("savedView".into(), json!(st.selected));
+                            }
+                            out = Out::open("advancedViewSettings", p);
+                        }
+                        if btn_en(ui, is_saved, "Rename...") {
+                            st.prompt = ViewPrompt::Rename;
+                            st.name = st.selected.clone();
+                        }
+                        if btn_en(ui, built_in, "Reset") {
+                            app.run("view.manageViews", json!({"op": "reset", "name": st.selected}));
+                        }
+                        if btn_en(ui, is_saved, "Delete")
+                            && app
+                                .run("view.manageViews", json!({"op": "delete", "name": st.selected}))
+                                .is_some()
+                        {
+                            st.selected = mailview::current_view_name(&app.s, folder);
+                        }
+                    });
+                });
+                ui.checkbox(&mut st.this_folder, "Only show views created for this folder");
+                if st.prompt != ViewPrompt::None {
+                    let title = match st.prompt {
+                        ViewPrompt::New => "Create a New View",
+                        ViewPrompt::Copy => "Copy View",
+                        _ => "Rename View",
+                    };
+                    common::heading(ui, app, title);
+                    common::field(ui, "Name of new view:", &mut st.name, 220.0);
+                    if st.prompt == ViewPrompt::New {
+                        ui.horizontal(|ui| {
+                            ui.label("Type of view:");
+                            common::combo_idx(
+                                ui,
+                                ("mmv-base", uid),
+                                &mut st.base,
+                                &mailview::BUILT_IN,
+                                120.0,
+                            );
+                        });
+                    }
+                    if st.prompt != ViewPrompt::Rename {
+                        ui.label("Can be used on:");
+                        ui.radio_value(&mut st.scope, "folder".to_owned(), "This folder");
+                        ui.radio_value(&mut st.scope, "all".to_owned(), mailview::ALL_FOLDERS);
+                    }
+                    ui.horizontal(|ui| {
+                        if btn_en(ui, !st.name.trim().is_empty(), "OK") {
+                            let p = match st.prompt {
+                                ViewPrompt::New => json!({
+                                    "op": "new",
+                                    "name": st.name.trim(),
+                                    "base": mailview::BUILT_IN.get(st.base).copied().unwrap_or("Compact"),
+                                    "scope": st.scope,
+                                }),
+                                ViewPrompt::Copy => json!({
+                                    "op": "copy", "name": st.selected, "newName": st.name.trim(), "scope": st.scope,
+                                }),
+                                _ => json!({"op": "rename", "name": st.selected, "newName": st.name.trim()}),
+                            };
+                            if app.run("view.manageViews", p).is_some() {
+                                st.selected = st.name.trim().to_owned();
+                                st.prompt = ViewPrompt::None;
+                            }
+                        }
+                        if btn(ui, "Cancel") {
+                            st.prompt = ViewPrompt::None;
+                        }
+                    });
+                }
+                if !matches!(out, Out::Keep) {
+                    return out;
+                }
+                footer(ui, |ui| {
+                    if btn(ui, "Close") {
+                        return Out::Close;
+                    }
+                    if primary(ui, app, built_in || is_saved, "Apply View") {
+                        app.run("view.manageViews", json!({"op": "apply", "name": st.selected}));
+                        return Out::Close;
+                    }
+                    Out::Keep
+                })
+            })
+        },
+    )
+}
+
 #[derive(Clone, Default)]
 struct ViewsState {
     selected: String,
@@ -584,10 +1107,8 @@ fn manage_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     if views.is_empty() {
         views = vec!["Compact".into(), "Single".into(), "Preview".into()];
     }
-    let saved: Vec<String> = common::pref(ctx, "views.saved")
-        .and_then(|v| v.as_array().cloned())
-        .map(|a| a.iter().filter_map(|x| x.get("name").and_then(Value::as_str).map(str::to_owned)).collect())
-        .unwrap_or_default();
+    // Saved module views come in `views` after the built-in ones.
+    let saved: Vec<String> = Vec::new();
     let current = d.str("current");
     with_state(
         ctx,
@@ -612,16 +1133,18 @@ fn manage_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                     if ui.selectable_label(st.selected.eq_ignore_ascii_case(v), v).clicked() {
                                         st.selected = v.clone();
                                     }
-                                    ui.label("All Mail and Post folders");
+                                    ui.label("This folder");
                                     ui.end_row();
                                 }
                             });
                         });
                     ui.vertical(|ui| {
                         ui.add_enabled(false, egui::Button::new("New...").min_size(egui::vec2(90.0, 24.0)));
-                        if btn(ui, "Copy...") {
-                            out =
-                                Out::open("saveViewAs", json!({"name": format!("Copy of {}", st.selected)}));
+                        if btn_en(ui, !st.selected.is_empty(), "Copy...") {
+                            // The module's Save View dialog saves the current view: show the chosen one first.
+                            app.run("view.changeView", json!({"name": st.selected}));
+                            app.run("view.saveViewAs", json!({"name": format!("Copy of {}", st.selected)}));
+                            out = Out::Close;
                         }
                         if btn(ui, "Modify...") {
                             app.run("view.viewSettings", json!({}));
@@ -641,7 +1164,7 @@ fn manage_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     }
                     if primary(ui, app, !st.selected.is_empty(), "Apply View") {
                         if views.iter().any(|v| v.eq_ignore_ascii_case(&st.selected)) {
-                            app.run("view.changeView", json!({"name": st.selected.to_lowercase()}));
+                            app.run("view.changeView", json!({"name": st.selected}));
                         }
                         return Out::Close;
                     }
@@ -655,9 +1178,11 @@ fn manage_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 #[derive(Clone, Default)]
 struct NameState {
     name: String,
-    error: String,
+    /// "folder" or "all".
+    scope: String,
 }
 
+/// Save Current View As a New View: a name and where the view can be used (`view.saveViewAs`).
 fn save_view_as(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let start = d.str("name");
@@ -665,33 +1190,18 @@ fn save_view_as(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         ctx,
         app,
         uid,
-        |_: &App| NameState { name: start.clone(), ..Default::default() },
+        |_: &App| NameState { name: start.clone(), scope: "all".into() },
         |st, app| {
-            window(ctx, app, d, "Save Current View As a New View", 380.0, |ui, app| {
+            window(ctx, app, d, "Save Current View As a New View", 400.0, |ui, app| {
                 common::field(ui, "Name of new view:", &mut st.name, 220.0);
-                ui.label("Can be used on: All Mail and Post folders");
-                if !st.error.is_empty() {
-                    ui.colored_label(app.theme.danger, &st.error);
-                }
+                ui.label("Can be used on:");
+                ui.radio_value(&mut st.scope, "folder".to_owned(), "This folder");
+                ui.radio_value(&mut st.scope, "all".to_owned(), mailview::ALL_FOLDERS);
                 match ok_cancel(ui, app, !st.name.trim().is_empty()) {
                     Some(true) => {
-                        let name = st.name.trim();
-                        if ["compact", "single", "preview"].contains(&name.to_lowercase().as_str()) {
-                            st.error = format!("A view named \"{name}\" already exists.");
-                            return Out::Keep;
-                        }
-                        let settings = d.get("settings").cloned().unwrap_or_else(|| {
-                            serde_json::to_value(view_settings(&app.s, app.s.selection.folder))
-                                .unwrap_or(Value::Null)
-                        });
-                        let mut prefs = common::prefs(ctx);
-                        let list = prefs.values.entry("views.saved").or_insert_with(|| json!([]));
-                        if let Some(a) = list.as_array_mut() {
-                            a.retain(|x| x.get("name").and_then(Value::as_str) != Some(name));
-                            a.push(json!({"name": name, "settings": settings}));
-                        }
-                        common::set_prefs(ctx, prefs);
-                        Out::Close
+                        let p = json!({"name": st.name.trim(), "scope": st.scope, "confirm": true});
+                        // A refused name (a built-in view's) keeps the dialog open; the error shows as a toast.
+                        if app.run("view.saveViewAs", p).is_some() { Out::Close } else { Out::Keep }
                     }
                     Some(false) => Out::Close,
                     None => Out::Keep,
@@ -769,47 +1279,54 @@ fn apply_view(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     )
 }
 
-const QUICK_ACTIONS: [&str; 8] = [
-    "None",
-    "Delete",
-    "Archive",
-    "Flag / Unflag",
-    "Mark as Read / Unread",
-    "Move",
-    "Pin / Unpin",
-    "Categorize",
-];
-
 #[derive(Clone, Default)]
 struct QaState {
-    first: String,
-    second: String,
+    first: usize,
+    second: usize,
 }
 
+/// Quick Actions: the two buttons a hovered message row shows (`view.quickActions`).
 fn quick_actions(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let s = |k: &str, def: &str| {
-        common::pref(ctx, k).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| def.to_owned())
+    let idx = |id: &str| mailview::QUICK_ACTIONS.iter().position(|(k, _)| *k == id).unwrap_or(0);
+    let init = |a: &App| {
+        let [first, second] = mailview::quick_actions(&a.s);
+        QaState { first: idx(first), second: idx(second) }
     };
-    let init = |_: &App| QaState {
-        first: s("quickActions.1", "Flag / Unflag"),
-        second: s("quickActions.2", "Delete"),
-    };
+    let labels: Vec<&str> = mailview::QUICK_ACTIONS.iter().map(|x| x.1).collect();
     with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Quick Actions", 360.0, |ui, app| {
+        window(ctx, app, d, "Quick Actions", 380.0, |ui, app| {
             muted(ui, app, "Choose the buttons shown on a message when you point at it in the list.");
             ui.horizontal(|ui| {
-                ui.label("First action:");
-                common::combo(ui, ("qa1", uid), &mut st.first, &QUICK_ACTIONS, 180.0);
+                ui.label("First button (right edge):");
+                common::combo_idx(ui, ("qa1", uid), &mut st.first, &labels, 180.0);
             });
             ui.horizontal(|ui| {
-                ui.label("Second action:");
-                common::combo(ui, ("qa2", uid), &mut st.second, &QUICK_ACTIONS, 180.0);
+                ui.label("Second button:");
+                common::combo_idx(ui, ("qa2", uid), &mut st.second, &labels, 180.0);
             });
-            match ok_cancel(ui, app, true) {
+            let mut reset = false;
+            let r = footer(ui, |ui| {
+                if btn(ui, "Cancel") {
+                    return Some(false);
+                }
+                if primary(ui, app, true, "OK") {
+                    return Some(true);
+                }
+                if btn(ui, "Reset") {
+                    reset = true;
+                }
+                None
+            });
+            if reset {
+                let [a, b] = mailview::DEFAULT_QUICK_ACTIONS;
+                st.first = idx(a);
+                st.second = idx(b);
+            }
+            match r {
                 Some(true) => {
-                    common::set_pref(ctx, "quickActions.1", json!(st.first));
-                    common::set_pref(ctx, "quickActions.2", json!(st.second));
+                    let id = |i: usize| mailview::QUICK_ACTIONS.get(i).map_or("none", |x| x.0);
+                    app.run("view.quickActions", json!({"actions": [id(st.first), id(st.second)]}));
                     Out::Close
                 }
                 Some(false) => Out::Close,
@@ -817,4 +1334,115 @@ fn quick_actions(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use serde_json::json;
+
+    use crate::App;
+    use mailcraft_engine::cmd::view::mail as mailview;
+    use mailcraft_engine::sample::sample_session;
+
+    fn harness() -> Harness<'static, App> {
+        let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+            |ui, app: &mut App| {
+                let ctx = ui.ctx().clone();
+                crate::dialogs::dialogs(&ctx, app);
+            },
+            App::new(sample_session()),
+        );
+        h.run_steps(2);
+        h
+    }
+
+    fn open(h: &mut Harness<'static, App>, id: &str, p: serde_json::Value) {
+        h.state_mut().run(id, p).unwrap();
+        h.run_steps(3);
+    }
+
+    #[test]
+    fn show_columns_adds_a_column() {
+        let mut h = harness();
+        open(&mut h, "view.addColumns", json!({}));
+        h.get_by_label("Cc").click();
+        h.run();
+        h.get_by_label("Add ->").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        let s = &h.state().s;
+        let ids: Vec<&str> = mailview::columns(s, s.selection.folder).iter().map(|c| c.id).collect();
+        assert_eq!(ids.last(), Some(&"cc"));
+        assert!(h.query_by_label("Show Columns").is_none(), "closed");
+    }
+
+    #[test]
+    fn save_view_as_for_this_folder() {
+        let mut h = harness();
+        open(&mut h, "view.saveViewAs", json!({"name": "Team"}));
+        h.get_by_label("This folder").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        let s = &h.state().s;
+        let saved = mailview::saved_views(s);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved.first().and_then(|v| v.folder), Some(s.selection.folder.0));
+        assert_eq!(mailview::current_view_name(s, s.selection.folder), "Team");
+    }
+
+    #[test]
+    fn manage_views_copy_and_delete() {
+        let mut h = harness();
+        open(&mut h, "view.manageViews", json!({}));
+        assert!(h.query_by_label("Manage All Views").is_some());
+        h.get_by_label("Copy...").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        let names: Vec<String> = mailview::saved_views(&h.state().s).into_iter().map(|v| v.name).collect();
+        assert_eq!(names, ["Copy of Compact"]);
+        // The window shrinks once the name prompt closes: let it settle before clicking.
+        h.run_steps(6);
+        h.get_by_label("Delete").click();
+        h.run_steps(2);
+        assert!(mailview::saved_views(&h.state().s).is_empty());
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(h.query_by_label("Manage All Views").is_none());
+    }
+
+    #[test]
+    fn filter_and_rules_dialogs_apply() {
+        let mut h = harness();
+        open(&mut h, "view.customFilter", json!({}));
+        h.get_by_label("Only items that are flagged").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        let folder = h.state().s.selection.folder;
+        assert!(mailview::custom_filter(&h.state().s, folder).is_some_and(|f| f.flagged));
+        open(&mut h, "view.conditionalFormatting", json!({}));
+        h.get_by_label("Add").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        assert_eq!(mailview::rules(&h.state().s, folder).len(), mailview::default_rules().len() + 1);
+    }
+
+    #[test]
+    fn quick_actions_dialog_keeps_the_choice() {
+        let mut h = harness();
+        h.state_mut().run("view.quickActions", json!({"actions": ["archive", "pin"]})).unwrap();
+        open(&mut h, "view.quickActions", json!({}));
+        assert!(h.query_by_label("Quick Actions").is_some());
+        h.get_by_label("Reset").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        assert_eq!(mailview::quick_actions(&h.state().s), mailview::DEFAULT_QUICK_ACTIONS);
+    }
 }

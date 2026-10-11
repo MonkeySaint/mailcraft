@@ -727,30 +727,21 @@ pub fn account_menu(ui: &mut Ui, app: &mut App, account: u32) {
 // Status bar
 
 /// Status bar elements (Customize Status Bar): (key used by `view.statusBar`, label).
-pub const STATUS_BAR_ITEMS: [(&str, &str); 11] = [
-    ("quota", "Quota Information"),
-    ("filter", "Filter"),
-    ("itemsInView", "Items in View"),
-    ("headerItems", "Header Items in View"),
-    ("unreadItems", "Unread Items in View"),
-    ("unseenItems", "Unseen Items in View"),
-    ("reminders", "Reminders"),
-    ("groupNotifications", "Group Notifications"),
-    ("viewShortcuts", "View Shortcuts"),
-    ("zoomSlider", "Zoom Slider"),
-    ("zoom", "Zoom"),
-];
+pub const STATUS_BAR_ITEMS: [(&str, &str); 11] = mailcraft_engine::cmd::view::mail::STATUS_ITEMS;
 
-/// Which status bar elements are hidden (the session keeps no field for this; the UI does).
+/// Which status bar elements are hidden: a copy of the engine's setting (`view.statusBar`, saved with the
+/// profile) refreshed when the settings change.
 #[derive(Clone, Debug)]
 pub struct StatusBarItems {
     pub hidden: BTreeSet<String>,
+    /// Settings revision the copy was taken at (`None`: never taken; the defaults apply).
+    rev: Option<u64>,
 }
 
 impl Default for StatusBarItems {
     fn default() -> Self {
         // Quota Information is off by default; everything else shows.
-        StatusBarItems { hidden: ["quota".to_owned()].into_iter().collect() }
+        StatusBarItems { hidden: ["quota".to_owned()].into_iter().collect(), rev: None }
     }
 }
 
@@ -764,14 +755,35 @@ fn status_id() -> Id {
     Id::new("mailcraft.menus.statusBar")
 }
 
-/// Current status bar element visibility (the status bar reads this when drawing).
+/// Status bar element visibility as last read from the engine (the defaults before the first read).
 pub fn status_bar_items(ctx: &egui::Context) -> StatusBarItems {
     ctx.data_mut(|d| d.get_temp_mut_or_default::<StatusBarItems>(status_id()).clone())
+}
+
+/// Status bar element visibility from the engine's settings (read again only when they changed).
+pub fn status_bar_items_of(ctx: &egui::Context, app: &App) -> StatusBarItems {
+    let rev = app.s.settings.rev();
+    let cur = status_bar_items(ctx);
+    if cur.rev == Some(rev) {
+        return cur;
+    }
+    let fresh =
+        StatusBarItems { hidden: mailcraft_engine::cmd::view::mail::status_hidden(&app.s), rev: Some(rev) };
+    ctx.data_mut(|d| d.insert_temp(status_id(), fresh.clone()));
+    fresh
 }
 
 /// Whether one status bar element (`STATUS_BAR_ITEMS` key) is shown.
 pub fn status_bar_item_shown(ctx: &egui::Context, key: &str) -> bool {
     status_bar_items(ctx).shown(key)
+}
+
+/// The list is filtered: Filter Email, a View Settings filter or a search.
+pub fn filter_applied(app: &App) -> bool {
+    let folder = app.s.selection.folder;
+    queries::view_settings(&app.s, folder).filter != ListFilter::All
+        || !app.s.view.search.trim().is_empty()
+        || mailcraft_engine::cmd::view::mail::custom_filter(&app.s, folder).is_some()
 }
 
 /// `7219` → `"7,219"`.
@@ -789,13 +801,16 @@ pub fn thousands(n: usize) -> String {
 
 /// Customize Status Bar menu (right-click on the status bar).
 pub fn status_bar_menu(ui: &mut Ui, app: &mut App) {
-    let items = status_bar_items(ui.ctx());
+    let items = status_bar_items_of(ui.ctx(), app);
     let (in_view, unread) = queries::status_counts(&app.s);
-    let filtered = queries::view_settings(&app.s, app.s.selection.folder).filter != ListFilter::All
-        || !app.s.view.search.trim().is_empty();
+    let filtered = filter_applied(app);
     for (key, label) in STATUS_BAR_ITEMS {
         let value = match key {
             "quota" => "Off".to_owned(),
+            "headerItems" => {
+                let n = queries::header_items_in_view(&app.s);
+                if n > 0 { thousands(n) } else { String::new() }
+            }
             "filter" => {
                 if filtered {
                     "Filter Applied".to_owned()
@@ -816,17 +831,9 @@ pub fn status_bar_menu(ui: &mut Ui, app: &mut App) {
             paint_glyph(ui, app, rect, &Glyph::Check(on), true);
         }
         if resp.response.clicked() {
-            let show = !on;
-            if app.run("view.statusBar", json!({"item": key, "show": show})).is_some() {
-                ui.ctx().data_mut(|d| {
-                    let s = d.get_temp_mut_or_default::<StatusBarItems>(status_id());
-                    if show {
-                        s.hidden.remove(key);
-                    } else {
-                        s.hidden.insert(key.to_owned());
-                    }
-                });
-            }
+            // The engine keeps the state; the next read of the settings picks it up.
+            app.run("view.statusBar", json!({"item": key, "show": !on}));
+            status_bar_items_of(ui.ctx(), app);
             ui.close();
         }
     }
@@ -878,4 +885,21 @@ pub fn arrange_menu(ui: &mut Ui, app: &mut App) {
     let inbox = app.s.current_account().and_then(|a| app.s.mailbox.role_folder(a, FolderRole::Inbox));
     let focused = inbox.is_some_and(|i| queries::view_settings(&app.s, i).focused_inbox);
     check_cmd(ui, app, focused, "Show Focused Inbox", "view.focusedInbox", json!({}));
+}
+
+/// Context menu of a column header (column layout): the "By Date ▾" menu, then the column's own commands.
+pub fn column_header_menu(ui: &mut Ui, app: &mut App, column: &str) {
+    arrange_menu(ui, app);
+    ui.separator();
+    cmd(ui, app, "table", "Add Columns...", "view.addColumns", json!({}));
+    cmd(ui, app, "settings", "Format Columns...", "view.formatColumns", json!({}));
+    let shown = mailcraft_engine::cmd::view::mail::columns(&app.s, app.s.selection.folder);
+    let removable = shown.len() > 1 && shown.iter().any(|c| c.id == column);
+    cmd_if(ui, app, "minus", "Remove This Column", removable, "view.columns", json!({"remove": column}));
+    let sized = mailcraft_engine::cmd::view::mail::mail_view(&app.s, app.s.selection.folder)
+        .widths
+        .contains_key(column);
+    cmd_if(ui, app, "", "Automatic Width", sized, "view.columns", json!({"widths": {column: null}}));
+    ui.separator();
+    cmd(ui, app, "settings", "View Settings...", "view.viewSettings", json!({}));
 }

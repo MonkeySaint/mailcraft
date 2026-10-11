@@ -40,7 +40,9 @@ pub enum FolderRowKind {
     Folder,
 }
 
-/// One row of the message list (an item or a group header).
+/// One row of the message list (an item or a group header). Nearly every row is an item, so boxing it would
+/// only add an allocation per row.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ListRow {
     Group { label: String, count: usize, collapsed: bool },
@@ -78,6 +80,29 @@ pub struct ItemRow {
     /// conversations of a single message).
     #[serde(default)]
     pub conversation: Option<ConversationRow>,
+    /// Font from the view's Conditional Formatting rules (`cmd::view::mail`).
+    #[serde(default)]
+    pub style: RowStyle,
+    /// Pinned to the top of the list (Quick Action Pin).
+    #[serde(default)]
+    pub pinned: bool,
+    /// Only the header was downloaded (Send / Receive › Download Headers).
+    #[serde(default)]
+    pub header_only: bool,
+    /// Marked to download (`Some(true)`: Mark to Download Message Copy).
+    #[serde(default)]
+    pub marked: Option<bool>,
+}
+
+/// Font effects of a list row (Conditional Formatting). The default is plain text in the list's colours.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    /// "#rrggbb" text colour.
+    pub color: Option<String>,
 }
 
 /// Conversation part of a message-list row (Show as Conversations).
@@ -292,8 +317,27 @@ fn view_items(s: &Session) -> (ViewSettings, Vec<&MailItem>) {
             });
         }
     }
+    // View Settings › Filter.
+    if let Some(f) = crate::cmd::view::mail::custom_filter(s, folder) {
+        items.retain(|m| f.matches(s, m));
+    }
     sort_items(s, &vs, &mut items);
+    // Pinned messages lead the list (conversations keep their own order).
+    if !vs.conversations {
+        let pins = crate::cmd::view::mail::pinned(s);
+        if !pins.is_empty() {
+            let (mut top, rest): (Vec<&MailItem>, Vec<&MailItem>) =
+                items.into_iter().partition(|m| pins.contains(&m.id));
+            top.extend(rest);
+            items = top;
+        }
+    }
     (vs, items)
+}
+
+/// Pinned messages of the list (empty in conversation view, which keeps its own order).
+fn list_pins(s: &Session, vs: &ViewSettings) -> BTreeSet<ItemId> {
+    if vs.conversations { BTreeSet::new() } else { crate::cmd::view::mail::pinned(s) }
 }
 
 /// Primary sort / group key.
@@ -439,13 +483,24 @@ fn sort_items(s: &Session, vs: &ViewSettings, items: &mut [&MailItem]) {
 ///
 /// Items group by their sort key (so "Alice Rivera" and "alice rivera", or "Re: Plans" and "plans", share
 /// one group); Date groups by its bucket. The header shows the label of the group's first item.
+///
+/// Pinned messages (`pins`, already first in `items`) form a group of their own at the top.
 fn grouped<'a>(
     s: &Session,
     arrange: ArrangeBy,
     items: Vec<&'a MailItem>,
+    pins: &BTreeSet<ItemId>,
 ) -> Vec<(String, Vec<&'a MailItem>)> {
     let mut out: Vec<(Key, String, Vec<&'a MailItem>)> = Vec::new();
     for m in items {
+        if pins.contains(&m.id) {
+            let id = Key::Text("\u{1}pinned".to_owned());
+            match out.last_mut() {
+                Some((last, _, list)) if *last == id => list.push(m),
+                _ => out.push((id, crate::cmd::view::mail::PINNED_LABEL.to_owned(), vec![m])),
+            }
+            continue;
+        }
         let (key, label) = group_of(s, m, arrange);
         let id = if arrange == ArrangeBy::Date { Key::Text(label.clone()) } else { key };
         match out.last_mut() {
@@ -464,7 +519,7 @@ fn group_ids(s: &Session) -> Vec<(String, Vec<ItemId>)> {
         let convs = build_conversations(s, &vs, items);
         let by_sort: HashMap<ItemId, &ListConversation> = convs.iter().map(|c| (c.sort_item, c)).collect();
         let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
-        return grouped(s, vs.arrange_by, reps)
+        return grouped(s, vs.arrange_by, reps, &BTreeSet::new())
             .into_iter()
             .map(|(label, list)| {
                 let ids = list
@@ -476,10 +531,35 @@ fn group_ids(s: &Session) -> Vec<(String, Vec<ItemId>)> {
             })
             .collect();
     }
-    grouped(s, vs.arrange_by, items)
+    let pins = list_pins(s, &vs);
+    grouped(s, vs.arrange_by, items, &pins)
         .into_iter()
         .map(|(label, list)| (label, list.into_iter().map(|m| m.id).collect()))
         .collect()
+}
+
+/// Header labels of the list's groups, in list order (collapsed groups included).
+pub fn group_labels(s: &Session) -> Vec<String> {
+    group_ids(s).into_iter().map(|(label, _)| label).collect()
+}
+
+/// Status bar "Header Items in View": items of the view whose body was not downloaded yet.
+pub fn header_items_in_view(s: &Session) -> usize {
+    // Only server accounts download headers alone; skip the view walk for local profiles.
+    if s.mailbox.accounts.iter().all(|a| a.kind == mailcraft_model::AccountKind::Local) {
+        return 0;
+    }
+    view_items(s).1.into_iter().filter(|m| header_only(s, m)).count()
+}
+
+/// Only the header of `m` was downloaded (an item of a server account; local items never are).
+fn header_only(s: &Session, m: &MailItem) -> bool {
+    let server = s
+        .mailbox
+        .folder_account(m.folder)
+        .and_then(|a| s.mailbox.account(a))
+        .is_some_and(|a| a.kind != mailcraft_model::AccountKind::Local);
+    server && crate::sync::cmds::is_header_only(s, m.id)
 }
 
 /// Header label of the group `item` falls in under the selected folder's arrangement.
@@ -609,12 +689,45 @@ fn item_row(s: &Session, m: &MailItem) -> ItemRow {
         conversation_depth: 0,
         accessible,
         conversation: None,
+        style: RowStyle::default(),
+        pinned: false,
+        header_only: false,
+        marked: None,
     }
 }
 
 /// Message list rows for the selected folder with the folder's view settings (filter, Focused/Other,
 /// search, arrange/sort, groups and collapsed groups, conversations).
 pub fn list_rows(s: &Session) -> Vec<ListRow> {
+    let mut rows = undecorated_rows(s);
+    decorate(s, &mut rows);
+    rows
+}
+
+/// Conditional Formatting, pins and download state of every item row.
+fn decorate(s: &Session, rows: &mut [ListRow]) {
+    let rules = crate::cmd::view::mail::rules(s, s.selection.folder);
+    let pins = crate::cmd::view::mail::pinned(s);
+    for r in rows.iter_mut() {
+        let ListRow::Item(row) = r else { continue };
+        let Some(m) = s.mailbox.mail.get(&row.id) else { continue };
+        row.style = crate::cmd::view::mail::row_style(s, &rules, m, row.unread);
+        row.pinned = pins.contains(&m.id);
+        row.header_only = header_only(s, m);
+        row.marked = crate::sync::cmds::marked(s, m.id);
+        if row.pinned {
+            row.accessible.push_str("Pinned, ");
+        }
+        match row.marked {
+            Some(true) => row.accessible.push_str("Marked to Download Message Copy, "),
+            Some(false) => row.accessible.push_str("Marked to Download, "),
+            None if row.header_only => row.accessible.push_str("Header Only, "),
+            None => {}
+        }
+    }
+}
+
+fn undecorated_rows(s: &Session) -> Vec<ListRow> {
     let (vs, items) = view_items(s);
     if vs.conversations {
         return conversation_rows(s, &vs, items);
@@ -623,8 +736,9 @@ pub fn list_rows(s: &Session) -> Vec<ListRow> {
         return items.into_iter().map(|m| ListRow::Item(item_row(s, m))).collect();
     }
     let collapsed = collapsed_labels(s);
+    let pins = list_pins(s, &vs);
     let mut rows = Vec::new();
-    for (label, list) in grouped(s, vs.arrange_by, items) {
+    for (label, list) in grouped(s, vs.arrange_by, items, &pins) {
         let is_collapsed = group_collapsed(s, &vs, &collapsed, &label, &list);
         rows.push(ListRow::Group { label, count: list.len(), collapsed: is_collapsed });
         if !is_collapsed {
@@ -654,7 +768,8 @@ fn group_collapsed(
 ) -> bool {
     !collapsed.is_empty()
         && (collapsed.iter().any(|c| c == label)
-            || list.iter().any(|m| {
+            // The pinned group goes by its own label only (its items belong to other groups too).
+            || label != crate::cmd::view::mail::PINNED_LABEL && list.iter().any(|m| {
                 let other = crate::cmd::view::group_label(s, m, vs.arrange_by);
                 collapsed.contains(&other)
             }))
@@ -846,7 +961,7 @@ fn conversation_rows(s: &Session, vs: &ViewSettings, items: Vec<&MailItem>) -> V
     let by_sort: HashMap<ItemId, &ListConversation> = convs.iter().map(|c| (c.sort_item, c)).collect();
     let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
     let collapsed = collapsed_labels(s);
-    for (label, list) in grouped(s, vs.arrange_by, reps) {
+    for (label, list) in grouped(s, vs.arrange_by, reps, &BTreeSet::new()) {
         let group: Vec<&ListConversation> = list.iter().filter_map(|m| by_sort.get(&m.id).copied()).collect();
         let is_collapsed = group_collapsed(s, vs, &collapsed, &label, &list);
         let count = group.iter().map(|c| c.items.len().saturating_sub(c.other.len())).sum();

@@ -78,6 +78,20 @@ fn is_mirror(key: &str) -> bool {
     key.starts_with("options.") || LEGACY_PREFS.iter().any(|(_, p)| *p == key)
 }
 
+/// Keys of the saved dialog settings that the engine writes itself (saved views, Quick Actions, status bar
+/// items: `cmd::view::mail`). The shell copies them in but never writes them back.
+fn is_engine(key: &str) -> bool {
+    key.starts_with(mailcraft_engine::cmd::view::mail::PREF_PREFIX)
+}
+
+/// The engine-written part of the saved dialog settings.
+fn engine_prefs(app: &App) -> Map<String, Value> {
+    match app.s.settings.get("state.uiPrefs") {
+        Some(Value::Object(saved)) => saved.into_iter().filter(|(k, _)| is_engine(k)).collect(),
+        _ => Map::new(),
+    }
+}
+
 /// What [`sync_ui_prefs`] last saw.
 #[derive(Clone, Copy, Debug, Default)]
 struct PrefSync {
@@ -107,9 +121,14 @@ pub(crate) fn sync_ui_prefs(ctx: &egui::Context, app: &mut App) {
         touched = true;
     }
     if touched || p.rev != sync.prefs_rev {
-        // A dialog changed its settings: save them with the profile.
-        let own: Map<String, Value> =
-            p.values.iter().filter(|(k, _)| !is_mirror(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+        // A dialog changed its settings: save them with the profile (the engine's own keys as it has them).
+        let mut own: Map<String, Value> = p
+            .values
+            .iter()
+            .filter(|(k, _)| !is_mirror(k) && !is_engine(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        own.extend(engine_prefs(app));
         let own = Value::Object(own);
         if app.s.settings.get("state.uiPrefs").as_ref() != Some(&own)
             && let Err(e) = app.s.set_option("state.uiPrefs", &own)
@@ -119,6 +138,8 @@ pub(crate) fn sync_ui_prefs(ctx: &egui::Context, app: &mut App) {
         sync.prefs_rev = p.rev;
     }
     if sync.settings_rev != Some(app.s.settings.rev()) {
+        p.values.retain(|k, _| !is_engine(k));
+        p.values.extend(engine_prefs(app));
         for d in mailcraft_engine::settings::DEFS {
             if d.page == "state" {
                 continue;
@@ -947,6 +968,11 @@ fn t_to_zoom(t: f32) -> u16 {
     p
 }
 
+/// The status bar (`plan/outlook/layout.md`, `message-list.md` › Customize Status Bar): items in view, unread,
+/// header items, filter and reminders at the left, then send/receive progress; view shortcuts and the zoom
+/// slider and percentage at the right. Each element can be hidden from the right-click menu (`view.statusBar`,
+/// saved with the profile). Every part stays down to the 400-px minimum window (`responsive.md`); only the
+/// slider gets shorter.
 pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
     let bar = ui.max_rect();
     let theme = app.theme.clone();
@@ -954,26 +980,36 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
     ui.painter().hline(bar.x_range(), bar.top() + 0.5, Stroke::new(1.0, theme.separator));
     let bg = ui.interact(bar, ui.id().with("mc_status_bg"), Sense::click());
     bg.context_menu(|ui| crate::menus::status_bar_menu(ui, app));
+    let items = crate::menus::status_bar_items_of(ui.ctx(), app);
 
     ui.visuals_mut().override_text_color = Some(theme.text_muted);
     ui.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
     ui.spacing_mut().interact_size.y = 20.0;
-    ui.spacing_mut().item_spacing.x = 14.0;
+    ui.spacing_mut().item_spacing.x = if frame.width < 600.0 { 8.0 } else { 14.0 };
     ui.add_space(10.0);
 
     if app.mail_like_module() {
-        let (items, unread) = mailcraft_engine::queries::status_counts(&app.s);
-        ui.label(format!("Items: {items}"));
-        if unread > 0 {
-            ui.label(format!("Unread: {unread}"));
+        let s = &app.s;
+        let (count, unread) = mailcraft_engine::queries::status_counts(s);
+        if items.shown("itemsInView") {
+            ui.label(format!("Items: {}", crate::menus::thousands(count)));
         }
-        if !app.s.view.search.is_empty() {
+        if items.shown("unreadItems") && unread > 0 {
+            ui.label(format!("Unread: {}", crate::menus::thousands(unread)));
+        }
+        if items.shown("headerItems") {
+            let headers = mailcraft_engine::queries::header_items_in_view(s);
+            if headers > 0 {
+                ui.label(format!("Header Items: {}", crate::menus::thousands(headers)));
+            }
+        }
+        if items.shown("filter") && crate::menus::filter_applied(app) {
             ui.label("Filter applied");
         }
     }
     // The Reminders window's last scan (also counts flagged mail); before its first scan, a direct count.
     let due = reminders_due(app).max(crate::modules::reminders_due(ui.ctx()));
-    if due > 0 {
+    if due > 0 && items.shown("reminders") {
         let r = widgets::icon_button(ui, app, "bell", &format!("Reminders: {due}"), true);
         if r.clicked() {
             app.run("view.reminderWindow", json!({}));
@@ -981,22 +1017,23 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
     }
     sync_status(ui, app, frame);
 
-    // Right side: view buttons and zoom (the zoom group is dropped first on very narrow windows), then the
-    // connection state.
+    // Right side: zoom percentage, zoom slider, view shortcuts, then the connection state.
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.add_space(8.0);
         let zoom = app.s.view.zoom;
-        if frame.width > 520.0 {
-            if ui.add(egui::Button::new(format!("{zoom}%")).frame(false)).on_hover_text("Zoom").clicked() {
-                app.run("view.zoom", json!({}));
-            }
+        if items.shown("zoom")
+            && ui.add(egui::Button::new(format!("{zoom}%")).frame(false)).on_hover_text("Zoom").clicked()
+        {
+            app.run("view.zoom", json!({}));
+        }
+        if items.shown("zoomSlider") {
             if widgets::icon_only(ui, app, "zoom-in", "Zoom In", zoom < 500).clicked() {
                 let next = (zoom / 10 + 1).saturating_mul(10).min(500);
                 app.run("view.zoom", json!({ "pct": next }));
             }
             let mut t = zoom_to_t(zoom);
-            ui.spacing_mut().slider_width = 96.0;
+            ui.spacing_mut().slider_width = if frame.width < 600.0 { 56.0 } else { 96.0 };
             let slider = ui
                 .scope(|ui| {
                     ui.spacing_mut().interact_size.y = 12.0;
@@ -1015,14 +1052,18 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
                 let next = zoom.saturating_sub(1) / 10 * 10;
                 app.run("view.zoom", json!({ "pct": next.max(10) }));
             }
-            ui.add_space(10.0);
         }
-        let reading = app.s.view.reading_view;
-        if widgets::icon_toggle(ui, app, "reading-pane", "Reading", reading, 20.0).clicked() && !reading {
-            app.run("view.readingView", json!({}));
+        if items.shown("zoom") || items.shown("zoomSlider") {
+            ui.add_space(if frame.width < 600.0 { 4.0 } else { 10.0 });
         }
-        if widgets::icon_toggle(ui, app, "folder-pane", "Normal", !reading, 20.0).clicked() && reading {
-            app.run("view.normalView", json!({}));
+        if items.shown("viewShortcuts") {
+            let reading = app.s.view.reading_view;
+            if widgets::icon_toggle(ui, app, "reading-pane", "Reading", reading, 20.0).clicked() && !reading {
+                app.run("view.readingView", json!({}));
+            }
+            if widgets::icon_toggle(ui, app, "folder-pane", "Normal", !reading, 20.0).clicked() && reading {
+                app.run("view.normalView", json!({}));
+            }
         }
         connection_state(ui, app, frame);
     });
@@ -1396,6 +1437,46 @@ mod tests {
         let ctx2 = egui::Context::default();
         sync_ui_prefs(&ctx2, &mut app);
         assert_eq!(crate::dialogs::ui_pref(&ctx2, "columns.7"), Some(json!(["from", "subject"])));
+    }
+
+    #[test]
+    fn status_bar_items_follow_the_engine_and_keep_zoom_when_narrow() {
+        use egui_kittest::kittest::Queryable;
+        let app = App::new(mailcraft_engine::sample::sample_session());
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(400.0, 30.0)).build_ui_state(
+            |ui, app: &mut App| {
+                let frame = Frame::compute(400.0, 400.0);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| status_bar(ui, app, &frame));
+            },
+            app,
+        );
+        h.run();
+        assert!(h.query_by_label("Zoom In").is_some(), "the zoom slider stays at 400 px (responsive.md)");
+        assert!(h.query_by_label("Normal").is_some(), "view shortcuts");
+        assert!(h.query_all_by_label_contains("Items: ").next().is_some());
+        h.state_mut().run("view.statusBar", json!({"item": "zoomSlider", "show": false}));
+        h.state_mut().run("view.statusBar", json!({"item": "itemsInView", "show": false}));
+        h.state_mut().run("view.statusBar", json!({"item": "viewShortcuts", "show": false}));
+        h.run();
+        assert!(h.query_by_label("Zoom In").is_none());
+        assert!(h.query_by_label("Normal").is_none());
+        assert!(h.query_all_by_label_contains("Items: ").next().is_none());
+        assert!(!crate::menus::status_bar_item_shown(&h.ctx, "zoomSlider"), "the menu reads the same state");
+        // Saved with the profile settings; the shell's own dialog settings leave it alone.
+        let ctx = h.ctx.clone();
+        sync_ui_prefs(&ctx, h.state_mut());
+        let id = egui::Id::new(UI_PREFS_ID);
+        let mut p = ctx.data_mut(|d| d.get_temp::<UiPrefs>(id)).unwrap_or_default();
+        p.values.insert("columns.7".into(), json!(["a"]));
+        // A stale copy of the engine's key in the shell's memory must not overwrite the engine's value.
+        p.values.insert("view.statusBar.hidden".into(), json!([]));
+        p.rev += 1;
+        ctx.data_mut(|d| d.insert_temp(id, p));
+        sync_ui_prefs(&ctx, h.state_mut());
+        let saved = h.state().s.settings.get("state.uiPrefs").unwrap();
+        assert!(saved.get("view.statusBar.hidden").is_some());
+        assert_eq!(saved["columns.7"], json!(["a"]));
+        assert!(!mailcraft_engine::cmd::view::mail::status_item_shown(&h.state().s, "zoomSlider"));
     }
 
     #[test]

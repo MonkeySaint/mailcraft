@@ -10,7 +10,11 @@
 //! arrangement, message preview, reading pane, saved views, View Settings and Apply View act on the
 //! folder's module view ([`modules`]). In the Calendar the calendar's own view handling
 //! (`calendar::module_view`) runs first.
+//!
+//! Mail and search folders add the per-folder columns, Format Columns, Conditional Formatting, View Settings
+//! filter and saved views of [`mail`], which also keeps the window-wide Quick Actions and status bar items.
 
+pub mod mail;
 pub mod modules;
 
 use serde_json::{Value, json};
@@ -195,8 +199,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Manage Views",
             "View › Current View › Change View",
             "",
-            "",
-            false,
+            r#"{"op"?:"new"|"copy"|"rename"|"delete"|"reset"|"apply"|"update","name"?:string,"newName"?:string,"base"?:"compact"|"single"|"preview","scope"?:"all"|"folder"}"#,
+            true,
             always,
             manage_views,
         ),
@@ -216,10 +220,10 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Quick Actions",
             "Home › Tags › Follow Up",
             "",
-            "",
+            r#"{"actions"?:[string]}"#,
             false,
             always,
-            quick_actions,
+            mail::quick_actions_cmd,
         ),
         spec(
             "view.readingPane",
@@ -277,8 +281,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save View As",
             "View › Current View › Change View",
             "",
-            r#"{"name"?:string}"#,
-            false,
+            r#"{"name"?:string,"scope"?:"all"|"folder","confirm"?:bool}"#,
+            true,
             has_folder,
             save_view_as,
         ),
@@ -310,7 +314,7 @@ pub fn specs() -> Vec<CommandSpec> {
             r#"{"item":"quota|filter|itemsInView|headerItems|unreadItems|unseenItems|reminders|groupNotifications|viewShortcuts|zoomSlider|zoom","show":bool}"#,
             false,
             always,
-            status_bar,
+            mail::status_bar,
         ),
         spec(
             "view.tighterSpacing",
@@ -344,6 +348,9 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec("view.zoom", "Zoom", "Message › Zoom", "", r#"{"pct"?:number}"#, false, always, zoom),
     ]
+    .into_iter()
+    .chain(mail::specs())
+    .collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -365,7 +372,8 @@ fn update(s: &mut Session, f: impl FnOnce(&mut ViewSettings) -> Value) -> CmdRes
     Ok(out)
 }
 
-fn arrange_name(a: ArrangeBy) -> &'static str {
+/// `view.arrangeBy` key of an arrangement.
+pub fn arrange_name(a: ArrangeBy) -> &'static str {
     match a {
         ArrangeBy::Date => "date",
         ArrangeBy::From => "from",
@@ -483,15 +491,9 @@ fn selected_group(s: &Session) -> Option<String> {
     if modules::module_kind(s, s.selection.folder).is_some() {
         return modules::group_of(s, s.selection.folder, id);
     }
-    let by = settings(s, s.selection.folder).arrange_by;
-    if settings(s, s.selection.folder).conversations
-        && let Some(c) = crate::queries::conversation_of(s, id)
-        && let Some(m) = s.mailbox.mail.get(&c.sort_item)
-    {
-        return Some(group_label(s, m, by));
-    }
     let m = s.mailbox.mail.get(&id)?;
-    Some(group_label(s, m, by))
+    // The list's own header label (pinned messages, conversations grouped by their sort item).
+    Some(crate::queries::group_label(s, m))
 }
 
 fn inbox_of_current_account(s: &Session) -> Option<FolderId> {
@@ -597,6 +599,7 @@ fn view_customized(s: &Session) -> Option<&'static str> {
     // Conversation expansion is not a view customisation; collapsed groups and Conversation Settings are.
     let custom = s.mailbox.views.get(&f).is_some_and(|v| *v != ViewSettings::default())
         || modules::customized(s, f)
+        || mail::customized(s, f)
         || s.view
             .collapsed_groups
             .get(&f)
@@ -615,23 +618,36 @@ fn change_view(s: &mut Session, p: &Value) -> CmdResult {
     if let Some((folder, kind)) = module_here(s) {
         return modules::change_view(s, folder, kind, name);
     }
+    change_view_by_name(s, name)
+}
+
+/// Change View in a mail folder: a built-in view (the layout) or a saved view usable here.
+fn change_view_by_name(s: &mut Session, name: &str) -> CmdResult {
     let Some(l) = parse_layout(name) else {
-        return Err(CmdError::Params(format!("no view named \"{}\"", name.trim())));
+        let clipped: String = name.trim().chars().take(mail::MAX_NAME).collect();
+        return mail::change_to_saved(s, name)
+            .unwrap_or_else(|| Err(CmdError::Params(format!("no view named \"{clipped}\""))));
     };
-    update(s, |v| {
+    let r = update(s, |v| {
         v.layout = l;
         json!({ "view": layout_name(l) })
-    })
+    })?;
+    let folder = s.selection.folder;
+    mail::clear_view_name(s, folder);
+    Ok(r)
 }
 
 fn layout(s: &mut Session, p: &Value) -> CmdResult {
     let name = req_str(p, "layout")?;
     let l = parse_layout(name)
         .ok_or_else(|| CmdError::Params("`layout` must be compact, single or preview".into()))?;
-    update(s, |v| {
+    let r = update(s, |v| {
         v.layout = l;
         json!({ "view": layout_name(l) })
-    })
+    })?;
+    let folder = s.selection.folder;
+    mail::clear_view_name(s, folder);
+    Ok(r)
 }
 
 fn reset_view(s: &mut Session, p: &Value) -> CmdResult {
@@ -640,7 +656,13 @@ fn reset_view(s: &mut Session, p: &Value) -> CmdResult {
     }
     let folder = current_folder(s, &Value::Null)?;
     s.mailbox.views.remove(&folder);
-    s.view.collapsed_groups.remove(&folder);
+    // Columns, rules, filter and collapsed groups go; pinned messages stay pinned.
+    if let Some(list) = s.view.collapsed_groups.get_mut(&folder) {
+        list.retain(|e| mail::kept_on_reset(e));
+        if list.is_empty() {
+            s.view.collapsed_groups.remove(&folder);
+        }
+    }
     Ok(json!({ "folder": folder.0, "reset": true }))
 }
 
@@ -651,13 +673,7 @@ fn save_view_as(s: &mut Session, p: &Value) -> CmdResult {
     if let Some((folder, kind)) = module_here(s) {
         return modules::save_view_as(s, folder, kind, p);
     }
-    let folder = current_folder(s, &Value::Null)?;
-    let name = opt_str(p, "name").map(str::trim).unwrap_or_default().to_owned();
-    if parse_layout(&name).is_some() {
-        return Err(CmdError::Params(format!("a view named \"{name}\" already exists")));
-    }
-    let current = serde_json::to_value(settings(s, folder)).unwrap_or(Value::Null);
-    Ok(dialog(s, "saveViewAs", json!({ "name": name, "settings": current })))
+    mail::save_view_as(s, p)
 }
 
 fn manage_views(s: &mut Session, p: &Value) -> CmdResult {
@@ -667,9 +683,7 @@ fn manage_views(s: &mut Session, p: &Value) -> CmdResult {
     if let Some((folder, kind)) = module_here(s) {
         return modules::manage_views(s, folder, kind);
     }
-    let current =
-        s.mailbox.views.get(&s.selection.folder).map(|v| layout_name(v.layout)).unwrap_or("Compact");
-    Ok(dialog(s, "manageViews", json!({ "views": ["Compact", "Single", "Preview"], "current": current })))
+    mail::manage_views(s, p)
 }
 
 fn view_settings(s: &mut Session, p: &Value) -> CmdResult {
@@ -681,7 +695,16 @@ fn view_settings(s: &mut Session, p: &Value) -> CmdResult {
     }
     let folder = current_folder(s, &Value::Null)?;
     let current = serde_json::to_value(settings(s, folder)).unwrap_or(Value::Null);
-    Ok(dialog(s, "advancedViewSettings", json!({ "folder": folder.0, "settings": current })))
+    let mut params = json!({ "folder": folder.0, "settings": current });
+    if mail::mail_list(s).is_none()
+        && let Some(o) = params.as_object_mut()
+    {
+        o.insert("summary".into(), mail::summary(s, folder));
+        if let Some(name) = opt_str(p, "savedView") {
+            o.insert("savedView".into(), json!(name));
+        }
+    }
+    Ok(dialog(s, "advancedViewSettings", params))
 }
 
 fn add_columns(s: &mut Session, p: &Value) -> CmdResult {
@@ -689,7 +712,17 @@ fn add_columns(s: &mut Session, p: &Value) -> CmdResult {
         return r;
     }
     let folder = current_folder(s, &Value::Null)?;
-    Ok(dialog(s, "showColumns", json!({ "folder": folder.0 })))
+    if mail::mail_list(s).is_some() {
+        // Module tables (Tasks, People › Phone and List) keep their own fixed columns.
+        return Ok(dialog(s, "showColumns", json!({ "folder": folder.0, "mail": false })));
+    }
+    let shown: Vec<&str> = mail::columns(s, folder).iter().map(|c| c.id).collect();
+    let available: Vec<Value> = mail::COLUMNS.iter().map(|c| json!({"id": c.id, "label": c.label})).collect();
+    Ok(dialog(
+        s,
+        "showColumns",
+        json!({ "folder": folder.0, "mail": true, "columns": shown, "available": available }),
+    ))
 }
 
 fn apply_view_to(s: &mut Session, p: &Value) -> CmdResult {
@@ -718,12 +751,18 @@ fn apply_view_to(s: &mut Session, p: &Value) -> CmdResult {
         return modules::apply_view_to(s, src, kind, Some(targets));
     }
     let current = settings(s, src);
+    let extra = mail::mail_view(s, src);
     let mut applied = 0usize;
     for id in targets {
         if id != src
             && s.mailbox.folder(id).is_some_and(|f| matches!(f.kind, FolderKind::Mail | FolderKind::Search))
         {
-            s.mailbox.views.insert(id, current.clone());
+            if current == ViewSettings::default() {
+                s.mailbox.views.remove(&id);
+            } else {
+                s.mailbox.views.insert(id, current.clone());
+            }
+            mail::store_view(s, id, &extra);
             applied = applied.saturating_add(1);
         }
     }
@@ -828,16 +867,8 @@ fn collapse_all(s: &mut Session, p: &Value) -> CmdResult {
     let mut labels: Vec<String> = if modules::module_kind(s, folder).is_some() {
         modules::groups(s, folder)
     } else {
-        let by = settings(s, folder).arrange_by;
-        let mut labels: Vec<String> =
-            s.mailbox.items_in(folder).iter().map(|m| group_label(s, m, by)).collect();
-        // Conversations group by their sort item, which may be a message from another folder.
-        for c in crate::queries::list_conversations(s) {
-            if let Some(m) = s.mailbox.mail.get(&c.sort_item) {
-                labels.push(group_label(s, m, by));
-            }
-        }
-        labels
+        // The list's own headers (conversations group by their sort item, pinned messages on top).
+        crate::queries::group_labels(s)
     };
     labels.sort();
     labels.dedup();
@@ -1212,30 +1243,6 @@ fn todo_bar(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "todoBar": part }))
 }
 
-/// Status bar elements; per-element visibility has no session field yet, so the command validates and
-/// reports the requested state.
-fn status_bar(_s: &mut Session, p: &Value) -> CmdResult {
-    const ITEMS: [&str; 11] = [
-        "quota",
-        "filter",
-        "itemsInView",
-        "headerItems",
-        "unreadItems",
-        "unseenItems",
-        "reminders",
-        "groupNotifications",
-        "viewShortcuts",
-        "zoomSlider",
-        "zoom",
-    ];
-    let item = req_str(p, "item")?;
-    if !ITEMS.contains(&item) {
-        return Err(CmdError::Params(format!("unknown status bar item `{item}`")));
-    }
-    let show = opt_bool(p, "show").ok_or_else(|| CmdError::Params("`show` (bool) required".into()))?;
-    Ok(json!({ "item": item, "show": show }))
-}
-
 fn reading_view(s: &mut Session, _p: &Value) -> CmdResult {
     s.view.reading_view = true;
     Ok(json!({ "readingView": true }))
@@ -1265,10 +1272,6 @@ fn zoom(s: &mut Session, p: &Value) -> CmdResult {
 
 // ---------------------------------------------------------------------------------------------------------
 // Dialog-only
-
-fn quick_actions(s: &mut Session, _p: &Value) -> CmdResult {
-    Ok(dialog(s, "quickActions", json!({})))
-}
 
 fn reading_pane_options(s: &mut Session, _p: &Value) -> CmdResult {
     Ok(dialog(s, "readingPaneOptions", json!({})))

@@ -13,6 +13,12 @@
 //! when expanded, by indented compact child rows (sender + time, preview below); messages from other
 //! folders are dimmed with their folder name in italics. Left / Right collapse / expand the focused
 //! conversation. Turning Show as Conversations on or off asks for the scope ([`ask_conversation_scope`]).
+//!
+//! What the view settings add (`mailcraft_engine::cmd::view::mail`): the column layout shows the folder's
+//! columns in their order, labels, formats and widths (drag a header edge to resize; the header's context
+//! menu adds, removes and formats columns); rows take the font of the view's Conditional Formatting rules;
+//! the hover buttons are the saved Quick Actions; the category column applies the Quick Click category;
+//! pinned messages carry a pin and lead the list; header-only and marked-to-download messages show it.
 
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
@@ -25,8 +31,11 @@ use egui::{
     Ui, UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
 };
 use mailcraft_engine::Session;
-use mailcraft_engine::queries::{self, ConversationRow, ItemRow, ListRow};
+use mailcraft_engine::cmd::view::mail::{self as mailview, ColumnKind, ColumnSpec};
+use mailcraft_engine::queries::{self, ConversationRow, ItemRow, ListRow, RowStyle};
 use mailcraft_engine::search_index::{self, Field};
+#[cfg(test)]
+use mailcraft_model::FolderId;
 use mailcraft_model::{
     ArrangeBy, FlagState, FocusClass, FolderRole, ListFilter, ReadingPanePos, SortOrder, ViewLayout,
     ViewSettings,
@@ -122,6 +131,31 @@ pub(crate) fn highlight_job(
     job
 }
 
+/// Font effects of list text (Conditional Formatting).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Look {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+}
+
+impl Look {
+    fn plain(bold: bool) -> Look {
+        Look { bold, ..Look::default() }
+    }
+
+    /// A row's rule font; `bold` follows the rules (the Unread messages rule makes unread rows bold).
+    fn of(st: &RowStyle) -> Look {
+        Look { bold: st.bold, italic: st.italic, underline: st.underline, strike: st.strike }
+    }
+}
+
+/// The rule colour of a row, else `fallback`.
+fn rule_color(st: &RowStyle, fallback: Color32) -> Color32 {
+    st.color.as_deref().and_then(|h| Color32::from_hex(h.trim()).ok()).unwrap_or(fallback)
+}
+
 impl Text {
     /// Lays out `text` within `max_w`, at most `rows` lines, elided with "…".
     pub(crate) fn new(
@@ -148,6 +182,22 @@ impl Text {
         rows: usize,
         hits: Option<(&Session, Field, Color32)>,
     ) -> Text {
+        Text::styled(ui, text, size, Look::plain(bold), color, max_w, rows, hits)
+    }
+
+    /// [`Text::highlighted`] with a full [`Look`] (italic, underline, strikethrough).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn styled(
+        ui: &Ui,
+        text: &str,
+        size: f32,
+        look: Look,
+        color: Color32,
+        max_w: f32,
+        rows: usize,
+        hits: Option<(&Session, Field, Color32)>,
+    ) -> Text {
+        let bold = look.bold;
         let (family, faux_bold) = if bold {
             match bold_family(ui.ctx()) {
                 Some(f) => (f, false),
@@ -158,7 +208,15 @@ impl Text {
         };
         // Line breaks in one-line fields (subjects, previews) would push text out of the row.
         let clean: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-        let format = TextFormat { font_id: FontId::new(size, family), color, ..Default::default() };
+        let line = |on: bool| if on { Stroke::new(1.0, color) } else { Stroke::NONE };
+        let format = TextFormat {
+            font_id: FontId::new(size, family),
+            color,
+            italics: look.italic,
+            underline: line(look.underline),
+            strikethrough: line(look.strike),
+            ..Default::default()
+        };
         let ranges = match hits {
             Some((s, field, _)) => search_index::highlights(s, field, &clean),
             None => Vec::new(),
@@ -246,6 +304,12 @@ struct Cached {
     searching: bool,
     /// Effective reading pane position for the folder.
     pane: ReadingPanePos,
+    /// Columns of the column layout (Show Columns, Format Columns, widths).
+    columns: Vec<ColumnSpec>,
+    /// Quick Actions on a hovered row, nearest the right edge first.
+    quick: [&'static str; 2],
+    /// [`download_signature`] of the rows.
+    downloads: u64,
 }
 
 #[derive(Clone, Default)]
@@ -290,6 +354,22 @@ fn fingerprint(s: &Session) -> u64 {
     }
     (s.now().unix / 60).hash(&mut h);
     s.tz_offset_min.hash(&mut h);
+    // Quick Actions and saved views live in the settings.
+    s.settings.rev().hash(&mut h);
+    h.finish()
+}
+
+/// Download state (header only, marked to download) of the listed items: marking and downloading change no
+/// undo entry, so the cache compares this too.
+fn download_signature(s: &Session, rows: &[ListRow]) -> u64 {
+    use mailcraft_engine::sync::cmds;
+    let mut h = DefaultHasher::new();
+    for r in rows {
+        if let ListRow::Item(i) = r {
+            cmds::marked(s, i.id).hash(&mut h);
+            cmds::is_header_only(s, i.id).hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -327,7 +407,21 @@ fn build(s: &Session, key: u64) -> Cached {
         None
     };
     let pane = s.mailbox.views.get(&folder).map(|v| v.reading_pane).unwrap_or(s.view.reading_pane);
-    Cached { key, rows: Arc::new(queries::list_rows(s)), vs, role, focused_tabs, other_new, searching, pane }
+    let rows = queries::list_rows(s);
+    let downloads = download_signature(s, &rows);
+    Cached {
+        key,
+        rows: Arc::new(rows),
+        downloads,
+        vs,
+        role,
+        focused_tabs,
+        other_new,
+        searching,
+        pane,
+        columns: mailview::columns(s, folder),
+        quick: mailview::quick_actions(s),
+    }
 }
 
 /// Runs a command and asks for a repaint so the change shows next frame.
@@ -413,116 +507,93 @@ fn child_height(mode: Mode, preview_lines: u8, tighter: bool) -> f32 {
     }
 }
 
-/// Message list columns (column layout).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Col {
-    Importance,
-    Reminder,
-    Icon,
-    Attachment,
-    From,
-    Subject,
-    Received,
-    Size,
-    Categories,
-    Mention,
-    Flag,
-}
+/// Below this list width the column layout keeps only the essential columns (`ColumnSpec::essential`).
+const NARROW_LIST: f32 = 620.0;
+/// Received on a narrow list (the observed narrow geometry), unless set by hand.
+const NARROW_RECEIVED: f32 = 112.0;
 
-impl Col {
-    /// `view.arrangeBy` key for clicking the header (`None` = not sortable).
-    fn key(self, outgoing: bool) -> Option<&'static str> {
-        match self {
-            Col::Importance => Some("importance"),
-            Col::Reminder | Col::Mention => None,
-            Col::Icon => Some("type"),
-            Col::Attachment => Some("attachments"),
-            Col::From => Some(if outgoing { "to" } else { "from" }),
-            Col::Subject => Some("subject"),
-            Col::Received => Some("date"),
-            Col::Size => Some("size"),
-            Col::Categories => Some("categories"),
-            Col::Flag => Some("flagStatus"),
-        }
-    }
-
-    fn arrange(self, outgoing: bool) -> Option<ArrangeBy> {
-        Some(match self {
-            Col::Importance => ArrangeBy::Importance,
-            Col::Icon => ArrangeBy::Type,
-            Col::Attachment => ArrangeBy::Attachments,
-            Col::From if outgoing => ArrangeBy::To,
-            Col::From => ArrangeBy::From,
-            Col::Subject => ArrangeBy::Subject,
-            Col::Received => ArrangeBy::Date,
-            Col::Size => ArrangeBy::Size,
-            Col::Categories => ArrangeBy::Categories,
-            Col::Flag => ArrangeBy::FlagStatus,
-            Col::Reminder | Col::Mention => return None,
-        })
-    }
-
-    fn name(self, outgoing: bool) -> &'static str {
-        match self {
-            Col::Importance => "Importance",
-            Col::Reminder => "Reminder",
-            Col::Icon => "Icon",
-            Col::Attachment => "Attachment",
-            Col::From if outgoing => "To",
-            Col::From => "From",
-            Col::Subject => "Subject",
-            Col::Received => "Received",
-            Col::Size => "Size",
-            Col::Categories => "Categories",
-            Col::Mention => "Mention",
-            Col::Flag => "Flag Status",
-        }
-    }
-
-    /// Header icon (icon-only columns).
-    fn icon(self) -> Option<&'static str> {
-        match self {
-            Col::Importance => Some("importance-high"),
-            Col::Reminder => Some("bell"),
-            Col::Icon => Some("envelope-open"),
-            Col::Attachment => Some("paperclip"),
-            Col::Flag => Some("flag"),
-            _ => None,
-        }
+/// Width of a column that does not share the free space (`None` = it shares it).
+fn fixed_width(c: &ColumnSpec, wide: bool) -> Option<f32> {
+    match c.width {
+        Some(w) => Some(f32::from(w)),
+        None if c.default_width == 0 => None,
+        None if !wide && c.id == "received" => Some(NARROW_RECEIVED),
+        None => Some(f32::from(c.default_width)),
     }
 }
 
-/// Column x offsets and widths for a list `width` wide.
-fn columns(width: f32) -> Vec<(Col, f32, f32)> {
-    let wide = width >= 620.0;
-    let mut fixed: Vec<(Col, f32)> = vec![(Col::Importance, 22.0)];
-    if wide {
-        fixed.push((Col::Reminder, 22.0));
+/// Column x offsets and widths for a list `width` wide: `(index into cols, x, w)`. Person columns (From, To)
+/// that share the free space with Subject stay narrow (a third of it, at most 200 px); the rest goes to the
+/// other sharing columns. A narrow list keeps only the essential columns.
+fn layout_columns(cols: &[ColumnSpec], width: f32) -> Vec<(usize, f32, f32)> {
+    let wide = width >= NARROW_LIST;
+    let mut shown: Vec<usize> =
+        (0..cols.len()).filter(|i| wide || cols.get(*i).is_some_and(|c| c.essential)).collect();
+    if shown.is_empty() {
+        shown = (0..cols.len()).collect();
     }
-    fixed.extend([(Col::Icon, 24.0), (Col::Attachment, 22.0)]);
-    let tail: Vec<(Col, f32)> = if wide {
-        vec![
-            (Col::Received, 150.0),
-            (Col::Size, 72.0),
-            (Col::Categories, 110.0),
-            (Col::Mention, 22.0),
-            (Col::Flag, 26.0),
-        ]
-    } else {
-        vec![(Col::Received, 112.0), (Col::Flag, 26.0)]
+    let used: f32 =
+        shown.iter().filter_map(|i| cols.get(*i)).filter_map(|c| fixed_width(c, wide)).sum::<f32>() + 8.0;
+    let sharing: Vec<usize> = shown
+        .iter()
+        .copied()
+        .filter(|i| cols.get(*i).is_some_and(|c| fixed_width(c, wide).is_none()))
+        .collect();
+    let n_person =
+        sharing.iter().filter(|i| cols.get(**i).is_some_and(|c| c.kind == ColumnKind::Person)).count();
+    let n_other = sharing.len().saturating_sub(n_person);
+    let free = (width - used).max(80.0);
+    #[allow(clippy::cast_precision_loss)]
+    let (person_w, other_w) = match (n_person, n_other) {
+        (0, 0) => (0.0, 0.0),
+        (0, n) => (0.0, (free / n as f32).max(40.0)),
+        (p, 0) => ((free / p as f32).max(40.0), 0.0),
+        (p, n) => {
+            let each = (free * 0.34 / p as f32).clamp(40.0, 200.0);
+            (each, ((free - each * p as f32) / n as f32).max(40.0))
+        }
     };
-    let used: f32 = fixed.iter().chain(tail.iter()).map(|(_, w)| *w).sum::<f32>() + 8.0;
-    let flex = (width - used).max(80.0);
-    // From stays narrow on wide lists; Subject takes the rest (size-data-bottom geometry).
-    let from_w = (flex * 0.34).clamp(40.0, 200.0);
-    let subject_w = (flex - from_w).max(40.0);
     let mut out = Vec::new();
     let mut x = 4.0;
-    for (c, w) in fixed.into_iter().chain([(Col::From, from_w), (Col::Subject, subject_w)]).chain(tail) {
-        out.push((c, x, w));
+    for i in shown {
+        let Some(c) = cols.get(i) else { continue };
+        let w = match fixed_width(c, wide) {
+            Some(w) => w,
+            None if c.kind == ColumnKind::Person => person_w,
+            None => other_w,
+        };
+        out.push((i, x, w));
         x += w;
     }
     out
+}
+
+/// Header label of a column: From reads "To" in Drafts, Sent Items and the Outbox (unless renamed).
+fn column_label(c: &ColumnSpec, outgoing: bool) -> String {
+    if c.id == "from" && outgoing && c.label == "From" { "To".to_owned() } else { c.label.clone() }
+}
+
+/// Arrangement of a header click (From arranges by To in outgoing folders).
+fn column_arrange(c: &ColumnSpec, outgoing: bool) -> Option<ArrangeBy> {
+    match c.arrange {
+        Some(ArrangeBy::From) if outgoing => Some(ArrangeBy::To),
+        a => a,
+    }
+}
+
+/// Header glyph of an icon column (icon format).
+fn column_icon(c: &ColumnSpec) -> Option<&'static str> {
+    if c.kind != ColumnKind::Icon || c.format != "icon" {
+        return None;
+    }
+    match c.id {
+        "importance" => Some("importance-high"),
+        "reminder" => Some("bell"),
+        "icon" => Some("envelope-open"),
+        "attachment" => Some("paperclip"),
+        "flagStatus" => Some("flag"),
+        _ => None,
+    }
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -533,7 +604,7 @@ pub fn message_list(ui: &mut Ui, app: &mut App, frame: &Frame) {
     let mut st: ListState = ctx.data_mut(|d| d.get_temp(state_id())).unwrap_or_default();
     let key = fingerprint(&app.s);
     let cached = match &st.cache {
-        Some(c) if c.key == key => c.clone(),
+        Some(c) if c.key == key && c.downloads == download_signature(&app.s, &c.rows) => c.clone(),
         _ => {
             let c = Arc::new(build(&app.s, key));
             st.cache = Some(c.clone());
@@ -770,19 +841,27 @@ fn outgoing(role: Option<FolderRole>) -> bool {
     matches!(role, Some(FolderRole::Drafts | FolderRole::SentItems | FolderRole::Outbox))
 }
 
+/// Id of a column's resize drag (memory holds the px dragged so far).
+fn resize_id(col: &str) -> Id {
+    Id::new(("mailcraft.list.colsize", col))
+}
+
 fn column_header(ui: &mut Ui, app: &mut App, c: &Cached, row: Rect) {
     let th = app.theme.clone();
     let painter = ui.painter_at(row);
     painter.rect_filled(row, 0.0, th.group_header);
     let out = outgoing(c.role);
-    for (col, x, w) in columns(row.width()) {
+    let mut resized: Option<(&'static str, f32)> = None;
+    for (i, x, w) in layout_columns(&c.columns, row.width()) {
+        let Some(col) = c.columns.get(i) else { continue };
         let cell = Rect::from_min_size(pos2(row.left() + x, row.top()), vec2(w, row.height()));
-        let resp = ui.interact(cell, Id::new(("mailcraft.list.colhdr", col as u8)), Sense::click());
-        if resp.hovered() && col.key(out).is_some() {
+        let resp = ui.interact(cell, Id::new(("mailcraft.list.colhdr", col.id)), Sense::click());
+        let arrange = column_arrange(col, out);
+        if resp.hovered() && arrange.is_some() {
             painter.rect_filled(cell, 0.0, th.hover);
         }
-        let sorted = col.arrange(out) == Some(c.vs.arrange_by);
-        let name = col.name(out);
+        let sorted = arrange == Some(c.vs.arrange_by);
+        let name = column_label(col, out);
         let mut right = cell.right() - 4.0;
         if sorted {
             let icon = if c.vs.order == SortOrder::Descending { "sort-down" } else { "sort-up" };
@@ -791,37 +870,71 @@ fn column_header(ui: &mut Ui, app: &mut App, c: &Cached, row: Rect) {
                 right -= 14.0;
             }
         }
-        match col.icon() {
+        match column_icon(col) {
             Some(icon) => {
                 let tint = if sorted { th.accent } else { th.text_muted };
                 app.icons.paint(ui, icon_rect(cell.center(), 14.0), icon, tint);
             }
-            None if col == Col::Mention => {
+            None if col.id == "mention" && col.format == "icon" => {
                 let t = Text::new(ui, "@", 12.0, false, th.text_muted, w, 1);
                 t.paint_left(&painter, cell, cell.center().x - t.width() / 2.0);
             }
             None => {
-                let t =
-                    Text::new(ui, name, 12.0, sorted, th.text_muted, (right - cell.left() - 6.0).max(1.0), 1);
-                t.paint_left(&painter, cell, cell.left() + 6.0);
+                let room = (right - cell.left() - 6.0).max(1.0);
+                let t = Text::new(ui, &name, 12.0, sorted, th.text_muted, room, 1);
+                match col.align {
+                    "right" => t.paint_right(&painter, cell, right),
+                    "center" => t.paint_left(&painter, cell, cell.center().x - t.width() / 2.0),
+                    _ => t.paint_left(&painter, cell, cell.left() + 6.0),
+                };
             }
         }
         painter.line_segment(
             [pos2(cell.right() - 0.5, cell.top() + 5.0), pos2(cell.right() - 0.5, cell.bottom() - 5.0)],
             Stroke::new(1.0, th.separator),
         );
-        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, name));
-        let resp = resp.on_hover_text(name);
+        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+        let resp = resp.on_hover_text(&name);
         if resp.clicked()
-            && let Some(key) = col.key(out)
+            && let Some(a) = arrange
         {
             if sorted {
                 run(ui, app, "view.reverseSort", json!({}));
             } else {
-                run(ui, app, "view.arrangeBy", json!({ "key": key }));
+                run(
+                    ui,
+                    app,
+                    "view.arrangeBy",
+                    json!({ "key": mailcraft_engine::cmd::view::arrange_name(a) }),
+                );
             }
         }
-        resp.context_menu(|ui| crate::menus::arrange_menu(ui, app));
+        resp.context_menu(|ui| crate::menus::column_header_menu(ui, app, col.id));
+
+        // Right edge: drag to resize (committed as the column's width when released).
+        let edge = Rect::from_center_size(pos2(cell.right(), cell.center().y), vec2(6.0, row.height()));
+        let grip = ui.interact(edge, Id::new(("mailcraft.list.colgrip", col.id)), Sense::drag());
+        let grip = grip.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        let rid = resize_id(col.id);
+        if grip.dragged() {
+            let dx = grip.drag_delta().x;
+            let total = ui.ctx().data_mut(|d| {
+                let v = d.get_temp_mut_or_default::<f32>(rid);
+                *v += dx;
+                *v
+            });
+            let guide = (cell.right() + total).max(cell.left() + f32::from(mailview::MIN_WIDTH));
+            ui.painter().vline(guide, row.y_range(), Stroke::new(2.0, th.accent));
+        }
+        if grip.drag_stopped() {
+            let total = ui.ctx().data_mut(|d| d.remove_temp::<f32>(rid)).unwrap_or(0.0);
+            if total.abs() >= 1.0 {
+                resized = Some((col.id, (w + total).max(f32::from(mailview::MIN_WIDTH))));
+            }
+        }
+    }
+    if let Some((id, w)) = resized {
+        run(ui, app, "view.columns", json!({ "widths": { id: w.round() } }));
     }
 }
 
@@ -1050,10 +1163,124 @@ fn group_row(ui: &mut Ui, app: &mut App, r: Rect, label: &str, count: usize, col
 
 /// Where the clickable parts of a row ended up.
 struct Slots {
-    flag: Rect,
-    delete: Option<Rect>,
+    /// Flag column (none in a column layout without the Flag Status column).
+    flag: Option<Rect>,
+    /// Category column (applies the Quick Click category).
+    category: Option<Rect>,
+    /// Quick Action buttons shown while the row is hovered.
+    actions: Vec<(&'static str, Rect)>,
 }
 
+/// Glyph and accessible name of a Quick Action button for `row`.
+fn action_look(action: &str, row: &ItemRow) -> (&'static str, &'static str) {
+    match action {
+        "delete" => ("delete", "Delete"),
+        "archive" => ("archive", "Archive"),
+        "markRead" if row.unread => ("read", "Mark as Read"),
+        "markRead" => ("unread", "Mark as Unread"),
+        "move" => ("move", "Move"),
+        "categorize" => ("categorize", "Categorize"),
+        "pin" if row.pinned => ("pin", "Unpin"),
+        "pin" => ("pin", "Pin"),
+        _ => ("ellipsis", ""),
+    }
+}
+
+/// Runs a Quick Action on message `id`.
+fn run_action(ui: &Ui, app: &mut App, action: &str, id: u64) {
+    let cmd = match action {
+        "delete" => "mail.delete",
+        "archive" => "mail.archive",
+        "markRead" => "mail.toggleRead",
+        "move" => "mail.move",
+        // Without a name the Quick Click category is applied (or chosen first).
+        "categorize" => "mail.categorize",
+        "pin" => "view.pin",
+        _ => return,
+    };
+    run_on_items(ui, app, cmd, &[id], json!({}));
+}
+
+/// The flag column takes clicks while Flag / Unflag is one of the Quick Actions.
+fn flag_active(c: &Cached) -> bool {
+    c.quick.contains(&"flag")
+}
+
+/// Quick Action buttons (hovered rows) placed right to left from `right` on `band`; returns them and the left
+/// edge they reached.
+fn paint_actions(
+    ui: &Ui,
+    icons: &mut crate::icons::Icons,
+    th: &Theme,
+    c: &Cached,
+    row: &ItemRow,
+    band: Rect,
+    mut right: f32,
+) -> (Vec<(&'static str, Rect)>, f32) {
+    let mut out = Vec::new();
+    for a in c.quick {
+        if a == "none" || a == "flag" {
+            continue;
+        }
+        let r = Rect::from_min_size(pos2(right - 19.0, band.center().y - 10.0), vec2(19.0, 20.0));
+        let (icon, _) = action_look(a, row);
+        icons.paint(ui, icon_rect(r.center(), 14.0), icon, th.text_muted);
+        out.push((a, r));
+        right = r.left() - 2.0;
+    }
+    (out, right)
+}
+
+/// Category column blocks (up to three) inside `slot`; an outline tag while hovered without categories.
+fn paint_categories(ui: &Ui, app: &mut App, row: &ItemRow, slot: Rect, hovered: bool) {
+    let n = row.categories.len().min(3);
+    if n == 0 {
+        if hovered {
+            app.icons.paint(ui, icon_rect(slot.center(), 13.0), "category-tag", app.theme.text_muted);
+        }
+        return;
+    }
+    let mut x = slot.right() - 6.0;
+    for hex in row.categories.iter().take(n).rev() {
+        let block = Rect::from_min_size(pos2(x - 5.0, slot.center().y - 6.0), vec2(5.0, 12.0));
+        ui.painter().rect_filled(block, 1.5, hex_color(hex));
+        x -= 7.0;
+    }
+}
+
+/// Width of the category column of a compact row.
+fn category_width(row: &ItemRow) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let n = row.categories.len().min(3) as f32;
+    (n * 7.0 + 8.0).max(19.0)
+}
+
+/// Line-1 right end of compact rows: flag column, category column, then (hovered) the Quick Actions. Returns
+/// the slots and where the status icons may end.
+fn paint_row_end(
+    ui: &Ui,
+    app: &mut App,
+    c: &Cached,
+    row: &ItemRow,
+    line1: Rect,
+    right: f32,
+    hovered: bool,
+) -> (Slots, f32) {
+    let th = app.theme.clone();
+    let flag = Rect::from_min_size(pos2(right - 19.0, line1.center().y - 10.0), vec2(19.0, 20.0));
+    paint_flag(ui, &mut app.icons, &th, row, flag, hovered && flag_active(c));
+    let cw = category_width(row);
+    let category = Rect::from_min_size(pos2(flag.left() - cw - 1.0, flag.top()), vec2(cw, 20.0));
+    paint_categories(ui, app, row, category, hovered);
+    let (actions, left) = if hovered {
+        paint_actions(ui, &mut app.icons, &th, c, row, line1, category.left() - 2.0)
+    } else {
+        (Vec::new(), category.left())
+    };
+    (Slots { flag: Some(flag), category: Some(category), actions }, left)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn item_row(
     ui: &mut Ui,
     app: &mut App,
@@ -1102,12 +1329,14 @@ fn item_row(
     let (preview_lines, tighter) = (c.vs.preview_lines, c.vs.tighter_spacing);
     let (slots, glyph) = match (mode, conv) {
         (Mode::Compact, Some(cv)) if cv.header => {
-            paint_conversation_header(ui, app, r, row, cv, hovered, preview_lines, tighter)
+            paint_conversation_header(ui, app, c, r, row, cv, hovered, preview_lines, tighter)
         }
         (Mode::Compact, Some(cv)) => {
-            (paint_child(ui, app, r, row, cv, hovered, preview_lines, tighter), None)
+            (paint_child(ui, app, c, r, row, cv, hovered, preview_lines, tighter), None)
         }
-        (Mode::Compact, None) => (paint_compact(ui, app, r, row, hovered, preview_lines, tighter, 0.0), None),
+        (Mode::Compact, None) => {
+            (paint_compact(ui, app, c, r, row, hovered, preview_lines, tighter, 0.0), None)
+        }
         (Mode::Columns { preview }, _) => paint_columns(ui, app, c, r, row, hovered, preview, st),
     };
     painter.line_segment(
@@ -1119,40 +1348,50 @@ fn item_row(
     if let (Some(g), Some(cv)) = (glyph, conv) {
         conversation_glyph(ui, app, g, row, cv);
     }
-    let flag_resp = ui.interact(slots.flag, Id::new(("mailcraft.list.flag", id, part)), Sense::click());
-    let flag_tip = if row.flag_complete {
-        "Clear flag"
-    } else if row.flagged {
-        "Mark complete"
-    } else {
-        "Flag this message"
+    let outline = |rect: Rect| {
+        painter.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, th.separator), egui::StrokeKind::Inside);
     };
-    if flag_resp.hovered() {
-        painter.rect_stroke(
-            slots.flag.shrink(1.0),
-            3.0,
-            Stroke::new(1.0, th.separator),
-            egui::StrokeKind::Inside,
-        );
-    }
-    flag_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, flag_tip));
-    if flag_resp.on_hover_text(flag_tip).clicked() {
-        let params = if row.flag_complete { json!({ "kind": "clear" }) } else { json!({}) };
-        run_on_items(ui, app, "mail.flag", &[id], params);
-    }
-    if let Some(del) = slots.delete {
-        let del_resp = ui.interact(del, Id::new(("mailcraft.list.delete", id, part)), Sense::click());
-        if del_resp.hovered() {
-            painter.rect_stroke(
-                del.shrink(1.0),
-                3.0,
-                Stroke::new(1.0, th.separator),
-                egui::StrokeKind::Inside,
-            );
+    if flag_active(c)
+        && let Some(flag) = slots.flag
+    {
+        let flag_resp = ui.interact(flag, Id::new(("mailcraft.list.flag", id, part)), Sense::click());
+        let flag_tip = if row.flag_complete {
+            "Clear flag"
+        } else if row.flagged {
+            "Mark complete"
+        } else {
+            "Flag this message"
+        };
+        if flag_resp.hovered() {
+            outline(flag);
         }
-        del_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Delete"));
-        if del_resp.on_hover_text("Delete").clicked() {
-            run_on_items(ui, app, "mail.delete", &[id], json!({}));
+        flag_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, flag_tip));
+        if flag_resp.on_hover_text(flag_tip).clicked() {
+            let params = if row.flag_complete { json!({ "kind": "clear" }) } else { json!({}) };
+            run_on_items(ui, app, "mail.flag", &[id], params);
+        }
+    }
+    if let Some(cat) = slots.category {
+        let cat_resp = ui.interact(cat, Id::new(("mailcraft.list.category", id, part)), Sense::click());
+        if cat_resp.hovered() {
+            outline(cat);
+        }
+        let label = if row.categories.is_empty() { "No Categories" } else { "Categories" };
+        cat_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+        if cat_resp.on_hover_text("Quick Click category").clicked() {
+            run_on_items(ui, app, "mail.categorize", &[id], json!({}));
+        }
+    }
+    for (action, rect) in &slots.actions {
+        let a_resp =
+            ui.interact(*rect, Id::new(("mailcraft.list.action", id, part, *action)), Sense::click());
+        if a_resp.hovered() {
+            outline(*rect);
+        }
+        let (_, label) = action_look(action, row);
+        a_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+        if a_resp.on_hover_text(label).clicked() {
+            run_action(ui, app, action, id);
         }
     }
 
@@ -1242,6 +1481,7 @@ fn conversation_glyph(ui: &Ui, app: &mut App, g: Rect, row: &ItemRow, cv: &Conve
 fn paint_conversation_header(
     ui: &Ui,
     app: &mut App,
+    c: &Cached,
     r: Rect,
     row: &ItemRow,
     cv: &ConversationRow,
@@ -1256,7 +1496,7 @@ fn paint_conversation_header(
     if !cv.senders_above_subject {
         std::mem::swap(&mut shown.who, &mut shown.subject);
     }
-    let slots = paint_compact(ui, app, r, &shown, hovered, preview_lines, tighter, GLYPH_W);
+    let slots = paint_compact(ui, app, c, r, &shown, hovered, preview_lines, tighter, GLYPH_W);
     let pad = if tighter { 4.0 } else { 8.0 };
     let center = pos2(r.left() + 12.0 + GLYPH_W / 2.0 - 2.0, r.top() + pad + LINE1 / 2.0);
     paint_conversation_glyph(ui.painter(), center, cv.expanded, app.theme.text_muted);
@@ -1269,6 +1509,7 @@ fn paint_conversation_header(
 fn paint_child(
     ui: &Ui,
     app: &mut App,
+    c: &Cached,
     r: Rect,
     row: &ItemRow,
     cv: &ConversationRow,
@@ -1284,27 +1525,16 @@ fn paint_child(
     let right = r.right() - 8.0;
     let line1 = Rect::from_min_max(pos2(left, r.top() + pad), pos2(right, r.top() + pad + LINE1));
     let other = cv.other_folder.as_deref();
-    let flag = Rect::from_min_size(pos2(right - 19.0, line1.center().y - 10.0), vec2(19.0, 20.0));
-    paint_flag(ui, &mut app.icons, &th, row, flag, hovered);
-    let mut icons_left = flag.left();
-    let delete = if hovered {
-        let d = Rect::from_min_size(pos2(icons_left - 21.0, flag.top()), vec2(19.0, 20.0));
-        app.icons.paint(ui, icon_rect(d.center(), 14.0), "delete", th.text_muted);
-        icons_left = d.left();
-        Some(d)
-    } else {
-        None
-    };
-    icons_left = paint_status_icons(ui, app, row, line1, icons_left - 2.0);
-    let time_color = if row.unread { th.unread } else { th.text_muted };
-    let time = Text::new(ui, &row.time, 12.0, row.unread, time_color, 120.0, 1);
+    let (slots, icons_left) = paint_row_end(ui, app, c, row, line1, right, hovered);
+    let icons_left = paint_status_icons(ui, app, row, line1, icons_left - 2.0);
+    let look = Look::of(&row.style);
+    let time_color = rule_color(&row.style, if row.unread { th.unread } else { th.text_muted });
+    let time = Text::styled(ui, &row.time, 12.0, look, time_color, 120.0, 1, None);
     let time_left = time.paint_right(&painter, line1, icons_left - 4.0);
     let who_color = if other.is_some() {
         th.text_muted
-    } else if row.unread {
-        th.unread
     } else {
-        th.text
+        rule_color(&row.style, if row.unread { th.unread } else { th.text })
     };
     let mut x = left;
     if row.draft_marker {
@@ -1312,14 +1542,15 @@ fn paint_child(
         x = t.paint_left(&painter, line1, x) + 5.0;
     }
     let room = (time_left - x - 8.0).max(1.0);
-    let who = Text::new(
+    let who = Text::styled(
         ui,
         &row.who,
         13.5,
-        row.unread,
+        look,
         who_color,
         room * if other.is_some() { 0.6 } else { 1.0 },
         1,
+        None,
     );
     let end = who.paint_left(&painter, line1, x);
     if let Some(folder) = other {
@@ -1332,38 +1563,39 @@ fn paint_child(
         let t = Text::new(ui, row.preview.trim(), 12.5, false, color, (right - left).max(1.0), lines);
         t.paint(&painter, pos2(left, line1.bottom() + 1.0));
     }
-    Slots { flag, delete }
+    slots
 }
 
-/// Line-1 status icons (right to left after the flag slot): categories, importance, attachment.
+/// Download state glyph and its name: marked to download, or only the header downloaded.
+fn download_icon(row: &ItemRow) -> Option<(&'static str, &'static str)> {
+    match row.marked {
+        Some(true) => Some(("sync", "Marked to download a copy")),
+        Some(false) => Some(("sync", "Marked to download")),
+        None if row.header_only => Some(("ellipsis", "Only the header is downloaded")),
+        None => None,
+    }
+}
+
+/// Line-1 status icons (right to left from `right`): importance, attachment, pin, download state.
 fn paint_status_icons(ui: &Ui, app: &mut App, row: &ItemRow, band: Rect, mut right: f32) -> f32 {
     let th = app.theme.clone();
-    let painter = ui.painter();
-    for hex in row.categories.iter().take(4).rev() {
-        let block = Rect::from_min_size(pos2(right - 8.0, band.center().y - 6.0), vec2(8.0, 12.0));
-        painter.rect_filled(block, 2.0, hex_color(hex));
-        right -= 11.0;
-    }
+    let mut icon = |name: &str, color: Color32| {
+        app.icons.paint(ui, icon_rect(pos2(right - 8.0, band.center().y), 14.0), name, color);
+        right -= 17.0;
+    };
     if row.importance_high {
-        app.icons.paint(
-            ui,
-            icon_rect(pos2(right - 8.0, band.center().y), 14.0),
-            "importance-high",
-            th.importance_high,
-        );
-        right -= 17.0;
+        icon("importance-high", th.importance_high);
     } else if row.importance_low {
-        app.icons.paint(
-            ui,
-            icon_rect(pos2(right - 8.0, band.center().y), 14.0),
-            "importance-low",
-            th.importance_low,
-        );
-        right -= 17.0;
+        icon("importance-low", th.importance_low);
     }
     if row.has_attachments {
-        app.icons.paint(ui, icon_rect(pos2(right - 8.0, band.center().y), 14.0), "paperclip", th.text_muted);
-        right -= 17.0;
+        icon("paperclip", th.text_muted);
+    }
+    if row.pinned {
+        icon("pin", th.accent);
+    }
+    if let Some((name, _)) = download_icon(row) {
+        icon(name, if row.marked.is_some() { th.accent } else { th.text_muted });
     }
     right
 }
@@ -1391,6 +1623,7 @@ fn paint_flag(
 fn paint_compact(
     ui: &Ui,
     app: &mut App,
+    c: &Cached,
     r: Rect,
     row: &ItemRow,
     hovered: bool,
@@ -1405,20 +1638,11 @@ fn paint_compact(
     let right = r.right() - 8.0;
     let line1 = Rect::from_min_max(pos2(left, r.top() + pad), pos2(right, r.top() + pad + LINE1));
     let line2 = Rect::from_min_max(pos2(left, line1.bottom()), pos2(right, line1.bottom() + LINE));
+    let look = Look::of(&row.style);
 
-    // Line 1: [Draft] sender … status icons, delete (hover), flag.
-    let flag = Rect::from_min_size(pos2(right - 19.0, line1.center().y - 10.0), vec2(19.0, 20.0));
-    paint_flag(ui, &mut app.icons, &th, row, flag, hovered);
-    let mut icons_left = flag.left();
-    let delete = if hovered {
-        let d = Rect::from_min_size(pos2(icons_left - 21.0, flag.top()), vec2(19.0, 20.0));
-        app.icons.paint(ui, icon_rect(d.center(), 14.0), "delete", th.text_muted);
-        icons_left = d.left();
-        Some(d)
-    } else {
-        None
-    };
-    icons_left = paint_status_icons(ui, app, row, line1, icons_left - 2.0);
+    // Line 1: [Draft] sender … status icons, Quick Actions (hover), categories, flag.
+    let (slots, icons_left) = paint_row_end(ui, app, c, row, line1, right, hovered);
+    let icons_left = paint_status_icons(ui, app, row, line1, icons_left - 2.0);
     let mut x = left;
     if row.draft_marker {
         let t = Text::new(ui, "[Draft]", 14.0, false, th.draft, 60.0, 1);
@@ -1426,12 +1650,13 @@ fn paint_compact(
     }
     let searching = !app.s.view.search.trim().is_empty() && crate::dialogs::search_highlight_on(&app.s);
     let hl = |field: Field| searching.then_some((&app.s, field, th.search_hit));
-    let who = Text::highlighted(
+    let who_look = Look { bold: false, ..look };
+    let who = Text::styled(
         ui,
         &row.who,
         14.5,
-        false,
-        th.text,
+        who_look,
+        rule_color(&row.style, th.text),
         (icons_left - x - 6.0).max(1.0),
         1,
         hl(Field::From),
@@ -1439,8 +1664,8 @@ fn paint_compact(
     who.paint_left(&painter, line1, x);
 
     // Line 2: subject … reply/forward state, time.
-    let time_color = if row.unread { th.unread } else { th.text_muted };
-    let time = Text::new(ui, &row.time, 12.0, row.unread, time_color, 120.0, 1);
+    let time_color = rule_color(&row.style, if row.unread { th.unread } else { th.text_muted });
+    let time = Text::styled(ui, &row.time, 12.0, Look::plain(look.bold), time_color, 120.0, 1, None);
     let mut sub_right = time.paint_right(&painter, line2, right) - 6.0;
     let state_icon = if row.replied {
         Some("replied")
@@ -1453,12 +1678,12 @@ fn paint_compact(
         app.icons.paint(ui, icon_rect(pos2(sub_right - 7.0, line2.center().y), 13.0), icon, th.text_muted);
         sub_right -= 18.0;
     }
-    let subject_color = if row.unread { th.unread } else { th.text };
-    let subject = Text::highlighted(
+    let subject_color = rule_color(&row.style, if row.unread { th.unread } else { th.text });
+    let subject = Text::styled(
         ui,
         &row.subject,
         13.0,
-        row.unread,
+        look,
         subject_color,
         (sub_right - left).max(1.0),
         1,
@@ -1481,9 +1706,25 @@ fn paint_compact(
         );
         t.paint(&painter, pos2(left, line2.bottom() + 1.0));
     }
-    Slots { flag, delete }
+    slots
 }
 
+/// Paints one cell's text with the column's alignment.
+fn paint_cell_text(painter: &Painter, t: &Text, cell: Rect, align: &str) {
+    match align {
+        "right" => {
+            t.paint_right(painter, cell, cell.right() - 6.0);
+        }
+        "center" => {
+            t.paint_left(painter, cell, cell.center().x - t.width() / 2.0);
+        }
+        _ => {
+            t.paint_left(painter, cell, cell.left() + 6.0);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_columns(
     ui: &Ui,
     app: &mut App,
@@ -1505,26 +1746,60 @@ fn paint_columns(
     let indent = conv
         .filter(|cv| !cv.header)
         .map_or(0.0, |_| INDENT * f32::from(row.conversation_depth.clamp(1, MAX_INDENT)));
-    let mut glyph = None;
+    let look = Look::of(&row.style);
     let text_color = if other {
         th.text_muted
-    } else if row.unread {
-        th.unread
     } else {
-        th.text
+        rule_color(&row.style, if row.unread { th.unread } else { th.text })
     };
-    let mut flag = Rect::from_min_size(pos2(r.right() - 22.0, line.top()), vec2(19.0, line_h));
-    let mut delete = None;
-    for (col, x, w) in columns(r.width()) {
+    let muted = rule_color(&row.style, th.text_muted);
+    let mut glyph = None;
+    let mut slots = Slots { flag: None, category: None, actions: Vec::new() };
+    let layout = layout_columns(&c.columns, r.width());
+    // Quick Actions go at the right end of Subject, else of the first column sharing the free space.
+    let action_col = c
+        .columns
+        .iter()
+        .position(|x| x.id == "subject")
+        .filter(|i| layout.iter().any(|(j, _, _)| j == i))
+        .or_else(|| {
+            layout
+                .iter()
+                .map(|(i, _, _)| *i)
+                .find(|i| c.columns.get(*i).is_some_and(|x| x.default_width == 0))
+        });
+    let mut glyph_done = false;
+    for (i, x, w) in layout.iter().copied() {
+        let Some(col) = c.columns.get(i) else { continue };
         let cell = Rect::from_min_size(pos2(r.left() + x, line.top()), vec2(w, line_h));
         let inner_w = (w - 10.0).max(1.0);
-        match col {
-            Col::Importance if header => {
-                let center = cell.center();
-                paint_conversation_glyph(&painter, center, conv.is_some_and(|cv| cv.expanded), th.text_muted);
-                glyph = Some(Rect::from_center_size(center, vec2(18.0, line_h)));
+        let mut right = cell.right() - 4.0;
+        if hovered && action_col == Some(i) {
+            let (actions, left) = paint_actions(ui, &mut app.icons, &th, c, row, cell, right);
+            slots.actions = actions;
+            right = left;
+        }
+        let text_cell = Rect::from_min_max(cell.min, pos2(right.max(cell.left() + 1.0), cell.max.y));
+        // The conversation glyph takes the first narrow icon column (Importance by default).
+        if header && !glyph_done && col.kind == ColumnKind::Icon {
+            glyph_done = true;
+            let center = cell.center();
+            paint_conversation_glyph(&painter, center, conv.is_some_and(|cv| cv.expanded), th.text_muted);
+            glyph = Some(Rect::from_center_size(center, vec2(18.0, line_h)));
+            continue;
+        }
+        let text =
+            |id: &str| mail.map(|m| mailview::cell_text(&app.s, m, id, col.format)).unwrap_or_default();
+        if col.kind == ColumnKind::Icon && col.format == "text" {
+            let t = Text::styled(ui, &text(col.id), 12.5, look, muted, inner_w, 1, None);
+            paint_cell_text(&painter, &t, text_cell, col.align);
+            if col.id == "flagStatus" {
+                slots.flag = Some(cell);
             }
-            Col::Importance => {
+            continue;
+        }
+        match col.id {
+            "importance" => {
                 if row.importance_high {
                     app.icons.paint(
                         ui,
@@ -1536,98 +1811,35 @@ fn paint_columns(
                     app.icons.paint(ui, icon_rect(cell.center(), 14.0), "importance-low", th.importance_low);
                 }
             }
-            Col::Reminder => {
+            "reminder" => {
                 let reminder =
                     mail.is_some_and(|m| matches!(m.flag, FlagState::Flagged { reminder: Some(_), .. }));
                 if reminder {
                     app.icons.paint(ui, icon_rect(cell.center(), 13.0), "bell", th.text_muted);
                 }
             }
-            Col::Icon => {
-                let icon = if row.draft_marker || mail.is_some_and(|m| m.is_draft) {
-                    "draft"
+            "icon" => {
+                let (icon, tint) = if let Some((name, _)) = download_icon(row) {
+                    (name, if row.marked.is_some() { th.accent } else { th.text_muted })
+                } else if row.draft_marker || mail.is_some_and(|m| m.is_draft) {
+                    ("draft", th.text_muted)
                 } else if row.replied {
-                    "replied"
+                    ("replied", th.text_muted)
                 } else if row.forwarded {
-                    "forwarded"
+                    ("forwarded", th.text_muted)
                 } else if row.unread {
-                    "mail"
+                    ("mail", th.text_muted)
                 } else {
-                    "envelope-open"
+                    ("envelope-open", th.text_muted)
                 };
-                app.icons.paint(ui, icon_rect(cell.center(), 14.0), icon, th.text_muted);
+                app.icons.paint(ui, icon_rect(cell.center(), 14.0), icon, tint);
             }
-            Col::Attachment => {
+            "attachment" => {
                 if row.has_attachments {
                     app.icons.paint(ui, icon_rect(cell.center(), 14.0), "paperclip", th.text_muted);
                 }
             }
-            Col::From => {
-                let mut x = cell.left() + 6.0 + indent;
-                if row.draft_marker {
-                    let t = Text::new(ui, "[Draft]", 13.0, false, th.draft, inner_w, 1);
-                    x = t.paint_left(&painter, cell, x) + 4.0;
-                }
-                let color = if other { th.text_muted } else { th.text };
-                let t =
-                    Text::new(ui, &row.who, 13.0, row.unread, color, (cell.right() - x - 4.0).max(1.0), 1);
-                t.paint_left(&painter, cell, x);
-            }
-            Col::Subject => {
-                let mut right = cell.right() - 4.0;
-                if hovered {
-                    let d = Rect::from_min_size(pos2(right - 19.0, cell.top()), vec2(19.0, line_h));
-                    app.icons.paint(ui, icon_rect(d.center(), 14.0), "delete", th.text_muted);
-                    right = d.left() - 2.0;
-                    delete = Some(d);
-                }
-                let subject = match conv {
-                    Some(cv) if cv.header && cv.unread > 0 => format!("{} ({})", row.subject, cv.unread),
-                    _ => row.subject.clone(),
-                };
-                let room = (right - cell.left() - 6.0).max(1.0);
-                let end = Text::new(ui, &subject, 13.0, row.unread, text_color, room, 1).paint_left(
-                    &painter,
-                    cell,
-                    cell.left() + 6.0,
-                );
-                if let Some(folder) = conv.and_then(|cv| cv.other_folder.as_deref()) {
-                    let t = Text::italic(ui, folder, 12.0, th.text_muted, (right - end - 10.0).max(1.0));
-                    t.paint_left(&painter, cell, end + 8.0);
-                }
-            }
-            Col::Received => {
-                let color = if row.unread { th.unread } else { th.text_muted };
-                let t = Text::new(ui, &row.time, 12.5, row.unread, color, inner_w, 1);
-                t.paint_left(&painter, cell, cell.left() + 6.0);
-            }
-            Col::Size => {
-                let label = mail.map(|m| m.size_label()).unwrap_or_default();
-                let t = Text::new(ui, &label, 12.5, false, th.text_muted, inner_w, 1);
-                t.paint_right(&painter, cell, cell.right() - 6.0);
-            }
-            Col::Categories => {
-                let mut x = cell.left() + 6.0;
-                let names: Vec<String> = mail.map(|m| m.categories.clone()).unwrap_or_default();
-                for hex in row.categories.iter().take(3) {
-                    let block = Rect::from_min_size(pos2(x, cell.center().y - 6.0), vec2(8.0, 12.0));
-                    painter.rect_filled(block, 2.0, hex_color(hex));
-                    x += 11.0;
-                }
-                if !names.is_empty() {
-                    let t = Text::new(
-                        ui,
-                        &names.join(", "),
-                        12.0,
-                        false,
-                        th.text_muted,
-                        (cell.right() - x - 4.0).max(1.0),
-                        1,
-                    );
-                    t.paint_left(&painter, cell, x + 2.0);
-                }
-            }
-            Col::Mention => {
+            "mention" => {
                 let mentioned = match st.mentions.get(&row.id.0) {
                     Some(m) => *m,
                     None => {
@@ -1641,16 +1853,100 @@ fn paint_columns(
                     t.paint_left(&painter, cell, cell.center().x - t.width() / 2.0);
                 }
             }
-            Col::Flag => {
-                flag = cell;
-                paint_flag(ui, &mut app.icons, &th, row, cell, hovered);
+            "flagStatus" => {
+                slots.flag = Some(cell);
+                paint_flag(ui, &mut app.icons, &th, row, cell, hovered && flag_active(c));
+            }
+            "from" => {
+                let mut x = cell.left() + 6.0 + indent;
+                if row.draft_marker {
+                    let t = Text::new(ui, "[Draft]", 13.0, false, th.draft, inner_w, 1);
+                    x = t.paint_left(&painter, cell, x) + 4.0;
+                }
+                if row.pinned {
+                    app.icons.paint(ui, icon_rect(pos2(x + 6.0, cell.center().y), 12.0), "pin", th.accent);
+                    x += 15.0;
+                }
+                // Name format keeps the row's own text (conversation senders, "(unknown sender)").
+                let who = if col.format == "name" { row.who.clone() } else { text("from") };
+                let color = if other { th.text_muted } else { rule_color(&row.style, th.text) };
+                let t = Text::styled(
+                    ui,
+                    &who,
+                    13.0,
+                    look,
+                    color,
+                    (text_cell.right() - x - 4.0).max(1.0),
+                    1,
+                    None,
+                );
+                t.paint_left(&painter, cell, x);
+            }
+            "subject" => {
+                let subject = match conv {
+                    Some(cv) if cv.header && cv.unread > 0 => format!("{} ({})", row.subject, cv.unread),
+                    _ => row.subject.clone(),
+                };
+                let room = (text_cell.right() - cell.left() - 6.0).max(1.0);
+                let t = Text::styled(ui, &subject, 13.0, look, text_color, room, 1, None);
+                let end = match col.align {
+                    "right" | "center" => {
+                        paint_cell_text(&painter, &t, text_cell, col.align);
+                        text_cell.right()
+                    }
+                    _ => t.paint_left(&painter, cell, cell.left() + 6.0),
+                };
+                if let Some(folder) = conv.and_then(|cv| cv.other_folder.as_deref()) {
+                    let t = Text::italic(ui, folder, 12.0, th.text_muted, (right - end - 10.0).max(1.0));
+                    t.paint_left(&painter, cell, end + 8.0);
+                }
+            }
+            "received" => {
+                let shown = if col.format == "bestFit" { row.time.clone() } else { text("received") };
+                let t = Text::styled(ui, &shown, 12.5, look, muted, inner_w, 1, None);
+                paint_cell_text(&painter, &t, text_cell, col.align);
+            }
+            "categories" => {
+                slots.category = Some(cell);
+                let mut x = cell.left() + 6.0;
+                for hex in row.categories.iter().take(3) {
+                    let block = Rect::from_min_size(pos2(x, cell.center().y - 6.0), vec2(8.0, 12.0));
+                    painter.rect_filled(block, 2.0, hex_color(hex));
+                    x += 11.0;
+                }
+                let names = text("categories");
+                if !names.is_empty() {
+                    let t = Text::new(
+                        ui,
+                        &names,
+                        12.0,
+                        false,
+                        th.text_muted,
+                        (cell.right() - x - 4.0).max(1.0),
+                        1,
+                    );
+                    t.paint_left(&painter, cell, x + 2.0);
+                } else if hovered {
+                    app.icons.paint(
+                        ui,
+                        icon_rect(pos2(x + 6.0, cell.center().y), 13.0),
+                        "category-tag",
+                        th.text_muted,
+                    );
+                }
+            }
+            id => {
+                let t = Text::styled(ui, &text(id), 12.5, look, muted, inner_w, 1, None);
+                paint_cell_text(&painter, &t, text_cell, col.align);
             }
         }
     }
     if preview > 0 && !row.preview.trim().is_empty() {
-        // The preview line starts under the From column.
-        let from_x =
-            columns(r.width()).iter().find(|(col, _, _)| *col == Col::From).map_or(76.0, |(_, x, _)| *x);
+        // The preview line starts under the first column sharing the free space (From by default).
+        let from_x = layout
+            .iter()
+            .find(|(i, _, _)| c.columns.get(*i).is_some_and(|x| x.default_width == 0))
+            .map_or(76.0, |(_, x, _)| *x);
         let left = r.left() + from_x + 6.0;
         let color = if row.unread { th.unread } else { th.text_muted };
         let t = Text::new(
@@ -1664,7 +1960,7 @@ fn paint_columns(
         );
         t.paint(&painter, pos2(left, line.bottom() + 1.0));
     }
-    (Slots { flag, delete }, glyph)
+    (slots, glyph)
 }
 
 /// "Move N items" chip under the pointer while rows are dragged.
@@ -1891,12 +2187,119 @@ mod tests {
         assert_eq!(item_height(Mode::Compact, 1, false), 72.0);
         assert_eq!(item_height(Mode::Compact, 0, false), 54.0);
         assert_eq!(item_height(Mode::Columns { preview: 0 }, 1, false), 24.0);
-        let cols = columns(900.0);
+        let s = sample_session();
+        let specs = mailview::columns(&s, s.selection.folder);
+        let cols = layout_columns(&specs, 900.0);
         assert_eq!(cols.len(), 11);
         assert!(cols.windows(2).all(|w| w[0].1 < w[1].1));
-        assert_eq!(columns(400.0).len(), 7);
+        assert_eq!(layout_columns(&specs, 400.0).len(), 7, "a narrow list keeps the essential columns");
+        // From stays narrow next to Subject; Subject takes the rest.
+        let width_of = |id: &str| {
+            cols.iter().find(|(i, _, _)| specs.get(*i).is_some_and(|c| c.id == id)).map(|x| x.2).unwrap()
+        };
+        assert!(width_of("from") < width_of("subject"));
+        assert!(layout_columns(&[], 500.0).is_empty());
         assert_eq!(hex_color("#ff0000"), Color32::from_rgb(255, 0, 0));
         assert_eq!(hex_color("junk"), Color32::GRAY);
+    }
+
+    // ---- View settings: columns, Quick Actions, Quick Click, pins ------------------------------------------
+
+    #[test]
+    fn chosen_columns_drive_the_column_layout() {
+        let mut s = sample_session();
+        s.run("view.readingPane", &json!({"position": "bottom"})).unwrap();
+        s.run("view.columns", &json!({"columns": ["subject", "cc", "size"]})).unwrap();
+        s.run("view.formatColumns", &json!({"column": "size", "label": "Bytes", "format": "bytes"})).unwrap();
+        let app = App::new(s);
+        let mut h = harness(app, vec2(900.0, 700.0));
+        h.run();
+        assert!(h.query_by_label("Subject").is_some());
+        assert!(h.query_by_label("Cc").is_some());
+        assert!(h.query_by_label("Bytes").is_some(), "Format Columns label");
+        assert!(h.query_by_label("Received").is_none(), "a column left out is not drawn");
+        // Clicking a header still arranges by it.
+        h.get_by_label("Bytes").click();
+        h.run();
+        let folder = h.state().s.selection.folder;
+        assert_eq!(queries::view_settings(&h.state().s, folder).arrange_by, ArrangeBy::Size);
+    }
+
+    #[test]
+    fn hover_buttons_are_the_saved_quick_actions() {
+        let mut s = sample_session();
+        s.run("view.quickActions", &json!({"actions": ["pin", "archive"]})).unwrap();
+        let app = App::new(s);
+        let (id, subject) = item_ids(&app).into_iter().next().unwrap();
+        let mut h = harness(app, vec2(420.0, 1400.0));
+        h.run();
+        h.query_all_by_label_contains(&format!("Subject {subject}")).next().unwrap().hover();
+        h.run();
+        assert!(h.query_by_label("Archive").is_some());
+        assert!(h.query_by_label("Delete").is_none(), "Delete is not a Quick Action now");
+        assert!(h.query_by_label("Flag this message").is_none(), "flag clicks need the Flag Quick Action");
+        h.get_by_label("Pin").click();
+        h.run();
+        assert!(mailview::pinned(&h.state().s).contains(&mailcraft_model::ItemId(id)));
+        assert!(h.query_all_by_label_contains("Pinned").next().is_some(), "pinned group and row");
+    }
+
+    #[test]
+    fn category_column_applies_the_quick_click_category() {
+        let app = App::new(sample_session());
+        let target = item_ids(&app)
+            .into_iter()
+            .map(|(id, _)| id)
+            .find(|id| {
+                app.s.mailbox.mail.get(&mailcraft_model::ItemId(*id)).is_some_and(|m| m.categories.is_empty())
+            })
+            .unwrap();
+        let category = mailcraft_engine::cmd::categories::quick_click_category(&app.s).unwrap();
+        let mut h = harness(app, vec2(420.0, 1400.0));
+        h.run();
+        let before = h.query_all_by_label("No Categories").count();
+        assert!(before > 0, "rows without categories offer the category column");
+        // The first row without categories in list order.
+        let rows: Vec<u64> = item_ids(h.state()).into_iter().map(|(id, _)| id).collect();
+        let nth = rows
+            .iter()
+            .filter(|id| {
+                h.state()
+                    .s
+                    .mailbox
+                    .mail
+                    .get(&mailcraft_model::ItemId(**id))
+                    .is_some_and(|m| m.categories.is_empty())
+            })
+            .position(|id| *id == target)
+            .unwrap();
+        h.query_all_by_label("No Categories").nth(nth).unwrap().click();
+        h.run();
+        let m = h.state().s.mailbox.mail.get(&mailcraft_model::ItemId(target)).unwrap();
+        assert!(m.categories.iter().any(|c| c.eq_ignore_ascii_case(&category)));
+    }
+
+    #[test]
+    fn rule_fonts_and_download_state_reach_the_rows() {
+        let mut s = sample_session();
+        let folder: FolderId = s.selection.folder;
+        let rules = json!([{"name": "Everything", "on": true, "kind": "custom",
+            "condition": {"words": ""}, "font": {"italic": true}}]);
+        // An empty condition matches nothing; one on the sender matches.
+        s.run("view.conditionalFormatting", &json!({"rules": rules})).unwrap();
+        let rows = queries::list_rows(&s);
+        assert!(rows.iter().all(|r| !matches!(r, ListRow::Item(i) if i.style.italic)));
+        let rules = json!([{"name": "Unread", "on": true, "kind": "unread", "font": {"underline": true}}]);
+        s.run("view.conditionalFormatting", &json!({"rules": rules})).unwrap();
+        let rows = queries::list_rows(&s);
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r, ListRow::Item(i) if i.unread && i.style.underline && !i.style.bold))
+        );
+        assert!(mailview::mail_view(&s, folder).rules.is_some());
+        let app = App::new(s);
+        let mut h = harness(app, vec2(420.0, 900.0));
+        h.run();
     }
 
     // ---- Conversation view ---------------------------------------------------------------------------------
