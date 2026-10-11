@@ -181,6 +181,11 @@ pub struct Group {
 }
 
 impl Group {
+    /// Stable id: the name lower-cased with only letters and digits kept ("Quick Steps" → "quicksteps").
+    pub fn id(&self) -> String {
+        self.name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
+    }
+
     pub fn icon(&self) -> &str {
         match &self.icon {
             Some(i) => i,
@@ -292,13 +297,38 @@ impl Defs {
     }
 }
 
-/// Parses every source.
+/// Width rules added to the parsed definitions, keyed by (surface, mode, tab, group id): observations of
+/// plan/outlook/responsive.md that the `.ribbon` files do not carry yet.
+///
+/// - Classic, main window, Home: at 1024 "Respond icon-only" — Reply, Reply All and Forward lose their
+///   labels and turn small (the `.ribbon` line only makes them small).
+pub const RULE_OVERRIDES: [(&str, Mode, &str, &str, Rule); 1] = [(
+    "main",
+    Mode::Classic,
+    "Home",
+    "respond",
+    Rule { classic: true, max_width: 1024.0, act: Act::IconOnly },
+)];
+
+/// Parses every source, then applies [`RULE_OVERRIDES`].
 pub fn parse_all(sources: &[(&str, &str)]) -> Defs {
     let mut d = Defs::default();
     for (file, text) in sources {
         parse_into(&mut d, file, text);
     }
+    apply_overrides(&mut d);
     d
+}
+
+fn apply_overrides(d: &mut Defs) {
+    for (surface, mode, tab, group, rule) in RULE_OVERRIDES {
+        let tabs = d.tabs.iter_mut().filter(|t| t.surface == surface && t.mode == mode && t.name == tab);
+        for g in tabs.flat_map(|t| t.groups.iter_mut()).filter(|g| g.id() == group) {
+            if !g.rules.contains(&rule) {
+                g.rules.push(rule);
+            }
+        }
+    }
 }
 
 enum Block {
@@ -557,5 +587,46 @@ fn parse_into(d: &mut Defs, file: &str, text: &str) {
                 group.ctls.push(c);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home_classic() -> &'static Tab {
+        defs().tab("main", false, "Home").unwrap()
+    }
+
+    #[test]
+    fn group_ids() {
+        let ids: Vec<String> = home_classic().groups.iter().map(Group::id).collect();
+        assert!(ids.iter().any(|i| i == "respond") && ids.iter().any(|i| i == "quicksteps"), "{ids:?}");
+    }
+
+    #[test]
+    fn classic_respond_goes_icon_only_at_1024() {
+        // responsive.md, Classic 1024: "Respond icon-only".
+        let respond = home_classic().groups.iter().find(|g| g.id() == "respond").unwrap();
+        let icon_only =
+            |w: f32| respond.rules.iter().any(|r| r.classic && w <= r.max_width && r.act == Act::IconOnly);
+        assert!(icon_only(1024.0) && icon_only(700.0));
+        assert!(!icon_only(1025.0) && !icon_only(1366.0));
+        // Only the Classic Home tab of the main window gets it; the Simplified ribbon keeps its own rule.
+        let simplified = defs().tab("main", true, "Home").unwrap();
+        let s_respond = simplified.groups.iter().find(|g| g.id() == "respond").unwrap();
+        assert!(s_respond.rules.iter().all(|r| !r.classic));
+        assert!(defs().errors.is_empty(), "{:?}", defs().errors);
+    }
+
+    #[test]
+    fn overrides_apply_once_and_leave_other_sources_alone() {
+        let src = "mode classic\ntab Home | H\ngroup Respond | ZR | c1024=iconly\nbutton L | Reply | reply | mail.reply | | RP\n";
+        let d = parse_all(&[("t.ribbon", src)]);
+        let g = d.tabs.first().and_then(|t| t.groups.first()).unwrap();
+        assert_eq!(g.rules.len(), 1, "an existing identical rule is not added twice");
+        let other =
+            parse_all(&[("t.ribbon", "surface read\nmode classic\ntab Home | H\ngroup Respond | ZR\n")]);
+        assert!(other.tabs.first().and_then(|t| t.groups.first()).unwrap().rules.is_empty());
     }
 }

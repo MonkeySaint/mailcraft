@@ -176,6 +176,18 @@ fn paint_bg(ui: &Ui, app: &App, rect: Rect, hovered: bool, on: bool, down: bool)
     }
 }
 
+/// Keyboard focus (Tab, F6): an accent outline, so the ribbon can be worked without a mouse.
+fn paint_focus(ui: &Ui, app: &App, rect: Rect, focused: bool) {
+    if focused {
+        ui.painter().rect_stroke(
+            rect.shrink(0.5),
+            CornerRadius::same(4),
+            Stroke::new(1.5, app.theme.accent),
+            StrokeKind::Inside,
+        );
+    }
+}
+
 fn paint_icon(ui: &Ui, app: &mut App, rect: Rect, name: &str, tint: Color32) {
     if !name.is_empty() {
         app.icons.paint(ui, rect, name, tint);
@@ -293,6 +305,7 @@ fn button(
         look.on,
         open || resp.is_pointer_button_down_on(),
     );
+    paint_focus(ui, app, rect, resp.has_focus());
     paint_look(ui, app, rect, look);
     tooltip(resp, tip, why)
 }
@@ -336,6 +349,8 @@ fn split_button(
         };
         ui.painter().line_segment(sep, Stroke::new(1.0, app.theme.separator));
     }
+    paint_focus(ui, app, main_r, main.has_focus());
+    paint_focus(ui, app, arrow_r, arrow.has_focus());
     paint_look(ui, app, rect, look);
     (tooltip(main, tip, why), arrow.on_hover_text(format!("{tip} options")))
 }
@@ -637,7 +652,7 @@ fn combo(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, id: Id, rect: Rect) {
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, c.label.as_str()));
     let t = app.theme.clone();
     ui.painter().rect_filled(r, CornerRadius::same(3), t.pane);
-    let border = if resp.hovered() { t.accent } else { t.separator };
+    let border = if resp.hovered() || resp.has_focus() { t.accent } else { t.separator };
     ui.painter().rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, border), StrokeKind::Inside);
     let mut value = state::combo_value(app, cx.surface, c.on.as_deref());
     // A box that shows a value stays blank when the selection mixes values; others show their label.

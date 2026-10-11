@@ -18,8 +18,9 @@
 //! | Delete | Delete message | Delete contact / appointment / task / note | – (body editing) | Delete message |
 //! | F11 | Search People (ribbon) | People: Search People | – | – |
 //! | Space / Shift+Space | Page through the message, then next / previous item (option) | – | – | – |
-//! | F6 / Shift+F6 | Move focus to the next / previous pane | same | – | – |
+//! | F6 / Shift+F6 | Move keyboard focus to the next / previous pane | same | – | – |
 //! | Mod+F1 | Collapse / expand the ribbon | same | – | – |
+//! | Mod+< / Mod+> (Mod+, / Mod+.) | – | – | Previous / Next Item | Previous / Next Item |
 //!
 //! Options (engine settings) change some keys: Mail › "CTRL + ENTER sends a message", Reading Pane ›
 //! "Single key reading using space bar", Advanced › "Prompt for confirmation before permanently deleting
@@ -27,7 +28,16 @@
 //!
 //! Nothing is taken from a focused text field except Escape, function keys, Mod+Shift+letter / Mod+Alt chords
 //! and Mod+digit — and, in compose windows, the formatting shortcuts (Bold, Italic, alignment, link, font
-//! size, sub/superscript, Send, Save).
+//! size, sub/superscript, Send, Save) and Previous / Next Item.
+//!
+//! When keyboard focus is on a widget that a click activates (a ribbon button, tab, check box, folder row —
+//! reached with Tab or F6), Space and Enter press that widget and the plain arrow keys move focus between
+//! widgets: they are not taken for Space-bar reading, Open or list navigation. The message list and the
+//! reading pane's body keep their keys while they have focus.
+//!
+//! F6 moves egui keyboard focus itself (not only a highlight): the selected folder's row, the message list,
+//! the message body, the status bar's first control and the selected ribbon tab (Tab then walks the ribbon's
+//! controls). Panes with nothing focusable get the focus ring only.
 //!
 //! Call [`handle`] once per frame per surface **before** drawing that surface's widgets, so consumed key
 //! events do not also reach the widgets.
@@ -203,6 +213,9 @@ pub struct KeyContext {
     pub ctrl_enter_sends: bool,
     /// Reading Pane options › "Single key reading using space bar".
     pub space_reading: bool,
+    /// A non-text widget that a click activates (button, tab, check box, folder row) has keyboard focus:
+    /// Space / Enter press it and the arrow keys move focus, so they are not bound here.
+    pub widget_focus: bool,
 }
 
 impl KeyContext {
@@ -218,6 +231,7 @@ impl KeyContext {
             popup: false,
             ctrl_enter_sends: true,
             space_reading: true,
+            widget_focus: false,
         }
     }
 
@@ -243,7 +257,38 @@ impl KeyContext {
             popup: ctx.any_popup_open(),
             ctrl_enter_sends: app.s.settings.bool("mail.send.ctrlEnterSends"),
             space_reading: app.s.settings.bool("mail.readingPane.spaceBarReading"),
+            widget_focus: widget_focused(ctx),
         }
+    }
+}
+
+/// Whether keyboard focus is on a widget that Space / Enter activate: enabled, senses clicks but not drags
+/// (text fields, the message body and list rows sense drags too), and not the message list body (its own
+/// keys are list navigation).
+pub fn widget_focused(ctx: &egui::Context) -> bool {
+    let Some(id) = ctx.memory(|m| m.focused()) else { return false };
+    if ctx.text_edit_focused() || id == crate::list::focus_id() {
+        return false;
+    }
+    ctx.viewport(|v| {
+        v.this_pass
+            .widgets
+            .get(id)
+            .or_else(|| v.prev_pass.widgets.get(id))
+            .is_some_and(|w| w.enabled && w.sense.senses_click() && !w.sense.senses_drag())
+    })
+}
+
+/// Keys that belong to a focused button-like widget (see [`KeyContext::widget_focus`]): Space and Enter
+/// (egui presses the focused widget with either, Shift or not) and the plain arrows (egui moves focus).
+fn goes_to_focused_widget(c: Chord) -> bool {
+    if c.cmd || c.alt {
+        return false;
+    }
+    match c.key {
+        Key::Space | Key::Enter => true,
+        Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => !c.shift,
+        _ => false,
     }
 }
 
@@ -274,6 +319,8 @@ pub enum Action {
     SpaceRead(bool),
     /// F6 / Shift+F6 (`true` = back): move focus to the next pane.
     CyclePane(bool),
+    /// Compose window: Previous (`false`) / Next (`true`) Item — close it and open the neighbouring message.
+    ComposeStep(bool),
     /// Mod+F1: collapse or expand the ribbon.
     ToggleRibbon,
 }
@@ -333,6 +380,8 @@ fn is_compose_formatting(c: Chord) -> bool {
                 | Key::S
                 | Key::Enter
                 | Key::Equals
+                | Key::Period
+                | Key::Comma
         ) | (true, false, Key::Period | Key::Comma | Key::Equals | Key::Num8)
     )
 }
@@ -381,6 +430,9 @@ pub fn resolve(c: Chord, cx: &KeyContext) -> Option<Action> {
     if cx.text_focus && !allowed_with_text_focus(c, cx.surface) {
         return None;
     }
+    if cx.widget_focus && goes_to_focused_widget(c) {
+        return None;
+    }
     if c.key == Key::Escape && !c.cmd && !c.alt && !c.shift {
         // An open popup / context menu closes itself on Escape.
         let nothing_open = cx.surface == Surface::Main && !cx.dialog && !cx.backstage && !cx.search_active;
@@ -411,6 +463,9 @@ pub fn resolve_with(c: Chord, cx: &KeyContext, registry: &Registry) -> Option<Ac
         return None;
     }
     if cx.text_focus && !allowed_with_text_focus(c, cx.surface) {
+        return None;
+    }
+    if cx.widget_focus && goes_to_focused_widget(c) {
         return None;
     }
     if cx.dialog || cx.backstage {
@@ -613,6 +668,10 @@ fn resolve_compose(c: Chord, id: u64, _cx: &KeyContext) -> Option<Action> {
         (true, false, false, Key::J) => run_p("format.align", with(json!({"kind": "justify"}))),
         (true, false, false, Key::K) => run_p("insert.link", p()),
         (true, false, true, Key::Period) => run_p("format.growFont", p()),
+        // Ctrl+< / Ctrl+> (keyboard.md, compose window): the unshifted , and . keys; with Shift they size
+        // the font.
+        (true, false, false, Key::Period) => Some(Action::ComposeStep(true)),
+        (true, false, false, Key::Comma) => Some(Action::ComposeStep(false)),
         (true, false, true, Key::Comma) => run_p("format.shrinkFont", p()),
         (true, false, false, Key::Equals) => run_p("format.sub", p()),
         (true, false, true, Key::Equals) => run_p("format.sup", p()),
@@ -683,32 +742,170 @@ pub fn focused_pane(ctx: &egui::Context) -> Option<String> {
     with_mem(ctx, |m| m.pane.clone())
 }
 
-/// F6 / Shift+F6: the next (previous) pane of the main window, in drawing order, then the status bar and the
-/// ribbon. Returns the pane now focused.
-fn cycle_pane(ctx: &egui::Context, app: &App, back: bool) -> Option<String> {
+/// A focusable widget of the main window's previous frame.
+#[derive(Clone, Copy, Debug)]
+struct Focusable {
+    id: egui::Id,
+    /// Visible (clipped) interaction rectangle.
+    rect: egui::Rect,
+    click: bool,
+    drag: bool,
+}
+
+/// Enabled, focusable, visible widgets the main window drew in the previous frame, in drawing order (which
+/// is also egui's Tab order).
+fn focusables(ctx: &egui::Context) -> Vec<Focusable> {
+    ctx.viewport(|v| {
+        v.prev_pass
+            .widgets
+            .get_layer(egui::LayerId::background())
+            .filter(|w| w.enabled && w.sense.is_focusable() && w.interact_rect.is_positive())
+            .map(|w| Focusable {
+                id: w.id,
+                rect: w.interact_rect,
+                click: w.sense.senses_click(),
+                drag: w.sense.senses_drag(),
+            })
+            .collect()
+    })
+}
+
+/// The main window's F6 stops with their rectangles, in order: the content panes left to right (folder pane,
+/// list, reading pane, To-Do Bar, module views), then the status bar and the ribbon (tab row and body) —
+/// keyboard.md: "reading pane → status bar → ribbon tabs → …".
+fn pane_stops(ctx: &egui::Context, app: &App) -> Vec<(String, egui::Rect)> {
+    use crate::theme::size;
     let layout = App::shell_layout(ctx);
-    let mut order: Vec<String> = layout.panes.iter().map(|p| (*p).to_owned()).collect();
+    let mut out: Vec<(String, egui::Rect)> =
+        layout.panes.iter().zip(layout.rects.iter()).map(|(p, r)| ((*p).to_owned(), *r)).collect();
+    let full = ctx.content_rect();
     if app.s.view.status_bar {
-        order.push("statusBar".into());
+        let top = (full.bottom() - size::STATUS_BAR).max(full.top());
+        out.push(("statusBar".into(), egui::Rect::from_min_max(egui::pos2(full.left(), top), full.max)));
     }
     if layout.tabs_shown {
-        order.push("ribbon".into());
+        let top = full.top() + size::TITLE_BAR;
+        let body = if !layout.ribbon_shown {
+            0.0
+        } else if app.s.view.simplified_ribbon {
+            size::RIBBON_SIMPLIFIED
+        } else {
+            size::RIBBON_CLASSIC
+        };
+        let bottom = (top + size::TAB_ROW + body).min(full.bottom()).max(top);
+        out.push((
+            "ribbon".into(),
+            egui::Rect::from_min_max(egui::pos2(full.left(), top), egui::pos2(full.right(), bottom)),
+        ));
     }
-    if order.is_empty() {
+    out
+}
+
+/// The stop holding the widget with keyboard focus, if any.
+fn pane_of_focus(
+    ctx: &egui::Context,
+    stops: &[(String, egui::Rect)],
+    widgets: &[Focusable],
+) -> Option<String> {
+    let id = ctx.memory(|m| m.focused())?;
+    if id == crate::list::focus_id() && stops.iter().any(|(n, _)| n == "list") {
+        return Some("list".into());
+    }
+    let w = widgets.iter().find(|w| w.id == id)?;
+    stops.iter().find(|(_, r)| r.contains(w.rect.center())).map(|(n, _)| n.clone())
+}
+
+/// The widget F6 focuses in stop `name`: the selected folder's row, the message list, the message body, the
+/// selected ribbon tab; otherwise the first clickable widget inside the stop.
+fn focus_target(app: &App, name: &str, rect: egui::Rect, widgets: &[Focusable]) -> Option<egui::Id> {
+    let inside = |w: &&Focusable| rect.contains(w.rect.center());
+    let present = |id: egui::Id| widgets.iter().any(|w| w.id == id && rect.contains(w.rect.center()));
+    match name {
+        "list" if present(crate::list::focus_id()) => return Some(crate::list::focus_id()),
+        "folders" => {
+            let sel = app.s.selection.folder.0;
+            for tag in ["tree", "fav"] {
+                let id = egui::Id::new(("mailcraft.folders.row", tag, sel));
+                if present(id) {
+                    return Some(id);
+                }
+            }
+        }
+        "reading" => {
+            if let Some(w) = widgets.iter().filter(inside).find(|w| w.click && w.drag) {
+                return Some(w.id);
+            }
+        }
+        "ribbon" => {
+            // Tab row: File, then the tabs in order.
+            let band = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.right(), (rect.top() + crate::theme::size::TAB_ROW).min(rect.bottom())),
+            );
+            let mut tabs: Vec<&Focusable> =
+                widgets.iter().filter(|w| w.click && band.contains(w.rect.center())).collect();
+            tabs.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+            let selected = crate::ribbon::selected_tab(app, Surface::Main);
+            let pos = crate::ribbon::tabs(app, Surface::Main).iter().position(|t| *t == selected);
+            if let Some(w) = pos.and_then(|i| tabs.get(i.saturating_add(1))) {
+                return Some(w.id);
+            }
+        }
+        _ => {}
+    }
+    // Buttons before drag areas (a scroll area's background senses drags only and is never picked).
+    widgets
+        .iter()
+        .filter(inside)
+        .find(|w| w.click && !w.drag)
+        .or_else(|| widgets.iter().filter(inside).find(|w| w.click))
+        .map(|w| w.id)
+}
+
+/// F6 / Shift+F6: moves keyboard focus to the next (previous) pane of the main window, in drawing order, then
+/// the status bar and the ribbon. The pane is the one after the F6 pane, else after the pane holding the
+/// focused widget (a clicked list → reading pane). Returns the pane now focused.
+fn cycle_pane(ctx: &egui::Context, app: &App, back: bool) -> Option<String> {
+    let stops = pane_stops(ctx, app);
+    if stops.is_empty() {
         return None;
     }
-    let cur = with_mem(ctx, |m| m.pane.clone()).and_then(|p| order.iter().position(|o| *o == p));
-    let n = order.len();
+    let widgets = focusables(ctx);
+    let cur_name = with_mem(ctx, |m| m.pane.clone()).or_else(|| pane_of_focus(ctx, &stops, &widgets));
+    let cur = cur_name.and_then(|p| stops.iter().position(|(n, _)| *n == p));
+    let n = stops.len();
     let next = match (cur, back) {
         (None, false) => 0,
         (None, true) => n.saturating_sub(1),
-        (Some(i), false) => (i + 1) % n,
-        (Some(i), true) => (i + n - 1) % n,
+        (Some(i), false) => i.saturating_add(1) % n,
+        (Some(i), true) => i.checked_sub(1).unwrap_or(n.saturating_sub(1)),
     };
-    let pane = order.get(next).cloned();
-    with_mem(ctx, |m| m.pane = pane.clone());
+    let (name, rect) = stops.get(next).cloned()?;
+    let target = focus_target(app, &name, rect, &widgets);
+    ctx.memory_mut(|m| match target {
+        Some(id) => m.request_focus(id),
+        // Nothing focusable there: focus leaves the old pane (its keys must not keep working).
+        None => {
+            if let Some(f) = m.focused() {
+                m.surrender_focus(f);
+            }
+        }
+    });
+    with_mem(ctx, |m| m.pane = Some(name.clone()));
     ctx.request_repaint();
-    pane
+    Some(name)
+}
+
+/// Keeps the F6 ring on the pane that holds keyboard focus once Tab has moved it into another pane.
+fn follow_focus(ctx: &egui::Context, app: &App) {
+    if with_mem(ctx, |m| m.pane.is_none()) || ctx.memory(|m| m.focused().is_none()) {
+        return;
+    }
+    let stops = pane_stops(ctx, app);
+    let widgets = focusables(ctx);
+    if let Some(p) = pane_of_focus(ctx, &stops, &widgets) {
+        with_mem(ctx, |m| m.pane = Some(p));
+    }
 }
 
 fn mem_id() -> egui::Id {
@@ -780,6 +977,7 @@ pub fn apply(ctx: &egui::Context, app: &mut App, surface: Surface, action: Actio
             let pane = cycle_pane(ctx, app, back);
             json!({"action": "cyclePane", "pane": pane})
         }
+        Action::ComposeStep(next) => compose_step(app, surface, next),
         Action::ToggleRibbon => {
             let mode = if app.s.view.ribbon_collapsed || app.s.view.ribbon_auto_hide {
                 "always"
@@ -860,6 +1058,42 @@ pub fn apply(ctx: &egui::Context, app: &mut App, surface: Surface, action: Actio
             }
         }
     }
+}
+
+/// Compose window Previous / Next Item (keyboard.md, Ctrl+< / Ctrl+>): the message before / after this one in
+/// the main window's list — the saved draft, else the message replied to, else the selected message — is
+/// selected and opened in a read window, and the compose window closes. Unsaved changes get the save prompt
+/// first (nothing moves). Inline responses and new messages with nothing to step from do nothing.
+fn compose_step(app: &mut App, surface: Surface, next: bool) -> Value {
+    let fail = |why: &str| json!({"action": "composeStep", "ok": false, "error": why});
+    let Surface::Compose(cid) = surface else { return fail("not a compose window") };
+    let Some((inline, dirty, draft, source)) =
+        app.s.composes.get(&cid).map(|c| (c.inline, c.dirty, c.draft, c.source))
+    else {
+        return fail("no such compose window");
+    };
+    if inline {
+        return fail("inline response");
+    }
+    let order = mailcraft_engine::queries::visible_item_ids(&app.s);
+    let pos = [draft, source, app.s.selection.focus]
+        .into_iter()
+        .flatten()
+        .find_map(|anchor| order.iter().position(|i| *i == anchor));
+    let target = pos.and_then(|p| {
+        if next { order.get(p.saturating_add(1)) } else { p.checked_sub(1).and_then(|q| order.get(q)) }
+    });
+    let Some(target) = target.map(|t| t.0) else { return fail("no previous / next item") };
+    if dirty {
+        let r = app.run("compose.close", json!({"compose": cid}));
+        return json!({"action": "composeStep", "ok": false, "prompt": true, "result": r});
+    }
+    if app.run("compose.close", json!({"compose": cid})).is_none() {
+        return fail("cannot close");
+    }
+    app.run("nav.selectItem", json!({"id": target}));
+    let r = app.run("mail.open", json!({"ids": [target]}));
+    json!({"action": "composeStep", "ok": r.is_some(), "item": target})
 }
 
 /// Runs a command for a key: calendar commands in the main window go through the modules area so the
@@ -987,6 +1221,8 @@ pub fn handle(ctx: &egui::Context, app: &mut App, surface: Surface) {
     track_alt(ctx, app);
     if ctx.input(|i| i.pointer.any_pressed()) {
         with_mem(ctx, |m| m.pane = None);
+    } else if surface == Surface::Main {
+        follow_focus(ctx, app);
     }
     if app.ui.keytips.is_some() {
         handle_keytips(ctx, app, surface);
@@ -1048,7 +1284,12 @@ pub fn press(ctx: &egui::Context, app: &mut App, surface: Surface, keys: &str) -
             out.push(json!({"key": token, "error": "unknown key"}));
             continue;
         };
-        let cx = KeyContext { text_focus: false, popup: false, ..KeyContext::of(ctx, app, surface) };
+        let cx = KeyContext {
+            text_focus: false,
+            popup: false,
+            widget_focus: false,
+            ..KeyContext::of(ctx, app, surface)
+        };
         match resolve_with(chord, &cx, &app.s.registry) {
             Some(a) => out.push(apply(ctx, app, surface, a)),
             None => out.push(json!({"key": chord.portable(), "action": null})),
@@ -1471,5 +1712,161 @@ mod tests {
             Action::Run { id: "mail.permanentDelete".into(), params: json!({"ids": [item.0]}) },
         );
         assert!(!app.s.mailbox.mail.contains_key(&item));
+    }
+
+    #[test]
+    fn focused_button_gets_space_and_enter() {
+        let main = KeyContext { widget_focus: true, ..KeyContext::main(Module::Mail) };
+        for keys in ["Space", "Shift+Space", "Enter", "Up", "Down", "Left", "Right"] {
+            assert_eq!(resolve(chord(keys), &main), None, "{keys} presses / moves from the focused widget");
+        }
+        let s = sample_session();
+        assert_eq!(resolve_with(chord("Enter"), &main, &s.registry), None);
+        // Everything else still works: shortcuts, list selection extension, F6.
+        assert_eq!(resolve(chord("Mod+R"), &main), run("mail.reply"));
+        assert!(matches!(resolve(chord("Shift+Down"), &main), Some(Action::Run { .. })));
+        assert_eq!(resolve(chord("F6"), &main), Some(Action::CyclePane(false)));
+        // Without a focused widget Space reads and Enter opens.
+        let plain = KeyContext::main(Module::Mail);
+        assert_eq!(resolve(chord("Space"), &plain), Some(Action::SpaceRead(false)));
+        assert_eq!(resolve(chord("Enter"), &plain), run("mail.open"));
+        // Compose: Ctrl+Enter still sends from a focused button.
+        let compose = KeyContext { widget_focus: true, ..KeyContext::compose(3) };
+        assert!(matches!(resolve(chord("Mod+Enter"), &compose), Some(Action::RunIfEnabled { .. })));
+        // Nothing focused in a fresh context.
+        assert!(!widget_focused(&egui::Context::default()));
+    }
+
+    #[test]
+    fn previous_next_item_in_compose_and_read_windows() {
+        let compose = KeyContext::compose(7);
+        assert_eq!(resolve(chord("Mod+."), &compose), Some(Action::ComposeStep(true)));
+        assert_eq!(resolve(chord("Mod+,"), &compose), Some(Action::ComposeStep(false)));
+        // With Shift they are Grow / Shrink Font (Ctrl+Shift+> / Ctrl+Shift+<).
+        assert_eq!(resolve(chord("Mod+>"), &compose), run_p("format.growFont", json!({"compose": 7})));
+        assert_eq!(resolve(chord("Mod+<"), &compose), run_p("format.shrinkFont", json!({"compose": 7})));
+        // Also while typing in the body or a header field.
+        let typing = KeyContext { text_focus: true, ..compose };
+        assert_eq!(resolve(chord("Mod+."), &typing), Some(Action::ComposeStep(true)));
+        let read = KeyContext::read(5);
+        assert_eq!(resolve(chord("Mod+."), &read), Some(Action::ReadStep(true)));
+        assert_eq!(resolve(chord("Mod+,"), &read), Some(Action::ReadStep(false)));
+    }
+
+    #[test]
+    fn compose_step_opens_the_neighbour_and_closes_the_window() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(sample_session());
+        let order = mailcraft_engine::queries::visible_item_ids(&app.s);
+        let (first, second) = (order[0], order[1]);
+        app.run("nav.selectItem", json!({"id": first.0}));
+        let cid = app.run("mail.newEmail", json!({})).unwrap()["compose"].as_u64().unwrap();
+        let surface = Surface::Compose(cid);
+        // Nothing before the first message.
+        let r = apply(&ctx, &mut app, surface, Action::ComposeStep(false));
+        assert_eq!(r["ok"], false);
+        assert!(app.s.composes.contains_key(&cid));
+        // Unsaved changes: the save prompt comes first and nothing moves.
+        app.run("compose.setSubject", json!({"compose": cid, "value": "Draft"}));
+        let r = apply(&ctx, &mut app, surface, Action::ComposeStep(true));
+        assert_eq!(r["prompt"], true);
+        assert!(app.s.composes.contains_key(&cid));
+        assert_eq!(app.s.selection.focus, Some(first));
+        app.s.notices.clear();
+        app.s.composes.get_mut(&cid).unwrap().dirty = false;
+        // Next Item: the window closes, the next message is selected and opens.
+        let r = apply(&ctx, &mut app, surface, Action::ComposeStep(true));
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(!app.s.composes.contains_key(&cid));
+        assert_eq!(app.s.selection.focus, Some(second));
+        crate::dialogs::take_notices(&mut app);
+        assert_eq!(app.ui.read_windows, vec![second.0]);
+        // Not a compose window / gone: nothing happens.
+        assert_eq!(apply(&ctx, &mut app, surface, Action::ComposeStep(true))["ok"], false);
+        assert_eq!(apply(&ctx, &mut app, Surface::Main, Action::ComposeStep(true))["ok"], false);
+    }
+
+    fn shell(w: f32, h: f32) -> egui_kittest::Harness<'static, App> {
+        let mut app = App::new(sample_session());
+        let first = mailcraft_engine::queries::visible_item_ids(&app.s)[0];
+        app.run("nav.selectItem", json!({"id": first.0}));
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(w, h))
+            .build_ui_state(|ui, app: &mut App| app.ui_root(ui), app);
+        h.run_steps(4);
+        h
+    }
+
+    fn focus_of(h: &egui_kittest::Harness<'static, App>) -> Option<egui::Id> {
+        h.ctx.memory(|m| m.focused())
+    }
+
+    fn press(h: &mut egui_kittest::Harness<'static, App>, m: egui::Modifiers, key: Key) {
+        h.key_press_modifiers(m, key);
+        h.run_steps(3);
+    }
+
+    #[test]
+    fn f6_moves_keyboard_focus_through_the_panes() {
+        let mut h = shell(1400.0, 900.0);
+        let folder = h.state().s.selection.folder.0;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            press(&mut h, egui::Modifiers::NONE, Key::F6);
+            let pane = focused_pane(&h.ctx).unwrap();
+            let id = focus_of(&h);
+            match pane.as_str() {
+                "folders" => assert!(
+                    ["tree", "fav"]
+                        .iter()
+                        .any(|t| id == Some(egui::Id::new(("mailcraft.folders.row", *t, folder)))),
+                    "the selected folder's row has focus"
+                ),
+                "list" => assert!(crate::list::has_focus(&h.ctx)),
+                "reading" => {
+                    // The message body (senses clicks and drags), so Space keeps paging.
+                    let w = h.ctx.viewport(|v| v.prev_pass.widgets.get(id.unwrap()).copied()).unwrap();
+                    assert!(w.sense.senses_click() && w.sense.senses_drag());
+                    assert!(!widget_focused(&h.ctx));
+                }
+                "ribbon" | "statusBar" => assert!(widget_focused(&h.ctx), "{pane}: a button has focus"),
+                _ => {}
+            }
+            if seen.contains(&pane) {
+                break;
+            }
+            seen.push(pane);
+        }
+        let at = |p: &str| seen.iter().position(|s| s == p).unwrap();
+        assert!(at("folders") < at("list") && at("list") < at("reading"), "{seen:?}");
+        assert!(at("reading") < at("statusBar") && at("statusBar") < at("ribbon"), "{seen:?}");
+        // Back to the folder pane wrapped around; Shift+F6 goes the other way.
+        assert_eq!(focused_pane(&h.ctx).as_deref(), Some("folders"));
+        press(&mut h, egui::Modifiers::SHIFT, Key::F6);
+        assert_eq!(focused_pane(&h.ctx).as_deref(), Some("ribbon"));
+        press(&mut h, egui::Modifiers::SHIFT, Key::F6);
+        assert_eq!(focused_pane(&h.ctx).as_deref(), Some("statusBar"));
+    }
+
+    #[test]
+    fn ribbon_is_keyboard_operable_after_f6() {
+        let mut h = shell(1400.0, 900.0);
+        let focus = h.state().s.selection.focus;
+        // Shift+F6 from nowhere: the last stop, the ribbon, with the selected tab (Home) focused.
+        press(&mut h, egui::Modifiers::SHIFT, Key::F6);
+        assert_eq!(focused_pane(&h.ctx).as_deref(), Some("ribbon"));
+        assert!(widget_focused(&h.ctx));
+        let home = crate::ribbon::selected_tab(h.state(), Surface::Main);
+        // Tab walks to the next tab; Enter presses it (and does not open the selected message).
+        press(&mut h, egui::Modifiers::NONE, Key::Tab);
+        press(&mut h, egui::Modifiers::NONE, Key::Enter);
+        let now = crate::ribbon::selected_tab(h.state(), Surface::Main);
+        assert_ne!(now, home, "Enter selected the focused tab");
+        assert!(h.state().ui.read_windows.is_empty(), "Enter was not Open");
+        // Space presses too, and is not Space-bar reading.
+        press(&mut h, egui::Modifiers::NONE, Key::Tab);
+        press(&mut h, egui::Modifiers::NONE, Key::Space);
+        assert_ne!(crate::ribbon::selected_tab(h.state(), Surface::Main), now, "Space selected the next tab");
+        assert_eq!(h.state().s.selection.focus, focus, "Space did not move to another message");
     }
 }
