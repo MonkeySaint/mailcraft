@@ -13,7 +13,7 @@ use mailcraft_model::{FolderPaneState, ReadingPanePos};
 
 pub use settings::{Def, Effect, Kind, Settings};
 
-/// Options pages in window order (`plan/outlook/options.md`): (id, title).
+/// Options pages in window order (`plan/reference/options.md`): (id, title).
 pub const PAGES: [(&str, &str); 14] = settings::PAGES;
 
 /// Pages opened from elsewhere that land on a section of a page: (alias, page, section). Set Default Paste

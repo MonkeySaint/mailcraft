@@ -301,7 +301,7 @@ fn scope_name(sc: mailcraft_engine::SearchScope) -> &'static str {
         S::CurrentMailbox => "currentMailbox",
         S::CurrentFolder => "currentFolder",
         S::Subfolders => "subfolders",
-        S::AllOutlookItems => "allItems",
+        S::AllItems => "allItems",
     }
 }
 
@@ -829,7 +829,7 @@ pub fn run(ctx: &egui::Context, app: &mut App, surface: Surface, mem: &mut Mem, 
         }
     }
     // Show as Conversations first asks whether it changes for this folder or all mailboxes
-    // (`plan/outlook/reply-forward.md` › Conversation view); the answer runs the command with a scope.
+    // (`plan/reference/reply-forward.md` › Conversation view); the answer runs the command with a scope.
     if surface == Surface::Main && act.cmd == "view.conversations" && act.params.get("scope").is_none() {
         if app.s.enabled(&act.cmd).is_none() {
             crate::list::ask_conversation_scope(ctx, app);

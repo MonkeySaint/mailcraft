@@ -632,7 +632,7 @@ fn new_data_file(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.mailbox.add_account(Account {
         kind: AccountKind::Local,
         display_name: name.clone(),
-        sender_name: name.clone(),
+        sender_name: String::new(),
         is_default: false,
         ..Default::default()
     });

@@ -1,4 +1,4 @@
-//! The Reminders window (View › Window › Reminders Window): modeless, centred (`plan/outlook/layout.md`).
+//! The Reminders window (View › Window › Reminders Window): modeless, centred (`plan/reference/layout.md`).
 //!
 //! The engine's reminder scanner (`calendar::reminders::due`) runs once a minute (and whenever this window
 //! acts); when a reminder comes due that has not been shown yet the window opens by itself. Dismiss,

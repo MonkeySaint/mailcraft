@@ -1,5 +1,5 @@
 //! `mail.reply`, `mail.replyAll`, `mail.forward`, `mail.forwardAsAttachment`, `mail.replyWithMeeting`
-//! (Home › Respond; `plan/outlook/reply-forward.md`).
+//! (Home › Respond; `plan/reference/reply-forward.md`).
 //!
 //! A response is a [`ComposeState`] with the "RE: "/"FW: " subject, the recipients and a body of two empty
 //! paragraphs followed by the quoted header block and the original. Plain-text originals get the

@@ -359,7 +359,7 @@ fn deleted_folders(mb: &Mailbox) -> BTreeSet<FolderId> {
 }
 
 /// Folders the active search covers. Mailbox-wide scopes leave out non-mail folders and (unless Include
-/// Deleted Items is on) Deleted Items; All Outlook Items covers every folder.
+/// Deleted Items is on) Deleted Items; All Items covers every folder.
 pub fn scope_folders(s: &Session) -> Vec<FolderId> {
     let mb = &s.mailbox;
     let sel = s.selection.folder;
@@ -376,14 +376,14 @@ pub fn scope_folders(s: &Session) -> Vec<FolderId> {
             mb.folders.values().filter(|f| Some(f.account) == account && mail_like(f)).map(|f| f.id).collect()
         }
         SearchScope::AllMailboxes => mb.folders.values().filter(|f| mail_like(f)).map(|f| f.id).collect(),
-        SearchScope::AllOutlookItems => mb.folders.keys().copied().collect(),
+        SearchScope::AllItems => mb.folders.keys().copied().collect(),
     }
 }
 
-/// Filter for the active search scope (All Outlook Items: every kind; otherwise mail only).
+/// Filter for the active search scope (All Items: every kind; otherwise mail only).
 pub fn scope_filter(s: &Session) -> Filter {
     let folders = scope_folders(s).into_iter().map(|f| f.0);
-    if s.view.search_scope == SearchScope::AllOutlookItems {
+    if s.view.search_scope == SearchScope::AllItems {
         Filter { folders: Some(folders.collect()), kinds: Vec::new() }
     } else {
         Filter::mail_in(folders)
@@ -502,11 +502,7 @@ pub fn highlights(s: &Session, field: Field, text: &str) -> Vec<(usize, usize)> 
 
 /// Kinds the active scope searches.
 pub fn scope_kinds(s: &Session) -> Vec<DocKind> {
-    if s.view.search_scope == SearchScope::AllOutlookItems {
-        DocKind::ALL.to_vec()
-    } else {
-        vec![DocKind::Mail]
-    }
+    if s.view.search_scope == SearchScope::AllItems { DocKind::ALL.to_vec() } else { vec![DocKind::Mail] }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -650,7 +646,7 @@ mod tests {
         // Removal through a command.
         s.run("mail.delete", &json!({"ids": [c.0]})).unwrap();
         assert!(results(&s).is_empty());
-        s.view.search_scope = SearchScope::AllOutlookItems;
+        s.view.search_scope = SearchScope::AllItems;
         assert_eq!(results(&s), [c]);
         s.search.include_deleted = true;
         s.view.search_scope = SearchScope::AllMailboxes;
@@ -784,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn all_outlook_items_finds_other_kinds() {
+    fn all_items_finds_other_kinds() {
         let mut s = session();
         let acct = s.mailbox.accounts.first().map(|a| a.id).unwrap();
         let tasks = s.mailbox.role_folder(acct, FolderRole::Tasks).unwrap();
@@ -801,7 +797,7 @@ mod tests {
         s.view.search = "budget".into();
         s.view.search_scope = SearchScope::AllMailboxes;
         assert!(results(&s).is_empty());
-        s.view.search_scope = SearchScope::AllOutlookItems;
+        s.view.search_scope = SearchScope::AllItems;
         assert_eq!(results(&s), [id]);
         assert_eq!(scope_kinds(&s).len(), 5);
     }

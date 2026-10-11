@@ -1,6 +1,6 @@
 //! Folder pickers (Move/Copy Items, Move/Copy Folder, Go to Folder, Archive, Always Move…), Create New
 //! Folder, Rename, Properties, New Search Folder, Recover Deleted Items, AutoArchive, and the generic
-//! Yes/No confirmation (plan/outlook/dialogs.md: new-folder, new-search-folder).
+//! Yes/No confirmation (plan/reference/dialogs.md: new-folder, new-search-folder).
 
 use egui::{Context, RichText};
 use serde_json::{Value, json};

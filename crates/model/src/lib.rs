@@ -1,7 +1,7 @@
 //! MailCraft data model (layer L1).
 //!
 //! Plain data plus pure operations. No I/O: persistence is `mailcraft-store`, networking is `mailcraft-net`.
-//! Behaviour follows the black-box observations in `plan/outlook/` (folder order, count badges, date groups,
+//! Behaviour follows the black-box observations in `plan/reference/` (folder order, count badges, date groups,
 //! list time formats, subject prefixes).
 //!
 //! Interface rule for parallel work: the public types below are frozen for commit 2. Add fields only with

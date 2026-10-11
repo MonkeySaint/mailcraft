@@ -64,7 +64,7 @@ const ARRANGE_KEYS: [&str; 13] = [
     "importance",
 ];
 
-/// Advanced View Settings (`plan/outlook/dialogs.md` › view-settings): a button per part with what it is set
+/// Advanced View Settings (`plan/reference/dialogs.md` › view-settings): a button per part with what it is set
 /// to. Opened from Manage Views › Modify (`savedView`), OK stores the folder's view into that saved view.
 fn advanced(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let folder = app.s.selection.folder;
@@ -930,7 +930,7 @@ struct MailViewsState {
     base: usize,
 }
 
-/// Manage All Views in a mail folder (`plan/outlook/dialogs.md` › manage-views): the built-in views and the
+/// Manage All Views in a mail folder (`plan/reference/dialogs.md` › manage-views): the built-in views and the
 /// saved ones with where they can be used; New, Copy, Modify, Rename, Reset, Delete and Apply View
 /// (`view.manageViews`).
 fn manage_mail_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {

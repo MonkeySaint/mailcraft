@@ -1,4 +1,4 @@
-//! Account dialogs (File › Info › Account Settings, `plan/outlook/backstage.md`): Account Settings (Email and
+//! Account dialogs (File › Info › Account Settings, `plan/reference/backstage.md`): Account Settings (Email and
 //! Data Files tabs), the Add Account wizard (also Change Account), Test Account Settings, the Remove Account
 //! confirmation and Send/Receive Progress.
 //!
@@ -761,11 +761,17 @@ fn wizard(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             w.fill_from(app, &a);
         }
         if w.name.is_empty() {
+            // Your name: the Options user name, else the sender name of an existing mail account (never a
+            // data file's name).
+            w.name = app.s.settings.text("general.userName");
+        }
+        if w.name.trim().is_empty() {
             w.name = app
                 .s
                 .mailbox
                 .accounts
                 .iter()
+                .filter(|a| a.kind != AccountKind::Local)
                 .find(|a| !a.sender_name.is_empty())
                 .map(|a| a.sender_name.clone())
                 .unwrap_or_default();

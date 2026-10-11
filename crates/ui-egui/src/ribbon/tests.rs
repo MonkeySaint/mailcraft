@@ -199,7 +199,7 @@ fn every_command_id_exists_in_the_registry() {
 
 #[test]
 fn every_command_has_a_mapped_catalog_counterpart_or_is_known() {
-    // Every id we use is one the Outlook feature catalog maps somewhere (or one of our own few additions).
+    // Every id we use is one the feature catalog maps somewhere (or one of our own few additions).
     let catalog: BTreeSet<&str> =
         mailcraft_engine::catalog::catalog_rows().iter().filter_map(|r| r.id).collect();
     // Module commands act on the selected module item (the catalog maps some of these to mail.* ids).
@@ -582,7 +582,7 @@ fn compose_read_search_and_module_ribbons_render() {
 }
 
 /// View › Show as Conversations asks This folder / All mailboxes before it changes anything
-/// (`plan/outlook/reply-forward.md` › Conversation view), like the list's Current View menu.
+/// (`plan/reference/reply-forward.md` › Conversation view), like the list's Current View menu.
 #[test]
 fn show_as_conversations_asks_for_the_scope() {
     use egui_kittest::kittest::Queryable;

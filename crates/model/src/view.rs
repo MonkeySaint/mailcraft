@@ -1,4 +1,4 @@
-//! Per-folder view settings (`plan/outlook/message-list.md` › Views, `layout.md` › Panes).
+//! Per-folder view settings (`plan/reference/message-list.md` › Views, `layout.md` › Panes).
 
 use serde::{Deserialize, Serialize};
 

@@ -1,4 +1,4 @@
-//! Send/receive (`plan/outlook/ribbon-mail.md` Send / Receive, `reading-pane.md` sending, `folders.md`).
+//! Send/receive (`plan/reference/ribbon-mail.md` Send / Receive, `reading-pane.md` sending, `folders.md`).
 //!
 //! **Threads.** Each server account gets a worker thread (native builds only) that owns its IMAP connection
 //! (`mailcraft_net::sync::ImapAccount`) and opens SMTP sessions for sending. The session talks to workers

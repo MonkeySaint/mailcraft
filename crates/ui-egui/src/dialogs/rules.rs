@@ -1,4 +1,4 @@
-//! Rules (plan/outlook/rules.md): the quick Create Rule dialog and its Success box, Rules and Alerts (Email
+//! Rules (plan/reference/rules.md): the quick Create Rule dialog and its Success box, Rules and Alerts (Email
 //! Rules list, toolbar, Change Rule menu, Copy to other accounts, description pane, Manage Alerts tab), the
 //! Rules Wizard (start from a template or a blank rule for received or sent messages, then condition /
 //! action / exception checklists with underlined editable values), Run Rules Now, Rename Rule and Options

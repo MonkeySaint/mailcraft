@@ -207,7 +207,7 @@ fn parity(json_out: bool) -> Result<(), String> {
     }
     let n = |k: &str| p.get(k).and_then(Value::as_u64).unwrap_or(0);
     let mut text = format!(
-        "Outlook parity: {} of {} mapped features implemented ({}%); {} catalog rows, {} not applicable.\n\n",
+        "Feature parity: {} of {} mapped features implemented ({}%); {} catalog rows, {} not applicable.\n\n",
         n("implemented_rows"),
         n("mapped_rows"),
         p.get("percent").and_then(Value::as_f64).unwrap_or(0.0),

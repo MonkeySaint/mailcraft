@@ -1,6 +1,6 @@
 [package]
 name = "mailcraft-ui-egui"
-description = "MailCraft's Outlook-style user interface on egui"
+description = "MailCraft's desktop user interface on egui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

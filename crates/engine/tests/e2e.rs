@@ -101,7 +101,7 @@ fn add_alice(s: &mut Session, srv: &TestServers, password: &str) -> AccountId {
 }
 
 fn session() -> Session {
-    let mut s = Session::new(Mailbox::new_local("Outlook Data File"));
+    let mut s = Session::new(Mailbox::new_local("Local Folders"));
     // Only explicit send/receive runs in these tests.
     s.view.auto_send_receive_minutes = 0;
     s

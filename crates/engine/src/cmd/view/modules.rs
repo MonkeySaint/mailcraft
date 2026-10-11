@@ -1,4 +1,4 @@
-//! Views of the People, Tasks and Notes modules (`plan/outlook/modules.md` › Current View, Arrangement,
+//! Views of the People, Tasks and Notes modules (`plan/reference/modules.md` › Current View, Arrangement,
 //! Layout): the `view.*` commands act on these when the selected folder is a contacts, tasks or notes folder.
 //!
 //! **Views.** People: People, Business Card, Card, Phone, List. Tasks: Detailed, Simple List, To-Do List,

@@ -37,7 +37,7 @@ Calendar|Home > New Items > More Items|Contact Group|people.newGroup
 Calendar|Home > New Items > More Items|Task Request|tasks.assign
 Calendar|Home > New Items > More Items|Internet Fax|-|requires a third-party internet fax service provider
 Calendar|Home > New Items > More Items|Choose Form...|mail.newItem
-Calendar|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+Calendar|Home > New Items > More Items|Data File...|file.newDataFile
 Calendar|Home > Add Calendar|From Address Book...|-|opening other people's calendars from the address book needs a Microsoft Exchange server (MailCraft accounts are IMAP/JMAP/local)
 Calendar|Home > Add Calendar|From Room List...|-|room lists and room calendars are Exchange directory objects (no Exchange support)
 Calendar|Home > Add Calendar|From Internet...|calendar.addCalendar

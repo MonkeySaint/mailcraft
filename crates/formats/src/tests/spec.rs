@@ -26,7 +26,7 @@ fn streams_of(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// [MS-OXMSG] 2.4.2.2: a PtypString value stream must hold at least one character (Outlook refuses to open a
+/// [MS-OXMSG] 2.4.2.2: a PtypString value stream must hold at least one character (readers refuse to open a
 /// file with a zero-length one).
 #[test]
 fn msg_writer_never_writes_empty_string_streams() {
@@ -519,7 +519,7 @@ fn csv_phone_list_is_capped() {
     assert_eq!(imp.contacts[0].phones.len(), 64);
 }
 
-/// Saved items use the 512-byte-sector compound file version (3), the form Outlook items use and every
+/// Saved items use the 512-byte-sector compound file version (3), the form MSG files use and every
 /// [MS-CFB] reader accepts.
 #[test]
 fn msg_writer_uses_cfb_version_3() {

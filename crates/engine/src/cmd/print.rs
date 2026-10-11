@@ -1,4 +1,4 @@
-//! `print.*`: Print and Save as PDF (File › Print, `plan/outlook/backstage.md`). Builds print content from the
+//! `print.*`: Print and Save as PDF (File › Print, `plan/reference/backstage.md`). Builds print content from the
 //! session (Memo Style for items, Table Style for the list, Calendar Daily / Weekly / Monthly, Card / Small
 //! Booklet / Phone Directory for contacts), lays it out with `mailcraft_render::print` and writes a PDF with
 //! `mailcraft_render::pdf`.

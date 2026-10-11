@@ -1,6 +1,6 @@
 //! Reading pane and read windows (reading area).
 //!
-//! Layout per plan/outlook/reading-pane.md and read-window.md: subject (large); persona circle with initials
+//! Layout per plan/reference/reading-pane.md and read-window.md: subject (large); persona circle with initials
 //! (stable colour per sender) next to "Name <address>", To and Cc lines; on the right an optional
 //! background toggle (dark mode only), the Reply | Reply All | Forward segmented control (icon-only when
 //! narrow), a "…" menu and the sent date (short form when narrow); info bars; attachment chips; the

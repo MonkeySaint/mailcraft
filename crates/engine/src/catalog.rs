@@ -1,5 +1,5 @@
-//! The Outlook feature catalog: every observed command (feature names only, from
-//! `plan/outlook/INVENTORY.md`) mapped to our command ids. `parity()` compares it with the registry;
+//! The feature catalog: every observed command (feature names only, from
+//! `plan/reference/INVENTORY.md`) mapped to our command ids. `parity()` compares it with the registry;
 //! the gap is the work list (`cargo xtask parity` → docs/parity.md).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,7 +37,7 @@ pub const CATALOG: &str = concat!(
 pub struct CatalogRow {
     /// Catalog area as written ("Mail", "Compose", "Context", …).
     pub area: &'static str,
-    /// Where the feature lives in Outlook ("Home › Respond", "message-row", …).
+    /// Where the feature lives in the observed client ("Home › Respond", "message-row", …).
     pub location: &'static str,
     /// Feature name as observed.
     pub feature: &'static str,

@@ -563,7 +563,7 @@ fn zoned_recurring_appointment_exports_its_named_zone() {
 
 #[test]
 fn imported_zones_name_their_iana_zone() {
-    // A file's own definition under a non-IANA name (as Outlook writes them) maps to the built-in zone with
+    // A file's own definition under a non-IANA name (as some desktop clients write them) maps to the built-in zone with
     // the same rules; IANA names are kept; fixed offsets and floating times name no zone.
     let cal = ics::read_str(MEETING, ImportOptions::default()).unwrap();
     assert_eq!(cal.events[0].appointment.tz.as_deref(), Some("America/New_York"));

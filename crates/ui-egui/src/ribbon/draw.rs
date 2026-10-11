@@ -1,5 +1,5 @@
 //! Painting and layout of the Simplified (one 49-px row) and Classic (100-px groups) ribbons, width
-//! degradation (plan/outlook/responsive.md), dropdown menus, galleries and keytip badges.
+//! degradation (plan/reference/responsive.md), dropdown menus, galleries and keytip badges.
 
 use egui::containers::menu::SubMenu;
 use egui::{

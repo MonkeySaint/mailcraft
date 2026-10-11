@@ -13,7 +13,7 @@ Commands:
   commands [--json] [--filter TEXT]
         Every command (id, shortcut, location, label); --json adds params and enabled state.
   parity [--json]
-        Outlook feature parity: implemented share of the observed feature catalog.
+        Feature parity: implemented share of the observed feature catalog.
   run [--sample | --profile DIR] --cmd 'ID[={json params}]'... [--query list|folders|status|selection]...
         Runs commands in order (stops at the first failure) and prints the results as JSON.
   show [--sample | --profile DIR] [--folder NAME] [--limit N]

@@ -258,7 +258,7 @@ fn rejects_non_msg() {
     let mut bad = msg::CFB_SIGNATURE.to_vec();
     bad.extend_from_slice(&[0u8; 600]);
     assert!(msg::read(&bad).is_err());
-    // A valid compound file that is not an Outlook item.
+    // A valid compound file that is not an MSG item.
     let mut cf = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
     cf.create_stream("/other").unwrap().write_all(b"x").unwrap();
     cf.flush().unwrap();

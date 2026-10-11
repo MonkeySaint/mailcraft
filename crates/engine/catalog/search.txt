@@ -11,7 +11,7 @@ Search|Search › Scope|All Mailboxes|search.scope
 Search|Search › Scope|Current Mailbox|search.scope
 Search|Search › Scope|Current Folder|search.scope
 Search|Search › Scope|Subfolders|search.scope
-Search|Search › Scope|All Outlook Items|search.scope
+Search|Search › Scope|All Items|search.scope
 Search|Search › Results|Include Deleted Items|search.scope
 Search|Search › Options|Recent Searches|search.recent
 Search|Search › Options|Search Tools|search.searchTools

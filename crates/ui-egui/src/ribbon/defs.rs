@@ -77,7 +77,7 @@ pub enum Size {
     Icon,
 }
 
-/// Width-degradation action (plan/outlook/responsive.md).
+/// Width-degradation action (plan/reference/responsive.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Act {
     /// Labels drop (Simplified: every control; Classic: small buttons).

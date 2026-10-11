@@ -197,7 +197,7 @@ fn scope_name(sc: SearchScope) -> &'static str {
         SearchScope::CurrentMailbox => "currentMailbox",
         SearchScope::CurrentFolder => "currentFolder",
         SearchScope::Subfolders => "subfolders",
-        SearchScope::AllOutlookItems => "allItems",
+        SearchScope::AllItems => "allItems",
     }
 }
 
@@ -314,7 +314,7 @@ fn scope(s: &mut Session, p: &Value) -> CmdResult {
         Some("currentMailbox") => Some(SearchScope::CurrentMailbox),
         Some("currentFolder") => Some(SearchScope::CurrentFolder),
         Some("subfolders") => Some(SearchScope::Subfolders),
-        Some("allItems") => Some(SearchScope::AllOutlookItems),
+        Some("allItems") => Some(SearchScope::AllItems),
         Some(other) => return Err(CmdError::Params(format!("unknown scope `{other}`"))),
         // The bare command is the All Mailboxes shortcut.
         None if include_deleted.is_none() && store.is_none() => Some(SearchScope::AllMailboxes),
@@ -771,7 +771,7 @@ mod tests {
         s.view.search = "budget".into();
         s.view.search_scope = SearchScope::CurrentMailbox;
         assert!(results(&s).is_empty());
-        s.view.search_scope = SearchScope::AllOutlookItems;
+        s.view.search_scope = SearchScope::AllItems;
         assert_eq!(results(&s).len(), 1);
         s.view.search_scope = SearchScope::CurrentMailbox;
         run(&mut s, "search.scope", json!({"includeDeleted": true, "scope": "currentMailbox"}));

@@ -3,7 +3,7 @@
 
 use mailcraft_model::{Appointment, Contact, DateTime, FlagState, Importance, MailItem, Note, Task};
 
-/// Item kind (the `kind:` key; All Outlook Items searches every kind).
+/// Item kind (the `kind:` key; All Items searches every kind).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DocKind {
     #[default]

@@ -174,11 +174,11 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "parity",
-            "title": "Outlook parity",
-            "description": "How much of the observed Outlook feature catalog MailCraft implements: totals, percent, \
+            "title": "Feature parity",
+            "description": "How much of the observed feature catalog MailCraft implements: totals, percent, \
                 per-area counts and missing command ids.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
-            "annotations": read_only("Outlook parity"),
+            "annotations": read_only("Feature parity"),
         }),
     ]
 }

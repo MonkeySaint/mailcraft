@@ -1,7 +1,7 @@
 //! Print layout (layer L3): turns print content into pages of display lists, ready for the PDF writer
 //! ([`crate::pdf`]) or the print preview ([`render_page`]).
 //!
-//! Styles (Outlook names): Memo Style (one item after another: user-name band, bold-label header block, rule,
+//! Styles (observed names): Memo Style (one item after another: user-name band, bold-label header block, rule,
 //! body laid out with `mailcraft-layout`), Table Style (the message list as columns, header repeated on every
 //! page), Calendar Daily / Weekly / Monthly (grids), and Card / Small Booklet / Phone Directory for contacts.
 //!

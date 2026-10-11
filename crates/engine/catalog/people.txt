@@ -38,7 +38,7 @@ People|Home > New Items|More Items|mail.newItem
 People|Home > New Items > More Items|Task Request|tasks.assign
 People|Home > New Items > More Items|Internet Fax|-|third-party online fax service upsell
 People|Home > New Items > More Items|Choose Form...|mail.newItem
-People|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+People|Home > New Items > More Items|Data File...|file.newDataFile
 People|Home > More|Assign Task|people.assignTask
 People|Home >|People|view.changeView
 People|Home >|Business Card|view.changeView
@@ -59,7 +59,7 @@ People|Home > Change View|Apply Current View to Other Contact Folders...|view.ap
 People|Home > Move|Other Folder...|people.move
 People|Home > Move|Copy to Folder...|people.copy
 People|Home > Forward Contact|As a Business Card|people.forward
-People|Home > Forward Contact|As an Outlook Contact|people.forward
+People|Home > Forward Contact|As a Contact|people.forward
 People|Home > Categorize|Clear All Categories|people.categorize
 People|Home > Categorize|Blue category|people.categorize
 People|Home > Categorize|Green category|people.categorize

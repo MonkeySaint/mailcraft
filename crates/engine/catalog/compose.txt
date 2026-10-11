@@ -73,7 +73,7 @@ Compose|Message > Attach File...|Attach Item|compose.attachItem
 Compose|Message > Attach File...|Browse Web Locations|-|Browse Web Locations lists OneDrive/SharePoint cloud storage
 Compose|Message > Attach File...|Browse This PC...|compose.attachFile
 Compose|Message > Attach File... > Attach Item|Business Card|insert.businessCard
-Compose|Message > Attach File... > Attach Item|Outlook Item|compose.attachItem
+Compose|Message > Attach File... > Attach Item|Item|compose.attachItem
 Compose|Message > Attach File... > Browse Web Locations|OneDrive - Organization|-|OneDrive is Microsoft cloud storage
 Compose|Message > More Options|Insert Link...|insert.link
 Compose|Message > Signature|Signatures...|options.open
@@ -93,7 +93,7 @@ Compose|Message > Follow Up|Custom...|compose.followUp
 Compose|Message > Follow Up|Add Reminder...|compose.followUp
 Compose|Message > Follow Up|Clear Flag|compose.followUp
 Compose|Insert › Include|Attach File...|compose.attachFile
-Compose|Insert › Include|Outlook Item|compose.attachItem
+Compose|Insert › Include|Item|compose.attachItem
 Compose|Insert › Include|Business Card|insert.businessCard
 Compose|Insert › Include|Calendar...|insert.calendar
 Compose|Insert › Include|Signature|compose.signature
@@ -136,7 +136,7 @@ Compose|Insert > Shapes|(gallery of 159 items, e.g. Text Box, Line, Line Arrow)|
 Compose|Insert > Shapes|New Drawing Canvas|insert.shape
 Compose|Insert > More Options|This Device...|insert.model3d
 Compose|Insert > More Options|Stock 3D Models...|-|Stock 3D Models is an online Microsoft content service
-Compose|Insert > Screenshot|Inbox - user@example.com - Outlook|insert.screenshot
+Compose|Insert > Screenshot|Inbox - user@example.com - MailCraft|insert.screenshot
 Compose|Insert > Screenshot|13 Reminder(s)|insert.screenshot
 Compose|Insert > Screenshot|Downloads|insert.screenshot
 Compose|Insert > Screenshot|Download Microsoft Office 365 for Windows and Mac \/Microsoft 365 — Mozilla Firefox|insert.screenshot

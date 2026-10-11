@@ -1,5 +1,5 @@
 //! Shared dialog plumbing: the modal frame, per-dialog state, replies between dialogs, buttons, the folder
-//! tree picker and small value helpers. Look is our own (theme tokens); sizes follow plan/outlook/dialogs.md.
+//! tree picker and small value helpers. Look is our own (theme tokens); sizes follow plan/reference/dialogs.md.
 
 use egui::{
     Align, Align2, Color32, Context, Id, Key, Layout, Modifiers, RichText, Sense, Ui, Vec2, WidgetInfo,

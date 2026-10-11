@@ -1,4 +1,4 @@
-//! Window-size rules from plan/outlook/responsive.md, computed once per frame.
+//! Window-size rules from plan/reference/responsive.md, computed once per frame.
 //!
 //! Each observed break point is the largest window width at which that step was seen, so a step applies at or
 //! below its width (`≤`), the same reading as the folder-pane (≤ 800) and single-pane (≤ 700) rules.

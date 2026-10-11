@@ -1,4 +1,4 @@
-//! Date groups and list time labels (`plan/outlook/reading-pane.md` › List rows).
+//! Date groups and list time labels (`plan/reference/reading-pane.md` › List rows).
 //!
 //! Observed (compact view, arranged by Date, newest first): groups "Today", "Yesterday", weekday names for
 //! earlier days of this week ("Tuesday", "Monday"), "Last Week", "Two Weeks Ago", "Three Weeks Ago",

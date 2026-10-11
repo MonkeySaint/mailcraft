@@ -62,7 +62,7 @@ pub fn run(root: &Path) -> TaskResult {
     println!("{:<20} {:>9} {:>11} {:>6}", "total", total.src_lines, total.test_lines, total.tests);
     let reg = mailcraft_engine::cmd::registry();
     let rows = mailcraft_engine::catalog::catalog_rows().len();
-    println!("commands registered: {}; Outlook catalog rows: {rows}", reg.len());
+    println!("commands registered: {}; catalog rows: {rows}", reg.len());
     Ok(())
 }
 

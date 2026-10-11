@@ -1,4 +1,4 @@
-//! Subject prefixes ("RE: ", "FW: ") and conversation topic normalisation (`plan/outlook/reply-forward.md`).
+//! Subject prefixes ("RE: ", "FW: ") and conversation topic normalisation (`plan/reference/reply-forward.md`).
 
 /// Reply/forward markers recognised at the start of a subject (compared ASCII case-insensitively).
 /// Longer tokens first so "Fwd" is tried before "Fw".

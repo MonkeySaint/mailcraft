@@ -1,5 +1,5 @@
-//! Session core and list/folder query checks against the observed Outlook behaviour
-//! (`plan/outlook/message-list.md`, `reading-pane.md`, `folders.md`).
+//! Session core and list/folder query checks against the observed behaviour
+//! (`plan/reference/message-list.md`, `reading-pane.md`, `folders.md`).
 
 #![allow(clippy::expect_used)]
 

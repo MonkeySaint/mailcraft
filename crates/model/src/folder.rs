@@ -1,10 +1,10 @@
-//! Folders. Default order and badge rules from `plan/outlook/folders.md`.
+//! Folders. Default order and badge rules from `plan/reference/folders.md`.
 
 use serde::{Deserialize, Serialize};
 
 use crate::{AccountId, FolderId};
 
-/// Well-known folder roles in Outlook's fixed display order (not alphabetical).
+/// Well-known folder roles in the observed fixed display order (not alphabetical).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum FolderRole {
     Inbox,

@@ -44,7 +44,7 @@ fn commands_table_and_json() {
 
 #[test]
 fn parity_summary_and_json() {
-    assert!(ok(&["parity"]).contains("Outlook parity:"));
+    assert!(ok(&["parity"]).contains("Feature parity:"));
     let p: Value = serde_json::from_str(&ok(&["parity", "--json"])).unwrap();
     assert!(p["total_rows"].as_u64().unwrap() > 1000);
     assert!(p["percent"].as_f64().is_some());

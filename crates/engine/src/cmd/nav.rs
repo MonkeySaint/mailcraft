@@ -1,7 +1,7 @@
 //! Module switching (module rail, More Apps) and selection in the folder pane and message list.
 //!
 //! Selection follows the observed read marking: a selected unread message stays unread while selected and
-//! is marked read when the selection moves to another message (`plan/outlook/reading-pane.md`).
+//! is marked read when the selection moves to another message (`plan/reference/reading-pane.md`).
 
 use serde_json::{Value, json};
 

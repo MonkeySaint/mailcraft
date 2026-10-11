@@ -1,4 +1,4 @@
-//! Send / Receive › Server and Preferences (`plan/outlook/ribbon-mail.md`): Download Headers, Mark to
+//! Send / Receive › Server and Preferences (`plan/reference/ribbon-mail.md`): Download Headers, Mark to
 //! Download (and Message Copy), Unmark to Download (and Unmark All), Process Marked Headers (and in All
 //! Folders), and Download Preferences with the Send/Receive group basics (per-account membership, interval and
 //! push).

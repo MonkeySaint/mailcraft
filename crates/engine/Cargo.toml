@@ -1,6 +1,6 @@
 [package]
 name = "mailcraft-engine"
-description = "MailCraft engine: session, undo, command registry, Outlook feature catalog, sample mailbox"
+description = "MailCraft engine: session, undo, command registry, feature catalog, sample mailbox"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-# Module ribbons (plan/outlook/modules.md): Home tabs for Calendar, People, Tasks and Notes, plus the module
+# Module ribbons (plan/reference/modules.md): Home tabs for Calendar, People, Tasks and Notes, plus the module
 # View tabs that differ from Mail (Calendar, Notes) and the Calendar Folder tab. Only the Classic ribbon was
 # observed; the Simplified ribbon is derived. Tabs a module does not define fall back to the Mail ones.
 
@@ -238,7 +238,7 @@ item | Recurring Event | recurrence | calendar.newAppointment | {"form":true,"al
 item | Contact Group | contact-group | people.newGroup | | G
 item | Task Request | task | tasks.assign | | Q
 item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
-item | Outlook Data File... | | file.newDataFile | | F
+item | Data File... | | file.newDataFile | | F
 
 menu addCalendar
 item | From Address Book... | address-book | calendar.addCalendar | {"source":"addressBook"} | A
@@ -302,7 +302,7 @@ sub | More Items | new-items | peopleMoreItems | | I
 menu peopleMoreItems
 item | Task Request | task | tasks.assign | | Q
 item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
-item | Outlook Data File... | | file.newDataFile | | F
+item | Data File... | | file.newDataFile | | F
 
 menu peopleMore
 item | Assign Task | task | people.assignTask | | T
@@ -341,7 +341,7 @@ item | View Settings... | settings | view.viewSettings | | V
 
 menu forwardContact
 item | As a Business Card | contact-group | people.forward | {"as":"businessCard"} | B
-item | As an Outlook Contact | person | people.forward | {"as":"contact"} | O
+item | As a Contact | person | people.forward | {"as":"contact"} | O
 
 menu peopleCategorize
 dyn | categories | people.categorize | {"name":"$name"}
@@ -363,7 +363,7 @@ sub | More Items | new-items | tasksMoreItems | | I
 menu tasksMoreItems
 item | Contact Group | contact-group | people.newGroup | | G
 item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
-item | Outlook Data File... | | file.newDataFile | | F
+item | Data File... | | file.newDataFile | | F
 
 menu tasksChangeView
 dyn | views:tasks | view.changeView | {"name":"$name"}
@@ -408,7 +408,7 @@ sub | More Items | new-items | notesMoreItems | | I
 menu notesMoreItems
 item | Contact Group | contact-group | people.newGroup | | G
 item | Task Request | task | tasks.assign | | Q
-item | Outlook Data File... | | file.newDataFile | | F
+item | Data File... | | file.newDataFile | | F
 
 menu notesChangeView
 dyn | views:notes | view.changeView | {"name":"$name"}

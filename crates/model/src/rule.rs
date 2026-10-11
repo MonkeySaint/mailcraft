@@ -1,4 +1,4 @@
-//! Rules (`plan/outlook/rules.md`). Conditions/actions mirror the Rules Wizard lists; evaluation lives here
+//! Rules (`plan/reference/rules.md`). Conditions/actions mirror the Rules Wizard lists; evaluation lives here
 //! (pure), execution of actions (move, forward, alert) lives in the engine (`rules_exec`).
 //!
 //! A rule applies to messages the user receives unless its conditions contain the marker

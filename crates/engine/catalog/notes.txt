@@ -22,8 +22,8 @@ Notes|Home > New Items|More Items|mail.newItem
 Notes|Home > New Items > More Items|Contact Group|people.newGroup
 Notes|Home > New Items > More Items|Task Request|tasks.assign
 Notes|Home > New Items > More Items|Internet Fax|-|Hands off to a third-party internet fax service; no local behaviour
-Notes|Home > New Items > More Items|Choose Form...|-|Custom Outlook form libraries (MAPI/Exchange forms) have no equivalent in MailCraft
-Notes|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+Notes|Home > New Items > More Items|Choose Form...|-|Custom form libraries (MAPI/Exchange forms) have no equivalent in MailCraft
+Notes|Home > New Items > More Items|Data File...|file.newDataFile
 Notes|Home >|Icon|view.changeView
 Notes|Home >|Notes List|view.changeView
 Notes|Home >|Last 7 Days|view.changeView

@@ -47,15 +47,34 @@ pub struct Mailbox {
 pub const MAX_FOLDER_NAME_CHARS: usize = 255;
 
 /// Name given to a local account created with an empty display name.
-pub const LOCAL_ACCOUNT_FALLBACK_NAME: &str = "Outlook Data File";
+pub const LOCAL_ACCOUNT_FALLBACK_NAME: &str = "Local Folders";
 
-/// Default Favorites, in order (`plan/outlook/folders.md`).
+/// The local account name MailCraft 0.1.x gave new profiles; [`Mailbox::rename_legacy_local_account`] renames it.
+pub const LEGACY_LOCAL_ACCOUNT_NAME: &str = "Outlook Data File";
+
+/// Default Favorites, in order (`plan/reference/folders.md`).
 pub const DEFAULT_FAVORITES: [FolderRole; 4] =
     [FolderRole::Inbox, FolderRole::SentItems, FolderRole::Drafts, FolderRole::DeletedItems];
 
 impl Mailbox {
-    /// Empty mailbox with one local account ("Outlook Data File"-like, named `display_name`), all default
+    /// Empty mailbox with one local account (a data file named `display_name`), all default
     /// folders, default categories and quick steps.
+    /// Renames local accounts still called [`LEGACY_LOCAL_ACCOUNT_NAME`] (profiles made by MailCraft 0.1.x)
+    /// to [`LOCAL_ACCOUNT_FALLBACK_NAME`] and drops the matching sender name. Returns how many changed.
+    pub fn rename_legacy_local_account(&mut self) -> usize {
+        let mut changed = 0;
+        for a in self.accounts.iter_mut().filter(|a| a.kind == AccountKind::Local) {
+            if a.display_name == LEGACY_LOCAL_ACCOUNT_NAME {
+                a.display_name = LOCAL_ACCOUNT_FALLBACK_NAME.to_owned();
+                changed += 1;
+            }
+            if a.sender_name == LEGACY_LOCAL_ACCOUNT_NAME {
+                a.sender_name.clear();
+            }
+        }
+        changed
+    }
+
     pub fn new_local(display_name: &str) -> Mailbox {
         let mut mb = Mailbox::default();
         let name = display_name.trim();
@@ -63,7 +82,8 @@ impl Mailbox {
         let account = mb.add_account(Account {
             kind: AccountKind::Local,
             display_name: name.to_string(),
-            sender_name: name.to_string(),
+            // A data file is not a person: no sender name to suggest anywhere.
+            sender_name: String::new(),
             is_default: true,
             ..Default::default()
         });

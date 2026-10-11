@@ -83,7 +83,7 @@ impl Appointment {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Calendar views (`plan/outlook/modules.md` › Calendar › View tab)
+// Calendar views (`plan/reference/modules.md` › Calendar › View tab)
 // ---------------------------------------------------------------------------------------------------------
 
 /// Calendar arrangement (Day, Work Week, Week, Month, Schedule View).

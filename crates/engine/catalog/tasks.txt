@@ -50,7 +50,7 @@ Tasks|Home > New Items|More Items|mail.newItem
 Tasks|Home > New Items > More Items|Contact Group|people.newGroup
 Tasks|Home > New Items > More Items|Internet Fax|-|needs a third-party online fax service provider
 Tasks|Home > New Items > More Items|Choose Form...|mail.newItem
-Tasks|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+Tasks|Home > New Items > More Items|Data File...|file.newDataFile
 Tasks|Home >|Detailed|view.changeView
 Tasks|Home >|Simple List|view.changeView
 Tasks|Home >|To-Do List|view.changeView

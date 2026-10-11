@@ -81,7 +81,7 @@ pub struct ViewState {
     pub send_immediately: bool,
 }
 
-/// Default Quick Access Toolbar: Send/Receive All Folders, Undo (`plan/outlook/layout.md`).
+/// Default Quick Access Toolbar: Send/Receive All Folders, Undo (`plan/reference/layout.md`).
 pub const DEFAULT_QUICK_ACCESS: [&str; 2] = ["sendReceive.all", "app.undo"];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +91,7 @@ pub enum SearchScope {
     Subfolders,
     CurrentMailbox,
     AllMailboxes,
-    AllOutlookItems,
+    AllItems,
 }
 
 impl Default for ViewState {
@@ -233,8 +233,8 @@ impl Session {
         s
     }
 
-    /// Opens (or creates) a persistent session in `dir`. A new data folder gets a local mailbox ("Outlook Data
-    /// File") written as its first snapshot.
+    /// Opens (or creates) a persistent session in `dir`. A new data folder gets a local mailbox ("Local
+    /// Folders") written as its first snapshot.
     pub fn open(dir: &std::path::Path) -> Result<Session, CmdError> {
         let mut store = mailcraft_store::Store::open(dir)
             .map_err(|e| CmdError::Failed(format!("cannot open the data folder {}: {e}", dir.display())))?;
@@ -244,6 +244,7 @@ impl Session {
         // Junk lists from disk may be unsorted, duplicated or over the cap (older or hand-edited files);
         // adding to a list relies on it being sorted.
         mailbox.junk.sanitize();
+        mailbox.rename_legacy_local_account();
         if mailbox.accounts.is_empty() && mailbox.folders.is_empty() {
             mailbox = Mailbox::new_local(mailcraft_model::mailbox::LOCAL_ACCOUNT_FALLBACK_NAME);
             store.checkpoint(&mailbox).map_err(|e| {
@@ -857,7 +858,7 @@ pub(crate) const SCOPE_NAMES: [(SearchScope, &str); 5] = [
     (SearchScope::Subfolders, "subfolders"),
     (SearchScope::CurrentMailbox, "currentMailbox"),
     (SearchScope::AllMailboxes, "allMailboxes"),
-    (SearchScope::AllOutlookItems, "allOutlookItems"),
+    (SearchScope::AllItems, "allItems"),
 ];
 
 /// Text of a panic payload.

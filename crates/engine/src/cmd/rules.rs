@@ -1,4 +1,4 @@
-//! `rules.*`: CRUD over [`Mailbox::rules`](mailcraft_model::Mailbox) (`plan/outlook/rules.md`), the one-click
+//! `rules.*`: CRUD over [`Mailbox::rules`](mailcraft_model::Mailbox) (`plan/reference/rules.md`), the one-click
 //! "Always Move Messages From" rule, Create Rule from a message, rule templates (Rules Wizard "Start from a
 //! template"), Change Rule quick actions, Copy to other accounts, Run Rules Now, rules for sent and arriving
 //! messages, and `.mcrules` export/import (JSON, folders written as paths so files move between mailboxes).

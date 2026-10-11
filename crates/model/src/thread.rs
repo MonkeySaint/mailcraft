@@ -1,4 +1,4 @@
-//! Conversation threading (Conversation view, `plan/outlook/reply-forward.md` › Conversation view).
+//! Conversation threading (Conversation view, `plan/reference/reply-forward.md` › Conversation view).
 //!
 //! Messages join a conversation when they are linked through Message-ID / In-Reply-To / References (the
 //! container idea from the classic threading algorithm: any two messages that mention the same id, even a

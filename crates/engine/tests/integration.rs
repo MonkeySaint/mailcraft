@@ -168,13 +168,27 @@ fn panic_guard_and_errors_restore_the_mailbox() {
 }
 
 #[test]
+fn reopen_renames_the_legacy_local_account() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut s = Session::open(dir.path()).expect("open new store");
+        s.mailbox.accounts[0].display_name = mailcraft_model::mailbox::LEGACY_LOCAL_ACCOUNT_NAME.to_owned();
+        s.mailbox.accounts[0].sender_name = mailcraft_model::mailbox::LEGACY_LOCAL_ACCOUNT_NAME.to_owned();
+        s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
+    }
+    let s = Session::open(dir.path()).expect("reopen");
+    assert_eq!(s.mailbox.accounts[0].display_name, "Local Folders");
+    assert_eq!(s.mailbox.accounts[0].sender_name, "");
+}
+
+#[test]
 fn store_journal_survives_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     let count;
     {
         let mut s = Session::open(dir.path()).expect("open new store");
         assert_eq!(s.mailbox.accounts.len(), 1);
-        assert_eq!(s.mailbox.accounts[0].display_name, "Outlook Data File");
+        assert_eq!(s.mailbox.accounts[0].display_name, "Local Folders");
         assert_eq!(s.mailbox.folder(s.selection.folder).and_then(|f| f.role), Some(FolderRole::Inbox));
         // Load the sample into the store, then change it through commands.
         let sample = sample_session();

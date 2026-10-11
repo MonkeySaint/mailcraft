@@ -47,7 +47,7 @@ pub fn read(data: &[u8]) -> Result<MsgMessage> {
 fn read_inner(data: &[u8]) -> Result<MsgMessage> {
     let cf = cfb::CompoundFile::open(Cursor::new(data)).map_err(|e| err(e.to_string()))?;
     if !cf.is_stream(format!("/{PROPERTIES_STREAM}")) {
-        return Err(err("no property stream (not an Outlook item)"));
+        return Err(err("no property stream (not an MSG item)"));
     }
     // Directory entries may share sector chains; cap the total bytes read at a few times the file size.
     let budget = u64::try_from(data.len()).unwrap_or(u64::MAX).saturating_mul(4).max(1 << 20);

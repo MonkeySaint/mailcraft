@@ -44,7 +44,28 @@ fn new_local_account() {
 #[test]
 fn empty_display_name_falls_back() {
     let m = Mailbox::new_local("   ");
-    assert_eq!(m.accounts[0].display_name, "Outlook Data File");
+    assert_eq!(m.accounts[0].display_name, "Local Folders");
+}
+
+#[test]
+fn local_account_has_no_sender_name() {
+    let m = Mailbox::new_local("Local Folders");
+    assert_eq!(m.accounts[0].sender_name, "");
+}
+
+#[test]
+fn legacy_local_account_name_is_renamed() {
+    use crate::mailbox::{LEGACY_LOCAL_ACCOUNT_NAME, LOCAL_ACCOUNT_FALLBACK_NAME};
+    let mut m = Mailbox::new_local(LEGACY_LOCAL_ACCOUNT_NAME);
+    m.accounts[0].sender_name = LEGACY_LOCAL_ACCOUNT_NAME.to_owned();
+    assert_eq!(m.rename_legacy_local_account(), 1);
+    assert_eq!(m.accounts[0].display_name, LOCAL_ACCOUNT_FALLBACK_NAME);
+    assert_eq!(m.accounts[0].sender_name, "");
+    // A second run changes nothing, and other names are left alone.
+    assert_eq!(m.rename_legacy_local_account(), 0);
+    let mut other = Mailbox::new_local("Archive 2024");
+    assert_eq!(other.rename_legacy_local_account(), 0);
+    assert_eq!(other.accounts[0].display_name, "Archive 2024");
 }
 
 #[test]

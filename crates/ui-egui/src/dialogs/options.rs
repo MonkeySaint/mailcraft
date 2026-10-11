@@ -1,4 +1,4 @@
-//! The Options window (plan/outlook/options.md): 14 categories in a left list, each page a list of sections
+//! The Options window (plan/reference/options.md): 14 categories in a left list, each page a list of sections
 //! and settings. Every setting is an engine setting (`mailcraft_engine::settings::DEFS`, read
 //! with `Session::option`, written with `options.set` on OK and saved with the profile); the page layout is
 //! generated from that schema, with the buttons and notes of each section added here. Buttons open the

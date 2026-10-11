@@ -816,7 +816,7 @@ fn vcard_name(c: &Contact) -> String {
     crate::compose::clean_attachment_name(&format!("{}.vcf", display_name(c)), "contact.vcf")
 }
 
-/// Forward Contact › As a Business Card / As an Outlook Contact: a new message with each contact attached as
+/// Forward Contact › As a Business Card / As a Contact: a new message with each contact attached as
 /// a vCard (`text/vcard`, RFC 6350 via `mailcraft-formats`); a business card also puts the card text in the
 /// body. Contact groups are skipped (a vCard has no member list).
 fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
@@ -1914,7 +1914,7 @@ mod tests {
             text.contains("Ann Lee") && text.contains("Editor") && text.contains("+1 555 0100 Mobile"),
             "{text}"
         );
-        // As an Outlook contact: the vCard alone.
+        // As a contact: the vCard alone.
         let r = s.run("people.forward", &json!({"as": "contact", "ids": [a]})).unwrap();
         let c = &s.composes[&r["compose"].as_u64().unwrap()];
         assert!(c.body.to_plain_text().trim().is_empty());

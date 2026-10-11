@@ -4,7 +4,7 @@
 //! - [`eml`]: one RFC 5322 message per file (via `mailcraft-mime`; rebuilt from the item when no source is kept).
 //! - [`mbox`]: mboxrd/mboxo mailboxes (the reader and writer live in `mailcraft-store`; this wraps them for
 //!   in-memory import/export with caps).
-//! - [`msg`]: Outlook item files per [MS-OXMSG] stored in a Compound File Binary container ([MS-CFB], via the
+//! - [`msg`]: MSG item files per [MS-OXMSG] stored in a Compound File Binary container ([MS-CFB], via the
 //!   MIT-licensed `cfb` crate), compressed RTF per [MS-OXRTFCP] and HTML de-encapsulation per [MS-OXRTFEX].
 //! - [`ics`]: iCalendar (RFC 5545) with recurrence expansion, time zones and iTIP methods (RFC 5546).
 //! - [`vcf`]: vCard 4.0 (RFC 6350) and 3.0 (RFC 2426), lenient with 2.1.

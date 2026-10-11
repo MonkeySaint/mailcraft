@@ -2216,7 +2216,7 @@ impl ComposeState {
         self.spell_rev != Some(self.edit_rev)
     }
 
-    /// First top-level block of the quoted original in a reply/forward (proofing skips it, Outlook's
+    /// First top-level block of the quoted original in a reply/forward (proofing skips it, the observed client's
     /// "Ignore original message text in reply or forward").
     pub fn quoted_start(&self) -> Option<usize> {
         if !matches!(self.kind, ComposeKind::Reply | ComposeKind::ReplyAll | ComposeKind::Forward) {

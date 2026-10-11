@@ -73,8 +73,8 @@ pub struct ItemRow {
     /// Indent level of a conversation child row (1 = directly under the header; deeper in the Classic
     /// Indented View). 0 for header rows and plain rows.
     pub conversation_depth: u8,
-    /// Accessible name as documented in plan/outlook/reading-pane.md (conversation headers:
-    /// "Conversation, From …, Subject …", `plan/outlook/reply-forward.md` › Conversation view).
+    /// Accessible name as documented in plan/reference/reading-pane.md (conversation headers:
+    /// "Conversation, From …, Subject …", `plan/reference/reply-forward.md` › Conversation view).
     pub accessible: String,
     /// Conversation view: what this row is within its conversation (`None` for plain rows, including
     /// conversations of a single message).
@@ -775,7 +775,7 @@ fn group_collapsed(
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Conversation view (`plan/outlook/reply-forward.md` › Conversation view, `message-list.md` › Views)
+// Conversation view (`plan/reference/reply-forward.md` › Conversation view, `message-list.md` › Views)
 
 /// One conversation of the message list in conversation view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -33,7 +33,7 @@ People trust a mail client with their mail; a crash can lose a draft. This outra
   (`crates/fonts`).
 
 ## Clean room
-- Outlook was observed black-box only; the notes live in `plan/outlook/` (local). Behaviour and feature names
+- Outlook was observed black-box only; the notes live in `plan/reference/` (local). Behaviour and feature names
   come from there. Never read or copy anything from an Outlook install, never copy Microsoft wording beyond
   feature names.
 - Formats and protocols come from public specs: RFC 5322/2045–2049/2047/2231 (mail), RFC 3501/9051 (IMAP),

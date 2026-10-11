@@ -19,7 +19,7 @@ impl Mailbox {
     pub fn display(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.addr)
     }
-    /// `Name <addr>` or `addr` (the form Outlook shows in quoted headers and recipient fields).
+    /// `Name <addr>` or `addr` (the form shown in quoted headers and recipient fields).
     pub fn to_display_string(&self) -> String {
         match &self.name {
             Some(n) => format!("{n} <{}>", self.addr),

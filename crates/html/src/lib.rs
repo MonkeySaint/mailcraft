@@ -14,7 +14,7 @@
 //! - Paragraph spacing comes from CSS margins; a bare `<p>` gets `space_after_px` of 1em (16 px at 12 pt),
 //!   `div`s get none. An empty `Paragraph` (no inlines) is a blank line (`<div><br></div>`, `<p><br></p>`).
 //! - Text styles hold only what the markup sets (`None` inherits from `Doc::base`, which comes from `<body>`).
-//! - A `div`/`p` with a top border (the Outlook reply header box) is preceded by a `Block::Rule`.
+//! - A `div`/`p` with a top border (the desktop-client reply header box) is preceded by a `Block::Rule`.
 //! - `display:none` / `mso-hide:all` content (newsletter preheaders) is dropped.
 
 mod convert;

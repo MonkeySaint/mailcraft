@@ -6,7 +6,7 @@
 //! (contextual Search tab while `app.ui.search_active`), `calendar` / `people` / `tasks` / `notes` (module tabs,
 //! falling back to the Mail tabs), `compose` (Message, Insert, Options, Format Text, Review, Help) and `read`
 //! (Message, Help). The Simplified ribbon is one 49-px row with a "…" overflow menu; the Classic ribbon is
-//! 100 px of labelled groups. Width degradation follows plan/outlook/responsive.md.
+//! 100 px of labelled groups. Width degradation follows plan/reference/responsive.md.
 //!
 //! Helpers for other areas: [`surface_key`] (the `app.ui.ribbon_tab` key), [`selected_tab`] / [`select_tab`],
 //! [`tab_keytip`] (badge text for the tab row) and [`keytip`] (resolves an Alt keytip sequence).
@@ -290,7 +290,7 @@ pub fn keytip(ctx: &egui::Context, app: &mut App, surface: Surface, seq: &str) -
         let exact = tab.groups.iter().flat_map(|g| g.ctls.iter()).find(|c| c.key == rest);
         if let Some(c) = exact {
             select_tab(app, surface, name);
-            // Split buttons open their dropdown (plan/outlook/ribbon-*.md: "Alt, H, R 1" opens Report's menu,
+            // Split buttons open their dropdown (plan/reference/ribbon-*.md: "Alt, H, R 1" opens Report's menu,
             // "Alt, H, V" Paste's); dropdowns, galleries and combos open theirs; edits take focus.
             let opens_menu = match c.kind {
                 defs::Kind::Split => c.menu.is_some(),

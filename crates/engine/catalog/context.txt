@@ -44,7 +44,7 @@ Context|favorites-root|Minimize|app.minimize
 Context|favorites-root|Restore Down|app.toggleMaximize
 Context|favorites-root|Close|file.exit
 Context|favorites-root|File Tab|file.info
-Context|favorites-root|Try the new Outlook|-|product upsell to switch to the new Outlook
+Context|favorites-root|Try the new version|-|product upsell to switch to a different, cloud-based client
 Context|favorites-root|New Email|mail.newEmail
 Context|favorites-root|New Items|mail.newItem
 Context|favorites-root|Ignore|mail.ignore

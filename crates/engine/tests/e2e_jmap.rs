@@ -73,7 +73,7 @@ fn jmap_account_receives_writes_back_and_sends() {
         ..Config::default()
     })
     .unwrap();
-    let mut s = Session::new(Mailbox::new_local("Outlook Data File"));
+    let mut s = Session::new(Mailbox::new_local("Local Folders"));
     s.view.auto_send_receive_minutes = 0;
     let r = run(
         &mut s,

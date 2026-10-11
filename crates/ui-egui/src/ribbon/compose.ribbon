@@ -1,4 +1,4 @@
-# Compose window ribbon (plan/outlook/ribbon-compose.md, responsive.md "Compose window"). Only the Classic
+# Compose window ribbon (plan/reference/ribbon-compose.md, responsive.md "Compose window"). Only the Classic
 # ribbon was observed; the Simplified ribbon is derived from it (every control small, one row). Grammar: see
 # main.ribbon. Commands get {"compose": <id>} added by the ribbon.
 
@@ -49,7 +49,7 @@ toggle L | Switch Background | view | compose.switchBackground | | B | on=lightc
 tab Insert | N
 group Include | ZC
 drop L | Attach File... | attach | | | AF | menu=attachFileInsert
-button L | Outlook Item | email | compose.attachItem | | AM
+button L | Item | email | compose.attachItem | | AM
 drop L | Business Card | contact-group | | | AA | menu=businessCard
 button L | Calendar... | calendar | insert.calendar | | OC
 drop L | Signature | signature | | | AS | menu=signature
@@ -498,7 +498,7 @@ item | Browse This PC... | attach | compose.attachFile | | B
 
 menu attachItem
 item | Business Card | contact-group | insert.businessCard | | B
-item | Outlook Item | email | compose.attachItem | | I
+item | Item | email | compose.attachItem | | I
 
 menu businessCard
 item | Other Business Cards... | contact-group | insert.businessCard | | B

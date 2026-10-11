@@ -264,7 +264,7 @@ impl Expiry {
     }
 }
 
-/// Outlook's size buckets.
+/// The observed size buckets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SizeBucket {
     Tiny,

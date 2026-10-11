@@ -28,7 +28,7 @@ pub fn write(m: &MsgMessage) -> Result<Vec<u8>> {
 }
 
 fn write_inner(m: &MsgMessage) -> Result<Vec<u8>> {
-    // Version 3 (512-byte sectors): what Outlook items use and every compound file reader accepts.
+    // Version 3 (512-byte sectors): what MSG files use and every compound file reader accepts.
     let mut cf: Cf =
         cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new())).map_err(io_err)?;
     write_nameid(&mut cf)?;
@@ -88,7 +88,7 @@ impl Obj {
     }
 
     /// A PtypString property. Empty strings are left out: a value stream must hold at least one character
-    /// ([MS-OXMSG] 2.4.2.2; Outlook refuses files with zero-length string streams).
+    /// ([MS-OXMSG] 2.4.2.2; readers refuse files with zero-length string streams).
     fn string(&mut self, id: u16, s: &str) {
         if s.is_empty() {
             return;

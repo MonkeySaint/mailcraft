@@ -1,4 +1,4 @@
-//! `sendReceive.*` (`plan/outlook/ribbon-mail.md`, Send / Receive tab): start send/receive runs on the
+//! `sendReceive.*` (`plan/reference/ribbon-mail.md`, Send / Receive tab): start send/receive runs on the
 //! accounts' worker threads (`crate::sync`), report each account's Outbox, cancel runs, show progress, and
 //! toggle Work Offline (kept in the session's view state). Results arrive through `Session::poll_sync`.
 //! The Server and Preferences command bodies (header-only download, marks, Download Preferences and the

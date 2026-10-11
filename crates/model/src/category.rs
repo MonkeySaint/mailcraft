@@ -3,7 +3,7 @@
 use mailcraft_geom::Color;
 use serde::{Deserialize, Serialize};
 
-/// The 25 preset category colours plus None. Our own palette (not sampled from Outlook).
+/// The 25 preset category colours plus None. Our own palette (not sampled from any other product).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CategoryColor {
     #[default]

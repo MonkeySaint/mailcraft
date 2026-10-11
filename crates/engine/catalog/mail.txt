@@ -54,7 +54,7 @@ Mail|Home > New Items > More Items|Contact Group|mail.newItem
 Mail|Home > New Items > More Items|Task Request|mail.newItem
 Mail|Home > New Items > More Items|Internet Fax|-|Internet Fax requires a third-party online fax service
 Mail|Home > New Items > More Items|Choose Form...|mail.newItem
-Mail|Home > New Items > More Items|Outlook Data File...|file.newDataFile
+Mail|Home > New Items > More Items|Data File...|file.newDataFile
 Mail|Home > Clean Up|Clean Up Conversation|mail.cleanUpConversation
 Mail|Home > Clean Up|Clean Up Folder|mail.cleanUpFolder
 Mail|Home > Clean Up|Clean Up Folder & Subfolders|mail.cleanUpSubfolders

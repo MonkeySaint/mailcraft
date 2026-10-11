@@ -198,7 +198,7 @@ fn whats_new(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     window(ctx, app, d, "What's New", 440.0, |ui, app| {
         ui.label(RichText::new(format!("MailCraft {}", d.str("version"))).strong());
         for line in [
-            "Outlook-style shell: ribbon, folder pane, message list and reading pane.",
+            "Classic desktop mail layout: ribbon, folder pane, message list and reading pane.",
             "Rules: Create Rule, Rules and Alerts and the four-step Rules Wizard.",
             "Import and export EML and MBOX from File › Open & Export.",
             "Light and dark themes (File › Account).",

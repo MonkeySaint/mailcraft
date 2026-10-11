@@ -1,4 +1,4 @@
-# Opened-message (read) window ribbon: Message tab (plan/outlook/read-window.md, responsive.md "Read window").
+# Opened-message (read) window ribbon: Message tab (plan/reference/read-window.md, responsive.md "Read window").
 # Commands get {"ids": [<item>]} / {"id": <item>} added by the ribbon. Help falls back to the main window's.
 
 surface read

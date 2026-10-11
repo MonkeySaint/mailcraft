@@ -1393,7 +1393,7 @@ fn contact_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
                             act = Act::ForwardCard;
                             ui.close();
                         }
-                        if ui.button("As an Outlook Contact").clicked() {
+                        if ui.button("As a Contact").clicked() {
                             act = Act::ForwardContact;
                             ui.close();
                         }

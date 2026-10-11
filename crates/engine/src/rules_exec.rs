@@ -1,4 +1,4 @@
-//! The rule executor (`plan/outlook/rules.md`): runs [`Rule`]s over mail items and carries out their actions.
+//! The rule executor (`plan/reference/rules.md`): runs [`Rule`]s over mail items and carries out their actions.
 //!
 //! Entry points:
 //! - [`on_new_mail`]: enabled receive rules over newly arrived mail (the send/receive hook in `sync.rs` and any

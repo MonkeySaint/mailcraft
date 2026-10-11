@@ -550,7 +550,7 @@ pub(crate) fn group_header(ui: &mut Ui, app: &mut App, text: &str, collapsed: bo
     resp.clicked()
 }
 
-/// Folder rows of `kind` (Outlook: "Calendar - account" when several accounts). Returns the clicked folder.
+/// Folder rows of `kind` (observed: "Calendar - account" when several accounts). Returns the clicked folder.
 pub(crate) fn folder_rows(
     ui: &mut Ui,
     app: &mut App,

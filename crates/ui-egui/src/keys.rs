@@ -1,7 +1,7 @@
 //! Keyboard: shortcuts → commands with context (main window vs compose vs read window, and by module), Alt
 //! keytips (keys area).
 //!
-//! Bindings follow `plan/outlook/keyboard.md` (the accelerator tables and the tested-keys sections) plus each
+//! Bindings follow `plan/reference/keyboard.md` (the accelerator tables and the tested-keys sections) plus each
 //! `CommandSpec.shortcut`. Keys that mean different things in different places are resolved by surface and
 //! module:
 //!
@@ -1389,7 +1389,7 @@ pub fn keytip_targets(ctx: &egui::Context, app: &App, surface: Surface) -> Vec<K
     targets
 }
 
-/// Built-in top-level keytips (`plan/outlook/*`: File `F`, Home `H`, Send / Receive `J S`, Folder `O`, View
+/// Built-in top-level keytips (`plan/reference/*`: File `F`, Home `H`, Send / Receive `J S`, Folder `O`, View
 /// `V`, Help `E`; compose: Message `H`, Insert `N`, Options `P`, Format Text `O`, Review `V`; Quick Access
 /// Toolbar `1`, `2`).
 pub fn default_keytips(app: &App, surface: Surface) -> Vec<KeytipTarget> {

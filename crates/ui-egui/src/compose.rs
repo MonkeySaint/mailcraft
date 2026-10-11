@@ -1,6 +1,6 @@
 //! Compose windows (viewports) and inline responses in the reading pane, with the body editor (compose area).
 //!
-//! Layout follows plan/outlook/compose.md, reading-pane.md (inline reply) and responsive.md (compose window):
+//! Layout follows plan/reference/compose.md, reading-pane.md (inline reply) and responsive.md (compose window):
 //!
 //! - Each non-inline [`ComposeState`] is an immediate viewport (default 1440×780, title from
 //!   [`ComposeState::title`], OS title bar). Under it: a Quick Access row (Save, Undo, Redo, Previous Item, Next

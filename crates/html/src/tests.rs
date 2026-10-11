@@ -478,7 +478,7 @@ fn newsletter() {
     assert_round_trip(NEWSLETTER);
 }
 
-const OUTLOOK_REPLY: &str = r##"<html><head><style>p.MsoNormal{margin:0cm;font-size:12.0pt;font-family:"Aptos",sans-serif;}</style></head>
+const DESKTOP_REPLY: &str = r##"<html><head><style>p.MsoNormal{margin:0cm;font-size:12.0pt;font-family:"Aptos",sans-serif;}</style></head>
 <body lang="EN-CA" link="#467886" vlink="#96607D" style="word-wrap:break-word">
 <div class="WordSection1">
 <p class="MsoNormal">Thanks, see you then.<o:p></o:p></p>
@@ -490,15 +490,15 @@ const OUTLOOK_REPLY: &str = r##"<html><head><style>p.MsoNormal{margin:0cm;font-s
 <p class="MsoNormal">Are you free <i>Tuesday</i>?</p>
 </div></body></html>"##;
 
-const OUTLOOK_REPLY_HR: &str = r##"<div dir="ltr"><div>Sounds good.</div><div><br></div>
+const DESKTOP_REPLY_HR: &str = r##"<div dir="ltr"><div>Sounds good.</div><div><br></div>
 <hr style="display:inline-block;width:98%" tabindex="-1">
 <div id="divRplyFwdMsg" dir="ltr"><font face="Calibri, sans-serif" style="font-size:11pt" color="#000000"><b>From:</b> Jane Doe &lt;jane@example.com&gt;<br>
 <b>Sent:</b> Monday, October 5, 2026 9:14 AM<br><b>To:</b> Sam<br><b>Subject:</b> Lunch?</font>
 <div>&nbsp;</div></div><div>Are you free?</div></div>"##;
 
 #[test]
-fn outlook_reply_with_border_separator() {
-    let d = doc(OUTLOOK_REPLY);
+fn desktop_reply_with_border_separator() {
+    let d = doc(DESKTOP_REPLY);
     assert!(d.blocks.contains(&Block::Rule), "{:#?}", d.blocks);
     let from = run_style(&d, "From:");
     assert_eq!(from.bold, Some(true));
@@ -512,12 +512,12 @@ fn outlook_reply_with_border_separator() {
         "Thanks, see you then.\n\n------------------------------\nFrom: Jane Doe <jane@example.com>\n\
          Sent: Monday, October 5, 2026 9:14 AM\nTo: Sam <sam@example.com>\nSubject: Lunch?\n\nAre you free Tuesday?"
     );
-    assert_round_trip(OUTLOOK_REPLY);
+    assert_round_trip(DESKTOP_REPLY);
 }
 
 #[test]
-fn outlook_reply_with_hr() {
-    let d = doc(OUTLOOK_REPLY_HR);
+fn desktop_reply_with_hr() {
+    let d = doc(DESKTOP_REPLY_HR);
     let i = d.blocks.iter().position(|b| *b == Block::Rule).expect("rule");
     assert_eq!(
         para_texts(&Doc { blocks: d.blocks[..i].to_vec(), ..Doc::default() }),
@@ -533,7 +533,7 @@ fn outlook_reply_with_hr() {
         "Sounds good.\n\n------------------------------\nFrom: Jane Doe <jane@example.com>\n\
          Sent: Monday, October 5, 2026 9:14 AM\nTo: Sam\nSubject: Lunch?\n\nAre you free?"
     );
-    assert_round_trip(OUTLOOK_REPLY_HR);
+    assert_round_trip(DESKTOP_REPLY_HR);
 }
 
 // ---------------------------------------------------------------------------------------------------------

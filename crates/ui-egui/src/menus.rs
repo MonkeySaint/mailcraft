@@ -1,6 +1,6 @@
 //! Context menus (keys/menus area): message row, group header, folder, account root, status bar, sort menu.
 //!
-//! Contents follow `plan/outlook/context-menus.md` and `message-list.md`; every entry runs a command through
+//! Contents follow `plan/reference/context-menus.md` and `message-list.md`; every entry runs a command through
 //! [`App::run`]. Entries for services MailCraft does not have (retention policies, OneNote) are left out.
 //! Callers open these from `Response::context_menu(|ui| menus::…(ui, app, …))` (or a `menu_button` for the
 //! arrange menu); the functions draw the menu body.

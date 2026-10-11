@@ -41,7 +41,7 @@ pub struct ServerSettings {
 pub struct Account {
     pub id: AccountId,
     pub kind: AccountKind,
-    /// Shown as the mailbox root label (Outlook uses the address).
+    /// Shown as the mailbox root label (the address, as observed).
     pub display_name: String,
     pub address: String,
     /// Sender name for outgoing mail.

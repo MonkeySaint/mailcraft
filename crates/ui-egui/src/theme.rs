@@ -1,4 +1,4 @@
-//! Colour and size tokens. Our own palette (light default, dark variant); geometry from plan/outlook/layout.md.
+//! Colour and size tokens. Our own palette (light default, dark variant); geometry from plan/reference/layout.md.
 
 use egui::Color32;
 

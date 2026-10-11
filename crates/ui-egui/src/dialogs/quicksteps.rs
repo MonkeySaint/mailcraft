@@ -1,4 +1,4 @@
-//! Quick Steps dialogs (plan/outlook/dialogs.md "Manage Quick Steps" 558×400, "Edit Quick Step" 510×570, and the
+//! Quick Steps dialogs (plan/reference/dialogs.md "Manage Quick Steps" 558×400, "Edit Quick Step" 510×570, and the
 //! first-use setup of steps such as "Move to: ?"):
 //! - `manageQuickSteps`: the list with ▲ ▼, New ▾ (templates), the Description pane (actions, shortcut key,
 //!   tooltip), Edit / Duplicate / Delete, Reset to Defaults, OK / Cancel.

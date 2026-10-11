@@ -1,4 +1,4 @@
-//! Reading-pane tracking bars (our layout; behaviour from plan/outlook/options.md › Tracking and
+//! Reading-pane tracking bars (our layout; behaviour from plan/reference/options.md › Tracking and
 //! ribbon-compose.md › Use Voting Buttons):
 //!
 //! - a received voting message: "This message has voting buttons." with one button per choice, each

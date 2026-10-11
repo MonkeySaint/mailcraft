@@ -1,6 +1,6 @@
 //! Folder pane: Favorites + mailbox trees, badges, minimised strip, drag targets (folders area).
 //!
-//! Behaviour from `plan/outlook/folders.md` and `plan/outlook/layout.md`: a collapsible Favorites section,
+//! Behaviour from `plan/reference/folders.md` and `plan/reference/layout.md`: a collapsible Favorites section,
 //! then one tree per account (root row 34 px, folder rows 24 px), expand chevrons, unread badges (total in
 //! brackets for Drafts / Junk Email / Outbox), a « button that minimises the pane to a 26 px strip with the
 //! Favorites written vertically, and folders that accept messages dragged from the list. Rows come from

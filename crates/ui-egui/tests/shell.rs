@@ -1,4 +1,4 @@
-//! Shell tests: the main window renders the sample mailbox at the observed window sizes (plan/outlook/
+//! Shell tests: the main window renders the sample mailbox at the observed window sizes (plan/reference/
 //! layout.md, responsive.md), checked through the accessibility tree and the shell's layout snapshot.
 
 #![allow(clippy::unwrap_used)]

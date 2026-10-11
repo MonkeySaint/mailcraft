@@ -1,6 +1,6 @@
 //! File backstage (main and compose) — backstage/dialogs area.
 //!
-//! A full-window page below the title bar (plan/outlook/backstage.md): a left navigation column (Back, Info,
+//! A full-window page below the title bar (plan/reference/backstage.md): a left navigation column (Back, Info,
 //! Open & Export, Save As, Save Attachments, Print, then Account, Options, Exit at the bottom; the compose
 //! variant adds Save and Close) and the selected page on the right. Pages act only through `app.run`.
 //!
@@ -902,7 +902,7 @@ fn save_attachments(ui: &mut Ui, app: &mut App, surface: Surface, st: &mut PageS
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Print (plan/outlook/backstage.md "PAGE Print"): Print, Which Printer, Print Options..., Settings gallery,
+// Print (plan/reference/backstage.md "PAGE Print"): Print, Which Printer, Print Options..., Settings gallery,
 // and the preview with Previous Page / Current Page / Next Page / Actual Size / One Page / Multiple Pages.
 // Everything goes through the engine's `print.*` commands; the preview pages are rendered by the engine
 // (`print.preview`) and shown as textures.

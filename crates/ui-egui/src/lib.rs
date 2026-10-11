@@ -1,6 +1,6 @@
-//! MailCraft's user interface (layer L6): an Outlook-style shell on egui.
+//! MailCraft's user interface (layer L6): a classic desktop mail shell on egui.
 //!
-//! Behaviour and geometry follow the black-box notes in `plan/outlook/` (layout.md, responsive.md,
+//! Behaviour and geometry follow the black-box notes in `plan/reference/` (layout.md, responsive.md,
 //! folders.md, message-list.md, reading-pane.md, compose.md, read-window.md, ribbon-*.md, backstage.md,
 //! options.md, dialogs.md, keyboard.md, context-menus.md, search.md, modules.md). The look (colours, icons) is
 //! our own. Every action goes through [`App::run`] → `Session::run` (the engine command registry).

@@ -29,7 +29,7 @@ fn main_mail() -> KeyContext {
 }
 
 #[test]
-fn chords_parse_portable_and_outlook_forms() {
+fn chords_parse_portable_and_windows_forms() {
     assert_eq!(c("Mod+Shift+R"), Chord::cmd_shift(Key::R));
     assert_eq!(c("Ctrl+Shift+R"), Chord::cmd_shift(Key::R));
     assert_eq!(c("Mod+Shift+>"), Chord::cmd_shift(Key::Period));

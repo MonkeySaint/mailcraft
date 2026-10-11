@@ -47,7 +47,7 @@ fn sync(s: &mut Session) {
 }
 
 fn session() -> Session {
-    let mut s = Session::new(Mailbox::new_local("Outlook Data File"));
+    let mut s = Session::new(Mailbox::new_local("Local Folders"));
     s.view.auto_send_receive_minutes = 0;
     s
 }

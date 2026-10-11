@@ -52,7 +52,7 @@ pub struct Face {
 
 /// Family names used by the UI.
 pub const UI_FAMILY: &str = "Inter";
-/// Compose body default (Outlook shows "Aptos (Body)" 12 pt; we map Aptos to a bundled sans).
+/// Compose body default (the observed client shows "Aptos (Body)" 12 pt; we map Aptos to a bundled sans).
 pub const BODY_FAMILY: &str = "Aptos";
 pub const BODY_SIZE_PT: f32 = 12.0;
 

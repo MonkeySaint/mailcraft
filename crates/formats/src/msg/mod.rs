@@ -1,4 +1,4 @@
-//! Outlook item files (`.msg`): [MS-OXMSG] objects stored in a [MS-CFB] compound file.
+//! MSG item files (`.msg`): [MS-OXMSG] objects stored in a [MS-CFB] compound file.
 //!
 //! Reading extracts the message class, subject, sender, recipients (To/Cc/Bcc from the recipient storages),
 //! dates, internet ids, importance/sensitivity/flags, categories (the `Keywords` named property), the bodies

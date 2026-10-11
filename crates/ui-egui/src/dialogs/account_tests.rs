@@ -934,3 +934,21 @@ fn add_account_points_out_servers_outside_the_domain_found_in_dns() {
     assert_eq!(field_value(&h, "Server:"), "pop.example.org");
     assert!(h.query_by_label_contains("guessed from your address").is_some());
 }
+
+#[test]
+fn add_account_name_never_comes_from_a_data_file() {
+    use mailcraft_engine::Session;
+    use mailcraft_model::Mailbox;
+    // A fresh profile has only its local data file: Your name starts empty.
+    let mut app = App::new(Session::new(Mailbox::new_local("Local Folders")));
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    let h = harness(app);
+    assert_eq!(field_value(&h, "Your name:"), "");
+
+    // With a user name in Options › General, that name is offered.
+    let mut app = App::new(Session::new(Mailbox::new_local("Local Folders")));
+    app.s.settings.set("general.userName", &json!("Sam Example")).expect("set user name");
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    let h = harness(app);
+    assert_eq!(field_value(&h, "Your name:"), "Sam Example");
+}

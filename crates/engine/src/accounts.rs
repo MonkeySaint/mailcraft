@@ -1,4 +1,4 @@
-//! Accounts (File › Info › Add Account / Account Settings, `plan/outlook/backstage.md`): the `accounts.*`
+//! Accounts (File › Info › Add Account / Account Settings, `plan/reference/backstage.md`): the `accounts.*`
 //! commands, the credentials store, and the connection settings built from an account plus its secret.
 //!
 //! Secrets (passwords, OAuth access and refresh tokens) never enter the mailbox, its snapshot or its journal.

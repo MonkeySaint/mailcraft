@@ -1,6 +1,6 @@
 # MailCraft ribbon definitions: main window, Mail module (plus the Search contextual tab).
 #
-# Behaviour, group/control order, feature names and keytips follow plan/outlook/ribbon-mail.md, search.md and
+# Behaviour, group/control order, feature names and keytips follow plan/reference/ribbon-mail.md, search.md and
 # responsive.md; icons and wording beyond feature names are our own. Grammar (see ribbon/defs.rs):
 #
 #   surface <name>                      main | search | compose | read | calendar | people | tasks | notes
@@ -218,7 +218,7 @@ toggle S | All Mailboxes | account | search.scope | {"scope":"allMailboxes"} | A
 toggle S | Current Mailbox | inbox | search.scope | {"scope":"currentMailbox"} | C1 | on=scope:currentMailbox
 toggle S | Current Folder | folder | search.scope | {"scope":"currentFolder"} | CF | on=scope:currentFolder
 toggle S | Subfolders | folder-open | search.scope | {"scope":"subfolders"} | SU | on=scope:subfolders
-toggle S | All Outlook Items | search | search.scope | {"scope":"allItems"} | OL | on=scope:allItems
+toggle S | All Items | search | search.scope | {"scope":"allItems"} | OL | on=scope:allItems
 group Results | ZE
 toggle S | Include Deleted Items | deleted | search.scope | {"includeDeleted":"$!on"} | I2 | on=searchDeleted
 group Options | ZO
@@ -252,7 +252,7 @@ item | Post in This Folder | | mail.newItem | {"kind":"post"} | P
 item | Contact Group | contact-group | mail.newItem | {"kind":"contactGroup"} | G
 item | Task Request | task | mail.newItem | {"kind":"taskRequest"} | Q
 item | Choose Form... | | mail.newItem | {"kind":"fromForm"} | O
-item | Outlook Data File... | | file.newDataFile | | F
+item | Data File... | | file.newDataFile | | F
 
 menu deleteMore
 item | Ignore | ignore | mail.ignore | | I | on=ignored

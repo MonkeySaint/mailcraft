@@ -31,7 +31,7 @@ use mailcraft_model::{
     MailItem, ResponseState, Sensitivity,
 };
 
-/// Error shown when sending without an account that can send (plan/outlook/reading-pane.md).
+/// Error shown when sending without an account that can send (plan/reference/reading-pane.md).
 pub const NO_ACCOUNT: &str = "No valid email accounts are configured. Add an account to send email.";
 /// Largest file Attach File accepts.
 pub const MAX_ATTACHMENT_BYTES: u64 = 150 * 1024 * 1024;

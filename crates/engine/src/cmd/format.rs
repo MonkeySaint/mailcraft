@@ -179,7 +179,7 @@ fn parse_color(t: &str) -> Result<Color, CmdError> {
     mailcraft_html::parse_css_color(t).ok_or_else(|| CmdError::Params(format!("unknown colour `{t}`")))
 }
 
-/// Theme colour columns of the Font Color and Shading galleries (plan/outlook/ribbon-compose.md): key, palette
+/// Theme colour columns of the Font Color and Shading galleries (plan/reference/ribbon-compose.md): key, palette
 /// slot ([`crate::compose::THEME_COLOR_SLOTS`]), name in the default theme, and the five shade rows under
 /// the base colour (positive: lighter by that %, negative: darker).
 pub const THEME_COLUMNS: [(&str, usize, &str, [i8; 5]); 10] = [

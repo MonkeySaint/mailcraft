@@ -1,4 +1,4 @@
-//! Profile settings: every File › Options setting (`plan/outlook/options.md`, all 14 pages), the settings
+//! Profile settings: every File › Options setting (`plan/reference/options.md`, all 14 pages), the settings
 //! of the option dialogs reached from them (Reading Pane, Junk Email Options, Stationery and Fonts) and UI
 //! state that outlives a session, as typed key/value pairs with defaults.
 //!
@@ -250,7 +250,7 @@ const SEARCH_SCOPES: &[(&str, &str)] = &[
     ("subfolders", "Current folder and its subfolders"),
     ("currentMailbox", "Current mailbox"),
     ("allMailboxes", "All mailboxes"),
-    ("allOutlookItems", "All MailCraft items"),
+    ("allItems", "All items"),
 ];
 const DISPLAY_LANGUAGES: &[(&str, &str)] = &[("en-US", "English (United States)")];
 const AUTHORING_LANGUAGES: &[(&str, &str)] = &[

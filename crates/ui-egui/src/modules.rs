@@ -1,6 +1,6 @@
 //! Calendar, People, Tasks (To Do), Notes module views (modules area).
 //!
-//! Layout and behaviour follow `plan/outlook/modules.md` and its screenshots (geometry only): each module
+//! Layout and behaviour follow `plan/reference/modules.md` and its screenshots (geometry only): each module
 //! draws its own folder pane (calendar: date navigator + My Calendars; people: My Contacts; tasks: My Tasks
 //! with the To-Do List; notes: My Notes) next to the module's content. Item changes go through
 //! [`App::run`] with the `calendar.*`, `people.*`, `tasks.*` and `notes.*` commands; the views only read the

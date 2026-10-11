@@ -1,4 +1,4 @@
-//! Mail views (`plan/outlook/message-list.md` › Views, `dialogs.md` › view-settings and manage-views): what
+//! Mail views (`plan/reference/message-list.md` › Views, `dialogs.md` › view-settings and manage-views): what
 //! the list of a mail or search folder shows beyond its [`ViewSettings`].
 //!
 //! **Per folder** ([`MailView`], stored like the module views as one reserved entry of
@@ -146,7 +146,7 @@ pub const COLUMNS: [ColumnDef; 18] = [
     col("inFolder", "In Folder", 110, None, ColumnKind::Text, false),
 ];
 
-/// Columns of a view nobody changed (the bottom reading pane layout of `plan/outlook/responsive.md`).
+/// Columns of a view nobody changed (the bottom reading pane layout of `plan/reference/responsive.md`).
 pub const DEFAULT_COLUMNS: [&str; 11] = [
     "importance",
     "reminder",
@@ -798,7 +798,7 @@ fn set_ui_pref(s: &mut Session, key: &str, v: Option<Value>) -> Result<(), CmdEr
     s.set_option("state.uiPrefs", &Value::Object(m)).map(|_| ())
 }
 
-/// Status bar elements (Customize Status Bar, `plan/outlook/message-list.md`): (key, label).
+/// Status bar elements (Customize Status Bar, `plan/reference/message-list.md`): (key, label).
 pub const STATUS_ITEMS: [(&str, &str); 11] = [
     ("quota", "Quota Information"),
     ("filter", "Filter"),

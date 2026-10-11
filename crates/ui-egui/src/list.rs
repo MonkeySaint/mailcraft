@@ -1,14 +1,14 @@
 //! Message list: header (Focused/Other, arrange menu, sort direction), grouped rows, compact/single/preview
 //! layouts, hover actions, selection, keyboard navigation (list area).
 //!
-//! Behaviour from `plan/outlook/message-list.md` and `plan/outlook/reading-pane.md`: a 97 px header block,
+//! Behaviour from `plan/reference/message-list.md` and `plan/reference/reading-pane.md`: a 97 px header block,
 //! date-group headers (24 px) and compact three-line rows (72 px with one preview line), or one-line column
 //! rows (Single / Preview views, and Compact when the reading pane sits at the bottom or is off on a wide
 //! list). Rows are virtualised: only the rows inside the viewport are laid out and painted, and the row
 //! model from `queries::list_rows` is cached until the session changes, so thousands of items scroll
 //! smoothly. All changes go through [`App::run`].
 //!
-//! Conversation view (`plan/outlook/reply-forward.md` › Conversation view): a conversation is a header row
+//! Conversation view (`plan/reference/reply-forward.md` › Conversation view): a conversation is a header row
 //! (◢ expanded / ▷ collapsed glyph, senders, subject without prefixes, unread count, latest time) followed,
 //! when expanded, by indented compact child rows (sender + time, preview below); messages from other
 //! folders are dimmed with their folder name in italics. Left / Right collapse / expand the focused
@@ -649,7 +649,7 @@ fn scope_prompt_id() -> Id {
 }
 
 /// Asks whether Show as Conversations changes for this folder or for all mailboxes before toggling it
-/// (`plan/outlook/reply-forward.md` › Conversation view). The answer runs `view.conversations` with
+/// (`plan/reference/reply-forward.md` › Conversation view). The answer runs `view.conversations` with
 /// `{"on", "scope": "folder" | "all"}`; Cancel changes nothing. Surfaces offering Show as Conversations
 /// call this instead of running the command directly.
 pub fn ask_conversation_scope(ctx: &egui::Context, app: &App) {

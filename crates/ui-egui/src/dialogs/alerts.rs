@@ -1,4 +1,4 @@
-//! The New Item Alert window (rules' "display in the New Item Alert window", plan/outlook/rules.md) and the
+//! The New Item Alert window (rules' "display in the New Item Alert window", plan/reference/rules.md) and the
 //! rules' sound player.
 //!
 //! The engine opens `newItemAlerts` once per rule run with `{"alerts": [{item, from, subject, receivedText,

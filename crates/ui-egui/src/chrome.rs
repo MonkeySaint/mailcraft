@@ -1,6 +1,6 @@
 //! Window chrome: title bar (QAT, search box, account), tab row, module rail, status bar (shell area), and the
-//! main-window composition: bands from plan/outlook/layout.md, rounded panes on a backdrop, splitters and the
-//! narrow-window rules from plan/outlook/responsive.md.
+//! main-window composition: bands from plan/reference/layout.md, rounded panes on a backdrop, splitters and the
+//! narrow-window rules from plan/reference/responsive.md.
 //!
 //! Options that act here (engine settings, read every frame): General › Theme ("Use system setting" follows
 //! the system), Advanced › animations, Quick Access Toolbar (show, position, labels), the pane sizes the
@@ -548,7 +548,7 @@ fn scope_label(scope: SearchScope) -> &'static str {
         SearchScope::Subfolders => "Subfolders",
         SearchScope::CurrentMailbox => "Current Mailbox",
         SearchScope::AllMailboxes => "All Mailboxes",
-        SearchScope::AllOutlookItems => "All Items",
+        SearchScope::AllItems => "All Items",
     }
 }
 
@@ -557,16 +557,16 @@ const SCOPES: [(SearchScope, &str); 5] = [
     (SearchScope::CurrentMailbox, "currentMailbox"),
     (SearchScope::CurrentFolder, "currentFolder"),
     (SearchScope::Subfolders, "subfolders"),
-    (SearchScope::AllOutlookItems, "allItems"),
+    (SearchScope::AllItems, "allItems"),
 ];
 
-/// Keyboard shortcut shown next to a scope in the dropdown (`plan/outlook/keyboard.md`).
+/// Keyboard shortcut shown next to a scope in the dropdown (`plan/reference/keyboard.md`).
 fn scope_shortcut(scope: SearchScope) -> &'static str {
     match scope {
         SearchScope::AllMailboxes => "Ctrl+Alt+A",
         SearchScope::CurrentFolder => "Ctrl+Alt+K",
         SearchScope::Subfolders => "Ctrl+Alt+Z",
-        SearchScope::CurrentMailbox | SearchScope::AllOutlookItems => "",
+        SearchScope::CurrentMailbox | SearchScope::AllItems => "",
     }
 }
 
@@ -1013,7 +1013,7 @@ fn t_to_zoom(t: f32) -> u16 {
     p
 }
 
-/// The status bar (`plan/outlook/layout.md`, `message-list.md` › Customize Status Bar): items in view, unread,
+/// The status bar (`plan/reference/layout.md`, `message-list.md` › Customize Status Bar): items in view, unread,
 /// header items, filter and reminders at the left, then send/receive progress; view shortcuts and the zoom
 /// slider and percentage at the right. Each element can be hidden from the right-click menu (`view.statusBar`,
 /// saved with the profile). Every part stays down to the 400-px minimum window (`responsive.md`); only the
