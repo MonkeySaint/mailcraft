@@ -20,8 +20,10 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of MailCraft is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <Icon Id="MailCraftIcon" SourceFile="$(var.RepoDir)\assets\app-icon\mailcraft.ico" />
-    <Property Id="ARPPRODUCTICON" Value="MailCraftIcon" />
+    <!-- The Id must end in .ico: Windows Installer names the extracted shortcut icon after it and reads its
+         format from the extension; without one, Start menu shortcuts show a blank icon. -->
+    <Icon Id="MailCraft.ico" SourceFile="$(var.RepoDir)\assets\app-icon\mailcraft.ico" />
+    <Property Id="ARPPRODUCTICON" Value="MailCraft.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/MonkeySaint/mailcraft" />
     <Property Id="ARPHELPLINK" Value="https://github.com/MonkeySaint/mailcraft/issues" />
 
@@ -47,7 +49,7 @@
                     Name="MailCraft"
                     Description="Mail, calendar, people, tasks and notes"
                     WorkingDirectory="INSTALLFOLDER"
-                    Icon="MailCraftIcon"
+                    Icon="MailCraft.ico"
                     Advertise="yes" />
         </File>
       </Component>

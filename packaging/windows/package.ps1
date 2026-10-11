@@ -66,6 +66,8 @@ if (-not $env:MAILCRAFT_BUILD_DATE) {
 Write-Host "MailCraft $Version ($AppId) for $Target, git $($env:MAILCRAFT_GIT_HASH), $($env:MAILCRAFT_BUILD_DATE)"
 
 if (-not $NoBuild) {
+    # Release builds must carry the icon resource (taskbar, Start menu, Explorer); build.rs fails without it.
+    $env:MAILCRAFT_REQUIRE_ICON = "1"
     Invoke-Checked "rustup" @("target", "add", $Target)
     Invoke-Checked "cargo" @("build", "--locked", "--release", "--target", $Target, "-p", "mailcraft", "-p", "mailcraft-cli")
 }

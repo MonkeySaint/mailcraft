@@ -4,18 +4,20 @@
 //!    `MAILCRAFT_BUILD_DATE` (YYYY-MM-DD, UTC). Values already in the environment win, so release builds
 //!    (`packaging/env.sh`) and builds from a source tarball without `.git` can set them; otherwise the hash
 //!    comes from `git` and the date from `SOURCE_DATE_EPOCH` or the clock. Missing values become `unknown`.
-//! 2. On Windows targets, the app icon (`assets/app-icon/mailcraft.ico`) as a Win32 resource, when a
-//!    resource compiler (`rc.exe`, `llvm-rc`, `windres`) is on PATH. Without one the build goes on with a
-//!    warning: the window icon is set at run time anyway, only Explorer's file icon is missing.
+//! 2. On Windows targets, the app icon (`assets/app-icon/mailcraft.ico`) as a Win32 resource, compiled with
+//!    `rc.exe`, `llvm-rc` or `windres` from PATH, or with the Windows SDK's `rc.exe` found under
+//!    `Windows Kits\10\bin` (it is not on PATH outside a Developer prompt, e.g. on CI runners). Explorer, the
+//!    taskbar and Start menu shortcuts take the icon from this resource.
 //!
-//! A build script must never fail the build for these extras, so every step falls back quietly.
+//! A build script must not fail a developer build for these extras, so every step falls back with a warning.
+//! Release packaging sets `MAILCRAFT_REQUIRE_ICON=1`, which turns a missing icon resource into a build error.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    for var in ["MAILCRAFT_GIT_HASH", "MAILCRAFT_BUILD_DATE", "SOURCE_DATE_EPOCH"] {
+    for var in ["MAILCRAFT_GIT_HASH", "MAILCRAFT_BUILD_DATE", "SOURCE_DATE_EPOCH", "MAILCRAFT_REQUIRE_ICON"] {
         println!("cargo:rerun-if-env-changed={var}");
     }
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
@@ -125,7 +127,9 @@ fn windows_icon(manifest_dir: &Path) {
         let res = out_dir.join("mailcraft.res");
         let res_s = res.display().to_string();
         let fo = format!("/fo{res_s}");
-        let ok = ["rc.exe", "rc", "llvm-rc"].iter().any(|tool| {
+        let mut tools: Vec<PathBuf> = ["rc.exe", "rc", "llvm-rc"].iter().map(PathBuf::from).collect();
+        tools.extend(sdk_rc());
+        let ok = tools.iter().any(|tool| {
             Command::new(tool)
                 .args(["/nologo", fo.as_str(), rc_s.as_str()])
                 .status()
@@ -148,7 +152,38 @@ fn windows_icon(manifest_dir: &Path) {
     match compiled {
         Some(path) => println!("cargo:rustc-link-arg-bins={}", path.display()),
         None => {
-            println!("cargo:warning=no resource compiler found (rc.exe/llvm-rc/windres); no icon resource")
+            let msg =
+                "no resource compiler found (rc.exe/llvm-rc/windres or the Windows SDK); no icon resource";
+            if env_value("MAILCRAFT_REQUIRE_ICON").is_some_and(|v| v != "0") {
+                println!("cargo::error={msg}");
+            } else {
+                println!("cargo:warning={msg}");
+            }
         }
     }
+}
+
+/// The newest Windows SDK `rc.exe` for the build machine's architecture, from
+/// `%ProgramFiles(x86)%\Windows Kits\10\bin\<version>\<arch>\rc.exe` (or the folder `WindowsSdkDir` names).
+fn sdk_rc() -> Option<PathBuf> {
+    let kits = std::env::var_os("WindowsSdkDir").map(PathBuf::from).or_else(|| {
+        std::env::var_os("ProgramFiles(x86)").map(|p| PathBuf::from(p).join("Windows Kits").join("10"))
+    })?;
+    let arch = match std::env::var("PROCESSOR_ARCHITECTURE").as_deref() {
+        Ok("ARM64") => "arm64",
+        Ok("x86") => "x86",
+        _ => "x64",
+    };
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(kits.join("bin"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("10.")))
+        .collect();
+    // Version folders are 10.0.NNNNN.0; compare them as numbers, newest first.
+    versions.sort_by_key(|p| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+        std::cmp::Reverse(name.split('.').map(|part| part.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>())
+    });
+    versions.into_iter().map(|v| v.join(arch).join("rc.exe")).find(|rc| rc.is_file())
 }

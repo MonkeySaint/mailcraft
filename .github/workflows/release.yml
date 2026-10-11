@@ -183,6 +183,11 @@ jobs:
           WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: ./packaging/windows/package.ps1 -Target x86_64-pc-windows-msvc -OutDir dist
+      - name: Icon resource and MSI shortcut icon
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem dist -Filter *.msi | Select-Object -First 1).FullName
+          ./packaging/windows/check-icon.ps1 -Exe target/x86_64-pc-windows-msvc/release/mailcraft.exe -Msi $msi
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64

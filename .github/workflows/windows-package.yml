@@ -1,0 +1,53 @@
+# Builds the Windows MSI on pushes that touch the Windows app or its packaging, and checks that the
+# executable carries the icon resource and the MSI's shortcut icon is readable (packaging/windows/check-icon.ps1).
+# Nothing is published; the MSI is kept as a run artifact for a few days.
+name: windows-package
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - apps/mailcraft/**
+      - assets/app-icon/**
+      - packaging/windows/**
+      - .github/workflows/windows-package.yml
+  pull_request:
+    paths:
+      - apps/mailcraft/**
+      - assets/app-icon/**
+      - packaging/windows/**
+      - .github/workflows/windows-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.99"
+
+jobs:
+  msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target x86_64-pc-windows-msvc
+          rustup default $env:RUST_TOOLCHAIN
+      - name: Build and MSI (unsigned)
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Target x86_64-pc-windows-msvc -OutDir dist
+      - name: Icon resource and MSI shortcut icon
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem dist -Filter *.msi | Select-Object -First 1).FullName
+          ./packaging/windows/check-icon.ps1 -Exe target/x86_64-pc-windows-msvc/release/mailcraft.exe -Msi $msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: dist/*.msi
+          retention-days: 5
