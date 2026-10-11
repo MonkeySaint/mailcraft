@@ -245,8 +245,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Items",
             "Home › New › New Items",
             "",
-            r#"{"kind":"appointment"|"meeting"|"contact"|"task"|"post"|"contactGroup"|"taskRequest"|"fromForm"}"#,
-            false,
+            r#"{"kind":"appointment"|"meeting"|"allDayEvent"|"recurringAppointment"|"recurringMeeting"|"recurringEvent"|"meetingWithAll"|"contact"|"task"|"post"|"contactGroup"|"taskRequest"|"fromForm", "subject"?:string, "text"?:string, "html"?:string, "folder"?:number|string (post: subject/text save the post in the mail folder)}"#,
+            true,
             always,
             new_item,
         ),
@@ -732,27 +732,170 @@ fn new_email(s: &mut Session, p: &Value) -> CmdResult {
 
 fn new_item(s: &mut Session, p: &Value) -> CmdResult {
     let kind = req_str(p, "kind")?;
-    let dialog = match kind {
-        "appointment" => "newAppointment",
-        "meeting" => "newMeeting",
-        "contact" => "newContact",
-        "task" => "newTask",
-        "post" => "newPost",
-        "contactGroup" => "newContactGroup",
-        "taskRequest" => "newTaskRequest",
-        "fromForm" => "chooseForm",
+    // New Items presets: (dialog, all day, recurrence pattern the form starts with).
+    let (dialog, all_day, recurrence) = match kind {
+        "appointment" => ("newAppointment", false, None),
+        "meeting" => ("newMeeting", false, None),
+        "allDayEvent" => ("newAppointment", true, None),
+        "recurringAppointment" => ("newAppointment", false, Some("weekly")),
+        "recurringMeeting" => ("newMeeting", false, Some("weekly")),
+        "recurringEvent" => ("newAppointment", true, Some("weekly")),
+        "meetingWithAll" => return meeting_with_all(s, p),
+        "post" => return new_post(s, p),
+        "contact" => ("newContact", false, None),
+        "task" => ("newTask", false, None),
+        "contactGroup" => ("newContactGroup", false, None),
+        "taskRequest" => ("newTaskRequest", false, None),
+        "fromForm" => ("chooseForm", false, None),
         "email" | "message" => return new_email(s, p),
         other => return Err(CmdError::Params(format!("unknown item kind `{other}`"))),
     };
-    // Only a post goes into the selected (mail) folder; appointments, contacts and tasks go to their own
-    // module's current or default folder, so no mail folder is passed for them.
-    let params = if kind == "post" {
-        json!({"kind": kind, "folder": s.selection.folder.0})
-    } else {
-        json!({"kind": kind})
-    };
+    // Appointments, contacts and tasks go to their own module's current or default folder, so no mail folder
+    // is passed for them.
+    let mut params = json!({"kind": kind});
+    if let Some(o) = params.as_object_mut() {
+        if all_day {
+            o.insert("allDay".into(), json!(true));
+        }
+        if let Some(r) = recurrence {
+            o.insert("recurrence".into(), json!(r));
+        }
+        // A start / end / subject chosen by the caller (the calendar's selected slot) carries over.
+        for key in ["start", "end", "subject"] {
+            if let Some(v) = opt_str(p, key) {
+                o.insert(key.into(), json!(v));
+            }
+        }
+    }
     open_dialog(s, dialog, params)
 }
+
+/// Lower-case address of `m` is one of the user's own.
+fn is_me(me: &[String], addr: &str) -> bool {
+    let a = addr.trim().to_lowercase();
+    !a.is_empty() && me.contains(&a)
+}
+
+/// New Items › Meeting with All: a meeting request to everybody on the selected meeting (organizer and
+/// attendees, without the user), or to the people on the selected message.
+fn meeting_with_all(s: &mut Session, p: &Value) -> CmdResult {
+    let appointment = s.target_ids(p).into_iter().find_map(|id| s.mailbox.appointments.get(&id).cloned());
+    let Some(a) = appointment else {
+        if primary_item(s, p).is_some() {
+            return s.run("mail.replyWithMeeting", p);
+        }
+        return Err(CmdError::Disabled("Select a meeting or a message first.".into()));
+    };
+    let me = my_addresses(s);
+    let mut required: Vec<String> = Vec::new();
+    let mut optional: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut add = |list: &mut Vec<String>, m: &mailcraft_model::Address| {
+        if !is_me(&me, &m.addr) && seen.insert(m.addr.trim().to_lowercase()) {
+            list.push(crate::cmd::compose::field_mailbox(m));
+        }
+    };
+    if let Some(o) = &a.organizer {
+        add(&mut required, o);
+    }
+    for at in &a.attendees {
+        match at.role {
+            mailcraft_model::calendar::AttendeeRole::Optional => add(&mut optional, &at.mailbox),
+            mailcraft_model::calendar::AttendeeRole::Required => add(&mut required, &at.mailbox),
+            // Rooms and equipment are booked by the new meeting's own Scheduling, not invited.
+            mailcraft_model::calendar::AttendeeRole::Resource => {}
+        }
+    }
+    if required.is_empty() && optional.is_empty() {
+        return Err(CmdError::Disabled("The selected item has no other attendees.".into()));
+    }
+    let params = json!({
+        "kind": "meetingWithAll",
+        "source": a.id.0,
+        "subject": a.subject,
+        "attendees": required,
+        "optional": optional,
+        "location": a.location,
+    });
+    open_dialog(s, "newMeeting", params)
+}
+
+/// The mail folder a post goes to: `params.folder`, else the selected folder; it must hold mail.
+fn post_folder(s: &Session, p: &Value) -> Result<FolderId, CmdError> {
+    let folder = param_folder(s, p)?.unwrap_or(s.selection.folder);
+    match s.mailbox.folder(folder) {
+        Some(f) if f.kind == FolderKind::Mail => Ok(folder),
+        Some(_) => Err(CmdError::Disabled("Posts can be added to mail folders only.".into())),
+        None => Err(CmdError::Disabled("No mail folder is selected.".into())),
+    }
+}
+
+/// Post in This Folder (Ctrl+Shift+S): without `subject`/`text`/`html` opens the post form for the selected
+/// mail folder; with them saves a post there: a message from the user with no recipients, stored (not
+/// sent) in the folder like any message (a synchronised folder uploads it).
+fn new_post(s: &mut Session, p: &Value) -> CmdResult {
+    let folder = post_folder(s, p)?;
+    let (subject, text, html) = (opt_str(p, "subject"), opt_str(p, "text"), opt_str(p, "html"));
+    if subject.is_none() && text.is_none() && html.is_none() {
+        let path = s.mailbox.folder_path(folder);
+        return open_dialog(s, "newPost", json!({"kind": "post", "folder": folder.0, "path": path}));
+    }
+    let subject = subject.unwrap_or("").trim();
+    if subject.chars().count() > MAX_EDIT_SUBJECT_CHARS {
+        return Err(CmdError::Params("the subject is too long".into()));
+    }
+    if text.map_or(0, str::len).saturating_add(html.map_or(0, str::len)) > MAX_EDIT_BODY_BYTES {
+        return Err(CmdError::Params("the post is too large".into()));
+    }
+    let account = s.mailbox.folder_account(folder);
+    let from = account.and_then(|a| s.mailbox.account(a)).filter(|a| !a.address.trim().is_empty()).map(|a| {
+        let name = if a.sender_name.trim().is_empty() { a.display_name.trim() } else { a.sender_name.trim() };
+        mailcraft_model::Address::new(Some(name).filter(|n| !n.is_empty()), a.address.trim())
+    });
+    let now = s.now();
+    let body = match html {
+        Some(h) => mailcraft_model::Body {
+            format: BodyFormat::Html,
+            text: Some(text.map_or_else(|| mailcraft_html::html_to_text(h), str::to_owned)),
+            html: Some(h.to_owned()),
+        },
+        None => mailcraft_model::Body {
+            format: BodyFormat::PlainText,
+            text: Some(text.unwrap_or("").to_owned()),
+            html: None,
+        },
+    };
+    let builder = mailcraft_mime::MessageBuilder {
+        from: from.clone(),
+        subject: subject.to_owned(),
+        date: Some(now),
+        ..Default::default()
+    };
+    let message_id = builder.generate_message_id(now, s.mailbox.next_id);
+    let size =
+        body.text.as_ref().map_or(0, String::len).saturating_add(body.html.as_ref().map_or(0, String::len));
+    let mut item = MailItem {
+        folder,
+        message_id: Some(message_id),
+        subject: subject.to_owned(),
+        from,
+        sent: Some(now),
+        received: now,
+        size: u64::try_from(size).unwrap_or(u64::MAX),
+        read: true,
+        body,
+        ..Default::default()
+    };
+    item.refresh_preview();
+    let id = s.mailbox.add_mail(item);
+    journal(s, &[id]);
+    Ok(json!({"id": id.0, "folder": folder.0, "post": true}))
+}
+
+/// Longest subject a post or an edited message takes.
+const MAX_EDIT_SUBJECT_CHARS: usize = 1000;
+/// Largest text (+ HTML) a post or an edited message takes.
+const MAX_EDIT_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------------------------------------
 // Delete / archive / move / copy
@@ -897,6 +1040,42 @@ fn move_to_other(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"changed": changed.len(), "ids": ids_json(&changed)}))
 }
 
+/// Setting holding the senders whose mail always goes to Other (lower-case addresses), saved with the
+/// profile when the settings store defines it.
+pub const OTHER_SENDERS_SETTING: &str = "mail.focused.otherSenders";
+
+/// Most sender overrides kept (the oldest are dropped first).
+const MAX_OTHER_SENDERS: usize = 1000;
+
+/// Senders whose mail always goes to Other (lower-case addresses).
+pub fn other_senders(s: &Session) -> Vec<String> {
+    s.settings.list(OTHER_SENDERS_SETTING)
+}
+
+/// The Focused Inbox class a sender override gives `m` (`None` = no override: the default classification
+/// applies). New mail goes through [`apply_focus_overrides`].
+pub fn focus_override(senders: &[String], m: &MailItem) -> Option<FocusClass> {
+    let from = m.from.as_ref()?.addr.trim().to_lowercase();
+    (!from.is_empty() && senders.contains(&from)).then_some(FocusClass::Other)
+}
+
+/// Applies the sender overrides (Always Move to Other) to `ids`, e.g. newly arrived mail; returns the items
+/// whose class changed (journaled).
+pub fn apply_focus_overrides(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
+    let senders = other_senders(s);
+    if senders.is_empty() {
+        return Vec::new();
+    }
+    let other: Vec<ItemId> = ids
+        .iter()
+        .copied()
+        .filter(|id| s.mailbox.mail.get(id).and_then(|m| focus_override(&senders, m)).is_some())
+        .collect();
+    set_focus_class(s, &other, FocusClass::Other)
+}
+
+/// Always Move to Other: every message from the sender in this folder goes to Other now, and
+/// the sender is remembered so later mail from them is classified Other too ([`apply_focus_overrides`]).
 fn always_move_to_other(s: &mut Session, p: &Value) -> CmdResult {
     let Some(focus) = primary_item(s, p) else {
         return Err(CmdError::Disabled("No message is selected.".into()));
@@ -905,11 +1084,11 @@ fn always_move_to_other(s: &mut Session, p: &Value) -> CmdResult {
         .mailbox
         .mail
         .get(&focus)
-        .map(|m| (m.from.as_ref().map(|a| a.addr.clone()).unwrap_or_default(), m.folder))
+        .map(|m| (m.from.as_ref().map(|a| a.addr.trim().to_lowercase()).unwrap_or_default(), m.folder))
     else {
         return Err(CmdError::Failed("message not found".into()));
     };
-    // Every message from the sender in this folder goes to Other.
+    // Every message from the sender in this folder (the Focused Inbox) goes to Other.
     let mut ids: Vec<ItemId> = vec![focus];
     if !sender.is_empty() {
         ids.extend(
@@ -918,13 +1097,22 @@ fn always_move_to_other(s: &mut Session, p: &Value) -> CmdResult {
                 .values()
                 .filter(|m| {
                     m.folder == folder
-                        && m.from.as_ref().is_some_and(|a| a.addr.eq_ignore_ascii_case(&sender))
+                        && m.from.as_ref().is_some_and(|a| a.addr.trim().eq_ignore_ascii_case(&sender))
                 })
                 .map(|m| m.id),
         );
     }
     let changed = set_focus_class(s, &ids, FocusClass::Other);
-    Ok(json!({"changed": changed.len(), "sender": sender}))
+    let mut persisted = false;
+    if !sender.is_empty() && crate::settings::def(OTHER_SENDERS_SETTING).is_some() {
+        let mut list = other_senders(s);
+        list.retain(|x| *x != sender);
+        list.push(sender.clone());
+        let excess = list.len().saturating_sub(MAX_OTHER_SENDERS);
+        list.drain(..excess);
+        persisted = s.settings.set(OTHER_SENDERS_SETTING, &json!(list)).is_ok();
+    }
+    Ok(json!({"changed": changed.len(), "sender": sender, "persisted": persisted}))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1813,15 +2001,29 @@ fn quick_print(s: &mut Session, p: &Value) -> CmdResult {
     open_dialog(s, "print", json!({"ids": ids_json(&ids), "quick": true, "style": "memo"}))
 }
 
-/// Edit Message: with `subject`/`text`/`html` saves the edits to the stored item; otherwise opens the read
-/// window in edit mode.
+/// Edit Message: with `subject`/`text`/`html` saves the edits to the stored item; otherwise opens the Edit
+/// Message window (`editMessage`: subject and text of the message, to edit and save).
 fn edit_message(s: &mut Session, p: &Value) -> CmdResult {
     let Some(focus) = primary_item(s, p) else {
         return Err(CmdError::Disabled("No message is selected.".into()));
     };
     let (subject, text, html) = (opt_str(p, "subject"), opt_str(p, "text"), opt_str(p, "html"));
     if subject.is_none() && text.is_none() && html.is_none() {
-        return open_dialog(s, "readWindow", json!({"id": focus.0, "edit": true}));
+        let Some(m) = s.mailbox.mail.get(&focus) else {
+            return Err(CmdError::Failed("message not found".into()));
+        };
+        let params = json!({
+            "id": focus.0,
+            "subject": m.subject,
+            "text": m.body_text(),
+            "html": m.body.html.is_some(),
+        });
+        return open_dialog(s, "editMessage", params);
+    }
+    if subject.is_some_and(|x| x.chars().count() > MAX_EDIT_SUBJECT_CHARS)
+        || text.map_or(0, str::len).saturating_add(html.map_or(0, str::len)) > MAX_EDIT_BODY_BYTES
+    {
+        return Err(CmdError::Params("the edited message is too large".into()));
     }
     let Some(m) = s.mailbox.mail.get_mut(&focus) else {
         return Err(CmdError::Failed("message not found".into()));
@@ -2193,6 +2395,168 @@ mod tests {
         );
         let r = always_move_conversation(&mut f.s, &Value::Null).unwrap();
         assert_eq!(r["dialog"], "alwaysMoveConversation");
+    }
+
+    /// Params of the last `name` dialog the session asked for.
+    fn last_dialog(s: &Session, name: &str) -> Value {
+        s.notices
+            .iter()
+            .rev()
+            .find_map(|n| match n {
+                Notice::OpenDialog(d, p) if d == name => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn new_items_presets() {
+        let mut f = fx();
+        let r = f.s.run("mail.newItem", &json!({"kind": "allDayEvent"})).unwrap();
+        assert_eq!(r["dialog"], "newAppointment");
+        let p = last_dialog(&f.s, "newAppointment");
+        assert_eq!(p["allDay"], true);
+        assert!(p.get("recurrence").is_none() && p.get("folder").is_none());
+        f.s.run("mail.newItem", &json!({"kind": "recurringMeeting"})).unwrap();
+        let p = last_dialog(&f.s, "newMeeting");
+        assert_eq!(p["recurrence"], "weekly");
+        assert!(p.get("allDay").is_none());
+        f.s.run("mail.newItem", &json!({"kind": "recurringEvent", "start": "2026-10-12T00:00"})).unwrap();
+        let p = last_dialog(&f.s, "newAppointment");
+        assert_eq!((p["allDay"].clone(), p["recurrence"].clone()), (json!(true), json!("weekly")));
+        assert_eq!(p["start"], "2026-10-12T00:00");
+        f.s.run("mail.newItem", &json!({"kind": "recurringAppointment"})).unwrap();
+        assert_eq!(last_dialog(&f.s, "newAppointment")["recurrence"], "weekly");
+        assert!(f.s.run("mail.newItem", &json!({"kind": "fax"})).is_err());
+        // Opening a form changes nothing, so it leaves no undo step.
+        assert!(f.s.undo.undo.is_empty());
+    }
+
+    #[test]
+    fn meeting_with_all_invites_everyone_but_me() {
+        let mut f = fx();
+        let cal = role(&f.s, FolderRole::Calendar);
+        let att = |name: &str, addr: &str, role| mailcraft_model::Attendee {
+            mailbox: Address::new(Some(name), addr),
+            role,
+            ..Default::default()
+        };
+        use mailcraft_model::calendar::AttendeeRole;
+        let id = ItemId(f.s.mailbox.alloc_id());
+        f.s.mailbox.appointments.insert(
+            id,
+            mailcraft_model::Appointment {
+                id,
+                folder: cal,
+                subject: "Budget review".into(),
+                location: "Room 4".into(),
+                organizer: Some(Address::new(Some("Dana"), "dana@example.org")),
+                attendees: vec![
+                    att("Test User", "Test.User@example.net", AttendeeRole::Required),
+                    att("Eve", "eve@example.com", AttendeeRole::Required),
+                    att("Dana", "DANA@example.org", AttendeeRole::Optional),
+                    att("Frank", "frank@example.com", AttendeeRole::Optional),
+                    att("Room 4", "room4@example.com", AttendeeRole::Resource),
+                ],
+                is_meeting: true,
+                ..Default::default()
+            },
+        );
+        f.s.selection.items = vec![id];
+        f.s.selection.focus = Some(id);
+        let r = f.s.run("mail.newItem", &json!({"kind": "meetingWithAll"})).unwrap();
+        assert_eq!(r["dialog"], "newMeeting");
+        let p = last_dialog(&f.s, "newMeeting");
+        assert_eq!(p["subject"], "Budget review");
+        assert_eq!(p["attendees"], json!(["Dana <dana@example.org>", "Eve <eve@example.com>"]));
+        assert_eq!(p["optional"], json!(["Frank <frank@example.com>"]));
+        // A selected message: the people on it (Reply with Meeting).
+        f.s.selection.items = vec![f.c];
+        f.s.selection.focus = Some(f.c);
+        f.s.notices.clear();
+        f.s.run("mail.newItem", &json!({"kind": "meetingWithAll"})).unwrap();
+        let p = last_dialog(&f.s, "newMeeting");
+        assert_eq!(p["source"], f.c.0);
+        assert!(p["attendees"].to_string().contains("alice@example.com"));
+        // Nothing selected.
+        f.s.selection.items.clear();
+        f.s.selection.focus = None;
+        assert!(matches!(
+            f.s.run("mail.newItem", &json!({"kind": "meetingWithAll"})),
+            Err(CmdError::Disabled(_))
+        ));
+    }
+
+    #[test]
+    fn post_in_this_folder_saves_a_post_in_the_mail_folder() {
+        let mut f = fx();
+        let r = f.s.run("mail.newItem", &json!({"kind": "post"})).unwrap();
+        assert_eq!(r["dialog"], "newPost");
+        assert_eq!(last_dialog(&f.s, "newPost")["folder"], f.inbox.0);
+        assert!(f.s.mailbox.notes.is_empty());
+        let before = f.s.mailbox.mail.len();
+        let r =
+            f.s.run(
+                "mail.newItem",
+                &json!({"kind": "post", "subject": " Team lunch ", "text": "Friday at noon."}),
+            )
+            .unwrap();
+        let id = ItemId(r["id"].as_u64().unwrap());
+        let m = &f.s.mailbox.mail[&id];
+        assert_eq!(m.folder, f.inbox);
+        assert_eq!(m.subject, "Team lunch");
+        assert!(m.to.is_empty() && m.cc.is_empty() && m.bcc.is_empty());
+        assert_eq!(m.from.as_ref().map(|a| a.addr.as_str()), Some("test.user@example.net"));
+        assert!(m.read && !m.is_draft && m.message_id.is_some());
+        assert_eq!(m.preview, "Friday at noon.");
+        assert_eq!(f.s.mailbox.mail.len(), before + 1);
+        assert!(f.s.mailbox.notes.is_empty(), "a post is not a note");
+        // One undo step takes it back.
+        f.s.run("app.undo", &json!({})).unwrap();
+        assert!(!f.s.mailbox.mail.contains_key(&id));
+        // HTML posts keep their text too.
+        let r = f.s.run("mail.newItem", &json!({"kind": "post", "html": "<p>Hi <b>all</b></p>"})).unwrap();
+        let m = &f.s.mailbox.mail[&ItemId(r["id"].as_u64().unwrap())];
+        assert_eq!(m.body.format, BodyFormat::Html);
+        assert!(m.body.text.as_deref().unwrap_or("").contains("Hi all"));
+        // Only mail folders take posts.
+        let cal = role(&f.s, FolderRole::Calendar);
+        assert!(f.s.run("mail.newItem", &json!({"kind": "post", "folder": cal.0})).is_err());
+        f.s.selection.folder = cal;
+        assert!(f.s.run("mail.newItem", &json!({"kind": "post", "text": "x"})).is_err());
+        assert!(
+            f.s.run(
+                "mail.newItem",
+                &json!({"kind": "post", "folder": f.inbox.0, "text": "x".repeat(MAX_EDIT_BODY_BYTES + 1)})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn other_sender_override() {
+        let mut f = fx();
+        let senders = vec!["alice@example.com".to_owned()];
+        assert_eq!(focus_override(&senders, &f.s.mailbox.mail[&f.c]), Some(FocusClass::Other));
+        assert_eq!(focus_override(&senders, &f.s.mailbox.mail[&f.a]), None);
+        assert_eq!(focus_override(&[], &f.s.mailbox.mail[&f.c]), None);
+        f.s.selection.items = vec![f.c];
+        f.s.selection.focus = Some(f.c);
+        let r = f.s.run("mail.alwaysMoveToOther", &json!({})).unwrap();
+        let defined = crate::settings::def(OTHER_SENDERS_SETTING).is_some();
+        assert_eq!(r["persisted"], defined);
+        // Later mail from the sender: classified Other when the override is kept.
+        let later =
+            f.s.mailbox.add_mail(msg(f.inbox, "Lunch again", "Alice@Example.com", "Tuesday?", at(20736, 9)));
+        let changed = apply_focus_overrides(&mut f.s, &[later, f.a]);
+        if defined {
+            assert_eq!(other_senders(&f.s), senders);
+            assert_eq!(changed, vec![later]);
+            assert_eq!(f.s.mailbox.mail[&later].focus, FocusClass::Other);
+        } else {
+            assert!(changed.is_empty());
+        }
+        assert_eq!(f.s.mailbox.mail[&f.a].focus, FocusClass::Focused);
     }
 
     #[test]
@@ -2627,7 +2991,13 @@ mod tests {
     #[test]
     fn edit_message_saves() {
         let mut f = fx();
-        assert_eq!(edit_message(&mut f.s, &Value::Null).unwrap()["dialog"], "readWindow");
+        assert_eq!(edit_message(&mut f.s, &Value::Null).unwrap()["dialog"], "editMessage");
+        let p = last_dialog(&f.s, "editMessage");
+        assert_eq!(p["id"], f.a.0);
+        assert_eq!(p["subject"], "Invoice");
+        assert_eq!(p["text"], "Invoice attached.");
+        assert_eq!(p["html"], false);
+        assert!(edit_message(&mut f.s, &json!({"subject": "x".repeat(MAX_EDIT_SUBJECT_CHARS + 1)})).is_err());
         edit_message(&mut f.s, &json!({"subject": "Invoice 7", "text": "Paid."})).unwrap();
         let m = &f.s.mailbox.mail[&f.a];
         assert_eq!(m.subject, "Invoice 7");

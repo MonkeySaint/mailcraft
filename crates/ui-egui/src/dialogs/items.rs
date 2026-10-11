@@ -1,7 +1,9 @@
-//! Item windows shown as dialogs until the modules area gives them their own windows: appointment and
-//! meeting, contact and contact group, task, note, plus Go to Date, Time Zone, Add Calendar, contact card /
-//! chooser, Forward Contact and Choose Form. (Mail Merge and the Task Request window are the modules area's
-//! own dialogs.)
+//! Item windows shown as dialogs until the modules area gives them their own windows: appointment, event and
+//! meeting (with the New Items presets: All Day Event, Recurring Appointment / Meeting / Event, Meeting with
+//! All), contact and contact group, task, note, post (Post in This Folder), Edit Message, plus Go to Date,
+//! Time Zone, Add Calendar, contact card / chooser, Forward Contact and Choose Form. (Mail Merge and the Task
+//! Request window are the modules area's own dialogs.) `closeAllItems` (Close All Items) closes the read
+//! windows and these item windows.
 
 use egui::{Context, RichText};
 use serde_json::{Value, json};
@@ -17,7 +19,10 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "contact" | "newContact" => contact(ctx, app, d),
         "contactGroup" | "newContactGroup" => contact_group(ctx, app, d),
         "task" | "newTask" => task(ctx, app, d),
-        "note" | "newPost" => note(ctx, app, d),
+        "note" => note(ctx, app, d),
+        "newPost" => post(ctx, app, d),
+        "editMessage" => edit_message(ctx, app, d),
+        "closeAllItems" => close_item_windows(app),
         "goToDate" => run_form(
             ctx,
             app,
@@ -113,6 +118,11 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                     combo(&[
                         "appointment",
                         "meeting",
+                        "allDayEvent",
+                        "recurringAppointment",
+                        "recurringMeeting",
+                        "recurringEvent",
+                        "post",
                         "contact",
                         "task",
                         "contactGroup",
@@ -151,19 +161,101 @@ fn split_stamp(s: &str) -> (String, String) {
 
 const SHOW_AS: [&str; 5] = ["busy", "free", "tentative", "workingElsewhere", "outOfOffice"];
 
+/// Recurrence patterns the New Items forms offer ("none" = a single occurrence).
+const RECURRENCE: [&str; 6] = ["none", "daily", "weekdays", "weekly", "monthly", "yearly"];
+
+/// RFC 5545 RRULE for a recurrence pattern ending after `count` occurrences (0 = no end date); `None` for a
+/// single occurrence or an unknown pattern. Weekly, monthly and yearly repeat on the start's day.
+fn rrule(pattern: &str, count: u64) -> Option<String> {
+    let base = match pattern {
+        "daily" => "FREQ=DAILY",
+        "weekdays" => "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        "weekly" => "FREQ=WEEKLY",
+        "monthly" => "FREQ=MONTHLY",
+        "yearly" => "FREQ=YEARLY",
+        _ => return None,
+    };
+    Some(if count > 0 { format!("{base};COUNT={}", count.min(MAX_OCCURRENCES)) } else { base.to_owned() })
+}
+
+/// Most occurrences the "End after" box takes.
+const MAX_OCCURRENCES: u64 = 999;
+
+/// People typed into a To / Required / Optional box: entries separated by ';', or by ',' after an address
+/// (so "Rivera, Alice <alice@example.com>" stays whole); quoted names are kept intact.
+fn split_people(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut angle) = (false, false);
+    for ch in text.chars() {
+        match ch {
+            '"' if !angle => quoted = !quoted,
+            '<' if !quoted => angle = true,
+            '>' if !quoted => angle = false,
+            _ => {}
+        }
+        let split = !quoted && !angle && (ch == ';' || (ch == ',' && cur.contains('@')));
+        if split {
+            push_person(&mut out, &cur);
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    push_person(&mut out, &cur);
+    out
+}
+
+/// Adds one entry of a people list, unless it is only spaces and stray commas.
+fn push_person(out: &mut Vec<String>, entry: &str) {
+    let t = entry.trim().trim_matches(',').trim();
+    if !t.is_empty() {
+        out.push(t.to_owned());
+    }
+}
+
+/// "HH:MM" plus `minutes`, kept within the day; `None` when `t` is not a time.
+fn later(t: &str, minutes: u32) -> Option<String> {
+    let (h, m) = t.trim().split_once(':')?;
+    let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().get(..2).unwrap_or(m.trim()).parse().ok()?);
+    if h > 23 || m > 59 {
+        return None;
+    }
+    let total = (h * 60 + m).saturating_add(minutes).min(23 * 60 + 59);
+    Some(format!("{:02}:{:02}", total / 60, total % 60))
+}
+
+/// A people list from the dialog params: `key` as text, else the `list` array joined with "; ".
+fn people_param(d: &Dlg<'_>, key: &str, list: &str) -> String {
+    let text = d.str(key);
+    if !text.is_empty() {
+        return text;
+    }
+    d.arr(list).iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")
+}
+
 fn appointment(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let meeting = d.name == "newMeeting";
     let id = d.u64("id").filter(|i| app.s.mailbox.appointments.contains_key(&ItemId(*i)));
     let existing = id.and_then(|i| app.s.mailbox.appointments.get(&ItemId(i))).cloned();
+    // New Items presets: All Day Event / Recurring Event start as all-day items, the Recurring ones weekly.
+    let all_day = existing.as_ref().map_or(d.bool("allDay"), |a| a.all_day);
+    let recurrence = match d.str("recurrence").as_str() {
+        r if RECURRENCE.contains(&r) => r.to_owned(),
+        _ => "none".to_owned(),
+    };
     let (sd, st) = match &existing {
         Some(a) => stamp(app, a.start.unix),
         None if !d.str("start").is_empty() => split_stamp(&d.str("start")),
         None => (common::today(app), "09:00".into()),
     };
     let (ed, et) = match &existing {
+        // An all-day item ends at midnight after its last day; the form shows that last day.
+        Some(a) if a.all_day => stamp(app, a.end.unix.saturating_sub(1).max(a.start.unix)),
         Some(a) => stamp(app, a.end.unix),
         None if !d.str("end").is_empty() => split_stamp(&d.str("end")),
-        None => (sd.clone(), "09:30".into()),
+        // A start without an end: half an hour from the start.
+        None => (sd.clone(), later(&st, 30).unwrap_or_else(|| "09:30".into())),
     };
     let mut fields = Vec::new();
     if meeting {
@@ -178,45 +270,72 @@ fn appointment(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         f("endDate", "End date:", Kind::Text),
         f("endTime", "End time:", Kind::Text),
         f("allDay", "All day event", Kind::Check),
+    ]);
+    if existing.is_none() {
+        fields.push(f("recurrence", "Recurrence:", combo(&RECURRENCE)));
+        fields.push(f(
+            "occurrences",
+            "End after (occurrences, 0 = no end date):",
+            Kind::Num { min: 0.0, max: MAX_OCCURRENCES as f64 },
+        ));
+    }
+    fields.extend([
         f("showAs", "Show As:", combo(&SHOW_AS)),
         f("reminder", "Reminder (minutes, 0 = none):", Kind::Num { min: 0.0, max: 20_160.0 }),
         f("private", "Private", Kind::Check),
         f("body", "Notes:", Kind::Multi),
     ]);
-    let title = if meeting {
-        "Meeting"
-    } else if existing.is_some() {
-        "Appointment"
-    } else {
-        "New Appointment"
+    let title = match (meeting, existing.is_some(), all_day, recurrence != "none") {
+        (true, _, _, true) => "Recurring Meeting",
+        (true, _, _, false) => "Meeting",
+        (false, true, _, _) => "Appointment",
+        (false, false, true, true) => "Recurring Event",
+        (false, false, true, false) => "Event",
+        (false, false, false, true) => "Recurring Appointment",
+        (false, false, false, false) => "New Appointment",
     };
     let mut form = Form::new(title, fields)
         .init("startDate", json!(sd))
-        .init("startTime", json!(st))
+        .init("startTime", json!(if all_day && existing.is_none() { String::new() } else { st }))
         .init("endDate", json!(ed))
-        .init("endTime", json!(et))
-        .init("reminder", json!(d.u64("reminderMin").unwrap_or(15)))
-        .init("to", json!(d.str("to")))
+        .init("endTime", json!(if all_day && existing.is_none() { String::new() } else { et }))
+        .init("allDay", json!(all_day))
+        .init("recurrence", json!(recurrence))
+        .init("occurrences", json!(0))
+        // All-day events show as free, like a birthday or a holiday; appointments as busy.
+        .init("showAs", json!(if all_day { "free" } else { "busy" }))
+        .init("reminder", json!(d.u64("reminderMin").unwrap_or(if all_day { 0 } else { 15 })))
+        .init("to", json!(people_param(d, "to", "attendees")))
+        .init("optional", json!(people_param(d, "optional", "optional")))
         .init("subject", json!(d.str("subject")))
+        .init("location", json!(d.str("location")))
+        .init("body", json!(d.str("body")))
         .ok(if meeting { "Send" } else { "Save & Close" })
         .width(520.0);
     if let Some(a) = &existing {
         form = form
             .init("subject", json!(a.subject))
             .init("location", json!(a.location))
-            .init("allDay", json!(a.all_day))
             .init("reminder", json!(a.reminder_min.unwrap_or(0)))
             .init("private", json!(a.private))
             .init("body", json!(a.body));
     }
     let folder = d.u64("folder");
     run_form(ctx, app, d, form, move |app, v| {
+        let all_day = v.b("allDay");
+        let time = |key: &str, default: &str| {
+            let t = v.s(key);
+            if all_day || t.is_empty() { default.to_owned() } else { t }
+        };
+        let start_date = v.s("startDate");
+        let end_date = if v.s("endDate").is_empty() { start_date.clone() } else { v.s("endDate") };
         let mut p = json!({
             "subject": v.s("subject"),
             "location": v.s("location"),
-            "start": format!("{}T{}", v.s("startDate"), if v.s("startTime").is_empty() { "00:00".into() } else { v.s("startTime") }),
-            "end": format!("{}T{}", v.s("endDate"), if v.s("endTime").is_empty() { "00:00".into() } else { v.s("endTime") }),
-            "allDay": v.b("allDay"),
+            "start": format!("{start_date}T{}", time("startTime", "00:00")),
+            // All day: the end date is the last day of the event (inclusive).
+            "end": format!("{end_date}T{}", time("endTime", if all_day { "23:59" } else { "00:00" })),
+            "allDay": all_day,
             "showAs": if v.s("showAs").is_empty() { "busy".to_owned() } else { v.s("showAs") },
             "reminderMin": if v.n("reminder") > 0.0 { json!(v.n("reminder") as u64) } else { Value::Null },
             "private": v.b("private"),
@@ -227,8 +346,13 @@ fn appointment(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 o.insert("folder".into(), json!(fid));
             }
             if meeting {
-                o.insert("attendees".into(), json!(common::split_list(&v.s("to"))));
-                o.insert("optional".into(), json!(common::split_list(&v.s("optional"))));
+                o.insert("attendees".into(), json!(split_people(&v.s("to"))));
+                o.insert("optional".into(), json!(split_people(&v.s("optional"))));
+            }
+            if id.is_none()
+                && let Some(rule) = rrule(&v.s("recurrence"), v.n("occurrences").max(0.0) as u64)
+            {
+                o.insert("recurrence".into(), json!(rule));
             }
             if let Some(i) = id {
                 o.remove("folder");
@@ -244,6 +368,93 @@ fn appointment(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         };
         cmd(app, id_cmd, p).map(|_| None)
     })
+}
+
+/// Post in This Folder: a subject and text saved as a post in the mail folder (`mail.newItem` kind post).
+fn post(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let folder = d.u64("folder");
+    let path = d.str("path");
+    let mut fields = Vec::new();
+    if !path.is_empty() {
+        fields.push(f("n", "", Kind::Note(format!("Posted to: {path}"))));
+    }
+    fields.extend([f("subject", "Subject:", Kind::Text), f("body", "Message:", Kind::Multi)]);
+    let form = Form::new("New Post", fields).init("subject", json!(d.str("subject"))).ok("Post").width(520.0);
+    run_form(ctx, app, d, form, move |app, v| {
+        let text = v.0.get("body").and_then(Value::as_str).unwrap_or_default().to_owned();
+        if v.s("subject").is_empty() && text.trim().is_empty() {
+            return Err("Enter a subject or a message.".into());
+        }
+        let mut p = json!({"kind": "post", "subject": v.s("subject"), "text": text});
+        if let (Some(fid), Some(o)) = (folder, p.as_object_mut()) {
+            o.insert("folder".into(), json!(fid));
+        }
+        cmd(app, "mail.newItem", p).map(|_| None)
+    })
+}
+
+/// Edit Message: the subject and text of a received message, saved back to the stored item.
+fn edit_message(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let Some(id) = d.u64("id").filter(|i| app.s.mailbox.mail.contains_key(&ItemId(*i))) else {
+        return Out::Close;
+    };
+    let (subject, text) = (d.str("subject"), d.str("text"));
+    let mut fields = vec![f("subject", "Subject:", Kind::Text), f("body", "Message:", Kind::Multi)];
+    if d.bool("html") {
+        fields.push(f(
+            "n",
+            "",
+            Kind::Note("Saving changed text replaces the message's formatting with plain paragraphs.".into()),
+        ));
+    }
+    let form = Form::new("Edit Message", fields)
+        .init("subject", json!(subject))
+        .init("body", json!(text))
+        .ok("Save")
+        .width(560.0);
+    run_form(ctx, app, d, form, move |app, v| {
+        let body = v.0.get("body").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut p = json!({"ids": [id]});
+        if let Some(o) = p.as_object_mut() {
+            if v.s("subject") != subject.trim() {
+                o.insert("subject".into(), json!(v.s("subject")));
+            }
+            // Untouched text keeps the message's own body (and its formatting).
+            if body.trim() != text.trim() {
+                o.insert("text".into(), json!(body));
+            }
+            if o.len() == 1 {
+                return Ok(None);
+            }
+        }
+        cmd(app, "mail.editMessage", p).map(|_| None)
+    })
+}
+
+/// Item windows Close All Items closes (besides the read windows).
+const ITEM_WINDOWS: [&str; 15] = [
+    "appointment",
+    "newAppointment",
+    "newMeeting",
+    "contact",
+    "newContact",
+    "contactGroup",
+    "newContactGroup",
+    "task",
+    "newTask",
+    "note",
+    "newPost",
+    "editMessage",
+    "contactCard",
+    "chooseContact",
+    "forwardContact",
+];
+
+/// Close All Items (`app.closeAllItems` asks for it): closes the read windows and the item windows here.
+fn close_item_windows(app: &mut App) -> Out {
+    app.ui.read_windows.clear();
+    app.ui.dialogs.retain(|(name, _)| !ITEM_WINDOWS.contains(&name.as_str()));
+    Out::Close
 }
 
 fn contact(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -629,6 +840,178 @@ fn forward_contact(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 
 #[cfg(test)]
 mod tests {
+    use crate::App;
+    use egui::accesskit::Role;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use mailcraft_engine::sample::sample_session;
+    use mailcraft_model::ItemId;
+    use serde_json::json;
+
+    fn harness(app: App) -> Harness<'static, App> {
+        let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+            |ui, app: &mut App| {
+                let ctx = ui.ctx().clone();
+                crate::dialogs::dialogs(&ctx, app);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h
+    }
+
+    fn names(h: &Harness<'_, App>) -> Vec<String> {
+        h.state().ui.dialogs.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// Types `text` into the `n`th text box of the open form.
+    fn type_into(h: &mut Harness<'_, App>, n: usize, text: &str) {
+        h.query_all_by_role(Role::TextInput).nth(n).unwrap().focus();
+        h.run_steps(3);
+        h.query_all_by_role(Role::TextInput).nth(n).unwrap().type_text(text);
+        h.run_steps(3);
+    }
+
+    #[test]
+    fn all_day_event_preset_saves_a_whole_day() {
+        let mut app = App::new(sample_session());
+        let before: Vec<ItemId> = app.s.mailbox.appointments.keys().copied().collect();
+        app.run("mail.newItem", json!({"kind": "allDayEvent", "start": "2026-10-14T00:00"})).unwrap();
+        let mut h = harness(app);
+        assert_eq!(names(&h), ["newAppointment"]);
+        type_into(&mut h, 0, "Holiday");
+        h.get_by_label("Save & Close").click();
+        h.run_steps(3);
+        assert!(names(&h).is_empty(), "{:?}", names(&h));
+        let s = &h.state().s;
+        let a = s.mailbox.appointments.values().find(|a| !before.contains(&a.id)).expect("saved");
+        assert_eq!(a.subject, "Holiday");
+        assert!(a.all_day);
+        assert_eq!(a.end.unix - a.start.unix, 86_400, "one whole day");
+        assert!(a.recurrence.is_none());
+    }
+
+    #[test]
+    fn recurring_meeting_preset_saves_a_weekly_series_with_attendees() {
+        let mut app = App::new(sample_session());
+        let before: Vec<ItemId> = app.s.mailbox.appointments.keys().copied().collect();
+        app.run("mail.newItem", json!({"kind": "recurringMeeting", "start": "2026-10-14T10:00"})).unwrap();
+        let mut h = harness(app);
+        assert_eq!(names(&h), ["newMeeting"]);
+        type_into(&mut h, 0, "Rivera, Alice <alice@example.com>; bob@example.org");
+        type_into(&mut h, 2, "Standup");
+        h.get_by_label("Send").click();
+        h.run_steps(3);
+        let s = &h.state().s;
+        let a = s.mailbox.appointments.values().find(|a| !before.contains(&a.id)).expect("saved");
+        assert_eq!(a.subject, "Standup");
+        assert!(a.recurrence.as_ref().is_some_and(|r| r.rrule.starts_with("FREQ=WEEKLY")));
+        let who: Vec<&str> = a.attendees.iter().map(|x| x.mailbox.addr.as_str()).collect();
+        assert!(who.contains(&"alice@example.com") && who.contains(&"bob@example.org"), "{who:?}");
+    }
+
+    #[test]
+    fn post_in_this_folder_saves_a_post_not_a_note() {
+        let mut app = App::new(sample_session());
+        let inbox = app.s.selection.folder;
+        let notes = app.s.mailbox.notes.len();
+        let mail = app.s.mailbox.mail.len();
+        app.run("mail.newItem", json!({"kind": "post"})).unwrap();
+        let mut h = harness(app);
+        assert_eq!(names(&h), ["newPost"]);
+        type_into(&mut h, 0, "Team lunch");
+        h.get_by_role(Role::MultilineTextInput).focus();
+        h.run_steps(3);
+        h.get_by_role(Role::MultilineTextInput).type_text("Friday at noon.");
+        h.run_steps(3);
+        h.get_by_label("Post").click();
+        h.run_steps(3);
+        assert!(names(&h).is_empty(), "{:?}", names(&h));
+        let s = &h.state().s;
+        assert_eq!(s.mailbox.notes.len(), notes);
+        assert_eq!(s.mailbox.mail.len(), mail + 1);
+        let m = s.mailbox.mail.values().find(|m| m.subject == "Team lunch").expect("post saved");
+        assert_eq!(m.folder, inbox);
+        assert!(m.to.is_empty() && !m.is_draft);
+        assert_eq!(m.body.text.as_deref(), Some("Friday at noon."));
+    }
+
+    #[test]
+    fn edit_message_saves_the_new_subject() {
+        let mut app = App::new(sample_session());
+        let folder = app.s.selection.folder;
+        let id = app.s.mailbox.items_in(folder).first().map(|m| m.id).unwrap();
+        let body = app.s.mailbox.mail[&id].body.clone();
+        app.run("nav.selectItem", json!({"id": id.0})).unwrap();
+        app.run("mail.editMessage", json!({})).unwrap();
+        let mut h = harness(app);
+        assert_eq!(names(&h), ["editMessage"]);
+        type_into(&mut h, 0, " (edited)");
+        h.get_by_label("Save").click();
+        h.run_steps(3);
+        assert!(names(&h).is_empty(), "{:?}", names(&h));
+        let m = &h.state().s.mailbox.mail[&id];
+        assert!(m.subject.contains("(edited)"), "{}", m.subject);
+        // The text was not touched: the body (and its formatting) stays as it was.
+        assert_eq!(m.body, body);
+    }
+
+    #[test]
+    fn close_all_items_closes_read_and_item_windows() {
+        let mut app = App::new(sample_session());
+        let folder = app.s.selection.folder;
+        let id = app.s.mailbox.items_in(folder).first().map(|m| m.id.0).unwrap();
+        crate::dialogs::open(&mut app, "readWindow", json!({"id": id}));
+        app.run("mail.newItem", json!({"kind": "post"})).unwrap();
+        app.run("mail.newItem", json!({"kind": "contact"})).unwrap();
+        let mut h = harness(app);
+        assert_eq!(names(&h), ["newPost", "newContact"]);
+        assert_eq!(h.state().ui.read_windows, [id]);
+        h.state_mut().run("app.closeAllItems", json!({}));
+        h.run_steps(3);
+        assert!(names(&h).is_empty(), "{:?}", names(&h));
+        assert!(h.state().ui.read_windows.is_empty());
+    }
+    #[test]
+    fn recurrence_patterns_become_rrules() {
+        assert_eq!(super::rrule("none", 5), None);
+        assert_eq!(super::rrule("bogus", 0), None);
+        assert_eq!(super::rrule("weekly", 0).as_deref(), Some("FREQ=WEEKLY"));
+        assert_eq!(
+            super::rrule("weekdays", 10).as_deref(),
+            Some("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10")
+        );
+        assert_eq!(super::rrule("yearly", 1_000_000).as_deref(), Some("FREQ=YEARLY;COUNT=999"));
+        // The calendar takes every rule the form makes.
+        let mut s = mailcraft_engine::sample::sample_session();
+        for p in super::RECURRENCE.iter().skip(1) {
+            let r = super::rrule(p, 3).unwrap();
+            let params = serde_json::json!({"subject": p, "start": "2026-10-12T09:00", "recurrence": r});
+            assert!(s.run("calendar.newAppointment", &params).is_ok(), "{r}");
+        }
+    }
+
+    #[test]
+    fn people_lists_split_between_entries_only() {
+        assert_eq!(
+            super::split_people("Rivera, Alice <alice@example.com>; bob@example.org, carol@example.net"),
+            vec!["Rivera, Alice <alice@example.com>", "bob@example.org", "carol@example.net"]
+        );
+        assert_eq!(
+            super::split_people("\"Lee; Dana\" <dana@example.org>, Eve <eve@example.com>;;"),
+            vec!["\"Lee; Dana\" <dana@example.org>", "Eve <eve@example.com>"]
+        );
+        assert!(super::split_people(" ; , ").is_empty());
+        assert_eq!(super::later("10:00", 30).as_deref(), Some("10:30"));
+        assert_eq!(super::later("23:45", 30).as_deref(), Some("23:59"));
+        assert_eq!(super::later("noon", 30), None);
+        assert_eq!(super::later("25:00", 30), None);
+        assert_eq!(
+            super::split_people("\"unterminated <x@example.com"),
+            vec!["\"unterminated <x@example.com"]
+        );
+    }
+
     #[test]
     fn add_calendar_offers_only_supported_sources() {
         assert_eq!(super::add_calendar_source("file"), "file");

@@ -20,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Close All Items",
             location: "View › Window",
             shortcut: "",
-            params: r#"{"save"?: bool}  (absent: unsaved drafts stay open and a save prompt is requested)"#,
+            params: r#"{"save"?: bool}  (absent: unsaved drafts stay open and a save prompt is requested; read and item windows close)"#,
             mutates: true,
             enabled: always,
             run: close_all_items,
@@ -338,11 +338,19 @@ fn save_compose(s: &mut Session, cid: u64) -> Option<ItemId> {
     Some(id)
 }
 
+/// Dialog request that asks the UI to close its read windows and item windows (Close All Items); compose
+/// windows are closed here.
+pub const CLOSE_ITEM_WINDOWS: &str = "closeAllItems";
+
+/// Close All Items: closes every compose window (asking about unsaved ones unless `save` says what to do) and
+/// asks the UI to close its read and item windows ([`CLOSE_ITEM_WINDOWS`]).
 fn close_all_items(s: &mut Session, p: &Value) -> CmdResult {
     let save = match p.get("save").filter(|v| !v.is_null()) {
         None => None,
         Some(v) => Some(v.as_bool().ok_or_else(|| CmdError::Params("`save` must be true or false".into()))?),
     };
+    // Read windows and item windows hold nothing unsaved that the engine knows of: they close right away.
+    s.notify(crate::Notice::OpenDialog(CLOSE_ITEM_WINDOWS.into(), json!({})));
     let dirty: Vec<u64> = s.composes.values().filter(|c| c.dirty).map(|c| c.id).collect();
     let mut saved = Vec::new();
     match save {
@@ -444,6 +452,12 @@ mod tests {
         });
         let r = s.run("app.closeAllItems", &json!({})).unwrap();
         assert_eq!(r["dialog"], "saveChanges");
+        // The UI is asked to close read and item windows as well.
+        assert!(
+            s.notices
+                .iter()
+                .any(|n| matches!(n, crate::Notice::OpenDialog(d, _) if d == super::CLOSE_ITEM_WINDOWS))
+        );
         assert!(!s.composes.contains_key(&clean));
         assert!(s.composes.contains_key(&dirty));
         let drafts_before = s.mailbox.mail.values().filter(|m| m.is_draft).count();

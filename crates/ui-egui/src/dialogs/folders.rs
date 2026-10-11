@@ -328,6 +328,11 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         show_total: common::pref(ctx, &format!("{key}showTotal")).and_then(|v| v.as_bool()).unwrap_or(false),
         ..Default::default()
     };
+    let kind = d.str("kind");
+    let is_mail = kind.is_empty() || kind == "mail";
+    let kind_type = d.str("type");
+    let query = d.str("query");
+    let calendar = d.get("calendar").map(calendar_rows).unwrap_or_default();
     with_state(ctx, app, uid, init, |st, app| {
         let title = format!("{} Properties", d.str("name"));
         window(ctx, app, d, &title, 420.0, |ui, app| {
@@ -351,25 +356,39 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     );
                     ui.end_row();
                     ui.label("Type:");
-                    ui.label("Folder containing Mail and Post Items");
+                    ui.label(if kind_type.is_empty() { "Mail and post items" } else { kind_type.as_str() });
                     ui.end_row();
                     ui.label("Location:");
                     ui.label(d.str("path"));
                     ui.end_row();
+                    if !query.is_empty() {
+                        ui.label("Search:");
+                        ui.label(&query);
+                        ui.end_row();
+                    }
                     ui.label("Description:");
                     ui.add(
                         egui::TextEdit::multiline(&mut st.description).desired_rows(3).desired_width(240.0),
                     );
                     ui.end_row();
-                    ui.label("Unread items:");
-                    ui.label(d.u64("unread").unwrap_or(0).to_string());
-                    ui.end_row();
+                    if is_mail {
+                        ui.label("Unread items:");
+                        ui.label(d.u64("unread").unwrap_or(0).to_string());
+                        ui.end_row();
+                    }
                     ui.label("Total items:");
                     ui.label(d.u64("total").unwrap_or(0).to_string());
                     ui.end_row();
+                    for (label, value) in &calendar {
+                        ui.label(*label);
+                        ui.label(value);
+                        ui.end_row();
+                    }
                 });
-                ui.radio_value(&mut st.show_total, false, "Show number of unread items");
-                ui.radio_value(&mut st.show_total, true, "Show total number of items");
+                if is_mail {
+                    ui.radio_value(&mut st.show_total, false, "Show number of unread items");
+                    ui.radio_value(&mut st.show_total, true, "Show total number of items");
+                }
                 if btn(ui, "Folder Size...") {
                     st.show_size = !st.show_size;
                 }
@@ -406,6 +425,35 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             }
         })
     })
+}
+
+/// Calendar Properties rows (label, value) from the `calendar` part of the folderProperties params.
+fn calendar_rows(c: &Value) -> Vec<(&'static str, String)> {
+    let text = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut rows = vec![("Color:", text("color"))];
+    let source = match text("source").as_str() {
+        "internet" => "Internet calendar subscription",
+        "file" => "Imported from an iCalendar file",
+        _ => "Items created in MailCraft",
+    };
+    rows.push(("Source:", source.to_owned()));
+    if c.get("readOnly").and_then(Value::as_bool) == Some(true) {
+        rows.push(("Permissions:", "Read-only".to_owned()));
+    }
+    let url = text("url");
+    if !url.is_empty() {
+        rows.push(("Address:", url));
+        if let Some(m) = c.get("refreshMin").and_then(Value::as_u64).filter(|m| *m > 0) {
+            rows.push(("Updates:", format!("Every {m} minutes")));
+        }
+        let err = text("lastError");
+        if !err.is_empty() {
+            rows.push(("Last update:", format!("Failed: {err}")));
+        } else if c.get("lastUpdate").and_then(Value::as_i64).is_none() {
+            rows.push(("Last update:", "Not downloaded yet".to_owned()));
+        }
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -523,6 +571,8 @@ fn new_search_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 #[derive(Clone, Default)]
 struct RecoverState {
     picked: Vec<u64>,
+    /// Items already recovered (no longer listed).
+    recovered: Vec<u64>,
     done: String,
 }
 
@@ -536,17 +586,21 @@ fn recover(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         |_: &App| RecoverState::default(),
         |st, app| {
             window(ctx, app, d, "Recover Deleted Items", 560.0, |ui, app| {
-                if items.is_empty() {
+                let id_of = |it: &Value| it.get("id").and_then(Value::as_u64);
+                let left: Vec<&Value> =
+                    items.iter().filter(|it| id_of(it).is_some_and(|i| !st.recovered.contains(&i))).collect();
+                if left.is_empty() {
                     muted(ui, app, "There are no items to recover.");
                 }
                 egui::ScrollArea::vertical().id_salt(("rec", uid)).max_height(260.0).show(ui, |ui| {
-                    egui::Grid::new(("recg", uid)).num_columns(4).striped(true).show(ui, |ui| {
+                    egui::Grid::new(("recg", uid)).num_columns(5).striped(true).show(ui, |ui| {
                         ui.label("");
                         ui.label(RichText::new("Subject").strong());
+                        ui.label(RichText::new("Type").strong());
                         ui.label(RichText::new("From").strong());
                         ui.label(RichText::new("Folder").strong());
                         ui.end_row();
-                        for it in &items {
+                        for it in &left {
                             let Some(id) = it.get("id").and_then(Value::as_u64) else { continue };
                             let mut on = st.picked.contains(&id);
                             let subject = it.get("subject").and_then(Value::as_str).unwrap_or_default();
@@ -558,6 +612,7 @@ fn recover(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                 }
                             }
                             ui.label(if subject.is_empty() { "(no subject)" } else { subject });
+                            ui.label(kind_label(it.get("kind").and_then(Value::as_str).unwrap_or("mail")));
                             ui.label(it.get("from").and_then(Value::as_str).unwrap_or_default());
                             ui.label(it.get("folder").and_then(Value::as_str).unwrap_or_default());
                             ui.end_row();
@@ -578,18 +633,35 @@ fn recover(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                 "Recovered {} item(s) to Deleted Items.",
                                 v.get("restored").and_then(Value::as_u64).unwrap_or(0)
                             );
+                            st.recovered.extend(
+                                v.get("recovered")
+                                    .and_then(Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(Value::as_u64),
+                            );
                             st.picked.clear();
                         }
                     }
-                    if btn(ui, "Select All") {
-                        st.picked =
-                            items.iter().filter_map(|i| i.get("id").and_then(Value::as_u64)).collect();
+                    if btn_en(ui, !left.is_empty(), "Select All") {
+                        st.picked = left.iter().filter_map(|it| id_of(it)).collect();
                     }
                     Out::Keep
                 })
             })
         },
     )
+}
+
+/// Item type shown in the Recover Deleted Items list.
+fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "appointment" => "Appointment",
+        "contact" => "Contact",
+        "task" => "Task",
+        "note" => "Note",
+        _ => "Message",
+    }
 }
 
 #[derive(Clone, Default)]

@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 
 use super::util::{opt_bool, opt_str};
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Selection, Session, always};
-use mailcraft_model::{Folder, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox, Rule};
+use mailcraft_model::{
+    Appointment, Contact, Folder, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox, Note, Rule,
+    Task,
+};
 
 #[allow(clippy::too_many_arguments)]
 fn spec(
@@ -34,7 +37,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add to Favorites",
             "Folder › Favorites",
             "",
-            r#"{"folder"?:string}"#,
+            r#"{"folder"?:string} | {"account":number} (account root: its Inbox)"#,
             true,
             has_folder,
             add_favorite,
@@ -629,32 +632,159 @@ fn empty_deleted(s: &mut Session, _p: &Value) -> CmdResult {
     Ok(json!({ "items": items, "folders": subs.len() }))
 }
 
-/// Items that are gone from the mailbox but still held by an undo snapshot (newest snapshot first).
-fn recoverable(s: &Session) -> Vec<MailItem> {
+/// An item of any kind that is gone from the mailbox but still held by an undo snapshot.
+#[derive(Clone)]
+enum Lost {
+    Mail(Box<MailItem>),
+    Appointment(Box<Appointment>),
+    Contact(Box<Contact>),
+    Task(Box<Task>),
+    Note(Box<Note>),
+}
+
+impl Lost {
+    fn id(&self) -> ItemId {
+        match self {
+            Lost::Mail(m) => m.id,
+            Lost::Appointment(a) => a.id,
+            Lost::Contact(c) => c.id,
+            Lost::Task(t) => t.id,
+            Lost::Note(n) => n.id,
+        }
+    }
+
+    fn folder(&self) -> FolderId {
+        match self {
+            Lost::Mail(m) => m.folder,
+            Lost::Appointment(a) => a.folder,
+            Lost::Contact(c) => c.folder,
+            Lost::Task(t) => t.folder,
+            Lost::Note(n) => n.folder,
+        }
+    }
+
+    /// (kind, subject, from, date) for the Recover Deleted Items list.
+    fn summary(&self) -> (&'static str, String, String, i64) {
+        match self {
+            Lost::Mail(m) => (
+                "mail",
+                m.subject.clone(),
+                m.from.as_ref().map(|f| f.addr.clone()).unwrap_or_default(),
+                m.received.unix,
+            ),
+            Lost::Appointment(a) => ("appointment", a.subject.clone(), String::new(), a.start.unix),
+            Lost::Contact(c) => ("contact", c.full_name(), String::new(), 0),
+            Lost::Task(t) => ("task", t.subject.clone(), String::new(), t.due.map_or(0, |d| d.unix)),
+            Lost::Note(n) => {
+                ("note", n.text.lines().next().unwrap_or("").to_owned(), String::new(), n.modified.unix)
+            }
+        }
+    }
+
+    /// Puts the item back into `mb` with `id` in `folder`.
+    fn restore(self, mb: &mut Mailbox, id: ItemId, folder: FolderId) {
+        match self {
+            Lost::Mail(mut m) => {
+                m.id = id;
+                m.folder = folder;
+                // The server copy is gone: the item comes back as a new local message (a synchronised folder
+                // uploads it).
+                m.remote_id = None;
+                mb.mail.insert(id, *m);
+            }
+            Lost::Appointment(mut a) => {
+                a.id = id;
+                a.folder = folder;
+                mb.appointments.insert(id, *a);
+            }
+            Lost::Contact(mut c) => {
+                c.id = id;
+                c.folder = folder;
+                mb.contacts.insert(id, *c);
+            }
+            Lost::Task(mut t) => {
+                t.id = id;
+                t.folder = folder;
+                mb.tasks.insert(id, *t);
+            }
+            Lost::Note(mut n) => {
+                n.id = id;
+                n.folder = folder;
+                mb.notes.insert(id, *n);
+            }
+        }
+    }
+}
+
+/// Most items Recover Deleted Items lists.
+const MAX_RECOVERABLE: usize = 5000;
+
+/// Items of every kind that are gone from the mailbox but still held by an undo snapshot (newest snapshot
+/// first; at most [`MAX_RECOVERABLE`]). Nothing can be fetched back from a server: IMAP and JMAP keep no
+/// copy of an expunged / destroyed message.
+fn recoverable(s: &Session) -> Vec<Lost> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
+    let mb = &s.mailbox;
     for entry in s.undo.undo.iter().rev() {
-        for m in entry.before.mail.values() {
-            if !s.mailbox.mail.contains_key(&m.id) && seen.insert(m.id) {
-                out.push(m.clone());
+        let b = &entry.before;
+        let lost = b
+            .mail
+            .values()
+            .filter(|m| !mb.mail.contains_key(&m.id))
+            .map(|m| Lost::Mail(Box::new(m.clone())))
+            .chain(
+                b.appointments
+                    .values()
+                    .filter(|a| !mb.appointments.contains_key(&a.id))
+                    .map(|a| Lost::Appointment(Box::new(a.clone()))),
+            )
+            .chain(
+                b.contacts
+                    .values()
+                    .filter(|c| !mb.contacts.contains_key(&c.id))
+                    .map(|c| Lost::Contact(Box::new(c.clone()))),
+            )
+            .chain(
+                b.tasks
+                    .values()
+                    .filter(|t| !mb.tasks.contains_key(&t.id))
+                    .map(|t| Lost::Task(Box::new(t.clone()))),
+            )
+            .chain(
+                b.notes
+                    .values()
+                    .filter(|n| !mb.notes.contains_key(&n.id))
+                    .map(|n| Lost::Note(Box::new(n.clone()))),
+            );
+        for item in lost {
+            if out.len() >= MAX_RECOVERABLE {
+                return out;
+            }
+            if seen.insert(item.id()) {
+                out.push(item);
             }
         }
     }
     out
 }
 
+/// Recover Deleted Items: no `ids` lists what can be recovered (dialog); `ids` puts those items back into
+/// the Deleted Items folder of their account.
 fn recover_deleted(s: &mut Session, p: &Value) -> CmdResult {
     let items = recoverable(s);
     let Some(ids) = super::util::opt_ids(p) else {
         let list: Vec<Value> = items
             .iter()
-            .map(|m| {
+            .map(|it| {
+                let (kind, subject, from, when) = it.summary();
                 json!({
-                    "id": m.id.0,
-                    "subject": m.subject,
-                    "from": m.from.as_ref().map(|f| f.addr.clone()).unwrap_or_default(),
-                    "received": m.received.unix,
-                    "folder": s.mailbox.folder_path(m.folder),
+                    "id": it.id().0,
+                    "kind": kind,
+                    "subject": subject,
+                    "from": from,
+                    "received": when,
+                    "folder": s.mailbox.folder_path(it.folder()),
                 })
             })
             .collect();
@@ -666,30 +796,48 @@ fn recover_deleted(s: &mut Session, p: &Value) -> CmdResult {
         return Ok(v);
     };
     let fallback = deleted_items_folder(s);
+    let wanted: BTreeSet<ItemId> = ids.into_iter().collect();
     let mut restored = Vec::new();
-    for id in ids {
-        let Some(mut m) = items.iter().find(|m| m.id == id).cloned() else { continue };
-        let account = s.mailbox.folder_account(m.folder);
+    let mut recovered = Vec::new();
+    for item in items.into_iter().filter(|it| wanted.contains(&it.id())) {
+        let old_id = item.id();
+        let account = s.mailbox.folder_account(item.folder());
         let target = account
             .and_then(|a| s.mailbox.role_folder(a, FolderRole::DeletedItems))
-            .or_else(|| s.mailbox.folders.contains_key(&m.folder).then_some(m.folder))
+            .or_else(|| s.mailbox.folders.contains_key(&item.folder()).then_some(item.folder()))
             .or(fallback);
         let Some(target) = target else { continue };
-        if id_taken(&s.mailbox, m.id.0) {
-            m.id = ItemId(s.mailbox.alloc_id());
-        }
-        s.mailbox.next_id = s.mailbox.next_id.max(m.id.0);
-        m.folder = target;
-        restored.push(m.id.0);
-        s.mailbox.mail.insert(m.id, m);
+        let id = if id_taken(&s.mailbox, old_id.0) { ItemId(s.mailbox.alloc_id()) } else { old_id };
+        s.mailbox.next_id = s.mailbox.next_id.max(id.0);
+        item.restore(&mut s.mailbox, id, target);
+        restored.push(id.0);
+        recovered.push(old_id.0);
     }
-    Ok(json!({ "restored": restored.len(), "ids": restored }))
+    Ok(json!({ "restored": restored.len(), "ids": restored, "recovered": recovered }))
 }
 
 // ---------------------------------------------------------------------------------------------------------
 // Favourites, order, expansion
 
+/// Add to Favorites (a toggle on the Folder tab). On an account root (`{"account": n}`, no folder) it adds
+/// the account's Inbox.
 fn add_favorite(s: &mut Session, p: &Value) -> CmdResult {
+    if p.get("folder").is_none()
+        && let Some(account) = super::util::opt_u64(p, "account")
+    {
+        let account = u32::try_from(account)
+            .ok()
+            .map(mailcraft_model::AccountId)
+            .filter(|a| s.mailbox.account(*a).is_some())
+            .ok_or_else(|| CmdError::Params(format!("no such account {account}")))?;
+        let inbox = s
+            .mailbox
+            .role_folder(account, FolderRole::Inbox)
+            .ok_or_else(|| CmdError::Failed("this account has no Inbox".into()))?;
+        let was = s.mailbox.folder(inbox).is_some_and(|f| f.favorite_pos.is_some());
+        s.mailbox.add_favorite(inbox)?;
+        return Ok(json!({ "folder": inbox.0, "favorite": true, "changed": !was }));
+    }
     let id = current_folder(s, p)?;
     let is_fav = s.mailbox.folder(id).is_some_and(|f| f.favorite_pos.is_some());
     if is_fav {
@@ -800,12 +948,38 @@ fn collapse(s: &mut Session, p: &Value) -> CmdResult {
     set_expanded(s, p, false)
 }
 
-/// Show All Folders A to Z is a folder-pane display mode; the session keeps no flag for it yet, so the
-/// command reports the requested state (`on`, default true) for the UI to apply.
+/// Setting that sorts every folder of the folder pane alphabetically, default folders included (Folder ›
+/// Show All Folders A to Z), saved with the profile when the settings store defines it.
+pub const SHOW_ALL_AZ_SETTING: &str = "state.showAllFoldersAZ";
+
+/// True when Show All Folders A to Z is on.
+pub fn show_all_az_on(s: &Session) -> bool {
+    s.settings.bool(SHOW_ALL_AZ_SETTING)
+}
+
+/// `account`'s folders under `parent` in folder-pane order: [`Mailbox::children`] order, or by name only
+/// (default folders mixed in) when Show All Folders A to Z is on.
+pub fn pane_children(
+    s: &Session,
+    account: mailcraft_model::AccountId,
+    parent: Option<FolderId>,
+) -> Vec<FolderId> {
+    let mut kids = s.mailbox.children(account, parent);
+    if show_all_az_on(s) {
+        kids.sort_by_cached_key(|id| {
+            (s.mailbox.folder(*id).map(|f| f.name.to_lowercase()).unwrap_or_default(), *id)
+        });
+    }
+    kids
+}
+
+/// Show All Folders A to Z (toggle): `on` sets it, no `on` flips it. Returns the new state and whether it
+/// was saved with the profile.
 fn show_all_az(s: &mut Session, p: &Value) -> CmdResult {
-    let on = opt_bool(p, "on").unwrap_or(true);
-    let _ = s;
-    Ok(json!({ "showAllAZ": on }))
+    let on = opt_bool(p, "on").unwrap_or(!show_all_az_on(s));
+    let saved = crate::settings::def(SHOW_ALL_AZ_SETTING).is_some()
+        && s.settings.set(SHOW_ALL_AZ_SETTING, &json!(on)).is_ok();
+    Ok(json!({ "showAllAZ": on, "saved": saved }))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -851,18 +1025,83 @@ fn new_search_folder(s: &mut Session, p: &Value) -> CmdResult {
 // ---------------------------------------------------------------------------------------------------------
 // Dialog-only commands
 
+/// What a folder holds, as the Properties dialog names it.
+pub fn folder_type_label(kind: FolderKind) -> &'static str {
+    match kind {
+        FolderKind::Mail => "Mail and post items",
+        FolderKind::Calendar => "Calendar items",
+        FolderKind::Contacts => "Contacts",
+        FolderKind::Tasks => "Tasks",
+        FolderKind::Notes => "Notes",
+        FolderKind::Journal => "Journal entries",
+        FolderKind::SearchRoot => "Search folders",
+        FolderKind::Search => "Saved search (search folder)",
+    }
+}
+
+fn kind_id(kind: FolderKind) -> &'static str {
+    match kind {
+        FolderKind::Mail => "mail",
+        FolderKind::Calendar => "calendar",
+        FolderKind::Contacts => "contacts",
+        FolderKind::Tasks => "tasks",
+        FolderKind::Notes => "notes",
+        FolderKind::Journal => "journal",
+        FolderKind::SearchRoot => "searchRoot",
+        FolderKind::Search => "search",
+    }
+}
+
+/// Folder Properties (Calendar Properties for a calendar): name, type, location, item counts and size; a
+/// calendar adds its colour, source and Internet subscription, a search folder its query.
 fn properties(s: &mut Session, p: &Value) -> CmdResult {
     let id = current_folder(s, p)?;
     let mb = &s.mailbox;
+    let Some(folder) = mb.folder(id) else {
+        return Err(CmdError::Params("no such folder".into()));
+    };
+    let kind = folder.kind;
     let size: u64 = mb.items_in(id).iter().fold(0u64, |acc, m| acc.saturating_add(m.size));
-    let params = json!({
+    let pim = pim_items_in(mb, id).len();
+    let mut params = json!({
         "folder": id.0,
-        "name": mb.folder(id).map(|f| f.name.clone()).unwrap_or_default(),
+        "name": folder.name,
         "path": mb.folder_path(id),
+        "kind": kind_id(kind),
+        "type": folder_type_label(kind),
+        "default": folder.is_default(),
         "unread": mb.unread_count(id),
-        "total": mb.total_count(id),
+        "total": mb.total_count(id).saturating_add(pim),
         "sizeKb": size.div_ceil(1024),
     });
+    if let Some(o) = params.as_object_mut() {
+        match kind {
+            FolderKind::Calendar => {
+                let props = super::calendar::props::read(mb, id);
+                let source = match props.source {
+                    mailcraft_model::calendar::CalendarSource::Local => "local",
+                    mailcraft_model::calendar::CalendarSource::Internet => "internet",
+                    mailcraft_model::calendar::CalendarSource::File => "file",
+                };
+                o.insert(
+                    "calendar".into(),
+                    json!({
+                        "color": props.color.unwrap_or_else(|| "Automatic".into()),
+                        "source": source,
+                        "readOnly": props.read_only,
+                        "url": props.subscription.as_ref().map(|x| x.url.clone()),
+                        "refreshMin": props.subscription.as_ref().map(|x| x.refresh_min),
+                        "lastUpdate": props.subscription.as_ref().and_then(|x| x.last_update),
+                        "lastError": props.subscription.as_ref().and_then(|x| x.last_error.clone()),
+                    }),
+                );
+            }
+            FolderKind::Search => {
+                o.insert("query".into(), json!(folder.search_query.clone().unwrap_or_default()));
+            }
+            _ => {}
+        }
+    }
     Ok(dialog(s, "folderProperties", params))
 }
 
@@ -1198,6 +1437,145 @@ mod tests {
         run(&mut s, "folder.expand", json!({"folder": "Inbox"}));
         assert!(s.mailbox.folder(inbox).unwrap().expanded);
         assert_eq!(run(&mut s, "folder.showAllAZ", json!({"on": false}))["showAllAZ"], false);
+    }
+
+    #[test]
+    fn show_all_folders_a_to_z_orders_default_folders_by_name_too() {
+        let mut s = session();
+        let acct = s.mailbox.accounts.first().map(|a| a.id).unwrap();
+        let names = |s: &Session| -> Vec<String> {
+            pane_children(s, acct, None).iter().map(|f| s.mailbox.folder(*f).unwrap().name.clone()).collect()
+        };
+        // Off: default folders first, in their fixed order.
+        assert_eq!(
+            names(&s),
+            s.mailbox
+                .children(acct, None)
+                .iter()
+                .map(|f| s.mailbox.folder(*f).unwrap().name.clone())
+                .collect::<Vec<_>>()
+        );
+        let r = run(&mut s, "folder.showAllAZ", json!({"on": true}));
+        assert_eq!(r["showAllAZ"], true);
+        let saved = crate::settings::def(SHOW_ALL_AZ_SETTING).is_some();
+        assert_eq!(r["saved"], saved);
+        if saved {
+            assert!(show_all_az_on(&s));
+            let got = names(&s);
+            let mut sorted = got.clone();
+            sorted.sort_by_key(|n| n.to_lowercase());
+            assert_eq!(got, sorted);
+            // No `on`: flips.
+            assert_eq!(run(&mut s, "folder.showAllAZ", json!({}))["showAllAZ"], false);
+            assert!(!show_all_az_on(&s));
+        }
+    }
+
+    #[test]
+    fn add_to_favorites_on_an_account_root_adds_its_inbox() {
+        let mut s = session();
+        let inbox = role(&s, FolderRole::Inbox);
+        let acct = s.mailbox.accounts.first().map(|a| a.id.0).unwrap();
+        s.mailbox.remove_favorite(inbox).unwrap();
+        let r = run(&mut s, "folder.addFavorite", json!({"account": acct}));
+        assert_eq!(
+            (r["folder"].clone(), r["favorite"].clone(), r["changed"].clone()),
+            (json!(inbox.0), json!(true), json!(true))
+        );
+        assert!(s.mailbox.favorites().contains(&inbox));
+        // Already a favourite: stays one (not a toggle on the account root).
+        let r = run(&mut s, "folder.addFavorite", json!({"account": acct}));
+        assert_eq!(r["changed"], false);
+        assert!(s.mailbox.favorites().contains(&inbox));
+        assert!(s.run("folder.addFavorite", &json!({"account": 999})).is_err());
+    }
+
+    #[test]
+    fn properties_name_the_folder_type_and_calendar_details() {
+        let mut s = session();
+        let p = |s: &Session| -> Value {
+            s.notices
+                .iter()
+                .rev()
+                .find_map(|n| match n {
+                    Notice::OpenDialog(d, p) if d == "folderProperties" => Some(p.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        run(&mut s, "folder.properties", json!({}));
+        assert_eq!(p(&s)["kind"], "mail");
+        assert_eq!(p(&s)["type"], folder_type_label(FolderKind::Mail));
+        assert!(p(&s).get("calendar").is_none());
+        let cal = role(&s, FolderRole::Calendar);
+        run(&mut s, "calendar.newAppointment", json!({"subject": "Dentist", "start": "2026-10-12T09:00"}));
+        let mut props = crate::cmd::calendar::props::read(&s.mailbox, cal);
+        props.color = Some("Teal".into());
+        crate::cmd::calendar::props::write(&mut s.mailbox, cal, &props);
+        run(&mut s, "folder.properties", json!({"folder": cal.0}));
+        let v = p(&s);
+        assert_eq!(v["kind"], "calendar");
+        assert_eq!(v["type"], folder_type_label(FolderKind::Calendar));
+        assert_eq!(v["total"], 1, "appointments count as the calendar's items");
+        assert_eq!(v["calendar"]["color"], "Teal");
+        assert_eq!(v["calendar"]["source"], "local");
+        assert_eq!(v["calendar"]["readOnly"], false);
+        let contacts = role(&s, FolderRole::Contacts);
+        run(&mut s, "folder.properties", json!({"folder": contacts.0}));
+        assert_eq!(p(&s)["type"], folder_type_label(FolderKind::Contacts));
+        let sf = run(&mut s, "folder.newSearchFolder", json!({"name": "Unread", "query": "isread:no"}));
+        run(&mut s, "folder.properties", json!({"folder": sf["folder"]}));
+        assert_eq!(p(&s)["query"], "isread:no");
+    }
+
+    #[test]
+    fn recover_deleted_brings_back_contacts_tasks_notes_and_appointments() {
+        let mut s = session();
+        let deleted = role(&s, FolderRole::DeletedItems);
+        let task = run(&mut s, "tasks.new", json!({"subject": "old task"}))["id"].as_u64().unwrap();
+        let appt = run(
+            &mut s,
+            "calendar.newAppointment",
+            json!({"subject": "Dentist", "start": "2026-10-12T09:00"}),
+        )["id"]
+            .as_u64()
+            .unwrap();
+        run(&mut s, "tasks.delete", json!({"id": task}));
+        run(&mut s, "calendar.delete", json!({"ids": [appt]}));
+        // The appointment may go to Deleted Items or straight away; empty Deleted Items removes what is left.
+        if s.enabled("folder.emptyDeleted").is_none() {
+            run(&mut s, "folder.emptyDeleted", json!({}));
+        }
+        assert!(!s.mailbox.tasks.contains_key(&ItemId(task)));
+        assert!(!s.mailbox.appointments.contains_key(&ItemId(appt)));
+        let r = run(&mut s, "folder.recoverDeleted", json!({}));
+        assert_eq!(r["dialog"], "recoverDeletedItems");
+        assert!(r["count"].as_u64().unwrap() >= 2);
+        let listed = s
+            .notices
+            .iter()
+            .rev()
+            .find_map(|n| match n {
+                Notice::OpenDialog(d, p) if d == "recoverDeletedItems" => Some(p["items"].clone()),
+                _ => None,
+            })
+            .unwrap();
+        let kinds: Vec<&str> = listed.as_array().unwrap().iter().filter_map(|i| i["kind"].as_str()).collect();
+        assert!(kinds.contains(&"task") && kinds.contains(&"appointment"), "{kinds:?}");
+        let r = run(&mut s, "folder.recoverDeleted", json!({"ids": [task, appt]}));
+        assert_eq!(r["restored"], 2);
+        let mut recovered: Vec<u64> =
+            r["recovered"].as_array().unwrap().iter().filter_map(Value::as_u64).collect();
+        recovered.sort_unstable();
+        let mut want = vec![task, appt];
+        want.sort_unstable();
+        assert_eq!(recovered, want);
+        assert_eq!(s.mailbox.tasks[&ItemId(task)].folder, deleted);
+        assert_eq!(s.mailbox.appointments[&ItemId(appt)].folder, deleted);
+        assert!(s.mailbox.validate().is_empty());
+        // Recovering is one undo step.
+        run(&mut s, "app.undo", json!({}));
+        assert!(!s.mailbox.tasks.contains_key(&ItemId(task)));
     }
 
     #[test]
