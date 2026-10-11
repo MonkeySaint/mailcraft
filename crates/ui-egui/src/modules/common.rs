@@ -53,9 +53,11 @@ pub(crate) struct ModState {
     /// see `notes_view_seen`).
     pub notes_view: NotesViewState,
     pub notes_view_seen: NotesViewState,
-    /// Notes Icon view: icons dragged off the grid (note id → offset from the grid's top-left corner).
-    /// Cleared by Line Up Icons.
+    /// Notes Icon view: icons placed off the grid (note id → offset from the grid's top-left corner), as
+    /// drawn: the saved positions (`notes::positions`) plus the icon being dragged. Cleared by Line Up Icons.
     pub note_pos: BTreeMap<u64, (f32, f32)>,
+    /// The icon being dragged and where it is (saved with `notes.setPosition` when dropped).
+    pub note_drag: Option<(u64, (f32, f32))>,
     /// Note being edited in place: (id, text).
     pub note_edit: Option<(u64, String)>,
     /// Note whose edit box should take focus.
@@ -354,7 +356,8 @@ pub(crate) fn persona_fill(idx: u8) -> Color32 {
 pub(crate) const GAP: f32 = 6.0;
 pub(crate) const RADIUS: u8 = 6;
 
-/// Splits the module area into the folder pane (when shown) and the content.
+/// Splits the module area into the folder pane (Normal only) and the content, without drawing; the
+/// calendar uses it. People, Tasks and Notes use [`module_folder_pane`], which draws the minimised strip.
 pub(crate) fn split_folder_pane(ui: &Ui, app: &App) -> (Option<Rect>, Rect) {
     let full = ui.max_rect();
     let window_w = ui.ctx().content_rect().width();
@@ -368,6 +371,167 @@ pub(crate) fn split_folder_pane(ui: &Ui, app: &App) -> (Option<Rect>, Rect) {
     let pane = Rect::from_min_size(full.min, vec2(size::FOLDER_PANE, full.height()));
     let main = Rect::from_min_max(pos2(pane.max.x + GAP, full.min.y), full.max);
     (Some(pane), main)
+}
+
+/// Width of the slim bar above a module's folder pane (with its « button).
+const PANE_BAR: f32 = 26.0;
+
+/// The folder pane of a module view (People, Tasks, Notes), following View › Folder Pane:
+/// - Normal: the pane on the left (its rect is returned below a slim bar whose « button minimises it);
+/// - Minimized — chosen, or automatic in narrow windows (≤ 800 wide) and Reading view — a strip with the
+///   current folder's name written downwards and a » button: the button restores Normal (or, when the
+///   pane is only minimised automatically, shows it as a flyout until « closes it), the name shows the
+///   flyout;
+/// - Off: nothing.
+///
+/// Returns the folder pane rect when it is shown (for the view to fill) and the main area.
+pub(crate) fn module_folder_pane(ui: &mut Ui, app: &mut App) -> (Option<Rect>, Rect) {
+    let full = ui.max_rect();
+    let setting = app.s.view.folder_pane;
+    if setting == FolderPaneState::Off || full.width() < size::FOLDER_PANE_MIN + 120.0 {
+        return (None, full);
+    }
+    let window_w = ui.ctx().content_rect().width();
+    let auto =
+        setting == FolderPaneState::Normal && (app.s.view.reading_view || window_w <= size::AUTO_MINIMIZE_W);
+    let minimized = setting == FolderPaneState::Minimized || auto;
+    let flyout_id = Id::new("mc-modules-folder-flyout");
+    let mut flyout = minimized && ui.ctx().data(|d| d.get_temp::<bool>(flyout_id)).unwrap_or(false);
+    let roomy = full.width() > size::FOLDER_PANE + 200.0;
+    let theme = app.theme.clone();
+    let out = if (!minimized || flyout) && roomy {
+        let pane = Rect::from_min_size(full.min, vec2(size::FOLDER_PANE, full.height()));
+        let main = Rect::from_min_max(pos2(pane.max.x + GAP, full.min.y), full.max);
+        let bar = Rect::from_min_size(pane.min, vec2(pane.width(), PANE_BAR));
+        pane_bg(ui, pane, theme.pane);
+        let b = Rect::from_center_size(pos2(bar.right() - 16.0, bar.center().y), Vec2::splat(19.0));
+        let resp = ui.interact(b, Id::new("mc-modules-folder-minimize"), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(b, CornerRadius::same(3), theme.hover);
+        }
+        app.icons.paint(
+            ui,
+            Rect::from_center_size(b.center(), Vec2::splat(14.0)),
+            "chevron-left",
+            theme.text_muted,
+        );
+        a11y(&resp, WidgetType::Button, "Minimize the Folder Pane");
+        if resp.on_hover_text("Minimize the Folder Pane").clicked() {
+            if minimized {
+                flyout = false;
+            } else {
+                app.run("view.folderPane", serde_json::json!({ "mode": "minimized" }));
+            }
+        }
+        (Some(Rect::from_min_max(pos2(pane.min.x, bar.max.y), pane.max)), main)
+    } else {
+        let strip = Rect::from_min_size(full.min, vec2(size::FOLDER_PANE_MIN, full.height()));
+        let main = Rect::from_min_max(pos2(strip.max.x + GAP, full.min.y), full.max);
+        pane_bg(ui, strip, theme.pane);
+        let b = Rect::from_min_size(pos2(strip.center().x - 9.5, strip.top() + 7.5), Vec2::splat(19.0));
+        let resp = ui.interact(b, Id::new("mc-modules-folder-expand"), Sense::click());
+        if resp.hovered() || flyout {
+            ui.painter().rect_filled(b, CornerRadius::same(3), theme.hover);
+        }
+        app.icons.paint(
+            ui,
+            Rect::from_center_size(b.center(), Vec2::splat(14.0)),
+            "chevron-right",
+            theme.text_muted,
+        );
+        a11y(&resp, WidgetType::Button, "Expand the Folder Pane");
+        if resp.on_hover_text("Expand the Folder Pane").clicked() {
+            if auto {
+                flyout = !flyout;
+            } else {
+                app.run("view.folderPane", serde_json::json!({ "mode": "normal" }));
+            }
+        }
+        // The current folder's name, written downwards.
+        let name = app.s.mailbox.folder(app.s.selection.folder).map(|f| f.name.clone()).unwrap_or_default();
+        let top = b.bottom() + 12.0;
+        let room = (strip.bottom() - top - 8.0).max(0.0);
+        if !name.is_empty() && room > 20.0 {
+            let galley = ui.painter().layout(name.clone(), FontId::proportional(13.0), theme.text, room);
+            let len = galley.size().x.min(room);
+            let item = Rect::from_min_size(pos2(strip.left(), top - 4.0), vec2(strip.width(), len + 8.0));
+            let iresp = ui.interact(item, Id::new("mc-modules-folder-name"), Sense::click());
+            if iresp.hovered() {
+                ui.painter().rect_filled(item.shrink2(vec2(2.0, 0.0)), CornerRadius::same(3), theme.hover);
+            }
+            let pos = pos2(strip.center().x + galley.size().y / 2.0, top);
+            ui.painter().with_clip_rect(item).add(
+                egui::epaint::TextShape::new(pos, galley, theme.text).with_angle(std::f32::consts::FRAC_PI_2),
+            );
+            a11y(&iresp, WidgetType::Button, &name);
+            if iresp.on_hover_text(&name).clicked() && roomy {
+                flyout = !flyout;
+            }
+        }
+        (None, main)
+    };
+    ui.ctx().data_mut(|d| d.insert_temp(flyout_id, flyout));
+    out
+}
+
+/// Paints a contact's picture in `rect` (rounded to a circle); false when the contact has none or it cannot
+/// be shown (only PNG pictures are decoded; others keep the initials).
+pub(crate) fn paint_contact_picture(ui: &Ui, rect: Rect, c: &mailcraft_model::Contact) -> bool {
+    let Some(pic) = c.picture.as_ref() else { return false };
+    let Some(tex) = picture_texture(ui.ctx(), c.id, pic) else { return false };
+    let radius =
+        u8::try_from((rect.width().min(rect.height()) / 2.0).clamp(0.0, 255.0) as u32).unwrap_or(255);
+    egui::Image::from_texture((tex.id(), rect.size()))
+        .corner_radius(CornerRadius::same(radius))
+        .paint_at(ui, rect);
+    true
+}
+
+/// Cheap fingerprint of a picture (its size and both ends) to notice a changed picture.
+fn picture_key(pic: &mailcraft_model::contact::ContactPicture) -> u64 {
+    let d = &pic.data;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ d.len() as u64;
+    let head = d.get(..d.len().min(256)).unwrap_or(&[]);
+    let tail = d.get(d.len().saturating_sub(256)..).unwrap_or(&[]);
+    for b in head.iter().chain(tail) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Decodes a PNG picture (bounded size) into an image.
+pub(crate) fn decode_picture(pic: &mailcraft_model::contact::ContactPicture) -> Option<egui::ColorImage> {
+    if pic.mime != "image/png" {
+        return None;
+    }
+    let (w, h) = pic.dimensions()?;
+    let limit = mailcraft_engine::cmd::people::MAX_PICTURE_SIDE;
+    if w == 0 || h == 0 || w > limit || h > limit {
+        return None;
+    }
+    let pix = resvg::tiny_skia::Pixmap::decode_png(&pic.data).ok()?;
+    let size = [usize::try_from(pix.width()).ok()?, usize::try_from(pix.height()).ok()?];
+    Some(egui::ColorImage::from_rgba_premultiplied(size, pix.data()))
+}
+
+/// The texture of a contact's picture, decoded once per picture and kept in egui memory.
+fn picture_texture(
+    ctx: &egui::Context,
+    id: ItemId,
+    pic: &mailcraft_model::contact::ContactPicture,
+) -> Option<egui::TextureHandle> {
+    let key = picture_key(pic);
+    let mem = Id::new(("mc-contact-picture", id.0));
+    if let Some((k, tex)) = ctx.data(|d| d.get_temp::<(u64, Option<egui::TextureHandle>)>(mem))
+        && k == key
+    {
+        return tex;
+    }
+    let tex = decode_picture(pic)
+        .map(|img| ctx.load_texture(format!("contact-picture-{}", id.0), img, egui::TextureOptions::LINEAR));
+    ctx.data_mut(|d| d.insert_temp(mem, (key, tex.clone())));
+    tex
 }
 
 /// Fills a rounded pane background.
@@ -757,5 +921,65 @@ mod tests {
     fn blend_mixes() {
         let c = blend(Color32::BLACK, Color32::WHITE, 0.5);
         assert!(c.r() > 120 && c.r() < 135);
+    }
+
+    fn folder_pane_harness(module: &str, mode: &str, width: f32) -> egui_kittest::Harness<'static, App> {
+        let mut app = App::new(mailcraft_engine::sample::sample_session());
+        app.run(module, serde_json::json!({}));
+        app.run("view.folderPane", serde_json::json!({ "mode": mode }));
+        let view: fn(&mut Ui, &mut App) = match module {
+            "nav.tasks" => crate::modules::tasks,
+            "nav.notes" => crate::modules::notes,
+            _ => crate::modules::people,
+        };
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(width, 800.0))
+            .build_ui_state(move |ui: &mut Ui, app: &mut App| view(ui, app), app);
+        h.run_ok();
+        h
+    }
+
+    fn labelled(h: &egui_kittest::Harness<'_, App>, label: &str) -> bool {
+        use egui_kittest::kittest::Queryable;
+        h.query_all_by_label(label).next().is_some()
+    }
+
+    fn press(h: &mut egui_kittest::Harness<'_, App>, label: &str) {
+        use egui_kittest::kittest::Queryable;
+        if let Some(n) = h.query_all_by_label(label).next() {
+            n.click();
+        }
+        h.run_ok();
+        h.run_ok();
+    }
+
+    #[test]
+    fn minimized_folder_pane_is_a_strip_in_modules() {
+        for (module, group) in
+            [("nav.people", "My Contacts"), ("nav.tasks", "My Tasks"), ("nav.notes", "My Notes")]
+        {
+            let mut h = folder_pane_harness(module, "minimized", 1400.0);
+            assert!(labelled(&h, "Expand the Folder Pane"), "{module}: strip shown");
+            assert!(!labelled(&h, group), "{module}: pane hidden");
+            press(&mut h, "Expand the Folder Pane");
+            assert_eq!(h.state().s.view.folder_pane, FolderPaneState::Normal, "{module}");
+            assert!(labelled(&h, group) && labelled(&h, "Minimize the Folder Pane"), "{module}");
+            press(&mut h, "Minimize the Folder Pane");
+            assert_eq!(h.state().s.view.folder_pane, FolderPaneState::Minimized, "{module}");
+            let h = folder_pane_harness(module, "off", 1400.0);
+            assert!(!labelled(&h, "Expand the Folder Pane") && !labelled(&h, group), "{module}: off");
+        }
+    }
+
+    #[test]
+    fn narrow_window_minimizes_the_pane_with_a_flyout() {
+        let mut h = folder_pane_harness("nav.people", "normal", 760.0);
+        assert!(labelled(&h, "Expand the Folder Pane") && !labelled(&h, "My Contacts"));
+        press(&mut h, "Expand the Folder Pane");
+        assert!(labelled(&h, "My Contacts"), "flyout");
+        assert_eq!(h.state().s.view.folder_pane, FolderPaneState::Normal, "the setting stays");
+        press(&mut h, "Minimize the Folder Pane");
+        assert!(!labelled(&h, "My Contacts"), "flyout closed");
+        assert_eq!(h.state().s.view.folder_pane, FolderPaneState::Normal);
     }
 }

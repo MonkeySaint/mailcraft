@@ -16,10 +16,24 @@
 //! assignees); Forward sends the task details with the task as an iCalendar VTODO attachment; Meeting
 //! starts a meeting about the task. **Task requests** (`tasks.assign`, People › Assign Task) send a
 //! message with a VTODO (`METHOD:REQUEST`, written by `mailcraft-formats`) to the assignees and keep an
-//! assigned copy (the Assigned view).
+//! assigned copy (the Assigned view) whose UID ties later answers to it.
+//!
+//! **Received task requests** (RFC 5546 iTIP with a VTODO: our own `tasks.assign` messages and other
+//! clients'): [`task_request_info`] is what the reading pane shows for a message carrying a task
+//! (`tasks.requestInfo`). `tasks.acceptRequest` adds the task to my list with `requested_by` (the
+//! organizer) and answers with a VTODO `REPLY` (PARTSTAT=ACCEPTED); `tasks.declineRequest` answers
+//! DECLINED. `tasks.sendStatusReport` sends the requester the task's progress (REPLY, PARTSTAT IN-PROCESS
+//! or COMPLETED), and completing a requested task sends a completion report by itself while Options ›
+//! Tasks › "Send status report when I complete an assigned task" is on. On the requester's side
+//! [`process_report`] (`tasks.processReport`) applies an answer or report to the assigned copy (accepted /
+//! declined, status, % complete, completion date); it only takes answers from the people the task was
+//! assigned to.
 //!
 //! **Views.** [`view_rows`] is the list of the Tasks views (`cmd::view::modules`).
 
+use std::collections::BTreeSet;
+
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cmd::calendar::{pim, pim::Kind};
@@ -27,7 +41,7 @@ use crate::cmd::util::{opt_bool, opt_str};
 use crate::cmd::view::modules::{self, ModuleKind, ViewRow};
 use crate::compose::{ComposeAttachment, ComposeState};
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
-use mailcraft_model::task::TaskRecurrence;
+use mailcraft_model::task::{TaskRecurrence, TaskRequestState};
 use mailcraft_model::{
     AccountKind, Appointment, DateTime, Doc, FlagState, FolderId, FolderRole, ItemId, Recurrence, Task,
     TaskPriority, TaskStatus,
@@ -301,6 +315,16 @@ fn advance_recurring(s: &mut Session, id: ItemId) -> Option<ItemId> {
     Some(copy_id)
 }
 
+/// "none", "waiting", "accepted" or "declined".
+pub fn request_state_name(r: TaskRequestState) -> &'static str {
+    match r {
+        TaskRequestState::None => "none",
+        TaskRequestState::Waiting => "waiting",
+        TaskRequestState::Accepted => "accepted",
+        TaskRequestState::Declined => "declined",
+    }
+}
+
 /// Summary of a task for results.
 pub fn task_json(t: &Task, tz: i32) -> Value {
     json!({
@@ -323,6 +347,7 @@ pub fn task_json(t: &Task, tz: i32) -> Value {
         "private": t.private,
         "assignedTo": t.assigned_to,
         "requestedBy": t.requested_by,
+        "requestState": request_state_name(t.request_state),
     })
 }
 
@@ -377,6 +402,10 @@ fn sync_mail_flag(s: &mut Session, task: ItemId) {
 }
 
 fn run_update(s: &mut Session, p: &Value) -> CmdResult {
+    with_reports(s, p, run_update_now)
+}
+
+fn run_update_now(s: &mut Session, p: &Value) -> CmdResult {
     let ids = pim::require_targets(s, p, Kind::Task)?;
     let mut updated = Vec::new();
     for id in &ids {
@@ -491,6 +520,10 @@ fn linked_tasks(s: &Session, mail: ItemId) -> Vec<ItemId> {
 }
 
 fn run_mark_complete(s: &mut Session, p: &Value) -> CmdResult {
+    with_reports(s, p, run_mark_complete_now)
+}
+
+fn run_mark_complete_now(s: &mut Session, p: &Value) -> CmdResult {
     let (tasks, mail) = todo_targets(s, p);
     if tasks.is_empty() && mail.is_empty() {
         return Err(CmdError::Params("no task or flagged item selected".into()));
@@ -770,7 +803,7 @@ pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
                     "Today" => open && due.is_some_and(|d| d <= today),
                     "Next 7 Days" => open && due.is_some_and(|d| d >= today && d < today.saturating_add(7)),
                     "Overdue" => open && due.is_some_and(|d| d < today),
-                    "Assigned" => !t.assigned_to.is_empty(),
+                    "Assigned" => t.is_assigned_by_me(),
                     "Server Tasks" => server,
                     _ => true,
                 }
@@ -844,6 +877,10 @@ pub(crate) fn parse_flag_kind(k: &str) -> Option<crate::cmd::mail::FlagKind> {
 /// Follow Up on tasks sets their start and due dates (Today, Tomorrow, This Week, Next Week, No Date);
 /// `custom` sets `start` / `due` / `reminder` from params, or opens the Custom dialog without them.
 fn run_flag(s: &mut Session, p: &Value) -> CmdResult {
+    with_reports(s, p, run_flag_now)
+}
+
+fn run_flag_now(s: &mut Session, p: &Value) -> CmdResult {
     let ids = pim::require_targets(s, p, Kind::Task)?;
     // No kind: the Quick Click flag (Options › Tasks › Quick Click).
     let quick = crate::cmd::mail::quick_click_kind(s);
@@ -1045,6 +1082,12 @@ pub fn task_ics(
         if let Some(r) = t.recurrence.as_ref().filter(|r| r.regenerate_days == 0 && !r.rrule.is_empty()) {
             todo.push("RRULE", vec![], r.rrule.clone());
         }
+        // A task request's UID stays the same in every message about it.
+        let uid = clean_uid(&t.uid);
+        if !uid.is_empty() {
+            todo.props.retain(|p| !p.name.eq_ignore_ascii_case("UID"));
+            todo.push("UID", vec![], uid);
+        }
     }
     let mut out = String::new();
     cal.write(&mut out);
@@ -1190,6 +1233,9 @@ pub fn assign(s: &mut Session, p: &Value) -> CmdResult {
     let keep = opt_bool(p, "keepCopy").unwrap_or_else(|| s.settings.bool("tasks.keepCopies"));
     let id = ItemId(s.mailbox.alloc_id());
     t.id = id;
+    // The UID ties the assignee's answers and status reports to this copy.
+    t.uid = clean_uid(&crate::cmd::calendar::new_uid(s, id, s.now().unix));
+    t.request_state = TaskRequestState::Waiting;
     if keep {
         s.mailbox.tasks.insert(id, t.clone());
     }
@@ -1273,6 +1319,645 @@ pub(crate) fn recipients(s: &Session, v: Option<&Value>) -> Result<Vec<String>, 
 
 fn run_assign(s: &mut Session, p: &Value) -> CmdResult {
     assign(s, p)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Received task requests, task responses and status reports (iTIP VTODO, RFC 5546 §3.4)
+
+/// Most attendees read from one task message.
+const MAX_TASK_ATTENDEES: usize = 500;
+/// Longest task subject kept from a received message (characters).
+const MAX_SUBJECT_CHARS: usize = 4_096;
+/// Longest UID kept from a received message (characters).
+const MAX_UID_CHARS: usize = 255;
+
+/// A task carried by a message: a VTODO in its `text/calendar` part (a task request, a task response or
+/// status report, a cancellation, or a published task).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskMessage {
+    /// Upper-case iTIP METHOD ("REQUEST", "REPLY", "CANCEL", "PUBLISH", …).
+    pub method: String,
+    pub uid: String,
+    /// The VTODO's fields (subject, dates, status, % complete, priority, notes, categories, recurrence).
+    pub task: Task,
+    /// The person who assigned the task ("Name <address>").
+    pub organizer: Option<String>,
+    /// (attendee "Name <address>", upper-case PARTSTAT).
+    pub attendees: Vec<(String, String)>,
+}
+
+fn clip_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// A UID safe to write back as a property value (no control characters, no TEXT separators).
+fn clean_uid(s: &str) -> String {
+    s.trim()
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\\' | ';' | ','))
+        .take(MAX_UID_CHARS)
+        .collect()
+}
+
+/// Parses a task message from iCalendar data (`tz` places floating and all-day times). `None` when the
+/// data has no VCALENDAR with a VTODO.
+pub fn parse_task_message(data: &[u8], tz: i32) -> Option<TaskMessage> {
+    use mailcraft_formats::ics::{ImportOptions, parse::parse};
+    let text = String::from_utf8_lossy(data);
+    let comps = parse(&text);
+    let cal = comps.iter().find(|c| c.name == "VCALENDAR")?;
+    let todo = cal.children_named("VTODO").next()?;
+    let method = cal
+        .text("METHOD")
+        .map(|m| clip_chars(m.trim(), 64).to_ascii_uppercase())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "PUBLISH".to_owned());
+    let uid = todo.text("UID").map(|u| clean_uid(&u)).unwrap_or_default();
+    let read = mailcraft_formats::ics::read_str(&text, ImportOptions { local_offset_min: tz }).ok()?;
+    let mut task = read.tasks.into_iter().next()?;
+    task.subject = clip_chars(&task.subject, MAX_SUBJECT_CHARS);
+    if task.body.len() > pim::MAX_TEXT {
+        task.body = clip_chars(&task.body, pim::MAX_TEXT / 4);
+    }
+    task.categories.truncate(64);
+    if let Some(rule) = todo.text("RRULE").map(|r| clip_chars(r.trim(), MAX_RRULE)).filter(|r| !r.is_empty())
+    {
+        task.recurrence = Some(TaskRecurrence { rrule: rule, start: task.due, ..Default::default() });
+    }
+    let address = |value: &str, cn: Option<&str>| -> Option<String> {
+        let v = value.trim();
+        let addr = match v.get(..7) {
+            Some(p) if p.eq_ignore_ascii_case("mailto:") => v.get(7..).unwrap_or(""),
+            _ => v,
+        };
+        let addr = addr.trim().replace("%40", "@");
+        let found = pim::parse_addresses(&[addr]).into_iter().next()?;
+        let name = cn
+            .map(|n| n.trim().chars().filter(|c| !c.is_control() && *c != '"').take(256).collect::<String>());
+        Some(match name.filter(|n| !n.is_empty()) {
+            Some(n) => mailcraft_model::Address::new(Some(&n), &found.addr).to_display_string(),
+            None => found.addr,
+        })
+    };
+    let organizer = todo.prop("ORGANIZER").and_then(|p| address(&p.value, p.param("CN")));
+    let attendees: Vec<(String, String)> = todo
+        .props_named("ATTENDEE")
+        .take(MAX_TASK_ATTENDEES)
+        .filter_map(|p| {
+            let who = address(&p.value, p.param("CN"))?;
+            let stat = p.param("PARTSTAT").map(|v| clip_chars(v.trim(), 32).to_ascii_uppercase());
+            Some((who, stat.unwrap_or_else(|| "NEEDS-ACTION".to_owned())))
+        })
+        .collect();
+    Some(TaskMessage { method, uid, task, organizer, attendees })
+}
+
+/// The task message carried by mail item `mail` (its `text/calendar` part, else an attached `.ics`).
+pub fn read_task_message(s: &Session, mail: ItemId) -> Option<TaskMessage> {
+    let m = s.mailbox.mail.get(&mail)?;
+    let data = crate::cmd::calendar::calendar_data(s, m)?;
+    parse_task_message(&data, s.tz_offset_min)
+}
+
+/// True when `addr` ("Name <a@b>" or "a@b") is one of the user's addresses.
+fn is_my_address(s: &Session, addr: &str) -> bool {
+    let parsed = pim::parse_addresses(&[addr.to_owned()]);
+    !parsed.is_empty()
+        && parsed.iter().all(|a| {
+            let a = a.addr.trim().to_ascii_lowercase();
+            s.me.contains(&a)
+                || s.mailbox.accounts.iter().any(|acc| acc.address.trim().eq_ignore_ascii_case(&a))
+        })
+}
+
+fn same_address(a: &str, b: &str) -> bool {
+    let a = pim::parse_addresses(&[a.to_owned()]);
+    let b = pim::parse_addresses(&[b.to_owned()]);
+    a.first().zip(b.first()).is_some_and(|(x, y)| x.same_address(y))
+}
+
+/// The task I accepted from the task request with `uid`.
+pub fn find_requested(s: &Session, uid: &str) -> Option<ItemId> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    s.mailbox.tasks.values().filter(|t| t.is_requested() && t.uid.trim() == uid).map(|t| t.id).min()
+}
+
+/// My copy of the task I assigned with `uid`.
+pub fn find_assigned(s: &Session, uid: &str) -> Option<ItemId> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    s.mailbox
+        .tasks
+        .values()
+        .filter(|t| t.is_assigned_by_me() && t.uid.trim() == uid && !t.is_complete())
+        .chain(s.mailbox.tasks.values().filter(|t| t.is_assigned_by_me() && t.uid.trim() == uid))
+        .map(|t| t.id)
+        .next()
+}
+
+/// "accepted", "declined", "inProgress", "completed" or "none" for an attendee PARTSTAT.
+fn partstat_name(p: &str) -> &'static str {
+    match p {
+        "ACCEPTED" => "accepted",
+        "DECLINED" => "declined",
+        "IN-PROCESS" => "inProgress",
+        "COMPLETED" => "completed",
+        "TENTATIVE" => "tentative",
+        "DELEGATED" => "delegated",
+        _ => "none",
+    }
+}
+
+/// The PARTSTAT that reports `t`'s progress.
+fn progress_partstat(t: &Task) -> &'static str {
+    match t.status {
+        TaskStatus::Completed => "COMPLETED",
+        TaskStatus::NotStarted => "ACCEPTED",
+        _ => "IN-PROCESS",
+    }
+}
+
+/// What the reading pane shows for a message carrying a task (the info bar and its buttons).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRequestInfo {
+    pub mail: u64,
+    /// "REQUEST", "REPLY", "CANCEL", "PUBLISH", …
+    pub method: String,
+    pub uid: String,
+    pub subject: String,
+    pub start: Option<String>,
+    pub due: Option<String>,
+    pub status: String,
+    pub percent: u8,
+    pub priority: String,
+    /// The person who assigned the task.
+    pub requested_by: String,
+    /// REPLY: the assignee who answered, and how ("accepted", "declined", "inProgress", "completed").
+    pub assignee: Option<String>,
+    pub response: Option<String>,
+    /// The task on my task list: the task I accepted (REQUEST) or my copy of the task I assigned (REPLY).
+    pub task: Option<u64>,
+    pub i_am_requester: bool,
+    /// Accept / Decline apply (`tasks.acceptRequest` / `tasks.declineRequest`).
+    pub can_respond: bool,
+    /// The response can update my copy of the task (`tasks.processReport`).
+    pub can_update: bool,
+    /// The info-bar line.
+    pub info: String,
+}
+
+/// Summary of the task message carried by `mail` against my task list; `None` when it carries no task.
+pub fn task_request_info(s: &Session, mail: ItemId) -> Option<TaskRequestInfo> {
+    let msg = read_task_message(s, mail)?;
+    Some(task_request_info_from(s, mail, &msg))
+}
+
+/// [`task_request_info`] for an already parsed message.
+pub fn task_request_info_from(s: &Session, mail: ItemId, msg: &TaskMessage) -> TaskRequestInfo {
+    let tz = s.tz_offset_min;
+    let t = &msg.task;
+    let requested_by = msg.organizer.clone().unwrap_or_default();
+    let i_am_requester = msg.organizer.as_deref().is_some_and(|o| is_my_address(s, o));
+    let reply = msg.method == "REPLY";
+    let answer = if reply {
+        msg.attendees.iter().find(|(a, _)| !is_my_address(s, a)).or(msg.attendees.first())
+    } else {
+        None
+    };
+    let task = if reply { find_assigned(s, &msg.uid) } else { find_requested(s, &msg.uid) };
+    let name = |who: &str| {
+        pim::parse_addresses(&[who.to_owned()])
+            .first()
+            .map(|a| a.display().to_owned())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "The assignee".to_owned())
+    };
+    let subject = if t.subject.trim().is_empty() { "(No subject)".to_owned() } else { t.subject.clone() };
+    let (info, can_respond, can_update) = match msg.method.as_str() {
+        "REQUEST" if i_am_requester => ("You sent this task request.".to_owned(), false, false),
+        "REQUEST" => match task.and_then(|i| s.mailbox.tasks.get(&i)).map(|t| t.request_state) {
+            Some(TaskRequestState::Declined) => ("You declined this task.".to_owned(), true, false),
+            Some(_) => ("You accepted this task. It is on your task list.".to_owned(), true, false),
+            None => ("Please respond. Accept the task to add it to your task list.".to_owned(), true, false),
+        },
+        "REPLY" => {
+            let (who, stat) =
+                answer.map(|(w, p)| (name(w), p.as_str())).unwrap_or_else(|| ("The assignee".to_owned(), ""));
+            let mut line = match stat {
+                "ACCEPTED" => format!("{who} accepted the task."),
+                "DECLINED" => format!("{who} declined the task."),
+                "COMPLETED" => format!("{who} completed the task."),
+                "IN-PROCESS" => format!(
+                    "{who} reports: {}, {}% complete.",
+                    task_status_text(t.status),
+                    t.percent_complete.min(100)
+                ),
+                _ => format!("{who} has not responded yet."),
+            };
+            if task.is_none() {
+                line.push_str(" The task is not on your task list.");
+            }
+            (line, false, task.is_some())
+        }
+        "CANCEL" => ("This task request was canceled.".to_owned(), false, false),
+        _ => ("This message carries a task.".to_owned(), false, false),
+    };
+    TaskRequestInfo {
+        mail: mail.0,
+        method: msg.method.clone(),
+        uid: msg.uid.clone(),
+        subject,
+        start: t.start.map(|d| pim::date_string(d, tz)),
+        due: t.due.map(|d| pim::date_string(d, tz)),
+        status: status_name(t.status).to_owned(),
+        percent: t.percent_complete.min(100),
+        priority: priority_name(t.priority).to_owned(),
+        requested_by,
+        assignee: answer.map(|(w, _)| w.clone()),
+        response: answer.map(|(_, p)| partstat_name(p).to_owned()),
+        task: task.map(|i| i.0),
+        i_am_requester,
+        can_respond,
+        can_update,
+        info,
+    }
+}
+
+fn task_status_text(s: TaskStatus) -> &'static str {
+    match s {
+        TaskStatus::NotStarted => "Not Started",
+        TaskStatus::InProgress => "In Progress",
+        TaskStatus::Completed => "Completed",
+        TaskStatus::WaitingOnSomeoneElse => "Waiting on someone else",
+        TaskStatus::Deferred => "Deferred",
+    }
+}
+
+/// The task message a command acts on: `id` (a message), else the focused message.
+fn req_task_mail(s: &Session, p: &Value) -> Result<(ItemId, TaskMessage), CmdError> {
+    let id = crate::cmd::util::opt_u64(p, "id")
+        .map(ItemId)
+        .or(s.selection.focus)
+        .ok_or_else(|| CmdError::Params("`id` (the task request message) is required".into()))?;
+    if !s.mailbox.mail.contains_key(&id) {
+        return Err(CmdError::Params(format!("no message {}", id.0)));
+    }
+    let msg = read_task_message(s, id)
+        .ok_or_else(|| CmdError::Params("the message has no task information".into()))?;
+    Ok((id, msg))
+}
+
+/// How a response goes out: sent now (default for answers), opened for editing, or not sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendMode {
+    Now,
+    Edit,
+    None,
+}
+
+fn send_mode(p: &Value, default: SendMode) -> Result<SendMode, CmdError> {
+    match opt_str(p, "send") {
+        None => Ok(default),
+        Some("now") => Ok(SendMode::Now),
+        Some("edit") => Ok(SendMode::Edit),
+        Some("none") => Ok(SendMode::None),
+        Some(_) => Err(CmdError::Params("`send` must be now|edit|none".into())),
+    }
+}
+
+/// The VTODO reply (METHOD:REPLY) about `t`: its UID, the requester as ORGANIZER and me as the ATTENDEE
+/// with `partstat`, with the task's current status, % complete and completion date.
+pub fn reply_ics(
+    t: &Task,
+    organizer: Option<&str>,
+    me: Option<&str>,
+    partstat: &str,
+    now: DateTime,
+) -> String {
+    use mailcraft_formats::ics::parse::parse;
+    let base = task_ics(t, Some("REPLY"), organizer, &[], now);
+    let mut comps = parse(&base);
+    let Some(cal) = comps.first_mut() else { return base };
+    if let Some(todo) = cal.children.iter_mut().find(|c| c.name == "VTODO")
+        && let Some(a) = me.map(|m| pim::parse_addresses(&[m.to_owned()])).and_then(|v| v.into_iter().next())
+    {
+        let mut params = vec![("PARTSTAT", partstat.to_owned())];
+        if let Some(n) = a.name.as_deref() {
+            let n: String =
+                n.chars().filter(|c| !matches!(c, '"' | ';' | ':' | ',') && !c.is_control()).collect();
+            if !n.is_empty() {
+                params.push(("CN", n));
+            }
+        }
+        todo.push("ATTENDEE", params, format!("mailto:{}", a.addr));
+    }
+    let mut out = String::new();
+    cal.write(&mut out);
+    out
+}
+
+/// Opens (and for [`SendMode::Now`] sends) a message about task `t` to `to` with a VTODO reply carrying
+/// `partstat`. Returns (compose id, sent).
+fn send_task_reply(
+    s: &mut Session,
+    t: &Task,
+    to: &[String],
+    subject: String,
+    intro: &str,
+    partstat: &str,
+    mode: SendMode,
+) -> Result<(Option<u64>, bool), CmdError> {
+    if mode == SendMode::None {
+        return Ok((None, false));
+    }
+    let now = s.now();
+    let tz = s.tz_offset_min;
+    let me = my_address(s);
+    let mut text = String::new();
+    if !intro.trim().is_empty() {
+        text.push_str(intro.trim());
+        text.push_str("\n\n");
+    }
+    text.push_str(&task_text(t, tz));
+    let ics = reply_ics(t, t.requested_by.as_deref(), me.as_deref(), partstat, now);
+    let mut c = ComposeState {
+        to: to.join("; "),
+        subject,
+        body: Doc::from_plain_text(&text),
+        attachments: vec![ComposeAttachment {
+            filename: ics_name(t),
+            mime_type: "text/calendar; method=REPLY".into(),
+            data: ics.into_bytes(),
+        }],
+        dirty: true,
+        ..Default::default()
+    };
+    crate::compose::insert_default_signature(&s.mailbox, &mut c);
+    let cid = s.open_compose(c);
+    if mode == SendMode::Now {
+        if to.is_empty() {
+            return Ok((Some(cid), false));
+        }
+        let r = s.run("compose.send", &json!({ "compose": cid }))?;
+        return Ok((Some(cid), r.get("sent").and_then(Value::as_bool).unwrap_or(false)));
+    }
+    Ok((Some(cid), false))
+}
+
+/// The tasks folder a task accepted from `mail` goes to: `folder` param, else the receiving account's Tasks
+/// folder, else the default tasks folder.
+fn accept_folder(s: &Session, p: &Value, mail: ItemId) -> Result<FolderId, CmdError> {
+    if p.get("folder").is_some_and(|v| !v.is_null()) {
+        return pim::new_item_folder(s, p, Kind::Task);
+    }
+    s.mailbox
+        .mail
+        .get(&mail)
+        .and_then(|m| s.mailbox.folder_account(m.folder))
+        .and_then(|a| s.mailbox.role_folder(a, FolderRole::Tasks))
+        .or_else(|| pim::default_folder(s, Kind::Task))
+        .ok_or_else(|| CmdError::Failed("there is no tasks folder".into()))
+}
+
+/// Accept / Decline a task request (`id` = the request message; `send` now|edit|none, default now;
+/// `comment` goes above the task details). Accept adds the task to my task list (requested by the
+/// organizer) or updates the one accepted before; Decline moves an accepted copy to Deleted Items. Either
+/// way a task response (VTODO REPLY, PARTSTAT ACCEPTED / DECLINED) goes to the requester.
+fn respond_request(s: &mut Session, p: &Value, accept: bool) -> CmdResult {
+    let (mail, msg) = req_task_mail(s, p)?;
+    if msg.method != "REQUEST" {
+        return Err(CmdError::Params("the message is not a task request".into()));
+    }
+    let requester = msg
+        .organizer
+        .clone()
+        .or_else(|| s.mailbox.mail.get(&mail).and_then(|m| m.from.as_ref()).map(|a| a.to_display_string()))
+        .ok_or_else(|| CmdError::Params("the task request does not say who sent it".into()))?;
+    if is_my_address(s, &requester) {
+        return Err(CmdError::Disabled("you sent this task request".into()));
+    }
+    let mode = send_mode(p, SendMode::Now)?;
+    let comment = pim::text(p, "comment")?.unwrap_or_default();
+    let now = s.now();
+    let tz = s.tz_offset_min;
+    let existing = find_requested(s, &msg.uid);
+    let assignees: Vec<String> = msg.attendees.iter().map(|(a, _)| a.clone()).collect();
+    let mut answered = existing
+        .and_then(|id| s.mailbox.tasks.get(&id))
+        .cloned()
+        .unwrap_or_else(|| Task { priority: msg.task.priority, ..Default::default() });
+    {
+        let src = &msg.task;
+        answered.subject = src.subject.clone();
+        answered.body = src.body.clone();
+        answered.start = src.start.map(|d| pim::local_midnight(d, tz));
+        answered.due = src.due.map(|d| pim::local_midnight(d, tz));
+        answered.priority = src.priority;
+        if existing.is_none() {
+            answered.status = src.status;
+            answered.percent_complete = src.percent_complete.min(100);
+            answered.completed = src.completed;
+            if answered.categories.is_empty() {
+                answered.categories = src.categories.clone();
+            }
+        }
+        answered.requested_by = Some(requester.clone());
+        answered.assigned_to = assignees;
+        answered.uid = if msg.uid.is_empty() { answered.uid.clone() } else { msg.uid.clone() };
+        answered.request_state = if accept { TaskRequestState::Accepted } else { TaskRequestState::Declined };
+        answered.last_report = Some(now);
+        answered.recurrence = None;
+    }
+    // The pattern is checked like a typed one; a pattern MailCraft cannot follow is dropped.
+    if let Some(rule) = msg.task.recurrence.as_ref().map(|r| r.rrule.clone()) {
+        let mut tmp = answered.clone();
+        if apply_task_fields(s, &mut tmp, &json!({ "recurrence": rule })).is_ok() {
+            answered = tmp;
+        }
+    }
+    let task_id = if accept {
+        let id = match existing {
+            // Accepted again after declining: back from Deleted Items to the task list.
+            Some(id) if !pim::is_kind_folder(s, answered.folder, Kind::Task) => {
+                answered.folder = accept_folder(s, p, mail)?;
+                id
+            }
+            Some(id) => id,
+            None => {
+                let folder = accept_folder(s, p, mail)?;
+                answered.folder = folder;
+                if answered.reminder.is_none()
+                    && !answered.is_complete()
+                    && s.settings.task_reminders_on_due()
+                    && let Some(due) = answered.due
+                {
+                    answered.reminder =
+                        Some(pim::add_secs(due, i64::from(s.settings.task_reminder_minutes()) * 60));
+                }
+                ItemId(s.mailbox.alloc_id())
+            }
+        };
+        answered.id = id;
+        s.mailbox.tasks.insert(id, answered.clone());
+        Some(id)
+    } else {
+        if let Some(id) = existing {
+            if let Some(t) = s.mailbox.tasks.get_mut(&id) {
+                t.request_state = TaskRequestState::Declined;
+                t.last_report = Some(now);
+            }
+            pim::delete(s, &[id]);
+        }
+        None
+    };
+    let (prefix, partstat) =
+        if accept { ("Task Accepted", "ACCEPTED") } else { ("Task Declined", "DECLINED") };
+    let subject = format!("{prefix}: {}", answered.subject.trim());
+    let (compose, sent) =
+        send_task_reply(s, &answered, std::slice::from_ref(&requester), subject, &comment, partstat, mode)?;
+    Ok(json!({
+        "task": task_id.map(|i| i.0),
+        "response": if accept { "accepted" } else { "declined" },
+        "requestedBy": requester,
+        "compose": compose,
+        "sent": sent,
+    }))
+}
+
+fn run_accept_request(s: &mut Session, p: &Value) -> CmdResult {
+    respond_request(s, p, true)
+}
+
+fn run_decline_request(s: &mut Session, p: &Value) -> CmdResult {
+    respond_request(s, p, false)
+}
+
+fn run_request_info(s: &mut Session, p: &Value) -> CmdResult {
+    let (mail, msg) = req_task_mail(s, p)?;
+    serde_json::to_value(task_request_info_from(s, mail, &msg)).map_err(|e| CmdError::Failed(e.to_string()))
+}
+
+/// Applies a task response or status report (`mail`, a VTODO REPLY from one of the assignees) to my copy
+/// of the task I assigned: accepted / declined, status, % complete and completion date. The receiving
+/// side can call this when a REPLY arrives; `tasks.processReport` runs it for one message.
+pub fn process_report(s: &mut Session, mail: ItemId) -> CmdResult {
+    let msg = read_task_message(s, mail)
+        .ok_or_else(|| CmdError::Params("the message has no task information".into()))?;
+    if msg.method != "REPLY" {
+        return Err(CmdError::Params("the message is not a task response".into()));
+    }
+    let id = find_assigned(s, &msg.uid)
+        .ok_or_else(|| CmdError::Params("the task is not on your task list".into()))?;
+    let Some(mut t) = s.mailbox.tasks.get(&id).cloned() else {
+        return Err(CmdError::Params("the task is not on your task list".into()));
+    };
+    // Only the people the task was assigned to can answer for it.
+    let Some((who, stat)) =
+        msg.attendees.iter().find(|(a, _)| t.assigned_to.iter().any(|x| same_address(x, a))).cloned()
+    else {
+        return Err(CmdError::Params("the response is not from someone the task was assigned to".into()));
+    };
+    let now = s.now();
+    let src = &msg.task;
+    match stat.as_str() {
+        "DECLINED" => t.request_state = TaskRequestState::Declined,
+        "ACCEPTED" | "IN-PROCESS" | "COMPLETED" => {
+            t.request_state = TaskRequestState::Accepted;
+            let done =
+                stat == "COMPLETED" || src.status == TaskStatus::Completed || src.percent_complete >= 100;
+            if done {
+                if !t.is_complete() {
+                    t.completed = None;
+                }
+                set_complete(&mut t, true, src.completed.unwrap_or(now));
+            } else {
+                t.status = src.status;
+                t.percent_complete = src.percent_complete;
+                t.completed = None;
+            }
+        }
+        _ => t.request_state = TaskRequestState::Waiting,
+    }
+    t.last_report = Some(now);
+    let tz = s.tz_offset_min;
+    let out = task_json(&t, tz);
+    s.mailbox.tasks.insert(id, t);
+    sync_mail_flag(s, id);
+    Ok(json!({ "task": id.0, "from": who, "response": partstat_name(&stat), "updated": out }))
+}
+
+fn run_process_report(s: &mut Session, p: &Value) -> CmdResult {
+    let (mail, _) = req_task_mail(s, p)?;
+    process_report(s, mail)
+}
+
+/// Sends a status report about `t` to the person who assigned it (for my own tasks: the people I assigned it
+/// to). Completed tasks report as "Task Completed". Returns (compose id, sent).
+fn send_status_report(s: &mut Session, id: ItemId, mode: SendMode) -> Result<(Option<u64>, bool), CmdError> {
+    let Some(t) = s.mailbox.tasks.get(&id).cloned() else {
+        return Err(CmdError::Params(format!("no task {}", id.0)));
+    };
+    let to = reply_targets(s, &t, false);
+    let prefix = if t.is_complete() { "Task Completed" } else { "Task Status Report" };
+    let subject = format!("{prefix}: {}", t.subject.trim());
+    let now = s.now();
+    let r = send_task_reply(s, &t, &to, subject, "", progress_partstat(&t), mode)?;
+    if let Some(task) = s.mailbox.tasks.get_mut(&id) {
+        task.last_report = Some(now);
+    }
+    Ok(r)
+}
+
+/// Send Status Report (`send` now|edit|none, default edit: the report opens in a message window).
+fn run_status_report(s: &mut Session, p: &Value) -> CmdResult {
+    let t = first_task(s, p)?;
+    let mode = send_mode(p, SendMode::Edit)?;
+    let (compose, sent) = send_status_report(s, t.id, mode)?;
+    Ok(json!({ "task": t.id.0, "compose": compose, "sent": sent, "to": reply_targets(s, &t, false) }))
+}
+
+/// Tasks accepted from task requests that are complete now.
+fn requested_complete(s: &Session) -> BTreeSet<ItemId> {
+    s.mailbox.tasks.values().filter(|t| t.is_requested() && t.is_complete()).map(|t| t.id).collect()
+}
+
+/// After a command completed tasks: a completion report goes to the requester of every task accepted
+/// from a task request that was not complete before (`before`), when Options › Tasks › "Send status report
+/// when I complete an assigned task" is on. Returns the report compose ids.
+fn completion_reports(s: &mut Session, before: &BTreeSet<ItemId>) -> Vec<u64> {
+    if !s.settings.bool("tasks.statusReport") {
+        return Vec::new();
+    }
+    let done: Vec<ItemId> = requested_complete(s).into_iter().filter(|i| !before.contains(i)).collect();
+    let mut out = Vec::new();
+    for id in done {
+        // The task is complete either way: a report that cannot go out stays open in its window.
+        match send_status_report(s, id, SendMode::Now) {
+            Ok((Some(cid), _)) => out.push(cid),
+            Ok((None, _)) => {}
+            Err(e) => log::warn!("completion report for task {} not sent: {e}", id.0),
+        }
+    }
+    out
+}
+
+/// Runs `f`, then sends the completion reports it calls for (added to its result as `reports`).
+fn with_reports(s: &mut Session, p: &Value, f: fn(&mut Session, &Value) -> CmdResult) -> CmdResult {
+    let before = requested_complete(s);
+    let mut out = f(s, p)?;
+    let reports = completion_reports(s, &before);
+    if !reports.is_empty()
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert("reports".into(), json!(reports));
+    }
+    Ok(out)
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -1467,6 +2152,56 @@ pub fn specs() -> Vec<CommandSpec> {
             true,
             always,
             run_assign,
+        ),
+        spec(
+            "tasks.requestInfo",
+            "Task Request Information",
+            "Reading Pane › Task request",
+            "",
+            r#"{"id"?: number} (a message carrying a task; default the focused message)"#,
+            false,
+            always,
+            run_request_info,
+        ),
+        spec(
+            "tasks.acceptRequest",
+            "Accept",
+            "Reading Pane › Task request",
+            "",
+            r#"{"id"?: number, "send"?: "now|edit|none", "comment"?: string, "folder"?: number}"#,
+            true,
+            always,
+            run_accept_request,
+        ),
+        spec(
+            "tasks.declineRequest",
+            "Decline",
+            "Reading Pane › Task request",
+            "",
+            r#"{"id"?: number, "send"?: "now|edit|none", "comment"?: string}"#,
+            true,
+            always,
+            run_decline_request,
+        ),
+        spec(
+            "tasks.processReport",
+            "Update Task from Response",
+            "Reading Pane › Task response",
+            "",
+            r#"{"id"?: number} (a task response or status report about a task I assigned)"#,
+            true,
+            always,
+            run_process_report,
+        ),
+        spec(
+            "tasks.sendStatusReport",
+            "Send Status Report",
+            "Task › Manage Task",
+            "",
+            r#"{"ids"?: [number], "send"?: "now|edit|none"} (default edit: the report opens in a message window)"#,
+            true,
+            task_selected,
+            run_status_report,
         ),
     ]
 }
@@ -1746,8 +2481,8 @@ mod tests {
         assert_eq!(s.composes[&r["compose"].as_u64().unwrap()].subject, "RE: Assigned to me");
         let r = s.run("tasks.replyAll", &json!({"ids": [got]})).unwrap();
         assert_eq!(r["to"], json!(["Boss <boss@example.com>", "Pat <pat@example.org>"]));
-        // Meeting about the task.
-        let r = s.run("tasks.meeting", &json!({"ids": [got]})).unwrap();
+        // Meeting about the task (`form: false` saves it without opening the meeting form first).
+        let r = s.run("tasks.meeting", &json!({"ids": [got], "form": false})).unwrap();
         let a = &s.mailbox.appointments[&ItemId(r["id"].as_u64().unwrap())];
         assert_eq!(a.subject, "Assigned to me");
         assert_eq!(a.attendees.len(), 2);
@@ -1876,5 +2611,258 @@ mod tests {
         assert!(next_occurrence(&t, DateTime::from_unix(0, 0), 0).is_some());
         let far = Task { due: Some(DateTime::from_unix(253_402_000_000, 0)), ..t.clone() };
         assert!(next_occurrence(&far, DateTime::from_unix(0, 0), 0).is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------------------
+    // Task requests between two people
+
+    fn person(addr: &str, name: &str) -> Session {
+        let mut s = session();
+        if let Some(a) = s.mailbox.accounts.first_mut() {
+            a.address = addr.into();
+            a.sender_name = name.into();
+        }
+        s.refresh_me();
+        s
+    }
+
+    /// Delivers compose `cid` of `from` into `to`'s Inbox, built like a sent message.
+    fn deliver(from: &Session, cid: u64, to: &mut Session) -> ItemId {
+        let c = &from.composes[&cid];
+        let acc = from.mailbox.default_account().unwrap();
+        let attachments = c
+            .attachments
+            .iter()
+            .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.clone()))
+            .collect::<Vec<_>>();
+        deliver_raw(
+            to,
+            (&acc.sender_name, &acc.address),
+            &c.to,
+            &c.subject,
+            &c.body.to_plain_text(),
+            attachments,
+        )
+    }
+
+    fn deliver_raw(
+        to: &mut Session,
+        from: (&str, &str),
+        rcpt: &str,
+        subject: &str,
+        text: &str,
+        attachments: Vec<(String, String, Vec<u8>)>,
+    ) -> ItemId {
+        let mut b = mailcraft_mime::MessageBuilder::new();
+        b.from = Some(mailcraft_model::Address::new(Some(from.0), from.1));
+        b.to = mailcraft_mime::parse_address_list(rcpt);
+        b.subject = subject.into();
+        b.text = Some(text.into());
+        b.attachments = attachments
+            .into_iter()
+            .map(|(filename, mime_type, data)| mailcraft_mime::AttachmentSpec {
+                filename,
+                mime_type,
+                data,
+                content_id: None,
+            })
+            .collect();
+        let raw = b.build();
+        let msg = mailcraft_mime::parse(&raw).unwrap();
+        let mut item = MailItem::from_message(&msg, &raw, to.now());
+        item.folder = role(to, FolderRole::Inbox);
+        to.mailbox.add_mail(item)
+    }
+
+    fn assign_to_ann(org: &mut Session, subject: &str) -> (ItemId, u64) {
+        let r = org
+            .run(
+                "tasks.assign",
+                &json!({"to": "Ann Lee <ann@example.com>", "subject": subject, "due": "2026-10-20",
+                        "body": "Numbers for Q4", "priority": "high", "send": false}),
+            )
+            .unwrap();
+        (ItemId(r["task"].as_u64().unwrap()), r["compose"].as_u64().unwrap())
+    }
+
+    #[test]
+    fn task_request_round_trip() {
+        let mut org = session();
+        let (copy, cid) = assign_to_ann(&mut org, "Budget");
+        assert_eq!(org.mailbox.tasks[&copy].request_state, TaskRequestState::Waiting);
+        assert!(!org.mailbox.tasks[&copy].uid.is_empty());
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let req = deliver(&org, cid, &mut ann);
+
+        // The reading pane's query.
+        let info = task_request_info(&ann, req).unwrap();
+        assert_eq!((info.method.as_str(), info.can_respond, info.task), ("REQUEST", true, None));
+        assert_eq!(info.subject, "Budget");
+        assert_eq!(info.due.as_deref(), Some("2026-10-20"));
+        assert!(info.requested_by.contains("me@example.com"), "{info:?}");
+        assert_eq!(info.uid, org.mailbox.tasks[&copy].uid);
+        let r = ann.run("tasks.requestInfo", &json!({"id": req.0})).unwrap();
+        assert_eq!(r["canRespond"], true);
+        // My own request is not mine to answer.
+        let atts: Vec<(String, String, Vec<u8>)> = org.composes[&cid]
+            .attachments
+            .iter()
+            .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.clone()))
+            .collect();
+        let mine =
+            deliver_raw(&mut org, ("Me Myself", "me@example.com"), "ann@example.com", "Copy", "", atts);
+        let info = task_request_info(&org, mine).unwrap();
+        assert!(!info.can_respond && info.i_am_requester);
+        assert_eq!(info.info, "You sent this task request.");
+        assert!(matches!(org.run("tasks.acceptRequest", &json!({"id": mine.0})), Err(CmdError::Disabled(_))));
+
+        // Accept: the task joins Ann's list, requested by the organizer; the response goes back.
+        let r = ann
+            .run("tasks.acceptRequest", &json!({"id": req.0, "send": "edit", "comment": "On it"}))
+            .unwrap();
+        let t = ItemId(r["task"].as_u64().unwrap());
+        let task = &ann.mailbox.tasks[&t];
+        assert_eq!(task.folder, role(&ann, FolderRole::Tasks));
+        assert_eq!(task.subject, "Budget");
+        assert_eq!(task.priority, TaskPriority::High);
+        assert_eq!(task.body, "Numbers for Q4");
+        assert!(task.requested_by.as_deref().unwrap().contains("me@example.com"));
+        assert_eq!(task.request_state, TaskRequestState::Accepted);
+        assert_eq!(task.uid, org.mailbox.tasks[&copy].uid);
+        assert!(!task.is_assigned_by_me());
+        let reply = r["compose"].as_u64().unwrap();
+        assert_eq!(ann.composes[&reply].subject, "Task Accepted: Budget");
+        assert!(ann.composes[&reply].to.contains("me@example.com"));
+        assert!(ann.composes[&reply].body.to_plain_text().starts_with("On it"));
+        let ics =
+            String::from_utf8(ann.composes[&reply].attachments[0].data.clone()).unwrap().replace("\r\n ", "");
+        assert!(ics.contains("METHOD:REPLY") && ics.contains("PARTSTAT=ACCEPTED"), "{ics}");
+        assert!(task_request_info(&ann, req).unwrap().task == Some(t.0));
+        // Accepting again updates the same task.
+        ann.run("tasks.acceptRequest", &json!({"id": req.0, "send": "none"})).unwrap();
+        assert_eq!(ann.mailbox.tasks.values().filter(|x| x.is_requested()).count(), 1);
+        // Declining after accepting moves it to Deleted Items; accepting once more brings it back.
+        ann.run("tasks.declineRequest", &json!({"id": req.0, "send": "none"})).unwrap();
+        assert_eq!(ann.mailbox.tasks[&t].folder, role(&ann, FolderRole::DeletedItems));
+        assert_eq!(task_request_info(&ann, req).unwrap().info, "You declined this task.");
+        let r = ann.run("tasks.acceptRequest", &json!({"id": req.0, "send": "none"})).unwrap();
+        assert_eq!(r["task"], t.0);
+        assert_eq!(ann.mailbox.tasks[&t].folder, role(&ann, FolderRole::Tasks));
+        assert_eq!(ann.mailbox.tasks[&t].request_state, TaskRequestState::Accepted);
+        // Ann's task is not in her Assigned view but Reply reaches the requester.
+        ann.selection = Selection { folder: role(&ann, FolderRole::Tasks), items: vec![t], focus: Some(t) };
+        ann.run("view.changeView", &json!({"name": "Assigned"})).unwrap();
+        assert!(view_rows(&ann, role(&ann, FolderRole::Tasks)).is_empty());
+        let r = ann.run("tasks.reply", &json!({"ids": [t.0]})).unwrap();
+        assert!(r["to"][0].as_str().unwrap().contains("me@example.com"));
+
+        // The organizer applies the answer to the assigned copy.
+        let answer = deliver(&ann, reply, &mut org);
+        let info = task_request_info(&org, answer).unwrap();
+        assert_eq!(info.method, "REPLY");
+        assert_eq!(info.response.as_deref(), Some("accepted"));
+        assert_eq!((info.task, info.can_update), (Some(copy.0), true));
+        assert_eq!(info.info, "Ann Lee accepted the task.");
+        org.run("tasks.processReport", &json!({"id": answer.0})).unwrap();
+        assert_eq!(org.mailbox.tasks[&copy].request_state, TaskRequestState::Accepted);
+
+        // A status report carries the progress.
+        ann.run("tasks.update", &json!({"id": t.0, "percent": 50})).unwrap();
+        let r = ann.run("tasks.sendStatusReport", &json!({"ids": [t.0]})).unwrap();
+        let rep = r["compose"].as_u64().unwrap();
+        assert_eq!(ann.composes[&rep].subject, "Task Status Report: Budget");
+        assert!(ann.composes[&rep].body.to_plain_text().contains("% Complete: 50%"));
+        let report = deliver(&ann, rep, &mut org);
+        assert!(task_request_info(&org, report).unwrap().info.contains("50% complete"));
+        org.run("tasks.processReport", &json!({"id": report.0})).unwrap();
+        assert_eq!(org.mailbox.tasks[&copy].percent_complete, 50);
+        assert_eq!(org.mailbox.tasks[&copy].status, TaskStatus::InProgress);
+
+        // Completing the task sends the completion report by itself (Options › Tasks, on by default).
+        let r = ann.run("tasks.markComplete", &json!({"ids": [t.0]})).unwrap();
+        let done = r["reports"][0].as_u64().unwrap();
+        assert_eq!(ann.composes[&done].subject, "Task Completed: Budget");
+        let done_mail = deliver(&ann, done, &mut org);
+        org.run("tasks.processReport", &json!({"id": done_mail.0})).unwrap();
+        assert!(org.mailbox.tasks[&copy].is_complete());
+        assert!(org.mailbox.tasks[&copy].completed.is_some());
+        // Reopening and completing again with the option off sends nothing.
+        ann.run("options.set", &json!({"key": "tasks.statusReport", "value": false})).unwrap();
+        ann.run("tasks.update", &json!({"id": t.0, "complete": false})).unwrap();
+        let r = ann.run("tasks.update", &json!({"id": t.0, "complete": true})).unwrap();
+        assert!(r.get("reports").is_none(), "{r}");
+        assert!(ann.mailbox.validate().is_empty() && org.mailbox.validate().is_empty());
+    }
+
+    #[test]
+    fn declining_and_hostile_answers() {
+        let mut org = session();
+        let (copy, cid) = assign_to_ann(&mut org, "Audit");
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let req = deliver(&org, cid, &mut ann);
+        let r = ann.run("tasks.declineRequest", &json!({"id": req.0, "send": "edit"})).unwrap();
+        assert_eq!(r["task"], Value::Null);
+        assert!(!ann.mailbox.tasks.values().any(|t| t.subject == "Audit"));
+        let reply = r["compose"].as_u64().unwrap();
+        assert_eq!(ann.composes[&reply].subject, "Task Declined: Audit");
+        let answer = deliver(&ann, reply, &mut org);
+        assert_eq!(task_request_info(&org, answer).unwrap().info, "Ann Lee declined the task.");
+        // A REPLY is not a request, and a request is not a report.
+        assert!(matches!(org.run("tasks.acceptRequest", &json!({"id": answer.0})), Err(CmdError::Params(_))));
+        assert!(matches!(ann.run("tasks.processReport", &json!({"id": req.0})), Err(CmdError::Params(_))));
+        // Someone the task was not assigned to cannot answer for it.
+        let mut eve = person("eve@example.net", "Eve");
+        let eve_req = deliver(&org, cid, &mut eve);
+        let r = eve.run("tasks.acceptRequest", &json!({"id": eve_req.0, "send": "edit"})).unwrap();
+        let forged = deliver(&eve, r["compose"].as_u64().unwrap(), &mut org);
+        assert!(matches!(org.run("tasks.processReport", &json!({"id": forged.0})), Err(CmdError::Params(_))));
+        assert_eq!(org.mailbox.tasks[&copy].request_state, TaskRequestState::Waiting);
+        org.run("tasks.processReport", &json!({"id": answer.0})).unwrap();
+        assert_eq!(org.mailbox.tasks[&copy].request_state, TaskRequestState::Declined);
+        // Messages without a task.
+        let plain =
+            deliver_raw(&mut org, ("Pat", "pat@example.org"), "me@example.com", "Hi", "Hello", vec![]);
+        assert!(task_request_info(&org, plain).is_none());
+        for cmd in ["tasks.requestInfo", "tasks.acceptRequest", "tasks.declineRequest", "tasks.processReport"]
+        {
+            assert!(matches!(org.run(cmd, &json!({"id": plain.0})), Err(CmdError::Params(_))), "{cmd}");
+            assert!(org.run(cmd, &json!({"id": u64::MAX})).is_err());
+        }
+    }
+
+    #[test]
+    fn itip_vtodo_from_another_client() {
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//Other client//EN\r\nMETHOD:REQUEST\r\n\
+BEGIN:VTODO\r\nUID:todo-42@example.com\r\nDTSTAMP:20261009T080000Z\r\nSUMMARY:Water the plants\r\n\
+DUE;VALUE=DATE:20261016\r\nPRIORITY:9\r\nSTATUS:NEEDS-ACTION\r\nRRULE:FREQ=WEEKLY;BYDAY=FR\r\n\
+ORGANIZER;CN=\"Boss\":mailto:boss@example.com\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.com\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let req = deliver_raw(
+            &mut ann,
+            ("Boss", "boss@example.com"),
+            "ann@example.com",
+            "Plants",
+            "Please",
+            vec![("task.ics".into(), "text/calendar; method=REQUEST".into(), ics.as_bytes().to_vec())],
+        );
+        let info = task_request_info(&ann, req).unwrap();
+        assert_eq!(info.requested_by, "Boss <boss@example.com>");
+        assert_eq!(info.priority, "low");
+        let r = ann.run("tasks.acceptRequest", &json!({"id": req.0, "send": "edit"})).unwrap();
+        let t = &ann.mailbox.tasks[&ItemId(r["task"].as_u64().unwrap())];
+        assert_eq!(t.uid, "todo-42@example.com");
+        assert_eq!(t.recurrence.as_ref().map(|r| r.rrule.as_str()), Some("FREQ=WEEKLY;BYDAY=FR"));
+        assert_eq!(t.due.map(|d| pim::date_string(d, ann.tz_offset_min)).as_deref(), Some("2026-10-16"));
+        let reply = &ann.composes[&r["compose"].as_u64().unwrap()];
+        let text = String::from_utf8(reply.attachments[0].data.clone()).unwrap().replace("\r\n ", "");
+        assert!(text.contains("UID:todo-42@example.com") && text.contains("ORGANIZER"), "{text}");
+        // Junk calendar data is not a task.
+        assert!(parse_task_message(b"BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:\x00\r\n", 0).is_some());
+        assert!(parse_task_message(b"\xff\xfe garbage", 0).is_none());
+        assert!(
+            parse_task_message(b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", 0)
+                .is_none()
+        );
     }
 }

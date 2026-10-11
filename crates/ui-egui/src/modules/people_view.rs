@@ -18,9 +18,9 @@ use mailcraft_model::{Contact, FlagState, FolderId, FolderKind, ItemId};
 
 use super::common::{
     ModState, a11y, change_view, child, collapsed_labels, current_folder, empty_message, folder_rows,
-    group_header, group_row, load, module_view, paint_text_clipped, pane_bg, pane_separator, persona_fill,
-    reading_split, row_height, select_folder, select_item, split_folder_pane, store, sync_selection,
-    todo_bar_strip, toggle_group, view_switch,
+    group_header, group_row, load, module_folder_pane, module_view, paint_text_clipped, pane_bg,
+    pane_separator, persona_fill, reading_split, row_height, select_folder, select_item, store,
+    sync_selection, todo_bar_strip, toggle_group, view_switch,
 };
 use super::editors;
 use crate::App;
@@ -73,8 +73,12 @@ fn first_address(c: &Contact) -> String {
     c.emails.iter().find(|e| !e.trim().is_empty()).cloned().unwrap_or_default()
 }
 
-/// Persona circle with initials.
+/// The contact's picture, else a persona circle with initials.
 fn avatar(ui: &Ui, center: egui::Pos2, radius: f32, c: &Contact) {
+    let rect = egui::Rect::from_center_size(center, egui::Vec2::splat(radius * 2.0));
+    if super::common::paint_contact_picture(ui, rect, c) {
+        return;
+    }
     let name = display_name(c);
     let addr = first_address(c);
     let key = if addr.is_empty() { name.clone() } else { addr.clone() };
@@ -101,10 +105,9 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
     let rows = view_rows(app, &st);
     sync_selection(app, |_, id| rows.iter().any(|r| r.id == id));
     let full = ui.max_rect();
-    let (pane, main) = split_folder_pane(ui, app);
+    let (pane, main) = module_folder_pane(ui, app);
     if let Some(p) = pane {
-        pane_bg(ui, p, app.theme.pane);
-        child(ui, p.shrink(6.0), "mc-people-pane", |ui| {
+        child(ui, p.shrink2(egui::vec2(6.0, 0.0)), "mc-people-pane", |ui| {
             group_header(ui, app, "My Contacts", false, "mc-people-group");
             let current = current_folder(app, Kind::Contact);
             if let (Some(f), _) = folder_rows(ui, app, FolderKind::Contacts, current, None) {
@@ -647,6 +650,28 @@ fn contact_card(ui: &mut Ui, app: &mut App, st: &mut ModState, id: ItemId) {
             }
             if !c.categories.is_empty() {
                 info_row(ui, app, "category-tag", "Categories", &c.categories.join(", "));
+            }
+            // Details page.
+            let details = [
+                ("Office", &c.office),
+                ("Profession", &c.profession),
+                ("Manager's name", &c.manager),
+                ("Assistant's name", &c.assistant),
+                ("Nickname", &c.nickname),
+                ("Spouse/Partner", &c.spouse),
+            ];
+            if details.iter().any(|(_, v)| !v.trim().is_empty()) || c.anniversary.is_some() {
+                section(ui, app, "Details");
+                for (label, value) in details {
+                    info_row(ui, app, "person", label, value);
+                }
+                if let Some(a) = &c.anniversary {
+                    info_row(ui, app, "calendar", "Anniversary", a);
+                }
+            }
+            if let mailcraft_model::FlagState::Flagged { label, reminder: Some(r), .. } = &c.flag {
+                let when = mailcraft_model::ListTime::short_date_time(*r, app.s.tz_offset_min);
+                info_row(ui, app, "flag", "Follow up", &format!("{label}. Reminder: {when}"));
             }
         }
         let notes = if is_group(&c) {

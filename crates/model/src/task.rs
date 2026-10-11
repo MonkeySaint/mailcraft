@@ -20,6 +20,21 @@ pub enum TaskPriority {
     High,
 }
 
+/// Where a task request stands.
+///
+/// On the copy kept by the person who assigned the task it follows the assignee's answers (task responses
+/// and status reports); on a task accepted from a task request it is [`TaskRequestState::Accepted`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskRequestState {
+    /// Not a task request.
+    #[default]
+    None,
+    /// Sent; no answer yet.
+    Waiting,
+    Accepted,
+    Declined,
+}
+
 /// Task recurrence (the task window's Recurrence dialog).
 ///
 /// Either the due dates follow an RFC 5545 RRULE anchored at `start` (the first occurrence's due date), or
@@ -67,11 +82,50 @@ pub struct Task {
     /// Who assigned this task to me (the task request's organizer), when it came from a task request.
     #[serde(default)]
     pub requested_by: Option<String>,
+    /// iCalendar UID shared by the requester's copy and the assignee's task (RFC 5546 iTIP); empty for
+    /// tasks that never took part in a task request.
+    #[serde(default)]
+    pub uid: String,
+    /// Where the task request stands (see [`TaskRequestState`]).
+    #[serde(default)]
+    pub request_state: TaskRequestState,
+    /// When the last task response or status report about this task was sent or applied.
+    #[serde(default)]
+    pub last_report: Option<DateTime>,
 }
 
 impl Task {
     /// True when the task is complete.
     pub fn is_complete(&self) -> bool {
         self.status == TaskStatus::Completed
+    }
+
+    /// True for a task I accepted from someone else's task request.
+    pub fn is_requested(&self) -> bool {
+        self.requested_by.is_some()
+    }
+
+    /// True for my copy of a task I assigned to other people.
+    pub fn is_assigned_by_me(&self) -> bool {
+        self.requested_by.is_none() && !self.assigned_to.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_tasks_load_without_request_fields() {
+        let json = r#"{"id":1,"folder":2,"subject":"Old","start":null,"due":null,"status":"NotStarted",
+            "priority":"Normal","percent_complete":0,"reminder":null,"body":"","categories":[],
+            "completed":null,"from_mail":null}"#;
+        let t: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(t.request_state, TaskRequestState::None);
+        assert!(t.uid.is_empty() && !t.is_requested() && !t.is_assigned_by_me());
+        let mine = Task { assigned_to: vec!["pat@example.org".into()], ..t.clone() };
+        assert!(mine.is_assigned_by_me());
+        let got = Task { requested_by: Some("boss@example.com".into()), ..mine };
+        assert!(got.is_requested() && !got.is_assigned_by_me());
     }
 }

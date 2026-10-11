@@ -44,6 +44,8 @@ Tasks|Home > New Items|Group|-|Microsoft 365 Groups are a cloud tenant service
 Tasks|Home > New Items|Contact|people.new
 Tasks|Home > New Items|Task|tasks.new
 Tasks|Home > New Items|Task Request|tasks.assign
+# Received task requests (iTIP VTODO): tasks.requestInfo, tasks.acceptRequest, tasks.declineRequest; answers and
+# status reports: tasks.sendStatusReport, tasks.processReport (not observed rows: the reading pane's info bar).
 Tasks|Home > New Items|More Items|mail.newItem
 Tasks|Home > New Items > More Items|Contact Group|people.newGroup
 Tasks|Home > New Items > More Items|Internet Fax|-|needs a third-party online fax service provider

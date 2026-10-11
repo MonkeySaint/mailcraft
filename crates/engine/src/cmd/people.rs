@@ -9,25 +9,36 @@
 //! given and otherwise ask the UI to open the contact / contact group window. `people.forward` attaches
 //! vCards (RFC 6350, `mailcraft-formats`).
 //!
+//! **Details and picture.** Besides the General fields a contact holds the Details page (office,
+//! profession, manager, assistant, nickname, spouse/partner, anniversary) and a picture (`picture`: base64
+//! PNG/JPEG/GIF, or `picturePath`: a file; `null` removes it), all set through `people.new` /
+//! `people.update`. [`all_fields`] is the All Fields page: every field with its value.
+//!
 //! **Tags.** Contacts can be flagged for follow-up like messages (`people.flag`; flagged contacts appear in
-//! the To-Do List) and marked private (`people.private`).
+//! the To-Do List) and marked private (`people.private`). Follow Up › Add Reminder puts a reminder time on
+//! the contact's flag; [`due_reminders`], [`next_reminder_after`], [`dismiss_reminder`] and
+//! [`snooze_reminder`] are what the reminders scan uses for contacts.
 //!
 //! **Mail Merge** (`people.mailMerge`) merges the contacts into E-mail messages: `{{Field}}` placeholders
 //! ([`MERGE_FIELDS`]) in the subject and body are replaced with each contact's fields, a preview shows one
-//! merged message, and Send puts one message per contact with an address in the Outbox.
+//! merged message, and Send puts one message per contact with an address in the Outbox. Merging to Form
+//! Letters, Mailing Labels or Envelopes needs a word processor document, which MailCraft does not have:
+//! those document types are listed but off (the command answers that they are not available), and E-mail
+//! is the default.
 //!
 //! **Assign Task** (`people.assignTask`) sends a task request (VTODO) to the selected contacts
 //! (`tasks::assign`).
 //!
 //! **Views.** [`view_rows`] is the list of the People views (`cmd::view::modules`).
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cmd::calendar::{self, pim, pim::Kind};
 use crate::cmd::util::{opt_bool, opt_str};
 use crate::cmd::view::modules::{self, ModuleKind, RowKind, ViewRow};
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
-use mailcraft_model::contact::PostalAddress;
+use mailcraft_model::contact::{ContactPicture, MAX_PICTURE_BYTES, PostalAddress};
 use mailcraft_model::text::contains_ci;
 use mailcraft_model::{Contact, DateTime, FlagState, FolderId, ItemId, dates};
 
@@ -143,7 +154,7 @@ fn group_notes(c: &Contact) -> String {
     }
 }
 
-const CONTACT_FIELDS: [&str; 22] = [
+const CONTACT_FIELDS: [&str; 31] = [
     "fullName",
     "firstName",
     "middleName",
@@ -166,7 +177,66 @@ const CONTACT_FIELDS: [&str; 22] = [
     "birthday",
     "notes",
     "categories",
+    "office",
+    "profession",
+    "manager",
+    "assistant",
+    "nickname",
+    "spouse",
+    "anniversary",
+    "picture",
+    "picturePath",
 ];
+
+/// Largest picture side accepted (pixels).
+pub const MAX_PICTURE_SIDE: u32 = 4_096;
+
+/// A picture from encoded image bytes: PNG, JPEG or GIF of at most [`MAX_PICTURE_BYTES`] and
+/// [`MAX_PICTURE_SIDE`] pixels a side.
+pub fn picture_from_bytes(data: &[u8]) -> Result<ContactPicture, CmdError> {
+    if data.len() > MAX_PICTURE_BYTES {
+        return Err(CmdError::Params(format!("the picture is larger than {} KB", MAX_PICTURE_BYTES / 1024)));
+    }
+    let pic = ContactPicture::sniff(data)
+        .ok_or_else(|| CmdError::Params("the picture must be a PNG, JPEG or GIF image".into()))?;
+    match pic.dimensions() {
+        Some((w, h)) if w > 0 && h > 0 && w <= MAX_PICTURE_SIDE && h <= MAX_PICTURE_SIDE => Ok(pic),
+        Some(_) => {
+            Err(CmdError::Params(format!("the picture must be at most {MAX_PICTURE_SIDE} pixels a side")))
+        }
+        None => Err(CmdError::Params("the picture is damaged".into())),
+    }
+}
+
+/// Reads a picture file (size-checked before reading).
+fn picture_from_path(path: &str) -> Result<ContactPicture, CmdError> {
+    let path = std::path::Path::new(path.trim());
+    let meta = std::fs::metadata(path).map_err(|e| CmdError::Failed(format!("{}: {e}", path.display())))?;
+    if !meta.is_file() {
+        return Err(CmdError::Params(format!("{} is not a file", path.display())));
+    }
+    if meta.len() > MAX_PICTURE_BYTES as u64 {
+        return Err(CmdError::Params(format!("the picture is larger than {} KB", MAX_PICTURE_BYTES / 1024)));
+    }
+    let data = std::fs::read(path).map_err(|e| CmdError::Failed(format!("{}: {e}", path.display())))?;
+    picture_from_bytes(&data)
+}
+
+fn date_field(p: &Value, key: &str) -> Result<Option<Option<String>>, CmdError> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(b)) if b.trim().is_empty() => Ok(Some(None)),
+        Some(Value::String(b)) => {
+            let b = b.trim();
+            if !valid_birthday(b) {
+                return Err(CmdError::Params(format!("`{key}` must be YYYY-MM-DD")));
+            }
+            Ok(Some(Some(b.to_owned())))
+        }
+        Some(_) => Err(CmdError::Params(format!("`{key}` must be a string"))),
+    }
+}
 
 fn address_from(v: &Value, default_kind: &str) -> Result<PostalAddress, CmdError> {
     let Some(o) = v.as_object() else {
@@ -211,6 +281,12 @@ pub fn apply_contact_fields(s: &Session, c: &mut Contact, p: &Value) -> Result<(
         ("webPage", &mut c.web_page),
         ("im", &mut c.im_address),
         ("notes", &mut c.notes),
+        ("office", &mut c.office),
+        ("profession", &mut c.profession),
+        ("manager", &mut c.manager),
+        ("assistant", &mut c.assistant),
+        ("nickname", &mut c.nickname),
+        ("spouse", &mut c.spouse),
     ] {
         if let Some(v) = pim::text(p, key)? {
             *slot = v.trim().to_owned();
@@ -274,18 +350,30 @@ pub fn apply_contact_fields(s: &Session, c: &mut Contact, p: &Value) -> Result<(
         c.addresses.retain(|x| !x.kind.eq_ignore_ascii_case("Business"));
         c.addresses.insert(0, addr);
     }
-    match p.get("birthday") {
+    if let Some(b) = date_field(p, "birthday")? {
+        c.birthday = b;
+    }
+    if let Some(a) = date_field(p, "anniversary")? {
+        c.anniversary = a;
+    }
+    match p.get("picture") {
         None => {}
-        Some(Value::Null) => c.birthday = None,
-        Some(Value::String(b)) if b.trim().is_empty() => c.birthday = None,
-        Some(Value::String(b)) => {
-            let b = b.trim();
-            if !valid_birthday(b) {
-                return Err(CmdError::Params("`birthday` must be YYYY-MM-DD".into()));
-            }
-            c.birthday = Some(b.to_owned());
+        Some(Value::Null) => c.picture = None,
+        Some(Value::String(t)) if t.len() <= MAX_PICTURE_BYTES.saturating_mul(2) => {
+            use base64::Engine as _;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(t.trim())
+                .map_err(|_| CmdError::Params("`picture` must be base64 image data".into()))?;
+            c.picture = Some(picture_from_bytes(&data)?);
         }
-        Some(_) => return Err(CmdError::Params("`birthday` must be a string".into())),
+        Some(_) => return Err(CmdError::Params("`picture` must be base64 image data or null".into())),
+    }
+    match p.get("picturePath") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(path)) if !path.trim().is_empty() && path.len() <= 4_096 => {
+            c.picture = Some(picture_from_path(path)?);
+        }
+        Some(_) => return Err(CmdError::Params("`picturePath` must be a file path".into())),
     }
     if let Some(v) = pim::list(p, "categories")? {
         c.categories = v;
@@ -381,7 +469,61 @@ pub fn contact_json(c: &Contact) -> Value {
         "emails": c.emails,
         "phones": c.phones.iter().map(|(k, n)| json!({ "kind": k, "number": n })).collect::<Vec<_>>(),
         "categories": c.categories,
+        "picture": c.picture.as_ref().map(|p| json!({ "type": p.mime, "bytes": p.data.len() })),
     })
+}
+
+/// The All Fields page: (field name, value) for every contact field that has a value, in the order of the
+/// General and Details pages.
+pub fn all_fields(c: &Contact) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut add = |name: &str, value: &str| {
+        if !value.trim().is_empty() {
+            out.push((name.to_owned(), value.trim().to_owned()));
+        }
+    };
+    add("Full Name", &c.full_name());
+    add("Title", &c.title);
+    add("First Name", &c.first_name);
+    add("Middle Name", &c.middle_name);
+    add("Last Name", &c.last_name);
+    add("Suffix", &c.suffix);
+    add("Nickname", &c.nickname);
+    add("File As", &c.file_as);
+    add("Company", &c.company);
+    add("Job Title", &c.job_title);
+    add("Department", &c.department);
+    add("Office Location", &c.office);
+    add("Profession", &c.profession);
+    add("Manager's Name", &c.manager);
+    add("Assistant's Name", &c.assistant);
+    add("Spouse/Partner", &c.spouse);
+    add("Birthday", c.birthday.as_deref().unwrap_or(""));
+    add("Anniversary", c.anniversary.as_deref().unwrap_or(""));
+    for (i, e) in c.emails.iter().enumerate() {
+        let name = if i == 0 { "E-mail".to_owned() } else { format!("E-mail {}", i + 1) };
+        add(&name, e);
+    }
+    for (kind, number) in &c.phones {
+        add(&format!("{kind} Phone"), number);
+    }
+    for a in &c.addresses {
+        let text = [&a.street, &a.city, &a.region, &a.postal_code, &a.country]
+            .iter()
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        add(&format!("{} Address", a.kind), &text);
+    }
+    add("Web Page", &c.web_page);
+    add("IM Address", &c.im_address);
+    add("Categories", &c.categories.join("; "));
+    if let Some(p) = &c.picture {
+        add("Picture", &format!("{} ({} KB)", p.mime, p.data.len().div_ceil(1024)));
+    }
+    add("Notes", &c.notes);
+    out
 }
 
 /// Creates a contact in `folder` from field params; returns its id.
@@ -823,9 +965,10 @@ pub fn merge_text(template: &str, c: &Contact) -> Result<String, CmdError> {
     Ok(out)
 }
 
-/// Mail Merge. `contacts`: all (the current contacts folder, in list order) or selected; `output`: letters,
-/// email, labels or envelopes (only E-mail can be produced: form letters, labels and envelopes need a
-/// word processor). Without `action` the Mail Merge window opens. With `action`:
+/// Mail Merge. `contacts`: all (the current contacts folder, in list order) or selected; `output`: email
+/// (default), letters, labels or envelopes. Only E-mail can be produced: form letters, labels and envelopes
+/// need a word processor document, so they are off (the window lists them disabled and merging to them is
+/// refused as not available). Without `action` the Mail Merge window opens. With `action`:
 /// - `preview` {subject, body, index?}: the merged message for one contact (with an address),
 /// - `send` {subject, body}: one message per contact with an address, sent to the Outbox.
 fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
@@ -835,8 +978,8 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
         Some(_) => return Err(CmdError::Params("`contacts` must be all|selected".into())),
     };
     let output = match opt_str(p, "output") {
-        None | Some("letters") => "letters",
-        Some(o @ ("email" | "labels" | "envelopes")) => o,
+        None | Some("email") => "email",
+        Some(o @ ("letters" | "labels" | "envelopes")) => o,
         Some(_) => return Err(CmdError::Params("`output` must be letters|email|labels|envelopes".into())),
     };
     let ids = if contacts == "selected" {
@@ -853,7 +996,7 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
         );
     };
     if output != "email" {
-        return Err(CmdError::Failed(
+        return Err(CmdError::Disabled(
             "Form letters, mailing labels and envelopes need a word processor; choose E-mail to merge into messages."
                 .into(),
         ));
@@ -1068,6 +1211,93 @@ fn run_private(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     Ok(json!({ "ids": pim::ids_json(&ids), "private": on }))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Contact reminders (Follow Up › Add Reminder)
+
+/// A contact whose follow-up reminder is due.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactReminder {
+    pub contact: u64,
+    /// The contact's name (the Reminders window's subject line).
+    pub subject: String,
+    /// The flag's text ("Follow up", "Call", …).
+    pub label: String,
+    /// When the reminder came due (unix seconds).
+    pub remind_at: i64,
+    /// The flag's due date (unix seconds).
+    pub due: Option<i64>,
+}
+
+fn in_deleted(s: &Session, folder: FolderId) -> bool {
+    s.mailbox
+        .folder_account(folder)
+        .and_then(|a| s.mailbox.role_folder(a, mailcraft_model::FolderRole::DeletedItems))
+        .is_some_and(|d| s.mailbox.is_in_subtree(folder, d))
+}
+
+/// Contacts whose flag reminder is due at `now` (unix seconds): flagged, not complete, in a contacts folder
+/// outside Deleted Items; soonest first. The reminders scan lists them with the key `contact:<id>`.
+pub fn due_reminders(s: &Session, now: i64) -> Vec<ContactReminder> {
+    let mut out: Vec<ContactReminder> = s
+        .mailbox
+        .contacts
+        .values()
+        .filter_map(|c| {
+            let FlagState::Flagged { label, due, reminder: Some(r), .. } = &c.flag else { return None };
+            if r.unix > now || !pim::is_kind_folder(s, c.folder, Kind::Contact) || in_deleted(s, c.folder) {
+                return None;
+            }
+            Some(ContactReminder {
+                contact: c.id.0,
+                subject: Some(c.full_name())
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| display_name(c)),
+                label: label.clone(),
+                remind_at: r.unix,
+                due: due.map(|d| d.unix),
+            })
+        })
+        .collect();
+    out.sort_by_key(|r| (r.remind_at, r.contact));
+    out
+}
+
+/// The next contact reminder time after `now` and no later than `limit` (unix seconds), so the reminders
+/// scan can wake up exactly then.
+pub fn next_reminder_after(s: &Session, now: i64, limit: i64) -> Option<i64> {
+    s.mailbox
+        .contacts
+        .values()
+        .filter_map(|c| match &c.flag {
+            FlagState::Flagged { reminder: Some(r), .. } if r.unix > now && r.unix <= limit => Some(r.unix),
+            _ => None,
+        })
+        .min()
+}
+
+/// Dismiss: the contact stays flagged but its reminder is gone. False when it had none.
+pub fn dismiss_reminder(s: &mut Session, id: ItemId) -> bool {
+    match s.mailbox.contacts.get_mut(&id).map(|c| &mut c.flag) {
+        Some(FlagState::Flagged { reminder: r @ Some(_), .. }) => {
+            *r = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Snooze: the reminder comes back at `until`. False when the contact has no reminder.
+pub fn snooze_reminder(s: &mut Session, id: ItemId, until: DateTime) -> bool {
+    match s.mailbox.contacts.get_mut(&id).map(|c| &mut c.flag) {
+        Some(FlagState::Flagged { reminder: r @ Some(_), .. }) => {
+            *r = Some(until);
+            true
+        }
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1306,7 +1536,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mail Merge",
             "People › Home › Actions",
             "",
-            r#"{"contacts": "all|selected", "output": "letters|email|labels|envelopes", "action"?: "preview|send", "subject"?: string, "body"?: string ({{Field}} placeholders), "index"?: number, "ids"?: [number]} (no action = open the Mail Merge window)"#,
+            r#"{"contacts": "all|selected", "output"?: "email|letters|labels|envelopes" (only email merges), "action"?: "preview|send", "subject"?: string, "body"?: string ({{Field}} placeholders), "index"?: number, "ids"?: [number]} (no action = open the Mail Merge window)"#,
             true,
             always,
             run_mail_merge,
@@ -1648,7 +1878,10 @@ mod tests {
         assert!(matches!(s.run("people.mailMerge", &json!({"output": "fax"})), Err(CmdError::Params(_))));
         // Labels cannot be produced; only E-mail merges.
         let r = s.run("people.mailMerge", &json!({"output": "labels", "action": "send", "subject": "x"}));
-        assert!(matches!(r, Err(CmdError::Failed(_))));
+        assert!(matches!(r, Err(CmdError::Disabled(_))));
+        // E-mail is the default document type.
+        s.run("people.mailMerge", &json!({})).unwrap();
+        assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(_, p)) if p["output"] == "email"));
     }
 
     #[test]
@@ -1694,7 +1927,8 @@ mod tests {
         let a = add(&mut s, json!({"fullName": "Ann Lee", "email": "ann@example.com"}));
         let b = add(&mut s, json!({"fullName": "No Mail"}));
         select(&mut s, &[a, b]);
-        let r = s.run("people.meeting", &json!({})).unwrap();
+        // `form: false` saves the meeting straight away (without it the meeting form opens first).
+        let r = s.run("people.meeting", &json!({"form": false})).unwrap();
         let appt = &s.mailbox.appointments[&ItemId(r["id"].as_u64().unwrap())];
         assert_eq!(appt.attendees.len(), 1);
         assert_eq!(appt.folder, role(&s, FolderRole::Calendar));
@@ -1897,5 +2131,92 @@ mod tests {
         assert_eq!(s.mailbox.contacts[&ItemId(a)].categories, vec!["Blue category".to_string()]);
         assert!(valid_birthday("2000-02-29"));
         assert!(!valid_birthday("2001-02-29"));
+    }
+
+    /// A 2×2 PNG (valid header; the pixels are not decoded by the engine).
+    fn png_bytes() -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        v.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 2, 8, 6, 0, 0, 0]);
+        v
+    }
+
+    #[test]
+    fn details_all_fields_and_picture() {
+        use base64::Engine as _;
+        let mut s = session();
+        let pic = base64::engine::general_purpose::STANDARD.encode(png_bytes());
+        let a = add(
+            &mut s,
+            json!({"fullName": "Ann Lee", "office": "B-12", "profession": "Editor", "manager": "Bo Ek",
+                   "assistant": "Cy", "nickname": "Annie", "spouse": "Dee", "anniversary": "2020-06-01",
+                   "picture": pic, "email": "ann@example.com"}),
+        );
+        let c = &s.mailbox.contacts[&ItemId(a)];
+        assert_eq!((c.office.as_str(), c.nickname.as_str()), ("B-12", "Annie"));
+        assert_eq!(c.anniversary.as_deref(), Some("2020-06-01"));
+        assert_eq!(c.picture.as_ref().map(|p| p.mime.as_str()), Some("image/png"));
+        let fields = all_fields(c);
+        assert!(fields.contains(&("Manager's Name".to_owned(), "Bo Ek".to_owned())), "{fields:?}");
+        assert!(fields.contains(&("E-mail".to_owned(), "ann@example.com".to_owned())));
+        assert!(fields.iter().any(|(k, _)| k == "Picture"));
+        assert!(!fields.iter().any(|(k, _)| k == "Suffix"), "empty fields are left out");
+        let r = s.run("people.update", &json!({"id": a, "picture": null, "anniversary": ""})).unwrap();
+        assert_eq!(r["updated"][0]["picture"], Value::Null, "{r}");
+        assert!(s.mailbox.contacts[&ItemId(a)].anniversary.is_none());
+        // Bad pictures and dates are refused.
+        for bad in [
+            json!({"id": a, "picture": "not base64!"}),
+            json!({"id": a, "picture": base64::engine::general_purpose::STANDARD.encode(b"plain text")}),
+            json!({"id": a, "picture": 7}),
+            json!({"id": a, "anniversary": "June"}),
+            json!({"id": a, "picturePath": ""}),
+        ] {
+            assert!(matches!(s.run("people.update", &bad), Err(CmdError::Params(_))), "{bad}");
+        }
+        let mut huge = png_bytes();
+        huge.splice(16..24, [0, 1, 0, 0, 0, 1, 0, 0]);
+        assert!(picture_from_bytes(&huge).is_err(), "65536 px a side");
+        // From a file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ann.png");
+        std::fs::write(&path, png_bytes()).unwrap();
+        s.run("people.update", &json!({"id": a, "picturePath": path.to_string_lossy()})).unwrap();
+        assert_eq!(s.mailbox.contacts[&ItemId(a)].picture.as_ref().unwrap().data, png_bytes());
+        let missing = dir.path().join("missing.png");
+        assert!(s.run("people.update", &json!({"id": a, "picturePath": missing.to_string_lossy()})).is_err());
+        assert!(
+            s.run("people.update", &json!({"id": a, "picturePath": dir.path().to_string_lossy()})).is_err()
+        );
+    }
+
+    #[test]
+    fn contact_reminders_come_due() {
+        let mut s = session(); // 2026-10-09 10:07
+        let a = add(&mut s, json!({"fullName": "Ann Lee"}));
+        select(&mut s, &[a]);
+        let now = s.now().unix;
+        assert!(due_reminders(&s, now).is_empty());
+        // Add Reminder without a flag yet: flagged with the reminder.
+        s.run("people.flag", &json!({"kind": "reminder", "reminder": "2026-10-09T10:00", "label": "Call"}))
+            .unwrap();
+        let due = due_reminders(&s, now);
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].contact, due[0].subject.as_str(), due[0].label.as_str()), (a, "Ann Lee", "Call"));
+        assert_eq!(next_reminder_after(&s, now, now + 86_400), None);
+        // Snooze moves it into the future; dismiss keeps the flag without the reminder.
+        assert!(snooze_reminder(&mut s, ItemId(a), DateTime::from_unix(now + 600, 0)));
+        assert!(due_reminders(&s, now).is_empty());
+        assert_eq!(next_reminder_after(&s, now, now + 86_400), Some(now + 600));
+        assert_eq!(due_reminders(&s, now + 600).len(), 1);
+        assert!(dismiss_reminder(&mut s, ItemId(a)));
+        assert!(!dismiss_reminder(&mut s, ItemId(a)));
+        assert!(matches!(s.mailbox.contacts[&ItemId(a)].flag, FlagState::Flagged { reminder: None, .. }));
+        assert!(due_reminders(&s, now + 600).is_empty());
+        assert!(!snooze_reminder(&mut s, ItemId(u64::MAX), DateTime::from_unix(now, 0)));
+        // Completed or deleted contacts do not remind.
+        s.run("people.flag", &json!({"kind": "reminder", "reminder": "2026-10-09T09:00"})).unwrap();
+        assert_eq!(due_reminders(&s, now).len(), 1);
+        s.run("people.delete", &json!({"ids": [a]})).unwrap();
+        assert!(due_reminders(&s, now).is_empty());
     }
 }

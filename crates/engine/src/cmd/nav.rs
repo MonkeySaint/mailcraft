@@ -6,6 +6,7 @@
 use serde_json::{Value, json};
 
 use crate::cmd::util::{dialog, opt_bool, opt_ids};
+use crate::cmd::view::modules;
 use crate::queries;
 use crate::{CmdError, CmdResult, CommandSpec, Module, Selection, Session, always};
 use mailcraft_model::{FolderId, FolderKind, FolderRole, ItemId, TaskStatus};
@@ -74,7 +75,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Select Item",
             location: "Message list",
             shortcut: "",
-            params: r#"{"id": number} | {"ids": [number]}, "toggle"?: bool (Ctrl+click), "extend"?: bool (Shift+click)"#,
+            params: r#"{"id": number} | {"ids": [number]} (messages, contacts, tasks or notes), "toggle"?: bool (Ctrl+click), "extend"?: bool (Shift+click)"#,
             mutates: true,
             enabled: always,
             run: select_item,
@@ -365,34 +366,71 @@ fn go_to_role(s: &mut Session, role: FolderRole) -> CmdResult {
 
 fn selection_result(s: &Session) -> Value {
     let items: Vec<u64> = s.selection.items.iter().map(|i| i.0).collect();
-    json!({"folder": s.selection.folder.0, "items": items, "focus": s.selection.focus.map(|f| f.0)})
+    json!({
+        "folder": s.selection.folder.0,
+        "module": module_name(s.view.module),
+        "items": items,
+        "focus": s.selection.focus.map(|f| f.0),
+    })
 }
 
+/// The folder an item lives in: a message's, or a contact's, task's or note's (module items).
+fn item_folder(s: &Session, id: ItemId) -> Option<FolderId> {
+    let mb = &s.mailbox;
+    mb.mail
+        .get(&id)
+        .map(|m| m.folder)
+        .or_else(|| mb.contacts.get(&id).map(|c| c.folder))
+        .or_else(|| mb.tasks.get(&id).map(|t| t.folder))
+        .or_else(|| mb.notes.get(&id).map(|n| n.folder))
+}
+
+/// Items in the order the current folder shows them: a module folder's view rows (People, Tasks — the
+/// To-Do List also shows flagged messages and contacts — and Notes), else the message list.
+fn shown_order(s: &Session) -> Vec<ItemId> {
+    if modules::module_kind(s, s.selection.folder).is_some() {
+        modules::rows(s, s.selection.folder).into_iter().map(|r| r.id).collect()
+    } else {
+        queries::visible_item_ids(s)
+    }
+}
+
+/// Selects items: messages in the message list, or contacts, tasks and notes in their module view (the
+/// module selection the People, Tasks and Notes commands act on), so the CLI and MCP can drive them. An item
+/// the current view does not show switches to its folder (and module) first; a message found by a search
+/// keeps the search results.
 fn select_item(s: &mut Session, p: &Value) -> CmdResult {
-    let mut ids: Vec<ItemId> =
-        match p.get("id").filter(|v| !v.is_null()) {
-            Some(v) => vec![ItemId(v.as_u64().ok_or_else(|| {
-                CmdError::Params("`id` must be a message id (non-negative integer)".into())
-            })?)],
-            None => opt_ids(p).ok_or_else(|| CmdError::Params("`id` or `ids` required".into()))?,
-        };
+    let mut ids: Vec<ItemId> = match p.get("id").filter(|v| !v.is_null()) {
+        Some(v) => vec![ItemId(
+            v.as_u64()
+                .ok_or_else(|| CmdError::Params("`id` must be an item id (non-negative integer)".into()))?,
+        )],
+        None => opt_ids(p).ok_or_else(|| CmdError::Params("`id` or `ids` required".into()))?,
+    };
     let mut seen = std::collections::BTreeSet::new();
     ids.retain(|id| seen.insert(*id));
     if ids.is_empty() {
-        return Err(CmdError::Params("no message ids given".into()));
+        return Err(CmdError::Params("no item ids given".into()));
     }
-    if let Some(missing) = ids.iter().find(|id| !s.mailbox.mail.contains_key(id)) {
-        return Err(CmdError::Params(format!("no message with id {}", missing.0)));
+    if let Some(missing) = ids.iter().find(|id| item_folder(s, **id).is_none()) {
+        return Err(CmdError::Params(format!("no message, contact, task or note with id {}", missing.0)));
     }
     let toggle = opt_bool(p, "toggle").unwrap_or(false);
     let extend = opt_bool(p, "extend").unwrap_or(false);
     let focus = ids.last().copied();
-    // Selecting a message from another folder (outside a search) shows that folder.
-    if s.view.search.trim().is_empty()
-        && let Some(folder) = focus.and_then(|f| s.mailbox.mail.get(&f)).map(|m| m.folder)
+    if let Some(f) = focus
+        && let Some(folder) = item_folder(s, f)
         && folder != s.selection.folder
     {
-        select_folder_id(s, folder)?;
+        let is_mail = s.mailbox.mail.contains_key(&f);
+        // A message found by a search stays in the results; an item the current module view lists (the
+        // To-Do List's flagged messages and contacts) stays in that view.
+        let searching = is_mail && !s.view.search.trim().is_empty();
+        let listed_here =
+            modules::module_kind(s, s.selection.folder).is_some() && shown_order(s).contains(&f);
+        if !searching && !listed_here {
+            select_folder_id(s, folder)?;
+        }
     }
     leave_focus(s, focus);
     if toggle {
@@ -404,7 +442,7 @@ fn select_item(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
     } else if extend && let (Some(anchor), Some(target)) = (s.selection.focus, focus) {
-        let order = queries::visible_item_ids(s);
+        let order = shown_order(s);
         let a = order.iter().position(|x| *x == anchor);
         let b = order.iter().position(|x| *x == target);
         s.selection.items = match (a, b) {
@@ -539,5 +577,54 @@ mod tests {
         s.run("nav.inbox", &json!({})).unwrap();
         assert_eq!(s.mailbox.folder(s.selection.folder).and_then(|f| f.role), Some(FolderRole::Inbox));
         assert!(s.run("nav.selectFolder", &json!({"folder": -1})).is_err());
+    }
+
+    #[test]
+    fn select_item_drives_module_selection() {
+        let mut s = sample_session();
+        let contact =
+            s.run("people.new", &json!({"fullName": "Ann Lee", "email": "ann@example.com"})).unwrap()["id"]
+                .as_u64()
+                .unwrap();
+        let task = s.run("tasks.new", &json!({"subject": "Report"})).unwrap()["id"].as_u64().unwrap();
+        let note = s.run("notes.new", &json!({"text": "Idea"})).unwrap()["id"].as_u64().unwrap();
+        // From the Inbox: selecting a contact opens People with the contact selected.
+        s.run("nav.inbox", &json!({})).unwrap();
+        let r = s.run("nav.selectItem", &json!({"id": contact})).unwrap();
+        assert_eq!(r["module"], "People");
+        assert_eq!(s.view.module, Module::People);
+        assert_eq!(s.selection.focus.map(|i| i.0), Some(contact));
+        // Module commands now act on it.
+        let r = s.run("people.private", &json!({})).unwrap();
+        assert_eq!(r["ids"], json!([contact]));
+        // Tasks and notes likewise.
+        s.run("nav.selectItem", &json!({"id": task})).unwrap();
+        assert_eq!(s.view.module, Module::Tasks);
+        assert!(s.run("tasks.markComplete", &json!({})).is_ok());
+        assert!(s.mailbox.tasks[&mailcraft_model::ItemId(task)].is_complete());
+        s.run("nav.selectItem", &json!({"id": note})).unwrap();
+        assert_eq!(s.view.module, Module::Notes);
+        assert_eq!(s.run("notes.delete", &json!({})).unwrap()["deleted"], json!([note]));
+        // The To-Do List shows flagged messages: selecting one keeps the Tasks module.
+        s.run("nav.inbox", &json!({})).unwrap();
+        let mail = crate::queries::visible_item_ids(&s)[0];
+        if let Some(m) = s.mailbox.mail.get_mut(&mail) {
+            m.flag = mailcraft_model::FlagState::Flagged {
+                label: "Follow up".into(),
+                start: None,
+                due: None,
+                reminder: None,
+            };
+        }
+        s.run("nav.tasks", &json!({})).unwrap();
+        let tasks_folder = s.selection.folder;
+        s.run("nav.selectItem", &json!({"id": mail.0})).unwrap();
+        assert_eq!((s.view.module, s.selection.folder), (Module::Tasks, tasks_folder));
+        // Shift+click extends along the view's rows.
+        let open = s.run("tasks.new", &json!({"subject": "Another"})).unwrap()["id"].as_u64().unwrap();
+        let r = s.run("nav.selectItem", &json!({"id": open, "extend": true})).unwrap();
+        assert!(r["items"].as_array().unwrap().len() >= 2, "{r}");
+        assert!(s.run("nav.selectItem", &json!({"id": u64::MAX})).is_err());
+        assert!(s.run("nav.selectItem", &json!({"ids": []})).is_err());
     }
 }

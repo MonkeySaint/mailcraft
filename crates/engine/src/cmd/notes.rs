@@ -9,8 +9,15 @@
 //! `{"view": NotesViewState}`. A `view` param overrides the stored state as the starting point.
 //! `notes.lineUpIcons` also returns the grid order of the notes in the current folder.
 //!
+//! **Icon positions.** Icons dragged off the grid keep their place: `notes.setPosition` stores the note's
+//! offset from the grid's top-left corner (points) with the folder's view state, which the profile saves,
+//! and [`positions`] reads them back. Line Up Icons drops them (the icons snap back to the grid), and so
+//! does Reset View.
+//!
 //! `notes.forward` sends the note's text in a new message. [`view_rows`] is the list of the Notes views
 //! (Icon, Notes List, Last 7 Days).
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -63,6 +70,85 @@ fn store_view(s: &mut Session, v: &NotesViewState) {
     if let Some(f) = pim::current_folder(s, Kind::Note) {
         modules::set_icons(s, f, v.icon_mode, v.lined_up);
     }
+}
+
+/// Reserved entry of the folder's view state holding the icon positions (JSON after the prefix). The
+/// control character keeps it apart from group labels (`cmd::view::is_group_label`).
+const NOTE_POS: &str = "\u{1}notes.pos=";
+/// Most icon positions kept per folder.
+pub const MAX_POSITIONS: usize = 2_000;
+/// Largest offset accepted (points).
+pub const MAX_OFFSET: f32 = 100_000.0;
+
+fn valid_offset(v: f32) -> bool {
+    v.is_finite() && (0.0..=MAX_OFFSET).contains(&v)
+}
+
+/// Icon positions of the notes of `folder` that were dragged off the grid: note id → (x, y) offset from the
+/// grid's top-left corner. Positions of notes no longer in the folder are left out.
+pub fn positions(s: &Session, folder: FolderId) -> BTreeMap<u64, (f32, f32)> {
+    s.view
+        .collapsed_groups
+        .get(&folder)
+        .and_then(|list| list.iter().find_map(|e| e.strip_prefix(NOTE_POS)))
+        .and_then(|json| serde_json::from_str::<BTreeMap<u64, (f32, f32)>>(json).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(id, (x, y))| {
+            valid_offset(*x)
+                && valid_offset(*y)
+                && s.mailbox.notes.get(&ItemId(*id)).is_some_and(|n| n.folder == folder)
+        })
+        .take(MAX_POSITIONS)
+        .collect()
+}
+
+fn store_positions(s: &mut Session, folder: FolderId, map: &BTreeMap<u64, (f32, f32)>) {
+    let list = s.view.collapsed_groups.entry(folder).or_default();
+    list.retain(|e| !e.starts_with(NOTE_POS));
+    if !map.is_empty()
+        && let Ok(json) = serde_json::to_string(map)
+    {
+        list.push(format!("{NOTE_POS}{json}"));
+    }
+    if list.is_empty() {
+        s.view.collapsed_groups.remove(&folder);
+    }
+}
+
+fn offset_param(p: &Value, key: &str) -> Result<f32, CmdError> {
+    p.get(key)
+        .and_then(Value::as_f64)
+        .map(|v| v as f32)
+        .filter(|v| valid_offset(*v))
+        .ok_or_else(|| CmdError::Params(format!("`{key}` must be a number from 0 to {MAX_OFFSET}")))
+}
+
+/// `notes.setPosition {id, x, y}` keeps a dragged icon where it was dropped; `{id, position: null}` puts it
+/// back on the grid. Dragging means the icons are no longer lined up.
+fn run_set_position(s: &mut Session, p: &Value) -> CmdResult {
+    let id = pim::require_targets(s, p, Kind::Note)?
+        .first()
+        .copied()
+        .ok_or_else(|| CmdError::Params("no note given".into()))?;
+    let folder =
+        s.mailbox.notes.get(&id).map(|n| n.folder).ok_or_else(|| CmdError::Params("no note".into()))?;
+    let mut map = positions(s, folder);
+    if p.get("position").is_some_and(Value::is_null) {
+        map.remove(&id.0);
+    } else {
+        let (x, y) = (offset_param(p, "x")?, offset_param(p, "y")?);
+        if !map.contains_key(&id.0) && map.len() >= MAX_POSITIONS {
+            return Err(CmdError::Params(format!("at most {MAX_POSITIONS} icons keep a position")));
+        }
+        map.insert(id.0, (x, y));
+        let st = modules::state(s, folder, ModuleKind::Notes);
+        if st.lined_up {
+            modules::set_icons(s, folder, st.icon_mode, false);
+        }
+    }
+    store_positions(s, folder, &map);
+    Ok(json!({ "id": id.0, "folder": folder.0, "positions": map.len() }))
 }
 
 fn parse_color(c: &str) -> Option<NoteColor> {
@@ -267,6 +353,9 @@ fn run_line_up(s: &mut Session, p: &Value) -> CmdResult {
     }
     v.lined_up = true;
     store_view(s, &v);
+    if let Some(f) = pim::current_folder(s, Kind::Note) {
+        store_positions(s, f, &BTreeMap::new());
+    }
     Ok(json!({ "view": v, "order": pim::ids_json(&grid_order(s)) }))
 }
 
@@ -299,6 +388,15 @@ pub fn specs() -> Vec<CommandSpec> {
             true,
             notes_present,
             run_line_up,
+        ),
+        spec(
+            "notes.setPosition",
+            "Move Icon",
+            "Notes › Icon view",
+            r#"{"id": number, "x": number, "y": number} | {"id": number, "position": null} (back to the grid)"#,
+            true,
+            always,
+            run_set_position,
         ),
         spec(
             "notes.new",
@@ -465,5 +563,47 @@ mod tests {
         s.run("notes.delete", &json!({"id": id})).unwrap();
         assert_eq!(s.mailbox.notes[&ItemId(id)].folder, role(&s, FolderRole::DeletedItems));
         assert!(matches!(s.run("notes.delete", &json!({"id": 424_242})), Err(CmdError::Params(_))));
+    }
+
+    #[test]
+    fn dragged_icon_positions_are_kept() {
+        let mut s = session();
+        let folder = role(&s, FolderRole::Notes);
+        s.selection = Selection { folder, items: vec![], focus: None };
+        let a = s.run("notes.new", &json!({"text": "A"})).unwrap()["id"].as_u64().unwrap();
+        let b = s.run("notes.new", &json!({"text": "B"})).unwrap()["id"].as_u64().unwrap();
+        s.run("notes.lineUpIcons", &json!({})).unwrap();
+        assert!(stored_view(&s).lined_up);
+        s.run("notes.setPosition", &json!({"id": a, "x": 420.5, "y": 30})).unwrap();
+        s.run("notes.setPosition", &json!({"id": b, "x": 0, "y": 900})).unwrap();
+        assert_eq!(positions(&s, folder).get(&a), Some(&(420.5, 30.0)));
+        assert!(!stored_view(&s).lined_up, "dragging breaks the lined-up grid");
+        // The positions are not group labels and survive a settings round trip of the view state.
+        assert!(s.view.collapsed_groups[&folder].iter().all(|e| !crate::cmd::view::is_group_label(e)));
+        let view: crate::ViewState = serde_json::from_value(serde_json::to_value(&s.view).unwrap()).unwrap();
+        s.view = view;
+        assert_eq!(positions(&s, folder).len(), 2);
+        // Back to the grid one at a time, or all with Line Up Icons.
+        s.run("notes.setPosition", &json!({"id": b, "position": null})).unwrap();
+        assert_eq!(positions(&s, folder).keys().copied().collect::<Vec<_>>(), vec![a]);
+        s.run("notes.lineUpIcons", &json!({})).unwrap();
+        assert!(positions(&s, folder).is_empty());
+        // Hostile values.
+        for bad in [
+            json!({"id": a, "x": -1, "y": 0}),
+            json!({"id": a, "x": 1e30, "y": 0}),
+            json!({"id": a, "x": "1", "y": 0}),
+            json!({"id": a}),
+            json!({"id": u64::MAX, "x": 1, "y": 1}),
+        ] {
+            assert!(s.run("notes.setPosition", &bad).is_err(), "{bad}");
+        }
+        // A deleted note's position is dropped.
+        s.run("notes.setPosition", &json!({"id": a, "x": 5, "y": 5})).unwrap();
+        s.run("notes.delete", &json!({"id": a})).unwrap();
+        assert!(positions(&s, folder).is_empty());
+        // Damaged stored text reads as no positions.
+        s.view.collapsed_groups.insert(folder, vec![format!("{NOTE_POS}{{not json")]);
+        assert!(positions(&s, folder).is_empty());
     }
 }

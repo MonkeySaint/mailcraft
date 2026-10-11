@@ -12,6 +12,8 @@ People|Home › Current View|Phone|view.changeView
 People|Home › Current View|List|view.changeView
 People|Home › Current View|Change View|view.changeView
 People|Home › Actions|Move|people.move
+# Mail Merge merges to E-mail only: Form Letters, Mailing Labels and Envelopes need a word processor document
+# and are listed but off (people.mailMerge answers Disabled for them).
 People|Home › Actions|Mail Merge...|people.mailMerge
 People|Home › Actions|Send to OneNote|-|OneNote integration (Microsoft service)
 People|Home › Share|Forward Contact|people.forward
@@ -73,6 +75,7 @@ People|Home > Follow Up|This Week|people.flag
 People|Home > Follow Up|Next Week|people.flag
 People|Home > Follow Up|No Date|people.flag
 People|Home > Follow Up|Custom...|people.flag
+# Add Reminder: the reminder is kept on the contact's flag; people::due_reminders lists the due ones.
 People|Home > Follow Up|Add Reminder...|people.flag
 People|Home > Follow Up|Mark Complete|people.flag
 People|Home > Follow Up|Clear Flag|people.flag

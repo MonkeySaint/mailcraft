@@ -2,9 +2,10 @@
 //! Mail, People, Tasks and Notes modules with a month calendar and the selected day's (or the next days') appointments, a people
 //! search, and the To-Do List with "Type a new task".
 //!
-//! The session keeps no To-Do Bar state (`view.todoBar` only validates its part), so the parts shown live in
-//! egui memory: the shell calls [`set_todo_bar`] with the part `view.todoBar` returned and reserves
-//! [`TODO_BAR_WIDTH`] on the right for [`todo_bar`] while [`todo_bar_shown`].
+//! The shell calls [`set_todo_bar`] with the part `view.todoBar` returned and reserves [`TODO_BAR_WIDTH`]
+//! on the right for [`todo_bar`] while [`todo_bar_shown`]. The parts shown are kept with the profile: they
+//! go into the dialog settings (`todoBar.parts`), which the shell saves in the session settings
+//! (`state.uiPrefs`, `settings.json`) and restores at start-up, so the To-Do Bar comes back as it was left.
 
 use egui::{
     Align2, Color32, CornerRadius, FontId, Id, Rect, RichText, ScrollArea, Sense, TextEdit, Ui, pos2, vec2,
@@ -39,6 +40,43 @@ pub(crate) struct TodoBarState {
     pub month: Option<(i64, u8)>,
     pub search: String,
     pub new_task: String,
+    /// The saved parts were applied (or the user changed the parts before they could be).
+    pub restored: bool,
+}
+
+/// Dialog-settings key holding the parts shown (`["calendar", "people", "tasks"]`, any subset).
+pub(crate) const PREF_KEY: &str = "todoBar.parts";
+
+/// Saves the parts shown with the dialog settings (the shell writes them to the profile).
+fn persist(ctx: &egui::Context, st: &TodoBarState) {
+    let parts: Vec<&str> = [("calendar", st.calendar), ("people", st.people), ("tasks", st.tasks)]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(k, _)| k)
+        .collect();
+    let value = json!(parts);
+    ctx.data_mut(|d| {
+        let p = d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::new(crate::chrome::UI_PREFS_ID));
+        if p.values.get(PREF_KEY) != Some(&value) {
+            p.values.insert(PREF_KEY.to_owned(), value);
+            p.rev = p.rev.wrapping_add(1);
+        }
+    });
+}
+
+/// Applies the saved parts once they are available (the shell restores the dialog settings in its first
+/// frame).
+fn restore(ctx: &egui::Context, st: &mut TodoBarState) -> bool {
+    if st.restored {
+        return false;
+    }
+    let Some(Value::Array(saved)) = crate::dialogs::ui_pref(ctx, PREF_KEY) else { return false };
+    let on = |k: &str| saved.iter().any(|v| v.as_str() == Some(k));
+    st.calendar = on("calendar");
+    st.people = on("people");
+    st.tasks = on("tasks");
+    st.restored = true;
+    true
 }
 
 fn state_id() -> Id {
@@ -46,7 +84,11 @@ fn state_id() -> Id {
 }
 
 pub(crate) fn load(ctx: &egui::Context) -> TodoBarState {
-    ctx.data_mut(|d| d.get_temp::<TodoBarState>(state_id())).unwrap_or_default()
+    let mut st = ctx.data_mut(|d| d.get_temp::<TodoBarState>(state_id())).unwrap_or_default();
+    if restore(ctx, &mut st) {
+        ctx.data_mut(|d| d.insert_temp(state_id(), st.clone()));
+    }
+    st
 }
 
 pub(crate) fn store(ctx: &egui::Context, st: TodoBarState) {
@@ -65,8 +107,10 @@ pub fn set_todo_bar(ctx: &egui::Context, part: &str) {
             st.people = false;
             st.tasks = false;
         }
-        _ => {}
+        _ => return,
     }
+    st.restored = true;
+    persist(ctx, &st);
     store(ctx, st);
 }
 
@@ -319,5 +363,44 @@ mod tests {
         assert!(todo_bar_shown(&ctx));
         set_todo_bar(&ctx, "off");
         assert!(!todo_bar_shown(&ctx));
+    }
+
+    #[test]
+    fn parts_are_saved_and_restored() {
+        let ctx = egui::Context::default();
+        set_todo_bar(&ctx, "people");
+        set_todo_bar(&ctx, "tasks");
+        let saved = crate::dialogs::ui_pref(&ctx, PREF_KEY).unwrap();
+        assert_eq!(saved, json!(["people", "tasks"]));
+        // A new run: the dialog settings come back from the profile, the To-Do Bar follows.
+        let next = egui::Context::default();
+        assert!(!todo_bar_shown(&next));
+        next.data_mut(|d| {
+            let p = d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::new(crate::chrome::UI_PREFS_ID));
+            p.values.insert(PREF_KEY.to_owned(), saved.clone());
+        });
+        assert_eq!(todo_bar_parts(&next), (false, true, true));
+        // Once restored, toggling wins over the saved value and is saved in turn.
+        set_todo_bar(&next, "off");
+        assert!(!todo_bar_shown(&next));
+        assert_eq!(crate::dialogs::ui_pref(&next, PREF_KEY), Some(json!([])));
+        // Junk in the saved value shows nothing rather than failing.
+        let junk = egui::Context::default();
+        junk.data_mut(|d| {
+            let p = d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::new(crate::chrome::UI_PREFS_ID));
+            p.values.insert(PREF_KEY.to_owned(), json!([1, null, "mail"]));
+        });
+        assert!(!todo_bar_shown(&junk));
+    }
+
+    #[test]
+    fn parts_reach_the_profile_settings() {
+        let ctx = egui::Context::default();
+        let mut app = crate::App::new(mailcraft_engine::sample::sample_session());
+        crate::chrome::sync_ui_prefs(&ctx, &mut app);
+        set_todo_bar(&ctx, "calendar");
+        crate::chrome::sync_ui_prefs(&ctx, &mut app);
+        let saved = app.s.settings.get("state.uiPrefs").unwrap();
+        assert_eq!(saved[PREF_KEY], json!(["calendar"]));
     }
 }

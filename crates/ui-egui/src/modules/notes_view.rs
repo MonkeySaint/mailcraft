@@ -1,5 +1,6 @@
 //! Notes module: My Notes (folder pane) and the folder's current view: Icon (large icons, small icons or a
-//! list; icons can be dragged anywhere and View › Line Up Icons snaps them back to the grid), Notes List and
+//! list; icons can be dragged anywhere — where they are dropped is saved with `notes.setPosition` and
+//! kept with the profile — and View › Line Up Icons snaps them back to the grid), Notes List and
 //! Last 7 Days (lists, newest first). Notes are edited in place; the text is saved with `notes.update` when
 //! the edit box loses focus. The reading pane (off by default) shows the selected note. The order and the
 //! filter come from the engine (`mailcraft_engine::cmd::notes::view_rows`), the view and the icon
@@ -18,8 +19,9 @@ use mailcraft_model::{FolderKind, ItemId, ListTime, Note, NoteColor};
 
 use super::common::{
     ModState, a11y, blend, change_view, child, current_folder, empty_message, folder_rows, group_header,
-    load, module_view, note_fill, paint_text_clipped, pane_bg, pane_separator, reading_split, row_height,
-    select_folder, select_item, split_folder_pane, store, sync_selection, todo_bar_strip, view_switch,
+    load, module_folder_pane, module_view, note_fill, paint_text_clipped, pane_bg, pane_separator,
+    reading_split, row_height, select_folder, select_item, store, sync_selection, todo_bar_strip,
+    view_switch,
 };
 use crate::App;
 
@@ -83,10 +85,9 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
     let ids = order(app);
     sync_selection(app, |_, id| ids.contains(&id));
     let full = ui.max_rect();
-    let (pane, main) = split_folder_pane(ui, app);
+    let (pane, main) = module_folder_pane(ui, app);
     if let Some(p) = pane {
-        pane_bg(ui, p, app.theme.pane);
-        child(ui, p.shrink(6.0), "mc-notes-pane", |ui| {
+        child(ui, p.shrink2(egui::vec2(6.0, 0.0)), "mc-notes-pane", |ui| {
             group_header(ui, app, "My Notes", false, "mc-notes-group");
             let current = current_folder(app, Kind::Note);
             if let (Some(f), _) = folder_rows(ui, app, FolderKind::Notes, current, None) {
@@ -413,8 +414,16 @@ fn grid(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &
     let cols = ((ui.available_width() + gap) / (w + gap)).floor().max(1.0) as usize;
     let rows = order.len().div_ceil(cols);
     // Room for icons dragged below or right of the grid.
+    // Saved positions, with the icon being dragged (saved when it is dropped) on top.
+    let mut placed = current_folder(app, Kind::Note)
+        .map(|f| mailcraft_engine::cmd::notes::positions(&app.s, f))
+        .unwrap_or_default();
+    if let Some((id, pos)) = st.note_drag {
+        placed.insert(id, pos);
+    }
+    st.note_pos = placed.clone();
     let (mut need_w, mut need_h) = (ui.available_width(), rows as f32 * (h + gap) + 4.0);
-    for (x, y) in st.note_pos.values() {
+    for (x, y) in placed.values() {
         need_w = need_w.max(x + w);
         need_h = need_h.max(y + h + gap);
     }
@@ -422,7 +431,7 @@ fn grid(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &
     for (k, &id) in order.iter().enumerate() {
         let Some(n) = app.s.mailbox.notes.get(&id).cloned() else { continue };
         let slot = vec2((k % cols) as f32 * (w + gap), (k / cols) as f32 * (h + gap));
-        let off = st.note_pos.get(&id.0).map_or(slot, |(x, y)| vec2(*x, *y));
+        let off = placed.get(&id.0).map_or(slot, |(x, y)| vec2(*x, *y));
         let card = Rect::from_min_size(area.min + off, vec2(w, h));
         let editing = st.note_edit.as_ref().is_some_and(|(e, _)| *e == id.0);
         let sense = if editing { Sense::click() } else { Sense::click_and_drag() };
@@ -435,8 +444,16 @@ fn grid(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &
         }
         if resp.dragged() {
             let d = resp.drag_delta();
-            let (x, y) = st.note_pos.get(&id.0).copied().unwrap_or((slot.x, slot.y));
-            st.note_pos.insert(id.0, ((x + d.x).max(0.0), (y + d.y).max(0.0)));
+            let (x, y) = placed.get(&id.0).copied().unwrap_or((slot.x, slot.y));
+            let max = mailcraft_engine::cmd::notes::MAX_OFFSET;
+            let pos = ((x + d.x).clamp(0.0, max), (y + d.y).clamp(0.0, max));
+            st.note_drag = Some((id.0, pos));
+            st.note_pos.insert(id.0, pos);
+        }
+        if resp.drag_stopped()
+            && let Some((_, (x, y))) = st.note_drag.take().filter(|(d, _)| *d == id.0)
+        {
+            app.run("notes.setPosition", json!({ "id": id.0, "x": x, "y": y }));
         }
         if resp.drag_started() && view.lined_up {
             // Icons are no longer lined up (Line Up Icons becomes useful again).

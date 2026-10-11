@@ -11,6 +11,11 @@
 //! first asks whether to open the occurrence or the series; saving an occurrence makes it an exception
 //! (`calendar.editOccurrence`).
 //!
+//! The contact window has three pages: General (name, company, addresses, phones, picture, notes — with
+//! the business card), Details (office, profession, manager, assistant, nickname, spouse/partner,
+//! anniversary) and All Fields (every field with a value, read-only). Add Picture takes a PNG, JPEG or GIF
+//! file; the cards show PNG pictures.
+//!
 //! The task window also sets the task's recurrence (a pattern, or "regenerate N days after completion") and
 //! Private, and Assign Task turns it into a task request. The module dialogs (move/copy, categories,
 //! follow up, module view settings, Mail Merge, Task Request) are in [`dialogs`].
@@ -31,7 +36,7 @@ use mailcraft_engine::cmd::people::{
     CONTACT_GROUP_MARKER, business_card_lines, contact_addresses, display_name, is_group,
 };
 use mailcraft_model::calendar::{AttendeeRole, ResponseStatus};
-use mailcraft_model::contact::PostalAddress;
+use mailcraft_model::contact::{ContactPicture, PostalAddress};
 use mailcraft_model::{BusyStatus, Contact, FolderId, ItemId, NoteColor, TaskPriority, TaskStatus};
 
 use super::common::{
@@ -154,6 +159,17 @@ pub(crate) struct ContactEditor {
     /// Add Members picker (group).
     pub picker: Option<MemberPicker>,
     pub categories: Vec<String>,
+    /// Page shown: General, Details or All Fields.
+    pub page: ContactPage,
+    /// Details page: office, profession, manager's name, assistant's name, nickname, spouse/partner.
+    pub details: [String; 6],
+    pub anniversary: String,
+    /// The picture shown (as saved, or as added / removed in this window).
+    pub picture: Option<ContactPicture>,
+    /// The picture was added, changed or removed here (saved with the contact).
+    pub picture_changed: bool,
+    /// Picture file path typed when the app has no file dialogs.
+    pub picture_path: String,
     pub error: Option<String>,
     /// Duplicate Contact Detected (Options › People › Check for duplicates): the existing contact's id and
     /// name, shown with the Add / Update choices.
@@ -163,6 +179,25 @@ pub(crate) struct ContactEditor {
     pub nonce: u64,
     pub focus: bool,
 }
+
+/// Pages of the contact window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ContactPage {
+    #[default]
+    General,
+    Details,
+    AllFields,
+}
+
+/// Labels of [`ContactEditor::details`], in order.
+pub(crate) const DETAIL_FIELDS: [(&str, &str); 6] = [
+    ("office", "Office"),
+    ("profession", "Profession"),
+    ("manager", "Manager's name"),
+    ("assistant", "Assistant's name"),
+    ("nickname", "Nickname"),
+    ("spouse", "Spouse/Partner"),
+];
 
 /// What saving the contact window did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +244,10 @@ pub(crate) struct TaskEditor {
     pub private: bool,
     /// Assigned to (task requests sent), shown read-only.
     pub assigned_to: String,
+    /// Who assigned the task to me (an accepted task request), shown read-only.
+    pub requested_by: String,
+    /// Where the task request stands ("waiting", "accepted", "declined"; "none" otherwise).
+    pub request_state: String,
     pub error: Option<String>,
     pub nonce: u64,
     pub focus: bool,
@@ -445,6 +484,16 @@ pub(crate) fn open_contact(app: &App, st: &mut ModState, id: ItemId) {
         notes,
         members: if group { c.emails.join("; ") } else { String::new() },
         categories: c.categories.clone(),
+        details: [
+            c.office.clone(),
+            c.profession.clone(),
+            c.manager.clone(),
+            c.assistant.clone(),
+            c.nickname.clone(),
+            c.spouse.clone(),
+        ],
+        anniversary: c.anniversary.clone().unwrap_or_default(),
+        picture: c.picture.clone(),
         nonce,
         ..Default::default()
     });
@@ -493,6 +542,8 @@ pub(crate) fn open_task(app: &App, st: &mut ModState, id: ItemId) {
         regenerate_days: t.recurrence.as_ref().map_or(0, |r| r.regenerate_days),
         private: t.private,
         assigned_to: t.assigned_to.join("; "),
+        requested_by: t.requested_by.clone().unwrap_or_default(),
+        request_state: mailcraft_engine::cmd::tasks::request_state_name(t.request_state).to_owned(),
         error: None,
         nonce,
         focus: false,
@@ -723,6 +774,20 @@ enum Act {
     ForwardCard,
     ForwardContact,
     AssignTask,
+    StatusReport,
+}
+
+/// The task window's line about its task request.
+fn request_line(ed: &TaskEditor) -> Option<&'static str> {
+    match (ed.request_state.as_str(), ed.requested_by.is_empty()) {
+        ("waiting", _) => Some("Waiting for a response from the people this task was assigned to."),
+        ("accepted", true) => Some("The task was accepted."),
+        ("accepted", false) => {
+            Some("You accepted this task. Send Status Report keeps the person who assigned it informed.")
+        }
+        ("declined", true) => Some("The task was declined."),
+        _ => None,
+    }
 }
 
 /// Standard buttons row (right-aligned: primary, Delete, Cancel). `primary` is the main button's label.
@@ -1192,6 +1257,8 @@ fn preview_contact(ed: &ContactEditor) -> Contact {
         department: ed.department.clone(),
         emails: ed.email.iter().filter(|e| !e.trim().is_empty()).cloned().collect(),
         web_page: ed.web.clone(),
+        picture: ed.picture.clone(),
+        id: ItemId(ed.id.unwrap_or(0)),
         ..Default::default()
     };
     for (kind, n) in [
@@ -1241,15 +1308,17 @@ pub(crate) fn business_card(ui: &mut Ui, app: &App, c: &Contact, width: f32) {
                 let (r, resp) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
                 super::common::a11y(&resp, egui::WidgetType::Image, "Contact picture");
                 let name = lines.first().cloned().unwrap_or_default();
-                let idx = name.bytes().fold(0u8, |a, b| a.wrapping_add(b));
-                ui.painter().circle_filled(r.center(), 24.0, persona_fill(idx));
-                ui.painter().text(
-                    r.center(),
-                    egui::Align2::CENTER_CENTER,
-                    initials(&name),
-                    egui::FontId::proportional(17.0),
-                    Color32::WHITE,
-                );
+                if !super::common::paint_contact_picture(ui, r, c) {
+                    let idx = name.bytes().fold(0u8, |a, b| a.wrapping_add(b));
+                    ui.painter().circle_filled(r.center(), 24.0, persona_fill(idx));
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        initials(&name),
+                        egui::FontId::proportional(17.0),
+                        Color32::WHITE,
+                    );
+                }
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     for (i, l) in lines.iter().enumerate() {
@@ -1280,7 +1349,11 @@ fn contact_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             if ed.group {
                 group_page(ui, app, &mut ed);
             } else {
-                contact_page(ui, app, &mut ed);
+                match ed.page {
+                    ContactPage::General => contact_page(ui, app, &mut ed),
+                    ContactPage::Details => details_page(ui, app, &mut ed),
+                    ContactPage::AllFields => all_fields_page(ui, app, &ed),
+                }
             }
             error_line(ui, app, &ed.error);
             if let Some((_, name)) = &ed.duplicate {
@@ -1300,6 +1373,17 @@ fn contact_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             }
             ui.separator();
             ui.horizontal(|ui| {
+                if !ed.group {
+                    // Show: the window's pages (in the button row, so the page above keeps its place).
+                    for (page, label) in [
+                        (ContactPage::General, "General"),
+                        (ContactPage::Details, "Details"),
+                        (ContactPage::AllFields, "All Fields"),
+                    ] {
+                        ui.selectable_value(&mut ed.page, page, label);
+                    }
+                    ui.separator();
+                }
                 if !ed.group && ed.id.is_some() {
                     ui.menu_button("Forward", |ui| {
                         if ui.button("As a Business Card").clicked() {
@@ -1471,8 +1555,157 @@ fn contact_page(ui: &mut Ui, app: &App, ed: &mut ContactEditor) {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Business card").color(app.theme.text_muted));
                 business_card(ui, app, &preview, 250.0);
+                ui.add_space(8.0);
+                picture_controls(ui, app, ed);
             });
         }
+    });
+    if !wide {
+        picture_controls(ui, app, ed);
+    }
+}
+
+/// Add Picture / Change Picture / Remove Picture (a fixed layout: the window does not resize as it settles).
+fn picture_controls(ui: &mut Ui, app: &App, ed: &mut ContactEditor) {
+    let add = if ed.picture.is_some() { "Change Picture..." } else { "Add Picture..." };
+    let mut pick: Option<std::path::PathBuf> = None;
+    if app.files.is_none() {
+        let l = ui.label("Picture file");
+        ui.add(
+            TextEdit::singleline(&mut ed.picture_path)
+                .desired_width(240.0)
+                .hint_text("path to a PNG, JPEG or GIF"),
+        )
+        .labelled_by(l.id);
+    }
+    ui.horizontal(|ui| {
+        if let Some(files) = app.files.clone() {
+            if ui.button(add).clicked() {
+                let filters = [crate::FileFilter::new("Pictures", &["png", "jpg", "jpeg", "gif"])];
+                pick = files
+                    .open_files("Add Contact Picture", &filters, false, None)
+                    .and_then(|v| v.into_iter().next());
+            }
+        } else if ui.add_enabled(!ed.picture_path.trim().is_empty(), egui::Button::new(add)).clicked() {
+            pick = Some(std::path::PathBuf::from(ed.picture_path.trim()));
+        }
+        if ui.add_enabled(ed.picture.is_some(), egui::Button::new("Remove Picture")).clicked() {
+            ed.picture = None;
+            ed.picture_changed = true;
+        }
+    });
+    if let Some(path) = pick {
+        set_picture_from(ed, &path);
+    }
+    if let Some(p) = &ed.picture
+        && p.mime != "image/png"
+    {
+        ui.label(
+            RichText::new("Saved with the contact; the cards show PNG pictures.").color(app.theme.text_muted),
+        );
+    }
+}
+
+/// Reads a picture file into the editor (checked like the engine does), or sets the window's error.
+pub(crate) fn set_picture_from(ed: &mut ContactEditor, path: &std::path::Path) {
+    let limit = mailcraft_model::contact::MAX_PICTURE_BYTES;
+    let read = std::fs::metadata(path)
+        .map_err(|e| e.to_string())
+        .and_then(|m| {
+            if m.len() > limit as u64 {
+                Err(format!("The picture is larger than {} KB.", limit / 1024))
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|_| std::fs::read(path).map_err(|e| e.to_string()))
+        .and_then(|data| mailcraft_engine::cmd::people::picture_from_bytes(&data).map_err(|e| e.to_string()));
+    match read {
+        Ok(p) => {
+            ed.picture = Some(p);
+            ed.picture_changed = true;
+            ed.picture_path.clear();
+            ed.error = None;
+        }
+        Err(e) => ed.error = Some(format!("{}: {e}", path.display())),
+    }
+}
+
+/// The Details page.
+fn details_page(ui: &mut Ui, app: &App, ed: &mut ContactEditor) {
+    let _ = app;
+    egui::Grid::new(("mc-contact-details", ed.nonce)).num_columns(2).spacing(vec2(10.0, 6.0)).show(
+        ui,
+        |ui| {
+            field(ui, "Department", &mut ed.department, "");
+            for ((_, label), value) in DETAIL_FIELDS.iter().zip(ed.details.iter_mut()) {
+                field(ui, label, value, "");
+            }
+            ui.label("Birthday");
+            date_field(ui, &mut ed.birthday, "mc-contact-bday-details");
+            ui.end_row();
+            ui.label("Anniversary");
+            date_field(ui, &mut ed.anniversary, "mc-contact-anniversary");
+            ui.end_row();
+        },
+    );
+}
+
+/// The contact as the window holds it now (for All Fields).
+fn edited_contact(ed: &ContactEditor) -> Contact {
+    let mut c = preview_contact(ed);
+    if ed.name_parts.iter().any(|p| !p.trim().is_empty()) {
+        let [t, f, m, l, x] = &ed.name_parts;
+        c.title = t.trim().to_owned();
+        c.first_name = f.trim().to_owned();
+        c.middle_name = m.trim().to_owned();
+        c.last_name = l.trim().to_owned();
+        c.suffix = x.trim().to_owned();
+    }
+    let [office, profession, manager, assistant, nickname, spouse] = ed.details.clone();
+    c.office = office;
+    c.profession = profession;
+    c.manager = manager;
+    c.assistant = assistant;
+    c.nickname = nickname;
+    c.spouse = spouse;
+    c.anniversary = Some(ed.anniversary.trim().to_owned()).filter(|a| !a.is_empty());
+    c.birthday = Some(ed.birthday.trim().to_owned()).filter(|a| !a.is_empty());
+    c.im_address = ed.im.clone();
+    c.notes = ed.notes.clone();
+    c.categories = ed.categories.clone();
+    let [a, b, cc, d, e] = &ed.home;
+    if [a, b, cc, d, e].iter().any(|x| !x.trim().is_empty()) {
+        c.addresses.push(PostalAddress {
+            kind: "Home".into(),
+            street: a.clone(),
+            city: b.clone(),
+            region: cc.clone(),
+            postal_code: d.clone(),
+            country: e.clone(),
+        });
+    }
+    c
+}
+
+/// The All Fields page: every field that has a value.
+fn all_fields_page(ui: &mut Ui, app: &App, ed: &ContactEditor) {
+    let fields = mailcraft_engine::cmd::people::all_fields(&edited_contact(ed));
+    ScrollArea::vertical().id_salt(("mc-contact-all", ed.nonce)).max_height(520.0).show(ui, |ui| {
+        egui::Grid::new(("mc-contact-all-grid", ed.nonce))
+            .num_columns(2)
+            .striped(true)
+            .spacing(vec2(14.0, 4.0))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("Value").strong());
+                ui.end_row();
+                for (name, value) in fields {
+                    ui.label(RichText::new(name).color(app.theme.text_muted));
+                    ui.label(value);
+                    ui.end_row();
+                }
+            });
     });
 }
 
@@ -1767,6 +2000,23 @@ pub(crate) fn save_contact_checked(app: &mut App, ed: &ContactEditor) -> Result<
         p.insert("addresses".into(), Value::Array(addresses));
         p.insert("birthday".into(), json!(ed.birthday.trim()));
         p.insert("categories".into(), json!(ed.categories));
+        if !ed.anniversary.trim().is_empty() && parse_day(&ed.anniversary).is_none() {
+            return Err("Enter the anniversary as YYYY-MM-DD.".into());
+        }
+        p.insert("anniversary".into(), json!(ed.anniversary.trim()));
+        for ((key, _), value) in DETAIL_FIELDS.iter().zip(ed.details.iter()) {
+            p.insert((*key).into(), json!(value.trim()));
+        }
+        if ed.picture_changed {
+            // The model's own serialisation gives the picture as base64 text.
+            let data = ed
+                .picture
+                .as_ref()
+                .and_then(|pic| serde_json::to_value(pic).ok())
+                .and_then(|v| v.get("data").cloned())
+                .unwrap_or(Value::Null);
+            p.insert("picture".into(), data);
+        }
     }
     if let Some(id) = ed.id {
         p.insert("id".into(), json!(id));
@@ -1957,12 +2207,20 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             ui.label("");
             ui.checkbox(&mut ed.private, "Private");
             ui.end_row();
+            if !ed.requested_by.is_empty() {
+                ui.label("Assigned by");
+                ui.label(&ed.requested_by);
+                ui.end_row();
+            }
             if !ed.assigned_to.is_empty() {
                 ui.label("Assigned to");
                 ui.label(&ed.assigned_to);
                 ui.end_row();
             }
         });
+        if let Some(text) = request_line(&ed) {
+            ui.label(RichText::new(text).color(app.theme.text_muted));
+        }
         if ed.linked_mail {
             ui.label(RichText::new("Linked to a flagged message.").color(app.theme.text_muted));
         }
@@ -1978,6 +2236,12 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             }
             if ed.assigned_to.is_empty() && ui.button("Assign Task").clicked() {
                 act = Act::AssignTask;
+            }
+            if ed.id.is_some()
+                && (!ed.requested_by.is_empty() || !ed.assigned_to.is_empty())
+                && ui.button("Send Status Report").clicked()
+            {
+                act = Act::StatusReport;
             }
             buttons(ui, "Save & Close", ed.id.is_some(), &mut act);
         });
@@ -2007,6 +2271,16 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
         ed.status = "completed".into();
         ed.percent = 100;
         act = Act::Save;
+    }
+    if act == Act::StatusReport {
+        // The report describes the task as saved: save first, then open the report in a message window.
+        match save_task_following(app, &mut ed).and_then(|id| {
+            let id = id.or(ed.id).ok_or_else(|| "Save the task first.".to_owned())?;
+            run_checked(app, "tasks.sendStatusReport", json!({ "ids": [id], "send": "edit" }))
+        }) {
+            Ok(_) => return,
+            Err(e) => ed.error = Some(e),
+        }
     }
     match act {
         Act::Save | Act::SaveSend => match save_task_following(app, &mut ed) {
@@ -2536,5 +2810,94 @@ mod tests {
         let st = load(&ctx);
         assert!(st.editors.task.is_some());
         assert_eq!(st.editors.go_to.as_ref().unwrap().mode, "week");
+    }
+
+    /// A real 3×2 PNG (red), written by the rasteriser the UI decodes with.
+    fn red_png() -> Vec<u8> {
+        let mut pix = resvg::tiny_skia::Pixmap::new(3, 2).unwrap();
+        pix.fill(resvg::tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        pix.encode_png().unwrap()
+    }
+
+    #[test]
+    fn contact_details_all_fields_and_picture() {
+        let mut app = app();
+        let mut st = ModState::default();
+        new_contact(&app, &mut st, None, false);
+        let mut ed = st.editors.contact.clone().unwrap();
+        ed.full_name = "Ines Okafor".into();
+        ed.details =
+            ["B-12".into(), "Editor".into(), "Bo Ek".into(), String::new(), "Nessa".into(), String::new()];
+        ed.anniversary = "2019-05-04".into();
+        // Add Picture from a file (no file dialogs in tests: the typed path).
+        let dir = std::env::temp_dir().join(format!("mc-g23-pic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ines.png");
+        std::fs::write(&path, red_png()).unwrap();
+        set_picture_from(&mut ed, &path);
+        assert!(ed.error.is_none(), "{:?}", ed.error);
+        assert!(ed.picture_changed);
+        let bad = dir.join("notes.txt");
+        std::fs::write(&bad, b"not a picture").unwrap();
+        let mut other = ed.clone();
+        set_picture_from(&mut other, &bad);
+        assert!(other.error.is_some());
+        set_picture_from(&mut other, &dir.join("missing.png"));
+        assert!(other.error.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+        // All Fields lists what the window holds.
+        let fields = mailcraft_engine::cmd::people::all_fields(&edited_contact(&ed));
+        assert!(fields.contains(&("Office Location".to_owned(), "B-12".to_owned())), "{fields:?}");
+        assert!(fields.contains(&("Anniversary".to_owned(), "2019-05-04".to_owned())));
+        let id = save_contact(&mut app, &ed).unwrap().unwrap();
+        let c = app.s.mailbox.contacts[&ItemId(id)].clone();
+        assert_eq!(
+            (c.office.as_str(), c.profession.as_str(), c.manager.as_str()),
+            ("B-12", "Editor", "Bo Ek")
+        );
+        assert_eq!(c.nickname, "Nessa");
+        assert_eq!(c.anniversary.as_deref(), Some("2019-05-04"));
+        assert_eq!(c.picture.as_ref().map(|p| p.data.clone()), Some(red_png()));
+        // The cards decode PNG pictures.
+        let img = super::super::common::decode_picture(c.picture.as_ref().unwrap()).unwrap();
+        assert_eq!(img.size, [3, 2]);
+        // Reopened: the fields and picture come back; Remove Picture removes it.
+        open_contact(&app, &mut st, ItemId(id));
+        let mut ed = st.editors.contact.clone().unwrap();
+        assert_eq!(ed.details[0], "B-12");
+        assert!(ed.picture.is_some() && !ed.picture_changed);
+        ed.picture = None;
+        ed.picture_changed = true;
+        ed.anniversary = "someday".into();
+        assert!(save_contact(&mut app, &ed).is_err(), "bad anniversary");
+        ed.anniversary.clear();
+        save_contact(&mut app, &ed).unwrap();
+        let c = &app.s.mailbox.contacts[&ItemId(id)];
+        assert!(c.picture.is_none() && c.anniversary.is_none());
+    }
+
+    #[test]
+    fn task_window_shows_task_requests() {
+        let mut app = app();
+        let mut st = ModState::default();
+        let r = app
+            .s
+            .run("tasks.assign", &json!({"to": "pat@example.org", "subject": "Assigned one", "send": false}))
+            .unwrap();
+        let id = ItemId(r["task"].as_u64().unwrap());
+        open_task(&app, &mut st, id);
+        let ed = st.editors.task.clone().unwrap();
+        assert_eq!(ed.request_state, "waiting");
+        assert!(request_line(&ed).unwrap().starts_with("Waiting"));
+        // A task assigned to me shows who assigned it.
+        if let Some(t) = app.s.mailbox.tasks.get_mut(&id) {
+            t.requested_by = Some("Boss <boss@example.com>".into());
+            t.request_state = mailcraft_model::task::TaskRequestState::Accepted;
+        }
+        open_task(&app, &mut st, id);
+        let ed = st.editors.task.clone().unwrap();
+        assert_eq!(ed.requested_by, "Boss <boss@example.com>");
+        assert!(request_line(&ed).unwrap().starts_with("You accepted"));
+        let _ = &mut app;
     }
 }

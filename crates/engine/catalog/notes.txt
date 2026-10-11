@@ -42,6 +42,7 @@ Notes|View › Current View|Reset View|view.resetView
 Notes|View › Arrangement|Large Icons|notes.iconView
 Notes|View › Arrangement|Small Icons|notes.iconView
 Notes|View › Arrangement|List|notes.iconView
+# Dragged icons keep their place (notes.setPosition, saved with the view state); Line Up Icons drops it.
 Notes|View › Arrangement|Line Up Icons|notes.lineUpIcons
 Notes|View › Layout|Use Tighter Spacing|view.tighterSpacing
 Notes|View › Layout|Folder Pane|view.folderPane

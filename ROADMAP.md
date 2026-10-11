@@ -4,7 +4,7 @@ MailCraft is a clean-room, open-source desktop mail client in Rust, modelled on 
 workflow. This file tracks what is done, what is next, and an honest estimate of how close each area is to
 Outlook. It is updated with every commit.
 
-Status: **pre-alpha** (2026-10-09). Repository: git@github.com:MonkeySaint/mailcraft.git. Nothing is released yet; the first local tag (v0.1.0) is planned at
+Status: **pre-alpha** (2026-10-10). Repository: git@github.com:MonkeySaint/mailcraft.git. Nothing is released yet; the first local tag (v0.1.0) is planned at
 commit 23.
 
 ## Milestones
@@ -22,9 +22,9 @@ commit 23.
 | — | Clippy/fmt clean, honest parity table, CI green | ✅ done (commit 10) |
 | — | README with screenshots | ✅ done (commit 11) |
 | — | Release pipeline on GitHub Actions (Linux AppImage/deb/rpm/tar/Flatpak, Windows MSI, macOS DMG, FreeBSD, web) | ✅ done (commits 12–13) |
-| — | Gap closing: profile settings store and Options; People/Tasks/Notes views and actions; calendar depth (colours, overlay, drag/resize, named time zones, subscriptions); compose (rich paste, themes, list formats, voting, receipts, Save Sent Item To); Junk Email; accounts (IDLE push, POP3, JMAP, OAuth sign-in, OS keyring) | ✅ round 1 done (commit 14); re-audit next |
-| — | Fidelity: responsive single-pane, reading pane Bottom columns, row icons/hover actions, read-on-selection-change + inline reply | planned (commits 14–17) |
-| M7/M14 | Rules UI depth, alpha/parity estimates, small fixes | planned (commits 18–26) |
+| — | Gap closing: profile settings store and Options; People/Tasks/Notes views and actions; calendar depth (colours, overlay, drag/resize, named time zones, subscriptions); compose (rich paste, themes, list formats, voting, receipts, Save Sent Item To); Junk Email; accounts (IDLE push, POP3, JMAP, OAuth sign-in, OS keyring) | ✅ round 1 done (commit 14), re-audited at 87.1 %; round 2 in progress |
+| — | Gap closing round 2: Options wiring, calendar settings, saved views and columns, task requests, compose panes, autodiscovery and JMAP push, keyboard focus, new items | in progress (commits 15–22) |
+| M7/M14 | Rules UI depth, alpha/parity estimates, small fixes | planned (commits 23–26) |
 | v0.1.0 / v0.2.0 / v0.3.0 | Local release tags | commits 23 / 27 / 30 |
 | v1.0.0 | Definition of done: full catalog coverage, ≥ 95 % honest parity in every area, end-to-end against a local IMAP/SMTP server | goal |
 
@@ -33,61 +33,61 @@ commit 23.
 Two numbers, kept separate on purpose:
 
 - **Catalog coverage** (mechanical, `cargo xtask parity` → [docs/parity.md](docs/parity.md)): every observed
-  Outlook command row maps to a MailCraft command id that exists in the registry. Today 1,518 of 1,518 applicable
-  rows (100 %); 125 rows are not applicable (cloud-only Microsoft services). This only proves an id exists.
-- **Honest parity** (audited 2026-10-10, commit 10): each of the 1,518 rows classified by what its command really
-  does: REAL (works and is reachable), DIALOG-OK (opens a dialog that works), DIALOG-STUB (opens a dialog that
-  doesn't do the thing), PARTIAL (works, but clearly less than observed), STUB (no-op, echo or error).
-  Honest % = (REAL + DIALOG-OK + ½ PARTIAL) / rows. **Overall: 61.9 %** (55.0 % counting only REAL + DIALOG-OK).
+  Outlook command row maps to a MailCraft command id that exists in the registry. Today 1,512 of 1,512 applicable
+  rows (100 %); 131 rows are not applicable (cloud-only Microsoft services). This only proves an id exists.
+- **Honest parity** (re-audited 2026-10-10 at commit 14): each of the 1,512 rows classified by what its command
+  really does: REAL (works and is reachable), DIALOG-OK (opens a dialog that works), DIALOG-STUB (opens a dialog
+  that doesn't do the thing), PARTIAL (works, but clearly less than observed), STUB (no-op, echo or error).
+  Honest % = (REAL + DIALOG-OK + ½ PARTIAL) / rows. **Overall: 87.1 %** (80.2 % counting only REAL + DIALOG-OK),
+  up from 61.9 % at commit 10. Six Exchange-only calendar rows moved to not applicable and 76 rows were re-mapped
+  to the command that now implements them.
 
 | Catalog area | Rows | REAL | DIALOG-OK | DIALOG-STUB | PARTIAL | STUB | Honest |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Mail (main window) | 262 | 189 | 14 | 16 | 25 | 18 | 82 % |
-| Context menus | 205 | 149 | 20 | 10 | 14 | 12 | 86 % |
-| Read window | 85 | 63 | 7 | 5 | 4 | 6 | 85 % |
-| Search | 40 | 29 | 3 | 0 | 2 | 6 | 83 % |
-| Compose | 448 | 223 | 28 | 21 | 90 | 86 | 66 % |
-| Calendar | 128 | 41 | 8 | 9 | 21 | 49 | 47 % |
-| People | 142 | 34 | 3 | 12 | 25 | 68 | 35 % |
-| Notes | 64 | 8 | 2 | 10 | 17 | 27 | 29 % |
-| Tasks | 144 | 12 | 2 | 9 | 12 | 109 | 14 % |
-| **Total** | **1,518** | **748** | **87** | **92** | **210** | **381** | **61.9 %** |
+| Mail (main window) | 262 | 200 | 23 | 7 | 28 | 4 | 90.5 % |
+| Context menus | 205 | 156 | 23 | 7 | 7 | 12 | 89.0 % |
+| Read window | 85 | 65 | 7 | 5 | 2 | 6 | 85.9 % |
+| Search | 40 | 29 | 3 | 0 | 2 | 6 | 82.5 % |
+| Compose | 448 | 286 | 40 | 9 | 88 | 25 | 82.6 % |
+| Calendar | 122 | 78 | 13 | 3 | 25 | 3 | 84.8 % |
+| People | 142 | 99 | 14 | 3 | 25 | 1 | 88.4 % |
+| Notes | 64 | 44 | 8 | 0 | 12 | 0 | 90.6 % |
+| Tasks | 144 | 116 | 9 | 1 | 18 | 0 | 93.1 % |
+| **Total** | **1,512** | **1,073** | **140** | **35** | **207** | **57** | **87.1 %** |
 
 ### By functional area (judgement, with evidence)
 
 | Area | Honest | Evidence |
 |---|---|---|
-| Message list and folders | ~75 % | grouping, Focused/Other, drafts, preview lines, arrange/sort/filter, folder CRUD and favourites work; saved views, columns, conditional formatting, Quick Actions, AutoArchive, Open in New Window don't |
-| Reading pane | ~75 % | header, info bars, blocked pictures, inline reply, read-on-selection-change; Reading Pane options inert, no Space-bar reading |
-| Compose | ~65 % | editing, styles, tables, attachments, signatures, receipts, delay delivery; themes, style sets, list formats, encryption, voting, Save Sent Item To, rich paste missing |
-| Ribbon, menus, shortcuts | ~80 % | data-driven ribbons with width rules and keytips; they also surface the stubs below |
-| Rules and quick steps | ~80 % | 31 conditions, 25 actions, wizard and manage dialogs, rules on new mail, Quick Steps all real |
-| Search | ~80 % | indexed query language, refiners, scopes, Advanced Find, search folders; "Locations to Search" and Expiring Soon inert |
-| Accounts and sync | ~45 % | IMAP (CONDSTORE/QRESYNC), SMTP, Outbox, retries, offline work end-to-end tested; no JMAP send/receive, Exchange, POP3, IDLE push, OAuth sign-in UI; secrets file unencrypted |
-| Calendar | ~50 % | five views, recurrence, reminders, iTIP round trip, ICS; no colours, overlay, subscriptions, drag/resize, named time zones |
-| People | ~40 % | editor, groups, vCard/CSV; module views other than Card, arrange, Mail Merge missing |
-| Tasks | ~25 % | editor and To-Do list; no recurrence, task requests, views, module actions |
-| Notes | ~40 % | create/edit/colour; ribbon views dropped |
+| Message list and folders | ~80 % | grouping, Focused/Other, arrange/sort/filter, folder CRUD, favourites, Bottom-pane columns, hover actions; saved views, Add Columns, conditional formatting, Quick Actions settings, AutoArchive missing |
+| Reading pane | ~85 % | header, info bars, inline reply, mark-as-read timing, Space-bar reading; no find in a received message |
+| Compose | ~80 % | editing, styles, themes, list formats, rich paste, voting, receipts, Save Sent Item To; Clipboard/Styles/Selection panes, ¶ marks, S/MIME, bitmap paste missing |
+| Ribbon, menus, shortcuts | ~88 % | data-driven ribbons with width rules and keytips; a few Calendar buttons route through Mail commands |
+| Rules and quick steps | ~80 % | 31 conditions, 25 actions, wizard and manage dialogs, Quick Steps |
+| Search | ~82 % | indexed query language, refiners, Advanced Find, search folders; scopes and Expiring Soon partial |
+| Accounts and sync | ~70 % | IMAP (IDLE, CONDSTORE/QRESYNC), POP3, JMAP, SMTP, OAuth sign-in, OS keyring; no autodiscovery, JMAP push, OAuth end-to-end test |
+| Calendar | ~80 % | views, colours, overlay, drag/resize, named time zones, subscriptions, iTIP; calendar settings inert, New Meeting saves before the form |
+| People | ~75 % | editor, groups, views, vCard/CSV, Mail Merge (e-mail); contact reminders, Details/All Fields pages missing |
+| Tasks | ~70 % | editor, recurrence, views, module actions; incoming task requests not processed |
+| Notes | ~85 % | create/edit/colour/views; positions not persisted |
 | Import/export and print | ~65 % | EML/MSG/MBOX/Maildir/ICS/VCF/CSV, PDF everywhere, CUPS; no PST, no Windows printing |
-| Options dialog | ~4 % | ~123 of 207 observed settings present but only 9 take effect and none persist |
-| Responsive behaviour | ~90 % | 26 of 30 observed behaviours, exact break points |
-| Keyboard | ~93 % | 38 of 41 tested keys |
+| Options dialog | ~22 % | all 179 observed settings persist in the profile; 40 take effect |
+| Responsive behaviour | ~97 % | 29 of 30 observed behaviours (Classic Respond group at 1024 px) |
+| Keyboard | ~99 % | Ctrl+< / Ctrl+> missing in compose; Space on a focused button |
 
 ### Biggest gaps (ranked by user impact)
 
-1. Options: settings don't take effect or persist (needs a profile settings store; one key mismatch for auto-complete).
-2. New Appointment/Contact/Task from the Mail module fail (`mail.newItem` passes a mail folder).
-3. View commands outside Mail (`view.changeView`, arrange, reading pane, To-Do Bar, view settings) error or do nothing.
-4. Accounts: JMAP send/receive, OAuth sign-in, IDLE push, POP3, Exchange (EWS), encrypted secrets.
-5. Calendar subscriptions and CalDAV/CardDAV; calendar colours, overlay, drag and resize; named time zones with DST.
-6. Compose: rich paste, S/MIME encryption, voting buttons, Save Sent Item To, themes and style sets, list formats.
-7. Junk: blocked/safe sender lists and junk levels.
-8. People/Tasks/Notes module actions routed to mail-only commands; task recurrence and requests.
-9. Reading Pane options (mark as read after N seconds), Space-bar reading.
-10. Saved views and columns; Quick Actions; status bar customisation; AutoArchive.
+1. Options: Mail and Calendar settings that persist but don't take effect yet.
+2. New Meeting saves the item before its form opens (an untitled meeting is left on cancel).
+3. Saved views, Add Columns, conditional formatting, status bar customisation, Quick Actions settings.
+4. Incoming task requests.
+5. Accounts: autodiscovery, JMAP push, configurable first-sync window, OAuth end-to-end test.
+6. Compose panes (Clipboard, Styles, Selection), formatting marks, S/MIME, bitmap paste.
+7. Find in a received message; F6 focus cycling; Space on a focused button.
+8. New Items depth, Reply with Meeting, Post in This Folder, folder properties, AutoArchive.
 
-The full audit (per-row classification) is regenerated before each release; commits 14–26 and the milestones
-after v0.3.0 work down this list until every area is ≥ 95 %.
+The full audit (per-row classification) is regenerated before each release; the commits after 14 and the
+milestones after v0.3.0 work down this list until every area is ≥ 95 %.
 
 ## Needs the owner
 

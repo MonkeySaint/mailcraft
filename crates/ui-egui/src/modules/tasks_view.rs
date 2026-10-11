@@ -13,14 +13,14 @@ use serde_json::{Value, json};
 
 use mailcraft_engine::cmd::calendar::pim::Kind;
 use mailcraft_engine::cmd::view::modules::{ModuleKind, ModuleView, RowKind, ViewRow, arrange_label};
+use mailcraft_model::task::TaskRequestState;
 use mailcraft_model::{FlagState, FolderId, FolderKind, ItemId, TaskPriority, TaskStatus};
 
 use super::common::{
     DAY, ModState, a11y, change_view, child, collapsed_labels, current_folder, day_string, draw_check,
-    empty_message, folder_rows, group_header, group_row, load, local_secs, long_date, module_view,
-    paint_text_clipped, pane_bg, pane_separator, reading_split, row_height, select_folder, select_item,
-    short_date, split_folder_pane, store, sync_selection, today, todo_bar_strip, toggle_group, tz,
-    weekday_short,
+    empty_message, folder_rows, group_header, group_row, load, local_secs, long_date, module_folder_pane,
+    module_view, paint_text_clipped, pane_bg, pane_separator, reading_split, row_height, select_folder,
+    select_item, short_date, store, sync_selection, today, todo_bar_strip, toggle_group, tz, weekday_short,
 };
 use super::editors;
 use crate::App;
@@ -104,10 +104,9 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
     let list = rows(app);
     sync_selection(app, |_, id| list.iter().any(|r| r.id == id));
     let full = ui.max_rect();
-    let (pane, main) = split_folder_pane(ui, app);
+    let (pane, main) = module_folder_pane(ui, app);
     if let Some(p) = pane {
-        pane_bg(ui, p, app.theme.pane);
-        child(ui, p.shrink(6.0), "mc-tasks-pane", |ui| folder_pane(ui, app, &view));
+        child(ui, p.shrink2(egui::vec2(6.0, 0.0)), "mc-tasks-pane", |ui| folder_pane(ui, app, &view));
     }
     let main = todo_bar_strip(ui, app, main);
     pane_bg(ui, main, app.theme.reading);
@@ -692,6 +691,20 @@ fn details(ui: &mut Ui, app: &mut App, st: &mut ModState, row: &Row) {
         }
         if let Some(r) = &t.requested_by {
             info(ui, app, "Assigned by", r);
+        }
+        let request = match t.request_state {
+            TaskRequestState::Waiting => "Waiting for a response",
+            TaskRequestState::Accepted if t.requested_by.is_some() => "Accepted by you",
+            TaskRequestState::Accepted => "Accepted",
+            TaskRequestState::Declined => "Declined",
+            TaskRequestState::None => "",
+        };
+        info(ui, app, "Task request", request);
+        if let Some(when) = t.last_report {
+            let s = local_secs(when, tz);
+            let text =
+                format!("{} {}", long_date(s.div_euclid(DAY)), super::common::clock(s.rem_euclid(DAY) / 60));
+            info(ui, app, "Last update", &text);
         }
         if t.from_mail.is_some() {
             info(ui, app, "Linked", "Created from a flagged message");
