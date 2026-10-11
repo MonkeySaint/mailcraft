@@ -4,8 +4,8 @@ MailCraft is a clean-room, open-source desktop mail client in Rust, modelled on 
 workflow. This file tracks what is done, what is next, and an honest estimate of how close each area is to
 Outlook. It is updated with every commit.
 
-Status: **pre-alpha** (2026-10-11). Repository: https://github.com/MonkeySaint/mailcraft. First tag: v0.1.0 at
-commit 23.
+Status: **pre-alpha** (2026-10-11). Repository: https://github.com/MonkeySaint/mailcraft. Tags: v0.1.0 (commit 23,
+unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release).
 
 ## Milestones
 
@@ -25,7 +25,8 @@ commit 23.
 | — | Gap closing: profile settings store and Options; People/Tasks/Notes views and actions; calendar depth (colours, overlay, drag/resize, named time zones, subscriptions); compose (rich paste, themes, list formats, voting, receipts, Save Sent Item To); Junk Email; accounts (IDLE push, POP3, JMAP, OAuth sign-in, OS keyring) | ✅ round 1 done (commit 14), re-audited at 87.1 % |
 | — | Gap closing round 2: task requests, contact reminders, calendar settings and meeting form, Options wiring, saved views and columns, compose panes and find in received mail, autodiscovery/OAuth/JMAP push, keyboard focus, New Items | ✅ done (commits 15–22) |
 | — | Round 3: new-mail pipeline (junk, Focused overrides, rules, meeting auto-respond, task and receipt processing), contact reminders, saved views in Change View, theme colours, picture paste, vCard photos, compose auto-save; move to GitHub Actions, app id `saint.dev.MailCraft`, new app icon | ✅ done (commit 23, tag v0.1.0) |
-| M7/M14 | Rules UI depth, re-audit, small fixes | planned (commits 24–26) |
+| — | Release fixes (desktop entry, web wasm-opt, Flatpak on trixie, CI cache); first published release | ✅ done (commits 24–26, tag v0.1.1) |
+| M7/M14 | Rules UI depth, re-audit, small fixes | planned (commits 27+) |
 | v0.1.0 / v0.2.0 / v0.3.0 | Local release tags | commits 23 / 27 / 30 |
 | v1.0.0 | Definition of done: full catalog coverage, ≥ 95 % honest parity in every area, end-to-end against a local IMAP/SMTP server | goal |
 

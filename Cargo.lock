@@ -2073,7 +2073,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mailcraft"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "eframe",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-engine",
  "mailcraft-mcp",
@@ -2097,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "log",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-fonts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-geom",
  "proptest",
@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-formats"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cfb",
  "encoding_rs",
@@ -2147,14 +2147,14 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-geom"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "mailcraft-html"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-geom",
  "mailcraft-model",
@@ -2163,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-layout"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-fonts",
  "mailcraft-geom",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-engine",
  "serde",
@@ -2185,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-mime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "encoding_rs",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-geom",
  "mailcraft-mime",
@@ -2208,7 +2208,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "keyring",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-proof"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "unicode-segmentation",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "krilla",
  "mailcraft-fonts",
@@ -2248,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-search"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-model",
  "proptest",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "mailcraft-mime",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-testmail"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "rcgen",
@@ -2281,14 +2281,14 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-testmail-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-testmail",
 ]
 
 [[package]]
 name = "mailcraft-ui-egui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "egui",
  "egui_extras",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "js-sys",
@@ -5378,7 +5378,7 @@ checksum = "9440ea3e5aeabb0ac63af70daf835274065238cdd0cec83418f417eae38bacee"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mailcraft-engine",
  "resvg",
