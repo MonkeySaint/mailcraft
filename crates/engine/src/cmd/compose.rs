@@ -619,8 +619,20 @@ pub(crate) fn build_message(
         Importance::Low => Some("low".into()),
         Importance::Normal => None,
     };
-    b.text = Some(c.plain_text_with_list_formats());
-    if c.format != BodyFormat::PlainText {
+    let st = &s.settings;
+    let mut text = c.plain_text_with_list_formats();
+    if c.format == BodyFormat::PlainText && !for_draft {
+        // Options › Mail › Message format › "Automatically wrap text at character".
+        text = wrap_plain_text(&text, st.wrap_at());
+    }
+    b.text = Some(text);
+    // Options › Mail › Message format › "When sending messages in Rich Text format to Internet recipients":
+    // converted to HTML (MailCraft has no Rich Text transport, so "Send using Rich Text format" sends HTML
+    // too) or to plain text.
+    let rich_as_plain = c.format == BodyFormat::RichText
+        && !for_draft
+        && st.text("mail.format.richTextToInternet") == "plain";
+    if c.format != BodyFormat::PlainText && !rich_as_plain {
         b.html = Some(c.apply_list_formats_html(&mailcraft_html::doc_to_html(&c.body)));
     }
     b.attachments = c
@@ -633,7 +645,7 @@ pub(crate) fn build_message(
             content_id: None,
         })
         .collect();
-    if c.format != BodyFormat::PlainText {
+    if c.format != BodyFormat::PlainText && !rich_as_plain {
         let used: Vec<String> = c.images().into_iter().map(|(src, _)| src).collect();
         for img in &c.inline_images {
             // Content-IDs compare case-insensitively (as the parser does when it marks inline parts).
@@ -684,11 +696,95 @@ pub(crate) fn build_message(
             b.extra_headers.push(("Sensitivity".into(), "Company-Confidential".into()))
         }
     }
+    if !for_draft && let Some(days) = st.expire_days() {
+        // Options › Mail › Send messages › "Mark messages as expired after this many days": the expiry
+        // travels with the message (RFC 4021 Expiry-Date).
+        let sent = c.delay_until.unwrap_or_else(|| s.now());
+        let at = DateTime {
+            unix: sent.unix.saturating_add(i64::from(days).saturating_mul(86_400)),
+            offset_min: sent.offset_min,
+        };
+        b.extra_headers.push(("Expiry-Date".into(), at.to_rfc5322()));
+    }
+    if !for_draft
+        && c.format == BodyFormat::PlainText
+        && st.bool("mail.format.uuencode")
+        && !b.attachments.is_empty()
+    {
+        // Options › Mail › Message format › "Encode attachments in UUENCODE format when sending plain-text
+        // messages": the files go into the text as uuencoded blocks instead of MIME parts.
+        let mut text = b.text.take().unwrap_or_default();
+        for a in std::mem::take(&mut b.attachments) {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push('\n');
+            text.push_str(&uuencode(&a.filename, &a.data));
+        }
+        b.text = Some(text);
+    }
     if for_draft {
         b.extra_headers.push(("X-Unsent".into(), "1".into()));
     }
     b.keep_bcc = for_draft;
     b
+}
+
+/// Wraps each line of plain text longer than `width` chars at the last space before the limit (a word longer
+/// than the limit, like a link, is left whole; quoted "> " lines are wrapped like any other).
+pub(crate) fn wrap_plain_text(text: &str, width: usize) -> String {
+    let width = width.max(1);
+    let mut out = String::with_capacity(text.len());
+    for (n, line) in text.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        let mut rest: &str = line;
+        while rest.chars().count() > width {
+            // The first char that does not fit (a space there still ends the line at the limit).
+            let Some((limit, ch)) = rest.char_indices().nth(width) else { break };
+            let head = rest.get(..limit.saturating_add(ch.len_utf8())).unwrap_or(rest);
+            // The last space up to the limit that has text before it (leading indentation is kept);
+            // otherwise the first space after it (a long word or link stays whole).
+            let cut = head
+                .rfind(' ')
+                .filter(|&i| head.get(..i).is_some_and(|h| !h.trim().is_empty()))
+                .or_else(|| rest.get(limit..).and_then(|t| t.find(' ')).map(|i| i.saturating_add(limit)));
+            let Some(cut) = cut else { break };
+            out.push_str(rest.get(..cut).unwrap_or("").trim_end());
+            out.push('\n');
+            rest = rest.get(cut..).unwrap_or("").trim_start_matches(' ');
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
+/// One file as a uuencoded block ("begin 644 name" … "end"; 45 bytes per line).
+pub(crate) fn uuencode(name: &str, data: &[u8]) -> String {
+    fn enc(v: u8) -> char {
+        let v = v & 0x3f;
+        if v == 0 { '`' } else { char::from(v.saturating_add(32)) }
+    }
+    let name: String = name.chars().map(|c| if c.is_control() { '_' } else { c }).collect();
+    let name = if name.trim().is_empty() { "attachment".to_owned() } else { name.trim().to_owned() };
+    let mut out = format!("begin 644 {name}\n");
+    for chunk in data.chunks(45) {
+        // A chunk holds at most 45 bytes, so its length always fits in a u8.
+        out.push(enc(u8::try_from(chunk.len()).unwrap_or(45)));
+        for group in chunk.chunks(3) {
+            let b0 = group.first().copied().unwrap_or(0);
+            let b1 = group.get(1).copied().unwrap_or(0);
+            let b2 = group.get(2).copied().unwrap_or(0);
+            out.push(enc(b0 >> 2));
+            out.push(enc((b0 << 4) | (b1 >> 4)));
+            out.push(enc((b1 << 2) | (b2 >> 6)));
+            out.push(enc(b2));
+        }
+        out.push('\n');
+    }
+    out.push_str("`\nend\n");
+    out
 }
 
 /// A stored item for a built message.
@@ -714,9 +810,16 @@ pub fn save_draft(s: &mut Session, cid: u64) -> Result<ItemId, CmdError> {
     let drafts = match existing {
         Some((_, f)) => Some(f),
         None => {
-            account.as_ref().and_then(|a| s.mailbox.role_folder(a.id, FolderRole::Drafts)).or_else(|| {
-                s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Drafts)).map(|f| f.id)
-            })
+            // Options › Mail › Save messages › "Save to this folder" (Drafts unless changed); Drafts when the
+            // account has no such folder.
+            let role = s.settings.draft_folder_role();
+            let find = |role: FolderRole| {
+                account
+                    .as_ref()
+                    .and_then(|a| s.mailbox.role_folder(a.id, role))
+                    .or_else(|| s.mailbox.folders.values().find(|f| f.role == Some(role)).map(|f| f.id))
+            };
+            find(role).or_else(|| find(FolderRole::Drafts))
         }
     };
     let Some(drafts) = drafts else {
@@ -747,8 +850,64 @@ pub fn save_draft(s: &mut Session, cid: u64) -> Result<ItemId, CmdError> {
     Ok(id)
 }
 
+/// Options › Mail › Send messages › "Automatic name checking": before a send, recipient entries that are
+/// not addresses are resolved against the contacts; when one matches several, the Check Names dialog asks
+/// which (and the message is not sent). `Some` = stop with this result.
+fn auto_check_names(s: &mut Session, cid: u64, p: &Value) -> Result<Option<Value>, CmdError> {
+    if !s.settings.bool("mail.send.autoNameCheck") || opt_bool(p, "checkNames") == Some(false) {
+        return Ok(None);
+    }
+    let Some(c) = s.composes.get(&cid) else { return Ok(None) };
+    if [&c.to, &c.cc, &c.bcc].iter().all(|f| parse_recipients(f).is_ok()) {
+        return Ok(None);
+    }
+    let (_, unresolved) = resolve_names(s, cid)?;
+    // Names with no match at all fall through to the "not valid" error below.
+    let ambiguous: Vec<Value> = unresolved
+        .into_iter()
+        .filter(|u| u.get("candidates").and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
+        .collect();
+    if ambiguous.is_empty() {
+        return Ok(None);
+    }
+    s.notify(Notice::OpenDialog("checkNames".into(), json!({"compose": cid, "unresolved": ambiguous})));
+    Ok(Some(json!({"sent": false, "compose": cid, "reason": "checkNames", "unresolved": ambiguous})))
+}
+
+/// Options › Mail › Compose messages › "Always check spelling before sending": a message with spelling
+/// issues asks first (the confirm dialog sends with `"spellCheck": false`). `Some` = stop with this result.
+fn spelling_before_send(s: &mut Session, cid: u64, p: &Value) -> Option<Value> {
+    if !s.settings.bool("mail.compose.spellBeforeSend") || opt_bool(p, "spellCheck") == Some(false) {
+        return None;
+    }
+    let sp = crate::cmd::review::speller(s);
+    let c = s.composes.get_mut(&cid)?;
+    crate::cmd::review::spell_check(&sp, c, false, 1);
+    let count = c.spell_issues.iter().filter(|i| i.kind == "spelling" || i.kind == "repeated").count();
+    if count == 0 {
+        return None;
+    }
+    let what = if count == 1 { "1 spelling issue".to_owned() } else { format!("{count} spelling issues") };
+    s.notify(Notice::OpenDialog(
+        "confirm".into(),
+        json!({
+            "title": "Spelling",
+            "text": format!("This message has {what}. Send it anyway?"),
+            "command": "compose.send",
+            "params": {"compose": cid, "spellCheck": false},
+        }),
+    ));
+    Some(json!({"sent": false, "compose": cid, "reason": "spelling", "issues": count}))
+}
+
 fn send(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
+    if !s.composes.contains_key(&cid) {
+        return Err(CmdError::Disabled(NO_COMPOSE.into()));
+    }
+    if let Some(stop) = auto_check_names(s, cid, p)? {
+        return Ok(stop);
+    }
     let c = s.composes.get(&cid).cloned().ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
     let fail = |s: &mut Session, msg: String| -> CmdResult {
         s.notify(Notice::Error(msg.clone()));
@@ -783,6 +942,9 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     let Some(outbox) = s.mailbox.role_folder(account.id, FolderRole::Outbox) else {
         return fail(s, format!("The account {} has no Outbox folder.", account.address));
     };
+    if let Some(stop) = spelling_before_send(s, cid, p) {
+        return Ok(stop);
+    }
     let now = s.now();
     let b = build_message(s, &c, Some(&account), false);
     let (mut item, _) = item_from(&b, now);
@@ -827,6 +989,60 @@ fn save_draft_cmd(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
     let id = save_draft(s, cid)?;
     Ok(json!({"draft": id.0, "compose": cid}))
+}
+
+/// Options › Mail › Save messages › "Automatically save items that have not been sent after this many
+/// minutes": saves every open compose whose changes have been unsaved that long (an untouched message is
+/// never saved). Runs from `compose.autoSaveTick` (the window's timer) and after typing. The saved drafts are
+/// written to the store like any change, without an undo step. Returns (compose, draft) pairs.
+pub fn auto_save(s: &mut Session) -> Vec<(u64, ItemId)> {
+    let Some(minutes) = s.settings.auto_save_minutes() else {
+        for c in s.composes.values_mut() {
+            c.dirty_since = None;
+        }
+        return Vec::new();
+    };
+    let now = s.now().unix;
+    let period = i64::from(minutes).saturating_mul(60);
+    let mut due = Vec::new();
+    for (cid, c) in &mut s.composes {
+        if !c.dirty {
+            c.dirty_since = None;
+            continue;
+        }
+        let since = *c.dirty_since.get_or_insert(now);
+        if now.saturating_sub(since) >= period {
+            due.push(*cid);
+        }
+    }
+    if due.is_empty() {
+        return Vec::new();
+    }
+    let before = s.mailbox.clone();
+    let mut saved = Vec::new();
+    for cid in due {
+        let result = save_draft(s, cid);
+        if let Some(c) = s.composes.get_mut(&cid) {
+            // Saved: the clock restarts with the next change. Failed: try again after another period.
+            c.dirty_since = if result.is_ok() { None } else { Some(now) };
+        }
+        match result {
+            Ok(id) => saved.push((cid, id)),
+            Err(e) => log::warn!("auto-save of compose {cid} failed: {e}"),
+        }
+    }
+    if !saved.is_empty() {
+        crate::sync::queue_local_changes(s, &before);
+        let ops = crate::session::diff_ops(&before, &s.mailbox);
+        s.journal(ops);
+    }
+    saved
+}
+
+fn auto_save_tick(s: &mut Session, _p: &Value) -> CmdResult {
+    let saved = auto_save(s);
+    let list: Vec<Value> = saved.iter().map(|(c, d)| json!({"compose": c, "draft": d.0})).collect();
+    Ok(json!({"saved": list, "minutes": s.settings.auto_save_minutes()}))
 }
 
 fn discard(s: &mut Session, p: &Value) -> CmdResult {
@@ -953,6 +1169,17 @@ fn show_from(s: &mut Session, p: &Value) -> CmdResult {
 
 fn check_names(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
+    let (resolved, unresolved) = resolve_names(s, cid)?;
+    if !unresolved.is_empty() {
+        s.notify(Notice::OpenDialog("checkNames".into(), json!({"compose": cid, "unresolved": unresolved})));
+    }
+    Ok(json!({"resolved": resolved, "unresolved": unresolved}))
+}
+
+/// Check Names without the dialog: replaces each recipient entry that is not an address but matches exactly
+/// one contact (or Auto-Complete entry) with that contact's "Name <address>". Returns how many entries
+/// resolve and, for the others, `{"name", "candidates"}`.
+fn resolve_names(s: &mut Session, cid: u64) -> Result<(usize, Vec<Value>), CmdError> {
     let Some(c) = s.composes.get(&cid).cloned() else {
         return Err(CmdError::Disabled(NO_COMPOSE.into()));
     };
@@ -990,10 +1217,7 @@ fn check_names(s: &mut Session, p: &Value) -> CmdResult {
         cm.cc = cc;
         cm.bcc = bcc;
     }
-    if !unresolved.is_empty() {
-        s.notify(Notice::OpenDialog("checkNames".into(), json!({"compose": cid, "unresolved": unresolved})));
-    }
-    Ok(json!({"resolved": resolved, "unresolved": unresolved}))
+    Ok((resolved, unresolved))
 }
 
 /// Check Names candidates ("Name <address>") for a typed recipient: contacts whose name, file-as, company or
@@ -1767,22 +1991,31 @@ fn insert_text(s: &mut Session, p: &Value) -> CmdResult {
     let c = compose_mut(s, p)?;
     // Typing is one undo step until the caret moves or another edit runs; Enter starts a new one.
     let run = (!text.contains(['\n', '\r'])).then_some(EditRun::Typing);
-    c.run_edit(run, |c| c.insert_text(&text));
-    Ok(json!({"caret": pos_json(&c.selection.focus)}))
+    c.run_edit(run, |c| c.type_text(&text));
+    let r = json!({"caret": pos_json(&c.selection.focus)});
+    auto_save(s);
+    Ok(r)
 }
 
 fn delete_text(s: &mut Session, p: &Value) -> CmdResult {
     let dir = opt_str(p, "direction").unwrap_or("backward");
     let c = compose_mut(s, p)?;
+    let before = c.selection.focus.clone();
     match dir {
-        "backward" => c.run_edit(Some(EditRun::DeleteBackward), ComposeState::delete_backward),
+        "backward" => {
+            c.run_edit(Some(EditRun::DeleteBackward), ComposeState::delete_backward);
+            // Backspace inside a prefaced comment keeps it going.
+            c.follow_preface(&before);
+        }
         "forward" => c.run_edit(Some(EditRun::DeleteForward), ComposeState::delete_forward),
         "selection" => c.run_edit(None, |c| {
             c.delete_selection();
         }),
         other => return Err(CmdError::Params(format!("unknown direction `{other}`"))),
     }
-    Ok(json!({"caret": pos_json(&c.selection.focus)}))
+    let r = json!({"caret": pos_json(&c.selection.focus)});
+    auto_save(s);
+    Ok(r)
 }
 
 fn edit_undo(s: &mut Session, p: &Value) -> CmdResult {
@@ -2391,6 +2624,9 @@ pub fn tracking(s: &Session, id: ItemId) -> Option<Tracking> {
         .collect();
     candidates.sort_by_key(|x| (x.received.unix, x.id));
     candidates.truncate(MAX_REPORT_CANDIDATES);
+    // Options › Mail › Tracking › "Automatically update original sent item with receipt information": off,
+    // a sent item shows no receipts or vote responses (the replies themselves stay in the Inbox).
+    let update_sent = s.settings.bool("mail.tracking.updateSentItem");
     for x in candidates {
         let replies = x.in_reply_to.iter().any(|r| bare_id(r) == mid);
         let mine = item_sent_by_me(s, x);
@@ -2404,6 +2640,9 @@ pub fn tracking(s: &Session, id: ItemId) -> Option<Tracking> {
                 continue;
             }
             if t.sent_by_me && !mine {
+                if !update_sent {
+                    continue;
+                }
                 let from = x.from.as_ref().map(|f| f.addr.clone()).unwrap_or_default();
                 t.responses.retain(|r| !r.from.eq_ignore_ascii_case(&from) || from.is_empty());
                 t.responses.push(VoteResponse { item: x.id.0, from, choice, when });
@@ -2415,6 +2654,7 @@ pub fn tracking(s: &Session, id: ItemId) -> Option<Tracking> {
         }
         if t.sent_by_me
             && !mine
+            && update_sent
             && let Some(raw) = stored_raw(s, x)
             && raw_headers(&raw)
                 .get("Content-Type")
@@ -2491,7 +2731,8 @@ fn send_hidden(s: &mut Session, mut c: ComposeState) -> CmdResult {
     c.id = s.next_compose;
     let cid = c.id;
     s.composes.insert(cid, c);
-    let r = send(s, &json!({"compose": cid}));
+    // Nothing to ask about in a message the user does not see (no name check or spelling prompt).
+    let r = send(s, &json!({"compose": cid, "checkNames": false, "spellCheck": false}));
     // A refused send leaves no hidden compose behind.
     s.composes.remove(&cid);
     r
@@ -2527,6 +2768,8 @@ fn vote(s: &mut Session, p: &Value) -> CmdResult {
     }
     c.body = Doc::default();
     c.inline_images.clear();
+    // An original attached by "Attach original message" does not go with a vote either.
+    c.attachments.clear();
     c.ensure_body();
     let r = send_hidden(s, c)?;
     Ok(json!({"vote": choice, "sent": r.get("sent").cloned().unwrap_or(json!(false)), "item": r.get("item")}))
@@ -2910,6 +3153,18 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         // Header / window commands (not ribbon rows).
         spec("compose.send", "Send", "Compose › Header", "Mod+Enter / Alt+S", "", true, has_compose, send),
+        // Options › Mail › Save messages: the compose window's auto-save timer calls this (cheap when nothing
+        // is due); it journals the drafts it saves itself, so it records no undo step.
+        spec(
+            "compose.autoSaveTick",
+            "AutoSave",
+            "Compose › (timer)",
+            "",
+            "",
+            false,
+            crate::always,
+            auto_save_tick,
+        ),
         spec(
             "compose.saveDraft",
             "Save",
@@ -4199,5 +4454,322 @@ mod review_tests {
         s.run("compose.deleteText", &json!({"direction": "backward"})).unwrap();
         assert_eq!(s.run("compose.editRedo", &json!({})).unwrap()["redone"], true);
         assert_eq!(text(&s, id), "ab");
+    }
+}
+
+/// Options › Mail settings that act on composing and sending.
+#[cfg(test)]
+mod options_tests {
+    use super::tests::{open, session};
+    use super::*;
+    use mailcraft_model::Contact;
+
+    fn set(s: &mut Session, key: &str, value: Value) {
+        s.run("options.set", &json!({"key": key, "value": value})).unwrap();
+    }
+
+    fn in_role(s: &Session, role: FolderRole) -> Vec<ItemId> {
+        s.mailbox
+            .mail
+            .values()
+            .filter(|m| s.mailbox.folder(m.folder).is_some_and(|f| f.role == Some(role)))
+            .map(|m| m.id)
+            .collect()
+    }
+
+    fn advance(s: &mut Session, secs: i64) {
+        let now = s.now();
+        s.fixed_now = Some(DateTime { unix: now.unix.saturating_add(secs), offset_min: now.offset_min });
+    }
+
+    fn outbox_raw(s: &Session) -> String {
+        let id = in_role(s, FolderRole::Outbox).into_iter().max().unwrap();
+        String::from_utf8_lossy(s.mailbox.mail[&id].raw.as_ref().unwrap()).into_owned()
+    }
+
+    #[test]
+    fn auto_save_after_the_set_minutes() {
+        let mut s = session();
+        let id = open(&mut s);
+        // An untouched message is never saved.
+        advance(&mut s, 3600);
+        assert_eq!(s.run("compose.autoSaveTick", &json!({})).unwrap()["saved"], json!([]));
+        s.run("compose.insertText", &json!({"text": "Draft text"})).unwrap();
+        advance(&mut s, 2 * 60);
+        assert_eq!(s.run("compose.autoSaveTick", &json!({})).unwrap()["saved"], json!([]), "not yet");
+        advance(&mut s, 60);
+        let r = s.run("compose.autoSaveTick", &json!({})).unwrap();
+        let draft = r["saved"][0]["draft"].as_u64().unwrap();
+        assert_eq!(r["saved"][0]["compose"], id);
+        assert_eq!(in_role(&s, FolderRole::Drafts), [ItemId(draft)]);
+        assert!(!s.composes[&id].dirty);
+        assert!(s.undo.undo.is_empty(), "auto-save is not an undo step");
+        // Typing on starts a new period; the save also happens from typing itself.
+        s.run("compose.insertText", &json!({"text": " more"})).unwrap();
+        advance(&mut s, 3 * 60);
+        s.run("compose.insertText", &json!({"text": "!"})).unwrap();
+        assert!(!s.composes[&id].dirty, "saved while typing");
+        assert!(s.mailbox.mail[&ItemId(draft)].body_text().contains("Draft text more!"));
+        // Every minute when set to 1; never when off.
+        set(&mut s, "mail.save.autoSaveMinutes", json!(1));
+        s.run("compose.insertText", &json!({"text": "x"})).unwrap();
+        advance(&mut s, 60);
+        assert_eq!(s.run("compose.autoSaveTick", &json!({})).unwrap()["saved"].as_array().unwrap().len(), 1);
+        set(&mut s, "mail.save.autoSave", json!(false));
+        s.run("compose.insertText", &json!({"text": "y"})).unwrap();
+        advance(&mut s, 3600);
+        let r = s.run("compose.autoSaveTick", &json!({})).unwrap();
+        assert_eq!((r["saved"].clone(), r["minutes"].clone()), (json!([]), Value::Null));
+        assert!(s.composes[&id].dirty);
+    }
+
+    #[test]
+    fn drafts_go_to_the_chosen_folder() {
+        let mut s = session();
+        set(&mut s, "mail.save.folder", json!("inbox"));
+        open(&mut s);
+        s.run("compose.insertText", &json!({"text": "Note to self"})).unwrap();
+        let d = s.run("compose.saveDraft", &json!({})).unwrap()["draft"].as_u64().unwrap();
+        assert_eq!(in_role(&s, FolderRole::Inbox), [ItemId(d)]);
+        assert!(s.mailbox.mail[&ItemId(d)].is_draft);
+    }
+
+    #[test]
+    fn expiry_date_travels_with_the_message() {
+        let mut s = session();
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        assert!(!outbox_raw(&s).contains("Expiry-Date"), "off by default");
+        set(&mut s, "mail.send.expire", json!(true));
+        set(&mut s, "mail.send.expireDays", json!(2));
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        // The test clock is Fri 2026-10-09 12:00 UTC.
+        assert!(
+            outbox_raw(&s).contains("Expiry-Date: Sun, 11 Oct 2026 12:00:00 +0000"),
+            "{}",
+            outbox_raw(&s)
+        );
+    }
+
+    #[test]
+    fn plain_text_wraps_at_the_set_column() {
+        assert_eq!(wrap_plain_text("aaa bbb ccc", 7), "aaa bbb\nccc");
+        assert_eq!(wrap_plain_text("aaa bbb ccc", 3), "aaa\nbbb\nccc");
+        // Long words stay whole; indentation stays; short lines and line ends are kept.
+        assert_eq!(
+            wrap_plain_text("https://example.com/a/very/long/link x", 10),
+            "https://example.com/a/very/long/link\nx"
+        );
+        assert_eq!(wrap_plain_text("    indented words here", 12), "    indented\nwords here");
+        assert_eq!(wrap_plain_text("one\n\ntwo", 2), "one\n\ntwo");
+        assert_eq!(wrap_plain_text("éé éé éé", 5), "éé éé\néé");
+        assert_eq!(wrap_plain_text("", 0), "");
+        let mut s = session();
+        set(&mut s, "mail.format.wrapAt", json!(30));
+        open(&mut s);
+        s.run("compose.format", &json!({"kind": "plain"})).unwrap();
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run(
+            "compose.insertText",
+            &json!({"text": "The quick brown fox jumps over the lazy dog again and again."}),
+        )
+        .unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        let raw = outbox_raw(&s);
+        assert!(raw.contains("The quick brown fox jumps over\r\nthe lazy dog again and again."), "{raw}");
+    }
+
+    #[test]
+    fn uuencoded_attachments_in_plain_text() {
+        assert_eq!(uuencode("cat.txt", b"Cat"), "begin 644 cat.txt\n#0V%T\n`\nend\n");
+        let long = uuencode("x\n.bin", &[0u8; 50]);
+        assert!(long.starts_with("begin 644 x_.bin\nM````"), "{long}");
+        assert_eq!(long.lines().count(), 5, "45 + 5 bytes, then the end lines");
+        let mut s = session();
+        set(&mut s, "mail.format.uuencode", json!(true));
+        let cid = open(&mut s);
+        s.run("compose.format", &json!({"kind": "plain"})).unwrap();
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.insertText", &json!({"text": "File below."})).unwrap();
+        s.composes
+            .get_mut(&cid)
+            .unwrap()
+            .attach_bytes("cat.txt", Some("text/plain"), b"Cat".to_vec())
+            .unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        let raw = outbox_raw(&s);
+        assert!(raw.contains("begin 644 cat.txt\r\n#0V%T\r\n`\r\nend"), "{raw}");
+        assert!(!raw.contains("multipart/mixed"), "no MIME attachment part: {raw}");
+    }
+
+    #[test]
+    fn rich_text_goes_out_as_html_or_plain_text() {
+        let mut s = session();
+        let send_rich = |s: &mut Session| {
+            open(s);
+            s.run("compose.format", &json!({"kind": "rich"})).unwrap();
+            s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+            s.run("compose.insertText", &json!({"text": "Hello"})).unwrap();
+            s.run("compose.send", &json!({})).unwrap();
+            outbox_raw(s)
+        };
+        assert!(send_rich(&mut s).contains("text/html"));
+        set(&mut s, "mail.format.richTextToInternet", json!("plain"));
+        let raw = send_rich(&mut s);
+        assert!(!raw.contains("text/html") && raw.contains("Hello"), "{raw}");
+    }
+
+    #[test]
+    fn spelling_is_checked_before_sending() {
+        let mut s = session();
+        let cid = open(&mut s);
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.insertText", &json!({"text": "Teh recieved wrod"})).unwrap();
+        set(&mut s, "mail.compose.spellBeforeSend", json!(true));
+        let r = s.run("compose.send", &json!({})).unwrap();
+        assert_eq!((r["sent"].clone(), r["reason"].clone()), (json!(false), json!("spelling")), "{r}");
+        assert!(r["issues"].as_u64().unwrap() >= 2);
+        let Some(Notice::OpenDialog(name, params)) = s.notices.last().cloned() else { panic!("no dialog") };
+        assert_eq!((name.as_str(), params["command"].as_str()), ("confirm", Some("compose.send")));
+        assert!(s.composes.contains_key(&cid));
+        // "Send anyway" from the dialog.
+        let r = s.run("compose.send", &params["params"]).unwrap();
+        assert_eq!(r["sent"], true, "{r}");
+        // Off (the default): no check.
+        set(&mut s, "mail.compose.spellBeforeSend", json!(false));
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.insertText", &json!({"text": "Teh wrod"})).unwrap();
+        assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
+    }
+
+    fn add_contact(s: &mut Session, first: &str, last: &str, emails: &[&str]) {
+        let id = s.mailbox.alloc_id();
+        s.mailbox.contacts.insert(
+            ItemId(id),
+            Contact {
+                id: ItemId(id),
+                first_name: first.into(),
+                last_name: last.into(),
+                emails: emails.iter().map(|e| (*e).to_owned()).collect(),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn names_are_checked_automatically_on_send() {
+        let mut s = session();
+        add_contact(&mut s, "Bob", "Chen", &["bob@example.org"]);
+        add_contact(&mut s, "Ann", "Lee", &["ann@example.org", "ann.lee@example.com"]);
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "bob"})).unwrap();
+        let r = s.run("compose.send", &json!({})).unwrap();
+        assert_eq!(r["sent"], true, "{r}");
+        assert!(outbox_raw(&s).contains("To: Bob Chen <bob@example.org>"));
+        // Several matches: Check Names asks, nothing is sent.
+        let cid = open(&mut s);
+        s.run("compose.setTo", &json!({"value": "Ann Lee"})).unwrap();
+        let r = s.run("compose.send", &json!({})).unwrap();
+        assert_eq!(r["reason"], "checkNames", "{r}");
+        assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(n, _)) if n == "checkNames"));
+        assert!(s.composes.contains_key(&cid));
+        // No match: the usual error. Option off: no lookup, the name is refused.
+        s.run("compose.setTo", &json!({"value": "nobody"})).unwrap();
+        assert!(s.run("compose.send", &json!({})).unwrap()["error"].as_str().unwrap().contains("not valid"));
+        set(&mut s, "mail.send.autoNameCheck", json!(false));
+        s.run("compose.setTo", &json!({"value": "bob"})).unwrap();
+        let r = s.run("compose.send", &json!({})).unwrap();
+        assert_eq!(r["sent"], false);
+        assert_eq!(s.composes[&cid].to, "bob");
+    }
+
+    #[test]
+    fn prefaced_comments_in_the_original() {
+        let mut s = session();
+        let cid = s.open_compose(ComposeState {
+            kind: ComposeKind::Reply,
+            format: BodyFormat::Html,
+            preface: Some("Kim".into()),
+            body: Doc {
+                blocks: vec![
+                    Block::text_paragraph(""),
+                    Block::Rule,
+                    Block::text_paragraph("From: Ann <ann@example.org>"),
+                    Block::text_paragraph("Can you come?"),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let type_at = |s: &mut Session, path: usize, offset: usize, t: &str| {
+            s.run("compose.select", &json!({"compose": cid, "anchor": {"path": [path], "offset": offset}}))
+                .unwrap();
+            s.run("compose.insertText", &json!({"compose": cid, "text": t})).unwrap();
+        };
+        // Above the original: no preface.
+        type_at(&mut s, 0, 0, "Hi");
+        assert!(s.composes[&cid].body.to_plain_text().starts_with("Hi\n"));
+        // Inside it: "[Kim] " once per comment, bold italic; the comment itself is not.
+        type_at(&mut s, 3, 13, " Y");
+        for ch in ["e", "s"] {
+            s.run("compose.insertText", &json!({"compose": cid, "text": ch})).unwrap();
+        }
+        s.run("compose.deleteText", &json!({"compose": cid})).unwrap();
+        s.run("compose.insertText", &json!({"compose": cid, "text": "s"})).unwrap();
+        let c = &s.composes[&cid];
+        assert_eq!(c.body.to_plain_text().lines().last(), Some("Can you come?[Kim]  Yes"));
+        let Block::Paragraph { inlines, .. } = &c.body.blocks[3] else { panic!() };
+        let styled: Vec<(String, Option<bool>, Option<bool>)> = inlines
+            .iter()
+            .filter_map(|i| match i {
+                mailcraft_model::Inline::Text { text, style } => {
+                    Some((text.clone(), style.bold, style.italic))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            styled.iter().any(|(t, b, i)| t == "[Kim] " && *b == Some(true) && *i == Some(true)),
+            "{styled:?}"
+        );
+        assert!(styled.iter().any(|(t, b, _)| t.contains("Yes") && *b != Some(true)), "{styled:?}");
+        // Somewhere else in the original: a new preface.
+        type_at(&mut s, 3, 0, "No. ");
+        assert!(s.composes[&cid].body.to_plain_text().ends_with("[Kim] No. Can you come?[Kim]  Yes"));
+        // Off: plain typing.
+        s.composes.get_mut(&cid).unwrap().preface = None;
+        type_at(&mut s, 2, 0, ">");
+        assert!(s.composes[&cid].body.to_plain_text().contains(">From: Ann"));
+    }
+
+    #[test]
+    fn sent_items_do_not_update_when_tracking_is_off() {
+        let mut s = session();
+        set(&mut s, "mail.tracking.updateSentItem", json!(false));
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "ann@example.org"})).unwrap();
+        s.run("compose.setSubject", &json!({"value": "Plan"})).unwrap();
+        s.run("compose.readReceipt", &json!({"on": true})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        let sent = in_role(&s, FolderRole::Outbox)[0];
+        let mid = s.mailbox.mail[&sent].message_id.clone().unwrap();
+        let raw = format!(
+            "From: Ann <ann@example.org>\r\nSubject: Read: Plan\r\nMessage-ID: <m1@example.org>\r\nIn-Reply-To: <{mid}>\r\n\
+Content-Type: multipart/report; report-type=disposition-notification; boundary=\"c\"\r\n\r\n--c\r\nContent-Type: text/plain\r\n\r\nRead.\r\n\
+--c\r\nContent-Type: message/disposition-notification\r\n\r\nReporting-UA: x\r\nFinal-Recipient: rfc822;ann@example.org\r\n\
+Original-Message-ID: <{mid}>\r\nDisposition: manual-action/MDN-sent-manually; displayed\r\n--c--\r\n"
+        )
+        .into_bytes();
+        let msg = mailcraft_mime::parse(&raw).unwrap();
+        let mut item = MailItem::from_message(&msg, &raw, s.now());
+        item.folder = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
+        s.mailbox.add_mail(item);
+        assert!(tracking(&s, sent).unwrap().receipts.is_empty());
+        set(&mut s, "mail.tracking.updateSentItem", json!(true));
+        assert_eq!(tracking(&s, sent).unwrap().receipts.len(), 1);
     }
 }

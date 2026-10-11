@@ -7,6 +7,13 @@
 //! horizontal rule and bold labels. The original's format is kept. Responses open inline in the reading pane
 //! unless `{"window": true}`. The source item's replied/forwarded state is set by the send command
 //! (`ComposeState::source` + `kind`), not here.
+//!
+//! Options › Mail › Replies and forwards shape the body: the original text included (default), left out
+//! (replies only), attached as an .eml item, indented, or prefixed line by line ("> " in plain text, a quote
+//! bar in HTML); "Preface comments with" marks what the user types inside the original
+//! ([`ComposeState::type_text`]). Save messages › "Save forwarded messages" and "save the reply in the same
+//! folder" pick where the sent copy goes; "Ignore original message text" leaves the original out of
+//! proofing.
 
 use std::collections::BTreeSet;
 
@@ -18,11 +25,13 @@ use super::mail::{
 };
 use crate::cmd::compose::field_mailbox;
 use crate::cmd::util::opt_bool;
-use crate::compose::{ComposeAttachment, ComposeKind, ComposeState, InlineImage};
+use crate::compose::{ComposeAttachment, ComposeKind, ComposeState, InlineImage, SaveSentTo};
+use crate::settings::OriginalText;
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_model::subject::{forward_subject, reply_subject};
 use mailcraft_model::{
-    Address, Block, BodyFormat, Importance, Inline, ItemId, ListTime, MailItem, ParaStyle, TextStyle,
+    Address, Block, BodyFormat, FolderKind, FolderRole, Importance, Inline, ItemId, ListTime, MailItem,
+    ParaStyle, TextStyle,
 };
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -207,9 +216,23 @@ fn header_lines(s: &Session, m: &MailItem) -> Vec<(&'static str, String)> {
 }
 
 /// Body of a response: two empty paragraphs (the caret goes in the first), then the quoted header block,
-/// a blank line and the original.
+/// a blank line and the original ("Include original message text").
 pub fn quoted_body(s: &Session, m: &MailItem) -> mailcraft_model::Doc {
+    quoted_body_as(s, m, OriginalText::Include, "")
+}
+
+/// Left indent of an indented original ("Include and indent original message text"), px.
+const INDENT_PX: f32 = 36.0;
+
+/// Body of a response for one of the Options › Mail › Replies and forwards choices: two empty paragraphs,
+/// then (when the original's text goes in) the header block, a blank line and the original: as it is, indented
+/// (a tab before each plain-text line), or with `prefix` before each plain-text line (a quote bar in HTML).
+/// The header block itself is never indented or prefixed.
+pub fn quoted_body_as(s: &Session, m: &MailItem, mode: OriginalText, prefix: &str) -> mailcraft_model::Doc {
     let mut blocks = vec![Block::text_paragraph(""), Block::text_paragraph("")];
+    if !mode.quotes() {
+        return mailcraft_model::Doc { blocks, ..Default::default() };
+    }
     let lines = header_lines(s, m);
     if m.body.format == BodyFormat::PlainText {
         blocks.push(Block::text_paragraph("-----Original Message-----"));
@@ -218,7 +241,23 @@ pub fn quoted_body(s: &Session, m: &MailItem) -> mailcraft_model::Doc {
         }
         blocks.push(Block::text_paragraph(""));
         let text = m.body.text.clone().unwrap_or_else(|| m.body_text());
-        blocks.extend(mailcraft_model::Doc::from_plain_text(&text).blocks);
+        let lead = match mode {
+            OriginalText::Indent => "\t",
+            OriginalText::Prefix => prefix,
+            _ => "",
+        };
+        if lead.is_empty() {
+            blocks.extend(mailcraft_model::Doc::from_plain_text(&text).blocks);
+        } else {
+            let text = text.replace("\r\n", "\n");
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            for line in text.split('\n') {
+                let quoted = format!("{lead}{line}");
+                // An empty line gets the prefix without its trailing blank ("> " → ">").
+                let quoted = if line.is_empty() { quoted.trim_end().to_owned() } else { quoted };
+                blocks.push(Block::text_paragraph(&quoted));
+            }
+        }
     } else {
         blocks.push(Block::Rule);
         for (label, value) in lines {
@@ -232,20 +271,68 @@ pub fn quoted_body(s: &Session, m: &MailItem) -> mailcraft_model::Doc {
             });
         }
         blocks.push(Block::text_paragraph(""));
-        blocks.extend(body_doc(m).blocks);
+        let original = body_doc(m).blocks;
+        match mode {
+            OriginalText::Indent => blocks.push(Block::Container {
+                style: ParaStyle { indent_px: INDENT_PX, ..Default::default() },
+                blocks: original,
+            }),
+            OriginalText::Prefix => blocks.push(Block::Quote { blocks: original }),
+            _ => blocks.extend(original),
+        }
     }
     mailcraft_model::Doc { blocks, ..Default::default() }
 }
 
-/// Builds the compose state for a Reply / Reply All / Forward of item `id` (None when it does not exist).
+/// The name a prefaced comment starts with (Options › Mail › "Preface comments with"): the name set there
+/// (or General › User name), else the replying account's sender or display name. `None` when the option is
+/// off or no name is known.
+fn preface_name(s: &Session, id: ItemId) -> Option<String> {
+    let name = s.settings.preface_name()?;
+    if !name.is_empty() {
+        return Some(name);
+    }
+    let account =
+        item_account(s, id).and_then(|a| s.mailbox.account(a)).or_else(|| s.mailbox.default_account())?;
+    let name = if account.sender_name.trim().is_empty() {
+        account.display_name.trim()
+    } else {
+        account.sender_name.trim()
+    };
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The original message as an attached .eml item.
+fn original_attachment(m: &MailItem) -> ComposeAttachment {
+    ComposeAttachment {
+        filename: eml_name(&m.subject),
+        mime_type: "message/rfc822".into(),
+        data: item_source(m),
+    }
+}
+
+/// Builds the compose state for a Reply / Reply All / Forward of item `id` (None when it does not exist),
+/// following Options › Mail: what happens to the original text (include, omit, attach, indent, prefix),
+/// prefaced comments, proofing of the original, where the sent copy of a forward or of a reply to a message
+/// outside the Inbox is saved.
 pub fn build_response(s: &Session, id: ItemId, kind: ComposeKind, inline: bool) -> Option<ComposeState> {
     let m = s.mailbox.mail.get(&id)?;
+    let forward = kind == ComposeKind::Forward;
+    let st = &s.settings;
+    let mode = st.original_text(forward);
     let (to, cc) = response_recipients(s, m, kind);
-    let subject =
-        if kind == ComposeKind::Forward { forward_subject(&m.subject) } else { reply_subject(&m.subject) };
-    let attachments = if kind == ComposeKind::Forward { source_attachments(m) } else { Vec::new() };
-    let inline_images =
-        if m.body.format == BodyFormat::PlainText { Vec::new() } else { source_inline_images(m) };
+    let subject = if forward { forward_subject(&m.subject) } else { reply_subject(&m.subject) };
+    let attachments = match mode {
+        OriginalText::Attach => vec![original_attachment(m)],
+        _ if forward => source_attachments(m),
+        _ => Vec::new(),
+    };
+    let inline_images = if m.body.format == BodyFormat::PlainText || !mode.quotes() {
+        Vec::new()
+    } else {
+        source_inline_images(m)
+    };
+    let save_sent = sent_copy_for(s, m, kind);
     Some(ComposeState {
         kind,
         source: Some(id),
@@ -254,13 +341,44 @@ pub fn build_response(s: &Session, id: ItemId, kind: ComposeKind, inline: bool) 
         cc,
         from: account_from(s, item_account(s, id)),
         subject,
-        body: quoted_body(s, m),
+        body: quoted_body_as(s, m, mode, &st.plain_prefix()),
         format: m.body.format,
         importance: Importance::Normal,
         attachments,
         inline_images,
+        save_sent,
+        preface: if mode.quotes() { preface_name(s, id) } else { None },
+        proof_original: !st.bool("mail.compose.ignoreOriginal"),
         ..Default::default()
     })
+}
+
+/// Where the sent copy of a response goes (Options › Mail › Save messages): not saved for a forward when
+/// "Save forwarded messages" is off; a reply to a message outside the Inbox goes to that message's folder
+/// when "When replying to a message that is not in the Inbox, save the reply in the same folder" is on
+/// (and copies are saved at all). Otherwise the default (Sent Items).
+fn sent_copy_for(s: &Session, m: &MailItem, kind: ComposeKind) -> SaveSentTo {
+    let st = &s.settings;
+    match kind {
+        ComposeKind::Forward if !st.bool("mail.save.forwarded") => SaveSentTo::DoNotSave,
+        ComposeKind::Reply | ComposeKind::ReplyAll
+            if st.bool("mail.save.replyInSameFolder") && st.bool("mail.save.sentCopies") =>
+        {
+            match s.mailbox.folder(m.folder) {
+                Some(f)
+                    if f.kind == FolderKind::Mail
+                        && !matches!(
+                            f.role,
+                            Some(FolderRole::Inbox | FolderRole::Outbox | FolderRole::Drafts)
+                        ) =>
+                {
+                    SaveSentTo::Folder(f.id)
+                }
+                _ => SaveSentTo::Default,
+            }
+        }
+        _ => SaveSentTo::Default,
+    }
 }
 
 /// File name for a message attached as .eml: its subject with characters unsafe in file names replaced.
@@ -294,11 +412,7 @@ fn forward_as_attachment(s: &mut Session, p: &Value) -> CmdResult {
             if subject.is_empty() {
                 subject = forward_subject(&m.subject);
             }
-            attachments.push(ComposeAttachment {
-                filename: eml_name(&m.subject),
-                mime_type: "message/rfc822".into(),
-                data: item_source(m),
-            });
+            attachments.push(original_attachment(m));
         }
     }
     let c = ComposeState {
@@ -309,6 +423,11 @@ fn forward_as_attachment(s: &mut Session, p: &Value) -> CmdResult {
         subject,
         format: BodyFormat::Html,
         attachments,
+        save_sent: if s.settings.bool("mail.save.forwarded") {
+            SaveSentTo::Default
+        } else {
+            SaveSentTo::DoNotSave
+        },
         ..Default::default()
     };
     // Options › Mail › Signatures: the replies/forwards signature, as for a forward with the text included.
@@ -744,5 +863,145 @@ The badge reader is down. Please use the side door today.";
         let r = f.s.run("mail.reply", &Value::Null).unwrap();
         assert!(r["compose"].as_u64().is_some());
         assert!(f.s.notices.iter().any(|n| matches!(n, crate::Notice::Compose(_))));
+    }
+
+    fn set(s: &mut Session, key: &str, value: Value) {
+        s.run("options.set", &json!({"key": key, "value": value})).unwrap();
+    }
+
+    fn respond_to(f: &mut Fx, id: ItemId, kind: ComposeKind) -> ComposeState {
+        f.s.selection.focus = Some(id);
+        f.s.selection.items = vec![id];
+        let r = respond(&mut f.s, &Value::Null, kind).unwrap();
+        f.s.composes[&r["compose"].as_u64().unwrap()].clone()
+    }
+
+    const ORIGINAL: &str = "The badge reader is down. Please use the side door today.";
+
+    #[test]
+    fn reply_text_options_shape_the_body() {
+        let mut f = fx();
+        let plain = f.plain;
+        // Prefix each line (the default prefix "> ", then a custom one).
+        set(&mut f.s, "mail.reply.replyText", json!("prefix"));
+        let c = respond_to(&mut f, plain, ComposeKind::Reply);
+        let text = c.body.to_plain_text();
+        assert!(text.contains("Subject: URGENT: server room access\n"), "header kept: {text}");
+        assert!(text.ends_with(&format!("\n> {ORIGINAL}")), "{text}");
+        set(&mut f.s, "mail.reply.plainPrefix", json!("| "));
+        let c = respond_to(&mut f, plain, ComposeKind::Reply);
+        assert!(c.body.to_plain_text().ends_with(&format!("\n| {ORIGINAL}")));
+        // Include and indent.
+        set(&mut f.s, "mail.reply.replyText", json!("indent"));
+        let c = respond_to(&mut f, plain, ComposeKind::Reply);
+        assert!(c.body.to_plain_text().ends_with(&format!("\n\t{ORIGINAL}")));
+        // Do not include: an empty body; attach: the original as an .eml item.
+        set(&mut f.s, "mail.reply.replyText", json!("none"));
+        let c = respond_to(&mut f, plain, ComposeKind::Reply);
+        assert_eq!(c.body.to_plain_text().trim(), "");
+        assert!(c.attachments.is_empty());
+        set(&mut f.s, "mail.reply.replyText", json!("attach"));
+        let c = respond_to(&mut f, plain, ComposeKind::ReplyAll);
+        assert_eq!(c.body.to_plain_text().trim(), "");
+        assert_eq!(c.attachments.len(), 1);
+        assert_eq!(c.attachments[0].filename, "URGENT_ server room access.eml");
+        assert_eq!(c.attachments[0].mime_type, "message/rfc822");
+        assert!(String::from_utf8_lossy(&c.attachments[0].data).contains(ORIGINAL));
+        // Forwards follow their own option.
+        let c = respond_to(&mut f, plain, ComposeKind::Forward);
+        assert!(c.body.to_plain_text().ends_with(ORIGINAL) && c.attachments.is_empty());
+    }
+
+    #[test]
+    fn forward_text_options_in_html() {
+        let mut f = fx();
+        let html = f.html;
+        set(&mut f.s, "mail.reply.forwardText", json!("prefix"));
+        let c = respond_to(&mut f, html, ComposeKind::Forward);
+        assert!(matches!(c.body.blocks.last(), Some(Block::Quote { blocks }) if !blocks.is_empty()));
+        assert!(mailcraft_html::doc_to_html(&c.body).contains("<blockquote"));
+        set(&mut f.s, "mail.reply.forwardText", json!("indent"));
+        let c = respond_to(&mut f, html, ComposeKind::Forward);
+        assert!(matches!(
+            c.body.blocks.last(),
+            Some(Block::Container { style, .. }) if style.indent_px == INDENT_PX
+        ));
+        // The header block stays outside, so it is still recognised as the start of the original.
+        assert_eq!(c.quoted_start(), Some(2));
+        set(&mut f.s, "mail.reply.forwardText", json!("attach"));
+        let c = respond_to(&mut f, html, ComposeKind::Forward);
+        assert_eq!(c.attachments.len(), 1);
+        assert!(c.inline_images.is_empty());
+        // "Do not include" is not a forward choice.
+        assert!(f.s.run("options.set", &json!({"key": "mail.reply.forwardText", "value": "none"})).is_err());
+    }
+
+    #[test]
+    fn preface_and_proofing_options_reach_the_response() {
+        let mut f = fx();
+        let plain = f.plain;
+        let c = respond_to(&mut f, plain, ComposeKind::Reply);
+        assert_eq!((c.preface.clone(), c.proof_original), (None, false));
+        set(&mut f.s, "mail.reply.prefaceComments", json!(true));
+        // No name set anywhere: the account's sender name.
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Reply).preface.as_deref(), Some("Test User"));
+        set(&mut f.s, "general.userName", json!("T. User"));
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Reply).preface.as_deref(), Some("T. User"));
+        set(&mut f.s, "mail.reply.prefaceName", json!("TU"));
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Forward).preface.as_deref(), Some("TU"));
+        // Nothing to preface when the original is not in the body.
+        set(&mut f.s, "mail.reply.replyText", json!("attach"));
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Reply).preface, None);
+        // Proofing the original.
+        set(&mut f.s, "mail.compose.ignoreOriginal", json!(false));
+        let mut c = respond_to(&mut f, plain, ComposeKind::Forward);
+        assert!(c.proof_original);
+        c.refresh_spelling(true, &mut |t: &str| {
+            t.find("badge")
+                .map(|i| crate::compose::TextIssue {
+                    start: i,
+                    end: i + 5,
+                    kind: String::new(),
+                    suggestions: vec![],
+                })
+                .into_iter()
+                .collect()
+        });
+        assert_eq!(c.spell_issues.len(), 1, "the original is checked");
+        c.proof_original = false;
+        c.refresh_spelling(true, &mut |t: &str| {
+            t.find("badge")
+                .map(|i| crate::compose::TextIssue {
+                    start: i,
+                    end: i + 5,
+                    kind: String::new(),
+                    suggestions: vec![],
+                })
+                .into_iter()
+                .collect()
+        });
+        assert!(c.spell_issues.is_empty());
+    }
+
+    #[test]
+    fn where_sent_copies_of_responses_go() {
+        let mut f = fx();
+        let plain = f.plain;
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Forward).save_sent, SaveSentTo::Default);
+        set(&mut f.s, "mail.save.forwarded", json!(false));
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Forward).save_sent, SaveSentTo::DoNotSave);
+        let r = forward_as_attachment(&mut f.s, &Value::Null).unwrap();
+        assert_eq!(f.s.composes[&r["compose"].as_u64().unwrap()].save_sent, SaveSentTo::DoNotSave);
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Reply).save_sent, SaveSentTo::Default);
+        // A reply to a message outside the Inbox is saved next to it when asked to.
+        set(&mut f.s, "mail.save.replyInSameFolder", json!(true));
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Reply).save_sent, SaveSentTo::Default, "Inbox");
+        let inbox = f.s.mailbox.mail[&plain].folder;
+        let projects = f.s.mailbox.create_folder(inbox, "Projects").unwrap();
+        f.s.mailbox.mail.get_mut(&plain).unwrap().folder = projects;
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::ReplyAll).save_sent, SaveSentTo::Folder(projects));
+        // ...unless sent copies are not saved at all.
+        set(&mut f.s, "mail.save.sentCopies", json!(false));
+        assert_eq!(respond_to(&mut f, plain, ComposeKind::Reply).save_sent, SaveSentTo::DoNotSave);
     }
 }

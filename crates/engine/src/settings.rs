@@ -284,6 +284,10 @@ const PASTE_MODES: &[(&str, &str)] = &[
     ("merge", "Merge Formatting"),
     ("textOnly", "Keep Text Only"),
 ];
+/// Section of the Editor Options proofing settings (Mail page).
+pub const EDITOR_PROOFING: &str = "Editor Options › Proofing";
+/// Section of the Editor Options paste defaults (Mail page; Set Default Paste opens it).
+pub const EDITOR_PASTE: &str = "Editor Options › Cut, copy, and paste";
 const QAT_POSITION: &[(&str, &str)] = &[("above", "Above Ribbon"), ("below", "Below Ribbon")];
 const AUTO_ARCHIVE_ACTION: &[(&str, &str)] =
     &[("move", "Move old items to the archive folder"), ("delete", "Permanently delete old items")];
@@ -376,7 +380,7 @@ pub const DEFS: &[Def] = &[
         "mail.compose.spellBeforeSend",
         "Always check spelling before sending",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -384,7 +388,7 @@ pub const DEFS: &[Def] = &[
         "mail.compose.ignoreOriginal",
         "Ignore original message text in reply or forward",
         Bool(true),
-        E,
+        A,
     ),
     d("mail", "Compose messages", "mail.compose.showBcc", "Always show the Bcc box", Bool(false), A),
     d("mail", "Compose messages", "mail.compose.showFrom", "Always show the From box", Bool(false), A),
@@ -500,7 +504,7 @@ pub const DEFS: &[Def] = &[
         "mail.reply.prefaceComments",
         "Preface comments with my name",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -508,7 +512,7 @@ pub const DEFS: &[Def] = &[
         "mail.reply.prefaceName",
         "Name used to preface comments:",
         Text("", 128),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -516,7 +520,7 @@ pub const DEFS: &[Def] = &[
         "mail.reply.replyText",
         "When replying to a message:",
         Choice("include", REPLY_TEXT),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -524,7 +528,7 @@ pub const DEFS: &[Def] = &[
         "mail.reply.forwardText",
         "When forwarding a message:",
         Choice("include", FORWARD_TEXT),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -532,7 +536,7 @@ pub const DEFS: &[Def] = &[
         "mail.reply.plainPrefix",
         "Preface each line in a plain-text message with:",
         Text("> ", 8),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -540,19 +544,19 @@ pub const DEFS: &[Def] = &[
         "mail.save.autoSave",
         "Automatically save items that have not been sent",
         Bool(true),
-        E,
+        A,
     ),
-    d("mail", "Save messages", "mail.save.autoSaveMinutes", "Minutes between saves:", Int(3, 1, 99), E),
-    d("mail", "Save messages", "mail.save.folder", "Save to this folder:", Choice("drafts", SAVE_FOLDERS), E),
+    d("mail", "Save messages", "mail.save.autoSaveMinutes", "Minutes between saves:", Int(3, 1, 99), A),
+    d("mail", "Save messages", "mail.save.folder", "Save to this folder:", Choice("drafts", SAVE_FOLDERS), A),
     d(
         "mail",
         "Save messages",
         "mail.save.replyInSameFolder",
         "When replying to a message that is not in the Inbox, save the reply in the same folder",
         Bool(false),
-        E,
+        A,
     ),
-    d("mail", "Save messages", "mail.save.forwarded", "Save forwarded messages", Bool(true), E),
+    d("mail", "Save messages", "mail.save.forwarded", "Save forwarded messages", Bool(true), A),
     d(
         "mail",
         "Save messages",
@@ -584,9 +588,9 @@ pub const DEFS: &[Def] = &[
         "mail.send.expire",
         "Mark messages as expired after a number of days",
         Bool(false),
-        E,
+        A,
     ),
-    d("mail", "Send messages", "mail.send.expireDays", "Days before messages expire:", Int(0, 0, 999), E),
+    d("mail", "Send messages", "mail.send.expireDays", "Days before messages expire:", Int(0, 0, 999), A),
     d(
         "mail",
         "Send messages",
@@ -603,7 +607,7 @@ pub const DEFS: &[Def] = &[
         Bool(false),
         E,
     ),
-    d("mail", "Send messages", "mail.send.autoNameCheck", "Automatic name checking", Bool(true), E),
+    d("mail", "Send messages", "mail.send.autoNameCheck", "Automatic name checking", Bool(true), A),
     d(
         "mail",
         "Send messages",
@@ -675,7 +679,7 @@ pub const DEFS: &[Def] = &[
         "mail.tracking.updateSentItem",
         "Automatically update original sent item with receipt information",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -716,7 +720,7 @@ pub const DEFS: &[Def] = &[
         "mail.format.uuencode",
         "Encode attachments in UUENCODE format when sending plain-text messages",
         Bool(false),
-        S,
+        A,
     ),
     d(
         "mail",
@@ -724,7 +728,7 @@ pub const DEFS: &[Def] = &[
         "mail.format.wrapAt",
         "Automatically wrap text at character:",
         Int(76, 30, 132),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -740,7 +744,7 @@ pub const DEFS: &[Def] = &[
         "mail.format.richTextToInternet",
         "When sending messages in Rich Text format to Internet recipients:",
         Choice("html", RTF_TO_INTERNET),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -783,20 +787,20 @@ pub const DEFS: &[Def] = &[
         Bool(true),
         E,
     ),
-    // Mail › Editor Options... (proofing and cut, copy and paste)
-    d("mail", "Editor Options", "mail.editor.spellAsYouType", "Check spelling as you type", Bool(true), E),
+    // Mail › Editor Options... (Proofing; Advanced › Cut, copy, and paste)
+    d("mail", EDITOR_PROOFING, "mail.editor.spellAsYouType", "Check spelling as you type", Bool(true), E),
     d(
         "mail",
-        "Editor Options",
+        EDITOR_PROOFING,
         "mail.editor.grammarAsYouType",
         "Mark grammar errors as you type",
         Bool(true),
         E,
     ),
-    d("mail", "Editor Options", "mail.editor.ignoreUppercase", "Ignore words in UPPERCASE", Bool(true), E),
+    d("mail", EDITOR_PROOFING, "mail.editor.ignoreUppercase", "Ignore words in UPPERCASE", Bool(true), E),
     d(
         "mail",
-        "Editor Options",
+        EDITOR_PROOFING,
         "mail.editor.ignoreNumbers",
         "Ignore words that contain numbers",
         Bool(true),
@@ -804,16 +808,16 @@ pub const DEFS: &[Def] = &[
     ),
     d(
         "mail",
-        "Editor Options",
+        EDITOR_PROOFING,
         "mail.editor.ignoreInternet",
         "Ignore Internet and file addresses",
         Bool(true),
         E,
     ),
-    d("mail", "Editor Options", "mail.editor.flagRepeated", "Flag repeated words", Bool(true), E),
+    d("mail", EDITOR_PROOFING, "mail.editor.flagRepeated", "Flag repeated words", Bool(true), E),
     d(
         "mail",
-        "Editor Options",
+        EDITOR_PROOFING,
         "mail.editor.mainDictionaryOnly",
         "Suggest from main dictionary only",
         Bool(false),
@@ -821,7 +825,7 @@ pub const DEFS: &[Def] = &[
     ),
     d(
         "mail",
-        "Editor Options",
+        EDITOR_PASTE,
         "mail.editor.pasteWithinMessage",
         "Pasting within the same message:",
         Choice("keepSource", PASTE_MODES),
@@ -829,7 +833,7 @@ pub const DEFS: &[Def] = &[
     ),
     d(
         "mail",
-        "Editor Options",
+        EDITOR_PASTE,
         "mail.editor.pasteBetweenMessages",
         "Pasting between messages:",
         Choice("keepSource", PASTE_MODES),
@@ -837,7 +841,7 @@ pub const DEFS: &[Def] = &[
     ),
     d(
         "mail",
-        "Editor Options",
+        EDITOR_PASTE,
         "mail.editor.pasteFromOtherPrograms",
         "Pasting from other programs:",
         Choice("keepSource", PASTE_MODES),
@@ -2158,6 +2162,122 @@ impl Settings {
             _ => mailcraft_model::Sensitivity::Normal,
         }
     }
+
+    /// Mail › Replies and forwards › "When replying to a message" (`forward = false`) / "When forwarding a
+    /// message" (`forward = true`).
+    pub fn original_text(&self, forward: bool) -> OriginalText {
+        let key = if forward { "mail.reply.forwardText" } else { "mail.reply.replyText" };
+        match self.text(key).as_str() {
+            "none" if !forward => OriginalText::Omit,
+            "attach" => OriginalText::Attach,
+            "indent" => OriginalText::Indent,
+            "prefix" => OriginalText::Prefix,
+            _ => OriginalText::Include,
+        }
+    }
+
+    /// Mail › Replies and forwards › "Preface each line in a plain-text message with" (default "> ").
+    pub fn plain_prefix(&self) -> String {
+        self.text("mail.reply.plainPrefix")
+    }
+
+    /// Mail › Replies and forwards › "Preface comments with": `None` when off; otherwise the name typed there,
+    /// else General › User name, else `Some("")` (the caller then uses the account's name).
+    pub fn preface_name(&self) -> Option<String> {
+        if !self.bool("mail.reply.prefaceComments") {
+            return None;
+        }
+        let name = self.text("mail.reply.prefaceName");
+        let name = if name.trim().is_empty() { self.text("general.userName") } else { name };
+        Some(name.trim().to_owned())
+    }
+
+    /// Mail › Save messages › "Automatically save items that have not been sent after this many minutes":
+    /// the period in minutes, `None` when off.
+    pub fn auto_save_minutes(&self) -> Option<u32> {
+        self.bool("mail.save.autoSave")
+            .then(|| u32::try_from(self.int("mail.save.autoSaveMinutes")).unwrap_or(3).max(1))
+    }
+
+    /// Mail › Save messages › "Save to this folder": the folder unsent items are saved to.
+    pub fn draft_folder_role(&self) -> mailcraft_model::FolderRole {
+        match self.text("mail.save.folder").as_str() {
+            "inbox" => mailcraft_model::FolderRole::Inbox,
+            "sentItems" => mailcraft_model::FolderRole::SentItems,
+            "outbox" => mailcraft_model::FolderRole::Outbox,
+            _ => mailcraft_model::FolderRole::Drafts,
+        }
+    }
+
+    /// Mail › Send messages › "Mark messages as expired after this many days": the days, `None` when off.
+    pub fn expire_days(&self) -> Option<u32> {
+        self.bool("mail.send.expire").then(|| u32::try_from(self.int("mail.send.expireDays")).unwrap_or(0))
+    }
+
+    /// Mail › Message format › "Automatically wrap text at character" (plain-text messages).
+    pub fn wrap_at(&self) -> usize {
+        usize::try_from(self.int("mail.format.wrapAt")).unwrap_or(76).max(1)
+    }
+
+    /// Mail › Conversation Clean Up options.
+    pub fn clean_up(&self) -> CleanUpOptions {
+        CleanUpOptions {
+            folder: self.text("mail.cleanup.folder").trim().to_owned(),
+            recreate_hierarchy: self.bool("mail.cleanup.recreateHierarchy"),
+            keep_unread: self.bool("mail.cleanup.keepUnread"),
+            keep_categorized: self.bool("mail.cleanup.keepCategorized"),
+            keep_flagged: self.bool("mail.cleanup.keepFlagged"),
+            keep_signed: self.bool("mail.cleanup.keepSigned"),
+            keep_original: self.bool("mail.cleanup.keepOriginal"),
+        }
+    }
+}
+
+/// What a reply or forward does with the original message (Options › Mail › Replies and forwards).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginalText {
+    /// Include original message text (below a header block).
+    Include,
+    /// Do not include original message (replies only).
+    Omit,
+    /// Attach original message (as an .eml item).
+    Attach,
+    /// Include and indent original message text.
+    Indent,
+    /// Prefix each line of the original message (the plain-text prefix; a quote bar in HTML).
+    Prefix,
+}
+
+impl OriginalText {
+    /// Whether the original's text goes into the body.
+    pub fn quotes(self) -> bool {
+        matches!(self, OriginalText::Include | OriginalText::Indent | OriginalText::Prefix)
+    }
+}
+
+/// Conversation Clean Up options (Options › Mail): where cleaned-up items go and which are kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CleanUpOptions {
+    /// Folder path for cleaned-up items; empty = the account's Deleted Items.
+    pub folder: String,
+    pub recreate_hierarchy: bool,
+    pub keep_unread: bool,
+    pub keep_categorized: bool,
+    pub keep_flagged: bool,
+    pub keep_signed: bool,
+    /// When a reply modifies a message, don't move the original.
+    pub keep_original: bool,
+}
+
+impl CleanUpOptions {
+    /// Whether these options keep `m` in place whatever its conversation holds (unread, categorized,
+    /// flagged or digitally signed, as ticked). `signed` says whether `m` carries a signature part.
+    pub fn keeps(&self, m: &mailcraft_model::MailItem, signed: bool) -> bool {
+        (self.keep_unread && !m.read)
+            || (self.keep_categorized && !m.categories.is_empty())
+            || (self.keep_flagged && m.flag != mailcraft_model::FlagState::None)
+            || (self.keep_signed && signed)
+    }
 }
 
 fn short(key: &str) -> String {
@@ -2395,5 +2515,63 @@ mod tests {
         assert!(!dir.path().join("settings.json.tmp").exists());
         std::fs::write(dir.path().join(FILE_NAME), b"{not json").unwrap();
         assert!(SettingsFile::read(dir.path()).is_err());
+    }
+
+    #[test]
+    fn mail_option_getters() {
+        let mut s = Settings::default();
+        assert_eq!(
+            (s.original_text(false), s.original_text(true)),
+            (OriginalText::Include, OriginalText::Include)
+        );
+        s.set("mail.reply.replyText", &json!("none")).unwrap();
+        s.set("mail.reply.forwardText", &json!("prefix")).unwrap();
+        assert_eq!(
+            (s.original_text(false), s.original_text(true)),
+            (OriginalText::Omit, OriginalText::Prefix)
+        );
+        assert!(
+            !OriginalText::Omit.quotes() && !OriginalText::Attach.quotes() && OriginalText::Indent.quotes()
+        );
+        assert_eq!(s.plain_prefix(), "> ");
+        assert_eq!(s.preface_name(), None);
+        s.set("mail.reply.prefaceComments", &json!(true)).unwrap();
+        assert_eq!(s.preface_name().as_deref(), Some(""));
+        s.set("mail.reply.prefaceName", &json!("  Kim ")).unwrap();
+        assert_eq!(s.preface_name().as_deref(), Some("Kim"));
+        assert_eq!(s.auto_save_minutes(), Some(3));
+        s.set("mail.save.autoSave", &json!(false)).unwrap();
+        assert_eq!(s.auto_save_minutes(), None);
+        assert_eq!(s.draft_folder_role(), mailcraft_model::FolderRole::Drafts);
+        s.set("mail.save.folder", &json!("sentItems")).unwrap();
+        assert_eq!(s.draft_folder_role(), mailcraft_model::FolderRole::SentItems);
+        assert_eq!(s.expire_days(), None);
+        s.set("mail.send.expire", &json!(true)).unwrap();
+        s.set("mail.send.expireDays", &json!(7)).unwrap();
+        assert_eq!(s.expire_days(), Some(7));
+        assert_eq!(s.wrap_at(), 76);
+        assert!(s.set("mail.format.wrapAt", &json!(5)).is_err(), "below the range");
+    }
+
+    #[test]
+    fn clean_up_options_keep_what_is_ticked() {
+        let mut s = Settings::default();
+        let o = s.clean_up();
+        assert!(
+            o.folder.is_empty() && !o.keep_unread && o.keep_categorized && o.keep_flagged && o.keep_signed
+        );
+        let mut m = mailcraft_model::MailItem { read: true, ..Default::default() };
+        assert!(!o.keeps(&m, false));
+        assert!(o.keeps(&m, true), "signed");
+        m.categories = vec!["Red".into()];
+        assert!(o.keeps(&m, false));
+        m.categories.clear();
+        m.read = false;
+        assert!(!o.keeps(&m, false));
+        s.set("mail.cleanup.keepUnread", &json!(true)).unwrap();
+        s.set("mail.cleanup.folder", &json!("Archive/Old")).unwrap();
+        let o = s.clean_up();
+        assert!(o.keeps(&m, false));
+        assert_eq!(o.folder, "Archive/Old");
     }
 }

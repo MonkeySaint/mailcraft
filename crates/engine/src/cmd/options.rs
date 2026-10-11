@@ -16,10 +16,13 @@ pub use settings::{Def, Effect, Kind, Settings};
 /// Options pages in window order (`plan/outlook/options.md`): (id, title).
 pub const PAGES: [(&str, &str); 14] = settings::PAGES;
 
-/// Pages opened from elsewhere that land on a section of a page: (alias, page, section).
-const ALIASES: [(&str, &str, &str); 6] = [
+/// Pages opened from elsewhere that land on a section of a page: (alias, page, section). Set Default Paste
+/// (Message › Paste) opens `editorAdvanced`: the paste defaults.
+const ALIASES: [(&str, &str, &str); 8] = [
     ("signatures", "mail", "signatures"),
-    ("editorAdvanced", "mail", "Editor Options"),
+    ("editorAdvanced", "mail", settings::EDITOR_PASTE),
+    ("setDefaultPaste", "mail", settings::EDITOR_PASTE),
+    ("editorProofing", "mail", settings::EDITOR_PROOFING),
     ("readingPane", "mail", "readingPane"),
     ("sendReceive", "advanced", "sendReceive"),
     ("workHours", "calendar", "Work time"),
@@ -64,7 +67,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "options.open",
             "Options",
-            r#"{"page"?: "general"|"mail"|…|"signatures"|"editorAdvanced"|"language"}"#,
+            r#"{"page"?: "general"|"mail"|…|"signatures"|"editorAdvanced"|"setDefaultPaste"|"editorProofing"|"language"}"#,
             open,
         ),
         spec("options.set", "Set Option", r#"{"key": string, "value": any}"#, set),
@@ -337,6 +340,32 @@ mod tests {
     }
 
     #[test]
+    fn set_default_paste_opens_the_paste_defaults() {
+        let (mut s, _, _) = session();
+        for alias in ["editorAdvanced", "setDefaultPaste"] {
+            let r = s.run("options.open", &json!({"page": alias})).unwrap();
+            assert_eq!(r["params"]["page"], "mail");
+            assert_eq!(r["params"]["section"], settings::EDITOR_PASTE);
+        }
+        // The section holds the three paste defaults.
+        let paste: Vec<&str> = settings::page_defs("mail")
+            .into_iter()
+            .filter(|(section, _)| *section == settings::EDITOR_PASTE)
+            .map(|(_, d)| d.key)
+            .collect();
+        assert_eq!(
+            paste,
+            [
+                "mail.editor.pasteWithinMessage",
+                "mail.editor.pasteBetweenMessages",
+                "mail.editor.pasteFromOtherPrograms"
+            ]
+        );
+        let r = s.run("options.open", &json!({"page": "editorProofing"})).unwrap();
+        assert_eq!(r["params"]["section"], settings::EDITOR_PROOFING);
+    }
+
+    #[test]
     fn set_and_get() {
         let (mut s, _, _) = session();
         s.run("options.set", &json!({"key": "view.darkMode", "value": true})).unwrap();
@@ -380,7 +409,7 @@ mod tests {
         let page = s.run("options.get", &json!({"page": "people"})).unwrap();
         assert!(page["options"].as_array().unwrap().iter().any(|o| o["key"] == "people.fileAs"));
         let all = s.run("options.get", &json!({"meta": true})).unwrap();
-        assert!(all["applied"].as_u64().unwrap() >= 40);
+        assert!(all["applied"].as_u64().unwrap() >= 60, "{}", all["applied"]);
     }
 
     #[test]

@@ -343,6 +343,19 @@ pub struct ComposeState {
     /// counter after it.
     #[serde(skip)]
     pub edit_run: Option<(EditRun, DocPos, u64)>,
+
+    // --- Options › Mail (replies and forwards, proofing, auto-save) ---
+    /// "Preface comments with": typing inside the quoted original first inserts "[name] " (see
+    /// [`ComposeState::type_text`]); `None` = off.
+    pub preface: Option<String>,
+    /// Proofing checks the quoted original too ("Ignore original message text in reply or forward" off).
+    pub proof_original: bool,
+    /// Where the last prefaced comment's typing left the caret (typing on from there adds no new preface).
+    #[serde(skip)]
+    pub preface_at: Option<DocPos>,
+    /// Unix seconds since when the compose has had unsaved changes, as seen by the auto-save check.
+    #[serde(skip)]
+    pub dirty_since: Option<i64>,
 }
 
 /// Edits that share one undo step while they follow each other at the caret (typing a word, holding
@@ -402,6 +415,8 @@ pub const MAX_COMPOSE_ATTACHMENTS: usize = 500;
 pub const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
 /// Most spelling issues kept per check.
 pub const MAX_SPELL_ISSUES: usize = 5_000;
+/// Longest name used to preface comments (chars).
+pub const MAX_PREFACE_CHARS: usize = 128;
 
 impl ComposeState {
     /// Window title: "Untitled - Message (HTML)" / "<subject> - Message (Plain Text)".
@@ -625,6 +640,55 @@ impl ComposeState {
         self.extra_ranges.clear();
         self.dirty = true;
         self.mark_edited();
+    }
+
+    /// Whether the caret is inside the quoted original of a reply or forward (below its header line).
+    pub fn caret_in_original(&self) -> bool {
+        self.quoted_start().is_some_and(|q| self.selection.focus.path.first().is_some_and(|i| *i > q))
+    }
+
+    /// Typing (the editor's `compose.insertText`): like [`ComposeState::insert_text`], and with "Preface
+    /// comments with" on ([`ComposeState::preface`]) a comment typed inside the quoted original starts with
+    /// "[name] " (bold italic outside plain text). Typing on where the last comment ended (or after a
+    /// Backspace there, see [`ComposeState::follow_preface`]) continues that comment without a new preface.
+    pub fn type_text(&mut self, text: &str) {
+        let name: Option<String> = self
+            .preface
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(|n| n.chars().take(MAX_PREFACE_CHARS).collect());
+        let Some(name) = name.filter(|_| self.caret_in_original()) else {
+            self.insert_text(text);
+            return;
+        };
+        self.ensure_body();
+        self.delete_selection();
+        let continuing = self.preface_at.as_ref() == Some(&self.selection.focus);
+        let starts = !continuing && text.chars().any(|c| !c.is_whitespace());
+        if starts {
+            let base = self.style_at_caret();
+            let rich = self.format != BodyFormat::PlainText;
+            if rich {
+                self.pending_style = Some(TextStyle { bold: Some(true), italic: Some(true), ..base.clone() });
+            }
+            self.insert_text(&format!("[{name}] "));
+            if rich {
+                self.pending_style = Some(base);
+            }
+        }
+        self.insert_text(text);
+        if continuing || starts {
+            self.preface_at = Some(self.selection.focus.clone());
+        }
+    }
+
+    /// Keeps a prefaced comment going after an edit that moved the caret from `before` (Backspace): when the
+    /// comment ended at `before`, it now ends at the caret.
+    pub fn follow_preface(&mut self, before: &DocPos) {
+        if self.preface_at.as_ref() == Some(before) {
+            self.preface_at = Some(self.selection.focus.clone());
+        }
     }
 
     /// Deletes the selected text; false when the selection is collapsed.
@@ -2177,13 +2241,13 @@ impl ComposeState {
 
     /// Re-checks the body when it changed since the last check (or with `force`): `check` gets the text of
     /// one paragraph (one char per position; a line break is '\n', a picture U+FFFC) and returns issues as
-    /// char ranges. Linked and monospace (code) text, the quoted original of a reply/forward, ignored words
-    /// and ignored occurrences are skipped. Returns whether it re-checked.
+    /// char ranges. Linked and monospace (code) text, the quoted original of a reply/forward (unless
+    /// `proof_original`), ignored words and ignored occurrences are skipped. Returns whether it re-checked.
     pub fn refresh_spelling(&mut self, force: bool, check: &mut dyn FnMut(&str) -> Vec<TextIssue>) -> bool {
         if !force && !self.spelling_stale() {
             return false;
         }
-        let stop = self.quoted_start().map(|i| vec![i]);
+        let stop = if self.proof_original { None } else { self.quoted_start().map(|i| vec![i]) };
         let mut out: Vec<SpellIssue> = Vec::new();
         'leaves: for path in leaves(&self.body.blocks) {
             if stop.as_ref().is_some_and(|s| path >= *s) {

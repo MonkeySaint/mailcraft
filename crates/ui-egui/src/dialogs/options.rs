@@ -106,6 +106,14 @@ const RADIO_KEYS: [&str; 7] = [
     "accessibility.warnings",
 ];
 
+/// Settings greyed out until the check box they belong to is ticked: (setting, check box).
+const DEPENDS: [(&str, &str); 4] = [
+    ("mail.reply.prefaceName", "mail.reply.prefaceComments"),
+    ("mail.save.autoSaveMinutes", "mail.save.autoSave"),
+    ("mail.send.expireDays", "mail.send.expire"),
+    ("mail.tracking.moveReceiptsTo", "mail.tracking.moveReceipts"),
+];
+
 /// Whole-number settings holding a UTC offset in minutes (shown as a time zone list).
 const TZ_KEYS: [&str; 3] =
     ["calendar.timeZone", "calendar.secondTimeZoneOffset", "calendar.thirdTimeZoneOffset"];
@@ -175,6 +183,8 @@ fn sections(page: &str) -> Vec<Section> {
 #[derive(Clone, Default)]
 struct OptState {
     page: usize,
+    /// Section to scroll to when the window opens (`options.open` with an alias such as `editorAdvanced`).
+    scroll_to: Option<String>,
     /// Edited values (key → value); untouched keys show their current value.
     edits: Map<String, Value>,
     note: String,
@@ -189,11 +199,32 @@ fn current(app: &App, st: &OptState, d: &Def) -> Value {
     app.s.option(d.key).unwrap_or_else(|| d.default_value())
 }
 
+/// Current (edited or stored) value of a setting by key.
+fn current_key(app: &App, st: &OptState, key: &str) -> Value {
+    settings::def(key).map_or(Value::Null, |d| current(app, st, d))
+}
+
+/// Whether a setting can be edited now: the ones in [`DEPENDS`] follow their check box, the plain-text
+/// prefix is used only when replies or forwards prefix each line.
+fn enabled(app: &App, st: &OptState, key: &str) -> bool {
+    if let Some((_, parent)) = DEPENDS.iter().find(|(k, _)| *k == key) {
+        return current_key(app, st, parent).as_bool().unwrap_or(false);
+    }
+    if key == "mail.reply.plainPrefix" {
+        return ["mail.reply.replyText", "mail.reply.forwardText"]
+            .iter()
+            .any(|k| current_key(app, st, k).as_str() == Some("prefix"));
+    }
+    true
+}
+
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let want = d.str("page");
+    let section = d.str("section");
     let init = |_: &App| OptState {
         page: settings::PAGES.iter().position(|(id, _)| *id == want).unwrap_or(0),
+        scroll_to: (!section.is_empty()).then(|| section.clone()),
         ..Default::default()
     };
     with_state(ctx, app, uid, init, |st, app| {
@@ -285,9 +316,15 @@ fn apply(ctx: &Context, app: &mut App, st: &OptState) -> Vec<String> {
 fn page_ui(ui: &mut egui::Ui, app: &mut App, uid: u64, st: &mut OptState, pid: &str) -> Option<Out> {
     let mut out = None;
     for sec in sections(pid) {
+        if st.scroll_to.as_deref() == Some(sec.heading) {
+            // Opened at this section (e.g. Set Default Paste): bring its heading to the top once.
+            ui.scroll_to_cursor(Some(egui::Align::TOP));
+            st.scroll_to = None;
+        }
         common::heading(ui, app, sec.heading);
         for d in &sec.defs {
-            setting_ui(ui, app, uid, st, d);
+            let on = enabled(app, st, d.key);
+            ui.add_enabled_ui(on, |ui| setting_ui(ui, app, uid, st, d));
         }
         for (_, _, text) in NOTES.iter().filter(|(p, s, _)| *p == pid && *s == sec.heading) {
             muted(ui, app, text);
@@ -473,6 +510,40 @@ mod tests {
         h.get_by_label("Cancel").click();
         h.run_steps(2);
         assert_eq!(h.state().s.settings.text("search.scope"), "currentFolder");
+    }
+
+    #[test]
+    fn set_default_paste_scrolls_to_the_paste_defaults() {
+        // The paste defaults sit at the end of the long Mail page: below the window unless it scrolls there.
+        let y = |page: &str| {
+            let mut app = App::new(sample_session());
+            app.run("options.open", json!({"page": page})).unwrap();
+            let mut h = harness(app);
+            h.run_steps(4);
+            h.query_by_label("Pasting from other programs:").map(|n| n.rect().top())
+        };
+        let (scrolled, plain) = (y("editorAdvanced"), y("mail"));
+        let scrolled = scrolled.unwrap_or(f32::MAX);
+        assert!(scrolled < 900.0, "{scrolled}");
+        // Without a section the page opens at its top: the row is far down (or not laid out at all).
+        assert!(plain.is_none_or(|p| p > scrolled + 100.0), "{plain:?} vs {scrolled}");
+    }
+
+    #[test]
+    fn dependent_settings_follow_their_check_box() {
+        let app = App::new(sample_session());
+        let st = OptState::default();
+        assert!(!enabled(&app, &st, "mail.reply.prefaceName"));
+        assert!(!enabled(&app, &st, "mail.reply.plainPrefix"), "only for Prefix each line");
+        assert!(enabled(&app, &st, "mail.save.autoSaveMinutes"));
+        let mut st = OptState::default();
+        st.edits.insert("mail.reply.prefaceComments".into(), json!(true));
+        st.edits.insert("mail.reply.forwardText".into(), json!("prefix"));
+        st.edits.insert("mail.save.autoSave".into(), json!(false));
+        assert!(enabled(&app, &st, "mail.reply.prefaceName"));
+        assert!(enabled(&app, &st, "mail.reply.plainPrefix"));
+        assert!(!enabled(&app, &st, "mail.save.autoSaveMinutes"));
+        assert!(enabled(&app, &st, "mail.compose.showBcc"));
     }
 
     #[test]
