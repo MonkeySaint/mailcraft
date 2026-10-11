@@ -1,12 +1,19 @@
-# Continuous integration on GitHub Actions.
-# Runs on the default `docker` runner label with a pinned Rust image.
+# Continuous integration on GitHub Actions: `cargo xtask ci` (fmt, clippy, tests, layers, assets, licences,
+# parity, wasm build) on a GitHub-hosted Ubuntu runner, inside a pinned Rust image.
 name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,11 +21,13 @@ env:
 
 jobs:
   ci:
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: rust:1.99-bookworm
     steps:
       - uses: actions/checkout@v4
+      - name: Trust the checkout (container user differs from the runner's)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: System packages (egui/wgpu headless tests)
         run: |
           apt-get update
@@ -27,13 +36,14 @@ jobs:
         run: |
           rustup component add rustfmt clippy
           rustup target add wasm32-unknown-unknown
-      - name: Cache cargo
+      - name: Cache cargo (CARGO_HOME is /usr/local/cargo in the rust image)
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
             target
-          key: cargo-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: cargo xtask ci
         run: cargo xtask ci

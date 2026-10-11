@@ -13,7 +13,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::doc::{Doc, DocKind, Level, Person};
 use crate::eval::{Context, date_of, text_in_segment};
 use crate::fold::fold;
-use crate::query::{CategoryMatch, Query, Term, Text, field};
+use crate::query::{CategoryMatch, Expiry, Query, Term, Text, field};
 use crate::token::{for_each_token, words};
 
 /// Most body tokens kept per item: every token of the longest body a [`Doc`] holds
@@ -135,6 +135,7 @@ struct Slot {
     flagged: bool,
     has_attachments: bool,
     importance: Level,
+    expires: Option<i64>,
     /// (field bit, folded address) for `from:me` and friends.
     people: Box<[(u8, Box<str>)]>,
     /// Folded word tokens of each category name.
@@ -333,6 +334,7 @@ impl Index {
             flagged: doc.flagged,
             has_attachments: doc.has_attachments,
             importance: doc.importance,
+            expires: doc.expires,
             people: people.into_boxed_slice(),
             categories: categories.into_boxed_slice(),
             tokens: tokens.into_boxed_slice(),
@@ -506,7 +508,11 @@ impl Index {
             }
             Term::Size(spec) => self.scan(|s| spec.contains(s.size)),
             Term::Kind(k) => self.scan(|s| s.kind == *k),
-            Term::Expires(_) | Term::Invalid(..) => self.empty_bits(),
+            Term::Expires(v) => match Expiry::parse(v) {
+                Some(e) => self.scan(|s| ctx.expiry_matches(&e, s.expires)),
+                None => self.empty_bits(),
+            },
+            Term::Invalid(..) => self.empty_bits(),
         }
     }
 
@@ -697,6 +703,29 @@ mod tests {
         let mut v = ix.matching(&parse(q), &ctx(), &Filter::default());
         v.sort_unstable();
         v
+    }
+
+    #[test]
+    fn expiring_soon_agrees_with_direct_evaluation() {
+        let mut ix = index();
+        let mut docs = docs();
+        for (d, days) in docs.iter_mut().zip([Some(2), Some(-1), None, Some(20)]) {
+            d.expires = days.map(|n| NOW + n * 86_400);
+            ix.upsert(d);
+        }
+        for (q, want) in [
+            ("expires:soon", vec![1]),
+            ("expires:expired", vec![2]),
+            ("expires:yes", vec![1, 2, 4]),
+            ("expires:no", vec![3]),
+            ("budget expires:soon", vec![1]),
+            ("expires:whenever", vec![]),
+        ] {
+            assert_eq!(ids(&ix, q), want, "{q}");
+            let direct: Vec<u64> =
+                docs.iter().filter(|d| crate::eval::matches(&parse(q), d, &ctx())).map(|d| d.id).collect();
+            assert_eq!(direct, want, "{q} (direct)");
+        }
     }
 
     #[test]

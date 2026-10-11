@@ -1,6 +1,6 @@
-# FreeBSD build on demand: runs on a self-hosted runner with the `freebsd` label (a FreeBSD machine or VM
-# running github-runner in host mode; see docs/releasing.md for what it needs installed). Produces the same
-# files as the release job: mailcraft-VERSION-freebsd-ARCH.tar.gz and mailcraft-VERSION.pkg.
+# FreeBSD build on demand, in a FreeBSD VM on a GitHub-hosted Ubuntu runner (vmactions/freebsd-vm). Runs the
+# engine and CLI tests, then produces the same files as the release job:
+# mailcraft-VERSION-freebsd-ARCH.tar.gz and mailcraft-VERSION.pkg.
 name: freebsd
 
 on:
@@ -12,24 +12,35 @@ on:
         options: [release, debug]
         default: release
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "4"
 
 jobs:
   freebsd:
-    runs-on: freebsd
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain
-        run: |
-          uname -a
-          rustc --version
-          cargo --version
-      - name: Tests (engine and CLI)
-        run: cargo test --locked -p mailcraft-engine -p mailcraft-cli
-      - name: Build and package
-        run: bash packaging/freebsd/package.sh --build --profile "${{ inputs.profile }}" --out dist
+      - name: Tests, build and package (FreeBSD VM)
+        uses: vmactions/freebsd-vm@v1
+        env:
+          MC_PROFILE: ${{ inputs.profile }}
+        with:
+          release: "14.3"
+          usesh: true
+          envs: "CARGO_TERM_COLOR CARGO_BUILD_JOBS MC_PROFILE"
+          prepare: |
+            pkg install -y bash git rust
+          run: |
+            git config --global --add safe.directory "$PWD"
+            uname -a
+            rustc --version
+            cargo --version
+            cargo test --locked -p mailcraft-engine -p mailcraft-cli
+            bash packaging/freebsd/package.sh --build --profile "$MC_PROFILE" --out dist
       - uses: actions/upload-artifact@v4
         with:
           name: freebsd-${{ inputs.profile }}

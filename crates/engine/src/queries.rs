@@ -207,8 +207,8 @@ pub fn folder_rows(s: &Session) -> Vec<FolderRow> {
         } else {
             account.address.clone()
         };
-        let roots: Vec<FolderId> = mb
-            .children(account.id, None)
+        // Folder-pane order: Show All Folders A to Z sorts default folders in with the rest.
+        let roots: Vec<FolderId> = crate::cmd::folder::pane_children(s, account.id, None)
             .into_iter()
             .filter(|id| mb.folder(*id).is_some_and(|f| kind_visible(f.kind, module)))
             .collect();
@@ -231,8 +231,7 @@ pub fn folder_rows(s: &Session) -> Vec<FolderRow> {
             if !visited.insert(id) {
                 continue;
             }
-            let kids: Vec<FolderId> = mb
-                .children(account.id, Some(id))
+            let kids: Vec<FolderId> = crate::cmd::folder::pane_children(s, account.id, Some(id))
                 .into_iter()
                 .filter(|k| mb.folder(*k).is_some_and(|f| kind_visible(f.kind, module)))
                 .collect();
@@ -1190,6 +1189,27 @@ pub fn info_lines(s: &Session, m: &MailItem) -> Vec<String> {
     info
 }
 
+/// Most inline pictures handed over per message.
+const MAX_INLINE_PICTURES: usize = 32;
+
+/// The inline pictures of a message as (`cid:<Content-ID>`, bytes): image parts with a Content-ID, which an
+/// HTML body shows with `<img src="cid:…">`. Empty when the message has none or its source is unavailable;
+/// the parse only runs for messages whose attachment list names a Content-ID.
+pub fn inline_pictures(s: &Session, id: ItemId) -> Vec<(String, Vec<u8>)> {
+    let Some(m) = s.mailbox.mail.get(&id) else { return Vec::new() };
+    if !m.attachments.iter().any(|a| a.content_id.is_some()) {
+        return Vec::new();
+    }
+    let raw = crate::cmd::file::raw_source(s, m);
+    let Ok(msg) = mailcraft_mime::parse(&raw) else { return Vec::new() };
+    msg.attachments()
+        .into_iter()
+        .filter(|a| a.mime_type.get(..6).is_some_and(|t| t.eq_ignore_ascii_case("image/")))
+        .filter_map(|a| Some((format!("cid:{}", a.content_id?), a.data)))
+        .take(MAX_INLINE_PICTURES)
+        .collect()
+}
+
 pub fn reading_header(s: &Session, id: ItemId) -> Option<ReadingHeader> {
     let m = s.mailbox.mail.get(&id)?;
     let from_box = m.from.as_ref().or(m.sender.as_ref());
@@ -1463,6 +1483,86 @@ mod tests {
         let mut vs = view_settings(s, folder);
         f(&mut vs);
         s.mailbox.views.insert(folder, vs);
+    }
+
+    #[test]
+    fn inline_pictures_come_from_the_message_source() {
+        let mut s = sample_session();
+        let png = b"\x89PNG\r\n\x1a\nnot really".to_vec();
+        let b = mailcraft_mime::MessageBuilder {
+            from: Some(mailcraft_mime::Mailbox::new(None, "ann@example.com")),
+            subject: "Logo".into(),
+            text: Some("Logo".into()),
+            html: Some("<p><img src=\"cid:logo@example.com\"></p>".into()),
+            attachments: vec![
+                mailcraft_mime::AttachmentSpec {
+                    filename: "logo.png".into(),
+                    mime_type: "image/png".into(),
+                    data: png.clone(),
+                    content_id: Some("logo@example.com".into()),
+                },
+                mailcraft_mime::AttachmentSpec {
+                    filename: "notes.txt".into(),
+                    mime_type: "text/plain".into(),
+                    data: b"plain".to_vec(),
+                    content_id: Some("notes@example.com".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let raw = b.build();
+        let msg = mailcraft_mime::parse(&raw).unwrap();
+        let mut item = MailItem::from_message(&msg, &raw, s.now());
+        item.raw = Some(raw);
+        item.folder = s.selection.folder;
+        let id = s.mailbox.add_mail(item);
+        assert_eq!(inline_pictures(&s, id), vec![("cid:logo@example.com".to_owned(), png)]);
+        // Messages without Content-IDs, and unknown ids, have none.
+        let plain = *s.mailbox.mail.keys().find(|k| **k != id).unwrap();
+        assert!(inline_pictures(&s, plain).is_empty());
+        assert!(inline_pictures(&s, ItemId(u64::MAX)).is_empty());
+    }
+
+    /// Top-level folder names of the first account's tree in the folder pane.
+    fn first_account_roots(s: &Session) -> Vec<String> {
+        folder_rows(s)
+            .into_iter()
+            .skip_while(|r| r.kind != FolderRowKind::AccountRoot)
+            .skip(1)
+            .take_while(|r| r.kind != FolderRowKind::AccountRoot)
+            .filter(|r| r.kind == FolderRowKind::Folder && r.depth == 1)
+            .map(|r| r.name)
+            .collect()
+    }
+
+    #[test]
+    fn folder_tree_follows_show_all_folders_a_to_z() {
+        let mut s = sample_session();
+        let account = s.mailbox.accounts.first().map(|a| a.id).unwrap();
+        let pane_names = |s: &Session| -> Vec<String> {
+            crate::cmd::folder::pane_children(s, account, None)
+                .into_iter()
+                .filter_map(|id| s.mailbox.folder(id))
+                .filter(|f| kind_visible(f.kind, s.view.module))
+                .map(|f| f.name.clone())
+                .collect()
+        };
+        let before = first_account_roots(&s);
+        assert!(before.len() > 2, "{before:?}");
+        assert_eq!(before, pane_names(&s));
+        let r = s.run("folder.showAllAZ", &serde_json::json!({"on": true})).unwrap();
+        let after = first_account_roots(&s);
+        assert_eq!(after, pane_names(&s), "the tree uses the folder pane's order");
+        if r["saved"] == true {
+            // Default folders are sorted in with the rest.
+            let mut sorted = after.clone();
+            sorted.sort_by_key(|n| n.to_lowercase());
+            assert_eq!(after, sorted);
+            assert_ne!(after, before);
+        } else {
+            // The setting is not kept by this build: nothing changes.
+            assert_eq!(after, before);
+        }
     }
 
     #[test]

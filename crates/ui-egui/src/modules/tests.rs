@@ -825,3 +825,112 @@ fn task_colour_options_override_the_theme() {
     let muted = app.theme.text_muted;
     assert_eq!(super::tasks_view::option_color(&app, "tasks.completedColor", muted), muted);
 }
+
+/// A message from `from` carrying the task part `ics` (as a received message in the sample Inbox).
+fn task_mail(a: &mut App, from: (&str, &str), ics: &str) -> u64 {
+    let me = a.s.mailbox.default_account().map(|x| x.address.clone()).unwrap();
+    let mut b = mailcraft_mime::MessageBuilder::new();
+    b.from = Some(mailcraft_mime::Mailbox::new(Some(from.0), from.1));
+    b.to = mailcraft_mime::parse_address_list(&me);
+    b.subject = "Task".into();
+    b.text = Some("See the task.".into());
+    b.attachments = vec![mailcraft_mime::AttachmentSpec {
+        filename: "task.ics".into(),
+        mime_type: "text/calendar; method=REQUEST".into(),
+        data: ics.as_bytes().to_vec(),
+        content_id: None,
+    }];
+    let raw = b.build();
+    let msg = mailcraft_mime::parse(&raw).unwrap();
+    let mut item = mailcraft_model::MailItem::from_message(&msg, &raw, a.s.now());
+    let acc = a.s.mailbox.default_account().unwrap().id;
+    item.folder = a.s.mailbox.role_folder(acc, mailcraft_model::FolderRole::Inbox).unwrap();
+    a.s.mailbox.add_mail(item).0
+}
+
+fn bar_harness(a: App, mail: u64) -> Harness<'static, App> {
+    let mut h = Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(
+        move |ui: &mut egui::Ui, app: &mut App| {
+            super::meeting_bar(ui, app, mail);
+        },
+        a,
+    );
+    h.run_ok();
+    h
+}
+
+#[test]
+fn task_bar_accepts_and_declines_a_task_request() {
+    let mut a = app();
+    let me = a.s.mailbox.default_account().map(|x| x.address.clone()).unwrap();
+    let ics = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//Other client//EN\r\nMETHOD:REQUEST\r\n\
+BEGIN:VTODO\r\nUID:todo-7@example.com\r\nDTSTAMP:20261009T080000Z\r\nSUMMARY:Water the plants\r\n\
+DUE;VALUE=DATE:20261016\r\nSTATUS:NEEDS-ACTION\r\nORGANIZER;CN=\"Boss\":mailto:boss@example.com\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{me}\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+    );
+    let mail = task_mail(&mut a, ("Boss", "boss@example.com"), &ics);
+    let mut h = bar_harness(a, mail);
+    assert!(has(&h, "Please respond. Accept the task to add it to your task list."));
+    assert!(has(&h, "Water the plants"));
+    assert!(has(&h, "2026-10-16"));
+    assert!(has(&h, "Boss <boss@example.com>"));
+    assert!(!has(&h, "Update"), "requests have no Update");
+    click(&h, "Accept");
+    h.run_ok();
+    click(&h, "Edit the response before sending");
+    h.run_ok();
+    let task = h.state().s.mailbox.tasks.values().find(|t| t.subject == "Water the plants").map(|t| t.id);
+    assert!(task.is_some(), "accepting adds the task");
+    assert!(
+        h.state().s.composes.values().any(|c| c.subject.starts_with("Task Accepted:")),
+        "the response opens for editing"
+    );
+    assert!(has(&h, "You accepted this task. It is on your task list."));
+    click(&h, "Open Task");
+    h.run_ok();
+    assert!(h.state().ui.dialogs.iter().any(|(n, p)| n == "task" && p["id"] == task.unwrap().0));
+    // Declining afterwards still works from the bar.
+    click(&h, "Decline");
+    h.run_ok();
+    click(&h, "Edit the response before sending");
+    h.run_ok();
+    assert!(has(&h, "You declined this task."));
+    // Plain mail gets no task bar.
+    let plain = *h.state().s.mailbox.mail.keys().next().unwrap();
+    let ctx = egui::Context::default();
+    let mut drew = true;
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        drew = super::meeting_bar::task_bar(ui, h.state_mut(), plain.0);
+    });
+    out.textures_delta.clear();
+    assert!(!drew);
+}
+
+#[test]
+fn task_bar_updates_my_copy_from_a_response() {
+    let mut a = app();
+    let r = a
+        .s
+        .run("tasks.assign", &json!({"to": "Ann Lee <ann@example.com>", "subject": "Budget", "send": false}))
+        .unwrap();
+    let copy = ItemId(r["task"].as_u64().unwrap());
+    let uid = a.s.mailbox.tasks[&copy].uid.clone();
+    let me = a.s.mailbox.default_account().map(|x| x.address.clone()).unwrap();
+    let ics = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//Other client//EN\r\nMETHOD:REPLY\r\n\
+BEGIN:VTODO\r\nUID:{uid}\r\nDTSTAMP:20261009T080000Z\r\nSUMMARY:Budget\r\nSTATUS:IN-PROCESS\r\n\
+PERCENT-COMPLETE:40\r\nORGANIZER:mailto:{me}\r\n\
+ATTENDEE;CN=\"Ann Lee\";PARTSTAT=IN-PROCESS:mailto:ann@example.com\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+    );
+    let mail = task_mail(&mut a, ("Ann Lee", "ann@example.com"), &ics);
+    let mut h = bar_harness(a, mail);
+    assert!(has(&h, "Ann Lee reports: In Progress, 40% complete."));
+    assert!(!has(&h, "Accept"), "responses cannot be accepted");
+    assert_eq!(h.state().s.mailbox.tasks[&copy].percent_complete, 0);
+    click(&h, "Update");
+    h.run_ok();
+    let t = &h.state().s.mailbox.tasks[&copy];
+    assert_eq!(t.percent_complete, 40);
+    assert_eq!(t.request_state, mailcraft_model::task::TaskRequestState::Accepted);
+}

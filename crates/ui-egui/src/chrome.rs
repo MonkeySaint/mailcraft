@@ -209,6 +209,34 @@ fn focus_ring(ui: &Ui, app: &App, name: &str, rect: Rect) {
     }
 }
 
+/// Keyboard focus (Tab, F6) on a chrome control (tab row, status bar): the accent outline the ribbon's
+/// controls draw too.
+fn paint_focus(ui: &Ui, app: &App, rect: Rect) {
+    ui.painter().rect_stroke(
+        rect.shrink(0.5),
+        CornerRadius::same(4),
+        Stroke::new(1.5, app.theme.accent),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Where the main window drew its status bar and ribbon (tab row and ribbon body) in the last frame; `None`
+/// when hidden. The keyboard handler takes the F6 stops from here.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Bands {
+    pub status_bar: Option<Rect>,
+    pub ribbon: Option<Rect>,
+}
+
+fn bands_id() -> egui::Id {
+    egui::Id::new("mailcraft.chrome.bands")
+}
+
+/// The status bar and ribbon rectangles of the main window's last frame.
+pub fn bands(ctx: &egui::Context) -> Bands {
+    ctx.data(|d| d.get_temp::<Bands>(bands_id())).unwrap_or_default()
+}
+
 /// Icon for a command shown as a toolbar button.
 pub fn command_icon(id: &str) -> &'static str {
     match id {
@@ -284,10 +312,12 @@ pub fn main_window(ui: &mut Ui, app: &mut App, frame: &Frame) {
         st.layout.ribbon_shown = show_ribbon;
     });
     let mut keep = title;
+    let mut bands = Bands::default();
     if show_tabs {
         let r = Rect::from_min_max(pos2(full.left(), top), pos2(full.right(), top + size::TAB_ROW));
         top = r.bottom();
         keep = keep.union(r);
+        bands.ribbon = Some(r);
         let mut c = child(ui, r, "mc_tab_row", Layout::left_to_right(Align::Center));
         tab_row(&mut c, app, frame);
     }
@@ -296,6 +326,7 @@ pub fn main_window(ui: &mut Ui, app: &mut App, frame: &Frame) {
         let r = Rect::from_min_max(pos2(full.left(), top), pos2(full.right(), (top + h).min(full.bottom())));
         top = r.bottom();
         keep = keep.union(r);
+        bands.ribbon = Some(bands.ribbon.map_or(r, |b| b.union(r)));
         ui.painter().rect_filled(r, CornerRadius::ZERO, app.theme.ribbon);
         ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, app.theme.separator));
         let mut c = child(ui, r, "mc_ribbon", Layout::left_to_right(Align::Center));
@@ -331,10 +362,16 @@ pub fn main_window(ui: &mut Ui, app: &mut App, frame: &Frame) {
             pos2(full.right(), bottom),
         );
         bottom = r.top();
+        bands.status_bar = Some(r);
         let mut c = child(ui, r, "mc_status_bar", Layout::left_to_right(Align::Center));
         status_bar(&mut c, app, frame);
         focus_ring(ui, app, "statusBar", r);
     }
+    // A ribbon shown only on demand (tabs only) is not an F6 stop while its tab row is hidden.
+    if !show_tabs {
+        bands.ribbon = None;
+    }
+    ctx.data_mut(|d| d.insert_temp(bands_id(), bands));
 
     let rail = Rect::from_min_max(
         pos2(full.left(), top),
@@ -815,6 +852,14 @@ fn tab_button(
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     let info = label.to_owned();
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, info.clone()));
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink2(vec2(0.5, 2.5)),
+            CornerRadius::same(4),
+            Stroke::new(1.5, theme.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     if resp.hovered() {
         ui.painter().rect_filled(
             rect.shrink2(vec2(0.0, 2.0)),
@@ -1067,6 +1112,14 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
         }
         connection_state(ui, app, frame);
     });
+    // The control with keyboard focus (Tab, F6 lands on the first one) gets the accent outline.
+    let ctx = ui.ctx().clone();
+    if let Some(id) = ctx.memory(|m| m.focused()).filter(|id| *id != bg.id)
+        && let Some(r) = ctx.read_response(id)
+        && bar.contains(r.rect.center())
+    {
+        paint_focus(ui, app, r.rect.intersect(bar));
+    }
 }
 
 /// Total messages waiting in the Outboxes of server accounts, and the first account with any.
@@ -1394,6 +1447,68 @@ fn save_pane_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rectangles outlined with the accent keyboard-focus stroke in the last frame.
+    fn focus_outlines(h: &egui_kittest::Harness<'_, App>) -> Vec<Rect> {
+        fn walk(shape: &egui::Shape, accent: egui::Color32, out: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, accent, out)),
+                egui::Shape::Rect(r) if r.stroke.color == accent && (r.stroke.width - 1.5).abs() < 0.01 => {
+                    out.push(r.rect);
+                }
+                _ => {}
+            }
+        }
+        let accent = h.state().theme.accent;
+        let mut out = Vec::new();
+        for c in &h.output().shapes {
+            walk(&c.shape, accent, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn bands_and_keyboard_focus_on_tabs_and_status_bar() {
+        use egui_kittest::kittest::Queryable;
+        let app = App::new(mailcraft_engine::sample::sample_session());
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui_state(|ui, app: &mut App| app.ui_root(ui), app);
+        h.run();
+        h.run();
+        // The shell records where it drew the ribbon (tab row + body) and the status bar.
+        let b = bands(&h.ctx);
+        let ribbon = b.ribbon.unwrap();
+        assert_eq!(ribbon.top(), size::TITLE_BAR);
+        let body =
+            if h.state().s.view.simplified_ribbon { size::RIBBON_SIMPLIFIED } else { size::RIBBON_CLASSIC };
+        assert!((ribbon.height() - (size::TAB_ROW + body)).abs() < 0.5, "{ribbon:?}");
+        let status = b.status_bar.unwrap();
+        assert!((status.bottom() - 900.0).abs() < 0.5 && (status.height() - size::STATUS_BAR).abs() < 0.5);
+        assert!(focus_outlines(&h).is_empty(), "nothing focused, no outline");
+        // A focused tab (F6 lands on the selected one) shows the outline in the tab row.
+        let tab_band = Rect::from_min_size(ribbon.min, egui::vec2(ribbon.width(), size::TAB_ROW));
+        h.get_by_label("View").focus();
+        h.run();
+        h.run();
+        let outlines = focus_outlines(&h);
+        assert!(outlines.iter().any(|r| tab_band.contains_rect(*r)), "{outlines:?}");
+        // So does a focused status-bar control.
+        h.get_by_label("Zoom In").focus();
+        h.run();
+        h.run();
+        let outlines = focus_outlines(&h);
+        assert!(outlines.iter().any(|r| status.contains_rect(*r)), "{outlines:?}");
+        assert!(!outlines.iter().any(|r| tab_band.contains_rect(*r)));
+        // Hiding the status bar and the ribbon removes their bands.
+        h.state_mut().s.view.status_bar = false;
+        h.state_mut().run("app.toggleRibbonMode", json!({"mode": "autoHide"}));
+        h.run();
+        h.run();
+        let b = bands(&h.ctx);
+        assert_eq!(b.status_bar, None, "{b:?}");
+        assert_eq!(b.ribbon, None, "{b:?}");
+    }
 
     #[test]
     fn zoom_mapping_round_trips() {

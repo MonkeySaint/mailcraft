@@ -582,6 +582,10 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     if let Some(m) = app.s.mailbox.mail.get(&ItemId(id)) {
         let sk = source_key(id, &m.body) ^ u64::from(plain);
         if cache.item != id || cache.source_key != sk {
+            // Inline attachments, so `cid:` pictures draw instead of the placeholder.
+            for (src, data) in queries::inline_pictures(&app.s, ItemId(id)) {
+                body::provide_image(&ctx, &src, &data);
+            }
             let doc = body_doc(&m.body, plain);
             cache = MsgCache {
                 item: id,
@@ -800,7 +804,8 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
         &app.s.settings.text("mail.tracking.readReceiptResponse"),
     );
     crate::compose::tracking_bars(ui, app, ItemId(id), policy);
-    // 6. Meeting requests, responses, cancellations and proposals (nothing for ordinary mail).
+    // 6. Meeting requests, responses, cancellations and proposals; task requests, responses and status
+    // reports (nothing for ordinary mail).
     crate::modules::meeting_bar(ui, app, id);
 }
 
@@ -1149,7 +1154,8 @@ fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClas
                 });
             });
         }
-        if !(size.x <= 300.0 && size.y <= 200.0) {
+        // A tiny window (responsive.md: 300×200) keeps the message and drops the ribbon, as compose does.
+        if !frame.inspector_tiny {
             crate::ribbon::ribbon(ui, app, Surface::Read(id), &frame);
             ui.separator();
         }
@@ -1221,6 +1227,42 @@ mod tests {
             }
         }
         assert!(moved, "Space reached the next item");
+    }
+
+    #[test]
+    fn inline_cid_pictures_reach_the_body() {
+        let s = sample_session();
+        let subject = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let mut app = app_with(&subject);
+        let id = app.s.selection.focus.unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(6, 4, image::Rgba([0, 120, 215, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let b = mailcraft_mime::MessageBuilder {
+            from: Some(mailcraft_mime::Mailbox::new(None, "ann@example.org")),
+            subject: subject.clone(),
+            text: Some("Logo".into()),
+            html: Some("<p>Logo: <img src=\"cid:logo@example.org\" width=6 height=4></p>".into()),
+            attachments: vec![mailcraft_mime::AttachmentSpec {
+                filename: "logo.png".into(),
+                mime_type: "image/png".into(),
+                data: png.into_inner(),
+                content_id: Some("logo@example.org".into()),
+            }],
+            ..Default::default()
+        };
+        let raw = b.build();
+        let msg = mailcraft_mime::parse(&raw).unwrap();
+        let mut built = mailcraft_model::MailItem::from_message(&msg, &raw, app.s.now());
+        if let Some(m) = app.s.mailbox.mail.get_mut(&id) {
+            m.body = built.body.clone();
+            m.attachments = std::mem::take(&mut built.attachments);
+            m.raw = Some(raw);
+        }
+        let mut h = harness(app);
+        h.run();
+        assert_eq!(body::image_texture(&h.ctx, "cid:logo@example.org").map(|t| t.size()), Some([6, 4]));
     }
 
     #[test]
@@ -1448,6 +1490,29 @@ mod tests {
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         App::new(s)
+    }
+
+    #[test]
+    fn tiny_read_windows_drop_the_ribbon_like_compose() {
+        let s = sample_session();
+        let id = s.mailbox.mail.keys().next().copied().unwrap();
+        let ribbon_shown = |w: f32, h: f32| {
+            let mut app = App::new(sample_session());
+            app.ui.read_windows.push(id.0);
+            let mut hn = Harness::builder().with_size(Vec2::new(w, h)).build_ui_state(
+                move |ui, app: &mut App| {
+                    read_window_ui(ui, app, id.0, egui::ViewportClass::Immediate);
+                },
+                app,
+            );
+            hn.run();
+            hn.query_all_by_label("Move & Delete").next().is_some() || hn.query_by_label("Delete").is_some()
+        };
+        assert!(ribbon_shown(900.0, 700.0), "a normal window has its ribbon");
+        // responsive::inspector_tiny: narrower than 360 or lower than 260 (the observed 300×200 included).
+        assert!(!ribbon_shown(340.0, 700.0));
+        assert!(!ribbon_shown(900.0, 240.0));
+        assert!(!ribbon_shown(300.0, 200.0));
     }
 
     #[test]

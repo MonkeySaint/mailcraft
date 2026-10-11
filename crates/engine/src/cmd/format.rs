@@ -1508,7 +1508,7 @@ fn paste_doc(s: &mut Session, p: &Value, mut doc: Doc, mode: PasteMode) -> CmdRe
     }
     c.checkpoint();
     c.insert_fragment(&doc, mode);
-    Ok(json!({"pasted": true, "caret": pos_json(&c.selection.focus)}))
+    Ok(json!({"pasted": true, "mode": paste_mode_name(mode), "caret": pos_json(&c.selection.focus)}))
 }
 
 /// A picture from the clipboard: `image` holds its bytes in base64 (PNG, JPEG, GIF, BMP or WebP).
@@ -1532,8 +1532,79 @@ fn paste_image(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"pasted": true, "picture": cid, "caret": pos_json(&c.selection.focus)}))
 }
 
+/// Where pasted content was copied from (File › Options › Mail › Editor Options › Advanced › Cut, copy, and
+/// paste): the same message, another message, or another program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteOrigin {
+    SameMessage,
+    OtherMessage,
+    OtherProgram,
+}
+
+impl PasteOrigin {
+    /// `sameMessage`, `otherMessage` or `otherProgram`.
+    pub fn parse(s: &str) -> Option<PasteOrigin> {
+        match s {
+            "sameMessage" => Some(PasteOrigin::SameMessage),
+            "otherMessage" => Some(PasteOrigin::OtherMessage),
+            "otherProgram" => Some(PasteOrigin::OtherProgram),
+            _ => None,
+        }
+    }
+
+    /// The setting that holds the default paste mode for content from here.
+    pub fn setting(self) -> &'static str {
+        match self {
+            PasteOrigin::SameMessage => "mail.editor.pasteWithinMessage",
+            PasteOrigin::OtherMessage => "mail.editor.pasteBetweenMessages",
+            PasteOrigin::OtherProgram => "mail.editor.pasteFromOtherPrograms",
+        }
+    }
+}
+
+/// The default paste mode (`keepSource`, `merge` or `textOnly`) for content copied from `origin`: "Pasting
+/// within the same message", "Pasting between messages" or "Pasting from other programs".
+pub fn default_paste_mode(s: &Session, origin: PasteOrigin) -> &'static str {
+    match s.settings.text(origin.setting()).as_str() {
+        "merge" => "merge",
+        "textOnly" => "textOnly",
+        _ => "keepSource",
+    }
+}
+
+fn paste_mode_name(m: PasteMode) -> &'static str {
+    match m {
+        PasteMode::KeepSource => "keepSource",
+        PasteMode::Merge => "merge",
+        PasteMode::TextOnly => "textOnly",
+    }
+}
+
+/// Where a paste without an explicit `mode` comes from: `origin`, else another program when the content is
+/// given (`html` / `text`, the system clipboard), else the in-app clipboard — the same message while only one
+/// message is being written (copies come from compose bodies), between messages otherwise.
+fn paste_origin(s: &Session, p: &Value) -> Result<PasteOrigin, CmdError> {
+    if let Some(o) = opt_str(p, "origin") {
+        return PasteOrigin::parse(o).ok_or_else(|| {
+            CmdError::Params("`origin` must be sameMessage, otherMessage or otherProgram".into())
+        });
+    }
+    if opt_str(p, "html").is_some() || opt_str(p, "text").is_some() {
+        return Ok(PasteOrigin::OtherProgram);
+    }
+    Ok(if s.composes.len() <= 1 { PasteOrigin::SameMessage } else { PasteOrigin::OtherMessage })
+}
+
+/// Paste: `mode` when given (Paste Options, the ribbon's Paste menu), else the default for where the content
+/// was copied (see [`paste_origin`]).
 fn paste(s: &mut Session, p: &Value) -> CmdResult {
-    let mode = paste_mode(opt_str(p, "mode"))?;
+    let mode = match opt_str(p, "mode") {
+        Some(m) => paste_mode(Some(m))?,
+        None => {
+            let origin = paste_origin(s, p)?;
+            paste_mode(Some(default_paste_mode(s, origin)))?
+        }
+    };
     do_paste(s, p, mode)
 }
 
@@ -2193,7 +2264,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paste",
             "Message › Clipboard; Format Text › Clipboard",
             "Mod+V",
-            r#"{"mode"?:"keepSource"|"merge"|"textOnly","text"?:string,"html"?:string,"image"?:string}  (image: base64 picture)"#,
+            r#"{"mode"?:"keepSource"|"merge"|"textOnly","origin"?:"sameMessage"|"otherMessage"|"otherProgram","text"?:string,"html"?:string,"image"?:string}  (no mode: the Options default for the origin; image: base64 picture)"#,
             false,
             has_compose,
             paste,
@@ -2760,6 +2831,54 @@ mod tests {
         let r = s.run("format.clipboardPane", &json!({})).unwrap();
         assert_eq!(r["entries"][0], "alpha");
         assert!(s.run("format.paste", &json!({"mode": "weird"})).is_err());
+    }
+
+    #[test]
+    fn paste_defaults_follow_where_the_content_was_copied() {
+        let (mut s, id) = with_text("alpha beta");
+        for (k, v) in
+            [("mail.editor.pasteWithinMessage", "textOnly"), ("mail.editor.pasteBetweenMessages", "merge")]
+        {
+            s.run("options.set", &json!({"key": k, "value": v})).unwrap();
+        }
+        let mode = |s: &mut Session, p: Value| s.run("format.paste", &p).unwrap()["mode"].clone();
+        assert_eq!(mode(&mut s, json!({"text": "x", "origin": "sameMessage"})), "textOnly");
+        assert_eq!(mode(&mut s, json!({"text": "x", "origin": "otherMessage"})), "merge");
+        assert_eq!(mode(&mut s, json!({"text": "x", "origin": "otherProgram"})), "keepSource");
+        // A mode chosen for this paste (Paste Options, the Paste menu) wins.
+        assert_eq!(mode(&mut s, json!({"text": "x", "origin": "sameMessage", "mode": "merge"})), "merge");
+        // Without an origin: given content comes from another program …
+        assert_eq!(mode(&mut s, json!({"text": "x"})), "keepSource");
+        assert_eq!(default_paste_mode(&s, PasteOrigin::OtherProgram), "keepSource");
+        // … and the in-app clipboard from the one message being written.
+        sel(&mut s, (&[0], 0), (&[0], 5));
+        s.run("format.bold", &json!({})).unwrap();
+        s.run("format.copy", &json!({})).unwrap();
+        let end = s.composes[&id].body.to_plain_text().chars().count();
+        sel(&mut s, (&[0], end), (&[0], end));
+        assert_eq!(mode(&mut s, json!({})), "textOnly");
+        assert_eq!(s.composes[&id].body.to_plain_text(), "alpha betaxxxxxalpha");
+        // Keep Text Only dropped the copied bold.
+        let bolds = match &s.composes[&id].body.blocks[0] {
+            Block::Paragraph { inlines, .. } => inlines
+                .iter()
+                .filter(|i| matches!(i, Inline::Text { style, .. } if style.bold == Some(true)))
+                .count(),
+            _ => 0,
+        };
+        assert_eq!(bolds, 1, "only the original run is bold");
+        // With a second message open, the in-app clipboard pastes between messages.
+        let other = open(&mut s);
+        assert_eq!(mode(&mut s, json!({"compose": other})), "merge");
+        // Junk origins are refused.
+        assert!(matches!(
+            s.run("format.paste", &json!({"text": "x", "origin": "elsewhere"})),
+            Err(CmdError::Params(_))
+        ));
+        assert_eq!(
+            PasteOrigin::parse("otherMessage").map(PasteOrigin::setting),
+            Some("mail.editor.pasteBetweenMessages")
+        );
     }
 
     #[test]

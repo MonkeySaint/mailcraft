@@ -2,8 +2,8 @@
 //!
 //! The version lives in `[workspace.package] version` of the root Cargo.toml; every crate inherits it.
 //! `bump` edits that line and the matching Cargo.lock entries of the workspace crates (path packages, which
-//! have no `source`). `check` compares it with the tag CI is building (GITHUB_REF / GITHUB_REF / GITHUB_REF
-//! = `refs/tags/vX.Y.Z`).
+//! have no `source`). `check` compares it with the tag GitHub Actions is building (GITHUB_REF =
+//! `refs/tags/vX.Y.Z`).
 
 use std::path::Path;
 
@@ -109,13 +109,30 @@ pub fn bump_lock(lock: &str, old: &str, new: &str) -> (String, Vec<String>) {
     (join_lines(&lines, lock), changed)
 }
 
-/// The tag CI is building, from the first of GITHUB_REF / GITHUB_REF / GITHUB_REF that is a tag ref.
-fn ci_tag() -> Option<(String, String)> {
-    ["GITHUB_REF", "GITHUB_REF", "GITHUB_REF"].iter().find_map(|var| {
-        let r = std::env::var(var).ok()?;
-        let tag = r.strip_prefix("refs/tags/")?.to_owned();
-        Some(((*var).to_owned(), tag))
-    })
+/// The tag in a git ref (`refs/tags/vX.Y.Z` → `vX.Y.Z`); `None` for branches and other refs.
+fn tag_of_ref(git_ref: &str) -> Option<&str> {
+    git_ref.strip_prefix("refs/tags/").filter(|t| !t.is_empty())
+}
+
+/// `version check`: the workspace version `current` against the ref CI is building (GITHUB_REF).
+fn check_tag(current: &str, github_ref: Option<&str>) -> TaskResult {
+    match github_ref.and_then(tag_of_ref) {
+        None => {
+            println!("version {current}: not a tag build (GITHUB_REF), nothing to check");
+            Ok(())
+        }
+        Some(tag) => {
+            let want = tag.trim_start_matches('v');
+            if want == current {
+                println!("version {current} matches tag {tag} (GITHUB_REF)");
+                Ok(())
+            } else {
+                Err(format!(
+                    "tag {tag} (GITHUB_REF) does not match the workspace version {current}: run `cargo xtask version bump {want}`"
+                ))
+            }
+        }
+    }
 }
 
 pub fn run(root: &Path, args: &[String]) -> TaskResult {
@@ -153,25 +170,7 @@ pub fn run(root: &Path, args: &[String]) -> TaskResult {
             }
             Ok(())
         }
-        ["check"] => match ci_tag() {
-            None => {
-                println!(
-                    "version {current}: not a tag build (GITHUB_REF/GITHUB_REF/GITHUB_REF), nothing to check"
-                );
-                Ok(())
-            }
-            Some((var, tag)) => {
-                let want = tag.trim_start_matches('v');
-                if want == current {
-                    println!("version {current} matches tag {tag} ({var})");
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "tag {tag} ({var}) does not match the workspace version {current}: run `cargo xtask version bump {want}`"
-                    ))
-                }
-            }
-        },
+        ["check"] => check_tag(&current, std::env::var("GITHUB_REF").ok().as_deref()),
         other => Err(format!("usage: cargo xtask version show | bump X.Y.Z | check (got {other:?})")),
     }
 }
@@ -221,5 +220,18 @@ mod tests {
         assert!(run(dir.path(), &["bump".into(), "nope".into()]).is_err());
         assert!(run(dir.path(), &["frob".into()]).is_err());
         run(dir.path(), &["show".into()]).unwrap();
+    }
+
+    #[test]
+    fn check_against_github_ref() {
+        assert_eq!(tag_of_ref("refs/tags/v1.2.3"), Some("v1.2.3"));
+        assert_eq!(tag_of_ref("refs/heads/master"), None);
+        assert_eq!(tag_of_ref("refs/tags/"), None);
+        check_tag("1.2.3", Some("refs/tags/v1.2.3")).unwrap();
+        check_tag("1.2.3-rc.1", Some("refs/tags/v1.2.3-rc.1")).unwrap();
+        assert!(check_tag("1.2.3", Some("refs/tags/v1.2.4")).is_err());
+        check_tag("1.2.3", Some("refs/heads/master")).unwrap();
+        check_tag("1.2.3", Some("refs/pull/7/merge")).unwrap();
+        check_tag("1.2.3", None).unwrap();
     }
 }

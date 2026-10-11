@@ -27,7 +27,7 @@
 //! Meeting requests are answered automatically when Auto Accept/Decline asks for it (`calendar.autoRespond`,
 //! checked while the calendar shows).
 
-mod forms;
+pub(super) mod forms;
 mod table;
 #[cfg(test)]
 mod ui_tests;
@@ -52,8 +52,8 @@ use mailcraft_model::{Appointment, BusyStatus, FolderId, FolderKind, ItemId, Rea
 
 use super::common::{
     DAY, ModState, a11y, add_months, blend, category_color, child, clock, current_folder, day_of, day_string,
-    empty_message, folder_rows, group_header, hour_label, load, long_date, month_name, now_minute,
-    paint_text_clipped, pane_bg, parse_day, select_folder, shift_month, split_folder_pane, store, today, tz,
+    empty_message, folder_rows, group_header, hour_label, load, long_date, module_folder_pane, month_name,
+    now_minute, paint_text_clipped, pane_bg, parse_day, select_folder, shift_month, store, today, tz,
     weekday, weekday_name, ymd,
 };
 use super::editors;
@@ -759,7 +759,8 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
     }
     let look = Look::of(app, &st);
     let full = ui.max_rect();
-    let (pane, mut main) = split_folder_pane(ui, app);
+    // View › Folder Pane: the pane, the minimised strip (chosen, narrow windows, Reading view) or nothing.
+    let (pane, mut main) = module_folder_pane(ui, app);
     // To-Do Bar (View › Layout › To-Do Bar) on the right, when there is room.
     let bar_w = super::TODO_BAR_WIDTH;
     if super::todo_bar_shown(&ctx) && main.width() >= bar_w + 420.0 {
@@ -768,8 +769,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
         child(ui, bar, "mc-cal-todo-bar", |ui| super::todo_bar(ui, app));
     }
     if let Some(p) = pane {
-        pane_bg(ui, p, app.theme.pane);
-        child(ui, p.shrink(6.0), "mc-cal-pane", |ui| folder_pane(ui, app, &mut st, &look));
+        child(ui, p.shrink2(vec2(6.0, 0.0)), "mc-cal-pane", |ui| folder_pane(ui, app, &mut st, &look));
     }
     pane_bg(ui, main, app.theme.reading);
     child(ui, main, "mc-cal-main", |ui| content(ui, app, &mut st, &mut cu, &look));

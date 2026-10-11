@@ -388,7 +388,7 @@ fn open_export(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Raw RFC 5322 source of an item: kept bytes, else the blob store, else rebuilt from its fields.
-fn raw_source(s: &Session, m: &MailItem) -> Vec<u8> {
+pub(crate) fn raw_source(s: &Session, m: &MailItem) -> Vec<u8> {
     if let Some(raw) = &m.raw {
         return raw.clone();
     }

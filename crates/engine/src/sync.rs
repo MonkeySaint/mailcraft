@@ -1452,6 +1452,7 @@ fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
 // Native: workers, jobs and results
 // =======================================================================================================
 
+pub mod arrival;
 pub mod cmds;
 #[cfg(not(target_arch = "wasm32"))]
 mod jmap;

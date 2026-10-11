@@ -310,6 +310,9 @@ struct Cached {
     quick: [&'static str; 2],
     /// [`download_signature`] of the rows.
     downloads: u64,
+    /// File › Options › Mail › Other › "Highlight flagged items in the message list": flagged rows get the
+    /// flagged tint.
+    highlight_flagged: bool,
 }
 
 #[derive(Clone, Default)]
@@ -421,6 +424,7 @@ fn build(s: &Session, key: u64) -> Cached {
         pane,
         columns: mailview::columns(s, folder),
         quick: mailview::quick_actions(s),
+        highlight_flagged: s.settings.bool("mail.other.highlightFlagged"),
     }
 }
 
@@ -1280,6 +1284,28 @@ fn paint_row_end(
     (Slots { flag: Some(flag), category: Some(category), actions }, left)
 }
 
+/// Background of an item row: selected, hovered, the header of an expanded selected conversation (a light
+/// tint; the child row carries the selection), then flagged rows when "Highlight flagged items" is on.
+fn row_fill(
+    th: &Theme,
+    row: &ItemRow,
+    hovered: bool,
+    header_of_selection: bool,
+    highlight_flagged: bool,
+) -> Option<Color32> {
+    if row.selected {
+        Some(th.selected)
+    } else if hovered {
+        Some(th.hover)
+    } else if header_of_selection {
+        Some(th.selected.gamma_multiply(0.45))
+    } else if row.flagged && highlight_flagged {
+        Some(th.flagged_row)
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn item_row(
     ui: &mut Ui,
@@ -1307,18 +1333,8 @@ fn item_row(
     }
     let painter = ui.painter().clone();
     let conv = row.conversation.as_ref();
-    let fill = if row.selected {
-        Some(th.selected)
-    } else if hovered {
-        Some(th.hover)
-    } else if conv.is_some_and(|c| c.header && c.contains_selection) {
-        // Expanded selected conversation: the child row carries the selection, the header a light tint.
-        Some(th.selected.gamma_multiply(0.45))
-    } else if row.flagged {
-        Some(th.flagged_row)
-    } else {
-        None
-    };
+    let header_of_selection = conv.is_some_and(|c| c.header && c.contains_selection);
+    let fill = row_fill(&th, row, hovered, header_of_selection, c.highlight_flagged);
     if let Some(fill) = fill {
         painter.rect_filled(r, 0.0, fill);
     }
@@ -2277,6 +2293,53 @@ mod tests {
         h.run();
         let m = h.state().s.mailbox.mail.get(&mailcraft_model::ItemId(target)).unwrap();
         assert!(m.categories.iter().any(|c| c.eq_ignore_ascii_case(&category)));
+    }
+
+    /// True when a rectangle filled with `color` was painted in the last frame.
+    fn painted_fill(h: &Harness<'_, App>, color: Color32) -> bool {
+        fn walk(shape: &egui::Shape, color: Color32) -> bool {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().any(|s| walk(s, color)),
+                egui::Shape::Rect(r) => r.fill == color,
+                _ => false,
+            }
+        }
+        h.output().shapes.iter().any(|c| walk(&c.shape, color))
+    }
+
+    #[test]
+    fn flagged_rows_are_tinted_only_while_highlighting_is_on() {
+        let mut s = sample_session();
+        let ids = item_ids(&App::new(sample_session()));
+        let (id, _) = ids.get(1).cloned().unwrap();
+        s.selection.items = vec![mailcraft_model::ItemId(id)];
+        s.selection.focus = Some(mailcraft_model::ItemId(id));
+        s.run("mail.flag", &json!({"ids": [id]})).unwrap();
+        s.selection.items.clear();
+        s.selection.focus = None;
+        let app = App::new(s);
+        let tint = app.theme.flagged_row;
+        let mut h = harness(app, vec2(420.0, 1400.0));
+        h.run();
+        assert!(painted_fill(&h, tint), "File › Options › Mail › Highlight flagged items is on by default");
+        h.state_mut().run("options.set", json!({"key": "mail.other.highlightFlagged", "value": false}));
+        h.run();
+        h.run();
+        assert!(!painted_fill(&h, tint), "no flagged tint once it is off");
+        // The fill order: selection and hover beat the flagged tint.
+        let th = h.state().theme.clone();
+        let row = queries::list_rows(&h.state().s)
+            .into_iter()
+            .find_map(|r| match r {
+                ListRow::Item(i) if i.flagged => Some(i),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(row_fill(&th, &row, false, false, true), Some(th.flagged_row));
+        assert_eq!(row_fill(&th, &row, false, false, false), None);
+        assert_eq!(row_fill(&th, &row, true, false, true), Some(th.hover));
+        let selected = ItemRow { selected: true, ..row };
+        assert_eq!(row_fill(&th, &selected, true, false, true), Some(th.selected));
     }
 
     #[test]

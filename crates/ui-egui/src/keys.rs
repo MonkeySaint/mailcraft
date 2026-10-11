@@ -773,30 +773,17 @@ fn focusables(ctx: &egui::Context) -> Vec<Focusable> {
 /// The main window's F6 stops with their rectangles, in order: the content panes left to right (folder pane,
 /// list, reading pane, To-Do Bar, module views), then the status bar and the ribbon (tab row and body) —
 /// keyboard.md: "reading pane → status bar → ribbon tabs → …".
-fn pane_stops(ctx: &egui::Context, app: &App) -> Vec<(String, egui::Rect)> {
-    use crate::theme::size;
+fn pane_stops(ctx: &egui::Context) -> Vec<(String, egui::Rect)> {
     let layout = App::shell_layout(ctx);
     let mut out: Vec<(String, egui::Rect)> =
         layout.panes.iter().zip(layout.rects.iter()).map(|(p, r)| ((*p).to_owned(), *r)).collect();
-    let full = ctx.content_rect();
-    if app.s.view.status_bar {
-        let top = (full.bottom() - size::STATUS_BAR).max(full.top());
-        out.push(("statusBar".into(), egui::Rect::from_min_max(egui::pos2(full.left(), top), full.max)));
+    // Where the shell drew the status bar and the ribbon (tab row and body) in the last frame.
+    let bands = crate::chrome::bands(ctx);
+    if let Some(r) = bands.status_bar {
+        out.push(("statusBar".into(), r));
     }
-    if layout.tabs_shown {
-        let top = full.top() + size::TITLE_BAR;
-        let body = if !layout.ribbon_shown {
-            0.0
-        } else if app.s.view.simplified_ribbon {
-            size::RIBBON_SIMPLIFIED
-        } else {
-            size::RIBBON_CLASSIC
-        };
-        let bottom = (top + size::TAB_ROW + body).min(full.bottom()).max(top);
-        out.push((
-            "ribbon".into(),
-            egui::Rect::from_min_max(egui::pos2(full.left(), top), egui::pos2(full.right(), bottom)),
-        ));
+    if let Some(r) = bands.ribbon {
+        out.push(("ribbon".into(), r));
     }
     out
 }
@@ -823,9 +810,9 @@ fn focus_target(app: &App, name: &str, rect: egui::Rect, widgets: &[Focusable]) 
     match name {
         "list" if present(crate::list::focus_id()) => return Some(crate::list::focus_id()),
         "folders" => {
-            let sel = app.s.selection.folder.0;
-            for tag in ["tree", "fav"] {
-                let id = egui::Id::new(("mailcraft.folders.row", tag, sel));
+            let sel = app.s.selection.folder;
+            for favorite in [false, true] {
+                let id = crate::folders::row_focus_id(sel, favorite);
                 if present(id) {
                     return Some(id);
                 }
@@ -866,7 +853,7 @@ fn focus_target(app: &App, name: &str, rect: egui::Rect, widgets: &[Focusable]) 
 /// the status bar and the ribbon. The pane is the one after the F6 pane, else after the pane holding the
 /// focused widget (a clicked list → reading pane). Returns the pane now focused.
 fn cycle_pane(ctx: &egui::Context, app: &App, back: bool) -> Option<String> {
-    let stops = pane_stops(ctx, app);
+    let stops = pane_stops(ctx);
     if stops.is_empty() {
         return None;
     }
@@ -897,11 +884,11 @@ fn cycle_pane(ctx: &egui::Context, app: &App, back: bool) -> Option<String> {
 }
 
 /// Keeps the F6 ring on the pane that holds keyboard focus once Tab has moved it into another pane.
-fn follow_focus(ctx: &egui::Context, app: &App) {
+fn follow_focus(ctx: &egui::Context) {
     if with_mem(ctx, |m| m.pane.is_none()) || ctx.memory(|m| m.focused().is_none()) {
         return;
     }
-    let stops = pane_stops(ctx, app);
+    let stops = pane_stops(ctx);
     let widgets = focusables(ctx);
     if let Some(p) = pane_of_focus(ctx, &stops, &widgets) {
         with_mem(ctx, |m| m.pane = Some(p));
@@ -1222,7 +1209,7 @@ pub fn handle(ctx: &egui::Context, app: &mut App, surface: Surface) {
     if ctx.input(|i| i.pointer.any_pressed()) {
         with_mem(ctx, |m| m.pane = None);
     } else if surface == Surface::Main {
-        follow_focus(ctx, app);
+        follow_focus(ctx);
     }
     if app.ui.keytips.is_some() {
         handle_keytips(ctx, app, surface);
@@ -1688,7 +1675,10 @@ mod tests {
         assert!(app.s.view.ribbon_collapsed);
         apply(&ctx, &mut app, Surface::Main, Action::ToggleRibbon);
         assert!(!app.s.view.ribbon_collapsed);
-        // F6 focuses a pane, Shift+F6 goes back.
+        // F6 focuses a pane, Shift+F6 goes back (the stops are where the last frame drew the panes, the status
+        // bar and the ribbon).
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.ui_root(ui));
+        out.textures_delta.clear();
         let first = apply(&ctx, &mut app, Surface::Main, Action::CyclePane(false));
         assert!(first["pane"].is_string());
         assert_eq!(focused_pane(&ctx).as_deref(), first["pane"].as_str());
@@ -1809,7 +1799,7 @@ mod tests {
     #[test]
     fn f6_moves_keyboard_focus_through_the_panes() {
         let mut h = shell(1400.0, 900.0);
-        let folder = h.state().s.selection.folder.0;
+        let folder = h.state().s.selection.folder;
         let mut seen = Vec::new();
         for _ in 0..8 {
             press(&mut h, egui::Modifiers::NONE, Key::F6);
@@ -1817,9 +1807,9 @@ mod tests {
             let id = focus_of(&h);
             match pane.as_str() {
                 "folders" => assert!(
-                    ["tree", "fav"]
-                        .iter()
-                        .any(|t| id == Some(egui::Id::new(("mailcraft.folders.row", *t, folder)))),
+                    [false, true]
+                        .into_iter()
+                        .any(|fav| id == Some(crate::folders::row_focus_id(folder, fav))),
                     "the selected folder's row has focus"
                 ),
                 "list" => assert!(crate::list::has_focus(&h.ctx)),

@@ -751,6 +751,31 @@ fn last_paste_id(cid: u64) -> Id {
     Id::new(("mailcraft-compose-last-paste", cid))
 }
 
+fn last_copy_id() -> Id {
+    Id::new("mailcraft-compose-last-copy")
+}
+
+/// The text the last Copy / Cut in a message body put on the clipboard, and the compose it came from.
+#[derive(Clone, Default)]
+struct LastCopy {
+    cid: u64,
+    text: String,
+}
+
+/// Where pasted text `t` was copied (for the paste default in Options › Mail › Editor Options ›
+/// Advanced): `sameMessage` / `otherMessage` when it is what the last in-app copy put on the clipboard
+/// (from compose `cid` / another compose), else `otherProgram`.
+pub(crate) fn paste_origin(ctx: &egui::Context, cid: u64, t: &str) -> &'static str {
+    let Some(last) = ctx.data(|d| d.get_temp::<LastCopy>(last_copy_id())) else { return "otherProgram" };
+    // Platforms may hand line breaks back as CR LF.
+    let same = last.text.chars().filter(|c| *c != '\r').eq(t.chars().filter(|c| *c != '\r'));
+    match (same, last.cid == cid) {
+        (true, true) => "sameMessage",
+        (true, false) => "otherMessage",
+        _ => "otherProgram",
+    }
+}
+
 fn with_compose(cid: u64, mut v: Value) -> Value {
     if let Some(o) = v.as_object_mut() {
         o.insert("compose".into(), json!(cid));
@@ -815,20 +840,31 @@ fn apply(
                 host.run("compose.insertText", json!({"compose": cid, "text": t}));
             }
             Act::Paste(t) => {
+                // A mode chosen on the ribbon's Paste menu, else the Options default for where the text was
+                // copied (the same message, another message, another program), which the engine applies.
                 let pending: Option<&'static str> = ctx.data_mut(|d| d.remove_temp(paste_mode_id(cid)));
-                let mode = pending.unwrap_or_else(|| host.paste_mode());
                 let html = super::clipboard::html_for_paste(&t);
-                let mut p = json!({"compose": cid, "text": t, "mode": mode});
-                if let (Some(h), Some(o)) = (&html, p.as_object_mut()) {
-                    o.insert("html".into(), json!(h));
+                let mut p = json!({"compose": cid, "text": t});
+                if let Some(o) = p.as_object_mut() {
+                    match pending {
+                        Some(mode) => o.insert("mode".into(), json!(mode)),
+                        None => o.insert("origin".into(), json!(paste_origin(&ctx, cid, &t))),
+                    };
+                    if let Some(h) = &html {
+                        o.insert("html".into(), json!(h));
+                    }
                 }
-                if host.run("format.paste", p).is_some() && html.is_some() && host.paste_options() {
+                if let Some(r) = host.run("format.paste", p)
+                    && html.is_some()
+                    && host.paste_options()
+                {
+                    let mode = r.get("mode").and_then(Value::as_str).map_or_else(
+                        || pending.unwrap_or_else(|| host.paste_mode()).to_owned(),
+                        str::to_owned,
+                    );
                     let rev = host.compose(cid).map_or(0, |c| c.edit_rev);
                     ctx.data_mut(|d| {
-                        d.insert_temp(
-                            last_paste_id(cid),
-                            LastPaste { html, text: t.clone(), mode: mode.to_owned(), rev },
-                        );
+                        d.insert_temp(last_paste_id(cid), LastPaste { html, text: t.clone(), mode, rev });
                     });
                 }
             }
@@ -840,6 +876,9 @@ fn apply(
                 if let Some(r) = host.run(id, json!({"compose": cid}))
                     && let Some(t) = r.get("text").and_then(Value::as_str)
                 {
+                    ctx.data_mut(|d| {
+                        d.insert_temp(last_copy_id(), LastCopy { cid, text: t.to_owned() });
+                    });
                     // HTML (with the text as its alternative) where the platform takes it, else text.
                     let html = r.get("html").and_then(Value::as_str).unwrap_or_default();
                     if !super::clipboard::copy_html(html, t) {

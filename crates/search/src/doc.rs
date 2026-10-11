@@ -1,7 +1,7 @@
 //! What gets indexed: a flat, owned [`Doc`] per item (mail, appointment, contact, task, note), built from
 //! the mailbox model by [`Doc::from_mail`] and friends.
 
-use mailcraft_model::{Appointment, Contact, FlagState, Importance, MailItem, Note, Task};
+use mailcraft_model::{Appointment, Contact, DateTime, FlagState, Importance, MailItem, Note, Task};
 
 /// Item kind (the `kind:` key; All Outlook Items searches every kind).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -125,6 +125,45 @@ pub struct Doc {
     pub flagged: bool,
     pub importance: Level,
     pub has_attachments: bool,
+    /// Unix seconds the item expires (mail: the `Expiry-Date` or `Expires` header, RFC 4021).
+    pub expires: Option<i64>,
+}
+
+/// Most header bytes looked at for the expiry date.
+const HEADER_SCAN: usize = 64 * 1024;
+
+/// The expiry date in a message's header section (the first `Expiry-Date` or `Expires` header, RFC 4021),
+/// unix seconds.
+pub fn expiry_of(raw: &[u8]) -> Option<i64> {
+    let head = raw.get(..raw.len().min(HEADER_SCAN))?;
+    let text = String::from_utf8_lossy(head);
+    let mut found: Option<String> = None;
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            if let Some(v) = current.as_mut() {
+                v.push(' ');
+                v.push_str(line.trim());
+            }
+            continue;
+        }
+        if let Some(v) = current.take()
+            && found.is_none()
+        {
+            found = Some(v);
+        }
+        if let Some((name, rest)) = line.split_once(':') {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("expiry-date") || name.eq_ignore_ascii_case("expires") {
+                current = Some(rest.trim().to_owned());
+            }
+        }
+    }
+    let value = found.or(current)?;
+    DateTime::parse_rfc5322(value.trim()).ok().map(|d| d.unix)
 }
 
 /// Longest body text indexed per item (bytes, cut on a char boundary); longer bodies are indexed in part.
@@ -173,6 +212,7 @@ impl Doc {
             flagged: matches!(m.flag, FlagState::Flagged { .. }),
             importance: m.importance.into(),
             has_attachments: m.has_attachments(),
+            expires: m.raw.as_deref().and_then(expiry_of),
         }
     }
 

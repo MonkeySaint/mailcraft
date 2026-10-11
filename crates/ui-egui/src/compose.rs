@@ -7,7 +7,11 @@
 //!   Item), the tab row (File + the compose tabs) and the ribbon from [`crate::ribbon::ribbon`].
 //! - Header: a big Send button (60×76) spanning the first two address rows; To / Cc buttons (80×32) that open the
 //!   address book; Subject label; optional From and Bcc rows; the attachments well; a 1-px separator; the body.
-//! - At 300×200 (anything below ~360×260) the Quick Access row, tab row and ribbon disappear; the header stays.
+//! - At 300×200 (anything below ~360×260, `responsive::inspector_tiny`, shared with read windows) the Quick
+//!   Access row, tab row and ribbon disappear; the header stays.
+//! - While any compose has unsaved changes, `compose.autoSaveTick` runs every [`AUTO_SAVE_CHECK_SECS`]
+//!   seconds ([`auto_save_timer`]); the engine saves the drafts whose changes are older than the Options ›
+//!   Mail auto-save minutes (nothing when auto-save is off).
 //! - Closing a window with unsaved changes asks "Do you want to save changes?" (Yes / No / Cancel) →
 //!   `compose.close {"save": true|false}`.
 //! - Inline responses: the same header plus Discard and Pop Out at the top right, the body editor below.
@@ -66,9 +70,9 @@ pub use voting::{READ_RECEIPT_REQUEST, ReceiptPolicy, tracking_bars};
 pub const DEFAULT_SIZE: [f32; 2] = [1440.0, 780.0];
 /// Smallest size accepted (responsive.md: 300×200 accepted).
 pub const MIN_SIZE: [f32; 2] = [300.0, 200.0];
-/// Below this width or height the Quick Access row, tab row and ribbon are hidden (300×200 observation).
-pub const TINY_W: f32 = 360.0;
-pub const TINY_H: f32 = 260.0;
+/// Seconds between auto-save checks while a compose has unsaved changes (`compose.autoSaveTick`; the engine
+/// saves only once File › Options › Mail › "Automatically save items…" minutes have passed).
+pub const AUTO_SAVE_CHECK_SECS: f64 = 15.0;
 
 const SEND_SIZE: Vec2 = Vec2::new(60.0, 76.0);
 const NAME_BTN: Vec2 = Vec2::new(80.0, 32.0);
@@ -85,11 +89,6 @@ const FALLBACK_TABS: [&str; 6] = ["Message", "Insert", "Options", "Format Text",
 
 /// Save-changes prompt text (our wording).
 pub const SAVE_PROMPT: &str = "Do you want to save changes?";
-
-/// Whether a compose window of this size hides its Quick Access row, tabs and ribbon.
-pub fn is_tiny(width: f32, height: f32) -> bool {
-    width < TINY_W || height < TINY_H
-}
 
 /// The viewport of compose window `cid`.
 pub fn viewport_id(cid: u64) -> ViewportId {
@@ -207,6 +206,8 @@ fn request_close(ctx: &egui::Context, app: &mut App, cid: u64) {
 
 /// All open compose windows (non-inline composes in `app.s.composes`).
 pub fn compose_windows(ctx: &egui::Context, app: &mut App) {
+    let now = ctx.input(|i| i.time);
+    auto_save_timer(ctx, app, now);
     let ids: Vec<u64> = app.s.composes.values().filter(|c| !c.inline).map(|c| c.id).collect();
     for cid in ids {
         let Some(c) = app.s.composes.get(&cid) else {
@@ -220,6 +221,44 @@ pub fn compose_windows(ctx: &egui::Context, app: &mut App) {
             compose_viewport(ui, app, cid, class)
         });
     }
+}
+
+fn auto_save_id() -> Id {
+    Id::new("mailcraft-compose-autosave")
+}
+
+/// The auto-save timer: while a compose (window or inline) has unsaved changes, runs `compose.autoSaveTick`
+/// every [`AUTO_SAVE_CHECK_SECS`] seconds of `now` (egui time) and asks for a repaint then, so a message
+/// nobody is typing in is still saved. The first check comes one period after the changes are first seen.
+/// Returns true when it ran the tick.
+pub fn auto_save_timer(ctx: &egui::Context, app: &mut App, now: f64) -> bool {
+    let dirty = app.s.composes.values().any(|c| c.dirty);
+    let last: Option<f64> = ctx.data(|d| d.get_temp(auto_save_id()));
+    if !dirty {
+        if last.is_some() {
+            ctx.data_mut(|d| d.remove::<f64>(auto_save_id()));
+        }
+        return false;
+    }
+    // A clock that went backwards (a new context) restarts the period.
+    let since = match last {
+        Some(t) if t <= now => t,
+        _ => {
+            ctx.data_mut(|d| d.insert_temp(auto_save_id(), now));
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(AUTO_SAVE_CHECK_SECS));
+            return false;
+        }
+    };
+    let waited = now - since;
+    if waited < AUTO_SAVE_CHECK_SECS {
+        let left = (AUTO_SAVE_CHECK_SECS - waited).clamp(0.1, AUTO_SAVE_CHECK_SECS);
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+        return false;
+    }
+    ctx.data_mut(|d| d.insert_temp(auto_save_id(), now));
+    ctx.request_repaint_after(std::time::Duration::from_secs_f64(AUTO_SAVE_CHECK_SECS));
+    app.run("compose.autoSaveTick", json!({}));
+    true
 }
 
 /// Inline response inside the reading pane.
@@ -285,8 +324,8 @@ fn compose_viewport(ui: &mut Ui, app: &mut App, cid: u64, class: ViewportClass) 
     initial_focus(&ctx, app, cid);
 
     let size = if embedded { ui.available_size() } else { ctx.content_rect().size() };
-    let tiny = is_tiny(size.x, size.y);
     let frame = Frame::compute(size.x, size.y);
+    let tiny = frame.inspector_tiny;
 
     let backstage_here = matches!(&app.ui.backstage, Some((Surface::Compose(s), _)) if *s == cid);
     egui::CentralPanel::default().frame(egui::Frame::new().fill(app.theme.pane)).show(ui, |ui| {

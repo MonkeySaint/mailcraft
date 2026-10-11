@@ -171,6 +171,8 @@ pub struct Session {
     journal_calls: u64,
     /// Mutating commands running (one may run others); server changes are queued by the outermost one.
     run_depth: u32,
+    /// Automatic actions running ([`Session::run_automatic`]): their changes record no undo step.
+    automatic_depth: u32,
     /// Account passwords and tokens (never in the mailbox or its journal; see `accounts.rs`).
     pub secrets: Box<dyn crate::accounts::SecretStore>,
     /// Send/receive workers, queued results and the status bar state (see `sync.rs`).
@@ -218,6 +220,7 @@ impl Session {
             checkpoint_bytes: mailcraft_store::Autosave::DEFAULT_CHECKPOINT_BYTES,
             journal_calls: 0,
             run_depth: 0,
+            automatic_depth: 0,
             secrets: Box::new(crate::accounts::MemorySecretStore::default()),
             sync: crate::sync::SyncState::default(),
             search: crate::search_index::SearchState::default(),
@@ -665,7 +668,9 @@ impl Session {
                 }
                 let ops = diff_ops(&before, &self.mailbox);
                 if !ops.is_empty() {
-                    self.undo.push(UndoEntry { label: spec.label.to_owned(), before: Box::new(before) });
+                    if self.automatic_depth == 0 {
+                        self.undo.push(UndoEntry { label: spec.label.to_owned(), before: Box::new(before) });
+                    }
                     self.journal(ops);
                 }
             }
@@ -684,6 +689,19 @@ impl Session {
         if let Err(e) = self.save_settings() {
             log::error!("{e}");
         }
+        result
+    }
+
+    /// Runs a command as an automatic action of the session (new mail being processed: automatic meeting
+    /// responses, tracking updates), not as something the user did: like [`Session::run`], but the change
+    /// records no undo step, and the server changes it makes are left to the caller, which queues them with
+    /// its own (it compares the mailbox from before the whole batch).
+    pub fn run_automatic(&mut self, id: &str, params: &Value) -> CmdResult {
+        self.automatic_depth = self.automatic_depth.saturating_add(1);
+        self.run_depth = self.run_depth.saturating_add(1);
+        let result = self.run(id, params);
+        self.run_depth = self.run_depth.saturating_sub(1);
+        self.automatic_depth = self.automatic_depth.saturating_sub(1);
         result
     }
 
@@ -935,5 +953,24 @@ mod tests {
         after.signatures.push(Default::default());
         assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::Replace(_)]));
         assert!(diff_ops(&mb, &mb.clone()).is_empty());
+    }
+
+    #[test]
+    fn automatic_runs_record_no_undo_step() {
+        let mut s = crate::sample::sample_session();
+        let id = s.mailbox.mail.values().find(|m| !m.read).map(|m| m.id).unwrap();
+        s.selection.folder = s.mailbox.mail[&id].folder;
+        s.selection.items = vec![id];
+        s.selection.focus = Some(id);
+        let undo_before = s.undo.undo.len();
+        let ops_before = s.journal_calls;
+        s.run_automatic("mail.markRead", &serde_json::json!({"ids": [id.0]})).unwrap();
+        assert!(s.mailbox.mail[&id].read);
+        assert_eq!(s.undo.undo.len(), undo_before, "not undoable");
+        assert!(s.journal_calls > ops_before, "still journaled");
+        assert_eq!((s.automatic_depth, s.run_depth), (0, 0));
+        // The same command run by the user is one undo step.
+        s.run("mail.markUnread", &serde_json::json!({"ids": [id.0]})).unwrap();
+        assert_eq!(s.undo.undo.len(), undo_before + 1);
     }
 }

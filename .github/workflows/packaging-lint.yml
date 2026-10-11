@@ -5,7 +5,7 @@ name: packaging-lint
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "packaging/**"
       - ".github/**"
@@ -19,13 +19,16 @@ on:
       - "assets/app-icon/**"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   SHELLCHECK_VERSION: "0.10.0"
   ACTIONLINT_VERSION: "1.7.7"
 
 jobs:
   lint:
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: node:22-bookworm
     steps:
@@ -57,7 +60,7 @@ jobs:
             curl -fsSL --retry 3 "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt" | grep " $f\$" | sha256sum -c -
             tar -xzf "$f" -C "$bin" actionlint
           fi
-          echo "$bin" >>"${GITHUB_PATH:-$GITHUB_PATH}"
+          echo "$bin" >>"$GITHUB_PATH"
       - name: ShellCheck
         run: |
           shellcheck --version

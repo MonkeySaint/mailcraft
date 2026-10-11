@@ -297,38 +297,13 @@ impl Defs {
     }
 }
 
-/// Width rules added to the parsed definitions, keyed by (surface, mode, tab, group id): observations of
-/// plan/outlook/responsive.md that the `.ribbon` files do not carry yet.
-///
-/// - Classic, main window, Home: at 1024 "Respond icon-only" — Reply, Reply All and Forward lose their
-///   labels and turn small (the `.ribbon` line only makes them small).
-pub const RULE_OVERRIDES: [(&str, Mode, &str, &str, Rule); 1] = [(
-    "main",
-    Mode::Classic,
-    "Home",
-    "respond",
-    Rule { classic: true, max_width: 1024.0, act: Act::IconOnly },
-)];
-
-/// Parses every source, then applies [`RULE_OVERRIDES`].
+/// Parses every source.
 pub fn parse_all(sources: &[(&str, &str)]) -> Defs {
     let mut d = Defs::default();
     for (file, text) in sources {
         parse_into(&mut d, file, text);
     }
-    apply_overrides(&mut d);
     d
-}
-
-fn apply_overrides(d: &mut Defs) {
-    for (surface, mode, tab, group, rule) in RULE_OVERRIDES {
-        let tabs = d.tabs.iter_mut().filter(|t| t.surface == surface && t.mode == mode && t.name == tab);
-        for g in tabs.flat_map(|t| t.groups.iter_mut()).filter(|g| g.id() == group) {
-            if !g.rules.contains(&rule) {
-                g.rules.push(rule);
-            }
-        }
-    }
 }
 
 enum Block {
@@ -606,7 +581,7 @@ mod tests {
 
     #[test]
     fn classic_respond_goes_icon_only_at_1024() {
-        // responsive.md, Classic 1024: "Respond icon-only".
+        // responsive.md, Classic 1024: "Respond icon-only" (Reply, Reply All and Forward lose their labels).
         let respond = home_classic().groups.iter().find(|g| g.id() == "respond").unwrap();
         let icon_only =
             |w: f32| respond.rules.iter().any(|r| r.classic && w <= r.max_width && r.act == Act::IconOnly);
@@ -620,13 +595,13 @@ mod tests {
     }
 
     #[test]
-    fn overrides_apply_once_and_leave_other_sources_alone() {
+    fn group_rules_come_from_the_source_alone() {
         let src = "mode classic\ntab Home | H\ngroup Respond | ZR | c1024=iconly\nbutton L | Reply | reply | mail.reply | | RP\n";
         let d = parse_all(&[("t.ribbon", src)]);
         let g = d.tabs.first().and_then(|t| t.groups.first()).unwrap();
-        assert_eq!(g.rules.len(), 1, "an existing identical rule is not added twice");
+        assert_eq!(g.rules, [Rule { classic: true, max_width: 1024.0, act: Act::IconOnly }]);
         let other =
-            parse_all(&[("t.ribbon", "surface read\nmode classic\ntab Home | H\ngroup Respond | ZR\n")]);
+            parse_all(&[("t.ribbon", "surface main\nmode classic\ntab Home | H\ngroup Respond | ZR\n")]);
         assert!(other.tabs.first().and_then(|t| t.groups.first()).unwrap().rules.is_empty());
     }
 }

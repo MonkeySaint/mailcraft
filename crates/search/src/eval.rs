@@ -7,7 +7,8 @@ use mailcraft_model::dates::{civil_from_days, days_from_civil, days_in_month, we
 use crate::doc::Doc;
 use crate::fold::fold;
 use crate::query::{
-    AgoUnit, Bound, CategoryMatch, DateField, DatePoint, DateRange, Query, RelDate, Term, Text, field,
+    AgoUnit, Bound, CategoryMatch, DateField, DatePoint, DateRange, EXPIRING_SOON_DAYS, Expiry, Query,
+    RelDate, Term, Text, field,
 };
 use crate::token::words;
 
@@ -129,6 +130,26 @@ impl Context {
     }
 }
 
+impl Context {
+    /// True when an item expiring at `expires` (unix seconds) matches `e`.
+    pub fn expiry_matches(&self, e: &Expiry, expires: Option<i64>) -> bool {
+        match (e, expires) {
+            (Expiry::Any, x) => x.is_some(),
+            (Expiry::Never, x) => x.is_none(),
+            (_, None) => false,
+            (Expiry::Past, Some(x)) => x <= self.now,
+            (Expiry::Soon, Some(x)) => {
+                x > self.now && self.day_of(x) <= self.today().saturating_add(EXPIRING_SOON_DAYS)
+            }
+            (Expiry::Range(r), Some(x)) => {
+                let (lo, hi) = self.day_bounds(r);
+                let day = self.day_of(x);
+                day >= lo && day <= hi
+            }
+        }
+    }
+}
+
 /// True when `word` (query) matches `token` (indexed).
 pub(crate) fn word_matches(word: &str, token: &str, prefix: bool) -> bool {
     if prefix { token.starts_with(word) } else { token == word }
@@ -208,7 +229,8 @@ fn term_matches(t: &Term, doc: &Doc, ctx: &Context) -> bool {
         }
         Term::Size(s) => s.contains(doc.size),
         Term::Kind(k) => doc.kind == *k,
-        Term::Expires(_) | Term::Invalid(..) => false,
+        Term::Expires(v) => Expiry::parse(v).is_some_and(|e| ctx.expiry_matches(&e, doc.expires)),
+        Term::Invalid(..) => false,
     }
 }
 
@@ -347,6 +369,49 @@ mod tests {
         ] {
             assert!(!matches(&parse(q), &d, &c), "{q} should not match");
         }
+    }
+
+    #[test]
+    fn expiry_dates() {
+        let c = ctx();
+        let at = |days: i64| Doc { expires: Some(NOW + days * DAY_SECS), ..doc() };
+        let none = doc();
+        let m = |q: &str, d: &Doc| matches(&parse(q), d, &c);
+        // Expiring Soon: later today up to a week from today; not what has expired or is far off.
+        let later_today = Doc { expires: Some(NOW + 3600), ..doc() };
+        assert!(m("expires:soon", &later_today) && m("expires:soon", &at(7)) && m("EXPIRES:Soon", &at(3)));
+        assert!(!m("expires:soon", &at(0)), "expires right now: expired");
+        assert!(!m("expires:soon", &at(8)) && !m("expires:soon", &at(-1)) && !m("expires:soon", &none));
+        assert!(m("expires:expired", &at(-1)) && !m("expires:expired", &at(1)) && !m("expires:past", &none));
+        assert!(m("expires:yes", &at(30)) && !m("expires:yes", &none));
+        assert!(m("expires:no", &none) && !m("expires:no", &at(30)));
+        assert!(m("expires:2026-10-12", &at(3)) && !m("expires:2026-10-12", &at(4)));
+        assert!(m("expires:<2026-10-09", &at(-2)) && !m("expires:<2026-10-09", &none));
+        assert!(!m("expires:maybe", &at(1)) && !m("-expires:yes", &at(1)) && m("-expires:yes", &none));
+    }
+
+    #[test]
+    fn expiry_header() {
+        use crate::doc::expiry_of;
+        assert_eq!(expiry_of(b"Expiry-Date: Fri, 9 Oct 2026 12:00:00 +0000\r\n\r\n"), Some(NOW));
+        assert_eq!(
+            expiry_of(b"Subject: x\r\nExpires:\r\n Fri, 9 Oct 2026 12:00:00 +0000\r\nX: y\r\n\r\n"),
+            Some(NOW)
+        );
+        assert_eq!(
+            expiry_of(b"Subject: x\r\n\r\nExpires: Fri, 9 Oct 2026 12:00:00 +0000\r\n"),
+            None,
+            "body ignored"
+        );
+        assert_eq!(expiry_of(b"Expires: soon\r\n\r\n"), None);
+        assert_eq!(expiry_of(&[0xff, 0xfe, b':', b'\n']), None);
+        assert_eq!(expiry_of(b""), None);
+        let m = mailcraft_model::MailItem {
+            raw: Some(b"Expires: Fri, 9 Oct 2026 12:00:00 +0000\r\n\r\nHi".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(Doc::from_mail(&m).expires, Some(NOW));
+        assert_eq!(Doc::from_mail(&mailcraft_model::MailItem::default()).expires, None);
     }
 
     #[test]

@@ -356,27 +356,10 @@ pub(crate) fn persona_fill(idx: u8) -> Color32 {
 pub(crate) const GAP: f32 = 6.0;
 pub(crate) const RADIUS: u8 = 6;
 
-/// Splits the module area into the folder pane (Normal only) and the content, without drawing; the
-/// calendar uses it. People, Tasks and Notes use [`module_folder_pane`], which draws the minimised strip.
-pub(crate) fn split_folder_pane(ui: &Ui, app: &App) -> (Option<Rect>, Rect) {
-    let full = ui.max_rect();
-    let window_w = ui.ctx().content_rect().width();
-    let show = app.s.view.folder_pane == FolderPaneState::Normal
-        && !app.s.view.reading_view
-        && window_w > size::AUTO_MINIMIZE_W
-        && full.width() > size::FOLDER_PANE + 200.0;
-    if !show {
-        return (None, full);
-    }
-    let pane = Rect::from_min_size(full.min, vec2(size::FOLDER_PANE, full.height()));
-    let main = Rect::from_min_max(pos2(pane.max.x + GAP, full.min.y), full.max);
-    (Some(pane), main)
-}
-
 /// Width of the slim bar above a module's folder pane (with its « button).
 const PANE_BAR: f32 = 26.0;
 
-/// The folder pane of a module view (People, Tasks, Notes), following View › Folder Pane:
+/// The folder pane of a module view (Calendar, People, Tasks, Notes), following View › Folder Pane:
 /// - Normal: the pane on the left (its rect is returned below a slim bar whose « button minimises it);
 /// - Minimized — chosen, or automatic in narrow windows (≤ 800 wide) and Reading view — a strip with the
 ///   current folder's name written downwards and a » button: the button restores Normal (or, when the
@@ -500,19 +483,9 @@ fn picture_key(pic: &mailcraft_model::contact::ContactPicture) -> u64 {
     h
 }
 
-/// Decodes a PNG picture (bounded size) into an image.
+/// Decodes a contact picture (PNG, JPEG or GIF, bounded size) into an image.
 pub(crate) fn decode_picture(pic: &mailcraft_model::contact::ContactPicture) -> Option<egui::ColorImage> {
-    if pic.mime != "image/png" {
-        return None;
-    }
-    let (w, h) = pic.dimensions()?;
-    let limit = mailcraft_engine::cmd::people::MAX_PICTURE_SIDE;
-    if w == 0 || h == 0 || w > limit || h > limit {
-        return None;
-    }
-    let pix = resvg::tiny_skia::Pixmap::decode_png(&pic.data).ok()?;
-    let size = [usize::try_from(pix.width()).ok()?, usize::try_from(pix.height()).ok()?];
-    Some(egui::ColorImage::from_rgba_premultiplied(size, pix.data()))
+    crate::body::decode_contact_picture(pic)
 }
 
 /// The texture of a contact's picture, decoded once per picture and kept in egui memory.
@@ -930,6 +903,7 @@ mod tests {
         let view: fn(&mut Ui, &mut App) = match module {
             "nav.tasks" => crate::modules::tasks,
             "nav.notes" => crate::modules::notes,
+            "nav.calendar" => crate::modules::calendar,
             _ => crate::modules::people,
         };
         let mut h = egui_kittest::Harness::builder()
@@ -955,9 +929,12 @@ mod tests {
 
     #[test]
     fn minimized_folder_pane_is_a_strip_in_modules() {
-        for (module, group) in
-            [("nav.people", "My Contacts"), ("nav.tasks", "My Tasks"), ("nav.notes", "My Notes")]
-        {
+        for (module, group) in [
+            ("nav.calendar", "My Calendars"),
+            ("nav.people", "My Contacts"),
+            ("nav.tasks", "My Tasks"),
+            ("nav.notes", "My Notes"),
+        ] {
             let mut h = folder_pane_harness(module, "minimized", 1400.0);
             assert!(labelled(&h, "Expand the Folder Pane"), "{module}: strip shown");
             assert!(!labelled(&h, group), "{module}: pane hidden");

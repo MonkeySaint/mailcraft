@@ -2,18 +2,20 @@
 //!
 //! [`due`] scans the mailbox for reminders that are due now: appointment occurrences (calendar folders,
 //! `reminder_min` before the start, until the occurrence ends; a recurring series shows its first due
-//! occurrence), open tasks with a reminder time, and flagged mail with a reminder time. The UI polls it once a
-//! minute and opens the Reminders window when a reminder it has not shown yet comes due.
+//! occurrence), open tasks with a reminder time, and flagged mail and contacts with a reminder time
+//! (contacts through [`crate::cmd::people::due_reminders`]). The UI polls it once a minute and opens the
+//! Reminders window when a reminder it has not shown yet comes due.
 //!
 //! **State.** The session has no reminder fields (its interface is frozen), so — like the calendar view
 //! state — what can't be kept on the items lives in a [`ReminderState`] that the caller holds and passes to
 //! the `calendar.*Reminder*` commands as `{"state": {...}}` (they return the new state). Dismissing keeps what
 //! it can on the item itself, so it survives a restart: a one-off appointment loses its reminder
-//! (`reminder_min = None`), a task or flagged message loses its reminder time. Dismissing one occurrence of a
-//! recurring series is recorded in the state. Snoozing a task or message moves its reminder time; snoozing an
-//! appointment is recorded in the state.
+//! (`reminder_min = None`), a task, flagged message or flagged contact loses its reminder time. Dismissing
+//! one occurrence of a recurring series is recorded in the state. Snoozing a task, message or contact moves
+//! its reminder time; snoozing an appointment is recorded in the state.
 //!
-//! Keys identify a reminder: `appointment:<id>:<occurrence start, unix>`, `task:<id>`, `mail:<id>`.
+//! Keys identify a reminder: `appointment:<id>:<occurrence start, unix>`, `task:<id>`, `mail:<id>`,
+//! `contact:<id>`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,7 +45,10 @@ const MAX_OCCURRENCES: usize = 64;
 pub enum ReminderKind {
     Appointment,
     Task,
+    /// A follow-up flag's reminder on a message (key `mail:<id>`).
     Mail,
+    /// A follow-up flag's reminder on a contact (key `contact:<id>`).
+    Contact,
 }
 
 /// One due reminder.
@@ -102,6 +107,7 @@ pub enum Key {
     Appointment(ItemId, i64),
     Task(ItemId),
     Mail(ItemId),
+    Contact(ItemId),
 }
 
 impl Key {
@@ -113,6 +119,7 @@ impl Key {
             "appointment" => Key::Appointment(id, parts.next()?.trim().parse().ok()?),
             "task" => Key::Task(id),
             "mail" => Key::Mail(id),
+            "contact" => Key::Contact(id),
             _ => return None,
         };
         if parts.next().is_some() { None } else { Some(key) }
@@ -123,12 +130,13 @@ impl Key {
             Key::Appointment(id, at) => format!("appointment:{}:{at}", id.0),
             Key::Task(id) => format!("task:{}", id.0),
             Key::Mail(id) => format!("mail:{}", id.0),
+            Key::Contact(id) => format!("contact:{}", id.0),
         }
     }
 
     pub fn item(self) -> ItemId {
         match self {
-            Key::Appointment(id, _) | Key::Task(id) | Key::Mail(id) => id,
+            Key::Appointment(id, _) | Key::Task(id) | Key::Mail(id) | Key::Contact(id) => id,
         }
     }
 }
@@ -143,8 +151,8 @@ fn in_deleted(mb: &Mailbox, folder: mailcraft_model::FolderId) -> bool {
         .is_some_and(|d| mb.is_in_subtree(folder, d))
 }
 
-/// Reminders due at `s.now()` that `st` does not hide, soonest first (appointments by start, then tasks and
-/// mail by reminder time).
+/// Reminders due at `s.now()` that `st` does not hide, soonest first (appointments by start, then tasks, mail
+/// and contacts by due date and reminder time).
 pub fn due(s: &Session, st: &ReminderState) -> Vec<Reminder> {
     let now = s.now();
     let mb = &s.mailbox;
@@ -228,6 +236,24 @@ pub fn due(s: &Session, st: &ReminderState) -> Vec<Reminder> {
             recurring: false,
         });
     }
+    for c in crate::cmd::people::due_reminders(s, now.unix) {
+        let key = Key::Contact(ItemId(c.contact)).text();
+        if st.hidden(&key, now.unix) {
+            continue;
+        }
+        out.push(Reminder {
+            key,
+            kind: ReminderKind::Contact,
+            item: c.contact,
+            subject: c.subject,
+            location: String::new(),
+            remind_at: c.remind_at,
+            due: c.due,
+            end: None,
+            all_day: false,
+            recurring: false,
+        });
+    }
     out.sort_by_key(|r| {
         (r.kind != ReminderKind::Appointment, r.due.unwrap_or(r.remind_at), r.remind_at, r.item)
     });
@@ -261,6 +287,9 @@ pub fn next_due_after(s: &Session, st: &ReminderState, horizon_secs: i64) -> Opt
         if let FlagState::Flagged { reminder: Some(r), .. } = &m.flag {
             consider(r.unix);
         }
+    }
+    if let Some(t) = crate::cmd::people::next_reminder_after(s, now, limit) {
+        consider(t);
     }
     let from = s.now();
     for a in mb.appointments.values() {
@@ -342,6 +371,7 @@ pub fn dismiss(s: &mut Session, st: &mut ReminderState, keys: &[String]) -> usiz
                 },
                 None => false,
             },
+            Key::Contact(id) => crate::cmd::people::dismiss_reminder(s, id),
         };
         if done {
             st.snoozed.remove(&key.text());
@@ -385,6 +415,7 @@ pub fn snooze(s: &mut Session, st: &mut ReminderState, keys: &[String], minutes:
                 },
                 None => false,
             },
+            Key::Contact(id) => crate::cmd::people::snooze_reminder(s, id, until),
         };
         if done {
             n = n.saturating_add(1);
@@ -500,6 +531,9 @@ pub fn run_open(s: &mut Session, p: &Value) -> CmdResult {
         Key::Mail(id) if s.mailbox.mail.contains_key(&id) => {
             pim::dialog(s, "readWindow", json!({ "id": id.0 }))
         }
+        Key::Contact(id) if s.mailbox.contacts.contains_key(&id) => {
+            pim::dialog(s, "contact", json!({ "id": id.0 }))
+        }
         _ => Err(CmdError::Params("the item no longer exists".into())),
     }
 }
@@ -532,10 +566,20 @@ mod tests {
 
     #[test]
     fn keys_round_trip_and_reject_junk() {
-        for k in ["appointment:7:1760000000", "task:3", "mail:12"] {
+        for k in ["appointment:7:1760000000", "task:3", "mail:12", "contact:4"] {
             assert_eq!(Key::parse(k).unwrap().text(), k);
         }
-        for k in ["", "task", "task:x", "appointment:1", "mail:1:2", "note:1", "task:1:"] {
+        for k in [
+            "",
+            "task",
+            "task:x",
+            "appointment:1",
+            "mail:1:2",
+            "note:1",
+            "task:1:",
+            "contact:",
+            "contact:1:2",
+        ] {
             assert!(Key::parse(k).is_none(), "{k}");
         }
     }
@@ -652,6 +696,48 @@ mod tests {
         // Completed tasks never remind.
         s.run("tasks.update", &json!({ "id": t, "reminder": reminder, "complete": true })).unwrap();
         assert!(due(&s, &st).is_empty());
+    }
+
+    #[test]
+    fn contact_reminders_come_due_snooze_and_dismiss() {
+        let mut s = session(); // 10:07
+        let c = s.run("people.new", &json!({"fullName": "Ann Lee"})).unwrap()["id"].as_u64().unwrap();
+        s.selection = crate::Selection {
+            folder: role(&s, FolderRole::Contacts),
+            items: vec![ItemId(c)],
+            focus: Some(ItemId(c)),
+        };
+        // Comes due at 10:30: the scan wakes up then.
+        s.run("people.flag", &json!({"kind": "reminder", "reminder": "2026-10-09T10:30", "label": "Call"}))
+            .unwrap();
+        let st = ReminderState::default();
+        assert!(due(&s, &st).is_empty());
+        assert_eq!(next_due_after(&s, &st, 3600), Some(at(&s, 23).unix - at(&s, 23).unix % 60));
+        s.fixed_now = Some(at(&s, 25));
+        let d = due(&s, &st);
+        assert_eq!(d.len(), 1);
+        let key = format!("contact:{c}");
+        assert_eq!(
+            (d[0].key.as_str(), d[0].kind, d[0].subject.as_str()),
+            (key.as_str(), ReminderKind::Contact, "Ann Lee")
+        );
+        // Snooze moves the contact's reminder; dismiss keeps the flag without it.
+        let r = s.run("calendar.snoozeReminder", &json!({"keys": [key], "minutes": 10})).unwrap();
+        assert_eq!(r["snoozed"], 1);
+        assert!(due(&s, &st).is_empty());
+        s.fixed_now = Some(at(&s, 10));
+        assert_eq!(due(&s, &st).len(), 1);
+        let r = s.run("calendar.dismissReminder", &json!({"keys": [key]})).unwrap();
+        assert_eq!(r["dismissed"], 1);
+        assert!(matches!(s.mailbox.contacts[&ItemId(c)].flag, FlagState::Flagged { reminder: None, .. }));
+        assert!(due(&s, &st).is_empty());
+        // Opening it opens the contact; a contact that is gone is an error.
+        assert_eq!(s.run("calendar.openReminderItem", &json!({"key": key})).unwrap()["dialog"], "contact");
+        assert!(s.run("calendar.openReminderItem", &json!({"key": "contact:999999"})).is_err());
+        assert_eq!(
+            s.run("calendar.dismissReminder", &json!({"keys": ["contact:999999"]})).unwrap()["dismissed"],
+            0
+        );
     }
 
     #[test]

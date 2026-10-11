@@ -14,7 +14,7 @@
 //! The contact window has three pages: General (name, company, addresses, phones, picture, notes — with
 //! the business card), Details (office, profession, manager, assistant, nickname, spouse/partner,
 //! anniversary) and All Fields (every field with a value, read-only). Add Picture takes a PNG, JPEG or GIF
-//! file; the cards show PNG pictures.
+//! file; the cards show it.
 //!
 //! The task window also sets the task's recurrence (a pattern, or "regenerate N days after completion") and
 //! Private, and Assign Task turns it into a task request. The module dialogs (move/copy, categories,
@@ -30,6 +30,7 @@ use egui::{
 };
 use serde_json::{Value, json};
 
+use mailcraft_engine::cmd::app::CLOSE_ITEM_WINDOWS;
 use mailcraft_engine::cmd::calendar::pim::Kind;
 use mailcraft_engine::cmd::calendar::{CalendarMode, recurrence::pattern_text};
 use mailcraft_engine::cmd::people::{
@@ -41,7 +42,7 @@ use mailcraft_model::{BusyStatus, Contact, FolderId, ItemId, NoteColor, TaskPrio
 
 use super::common::{
     DAY, ModState, clock, current_folder, day_string, day_time_string, load, local_secs, note_fill,
-    parse_day, parse_day_time, persona_fill, run_checked, select_item, store, today, tz, weekday,
+    parse_day, persona_fill, run_checked, select_item, store, today, tz, weekday,
 };
 use super::recurrence::{Outcome, RecurrenceDialog};
 use super::{HANDLED_DIALOGS, calendar_view};
@@ -596,25 +597,12 @@ fn open_from_dialog(app: &mut App, st: &mut ModState, name: &str, p: &Value) {
     let folder = p.get("folder").and_then(Value::as_u64).map(FolderId);
     let id = p.get("id").and_then(Value::as_u64).map(ItemId);
     match name {
+        // A new appointment or meeting asked for from any module (People › Meeting, Tasks › Meeting, Mail ›
+        // Reply with Meeting, New Items…): the full appointment window, prefilled from the request.
+        _ if calendar_view::forms::is_form(name, p) => calendar_view::forms::open(app, st, name, p),
         "appointment" => {
             if let Some(id) = id {
                 open_appointment(app, st, id);
-                return;
-            }
-            let now = today(app);
-            let start =
-                p.get("start").and_then(Value::as_str).and_then(parse_day_time).unwrap_or((now, 9 * 60));
-            let end = p
-                .get("end")
-                .and_then(Value::as_str)
-                .and_then(parse_day_time)
-                .unwrap_or((start.0, start.1 + 30));
-            let dur = (end.0 - start.0) * 24 * 60 + end.1 - start.1;
-            new_appointment(app, st, folder, start.0, start.1, dur.max(0), false);
-            if let Some(ed) = st.editors.appt.as_mut()
-                && let Some(r) = p.get("reminderMin")
-            {
-                ed.reminder = r.as_u64().and_then(|m| u32::try_from(m).ok());
             }
         }
         "contact" | "contactGroup" => {
@@ -680,9 +668,14 @@ pub(crate) fn show(ctx: &egui::Context, app: &mut App) {
         return;
     }
     st.windows_pass = Some(pass);
+    // Close All Items (`app.closeAllItems`): the item windows here close with the read windows; the request
+    // stays for the dialogs area, which closes those.
+    if app.ui.dialogs.iter().any(|(name, _)| name == CLOSE_ITEM_WINDOWS) {
+        close_item_windows(&mut st);
+    }
     let mut i = 0;
     while let Some((name, params)) = app.ui.dialogs.get(i).cloned() {
-        if HANDLED_DIALOGS.contains(&name.as_str()) {
+        if HANDLED_DIALOGS.contains(&name.as_str()) || calendar_view::forms::is_form(&name, &params) {
             app.ui.dialogs.remove(i);
             open_from_dialog(app, &mut st, &name, &params);
         } else if dialogs::HANDLED.contains(&name.as_str()) {
@@ -700,6 +693,16 @@ pub(crate) fn show(ctx: &egui::Context, app: &mut App) {
     go_to_window(ctx, app, &mut st);
     dialogs::show(ctx, app, &mut st);
     store(ctx, st);
+}
+
+/// Closes the item windows (appointment, contact, task and note editors, and the recurring-item prompt) for
+/// Close All Items. Unsaved edits in them are dropped, as the engine closes read and item windows right away.
+pub(crate) fn close_item_windows(st: &mut ModState) {
+    st.editors.appt = None;
+    st.editors.contact = None;
+    st.editors.task = None;
+    st.editors.note = None;
+    st.editors.occ_prompt = None;
 }
 
 fn window<'a>(title: String, id: (&'static str, u64)) -> egui::Window<'a> {
@@ -1600,9 +1603,7 @@ fn picture_controls(ui: &mut Ui, app: &App, ed: &mut ContactEditor) {
     if let Some(p) = &ed.picture
         && p.mime != "image/png"
     {
-        ui.label(
-            RichText::new("Saved with the contact; the cards show PNG pictures.").color(app.theme.text_muted),
-        );
+        ui.label(RichText::new("Saved with the contact and shown on its cards.").color(app.theme.text_muted));
     }
 }
 
@@ -2812,6 +2813,88 @@ mod tests {
         assert_eq!(st.editors.go_to.as_ref().unwrap().mode, "week");
     }
 
+    /// Moves the session's dialog requests into `app.ui.dialogs` (what the shell does each frame).
+    fn forward_dialogs(app: &mut App) {
+        for n in std::mem::take(&mut app.s.notices) {
+            if let mailcraft_engine::Notice::OpenDialog(name, p) = n {
+                app.ui.dialogs.push((name, p));
+            }
+        }
+    }
+
+    fn draw(ctx: &egui::Context, app: &mut App) {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), app));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn meeting_forms_from_other_modules_are_prefilled() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        // People › Meeting: the full meeting window with the contact as attendee (not the To/Subject form).
+        let c = app.s.run("people.new", &json!({"fullName": "Ann Lee", "email": "ann@example.com"})).unwrap()
+            ["id"]
+            .as_u64()
+            .unwrap();
+        app.s.notices.clear();
+        app.s.run("people.meeting", &json!({"ids": [c]})).unwrap();
+        forward_dialogs(&mut app);
+        draw(&ctx, &mut app);
+        assert!(app.ui.dialogs.is_empty(), "the modules area took the request");
+        let ed = load(&ctx).editors.appt.unwrap();
+        assert!(ed.meeting && ed.id.is_none());
+        assert_eq!(ed.attendees, "Ann Lee <ann@example.com>");
+        // Tasks › Meeting: the task's subject.
+        let t = app.s.run("tasks.new", &json!({"subject": "Budget"})).unwrap()["id"].as_u64().unwrap();
+        app.s.selection.items = vec![ItemId(t)];
+        app.s.selection.focus = Some(ItemId(t));
+        app.s.notices.clear();
+        app.s.run("tasks.meeting", &json!({"ids": [t]})).unwrap();
+        forward_dialogs(&mut app);
+        draw(&ctx, &mut app);
+        let ed = load(&ctx).editors.appt.unwrap();
+        assert_eq!(ed.subject, "Budget");
+        assert!(ed.meeting);
+        // A new appointment form (no id): all day, times and reminder from the request; nothing saved yet.
+        let before = app.s.mailbox.appointments.len();
+        app.ui.dialogs.push((
+            "appointment".into(),
+            json!({"subject": "Dentist", "location": "Clinic", "start": "2026-10-14T15:00",
+                   "end": "2026-10-14T16:30", "reminderMin": 30}),
+        ));
+        draw(&ctx, &mut app);
+        let ed = load(&ctx).editors.appt.unwrap();
+        assert_eq!((ed.subject.as_str(), ed.location.as_str()), ("Dentist", "Clinic"));
+        assert_eq!((ed.start_date.as_str(), ed.start_min, ed.end_min), ("2026-10-14", 15 * 60, 16 * 60 + 30));
+        assert_eq!(ed.reminder, Some(30));
+        assert!(!ed.meeting);
+        assert_eq!(app.s.mailbox.appointments.len(), before);
+        // With an id it opens that appointment.
+        let id = *app.s.mailbox.appointments.keys().next().unwrap();
+        app.ui.dialogs.push(("appointment".into(), json!({"id": id.0})));
+        draw(&ctx, &mut app);
+        assert_eq!(load(&ctx).editors.appt.unwrap().id, Some(id.0));
+    }
+
+    #[test]
+    fn close_all_items_closes_module_item_windows() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.ui.dialogs.push(("task".into(), json!({})));
+        app.ui.dialogs.push(("contact".into(), json!({})));
+        app.ui.dialogs.push(("appointment".into(), json!({"subject": "Lunch"})));
+        draw(&ctx, &mut app);
+        let st = load(&ctx);
+        assert!(st.editors.task.is_some() && st.editors.contact.is_some() && st.editors.appt.is_some());
+        app.s.run("app.closeAllItems", &json!({})).unwrap();
+        forward_dialogs(&mut app);
+        draw(&ctx, &mut app);
+        let st = load(&ctx);
+        assert!(st.editors.task.is_none() && st.editors.contact.is_none() && st.editors.appt.is_none());
+        // The request stays for the dialogs area (it closes the read windows).
+        assert!(app.ui.dialogs.iter().any(|(n, _)| n == CLOSE_ITEM_WINDOWS));
+    }
+
     /// A real 3×2 PNG (red), written by the rasteriser the UI decodes with.
     fn red_png() -> Vec<u8> {
         let mut pix = resvg::tiny_skia::Pixmap::new(3, 2).unwrap();
@@ -2858,9 +2941,15 @@ mod tests {
         assert_eq!(c.nickname, "Nessa");
         assert_eq!(c.anniversary.as_deref(), Some("2019-05-04"));
         assert_eq!(c.picture.as_ref().map(|p| p.data.clone()), Some(red_png()));
-        // The cards decode PNG pictures.
+        // The cards decode PNG pictures, and JPEG ones too.
         let img = super::super::common::decode_picture(c.picture.as_ref().unwrap()).unwrap();
         assert_eq!(img.size, [3, 2]);
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(4, 5, image::Rgb([0, 128, 255]))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg = mailcraft_model::contact::ContactPicture::sniff(jpeg.get_ref()).unwrap();
+        assert_eq!(super::super::common::decode_picture(&jpeg).map(|i| i.size), Some([4, 5]));
         // Reopened: the fields and picture come back; Remove Picture removes it.
         open_contact(&app, &mut st, ItemId(id));
         let mut ed = st.editors.contact.clone().unwrap();

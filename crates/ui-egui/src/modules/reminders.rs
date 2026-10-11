@@ -110,6 +110,7 @@ fn icon_for(kind: ReminderKind) -> &'static str {
         ReminderKind::Appointment => "calendar-reminder",
         ReminderKind::Task => "task",
         ReminderKind::Mail => "flag",
+        ReminderKind::Contact => "person",
     }
 }
 
@@ -313,6 +314,7 @@ mod tests {
         assert_eq!(snooze_label(1440), "1 day");
         assert_eq!(snooze_label(20_160), "2 weeks");
         assert_eq!(icon_for(ReminderKind::Mail), "flag");
+        assert_eq!(icon_for(ReminderKind::Contact), "person");
     }
 
     #[test]

@@ -84,6 +84,132 @@ fn custom_file_as_survives() {
     assert_eq!(back[0].file_as, "Annie");
 }
 
+/// A 2 × 1 PNG (signature and IHDR are all the picture checks need).
+fn png_2x1() -> Vec<u8> {
+    vec![
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 2, 0,
+        0, 0, 1, 8, 6, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef,
+    ]
+}
+
+/// A JPEG header with a 64 × 48 start-of-frame.
+fn jpeg_64x48() -> Vec<u8> {
+    let mut d = vec![0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 11, 8, 0, 48, 0, 64, 3, 0, 0, 0];
+    d.extend(std::iter::repeat_n(0x55, 600));
+    d
+}
+
+fn detailed_contact() -> Contact {
+    let mut c = super::csv::sample_contact();
+    c.nickname = "Annie, A.".into();
+    c.profession = "Engineer; civil".into();
+    c.office = "Building 4, Room 210".into();
+    c.manager = "Rivera, Alice".into();
+    c.assistant = "Bob Stone".into();
+    c.spouse = "Sam Lee".into();
+    c.anniversary = Some("2010-06-19".into());
+    c.picture = mailcraft_model::contact::ContactPicture::sniff(&jpeg_64x48());
+    c
+}
+
+#[test]
+fn details_fields_and_photo_round_trip() {
+    let c = detailed_contact();
+    assert!(c.picture.is_some());
+    for v in [Version::V3, Version::V4] {
+        let text = vcf::write(std::slice::from_ref(&c), v);
+        for line in text.split("\r\n") {
+            assert!(line.len() <= 75, "unfolded line: {line:?}");
+        }
+        let back = vcf::read(text.as_bytes()).unwrap();
+        assert_eq!(back, vec![c.clone()], "version {v:?}:\n{text}");
+    }
+    let v4 = vcf::write(std::slice::from_ref(&c), Version::V4);
+    assert!(v4.contains("\r\nPHOTO:data:image/jpeg;base64,/9j/"), "{v4}");
+    assert!(v4.contains("\r\nNICKNAME:Annie\\, A.\r\n"), "{v4}");
+    assert!(v4.contains("\r\nROLE:Engineer\\; civil\r\n"), "{v4}");
+    assert!(v4.contains("\r\nANNIVERSARY:20100619\r\n"), "{v4}");
+    assert!(v4.contains("\r\nRELATED;VALUE=text;TYPE=spouse:Sam Lee\r\n"), "{v4}");
+    assert!(v4.contains("\r\nX-MAILCRAFT-MANAGER:Rivera\\, Alice\r\n"), "{v4}");
+    let v3 = vcf::write(std::slice::from_ref(&c), Version::V3);
+    assert!(v3.contains("\r\nPHOTO;ENCODING=b;TYPE=JPEG:/9j/"), "{v3}");
+    assert!(v3.contains("\r\nX-ANNIVERSARY:2010-06-19\r\n"), "{v3}");
+    assert!(v3.contains("\r\nX-MAILCRAFT-SPOUSE:Sam Lee\r\n"), "{v3}");
+    // A PNG picture keeps its type.
+    let mut p = c.clone();
+    p.picture = mailcraft_model::contact::ContactPicture::sniff(&png_2x1());
+    for v in [Version::V3, Version::V4] {
+        let back = vcf::read_str(&vcf::write(std::slice::from_ref(&p), v));
+        assert_eq!(back[0].picture, p.picture, "{v:?}");
+    }
+}
+
+#[test]
+fn reads_photos_in_every_encoding() {
+    let b64 = mailcraft_mime::transfer::encode_base64_flat(&png_2x1());
+    let jpeg = mailcraft_mime::transfer::encode_base64_flat(&jpeg_64x48());
+    // vCard 2.1: bare TYPE, ENCODING=BASE64, value folded onto indented lines.
+    let folded: String =
+        jpeg.as_bytes().chunks(60).map(|c| format!("  {}\r\n", String::from_utf8_lossy(c))).collect();
+    let text = format!(
+        "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nPHOTO:data:image/png;base64,{b64}\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:3.0\r\nFN:B\r\nPHOTO;ENCODING=b;TYPE=PNG:{b64}\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:2.1\r\nFN:C\r\nPHOTO;ENCODING=BASE64;JPEG:\r\n{folded}\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:4.0\r\nFN:D\r\nPHOTO:https://example.com/d.png\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:4.0\r\nFN:E\r\nPHOTO:data:image/png;base64,bm90IGFuIGltYWdl\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:4.0\r\nFN:F\r\nPHOTO:data:text/plain;base64,{b64}\r\nEND:VCARD\r\n"
+    );
+    let cs = vcf::read(text.as_bytes()).unwrap();
+    assert_eq!(cs.len(), 6);
+    let mime = |i: usize| cs[i].picture.as_ref().map(|p| p.mime.as_str());
+    assert_eq!(mime(0), Some("image/png"));
+    assert_eq!(cs[0].picture.as_ref().unwrap().data, png_2x1());
+    assert_eq!(mime(1), Some("image/png"));
+    assert_eq!(mime(2), Some("image/jpeg"));
+    assert_eq!(cs[2].picture.as_ref().unwrap().data, jpeg_64x48());
+    assert_eq!(mime(3), None, "remote photos are not fetched");
+    assert_eq!(mime(4), None, "not a picture");
+    assert_eq!(mime(5), None, "not an image type");
+    // Too big a picture (by bytes or by pixels) is dropped.
+    let big = mailcraft_mime::transfer::encode_base64_flat(&vec![
+        0x89;
+        mailcraft_model::contact::MAX_PICTURE_BYTES
+            + 10
+    ]);
+    let mut wide = png_2x1();
+    wide.splice(16..20, [0, 0, 0x20, 0]);
+    let wide = mailcraft_mime::transfer::encode_base64_flat(&wide);
+    for v in [big, wide] {
+        let t = format!("BEGIN:VCARD\nFN:G\nPHOTO;ENCODING=b:{v}\nEND:VCARD\n");
+        assert!(vcf::read_str(&t)[0].picture.is_none());
+    }
+}
+
+#[test]
+fn reads_details_from_other_address_books() {
+    let text = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ann Lee\r\nNICKNAME:Annie\r\nROLE:Surveyor\r\n\
+X-MS-MANAGER:Max Power\r\nX-EVOLUTION-ASSISTANT:Ada\r\nX-KADDRESSBOOK-X-OFFICE:B4\r\n\
+X-EVOLUTION-ANNIVERSARY:2001-02-03\r\nX-MS-SPOUSE:Sam\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Bo Ng\r\nitem1.X-ABRELATEDNAMES:Kim\r\nitem1.X-ABLabel:_$!<Spouse>!$_\r\n\
+item2.X-ABRELATEDNAMES:Pat\r\nitem2.X-ABLabel:_$!<Manager>!$_\r\nitem3.X-ABDATE:1999-09-09\r\n\
+item3.X-ABLabel:_$!<Anniversary>!$_\r\nitem4.X-ABRELATEDNAMES:Lou\r\nitem4.X-ABLabel:_$!<Friend>!$_\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Cy Ho\r\nRELATED;TYPE=spouse:urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6\r\n\
+RELATED;TYPE=friend;VALUE=text:Jo\r\nANNIVERSARY:--0415\r\nEND:VCARD\r\n";
+    let cs = vcf::read(text.as_bytes()).unwrap();
+    let a = &cs[0];
+    assert_eq!((a.nickname.as_str(), a.profession.as_str()), ("Annie", "Surveyor"));
+    assert_eq!((a.manager.as_str(), a.assistant.as_str(), a.office.as_str()), ("Max Power", "Ada", "B4"));
+    assert_eq!((a.spouse.as_str(), a.anniversary.as_deref()), ("Sam", Some("2001-02-03")));
+    assert!(a.job_title.is_empty(), "ROLE is the profession, not the job title");
+    let b = &cs[1];
+    assert_eq!((b.spouse.as_str(), b.manager.as_str()), ("Kim", "Pat"));
+    assert_eq!(b.anniversary.as_deref(), Some("1999-09-09"));
+    assert!(b.assistant.is_empty());
+    let c = &cs[2];
+    assert!(c.spouse.is_empty(), "a URI relation is not a name");
+    assert!(c.anniversary.is_none(), "a date without a year is dropped");
+}
+
 proptest! {
     #[test]
     fn vcf_never_panics(data in proptest::collection::vec(any::<u8>(), 0..1024)) {

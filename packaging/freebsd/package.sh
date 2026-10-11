@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FreeBSD packages, built natively on a FreeBSD machine (self-hosted `freebsd` runner).
+# FreeBSD packages, built natively on a FreeBSD machine (a vmactions/freebsd-vm VM in CI).
 #
 #     packaging/freebsd/package.sh [--build] [--profile release|debug] [--out DIR]
 #

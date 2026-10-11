@@ -16,8 +16,10 @@ rfd.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# HTML on the system clipboard (rich paste into compose).
+# HTML and pictures on the system clipboard (rich paste into compose).
 arboard.workspace = true
+# Encodes clipboard pictures (RGBA) as PNG for the compose editor.
+image.workspace = true
 
 [lints]
 workspace = true

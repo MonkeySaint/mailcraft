@@ -98,7 +98,7 @@ button L | Delete | delete | mail.delete | | D
 button L | Archive... | archive | mail.archive | | O1
 group Report | Z1 | c1024=collapse
 split L | Report | junk | mail.report | {"kind":"junk"} | R1 | menu=report
-group Respond | ZR | c1024=small
+group Respond | ZR | c1024=iconly
 button L | Reply | reply | mail.reply | | RP
 button L | Reply All | reply-all | mail.replyAll | | RA
 button L | Forward | forward | mail.forward | | FW
@@ -150,7 +150,7 @@ button S | Delete Folder | delete | folder.delete | | DF
 group Clean Up | ZC
 button L | Mark All as Read | read | folder.markAllRead | | MA
 button L | Run Rules Now... | rules | folder.runRulesNow | | RR
-toggle L | Show All Folders A to Z | sort | folder.showAllAZ | {"on":"$!on"} | H | on=mem:allaz
+toggle L | Show All Folders A to Z | sort | folder.showAllAZ | {"on":"$!on"} | H | on=allaz
 drop S | Clean Up Folder | clean-up | | | CU | menu=cleanUpFolder
 button S | Delete All | delete | folder.deleteAll | | DA
 button S | Recover Deleted Items... | undo | folder.recoverDeleted | | RD
@@ -379,7 +379,7 @@ item | Download Full Items | | sendReceive.preferences | {"mode":"full"} | F
 item | Download Headers and Then Full Items | | sendReceive.preferences | {"mode":"headersThenFull"} | D
 item | Download Headers | | sendReceive.preferences | {"mode":"headers"} | H
 sep
-item | On Slow Connections Download Only Headers | | sendReceive.preferences | {"slowHeadersOnly":true} | S
+item | On Slow Connections Download Only Headers | | sendReceive.preferences | {"slowHeadersOnly":"toggle"} | S
 
 menu moreSendReceive
 item | Download Headers | envelope-open | sendReceive.downloadHeaders | | H
@@ -392,6 +392,7 @@ menu changeView
 item | Compact | view | view.changeView | {"name":"Compact"} | C | on=layout:compact
 item | Single | view | view.changeView | {"name":"Single"} | S | on=layout:single
 item | Preview | view | view.changeView | {"name":"Preview"} | P | on=layout:preview
+dyn | views:mail | view.changeView | {"name":"$name"}
 sep
 item | Manage Views... | settings | view.manageViews | | M
 item | Save Current View As a New View... | save | view.saveViewAs | | S

@@ -179,9 +179,10 @@ fn bold_shortcut_in_body_runs_format_bold() {
 
 #[test]
 fn tiny_windows_hide_the_ribbon() {
-    assert!(is_tiny(300.0, 200.0));
-    assert!(!is_tiny(500.0, 400.0));
-    assert!(!is_tiny(DEFAULT_SIZE[0], DEFAULT_SIZE[1]));
+    use crate::responsive::inspector_tiny;
+    assert!(inspector_tiny(300.0, 200.0));
+    assert!(!inspector_tiny(500.0, 400.0));
+    assert!(!inspector_tiny(DEFAULT_SIZE[0], DEFAULT_SIZE[1]));
     assert_eq!(size_text(10), "1 KB");
     assert_eq!(size_text(3 * 1024 * 1024), "3.0 MB");
 }
@@ -1156,4 +1157,74 @@ fn insert_3d_model_and_gallery_filter_open_their_windows() {
     h.run();
     assert!(compose(&h, cid).list_at_caret().is_some());
     assert!(h.state().ui.dialogs.is_empty());
+}
+
+#[test]
+fn auto_save_timer_ticks_while_a_compose_has_changes() {
+    let (mut app, cid) = app_with_compose(false);
+    let now = app.s.now();
+    app.s.fixed_now = Some(now);
+    app.run("options.set", json!({"key": "mail.save.autoSave", "value": true}));
+    app.run("options.set", json!({"key": "mail.save.autoSaveMinutes", "value": 1}));
+    let ctx = egui::Context::default();
+    // Nothing unsaved: no tick.
+    assert!(!auto_save_timer(&ctx, &mut app, 0.0));
+    app.run("compose.insertText", json!({"compose": cid, "text": "Draft text"}));
+    assert!(app.s.composes[&cid].dirty);
+    // The period starts when the changes are first seen; the tick runs once it has passed.
+    assert!(!auto_save_timer(&ctx, &mut app, 1.0));
+    assert!(!auto_save_timer(&ctx, &mut app, 10.0));
+    assert!(auto_save_timer(&ctx, &mut app, 1.0 + AUTO_SAVE_CHECK_SECS));
+    // The engine waits for the auto-save minutes: nothing saved yet.
+    assert!(app.s.composes[&cid].dirty && app.s.composes[&cid].draft.is_none());
+    app.s.fixed_now = Some(DateTime { unix: now.unix + 61, offset_min: now.offset_min });
+    assert!(!auto_save_timer(&ctx, &mut app, 20.0), "one tick per period");
+    assert!(auto_save_timer(&ctx, &mut app, 1.0 + 2.0 * AUTO_SAVE_CHECK_SECS));
+    let c = &app.s.composes[&cid];
+    assert!(!c.dirty && c.draft.is_some(), "saved without anyone typing");
+    // Saved: the timer stops until the next change.
+    assert!(!auto_save_timer(&ctx, &mut app, 100.0));
+    // A clock that went backwards restarts the period instead of ticking.
+    app.run("compose.insertText", json!({"compose": cid, "text": "!"}));
+    assert!(!auto_save_timer(&ctx, &mut app, 200.0));
+    assert!(!auto_save_timer(&ctx, &mut app, 5.0));
+    // The window draws the timer every frame.
+    let mut h = window_harness(app);
+    h.run();
+    assert!(h.ctx.data(|d| d.get_temp::<f64>(egui::Id::new("mailcraft-compose-autosave"))).is_some());
+}
+
+#[test]
+fn paste_defaults_follow_where_the_text_was_copied() {
+    let (mut h, cid) = typed_body("Rich bold paste");
+    // Nothing copied in a message yet: from another program.
+    assert_eq!(super::editor::paste_origin(&h.ctx, cid, "Rich bold paste"), "otherProgram");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run();
+    push(&mut h, Event::Copy);
+    h.run();
+    assert_eq!(super::editor::paste_origin(&h.ctx, cid, "Rich bold paste"), "sameMessage");
+    assert_eq!(super::editor::paste_origin(&h.ctx, cid, "Rich bold paste\r\n"), "otherProgram");
+    assert_eq!(super::editor::paste_origin(&h.ctx, cid + 1, "Rich bold paste"), "otherMessage");
+    // "Pasting within the same message: Keep Text Only" drops the clipboard's formatting.
+    h.state_mut().run("options.set", json!({"key": "mail.editor.pasteWithinMessage", "value": "textOnly"}));
+    h.key_press(egui::Key::End);
+    h.run();
+    set_clipboard_hooks(ClipboardHooks {
+        read_html: Some(clipboard_html_fixture),
+        ..ClipboardHooks::default()
+    });
+    push(&mut h, Event::Paste("Rich bold paste".into()));
+    h.run();
+    h.run();
+    set_clipboard_hooks(ClipboardHooks::default());
+    let c = compose(&h, cid);
+    assert_eq!(c.body.to_plain_text().matches("Rich bold paste").count(), 2, "{}", c.body.to_plain_text());
+    let bold = c.body.blocks.iter().any(|b| match b {
+        mailcraft_model::Block::Paragraph { inlines, .. } => inlines
+            .iter()
+            .any(|i| matches!(i, mailcraft_model::Inline::Text { style, .. } if style.bold == Some(true))),
+        _ => false,
+    });
+    assert!(!bold, "kept text only: {:?}", c.body);
 }

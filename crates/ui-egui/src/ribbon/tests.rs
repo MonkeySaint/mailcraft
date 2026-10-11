@@ -708,3 +708,153 @@ fn module_view_galleries_and_calendar_view_commands() {
     state::run(&ctx, &mut app, Surface::Main, &mut mem, &act);
     assert_eq!(app.ui.calendar_view, "day");
 }
+
+/// Labels and actions of a menu as it would be drawn.
+fn menu_entries(app: &App, surface: Surface, menu: &str) -> Vec<(String, state::Action, Option<[u8; 3]>)> {
+    let items = defs().menu(menu).unwrap();
+    state::expand_items(app, surface, &state::Mem::default(), items)
+        .into_iter()
+        .filter_map(|r| match r {
+            state::Resolved::Cmd { label, action, swatch, .. } => Some((label, action, swatch)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn run_entry(app: &mut App, surface: Surface, menu: &str, label: &str) {
+    let (_, act, _) = menu_entries(app, surface, menu).into_iter().find(|(l, ..)| l == label).unwrap();
+    let ctx = egui::Context::default();
+    state::run(&ctx, app, surface, &mut state::Mem::default(), &act);
+}
+
+#[test]
+fn change_view_lists_saved_mail_views() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    assert!(state::dyn_items(&app, Surface::Main, "views:mail").is_empty());
+    app.run("view.saveViewAs", serde_json::json!({"name": "Mine", "confirm": true})).unwrap();
+    let views = state::dyn_items(&app, Surface::Main, "views:mail");
+    assert_eq!(views.iter().map(|d| d.label.as_str()).collect::<Vec<_>>(), ["Mine"]);
+    // Pick Compact, then the saved view from the Change View menu: the folder shows it again.
+    run_entry(&mut app, Surface::Main, "changeView", "Compact");
+    let folder = app.s.selection.folder;
+    let name = mailcraft_engine::cmd::view::mail::current_view_name;
+    assert_eq!(name(&app.s, folder), "Compact");
+    run_entry(&mut app, Surface::Main, "changeView", "Mine");
+    assert_eq!(name(&app.s, folder), "Mine");
+    assert!(state::dyn_items(&app, Surface::Main, "views:mail").first().unwrap().on);
+}
+
+#[test]
+fn theme_colour_swatches_follow_the_compose_theme() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let cid = app.run("mail.newEmail", serde_json::Value::Null).and_then(|v| v["compose"].as_u64()).unwrap();
+    let s = Surface::Compose(cid);
+    let base = menu_entries(&app, s, "fontColor");
+    let accent = |entries: &[(String, state::Action, Option<[u8; 3]>)]| {
+        entries.iter().find(|(l, ..)| l == "Dark Teal, Accent 1").cloned().unwrap()
+    };
+    let (_, act, before) = accent(&base);
+    assert_eq!(act.params, serde_json::json!({"theme": "accent1", "tint": 0}));
+    let shades = menu_entries(&app, s, "fontColorShades5");
+    assert_eq!(shades.len(), 5);
+    assert_eq!(shades[3].0, "Dark Teal, Accent 1, Darker 25%");
+    assert_eq!(shades[3].1.params, serde_json::json!({"theme": "accent1", "tint": -25}));
+    assert_eq!(menu_entries(&app, s, "shadingShades5")[0].1.cmd, "format.shading");
+    app.run("compose.theme", serde_json::json!({"compose": cid, "part": "colors", "name": "Grayscale"}))
+        .unwrap();
+    let (_, _, after) = accent(&menu_entries(&app, s, "fontColor"));
+    assert_ne!(before, after, "the swatch shows the new theme's Accent 1");
+    let c = app.s.composes.get(&cid).unwrap();
+    let want = mailcraft_engine::cmd::format::theme_color(c, "accent1", 0).unwrap();
+    assert_eq!(after, Some([want.r, want.g, want.b]));
+}
+
+#[test]
+fn high_contrast_only_hides_low_contrast_pens() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let cid = app.run("mail.newEmail", serde_json::Value::Null).and_then(|v| v["compose"].as_u64()).unwrap();
+    let s = Surface::Compose(cid);
+    let pens = |app: &App| -> Vec<String> {
+        menu_entries(app, s, "highlight")
+            .into_iter()
+            .filter(|(_, a, sw)| a.cmd == "format.highlight" && sw.is_some())
+            .map(|(l, ..)| l)
+            .collect()
+    };
+    let all = pens(&app);
+    assert_eq!(all.len(), 15);
+    run_entry(&mut app, s, "highlight", "High-contrast only");
+    assert!(app.s.composes.get(&cid).unwrap().editor.high_contrast_only);
+    let shown = pens(&app);
+    assert!(!shown.is_empty() && shown.len() < all.len(), "{shown:?}");
+    // Every pen still offered is accepted by the engine.
+    for label in &shown {
+        let (_, act, _) = menu_entries(&app, s, "highlight").into_iter().find(|(l, ..)| l == label).unwrap();
+        let params = state::with_context(&app, s, &act.cmd, act.params.clone());
+        assert!(app.s.run(&act.cmd, &params).is_ok(), "{label}");
+    }
+    run_entry(&mut app, s, "highlight", "High-contrast only");
+    assert_eq!(pens(&app), all);
+}
+
+#[test]
+fn styles_gallery_lists_created_styles() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let cid = app.run("mail.newEmail", serde_json::Value::Null).and_then(|v| v["compose"].as_u64()).unwrap();
+    let s = Surface::Compose(cid);
+    let before = state::dyn_items(&app, s, "styles").len();
+    app.run("format.style", serde_json::json!({"compose": cid, "name": "Callout", "action": "create"}))
+        .unwrap();
+    let styles = state::dyn_items(&app, s, "styles");
+    assert_eq!(styles.len(), before + 1);
+    assert_eq!(styles.last().unwrap().label, "Callout");
+    assert!(
+        menu_entries(&app, s, "styles")
+            .iter()
+            .any(|(l, a, _)| l == "Callout" && a.params == serde_json::json!({"name": "Callout"}))
+    );
+}
+
+#[test]
+fn show_all_folders_a_to_z_reads_the_engine() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let mem = state::Mem::default();
+    let toggle = defs()
+        .tabs
+        .iter()
+        .flat_map(|t| t.groups.iter().flat_map(|g| g.ctls.iter()))
+        .find(|c| c.cmd.id == "folder.showAllAZ")
+        .unwrap();
+    assert_eq!(toggle.on.as_deref(), Some("allaz"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "allaz"));
+    let act = state::action(&app, &toggle.cmd, false, None, &[]);
+    assert_eq!(act.params, serde_json::json!({"on": true}));
+    let r = app.run(&act.cmd, act.params.clone()).unwrap();
+    assert_eq!(
+        state::is_on(&app, Surface::Main, &mem, "allaz"),
+        r["saved"] == true,
+        "on exactly when the engine kept it"
+    );
+    assert_eq!(
+        state::is_on(&app, Surface::Main, &mem, "allaz"),
+        mailcraft_engine::cmd::folder::show_all_az_on(&app.s)
+    );
+}
+
+#[test]
+fn followup_menu_entries_send_the_engine_params() {
+    let app = App::new(mailcraft_engine::sample::sample_session());
+    let find =
+        |menu: &str, label: &str| defs().menu(menu).unwrap().iter().find(|i| i.label == label).cloned();
+    let slow = find("downloadPreferences", "On Slow Connections Download Only Headers").unwrap();
+    assert_eq!(
+        state::action(&app, &slow.cmd, false, None, &[]).params,
+        serde_json::json!({"slowHeadersOnly": "toggle"})
+    );
+    let paste = find("paste", "Set Default Paste...").unwrap();
+    assert_eq!(paste.cmd.params, r#"{"page":"editorAdvanced"}"#);
+    let similar = find("readSelect", "Select All Text With Similar Formatting").unwrap();
+    assert_eq!(similar.cmd.id, "format.selectSimilar");
+    // Message recall is not offered: IMAP, SMTP and JMAP cannot withdraw delivered mail.
+    assert!(all_cmds().iter().all(|(_, c)| c.id != "mail.recall"));
+}

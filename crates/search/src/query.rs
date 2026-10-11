@@ -18,8 +18,7 @@
 //!   `attachments` (file names), `category` (`any`, `none` or a name), `folder` (a folder name),
 //!   `hasattachments`, `isread`, `isflagged` (`yes`/`no`), `importance` (`high`/`normal`/`low`), `received`
 //!   and `sent` (dates, see below), `size` (see below), `kind` (`email`, `meeting`, `contact`, `task`,
-//!   `note`), `expires` (items carry no expiry date: matches nothing). People keys accept `me` (one of the
-//!   user's own addresses).
+//!   `note`), `expires` (see below). People keys accept `me` (one of the user's own addresses).
 //! - Dates: `today`, `yesterday`, `tomorrow`, `this|last|next week|month|year` (quoted or not),
 //!   `N days|weeks|months|years ago`, `2026-10-09`, `2026/10/09`, `10/9/2026`; comparisons `>=x`, `<=x`,
 //!   `>x`, `<x` and ranges `a..b` (either side may be missing). Unquoted multi-word dates also work inside
@@ -28,6 +27,10 @@
 //! - Sizes: `tiny` (< 10 KB), `small` (10–25 KB), `medium` (25–100 KB), `large` (100–500 KB), `verylarge`
 //!   (500 KB–1 MB), `huge` (> 1 MB), or byte counts with an optional `B`/`KB`/`MB`/`GB` unit
 //!   (1 KB = 1024 bytes) as `>=x`, `<=x`, `>x`, `<x`, `a..b`; a bare number means "at least".
+//! - Expiry (mail with an `Expiry-Date` / `Expires` header): `expires:soon` (not expired yet, and expiring
+//!   by the end of the [`EXPIRING_SOON_DAYS`]th day from today: View Items Expiring Soon), `expires:yes`
+//!   (any expiry date), `expires:no`, `expires:expired` (the date has passed), or a date / range as for
+//!   `received:`.
 //! - A key with an empty value (`from:""`, `subject:`) is a placeholder being typed and matches everything;
 //!   a value a key does not understand (`isread:maybe`) matches nothing.
 //!
@@ -229,6 +232,38 @@ pub struct DateRange {
     pub hi: Option<Bound>,
 }
 
+/// Days ahead that `expires:soon` looks (today counts as day 0).
+pub const EXPIRING_SOON_DAYS: i64 = 7;
+
+/// What an `expires:` value asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expiry {
+    /// `soon`: not expired yet, and expiring within [`EXPIRING_SOON_DAYS`] days.
+    Soon,
+    /// `yes` / `any`: carries an expiry date.
+    Any,
+    /// `no` / `none` / `never`: carries none.
+    Never,
+    /// `expired` / `past`: its expiry date has passed.
+    Past,
+    /// Its expiry date falls in the range (local days).
+    Range(DateRange),
+}
+
+impl Expiry {
+    /// Parses an `expires:` value (any case); `None` when it means nothing.
+    pub fn parse(v: &str) -> Option<Expiry> {
+        let v = v.trim().to_lowercase();
+        Some(match v.as_str() {
+            "soon" | "expiringsoon" => Expiry::Soon,
+            "yes" | "any" | "true" => Expiry::Any,
+            "no" | "none" | "never" | "false" => Expiry::Never,
+            "expired" | "past" => Expiry::Past,
+            other => Expiry::Range(parse_date_range(other)?),
+        })
+    }
+}
+
 /// Outlook's size buckets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SizeBucket {
@@ -308,7 +343,8 @@ pub enum Term {
     Date(DateField, DateRange),
     Size(SizeSpec),
     Kind(DocKind),
-    /// `expires:` (no expiry dates are kept: matches nothing). Holds the value as written.
+    /// `expires:` (see [`Expiry`]; a value it does not understand matches nothing). Holds the value as
+    /// written.
     Expires(String),
     /// A value the key does not understand (matches nothing). Holds the value as written.
     Invalid(Key, String),
@@ -523,7 +559,7 @@ fn split_op(v: &str) -> (&str, &str) {
     ("", v)
 }
 
-fn parse_date_range(v: &str) -> Option<DateRange> {
+pub(crate) fn parse_date_range(v: &str) -> Option<DateRange> {
     let v = v.trim();
     if let Some((a, b)) = v.split_once("..") {
         let lo =

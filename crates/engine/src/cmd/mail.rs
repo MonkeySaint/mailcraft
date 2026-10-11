@@ -720,7 +720,7 @@ fn new_email(s: &mut Session, p: &Value) -> CmdResult {
     }
     let c = ComposeState {
         kind: ComposeKind::New,
-        from: account_from(s, s.mailbox.default_account().map(|a| a.id)),
+        from: account_from(s, new_mail_account(s)),
         format,
         inline: false,
         ..Default::default()
@@ -728,6 +728,20 @@ fn new_email(s: &mut Session, p: &Value) -> CmdResult {
     let c = crate::compose::with_default_signature(&s.mailbox, c);
     let id = s.open_compose(c);
     Ok(json!({"compose": id}))
+}
+
+/// The account a new message is sent from: the current folder's account, unless Options › Mail › "Always use
+/// the default account when composing new messages" is on or that account cannot send (a data file without
+/// an address); then the default account.
+pub(crate) fn new_mail_account(s: &Session) -> Option<AccountId> {
+    let default = s.mailbox.default_account().map(|a| a.id);
+    if s.settings.bool("mail.send.alwaysDefaultAccount") {
+        return default;
+    }
+    s.mailbox
+        .folder_account(s.selection.folder)
+        .filter(|a| s.mailbox.account(*a).is_some_and(|acc| !acc.address.trim().is_empty()))
+        .or(default)
 }
 
 fn new_item(s: &mut Session, p: &Value) -> CmdResult {
@@ -1575,20 +1589,21 @@ fn is_signed(m: &MailItem) -> bool {
     })
 }
 
-/// Members of `conv` passing `candidate` whose text is fully contained in a later member (Conversation
-/// Clean Up defaults: categorized, flagged and signed messages are kept; drafts are never moved).
-fn redundant_members(s: &Session, conv: &Conversation, candidate: &dyn Fn(&MailItem) -> bool) -> Vec<ItemId> {
+/// Members of `conv` passing `candidate` whose text is fully contained in a later member. Options › Mail ›
+/// Conversation Clean Up says which are kept whatever their text (unread, categorized, flagged, digitally
+/// signed); drafts are never moved. A message whose text a later reply changed is never contained in it, so
+/// "When a reply modifies a message, don't move the original" always holds.
+fn redundant_members(
+    s: &Session,
+    conv: &Conversation,
+    candidate: &dyn Fn(&MailItem) -> bool,
+    opts: &crate::settings::CleanUpOptions,
+) -> Vec<ItemId> {
     let members: Vec<(&MailItem, String)> =
         conv.items.iter().filter_map(|id| s.mailbox.mail.get(id)).map(|m| (m, normalised_text(m))).collect();
     let mut out = Vec::new();
     for (m, text) in &members {
-        if text.is_empty()
-            || m.is_draft
-            || !candidate(m)
-            || !m.categories.is_empty()
-            || m.flag != FlagState::None
-            || is_signed(m)
-        {
+        if text.is_empty() || m.is_draft || !candidate(m) || opts.keeps(m, is_signed(m)) {
             continue;
         }
         let quoted_later = members.iter().any(|(n, ntext)| {
@@ -1604,13 +1619,121 @@ fn redundant_members(s: &Session, conv: &Conversation, candidate: &dyn Fn(&MailI
     out
 }
 
-/// Moves redundant items to their account's Deleted Items.
-fn clean_up(s: &mut Session, convs: &[Conversation], candidate: &dyn Fn(&MailItem) -> bool) -> CmdResult {
+/// The Conversation Clean Up folder named in the options (a folder path, preferring `account`'s folders);
+/// `None` when the option is empty (each item's account's Deleted Items).
+fn clean_up_target(
+    s: &Session,
+    folder: &str,
+    account: Option<AccountId>,
+) -> Result<Option<FolderId>, CmdError> {
+    let want = folder.trim().trim_matches('\\').trim();
+    if want.is_empty() {
+        return Ok(None);
+    }
+    let lower = want.to_lowercase();
+    let mail_folder = |f: FolderId| s.mailbox.folder(f).is_some_and(|f| f.kind == FolderKind::Mail);
+    account
+        .and_then(|a| {
+            s.mailbox
+                .folders
+                .values()
+                .find(|f| f.account == a && s.mailbox.folder_path(f.id).to_lowercase() == lower)
+                .map(|f| f.id)
+        })
+        .or_else(|| crate::cmd::folder::resolve_folder(s, &json!(want)))
+        .filter(|f| mail_folder(*f))
+        .map(Some)
+        .ok_or_else(|| {
+            CmdError::Failed(format!(
+                "The Conversation Clean Up folder \"{want}\" was not found. Choose another one in File › Options \
+                 › Mail."
+            ))
+        })
+}
+
+/// `dest`'s subfolder at `path` (folder names), created where missing.
+fn ensure_subfolder(s: &mut Session, dest: FolderId, path: &[String]) -> Result<FolderId, CmdError> {
+    let mut cur = dest;
+    for name in path {
+        let existing = s
+            .mailbox
+            .folders
+            .values()
+            .find(|f| f.parent == Some(cur) && f.name.eq_ignore_ascii_case(name))
+            .map(|f| f.id);
+        cur = match existing {
+            Some(f) => f,
+            None => s.mailbox.create_folder(cur, name)?,
+        };
+    }
+    Ok(cur)
+}
+
+/// Folder names from just below `root` down to `folder` (empty for `root` itself or a folder outside it).
+fn path_below(s: &Session, root: FolderId, folder: FolderId) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cur = Some(folder);
+    for _ in 0..=s.mailbox.folders.len() {
+        match cur {
+            Some(c) if c == root => {
+                names.reverse();
+                return names;
+            }
+            Some(c) => {
+                let Some(f) = s.mailbox.folder(c) else { break };
+                names.push(f.name.clone());
+                cur = f.parent;
+            }
+            None => break,
+        }
+    }
+    Vec::new()
+}
+
+/// Moves redundant items to the Conversation Clean Up folder of the options (else their account's Deleted
+/// Items). Cleaning a folder and its subfolders (`root`) with "recreate the folder hierarchy" on files items
+/// of each subfolder in a subfolder of the same name below the destination (created where missing).
+fn clean_up(
+    s: &mut Session,
+    convs: &[Conversation],
+    candidate: &dyn Fn(&MailItem) -> bool,
+    root: Option<FolderId>,
+) -> CmdResult {
+    let opts = s.settings.clean_up();
     let mut redundant = Vec::new();
     for c in convs {
-        redundant.extend(redundant_members(s, c, candidate));
+        redundant.extend(redundant_members(s, c, candidate, &opts));
     }
-    let moved = move_to_role(s, &redundant, FolderRole::DeletedItems)?;
+    let order = list_order(s);
+    let mut moved = Vec::new();
+    for id in redundant {
+        let Some((folder, account)) =
+            s.mailbox.mail.get(&id).map(|m| (m.folder, s.mailbox.folder_account(m.folder)))
+        else {
+            continue;
+        };
+        let base = match clean_up_target(s, &opts.folder, account)? {
+            Some(f) => f,
+            None => match account.and_then(|a| s.mailbox.role_folder(a, FolderRole::DeletedItems)) {
+                Some(f) => f,
+                None => continue,
+            },
+        };
+        if s.mailbox.is_in_subtree(folder, base) {
+            // Already cleaned up into the destination (or below it).
+            continue;
+        }
+        let dest = match root.filter(|_| opts.recreate_hierarchy) {
+            Some(r) => {
+                let path = path_below(s, r, folder);
+                ensure_subfolder(s, base, &path)?
+            }
+            None => base,
+        };
+        moved.extend(s.mailbox.move_items(&[id], dest)?);
+    }
+    journal(s, &moved);
+    reselect(s, &order);
     Ok(json!({"moved": moved.len(), "ids": ids_json(&moved)}))
 }
 
@@ -1632,10 +1755,10 @@ fn clean_up_conversation(s: &mut Session, p: &Value) -> CmdResult {
             )
         )
     };
-    clean_up(s, &convs, &skip)
+    clean_up(s, &convs, &skip, None)
 }
 
-fn clean_up_folders(s: &mut Session, folders: Vec<FolderId>) -> CmdResult {
+fn clean_up_folders(s: &mut Session, folders: Vec<FolderId>, root: Option<FolderId>) -> CmdResult {
     let folders: BTreeSet<FolderId> = folders
         .into_iter()
         .filter(|f| {
@@ -1651,18 +1774,18 @@ fn clean_up_folders(s: &mut Session, folders: Vec<FolderId>) -> CmdResult {
     let ids: Vec<ItemId> =
         s.mailbox.mail.values().filter(|m| folders.contains(&m.folder)).map(|m| m.id).collect();
     let convs = conversations_of(s, &ids);
-    clean_up(s, &convs, &|m: &MailItem| folders.contains(&m.folder))
+    clean_up(s, &convs, &|m: &MailItem| folders.contains(&m.folder), root)
 }
 
 fn clean_up_folder(s: &mut Session, p: &Value) -> CmdResult {
     let folder = param_folder(s, p)?.unwrap_or(s.selection.folder);
-    clean_up_folders(s, vec![folder])
+    clean_up_folders(s, vec![folder], None)
 }
 
 fn clean_up_subfolders(s: &mut Session, p: &Value) -> CmdResult {
     let folder = param_folder(s, p)?.unwrap_or(s.selection.folder);
     let tree = s.mailbox.subtree(folder);
-    clean_up_folders(s, tree)
+    clean_up_folders(s, tree, Some(folder))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -2754,6 +2877,88 @@ mod tests {
         // Folder-only clean up of Inbox no longer sees c; subfolders variant does.
         assert_eq!(clean_up_folder(&mut f.s, &Value::Null).unwrap()["moved"], 0);
         assert_eq!(clean_up_subfolders(&mut f.s, &Value::Null).unwrap()["moved"], 1);
+    }
+
+    #[test]
+    fn clean_up_follows_the_options() {
+        let mut f = fx();
+        f.s.selection.items = vec![f.b];
+        f.s.selection.focus = Some(f.b);
+        // "Don't move unread messages": c is unread.
+        f.s.settings.set("mail.cleanup.keepUnread", &json!(true)).unwrap();
+        assert_eq!(f.s.run("mail.cleanUpConversation", &json!({})).unwrap()["moved"], 0);
+        // Flagged messages stay unless that option is off.
+        f.s.settings.set("mail.cleanup.keepUnread", &json!(false)).unwrap();
+        f.s.mailbox.mail.get_mut(&f.c).unwrap().flag =
+            FlagState::Flagged { label: "Follow up".into(), start: None, due: None, reminder: None };
+        assert_eq!(f.s.run("mail.cleanUpConversation", &json!({})).unwrap()["moved"], 0);
+        f.s.settings.set("mail.cleanup.keepFlagged", &json!(false)).unwrap();
+        // A folder that does not exist: refused, nothing moves.
+        f.s.settings.set("mail.cleanup.folder", &json!("Nowhere")).unwrap();
+        assert!(matches!(f.s.run("mail.cleanUpConversation", &json!({})), Err(CmdError::Failed(_))));
+        assert_eq!(folder_of(&f.s, f.c), f.inbox);
+        // The chosen folder.
+        let cleaned = f.s.mailbox.create_folder(f.inbox, "Cleaned").unwrap();
+        f.s.settings.set("mail.cleanup.folder", &json!("Inbox\\Cleaned")).unwrap();
+        let r = f.s.run("mail.cleanUpConversation", &json!({})).unwrap();
+        assert_eq!(r["moved"], 1);
+        assert_eq!(folder_of(&f.s, f.c), cleaned);
+        // Undo puts it back (one step).
+        f.s.run("app.undo", &json!({})).unwrap();
+        assert_eq!(folder_of(&f.s, f.c), f.inbox);
+    }
+
+    #[test]
+    fn clean_up_recreates_the_folder_hierarchy() {
+        let mut f = fx();
+        let sub = f.s.mailbox.create_folder(f.inbox, "Projects").unwrap();
+        let deeper = f.s.mailbox.create_folder(sub, "Lunch").unwrap();
+        f.s.mailbox.move_items(&[f.c], deeper).unwrap();
+        let archive = role(&f.s, FolderRole::Archive);
+        f.s.settings.set("mail.cleanup.folder", &json!("Archive")).unwrap();
+        f.s.settings.set("mail.cleanup.recreateHierarchy", &json!(true)).unwrap();
+        let r = f.s.run("mail.cleanUpSubfolders", &json!({"folder": f.inbox.0})).unwrap();
+        assert_eq!(r["moved"], 1);
+        let dest = folder_of(&f.s, f.c);
+        assert_eq!(f.s.mailbox.folder_path(dest), "Archive\\Projects\\Lunch");
+        assert!(f.s.mailbox.is_in_subtree(dest, archive));
+        // Off: straight into the destination.
+        f.s.mailbox.move_items(&[f.c], deeper).unwrap();
+        f.s.settings.set("mail.cleanup.recreateHierarchy", &json!(false)).unwrap();
+        f.s.run("mail.cleanUpSubfolders", &json!({"folder": f.inbox.0})).unwrap();
+        assert_eq!(folder_of(&f.s, f.c), archive);
+        // Already in the destination: left alone.
+        assert_eq!(f.s.run("mail.cleanUpSubfolders", &json!({"folder": archive.0})).unwrap()["moved"], 0);
+    }
+
+    #[test]
+    fn new_email_uses_the_current_folders_account() {
+        let mut f = fx();
+        let work = f.s.mailbox.add_account(mailcraft_model::Account {
+            display_name: "Work".into(),
+            address: "kim@work.example.org".into(),
+            sender_name: "Kim".into(),
+            ..Default::default()
+        });
+        f.s.mailbox.create_default_folders(work);
+        let data = f.s.mailbox.add_account(mailcraft_model::Account {
+            display_name: "Archive file".into(),
+            ..Default::default()
+        });
+        f.s.mailbox.create_default_folders(data);
+        let from = |s: &mut Session| {
+            let id = s.run("mail.newEmail", &json!({})).unwrap()["compose"].as_u64().unwrap();
+            s.composes[&id].from.clone()
+        };
+        f.s.selection.folder = f.s.mailbox.role_folder(work, FolderRole::Inbox).unwrap();
+        assert_eq!(from(&mut f.s), "Kim <kim@work.example.org>");
+        // A data file cannot send: the default account.
+        f.s.selection.folder = f.s.mailbox.role_folder(data, FolderRole::Inbox).unwrap();
+        assert_eq!(from(&mut f.s), "Test User <test.user@example.net>");
+        // "Always use the default account".
+        f.s.selection.folder = f.s.mailbox.role_folder(work, FolderRole::Inbox).unwrap();
+        f.s.settings.set("mail.send.alwaysDefaultAccount", &json!(true)).unwrap();
+        assert_eq!(from(&mut f.s), "Test User <test.user@example.net>");
     }
 
     #[test]

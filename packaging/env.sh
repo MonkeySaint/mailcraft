@@ -3,7 +3,7 @@
 #
 #     . "$(dirname "$0")/../env.sh"
 #
-# This file is the single place for the application id, names and the forge URLs. Files that cannot read
+# This file is the single place for the application id, names and the GitHub URLs. Files that cannot read
 # shell variables (the .desktop file name, the Flatpak manifest, the WiX source) carry the same values, and
 # `packaging/check.sh` fails when they drift apart.
 
@@ -17,14 +17,12 @@ APP_SUMMARY="Desktop mail, calendar and contacts in the classic three-pane layou
 # Executables shipped in every package.
 APP_BINS="mailcraft mailcraft-cli"
 
-FORGE_URL="https://github.com"
-FORGE_REPO="MonkeySaint/mailcraft"
-HOMEPAGE="$FORGE_URL/$FORGE_REPO"
+# GitHub repository (owner/name): homepage, issues, releases.
+GH_OWNER="MonkeySaint"
+GH_REPO="mailcraft"
+HOMEPAGE="https://github.com/$GH_OWNER/$GH_REPO"
 # Files on the default branch (AppStream screenshots).
-RAW_URL="$HOMEPAGE/raw/branch/main"
-# GitHub serves the newest release's asset at releases/download/latest/<file> (when no tag is literally
-# named `latest`); AppImage update information points there.
-LATEST_DOWNLOAD_URL="$HOMEPAGE/releases/download/latest"
+RAW_URL="https://raw.githubusercontent.com/$GH_OWNER/$GH_REPO/master"
 # deb/rpm Maintainer/Packager (Debian policy wants a name and an address).
 MAINTAINER="${MAILCRAFT_MAINTAINER:-MonkeySaint <monkey@saint.dev>}"
 VENDOR="MailCraft contributors"

@@ -58,6 +58,8 @@ fn doc() -> impl Strategy<Value = Doc> {
                 flagged,
                 importance: [Level::Low, Level::Normal, Level::High][usize::from(imp)],
                 has_attachments: has_att,
+                // Some expire (a few days back up to a few weeks ahead), the rest never.
+                expires: flagged.then(|| NOW + (days - 10) * 86_400 + 1_800),
             },
         )
 }
@@ -98,6 +100,10 @@ fn query() -> impl Strategy<Value = String> {
         Just("size:large".to_owned()),
         Just("size:>1MB".to_owned()),
         Just("kind:note".to_owned()),
+        Just("expires:soon".to_owned()),
+        Just("expires:expired".to_owned()),
+        Just("expires:no".to_owned()),
+        Just("expires:<=tomorrow".to_owned()),
     ];
     prop::collection::vec(
         (atom, prop::sample::select(vec![" ", " OR ", " -", " AND NOT ", " (", ") "])),

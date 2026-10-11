@@ -328,7 +328,7 @@ pub const DEFS: &[Def] = &[
         Choice("descriptions", SCREEN_TIPS),
         E,
     ),
-    d("general", "Personalize your copy of MailCraft", "general.userName", "User name:", Text("", 128), E),
+    d("general", "Personalize your copy of MailCraft", "general.userName", "User name:", Text("", 128), A),
     d("general", "Personalize your copy of MailCraft", "general.initials", "Initials:", Text("", 16), E),
     d(
         "general",
@@ -424,7 +424,7 @@ pub const DEFS: &[Def] = &[
         "mail.cleanup.folder",
         "Cleaned-up items will go to this folder (empty = Deleted Items):",
         Text("", 512),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -432,7 +432,7 @@ pub const DEFS: &[Def] = &[
         "mail.cleanup.recreateHierarchy",
         "When cleaning sub-folders, recreate the folder hierarchy in the destination folder",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -440,7 +440,7 @@ pub const DEFS: &[Def] = &[
         "mail.cleanup.keepUnread",
         "Don't move unread messages",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -448,7 +448,7 @@ pub const DEFS: &[Def] = &[
         "mail.cleanup.keepCategorized",
         "Don't move categorized messages",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -456,7 +456,7 @@ pub const DEFS: &[Def] = &[
         "mail.cleanup.keepFlagged",
         "Don't move flagged messages",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -464,7 +464,7 @@ pub const DEFS: &[Def] = &[
         "mail.cleanup.keepSigned",
         "Don't move digitally-signed messages",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -597,7 +597,7 @@ pub const DEFS: &[Def] = &[
         "mail.send.alwaysDefaultAccount",
         "Always use the default account when composing new messages",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -605,7 +605,7 @@ pub const DEFS: &[Def] = &[
         "mail.send.commasSeparate",
         "Commas can be used to separate multiple message recipients",
         Bool(false),
-        E,
+        A,
     ),
     d("mail", "Send messages", "mail.send.autoNameCheck", "Automatic name checking", Bool(true), A),
     d(
@@ -671,7 +671,7 @@ pub const DEFS: &[Def] = &[
         "mail.tracking.autoProcessMeetings",
         "Automatically process meeting requests and responses to meeting requests and polls",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -687,7 +687,7 @@ pub const DEFS: &[Def] = &[
         "mail.tracking.deleteWithoutComments",
         "Update tracking information, and then delete responses that don't contain comments",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -695,9 +695,9 @@ pub const DEFS: &[Def] = &[
         "mail.tracking.moveReceipts",
         "After updating tracking information, move receipt to a folder",
         Bool(false),
-        E,
+        A,
     ),
-    d("mail", "Tracking", "mail.tracking.moveReceiptsTo", "Move receipts to:", Text("Deleted Items", 512), E),
+    d("mail", "Tracking", "mail.tracking.moveReceiptsTo", "Move receipts to:", Text("Deleted Items", 512), A),
     d(
         "mail",
         "Message format",
@@ -929,7 +929,7 @@ pub const DEFS: &[Def] = &[
         "calendar.firstDayOfWeek",
         "First day of week:",
         Choice("sun", DAYS_CHOICE),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -937,7 +937,7 @@ pub const DEFS: &[Def] = &[
         "calendar.firstWeekOfYear",
         "First week of year:",
         Choice("jan1", FIRST_WEEK),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -953,7 +953,7 @@ pub const DEFS: &[Def] = &[
         "calendar.defaultDuration",
         "Default duration for new appointments and meetings (minutes):",
         Int(30, 5, 1440),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -961,7 +961,7 @@ pub const DEFS: &[Def] = &[
         "calendar.shorten",
         "Shorten appointments and meetings",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -969,7 +969,7 @@ pub const DEFS: &[Def] = &[
         "calendar.shortenUnderHour",
         "Shorten meetings under an hour by (minutes):",
         Int(5, 0, 30),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -977,16 +977,16 @@ pub const DEFS: &[Def] = &[
         "calendar.shortenHourOrLonger",
         "Shorten meetings of an hour or longer by (minutes):",
         Int(10, 0, 60),
-        E,
+        A,
     ),
-    d("calendar", "Calendar options", "calendar.defaultReminders", "Default reminders", Bool(true), E),
+    d("calendar", "Calendar options", "calendar.defaultReminders", "Default reminders", Bool(true), A),
     d(
         "calendar",
         "Calendar options",
         "calendar.reminderMinutes",
         "Default reminder (minutes before start):",
         Int(15, 0, 20_160),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -994,7 +994,7 @@ pub const DEFS: &[Def] = &[
         "calendar.allowProposeNewTime",
         "Allow attendees to propose new times for meetings",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1002,7 +1002,7 @@ pub const DEFS: &[Def] = &[
         "calendar.proposeResponse",
         "Use this response when proposing a new meeting time:",
         Choice("tentative", PROPOSE_RESPONSE),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1026,7 +1026,7 @@ pub const DEFS: &[Def] = &[
         "calendar.bellIcon",
         "Show bell icon on the calendar for appointments and meetings with reminders",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1034,7 +1034,7 @@ pub const DEFS: &[Def] = &[
         "calendar.defaultColor",
         "Default calendar color (#rrggbb, empty = automatic):",
         Text("", 16),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1042,7 +1042,7 @@ pub const DEFS: &[Def] = &[
         "calendar.useColorOnAll",
         "Use this color on all calendars",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1050,7 +1050,7 @@ pub const DEFS: &[Def] = &[
         "calendar.weekNumbers",
         "Show week numbers in the month view and in the Date Navigator",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1058,7 +1058,7 @@ pub const DEFS: &[Def] = &[
         "calendar.scheduleShowFree",
         "When in Schedule View, show free appointments",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1066,7 +1066,7 @@ pub const DEFS: &[Def] = &[
         "calendar.autoScheduleView",
         "Automatically switch from vertical layout to schedule view when many calendars are shown",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1074,7 +1074,7 @@ pub const DEFS: &[Def] = &[
         "calendar.autoScheduleViewAt",
         "Switch to schedule view at this many calendars:",
         Int(5, 2, 30),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1082,7 +1082,7 @@ pub const DEFS: &[Def] = &[
         "calendar.autoVerticalLayout",
         "Automatically switch from schedule view to vertical layout when few calendars are shown",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1090,9 +1090,9 @@ pub const DEFS: &[Def] = &[
         "calendar.autoVerticalLayoutAt",
         "Switch to vertical layout at this many calendars:",
         Int(1, 1, 29),
-        E,
+        A,
     ),
-    d("calendar", "Time zones", "calendar.timeZoneLabel", "Label:", Text("", 64), E),
+    d("calendar", "Time zones", "calendar.timeZoneLabel", "Label:", Text("", 64), A),
     d("calendar", "Time zones", "calendar.timeZone", "Time zone:", Int(0, -720, 840), A),
     d("calendar", "Time zones", "calendar.secondTimeZone", "Show a second time zone", Bool(false), A),
     d("calendar", "Time zones", "calendar.secondTimeZoneLabel", "Second time zone label:", Text("", 64), A),
@@ -1122,7 +1122,7 @@ pub const DEFS: &[Def] = &[
         "calendar.autoAccept",
         "Automatically accept meeting requests and remove canceled meetings",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1130,7 +1130,7 @@ pub const DEFS: &[Def] = &[
         "calendar.declineConflicts",
         "Automatically decline meeting requests that conflict with an existing appointment or meeting",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1138,7 +1138,7 @@ pub const DEFS: &[Def] = &[
         "calendar.declineRecurring",
         "Automatically decline recurring meeting requests",
         Bool(false),
-        E,
+        A,
     ),
     d("calendar", "Meeting Insights", "calendar.meetingInsights", "Show Meeting Insights", Bool(false), N),
     // ---------------------------------------------------------------- Groups
@@ -1764,6 +1764,15 @@ pub const DEFS: &[Def] = &[
     d("state", "Print", "state.printSetup", "Print page setup per print style", Object(64 * 1024), E),
     d(
         "state",
+        "Focused Inbox",
+        "mail.focused.otherSenders",
+        "Senders whose mail always goes to Other (Always Move to Other)",
+        List(1000),
+        A,
+    ),
+    d("state", "Folder pane", "state.showAllFoldersAZ", "Show all folders A to Z", Bool(false), A),
+    d(
+        "state",
         "Dialogs",
         "state.uiPrefs",
         "Settings kept by dialogs (columns, folder descriptions…)",
@@ -2375,10 +2384,12 @@ impl SettingsFile {
         let path = dir.join(FILE_NAME);
         let tmp = dir.join(format!("{FILE_NAME}.tmp"));
         let res = (|| -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
-            drop(f);
+            {
+                // Closed at the end of this block, before the rename.
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(bytes)?;
+                f.sync_all()?;
+            }
             std::fs::rename(&tmp, &path)
         })();
         if res.is_err() {
@@ -2417,7 +2428,7 @@ mod tests {
         }
         let (applied, total) = effect_counts();
         assert!(total >= 200, "{total}");
-        assert!(applied >= 40, "{applied}");
+        assert!(applied >= 110, "{applied}");
     }
 
     #[test]
@@ -2465,6 +2476,33 @@ mod tests {
         assert!(s.rev() > rev);
         s.reset_all();
         assert!(s.overrides().is_empty());
+    }
+
+    #[test]
+    fn focused_inbox_senders_and_folder_order_are_kept() {
+        let mut s = Settings::default();
+        assert!(s.list("mail.focused.otherSenders").is_empty());
+        assert_eq!(
+            s.set(
+                "mail.focused.otherSenders",
+                &json!(["ann@example.com", "ANN@example.com", " bo@example.org"])
+            )
+            .unwrap(),
+            json!(["ann@example.com", "bo@example.org"])
+        );
+        let too_many: Vec<String> = (0..1001).map(|i| format!("p{i}@example.com")).collect();
+        assert!(s.set("mail.focused.otherSenders", &json!(too_many)).is_err());
+        assert!(s.set("mail.focused.otherSenders", &json!(["a\nb@example.com"])).is_err());
+        assert!(!s.bool("state.showAllFoldersAZ"));
+        s.set("state.showAllFoldersAZ", &json!(true)).unwrap();
+        assert!(s.bool("state.showAllFoldersAZ"));
+        // UI state: not shown in Options, not counted.
+        for key in ["mail.focused.otherSenders", "state.showAllFoldersAZ"] {
+            assert_eq!(def(key).map(|d| d.page), Some("state"));
+        }
+        let (back, dropped) = Settings::from_json(&s.to_json());
+        assert!(dropped.is_empty());
+        assert_eq!(back.list("mail.focused.otherSenders").len(), 2);
     }
 
     #[test]

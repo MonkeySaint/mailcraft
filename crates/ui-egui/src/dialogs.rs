@@ -302,6 +302,8 @@ pub const KNOWN: &[&str] = &[
     "newTask",
     "note",
     "newPost",
+    "editMessage",
+    "closeAllItems",
     "chooseForm",
     "forwardContact",
     "goToDate",

@@ -5,9 +5,9 @@
 #
 # Expects the binaries to be built already (packaging/linux/package.sh --build does that).
 # Output: MailCraft-ARCH.AppImage and MailCraft-ARCH.AppImage.zsync. The name carries no version on purpose:
-# the update information embedded in the AppImage points at
-#     zsync|https://github.com/MonkeySaint/mailcraft/releases/download/latest/MailCraft-ARCH.AppImage.zsync
-# and AppImageUpdate fetches the newest release's file of that exact name.
+# the update information embedded in the AppImage is
+#     gh-releases-zsync|MonkeySaint|mailcraft|latest|MailCraft-*ARCH.AppImage.zsync
+# and AppImageUpdate fetches the matching file from the newest GitHub release.
 #
 # Tools:
 #   appimagetool  $APPIMAGETOOL, else PATH, else (MC_DOWNLOAD_TOOLS=1) downloaded once from
@@ -103,8 +103,8 @@ rm -f "$image" "$image.zsync"
 # is private or offline; packaging/check.sh validates the same file with `appstreamcli validate --no-net`.
 args=(-n)
 [ -n "$runtime" ] && args+=(--runtime-file "$runtime")
-zsync_url="zsync|$LATEST_DOWNLOAD_URL/MailCraft-$arch.AppImage.zsync"
-[ "$update_info" = 1 ] && args+=(-u "$zsync_url")
+update_info_str="gh-releases-zsync|$GH_OWNER|$GH_REPO|latest|MailCraft-*$arch.AppImage.zsync"
+[ "$update_info" = 1 ] && args+=(-u "$update_info_str")
 mc_log "appimagetool ${args[*]} → $image"
 # SOURCE_DATE_EPOCH is dropped for this call: appimagetool passes its own timestamp options to mksquashfs,
 # and mksquashfs 4.6+ refuses both together.

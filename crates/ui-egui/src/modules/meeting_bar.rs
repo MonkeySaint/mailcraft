@@ -9,6 +9,7 @@ use egui::{Align, ComboBox, Id, Layout, RichText, Sense, TextEdit, Ui, vec2};
 use serde_json::json;
 
 use mailcraft_engine::cmd::calendar::{self, ItipMessage, MeetingMessage};
+use mailcraft_engine::cmd::tasks::{self, TaskMessage, TaskRequestInfo};
 use mailcraft_model::ItemId;
 
 use super::common::{DAY, clock, day_string, day_time_string, local_secs, parse_day};
@@ -41,6 +42,18 @@ fn cache_id() -> Id {
     Id::new("mailcraft.modules.meeting-cache")
 }
 
+fn task_cache_id() -> Id {
+    Id::new("mailcraft.modules.task-message-cache")
+}
+
+/// The parsed task part of the message shown last.
+#[derive(Clone, Default)]
+struct TaskCache {
+    mail: u64,
+    stamp: (u64, i64),
+    msg: Option<TaskMessage>,
+}
+
 fn propose_id() -> Id {
     Id::new("mailcraft.modules.meeting-propose")
 }
@@ -58,11 +71,24 @@ pub(crate) fn summary(ctx: &egui::Context, app: &App, mail: u64) -> Option<Meeti
     Some(calendar::meeting_message_from(&app.s, ItemId(mail), msg))
 }
 
-/// Draws the meeting area for `mail` (nothing when the message is not a meeting message). Returns true when
-/// it drew something.
+/// The task summary for `mail` (its info bar against my task list), or `None` when it carries no task.
+pub(crate) fn task_summary(ctx: &egui::Context, app: &App, mail: u64) -> Option<TaskRequestInfo> {
+    let m = app.s.mailbox.mail.get(&ItemId(mail))?;
+    let stamp = (m.size, m.received.unix);
+    let mut cache: TaskCache = ctx.data_mut(|d| d.get_temp(task_cache_id())).unwrap_or_default();
+    if cache.mail != mail || cache.stamp != stamp {
+        cache = TaskCache { mail, stamp, msg: tasks::read_task_message(&app.s, ItemId(mail)) };
+        ctx.data_mut(|d| d.insert_temp(task_cache_id(), cache.clone()));
+    }
+    let msg = cache.msg.as_ref()?;
+    Some(tasks::task_request_info_from(&app.s, ItemId(mail), msg))
+}
+
+/// Draws the meeting area for `mail`, or the task bar when the message carries a task (nothing for other
+/// messages). Returns true when it drew something.
 pub fn meeting_bar(ui: &mut Ui, app: &mut App, mail: u64) -> bool {
     let ctx = ui.ctx().clone();
-    let Some(m) = summary(&ctx, app, mail) else { return false };
+    let Some(m) = summary(&ctx, app, mail) else { return task_bar(ui, app, mail) };
     if m.method == "REPLY" {
         record_reply(&ctx, app, &m);
     }
@@ -198,6 +224,87 @@ fn buttons(ui: &mut Ui, app: &mut App, m: &MeetingMessage) {
     {
         app.run("nav.calendar", json!({}));
         app.ui.module_selection = Some(id);
+    }
+}
+
+/// The task area of a message carrying a task (a request, a response or a status report). Returns true
+/// when it drew something.
+pub(crate) fn task_bar(ui: &mut Ui, app: &mut App, mail: u64) -> bool {
+    let ctx = ui.ctx().clone();
+    let Some(t) = task_summary(&ctx, app, mail) else { return false };
+    let theme = app.theme.clone();
+    egui::Frame::new()
+        .fill(theme.info_bar)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                app.icons.paint(ui, rect, "task", theme.accent);
+                ui.add(egui::Label::new(RichText::new(&t.info).color(theme.text)).wrap());
+            });
+            ui.add_space(4.0);
+            egui::Grid::new(("mc-task-grid", mail)).num_columns(2).spacing(vec2(8.0, 2.0)).show(ui, |ui| {
+                let row = |ui: &mut Ui, label: &str, value: &str| {
+                    ui.label(RichText::new(label).color(theme.text_muted));
+                    ui.label(value);
+                    ui.end_row();
+                };
+                row(ui, "Subject", &t.subject);
+                if let Some(d) = &t.start {
+                    row(ui, "Start date", d);
+                }
+                row(ui, "Due date", t.due.as_deref().unwrap_or("None"));
+                row(ui, "Status", task_status_label(&t.status));
+                row(ui, "% Complete", &format!("{}%", t.percent));
+                if !t.requested_by.trim().is_empty() {
+                    row(ui, "Assigned by", &t.requested_by);
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| task_buttons(ui, app, &t));
+        });
+    true
+}
+
+/// Display name of a task status key (`tasks::status_name`).
+fn task_status_label(key: &str) -> &'static str {
+    match key {
+        "inProgress" => "In Progress",
+        "completed" => "Completed",
+        "waiting" | "waitingOnSomeoneElse" => "Waiting on someone else",
+        "deferred" => "Deferred",
+        _ => "Not Started",
+    }
+}
+
+fn task_respond_menu(ui: &mut Ui, app: &mut App, t: &TaskRequestInfo, label: &str, cmd: &str) {
+    ui.menu_button(label, |ui| {
+        for (text, send) in [("Edit the response before sending", "edit"), ("Send the response now", "now")] {
+            if ui.button(text).clicked() {
+                app.run(cmd, json!({ "id": t.mail, "send": send }));
+                ui.close();
+            }
+        }
+    });
+}
+
+fn task_buttons(ui: &mut Ui, app: &mut App, t: &TaskRequestInfo) {
+    if t.method == "REQUEST" && t.can_respond {
+        task_respond_menu(ui, app, t, "Accept", "tasks.acceptRequest");
+        task_respond_menu(ui, app, t, "Decline", "tasks.declineRequest");
+    }
+    if t.method == "REPLY"
+        && t.can_update
+        && ui.button("Update").on_hover_text("Update my copy of the task").clicked()
+    {
+        app.run("tasks.processReport", json!({ "id": t.mail }));
+    }
+    if let Some(id) = t.task.filter(|id| app.s.mailbox.tasks.contains_key(&ItemId(*id)))
+        && ui.button("Open Task").clicked()
+    {
+        app.ui.dialogs.push(("task".to_owned(), json!({ "id": id })));
     }
 }
 

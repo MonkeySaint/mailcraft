@@ -12,6 +12,11 @@
 //!   addresses stay plain text. The field's text (and its accessible value) is unchanged.
 //! - **Check Names**: Ctrl+K in a recipient field runs `compose.checkNames`; names it cannot resolve (none or
 //!   several matches) open the Check Names dialog.
+//! - **Commas**: semicolons always separate recipients. With File › Options › Mail › Send messages › "Commas
+//!   can be used to separate multiple message recipients" (`mail.send.commasSeparate`) on, commas outside
+//!   quoted names and angle brackets separate them too: a typed separating comma becomes a semicolon (the
+//!   engine's separator), and the pills and Auto-Complete split at commas in text that came from elsewhere.
+//!   One entry written as "Last, First <address>" stays one recipient either way.
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{
@@ -46,9 +51,29 @@ impl Entry {
 
 /// Splits a recipient field at `;` outside quoted names and angle brackets (trimmed, empty entries dropped).
 pub fn split_entries(field: &str) -> Vec<&str> {
-    let mut out = Vec::new();
+    split_entries_with(field, false)
+}
+
+/// Options › Mail › Send messages › "Commas can be used to separate multiple message recipients".
+pub fn commas_separate(s: &mailcraft_engine::Session) -> bool {
+    s.settings.bool("mail.send.commasSeparate")
+}
+
+/// One entry written as an unquoted display name holding commas and an angle address ("Rivera, Alice
+/// <alice@example.com>"): a single recipient even where commas separate recipients.
+fn comma_named(entry: &str) -> bool {
+    entry.trim().strip_suffix('>').and_then(|p| p.rsplit_once('<')).is_some_and(|(name, _)| {
+        let name = name.trim();
+        name.contains(',') && !name.contains(['"', '@', '<', '>', ';'])
+    })
+}
+
+/// Byte offsets of the separators of a recipient field: `;` outside quoted names and angle brackets, and,
+/// when `commas`, `,` likewise (except inside a "Last, First <address>" entry). In order.
+fn separators(field: &str, commas: bool) -> Vec<usize> {
+    let mut semis = Vec::new();
+    let mut comma_at = Vec::new();
     let (mut quoted, mut escaped, mut angle) = (false, false, false);
-    let mut start = 0usize;
     for (i, ch) in field.char_indices() {
         if escaped {
             escaped = false;
@@ -59,15 +84,65 @@ pub fn split_entries(field: &str) -> Vec<&str> {
             '"' => quoted = !quoted,
             '<' if !quoted => angle = true,
             '>' if !quoted => angle = false,
-            ';' if !quoted && !angle => {
-                out.extend(field.get(start..i));
-                start = i.saturating_add(1);
-            }
+            ';' if !quoted && !angle => semis.push(i),
+            ',' if commas && !quoted && !angle => comma_at.push(i),
             _ => {}
         }
     }
+    if comma_at.is_empty() {
+        return semis;
+    }
+    // Commas inside an entry that is one comma-named mailbox stay part of its name.
+    let mut out = semis.clone();
+    let mut start = 0usize;
+    let mut commas = comma_at.iter().copied().peekable();
+    for end in semis.iter().copied().chain(std::iter::once(field.len())) {
+        let whole = field.get(start..end).is_some_and(comma_named);
+        while let Some(c) = commas.next_if(|&c| c < end) {
+            if !whole {
+                out.push(c);
+            }
+        }
+        start = end.saturating_add(1);
+    }
+    out.sort_unstable();
+    out
+}
+
+/// [`split_entries`], also splitting at commas when `commas` (`mail.send.commasSeparate`).
+pub fn split_entries_with(field: &str, commas: bool) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for i in separators(field, commas) {
+        out.extend(field.get(start..i));
+        start = i.saturating_add(1);
+    }
     out.extend(field.get(start..));
     out.into_iter().map(str::trim).filter(|x| !x.is_empty()).collect()
+}
+
+/// The field with every separating comma turned into `;` (same length, so the text cursor stays put);
+/// `None` when it has none. Commas inside quoted names, angle brackets and "Last, First <address>" entries
+/// are kept.
+pub fn commas_to_semicolons(field: &str) -> Option<String> {
+    let bytes = field.as_bytes();
+    let commas: Vec<usize> =
+        separators(field, true).into_iter().filter(|&i| bytes.get(i) == Some(&b',')).collect();
+    if commas.is_empty() {
+        return None;
+    }
+    // Both lists are in order: walk them together.
+    let mut next = commas.iter().copied().peekable();
+    let mut out = String::with_capacity(field.len());
+    for (i, ch) in field.char_indices() {
+        if next.peek() == Some(&i) {
+            next.next();
+            out.push(';');
+        } else {
+            out.push(ch);
+        }
+    }
+    Some(out)
 }
 
 fn valid_address(addr: &str) -> bool {
@@ -85,7 +160,12 @@ fn valid_address(addr: &str) -> bool {
 /// The entries of a recipient field, resolved where they are valid addresses ("Name <a@b>", "a@b",
 /// "Last, First <a@b>").
 pub fn entries(field: &str) -> Vec<Entry> {
-    split_entries(field)
+    entries_with(field, false)
+}
+
+/// [`entries`], also splitting at commas when `commas` (`mail.send.commasSeparate`).
+pub fn entries_with(field: &str, commas: bool) -> Vec<Entry> {
+    split_entries_with(field, commas)
         .into_iter()
         .take(500)
         .map(|piece| {
@@ -229,7 +309,8 @@ pub(super) fn address_field(
     // The text edit (pills painted over it when it does not have focus).
     let edit_rect =
         Rect::from_min_max(pos2(rect.left(), rect.top() + 3.0), pos2(rect.right(), rect.bottom() - 3.0));
-    let shown = entries(&text);
+    let commas = commas_separate(&app.s);
+    let shown = entries_with(&text, commas);
     let pills = !focused && shown.iter().any(Entry::resolved);
     let color = if pills { Color32::TRANSPARENT } else { app.theme.text };
     let te = TextEdit::singleline(&mut text)
@@ -252,8 +333,12 @@ pub(super) fn address_field(
         paint_pills(ui, app, cid, f, edit_rect, &shown);
     }
 
-    // Typing: store the text and refresh the suggestions.
+    // Typing: store the text and refresh the suggestions. Where commas separate recipients, a separating comma
+    // is stored as the semicolon the rest of compose splits at.
     if text != before {
+        if commas && let Some(t) = commas_to_semicolons(&text) {
+            text = t;
+        }
         app.run(f.command(), json!({"compose": cid, "value": text}));
         ac.dismissed = false;
         ac.sel = 0;
@@ -327,7 +412,10 @@ pub(super) fn address_field(
     if let Some(i) = accept
         && let Some(s) = ac.items.get(i).cloned()
     {
-        let current = app.s.composes.get(&cid).map(|c| f.value(c).to_owned()).unwrap_or_default();
+        let mut current = app.s.composes.get(&cid).map(|c| f.value(c).to_owned()).unwrap_or_default();
+        if commas && let Some(t) = commas_to_semicolons(&current) {
+            current = t;
+        }
         let new_text = complete_entry(&current, &s.entry());
         app.run(f.command(), json!({"compose": cid, "value": new_text}));
         cursor_to_end(&ctx, fid, &new_text);
@@ -418,5 +506,89 @@ mod tests {
         );
         assert_eq!(typed_entry("bob@example.org; al "), "al");
         assert_eq!(typed_entry("bob@example.org;"), "");
+    }
+
+    #[test]
+    fn commas_separate_only_when_the_option_is_on() {
+        let field =
+            "a@example.com, Bob <b@example.org>; \"Doe, Jo\" <jo@example.com>, Rivera, Al <al@example.net>";
+        // Off: semicolons only.
+        assert_eq!(split_entries_with(field, false).len(), 2);
+        assert_eq!(split_entries(field), split_entries_with(field, false));
+        // On: commas outside quotes and angle brackets too.
+        assert_eq!(
+            split_entries_with(field, true),
+            vec![
+                "a@example.com",
+                "Bob <b@example.org>",
+                "\"Doe, Jo\" <jo@example.com>",
+                "Rivera",
+                "Al <al@example.net>"
+            ]
+        );
+        // One "Last, First <address>" entry stays whole; so do commas inside angle brackets.
+        assert_eq!(split_entries_with("Rivera, Alice <alice@example.com>; bob@example.org", true).len(), 2);
+        assert_eq!(split_entries_with("x <a,b@example.com>", true), vec!["x <a,b@example.com>"]);
+        let e = entries_with("Rivera, Alice <alice@example.com>, bob@example.org", true);
+        assert_eq!(e.len(), 3, "{e:?}");
+        let e = entries_with("Rivera, Alice <alice@example.com>; bob@example.org, carol@example.net", true);
+        assert_eq!(e.iter().filter(|e| e.resolved()).count(), 3);
+        assert_eq!(e[0].label, "Rivera, Alice");
+        assert_eq!(entries_with("bob@example.org, carol@example.net", false).len(), 1);
+    }
+
+    #[test]
+    fn separating_commas_become_semicolons() {
+        assert_eq!(
+            commas_to_semicolons("a@example.com, b@example.org,").as_deref(),
+            Some("a@example.com; b@example.org;")
+        );
+        assert_eq!(
+            commas_to_semicolons("\"Doe, Jo\" <jo@example.com>, Rivera, Al <al@example.net>; x").as_deref(),
+            Some("\"Doe, Jo\" <jo@example.com>; Rivera; Al <al@example.net>; x")
+        );
+        assert_eq!(commas_to_semicolons("Rivera, Alice <alice@example.com>; bo"), None);
+        assert_eq!(commas_to_semicolons("plain; text"), None);
+        assert_eq!(commas_to_semicolons(""), None);
+        // Same length, multi-byte text intact.
+        let t = "Zo\u{eb}, \u{4e2d}@example.com";
+        assert_eq!(commas_to_semicolons(t).map(|x| x.len()), Some(t.len()));
+        // Hostile input stays total and linear.
+        let long = "a,\"b,".repeat(20_000);
+        let _ = commas_to_semicolons(&long);
+        assert!(split_entries_with(&",;".repeat(50_000), true).is_empty());
+    }
+
+    fn compose_app(commas: bool) -> (crate::App, u64) {
+        use mailcraft_engine::compose::{ComposeKind, ComposeState};
+        let mut s = mailcraft_engine::Session::new(mailcraft_engine::model::Mailbox::new_local("Local"));
+        s.settings.set("mail.send.commasSeparate", &json!(commas)).unwrap();
+        let cid =
+            s.open_compose(ComposeState { inline: true, kind: ComposeKind::New, ..ComposeState::default() });
+        s.notices.clear();
+        (crate::App::new(s), cid)
+    }
+
+    fn typed_to(commas: bool, typed: &str) -> String {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let (app, cid) = compose_app(commas);
+        let mut h = egui_kittest::Harness::builder().with_size([900.0, 700.0]).build_ui_state(
+            move |ui, app: &mut crate::App| {
+                super::super::inline_compose(ui, app, cid);
+            },
+            app,
+        );
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "To").type_text(typed);
+        h.run();
+        h.state().s.composes.get(&cid).map(|c| c.to.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn typed_commas_follow_the_commas_separate_option() {
+        let typed = "ann@example.com, \"Lee, Bo\" <bo@example.org>, cy@example.net";
+        assert_eq!(typed_to(false, typed), typed);
+        assert_eq!(typed_to(true, typed), "ann@example.com; \"Lee, Bo\" <bo@example.org>; cy@example.net");
     }
 }

@@ -705,7 +705,7 @@ pub fn account_menu(ui: &mut Ui, app: &mut App, account: u32) {
     cmd_if(ui, app, "close", "Remove", !is_default, "file.closeDataFile", store);
     ui.separator();
     cmd(ui, app, "folder", "New Folder...", "folder.new", json!({}));
-    cmd_if(ui, app, "favorites", "Add to Favorites", false, "folder.addFavorite", json!({}));
+    cmd(ui, app, "favorites", "Add to Favorites", "folder.addFavorite", json!({"account": account}));
     cmd(ui, app, "sort", "Sort Subfolders A to Z", "folder.sortAZ", json!({"account": account}));
     ui.separator();
     cmd(ui, app, "account", "Account Properties...", "file.accountSettings", json!({"account": account}));
@@ -902,4 +902,28 @@ pub fn column_header_menu(ui: &mut Ui, app: &mut App, column: &str) {
     cmd_if(ui, app, "", "Automatic Width", sized, "view.columns", json!({"widths": {column: null}}));
     ui.separator();
     cmd(ui, app, "settings", "View Settings...", "view.viewSettings", json!({}));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use mailcraft_engine::sample::sample_session;
+
+    #[test]
+    fn account_root_add_to_favorites_adds_its_inbox() {
+        let mut app = App::new(sample_session());
+        let account = app.s.mailbox.accounts.first().map(|a| a.id).unwrap();
+        let inbox = app.s.mailbox.role_folder(account, FolderRole::Inbox).unwrap();
+        app.run("folder.removeFavorite", json!({"folder": inbox.0})).unwrap();
+        assert!(app.s.mailbox.folder(inbox).unwrap().favorite_pos.is_none());
+        let mut h = Harness::builder()
+            .with_size(vec2(300.0, 400.0))
+            .build_ui_state(move |ui, app: &mut App| account_menu(ui, app, account.0), app);
+        h.run();
+        h.get_by_label("Add to Favorites").click();
+        h.run();
+        assert!(h.state().s.mailbox.folder(inbox).unwrap().favorite_pos.is_some());
+    }
 }

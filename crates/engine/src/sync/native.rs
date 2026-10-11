@@ -1904,12 +1904,9 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
         }
         if !new_inbox.is_empty() {
             let ids: Vec<ItemId> = new_inbox.into_iter().filter(|i| s.mailbox.mail.contains_key(i)).collect();
-            // Junk Email filter first, then the rules for received messages (client-side, like every rule
-            // here) over what stayed in the Inbox.
-            let junk = crate::junk::on_new_mail(s, &ids);
-            let ids: Vec<ItemId> =
-                ids.into_iter().filter(|i| !junk.moved.contains(i) && !junk.deleted.contains(i)).collect();
-            crate::cmd::rules::exec::on_new_mail(s, &ids);
+            // Junk Email filter first, then Focused Inbox overrides, the rules for received messages
+            // (client-side, like every rule here), automatic meeting responses, tracking and receipts.
+            super::arrival::on_new_mail(s, &ids);
         }
         queue_local_changes(s, &mid);
     }
@@ -2819,6 +2816,13 @@ mod tests {
         let ham = by_subject("hello again");
         assert_eq!(ham.folder, inbox);
         assert_eq!(ham.categories, vec!["Red category".to_string()]);
+        assert_eq!(ham.focus, mailcraft_model::FocusClass::Focused);
+        // Always Move to Other reaches mail that arrives later.
+        s.run("options.set", &json!({"key": "mail.focused.otherSenders", "value": ["ann@example.org"]}))
+            .unwrap();
+        apply_all(&mut s, vec![pop3_new(acct, "u3", "Ann <ann@example.org>", "later")]);
+        let later = s.mailbox.mail.values().find(|m| m.subject == "later").unwrap();
+        assert_eq!(later.focus, mailcraft_model::FocusClass::Other);
     }
 
     #[test]

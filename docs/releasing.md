@@ -1,15 +1,13 @@
 # Releasing MailCraft
 
-Releases are built by GitHub Actions on github.com (`.github/workflows/release.yml`) and published as a
-GitHub release with every package and a `SHA256SUMS` file.
-
-> **Status:** no Actions runners are registered on github.com yet, so neither CI nor releases run.
-> Until the owner registers at least a `docker` runner (below), pushing a tag does nothing but sit in the
-> queue. Everything in this document can still be run by hand on a developer machine.
+Releases are built by GitHub Actions on GitHub-hosted runners (`.github/workflows/release.yml`) and
+published as a [GitHub release](https://github.com/MonkeySaint/mailcraft/releases) with every package and a
+`SHA256SUMS` file. Nothing needs registering: the workflows run as soon as they are on GitHub. Everything in
+this document can also be run by hand on a developer machine.
 
 ## Cutting a release
 
-1. Make sure `main` is green: `cargo xtask ci`.
+1. Make sure `master` is green: `cargo xtask ci`.
 2. Bump the version (root `Cargo.toml` `[workspace.package]` and the workspace entries in `Cargo.lock`):
 
    ```sh
@@ -23,16 +21,19 @@ GitHub release with every package and a `SHA256SUMS` file.
    git tag -a v0.2.0 -m "MailCraft 0.2.0"
    ```
 
-4. Push the commit, then the tag (pushing is the owner's call):
+4. Push the commit, then the tag to `origin` (`git@github.com:MonkeySaint/mailcraft.git`; pushing is the
+   owner's call):
 
    ```sh
-   git push origin main
+   git push origin master
    git push origin v0.2.0
    ```
 
-5. Watch the `release` workflow under the repository's Actions tab. When it succeeds, the release appears
-   under Releases with the notes generated from the commit subjects since the previous tag. Edit the
-   notes there if needed.
+5. Watch the `release` workflow under the repository's
+   [Actions tab](https://github.com/MonkeySaint/mailcraft/actions). When it succeeds, the release appears
+   under [Releases](https://github.com/MonkeySaint/mailcraft/releases) with the notes generated from the
+   commit subjects since the previous tag. Edit the notes there if needed. Re-running a failed `publish`
+   job replaces the files of a release that already exists.
 
 A version with a pre-release suffix (`0.2.0-rc.1`, tag `v0.2.0-rc.1`) is published as a pre-release. The
 MSI cannot carry the suffix, so it installs as `0.2.0`.
@@ -43,26 +44,28 @@ tags.
 
 ## What each job produces
 
-| Job | Runner label | Files |
+| Job | Runner | Files |
 |---|---|---|
-| `version-check` | `docker` | (fails when the tag and `Cargo.toml` disagree) |
-| `linux` (x86_64, aarch64) | `docker` | `mailcraft-VERSION-linux-ARCH.tar.gz`, `mailcraft_VERSION-1_ARCH.deb`, `mailcraft-VERSION-1.ARCH.rpm`, `MailCraft-ARCH.AppImage` + `.zsync` |
-| `flatpak` | `docker` (privileged) | `mailcraft-VERSION-x86_64.flatpak` |
-| `web` | `docker` | `mailcraft-VERSION-web.zip` |
-| `windows` | `windows` | `mailcraft-VERSION-windows-x86_64.msi`, `mailcraft-VERSION-windows-x86_64.zip` |
-| `macos` | `macos` | `MailCraft-VERSION-macos-universal.dmg` |
-| `freebsd` | `freebsd` | `mailcraft-VERSION-freebsd-ARCH.tar.gz`, `mailcraft-VERSION.pkg` |
-| `publish` | `docker` | the GitHub release, all of the above, `SHA256SUMS` |
+| `version-check` | `ubuntu-latest` (`rust:1.99-bookworm` container) | (fails when the tag and `Cargo.toml` disagree) |
+| `linux` (x86_64, aarch64) | `ubuntu-latest`, `ubuntu-24.04-arm` (`rust:1.99-bookworm` container) | `mailcraft-VERSION-linux-ARCH.tar.gz`, `mailcraft_VERSION-1_ARCH.deb`, `mailcraft-VERSION-1.ARCH.rpm`, `MailCraft-ARCH.AppImage` + `.zsync` |
+| `flatpak` | `ubuntu-latest` (privileged `debian:bookworm` container) | `mailcraft-VERSION-x86_64.flatpak` |
+| `web` | `ubuntu-latest` (`rust:1.99-bookworm` container) | `mailcraft-VERSION-web.zip` |
+| `windows` | `windows-latest` | `mailcraft-VERSION-windows-x86_64.msi`, `mailcraft-VERSION-windows-x86_64.zip` |
+| `macos` | `macos-latest` | `MailCraft-VERSION-macos-universal.dmg` |
+| `freebsd` | `ubuntu-latest` (FreeBSD 14.3 VM, `vmactions/freebsd-vm`) | `mailcraft-VERSION-freebsd-ARCH.tar.gz`, `mailcraft-VERSION.pkg` |
+| `publish` | `ubuntu-latest` | the GitHub release, all of the above, `SHA256SUMS` |
 
-The `windows`, `macos` and `freebsd` jobs only run when the repository variables `RELEASE_WINDOWS`,
-`RELEASE_MACOS` and `RELEASE_FREEBSD` are `true` (Settings → Actions → Variables). A job whose label has
-no runner waits forever and would hold the release back, so turn a platform on only once its runner is
-registered. Skipped platforms do not stop the release; failed ones do.
+Every job runs by default. To leave a platform out, set the repository variable `RELEASE_WINDOWS`,
+`RELEASE_MACOS` or `RELEASE_FREEBSD` to `false` (Settings → Secrets and variables → Actions → Variables).
+Skipped platforms do not stop the release; failed ones do. The Rust version is the `rust:1.99-bookworm`
+image on Linux and `RUST_TOOLCHAIN` (installed with rustup) on Windows and macOS; change them together.
+FreeBSD uses the `rust` package of the VM's FreeBSD release.
 
-Two more workflows build single platforms on demand (Actions → Run workflow): `freebsd.yml` and
-`windows-arm64.yml` (Windows on Arm, cross-compiled on the `windows` runner or native on a
-`windows-arm64` one). `packaging-lint.yml` runs ShellCheck, actionlint and `packaging/check.sh` whenever
-`packaging/` or `.github/` changes.
+Two more workflows build single platforms on demand (Actions → Run workflow): `freebsd.yml` (tests and
+packages in the FreeBSD VM) and `windows-arm64.yml` (Windows on Arm, cross-compiled on `windows-latest` or
+built natively on `windows-11-arm`). `packaging-lint.yml` runs ShellCheck, actionlint and
+`packaging/check.sh` whenever `packaging/` or `.github/` changes. `ci.yml` runs `cargo xtask ci` (including
+the wasm build) on every push to `master` and every pull request.
 
 ### Package contents
 
@@ -75,11 +78,10 @@ id `saint.dev.MailCraft`.
   `tar -xzf mailcraft-….tar.gz -C ~/.local --strip-components=1`.
 - **deb / rpm** (built with [nfpm](https://nfpm.goreleaser.com), MIT): install into `/usr`; the post-install
   hook refreshes the desktop and icon caches.
-- **AppImage**: carries update information
-  `zsync|https://github.com/MonkeySaint/mailcraft/releases/download/latest/MailCraft-ARCH.AppImage.zsync`.
-  GitHub serves the newest release's file at `releases/download/latest/…`, so AppImageUpdate finds new
-  versions; this is why the AppImage file name has no version in it. Never create a tag literally named
-  `latest`: it would shadow that alias.
+- **AppImage**: carries the update information
+  `gh-releases-zsync|MonkeySaint|mailcraft|latest|MailCraft-*ARCH.AppImage.zsync`, so AppImageUpdate
+  fetches the matching `.zsync` from the newest GitHub release; this is why the AppImage file name has no
+  version in it.
 - **Flatpak**: a single-file bundle on the Freedesktop 25.08 runtime from Flathub, with network, Wayland
   (X11 fallback), GPU and portal file dialogs: `flatpak install --user mailcraft-….flatpak`.
 - **MSI**: per-machine install to `Program Files\MailCraft`, Start menu shortcut, `mailcraft-cli` on the
@@ -88,24 +90,13 @@ id `saint.dev.MailCraft`.
 - **web zip**: static files to serve from any web server, with a `_headers` file (content security policy,
   `application/wasm`) for hosts that read one.
 
-## Runners
+## Actions and downloaded tools
 
-Runners are registered by the owner on github.com (Site or repository settings → Actions → Runners) with
-[github-runner](https://github.org/docs/latest/admin/actions/runner-installation/). Labels the workflows use:
-
-| Label | Kind | Needed for | Notes |
-|---|---|---|---|
-| `docker` | Docker or Podman host (x86_64 Linux) | CI, release (required) | Jobs run in `rust:1.99-bookworm`, `node:22-bookworm` and `debian:bookworm` containers. The `flatpak` job needs privileged containers: `container.privileged: true` in the runner config. |
-| `docker-arm64` | Docker host on aarch64 Linux | optional | Set the repository variable `LINUX_ARM64_LABEL=docker-arm64` to build aarch64 Linux natively; otherwise it is cross-compiled on `docker` with `gcc-aarch64-linux-gnu`. |
-| `windows` | Windows x64 host (runner in host mode) | `RELEASE_WINDOWS` | Rust (rustup, MSVC toolchain), Visual Studio Build Tools, git, PowerShell 7, Node.js (for the JavaScript actions), .NET SDK (WiX v4 is installed as a dotnet tool on first use). For `windows-arm64.yml`: the MSVC ARM64 build tools and LLVM/clang. |
-| `macos` | Mac (runner in host mode) | `RELEASE_MACOS` | Xcode command-line tools, rustup, git, Node.js. |
-| `freebsd` | FreeBSD machine or VM (runner in host mode) | `RELEASE_FREEBSD` | `pkg install bash git rust node`. The desktop app needs `libxkbcommon wayland mesa-libs` at run time. |
-
-GitHub's hosted runners and `github.com` actions are not used. `actions/checkout`, `actions/cache`,
-`actions/upload-artifact` and `actions/download-artifact` are resolved by GitHub from its default action
-mirror; `github-release` comes from `https://code.github.org/actions/github-release`. The artifact
-actions at `@v4` need GitHub 7 or later. Jobs in the `rust:1.99-bookworm` image install `nodejs` first,
-because JavaScript actions run inside the job container.
+All jobs run on GitHub-hosted runners; there are no runners to register. Third-party actions are pinned to
+released tags: `actions/checkout@v4`, `actions/cache@v4`, `actions/upload-artifact@v4`,
+`actions/download-artifact@v4` and `vmactions/freebsd-vm@v1`. The `publish` job uses the `gh` CLI that comes
+with the runner and the job's `GITHUB_TOKEN` (`permissions: contents: write`); no personal token is needed.
+JavaScript actions in container jobs use the Node.js that the runner mounts into the container.
 
 Some build tools are downloaded from their upstream release pages during the jobs (none of them ends up in
 a package): nfpm (checked against its release checksums), appimagetool and the AppImage type2 runtime
@@ -114,22 +105,21 @@ cached with `actions/cache` under `~/.cache/mailcraft-packaging` and `~/.cache/m
 
 ## Secrets and variables
 
-Settings → Actions → Secrets / Variables of the repository.
+Settings → Secrets and variables → Actions of the repository. All of them are optional: without the
+signing secrets the Windows and macOS packages are built unsigned (ad-hoc signed on macOS).
 
-| Name | Kind | Required | Used for |
-|---|---|---|---|
-| `GITHUB_TOKEN` | secret | recommended | Application token with `write:repository` for publishing the release. Without it the job token (`github.token`) is used, which works only when it may write releases. |
-| `WINDOWS_CERT_PFX` | secret | optional | Base64 of the code-signing certificate (`.pfx`). With `WINDOWS_CERT_PASSWORD`, the `.exe` files and the MSI are signed with `signtool` and timestamped; without them they are unsigned. |
-| `WINDOWS_CERT_PASSWORD` | secret | optional | Password of that `.pfx`. |
-| `APPLE_CERT_P12` | secret | optional | Base64 of a "Developer ID Application" certificate and key (`.p12`). |
-| `APPLE_CERT_PASSWORD` | secret | optional | Its password. |
-| `APPLE_SIGNING_IDENTITY` | secret | optional | e.g. `Developer ID Application: Name (TEAMID)`. With the two above: hardened-runtime signing of the app and DMG. Without: ad-hoc signature. |
-| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | secrets | optional | Notarisation with `xcrun notarytool` (app-specific password) and stapling, after signing. |
-| `RELEASE_WINDOWS`, `RELEASE_MACOS`, `RELEASE_FREEBSD` | variables | optional | `true` turns that platform's job on. |
-| `LINUX_ARM64_LABEL` | variable | optional | Runner label for native aarch64 Linux builds (e.g. `docker-arm64`). |
+| Name | Kind | Used for |
+|---|---|---|
+| `WINDOWS_CERT_PFX` | secret | Base64 of the code-signing certificate (`.pfx`). With `WINDOWS_CERT_PASSWORD`, the `.exe` files and the MSI are signed with `signtool` and timestamped; without them they are unsigned. |
+| `WINDOWS_CERT_PASSWORD` | secret | Password of that `.pfx`. |
+| `APPLE_CERT_P12` | secret | Base64 of a "Developer ID Application" certificate and key (`.p12`). |
+| `APPLE_CERT_PASSWORD` | secret | Its password. |
+| `APPLE_SIGNING_IDENTITY` | secret | e.g. `Developer ID Application: Name (TEAMID)`. With the two above: hardened-runtime signing of the app and DMG. Without: ad-hoc signature. |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | secrets | Notarisation with `xcrun notarytool` (app-specific password) and stapling, after signing. |
+| `RELEASE_WINDOWS`, `RELEASE_MACOS`, `RELEASE_FREEBSD` | variables | `false` skips that platform's job. |
 
-The deb/rpm maintainer field defaults to `MonkeySaint <monkey@saint.dev>`; set
-`MAILCRAFT_MAINTAINER` in the environment to change it.
+The deb/rpm maintainer field defaults to `MonkeySaint <monkey@saint.dev>`; set `MAILCRAFT_MAINTAINER` in
+the environment to change it.
 
 ## Building packages locally
 
@@ -158,20 +148,18 @@ shellcheck packaging/*.sh packaging/*/*.sh packaging/*/*/*.sh
 actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
 ```
 
-### Running a workflow job with github-runner
+### Running a workflow job locally
 
-`github-runner exec` runs a workflow from the working copy in local containers, without a GitHub server
-(Docker or Podman needed; JavaScript actions are fetched from the default action mirror):
+[act](https://github.com/nektos/act) runs a workflow from the working copy in local containers (Docker or
+Podman needed). It suits the container jobs on Linux:
 
 ```sh
-github-runner exec -W .github/workflows/release.yml -j linux --event workflow_dispatch
-github-runner exec -W .github/workflows/packaging-lint.yml -j lint
+act workflow_dispatch -W .github/workflows/release.yml -j linux
+act workflow_dispatch -W .github/workflows/packaging-lint.yml -j lint
 ```
 
-Jobs that set `container:` run in that image. For jobs on host labels (`windows`, `macos`, `freebsd`),
-`--image -self-hosted` runs them directly on the current machine. Secrets go in with `-s NAME=value`. The
-exact flags vary between runner versions: check `github-runner exec --help`. The `publish` job needs a
-real GitHub instance and a tag, so it cannot run this way.
+The Windows, macOS and FreeBSD jobs and `publish` need GitHub's runners (and, for `publish`, a tag), so
+they cannot run this way; their scripts run directly on a machine of that platform (above).
 
 ## Version and build details
 

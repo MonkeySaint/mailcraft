@@ -4,7 +4,7 @@ MailCraft is a clean-room, open-source desktop mail client in Rust, modelled on 
 workflow. This file tracks what is done, what is next, and an honest estimate of how close each area is to
 Outlook. It is updated with every commit.
 
-Status: **pre-alpha** (2026-10-10). Repository: git@github.com:MonkeySaint/mailcraft.git. Nothing is released yet; the first local tag (v0.1.0) is planned at
+Status: **pre-alpha** (2026-10-11). Repository: https://github.com/MonkeySaint/mailcraft. First tag: v0.1.0 at
 commit 23.
 
 ## Milestones
@@ -22,9 +22,10 @@ commit 23.
 | — | Clippy/fmt clean, honest parity table, CI green | ✅ done (commit 10) |
 | — | README with screenshots | ✅ done (commit 11) |
 | — | Release pipeline on GitHub Actions (Linux AppImage/deb/rpm/tar/Flatpak, Windows MSI, macOS DMG, FreeBSD, web) | ✅ done (commits 12–13) |
-| — | Gap closing: profile settings store and Options; People/Tasks/Notes views and actions; calendar depth (colours, overlay, drag/resize, named time zones, subscriptions); compose (rich paste, themes, list formats, voting, receipts, Save Sent Item To); Junk Email; accounts (IDLE push, POP3, JMAP, OAuth sign-in, OS keyring) | ✅ round 1 done (commit 14), re-audited at 87.1 %; round 2 in progress |
-| — | Gap closing round 2: Options wiring, calendar settings, saved views and columns, task requests, compose panes, autodiscovery and JMAP push, keyboard focus, new items | in progress (commits 15–22) |
-| M7/M14 | Rules UI depth, alpha/parity estimates, small fixes | planned (commits 23–26) |
+| — | Gap closing: profile settings store and Options; People/Tasks/Notes views and actions; calendar depth (colours, overlay, drag/resize, named time zones, subscriptions); compose (rich paste, themes, list formats, voting, receipts, Save Sent Item To); Junk Email; accounts (IDLE push, POP3, JMAP, OAuth sign-in, OS keyring) | ✅ round 1 done (commit 14), re-audited at 87.1 % |
+| — | Gap closing round 2: task requests, contact reminders, calendar settings and meeting form, Options wiring, saved views and columns, compose panes and find in received mail, autodiscovery/OAuth/JMAP push, keyboard focus, New Items | ✅ done (commits 15–22) |
+| — | Round 3: new-mail pipeline (junk, Focused overrides, rules, meeting auto-respond, task and receipt processing), contact reminders, saved views in Change View, theme colours, picture paste, vCard photos, compose auto-save; move to GitHub Actions, app id `saint.dev.MailCraft`, new app icon | ✅ done (commit 23, tag v0.1.0) |
+| M7/M14 | Rules UI depth, re-audit, small fixes | planned (commits 24–26) |
 | v0.1.0 / v0.2.0 / v0.3.0 | Local release tags | commits 23 / 27 / 30 |
 | v1.0.0 | Definition of done: full catalog coverage, ≥ 95 % honest parity in every area, end-to-end against a local IMAP/SMTP server | goal |
 
@@ -71,20 +72,21 @@ Two numbers, kept separate on purpose:
 | Tasks | ~70 % | editor, recurrence, views, module actions; incoming task requests not processed |
 | Notes | ~85 % | create/edit/colour/views; positions not persisted |
 | Import/export and print | ~65 % | EML/MSG/MBOX/Maildir/ICS/VCF/CSV, PDF everywhere, CUPS; no PST, no Windows printing |
-| Options dialog | ~22 % | all 179 observed settings persist in the profile; 40 take effect |
+| Options dialog | ~50 % | every setting persists in the profile; 118 of 223 take effect (commit 23, `settings::effect_counts`); re-audit pending |
 | Responsive behaviour | ~97 % | 29 of 30 observed behaviours (Classic Respond group at 1024 px) |
 | Keyboard | ~99 % | Ctrl+< / Ctrl+> missing in compose; Space on a focused button |
 
 ### Biggest gaps (ranked by user impact)
 
-1. Options: Mail and Calendar settings that persist but don't take effect yet.
-2. New Meeting saves the item before its form opens (an untitled meeting is left on cancel).
-3. Saved views, Add Columns, conditional formatting, status bar customisation, Quick Actions settings.
-4. Incoming task requests.
-5. Accounts: autodiscovery, JMAP push, configurable first-sync window, OAuth end-to-end test.
-6. Compose panes (Clipboard, Styles, Selection), formatting marks, S/MIME, bitmap paste.
-7. Find in a received message; F6 focus cycling; Space on a focused button.
-8. New Items depth, Reply with Meeting, Post in This Folder, folder properties, AutoArchive.
+1. Options: settings that persist but don't take effect yet (105 of 223).
+2. S/MIME signing and encryption; AutoArchive.
+3. Incoming meeting requests are not placed on the calendar as tentative until answered.
+4. Import/export: PST; printing on Windows.
+5. Smaller: pins and note positions live in view state rather than on the item; F6 inside compose and read
+   windows; engine-side recipient splitting ignores the commas option.
+
+The table above is from the commit-14 re-audit; commits 15–23 closed most of its listed gaps, and the next
+re-audit (commits 24–26) will refresh the numbers.
 
 The full audit (per-row classification) is regenerated before each release; the commits after 14 and the
 milestones after v0.3.0 work down this list until every area is ≥ 95 %.
@@ -93,9 +95,7 @@ milestones after v0.3.0 work down this list until every area is ≥ 95 %.
 
 These need you and do not block other work:
 
-- **Code-signing secrets** for Windows (MSI) and macOS (DMG), when releases should be signed.
-- **GitHub runners** (not enabled yet on github.com): CI and release workflows are committed under
-  `.github/workflows/` and stay dormant until runners exist; labels are documented in docs/releasing.md
-  (Linux docker, plus self-hosted Windows/macOS/FreeBSD if you want those artifacts).
+- **Code-signing secrets** (optional) for Windows (MSI) and macOS (DMG), when releases should be signed:
+  `WINDOWS_CERT_PFX`/`WINDOWS_CERT_PASSWORD` and the `APPLE_*` secrets (docs/releasing.md).
 
 Not needed from you: icon art (all icons are original SVGs made for this project).

@@ -263,6 +263,12 @@ fn section_row(ui: &mut Ui, app: &mut App, row: &FolderRow, collapsed: bool) -> 
     toggled
 }
 
+/// Widget id (keyboard focus target) of a folder's row in the folder pane: its Favorites row when `favorite`,
+/// else its row in the account tree. A folder listed in both has one row of each.
+pub fn row_focus_id(folder: FolderId, favorite: bool) -> Id {
+    Id::new(("mailcraft.folders.row", if favorite { "fav" } else { "tree" }, folder.0))
+}
+
 /// One folder (or favourite) row; `highlight` = drawn as the selected row. Returns true when it was clicked
 /// to select its folder.
 fn folder_row(ui: &mut Ui, app: &mut App, row: &FolderRow, highlight: bool) -> bool {
@@ -270,8 +276,8 @@ fn folder_row(ui: &mut Ui, app: &mut App, row: &FolderRow, highlight: bool) -> b
     let th = app.theme.clone();
     let w = ui.available_width();
     let (_, rect) = ui.allocate_space(vec2(w, size::FOLDER_ROW));
+    let resp = ui.interact(rect, row_focus_id(fid, row.kind == FolderRowKind::Favorite), Sense::click());
     let tag = if row.kind == FolderRowKind::Favorite { "fav" } else { "tree" };
-    let resp = ui.interact(rect, Id::new(("mailcraft.folders.row", tag, fid.0)), Sense::click());
     let painter = ui.painter().clone();
 
     // Drop target for messages dragged from the list.
@@ -533,6 +539,24 @@ mod tests {
         h.query_all_by_label(&inbox).next().unwrap().click();
         h.run();
         assert_eq!(selected(&h), [true, false]);
+    }
+
+    #[test]
+    fn row_focus_ids_name_the_drawn_rows() {
+        let app = App::new(sample_session());
+        let rows = queries::folder_rows(&app.s);
+        let inbox = rows.iter().find(|r| r.kind == FolderRowKind::Folder && r.name == "Inbox").unwrap();
+        let fid = inbox.id.unwrap();
+        let mut h = harness(app, vec2(230.0, 900.0));
+        h.run();
+        let tree = h.ctx.read_response(row_focus_id(fid, false)).unwrap();
+        let fav = h.ctx.read_response(row_focus_id(fid, true)).unwrap();
+        assert!(fav.rect.top() < tree.rect.top(), "the Favorites row is drawn above the tree row");
+        assert_ne!(row_focus_id(fid, false), row_focus_id(fid, true));
+        // Focusing the id focuses that row (what F6 does).
+        h.ctx.memory_mut(|m| m.request_focus(row_focus_id(fid, false)));
+        h.run();
+        assert!(h.ctx.memory(|m| m.has_focus(row_focus_id(fid, false))));
     }
 
     #[test]

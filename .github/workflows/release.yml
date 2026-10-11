@@ -1,16 +1,14 @@
-# Release builds on GitHub Actions. See docs/releasing.md for how to cut a release, the runner labels and
-# the secrets.
+# Release builds on GitHub Actions (GitHub-hosted runners). See docs/releasing.md for how to cut a release
+# and the optional signing secrets.
 #
 # A pushed tag vX.Y.Z builds every package and publishes a GitHub release with them and SHA256SUMS.
 # Run by hand (workflow_dispatch) it builds the same packages as run artifacts and publishes nothing.
 #
-# Always on (runner label `docker`): version check, Linux x86_64 + aarch64 (tar.gz, deb, rpm, AppImage),
-# Flatpak (x86_64), web. Opt-in per platform with repository variables, because a job whose runner label
-# has no runner waits forever and would hold the release back:
-#   RELEASE_WINDOWS=true   runner label `windows`  (MSI + zip)
-#   RELEASE_MACOS=true     runner label `macos`    (universal DMG)
-#   RELEASE_FREEBSD=true   runner label `freebsd`  (tar.gz + pkg)
-#   LINUX_ARM64_LABEL=docker-arm64   build aarch64 Linux natively on that label instead of cross-compiling
+# Jobs: version check, Linux x86_64 (ubuntu-latest) and aarch64 (ubuntu-24.04-arm) with tar.gz, deb, rpm and
+# AppImage, Flatpak (x86_64), web, Windows MSI + zip (windows-latest), macOS universal DMG (macos-latest) and
+# FreeBSD tar.gz + pkg (a FreeBSD VM on ubuntu-latest). A repository variable RELEASE_WINDOWS,
+# RELEASE_MACOS or RELEASE_FREEBSD set to `false` skips that platform; skipped platforms do not hold the
+# release back, failed ones do.
 name: release
 
 on:
@@ -18,36 +16,36 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "4"
   CARGO_INCREMENTAL: "0"
+  # Toolchain for the jobs that do not run in the rust:1.99-bookworm image; keep the two in step.
+  RUST_TOOLCHAIN: "1.99"
 
 jobs:
   version-check:
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: rust:1.99-bookworm
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - name: Node for the JavaScript actions
-        run: command -v node || { apt-get update -q && apt-get install -y -q --no-install-recommends nodejs; }
       - uses: actions/checkout@v4
       - name: Tag matches the workspace version
-        # xtask reads the tag from GITHUB_REF / GITHUB_REF (refs/tags/vX.Y.Z); not a tag: nothing to check.
-        env:
-          GITHUB_REF: ${{ forge.ref }}
+        # xtask reads the tag from GITHUB_REF (refs/tags/vX.Y.Z); not a tag: nothing to check.
         run: cargo xtask version check
       - name: Version
         id: version
         run: |
           v="$(cargo xtask version show)"
           case "$v" in *-*) pre=true ;; *) pre=false ;; esac
-          out="${GITHUB_OUTPUT:-$GITHUB_OUTPUT}"
-          echo "version=$v" >>"$out"
-          echo "prerelease=$pre" >>"$out"
+          echo "version=$v" >>"$GITHUB_OUTPUT"
+          echo "prerelease=$pre" >>"$GITHUB_OUTPUT"
           echo "MailCraft $v (prerelease: $pre)"
 
   linux:
@@ -58,28 +56,31 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
           - arch: aarch64
             target: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.arch == 'aarch64' && vars.LINUX_ARM64_LABEL || 'docker' }}
+            runner: ubuntu-24.04-arm
+    # Both architectures build natively, so ci-deps.sh installs no cross compiler.
+    runs-on: ${{ matrix.runner }}
     container:
       image: rust:1.99-bookworm
     env:
       MC_REQUIRE_NFPM: "1"
       MC_DOWNLOAD_TOOLS: "1"
     steps:
-      - name: Node for the JavaScript actions
-        run: command -v node || { apt-get update -q && apt-get install -y -q --no-install-recommends nodejs; }
       - uses: actions/checkout@v4
+      - name: Trust the checkout (container user differs from the runner's)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Cache cargo and packaging tools
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
             ~/.cache/mailcraft-packaging
             target
           key: release-linux-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
-      - name: Packaging tools (apt, nfpm, cross compiler)
+      - name: Packaging tools (apt, nfpm)
         run: |
           packaging/linux/ci-deps.sh "${{ matrix.target }}"
           rustup target add "${{ matrix.target }}"
@@ -95,17 +96,16 @@ jobs:
 
   flatpak:
     needs: linux
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: debian:bookworm
-      # flatpak-builder sandboxes every build step with bubblewrap, which needs a privileged container
-      # (the runner must allow it: `container.privileged: true` in its config).
+      # flatpak-builder sandboxes every build step with bubblewrap, which needs a privileged container.
       options: --privileged
     steps:
       - name: Tools
         run: |
           apt-get update -q
-          apt-get install -y -q --no-install-recommends nodejs git ca-certificates curl flatpak flatpak-builder
+          apt-get install -y -q --no-install-recommends git ca-certificates curl flatpak flatpak-builder
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
@@ -128,22 +128,21 @@ jobs:
 
   web:
     needs: version-check
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: rust:1.99-bookworm
     env:
       TRUNK_VERSION: "0.21.14"
     steps:
-      - name: Node for the JavaScript actions
-        run: command -v node || { apt-get update -q && apt-get install -y -q --no-install-recommends nodejs; }
       - uses: actions/checkout@v4
+      - name: Trust the checkout (container user differs from the runner's)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
             target
           key: release-web-${{ hashFiles('Cargo.lock') }}
       - name: Tools (zip, Trunk)
@@ -168,10 +167,15 @@ jobs:
 
   windows:
     needs: version-check
-    if: vars.RELEASE_WINDOWS == 'true'
-    runs-on: windows
+    if: vars.RELEASE_WINDOWS != 'false'
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target x86_64-pc-windows-msvc
+          rustup default $env:RUST_TOOLCHAIN
       - name: Build, sign (when the certificate secrets exist), MSI and zip
         shell: pwsh
         env:
@@ -186,10 +190,14 @@ jobs:
 
   macos:
     needs: version-check
-    if: vars.RELEASE_MACOS == 'true'
-    runs-on: macos
+    if: vars.RELEASE_MACOS != 'false'
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target aarch64-apple-darwin,x86_64-apple-darwin
+          rustup default "$RUST_TOOLCHAIN"
       - name: Universal app, sign and notarise (when the Apple secrets exist), DMG
         env:
           APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
@@ -207,12 +215,21 @@ jobs:
 
   freebsd:
     needs: version-check
-    if: vars.RELEASE_FREEBSD == 'true'
-    runs-on: freebsd
+    if: vars.RELEASE_FREEBSD != 'false'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build, tar.gz and pkg
-        run: bash packaging/freebsd/package.sh --build --out dist
+      - name: Build, tar.gz and pkg (FreeBSD VM)
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          usesh: true
+          envs: "CARGO_TERM_COLOR CARGO_BUILD_JOBS CARGO_INCREMENTAL"
+          prepare: |
+            pkg install -y bash git rust
+          run: |
+            git config --global --add safe.directory "$PWD"
+            bash packaging/freebsd/package.sh --build --out dist
       - uses: actions/upload-artifact@v4
         with:
           name: freebsd
@@ -221,23 +238,19 @@ jobs:
 
   publish:
     needs: [version-check, linux, flatpak, web, windows, macos, freebsd]
-    # Tag pushes only; skipped (opt-in) platforms are fine, a failed one stops the release.
+    # Tag pushes only; skipped platforms are fine, a failed one stops the release.
     if: >-
-      ${{ !cancelled() && startsWith(forge.ref, 'refs/tags/v')
+      ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v')
       && needs.version-check.result == 'success' && needs.linux.result == 'success'
       && needs.flatpak.result == 'success' && needs.web.result == 'success'
       && !contains(needs.*.result, 'failure') }}
-    runs-on: docker
-    container:
-      image: node:22-bookworm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Tools for github-release
-        run: |
-          apt-get update -q
-          apt-get install -y -q --no-install-recommends jq curl ca-certificates
       - uses: actions/download-artifact@v4
         with:
           path: dist/artifacts
@@ -249,34 +262,35 @@ jobs:
           sha256sum -- * >SHA256SUMS
           cat SHA256SUMS
       - name: Release notes
-        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version-check.outputs.version }}
         run: |
-          tag="${{ forge.ref_name }}"
-          prev="$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)"
-          range="$tag"
-          [ -n "$prev" ] && range="$prev..$tag"
-          out="${GITHUB_OUTPUT:-$GITHUB_OUTPUT}"
+          prev="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
+          range="$TAG"
+          [ -n "$prev" ] && range="$prev..$TAG"
           {
-            echo "notes<<MAILCRAFT_NOTES_EOF"
-            echo "MailCraft ${{ needs.version-check.outputs.version }}."
+            echo "MailCraft $VERSION."
             echo
-            echo "Downloads: Linux (tar.gz, .deb, .rpm, AppImage, Flatpak), web (zip) and, when built, Windows (MSI, zip), macOS (DMG) and FreeBSD. Check them against SHA256SUMS."
+            echo "Downloads: Linux (tar.gz, .deb, .rpm, AppImage, Flatpak), Windows (MSI, zip), macOS (DMG), FreeBSD (tar.gz, pkg) and web (zip). Check them against SHA256SUMS."
             echo
             echo "Changes${prev:+ since $prev}:"
             git log --no-merges --format='- %s' "$range"
-            echo "MAILCRAFT_NOTES_EOF"
-          } >>"$out"
+          } >dist/notes.md
+          cat dist/notes.md
       - name: Publish the release
-        uses: https://code.github.org/actions/github-release@v2
-        with:
-          direction: upload
-          url: ${{ forge.server_url }}
-          repo: ${{ forge.repository }}
-          tag: ${{ forge.ref_name }}
-          sha: ${{ forge.sha }}
-          title: MailCraft ${{ needs.version-check.outputs.version }}
-          release-dir: dist/release
-          release-notes: ${{ steps.notes.outputs.notes }}
-          prerelease: ${{ needs.version-check.outputs.prerelease }}
-          # A token with write:repository; the job token works when the repository allows it to write releases.
-          token: ${{ secrets.GITHUB_TOKEN || github.token }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version-check.outputs.version }}
+          PRERELEASE: ${{ needs.version-check.outputs.prerelease }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run: replace the files of the existing release.
+            gh release upload "$TAG" dist/release/* --clobber
+          else
+            flags=(--verify-tag --title "MailCraft $VERSION" --notes-file dist/notes.md)
+            [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+            gh release create "$TAG" "${flags[@]}" dist/release/*
+          fi

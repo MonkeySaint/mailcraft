@@ -4,6 +4,7 @@
 #     packaging/check.sh
 #
 # - files named after APP_ID exist and carry it (desktop file, Flatpak manifest)
+# - the WiX source links to HOMEPAGE
 # - the desktop file passes desktop-file-validate and the filled-in AppStream file passes
 #   `appstreamcli validate --no-net` (each when the tool is installed)
 # - XML templates are well-formed (xmllint, when installed)
@@ -26,6 +27,8 @@ manifest="$p/linux/flatpak/$APP_ID.yml"
 [ -f "$manifest" ] || bad "missing $manifest"
 [ -f "$manifest" ] && { grep -qx "id: $APP_ID" "$manifest" || bad "$manifest: id is not $APP_ID"; }
 [ -f "$desktop" ] && { grep -qx "Icon=$APP_ID" "$desktop" || bad "$desktop: Icon is not $APP_ID"; }
+[ -f "$desktop" ] && { grep -qx "StartupWMClass=$APP_ID" "$desktop" || bad "$desktop: StartupWMClass is not $APP_ID"; }
+grep -q "Value=\"$HOMEPAGE\"" "$p/windows/mailcraft.wxs" || bad "mailcraft.wxs: ARPURLINFOABOUT is not $HOMEPAGE"
 grep -qx "license: $LICENSE_SPDX" "$p/linux/nfpm.yaml" || bad "nfpm.yaml: license is not $LICENSE_SPDX"
 grep -qx "vendor: $VENDOR" "$p/linux/nfpm.yaml" || bad "nfpm.yaml: vendor is not $VENDOR"
 grep -q '@APP_ID@' "$p/linux/metainfo.xml.in" || bad "metainfo.xml.in does not use @APP_ID@"

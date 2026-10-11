@@ -5,9 +5,23 @@
 //! EMAIL (first three), TEL (TYPE work/home/cell/fax/pager/car → phone kind), ADR (TYPE work/home → Business,
 //! Home, else Other), URL, IMPP (and the common X-…IM properties), BDAY, NOTE, CATEGORIES. MailCraft-only
 //! detail that has no standard property is kept in `X-MAILCRAFT-*` extension properties/parameters.
+//!
+//! Details page and picture:
+//! - PHOTO → picture (PNG, JPEG or GIF, at most [`MAX_PICTURE_BYTES`] and [`MAX_PHOTO_SIDE`] pixels a side).
+//!   Read from an RFC 6350 `data:image/…;base64,` URI, an RFC 2426 `ENCODING=b` value, or a vCard 2.1
+//!   `ENCODING=BASE64` value; remote (http) photos are not fetched. Written as a `data:` URI (4.0) or
+//!   `ENCODING=b;TYPE=JPEG|PNG|GIF` (3.0).
+//! - NICKNAME → nickname; ROLE → profession; ANNIVERSARY (4.0; `X-ANNIVERSARY` in 3.0) → anniversary.
+//! - Spouse/partner: RFC 6350 `RELATED;VALUE=text;TYPE=spouse` (4.0); `X-MAILCRAFT-SPOUSE` in 3.0, which has no
+//!   RELATED property.
+//! - Office, manager and assistant have no standard property: `X-MAILCRAFT-OFFICE`, `X-MAILCRAFT-MANAGER`,
+//!   `X-MAILCRAFT-ASSISTANT`.
+//! - Read also: the `X-` names other address books use for these fields (`X-MS-…`, `X-EVOLUTION-…`,
+//!   `X-KADDRESSBOOK-X-…`, plain `X-MANAGER` and similar), and grouped `X-ABRELATEDNAMES` / `X-ABDATE` values
+//!   with an `X-ABLABEL` naming the relation or date.
 
 use mailcraft_model::Contact;
-use mailcraft_model::contact::PostalAddress;
+use mailcraft_model::contact::{ContactPicture, MAX_PICTURE_BYTES, PostalAddress};
 
 use crate::text::{CategoryList, ContentLine, MAX_CATEGORIES, escape, split_raw, split_unescaped, unescape};
 use crate::{Result, check_size};
@@ -18,6 +32,8 @@ pub const MAX_VCF_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CARDS: usize = 100_000;
 /// Most properties read per card.
 pub const MAX_PROPS_PER_CARD: usize = 10_000;
+/// Longest side of a PHOTO kept (pixels; the contact window's limit).
+pub const MAX_PHOTO_SIDE: u32 = 4096;
 
 /// vCard version to write.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -179,8 +195,88 @@ fn birthday(v: &str) -> Option<String> {
     crate::csv::normalize_date(v)
 }
 
+/// Whether a value is a URI rather than text (RELATED defaults to a URI value).
+fn is_uri(v: &str) -> bool {
+    let lower = v.trim().to_ascii_lowercase();
+    ["urn:", "http:", "https:", "mailto:", "tel:", "data:", "cid:"].iter().any(|p| lower.starts_with(p))
+}
+
+/// A PHOTO value as a picture: a `data:` URI, or inline base64 (`ENCODING=b`, 2.1 `ENCODING=BASE64`). Remote
+/// photos, other encodings, other formats, and pictures beyond the size limits give `None`.
+fn photo(cl: &ContentLine) -> Option<ContactPicture> {
+    let value = cl.value.trim();
+    let inline_b64 = cl
+        .param_values("ENCODING")
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case("b") || e.eq_ignore_ascii_case("base64"));
+    let payload = if inline_b64 {
+        value
+    } else {
+        let rest = value.get(..5).filter(|p| p.eq_ignore_ascii_case("data:")).and(value.get(5..))?;
+        let (meta, payload) = rest.split_once(',')?;
+        let mut parts = meta.split(';').map(str::trim);
+        let image =
+            parts.next().is_some_and(|m| m.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("image/")));
+        if !image || !parts.any(|x| x.eq_ignore_ascii_case("base64")) {
+            return None;
+        }
+        payload
+    };
+    // Base64 is 4/3 of its bytes: refuse oversized photos before decoding.
+    if payload.len() / 4 * 3 > MAX_PICTURE_BYTES.saturating_add(3) {
+        return None;
+    }
+    let data = mailcraft_mime::transfer::decode_base64(payload.as_bytes());
+    let pic = ContactPicture::sniff(&data)?;
+    let (w, h) = pic.dimensions()?;
+    (w > 0 && h > 0 && w <= MAX_PHOTO_SIDE && h <= MAX_PHOTO_SIDE).then_some(pic)
+}
+
+/// TYPE value for a picture's MIME type (3.0 PHOTO).
+fn photo_type(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "JPEG",
+        "image/gif" => "GIF",
+        _ => "PNG",
+    }
+}
+
+/// Which Details field an `X-ABLABEL` (Apple's grouped labels, e.g. `_$!<Spouse>!$_`) names.
+fn label_field(label: &str) -> Option<&'static str> {
+    let l = label.to_ascii_lowercase();
+    if l.contains("spouse") || l.contains("partner") {
+        Some("spouse")
+    } else if l.contains("manager") {
+        Some("manager")
+    } else if l.contains("assistant") {
+        Some("assistant")
+    } else if l.contains("anniversary") {
+        Some("anniversary")
+    } else {
+        None
+    }
+}
+
+/// Sets `field` when it is still empty (the first value of a card wins).
+fn set_once(field: &mut String, v: String) {
+    if field.is_empty() {
+        *field = v;
+    }
+}
+
 fn contact_from_lines(lines: &[ContentLine]) -> Contact {
     let mut c = Contact::default();
+    // Apple-style grouped labels: group → label.
+    let labels: Vec<(&str, String)> = lines
+        .iter()
+        .filter(|cl| cl.name == "X-ABLABEL")
+        .filter_map(|cl| Some((cl.group.as_deref()?, text_value(cl))))
+        .take(256)
+        .collect();
+    let label_of = |cl: &ContentLine| -> Option<&'static str> {
+        let g = cl.group.as_deref()?;
+        labels.iter().find(|(lg, _)| lg.eq_ignore_ascii_case(g)).and_then(|(_, l)| label_field(l))
+    };
     let mut fn_value = String::new();
     let mut have_n = false;
     let mut file_as = None;
@@ -207,7 +303,58 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
                     p.iter().skip(1).filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(", ");
             }
             "TITLE" => c.job_title = text_value(cl),
-            "ROLE" if c.job_title.is_empty() => c.job_title = text_value(cl),
+            "ROLE" | "X-PROFESSION" | "X-KADDRESSBOOK-X-PROFESSION" => {
+                set_once(&mut c.profession, text_value(cl))
+            }
+            "NICKNAME" => set_once(&mut c.nickname, text_value(cl)),
+            "X-MAILCRAFT-OFFICE"
+            | "X-OFFICE"
+            | "X-MS-OFFICE"
+            | "X-EVOLUTION-OFFICE"
+            | "X-KADDRESSBOOK-X-OFFICE" => {
+                set_once(&mut c.office, text_value(cl));
+            }
+            "X-MAILCRAFT-MANAGER"
+            | "X-MANAGER"
+            | "X-MS-MANAGER"
+            | "X-EVOLUTION-MANAGER"
+            | "X-KADDRESSBOOK-X-MANAGERSNAME" => set_once(&mut c.manager, text_value(cl)),
+            "X-MAILCRAFT-ASSISTANT"
+            | "X-ASSISTANT"
+            | "X-MS-ASSISTANT"
+            | "X-EVOLUTION-ASSISTANT"
+            | "X-KADDRESSBOOK-X-ASSISTANTSNAME" => set_once(&mut c.assistant, text_value(cl)),
+            "X-MAILCRAFT-SPOUSE"
+            | "X-SPOUSE"
+            | "X-MS-SPOUSE"
+            | "X-EVOLUTION-SPOUSE"
+            | "X-KADDRESSBOOK-X-SPOUSESNAME" => set_once(&mut c.spouse, text_value(cl)),
+            "RELATED" if cl.has_type("spouse") => {
+                let v = text_value(cl);
+                let text = cl.param("VALUE").is_some_and(|t| t.eq_ignore_ascii_case("text")) || !is_uri(&v);
+                if text {
+                    set_once(&mut c.spouse, v);
+                }
+            }
+            "X-ABRELATEDNAMES" => match label_of(cl) {
+                Some("spouse") => set_once(&mut c.spouse, text_value(cl)),
+                Some("manager") => set_once(&mut c.manager, text_value(cl)),
+                Some("assistant") => set_once(&mut c.assistant, text_value(cl)),
+                _ => {}
+            },
+            "ANNIVERSARY"
+            | "X-ANNIVERSARY"
+            | "X-MS-ANNIVERSARY"
+            | "X-EVOLUTION-ANNIVERSARY"
+            | "X-KADDRESSBOOK-X-ANNIVERSARY"
+                if c.anniversary.is_none() =>
+            {
+                c.anniversary = birthday(&text_value(cl));
+            }
+            "X-ABDATE" if c.anniversary.is_none() && label_of(cl) == Some("anniversary") => {
+                c.anniversary = birthday(&text_value(cl));
+            }
+            "PHOTO" if c.picture.is_none() => c.picture = photo(cl),
             "EMAIL" => {
                 let v = text_value(cl);
                 let v = strip_scheme(&v, "mailto:").trim().to_owned();
@@ -369,6 +516,12 @@ pub fn write_one(c: &Contact, version: Version, out: &mut String) {
     if !c.job_title.is_empty() {
         lines.push(line("TITLE", vec![], escape(&c.job_title)));
     }
+    if !c.profession.is_empty() {
+        lines.push(line("ROLE", vec![], escape(&c.profession)));
+    }
+    if !c.nickname.is_empty() {
+        lines.push(line("NICKNAME", vec![], escape(&c.nickname)));
+    }
     for (i, e) in c.emails.iter().enumerate().filter(|(_, e)| !e.is_empty()) {
         let params = match (v4, i) {
             (true, 0) => vec![("PREF", "1".to_owned())],
@@ -415,6 +568,40 @@ pub fn write_one(c: &Contact, version: Version, out: &mut String) {
     }
     if let Some(b) = c.birthday.as_deref().and_then(crate::csv::normalize_date) {
         lines.push(line("BDAY", vec![], if v4 { b.replace('-', "") } else { b }));
+    }
+    if let Some(a) = c.anniversary.as_deref().and_then(crate::csv::normalize_date) {
+        if v4 {
+            lines.push(line("ANNIVERSARY", vec![], a.replace('-', "")));
+        } else {
+            lines.push(line("X-ANNIVERSARY", vec![], a));
+        }
+    }
+    for (name, value) in [
+        ("X-MAILCRAFT-OFFICE", &c.office),
+        ("X-MAILCRAFT-MANAGER", &c.manager),
+        ("X-MAILCRAFT-ASSISTANT", &c.assistant),
+    ] {
+        if !value.is_empty() {
+            lines.push(line(name, vec![], escape(value)));
+        }
+    }
+    if !c.spouse.is_empty() {
+        if v4 {
+            let params = vec![("VALUE", "text".to_owned()), ("TYPE", "spouse".to_owned())];
+            lines.push(line("RELATED", params, escape(&c.spouse)));
+        } else {
+            lines.push(line("X-MAILCRAFT-SPOUSE", vec![], escape(&c.spouse)));
+        }
+    }
+    if let Some(p) = c.picture.as_ref().filter(|p| !p.data.is_empty()) {
+        let b64 = mailcraft_mime::transfer::encode_base64_flat(&p.data);
+        if v4 {
+            let mime = photo_type(&p.mime).to_ascii_lowercase();
+            lines.push(line("PHOTO", vec![], format!("data:image/{mime};base64,{b64}")));
+        } else {
+            let params = vec![("ENCODING", "b".to_owned()), ("TYPE", photo_type(&p.mime).to_owned())];
+            lines.push(line("PHOTO", params, b64));
+        }
     }
     if !c.notes.is_empty() {
         lines.push(line("NOTE", vec![], escape(&c.notes)));

@@ -1,7 +1,7 @@
 <h1 align="center">MailCraft</h1>
 
 <p align="center">
-  <img src="assets/app-icon/hicolor/128x128/apps/mailcraft.png" alt="MailCraft app icon: a cream envelope with a pen on a teal tile" width="96">
+  <img src="assets/app-icon/hicolor/128x128/apps/mailcraft.png" alt="MailCraft app icon: a white envelope with a shaded flap on a teal tile" width="96">
 </p>
 
 <p align="center">
@@ -68,7 +68,13 @@ where passwords are kept: [docs/accounts.md](docs/accounts.md).
 
 ## Quick start
 
+Packages for Linux, Windows, macOS, FreeBSD and the web are published on the
+[releases page](https://github.com/MonkeySaint/mailcraft/releases) (see [docs/releasing.md](docs/releasing.md)).
+To build from source:
+
 ```sh
+git clone https://github.com/MonkeySaint/mailcraft.git && cd mailcraft
+
 # Desktop app with the built-in sample mailbox
 cargo run --release -p mailcraft -- --sample
 
@@ -111,7 +117,8 @@ floor and the wasm build. CI runs on GitHub Actions (`.github/workflows/`).
 
 ## Roadmap
 
-[ROADMAP.md](ROADMAP.md) lists milestones, honest parity per area and what needs the project owner.
+[ROADMAP.md](ROADMAP.md) lists milestones, honest parity per area and what needs the project owner. Bugs and
+ideas go to the [issue tracker](https://github.com/MonkeySaint/mailcraft/issues).
 
 ## Crafting Apps
 

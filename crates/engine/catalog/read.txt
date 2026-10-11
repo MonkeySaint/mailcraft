@@ -78,7 +78,7 @@ Read|Message > More Commands, Message|Actions|mail.resend
 Read|Message > More Commands, Message|Related|mail.findRelated
 Read|Message > More Commands, Message|Select|format.selectAll
 Read|Message > More Commands, Message > Actions|Edit Message|mail.editMessage
-Read|Message > More Commands, Message > Actions|Recall This Message...|mail.recall
+Read|Message > More Commands, Message > Actions|Recall This Message...|-|Message recall is an Exchange server feature; IMAP, SMTP and JMAP have no way to withdraw delivered mail
 Read|Message > More Commands, Message > Actions|Resend This Message...|mail.resend
 Read|Message > More Commands, Message > Actions|Other Actions|mail.viewSource
 Read|Message > More Commands, Message > Related|Messages in this Conversation|mail.findRelated

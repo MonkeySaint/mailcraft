@@ -115,6 +115,8 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
                 | ("off", FolderPaneState::Off)
         ),
         "favorites" => v.favorites_visible,
+        // Folder › Show All Folders A to Z, as the engine keeps it.
+        "allaz" => mailcraft_engine::cmd::folder::show_all_az_on(&app.s),
         "favorite" => {
             app.s.mailbox.folders.get(&app.s.selection.folder).is_some_and(|f| f.favorite_pos.is_some())
         }
@@ -385,7 +387,7 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 11] = [
+pub const SOURCES: [&str; 24] = [
     "recentSearches",
     "signatures",
     "recentFiles",
@@ -394,10 +396,131 @@ pub const SOURCES: [&str; 11] = [
     "accounts",
     "arrange",
     "styles",
+    "views:mail",
     "views:people",
     "views:tasks",
     "views:notes",
+    "themeColors",
+    "themeShades:bg1",
+    "themeShades:tx1",
+    "themeShades:bg2",
+    "themeShades:tx2",
+    "themeShades:accent1",
+    "themeShades:accent2",
+    "themeShades:accent3",
+    "themeShades:accent4",
+    "themeShades:accent5",
+    "themeShades:accent6",
+    "highlightPens",
 ];
+
+/// Swatch bytes of a colour.
+fn swatch(c: mailcraft_geom::Color) -> Option<[u8; 3]> {
+    Some([c.r, c.g, c.b])
+}
+
+/// Theme colour items of the Font Color / Shading menus, from the compose window's active theme (the default
+/// theme elsewhere): the base colour of each column (`key` = None) or the five shades of column `key`.
+/// Template variables: `$theme` (column key) and `$tint` (percent, positive lighter).
+fn theme_items(app: &App, surface: Surface, key: Option<&str>) -> Vec<DynItem> {
+    use mailcraft_engine::cmd::format::{THEME_COLUMNS, theme_color};
+    let fallback;
+    let c = match compose(app, surface) {
+        Some(c) => c,
+        None => {
+            fallback = mailcraft_engine::compose::ComposeState::default();
+            &fallback
+        }
+    };
+    let item = |col: &str, name: &str, tint: i8| {
+        let label = match tint.signum() {
+            1 => format!("{name}, Lighter {tint}%"),
+            -1 => format!("{name}, Darker {}%", tint.unsigned_abs()),
+            _ => name.to_owned(),
+        };
+        DynItem {
+            label,
+            icon: "",
+            swatch: theme_color(c, col, i64::from(tint)).and_then(swatch),
+            vars: vec![("$theme", json!(col)), ("$tint", json!(tint))],
+            on: false,
+        }
+    };
+    match key {
+        None => THEME_COLUMNS.iter().map(|(k, _, name, _)| item(k, name, 0)).collect(),
+        Some(want) => THEME_COLUMNS
+            .iter()
+            .filter(|(k, ..)| k.eq_ignore_ascii_case(want))
+            .flat_map(|(k, _, name, tints)| tints.iter().map(|t| item(k, name, *t)).collect::<Vec<_>>())
+            .collect(),
+    }
+}
+
+/// Text Highlight Color pens; with High-contrast only on, the pens that leave text hard to read are hidden.
+fn highlight_pens(app: &App, surface: Surface) -> Vec<DynItem> {
+    use mailcraft_engine::cmd::format::{HIGHLIGHT_COLORS, is_high_contrast};
+    let hc = compose(app, surface).is_some_and(|c| c.editor.high_contrast_only);
+    HIGHLIGHT_COLORS
+        .iter()
+        .filter_map(|(name, hex)| {
+            let col = mailcraft_geom::Color::parse_hex(hex)?;
+            if hc && !is_high_contrast(col) {
+                return None;
+            }
+            Some(DynItem {
+                label: (*name).to_owned(),
+                icon: "",
+                swatch: swatch(col),
+                vars: vec![("$color", json!(hex))],
+                on: false,
+            })
+        })
+        .collect()
+}
+
+/// Styles gallery: the built-in styles plus the styles created in this message (engine order), the caret's
+/// style checked; outside a compose window the built-in list.
+fn style_items(app: &App, surface: Surface) -> Vec<DynItem> {
+    let item = |name: &str, on: bool| DynItem {
+        label: name.to_owned(),
+        icon: "font-color",
+        swatch: None,
+        vars: vec![("$name", json!(name))],
+        on,
+    };
+    let Some(c) = compose(app, surface) else {
+        return STYLES.iter().map(|s| item(s, false)).collect();
+    };
+    let current = current_style(c);
+    let mut out: Vec<DynItem> = STYLES.iter().map(|s| item(s, current.eq_ignore_ascii_case(s))).collect();
+    for v in mailcraft_engine::cmd::format::styles_list(c) {
+        let Some(name) = v.get("name").and_then(Value::as_str) else { continue };
+        let on = v.get("current").and_then(Value::as_bool).unwrap_or(false);
+        match out.iter_mut().find(|d| d.label.eq_ignore_ascii_case(name)) {
+            Some(d) => d.on = d.on || on,
+            None if v.get("builtin").and_then(Value::as_bool) == Some(false) => out.push(item(name, on)),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Change View: the saved views usable in the selected mail folder (checked: the one it shows).
+fn mail_view_items(app: &App) -> Vec<DynItem> {
+    use mailcraft_engine::cmd::view::mail::{current_view_name, views_for};
+    let folder = app.s.selection.folder;
+    let current = current_view_name(&app.s, folder);
+    views_for(&app.s, folder)
+        .into_iter()
+        .map(|v| DynItem {
+            on: v.name.eq_ignore_ascii_case(&current),
+            label: v.name.clone(),
+            icon: "view",
+            swatch: None,
+            vars: vec![("$name", json!(v.name))],
+        })
+        .collect()
+}
 
 /// Items of a dynamic source.
 pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
@@ -498,12 +621,12 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 })
                 .collect()
         }
-        "styles" => {
-            let current = compose(app, surface).map(current_style).unwrap_or_default();
-            STYLES
-                .iter()
-                .map(|s| DynItem { on: current.eq_ignore_ascii_case(s), ..plain(s, "font-color") })
-                .collect()
+        "styles" => style_items(app, surface),
+        "views:mail" => mail_view_items(app),
+        "themeColors" => theme_items(app, surface, None),
+        "highlightPens" => highlight_pens(app, surface),
+        _ if source.starts_with("themeShades:") => {
+            theme_items(app, surface, source.strip_prefix("themeShades:"))
         }
         // Signature ▾: the saved signatures (checked: the one in this message).
         "signatures" => {

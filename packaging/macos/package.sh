@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# macOS: universal (Apple silicon + Intel) MailCraft.app in a DMG. Runs on a Mac (self-hosted `macos`
-# runner) with Xcode command-line tools and rustup.
+# macOS: universal (Apple silicon + Intel) MailCraft.app in a DMG. Runs on a Mac (the GitHub-hosted
+# macos-latest runner in release.yml) with Xcode command-line tools and rustup.
 #
 #     packaging/macos/package.sh [--out DIR] [--no-build]
 #

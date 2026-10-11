@@ -12,8 +12,12 @@
 //!   find hits ([`BodyView::marks`], from [`find_all`]) are painted on a highlight colour.
 //! - Where [`BodyView::context_menu`] is on (reading pane, read windows), right-click offers Copy, Select All,
 //!   Select Text With Similar Formatting and Find… (reported in [`BodyView::find_requested`]).
-//! - Images: no image decoder is bundled in this crate, so `data:` and `cid:` images show a framed placeholder
-//!   with their alt text; `http(s):` images are blocked (placeholder) unless [`BodyOptions::allow_remote`].
+//! - Images: `data:image/…;base64` pictures are decoded (PNG, JPEG, GIF; [`decode_image`], at most
+//!   [`MAX_IMAGE_SIDE`] pixels a side) and drawn in their box; `cid:` pictures are drawn once the owner hands
+//!   over the attachment bytes with [`provide_image`]. Anything else (undecodable data, unknown `cid:`,
+//!   `http(s):`, which has no loader) shows a framed placeholder with its alt text; remote pictures are
+//!   labelled blocked unless [`BodyOptions::allow_remote`]. Decoded pictures are kept as textures in a small
+//!   per-context cache ([`MAX_IMAGE_CACHE`] pictures).
 //! - Dark mode: colours are re-mapped by lightness (dark text becomes light, white backgrounds become dark) so
 //!   authored hues survive; pass `dark = false` for the "light background" toggle.
 
@@ -378,7 +382,10 @@ fn paint_and_interact(
             DisplayItem::Image { rect: r, src, alt } => {
                 let rr = rect_of(r);
                 if rr.intersects(clip) {
-                    paint_image_placeholder(&painter, rr, src, alt, opts, &ctx);
+                    match image_texture(&ctx, src) {
+                        Some(tex) => paint_texture(&painter, rr, &tex),
+                        None => paint_image_placeholder(&painter, rr, src, alt, opts, &ctx),
+                    }
                 }
             }
         }
@@ -998,6 +1005,166 @@ impl std::fmt::Write for HashWriter<'_> {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Pictures
+
+/// Longest side of a picture that is decoded (pixels); bigger pictures show the placeholder.
+pub const MAX_IMAGE_SIDE: u32 = 4096;
+/// Largest encoded picture that is decoded (bytes).
+pub const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+/// Most memory a decoder may allocate for one picture (a 4096 × 4096 RGBA picture plus working space).
+const MAX_DECODE_ALLOC: u64 = 160 * 1024 * 1024;
+/// Most decoded pictures kept as textures per egui context (oldest dropped first).
+pub const MAX_IMAGE_CACHE: usize = 64;
+
+/// Decodes a PNG, JPEG or GIF picture (first frame) into an image; `None` for other formats, damaged data,
+/// an empty picture, or one beyond [`MAX_IMAGE_BYTES`] / [`MAX_IMAGE_SIDE`]. Never panics: the decoders run
+/// with size limits, and a panic inside one is caught and treated as undecodable.
+pub fn decode_image(data: &[u8]) -> Option<egui::ColorImage> {
+    if data.is_empty() || data.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let format = image::guess_format(data).ok()?;
+    if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::Gif) {
+        return None;
+    }
+    std::panic::catch_unwind(|| decode_limited(data, format)).ok().flatten()
+}
+
+fn decode_limited(data: &[u8], format: image::ImageFormat) -> Option<egui::ColorImage> {
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(data), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    reader.limits(limits);
+    let rgba = reader.decode().ok()?.into_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    if w == 0 || h == 0 || w > MAX_IMAGE_SIDE || h > MAX_IMAGE_SIDE {
+        return None;
+    }
+    let size = [usize::try_from(w).ok()?, usize::try_from(h).ok()?];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+/// Decodes a contact's picture (PNG, JPEG or GIF) for the cards and the contact window.
+pub fn decode_contact_picture(pic: &mailcraft_model::contact::ContactPicture) -> Option<egui::ColorImage> {
+    decode_image(&pic.data)
+}
+
+/// The bytes of a `data:image/…;base64,…` URL; `None` for other URLs, other encodings and oversized data.
+pub fn data_image_bytes(src: &str) -> Option<Vec<u8>> {
+    let src = src.trim();
+    let rest = src.get(..5).filter(|p| p.eq_ignore_ascii_case("data:")).and(src.get(5..))?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mut parts = meta.split(';').map(str::trim);
+    let mime = parts.next()?;
+    if !mime.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("image/")) {
+        return None;
+    }
+    if !parts.any(|x| x.eq_ignore_ascii_case("base64")) || payload.len() / 4 * 3 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let data = mailcraft_mime::transfer::decode_base64(payload.as_bytes());
+    (!data.is_empty() && data.len() <= MAX_IMAGE_BYTES).then_some(data)
+}
+
+/// Cheap fingerprint of a byte string: its length, both ends and samples across it (long `data:` URLs
+/// are not hashed in full every frame).
+fn fingerprint(b: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    b.len().hash(&mut h);
+    if b.len() <= 4096 {
+        b.hash(&mut h);
+    } else {
+        b.get(..1024).hash(&mut h);
+        b.get(b.len().saturating_sub(1024)..).hash(&mut h);
+        let step = b.len() / 64;
+        for k in 1..64usize {
+            let at = k.saturating_mul(step);
+            b.get(at..at.saturating_add(16).min(b.len())).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Decoded pictures by source: (source fingerprint, data fingerprint, texture or `None` when undecodable),
+/// oldest first.
+#[derive(Clone, Default)]
+struct ImageCache {
+    entries: Vec<(u64, u64, Option<egui::TextureHandle>)>,
+}
+
+impl ImageCache {
+    fn get(&self, key: u64) -> Option<&(u64, u64, Option<egui::TextureHandle>)> {
+        self.entries.iter().find(|e| e.0 == key)
+    }
+
+    fn put(&mut self, key: u64, data_key: u64, tex: Option<egui::TextureHandle>) {
+        self.entries.retain(|e| e.0 != key);
+        while self.entries.len() >= MAX_IMAGE_CACHE {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, data_key, tex));
+    }
+}
+
+fn image_cache_id() -> Id {
+    Id::new("mailcraft-body-images")
+}
+
+fn load_picture(ctx: &egui::Context, key: u64, data: &[u8]) -> Option<egui::TextureHandle> {
+    decode_image(data).map(|img| {
+        ctx.load_texture(format!("mailcraft-body-image-{key:016x}"), img, egui::TextureOptions::LINEAR)
+    })
+}
+
+/// Hands over the bytes of the picture a body refers to as `src` (an inline attachment's `cid:…` URL), so
+/// bodies draw it instead of the placeholder. Decodes once per source and data; returns whether the picture
+/// could be decoded. Call it again when showing the message (pictures can drop out of the cache).
+pub fn provide_image(ctx: &egui::Context, src: &str, data: &[u8]) -> bool {
+    let key = fingerprint(src.trim().as_bytes());
+    let data_key = fingerprint(data);
+    let cached = ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<ImageCache>(image_cache_id())
+            .get(key)
+            .filter(|e| e.1 == data_key)
+            .map(|e| e.2.is_some())
+    });
+    if let Some(ok) = cached {
+        return ok;
+    }
+    let tex = load_picture(ctx, key, data);
+    let ok = tex.is_some();
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<ImageCache>(image_cache_id()).put(key, data_key, tex));
+    ok
+}
+
+/// The texture for a body picture: one handed over with [`provide_image`], or a `data:` picture (decoded on
+/// first use). `None` draws the placeholder.
+pub fn image_texture(ctx: &egui::Context, src: &str) -> Option<egui::TextureHandle> {
+    let key = fingerprint(src.trim().as_bytes());
+    if let Some(hit) = ctx
+        .data_mut(|d| d.get_temp_mut_or_default::<ImageCache>(image_cache_id()).get(key).map(|e| e.2.clone()))
+    {
+        return hit;
+    }
+    let data = data_image_bytes(src)?;
+    let tex = load_picture(ctx, key, &data);
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<ImageCache>(image_cache_id()).put(key, 0, tex.clone()));
+    tex
+}
+
+/// Draws a decoded picture in its box, keeping its aspect ratio (top-left aligned).
+fn paint_texture(painter: &egui::Painter, r: Rect, tex: &egui::TextureHandle) {
+    let [w, h] = tex.size();
+    let (w, h) = (w as f32, h as f32);
+    let scale = if w > 0.0 && h > 0.0 { (r.width() / w).min(r.height() / h) } else { 0.0 };
+    let size = if scale.is_finite() && scale > 0.0 { Vec2::new(w * scale, h * scale) } else { r.size() };
+    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    painter.image(tex.id(), Rect::from_min_size(r.min, size), uv, Color32::WHITE);
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Fonts and colours
 
 /// The bundled font database, shared through egui's temp data (built once per context).
@@ -1240,5 +1407,123 @@ mod tests {
         assert_eq!(selected_text(&view, &doc).as_deref(), Some("line\nsecond"));
         view.selection = select_all_range(view.layout.as_ref().unwrap());
         assert_eq!(selected_text(&view, &doc).as_deref(), Some("first line\nsecond line"));
+    }
+
+    fn encoded(format: image::ImageFormat, w: u32, h: u32) -> Vec<u8> {
+        let img =
+            image::RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x * 40) as u8, (y * 40) as u8, 200, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img).to_rgb8().write_to(&mut out, format).unwrap();
+        out.into_inner()
+    }
+
+    fn data_url(mime: &str, data: &[u8]) -> String {
+        format!("data:{mime};base64,{}", mailcraft_mime::transfer::encode_base64(data))
+    }
+
+    #[test]
+    fn png_jpeg_and_gif_pictures_decode() {
+        for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg, image::ImageFormat::Gif] {
+            let img = decode_image(&encoded(format, 5, 3)).unwrap_or_else(|| panic!("{format:?}"));
+            assert_eq!(img.size, [5, 3], "{format:?}");
+        }
+        let pic = mailcraft_model::contact::ContactPicture::sniff(&encoded(image::ImageFormat::Jpeg, 4, 4))
+            .unwrap();
+        assert_eq!(pic.mime, "image/jpeg");
+        assert_eq!(decode_contact_picture(&pic).map(|i| i.size), Some([4, 4]));
+        let gif =
+            mailcraft_model::contact::ContactPicture::sniff(&encoded(image::ImageFormat::Gif, 2, 6)).unwrap();
+        assert_eq!(decode_contact_picture(&gif).map(|i| i.size), Some([2, 6]));
+    }
+
+    #[test]
+    fn hostile_pictures_are_refused_without_panicking() {
+        assert!(decode_image(&[]).is_none());
+        assert!(decode_image(b"not a picture at all").is_none());
+        // Too wide: refused by the decoder limits.
+        assert!(decode_image(&encoded(image::ImageFormat::Png, MAX_IMAGE_SIDE + 1, 1)).is_none());
+        // Damaged and truncated data of every format.
+        for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg, image::ImageFormat::Gif] {
+            let good = encoded(format, 16, 16);
+            for cut in [4, 12, 30, good.len() / 2, good.len().saturating_sub(3)] {
+                let _ = decode_image(good.get(..cut).unwrap());
+            }
+            let mut bad = good.clone();
+            for b in bad.iter_mut().skip(20).step_by(7) {
+                *b ^= 0x5a;
+            }
+            let _ = decode_image(&bad);
+        }
+        // A header claiming a huge picture.
+        let mut huge = encoded(image::ImageFormat::Png, 1, 1);
+        huge.splice(16..24, [0, 1, 0, 0, 0, 1, 0, 0]);
+        assert!(decode_image(&huge).is_none());
+        // Other formats are not decoded.
+        assert!(decode_image(b"BM\x3a\0\0\0\0\0\0\0\x36\0\0\0").is_none());
+    }
+
+    #[test]
+    fn data_urls_decode_to_bytes() {
+        let png = encoded(image::ImageFormat::Png, 2, 2);
+        assert_eq!(data_image_bytes(&data_url("image/png", &png)), Some(png.clone()));
+        assert_eq!(
+            data_image_bytes(&format!(
+                "  DATA:Image/PNG;BASE64,{}",
+                mailcraft_mime::transfer::encode_base64_flat(&png)
+            )),
+            Some(png)
+        );
+        assert!(data_image_bytes("data:text/plain;base64,QUJD").is_none());
+        assert!(data_image_bytes("data:image/png,rawtext").is_none());
+        assert!(data_image_bytes("data:image/png;base64,").is_none());
+        assert!(data_image_bytes("cid:logo@x").is_none());
+        assert!(data_image_bytes("https://x.example/a.png").is_none());
+        assert!(data_image_bytes("data:").is_none());
+    }
+
+    #[test]
+    fn body_pictures_become_textures() {
+        let ctx = egui::Context::default();
+        let jpeg = encoded(image::ImageFormat::Jpeg, 6, 4);
+        let tex = image_texture(&ctx, &data_url("image/jpeg", &jpeg)).unwrap();
+        assert_eq!(tex.size(), [6, 4]);
+        // Junk data and unknown sources draw the placeholder.
+        assert!(image_texture(&ctx, "data:image/png;base64,AAAA").is_none());
+        assert!(image_texture(&ctx, "cid:logo@x").is_none());
+        assert!(image_texture(&ctx, "https://x.example/a.png").is_none());
+        // An inline attachment handed over by the owner is drawn; new bytes for the same source replace it.
+        assert!(provide_image(&ctx, "cid:logo@x", &encoded(image::ImageFormat::Gif, 3, 3)));
+        assert_eq!(image_texture(&ctx, "cid:logo@x").map(|t| t.size()), Some([3, 3]));
+        assert!(provide_image(&ctx, "cid:logo@x", &encoded(image::ImageFormat::Png, 8, 2)));
+        assert_eq!(image_texture(&ctx, "cid:logo@x").map(|t| t.size()), Some([8, 2]));
+        assert!(!provide_image(&ctx, "cid:bad@x", b"junk"));
+        assert!(image_texture(&ctx, "cid:bad@x").is_none());
+        // The cache stays bounded.
+        let png = encoded(image::ImageFormat::Png, 1, 1);
+        for i in 0..(MAX_IMAGE_CACHE + 10) {
+            provide_image(&ctx, &format!("cid:{i}@x"), &png);
+        }
+        let n = ctx.data_mut(|d| d.get_temp_mut_or_default::<ImageCache>(image_cache_id()).entries.len());
+        assert_eq!(n, MAX_IMAGE_CACHE);
+    }
+
+    #[test]
+    fn body_with_a_data_picture_paints_it() {
+        let png = encoded(image::ImageFormat::Png, 4, 4);
+        let doc = mailcraft_html::html_to_doc(&format!(
+            "<p>Logo <img src=\"{}\" width=40 height=40 alt=\"Logo\"></p>",
+            data_url("image/png", &png)
+        ));
+        let ctx = egui::Context::default();
+        let mut view = BodyView::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show_doc(ui, &mut view, &doc, false);
+        });
+        out.textures_delta.clear();
+        let textured = out.shapes.iter().any(|s| match &s.shape {
+            egui::Shape::Mesh(m) => m.texture_id != egui::TextureId::default(),
+            _ => false,
+        });
+        assert!(textured, "the picture is drawn from its texture");
     }
 }

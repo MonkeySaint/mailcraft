@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs what the Linux release job needs inside the Debian (rust:*-bookworm) container.
+# Installs what the Linux release job needs inside the Debian (rust:*-bookworm) container (as root).
 #
 #     packaging/linux/ci-deps.sh [TARGET-TRIPLE]
 #
@@ -7,8 +7,8 @@
 #   different architecture than the container, the GNU cross compiler for it.
 # - nfpm NFPM_VERSION (MIT) from its GitHub release, checked against the release's checksums file and
 #   cached in $MC_TOOL_CACHE.
-# - With a CI env file ($GITHUB_ENV / $GITHUB_ENV), the cross linker settings for cargo and the cc crate,
-#   and the cache folder on PATH ($GITHUB_PATH / $GITHUB_PATH).
+# - With a CI env file ($GITHUB_ENV), the cross linker settings for cargo and the cc crate, and the cache
+#   folder on PATH ($GITHUB_PATH).
 set -euo pipefail
 # shellcheck source=packaging/env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -16,8 +16,8 @@ set -euo pipefail
 triple="${1:-}"
 nfpm_version="${NFPM_VERSION:-2.43.0}"
 cache="${MC_TOOL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mailcraft-packaging}"
-env_file="${GITHUB_ENV:-${GITHUB_ENV:-/dev/null}}"
-path_file="${GITHUB_PATH:-${GITHUB_PATH:-/dev/null}}"
+env_file="${GITHUB_ENV:-/dev/null}"
+path_file="${GITHUB_PATH:-/dev/null}"
 
 host="$(uname -m)"
 want="${triple%%-*}"

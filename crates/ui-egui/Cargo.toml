@@ -21,11 +21,12 @@ serde_json.workspace = true
 log.workspace = true
 # SVG rasterising for the app icon (Apache-2.0 OR MIT; same version egui_extras' svg loader uses).
 resvg.workspace = true
+# PNG / JPEG / GIF decoding for contact pictures and pictures in message bodies (MIT OR Apache-2.0).
+image.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
 mailcraft-testmail.workspace = true
-image.workspace = true
 
 [lints]
 workspace = true
