@@ -63,7 +63,16 @@ fn print_json(v: &Value) -> Result<(), String> {
 fn open(source: &Source) -> Result<Session, String> {
     match source {
         Source::Sample => Ok(mailcraft_engine::sample::sample_session()),
-        Source::Profile(dir) => Session::open(dir).map_err(|e| e.to_string()),
+        Source::Profile(dir) => {
+            let mut s = Session::open(dir).map_err(|e| e.to_string())?;
+            // Secrets the desktop app moved into the OS credential store are read from there. Profiles without
+            // mail accounts have no secrets, so the keyring is not touched for them. Without a keyring the
+            // profile's secrets file stays in use.
+            if s.mailbox.accounts.iter().any(|a| a.kind != mailcraft_engine::model::AccountKind::Local) {
+                let _ = s.use_os_keyring();
+            }
+            Ok(s)
+        }
     }
 }
 

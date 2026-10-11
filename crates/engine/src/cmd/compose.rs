@@ -2,6 +2,15 @@
 //! delivery options, themes). Every command takes an optional `{"compose": id}`; without it the most recently
 //! opened compose is used.
 //!
+//! Tracking and delivery options travel with the queued message as header fields: a read receipt request is
+//! `Disposition-Notification-To` (RFC 8098); a delivery receipt and Save Sent Item To are submission-only
+//! `X-MailCraft-Submit-*` fields that the SMTP client turns into RFC 3461 DSN parameters and strips
+//! (`mailcraft_net::smtp`), and that [`file_sent_copy`] reads when the send completes; voting buttons are
+//! MailCraft's own `X-MailCraft-Voting` field, answered with `X-MailCraft-Vote` replies (`compose.vote`) and
+//! tallied on the sent item ([`tracking`], `compose.tracking`). `compose.sendReadReceipt` answers a received
+//! read-receipt request with an RFC 8098 disposition notification. S/MIME encryption is not implemented:
+//! `compose.encrypt` explains that and stays off.
+//!
 //! Body-edit commands here (`compose.select`, `compose.insertText`, `compose.deleteText`, `compose.editUndo`,
 //! `compose.editRedo`) drive the editor model in [`crate::compose`] for agents and tests; they change only the
 //! compose (not the mailbox), so they do not record mailbox undo (`mutates: false`) and use the compose's own
@@ -15,6 +24,7 @@ use crate::compose::{
     Bookmark, ComposeAttachment, ComposeKind, ComposeState, DocPos, EditRun, SaveSentTo, SignatureBlock,
 };
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Session};
+use mailcraft_geom::Color;
 use mailcraft_mime::{Address, AttachmentSpec, MessageBuilder, parse_address_list};
 use mailcraft_model::{
     Account, Block, BodyFormat, DateTime, Doc, FlagState, FolderKind, FolderRole, Importance, ItemId,
@@ -609,9 +619,9 @@ pub(crate) fn build_message(
         Importance::Low => Some("low".into()),
         Importance::Normal => None,
     };
-    b.text = Some(c.body.to_plain_text());
+    b.text = Some(c.plain_text_with_list_formats());
     if c.format != BodyFormat::PlainText {
-        b.html = Some(mailcraft_html::doc_to_html(&c.body));
+        b.html = Some(c.apply_list_formats_html(&mailcraft_html::doc_to_html(&c.body)));
     }
     b.attachments = c
         .attachments
@@ -642,13 +652,29 @@ pub(crate) fn build_message(
         }
     }
     let notify_to = b.from.as_ref().map(|m| mailcraft_mime::addr::format_mailbox(m, true));
-    if let Some(addr) = &notify_to {
-        if c.request_read_receipt {
-            b.extra_headers.push(("Disposition-Notification-To".into(), addr.clone()));
-        }
-        if c.request_delivery_receipt {
-            b.extra_headers.push(("Return-Receipt-To".into(), addr.clone()));
-        }
+    if let Some(addr) = &notify_to
+        && c.request_read_receipt
+    {
+        // RFC 8098 read receipt (message disposition notification) request.
+        b.extra_headers.push(("Disposition-Notification-To".into(), addr.clone()));
+    }
+    if c.request_delivery_receipt {
+        // RFC 3461 delivery status notification, turned into envelope parameters at submission (no legacy
+        // Return-Receipt-To: servers ignore it and recipients' clients may answer it).
+        b.extra_headers.push((DSN_HEADER.into(), DSN_REQUEST.into()));
+    }
+    match c.save_sent {
+        SaveSentTo::Default => {}
+        SaveSentTo::DoNotSave => b.extra_headers.push((SAVE_SENT_HEADER.into(), "none".into())),
+        SaveSentTo::Folder(f) => b.extra_headers.push((SAVE_SENT_HEADER.into(), format!("folder={}", f.0))),
+    }
+    let choices = voting_choices(&c.voting);
+    if !choices.is_empty() {
+        b.extra_headers
+            .push((VOTING_HEADER.into(), mailcraft_mime::encoded::encode_words(&choices.join(";"))));
+    }
+    if let Some(v) = c.vote_response.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        b.extra_headers.push((VOTE_HEADER.into(), mailcraft_mime::encoded::encode_words(v)));
     }
     match c.sensitivity {
         Sensitivity::Normal => {}
@@ -1301,8 +1327,7 @@ fn voting_buttons(s: &mut Session, p: &Value) -> CmdResult {
     if choices.eq_ignore_ascii_case("custom") {
         return dialog(s, "messageOptions", json!({"compose": compose_id(s, p)?, "focus": "voting"}));
     }
-    let norm: Vec<&str> = choices.split(';').map(str::trim).filter(|x| !x.is_empty()).collect();
-    let norm = norm.join(";");
+    let norm = voting_choices(&choices).join(";");
     let c = compose_mut(s, p)?;
     c.voting = if c.voting == norm { String::new() } else { norm };
     c.dirty = true;
@@ -1388,6 +1413,12 @@ fn save_sent_item_to(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"mode": mode, "folder": folder}))
 }
 
+/// Why Encrypt is unavailable (S/MIME needs certificates, which MailCraft cannot manage yet).
+pub const ENCRYPT_UNAVAILABLE: &str = "Encryption is not available yet: MailCraft cannot use S/MIME certificates. \
+This message will be sent without encryption; don't include anything that must stay confidential.";
+
+/// Encrypt: S/MIME is not implemented, so the option explains that and stays off (Send keeps working).
+/// Turning it off (for a draft saved with it on) works.
 fn encrypt(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(m) = opt_str(p, "mode")
         && m != "smime"
@@ -1395,9 +1426,15 @@ fn encrypt(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params(format!("unknown encryption mode `{m}`")));
     }
     let c = compose_mut(s, p)?;
-    c.encrypt = opt_bool(p, "on").unwrap_or(!c.encrypt);
-    c.dirty = true;
-    Ok(json!({"encrypt": c.encrypt}))
+    let want = opt_bool(p, "on").unwrap_or(!c.encrypt);
+    if c.encrypt && !want {
+        c.encrypt = false;
+        c.dirty = true;
+    }
+    if want {
+        s.notify(Notice::Info(ENCRYPT_UNAVAILABLE.into()));
+    }
+    Ok(json!({"encrypt": false, "available": false, "message": if want { ENCRYPT_UNAVAILABLE } else { "" }}))
 }
 
 fn message_options(s: &mut Session, p: &Value) -> CmdResult {
@@ -1452,14 +1489,77 @@ fn format_cmd(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"format": kind, "converted": converted, "title": c.title()}))
 }
 
-/// Theme fonts by theme/font-set name: (body, headings).
-fn theme_fonts(name: &str) -> Option<(&'static str, &'static str)> {
-    match name {
-        "Office" => Some(("Aptos", "Aptos Display")),
-        "Office 2013 - 2022" | "Office 2013 - 2022 Theme" => Some(("Calibri", "Calibri Light")),
-        "Office 2007 - 2010" => Some(("Calibri", "Cambria")),
-        _ => None,
+/// Largest theme file Browse for Themes reads.
+const MAX_THEME_FILE: u64 = 64 * 1024;
+
+/// Galleries for the Themes / Colors / Fonts / Effects menus and dialogs.
+pub fn theme_galleries() -> Value {
+    use crate::compose::{COLOR_GALLERY_LEN, THEME_COLOR_SETS, THEME_EFFECTS, THEME_FONT_SETS, THEMES};
+    let colors: Vec<Value> = THEME_COLOR_SETS
+        .iter()
+        .take(COLOR_GALLERY_LEN)
+        .map(|(n, v)| json!({"name": n, "colors": v.iter().map(|c| Color::hex(*c).to_hex()).collect::<Vec<_>>()}))
+        .collect();
+    let fonts: Vec<Value> =
+        THEME_FONT_SETS.iter().map(|(n, h, b)| json!({"name": n, "heading": h, "body": b})).collect();
+    let themes: Vec<Value> =
+        THEMES.iter().map(|(n, c, f, e)| json!({"name": n, "colors": c, "fonts": f, "effects": e})).collect();
+    json!({"themes": themes, "colors": colors, "fonts": fonts, "effects": THEME_EFFECTS})
+}
+
+fn theme_state_json(c: &ComposeState) -> Value {
+    let r = c.theme_resolved();
+    json!({
+        "theme": c.theme.name,
+        "colors": c.theme.colors,
+        "fonts": c.theme.fonts,
+        "effects": c.theme.effects,
+        "palette": r.colors.iter().map(Color::to_hex).collect::<Vec<_>>(),
+        "headingFont": r.heading_font,
+        "bodyFont": r.body_font,
+        "effectSet": r.effects,
+    })
+}
+
+/// A theme file (Save Current Theme / Browse for Themes): MailCraft's own JSON format.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ThemeFile {
+    #[serde(rename = "mailcraftTheme")]
+    version: u32,
+    name: String,
+    colors: Vec<String>,
+    #[serde(rename = "headingFont")]
+    heading_font: String,
+    #[serde(rename = "bodyFont")]
+    body_font: String,
+    effects: String,
+}
+
+fn clean_name(v: &str, fallback: &str) -> String {
+    let n: String = v.chars().filter(|c| !c.is_control()).take(64).collect();
+    let n = n.trim();
+    if n.is_empty() { fallback.to_owned() } else { n.to_owned() }
+}
+
+fn font_name(v: &str) -> Option<String> {
+    let n: String =
+        v.chars().filter(|c| !c.is_control() && !matches!(c, ';' | '{' | '}' | '<' | '>')).take(64).collect();
+    let n = n.trim();
+    (!n.is_empty()).then(|| n.to_owned())
+}
+
+fn palette_param(v: &Value) -> Result<Vec<Color>, CmdError> {
+    let arr = v.as_array().ok_or_else(|| CmdError::Params("`colors` must be a list of 12 colours".into()))?;
+    if arr.len() != 12 {
+        return Err(CmdError::Params("`colors` must hold 12 colours (dark 1, light 1, dark 2, light 2, accents 1-6, hyperlink, followed hyperlink)".into()));
     }
+    arr.iter()
+        .map(|c| {
+            c.as_str()
+                .and_then(Color::parse_hex)
+                .ok_or_else(|| CmdError::Params(format!("`{c}` is not a colour (#rrggbb)")))
+        })
+        .collect()
 }
 
 fn theme(s: &mut Session, p: &Value) -> CmdResult {
@@ -1468,47 +1568,137 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
     if !matches!(part, "all" | "colors" | "fonts" | "effects") {
         return Err(CmdError::Params(format!("unknown theme part `{part}`")));
     }
+    let cid = compose_id(s, p)?;
     match action {
-        "browse" => return dialog(s, "browseThemes", json!({"compose": compose_id(s, p)?})),
-        "save" => return dialog(s, "saveTheme", json!({"compose": compose_id(s, p)?})),
-        "customize" => {
-            return dialog(s, "customizeTheme", json!({"compose": compose_id(s, p)?, "part": part}));
+        "list" => return Ok(theme_galleries()),
+        "browse" if opt_str(p, "path").is_none() => {
+            return dialog(s, "browseThemes", json!({"compose": cid}));
         }
-        "apply" | "reset" => {}
+        "save" => {
+            let Some(path) = opt_str(p, "path").map(str::to_owned) else {
+                return dialog(s, "saveTheme", json!({"compose": cid}));
+            };
+            let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
+            let r = c.theme_resolved();
+            let file = ThemeFile {
+                version: 1,
+                name: clean_name(
+                    opt_str(p, "name").unwrap_or(""),
+                    c.theme.name.as_deref().unwrap_or("Custom Theme"),
+                ),
+                colors: r.colors.iter().map(Color::to_hex).collect(),
+                heading_font: r.heading_font,
+                body_font: r.body_font,
+                effects: r.effects.to_owned(),
+            };
+            let text = serde_json::to_string_pretty(&file).map_err(|e| CmdError::Failed(e.to_string()))?;
+            std::fs::write(&path, text)
+                .map_err(|e| CmdError::Failed(format!("the theme could not be saved: {e}")))?;
+            return Ok(json!({"saved": path, "name": file.name}));
+        }
+        "customize" if p.get("colors").is_none() && p.get("heading").is_none() && p.get("body").is_none() => {
+            let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
+            let mut st = theme_state_json(c);
+            if let Some(o) = st.as_object_mut() {
+                o.insert("compose".into(), json!(cid));
+                o.insert("part".into(), json!(part));
+                o.insert("slots".into(), json!(crate::compose::THEME_COLOR_SLOTS));
+            }
+            let name = if part == "fonts" { "customizeFonts" } else { "customizeColors" };
+            return dialog(s, name, st);
+        }
+        "apply" | "reset" | "browse" | "customize" => {}
         other => return Err(CmdError::Params(format!("unknown theme action `{other}`"))),
     }
-    let name = opt_str(p, "name").map(str::to_owned);
-    if action == "apply" && name.is_none() {
-        return dialog(s, "themes", json!({"compose": compose_id(s, p)?, "part": part}));
+    // Work out the new state first (errors leave the compose untouched).
+    let mut next =
+        s.composes.get(&cid).map(|c| c.theme.clone()).ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
+    match action {
+        "reset" => next = Default::default(),
+        "browse" => {
+            let path = opt_str(p, "path").unwrap_or_default();
+            let (_, data) = read_file(path, MAX_THEME_FILE)?;
+            let file: ThemeFile = serde_json::from_slice(&data)
+                .map_err(|e| CmdError::Failed(format!("this is not a MailCraft theme file: {e}")))?;
+            let colors = palette_param(&json!(file.colors))?;
+            let name = clean_name(&file.name, "Custom Theme");
+            let heading = font_name(&file.heading_font).unwrap_or_else(|| "Aptos Display".into());
+            let body = font_name(&file.body_font).unwrap_or_else(|| "Aptos".into());
+            next.name = Some(name.clone());
+            next.colors = Some(name.clone());
+            next.fonts = Some(name.clone());
+            next.effects = crate::compose::effect_set(&file.effects).map(str::to_owned);
+            next.custom_colors = Some(crate::compose::CustomColors { name: name.clone(), colors });
+            next.custom_fonts = Some(crate::compose::CustomFonts { name, heading, body });
+        }
+        "customize" => {
+            let name = clean_name(opt_str(p, "name").unwrap_or(""), "Custom 1");
+            if part == "fonts" {
+                let heading = opt_str(p, "heading").and_then(font_name);
+                let body = opt_str(p, "body").and_then(font_name);
+                let cur = next.resolve();
+                next.custom_fonts = Some(crate::compose::CustomFonts {
+                    name: name.clone(),
+                    heading: heading.unwrap_or(cur.heading_font),
+                    body: body.unwrap_or(cur.body_font),
+                });
+                next.fonts = Some(name);
+            } else {
+                let colors = palette_param(p.get("colors").unwrap_or(&Value::Null))?;
+                next.custom_colors = Some(crate::compose::CustomColors { name: name.clone(), colors });
+                next.colors = Some(name);
+            }
+        }
+        _ => {
+            let Some(name) = opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty()) else {
+                return dialog(
+                    s,
+                    "themes",
+                    json!({"compose": cid, "part": part, "galleries": theme_galleries()}),
+                );
+            };
+            let known = match part {
+                "colors" => {
+                    crate::compose::color_set(name).is_some()
+                        || next.custom_colors.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(name))
+                }
+                "fonts" => {
+                    crate::compose::font_set(name).is_some()
+                        || next.custom_fonts.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(name))
+                }
+                "effects" => crate::compose::effect_set(name).is_some(),
+                _ => crate::compose::named_theme(name).is_some(),
+            };
+            if !known {
+                return Err(CmdError::Params(format!(
+                    "unknown {} `{name}`",
+                    if part == "all" { "theme" } else { part }
+                )));
+            }
+            let name = name.to_owned();
+            match part {
+                "all" => {
+                    next.name = Some(name);
+                    next.colors = None;
+                    next.fonts = None;
+                    next.effects = None;
+                }
+                "colors" => next.colors = Some(name),
+                "fonts" => next.fonts = Some(name),
+                _ => next.effects = Some(name),
+            }
+        }
     }
     let c = compose_mut(s, p)?;
     c.checkpoint();
-    if action == "reset" {
-        c.theme = Default::default();
-        c.body.base.font_family = None;
-    } else {
-        let set = |slot: &mut Option<String>| *slot = name.clone();
-        match part {
-            "all" => {
-                set(&mut c.theme.name);
-                set(&mut c.theme.colors);
-                set(&mut c.theme.fonts);
-                set(&mut c.theme.effects);
-            }
-            "colors" => set(&mut c.theme.colors),
-            "fonts" => set(&mut c.theme.fonts),
-            _ => set(&mut c.theme.effects),
-        }
-        if matches!(part, "all" | "fonts")
-            && let Some((body, _)) = name.as_deref().and_then(theme_fonts)
-        {
-            c.body.base.font_family = Some(body.to_owned());
-        }
+    let before = c.theme_resolved();
+    c.theme = next;
+    c.retheme(&before);
+    if c.style_set.is_some() {
+        c.apply_style_set();
     }
     c.dirty = true;
-    Ok(
-        json!({"theme": c.theme.name, "colors": c.theme.colors, "fonts": c.theme.fonts, "effects": c.theme.effects}),
-    )
+    Ok(theme_state_json(c))
 }
 
 fn page_color(s: &mut Session, p: &Value) -> CmdResult {
@@ -1814,6 +2004,677 @@ fn table_edit(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"changed": changed, "caret": pos_json(&c.selection.focus)}))
 }
 
+// =======================================================================================================
+// Tracking: Save Sent Item To, delivery and read receipts, voting buttons
+// =======================================================================================================
+
+/// Submission-only header asking for a delivery status notification. The SMTP client removes it and sends
+/// RFC 3461 envelope parameters instead (same name as `mailcraft_net::smtp::DSN_HEADER`).
+pub const DSN_HEADER: &str = "X-MailCraft-Submit-DSN";
+/// What a delivery receipt asks for: success and failure reports, headers only.
+pub const DSN_REQUEST: &str = "NOTIFY=SUCCESS,FAILURE; RET=HDRS";
+/// Submission-only header carrying Save Sent Item To: `none` or `folder=<id>`.
+pub const SAVE_SENT_HEADER: &str = "X-MailCraft-Submit-Save-Sent";
+/// Prefix of every submission-only header (never transmitted; see `mailcraft_net::smtp`).
+pub const SUBMIT_PREFIX: &str = "X-MailCraft-Submit-";
+/// Voting buttons a message offers ("Approve;Reject"). MailCraft's own header: the Exchange voting
+/// properties are not used.
+pub const VOTING_HEADER: &str = "X-MailCraft-Voting";
+/// The choice a voting response carries.
+pub const VOTE_HEADER: &str = "X-MailCraft-Vote";
+/// Most voting choices kept.
+const MAX_VOTING_CHOICES: usize = 20;
+/// Longest voting choice (chars).
+const MAX_CHOICE_CHARS: usize = 64;
+/// Most report / response candidates parsed for one tracking query.
+const MAX_REPORT_CANDIDATES: usize = 500;
+/// Subject prefix of a read receipt.
+const READ_PREFIX: &str = "Read: ";
+
+/// Voting choices from "Approve; Reject;;approve": trimmed, control characters dropped, duplicates
+/// (case-insensitive) and empties removed, at most 20 of at most 64 chars.
+pub fn voting_choices(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in text.split(';') {
+        let c: String = c.chars().filter(|ch| !ch.is_control()).take(MAX_CHOICE_CHARS).collect();
+        let c = c.trim().to_owned();
+        if !c.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&c)) {
+            out.push(c);
+        }
+        if out.len() >= MAX_VOTING_CHOICES {
+            break;
+        }
+    }
+    out
+}
+
+/// Raw source of a stored item: kept bytes, else the blob store.
+pub(crate) fn stored_raw(s: &Session, m: &MailItem) -> Option<Vec<u8>> {
+    if let Some(r) = &m.raw {
+        return Some(r.clone());
+    }
+    s.store.as_ref().and_then(|st| st.raw_of(m).ok().flatten())
+}
+
+/// The header section of `raw` (up to, not including, the first empty line).
+fn header_block(raw: &[u8]) -> &[u8] {
+    let mut line_start = 0usize;
+    for (i, &b) in raw.iter().enumerate() {
+        if b == b'\n' {
+            let line = raw.get(line_start..i).unwrap_or_default();
+            if line.is_empty() || line == b"\r" {
+                return raw.get(..line_start).unwrap_or_default();
+            }
+            line_start = i.saturating_add(1);
+        }
+    }
+    raw
+}
+
+/// Header fields of `raw` (only the header section is parsed).
+pub fn raw_headers(raw: &[u8]) -> mailcraft_mime::Headers {
+    let mut head = header_block(raw).to_vec();
+    head.extend_from_slice(b"\r\n");
+    mailcraft_mime::parse(&head).map(|m| m.headers).unwrap_or_default()
+}
+
+/// `raw` without its submission-only `X-MailCraft-Submit-*` header fields (folded lines included).
+pub fn strip_submit_headers(raw: &[u8]) -> Vec<u8> {
+    let head_len = header_block(raw).len().min(raw.len());
+    let (head, body) = raw.split_at(head_len);
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipping = false;
+    for line in head.split_inclusive(|&b| b == b'\n') {
+        let folded = line.first().is_some_and(|&b| b == b' ' || b == b'\t');
+        if !folded {
+            skipping = line
+                .get(..SUBMIT_PREFIX.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(SUBMIT_PREFIX.as_bytes()));
+        }
+        if !skipping {
+            out.extend_from_slice(line);
+        }
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// Files the sent copy of Outbox item `item` the way its Save Sent Item To choice says, once it has been
+/// sent. Returns `false` for the default (the caller files it in Sent Items as usual); otherwise the item has
+/// been removed (Do Not Save) or moved to the chosen folder without its submission-only headers.
+///
+/// Called by the send worker's completion (`sync::message_sent`) before it files the copy itself.
+pub fn file_sent_copy(s: &mut Session, item: ItemId) -> bool {
+    let Some(raw) = s.mailbox.mail.get(&item).and_then(|m| stored_raw(s, m)) else {
+        return false;
+    };
+    let choice = raw_headers(&raw).get(SAVE_SENT_HEADER).map(|v| v.trim().to_ascii_lowercase());
+    match choice.as_deref() {
+        Some("none") => {
+            s.mailbox.mail.remove(&item);
+            true
+        }
+        Some(v) => {
+            let folder = v
+                .strip_prefix("folder=")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .map(mailcraft_model::FolderId)
+                .filter(|f| s.mailbox.folder(*f).is_some_and(|f| f.kind == FolderKind::Mail));
+            let Some(folder) = folder else {
+                return false;
+            };
+            let Some(m) = s.mailbox.mail.get_mut(&item) else {
+                return false;
+            };
+            m.folder = folder;
+            m.read = true;
+            m.remote_id = None;
+            m.raw = Some(strip_submit_headers(&raw));
+            m.size = m.raw.as_ref().map_or(m.size, |r| u64::try_from(r.len()).unwrap_or(u64::MAX));
+            true
+        }
+        None => false,
+    }
+}
+
+/// One voting response received for a message the user sent.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct VoteResponse {
+    pub item: u64,
+    pub from: String,
+    pub choice: String,
+    pub when: DateTime,
+}
+
+/// Delivery / read receipt information for one recipient of a sent message.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct ReceiptRow {
+    pub recipient: String,
+    /// "Delivered", "Failed", "Delayed" (DSN Action), when a report came back.
+    pub delivery: Option<String>,
+    pub delivered_at: Option<DateTime>,
+    /// "Read" / "Deleted" (MDN disposition), when a read receipt came back.
+    pub read: Option<String>,
+    pub read_at: Option<DateTime>,
+}
+
+/// Tracking state of one message (reading-pane info bar, Tracking page).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Tracking {
+    /// Voting choices the message offers.
+    pub choices: Vec<String>,
+    /// The user sent this message (Sent Items / Outbox, or From is one of the user's addresses).
+    pub sent_by_me: bool,
+    /// For a received voting message: the choice already sent and when.
+    pub my_vote: Option<(String, DateTime)>,
+    /// For a sent voting message: the responses received, oldest first (latest per responder).
+    pub responses: Vec<VoteResponse>,
+    /// Count per choice, in choice order.
+    pub tally: Vec<(String, usize)>,
+    /// For a sent message: delivery and read receipts that came back.
+    pub receipts: Vec<ReceiptRow>,
+    /// For a received message: the address asking for a read receipt.
+    pub read_receipt_to: Option<String>,
+    /// A read receipt for it has already been sent.
+    pub read_receipt_sent: bool,
+    /// The receipt may not be sent without asking, even when the user chose to always send them (RFC 8098
+    /// section 2.1): the message has no Return-Path, its Return-Path differs from the address asking, or
+    /// several addresses ask.
+    pub read_receipt_ask: bool,
+}
+
+impl Tracking {
+    /// Text of the voting info bar (`None` when the message has no voting buttons).
+    pub fn voting_text(&self, tz_offset_min: i32) -> Option<String> {
+        if self.choices.is_empty() {
+            return None;
+        }
+        if self.sent_by_me {
+            let totals: Vec<String> = self.tally.iter().map(|(c, n)| format!("{c} {n}")).collect();
+            return Some(format!("Reply totals: {}", totals.join("; ")));
+        }
+        Some(match &self.my_vote {
+            Some((choice, when)) => {
+                let c = when.civil(tz_offset_min);
+                format!(
+                    "You responded {choice} on {:04}-{:02}-{:02} {:02}:{:02}.",
+                    c.year, c.month, c.day, c.hour, c.minute
+                )
+            }
+            None => "This message has voting buttons. Choose a response.".to_owned(),
+        })
+    }
+}
+
+fn is_mine(s: &Session, addr: &str) -> bool {
+    let a = addr.trim().to_ascii_lowercase();
+    !a.is_empty()
+        && (s.me.contains(&a) || s.mailbox.accounts.iter().any(|x| x.address.eq_ignore_ascii_case(&a)))
+}
+
+fn item_sent_by_me(s: &Session, m: &MailItem) -> bool {
+    let role = s.mailbox.folder(m.folder).and_then(|f| f.role);
+    matches!(role, Some(FolderRole::SentItems | FolderRole::Outbox))
+        || m.from.as_ref().is_some_and(|f| is_mine(s, &f.addr))
+}
+
+/// Field groups of a `message/delivery-status` or `message/disposition-notification` body (RFC 3464 /
+/// RFC 8098): blank-line separated blocks of `Name: value` fields, folded lines joined.
+fn report_groups(text: &str) -> Vec<Vec<(String, String)>> {
+    let mut groups: Vec<Vec<(String, String)>> = Vec::new();
+    let mut cur: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !cur.is_empty() {
+                groups.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if line.starts_with([' ', '\t']) {
+            if let Some((_, v)) = cur.last_mut() {
+                v.push(' ');
+                v.push_str(line.trim());
+            }
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            cur.push((k.trim().to_ascii_lowercase(), v.trim().to_owned()));
+        }
+        if cur.len() > 200 {
+            break;
+        }
+    }
+    if !cur.is_empty() {
+        groups.push(cur);
+    }
+    groups
+}
+
+fn field<'a>(g: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    g.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+/// `rfc822;a@example.com` → `a@example.com`.
+fn report_address(v: &str) -> String {
+    let addr = v.split_once(';').map_or(v, |(_, a)| a).trim();
+    addr.trim_start_matches('<').trim_end_matches('>').to_owned()
+}
+
+fn bare_id(v: &str) -> String {
+    v.trim().trim_start_matches('<').trim_end_matches('>').trim().to_owned()
+}
+
+/// Delivery / read receipts for sent message `mid` found in `report` (a parsed report message).
+fn read_report(msg: &mailcraft_mime::Message, mid: &str, when: DateTime, rows: &mut Vec<ReceiptRow>) {
+    let envid = crate::cmd::compose::xtext(mid);
+    let refers = msg.in_reply_to().iter().chain(msg.references().iter()).any(|r| bare_id(r) == mid);
+    let parts = msg.parts();
+    // Headers of the original returned with the report (RET=HDRS / message/rfc822).
+    let returned_id = parts.iter().find_map(|p| match (&p.body, p.mime_type()) {
+        (mailcraft_mime::PartBody::Message(m), _) => m.message_id().map(|i| bare_id(&i)),
+        (_, "text/rfc822-headers") => {
+            p.text().and_then(|t| raw_headers(t.as_bytes()).get("Message-ID").map(bare_id))
+        }
+        _ => None,
+    });
+    for p in &parts {
+        let kind = p.mime_type().to_owned();
+        if kind != "message/delivery-status" && kind != "message/disposition-notification" {
+            continue;
+        }
+        let Some(text) = p.text() else { continue };
+        let groups = report_groups(&text);
+        let Some(first) = groups.first() else { continue };
+        let matches = refers
+            || returned_id.as_deref() == Some(mid)
+            || field(first, "original-envelope-id").is_some_and(|e| e.trim() == envid || bare_id(e) == mid)
+            || field(first, "original-message-id").is_some_and(|e| bare_id(e) == mid);
+        if !matches {
+            continue;
+        }
+        let mut upsert = |recipient: String, f: &mut dyn FnMut(&mut ReceiptRow)| {
+            if recipient.is_empty() {
+                return;
+            }
+            match rows.iter_mut().find(|r| r.recipient.eq_ignore_ascii_case(&recipient)) {
+                Some(r) => f(r),
+                None => {
+                    let mut r = ReceiptRow { recipient, ..Default::default() };
+                    f(&mut r);
+                    rows.push(r);
+                }
+            }
+        };
+        if kind == "message/delivery-status" {
+            for g in groups.iter().skip(1) {
+                let rcpt = field(g, "original-recipient").or_else(|| field(g, "final-recipient"));
+                let action = field(g, "action").unwrap_or("").trim().to_ascii_lowercase();
+                let label = match action.as_str() {
+                    "delivered" | "relayed" | "expanded" => "Delivered",
+                    "failed" => "Failed",
+                    "delayed" => "Delayed",
+                    _ => continue,
+                };
+                upsert(report_address(rcpt.unwrap_or("")), &mut |r: &mut ReceiptRow| {
+                    // A later "Delayed" does not hide a delivery or failure already reported.
+                    if label != "Delayed" || r.delivery.is_none() {
+                        r.delivery = Some(label.to_owned());
+                        r.delivered_at = Some(when);
+                    }
+                });
+            }
+        } else {
+            let rcpt = field(first, "original-recipient").or_else(|| field(first, "final-recipient"));
+            let disp = field(first, "disposition").unwrap_or("").to_ascii_lowercase();
+            let label = if disp.contains("deleted") { "Deleted" } else { "Read" };
+            upsert(report_address(rcpt.unwrap_or("")), &mut |r: &mut ReceiptRow| {
+                r.read = Some(label.to_owned());
+                r.read_at = Some(when);
+            });
+        }
+    }
+}
+
+/// The voting choice a response carries: its vote header, else a subject that starts with a choice and a
+/// colon ("Approve: Budget").
+fn vote_of(s: &Session, m: &MailItem, choices: &[String]) -> Option<String> {
+    let from_header = stored_raw(s, m)
+        .and_then(|raw| raw_headers(&raw).text(VOTE_HEADER))
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let pick = |v: &str| choices.iter().find(|c| c.eq_ignore_ascii_case(v.trim())).cloned();
+    if let Some(v) = from_header {
+        return pick(&v).or(Some(v));
+    }
+    let (head, _) = m.subject.split_once(':')?;
+    pick(head)
+}
+
+/// Tracking state of message `id` (voting buttons and responses, receipts, a pending read-receipt request).
+pub fn tracking(s: &Session, id: ItemId) -> Option<Tracking> {
+    let m = s.mailbox.mail.get(&id)?;
+    let headers = stored_raw(s, m).map(|r| raw_headers(&r)).unwrap_or_default();
+    let mut t = Tracking {
+        choices: headers.text(VOTING_HEADER).map(|v| voting_choices(&v)).unwrap_or_default(),
+        sent_by_me: item_sent_by_me(s, m),
+        ..Default::default()
+    };
+    let mid = m.message_id.as_deref().map(bare_id).filter(|i| !i.is_empty());
+    // Reports (read receipts, delivery notifications) are never answered with a read receipt.
+    let is_report = headers
+        .get("Content-Type")
+        .is_some_and(|c| c.trim().to_ascii_lowercase().starts_with("multipart/report"));
+    if !t.sent_by_me
+        && !is_report
+        && let Some(to) = headers.text("Disposition-Notification-To").filter(|v| !v.trim().is_empty())
+    {
+        t.read_receipt_ask = receipt_needs_asking(&to, headers.text("Return-Path").as_deref());
+        t.read_receipt_to = Some(to.trim().to_owned());
+    }
+    let Some(mid) = mid else {
+        t.tally = t.choices.iter().map(|c| (c.clone(), 0)).collect();
+        return Some(t);
+    };
+    let since = m.sent.unwrap_or(m.received).unix.saturating_sub(86_400);
+    let subject = m.subject.trim().to_lowercase();
+    let mut candidates: Vec<&MailItem> = s
+        .mailbox
+        .mail
+        .values()
+        .filter(|x| x.id != id && x.received.unix >= since)
+        .filter(|x| {
+            let replies = x.in_reply_to.iter().chain(x.references.iter()).any(|r| bare_id(r) == mid);
+            let from = x.from.as_ref().map(|f| f.addr.to_ascii_lowercase()).unwrap_or_default();
+            let daemon = from.starts_with("mailer-daemon") || from.starts_with("postmaster");
+            replies || daemon || (!subject.is_empty() && x.subject.to_lowercase().contains(&subject))
+        })
+        .collect();
+    candidates.sort_by_key(|x| (x.received.unix, x.id));
+    candidates.truncate(MAX_REPORT_CANDIDATES);
+    for x in candidates {
+        let replies = x.in_reply_to.iter().any(|r| bare_id(r) == mid);
+        let mine = item_sent_by_me(s, x);
+        if replies
+            && !t.choices.is_empty()
+            && let Some(choice) = vote_of(s, x, &t.choices)
+        {
+            let when = x.sent.unwrap_or(x.received);
+            if mine && !t.sent_by_me {
+                t.my_vote = Some((choice, when));
+                continue;
+            }
+            if t.sent_by_me && !mine {
+                let from = x.from.as_ref().map(|f| f.addr.clone()).unwrap_or_default();
+                t.responses.retain(|r| !r.from.eq_ignore_ascii_case(&from) || from.is_empty());
+                t.responses.push(VoteResponse { item: x.id.0, from, choice, when });
+                continue;
+            }
+        }
+        if replies && mine && x.subject.starts_with(READ_PREFIX.trim_end()) {
+            t.read_receipt_sent = true;
+        }
+        if t.sent_by_me
+            && !mine
+            && let Some(raw) = stored_raw(s, x)
+            && raw_headers(&raw)
+                .get("Content-Type")
+                .is_some_and(|c| c.to_ascii_lowercase().contains("report"))
+            && let Ok(msg) = mailcraft_mime::parse(&raw)
+        {
+            read_report(&msg, &mid, x.received, &mut t.receipts);
+        }
+    }
+    t.tally = t
+        .choices
+        .iter()
+        .map(|c| (c.clone(), t.responses.iter().filter(|r| r.choice.eq_ignore_ascii_case(c)).count()))
+        .collect();
+    Some(t)
+}
+
+/// RFC 8098 section 2.1: a receipt is not sent automatically when the message has no Return-Path, when the
+/// Return-Path differs from the address in `Disposition-Notification-To`, or when that names more than one
+/// distinct address.
+fn receipt_needs_asking(notify_to: &str, return_path: Option<&str>) -> bool {
+    let mut asking: Vec<String> = parse_address_list(notify_to)
+        .iter()
+        .flat_map(mailcraft_mime::Address::mailboxes)
+        .map(|m| m.addr.trim().to_ascii_lowercase())
+        .collect();
+    asking.sort();
+    asking.dedup();
+    let [only] = asking.as_slice() else { return true };
+    let Some(rp) = return_path else { return true };
+    let rp = rp.trim().trim_start_matches('<').trim_end_matches('>').trim().to_ascii_lowercase();
+    rp.is_empty() || rp != *only
+}
+
+/// RFC 3461 xtext (as the SMTP client writes ENVID), used to match `Original-Envelope-Id`.
+pub(crate) fn xtext(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if (33..=126).contains(&b) && b != b'+' && b != b'=' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("+{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The message a tracking command acts on: `params.id`, else the selected message.
+fn tracked_item(s: &Session, p: &Value) -> Result<ItemId, CmdError> {
+    if p.get("id").is_some() {
+        return crate::cmd::util::req_mail(s, p);
+    }
+    crate::cmd::util::mail_targets(s, p)
+        .first()
+        .copied()
+        .ok_or_else(|| CmdError::Disabled("select a message first".into()))
+}
+
+fn tracking_cmd(s: &mut Session, p: &Value) -> CmdResult {
+    let id = tracked_item(s, p)?;
+    let t = tracking(s, id).ok_or_else(|| CmdError::Params(format!("no message with id {}", id.0)))?;
+    let text = t.voting_text(s.tz_offset_min);
+    let mut v = serde_json::to_value(&t).map_err(|e| CmdError::Failed(e.to_string()))?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("id".into(), json!(id.0));
+        o.insert("votingText".into(), json!(text));
+    }
+    Ok(v)
+}
+
+/// Queues `c` (not shown in a window) and sends it right away.
+fn send_hidden(s: &mut Session, mut c: ComposeState) -> CmdResult {
+    s.next_compose = s.next_compose.saturating_add(1);
+    c.id = s.next_compose;
+    let cid = c.id;
+    s.composes.insert(cid, c);
+    let r = send(s, &json!({"compose": cid}));
+    // A refused send leaves no hidden compose behind.
+    s.composes.remove(&cid);
+    r
+}
+
+/// Vote: answers a voting message with one of its choices. `edit: true` opens the response for editing
+/// (quoted original); otherwise it is sent right away with an empty body.
+fn vote(s: &mut Session, p: &Value) -> CmdResult {
+    let id = tracked_item(s, p)?;
+    let choice = req_str(p, "choice")?.trim().to_owned();
+    let t = tracking(s, id).ok_or_else(|| CmdError::Params(format!("no message with id {}", id.0)))?;
+    if t.choices.is_empty() {
+        return Err(CmdError::Failed("this message has no voting buttons".into()));
+    }
+    let Some(choice) = t.choices.iter().find(|c| c.eq_ignore_ascii_case(&choice)).cloned() else {
+        return Err(CmdError::Params(format!(
+            "`{choice}` is not one of the choices: {}",
+            t.choices.join("; ")
+        )));
+    };
+    if t.sent_by_me {
+        return Err(CmdError::Failed("you cannot vote on a message you sent".into()));
+    }
+    let Some(mut c) = crate::cmd::respond::build_response(s, id, ComposeKind::Reply, false) else {
+        return Err(CmdError::Params(format!("no message with id {}", id.0)));
+    };
+    let original = s.mailbox.mail.get(&id).map(|m| m.subject.clone()).unwrap_or_default();
+    c.subject = format!("{choice}: {}", mailcraft_model::subject::strip_prefixes(&original));
+    c.vote_response = Some(choice.clone());
+    if opt_bool(p, "edit") == Some(true) {
+        let cid = s.open_compose(c);
+        return Ok(json!({"vote": choice, "compose": cid}));
+    }
+    c.body = Doc::default();
+    c.inline_images.clear();
+    c.ensure_body();
+    let r = send_hidden(s, c)?;
+    Ok(json!({"vote": choice, "sent": r.get("sent").cloned().unwrap_or(json!(false)), "item": r.get("item")}))
+}
+
+/// An RFC 8098 message disposition notification ("displayed") for `m`, from `from` to `to`.
+fn mdn_message(
+    s: &Session,
+    m: &MailItem,
+    from: &mailcraft_mime::Mailbox,
+    to: &str,
+    now: DateTime,
+    automatic: bool,
+) -> Vec<u8> {
+    use base64::Engine as _;
+    let mid = m.message_id.as_deref().map(bare_id).unwrap_or_default();
+    let mut b = MessageBuilder::new();
+    b.from = Some(from.clone());
+    b.subject = format!("{READ_PREFIX}{}", m.subject);
+    let id = b.generate_message_id(now, now.unix.unsigned_abs());
+    let to_list = parse_address_list(to);
+    let sent = m.sent.unwrap_or(m.received).civil(s.tz_offset_min);
+    let read = now.civil(s.tz_offset_min);
+    let recipients: Vec<String> = m.to.iter().map(|x| x.addr.clone()).collect();
+    let text = format!(
+        "Your message\r\n\r\n  To: {}\r\n  Subject: {}\r\n  Sent: {:04}-{:02}-{:02} {:02}:{:02}\r\n\r\n\
+was read on {:04}-{:02}-{:02} {:02}:{:02}.\r\n",
+        recipients.join(", "),
+        m.subject,
+        sent.year,
+        sent.month,
+        sent.day,
+        sent.hour,
+        sent.minute,
+        read.year,
+        read.month,
+        read.day,
+        read.hour,
+        read.minute
+    );
+    let boundary = format!("=_mdn_{:x}", now.unix.unsigned_abs() ^ 0x5bd1_e995);
+    let mut out = String::new();
+    let mut header = |k: &str, v: &str| {
+        out.push_str(&mailcraft_mime::header::fold(k, v));
+        out.push_str("\r\n");
+    };
+    header("From", &mailcraft_mime::addr::format_mailbox(from, true));
+    header("To", &mailcraft_mime::format_address_list(&to_list, true));
+    header("Subject", &mailcraft_mime::encoded::encode_words(&b.subject));
+    header("Date", &now.to_rfc5322());
+    header("Message-ID", &format!("<{id}>"));
+    if !mid.is_empty() {
+        header("In-Reply-To", &format!("<{mid}>"));
+        header("References", &format!("<{mid}>"));
+    }
+    header("MIME-Version", "1.0");
+    header(
+        "Content-Type",
+        &format!("multipart/report; report-type=disposition-notification; boundary=\"{boundary}\""),
+    );
+    out.push_str("\r\n");
+    out.push_str(&format!(
+        "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+    ));
+    let enc = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    for chunk in enc.as_bytes().chunks(76) {
+        out.push_str(&String::from_utf8_lossy(chunk));
+        out.push_str("\r\n");
+    }
+    let me = &from.addr;
+    out.push_str(&format!("--{boundary}\r\nContent-Type: message/disposition-notification\r\n\r\n"));
+    out.push_str("Reporting-UA: MailCraft\r\n");
+    if me.is_ascii() {
+        out.push_str(&format!("Final-Recipient: rfc822;{me}\r\n"));
+    } else {
+        out.push_str(&format!("Final-Recipient: utf-8;{me}\r\n"));
+    }
+    if !mid.is_empty() {
+        out.push_str(&format!("Original-Message-ID: <{mid}>\r\n"));
+    }
+    // RFC 8098 section 3.2.6.1: who decided to send it.
+    out.push_str(if automatic {
+        "Disposition: automatic-action/MDN-sent-automatically; displayed\r\n"
+    } else {
+        "Disposition: manual-action/MDN-sent-manually; displayed\r\n"
+    });
+    out.push_str(&format!("\r\n--{boundary}--\r\n"));
+    out.into_bytes()
+}
+
+/// Answers a read-receipt request on a received message: `send: true` sends the receipt (RFC 8098),
+/// `send: false` declines (nothing is sent). `automatic: true` is the "Always send a read receipt" option
+/// answering without the user: refused with `{"sent": false, "ask": true}` when the request must be confirmed
+/// by the user (RFC 8098 section 2.1; see [`Tracking::read_receipt_ask`]).
+fn send_read_receipt(s: &mut Session, p: &Value) -> CmdResult {
+    let id = tracked_item(s, p)?;
+    let t = tracking(s, id).ok_or_else(|| CmdError::Params(format!("no message with id {}", id.0)))?;
+    let Some(to) = t.read_receipt_to.clone() else {
+        return Err(CmdError::Failed("the sender did not ask for a read receipt".into()));
+    };
+    if opt_bool(p, "send") == Some(false) {
+        return Ok(json!({"sent": false, "declined": true}));
+    }
+    if t.read_receipt_sent {
+        return Ok(json!({"sent": false, "alreadySent": true}));
+    }
+    let automatic = opt_bool(p, "automatic") == Some(true);
+    if automatic && t.read_receipt_ask {
+        return Ok(json!({"sent": false, "ask": true}));
+    }
+    if parse_recipients(&to).map(|v| v.is_empty()).unwrap_or(true) {
+        return Err(CmdError::Failed(format!("the read receipt address is not valid: {to}")));
+    }
+    let account = crate::cmd::mail::item_account(s, id)
+        .and_then(|a| s.mailbox.account(a))
+        .filter(|a| a.can_send())
+        .or_else(|| s.mailbox.default_account().filter(|a| a.can_send()))
+        .cloned();
+    let Some(account) = account else {
+        return Err(CmdError::Failed(NO_ACCOUNT.into()));
+    };
+    let Some(outbox) = s.mailbox.role_folder(account.id, FolderRole::Outbox) else {
+        return Err(CmdError::Failed(format!("The account {} has no Outbox folder.", account.address)));
+    };
+    let Some(m) = s.mailbox.mail.get(&id).cloned() else {
+        return Err(CmdError::Params(format!("no message with id {}", id.0)));
+    };
+    let name = if account.sender_name.trim().is_empty() {
+        account.display_name.trim()
+    } else {
+        account.sender_name.trim()
+    };
+    let from = mailcraft_mime::Mailbox::new(Some(name), account.address.trim());
+    let now = s.now();
+    let raw = mdn_message(s, &m, &from, &to, now, automatic);
+    let mut item = match mailcraft_mime::parse(&raw) {
+        Ok(msg) => MailItem::from_message(&msg, &raw, now),
+        Err(e) => return Err(CmdError::Failed(format!("the read receipt could not be built: {e}"))),
+    };
+    item.folder = outbox;
+    item.read = true;
+    item.received = now;
+    item.sent = Some(now);
+    let rid = s.mailbox.add_mail(item);
+    crate::sync::send_now(s, account.id);
+    Ok(json!({"sent": true, "item": rid.0, "to": to}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         spec(
@@ -1876,6 +2737,36 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             has_compose,
             direct_replies_to,
+        ),
+        spec(
+            "compose.vote",
+            "Vote",
+            "Reading Pane › Voting info bar",
+            "",
+            r#"{"id"?:number,"choice":string,"edit"?:bool}"#,
+            true,
+            crate::always,
+            vote,
+        ),
+        spec(
+            "compose.sendReadReceipt",
+            "Send a Read Receipt",
+            "Reading Pane › Read receipt request",
+            "",
+            r#"{"id"?:number,"send"?:bool,"automatic"?:bool}"#,
+            true,
+            crate::always,
+            send_read_receipt,
+        ),
+        spec(
+            "compose.tracking",
+            "Tracking",
+            "Read Message › Show › Tracking",
+            "",
+            r#"{"id"?:number}"#,
+            false,
+            crate::always,
+            tracking_cmd,
         ),
         spec(
             "compose.encrypt",
@@ -2418,7 +3309,9 @@ pub(crate) mod tests {
         s.run("compose.importance", &json!({"level": "high"})).unwrap();
         assert_eq!(s.composes[&id].importance, Importance::Normal);
         s.run("compose.deliveryReceipt", &json!({})).unwrap();
-        s.run("compose.encrypt", &json!({})).unwrap();
+        let r = s.run("compose.encrypt", &json!({})).unwrap();
+        assert_eq!(r["encrypt"], false);
+        assert!(s.notices.contains(&Notice::Info(ENCRYPT_UNAVAILABLE.into())));
         s.run("compose.votingButtons", &json!({"choices": "Yes;No"})).unwrap();
         s.run("compose.directRepliesTo", &json!({"addresses": "r@example.com"})).unwrap();
         assert!(s.run("compose.directRepliesTo", &json!({"addresses": "nope"})).is_err());
@@ -2427,7 +3320,7 @@ pub(crate) mod tests {
         s.run("compose.followUp", &json!({"kind": "tomorrow"})).unwrap();
         s.run("compose.sensitivity", &json!({"level": "private"})).unwrap();
         let c = &s.composes[&id];
-        assert!(c.show_bcc && c.show_from && c.request_delivery_receipt && c.encrypt);
+        assert!(c.show_bcc && c.show_from && c.request_delivery_receipt && !c.encrypt);
         assert_eq!(c.voting, "Yes;No");
         assert_eq!(c.reply_to, "r@example.com");
         assert_eq!(c.delay_until.unwrap().civil(0).hour, 8);
@@ -2438,11 +3331,384 @@ pub(crate) mod tests {
         }
         s.run("compose.followUp", &json!({"kind": "clear"})).unwrap();
         assert_eq!(s.composes[&id].flag, FlagState::None);
-        // Encrypted sends are refused (no certificates yet).
+        // Encrypt stays off, so Send works; a draft saved with Encrypt on is refused until it is turned off.
         s.run("compose.setTo", &json!({"value": "x@example.com"})).unwrap();
+        s.composes.get_mut(&id).unwrap().encrypt = true;
         assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], false);
+        s.run("compose.encrypt", &json!({"on": false})).unwrap();
+        assert!(!s.composes[&id].encrypt);
         assert_eq!(s.run("compose.messageOptions", &json!({})).unwrap()["dialog"], "messageOptions");
         assert_eq!(s.run("compose.addressBook", &json!({})).unwrap()["dialog"], "addressBook");
+    }
+
+    fn outbox_raw(s: &Session) -> String {
+        let m = folder_items(s, FolderRole::Outbox).into_iter().max_by_key(|m| m.id).unwrap();
+        String::from_utf8_lossy(m.raw.as_ref().unwrap()).into_owned()
+    }
+
+    fn folder_of(s: &Session, role: FolderRole) -> mailcraft_model::FolderId {
+        let acc = s.mailbox.accounts.iter().find(|a| a.kind == AccountKind::Imap).unwrap().id;
+        s.mailbox.role_folder(acc, role).unwrap()
+    }
+
+    #[test]
+    fn delivery_receipt_is_a_dsn_request_and_save_sent_is_honoured() {
+        let mut s = session();
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.deliveryReceipt", &json!({"on": true})).unwrap();
+        s.run("compose.saveSentItemTo", &json!({"mode": "none"})).unwrap();
+        assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
+        let raw = outbox_raw(&s);
+        assert!(raw.contains("X-MailCraft-Submit-DSN: NOTIFY=SUCCESS,FAILURE; RET=HDRS"), "{raw}");
+        assert!(!raw.contains("Return-Receipt-To"));
+        assert!(raw.contains("X-MailCraft-Submit-Save-Sent: none"));
+        // After sending, Do Not Save drops the copy.
+        let id = folder_items(&s, FolderRole::Outbox)[0].id;
+        assert!(file_sent_copy(&mut s, id));
+        assert!(!s.mailbox.mail.contains_key(&id));
+
+        // Other Folder: the copy moves there without the submission-only headers.
+        let inbox = folder_of(&s, FolderRole::Inbox);
+        let archive = s.mailbox.create_folder(inbox, "Kept").unwrap();
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.saveSentItemTo", &json!({"mode": "other", "folder": archive.0})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        assert!(outbox_raw(&s).contains(&format!("X-MailCraft-Submit-Save-Sent: folder={}", archive.0)));
+        let id = folder_items(&s, FolderRole::Outbox)[0].id;
+        assert!(file_sent_copy(&mut s, id));
+        let m = &s.mailbox.mail[&id];
+        assert_eq!(m.folder, archive);
+        assert!(!String::from_utf8_lossy(m.raw.as_ref().unwrap()).contains("X-MailCraft-Submit"));
+
+        // Default: the caller files it in Sent Items.
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        let id = folder_items(&s, FolderRole::Outbox)[0].id;
+        assert!(!outbox_raw(&s).contains("X-MailCraft-Submit"));
+        assert!(!file_sent_copy(&mut s, id));
+    }
+
+    #[test]
+    fn submit_headers_strip_with_folded_lines() {
+        let raw = b"From: a@example.com\r\nX-MailCraft-Submit-DSN: NOTIFY=SUCCESS,\r\n FAILURE\r\nSubject: x\r\n\r\nX-MailCraft-Submit-DSN: body\r\n";
+        assert_eq!(
+            strip_submit_headers(raw),
+            b"From: a@example.com\r\nSubject: x\r\n\r\nX-MailCraft-Submit-DSN: body\r\n".to_vec()
+        );
+        assert_eq!(DSN_HEADER, "X-MailCraft-Submit-DSN");
+        assert_eq!(voting_choices(" Approve; Reject;;approve ;x\u{0}y"), vec!["Approve", "Reject", "xy"]);
+        assert_eq!(xtext("a+b c"), "a+2Bb+20c");
+    }
+
+    /// A received message (raw) in the IMAP account's Inbox.
+    fn receive(s: &mut Session, raw: &str) -> ItemId {
+        let inbox = folder_of(s, FolderRole::Inbox);
+        let raw = raw.replace('\n', "\r\n").into_bytes();
+        let msg = mailcraft_mime::parse(&raw).unwrap();
+        let mut item = MailItem::from_message(&msg, &raw, s.now());
+        item.folder = inbox;
+        s.mailbox.add_mail(item)
+    }
+
+    #[test]
+    fn voting_buttons_vote_and_tally() {
+        // The sender's side: the choices travel in the voting header.
+        let mut s = session();
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "ann@example.org"})).unwrap();
+        s.run("compose.setSubject", &json!({"value": "Lunch"})).unwrap();
+        s.run("compose.votingButtons", &json!({"choices": "Approve;Reject"})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        assert!(outbox_raw(&s).contains("X-MailCraft-Voting: Approve;Reject"));
+        let sent = folder_items(&s, FolderRole::Outbox)[0].id;
+        let mid = s.mailbox.mail[&sent].message_id.clone().unwrap();
+
+        // The recipient votes.
+        let mut r = session();
+        let got = receive(
+            &mut r,
+            &format!(
+                "From: Me <me@example.net>\nTo: me@example.com\nSubject: Lunch\nMessage-ID: <{mid}>\nX-MailCraft-Voting: Approve;Reject\n\nWhere?\n"
+            ),
+        );
+        r.selection.items = vec![got];
+        r.selection.focus = Some(got);
+        let t = r.run("compose.tracking", &json!({})).unwrap();
+        assert_eq!(t["choices"], json!(["Approve", "Reject"]));
+        assert!(t["votingText"].as_str().unwrap().contains("voting buttons"));
+        assert!(r.run("compose.vote", &json!({"choice": "Maybe"})).is_err());
+        let v = r.run("compose.vote", &json!({"choice": "approve"})).unwrap();
+        assert_eq!(v["vote"], "Approve");
+        assert_eq!(v["sent"], true);
+        assert!(r.composes.is_empty(), "no compose window is left open");
+        let raw = outbox_raw(&r);
+        assert!(
+            raw.contains("X-MailCraft-Vote: Approve") && raw.contains("Subject: Approve: Lunch"),
+            "{raw}"
+        );
+        assert!(raw.contains(&format!("In-Reply-To: <{mid}>")));
+        let t = tracking(&r, got).unwrap();
+        assert_eq!(t.my_vote.as_ref().map(|v| v.0.as_str()), Some("Approve"));
+        assert!(t.voting_text(0).unwrap().starts_with("You responded Approve"));
+        // Edit the response before sending: a compose opens with the vote attached.
+        let v = r.run("compose.vote", &json!({"id": got.0, "choice": "Reject", "edit": true})).unwrap();
+        let cid = v["compose"].as_u64().unwrap();
+        assert_eq!(r.composes[&cid].vote_response.as_deref(), Some("Reject"));
+        assert_eq!(r.composes[&cid].subject, "Reject: Lunch");
+
+        // Back on the sender's side the responses are tallied (latest per responder).
+        let vote_raw = raw.replace("\r\n", "\n");
+        receive(
+            &mut s,
+            &vote_raw.replace("From: Me Example <me@example.com>", "From: Ann <ann@example.org>"),
+        );
+        receive(
+            &mut s,
+            &format!(
+                "From: Bo <bo@example.org>\nSubject: Reject: Lunch\nIn-Reply-To: <{mid}>\nMessage-ID: <b1@example.org>\n\nno\n"
+            ),
+        );
+        let t = tracking(&s, sent).unwrap();
+        assert!(t.sent_by_me);
+        assert_eq!(t.tally, vec![("Approve".to_owned(), 1), ("Reject".to_owned(), 1)], "{t:?}");
+        assert_eq!(t.voting_text(0).unwrap(), "Reply totals: Approve 1; Reject 1");
+        assert!(s.run("compose.vote", &json!({"id": sent.0, "choice": "Approve"})).is_err(), "own message");
+    }
+
+    #[test]
+    fn read_receipt_requests_are_answered_with_an_mdn() {
+        let mut s = session();
+        let got = receive(
+            &mut s,
+            "From: Ann <ann@example.org>\nTo: me@example.com\nSubject: Report\nMessage-ID: <r1@example.org>\nDisposition-Notification-To: Ann <ann@example.org>\n\nPlease confirm\n",
+        );
+        let t = tracking(&s, got).unwrap();
+        assert_eq!(t.read_receipt_to.as_deref(), Some("Ann <ann@example.org>"));
+        assert!(!t.read_receipt_sent);
+        assert_eq!(
+            s.run("compose.sendReadReceipt", &json!({"id": got.0, "send": false})).unwrap()["declined"],
+            true
+        );
+        assert!(folder_items(&s, FolderRole::Outbox).is_empty());
+        let r = s.run("compose.sendReadReceipt", &json!({"id": got.0})).unwrap();
+        assert_eq!(r["sent"], true);
+        let raw = outbox_raw(&s);
+        assert!(raw.contains("multipart/report; report-type=disposition-notification"), "{raw}");
+        assert!(raw.contains("Content-Type: message/disposition-notification"));
+        assert!(raw.contains("Original-Message-ID: <r1@example.org>"));
+        assert!(raw.contains("Disposition: manual-action/MDN-sent-manually; displayed"));
+        assert!(raw.contains("Final-Recipient: rfc822;me@example.com"));
+        assert!(raw.contains("Subject: Read: Report"));
+        let msg = mailcraft_mime::parse(raw.as_bytes()).unwrap();
+        assert!(msg.text_body().unwrap().contains("was read on"));
+        assert!(tracking(&s, got).unwrap().read_receipt_sent);
+        assert_eq!(s.run("compose.sendReadReceipt", &json!({"id": got.0})).unwrap()["alreadySent"], true);
+        // A message without a request has nothing to answer.
+        let plain = receive(&mut s, "From: b@example.org\nSubject: x\nMessage-ID: <x@example.org>\n\nx\n");
+        assert!(s.run("compose.sendReadReceipt", &json!({"id": plain.0})).is_err());
+    }
+
+    #[test]
+    fn automatic_read_receipts_follow_rfc_8098() {
+        let mut s = session();
+        // Return-Path matches the requester: sent automatically, marked as such.
+        let ok = receive(
+            &mut s,
+            "Return-Path: <ann@example.org>\nFrom: Ann <ann@example.org>\nTo: me@example.com\nSubject: A\nMessage-ID: <a1@example.org>\nDisposition-Notification-To: Ann <ann@example.org>\n\nx\n",
+        );
+        assert!(!tracking(&s, ok).unwrap().read_receipt_ask);
+        let r = s.run("compose.sendReadReceipt", &json!({"id": ok.0, "automatic": true})).unwrap();
+        assert_eq!(r["sent"], true, "{r}");
+        let raw = outbox_raw(&s);
+        assert!(raw.contains("Disposition: automatic-action/MDN-sent-automatically; displayed"), "{raw}");
+        // No Return-Path, a different one, or several addresses: the user is asked instead (section 2.1).
+        for (i, head) in [
+            "Disposition-Notification-To: ann@example.org\n",
+            "Return-Path: <bounce@lists.example.net>\nDisposition-Notification-To: ann@example.org\n",
+            "Return-Path: <ann@example.org>\nDisposition-Notification-To: ann@example.org, bo@example.org\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = receive(
+                &mut s,
+                &format!(
+                    "{head}From: Ann <ann@example.org>\nSubject: B\nMessage-ID: <b{i}@example.org>\n\nx\n"
+                ),
+            );
+            let t = tracking(&s, id).unwrap();
+            assert!(t.read_receipt_to.is_some());
+            assert!(t.read_receipt_ask, "{head}");
+            let r = s.run("compose.sendReadReceipt", &json!({"id": id.0, "automatic": true})).unwrap();
+            assert_eq!((r["sent"].clone(), r["ask"].clone()), (json!(false), json!(true)), "{head}");
+            // Answered by the user, it goes out as a manual receipt.
+            assert_eq!(s.run("compose.sendReadReceipt", &json!({"id": id.0})).unwrap()["sent"], true);
+        }
+        // Reports (receipts, delivery notifications) are never answered with a receipt.
+        let report = receive(
+            &mut s,
+            "Return-Path: <ann@example.org>\nFrom: ann@example.org\nSubject: Read: Hi\nMessage-ID: <rep@example.org>\nDisposition-Notification-To: ann@example.org\nMIME-Version: 1.0\nContent-Type: multipart/report; report-type=disposition-notification; boundary=b\n\n--b\nContent-Type: text/plain\n\nread\n--b--\n",
+        );
+        assert_eq!(tracking(&s, report).unwrap().read_receipt_to, None);
+        assert!(s.run("compose.sendReadReceipt", &json!({"id": report.0})).is_err());
+    }
+
+    #[test]
+    fn delivery_and_read_reports_update_the_sent_item() {
+        let mut s = session();
+        open(&mut s);
+        s.run("compose.setTo", &json!({"value": "ann@example.org; bo@example.org"})).unwrap();
+        s.run("compose.setSubject", &json!({"value": "Plan"})).unwrap();
+        s.run("compose.deliveryReceipt", &json!({"on": true})).unwrap();
+        s.run("compose.readReceipt", &json!({"on": true})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        let sent = folder_items(&s, FolderRole::Outbox)[0].id;
+        let mid = s.mailbox.mail[&sent].message_id.clone().unwrap();
+        receive(
+            &mut s,
+            &format!(
+                "From: Mail Delivery System <MAILER-DAEMON@example.org>\nSubject: Successful Mail Delivery Report\n\
+Message-ID: <d1@example.org>\nContent-Type: multipart/report; report-type=delivery-status; boundary=\"b\"\n\n\
+--b\nContent-Type: text/plain\n\nDelivered.\n--b\nContent-Type: message/delivery-status\n\n\
+Reporting-MTA: dns; mx.example.org\nOriginal-Envelope-Id: {}\n\nFinal-Recipient: rfc822; ann@example.org\n\
+Original-Recipient: rfc822;ann@example.org\nAction: delivered\nStatus: 2.0.0\n\nFinal-Recipient: rfc822; bo@example.org\n\
+Action: failed\nStatus: 5.1.1\n--b--\n",
+                xtext(&mid)
+            ),
+        );
+        receive(
+            &mut s,
+            &format!(
+                "From: Ann <ann@example.org>\nSubject: Read: Plan\nMessage-ID: <m1@example.org>\nIn-Reply-To: <{mid}>\n\
+Content-Type: multipart/report; report-type=disposition-notification; boundary=\"c\"\n\n--c\nContent-Type: text/plain\n\nRead.\n\
+--c\nContent-Type: message/disposition-notification\n\nReporting-UA: x\nFinal-Recipient: rfc822;ann@example.org\n\
+Original-Message-ID: <{mid}>\nDisposition: manual-action/MDN-sent-manually; displayed\n--c--\n"
+            ),
+        );
+        let t = tracking(&s, sent).unwrap();
+        let ann = t.receipts.iter().find(|r| r.recipient == "ann@example.org").unwrap();
+        assert_eq!(ann.delivery.as_deref(), Some("Delivered"));
+        assert_eq!(ann.read.as_deref(), Some("Read"));
+        let bo = t.receipts.iter().find(|r| r.recipient == "bo@example.org").unwrap();
+        assert_eq!(bo.delivery.as_deref(), Some("Failed"));
+        assert_eq!(bo.read, None);
+        // Reports about other messages are ignored.
+        assert!(tracking(&s, ItemId(u64::MAX)).is_none());
+    }
+
+    #[test]
+    fn themes_restyle_the_body() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "Title\nBody text"})).unwrap();
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": [0], "offset": 0}, "focus": {"path": [0], "offset": 2}}),
+        )
+        .unwrap();
+        s.run("format.style", &json!({"name": "Heading 1"})).unwrap();
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": [1], "offset": 0}, "focus": {"path": [1], "offset": 4}}),
+        )
+        .unwrap();
+        let office_accent = crate::compose::ThemeState::default().resolve().color(crate::compose::ACCENT1);
+        s.run("format.color", &json!({"color": office_accent.to_hex()})).unwrap();
+        let r = s.run("compose.theme", &json!({"name": "Organic"})).unwrap();
+        assert_eq!(r["headingFont"], "Garamond");
+        assert_eq!(r["effectSet"], "Grunge Texture");
+        let c = &s.composes[&id];
+        assert_eq!(c.body.base.font_family.as_deref(), Some("Garamond"));
+        let organic = crate::compose::color_set("Organic").unwrap();
+        // The accent-coloured run follows the palette; the heading takes the heading font.
+        let mut colors = Vec::new();
+        let mut fonts = Vec::new();
+        for b in &c.body.blocks {
+            if let Block::Heading { inlines, .. } | Block::Paragraph { inlines, .. } = b {
+                for i in inlines {
+                    if let mailcraft_model::Inline::Text { style, .. } = i {
+                        colors.push(style.color);
+                        fonts.push(style.font_family.clone());
+                    }
+                }
+            }
+        }
+        assert!(colors.contains(&Some(organic[crate::compose::ACCENT1])), "{colors:?}");
+        assert!(fonts.contains(&Some("Garamond".to_owned())));
+        // Colors / Fonts / Effects one part at a time, then undo.
+        s.run("compose.theme", &json!({"part": "colors", "name": "Blue"})).unwrap();
+        assert_eq!(s.composes[&id].theme_resolved().colors, crate::compose::color_set("Blue").unwrap());
+        s.run("compose.theme", &json!({"part": "fonts", "name": "Georgia"})).unwrap();
+        assert_eq!(s.composes[&id].body.base.font_family.as_deref(), Some("Georgia"));
+        s.run("compose.theme", &json!({"part": "effects", "name": "Glossy"})).unwrap();
+        assert_eq!(s.composes[&id].theme_resolved().effects, "Glossy");
+        assert!(s.run("compose.theme", &json!({"part": "colors", "name": "Plaid"})).is_err());
+        assert!(s.run("compose.theme", &json!({"name": "Nope"})).is_err());
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(
+            s.composes[&id].body.base.font_family.as_deref(),
+            Some("Georgia"),
+            "undo restores the body"
+        );
+        // Galleries for the menus.
+        let g = s.run("compose.theme", &json!({"action": "list"})).unwrap();
+        assert_eq!(g["colors"].as_array().unwrap().len(), crate::compose::COLOR_GALLERY_LEN);
+        assert_eq!(g["fonts"].as_array().unwrap().len(), 26);
+        assert_eq!(g["effects"].as_array().unwrap().len(), 15);
+        assert_eq!(g["themes"].as_array().unwrap().len(), 11);
+        s.run("compose.theme", &json!({"action": "reset"})).unwrap();
+        assert_eq!(s.composes[&id].body.base.font_family.as_deref(), Some("Aptos"));
+    }
+
+    #[test]
+    fn custom_theme_colours_fonts_and_theme_files() {
+        let mut s = session();
+        let id = open(&mut s);
+        assert_eq!(
+            s.run("compose.theme", &json!({"action": "customize", "part": "colors"})).unwrap()["dialog"],
+            "customizeColors"
+        );
+        assert_eq!(
+            s.run("compose.theme", &json!({"action": "customize", "part": "fonts"})).unwrap()["dialog"],
+            "customizeFonts"
+        );
+        let pal: Vec<String> = (0..12).map(|i| format!("#{:02x}0000", i * 20)).collect();
+        assert!(
+            s.run("compose.theme", &json!({"action": "customize", "part": "colors", "colors": ["#000000"]}))
+                .is_err()
+        );
+        s.run(
+            "compose.theme",
+            &json!({"action": "customize", "part": "colors", "colors": pal, "name": "Mine"}),
+        )
+        .unwrap();
+        assert_eq!(s.composes[&id].theme.colors.as_deref(), Some("Mine"));
+        assert_eq!(s.composes[&id].theme_resolved().color(5).to_hex(), "#640000");
+        s.run("compose.theme", &json!({"action": "customize", "part": "fonts", "heading": "Georgia", "body": "Verdana", "name": "Pair"})).unwrap();
+        assert_eq!(s.composes[&id].body.base.font_family.as_deref(), Some("Verdana"));
+        // Save Current Theme / Browse for Themes round trip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mine.json");
+        let path = path.to_str().unwrap();
+        s.run("compose.theme", &json!({"action": "save", "path": path, "name": "My Theme"})).unwrap();
+        let other = open(&mut s);
+        s.run("compose.theme", &json!({"compose": other, "action": "browse", "path": path})).unwrap();
+        assert_eq!(s.composes[&other].theme_resolved().colors, s.composes[&id].theme_resolved().colors);
+        assert_eq!(s.composes[&other].theme_resolved().heading_font, "Georgia");
+        assert_eq!(s.composes[&other].theme.name.as_deref(), Some("My Theme"));
+        std::fs::write(dir.path().join("bad.json"), "{}").unwrap();
+        assert!(
+            s.run(
+                "compose.theme",
+                &json!({"action": "browse", "path": dir.path().join("bad.json").to_str().unwrap()})
+            )
+            .is_err()
+        );
+        assert_eq!(s.run("compose.theme", &json!({"action": "browse"})).unwrap()["dialog"], "browseThemes");
+        assert_eq!(s.run("compose.theme", &json!({"action": "save"})).unwrap()["dialog"], "saveTheme");
     }
 
     #[test]

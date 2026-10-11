@@ -1,6 +1,7 @@
 //! Item windows shown as dialogs until the modules area gives them their own windows: appointment and
-//! meeting, contact and contact group, task and task request, note, plus Go to Date, Time Zone, Add
-//! Calendar, contact card / chooser, Forward Contact, Mail Merge and Choose Form.
+//! meeting, contact and contact group, task, note, plus Go to Date, Time Zone, Add Calendar, contact card /
+//! chooser, Forward Contact and Choose Form. (Mail Merge and the Task Request window are the modules area's
+//! own dialogs.)
 
 use egui::{Context, RichText};
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "appointment" | "newAppointment" | "newMeeting" => appointment(ctx, app, d),
         "contact" | "newContact" => contact(ctx, app, d),
         "contactGroup" | "newContactGroup" => contact_group(ctx, app, d),
-        "task" | "newTask" | "taskRequest" | "newTaskRequest" => task(ctx, app, d),
+        "task" | "newTask" => task(ctx, app, d),
         "note" | "newPost" => note(ctx, app, d),
         "goToDate" => run_form(
             ctx,
@@ -41,16 +42,32 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             Form::new(
                 "Time Zone",
                 vec![
-                    f("offset", "Offset from UTC (minutes):", Kind::Num { min: -840.0, max: 840.0 }),
-                    f("n", "", Kind::Note("For example -300 for UTC-05:00, 60 for UTC+01:00.".into())),
+                    f("zone", "Time zone (IANA name, e.g. America/Toronto):", Kind::Text),
+                    f("offset", "Or a fixed offset from UTC (minutes):", Kind::Num { min: -840.0, max: 840.0 }),
+                    f(
+                        "n",
+                        "",
+                        Kind::Note(
+                            "A named zone follows daylight saving time. A fixed offset is used when no zone is \
+                             given, for example -300 for UTC-05:00."
+                                .into(),
+                        ),
+                    ),
                 ],
             )
+            .init("zone", json!(mailcraft_engine::cmd::calendar::views::time_zones(&app.s).zone))
             .init(
                 "offset",
                 json!(d.get("offsetMin").and_then(Value::as_i64).unwrap_or(i64::from(app.s.tz_offset_min))),
             ),
             |app, v| {
-                cmd(app, "calendar.changeTimeZone", json!({"offsetMin": v.n("offset") as i64})).map(|_| None)
+                let zone = v.s("zone");
+                let params = if zone.trim().is_empty() {
+                    json!({"offsetMin": v.n("offset") as i64})
+                } else {
+                    json!({"zone": zone.trim()})
+                };
+                cmd(app, "calendar.changeTimeZone", params).map(|_| None)
             },
         ),
         "addCalendar" => run_form(
@@ -60,34 +77,30 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             Form::new(
                 "Add Calendar",
                 vec![
-                    f("source", "From:", combo(&["internet", "addressBook", "roomList", "shared"])),
+                    f("source", "From:", combo(&["internet", "file", "blank"])),
                     f("name", "Name:", Kind::Text),
-                    f("address", "Address (people / rooms):", Kind::Text),
                     f("url", "Internet calendar URL:", Kind::Text),
+                    f("path", "iCalendar file (.ics):", Kind::Text),
+                    f(
+                        "n",
+                        "",
+                        Kind::Note(
+                            "An Internet calendar is read-only and is downloaded in the background.".into(),
+                        ),
+                    ),
                 ],
             )
-            .init(
-                "source",
-                json!(if d.str("source").is_empty() { "internet".to_owned() } else { d.str("source") }),
-            )
+            .init("source", json!(add_calendar_source(&d.str("source"))))
             .width(480.0),
             |app, v| {
-                cmd(app, "calendar.addCalendar", json!({"source": v.s("source"), "name": v.s("name"), "address": v.s("address"), "url": v.s("url")}))
-                    .map(|_| None)
+                // Never fetch on the UI thread: the calendar's workers download the feed.
+                let params = json!({"source": v.s("source"), "name": v.s("name"), "url": v.s("url"), "path": v.s("path"), "fetch": false});
+                cmd(app, "calendar.addCalendar", params).map(|_| None)
             },
         ),
         "contactCard" => contact_card(ctx, app, d),
         "chooseContact" => choose_contact(ctx, app, d),
         "forwardContact" => forward_contact(ctx, app, d),
-        "mailMerge" => window(ctx, app, d, "Mail Merge Contacts", 420.0, |ui, app| {
-            ui.label(format!("{} contact(s), output: {}.", d.ids().len(), d.str("output")));
-            muted(
-                ui,
-                app,
-                "Mail merge needs a word processor; MailCraft can't produce merged documents yet.",
-            );
-            footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
-        }),
         "chooseForm" => run_form(
             ctx,
             app,
@@ -113,6 +126,15 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         ),
         _ => return None,
     })
+}
+
+/// The Add Calendar source offered first: the requested one when MailCraft supports it, else Internet.
+fn add_calendar_source(requested: &str) -> &'static str {
+    match requested {
+        "file" => "file",
+        "blank" => "blank",
+        _ => "internet",
+    }
 }
 
 /// Unix seconds → "YYYY-MM-DDTHH:MM".
@@ -305,7 +327,16 @@ fn contact(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 }
             }
         }
-        cmd(app, if id.is_some() { "people.update" } else { "people.new" }, p).map(|_| None)
+        let out = cmd(app, if id.is_some() { "people.update" } else { "people.new" }, p)?;
+        // Options › People › Check for duplicates: nothing was saved (the contact window offers Add / Update).
+        if let Some(d) = out.get("duplicate").filter(|_| out.get("id").is_none()) {
+            let name = d.get("name").and_then(Value::as_str).unwrap_or("");
+            return Err(format!(
+                "A contact with this name or email address already exists in this folder ({name}). Open it to \
+                 update it, or change the name."
+            ));
+        }
+        Ok(None)
     })
 }
 
@@ -594,4 +625,16 @@ fn forward_contact(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             Out::Keep
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn add_calendar_offers_only_supported_sources() {
+        assert_eq!(super::add_calendar_source("file"), "file");
+        assert_eq!(super::add_calendar_source("blank"), "blank");
+        for other in ["", "internet", "addressBook", "roomList", "shared"] {
+            assert_eq!(super::add_calendar_source(other), "internet");
+        }
+    }
 }

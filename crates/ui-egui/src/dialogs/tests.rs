@@ -14,6 +14,8 @@ fn harness(app: App) -> Harness<'static, App> {
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             crate::backstage::backstage(&ctx, app);
+            // Same order as the app: item windows and module dialogs take their requests first.
+            crate::modules::pim_windows(&ctx, app);
             crate::dialogs::dialogs(&ctx, app);
         },
         app,
@@ -318,7 +320,7 @@ fn options_apply_engine_settings_on_ok() {
     h.get_by_label("OK").click();
     step(&mut h);
     assert!(!h.state().s.view.status_bar);
-    // UI-only settings persist in the dialog prefs.
+    // Mail settings are saved in the profile settings store.
     let mut app = h.into_state();
     app.run("options.open", json!({"page": "mail"})).unwrap();
     let mut h = harness(app);
@@ -326,8 +328,7 @@ fn options_apply_engine_settings_on_ok() {
     step(&mut h);
     h.get_by_label("OK").click();
     step(&mut h);
-    let ctx = h.ctx.clone();
-    assert_eq!(crate::dialogs::ui_pref(&ctx, "options.mail.arrivalSound"), Some(json!(false)));
+    assert!(!h.state().s.settings.bool("mail.arrival.playSound"));
 }
 
 #[test]
@@ -357,6 +358,22 @@ fn every_known_dialog_renders_and_closes() {
             step(&mut h);
         }
     }
+}
+
+#[test]
+fn module_dialogs_raised_mid_frame_do_not_flash_a_generic_window() {
+    let app = sample_app();
+    let mut h = harness(app);
+    // Raised by a command during the frame (after the modules drew): the dialogs area leaves it queued.
+    h.state_mut()
+        .s
+        .notices
+        .push(mailcraft_engine::Notice::OpenDialog("mailMerge".into(), json!({"ids": []})));
+    h.run_steps(1);
+    assert!(h.query_by_label_contains("is not available yet").is_none());
+    assert!(h.query_by_label_contains("needs a word processor").is_none());
+    h.run_steps(2);
+    assert!(names(&h).is_empty(), "the modules area took the request: {:?}", names(&h));
 }
 
 #[test]
@@ -454,8 +471,7 @@ fn reading_pane_options_has_every_observed_setting() {
     h.get_by_label("OK").click();
     step(&mut h);
     assert!(names(&h).is_empty());
-    let ctx = h.ctx.clone();
-    assert_eq!(crate::dialogs::ui_pref(&ctx, "readingPane.alwaysPreview"), Some(json!(false)));
+    assert!(!h.state().s.settings.bool("mail.readingPane.alwaysPreview"));
 }
 
 #[test]

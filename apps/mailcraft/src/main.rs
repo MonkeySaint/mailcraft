@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use mailcraft_engine::Session;
 use mailcraft_ui_egui::App;
 
+mod clipboard;
 mod file_dialogs;
 
 const USAGE: &str = "\
@@ -114,7 +115,15 @@ fn open_session(args: &Args) -> Session {
         log::warn!("cannot create {}: {e}", dir.display());
     }
     match Session::open(&dir) {
-        Ok(s) => s,
+        Ok(mut s) => {
+            // Account secrets live in the OS credential store where there is one; otherwise the profile's
+            // unencrypted secrets file stays in use (Account Settings says so).
+            match s.use_os_keyring() {
+                Ok(at) => log::info!("account secrets: {at}"),
+                Err(e) => log::warn!("OS keyring not used, secrets stay in the profile file: {e}"),
+            }
+            s
+        }
         Err(e) => {
             let mut s = Session::new(mailcraft_engine::model::Mailbox::new_local(
                 mailcraft_engine::model::mailbox::LOCAL_ACCOUNT_FALLBACK_NAME,
@@ -170,6 +179,7 @@ fn main() -> ExitCode {
     let session = open_session(&args);
     let mut app = App::new(session);
     file_dialogs::install(&mut app);
+    clipboard::install();
     app.ui.control_port = args.control_port.or_else(|| {
         std::env::var("MAILCRAFT_CONTROL_PORT")
             .ok()

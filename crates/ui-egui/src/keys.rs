@@ -17,6 +17,13 @@
 //! | Mod+Y | Go to Folder | Go to Folder | Redo | – |
 //! | Delete | Delete message | Delete contact / appointment / task / note | – (body editing) | Delete message |
 //! | F11 | Search People (ribbon) | People: Search People | – | – |
+//! | Space / Shift+Space | Page through the message, then next / previous item (option) | – | – | – |
+//! | F6 / Shift+F6 | Move focus to the next / previous pane | same | – | – |
+//! | Mod+F1 | Collapse / expand the ribbon | same | – | – |
+//!
+//! Options (engine settings) change some keys: Mail › "CTRL + ENTER sends a message", Reading Pane ›
+//! "Single key reading using space bar", Advanced › "Prompt for confirmation before permanently deleting
+//! items" (Shift+Delete asks first).
 //!
 //! Nothing is taken from a focused text field except Escape, function keys, Mod+Shift+letter / Mod+Alt chords
 //! and Mod+digit — and, in compose windows, the formatting shortcuts (Bold, Italic, alignment, link, font
@@ -192,6 +199,10 @@ pub struct KeyContext {
     pub dialog: bool,
     /// An egui popup / context menu is open (it gets Escape).
     pub popup: bool,
+    /// Options › Mail › "CTRL + ENTER sends a message".
+    pub ctrl_enter_sends: bool,
+    /// Reading Pane options › "Single key reading using space bar".
+    pub space_reading: bool,
 }
 
 impl KeyContext {
@@ -205,6 +216,8 @@ impl KeyContext {
             backstage: false,
             dialog: false,
             popup: false,
+            ctrl_enter_sends: true,
+            space_reading: true,
         }
     }
 
@@ -228,6 +241,8 @@ impl KeyContext {
             backstage: app.ui.backstage.as_ref().is_some_and(|(s, _)| *s == surface),
             dialog: !app.ui.dialogs.is_empty(),
             popup: ctx.any_popup_open(),
+            ctrl_enter_sends: app.s.settings.bool("mail.send.ctrlEnterSends"),
+            space_reading: app.s.settings.bool("mail.readingPane.spaceBarReading"),
         }
     }
 }
@@ -255,6 +270,12 @@ pub enum Action {
     ReadStep(bool),
     /// Focus the ribbon's Search People box (F11; Home tab).
     FocusSearchPeople,
+    /// Space-bar reading: page the reading pane, then the next item (`true` = Shift: back).
+    SpaceRead(bool),
+    /// F6 / Shift+F6 (`true` = back): move focus to the next pane.
+    CyclePane(bool),
+    /// Mod+F1: collapse or expand the ribbon.
+    ToggleRibbon,
 }
 
 fn run(id: &str) -> Option<Action> {
@@ -385,6 +406,10 @@ pub fn resolve_with(c: Chord, cx: &KeyContext, registry: &Registry) -> Option<Ac
     if let Some(a) = resolve(c, cx) {
         return Some(a);
     }
+    // Options › Mail › "CTRL + ENTER sends a message" off: Send's registry shortcut does not apply either.
+    if matches!(cx.surface, Surface::Compose(_)) && !cx.ctrl_enter_sends && c == Chord::cmd(Key::Enter) {
+        return None;
+    }
     if cx.text_focus && !allowed_with_text_focus(c, cx.surface) {
         return None;
     }
@@ -463,6 +488,9 @@ fn resolve_main(c: Chord, cx: &KeyContext) -> Option<Action> {
         (false, false, false, Key::F9) => run("sendReceive.all"),
         (false, false, false, Key::F3) => Some(Action::FocusSearch),
         (false, false, false, Key::F1) => run("help.help"),
+        (true, false, false, Key::F1) => Some(Action::ToggleRibbon),
+        (false, false, back, Key::F6) => Some(Action::CyclePane(back)),
+        (false, false, back, Key::Space) if mail_like(m) && cx.space_reading => Some(Action::SpaceRead(back)),
         // Mail: the ribbon's Search People box (keyboard.md); People keeps its own `people.search`.
         (false, false, false, Key::F11) if mail_like(m) => Some(Action::FocusSearchPeople),
         (true, false, false, Key::E) => Some(Action::FocusSearch),
@@ -593,9 +621,10 @@ fn resolve_compose(c: Chord, id: u64, _cx: &KeyContext) -> Option<Action> {
         (true, true, false, Key::V) => run_p("format.pasteSpecial", p()),
         (true, false, false, Key::H) => run_p("format.replace", p()),
         (true, false, false, Key::G) => run_p("format.goTo", p()),
-        (true, false, false, Key::Enter) | (false, true, false, Key::S) => {
+        (true, false, false, Key::Enter) if _cx.ctrl_enter_sends => {
             Some(Action::RunIfEnabled { id: "compose.send".into(), params: p() })
         }
+        (false, true, false, Key::S) => Some(Action::RunIfEnabled { id: "compose.send".into(), params: p() }),
         (true, false, false, Key::S) => run_p("compose.saveDraft", p()),
         (true, false, true, Key::B) => run_p("compose.addressBook", p()),
         (false, false, false, Key::F7) => run_p("review.spelling", p()),
@@ -645,6 +674,41 @@ struct KeyMemory {
     keytips: BTreeMap<String, Vec<KeytipTarget>>,
     /// A keytip asked for a menu / dropdown to open: (surface key, menu id).
     menu_request: Option<(String, String)>,
+    /// Pane focused with F6 ("folders", "list", "reading", …, "statusBar", "ribbon"), until the next click.
+    pane: Option<String>,
+}
+
+/// The pane F6 moved focus to, if any (the shell draws a focus ring around it).
+pub fn focused_pane(ctx: &egui::Context) -> Option<String> {
+    with_mem(ctx, |m| m.pane.clone())
+}
+
+/// F6 / Shift+F6: the next (previous) pane of the main window, in drawing order, then the status bar and the
+/// ribbon. Returns the pane now focused.
+fn cycle_pane(ctx: &egui::Context, app: &App, back: bool) -> Option<String> {
+    let layout = App::shell_layout(ctx);
+    let mut order: Vec<String> = layout.panes.iter().map(|p| (*p).to_owned()).collect();
+    if app.s.view.status_bar {
+        order.push("statusBar".into());
+    }
+    if layout.tabs_shown {
+        order.push("ribbon".into());
+    }
+    if order.is_empty() {
+        return None;
+    }
+    let cur = with_mem(ctx, |m| m.pane.clone()).and_then(|p| order.iter().position(|o| *o == p));
+    let n = order.len();
+    let next = match (cur, back) {
+        (None, false) => 0,
+        (None, true) => n.saturating_sub(1),
+        (Some(i), false) => (i + 1) % n,
+        (Some(i), true) => (i + n - 1) % n,
+    };
+    let pane = order.get(next).cloned();
+    with_mem(ctx, |m| m.pane = pane.clone());
+    ctx.request_repaint();
+    pane
 }
 
 fn mem_id() -> egui::Id {
@@ -667,6 +731,20 @@ pub fn apply(ctx: &egui::Context, app: &mut App, surface: Surface, action: Actio
             let Some(params) = module_params(app, surface, &id, params) else {
                 return json!({"action": "run", "command": id, "ok": false, "disabled": "nothing selected"});
             };
+            if id == "mail.permanentDelete" && app.s.settings.bool("advanced.confirmPermanentDelete") {
+                // Advanced › "Prompt for confirmation before permanently deleting items".
+                let ids: Vec<u64> = app.s.target_ids(&params).iter().map(|i| i.0).collect();
+                if ids.is_empty() {
+                    return json!({"action": "run", "command": id, "ok": false, "disabled": "nothing selected"});
+                }
+                let text = if ids.len() == 1 {
+                    "The selected item will be permanently deleted.".to_owned()
+                } else {
+                    format!("The {} selected items will be permanently deleted.", ids.len())
+                };
+                crate::dialogs::confirm(app, "MailCraft", &text, &id, json!({"ids": ids}));
+                return json!({"action": "confirm", "command": id, "ok": true});
+            }
             let r = run_cmd(ctx, app, surface, &id, params);
             after_run(ctx, &id, r.as_ref());
             json!({"action": "run", "command": id, "ok": r.is_some(), "result": r})
@@ -693,6 +771,23 @@ pub fn apply(ctx: &egui::Context, app: &mut App, surface: Surface, action: Actio
             // The same path as its keytip (Alt, H, F C): selects Home and focuses the box when drawn.
             let hit = crate::ribbon::keytip(ctx, app, surface, "HFC");
             json!({"action": "focusSearchPeople", "ok": hit == crate::ribbon::KeytipHit::Done})
+        }
+        Action::SpaceRead(back) => {
+            let ok = crate::reading::space_read(ctx, app, back);
+            json!({"action": "spaceRead", "ok": ok})
+        }
+        Action::CyclePane(back) => {
+            let pane = cycle_pane(ctx, app, back);
+            json!({"action": "cyclePane", "pane": pane})
+        }
+        Action::ToggleRibbon => {
+            let mode = if app.s.view.ribbon_collapsed || app.s.view.ribbon_auto_hide {
+                "always"
+            } else {
+                "tabsOnly"
+            };
+            let r = app.run("app.toggleRibbonMode", json!({"mode": mode}));
+            json!({"action": "toggleRibbon", "ok": r.is_some(), "result": r})
         }
         Action::Keytips => {
             app.ui.keytips = if app.ui.keytips.is_some() { None } else { Some(String::new()) };
@@ -890,6 +985,9 @@ pub fn handle(ctx: &egui::Context, app: &mut App, surface: Surface) {
         other => other,
     };
     track_alt(ctx, app);
+    if ctx.input(|i| i.pointer.any_pressed()) {
+        with_mem(ctx, |m| m.pane = None);
+    }
     if app.ui.keytips.is_some() {
         handle_keytips(ctx, app, surface);
         return;
@@ -1301,4 +1399,77 @@ pub fn display_chord(c: &Chord) -> String {
         k => key_name(k),
     });
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mailcraft_engine::sample::sample_session;
+
+    fn chord(text: &str) -> Chord {
+        Chord::parse(text).unwrap()
+    }
+
+    #[test]
+    fn option_dependent_bindings() {
+        let main = KeyContext::main(Module::Mail);
+        assert_eq!(resolve(chord("Space"), &main), Some(Action::SpaceRead(false)));
+        assert_eq!(resolve(chord("Shift+Space"), &main), Some(Action::SpaceRead(true)));
+        let off = KeyContext { space_reading: false, ..main };
+        assert_eq!(resolve(chord("Space"), &off), None);
+        assert_eq!(resolve(chord("Space"), &KeyContext::main(Module::Calendar)), None);
+        let typing = KeyContext { text_focus: true, ..main };
+        assert_eq!(resolve(chord("Space"), &typing), None, "typing a space is not a command");
+        assert_eq!(resolve(chord("F6"), &main), Some(Action::CyclePane(false)));
+        assert_eq!(resolve(chord("Shift+F6"), &main), Some(Action::CyclePane(true)));
+        assert_eq!(resolve(chord("Mod+F1"), &main), Some(Action::ToggleRibbon));
+        let s = sample_session();
+        let compose = KeyContext::compose(1);
+        assert!(matches!(
+            resolve_with(chord("Mod+Enter"), &compose, &s.registry),
+            Some(Action::RunIfEnabled { .. })
+        ));
+        let no_ctrl_enter = KeyContext { ctrl_enter_sends: false, ..compose };
+        assert_eq!(resolve_with(chord("Mod+Enter"), &no_ctrl_enter, &s.registry), None);
+        // Alt+S still sends.
+        assert!(resolve_with(chord("Alt+S"), &no_ctrl_enter, &s.registry).is_some());
+    }
+
+    #[test]
+    fn applying_new_actions() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(sample_session());
+        // Space with nothing focused selects the first message.
+        apply(&ctx, &mut app, Surface::Main, Action::SpaceRead(false));
+        assert!(app.s.selection.focus.is_some());
+        // Ctrl+F1 collapses and expands the ribbon.
+        apply(&ctx, &mut app, Surface::Main, Action::ToggleRibbon);
+        assert!(app.s.view.ribbon_collapsed);
+        apply(&ctx, &mut app, Surface::Main, Action::ToggleRibbon);
+        assert!(!app.s.view.ribbon_collapsed);
+        // F6 focuses a pane, Shift+F6 goes back.
+        let first = apply(&ctx, &mut app, Surface::Main, Action::CyclePane(false));
+        assert!(first["pane"].is_string());
+        assert_eq!(focused_pane(&ctx).as_deref(), first["pane"].as_str());
+        // Shift+Delete asks first (Advanced › confirm before permanently deleting).
+        let item = app.s.selection.focus.unwrap();
+        let r = apply(
+            &ctx,
+            &mut app,
+            Surface::Main,
+            Action::Run { id: "mail.permanentDelete".into(), params: json!({}) },
+        );
+        assert_eq!(r["action"], "confirm");
+        assert!(app.s.mailbox.mail.contains_key(&item));
+        assert!(app.ui.dialogs.iter().any(|(n, p)| n == "confirm" && p["params"]["ids"][0] == item.0));
+        app.ui.dialogs.clear();
+        app.run("options.set", json!({"key": "advanced.confirmPermanentDelete", "value": false}));
+        apply(
+            &ctx,
+            &mut app,
+            Surface::Main,
+            Action::Run { id: "mail.permanentDelete".into(), params: json!({"ids": [item.0]}) },
+        );
+        assert!(!app.s.mailbox.mail.contains_key(&item));
+    }
 }

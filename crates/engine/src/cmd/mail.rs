@@ -15,7 +15,8 @@ use mailcraft_model::dates::{local_day, weekday_of_day};
 use mailcraft_model::subject::strip_prefixes;
 use mailcraft_model::{
     AccountId, AccountKind, BodyFormat, Category, CategoryColor, Conversation, DateTime, FlagState,
-    FocusClass, FolderId, FolderKind, FolderRole, Importance, ItemId, MailItem, Sensitivity, thread,
+    FocusClass, FolderId, FolderKind, FolderRole, Importance, ItemId, JunkLevel, JunkList, MailItem,
+    Sensitivity, thread,
 };
 
 // ---------------------------------------------------------------------------------------------------------
@@ -316,7 +317,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Junk E-mail Options",
             "Home › Delete › Block",
             "",
-            r#"{"action":"options"|"moveToJunk"|"notJunk"}"#,
+            r#"{"action":"options"|"get"|"set"|"add"|"remove"|"import"|"export"|"moveToJunk"|"notJunk"|"run"|"classify", "list"?:"safeSenders"|"safeRecipients"|"blockedSenders"|"blockedTlds"|"blockedEncodings", "entry"?:string, "entries"?:[string], "path"?:string, "settings"?:{"level"?:"noFiltering"|"low"|"high"|"safeListsOnly", "deleteSuspected"?:bool, "disableLinks"?:bool, "warnSuspiciousDomains"?:bool, "trustContacts"?:bool, "addRecipientsToSafe"?:bool}, "addToSafe"?:bool, "folder"?:number|string, "ids"?:[number]}"#,
             true,
             always,
             junk,
@@ -1017,9 +1018,20 @@ pub(crate) fn flag_dates(s: &Session, kind: FlagKind) -> (Option<DateTime>, Opti
     (day_start(s, start), day_start(s, due))
 }
 
-/// The flag a plain click / Insert applies (the Quick Click default: Today).
+/// The Quick Click flag kind (`today` … `noDate`, or `complete`): Options › Tasks › Quick Click, set with
+/// Follow Up › Set Quick Click (`tasks.quickClickFlag`).
+pub(crate) fn quick_click_kind(s: &Session) -> String {
+    let k = s.settings.text("tasks.quickClickFlag");
+    if k == "complete" || FlagKind::parse(&k).is_some() { k } else { "today".to_owned() }
+}
+
+/// The flag a plain click / Insert applies (the Quick Click flag).
 fn quick_click_flag(s: &Session) -> FlagState {
-    let (start, due) = flag_dates(s, FlagKind::Today);
+    let kind = quick_click_kind(s);
+    if kind == "complete" {
+        return FlagState::Complete { completed: Some(s.now()) };
+    }
+    let (start, due) = flag_dates(s, FlagKind::parse(&kind).unwrap_or(FlagKind::Today));
     FlagState::Flagged { label: "Follow up".into(), start, due, reminder: None }
 }
 
@@ -1143,14 +1155,29 @@ fn clear_flag(s: &mut Session, p: &Value) -> CmdResult {
 /// Set Quick Click: without `kind` opens the dialog; with a kind validates and reports it. There is no
 /// session or mailbox field for the setting yet (same as `categories.quickClick`), so the caller (UI
 /// profile) keeps the returned value; the engine's Insert/click default is Today.
+/// Set Quick Click (flags): without `kind` opens the dialog; with it stores the Quick Click flag in the
+/// profile settings (`tasks.quickClickFlag`), used by a click in the flag column, Insert and Follow Up.
 fn set_quick_click_flag(s: &mut Session, p: &Value) -> CmdResult {
     match opt_str(p, "kind") {
-        None => open_dialog(s, "setQuickClick", json!({"for": "flag"})),
+        None => open_dialog(s, "setQuickClick", json!({"for": "flag", "kind": quick_click_kind(s)})),
         Some(k) => {
-            if FlagKind::parse(k).is_none() && !k.eq_ignore_ascii_case("complete") {
-                return Err(CmdError::Params(format!("unknown flag kind `{k}`")));
-            }
-            Ok(json!({"quickClick": k}))
+            let id = if k.eq_ignore_ascii_case("complete") {
+                "complete"
+            } else {
+                match FlagKind::parse(k) {
+                    Some(FlagKind::Today) => "today",
+                    Some(FlagKind::Tomorrow) => "tomorrow",
+                    Some(FlagKind::ThisWeek) => "thisWeek",
+                    Some(FlagKind::NextWeek) => "nextWeek",
+                    Some(FlagKind::NoDate) => "noDate",
+                    None => {
+                        let shown: String = k.chars().take(40).collect();
+                        return Err(CmdError::Params(format!("unknown flag kind `{shown}`")));
+                    }
+                }
+            };
+            crate::cmd::options::set_option(s, "tasks.quickClickFlag", &json!(id))?;
+            Ok(json!({"quickClick": id}))
         }
     }
 }
@@ -1160,7 +1187,8 @@ fn set_quick_click_flag(s: &mut Session, p: &Value) -> CmdResult {
 // ---------------------------------------------------------------------------------------------------------
 
 /// Toggles a category on the selection: removed from all when every item has it, else added where missing.
-/// Unknown names are added to the master list. Without a name the Quick Click category (the first one).
+/// Unknown names are added to the master list. Without a name the Quick Click category
+/// ([`crate::cmd::categories::quick_click_category`]).
 fn categorize(s: &mut Session, p: &Value) -> CmdResult {
     let ids = mail_targets(s, p);
     if ids.is_empty() {
@@ -1168,8 +1196,8 @@ fn categorize(s: &mut Session, p: &Value) -> CmdResult {
     }
     let name = match opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) => n.to_owned(),
-        None => match s.mailbox.categories.first() {
-            Some(c) => c.name.clone(),
+        None => match crate::cmd::categories::quick_click_category(s) {
+            Some(c) => c,
             None => return open_dialog(s, "colorCategories", json!({"ids": ids_json(&ids)})),
         },
     };
@@ -1453,31 +1481,213 @@ fn clean_up_subfolders(s: &mut Session, p: &Value) -> CmdResult {
 // Junk
 // ---------------------------------------------------------------------------------------------------------
 
+/// Upper bound for an imported list file.
+const MAX_JUNK_LIST_FILE: u64 = 4 * 1024 * 1024;
+
 fn not_junk(s: &mut Session, ids: &[ItemId]) -> Result<Vec<ItemId>, CmdError> {
     let in_junk: Vec<ItemId> =
         ids.iter().copied().filter(|id| item_role(s, *id) == Some(FolderRole::JunkEmail)).collect();
     move_to_role(s, &in_junk, FolderRole::Inbox)
 }
 
+/// `params.list` as a junk list.
+fn junk_list(p: &Value) -> Result<JunkList, CmdError> {
+    let key = req_str(p, "list")?;
+    JunkList::parse(key).ok_or_else(|| {
+        CmdError::Params(format!(
+            "unknown list `{key}` (safeSenders, safeRecipients, blockedSenders, blockedTlds, blockedEncodings)"
+        ))
+    })
+}
+
+/// `params.path` as a non-empty file path.
+fn junk_path(p: &Value) -> Result<std::path::PathBuf, CmdError> {
+    let path = req_str(p, "path")?.trim();
+    if path.is_empty() || path.contains('\0') {
+        return Err(CmdError::Params("`path` must name a file".into()));
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
+/// Junk Email Options as JSON (the settings plus the choices offered on the International tab).
+fn junk_settings_json(s: &Session) -> Value {
+    let mut v = serde_json::to_value(&s.mailbox.junk).unwrap_or_else(|_| json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("levelIndex".into(), json!(s.mailbox.junk.level.index()));
+    }
+    v
+}
+
+/// Applies `mail.junk {"action":"set"}`: any of `level`, the option flags and whole lists, from
+/// `params.settings` or the params themselves. Invalid list entries are skipped and reported.
+fn junk_set(s: &mut Session, p: &Value) -> CmdResult {
+    let src = p.get("settings").filter(|v| v.is_object()).unwrap_or(p);
+    let mut next = s.mailbox.junk.clone();
+    if let Some(v) = src.get("level").filter(|v| !v.is_null()) {
+        let parsed = match v {
+            Value::String(t) => JunkLevel::parse(t),
+            Value::Number(n) => {
+                n.as_u64().and_then(|i| usize::try_from(i).ok()).and_then(|i| JunkLevel::ALL.get(i).copied())
+            }
+            _ => None,
+        };
+        next.level = parsed.ok_or_else(|| {
+            CmdError::Params(format!("unknown junk level {v} (noFiltering, low, high, safeListsOnly)"))
+        })?;
+    }
+    let flags: [(&str, &mut bool); 5] = [
+        ("deleteSuspected", &mut next.delete_suspected),
+        ("disableLinks", &mut next.disable_links),
+        ("warnSuspiciousDomains", &mut next.warn_suspicious_domains),
+        ("trustContacts", &mut next.trust_contacts),
+        ("addRecipientsToSafe", &mut next.add_recipients_to_safe),
+    ];
+    for (key, slot) in flags {
+        if let Some(v) = src.get(key).filter(|v| !v.is_null()) {
+            *slot = v.as_bool().ok_or_else(|| CmdError::Params(format!("`{key}` must be true or false")))?;
+        }
+    }
+    let mut rejected: Vec<String> = Vec::new();
+    for l in JunkList::ALL {
+        let Some(v) = src.get(l.key()).filter(|v| !v.is_null()) else { continue };
+        let Some(arr) = v.as_array() else {
+            return Err(CmdError::Params(format!("`{}` must be a list of entries", l.key())));
+        };
+        next.list_mut(l).clear();
+        for e in arr {
+            let text = e.as_str().unwrap_or_default();
+            match next.add(l, text) {
+                Ok(_) => {}
+                Err(_) if rejected.len() < 100 => rejected.push(text.chars().take(80).collect()),
+                Err(_) => {}
+            }
+        }
+    }
+    s.mailbox.junk = next;
+    let mut out = junk_settings_json(s);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("rejected".into(), json!(rejected));
+    }
+    Ok(out)
+}
+
+/// `params.entry` / `params.entries` as strings.
+fn junk_entries(p: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(e) = p.get("entry").and_then(Value::as_str) {
+        out.push(e.to_owned());
+    }
+    if let Some(a) = p.get("entries").and_then(Value::as_array) {
+        out.extend(a.iter().filter_map(Value::as_str).map(str::to_owned));
+    }
+    out
+}
+
+/// Junk E-mail Options and the junk actions: `options` (dialog), `get`, `set`, `add`/`remove` list entries,
+/// `import`/`export` a list from/to a `.txt` file, `moveToJunk`, `notJunk` (back to the Inbox; the senders
+/// join the Safe Senders List unless `addToSafe` is false), `run` (Run Junk Filter on a folder) and
+/// `classify` (verdicts with their scoring signals).
 fn junk(s: &mut Session, p: &Value) -> CmdResult {
     let ids = mail_targets(s, p);
     match opt_str(p, "action").unwrap_or("options") {
         "options" => open_dialog(s, "junkOptions", json!({})),
+        "get" => Ok(junk_settings_json(s)),
+        "set" => junk_set(s, p),
+        "add" | "remove" => {
+            let list = junk_list(p)?;
+            let entries = junk_entries(p);
+            if entries.is_empty() {
+                return Err(CmdError::Params("`entry` or `entries` is required".into()));
+            }
+            let adding = opt_str(p, "action") == Some("add");
+            let mut changed = 0usize;
+            for e in &entries {
+                let did = if adding { s.mailbox.junk.add(list, e)? } else { s.mailbox.junk.remove(list, e) };
+                changed = changed.saturating_add(usize::from(did));
+            }
+            Ok(json!({"list": list.key(), "changed": changed, "entries": s.mailbox.junk.list(list)}))
+        }
+        "import" => {
+            let list = junk_list(p)?;
+            let path = junk_path(p)?;
+            let bytes = mailcraft_store::journal::read_capped(&path, MAX_JUNK_LIST_FILE)
+                .map_err(|e| CmdError::Failed(format!("could not read {}: {e}", path.display())))?
+                .ok_or_else(|| CmdError::Failed(format!("{} does not exist", path.display())))?;
+            let text = String::from_utf8_lossy(&bytes);
+            let added = s.mailbox.junk.import_text(list, &text);
+            Ok(json!({"list": list.key(), "added": added, "total": s.mailbox.junk.list(list).len()}))
+        }
+        "export" => {
+            let list = junk_list(p)?;
+            let path = junk_path(p)?;
+            let text = s.mailbox.junk.export_text(list);
+            mailcraft_store::journal::write_atomic(&path, |w| std::io::Write::write_all(w, text.as_bytes()))
+                .map_err(|e| CmdError::Failed(format!("could not write {}: {e}", path.display())))?;
+            Ok(
+                json!({"list": list.key(), "exported": s.mailbox.junk.list(list).len(), "path": path.display().to_string()}),
+            )
+        }
         "moveToJunk" | "junk" => {
             let moved = move_to_role(s, &ids, FolderRole::JunkEmail)?;
             Ok(json!({"moved": moved.len()}))
         }
         "notJunk" => {
+            let add = opt_bool(p, "addToSafe").unwrap_or(true);
+            let mut trusted = Vec::new();
+            if add {
+                let senders: Vec<String> = ids
+                    .iter()
+                    .filter(|id| item_role(s, **id) == Some(FolderRole::JunkEmail))
+                    .filter_map(|id| {
+                        s.mailbox.mail.get(id).and_then(|m| m.from.as_ref()).map(|a| a.addr.clone())
+                    })
+                    .collect();
+                for a in senders {
+                    s.mailbox.junk.remove(JunkList::BlockedSenders, &a);
+                    if matches!(s.mailbox.junk.add(JunkList::SafeSenders, &a), Ok(true)) {
+                        trusted.push(a.to_lowercase());
+                    }
+                }
+            }
             let moved = not_junk(s, &ids)?;
-            Ok(json!({"moved": moved.len()}))
+            Ok(json!({"moved": moved.len(), "trusted": trusted}))
+        }
+        "run" => {
+            let folder = param_folder(s, p)?.unwrap_or(s.selection.folder);
+            if !s.mailbox.folder(folder).is_some_and(|f| f.kind == FolderKind::Mail) {
+                return Err(CmdError::Params("Run Junk Filter needs a mail folder".into()));
+            }
+            Ok(crate::junk::run_filter(s, folder).to_json())
+        }
+        "classify" => {
+            let verdicts: Vec<Value> = ids
+                .iter()
+                .filter_map(|id| crate::junk::classify(s, *id).map(|v| crate::junk::verdict_json(*id, &v)))
+                .collect();
+            Ok(json!({"verdicts": verdicts}))
         }
         other => Err(CmdError::Params(format!("unknown junk action `{other}`"))),
     }
 }
 
-/// Block Sender moves the message to Junk Email; the "never block" kinds treat it as not junk (back to the
-/// Inbox when it is in Junk Email). The safe/blocked lists themselves live in the Junk E-mail Options
-/// dialog; the result names the address or domain for it.
+/// The group or mailing list a message came through: its List-Post address, else the first To/Cc address
+/// that is not one of the user's own.
+fn list_entry(s: &Session, item: &MailItem) -> Option<String> {
+    if let Some(a) = crate::junk::list_address(item) {
+        return Some(a);
+    }
+    let mine = my_addresses(s);
+    item.to
+        .iter()
+        .chain(item.cc.iter())
+        .map(|a| a.addr.trim().to_lowercase())
+        .find(|a| !a.is_empty() && !mine.contains(a))
+}
+
+/// Block Sender adds the sender to the Blocked Senders List and moves the selection to Junk Email. Never
+/// Block Sender / Sender's Domain add the address / `@domain` to the Safe Senders List, Never Block this
+/// Group or Mailing List adds the list address to the Safe Recipients List; those also move the messages
+/// back to the Inbox when they are in Junk Email.
 fn block(s: &mut Session, p: &Value) -> CmdResult {
     let Some(focus) = primary_item(s, p) else {
         return Err(CmdError::Disabled("No message is selected.".into()));
@@ -1486,21 +1696,42 @@ fn block(s: &mut Session, p: &Value) -> CmdResult {
     let Some(item) = s.mailbox.mail.get(&focus) else {
         return Err(CmdError::Failed("message not found".into()));
     };
-    let sender = item.from.as_ref().map(|a| a.addr.clone()).unwrap_or_default();
+    let sender = item.from.as_ref().map(|a| a.addr.trim().to_lowercase()).unwrap_or_default();
+    let group = list_entry(s, item);
     let ids = mail_targets(s, p);
+    let no_sender = || CmdError::Failed("The message has no sender address.".into());
     match kind {
         "sender" => {
+            if sender.is_empty() {
+                return Err(no_sender());
+            }
+            s.mailbox.junk.remove(JunkList::SafeSenders, &sender);
+            s.mailbox.junk.add(JunkList::BlockedSenders, &sender)?;
             let moved = move_to_role(s, &ids, FolderRole::JunkEmail)?;
             Ok(json!({"blocked": sender, "moved": moved.len()}))
         }
         "neverSender" | "neverDomain" | "neverList" => {
-            let entry = match kind {
-                "neverSender" => sender,
-                "neverDomain" => sender.rsplit_once('@').map(|(_, d)| format!("@{d}")).unwrap_or_default(),
-                _ => item.to.first().map(|a| a.addr.clone()).unwrap_or_default(),
+            let (list, entry) = match kind {
+                "neverSender" => (JunkList::SafeSenders, sender),
+                "neverDomain" => (
+                    JunkList::SafeSenders,
+                    mailcraft_model::junk::domain_of(&sender).map(|d| format!("@{d}")).unwrap_or_default(),
+                ),
+                _ => (JunkList::SafeRecipients, group.unwrap_or_default()),
             };
+            if entry.is_empty() {
+                return Err(if kind == "neverList" {
+                    CmdError::Failed("The message names no group or mailing list.".into())
+                } else {
+                    no_sender()
+                });
+            }
+            if list == JunkList::SafeSenders {
+                s.mailbox.junk.remove(JunkList::BlockedSenders, &entry);
+            }
+            s.mailbox.junk.add(list, &entry)?;
             let moved = not_junk(s, &ids)?;
-            Ok(json!({"safe": entry, "kind": kind, "moved": moved.len()}))
+            Ok(json!({"safe": entry, "kind": kind, "list": list.key(), "moved": moved.len()}))
         }
         other => Err(CmdError::Params(format!("unknown block kind `{other}`"))),
     }
@@ -2180,6 +2411,176 @@ mod tests {
         assert_eq!(folder_of(&f.s, f.c), junkf);
         assert!(f.s.mailbox.mail[&f.c].read);
         assert!(block(&mut f.s, &json!({"kind": "everyone"})).is_err());
+    }
+
+    #[test]
+    fn block_and_never_block_fill_the_lists() {
+        let mut f = fx();
+        let r = f.s.run("mail.block", &json!({"kind": "sender"})).unwrap();
+        assert_eq!(r["blocked"], "carol@example.com");
+        assert_eq!(f.s.mailbox.junk.blocked_senders, vec!["carol@example.com"]);
+        // Never Block Sender takes it off the Blocked Senders List and moves it back.
+        let r = f.s.run("mail.block", &json!({"ids": [f.a.0], "kind": "neverSender"})).unwrap();
+        assert_eq!(r["list"], "safeSenders");
+        assert!(f.s.mailbox.junk.blocked_senders.is_empty());
+        assert_eq!(f.s.mailbox.junk.safe_senders, vec!["carol@example.com"]);
+        assert_eq!(folder_of(&f.s, f.a), f.inbox);
+        f.s.run("mail.block", &json!({"ids": [f.b.0], "kind": "neverDomain"})).unwrap();
+        assert!(f.s.mailbox.junk.safe_senders.contains(&"@example.org".to_owned()));
+        // The group: the first To address that is not mine, or the List-Post address.
+        let r = f.s.run("mail.block", &json!({"ids": [f.c.0], "kind": "neverList"}));
+        assert!(r.is_err(), "c is addressed only to me: {r:?}");
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.c) {
+            m.raw = Some(
+                b"From: alice@example.com\r\nList-Post: <mailto:team@lists.example.org>\r\n\r\nx".to_vec(),
+            );
+        }
+        let r = f.s.run("mail.block", &json!({"ids": [f.c.0], "kind": "neverList"})).unwrap();
+        assert_eq!(r["safe"], "team@lists.example.org");
+        assert_eq!(f.s.mailbox.junk.safe_recipients, vec!["team@lists.example.org"]);
+        // Undo restores the previous lists.
+        f.s.run("app.undo", &json!({})).unwrap();
+        assert!(f.s.mailbox.junk.safe_recipients.is_empty());
+    }
+
+    #[test]
+    fn not_junk_trusts_the_sender_unless_asked_not_to() {
+        let mut f = fx();
+        f.s.run("mail.junk", &json!({"ids": [f.a.0, f.b.0], "action": "moveToJunk"})).unwrap();
+        let r = f.s.run("mail.junk", &json!({"ids": [f.a.0], "action": "notJunk"})).unwrap();
+        assert_eq!(r["trusted"], json!(["carol@example.com"]));
+        assert_eq!(folder_of(&f.s, f.a), f.inbox);
+        let r =
+            f.s.run("mail.junk", &json!({"ids": [f.b.0], "action": "notJunk", "addToSafe": false})).unwrap();
+        assert_eq!(r["moved"], 1);
+        assert_eq!(f.s.mailbox.junk.safe_senders, vec!["carol@example.com"]);
+    }
+
+    #[test]
+    fn junk_settings_get_set_add_remove() {
+        let mut f = fx();
+        let g = f.s.run("mail.junk", &json!({"action": "get"})).unwrap();
+        assert_eq!(g["level"], "low");
+        assert_eq!(g["disableLinks"], true);
+        let r =
+            f.s.run(
+                "mail.junk",
+                &json!({"action": "set", "settings": {
+                    "level": "safeListsOnly", "deleteSuspected": true, "warnSuspiciousDomains": false,
+                    "blockedSenders": ["Spam@Example.net", "not valid", "@example.org"],
+                    "blockedTlds": [".RU"], "blockedEncodings": ["KOI8-R"]
+                }}),
+            )
+            .unwrap();
+        assert_eq!(r["rejected"], json!(["not valid"]));
+        let j = &f.s.mailbox.junk;
+        assert_eq!(j.level, JunkLevel::SafeListsOnly);
+        assert!(j.delete_suspected && !j.warn_suspicious_domains && j.disable_links);
+        assert_eq!(j.blocked_senders, vec!["@example.org", "spam@example.net"]);
+        assert_eq!(j.blocked_tlds, vec!["ru"]);
+        assert_eq!(j.blocked_encodings, vec!["koi8-r"]);
+        f.s.run("mail.junk", &json!({"action": "set", "level": 2})).unwrap();
+        assert_eq!(f.s.mailbox.junk.level, JunkLevel::High);
+        assert!(f.s.run("mail.junk", &json!({"action": "set", "level": "extreme"})).is_err());
+        assert!(f.s.run("mail.junk", &json!({"action": "set", "disableLinks": "yes"})).is_err());
+        assert!(f.s.run("mail.junk", &json!({"action": "set", "safeSenders": "x@example.com"})).is_err());
+        assert_eq!(f.s.mailbox.junk.level, JunkLevel::High);
+        let r = f
+            .s
+            .run(
+                "mail.junk",
+                &json!({"action": "add", "list": "safeRecipients", "entries": ["a@example.com", "@example.net"]}),
+            )
+            .unwrap();
+        assert_eq!(r["changed"], 2);
+        assert!(
+            f.s.run("mail.junk", &json!({"action": "add", "list": "safeRecipients", "entry": "x y"}))
+                .is_err()
+        );
+        assert!(f.s.run("mail.junk", &json!({"action": "add", "list": "nope", "entry": "a@b.c"})).is_err());
+        assert!(f.s.run("mail.junk", &json!({"action": "add", "list": "safeRecipients"})).is_err());
+        let r =
+            f.s.run(
+                "mail.junk",
+                &json!({"action": "remove", "list": "safeRecipients", "entry": "A@example.com"}),
+            )
+            .unwrap();
+        assert_eq!(r["entries"], json!(["@example.net"]));
+        // Settings survive a store round trip (serde default on old data).
+        let v = serde_json::to_value(&f.s.mailbox).unwrap();
+        let back: Mailbox = serde_json::from_value(v).unwrap();
+        assert_eq!(back.junk, f.s.mailbox.junk);
+        let mut old = serde_json::to_value(&f.s.mailbox).unwrap();
+        old.as_object_mut().unwrap().remove("junk");
+        let back: Mailbox = serde_json::from_value(old).unwrap();
+        assert_eq!(back.junk, mailcraft_model::JunkSettings::default());
+    }
+
+    #[test]
+    fn junk_lists_import_and_export_txt() {
+        let mut f = fx();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("blocked.txt");
+        std::fs::write(&src, "# my list\r\nspam@example.net\r\n@example.org\r\n\r\nbad entry\r\n").unwrap();
+        let r =
+            f.s.run(
+                "mail.junk",
+                &json!({"action": "import", "list": "blockedSenders", "path": src.to_str().unwrap()}),
+            )
+            .unwrap();
+        assert_eq!(r["added"], 2);
+        let out = dir.path().join("out.txt");
+        let r =
+            f.s.run(
+                "mail.junk",
+                &json!({"action": "export", "list": "blockedSenders", "path": out.to_str().unwrap()}),
+            )
+            .unwrap();
+        assert_eq!(r["exported"], 2);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "@example.org\r\nspam@example.net\r\n");
+        let missing = dir.path().join("missing.txt");
+        assert!(
+            f.s.run(
+                "mail.junk",
+                &json!({"action": "import", "list": "safeSenders", "path": missing.to_str().unwrap()})
+            )
+            .is_err()
+        );
+        assert!(
+            f.s.run("mail.junk", &json!({"action": "import", "list": "safeSenders", "path": ""})).is_err()
+        );
+        let bad_dir = dir.path().join("no/such/dir/x.txt");
+        assert!(
+            f.s.run(
+                "mail.junk",
+                &json!({"action": "export", "list": "safeSenders", "path": bad_dir.to_str().unwrap()})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_junk_filter_and_classify() {
+        let mut f = fx();
+        let junkf = role(&f.s, FolderRole::JunkEmail);
+        f.s.run("mail.junk", &json!({"action": "add", "list": "blockedSenders", "entry": "@example.org"}))
+            .unwrap();
+        let r = f.s.run("mail.junk", &json!({"action": "classify", "ids": [f.a.0, f.b.0]})).unwrap();
+        assert_eq!(r["verdicts"][0]["junk"], false);
+        assert_eq!(r["verdicts"][1]["reason"], "blockedSender");
+        assert_eq!(r["verdicts"][1]["entry"], "@example.org");
+        let r = f.s.run("mail.junk", &json!({"action": "run", "folder": f.inbox.0})).unwrap();
+        assert_eq!(r["checked"], 3);
+        assert_eq!(r["moved"], 1);
+        assert_eq!(folder_of(&f.s, f.b), junkf);
+        assert_eq!(folder_of(&f.s, f.a), f.inbox);
+        // Running it on Junk Email itself does nothing.
+        let r = f.s.run("mail.junk", &json!({"action": "run", "folder": junkf.0})).unwrap();
+        assert_eq!(r["checked"], 0);
+        assert!(f.s.run("mail.junk", &json!({"action": "nonsense"})).is_err());
+        f.s.run("app.undo", &json!({})).unwrap();
+        f.s.run("app.undo", &json!({})).unwrap();
+        assert_eq!(folder_of(&f.s, f.b), f.inbox);
     }
 
     #[test]

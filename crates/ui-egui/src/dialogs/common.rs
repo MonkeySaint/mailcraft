@@ -5,7 +5,7 @@ use egui::{
     Align, Align2, Color32, Context, Id, Key, Layout, Modifiers, RichText, Sense, Ui, Vec2, WidgetInfo,
     WidgetType,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::App;
 use mailcraft_model::{Folder, FolderId, FolderKind, FolderRole};
@@ -131,30 +131,48 @@ pub(crate) fn child(parent: u64, key: &str, mut extra: Value) -> Value {
     extra
 }
 
-/// UI-only settings shared by dialogs (Options values the engine does not hold yet, signatures, junk lists…).
-#[derive(Clone, Debug, Default)]
-pub(crate) struct UiPrefs {
-    pub values: Map<String, Value>,
-}
+/// Settings kept by dialogs for themselves (columns, folder descriptions, quick actions…), in egui memory.
+/// The shell saves them in the profile settings (`state.uiPrefs`) and restores them at start-up, and mirrors
+/// every engine option in as a read-only copy under `options.<key>` ([`crate::chrome::sync_ui_prefs`]).
+/// Options themselves are read and written through the engine (`app.s.settings`, `options.set`).
+pub(crate) use crate::chrome::UiPrefs;
 
-const PREFS_ID: &str = "mc-ui-prefs";
+const PREFS_ID: &str = crate::chrome::UI_PREFS_ID;
 
 pub(crate) fn prefs(ctx: &Context) -> UiPrefs {
     ctx.data_mut(|d| d.get_temp::<UiPrefs>(Id::new(PREFS_ID))).unwrap_or_default()
 }
 
-pub(crate) fn set_prefs(ctx: &Context, p: UiPrefs) {
+/// Replaces the dialog settings (bumps their revision so the shell saves them).
+pub(crate) fn set_prefs(ctx: &Context, mut p: UiPrefs) {
+    p.rev = prefs(ctx).rev.wrapping_add(1);
     ctx.data_mut(|d| d.insert_temp(Id::new(PREFS_ID), p));
 }
 
 pub(crate) fn pref(ctx: &Context, key: &str) -> Option<Value> {
-    prefs(ctx).values.get(key).cloned()
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<UiPrefs>(Id::new(PREFS_ID)).values.get(key).cloned())
 }
 
 pub(crate) fn set_pref(ctx: &Context, key: &str, v: Value) {
     let mut p = prefs(ctx);
     p.values.insert(key.to_owned(), v);
     set_prefs(ctx, p);
+}
+
+/// Sets engine options (validated, saved with the profile); returns the first error, if any.
+pub(crate) fn set_options(app: &mut App, values: &[(&str, Value)]) -> Option<String> {
+    let mut first = None;
+    for (k, v) in values {
+        if let Err(e) = app.s.set_option(k, v) {
+            first.get_or_insert_with(|| e.to_string());
+        }
+    }
+    first
+}
+
+/// Mirrors engine options into the dialog settings now (the shell also does it every frame).
+pub(crate) fn sync_mirror(ctx: &Context, app: &mut App) {
+    crate::chrome::sync_ui_prefs(ctx, app);
 }
 
 // ---------------------------------------------------------------------------------------------------------

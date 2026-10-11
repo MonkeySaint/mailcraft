@@ -1,7 +1,11 @@
 //! `insert.*`: tables, pictures and generated graphics, links, bookmarks, symbols, building blocks, cards and
-//! calendars in the compose body. Graphics the body model cannot hold natively (shapes, icons, charts,
-//! SmartArt, 3D models) are rendered to inline SVG images (`cid:` parts when sent). Commands that need an
-//! OS facility (screen capture) or a picker without params open a dialog instead.
+//! calendars in the compose body. Graphics the body model cannot hold natively are inserted as inline images
+//! (`cid:` parts when sent): shapes, WordArt and SmartArt are drawn to PNG with `mailcraft-render` in the
+//! theme's colours and effects; icons, charts and 3D models are SVG. Commands that need an OS facility (screen
+//! capture) or a picker without params open a dialog instead.
+//!
+//! Quick Parts / AutoText and the other building-block galleries are kept in `building-blocks.json` in the
+//! profile directory (next to the data file), so they outlive the compose windows.
 
 use std::fmt::Write as _;
 
@@ -210,65 +214,904 @@ fn picture(s: &mut Session, p: &Value) -> CmdResult {
 // Shapes, icons, charts, SmartArt, 3D models
 // ---------------------------------------------------------------------------------------------------------
 
-fn star_points(cx: f32, cy: f32, r_out: f32, r_in: f32, n: usize) -> String {
-    let mut pts = String::new();
-    let total = n.saturating_mul(2);
-    for i in 0..total {
-        #[allow(clippy::cast_precision_loss)]
-        let a = std::f32::consts::PI * (i as f32) / (n as f32) - std::f32::consts::FRAC_PI_2;
-        let r = if i % 2 == 0 { r_out } else { r_in };
-        let _ = write!(pts, "{:.1},{:.1} ", cx + r * a.cos(), cy + r * a.sin());
-    }
-    pts
+const SHAPES: &str = "rectangle, roundedRectangle, oval, circle, triangle, rightTriangle, diamond, pentagon, hexagon, octagon, star, star6, line, arrow, leftArrow, upArrow, downArrow, parallelogram, trapezoid, plus, chevron, heart, callout, canvas";
+
+fn shape(s: &mut Session, p: &Value) -> CmdResult {
+    let kind = req_str(p, "kind")?.to_owned();
+    let cid = compose_id(s, p)?;
+    let theme = s
+        .composes
+        .get(&cid)
+        .map(ComposeState::theme_resolved)
+        .ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let color = match opt_str(p, "color") {
+        Some(c) => mailcraft_html::parse_css_color(c)
+            .ok_or_else(|| CmdError::Params(format!("`{c}` is not a colour")))?,
+        None => theme.color(crate::compose::ACCENT1),
+    };
+    let Some((png, w, h)) = shape_png(&kind, color, theme.effects) else {
+        return Err(CmdError::Params(format!("unknown shape `{kind}` (known: {SHAPES})")));
+    };
+    let c = compose_mut(s, p)?;
+    let cid = put_png(c, &kind, png, &kind, w, h)?;
+    Ok(json!({"shape": kind, "cid": cid, "format": "png", "effects": theme.effects}))
 }
 
-fn polygon_points(cx: f32, cy: f32, r: f32, n: usize) -> String {
-    let mut pts = String::new();
-    for i in 0..n {
-        #[allow(clippy::cast_precision_loss)]
-        let a = 2.0 * std::f32::consts::PI * (i as f32) / (n as f32) - std::f32::consts::FRAC_PI_2;
-        let _ = write!(pts, "{:.1},{:.1} ", cx + r * a.cos(), cy + r * a.sin());
-    }
-    pts
+// ---------------------------------------------------------------------------------------------------------
+// Raster graphics: shapes, WordArt and SmartArt are drawn with mailcraft-render into coverage masks,
+// composited here with the theme's colours and effects, and inserted as PNG (every mail client shows PNG;
+// many do not show SVG).
+// ---------------------------------------------------------------------------------------------------------
+
+/// Device pixels per logical px of generated pictures.
+const RASTER_SCALE: f32 = 2.0;
+/// Largest generated picture side (logical px).
+const MAX_RASTER_SIDE: f32 = 1000.0;
+/// Room around a drawing for shadows and glows (logical px).
+const EFFECT_MARGIN: f32 = 12.0;
+
+/// Coverage (0..=255) per device pixel.
+#[derive(Clone)]
+struct Mask {
+    w: usize,
+    h: usize,
+    a: Vec<u8>,
 }
 
-/// SVG body (without the outer element) for a shape kind in a 160×100 box.
-fn shape_svg(kind: &str) -> Option<String> {
-    let st = r##"fill="#156082" stroke="#0e3f56" stroke-width="2""##;
-    let line = r##"stroke="#156082" stroke-width="3" fill="none""##;
+impl Mask {
+    fn new(w: usize, h: usize) -> Mask {
+        Mask { w, h, a: vec![0; w.saturating_mul(h)] }
+    }
+
+    fn get(&self, x: i64, y: i64) -> u8 {
+        if x < 0 || y < 0 {
+            return 0;
+        }
+        let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else { return 0 };
+        if x >= self.w || y >= self.h {
+            return 0;
+        }
+        self.a.get(y.saturating_mul(self.w).saturating_add(x)).copied().unwrap_or(0)
+    }
+
+    fn map(&self, f: impl Fn(i64, i64) -> u8) -> Mask {
+        let mut m = Mask::new(self.w, self.h);
+        for y in 0..self.h {
+            for x in 0..self.w {
+                if let Some(v) = m.a.get_mut(y.saturating_mul(self.w).saturating_add(x)) {
+                    *v = f(i64::try_from(x).unwrap_or(0), i64::try_from(y).unwrap_or(0));
+                }
+            }
+        }
+        m
+    }
+
+    /// The display list's ink as coverage (rendered black on transparent).
+    fn from_list(
+        list: &mailcraft_layout::DisplayList,
+        w: usize,
+        h: usize,
+        fonts: &mailcraft_fonts::FontDb,
+    ) -> Mask {
+        let (Ok(wu), Ok(hu)) = (u32::try_from(w), u32::try_from(h)) else { return Mask::new(0, 0) };
+        let canvas =
+            mailcraft_render::render(list, fonts, wu, hu, RASTER_SCALE, Color::rgba(0, 0, 0, 0), &|_| None);
+        let mut m = Mask::new(w, h);
+        if canvas.pixels.len() == m.a.len().saturating_mul(4) {
+            for (dst, px) in m.a.iter_mut().zip(canvas.pixels.as_chunks::<4>().0) {
+                let [_, _, _, alpha] = *px;
+                *dst = alpha;
+            }
+        }
+        m
+    }
+
+    fn shifted(&self, dx: i64, dy: i64) -> Mask {
+        self.map(|x, y| self.get(x - dx, y - dy))
+    }
+
+    /// Max filter of radius `r` (grows the shape).
+    fn dilated(&self, r: i64) -> Mask {
+        let horiz = self.map(|x, y| (-r..=r).map(|d| self.get(x + d, y)).max().unwrap_or(0));
+        horiz.map(|x, y| (-r..=r).map(|d| horiz.get(x, y + d)).max().unwrap_or(0))
+    }
+
+    /// Min filter of radius `r` (shrinks the shape).
+    fn eroded(&self, r: i64) -> Mask {
+        let horiz = self.map(|x, y| (-r..=r).map(|d| self.get(x + d, y)).min().unwrap_or(0));
+        horiz.map(|x, y| (-r..=r).map(|d| horiz.get(x, y + d)).min().unwrap_or(0))
+    }
+
+    /// Box blur of radius `r` (two passes).
+    fn blurred(&self, r: i64) -> Mask {
+        if r <= 0 {
+            return self.clone();
+        }
+        let n = u32::try_from(2 * r + 1).unwrap_or(1);
+        let pass = |m: &Mask, horizontal: bool| {
+            m.map(|x, y| {
+                let sum: u32 = (-r..=r)
+                    .map(|d| u32::from(if horizontal { m.get(x + d, y) } else { m.get(x, y + d) }))
+                    .sum();
+                u8::try_from(sum / n).unwrap_or(255)
+            })
+        };
+        let once = pass(&pass(self, true), false);
+        pass(&pass(&once, true), false)
+    }
+
+    fn minus(&self, o: &Mask) -> Mask {
+        self.map(|x, y| self.get(x, y).saturating_sub(o.get(x, y)))
+    }
+
+    /// Mirror image below row `axis` (reflection), fading out over `len` rows.
+    fn reflected(&self, axis: i64, len: i64) -> Mask {
+        self.map(|x, y| {
+            let d = y - axis;
+            if d < 0 || d > len {
+                return 0;
+            }
+            let src = self.get(x, axis - d);
+            let fade = 1.0 - d as f32 / len.max(1) as f32;
+            (f32::from(src) * fade * 0.45) as u8
+        })
+    }
+
+    /// Bounds of the covered pixels (x0, y0, x1, y1), if any.
+    fn bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        let mut b: Option<(usize, usize, usize, usize)> = None;
+        for y in 0..self.h {
+            for x in 0..self.w {
+                if self.a.get(y * self.w + x).copied().unwrap_or(0) > 8 {
+                    b = Some(match b {
+                        None => (x, y, x, y),
+                        Some((a, c, d, e)) => (a.min(x), c.min(y), d.max(x), e.max(y)),
+                    });
+                }
+            }
+        }
+        b
+    }
+}
+
+/// An RGBA image being composited (premultiplied, 0..=1).
+struct Img {
+    w: usize,
+    h: usize,
+    px: Vec<[f32; 4]>,
+}
+
+impl Img {
+    fn new(w: usize, h: usize) -> Img {
+        Img { w, h, px: vec![[0.0; 4]; w.saturating_mul(h)] }
+    }
+
+    /// Paints `color(x, y)` through `mask` × `opacity` over the image.
+    fn paint(&mut self, mask: &Mask, opacity: f32, color: &dyn Fn(usize, usize) -> Color) {
+        self.paint_at(mask, (0, 0), opacity, color);
+    }
+
+    /// [`Img::paint`] with the mask's top-left corner at device pixel `at` (mask coordinates go to
+    /// `color`).
+    fn paint_at(
+        &mut self,
+        mask: &Mask,
+        at: (usize, usize),
+        opacity: f32,
+        color: &dyn Fn(usize, usize) -> Color,
+    ) {
+        for y in 0..mask.h {
+            let iy = y.saturating_add(at.1);
+            if iy >= self.h {
+                break;
+            }
+            for x in 0..mask.w {
+                let ix = x.saturating_add(at.0);
+                if ix >= self.w {
+                    break;
+                }
+                let cov = f32::from(mask.a.get(y * mask.w + x).copied().unwrap_or(0)) / 255.0 * opacity;
+                if cov <= 0.0 {
+                    continue;
+                }
+                let c = color(x, y);
+                let a = cov * f32::from(c.a) / 255.0;
+                if let Some(p) = self.px.get_mut(iy * self.w + ix) {
+                    let src = [
+                        f32::from(c.r) / 255.0 * a,
+                        f32::from(c.g) / 255.0 * a,
+                        f32::from(c.b) / 255.0 * a,
+                        a,
+                    ];
+                    for (pk, sk) in p.iter_mut().zip(src) {
+                        *pk = sk + *pk * (1.0 - a);
+                    }
+                }
+            }
+        }
+    }
+
+    fn to_png(&self) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity(self.px.len() * 4);
+        for p in &self.px {
+            for v in p {
+                pixels.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+        }
+        let canvas = mailcraft_render::Canvas {
+            width: u32::try_from(self.w).unwrap_or(0),
+            height: u32::try_from(self.h).unwrap_or(0),
+            pixels,
+        };
+        canvas.to_png()
+    }
+}
+
+/// Device size of a logical length.
+fn dev(v: f32) -> usize {
+    (v.clamp(1.0, MAX_RASTER_SIDE) * RASTER_SCALE).ceil() as usize
+}
+
+/// Display list filling the polygon `pts` (logical px): one rectangle span per device row (even-odd rule),
+/// antialiased by the renderer at the span ends.
+fn polygon_list(pts: &[(f32, f32)], list: &mut mailcraft_layout::DisplayList) {
+    use mailcraft_geom::Rect;
+    use mailcraft_layout::DisplayItem;
+    if pts.len() < 3 {
+        return;
+    }
+    let (min_y, max_y) = pts.iter().fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p.1), b.max(p.1)));
+    if !min_y.is_finite() || !max_y.is_finite() {
+        return;
+    }
+    let step = 1.0 / RASTER_SCALE;
+    let mut y = (min_y * RASTER_SCALE).floor() / RASTER_SCALE;
+    let mut rows = 0usize;
+    while y < max_y && rows < 40_000 {
+        let yc = y + step / 2.0;
+        let mut xs: Vec<f32> = Vec::new();
+        for i in 0..pts.len() {
+            let (a, b) = (
+                pts.get(i).copied().unwrap_or_default(),
+                pts.get((i + 1) % pts.len()).copied().unwrap_or_default(),
+            );
+            if (a.1 <= yc && b.1 > yc) || (b.1 <= yc && a.1 > yc) {
+                let t = (yc - a.1) / (b.1 - a.1);
+                xs.push(a.0 + t * (b.0 - a.0));
+            }
+        }
+        xs.sort_by(f32::total_cmp);
+        for pair in xs.chunks(2) {
+            if let [x0, x1] = pair
+                && x1 > x0
+            {
+                list.items.push(DisplayItem::FillRect {
+                    rect: Rect::new(*x0, y, x1 - x0, step),
+                    color: Color::BLACK,
+                });
+            }
+        }
+        y += step;
+        rows += 1;
+    }
+}
+
+fn ellipse_pts(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
+    (0..96)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / 96.0;
+            (cx + rx * a.cos(), cy + ry * a.sin())
+        })
+        .collect()
+}
+
+fn rounded_rect_pts(x: f32, y: f32, w: f32, h: f32, r: f32) -> Vec<(f32, f32)> {
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let mut out = Vec::new();
+    let corners = [
+        (x + w - r, y + r, -90.0f32),
+        (x + w - r, y + h - r, 0.0),
+        (x + r, y + h - r, 90.0),
+        (x + r, y + r, 180.0),
+    ];
+    for (cx, cy, start) in corners {
+        for k in 0..=8 {
+            let a = (start + 90.0 * k as f32 / 8.0).to_radians();
+            out.push((cx + r * a.cos(), cy + r * a.sin()));
+        }
+    }
+    out
+}
+
+/// Points of a cubic Bézier from `p0` (exclusive) to `p3`.
+fn bezier(out: &mut Vec<(f32, f32)>, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)) {
+    for i in 1..=16 {
+        let t = i as f32 / 16.0;
+        let u = 1.0 - t;
+        let x = u * u * u * p0.0 + 3.0 * u * u * t * p1.0 + 3.0 * u * t * t * p2.0 + t * t * t * p3.0;
+        let y = u * u * u * p0.1 + 3.0 * u * u * t * p1.1 + 3.0 * u * t * t * p2.1 + t * t * t * p3.1;
+        out.push((x, y));
+    }
+}
+
+fn regular_pts(cx: f32, cy: f32, r: f32, n: usize, inner: Option<f32>) -> Vec<(f32, f32)> {
+    let k = if inner.is_some() { n * 2 } else { n };
+    (0..k)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / k as f32 - std::f32::consts::FRAC_PI_2;
+            let rr = match inner {
+                Some(ri) if i % 2 == 1 => ri,
+                _ => r,
+            };
+            (cx + rr * a.cos(), cy + rr * a.sin())
+        })
+        .collect()
+}
+
+/// Outline of shape `kind` in a 160×100 box at (`ox`, `oy`).
+fn shape_points(kind: &str, ox: f32, oy: f32) -> Option<Vec<(f32, f32)>> {
+    let t = |pts: &[(f32, f32)]| pts.iter().map(|(x, y)| (x + ox, y + oy)).collect::<Vec<_>>();
     Some(match kind {
-        "rectangle" => format!(r#"<rect x="4" y="4" width="152" height="92" {st}/>"#),
-        "roundedRectangle" => format!(r#"<rect x="4" y="4" width="152" height="92" rx="16" {st}/>"#),
-        "oval" | "ellipse" => format!(r#"<ellipse cx="80" cy="50" rx="76" ry="46" {st}/>"#),
-        "circle" => format!(r#"<circle cx="80" cy="50" r="46" {st}/>"#),
-        "triangle" => format!(r#"<polygon points="80,4 156,96 4,96" {st}/>"#),
-        "rightTriangle" => format!(r#"<polygon points="4,4 156,96 4,96" {st}/>"#),
-        "diamond" => format!(r#"<polygon points="80,4 156,50 80,96 4,50" {st}/>"#),
-        "pentagon" => format!(r#"<polygon points="{}" {st}/>"#, polygon_points(80.0, 52.0, 46.0, 5)),
-        "hexagon" => format!(r#"<polygon points="{}" {st}/>"#, polygon_points(80.0, 50.0, 46.0, 6)),
-        "star" => format!(r#"<polygon points="{}" {st}/>"#, star_points(80.0, 52.0, 48.0, 20.0, 5)),
-        "line" => format!(r#"<line x1="4" y1="96" x2="156" y2="4" {line}/>"#),
-        "arrow" | "rightArrow" => format!(r#"<polygon points="4,32 110,32 110,8 156,50 110,92 110,68 4,68" {st}/>"#),
-        "leftArrow" => format!(r#"<polygon points="156,32 50,32 50,8 4,50 50,92 50,68 156,68" {st}/>"#),
-        "heart" => format!(r#"<path d="M80 92 C20 60 4 36 24 16 C40 2 64 6 80 26 C96 6 120 2 136 16 C156 36 140 60 80 92 Z" {st}/>"#),
-        "callout" => format!(r#"<path d="M8 8 H152 V70 H60 L36 94 L40 70 H8 Z" {st}/>"#),
-        "canvas" => r##"<rect x="1" y="1" width="158" height="98" fill="#ffffff" stroke="#a0a0a0" stroke-dasharray="4 3"/>"##.to_owned(),
+        "rectangle" | "textBox" => t(&[(4.0, 4.0), (156.0, 4.0), (156.0, 96.0), (4.0, 96.0)]),
+        "roundedRectangle" => t(&rounded_rect_pts(4.0, 4.0, 152.0, 92.0, 16.0)),
+        "oval" | "ellipse" => t(&ellipse_pts(80.0, 50.0, 76.0, 46.0)),
+        "circle" => t(&ellipse_pts(80.0, 50.0, 46.0, 46.0)),
+        "triangle" => t(&[(80.0, 4.0), (156.0, 96.0), (4.0, 96.0)]),
+        "rightTriangle" => t(&[(4.0, 4.0), (156.0, 96.0), (4.0, 96.0)]),
+        "diamond" => t(&[(80.0, 4.0), (156.0, 50.0), (80.0, 96.0), (4.0, 50.0)]),
+        "pentagon" => t(&regular_pts(80.0, 52.0, 46.0, 5, None)),
+        "hexagon" => t(&regular_pts(80.0, 50.0, 46.0, 6, None)),
+        "octagon" => t(&regular_pts(80.0, 50.0, 46.0, 8, None)),
+        "star" => t(&regular_pts(80.0, 52.0, 48.0, 5, Some(20.0))),
+        "star6" => t(&regular_pts(80.0, 50.0, 46.0, 6, Some(24.0))),
+        "arrow" | "rightArrow" => t(&[
+            (4.0, 32.0),
+            (110.0, 32.0),
+            (110.0, 8.0),
+            (156.0, 50.0),
+            (110.0, 92.0),
+            (110.0, 68.0),
+            (4.0, 68.0),
+        ]),
+        "leftArrow" => t(&[
+            (156.0, 32.0),
+            (50.0, 32.0),
+            (50.0, 8.0),
+            (4.0, 50.0),
+            (50.0, 92.0),
+            (50.0, 68.0),
+            (156.0, 68.0),
+        ]),
+        "upArrow" => t(&[
+            (62.0, 96.0),
+            (62.0, 40.0),
+            (40.0, 40.0),
+            (80.0, 4.0),
+            (120.0, 40.0),
+            (98.0, 40.0),
+            (98.0, 96.0),
+        ]),
+        "downArrow" => t(&[
+            (62.0, 4.0),
+            (62.0, 60.0),
+            (40.0, 60.0),
+            (80.0, 96.0),
+            (120.0, 60.0),
+            (98.0, 60.0),
+            (98.0, 4.0),
+        ]),
+        "parallelogram" => t(&[(36.0, 4.0), (156.0, 4.0), (124.0, 96.0), (4.0, 96.0)]),
+        "trapezoid" => t(&[(36.0, 4.0), (124.0, 4.0), (156.0, 96.0), (4.0, 96.0)]),
+        "plus" | "cross" => t(&[
+            (60.0, 4.0),
+            (100.0, 4.0),
+            (100.0, 32.0),
+            (156.0, 32.0),
+            (156.0, 68.0),
+            (100.0, 68.0),
+            (100.0, 96.0),
+            (60.0, 96.0),
+            (60.0, 68.0),
+            (4.0, 68.0),
+            (4.0, 32.0),
+            (60.0, 32.0),
+        ]),
+        "chevron" => t(&[(4.0, 4.0), (116.0, 4.0), (156.0, 50.0), (116.0, 96.0), (4.0, 96.0), (44.0, 50.0)]),
+        "heart" => {
+            let mut v = vec![(80.0, 92.0)];
+            bezier(&mut v, (80.0, 92.0), (20.0, 60.0), (4.0, 36.0), (24.0, 16.0));
+            bezier(&mut v, (24.0, 16.0), (40.0, 2.0), (64.0, 6.0), (80.0, 26.0));
+            bezier(&mut v, (80.0, 26.0), (96.0, 6.0), (120.0, 2.0), (136.0, 16.0));
+            bezier(&mut v, (136.0, 16.0), (156.0, 36.0), (140.0, 60.0), (80.0, 92.0));
+            t(&v)
+        }
+        "callout" => t(&[
+            (8.0, 8.0),
+            (152.0, 8.0),
+            (152.0, 70.0),
+            (60.0, 70.0),
+            (36.0, 94.0),
+            (40.0, 70.0),
+            (8.0, 70.0),
+        ]),
+        "canvas" => t(&[(1.0, 1.0), (159.0, 1.0), (159.0, 99.0), (1.0, 99.0)]),
         _ => return None,
     })
 }
 
-const SHAPES: &str = "rectangle, roundedRectangle, oval, circle, triangle, rightTriangle, diamond, pentagon, hexagon, star, line, arrow, leftArrow, heart, callout, canvas";
+/// How the theme's effect set draws a shape.
+#[derive(Clone, Copy, Debug, Default)]
+struct Effect {
+    /// Lighter top → base colour bottom (0 = flat).
+    gradient: f32,
+    /// Soft shadow: offset (logical px), blur radius, opacity.
+    shadow: Option<(f32, f32, f32)>,
+    /// Glow: radius, opacity.
+    glow: Option<(f32, f32)>,
+    /// Darker outline width (logical px).
+    outline: f32,
+    /// Shine on the upper half.
+    gloss: bool,
+    reflection: bool,
+    /// Darker inner edge.
+    inset: bool,
+    /// 0 none, 1 grain, 2 ribs.
+    texture: u8,
+    /// Fill opacity.
+    opacity: f32,
+}
 
-fn shape(s: &mut Session, p: &Value) -> CmdResult {
-    let kind = req_str(p, "kind")?;
-    let Some(body) = shape_svg(kind) else {
-        return Err(CmdError::Params(format!("unknown shape `{kind}` (known: {SHAPES})")));
+fn effect_style(name: &str) -> Effect {
+    let base = Effect { opacity: 1.0, outline: 1.0, ..Effect::default() };
+    match name {
+        "Office 2007 - 2010" => Effect { gradient: 0.25, shadow: Some((2.0, 2.0, 0.35)), ..base },
+        "Subtle Solids" => Effect { outline: 0.0, ..base },
+        "Banded Edge" => Effect { outline: 4.0, ..base },
+        "Smokey Glass" => Effect { opacity: 0.7, gradient: 0.2, shadow: Some((2.0, 3.0, 0.3)), ..base },
+        "Glow Edge" => Effect { glow: Some((5.0, 0.6)), ..base },
+        "Grunge Texture" => Effect { texture: 1, shadow: Some((2.0, 2.0, 0.3)), ..base },
+        "Frosted Glass" => Effect { opacity: 0.8, gradient: 0.45, gloss: true, ..base },
+        "Top Shadow" => Effect { shadow: Some((3.0, 3.0, 0.45)), ..base },
+        "Inset" => Effect { inset: true, ..base },
+        "Milk Glass" => Effect { gradient: 0.55, gloss: true, ..base },
+        "Riblet" => Effect { texture: 2, ..base },
+        "Reflection" => Effect { reflection: true, gradient: 0.15, ..base },
+        "Extreme Shadow" => Effect { shadow: Some((6.0, 4.0, 0.6)), ..base },
+        "Glossy" => Effect { gloss: true, gradient: 0.3, shadow: Some((2.0, 2.0, 0.3)), ..base },
+        _ => base,
+    }
+}
+
+fn lighten(c: Color, t: f32) -> Color {
+    c.lerp(Color::WHITE, t.clamp(0.0, 1.0))
+}
+
+fn darken(c: Color, t: f32) -> Color {
+    c.lerp(Color::BLACK, t.clamp(0.0, 1.0))
+}
+
+/// Composites `mask` (the drawing's shape) filled with `color` and decorated per `fx`, onto `img` with the
+/// mask's corner at device pixel `at`.
+fn composite(img: &mut Img, at: (usize, usize), mask: &Mask, color: Color, fx: &Effect) {
+    let s = RASTER_SCALE;
+    let d = |v: f32| (v * s).round() as i64;
+    if let Some((off, blur, op)) = fx.shadow {
+        let sh = mask.shifted(d(off), d(off)).blurred(d(blur / 2.0).max(1));
+        img.paint_at(&sh, at, op, &|_, _| Color::BLACK);
+    }
+    if let Some((r, op)) = fx.glow {
+        let g = mask.dilated(d(r / 2.0)).blurred(d(r / 2.0).max(1));
+        img.paint_at(&g, at, op, &|_, _| lighten(color, 0.4));
+    }
+    let (y0, y1) = mask.bounds().map_or((0, mask.h), |(_, a, _, b)| (a, b.max(a + 1)));
+    let grad = fx.gradient;
+    let texture = fx.texture;
+    let fill = move |x: usize, y: usize| {
+        let t = (y.saturating_sub(y0)) as f32 / (y1.saturating_sub(y0)).max(1) as f32;
+        let mut c = lighten(color, grad * (1.0 - t));
+        match texture {
+            1 => {
+                let n = ((x.wrapping_mul(7919) ^ y.wrapping_mul(104_729)) % 23) as f32 / 23.0;
+                c = darken(c, n * 0.18);
+            }
+            2 if (y / 6).is_multiple_of(2) => c = darken(c, 0.12),
+            _ => {}
+        }
+        c
     };
-    let svg = format!("{}{body}</svg>", svg_open(160.0, 100.0));
-    let kind = kind.to_owned();
-    let c = compose_mut(s, p)?;
-    let cid = put_svg(c, &kind, svg, &kind, 160.0, 100.0);
-    Ok(json!({"shape": kind, "cid": cid}))
+    img.paint_at(mask, at, fx.opacity, &fill);
+    if fx.inset {
+        let edge = mask.minus(&mask.shifted(d(2.0), d(2.0)));
+        img.paint_at(&edge, at, 0.5, &|_, _| darken(color, 0.5));
+    }
+    if fx.outline > 0.0 {
+        let ring = mask.minus(&mask.eroded(d(fx.outline / 2.0).max(1)));
+        img.paint_at(&ring, at, 1.0, &|_, _| darken(color, 0.35));
+    }
+    if fx.gloss {
+        let mid = y0 + (y1.saturating_sub(y0)) / 2;
+        let top = mask.map(|x, y| if usize::try_from(y).is_ok_and(|y| y < mid) { mask.get(x, y) } else { 0 });
+        img.paint_at(&top, at, 0.3, &|_, _| Color::WHITE);
+    }
+    if fx.reflection {
+        let r = mask.reflected(i64::try_from(y1).unwrap_or(0), i64::try_from((y1 - y0) / 2).unwrap_or(1));
+        img.paint_at(&r, at, 1.0, &|_, _| color);
+    }
+}
+
+/// A display list of `text` laid out on one line (black), and its ink width / height (logical px).
+fn text_list(
+    text: &str,
+    style: &TextStyle,
+    fonts: &mailcraft_fonts::FontDb,
+) -> (mailcraft_layout::DisplayList, f32, f32, f32, f32) {
+    let doc = Doc {
+        blocks: vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            inlines: vec![Inline::Text { text: text.to_owned(), style: style.clone() }],
+        }],
+        ..Default::default()
+    };
+    let lo = mailcraft_layout::LayoutOptions { width: MAX_RASTER_SIDE * 4.0, ..Default::default() };
+    let layout = mailcraft_layout::layout_doc(&doc, fonts, &lo);
+    let mut list = mailcraft_layout::DisplayList::default();
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for r in &layout.index.runs {
+        x0 = x0.min(r.rect.x);
+        y0 = y0.min(r.rect.y);
+        x1 = x1.max(r.rect.x + r.rect.w);
+        y1 = y1.max(r.rect.y + r.rect.h);
+    }
+    for item in layout.display.items {
+        if let mailcraft_layout::DisplayItem::Text { .. } = item {
+            list.items.push(item);
+        }
+    }
+    if x0 > x1 {
+        return (list, 0.0, 0.0, 0.0, 0.0);
+    }
+    (list, x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Moves every item of `list` by (`dx`, `dy`) and recolours text.
+fn translate(list: &mut mailcraft_layout::DisplayList, dx: f32, dy: f32) {
+    use mailcraft_layout::DisplayItem;
+    for item in &mut list.items {
+        match item {
+            DisplayItem::Text { origin, .. } => *origin = origin.offset(dx, dy),
+            DisplayItem::FillRect { rect, .. } | DisplayItem::StrokeRect { rect, .. } => {
+                *rect = rect.translate(dx, dy)
+            }
+            DisplayItem::Line { from, to, .. } => {
+                *from = from.offset(dx, dy);
+                *to = to.offset(dx, dy);
+            }
+            DisplayItem::Image { rect, .. } => *rect = rect.translate(dx, dy),
+        }
+    }
+}
+
+/// Inserts a generated PNG of `w`×`h` logical px at the caret.
+fn put_png(
+    c: &mut ComposeState,
+    name: &str,
+    png: Vec<u8>,
+    alt: &str,
+    w: f32,
+    h: f32,
+) -> Result<String, CmdError> {
+    if png.is_empty() {
+        return Err(CmdError::Failed("the picture could not be drawn".into()));
+    }
+    Ok(put_image(c, &format!("{name}.png"), "image/png", png, alt, (Some(w), Some(h))))
+}
+
+/// PNG of shape `kind` filled with `color` and drawn with effect set `effects`; (png, width, height).
+fn shape_png(kind: &str, color: Color, effects: &str) -> Option<(Vec<u8>, f32, f32)> {
+    let fonts = mailcraft_fonts::FontDb::bundled();
+    let m = EFFECT_MARGIN;
+    let (w, h) = (160.0 + 2.0 * m, 100.0 + 2.0 * m);
+    let mut list = mailcraft_layout::DisplayList::default();
+    let fx = effect_style(effects);
+    if kind == "line" {
+        list.items.push(mailcraft_layout::DisplayItem::Line {
+            from: mailcraft_geom::Point::new(m + 4.0, m + 96.0),
+            to: mailcraft_geom::Point::new(m + 156.0, m + 4.0),
+            color: Color::BLACK,
+            width: 3.0,
+        });
+    } else {
+        polygon_list(&shape_points(kind, m, m)?, &mut list);
+    }
+    let mask = Mask::from_list(&list, dev(w), dev(h), &fonts);
+    let mut img = Img::new(dev(w), dev(h));
+    if kind == "canvas" {
+        // A drawing canvas: white with a dashed-looking grey frame.
+        img.paint(&mask, 1.0, &|_, _| Color::WHITE);
+        let ring = mask.minus(&mask.eroded(2));
+        img.paint(&ring, 1.0, &|x, y| {
+            if (x + y) / 8 % 2 == 0 { Color::rgb(0xa0, 0xa0, 0xa0) } else { Color::WHITE }
+        });
+    } else {
+        composite(&mut img, (0, 0), &mask, color, &fx);
+    }
+    Some((img.to_png(), w, h))
+}
+
+/// Parsed WordArt style ("Fill: Orange, Accent color 2; Outline: White, Background color 1; Hard Shadow: …").
+#[derive(Clone, Debug, PartialEq)]
+struct WordArtStyle {
+    fill: Color,
+    gradient: Option<Color>,
+    outline: Option<Color>,
+    shadow: bool,
+    hard_shadow: Option<Color>,
+    inner_shadow: bool,
+    glow: Option<Color>,
+    bevel: bool,
+    reflection: bool,
+}
+
+/// A colour named in a WordArt style part: a theme reference ("Accent color 2", "Text color 1",
+/// "Background color 2") wins over a colour word ("Orange", "Dark Teal").
+fn wordart_part_color(part: &str, theme: &crate::compose::ResolvedTheme) -> Option<Color> {
+    let p = part.to_lowercase();
+    let slot = |label: &str, base: usize| -> Option<usize> {
+        let at = p.find(label)?;
+        let n: String = p.get(at + label.len()..)?.trim().chars().take_while(char::is_ascii_digit).collect();
+        let n: usize = n.parse().ok()?;
+        Some(base + n.saturating_sub(1))
+    };
+    if let Some(i) =
+        slot("accent color", crate::compose::ACCENT1).filter(|i| *i <= crate::compose::ACCENT1 + 5)
+    {
+        return Some(theme.color(i));
+    }
+    if let Some(i) = slot("text color", 0) {
+        return Some(theme.color(if i == 0 { 0 } else { 2 }));
+    }
+    if let Some(i) = slot("background color", 1) {
+        return Some(theme.color(if i == 1 { 1 } else { 3 }));
+    }
+    let word: String = p.split(',').next().unwrap_or("").chars().filter(|c| c.is_alphabetic()).collect();
+    if word.is_empty() {
+        return None;
+    }
+    mailcraft_html::parse_css_color(&word)
+}
+
+fn parse_wordart(style: &str, theme: &crate::compose::ResolvedTheme) -> WordArtStyle {
+    let accent = theme.color(crate::compose::ACCENT1);
+    let mut w = WordArtStyle {
+        fill: accent,
+        gradient: None,
+        outline: None,
+        shadow: false,
+        hard_shadow: None,
+        inner_shadow: false,
+        glow: None,
+        bevel: false,
+        reflection: false,
+    };
+    for part in style.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let (head, rest) = part.split_once(':').map_or((part, ""), |(h, r)| (h.trim(), r.trim()));
+        let h = head.to_lowercase();
+        let col = wordart_part_color(rest, theme);
+        if h.starts_with("gradient fill") {
+            let base = col.unwrap_or_else(|| {
+                wordart_part_color(head.trim_start_matches("Gradient Fill").trim_start_matches(','), theme)
+                    .unwrap_or(Color::rgb(0x80, 0x80, 0x80))
+            });
+            w.fill = base;
+            w.gradient = Some(lighten(base, 0.6));
+        } else if h.starts_with("fill") {
+            if let Some(c) = col {
+                w.fill = c;
+            }
+        } else if h.starts_with("outline") {
+            w.outline = col.or(Some(darken(w.fill, 0.4)));
+        } else if h.starts_with("hard shadow") {
+            w.hard_shadow = col.or(Some(Color::rgb(0x40, 0x40, 0x40)));
+        } else if h.starts_with("inner shadow") {
+            w.inner_shadow = true;
+        } else if h.starts_with("shadow") {
+            w.shadow = true;
+        } else if h.starts_with("glow") {
+            w.glow = col.or(Some(accent));
+        } else if h.contains("bevel") {
+            w.bevel = true;
+        } else if h.starts_with("reflection") {
+            w.reflection = true;
+        }
+    }
+    w
+}
+
+/// PNG of `text` as WordArt in `style`, set in `font` (the theme's heading font); (png, width, height).
+fn wordart_png(
+    text: &str,
+    style: &str,
+    theme: &crate::compose::ResolvedTheme,
+) -> Option<(Vec<u8>, f32, f32)> {
+    let fonts = mailcraft_fonts::FontDb::bundled();
+    let mut ts = TextStyle {
+        bold: Some(true),
+        size_pt: Some(36.0),
+        font_family: Some(theme.heading_font.clone()),
+        ..Default::default()
+    };
+    let (mut list, mut x0, mut y0, mut tw, mut th) = text_list(text, &ts, &fonts);
+    let room = MAX_RASTER_SIDE - 2.0 * EFFECT_MARGIN;
+    if tw > room {
+        // Long text gets a smaller size rather than being cut off.
+        ts.size_pt = Some((36.0 * room / tw).max(8.0));
+        (list, x0, y0, tw, th) = text_list(text, &ts, &fonts);
+    }
+    if tw <= 0.0 || th <= 0.0 {
+        return None;
+    }
+    let ws = parse_wordart(style, theme);
+    let m = EFFECT_MARGIN;
+    let extra = if ws.reflection { th * 0.6 } else { 0.0 };
+    let (w, h) = ((tw + 2.0 * m).min(MAX_RASTER_SIDE), (th + 2.0 * m + extra).min(MAX_RASTER_SIDE));
+    translate(&mut list, m - x0, m - y0);
+    let mask = Mask::from_list(&list, dev(w), dev(h), &fonts);
+    let mut img = Img::new(dev(w), dev(h));
+    let s = RASTER_SCALE;
+    let d = |v: f32| (v * s).round() as i64;
+    if ws.shadow {
+        img.paint(&mask.shifted(d(2.0), d(2.0)).blurred(d(1.5)), 0.45, &|_, _| Color::BLACK);
+    }
+    if let Some(hs) = ws.hard_shadow {
+        img.paint(&mask.shifted(d(3.0), d(3.0)), 1.0, &|_, _| hs);
+    }
+    if let Some(g) = ws.glow {
+        img.paint(&mask.dilated(d(3.0)).blurred(d(2.0)), 0.6, &|_, _| lighten(g, 0.3));
+    }
+    if let Some(o) = ws.outline {
+        img.paint(&mask.dilated(d(1.0)), 1.0, &|_, _| o);
+    }
+    let (y_top, y_bot) = mask.bounds().map_or((0, mask.h), |(_, a, _, b)| (a, b.max(a + 1)));
+    let fill = ws.fill;
+    let grad = ws.gradient;
+    img.paint(&mask, 1.0, &move |_, y| match grad {
+        Some(top) => {
+            let t = (y.saturating_sub(y_top)) as f32 / (y_bot.saturating_sub(y_top)).max(1) as f32;
+            top.lerp(fill, t)
+        }
+        None => fill,
+    });
+    if ws.inner_shadow {
+        img.paint(&mask.minus(&mask.shifted(d(1.5), d(1.5))), 0.5, &|_, _| darken(fill, 0.6));
+    }
+    if ws.bevel {
+        img.paint(&mask.minus(&mask.shifted(d(1.0), d(1.0))), 0.6, &|_, _| Color::WHITE);
+        img.paint(&mask.minus(&mask.shifted(-d(1.0), -d(1.0))), 0.4, &|_, _| darken(fill, 0.5));
+    }
+    if ws.reflection {
+        let r = mask.reflected(i64::try_from(y_bot).unwrap_or(0) + d(1.0), d(th * 0.6));
+        img.paint(&r, 1.0, &|_, _| fill);
+    }
+    Some((img.to_png(), w, h))
+}
+
+/// PNG of a SmartArt `layout` over `items` with theme colours and effects; (png, width, height).
+fn smart_art_png(
+    layout: &str,
+    items: &[String],
+    theme: &crate::compose::ResolvedTheme,
+) -> Option<(Vec<u8>, f32, f32)> {
+    let fonts = mailcraft_fonts::FontDb::bundled();
+    // At most as many items as fit the largest picture.
+    let cap = match layout {
+        "list" => 19,
+        "process" => 6,
+        "hierarchy" => 8,
+        _ => 30,
+    };
+    let items = items.get(..items.len().min(cap)).unwrap_or(items);
+    let n = items.len();
+    if n == 0 {
+        return None;
+    }
+    // Boxes (x, y, w, h) and connector polygons in logical px.
+    let mut boxes: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut connectors: Vec<Vec<(f32, f32)>> = Vec::new();
+    let (w, h) = match layout {
+        "list" => {
+            for i in 0..n {
+                boxes.push((10.0, 10.0 + 50.0 * i as f32, 340.0, 40.0));
+            }
+            (360.0, 20.0 + 50.0 * n as f32)
+        }
+        "process" => {
+            for i in 0..n {
+                let x = 10.0 + 150.0 * i as f32;
+                boxes.push((x, 15.0, 115.0, 50.0));
+                if i + 1 < n {
+                    connectors.push(vec![(x + 120.0, 30.0), (x + 142.0, 40.0), (x + 120.0, 50.0)]);
+                }
+            }
+            (20.0 + 150.0 * n as f32, 80.0)
+        }
+        "cycle" => {
+            let ring_outer = ellipse_pts(210.0, 210.0, 142.0, 142.0);
+            let mut ring_inner = ellipse_pts(210.0, 210.0, 138.0, 138.0);
+            ring_inner.reverse();
+            // A ring as one polygon: outer circle, bridge, inner circle reversed.
+            let mut ring = ring_outer;
+            ring.extend(ring_inner);
+            connectors.push(ring);
+            for i in 0..n {
+                let a = std::f32::consts::TAU * i as f32 / n as f32 - std::f32::consts::FRAC_PI_2;
+                boxes.push((210.0 + 140.0 * a.cos() - 55.0, 210.0 + 140.0 * a.sin() - 22.0, 110.0, 44.0));
+            }
+            (420.0, 420.0)
+        }
+        "hierarchy" => {
+            let kids = n.saturating_sub(1).max(1);
+            let w = (20.0 + 140.0 * kids as f32).max(200.0);
+            boxes.push((w / 2.0 - 60.0, 10.0, 120.0, 44.0));
+            for i in 1..n {
+                let x = 10.0 + 140.0 * (i - 1) as f32;
+                let cx = x + 60.0;
+                connectors.push(vec![
+                    (w / 2.0 - 1.0, 54.0),
+                    (w / 2.0 + 1.0, 54.0),
+                    (w / 2.0 + 1.0, 80.0),
+                    (w / 2.0 - 1.0, 80.0),
+                ]);
+                let (l, r) = (cx.min(w / 2.0) - 1.0, cx.max(w / 2.0) + 1.0);
+                connectors.push(vec![(l, 79.0), (r, 79.0), (r, 81.0), (l, 81.0)]);
+                connectors.push(vec![
+                    (cx - 1.0, 80.0),
+                    (cx + 1.0, 80.0),
+                    (cx + 1.0, 110.0),
+                    (cx - 1.0, 110.0),
+                ]);
+                boxes.push((x, 110.0, 120.0, 44.0));
+            }
+            (w, 170.0)
+        }
+        _ => return None,
+    };
+    let (w, h) = (w.min(MAX_RASTER_SIDE), h.min(MAX_RASTER_SIDE));
+    let fx = effect_style(theme.effects);
+    let mut img = Img::new(dev(w), dev(h));
+    let grey = Color::rgb(0x9e, 0x9e, 0x9e);
+    if !connectors.is_empty() {
+        let mut list = mailcraft_layout::DisplayList::default();
+        for c in &connectors {
+            polygon_list(c, &mut list);
+        }
+        img.paint(&Mask::from_list(&list, dev(w), dev(h), &fonts), 1.0, &|_, _| grey);
+    }
+    // Each box is drawn on its own small canvas (box plus room for effects) and placed on the picture.
+    let m = EFFECT_MARGIN / 2.0;
+    for (i, (bx, by, bw, bh)) in boxes.iter().enumerate() {
+        let color = theme.color(crate::compose::ACCENT1 + i % 6);
+        let (lw, lh) = (bw + 2.0 * m, bh + 2.0 * m);
+        let mut list = mailcraft_layout::DisplayList::default();
+        polygon_list(&rounded_rect_pts(m, m, *bw, *bh, 6.0), &mut list);
+        let mask = Mask::from_list(&list, dev(lw), dev(lh), &fonts);
+        let at = (((bx - m).max(0.0) * RASTER_SCALE) as usize, ((by - m).max(0.0) * RASTER_SCALE) as usize);
+        composite(&mut img, at, &mask, color, &Effect { reflection: false, glow: None, ..fx });
+        let label = items.get(i).map(String::as_str).unwrap_or("");
+        let ts = TextStyle {
+            size_pt: Some(10.0),
+            font_family: Some(theme.body_font.clone()),
+            ..Default::default()
+        };
+        let (mut tl, x0, y0, tw, th) = text_list(label, &ts, &fonts);
+        if tw > 0.0 {
+            translate(&mut tl, m + (bw - tw.min(*bw - 6.0)) / 2.0 - x0, m + (bh - th) / 2.0 - y0);
+            let tm = Mask::from_list(&tl, dev(lw), dev(lh), &fonts);
+            let clip = mask.eroded(2);
+            let text_mask = tm.map(|x, y| tm.get(x, y).min(clip.get(x, y)));
+            img.paint_at(&text_mask, at, 1.0, &|_, _| Color::WHITE);
+        }
+    }
+    Some((img.to_png(), w, h))
 }
 
 /// Bundled icons: 48×48 SVG bodies drawn for MailCraft.
@@ -500,97 +1343,6 @@ fn chart(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"chart": kind, "points": data.len(), "cid": cid}))
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn smart_art_svg(layout: &str, items: &[String]) -> Option<(String, f32, f32)> {
-    let n = items.len();
-    let box_ = |svg: &mut String, x: f32, y: f32, w: f32, h: f32, i: usize, t: &str| {
-        let col = PALETTE.get(i % PALETTE.len()).copied().unwrap_or("#156082");
-        let _ = write!(
-            svg,
-            r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" rx="6" fill="{col}"/>"#
-        );
-        let _ = write!(
-            svg,
-            r##"<text x="{:.1}" y="{:.1}" font-family="sans-serif" font-size="13" text-anchor="middle" fill="#fff">{}</text>"##,
-            x + w / 2.0,
-            y + h / 2.0 + 4.0,
-            esc(t)
-        );
-    };
-    match layout {
-        "list" => {
-            let (w, h) = (360.0, 20.0 + 50.0 * n as f32);
-            let mut svg = svg_open(w, h);
-            for (i, t) in items.iter().enumerate() {
-                box_(&mut svg, 10.0, 10.0 + 50.0 * i as f32, 340.0, 40.0, i, t);
-            }
-            svg.push_str("</svg>");
-            Some((svg, w, h))
-        }
-        "process" => {
-            let (w, h) = (20.0 + 150.0 * n as f32, 80.0);
-            let mut svg = svg_open(w, h);
-            for (i, t) in items.iter().enumerate() {
-                let x = 10.0 + 150.0 * i as f32;
-                box_(&mut svg, x, 15.0, 115.0, 50.0, i, t);
-                if i.saturating_add(1) < n {
-                    let _ = write!(
-                        svg,
-                        r##"<polygon points="{:.1},32 {:.1},40 {:.1},48" fill="#9e9e9e"/>"##,
-                        x + 120.0,
-                        x + 142.0,
-                        x + 120.0
-                    );
-                }
-            }
-            svg.push_str("</svg>");
-            Some((svg, w, h))
-        }
-        "cycle" => {
-            let (w, h) = (420.0, 420.0);
-            let mut svg = svg_open(w, h);
-            svg.push_str(
-                r##"<circle cx="210" cy="210" r="140" fill="none" stroke="#bdbdbd" stroke-width="4"/>"##,
-            );
-            for (i, t) in items.iter().enumerate() {
-                let a = std::f32::consts::TAU * i as f32 / n.max(1) as f32 - std::f32::consts::FRAC_PI_2;
-                box_(
-                    &mut svg,
-                    210.0 + 140.0 * a.cos() - 55.0,
-                    210.0 + 140.0 * a.sin() - 22.0,
-                    110.0,
-                    44.0,
-                    i,
-                    t,
-                );
-            }
-            svg.push_str("</svg>");
-            Some((svg, w, h))
-        }
-        "hierarchy" => {
-            let kids = n.saturating_sub(1).max(1);
-            let w = (20.0 + 140.0 * kids as f32).max(200.0);
-            let h = 170.0;
-            let mut svg = svg_open(w, h);
-            let top = items.first()?;
-            box_(&mut svg, w / 2.0 - 60.0, 10.0, 120.0, 44.0, 0, top);
-            for (i, t) in items.iter().enumerate().skip(1) {
-                let x = 10.0 + 140.0 * (i - 1) as f32;
-                let _ = write!(
-                    svg,
-                    r##"<path d="M{:.1} 54 V80 H{:.1} V110" stroke="#9e9e9e" fill="none" stroke-width="2"/>"##,
-                    w / 2.0,
-                    x + 60.0
-                );
-                box_(&mut svg, x, 110.0, 120.0, 44.0, i, t);
-            }
-            svg.push_str("</svg>");
-            Some((svg, w, h))
-        }
-        _ => None,
-    }
-}
-
 fn smart_art(s: &mut Session, p: &Value) -> CmdResult {
     let layout = opt_str(p, "layout").map(str::to_owned);
     let items: Vec<String> = p
@@ -605,13 +1357,22 @@ fn smart_art(s: &mut Session, p: &Value) -> CmdResult {
             json!({"compose": compose_id(s, p)?, "layouts": ["list", "process", "cycle", "hierarchy"]}),
         );
     };
-    let Some((svg, w, h)) = smart_art_svg(&layout, &items) else {
+    if !matches!(layout.as_str(), "list" | "process" | "cycle" | "hierarchy") {
         return Err(CmdError::Params(format!("unknown layout `{layout}` (list, process, cycle, hierarchy)")));
+    }
+    let cid = compose_id(s, p)?;
+    let theme = s
+        .composes
+        .get(&cid)
+        .map(ComposeState::theme_resolved)
+        .ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let Some((png, w, h)) = smart_art_png(&layout, &items, &theme) else {
+        return Err(CmdError::Failed("the SmartArt graphic could not be drawn".into()));
     };
     let alt = items.join(", ");
     let c = compose_mut(s, p)?;
-    let cid = put_svg(c, "smartart", svg, &alt, w, h);
-    Ok(json!({"layout": layout, "items": items.len(), "cid": cid}))
+    let cid = put_png(c, "smartart", png, &alt, w, h)?;
+    Ok(json!({"layout": layout, "items": items.len(), "cid": cid, "format": "png"}))
 }
 
 /// Parses OBJ / ASCII STL / binary STL into (vertices, edges).
@@ -763,11 +1524,27 @@ fn model3d(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"inserted": name, "vertices": verts.len(), "edges": edges.len(), "cid": cid}))
 }
 
+/// Why Screenshot inserts a file instead of capturing (no screen capture without a platform library).
+pub const SCREENSHOT_UNAVAILABLE: &str = "MailCraft cannot capture the screen yet. Take the screenshot with your \
+system's screenshot tool, then choose the saved picture to insert it.";
+
+/// Screenshot: inserts a screenshot saved as a picture file (`path`, or `name` + `data_base64`); without
+/// one, a dialog explains that capturing is not available and offers to pick the file.
 fn screenshot(s: &mut Session, p: &Value) -> CmdResult {
-    // Capturing the screen is the UI's job; it inserts the capture with insert.picture {name, data_base64}.
+    if p.get("path").is_some() || p.get("data_base64").is_some() {
+        let mut r = picture(s, p)?;
+        if let Some(o) = r.as_object_mut() {
+            o.insert("screenshot".into(), json!(true));
+        }
+        return Ok(r);
+    }
     let window = opt_str(p, "window");
     let clip = opt_bool(p, "clip").unwrap_or(false);
-    dialog(s, "screenshot", json!({"compose": compose_id(s, p)?, "window": window, "clip": clip}))
+    dialog(
+        s,
+        "screenshot",
+        json!({"compose": compose_id(s, p)?, "window": window, "clip": clip, "capture": false, "message": SCREENSHOT_UNAVAILABLE}),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -969,19 +1746,29 @@ fn symbol(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"inserted": text}))
 }
 
-/// Built-in equations (standard formulas written in plain math notation).
+/// Built-in equations: key, gallery name, formula in plain math notation.
+pub const EQUATION_PRESETS: [(&str, &str, &str); 6] = [
+    ("areaOfCircle", "Area of Circle", "A = \u{3c0}r\u{b2}"),
+    (
+        "binomialTheorem",
+        "Binomial Theorem",
+        "(x + a)\u{207f} = \u{3a3}\u{2096}\u{208c}\u{2080}\u{207f} C(n,k) x\u{1d4f} a\u{207f}\u{207b}\u{1d4f}",
+    ),
+    (
+        "expansionOfSum",
+        "Expansion of a Sum",
+        "(1 + x)\u{207f} = 1 + nx/1! + n(n \u{2212} 1)x\u{b2}/2! + \u{2026}",
+    ),
+    ("pythagoreanTheorem", "Pythagorean Theorem", "a\u{b2} + b\u{b2} = c\u{b2}"),
+    ("quadraticFormula", "Quadratic Formula", "x = (\u{2212}b \u{b1} \u{221a}(b\u{b2} \u{2212} 4ac)) / 2a"),
+    ("eulerIdentity", "Euler's Identity", "e^(i\u{3c0}) + 1 = 0"),
+];
+
+/// A built-in equation by key ("areaOfCircle") or gallery name ("Area of Circle", any case/spacing).
 fn equation_preset(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "areaOfCircle" => "A = \u{3c0}r\u{b2}",
-        "pythagoreanTheorem" => "a\u{b2} + b\u{b2} = c\u{b2}",
-        "quadraticFormula" => "x = (\u{2212}b \u{b1} \u{221a}(b\u{b2} \u{2212} 4ac)) / 2a",
-        "binomialTheorem" => {
-            "(x + a)\u{207f} = \u{3a3}\u{2096}\u{208c}\u{2080}\u{207f} C(n,k) x\u{1d4f} a\u{207f}\u{207b}\u{1d4f}"
-        }
-        "expansionOfSum" => "(1 + x)\u{207f} = 1 + nx/1! + n(n \u{2212} 1)x\u{b2}/2! + \u{2026}",
-        "eulerIdentity" => "e^(i\u{3c0}) + 1 = 0",
-        _ => return None,
-    })
+    let norm = |t: &str| t.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    let n = norm(name);
+    EQUATION_PRESETS.iter().find(|(k, label, _)| norm(k) == n || norm(label) == n).map(|(_, _, f)| *f)
 }
 
 fn equation_block(text: &str) -> Block {
@@ -1012,7 +1799,7 @@ fn equation(s: &mut Session, p: &Value) -> CmdResult {
             return dialog(
                 s,
                 "equation",
-                json!({"compose": compose_id(s, p)?, "presets": ["areaOfCircle", "pythagoreanTheorem", "quadraticFormula", "binomialTheorem", "expansionOfSum", "eulerIdentity"]}),
+                json!({"compose": compose_id(s, p)?, "presets": EQUATION_PRESETS.iter().map(|(k, n, f)| json!({"key": k, "name": n, "formula": f})).collect::<Vec<_>>()}),
             );
         }
     };
@@ -1177,13 +1964,79 @@ fn drop_cap(s: &mut Session, p: &Value) -> CmdResult {
 // Building blocks, WordArt
 // ---------------------------------------------------------------------------------------------------------
 
-fn find_block(s: &Session, cid: u64, gallery: Option<&str>, name: &str) -> Option<BuildingBlock> {
+/// Building-block file in the profile directory.
+pub const BUILDING_BLOCKS_FILE: &str = "building-blocks.json";
+/// Largest building-block file read.
+const MAX_BUILDING_BLOCKS_BYTES: u64 = 16 * 1024 * 1024;
+/// Most saved building blocks.
+const MAX_BUILDING_BLOCKS: usize = 1000;
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct BuildingBlocksFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    entries: Vec<BuildingBlock>,
+}
+
+fn blocks_path(s: &Session) -> Option<std::path::PathBuf> {
+    s.store.as_ref().map(|st| st.dir.join(BUILDING_BLOCKS_FILE))
+}
+
+/// Saved building blocks from the profile (empty without a profile, or when the file is missing or garbled).
+pub fn load_building_blocks(s: &Session) -> Vec<BuildingBlock> {
+    let Some(path) = blocks_path(s) else {
+        return Vec::new();
+    };
+    let too_big = std::fs::metadata(&path).map(|m| m.len() > MAX_BUILDING_BLOCKS_BYTES).unwrap_or(true);
+    if too_big {
+        return Vec::new();
+    }
+    std::fs::read(&path)
+        .ok()
+        .and_then(|d| serde_json::from_slice::<BuildingBlocksFile>(&d).ok())
+        .map(|f| {
+            f.entries
+                .into_iter()
+                .filter(|b| GALLERIES.contains(&b.gallery.as_str()))
+                .take(MAX_BUILDING_BLOCKS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Writes `entries` to the profile's building-block file (atomically: temp file, then rename). Without a
+/// profile (in-memory session) nothing is written.
+fn save_building_blocks(s: &Session, entries: &[BuildingBlock]) -> Result<(), CmdError> {
+    let Some(path) = blocks_path(s) else {
+        return Ok(());
+    };
+    let file = BuildingBlocksFile { version: 1, entries: entries.to_vec() };
+    let text = serde_json::to_vec_pretty(&file).map_err(|e| CmdError::Failed(e.to_string()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| CmdError::Failed(format!("the building blocks could not be saved: {e}")))
+}
+
+/// Every building block: the profile's, then entries only on open composes (newer entries of the same
+/// gallery and name win).
+fn all_blocks(s: &Session, cid: u64) -> Vec<BuildingBlock> {
+    let mut out = load_building_blocks(s);
     let own = s.composes.get(&cid).into_iter();
     let others = s.composes.iter().filter(|(k, _)| **k != cid).map(|(_, c)| c);
-    own.chain(others)
-        .flat_map(|c| c.building_blocks.iter().rev())
+    for b in others.chain(own).flat_map(|c| c.building_blocks.iter()) {
+        out.retain(|x| !(x.gallery == b.gallery && x.name.eq_ignore_ascii_case(&b.name)));
+        out.push(b.clone());
+    }
+    out
+}
+
+fn find_block(s: &Session, cid: u64, gallery: Option<&str>, name: &str) -> Option<BuildingBlock> {
+    all_blocks(s, cid)
+        .into_iter()
+        .rev()
         .find(|b| b.name.eq_ignore_ascii_case(name) && gallery.is_none_or(|g| b.gallery == g))
-        .cloned()
 }
 
 fn insert_building_block(s: &mut Session, p: &Value, gallery: &str, name: &str) -> CmdResult {
@@ -1196,24 +2049,48 @@ fn insert_building_block(s: &mut Session, p: &Value, gallery: &str, name: &str) 
 }
 
 fn quick_part(s: &mut Session, p: &Value) -> CmdResult {
-    let Some(name) = opt_str(p, "name").map(str::to_owned) else {
-        let cid = compose_id(s, p)?;
-        let entries: Vec<Value> = s
-            .composes
-            .get(&cid)
-            .map(|c| {
-                c.building_blocks.iter().map(|b| json!({"gallery": b.gallery, "name": b.name})).collect()
-            })
-            .unwrap_or_default();
-        return dialog(s, "quickParts", json!({"compose": cid, "entries": entries}));
-    };
     let gallery = opt_str(p, "gallery");
     if let Some(g) = gallery
         && !GALLERIES.contains(&g)
     {
         return Err(CmdError::Params(format!("unknown gallery `{g}`")));
     }
+    let Some(name) = opt_str(p, "name").map(str::to_owned) else {
+        let cid = compose_id(s, p)?;
+        let entries: Vec<Value> = all_blocks(s, cid)
+            .iter()
+            .filter(|b| gallery.is_none_or(|g| b.gallery == g))
+            .map(|b| {
+                let preview: String = Doc { blocks: b.blocks.clone(), ..Default::default() }
+                    .text_content()
+                    .chars()
+                    .take(120)
+                    .collect();
+                json!({"gallery": b.gallery, "name": b.name, "preview": preview})
+            })
+            .collect();
+        return dialog(s, "quickParts", json!({"compose": cid, "gallery": gallery, "entries": entries}));
+    };
     let cid = compose_id(s, p)?;
+    if opt_str(p, "action") == Some("delete") {
+        // Building Blocks Organizer › Delete.
+        let matches =
+            |b: &BuildingBlock| b.name.eq_ignore_ascii_case(&name) && gallery.is_none_or(|g| b.gallery == g);
+        let mut saved = load_building_blocks(s);
+        let before = saved.len();
+        saved.retain(|b| !matches(b));
+        let mut removed = before - saved.len();
+        for c in s.composes.values_mut() {
+            let n = c.building_blocks.len();
+            c.building_blocks.retain(|b| !matches(b));
+            removed = removed.max(n - c.building_blocks.len());
+        }
+        if removed == 0 {
+            return Err(CmdError::Params(format!("no saved entry `{name}`")));
+        }
+        save_building_blocks(s, &saved)?;
+        return Ok(json!({"deleted": name}));
+    }
     let found = find_block(s, cid, gallery, &name)
         .or_else(|| if gallery.is_none() { None } else { find_block(s, cid, None, &name) })
         .ok_or_else(|| CmdError::Params(format!("no saved entry `{name}`")))?;
@@ -1257,50 +2134,49 @@ fn save_to_gallery(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params("`name` required".into()));
     }
     let entry = BuildingBlock { gallery: gallery.clone(), name: name.clone(), blocks: frag.blocks };
-    // Every open compose shares the galleries.
+    let same = |b: &BuildingBlock| b.gallery == entry.gallery && b.name.eq_ignore_ascii_case(&entry.name);
+    // Every open compose shares the galleries; the profile keeps them.
     for other in s.composes.values_mut() {
-        other
-            .building_blocks
-            .retain(|b| !(b.gallery == entry.gallery && b.name.eq_ignore_ascii_case(&entry.name)));
+        other.building_blocks.retain(|b| !same(b));
         other.building_blocks.push(entry.clone());
     }
-    Ok(json!({"saved": name, "gallery": gallery}))
+    let mut saved = load_building_blocks(s);
+    saved.retain(|b| !same(b));
+    saved.push(entry.clone());
+    if saved.len() > MAX_BUILDING_BLOCKS {
+        let extra = saved.len() - MAX_BUILDING_BLOCKS;
+        saved.drain(..extra);
+    }
+    let persisted = blocks_path(s).is_some();
+    save_building_blocks(s, &saved)?;
+    Ok(json!({"saved": name, "gallery": gallery, "persisted": persisted}))
 }
 
-/// Text colour of a WordArt preset from the colour named after "Fill" (falls back to the accent).
-fn wordart_color(style: &str) -> Color {
-    let after = style.split_once("Fill").map_or(style, |(_, r)| r);
-    let word: String = after
-        .trim_start_matches([':', ',', ' '])
-        .split([',', ';'])
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| c.is_alphabetic())
-        .collect::<String>()
-        .to_lowercase();
-    mailcraft_html::parse_css_color(&word).unwrap_or(Color::rgb(0x15, 0x60, 0x82))
-}
-
+/// WordArt: the selected text (or `text`, or "Your text here") drawn in the chosen style with the theme's
+/// heading font and colours, inserted as a picture in place of the selection.
 fn word_art(s: &mut Session, p: &Value) -> CmdResult {
     let style = req_str(p, "style")?.to_owned();
-    let color = wordart_color(&style);
-    let text = opt_str(p, "text").map(str::to_owned);
+    let cid = compose_id(s, p)?;
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let theme = c.theme_resolved();
+    let selected = (!c.selection.is_collapsed()).then(|| c.selected_text());
+    let text: String = opt_str(p, "text")
+        .map(str::to_owned)
+        .or(selected)
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "Your text here".to_owned())
+        .chars()
+        .take(200)
+        .collect();
+    let Some((png, w, h)) = wordart_png(&text, &style, &theme) else {
+        return Err(CmdError::Failed("the WordArt could not be drawn".into()));
+    };
     let c = compose_mut(s, p)?;
     c.checkpoint();
-    if c.selection.is_collapsed() {
-        let shown = text.unwrap_or_else(|| "WordArt".to_owned());
-        let start = c.selection.focus.clone();
-        c.insert_text(&shown);
-        let end = c.selection.focus.clone();
-        c.selection = crate::compose::BodySelection { anchor: start, focus: end };
-    }
-    c.apply_text_style(|st| {
-        st.size_pt = Some(36.0);
-        st.bold = Some(true);
-        st.color = Some(color);
-    });
-    Ok(json!({"wordArt": style, "color": color.to_hex()}))
+    c.delete_selection();
+    let cid = put_png(c, "wordart", png, &text, w, h)?;
+    Ok(json!({"wordArt": style, "text": text, "cid": cid, "format": "png"}))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1623,7 +2499,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Quick Parts",
             "Insert › Text",
             "",
-            r#"{"name"?:string,"gallery"?:string}"#,
+            r#"{"name"?:string,"gallery"?:string,"action"?:"insert"|"delete"}"#,
             false,
             has_compose,
             quick_part,
@@ -1643,7 +2519,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Screenshot",
             "Insert › Illustrations",
             "",
-            r#"{"window"?:string,"clip"?:bool}"#,
+            r#"{"path"?:string,"name"?:string,"data_base64"?:string,"window"?:string,"clip"?:bool}"#,
             false,
             rich_compose,
             screenshot,
@@ -1653,7 +2529,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shapes",
             "Insert › Illustrations",
             "",
-            r#"{"kind":string}"#,
+            r#"{"kind":string,"color"?:string}"#,
             false,
             rich_compose,
             shape,
@@ -1724,6 +2600,18 @@ mod tests {
         (s, id)
     }
 
+    /// Params of the most recent dialog a command opened.
+    pub(crate) fn last_dialog(s: &Session) -> Value {
+        s.notices
+            .iter()
+            .rev()
+            .find_map(|n| match n {
+                crate::Notice::OpenDialog(_, p) => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap_or(Value::Null)
+    }
+
     const PNG_1X1: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
@@ -1778,8 +2666,90 @@ mod tests {
         assert_eq!(c.inline_images.len(), 9);
         let chart = String::from_utf8(c.inline_images[2].data.clone()).unwrap();
         assert!(chart.contains("Share &lt;1&gt;"));
-        assert!(c.inline_images.iter().all(|i| i.mime_type == "image/svg+xml"));
-        assert_eq!(s.run("insert.screenshot", &json!({"clip": true})).unwrap()["dialog"], "screenshot");
+        // Shapes and SmartArt are PNG; icons and charts stay SVG.
+        let mimes: Vec<&str> = c.inline_images.iter().map(|i| i.mime_type.as_str()).collect();
+        assert_eq!(mimes[0], "image/png");
+        assert!(mimes[5..].iter().all(|m| *m == "image/png"), "{mimes:?}");
+        assert!(
+            c.inline_images
+                .iter()
+                .filter(|i| i.mime_type == "image/png")
+                .all(|i| i.data.starts_with(b"\x89PNG"))
+        );
+        let r = s.run("insert.screenshot", &json!({"clip": true})).unwrap();
+        assert_eq!(r["dialog"], "screenshot");
+        assert_eq!(last_dialog(&s)["capture"], false);
+    }
+
+    /// Decoded RGBA of a generated PNG via the renderer's own decoder path is not available here, so check
+    /// pixels through the mask helpers instead: a shape covers its middle and leaves its corner empty.
+    #[test]
+    fn shapes_are_drawn_in_theme_colours_with_effects() {
+        let theme = crate::compose::ThemeState::default().resolve();
+        let accent = theme.color(crate::compose::ACCENT1);
+        let fonts = mailcraft_fonts::FontDb::bundled();
+        let mut list = mailcraft_layout::DisplayList::default();
+        polygon_list(&shape_points("rectangle", 0.0, 0.0).unwrap(), &mut list);
+        let mask = Mask::from_list(&list, dev(160.0), dev(100.0), &fonts);
+        assert!(mask.get(160, 100) > 250, "inside");
+        assert_eq!(mask.get(2, 2), 0, "outside the 4 px inset");
+        let mut img = Img::new(mask.w, mask.h);
+        composite(&mut img, (0, 0), &mask, accent, &effect_style("Subtle Solids"));
+        let mid = img.px[100 * mask.w + 160];
+        assert!((mid[0] * 255.0 - f32::from(accent.r)).abs() < 2.0 && (mid[3] - 1.0).abs() < 0.01);
+        // Effects change the drawing.
+        let png = |fx: &str| shape_png("oval", accent, fx).unwrap().0;
+        assert_ne!(png("Subtle Solids"), png("Top Shadow"));
+        assert_ne!(png("Glow Edge"), png("Glossy"));
+        for kind in SHAPES.split(", ") {
+            let (data, w, h) = shape_png(kind, accent, "Office").unwrap();
+            assert!(data.starts_with(b"\x89PNG") && w > 100.0 && h > 50.0, "{kind}");
+        }
+    }
+
+    #[test]
+    fn shape_colour_follows_the_theme() {
+        let (mut s, id) = setup();
+        s.run("compose.theme", &json!({"part": "colors", "name": "Red"})).unwrap();
+        s.run("insert.shape", &json!({"kind": "rectangle"})).unwrap();
+        s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
+        s.run("insert.shape", &json!({"kind": "rectangle"})).unwrap();
+        let c = &s.composes[&id];
+        assert_ne!(c.inline_images[0].data, c.inline_images[1].data);
+        assert!(s.run("insert.shape", &json!({"kind": "rectangle", "color": "nope"})).is_err());
+    }
+
+    #[test]
+    fn word_art_styles_parse_and_draw() {
+        let theme = crate::compose::ThemeState::default().resolve();
+        let w = parse_wordart("Fill: Orange, Accent color 2; Outline: Orange, Accent color 2", &theme);
+        assert_eq!(w.fill, theme.color(crate::compose::ACCENT1 + 1));
+        assert_eq!(w.outline, Some(theme.color(crate::compose::ACCENT1 + 1)));
+        let w = parse_wordart("Fill: White; Outline: Plum, Accent color 5; Shadow", &theme);
+        assert_eq!(w.fill, Color::WHITE);
+        assert!(w.shadow);
+        let w = parse_wordart(
+            "Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5",
+            &theme,
+        );
+        assert_eq!(w.fill, theme.color(0));
+        assert_eq!(w.outline, Some(theme.color(1)));
+        assert_eq!(w.hard_shadow, Some(theme.color(crate::compose::ACCENT1 + 4)));
+        let w = parse_wordart("Gradient Fill: Plum, Accent color 5; Reflection", &theme);
+        assert!(w.gradient.is_some() && w.reflection);
+        assert!(parse_wordart("Fill: Dark Teal, Accent color 1; Soft Bevel", &theme).bevel);
+        assert!(parse_wordart("Fill: Light Gray, Background color 2; Inner Shadow", &theme).inner_shadow);
+        let w = parse_wordart(
+            "Fill: White; Outline: Dark Teal, Accent color 1; Glow: Dark Teal, Accent color 1",
+            &theme,
+        );
+        assert_eq!(w.glow, Some(theme.color(crate::compose::ACCENT1)));
+        // Different styles give different pictures.
+        let a = wordart_png("Hi", "Fill: Black, Text color 1; Shadow", &theme).unwrap();
+        let b = wordart_png("Hi", "Gradient Fill: Plum, Accent color 5; Reflection", &theme).unwrap();
+        assert_ne!(a.0, b.0);
+        assert!(b.2 > a.2, "the reflection adds height");
+        assert!(wordart_png("", "Fill: Black", &theme).is_none());
     }
 
     #[test]
@@ -1895,16 +2865,22 @@ mod tests {
         assert_eq!(first(&s), ("s".to_owned(), Some(36.0)));
         s.run("insert.dropCap", &json!({"kind": "none"})).unwrap();
         assert_eq!(first(&s).1, None);
-        s.run(
-            "insert.wordArt",
-            &json!({"style": "Fill: Orange, Accent color 2; Outline: Orange, Accent color 2", "text": "Big"}),
-        )
-        .unwrap();
-        assert!(s.composes[&id].body.to_plain_text().contains("Big"));
-        assert!(
-            s.composes[&id]
-                .selection_all(|st, _| st.size_pt == Some(36.0) && st.color == Some(Color::rgb(255, 165, 0)))
-        );
+        let r = s
+            .run(
+                "insert.wordArt",
+                &json!({"style": "Fill: Orange, Accent color 2; Outline: Orange, Accent color 2", "text": "Big"}),
+            )
+            .unwrap();
+        assert_eq!(r["format"], "png");
+        let c = &s.composes[&id];
+        let img = c.inline_images.last().unwrap();
+        assert_eq!(img.mime_type, "image/png");
+        assert!(img.data.starts_with(b"\x89PNG"));
+        assert_eq!(c.images().last().unwrap().1, "Big", "alt text is the WordArt text");
+        // The selected text becomes the WordArt.
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        let r = s.run("insert.wordArt", &json!({"style": "Fill: Black, Text color 1; Shadow"})).unwrap();
+        assert!(r["text"].as_str().unwrap().contains("tart"));
     }
 
     #[test]
@@ -1923,6 +2899,57 @@ mod tests {
         s.run("insert.saveToGallery", &json!({"compose": id, "gallery": "quickTables", "name": "T"}))
             .unwrap();
         s.run("insert.table", &json!({"compose": other, "mode": "quick", "name": "T"})).unwrap();
+    }
+
+    #[test]
+    fn building_blocks_persist_in_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (mut s, id) = setup();
+            s.store = Some(mailcraft_store::Store::open(dir.path()).unwrap());
+            s.run("compose.select", &json!({"compose": id, "all": true})).unwrap();
+            let r = s
+                .run("insert.saveToGallery", &json!({"compose": id, "gallery": "autoText", "name": "Sig"}))
+                .unwrap();
+            assert_eq!(r["persisted"], true);
+            s.composes.clear();
+        }
+        assert!(dir.path().join(BUILDING_BLOCKS_FILE).exists());
+        // A new session (all compose windows closed) still has the entry.
+        let mut s = session();
+        s.store = Some(mailcraft_store::Store::open(dir.path()).unwrap());
+        let id = open(&mut s);
+        s.run("insert.quickPart", &json!({"gallery": "autoText"})).unwrap();
+        let d = last_dialog(&s);
+        assert_eq!(d["entries"][0]["name"], "Sig");
+        assert_eq!(d["entries"][0]["preview"], "start");
+        s.run("insert.quickPart", &json!({"compose": id, "name": "sig", "gallery": "autoText"})).unwrap();
+        assert_eq!(s.composes[&id].body.to_plain_text(), "start");
+        s.run("insert.quickPart", &json!({"name": "Sig", "action": "delete"})).unwrap();
+        assert!(s.run("insert.quickPart", &json!({"name": "Sig"})).is_err());
+        assert!(load_building_blocks(&s).is_empty());
+        // A garbled file reads as empty instead of failing.
+        std::fs::write(dir.path().join(BUILDING_BLOCKS_FILE), b"{not json").unwrap();
+        assert!(load_building_blocks(&s).is_empty());
+    }
+
+    #[test]
+    fn equation_presets_by_key_or_name_and_screenshot_files() {
+        let (mut s, id) = setup();
+        for name in
+            ["Area of Circle", "area of circle", "areaOfCircle", "Pythagorean Theorem", "Euler's Identity"]
+        {
+            s.run("insert.equation", &json!({"preset": name})).unwrap();
+        }
+        assert!(s.composes[&id].body.to_plain_text().contains("A = \u{3c0}r\u{b2}"));
+        s.run("insert.equation", &json!({})).unwrap();
+        assert_eq!(last_dialog(&s)["presets"][0]["name"], "Area of Circle");
+        // Screenshot inserts a saved picture.
+        let r = s.run("insert.screenshot", &json!({"name": "shot.png", "data_base64": PNG_1X1})).unwrap();
+        assert_eq!(r["screenshot"], true);
+        assert_eq!(s.composes[&id].inline_images.len(), 1);
+        s.run("insert.screenshot", &json!({"window": "Inbox"})).unwrap();
+        assert!(last_dialog(&s)["message"].as_str().unwrap().contains("cannot capture"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! The To-Do Bar (View › Layout › To-Do Bar › Calendar / People / Tasks / Off): a pane on the right of the
-//! Mail module with a month calendar and the selected day's (or the next days') appointments, a people
+//! Mail, People, Tasks and Notes modules with a month calendar and the selected day's (or the next days') appointments, a people
 //! search, and the To-Do List with "Type a new task".
 //!
 //! The session keeps no To-Do Bar state (`view.todoBar` only validates its part), so the parts shown live in
@@ -278,7 +278,9 @@ fn tasks_part(ui: &mut Ui, app: &mut App, st: &mut TodoBarState) {
                 if kind == "task" {
                     app.run("tasks.update", json!({ "id": id, "complete": true }));
                 } else {
-                    app.run("mail.markComplete", json!({ "ids": [id] }));
+                    // Flagged messages and contacts complete through the To-Do List command, which takes the
+                    // item ids whatever is selected.
+                    app.run("tasks.markComplete", json!({ "ids": [id] }));
                 }
             }
             let label = if due.is_empty() { subject.clone() } else { format!("{subject}  ({due})") };
@@ -287,6 +289,10 @@ fn tasks_part(ui: &mut Ui, app: &mut App, st: &mut TodoBarState) {
                 if kind == "task" {
                     let mut ms = load_mod(ui.ctx());
                     super::editors::open_task(app, &mut ms, ItemId(id));
+                    store_mod(ui.ctx(), ms);
+                } else if kind == "contact" {
+                    let mut ms = load_mod(ui.ctx());
+                    super::editors::open_contact(app, &mut ms, ItemId(id));
                     store_mod(ui.ctx(), ms);
                 } else {
                     app.run("mail.open", json!({ "id": id }));

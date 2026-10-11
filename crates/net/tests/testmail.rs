@@ -369,3 +369,50 @@ fn smtp_auth_modes_and_limits() {
         .unwrap_err();
     assert!(matches!(e, NetError::Unsupported(_)), "{e:?}");
 }
+
+#[test]
+fn headers_first_then_whole_messages() {
+    let s = servers(Config::default());
+    let u1 = s.seed_message(USER, "INBOX", &msg("big", "the body text"), &["\\Seen"]).unwrap();
+    let mut acc = account(&s, Security::Tls);
+    let d = acc.sync_folder_headers("INBOX", &FolderState::default()).unwrap();
+    assert_eq!(d.new.len(), 1);
+    let h = &d.new[0];
+    assert!(h.headers_only);
+    assert_eq!(h.uid, u1);
+    let text = String::from_utf8_lossy(&h.raw).into_owned();
+    assert!(text.contains("Subject: big") && !text.contains("the body text"), "{text}");
+    assert!(h.size.unwrap() > h.raw.len() as u64);
+    // The header-only message counts as known: the next sync finds nothing new.
+    let again = acc.sync_folder("INBOX", &d.state).unwrap();
+    assert!(again.new.is_empty());
+    let full = acc.fetch_messages("INBOX", &[u1, 999, 0]).unwrap();
+    assert_eq!(full.len(), 1);
+    assert!(!full[0].headers_only);
+    assert!(String::from_utf8_lossy(&full[0].raw).contains("the body text"));
+    assert!(full[0].flags.iter().any(|f| f == "\\Seen"));
+}
+
+#[test]
+fn idle_once_reports_new_mail_and_stops_on_request() {
+    let s = servers(Config::default());
+    let mut acc = account(&s, Security::Tls);
+    // Nothing happens: the stop flag ends the wait quickly.
+    let stop = AtomicBool::new(true);
+    let t = std::time::Instant::now();
+    assert!(!acc.idle_once("INBOX", Duration::from_secs(30), Some(&stop)).unwrap());
+    assert!(t.elapsed() < Duration::from_secs(10));
+    // Mail delivered during IDLE is reported.
+    let seeder = std::thread::spawn({
+        let raw = msg("pushed", "hello");
+        let srv = std::sync::Arc::new(s);
+        let srv2 = std::sync::Arc::clone(&srv);
+        move || {
+            std::thread::sleep(Duration::from_millis(300));
+            srv2.seed_message(USER, "INBOX", &raw, &[]).unwrap();
+            srv
+        }
+    });
+    assert!(acc.idle_once("INBOX", Duration::from_secs(20), None).unwrap());
+    let _srv = seeder.join().unwrap();
+}

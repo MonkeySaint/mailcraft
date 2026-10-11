@@ -450,7 +450,7 @@ fn info(ui: &mut Ui, app: &mut App, st: &mut PageState) {
             app,
             &format!(
                 "{} · {}",
-                kind_label(a.kind),
+                kind_label(&app.s, a),
                 if a.can_send() { "can send mail" } else { "stores mail on this computer" }
             ),
         );
@@ -579,8 +579,12 @@ fn account_settings_menu(ui: &mut Ui, app: &mut App, acct: Option<&mailcraft_mod
     }
 }
 
-fn kind_label(k: mailcraft_model::AccountKind) -> &'static str {
-    match k {
+/// Account type shown under the account picker (POP3 accounts are stored as IMAP plus a POP3 option).
+fn kind_label(s: &mailcraft_engine::Session, a: &mailcraft_model::Account) -> &'static str {
+    if mailcraft_engine::accounts::kind_label(s, a) == "pop3" {
+        return "POP/SMTP";
+    }
+    match a.kind {
         mailcraft_model::AccountKind::Local => "Local data file",
         mailcraft_model::AccountKind::Imap => "IMAP/SMTP",
         mailcraft_model::AccountKind::Jmap => "JMAP",
@@ -1580,5 +1584,25 @@ pub fn version_line() -> String {
     match info {
         Some(info) => format!("Version {version} ({info})"),
         None => format!("Version {version}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn account_kinds_are_labelled_with_pop_accounts_as_pop() {
+        let mut s = mailcraft_engine::sample::sample_session();
+        s.run(
+            "accounts.add",
+            &json!({"kind": "pop3", "address": "pop@example.org", "incoming": {"host": "pop.example.org"}, "password": "x"}),
+        )
+        .unwrap();
+        let pop = s.mailbox.accounts.iter().find(|a| a.address == "pop@example.org").unwrap();
+        assert_eq!(super::kind_label(&s, pop), "POP/SMTP");
+        let local =
+            s.mailbox.accounts.iter().find(|a| a.kind == mailcraft_model::AccountKind::Local).unwrap();
+        assert_eq!(super::kind_label(&s, local), "Local data file");
     }
 }

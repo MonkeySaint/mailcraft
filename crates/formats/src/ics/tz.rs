@@ -260,6 +260,31 @@ impl TimeZone {
         Some(TimeZone { tzid, observances })
     }
 
+    /// VTIMEZONE component describing this zone: one STANDARD / DAYLIGHT sub-component per observance with
+    /// its first onset, offsets and rule (RFC 5545 §3.6.5).
+    pub fn to_component(&self) -> Component {
+        let mut tz = Component::new("VTIMEZONE");
+        tz.push("TZID", vec![], self.tzid.trim().chars().filter(|c| !c.is_control()).collect::<String>());
+        for o in self.observances.iter().take(MAX_OBSERVANCES) {
+            let mut sub = Component::new(if o.daylight { "DAYLIGHT" } else { "STANDARD" });
+            // An observance "since forever" (a fixed zone) starts at the epoch.
+            let start = if o.rrule.is_none() && o.rdates.is_empty() { o.start.max(0) } else { o.start };
+            sub.push("DTSTART", vec![], value::format_date_time(start));
+            sub.push("TZOFFSETFROM", vec![], value::format_utc_offset(o.offset_from));
+            sub.push("TZOFFSETTO", vec![], value::format_utc_offset(o.offset_to));
+            if let Some(r) = &o.rrule {
+                sub.push("RRULE", vec![], r.to_value());
+            }
+            if !o.rdates.is_empty() {
+                let list: Vec<String> =
+                    o.rdates.iter().take(MAX_RDATES).map(|&d| value::format_date_time(d)).collect();
+                sub.push("RDATE", vec![], list.join(","));
+            }
+            tz.children.push(sub);
+        }
+        tz
+    }
+
     /// VTIMEZONE component for a fixed-offset zone named by [`fixed_tzid`].
     pub fn fixed_component(offset: i32) -> Component {
         let mut tz = Component::new("VTIMEZONE");
@@ -329,6 +354,9 @@ enum Dst {
     Australia,
     /// New Zealand: last Sunday September 02:00 → 1st Sunday April 03:00.
     NewZealand,
+    /// Egypt (since 2023): last Friday April 00:00 → the Friday after the last Thursday of October 00:00
+    /// (that Thursday's 24:00).
+    Egypt,
 }
 
 const BUILTIN: &[(&[&str], i32, Dst)] = &[
@@ -410,17 +438,19 @@ const BUILTIN: &[(&[&str], i32, Dst)] = &[
         Dst::Europe,
     ),
     (&["Africa/Lagos", "Africa/Algiers", "Africa/Tunis"], 60, Dst::None),
-    (&["Africa/Johannesburg", "Africa/Cairo", "Africa/Harare", "Africa/Maputo"], 120, Dst::None),
+    (&["Africa/Johannesburg", "Africa/Harare", "Africa/Maputo"], 120, Dst::None),
+    (&["Africa/Cairo", "Egypt"], 120, Dst::Egypt),
     (
         &["Europe/Moscow", "Europe/Istanbul", "Europe/Minsk", "Asia/Riyadh", "Asia/Qatar", "Africa/Nairobi"],
         180,
         Dst::None,
     ),
     (&["Asia/Dubai", "Asia/Muscat", "Asia/Baku", "Asia/Tbilisi"], 240, Dst::None),
-    (&["Asia/Karachi", "Asia/Tashkent"], 300, Dst::None),
+    // Kazakhstan moved to one zone, UTC+05:00, in 2024.
+    (&["Asia/Karachi", "Asia/Tashkent", "Asia/Almaty"], 300, Dst::None),
     (&["Asia/Kolkata", "Asia/Calcutta", "Asia/Colombo"], 330, Dst::None),
     (&["Asia/Kathmandu"], 345, Dst::None),
-    (&["Asia/Dhaka", "Asia/Almaty"], 360, Dst::None),
+    (&["Asia/Dhaka"], 360, Dst::None),
     (&["Asia/Bangkok", "Asia/Jakarta", "Asia/Ho_Chi_Minh"], 420, Dst::None),
     (
         &[
@@ -497,8 +527,54 @@ pub fn builtin(tzid: &str) -> Option<TimeZone> {
             observance(false, at(2008, 4, 6, 3), day, std, "FREQ=YEARLY;BYMONTH=4;BYDAY=1SU"),
             observance(true, at(2007, 9, 30, 2), std, day, "FREQ=YEARLY;BYMONTH=9;BYDAY=-1SU"),
         ],
+        Dst::Egypt => vec![
+            observance(true, at(2023, 4, 28, 0), std, day, "FREQ=YEARLY;BYMONTH=4;BYDAY=-1FR"),
+            // The seven days after the last Thursday of October hold exactly one Friday.
+            observance(
+                false,
+                at(2023, 10, 27, 0),
+                day,
+                std,
+                "FREQ=YEARLY;BYMONTH=10,11;BYMONTHDAY=26,27,28,29,30,31,1;BYDAY=FR",
+            ),
+        ],
     };
     Some(TimeZone { tzid: tzid.to_owned(), observances })
+}
+
+/// The canonical spelling of a built-in zone named `tzid` (an IANA id or alias, case-insensitive, as listed in
+/// the built-in table); `None` for fixed-offset names and unknown zones.
+pub fn builtin_name(tzid: &str) -> Option<&'static str> {
+    let name = tzid.trim().trim_matches('"').trim_start_matches('/');
+    if fixed_from_name(name).is_some() {
+        return None;
+    }
+    BUILTIN.iter().flat_map(|(names, _, _)| names.iter()).find(|n| n.eq_ignore_ascii_case(name)).copied()
+}
+
+/// The built-in zone that keeps the same offsets as `zone` (a file's own VTIMEZONE, such as one named
+/// "Eastern Standard Time") through `year` and the next, sampled daily at 12:00 UTC: the first IANA name of
+/// its table row. `None` when `zone` keeps one offset all along (a fixed offset says everything) or no
+/// built-in zone matches.
+pub fn equivalent_builtin(zone: &TimeZone, year: i64) -> Option<&'static str> {
+    let year = year.clamp(1971, 2400);
+    let first = value::local_secs(year, 1, 1, 12, 0, 0)?;
+    let days: Vec<i64> = (0..731).map(|d| first.saturating_add(d * DAY)).collect();
+    let mine = ZoneLookup::new(Cow::Borrowed(zone));
+    let offsets: Vec<i32> = days.iter().map(|&u| mine.offset_at_utc(u)).collect();
+    let lo = offsets.iter().min().copied()?;
+    let hi = offsets.iter().max().copied()?;
+    if lo == hi {
+        return None;
+    }
+    BUILTIN.iter().filter(|(_, std, dst)| *std == lo && !matches!(dst, Dst::None)).find_map(
+        |(names, _, _)| {
+            let name = names.first()?;
+            let z = builtin(name)?;
+            let theirs = ZoneLookup::new(Cow::Owned(z));
+            days.iter().zip(&offsets).all(|(&u, &off)| theirs.offset_at_utc(u) == off).then_some(*name)
+        },
+    )
 }
 
 /// The zones a calendar defines plus the built-in fallback.

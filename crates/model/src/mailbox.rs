@@ -38,6 +38,9 @@ pub struct Mailbox {
     /// Words added to the spelling dictionary.
     #[serde(default)]
     pub custom_dictionary: Vec<String>,
+    /// Junk Email Options: level, options and the safe/blocked lists (`junk.rs`).
+    #[serde(default)]
+    pub junk: crate::junk::JunkSettings,
 }
 
 /// Longest folder name accepted.

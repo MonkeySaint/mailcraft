@@ -15,6 +15,7 @@ pub mod dates;
 pub mod folder;
 pub mod ids;
 pub mod item;
+pub mod junk;
 pub mod mailbox;
 pub mod note;
 pub mod quickstep;
@@ -40,6 +41,7 @@ pub use ids::{AccountId, FolderId, ItemId};
 pub use item::{
     AttachmentMeta, Body, BodyFormat, FlagState, FocusClass, Importance, MailItem, ResponseState, Sensitivity,
 };
+pub use junk::{JunkLevel, JunkList, JunkSettings};
 pub use mailbox::Mailbox;
 pub use note::{Note, NoteColor};
 pub use quickstep::{QuickStep, QuickStepAction};

@@ -1,6 +1,6 @@
 //! Shared helpers for the module views: UI state in egui memory, local dates, colours and pane drawing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Id, Layout, Rect, Response, Sense, Stroke, StrokeKind, Ui,
@@ -8,9 +8,13 @@ use egui::{
 };
 use mailcraft_engine::cmd::calendar::CalendarViewState;
 use mailcraft_engine::cmd::notes::NotesViewState;
-use mailcraft_model::{DateTime, FolderId, FolderKind, FolderPaneState, NoteColor, dates};
+use mailcraft_engine::cmd::view::modules::{ModuleKind, ModuleView};
+use mailcraft_model::{
+    DateTime, FolderId, FolderKind, FolderPaneState, ItemId, NoteColor, ReadingPanePos, dates,
+};
 
 use super::editors::Editors;
+use super::editors::dialogs::ModuleDialogs;
 use crate::App;
 use crate::theme::size;
 
@@ -32,21 +36,34 @@ pub(crate) struct ModState {
     pub cal_slot: Option<(i64, i64)>,
     /// Key of the last view the grid scrolled to the start of the working day for.
     pub cal_scroll_key: String,
-    /// People: business-card grid instead of the list + contact card.
+    /// People: business-card grid instead of the list + contact card (`modules::set_people_view`; applied to
+    /// the folder's view once, see `people_cards_seen`).
     pub people_cards: bool,
+    pub people_cards_seen: bool,
     pub people_search: String,
     /// Letter-index jump requested ('#' = digits).
     pub people_jump: Option<char>,
-    /// Tasks: show the selected tasks folder instead of the To-Do List.
+    /// Tasks: show the selected tasks folder instead of the To-Do List (`modules::set_tasks_todo`; applied
+    /// to the folder's view once, see `tasks_folder_seen`).
     pub tasks_folder_view: bool,
+    pub tasks_folder_seen: bool,
     /// "Type a new task" text.
     pub new_task: String,
+    /// Notes icon arrangement requested with `modules::set_notes_view` (applied to the folder's view once,
+    /// see `notes_view_seen`).
     pub notes_view: NotesViewState,
+    pub notes_view_seen: NotesViewState,
+    /// Notes Icon view: icons dragged off the grid (note id → offset from the grid's top-left corner).
+    /// Cleared by Line Up Icons.
+    pub note_pos: BTreeMap<u64, (f32, f32)>,
     /// Note being edited in place: (id, text).
     pub note_edit: Option<(u64, String)>,
     /// Note whose edit box should take focus.
     pub note_focus: bool,
     pub editors: Editors,
+    /// Module dialogs (move/copy, categories, follow up, view settings, apply/save view, mail merge, task
+    /// request).
+    pub dialogs: ModuleDialogs,
     /// Last egui pass the item windows were drawn in.
     pub windows_pass: Option<u64>,
 }
@@ -522,6 +539,174 @@ pub(crate) fn current_folder(
 /// Selects a folder through the engine (`nav.selectFolder`).
 pub(crate) fn select_folder(app: &mut App, folder: FolderId) {
     app.run("nav.selectFolder", serde_json::json!({ "folder": folder.0 }));
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Selection, module views, layout
+// ---------------------------------------------------------------------------------------------------------
+
+/// Selects a module item (or nothing): the module selection the views draw and the engine selection, so
+/// ribbon commands, keyboard commands and their enabled checks act on it.
+pub(crate) fn select_item(app: &mut App, id: Option<u64>) {
+    app.ui.module_selection = id;
+    match id {
+        Some(i) => {
+            app.s.selection.items = vec![ItemId(i)];
+            app.s.selection.focus = Some(ItemId(i));
+        }
+        None => {
+            app.s.selection.items.clear();
+            app.s.selection.focus = None;
+        }
+    }
+}
+
+/// Keeps the module selection and the engine selection in step at the start of a module view's frame: an
+/// item the engine selected (Delete selects the neighbour) wins over the view's; a view selection the engine
+/// does not know yet (an item window saved, a click) is pushed to the engine. `is_item` tells which ids
+/// belong to the view.
+pub(crate) fn sync_selection(app: &mut App, is_item: impl Fn(&App, ItemId) -> bool) {
+    let engine = app.s.selection.focus.or_else(|| app.s.selection.items.first().copied());
+    let view = app.ui.module_selection.map(ItemId);
+    match (engine, view) {
+        (Some(e), v) if Some(e) != v && is_item(app, e) => app.ui.module_selection = Some(e.0),
+        (_, Some(v)) if Some(v) != engine && is_item(app, v) => select_item(app, Some(v.0)),
+        (_, Some(v)) if !is_item(app, v) => app.ui.module_selection = None,
+        _ => {}
+    }
+}
+
+/// Makes sure the engine's selected folder is a folder of the module (the View commands act on it): when
+/// another folder is selected, the module's current folder is selected.
+pub(crate) fn ensure_folder(
+    app: &mut App,
+    kind: mailcraft_engine::cmd::calendar::pim::Kind,
+) -> Option<FolderId> {
+    let folder = current_folder(app, kind)?;
+    if app.s.selection.folder != folder {
+        select_folder(app, folder);
+    }
+    Some(folder)
+}
+
+/// The module view of `folder` (the engine's per-folder view state).
+pub(crate) fn module_view(app: &App, folder: Option<FolderId>, kind: ModuleKind) -> ModuleView {
+    folder
+        .map(|f| mailcraft_engine::cmd::view::modules::state(&app.s, f, kind))
+        .unwrap_or_else(|| ModuleView::defaults(kind))
+}
+
+/// Runs `view.changeView` for the module's current folder.
+pub(crate) fn change_view(app: &mut App, name: &str) {
+    app.run("view.changeView", serde_json::json!({ "name": name }));
+}
+
+/// Row height with View › Use Tighter Spacing applied.
+pub(crate) fn row_height(app: &App, base: f32) -> f32 {
+    let tight = mailcraft_engine::queries::view_settings(&app.s, app.s.selection.folder).tighter_spacing;
+    if tight { (base * 0.78).round() } else { base }
+}
+
+/// Group labels collapsed in `folder` (View › Expand/Collapse).
+pub(crate) fn collapsed_labels(app: &App, folder: FolderId) -> BTreeSet<String> {
+    app.s
+        .view
+        .collapsed_groups
+        .get(&folder)
+        .map(|v| v.iter().filter(|e| mailcraft_engine::cmd::view::is_group_label(e)).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Collapses or expands a group of a module view: the engine's group commands act on the selected item's
+/// group, so an item of the group (`first`) is selected first.
+pub(crate) fn toggle_group(app: &mut App, first: ItemId, collapsed: bool) {
+    let inside = app.s.selection.focus == Some(first);
+    if !inside {
+        select_item(app, Some(first.0));
+    }
+    let id = if collapsed { "view.expandGroup" } else { "view.collapseGroup" };
+    app.run(id, serde_json::json!({}));
+}
+
+/// A group header row (▾/▸, label, item count); returns true when clicked.
+pub(crate) fn group_row(ui: &mut Ui, app: &mut App, label: &str, count: usize, collapsed: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+    let state = if collapsed { "collapsed" } else { "expanded" };
+    a11y(&resp, WidgetType::Button, &format!("Group {label}: {count} items, {state}"));
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.hover);
+    }
+    let chev = Rect::from_center_size(pos2(rect.min.x + 10.0, rect.center().y), Vec2::splat(12.0));
+    app.icons.paint(ui, chev, if collapsed { "chevron-right" } else { "chevron-down" }, app.theme.text_muted);
+    let text = format!("{label}: {count}");
+    ui.painter().text(
+        pos2(rect.min.x + 22.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(12.5),
+        if label == "Overdue" { app.theme.danger } else { app.theme.accent },
+    );
+    ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, app.theme.separator));
+    resp.clicked()
+}
+
+/// Splits a module's content into the item list and the reading pane by the folder's reading pane position
+/// (`Off` or too little room → no pane). With the pane on the right the list is `list_w` wide; at the
+/// bottom it takes `frac` of the height.
+pub(crate) fn reading_split(rect: Rect, pos: ReadingPanePos, list_w: f32, frac: f32) -> (Rect, Option<Rect>) {
+    match pos {
+        ReadingPanePos::Right if rect.width() > list_w + 280.0 => {
+            let list = Rect::from_min_size(rect.min, vec2(list_w, rect.height()));
+            (list, Some(Rect::from_min_max(pos2(list.max.x + 1.0, rect.min.y), rect.max)))
+        }
+        ReadingPanePos::Bottom if rect.height() > 260.0 => {
+            let h = (rect.height() * frac.clamp(0.2, 0.8)).round();
+            let list = Rect::from_min_size(rect.min, vec2(rect.width(), h));
+            (list, Some(Rect::from_min_max(pos2(rect.min.x, list.max.y + 1.0), rect.max)))
+        }
+        _ => (rect, None),
+    }
+}
+
+/// Draws the separator between the list and the reading pane.
+pub(crate) fn pane_separator(ui: &Ui, app: &App, list: Rect, pane: Rect) {
+    let stroke = Stroke::new(1.0, app.theme.separator);
+    if (pane.min.y - list.max.y).abs() < 2.0 && pane.min.x <= list.min.x + 1.0 {
+        ui.painter().hline(list.x_range(), list.max.y, stroke);
+    } else {
+        ui.painter().vline(list.max.x, list.y_range(), stroke);
+    }
+}
+
+/// The To-Do Bar (View › Layout › To-Do Bar) on the right of a module's content when it is on and there is
+/// room; returns the rest of `rect`.
+pub(crate) fn todo_bar_strip(ui: &mut Ui, app: &mut App, rect: Rect) -> Rect {
+    let w = super::TODO_BAR_WIDTH;
+    if !super::todo_bar_shown(ui.ctx()) || rect.width() < w + 420.0 {
+        return rect;
+    }
+    let bar = Rect::from_min_max(pos2(rect.max.x - w, rect.min.y), rect.max);
+    pane_bg(ui, bar, app.theme.pane);
+    child(ui, bar.shrink(6.0), "mc-module-todo-bar", |ui| super::todo_bar(ui, app));
+    Rect::from_min_max(rect.min, pos2(bar.min.x - GAP, rect.max.y))
+}
+
+/// Small toggle buttons for a module's views (the ribbon's Current View gallery, also in the view's
+/// toolbar). Returns the view picked.
+pub(crate) fn view_switch(
+    ui: &mut Ui,
+    app: &mut App,
+    views: &[(&str, &str)],
+    current: &str,
+) -> Option<String> {
+    let mut picked = None;
+    for (name, icon) in views.iter().rev() {
+        if crate::widgets::toggle_button(ui, app, icon, name, current == *name).clicked() && current != *name
+        {
+            picked = Some((*name).to_owned());
+        }
+    }
+    picked
 }
 
 #[cfg(test)]

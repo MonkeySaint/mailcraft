@@ -205,37 +205,62 @@ item | 72 | | format.fontSize | {"pt":72} |
 
 menu bullets
 item | None | | format.bullets | {"style":"none"} |
-item | Solid Circle | bullets | format.bullets | {"style":"disc"} |
-item | Hollow Circle | bullets | format.bullets | {"style":"circle"} |
-item | Solid Square | bullets | format.bullets | {"style":"square"} |
-item | Arrow | bullets | format.bullets | {"style":"arrow"} |
-item | Check Mark | check | format.bullets | {"style":"check"} |
+item | Bulleted, Solid Circle | bullets | format.bullets | {"style":"disc"} |
+item | Bulleted, Hollow Circle | bullets | format.bullets | {"style":"circle"} |
+item | Bulleted, Solid Square | bullets | format.bullets | {"style":"square"} |
+item | Picture bulleted | bullets | format.bullets | {"style":"picture"} |
+item | Bulleted, Four Small Diamonds | bullets | format.bullets | {"style":"diamonds"} |
+item | Bulleted, Hollow Arrow | bullets | format.bullets | {"style":"arrow"} |
+item | Bulleted, Checkmark | check | format.bullets | {"style":"check"} |
 sep
-item | Change List Level | indent | format.indent | | L
+sub | Change List Level | indent | listLevels | | L
 item | Define New Bullet... | | format.bullets | {"style":"define"} | D
 
 menu numbering
 item | None | | format.numbering | {"style":"none"} |
-item | 1. 2. 3. | numbering | format.numbering | {"style":"decimal"} |
-item | 1) 2) 3) | numbering | format.numbering | {"style":"decimalParen"} |
-item | I. II. III. | numbering | format.numbering | {"style":"upperRoman"} |
-item | A. B. C. | numbering | format.numbering | {"style":"upperAlpha"} |
-item | a) b) c) | numbering | format.numbering | {"style":"lowerAlphaParen"} |
-item | i. ii. iii. | numbering | format.numbering | {"style":"lowerRoman"} |
+item | 1, 2, 3, …, Number Format: 1. | numbering | format.numbering | {"style":"decimal"} |
+item | 1, 2, 3, …, Number Format: 1) | numbering | format.numbering | {"style":"decimalParen"} |
+item | I, II, III, …, Number Format: I. | numbering | format.numbering | {"style":"upperRoman"} |
+item | A, B, C, …, Number Format: A. | numbering | format.numbering | {"style":"upperAlpha"} |
+item | a, b, c, …, Number Format: a) | numbering | format.numbering | {"style":"lowerAlphaParen"} |
+item | a, b, c, …, Number Format: a. | numbering | format.numbering | {"style":"lowerAlpha"} |
+item | i, ii, iii, …, Number Format: i. | numbering | format.numbering | {"style":"lowerRoman"} |
 sep
-item | Change List Level | indent | format.indent | | L
+sub | Change List Level | indent | listLevels | | L
 item | Define New Number Format... | | format.numbering | {"style":"define"} | D
 item | Set Numbering Value... | | format.numbering | {"style":"setValue"} | V
 
 menu multilevel
 item | None | | format.multilevel | {"style":"none"} |
+item | 1. a. i. | numbering | format.multilevel | {"style":"numbered"} |
+item | 1) a) i) | numbering | format.multilevel | {"style":"numberedParen"} |
 item | 1. 1.1. 1.1.1. | numbering | format.multilevel | {"style":"outline"} |
-item | Article / Section | numbering | format.multilevel | {"style":"article"} |
-item | Chapter headings | numbering | format.multilevel | {"style":"chapter"} |
+item | I. A. 1. a) | numbering | format.multilevel | {"style":"outlineRoman"} |
+item | Article I. / Section 1.01 | numbering | format.multilevel | {"style":"article"} |
+item | Chapter 1 / 1.1 | numbering | format.multilevel | {"style":"chapter"} |
+item | Bullets by level | bullets | format.multilevel | {"style":"bullets"} |
+item | Four Small Diamonds | bullets | format.multilevel | {"style":"diamonds"} |
 sep
-item | Change List Level | indent | format.indent | | L
+sub | Gallery Filter | filter | multilevelFilter | | F
+sub | Change List Level | indent | listLevels | | L
 item | Define New Multilevel List... | | format.multilevel | {"style":"define"} | D
-item | Define New List Style... | | format.multilevel | {"style":"defineStyle"} | L
+item | Define New List Style... | | format.multilevel | {"style":"defineStyle"} | S
+
+menu multilevelFilter
+item | All | | format.multilevel | {"filter":"all"} | A
+item | Current List | | format.multilevel | {"filter":"current"} | C
+item | List Library | | format.multilevel | {"filter":"library"} | L
+
+menu listLevels
+item | Level 1 | | format.indent | {"level":1} | 1
+item | Level 2 | | format.indent | {"level":2} | 2
+item | Level 3 | | format.indent | {"level":3} | 3
+item | Level 4 | | format.indent | {"level":4} | 4
+item | Level 5 | | format.indent | {"level":5} | 5
+item | Level 6 | | format.indent | {"level":6} | 6
+item | Level 7 | | format.indent | {"level":7} | 7
+item | Level 8 | | format.indent | {"level":8} | 8
+item | Level 9 | | format.indent | {"level":9} | 9
 
 menu highlight
 item | High-contrast only | | format.highlight | {"highContrastOnly":"$!on"} | H | on=hc
@@ -338,11 +363,21 @@ item | Document | | format.styleSet | {"name":"Document"} |
 item | Basic (Elegant) | | format.styleSet | {"name":"Basic (Elegant)"} |
 item | Basic (Simple) | | format.styleSet | {"name":"Basic (Simple)"} |
 item | Basic (Stylish) | | format.styleSet | {"name":"Basic (Stylish)"} |
+item | Black & White (Capitalized) | | format.styleSet | {"name":"Black & White (Capitalized)"} |
+item | Black & White (Classic) | | format.styleSet | {"name":"Black & White (Classic)"} |
+item | Black & White (Numbered) | | format.styleSet | {"name":"Black & White (Numbered)"} |
+item | Black & White (Word 2013) | | format.styleSet | {"name":"Black & White (Word 2013)"} |
 item | Casual | | format.styleSet | {"name":"Casual"} |
 item | Centered | | format.styleSet | {"name":"Centered"} |
+item | Lines (Distinctive) | | format.styleSet | {"name":"Lines (Distinctive)"} |
 item | Lines (Simple) | | format.styleSet | {"name":"Lines (Simple)"} |
+item | Lines (Stylish) | | format.styleSet | {"name":"Lines (Stylish)"} |
 item | Minimalist | | format.styleSet | {"name":"Minimalist"} |
 item | Shaded | | format.styleSet | {"name":"Shaded"} |
+item | Word | | format.styleSet | {"name":"Word"} |
+item | Word 2003 | | format.styleSet | {"name":"Word 2003"} |
+item | Word 2010 | | format.styleSet | {"name":"Word 2010"} |
+item | Word 2013 | | format.styleSet | {"name":"Word 2013"} |
 sep
 item | Reset to the Default Style Set | undo | format.styleSet | {"action":"reset"} | R
 item | Save as a New Style Set... | save | format.styleSet | {"action":"save"} | S
@@ -428,16 +463,27 @@ item | This Device... | picture | insert.picture | | D
 
 menu shapes
 item | Line | minus | insert.shape | {"kind":"line"} |
-item | Arrow | chevron-right | insert.shape | {"kind":"rightArrow"} |
-item | Left Arrow | chevron-left | insert.shape | {"kind":"leftArrow"} |
+item | Arrow: Right | chevron-right | insert.shape | {"kind":"rightArrow"} |
+item | Arrow: Left | chevron-left | insert.shape | {"kind":"leftArrow"} |
+item | Arrow: Up | chevron-up | insert.shape | {"kind":"upArrow"} |
+item | Arrow: Down | chevron-down | insert.shape | {"kind":"downArrow"} |
 item | Rectangle | table | insert.shape | {"kind":"rectangle"} |
-item | Rounded Rectangle | | insert.shape | {"kind":"roundedRectangle"} |
+item | Rectangle: Rounded Corners | | insert.shape | {"kind":"roundedRectangle"} |
 item | Oval | | insert.shape | {"kind":"oval"} |
-item | Triangle | | insert.shape | {"kind":"triangle"} |
+item | Isosceles Triangle | | insert.shape | {"kind":"triangle"} |
+item | Right Triangle | | insert.shape | {"kind":"rightTriangle"} |
+item | Parallelogram | | insert.shape | {"kind":"parallelogram"} |
+item | Trapezoid | | insert.shape | {"kind":"trapezoid"} |
 item | Diamond | | insert.shape | {"kind":"diamond"} |
-item | Star | | insert.shape | {"kind":"star"} |
+item | Pentagon | | insert.shape | {"kind":"pentagon"} |
+item | Hexagon | | insert.shape | {"kind":"hexagon"} |
+item | Octagon | | insert.shape | {"kind":"octagon"} |
+item | Cross | plus | insert.shape | {"kind":"plus"} |
+item | Arrow: Chevron | chevron-right | insert.shape | {"kind":"chevron"} |
+item | Star: 5 Points | | insert.shape | {"kind":"star"} |
+item | Star: 6 Points | | insert.shape | {"kind":"star6"} |
 item | Heart | | insert.shape | {"kind":"heart"} |
-item | Callout | conversation | insert.shape | {"kind":"callout"} |
+item | Speech Bubble: Rectangle | conversation | insert.shape | {"kind":"callout"} |
 sep
 item | New Drawing Canvas | picture | insert.shape | {"kind":"canvas"} | N
 
@@ -446,6 +492,7 @@ item | This Device... | picture | insert.model3d | | D
 
 menu screenshot
 item | Screen Clipping | picture | insert.screenshot | {"clip":true} | C
+item | Insert a Saved Screenshot... | folder-open | insert.screenshot | | F
 
 menu textBox
 item | Simple Text Box | note | insert.textBox | {"preset":"simple"} |
@@ -465,10 +512,21 @@ item | Insert AutoText... | quick-steps | insert.quickPart | {"gallery":"autoTex
 item | Save Selection to AutoText Gallery | save | insert.saveToGallery | {"gallery":"autoText"} | S
 
 menu wordArt
-item | Fill: Black, Shadow | font-color | insert.wordArt | {"style":"fillBlackShadow"} |
-item | Fill: Accent, Shadow | font-color | insert.wordArt | {"style":"fillAccentShadow"} |
-item | Fill: White, Outline | font-color | insert.wordArt | {"style":"fillWhiteOutline"} |
-item | Gradient Fill | font-color | insert.wordArt | {"style":"gradient"} |
+item | Fill: Black, Text color 1; Shadow | font-color | insert.wordArt | {"style":"Fill: Black, Text color 1; Shadow"} |
+item | Fill: Dark Teal, Accent color 1; Shadow | font-color | insert.wordArt | {"style":"Fill: Dark Teal, Accent color 1; Shadow"} |
+item | Fill: Orange, Accent color 2; Outline: Orange, Accent color 2 | font-color | insert.wordArt | {"style":"Fill: Orange, Accent color 2; Outline: Orange, Accent color 2"} |
+item | Fill: White; Outline: Plum, Accent color 5; Shadow | font-color | insert.wordArt | {"style":"Fill: White; Outline: Plum, Accent color 5; Shadow"} |
+item | Fill: Turquoise, Accent color 4; Soft Bevel | font-color | insert.wordArt | {"style":"Fill: Turquoise, Accent color 4; Soft Bevel"} |
+item | Gradient Fill, Gray | font-color | insert.wordArt | {"style":"Gradient Fill, Gray"} |
+item | Gradient Fill: Plum, Accent color 5; Reflection | font-color | insert.wordArt | {"style":"Gradient Fill: Plum, Accent color 5; Reflection"} |
+item | Gradient Fill: Turquoise, Accent color 4; Outline: Turquoise, Accent color 4 | font-color | insert.wordArt | {"style":"Gradient Fill: Turquoise, Accent color 4; Outline: Turquoise, Accent color 4"} |
+item | Fill: White; Outline: Dark Teal, Accent color 1; Glow: Dark Teal, Accent color 1 | font-color | insert.wordArt | {"style":"Fill: White; Outline: Dark Teal, Accent color 1; Glow: Dark Teal, Accent color 1"} |
+item | Fill: Dark Green, Accent color 3; Sharp Bevel | font-color | insert.wordArt | {"style":"Fill: Dark Green, Accent color 3; Sharp Bevel"} |
+item | Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: White, Background color 1 | font-color | insert.wordArt | {"style":"Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: White, Background color 1"} |
+item | Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5 | font-color | insert.wordArt | {"style":"Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5"} |
+item | Fill: Plum, Accent color 5; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5 | font-color | insert.wordArt | {"style":"Fill: Plum, Accent color 5; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5"} |
+item | Fill: White; Outline: Orange, Accent color 2; Hard Shadow: Orange, Accent color 2 | font-color | insert.wordArt | {"style":"Fill: White; Outline: Orange, Accent color 2; Hard Shadow: Orange, Accent color 2"} |
+item | Fill: Light Gray, Background color 2; Inner Shadow | font-color | insert.wordArt | {"style":"Fill: Light Gray, Background color 2; Inner Shadow"} |
 
 menu dropCap
 item | None | | insert.dropCap | {"kind":"none"} | N
@@ -503,11 +561,13 @@ sep
 item | More Symbols... | info | insert.symbol | | M
 
 menu themes
-item | Default | view | compose.theme | {"name":"Default"} |
+item | Office | view | compose.theme | {"name":"Office"} |
+item | Office 2013 - 2022 Theme | view | compose.theme | {"name":"Office 2013 - 2022 Theme"} |
 item | Facet | view | compose.theme | {"name":"Facet"} |
 item | Gallery | view | compose.theme | {"name":"Gallery"} |
 item | Integral | view | compose.theme | {"name":"Integral"} |
 item | Ion | view | compose.theme | {"name":"Ion"} |
+item | Ion Boardroom | view | compose.theme | {"name":"Ion Boardroom"} |
 item | Organic | view | compose.theme | {"name":"Organic"} |
 item | Retrospect | view | compose.theme | {"name":"Retrospect"} |
 item | Slice | view | compose.theme | {"name":"Slice"} |
@@ -518,32 +578,79 @@ item | Browse for Themes... | folder-open | compose.theme | {"action":"browse"} 
 item | Save Current Theme... | save | compose.theme | {"action":"save"} | A
 
 menu themeColors
-item | Default | | compose.theme | {"part":"colors","name":"Default"} |
-item | Grayscale | | compose.theme | {"part":"colors","name":"Grayscale"} |
-item | Blue Warm | | compose.theme | {"part":"colors","name":"Blue Warm"} |
-item | Blue | | compose.theme | {"part":"colors","name":"Blue"} |
-item | Blue Green | | compose.theme | {"part":"colors","name":"Blue Green"} |
-item | Green | | compose.theme | {"part":"colors","name":"Green"} |
-item | Orange | | compose.theme | {"part":"colors","name":"Orange"} |
-item | Red | | compose.theme | {"part":"colors","name":"Red"} |
+item | Office | | compose.theme | {"part":"colors","name":"Office"} | | swatch=#1a6894
+item | Office 2013 - 2022 | | compose.theme | {"part":"colors","name":"Office 2013 - 2022"} | | swatch=#4276be
+item | Office 2007 - 2010 | | compose.theme | {"part":"colors","name":"Office 2007 - 2010"} | | swatch=#4b7cbb
+item | Grayscale | | compose.theme | {"part":"colors","name":"Grayscale"} | | swatch=#d9d9d9
+item | Blue Warm | | compose.theme | {"part":"colors","name":"Blue Warm"} | | swatch=#4b65aa
+item | Blue | | compose.theme | {"part":"colors","name":"Blue"} | | swatch=#1270c4
+item | Blue II | | compose.theme | {"part":"colors","name":"Blue II"} | | swatch=#20a9e0
+item | Blue Green | | compose.theme | {"part":"colors","name":"Blue Green"} | | swatch=#3592b6
+item | Green | | compose.theme | {"part":"colors","name":"Green"} | | swatch=#569b3c
+item | Green Yellow | | compose.theme | {"part":"colors","name":"Green Yellow"} | | swatch=#97c73b
+item | Yellow | | compose.theme | {"part":"colors","name":"Yellow"} | | swatch=#f8c412
+item | Yellow Orange | | compose.theme | {"part":"colors","name":"Yellow Orange"} | | swatch=#ec9f31
+item | Orange | | compose.theme | {"part":"colors","name":"Orange"} | | swatch=#e08216
+item | Orange Red | | compose.theme | {"part":"colors","name":"Orange Red"} | | swatch=#cf4a1b
+item | Red Orange | | compose.theme | {"part":"colors","name":"Red Orange"} | | swatch=#e34e25
+item | Red | | compose.theme | {"part":"colors","name":"Red"} | | swatch=#a13212
+item | Red Violet | | compose.theme | {"part":"colors","name":"Red Violet"} | | swatch=#dd3090
+item | Violet | | compose.theme | {"part":"colors","name":"Violet"} | | swatch=#aa85c3
+item | Violet II | | compose.theme | {"part":"colors","name":"Violet II"} | | swatch=#8f2a8d
+item | Median | | compose.theme | {"part":"colors","name":"Median"} | | swatch=#95b4cf
+item | Paper | | compose.theme | {"part":"colors","name":"Paper"} | | swatch=#a4b393
+item | Marquee | | compose.theme | {"part":"colors","name":"Marquee"} | | swatch=#438ab0
+item | Slipstream | | compose.theme | {"part":"colors","name":"Slipstream"} | | swatch=#5068c4
+item | Aspect | | compose.theme | {"part":"colors","name":"Aspect"} | | swatch=#eb800d
 sep
 item | Customize Colors... | settings | compose.theme | {"part":"colors","action":"customize"} | C
 
 menu themeFonts
-item | Default | | compose.theme | {"part":"fonts","name":"Default"} |
-item | Inter | | compose.theme | {"part":"fonts","name":"Inter"} |
-item | Liberation Sans | | compose.theme | {"part":"fonts","name":"Liberation Sans"} |
-item | Liberation Serif | | compose.theme | {"part":"fonts","name":"Liberation Serif"} |
+item | Office, Heading Font: Aptos Display, Body Font: Aptos | | compose.theme | {"part":"fonts","name":"Office"} |
+item | Office 2013 - 2022 | | compose.theme | {"part":"fonts","name":"Office 2013 - 2022"} |
+item | Office 2007 - 2010 | | compose.theme | {"part":"fonts","name":"Office 2007 - 2010"} |
+item | Calibri | | compose.theme | {"part":"fonts","name":"Calibri"} |
+item | Arial | | compose.theme | {"part":"fonts","name":"Arial"} |
+item | Corbel | | compose.theme | {"part":"fonts","name":"Corbel"} |
+item | Candara | | compose.theme | {"part":"fonts","name":"Candara"} |
+item | Franklin Gothic, Heading Font: Franklin Gothic Medium, Body Font: Franklin Gothic Book | | compose.theme | {"part":"fonts","name":"Franklin Gothic"} |
+item | Century Gothic | | compose.theme | {"part":"fonts","name":"Century Gothic"} |
+item | Tw Cen MT | | compose.theme | {"part":"fonts","name":"Tw Cen MT"} |
+item | Cambria | | compose.theme | {"part":"fonts","name":"Cambria"} |
+item | Garamond | | compose.theme | {"part":"fonts","name":"Garamond"} |
+item | Georgia | | compose.theme | {"part":"fonts","name":"Georgia"} |
+item | Century Schoolbook | | compose.theme | {"part":"fonts","name":"Century Schoolbook"} |
+item | Calibri-Cambria | | compose.theme | {"part":"fonts","name":"Calibri-Cambria"} |
+item | Arial-Times New Roman | | compose.theme | {"part":"fonts","name":"Arial-Times New Roman"} |
+item | Calibri Light-Constantia | | compose.theme | {"part":"fonts","name":"Calibri Light-Constantia"} |
+item | Century Gothic-Palatino Linotype | | compose.theme | {"part":"fonts","name":"Century Gothic-Palatino Linotype"} |
+item | Tw Cen MT-Rockwell | | compose.theme | {"part":"fonts","name":"Tw Cen MT-Rockwell"} |
+item | Times New Roman-Arial | | compose.theme | {"part":"fonts","name":"Times New Roman-Arial"} |
+item | Constantia-Franklin Gothic Book | | compose.theme | {"part":"fonts","name":"Constantia-Franklin Gothic Book"} |
+item | Consolas-Verdana | | compose.theme | {"part":"fonts","name":"Consolas-Verdana"} |
+item | Arial Black-Arial | | compose.theme | {"part":"fonts","name":"Arial Black-Arial"} |
+item | Garamond-TrebuchetMs | | compose.theme | {"part":"fonts","name":"Garamond-TrebuchetMs"} |
+item | Gill Sans MT | | compose.theme | {"part":"fonts","name":"Gill Sans MT"} |
+item | TrebuchetMs, Heading Font: Trebuchet MS, Body Font: Trebuchet MS | | compose.theme | {"part":"fonts","name":"TrebuchetMs"} |
 sep
 item | Customize Fonts... | settings | compose.theme | {"part":"fonts","action":"customize"} | C
 
 menu themeEffects
-item | Default | | compose.theme | {"part":"effects","name":"Default"} |
+item | Office | | compose.theme | {"part":"effects","name":"Office"} |
+item | Office 2007 - 2010 | | compose.theme | {"part":"effects","name":"Office 2007 - 2010"} |
 item | Subtle Solids | | compose.theme | {"part":"effects","name":"Subtle Solids"} |
 item | Banded Edge | | compose.theme | {"part":"effects","name":"Banded Edge"} |
+item | Smokey Glass | | compose.theme | {"part":"effects","name":"Smokey Glass"} |
 item | Glow Edge | | compose.theme | {"part":"effects","name":"Glow Edge"} |
+item | Grunge Texture | | compose.theme | {"part":"effects","name":"Grunge Texture"} |
+item | Frosted Glass | | compose.theme | {"part":"effects","name":"Frosted Glass"} |
 item | Top Shadow | | compose.theme | {"part":"effects","name":"Top Shadow"} |
 item | Inset | | compose.theme | {"part":"effects","name":"Inset"} |
+item | Milk Glass | | compose.theme | {"part":"effects","name":"Milk Glass"} |
+item | Riblet | | compose.theme | {"part":"effects","name":"Riblet"} |
+item | Reflection | | compose.theme | {"part":"effects","name":"Reflection"} |
+item | Extreme Shadow | | compose.theme | {"part":"effects","name":"Extreme Shadow"} |
+item | Glossy | | compose.theme | {"part":"effects","name":"Glossy"} |
 
 menu pageColor
 item | No Color | | compose.pageColor | {"color":null} | N

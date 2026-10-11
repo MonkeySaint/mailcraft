@@ -268,6 +268,14 @@ impl Store {
         self.user(address).filter(|u| u.password == password).map(|u| u.address.clone())
     }
 
+    /// The user whose password is `secret` (JMAP Bearer tokens in tests); `None` for an empty secret.
+    pub fn user_by_password(&self, secret: &str) -> Option<String> {
+        if secret.is_empty() {
+            return None;
+        }
+        self.users.values().find(|u| u.password == secret).map(|u| u.address.clone())
+    }
+
     fn new_uidvalidity(&mut self) -> u32 {
         let v = self.next_uidvalidity;
         self.next_uidvalidity = self.next_uidvalidity.checked_add(1).unwrap_or(1);

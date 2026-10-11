@@ -1,27 +1,32 @@
-//! Mail option dialogs: Reading Pane options, Junk Email Options, Message Options / Properties, and
-//! Signatures and Stationery (`signatures`).
+//! Mail option dialogs: Reading Pane options, Message Options / Properties, and Signatures and Stationery
+//! (`signatures`). Reading Pane and Stationery settings are engine settings (`mail.readingPane.*`,
+//! `mail.compose.font*`, saved with the profile). Junk Email Options are `super::junk`.
 
 mod signatures;
 
 use egui::{Context, RichText};
 use serde_json::{Value, json};
 
-use super::common::{self, Dlg, Out, btn_en, muted, ok_cancel, window, with_state};
+use super::common::{self, Dlg, Out, muted, ok_cancel, window, with_state};
 use crate::App;
 use mailcraft_model::{Importance, ItemId, Sensitivity};
 
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
         "readingPaneOptions" => reading_pane(ctx, app, d),
-        "junkOptions" => junk(ctx, app, d),
         "messageOptions" => message_options(ctx, app, d),
         "stationery" | "signatures" => signatures::show(ctx, app, d),
         _ => return None,
     })
 }
 
-fn pbool(ctx: &Context, key: &str, default: bool) -> bool {
-    common::pref(ctx, key).and_then(|v| v.as_bool()).unwrap_or(default)
+fn sbool(app: &App, key: &str) -> bool {
+    app.s.settings.bool(key)
+}
+
+/// Applies option values; an error (none expected from these controls) is shown in the dialog.
+fn save(app: &mut App, values: &[(&str, Value)]) -> Option<String> {
+    common::set_options(app, values)
 }
 
 #[derive(Clone, Default)]
@@ -32,20 +37,19 @@ struct PaneState {
     space: bool,
     portrait: bool,
     always_preview: bool,
+    error: Option<String>,
 }
 
 fn reading_pane(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let init = |_: &App| PaneState {
-        mark_viewed: pbool(ctx, "readingPane.markWhenViewed", false),
-        wait: common::pref(ctx, "readingPane.waitSeconds")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(5),
-        mark_change: pbool(ctx, "readingPane.markOnSelectionChange", true),
-        space: pbool(ctx, "readingPane.singleKey", true),
-        portrait: pbool(ctx, "readingPane.portraitFullScreen", false),
-        always_preview: pbool(ctx, "readingPane.alwaysPreview", true),
+    let init = |a: &App| PaneState {
+        mark_viewed: sbool(a, "mail.readingPane.markReadWhenViewed"),
+        wait: u32::try_from(a.s.settings.int("mail.readingPane.markReadAfterSeconds")).unwrap_or(5),
+        mark_change: sbool(a, "mail.readingPane.markReadOnSelectionChange"),
+        space: sbool(a, "mail.readingPane.spaceBarReading"),
+        portrait: sbool(a, "mail.readingPane.portraitFullScreen"),
+        always_preview: sbool(a, "mail.readingPane.alwaysPreview"),
+        error: None,
     };
     with_state(ctx, app, uid, init, |st, app| {
         window(ctx, app, d, "Reading Pane", 440.0, |ui, app| {
@@ -62,154 +66,24 @@ fn reading_pane(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             ui.checkbox(&mut st.space, "Single key reading using space bar");
             ui.checkbox(&mut st.portrait, "Turn on automatic full-screen reading in portrait orientation");
             ui.checkbox(&mut st.always_preview, "Always preview messages");
-            match ok_cancel(ui, app, true) {
-                Some(true) => {
-                    common::set_pref(ctx, "readingPane.markWhenViewed", json!(st.mark_viewed));
-                    common::set_pref(ctx, "readingPane.waitSeconds", json!(st.wait));
-                    common::set_pref(ctx, "readingPane.markOnSelectionChange", json!(st.mark_change));
-                    common::set_pref(ctx, "readingPane.singleKey", json!(st.space));
-                    common::set_pref(ctx, "readingPane.portraitFullScreen", json!(st.portrait));
-                    common::set_pref(ctx, "readingPane.alwaysPreview", json!(st.always_preview));
-                    Out::Close
-                }
-                Some(false) => Out::Close,
-                None => Out::Keep,
-            }
-        })
-    })
-}
-
-// ---------------------------------------------------------------------------------------------------------
-
-const JUNK_TABS: [&str; 5] =
-    ["Options", "Safe Senders", "Safe Recipients", "Blocked Senders", "International"];
-const JUNK_LISTS: [&str; 3] = ["junk.safeSenders", "junk.safeRecipients", "junk.blockedSenders"];
-
-#[derive(Clone, Default)]
-struct JunkState {
-    tab: usize,
-    level: usize,
-    delete: bool,
-    links: bool,
-    warn: bool,
-    lists: [Vec<String>; 3],
-    entry: String,
-    selected: Option<usize>,
-    trust_contacts: bool,
-}
-
-fn list_pref(ctx: &Context, key: &str) -> Vec<String> {
-    common::pref(ctx, key)
-        .and_then(|v| v.as_array().cloned())
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-        .unwrap_or_default()
-}
-
-fn junk(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let init = |_: &App| JunkState {
-        level: common::pref(ctx, "junk.level")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(1),
-        delete: pbool(ctx, "junk.deleteInstead", false),
-        links: pbool(ctx, "junk.disableLinks", true),
-        warn: pbool(ctx, "junk.warnDomains", true),
-        trust_contacts: pbool(ctx, "junk.trustContacts", true),
-        lists: [list_pref(ctx, JUNK_LISTS[0]), list_pref(ctx, JUNK_LISTS[1]), list_pref(ctx, JUNK_LISTS[2])],
-        ..Default::default()
-    };
-    with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Junk Email Options", 520.0, |ui, app| {
-            ui.horizontal(|ui| {
-                for (i, t) in JUNK_TABS.iter().enumerate() {
-                    if ui.selectable_label(st.tab == i, *t).clicked() {
-                        st.tab = i;
-                        st.selected = None;
-                    }
-                }
-            });
-            ui.separator();
-            match st.tab {
-                0 => {
-                    muted(ui, app, "Messages that look like junk can be moved to the Junk Email folder.");
-                    ui.label("Choose the level of junk email protection you want:");
-                    for (i, t) in [
-                        "No Automatic Filtering. Mail from blocked senders is still moved to the Junk Email folder.",
-                        "Low: Move the most obvious junk email to the Junk Email folder.",
-                        "High: Most junk email is caught, but some regular mail may be caught as well.",
-                        "Safe Lists Only: Only mail from people or domains on your Safe Senders List or Safe Recipients List is delivered to your Inbox.",
-                    ]
-                    .iter()
-                    .enumerate()
-                    {
-                        ui.radio_value(&mut st.level, i, *t);
-                    }
-                    ui.checkbox(&mut st.delete, "Permanently delete suspected junk email instead of moving it to the Junk Email folder");
-                    ui.checkbox(&mut st.links, "Disable links and other functionality in phishing messages");
-                    ui.checkbox(&mut st.warn, "Warn me about suspicious domain names in email addresses");
-                }
-                1..=3 => {
-                    let idx = st.tab - 1;
-                    if idx == 0 {
-                        ui.checkbox(&mut st.trust_contacts, "Also trust email from my Contacts");
-                    }
-                    ui.horizontal_top(|ui| {
-                        egui::Frame::new()
-                            .stroke(egui::Stroke::new(1.0, app.theme.separator))
-                            .inner_margin(4.0)
-                            .show(ui, |ui| {
-                                ui.set_width(300.0);
-                                ui.set_min_height(200.0);
-                                if let Some(list) = st.lists.get(idx) {
-                                    for (i, e) in list.iter().enumerate() {
-                                        if ui.selectable_label(st.selected == Some(i), e).clicked() {
-                                            st.selected = Some(i);
-                                        }
-                                    }
-                                }
-                            });
-                        ui.vertical(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut st.entry)
-                                    .hint_text("name@example.com or @example.com")
-                                    .desired_width(170.0),
-                            );
-                            if btn_en(ui, !st.entry.trim().is_empty(), "Add...") {
-                                let e = st.entry.trim().to_lowercase();
-                                if let Some(list) = st.lists.get_mut(idx)
-                                    && !list.contains(&e)
-                                {
-                                    list.push(e);
-                                    list.sort();
-                                }
-                                st.entry.clear();
-                            }
-                            if btn_en(ui, st.selected.is_some(), "Remove")
-                                && let (Some(i), Some(list)) = (st.selected.take(), st.lists.get_mut(idx))
-                                && i < list.len()
-                            {
-                                list.remove(i);
-                            }
-                        });
-                    });
-                }
-                _ => {
-                    muted(ui, app, "Block messages by top-level domain or encoding: nothing is blocked.");
-                    ui.add_space(120.0);
-                }
+            if let Some(e) = &st.error {
+                muted(ui, app, e);
             }
             match ok_cancel(ui, app, true) {
                 Some(true) => {
-                    common::set_pref(ctx, "junk.level", json!(st.level));
-                    common::set_pref(ctx, "junk.deleteInstead", json!(st.delete));
-                    common::set_pref(ctx, "junk.disableLinks", json!(st.links));
-                    common::set_pref(ctx, "junk.warnDomains", json!(st.warn));
-                    common::set_pref(ctx, "junk.trustContacts", json!(st.trust_contacts));
-                    for (k, l) in JUNK_LISTS.iter().zip(st.lists.iter()) {
-                        common::set_pref(ctx, k, json!(l));
-                    }
-                    Out::Close
+                    st.error = save(
+                        app,
+                        &[
+                            ("mail.readingPane.markReadWhenViewed", json!(st.mark_viewed)),
+                            ("mail.readingPane.markReadAfterSeconds", json!(st.wait)),
+                            ("mail.readingPane.markReadOnSelectionChange", json!(st.mark_change)),
+                            ("mail.readingPane.spaceBarReading", json!(st.space)),
+                            ("mail.readingPane.portraitFullScreen", json!(st.portrait)),
+                            ("mail.readingPane.alwaysPreview", json!(st.always_preview)),
+                        ],
+                    );
+                    common::sync_mirror(ctx, app);
+                    if st.error.is_some() { Out::Keep } else { Out::Close }
                 }
                 Some(false) => Out::Close,
                 None => Out::Keep,

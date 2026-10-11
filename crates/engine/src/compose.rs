@@ -120,11 +120,16 @@ pub enum SaveSentTo {
 
 /// Document theme choices applied to the draft (Options › Themes).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ThemeState {
     pub name: Option<String>,
     pub colors: Option<String>,
     pub fonts: Option<String>,
     pub effects: Option<String>,
+    /// Colours made with Customize Colors (used while `colors` names them).
+    pub custom_colors: Option<CustomColors>,
+    /// Fonts made with Customize Fonts (used while `fonts` names them).
+    pub custom_fonts: Option<CustomFonts>,
 }
 
 /// The signature block currently in the body (so a new choice replaces it).
@@ -203,6 +208,9 @@ pub struct EditSnapshot {
     pub selection: BodySelection,
     /// The signature block the body held (so Undo of a signature change restores which one it is).
     pub signature: Option<SignatureBlock>,
+    /// List formats (and the list count they were anchored at).
+    pub list_formats: Vec<ListFormatEntry>,
+    pub list_count: usize,
 }
 
 /// Letter-case rewrite kinds (Change Case).
@@ -277,6 +285,8 @@ pub struct ComposeState {
     pub flag: FlagState,
     /// Voting button choices ("Yes;No"), empty = none.
     pub voting: String,
+    /// This compose answers a voting message with this choice (sent as the vote header).
+    pub vote_response: Option<String>,
     pub save_sent: SaveSentTo,
     pub encrypt: bool,
     pub theme: ThemeState,
@@ -295,6 +305,10 @@ pub struct ComposeState {
     /// In-app clipboard history (newest last).
     pub clipboard: Vec<ClipEntry>,
     pub building_blocks: Vec<BuildingBlock>,
+    /// Marker formats of the body's lists (see [`ListFormatEntry`]).
+    pub list_formats: Vec<ListFormatEntry>,
+    /// Number of lists in the body when `list_formats` was last anchored.
+    pub list_count: usize,
     pub painter: Option<PainterState>,
     pub editor: EditorFlags,
     pub last_font_color: Option<Color>,
@@ -501,6 +515,8 @@ impl ComposeState {
             body: self.body.clone(),
             selection: self.selection.clone(),
             signature: self.signature.clone(),
+            list_formats: self.list_formats.clone(),
+            list_count: self.list_count,
         }
     }
 
@@ -510,11 +526,14 @@ impl ComposeState {
             body: std::mem::replace(&mut self.body, snap.body),
             selection: std::mem::replace(&mut self.selection, snap.selection),
             signature: std::mem::replace(&mut self.signature, snap.signature),
+            list_formats: std::mem::replace(&mut self.list_formats, snap.list_formats),
+            list_count: std::mem::replace(&mut self.list_count, snap.list_count),
         }
     }
 
     /// Records an editor undo step (call before changing the body).
     pub fn checkpoint(&mut self) {
+        self.sync_list_formats();
         self.mark_edited();
         self.edit_undo.push(self.snapshot());
         if self.edit_undo.len() > MAX_EDIT_UNDO {
@@ -533,6 +552,7 @@ impl ComposeState {
             && self.edit_run.as_ref().is_some_and(|(k, at, rev)| {
                 Some(*k) == run && *at == self.selection.focus && *rev == self.edit_rev
             });
+        self.sync_list_formats();
         let before = self.snapshot();
         let dirty = self.dirty;
         f(self);
@@ -3763,6 +3783,1608 @@ pub fn align_of(kind: &str) -> Option<Align> {
         "justify" => Some(Align::Justify),
         _ => None,
     }
+}
+
+// =======================================================================================================
+// Document themes (Options › Themes: colors, fonts, effects) and style sets (Format Text › Change Styles)
+// =======================================================================================================
+
+/// Theme colour slots, in order: Text/Background dark 1, light 1, dark 2, light 2, Accent 1–6, Hyperlink,
+/// Followed Hyperlink.
+pub const THEME_COLOR_SLOTS: [&str; 12] = [
+    "Text/Background - Dark 1",
+    "Text/Background - Light 1",
+    "Text/Background - Dark 2",
+    "Text/Background - Light 2",
+    "Accent 1",
+    "Accent 2",
+    "Accent 3",
+    "Accent 4",
+    "Accent 5",
+    "Accent 6",
+    "Hyperlink",
+    "Followed Hyperlink",
+];
+
+/// Index of Accent 1 in a palette.
+pub const ACCENT1: usize = 4;
+
+/// Colour sets (Options › Colors). Palettes drawn for MailCraft (names as observed); each is
+/// dark 1, light 1, dark 2, light 2, accents 1–6, hyperlink, followed hyperlink.
+pub const THEME_COLOR_SETS: &[(&str, [u32; 12])] = &[
+    (
+        "Office",
+        [
+            0x000000, 0xffffff, 0x14324a, 0xe8edf1, 0x1a6894, 0xd8742a, 0x2f8a46, 0x2a9ad4, 0x93398b,
+            0x5a9e38, 0x1f62b8, 0x7a4c9e,
+        ],
+    ),
+    (
+        "Office 2013 - 2022",
+        [
+            0x000000, 0xffffff, 0x3b4658, 0xe9e7e2, 0x4276be, 0xdd7834, 0x9a9a9a, 0xefbb21, 0x5a8dcc,
+            0x6aa346, 0x2b5fc4, 0x8b4ea6,
+        ],
+    ),
+    (
+        "Office 2007 - 2010",
+        [
+            0x000000, 0xffffff, 0x223b5b, 0xeeeadd, 0x4b7cbb, 0xbf4f4b, 0x98b85a, 0x7d63a0, 0x47a5c2,
+            0xf09943, 0x2350be, 0x7b4096,
+        ],
+    ),
+    (
+        "Grayscale",
+        [
+            0x000000, 0xffffff, 0x101010, 0xf1f1f1, 0xd9d9d9, 0xb0b0b0, 0x949494, 0x7e7e7e, 0x5d5d5d,
+            0x4b4b4b, 0x5d5d5d, 0x8f8f8f,
+        ],
+    ),
+    (
+        "Blue Warm",
+        [
+            0x000000, 0xffffff, 0x23334f, 0xdde3eb, 0x4b65aa, 0x6b8ac9, 0xa3b7dd, 0x3c5a96, 0x7a6db2,
+            0x9b88c5, 0x3e6fc0, 0x8869b4,
+        ],
+    ),
+    (
+        "Blue",
+        [
+            0x000000, 0xffffff, 0x183f6b, 0xdcedf8, 0x1270c4, 0x0b9bd6, 0x12c8d4, 0x15c897, 0x79c560,
+            0xa2bf4a, 0x0e72d0, 0x6a59b8,
+        ],
+    ),
+    (
+        "Blue II",
+        [
+            0x000000, 0xffffff, 0x345a72, 0xe0e4e6, 0x20a9e0, 0x2881c2, 0x2bc8d2, 0x45b594, 0x418653,
+            0x649f9b, 0x1f86d0, 0x5b6fa8,
+        ],
+    ),
+    (
+        "Blue Green",
+        [
+            0x000000, 0xffffff, 0x383646, 0xd0dbe5, 0x3592b6, 0x5ab3bd, 0x77baa5, 0x7b8a8c, 0x86aab3,
+            0x2c82c1, 0x2a7fc0, 0x6c7f99,
+        ],
+    ),
+    (
+        "Green",
+        [
+            0x000000, 0xffffff, 0x465e51, 0xe2ddd0, 0x569b3c, 0x88b436, 0xbccb3c, 0x0b9275, 0x4db1c0,
+            0x0f88ad, 0x1d79b2, 0x5f7f93,
+        ],
+    ),
+    (
+        "Green Yellow",
+        [
+            0x000000, 0xffffff, 0x465e51, 0xe8eed8, 0x97c73b, 0x63a13a, 0x3aa46e, 0x46bea1, 0x50b0cb,
+            0x53bff4, 0x2f9bd8, 0x6b8f6e,
+        ],
+    ),
+    (
+        "Yellow",
+        [
+            0x000000, 0xffffff, 0x3a312b, 0xe4dddb, 0xf8c412, 0xf38f21, 0xc98a40, 0xe76f1a, 0xe14927,
+            0x996a6a, 0xc06a1c, 0x8a5e4b,
+        ],
+    ),
+    (
+        "Yellow Orange",
+        [
+            0x000000, 0xffffff, 0x4d3b31, 0xfaedca, 0xec9f31, 0xa26450, 0xb28a80, 0xc0966e, 0x9e9476,
+            0xbd752d, 0xb0661e, 0x84603f,
+        ],
+    ),
+    (
+        "Orange",
+        [
+            0x000000, 0xffffff, 0x626f53, 0xcddbe8, 0xe08216, 0xba592e, 0x845642, 0x998259, 0xbfb980,
+            0x939f89, 0xc96c12, 0x7c6a52,
+        ],
+    ),
+    (
+        "Orange Red",
+        [
+            0x000000, 0xffffff, 0x686363, 0xe8e4dc, 0xcf4a1b, 0x982e21, 0xa08d6b, 0x936252, 0x8f8486,
+            0x845e5e, 0xb5401a, 0x7e5a5a,
+        ],
+    ),
+    (
+        "Red Orange",
+        [
+            0x000000, 0xffffff, 0x504f47, 0xedebe2, 0xe34e25, 0xfab949, 0xb34a28, 0xf9842a, 0xc89a08,
+            0xae2804, 0xc84422, 0x80583e,
+        ],
+    ),
+    (
+        "Red",
+        [
+            0x000000, 0xffffff, 0x333232, 0xe4c046, 0xa13212, 0xd15a19, 0xdc9728, 0xae9b7e, 0x7e5f53,
+            0xae7d4b, 0x9e3618, 0x7b5848,
+        ],
+    ),
+    (
+        "Red Violet",
+        [
+            0x000000, 0xffffff, 0x464552, 0xd9d9dc, 0xdd3090, 0xc432c8, 0x50a4d8, 0x4975e2, 0x8a72dc,
+            0xd04a74, 0x4a6ed8, 0x9a52a8,
+        ],
+    ),
+    (
+        "Violet",
+        [
+            0x000000, 0xffffff, 0x383646, 0xdbd8dc, 0xaa85c3, 0x8886c4, 0x5f7398, 0x6b96ac, 0x86aab3,
+            0x718084, 0x6a6bc0, 0x8a6c9a,
+        ],
+    ),
+    (
+        "Violet II",
+        [
+            0x000000, 0xffffff, 0x612f61, 0xe9e5ea, 0x8f2a8d, 0x9858ce, 0x765fd4, 0x6760b4, 0x48a3e8,
+            0x5b82d6, 0x6a52c8, 0x8d4f8a,
+        ],
+    ),
+    (
+        "Median",
+        [
+            0x000000, 0xffffff, 0x765f56, 0xeadcc4, 0x95b4cf, 0xd8814a, 0xa4a982, 0xd4b05e, 0x7da59c,
+            0x958b8b, 0x5b88b8, 0x8a7a72,
+        ],
+    ),
+    (
+        "Paper",
+        [
+            0x000000, 0xffffff, 0x454c28, 0xfdf9ca, 0xa4b393, 0xefa349, 0xe2b92c, 0xcc93a6, 0x9b86bd,
+            0x819dc0, 0x6b8a3a, 0x8c7a4c,
+        ],
+    ),
+    (
+        "Marquee",
+        [
+            0x000000, 0xffffff, 0x5d5d5d, 0xdcdcdc, 0x438ab0, 0xa4b42a, 0xf09103, 0x828282, 0xf9c10a,
+            0xd95429, 0x2f78ba, 0x7a6a8a,
+        ],
+    ),
+    (
+        "Slipstream",
+        [
+            0x000000, 0xffffff, 0x222744, 0xb6dbf7, 0x5068c4, 0x60c9ef, 0xa5e555, 0x5fcbad, 0xfa8125,
+            0xec4327, 0x3a64d0, 0x6e5aa8,
+        ],
+    ),
+    (
+        "Aspect",
+        [
+            0x000000, 0xffffff, 0x333232, 0xe2ddd2, 0xeb800d, 0x9c2a37, 0x1d577a, 0x508344, 0x624977,
+            0xbc985b, 0x2a63a8, 0x7c5a80,
+        ],
+    ),
+    // Palettes of the named themes (not offered in the Colors gallery on their own).
+    (
+        "Facet",
+        [
+            0x000000, 0xffffff, 0x2b3a1f, 0xeef3e5, 0x8cb63c, 0x2f9b6b, 0x43a0c7, 0x7e6fb3, 0xd45a7a,
+            0xe9a23b, 0x4a8bc8, 0x7c6a9e,
+        ],
+    ),
+    (
+        "Gallery",
+        [
+            0x000000, 0xffffff, 0x3a2f2c, 0xebe6e2, 0xb83d36, 0xd77d39, 0xa8a145, 0x6f8e72, 0x5d7f9c,
+            0x8a6b8f, 0x3d6fa0, 0x7d5b78,
+        ],
+    ),
+    (
+        "Integral",
+        [
+            0x000000, 0xffffff, 0x2d3b47, 0xe4eaee, 0x1d97b8, 0x47b7a8, 0x6fbf6c, 0xa9c24f, 0xe0a83a,
+            0xd9643a, 0x2283bf, 0x6f7f9e,
+        ],
+    ),
+    (
+        "Ion",
+        [
+            0x000000, 0xffffff, 0x1f4b4a, 0xdcefee, 0x0fa59d, 0x39b8d6, 0x8f6cc9, 0xe26a8f, 0xf2a43c,
+            0x8cb346, 0x1c8bc4, 0x6a5ab0,
+        ],
+    ),
+    (
+        "Ion Boardroom",
+        [
+            0x000000, 0xffffff, 0x2e2a54, 0xe2e0f0, 0x4b5fc2, 0x8d58c0, 0x3ea3d5, 0x46b58f, 0xe2903d,
+            0xd34e6a, 0x3f6fd6, 0x7a58b0,
+        ],
+    ),
+    (
+        "Organic",
+        [
+            0x000000, 0xffffff, 0x3c4a28, 0xf1eee0, 0x7c9a3c, 0xb5833f, 0x8e6447, 0x5f8f8a, 0xc0a54c,
+            0x9c4f3f, 0x4a7a9a, 0x7f6a52,
+        ],
+    ),
+    (
+        "Retrospect",
+        [
+            0x000000, 0xffffff, 0x4a3a2f, 0xf2ece4, 0xd98236, 0x8f9f9a, 0x6a8fa8, 0xb9a26b, 0xa65f4e,
+            0x6d7b5a, 0x4b78a6, 0x8a6a5a,
+        ],
+    ),
+    (
+        "Slice",
+        [
+            0x000000, 0xffffff, 0x1d2f45, 0xe0e8f1, 0x0b74c4, 0x3fa9d8, 0x22b3a6, 0x7ac24c, 0xf0b33c,
+            0xe46a3d, 0x1477d0, 0x6a5ab8,
+        ],
+    ),
+    (
+        "Wisp",
+        [
+            0x000000, 0xffffff, 0x3f3a2f, 0xf4f0e6, 0xa45f3c, 0xc69a3f, 0x8aa54d, 0x5b8c86, 0x6a74a6,
+            0x9c5f89, 0x4a74a8, 0x8a6a6a,
+        ],
+    ),
+];
+
+/// Number of colour sets shown in the Colors gallery (the rest belong to named themes).
+pub const COLOR_GALLERY_LEN: usize = 24;
+
+/// Font sets (Options › Fonts): name, heading font, body font. Proprietary names map to bundled
+/// substitutes when rendered (`mailcraft-fonts`).
+pub const THEME_FONT_SETS: &[(&str, &str, &str)] = &[
+    ("Office", "Aptos Display", "Aptos"),
+    ("Office 2013 - 2022", "Calibri Light", "Calibri"),
+    ("Office 2007 - 2010", "Cambria", "Calibri"),
+    ("Calibri", "Calibri", "Calibri"),
+    ("Arial", "Arial", "Arial"),
+    ("Corbel", "Corbel", "Corbel"),
+    ("Candara", "Candara", "Candara"),
+    ("Franklin Gothic", "Franklin Gothic Medium", "Franklin Gothic Book"),
+    ("Century Gothic", "Century Gothic", "Century Gothic"),
+    ("Tw Cen MT", "Tw Cen MT", "Tw Cen MT"),
+    ("Cambria", "Cambria", "Cambria"),
+    ("Garamond", "Garamond", "Garamond"),
+    ("Georgia", "Georgia", "Georgia"),
+    ("Century Schoolbook", "Century Schoolbook", "Century Schoolbook"),
+    ("Calibri-Cambria", "Calibri", "Cambria"),
+    ("Arial-Times New Roman", "Arial", "Times New Roman"),
+    ("Calibri Light-Constantia", "Calibri Light", "Constantia"),
+    ("Century Gothic-Palatino Linotype", "Century Gothic", "Palatino Linotype"),
+    ("Tw Cen MT-Rockwell", "Tw Cen MT", "Rockwell"),
+    ("Times New Roman-Arial", "Times New Roman", "Arial"),
+    ("Constantia-Franklin Gothic Book", "Constantia", "Franklin Gothic Book"),
+    ("Consolas-Verdana", "Consolas", "Verdana"),
+    ("Arial Black-Arial", "Arial Black", "Arial"),
+    ("Garamond-TrebuchetMs", "Garamond", "Trebuchet MS"),
+    ("Gill Sans MT", "Gill Sans MT", "Gill Sans MT"),
+    ("TrebuchetMs", "Trebuchet MS", "Trebuchet MS"),
+];
+
+/// Effect sets (Options › Effects), as observed.
+pub const THEME_EFFECTS: &[&str] = &[
+    "Office",
+    "Office 2007 - 2010",
+    "Subtle Solids",
+    "Banded Edge",
+    "Smokey Glass",
+    "Glow Edge",
+    "Grunge Texture",
+    "Frosted Glass",
+    "Top Shadow",
+    "Inset",
+    "Milk Glass",
+    "Riblet",
+    "Reflection",
+    "Extreme Shadow",
+    "Glossy",
+];
+
+/// Named themes (Options › Themes): name, colour set, font set, effect set.
+pub const THEMES: &[(&str, &str, &str, &str)] = &[
+    ("Office", "Office", "Office", "Office"),
+    ("Office 2013 - 2022 Theme", "Office 2013 - 2022", "Office 2013 - 2022", "Office"),
+    ("Facet", "Facet", "TrebuchetMs", "Subtle Solids"),
+    ("Gallery", "Gallery", "Gill Sans MT", "Banded Edge"),
+    ("Integral", "Integral", "Tw Cen MT", "Top Shadow"),
+    ("Ion", "Ion", "Century Gothic", "Glow Edge"),
+    ("Ion Boardroom", "Ion Boardroom", "Century Gothic", "Glossy"),
+    ("Organic", "Organic", "Garamond", "Grunge Texture"),
+    ("Retrospect", "Retrospect", "Calibri Light-Constantia", "Inset"),
+    ("Slice", "Slice", "Century Gothic-Palatino Linotype", "Frosted Glass"),
+    ("Wisp", "Wisp", "Century Schoolbook", "Milk Glass"),
+];
+
+/// Case-insensitive lookup of `name` in a name-keyed table (accepts the "Office 2013 - 2022 Theme" /
+/// "Office 2013 - 2022" spellings and "Default" for Office).
+fn lookup<'a, T>(table: &'a [T], name: &str, key: impl Fn(&T) -> &str) -> Option<&'a T> {
+    let n = name.trim();
+    let n = if n.eq_ignore_ascii_case("default") { "Office" } else { n };
+    table.iter().find(|t| key(t).eq_ignore_ascii_case(n)).or_else(|| {
+        let stripped = n.trim_end_matches(" Theme").trim();
+        table.iter().find(|t| key(t).trim_end_matches(" Theme").eq_ignore_ascii_case(stripped))
+    })
+}
+
+/// The colour palette named `name`.
+pub fn color_set(name: &str) -> Option<[Color; 12]> {
+    lookup(THEME_COLOR_SETS, name, |t| t.0).map(|(_, v)| v.map(Color::hex))
+}
+
+/// (heading, body) fonts of the font set named `name`.
+pub fn font_set(name: &str) -> Option<(&'static str, &'static str)> {
+    lookup(THEME_FONT_SETS, name, |t| t.0).map(|(_, h, b)| (*h, *b))
+}
+
+/// The effect set named `name` (canonical spelling).
+pub fn effect_set(name: &str) -> Option<&'static str> {
+    lookup(THEME_EFFECTS, name, |t| t).copied()
+}
+
+/// The theme named `name`: (name, colours, fonts, effects).
+pub fn named_theme(name: &str) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    lookup(THEMES, name, |t| t.0).copied()
+}
+
+/// Custom colours saved with Customize Colors.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomColors {
+    pub name: String,
+    pub colors: Vec<Color>,
+}
+
+/// Custom fonts saved with Customize Fonts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomFonts {
+    pub name: String,
+    pub heading: String,
+    pub body: String,
+}
+
+/// A theme with every part resolved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedTheme {
+    pub colors: [Color; 12],
+    pub heading_font: String,
+    pub body_font: String,
+    pub effects: &'static str,
+}
+
+impl ResolvedTheme {
+    /// Colour of slot `i` (black when out of range).
+    pub fn color(&self, i: usize) -> Color {
+        self.colors.get(i).copied().unwrap_or(Color::BLACK)
+    }
+}
+
+impl ThemeState {
+    /// The palette, fonts and effects this state selects (Office for anything unset or unknown).
+    pub fn resolve(&self) -> ResolvedTheme {
+        let theme = self.name.as_deref().and_then(named_theme);
+        let colors = self
+            .custom_colors
+            .as_ref()
+            .filter(|c| self.colors.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&c.name)))
+            .and_then(|c| <[Color; 12]>::try_from(c.colors.clone()).ok())
+            .or_else(|| self.colors.as_deref().and_then(color_set))
+            .or_else(|| theme.and_then(|t| color_set(t.1)))
+            .or_else(|| color_set("Office"))
+            .unwrap_or([Color::BLACK; 12]);
+        let custom_fonts = self
+            .custom_fonts
+            .as_ref()
+            .filter(|c| self.fonts.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&c.name)))
+            .map(|c| (c.heading.clone(), c.body.clone()));
+        let (heading_font, body_font) = custom_fonts
+            .or_else(|| {
+                self.fonts
+                    .as_deref()
+                    .and_then(font_set)
+                    .or_else(|| theme.and_then(|t| font_set(t.2)))
+                    .map(|(h, b)| (h.to_owned(), b.to_owned()))
+            })
+            .unwrap_or_else(|| ("Aptos Display".to_owned(), "Aptos".to_owned()));
+        let effects =
+            self.effects.as_deref().and_then(effect_set).or_else(|| theme.map(|t| t.3)).unwrap_or("Office");
+        ResolvedTheme { colors, heading_font, body_font, effects }
+    }
+}
+
+/// A style set (Format Text › Change Styles › Style Set): how headings look and how far paragraphs are
+/// spaced. Sizes in points for heading levels 1–3 (4–6 use the level-3 size).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StyleSet {
+    pub name: &'static str,
+    pub sizes: [f32; 3],
+    pub bold: bool,
+    /// Theme colour slot for heading text (`None` = automatic / Dark 1).
+    pub color: Option<usize>,
+    pub italic: bool,
+    /// Headings centred.
+    pub centered: bool,
+    /// Heading 1 shaded with Accent 1 and set in white.
+    pub shaded: bool,
+    /// Paragraph space after (pt) and line height multiple for body paragraphs.
+    pub space_after_pt: f32,
+    pub line_height: f32,
+}
+
+/// Style sets drawn for MailCraft (names as observed).
+pub const STYLE_SETS: &[StyleSet] = &[
+    StyleSet {
+        name: "Default",
+        sizes: [20.0, 16.0, 14.0],
+        bold: false,
+        color: Some(ACCENT1),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.08,
+    },
+    StyleSet {
+        name: "Document",
+        sizes: [20.0, 16.0, 14.0],
+        bold: false,
+        color: Some(ACCENT1),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.08,
+    },
+    StyleSet {
+        name: "Basic (Elegant)",
+        sizes: [18.0, 14.0, 12.0],
+        bold: false,
+        color: None,
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 10.0,
+        line_height: 1.15,
+    },
+    StyleSet {
+        name: "Basic (Simple)",
+        sizes: [18.0, 14.0, 12.0],
+        bold: true,
+        color: None,
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.15,
+    },
+    StyleSet {
+        name: "Basic (Stylish)",
+        sizes: [20.0, 15.0, 13.0],
+        bold: false,
+        color: Some(ACCENT1 + 1),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 10.0,
+        line_height: 1.2,
+    },
+    StyleSet {
+        name: "Black & White (Capitalized)",
+        sizes: [18.0, 14.0, 12.0],
+        bold: true,
+        color: None,
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.08,
+    },
+    StyleSet {
+        name: "Black & White (Classic)",
+        sizes: [20.0, 15.0, 13.0],
+        bold: true,
+        color: None,
+        italic: false,
+        centered: true,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.15,
+    },
+    StyleSet {
+        name: "Black & White (Numbered)",
+        sizes: [16.0, 14.0, 12.0],
+        bold: true,
+        color: None,
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 6.0,
+        line_height: 1.08,
+    },
+    StyleSet {
+        name: "Black & White (Word 2013)",
+        sizes: [16.0, 13.0, 12.0],
+        bold: false,
+        color: None,
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.08,
+    },
+    StyleSet {
+        name: "Casual",
+        sizes: [22.0, 16.0, 13.0],
+        bold: false,
+        color: Some(ACCENT1 + 1),
+        italic: true,
+        centered: false,
+        shaded: false,
+        space_after_pt: 10.0,
+        line_height: 1.2,
+    },
+    StyleSet {
+        name: "Centered",
+        sizes: [18.0, 14.0, 12.0],
+        bold: true,
+        color: Some(ACCENT1),
+        italic: false,
+        centered: true,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.15,
+    },
+    StyleSet {
+        name: "Lines (Distinctive)",
+        sizes: [20.0, 15.0, 13.0],
+        bold: true,
+        color: Some(ACCENT1),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.15,
+    },
+    StyleSet {
+        name: "Lines (Simple)",
+        sizes: [16.0, 13.0, 12.0],
+        bold: false,
+        color: Some(2),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.08,
+    },
+    StyleSet {
+        name: "Lines (Stylish)",
+        sizes: [20.0, 15.0, 13.0],
+        bold: false,
+        color: Some(ACCENT1),
+        italic: true,
+        centered: false,
+        shaded: false,
+        space_after_pt: 10.0,
+        line_height: 1.15,
+    },
+    StyleSet {
+        name: "Minimalist",
+        sizes: [16.0, 13.0, 12.0],
+        bold: false,
+        color: Some(2),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 12.0,
+        line_height: 1.25,
+    },
+    StyleSet {
+        name: "Shaded",
+        sizes: [16.0, 14.0, 12.0],
+        bold: true,
+        color: Some(ACCENT1),
+        italic: false,
+        centered: false,
+        shaded: true,
+        space_after_pt: 8.0,
+        line_height: 1.15,
+    },
+    StyleSet {
+        name: "Word",
+        sizes: [16.0, 13.0, 12.0],
+        bold: false,
+        color: Some(ACCENT1),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.08,
+    },
+    StyleSet {
+        name: "Word 2003",
+        sizes: [16.0, 14.0, 13.0],
+        bold: true,
+        color: None,
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 0.0,
+        line_height: 1.0,
+    },
+    StyleSet {
+        name: "Word 2010",
+        sizes: [14.0, 13.0, 11.0],
+        bold: true,
+        color: Some(ACCENT1),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 10.0,
+        line_height: 1.15,
+    },
+    StyleSet {
+        name: "Word 2013",
+        sizes: [16.0, 13.0, 12.0],
+        bold: false,
+        color: Some(ACCENT1),
+        italic: false,
+        centered: false,
+        shaded: false,
+        space_after_pt: 8.0,
+        line_height: 1.08,
+    },
+];
+
+/// The style set named `name`.
+pub fn style_set(name: &str) -> Option<&'static StyleSet> {
+    STYLE_SETS.iter().find(|s| s.name.eq_ignore_ascii_case(name.trim()))
+}
+
+/// Calls `f` on every block (depth-first, lists / quotes / containers / table cells included).
+fn for_each_block_mut(blocks: &mut [Block], depth: usize, f: &mut dyn FnMut(&mut Block)) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
+    for b in blocks.iter_mut() {
+        f(b);
+        match b {
+            Block::List { items, .. } => {
+                for item in items.iter_mut() {
+                    for_each_block_mut(item, depth.saturating_add(1), f);
+                }
+            }
+            Block::Quote { blocks } | Block::Container { blocks, .. } => {
+                for_each_block_mut(blocks, depth.saturating_add(1), f);
+            }
+            Block::Table { rows, .. } => {
+                for cell in rows.iter_mut().flatten() {
+                    for_each_block_mut(&mut cell.blocks, depth.saturating_add(1), f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Calls `f` on the style of every text run in `inlines` (links included).
+fn for_each_run_style(inlines: &mut [Inline], depth: usize, f: &mut dyn FnMut(&mut TextStyle)) {
+    if depth > MAX_INLINE_DEPTH {
+        return;
+    }
+    for i in inlines.iter_mut() {
+        match i {
+            Inline::Text { style, .. } => f(style),
+            Inline::Link { children, .. } => for_each_run_style(children, depth.saturating_add(1), f),
+            _ => {}
+        }
+    }
+}
+
+/// Font family name without fallbacks ("Aptos, sans-serif" → "Aptos").
+fn first_family(f: &str) -> &str {
+    f.split(',').next().unwrap_or(f).trim().trim_matches(['"', '\''])
+}
+
+impl ComposeState {
+    /// The theme in effect (palette, fonts, effects).
+    pub fn theme_resolved(&self) -> ResolvedTheme {
+        self.theme.resolve()
+    }
+
+    /// The style set in effect, if one was chosen.
+    pub fn style_set_def(&self) -> Option<&'static StyleSet> {
+        self.style_set.as_deref().and_then(style_set)
+    }
+
+    /// Character formatting a heading of `level` gets from the theme and the style set: the theme's heading
+    /// font, plus size, weight and colour from the style set when one is chosen.
+    pub fn heading_text_style(&self, level: u8) -> TextStyle {
+        let theme = self.theme_resolved();
+        let mut st = TextStyle { font_family: Some(theme.heading_font.clone()), ..Default::default() };
+        if let Some(set) = self.style_set_def() {
+            let i = usize::from(level.clamp(1, 3)).saturating_sub(1);
+            st.size_pt = set.sizes.get(i).copied();
+            st.bold = Some(set.bold);
+            st.italic = set.italic.then_some(true);
+            st.color = Some(if set.shaded && level == 1 {
+                theme.color(1)
+            } else {
+                set.color.map_or(theme.color(0), |slot| theme.color(slot))
+            });
+        }
+        st
+    }
+
+    /// Re-applies theme fonts and colours after the theme changed from `before`: runs, paragraph shading and
+    /// cell backgrounds that use a colour of the old palette take the colour in the same slot of the new one;
+    /// runs set in the old heading / body font take the new ones; headings get the new heading font; the
+    /// body's default font becomes the new body font.
+    pub fn retheme(&mut self, before: &ResolvedTheme) {
+        let after = self.theme_resolved();
+        let map_color = |c: &mut Option<Color>| {
+            if let Some(col) = c.as_mut()
+                && let Some(i) = before.colors.iter().position(|x| x == col)
+                && let Some(n) = after.colors.get(i)
+            {
+                *col = *n;
+            }
+        };
+        let map_font = |f: &mut Option<String>, heading: bool| {
+            let cur = f.as_deref().map(first_family);
+            let new = match cur {
+                Some(c) if c.eq_ignore_ascii_case(&before.heading_font) => Some(after.heading_font.clone()),
+                Some(c) if c.eq_ignore_ascii_case(&before.body_font) => Some(after.body_font.clone()),
+                None if heading => Some(after.heading_font.clone()),
+                _ => None,
+            };
+            if let Some(n) = new {
+                *f = Some(n);
+            }
+        };
+        for_each_block_mut(&mut self.body.blocks, 0, &mut |b| match b {
+            Block::Heading { style, inlines, .. } => {
+                map_color(&mut style.background);
+                for_each_run_style(inlines, 0, &mut |st| {
+                    map_color(&mut st.color);
+                    map_font(&mut st.font_family, true);
+                });
+            }
+            Block::Paragraph { style, inlines } => {
+                map_color(&mut style.background);
+                for_each_run_style(inlines, 0, &mut |st| {
+                    map_color(&mut st.color);
+                    map_font(&mut st.font_family, false);
+                });
+            }
+            Block::Container { style, .. } => map_color(&mut style.background),
+            Block::Table { rows, .. } => {
+                for cell in rows.iter_mut().flatten() {
+                    map_color(&mut cell.background);
+                }
+            }
+            _ => {}
+        });
+        self.body.base.font_family = Some(after.body_font.clone());
+        self.dirty = true;
+    }
+
+    /// Applies the chosen style set to every heading and body paragraph (sizes, weight, colour, centring and
+    /// shading of headings; paragraph spacing). `previous` is the set that was in effect, whose
+    /// heading formatting is replaced.
+    pub fn apply_style_set(&mut self) {
+        let Some(set) = self.style_set_def().copied() else {
+            return;
+        };
+        let theme = self.theme_resolved();
+        let styles: Vec<TextStyle> = (1..=6).map(|l| self.heading_text_style(l)).collect();
+        let after_px = set.space_after_pt * 96.0 / 72.0;
+        for_each_block_mut(&mut self.body.blocks, 0, &mut |b| match b {
+            Block::Heading { level, style, inlines } => {
+                let hs = styles.get(usize::from(*level).saturating_sub(1)).cloned().unwrap_or_default();
+                style.align = if set.centered { Align::Center } else { Align::Start };
+                style.background = (set.shaded && *level == 1).then(|| theme.color(ACCENT1));
+                for_each_run_style(inlines, 0, &mut |st| {
+                    st.size_pt = hs.size_pt;
+                    st.bold = hs.bold;
+                    st.italic = hs.italic;
+                    st.color = hs.color;
+                    st.font_family = hs.font_family.clone();
+                });
+            }
+            Block::Paragraph { style, .. } => {
+                style.space_after_px = after_px;
+                style.line_height = Some(set.line_height);
+            }
+            _ => {}
+        });
+        self.dirty = true;
+    }
+}
+
+// =======================================================================================================
+// List formats (Bullets / Numbering galleries, Define New Bullet / Number Format, Multilevel List)
+// =======================================================================================================
+//
+// The document model knows only bulleted and numbered lists, so the marker format of a list is kept here,
+// beside the body: one entry per formatted list, found again after edits by its position among the body's
+// lists and the text of its first item. The editor draws the markers from [`ComposeState::list_markers`]
+// and sending writes them into the HTML ([`ComposeState::apply_list_formats_html`]).
+
+/// How list items are numbered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NumberStyle {
+    /// 1, 2, 3
+    #[default]
+    Decimal,
+    /// 01, 02, 03
+    DecimalZero,
+    /// a, b, c
+    LowerAlpha,
+    /// A, B, C
+    UpperAlpha,
+    /// i, ii, iii
+    LowerRoman,
+    /// I, II, III
+    UpperRoman,
+}
+
+impl NumberStyle {
+    /// `n` written in this style (`n` ≥ 1; 0 and out-of-range values fall back to decimal).
+    pub fn format(self, n: u64) -> String {
+        match self {
+            NumberStyle::Decimal => n.to_string(),
+            NumberStyle::DecimalZero => format!("{n:02}"),
+            NumberStyle::LowerAlpha => alpha(n).to_lowercase(),
+            NumberStyle::UpperAlpha => alpha(n),
+            NumberStyle::LowerRoman => roman(n).to_lowercase(),
+            NumberStyle::UpperRoman => roman(n),
+        }
+    }
+
+    /// CSS `list-style-type` keyword.
+    pub fn css(self) -> &'static str {
+        match self {
+            NumberStyle::Decimal => "decimal",
+            NumberStyle::DecimalZero => "decimal-leading-zero",
+            NumberStyle::LowerAlpha => "lower-alpha",
+            NumberStyle::UpperAlpha => "upper-alpha",
+            NumberStyle::LowerRoman => "lower-roman",
+            NumberStyle::UpperRoman => "upper-roman",
+        }
+    }
+
+    /// Parses a style name ("decimal", "lowerAlpha", "upper-roman", "I", "a", …).
+    pub fn parse(s: &str) -> Option<NumberStyle> {
+        let k: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>();
+        Some(match k.as_str() {
+            "1" | "decimal" | "Decimal" | "arabic" => NumberStyle::Decimal,
+            "01" | "decimalZero" | "decimalleadingzero" | "DecimalZero" => NumberStyle::DecimalZero,
+            "a" | "lowerAlpha" | "loweralpha" | "LowerAlpha" | "lowerLetter" => NumberStyle::LowerAlpha,
+            "A" | "upperAlpha" | "upperalpha" | "UpperAlpha" | "upperLetter" => NumberStyle::UpperAlpha,
+            "i" | "lowerRoman" | "lowerroman" | "LowerRoman" => NumberStyle::LowerRoman,
+            "I" | "upperRoman" | "upperroman" | "UpperRoman" => NumberStyle::UpperRoman,
+            _ => return None,
+        })
+    }
+}
+
+/// 1 → A, 26 → Z, 27 → AA (bijective base 26; 0 → "0").
+fn alpha(n: u64) -> String {
+    if n == 0 {
+        return "0".into();
+    }
+    let mut n = n;
+    let mut out = Vec::new();
+    while n > 0 {
+        n -= 1;
+        out.push(char::from(b'A' + u8::try_from(n % 26).unwrap_or(0)));
+        n /= 26;
+    }
+    out.iter().rev().collect()
+}
+
+/// Upper-case Roman numeral for 1..=3999 (decimal beyond).
+fn roman(n: u64) -> String {
+    if n == 0 || n > 3999 {
+        return n.to_string();
+    }
+    const T: [(u64, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut n = n;
+    let mut out = String::new();
+    for (v, s) in T {
+        while n >= v {
+            out.push_str(s);
+            n -= v;
+        }
+    }
+    out
+}
+
+/// Marker format of one list level.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListFormat {
+    /// A bullet glyph.
+    Bullet { glyph: String },
+    /// A number between `prefix` and `suffix` ("Article " I "."); with `chain` the numbers of the enclosing
+    /// levels come first, joined by dots ("1.2.").
+    Number { style: NumberStyle, prefix: String, suffix: String, chain: bool },
+}
+
+/// Longest bullet glyph / number prefix or suffix (chars).
+const MAX_MARKER_PART: usize = 16;
+
+fn clean_marker_part(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(MAX_MARKER_PART).collect()
+}
+
+impl ListFormat {
+    pub fn bullet(glyph: &str) -> ListFormat {
+        let g = clean_marker_part(glyph.trim());
+        ListFormat::Bullet { glyph: if g.is_empty() { "\u{2022}".into() } else { g } }
+    }
+
+    pub fn number(style: NumberStyle, prefix: &str, suffix: &str) -> ListFormat {
+        ListFormat::Number {
+            style,
+            prefix: clean_marker_part(prefix),
+            suffix: clean_marker_part(suffix),
+            chain: false,
+        }
+    }
+
+    pub fn is_number(&self) -> bool {
+        matches!(self, ListFormat::Number { .. })
+    }
+
+    /// Gallery formats by key: bullets `disc`, `circle`, `square`, `diamonds`, `arrow`, `check`, `star`,
+    /// `dash`, `picture`; numbers `decimal` (1.), `decimalParen` (1)), `upperRoman` (I.), `upperAlpha` (A.),
+    /// `lowerAlphaParen` (a)), `lowerAlpha` (a.), `lowerRoman` (i.), `decimalZero` (01.).
+    pub fn from_key(key: &str) -> Option<ListFormat> {
+        let b = ListFormat::bullet;
+        let n = |s, suffix: &str| ListFormat::number(s, "", suffix);
+        Some(match key {
+            "disc" | "solidCircle" => b("\u{2022}"),
+            "circle" | "hollowCircle" => b("\u{25e6}"),
+            "square" | "solidSquare" => b("\u{25aa}"),
+            "diamonds" | "fourDiamonds" => b("\u{2756}"),
+            "arrow" | "hollowArrow" => b("\u{27a2}"),
+            "check" | "checkmark" => b("\u{2714}"),
+            "star" => b("\u{2605}"),
+            "dash" => b("\u{2013}"),
+            "picture" => b("\u{25c6}"),
+            "decimal" => n(NumberStyle::Decimal, "."),
+            "decimalParen" => n(NumberStyle::Decimal, ")"),
+            "decimalZero" => n(NumberStyle::DecimalZero, "."),
+            "upperRoman" => n(NumberStyle::UpperRoman, "."),
+            "upperAlpha" => n(NumberStyle::UpperAlpha, "."),
+            "lowerAlphaParen" => n(NumberStyle::LowerAlpha, ")"),
+            "lowerAlpha" => n(NumberStyle::LowerAlpha, "."),
+            "lowerRoman" => n(NumberStyle::LowerRoman, "."),
+            _ => return None,
+        })
+    }
+
+    /// Parses a number format pattern like Word's "Number format" box: the first number placeholder (`1`,
+    /// `01`, `a`, `A`, `i`, `I`) with the text around it, e.g. `Article I.`, `(a)`, `1)`, `Chapter 1`. Without a
+    /// placeholder, `style` is used and the text becomes the suffix.
+    pub fn from_pattern(pattern: &str, style: Option<NumberStyle>) -> ListFormat {
+        let p = clean_marker_part(pattern);
+        // A placeholder is a run of digits / roman letters / one letter standing alone (not inside a word).
+        let chars: Vec<char> = p.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            let prev_alpha = i > 0 && chars.get(i - 1).is_some_and(|c| c.is_alphabetic());
+            let start = i;
+            let mut j = i;
+            while chars.get(j).is_some_and(|c| c.is_alphanumeric()) {
+                j += 1;
+            }
+            if j > start && !prev_alpha {
+                let token: String = chars.get(start..j).map(|s| s.iter().collect()).unwrap_or_default();
+                let found = match token.as_str() {
+                    t if t.chars().all(|c| c.is_ascii_digit()) => {
+                        Some(if t.starts_with('0') && t.len() > 1 {
+                            NumberStyle::DecimalZero
+                        } else {
+                            NumberStyle::Decimal
+                        })
+                    }
+                    "a" => Some(NumberStyle::LowerAlpha),
+                    "A" => Some(NumberStyle::UpperAlpha),
+                    "i" => Some(NumberStyle::LowerRoman),
+                    "I" => Some(NumberStyle::UpperRoman),
+                    _ => None,
+                };
+                if let Some(st) = found {
+                    let prefix: String = chars.get(..start).map(|s| s.iter().collect()).unwrap_or_default();
+                    let suffix: String = chars.get(j..).map(|s| s.iter().collect()).unwrap_or_default();
+                    return ListFormat::Number { style: style.unwrap_or(st), prefix, suffix, chain: false };
+                }
+            }
+            i = j.max(i + 1);
+        }
+        ListFormat::Number {
+            style: style.unwrap_or_default(),
+            prefix: String::new(),
+            suffix: p,
+            chain: false,
+        }
+    }
+
+    /// Marker text for item number `n`, with the numbers of the enclosing levels (outermost first) for
+    /// chained formats.
+    pub fn marker(&self, n: u64, parents: &[u64]) -> String {
+        match self {
+            ListFormat::Bullet { glyph } => glyph.clone(),
+            ListFormat::Number { style, prefix, suffix, chain } => {
+                let mut num = String::new();
+                if *chain {
+                    for p in parents {
+                        num.push_str(&p.to_string());
+                        num.push('.');
+                    }
+                }
+                num.push_str(&style.format(n));
+                format!("{prefix}{num}{suffix}")
+            }
+        }
+    }
+
+    /// The CSS `list-style-type` keyword that draws this marker exactly, if one does.
+    pub fn css_keyword(&self) -> Option<&'static str> {
+        match self {
+            ListFormat::Bullet { glyph } => match glyph.as_str() {
+                "\u{2022}" => Some("disc"),
+                "\u{25e6}" => Some("circle"),
+                "\u{25aa}" | "\u{25a0}" => Some("square"),
+                _ => None,
+            },
+            ListFormat::Number { style, prefix, suffix, chain } => {
+                (prefix.is_empty() && suffix == "." && !chain).then(|| style.css())
+            }
+        }
+    }
+
+    /// The marker the layout engine draws without a format (what the editor replaces).
+    pub fn default_marker(numbered: bool, n: u64, list_depth: usize) -> String {
+        if numbered {
+            return format!("{n}.");
+        }
+        ["\u{2022}", "\u{25e6}", "\u{25aa}"].get(list_depth % 3).copied().unwrap_or("\u{2022}").to_owned()
+    }
+}
+
+/// Multilevel list definitions by key (Format Text › Multilevel List): one format per level 1–9.
+pub fn multilevel_formats(key: &str) -> Option<Vec<ListFormat>> {
+    use NumberStyle::{Decimal, DecimalZero, LowerAlpha, LowerRoman, UpperAlpha, UpperRoman};
+    let n = |st, pre: &str, suf: &str| ListFormat::number(st, pre, suf);
+    let chained =
+        |st| ListFormat::Number { style: st, prefix: String::new(), suffix: ".".into(), chain: true };
+    let levels: Vec<ListFormat> = match key {
+        // 1. / a. / i. repeating (the default numbered outline).
+        "numbered" | "outlineNumbered" => {
+            [n(Decimal, "", "."), n(LowerAlpha, "", "."), n(LowerRoman, "", ".")]
+                .into_iter()
+                .cycle()
+                .take(9)
+                .collect()
+        }
+        // 1) / a) / i) repeating.
+        "numberedParen" => [n(Decimal, "", ")"), n(LowerAlpha, "", ")"), n(LowerRoman, "", ")")]
+            .into_iter()
+            .cycle()
+            .take(9)
+            .collect(),
+        // 1. / 1.1. / 1.1.1.
+        "outline" | "legal" => {
+            (0..9).map(|i| if i == 0 { n(Decimal, "", ".") } else { chained(Decimal) }).collect()
+        }
+        // Article I. / Section 1.01 / (a) / (i) / …
+        "article" => vec![
+            n(UpperRoman, "Article ", "."),
+            ListFormat::Number {
+                style: DecimalZero,
+                prefix: "Section ".into(),
+                suffix: String::new(),
+                chain: true,
+            },
+            n(LowerAlpha, "(", ")"),
+            n(LowerRoman, "(", ")"),
+            n(Decimal, "", ")"),
+            n(LowerAlpha, "", ")"),
+            n(LowerRoman, "", ")"),
+            n(LowerAlpha, "", "."),
+            n(LowerRoman, "", "."),
+        ],
+        // Chapter 1 / 1.1 / 1.1.1 headings-style numbering.
+        "chapter" => {
+            let mut v = vec![n(Decimal, "Chapter ", "")];
+            v.extend((1..9).map(|_| ListFormat::Number {
+                style: Decimal,
+                prefix: String::new(),
+                suffix: String::new(),
+                chain: true,
+            }));
+            v
+        }
+        // I. / A. / 1. / a) / (1) / (a) / (i) / (a) / (i)
+        "outlineRoman" => vec![
+            n(UpperRoman, "", "."),
+            n(UpperAlpha, "", "."),
+            n(Decimal, "", "."),
+            n(LowerAlpha, "", ")"),
+            n(Decimal, "(", ")"),
+            n(LowerAlpha, "(", ")"),
+            n(LowerRoman, "(", ")"),
+            n(LowerAlpha, "(", ")"),
+            n(LowerRoman, "(", ")"),
+        ],
+        // Bullets per level.
+        "bullets" => ["\u{2022}", "\u{25e6}", "\u{25aa}"]
+            .iter()
+            .cycle()
+            .take(9)
+            .map(|g| ListFormat::bullet(g))
+            .collect(),
+        "diamonds" => ["\u{2756}", "\u{27a2}", "\u{25aa}", "\u{2022}"]
+            .iter()
+            .cycle()
+            .take(9)
+            .map(|g| ListFormat::bullet(g))
+            .collect(),
+        _ => return None,
+    };
+    Some(levels)
+}
+
+/// Stored format of one list (see the section comment).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ListFormatEntry {
+    /// Position among the body's lists in document order (outer lists before their nested lists).
+    pub ordinal: usize,
+    pub numbered: bool,
+    /// Start of the first item's text (finds the list again after edits).
+    pub key: String,
+    /// Formats by level: `levels[0]` for this list, `levels[d]` for lists nested `d` deep inside it.
+    pub levels: Vec<ListFormat>,
+}
+
+/// Chars of the first item's text kept as a list's key.
+const LIST_KEY_CHARS: usize = 40;
+/// Most lists walked / formats kept.
+const MAX_FORMATTED_LISTS: usize = 2_000;
+
+/// A list in the body: its path, kind, start number, key, and nesting depth among lists.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListInfo {
+    pub path: Vec<usize>,
+    pub numbered: bool,
+    pub start: u32,
+    pub key: String,
+    pub depth: usize,
+    pub items: usize,
+}
+
+/// Key of a list: the text of its first item's first block (nested lists below it do not count).
+fn list_key(items: &[Vec<Block>]) -> String {
+    let first = items.first().and_then(|item| item.first());
+    first
+        .map(|b| blocks_text(std::slice::from_ref(b)))
+        .unwrap_or_default()
+        .chars()
+        .take(LIST_KEY_CHARS)
+        .collect()
+}
+
+fn walk_lists(
+    blocks: &[Block],
+    path: &mut Vec<usize>,
+    depth: usize,
+    list_depth: usize,
+    out: &mut Vec<ListInfo>,
+) {
+    if depth > MAX_WALK_DEPTH || out.len() >= MAX_FORMATTED_LISTS {
+        return;
+    }
+    for (i, b) in blocks.iter().enumerate() {
+        path.push(i);
+        match b {
+            Block::List { kind, items } => {
+                let (numbered, start) = match kind {
+                    ListKind::Bullet => (false, 1),
+                    ListKind::Numbered { start } => (true, *start),
+                };
+                out.push(ListInfo {
+                    path: path.clone(),
+                    numbered,
+                    start,
+                    key: list_key(items),
+                    depth: list_depth,
+                    items: items.len(),
+                });
+                for (k, item) in items.iter().enumerate() {
+                    path.push(k);
+                    walk_lists(item, path, depth.saturating_add(1), list_depth.saturating_add(1), out);
+                    path.pop();
+                }
+            }
+            Block::Quote { blocks } | Block::Container { blocks, .. } => {
+                walk_lists(blocks, path, depth.saturating_add(1), list_depth, out);
+            }
+            Block::Table { rows, .. } => {
+                for (r, row) in rows.iter().enumerate() {
+                    for (c, cell) in row.iter().enumerate() {
+                        path.push(r);
+                        path.push(c);
+                        walk_lists(&cell.blocks, path, depth.saturating_add(1), list_depth, out);
+                        path.pop();
+                        path.pop();
+                    }
+                }
+            }
+            _ => {}
+        }
+        path.pop();
+    }
+}
+
+impl ComposeState {
+    /// The body's lists in document order.
+    pub fn lists(&self) -> Vec<ListInfo> {
+        let mut out = Vec::new();
+        walk_lists(&self.body.blocks, &mut Vec::new(), 0, 0, &mut out);
+        out
+    }
+
+    /// The stored list formats matched to the body's current lists: an entry keeps its list when the list at
+    /// its position is of the same kind and either starts with the same text or the number of lists did not
+    /// change; otherwise the nearest list of the same kind with the same first text takes it. Unmatched
+    /// entries are dropped.
+    pub fn resolve_list_formats(&self) -> Vec<ListFormatEntry> {
+        if self.list_formats.is_empty() {
+            return Vec::new();
+        }
+        let lists = self.lists();
+        let mut used = vec![false; lists.len()];
+        let mut out: Vec<ListFormatEntry> = Vec::new();
+        let same_count = self.list_count == lists.len();
+        for e in &self.list_formats {
+            let fits = |i: usize, l: &ListInfo, used: &[bool]| {
+                l.numbered == e.numbered && !used.get(i).copied().unwrap_or(true)
+            };
+            let direct = lists
+                .get(e.ordinal)
+                .filter(|l| fits(e.ordinal, l, &used) && (same_count || l.key == e.key))
+                .map(|_| e.ordinal);
+            let by_key = || {
+                lists
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, l)| fits(*i, l, &used) && l.key == e.key && !e.key.is_empty())
+                    .min_by_key(|(i, _)| i.abs_diff(e.ordinal))
+                    .map(|(i, _)| i)
+            };
+            if let Some(i) = direct.or_else(by_key)
+                && let Some(l) = lists.get(i)
+            {
+                if let Some(u) = used.get_mut(i) {
+                    *u = true;
+                }
+                out.push(ListFormatEntry {
+                    ordinal: i,
+                    numbered: l.numbered,
+                    key: l.key.clone(),
+                    levels: e.levels.clone(),
+                });
+            }
+        }
+        out.sort_by_key(|e| e.ordinal);
+        out
+    }
+
+    /// Re-anchors the stored list formats to the current body (call before an edit).
+    pub fn sync_list_formats(&mut self) {
+        if self.list_formats.is_empty() {
+            self.list_count = 0;
+            return;
+        }
+        self.list_formats = self.resolve_list_formats();
+        self.list_count = self.lists().len();
+    }
+
+    /// The format of each current list (`None` = default markers), in [`ComposeState::lists`] order: its own
+    /// entry, else the entry of the nearest enclosing list at the matching level.
+    pub fn effective_list_formats(&self) -> Vec<(ListInfo, Option<ListFormat>)> {
+        let lists = self.lists();
+        let entries = self.resolve_list_formats();
+        let mut out: Vec<(ListInfo, Option<ListFormat>)> = Vec::with_capacity(lists.len());
+        for (i, l) in lists.iter().enumerate() {
+            let own = entries.iter().find(|e| e.ordinal == i).and_then(|e| e.levels.first().cloned());
+            let inherited = || {
+                // Nearest enclosing list (by path prefix) that has an entry: its level for this depth.
+                lists
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, o)| o.path.len() < l.path.len() && l.path.starts_with(&o.path))
+                    .rev()
+                    .find_map(|(j, o)| {
+                        let e = entries.iter().find(|e| e.ordinal == j)?;
+                        let d = l.depth.saturating_sub(o.depth);
+                        e.levels.get(d).cloned()
+                    })
+            };
+            let f = own.or_else(inherited).filter(|f| f.is_number() == l.numbered);
+            out.push((l.clone(), f));
+        }
+        out
+    }
+
+    /// Sets the format of the list holding the caret (`levels[0]`; deeper entries apply to nested lists).
+    /// With `whole`, the outermost list holding the caret gets it (multilevel lists). False when the caret
+    /// is in no list.
+    pub fn set_list_format(&mut self, levels: Vec<ListFormat>, whole: bool) -> bool {
+        self.sync_list_formats();
+        let lists = self.lists();
+        let caret = self.selection.focus.path.clone();
+        let mut holding = lists
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| caret.len() > l.path.len() && caret.starts_with(&l.path));
+        let target = if whole { holding.next() } else { holding.next_back() };
+        let Some((i, l)) = target.map(|(i, l)| (i, l.clone())) else {
+            return false;
+        };
+        self.list_formats.retain(|e| e.ordinal != i);
+        if !levels.is_empty() {
+            self.list_formats.push(ListFormatEntry {
+                ordinal: i,
+                numbered: l.numbered,
+                key: l.key.clone(),
+                levels,
+            });
+        }
+        if whole {
+            // Nested lists follow the multilevel definition rather than formats of their own.
+            let nested: Vec<usize> = lists
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.path.len() > l.path.len() && o.path.starts_with(&l.path))
+                .map(|(j, _)| j)
+                .collect();
+            self.list_formats.retain(|e| !nested.contains(&e.ordinal));
+        }
+        self.list_formats.sort_by_key(|e| e.ordinal);
+        self.list_formats.truncate(MAX_FORMATTED_LISTS);
+        self.list_count = lists.len();
+        self.dirty = true;
+        true
+    }
+
+    /// The format of the innermost list holding the caret.
+    pub fn list_format_at_caret(&self) -> Option<ListFormat> {
+        let caret = &self.selection.focus.path;
+        self.effective_list_formats()
+            .into_iter()
+            .rev()
+            .find(|(l, _)| caret.len() > l.path.len() && caret.starts_with(&l.path))
+            .and_then(|(_, f)| f)
+    }
+
+    /// Markers of formatted lists for display: (list path, item index, marker text, the default marker the
+    /// layout draws there).
+    pub fn list_markers(&self) -> Vec<(Vec<usize>, usize, String, String)> {
+        let all = self.effective_list_formats();
+        if all.iter().all(|(_, f)| f.is_none()) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (l, f) in &all {
+            let Some(f) = f else { continue };
+            let parents = self.parent_numbers(&all, l);
+            for k in 0..l.items {
+                let n = u64::from(l.start).saturating_add(u64::try_from(k).unwrap_or(u64::MAX));
+                out.push((
+                    l.path.clone(),
+                    k,
+                    f.marker(n, &parents),
+                    ListFormat::default_marker(l.numbered, n, l.depth),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Numbers of the items enclosing list `l` in numbered lists (outermost first), for chained formats.
+    fn parent_numbers(&self, all: &[(ListInfo, Option<ListFormat>)], l: &ListInfo) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (o, _) in all {
+            if o.path.len() < l.path.len() && l.path.starts_with(&o.path) && o.numbered {
+                let item = l.path.get(o.path.len()).copied().unwrap_or(0);
+                out.push(u64::from(o.start).saturating_add(u64::try_from(item).unwrap_or(u64::MAX)));
+            }
+        }
+        out
+    }
+
+    /// Plain text of the body (as [`Doc::to_plain_text`]) with formatted list markers ("ii. ", "\u{2714} ") in
+    /// place of the default "1. " / "\u{2022} " ones.
+    pub fn plain_text_with_list_formats(&self) -> String {
+        let text = self.body.to_plain_text();
+        let all = self.effective_list_formats();
+        if all.iter().all(|(_, f)| f.is_none()) {
+            return text;
+        }
+        // Every list item in document order: (item path, default marker, marker to write).
+        let mut items: Vec<(Vec<usize>, String, String)> = Vec::new();
+        for (l, f) in &all {
+            let parents = self.parent_numbers(&all, l);
+            for k in 0..l.items {
+                let n = u64::from(l.start).saturating_add(u64::try_from(k).unwrap_or(u64::MAX));
+                let default = if l.numbered { format!("{n}. ") } else { "\u{2022} ".to_owned() };
+                let new =
+                    f.as_ref().map_or_else(|| default.clone(), |f| format!("{} ", f.marker(n, &parents)));
+                let mut p = l.path.clone();
+                p.push(k);
+                items.push((p, default, new));
+            }
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut k = 0usize;
+        let mut out: Vec<String> = Vec::new();
+        for line in text.split('\n') {
+            let rest = line.trim_start_matches(' ');
+            let indent = line.get(..line.len().saturating_sub(rest.len())).unwrap_or("");
+            // Items inside tables are flattened away, so look a few items ahead.
+            let hit = (k..items.len().min(k.saturating_add(8))).find(|&j| {
+                items.get(j).is_some_and(|(_, d, _)| rest.starts_with(d.as_str()) || rest == d.trim_end())
+            });
+            match hit.and_then(|j| items.get(j).map(|it| (j, it))) {
+                Some((j, (_, d, n))) => {
+                    let tail = rest.get(d.len().min(rest.len())..).unwrap_or("");
+                    out.push(format!("{indent}{n}{tail}").trim_end().to_owned());
+                    k = j.saturating_add(1);
+                }
+                None => out.push(line.to_owned()),
+            }
+        }
+        out.join("\n")
+    }
+
+    /// Writes the list formats into `html` (from `mailcraft_html::doc_to_html` of this body): a list whose
+    /// format has a CSS keyword gets `list-style-type`; others get `list-style-type:none` and the marker text
+    /// at the start of each item.
+    pub fn apply_list_formats_html(&self, html: &str) -> String {
+        let all = self.effective_list_formats();
+        if all.iter().all(|(_, f)| f.is_none()) {
+            return html.to_owned();
+        }
+        // Per list ordinal: (format, list info, parent numbers).
+        let lists: Vec<(Option<ListFormat>, ListInfo, Vec<u64>)> =
+            all.iter().map(|(l, f)| (f.clone(), l.clone(), self.parent_numbers(&all, l))).collect();
+        let mut out = String::with_capacity(html.len() + 256);
+        // Open lists: (ordinal, items seen).
+        let mut stack: Vec<(usize, u64)> = Vec::new();
+        let mut next_ordinal = 0usize;
+        let mut pending_marker: Option<String> = None;
+        let mut rest = html;
+        while let Some(lt) = rest.find('<') {
+            let (text, tail) = rest.split_at(lt);
+            out.push_str(text);
+            let Some(gt) = tail.find('>') else {
+                out.push_str(tail);
+                rest = "";
+                break;
+            };
+            let (tag, after) = tail.split_at(gt.saturating_add(1));
+            rest = after;
+            let lower = tag.to_ascii_lowercase();
+            let name: String = lower
+                .trim_start_matches('<')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '/')
+                .collect();
+            match name.as_str() {
+                "ul" | "ol" => {
+                    let ord = next_ordinal;
+                    next_ordinal = next_ordinal.saturating_add(1);
+                    stack.push((ord, 0));
+                    let style =
+                        lists.get(ord).and_then(|(f, _, _)| f.as_ref()).map(|f| match f.css_keyword() {
+                            Some(k) => format!("list-style-type:{k}"),
+                            None => "list-style-type:none".to_owned(),
+                        });
+                    match style {
+                        Some(st) => {
+                            let open = tag.trim_end_matches('>').trim_end_matches('/');
+                            out.push_str(open);
+                            out.push_str(&format!(" style=\"{st}\">"));
+                        }
+                        None => out.push_str(tag),
+                    }
+                }
+                "/ul" | "/ol" => {
+                    stack.pop();
+                    pending_marker = None;
+                    out.push_str(tag);
+                }
+                "li" => {
+                    out.push_str(tag);
+                    if let Some((ord, seen)) = stack.last_mut() {
+                        let k = *seen;
+                        *seen = seen.saturating_add(1);
+                        if let Some((Some(f), l, parents)) = lists.get(*ord)
+                            && f.css_keyword().is_none()
+                        {
+                            let n = u64::from(l.start).saturating_add(k);
+                            pending_marker = Some(f.marker(n, parents));
+                        }
+                    }
+                }
+                "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "div" => {
+                    out.push_str(tag);
+                    if let Some(m) = pending_marker.take() {
+                        out.push_str(&escape_html_text(&m));
+                        out.push('\u{a0}');
+                    }
+                }
+                _ => {
+                    if let Some(m) = pending_marker.take() {
+                        out.push_str(&escape_html_text(&m));
+                        out.push('\u{a0}');
+                    }
+                    out.push_str(tag);
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
+fn escape_html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

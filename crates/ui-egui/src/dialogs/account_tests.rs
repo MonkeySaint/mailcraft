@@ -712,3 +712,93 @@ fn the_shell_polls_send_receive_every_frame() {
     h.run_steps(2);
     assert!(h.query_by_label("Retry").is_some());
 }
+
+#[test]
+fn manual_setup_offers_pop3_with_server_copy_settings() {
+    let mut app = sample_app();
+    app.s.view.work_offline = true;
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    let mut h = harness(app);
+    set_text(&mut h, "Email address:", "lee@example.com");
+    h.get_by_label("Let me set up my account manually").click();
+    step(&mut h);
+    h.get_by_label("Connect").click();
+    step(&mut h);
+    h.get_by_label("POP").click();
+    step(&mut h);
+    assert!(h.query_by_label("POP Account Settings").is_some());
+    assert_eq!(field_value(&h, "Server:"), "pop.example.com");
+    assert_eq!(field_value(&h, "Port:"), "995");
+    h.get_by_label("More Settings").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("More Settings").click();
+    step(&mut h);
+    h.get_by_label("Leave a copy of messages on the server").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Leave a copy of messages on the server").click();
+    step(&mut h);
+    set_text(&mut h, "Password:", "pop-pw");
+    h.get_by_label("Connect").click();
+    step(&mut h);
+    assert!(h.query_by_label("Account successfully added").is_some(), "{:?}", h.state().ui.toast);
+    h.get_by_label("Done").click();
+    step(&mut h);
+    let app = h.state();
+    let a = app.s.mailbox.accounts.iter().find(|a| a.address == "lee@example.com").unwrap();
+    assert_eq!(mailcraft_engine::accounts::kind_label(&app.s, a), "pop3");
+    assert_eq!(a.incoming.as_ref().unwrap().port, 995);
+    let o = mailcraft_engine::accounts::account_options(&app.s, a.id);
+    assert!(o.pop3 && !o.leave_on_server);
+}
+
+#[test]
+fn account_settings_shows_pop_accounts_and_the_secret_store() {
+    let mut app = sample_app();
+    app.s
+        .run(
+            "accounts.add",
+            &json!({"kind": "pop3", "address": "pop@example.org", "incoming": {"host": "pop.example.org"}, "password": "x"}),
+        )
+        .unwrap();
+    crate::dialogs::open(&mut app, "accountSettings", json!({}));
+    let h = harness(app);
+    assert!(h.query_by_label_contains("POP/SMTP").is_some());
+    assert!(h.query_by_label_contains("kept in memory").is_some());
+}
+
+#[test]
+fn change_account_starts_and_cancels_an_oauth_sign_in() {
+    let mut app = sample_app();
+    let id = add_local_imap(&mut app, "pat@example.net");
+    crate::dialogs::open(&mut app, "addAccount", json!({"change": id}));
+    let mut h = harness(app);
+    h.get_by_label("Sign in with OAuth 2.0 instead of a password").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Sign in with OAuth 2.0 instead of a password").click();
+    step(&mut h);
+    assert!(h.query_by_label_contains("no built-in registration").is_some());
+    set_text(&mut h, "Client id:", "my-registered-app");
+    h.get_by_label("Browser").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Browser").click();
+    step(&mut h);
+    h.get_by_label("Sign In").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Sign In").click();
+    step(&mut h);
+    {
+        let app = h.state();
+        let flow = app.s.sync.oauth.get(&AccountId(id)).cloned().unwrap();
+        assert_eq!(flow.status, "waiting");
+        assert!(flow.auth_url.as_deref().is_some_and(|u| u.contains("client_id=my-registered-app")));
+        let o = mailcraft_engine::accounts::account_options(&app.s, AccountId(id));
+        assert_eq!(o.oauth.unwrap().client_id, "my-registered-app");
+    }
+    assert!(h.query_by_label_contains("Finish signing in in your browser").is_some());
+    h.get_by_label("Cancel Sign-In").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Cancel Sign-In").click();
+    step(&mut h);
+    assert_eq!(h.state().s.sync.oauth.get(&AccountId(id)).unwrap().status, "cancelled");
+    assert!(h.query_by_label_contains("Sign-in was cancelled").is_some());
+}

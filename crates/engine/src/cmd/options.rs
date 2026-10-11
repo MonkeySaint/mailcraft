@@ -1,54 +1,45 @@
-//! `options.*`: open the Options window at a page, and read/write the options the session actually holds
-//! (view state). Unknown keys are refused rather than silently stored.
+//! `options.*`: open the Options window at a page, and read / write / reset every setting of the profile
+//! settings store ([`settings`]) plus the few the session keeps in its view state. Unknown keys and invalid
+//! values are refused, never stored. Changes are saved to the profile's `settings.json` by the session.
+
+pub use crate::settings;
 
 use serde_json::{Value, json};
 
 use crate::cmd::rules::dialog;
-use crate::cmd::util::{opt_str, req_str};
-use crate::{CmdError, CmdResult, CommandSpec, SearchScope, Session, always};
+use crate::cmd::util::{opt_bool, opt_str, req_str};
+use crate::{CmdError, CmdResult, CommandSpec, Session, always};
 use mailcraft_model::{FolderPaneState, ReadingPanePos};
 
+pub use settings::{Def, Effect, Kind, Settings};
+
 /// Options pages in window order (`plan/outlook/options.md`): (id, title).
-pub const PAGES: [(&str, &str); 14] = [
-    ("general", "General"),
-    ("mail", "Mail"),
-    ("calendar", "Calendar"),
-    ("groups", "Groups"),
-    ("people", "People"),
-    ("tasks", "Tasks"),
-    ("search", "Search"),
-    ("language", "Language"),
-    ("accessibility", "Accessibility"),
-    ("advanced", "Advanced"),
-    ("customizeRibbon", "Customize Ribbon"),
-    ("quickAccessToolbar", "Quick Access Toolbar"),
-    ("addIns", "Add-ins"),
-    ("trustCenter", "Trust Center"),
-];
+pub const PAGES: [(&str, &str); 14] = settings::PAGES;
 
 /// Pages opened from elsewhere that land on a section of a page: (alias, page, section).
-const ALIASES: [(&str, &str, &str); 4] = [
+const ALIASES: [(&str, &str, &str); 6] = [
     ("signatures", "mail", "signatures"),
-    ("editorAdvanced", "mail", "editorOptions.advanced"),
+    ("editorAdvanced", "mail", "Editor Options"),
     ("readingPane", "mail", "readingPane"),
     ("sendReceive", "advanced", "sendReceive"),
+    ("workHours", "calendar", "Work time"),
+    ("translation", "language", "Translation"),
 ];
 
-/// Option keys `options.set` / `options.get` understand.
-pub const KEYS: [&str; 12] = [
-    "view.darkMode",
-    "view.zoom",
-    "view.statusBar",
-    "view.simplifiedRibbon",
-    "view.ribbonCollapsed",
-    "view.favorites",
-    "view.readingPane",
-    "view.folderPane",
-    "search.scope",
-    "sendReceive.autoMinutes",
-    "sendReceive.sendImmediately",
-    "sendReceive.workOffline",
+/// Keys held only by the session's view state (not listed in the Options window).
+pub const VIEW_KEYS: [&str; 5] =
+    ["view.darkMode", "view.zoom", "view.readingPane", "view.folderPane", "sendReceive.workOffline"];
+
+/// Older key names still accepted: (old, current).
+const RENAMED: [(&str, &str); 2] = [
+    ("sendReceive.autoMinutes", "advanced.sendReceiveMinutes"),
+    ("sendReceive.sendImmediately", "advanced.sendImmediately"),
 ];
+
+/// Every key `options.get` lists: the view keys, then every setting.
+pub fn all_keys() -> Vec<&'static str> {
+    VIEW_KEYS.iter().copied().chain(settings::DEFS.iter().map(|d| d.key)).collect()
+}
 
 fn spec(
     id: &'static str,
@@ -77,25 +68,34 @@ pub fn specs() -> Vec<CommandSpec> {
             open,
         ),
         spec("options.set", "Set Option", r#"{"key": string, "value": any}"#, set),
-        spec("options.get", "Get Option", r#"{"key"?: string} (no key = all)"#, get),
+        spec(
+            "options.get",
+            "Get Option",
+            r#"{"key"?: string, "page"?: string, "meta"?: bool} (no key = all, `meta` adds labels, defaults, kinds)"#,
+            get,
+        ),
+        spec("options.reset", "Reset Options", r#"{"key"?: string} (no key = every option)"#, reset),
     ]
 }
 
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let want = opt_str(p, "page").unwrap_or("general").trim();
-    let (page, section) = if let Some((_, page, section)) =
-        ALIASES.iter().find(|(a, _, _)| a.eq_ignore_ascii_case(want))
-    {
-        (*page, Some(*section))
-    } else if let Some((id, _)) =
-        PAGES.iter().find(|(id, title)| id.eq_ignore_ascii_case(want) || title.eq_ignore_ascii_case(want))
-    {
-        (*id, None)
-    } else {
-        let known: Vec<&str> =
-            PAGES.iter().map(|(id, _)| *id).chain(ALIASES.iter().map(|(a, _, _)| *a)).collect();
-        return Err(CmdError::Params(format!("unknown options page `{want}` (known: {})", known.join(", "))));
-    };
+    let (page, section) =
+        if let Some((_, page, section)) = ALIASES.iter().find(|(a, _, _)| a.eq_ignore_ascii_case(want)) {
+            (*page, Some(*section))
+        } else if let Some((id, _)) =
+            PAGES.iter().find(|(id, title)| id.eq_ignore_ascii_case(want) || title.eq_ignore_ascii_case(want))
+        {
+            (*id, None)
+        } else {
+            let known: Vec<&str> =
+                PAGES.iter().map(|(id, _)| *id).chain(ALIASES.iter().map(|(a, _, _)| *a)).collect();
+            let shown: String = want.chars().take(40).collect();
+            return Err(CmdError::Params(format!(
+                "unknown options page `{shown}` (known: {})",
+                known.join(", ")
+            )));
+        };
     dialog(s, "options", json!({"page": page, "section": section}))
 }
 
@@ -115,16 +115,15 @@ fn folder_pane_name(f: FolderPaneState) -> &'static str {
     }
 }
 
-const SCOPES: [(SearchScope, &str); 5] = [
-    (SearchScope::CurrentFolder, "currentFolder"),
-    (SearchScope::Subfolders, "subfolders"),
-    (SearchScope::CurrentMailbox, "currentMailbox"),
-    (SearchScope::AllMailboxes, "allMailboxes"),
-    (SearchScope::AllOutlookItems, "allOutlookItems"),
-];
+fn canonical(key: &str) -> &str {
+    RENAMED.iter().find(|(old, _)| *old == key).map_or(key, |(_, new)| new)
+}
 
-fn value_of(s: &Session, key: &str) -> Option<Value> {
+/// Current value of an option (view-held keys from the session, mirrored settings from where the session
+/// keeps them, the rest from the settings store); `None` for unknown keys.
+pub fn option_value(s: &Session, key: &str) -> Option<Value> {
     let v = &s.view;
+    let key = canonical(key);
     Some(match key {
         "view.darkMode" => json!(v.dark),
         "view.zoom" => json!(v.zoom),
@@ -134,13 +133,18 @@ fn value_of(s: &Session, key: &str) -> Option<Value> {
         "view.favorites" => json!(v.favorites_visible),
         "view.readingPane" => json!(reading_pane_name(v.reading_pane)),
         "view.folderPane" => json!(folder_pane_name(v.folder_pane)),
-        "sendReceive.autoMinutes" => json!(v.auto_send_receive_minutes),
-        "sendReceive.sendImmediately" => json!(v.send_immediately),
         "sendReceive.workOffline" => json!(v.work_offline),
-        "search.scope" => {
-            json!(SCOPES.iter().find(|(sc, _)| *sc == v.search_scope).map_or("currentFolder", |(_, n)| *n))
-        }
-        _ => return None,
+        "advanced.sendImmediately" => json!(v.send_immediately),
+        "advanced.sendReceiveMinutes" => json!(v.auto_send_receive_minutes),
+        "search.includeDeleted" => json!(s.search.include_deleted),
+        "calendar.timeZone" => json!(s.tz_offset_min),
+        "search.scope" => json!(
+            crate::session::SCOPE_NAMES
+                .iter()
+                .find(|(sc, _)| *sc == v.search_scope)
+                .map_or("currentFolder", |(_, n)| *n)
+        ),
+        _ => return s.settings.get(key),
     })
 }
 
@@ -152,11 +156,16 @@ fn want_str<'a>(key: &str, v: &'a Value) -> Result<&'a str, CmdError> {
     v.as_str().ok_or_else(|| CmdError::Params(format!("`{key}` takes a string")))
 }
 
-fn set(s: &mut Session, p: &Value) -> CmdResult {
-    let key = req_str(p, "key")?;
-    let v = p.get("value").ok_or_else(|| CmdError::Params("`value` required".into()))?;
+/// Sets an option (validated), applies it where the session holds it and saves the settings file. Returns
+/// the stored (normalised) value.
+pub fn set_option(s: &mut Session, key: &str, v: &Value) -> Result<Value, CmdError> {
+    let key = canonical(key);
     match key {
-        "view.darkMode" => s.view.dark = want_bool(key, v)?,
+        "view.darkMode" => {
+            let dark = want_bool(key, v)?;
+            s.view.dark = dark;
+            s.settings.set("general.theme", &json!(if dark { "dark" } else { "light" }))?;
+        }
         "view.statusBar" => s.view.status_bar = want_bool(key, v)?,
         "view.simplifiedRibbon" => s.view.simplified_ribbon = want_bool(key, v)?,
         "view.ribbonCollapsed" => s.view.ribbon_collapsed = want_bool(key, v)?,
@@ -175,7 +184,9 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
                 "right" => ReadingPanePos::Right,
                 "bottom" => ReadingPanePos::Bottom,
                 "off" => ReadingPanePos::Off,
-                o => return Err(CmdError::Params(format!("`view.readingPane`: unknown value `{o}`"))),
+                o => {
+                    return Err(CmdError::Params(format!("`view.readingPane`: unknown value `{}`", clip(o))));
+                }
             };
         }
         "view.folderPane" => {
@@ -183,39 +194,115 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
                 "normal" => FolderPaneState::Normal,
                 "minimized" => FolderPaneState::Minimized,
                 "off" => FolderPaneState::Off,
-                o => return Err(CmdError::Params(format!("`view.folderPane`: unknown value `{o}`"))),
+                o => return Err(CmdError::Params(format!("`view.folderPane`: unknown value `{}`", clip(o)))),
             };
         }
-        "sendReceive.autoMinutes" => {
-            s.view.auto_send_receive_minutes =
-                v.as_u64().filter(|m| *m <= 1440).and_then(|m| u32::try_from(m).ok()).ok_or_else(|| {
-                    CmdError::Params("`sendReceive.autoMinutes` takes minutes from 0 (off) to 1440".into())
-                })?;
-        }
-        "sendReceive.sendImmediately" => s.view.send_immediately = want_bool(key, v)?,
         "sendReceive.workOffline" => s.view.work_offline = want_bool(key, v)?,
-        "search.scope" => {
-            let name = want_str(key, v)?;
-            s.view.search_scope = SCOPES
-                .iter()
-                .find(|(_, n)| n.eq_ignore_ascii_case(name))
-                .map(|(sc, _)| *sc)
-                .ok_or_else(|| CmdError::Params(format!("`search.scope`: unknown value `{name}`")))?;
+        _ => {
+            if settings::def(key).is_none() {
+                return Err(CmdError::Disabled(format!("option `{}` is not supported", clip(key))));
+            }
+            s.settings.set(key, v)?;
+            s.apply_setting(key);
         }
-        _ => return Err(CmdError::Disabled(format!("option `{key}` is not supported yet"))),
     }
-    Ok(json!({"key": key, "value": value_of(s, key)}))
+    if let Err(e) = s.save_settings() {
+        log::error!("{e}");
+        s.notify(crate::Notice::Error(format!("The setting was changed but could not be saved: {e}")));
+    }
+    option_value(s, key).ok_or_else(|| CmdError::Failed(format!("option `{}` has no value", clip(key))))
+}
+
+fn clip(t: &str) -> String {
+    t.chars().take(60).collect()
+}
+
+fn set(s: &mut Session, p: &Value) -> CmdResult {
+    let key = req_str(p, "key")?;
+    let v = p.get("value").ok_or_else(|| CmdError::Params("`value` required".into()))?;
+    let value = set_option(s, key, v)?;
+    Ok(json!({"key": canonical(key), "value": value}))
+}
+
+fn kind_json(k: &Kind) -> Value {
+    match k {
+        Kind::Bool(_) => json!({"type": "bool"}),
+        Kind::Int(_, min, max) => json!({"type": "int", "min": min, "max": max}),
+        Kind::Choice(_, choices) => {
+            json!({"type": "choice", "choices": choices.iter().map(|(id, label)| json!({"id": id, "label": label})).collect::<Vec<_>>()})
+        }
+        Kind::Text(_, max) => json!({"type": "text", "maxChars": max}),
+        Kind::Time(_) => json!({"type": "time"}),
+        Kind::TimeRange(_) => json!({"type": "timeRange"}),
+        Kind::Days(_) => {
+            json!({"type": "days", "choices": settings::WEEKDAYS.iter().map(|(id, _)| *id).collect::<Vec<_>>()})
+        }
+        Kind::List(max) => json!({"type": "list", "maxEntries": max}),
+        Kind::Object(max) => json!({"type": "object", "maxBytes": max}),
+    }
+}
+
+fn meta(s: &Session, d: &Def) -> Value {
+    json!({
+        "key": d.key,
+        "page": d.page,
+        "section": d.section,
+        "label": d.label,
+        "kind": kind_json(&d.kind),
+        "default": d.default_value(),
+        "value": option_value(s, d.key),
+        "effect": d.effect,
+    })
 }
 
 fn get(s: &mut Session, p: &Value) -> CmdResult {
+    let with_meta = opt_bool(p, "meta").unwrap_or(false);
+    if let Some(key) = opt_str(p, "key") {
+        let key = canonical(key);
+        let value = option_value(s, key)
+            .ok_or_else(|| CmdError::Disabled(format!("option `{}` is not supported", clip(key))))?;
+        return Ok(match settings::def(key) {
+            Some(d) if with_meta => meta(s, d),
+            _ => json!({"key": key, "value": value}),
+        });
+    }
+    if let Some(page) = opt_str(p, "page") {
+        let defs = settings::page_defs(page);
+        if defs.is_empty() {
+            return Err(CmdError::Params(format!("no options on page `{}`", clip(page))));
+        }
+        let rows: Vec<Value> = defs.iter().map(|(_, d)| meta(s, d)).collect();
+        return Ok(json!({"page": page, "options": rows}));
+    }
+    if with_meta {
+        let rows: Vec<Value> = settings::DEFS.iter().map(|d| meta(s, d)).collect();
+        let (applied, total) = settings::effect_counts();
+        return Ok(json!({"options": rows, "applied": applied, "total": total}));
+    }
+    let all: serde_json::Map<String, Value> =
+        all_keys().into_iter().filter_map(|k| option_value(s, k).map(|v| (k.to_owned(), v))).collect();
+    Ok(Value::Object(all))
+}
+
+fn reset(s: &mut Session, p: &Value) -> CmdResult {
     match opt_str(p, "key") {
-        Some(key) => value_of(s, key)
-            .map(|v| json!({"key": key, "value": v}))
-            .ok_or_else(|| CmdError::Disabled(format!("option `{key}` is not supported yet"))),
+        Some(key) => {
+            let key = canonical(key);
+            let d = settings::def(key)
+                .ok_or_else(|| CmdError::Disabled(format!("option `{}` is not supported", clip(key))))?;
+            let value = set_option(s, key, &d.default_value())?;
+            Ok(json!({"key": key, "value": value}))
+        }
         None => {
-            let all: serde_json::Map<String, Value> =
-                KEYS.iter().filter_map(|k| value_of(s, k).map(|v| ((*k).to_owned(), v))).collect();
-            Ok(Value::Object(all))
+            s.settings.reset_all();
+            for d in settings::DEFS.iter().filter(|d| d.view) {
+                set_option(s, d.key, &d.default_value())?;
+            }
+            s.apply_settings();
+            if let Err(e) = s.save_settings() {
+                log::error!("{e}");
+            }
+            Ok(json!({"reset": true}))
         }
     }
 }
@@ -223,8 +310,10 @@ fn get(s: &mut Session, p: &Value) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Notice;
     use crate::cmd::rules::tests::session;
+    use crate::compose::ComposeState;
+    use crate::{Notice, SearchScope};
+    use mailcraft_model::{BodyFormat, Doc, FolderRole, Importance};
 
     #[test]
     fn open_pages_and_aliases() {
@@ -252,6 +341,7 @@ mod tests {
         let (mut s, _, _) = session();
         s.run("options.set", &json!({"key": "view.darkMode", "value": true})).unwrap();
         assert!(s.view.dark);
+        assert_eq!(s.settings.text("general.theme"), "dark");
         s.run("options.set", &json!({"key": "view.readingPane", "value": "bottom"})).unwrap();
         assert_eq!(s.view.reading_pane, ReadingPanePos::Bottom);
         s.run("options.set", &json!({"key": "search.scope", "value": "allMailboxes"})).unwrap();
@@ -270,9 +360,10 @@ mod tests {
         ));
         assert_eq!(s.run("options.get", &json!({"key": "view.readingPane"})).unwrap()["value"], "bottom");
         let all = s.run("options.get", &json!({})).unwrap();
-        assert_eq!(all.as_object().unwrap().len(), KEYS.len());
+        assert_eq!(all.as_object().unwrap().len(), all_keys().len());
         s.run("options.set", &json!({"key": "sendReceive.autoMinutes", "value": 5})).unwrap();
         assert_eq!(s.view.auto_send_receive_minutes, 5);
+        assert_eq!(s.settings.int("advanced.sendReceiveMinutes"), 5);
         assert!(matches!(
             s.run("options.set", &json!({"key": "sendReceive.autoMinutes", "value": 99_999})),
             Err(CmdError::Params(_))
@@ -281,5 +372,217 @@ mod tests {
             s.run("options.get", &json!({"key": "sendReceive.sendImmediately"})).unwrap()["value"],
             true
         );
+        let r = s.run("options.set", &json!({"key": "calendar.workWeek", "value": "mon,tue"})).unwrap();
+        assert_eq!(r["value"], json!(["mon", "tue"]));
+        let m = s.run("options.get", &json!({"key": "calendar.workWeek", "meta": true})).unwrap();
+        assert_eq!(m["page"], "calendar");
+        assert_eq!(m["default"], json!(["mon", "tue", "wed", "thu", "fri"]));
+        let page = s.run("options.get", &json!({"page": "people"})).unwrap();
+        assert!(page["options"].as_array().unwrap().iter().any(|o| o["key"] == "people.fileAs"));
+        let all = s.run("options.get", &json!({"meta": true})).unwrap();
+        assert!(all["applied"].as_u64().unwrap() >= 40);
+    }
+
+    #[test]
+    fn reset_one_and_all() {
+        let (mut s, _, _) = session();
+        s.run("options.set", &json!({"key": "people.fileAs", "value": "company"})).unwrap();
+        s.run("options.set", &json!({"key": "view.statusBar", "value": false})).unwrap();
+        s.run("options.reset", &json!({"key": "people.fileAs"})).unwrap();
+        assert_eq!(s.settings.file_as(), "lastFirst");
+        s.run("options.set", &json!({"key": "advanced.sendImmediately", "value": false})).unwrap();
+        assert!(!s.view.send_immediately);
+        s.run("options.reset", &json!({})).unwrap();
+        assert!(s.view.status_bar && s.view.send_immediately);
+        assert!(s.settings.overrides().is_empty());
+        assert!(s.run("options.reset", &json!({"key": "x.y"})).is_err());
+    }
+
+    #[test]
+    fn mirrored_settings_follow_commands() {
+        let (mut s, _, _) = session();
+        // Commands that change the session directly keep the settings in step.
+        s.view.send_immediately = false;
+        s.tz_offset_min = 60;
+        s.run("options.get", &json!({})).unwrap();
+        assert!(!s.settings.bool("advanced.sendImmediately"));
+        assert_eq!(s.settings.time_zone_offset_min(), 60);
+        s.run("options.set", &json!({"key": "calendar.timeZone", "value": -300})).unwrap();
+        assert_eq!(s.tz_offset_min, -300);
+        s.run("options.set", &json!({"key": "general.theme", "value": "system"})).unwrap();
+        s.view.dark = true;
+        s.run("options.get", &json!({})).unwrap();
+        assert_eq!(s.settings.text("general.theme"), "system", "system theme is not overwritten");
+    }
+
+    #[test]
+    fn compose_defaults_follow_the_options() {
+        let (mut s, _, _) = session();
+        for (k, v) in [
+            ("mail.compose.defaultFormat", json!("plain")),
+            ("mail.send.defaultImportance", json!("high")),
+            ("mail.compose.showBcc", json!(true)),
+            ("mail.tracking.requestRead", json!(true)),
+            ("mail.save.sentCopies", json!(false)),
+            ("mail.compose.fontFamily", json!("Carlito")),
+            ("mail.compose.fontSizePt", json!(14)),
+            ("language.authoring", json!("fr-CA")),
+        ] {
+            s.run("options.set", &json!({"key": k, "value": v})).unwrap();
+        }
+        let cid = s.run("mail.newEmail", &json!({})).unwrap()["compose"].as_u64().unwrap();
+        let c = &s.composes[&cid];
+        assert_eq!(c.format, BodyFormat::PlainText);
+        assert_eq!(c.importance, Importance::High);
+        assert!(c.show_bcc && c.request_read_receipt);
+        assert_eq!(c.save_sent, crate::compose::SaveSentTo::DoNotSave);
+        assert_eq!(c.body.base.font_family.as_deref(), Some("Carlito"));
+        assert_eq!(c.body.base.size_pt, Some(14.0));
+        assert_eq!(c.language.as_deref(), Some("fr-CA"));
+        // Replies open in their own window when asked to.
+        s.run("options.set", &json!({"key": "mail.reply.newWindow", "value": true})).unwrap();
+        let reply = s.open_compose(ComposeState {
+            kind: crate::compose::ComposeKind::Reply,
+            inline: true,
+            ..Default::default()
+        });
+        assert!(!s.composes[&reply].inline);
+        // Turning Bcc off in a message sticks too.
+        s.run("compose.showBcc", &json!({"compose": cid, "on": false})).unwrap();
+        assert!(!s.settings.bool("mail.compose.showBcc"));
+    }
+
+    #[test]
+    fn attachment_reminder_asks_before_sending() {
+        let (mut s, _, _) = session();
+        let cid = s.open_compose(ComposeState {
+            to: "ann@example.com".into(),
+            subject: "Report".into(),
+            body: Doc::from_plain_text("Please see the attached report."),
+            ..Default::default()
+        });
+        let r = s.run("compose.send", &json!({"compose": cid})).unwrap();
+        assert_eq!(r["reason"], "attachmentReminder");
+        assert!(s.composes.contains_key(&cid), "not sent");
+        let Some(Notice::OpenDialog(name, params)) = s.notices.last().cloned() else { panic!("no dialog") };
+        assert_eq!(name, "confirm");
+        assert_eq!(params["command"], "compose.send");
+        // "Yes" in the dialog sends with the reminder off: it gets past the check.
+        let r = s.run("compose.send", &params["params"]);
+        assert!(r.map(|v| v["reason"] != "attachmentReminder").unwrap_or(true));
+        // Option off: no reminder.
+        let cid = s.open_compose(ComposeState {
+            to: "ann@example.com".into(),
+            body: Doc::from_plain_text("attached"),
+            ..Default::default()
+        });
+        s.run("options.set", &json!({"key": "mail.send.attachmentReminder", "value": false})).unwrap();
+        let r = s.run("compose.send", &json!({"compose": cid}));
+        assert!(r.map(|v| v["reason"] != "attachmentReminder").unwrap_or(true));
+    }
+
+    #[test]
+    fn mark_read_on_delete() {
+        let mut s = crate::sample::sample_session();
+        let order = crate::queries::visible_item_ids(&s);
+        let a = order[0];
+        s.mailbox.set_read(&[a], false);
+        s.run("options.set", &json!({"key": "mail.other.markReadOnDelete", "value": true})).unwrap();
+        s.run("nav.selectItem", &json!({"id": a.0})).unwrap();
+        s.mailbox.set_read(&[a], false);
+        s.run("mail.delete", &json!({"ids": [a.0]})).unwrap();
+        assert!(s.mailbox.mail.get(&a).is_none_or(|m| m.read));
+        let deleted =
+            s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::DeletedItems)).unwrap().id;
+        assert!(s.mailbox.mail.get(&a).is_none_or(|m| m.folder == deleted));
+    }
+
+    #[test]
+    fn profile_settings_persist_and_apply_on_open() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        {
+            let mut s = Session::open(dir.path()).unwrap();
+            s.run("options.set", &json!({"key": "mail.send.ctrlEnterSends", "value": false})).unwrap();
+            s.run("options.set", &json!({"key": "view.zoom", "value": 150})).unwrap();
+            s.run("options.set", &json!({"key": "advanced.sendImmediately", "value": false})).unwrap();
+            s.run("options.set", &json!({"key": "advanced.startFolder", "value": "Sent Items"})).unwrap();
+            s.run("options.set", &json!({"key": "advanced.emptyDeletedOnExit", "value": true})).unwrap();
+            s.search.recent = vec!["invoice".into()];
+            s.view.collapsed_groups.insert(s.selection.folder, vec!["Older".into()]);
+            s.run("app.toggleRibbonMode", &json!({"mode": "classic"})).unwrap();
+            // Something in Deleted Items, emptied on exit.
+            let deleted =
+                s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::DeletedItems)).map(|f| f.id);
+            if let Some(d) = deleted {
+                s.mailbox.create_folder(d, "Old stuff").unwrap();
+            }
+            s.run("file.exit", &json!({})).unwrap();
+        }
+        assert!(dir.path().join("settings.json").exists());
+        let s = Session::open(dir.path()).unwrap();
+        assert!(!s.settings.bool("mail.send.ctrlEnterSends"));
+        assert_eq!(s.view.zoom, 150);
+        assert!(!s.view.send_immediately, "mirrored into the view state");
+        assert!(!s.view.simplified_ribbon, "view state persisted");
+        assert_eq!(s.search.recent, ["invoice"]);
+        assert_eq!(s.view.collapsed_groups.values().next().map(Vec::len), Some(1));
+        assert_eq!(s.mailbox.folder(s.selection.folder).and_then(|f| f.role), Some(FolderRole::SentItems));
+        let deleted =
+            s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::DeletedItems)).unwrap().id;
+        assert!(s.mailbox.folders.values().all(|f| f.parent != Some(deleted)), "emptied on exit");
+        drop(s);
+        // A broken file is set aside; defaults are used.
+        std::fs::write(dir.path().join("settings.json"), b"{\"settings\": 5").unwrap();
+        let s = Session::open(dir.path()).unwrap();
+        assert!(s.settings.bool("mail.send.ctrlEnterSends"));
+        assert!(dir.path().join("settings.json.bad").exists());
+        assert!(s.notices.iter().any(|n| matches!(n, Notice::Error(t) if t.contains("settings"))));
+    }
+
+    #[test]
+    fn module_views_and_quick_click_persist() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let tasks = {
+            let mut s = Session::open(dir.path()).unwrap();
+            let tasks = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Tasks)).unwrap().id;
+            s.run("nav.selectFolder", &json!({"folder": tasks.0})).unwrap();
+            s.run("view.changeView", &json!({"name": "Overdue"})).unwrap();
+            s.run("mail.setQuickClickFlag", &json!({"kind": "nextWeek"})).unwrap();
+            s.run("options.set", &json!({"key": "people.fileAs", "value": "firstLast"})).unwrap();
+            tasks
+        };
+        let s = Session::open(dir.path()).unwrap();
+        let v = crate::cmd::view::modules::state(&s, tasks, crate::cmd::view::modules::ModuleKind::Tasks);
+        assert_eq!(v.view, "Overdue");
+        assert_eq!(s.option("tasks.quickClickFlag"), Some(json!("nextWeek")));
+        assert_eq!(s.settings.file_as(), "firstLast");
+    }
+
+    #[test]
+    fn hostile_values_are_refused() {
+        let (mut s, _, _) = session();
+        for v in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!("\u{0}"),
+            json!(1e300),
+            json!(-1),
+            json!("x".repeat(100_000)),
+        ] {
+            for d in settings::DEFS {
+                // Errors are fine, panics are not; whatever is stored validates.
+                let _ = s.run("options.set", &json!({"key": d.key, "value": v}));
+                if let Some(cur) = s.option(d.key)
+                    && !d.view
+                {
+                    assert_eq!(settings::normalize(d, &cur).unwrap(), cur, "{}", d.key);
+                }
+            }
+        }
     }
 }

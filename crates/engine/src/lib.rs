@@ -13,12 +13,14 @@ pub mod accounts;
 pub mod catalog;
 pub mod cmd;
 pub mod compose;
+pub mod junk;
 pub mod queries;
 pub mod reminders;
 pub mod rules_exec;
 pub mod sample;
 pub mod search_index;
 mod session;
+pub mod settings;
 pub mod sync;
 pub mod undo;
 

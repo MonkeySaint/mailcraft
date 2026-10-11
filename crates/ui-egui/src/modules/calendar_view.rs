@@ -1,41 +1,77 @@
 //! Calendar module: date navigator + My Calendars (folder pane), folder bar (Today, previous/next, title,
-//! view switcher) and the Day / Work Week / Week / Month / Schedule views.
+//! view switcher) and the Day / Work Week / Week / Month / Schedule views, the List and Active tables
+//! ([`table`]), the reading pane, the Daily Task List and the To-Do Bar.
 //!
 //! The view state is the engine's `CalendarViewState`, kept in [`ModState`] and changed through the
-//! `calendar.*` view commands (they take the current state and return the new one). `app.ui.calendar_view`
-//! mirrors the mode so the ribbon can show and switch it.
+//! `calendar.*` view commands and the calendar's handling of the View tab (`calendar::module_view`); they
+//! take the current state and return the new one. `app.ui.calendar_view` mirrors the mode so the ribbon can
+//! show and switch it. The engine also saves each view on its calendar folder with a rising number; a newer
+//! saved view (from a command that ran without the UI's state, or the last session) is adopted here.
+//!
+//! Several calendars show side by side (one pane each, with a coloured tab) or overlaid in one grid
+//! (View › Overlay). Items take their first category's colour, else their calendar's colour (View › Color).
+//! In day and week views appointments are dragged to move them and their top or bottom edge is dragged to
+//! change their length (`calendar.moveItem` / `calendar.resize`; one occurrence of a series becomes an
+//! exception). Day and week views show the second time zone (Change Time Zone) in a second ruler.
+//!
+//! Windows the calendar draws itself (Change Time Zone, Add Calendar From Internet / From File / Create New
+//! Blank Calendar, View Settings) and the internet calendar refresh workers live in [`windows`].
 
-use std::collections::BTreeSet;
+mod table;
+#[cfg(test)]
+mod ui_tests;
+pub(super) mod windows;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{
-    Align, Align2, Color32, ComboBox, CornerRadius, FontId, Id, Key, Layout, Modifiers, Rect, RichText,
-    ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetType, pos2, vec2,
+    Align, Align2, Color32, ComboBox, CornerRadius, CursorIcon, FontId, Id, Key, Layout, Modifiers, Rect,
+    RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetType, pos2, vec2,
 };
 use serde_json::{Value, json};
 
+use mailcraft_engine::Module;
 use mailcraft_engine::cmd::calendar::pim::Kind;
-use mailcraft_engine::cmd::calendar::{CalendarMode, CalendarViewState, occurrences};
-use mailcraft_model::{Appointment, BusyStatus, DateTime, FolderId, FolderKind, ItemId, dates};
+use mailcraft_engine::cmd::calendar::tz::Clock;
+use mailcraft_engine::cmd::calendar::{
+    self as engine_cal, CalendarCurrentView, CalendarMode, CalendarViewState, DailyTaskList, occurrences,
+    props, views,
+};
+use mailcraft_model::{Appointment, BusyStatus, FolderId, FolderKind, ItemId, ReadingPanePos, dates};
 
 use super::common::{
     DAY, ModState, a11y, add_months, blend, category_color, child, clock, current_folder, day_of, day_string,
-    empty_message, folder_rows, group_header, hour_label, load, local_secs, long_date, month_name,
-    now_minute, paint_text_clipped, pane_bg, parse_day, select_folder, shift_month, split_folder_pane, store,
-    today, tz, week_start, weekday, weekday_name, ymd,
+    empty_message, folder_rows, group_header, hour_label, load, long_date, month_name, now_minute,
+    paint_text_clipped, pane_bg, parse_day, select_folder, shift_month, split_folder_pane, store, today, tz,
+    week_start, weekday, weekday_name, ymd,
 };
 use super::editors;
 use crate::App;
 
 /// Folder bar height (Today, arrows, title, view switcher).
 const BAR_H: f32 = 48.0;
-/// Height of one time slot in day/week views.
+/// Height of one time slot in day/week views (Use Tighter Spacing: the smaller one).
 const SLOT_H: f32 = 20.0;
-/// Width of the time ruler.
+const SLOT_H_TIGHT: f32 = 15.0;
+/// Width of one time ruler.
 const RULER_W: f32 = 56.0;
-const WORK_START: i64 = 8 * 60;
-const WORK_END: i64 = 17 * 60;
 /// Height of one all-day banner lane.
 const LANE_H: f32 = 22.0;
+/// Height of a calendar's tab above its pane (several calendars shown).
+const TAB_H: f32 = 24.0;
+/// Daily Task List: header and row heights.
+const TASK_HEAD_H: f32 = 22.0;
+const TASK_ROW_H: f32 = 20.0;
+/// Most task rows per day in the Daily Task List.
+const TASK_ROWS: usize = 3;
+/// Height of the internet calendar info strip.
+const INFO_H: f32 = 28.0;
+/// Most calendars shown side by side (more are overlaid).
+const MAX_SIDE_BY_SIDE: usize = 6;
+/// Grab zone (px) at a block's top and bottom edges for resizing.
+const EDGE: f32 = 5.0;
+/// Seconds between checks for internet calendars due a refresh (a new subscription is fetched soon after).
+const POLL_SECS: f64 = 5.0;
 
 const VIEW_COMMANDS: [&str; 8] = [
     "calendar.today",
@@ -47,6 +83,111 @@ const VIEW_COMMANDS: [&str; 8] = [
     "calendar.overlay",
     "calendar.dailyTaskList",
 ];
+
+// ---------------------------------------------------------------------------------------------------------
+// Calendar UI state (egui memory, separate from the shared ModState)
+// ---------------------------------------------------------------------------------------------------------
+
+/// What the calendar keeps between frames besides `ModState`.
+#[derive(Clone, Default)]
+struct CalUi {
+    /// Saved-view number last adopted, per calendar folder.
+    seen: BTreeMap<u64, u64>,
+    /// Appointment being dragged in a day/week view.
+    drag: Option<Drag>,
+    /// Scroll position key per pane (the grid scrolls to the working day when the view changes).
+    scroll_keys: BTreeMap<usize, String>,
+    windows: windows::Windows,
+    fetches: windows::Fetches,
+    /// `ctx.input().time` of the last check for internet calendars due a refresh.
+    last_poll: Option<f64>,
+}
+
+fn ui_id() -> Id {
+    Id::new("mailcraft.modules.calendar.ui")
+}
+
+fn load_ui(ctx: &egui::Context) -> CalUi {
+    ctx.data_mut(|d| d.get_temp::<CalUi>(ui_id())).unwrap_or_default()
+}
+
+fn store_ui(ctx: &egui::Context, cu: CalUi) {
+    ctx.data_mut(|d| d.insert_temp(ui_id(), cu));
+}
+
+/// A drag in progress: which block, what part, and where it started.
+#[derive(Clone, Debug, PartialEq)]
+struct Drag {
+    id: ItemId,
+    /// Unix start of the occurrence (series only).
+    occurrence: Option<i64>,
+    kind: DragKind,
+    /// The block's local start / end (seconds).
+    start: i64,
+    end: i64,
+    /// Minutes between the block's start and the grab point (moves).
+    grab_min: i64,
+    pane: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragKind {
+    Move,
+    Top,
+    Bottom,
+}
+
+/// Settings the views read each frame.
+#[derive(Clone, Debug, Default)]
+struct Look {
+    /// Working days, 0 = Sunday.
+    work_days: Vec<u8>,
+    /// Working hours (minutes after midnight).
+    work: (i64, i64),
+    slot_h: f32,
+    /// Second time zone: (label, offset at the first visible day).
+    second: Option<(String, i32)>,
+    /// The calendar's own offset then (the second ruler shows the difference).
+    primary_off: i32,
+    primary_label: String,
+    preview: bool,
+}
+
+impl Look {
+    fn of(app: &mut App, st: &ModState) -> Look {
+        // "Today" and the time line follow a daylight-saving change while the window stays open.
+        views::refresh_time_zone(&mut app.s);
+        let sel = selected_day(app, st);
+        let clock = cal_clock(app);
+        let noon = clock.from_local(sel.saturating_mul(DAY).saturating_add(12 * 3600)).unix;
+        let primary_off = clock.offset_at(noon);
+        let mut work_days = engine_cal::work_week(&mut app.s);
+        work_days.retain(|d| *d < 7);
+        if work_days.is_empty() {
+            work_days = vec![1, 2, 3, 4, 5];
+        }
+        Look {
+            work_days,
+            work: engine_cal::work_hours(&mut app.s),
+            slot_h: if st.cal.tighter_spacing { SLOT_H_TIGHT } else { SLOT_H },
+            second: engine_cal::second_zone(&mut app.s, noon),
+            primary_off,
+            primary_label: views::primary_zone_label(&app.s),
+            preview: st.cal.current == CalendarCurrentView::Preview,
+        }
+    }
+}
+
+/// One view pane: the calendars it shows and a key that keeps its widget ids apart.
+#[derive(Clone, Debug)]
+struct Pane {
+    cals: BTreeSet<FolderId>,
+    key: usize,
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// View state
+// ---------------------------------------------------------------------------------------------------------
 
 /// Follows `app.ui.calendar_view` (the ribbon may switch the mode) and fills in today's date.
 pub(super) fn sync_mode(app: &mut App, st: &mut ModState) {
@@ -63,15 +204,76 @@ pub(super) fn sync_mode(app: &mut App, st: &mut ModState) {
     }
 }
 
-/// Runs `id` (adding the current view state for view commands) and keeps a returned view state.
+/// Adopts the current calendar's saved view when it is newer than the last one seen (keeps the date).
+fn adopt_saved(app: &mut App, st: &mut ModState, cu: &mut CalUi) {
+    let Some(folder) = current_folder(app, Kind::Appointment) else { return };
+    let Some((saved, seq)) = engine_cal::saved_view(&app.s) else { return };
+    let seen = cu.seen.get(&folder.0).copied().unwrap_or(0);
+    if seq <= seen {
+        return;
+    }
+    cu.seen.insert(folder.0, seq);
+    let (date, days) = (st.cal.date.clone(), st.cal.days);
+    let same_mode = saved.mode == st.cal.mode;
+    st.cal = saved;
+    st.cal.date = date;
+    st.cal.days = if same_mode { days } else { 1 };
+    app.ui.calendar_view = st.cal.mode.name().to_owned();
+}
+
+/// The calendar's own window for a command run without the details it needs (`None` = run it).
+fn own_window(id: &str, p: &Value) -> Option<&'static str> {
+    let has = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
+    match id {
+        "calendar.changeTimeZone"
+            if !["offsetMin", "zone", "label", "secondZone", "secondLabel", "showSecond", "swap"]
+                .iter()
+                .any(|k| has(k)) =>
+        {
+            Some(windows::TZ_DIALOG)
+        }
+        "calendar.addCalendar" => match p.get("source").and_then(Value::as_str) {
+            Some("internet") if !has("url") => Some(windows::INTERNET_DIALOG),
+            Some("blank") if !has("name") => Some(windows::BLANK_DIALOG),
+            Some("file") if !has("path") && !has("data") => Some(windows::FILE_DIALOG),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Runs `id` (adding the current view state for view commands) and keeps a returned view state. The View
+/// tab's commands run the calendar's own handling directly; commands that need a calendar window open it.
 pub(super) fn run_view_cmd(app: &mut App, st: &mut ModState, id: &str, params: Value) -> Option<Value> {
     let mut params = if params.is_object() { params } else { json!({}) };
-    if VIEW_COMMANDS.contains(&id)
+    if let Some(dialog) = own_window(id, &params) {
+        crate::dialogs::open(app, dialog, params);
+        return Some(json!({ "dialog": dialog }));
+    }
+    let module_view = views::MODULE_VIEW_IDS.contains(&id);
+    if (VIEW_COMMANDS.contains(&id) || module_view)
         && let Some(o) = params.as_object_mut()
     {
         o.insert("view".into(), serde_json::to_value(&st.cal).unwrap_or(Value::Null));
     }
-    let out = app.run(id, params)?;
+    let out = if module_view {
+        app.s.view.module = Module::Calendar;
+        match engine_cal::module_view(&mut app.s, id, &params) {
+            Some(Ok(v)) => {
+                if let Some(part) = v.get("todoBar").and_then(Value::as_str) {
+                    app.ui.todo_bar_request = Some(part.to_owned());
+                }
+                v
+            }
+            Some(Err(e)) => {
+                app.ui.toast = Some((e.to_string(), 0.0));
+                return None;
+            }
+            None => app.run(id, params)?,
+        }
+    } else {
+        app.run(id, params)?
+    };
     if let Some(v) = out.get("view").and_then(|v| serde_json::from_value::<CalendarViewState>(v.clone()).ok())
     {
         st.cal = v;
@@ -104,11 +306,31 @@ fn shown_calendars(app: &App, st: &ModState) -> BTreeSet<FolderId> {
     set
 }
 
-/// Days shown by the current view (Month: the whole 5–6 week grid).
-fn visible_days(st: &ModState, sel: i64) -> Vec<i64> {
+/// Shown calendars in folder order (the default calendar first, then by name).
+fn ordered(app: &App, cals: &BTreeSet<FolderId>) -> Vec<FolderId> {
+    let mut v: Vec<(bool, String, FolderId)> = cals
+        .iter()
+        .filter_map(|f| app.s.mailbox.folder(*f).map(|x| (x.role.is_none(), x.name.to_lowercase(), *f)))
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, _, f)| f).collect()
+}
+
+/// The colour calendar `folder` is drawn in.
+pub(super) fn calendar_color32(app: &App, folder: FolderId) -> Color32 {
+    let (_, [r, g, b]) = engine_cal::calendar_color(&app.s.mailbox, folder);
+    Color32::from_rgb(r, g, b)
+}
+
+/// Days shown by the current view (Month: the whole 5–6 week grid). `work` = working days, 0 = Sunday.
+fn visible_days(st: &ModState, sel: i64, work: &[u8]) -> Vec<i64> {
     match st.cal.mode {
         CalendarMode::Day => (0..i64::from(st.cal.days.clamp(1, 14))).map(|i| sel + i).collect(),
-        CalendarMode::WorkWeek => (1..=5).map(|i| week_start(sel) + i).collect(),
+        CalendarMode::WorkWeek => {
+            let days: Vec<i64> =
+                work.iter().filter(|d| **d < 7).map(|d| week_start(sel) + i64::from(*d)).collect();
+            if days.is_empty() { (1..=5).map(|i| week_start(sel) + i).collect() } else { days }
+        }
         CalendarMode::Week => (0..7).map(|i| week_start(sel) + i).collect(),
         CalendarMode::Month => {
             let (start, weeks) = month_grid(sel);
@@ -129,7 +351,7 @@ fn month_grid(day: i64) -> (i64, i64) {
 }
 
 /// Folder-bar title for the view.
-fn title(st: &ModState, sel: i64) -> String {
+fn title(st: &ModState, sel: i64, work: &[u8]) -> String {
     let span = |a: i64, b: i64| {
         let (ya, ma, da) = ymd(a);
         let (yb, mb, db) = ymd(b);
@@ -149,22 +371,12 @@ fn title(st: &ModState, sel: i64) -> String {
         CalendarMode::Day if st.cal.days <= 1 => long_date(sel),
         CalendarMode::Schedule => long_date(sel),
         _ => {
-            let days = visible_days(st, sel);
+            let days = visible_days(st, sel, work);
             match (days.first(), days.last()) {
                 (Some(a), Some(b)) => span(*a, *b),
                 _ => long_date(sel),
             }
         }
-    }
-}
-
-fn mode_label(m: CalendarMode) -> &'static str {
-    match m {
-        CalendarMode::Day => "Day",
-        CalendarMode::WorkWeek => "Work Week",
-        CalendarMode::Week => "Week",
-        CalendarMode::Month => "Month",
-        CalendarMode::Schedule => "Schedule View",
     }
 }
 
@@ -187,16 +399,23 @@ fn step(st: &ModState, sel: i64, dir: i64) -> i64 {
 pub(super) struct Occ {
     pub id: ItemId,
     pub folder: FolderId,
+    /// Local seconds on the calendar's clock.
     pub start: i64,
     pub end: i64,
+    /// The occurrence's start instant (unix seconds): names it to the engine.
+    pub start_unix: i64,
     pub all_day: bool,
     pub subject: String,
     pub location: String,
+    /// The first lines of the body (Preview view).
+    pub preview: String,
     pub base: Color32,
     pub show_as: BusyStatus,
     pub private: bool,
     pub recurring: bool,
     pub meeting: bool,
+    /// In a read-only (internet) calendar.
+    pub read_only: bool,
 }
 
 impl Occ {
@@ -218,46 +437,78 @@ impl Occ {
     }
 }
 
-/// Occurrence spans (local seconds) of `a` overlapping days `[from, to)`, expanded by the engine
-/// (`calendar::occurrences`, i.e. the formats crate's RFC 5545 expansion with EXDATEs).
+/// Occurrence spans (local seconds) of `a` overlapping days `[from, to)` at fixed offset `tz`.
+#[cfg(test)]
 pub(super) fn expand(a: &Appointment, tz: i32, from: i64, to: i64) -> Vec<(i64, i64)> {
-    let shift = i64::from(tz).saturating_mul(60);
-    let at = |day: i64| DateTime::from_unix(day.saturating_mul(DAY).saturating_sub(shift), tz);
+    expand_on(a, &Clock::fixed(tz), from, to).into_iter().map(|(s, e, _)| (s, e)).collect()
+}
+
+/// Occurrences of `a` overlapping local days `[from, to)` on `clock` (the calendar's: its named zone across
+/// daylight-saving changes): (local start, local end, start instant), expanded by the engine
+/// (`calendar::occurrences`: RFC 5545 expansion with EXDATEs, in the appointment's time zone when it has one).
+pub(super) fn expand_on(a: &Appointment, clock: &Clock, from: i64, to: i64) -> Vec<(i64, i64, i64)> {
+    let at = |day: i64| clock.from_local(day.saturating_mul(DAY));
     if to <= from {
         return Vec::new();
     }
     occurrences(a, at(from), at(to), 1000)
         .into_iter()
         .map(|(s, e)| {
-            let ls = local_secs(s, tz);
-            (ls, local_secs(e, tz).max(ls))
+            let ls = clock.local(s.unix);
+            (ls, clock.local(e.unix).max(ls), s.unix)
         })
         .collect()
 }
 
-/// Occurrences of appointments in `calendars` over days `[from, to)`, sorted by start.
+/// The calendar's clock (see `engine_cal::tz::Clock`).
+pub(super) fn cal_clock(app: &App) -> Clock {
+    Clock::of(&app.s)
+}
+
+/// First lines of a body for the Preview view.
+fn preview_text(body: &str) -> String {
+    let mut out = String::new();
+    for word in body.split_whitespace() {
+        if out.len() > 160 {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+/// Occurrences of appointments in `calendars` over days `[from, to)`, sorted by start. Items take their
+/// first category's colour, else their calendar's.
 pub(super) fn gather(app: &App, calendars: &BTreeSet<FolderId>, from: i64, to: i64) -> Vec<Occ> {
-    let tz = tz(app);
+    let clock = cal_clock(app);
+    let looks: BTreeMap<FolderId, (Color32, bool)> = calendars
+        .iter()
+        .map(|f| (*f, (calendar_color32(app, *f), props::is_read_only(&app.s.mailbox, *f))))
+        .collect();
     let mut out = Vec::new();
     for a in app.s.mailbox.appointments.values() {
-        if !calendars.contains(&a.folder) {
-            continue;
-        }
-        let base = category_color(app, &a.categories).unwrap_or(app.theme.accent);
-        for (start, end) in expand(a, tz, from, to) {
+        let Some(&(cal_color, read_only)) = looks.get(&a.folder) else { continue };
+        let base = category_color(app, &a.categories).unwrap_or(cal_color);
+        for (start, end, start_unix) in expand_on(a, &clock, from, to) {
             out.push(Occ {
                 id: a.id,
                 folder: a.folder,
                 start,
                 end,
+                start_unix,
                 all_day: a.all_day,
                 subject: a.subject.clone(),
                 location: a.location.clone(),
+                preview: if a.private { String::new() } else { preview_text(&a.body) },
                 base,
                 show_as: a.show_as,
                 private: a.private,
                 recurring: a.recurrence.is_some(),
                 meeting: a.is_meeting,
+                read_only,
             });
         }
     }
@@ -299,15 +550,19 @@ fn occ_interact(app: &mut App, st: &mut ModState, resp: &egui::Response, o: &Occ
         st.cal_slot = None;
     }
     let id = o.id;
-    let occ_unix = o.start.saturating_sub(i64::from(tz(app)).saturating_mul(60));
+    let occ_unix = o.start_unix;
     if resp.double_clicked() {
         editors::open_occurrence(app, st, id, occ_unix);
     }
-    let recurring = o.recurring;
+    let (recurring, read_only) = (o.recurring, o.read_only);
     resp.context_menu(|ui| {
         if ui.button("Open").clicked() {
             editors::open_occurrence(app, st, id, occ_unix);
             ui.close();
+        }
+        if read_only {
+            ui.label(RichText::new("Internet calendar (read-only)").color(app.theme.text_muted));
+            return;
         }
         if recurring {
             if ui.button("Open Series").clicked() {
@@ -342,8 +597,8 @@ fn occ_interact(app: &mut App, st: &mut ModState, resp: &egui::Response, o: &Occ
     });
 }
 
-/// Paints an occurrence block (time grid / schedule).
-fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool) {
+/// Paints an occurrence block (time grid / schedule). `preview` adds the body's first lines.
+fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool, preview: bool) {
     let (fill, bar) = occ_colors(app, o);
     let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     p.rect_filled(rect, CornerRadius::same(3), fill);
@@ -376,15 +631,36 @@ fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool) {
         app.theme.text,
         w,
     );
+    let mut y = sub.max.y + 1.0;
     if !o.location.trim().is_empty() && inner.height() > 30.0 {
-        paint_text_clipped(
+        let r = paint_text_clipped(
             ui,
-            pos2(inner.min.x, sub.max.y + 1.0),
+            pos2(inner.min.x, y),
             o.location.trim(),
             FontId::proportional(11.5),
             app.theme.text_muted,
             inner.width(),
         );
+        y = r.max.y + 1.0;
+    }
+    if preview && !o.preview.is_empty() && inner.max.y - y > 12.0 {
+        // Preview: as much of the body as fits, line by line.
+        let mut job = egui::text::LayoutJob::single_section(
+            o.preview.clone(),
+            egui::TextFormat {
+                font_id: FontId::proportional(11.5),
+                color: app.theme.text_muted,
+                ..Default::default()
+            },
+        );
+        job.wrap = egui::text::TextWrapping {
+            max_width: inner.width().max(8.0),
+            max_rows: ((inner.max.y - y) / 14.0).floor().max(1.0) as usize,
+            break_anywhere: false,
+            overflow_character: Some('…'),
+        };
+        let galley = ui.painter().layout_job(job);
+        p.galley(pos2(inner.min.x, y), galley, app.theme.text_muted);
     }
 }
 
@@ -395,18 +671,40 @@ fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool) {
 pub(super) fn show(ui: &mut Ui, app: &mut App) {
     let ctx = ui.ctx().clone();
     let mut st = load(&ctx);
+    let mut cu = load_ui(&ctx);
     sync_mode(app, &mut st);
+    adopt_saved(app, &mut st, &mut cu);
+    // Dialog requests from commands (the calendar's own windows among them) before the dialogs area draws.
+    crate::dialogs::take_notices(app);
+    windows::take_requests(app, &mut cu);
+    windows::poll_fetches(&ctx, app, &mut cu);
+    let now = ctx.input(|i| i.time);
+    if cu.last_poll.is_none_or(|t| now - t >= POLL_SECS || now < t) {
+        cu.last_poll = Some(now);
+        windows::refresh_due(&ctx, app, &mut cu);
+        views::refresh_time_zone(&mut app.s);
+    }
+    let look = Look::of(app, &st);
     let full = ui.max_rect();
-    let (pane, main) = split_folder_pane(ui, app);
+    let (pane, mut main) = split_folder_pane(ui, app);
+    // To-Do Bar (View › Layout › To-Do Bar) on the right, when there is room.
+    let bar_w = super::TODO_BAR_WIDTH;
+    if super::todo_bar_shown(&ctx) && main.width() >= bar_w + 420.0 {
+        let bar = Rect::from_min_max(pos2(main.max.x - bar_w, main.min.y), main.max);
+        main = Rect::from_min_max(main.min, pos2(bar.min.x - super::common::GAP, main.max.y));
+        child(ui, bar, "mc-cal-todo-bar", |ui| super::todo_bar(ui, app));
+    }
     if let Some(p) = pane {
         pane_bg(ui, p, app.theme.pane);
-        child(ui, p.shrink(6.0), "mc-cal-pane", |ui| folder_pane(ui, app, &mut st));
+        child(ui, p.shrink(6.0), "mc-cal-pane", |ui| folder_pane(ui, app, &mut st, &look));
     }
     pane_bg(ui, main, app.theme.reading);
-    child(ui, main, "mc-cal-main", |ui| content(ui, app, &mut st));
+    child(ui, main, "mc-cal-main", |ui| content(ui, app, &mut st, &mut cu, &look));
     keyboard(&ctx, app, &mut st);
+    windows::show(&ctx, app, &mut st, &mut cu);
     ui.expand_to_include_rect(full);
     store(&ctx, st);
+    store_ui(&ctx, cu);
 }
 
 fn keyboard(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
@@ -420,13 +718,15 @@ fn keyboard(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
     };
     if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)) {
         app.run("calendar.delete", json!({ "id": sel.0 }));
-        app.ui.module_selection = None;
+        if !app.s.mailbox.appointments.contains_key(&sel) {
+            app.ui.module_selection = None;
+        }
     } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
         editors::open_appointment(app, st, sel);
     }
 }
 
-fn folder_pane(ui: &mut Ui, app: &mut App, st: &mut ModState) {
+fn folder_pane(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look) {
     ScrollArea::vertical().id_salt("mc-cal-pane-scroll").auto_shrink([false, false]).show(ui, |ui| {
         let sel = selected_day(app, st);
         let (y, m) = st.nav_month.unwrap_or_else(|| {
@@ -436,7 +736,7 @@ fn folder_pane(ui: &mut Ui, app: &mut App, st: &mut ModState) {
         let months = if ui.available_height() > 560.0 { 2 } else { 1 };
         for i in 0..months {
             let (yy, mm) = add_months(y, m, i);
-            mini_month(ui, app, st, yy, mm, i == 0);
+            mini_month(ui, app, st, look, yy, mm, i == 0);
             ui.add_space(10.0);
         }
         ui.separator();
@@ -460,12 +760,25 @@ fn folder_pane(ui: &mut Ui, app: &mut App, st: &mut ModState) {
                 st.cal_shown = set;
                 select_folder(app, f);
             }
+            // Colour key of the shown calendars.
+            let cals = ordered(app, &shown_calendars(app, st));
+            if cals.len() > 1 {
+                ui.add_space(4.0);
+                for f in cals {
+                    let name = app.s.mailbox.folder(f).map(|x| x.name.clone()).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                        ui.painter().rect_filled(r, CornerRadius::same(2), calendar_color32(app, f));
+                        ui.label(RichText::new(name).size(12.0).color(app.theme.text_muted));
+                    });
+                }
+            }
         }
     });
 }
 
 /// Date navigator month.
-fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, y: i64, m: u8, arrows: bool) {
+fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64, m: u8, arrows: bool) {
     let w = ui.available_width().min(240.0);
     let cell = (w / 7.0).floor();
     let (head, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
@@ -513,7 +826,7 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, y: i64, m: u8, arro
     let visible: BTreeSet<i64> = if st.cal.mode == CalendarMode::Month {
         [sel].into_iter().collect()
     } else {
-        visible_days(st, sel).into_iter().collect()
+        visible_days(st, sel, &look.work_days).into_iter().collect()
     };
     let busy: BTreeSet<i64> = gather(app, &shown_calendars(app, st), start, start + weeks * 7)
         .iter()
@@ -563,23 +876,148 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, y: i64, m: u8, arro
 
 const WEEK_INITIALS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 
-fn content(ui: &mut Ui, app: &mut App, st: &mut ModState) {
+fn content(ui: &mut Ui, app: &mut App, st: &mut ModState, cu: &mut CalUi, look: &Look) {
     let rect = ui.max_rect();
     let bar = Rect::from_min_size(rect.min, vec2(rect.width(), BAR_H));
-    child(ui, bar.shrink2(vec2(10.0, 8.0)), "mc-cal-bar", |ui| folder_bar(ui, app, st));
+    child(ui, bar.shrink2(vec2(10.0, 8.0)), "mc-cal-bar", |ui| folder_bar(ui, app, st, look));
     ui.painter().hline(rect.x_range(), bar.max.y, Stroke::new(1.0, app.theme.separator));
-    let body = Rect::from_min_max(pos2(rect.min.x, bar.max.y + 1.0), rect.max);
+    let mut top = bar.max.y + 1.0;
+    // Internet calendar: when it was updated, a Refresh button.
+    if let Some(folder) = current_folder(app, Kind::Appointment)
+        && let Some(sub) = props::read(&app.s.mailbox, folder).subscription
+    {
+        let strip = Rect::from_min_size(pos2(rect.min.x, top), vec2(rect.width(), INFO_H));
+        child(ui, strip.shrink2(vec2(10.0, 3.0)), "mc-cal-info", |ui| {
+            windows::subscription_strip(ui, app, cu, folder, &sub);
+        });
+        ui.painter().hline(rect.x_range(), strip.max.y, Stroke::new(1.0, app.theme.separator));
+        top = strip.max.y + 1.0;
+    }
+    let body = Rect::from_min_max(pos2(rect.min.x, top), rect.max);
     if body.height() < 40.0 || body.width() < 80.0 {
         return;
     }
-    match st.cal.mode {
-        CalendarMode::Month => month_view(ui, app, st, body),
-        CalendarMode::Schedule => schedule_view(ui, app, st, body),
-        _ => time_grid_view(ui, app, st, body),
+    // Reading pane (View › Reading Pane): Right or Bottom, when there is room.
+    let (view, reading) = match st.cal.reading_pane {
+        ReadingPanePos::Right if body.width() > 640.0 => {
+            let split = body.max.x - (body.width() * 0.34).clamp(260.0, 420.0);
+            (
+                Rect::from_min_max(body.min, pos2(split - 1.0, body.max.y)),
+                Some(Rect::from_min_max(pos2(split, body.min.y), body.max)),
+            )
+        }
+        ReadingPanePos::Bottom if body.height() > 320.0 => {
+            let split = body.max.y - (body.height() * 0.38).clamp(140.0, 360.0);
+            (
+                Rect::from_min_max(body.min, pos2(body.max.x, split - 1.0)),
+                Some(Rect::from_min_max(pos2(body.min.x, split), body.max)),
+            )
+        }
+        _ => (body, None),
+    };
+    let cals = shown_calendars(app, st);
+    if st.cal.current.is_table() {
+        child(ui, view, "mc-cal-table", |ui| table::table_view(ui, app, st, &cals, view));
+    } else {
+        match st.cal.mode {
+            CalendarMode::Schedule => schedule_view(ui, app, st, view),
+            mode => panes(ui, app, st, cu, look, view, &cals, mode == CalendarMode::Month),
+        }
+    }
+    if let Some(r) = reading {
+        let line = Stroke::new(1.0, app.theme.separator);
+        if st.cal.reading_pane == ReadingPanePos::Right {
+            ui.painter().vline(r.min.x, r.y_range(), line);
+        } else {
+            ui.painter().hline(r.x_range(), r.min.y, line);
+        }
+        child(ui, r.shrink2(vec2(14.0, 10.0)), "mc-cal-reading", |ui| reading_pane(ui, app));
     }
 }
 
-fn folder_bar(ui: &mut Ui, app: &mut App, st: &mut ModState) {
+/// Lays out one pane per calendar (side by side) or one overlaid pane, each with its calendar tabs, and
+/// draws the month or day/week view in each.
+#[allow(clippy::too_many_arguments)]
+fn panes(
+    ui: &mut Ui,
+    app: &mut App,
+    st: &mut ModState,
+    cu: &mut CalUi,
+    look: &Look,
+    rect: Rect,
+    cals: &BTreeSet<FolderId>,
+    month: bool,
+) {
+    let list = ordered(app, cals);
+    let side_by_side = list.len() > 1 && !st.cal.overlay && list.len() <= MAX_SIDE_BY_SIDE;
+    let mut panes: Vec<(Rect, Vec<FolderId>, Pane)> = Vec::new();
+    if side_by_side {
+        let w = rect.width() / list.len() as f32;
+        for (k, f) in list.iter().enumerate() {
+            let r = Rect::from_min_size(pos2(rect.min.x + w * k as f32, rect.min.y), vec2(w, rect.height()));
+            panes.push((r, vec![*f], Pane { cals: [*f].into_iter().collect(), key: k + 1 }));
+        }
+    } else {
+        panes.push((
+            rect,
+            if list.len() > 1 { list.clone() } else { Vec::new() },
+            Pane { cals: cals.clone(), key: 0 },
+        ));
+    }
+    for (r, tabs, pane) in panes {
+        let mut body = r;
+        if !tabs.is_empty() {
+            let strip = Rect::from_min_size(r.min, vec2(r.width(), TAB_H));
+            calendar_tabs(ui, app, strip, &tabs, pane.key);
+            body = Rect::from_min_max(pos2(r.min.x, strip.max.y + 1.0), r.max);
+        }
+        if body.height() < 40.0 || body.width() < 60.0 {
+            continue;
+        }
+        if month {
+            month_view(ui, app, st, &pane, body);
+        } else {
+            time_grid_view(ui, app, st, cu, look, &pane, body);
+        }
+        if pane.key > 0 {
+            ui.painter().vline(r.max.x, r.y_range(), Stroke::new(1.0, app.theme.separator));
+        }
+    }
+}
+
+/// Coloured calendar tabs over a pane; clicking one makes it the current calendar.
+fn calendar_tabs(ui: &mut Ui, app: &mut App, strip: Rect, tabs: &[FolderId], key: usize) {
+    let n = tabs.len().max(1) as f32;
+    let w = (strip.width() / n).min(220.0);
+    for (i, f) in tabs.iter().enumerate() {
+        let r = Rect::from_min_size(
+            pos2(strip.min.x + w * i as f32 + 2.0, strip.min.y + 2.0),
+            vec2(w - 4.0, TAB_H - 3.0),
+        );
+        let color = calendar_color32(app, *f);
+        let name = app.s.mailbox.folder(*f).map(|x| x.name.clone()).unwrap_or_default();
+        let resp = ui.interact(r, Id::new(("mc-cal-tab", key, f.0)), Sense::click());
+        a11y(&resp, WidgetType::Button, &name);
+        ui.painter().rect_filled(
+            r,
+            CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 },
+            blend(app.theme.reading, color, 0.75),
+        );
+        paint_text_clipped(
+            ui,
+            pos2(r.min.x + 8.0, r.min.y + 4.0),
+            &name,
+            FontId::proportional(12.5),
+            Color32::WHITE,
+            r.width() - 12.0,
+        );
+        if resp.clicked() && current_folder(app, Kind::Appointment) != Some(*f) {
+            select_folder(app, *f);
+        }
+    }
+}
+
+fn folder_bar(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look) {
     let sel = selected_day(app, st);
     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
         if crate::widgets::icon_button(ui, app, "today", "Today", true).on_hover_text("Go to today").clicked()
@@ -597,25 +1035,36 @@ fn folder_bar(ui: &mut Ui, app: &mut App, st: &mut ModState) {
             go_to(app, st, step(st, sel, 1));
         }
         ui.add_space(8.0);
-        ui.label(RichText::new(title(st, sel)).size(19.0).color(app.theme.text));
+        let text = if st.cal.current.is_table() {
+            st.cal.current.label().to_owned()
+        } else {
+            title(st, sel, &look.work_days)
+        };
+        ui.label(RichText::new(text).size(19.0).color(app.theme.text));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let mut mode = st.cal.mode;
-            ComboBox::from_id_salt("mc-cal-mode").selected_text(mode_label(mode)).width(130.0).show_ui(
+            ComboBox::from_id_salt("mc-cal-mode").selected_text(mode.label()).width(130.0).show_ui(
                 ui,
                 |ui| {
-                    for m in [
-                        CalendarMode::Day,
-                        CalendarMode::WorkWeek,
-                        CalendarMode::Week,
-                        CalendarMode::Month,
-                        CalendarMode::Schedule,
-                    ] {
-                        ui.selectable_value(&mut mode, m, mode_label(m));
+                    for m in CalendarMode::ALL {
+                        ui.selectable_value(&mut mode, m, m.label());
                     }
                 },
             );
             if mode != st.cal.mode {
                 run_view_cmd(app, st, "calendar.arrange", json!({ "mode": mode.name() }));
+            }
+            let mut current = st.cal.current;
+            ComboBox::from_id_salt("mc-cal-current").selected_text(current.label()).width(96.0).show_ui(
+                ui,
+                |ui| {
+                    for v in CalendarCurrentView::ALL {
+                        ui.selectable_value(&mut current, v, v.label());
+                    }
+                },
+            );
+            if current != st.cal.current {
+                run_view_cmd(app, st, "view.changeView", json!({ "name": current.label() }));
             }
             let go = crate::widgets::icon_only(ui, app, "calendar", "Go to Date", true);
             a11y(&go, WidgetType::Button, "Go to Date");
@@ -627,11 +1076,94 @@ fn folder_bar(ui: &mut Ui, app: &mut App, st: &mut ModState) {
     });
 }
 
+/// Reading pane: the selected appointment.
+fn reading_pane(ui: &mut Ui, app: &mut App) {
+    let Some(a) = app.ui.module_selection.and_then(|i| app.s.mailbox.appointments.get(&ItemId(i))).cloned()
+    else {
+        empty_message(
+            ui,
+            ui.max_rect(),
+            app,
+            "Select an item to read",
+            "Click an appointment to see it here.",
+        );
+        return;
+    };
+    let cal = cal_clock(app);
+    let tz = cal.offset_at(a.start.unix);
+    ScrollArea::vertical().id_salt("mc-cal-reading-scroll").auto_shrink([false, false]).show(ui, |ui| {
+        let subject = if a.subject.trim().is_empty() { "(No subject)" } else { a.subject.trim() };
+        ui.label(RichText::new(subject).size(18.0).strong().color(app.theme.text));
+        ui.add_space(4.0);
+        let when = engine_cal::describe_recurrence(&a, tz).unwrap_or_else(|| {
+            let (s, e) = (cal.local(a.start.unix), cal.local(a.end.unix));
+            if a.all_day {
+                long_date(s.div_euclid(DAY))
+            } else {
+                format!(
+                    "{} {} – {}",
+                    long_date(s.div_euclid(DAY)),
+                    clock(s.rem_euclid(DAY) / 60),
+                    clock(e.rem_euclid(DAY) / 60)
+                )
+            }
+        });
+        ui.label(RichText::new(when).color(app.theme.text));
+        if let Some(z) = a.zone() {
+            ui.label(
+                RichText::new(format!("Time zone: {}", z.replace('_', " "))).color(app.theme.text_muted),
+            );
+        }
+        if !a.location.trim().is_empty() {
+            ui.label(RichText::new(format!("Location: {}", a.location.trim())).color(app.theme.text_muted));
+        }
+        let cal = app.s.mailbox.folder(a.folder).map(|f| f.name.clone()).unwrap_or_default();
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+            ui.painter().rect_filled(r, CornerRadius::same(2), calendar_color32(app, a.folder));
+            ui.label(RichText::new(cal).color(app.theme.text_muted));
+        });
+        if let Some(o) = &a.organizer {
+            ui.label(
+                RichText::new(format!("Organizer: {}", o.to_display_string())).color(app.theme.text_muted),
+            );
+        }
+        if !a.attendees.is_empty() {
+            let list: Vec<String> = a.attendees.iter().map(|x| x.mailbox.to_display_string()).collect();
+            ui.label(RichText::new(format!("Attendees: {}", list.join("; "))).color(app.theme.text_muted));
+        }
+        if !a.categories.is_empty() {
+            ui.label(
+                RichText::new(format!("Categories: {}", a.categories.join(", "))).color(app.theme.text_muted),
+            );
+        }
+        if !a.body.trim().is_empty() && !a.private {
+            ui.separator();
+            ui.label(RichText::new(a.body.trim()).color(app.theme.text));
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Month view
 // ---------------------------------------------------------------------------------------------------------
 
-fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
+/// A calendar to create items in: `f` when it can take them, else the default calendar.
+fn writable(app: &App, f: Option<FolderId>) -> Option<FolderId> {
+    match f {
+        Some(f) if !props::is_read_only(&app.s.mailbox, f) => Some(f),
+        _ => engine_cal::pim::default_folder(&app.s, Kind::Appointment),
+    }
+}
+
+/// The calendar new items in `pane` go to.
+fn pane_folder(app: &App, pane: &Pane) -> Option<FolderId> {
+    let current = current_folder(app, Kind::Appointment);
+    let f = if pane.cals.len() == 1 { pane.cals.iter().next().copied() } else { current };
+    writable(app, f)
+}
+
+fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, pane: &Pane, rect: Rect) {
     let sel = selected_day(app, st);
     let (start, weeks) = month_grid(sel);
     let (_, month, _) = ymd(sel);
@@ -640,10 +1172,12 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
     let cell_w = rect.width() / 7.0;
     let cell_h = ((rect.height() - head_h) / weeks as f32).max(30.0);
     let p = ui.painter().clone();
+    let k = pane.key;
     for c in 0..7 {
         let r = Rect::from_min_size(pos2(rect.min.x + cell_w * c as f32, rect.min.y), vec2(cell_w, head_h));
         let strong = weekday(now) == c as u8;
         let name = super::common::WEEKDAYS.get(c).copied().unwrap_or("");
+        let name = if cell_w < 70.0 { name.get(..3).unwrap_or(name) } else { name };
         p.text(
             pos2(r.min.x + 8.0, r.center().y),
             Align2::LEFT_CENTER,
@@ -652,7 +1186,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
             if strong { app.theme.accent } else { app.theme.text_muted },
         );
     }
-    let occs = gather(app, &shown_calendars(app, st), start, start + weeks * 7);
+    let occs = gather(app, &pane.cals, start, start + weeks * 7);
     let shaded = blend(app.theme.reading, app.theme.backdrop, 0.45);
     let line = Stroke::new(1.0, app.theme.separator);
     for i in 0..weeks * 7 {
@@ -662,7 +1196,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
             pos2(rect.min.x + cell_w * c as f32, rect.min.y + head_h + cell_h * r as f32),
             vec2(cell_w, cell_h),
         );
-        let resp = ui.interact(cell, Id::new(("mc-cal-cell", d)), Sense::click());
+        let resp = ui.interact(cell, Id::new(("mc-cal-cell", k, d)), Sense::click());
         a11y(&resp, WidgetType::Button, &long_date(d));
         let (_, m, dd) = ymd(d);
         let fill = if d == sel {
@@ -706,7 +1240,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
             }
         }
         if resp.double_clicked() {
-            let folder = current_folder(app, Kind::Appointment);
+            let folder = pane_folder(app, pane);
             editors::new_appointment(app, st, folder, d, 0, 0, true);
         }
         // Items
@@ -717,12 +1251,12 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
         items.sort_by_key(|o| (!o.banner(), o.start, o.id));
         let n = items.len();
         let show = if n > avail { avail.saturating_sub(1) } else { n };
-        for (k, o) in items.iter().take(show).enumerate() {
+        for (j, o) in items.iter().take(show).enumerate() {
             let chip = Rect::from_min_size(
-                pos2(cell.min.x + 3.0, top + line_h * k as f32),
+                pos2(cell.min.x + 3.0, top + line_h * j as f32),
                 vec2(cell_w - 6.0, line_h - 2.0),
             );
-            let resp = ui.interact(chip, Id::new(("mc-cal-occ", o.id.0, d)), Sense::click());
+            let resp = ui.interact(chip, Id::new(("mc-cal-occ", k, o.id.0, d)), Sense::click());
             a11y(&resp, WidgetType::Button, &occ_a11y(o));
             let selected = app.ui.module_selection == Some(o.id.0);
             let (fill, bar) = occ_colors(app, o);
@@ -771,7 +1305,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
                 pos2(cell.min.x + 3.0, top + line_h * show as f32),
                 vec2(cell_w - 6.0, line_h - 2.0),
             );
-            let resp = ui.interact(more, Id::new(("mc-cal-more", d)), Sense::click());
+            let resp = ui.interact(more, Id::new(("mc-cal-more", k, d)), Sense::click());
             let text = format!("+{} more", n - show);
             a11y(&resp, WidgetType::Button, &text);
             p.text(
@@ -866,25 +1400,133 @@ fn banner_lanes(occs: &[Occ], first: i64, last: i64) -> Vec<(usize, usize)> {
     out
 }
 
-fn time_grid_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
+/// "9 AM" for whole hours, else "9:30 AM" (second time zone ruler).
+fn ruler_label(minute: i64) -> String {
+    let m = minute.rem_euclid(24 * 60);
+    if m % 60 == 0 { hour_label(m / 60) } else { clock(m) }
+}
+
+/// Where a drag lands: the new local (start, end) of the block, snapped to the time scale. `pointer` =
+/// (day, minute of day) under the pointer.
+fn drag_target(d: &Drag, pointer: (i64, i64), slot: i64, bounds: (i64, i64)) -> (i64, i64) {
+    let slot = slot.max(1);
+    let snap = |m: i64| ((m as f64 / slot as f64).round() as i64).saturating_mul(slot);
+    let (day, minute) = pointer;
+    let minute = minute.clamp(bounds.0, bounds.1);
+    let len = (d.end - d.start).max(0);
+    match d.kind {
+        DragKind::Move => {
+            let m = snap(minute - d.grab_min);
+            let start = day.saturating_mul(DAY).saturating_add(m.saturating_mul(60));
+            (start, start.saturating_add(len))
+        }
+        DragKind::Top => {
+            let day0 = d.start.div_euclid(DAY);
+            let start = day0.saturating_mul(DAY).saturating_add(snap(minute).saturating_mul(60));
+            (start.min(d.end - slot * 60), d.end)
+        }
+        DragKind::Bottom => {
+            let day0 = (d.end - 1).max(d.start).div_euclid(DAY);
+            let end = day0.saturating_mul(DAY).saturating_add(snap(minute).saturating_mul(60));
+            (d.start, end.max(d.start + slot * 60))
+        }
+    }
+}
+
+/// Sets `key` on a JSON object.
+fn put(v: &mut Value, key: &str, x: Value) {
+    if let Some(o) = v.as_object_mut() {
+        o.insert(key.to_owned(), x);
+    }
+}
+
+/// Runs the engine command for a finished drag. Returns the item now selected.
+fn commit_drag(app: &mut App, d: &Drag, target: (i64, i64)) -> Option<ItemId> {
+    if target == (d.start, d.end) {
+        return None;
+    }
+    let clock = cal_clock(app);
+    let unix = |local: i64| clock.from_local(local).unix;
+    let mut params = json!({ "id": d.id.0 });
+    let id = match d.kind {
+        DragKind::Move => {
+            put(&mut params, "start", json!(unix(target.0)));
+            "calendar.moveItem"
+        }
+        DragKind::Top => {
+            put(&mut params, "start", json!(unix(target.0)));
+            "calendar.resize"
+        }
+        DragKind::Bottom => {
+            put(&mut params, "end", json!(unix(target.1)));
+            "calendar.resize"
+        }
+    };
+    if let Some(o) = d.occurrence {
+        put(&mut params, "occurrence", json!(o));
+    }
+    let out = app.run(id, params)?;
+    let new_id = out.get("id").and_then(Value::as_u64).map(ItemId);
+    if out.get("sendUpdate").and_then(Value::as_bool) == Some(true)
+        && let Some(n) = new_id
+    {
+        crate::dialogs::confirm(
+            app,
+            "Send Update",
+            "This meeting changed. Send an update to the attendees?",
+            "calendar.sendUpdate",
+            json!({ "id": n.0 }),
+        );
+    }
+    new_id
+}
+
+#[allow(clippy::too_many_arguments)]
+fn time_grid_view(
+    ui: &mut Ui,
+    app: &mut App,
+    st: &mut ModState,
+    cu: &mut CalUi,
+    look: &Look,
+    pane: &Pane,
+    rect: Rect,
+) {
     let sel = selected_day(app, st);
-    let days = visible_days(st, sel);
+    let days = visible_days(st, sel, &look.work_days);
     let (Some(&first), Some(&last)) = (days.first(), days.last()) else { return };
     let n = days.len() as f32;
     let now = today(app);
     let scroll_w = 12.0;
-    let col_w = ((rect.width() - RULER_W - scroll_w) / n).max(20.0);
+    let k = pane.key;
+    let rulers = if look.second.is_some() { 2.0 } else { 1.0 };
+    let ruler_w = RULER_W * rulers;
+    let col_w = ((rect.width() - ruler_w - scroll_w) / n).max(20.0);
     let p = ui.painter().clone();
     let line = Stroke::new(1.0, app.theme.separator);
+    let tz_off = tz(app);
 
-    // Day headers.
+    // Day headers (and the zone labels over the rulers).
     let head_h = 44.0;
+    if let Some((label2, _)) = &look.second {
+        let primary =
+            if look.primary_label.is_empty() { "Local".to_owned() } else { look.primary_label.clone() };
+        for (i, text) in [label2.as_str(), primary.as_str()].iter().enumerate() {
+            paint_text_clipped(
+                ui,
+                pos2(rect.min.x + 4.0 + RULER_W * i as f32, rect.min.y + head_h - 16.0),
+                text,
+                FontId::proportional(10.5),
+                app.theme.text_muted,
+                RULER_W - 8.0,
+            );
+        }
+    }
     for (i, &d) in days.iter().enumerate() {
         let r = Rect::from_min_size(
-            pos2(rect.min.x + RULER_W + col_w * i as f32, rect.min.y),
+            pos2(rect.min.x + ruler_w + col_w * i as f32, rect.min.y),
             vec2(col_w, head_h),
         );
-        let resp = ui.interact(r, Id::new(("mc-cal-dayhead", d)), Sense::click());
+        let resp = ui.interact(r, Id::new(("mc-cal-dayhead", k, d)), Sense::click());
         a11y(&resp, WidgetType::Button, &long_date(d));
         let color = if d == now { app.theme.accent } else { app.theme.text };
         let (_, _, dd) = ymd(d);
@@ -916,7 +1558,7 @@ fn time_grid_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
     }
 
     // All-day strip.
-    let occs = gather(app, &shown_calendars(app, st), first, last + 1);
+    let occs = gather(app, &pane.cals, first, last + 1);
     let lanes = banner_lanes(&occs, first, last);
     let nlanes = lanes.iter().map(|(_, l)| l + 1).max().unwrap_or(0).min(4);
     let strip_h = LANE_H * nlanes.max(1) as f32 + 6.0;
@@ -932,14 +1574,14 @@ fn time_grid_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
     );
     for (i, &d) in days.iter().enumerate() {
         let r = Rect::from_min_size(
-            pos2(strip.min.x + RULER_W + col_w * i as f32, strip.min.y),
+            pos2(strip.min.x + ruler_w + col_w * i as f32, strip.min.y),
             vec2(col_w, strip_h),
         );
-        let resp = ui.interact(r, Id::new(("mc-cal-allday", d)), Sense::click());
+        let resp = ui.interact(r, Id::new(("mc-cal-allday", k, d)), Sense::click());
         a11y(&resp, WidgetType::Button, &format!("All day, {}", long_date(d)));
         p.vline(r.min.x, r.y_range(), line);
         if resp.double_clicked() {
-            let folder = current_folder(app, Kind::Appointment);
+            let folder = pane_folder(app, pane);
             editors::new_appointment(app, st, folder, d, 0, 0, true);
         }
     }
@@ -951,43 +1593,70 @@ fn time_grid_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
         let a = (o.first_day().max(first) - first) as f32;
         let b = (o.last_day().min(last) - first + 1) as f32;
         let r = Rect::from_min_max(
-            pos2(strip.min.x + RULER_W + col_w * a + 2.0, strip.min.y + 3.0 + LANE_H * lane as f32),
-            pos2(strip.min.x + RULER_W + col_w * b - 2.0, strip.min.y + 1.0 + LANE_H * (lane + 1) as f32),
+            pos2(strip.min.x + ruler_w + col_w * a + 2.0, strip.min.y + 3.0 + LANE_H * lane as f32),
+            pos2(strip.min.x + ruler_w + col_w * b - 2.0, strip.min.y + 1.0 + LANE_H * (lane + 1) as f32),
         );
-        let resp = ui.interact(r, Id::new(("mc-cal-banner", o.id.0, o.start)), Sense::click());
+        let resp = ui.interact(r, Id::new(("mc-cal-banner", k, o.id.0, o.start)), Sense::click());
         a11y(&resp, WidgetType::Button, &occ_a11y(o));
         let selected = app.ui.module_selection == Some(o.id.0);
-        paint_block(ui, app, r, o, selected);
+        paint_block(ui, app, r, o, selected, false);
         occ_interact(app, st, &resp, o);
     }
 
+    // Daily Task List under the grid.
+    let mut grid_bottom = rect.max.y;
+    if st.cal.daily_task_list != DailyTaskList::Off && rect.height() > 260.0 {
+        let tasks = engine_cal::tasks_for_days(&app.s.mailbox, tz_off, now, first, last + 1, 500);
+        let minimized = st.cal.daily_task_list == DailyTaskList::Minimized;
+        let rows = if minimized {
+            0
+        } else {
+            days.iter()
+                .map(|d| tasks.iter().filter(|(x, _)| x == d).count())
+                .max()
+                .unwrap_or(0)
+                .clamp(1, TASK_ROWS)
+        };
+        let h = TASK_HEAD_H + TASK_ROW_H * rows as f32 + 4.0;
+        let r = Rect::from_min_max(pos2(rect.min.x, rect.max.y - h), rect.max);
+        grid_bottom = r.min.y - 1.0;
+        task_strip(ui, app, st, r, ruler_w, col_w, &days, &tasks, minimized, k);
+    }
+
     // Time grid.
-    let grid = Rect::from_min_max(pos2(rect.min.x, strip.max.y + 1.0), rect.max);
-    let (start_min, end_min) = if st.cal.working_hours { (WORK_START, WORK_END) } else { (0, 24 * 60) };
+    let grid = Rect::from_min_max(pos2(rect.min.x, strip.max.y + 1.0), pos2(rect.max.x, grid_bottom));
+    if grid.height() < 20.0 {
+        return;
+    }
+    let (work_start, work_end) = look.work;
+    let (start_min, end_min) = if st.cal.working_hours { (work_start, work_end) } else { (0, 24 * 60) };
     let slot = i64::from(st.cal.time_scale.max(5));
-    let px_per_min = SLOT_H / slot as f32;
+    let px_per_min = look.slot_h / slot as f32;
     let total_h = (end_min - start_min) as f32 * px_per_min;
-    let key = format!("{}|{}|{}|{}", st.cal.mode.name(), st.cal.date, slot, st.cal.working_hours);
-    let mut area = ScrollArea::vertical().id_salt("mc-cal-grid").auto_shrink([false, false]);
-    if st.cal_scroll_key != key {
-        area = area.vertical_scroll_offset(((WORK_START - start_min).max(0)) as f32 * px_per_min);
-        st.cal_scroll_key = key;
+    let key =
+        format!("{}|{}|{}|{}|{}", st.cal.mode.name(), st.cal.date, slot, st.cal.working_hours, look.slot_h);
+    let mut area = ScrollArea::vertical().id_salt(("mc-cal-grid", k)).auto_shrink([false, false]);
+    if cu.scroll_keys.get(&k) != Some(&key) {
+        area = area.vertical_scroll_offset(((work_start - start_min).max(0)) as f32 * px_per_min);
+        cu.scroll_keys.insert(k, key);
     }
     let now_min = now_minute(app);
-    child(ui, grid, "mc-cal-grid-area", |ui| {
+    let second_shift = look.second.as_ref().map(|(_, off)| i64::from(*off) - i64::from(look.primary_off));
+    let salt = format!("mc-cal-grid-area-{k}");
+    child(ui, grid, &salt, |ui| {
         area.show(ui, |ui| {
             let (area_rect, resp) =
-                ui.allocate_exact_size(vec2(RULER_W + col_w * n, total_h), Sense::click());
+                ui.allocate_exact_size(vec2(ruler_w + col_w * n, total_h), Sense::click());
             let p = ui.painter().clone();
             let shade = blend(app.theme.reading, app.theme.backdrop, 0.3);
-            let x0 = area_rect.min.x + RULER_W;
+            let x0 = area_rect.min.x + ruler_w;
             for (i, &d) in days.iter().enumerate() {
                 let col =
                     Rect::from_min_size(pos2(x0 + col_w * i as f32, area_rect.min.y), vec2(col_w, total_h));
                 p.rect_filled(col, CornerRadius::ZERO, shade);
-                if (1..=5).contains(&weekday(d)) {
-                    let a = (WORK_START.max(start_min) - start_min) as f32 * px_per_min;
-                    let b = (WORK_END.min(end_min) - start_min) as f32 * px_per_min;
+                if look.work_days.contains(&weekday(d)) {
+                    let a = (work_start.max(start_min) - start_min) as f32 * px_per_min;
+                    let b = (work_end.min(end_min) - start_min) as f32 * px_per_min;
                     if b > a {
                         p.rect_filled(
                             Rect::from_min_max(
@@ -1001,12 +1670,15 @@ fn time_grid_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
                 }
                 p.vline(col.min.x, col.y_range(), line);
             }
+            if second_shift.is_some() {
+                p.vline(area_rect.min.x + RULER_W, area_rect.y_range(), line);
+            }
             if let Some((sd, sm)) = st.cal_slot
                 && let Some(i) = days.iter().position(|&d| d == sd)
                 && (start_min..end_min).contains(&sm)
             {
                 let y = area_rect.min.y + (sm - start_min) as f32 * px_per_min;
-                let r = Rect::from_min_size(pos2(x0 + col_w * i as f32, y), vec2(col_w, SLOT_H));
+                let r = Rect::from_min_size(pos2(x0 + col_w * i as f32, y), vec2(col_w, look.slot_h));
                 p.rect_filled(r, CornerRadius::ZERO, app.theme.selected);
             }
             let mut m = start_min;
@@ -1021,36 +1693,48 @@ fn time_grid_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
                 p.hline(x0..=area_rect.max.x, y, stroke);
                 if on_hour {
                     p.text(
-                        pos2(area_rect.min.x + RULER_W - 6.0, y + 2.0),
+                        pos2(x0 - 6.0, y + 2.0),
                         Align2::RIGHT_TOP,
                         hour_label(m / 60),
                         FontId::proportional(11.0),
                         app.theme.text_muted,
                     );
+                    if let Some(shift) = second_shift {
+                        p.text(
+                            pos2(area_rect.min.x + RULER_W - 6.0, y + 2.0),
+                            Align2::RIGHT_TOP,
+                            ruler_label(m + shift),
+                            FontId::proportional(11.0),
+                            app.theme.text_muted,
+                        );
+                    }
                 }
                 m += slot;
             }
-            let pos_to_slot = |pos: egui::Pos2| -> Option<(i64, i64)> {
+            let pos_to_point = |pos: egui::Pos2| -> Option<(i64, i64)> {
                 let i = ((pos.x - x0) / col_w).floor();
-                if i < 0.0 {
-                    return None;
-                }
-                let d = *days.get(i as usize)?;
-                let minute = start_min + (((pos.y - area_rect.min.y) / px_per_min) as i64 / slot) * slot;
-                Some((d, minute.clamp(start_min, end_min - slot)))
+                let i = if i < 0.0 { 0.0 } else { i };
+                let d = days.get(i as usize).or(days.last()).copied()?;
+                let minute = start_min + ((pos.y - area_rect.min.y) / px_per_min) as i64;
+                Some((d, minute))
             };
             if (resp.clicked() || resp.double_clicked())
                 && let Some(pos) = resp.interact_pointer_pos()
-                && let Some((d, minute)) = pos_to_slot(pos)
+                && pos.x >= x0
+                && let Some((d, minute)) = pos_to_point(pos)
             {
+                let minute = ((minute - start_min) / slot) * slot + start_min;
+                let minute = minute.clamp(start_min, end_min - slot);
                 st.cal_slot = Some((d, minute));
                 app.ui.module_selection = None;
                 if resp.double_clicked() {
-                    let folder = current_folder(app, Kind::Appointment);
+                    let folder = pane_folder(app, pane);
                     editors::new_appointment(app, st, folder, d, minute, slot.max(30), false);
                 }
             }
             // Appointments.
+            let dragging = cu.drag.clone().filter(|d| d.pane == k);
+            let mut finished: Option<(Drag, (i64, i64))> = None;
             for (i, &d) in days.iter().enumerate() {
                 let (ds, de) = (d * DAY + start_min * 60, d * DAY + end_min * 60);
                 let todays: Vec<&Occ> = occs
@@ -1066,11 +1750,64 @@ fn time_grid_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
                     let w = (col_w - 8.0) / nc as f32;
                     let x = x0 + col_w * i as f32 + 2.0 + w * c as f32;
                     let r = Rect::from_min_max(pos2(x, y0 + 1.0), pos2(x + w - 1.0, y1 - 1.0));
-                    let resp = ui.interact(r, Id::new(("mc-cal-block", o.id.0, o.start, d)), Sense::click());
+                    let sense = if o.read_only { Sense::click() } else { Sense::click_and_drag() };
+                    let resp = ui.interact(r, Id::new(("mc-cal-block", k, o.id.0, o.start, d)), sense);
                     a11y(&resp, WidgetType::Button, &occ_a11y(o));
+                    // Edges resize (the block's own start/end edges only), the body moves.
+                    let edge_of = |pos: egui::Pos2| -> DragKind {
+                        if r.height() < 3.0 * EDGE {
+                            DragKind::Move
+                        } else if pos.y <= r.min.y + EDGE && s == o.start {
+                            DragKind::Top
+                        } else if pos.y >= r.max.y - EDGE && e == o.end {
+                            DragKind::Bottom
+                        } else {
+                            DragKind::Move
+                        }
+                    };
+                    if !o.read_only
+                        && let Some(pos) = resp.hover_pos()
+                        && dragging.is_none()
+                        && edge_of(pos) != DragKind::Move
+                    {
+                        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+                    }
+                    // Where the button went down (a drag is reported only after the pointer moved).
+                    let origin =
+                        ui.input(|i| i.pointer.press_origin()).or_else(|| resp.interact_pointer_pos());
+                    if resp.drag_started()
+                        && let Some(pos) = origin
+                        && let Some((_, minute)) = pos_to_point(pos)
+                    {
+                        let kind = edge_of(pos);
+                        let occ_unix = o.start_unix;
+                        cu.drag = Some(Drag {
+                            id: o.id,
+                            occurrence: o.recurring.then_some(occ_unix),
+                            kind,
+                            start: o.start,
+                            end: o.end,
+                            grab_min: (d * 1440 + minute) - o.start.div_euclid(60),
+                            pane: k,
+                        });
+                        app.ui.module_selection = Some(o.id.0);
+                    }
+                    let is_dragged = dragging.as_ref().is_some_and(|g| g.id == o.id && g.start == o.start);
                     let selected = app.ui.module_selection == Some(o.id.0);
-                    paint_block(ui, app, r, o, selected);
-                    occ_interact(app, st, &resp, o);
+                    paint_block(ui, app, r, o, selected, look.preview);
+                    if is_dragged {
+                        p.rect_filled(r, CornerRadius::same(3), app.theme.reading.gamma_multiply(0.6));
+                    }
+                    if resp.drag_stopped()
+                        && let Some(g) = cu.drag.clone().filter(|g| g.id == o.id && g.start == o.start)
+                        && let Some(pos) =
+                            resp.interact_pointer_pos().or_else(|| ui.ctx().pointer_latest_pos())
+                        && let Some(pt) = pos_to_point(pos)
+                    {
+                        finished = Some((g.clone(), drag_target(&g, pt, slot, (start_min, end_min))));
+                    } else {
+                        occ_interact(app, st, &resp, o);
+                    }
                 }
                 if d == now && (start_min..end_min).contains(&now_min) {
                     let y = area_rect.min.y + (now_min - start_min) as f32 * px_per_min;
@@ -1079,8 +1816,159 @@ fn time_grid_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
                     p.circle_filled(pos2(xa, y), 4.0, app.theme.danger);
                 }
             }
+            // The dragged block's new place.
+            if let Some(g) = &dragging
+                && finished.is_none()
+            {
+                if let Some(pos) = ui.ctx().pointer_latest_pos()
+                    && let Some(pt) = pos_to_point(pos)
+                {
+                    ui.ctx().set_cursor_icon(if g.kind == DragKind::Move {
+                        CursorIcon::Grabbing
+                    } else {
+                        CursorIcon::ResizeVertical
+                    });
+                    let (ns, ne) = drag_target(g, pt, slot, (start_min, end_min));
+                    for (i, &d) in days.iter().enumerate() {
+                        let (ds, de) = (d * DAY + start_min * 60, d * DAY + end_min * 60);
+                        if ne <= ds || ns >= de {
+                            continue;
+                        }
+                        let y0 = area_rect.min.y + ((ns.max(ds) - ds) as f32 / 60.0) * px_per_min;
+                        let y1 = area_rect.min.y + ((ne.min(de) - ds) as f32 / 60.0) * px_per_min;
+                        let r = Rect::from_min_max(
+                            pos2(x0 + col_w * i as f32 + 2.0, y0 + 1.0),
+                            pos2(x0 + col_w * (i + 1) as f32 - 6.0, y1.max(y0 + 6.0) - 1.0),
+                        );
+                        p.rect_filled(r, CornerRadius::same(3), app.theme.accent.gamma_multiply(0.25));
+                        p.rect_stroke(
+                            r,
+                            CornerRadius::same(3),
+                            Stroke::new(2.0, app.theme.accent),
+                            StrokeKind::Inside,
+                        );
+                        let label = format!(
+                            "{} – {}",
+                            clock(ns.rem_euclid(DAY) / 60),
+                            clock(ne.rem_euclid(DAY) / 60)
+                        );
+                        paint_text_clipped(
+                            ui,
+                            pos2(r.min.x + 6.0, r.min.y + 2.0),
+                            &label,
+                            FontId::proportional(11.5),
+                            app.theme.text,
+                            r.width() - 8.0,
+                        );
+                    }
+                }
+                if !ui.ctx().input(|i| i.pointer.any_down()) {
+                    // Released outside any block response (e.g. after scrolling): drop the drag.
+                    cu.drag = None;
+                }
+            }
+            if let Some((g, target)) = finished {
+                cu.drag = None;
+                if let Some(id) = commit_drag(app, &g, target) {
+                    app.ui.module_selection = Some(id.0);
+                }
+            }
         });
     });
+}
+
+/// The Daily Task List under a day/week grid: unfinished tasks on their due days (overdue ones today).
+#[allow(clippy::too_many_arguments)]
+fn task_strip(
+    ui: &mut Ui,
+    app: &mut App,
+    st: &mut ModState,
+    rect: Rect,
+    ruler_w: f32,
+    col_w: f32,
+    days: &[i64],
+    tasks: &[(i64, ItemId)],
+    minimized: bool,
+    key: usize,
+) {
+    let p = ui.painter().clone();
+    let line = Stroke::new(1.0, app.theme.separator);
+    p.rect_filled(rect, CornerRadius::ZERO, blend(app.theme.reading, app.theme.backdrop, 0.35));
+    p.hline(rect.x_range(), rect.min.y, line);
+    p.text(
+        pos2(rect.min.x + 6.0, rect.min.y + TASK_HEAD_H / 2.0),
+        Align2::LEFT_CENTER,
+        "Tasks",
+        FontId::proportional(11.5),
+        app.theme.text_muted,
+    );
+    for (i, &d) in days.iter().enumerate() {
+        let col = Rect::from_min_max(
+            pos2(rect.min.x + ruler_w + col_w * i as f32, rect.min.y),
+            pos2(rect.min.x + ruler_w + col_w * (i + 1) as f32, rect.max.y),
+        );
+        p.vline(col.min.x, col.y_range(), line);
+        let mine: Vec<ItemId> = tasks.iter().filter(|(x, _)| *x == d).map(|(_, id)| *id).collect();
+        if minimized {
+            if !mine.is_empty() {
+                let text = format!("{} task{}", mine.len(), if mine.len() == 1 { "" } else { "s" });
+                p.text(
+                    pos2(col.min.x + 6.0, col.min.y + TASK_HEAD_H / 2.0),
+                    Align2::LEFT_CENTER,
+                    text,
+                    FontId::proportional(11.5),
+                    app.theme.text,
+                );
+            }
+            continue;
+        }
+        let shown = if mine.len() > TASK_ROWS { TASK_ROWS - 1 } else { mine.len() };
+        for (j, id) in mine.iter().take(shown).enumerate() {
+            let Some(t) = app.s.mailbox.tasks.get(id).cloned() else { continue };
+            let row = Rect::from_min_size(
+                pos2(col.min.x + 2.0, col.min.y + TASK_HEAD_H + TASK_ROW_H * j as f32),
+                vec2(col_w - 4.0, TASK_ROW_H - 2.0),
+            );
+            let subject =
+                if t.subject.trim().is_empty() { "(No subject)".to_owned() } else { t.subject.clone() };
+            let resp = ui.interact(row, Id::new(("mc-cal-task", key, d, id.0)), Sense::click());
+            a11y(&resp, WidgetType::Button, &format!("Task {subject}"));
+            if resp.hovered() {
+                p.rect_filled(row, CornerRadius::same(3), app.theme.hover);
+            }
+            let check = Rect::from_min_size(pos2(row.min.x + 3.0, row.center().y - 6.0), Vec2::splat(12.0));
+            let cresp = ui.interact(check, Id::new(("mc-cal-task-done", key, d, id.0)), Sense::click());
+            a11y(&cresp, WidgetType::Checkbox, &format!("Mark {subject} complete"));
+            p.rect_stroke(
+                check,
+                CornerRadius::same(2),
+                Stroke::new(1.0, app.theme.text_muted),
+                StrokeKind::Inside,
+            );
+            paint_text_clipped(
+                ui,
+                pos2(check.max.x + 5.0, row.min.y + 2.0),
+                &subject,
+                FontId::proportional(12.0),
+                app.theme.text,
+                row.width() - 22.0,
+            );
+            if cresp.clicked() {
+                app.run("tasks.markComplete", json!({ "ids": [id.0] }));
+            } else if resp.double_clicked() {
+                editors::open_task(app, st, *id);
+            }
+        }
+        if mine.len() > shown {
+            p.text(
+                pos2(col.min.x + 8.0, col.min.y + TASK_HEAD_H + TASK_ROW_H * shown as f32 + TASK_ROW_H / 2.0),
+                Align2::LEFT_CENTER,
+                format!("+{} more", mine.len() - shown),
+                FontId::proportional(11.5),
+                app.theme.link,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1094,9 +1982,10 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
     let head_h = 30.0;
     let row_h = 46.0;
     let shown = shown_calendars(app, st);
-    let mut rows: Vec<(String, FolderId)> =
-        shown.iter().filter_map(|f| app.s.mailbox.folder(*f).map(|x| (x.name.clone(), *f))).collect();
-    rows.sort();
+    let rows: Vec<(String, FolderId)> = ordered(app, &shown)
+        .into_iter()
+        .filter_map(|f| app.s.mailbox.folder(f).map(|x| (x.name.clone(), f)))
+        .collect();
     if rows.is_empty() {
         empty_message(ui, rect, app, "No calendar selected", "Tick a calendar under My Calendars.");
         return;
@@ -1107,18 +1996,23 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
     // Calendar names.
     let labels = Rect::from_min_size(rect.min, vec2(label_w, rect.height()));
     p.rect_filled(labels, CornerRadius::ZERO, blend(app.theme.reading, app.theme.backdrop, 0.3));
-    for (k, (name, _)) in rows.iter().enumerate() {
+    for (k, (name, folder)) in rows.iter().enumerate() {
         let r = Rect::from_min_size(
             pos2(labels.min.x, labels.min.y + head_h + row_h * k as f32),
             vec2(label_w, row_h),
         );
+        p.rect_filled(
+            Rect::from_min_size(pos2(r.min.x + 4.0, r.min.y + 6.0), vec2(4.0, row_h - 12.0)),
+            CornerRadius::same(2),
+            calendar_color32(app, *folder),
+        );
         paint_text_clipped(
             ui,
-            pos2(r.min.x + 10.0, r.center().y - 8.0),
+            pos2(r.min.x + 14.0, r.center().y - 8.0),
             name,
             FontId::proportional(13.0),
             app.theme.text,
-            label_w - 16.0,
+            label_w - 20.0,
         );
         p.hline(labels.x_range(), r.max.y, line);
     }
@@ -1173,7 +2067,8 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
                     st.cal_slot = Some((sel, minute.clamp(0, 23 * 60 + 30)));
                     app.ui.module_selection = None;
                     if resp.double_clicked() {
-                        editors::new_appointment(app, st, Some(*folder), sel, minute, 30, false);
+                        let f = writable(app, Some(*folder));
+                        editors::new_appointment(app, st, f, sel, minute, 30, false);
                     }
                 }
             }
@@ -1188,7 +2083,7 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
                     let resp = ui.interact(r, Id::new(("mc-cal-sched", o.id.0, o.start)), Sense::click());
                     a11y(&resp, WidgetType::Button, &occ_a11y(o));
                     let selected = app.ui.module_selection == Some(o.id.0);
-                    paint_block(ui, app, r, o, selected);
+                    paint_block(ui, app, r, o, selected, false);
                     occ_interact(app, st, &resp, o);
                 }
             }
@@ -1219,6 +2114,8 @@ mod tests {
     fn day(s: &str) -> i64 {
         parse_day(s).unwrap()
     }
+
+    const MON_FRI: [u8; 5] = [1, 2, 3, 4, 5];
 
     #[test]
     fn single_appointment_overlap() {
@@ -1289,14 +2186,80 @@ mod tests {
         let mut st = ModState::default();
         let sel = day("2026-10-09");
         st.cal.mode = CalendarMode::Month;
-        assert_eq!(title(&st, sel), "October 2026");
+        assert_eq!(title(&st, sel, &MON_FRI), "October 2026");
         assert_eq!(day_string(step(&st, sel, 1)), "2026-11-09");
         st.cal.mode = CalendarMode::Week;
-        assert_eq!(title(&st, sel), "October 4 – 10, 2026");
+        assert_eq!(title(&st, sel, &MON_FRI), "October 4 – 10, 2026");
         st.cal.mode = CalendarMode::WorkWeek;
-        assert_eq!(visible_days(&st, sel).len(), 5);
+        assert_eq!(visible_days(&st, sel, &MON_FRI).len(), 5);
         st.cal.mode = CalendarMode::Day;
-        assert_eq!(title(&st, sel), "Friday, October 9, 2026");
+        assert_eq!(title(&st, sel, &MON_FRI), "Friday, October 9, 2026");
         assert_eq!(month_grid(sel), (day("2026-09-27"), 5));
+    }
+
+    #[test]
+    fn work_week_follows_the_working_days() {
+        let mut st = ModState::default();
+        st.cal.mode = CalendarMode::WorkWeek;
+        let sel = day("2026-10-09");
+        // Sunday to Thursday.
+        let days = visible_days(&st, sel, &[0, 1, 2, 3, 4]);
+        assert_eq!(days.first().copied(), Some(day("2026-10-04")));
+        assert_eq!(days.len(), 5);
+        assert_eq!(title(&st, sel, &[0, 1, 2, 3, 4]), "October 4 – 8, 2026");
+        // Junk days fall back to Monday to Friday.
+        assert_eq!(visible_days(&st, sel, &[9]).len(), 5);
+    }
+
+    #[test]
+    fn drag_targets_snap_and_keep_length() {
+        let d0 = day("2026-10-09");
+        let g = Drag {
+            id: ItemId(1),
+            occurrence: None,
+            kind: DragKind::Move,
+            start: d0 * DAY + 9 * 3600,
+            end: d0 * DAY + 10 * 3600,
+            grab_min: 10,
+            pane: 0,
+        };
+        // Grabbed 10 minutes in, dropped at 13:22 next day → starts 13:15 with a 15-minute scale.
+        assert_eq!(
+            drag_target(&g, (d0 + 1, 13 * 60 + 22), 15, (0, 1440)),
+            ((d0 + 1) * DAY + 13 * 3600 + 900, (d0 + 1) * DAY + 14 * 3600 + 900)
+        );
+        let top = Drag { kind: DragKind::Top, ..g.clone() };
+        assert_eq!(drag_target(&top, (d0, 8 * 60 + 2), 30, (0, 1440)).0, d0 * DAY + 8 * 3600);
+        // The top cannot pass the end.
+        assert_eq!(drag_target(&top, (d0, 11 * 60), 30, (0, 1440)).0, d0 * DAY + 10 * 3600 - 1800);
+        let bottom = Drag { kind: DragKind::Bottom, ..g };
+        assert_eq!(drag_target(&bottom, (d0, 11 * 60 + 40), 30, (0, 1440)).1, d0 * DAY + 11 * 3600 + 1800);
+        assert_eq!(drag_target(&bottom, (d0, 6 * 60), 30, (0, 1440)).1, d0 * DAY + 9 * 3600 + 1800);
+    }
+
+    #[test]
+    fn own_windows_for_commands_without_details() {
+        assert_eq!(own_window("calendar.changeTimeZone", &json!({})), Some(windows::TZ_DIALOG));
+        assert_eq!(own_window("calendar.changeTimeZone", &json!({"zone": "UTC"})), None);
+        assert_eq!(
+            own_window("calendar.addCalendar", &json!({"source": "internet"})),
+            Some(windows::INTERNET_DIALOG)
+        );
+        assert_eq!(
+            own_window("calendar.addCalendar", &json!({"source": "internet", "url": "https://x"})),
+            None
+        );
+        assert_eq!(
+            own_window("calendar.addCalendar", &json!({"source": "blank"})),
+            Some(windows::BLANK_DIALOG)
+        );
+        assert_eq!(
+            own_window("calendar.addCalendar", &json!({"source": "file"})),
+            Some(windows::FILE_DIALOG)
+        );
+        assert_eq!(own_window("calendar.addCalendar", &json!({"source": "shared"})), None);
+        assert_eq!(ruler_label(-60), "11 PM");
+        assert_eq!(ruler_label(9 * 60 + 30), "9:30 AM");
+        assert_eq!(preview_text("  a\n\nb   c "), "a b c");
     }
 }

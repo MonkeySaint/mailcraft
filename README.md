@@ -54,7 +54,8 @@
 ## What works today
 
 Status: **pre-alpha**. See [ROADMAP.md](ROADMAP.md) for honest per-area estimates and
-[docs/parity.md](docs/parity.md) for the feature catalog.
+[docs/parity.md](docs/parity.md) for the feature catalog. Account types, push, POP3, JMAP, OAuth sign-in and
+where passwords are kept: [docs/accounts.md](docs/accounts.md).
 
 - **Mail:** read, reply, reply all, forward (inline or in a window), drafts, delete/archive/move/copy,
   flags, categories, importance, Focused/Other, arrange by 13 keys, filters, conversations, search with a

@@ -9,7 +9,8 @@ use super::compose::{
 };
 use crate::cmd::util::{dialog, opt_bool, opt_str, req_str};
 use crate::compose::{
-    BodySelection, CaseKind, ClipEntry, ComposeState, DocPos, NamedStyle, PainterState, PasteMode, align_of,
+    BodySelection, CaseKind, ClipEntry, ComposeState, DocPos, ListFormat, NamedStyle, NumberStyle,
+    PainterState, PasteMode, align_of, multilevel_formats,
 };
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_geom::Color;
@@ -394,20 +395,65 @@ fn borders(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"target": "paragraph", "border": kind, "changed": changed}))
 }
 
+/// The list format a Bullets / Numbering call asks for: `glyph` (Define New Bullet), `pattern` +
+/// `numberStyle` (Define New Number Format) or a gallery `style` key. `Ok(None)` for a plain toggle.
+fn requested_format(p: &Value, numbered: bool) -> Result<Option<ListFormat>, CmdError> {
+    if let Some(g) = opt_str(p, "glyph").filter(|g| !g.trim().is_empty()) {
+        return Ok(Some(ListFormat::bullet(g)));
+    }
+    if numbered && (p.get("pattern").is_some() || p.get("numberStyle").is_some()) {
+        let style = match opt_str(p, "numberStyle") {
+            Some(st) => Some(
+                NumberStyle::parse(st)
+                    .ok_or_else(|| CmdError::Params(format!("unknown number style `{st}`")))?,
+            ),
+            None => None,
+        };
+        let pattern = opt_str(p, "pattern").unwrap_or("1.");
+        return Ok(Some(ListFormat::from_pattern(pattern, style)));
+    }
+    match opt_str(p, "style") {
+        None => Ok(None),
+        Some(key) => match ListFormat::from_key(key) {
+            Some(f) if f.is_number() == numbered => Ok(Some(f)),
+            _ => Err(CmdError::Params(format!(
+                "unknown {} style `{key}`",
+                if numbered { "numbering" } else { "bullet" }
+            ))),
+        },
+    }
+}
+
+fn format_json(f: Option<&ListFormat>) -> Value {
+    match f {
+        None => Value::Null,
+        Some(ListFormat::Bullet { glyph }) => json!({"glyph": glyph}),
+        Some(ListFormat::Number { style, prefix, suffix, chain }) => {
+            json!({"numberStyle": style.css(), "prefix": prefix, "suffix": suffix, "chain": chain, "sample": f.map(|f| f.marker(1, &[1]))})
+        }
+    }
+}
+
 fn list_cmd(s: &mut Session, p: &Value, kind: ListKind, define_dialog: &str) -> CmdResult {
+    let numbered = matches!(kind, ListKind::Numbered { .. });
     let style = opt_str(p, "style");
     match style {
         Some("none") => {
             edit(s, p, |c| c.toggle_list(None))?;
             return Ok(json!({"list": null}));
         }
-        Some("define") => return dialog(s, define_dialog, json!({"compose": compose_id(s, p)?})),
+        Some("define") => {
+            let cid = compose_id(s, p)?;
+            let cur = s.composes.get(&cid).and_then(ComposeState::list_format_at_caret);
+            return dialog(s, define_dialog, json!({"compose": cid, "format": format_json(cur.as_ref())}));
+        }
         _ => {}
     }
+    let format = requested_format(p, numbered)?;
     let c = compose_mut(s, p)?;
     c.checkpoint();
-    if style.is_some() {
-        // Applying a gallery style keeps an existing list of the same kind.
+    if format.is_some() {
+        // Applying a format keeps an existing list of the same kind.
         let same = matches!(
             (c.list_at_caret().map(|(_, k)| k), &kind),
             (Some(ListKind::Bullet), ListKind::Bullet)
@@ -419,11 +465,15 @@ fn list_cmd(s: &mut Session, p: &Value, kind: ListKind, define_dialog: &str) -> 
     } else {
         c.toggle_list(Some(kind));
     }
+    if let Some(f) = format {
+        c.set_list_format(vec![f], false);
+    }
     let now = c.list_at_caret().map(|(_, k)| match k {
         ListKind::Bullet => "bullet",
         ListKind::Numbered { .. } => "numbered",
     });
-    Ok(json!({"list": now}))
+    let fmt = c.list_format_at_caret();
+    Ok(json!({"list": now, "format": format_json(fmt.as_ref())}))
 }
 
 fn bullets(s: &mut Session, p: &Value) -> CmdResult {
@@ -445,33 +495,125 @@ fn numbering(s: &mut Session, p: &Value) -> CmdResult {
     list_cmd(s, p, ListKind::Numbered { start: 1 }, "defineNewNumberFormat")
 }
 
+/// Multilevel gallery key for a key or an observed gallery name ("Outline numbered: L1: Numbered, I, II,
+/// III, …, Number Format: Article I., …").
+fn multilevel_key(name: &str) -> Option<&'static str> {
+    const KEYS: [&str; 8] =
+        ["numbered", "numberedParen", "outline", "article", "chapter", "outlineRoman", "bullets", "diamonds"];
+    if let Some(k) = KEYS.iter().find(|k| k.eq_ignore_ascii_case(name)) {
+        return Some(k);
+    }
+    let n = name.to_lowercase();
+    Some(if n.contains("article") {
+        "article"
+    } else if n.contains("chapter") {
+        "chapter"
+    } else if n.contains("diamond") {
+        "diamonds"
+    } else if n.contains("bullet") {
+        "bullets"
+    } else if n.contains("format: i.") {
+        "outlineRoman"
+    } else if n.contains("format: 1)") {
+        "numberedParen"
+    } else if n.contains("1.1") || n.contains("legal") {
+        "outline"
+    } else if n.contains("format: 1") || n.contains("numbered") {
+        "numbered"
+    } else {
+        return None;
+    })
+}
+
+/// One level of a Define New Multilevel List definition: `{"glyph"}` or `{"pattern","numberStyle","chain"}`.
+fn level_param(v: &Value) -> Result<ListFormat, CmdError> {
+    if let Some(g) = v.get("glyph").and_then(Value::as_str) {
+        return Ok(ListFormat::bullet(g));
+    }
+    let style = match v.get("numberStyle").and_then(Value::as_str) {
+        Some(st) => Some(
+            NumberStyle::parse(st).ok_or_else(|| CmdError::Params(format!("unknown number style `{st}`")))?,
+        ),
+        None => None,
+    };
+    let pattern = v.get("pattern").and_then(Value::as_str).unwrap_or("1.");
+    let mut f = ListFormat::from_pattern(pattern, style);
+    if v.get("chain").and_then(Value::as_bool) == Some(true)
+        && let ListFormat::Number { chain, .. } = &mut f
+    {
+        *chain = true;
+    }
+    Ok(f)
+}
+
 fn multilevel(s: &mut Session, p: &Value) -> CmdResult {
     let style = opt_str(p, "style");
     if let Some(f) = opt_str(p, "filter") {
         if !matches!(f, "all" | "current" | "library") {
             return Err(CmdError::Params(format!("unknown gallery filter `{f}`")));
         }
-        if style.is_none() {
-            return Ok(json!({"filter": f}));
-        }
-    }
-    match style {
-        None => edit(s, p, |c| c.toggle_list(Some(ListKind::Numbered { start: 1 })))
-            .map(|()| json!({"list": "numbered"})),
-        Some("none" | "None") => {
-            list_cmd(s, &json!({"style": "none", "compose": p.get("compose")}), ListKind::Bullet, "")
-        }
-        Some("define") => dialog(s, "defineNewMultilevelList", json!({"compose": compose_id(s, p)?})),
-        Some("defineStyle") => dialog(s, "defineNewListStyle", json!({"compose": compose_id(s, p)?})),
-        Some(name) => {
-            let kind = if name.to_lowercase().contains("bullet") {
-                ListKind::Bullet
-            } else {
-                ListKind::Numbered { start: 1 }
+        if style.is_none() && p.get("levels").is_none() {
+            // Gallery filter: which definitions the gallery shows.
+            let cid = compose_id(s, p)?;
+            let current = s.composes.get(&cid).and_then(ComposeState::list_format_at_caret);
+            let library = [
+                "numbered",
+                "numberedParen",
+                "outline",
+                "article",
+                "chapter",
+                "outlineRoman",
+                "bullets",
+                "diamonds",
+            ];
+            let shown: Vec<&str> = match f {
+                "current" if current.is_none() => Vec::new(),
+                "current" => vec!["current"],
+                _ => library.to_vec(),
             };
-            list_cmd(s, p, kind, "defineNewMultilevelList")
+            return Ok(json!({"filter": f, "shown": shown, "current": format_json(current.as_ref())}));
         }
     }
+    let levels: Option<Vec<ListFormat>> = match (p.get("levels"), style) {
+        (Some(v), _) => {
+            let arr = v.as_array().ok_or_else(|| CmdError::Params("`levels` must be a list".into()))?;
+            if arr.is_empty() || arr.len() > crate::compose::MAX_LIST_LEVEL {
+                return Err(CmdError::Params("`levels` must define 1 to 9 levels".into()));
+            }
+            Some(arr.iter().map(level_param).collect::<Result<Vec<_>, _>>()?)
+        }
+        (None, None) => Some(multilevel_formats("numbered").unwrap_or_default()),
+        (None, Some("none" | "None")) => {
+            return list_cmd(s, &json!({"style": "none", "compose": p.get("compose")}), ListKind::Bullet, "");
+        }
+        (None, Some("define")) => {
+            return dialog(s, "defineNewMultilevelList", json!({"compose": compose_id(s, p)?}));
+        }
+        (None, Some("defineStyle")) => {
+            return dialog(s, "defineNewListStyle", json!({"compose": compose_id(s, p)?}));
+        }
+        (None, Some(name)) => {
+            let key = multilevel_key(name)
+                .ok_or_else(|| CmdError::Params(format!("unknown multilevel list `{name}`")))?;
+            multilevel_formats(key)
+        }
+    };
+    let levels = levels.unwrap_or_default();
+    let numbered = levels.first().is_none_or(ListFormat::is_number);
+    let kind = if numbered { ListKind::Numbered { start: 1 } } else { ListKind::Bullet };
+    let c = compose_mut(s, p)?;
+    c.checkpoint();
+    let same = matches!(
+        (c.list_at_caret().map(|(_, k)| k), &kind),
+        (Some(ListKind::Bullet), ListKind::Bullet)
+            | (Some(ListKind::Numbered { .. }), ListKind::Numbered { .. })
+    );
+    if !same {
+        c.toggle_list(Some(kind));
+    }
+    c.set_list_format(levels, true);
+    let fmt = c.list_format_at_caret();
+    Ok(json!({"list": if numbered { "numbered" } else { "bullet" }, "format": format_json(fmt.as_ref())}))
 }
 
 fn indent(s: &mut Session, p: &Value) -> CmdResult {
@@ -513,6 +655,8 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
     let char_style = |c: &mut ComposeState, f: &dyn Fn(&mut TextStyle)| c.apply_text_style(|st| f(st));
     match name {
         "normal" => {
+            let theme_accent = accent(c);
+            let heading_font = (c.theme != Default::default()).then(|| c.theme_resolved().heading_font);
             c.set_heading(None);
             c.set_para_style(|ps| *ps = ParaStyle::default());
             // Drop what the paragraph styles set (Title size, Quote colours, Code font), keep the rest.
@@ -520,10 +664,12 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
                 c.apply_text_style(|st| {
                     st.size_pt = None;
                     st.monospace = None;
-                    if st.font_family.as_deref() == Some(CODE_FONT) {
+                    if st.font_family.as_deref() == Some(CODE_FONT)
+                        || (heading_font.is_some() && st.font_family == heading_font)
+                    {
                         st.font_family = None;
                     }
-                    if st.color.is_some_and(|col| STYLE_COLORS.contains(&col)) {
+                    if st.color.is_some_and(|col| STYLE_COLORS.contains(&col) || col == theme_accent) {
                         st.color = None;
                         st.italic = None;
                     }
@@ -555,6 +701,7 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
         }
         "title" => {
             c.set_heading(Some(1));
+            themed_heading(c, 1);
             c.with_whole_paragraphs(|c| c.apply_text_style(|st| st.size_pt = Some(28.0)));
         }
         "subtitle" => {
@@ -577,6 +724,7 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
             });
         }
         "intense quote" => {
+            let accent = accent(c);
             c.set_heading(None);
             c.set_para_style(|ps| {
                 ps.align = mailcraft_model::rich::Align::Center;
@@ -585,7 +733,7 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
             c.with_whole_paragraphs(|c| {
                 c.apply_text_style(|st| {
                     st.italic = Some(true);
-                    st.color = Some(ACCENT);
+                    st.color = Some(accent);
                 });
             });
         }
@@ -598,16 +746,22 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
             st.color = Some(SUBTLE);
         }),
         "emphasis" => char_style(c, &|st| st.italic = Some(true)),
-        "intense emphasis" => char_style(c, &|st| {
-            st.italic = Some(true);
-            st.color = Some(ACCENT);
-        }),
+        "intense emphasis" => {
+            let accent = accent(c);
+            char_style(c, &|st| {
+                st.italic = Some(true);
+                st.color = Some(accent);
+            });
+        }
         "strong" => char_style(c, &|st| st.bold = Some(true)),
         "subtle reference" => char_style(c, &|st| st.color = Some(SUBTLE_REF)),
-        "intense reference" => char_style(c, &|st| {
-            st.bold = Some(true);
-            st.color = Some(ACCENT);
-        }),
+        "intense reference" => {
+            let accent = accent(c);
+            char_style(c, &|st| {
+                st.bold = Some(true);
+                st.color = Some(accent);
+            });
+        }
         "book title" => char_style(c, &|st| {
             st.bold = Some(true);
             st.italic = Some(true);
@@ -621,9 +775,47 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
                 return false;
             };
             c.set_heading(Some(level.min(6)));
+            themed_heading(c, level.min(6));
         }
     }
     true
+}
+
+/// Heading formatting from the theme and style set, when either was chosen (otherwise headings keep the
+/// plain built-in look).
+fn themed_heading(c: &mut ComposeState, level: u8) {
+    if c.theme == Default::default() && c.style_set.is_none() {
+        return;
+    }
+    let hs = c.heading_text_style(level);
+    let set = c.style_set_def().copied();
+    let accent = c.theme_resolved().color(crate::compose::ACCENT1);
+    if let Some(set) = set {
+        c.set_para_style(|ps| {
+            ps.align = if set.centered {
+                mailcraft_model::rich::Align::Center
+            } else {
+                mailcraft_model::rich::Align::Start
+            };
+            ps.background = (set.shaded && level == 1).then_some(accent);
+        });
+    }
+    c.with_whole_paragraphs(|c| {
+        c.apply_text_style(|st| {
+            st.font_family = hs.font_family.clone();
+            if hs.size_pt.is_some() {
+                st.size_pt = hs.size_pt;
+                st.bold = hs.bold;
+                st.italic = hs.italic;
+                st.color = hs.color;
+            }
+        });
+    });
+}
+
+/// Accent colour for the emphasis styles: the theme's Accent 1 when a theme was chosen.
+fn accent(c: &ComposeState) -> Color {
+    if c.theme == Default::default() { ACCENT } else { c.theme_resolved().color(crate::compose::ACCENT1) }
 }
 
 fn style(s: &mut Session, p: &Value) -> CmdResult {
@@ -691,6 +883,8 @@ fn style_set(s: &mut Session, p: &Value) -> CmdResult {
     c.checkpoint();
     match action {
         "reset" => {
+            c.style_set = Some("Default".to_owned());
+            c.apply_style_set();
             c.style_set = None;
             c.paragraph_spacing_preset = None;
         }
@@ -701,8 +895,14 @@ fn style_set(s: &mut Session, p: &Value) -> CmdResult {
             if name.is_none() && spacing.is_none() {
                 return Err(CmdError::Params("`name` or `paragraphSpacing` required".into()));
             }
-            if name.is_some() {
-                c.style_set = name;
+            if let Some(n) = &name {
+                let Some(set) = crate::compose::style_set(n) else {
+                    c.undo_edit();
+                    c.edit_redo.clear();
+                    return Err(CmdError::Params(format!("unknown style set `{n}`")));
+                };
+                c.style_set = Some(set.name.to_owned());
+                c.apply_style_set();
             }
             if let Some(sp) = spacing {
                 if let Some((after, line)) = spacing_preset(&sp) {
@@ -787,11 +987,157 @@ fn paste_mode(m: Option<&str>) -> Result<PasteMode, CmdError> {
     }
 }
 
+/// Largest picture embedded from pasted HTML (bigger `data:` pictures are left out).
+const MAX_PASTED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+/// Most pictures embedded from one paste.
+const MAX_PASTED_IMAGES: usize = 200;
+/// Deepest block nesting walked for pasted pictures.
+const MAX_PASTE_DEPTH: usize = 64;
+
+/// `data:image/png;base64,…` → (MIME type, bytes); `None` for other URLs, other encodings and junk.
+fn decode_data_image(src: &str) -> Option<(String, Vec<u8>)> {
+    use base64::Engine as _;
+    let rest = src.trim().get(..5).filter(|p| p.eq_ignore_ascii_case("data:")).and(src.trim().get(5..))?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mut parts = meta.split(';').map(str::trim);
+    let mime = parts.next()?.to_ascii_lowercase();
+    let valid = mime.strip_prefix("image/").is_some_and(|sub| {
+        !sub.is_empty() && sub.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    if !valid || !parts.any(|x| x.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    // Base64 is 4/3 the size of its bytes: refuse oversized pictures before decoding.
+    if payload.len() / 4 * 3 > MAX_PASTED_IMAGE_BYTES {
+        return None;
+    }
+    let clean: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(clean.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(clean.as_bytes()))
+        .ok()?;
+    (!data.is_empty() && data.len() <= MAX_PASTED_IMAGE_BYTES).then_some((mime, data))
+}
+
+/// File name extension for an image MIME type.
+fn image_ext(mime: &str) -> &str {
+    match mime {
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => "jpg",
+        "image/svg+xml" => "svg",
+        m => {
+            m.strip_prefix("image/").filter(|x| x.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("img")
+        }
+    }
+}
+
+/// Pictures in pasted HTML that carry their data (`data:image/…;base64,…`, as browsers and office programs
+/// copy screenshots and pictures) become inline attachments of the compose referenced as `cid:`, like Insert
+/// Picture makes them: many mail programs refuse `data:` pictures. Ones that cannot be decoded, or beyond
+/// the size and count limits, are left out. A `cid:` picture copied from another open message (`others`:
+/// the other composes' inline pictures) is brought along, so it is not sent as a dangling reference.
+fn embed_pasted_images(doc: &mut Doc, c: &mut ComposeState, others: &[crate::compose::InlineImage]) {
+    fn inlines(
+        list: &mut Vec<mailcraft_model::Inline>,
+        c: &mut ComposeState,
+        others: &[crate::compose::InlineImage],
+        n: &mut usize,
+        depth: usize,
+    ) {
+        if depth > MAX_PASTE_DEPTH {
+            return;
+        }
+        list.retain_mut(|i| match i {
+            mailcraft_model::Inline::Image { src, .. }
+                if src.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cid:")) =>
+            {
+                let id = src.trim_start().get(4..).unwrap_or_default().trim();
+                let known = |x: &crate::compose::InlineImage| x.content_id.eq_ignore_ascii_case(id);
+                if !c.inline_images.iter().any(known)
+                    && let Some(img) = others.iter().find(|x| known(x))
+                {
+                    c.inline_images.push(img.clone());
+                }
+                true
+            }
+            mailcraft_model::Inline::Image { src, .. }
+                if src.trim_start().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) =>
+            {
+                let Some((mime, data)) = decode_data_image(src).filter(|_| *n < MAX_PASTED_IMAGES) else {
+                    return false;
+                };
+                *n += 1;
+                let cid = c.next_content_id();
+                let filename =
+                    format!("image{:03}.{}", c.inline_images.len().saturating_add(1), image_ext(&mime));
+                c.inline_images.push(crate::compose::InlineImage {
+                    content_id: cid.clone(),
+                    filename,
+                    mime_type: mime,
+                    data,
+                });
+                *src = format!("cid:{cid}");
+                true
+            }
+            mailcraft_model::Inline::Link { children, .. } => {
+                inlines(children, c, others, n, depth.saturating_add(1));
+                true
+            }
+            _ => true,
+        });
+    }
+    fn blocks(
+        list: &mut [mailcraft_model::Block],
+        c: &mut ComposeState,
+        others: &[crate::compose::InlineImage],
+        n: &mut usize,
+        depth: usize,
+    ) {
+        use mailcraft_model::Block;
+        if depth > MAX_PASTE_DEPTH {
+            return;
+        }
+        let d = depth.saturating_add(1);
+        for b in list {
+            match b {
+                Block::Paragraph { inlines: l, .. } | Block::Heading { inlines: l, .. } => {
+                    inlines(l, c, others, n, d)
+                }
+                Block::List { items, .. } => {
+                    for item in items {
+                        blocks(item, c, others, n, d);
+                    }
+                }
+                Block::Quote { blocks: inner } | Block::Container { blocks: inner, .. } => {
+                    blocks(inner, c, others, n, d)
+                }
+                Block::Table { rows, .. } => {
+                    for cell in rows.iter_mut().flatten() {
+                        blocks(&mut cell.blocks, c, others, n, d);
+                    }
+                }
+                Block::Pre { .. } | Block::Rule => {}
+            }
+        }
+    }
+    let mut n = 0usize;
+    blocks(&mut doc.blocks, c, others, &mut n, 0);
+}
+
 fn do_paste(s: &mut Session, p: &Value, mode: PasteMode) -> CmdResult {
     let cid = compose_id(s, p)?;
-    let doc = paste_source(s, p, cid)?;
+    let mut doc = paste_source(s, p, cid)?;
+    let others: Vec<crate::compose::InlineImage> = s
+        .composes
+        .iter()
+        .filter(|(id, _)| **id != cid)
+        .flat_map(|(_, x)| x.inline_images.iter().cloned())
+        .take(MAX_PASTED_IMAGES)
+        .collect();
     let c = compose_mut(s, p)?;
     let mode = if c.format == mailcraft_model::BodyFormat::PlainText { PasteMode::TextOnly } else { mode };
+    if mode != PasteMode::TextOnly {
+        embed_pasted_images(&mut doc, c, &others);
+    }
     c.checkpoint();
     c.insert_fragment(&doc, mode);
     Ok(json!({"pasted": true, "caret": pos_json(&c.selection.focus)}))
@@ -1564,7 +1910,7 @@ mod tests {
         sel(&mut s, (&[0], 0), (&[0], 3));
         s.run("format.style", &json!({"name": "mine"})).unwrap();
         assert_eq!(first_style(&s, id).bold, Some(true));
-        s.run("format.styleSet", &json!({"paragraphSpacing": "double", "name": "Basic"})).unwrap();
+        s.run("format.styleSet", &json!({"paragraphSpacing": "double", "name": "Basic (Simple)"})).unwrap();
         match &s.composes[&id].body.blocks[1] {
             Block::Paragraph { style, .. } => assert_eq!(style.line_height, Some(2.0)),
             other => panic!("{other:?}"),
@@ -1574,6 +1920,177 @@ mod tests {
         assert!(s.composes[&id].style_set.is_none());
         assert_eq!(s.run("format.stylesPane", &json!({})).unwrap()["stylesPane"], true);
         assert_eq!(s.run("format.stylesPane", &json!({"apply": true})).unwrap()["dialog"], "applyStyles");
+    }
+
+    fn send_html(s: &mut Session) -> String {
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
+        let m = s.mailbox.mail.values().filter(|m| !m.is_draft).max_by_key(|m| m.id).unwrap();
+        m.body.html.clone().unwrap()
+    }
+
+    #[test]
+    fn number_formats_bullet_glyphs_and_markers() {
+        let (mut s, id) = with_text("one\ntwo\nthree");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        let r = s.run("format.numbering", &json!({"style": "lowerRoman"})).unwrap();
+        assert_eq!(r["list"], "numbered");
+        assert_eq!(r["format"]["numberStyle"], "lower-roman");
+        let markers: Vec<String> = s.composes[&id].list_markers().into_iter().map(|m| m.2).collect();
+        assert_eq!(markers, vec!["i.", "ii.", "iii."]);
+        assert_eq!(s.composes[&id].plain_text_with_list_formats(), "i. one\nii. two\niii. three");
+        assert_eq!(s.composes[&id].list_markers()[2].3, "3.", "what the layout would draw");
+        // The format survives typing a paragraph above the list (the list moves).
+        s.run("compose.select", &json!({"anchor": {"path": [0, 0, 0], "offset": 0}})).unwrap();
+        s.run("format.numbering", &json!({"style": "decimalParen"})).unwrap();
+        s.composes.get_mut(&id).unwrap().body.blocks.insert(0, Block::text_paragraph("intro"));
+        s.composes.get_mut(&id).unwrap().set_caret(crate::compose::DocPos::new(vec![0], 5));
+        s.run("compose.insertText", &json!({"text": "!"})).unwrap();
+        let markers: Vec<String> = s.composes[&id].list_markers().into_iter().map(|m| m.2).collect();
+        assert_eq!(markers, vec!["1)", "2)", "3)"]);
+        // Undo / redo carry the formats with the body.
+        s.run("format.numbering", &json!({"style": "upperAlpha"})).ok();
+        let html = send_html(&mut s);
+        assert!(html.contains("1)\u{a0}one") || html.contains("list-style-type"), "{html}");
+        let _ = id;
+    }
+
+    #[test]
+    fn list_formats_in_sent_html() {
+        let (mut s, _) = with_text("a\nb");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("format.numbering", &json!({"style": "upperRoman"})).unwrap();
+        let html = send_html(&mut s);
+        assert!(html.contains("<ol style=\"list-style-type:upper-roman\">"), "{html}");
+
+        let (mut s, _) = with_text("a\nb");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("format.numbering", &json!({"style": "decimalParen"})).unwrap();
+        let html = send_html(&mut s);
+        assert!(html.contains("list-style-type:none"), "{html}");
+        assert!(html.contains(">1)\u{a0}a") && html.contains(">2)\u{a0}b"), "{html}");
+
+        let (mut s, _) = with_text("a\nb");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("format.bullets", &json!({"style": "check"})).unwrap();
+        let html = send_html(&mut s);
+        assert!(html.contains(">\u{2714}\u{a0}a"), "{html}");
+        // Unformatted lists are sent as before.
+        let (mut s, _) = with_text("a\nb");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("format.bullets", &json!({})).unwrap();
+        let html = send_html(&mut s);
+        assert!(html.contains("<ul>") && !html.contains("list-style-type"), "{html}");
+    }
+
+    #[test]
+    fn define_new_formats_and_multilevel_lists() {
+        let (mut s, id) = with_text("one\ntwo\nthree");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        assert_eq!(
+            s.run("format.numbering", &json!({"style": "define"})).unwrap()["dialog"],
+            "defineNewNumberFormat"
+        );
+        s.run("format.numbering", &json!({"pattern": "Step 1:"})).unwrap();
+        let m: Vec<String> = s.composes[&id].list_markers().into_iter().map(|m| m.2).collect();
+        assert_eq!(m, vec!["Step 1:", "Step 2:", "Step 3:"]);
+        s.run("format.numbering", &json!({"pattern": "(a)", "numberStyle": "upperRoman"})).unwrap();
+        assert_eq!(s.composes[&id].list_markers()[1].2, "(II)");
+        assert!(s.run("format.numbering", &json!({"numberStyle": "klingon"})).is_err());
+        s.run("format.bullets", &json!({"glyph": "\u{2192}"})).unwrap();
+        assert_eq!(s.composes[&id].list_markers()[0].2, "\u{2192}");
+        assert!(s.run("format.bullets", &json!({"style": "zigzag"})).is_err());
+
+        // Multilevel: outline numbering 1. / 1.1.
+        let (mut s, id) = with_text("one\ntwo\nthree");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("format.multilevel", &json!({"style": "outline"})).unwrap();
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": [0, 1, 0], "offset": 0}, "focus": {"path": [0, 2, 0], "offset": 1}}),
+        )
+        .unwrap();
+        s.run("format.indent", &json!({})).unwrap();
+        let m: Vec<String> = s.composes[&id].list_markers().into_iter().map(|m| m.2).collect();
+        assert_eq!(m, vec!["1.", "1.1.", "1.2."], "{m:?}");
+        // Observed gallery names map to definitions.
+        let (mut s, id) = with_text("x\ny");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("format.multilevel", &json!({"style": "Outline numbered: L1: Numbered, I, II, III, …, ALIGNMENT Left, Number Format: Article I., Aligned at:  0"})).unwrap();
+        assert_eq!(s.composes[&id].list_markers()[1].2, "Article II.");
+        s.run("format.multilevel", &json!({"levels": [{"pattern": "Part A"}, {"glyph": "-"}]})).unwrap();
+        assert_eq!(s.composes[&id].list_markers()[0].2, "Part A");
+        assert!(s.run("format.multilevel", &json!({"levels": []})).is_err());
+        assert!(s.run("format.multilevel", &json!({"style": "Mystery"})).is_err());
+        let f = s.run("format.multilevel", &json!({"filter": "current"})).unwrap();
+        assert_eq!(f["shown"], json!(["current"]));
+    }
+
+    #[test]
+    fn number_styles_and_patterns() {
+        use crate::compose::{ListFormat, NumberStyle};
+        assert_eq!(NumberStyle::UpperRoman.format(1994), "MCMXCIV");
+        assert_eq!(NumberStyle::LowerAlpha.format(28), "ab");
+        assert_eq!(NumberStyle::UpperAlpha.format(0), "0");
+        assert_eq!(NumberStyle::DecimalZero.format(7), "07");
+        assert_eq!(NumberStyle::LowerRoman.format(4000), "4000");
+        assert_eq!(ListFormat::from_pattern("Chapter 1", None).marker(3, &[]), "Chapter 3");
+        assert_eq!(ListFormat::from_pattern("a)", None).marker(2, &[]), "b)");
+        assert_eq!(ListFormat::from_pattern("Article I.", None).marker(4, &[]), "Article IV.");
+        assert_eq!(ListFormat::from_pattern("01.", None).marker(5, &[]), "05.");
+        assert_eq!(ListFormat::from_pattern("-", Some(NumberStyle::Decimal)).marker(2, &[]), "2-");
+        assert_eq!(ListFormat::from_key("decimal").unwrap().css_keyword(), Some("decimal"));
+        assert_eq!(ListFormat::from_key("decimalParen").unwrap().css_keyword(), None);
+        assert_eq!(ListFormat::bullet("").marker(1, &[]), "\u{2022}");
+        assert_eq!(ListFormat::bullet(&"x".repeat(100)).marker(1, &[]).len(), 16);
+    }
+
+    #[test]
+    fn style_sets_restyle_headings_and_spacing() {
+        use mailcraft_model::rich::Align;
+        let (mut s, id) = with_text("Head\nbody");
+        sel(&mut s, (&[0], 1), (&[0], 1));
+        s.run("format.style", &json!({"name": "Heading 1"})).unwrap();
+        s.run("format.styleSet", &json!({"name": "Shaded"})).unwrap();
+        let theme = s.composes[&id].theme_resolved();
+        match &s.composes[&id].body.blocks[0] {
+            Block::Heading { style, inlines, .. } => {
+                assert_eq!(style.background, Some(theme.color(crate::compose::ACCENT1)));
+                match &inlines[0] {
+                    Inline::Text { style, .. } => {
+                        assert_eq!(style.size_pt, Some(16.0));
+                        assert_eq!(style.bold, Some(true));
+                        assert_eq!(style.color, Some(theme.color(1)));
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+        s.run("format.styleSet", &json!({"name": "Centered"})).unwrap();
+        assert!(
+            matches!(&s.composes[&id].body.blocks[0], Block::Heading { style, .. } if style.align == Align::Center && style.background.is_none())
+        );
+        match &s.composes[&id].body.blocks[1] {
+            Block::Paragraph { style, .. } => assert_eq!(style.line_height, Some(1.15)),
+            other => panic!("{other:?}"),
+        }
+        // New headings follow the set too.
+        sel(&mut s, (&[1], 1), (&[1], 1));
+        s.run("format.style", &json!({"name": "Heading 2"})).unwrap();
+        match &s.composes[&id].body.blocks[1] {
+            Block::Heading { style, inlines, .. } => {
+                assert_eq!(style.align, Align::Center);
+                assert!(matches!(&inlines[0], Inline::Text { style, .. } if style.size_pt == Some(14.0)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(s.run("format.styleSet", &json!({"name": "Plaid"})).is_err());
+        s.run("format.styleSet", &json!({"action": "reset"})).unwrap();
+        assert!(s.composes[&id].style_set.is_none());
+        assert!(
+            matches!(&s.composes[&id].body.blocks[0], Block::Heading { style, .. } if style.align == Align::Start)
+        );
     }
 
     #[test]
@@ -1599,6 +2116,76 @@ mod tests {
         let r = s.run("format.clipboardPane", &json!({})).unwrap();
         assert_eq!(r["entries"][0], "alpha");
         assert!(s.run("format.paste", &json!({"mode": "weird"})).is_err());
+    }
+
+    #[test]
+    fn pasted_data_pictures_become_inline_attachments() {
+        let (mut s, id) = with_text("x");
+        // A 1x1 PNG as a browser copies it, plus a broken one, a non-image and a remote picture.
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let html = format!(
+            "<p>Look <img src=\"data:image/png;base64,{png}\" alt=\"dot\"> \
+             <img src=\"data:image/png;base64,%%%\"> <a href=\"https://example.com\"><img src=\"DATA:image/gif;base64,R0lGODlhAQABAAAAACw=\"></a> \
+             <img src=\"https://example.com/a.png\"></p>"
+        );
+        s.run("format.paste", &json!({"html": html})).unwrap();
+        let c = &s.composes[&id];
+        assert_eq!(c.inline_images.len(), 2, "{:?}", c.images());
+        assert_eq!(c.inline_images[0].mime_type, "image/png");
+        assert_eq!(&c.inline_images[0].data[1..4], b"PNG");
+        assert_eq!(c.inline_images[1].mime_type, "image/gif");
+        assert!(c.inline_images[1].filename.ends_with(".gif"));
+        let srcs: Vec<String> = c.images().into_iter().map(|(src, _)| src).collect();
+        assert_eq!(srcs.len(), 3, "the broken picture is left out: {srcs:?}");
+        assert!(srcs.iter().all(|x| !x.starts_with("data:")), "{srcs:?}");
+        assert_eq!(srcs[0], format!("cid:{}", c.inline_images[0].content_id));
+        assert_eq!(srcs[2], "https://example.com/a.png");
+        // Sent, the pictures travel as related parts.
+        let cids: Vec<String> = c.inline_images.iter().map(|i| i.content_id.clone()).collect();
+        s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        let out = s
+            .mailbox
+            .mail
+            .values()
+            .filter_map(|m| m.raw.as_ref())
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .find(|r| r.contains("Content-ID"))
+            .unwrap();
+        for cid in &cids {
+            assert!(out.contains(&format!("<{cid}>")), "{out}");
+        }
+        assert!(!out.contains("data:image"), "{out}");
+        // A picture copied from another message comes along with it.
+        let (mut s, a) = with_text("");
+        s.run("insert.picture", &json!({"compose": a, "name": "dot.png", "data_base64": png})).unwrap();
+        s.run(
+            "compose.select",
+            &json!({"compose": a, "anchor": {"path": [0], "offset": 0}, "focus": {"path": [0], "offset": 1}}),
+        )
+        .unwrap();
+        let copied =
+            s.run("format.copy", &json!({"compose": a})).unwrap()["html"].as_str().unwrap().to_owned();
+        assert!(copied.contains("cid:"), "{copied}");
+        let b = open(&mut s);
+        s.run("format.paste", &json!({"compose": b, "html": copied})).unwrap();
+        assert_eq!(s.composes[&b].inline_images, s.composes[&a].inline_images);
+        // Text-only paste embeds nothing.
+        let (mut s, id) = with_text("y");
+        s.run("format.paste", &json!({"html": html, "mode": "textOnly"})).unwrap();
+        assert!(s.composes[&id].inline_images.is_empty());
+        // Junk never panics.
+        for src in [
+            "data:",
+            "data:image/png",
+            "data:image/;base64,AA",
+            "data:text/html;base64,PGI+",
+            "data:image/png;base64,",
+        ] {
+            assert!(decode_data_image(src).is_none(), "{src}");
+        }
+        assert_eq!(image_ext("image/jpeg"), "jpg");
+        assert_eq!(image_ext("image/x.y"), "img");
     }
 
     #[test]

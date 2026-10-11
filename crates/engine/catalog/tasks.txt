@@ -1,20 +1,20 @@
 Tasks|Home › New|New Task|tasks.new
 Tasks|Home › New|New Email|mail.newEmail
 Tasks|Home › New|New Items|mail.newItem
-Tasks|Home › Delete|Delete|mail.delete
-Tasks|Home › Respond|Reply|mail.reply
-Tasks|Home › Respond|Reply All|mail.replyAll
-Tasks|Home › Respond|Forward|mail.forward
-Tasks|Home › Respond|Meeting|mail.replyWithMeeting
-Tasks|Home › Respond|More|mail.forwardAsAttachment
-Tasks|Home › Manage Task|Mark Complete|mail.markComplete
+Tasks|Home › Delete|Delete|tasks.delete
+Tasks|Home › Respond|Reply|tasks.reply
+Tasks|Home › Respond|Reply All|tasks.replyAll
+Tasks|Home › Respond|Forward|tasks.forward
+Tasks|Home › Respond|Meeting|tasks.meeting
+Tasks|Home › Respond|More|tasks.forward
+Tasks|Home › Manage Task|Mark Complete|tasks.markComplete
 Tasks|Home › Manage Task|Remove from List|tasks.removeFromList
-Tasks|Home › Follow Up|Today|mail.flag
-Tasks|Home › Follow Up|Tomorrow|mail.flag
-Tasks|Home › Follow Up|This Week|mail.flag
-Tasks|Home › Follow Up|Next Week|mail.flag
-Tasks|Home › Follow Up|No Date|mail.flag
-Tasks|Home › Follow Up|Custom...|mail.flagCustom
+Tasks|Home › Follow Up|Today|tasks.flag
+Tasks|Home › Follow Up|Tomorrow|tasks.flag
+Tasks|Home › Follow Up|This Week|tasks.flag
+Tasks|Home › Follow Up|Next Week|tasks.flag
+Tasks|Home › Follow Up|No Date|tasks.flag
+Tasks|Home › Follow Up|Custom...|tasks.flag
 Tasks|Home › Current View|Detailed|view.changeView
 Tasks|Home › Current View|Simple List|view.changeView
 Tasks|Home › Current View|To-Do List|view.changeView
@@ -27,25 +27,25 @@ Tasks|Home › Current View|Overdue|view.changeView
 Tasks|Home › Current View|Assigned|view.changeView
 Tasks|Home › Current View|Server Tasks|view.changeView
 Tasks|Home › Current View|Change View|view.changeView
-Tasks|Home › Actions|Move|mail.move
+Tasks|Home › Actions|Move|tasks.move
 Tasks|Home › Actions|Send to OneNote|-|OneNote is a separate Microsoft app; no local equivalent
-Tasks|Home › Tags|Categorize|mail.categorize
-Tasks|Home › Tags|Private|mail.private
-Tasks|Home › Tags|High Importance|mail.importance
-Tasks|Home › Tags|Low Importance|mail.importance
+Tasks|Home › Tags|Categorize|tasks.categorize
+Tasks|Home › Tags|Private|tasks.private
+Tasks|Home › Tags|High Importance|tasks.importance
+Tasks|Home › Tags|Low Importance|tasks.importance
 Tasks|Home › Groups|New Group|-|Microsoft 365 Groups are a cloud tenant service
 Tasks|Home › Groups|Browse Groups|-|Microsoft 365 Groups are a cloud tenant service
 Tasks|Home › Find|Search People|people.search
 Tasks|Home › Find|Address Book...|compose.addressBook
 Tasks|Home > New Items|E-mail Message|mail.newEmail
-Tasks|Home > New Items|Appointment|mail.newItem
-Tasks|Home > New Items|Meeting|mail.newItem
+Tasks|Home > New Items|Appointment|calendar.newAppointment
+Tasks|Home > New Items|Meeting|calendar.newMeeting
 Tasks|Home > New Items|Group|-|Microsoft 365 Groups are a cloud tenant service
-Tasks|Home > New Items|Contact|mail.newItem
+Tasks|Home > New Items|Contact|people.new
 Tasks|Home > New Items|Task|tasks.new
-Tasks|Home > New Items|Task Request|mail.newItem
+Tasks|Home > New Items|Task Request|tasks.assign
 Tasks|Home > New Items|More Items|mail.newItem
-Tasks|Home > New Items > More Items|Contact Group|mail.newItem
+Tasks|Home > New Items > More Items|Contact Group|people.newGroup
 Tasks|Home > New Items > More Items|Internet Fax|-|needs a third-party online fax service provider
 Tasks|Home > New Items > More Items|Choose Form...|mail.newItem
 Tasks|Home > New Items > More Items|Outlook Data File...|file.newDataFile
@@ -143,7 +143,7 @@ Tasks|View > Folder Pane|Off|view.folderPane
 Tasks|View > Reading Pane|Right|view.readingPane
 Tasks|View > Reading Pane|Bottom|view.readingPane
 Tasks|View > Reading Pane|Off|view.readingPane
-Tasks|View > Reading Pane|Options...|options.open
+Tasks|View > Reading Pane|Options...|view.readingPaneOptions
 Tasks|View > To-Do Bar|Calendar|view.todoBar
 Tasks|View > To-Do Bar|People|view.todoBar
 Tasks|View > To-Do Bar|Tasks|view.todoBar

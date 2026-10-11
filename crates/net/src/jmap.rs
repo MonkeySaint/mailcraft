@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{NetError, Result};
 use crate::http::{HttpClient, HttpResponse, Url, percent_encode};
+use crate::smtp::{DsnRequest, take_submit_options, xtext};
 
 pub const CORE: &str = "urn:ietf:params:jmap:core";
 pub const MAIL: &str = "urn:ietf:params:jmap:mail";
@@ -387,6 +388,27 @@ impl JmapClient {
             .unwrap_or_default())
     }
 
+    /// Mailbox/get for all mailboxes, with the state string for Mailbox/changes.
+    pub fn mailboxes_with_state(&self) -> Result<(Vec<JmapMailbox>, String)> {
+        let r = self.call_one("Mailbox/get", self.with_account(json!({ "ids": null })))?;
+        let list = r
+            .get("list")
+            .and_then(Value::as_array)
+            .map(|l| l.iter().filter_map(JmapMailbox::from_json).collect())
+            .unwrap_or_default();
+        Ok((list, r.get("state").and_then(Value::as_str).unwrap_or_default().to_owned()))
+    }
+
+    /// Email/get (even of no ids, to learn the state), with the state string for Email/changes.
+    pub fn get_emails_with_state(&self, ids: &[String], properties: &[&str]) -> Result<(Vec<Value>, String)> {
+        let r =
+            self.call_one("Email/get", self.with_account(json!({ "ids": ids, "properties": properties })))?;
+        Ok((
+            r.get("list").and_then(Value::as_array).cloned().unwrap_or_default(),
+            r.get("state").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        ))
+    }
+
     /// Email/query.
     pub fn query_emails(&self, filter: Value, sort: Value, position: u64, limit: u64) -> Result<EmailQuery> {
         let args = self.with_account(json!({
@@ -593,6 +615,20 @@ impl JmapClient {
             .unwrap_or_default())
     }
 
+    /// True when the server's submission capability lists SMTP extension `name` (RFC 8621 section 1.3.2,
+    /// `submissionExtensions`), e.g. `DSN`.
+    pub fn submission_extension(&self, name: &str) -> bool {
+        self.session
+            .raw
+            .get("accounts")
+            .and_then(|a| a.get(&self.session.account_id))
+            .and_then(|a| a.get("accountCapabilities"))
+            .and_then(|c| c.get(SUBMISSION))
+            .and_then(|c| c.get("submissionExtensions"))
+            .and_then(Value::as_object)
+            .is_some_and(|m| m.keys().any(|k| k.eq_ignore_ascii_case(name)))
+    }
+
     /// EmailSubmission/set create. `envelope` overrides the server-derived envelope; `on_success_move`
     /// (from drafts, to sent) files the email and clears `$draft` after sending.
     pub fn submit(
@@ -602,15 +638,45 @@ impl JmapClient {
         envelope: Option<(&str, &[&str])>,
         on_success_move: Option<(&str, &str)>,
     ) -> Result<String> {
+        self.submit_with(identity_id, email_id, envelope, None, on_success_move)
+    }
+
+    /// [`JmapClient::submit`] with a delivery status notification request: with an explicit envelope it
+    /// becomes the envelope's SMTP parameters (RFC 8621 section 7: `RET`/`ENVID` on `mailFrom`,
+    /// `NOTIFY`/`ORCPT` on each `rcptTo`, as RFC 3461 writes them).
+    pub fn submit_with(
+        &self,
+        identity_id: &str,
+        email_id: &str,
+        envelope: Option<(&str, &[&str])>,
+        dsn: Option<&DsnRequest>,
+        on_success_move: Option<(&str, &str)>,
+    ) -> Result<String> {
         let mut sub = json!({ "identityId": identity_id, "emailId": email_id });
         if let (Some((from, rcpts)), Some(m)) = (envelope, sub.as_object_mut()) {
-            m.insert(
-                "envelope".into(),
-                json!({
-                    "mailFrom": { "email": from },
-                    "rcptTo": rcpts.iter().map(|r| json!({ "email": r })).collect::<Vec<_>>(),
-                }),
-            );
+            let mail_from = match dsn {
+                Some(d) => {
+                    let mut params = Map::new();
+                    params.insert("RET".into(), json!(if d.headers_only { "HDRS" } else { "FULL" }));
+                    if let Some(id) = &d.envid {
+                        params.insert("ENVID".into(), json!(id));
+                    }
+                    json!({ "email": from, "parameters": params })
+                }
+                None => json!({ "email": from }),
+            };
+            let rcpt_to: Vec<Value> = rcpts
+                .iter()
+                .map(|r| match dsn {
+                    Some(d) if r.is_ascii() => json!({ "email": r, "parameters": {
+                        "NOTIFY": d.notify(),
+                        "ORCPT": format!("rfc822;{}", xtext(r)),
+                    } }),
+                    Some(d) => json!({ "email": r, "parameters": { "NOTIFY": d.notify() } }),
+                    None => json!({ "email": r }),
+                })
+                .collect();
+            m.insert("envelope".into(), json!({ "mailFrom": mail_from, "rcptTo": rcpt_to }));
         }
         let mut args = self.with_account(json!({ "create": { "s0": sub } }));
         if let (Some((from, to)), Some(m)) = (on_success_move, args.as_object_mut()) {
@@ -642,6 +708,11 @@ impl JmapClient {
 
     /// Sends a raw RFC 5322 message: upload, import into `drafts_id` as a draft, submit, and on success
     /// move it to `sent_id`. Returns (email id, submission id).
+    ///
+    /// Submission-only `X-MailCraft-Submit-*` header fields are removed first, as the SMTP client does
+    /// ([`crate::smtp::take_submit_options`]), so neither the recipients nor the server's sent copy see
+    /// them; a delivery receipt request among them becomes DSN envelope parameters when the server lists
+    /// the DSN extension and an envelope is given.
     pub fn send_raw(
         &self,
         identity_id: &str,
@@ -650,9 +721,12 @@ impl JmapClient {
         sent_id: &str,
         envelope: Option<(&str, &[&str])>,
     ) -> Result<(String, String)> {
-        let blob = self.upload(raw, "message/rfc822")?;
+        let (dsn, clean) = take_submit_options(raw);
+        let dsn = dsn.filter(|_| self.submission_extension("DSN"));
+        let blob = self.upload(&clean, "message/rfc822")?;
         let email = self.import_email(&blob, &[drafts_id], &["$draft", "$seen"])?;
-        let sub = self.submit(identity_id, &email, envelope, Some((drafts_id, sent_id)))?;
+        let sub =
+            self.submit_with(identity_id, &email, envelope, dsn.as_ref(), Some((drafts_id, sent_id)))?;
         Ok((email, sub))
     }
 }
@@ -685,7 +759,7 @@ fn pointer_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::testserver::{json as json_resp, serve};
+    use crate::http::testserver::{Seen, json as json_resp, serve};
 
     fn plaintext_ok() -> HttpClient {
         HttpClient::new(crate::ConnectOptions {
@@ -810,6 +884,77 @@ mod tests {
         let err = c.call_one("Foo/get", json!({})).unwrap_err();
         assert!(matches!(err, NetError::Jmap { ref kind, .. } if kind == "unknownMethod"));
         t.join().unwrap();
+    }
+
+    /// Sends one message with a DSN request through a server whose submission capability lists
+    /// `extensions`; returns (uploaded message, EmailSubmission/set create arguments).
+    fn send_with_dsn(extensions: Value) -> (String, Value) {
+        let (base, t, rx) = serve(4, move |s| {
+            let body: Value = serde_json::from_slice(&s.body).unwrap_or(Value::Null);
+            let first = body["methodCalls"][0][0].as_str().unwrap_or_default().to_owned();
+            match (s.method.as_str(), s.path.as_str()) {
+                ("GET", "/jmap/session") => {
+                    let mut sess: Value = serde_json::from_str(&session_json("")).unwrap();
+                    sess["accounts"]["A1"]["accountCapabilities"] =
+                        json!({ SUBMISSION: { "submissionExtensions": extensions.clone() } });
+                    json_resp(200, &sess.to_string())
+                }
+                ("POST", "/jmap/upload/A1") => json_resp(201, r#"{"blobId":"B9","type":"message/rfc822","size":5}"#),
+                ("POST", "/jmap/api") if first == "Email/import" => json_resp(
+                    200,
+                    &json!({"methodResponses": [["Email/import", {"created": {"i0": {"id": "E7"}}}, "c0"]]})
+                        .to_string(),
+                ),
+                ("POST", "/jmap/api") => json_resp(
+                    200,
+                    &json!({"methodResponses": [["EmailSubmission/set", {"created": {"s0": {"id": "S1"}}}, "c0"]]})
+                        .to_string(),
+                ),
+                _ => json_resp(404, "{}"),
+            }
+        });
+        let c = JmapClient::connect(
+            &format!("{base}/jmap/session"),
+            JmapAuth::Bearer("t".into()),
+            plaintext_ok(),
+        )
+        .unwrap();
+        let raw = b"From: a@example.com\r\nTo: b@example.org\r\nMessage-ID: <m1@example.com>\r\n\
+X-MailCraft-Submit-DSN: NOTIFY=SUCCESS,FAILURE; RET=HDRS\r\nX-MailCraft-Submit-Save-Sent: none\r\nSubject: s\r\n\r\nbody\r\n";
+        c.send_raw("I1", raw, "M9", "M2", Some(("a@example.com", &["b@example.org"]))).unwrap();
+        t.join().unwrap();
+        let seen: Vec<Seen> = rx.try_iter().collect();
+        let upload = seen.iter().find(|s| s.path.starts_with("/jmap/upload")).unwrap();
+        let submit = seen
+            .iter()
+            .filter_map(|s| serde_json::from_slice::<Value>(&s.body).ok())
+            .find(|b| b["methodCalls"][0][0] == "EmailSubmission/set")
+            .unwrap();
+        (
+            String::from_utf8_lossy(&upload.body).into_owned(),
+            submit["methodCalls"][0][1]["create"]["s0"].clone(),
+        )
+    }
+
+    #[test]
+    fn send_raw_strips_submission_fields_and_asks_for_dsn() {
+        let (msg, sub) = send_with_dsn(json!({ "DSN": [], "SIZE": ["0"] }));
+        assert!(!msg.contains("X-MailCraft-Submit"), "{msg}");
+        assert!(msg.contains("Subject: s\r\n") && msg.contains("Message-ID: <m1@example.com>"));
+        let env = &sub["envelope"];
+        assert_eq!(
+            env["mailFrom"],
+            json!({"email": "a@example.com", "parameters": {"RET": "HDRS", "ENVID": "m1@example.com"}})
+        );
+        assert_eq!(
+            env["rcptTo"][0],
+            json!({"email": "b@example.org", "parameters": {"NOTIFY": "SUCCESS,FAILURE", "ORCPT": "rfc822;b@example.org"}})
+        );
+        // Without the server's DSN extension: no parameters, still no submission-only fields.
+        let (msg, sub) = send_with_dsn(json!({}));
+        assert!(!msg.contains("X-MailCraft-Submit"), "{msg}");
+        assert_eq!(sub["envelope"]["mailFrom"], json!({"email": "a@example.com"}));
+        assert_eq!(sub["envelope"]["rcptTo"][0], json!({"email": "b@example.org"}));
     }
 
     #[test]

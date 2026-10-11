@@ -522,3 +522,108 @@ EXDATE;TZID=Bad:20260106T090000,20260107T090000\nEND:VEVENT\nEND:VCALENDAR\n";
     // 5 Jan … 31 Dec is 361 days, two of them excluded.
     assert_eq!(occ.len(), 359);
 }
+
+#[test]
+fn zoned_recurring_appointment_exports_its_named_zone() {
+    // 09:00 Toronto every Monday from October into November (DST ends 2026-11-01).
+    let start = at(2026, 10, 19, 9, 0, -240);
+    let a = Appointment {
+        uid: "weekly@example.com".into(),
+        subject: "Stand-up".into(),
+        start,
+        end: DateTime::from_unix(start.unix + 3600, -240),
+        recurrence: Some(Recurrence {
+            rrule: "FREQ=WEEKLY;COUNT=4".into(),
+            exdates: vec![at(2026, 10, 26, 9, 0, -240)],
+        }),
+        tz: Some("America/Toronto".into()),
+        ..Default::default()
+    };
+    let text = ics::write(&[&a], &[], None, utc(2026, 10, 1, 0, 0));
+    assert!(text.contains("DTSTART;TZID=America/Toronto:20261019T090000"), "{text}");
+    assert!(text.contains("EXDATE;TZID=America/Toronto:20261026T090000"), "{text}");
+    assert!(text.contains("BEGIN:VTIMEZONE\r\nTZID:America/Toronto\r\n"), "{text}");
+    assert!(text.contains("RRULE:FREQ=YEARLY;BYDAY=2SU;BYMONTH=3"), "{text}");
+    assert!(!text.contains("UTC-04:00"), "{text}");
+    // Read back (here and by any other calendar): the occurrence after the change stays at 09:00 local.
+    let cal = ics::read_str(&text, ImportOptions::default()).unwrap();
+    let e = &cal.events[0];
+    assert_eq!(e.appointment.tz.as_deref(), Some("America/Toronto"));
+    let occ = e.occurrences(&cal.zones, utc(2026, 1, 1, 0, 0), utc(2027, 1, 1, 0, 0), 10);
+    assert_eq!(occ.len(), 3);
+    assert_eq!(occ[1].0, at(2026, 11, 2, 9, 0, -300));
+    // An invitation carries the zone too.
+    let req = itip::request(&a, 0, utc(2026, 10, 1, 0, 0));
+    assert!(req.contains("DTSTART;TZID=America/Toronto:20261019T090000"), "{req}");
+    assert!(req.contains("TZID:America/Toronto"), "{req}");
+    // All-day and zone-less appointments are written as before.
+    let plain = Appointment { tz: None, ..a.clone() };
+    assert!(ics::write(&[&plain], &[], None, utc(2026, 10, 1, 0, 0)).contains("TZID=\"UTC-04:00\""));
+}
+
+#[test]
+fn imported_zones_name_their_iana_zone() {
+    // A file's own definition under a non-IANA name (as Outlook writes them) maps to the built-in zone with
+    // the same rules; IANA names are kept; fixed offsets and floating times name no zone.
+    let cal = ics::read_str(MEETING, ImportOptions::default()).unwrap();
+    assert_eq!(cal.events[0].appointment.tz.as_deref(), Some("America/New_York"));
+    let text = "BEGIN:VCALENDAR\nBEGIN:VTIMEZONE\nTZID:W. Europe\nBEGIN:STANDARD\nDTSTART:16011028T030000\n\
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10\nTZOFFSETFROM:+0200\nTZOFFSETTO:+0100\nEND:STANDARD\nBEGIN:DAYLIGHT\n\
+DTSTART:16010325T020000\nRRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0200\n\
+END:DAYLIGHT\nEND:VTIMEZONE\nBEGIN:VTIMEZONE\nTZID:India\nBEGIN:STANDARD\nDTSTART:16010101T000000\n\
+TZOFFSETFROM:+0530\nTZOFFSETTO:+0530\nEND:STANDARD\nEND:VTIMEZONE\n\
+BEGIN:VEVENT\nUID:a\nDTSTART;TZID=W. Europe:20260710T100000\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:b\nDTSTART;TZID=India:20260710T100000\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:c\nDTSTART;TZID=europe/berlin:20260710T100000\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:d\nDTSTART;TZID=\"UTC+02:00\":20260710T100000\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:e\nDTSTART:20260710T100000\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:f\nDTSTART;VALUE=DATE;TZID=Europe/Berlin:20260710\nEND:VEVENT\nEND:VCALENDAR\n";
+    let cal = ics::read_str(text, ImportOptions::default()).unwrap();
+    let zones: Vec<Option<&str>> = cal.events.iter().map(|e| e.appointment.tz.as_deref()).collect();
+    assert_eq!(
+        zones,
+        vec![Some("Europe/Paris"), None, Some("Europe/Berlin"), None, None, None],
+        "{:?}",
+        cal.events.iter().map(|e| &e.appointment.uid).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn builtin_zones_follow_current_rules() {
+    let off = |name: &str, y: i64, m: u8, d: u8, h: u8| {
+        tz::builtin(name).unwrap().offset_at_utc(value::local_secs(y, m, d, h, 0, 0).unwrap())
+    };
+    // Egypt (daylight saving time again since 2023): last Friday of April to the last Thursday of October.
+    assert_eq!(off("Africa/Cairo", 2026, 1, 15, 12), 120);
+    assert_eq!(off("Africa/Cairo", 2026, 7, 15, 12), 180);
+    assert_eq!(off("Africa/Cairo", 2026, 4, 23, 12), 120);
+    assert_eq!(off("Africa/Cairo", 2026, 4, 24, 12), 180);
+    // 2024: the last Thursday of October was the 31st; the change came at its midnight (21:00 UTC).
+    assert_eq!(off("Africa/Cairo", 2024, 10, 31, 20), 180);
+    assert_eq!(off("Africa/Cairo", 2024, 10, 31, 22), 120);
+    assert_eq!(off("Africa/Cairo", 2025, 10, 30, 22), 120);
+    assert_eq!(off("Africa/Cairo", 2025, 10, 30, 20), 180);
+    assert_eq!(off("Africa/Cairo", 2022, 7, 15, 12), 120);
+    // Kazakhstan: one zone, UTC+05:00, since 2024.
+    assert_eq!(off("Asia/Almaty", 2026, 1, 15, 12), 300);
+    assert_eq!(tz::builtin_name("america/toronto"), Some("America/Toronto"));
+    assert_eq!(tz::builtin_name("UTC+02:00"), None);
+    assert_eq!(tz::builtin_name("Nowhere/Special"), None);
+}
+
+#[test]
+fn named_zone_vtimezone_round_trips() {
+    for name in ["America/New_York", "Europe/London", "Australia/Sydney", "Pacific/Auckland", "Africa/Cairo"]
+    {
+        let z = tz::builtin(name).unwrap();
+        let mut text = String::new();
+        z.to_component().write(&mut text);
+        let parsed = ics::parse::parse(&text);
+        let back = tz::TimeZone::from_component(parsed.first().unwrap()).unwrap();
+        for day in 0..(3 * 366) {
+            let u = value::local_secs(2026, 1, 1, 12, 0, 0).unwrap() + day * 86_400;
+            assert_eq!(back.offset_at_utc(u), z.offset_at_utc(u), "{name} day {day}");
+        }
+        assert_eq!(tz::equivalent_builtin(&back, 2026).map(tz::builtin_name), Some(tz::builtin_name(name)));
+    }
+}

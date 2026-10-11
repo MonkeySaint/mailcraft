@@ -543,6 +543,7 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
             "Next 7 Days",
             "Overdue",
             "Assigned",
+            "Server Tasks",
         ]
         .iter()
         .map(|s| plain(s, "tasks"))
@@ -719,8 +720,11 @@ pub fn run(ctx: &egui::Context, app: &mut App, surface: Surface, mem: &mut Mem, 
     {
         return;
     }
-    // Calendar commands go through the modules area so the calendar's view state goes in and comes back.
-    let result = if surface == Surface::Main && act.cmd.starts_with("calendar.") {
+    // Calendar commands (and View-tab commands while the Calendar shows) go through the modules area so the
+    // calendar's view state goes in and comes back in the same frame.
+    let calendar_view = act.cmd.starts_with("calendar.")
+        || (act.cmd.starts_with("view.") && app.s.view.module == mailcraft_engine::Module::Calendar);
+    let result = if surface == Surface::Main && calendar_view {
         crate::modules::calendar_command(ctx, app, &act.cmd, params)
     } else {
         app.run(&act.cmd, params)

@@ -349,8 +349,13 @@ fn quick_click(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     } else {
         app.s.mailbox.categories.iter().map(|c| c.name.clone()).collect()
     };
-    let pref_key = if for_flag { "quickClick.flag" } else { "quickClick.category" };
-    let saved = common::pref(ctx, pref_key).and_then(|v| v.as_str().map(str::to_owned));
+    // The current Quick Click flag / category comes from the profile settings (the commands store it).
+    let saved = if for_flag {
+        let kind = app.s.settings.text("tasks.quickClickFlag");
+        FLAG_KINDS.iter().find(|(k, _)| *k == kind).map(|(_, l)| (*l).to_owned())
+    } else {
+        mailcraft_engine::cmd::categories::quick_click_category(&app.s)
+    };
     let init =
         |_: &App| QuickState { pick: saved.clone().or_else(|| names.first().cloned()).unwrap_or_default() };
     with_state(ctx, app, uid, init, |st, app| {
@@ -371,8 +376,8 @@ fn quick_click(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     } else {
                         app.run("categories.setQuickClick", json!({"name": st.pick}))
                     };
-                    if res.is_some() {
-                        common::set_pref(ctx, pref_key, json!(st.pick));
+                    if res.is_none() {
+                        return Out::Keep;
                     }
                     Out::Close
                 }

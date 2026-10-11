@@ -251,7 +251,7 @@ pub fn write(
     now: DateTime,
 ) -> String {
     let mut cal = map::calendar_shell(method);
-    let mut offsets = std::collections::BTreeSet::new();
+    let mut offsets = map::UsedZones::default();
     let mut children = Vec::new();
     for a in appointments {
         children.push(map::event_component(a, &map::EventOut::default(), now, &mut offsets));
@@ -259,9 +259,7 @@ pub fn write(
     for t in tasks {
         children.push(map::task_component(t, now, &mut offsets));
     }
-    for off in offsets {
-        cal.children.push(TimeZone::fixed_component(off));
-    }
+    cal.children.extend(offsets.components());
     cal.children.extend(children);
     let mut out = String::new();
     cal.write(&mut out);

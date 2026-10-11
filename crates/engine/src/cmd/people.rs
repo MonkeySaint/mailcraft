@@ -6,17 +6,30 @@
 //! address strings ("Name <a@b>"). [`is_group`] recognises them; the member list has no three-address limit.
 //!
 //! `people.new` / `people.newGroup` / `people.newFromSameCompany` create the item when field params are
-//! given and otherwise ask the UI to open the contact / contact group window. Forwarding as a vCard is
-//! commit 9 (formats): `people.forward` asks the UI to open the forward flow for now.
+//! given and otherwise ask the UI to open the contact / contact group window. `people.forward` attaches
+//! vCards (RFC 6350, `mailcraft-formats`).
+//!
+//! **Tags.** Contacts can be flagged for follow-up like messages (`people.flag`; flagged contacts appear in
+//! the To-Do List) and marked private (`people.private`).
+//!
+//! **Mail Merge** (`people.mailMerge`) merges the contacts into E-mail messages: `{{Field}}` placeholders
+//! ([`MERGE_FIELDS`]) in the subject and body are replaced with each contact's fields, a preview shows one
+//! merged message, and Send puts one message per contact with an address in the Outbox.
+//!
+//! **Assign Task** (`people.assignTask`) sends a task request (VTODO) to the selected contacts
+//! (`tasks::assign`).
+//!
+//! **Views.** [`view_rows`] is the list of the People views (`cmd::view::modules`).
 
 use serde_json::{Value, json};
 
 use crate::cmd::calendar::{self, pim, pim::Kind};
-use crate::cmd::util::opt_str;
+use crate::cmd::util::{opt_bool, opt_str};
+use crate::cmd::view::modules::{self, ModuleKind, RowKind, ViewRow};
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
 use mailcraft_model::contact::PostalAddress;
 use mailcraft_model::text::contains_ci;
-use mailcraft_model::{Contact, FolderId, ItemId, dates};
+use mailcraft_model::{Contact, DateTime, FlagState, FolderId, ItemId, dates};
 
 /// First line of `notes` marking a contact item as a contact group.
 pub const CONTACT_GROUP_MARKER: &str = "Contact Group";
@@ -43,16 +56,81 @@ pub fn display_name(c: &Contact) -> String {
     c.emails.first().cloned().unwrap_or_default()
 }
 
+/// The orders of Options › People › Default "File As" (`people.fileAs`).
+pub const FILE_AS_ORDERS: [&str; 5] =
+    ["lastFirst", "firstLast", "company", "lastFirstCompany", "companyLastFirst"];
+
 /// Default File As: "Last, First" (or whichever part exists, else company, else address).
 pub fn auto_file_as(c: &Contact) -> String {
+    file_as_in(c, "lastFirst")
+}
+
+/// File As in one of the [`FILE_AS_ORDERS`] ("Last, First", "First Last", "Company", "Last, First
+/// (Company)", "Company (Last, First)"); parts that are missing are left out, and a contact without a name
+/// or company files as its first address. Unknown orders mean "Last, First".
+pub fn file_as_in(c: &Contact, order: &str) -> String {
     let first = c.first_name.trim();
     let last = c.last_name.trim();
-    match (first.is_empty(), last.is_empty()) {
+    let company = c.company.trim();
+    let last_first = match (first.is_empty(), last.is_empty()) {
         (false, false) => format!("{last}, {first}"),
         (true, false) => last.to_owned(),
         (false, true) => first.to_owned(),
-        (true, true) if !c.company.trim().is_empty() => c.company.trim().to_owned(),
-        (true, true) => c.emails.first().cloned().unwrap_or_default(),
+        (true, true) => String::new(),
+    };
+    let first_last = [first, last].iter().filter(|x| !x.is_empty()).copied().collect::<Vec<_>>().join(" ");
+    let both = !last_first.is_empty() && !company.is_empty();
+    let out = match order {
+        "firstLast" => first_last,
+        "company" if !company.is_empty() => company.to_owned(),
+        "lastFirstCompany" if both => format!("{last_first} ({company})"),
+        "companyLastFirst" if both => format!("{company} ({last_first})"),
+        _ => last_first,
+    };
+    if !out.is_empty() {
+        out
+    } else if !company.is_empty() {
+        company.to_owned()
+    } else {
+        c.emails.first().cloned().unwrap_or_default()
+    }
+}
+
+/// Splits a Full Name into the contact's name parts in one of the orders of Options › People › Default
+/// "Full Name" order (`people.fullNameOrder`): `firstMiddleLast` ("Ann Marie Lee"), `lastFirst` ("Lee Ann
+/// Marie") or `firstLast1Last2` ("Ana García López": two surnames). "Last, First Middle" (with a comma) is
+/// understood in every order.
+pub fn split_full_name(c: &mut Contact, full: &str, order: &str) {
+    c.first_name.clear();
+    c.middle_name.clear();
+    c.last_name.clear();
+    let join = |v: &[&str]| v.join(" ");
+    if let Some((last, rest)) = full.split_once(',') {
+        let rest: Vec<&str> = rest.split_whitespace().collect();
+        c.last_name = join(&last.split_whitespace().collect::<Vec<_>>());
+        c.first_name = rest.first().map(|x| (*x).to_owned()).unwrap_or_default();
+        c.middle_name = rest.get(1..).map(join).unwrap_or_default();
+        return;
+    }
+    let parts: Vec<&str> = full.split_whitespace().collect();
+    match (order, parts.as_slice()) {
+        (_, []) => {}
+        ("lastFirst", [only]) => c.last_name = (*only).to_owned(),
+        (_, [only]) => c.first_name = (*only).to_owned(),
+        ("lastFirst", [last, first, middle @ ..]) => {
+            c.last_name = (*last).to_owned();
+            c.first_name = (*first).to_owned();
+            c.middle_name = join(middle);
+        }
+        ("firstLast1Last2", [first, lasts @ ..]) => {
+            c.first_name = (*first).to_owned();
+            c.last_name = join(lasts);
+        }
+        (_, [first, middle @ .., last]) => {
+            c.first_name = (*first).to_owned();
+            c.middle_name = join(middle);
+            c.last_name = (*last).to_owned();
+        }
     }
 }
 
@@ -112,20 +190,14 @@ fn address_from(v: &Value, default_kind: &str) -> Result<PostalAddress, CmdError
     })
 }
 
-/// Applies contact field params (shared by new and update).
-pub fn apply_contact_fields(c: &mut Contact, p: &Value) -> Result<(), CmdError> {
-    let was_auto = c.file_as.trim().is_empty() || c.file_as == auto_file_as(c);
+/// Applies contact field params (shared by new and update). A `fullName` is split in the profile's Default
+/// "Full Name" order and an automatic File As follows the Default "File As" order (Options › People).
+pub fn apply_contact_fields(s: &Session, c: &mut Contact, p: &Value) -> Result<(), CmdError> {
+    let file_as_order = s.settings.file_as();
+    let was_auto =
+        c.file_as.trim().is_empty() || FILE_AS_ORDERS.iter().any(|o| c.file_as == file_as_in(c, o));
     if let Some(full) = pim::text(p, "fullName")? {
-        let parts: Vec<&str> = full.split_whitespace().collect();
-        c.first_name = parts.first().map(|x| (*x).to_owned()).unwrap_or_default();
-        c.middle_name.clear();
-        c.last_name.clear();
-        if parts.len() >= 2 {
-            c.last_name = parts.last().map(|x| (*x).to_owned()).unwrap_or_default();
-            if let Some(mid) = parts.get(1..parts.len().saturating_sub(1)) {
-                c.middle_name = mid.join(" ");
-            }
-        }
+        split_full_name(c, &full, &s.settings.full_name_order());
     }
     for (key, slot) in [
         ("firstName", &mut c.first_name),
@@ -220,7 +292,7 @@ pub fn apply_contact_fields(c: &mut Contact, p: &Value) -> Result<(), CmdError> 
     }
     match pim::text(p, "fileAs")? {
         Some(f) if !f.trim().is_empty() => c.file_as = f.trim().to_owned(),
-        _ if was_auto => c.file_as = auto_file_as(c),
+        _ if was_auto => c.file_as = file_as_in(c, &file_as_order),
         _ => {}
     }
     Ok(())
@@ -315,7 +387,7 @@ pub fn contact_json(c: &Contact) -> Value {
 /// Creates a contact in `folder` from field params; returns its id.
 pub fn create_contact(s: &mut Session, folder: FolderId, p: &Value) -> Result<ItemId, CmdError> {
     let mut c = Contact { folder, ..Default::default() };
-    apply_contact_fields(&mut c, p)?;
+    apply_contact_fields(s, &mut c, p)?;
     if is_group(&c) {
         return Err(CmdError::Params(format!("notes cannot start with \"{CONTACT_GROUP_MARKER}\"")));
     }
@@ -330,8 +402,121 @@ fn run_new(s: &mut Session, p: &Value) -> CmdResult {
     if !pim::has_any(p, &CONTACT_FIELDS) {
         return pim::dialog(s, "contact", json!({ "folder": folder.0, "focus": "fullName" }));
     }
-    let id = create_contact(s, folder, p)?;
-    Ok(s.mailbox.contacts.get(&id).map_or_else(|| json!({ "id": id.0 }), contact_json))
+    let mut c = Contact { folder, ..Default::default() };
+    apply_contact_fields(s, &mut c, p)?;
+    if is_group(&c) {
+        return Err(CmdError::Params(format!("notes cannot start with \"{CONTACT_GROUP_MARKER}\"")));
+    }
+    if let Some(r) = check_duplicate(s, &c, p)? {
+        return Ok(r);
+    }
+    let id = ItemId(s.mailbox.alloc_id());
+    c.id = id;
+    let out = contact_json(&c);
+    s.mailbox.contacts.insert(id, c);
+    Ok(out)
+}
+
+/// An existing contact (not a group) in the folder of `c` with the same full name (ignoring case) or one of
+/// its email addresses: the first by id.
+pub fn find_duplicate(s: &Session, c: &Contact) -> Option<ItemId> {
+    let name = c.full_name().to_lowercase();
+    let emails: Vec<String> =
+        c.emails.iter().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
+    s.mailbox
+        .contacts
+        .values()
+        .filter(|o| o.folder == c.folder && o.id != c.id && !is_group(o))
+        .find(|o| {
+            (!name.is_empty() && o.full_name().to_lowercase() == name)
+                || o.emails.iter().any(|e| emails.contains(&e.trim().to_lowercase()))
+        })
+        .map(|o| o.id)
+}
+
+/// Copies what the new contact `new` has onto the existing contact `old` (Duplicate Contact Detected ›
+/// "Update information of selected Contact"): non-empty fields replace, phone numbers and addresses
+/// replace those of the same kind, new email addresses and categories are added.
+pub fn merge_contact(old: &mut Contact, new: &Contact) {
+    for (dst, src) in [
+        (&mut old.title, &new.title),
+        (&mut old.first_name, &new.first_name),
+        (&mut old.middle_name, &new.middle_name),
+        (&mut old.last_name, &new.last_name),
+        (&mut old.suffix, &new.suffix),
+        (&mut old.company, &new.company),
+        (&mut old.job_title, &new.job_title),
+        (&mut old.department, &new.department),
+        (&mut old.web_page, &new.web_page),
+        (&mut old.im_address, &new.im_address),
+        (&mut old.notes, &new.notes),
+    ] {
+        if !src.trim().is_empty() {
+            dst.clone_from(src);
+        }
+    }
+    for e in &new.emails {
+        let known = old.emails.iter().any(|o| o.trim().eq_ignore_ascii_case(e.trim()));
+        if !known && !e.trim().is_empty() && old.emails.len() < MAX_CONTACT_EMAILS {
+            old.emails.push(e.clone());
+        }
+    }
+    for (kind, num) in &new.phones {
+        old.phones.retain(|(k, _)| !k.eq_ignore_ascii_case(kind));
+        old.phones.push((kind.clone(), num.clone()));
+    }
+    for a in &new.addresses {
+        old.addresses.retain(|o| !o.kind.eq_ignore_ascii_case(&a.kind));
+        old.addresses.push(a.clone());
+    }
+    if new.birthday.is_some() {
+        old.birthday.clone_from(&new.birthday);
+    }
+    for cat in &new.categories {
+        if !old.categories.iter().any(|o| o.eq_ignore_ascii_case(cat)) {
+            old.categories.push(cat.clone());
+        }
+    }
+}
+
+/// Options › People › "Check for duplicates when saving new contacts". `duplicate` param: absent (check
+/// when the option is on: a duplicate is reported, nothing is saved), `"add"` (save as a new contact),
+/// `"update"` (merge into the duplicate, [`merge_contact`]). `Some(result)` when the contact must not be
+/// added.
+fn check_duplicate(s: &mut Session, c: &Contact, p: &Value) -> Result<Option<Value>, CmdError> {
+    let choice = opt_str(p, "duplicate");
+    match choice {
+        None | Some("add" | "update") => {}
+        Some(_) => return Err(CmdError::Params("`duplicate` must be add|update".into())),
+    }
+    if choice == Some("add") || (choice.is_none() && !s.settings.bool("people.checkDuplicates")) {
+        return Ok(None);
+    }
+    let Some(dup) = find_duplicate(s, c) else {
+        return if choice == Some("update") {
+            Err(CmdError::Params("there is no duplicate contact to update".into()))
+        } else {
+            Ok(None)
+        };
+    };
+    let Some(mut old) = s.mailbox.contacts.get(&dup).cloned() else { return Ok(None) };
+    if choice == Some("update") {
+        merge_contact(&mut old, c);
+        if FILE_AS_ORDERS.iter().any(|o| old.file_as == file_as_in(&old, o)) || old.file_as.trim().is_empty()
+        {
+            old.file_as = file_as_in(&old, &s.settings.file_as());
+        }
+        let mut out = contact_json(&old);
+        s.mailbox.contacts.insert(dup, old);
+        if let Some(o) = out.as_object_mut() {
+            o.insert("updatedDuplicate".into(), json!(true));
+        }
+        return Ok(Some(out));
+    }
+    Ok(Some(json!({
+        "created": false,
+        "duplicate": { "id": dup.0, "name": display_name(&old), "emails": old.emails },
+    })))
 }
 
 fn run_new_group(s: &mut Session, p: &Value) -> CmdResult {
@@ -363,7 +548,7 @@ fn run_update(s: &mut Session, p: &Value) -> CmdResult {
         if is_group(&c) {
             apply_group_fields(s, &mut c, p)?;
         } else {
-            apply_contact_fields(&mut c, p)?;
+            apply_contact_fields(s, &mut c, p)?;
             if is_group(&c) {
                 return Err(CmdError::Params(format!("notes cannot start with \"{CONTACT_GROUP_MARKER}\"")));
             }
@@ -426,10 +611,19 @@ fn run_delete(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn run_copy(s: &mut Session, p: &Value) -> CmdResult {
+    if p.get("folder").is_none_or(Value::is_null) {
+        return crate::cmd::tasks::move_dialog(s, p, Kind::Contact, true);
+    }
     pim::run_copy(s, p, Kind::Contact)
 }
 fn run_move(s: &mut Session, p: &Value) -> CmdResult {
+    if p.get("folder").is_none_or(Value::is_null) {
+        return crate::cmd::tasks::move_dialog(s, p, Kind::Contact, false);
+    }
     pim::run_move(s, p, Kind::Contact)
+}
+fn run_all_categories(s: &mut Session, p: &Value) -> CmdResult {
+    crate::cmd::tasks::categories_dialog(s, p, Kind::Contact)
 }
 fn run_categorize(s: &mut Session, p: &Value) -> CmdResult {
     pim::run_categorize(s, p, Kind::Contact)
@@ -527,6 +721,113 @@ fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "compose": cid, "as": as_kind, "contacts": contacts.len() }))
 }
 
+/// Contact fields usable as `{{Field}}` placeholders in Mail Merge.
+pub const MERGE_FIELDS: [&str; 24] = [
+    "Full Name",
+    "Title",
+    "First Name",
+    "Middle Name",
+    "Last Name",
+    "Suffix",
+    "File As",
+    "Company",
+    "Department",
+    "Job Title",
+    "Email",
+    "Email 2",
+    "Email 3",
+    "Business Phone",
+    "Home Phone",
+    "Mobile Phone",
+    "Business Fax",
+    "Street",
+    "City",
+    "State",
+    "Postal Code",
+    "Country",
+    "Web Page",
+    "Birthday",
+];
+/// Longest merged subject + body template (bytes).
+pub const MAX_MERGE_TEMPLATE: usize = 256 * 1024;
+/// Most messages one merge sends.
+pub const MAX_MERGE_MESSAGES: usize = 5_000;
+
+/// Value of merge field `name` for contact `c` ("" when the contact has none).
+pub fn merge_field(c: &Contact, name: &str) -> Option<String> {
+    let phone = |kind: &str| {
+        c.phones
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(kind))
+            .map(|(_, n)| n.clone())
+            .unwrap_or_default()
+    };
+    let addr = c.addresses.iter().find(|a| a.kind.eq_ignore_ascii_case("Business")).or(c.addresses.first());
+    let a = |f: fn(&PostalAddress) -> &String| addr.map(|x| f(x).clone()).unwrap_or_default();
+    let email = |i: usize| c.emails.get(i).cloned().unwrap_or_default();
+    let canonical = MERGE_FIELDS.iter().find(|f| f.eq_ignore_ascii_case(name.trim()))?;
+    Some(match *canonical {
+        "Full Name" => c.full_name(),
+        "Title" => c.title.clone(),
+        "First Name" => c.first_name.clone(),
+        "Middle Name" => c.middle_name.clone(),
+        "Last Name" => c.last_name.clone(),
+        "Suffix" => c.suffix.clone(),
+        "File As" => display_name(c),
+        "Company" => c.company.clone(),
+        "Department" => c.department.clone(),
+        "Job Title" => c.job_title.clone(),
+        "Email" => email(0),
+        "Email 2" => email(1),
+        "Email 3" => email(2),
+        "Business Phone" => phone("Business"),
+        "Home Phone" => phone("Home"),
+        "Mobile Phone" => phone("Mobile"),
+        "Business Fax" => phone("Business Fax"),
+        "Street" => a(|x| &x.street),
+        "City" => a(|x| &x.city),
+        "State" => a(|x| &x.region),
+        "Postal Code" => a(|x| &x.postal_code),
+        "Country" => a(|x| &x.country),
+        "Web Page" => c.web_page.clone(),
+        "Birthday" => c.birthday.clone().unwrap_or_default(),
+        _ => String::new(),
+    })
+}
+
+/// `template` with every `{{Field}}` replaced by the contact's value. Unknown fields are an error naming them;
+/// an unclosed `{{` is kept as text.
+pub fn merge_text(template: &str, c: &Contact) -> Result<String, CmdError> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        let (before, after) = rest.split_at(open);
+        out.push_str(before);
+        let inner = after.get(2..).unwrap_or("");
+        match inner.find("}}") {
+            Some(close) => {
+                let name = inner.get(..close).unwrap_or("");
+                let value = merge_field(c, name).ok_or_else(|| {
+                    CmdError::Params(format!("unknown merge field {{{{{}}}}}", name.trim()))
+                })?;
+                out.push_str(&value);
+                rest = inner.get(close.saturating_add(2)..).unwrap_or("");
+            }
+            None => {
+                out.push_str(after);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Mail Merge. `contacts`: all (the current contacts folder, in list order) or selected; `output`: letters,
+/// email, labels or envelopes (only E-mail can be produced: form letters, labels and envelopes need a
+/// word processor). Without `action` the Mail Merge window opens. With `action`:
+/// - `preview` {subject, body, index?}: the merged message for one contact (with an address),
+/// - `send` {subject, body}: one message per contact with an address, sent to the Outbox.
 fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
     let contacts = match opt_str(p, "contacts") {
         None | Some("all") => "all",
@@ -543,7 +844,97 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
     } else {
         pim::current_folder(s, Kind::Contact).map(|f| ordered(s, f)).unwrap_or_default()
     };
-    pim::dialog(s, "mailMerge", json!({ "contacts": contacts, "output": output, "ids": pim::ids_json(&ids) }))
+    let action = opt_str(p, "action");
+    let Some(action) = action else {
+        return pim::dialog(
+            s,
+            "mailMerge",
+            json!({ "contacts": contacts, "output": output, "ids": pim::ids_json(&ids), "fields": MERGE_FIELDS }),
+        );
+    };
+    if output != "email" {
+        return Err(CmdError::Failed(
+            "Form letters, mailing labels and envelopes need a word processor; choose E-mail to merge into messages."
+                .into(),
+        ));
+    }
+    let subject = pim::text(p, "subject")?.unwrap_or_default();
+    let body = pim::text(p, "body")?.unwrap_or_default();
+    if subject.len().saturating_add(body.len()) > MAX_MERGE_TEMPLATE {
+        return Err(CmdError::Params("the merge text is too long".into()));
+    }
+    // Contacts that can receive mail (groups and contacts without an address are skipped).
+    let recipients: Vec<Contact> = ids
+        .iter()
+        .filter_map(|i| s.mailbox.contacts.get(i))
+        .filter(|c| !is_group(c) && !contact_addresses(c).is_empty())
+        .cloned()
+        .collect();
+    let skipped = ids.len().saturating_sub(recipients.len());
+    match action {
+        "preview" => {
+            let index =
+                crate::cmd::util::opt_u64(p, "index").and_then(|i| usize::try_from(i).ok()).unwrap_or(0);
+            let Some(c) = recipients.get(index) else {
+                return Ok(json!({ "count": recipients.len(), "skipped": skipped, "preview": Value::Null }));
+            };
+            Ok(json!({
+                "count": recipients.len(),
+                "skipped": skipped,
+                "index": index,
+                "preview": {
+                    "to": contact_addresses(c).join("; "),
+                    "subject": merge_text(&subject, c)?,
+                    "body": merge_text(&body, c)?,
+                },
+            }))
+        }
+        "send" => {
+            if subject.trim().is_empty() {
+                return Err(CmdError::Params("enter the message subject line".into()));
+            }
+            if recipients.len() > MAX_MERGE_MESSAGES {
+                return Err(CmdError::Params(format!("a merge sends at most {MAX_MERGE_MESSAGES} messages")));
+            }
+            // Merge everything first so a bad field sends nothing.
+            let mut merged = Vec::new();
+            for c in &recipients {
+                merged.push((
+                    contact_addresses(c).join("; "),
+                    merge_text(&subject, c)?,
+                    merge_text(&body, c)?,
+                ));
+            }
+            let mut sent = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+            for (to, subj, text) in merged {
+                let mut compose = crate::compose::ComposeState {
+                    to,
+                    subject: subj,
+                    body: mailcraft_model::Doc::from_plain_text(&text),
+                    dirty: true,
+                    ..Default::default()
+                };
+                crate::compose::insert_default_signature(&s.mailbox, &mut compose);
+                let cid = s.open_compose(compose);
+                let r = s.run("compose.send", &json!({ "compose": cid }))?;
+                if r.get("sent").and_then(Value::as_bool) == Some(true) {
+                    sent = sent.saturating_add(1);
+                } else {
+                    let e = r.get("error").and_then(Value::as_str).unwrap_or("not sent").to_owned();
+                    s.composes.remove(&cid);
+                    if !errors.contains(&e) {
+                        errors.push(e);
+                    }
+                }
+            }
+            if sent == 0 && !errors.is_empty() {
+                return Err(CmdError::Failed(errors.join(" ")));
+            }
+            Ok(json!({ "sent": sent, "skipped": skipped, "errors": errors }))
+        }
+        other => Err(CmdError::Params(format!("`action` must be preview|send, not {other}"))),
+    }
 }
 
 /// Addresses of the target contacts (groups expand to members), de-duplicated.
@@ -574,10 +965,175 @@ fn run_meeting(s: &mut Session, p: &Value) -> CmdResult {
     calendar::create_meeting(s, &params)
 }
 
+/// Assign Task: with task fields (`subject`, …) sends the task request (`tasks::assign`) to `to` (default:
+/// the selected contacts); without them the Task Request window opens addressed to the selected contacts.
 fn run_assign_task(s: &mut Session, p: &Value) -> CmdResult {
-    let to = target_addresses(s, p).join("; ");
-    let folder = pim::default_folder(s, Kind::Task).map(|f| f.0);
-    pim::dialog(s, "taskRequest", json!({ "to": to, "folder": folder, "focus": "subject" }))
+    let to = target_addresses(s, p);
+    if p.get("subject").is_none() {
+        let folder = pim::default_folder(s, Kind::Task).map(|f| f.0);
+        return pim::dialog(
+            s,
+            "taskRequest",
+            json!({ "to": to.join("; "), "folder": folder, "focus": "subject" }),
+        );
+    }
+    let mut params = p.clone();
+    if let Some(o) = params.as_object_mut() {
+        o.remove("ids");
+        o.remove("id");
+        if !o.contains_key("to") {
+            o.insert("to".into(), json!(to));
+        }
+    }
+    crate::cmd::tasks::assign(s, &params)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Tags: Follow Up, Private
+
+/// Follow Up on contacts: today|tomorrow|thisWeek|nextWeek|noDate flag them (start/due as for mail),
+/// `complete` marks the flag complete, `clear` removes it, `custom` sets `label` / `start` / `due` /
+/// `reminder` (without them the Custom dialog opens; `reminder` opens it for Add Reminder).
+fn run_flag(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = pim::require_targets(s, p, Kind::Contact)?;
+    // No kind: the Quick Click flag (Options › Tasks › Quick Click).
+    let quick = crate::cmd::mail::quick_click_kind(s);
+    let kind = opt_str(p, "kind").unwrap_or(&quick);
+    let now = s.now();
+    let tz = s.tz_offset_min;
+    let flag = match kind {
+        "complete" => FlagState::Complete { completed: Some(now) },
+        "clear" => FlagState::None,
+        "custom" | "reminder" => {
+            if !pim::has_any(p, &["label", "start", "due", "reminder"])
+                || p.get("reminder") == Some(&json!(true))
+            {
+                return pim::dialog(
+                    s,
+                    "pimFlag",
+                    json!({ "ids": pim::ids_json(&ids), "area": "people", "reminder": kind == "reminder" }),
+                );
+            }
+            let label = pim::text(p, "label")?
+                .map(|l| l.trim().to_owned())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| "Follow up".to_owned());
+            let day = |key: &str| -> Result<Option<DateTime>, CmdError> {
+                Ok(pim::date(p, key, tz)?.flatten().map(|d| pim::local_midnight(d, tz)))
+            };
+            let (start, due) = (day("start")?, day("due")?);
+            if let (Some(a), Some(b)) = (start, due)
+                && b.unix < a.unix
+            {
+                return Err(CmdError::Params("the due date is before the start date".into()));
+            }
+            let reminder = pim::date(p, "reminder", tz)?.flatten();
+            FlagState::Flagged { label, start, due, reminder }
+        }
+        k => {
+            let fk = crate::cmd::tasks::parse_flag_kind(k).ok_or_else(|| {
+                CmdError::Params(
+                    "`kind` must be today|tomorrow|thisWeek|nextWeek|noDate|custom|reminder|complete|clear"
+                        .into(),
+                )
+            })?;
+            let (start, due) = crate::cmd::mail::flag_dates(s, fk);
+            FlagState::Flagged { label: "Follow up".into(), start, due, reminder: None }
+        }
+    };
+    for id in &ids {
+        if let Some(c) = s.mailbox.contacts.get_mut(id) {
+            // Add Reminder keeps the existing flag's dates.
+            c.flag = match (&flag, &c.flag) {
+                (
+                    FlagState::Flagged { label, reminder: Some(r), start: None, due: None },
+                    FlagState::Flagged { start, due, .. },
+                ) if kind == "reminder" => {
+                    FlagState::Flagged { label: label.clone(), start: *start, due: *due, reminder: Some(*r) }
+                }
+                _ => flag.clone(),
+            };
+        }
+    }
+    Ok(json!({ "ids": pim::ids_json(&ids), "kind": kind }))
+}
+
+fn run_private(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = pim::require_targets(s, p, Kind::Contact)?;
+    let all = ids.iter().all(|i| s.mailbox.contacts.get(i).is_some_and(|c| c.private));
+    let on = opt_bool(p, "on").unwrap_or(!all);
+    for id in &ids {
+        if let Some(c) = s.mailbox.contacts.get_mut(id) {
+            c.private = on;
+        }
+    }
+    Ok(json!({ "ids": pim::ids_json(&ids), "private": on }))
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Views
+
+fn row_matches(c: &Contact, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    contains_ci(&display_name(c), q)
+        || contains_ci(&c.full_name(), q)
+        || contains_ci(&c.company, q)
+        || contains_ci(&c.job_title, q)
+        || c.emails.iter().any(|e| contains_ci(e, q))
+        || c.phones.iter().any(|(_, n)| contains_ci(n, q))
+}
+
+/// Rows of the selected People view of `folder` matching `query`: by File As (Reverse Sort reverses),
+/// grouped by the arrangement (Phone and List views; List groups by company) when Show in Groups is on.
+pub fn view_rows(s: &Session, folder: FolderId, query: &str) -> Vec<ViewRow> {
+    let kind = ModuleKind::People;
+    let st = modules::state(s, folder, kind);
+    let q = query.trim();
+    let arrange = if modules::grouped_view(kind, &st.view) && modules::show_groups(s, folder) {
+        st.arrangement(kind).map(str::to_owned)
+    } else {
+        None
+    };
+    let mut keyed: Vec<((u8, String), (String, ItemId), ViewRow)> =
+        s.mailbox
+            .contacts
+            .values()
+            .filter(|c| c.folder == folder && row_matches(c, q))
+            .map(|c| {
+                let text = |v: &str| {
+                    let v = v.trim();
+                    if v.is_empty() { (1, "(none)".to_owned()) } else { (0, v.to_owned()) }
+                };
+                let group = arrange.as_deref().map(|a| match a {
+                    "categories" => text(c.categories.first().map(String::as_str).unwrap_or("")),
+                    "location" => {
+                        let a = c
+                            .addresses
+                            .iter()
+                            .find(|a| a.kind.eq_ignore_ascii_case("Business"))
+                            .or(c.addresses.first());
+                        text(
+                            a.map(|a| {
+                                if a.country.trim().is_empty() { a.city.as_str() } else { a.country.as_str() }
+                            })
+                            .unwrap_or(""),
+                        )
+                    }
+                    _ => text(&c.company),
+                });
+                let row =
+                    ViewRow { id: c.id, kind: RowKind::Contact, group: group.as_ref().map(|g| g.1.clone()) };
+                (group.unwrap_or((0, String::new())), (display_name(c).to_lowercase(), c.id), row)
+            })
+            .collect();
+    keyed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let mut out: Vec<ViewRow> = keyed.into_iter().map(|(_, _, r)| r).collect();
+    if modules::reversed(s, folder) {
+        out.reverse();
+    }
+    out
 }
 
 /// Contact prefilled from `c`: company, business address and business phone numbers.
@@ -622,9 +1178,12 @@ fn run_new_from_same_company(s: &mut Session, p: &Value) -> CmdResult {
             json!({ "folder": folder.0, "focus": "fullName", "prefill": prefill }),
         );
     }
-    apply_contact_fields(&mut c, p)?;
+    apply_contact_fields(s, &mut c, p)?;
     if is_group(&c) {
         return Err(CmdError::Params(format!("notes cannot start with \"{CONTACT_GROUP_MARKER}\"")));
+    }
+    if let Some(r) = check_duplicate(s, &c, p)? {
+        return Ok(r);
     }
     let id = ItemId(s.mailbox.alloc_id());
     c.id = id;
@@ -710,15 +1269,15 @@ pub fn specs() -> Vec<CommandSpec> {
         enabled,
         run,
     };
-    const FIELDS: &str = r#"{"fullName"?, "firstName"?, "middleName"?, "lastName"?, "title"?, "suffix"?, "fileAs"?, "company"?, "jobTitle"?, "department"?, "email"?, "email2"?, "email3"?, "emails"?: [string], "phones"?: {"Business": string, "Mobile": string, ...}, "addresses"?: [{"kind","street","city","region","postalCode","country"}], "businessAddress"?: {...}, "webPage"?, "im"?, "birthday"?: "YYYY-MM-DD", "notes"?, "categories"?: [string], "folder"?: number} (no fields = open a blank contact window)"#;
+    const FIELDS: &str = r#"{"fullName"?, "firstName"?, "middleName"?, "lastName"?, "title"?, "suffix"?, "fileAs"?, "company"?, "jobTitle"?, "department"?, "email"?, "email2"?, "email3"?, "emails"?: [string], "phones"?: {"Business": string, "Mobile": string, ...}, "addresses"?: [{"kind","street","city","region","postalCode","country"}], "businessAddress"?: {...}, "webPage"?, "im"?, "birthday"?: "YYYY-MM-DD", "notes"?, "categories"?: [string], "folder"?: number, "duplicate"?: "add"|"update" (new contacts: what to do when Options › People › Check for duplicates finds one; without it a duplicate is reported and nothing is saved)} (no fields = open a blank contact window)"#;
     vec![
         spec(
             "people.assignTask",
             "Assign Task",
             "People › Home › Communicate › More",
             "",
-            r#"{"ids"?: [number]}"#,
-            false,
+            r#"{"ids"?: [number], "to"?: string | [string], "subject"?: string, ...task fields, "keepCopy"?: bool, "send"?: bool} (no subject = open the Task Request window)"#,
+            true,
             always,
             run_assign_task,
         ),
@@ -747,8 +1306,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mail Merge",
             "People › Home › Actions",
             "",
-            r#"{"contacts": "all|selected", "output": "letters|email|labels|envelopes"}"#,
-            false,
+            r#"{"contacts": "all|selected", "output": "letters|email|labels|envelopes", "action"?: "preview|send", "subject"?: string, "body"?: string ({{Field}} placeholders), "index"?: number, "ids"?: [number]} (no action = open the Mail Merge window)"#,
+            true,
             always,
             run_mail_merge,
         ),
@@ -842,6 +1401,36 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             run_categorize,
         ),
+        spec(
+            "people.allCategories",
+            "All Categories",
+            "People › Home › Tags › Categorize",
+            "",
+            r#"{"ids"?: [number]}"#,
+            false,
+            contact_selected,
+            run_all_categories,
+        ),
+        spec(
+            "people.flag",
+            "Follow Up",
+            "People › Home › Tags › Follow Up",
+            "",
+            r#"{"kind": "today|tomorrow|thisWeek|nextWeek|noDate|custom|reminder|complete|clear", "label"?, "start"?, "due"?, "reminder"?, "ids"?: [number]} (custom/reminder without fields = open the Custom dialog)"#,
+            true,
+            contact_selected,
+            run_flag,
+        ),
+        spec(
+            "people.private",
+            "Private",
+            "People › Home › Tags",
+            "",
+            r#"{"on"?: bool, "ids"?: [number]}"#,
+            true,
+            contact_selected,
+            run_private,
+        ),
     ]
 }
 
@@ -899,6 +1488,96 @@ mod tests {
             s.run("people.new", &json!({"emails": ["a@x", "b@x", "c@x", "d@x"]})),
             Err(CmdError::Params(_))
         ));
+        assert!(s.mailbox.validate().is_empty());
+    }
+
+    #[test]
+    fn default_file_as_and_full_name_orders_apply() {
+        let mut s = session();
+        let id = add(&mut s, json!({"fullName": "Ann Lee", "company": "Example Co"}));
+        assert_eq!(s.mailbox.contacts[&ItemId(id)].file_as, "Lee, Ann");
+        for (order, want) in [
+            ("firstLast", "Ann Lee"),
+            ("company", "Example Co"),
+            ("lastFirstCompany", "Lee, Ann (Example Co)"),
+            ("companyLastFirst", "Example Co (Lee, Ann)"),
+        ] {
+            s.run("options.set", &json!({"key": "people.fileAs", "value": order})).unwrap();
+            let id = add(&mut s, json!({"fullName": "Ann Lee", "company": "Example Co", "duplicate": "add"}));
+            assert_eq!(s.mailbox.contacts[&ItemId(id)].file_as, want, "{order}");
+        }
+        // An automatic File As follows later name changes in the current order; a typed one stays.
+        s.run("people.update", &json!({"id": id, "lastName": "Berg"})).unwrap();
+        assert_eq!(s.mailbox.contacts[&ItemId(id)].file_as, "Example Co (Berg, Ann)");
+        // No company: the name parts alone.
+        let solo = add(&mut s, json!({"fullName": "Bo Ek"}));
+        assert_eq!(s.mailbox.contacts[&ItemId(solo)].file_as, "Ek, Bo");
+
+        s.run("options.set", &json!({"key": "people.fullNameOrder", "value": "lastFirst"})).unwrap();
+        let id = add(&mut s, json!({"fullName": "Ito Hana Mai"}));
+        let c = &s.mailbox.contacts[&ItemId(id)];
+        assert_eq!(
+            (c.first_name.as_str(), c.middle_name.as_str(), c.last_name.as_str()),
+            ("Hana", "Mai", "Ito")
+        );
+        s.run("options.set", &json!({"key": "people.fullNameOrder", "value": "firstLast1Last2"})).unwrap();
+        let id = add(&mut s, json!({"fullName": "Ana García López"}));
+        let c = &s.mailbox.contacts[&ItemId(id)];
+        assert_eq!((c.first_name.as_str(), c.last_name.as_str()), ("Ana", "García López"));
+        // "Last, First Middle" in any order.
+        let id = add(&mut s, json!({"fullName": "Lee,  Ann Marie"}));
+        let c = &s.mailbox.contacts[&ItemId(id)];
+        assert_eq!(
+            (c.first_name.as_str(), c.middle_name.as_str(), c.last_name.as_str()),
+            ("Ann", "Marie", "Lee")
+        );
+        assert!(s.mailbox.validate().is_empty());
+    }
+
+    #[test]
+    fn duplicate_contacts_are_detected_added_or_merged() {
+        let mut s = session();
+        let id =
+            add(&mut s, json!({"fullName": "Ann Lee", "email": "ann@example.com", "phones": {"Home": "1"}}));
+        // Same name: reported, nothing saved.
+        let r = s.run("people.new", &json!({"fullName": "ann lee", "jobTitle": "Editor"})).unwrap();
+        assert_eq!(r["created"], false);
+        assert_eq!(r["duplicate"]["id"], id);
+        assert_eq!(s.mailbox.contacts.len(), 1);
+        // Same address under another name.
+        let r = s.run("people.new", &json!({"fullName": "A. Lee", "email": "ANN@example.com"})).unwrap();
+        assert_eq!(r["duplicate"]["id"], id);
+        // Update merges what the new contact has into the existing one.
+        let r = s
+            .run(
+                "people.new",
+                &json!({"fullName": "Ann Lee", "jobTitle": "Editor", "email": "ann@example.org",
+                        "phones": {"Business": "2"}, "department": "", "duplicate": "update"}),
+            )
+            .unwrap();
+        assert_eq!(r["id"], id);
+        assert_eq!(s.mailbox.contacts.len(), 1);
+        let c = &s.mailbox.contacts[&ItemId(id)];
+        assert_eq!(c.job_title, "Editor");
+        assert_eq!(c.emails, vec!["ann@example.com".to_string(), "ann@example.org".to_string()]);
+        assert_eq!(c.phones.len(), 2);
+        // Add keeps both.
+        let r = s.run("people.new", &json!({"fullName": "Ann Lee", "duplicate": "add"})).unwrap();
+        assert!(r["id"].as_u64().is_some_and(|n| n != id));
+        assert_eq!(s.mailbox.contacts.len(), 2);
+        assert!(matches!(
+            s.run("people.new", &json!({"fullName": "Zed", "duplicate": "update"})),
+            Err(CmdError::Params(_))
+        ));
+        assert!(matches!(
+            s.run("people.new", &json!({"fullName": "Zed", "duplicate": "x"})),
+            Err(CmdError::Params(_))
+        ));
+        // With the option off, duplicates are saved without asking.
+        s.run("options.set", &json!({"key": "people.checkDuplicates", "value": false})).unwrap();
+        let r = s.run("people.new", &json!({"fullName": "Ann Lee"})).unwrap();
+        assert!(r["id"].as_u64().is_some());
+        assert_eq!(s.mailbox.contacts.len(), 3);
         assert!(s.mailbox.validate().is_empty());
     }
 
@@ -967,6 +1646,9 @@ mod tests {
         assert_eq!(r["dialog"], "mailMerge");
         assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(_, p)) if p["ids"] == json!([a])));
         assert!(matches!(s.run("people.mailMerge", &json!({"output": "fax"})), Err(CmdError::Params(_))));
+        // Labels cannot be produced; only E-mail merges.
+        let r = s.run("people.mailMerge", &json!({"output": "labels", "action": "send", "subject": "x"}));
+        assert!(matches!(r, Err(CmdError::Failed(_))));
     }
 
     #[test]
@@ -1023,6 +1705,138 @@ mod tests {
         assert!(
             matches!(s.notices.last(), Some(Notice::OpenDialog(_, p)) if p["to"] == "Ann Lee <ann@example.com>")
         );
+    }
+
+    #[test]
+    fn assign_task_to_selected_contacts() {
+        let mut s = session();
+        let a = add(&mut s, json!({"fullName": "Ann Lee", "email": "ann@example.com"}));
+        select(&mut s, &[a]);
+        let r = s
+            .run("people.assignTask", &json!({"subject": "Review", "due": "2026-10-20", "send": false}))
+            .unwrap();
+        let t = &s.mailbox.tasks[&ItemId(r["task"].as_u64().unwrap())];
+        assert_eq!(t.assigned_to, vec!["Ann Lee <ann@example.com>".to_string()]);
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.to, "Ann Lee <ann@example.com>");
+        assert!(String::from_utf8_lossy(&c.attachments[0].data).contains("BEGIN:VTODO"));
+    }
+
+    #[test]
+    fn follow_up_and_private_on_contacts() {
+        let mut s = session(); // Friday 2026-10-09
+        let a = add(&mut s, json!({"fullName": "Ann Lee"}));
+        select(&mut s, &[]);
+        assert!(matches!(s.run("people.flag", &json!({"kind": "today"})), Err(CmdError::Disabled(_))));
+        select(&mut s, &[a]);
+        s.run("people.flag", &json!({"kind": "thisWeek"})).unwrap();
+        let tz = s.tz_offset_min;
+        let FlagState::Flagged { due, .. } = &s.mailbox.contacts[&ItemId(a)].flag else {
+            panic!("not flagged")
+        };
+        assert_eq!(due.map(|d| pim::date_string(d, tz)).as_deref(), Some("2026-10-09"));
+        assert_eq!(s.run("people.flag", &json!({"kind": "custom"})).unwrap()["dialog"], "pimFlag");
+        s.run(
+            "people.flag",
+            &json!({"kind": "custom", "label": "Call", "due": "2026-10-20", "reminder": "2026-10-20T09:00"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(&s.mailbox.contacts[&ItemId(a)].flag, FlagState::Flagged { label, reminder: Some(_), .. } if label == "Call")
+        );
+        // Add Reminder keeps the dates.
+        s.run("people.flag", &json!({"kind": "reminder", "reminder": "2026-10-19T08:00"})).unwrap();
+        assert!(matches!(&s.mailbox.contacts[&ItemId(a)].flag, FlagState::Flagged { due: Some(_), .. }));
+        assert!(
+            s.run("people.flag", &json!({"kind": "custom", "start": "2026-10-20", "due": "2026-10-01"}))
+                .is_err()
+        );
+        s.run("people.flag", &json!({"kind": "complete"})).unwrap();
+        assert!(matches!(s.mailbox.contacts[&ItemId(a)].flag, FlagState::Complete { .. }));
+        s.run("people.flag", &json!({"kind": "clear"})).unwrap();
+        assert_eq!(s.mailbox.contacts[&ItemId(a)].flag, FlagState::None);
+        assert_eq!(s.run("people.private", &json!({})).unwrap()["private"], true);
+        assert!(s.mailbox.contacts[&ItemId(a)].private);
+        assert_eq!(s.run("people.move", &json!({})).unwrap()["dialog"], "pimMove");
+        assert_eq!(s.run("people.copy", &json!({})).unwrap()["dialog"], "pimMove");
+        assert_eq!(s.run("people.allCategories", &json!({})).unwrap()["dialog"], "pimCategories");
+    }
+
+    #[test]
+    fn merge_fields_and_text() {
+        let c = Contact {
+            first_name: "Ann".into(),
+            last_name: "Lee".into(),
+            company: "Example Co".into(),
+            emails: vec!["ann@example.com".into()],
+            phones: vec![("Mobile".into(), "+1 555 0100".into())],
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_text("Dear {{First Name}} of {{ company }},", &c).unwrap(),
+            "Dear Ann of Example Co,"
+        );
+        assert_eq!(merge_text("{{Mobile Phone}} {{Home Phone}}.", &c).unwrap(), "+1 555 0100 .");
+        assert_eq!(merge_text("no fields {{ unclosed", &c).unwrap(), "no fields {{ unclosed");
+        assert!(matches!(merge_text("{{Shoe Size}}", &c), Err(CmdError::Params(_))));
+        assert_eq!(merge_text("", &c).unwrap(), "");
+        assert_eq!(merge_text("{{}}x", &c).ok(), None);
+        // Multi-byte text around fields stays intact.
+        assert_eq!(merge_text("Grüße {{Last Name}} ✓", &c).unwrap(), "Grüße Lee ✓");
+    }
+
+    #[test]
+    fn mail_merge_to_email_messages() {
+        let mut s = session();
+        let a =
+            add(&mut s, json!({"fullName": "Ann Lee", "email": "ann@example.com", "company": "Example Co"}));
+        let b = add(&mut s, json!({"fullName": "Bo Ek", "email": "bo@example.org"}));
+        add(&mut s, json!({"fullName": "No Mail"}));
+        select(&mut s, &[a, b]);
+        let p = json!({"contacts": "selected", "output": "email", "subject": "Hi {{First Name}}", "body": "Dear {{Full Name}},\nfrom {{Company}}"});
+        let mut preview = p.clone();
+        preview["action"] = json!("preview");
+        let r = s.run("people.mailMerge", &preview).unwrap();
+        assert_eq!(r["count"], 2);
+        assert_eq!(r["preview"]["subject"], "Hi Ann");
+        assert_eq!(r["preview"]["to"], "Ann Lee <ann@example.com>");
+        preview["index"] = json!(1);
+        assert_eq!(s.run("people.mailMerge", &preview).unwrap()["preview"]["body"], "Dear Bo Ek,\nfrom ");
+        let mut send = p.clone();
+        send["action"] = json!("send");
+        // A local-only profile cannot send.
+        assert!(matches!(s.run("people.mailMerge", &send), Err(CmdError::Failed(_))));
+        if let Some(acct) = s.mailbox.accounts.first_mut() {
+            acct.kind = mailcraft_model::AccountKind::Jmap;
+        }
+        // All contacts of the folder: the one without an address is skipped.
+        send["contacts"] = json!("all");
+        let r = s.run("people.mailMerge", &send).unwrap();
+        assert_eq!((r["sent"].as_u64(), r["skipped"].as_u64()), (Some(2), Some(1)));
+        let outbox = role(&s, FolderRole::Outbox);
+        let subjects: Vec<&str> =
+            s.mailbox.mail.values().filter(|m| m.folder == outbox).map(|m| m.subject.as_str()).collect();
+        assert!(subjects.contains(&"Hi Ann") && subjects.contains(&"Hi Bo"), "{subjects:?}");
+        let mut bad = send.clone();
+        bad["subject"] = json!("{{Nope}}");
+        assert!(matches!(s.run("people.mailMerge", &bad), Err(CmdError::Params(_))));
+        assert!(matches!(
+            s.run("people.mailMerge", &json!({"output": "email", "action": "dance"})),
+            Err(CmdError::Params(_))
+        ));
+    }
+
+    #[test]
+    fn people_view_rows_search_and_reverse() {
+        let mut s = session();
+        let folder = role(&s, FolderRole::Contacts);
+        let a = add(&mut s, json!({"fullName": "Ann Lee", "company": "Example Co"}));
+        let b = add(&mut s, json!({"fullName": "Bo Ek"}));
+        select(&mut s, &[]);
+        assert_eq!(view_rows(&s, folder, "").iter().map(|r| r.id.0).collect::<Vec<_>>(), vec![b, a]);
+        assert_eq!(view_rows(&s, folder, "example").len(), 1);
+        s.run("view.reverseSort", &json!({})).unwrap();
+        assert_eq!(view_rows(&s, folder, "").iter().map(|r| r.id.0).collect::<Vec<_>>(), vec![a, b]);
     }
 
     #[test]

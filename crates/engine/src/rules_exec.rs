@@ -385,7 +385,7 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
             RuleAction::DeferDelivery(minutes) => defer(s, id, *minutes),
             RuleAction::CcTo(list) => cc_to(s, run, rule, id, list),
             RuleAction::NotifyWhenRead => notify_header(s, id, "Disposition-Notification-To"),
-            RuleAction::NotifyWhenDelivered => notify_header(s, id, "Return-Receipt-To"),
+            RuleAction::NotifyWhenDelivered => request_dsn(s, id),
         }
     }
     stop
@@ -530,6 +530,17 @@ fn notify_header(s: &mut Session, id: ItemId, header: &str) {
     let Some(from) = s.mailbox.mail.get(&id).and_then(|m| m.from.clone()) else { return };
     let value = mailcraft_mime::addr::format_mailbox(&from, true);
     edit_source(s, id, |raw| set_header(&raw, header, Some(value)));
+}
+
+/// "Notify me when it is delivered": asks the SMTP client for an RFC 3461 delivery status notification
+/// through the submission-only header (removed before the message is transmitted).
+fn request_dsn(s: &mut Session, id: ItemId) {
+    if !in_outbox(s, id) {
+        return;
+    }
+    edit_source(s, id, |raw| {
+        set_header(&raw, crate::cmd::compose::DSN_HEADER, Some(crate::cmd::compose::DSN_REQUEST.to_owned()))
+    });
 }
 
 /// An account that can send for item `id`: the item's own account, else the default one, else any.
@@ -1266,7 +1277,11 @@ mod tests {
             header_value(&raw, "Disposition-Notification-To").as_deref(),
             Some("Me Example <me@example.com>")
         );
-        assert!(header_value(&raw, "Return-Receipt-To").is_some());
+        assert!(header_value(&raw, "Return-Receipt-To").is_none());
+        assert_eq!(
+            header_value(&raw, crate::cmd::compose::DSN_HEADER).as_deref(),
+            Some("NOTIFY=SUCCESS,FAILURE; RET=HDRS")
+        );
         assert_eq!(header_value(&raw, "Sensitivity").as_deref(), Some("Company-Confidential"));
         let parsed = mailcraft_mime::parse(&raw).unwrap();
         let again = MailItem::from_message(&parsed, &raw, s.now());

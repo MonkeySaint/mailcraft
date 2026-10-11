@@ -487,3 +487,341 @@ fn note_window_colours_and_saves() {
     h.run_ok();
     assert_eq!(h.state().s.mailbox.notes[&id].color, mailcraft_model::NoteColor::Pink);
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Module views (view.changeView and friends), module actions and dialogs
+// ---------------------------------------------------------------------------------------------------------
+
+/// The shell forwards `Notice::OpenDialog` into `ui.dialogs`; the tests do the same.
+fn forward(app: &mut App) {
+    for n in std::mem::take(&mut app.s.notices) {
+        if let mailcraft_engine::Notice::OpenDialog(name, p) = n {
+            app.ui.dialogs.push((name, p));
+        }
+    }
+}
+
+/// Lets the sample account send (it is a local data file in the sample).
+fn can_send(a: &mut App) {
+    for acct in &mut a.s.mailbox.accounts {
+        acct.kind = mailcraft_model::AccountKind::Jmap;
+    }
+}
+
+fn select_module_folder(a: &mut App, kind: mailcraft_model::FolderKind) -> mailcraft_model::FolderId {
+    let f = a.s.mailbox.folders.values().find(|f| f.kind == kind).map(|f| f.id).unwrap();
+    a.run("nav.selectFolder", json!({ "folder": f.0 })).unwrap();
+    f
+}
+
+/// Runs a command in a harness and forwards its dialogs.
+fn run_cmd(h: &mut Harness<'_, App>, id: &str, p: serde_json::Value) {
+    let app = h.state_mut();
+    let r = app.run(id, p);
+    assert!(r.is_some(), "{id} failed: {:?}", app.ui.toast);
+    forward(app);
+    h.run_ok();
+}
+
+#[test]
+fn people_views_render() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 900.0));
+    assert!(has(&h, "Rivera, Alice"));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Business Card"}));
+    assert!(has(&h, "Business card Rivera, Alice"));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Phone"}));
+    assert!(has_part(&h, "Rivera, Alice"));
+    assert!(!has_part(&h, "Group "), "the Phone view is not grouped");
+    run_cmd(&mut h, "view.changeView", json!({"name": "List"}));
+    // The List view groups by company; a group header collapses its contacts.
+    assert!(has(&h, "Group Example Co.: 2 items, expanded"));
+    click(&h, "Group Example Co.: 2 items, expanded");
+    h.run_ok();
+    assert!(has(&h, "Group Example Co.: 2 items, collapsed"));
+    assert!(!has(&h, "Rivera, Alice"));
+    run_cmd(&mut h, "view.expandAll", json!({}));
+    assert!(has(&h, "Rivera, Alice"));
+    run_cmd(&mut h, "view.arrangeBy", json!({"key": "categories"}));
+    assert!(has(&h, "Group (none): 6 items, expanded"));
+    // The toolbar switches views too.
+    click(&h, "People");
+    h.run_ok();
+    assert!(has(&h, "Meeting"), "the contact card shows in the People view");
+    run_cmd(&mut h, "view.readingPane", json!({"position": "off"}));
+    assert!(!has(&h, "Meeting"), "Reading Pane › Off hides the contact card");
+}
+
+#[test]
+fn people_ribbon_actions_reach_contacts() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 900.0));
+    click(&h, "Rivera, Alice");
+    h.run_ok();
+    let id = ItemId(h.state().ui.module_selection.unwrap());
+    // The engine selection follows the view, so ribbon commands without ids act on the contact.
+    assert_eq!(h.state().s.selection.focus, Some(id));
+    run_cmd(&mut h, "people.flag", json!({"kind": "tomorrow"}));
+    assert!(matches!(h.state().s.mailbox.contacts[&id].flag, mailcraft_model::FlagState::Flagged { .. }));
+    run_cmd(&mut h, "people.private", json!({}));
+    assert!(h.state().s.mailbox.contacts[&id].private);
+    // Move › Other Folder opens the module's folder picker.
+    let root = h.state().s.mailbox.contacts[&id].folder;
+    let sub = h.state_mut().s.mailbox.create_folder(root, "Clients").unwrap();
+    run_cmd(&mut h, "people.move", json!({}));
+    assert!(has(&h, "Move Items"));
+    click(&h, &h.state().s.mailbox.folder_path(sub));
+    h.run_ok();
+    click(&h, "OK");
+    h.run_ok();
+    assert_eq!(h.state().s.mailbox.contacts[&id].folder, sub);
+    assert!(!has(&h, "Move Items"));
+}
+
+#[test]
+fn mail_merge_window_previews_and_sends() {
+    let mut a = app();
+    can_send(&mut a);
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 1000.0));
+    run_cmd(&mut h, "people.mailMerge", json!({"contacts": "all", "output": "letters"}));
+    assert!(has(&h, "Mail Merge Contacts"));
+    h.get_by_label("Message subject line").focus();
+    h.run_ok();
+    h.get_by_label("Message subject line").type_text("Hello");
+    h.run_ok();
+    assert!(has_part(&h, "Dear Bob,"), "the preview merges the first contact");
+    click(&h, "▶");
+    h.run_ok();
+    assert!(has_part(&h, "Dear Grace,"));
+    click(&h, "Send");
+    h.run_ok();
+    // The sample account sends: one message per contact in the Outbox.
+    let outbox: Vec<String> = h
+        .state()
+        .s
+        .mailbox
+        .mail
+        .values()
+        .filter(|m| {
+            h.state()
+                .s
+                .mailbox
+                .folder(m.folder)
+                .is_some_and(|f| f.role == Some(mailcraft_model::FolderRole::Outbox))
+        })
+        .map(|m| m.subject.clone())
+        .collect();
+    assert_eq!(outbox.iter().filter(|s| *s == "Hello").count(), 6, "{outbox:?}");
+    assert!(!has(&h, "Mail Merge Contacts"));
+}
+
+#[test]
+fn assign_task_window_sends_a_request() {
+    let mut a = app();
+    can_send(&mut a);
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 1000.0));
+    click(&h, "Rivera, Alice");
+    h.run_ok();
+    run_cmd(&mut h, "people.assignTask", json!({}));
+    assert!(has(&h, "Untitled - Task Request"));
+    h.get_by_label("Subject").focus();
+    h.run_ok();
+    h.get_by_label("Subject").type_text("Order supplies");
+    h.run_ok();
+    click(&h, "Send");
+    h.run_ok();
+    let t =
+        h.state().s.mailbox.tasks.values().find(|t| t.subject == "Order supplies").expect("assigned copy");
+    assert_eq!(t.assigned_to.len(), 1);
+    assert!(t.assigned_to[0].contains("alice@example.com"));
+    let sent = h.state().s.mailbox.mail.values().any(|m| m.subject == "Task Request: Order supplies");
+    assert!(sent, "the request went to the Outbox");
+}
+
+#[test]
+fn task_views_render_and_group() {
+    let mut a = app();
+    let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
+    let mut h = harness(super::tasks, a, (1500.0, 900.0));
+    // To-Do List: grouped by due date.
+    assert!(has_part(&h, "Group Next Week") || has_part(&h, "Group This Week"));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Detailed"}));
+    assert!(has(&h, "% Complete") && has(&h, "In Folder"));
+    assert!(has(&h, "Book meeting room for kickoff"));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Active"}));
+    assert!(!has(&h, "Book meeting room for kickoff"));
+    assert!(has(&h, "Submit benefits forms"));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Completed"}));
+    assert!(has(&h, "Book meeting room for kickoff"));
+    assert!(!has(&h, "Submit benefits forms"));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Prioritized"}));
+    assert!(has(&h, "Group High: 1 items, expanded"));
+    click(&h, "Group High: 1 items, expanded");
+    h.run_ok();
+    assert!(!has(&h, "Complete Review quarterly report"), "collapsed");
+    assert!(
+        h.state().s.view.collapsed_groups.get(&folder).is_some_and(|g| g.iter().any(|x| x == "High")),
+        "the engine keeps the collapsed group"
+    );
+    run_cmd(&mut h, "view.expandAll", json!({}));
+    // Message preview shows the task notes.
+    let id = h.state().s.mailbox.tasks.values().find(|t| t.subject == "Submit benefits forms").unwrap().id;
+    h.state_mut().run("tasks.update", json!({"id": id.0, "body": "Forms are in the HR portal"}));
+    run_cmd(&mut h, "view.messagePreview", json!({"lines": 1}));
+    assert!(has_part(&h, "Forms are in the HR portal"));
+    // Reading pane at the bottom still shows the details.
+    click(&h, "Submit benefits forms");
+    h.run_ok();
+    run_cmd(&mut h, "view.readingPane", json!({"position": "bottom"}));
+    assert!(has(&h, "Mark Complete"));
+    run_cmd(&mut h, "view.readingPane", json!({"position": "off"}));
+    assert!(!has(&h, "Remove from List"));
+}
+
+#[test]
+fn task_ribbon_actions_and_recurrence() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
+    let mut h = harness(super::tasks, a, (1500.0, 900.0));
+    click(&h, "Submit benefits forms");
+    h.run_ok();
+    let id = ItemId(h.state().ui.module_selection.unwrap());
+    run_cmd(&mut h, "tasks.importance", json!({"level": "high"}));
+    assert_eq!(h.state().s.mailbox.tasks[&id].priority, mailcraft_model::TaskPriority::High);
+    run_cmd(&mut h, "tasks.flag", json!({"kind": "tomorrow"}));
+    let tz = h.state().s.tz_offset_min;
+    let due =
+        h.state().s.mailbox.tasks[&id].due.map(|d| mailcraft_engine::cmd::calendar::pim::date_string(d, tz));
+    assert_eq!(due.as_deref(), Some("2026-10-10"));
+    run_cmd(&mut h, "tasks.forward", json!({}));
+    assert!(h.state().s.composes.values().any(|c| c.subject == "FW: Submit benefits forms"));
+    // The task window sets a weekly recurrence; completing moves the task on a week.
+    h.key_press(egui::Key::Enter);
+    h.run_ok();
+    assert!(has(&h, "Submit benefits forms - Task"));
+    // The recurrence combo's "Every week" (the due date is a Saturday).
+    let mut st = super::common::load(&h.ctx);
+    if let Some(ed) = st.editors.task.as_mut() {
+        ed.recurrence = "FREQ=WEEKLY;BYDAY=SA".into();
+    }
+    super::common::store(&h.ctx, st);
+    h.run_ok();
+    assert!(has_part(&h, "Occurs every Saturday"));
+    click(&h, "Save & Close");
+    h.run_ok();
+    assert!(h.state().s.mailbox.tasks[&id].recurrence.is_some());
+    click(&h, "Complete Submit benefits forms");
+    h.run_ok();
+    let t = &h.state().s.mailbox.tasks[&id];
+    assert_eq!(t.status, TaskStatus::NotStarted, "the series moved to its next occurrence");
+    assert_eq!(
+        t.due.map(|d| mailcraft_engine::cmd::calendar::pim::date_string(d, tz)).as_deref(),
+        Some("2026-10-17")
+    );
+    assert!(
+        h.state()
+            .s
+            .mailbox
+            .tasks
+            .values()
+            .any(|x| x.subject == "Submit benefits forms" && x.status == TaskStatus::Completed)
+    );
+}
+
+#[test]
+fn notes_views_icons_and_line_up() {
+    let mut a = app();
+    let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Notes);
+    let mut h = harness(super::notes, a, (1500.0, 900.0));
+    assert!(has(&h, "Wi-Fi for guests"));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Last 7 Days"}));
+    assert!(has(&h, "Retro ideas"));
+    assert!(!has(&h, "Wi-Fi for guests"), "changed 20 days ago");
+    run_cmd(&mut h, "view.changeView", json!({"name": "Notes List"}));
+    assert!(has(&h, "Wi-Fi for guests"));
+    // The ribbon's Small Icons switches back to the Icon view.
+    run_cmd(&mut h, "notes.iconView", json!({"mode": "small"}));
+    let st = mailcraft_engine::cmd::view::modules::state(
+        &h.state().s,
+        folder,
+        mailcraft_engine::cmd::view::modules::ModuleKind::Notes,
+    );
+    assert_eq!(st.view, "Icon");
+    // Dragging an icon takes it off the grid; Line Up Icons puts it back.
+    let node = h.query_all_by_label("Retro ideas").next().unwrap();
+    let r = node.rect();
+    h.drag_at(r.center());
+    h.run_ok();
+    h.hover_at(r.center() + egui::vec2(260.0, 160.0));
+    h.run_ok();
+    h.drop_at(r.center() + egui::vec2(260.0, 160.0));
+    h.run_ok();
+    assert!(!super::common::load(&h.ctx).note_pos.is_empty(), "dragged off the grid");
+    let st = mailcraft_engine::cmd::view::modules::state(
+        &h.state().s,
+        folder,
+        mailcraft_engine::cmd::view::modules::ModuleKind::Notes,
+    );
+    assert!(!st.lined_up);
+    run_cmd(&mut h, "notes.lineUpIcons", json!({}));
+    assert!(super::common::load(&h.ctx).note_pos.is_empty(), "lined up again");
+    // The reading pane shows the selected note.
+    click(&h, "Retro ideas");
+    h.run_ok();
+    run_cmd(&mut h, "view.readingPane", json!({"position": "right"}));
+    assert!(has_part(&h, "shared glossary"));
+}
+
+#[test]
+fn todo_bar_shows_in_every_module() {
+    for v in [super::people as View, super::tasks, super::notes] {
+        let a = app();
+        let mut h = harness(v, a, (1600.0, 900.0));
+        assert!(!has(&h, "Search people"));
+        super::set_todo_bar(&h.ctx, "people");
+        h.run_ok();
+        assert!(has(&h, "Search people"), "the To-Do Bar shows next to the module");
+        super::set_todo_bar(&h.ctx, "off");
+        h.run_ok();
+    }
+}
+
+#[test]
+fn module_view_settings_dialog_applies() {
+    let mut a = app();
+    let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
+    let mut h = harness(super::tasks, a, (1500.0, 1000.0));
+    run_cmd(&mut h, "view.viewSettings", json!({}));
+    assert!(has(&h, "Advanced View Settings: To-Do List"));
+    click(&h, "Reverse sort");
+    h.run_ok();
+    click(&h, "OK");
+    h.run_ok();
+    assert!(mailcraft_engine::cmd::view::modules::reversed(&h.state().s, folder));
+    run_cmd(&mut h, "view.saveViewAs", json!({}));
+    assert!(has(&h, "Save Current View As a New View"));
+    h.get_by_label("Name of new view:").focus();
+    h.run_ok();
+    h.get_by_label("Name of new view:").type_text("Upside down");
+    h.run_ok();
+    click(&h, "OK");
+    h.run_ok();
+    let saved = mailcraft_engine::cmd::view::modules::saved_views(&h.state().s, folder);
+    assert_eq!(saved.first().map(|v| v.name.as_str()), Some("Upside down"));
+}
+
+#[test]
+fn task_colour_options_override_the_theme() {
+    let mut app = app();
+    let danger = app.theme.danger;
+    assert_eq!(super::tasks_view::option_color(&app, "tasks.overdueColor", danger), danger);
+    app.s.run("options.set", &json!({"key": "tasks.overdueColor", "value": "#0000ff"})).unwrap();
+    assert_eq!(super::tasks_view::option_color(&app, "tasks.overdueColor", danger), egui::Color32::BLUE);
+    app.s.run("options.set", &json!({"key": "tasks.completedColor", "value": "nonsense"})).unwrap();
+    let muted = app.theme.text_muted;
+    assert_eq!(super::tasks_view::option_color(&app, "tasks.completedColor", muted), muted);
+}

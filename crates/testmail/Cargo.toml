@@ -10,6 +10,8 @@ publish = false
 [dependencies]
 thiserror.workspace = true
 base64.workspace = true
+# JMAP server request and response bodies.
+serde_json.workspace = true
 # TLS server side with the pure `ring` provider (no aws-lc / OpenSSL licence terms).
 rustls.workspace = true
 # Self-signed certificate generated at start.

@@ -5,19 +5,27 @@
 //! Filter Email kinds that the per-folder [`ListFilter`] cannot express (Has Attachments, Important, Sent
 //! To: Me or CC: Me, Expiring Soon, categories) are applied as search tokens in `ViewState::search`, the
 //! same syntax `search.refine` builds.
+//!
+//! In the People, Tasks and Notes modules (a contacts, tasks or notes folder selected) the current view,
+//! arrangement, message preview, reading pane, saved views, View Settings and Apply View act on the
+//! folder's module view ([`modules`]). In the Calendar the calendar's own view handling
+//! (`calendar::module_view`) runs first.
+
+pub mod modules;
 
 use serde_json::{Value, json};
 
 use super::folder::{current_folder, dialog, resolve_folder};
 use super::search::toggle_token;
 use super::util::{opt_bool, opt_str, req_str};
-use crate::{CmdError, CmdResult, CommandSpec, Session, always};
+use crate::{CmdError, CmdResult, CommandSpec, Module, Session, always};
 use mailcraft_model::dates::DateGroup;
 use mailcraft_model::thread::ConversationSettings;
 use mailcraft_model::{
     ArrangeBy, FlagState, FolderId, FolderKind, FolderPaneState, FolderRole, Importance, ItemId, ListFilter,
     MailItem, ReadingPanePos, SortOrder, ViewLayout, ViewSettings,
 };
+use modules::ModuleKind;
 use std::collections::BTreeSet;
 
 /// Zoom limits, percent.
@@ -199,7 +207,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"lines":0|1|2|3}"#,
             true,
-            list_view,
+            preview_view,
             message_preview,
         ),
         spec("view.normalView", "Normal View", "Status bar", "", "", false, always, normal_view),
@@ -472,6 +480,9 @@ pub fn group_label(s: &Session, m: &MailItem, by: ArrangeBy) -> String {
 /// item's conversation decides (it sits in the group of its sort item).
 fn selected_group(s: &Session) -> Option<String> {
     let id = s.selection.focus.or_else(|| s.selection.items.first().copied())?;
+    if modules::module_kind(s, s.selection.folder).is_some() {
+        return modules::group_of(s, s.selection.folder, id);
+    }
     let by = settings(s, s.selection.folder).arrange_by;
     if settings(s, s.selection.folder).conversations
         && let Some(c) = crate::queries::conversation_of(s, id)
@@ -487,6 +498,17 @@ fn inbox_of_current_account(s: &Session) -> Option<FolderId> {
     s.current_account().and_then(|a| s.mailbox.role_folder(a, FolderRole::Inbox))
 }
 
+/// The selected folder and its module when it is a contacts, tasks or notes folder.
+fn module_here(s: &Session) -> Option<(FolderId, ModuleKind)> {
+    let folder = s.selection.folder;
+    modules::module_kind(s, folder).map(|k| (folder, k))
+}
+
+/// In the Calendar, the calendar's own handling of a view command (`None` = not a calendar view command).
+fn calendar_first(s: &mut Session, id: &str, p: &Value) -> Option<CmdResult> {
+    if s.view.module == Module::Calendar { crate::cmd::calendar::module_view(s, id, p) } else { None }
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Enabled predicates
 
@@ -497,6 +519,22 @@ fn has_folder(s: &Session) -> Option<&'static str> {
 /// Message Preview, Add Columns and Expand/Collapse belong to list views (mail, tasks); the People
 /// (business card) view of a contacts folder and the calendar / notes views do not offer them.
 fn list_view(s: &Session) -> Option<&'static str> {
+    match s.mailbox.folder(s.selection.folder).map(|f| f.kind) {
+        None => Some("no folder is selected"),
+        Some(FolderKind::Contacts) => {
+            // The Phone and List table views of a contacts folder have groups and columns.
+            match modules::current(s, s.selection.folder) {
+                Some((kind, st)) if modules::grouped_view(kind, &st.view) => None,
+                _ => Some("not available in this view"),
+            }
+        }
+        Some(FolderKind::Calendar | FolderKind::Notes) => Some("not available in this view"),
+        Some(_) => None,
+    }
+}
+
+/// Message Preview: mail and tasks folders (not contacts, calendar or notes).
+fn preview_view(s: &Session) -> Option<&'static str> {
     match s.mailbox.folder(s.selection.folder).map(|f| f.kind) {
         None => Some("no folder is selected"),
         Some(FolderKind::Contacts | FolderKind::Calendar | FolderKind::Notes) => {
@@ -558,6 +596,7 @@ fn view_customized(s: &Session) -> Option<&'static str> {
     let f = s.selection.folder;
     // Conversation expansion is not a view customisation; collapsed groups and Conversation Settings are.
     let custom = s.mailbox.views.get(&f).is_some_and(|v| *v != ViewSettings::default())
+        || modules::customized(s, f)
         || s.view
             .collapsed_groups
             .get(&f)
@@ -569,7 +608,13 @@ fn view_customized(s: &Session) -> Option<&'static str> {
 // Current view
 
 fn change_view(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.changeView", p) {
+        return r;
+    }
     let name = req_str(p, "name")?;
+    if let Some((folder, kind)) = module_here(s) {
+        return modules::change_view(s, folder, kind, name);
+    }
     let Some(l) = parse_layout(name) else {
         return Err(CmdError::Params(format!("no view named \"{}\"", name.trim())));
     };
@@ -589,7 +634,10 @@ fn layout(s: &mut Session, p: &Value) -> CmdResult {
     })
 }
 
-fn reset_view(s: &mut Session, _p: &Value) -> CmdResult {
+fn reset_view(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.resetView", p) {
+        return r;
+    }
     let folder = current_folder(s, &Value::Null)?;
     s.mailbox.views.remove(&folder);
     s.view.collapsed_groups.remove(&folder);
@@ -597,6 +645,12 @@ fn reset_view(s: &mut Session, _p: &Value) -> CmdResult {
 }
 
 fn save_view_as(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.saveViewAs", p) {
+        return r;
+    }
+    if let Some((folder, kind)) = module_here(s) {
+        return modules::save_view_as(s, folder, kind, p);
+    }
     let folder = current_folder(s, &Value::Null)?;
     let name = opt_str(p, "name").map(str::trim).unwrap_or_default().to_owned();
     if parse_layout(&name).is_some() {
@@ -606,26 +660,48 @@ fn save_view_as(s: &mut Session, p: &Value) -> CmdResult {
     Ok(dialog(s, "saveViewAs", json!({ "name": name, "settings": current })))
 }
 
-fn manage_views(s: &mut Session, _p: &Value) -> CmdResult {
+fn manage_views(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.manageViews", p) {
+        return r;
+    }
+    if let Some((folder, kind)) = module_here(s) {
+        return modules::manage_views(s, folder, kind);
+    }
     let current =
         s.mailbox.views.get(&s.selection.folder).map(|v| layout_name(v.layout)).unwrap_or("Compact");
     Ok(dialog(s, "manageViews", json!({ "views": ["Compact", "Single", "Preview"], "current": current })))
 }
 
-fn view_settings(s: &mut Session, _p: &Value) -> CmdResult {
+fn view_settings(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.viewSettings", p) {
+        return r;
+    }
+    if let Some((folder, kind)) = module_here(s) {
+        return modules::view_settings(s, folder, kind);
+    }
     let folder = current_folder(s, &Value::Null)?;
     let current = serde_json::to_value(settings(s, folder)).unwrap_or(Value::Null);
     Ok(dialog(s, "advancedViewSettings", json!({ "folder": folder.0, "settings": current })))
 }
 
-fn add_columns(s: &mut Session, _p: &Value) -> CmdResult {
+fn add_columns(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.addColumns", p) {
+        return r;
+    }
     let folder = current_folder(s, &Value::Null)?;
     Ok(dialog(s, "showColumns", json!({ "folder": folder.0 })))
 }
 
 fn apply_view_to(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.applyViewTo", p) {
+        return r;
+    }
     let src = current_folder(s, &Value::Null)?;
+    let module = modules::module_kind(s, src);
     let Some(list) = p.get("folders").and_then(Value::as_array) else {
+        if let Some(kind) = module {
+            return modules::apply_view_to(s, src, kind, None);
+        }
         return Ok(dialog(s, "applyView", json!({ "folder": src.0 })));
     };
     let subfolders = opt_bool(p, "subfolders").unwrap_or(false);
@@ -637,6 +713,9 @@ fn apply_view_to(s: &mut Session, p: &Value) -> CmdResult {
         } else {
             targets.insert(id);
         }
+    }
+    if let Some(kind) = module {
+        return modules::apply_view_to(s, src, kind, Some(targets));
     }
     let current = settings(s, src);
     let mut applied = 0usize;
@@ -655,7 +734,13 @@ fn apply_view_to(s: &mut Session, p: &Value) -> CmdResult {
 // Arrangement
 
 fn arrange_by(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.arrangeBy", p) {
+        return r;
+    }
     let key = req_str(p, "key")?;
+    if let Some((folder, kind)) = module_here(s) {
+        return modules::arrange_by(s, folder, kind, key);
+    }
     let a = ArrangeBy::ALL
         .into_iter()
         .find(|a| {
@@ -667,12 +752,15 @@ fn arrange_by(s: &mut Session, p: &Value) -> CmdResult {
         v.arrange_by = a;
         json!({ "arrangeBy": arrange_name(a), "order": order_name(v.order) })
     })?;
-    // Group labels change meaning with the arrangement.
-    s.view.collapsed_groups.remove(&folder);
+    // Group labels change meaning with the arrangement (reserved state entries stay).
+    modules::clear_groups(s, folder);
     Ok(r)
 }
 
-fn reverse_sort(s: &mut Session, _p: &Value) -> CmdResult {
+fn reverse_sort(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.reverseSort", p) {
+        return r;
+    }
     update(s, |v| {
         v.order = match v.order {
             SortOrder::Descending => SortOrder::Ascending,
@@ -694,7 +782,10 @@ fn sort_order(s: &mut Session, p: &Value) -> CmdResult {
     })
 }
 
-fn show_in_groups(s: &mut Session, _p: &Value) -> CmdResult {
+fn show_in_groups(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.showInGroups", p) {
+        return r;
+    }
     update(s, |v| {
         v.show_in_groups = !v.show_in_groups;
         json!({ "on": v.show_in_groups })
@@ -702,6 +793,10 @@ fn show_in_groups(s: &mut Session, _p: &Value) -> CmdResult {
 }
 
 fn set_group(s: &mut Session, p: &Value, collapsed: bool) -> CmdResult {
+    let id = if collapsed { "view.collapseGroup" } else { "view.expandGroup" };
+    if let Some(r) = calendar_first(s, id, p) {
+        return r;
+    }
     if opt_bool(p, "conversation").unwrap_or(false) {
         return set_conversation(s, p, collapsed);
     }
@@ -725,16 +820,25 @@ fn expand_group(s: &mut Session, p: &Value) -> CmdResult {
     set_group(s, p, false)
 }
 
-fn collapse_all(s: &mut Session, _p: &Value) -> CmdResult {
-    let folder = current_folder(s, &Value::Null)?;
-    let by = settings(s, folder).arrange_by;
-    let mut labels: Vec<String> = s.mailbox.items_in(folder).iter().map(|m| group_label(s, m, by)).collect();
-    // Conversations group by their sort item, which may be a message from another folder.
-    for c in crate::queries::list_conversations(s) {
-        if let Some(m) = s.mailbox.mail.get(&c.sort_item) {
-            labels.push(group_label(s, m, by));
-        }
+fn collapse_all(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.collapseAll", p) {
+        return r;
     }
+    let folder = current_folder(s, &Value::Null)?;
+    let mut labels: Vec<String> = if modules::module_kind(s, folder).is_some() {
+        modules::groups(s, folder)
+    } else {
+        let by = settings(s, folder).arrange_by;
+        let mut labels: Vec<String> =
+            s.mailbox.items_in(folder).iter().map(|m| group_label(s, m, by)).collect();
+        // Conversations group by their sort item, which may be a message from another folder.
+        for c in crate::queries::list_conversations(s) {
+            if let Some(m) = s.mailbox.mail.get(&c.sort_item) {
+                labels.push(group_label(s, m, by));
+            }
+        }
+        labels
+    };
     labels.sort();
     labels.dedup();
     let n = labels.len();
@@ -749,7 +853,10 @@ fn collapse_all(s: &mut Session, _p: &Value) -> CmdResult {
     Ok(json!({ "collapsed": n }))
 }
 
-fn expand_all(s: &mut Session, _p: &Value) -> CmdResult {
+fn expand_all(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.expandAll", p) {
+        return r;
+    }
     let folder = current_folder(s, &Value::Null)?;
     if let Some(list) = s.view.collapsed_groups.get_mut(&folder) {
         list.retain(|e| !is_group_label(e));
@@ -873,6 +980,8 @@ fn set_conversation(s: &mut Session, p: &Value, collapse: bool) -> CmdResult {
 // `CONV_MARK` (a control character no group label produced by the list starts with). Group code skips
 // them through [`is_group_label`].
 
+/// First character of every reserved (non group label) entry.
+const RESERVED: char = '\u{1}';
 const CONV_MARK: &str = "\u{1}conv.";
 /// Most conversations remembered as expanded by hand per folder.
 const MAX_EXPANDED: usize = 1_000;
@@ -888,9 +997,10 @@ pub struct ConversationState {
     pub collapsed: Option<(u64, ItemId)>,
 }
 
-/// True for real group labels in `ViewState::collapsed_groups` (false for conversation state entries).
+/// True for real group labels in `ViewState::collapsed_groups` (false for the reserved conversation and
+/// module view state entries, which start with a control character).
 pub fn is_group_label(entry: &str) -> bool {
-    !entry.starts_with(CONV_MARK)
+    !entry.starts_with(RESERVED)
 }
 
 fn is_setting(entry: &str) -> bool {
@@ -918,7 +1028,7 @@ pub fn conversation_state(s: &Session, folder: FolderId) -> ConversationState {
 fn store_conversation_state(s: &mut Session, folder: FolderId, st: &ConversationState) {
     let defaults = ConversationSettings::default();
     let list = s.view.collapsed_groups.entry(folder).or_default();
-    list.retain(|e| is_group_label(e));
+    list.retain(|e| !e.starts_with(CONV_MARK));
     for name in ConversationSettings::NAMES {
         if let Some(on) = st.settings.get(name).filter(|on| Some(*on) != defaults.get(name)) {
             list.push(format!("{CONV_MARK}set:{name}={}", u8::from(on)));
@@ -937,19 +1047,28 @@ fn store_conversation_state(s: &mut Session, folder: FolderId, st: &Conversation
 }
 
 fn message_preview(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.messagePreview", p) {
+        return r;
+    }
     let lines = p
         .get("lines")
         .and_then(Value::as_u64)
         .and_then(|n| u8::try_from(n).ok())
         .filter(|n| *n <= 3)
         .ok_or_else(|| CmdError::Params("`lines` must be 0, 1, 2 or 3".into()))?;
+    if let Some((folder, kind)) = module_here(s) {
+        return modules::message_preview(s, folder, kind, lines);
+    }
     update(s, |v| {
         v.preview_lines = lines;
         json!({ "lines": lines })
     })
 }
 
-fn tighter_spacing(s: &mut Session, _p: &Value) -> CmdResult {
+fn tighter_spacing(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.tighterSpacing", p) {
+        return r;
+    }
     let on = !settings(s, s.selection.folder).tighter_spacing;
     // Density applies across the window: every folder's view gets the same value.
     let ids: Vec<FolderId> = s.mailbox.folders.keys().copied().collect();
@@ -1040,6 +1159,9 @@ fn focused_tab(s: &mut Session, p: &Value) -> CmdResult {
 // Layout
 
 fn reading_pane(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.readingPane", p) {
+        return r;
+    }
     let pos = match req_str(p, "position")? {
         "right" => ReadingPanePos::Right,
         "bottom" => ReadingPanePos::Bottom,
@@ -1048,6 +1170,10 @@ fn reading_pane(s: &mut Session, p: &Value) -> CmdResult {
             return Err(CmdError::Params(format!("`position` must be right, bottom or off, not {other}")));
         }
     };
+    if let Some((folder, kind)) = module_here(s) {
+        // A module folder keeps its own position; the window default (Mail) does not change.
+        return modules::reading_pane(s, folder, kind, pos);
+    }
     s.view.reading_pane = pos;
     let folder = s.selection.folder;
     if s.mailbox.folders.contains_key(&folder) {
@@ -1075,7 +1201,10 @@ fn favorites(s: &mut Session, _p: &Value) -> CmdResult {
 
 /// To-Do Bar parts are drawn by the UI; the session keeps no To-Do Bar state yet, so the command validates
 /// and reports the requested part.
-fn todo_bar(_s: &mut Session, p: &Value) -> CmdResult {
+fn todo_bar(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(r) = calendar_first(s, "view.todoBar", p) {
+        return r;
+    }
     let part = req_str(p, "part")?;
     if !["calendar", "people", "tasks", "off"].contains(&part) {
         return Err(CmdError::Params(format!("`part` must be calendar, people, tasks or off, not {part}")));

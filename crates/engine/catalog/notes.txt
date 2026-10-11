@@ -1,26 +1,26 @@
 Notes|Home › New|New Note|notes.new
 Notes|Home › New|New Items|mail.newItem
-Notes|Home › Delete|Delete|mail.delete
+Notes|Home › Delete|Delete|notes.delete
 Notes|Home › Current View|Icon|view.changeView
 Notes|Home › Current View|Notes List|view.changeView
 Notes|Home › Current View|Last 7 Days|view.changeView
 Notes|Home › Current View|Change View|view.changeView
-Notes|Home › Actions|Forward|mail.forward
-Notes|Home › Actions|Move|mail.move
-Notes|Home › Tags|Categorize|mail.categorize
+Notes|Home › Actions|Forward|notes.forward
+Notes|Home › Actions|Move|notes.move
+Notes|Home › Tags|Categorize|notes.categorize
 Notes|Home › Groups|New Group|-|Microsoft 365 Groups are a cloud-only service
 Notes|Home › Groups|Browse Groups|-|Microsoft 365 Groups are a cloud-only service
 Notes|Home › Find|Search People|people.search
 Notes|Home › Find|Address Book...|compose.addressBook
 Notes|Home > New Items|E-mail Message|mail.newEmail
-Notes|Home > New Items|Appointment|mail.newItem
-Notes|Home > New Items|Meeting|mail.newItem
+Notes|Home > New Items|Appointment|calendar.newAppointment
+Notes|Home > New Items|Meeting|calendar.newMeeting
 Notes|Home > New Items|Group|-|Microsoft 365 Groups are a cloud-only service
-Notes|Home > New Items|Contact|mail.newItem
-Notes|Home > New Items|Task|mail.newItem
+Notes|Home > New Items|Contact|people.new
+Notes|Home > New Items|Task|tasks.new
 Notes|Home > New Items|More Items|mail.newItem
-Notes|Home > New Items > More Items|Contact Group|mail.newItem
-Notes|Home > New Items > More Items|Task Request|mail.newItem
+Notes|Home > New Items > More Items|Contact Group|people.newGroup
+Notes|Home > New Items > More Items|Task Request|tasks.assign
 Notes|Home > New Items > More Items|Internet Fax|-|Hands off to a third-party internet fax service; no local behaviour
 Notes|Home > New Items > More Items|Choose Form...|-|Custom Outlook form libraries (MAPI/Exchange forms) have no equivalent in MailCraft
 Notes|Home > New Items > More Items|Outlook Data File...|file.newDataFile
@@ -63,7 +63,7 @@ Notes|View > Folder Pane|Off|view.folderPane
 Notes|View > Reading Pane|Right|view.readingPane
 Notes|View > Reading Pane|Bottom|view.readingPane
 Notes|View > Reading Pane|Off|view.readingPane
-Notes|View > Reading Pane|Options...|options.open
+Notes|View > Reading Pane|Options...|view.readingPaneOptions
 Notes|View > To-Do Bar|Calendar|view.todoBar
 Notes|View > To-Do Bar|People|view.todoBar
 Notes|View > To-Do Bar|Tasks|view.todoBar

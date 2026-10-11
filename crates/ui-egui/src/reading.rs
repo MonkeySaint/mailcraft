@@ -9,6 +9,11 @@
 //!
 //! Local UI state (not in the Session): which items show the light background in dark mode, which items may
 //! load remote pictures, and per-surface parsed-body caches (egui temp data).
+//!
+//! Options that act here (engine settings): Reading Pane options (mark as read after N seconds, Space-bar
+//! reading through [`space_read`]), General › "Never change the message background color", Search ›
+//! highlight, Trust Center › pictures / plain text / link warning, Mail › "Close original message window when
+//! replying or forwarding" and "After moving or deleting an open item" (read windows).
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -59,6 +64,7 @@ pub fn reading_pane(ui: &mut egui::Ui, app: &mut App, frame: &Frame) {
 }
 
 fn pane_contents(ui: &mut Ui, app: &mut App, focus: Option<u64>, frame: &Frame) {
+    link_prompt(ui.ctx(), app);
     let Some(id) = focus else {
         empty_state(ui, app);
         return;
@@ -68,18 +74,110 @@ fn pane_contents(ui: &mut Ui, app: &mut App, focus: Option<u64>, frame: &Frame) 
         return;
     }
     let narrow = frame.width <= NARROW_W && frame.width > 0.0 || ui.available_width() < NARROW_PANE_W;
+    mark_read_timer(ui.ctx(), app, id);
     message_view(ui, app, id, Surface::Main, narrow);
+}
+
+/// Reading Pane options › "Mark items as read when viewed in the Reading Pane" after the wait in seconds.
+fn mark_read_timer(ctx: &egui::Context, app: &mut App, id: u64) {
+    let key = Id::new("mailcraft.reading.read-timer");
+    let st = &app.s.settings;
+    let unread = app.s.mailbox.mail.get(&ItemId(id)).is_some_and(|m| !m.read);
+    if !st.bool("mail.readingPane.markReadWhenViewed") || !unread {
+        ctx.data_mut(|d| d.remove::<(u64, f64)>(key));
+        return;
+    }
+    let wait = st.int("mail.readingPane.markReadAfterSeconds").clamp(0, 999) as f64;
+    let now = ctx.input(|i| i.time);
+    let since = match ctx.data_mut(|d| d.get_temp::<(u64, f64)>(key)) {
+        Some((item, since)) if item == id => since,
+        _ => {
+            ctx.data_mut(|d| d.insert_temp(key, (id, now)));
+            now
+        }
+    };
+    let left = since + wait - now;
+    if left <= 0.0 {
+        ctx.data_mut(|d| d.remove::<(u64, f64)>(key));
+        app.run("mail.markRead", json!({"ids": [id]}));
+    } else {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(left.min(1000.0)));
+    }
+}
+
+/// Reading-pane scroll metrics of the last frame (for Space-bar reading).
+#[derive(Clone, Copy, Debug, Default)]
+struct ReadScroll {
+    item: u64,
+    offset: f32,
+    content: f32,
+    view: f32,
+}
+
+fn scroll_id() -> Id {
+    Id::new("mailcraft.reading.scroll-metrics")
+}
+
+fn pending_scroll_id() -> Id {
+    Id::new("mailcraft.reading.scroll-to")
+}
+
+/// Space-bar reading (Reading Pane options › "Single key reading using space bar"): pages the reading pane
+/// down (`back`: up); at the end of the message (start, going back) moves to the next (previous) item.
+/// Returns whether anything happened.
+pub fn space_read(ctx: &egui::Context, app: &mut App, back: bool) -> bool {
+    let focus = focused_mail(app);
+    let m = ctx.data_mut(|d| d.get_temp::<ReadScroll>(scroll_id()));
+    if let Some(m) = m.filter(|m| Some(m.item) == focus && m.view > 0.0) {
+        let max = (m.content - m.view).max(0.0);
+        let page = (m.view * 0.9).max(20.0);
+        let at_end = if back { m.offset <= 0.5 } else { m.offset >= max - 0.5 };
+        if !at_end {
+            let target = if back { m.offset - page } else { m.offset + page };
+            ctx.data_mut(|d| d.insert_temp(pending_scroll_id(), target.clamp(0.0, max)));
+            ctx.request_repaint();
+            return true;
+        }
+    }
+    app.run(if back { "nav.prevItem" } else { "nav.nextItem" }, json!({})).is_some()
 }
 
 /// Opened-message windows (secondary viewports) listed in `app.ui.read_windows`.
 pub fn read_windows(ctx: &egui::Context, app: &mut App) {
     let ids = app.ui.read_windows.clone();
     let mut closed: Vec<u64> = Vec::new();
+    let after = app.s.settings.text("mail.other.afterMoveOrDelete");
     for id in ids {
         let Some(m) = app.s.mailbox.mail.get(&ItemId(id)) else {
-            closed.push(id);
+            // Mail › "After moving or deleting an open item": open the previous / next item in this window, or
+            // return to the folder (close).
+            let neighbour = ctx.data_mut(|d| d.get_temp::<(Option<u64>, Option<u64>)>(neighbour_id(id)));
+            let next = match (after.as_str(), neighbour) {
+                ("openNext", Some((_, n))) => n,
+                ("openPrevious", Some((p, _))) => p,
+                _ => None,
+            }
+            .filter(|n| app.s.mailbox.mail.contains_key(&ItemId(*n)) && !app.ui.read_windows.contains(n));
+            match next {
+                Some(n) => {
+                    if let Some(slot) = app.ui.read_windows.iter_mut().find(|w| **w == id) {
+                        *slot = n;
+                    }
+                    ctx.request_repaint();
+                }
+                None => closed.push(id),
+            }
+            ctx.data_mut(|d| d.remove::<(Option<u64>, Option<u64>)>(neighbour_id(id)));
             continue;
         };
+        if after != "returnToFolder" {
+            let order = queries::visible_item_ids(&app.s);
+            if let Some(p) = order.iter().position(|i| i.0 == id) {
+                let prev = p.checked_sub(1).and_then(|q| order.get(q)).map(|i| i.0);
+                let next = order.get(p.saturating_add(1)).map(|i| i.0);
+                ctx.data_mut(|d| d.insert_temp(neighbour_id(id), (prev, next)));
+            }
+        }
         let title = window_title(&m.subject, m.body.format);
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
@@ -98,6 +196,10 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
             ctx.data_mut(|d| d.remove::<MsgCache>(key));
         }
     }
+}
+
+fn neighbour_id(item: u64) -> Id {
+    Id::new(("mailcraft.read-window.neighbours", item))
 }
 
 /// "<subject> - Message (HTML)".
@@ -203,7 +305,15 @@ fn source_key(id: u64, b: &mailcraft_model::Body) -> u64 {
     h.finish()
 }
 
-fn body_doc(b: &mailcraft_model::Body) -> Doc {
+fn body_doc(b: &mailcraft_model::Body, plain: bool) -> Doc {
+    if plain {
+        // Trust Center › "Read all standard mail in plain text".
+        return match (&b.text, &b.html) {
+            (Some(text), _) => Doc::from_plain_text(text),
+            (None, Some(html)) => Doc::from_plain_text(&mailcraft_html::html_to_doc(html).to_plain_text()),
+            (None, None) => Doc::default(),
+        };
+    }
     match (&b.html, &b.text, b.format) {
         (Some(html), _, BodyFormat::Html | BodyFormat::RichText) => mailcraft_html::html_to_doc(html),
         (_, Some(text), _) => Doc::from_plain_text(text),
@@ -265,10 +375,14 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     let ctx = ui.ctx().clone();
     let key = cache_id(surface);
     let mut cache: MsgCache = ctx.data_mut(|d| d.remove_temp::<MsgCache>(key)).unwrap_or_default();
+    // Junk Email Options › "Disable links and other functionality in phishing messages": a message in Junk
+    // Email is shown as plain text, without pictures, and its links do not open.
+    let links_off = mailcraft_engine::junk::links_disabled(&app.s, ItemId(id));
+    let plain = app.s.settings.bool("trust.plainText") || links_off;
     if let Some(m) = app.s.mailbox.mail.get(&ItemId(id)) {
-        let sk = source_key(id, &m.body);
+        let sk = source_key(id, &m.body) ^ u64::from(plain);
         if cache.item != id || cache.source_key != sk {
-            let doc = body_doc(&m.body);
+            let doc = body_doc(&m.body, plain);
             cache = MsgCache {
                 item: id,
                 source_key: sk,
@@ -280,8 +394,11 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
         }
     }
     let tg = toggles(&ctx);
-    let dark = app.theme.dark && !tg.light_bg.contains(&id);
-    let allow_remote = tg.pictures.contains(&id);
+    // General › "Never change the message background color" keeps messages light in dark mode.
+    let dark =
+        app.theme.dark && !tg.light_bg.contains(&id) && !app.s.settings.bool("general.keepMessageBackground");
+    // Trust Center › "Don't download pictures automatically" (on by default).
+    let allow_remote = !links_off && (tg.pictures.contains(&id) || !app.s.settings.bool("trust.blockImages"));
     let zoom = match app.s.view.zoom {
         0 => 1.0,
         z => f32::from(z) / 100.0,
@@ -289,33 +406,49 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     let in_window = matches!(surface, Surface::Read(_));
 
     let mut clicked_link = None;
-    egui::ScrollArea::vertical()
+    let mut area = egui::ScrollArea::vertical()
         .id_salt(("mailcraft.reading.scroll", surface, id))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.add_space(12.0);
-            egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
-                header(ui, app, &h, id, narrow, in_window);
-                if cache.remote_images && !allow_remote {
-                    pictures_bar(ui, app, id);
-                }
-            });
-            ui.add_space(10.0);
-            egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
-                let opts = BodyOptions {
-                    dark,
-                    zoom,
-                    allow_remote,
-                    paint_background: true,
-                    doc_key: Some(cache.doc_key),
-                };
-                let doc = Arc::clone(&cache.doc);
-                clicked_link = body::show_doc_with(ui, &mut cache.view, &doc, &opts);
-            });
-            ui.add_space(PAD);
+        .auto_shrink([false, false]);
+    if surface == Surface::Main
+        && let Some(y) = ctx.data_mut(|d| d.remove_temp::<f32>(pending_scroll_id()))
+    {
+        area = area.vertical_scroll_offset(y);
+    }
+    let shown = area.show(ui, |ui| {
+        ui.add_space(12.0);
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
+            header(ui, app, &h, id, narrow, in_window);
+            if cache.remote_images && !allow_remote {
+                pictures_bar(ui, app, id);
+            }
         });
+        ui.add_space(10.0);
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
+            let opts = BodyOptions {
+                dark,
+                zoom,
+                allow_remote,
+                paint_background: true,
+                doc_key: Some(cache.doc_key),
+            };
+            let doc = Arc::clone(&cache.doc);
+            clicked_link = body::show_doc_with(ui, &mut cache.view, &doc, &opts);
+        });
+        ui.add_space(PAD);
+    });
+    if surface == Surface::Main {
+        let m = ReadScroll {
+            item: id,
+            offset: shown.state.offset.y,
+            content: shown.content_size.y,
+            view: shown.inner_rect.height(),
+        };
+        ctx.data_mut(|d| d.insert_temp(scroll_id(), m));
+    }
     ctx.data_mut(|d| d.insert_temp(key, cache));
-    if let Some(href) = clicked_link {
+    if let Some(href) = clicked_link
+        && !links_off
+    {
         open_link(&ctx, app, &href);
     }
 }
@@ -326,7 +459,7 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
     let subject = if h.subject.trim().is_empty() { "(no subject)" } else { h.subject.as_str() };
     let subject_size = if in_window { 18.0 } else { 20.0 };
     // Search words in the subject on the highlight background (File › Options › Search).
-    let hits = if crate::dialogs::search_highlight_on(ui.ctx()) {
+    let hits = if app.s.settings.bool("search.highlight") {
         mailcraft_engine::search_index::highlights(
             &app.s,
             mailcraft_engine::search_index::Field::Subject,
@@ -415,6 +548,19 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
         ui.add_space(6.0);
         info_bar(ui, app, "info", line, None);
     }
+    // Junk Email: the folder notice and the suspicious-domain warning.
+    let junk = mailcraft_engine::junk::reading_info(&app.s, ItemId(id));
+    for (key, icon) in [("infobar", "junk"), ("warning", "warning")] {
+        if let Some(line) = junk.get(key).and_then(serde_json::Value::as_str) {
+            ui.add_space(6.0);
+            info_bar(ui, app, icon, line, None);
+        }
+    }
+    // Voting buttons, vote tallies, delivery / read receipts and read-receipt requests.
+    let policy = crate::compose::ReceiptPolicy::from_setting(
+        &app.s.settings.text("mail.tracking.readReceiptResponse"),
+    );
+    crate::compose::tracking_bars(ui, app, ItemId(id), policy);
     // 6. Meeting requests, responses, cancellations and proposals (nothing for ordinary mail).
     crate::modules::meeting_bar(ui, app, id);
 }
@@ -694,7 +840,41 @@ fn open_link(ctx: &egui::Context, app: &mut App, href: &str) {
             app.run("compose.setTo", json!({"compose": cid, "value": addr}));
         }
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
-        ctx.open_url(egui::OpenUrl::new_tab(h));
+        if app.s.settings.bool("trust.warnLinks") {
+            // Trust Center › "Ask before opening web links in messages": confirm first.
+            ctx.data_mut(|d| d.insert_temp(link_prompt_id(), h.to_owned()));
+        } else {
+            ctx.open_url(egui::OpenUrl::new_tab(h));
+        }
+    }
+}
+
+fn link_prompt_id() -> Id {
+    Id::new("mailcraft.reading.link-prompt")
+}
+
+/// The "open this link?" prompt of Trust Center › "Ask before opening web links in messages".
+fn link_prompt(ctx: &egui::Context, app: &mut App) {
+    let Some(url) = ctx.data_mut(|d| d.get_temp::<String>(link_prompt_id())) else { return };
+    let mut done = false;
+    egui::Modal::new(link_prompt_id().with("modal")).show(ctx, |ui| {
+        ui.set_max_width(420.0);
+        crate::dialogs::form_visuals(ui, &app.theme);
+        ui.label(RichText::new("Open this link?").strong());
+        let shown: String = url.chars().take(300).collect();
+        ui.label(RichText::new(shown).color(app.theme.link));
+        ui.horizontal(|ui| {
+            if ui.button("Open").clicked() {
+                ctx.open_url(egui::OpenUrl::new_tab(&url));
+                done = true;
+            }
+            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                done = true;
+            }
+        });
+    });
+    if done {
+        ctx.data_mut(|d| d.remove::<String>(link_prompt_id()));
     }
 }
 
@@ -706,6 +886,9 @@ fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClas
     let ctx = ui.ctx().clone();
     let embedded = class == egui::ViewportClass::EmbeddedWindow;
     let mut close = !embedded && ctx.input(|i| i.viewport().close_requested());
+    // Mail › "Close original message window when replying or forwarding".
+    let responses = |app: &App| app.s.composes.values().filter(|c| c.source == Some(ItemId(id))).count();
+    let responses_before = responses(app);
     if !embedded {
         // A real window has its own input; embedded ones share the main window's (handled there).
         crate::keys::handle(&ctx, app, Surface::Read(id));
@@ -736,6 +919,9 @@ fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClas
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !egui::Popup::is_any_open(&ctx) {
         close = true;
     }
+    if responses(app) > responses_before && app.s.settings.bool("mail.reply.closeOriginal") {
+        close = true;
+    }
     close
 }
 
@@ -762,6 +948,96 @@ mod tests {
             },
             app,
         )
+    }
+
+    #[test]
+    fn mark_as_read_after_the_wait_and_space_bar_reading() {
+        let s = sample_session();
+        let subject = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let mut app = app_with(&subject);
+        let id = app.s.selection.focus.unwrap();
+        app.s.mailbox.set_read(&[id], false);
+        app.run("options.set", json!({"key": "mail.readingPane.markReadWhenViewed", "value": true}));
+        app.run("options.set", json!({"key": "mail.readingPane.markReadAfterSeconds", "value": 0}));
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.state().s.mailbox.mail[&id].read, "marked read after 0 s");
+        // Option off: viewing leaves it unread.
+        let mut app = h.into_state();
+        app.s.mailbox.set_read(&[id], false);
+        app.run("options.set", json!({"key": "mail.readingPane.markReadWhenViewed", "value": false}));
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(!h.state().s.mailbox.mail[&id].read);
+        // Space pages the message, then moves on.
+        let ctx = h.ctx.clone();
+        let mut moved = false;
+        for _ in 0..50 {
+            let app = h.state_mut();
+            space_read(&ctx, app, false);
+            h.run_steps(1);
+            if h.state().s.selection.focus != Some(id) {
+                moved = true;
+                break;
+            }
+        }
+        assert!(moved, "Space reached the next item");
+    }
+
+    #[test]
+    fn trust_center_and_background_options_render() {
+        let s = sample_session();
+        let subject = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let mut app = app_with(&subject);
+        for (k, v) in
+            [("trust.plainText", true), ("trust.blockImages", false), ("general.keepMessageBackground", true)]
+        {
+            app.run("options.set", json!({"key": k, "value": v}));
+        }
+        app.run("options.set", json!({"key": "view.darkMode", "value": true}));
+        let mut h = harness(app);
+        h.run();
+        h.get_by_label(&subject);
+        let plain = body_doc(
+            &mailcraft_model::Body {
+                format: BodyFormat::Html,
+                text: None,
+                html: Some("<p>Hi <b>there</b></p>".into()),
+            },
+            true,
+        );
+        assert!(plain.to_plain_text().contains("Hi there"));
+    }
+
+    #[test]
+    fn junk_info_bar_and_read_receipt_request() {
+        let s = sample_session();
+        let subject = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let mut app = app_with(&subject);
+        let id = app.s.selection.focus.unwrap();
+        // A read-receipt request: the bar asks (Options › Mail › Tracking default), "never" hides it.
+        let raw = b"From: Ann <ann@example.org>\r\nTo: me@example.com\r\nSubject: Hi\r\n\
+                    Disposition-Notification-To: ann@example.org\r\n\r\nBody\r\n";
+        if let Some(m) = app.s.mailbox.mail.get_mut(&id) {
+            m.raw = Some(raw.to_vec());
+        }
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.query_by_label(crate::compose::READ_RECEIPT_REQUEST).is_some());
+        let mut app = h.into_state();
+        app.run("options.set", json!({"key": "mail.tracking.readReceiptResponse", "value": "never"}));
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.query_by_label(crate::compose::READ_RECEIPT_REQUEST).is_none());
+        // In Junk Email: the info bar, and the body is shown as plain text without working links.
+        let mut app = h.into_state();
+        let acct = app.s.mailbox.folder_account(app.s.mailbox.mail[&id].folder).unwrap();
+        let junk = app.s.mailbox.role_folder(acct, mailcraft_model::FolderRole::JunkEmail).unwrap();
+        app.s.mailbox.move_items(&[id], junk).unwrap();
+        assert!(mailcraft_engine::junk::links_disabled(&app.s, id));
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.query_by_label(mailcraft_engine::junk::JUNK_INFOBAR).is_some());
     }
 
     #[test]

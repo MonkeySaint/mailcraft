@@ -258,30 +258,121 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             .init("start", json!(1)),
             |app, v| cmd(app, "format.numbering", with(json!({"start": v.n("start") as u64}))).map(|_| None),
         ),
-        "defineNewBullet" | "defineNewNumberFormat" | "defineNewMultilevelList" | "defineNewListStyle" => {
-            let (title, id, choices): (&str, &str, &[&str]) = match d.name {
-                "defineNewBullet" => (
-                    "Define New Bullet",
-                    "format.bullets",
-                    &["disc", "circle", "square", "dash", "arrow", "check"],
-                ),
-                "defineNewNumberFormat" => (
-                    "Define New Number Format",
-                    "format.numbering",
-                    &["decimal", "lowerAlpha", "upperAlpha", "lowerRoman", "upperRoman"],
-                ),
-                _ => (
-                    "Define New Multilevel List",
-                    "format.multilevel",
-                    &["numbered", "outline", "bullets", "legal"],
-                ),
-            };
+        "defineNewBullet" => {
+            let cur = d
+                .get("format")
+                .and_then(|f| f.get("glyph"))
+                .and_then(Value::as_str)
+                .unwrap_or("\u{2022}")
+                .to_owned();
+            let glyphs: Vec<String> = BULLET_GLYPHS.iter().map(|(g, n)| format!("{g}  {n}")).collect();
+            let init = glyphs
+                .iter()
+                .find(|g| g.starts_with(&cur))
+                .cloned()
+                .unwrap_or_else(|| glyphs.first().cloned().unwrap_or_default());
             run_form(
                 ctx,
                 app,
                 d,
-                Form::new(title, vec![f("style", "Style:", combo(choices))]),
-                move |app, v| cmd(app, id, with(json!({"style": v.s("style")}))).map(|_| None),
+                Form::new(
+                    "Define New Bullet",
+                    vec![
+                        f("symbol", "Symbol:", Kind::Combo(glyphs)),
+                        f("custom", "Or type a character:", Kind::Text),
+                    ],
+                )
+                .init("symbol", json!(init)),
+                |app, v| {
+                    let custom = v.s("custom");
+                    let glyph = if custom.is_empty() {
+                        v.s("symbol").split_whitespace().next().unwrap_or("").to_owned()
+                    } else {
+                        custom
+                    };
+                    cmd(app, "format.bullets", with(json!({"glyph": glyph}))).map(|_| None)
+                },
+            )
+        }
+        "defineNewNumberFormat" => {
+            let fmt = d.get("format").cloned().unwrap_or(Value::Null);
+            let style = fmt.get("numberStyle").and_then(Value::as_str).unwrap_or("decimal").to_owned();
+            let pattern = format!(
+                "{}{}{}",
+                fmt.get("prefix").and_then(Value::as_str).unwrap_or(""),
+                NUMBER_STYLES.iter().find(|(k, _, _)| *k == style).map_or("1", |(_, _, sample)| *sample),
+                fmt.get("suffix").and_then(Value::as_str).unwrap_or("."),
+            );
+            let labels: Vec<String> = NUMBER_STYLES.iter().map(|(_, l, _)| (*l).to_owned()).collect();
+            let init =
+                NUMBER_STYLES.iter().find(|(k, _, _)| *k == style).map_or("1, 2, 3, …", |(_, l, _)| *l);
+            run_form(
+                ctx,
+                app,
+                d,
+                Form::new(
+                    "Define New Number Format",
+                    vec![
+                        f("style", "Number style:", Kind::Combo(labels)),
+                        f("pattern", "Number format:", Kind::Text),
+                        f("n", "", Kind::Note("The number (1, a, A, i or I) stands for each item's number: \"Step 1:\", \"(a)\", \"Article I.\"".into())),
+                    ],
+                )
+                .init("style", json!(init))
+                .init("pattern", json!(pattern)),
+                |app, v| {
+                    let label = v.s("style");
+                    let key = NUMBER_STYLES.iter().find(|(_, l, _)| *l == label).map_or("decimal", |(k, _, _)| *k);
+                    cmd(app, "format.numbering", with(json!({"pattern": v.s("pattern"), "numberStyle": key}))).map(|_| None)
+                },
+            )
+        }
+        "defineNewMultilevelList" | "defineNewListStyle" => {
+            let title = if d.name == "defineNewListStyle" {
+                "Define New List Style"
+            } else {
+                "Define New Multilevel List"
+            };
+            let labels: Vec<String> = MULTILEVEL.iter().map(|(_, l)| (*l).to_owned()).collect();
+            run_form(
+                ctx,
+                app,
+                d,
+                Form::new(
+                    title,
+                    vec![
+                        f("start", "Start from:", Kind::Combo(labels)),
+                        f("l1", "Level 1 format:", Kind::Text),
+                        f("l2", "Level 2 format:", Kind::Text),
+                        f("l3", "Level 3 format:", Kind::Text),
+                        f("chain", "Include the numbers of the levels above (1.1, 1.1.1)", Kind::Check),
+                        f("n", "", Kind::Note("Leave the levels empty to use the list chosen above. A format with no number (\u{2022}, \u{2013}) is a bullet.".into())),
+                    ],
+                )
+                .width(480.0),
+                |app, v| {
+                    let levels: Vec<Value> = ["l1", "l2", "l3"]
+                        .iter()
+                        .map(|k| v.s(k))
+                        .take_while(|t| !t.is_empty())
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let has_number = t.chars().any(|c| c.is_ascii_digit() || matches!(c, 'a' | 'A' | 'i' | 'I'));
+                            if has_number {
+                                json!({"pattern": t, "chain": i > 0 && v.b("chain")})
+                            } else {
+                                json!({"glyph": t})
+                            }
+                        })
+                        .collect();
+                    if levels.is_empty() {
+                        let label = v.s("start");
+                        let key = MULTILEVEL.iter().find(|(_, l)| *l == label).map_or("numbered", |(k, _)| *k);
+                        cmd(app, "format.multilevel", with(json!({"style": key}))).map(|_| None)
+                    } else {
+                        cmd(app, "format.multilevel", with(json!({"levels": levels}))).map(|_| None)
+                    }
+                },
             )
         }
         "paragraph" => run_form(
@@ -364,13 +455,49 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 cmd(app, "format.style", with(json!({"name": v.s("name"), "action": action}))).map(|_| None)
             },
         ),
-        "pasteSpecial" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new("Paste Special", vec![f("as", "As:", combo(&["html", "rtf", "text", "image"]))]),
-            |app, v| cmd(app, "format.pasteSpecial", with(json!({"as": v.s("as")}))).map(|_| None),
-        ),
+        "pasteSpecial" => {
+            let html = crate::compose::clipboard_html();
+            let text = crate::compose::clipboard_text();
+            let mut kinds: Vec<&str> = Vec::new();
+            if html.is_some() {
+                kinds.push("HTML Format");
+            }
+            kinds.push("Unformatted Text");
+            kinds.push("Unformatted Unicode Text");
+            run_form(
+                ctx,
+                app,
+                d,
+                Form::new(
+                    "Paste Special",
+                    vec![
+                        f("as", "As:", combo(&kinds)),
+                        f(
+                            "n",
+                            "",
+                            Kind::Note(if html.is_some() {
+                                "The clipboard holds formatted (HTML) content.".into()
+                            } else {
+                                "The clipboard holds text only.".into()
+                            }),
+                        ),
+                    ],
+                ),
+                move |app, v| {
+                    let as_html = v.s("as") == "HTML Format";
+                    let mut p = json!({"as": if as_html { "html" } else { "text" }});
+                    if let Some(o) = p.as_object_mut() {
+                        if as_html && let Some(h) = &html {
+                            o.insert("html".into(), json!(h));
+                        }
+                        if let Some(t) = &text {
+                            o.insert("text".into(), json!(t));
+                        }
+                    }
+                    cmd(app, "format.pasteSpecial", with(p)).map(|_| None)
+                },
+            )
+        }
         "find" | "replace" => find_replace(ctx, app, d),
         "goTo" => run_form(
             ctx,
@@ -465,16 +592,12 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             d,
             Form::new(
                 "Screenshot",
-                vec![
-                    f("window", "Available windows:", combo(&["MailCraft"])),
-                    f("clip", "Screen clipping (a part of the window)", Kind::Check),
-                ],
+                vec![f("n", "", Kind::Note(d.str("message"))), f("path", "Saved screenshot:", Kind::Text)],
             )
+            .init("path", json!(format!("{}/", std::env::var("HOME").unwrap_or_default())))
+            .width(480.0)
             .ok("Insert"),
-            |app, v| {
-                cmd(app, "insert.screenshot", with(json!({"window": v.s("window"), "clip": v.b("clip")})))
-                    .map(|_| None)
-            },
+            |app, v| cmd(app, "insert.screenshot", with(json!({"path": v.s("path")}))).map(|_| None),
         ),
         "drawTable" | "insertTable" | "quickTables" => run_form(
             ctx,
@@ -573,38 +696,63 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             |app, v| cmd(app, "insert.dateTime", with(json!({"format": v.s("format")}))).map(|_| None),
         ),
         "quickParts" => {
-            let entries: Vec<String> = d
+            let gallery = d.str("gallery");
+            let entries: Vec<(String, String, String)> = d
                 .arr("entries")
                 .iter()
                 .filter_map(|e| {
-                    e.as_str()
-                        .map(str::to_owned)
-                        .or_else(|| e.get("name").and_then(Value::as_str).map(str::to_owned))
+                    let name = e.get("name").and_then(Value::as_str).or_else(|| e.as_str())?.to_owned();
+                    let g = e.get("gallery").and_then(Value::as_str).unwrap_or("quickParts").to_owned();
+                    let preview = e.get("preview").and_then(Value::as_str).unwrap_or("").to_owned();
+                    Some((name, g, preview))
                 })
                 .collect();
+            let labels: Vec<String> =
+                entries.iter().map(|(n, g, _)| format!("{n}  ({})", gallery_label(g))).collect();
+            let previews: Vec<String> = entries.iter().map(|(n, _, p)| format!("{n}: {p}")).collect();
+            let title = if gallery == "autoText" { "AutoText" } else { "Quick Parts" };
+            let save_gallery = if gallery.is_empty() { "quickParts".to_owned() } else { gallery.clone() };
             run_form(
                 ctx,
                 app,
                 d,
                 Form::new(
-                    "Quick Parts",
+                    title,
                     vec![
-                        f("name", "Entry:", Kind::Combo(entries)),
+                        f("entry", "Entry:", Kind::Combo(labels.clone())),
+                        f(
+                            "n",
+                            "",
+                            Kind::Note(if previews.is_empty() {
+                                "No saved entries yet: select text in the message and save it here.".into()
+                            } else {
+                                previews.join("\n")
+                            }),
+                        ),
+                        f("delete", "Delete this entry (Building Blocks Organizer)", Kind::Check),
                         f("save", "Save the selection to the gallery under this name instead", Kind::Check),
                         f("newName", "New entry name:", Kind::Text),
                     ],
-                ),
-                |app, v| {
+                )
+                .width(480.0),
+                move |app, v| {
                     if v.b("save") {
-                        cmd(
+                        return cmd(
                             app,
                             "insert.saveToGallery",
-                            with(json!({"gallery": "quickParts", "name": v.s("newName")})),
+                            with(json!({"gallery": save_gallery, "name": v.s("newName")})),
                         )
-                        .map(|_| None)
-                    } else {
-                        cmd(app, "insert.quickPart", with(json!({"name": v.s("name")}))).map(|_| None)
+                        .map(|_| None);
                     }
+                    let pick = v.s("entry");
+                    let Some((name, g, _)) =
+                        labels.iter().position(|l| *l == pick).and_then(|i| entries.get(i))
+                    else {
+                        return Err("Choose an entry.".into());
+                    };
+                    let action = if v.b("delete") { "delete" } else { "insert" };
+                    cmd(app, "insert.quickPart", with(json!({"name": name, "gallery": g, "action": action})))
+                        .map(|_| None)
                 },
             )
         }
@@ -701,38 +849,119 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "browseThemes" | "themes" | "customizeTheme" => run_form(
+        "themes" | "customizeTheme" => {
+            use mailcraft_engine::compose::{
+                COLOR_GALLERY_LEN, THEME_COLOR_SETS, THEME_EFFECTS, THEME_FONT_SETS, THEMES,
+            };
+            let part = if d.str("part").is_empty() { "all".to_owned() } else { d.str("part") };
+            let names: Vec<String> = match part.as_str() {
+                "colors" => {
+                    THEME_COLOR_SETS.iter().take(COLOR_GALLERY_LEN).map(|(n, _)| (*n).to_owned()).collect()
+                }
+                "fonts" => THEME_FONT_SETS.iter().map(|(n, _, _)| (*n).to_owned()).collect(),
+                "effects" => THEME_EFFECTS.iter().map(|n| (*n).to_owned()).collect(),
+                _ => THEMES.iter().map(|t| t.0.to_owned()).collect(),
+            };
+            let title = match part.as_str() {
+                "colors" => "Theme Colors",
+                "fonts" => "Theme Fonts",
+                "effects" => "Theme Effects",
+                _ => "Themes",
+            };
+            run_form(
+                ctx,
+                app,
+                d,
+                Form::new(
+                    title,
+                    vec![
+                        f("name", "Name:", Kind::Combo(names)),
+                        f("reset", "Reset to Theme from Template", Kind::Check),
+                    ],
+                ),
+                move |app, v| {
+                    let p = if v.b("reset") {
+                        json!({"action": "reset"})
+                    } else {
+                        json!({"name": v.s("name"), "part": part})
+                    };
+                    cmd(app, "compose.theme", with(p)).map(|_| None)
+                },
+            )
+        }
+        "browseThemes" => run_form(
             ctx,
             app,
             d,
             Form::new(
-                "Themes",
+                "Browse for Themes",
                 vec![
-                    f("name", "Theme:", combo(&["Office", "Facet", "Ion", "Retrospect", "Slice", "Wisp"])),
-                    f("part", "Apply:", combo(&["all", "colors", "fonts", "effects"])),
-                    f("reset", "Reset to the theme from the template", Kind::Check),
+                    f("path", "Theme file:", Kind::Text),
+                    f(
+                        "n",
+                        "",
+                        Kind::Note("A theme saved with Save Current Theme (MailCraft theme, .json).".into()),
+                    ),
                 ],
             )
-            .init("part", json!(if d.str("part").is_empty() { "all".to_owned() } else { d.str("part") })),
+            .init("path", json!(format!("{}/", std::env::var("HOME").unwrap_or_default())))
+            .width(480.0)
+            .ok("Open"),
             |app, v| {
-                let action = if v.b("reset") { "reset" } else { "apply" };
-                cmd(
-                    app,
-                    "compose.theme",
-                    with(json!({"name": v.s("name"), "part": v.s("part"), "action": action})),
-                )
-                .map(|_| None)
+                cmd(app, "compose.theme", with(json!({"action": "browse", "path": v.s("path")})))
+                    .map(|_| None)
             },
         ),
         "saveTheme" => run_form(
             ctx,
             app,
             d,
-            Form::new("Save Current Theme", vec![f("name", "File name:", Kind::Text)]).ok("Save"),
+            Form::new(
+                "Save Current Theme",
+                vec![f("name", "Theme name:", Kind::Text), f("path", "File name:", Kind::Text)],
+            )
+            .init("name", json!("Custom Theme"))
+            .init("path", json!(format!("{}/Custom Theme.json", std::env::var("HOME").unwrap_or_default())))
+            .width(480.0)
+            .ok("Save"),
             |app, v| {
-                cmd(app, "compose.theme", with(json!({"name": v.s("name"), "action": "save"}))).map(|_| None)
+                cmd(
+                    app,
+                    "compose.theme",
+                    with(json!({"action": "save", "name": v.s("name"), "path": v.s("path")})),
+                )
+                .map(|_| None)
             },
         ),
+        "customizeColors" => customize_colors(ctx, app, d),
+        "customizeFonts" => {
+            let fonts: Vec<String> = THEME_FONT_CHOICES.iter().map(|s| (*s).to_owned()).collect();
+            run_form(
+                ctx,
+                app,
+                d,
+                Form::new(
+                    "Create New Theme Fonts",
+                    vec![
+                        f("heading", "Heading font:", Kind::Combo(fonts.clone())),
+                        f("body", "Body font:", Kind::Combo(fonts)),
+                        f("name", "Name:", Kind::Text),
+                    ],
+                )
+                .init("heading", json!(d.str("headingFont")))
+                .init("body", json!(d.str("bodyFont")))
+                .init("name", json!("Custom 1"))
+                .ok("Save"),
+                |app, v| {
+                    cmd(
+                        app,
+                        "compose.theme",
+                        with(json!({"action": "customize", "part": "fonts", "heading": v.s("heading"), "body": v.s("body"), "name": v.s("name")})),
+                    )
+                    .map(|_| None)
+                },
+            )
+        }
         "pageColor" => run_form(
             ctx,
             app,
@@ -758,13 +987,15 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                     f(
                         "preset",
                         "Or a built-in one:",
-                        combo(&[
-                            "",
-                            "area of circle",
-                            "binomial theorem",
-                            "pythagorean theorem",
-                            "quadratic formula",
-                        ]),
+                        Kind::Combo(
+                            std::iter::once(String::new())
+                                .chain(
+                                    mailcraft_engine::cmd::insert::EQUATION_PRESETS
+                                        .iter()
+                                        .map(|(_, n, _)| (*n).to_owned()),
+                                )
+                                .collect(),
+                        ),
                     ),
                 ],
             )
@@ -858,6 +1089,161 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         }
         _ => return None,
     })
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Lists, themes, building blocks
+
+/// Bullet glyphs offered by Define New Bullet: (glyph, name).
+const BULLET_GLYPHS: [(&str, &str); 12] = [
+    ("\u{2022}", "Solid circle"),
+    ("\u{25e6}", "Hollow circle"),
+    ("\u{25aa}", "Solid square"),
+    ("\u{25a1}", "Hollow square"),
+    ("\u{2756}", "Four small diamonds"),
+    ("\u{25c6}", "Diamond"),
+    ("\u{27a2}", "Arrow"),
+    ("\u{2192}", "Thin arrow"),
+    ("\u{2714}", "Checkmark"),
+    ("\u{2605}", "Star"),
+    ("\u{2013}", "Dash"),
+    ("\u{25ba}", "Pointer"),
+];
+
+/// Number styles of Define New Number Format: (engine key, label, sample number).
+const NUMBER_STYLES: [(&str, &str, &str); 6] = [
+    ("decimal", "1, 2, 3, …", "1"),
+    ("decimal-leading-zero", "01, 02, 03, …", "01"),
+    ("lower-alpha", "a, b, c, …", "a"),
+    ("upper-alpha", "A, B, C, …", "A"),
+    ("lower-roman", "i, ii, iii, …", "i"),
+    ("upper-roman", "I, II, III, …", "I"),
+];
+
+/// Multilevel list definitions: (key, label).
+const MULTILEVEL: [(&str, &str); 8] = [
+    ("numbered", "1. a. i."),
+    ("numberedParen", "1) a) i)"),
+    ("outline", "1. 1.1. 1.1.1."),
+    ("outlineRoman", "I. A. 1. a)"),
+    ("article", "Article I. / Section 1.01"),
+    ("chapter", "Chapter 1 / 1.1"),
+    ("bullets", "Bullets by level"),
+    ("diamonds", "Four small diamonds"),
+];
+
+/// Fonts offered by Customize Fonts: the theme font names (shown with bundled substitutes) and the bundled
+/// families.
+const THEME_FONT_CHOICES: [&str; 22] = [
+    "Aptos",
+    "Aptos Display",
+    "Calibri",
+    "Calibri Light",
+    "Cambria",
+    "Arial",
+    "Times New Roman",
+    "Georgia",
+    "Garamond",
+    "Century Gothic",
+    "Constantia",
+    "Corbel",
+    "Candara",
+    "Franklin Gothic Book",
+    "Trebuchet MS",
+    "Verdana",
+    "Consolas",
+    "Inter",
+    "Carlito",
+    "Liberation Sans",
+    "Liberation Serif",
+    "Liberation Mono",
+];
+
+/// Display name of a building-block gallery.
+fn gallery_label(g: &str) -> &'static str {
+    match g {
+        "autoText" => "AutoText",
+        "textBoxes" => "Text Boxes",
+        "quickTables" => "Quick Tables",
+        "equations" => "Equations",
+        _ => "Quick Parts",
+    }
+}
+
+#[derive(Clone, Default)]
+struct ColorsState {
+    colors: Vec<[u8; 3]>,
+    name: String,
+    error: String,
+}
+
+/// Create New Theme Colors: one colour button per theme slot, a sample row, and a name.
+fn customize_colors(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    use mailcraft_engine::compose::THEME_COLOR_SLOTS;
+    let uid = d.uid;
+    let palette: Vec<[u8; 3]> = d
+        .arr("palette")
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(mailcraft_geom::Color::parse_hex)
+        .map(|c| [c.r, c.g, c.b])
+        .collect();
+    let compose = d.u64("compose");
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| ColorsState {
+            colors: if palette.len() == 12 { palette.clone() } else { vec![[0, 0, 0]; 12] },
+            name: "Custom 1".into(),
+            error: String::new(),
+        },
+        |st, app| {
+            window(ctx, app, d, "Create New Theme Colors", 420.0, |ui, app| {
+                egui::Grid::new(("theme-colors", uid)).num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                    for (slot, c) in THEME_COLOR_SLOTS.iter().zip(st.colors.iter_mut()) {
+                        ui.label(*slot);
+                        egui::color_picker::color_edit_button_srgb(ui, c);
+                        ui.end_row();
+                    }
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut st.name);
+                    ui.end_row();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Sample:");
+                    for c in st.colors.iter().skip(4).take(6) {
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                        ui.painter().rect_filled(r, 2.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                    }
+                });
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                footer(ui, |ui| {
+                    if btn(ui, "Cancel") {
+                        return Out::Close;
+                    }
+                    if primary(ui, app, true, "Save") {
+                        let colors: Vec<String> = st
+                            .colors
+                            .iter()
+                            .map(|c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]))
+                            .collect();
+                        let p = json!({"compose": compose, "action": "customize", "part": "colors", "colors": colors, "name": st.name});
+                        return match cmd(app, "compose.theme", p) {
+                            Ok(_) => Out::Close,
+                            Err(e) => {
+                                st.error = e;
+                                Out::Keep
+                            }
+                        };
+                    }
+                    Out::Keep
+                })
+            })
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------------------------------------

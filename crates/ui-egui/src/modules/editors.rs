@@ -10,6 +10,12 @@
 //! `scheduling`) and Tracking (attendee responses of a meeting). Opening one occurrence of a recurring series
 //! first asks whether to open the occurrence or the series; saving an occurrence makes it an exception
 //! (`calendar.editOccurrence`).
+//!
+//! The task window also sets the task's recurrence (a pattern, or "regenerate N days after completion") and
+//! Private, and Assign Task turns it into a task request. The module dialogs (move/copy, categories,
+//! follow up, module view settings, Mail Merge, Task Request) are in [`dialogs`].
+
+pub(crate) mod dialogs;
 
 use std::collections::BTreeSet;
 
@@ -30,7 +36,7 @@ use mailcraft_model::{BusyStatus, Contact, FolderId, ItemId, NoteColor, TaskPrio
 
 use super::common::{
     DAY, ModState, clock, current_folder, day_string, day_time_string, load, local_secs, note_fill,
-    parse_day, parse_day_time, persona_fill, run_checked, store, today, tz, weekday,
+    parse_day, parse_day_time, persona_fill, run_checked, select_item, store, today, tz, weekday,
 };
 use super::recurrence::{Outcome, RecurrenceDialog};
 use super::{HANDLED_DIALOGS, calendar_view};
@@ -149,8 +155,22 @@ pub(crate) struct ContactEditor {
     pub picker: Option<MemberPicker>,
     pub categories: Vec<String>,
     pub error: Option<String>,
+    /// Duplicate Contact Detected (Options › People › Check for duplicates): the existing contact's id and
+    /// name, shown with the Add / Update choices.
+    pub duplicate: Option<(u64, String)>,
+    /// The choice made for a detected duplicate (`add` / `update`), sent with the next save.
+    pub duplicate_choice: Option<&'static str>,
     pub nonce: u64,
     pub focus: bool,
+}
+
+/// What saving the contact window did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContactSaved {
+    /// Saved (the item id when known).
+    Saved(Option<u64>),
+    /// Not saved: a contact with the same name or address exists (id, name).
+    Duplicate(u64, String),
 }
 
 /// Add Members › From Contacts / From Address Book.
@@ -176,9 +196,19 @@ pub(crate) struct TaskEditor {
     pub reminder_on: bool,
     pub reminder_date: String,
     pub reminder_min: i64,
+    /// The reminder follows the due date (a new task with Options › Tasks › "Set reminders on tasks with due
+    /// dates" on) until the reminder is changed by hand.
+    pub reminder_auto: bool,
     pub body: String,
     pub categories: Vec<String>,
     pub linked_mail: bool,
+    /// RRULE of a recurring task ("" = does not repeat).
+    pub recurrence: String,
+    /// Regenerate new task this many days after each one is completed (0 = follow `recurrence`).
+    pub regenerate_days: u32,
+    pub private: bool,
+    /// Assigned to (task requests sent), shown read-only.
+    pub assigned_to: String,
     pub error: Option<String>,
     pub nonce: u64,
     pub focus: bool,
@@ -238,15 +268,14 @@ pub(crate) fn open_appointment(app: &App, st: &mut ModState, id: ItemId) {
 /// Opens an appointment; with `occurrence` (unix start) only that occurrence of its series.
 pub(crate) fn open_appointment_at(app: &App, st: &mut ModState, id: ItemId, occurrence: Option<(i64, i64)>) {
     let Some(a) = app.s.mailbox.appointments.get(&id) else { return };
-    let tz = tz(app);
+    // Times on the calendar's clock (its named zone across daylight-saving changes), as saving reads them.
+    let clock = mailcraft_engine::cmd::calendar::tz::Clock::of(&app.s);
     let (start, end) = match occurrence {
-        Some((s, e)) => {
-            (mailcraft_model::DateTime::from_unix(s, tz), mailcraft_model::DateTime::from_unix(e, tz))
-        }
-        None => (a.start, a.end),
+        Some((s, e)) => (s, e),
+        None => (a.start.unix, a.end.unix),
     };
-    let s = local_secs(start, tz);
-    let mut e = local_secs(end, tz).max(s);
+    let s = clock.local(start);
+    let mut e = clock.local(end).max(s);
     if a.all_day {
         // Shown with the inclusive last day.
         e = (e - DAY).max(s);
@@ -441,7 +470,7 @@ pub(crate) fn open_task(app: &App, st: &mut ModState, id: ItemId) {
             let s = local_secs(r, tz);
             (day_string(s.div_euclid(DAY)), s.rem_euclid(DAY) / 60)
         }
-        None => (day_string(today(app) + 1), 8 * 60),
+        None => (day_string(today(app) + 1), i64::from(app.s.settings.task_reminder_minutes())),
     };
     let nonce = st.editors.next();
     st.editors.task = Some(TaskEditor {
@@ -456,9 +485,14 @@ pub(crate) fn open_task(app: &App, st: &mut ModState, id: ItemId) {
         reminder_on: t.reminder.is_some(),
         reminder_date,
         reminder_min,
+        reminder_auto: false,
         body: t.body.clone(),
         categories: t.categories.clone(),
         linked_mail: t.from_mail.is_some(),
+        recurrence: t.recurrence.as_ref().map(|r| r.rrule.clone()).unwrap_or_default(),
+        regenerate_days: t.recurrence.as_ref().map_or(0, |r| r.regenerate_days),
+        private: t.private,
+        assigned_to: t.assigned_to.join("; "),
         error: None,
         nonce,
         focus: false,
@@ -474,7 +508,9 @@ pub(crate) fn new_task(app: &App, st: &mut ModState, folder: Option<FolderId>) {
         status: "notStarted".into(),
         priority: "normal".into(),
         reminder_date: day_string(today(app) + 1),
-        reminder_min: 8 * 60,
+        // Options › Tasks › Default reminder time / Set reminders on tasks with due dates.
+        reminder_min: i64::from(app.s.settings.task_reminder_minutes()),
+        reminder_auto: app.s.settings.task_reminders_on_due(),
         nonce,
         focus: true,
         ..Default::default()
@@ -564,7 +600,7 @@ fn open_from_dialog(app: &mut App, st: &mut ModState, name: &str, p: &Value) {
                 let text = app.s.mailbox.notes.get(&id).map(|n| n.text.clone()).unwrap_or_default();
                 st.note_edit = Some((id.0, text));
                 st.note_focus = true;
-                app.ui.module_selection = Some(id.0);
+                select_item(app, Some(id.0));
             }
         }
         "goToDate" => {
@@ -598,6 +634,9 @@ pub(crate) fn show(ctx: &egui::Context, app: &mut App) {
         if HANDLED_DIALOGS.contains(&name.as_str()) {
             app.ui.dialogs.remove(i);
             open_from_dialog(app, &mut st, &name, &params);
+        } else if dialogs::HANDLED.contains(&name.as_str()) {
+            app.ui.dialogs.remove(i);
+            dialogs::open(app, &mut st, &name, &params);
         } else {
             i += 1;
         }
@@ -608,6 +647,7 @@ pub(crate) fn show(ctx: &egui::Context, app: &mut App) {
     task_window(ctx, app, &mut st);
     note_window(ctx, app, &mut st);
     go_to_window(ctx, app, &mut st);
+    dialogs::show(ctx, app, &mut st);
     store(ctx, st);
 }
 
@@ -682,6 +722,7 @@ enum Act {
     MarkComplete,
     ForwardCard,
     ForwardContact,
+    AssignTask,
 }
 
 /// Standard buttons row (right-aligned: primary, Delete, Cancel). `primary` is the main button's label.
@@ -1230,6 +1271,7 @@ fn contact_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
     let title =
         format!("{} - {kind}", if ed.full_name.trim().is_empty() { "Untitled" } else { ed.full_name.trim() });
     let mut act = Act::None;
+    let mut dup_choice: Option<&'static str> = None;
     window(title, ("mc-contact-editor", ed.nonce))
         .default_width(if ed.group { 560.0 } else { 760.0 })
         .open(&mut open)
@@ -1241,6 +1283,21 @@ fn contact_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
                 contact_page(ui, app, &mut ed);
             }
             error_line(ui, app, &ed.error);
+            if let Some((_, name)) = &ed.duplicate {
+                ui.separator();
+                ui.label(RichText::new("Duplicate Contact Detected").strong());
+                ui.label(format!(
+                    "A contact with this name or email address already exists in this folder: {name}."
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Add new contact").clicked() {
+                        dup_choice = Some("add");
+                    }
+                    if ui.button("Update information of selected Contact").clicked() {
+                        dup_choice = Some("update");
+                    }
+                });
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 if !ed.group && ed.id.is_some() {
@@ -1261,21 +1318,32 @@ fn contact_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
     if ed.group {
         member_picker(ctx, app, &mut ed);
     }
+    if let Some(choice) = dup_choice {
+        ed.duplicate_choice = Some(choice);
+        act = Act::Save;
+    }
     match act {
-        Act::Save | Act::SaveSend => match save_contact(app, &ed) {
-            Ok(id) => {
+        Act::Save | Act::SaveSend => match save_contact_checked(app, &ed) {
+            Ok(ContactSaved::Saved(id)) => {
                 if let Some(id) = id {
-                    app.ui.module_selection = Some(id);
+                    select_item(app, Some(id));
                 }
                 return;
             }
-            Err(e) => ed.error = Some(e),
+            Ok(ContactSaved::Duplicate(id, name)) => {
+                ed.error = None;
+                ed.duplicate = Some((id, name));
+            }
+            Err(e) => {
+                ed.duplicate_choice = None;
+                ed.error = Some(e);
+            }
         },
         Act::Delete => {
             if let Some(id) = ed.id {
                 app.run("people.delete", json!({ "ids": [id] }));
                 if app.ui.module_selection == Some(id) {
-                    app.ui.module_selection = None;
+                    select_item(app, None);
                 }
                 return;
             }
@@ -1625,8 +1693,18 @@ fn address_json(kind: &str, f: [&String; 5]) -> Option<Value> {
                  "postalCode": postal.trim(), "country": country.trim() }))
 }
 
-/// Saves the contact editor; returns the item id.
+/// Saves the contact editor; returns the item id (a detected duplicate is an error here).
+#[cfg(test)]
 pub(crate) fn save_contact(app: &mut App, ed: &ContactEditor) -> Result<Option<u64>, String> {
+    match save_contact_checked(app, ed)? {
+        ContactSaved::Saved(id) => Ok(id),
+        ContactSaved::Duplicate(_, name) => Err(format!("A contact named {name} already exists.")),
+    }
+}
+
+/// Saves the contact editor. A new contact that duplicates an existing one is not saved until the user
+/// chooses Add or Update ([`ContactEditor::duplicate_choice`]).
+pub(crate) fn save_contact_checked(app: &mut App, ed: &ContactEditor) -> Result<ContactSaved, String> {
     let mut p = serde_json::Map::new();
     if ed.group {
         if ed.full_name.trim().is_empty() {
@@ -1693,14 +1771,22 @@ pub(crate) fn save_contact(app: &mut App, ed: &ContactEditor) -> Result<Option<u
     if let Some(id) = ed.id {
         p.insert("id".into(), json!(id));
         run_checked(app, "people.update", Value::Object(p))?;
-        Ok(Some(id))
+        Ok(ContactSaved::Saved(Some(id)))
     } else {
         if let Some(f) = ed.folder {
             p.insert("folder".into(), json!(f));
         }
+        if let Some(choice) = ed.duplicate_choice.filter(|_| !ed.group) {
+            p.insert("duplicate".into(), json!(choice));
+        }
         let cmd = if ed.group { "people.newGroup" } else { "people.new" };
         let out = run_checked(app, cmd, Value::Object(p))?;
-        Ok(out.get("id").and_then(Value::as_u64))
+        if let Some(d) = out.get("duplicate").filter(|_| out.get("id").is_none()) {
+            let id = d.get("id").and_then(Value::as_u64).unwrap_or(0);
+            let name = d.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+            return Ok(ContactSaved::Duplicate(id, name));
+        }
+        Ok(ContactSaved::Saved(out.get("id").and_then(Value::as_u64)))
     }
 }
 
@@ -1811,17 +1897,71 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             }
             ui.end_row();
             ui.label("Reminder");
+            follow_due_date(&mut ed);
             ui.horizontal(|ui| {
+                let before = (ed.reminder_on, ed.reminder_date.clone(), ed.reminder_min);
                 ui.checkbox(&mut ed.reminder_on, "");
                 ui.add_enabled_ui(ed.reminder_on, |ui| {
                     date_field(ui, &mut ed.reminder_date, "mc-task-rdate");
                     time_combo(ui, "mc-task-rtime", &mut ed.reminder_min);
                 });
+                if before != (ed.reminder_on, ed.reminder_date.clone(), ed.reminder_min) {
+                    ed.reminder_auto = false;
+                }
             });
             ui.end_row();
             ui.label("Categories");
             categories_menu(ui, app, &mut ed.categories);
             ui.end_row();
+            ui.label("Recurrence");
+            ui.horizontal(|ui| {
+                let mut choices = recurrence_choices(parse_day(&ed.due).or_else(|| parse_day(&ed.start)));
+                choices.push(("Regenerate new task".into(), "regenerate".into()));
+                let key =
+                    if ed.regenerate_days > 0 { "regenerate".to_owned() } else { ed.recurrence.clone() };
+                let current = choices
+                    .iter()
+                    .find(|(_, r)| r.eq_ignore_ascii_case(&key))
+                    .map(|(l, _)| l.clone())
+                    .unwrap_or_else(|| "Custom".to_owned());
+                let mut picked = key.clone();
+                ComboBox::from_id_salt("mc-task-rec").selected_text(current).width(180.0).show_ui(ui, |ui| {
+                    for (label, rule) in &choices {
+                        ui.selectable_value(&mut picked, rule.clone(), label);
+                    }
+                });
+                if picked != key {
+                    if picked == "regenerate" {
+                        ed.recurrence.clear();
+                        ed.regenerate_days = 7;
+                    } else {
+                        ed.recurrence = picked;
+                        ed.regenerate_days = 0;
+                    }
+                }
+                if ed.regenerate_days > 0 {
+                    let mut days = i64::from(ed.regenerate_days);
+                    ui.add(egui::DragValue::new(&mut days).range(1..=999).speed(0.2));
+                    ed.regenerate_days = u32::try_from(days.clamp(1, 999)).unwrap_or(7);
+                    ui.label("day(s) after each task is completed");
+                }
+            });
+            ui.end_row();
+            if ed.regenerate_days == 0
+                && let Some(text) = pattern_text(&ed.recurrence)
+            {
+                ui.label("");
+                ui.label(RichText::new(format!("Occurs {text}")).color(app.theme.text_muted));
+                ui.end_row();
+            }
+            ui.label("");
+            ui.checkbox(&mut ed.private, "Private");
+            ui.end_row();
+            if !ed.assigned_to.is_empty() {
+                ui.label("Assigned to");
+                ui.label(&ed.assigned_to);
+                ui.end_row();
+            }
         });
         if ed.linked_mail {
             ui.label(RichText::new("Linked to a flagged message.").color(app.theme.text_muted));
@@ -1836,19 +1976,43 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             if ed.status != "completed" && ui.button("Mark Complete").clicked() {
                 act = Act::MarkComplete;
             }
+            if ed.assigned_to.is_empty() && ui.button("Assign Task").clicked() {
+                act = Act::AssignTask;
+            }
             buttons(ui, "Save & Close", ed.id.is_some(), &mut act);
         });
     });
+    if act == Act::AssignTask {
+        // The Task Request window, prefilled from this task.
+        let p = json!({ "to": "", "folder": ed.folder });
+        dialogs::open(app, st, "taskRequest", &p);
+        if let Some(d) = st.dialogs.open.last_mut()
+            && let dialogs::Kind::TaskRequest(f) = &mut d.kind
+        {
+            f.subject = ed.subject.clone();
+            f.start = ed.start.clone();
+            f.due = ed.due.clone();
+            f.status = ed.status.clone();
+            f.priority = ed.priority.clone();
+            f.body = ed.body.clone();
+            f.recurrence = ed.recurrence.clone();
+        }
+        // An unsaved new task becomes the request; a saved one stays as it is.
+        if ed.id.is_some() {
+            st.editors.task = Some(ed);
+        }
+        return;
+    }
     if act == Act::MarkComplete {
         ed.status = "completed".into();
         ed.percent = 100;
         act = Act::Save;
     }
     match act {
-        Act::Save | Act::SaveSend => match save_task(app, &ed) {
+        Act::Save | Act::SaveSend => match save_task_following(app, &mut ed) {
             Ok(id) => {
                 if let Some(id) = id {
-                    app.ui.module_selection = Some(id);
+                    select_item(app, Some(id));
                 }
                 return;
             }
@@ -1858,7 +2022,7 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             if let Some(id) = ed.id {
                 app.run("tasks.delete", json!({ "id": id }));
                 if app.ui.module_selection == Some(id) {
-                    app.ui.module_selection = None;
+                    select_item(app, None);
                 }
                 return;
             }
@@ -1869,6 +2033,27 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
     if open {
         st.editors.task = Some(ed);
     }
+}
+
+/// A new task's reminder follows its due date while [`TaskEditor::reminder_auto`] is set: on at the default
+/// reminder time on the due date, off without one.
+pub(crate) fn follow_due_date(ed: &mut TaskEditor) {
+    if !ed.reminder_auto {
+        return;
+    }
+    match parse_day(&ed.due) {
+        Some(d) => {
+            ed.reminder_on = true;
+            ed.reminder_date = day_string(d);
+        }
+        None => ed.reminder_on = false,
+    }
+}
+
+/// Saves the task editor after bringing an automatic reminder up to date with the due date.
+fn save_task_following(app: &mut App, ed: &mut TaskEditor) -> Result<Option<u64>, String> {
+    follow_due_date(ed);
+    save_task(app, ed)
 }
 
 /// Saves the task editor; returns the item id.
@@ -1903,6 +2088,15 @@ pub(crate) fn save_task(app: &mut App, ed: &TaskEditor) -> Result<Option<u64>, S
     }
     p.insert("reminder".into(), reminder);
     p.insert("categories".into(), json!(ed.categories));
+    p.insert("private".into(), json!(ed.private));
+    let recurrence = if ed.regenerate_days > 0 {
+        json!({ "regenerateDays": ed.regenerate_days })
+    } else if ed.recurrence.trim().is_empty() {
+        Value::Null
+    } else {
+        json!(ed.recurrence.trim())
+    };
+    p.insert("recurrence".into(), recurrence);
     if let Some(id) = ed.id {
         p.insert("id".into(), json!(id));
         run_checked(app, "tasks.update", Value::Object(p))?;
@@ -1979,7 +2173,7 @@ fn note_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
         Act::Delete => {
             app.run("notes.delete", json!({ "id": ed.id }));
             if app.ui.module_selection == Some(ed.id) {
-                app.ui.module_selection = None;
+                select_item(app, None);
             }
             return;
         }
@@ -2247,6 +2441,68 @@ mod tests {
         assert_eq!(app.s.mailbox.tasks[&ItemId(id)].status, TaskStatus::Completed);
         ed.due = "soon".into();
         assert!(save_task(&mut app, &ed).is_err());
+    }
+
+    #[test]
+    fn duplicate_contact_is_offered_add_or_update() {
+        let mut app = app();
+        let mut st = ModState::default();
+        new_contact(&app, &mut st, None, false);
+        let mut ed = st.editors.contact.clone().unwrap();
+        ed.full_name = "Hana Ito".into();
+        ed.email[0] = "hana@example.com".into();
+        let first = save_contact(&mut app, &ed).unwrap().unwrap();
+        let count = app.s.mailbox.contacts.len();
+        // Same name again: nothing saved, the editor learns about the duplicate.
+        ed.email[0].clear();
+        ed.job_title = "Writer".into();
+        assert_eq!(
+            save_contact_checked(&mut app, &ed),
+            Ok(ContactSaved::Duplicate(first, "Ito, Hana".into()))
+        );
+        assert_eq!(app.s.mailbox.contacts.len(), count);
+        // Update merges into the existing contact.
+        ed.duplicate_choice = Some("update");
+        assert_eq!(save_contact_checked(&mut app, &ed), Ok(ContactSaved::Saved(Some(first))));
+        assert_eq!(app.s.mailbox.contacts[&ItemId(first)].job_title, "Writer");
+        assert_eq!(app.s.mailbox.contacts.len(), count);
+        // Add keeps both.
+        ed.duplicate_choice = Some("add");
+        let Ok(ContactSaved::Saved(Some(second))) = save_contact_checked(&mut app, &ed) else {
+            panic!("not added")
+        };
+        assert_ne!(second, first);
+        assert_eq!(app.s.mailbox.contacts.len(), count + 1);
+    }
+
+    #[test]
+    fn new_task_reminder_follows_task_options() {
+        let mut app = app();
+        let mut st = ModState::default();
+        new_task(&app, &mut st, None);
+        let ed = st.editors.task.clone().unwrap();
+        assert!(!ed.reminder_auto);
+        assert_eq!(ed.reminder_min, 8 * 60);
+        app.s.run("options.set", &json!({"key": "tasks.remindersOnDueDates", "value": true})).unwrap();
+        app.s.run("options.set", &json!({"key": "tasks.reminderTime", "value": "07:15"})).unwrap();
+        new_task(&app, &mut st, None);
+        let mut ed = st.editors.task.clone().unwrap();
+        assert_eq!(ed.reminder_min, 7 * 60 + 15);
+        follow_due_date(&mut ed);
+        assert!(!ed.reminder_on, "no due date, no reminder");
+        ed.subject = "Pay invoice".into();
+        ed.due = "2026-10-20".into();
+        follow_due_date(&mut ed);
+        assert!(ed.reminder_on);
+        assert_eq!(ed.reminder_date, "2026-10-20");
+        let id = save_task(&mut app, &ed).unwrap().unwrap();
+        let t = &app.s.mailbox.tasks[&ItemId(id)];
+        assert_eq!(t.reminder.unwrap().unix - t.due.unwrap().unix, (7 * 60 + 15) * 60);
+        // Changed by hand: the reminder stays as set.
+        ed.reminder_auto = false;
+        ed.reminder_on = false;
+        follow_due_date(&mut ed);
+        assert!(!ed.reminder_on);
     }
 
     #[test]

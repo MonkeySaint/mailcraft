@@ -7,7 +7,8 @@
 //!   bar (bold, italic, underline, alignment, bullets). New / Delete / Rename / defaults apply at once
 //!   (`compose.signatureCreate` / `Delete` / `Edit` / `Defaults`); the body is saved with Save, when another
 //!   signature is selected, and with OK. Cancel drops unsaved body edits.
-//! - **Personal Stationery**: the font for new messages (UI preference `stationery.font`).
+//! - **Personal Stationery**: the font for new messages (engine settings `mail.compose.fontFamily` and
+//!   `mail.compose.fontSizePt`, applied to every new message).
 
 use std::sync::{Arc, Mutex};
 
@@ -153,9 +154,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             account: app.s.mailbox.accounts.iter().find(|a| !a.address.trim().is_empty()).map(|a| a.id.0),
             prompt: None,
             error: None,
-            font: common::pref(ctx, "stationery.font")
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "Inter 11pt".into()),
+            font: font_choice(app),
         }
     };
     with_state(ctx, app, uid, init, |st, app| {
@@ -188,7 +187,18 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     if let Ok(mut ed) = st.editor.lock() {
                         save_body(app, &mut ed);
                     }
-                    common::set_pref(ctx, "stationery.font", json!(st.font));
+                    let (family, size) = parse_font_choice(&st.font);
+                    let err = common::set_options(
+                        app,
+                        &[
+                            ("mail.compose.fontFamily", json!(family)),
+                            ("mail.compose.fontSizePt", json!(size)),
+                        ],
+                    );
+                    if let Some(e) = err {
+                        st.error = Some(e);
+                        return Out::Keep;
+                    }
                     Out::Close
                 }
                 Some(false) => Out::Close,
@@ -450,17 +460,42 @@ fn defaults(ui: &mut egui::Ui, app: &mut App, st: &mut SigState, uid: u64, list:
     });
 }
 
+/// Fonts offered for new messages ("Family Npt"; the first keeps the default body font).
+const FONT_CHOICES: [&str; 5] =
+    [DEFAULT_FONT, "Inter 11pt", "Carlito 11pt", "Liberation Serif 12pt", "Liberation Mono 10pt"];
+const DEFAULT_FONT: &str = "Default font";
+
+/// "Family Npt" → (family, size); the default choice → ("", 0).
+fn parse_font_choice(choice: &str) -> (String, i64) {
+    if choice == DEFAULT_FONT {
+        return (String::new(), 0);
+    }
+    match choice.rsplit_once(' ') {
+        Some((family, size)) => {
+            let pt =
+                size.trim_end_matches("pt").parse::<i64>().ok().filter(|p| (1..=72).contains(p)).unwrap_or(0);
+            (family.trim().to_owned(), pt)
+        }
+        None => (choice.trim().to_owned(), 0),
+    }
+}
+
+/// The current new-message font as a choice text.
+fn font_choice(app: &App) -> String {
+    let family = app.s.settings.text("mail.compose.fontFamily");
+    let size = app.s.settings.int("mail.compose.fontSizePt");
+    match (family.trim().is_empty(), size) {
+        (true, _) => DEFAULT_FONT.to_owned(),
+        (false, 0) => family,
+        (false, n) => format!("{family} {n}pt"),
+    }
+}
+
 fn stationery_tab(ui: &mut egui::Ui, app: &mut App, st: &mut SigState, uid: u64) {
     common::heading(ui, app, "New mail messages");
     ui.horizontal(|ui| {
         ui.label("Font:");
-        common::combo(
-            ui,
-            ("sfont", uid),
-            &mut st.font,
-            &["Inter 11pt", "Carlito 11pt", "Liberation Serif 12pt", "Liberation Mono 10pt"],
-            200.0,
-        );
+        common::combo(ui, ("sfont", uid), &mut st.font, &FONT_CHOICES, 200.0);
     });
     muted(ui, app, "The font applies to new messages you write.");
 }

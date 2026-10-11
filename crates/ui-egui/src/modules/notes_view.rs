@@ -1,5 +1,9 @@
-//! Notes module: My Notes (folder pane) and the sticky-note views (large icons grid, small icons, list).
-//! Notes are edited in place; the text is saved with `notes.update` when the edit box loses focus.
+//! Notes module: My Notes (folder pane) and the folder's current view: Icon (large icons, small icons or a
+//! list; icons can be dragged anywhere and View › Line Up Icons snaps them back to the grid), Notes List and
+//! Last 7 Days (lists, newest first). Notes are edited in place; the text is saved with `notes.update` when
+//! the edit box loses focus. The reading pane (off by default) shows the selected note. The order and the
+//! filter come from the engine (`mailcraft_engine::cmd::notes::view_rows`), the view and the icon
+//! arrangement from the folder's module view.
 
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Modifiers, Rect, ScrollArea, Sense,
@@ -8,12 +12,14 @@ use egui::{
 use serde_json::{Value, json};
 
 use mailcraft_engine::cmd::calendar::pim::Kind;
-use mailcraft_engine::cmd::notes::{IconMode, NotesViewState, grid_order, title};
+use mailcraft_engine::cmd::notes::{IconMode, NotesViewState, title};
+use mailcraft_engine::cmd::view::modules::{ModuleKind, ModuleView};
 use mailcraft_model::{FolderKind, ItemId, ListTime, Note, NoteColor};
 
 use super::common::{
-    ModState, a11y, blend, child, current_folder, empty_message, folder_rows, group_header, load, note_fill,
-    paint_text_clipped, pane_bg, select_folder, split_folder_pane, store,
+    ModState, a11y, blend, change_view, child, current_folder, empty_message, folder_rows, group_header,
+    load, module_view, note_fill, paint_text_clipped, pane_bg, pane_separator, reading_split, row_height,
+    select_folder, select_item, split_folder_pane, store, sync_selection, todo_bar_strip, view_switch,
 };
 use crate::App;
 
@@ -41,9 +47,41 @@ pub(super) fn apply_view(st: &mut ModState, v: &Value) {
     }
 }
 
+/// The Notes views with their toolbar icons.
+const VIEWS: [(&str, &str); 3] = [("Icon", "note"), ("Notes List", "bullets"), ("Last 7 Days", "today")];
+
+/// Applies an icon arrangement requested with `modules::set_notes_view` once.
+fn legacy_request(app: &mut App, st: &mut ModState) {
+    if st.notes_view != st.notes_view_seen {
+        st.notes_view_seen = st.notes_view.clone();
+        let mode = match st.notes_view.icon_mode {
+            IconMode::Large => "large",
+            IconMode::Small => "small",
+            IconMode::List => "list",
+        };
+        app.run("notes.iconView", json!({ "mode": mode, "view": st.notes_view }));
+    }
+}
+
+/// Notes of the current folder's view, in order.
+fn order(app: &App) -> Vec<ItemId> {
+    current_folder(app, Kind::Note)
+        .map(|f| mailcraft_engine::cmd::notes::view_rows(&app.s, f).into_iter().map(|r| r.id).collect())
+        .unwrap_or_default()
+}
+
 pub(super) fn show(ui: &mut Ui, app: &mut App) {
     let ctx = ui.ctx().clone();
     let mut st = load(&ctx);
+    super::common::ensure_folder(app, Kind::Note);
+    legacy_request(app, &mut st);
+    let view = module_view(app, current_folder(app, Kind::Note), ModuleKind::Notes);
+    if view.lined_up && !st.note_pos.is_empty() {
+        // Line Up Icons.
+        st.note_pos.clear();
+    }
+    let ids = order(app);
+    sync_selection(app, |_, id| ids.contains(&id));
     let full = ui.max_rect();
     let (pane, main) = split_folder_pane(ui, app);
     if let Some(p) = pane {
@@ -54,12 +92,13 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
             if let (Some(f), _) = folder_rows(ui, app, FolderKind::Notes, current, None) {
                 commit_edit(app, &mut st);
                 select_folder(app, f);
-                app.ui.module_selection = None;
+                select_item(app, None);
             }
         });
     }
+    let main = todo_bar_strip(ui, app, main);
     pane_bg(ui, main, app.theme.reading);
-    child(ui, main, "mc-notes-main", |ui| content(ui, app, &mut st));
+    child(ui, main, "mc-notes-main", |ui| content(ui, app, &mut st, &view, &ids));
     keyboard(&ctx, app, &mut st);
     ui.expand_to_include_rect(full);
     store(&ctx, st);
@@ -90,7 +129,7 @@ fn keyboard(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
     };
     if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)) {
         app.run("notes.delete", json!({ "id": sel.0 }));
-        app.ui.module_selection = None;
+        select_item(app, None);
     } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
         start_edit(app, st, sel);
     }
@@ -105,13 +144,21 @@ fn new_note(app: &mut App, st: &mut ModState) {
     if let Some(out) = app.run("notes.new", p)
         && let Some(id) = out.get("id").and_then(Value::as_u64)
     {
-        app.ui.module_selection = Some(id);
+        select_item(app, Some(id));
         st.note_edit = Some((id, String::new()));
         st.note_focus = true;
     }
 }
 
-fn content(ui: &mut Ui, app: &mut App, st: &mut ModState) {
+fn icon_mode_name(m: IconMode) -> &'static str {
+    match m {
+        IconMode::Large => "large",
+        IconMode::Small => "small",
+        IconMode::List => "list",
+    }
+}
+
+fn content(ui: &mut Ui, app: &mut App, st: &mut ModState, view: &ModuleView, order: &[ItemId]) {
     let rect = ui.max_rect();
     let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 44.0));
     child(ui, bar.shrink2(vec2(10.0, 7.0)), "mc-notes-bar", |ui| {
@@ -120,15 +167,25 @@ fn content(ui: &mut Ui, app: &mut App, st: &mut ModState) {
                 new_note(app, st);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                for (mode, icon, label) in [
-                    (IconMode::List, "bullets", "Notes List"),
-                    (IconMode::Small, "view", "Small Icons"),
-                    (IconMode::Large, "note", "Icon"),
-                ] {
-                    if crate::widgets::toggle_button(ui, app, icon, label, st.notes_view.icon_mode == mode)
-                        .clicked()
-                    {
-                        st.notes_view.icon_mode = mode;
+                if let Some(v) = view_switch(ui, app, &VIEWS, &view.view) {
+                    commit_edit(app, st);
+                    change_view(app, &v);
+                }
+                if view.view == "Icon" {
+                    ui.separator();
+                    for (mode, icon, label) in [
+                        (IconMode::List, "bullets", "List"),
+                        (IconMode::Small, "view", "Small Icons"),
+                        (IconMode::Large, "note", "Large Icons"),
+                    ] {
+                        if crate::widgets::toggle_button(ui, app, icon, label, view.icon_mode == mode).clicked()
+                            && view.icon_mode != mode
+                        {
+                            app.run(
+                                "notes.iconView",
+                                json!({ "mode": icon_mode_name(mode), "view": { "iconMode": icon_mode_name(mode), "linedUp": view.lined_up } }),
+                            );
+                        }
                     }
                 }
             });
@@ -136,25 +193,74 @@ fn content(ui: &mut Ui, app: &mut App, st: &mut ModState) {
     });
     ui.painter().hline(rect.x_range(), bar.max.y, Stroke::new(1.0, app.theme.separator));
     let body = Rect::from_min_max(pos2(rect.min.x, bar.max.y + 1.0), rect.max);
-    let order = grid_order(&app.s);
     if order.is_empty() {
-        empty_message(ui, body, app, "No notes", "Jot something down with New Note.");
+        let hint = if view.view == "Last 7 Days" {
+            "No note changed in the last seven days."
+        } else {
+            "Jot something down with New Note."
+        };
+        empty_message(ui, body, app, "No notes", hint);
         return;
     }
+    let (list_rect, pane) = reading_split(body, view.reading_pane, (body.width() * 0.6).max(360.0), 0.6);
     // Clicking the background ends editing.
-    let bg = ui.interact(body, Id::new("mc-notes-bg"), Sense::click());
+    let bg = ui.interact(list_rect, Id::new("mc-notes-bg"), Sense::click());
     if bg.clicked() {
         commit_edit(app, st);
-        app.ui.module_selection = None;
+        select_item(app, None);
     }
-    child(ui, body.shrink(10.0), "mc-notes-body", |ui| {
-        ScrollArea::vertical().id_salt("mc-notes-scroll").auto_shrink([false, false]).show(ui, |ui| match st
-            .notes_view
-            .icon_mode
-        {
-            IconMode::List => list(ui, app, st, &order),
-            mode => grid(ui, app, st, &order, mode == IconMode::Small),
+    let icons = view.view == "Icon" && view.icon_mode != IconMode::List;
+    child(ui, list_rect.shrink(10.0), "mc-notes-body", |ui| {
+        ScrollArea::vertical().id_salt("mc-notes-scroll").auto_shrink([false, false]).show(ui, |ui| {
+            if icons {
+                grid(ui, app, st, order, view);
+            } else {
+                list(ui, app, st, order);
+            }
         });
+    });
+    if let Some(p) = pane {
+        pane_separator(ui, app, list_rect, p);
+        reading(ui, app, st, p);
+    }
+}
+
+/// The reading pane: the selected note's text.
+fn reading(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
+    let Some(id) = app.ui.module_selection.map(ItemId).filter(|i| app.s.mailbox.notes.contains_key(i)) else {
+        empty_message(ui, rect, app, "No note selected", "Pick a note to read it here.");
+        return;
+    };
+    let Some(n) = app.s.mailbox.notes.get(&id).cloned() else { return };
+    child(ui, rect.shrink2(vec2(20.0, 14.0)), "mc-notes-reading", |ui| {
+        ui.horizontal(|ui| {
+            let (sw, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+            ui.painter().rect_filled(sw, CornerRadius::same(3), note_fill(n.color, app.theme.dark));
+            let t = title(&n);
+            ui.label(
+                egui::RichText::new(if t.is_empty() { "(Empty note)" } else { &t })
+                    .size(18.0)
+                    .color(app.theme.text),
+            );
+            if crate::widgets::icon_button(ui, app, "settings", "Edit", true).clicked() {
+                start_edit(app, st, id);
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "Modified {}",
+                ListTime::short_date_time(n.modified, app.s.tz_offset_min)
+            ))
+            .size(11.5)
+            .color(app.theme.text_muted),
+        );
+        ui.separator();
+        ScrollArea::vertical().id_salt("mc-notes-reading-scroll").auto_shrink([false, false]).show(
+            ui,
+            |ui| {
+                ui.label(egui::RichText::new(&n.text).color(app.theme.text));
+            },
+        );
     });
 }
 
@@ -185,12 +291,20 @@ fn note_menu(ui: &mut Ui, app: &mut App, st: &mut ModState, id: ItemId) {
             }
         }
     });
+    if ui.button("Forward").clicked() {
+        app.run("notes.forward", json!({ "ids": [id.0] }));
+        ui.close();
+    }
+    if ui.button("Move to Folder...").clicked() {
+        app.run("notes.move", json!({ "ids": [id.0] }));
+        ui.close();
+    }
     if ui.button("Delete").clicked() {
         if st.note_edit.as_ref().is_some_and(|(e, _)| *e == id.0) {
             st.note_edit = None;
         }
         app.run("notes.delete", json!({ "id": id.0 }));
-        app.ui.module_selection = None;
+        select_item(app, None);
         ui.close();
     }
 }
@@ -201,14 +315,14 @@ fn note_click(app: &mut App, st: &mut ModState, resp: &egui::Response, id: ItemI
     if resp.clicked() && !editing {
         let was_selected = app.ui.module_selection == Some(id.0);
         commit_edit(app, st);
-        app.ui.module_selection = Some(id.0);
+        select_item(app, Some(id.0));
         if was_selected {
             start_edit(app, st, id);
         }
     }
     if resp.double_clicked() && !editing {
         commit_edit(app, st);
-        app.ui.module_selection = Some(id.0);
+        select_item(app, Some(id.0));
         start_edit(app, st, id);
     }
 }
@@ -292,26 +406,45 @@ fn paint_note(ui: &Ui, app: &App, card: Rect, n: &Note, selected: bool, small: b
     );
 }
 
-fn grid(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], small: bool) {
+fn grid(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &ModuleView) {
+    let small = view.icon_mode == IconMode::Small;
     let (w, h) = if small { (160.0, 64.0) } else { (200.0, 180.0) };
     let gap = 16.0;
     let cols = ((ui.available_width() + gap) / (w + gap)).floor().max(1.0) as usize;
     let rows = order.len().div_ceil(cols);
-    let (area, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), rows as f32 * (h + gap) + 4.0), Sense::hover());
+    // Room for icons dragged below or right of the grid.
+    let (mut need_w, mut need_h) = (ui.available_width(), rows as f32 * (h + gap) + 4.0);
+    for (x, y) in st.note_pos.values() {
+        need_w = need_w.max(x + w);
+        need_h = need_h.max(y + h + gap);
+    }
+    let (area, _) = ui.allocate_exact_size(vec2(need_w, need_h), Sense::hover());
     for (k, &id) in order.iter().enumerate() {
         let Some(n) = app.s.mailbox.notes.get(&id).cloned() else { continue };
-        let card = Rect::from_min_size(
-            pos2(area.min.x + (k % cols) as f32 * (w + gap), area.min.y + (k / cols) as f32 * (h + gap)),
-            vec2(w, h),
-        );
+        let slot = vec2((k % cols) as f32 * (w + gap), (k / cols) as f32 * (h + gap));
+        let off = st.note_pos.get(&id.0).map_or(slot, |(x, y)| vec2(*x, *y));
+        let card = Rect::from_min_size(area.min + off, vec2(w, h));
         let editing = st.note_edit.as_ref().is_some_and(|(e, _)| *e == id.0);
-        let resp = ui.interact(card, Id::new(("mc-note", id.0)), Sense::click());
+        let sense = if editing { Sense::click() } else { Sense::click_and_drag() };
+        let resp = ui.interact(card, Id::new(("mc-note", id.0)), sense);
         let t = title(&n);
         a11y(&resp, WidgetType::Button, if t.is_empty() { "(Empty note)" } else { &t });
         paint_note(ui, app, card, &n, app.ui.module_selection == Some(id.0), small, editing);
         if editing {
             edit_box(ui, app, st, card.shrink2(vec2(8.0, 12.0)), id);
+        }
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            let (x, y) = st.note_pos.get(&id.0).copied().unwrap_or((slot.x, slot.y));
+            st.note_pos.insert(id.0, ((x + d.x).max(0.0), (y + d.y).max(0.0)));
+        }
+        if resp.drag_started() && view.lined_up {
+            // Icons are no longer lined up (Line Up Icons becomes useful again).
+            let mode = icon_mode_name(view.icon_mode);
+            app.run(
+                "notes.iconView",
+                json!({ "mode": mode, "view": { "iconMode": mode, "linedUp": false } }),
+            );
         }
         note_click(app, st, &resp, id);
         resp.context_menu(|ui| note_menu(ui, app, st, id));
@@ -323,7 +456,7 @@ fn list(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId]) {
     for &id in order {
         let Some(n) = app.s.mailbox.notes.get(&id).cloned() else { continue };
         let editing = st.note_edit.as_ref().is_some_and(|(e, _)| *e == id.0);
-        let h = if editing { 120.0 } else { 46.0 };
+        let h = if editing { 120.0 } else { row_height(app, 46.0) };
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
         let t = title(&n);
         a11y(&resp, WidgetType::Button, if t.is_empty() { "(Empty note)" } else { &t });
@@ -393,6 +526,25 @@ fn list(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_view_request_reaches_the_engine() {
+        let mut app = App::new(mailcraft_engine::sample::sample_session());
+        let notes =
+            app.s.mailbox.folders.values().find(|f| f.kind == FolderKind::Notes).map(|f| f.id).unwrap();
+        app.run("nav.selectFolder", json!({"folder": notes.0}));
+        let mut st = ModState::default();
+        apply_view(&mut st, &json!("small"));
+        legacy_request(&mut app, &mut st);
+        let v = mailcraft_engine::cmd::view::modules::state(&app.s, notes, ModuleKind::Notes);
+        assert_eq!(v.icon_mode, IconMode::Small);
+        // Applied once: changing the engine view later is not undone.
+        app.run("notes.iconView", json!({"mode": "large"}));
+        legacy_request(&mut app, &mut st);
+        let v = mailcraft_engine::cmd::view::modules::state(&app.s, notes, ModuleKind::Notes);
+        assert_eq!(v.icon_mode, IconMode::Large);
+        assert_eq!(order(&app).len(), 2);
+    }
 
     #[test]
     fn view_from_results() {

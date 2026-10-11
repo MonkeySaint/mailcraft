@@ -3,19 +3,36 @@
 //!
 //! **View state.** The session has no calendar fields (its interface is frozen), so the arrangement
 //! commands are pure functions of a [`CalendarViewState`] that the UI holds (commit 4): the caller passes
-//! the current state as `{"view": {...}}` (omitted = the default Month view on today) and the command
-//! returns the new state as `{"view": {...}}`. Toggles (`calendar.overlay`, `calendar.workingHours`) flip
-//! the passed state unless `{"on": bool}` is given. `calendar.color` returns the chosen colour for the
-//! calendar folder; the UI keeps it per folder. [`view_enabled`] answers the view-dependent enable rules
-//! (Time Scale, Working Hours and Daily Task List are unavailable in Month view).
+//! the current state as `{"view": {...}}` (omitted = the current calendar's saved view, else the default
+//! Month view on today) and the command returns the new state as `{"view": {...}}`. Toggles
+//! (`calendar.overlay`, `calendar.workingHours`) flip the passed state unless `{"on": bool}` is given. Each
+//! new state is also saved on the calendar folder ([`views`]). [`view_enabled`] answers the view-dependent
+//! enable rules (Time Scale, Working Hours and Daily Task List are unavailable in Month view). The View
+//! tab's generic commands (Change View, Arrange By, Reading Pane, To-Do Bar, View Settings, Reset View) are
+//! answered for the Calendar module by [`module_view`].
+//!
+//! **Calendars.** Per-calendar properties (colour, internet subscription, saved view, time zones) live in
+//! [`props`]; `calendar.color` sets the colour (Automatic = a palette colour per calendar,
+//! [`calendar_color`]). Add Calendar subscribes to internet calendars ([`subscribe`]; read-only, refreshed
+//! by `calendar.refreshCalendar`), copies an .ics file into a new calendar, or makes a blank one.
 //!
 //! **Items.** Appointments live in calendar folders (`Mailbox.appointments`). `calendar.newAppointment`
 //! creates one when field params are given (defaults: starts at the next half hour, lasts 30 minutes,
 //! reminder 15 minutes before) and otherwise asks the UI to open a blank appointment window.
 //! `calendar.newMeeting` creates a meeting (an appointment with attendees) and opens a compose with the
-//! invitation (plain-text summary plus an RFC 5545 `text/calendar` attachment).
+//! invitation (plain-text summary plus an RFC 5545 `text/calendar` attachment). `calendar.moveItem` and
+//! `calendar.resize` are the day/week views' drag and edge-drag. An appointment may name an IANA time zone
+//! ([`tz`]); its times are then entered in that zone and its recurrences expand in that zone's wall-clock
+//! time across daylight-saving changes.
 
-use serde::{Deserialize, Serialize};
+pub mod props;
+pub mod subscribe;
+pub mod tz;
+pub mod views;
+
+pub use views::{module_view, saved_view, second_zone, work_hours, work_week};
+
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use self::pim::Kind;
@@ -38,7 +55,7 @@ pub use crate::reminders;
 pub mod pim {
     use serde_json::{Value, json};
 
-    use crate::cmd::util::{opt_bool, opt_folder, opt_u64, req_str};
+    use crate::cmd::util::{opt_bool, opt_folder, opt_str, opt_u64};
     use crate::{CmdError, CmdResult, Notice, Session};
     use mailcraft_model::{
         Address, Category, DateTime, FolderId, FolderKind, FolderRole, ItemId, Mailbox, dates,
@@ -363,8 +380,8 @@ pub mod pim {
         Ok(json!({ "moved": ids_json(&out) }))
     }
 
-    /// Generic `<area>.categorize {name, on?}` / `{clear: true}`. Without `on`, toggles: removes the
-    /// category when every target has it, else adds it to all.
+    /// Generic `<area>.categorize {name?, on?}` / `{clear: true}` (no name = the Quick Click category).
+    /// Without `on`, toggles: removes the category when every target has it, else adds it to all.
     pub fn run_categorize(s: &mut Session, p: &Value, kind: Kind) -> CmdResult {
         let ids = require_targets(s, p, kind)?;
         if opt_bool(p, "clear") == Some(true) {
@@ -375,7 +392,13 @@ pub mod pim {
             }
             return Ok(json!({ "ids": ids_json(&ids), "cleared": true }));
         }
-        let name = req_str(p, "name")?;
+        // Without a name: the Quick Click category.
+        let name = match opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_owned(),
+            None => crate::cmd::categories::quick_click_category(s)
+                .ok_or_else(|| CmdError::Params("`name` required (there are no categories)".into()))?,
+        };
+        let name = name.as_str();
         let cat = Category::find(&s.mailbox.categories, name)
             .map(|c| c.name.clone())
             .ok_or_else(|| CmdError::Params(format!("no category named \"{name}\"")))?;
@@ -554,48 +577,35 @@ pub mod pim {
 // View state
 // ---------------------------------------------------------------------------------------------------------
 
-/// Calendar arrangement (Day, Work Week, Week, Month, Schedule View).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CalendarMode {
-    Day,
-    WorkWeek,
-    Week,
-    #[default]
-    Month,
-    Schedule,
-}
+pub use mailcraft_model::calendar::{
+    CalendarColumn, CalendarCurrentView, CalendarMode, CalendarProps, CalendarSource, CalendarTimeZones,
+    CalendarViewState, DailyTaskList, Subscription,
+};
 
-impl CalendarMode {
-    pub fn parse(s: &str) -> Option<CalendarMode> {
-        match s {
-            "day" => Some(CalendarMode::Day),
-            "workWeek" => Some(CalendarMode::WorkWeek),
-            "week" => Some(CalendarMode::Week),
-            "month" => Some(CalendarMode::Month),
-            "schedule" => Some(CalendarMode::Schedule),
-            _ => None,
-        }
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            CalendarMode::Day => "day",
-            CalendarMode::WorkWeek => "workWeek",
-            CalendarMode::Week => "week",
-            CalendarMode::Month => "month",
-            CalendarMode::Schedule => "schedule",
-        }
-    }
-}
-
-/// Daily Task List display under day/week views.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DailyTaskList {
-    #[default]
-    Normal,
-    Minimized,
-    Off,
+/// Daily Task List: unfinished tasks per local day in `[from_day, to_day)` (days since 1970-01-01 in offset
+/// `tz`), each on its due day (else its start day); overdue tasks show on `today`. Sorted by day, then due
+/// time and subject; at most `max`.
+pub fn tasks_for_days(
+    mb: &mailcraft_model::Mailbox,
+    tz: i32,
+    today: i64,
+    from_day: i64,
+    to_day: i64,
+    max: usize,
+) -> Vec<(i64, ItemId)> {
+    let mut out: Vec<(i64, i64, String, ItemId)> = mb
+        .tasks
+        .values()
+        .filter(|t| t.status != mailcraft_model::TaskStatus::Completed && t.completed.is_none())
+        .filter(|t| mb.folder(t.folder).is_some_and(|f| f.role != Some(FolderRole::DeletedItems)))
+        .filter_map(|t| {
+            let when = t.due.or(t.start)?;
+            let day = when.day_number(tz).max(today);
+            (from_day..to_day).contains(&day).then(|| (day, when.unix, t.subject.to_lowercase(), t.id))
+        })
+        .collect();
+    out.sort();
+    out.into_iter().take(max).map(|(d, _, _, id)| (d, id)).collect()
 }
 
 /// Allowed Time Scale slot sizes (minutes).
@@ -605,36 +615,31 @@ pub const TIME_SCALES: [u8; 6] = [60, 30, 15, 10, 6, 5];
 pub const CALENDAR_COLORS: [&str; 10] =
     ["Automatic", "Blue", "Green", "Orange", "Navy Blue", "Yellow", "Teal", "Magenta", "Brown", "Dark Red"];
 
-/// The calendar view the UI shows. Held by the UI; passed to and returned from view commands.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct CalendarViewState {
-    pub mode: CalendarMode,
-    /// Selected date "YYYY-MM-DD" (empty = today).
-    pub date: String,
-    /// Days shown in Day arrangement (1, or 7 for Next 7 Days).
-    pub days: u8,
-    /// Time Scale slot size in minutes.
-    pub time_scale: u8,
-    /// Show only working hours in day/week views.
-    pub working_hours: bool,
-    /// Overlay (true) vs side-by-side when several calendars are shown.
-    pub overlay: bool,
-    pub daily_task_list: DailyTaskList,
-}
+/// RGB of the named colours of [`CALENDAR_COLORS`] (Automatic picks one of them per calendar).
+pub const CALENDAR_RGB: [(&str, [u8; 3]); 9] = [
+    ("Blue", [0x3b, 0x78, 0xc2]),
+    ("Green", [0x4f, 0x9a, 0x4a]),
+    ("Orange", [0xe0, 0x88, 0x3a]),
+    ("Navy Blue", [0x2b, 0x3f, 0x7a]),
+    ("Yellow", [0xe6, 0xc3, 0x39]),
+    ("Teal", [0x2a, 0x8c, 0x8c]),
+    ("Magenta", [0xb4, 0x4b, 0x9a]),
+    ("Brown", [0x8a, 0x5a, 0x3a]),
+    ("Dark Red", [0x9a, 0x2a, 0x2a]),
+];
 
-impl Default for CalendarViewState {
-    fn default() -> Self {
-        Self {
-            mode: CalendarMode::Month,
-            date: String::new(),
-            days: 1,
-            time_scale: 30,
-            working_hours: false,
-            overlay: false,
-            daily_task_list: DailyTaskList::Normal,
-        }
+/// The colour a calendar is drawn in: its View › Color, else (Automatic) the palette entry for its position
+/// among the calendar folders (the first calendar blue, the next green, …).
+pub fn calendar_color(mb: &mailcraft_model::Mailbox, folder: FolderId) -> (&'static str, [u8; 3]) {
+    let chosen = props::read(mb, folder).color;
+    if let Some(c) =
+        chosen.as_deref().and_then(|c| CALENDAR_RGB.iter().find(|(n, _)| n.eq_ignore_ascii_case(c)))
+    {
+        return *c;
     }
+    let pos = mb.folders.values().filter(|f| f.kind == FolderKind::Calendar).position(|f| f.id == folder);
+    let fallback = ("Blue", [0x3b, 0x78, 0xc2]);
+    pos.and_then(|i| CALENDAR_RGB.get(i % CALENDAR_RGB.len())).copied().unwrap_or(fallback)
 }
 
 /// View-dependent enable rules for the UI (`None` = enabled).
@@ -650,8 +655,9 @@ pub fn view_enabled(view: &CalendarViewState, id: &str) -> Option<&'static str> 
 }
 
 /// Reads `params.view` (or the default) and normalises it (date defaults to today; out-of-range values
-/// reset).
-fn view_param(s: &Session, p: &Value) -> Result<CalendarViewState, CmdError> {
+/// reset). Also re-reads the display offset of a named time zone (it moves with daylight saving).
+fn view_param(s: &mut Session, p: &Value) -> Result<CalendarViewState, CmdError> {
+    views::refresh_time_zone(s);
     let mut v = match p.get("view") {
         None | Some(Value::Null) => CalendarViewState::default(),
         Some(x) => serde_json::from_value::<CalendarViewState>(x.clone())
@@ -669,8 +675,10 @@ fn view_param(s: &Session, p: &Value) -> Result<CalendarViewState, CmdError> {
     Ok(v)
 }
 
+/// Shows the Calendar module with view `v`, saves it on the current calendar and returns `{"view": v}`.
 fn view_result(s: &mut Session, v: &CalendarViewState) -> CmdResult {
     s.view.module = Module::Calendar;
+    views::save_view(s, v);
     Ok(json!({ "view": v }))
 }
 
@@ -688,6 +696,10 @@ fn run_arrange(s: &mut Session, p: &Value) -> CmdResult {
     let mut v = view_param(s, p)?;
     v.mode = mode;
     v.days = 1;
+    // An arrangement shows the calendar grid (leaving the List / Active tables).
+    if v.current.is_table() {
+        v.current = CalendarCurrentView::Calendar;
+    }
     view_result(s, &v)
 }
 
@@ -796,74 +808,395 @@ fn run_color(s: &mut Session, p: &Value) -> CmdResult {
         .and_then(|c| CALENDAR_COLORS.iter().find(|x| x.eq_ignore_ascii_case(c.trim())))
         .ok_or_else(|| CmdError::Params(format!("`color` must be one of {}", CALENDAR_COLORS.join(", "))))?;
     let folder = target_calendar(s, p)?;
+    let stored = (*color != "Automatic").then(|| (*color).to_owned());
+    props::update(&mut s.mailbox, folder, |x| x.color = stored);
     s.view.module = Module::Calendar;
-    Ok(json!({ "calendar": folder.0, "color": color }))
+    let (name, rgb) = calendar_color(&s.mailbox, folder);
+    Ok(json!({
+        "calendar": folder.0,
+        "color": color,
+        "shown": name,
+        "rgb": format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]),
+    }))
 }
 
+/// Change Time Zone: `{zone}` (IANA id) or `{offsetMin}` sets the calendar's zone; `label`, `secondZone`,
+/// `secondLabel`, `showSecond` set the labels and the second zone shown in day and week views. No params =
+/// open the dialog.
 fn run_change_time_zone(s: &mut Session, p: &Value) -> CmdResult {
-    match p.get("offsetMin") {
-        None | Some(Value::Null) => {
-            let params = json!({ "offsetMin": s.tz_offset_min });
-            pim::dialog(s, "timeZone", params)
+    let keys = ["offsetMin", "zone", "label", "secondZone", "secondLabel", "showSecond", "swap"];
+    if !pim::has_any(p, &keys) {
+        let z = views::time_zones(s);
+        let now = s.now().unix;
+        let zones: Vec<Value> =
+            tz::ZONES.iter().map(|id| json!({ "id": id, "label": tz::label(id, now) })).collect();
+        let params = json!({ "offsetMin": s.tz_offset_min, "timeZones": z, "zones": zones });
+        return pim::dialog(s, "timeZone", params);
+    }
+    let mut z = views::time_zones(s);
+    let text = |key: &str| -> Result<Option<String>, CmdError> {
+        match pim::text(p, key)? {
+            Some(t) if t.chars().count() > 64 => Err(CmdError::Params(format!("`{key}` is too long"))),
+            Some(t) => Ok(Some(t.trim().chars().filter(|c| !c.is_control()).collect())),
+            None => Ok(None),
         }
+    };
+    let zone_param = |key: &str| -> Result<Option<String>, CmdError> {
+        match text(key)? {
+            None => Ok(None),
+            Some(t) if t.is_empty() => Ok(Some(String::new())),
+            Some(t) => tz::canonical(&t)
+                .map(Some)
+                .ok_or_else(|| CmdError::Params(format!("`{key}`: unknown time zone `{t}`"))),
+        }
+    };
+    if let Some(zone) = zone_param("zone")? {
+        z.zone = zone;
+    }
+    if let Some(l) = text("label")? {
+        z.label = l;
+    }
+    if let Some(zone) = zone_param("secondZone")? {
+        z.second_zone = zone;
+    }
+    if let Some(l) = text("secondLabel")? {
+        z.second_label = l;
+    }
+    if let Some(on) = pim::flag(p, "showSecond")? {
+        z.show_second = on;
+    }
+    if pim::flag(p, "swap")? == Some(true) {
+        if !tz::known(&z.zone) || !tz::known(&z.second_zone) {
+            return Err(CmdError::Params("swapping needs two named time zones".into()));
+        }
+        std::mem::swap(&mut z.zone, &mut z.second_zone);
+        std::mem::swap(&mut z.label, &mut z.second_label);
+    }
+    if z.show_second && !tz::known(&z.second_zone) {
+        return Err(CmdError::Params("choose the second time zone (`secondZone`)".into()));
+    }
+    let now = s.now().unix;
+    let offset = match p.get("offsetMin") {
+        None | Some(Value::Null) => tz::offset_at(&z.zone, now),
         Some(v) => {
             let off = v
                 .as_i64()
                 .filter(|o| (-14 * 60..=14 * 60).contains(o))
                 .and_then(|o| i32::try_from(o).ok())
                 .ok_or_else(|| CmdError::Params("`offsetMin` must be between -840 and 840".into()))?;
-            s.tz_offset_min = off;
-            Ok(json!({ "offsetMin": off }))
+            // A bare offset replaces a named zone that disagrees with it.
+            if tz::offset_at(&z.zone, now) != Some(off) {
+                z.zone.clear();
+            }
+            Some(off)
         }
+    };
+    if let Some(off) = offset {
+        s.tz_offset_min = off;
     }
+    let root = pim::default_folder(s, Kind::Appointment);
+    if let Some(f) = root {
+        let keep = (z != CalendarTimeZones::default()).then(|| z.clone());
+        props::update(&mut s.mailbox, f, |x| x.time_zones = keep);
+    }
+    // Mirror into File › Options › Calendar › Time zones (numeric offsets there).
+    views::set_option(s, "calendar.timeZone", json!(s.tz_offset_min));
+    views::set_option(s, "calendar.timeZoneLabel", json!(z.label));
+    if let Some(off) = tz::offset_at(&z.second_zone, now) {
+        views::set_option(s, "calendar.secondTimeZoneOffset", json!(off));
+    }
+    views::set_option(s, "calendar.secondTimeZone", json!(z.show_second));
+    views::set_option(s, "calendar.secondTimeZoneLabel", json!(z.second_label));
+    Ok(json!({ "offsetMin": s.tz_offset_min, "timeZones": z }))
 }
 
+/// Add Calendar. `source`:
+/// - `internet` `{url, name?, refreshMin?, data?, fetch?}`: subscribes to an iCalendar URL (read-only
+///   calendar, refreshed periodically). Fetches at once unless `fetch: false` or the caller passes the
+///   fetched `data`.
+/// - `file` `{path | data, name?}`: a new calendar holding a copy of an .ics file's events.
+/// - `blank` `{name, parent?}`: Create New Blank Calendar.
+/// - `addressBook`, `roomList`, `shared`: other people's and rooms' calendars live on an Exchange server,
+///   which MailCraft does not connect to; refused with the reason.
 fn run_add_calendar(s: &mut Session, p: &Value) -> CmdResult {
     let Some(source) = opt_str(p, "source") else {
         return pim::dialog(s, "addCalendar", json!({}));
     };
-    if !matches!(source, "addressBook" | "roomList" | "internet" | "shared") {
-        return Err(CmdError::Params("`source` must be addressBook|roomList|internet|shared".into()));
+    match source {
+        "internet" => add_internet_calendar(s, p),
+        "file" => add_file_calendar(s, p),
+        "blank" => add_blank_calendar(s, p),
+        "addressBook" | "roomList" | "shared" => Err(CmdError::Disabled(
+            "opening other people's, rooms' and shared calendars needs a Microsoft Exchange account, which \
+             MailCraft does not support; subscribe to an internet calendar (From Internet) instead"
+                .into(),
+        )),
+        _ => Err(CmdError::Params("`source` must be internet|file|blank|addressBook|roomList|shared".into())),
     }
-    let root = pim::default_folder(s, Kind::Appointment)
-        .ok_or_else(|| CmdError::Failed("there is no calendar folder".into()))?;
-    let (name, remote) = if source == "internet" {
-        let Some(url) = opt_str(p, "url").map(str::trim).filter(|u| !u.is_empty()) else {
-            return pim::dialog(s, "addCalendar", json!({ "source": source }));
-        };
-        let lower = url.to_ascii_lowercase();
-        let rest = ["https://", "http://", "webcal://", "webcals://"]
-            .iter()
-            .find_map(|scheme| lower.strip_prefix(scheme).map(|_| url.get(scheme.len()..).unwrap_or("")))
-            .ok_or_else(|| CmdError::Params("`url` must be an http(s) or webcal address".into()))?;
-        let host = rest.split(['/', '?', '#']).next().unwrap_or("").to_owned();
-        if host.is_empty() {
-            return Err(CmdError::Params("`url` has no host".into()));
-        }
-        let name = opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty()).map_or(host, str::to_owned);
-        (name, format!("internet:{url}"))
-    } else {
-        let address = opt_str(p, "address").map(str::trim).filter(|a| !a.is_empty());
-        let name = opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty());
-        let Some(name) = name.or(address) else {
-            return pim::dialog(s, "addCalendar", json!({ "source": source }));
-        };
-        (name.to_owned(), format!("{source}:{}", address.unwrap_or(name)))
-    };
-    let id = s.mailbox.create_folder(root, &name)?;
-    if let Some(f) = s.mailbox.folders.get_mut(&id) {
-        f.remote_name = Some(remote);
-    }
-    Ok(json!({ "folder": id.0, "name": name }))
 }
 
+/// Optional `data` param: iCalendar text up to the iCalendar size limit.
+fn data_text(p: &Value) -> Result<Option<String>, CmdError> {
+    match p.get("data") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(t)) if t.len() <= mailcraft_formats::ics::MAX_ICS_BYTES => Ok(Some(t.clone())),
+        Some(Value::String(_)) => Err(CmdError::Params("`data` is too large for a calendar".into())),
+        Some(_) => Err(CmdError::Params("`data` must be iCalendar text".into())),
+    }
+}
+
+/// Optional `name` param, trimmed and non-empty.
+fn opt_name(p: &Value) -> Result<Option<String>, CmdError> {
+    Ok(pim::text(p, "name")?.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()))
+}
+
+/// Creates calendar folder `name` under `parent` (`name (2)`, `name (3)`… when taken).
+fn create_calendar(s: &mut Session, parent: FolderId, name: &str) -> Result<FolderId, CmdError> {
+    let base: String = name.chars().filter(|c| !c.is_control()).take(200).collect();
+    let base = if base.trim().is_empty() { "Calendar".to_owned() } else { base.trim().to_owned() };
+    let mut last = None;
+    for n in 1..=50u32 {
+        let candidate = if n == 1 { base.clone() } else { format!("{base} ({n})") };
+        match s.mailbox.create_folder(parent, &candidate) {
+            Ok(id) => return Ok(id),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.map_or_else(|| CmdError::Failed("could not create the calendar".into()), CmdError::from))
+}
+
+/// Where Add Calendar puts new calendars: `params.parent` when it is a calendar, else the default calendar.
+fn calendar_parent(s: &Session, p: &Value) -> Result<FolderId, CmdError> {
+    if let Some(f) = opt_u64(p, "parent").map(FolderId) {
+        return if pim::is_kind_folder(s, f, Kind::Appointment) {
+            Ok(f)
+        } else {
+            Err(CmdError::Params(format!("folder {} is not a calendar", f.0)))
+        };
+    }
+    pim::default_folder(s, Kind::Appointment)
+        .ok_or_else(|| CmdError::Failed("there is no calendar folder".into()))
+}
+
+fn add_internet_calendar(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(raw) = pim::text(p, "url")?.map(|u| u.trim().to_owned()).filter(|u| !u.is_empty()) else {
+        return pim::dialog(s, "addCalendar", json!({ "source": "internet" }));
+    };
+    if raw.len() > 4096 {
+        return Err(CmdError::Params("`url` is too long".into()));
+    }
+    let url = props::normalize_url(&raw)
+        .ok_or_else(|| CmdError::Params("`url` must be an http(s) or webcal address".into()))?;
+    let refresh = match p.get("refreshMin") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|m| u32::try_from(m).ok())
+                .filter(|m| (props::MIN_REFRESH_MIN..=props::MAX_REFRESH_MIN).contains(m))
+                .ok_or_else(|| {
+                    CmdError::Params(format!(
+                        "`refreshMin` must be {} to {} minutes",
+                        props::MIN_REFRESH_MIN,
+                        props::MAX_REFRESH_MIN
+                    ))
+                })?,
+        ),
+    };
+    let parent = calendar_parent(s, p)?;
+    // The fetched calendar (passed in, or fetched now) names the calendar when no name is given.
+    let outcome: Option<Result<subscribe::Fetched, String>> = match data_text(p)? {
+        Some(d) if !d.is_empty() => {
+            Some(Ok(subscribe::Fetched::Data { body: d.into_bytes(), etag: None, last_modified: None }))
+        }
+        _ if pim::flag(p, "fetch")? == Some(false) => None,
+        _ => Some(subscribe::fetch(&subscribe::Due {
+            folder: FolderId(0),
+            url: url.clone(),
+            etag: None,
+            last_modified: None,
+        })),
+    };
+    let published = match &outcome {
+        Some(Ok(subscribe::Fetched::Data { body, .. })) => subscribe::calendar_meta(body).0,
+        _ => None,
+    };
+    let name = opt_name(p)?.or(published).unwrap_or_else(|| props::url_host(&url));
+    let folder = create_calendar(s, parent, &name)?;
+    let sub = Subscription {
+        url: url.clone(),
+        refresh_min: refresh.unwrap_or(props::DEFAULT_REFRESH_MIN),
+        ..Default::default()
+    };
+    props::update(&mut s.mailbox, folder, |x| {
+        x.source = CalendarSource::Internet;
+        x.read_only = true;
+        x.subscription = Some(sub);
+    });
+    let mut out =
+        json!({ "folder": folder.0, "name": s.mailbox.folder(folder).map(|f| f.name.clone()), "url": url });
+    if let Some(o) = outcome {
+        let r = subscribe::apply(s, folder, o);
+        // An explicit refresh interval wins over the publisher's.
+        if let Some(m) = refresh {
+            props::update(&mut s.mailbox, folder, |x| {
+                if let Some(sub) = x.subscription.as_mut() {
+                    sub.refresh_min = m;
+                }
+            });
+        }
+        if let (Some(o), Some(r)) = (out.as_object_mut(), r.as_object()) {
+            for k in ["events", "notModified", "error"] {
+                if let Some(v) = r.get(k) {
+                    o.insert(k.into(), v.clone());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Largest .ics file read by From File.
+const MAX_FILE_BYTES: u64 = mailcraft_formats::ics::MAX_ICS_BYTES as u64;
+
+fn add_file_calendar(s: &mut Session, p: &Value) -> CmdResult {
+    let (data, stem) = match (data_text(p)?, pim::text(p, "path")?) {
+        (Some(d), _) if !d.is_empty() => (d.into_bytes(), None),
+        (_, Some(path)) if !path.trim().is_empty() => {
+            let path = std::path::PathBuf::from(path.trim());
+            let meta = std::fs::metadata(&path)
+                .map_err(|e| CmdError::Failed(format!("cannot open {}: {e}", path.display())))?;
+            if !meta.is_file() {
+                return Err(CmdError::Params(format!("{} is not a file", path.display())));
+            }
+            if meta.len() > MAX_FILE_BYTES {
+                return Err(CmdError::Params(format!("{} is too large for a calendar", path.display())));
+            }
+            let data = std::fs::read(&path)
+                .map_err(|e| CmdError::Failed(format!("cannot read {}: {e}", path.display())))?;
+            (data, path.file_stem().map(|x| x.to_string_lossy().into_owned()))
+        }
+        _ => return pim::dialog(s, "addCalendar", json!({ "source": "file" })),
+    };
+    // Refuse non-calendars before creating anything.
+    mailcraft_formats::ics::read(&data, ImportOptions { local_offset_min: s.tz_offset_min })
+        .map_err(|e| CmdError::Params(format!("not an iCalendar file: {e}")))?;
+    let parent = calendar_parent(s, p)?;
+    let name = opt_name(p)?
+        .or_else(|| subscribe::calendar_meta(&data).0)
+        .or(stem)
+        .unwrap_or_else(|| "Calendar".into());
+    let folder = create_calendar(s, parent, &name)?;
+    props::update(&mut s.mailbox, folder, |x| x.source = CalendarSource::File);
+    let events = subscribe::replace_items(s, folder, &data, true)?;
+    Ok(
+        json!({ "folder": folder.0, "name": s.mailbox.folder(folder).map(|f| f.name.clone()), "events": events }),
+    )
+}
+
+fn add_blank_calendar(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(name) = opt_name(p)? else {
+        return pim::dialog(s, "addCalendar", json!({ "source": "blank" }));
+    };
+    let parent = calendar_parent(s, p)?;
+    let folder = create_calendar(s, parent, &name)?;
+    Ok(json!({ "folder": folder.0, "name": s.mailbox.folder(folder).map(|f| f.name.clone()) }))
+}
+
+/// Refresh internet calendars. `{folder}` one, `{all: true}` every subscription, `{due: true}` those whose
+/// refresh interval has passed; default the selected calendar when it is a subscription, else all. A worker
+/// that fetched already passes the outcome for one `folder`: `data` (iCalendar text, with `etag` and
+/// `lastModified`), `notModified: true` or `error`.
+fn run_refresh_calendar(s: &mut Session, p: &Value) -> CmdResult {
+    let folder = opt_u64(p, "folder").map(FolderId);
+    let given: Option<Result<subscribe::Fetched, String>> = if let Some(d) = data_text(p)? {
+        let etag = pim::text(p, "etag")?.filter(|e| !e.is_empty());
+        let last_modified = pim::text(p, "lastModified")?.filter(|e| !e.is_empty());
+        Some(Ok(subscribe::Fetched::Data { body: d.into_bytes(), etag, last_modified }))
+    } else if pim::flag(p, "notModified")? == Some(true) {
+        Some(Ok(subscribe::Fetched::NotModified))
+    } else {
+        pim::text(p, "error")?.map(Err)
+    };
+    if let Some(outcome) = given {
+        let f =
+            folder.ok_or_else(|| CmdError::Params("`folder` is required with a fetched result".into()))?;
+        subscribe::subscription(s, f)
+            .ok_or_else(|| CmdError::Params(format!("folder {} is not an internet calendar", f.0)))?;
+        return Ok(json!({ "refreshed": [subscribe::apply(s, f, outcome)] }));
+    }
+    let targets: Vec<subscribe::Due> = if let Some(f) = folder {
+        vec![
+            subscribe::subscription(s, f)
+                .ok_or_else(|| CmdError::Params(format!("folder {} is not an internet calendar", f.0)))?,
+        ]
+    } else if pim::flag(p, "due")? == Some(true) {
+        subscribe::subscriptions(s, false)
+    } else {
+        let current = pim::current_folder(s, Kind::Appointment).and_then(|f| subscribe::subscription(s, f));
+        match (current, pim::flag(p, "all")?) {
+            (Some(c), None | Some(false)) => vec![c],
+            _ => subscribe::subscriptions(s, true),
+        }
+    };
+    let mut out = Vec::new();
+    for d in targets.into_iter().take(200) {
+        let outcome = subscribe::fetch(&d);
+        out.push(subscribe::apply(s, d.folder, outcome));
+    }
+    Ok(json!({ "refreshed": out }))
+}
+
+/// Share Calendar › E-mail Calendar: a message with the calendar as an iCalendar attachment. `range`: `all`
+/// (default), `today`, `tomorrow`, `next7`, `next30`; `detail`: `full` (default), `limited` (subject and time)
+/// or `availability` (busy/free blocks only).
 fn run_share(s: &mut Session, p: &Value) -> CmdResult {
     let folder = target_calendar(s, p)?;
     let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
-    let mut appts: Vec<&Appointment> =
-        s.mailbox.appointments.values().filter(|a| a.folder == folder).collect();
+    let tz = s.tz_offset_min;
+    let today = pim::local_midnight(s.now(), tz);
+    let range = opt_str(p, "range").unwrap_or("all");
+    let window = match range {
+        "all" => None,
+        "today" => Some((today, pim::add_secs(today, pim::DAY_SECS))),
+        "tomorrow" => Some((pim::add_secs(today, pim::DAY_SECS), pim::add_secs(today, 2 * pim::DAY_SECS))),
+        "next7" => Some((today, pim::add_secs(today, 7 * pim::DAY_SECS))),
+        "next30" => Some((today, pim::add_secs(today, 30 * pim::DAY_SECS))),
+        r => {
+            return Err(CmdError::Params(format!(
+                "`range` must be all|today|tomorrow|next7|next30, not `{r}`"
+            )));
+        }
+    };
+    let detail = opt_str(p, "detail").unwrap_or("full");
+    if !["full", "limited", "availability"].contains(&detail) {
+        return Err(CmdError::Params(format!("`detail` must be full|limited|availability, not `{detail}`")));
+    }
+    let mut appts: Vec<Appointment> = s
+        .mailbox
+        .appointments
+        .values()
+        .filter(|a| a.folder == folder)
+        .filter(|a| match window {
+            None => true,
+            Some((from, to)) => !occurrences(a, from, to, 1).is_empty(),
+        })
+        .cloned()
+        .collect();
     appts.sort_by_key(|a| (a.start.unix, a.id));
-    let ics = ics_calendar(Some("PUBLISH"), &appts, s.now());
+    for a in &mut appts {
+        if detail != "full" || a.private {
+            a.body.clear();
+            a.attendees.clear();
+            a.organizer = None;
+            a.categories.clear();
+        }
+        if detail == "availability" || (a.private && detail != "full") {
+            a.subject = show_as_label(a.show_as).to_owned();
+            a.location.clear();
+        }
+    }
+    let refs: Vec<&Appointment> = appts.iter().collect();
+    let ics = ics_calendar(Some("PUBLISH"), &refs, s.now());
     let events = appts.len();
     let calendars: Vec<Value> = s
         .mailbox
@@ -885,7 +1218,20 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
     // Options › Mail › Signatures: the new-messages signature.
     crate::compose::insert_default_signature(&s.mailbox, &mut compose);
     let id = s.open_compose(compose);
-    Ok(json!({ "compose": id, "calendar": folder.0, "events": events, "calendars": calendars }))
+    Ok(
+        json!({ "compose": id, "calendar": folder.0, "events": events, "calendars": calendars, "range": range, "detail": detail }),
+    )
+}
+
+/// "Busy", "Free"… for availability-only sharing.
+fn show_as_label(b: BusyStatus) -> &'static str {
+    match b {
+        BusyStatus::Free => "Free",
+        BusyStatus::WorkingElsewhere => "Working Elsewhere",
+        BusyStatus::Tentative => "Tentative",
+        BusyStatus::Busy => "Busy",
+        BusyStatus::OutOfOffice => "Out of Office",
+    }
 }
 
 fn file_safe(name: &str) -> String {
@@ -905,7 +1251,7 @@ pub const DEFAULT_REMINDER_MIN: u32 = 15;
 /// Longest appointment accepted (seconds; ten years).
 const MAX_SPAN_SECS: i64 = 10 * 366 * pim::DAY_SECS;
 
-const APPT_FIELDS: [&str; 15] = [
+const APPT_FIELDS: [&str; 16] = [
     "subject",
     "location",
     "body",
@@ -921,6 +1267,7 @@ const APPT_FIELDS: [&str; 15] = [
     "optional",
     "resources",
     "recurrence",
+    "timeZone",
 ];
 
 /// Start of the next half-hour slot after `now` (local time).
@@ -1004,6 +1351,7 @@ fn organizer(s: &Session) -> Option<Address> {
 /// Applies appointment field params to `a` (shared by new and update).
 pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> Result<(), CmdError> {
     let tz = s.tz_offset_min;
+    let cal = tz::Clock::of(s);
     if let Some(v) = pim::text(p, "subject")? {
         a.subject = v;
     }
@@ -1018,13 +1366,33 @@ pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> 
     if let Some(d) = all_day {
         a.all_day = d;
     }
-    let start = pim::date(p, "start", tz)?;
+    match p.get("timeZone") {
+        None => {}
+        Some(Value::Null) => a.tz = None,
+        Some(Value::String(z)) if z.trim().is_empty() => a.tz = None,
+        Some(Value::String(z)) => {
+            a.tz = Some(
+                tz::canonical(z)
+                    .ok_or_else(|| CmdError::Params(format!("`timeZone`: unknown time zone `{z}`")))?,
+            );
+        }
+        Some(_) => return Err(CmdError::Params("`timeZone` must be an IANA time zone name".into())),
+    }
+    // Wall-clock times are read in the zone named by this call's `timeZone` (timed appointments), else on the
+    // calendar's clock (its named zone, daylight-saving aware, else the session's offset), the clock the
+    // calendar views and the appointment window show times on.
+    let explicit = match p.get("timeZone") {
+        Some(Value::String(z)) if !z.trim().is_empty() && !a.all_day => a.zone().map(str::to_owned),
+        _ => None,
+    };
+    let clock = explicit.map_or_else(|| tz::Clock::of(s), |z| tz::Clock::named(&z, tz));
+    let start = clock.date_param(p, "start")?;
     match start {
         Some(Some(t)) => a.start = t,
         Some(None) => return Err(CmdError::Params("`start` cannot be cleared".into())),
         None => {}
     }
-    let end = pim::date(p, "end", tz)?;
+    let end = clock.date_param(p, "end")?;
     let duration = match p.get("durationMin") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -1040,13 +1408,20 @@ pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> 
         (None, None) => a.end = pim::add_secs(a.start, old_len),
     }
     if a.all_day {
-        a.start = pim::local_midnight(a.start, tz);
-        let end_mid = pim::local_midnight(a.end, tz);
-        let end_day = if end_mid.unix < a.end.unix { pim::add_secs(end_mid, pim::DAY_SECS) } else { end_mid };
-        a.end = if end_day.unix <= a.start.unix { pim::add_secs(a.start, pim::DAY_SECS) } else { end_day };
+        // Whole days on the calendar's clock (a day next to a daylight-saving change is 23 or 25 hours).
+        let (start, end) = whole_days(&cal, a.start, a.end);
+        a.start = start;
+        a.end = end;
     }
     if a.end.unix < a.start.unix {
         return Err(CmdError::Params("the end time is before the start time".into()));
+    }
+    // A zoned appointment's times carry its zone's offset (the same instants).
+    if !a.all_day
+        && let Some(z) = a.zone().map(str::to_owned)
+    {
+        a.start = tz::in_zone(&z, a.start).unwrap_or(a.start);
+        a.end = tz::in_zone(&z, a.end).unwrap_or(a.end);
     }
     if a.end.unix.saturating_sub(a.start.unix) > MAX_SPAN_SECS {
         return Err(CmdError::Params("the appointment is too long".into()));
@@ -1170,15 +1545,36 @@ pub fn sync_series_start(a: &mut Appointment) -> bool {
     true
 }
 
-/// Summary of an appointment for results.
+/// Midnight starting the day of `start` to the midnight ending the day of `end` (at least one day), on
+/// `clock`.
+fn whole_days(clock: &tz::Clock, start: DateTime, end: DateTime) -> (DateTime, DateTime) {
+    let first = clock.day(start);
+    let next_midnight = |day: i64| clock.from_local(day.saturating_add(1).saturating_mul(pim::DAY_SECS));
+    let s = clock.midnight(start);
+    let end_mid = clock.midnight(end);
+    let e = if end_mid.unix < end.unix { next_midnight(clock.day(end)) } else { end_mid };
+    (s, if e.unix <= s.unix { next_midnight(first) } else { e })
+}
+
+/// Summary of an appointment for results, its times on the calendar's clock.
+pub fn appointment_summary(s: &Session, a: &Appointment) -> Value {
+    appointment_json_on(a, &tz::Clock::of(s))
+}
+
+/// Summary of an appointment for results, its times at fixed offset `tz`.
 pub fn appointment_json(a: &Appointment, tz: i32) -> Value {
+    appointment_json_on(a, &tz::Clock::fixed(tz))
+}
+
+fn appointment_json_on(a: &Appointment, clock: &tz::Clock) -> Value {
+    let tz = clock.offset_at(a.start.unix);
     json!({
         "id": a.id.0,
         "folder": a.folder.0,
         "subject": a.subject,
         "location": a.location,
-        "start": pim::datetime_string(a.start, tz),
-        "end": pim::datetime_string(a.end, tz),
+        "start": clock.datetime_string(a.start),
+        "end": clock.datetime_string(a.end),
         "allDay": a.all_day,
         "showAs": show_as_name(a.show_as),
         "reminderMin": a.reminder_min,
@@ -1189,6 +1585,7 @@ pub fn appointment_json(a: &Appointment, tz: i32) -> Value {
         "recurrenceText": describe_recurrence(a, tz),
         "organizer": a.organizer.as_ref().map(Address::to_display_string),
         "tracking": tracking_json(a),
+        "timeZone": a.zone(),
     })
 }
 
@@ -1200,7 +1597,13 @@ pub fn create_appointment(
     meeting: bool,
 ) -> Result<ItemId, CmdError> {
     let mut a = default_appointment(s, folder);
+    // A timed appointment is entered in the calendar's time zone (when it names one), so a series keeps its
+    // wall-clock time across daylight-saving changes; `timeZone` overrides it.
+    a.tz = tz::Clock::of(s).zone_id().map(str::to_owned);
     apply_appointment_fields(s, &mut a, p)?;
+    if a.all_day {
+        a.tz = None;
+    }
     if meeting {
         a.is_meeting = true;
     }
@@ -1215,33 +1618,31 @@ pub fn create_appointment(
 }
 
 fn run_new_appointment(s: &mut Session, p: &Value) -> CmdResult {
-    let folder = pim::new_item_folder(s, p, Kind::Appointment)?;
+    let folder = new_appointment_folder(s, p)?;
     if !pim::has_any(p, &APPT_FIELDS) {
         let d = default_appointment(s, folder);
-        let tz = s.tz_offset_min;
+        let clock = tz::Clock::of(s);
         let params = json!({
             "folder": folder.0,
-            "start": pim::datetime_string(d.start, tz),
-            "end": pim::datetime_string(d.end, tz),
+            "start": clock.datetime_string(d.start),
+            "end": clock.datetime_string(d.end),
             "reminderMin": d.reminder_min,
             "focus": "subject",
         });
         return pim::dialog(s, "appointment", params);
     }
     let id = create_appointment(s, folder, p, false)?;
-    let tz = s.tz_offset_min;
-    Ok(s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |a| appointment_json(a, tz)))
+    Ok(s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |a| appointment_summary(s, a)))
 }
 
 /// Creates a meeting and opens a compose with the invitation. Returns `{"id", "compose", ...}`.
 pub fn create_meeting(s: &mut Session, p: &Value) -> CmdResult {
-    let folder = pim::new_item_folder(s, p, Kind::Appointment)?;
+    let folder = new_appointment_folder(s, p)?;
     let id = create_appointment(s, folder, p, true)?;
     let compose =
         meeting_compose(s, id).ok_or_else(|| CmdError::Failed("the meeting could not be created".into()))?;
-    let tz = s.tz_offset_min;
     let mut out =
-        s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |a| appointment_json(a, tz));
+        s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |a| appointment_summary(s, a));
     if let Some(o) = out.as_object_mut() {
         o.insert("compose".into(), json!(compose));
     }
@@ -1261,7 +1662,8 @@ pub fn meeting_compose(s: &mut Session, id: ItemId) -> Option<u64> {
 /// `id` with SEQUENCE `sequence` (0 for a new meeting, higher for updates).
 pub fn meeting_compose_seq(s: &mut Session, id: ItemId, sequence: u32) -> Option<u64> {
     let a = s.mailbox.appointments.get(&id)?.clone();
-    let tz = s.tz_offset_min;
+    // Times as the organizer's calendar shows them (the offset in force at the start).
+    let tz = tz::Clock::of(s).offset_at(a.start.unix);
     let join = |roles: &[AttendeeRole]| {
         a.attendees
             .iter()
@@ -1331,6 +1733,7 @@ fn when_text(a: &Appointment, tz: i32) -> String {
 
 fn run_update(s: &mut Session, p: &Value) -> CmdResult {
     let ids = pim::require_targets(s, p, Kind::Appointment)?;
+    check_items_writable(s, &ids)?;
     let mut updated = Vec::new();
     for id in &ids {
         let Some(mut a) = s.mailbox.appointments.get(id).cloned() else { continue };
@@ -1340,8 +1743,7 @@ fn run_update(s: &mut Session, p: &Value) -> CmdResult {
         }
         updated.push(a);
     }
-    let tz = s.tz_offset_min;
-    let out: Vec<Value> = updated.iter().map(|a| appointment_json(a, tz)).collect();
+    let out: Vec<Value> = updated.iter().map(|a| appointment_summary(s, a)).collect();
     for a in updated {
         s.mailbox.appointments.insert(a.id, a);
     }
@@ -1351,6 +1753,7 @@ fn run_update(s: &mut Session, p: &Value) -> CmdResult {
 /// Deleting a recurring series deletes its exceptions (edited occurrences, same UID) with it.
 fn run_delete(s: &mut Session, p: &Value) -> CmdResult {
     let mut ids = pim::require_targets(s, p, Kind::Appointment)?;
+    check_items_writable(s, &ids)?;
     let mut extra = Vec::new();
     for id in &ids {
         if let Some(a) = s.mailbox.appointments.get(id).filter(|a| a.recurrence.is_some()) {
@@ -1384,13 +1787,173 @@ fn exceptions_of(s: &Session, a: &Appointment) -> Vec<ItemId> {
         .collect()
 }
 fn run_copy(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(f) = opt_u64(p, "folder").map(FolderId) {
+        check_writable(s, f)?;
+    }
     pim::run_copy(s, p, Kind::Appointment)
 }
 fn run_move(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(f) = opt_u64(p, "folder").map(FolderId) {
+        check_writable(s, f)?;
+    }
+    let ids = pim::targets(s, p, Kind::Appointment);
+    check_items_writable(s, &ids)?;
     pim::run_move(s, p, Kind::Appointment)
 }
 fn run_categorize(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = pim::targets(s, p, Kind::Appointment);
+    check_items_writable(s, &ids)?;
     pim::run_categorize(s, p, Kind::Appointment)
+}
+
+/// Refuses changes to the items of a read-only calendar (an internet subscription).
+fn check_writable(s: &Session, folder: FolderId) -> Result<(), CmdError> {
+    if props::is_read_only(&s.mailbox, folder) {
+        let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
+        return Err(CmdError::Disabled(format!(
+            "\"{name}\" is a subscribed internet calendar; its items cannot be changed"
+        )));
+    }
+    Ok(())
+}
+
+fn check_items_writable(s: &Session, ids: &[ItemId]) -> Result<(), CmdError> {
+    for id in ids {
+        if let Some(a) = s.mailbox.appointments.get(id) {
+            check_writable(s, a.folder)?;
+        }
+    }
+    Ok(())
+}
+
+/// Folder for a new appointment: `params.folder` (a writable calendar), else the calendar in use, else the
+/// default calendar when the one in use is read-only.
+fn new_appointment_folder(s: &Session, p: &Value) -> Result<FolderId, CmdError> {
+    let folder = pim::new_item_folder(s, p, Kind::Appointment)?;
+    if opt_u64(p, "folder").is_none()
+        && props::is_read_only(&s.mailbox, folder)
+        && let Some(d) = pim::default_folder(s, Kind::Appointment)
+    {
+        check_writable(s, d)?;
+        return Ok(d);
+    }
+    check_writable(s, folder)?;
+    Ok(folder)
+}
+
+/// Day/week view drag (`calendar.moveItem`): the appointment starts at `start`, keeping its length.
+fn run_move_item(s: &mut Session, p: &Value) -> CmdResult {
+    drag_item(s, p, false)
+}
+
+/// Day/week view edge drag (`calendar.resize`): a new `start` and/or `end`.
+fn run_resize(s: &mut Session, p: &Value) -> CmdResult {
+    drag_item(s, p, true)
+}
+
+fn drag_item(s: &mut Session, p: &Value, resize: bool) -> CmdResult {
+    let id = pim::require_targets(s, p, Kind::Appointment)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CmdError::Params("no appointment".into()))?;
+    let a =
+        s.mailbox.appointments.get(&id).cloned().ok_or_else(|| CmdError::Params("no appointment".into()))?;
+    check_writable(s, a.folder)?;
+    let dest = match opt_u64(p, "folder").map(FolderId) {
+        Some(f) if f != a.folder => {
+            if !pim::is_kind_folder(s, f, Kind::Appointment) {
+                return Err(CmdError::Params(format!("folder {} is not a calendar", f.0)));
+            }
+            check_writable(s, f)?;
+            Some(f)
+        }
+        _ => None,
+    };
+    // One occurrence of a series becomes an exception; the series itself is edited in its window.
+    let (target, series) = if a.recurrence.is_some() {
+        if p.get("occurrence").is_none() {
+            return Err(CmdError::Params(
+                "pass `occurrence` to move one occurrence of a series (open the series to move them all)"
+                    .into(),
+            ));
+        }
+        if dest.is_some() {
+            return Err(CmdError::Params("an occurrence stays in its series' calendar".into()));
+        }
+        let (start, _) = occurrence_param(s, &a, p)?;
+        let ex = split_occurrence(s, id, start).ok_or_else(|| {
+            CmdError::Failed("the occurrence could not be separated from its series".into())
+        })?;
+        (ex, Some(id))
+    } else {
+        (id, None)
+    };
+    let mut x = s
+        .mailbox
+        .appointments
+        .get(&target)
+        .cloned()
+        .ok_or_else(|| CmdError::Params("no appointment".into()))?;
+    // Wall-clock input is read on the calendar's clock (the views pass unix times).
+    let cal = tz::Clock::of(s);
+    let zone = if x.all_day { None } else { x.zone().map(str::to_owned) };
+    let start = cal.date_param(p, "start")?.flatten();
+    let end = cal.date_param(p, "end")?.flatten();
+    let len = x.end.unix.saturating_sub(x.start.unix).max(0);
+    let (mut new_start, mut new_end) = if resize {
+        if start.is_none() && end.is_none() {
+            return Err(CmdError::Params("`start` or `end` is required".into()));
+        }
+        (start.unwrap_or(x.start), end.unwrap_or(x.end))
+    } else {
+        let st = start.ok_or_else(|| CmdError::Params("`start` is required".into()))?;
+        if x.all_day {
+            // An all-day item moves by whole days, keeping its number of days.
+            let days = cal.day(x.end).saturating_sub(cal.day(x.start)).max(1);
+            let first = cal.day(st);
+            (cal.midnight(st), cal.from_local(first.saturating_add(days).saturating_mul(pim::DAY_SECS)))
+        } else {
+            (st, pim::add_secs(st, len))
+        }
+    };
+    if x.all_day {
+        (new_start, new_end) = whole_days(&cal, new_start, new_end);
+    }
+    if new_end.unix <= new_start.unix && (resize || len > 0) {
+        return Err(CmdError::Params("the end must be after the start".into()));
+    }
+    if new_end.unix.saturating_sub(new_start.unix) > MAX_SPAN_SECS {
+        return Err(CmdError::Params("the appointment is too long".into()));
+    }
+    if let Some(z) = &zone {
+        new_start = tz::in_zone(z, new_start).unwrap_or(new_start);
+        new_end = tz::in_zone(z, new_end).unwrap_or(new_end);
+    }
+    x.start = new_start;
+    x.end = new_end;
+    if let Some(f) = dest {
+        x.folder = f;
+        for ex in exceptions_of(s, &a) {
+            if let Some(e) = s.mailbox.appointments.get_mut(&ex) {
+                e.folder = f;
+            }
+        }
+    }
+    let meeting = x.is_meeting && !x.attendees.is_empty();
+    s.mailbox.appointments.insert(target, x);
+    let mut out = s
+        .mailbox
+        .appointments
+        .get(&target)
+        .map_or_else(|| json!({ "id": target.0 }), |x| appointment_json_on(x, &cal));
+    if let Some(o) = out.as_object_mut() {
+        if let Some(sid) = series {
+            o.insert("series".into(), json!(sid.0));
+        }
+        // The organizer is asked whether to send the attendees an update (`calendar.sendUpdate`).
+        o.insert("sendUpdate".into(), json!(meeting));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1428,7 +1991,15 @@ pub fn ics_calendar(method: Option<&str>, appts: &[&Appointment], stamp: DateTim
 /// Occurrences (start, end) of `a` overlapping `[from, to)`, expanded by `mailcraft-formats` (RRULE with
 /// EXDATEs, in the appointment's own UTC offset). At most `max` (capped by the formats limit).
 pub fn occurrences(a: &Appointment, from: DateTime, to: DateTime, max: usize) -> Vec<(DateTime, DateTime)> {
-    mailcraft_formats::ics::expand_appointment(a, from, to, max.min(rrule::MAX_OCCURRENCES))
+    let max = max.min(rrule::MAX_OCCURRENCES);
+    // A recurring timed appointment in a named zone repeats that zone's wall-clock time (DST-aware).
+    if !a.all_day
+        && a.recurrence.is_some()
+        && let Some(z) = a.zone().and_then(tz::zone)
+    {
+        return tz::expand_zoned(a, z, from, to, max);
+    }
+    mailcraft_formats::ics::expand_appointment(a, from, to, max)
 }
 
 /// The Appointment Recurrence dialog's model and its RRULE mapping (RFC 5545 §3.3.10).
@@ -1823,7 +2394,7 @@ fn occurrence_param(s: &Session, a: &Appointment, p: &Value) -> Result<(DateTime
     if a.recurrence.is_none() {
         return Err(CmdError::Params("the appointment does not recur".into()));
     }
-    let t = match pim::date(p, "occurrence", s.tz_offset_min)? {
+    let t = match tz::Clock::of(s).date_param(p, "occurrence")? {
         Some(Some(t)) => t,
         _ => return Err(CmdError::Params("`occurrence` (the occurrence's start) is required".into())),
     };
@@ -1844,16 +2415,17 @@ fn series(s: &Session, p: &Value) -> Result<Appointment, CmdError> {
 
 fn run_occurrences(s: &mut Session, p: &Value) -> CmdResult {
     let a = series(s, p)?;
-    let tz = s.tz_offset_min;
-    let from = pim::date(p, "from", tz)?.flatten().unwrap_or(a.start);
-    let to = pim::date(p, "to", tz)?.flatten().unwrap_or_else(|| pim::add_secs(from, 366 * pim::DAY_SECS));
+    let cal = tz::Clock::of(s);
+    let tz = cal.offset_at(a.start.unix);
+    let from = cal.date_param(p, "from")?.flatten().unwrap_or(a.start);
+    let to = cal.date_param(p, "to")?.flatten().unwrap_or_else(|| pim::add_secs(from, 366 * pim::DAY_SECS));
     if to.unix < from.unix {
         return Err(CmdError::Params("`to` is before `from`".into()));
     }
     let max = opt_u64(p, "max").map_or(50, |m| usize::try_from(m).unwrap_or(50)).clamp(1, 1000);
     let list: Vec<Value> = occurrences(&a, from, to, max)
         .into_iter()
-        .map(|(st, en)| json!({ "start": pim::datetime_string(st, tz), "end": pim::datetime_string(en, tz) }))
+        .map(|(st, en)| json!({ "start": cal.datetime_string(st), "end": cal.datetime_string(en) }))
         .collect();
     Ok(json!({ "id": a.id.0, "occurrences": list, "text": describe_recurrence(&a, tz) }))
 }
@@ -1861,6 +2433,7 @@ fn run_occurrences(s: &mut Session, p: &Value) -> CmdResult {
 /// Edits one occurrence: the series gets an exception date and the occurrence becomes its own appointment.
 fn run_edit_occurrence(s: &mut Session, p: &Value) -> CmdResult {
     let mut a = series(s, p)?;
+    check_writable(s, a.folder)?;
     if p.get("recurrence").is_some() {
         return Err(CmdError::Params("an occurrence cannot have its own recurrence; edit the series".into()));
     }
@@ -1887,9 +2460,8 @@ fn run_edit_occurrence(s: &mut Session, p: &Value) -> CmdResult {
     let series_id = a.id;
     s.mailbox.appointments.insert(series_id, a);
     s.mailbox.appointments.insert(id, ex);
-    let tz = s.tz_offset_min;
     let mut out =
-        s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |x| appointment_json(x, tz));
+        s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |x| appointment_summary(s, x));
     if let Some(o) = out.as_object_mut() {
         o.insert("series".into(), json!(series_id.0));
     }
@@ -1924,6 +2496,7 @@ fn split_occurrence(s: &mut Session, series: ItemId, rid: DateTime) -> Option<It
 /// Deletes one occurrence (adds an exception date to the series).
 fn run_delete_occurrence(s: &mut Session, p: &Value) -> CmdResult {
     let mut a = series(s, p)?;
+    check_writable(s, a.folder)?;
     let (start, _) = occurrence_param(s, &a, p)?;
     if let Some(r) = a.recurrence.as_mut() {
         if r.exdates.len() >= pim::MAX_LIST {
@@ -1933,7 +2506,7 @@ fn run_delete_occurrence(s: &mut Session, p: &Value) -> CmdResult {
     }
     let id = a.id;
     s.mailbox.appointments.insert(id, a);
-    Ok(json!({ "series": id.0, "deleted": pim::datetime_string(start, s.tz_offset_min) }))
+    Ok(json!({ "series": id.0, "deleted": tz::Clock::of(s).datetime_string(start) }))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1996,9 +2569,9 @@ pub fn free_busy(
 }
 
 fn run_free_busy(s: &mut Session, p: &Value) -> CmdResult {
-    let tz = s.tz_offset_min;
-    let from = pim::date(p, "start", tz)?.flatten().unwrap_or_else(|| pim::local_midnight(s.now(), tz));
-    let to = pim::date(p, "end", tz)?.flatten().unwrap_or_else(|| pim::add_secs(from, pim::DAY_SECS));
+    let cal = tz::Clock::of(s);
+    let from = cal.date_param(p, "start")?.flatten().unwrap_or_else(|| cal.midnight(s.now()));
+    let to = cal.date_param(p, "end")?.flatten().unwrap_or_else(|| pim::add_secs(from, pim::DAY_SECS));
     if to.unix < from.unix || to.unix.saturating_sub(from.unix) > MAX_SPAN_SECS {
         return Err(CmdError::Params("`end` must follow `start` within ten years".into()));
     }
@@ -2559,11 +3132,14 @@ fn run_propose_new_time(s: &mut Session, p: &Value) -> CmdResult {
             r => r,
         },
     };
-    let tz = s.tz_offset_min;
-    let start =
-        pim::date(p, "start", tz)?.flatten().ok_or_else(|| CmdError::Params("`start` is required".into()))?;
+    let cal = tz::Clock::of(s);
+    let start = cal
+        .date_param(p, "start")?
+        .flatten()
+        .ok_or_else(|| CmdError::Params("`start` is required".into()))?;
     let end =
-        pim::date(p, "end", tz)?.flatten().ok_or_else(|| CmdError::Params("`end` is required".into()))?;
+        cal.date_param(p, "end")?.flatten().ok_or_else(|| CmdError::Params("`end` is required".into()))?;
+    let tz = cal.offset_at(start.unix);
     if end.unix < start.unix || end.unix.saturating_sub(start.unix) > MAX_SPAN_SECS {
         return Err(CmdError::Params("the proposed end is before the start".into()));
     }
@@ -2590,7 +3166,7 @@ fn run_propose_new_time(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({
         "appointment": item.map(|i| i.0),
         "response": response_name(response),
-        "proposed": { "start": pim::datetime_string(start, tz), "end": pim::datetime_string(end, tz) },
+        "proposed": { "start": cal.datetime_string(start), "end": cal.datetime_string(end) },
         "compose": compose,
         "sent": sent,
     }))
@@ -2641,7 +3217,7 @@ fn run_remove_canceled(s: &mut Session, p: &Value) -> CmdResult {
         if series || !removed.is_empty() {
             return Ok(json!({
                 "appointment": id.0,
-                "occurrence": pim::datetime_string(occ, s.tz_offset_min),
+                "occurrence": tz::Clock::of(s).datetime_string(occ),
                 "removed": pim::ids_json(&removed),
             }));
         }
@@ -2766,7 +3342,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Calendar",
             "Home › Manage Calendars; Folder › Share",
             "",
-            r#"{"source": "addressBook|roomList|internet|shared", "name"?: string, "address"?: string, "url"?: string}"#,
+            r#"{"source": "internet|file|blank|addressBook|roomList|shared", "name"?: string, "url"?: string (internet), "refreshMin"?: number, "fetch"?: bool, "data"?: "iCalendar text", "path"?: string (file), "parent"?: number} (addressBook/roomList/shared need Exchange: refused)"#,
             true,
             run_add_calendar,
         ),
@@ -2784,8 +3360,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Change Time Zone",
             "View › Time Scale",
             "",
-            r#"{"offsetMin"?: number}"#,
-            false,
+            r#"{"zone"?: "IANA id", "offsetMin"?: number, "label"?: string, "secondZone"?: "IANA id", "secondLabel"?: string, "showSecond"?: bool, "swap"?: bool} (no params = open the dialog)"#,
+            true,
             run_change_time_zone,
         ),
         spec(
@@ -2794,7 +3370,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "View › Color",
             "",
             r#"{"color": "Automatic|Blue|Green|Orange|Navy Blue|Yellow|Teal|Magenta|Brown|Dark Red", "calendar"?: string, "folder"?: number}"#,
-            false,
+            true,
             run_color,
         ),
         spec(
@@ -2839,9 +3415,36 @@ pub fn specs() -> Vec<CommandSpec> {
             "Share Calendar",
             "Home › Manage Calendars; Folder › Share",
             "",
-            r#"{"calendar"?: "<calendar name>", "folder"?: number}"#,
+            r#"{"calendar"?: "<calendar name>", "folder"?: number, "range"?: "all|today|tomorrow|next7|next30", "detail"?: "full|limited|availability"}"#,
             false,
             run_share,
+        ),
+        spec(
+            "calendar.refreshCalendar",
+            "Refresh Internet Calendar",
+            "Send / Receive › Update Folder (internet calendars)",
+            "",
+            r#"{"folder"?: number, "all"?: bool, "due"?: bool, "data"?: "fetched iCalendar text", "etag"?: string, "lastModified"?: string, "notModified"?: bool, "error"?: string}"#,
+            true,
+            run_refresh_calendar,
+        ),
+        spec(
+            "calendar.moveItem",
+            "Move Appointment",
+            "Calendar › Day/Week view (drag)",
+            "",
+            r#"{"id": number, "start": "YYYY-MM-DDTHH:MM" | unix, "occurrence"?: "YYYY-MM-DDTHH:MM" | unix (one occurrence of a series), "folder"?: number}"#,
+            true,
+            run_move_item,
+        ),
+        spec(
+            "calendar.resize",
+            "Change Appointment Length",
+            "Calendar › Day/Week view (drag an edge)",
+            "",
+            r#"{"id": number, "start"?: "YYYY-MM-DDTHH:MM" | unix, "end"?: "YYYY-MM-DDTHH:MM" | unix, "occurrence"?: "YYYY-MM-DDTHH:MM" | unix}"#,
+            true,
+            run_resize,
         ),
         spec(
             "calendar.timeScale",
@@ -2875,7 +3478,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Appointment",
             "Calendar › Home › New",
             "",
-            r#"{"subject"?, "location"?, "body"?, "start"?: "YYYY-MM-DDTHH:MM", "end"?, "durationMin"?, "allDay"?: bool, "showAs"?: "free|workingElsewhere|tentative|busy|outOfOffice", "reminderMin"?: number|null, "private"?: bool, "categories"?: [string], "recurrence"?: "RRULE", "folder"?: number} (no fields = open a blank appointment window)"#,
+            r#"{"subject"?, "location"?, "body"?, "start"?: "YYYY-MM-DDTHH:MM", "end"?, "durationMin"?, "timeZone"?: "IANA id", "allDay"?: bool, "showAs"?: "free|workingElsewhere|tentative|busy|outOfOffice", "reminderMin"?: number|null, "private"?: bool, "categories"?: [string], "recurrence"?: "RRULE", "folder"?: number} (no fields = open a blank appointment window)"#,
             true,
             run_new_appointment,
         ),
@@ -3083,6 +3686,9 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod depth_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -3405,7 +4011,7 @@ pub(crate) mod tests {
         let r = s
             .run(
                 "calendar.addCalendar",
-                &json!({"source": "internet", "url": "webcal://cal.example.com/holidays.ics"}),
+                &json!({"source": "internet", "url": "webcal://cal.example.com/holidays.ics", "fetch": false}),
             )
             .unwrap();
         let f = FolderId(r["folder"].as_u64().unwrap());
@@ -3413,11 +4019,16 @@ pub(crate) mod tests {
         assert_eq!(folder.name, "cal.example.com");
         assert_eq!(folder.kind, FolderKind::Calendar);
         assert_eq!(folder.parent, Some(cal(&s)));
-        let r = s.run(
-            "calendar.addCalendar",
-            &json!({"source": "shared", "address": "ann@example.com", "name": "Ann"}),
-        );
-        assert!(r.is_ok());
+        let sub = props::read(&s.mailbox, f).subscription.unwrap();
+        assert_eq!(sub.url, "http://cal.example.com/holidays.ics");
+        // Other people's, rooms' and shared calendars need Exchange.
+        for source in ["shared", "addressBook", "roomList"] {
+            let r = s.run(
+                "calendar.addCalendar",
+                &json!({"source": source, "address": "ann@example.com", "name": "Ann"}),
+            );
+            assert!(matches!(r, Err(CmdError::Disabled(_))), "{source}");
+        }
         assert!(matches!(s.run("calendar.addCalendar", &json!({"source": "fax"})), Err(CmdError::Params(_))));
         assert!(matches!(
             s.run("calendar.addCalendar", &json!({"source": "internet", "url": "ftp://x"})),

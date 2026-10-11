@@ -97,6 +97,66 @@ pub struct AccountStatus {
     pub last_sync: Option<i64>,
     pub pending_changes: usize,
     pub outbox: usize,
+    /// New-mail push (IMAP IDLE) state.
+    pub push: PushMode,
+}
+
+/// Whether new mail is pushed to an account (IMAP IDLE) or found by polling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PushMode {
+    /// No push: mail arrives with scheduled or manual send/receive.
+    #[default]
+    Off,
+    /// Connected and waiting for the server to report new mail.
+    Idle,
+    /// The server cannot push; the Inbox is checked every few minutes instead.
+    Polling,
+    /// The push connection was lost; reconnecting with increasing delays (the Inbox is polled meanwhile).
+    Reconnecting,
+}
+
+impl PushMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            PushMode::Off => "",
+            PushMode::Idle => "Waiting for new mail",
+            PushMode::Polling => "Checking for new mail every few minutes",
+            PushMode::Reconnecting => "Reconnecting",
+        }
+    }
+}
+
+/// An OAuth sign-in started by `accounts.oauthSignIn`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OAuthFlow {
+    pub provider: String,
+    /// "device" or "browser".
+    pub flow: String,
+    /// "starting", "waiting", "done", "failed" or "cancelled".
+    pub status: String,
+    pub user_code: Option<String>,
+    pub verification_uri: Option<String>,
+    pub verification_uri_complete: Option<String>,
+    /// Browser flow: the page to open.
+    pub auth_url: Option<String>,
+    pub error: Option<String>,
+}
+
+impl OAuthFlow {
+    pub fn to_json(&self, account: AccountId) -> Value {
+        json!({
+            "account": account.0,
+            "provider": self.provider,
+            "flow": self.flow,
+            "status": self.status,
+            "userCode": self.user_code,
+            "verificationUri": self.verification_uri,
+            "verificationUriComplete": self.verification_uri_complete,
+            "authUrl": self.auth_url,
+            "error": self.error,
+        })
+    }
 }
 
 /// What the status bar and the Send/Receive Progress dialog show.
@@ -204,6 +264,15 @@ struct AccountRun {
     last_sync: Option<i64>,
     /// Automatic runs wait until then after a run could not start.
     blocked_until: i64,
+    /// Push state reported by the worker.
+    push: PushMode,
+    push_error: Option<String>,
+    /// A `Push` message asking the worker to IDLE was sent (and not withdrawn).
+    push_on: bool,
+    /// Last scheduled send/receive (per account: each has its own interval).
+    last_auto: Option<i64>,
+    /// Last fallback Inbox check (push not available).
+    last_poll: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -222,10 +291,22 @@ pub struct SyncState {
     /// Last Test Account Settings result per account.
     pub tests: BTreeMap<AccountId, TestReport>,
     runs: BTreeMap<AccountId, AccountRun>,
-    last_auto: Option<i64>,
     /// Something happened since the status was last computed.
     dirty: bool,
     pub(crate) track: Track,
+    /// Account options and bookkeeping (`account-options.json`, see `accounts.rs`).
+    pub(crate) prefs: crate::accounts::PrefsSlot,
+    /// Marked items to download in full with the account's next run.
+    pub(crate) fetch: BTreeMap<AccountId, Vec<ItemId>>,
+    /// Accounts whose next run downloads new messages as headers only (Download Headers).
+    pub(crate) force_headers: BTreeSet<AccountId>,
+    /// JMAP accounts with local changes not sent yet (they have no change queue; see `sync/jmap.rs`).
+    pub(crate) jmap_dirty: BTreeSet<AccountId>,
+    /// OAuth sign-ins started in this session.
+    pub oauth: BTreeMap<AccountId, OAuthFlow>,
+    /// Test hook: HTTP options for OAuth endpoints (allows a local plain-HTTP token server).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) oauth_http: Option<mailcraft_net::ConnectOptions>,
     #[cfg(not(target_arch = "wasm32"))]
     rt: native::Runtime,
 }
@@ -279,9 +360,11 @@ impl Session {
             refresh_status(self);
             return Err(CmdError::Disabled("Working offline".into()));
         }
+        crate::accounts::load_prefs(self);
+        let accounts = group_members(self, accounts, &plan);
         let mut started = 0usize;
         let mut last_err = None;
-        for id in accounts {
+        for id in &accounts {
             match dispatch(self, *id, plan.clone()) {
                 Ok(true) => started = started.saturating_add(1),
                 Ok(false) => {}
@@ -303,6 +386,11 @@ impl Session {
             (0, Some(e)) if accounts.len() == 1 => Err(CmdError::Failed(e)),
             _ => Ok(started),
         }
+    }
+
+    /// The push (IDLE) state of an account and the last push error.
+    pub fn push_state(&self, id: AccountId) -> (PushMode, Option<String>) {
+        self.sync.runs.get(&id).map(|r| (r.push, r.push_error.clone())).unwrap_or_default()
     }
 
     /// Applies finished worker results (new folders and messages, flag changes, removed messages, sent
@@ -387,13 +475,45 @@ pub(crate) fn server_accounts(s: &Session) -> Vec<AccountId> {
     s.mailbox.accounts.iter().filter(|a| is_server_account(a.kind)).map(|a| a.id).collect()
 }
 
+/// Send/Receive Groups: a run of the whole "All Accounts" group (every server account, all folders) skips
+/// the accounts taken out of the group (`accounts.options` `include: false`); a run naming accounts or folders
+/// runs them as asked.
+fn group_members(s: &Session, accounts: &[AccountId], plan: &Plan) -> Vec<AccountId> {
+    let all: BTreeSet<AccountId> = server_accounts(s).into_iter().collect();
+    let asked: BTreeSet<AccountId> = accounts.iter().copied().collect();
+    if plan.folders.is_some() || asked != all {
+        return accounts.to_vec();
+    }
+    accounts
+        .iter()
+        .copied()
+        .filter(|a| crate::accounts::account_options(s, *a).include_in_send_receive)
+        .collect()
+}
+
+/// The accounts in the "All Accounts" Send/Receive group.
+pub fn group_accounts(s: &Session) -> Vec<AccountId> {
+    server_accounts(s)
+        .into_iter()
+        .filter(|a| crate::accounts::account_options(s, *a).include_in_send_receive)
+        .collect()
+}
+
+/// Account options changed: the status and push follow on the next poll.
+pub(crate) fn options_changed(s: &mut Session, id: AccountId) {
+    if let Some(r) = s.sync.runs.get_mut(&id) {
+        r.last_auto = None;
+    }
+    s.sync.dirty = true;
+}
+
 /// After `compose.send`: sends the Outbox of `account` now when "Send immediately when connected" is on.
 /// Problems only show in the status (the message waits in the Outbox either way).
 pub(crate) fn send_now(s: &mut Session, account: AccountId) {
     if s.view.work_offline || !s.view.send_immediately {
         return;
     }
-    if s.mailbox.account(account).is_none_or(|a| a.kind != AccountKind::Imap) {
+    if s.mailbox.account(account).is_none_or(|a| !is_server_account(a.kind)) {
         return;
     }
     let plan = Plan { send: true, receive: false, folders: None, user: false };
@@ -410,6 +530,9 @@ pub(crate) fn send_now(s: &mut Session, account: AccountId) {
 pub(crate) fn forget_account(s: &mut Session, id: AccountId) {
     s.sync.runs.remove(&id);
     s.sync.tests.remove(&id);
+    s.sync.fetch.remove(&id);
+    s.sync.force_headers.remove(&id);
+    s.sync.oauth.remove(&id);
     #[cfg(not(target_arch = "wasm32"))]
     s.sync.rt.forget(id);
     refresh_status(s);
@@ -459,6 +582,7 @@ fn refresh_status(s: &mut Session) {
             last_sync: run.and_then(|r| r.last_sync),
             pending_changes: a.sync.pending.len(),
             outbox,
+            push: run.map(|r| r.push).unwrap_or_default(),
         };
         if busy && busy_text.is_none() {
             busy_text = Some(row.progress.clone());
@@ -517,8 +641,12 @@ fn poll_events(_: &mut Session) -> bool {
     false
 }
 
-/// Starts automatic runs: every N minutes (Options), and for queued server changes that are due.
+/// Starts automatic runs: every N minutes (each account's Send/Receive group interval, else Options ›
+/// Advanced), for queued server changes that are due, and Inbox checks of accounts whose server cannot
+/// push; starts and stops push (IMAP IDLE) as the options and Work Offline ask.
 fn tick(s: &mut Session) {
+    crate::accounts::load_prefs(s);
+    manage_push(s);
     if s.view.work_offline {
         return;
     }
@@ -526,32 +654,52 @@ fn tick(s: &mut Session) {
         .mailbox
         .accounts
         .iter()
-        .filter(|a| a.kind == AccountKind::Imap && a.incoming.is_some())
+        .filter(|a| is_server_account(a.kind) && a.incoming.is_some())
         .map(|a| a.id)
         .collect();
     if accounts.is_empty() {
         return;
     }
     let now = s.now().unix;
-    let every = i64::from(s.view.auto_send_receive_minutes).saturating_mul(60);
-    let mut auto = false;
-    if every > 0 {
-        match s.sync.last_auto {
-            None => s.sync.last_auto = Some(now),
-            Some(t) if now.saturating_sub(t) >= every => {
-                s.sync.last_auto = Some(now);
-                auto = true;
-            }
-            Some(_) => {}
-        }
-    }
+    let global = s.view.auto_send_receive_minutes;
     for id in accounts {
+        let opts = crate::accounts::account_options(s, id);
+        let every = i64::from(opts.interval_minutes.unwrap_or(global)).saturating_mul(60);
+        let poll_every = i64::from(opts.poll_minutes.max(1)).saturating_mul(60);
+        let run = s.sync.runs.entry(id).or_default();
+        let mut auto = false;
+        if every > 0 && opts.include_in_send_receive {
+            match run.last_auto {
+                None => run.last_auto = Some(now),
+                Some(t) if now.saturating_sub(t) >= every => {
+                    run.last_auto = Some(now);
+                    auto = true;
+                }
+                Some(_) => {}
+            }
+        }
+        // Fallback polling: push wanted but the server cannot (or the connection is being re-made).
+        let mut poll = false;
+        if opts.push && matches!(run.push, PushMode::Polling | PushMode::Reconnecting) {
+            match run.last_poll {
+                None => run.last_poll = Some(now),
+                Some(t) if now.saturating_sub(t) >= poll_every => {
+                    run.last_poll = Some(now);
+                    poll = true;
+                }
+                Some(_) => {}
+            }
+        }
         if s.sync.busy(id) || s.sync.runs.get(&id).is_some_and(|r| r.blocked_until > now) {
             continue;
         }
-        let due = s.mailbox.account(id).is_some_and(|a| has_due_ops(&s.mailbox, a, now));
+        let due = s.mailbox.account(id).is_some_and(|a| has_due_ops(&s.mailbox, a, now))
+            || s.sync.jmap_dirty.remove(&id);
         let plan = if auto {
             Plan { send: true, receive: true, folders: None, user: false }
+        } else if poll {
+            let inbox = s.mailbox.role_folder(id, mailcraft_model::FolderRole::Inbox);
+            Plan { send: false, receive: true, folders: inbox.map(|f| vec![f]), user: false }
         } else if due {
             Plan::default()
         } else {
@@ -563,6 +711,65 @@ fn tick(s: &mut Session) {
             run.error = Some(e);
             run.blocked_until = now.saturating_add(BLOCKED_RETRY_SECS);
         }
+    }
+}
+
+/// Starts push (IDLE on the Inbox) on IMAP accounts that want it and have connected once, and stops it when
+/// offline or no longer wanted.
+fn manage_push(s: &mut Session) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // JMAP push (EventSource) is not implemented: accounts that want push have their Inbox polled.
+        let jmap: Vec<AccountId> = s
+            .mailbox
+            .accounts
+            .iter()
+            .filter(|a| a.kind == AccountKind::Jmap && a.incoming.is_some())
+            .map(|a| a.id)
+            .collect();
+        for id in jmap {
+            let want = !s.view.work_offline && crate::accounts::account_options(s, id).push;
+            if let Some(run) = s.sync.runs.get_mut(&id) {
+                let mode = if want && run.last_sync.is_some() { PushMode::Polling } else { PushMode::Off };
+                if run.push != mode {
+                    run.push = mode;
+                    s.sync.dirty = true;
+                }
+            }
+        }
+        let ids: Vec<AccountId> = s
+            .mailbox
+            .accounts
+            .iter()
+            .filter(|a| a.kind == AccountKind::Imap && a.incoming.is_some())
+            .map(|a| a.id)
+            .collect();
+        for id in ids {
+            let opts = crate::accounts::account_options(s, id);
+            let has_worker = s.sync.rt.has_worker(id);
+            let Some(run) = s.sync.runs.get(&id) else { continue };
+            let want = !s.view.work_offline
+                && opts.push
+                && !opts.pop3
+                && has_worker
+                && run.last_sync.is_some()
+                && run.error.is_none();
+            if want != run.push_on {
+                let folder = want.then(|| "INBOX".to_owned());
+                let sent = s.sync.rt.push(id, folder);
+                if let Some(r) = s.sync.runs.get_mut(&id) {
+                    r.push_on = want && sent;
+                    if !want {
+                        r.push = PushMode::Off;
+                    }
+                }
+                s.sync.dirty = true;
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = s;
     }
 }
 
@@ -711,20 +918,44 @@ fn set_remote_id(mb: &mut Mailbox, id: ItemId, uid: Option<u32>) {
 
 /// Queues the server changes that turn `before` into the current mailbox (after a command or an undo).
 pub(crate) fn queue_local_changes(s: &mut Session, before: &Mailbox) -> usize {
+    crate::accounts::load_prefs(s);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let jmap: Vec<AccountId> =
+            s.mailbox.accounts.iter().filter(|a| a.kind == AccountKind::Jmap).map(|a| a.id).collect();
+        for a in jmap {
+            if jmap::changed(before, &s.mailbox, a) {
+                s.sync.jmap_dirty.insert(a);
+            }
+        }
+    }
     let inflight = s.sync.inflight_ops();
-    queue_changes(before, &mut s.mailbox, &inflight)
+    let pop3: BTreeSet<AccountId> =
+        s.mailbox.accounts.iter().filter(|a| crate::accounts::is_pop3(s, a.id)).map(|a| a.id).collect();
+    queue_changes_except(before, &mut s.mailbox, &inflight, &pop3)
 }
 
 /// Compares `before` and `after` for IMAP accounts and appends [`RemoteOp`]s to the accounts' queues.
 /// Adjusts `after` as the server will see it: server names of new/renamed folders, cleared UIDs of moved or
 /// copied items, and queued (not yet dispatched) operations that a later change made moot. Returns how many
 /// operations were queued.
+#[cfg(test)]
 pub(crate) fn queue_changes(before: &Mailbox, after: &mut Mailbox, inflight: &Inflight) -> usize {
-    if !after.accounts.iter().any(|a| a.kind == AccountKind::Imap) {
+    queue_changes_except(before, after, inflight, &BTreeSet::new())
+}
+
+/// [`queue_changes`] leaving out `skip` (POP3 accounts: their folders are local).
+pub(crate) fn queue_changes_except(
+    before: &Mailbox,
+    after: &mut Mailbox,
+    inflight: &Inflight,
+    skip: &BTreeSet<AccountId>,
+) -> usize {
+    if !after.accounts.iter().any(|a| a.kind == AccountKind::Imap && !skip.contains(&a.id)) {
         return 0;
     }
     let mut q: Vec<(AccountId, RemoteOp)> = Vec::new();
-    folder_changes(before, after, &mut q);
+    folder_changes(before, after, skip, &mut q);
     item_changes(before, after, inflight, &mut q);
     let n = q.len();
     for (account, op) in q {
@@ -737,11 +968,21 @@ fn is_imap(mb: &Mailbox, account: AccountId) -> bool {
     mb.account(account).is_some_and(|a| a.kind == AccountKind::Imap && a.incoming.is_some())
 }
 
-fn folder_changes(before: &Mailbox, after: &mut Mailbox, q: &mut Vec<(AccountId, RemoteOp)>) {
+fn folder_changes(
+    before: &Mailbox,
+    after: &mut Mailbox,
+    skip: &BTreeSet<AccountId>,
+    q: &mut Vec<(AccountId, RemoteOp)>,
+) {
     let mut ids: Vec<FolderId> = after
         .folders
         .values()
-        .filter(|f| f.kind == FolderKind::Mail && f.role.is_none() && is_imap(after, f.account))
+        .filter(|f| {
+            f.kind == FolderKind::Mail
+                && f.role.is_none()
+                && is_imap(after, f.account)
+                && !skip.contains(&f.account)
+        })
         .map(|f| f.id)
         .collect();
     ids.sort_by_cached_key(|id| (depth(after, *id), *id));
@@ -812,6 +1053,7 @@ fn folder_changes(before: &Mailbox, after: &mut Mailbox, q: &mut Vec<(AccountId,
                 && b.role.is_none()
                 && b.kind == FolderKind::Mail
                 && is_imap(after, b.account)
+                && !skip.contains(&b.account)
         })
         .filter_map(|b| Some((b.account, b.remote_name.clone()?)))
         .collect();
@@ -991,6 +1233,8 @@ fn item_changes(
 /// Undo/redo replaced `live` with a snapshot (now `s.mailbox`): keep what synchronisation did meanwhile and
 /// queue the server changes that revert the undone command.
 pub(crate) fn after_restore(s: &mut Session, live: &Mailbox) {
+    // Internet calendars keep their last refresh (refreshes are not undo steps).
+    crate::cmd::calendar::subscribe::carry_over(live, &mut s.mailbox);
     if !live.accounts.iter().any(|a| a.kind == AccountKind::Imap) {
         return;
     }
@@ -1026,11 +1270,14 @@ fn carry_over(live: &Mailbox, restored: &mut Mailbox, track: &Track) {
             restored.mail.retain(|_, m| !sub.contains(&m.folder));
         }
     }
-    // Server names of folders present in both.
+    // Server names of folders present in both (calendar folders keep their properties there instead, which
+    // undo restores: see `cmd::calendar::props`).
     let names: Vec<(FolderId, Option<String>)> = restored
         .folders
         .keys()
-        .filter_map(|id| live.folders.get(id).map(|l| (*id, l.remote_name.clone())))
+        .filter_map(|id| live.folders.get(id).map(|l| (*id, l)))
+        .filter(|(_, l)| l.kind != FolderKind::Calendar)
+        .map(|(id, l)| (id, l.remote_name.clone()))
         .collect();
     for (id, name) in names {
         if let Some(f) = restored.folders.get_mut(&id) {
@@ -1144,1194 +1391,53 @@ fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
 // Native: workers, jobs and results
 // =======================================================================================================
 
+pub mod cmds;
 #[cfg(not(target_arch = "wasm32"))]
-mod native {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, mpsc};
-    use std::time::Duration;
+mod jmap;
+#[cfg(not(target_arch = "wasm32"))]
+mod native;
 
-    use mailcraft_net::smtp::{SmtpClient, SmtpSettings};
-    use mailcraft_net::sync::{FolderState, ImapAccount, ImapSettings, RemoteFolder, SyncDelta};
-    use mailcraft_net::{ConnectOptions, Credentials, NetError};
+// =======================================================================================================
+// OAuth sign-in
+// =======================================================================================================
 
-    use super::*;
-    use crate::accounts::{account_secret, pem_certificates};
-    use mailcraft_model::account::CredentialKind;
-    use mailcraft_model::{Account, FolderRole, ServerSettings};
-
-    /// Most batches of new messages fetched for one folder in one run.
-    const MAX_ROUNDS_PER_FOLDER: usize = 50;
-    /// Most events applied by one poll (the rest wait for the next one).
-    const MAX_EVENTS_PER_POLL: usize = 5_000;
-
-    /// Connection settings for one account (built on the session thread, used by the worker).
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub(super) struct Conn {
-        imap: ImapSettings,
-        smtp: Option<SmtpSettings>,
+/// Starts the OAuth sign-in of `id` with the registration stored in its options (`device`: RFC 8628 device
+/// flow, else the browser flow with PKCE and a loopback redirect). Returns the sign-in state as JSON.
+pub(crate) fn start_oauth(
+    s: &mut Session,
+    id: AccountId,
+    address: &str,
+    device: bool,
+) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        native::start_oauth(s, id, address, device)
     }
-
-    struct Outgoing {
-        item: ItemId,
-        from: String,
-        rcpts: Vec<String>,
-        raw: Vec<u8>,
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, id, address, device);
+        Err("OAuth sign-in is not available in the browser.".into())
     }
+}
 
-    struct Receive {
-        only: Option<Vec<String>>,
-        states: BTreeMap<String, FolderState>,
+/// The state of an account's OAuth sign-in (`status: "none"` when none was started).
+pub(crate) fn oauth_status(s: &Session, id: AccountId) -> Value {
+    match s.sync.oauth.get(&id) {
+        Some(f) => f.to_json(id),
+        None => json!({"account": id.0, "status": "none"}),
     }
+}
 
-    struct Job {
-        conn: Conn,
-        ops: Vec<(u64, RemoteOp, Option<Vec<u8>>)>,
-        outgoing: Vec<Outgoing>,
-        receive: Option<Receive>,
+/// Cancels a running OAuth sign-in; true when one was running.
+pub(crate) fn cancel_oauth(s: &mut Session, id: AccountId) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        native::cancel_oauth(s, id)
     }
-
-    pub(super) enum OpOutcome {
-        Done,
-        NewUid(Option<u32>),
-    }
-
-    pub(super) struct OpError {
-        message: String,
-        transient: bool,
-    }
-
-    pub(super) enum Event {
-        Progress { account: AccountId, text: String },
-        OpDone { account: AccountId, op: u64, result: Result<OpOutcome, OpError> },
-        Sent { account: AccountId, item: ItemId, result: Result<(), String> },
-        Folders { account: AccountId, folders: Vec<RemoteFolder> },
-        Delta { account: AccountId, name: String, delta: SyncDelta },
-        FolderFailed { account: AccountId, name: String, error: String },
-        Done { account: AccountId, error: Option<String> },
-        Test { account: AccountId, report: TestReport },
-    }
-
-    impl Event {
-        fn account(&self) -> AccountId {
-            match self {
-                Event::Progress { account, .. }
-                | Event::OpDone { account, .. }
-                | Event::Sent { account, .. }
-                | Event::Folders { account, .. }
-                | Event::Delta { account, .. }
-                | Event::FolderFailed { account, .. }
-                | Event::Done { account, .. }
-                | Event::Test { account, .. } => *account,
-            }
-        }
-    }
-
-    struct Worker {
-        jobs: mpsc::Sender<Job>,
-        cancel: Arc<AtomicBool>,
-        /// Tags this worker's events: results of a worker that was replaced or forgotten (account removed,
-        /// its id reused, its server changed) are dropped instead of being applied to the wrong account.
-        serial: u64,
-    }
-
-    /// Serial of events not tied to a worker (Test Account Settings).
-    const NO_WORKER: u64 = 0;
-
-    /// Where a worker sends its events.
-    #[derive(Clone)]
-    struct Events {
-        tx: mpsc::Sender<(u64, Event)>,
-        serial: u64,
-    }
-
-    impl Events {
-        /// False when the session is gone.
-        fn send(&self, e: Event) -> bool {
-            self.tx.send((self.serial, e)).is_ok()
-        }
-    }
-
-    pub(super) struct Runtime {
-        tx: mpsc::Sender<(u64, Event)>,
-        rx: mpsc::Receiver<(u64, Event)>,
-        workers: BTreeMap<AccountId, Worker>,
-        last_serial: u64,
-    }
-
-    impl Default for Runtime {
-        fn default() -> Self {
-            let (tx, rx) = mpsc::channel();
-            Runtime { tx, rx, workers: BTreeMap::new(), last_serial: NO_WORKER }
-        }
-    }
-
-    impl Drop for Runtime {
-        /// The session is closing: workers stop after their current step (dropping the job senders then ends
-        /// their threads) instead of finishing a long download nobody will apply.
-        fn drop(&mut self) {
-            for w in self.workers.values() {
-                w.cancel.store(true, Ordering::SeqCst);
-            }
-        }
-    }
-
-    impl Runtime {
-        pub(super) fn cancel(&self, id: AccountId) {
-            if let Some(w) = self.workers.get(&id) {
-                w.cancel.store(true, Ordering::SeqCst);
-            }
-        }
-
-        /// Dropping the job sender ends the worker after its current step; its events are ignored from now on.
-        pub(super) fn forget(&mut self, id: AccountId) {
-            if let Some(w) = self.workers.remove(&id) {
-                w.cancel.store(true, Ordering::SeqCst);
-            }
-        }
-
-        fn submit(&mut self, account: AccountId, job: Job) -> Result<(), String> {
-            let mut job = Some(job);
-            for _ in 0..2 {
-                if !self.workers.contains_key(&account) {
-                    let (jtx, jrx) = mpsc::channel::<Job>();
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    self.last_serial = self.last_serial.saturating_add(1);
-                    let serial = self.last_serial;
-                    let events = Events { tx: self.tx.clone(), serial };
-                    let c2 = Arc::clone(&cancel);
-                    std::thread::Builder::new()
-                        .name(format!("mailcraft-sync-{}", account.0))
-                        .spawn(move || worker_main(account, jrx, events, c2))
-                        .map_err(|e| format!("cannot start the send/receive thread: {e}"))?;
-                    self.workers.insert(account, Worker { jobs: jtx, cancel, serial });
-                }
-                let Some(w) = self.workers.get(&account) else { continue };
-                w.cancel.store(false, Ordering::SeqCst);
-                let Some(j) = job.take() else { break };
-                match w.jobs.send(j) {
-                    Ok(()) => return Ok(()),
-                    Err(mpsc::SendError(j)) => {
-                        // The worker ended (it should not): start a new one.
-                        job = Some(j);
-                        self.workers.remove(&account);
-                    }
-                }
-            }
-            Err("the send/receive thread is not running".into())
-        }
-    }
-
-    // ---------------------------------------------------------------------------------------------------
-    // Settings
-    // ---------------------------------------------------------------------------------------------------
-
-    fn connect_options(srv: &ServerSettings) -> Result<ConnectOptions, String> {
-        let mut o = ConnectOptions {
-            connect_timeout: Duration::from_secs(20),
-            io_timeout: Duration::from_secs(60),
-            ..ConnectOptions::default()
-        };
-        if let Some(pem) = &srv.extra_root_pem {
-            o.tls.extra_roots_der = pem_certificates(pem)?;
-        }
-        o.allow_plaintext_auth = srv.allow_plaintext_auth;
-        Ok(o)
-    }
-
-    fn credentials(a: &Account, user: &str, secret: String) -> Credentials {
-        match a.credential {
-            CredentialKind::Password => Credentials::password(user, secret),
-            CredentialKind::OAuthToken => Credentials::oauth2(user, secret),
-        }
-    }
-
-    pub(super) fn conn_settings(s: &Session, a: &Account) -> Result<Conn, String> {
-        let inc = a.incoming.as_ref().ok_or("The account has no incoming mail server.")?;
-        if inc.host.trim().is_empty() {
-            return Err("The account has no incoming mail server.".into());
-        }
-        let secret = account_secret(s, a.id, false)
-            .ok_or_else(|| format!("Enter the password for {} (Account Settings).", a.address))?;
-        let user = if inc.username.is_empty() { a.address.clone() } else { inc.username.clone() };
-        let mut imap = ImapSettings::from_server(inc, credentials(a, &user, secret));
-        imap.options = connect_options(inc)?;
-        let smtp = match &a.outgoing {
-            Some(o) if !o.host.trim().is_empty() => {
-                let mut st = SmtpSettings::new(o.host.clone(), o.port, o.security);
-                st.auth_mechanism = o.auth.clone();
-                st.options = connect_options(o)?;
-                let user = if o.username.is_empty() { a.address.clone() } else { o.username.clone() };
-                st.credentials = account_secret(s, a.id, true).map(|sec| credentials(a, &user, sec));
-                Some(st)
-            }
-            _ => None,
-        };
-        Ok(Conn { imap, smtp })
-    }
-
-    // ---------------------------------------------------------------------------------------------------
-    // Dispatch (session thread)
-    // ---------------------------------------------------------------------------------------------------
-
-    pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<bool, String> {
-        let Some(a) = s.mailbox.account(id).cloned() else { return Ok(false) };
-        match a.kind {
-            AccountKind::Imap => {}
-            AccountKind::Jmap => return Err("Send/Receive for JMAP accounts is not available yet.".into()),
-            AccountKind::Local | AccountKind::Exchange => return Ok(false),
-        }
-        if let Some(run) = s.sync.runs.get_mut(&id)
-            && run.busy.is_some()
-        {
-            match run.again.as_mut() {
-                Some(again) => again.merge(&plan),
-                None => run.again = Some(plan),
-            }
-            return Ok(false);
-        }
-        let conn = conn_settings(s, &a)?;
-        let now = s.now().unix;
-        let ops = job_ops(s, &a, &plan, now);
-        let mut outgoing = Vec::new();
-        if plan.send
-            && a.outgoing.is_some()
-            && let Some(outbox) = s.mailbox.role_folder(id, FolderRole::Outbox)
-        {
-            let mut items: Vec<&MailItem> = s
-                .mailbox
-                .items_in(outbox)
-                .into_iter()
-                .filter(|m| !m.is_draft && m.sent.is_none_or(|t| t.unix <= now))
-                .collect();
-            items.sort_by_key(|m| (m.received.unix, m.id));
-            for m in items {
-                let mut rcpts: Vec<String> = Vec::new();
-                for addr in m.to.iter().chain(&m.cc).chain(&m.bcc) {
-                    let x = addr.addr.trim().to_owned();
-                    if !x.is_empty() && !rcpts.iter().any(|r| r.eq_ignore_ascii_case(&x)) {
-                        rcpts.push(x);
-                    }
-                }
-                let from = if a.address.trim().is_empty() {
-                    m.from.as_ref().map(|f| f.addr.clone()).unwrap_or_default()
-                } else {
-                    a.address.trim().to_owned()
-                };
-                outgoing.push(Outgoing { item: m.id, from, rcpts, raw: item_source(s, m) });
-            }
-        }
-        // Sending before the first update: list the folders so the sent copy can be filed on the server.
-        let sent_unmapped = s
-            .mailbox
-            .role_folder(id, FolderRole::SentItems)
-            .and_then(|f| s.mailbox.folder(f))
-            .is_some_and(|f| f.remote_name.is_none());
-        let list_only = !plan.receive && !outgoing.is_empty() && sent_unmapped && !a.server_saves_sent;
-        let receive = (plan.receive || list_only).then(|| {
-            let mut uids: BTreeMap<FolderId, Vec<u32>> = BTreeMap::new();
-            for m in s.mailbox.mail.values() {
-                if let Some(u) = uid_of(m) {
-                    uids.entry(m.folder).or_default().push(u);
-                }
-            }
-            // UIDs that queued changes still refer to count as known: a message moved or deleted here whose
-            // server change has not run yet must not be downloaded again as new.
-            let mut queued: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
-            for p in &a.sync.pending {
-                if let RemoteOp::Flags { folder, uid, .. }
-                | RemoteOp::Move { folder, uid, .. }
-                | RemoteOp::Expunge { folder, uid } = &p.op
-                {
-                    queued.entry(folder.as_str()).or_default().push(*uid);
-                }
-            }
-            let mut states = BTreeMap::new();
-            for f in s.mailbox.folders.values().filter(|f| f.account == id && f.kind == FolderKind::Mail) {
-                let Some(name) = &f.remote_name else { continue };
-                let st = a.sync.folders.get(&f.id).cloned().unwrap_or_default();
-                let mut list = uids.remove(&f.id).unwrap_or_default();
-                list.extend(queued.remove(name.as_str()).unwrap_or_default());
-                list.sort_unstable();
-                list.dedup();
-                states.insert(
-                    name.clone(),
-                    FolderState {
-                        uidvalidity: st.uidvalidity,
-                        uidnext: st.uidnext,
-                        highest_modseq: st.highest_modseq,
-                        uids: list,
-                    },
-                );
-            }
-            let only = if list_only {
-                Some(Vec::new())
-            } else {
-                plan.folders.as_ref().map(|fs| {
-                    fs.iter()
-                        .filter_map(|f| s.mailbox.folder(*f).and_then(|f| f.remote_name.clone()))
-                        .collect()
-                })
-            };
-            Receive { only, states }
-        });
-        if ops.is_empty() && outgoing.is_empty() && receive.is_none() {
-            return Ok(false);
-        }
-        let inflight = InFlight {
-            ops: ops.iter().map(|(i, _, _)| *i).collect(),
-            sending: outgoing.iter().map(|o| o.item).collect(),
-        };
-        let progress = if receive.is_some() || !ops.is_empty() { "Connecting…" } else { "Sending…" };
-        s.sync.rt.submit(id, Job { conn, ops, outgoing, receive })?;
-        let run = s.sync.runs.entry(id).or_default();
-        run.busy = Some(inflight);
-        run.progress = progress.into();
-        run.error = None;
-        Ok(true)
-    }
-
-    // ---------------------------------------------------------------------------------------------------
-    // Worker thread
-    // ---------------------------------------------------------------------------------------------------
-
-    fn worker_main(account: AccountId, jobs: mpsc::Receiver<Job>, events: Events, cancel: Arc<AtomicBool>) {
-        let mut imap: Option<ImapAccount> = None;
-        while let Ok(job) = jobs.recv() {
-            let res = catch_unwind(AssertUnwindSafe(|| run_job(account, &mut imap, &job, &events, &cancel)));
-            let error = match res {
-                Ok(e) => e,
-                Err(_) => {
-                    imap = None;
-                    Some("internal error in send/receive".to_owned())
-                }
-            };
-            if !events.send(Event::Done { account, error }) {
-                break;
-            }
-        }
-        if let Some(mut a) = imap {
-            a.disconnect();
-        }
-    }
-
-    fn transient(e: &NetError) -> bool {
-        e.is_connection_lost()
-            || matches!(
-                e,
-                NetError::Connect(_) | NetError::Auth(_) | NetError::Insecure(_) | NetError::Tls(_)
-            )
-    }
-
-    fn exec_op(imap: &mut ImapAccount, op: &RemoteOp, raw: Option<&[u8]>) -> Result<OpOutcome, OpError> {
-        let res = match op {
-            RemoteOp::Flags { folder, uid, add, remove } => {
-                let add: Vec<&str> = add.iter().map(String::as_str).collect();
-                let remove: Vec<&str> = remove.iter().map(String::as_str).collect();
-                imap.push_flags(folder, &[*uid], &add, &remove).map(|()| OpOutcome::Done)
-            }
-            RemoteOp::Move { folder, uid, dest, .. } => imap.move_messages(folder, &[*uid], dest).map(|c| {
-                OpOutcome::NewUid(c.and_then(|c| c.pairs.iter().find(|(s, _)| s == uid).map(|(_, d)| *d)))
-            }),
-            RemoteOp::Append { folder, flags, .. } => match raw {
-                Some(raw) => {
-                    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-                    imap.append(folder, raw, &flags).map(OpOutcome::NewUid)
-                }
-                None => Err(NetError::Invalid("the message to upload no longer exists".into())),
-            },
-            RemoteOp::Expunge { folder, uid } => imap.expunge(folder, &[*uid]).map(|()| OpOutcome::Done),
-            RemoteOp::CreateFolder { name } => imap.create_folder(name).map(|()| OpOutcome::Done),
-            RemoteOp::RenameFolder { from, to } => imap.rename_folder(from, to).map(|()| OpOutcome::Done),
-            RemoteOp::DeleteFolder { name } => imap.delete_folder(name).map(|()| OpOutcome::Done),
-        };
-        res.map_err(|e| OpError { transient: transient(&e), message: e.to_string() })
-    }
-
-    fn run_job(
-        account: AccountId,
-        slot: &mut Option<ImapAccount>,
-        job: &Job,
-        events: &Events,
-        cancel: &AtomicBool,
-    ) -> Option<String> {
-        let send = |e: Event| {
-            if !events.send(e) {
-                // Nobody is listening any more (the session closed): stop at the next check.
-                cancel.store(true, Ordering::SeqCst);
-            }
-        };
-        let progress = |t: &str| send(Event::Progress { account, text: t.to_owned() });
-        let cancelled = || cancel.load(Ordering::SeqCst);
-        if slot.as_ref().is_some_and(|a| a.settings() != &job.conn.imap)
-            && let Some(mut old) = slot.take()
-        {
-            old.disconnect();
-        }
-        let imap = slot.get_or_insert_with(|| ImapAccount::new(job.conn.imap.clone()));
-        let mut error: Option<String> = None;
-        // 1. Local changes first, so the folders read below already contain them.
-        let total = job.ops.len();
-        for (i, (id, op, raw)) in job.ops.iter().enumerate() {
-            if cancelled() {
-                return Some("Send/Receive was cancelled.".into());
-            }
-            progress(&format!("Updating the server ({} of {total})…", i.saturating_add(1)));
-            let result = exec_op(imap, op, raw.as_deref());
-            let lost = match &result {
-                Err(e) if e.transient => Some(e.message.clone()),
-                _ => None,
-            };
-            send(Event::OpDone { account, op: *id, result });
-            if let Some(e) = lost {
-                // Keep the order of the queue: stop at the first connection problem.
-                error = Some(e);
-                break;
-            }
-        }
-        // 2. The folder list (before sending, so Sent Items is known when a sent message is filed).
-        let mut todo: Vec<(String, String)> = Vec::new();
-        if error.is_none()
-            && let Some(rcv) = &job.receive
-        {
-            if cancelled() {
-                return Some("Send/Receive was cancelled.".into());
-            }
-            progress("Updating the folder list…");
-            match imap.sync_folder_list() {
-                Ok(list) => {
-                    todo = list
-                        .iter()
-                        .filter(|f| f.selectable)
-                        .filter(|f| rcv.only.as_ref().is_none_or(|o| o.contains(&f.name)))
-                        .map(|f| (f.name.clone(), f.display_name.clone()))
-                        .collect();
-                    // Inbox first, then in name order.
-                    todo.sort_by_key(|(n, _)| (!n.eq_ignore_ascii_case("INBOX"), n.clone()));
-                    send(Event::Folders { account, folders: list });
-                }
-                Err(e) => error = Some(e.to_string()),
-            }
-        }
-        // 3. The Outbox (SMTP works even when the IMAP server does not).
-        if !job.outgoing.is_empty() {
-            send_outgoing(account, job, events, cancel, &mut error);
-        }
-        // 4. Folders.
-        if error.is_some() {
-            return error;
-        }
-        let Some(rcv) = &job.receive else { return error };
-        for (name, display) in todo {
-            if cancelled() {
-                return Some("Send/Receive was cancelled.".into());
-            }
-            progress(&format!("Updating {display}…"));
-            let mut since = rcv.states.get(&name).cloned().unwrap_or_default();
-            for _ in 0..MAX_ROUNDS_PER_FOLDER {
-                match imap.sync_folder(&name, &since) {
-                    Ok(delta) => {
-                        let more = delta.more;
-                        since = delta.state.clone();
-                        send(Event::Delta { account, name: name.clone(), delta });
-                        if !more || cancelled() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let lost = e.is_connection_lost();
-                        send(Event::FolderFailed { account, name: name.clone(), error: e.to_string() });
-                        if lost {
-                            return Some(e.to_string());
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        error
-    }
-
-    fn send_outgoing(
-        account: AccountId,
-        job: &Job,
-        events: &Events,
-        cancel: &AtomicBool,
-        error: &mut Option<String>,
-    ) {
-        let send = |e: Event| {
-            if !events.send(e) {
-                cancel.store(true, Ordering::SeqCst);
-            }
-        };
-        let Some(set) = &job.conn.smtp else {
-            for m in &job.outgoing {
-                send(Event::Sent {
-                    account,
-                    item: m.item,
-                    result: Err("The account has no outgoing mail server.".into()),
-                });
-            }
-            return;
-        };
-        send(Event::Progress { account, text: "Sending…".into() });
-        match SmtpClient::connect(set) {
-            Err(e) => {
-                let msg = e.to_string();
-                for m in &job.outgoing {
-                    send(Event::Sent { account, item: m.item, result: Err(msg.clone()) });
-                }
-                error.get_or_insert(msg);
-            }
-            Ok(mut c) => {
-                let n = job.outgoing.len();
-                for (i, m) in job.outgoing.iter().enumerate() {
-                    if cancel.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    send(Event::Progress {
-                        account,
-                        text: format!("Sending message {} of {n}…", i.saturating_add(1)),
-                    });
-                    let rcpts: Vec<&str> = m.rcpts.iter().map(String::as_str).collect();
-                    let result = c.send(&m.from, &rcpts, &m.raw).map_err(|e| e.to_string());
-                    send(Event::Sent { account, item: m.item, result });
-                    if !c.is_usable() {
-                        break;
-                    }
-                }
-                let _ = c.quit();
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------------------------------------------
-    // Test Account Settings
-    // ---------------------------------------------------------------------------------------------------
-
-    fn run_test(
-        account: AccountId,
-        kind: AccountKind,
-        conn: Result<Conn, String>,
-        jmap_url: String,
-    ) -> TestReport {
-        let mut r = TestReport { account: account.0, ..Default::default() };
-        let conn = match conn {
-            Ok(c) => c,
-            Err(e) => {
-                r.incoming = e;
-                return r;
-            }
-        };
-        if kind == AccountKind::Jmap {
-            let auth = match &conn.imap.credentials {
-                Credentials::Password { user, password } => {
-                    mailcraft_net::jmap::JmapAuth::Basic { user: user.clone(), password: password.clone() }
-                }
-                Credentials::OAuth2 { access_token, .. } => {
-                    mailcraft_net::jmap::JmapAuth::Bearer(access_token.clone())
-                }
-            };
-            let http = mailcraft_net::http::HttpClient::new(conn.imap.options.clone());
-            match mailcraft_net::jmap::JmapClient::connect(&jmap_url, auth, http) {
-                Ok(_) => {
-                    r.incoming_ok = true;
-                    r.incoming = format!("Signed in to {jmap_url} (JMAP).");
-                    r.outgoing_ok = Some(true);
-                    r.outgoing = "Sending uses the same JMAP server.".into();
-                }
-                Err(e) => r.incoming = e.to_string(),
-            }
-            return r;
-        }
-        let mut imap = ImapAccount::new(conn.imap.clone());
-        match imap.connect() {
-            Ok(_) => {
-                r.incoming_ok = true;
-                r.incoming = format!("Logged in to the incoming mail server {} (IMAP).", conn.imap.host);
-            }
-            Err(e) => r.incoming = e.to_string(),
-        }
-        imap.disconnect();
-        if let Some(set) = &conn.smtp {
-            match SmtpClient::connect(set) {
-                Ok(mut c) => {
-                    let _ = c.quit();
-                    r.outgoing_ok = Some(true);
-                    r.outgoing = if set.credentials.is_some() {
-                        format!("Logged in to the outgoing mail server {} (SMTP).", set.host)
-                    } else {
-                        format!("Connected to the outgoing mail server {} (SMTP).", set.host)
-                    };
-                }
-                Err(e) => {
-                    r.outgoing_ok = Some(false);
-                    r.outgoing = e.to_string();
-                }
-            }
-        }
-        r
-    }
-
-    pub(super) fn test_account(
-        s: &mut Session,
-        id: AccountId,
-        wait: bool,
-    ) -> Result<Option<TestReport>, CmdError> {
-        let Some(a) = s.mailbox.account(id).cloned() else {
-            return Err(CmdError::Params("no such account".into()));
-        };
-        let conn = conn_settings(s, &a);
-        let url = a.incoming.as_ref().map(|i| i.host.clone()).unwrap_or_default();
-        if wait {
-            let report = run_test(id, a.kind, conn, url);
-            s.sync.tests.insert(id, report.clone());
-            return Ok(Some(report));
-        }
-        let events = Events { tx: s.sync.rt.tx.clone(), serial: NO_WORKER };
-        std::thread::Builder::new()
-            .name(format!("mailcraft-test-{}", id.0))
-            .spawn(move || {
-                let report =
-                    catch_unwind(AssertUnwindSafe(|| run_test(id, a.kind, conn, url))).unwrap_or_else(|_| {
-                        TestReport { account: id.0, incoming: "internal error".into(), ..Default::default() }
-                    });
-                events.send(Event::Test { account: id, report });
-            })
-            .map_err(|e| CmdError::Failed(format!("cannot start the test: {e}")))?;
-        Ok(None)
-    }
-
-    // ---------------------------------------------------------------------------------------------------
-    // Applying results (session thread)
-    // ---------------------------------------------------------------------------------------------------
-
-    pub(super) fn poll_events(s: &mut Session) -> bool {
-        let mut events = Vec::new();
-        let mut received = false;
-        for _ in 0..MAX_EVENTS_PER_POLL {
-            let Ok((serial, e)) = s.sync.rt.rx.try_recv() else { break };
-            received = true;
-            // Results of a worker that was forgotten or replaced are dropped (its account may be gone, or
-            // a new account may have its id); test reports only need the account to exist.
-            let current = if serial == NO_WORKER {
-                s.mailbox.account(e.account()).is_some()
-            } else {
-                s.sync.rt.workers.get(&e.account()).is_some_and(|w| w.serial == serial)
-            };
-            if current {
-                events.push(e);
-            }
-        }
-        if !received {
-            return false;
-        }
-        s.sync.dirty = true;
-        if events.is_empty() {
-            return false;
-        }
-        // Progress, tests and the end of a run leave the mailbox alone: no snapshot needed.
-        let touches = events.iter().any(|e| {
-            matches!(
-                e,
-                Event::OpDone { .. } | Event::Sent { .. } | Event::Folders { .. } | Event::Delta { .. }
-            )
-        });
-        let before = touches.then(|| s.mailbox.clone());
-        let res = catch_unwind(AssertUnwindSafe(|| apply_all(s, events)));
-        let Some(before) = before else {
-            if res.is_err() {
-                log::error!("applying send/receive status panicked");
-            }
-            return false;
-        };
-        if res.is_err() {
-            log::error!("applying send/receive results panicked; the mailbox was restored");
-            s.mailbox = before;
-            return false;
-        }
-        let ops = crate::session::diff_ops(&before, &s.mailbox);
-        let changed = !ops.is_empty();
-        s.journal(ops);
-        s.tidy_selection();
-        changed
-    }
-
-    fn apply_all(s: &mut Session, events: Vec<Event>) {
-        let mut sent = Vec::new();
-        let mut done = Vec::new();
-        let mut new_inbox: Vec<ItemId> = Vec::new();
-        for ev in events {
-            match ev {
-                Event::Progress { account, text } => s.sync.runs.entry(account).or_default().progress = text,
-                Event::OpDone { account, op, result } => op_done(s, account, op, result),
-                Event::Folders { account, folders } => apply_folders(s, account, folders),
-                Event::Delta { account, name, delta } => {
-                    apply_delta(s, account, &name, delta, &mut new_inbox)
-                }
-                Event::FolderFailed { account, name, error } => {
-                    log::warn!("send/receive: folder {name} of account {}: {error}", account.0);
-                    s.sync.runs.entry(account).or_default().error = Some(format!("{name}: {error}"));
-                }
-                Event::Test { account, report } => {
-                    let name = s.mailbox.account(account).map(|a| a.display_name.clone()).unwrap_or_default();
-                    s.notify(if report.ok() {
-                        Notice::Info(format!("{name}: all tests completed successfully."))
-                    } else {
-                        let why = if report.incoming_ok { &report.outgoing } else { &report.incoming };
-                        Notice::Error(format!("{name}: the account test failed. {why}"))
-                    });
-                    s.sync.tests.insert(account, report);
-                }
-                e @ Event::Sent { .. } => sent.push(e),
-                e @ Event::Done { .. } => done.push(e),
-            }
-        }
-        // Changes below are local actions (sending files the message, rules move it): they reach the server
-        // through the queue like a command's changes.
-        if !sent.is_empty() || !new_inbox.is_empty() {
-            let mid = s.mailbox.clone();
-            for ev in sent {
-                if let Event::Sent { account, item, result } = ev {
-                    message_sent(s, account, item, result);
-                }
-            }
-            if !new_inbox.is_empty() {
-                let ids: Vec<ItemId> =
-                    new_inbox.into_iter().filter(|i| s.mailbox.mail.contains_key(i)).collect();
-                // Rules for received messages (client-side, like every rule here).
-                crate::cmd::rules::exec::on_new_mail(s, &ids);
-            }
-            queue_local_changes(s, &mid);
-        }
-        let inflight = s.sync.inflight_ops();
-        prune_stale_ops(&mut s.mailbox, &inflight);
-        for ev in done {
-            if let Event::Done { account, error } = ev {
-                run_done(s, account, error);
-            }
-        }
-    }
-
-    fn account_mut(s: &mut Session, id: AccountId) -> Option<&mut Account> {
-        s.mailbox.accounts.iter_mut().find(|a| a.id == id)
-    }
-
-    /// Drops queued uploads whose item is gone (not those in flight: their result still has to be
-    /// reconciled). Op ids are per account.
-    pub(super) fn prune_stale_ops(mb: &mut Mailbox, inflight: &Inflight) {
-        let mail = &mb.mail;
-        for a in mb.accounts.iter_mut() {
-            let account = a.id;
-            a.sync.pending.retain(|p| {
-                inflight.contains(&(account, p.id))
-                    || !matches!(&p.op, RemoteOp::Append { item, .. } if !mail.contains_key(item))
-            });
-        }
-    }
-
-    pub(super) fn op_done(s: &mut Session, account: AccountId, op: u64, result: Result<OpOutcome, OpError>) {
-        if let Some(b) = s.sync.runs.get_mut(&account).and_then(|r| r.busy.as_mut()) {
-            b.ops.remove(&op);
-        }
-        let now = s.now().unix;
-        let Some(a) = account_mut(s, account) else { return };
-        let Some(pos) = a.sync.pending.iter().position(|p| p.id == op) else { return };
-        match result {
-            Ok(outcome) => {
-                let p = a.sync.pending.remove(pos);
-                if let OpOutcome::NewUid(Some(uid)) = outcome
-                    && let RemoteOp::Move { dest: folder, item, .. } | RemoteOp::Append { folder, item, .. } =
-                        p.op
-                {
-                    landed(s, account, item, folder, uid);
-                }
-            }
-            Err(e) => {
-                let Some(p) = a.sync.pending.get_mut(pos) else { return };
-                p.attempts = p.attempts.saturating_add(1);
-                p.last_error = Some(e.message.clone());
-                p.not_before = now.saturating_add(backoff_secs(p.attempts));
-                if !e.transient || p.attempts >= MAX_ATTEMPTS {
-                    a.sync.pending.remove(pos);
-                    log::warn!("dropping a server change for account {}: {}", account.0, e.message);
-                    s.notify(Notice::Error(format!(
-                        "A change could not be made on the mail server: {}",
-                        e.message
-                    )));
-                }
-            }
-        }
-    }
-
-    /// A message reached server folder `folder` as `uid` (a finished move or upload of `item`). When the item
-    /// was moved again or deleted while that ran (the change could not be queued against a UID nobody knew
-    /// yet), the server copy follows it now: a queued upload of the item becomes a move, and a copy whose item
-    /// left the account or was deleted is removed, so it is not downloaded again.
-    fn landed(s: &mut Session, account: AccountId, item: ItemId, folder: String, uid: u32) {
-        let here = s.mailbox.mail.get(&item).and_then(|m| synced_folder(&s.mailbox, m.folder));
-        match here {
-            Some((a, name)) if a == account && name == folder => {
-                set_remote_id(&mut s.mailbox, item, Some(uid));
-                return;
-            }
-            Some((a, name)) if a == account => {
-                let inflight = s.sync.inflight_ops();
-                if let Some(acct) = account_mut(s, account)
-                    && let Some(p) = acct.sync.pending.iter_mut().find(|p| {
-                        !inflight.contains(&(account, p.id))
-                            && matches!(&p.op, RemoteOp::Append { item: i, folder: f, .. } if *i == item && *f == name)
-                    })
-                {
-                    p.op = RemoteOp::Move { folder, uid, dest: name, item };
-                }
-                return;
-            }
-            _ => {}
-        }
-        // Deleted, or now in a local folder or another account: the server copy goes, unless its folder is
-        // going away anyway.
-        if find_by_remote(&s.mailbox, account, &folder).is_some() {
-            push_op(&mut s.mailbox, account, RemoteOp::Expunge { folder, uid });
-        }
-    }
-
-    fn message_sent(s: &mut Session, account: AccountId, item: ItemId, result: Result<(), String>) {
-        if let Some(b) = s.sync.runs.get_mut(&account).and_then(|r| r.busy.as_mut()) {
-            b.sending.remove(&item);
-        }
-        let outbox = s.mailbox.role_folder(account, FolderRole::Outbox);
-        let Some(m) = s.mailbox.mail.get(&item) else { return };
-        if Some(m.folder) != outbox {
-            return;
-        }
-        let subject = if m.subject.trim().is_empty() { "(no subject)".to_owned() } else { m.subject.clone() };
-        match result {
-            Ok(()) => {
-                let saves = s.mailbox.account(account).is_some_and(|a| a.server_saves_sent);
-                let sent = s.mailbox.role_folder(account, FolderRole::SentItems);
-                match sent {
-                    Some(sent)
-                        if !saves || s.mailbox.folder(sent).is_some_and(|f| f.remote_name.is_none()) =>
-                    {
-                        if let Some(m) = s.mailbox.mail.get_mut(&item) {
-                            m.folder = sent;
-                            m.read = true;
-                            m.remote_id = None;
-                        }
-                    }
-                    // The server files its own copy (downloaded by the next update of Sent Items).
-                    _ => {
-                        s.mailbox.mail.remove(&item);
-                    }
-                }
-            }
-            Err(e) => {
-                s.sync.runs.entry(account).or_default().error = Some(e.clone());
-                s.notify(Notice::Error(format!(
-                    "The message \"{subject}\" could not be sent: {e} It stays in the Outbox, and the next \
-                     send/receive tries again."
-                )));
-            }
-        }
-    }
-
-    fn run_done(s: &mut Session, account: AccountId, error: Option<String>) {
-        let now = s.now().unix;
-        let run = s.sync.runs.entry(account).or_default();
-        run.busy = None;
-        run.progress.clear();
-        match error {
-            Some(e) => {
-                run.error = Some(e);
-                run.blocked_until = now.saturating_add(BLOCKED_RETRY_SECS.min(60));
-            }
-            None => {
-                if run.error.is_none() {
-                    run.last_sync = Some(now);
-                }
-                run.blocked_until = 0;
-            }
-        }
-        if let Some(again) = s.sync.runs.get_mut(&account).and_then(|r| r.again.take())
-            && let Err(e) = dispatch(s, account, again)
-        {
-            s.sync.runs.entry(account).or_default().error = Some(e);
-        }
-    }
-
-    /// UIDVALIDITY of server folder `name` changed: queued changes aimed at its old UIDs would hit other
-    /// messages now. Flag changes and removals are dropped (the folder is downloaded again); a move out of
-    /// it becomes an upload of the local item to where it was moved.
-    fn forget_old_uids(s: &mut Session, account: AccountId, name: &str) {
-        let inflight = s.sync.inflight_ops();
-        let mail = &s.mailbox.mail;
-        let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) else { return };
-        a.sync.pending.retain_mut(|p| {
-            if inflight.contains(&(account, p.id)) {
-                return true;
-            }
-            match &p.op {
-                RemoteOp::Flags { folder, .. } | RemoteOp::Expunge { folder, .. } => folder != name,
-                RemoteOp::Move { folder, dest, item, .. } if folder == name => match mail.get(item) {
-                    Some(m) => {
-                        let (dest, item) = (dest.clone(), *item);
-                        p.op = RemoteOp::Append { folder: dest, item, flags: upload_flags(m) };
-                        p.attempts = 0;
-                        p.not_before = 0;
-                        true
-                    }
-                    None => false,
-                },
-                _ => true,
-            }
-        });
-    }
-
-    fn find_by_remote(mb: &Mailbox, account: AccountId, name: &str) -> Option<FolderId> {
-        mb.folders
-            .values()
-            .find(|f| {
-                f.account == account && f.kind == FolderKind::Mail && f.remote_name.as_deref() == Some(name)
-            })
-            .map(|f| f.id)
-    }
-
-    fn apply_folders(s: &mut Session, account: AccountId, mut list: Vec<RemoteFolder>) {
-        let delim = list.iter().find_map(|f| f.delimiter);
-        if let Some(a) = account_mut(s, account)
-            && delim.is_some()
-            && a.sync.delimiter != delim
-        {
-            a.sync.delimiter = delim;
-        }
-        let d = delim.unwrap_or('/');
-        list.sort_by_cached_key(|f| (f.name.matches(d).count(), f.name.clone()));
-        let names: BTreeSet<String> = list.iter().map(|f| f.name.clone()).collect();
-        for rf in &list {
-            if find_by_remote(&s.mailbox, account, &rf.name).is_some() {
-                continue;
-            }
-            let set_name = |s: &mut Session, fid: FolderId| {
-                if let Some(f) = s.mailbox.folders.get_mut(&fid) {
-                    f.remote_name = Some(rf.name.clone());
-                }
-            };
-            if let Some(role) = rf.role
-                && role != FolderRole::Outbox
-                && let Some(fid) = s.mailbox.role_folder(account, role)
-                && s.mailbox.folder(fid).is_some_and(|f| f.remote_name.is_none())
-            {
-                set_name(s, fid);
-                continue;
-            }
-            let parent = rf.parent.as_deref().and_then(|p| find_by_remote(&s.mailbox, account, p));
-            let display = local_folder_name(&rf.display_name);
-            let adopt = s
-                .mailbox
-                .folders
-                .values()
-                .find(|f| {
-                    f.account == account
-                        && f.parent == parent
-                        && f.remote_name.is_none()
-                        && f.role.is_none()
-                        && f.kind == FolderKind::Mail
-                        && f.name.eq_ignore_ascii_case(&display)
-                })
-                .map(|f| f.id);
-            if let Some(fid) = adopt {
-                set_name(s, fid);
-                continue;
-            }
-            let taken = |mb: &Mailbox, n: &str| {
-                mb.folders
-                    .values()
-                    .any(|f| f.account == account && f.parent == parent && f.name.eq_ignore_ascii_case(n))
-            };
-            let mut name = display.clone();
-            let mut k = 2u32;
-            while taken(&s.mailbox, &name) && k < 1000 {
-                name = format!("{display} ({k})");
-                k = k.saturating_add(1);
-            }
-            let id = FolderId(s.mailbox.alloc_id());
-            s.mailbox.folders.insert(
-                id,
-                Folder {
-                    id,
-                    account,
-                    parent,
-                    name,
-                    kind: FolderKind::Mail,
-                    remote_name: Some(rf.name.clone()),
-                    ..Default::default()
-                },
-            );
-            s.sync.track.folders_created.insert(id);
-        }
-        // Folders gone from the server (unless a queued change is about to create them).
-        let queued: BTreeSet<String> = s
-            .mailbox
-            .account(account)
-            .map(|a| {
-                a.sync
-                    .pending
-                    .iter()
-                    .filter_map(|p| match &p.op {
-                        RemoteOp::CreateFolder { name } => Some(name.clone()),
-                        RemoteOp::RenameFolder { to, .. } => Some(to.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let gone: Vec<(FolderId, bool)> = s
-            .mailbox
-            .folders
-            .values()
-            .filter(|f| f.account == account && f.kind == FolderKind::Mail)
-            .filter(|f| f.remote_name.as_ref().is_some_and(|n| !names.contains(n) && !queued.contains(n)))
-            .map(|f| (f.id, f.role.is_some()))
-            .collect();
-        let mut remove = Vec::new();
-        for (fid, is_role) in gone {
-            if is_role {
-                if let Some(f) = s.mailbox.folders.get_mut(&fid) {
-                    f.remote_name = None;
-                }
-                for m in s.mailbox.mail.values_mut().filter(|m| m.folder == fid) {
-                    m.remote_id = None;
-                }
-                if let Some(a) = account_mut(s, account) {
-                    a.sync.folders.remove(&fid);
-                }
-            } else {
-                remove.push(fid);
-            }
-        }
-        if !remove.is_empty() {
-            let mut all = BTreeSet::new();
-            for f in &remove {
-                all.extend(s.mailbox.subtree(*f));
-            }
-            let items = remove_folders(&mut s.mailbox, &remove);
-            s.sync.track.removed.extend(items);
-            s.sync.track.folders_removed.extend(all);
-        }
-    }
-
-    pub(super) fn apply_delta(
-        s: &mut Session,
-        account: AccountId,
-        name: &str,
-        delta: SyncDelta,
-        new_inbox: &mut Vec<ItemId>,
-    ) {
-        let Some(fid) = find_by_remote(&s.mailbox, account, name) else { return };
-        let now = s.now();
-        let is_inbox = s.mailbox.folder(fid).is_some_and(|f| f.role == Some(FolderRole::Inbox));
-        let mut by_uid: BTreeMap<u32, ItemId> = BTreeMap::new();
-        for m in s.mailbox.mail.values().filter(|m| m.folder == fid) {
-            if let Some(u) = uid_of(m) {
-                by_uid.insert(u, m.id);
-            }
-        }
-        if delta.reset {
-            for (_, id) in std::mem::take(&mut by_uid) {
-                s.mailbox.mail.remove(&id);
-                s.sync.track.removed.insert(id);
-            }
-            forget_old_uids(s, account, name);
-        }
-        for uid in &delta.vanished {
-            if let Some(id) = by_uid.remove(uid) {
-                s.mailbox.mail.remove(&id);
-                s.sync.track.removed.insert(id);
-            }
-        }
-        // Flag changes: the server wins, except over a local change not sent yet.
-        let mut newer: BTreeSet<u32> = BTreeSet::new();
-        let mut failed: BTreeSet<u64> = BTreeSet::new();
-        if let Some(a) = s.mailbox.account(account) {
-            for p in &a.sync.pending {
-                if let RemoteOp::Flags { folder, uid, .. } = &p.op
-                    && folder == name
-                {
-                    if p.attempts == 0 {
-                        newer.insert(*uid);
-                    } else {
-                        failed.insert(p.id);
-                    }
-                }
-            }
-        }
-        if !failed.is_empty()
-            && let Some(a) = account_mut(s, account)
-        {
-            a.sync.pending.retain(|p| !failed.contains(&p.id));
-        }
-        for (uid, flags) in &delta.changed {
-            if newer.contains(uid) {
-                continue;
-            }
-            if let Some(id) = by_uid.get(uid)
-                && let Some(m) = s.mailbox.mail.get_mut(id)
-                && apply_server_flags(m, flags, now)
-            {
-                s.sync.track.flags.insert(*id);
-            }
-        }
-        for nm in delta.new {
-            if by_uid.contains_key(&nm.uid) {
-                continue;
-            }
-            let mut item = mailcraft_store::import::item_from_raw(&nm.raw, fid, now);
-            // A local copy waiting for this message (uploaded without a reported UID, or the server filed a
-            // sent message itself): adopt it instead of showing the message twice.
-            let adopt = item.message_id.as_ref().and_then(|mid| {
-                s.mailbox
-                    .mail
-                    .values()
-                    .find(|m| m.folder == fid && m.remote_id.is_none() && m.message_id.as_ref() == Some(mid))
-                    .map(|m| m.id)
-            });
-            if let Some(local) = adopt {
-                set_remote_id(&mut s.mailbox, local, Some(nm.uid));
-                if let Some(a) = account_mut(s, account) {
-                    a.sync
-                        .pending
-                        .retain(|p| !matches!(&p.op, RemoteOp::Append { item, .. } if *item == local));
-                }
-                by_uid.insert(nm.uid, local);
-                continue;
-            }
-            item.remote_id = Some(nm.uid.to_string());
-            apply_server_flags(&mut item, &nm.flags, now);
-            if nm.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Draft")) {
-                item.is_draft = true;
-            }
-            if let Some(size) = nm.size {
-                item.size = size;
-            }
-            let id = s.mailbox.add_mail(item);
-            s.sync.track.created.insert(id);
-            by_uid.insert(nm.uid, id);
-            if is_inbox {
-                new_inbox.push(id);
-            }
-        }
-        let st = mailcraft_model::account::RemoteFolderState {
-            uidvalidity: delta.state.uidvalidity,
-            uidnext: delta.state.uidnext,
-            highest_modseq: delta.state.highest_modseq,
-        };
-        if let Some(a) = account_mut(s, account)
-            && a.sync.folders.get(&fid) != Some(&st)
-        {
-            a.sync.folders.insert(fid, st);
-        }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, id);
+        false
     }
 }
 
@@ -2563,6 +1669,7 @@ mod tests {
                 flags: vec![],
                 internal_date: None,
                 size: None,
+                headers_only: false,
             }],
             state: mailcraft_net::sync::FolderState { uidvalidity: 99, uidnext: 2, ..Default::default() },
             ..Default::default()

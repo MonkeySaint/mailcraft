@@ -250,12 +250,27 @@ fn list(s: &mut Session, _: &Value) -> CmdResult {
     Ok(json!({"categories": s.mailbox.categories.iter().map(category_json).collect::<Vec<_>>()}))
 }
 
-/// Validates the Quick Click category and reports it. There is no session or mailbox field for it yet, so the
-/// caller (UI profile) keeps the returned value.
+/// Sets the Quick Click category (a category of the master list) in the profile settings
+/// (`advanced.quickClickCategory`, Options › Advanced › Quick Click): Categorize without a name and a click in
+/// the category column apply it.
 fn quick_click(s: &mut Session, p: &Value) -> CmdResult {
     let idx = find(s, req_str(p, "name")?)?;
     let name = s.mailbox.categories.get(idx).map(|c| c.name.clone()).unwrap_or_default();
+    crate::cmd::options::set_option(s, "advanced.quickClickCategory", &json!(name))?;
     Ok(json!({"quickClick": name}))
+}
+
+/// The Quick Click category: the one set with Set Quick Click while it is on the master list, else the first
+/// category; `None` without categories.
+pub fn quick_click_category(s: &Session) -> Option<String> {
+    let set = s.settings.text("advanced.quickClickCategory");
+    let set = set.trim();
+    s.mailbox
+        .categories
+        .iter()
+        .find(|c| !set.is_empty() && c.name.eq_ignore_ascii_case(set))
+        .or_else(|| s.mailbox.categories.first())
+        .map(|c| c.name.clone())
 }
 
 fn set_quick_click(s: &mut Session, p: &Value) -> CmdResult {
@@ -263,7 +278,7 @@ fn set_quick_click(s: &mut Session, p: &Value) -> CmdResult {
         return quick_click(s, p);
     }
     let cats: Vec<Value> = s.mailbox.categories.iter().map(category_json).collect();
-    dialog(s, "setQuickClick", json!({"categories": cats}))
+    dialog(s, "setQuickClick", json!({"categories": cats, "name": quick_click_category(s)}))
 }
 
 #[cfg(test)]
@@ -388,5 +403,32 @@ mod tests {
             "Red category"
         );
         assert_eq!(s.run("categories.list", &json!({})).unwrap()["categories"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn quick_click_category_and_flag_persist_and_apply() {
+        let (mut s, inbox, _) = session();
+        let first = s.mailbox.categories.first().unwrap().name.clone();
+        assert_eq!(quick_click_category(&s), Some(first));
+        s.run("categories.setQuickClick", &json!({"name": "Green category"})).unwrap();
+        assert_eq!(s.option("advanced.quickClickCategory"), Some(json!("Green category")));
+        assert_eq!(s.run("categories.setQuickClick", &json!({})).unwrap()["dialog"], "setQuickClick");
+        let id = s.mailbox.items_in(inbox).first().unwrap().id;
+        s.run("mail.categorize", &json!({"ids": [id.0]})).unwrap();
+        assert!(s.mailbox.mail[&id].categories.iter().any(|c| c == "Green category"));
+        // A Quick Click category that was deleted falls back to the first one.
+        s.run("categories.delete", &json!({"name": "Green category"})).unwrap();
+        assert_eq!(
+            quick_click_category(&s).as_deref(),
+            s.mailbox.categories.first().map(|c| c.name.as_str())
+        );
+
+        // Quick Click flag: a plain click / Insert on a message.
+        s.run("mail.setQuickClickFlag", &json!({"kind": "noDate"})).unwrap();
+        s.run("mail.flag", &json!({"ids": [id.0]})).unwrap();
+        assert!(matches!(
+            &s.mailbox.mail[&id].flag,
+            mailcraft_model::FlagState::Flagged { due: None, start: None, .. }
+        ));
     }
 }

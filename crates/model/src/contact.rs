@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{FolderId, ItemId};
+use crate::{FlagState, FolderId, ItemId};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostalAddress {
@@ -38,6 +38,12 @@ pub struct Contact {
     pub birthday: Option<String>,
     pub notes: String,
     pub categories: Vec<String>,
+    /// Follow-up flag (Home › Tags › Follow Up): contacts can be flagged like messages.
+    #[serde(default)]
+    pub flag: FlagState,
+    /// Private (Home › Tags › Private).
+    #[serde(default)]
+    pub private: bool,
 }
 
 impl Contact {

@@ -173,6 +173,10 @@ impl Session<'_> {
             "CONDSTORE",
             "ESEARCH",
         ];
+        if !self.ctx.config.imap_idle {
+            // IMAP4rev2 includes IDLE: a server without push offers neither.
+            c.retain(|x| *x != "IDLE" && *x != "IMAP4rev2");
+        }
         if !self.conn.is_tls() {
             c.push("STARTTLS");
         }
@@ -329,7 +333,7 @@ impl Session<'_> {
             (false, "LSUB") => self.list(p, out, true),
             (false, "STATUS") => self.status(p, out),
             (false, "APPEND") => self.append(p),
-            (false, "IDLE") => self.idle(p),
+            (false, "IDLE") => self.idle(p, out),
             (false, "UNSELECT") | (false, "CLOSE") => {
                 p.end()?;
                 self.need_sel()?;
@@ -796,11 +800,18 @@ impl Session<'_> {
         Ok(format!("[APPENDUID {v} {uid}] APPEND completed"))
     }
 
-    fn idle(&mut self, p: &mut Parser<'_>) -> Res {
+    fn idle(&mut self, p: &mut Parser<'_>, pending: &mut Vec<u8>) -> Res {
         self.need_auth()?;
         p.end()?;
+        // Changes that happened before IDLE are reported now, not after DONE (RFC 2177: the client is waiting
+        // for exactly these).
+        if !pending.is_empty() {
+            self.conn.write_all(pending)?;
+            pending.clear();
+        }
         self.conn.write_all(b"+ idling\r\n")?;
-        let mut seen_gen = self.shared().generation();
+        // Check once at the start: a change between the update above and now must not be missed.
+        let mut seen_gen = self.shared().generation().wrapping_sub(1);
         loop {
             let generation = self.shared().generation();
             if generation != seen_gen {

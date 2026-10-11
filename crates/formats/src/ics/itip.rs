@@ -1,13 +1,11 @@
 //! iTIP (RFC 5546) basics: meeting requests, replies and cancellations carried as `text/calendar`.
 
-use std::collections::BTreeSet;
-
 use mailcraft_mime::Mailbox;
 use mailcraft_model::calendar::ResponseStatus;
 use mailcraft_model::{Appointment, DateTime};
 
 use super::map::{self, EventOut};
-use super::{Event, ImportOptions, TimeZone};
+use super::{Event, ImportOptions};
 use crate::Result;
 
 /// iTIP METHOD.
@@ -92,11 +90,9 @@ pub fn read(data: &[u8], opts: ImportOptions) -> Result<ItipMessage> {
 
 fn one_event(a: &Appointment, method: Method, o: &EventOut<'_>, now: DateTime) -> String {
     let mut cal = map::calendar_shell(Some(&method));
-    let mut offsets = BTreeSet::new();
+    let mut offsets = map::UsedZones::default();
     let ev = map::event_component(a, o, now, &mut offsets);
-    for off in offsets {
-        cal.children.push(TimeZone::fixed_component(off));
-    }
+    cal.children.extend(offsets.components());
     cal.children.push(ev);
     let mut out = String::new();
     cal.write(&mut out);

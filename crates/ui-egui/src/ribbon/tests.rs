@@ -685,3 +685,26 @@ fn search_tab_recent_searches_and_toggles() {
         }
     }
 }
+
+#[test]
+fn module_view_galleries_and_calendar_view_commands() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let tasks: Vec<String> =
+        state::dyn_items(&app, Surface::Main, "views:tasks").into_iter().map(|d| d.label).collect();
+    assert!(tasks.iter().any(|l| l == "Server Tasks"), "{tasks:?}");
+    // In the Calendar, View-tab commands carry the calendar's view state in and out in the same frame.
+    app.s.view.module = mailcraft_engine::Module::Calendar;
+    let ctx = egui::Context::default();
+    let mut mem = state::Mem::default();
+    let act = state::Action {
+        cmd: "view.arrangeBy".into(),
+        params: serde_json::json!({"key": "month"}),
+        flip: None,
+    };
+    state::run(&ctx, &mut app, Surface::Main, &mut mem, &act);
+    assert_eq!(app.ui.calendar_view, "month");
+    let act =
+        state::Action { cmd: "view.arrangeBy".into(), params: serde_json::json!({"key": "day"}), flip: None };
+    state::run(&ctx, &mut app, Surface::Main, &mut mem, &act);
+    assert_eq!(app.ui.calendar_view, "day");
+}

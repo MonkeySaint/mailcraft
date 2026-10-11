@@ -16,8 +16,9 @@ use serde_json::Value;
 use crate::error::{NetError, Result};
 use crate::http::{HttpClient, HttpResponse, Url, percent_decode, percent_encode};
 
-/// An OAuth provider's endpoints and this application's registration with it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// An OAuth provider's endpoints and this application's registration with it. `Debug` leaves out the client
+/// secret.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OAuthProvider {
     /// Stable key ("example").
@@ -34,6 +35,33 @@ pub struct OAuthProvider {
     pub domains: Vec<String>,
     /// Extra authorization-request parameters (`access_type=offline`, `prompt=consent`, …).
     pub extra_auth_params: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for OAuthProvider {
+    // Never print the client secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthProvider")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("authorization_endpoint", &self.authorization_endpoint)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("device_authorization_endpoint", &self.device_authorization_endpoint)
+            .field("client_id", &self.client_id)
+            .field("has_client_secret", &self.client_secret.is_some())
+            .field("scopes", &self.scopes)
+            .field("domains", &self.domains)
+            .field("extra_auth_params", &self.extra_auth_params)
+            .finish()
+    }
+}
+
+/// The bundled provider list (`data/oauth-providers.json`): public endpoints, scopes and domains only. Every
+/// `client_id` is empty: the user supplies the registration (see `data/README.md`).
+pub fn builtin_providers() -> Vec<OAuthProvider> {
+    providers_from_json(include_str!("../data/oauth-providers.json")).unwrap_or_else(|e| {
+        log::error!("bundled OAuth provider list: {e}");
+        Vec::new()
+    })
 }
 
 /// Parses a JSON array of providers.
@@ -272,8 +300,9 @@ pub fn refresh(http: &HttpClient, p: &OAuthProvider, refresh_token: &str) -> Res
     Ok(t)
 }
 
-/// A pending device authorization (RFC 8628 §3.2).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A pending device authorization (RFC 8628 §3.2). `Debug` leaves out the device code (it can be redeemed
+/// for tokens).
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeviceAuthorization {
     pub device_code: String,
     /// Show this to the user.
@@ -283,6 +312,18 @@ pub struct DeviceAuthorization {
     pub expires_in: u64,
     /// Seconds between polls.
     pub interval: u64,
+}
+
+impl std::fmt::Debug for DeviceAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceAuthorization")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Starts the device flow.
@@ -394,8 +435,23 @@ impl LoopbackRedirect {
     }
 
     /// Waits for the browser's redirect and returns its request target (path and query), answering with a
-    /// short page telling the user to return to the app.
+    /// short page telling the user to return to the app. Takes the first request with a `code` or `error`
+    /// parameter; prefer [`LoopbackRedirect::wait_for`], which also checks the sign-in's `state`.
     pub fn wait(&self, timeout: Duration) -> Result<String> {
+        self.wait_until(timeout, |target| target.contains("code=") || target.contains("error="))
+    }
+
+    /// Like [`LoopbackRedirect::wait`], but only the redirect carrying `expected_state` ends the wait. Any
+    /// local process can connect to the loopback port: a request with another (or no) `state` is answered
+    /// with 400 and ignored, so a forged `code` or `error` can neither be taken as the answer nor cancel the
+    /// sign-in.
+    pub fn wait_for(&self, timeout: Duration, expected_state: &str) -> Result<String> {
+        self.wait_until(timeout, |target| {
+            query_params(target).iter().any(|(k, v)| k == "state" && v == expected_state)
+        })
+    }
+
+    fn wait_until(&self, timeout: Duration, accept: impl Fn(&str) -> bool) -> Result<String> {
         self.listener.set_nonblocking(true).map_err(NetError::from)?;
         let deadline = crate::transport::deadline_after(timeout);
         loop {
@@ -405,16 +461,21 @@ impl LoopbackRedirect {
                     // dropped and the wait goes on; the request line is read under a size cap.
                     let Some(line) = read_request_line(&sock) else { continue };
                     let target = line.split_whitespace().nth(1).unwrap_or_default().to_owned();
+                    let mut s = sock;
                     // Skip a favicon or other stray request.
                     if !target.contains("code=") && !target.contains("error=") {
-                        let mut s = sock;
                         let _ = s.write_all(
                             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         );
                         continue;
                     }
+                    if !accept(&target) {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        continue;
+                    }
                     let page = "<!doctype html><meta charset=utf-8><title>MailCraft</title><p>Sign-in finished. You can close this tab and return to MailCraft.</p>";
-                    let mut s = sock;
                     let _ = s.write_all(
                         format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len())
                             .as_bytes(),
@@ -458,6 +519,21 @@ pub fn xoauth2_string(user: &str, access_token: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_providers_are_public_metadata_only() {
+        let list = builtin_providers();
+        assert!(list.len() >= 2);
+        for p in &list {
+            assert!(p.client_id.is_empty(), "{}: no client id may be checked in", p.id);
+            assert!(p.client_secret.is_none(), "{}: no client secret may be checked in", p.id);
+            assert!(p.authorization_endpoint.starts_with("https://"), "{}", p.id);
+            assert!(p.token_endpoint.starts_with("https://"), "{}", p.id);
+            assert!(p.device_authorization_endpoint.as_deref().is_none_or(|d| d.starts_with("https://")));
+            assert!(!p.scopes.is_empty());
+        }
+        assert_eq!(provider_for_address(&list, "someone@gmail.com").map(|p| p.id.as_str()), Some("google"));
+    }
     use crate::http::testserver::{json, serve};
 
     fn provider(base: &str) -> OAuthProvider {
@@ -641,5 +717,54 @@ mod tests {
         let target = lb.wait(Duration::from_secs(20)).unwrap();
         assert_eq!(parse_redirect(&target, "S").unwrap(), "XYZ");
         assert_eq!(t.join().unwrap().status, 200);
+    }
+
+    #[test]
+    fn loopback_redirect_ignores_other_states() {
+        // Another local process can hit the redirect port first with a forged code or error: without the
+        // sign-in's state it must neither end the wait nor be taken as the answer.
+        let lb = LoopbackRedirect::bind().unwrap();
+        let uri = lb.redirect_uri();
+        let t = std::thread::spawn(move || {
+            let c = HttpClient::default();
+            let forged = c.get(&format!("{uri}?code=EVIL&state=guess"), &[]).unwrap();
+            let denied = c.get(&format!("{uri}?error=access_denied"), &[]).unwrap();
+            let real = c.get(&format!("{uri}?code=XYZ&state=S"), &[]).unwrap();
+            (forged.status, denied.status, real.status)
+        });
+        let target = lb.wait_for(Duration::from_secs(20), "S").unwrap();
+        assert_eq!(parse_redirect(&target, "S").unwrap(), "XYZ");
+        assert_eq!(t.join().unwrap(), (400, 400, 200));
+        // A provider's error redirect carries the state and does end the wait.
+        let lb = LoopbackRedirect::bind().unwrap();
+        let uri = lb.redirect_uri();
+        let t = std::thread::spawn(move || {
+            HttpClient::default().get(&format!("{uri}?error=access_denied&state=S"), &[]).unwrap().status
+        });
+        let target = lb.wait_for(Duration::from_secs(20), "S").unwrap();
+        assert!(
+            matches!(parse_redirect(&target, "S"), Err(NetError::OAuth { ref error, .. }) if error == "access_denied")
+        );
+        assert_eq!(t.join().unwrap(), 200);
+        assert!(matches!(lb.wait_for(Duration::from_millis(100), "S"), Err(NetError::Timeout(_))));
+    }
+
+    #[test]
+    fn debug_output_hides_secrets() {
+        let mut p = provider("https://login.example.com");
+        p.client_secret = Some("client-secret-value".into());
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("client-secret-value"), "{shown}");
+        assert!(shown.contains("client-1") && shown.contains("has_client_secret: true"), "{shown}");
+        let da = DeviceAuthorization {
+            device_code: "device-code-value".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://login.example.com/device".into(),
+            verification_uri_complete: None,
+            expires_in: 600,
+            interval: 5,
+        };
+        let shown = format!("{da:?}");
+        assert!(!shown.contains("device-code-value") && shown.contains("ABCD-EFGH"), "{shown}");
     }
 }

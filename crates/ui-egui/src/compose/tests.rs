@@ -243,7 +243,8 @@ fn file_opens_the_backstage_inside_the_compose_window() {
     // The page is drawn in the window (it used to stay blank when the window was embedded).
     h.get_by_role_and_label(Role::Button, "Encrypt").click();
     h.run();
-    assert!(compose(&h, cid).encrypt);
+    // S/MIME is not available: Encrypt explains that and stays off, so Send keeps working.
+    assert!(!compose(&h, cid).encrypt);
     // Escape goes back to the message.
     h.key_press(egui::Key::Escape);
     h.run();
@@ -846,4 +847,127 @@ fn ctrl_backspace_at_a_block_start_acts_like_backspace() {
         Some((0, 0)),
         "the caret moves into the cell before"
     );
+}
+
+fn clipboard_html_fixture() -> Option<String> {
+    Some("<p>Rich <b>bold</b> paste</p>".into())
+}
+
+#[test]
+fn ctrl_v_pastes_the_html_flavour_and_offers_paste_options() {
+    let (mut h, cid) = typed_body("x");
+    set_clipboard_hooks(ClipboardHooks {
+        read_html: Some(clipboard_html_fixture),
+        ..ClipboardHooks::default()
+    });
+    push(&mut h, Event::Paste("Rich bold paste".into()));
+    h.run();
+    h.run();
+    let c = compose(&h, cid);
+    assert!(c.body.to_plain_text().contains("Rich bold paste"), "{}", c.body.to_plain_text());
+    let bold = c.body.blocks.iter().any(|b| match b {
+        mailcraft_model::Block::Paragraph { inlines, .. } => inlines.iter().any(|i| {
+            matches!(i, mailcraft_model::Inline::Text { text, style } if text.contains("bold") && style.bold == Some(true))
+        }),
+        _ => false,
+    });
+    assert!(bold, "the HTML formatting came along: {:?}", c.body);
+    // Paste Options › Keep Text Only redoes the paste without formatting.
+    h.get_by_label("(Ctrl) Paste Options").click();
+    h.run();
+    h.get_by_label("Keep Text Only").click();
+    h.run();
+    h.run();
+    let c = compose(&h, cid);
+    assert!(c.body.to_plain_text().contains("Rich bold paste"), "{}", c.body.to_plain_text());
+    let still_bold = c.body.blocks.iter().any(|b| match b {
+        mailcraft_model::Block::Paragraph { inlines, .. } => inlines
+            .iter()
+            .any(|i| matches!(i, mailcraft_model::Inline::Text { style, .. } if style.bold == Some(true))),
+        _ => false,
+    });
+    assert!(!still_bold);
+    set_clipboard_hooks(ClipboardHooks::default());
+    // An HTML flavour that does not match the pasted text is ignored.
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    set_clipboard_hooks(ClipboardHooks {
+        read_html: Some(clipboard_html_fixture),
+        ..ClipboardHooks::default()
+    });
+    push(&mut h, Event::Paste("other words".into()));
+    h.run();
+    h.run();
+    set_clipboard_hooks(ClipboardHooks::default());
+    assert!(compose(&h, cid).body.to_plain_text().contains("other words"));
+}
+
+fn voting_app() -> (App, ItemId) {
+    let mut mb = Mailbox::new_local("Local");
+    let inbox = mb
+        .folders
+        .values()
+        .find(|f| f.role == Some(mailcraft_engine::model::FolderRole::Inbox))
+        .map(|f| f.id)
+        .unwrap();
+    let raw = b"From: Ann <ann@example.org>\r\nTo: me@example.com\r\nSubject: Lunch\r\nMessage-ID: <v1@example.org>\r\nX-MailCraft-Voting: Approve;Reject\r\nDisposition-Notification-To: ann@example.org\r\n\r\nWhere?\r\n".to_vec();
+    let msg = mailcraft_mime::parse(&raw).unwrap();
+    let mut item = mailcraft_engine::model::MailItem::from_message(
+        &msg,
+        &raw,
+        DateTime::from_civil(2026, 10, 9, 12, 0, 0, 0).unwrap(),
+    );
+    item.folder = inbox;
+    let id = mb.add_mail(item);
+    (App::new(Session::new(mb)), id)
+}
+
+#[test]
+fn reading_pane_tracking_bars_offer_votes_and_the_read_receipt() {
+    let (app, id) = voting_app();
+    let mut h = Harness::builder()
+        .with_size([900.0, 300.0])
+        .build_ui_state(move |ui, app: &mut App| tracking_bars(ui, app, id, ReceiptPolicy::Ask), app);
+    h.run();
+    h.get_by_label("This message has voting buttons. Choose a response.");
+    h.get_by_label(READ_RECEIPT_REQUEST);
+    h.get_by_label("Approve");
+    h.get_by_label("Reject");
+    // Don't Send hides the request without sending anything.
+    h.get_by_label("Don't Send").click();
+    h.run();
+    assert!(h.query_by_label(READ_RECEIPT_REQUEST).is_none());
+    // Voting: Edit the response before sending opens a compose with the vote.
+    h.get_by_label("Reject").click();
+    h.run();
+    h.get_by_label("Edit the response before sending").click();
+    h.run();
+    let c = h.state().s.composes.values().next().cloned().unwrap();
+    assert_eq!(c.vote_response.as_deref(), Some("Reject"));
+    assert_eq!(c.subject, "Reject: Lunch");
+}
+
+#[test]
+fn paste_defaults_follow_the_mail_options() {
+    use super::editor::EditorHost;
+    let (mut app, _) = app_with_compose(false);
+    assert_eq!(EditorHost::paste_mode(&app), "keepSource");
+    assert!(EditorHost::paste_options(&app));
+    app.run("options.set", json!({"key": "mail.editor.pasteFromOtherPrograms", "value": "textOnly"}));
+    app.run("options.set", json!({"key": "mail.other.pasteOptions", "value": false}));
+    assert_eq!(EditorHost::paste_mode(&app), "textOnly");
+    assert!(!EditorHost::paste_options(&app));
+}
+
+#[test]
+fn ribbon_paste_modes_paste_the_system_clipboard() {
+    let (mut app, cid) = app_with_compose(false);
+    let ctx = egui::Context::default();
+    // Paste ▾ entries with a mode ask the platform for a paste; the body editor takes it with that mode.
+    for mode in ["keepSource", "merge", "textOnly"] {
+        assert!(ribbon_command(&ctx, &mut app, cid, "format.paste", &json!({"mode": mode})));
+    }
+    // Explicit content or no mode runs the engine command as before.
+    assert!(!ribbon_command(&ctx, &mut app, cid, "format.paste", &json!({"mode": "merge", "text": "x"})));
+    assert!(!ribbon_command(&ctx, &mut app, cid, "format.paste", &json!({})));
 }

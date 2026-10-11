@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use mailcraft_mime::Mailbox;
 use mailcraft_model::calendar::{AttendeeRole, ResponseStatus};
@@ -12,7 +12,7 @@ use mailcraft_model::{
 
 use super::parse::Component;
 use super::rrule::Rrule;
-use super::tz::{TimeZone, ZoneLookup, Zones, builtin, fixed_tzid};
+use super::tz::{TimeZone, ZoneLookup, Zones, builtin, builtin_name, equivalent_builtin, fixed_tzid};
 use super::value::{self, DAY, TimeValue};
 use super::{Event, Method, PRODID};
 use crate::text::{CategoryList, ContentLine, MAX_CATEGORIES, escape, split_unescaped};
@@ -23,6 +23,8 @@ const MAX_LIST: usize = 2_000;
 const MAX_REMINDER_MIN: i64 = 525_600;
 /// Most zone lookups (with their listed onsets) kept while reading one file.
 const MAX_LOOKUPS: usize = 16;
+/// Most TZID → IANA zone answers kept while reading one file.
+const MAX_ZONE_NAMES: usize = 1_000;
 
 pub(crate) struct Ctx<'a> {
     pub zones: &'a Zones,
@@ -32,6 +34,8 @@ pub(crate) struct Ctx<'a> {
     defined: HashMap<String, usize>,
     /// Zone lookups by lower-cased TZID (`None`: the TZID names no known zone).
     lookups: RefCell<HashMap<String, Option<ZoneLookup<'a>>>>,
+    /// The built-in (IANA) zone each TZID stands for, by lower-cased TZID (`None`: none, or a fixed offset).
+    named: RefCell<HashMap<String, Option<&'static str>>>,
 }
 
 fn zone_key(tzid: &str) -> String {
@@ -44,7 +48,40 @@ impl<'a> Ctx<'a> {
         for (i, z) in zones.defined.iter().enumerate() {
             defined.entry(z.tzid.to_ascii_lowercase()).or_insert(i);
         }
-        Ctx { zones, local_offset, defined, lookups: RefCell::new(HashMap::new()) }
+        Ctx {
+            zones,
+            local_offset,
+            defined,
+            lookups: RefCell::new(HashMap::new()),
+            named: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The IANA zone an event in `tzid` keeps: the built-in zone of that name, or for a zone the file defines
+    /// under another name ("Eastern Standard Time"), the built-in zone with the same offsets around `year`.
+    /// `None` for fixed offsets, zones without daylight saving time and unknown zones.
+    pub fn named_zone(&self, tzid: &str, year: i64) -> Option<&'static str> {
+        let key = zone_key(tzid);
+        if let Ok(map) = self.named.try_borrow()
+            && let Some(known) = map.get(&key)
+        {
+            return *known;
+        }
+        let defined = self.defined.get(&key).and_then(|&i| self.zones.defined.get(i));
+        let found = match defined {
+            // The file's own rules decide; its name wins when it is the matching built-in zone.
+            Some(z) => equivalent_builtin(z, year).map(|eq| match builtin_name(tzid) {
+                Some(own) if builtin(own).is_some_and(|b| equivalent_builtin(&b, year) == Some(eq)) => own,
+                _ => eq,
+            }),
+            None => builtin_name(tzid),
+        };
+        if let Ok(mut map) = self.named.try_borrow_mut()
+            && map.len() < MAX_ZONE_NAMES
+        {
+            map.insert(key, found);
+        }
+        found
     }
 
     /// [`Zones::get`] through the index.
@@ -257,6 +294,10 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| format!("{:016x}@mailcraft.import", content_hash(c)));
     let recurrence_id = ctx.time(c, "RECURRENCE-ID").map(|(_, t)| t);
+    // The IANA zone the times were entered in (recurrences then follow its daylight-saving rules).
+    let year = value::civil(start_local).0;
+    let tz =
+        if all_day { None } else { tzid.as_deref().and_then(|t| ctx.named_zone(t, year)).map(str::to_owned) };
     let appointment = Appointment {
         uid,
         // An override replaces one instance; it never carries its own rule.
@@ -275,6 +316,7 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
         categories: categories_of(c),
         private: class == "PRIVATE" || class == "CONFIDENTIAL",
         body: text_or_empty(c, "DESCRIPTION"),
+        tz,
         ..Default::default()
     };
     Some(Event {
@@ -388,14 +430,25 @@ pub(crate) fn utc_text(t: DateTime) -> String {
     format!("{}Z", value::format_date_time(t.unix))
 }
 
+/// The time zones a written calendar refers to, each written once as a VTIMEZONE: fixed offsets
+/// (`UTC-04:00`) and named built-in zones (`America/Toronto`).
+#[derive(Debug, Default)]
+pub(crate) struct UsedZones {
+    pub fixed: BTreeSet<i32>,
+    pub named: BTreeMap<String, TimeZone>,
+}
+
+impl UsedZones {
+    /// The VTIMEZONE components, fixed offsets first.
+    pub fn components(self) -> Vec<Component> {
+        let mut out: Vec<Component> = self.fixed.into_iter().map(TimeZone::fixed_component).collect();
+        out.extend(self.named.into_values().map(|z| z.to_component()));
+        out
+    }
+}
+
 /// DTSTART-style line for `t` written in `offset` (UTC when 0, else a fixed-offset TZID).
-fn time_line(
-    name: &str,
-    t: DateTime,
-    all_day: bool,
-    offset: i32,
-    offsets: &mut BTreeSet<i32>,
-) -> ContentLine {
+fn time_line(name: &str, t: DateTime, all_day: bool, offset: i32, zones: &mut UsedZones) -> ContentLine {
     let local = t.unix.saturating_add(i64::from(offset) * 60);
     if all_day {
         return line(name, vec![("VALUE", "DATE".into())], value::format_date(local));
@@ -403,8 +456,18 @@ fn time_line(
     if offset == 0 {
         return line(name, vec![], utc_text(t));
     }
-    offsets.insert(offset);
+    zones.fixed.insert(offset);
     line(name, vec![("TZID", fixed_tzid(offset))], value::format_date_time(local))
+}
+
+/// DTSTART-style line for `t` as wall-clock time in named zone `z` (TZID = its name).
+fn zoned_line(name: &str, t: DateTime, z: &ZoneLookup<'_>, zones: &mut UsedZones) -> ContentLine {
+    let tzid = z.zone.tzid.clone();
+    let local = t.unix.saturating_add(i64::from(z.offset_at_utc(t.unix)) * 60);
+    if !zones.named.contains_key(&tzid) {
+        zones.named.insert(tzid.clone(), z.zone.clone().into_owned());
+    }
+    line(name, vec![("TZID", tzid)], value::format_date_time(local))
 }
 
 fn mailto(m: &Mailbox) -> String {
@@ -459,10 +522,18 @@ pub(crate) fn event_component(
     a: &Appointment,
     o: &EventOut<'_>,
     now: DateTime,
-    offsets: &mut BTreeSet<i32>,
+    offsets: &mut UsedZones,
 ) -> Component {
     let mut c = Component::new("VEVENT");
     let off = a.start.offset_min.clamp(-23 * 60 - 59, 23 * 60 + 59);
+    // A timed appointment entered in a named zone is written in it (TZID + VTIMEZONE), so other calendars
+    // repeat it at the same wall-clock time across daylight-saving changes.
+    let named = if a.all_day { None } else { a.zone().and_then(builtin_name).and_then(builtin) };
+    let named = named.map(|z| ZoneLookup::new(Cow::Owned(z)));
+    let time_line = |name: &str, t: DateTime, all_day: bool, off: i32, zones: &mut UsedZones| match &named {
+        Some(z) => zoned_line(name, t, z, zones),
+        None => time_line(name, t, all_day, off, zones),
+    };
     let uid = if a.uid.trim().is_empty() {
         format!("{:016x}@mailcraft.local", uid_hash(a))
     } else {
@@ -554,7 +625,7 @@ fn uid_hash(a: &Appointment) -> u64 {
     h
 }
 
-pub(crate) fn task_component(t: &Task, now: DateTime, offsets: &mut BTreeSet<i32>) -> Component {
+pub(crate) fn task_component(t: &Task, now: DateTime, offsets: &mut UsedZones) -> Component {
     let mut c = Component::new("VTODO");
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in t.subject.bytes().chain(t.id.0.to_be_bytes()) {

@@ -14,6 +14,12 @@
 //!   into the INBOX of local users, so send → receive round trips work, and every accepted transaction is
 //!   recorded ([`TestServers::submissions`]).
 //!
+//! - a POP3 server (RFC 1939 with CAPA, STLS, USER/PASS, AUTH PLAIN, UIDL and TOP) over each user's INBOX, so
+//!   POP3 accounts can be tested against the same mail (deletions at QUIT reach IMAP sessions too).
+//!
+//! - a JMAP server (RFC 8620/8621 over HTTP/1.1: session, Mailbox/Email get/changes/query/set/import,
+//!   Identity/get, EmailSubmission/set, blob upload and download) on the same mail, for JMAP accounts.
+//!
 //! Each protocol listens on a plain port (with STARTTLS) and an implicit-TLS port. TLS uses a self-signed
 //! certificate for `localhost`/`127.0.0.1` generated at start; [`TestServers::cert_pem`] /
 //! [`TestServers::cert_der`] let test clients trust it. All state is in memory and shared by both servers.
@@ -22,7 +28,9 @@
 mod conn;
 mod date;
 mod imap;
+mod jmap;
 mod mime;
+mod pop3;
 mod server;
 mod smtp;
 mod store;
@@ -71,6 +79,14 @@ pub struct Config {
     pub smtp_port: u16,
     /// SMTP submission over implicit TLS.
     pub smtps_port: u16,
+    /// POP3 with STLS.
+    pub pop3_port: u16,
+    /// POP3 over implicit TLS.
+    pub pop3s_port: u16,
+    /// JMAP over plain HTTP (clients must allow plain-text credentials for it).
+    pub jmap_port: u16,
+    /// JMAP over HTTPS.
+    pub jmaps_port: u16,
     /// SMTP SIZE limit in octets (also caps IMAP APPEND).
     pub max_message_size: usize,
     /// Recipients the SMTP server rejects with 550 (case-insensitive addresses).
@@ -83,6 +99,9 @@ pub struct Config {
     pub add_trace_headers: bool,
     /// Connections idle (no client data) for longer than this are closed. IDLE counts as activity-free time.
     pub idle_timeout: Duration,
+    /// IMAP advertises IDLE (and IMAP4rev2, which includes it). Off to test clients facing a server without
+    /// push.
+    pub imap_idle: bool,
     /// Users created at start: (address, password).
     pub users: Vec<(String, String)>,
 }
@@ -95,12 +114,17 @@ impl Default for Config {
             imaps_port: 0,
             smtp_port: 0,
             smtps_port: 0,
+            pop3_port: 0,
+            pop3s_port: 0,
+            jmap_port: 0,
+            jmaps_port: 0,
             max_message_size: 25 * 1024 * 1024,
             reject_recipients: Vec::new(),
             smtp_require_auth: true,
             auth_requires_tls: false,
             add_trace_headers: true,
             idle_timeout: Duration::from_secs(30 * 60),
+            imap_idle: true,
             users: Vec::new(),
         }
     }
@@ -116,6 +140,14 @@ pub struct TestServers {
     pub smtp_port: u16,
     /// SMTP implicit-TLS port.
     pub smtps_port: u16,
+    /// POP3 plain-text port (STLS available).
+    pub pop3_port: u16,
+    /// POP3 implicit-TLS port.
+    pub pop3s_port: u16,
+    /// JMAP plain HTTP port.
+    pub jmap_port: u16,
+    /// JMAP HTTPS port.
+    pub jmaps_port: u16,
     /// Self-signed server certificate (PEM) for `localhost` and `127.0.0.1`.
     pub cert_pem: String,
     /// The same certificate, DER-encoded.
@@ -138,6 +170,10 @@ impl TestServers {
             imaps_port: running.imaps.port(),
             smtp_port: running.smtp.port(),
             smtps_port: running.smtps.port(),
+            pop3_port: running.pop3.port(),
+            pop3s_port: running.pop3s.port(),
+            jmap_port: running.jmap.port(),
+            jmaps_port: running.jmaps.port(),
             cert_pem: identity.cert_pem,
             cert_der: identity.cert_der,
             inner: running,
@@ -160,6 +196,20 @@ impl TestServers {
     /// `127.0.0.1:<smtps_port>`.
     pub fn smtps_addr(&self) -> SocketAddr {
         self.inner.smtps
+    }
+
+    /// `127.0.0.1:<pop3_port>`.
+    pub fn pop3_addr(&self) -> SocketAddr {
+        self.inner.pop3
+    }
+    /// `127.0.0.1:<pop3s_port>`.
+    pub fn pop3s_addr(&self) -> SocketAddr {
+        self.inner.pop3s
+    }
+
+    /// The JMAP session URL over HTTPS (`https://127.0.0.1:<jmaps_port>/.well-known/jmap`).
+    pub fn jmap_url(&self) -> String {
+        format!("https://127.0.0.1:{}/.well-known/jmap", self.jmaps_port)
     }
 
     /// A rustls client configuration (ring provider) that trusts only this server's certificate.

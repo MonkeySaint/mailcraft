@@ -93,6 +93,9 @@ pub struct NewMessage {
     pub flags: Vec<String>,
     pub internal_date: Option<String>,
     pub size: Option<u64>,
+    /// Only the header was downloaded (`raw` is the header section); see
+    /// [`ImapAccount::sync_folder_headers`] and [`ImapAccount::fetch_messages`].
+    pub headers_only: bool,
 }
 
 /// The result of syncing one folder.
@@ -120,6 +123,7 @@ pub struct ImapAccount {
 }
 
 const BODY_ITEMS: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])";
+const HEADER_ITEMS: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])";
 
 impl ImapAccount {
     pub fn new(settings: ImapSettings) -> Self {
@@ -255,7 +259,47 @@ impl ImapAccount {
     pub fn sync_folder(&mut self, name: &str, since: &FolderState) -> Result<SyncDelta> {
         let batch = self.settings.fetch_batch.max(1);
         let cap = self.settings.max_new_per_sync.max(1);
-        self.with_client(true, |c| sync_once(c, name, since, batch, cap))
+        self.with_client(true, |c| sync_once(c, name, since, batch, cap, false))
+    }
+
+    /// [`Self::sync_folder`], but new messages come with their header only (`BODY.PEEK[HEADER]`, marked
+    /// [`NewMessage::headers_only`]); download the rest later with [`Self::fetch_messages`].
+    pub fn sync_folder_headers(&mut self, name: &str, since: &FolderState) -> Result<SyncDelta> {
+        let batch = self.settings.fetch_batch.max(1);
+        let cap = self.settings.max_new_per_sync.max(1);
+        self.with_client(true, |c| sync_once(c, name, since, batch, cap, true))
+    }
+
+    /// Downloads whole messages by UID (for messages first downloaded as headers). UIDs no longer on the
+    /// server are simply missing from the result.
+    pub fn fetch_messages(&mut self, folder: &str, uids: &[u32]) -> Result<Vec<NewMessage>> {
+        let batch = self.settings.fetch_batch.max(1);
+        let mut want: Vec<u32> = uids.iter().copied().filter(|u| *u > 0).collect();
+        want.sort_unstable();
+        want.dedup();
+        self.with_client(true, |c| {
+            Self::select(c, folder, false)?;
+            let mut out = Vec::new();
+            for chunk in SeqSet::chunks(&want, batch) {
+                for f in c.uid_fetch(&chunk, BODY_ITEMS)? {
+                    let (Some(uid), Some(raw)) = (f.uid, f.body) else { continue };
+                    if !chunk.contains(uid) {
+                        continue;
+                    }
+                    out.push(NewMessage {
+                        uid,
+                        raw,
+                        flags: f.flags.unwrap_or_default(),
+                        internal_date: f.internal_date,
+                        size: f.size,
+                        headers_only: false,
+                    });
+                }
+            }
+            out.sort_by_key(|m| m.uid);
+            out.dedup_by_key(|m| m.uid);
+            Ok(out)
+        })
     }
 
     /// Adds and removes flags on messages.
@@ -348,6 +392,20 @@ impl ImapAccount {
         })
     }
 
+    /// One IDLE (RFC 2177) on `folder` for up to `max_wait`, ended early when `stop` is raised. True when the
+    /// server reported a change. Unlike [`Self::wait_for_changes`] there is no NOOP fallback: a server
+    /// without IDLE gives [`NetError::Unsupported`], so the caller can poll on its own schedule. Connects
+    /// (and reconnects once after a lost connection) as needed.
+    pub fn idle_once(&mut self, folder: &str, max_wait: Duration, stop: Option<&AtomicBool>) -> Result<bool> {
+        self.with_client(true, |c| {
+            if !c.has_capability("IDLE") && !c.has_capability("IMAP4rev2") {
+                return Err(NetError::Unsupported("IDLE".into()));
+            }
+            Self::select(c, folder, false)?;
+            Ok(matches!(c.idle(max_wait, stop)?, IdleEvent::Changed(_)))
+        })
+    }
+
     /// Waits up to `max_wait` for changes in `folder` (IDLE, or NOOP polling every few seconds when the
     /// server lacks IDLE). Returns true when something changed; false on timeout or stop.
     pub fn wait_for_changes(
@@ -396,6 +454,7 @@ fn sync_once(
     since: &FolderState,
     batch: usize,
     cap: usize,
+    headers_only: bool,
 ) -> Result<SyncDelta> {
     let info = c.select(name)?;
     let mut delta = SyncDelta::default();
@@ -476,8 +535,10 @@ fn sync_once(
 
     // Download new messages.
     for chunk in SeqSet::chunks(&new_uids, batch) {
-        for f in c.uid_fetch(&chunk, BODY_ITEMS)? {
-            let (Some(uid), Some(raw)) = (f.uid, f.body) else { continue };
+        let items = if headers_only { HEADER_ITEMS } else { BODY_ITEMS };
+        for f in c.uid_fetch(&chunk, items)? {
+            let raw = if headers_only { f.header } else { f.body };
+            let (Some(uid), Some(raw)) = (f.uid, raw) else { continue };
             if !chunk.contains(uid) || uid <= max_known {
                 continue;
             }
@@ -487,6 +548,7 @@ fn sync_once(
                 flags: f.flags.unwrap_or_default(),
                 internal_date: f.internal_date,
                 size: f.size,
+                headers_only,
             });
         }
     }

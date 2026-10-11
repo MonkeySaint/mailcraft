@@ -91,7 +91,7 @@ Context|message-row|Follow Up|mail.flag
 Context|message-row|Assign Policy|-|Exchange retention policies require a Microsoft 365 tenant
 Context|message-row|Find Related|mail.findRelated
 Context|message-row|Quick Steps|quicksteps.run
-Context|message-row|Set Quick Actions...|options.open
+Context|message-row|Set Quick Actions...|view.quickActions
 Context|message-row|Rules|rules.createFromMessage
 Context|message-row|Move|mail.move
 Context|message-row|Send to OneNote|-|OneNote integration
@@ -110,7 +110,7 @@ Context|ctx message-row > Categorize|Purple category|mail.categorize
 Context|ctx message-row > Categorize|Red category|mail.categorize
 Context|ctx message-row > Categorize|Yellow category|mail.categorize
 Context|ctx message-row > Categorize|All Categories...|mail.allCategories
-Context|ctx message-row > Categorize|Set Quick Click...|options.open
+Context|ctx message-row > Categorize|Set Quick Click...|categories.setQuickClick
 Context|ctx message-row > Follow Up|Today|mail.flag
 Context|ctx message-row > Follow Up|Tomorrow|mail.flag
 Context|ctx message-row > Follow Up|This Week|mail.flag
@@ -120,8 +120,8 @@ Context|ctx message-row > Follow Up|Custom...|mail.flagCustom
 Context|ctx message-row > Follow Up|Add Reminder...|mail.flagCustom
 Context|ctx message-row > Follow Up|Mark Complete|mail.markComplete
 Context|ctx message-row > Follow Up|Clear Flag|mail.clearFlag
-Context|ctx message-row > Follow Up|Set Quick Click...|options.open
-Context|ctx message-row > Follow Up|Set Quick Actions...|options.open
+Context|ctx message-row > Follow Up|Set Quick Click...|mail.setQuickClickFlag
+Context|ctx message-row > Follow Up|Set Quick Actions...|view.quickActions
 Context|ctx message-row > Assign Policy|1 Month Delete (30 days)|-|Exchange retention policies require a Microsoft 365 tenant
 Context|ctx message-row > Assign Policy|1 Week Delete (1 week)|-|Exchange retention policies require a Microsoft 365 tenant
 Context|ctx message-row > Assign Policy|1 Year Delete (1 year)|-|Exchange retention policies require a Microsoft 365 tenant
@@ -171,7 +171,7 @@ Context|group-header|Categorize|mail.categorize
 Context|group-header|Follow Up|mail.flag
 Context|group-header|Assign Policy|-|Exchange retention policies require a Microsoft 365 tenant
 Context|group-header|Quick Steps|quicksteps.run
-Context|group-header|Set Quick Actions...|options.open
+Context|group-header|Set Quick Actions...|view.quickActions
 Context|group-header|Rules|rules.createFromMessage
 Context|group-header|Move|mail.move
 Context|group-header|Delete|mail.delete
@@ -183,7 +183,7 @@ Context|ctx group-header > Categorize|Purple category|mail.categorize
 Context|ctx group-header > Categorize|Red category|mail.categorize
 Context|ctx group-header > Categorize|Yellow category|mail.categorize
 Context|ctx group-header > Categorize|All Categories...|mail.allCategories
-Context|ctx group-header > Categorize|Set Quick Click...|options.open
+Context|ctx group-header > Categorize|Set Quick Click...|categories.setQuickClick
 Context|ctx group-header > Follow Up|Today|mail.flag
 Context|ctx group-header > Follow Up|Tomorrow|mail.flag
 Context|ctx group-header > Follow Up|This Week|mail.flag
@@ -193,8 +193,8 @@ Context|ctx group-header > Follow Up|Custom...|mail.flagCustom
 Context|ctx group-header > Follow Up|Add Reminder...|mail.flagCustom
 Context|ctx group-header > Follow Up|Mark Complete|mail.markComplete
 Context|ctx group-header > Follow Up|Clear Flag|mail.clearFlag
-Context|ctx group-header > Follow Up|Set Quick Click...|options.open
-Context|ctx group-header > Follow Up|Set Quick Actions...|options.open
+Context|ctx group-header > Follow Up|Set Quick Click...|mail.setQuickClickFlag
+Context|ctx group-header > Follow Up|Set Quick Actions...|view.quickActions
 Context|ctx group-header > Assign Policy|1 Month Delete (30 days)|-|Exchange retention policies require a Microsoft 365 tenant
 Context|ctx group-header > Assign Policy|1 Week Delete (1 week)|-|Exchange retention policies require a Microsoft 365 tenant
 Context|ctx group-header > Assign Policy|1 Year Delete (1 year)|-|Exchange retention policies require a Microsoft 365 tenant

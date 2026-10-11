@@ -16,15 +16,18 @@
 //! command once per frame when the text changed.
 //!
 //! Submodules: `editor` (the body editor), `recipients` (To / Cc / Bcc: Auto-Complete, resolved names, Ctrl+K
-//! Check Names), `attach` (attachments well, Browse This PC…, recent files, drag and drop, file hooks) and
-//! `spelling` (the F7 Spelling and Grammar dialog).
+//! Check Names), `attach` (attachments well, Browse This PC…, recent files, drag and drop, file hooks),
+//! `spelling` (the F7 Spelling and Grammar dialog), `clipboard` (the system clipboard's HTML flavour for rich
+//! paste and copy) and `voting` (reading-pane voting, read-receipt and tracking bars).
 
 mod attach;
+mod clipboard;
 mod editor;
 mod recipients;
 mod spelling;
 #[cfg(test)]
 mod tests;
+mod voting;
 
 use egui::{
     Align, Align2, CornerRadius, Id, Layout, Rect, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
@@ -41,12 +44,17 @@ pub use attach::{
     DROP_HINT, FileHooks, MAX_RECENT, SAVE_TITLE, file_hooks, file_name as recent_label, recent_files,
     remember_file, set_file_hooks, size_text,
 };
-pub use editor::{BODY_LABEL, NO_SUGGESTIONS, body_focused, editor_id};
+pub use clipboard::{
+    ClipboardHooks, clipboard_hooks, clipboard_html, clipboard_text, copy_html, html_for_paste,
+    set_clipboard_hooks,
+};
+pub use editor::{BODY_LABEL, NO_SUGGESTIONS, PASTE_MODES, body_focused, editor_id, request_paste};
 pub(crate) use editor::{EditorHost, body_editor_in};
 pub use recipients::{
     Entry as RecipientEntry, entries as recipient_entries, split_entries as split_recipients,
 };
 pub use spelling::{COMPLETE as SPELLING_COMPLETE, TITLE as SPELLING_TITLE, is_open as spelling_open};
+pub use voting::{READ_RECEIPT_REQUEST, ReceiptPolicy, tracking_bars};
 
 /// Default compose window size (compose.md).
 pub const DEFAULT_SIZE: [f32; 2] = [1440.0, 780.0];
@@ -573,7 +581,8 @@ pub fn focused_recipient_field(ctx: &egui::Context, app: &App) -> Option<u64> {
 ///   with a `path` it attaches and remembers the file for the recent list;
 /// - `options.open {"page": "signatures"}` (Signature ▾ › Signatures…) opens Signatures and Stationery itself
 ///   rather than the Options dialog;
-/// - `review.spelling` opens the Spelling and Grammar dialog.
+/// - `review.spelling` opens the Spelling and Grammar dialog;
+/// - `format.paste` with a `mode` (Paste ▾ menu) pastes the system clipboard with that mode.
 pub(crate) fn ribbon_command(
     ctx: &egui::Context,
     app: &mut App,
@@ -598,6 +607,18 @@ pub(crate) fn ribbon_command(
             let grammar = params.get("grammar").and_then(serde_json::Value::as_bool).unwrap_or(true);
             spelling::open_with(ctx, app, cid, grammar);
             true
+        }
+        // Paste ▾ › Keep Source Formatting / Merge Formatting / Keep Text Only: paste the system clipboard
+        // (HTML when it has some) with that mode, like Ctrl+V.
+        "format.paste" if params.get("text").is_none() && params.get("html").is_none() => {
+            let wanted = params.get("mode").and_then(serde_json::Value::as_str);
+            match PASTE_MODES.iter().map(|(m, _)| *m).find(|m| Some(*m) == wanted) {
+                Some(mode) => {
+                    request_paste(ctx, cid, mode);
+                    true
+                }
+                None => false,
+            }
         }
         _ => false,
     }

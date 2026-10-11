@@ -1,0 +1,279 @@
+//! Send / Receive › Server and Preferences (`plan/outlook/ribbon-mail.md`): Download Headers, Mark to
+//! Download (and Message Copy), Unmark to Download (and Unmark All), Process Marked Headers (and in All
+//! Folders), and Download Preferences with the Send/Receive group basics (per-account membership, interval and
+//! push).
+//!
+//! These are the command bodies for the `sendReceive.downloadHeaders`, `sendReceive.markToDownload`,
+//! `sendReceive.unmarkToDownload`, `sendReceive.processMarked` and `sendReceive.preferences` specs (same ids,
+//! same parameters plus the new optional ones in [`PREFERENCES_PARAMS`]).
+//!
+//! Header-only items are those downloaded with "Download Headers" or a headers-first download preference:
+//! their id is in the account options' `headersOnly` set and they carry no body or source yet. Marks live in
+//! the same file, so they survive a restart; Process Marked Headers hands the marked items to the accounts'
+//! workers, which download them whole (IMAP `UID FETCH BODY.PEEK[]`, POP3 `RETR`).
+
+use serde_json::{Value, json};
+
+use crate::accounts::{DownloadMode, account_options, apply_option_params, find_account, prefs, save_prefs};
+use crate::cmd::util::opt_bool;
+use crate::sync::Plan;
+use crate::{CmdError, CmdResult, Session};
+use mailcraft_model::{AccountId, AccountKind, FolderId, ItemId, MailItem};
+
+/// Parameters of `sendReceive.preferences`.
+pub const PREFERENCES_PARAMS: &str = r#"{"account"?: number|string (default: every account, the All Accounts group), "mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool, "include"?: bool (member of All Accounts: F9 and scheduled runs), "intervalMinutes"?: number|null (scheduled send/receive; null = Options › Advanced), "push"?: bool (new mail pushed with IMAP IDLE), "pollMinutes"?: number}"#;
+
+/// No body, no source, no stored blob: only the header was downloaded.
+fn bodyless(m: &MailItem) -> bool {
+    m.body.text.is_none() && m.body.html.is_none() && m.raw.is_none() && m.blob.is_none()
+}
+
+/// True when the item was downloaded as headers only and not yet in full.
+pub fn is_header_only(s: &Session, id: ItemId) -> bool {
+    s.mailbox.mail.get(&id).is_some_and(|m| {
+        (s.sync.prefs.data.headers_only.contains(&id.0) && m.raw.is_none() && m.blob.is_none()) || bodyless(m)
+    })
+}
+
+/// `Some(copy)` when the item is marked to download (`copy`: Mark to Download Message Copy).
+pub fn marked(s: &Session, id: ItemId) -> Option<bool> {
+    s.sync.prefs.data.marked.get(&id.0).copied()
+}
+
+/// The download preference of the current account (Download Preferences menu state).
+pub fn download_mode(s: &Session) -> DownloadMode {
+    match s.current_account() {
+        Some(a) => account_options(s, a).download,
+        None => s.sync.prefs.data.defaults.download,
+    }
+}
+
+fn server_account(s: &Session, id: AccountId) -> bool {
+    s.mailbox
+        .account(id)
+        .is_some_and(|a| matches!(a.kind, AccountKind::Imap | AccountKind::Jmap) && a.incoming.is_some())
+}
+
+/// Download Headers: the folder's account downloads the headers of new messages (bodies later, on demand).
+pub fn download_headers(s: &mut Session, p: &Value) -> CmdResult {
+    crate::accounts::load_prefs(s);
+    let f = s.target_folder(p);
+    let Some(folder) = s.mailbox.folder(f) else {
+        return Err(CmdError::Params(format!("no such folder {}", f.0)));
+    };
+    let account = folder.account;
+    let mapped = folder.remote_name.is_some();
+    if !server_account(s, account) {
+        return Err(CmdError::Disabled("this folder's account has no mail server".into()));
+    }
+    s.sync.force_headers.insert(account);
+    let folders = (mapped && !crate::accounts::is_pop3(s, account)).then(|| vec![f]);
+    let plan = Plan { send: false, receive: true, folders, user: true };
+    let started = match s.send_receive(&[account], plan) {
+        Ok(n) => n,
+        Err(e) => {
+            s.sync.force_headers.remove(&account);
+            return Err(e);
+        }
+    };
+    Ok(json!({"folder": f.0, "account": account.0, "started": started, "downloaded": 0}))
+}
+
+/// Mark to Download (`copy`: Mark to Download Message Copy) on the selected header-only items.
+pub fn mark(s: &mut Session, p: &Value) -> CmdResult {
+    crate::accounts::load_prefs(s);
+    let copy = opt_bool(p, "copy").unwrap_or(false);
+    let ids: Vec<ItemId> = s.target_ids(p).into_iter().filter(|i| is_header_only(s, *i)).collect();
+    let pr = prefs(s);
+    for i in &ids {
+        pr.marked.insert(i.0, copy);
+    }
+    if !ids.is_empty() {
+        save_prefs(s);
+    }
+    Ok(json!({"marked": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "copy": copy}))
+}
+
+/// Unmark to Download (`all`: Unmark All to Download).
+pub fn unmark(s: &mut Session, p: &Value) -> CmdResult {
+    crate::accounts::load_prefs(s);
+    let all = opt_bool(p, "all").unwrap_or(false);
+    let ids: Vec<u64> = if all {
+        let mut v: Vec<u64> = s.sync.prefs.data.marked.keys().copied().collect();
+        // Header-only items that were never marked are reported too (nothing to undo for them).
+        v.extend(s.mailbox.mail.values().filter(|m| bodyless(m)).map(|m| m.id.0));
+        v.sort_unstable();
+        v.dedup();
+        v
+    } else {
+        s.target_ids(p)
+            .iter()
+            .filter(|i| is_header_only(s, **i) || marked(s, **i).is_some())
+            .map(|i| i.0)
+            .collect()
+    };
+    let pr = prefs(s);
+    let mut changed = false;
+    for i in &ids {
+        changed |= pr.marked.remove(i).is_some();
+    }
+    if changed {
+        save_prefs(s);
+    }
+    Ok(json!({"unmarked": ids, "all": all}))
+}
+
+/// Process Marked Headers (`allFolders`: in All Folders): marked items are downloaded in full by their
+/// accounts' next run, started now.
+pub fn process_marked(s: &mut Session, p: &Value) -> CmdResult {
+    crate::accounts::load_prefs(s);
+    let all_folders = opt_bool(p, "allFolders").unwrap_or(false);
+    let f = s.target_folder(p);
+    let marked_ids: Vec<ItemId> = s.sync.prefs.data.marked.keys().map(|i| ItemId(*i)).collect();
+    let mut by_account: std::collections::BTreeMap<AccountId, Vec<ItemId>> = Default::default();
+    let mut stale = Vec::new();
+    for id in marked_ids {
+        let Some(m) = s.mailbox.mail.get(&id) else {
+            stale.push(id.0);
+            continue;
+        };
+        if !all_folders && m.folder != f {
+            continue;
+        }
+        if !is_header_only(s, id) {
+            stale.push(id.0);
+            continue;
+        }
+        let Some(acct) = s.mailbox.folder(m.folder).map(|x| x.account) else { continue };
+        by_account.entry(acct).or_default().push(id);
+    }
+    if !stale.is_empty() {
+        let pr = prefs(s);
+        for i in stale {
+            pr.marked.remove(&i);
+        }
+        save_prefs(s);
+    }
+    let requested: usize = by_account.values().map(Vec::len).sum();
+    let mut started = 0usize;
+    for (acct, ids) in by_account {
+        if !server_account(s, acct) {
+            continue;
+        }
+        s.sync.fetch.entry(acct).or_default().extend(ids);
+        let plan = Plan { send: false, receive: false, folders: Some(Vec::<FolderId>::new()), user: true };
+        started = started.saturating_add(s.send_receive(&[acct], plan)?);
+    }
+    Ok(
+        json!({"allFolders": all_folders, "folder": f.0, "requested": requested, "started": started, "downloaded": 0}),
+    )
+}
+
+/// Download Preferences and the Send/Receive group basics, for one account or (no `account`) for all of them
+/// and new ones. Without changes it reports the current state.
+pub fn preferences(s: &mut Session, p: &Value) -> CmdResult {
+    crate::accounts::load_prefs(s);
+    let targets: Vec<AccountId> = if p.get("account").is_some_and(|v| !v.is_null()) {
+        vec![find_account(s, p, "account")?]
+    } else {
+        s.mailbox.accounts.iter().filter(|a| a.kind != AccountKind::Local).map(|a| a.id).collect()
+    };
+    // Validate once against the defaults, then apply everywhere.
+    let mut defaults = s.sync.prefs.data.defaults.clone();
+    let changed = apply_option_params(&mut defaults, p)?;
+    if changed {
+        if p.get("account").is_none_or(Value::is_null) {
+            prefs(s).defaults = defaults.clone();
+        }
+        for id in &targets {
+            let mut o = account_options(s, *id);
+            apply_option_params(&mut o, p)?;
+            crate::accounts::update_options(s, *id, |x| *x = o);
+            crate::sync::options_changed(s, *id);
+        }
+        save_prefs(s);
+    }
+    let shown = match targets.first() {
+        Some(id) if targets.len() == 1 => account_options(s, *id),
+        _ => s.current_account().map(|a| account_options(s, a)).unwrap_or(defaults),
+    };
+    Ok(json!({
+        "mode": shown.download.name(),
+        "slowHeadersOnly": shown.slow_headers_only,
+        "include": shown.include_in_send_receive,
+        "intervalMinutes": shown.interval_minutes,
+        "push": shown.push,
+        "pollMinutes": shown.poll_minutes,
+        "accounts": targets.iter().map(|a| a.0).collect::<Vec<_>>(),
+        "changed": changed,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::rules::tests::session;
+    use mailcraft_model::{Account, ServerSettings};
+
+    fn imap(s: &mut Session) -> AccountId {
+        let id = s.mailbox.add_account(Account {
+            kind: AccountKind::Imap,
+            address: "me@example.net".into(),
+            display_name: "me@example.net".into(),
+            incoming: Some(ServerSettings::default()),
+            ..Default::default()
+        });
+        s.mailbox.create_default_folders(id);
+        id
+    }
+
+    #[test]
+    fn mark_unmark_and_preferences() {
+        let (mut s, inbox, _) = session();
+        let a = imap(&mut s);
+        let body =
+            s.mailbox.add_mail(MailItem { folder: inbox, raw: Some(b"x".to_vec()), ..Default::default() });
+        let head = s.mailbox.add_mail(MailItem { folder: inbox, ..Default::default() });
+        s.sync.prefs.data.headers_only.insert(head.0);
+        let r = mark(&mut s, &json!({"ids": [body.0, head.0], "copy": true})).unwrap();
+        assert_eq!(r["marked"], json!([head.0]));
+        assert_eq!(marked(&s, head), Some(true));
+        let r = unmark(&mut s, &json!({"ids": [head.0]})).unwrap();
+        assert_eq!(r["unmarked"], json!([head.0]));
+        assert_eq!(marked(&s, head), None);
+        mark(&mut s, &json!({"ids": [head.0]})).unwrap();
+        assert_eq!(marked(&s, head), Some(false));
+        assert_eq!(unmark(&mut s, &json!({"all": true})).unwrap()["all"], true);
+        assert!(s.sync.prefs.data.marked.is_empty());
+
+        // Preferences: all accounts, then one.
+        let r = preferences(&mut s, &json!({"mode": "headers", "slowHeadersOnly": false})).unwrap();
+        assert_eq!(r["mode"], "headers");
+        assert_eq!(account_options(&s, a).download, DownloadMode::Headers);
+        assert_eq!(s.sync.prefs.data.defaults.download, DownloadMode::Headers);
+        let r =
+            preferences(&mut s, &json!({"account": a.0, "include": false, "intervalMinutes": 10})).unwrap();
+        assert_eq!(r["include"], false);
+        assert_eq!(account_options(&s, a).interval_minutes, Some(10));
+        assert!(crate::sync::group_accounts(&s).is_empty());
+        assert!(matches!(preferences(&mut s, &json!({"mode": "x"})), Err(CmdError::Params(_))));
+        assert!(matches!(preferences(&mut s, &json!({"intervalMinutes": 99_999})), Err(CmdError::Params(_))));
+        // Unchanged state is reported.
+        assert_eq!(preferences(&mut s, &json!({"account": a.0})).unwrap()["changed"], false);
+        assert_eq!(download_mode(&s), DownloadMode::Headers);
+    }
+
+    #[test]
+    fn process_marked_needs_a_server_and_drops_stale_marks() {
+        let (mut s, inbox, _) = session();
+        let gone = ItemId(9_999);
+        s.sync.prefs.data.marked.insert(gone.0, false);
+        let full =
+            s.mailbox.add_mail(MailItem { folder: inbox, raw: Some(b"x".to_vec()), ..Default::default() });
+        s.sync.prefs.data.marked.insert(full.0, false);
+        let r = process_marked(&mut s, &json!({"allFolders": true})).unwrap();
+        assert_eq!(r["requested"], 0);
+        assert!(s.sync.prefs.data.marked.is_empty(), "marks of missing or complete items are dropped");
+        assert!(matches!(download_headers(&mut s, &json!({})), Err(CmdError::Disabled(_))));
+    }
+}

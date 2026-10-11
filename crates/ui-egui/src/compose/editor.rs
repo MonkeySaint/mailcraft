@@ -97,6 +97,15 @@ pub(crate) trait EditorHost {
     }
     /// F7 in the body.
     fn open_spelling(&mut self, _ctx: &egui::Context, _cid: u64) {}
+    /// How a paste from the system clipboard is merged (`keepSource`, `merge`, `textOnly`): Options › Mail ›
+    /// Editor Options › "Pasting from other programs".
+    fn paste_mode(&self) -> &'static str {
+        "keepSource"
+    }
+    /// Options › Mail › "Show Paste Options button when content is pasted into a message".
+    fn paste_options(&self) -> bool {
+        true
+    }
 }
 
 impl EditorHost for App {
@@ -127,6 +136,13 @@ impl EditorHost for App {
     fn open_spelling(&mut self, ctx: &egui::Context, cid: u64) {
         super::spelling::open(ctx, self, cid);
     }
+    fn paste_mode(&self) -> &'static str {
+        let chosen = self.s.settings.text("mail.editor.pasteFromOtherPrograms");
+        PASTE_MODES.iter().map(|(id, _)| *id).find(|id| *id == chosen).unwrap_or("keepSource")
+    }
+    fn paste_options(&self) -> bool {
+        self.s.settings.bool("mail.other.pasteOptions")
+    }
 }
 
 /// Per-editor state kept in egui temp memory (taken out for the frame, put back at the end).
@@ -147,6 +163,69 @@ struct Mem {
     menu: Option<MenuAt>,
     /// Image URIs already handed to egui's loaders.
     images: Vec<String>,
+    /// List markers patched into the cached layout (see [`patch_markers`]).
+    markers: Vec<(Vec<usize>, usize, String, String)>,
+}
+
+/// A paste the Paste Options button can redo in another mode.
+#[derive(Clone, Debug, Default)]
+struct LastPaste {
+    html: Option<String>,
+    text: String,
+    mode: String,
+    /// The compose's edit counter right after the paste.
+    rev: u64,
+}
+
+/// Paste modes offered by the Paste Options button: (mode, label).
+pub const PASTE_MODES: [(&str, &str); 3] =
+    [("keepSource", "Keep Source Formatting"), ("merge", "Merge Formatting"), ("textOnly", "Keep Text Only")];
+
+fn paste_mode_id(cid: u64) -> Id {
+    Id::new(("mailcraft-compose-paste-mode", cid))
+}
+
+/// Pastes the system clipboard into compose `cid` with `mode` (ribbon Paste › Keep Source Formatting /
+/// Merge Formatting / Keep Text Only): asks the platform for a paste event, which the body editor takes with
+/// this mode instead of the default one.
+pub fn request_paste(ctx: &egui::Context, cid: u64, mode: &'static str) {
+    ctx.data_mut(|d| d.insert_temp(paste_mode_id(cid), mode));
+    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+}
+
+/// Replaces the default list markers the layout drew (`markers`: list path, item, marker, default marker)
+/// with the formatted ones, keeping each marker's right edge where it was. Returns whether anything
+/// changed.
+fn patch_markers(
+    layout: &mut Layout,
+    markers: &[(Vec<usize>, usize, String, String)],
+    db: &mailcraft_fonts::FontDb,
+) -> bool {
+    let mut changed = false;
+    for (list, item, text, default) in markers {
+        let mut item_path = list.clone();
+        item_path.push(*item);
+        let Some(line) = layout.index.lines.iter().find(|l| l.block_path.starts_with(&item_path)) else {
+            continue;
+        };
+        let (baseline, left) = (line.baseline, line.rect.x);
+        for it in &mut layout.display.items {
+            if let DisplayItem::Text { origin, text: t, font, size_px, .. } = it
+                && (origin.y - baseline).abs() < 1.0
+                && origin.x < left
+                && t == default
+            {
+                let old_w = db.measure(*font, t, *size_px);
+                let new_w = db.measure(*font, text, *size_px);
+                let right = origin.x + old_w;
+                origin.x = (right - new_w).max(0.0);
+                *t = text.clone();
+                changed = true;
+                break;
+            }
+        }
+    }
+    changed
 }
 
 /// Context-menu target.
@@ -644,6 +723,10 @@ fn take_actions(ui: &Ui) -> Vec<Act> {
     })
 }
 
+fn last_paste_id(cid: u64) -> Id {
+    Id::new(("mailcraft-compose-last-paste", cid))
+}
+
 fn with_compose(cid: u64, mut v: Value) -> Value {
     if let Some(o) = v.as_object_mut() {
         o.insert("compose".into(), json!(cid));
@@ -707,7 +790,22 @@ fn apply(
                 host.run("compose.insertText", json!({"compose": cid, "text": t}));
             }
             Act::Paste(t) => {
-                host.run("format.paste", json!({"compose": cid, "text": t}));
+                let pending: Option<&'static str> = ctx.data_mut(|d| d.remove_temp(paste_mode_id(cid)));
+                let mode = pending.unwrap_or_else(|| host.paste_mode());
+                let html = super::clipboard::html_for_paste(&t);
+                let mut p = json!({"compose": cid, "text": t, "mode": mode});
+                if let (Some(h), Some(o)) = (&html, p.as_object_mut()) {
+                    o.insert("html".into(), json!(h));
+                }
+                if host.run("format.paste", p).is_some() && html.is_some() && host.paste_options() {
+                    let rev = host.compose(cid).map_or(0, |c| c.edit_rev);
+                    ctx.data_mut(|d| {
+                        d.insert_temp(
+                            last_paste_id(cid),
+                            LastPaste { html, text: t.clone(), mode: mode.to_owned(), rev },
+                        );
+                    });
+                }
             }
             Act::Copy | Act::Cut => {
                 if c.selection.is_collapsed() {
@@ -717,7 +815,11 @@ fn apply(
                 if let Some(r) = host.run(id, json!({"compose": cid}))
                     && let Some(t) = r.get("text").and_then(Value::as_str)
                 {
-                    ctx.copy_text(t.to_owned());
+                    // HTML (with the text as its alternative) where the platform takes it, else text.
+                    let html = r.get("html").and_then(Value::as_str).unwrap_or_default();
+                    if !super::clipboard::copy_html(html, t) {
+                        ctx.copy_text(t.to_owned());
+                    }
                 }
             }
             Act::Delete { back, word } => {
@@ -1096,7 +1198,10 @@ fn apply_pick(ctx: &egui::Context, host: &mut dyn EditorHost, cid: u64, pick: Pi
             if let Some(r) = host.run(id, json!({"compose": cid}))
                 && let Some(t) = r.get("text").and_then(Value::as_str)
             {
-                ctx.copy_text(t.to_owned());
+                let html = r.get("html").and_then(Value::as_str).unwrap_or_default();
+                if !super::clipboard::copy_html(html, t) {
+                    ctx.copy_text(t.to_owned());
+                }
             }
         }
         Pick::Paste => {
@@ -1164,6 +1269,12 @@ pub(crate) fn body_editor_in(
     let sel = c.selection.clone();
     mem.view.doc_key = mem.doc_key;
     mem.view.selection = Some((to_text(&sel.anchor), to_text(&sel.focus)));
+    // Formatted list markers: a new set of markers needs a fresh layout to patch.
+    let markers = if c.list_formats.is_empty() { Vec::new() } else { c.list_markers() };
+    if markers != mem.markers {
+        mem.view.key = 0;
+        mem.markers = markers;
+    }
     {
         let text_rect = Rect::from_min_size(origin, vec2(text_w, est_h.max(line_h)));
         let mut child =
@@ -1176,6 +1287,13 @@ pub(crate) fn body_editor_in(
             doc_key: Some(mem.doc_key),
         };
         let _link = crate::body::show_doc_with(&mut child, &mut mem.view, &c.body, &opts);
+    }
+    if !mem.markers.is_empty()
+        && let Some(layout) = mem.view.layout.as_mut()
+        && patch_markers(layout, &mem.markers, &crate::body::font_db(&ctx))
+    {
+        // Painted with the default markers this frame; the patched layout shows from the next one.
+        ctx.request_repaint();
     }
     if let Some(layout) = mem.view.layout.as_ref() {
         paint_images(ui, layout, c, cid, origin, &mut mem.images);
@@ -1338,6 +1456,7 @@ pub(crate) fn body_editor_in(
             });
         });
     }
+    paste_options_button(ui, host, cid, rect);
     if changed {
         ctx.request_repaint();
     }
@@ -1345,9 +1464,78 @@ pub(crate) fn body_editor_in(
     Some(resp)
 }
 
+/// The Paste Options button after a rich paste (while the paste is the latest edit): redo the paste as
+/// Keep Source Formatting, Merge Formatting or Keep Text Only.
+fn paste_options_button(ui: &mut Ui, host: &mut dyn EditorHost, cid: u64, rect: Rect) {
+    let ctx = ui.ctx().clone();
+    let Some(last) = ctx.data(|d| d.get_temp::<LastPaste>(last_paste_id(cid))) else {
+        return;
+    };
+    if host.compose(cid).is_none_or(|c| c.edit_rev != last.rev) {
+        ctx.data_mut(|d| d.remove::<LastPaste>(last_paste_id(cid)));
+        return;
+    }
+    let at = Rect::from_min_size(rect.right_bottom() - vec2(132.0, 30.0), vec2(124.0, 24.0));
+    let mut pick: Option<&'static str> = None;
+    let mut child = ui.new_child(UiBuilder::new().max_rect(at).id_salt(("mailcraft-paste-options", cid)));
+    let r = child.menu_button("(Ctrl) Paste Options", |ui| {
+        for (mode, label) in PASTE_MODES {
+            if ui.radio(last.mode == mode, label).clicked() {
+                pick = Some(mode);
+                ui.close();
+            }
+        }
+    });
+    r.response.on_hover_text("Paste Options");
+    if let Some(mode) = pick
+        && mode != last.mode
+    {
+        host.run("compose.editUndo", json!({"compose": cid}));
+        let mut p = json!({"compose": cid, "text": last.text, "mode": mode});
+        if let (Some(h), Some(o)) = (&last.html, p.as_object_mut()) {
+            o.insert("html".into(), json!(h));
+        }
+        host.run("format.paste", p);
+        let rev = host.compose(cid).map_or(0, |c| c.edit_rev);
+        ctx.data_mut(|d| d.insert_temp(last_paste_id(cid), LastPaste { mode: mode.to_owned(), rev, ..last }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatted_list_markers_replace_the_default_ones() {
+        let mut c = ComposeState::default();
+        c.insert_text("one\ntwo\nthree");
+        c.select_all();
+        c.toggle_list(Some(mailcraft_model::rich::ListKind::Numbered { start: 1 }));
+        let fmt = mailcraft_engine::compose::ListFormat::from_key("upperRoman").unwrap();
+        assert!(c.set_list_format(vec![fmt], false));
+        let db = mailcraft_fonts::FontDb::bundled();
+        let mut layout =
+            layout_doc(&c.body, &db, &LayoutOptions { width: 400.0, ..LayoutOptions::default() });
+        let texts = |l: &Layout| -> Vec<String> {
+            l.display
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    DisplayItem::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(texts(&layout).contains(&"2.".to_owned()));
+        let markers = c.list_markers();
+        assert!(patch_markers(&mut layout, &markers, &db));
+        let t = texts(&layout);
+        assert!(
+            t.contains(&"II.".to_owned()) && t.contains(&"III.".to_owned()) && !t.contains(&"2.".to_owned()),
+            "{t:?}"
+        );
+        assert!(!patch_markers(&mut layout, &markers, &db), "patching twice changes nothing");
+    }
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()

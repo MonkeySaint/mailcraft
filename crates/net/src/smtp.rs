@@ -1,6 +1,13 @@
 //! SMTP submission client (RFC 5321, RFC 6409): EHLO/HELO, STARTTLS (RFC 3207), AUTH PLAIN/LOGIN/XOAUTH2/
 //! OAUTHBEARER (RFC 4954), SIZE (RFC 1870), 8BITMIME (RFC 6152), SMTPUTF8 (RFC 6531), PIPELINING (RFC 2920),
-//! enhanced status codes (RFC 3463), dot-stuffing, and per-recipient error reporting.
+//! enhanced status codes (RFC 3463), delivery status notifications (DSN, RFC 3461), dot-stuffing, and
+//! per-recipient error reporting.
+//!
+//! Submission-only header fields: the engine asks for envelope options by writing `X-MailCraft-Submit-*`
+//! header fields into the message it queues (see [`SUBMIT_HEADER_PREFIX`]). [`SmtpClient::send`] reads them,
+//! turns them into envelope parameters (`X-MailCraft-Submit-DSN` → `NOTIFY`/`ORCPT`/`RET`/`ENVID` when the
+//! server advertises DSN) and removes every such field before DATA, so recipients never see them. Without
+//! server DSN support the request is dropped: no legacy `Return-Receipt-To` fallback.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -89,6 +96,8 @@ pub struct Extensions {
     pub pipelining: bool,
     pub starttls: bool,
     pub enhanced_status_codes: bool,
+    /// Delivery status notifications (RFC 3461).
+    pub dsn: bool,
     pub auth: Vec<String>,
     /// All keyword lines as sent.
     pub raw: Vec<String>,
@@ -109,6 +118,7 @@ impl Extensions {
                 "PIPELINING" => e.pipelining = true,
                 "STARTTLS" => e.starttls = true,
                 "ENHANCEDSTATUSCODES" => e.enhanced_status_codes = true,
+                "DSN" => e.dsn = true,
                 "AUTH" => e.auth.extend(words.map(|w| w.to_ascii_uppercase())),
                 k if k.starts_with("AUTH=") => {
                     // Old-style `AUTH=LOGIN PLAIN`.
@@ -124,6 +134,144 @@ impl Extensions {
         e.auth.dedup();
         e
     }
+}
+
+/// Prefix of submission-only header fields (removed by [`SmtpClient::send`] before DATA).
+pub const SUBMIT_HEADER_PREFIX: &str = "X-MailCraft-Submit-";
+/// Submission-only field asking for a delivery status notification, e.g.
+/// `X-MailCraft-Submit-DSN: NOTIFY=SUCCESS,FAILURE; RET=HDRS`.
+pub const DSN_HEADER: &str = "X-MailCraft-Submit-DSN";
+/// Longest ENVID (RFC 3461 section 4.4: 100 characters).
+const MAX_ENVID: usize = 100;
+
+/// Delivery status notification request (RFC 3461) for one message.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DsnRequest {
+    pub success: bool,
+    pub failure: bool,
+    pub delay: bool,
+    /// RET=HDRS (only the headers come back) rather than RET=FULL.
+    pub headers_only: bool,
+    /// ENVID: identifies the message in the reports (the Message-ID without brackets, when short enough).
+    pub envid: Option<String>,
+}
+
+impl DsnRequest {
+    /// Parses the value of [`DSN_HEADER`] (`NOTIFY=SUCCESS,FAILURE; RET=HDRS`). Unknown words are ignored;
+    /// `None` when nothing is requested.
+    pub fn parse(value: &str) -> Option<DsnRequest> {
+        let mut d = DsnRequest { headers_only: true, ..DsnRequest::default() };
+        // Whitespace next to `,` and `=` (a folded list) does not separate words.
+        let mut norm = String::with_capacity(value.len());
+        for ch in value.chars() {
+            if ch.is_whitespace() && norm.ends_with([',', '=']) {
+                continue;
+            }
+            if matches!(ch, ',' | '=') {
+                let trimmed = norm.trim_end().len();
+                norm.truncate(trimmed);
+            }
+            norm.push(ch);
+        }
+        for part in norm.split([';', ' ', '\t']).map(str::trim).filter(|p| !p.is_empty()) {
+            let (k, v) = part.split_once('=').unwrap_or((part, ""));
+            match k.to_ascii_uppercase().as_str() {
+                "NOTIFY" => {
+                    for w in v.split(',') {
+                        match w.trim().to_ascii_uppercase().as_str() {
+                            "SUCCESS" => d.success = true,
+                            "FAILURE" => d.failure = true,
+                            "DELAY" => d.delay = true,
+                            _ => {}
+                        }
+                    }
+                }
+                "RET" => d.headers_only = !v.trim().eq_ignore_ascii_case("FULL"),
+                _ => {}
+            }
+        }
+        (d.success || d.failure || d.delay).then_some(d)
+    }
+
+    /// The NOTIFY keyword list.
+    pub(crate) fn notify(&self) -> String {
+        let mut v = Vec::new();
+        if self.success {
+            v.push("SUCCESS");
+        }
+        if self.failure {
+            v.push("FAILURE");
+        }
+        if self.delay {
+            v.push("DELAY");
+        }
+        if v.is_empty() { "NEVER".to_owned() } else { v.join(",") }
+    }
+}
+
+/// RFC 3461 section 4 xtext: `+` followed by two upper-case hex digits for `+`, `=`, and bytes outside
+/// `!`..`~`.
+pub fn xtext(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if (33..=126).contains(&b) && b != b'+' && b != b'=' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("+{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Splits `raw` into the submission options it asks for and the message to transmit: every
+/// `X-MailCraft-Submit-*` field (with its folded continuation lines) is removed from the header section;
+/// the body is untouched. The ENVID comes from the Message-ID.
+pub fn take_submit_options(raw: &[u8]) -> (Option<DsnRequest>, Vec<u8>) {
+    let head_len = header_section(raw).len();
+    let (head, body) = raw.split_at(head_len.min(raw.len()));
+    let mut out = Vec::with_capacity(raw.len());
+    let mut dsn = None;
+    let mut message_id = None;
+    // Header fields with their continuation lines.
+    let mut fields: Vec<Vec<u8>> = Vec::new();
+    for line in head.split_inclusive(|&b| b == b'\n') {
+        let folded = line.first().is_some_and(|&b| b == b' ' || b == b'\t');
+        match fields.last_mut() {
+            Some(last) if folded => last.extend_from_slice(line),
+            _ => fields.push(line.to_vec()),
+        }
+    }
+    for f in fields {
+        let text = String::from_utf8_lossy(&f).into_owned();
+        let (name, value) = text.split_once(':').unwrap_or((text.as_str(), ""));
+        let name = name.trim();
+        let value: String =
+            value.split(['\r', '\n']).map(str::trim).filter(|v| !v.is_empty()).collect::<Vec<_>>().join(" ");
+        let skipping = name.len() >= SUBMIT_HEADER_PREFIX.len()
+            && name
+                .get(..SUBMIT_HEADER_PREFIX.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(SUBMIT_HEADER_PREFIX));
+        if skipping {
+            if name.eq_ignore_ascii_case(DSN_HEADER) {
+                dsn = DsnRequest::parse(&value);
+            }
+            continue;
+        }
+        if name.eq_ignore_ascii_case("Message-ID") {
+            message_id = Some(value.trim().trim_start_matches('<').trim_end_matches('>').to_owned());
+        }
+        out.extend_from_slice(&f);
+    }
+    out.extend_from_slice(body);
+    if let Some(d) = dsn.as_mut()
+        && let Some(id) = message_id.filter(|i| !i.is_empty() && i.is_ascii())
+    {
+        let x = xtext(&id);
+        if x.len() <= MAX_ENVID {
+            d.envid = Some(x);
+        }
+    }
+    (dsn, out)
 }
 
 /// A recipient the server refused.
@@ -539,7 +687,23 @@ impl SmtpClient {
     /// Sends `raw` (a complete RFC 5322 message) from `from` to `rcpts`. Succeeds only when every recipient
     /// was accepted and the server took the message; otherwise the error lists refused recipients and
     /// whether the message went out to the others.
+    ///
+    /// Submission-only `X-MailCraft-Submit-*` header fields are removed first; a DSN request among them
+    /// becomes the RFC 3461 envelope parameters when the server advertises DSN.
     pub fn send(&mut self, from: &str, rcpts: &[&str], raw: &[u8]) -> std::result::Result<(), SendError> {
+        let (dsn, clean) = take_submit_options(raw);
+        self.send_with(from, rcpts, &clean, dsn.as_ref())
+    }
+
+    /// [`SmtpClient::send`] with an explicit DSN request (ignored when the server has no DSN extension);
+    /// `raw` is sent as is.
+    pub fn send_with(
+        &mut self,
+        from: &str,
+        rcpts: &[&str],
+        raw: &[u8],
+        dsn: Option<&DsnRequest>,
+    ) -> std::result::Result<(), SendError> {
         if self.broken {
             return Err(SendError::from_net(NetError::Closed));
         }
@@ -601,7 +765,25 @@ impl SmtpClient {
         if non_ascii_addr || utf8_headers {
             mail.push_str(" SMTPUTF8");
         }
-        let rcpt_lines: Vec<String> = rcpts.iter().map(|r| format!("RCPT TO:<{r}>")).collect();
+        let dsn = dsn.filter(|_| self.ext.dsn);
+        if let Some(d) = dsn {
+            mail.push_str(if d.headers_only { " RET=HDRS" } else { " RET=FULL" });
+            if let Some(id) = &d.envid {
+                mail.push_str(&format!(" ENVID={id}"));
+            }
+        }
+        let rcpt_lines: Vec<String> = rcpts
+            .iter()
+            .map(|r| match dsn {
+                // ORCPT carries the address as typed (RFC 3461 section 4.2); utf-8 addresses would need
+                // RFC 6533's utf-8-addr-xtext, so they go without it.
+                Some(d) if r.is_ascii() => {
+                    format!("RCPT TO:<{r}> NOTIFY={} ORCPT=rfc822;{}", d.notify(), xtext(r))
+                }
+                Some(d) => format!("RCPT TO:<{r}> NOTIFY={}", d.notify()),
+                None => format!("RCPT TO:<{r}>"),
+            })
+            .collect();
 
         let (mail_reply, rcpt_replies) = if self.ext.pipelining {
             let mut batch = Vec::new();
@@ -747,6 +929,7 @@ mod tests {
         assert_eq!(e.size, Some(1000));
         assert!(e.eight_bit_mime && e.pipelining && e.starttls && !e.smtputf8);
         assert_eq!(e.auth, vec!["LOGIN", "PLAIN", "XOAUTH2"]);
+        assert!(!e.dsn);
     }
 
     #[test]
@@ -755,6 +938,121 @@ mod tests {
         assert!(valid_address(""));
         assert!(!valid_address("a@b>\r\nRCPT TO:<x"));
         assert!(!valid_address("a b@c"));
+    }
+
+    #[test]
+    fn dsn_requests_and_xtext() {
+        let d = DsnRequest::parse("NOTIFY=SUCCESS,FAILURE; RET=HDRS").unwrap();
+        assert!(d.success && d.failure && !d.delay && d.headers_only);
+        assert_eq!(d.notify(), "SUCCESS,FAILURE");
+        assert!(DsnRequest::parse("RET=FULL").is_none());
+        assert!(!DsnRequest::parse("NOTIFY=FAILURE RET=FULL").unwrap().headers_only);
+        assert_eq!(xtext("a+b=c d@example.com"), "a+2Bb+3Dc+20d@example.com");
+        assert_eq!(xtext("é"), "+C3+A9");
+    }
+
+    #[test]
+    fn submit_headers_are_removed_with_their_folds() {
+        let raw = b"From: a@example.com\r\nX-MailCraft-Submit-DSN: NOTIFY=SUCCESS,\r\n FAILURE; RET=HDRS\r\n\
+Message-ID: <id.1@example.com>\r\nx-mailcraft-submit-save-sent: none\r\nSubject: Hi\r\n\r\nX-MailCraft-Submit-DSN: body\r\n";
+        let (dsn, clean) = take_submit_options(raw);
+        let d = dsn.unwrap();
+        assert!(d.success && d.failure);
+        assert_eq!(d.envid.as_deref(), Some("id.1@example.com"));
+        assert_eq!(
+            clean,
+            b"From: a@example.com\r\nMessage-ID: <id.1@example.com>\r\nSubject: Hi\r\n\r\nX-MailCraft-Submit-DSN: body\r\n"
+        );
+        // Nothing to remove: unchanged.
+        let plain = b"Subject: x\n\nbody";
+        assert_eq!(take_submit_options(plain), (None, plain.to_vec()));
+        // Hostile input never panics.
+        let _ = take_submit_options(b"X-MailCraft-Submit-DSN\r\n \r\n\r\n");
+        let _ = take_submit_options(b"\xff\xfe: \x00\n\tfold");
+    }
+
+    /// A one-connection SMTP server on 127.0.0.1 that advertises `ehlo` lines and records what it is sent.
+    fn fake_server(ehlo: &'static str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            let mut seen = Vec::new();
+            w.write_all(b"220 test ESMTP\r\n").unwrap();
+            let mut in_data = false;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim_end_matches(['\r', '\n']).to_owned();
+                seen.push(line.clone());
+                if in_data {
+                    if line == "." {
+                        in_data = false;
+                        w.write_all(b"250 2.0.0 queued\r\n").unwrap();
+                    }
+                    continue;
+                }
+                let verb = line.split(' ').next().unwrap_or("").to_ascii_uppercase();
+                let reply: String = match verb.as_str() {
+                    "EHLO" => format!("250-test\r\n{ehlo}250 8BITMIME\r\n"),
+                    "DATA" => {
+                        in_data = true;
+                        "354 go\r\n".into()
+                    }
+                    "QUIT" => {
+                        w.write_all(b"221 bye\r\n").unwrap();
+                        break;
+                    }
+                    _ => "250 2.1.0 ok\r\n".into(),
+                };
+                w.write_all(reply.as_bytes()).unwrap();
+            }
+            seen
+        });
+        (port, t)
+    }
+
+    fn deliver(ehlo: &'static str) -> Vec<String> {
+        let (port, t) = fake_server(ehlo);
+        let mut set = SmtpSettings::new("127.0.0.1", port, Security::None);
+        set.options.io_timeout = Duration::from_secs(10);
+        let mut c = SmtpClient::connect(&set).unwrap();
+        let raw = b"From: a@example.com\r\nTo: b@example.org\r\nMessage-ID: <m1@example.com>\r\n\
+X-MailCraft-Submit-DSN: NOTIFY=SUCCESS,FAILURE; RET=HDRS\r\nSubject: s\r\n\r\nbody\r\n";
+        c.send("a@example.com", &["b@example.org"], raw).unwrap();
+        c.quit().unwrap();
+        t.join().unwrap()
+    }
+
+    #[test]
+    fn dsn_envelope_parameters_when_the_server_offers_dsn() {
+        let seen = deliver("250-DSN\r\n");
+        assert!(
+            seen.contains(&"MAIL FROM:<a@example.com> RET=HDRS ENVID=m1@example.com".to_owned()),
+            "{seen:?}"
+        );
+        assert!(
+            seen.contains(
+                &"RCPT TO:<b@example.org> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;b@example.org".to_owned()
+            ),
+            "{seen:?}"
+        );
+        assert!(!seen.iter().any(|l| l.contains("X-MailCraft-Submit")), "{seen:?}");
+        assert!(!seen.iter().any(|l| l.starts_with("Return-Receipt-To")));
+    }
+
+    #[test]
+    fn no_dsn_parameters_without_server_support() {
+        let seen = deliver("");
+        assert!(seen.contains(&"MAIL FROM:<a@example.com>".to_owned()), "{seen:?}");
+        assert!(seen.contains(&"RCPT TO:<b@example.org>".to_owned()), "{seen:?}");
+        assert!(!seen.iter().any(|l| l.contains("X-MailCraft-Submit") || l.contains("Return-Receipt-To")));
     }
 
     proptest! {

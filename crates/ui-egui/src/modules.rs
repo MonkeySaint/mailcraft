@@ -37,6 +37,16 @@ use crate::App;
 /// should leave these in `app.ui.dialogs`; [`pim_windows`] takes them out.
 pub const HANDLED_DIALOGS: [&str; 6] = ["appointment", "contact", "contactGroup", "task", "note", "goToDate"];
 
+/// True for a dialog request this area draws itself (item windows, module dialogs, and the calendar's own
+/// windows while the Calendar shows). The dialogs area leaves these in `app.ui.dialogs` for [`pim_windows`]
+/// (or the calendar view) to take on the next pass, instead of flashing a generic renderer for one frame.
+pub fn takes_dialog(app: &App, name: &str, params: &Value) -> bool {
+    HANDLED_DIALOGS.contains(&name)
+        || editors::dialogs::HANDLED.contains(&name)
+        || (app.s.view.module == mailcraft_engine::Module::Calendar
+            && calendar_view::windows::is_request(name, params))
+}
+
 pub fn calendar(ui: &mut egui::Ui, app: &mut App) {
     calendar_view::show(ui, app);
     pim_windows(ui.ctx(), app);

@@ -20,8 +20,9 @@ commit 23.
 | M1 | Protocols: IMAP sync, SMTP send, Outbox/Sent flow, OAuth2, account setup; MSG/EML/MBOX | ✅ done (commit 8) |
 | M3/M6/M12 | Calendar (iCalendar), contacts (vCard), tasks, notes, rules engine + Rules Wizard, quick steps, search folders, PDF/print, import/export | ✅ done (commit 9) |
 | — | Clippy/fmt clean, honest parity table, CI green | ✅ done (commit 10) |
-| — | README with screenshots | planned (commit 11) |
-| — | Release pipeline on GitHub Actions (Linux AppImage/deb/rpm/tar/Flatpak, Windows MSI, macOS DMG, FreeBSD, web) | planned (commits 12–13) |
+| — | README with screenshots | ✅ done (commit 11) |
+| — | Release pipeline on GitHub Actions (Linux AppImage/deb/rpm/tar/Flatpak, Windows MSI, macOS DMG, FreeBSD, web) | ✅ done (commits 12–13) |
+| — | Gap closing: profile settings store and Options; People/Tasks/Notes views and actions; calendar depth (colours, overlay, drag/resize, named time zones, subscriptions); compose (rich paste, themes, list formats, voting, receipts, Save Sent Item To); Junk Email; accounts (IDLE push, POP3, JMAP, OAuth sign-in, OS keyring) | ✅ round 1 done (commit 14); re-audit next |
 | — | Fidelity: responsive single-pane, reading pane Bottom columns, row icons/hover actions, read-on-selection-change + inline reply | planned (commits 14–17) |
 | M7/M14 | Rules UI depth, alpha/parity estimates, small fixes | planned (commits 18–26) |
 | v0.1.0 / v0.2.0 / v0.3.0 | Local release tags | commits 23 / 27 / 30 |

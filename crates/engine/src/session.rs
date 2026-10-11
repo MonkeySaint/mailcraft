@@ -3,11 +3,12 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::compose::ComposeState;
+use crate::compose::{ComposeKind, ComposeState, SaveSentTo};
+use crate::settings::{self, Settings, SettingsFile};
 use crate::undo::{UndoEntry, UndoStack};
 use crate::{CmdError, CmdResult, Registry};
 use mailcraft_model::{
@@ -176,6 +177,13 @@ pub struct Session {
     pub sync: crate::sync::SyncState,
     /// Search index, recent searches and search toggles (see `search_index.rs`).
     pub search: crate::search_index::SearchState,
+    /// Profile settings: File › Options and the option dialogs (see `settings.rs`). Saved with the view state
+    /// to `settings.json` in the profile folder after every command that changes them.
+    pub settings: Settings,
+    /// Profile folder holding `settings.json` (`None` = in-memory session: nothing is saved).
+    settings_dir: Option<std::path::PathBuf>,
+    /// Bytes last read from or written to `settings.json` (identical states are not rewritten).
+    settings_saved: Option<Vec<u8>>,
 }
 
 /// Most ops kept in `pending_ops` while no store is attached; beyond that they collapse into one `Replace`.
@@ -213,6 +221,9 @@ impl Session {
             secrets: Box::new(crate::accounts::MemorySecretStore::default()),
             sync: crate::sync::SyncState::default(),
             search: crate::search_index::SearchState::default(),
+            settings: Settings::default(),
+            settings_dir: None,
+            settings_saved: None,
         };
         s.refresh_me();
         s.select_default_folder();
@@ -227,6 +238,9 @@ impl Session {
         let mut mailbox = store
             .load()
             .map_err(|e| CmdError::Failed(format!("cannot read the data folder {}: {e}", dir.display())))?;
+        // Junk lists from disk may be unsorted, duplicated or over the cap (older or hand-edited files);
+        // adding to a list relies on it being sorted.
+        mailbox.junk.sanitize();
         if mailbox.accounts.is_empty() && mailbox.folders.is_empty() {
             mailbox = Mailbox::new_local(mailcraft_model::mailbox::LOCAL_ACCOUNT_FALLBACK_NAME);
             store.checkpoint(&mailbox).map_err(|e| {
@@ -245,7 +259,302 @@ impl Session {
                 )));
             }
         }
+        s.load_settings(dir);
+        // A named calendar time zone (Calendar › Time Zones) sets the display offset for today's DST rules.
+        crate::cmd::calendar::views::refresh_time_zone(&mut s);
         Ok(s)
+    }
+
+    // -----------------------------------------------------------------------------------------------------
+    // Settings
+
+    /// Loads `settings.json` from the profile folder `dir` (options, view state, recent searches), applies
+    /// them, opens the start-up folder and saves later changes there. A missing file means defaults; an
+    /// unreadable one is kept aside as `settings.json.bad` and defaults are used.
+    pub fn load_settings(&mut self, dir: &std::path::Path) {
+        self.settings_dir = Some(dir.to_path_buf());
+        match SettingsFile::read(dir) {
+            Ok(None) => {}
+            Ok(Some(f)) => {
+                let (loaded, dropped) = Settings::from_json(&f.settings);
+                for d in dropped {
+                    log::warn!("settings.json: ignored {d}");
+                }
+                self.settings = loaded;
+                if let Ok(view) = serde_json::from_value::<ViewState>(f.view) {
+                    self.view = self.sanitize_view(view);
+                }
+                self.search.recent = f
+                    .recent_searches
+                    .into_iter()
+                    .filter(|q| !q.trim().is_empty() && q.chars().count() <= 512)
+                    .take(crate::search_index::MAX_RECENT)
+                    .collect();
+            }
+            Err(e) => {
+                log::error!("settings.json unreadable: {e}");
+                let bad = dir.join(format!("{}.bad", settings::FILE_NAME));
+                let _ = std::fs::rename(dir.join(settings::FILE_NAME), bad);
+                self.notify(Notice::Error(format!(
+                    "Your settings could not be read ({e}); MailCraft started with the default settings."
+                )));
+            }
+        }
+        self.apply_settings();
+        self.select_start_folder();
+        self.settings_saved = self.settings_bytes();
+    }
+
+    /// View state as loaded from disk, made safe: zoom in range, known Quick Access commands only, no active
+    /// search, not minimised, online (Work Offline is per session), Mail module (the start-up folder decides
+    /// where the window opens).
+    fn sanitize_view(&self, mut v: ViewState) -> ViewState {
+        if v.zoom != 0 && !(10..=500).contains(&v.zoom) {
+            v.zoom = 100;
+        }
+        v.quick_access.retain(|id| self.registry.get(id).is_some());
+        v.quick_access.truncate(64);
+        v.quick_access.dedup();
+        v.collapsed_groups.retain(|f, labels| self.mailbox.folders.contains_key(f) && labels.len() <= 64);
+        v.search.clear();
+        v.minimized = false;
+        v.work_offline = false;
+        v.module = Module::Mail;
+        if v.auto_send_receive_minutes > 1440 {
+            v.auto_send_receive_minutes = crate::sync::DEFAULT_AUTO_MINUTES;
+        }
+        v
+    }
+
+    /// Copies settings that the session holds elsewhere (view state, search, time zone) into place.
+    pub fn apply_settings(&mut self) {
+        for key in MIRRORED {
+            self.apply_setting(key);
+        }
+    }
+
+    /// Applies one setting the session also holds elsewhere (no-op for the others).
+    pub fn apply_setting(&mut self, key: &str) {
+        let st = &self.settings;
+        match key {
+            "advanced.sendImmediately" => self.view.send_immediately = st.bool(key),
+            "advanced.sendReceiveMinutes" => {
+                self.view.auto_send_receive_minutes =
+                    u32::try_from(st.int(key)).unwrap_or(crate::sync::DEFAULT_AUTO_MINUTES);
+            }
+            "general.theme" => match st.text(key).as_str() {
+                "dark" => self.view.dark = true,
+                "light" => self.view.dark = false,
+                _ => {}
+            },
+            "search.scope" => {
+                let name = st.text(key);
+                if let Some((sc, _)) = SCOPE_NAMES.iter().find(|(_, n)| *n == name) {
+                    self.view.search_scope = *sc;
+                }
+            }
+            "search.includeDeleted" => self.search.include_deleted = st.bool(key),
+            "calendar.timeZone" => self.tz_offset_min = st.time_zone_offset_min(),
+            _ => {}
+        }
+    }
+
+    /// Copies session state that mirrors a setting back into the settings (commands such as Work Offline,
+    /// Change Time Zone or the dark-mode toggle change the session directly).
+    fn sync_settings_from_session(&mut self) {
+        let scope = SCOPE_NAMES
+            .iter()
+            .find(|(sc, _)| *sc == self.view.search_scope)
+            .map_or("currentFolder", |(_, n)| *n);
+        let pairs = [
+            ("advanced.sendImmediately", json!(self.view.send_immediately)),
+            ("advanced.sendReceiveMinutes", json!(self.view.auto_send_receive_minutes)),
+            ("search.scope", json!(scope)),
+            ("search.includeDeleted", json!(self.search.include_deleted)),
+            ("calendar.timeZone", json!(self.tz_offset_min)),
+        ];
+        for (k, v) in pairs {
+            if self.settings.get(k).as_ref() != Some(&v) {
+                // Out-of-range session values (none today) simply stay unsaved.
+                let _ = self.settings.set(k, &v);
+            }
+        }
+        let theme = self.settings.text("general.theme");
+        if theme != "system" && (theme == "dark") != self.view.dark {
+            let _ = self.settings.set("general.theme", &json!(if self.view.dark { "dark" } else { "light" }));
+        }
+    }
+
+    /// Opens Options › Advanced › "Start MailCraft in this folder" (a folder path, or a folder name), else
+    /// keeps the default Inbox.
+    pub fn select_start_folder(&mut self) {
+        let want = self.settings.text("advanced.startFolder");
+        let want = want.trim().trim_matches('\\');
+        if want.is_empty() {
+            return;
+        }
+        let mb = &self.mailbox;
+        let by_path = mb.folders.keys().copied().find(|f| mb.folder_path(*f).eq_ignore_ascii_case(want));
+        let by_name = || mb.folders.values().find(|f| f.name.eq_ignore_ascii_case(want)).map(|f| f.id);
+        if let Some(folder) = by_path.or_else(by_name) {
+            if let Some(kind) = mb.folder(folder).map(|f| f.kind) {
+                self.view.module = crate::cmd::nav::module_for_kind(kind);
+            }
+            self.selection = Selection { folder, items: Vec::new(), focus: None };
+        }
+    }
+
+    /// Serialised settings file for the current state (`None` for in-memory sessions).
+    fn settings_bytes(&self) -> Option<Vec<u8>> {
+        self.settings_dir.as_ref()?;
+        let mut view = self.view.clone();
+        view.search.clear();
+        view.minimized = false;
+        let view = serde_json::to_value(&view).unwrap_or(Value::Null);
+        SettingsFile::new(&self.settings, view, &self.search.recent).to_bytes().ok()
+    }
+
+    /// Writes `settings.json` when the settings or the persisted view state changed since the last write.
+    pub fn save_settings(&mut self) -> Result<(), CmdError> {
+        let Some(dir) = self.settings_dir.clone() else { return Ok(()) };
+        let Some(bytes) = self.settings_bytes() else { return Ok(()) };
+        if self.settings_saved.as_ref() == Some(&bytes) {
+            return Ok(());
+        }
+        SettingsFile::write_bytes(&dir, &bytes).map_err(CmdError::Failed)?;
+        self.settings_saved = Some(bytes);
+        Ok(())
+    }
+
+    /// Changes a setting (validated) and saves; view-backed keys go through `options.set` rules.
+    pub fn set_option(&mut self, key: &str, value: &Value) -> Result<Value, CmdError> {
+        crate::cmd::options::set_option(self, key, value)
+    }
+
+    /// Current value of a setting, `None` for unknown keys.
+    pub fn option(&self, key: &str) -> Option<Value> {
+        crate::cmd::options::option_value(self, key)
+    }
+
+    /// Fills in a new compose state from the settings: Bcc / From boxes, and for new messages the format, font,
+    /// importance, sensitivity, receipts, Sent Items copy and proofing language; replies and forwards open in
+    /// their own window when the option says so.
+    fn apply_compose_defaults(&self, c: &mut ComposeState) {
+        let st = &self.settings;
+        c.show_bcc |= st.bool("mail.compose.showBcc");
+        c.show_from |= st.bool("mail.compose.showFrom");
+        if c.kind == ComposeKind::Draft {
+            return;
+        }
+        c.request_delivery_receipt |= st.bool("mail.tracking.requestDelivery");
+        c.request_read_receipt |= st.bool("mail.tracking.requestRead");
+        if c.save_sent == SaveSentTo::Default && !st.bool("mail.save.sentCopies") {
+            c.save_sent = SaveSentTo::DoNotSave;
+        }
+        match c.kind {
+            ComposeKind::Reply | ComposeKind::ReplyAll | ComposeKind::Forward => {
+                if c.inline && st.bool("mail.reply.newWindow") {
+                    c.inline = false;
+                }
+            }
+            ComposeKind::New if c.source.is_none() && c.draft.is_none() => {
+                if c.format == mailcraft_model::BodyFormat::Html {
+                    c.format = st.compose_format();
+                }
+                if c.importance == mailcraft_model::Importance::Normal {
+                    c.importance = st.default_importance();
+                }
+                if c.sensitivity == mailcraft_model::Sensitivity::Normal {
+                    c.sensitivity = st.default_sensitivity();
+                }
+                let family = st.text("mail.compose.fontFamily");
+                if c.body.base.font_family.is_none() && !family.trim().is_empty() {
+                    c.body.base.font_family = Some(family.trim().to_owned());
+                }
+                let size = st.int("mail.compose.fontSizePt");
+                if c.body.base.size_pt.is_none() && size > 0 {
+                    c.body.base.size_pt = Some(size as f32);
+                }
+                let lang = st.text("language.authoring");
+                if c.language.is_none() && lang != "en-US" && !lang.is_empty() {
+                    c.language = Some(lang);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Options › Mail › "Warn me when I send a message that may be missing an attachment": a message that
+    /// mentions an attachment but has none asks first (the confirm dialog sends with
+    /// `"attachmentReminder": false`). `None` = send as usual.
+    fn attachment_reminder(&mut self, params: &Value) -> Option<CmdResult> {
+        if !self.settings.bool("mail.send.attachmentReminder")
+            || params.get("attachmentReminder").and_then(Value::as_bool) == Some(false)
+        {
+            return None;
+        }
+        let cid = crate::cmd::compose::compose_id(self, params).ok()?;
+        let c = self.composes.get(&cid)?;
+        if !c.attachments.is_empty() {
+            return None;
+        }
+        let body = c.body.to_plain_text();
+        let mentions = match c.kind {
+            ComposeKind::Reply | ComposeKind::ReplyAll | ComposeKind::Forward => {
+                settings::mentions_attachment(settings::new_text_of_reply(&body))
+            }
+            ComposeKind::New | ComposeKind::Draft => {
+                settings::mentions_attachment(&c.subject) || settings::mentions_attachment(&body)
+            }
+        };
+        if !mentions {
+            return None;
+        }
+        self.notify(Notice::OpenDialog(
+            "confirm".into(),
+            json!({
+                "title": "Attachment Reminder",
+                "text": "You may have forgotten to attach a file. Send anyway?",
+                "command": "compose.send",
+                "params": {"compose": cid, "attachmentReminder": false},
+            }),
+        ));
+        Some(Ok(json!({"sent": false, "compose": cid, "dialog": "confirm", "reason": "attachmentReminder"})))
+    }
+
+    /// Options › Advanced › "Empty Deleted Items folders when exiting": empties every Deleted Items folder
+    /// (items and subfolders) and journals the change before the exit save.
+    fn empty_deleted_on_exit(&mut self) {
+        if !self.settings.bool("advanced.emptyDeletedOnExit") {
+            return;
+        }
+        let before = self.mailbox.clone();
+        let deleted: Vec<FolderId> = self
+            .mailbox
+            .folders
+            .values()
+            .filter(|f| f.role == Some(FolderRole::DeletedItems))
+            .map(|f| f.id)
+            .collect();
+        for d in deleted {
+            let items: Vec<ItemId> = self.mailbox.items_in(d).iter().map(|m| m.id).collect();
+            if let Err(e) = self.mailbox.delete_items(&items) {
+                log::error!("emptying Deleted Items on exit: {e}");
+            }
+            let subs: Vec<FolderId> =
+                self.mailbox.folders.values().filter(|f| f.parent == Some(d)).map(|f| f.id).collect();
+            for f in subs {
+                if let Err(e) = self.mailbox.delete_folder(f) {
+                    log::error!("emptying Deleted Items on exit: {e}");
+                }
+            }
+        }
+        let ops = diff_ops(&before, &self.mailbox);
+        if !ops.is_empty() {
+            self.undo.push(UndoEntry { label: "Empty Deleted Items".into(), before: Box::new(before) });
+            self.journal(ops);
+            self.tidy_selection();
+        }
     }
 
     /// Recomputes [`Session::me`] from the accounts' addresses (lower-case, no duplicates).
@@ -292,6 +601,17 @@ impl Session {
                 return Err(CmdError::Failed(format!("command `{id}` panicked: {msg}")));
             }
         }
+        // Options that act around commands (see `settings.rs`).
+        if id == "compose.send"
+            && let Some(r) = self.attachment_reminder(params)
+        {
+            return r;
+        }
+        if id == "file.exit" {
+            self.empty_deleted_on_exit();
+        }
+        let read_on_delete = (id == "mail.delete" && self.settings.bool("mail.other.markReadOnDelete"))
+            .then(|| self.target_ids(params));
         // Undo/redo restore snapshots themselves (and journal a Replace); they must not record undo entries.
         let self_journaling = matches!(spec.id, "app.undo" | "app.redo");
         let snapshot = (spec.mutates && !self_journaling).then(|| self.mailbox.clone());
@@ -309,6 +629,23 @@ impl Session {
                 Err(CmdError::Failed(format!("command `{id}` panicked: {msg}")))
             }
         };
+        if let (Some(ids), Ok(_)) = (read_on_delete, &result) {
+            // Options › Mail › "Mark messages as read when deleted" (part of the delete's undo step).
+            self.mailbox.set_read(&ids, true);
+        }
+        if let Ok(v) = &result {
+            // Showing Bcc / From in one message keeps them shown in the next ones.
+            for (cmd, field, key) in [
+                ("compose.showBcc", "showBcc", "mail.compose.showBcc"),
+                ("compose.showFrom", "showFrom", "mail.compose.showFrom"),
+            ] {
+                if id == cmd
+                    && let Some(on) = v.get(field).and_then(Value::as_bool)
+                {
+                    let _ = self.settings.set(key, &json!(on));
+                }
+            }
+        }
         if let Some(before) = snapshot {
             if result.is_err() {
                 self.mailbox = before;
@@ -343,6 +680,10 @@ impl Session {
             self.flush_pending();
         }
         self.tidy_selection();
+        self.sync_settings_from_session();
+        if let Err(e) = self.save_settings() {
+            log::error!("{e}");
+        }
         result
     }
 
@@ -465,6 +806,7 @@ impl Session {
 
     /// Registers a compose state and returns its id (also queues `Notice::Compose`).
     pub fn open_compose(&mut self, mut c: ComposeState) -> u64 {
+        self.apply_compose_defaults(&mut c);
         self.next_compose = self.next_compose.saturating_add(1);
         c.id = self.next_compose;
         self.composes.insert(c.id, c);
@@ -480,6 +822,25 @@ impl Session {
         }
     }
 }
+
+/// Settings the session also holds elsewhere ([`Session::apply_setting`]).
+const MIRRORED: [&str; 6] = [
+    "advanced.sendImmediately",
+    "advanced.sendReceiveMinutes",
+    "general.theme",
+    "search.scope",
+    "search.includeDeleted",
+    "calendar.timeZone",
+];
+
+/// Search scopes by their option names (Options › Search › "Include results only from").
+pub(crate) const SCOPE_NAMES: [(SearchScope, &str); 5] = [
+    (SearchScope::CurrentFolder, "currentFolder"),
+    (SearchScope::Subfolders, "subfolders"),
+    (SearchScope::CurrentMailbox, "currentMailbox"),
+    (SearchScope::AllMailboxes, "allMailboxes"),
+    (SearchScope::AllOutlookItems, "allOutlookItems"),
+];
 
 /// Text of a panic payload.
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
@@ -514,6 +875,7 @@ pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
         signature_defaults,
         recent_recipients,
         custom_dictionary,
+        junk,
     } = after;
     let other_changed = before.accounts != *accounts
         || before.categories != *categories
@@ -527,7 +889,8 @@ pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
         || before.signatures != *signatures
         || before.signature_defaults != *signature_defaults
         || before.recent_recipients != *recent_recipients
-        || before.custom_dictionary != *custom_dictionary;
+        || before.custom_dictionary != *custom_dictionary
+        || before.junk != *junk;
     if other_changed {
         return vec![Op::Replace(Box::new(after.clone()))];
     }

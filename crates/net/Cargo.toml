@@ -18,6 +18,8 @@ log.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 ring.workspace = true
+# OS credential store (see `keychain`).
+keyring.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -140,8 +140,9 @@ fn ac_id(cid: u64, f: Field) -> Id {
     Id::new(("mailcraft-compose-autocomplete", cid, f))
 }
 
-fn auto_complete_on(ctx: &egui::Context) -> bool {
-    crate::dialogs::ui_pref(ctx, "options.mail.autoComplete").and_then(|v| v.as_bool()).unwrap_or(true)
+/// Options › Mail › "Use Auto-Complete List to suggest names" (engine setting `mail.autoComplete`).
+fn auto_complete_on(app: &App) -> bool {
+    app.s.settings.bool("mail.autoComplete")
 }
 
 /// Text of an Auto-Complete row.
@@ -256,7 +257,7 @@ pub(super) fn address_field(
         app.run(f.command(), json!({"compose": cid, "value": text}));
         ac.dismissed = false;
         ac.sel = 0;
-        ac.items = if auto_complete_on(&ctx) && !typed_entry(&text).is_empty() {
+        ac.items = if auto_complete_on(app) && !typed_entry(&text).is_empty() {
             let mut items = address_suggestions(&app.s, &text, MAX_SUGGESTIONS);
             // Nothing to suggest when the entry already is the only match.
             if items.len() == 1 && items.first().is_some_and(|s| s.entry() == typed_entry(&text)) {

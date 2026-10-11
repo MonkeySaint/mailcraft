@@ -6,8 +6,11 @@
 //! straight into the command params (the engine keeps them in its secret store) and are dropped with the
 //! dialog state; nothing here prints or stores them.
 //!
-//! The wizard guesses `imap.<domain>` / `smtp.<domain>` with the standard ports (no provider tables, no
-//! network lookups) and always shows the settings page so they can be checked. **Test Account Settings**
+//! The wizard guesses `imap.<domain>` (or `pop.<domain>`) / `smtp.<domain>` with the standard ports (no provider
+//! tables, no network lookups) and always shows the settings page so they can be checked. Its More Settings
+//! section holds the per-account options (POP3 server copies, download mode, Send/Receive group membership and
+//! interval, push), and Sign in with OAuth 2.0 runs `accounts.oauthSignIn` with a client id the user registered
+//! (MailCraft ships none; see `crates/net/data/README.md`). **Test Account Settings**
 //! needs an account to test: in the Add wizard the first test adds the account, later tests update it, and
 //! Cancel removes it again.
 
@@ -16,7 +19,8 @@ use serde_json::{Value, json};
 
 use super::common::{self, Dlg, Out, btn, btn_en, footer, heading, muted, primary, window, with_state};
 use crate::App;
-use mailcraft_engine::sync::TestReport;
+use mailcraft_engine::accounts::{AccountOptions, DownloadMode};
+use mailcraft_engine::sync::{PushMode, TestReport};
 use mailcraft_model::{Account, AccountId, AccountKind, Security};
 
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
@@ -33,6 +37,11 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
 /// Runs a command, returning its error text instead of raising a toast (dialogs show errors inline).
 fn try_run(app: &mut App, id: &str, params: Value) -> Result<Value, String> {
     app.s.run(id, &params).map_err(|e| e.to_string())
+}
+
+/// The account type shown in Account Settings (POP3 accounts are IMAP-kind accounts with the POP3 option).
+fn account_type(app: &App, a: &Account) -> &'static str {
+    if mailcraft_engine::accounts::kind_label(&app.s, a) == "pop3" { "POP/SMTP" } else { kind_label(a.kind) }
 }
 
 pub(crate) fn kind_label(k: AccountKind) -> &'static str {
@@ -177,7 +186,7 @@ fn email_tab(ui: &mut Ui, app: &mut App, st: &mut SettingsState) -> Out {
                 if ui.selectable_label(st.email == Some(a.id.0), common::account_title(a)).clicked() {
                     st.email = Some(a.id.0);
                 }
-                let mut kind = kind_label(a.kind).to_owned();
+                let mut kind = account_type(app, a).to_owned();
                 if a.is_default {
                     kind.push_str(" (send from this account by default)");
                 }
@@ -196,8 +205,20 @@ fn email_tab(ui: &mut Ui, app: &mut App, st: &mut SettingsState) -> Out {
     let loc = app.s.secrets.location();
     if loc == "memory" {
         muted(ui, app, "Passwords are kept in memory and forgotten when MailCraft closes.");
+    } else if app.s.secrets.encrypted() {
+        muted(ui, app, &format!("Passwords and sign-in tokens are kept in the {loc}."));
     } else {
-        muted(ui, app, &format!("Passwords are kept in {loc} (readable only by you; not encrypted yet)."));
+        muted(ui, app, &format!("Passwords are kept in {loc}: readable only by you, but NOT encrypted."));
+        if ui
+            .button("Use System Keyring")
+            .on_hover_text(
+                "Move passwords and sign-in tokens into the operating system's encrypted credential store",
+            )
+            .clicked()
+        {
+            st.error =
+                try_run(app, "accounts.useKeyring", json!({"confirm": true})).err().unwrap_or_default();
+        }
     }
     out
 }
@@ -299,6 +320,72 @@ const PAGE_TYPE: u8 = 1;
 const PAGE_SETTINGS: u8 = 2;
 const PAGE_DONE: u8 = 3;
 
+/// Download Preferences choices: label, engine name.
+const DOWNLOAD: [(&str, &str); 3] = [
+    ("Download full items", "full"),
+    ("Download headers and then full items", "headersThenFull"),
+    ("Download headers only", "headers"),
+];
+
+fn download_index(m: DownloadMode) -> usize {
+    match m {
+        DownloadMode::Full => 0,
+        DownloadMode::HeadersThenFull => 1,
+        DownloadMode::Headers => 2,
+    }
+}
+
+/// The More Settings and OAuth part of the wizard.
+#[derive(Clone)]
+struct Extra {
+    leave_on_server: bool,
+    remove_days_on: bool,
+    remove_days: u32,
+    remove_when_deleted: bool,
+    include: bool,
+    interval_own: bool,
+    interval: u32,
+    push: bool,
+    download: usize,
+    oauth_open: bool,
+    providers: Vec<(String, String, bool)>,
+    provider: usize,
+    client_id: String,
+    client_secret: String,
+    device: bool,
+    oauth_error: String,
+}
+
+impl Default for Extra {
+    fn default() -> Self {
+        let o = AccountOptions::default();
+        Extra::from_options(&o)
+    }
+}
+
+impl Extra {
+    fn from_options(o: &AccountOptions) -> Extra {
+        Extra {
+            leave_on_server: o.leave_on_server,
+            remove_days_on: o.remove_after_days.is_some(),
+            remove_days: o.remove_after_days.unwrap_or(14),
+            remove_when_deleted: o.remove_when_deleted,
+            include: o.include_in_send_receive,
+            interval_own: o.interval_minutes.is_some(),
+            interval: o.interval_minutes.unwrap_or(30),
+            push: o.push,
+            download: download_index(o.download),
+            oauth_open: false,
+            providers: Vec::new(),
+            provider: 0,
+            client_id: o.oauth.as_ref().map(|b| b.client_id.clone()).unwrap_or_default(),
+            client_secret: String::new(),
+            device: true,
+            oauth_error: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct Wizard {
     page: u8,
@@ -309,6 +396,9 @@ struct Wizard {
     finished: bool,
     manual: bool,
     jmap: bool,
+    /// Incoming mail over POP3.
+    pop3: bool,
+    extra: Extra,
     name: String,
     address: String,
     account_name: String,
@@ -351,11 +441,11 @@ impl Wizard {
         if self.jmap {
             self.in_host = format!("https://{domain}/.well-known/jmap");
         } else {
-            self.in_host = format!("imap.{domain}");
+            self.in_host = if self.pop3 { format!("pop.{domain}") } else { format!("imap.{domain}") };
             self.out_host = format!("smtp.{domain}");
         }
         self.in_sec = 0;
-        self.in_port = default_port(false, 0);
+        self.in_port = self.in_default_port(0);
         self.out_sec = 1;
         self.out_port = default_port(true, 1);
         self.in_port_set = false;
@@ -364,10 +454,31 @@ impl Wizard {
         self.guessed = true;
     }
 
+    /// Standard incoming port: IMAP 993/143, POP3 995/110.
+    fn in_default_port(&self, sec: usize) -> u16 {
+        match (self.pop3, security_name(sec)) {
+            (true, "tls") => 995,
+            (true, _) => 110,
+            (false, _) => default_port(false, sec),
+        }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        if self.jmap {
+            "JMAP"
+        } else if self.pop3 {
+            "POP"
+        } else {
+            "IMAP"
+        }
+    }
+
     /// Fills the fields from an account (Change Account). Passwords are never read back, only whether one
     /// is saved.
     fn fill_from(&mut self, app: &App, a: &Account) {
         self.jmap = a.kind == AccountKind::Jmap;
+        self.pop3 = mailcraft_engine::accounts::kind_label(&app.s, a) == "pop3";
+        self.extra = Extra::from_options(&mailcraft_engine::accounts::account_options(&app.s, a.id));
         self.address.clone_from(&a.address);
         self.name.clone_from(&a.sender_name);
         self.account_name.clone_from(&a.display_name);
@@ -375,7 +486,7 @@ impl Wizard {
         if let Some(i) = &a.incoming {
             self.in_host.clone_from(&i.host);
             self.in_sec = sec_index(i.security);
-            self.in_port = if i.port == 0 { default_port(false, self.in_sec) } else { i.port };
+            self.in_port = if i.port == 0 { self.in_default_port(self.in_sec) } else { i.port };
             self.in_user.clone_from(&i.username);
             self.in_port_set = true;
             self.allow_plain |= i.allow_plaintext_auth;
@@ -409,7 +520,28 @@ impl Wizard {
         self.address_ok()
             && !self.in_host.trim().is_empty()
             && (self.jmap || !self.out_host.trim().is_empty())
-            && (self.change.is_some() || self.created.is_some() || !self.password.is_empty())
+            && (self.change.is_some()
+                || self.created.is_some()
+                || !self.password.is_empty()
+                || self.extra.oauth_open)
+    }
+
+    /// The More Settings options as command params.
+    fn option_params(&self, o: &mut serde_json::Map<String, Value>) {
+        let e = &self.extra;
+        o.insert("mode".into(), json!(DOWNLOAD.get(e.download).map_or("full", |d| d.1)));
+        o.insert("include".into(), json!(e.include));
+        o.insert("intervalMinutes".into(), if e.interval_own { json!(e.interval) } else { Value::Null });
+        if self.pop3 {
+            o.insert("leaveOnServer".into(), json!(e.leave_on_server));
+            o.insert(
+                "removeAfterDays".into(),
+                if e.remove_days_on { json!(e.remove_days.max(1)) } else { Value::Null },
+            );
+            o.insert("removeWhenDeleted".into(), json!(e.remove_when_deleted));
+        } else if !self.jmap {
+            o.insert("push".into(), json!(e.push));
+        }
     }
 
     /// Params for `accounts.add` (no `account`) or `accounts.edit` (with it). Empty passwords are left out
@@ -417,7 +549,7 @@ impl Wizard {
     fn params(&self, account: Option<u32>) -> Value {
         let user = if self.in_user.trim().is_empty() { self.address.trim() } else { self.in_user.trim() };
         let mut p = json!({
-            "kind": if self.jmap { "jmap" } else { "imap" },
+            "kind": if self.jmap { "jmap" } else if self.pop3 { "pop3" } else { "imap" },
             "address": self.address.trim(),
             "senderName": self.name.trim(),
             "incoming": {
@@ -456,6 +588,7 @@ impl Wizard {
         if self.out_separate && !self.out_password.is_empty() {
             o.insert("outgoingPassword".into(), json!(self.out_password));
         }
+        self.option_params(o);
         if let Some(id) = account {
             o.remove("kind");
             o.insert("account".into(), json!(id));
@@ -555,6 +688,7 @@ fn page_email(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
                 st.page = PAGE_TYPE;
             } else {
                 st.jmap = false;
+                st.pop3 = false;
                 st.guess();
                 st.page = PAGE_SETTINGS;
             }
@@ -567,22 +701,29 @@ fn page_type(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
     heading(ui, app, "Advanced setup");
     ui.label(format!("Choose the account type for {}:", st.address.trim()));
     ui.add_space(6.0);
-    let mut pick: Option<bool> = None;
+    let mut pick: Option<(bool, bool)> = None;
     ui.horizontal(|ui| {
-        for (jmap, label, desc) in [
-            (false, "IMAP", "Reads mail with IMAP and sends it with SMTP (most providers)."),
-            (true, "JMAP", "One JSON-over-HTTPS server for reading and sending (RFC 8620/8621)."),
+        for (jmap, pop3, label, desc) in [
+            (false, false, "IMAP", "Reads mail with IMAP and sends it with SMTP (most providers)."),
+            (
+                false,
+                true,
+                "POP",
+                "Downloads mail with POP3 and sends it with SMTP; folders stay on this computer.",
+            ),
+            (true, false, "JMAP", "One JSON-over-HTTPS server for reading and sending (RFC 8620/8621)."),
         ] {
             let r = ui
                 .add_sized([120.0, 60.0], egui::Button::new(RichText::new(label).size(16.0)))
                 .on_hover_text(desc);
             if r.clicked() {
-                pick = Some(jmap);
+                pick = Some((jmap, pop3));
             }
         }
     });
-    if let Some(jmap) = pick {
+    if let Some((jmap, pop3)) = pick {
         st.jmap = jmap;
+        st.pop3 = pop3;
         st.guess();
         st.page = PAGE_SETTINGS;
     }
@@ -607,7 +748,7 @@ fn security_row(ui: &mut Ui, label: &str, salt: (&str, u64), sec: &mut usize) ->
 }
 
 fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
-    let kind = if st.jmap { "JMAP" } else { "IMAP" };
+    let kind = st.kind_name();
     heading(ui, app, &format!("{kind} Account Settings"));
     ui.horizontal(|ui| {
         ui.label(RichText::new(st.address.trim()).strong());
@@ -631,12 +772,13 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
             if st.jmap {
                 grid_edit(ui, "Session URL:", &mut st.in_host, "https://example.com/.well-known/jmap", false);
             } else {
-                grid_edit(ui, "Server:", &mut st.in_host, "imap.example.com", false);
+                let hint = if st.pop3 { "pop.example.com" } else { "imap.example.com" };
+                grid_edit(ui, "Server:", &mut st.in_host, hint, false);
                 st.in_port_set |= grid_port(ui, "Port:", &mut st.in_port);
                 if security_row(ui, "Encryption method:", ("mc-wiz-insec", uid), &mut st.in_sec)
                     && !st.in_port_set
                 {
-                    st.in_port = default_port(false, st.in_sec);
+                    st.in_port = st.in_default_port(st.in_sec);
                 }
             }
             grid_edit(ui, "User name:", &mut st.in_user, "Usually your email address", false);
@@ -665,6 +807,10 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
                     grid_edit(ui, "Outgoing password:", &mut st.out_password, "", true);
                 });
             }
+        }
+        more_settings(ui, app, st, uid);
+        if let Some(o) = oauth_section(ui, app, st, uid) {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(o));
         }
     });
     if st.unencrypted() {
@@ -711,6 +857,190 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
     out
 }
 
+/// More Settings: POP3 server copies, download preference, Send/Receive group membership and interval, push.
+fn more_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
+    egui::CollapsingHeader::new("More Settings").id_salt(("mc-wiz-more", uid)).show(ui, |ui| {
+        let e = &mut st.extra;
+        if st.pop3 {
+            ui.checkbox(&mut e.leave_on_server, "Leave a copy of messages on the server");
+            ui.add_enabled_ui(e.leave_on_server, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut e.remove_days_on, "Remove from server after");
+                    ui.add_enabled(
+                        e.remove_days_on,
+                        egui::DragValue::new(&mut e.remove_days).range(1..=3650),
+                    );
+                    ui.label("days");
+                });
+                ui.checkbox(&mut e.remove_when_deleted, "Remove from server when deleted from Deleted Items");
+            });
+        }
+        ui.horizontal(|ui| {
+            let l = ui.label("Download:");
+            let names: Vec<&str> = DOWNLOAD.iter().map(|d| d.0).collect();
+            let r = ui.scope(|ui| common::combo_idx(ui, ("mc-wiz-dl", uid), &mut e.download, &names, 260.0));
+            let _ = r.response.labelled_by(l.id);
+        });
+        ui.checkbox(
+            &mut e.include,
+            "Include this account in Send/Receive All Folders (F9) and scheduled send/receive",
+        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut e.interval_own, "Send/receive this account every");
+            ui.add_enabled(e.interval_own, egui::DragValue::new(&mut e.interval).range(1..=1440));
+            ui.label("minutes");
+        });
+        if !st.pop3 && !st.jmap {
+            ui.checkbox(&mut e.push, "Show new mail as soon as it arrives (push with IMAP IDLE)");
+        }
+        let _ = app;
+    });
+}
+
+/// Sign in with OAuth 2.0: provider, the user's client id, device code or browser. Returns a page to open.
+fn oauth_section(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Option<String> {
+    let mut open_url = None;
+    let r = egui::CollapsingHeader::new("Sign in with OAuth 2.0 instead of a password")
+        .id_salt(("mc-wiz-oauth", uid))
+        .open(if st.extra.oauth_open { Some(true) } else { None })
+        .show(ui, |ui| {
+            if st.extra.providers.is_empty() {
+                let list = try_run(app, "accounts.oauthProviders", json!({})).unwrap_or_default();
+                let mut v: Vec<(String, String, bool)> = list
+                    .get("providers")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| {
+                                let device = p.get("flows").and_then(Value::as_array).is_some_and(|f| f.iter().any(|x| x == "device"));
+                                Some((p.get("id")?.as_str()?.to_owned(), p.get("name")?.as_str()?.to_owned(), device))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if v.is_empty() {
+                    v.push((String::new(), "(none available)".into(), false));
+                }
+                // The provider serving the address first.
+                let domain = st.domain();
+                if let Some(i) = v.iter().position(|(id, _, _)| {
+                    (id == "google" && (domain == "gmail.com" || domain == "googlemail.com"))
+                        || (id == "microsoft" && ["outlook.com", "hotmail.com", "live.com", "msn.com"].contains(&domain.as_str()))
+                }) {
+                    st.extra.provider = i;
+                }
+                st.extra.providers = v;
+            }
+            muted(
+                ui,
+                app,
+                "MailCraft has no built-in registration with any provider. Register an application with your provider and enter its client id (and client secret, if the provider issued one).",
+            );
+            let e = &mut st.extra;
+            egui::Grid::new(("mc-wiz-oauth-grid", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                let l = ui.label("Provider:");
+                let names: Vec<&str> = e.providers.iter().map(|p| p.1.as_str()).collect();
+                let r = ui.scope(|ui| common::combo_idx(ui, ("mc-wiz-prov", uid), &mut e.provider, &names, 280.0));
+                let _ = r.response.labelled_by(l.id);
+                ui.end_row();
+                grid_edit(ui, "Client id:", &mut e.client_id, "From your app registration", false);
+                grid_edit(ui, "Client secret:", &mut e.client_secret, "Only if the provider issued one", true);
+            });
+            let device_ok = e.providers.get(e.provider).is_some_and(|p| p.2);
+            if !device_ok {
+                e.device = false;
+            }
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(device_ok, |ui| ui.radio_value(&mut e.device, true, "Device code"));
+                ui.radio_value(&mut e.device, false, "Browser");
+            });
+            st.extra.oauth_open = true;
+            let id = st.change.or(st.created);
+            let flow = id.and_then(|i| app.s.sync.oauth.get(&AccountId(i)).cloned());
+            let running = flow.as_ref().is_some_and(|f| f.status == "waiting" || f.status == "starting");
+            if running {
+                ctx_repaint(ui);
+            }
+            ui.horizontal(|ui| {
+                let ready = st.address_ok() && !st.extra.client_id.trim().is_empty() && !st.in_host.trim().is_empty();
+                if ui.add_enabled(ready && !running, egui::Button::new("Sign In")).clicked() {
+                    match st.save(app) {
+                        Ok(id) => {
+                            let e = &st.extra;
+                            let mut p = json!({
+                                "account": id,
+                                "provider": e.providers.get(e.provider).map(|p| p.0.clone()).unwrap_or_default(),
+                                "clientId": e.client_id.trim(),
+                                "flow": if e.device { "device" } else { "browser" },
+                            });
+                            if !e.client_secret.is_empty()
+                                && let Some(o) = p.as_object_mut()
+                            {
+                                o.insert("clientSecret".into(), json!(e.client_secret));
+                            }
+                            match try_run(app, "accounts.oauthSignIn", p) {
+                                Ok(v) => {
+                                    st.extra.oauth_error.clear();
+                                    open_url = v.get("authUrl").and_then(Value::as_str).map(str::to_owned);
+                                }
+                                Err(e) => st.extra.oauth_error = e,
+                            }
+                        }
+                        Err(e) => st.extra.oauth_error = e,
+                    }
+                }
+                if running && ui.button("Cancel Sign-In").clicked()
+                    && let Some(i) = id
+                {
+                    let _ = try_run(app, "accounts.oauthCancel", json!({"account": i}));
+                }
+            });
+            if let Some(f) = &flow {
+                match f.status.as_str() {
+                    "waiting" | "starting" => {
+                        if let (Some(code), Some(uri)) = (&f.user_code, &f.verification_uri) {
+                            ui.label(format!("Go to {uri} on any device and enter this code:"));
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(code).strong().size(18.0));
+                                if ui.button("Copy").clicked() {
+                                    ui.ctx().copy_text(code.clone());
+                                }
+                                if ui.link("Open the page").clicked() {
+                                    open_url = Some(f.verification_uri_complete.clone().unwrap_or_else(|| uri.clone()));
+                                }
+                            });
+                        } else if let Some(u) = &f.auth_url {
+                            ui.label("Finish signing in in your browser; MailCraft waits for it here.");
+                            if ui.link("Open the sign-in page again").clicked() {
+                                open_url = Some(u.clone());
+                            }
+                        } else {
+                            ui.label("Contacting the provider…");
+                        }
+                    }
+                    "done" => {
+                        ui.colored_label(app.theme.accent, format!("Signed in with {}.", f.provider));
+                    }
+                    "cancelled" => muted(ui, app, "Sign-in was cancelled."),
+                    _ => {
+                        ui.colored_label(app.theme.danger, f.error.clone().unwrap_or_else(|| "Sign-in failed.".into()));
+                    }
+                }
+            }
+            if !st.extra.oauth_error.is_empty() {
+                ui.colored_label(app.theme.danger, &st.extra.oauth_error);
+            }
+        });
+    if r.body_returned.is_none() {
+        st.extra.oauth_open = false;
+    }
+    open_url
+}
+
+fn ctx_repaint(ui: &Ui) {
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+}
+
 fn page_done(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
     let text =
         if st.change.is_some() { "Account successfully updated" } else { "Account successfully added" };
@@ -718,7 +1048,7 @@ fn page_done(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::hover());
         app.icons.paint(ui, r, "check", app.theme.accent);
-        ui.label(format!("{}  ({})", st.address.trim(), if st.jmap { "JMAP" } else { "IMAP" }));
+        ui.label(format!("{}  ({})", st.address.trim(), st.kind_name()));
     });
     if st.change.is_none() {
         muted(ui, app, "MailCraft downloads your folders and mail at the next send/receive.");
@@ -1006,6 +1336,8 @@ fn progress(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                         }
                                     } else if a.error.is_some() {
                                         "Error".to_owned()
+                                    } else if a.last_sync.is_some() && a.push != PushMode::Off {
+                                        format!("Completed. {}", a.push.label())
                                     } else if a.last_sync.is_some() {
                                         "Completed".to_owned()
                                     } else {

@@ -1,15 +1,16 @@
 //! `sendReceive.*` (`plan/outlook/ribbon-mail.md`, Send / Receive tab): start send/receive runs on the
 //! accounts' worker threads (`crate::sync`), report each account's Outbox, cancel runs, show progress, and
 //! toggle Work Offline (kept in the session's view state). Results arrive through `Session::poll_sync`.
-//! Download preferences have no session field yet, so that command returns the chosen state.
+//! The Server and Preferences command bodies (header-only download, marks, Download Preferences and the
+//! per-account Send/Receive group settings) live in [`crate::sync::cmds`].
 
 use serde_json::{Value, json};
 
 use crate::cmd::rules::{dialog, need_selection};
-use crate::cmd::util::{opt_bool, opt_str, req_str};
-use crate::sync::Plan;
+use crate::cmd::util::{opt_bool, req_str};
+use crate::sync::{Plan, cmds};
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Session, always};
-use mailcraft_model::{AccountId, FolderRole, ItemId, MailItem};
+use mailcraft_model::{AccountId, FolderRole};
 
 fn spec(
     id: &'static str,
@@ -67,7 +68,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"folder"?: number}"#,
             server_account,
-            download_headers,
+            cmds::download_headers,
         ),
         spec(
             "sendReceive.markToDownload",
@@ -76,7 +77,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mod+Alt+M",
             r#"{"copy"?: bool, "ids"?: [number]}"#,
             need_selection,
-            mark,
+            cmds::mark,
         ),
         spec(
             "sendReceive.unmarkToDownload",
@@ -85,7 +86,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mod+Alt+U",
             r#"{"all"?: bool, "ids"?: [number]}"#,
             always,
-            unmark,
+            cmds::unmark,
         ),
         spec(
             "sendReceive.processMarked",
@@ -94,16 +95,16 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"allFolders"?: bool}"#,
             server_account,
-            process_marked,
+            cmds::process_marked,
         ),
         spec(
             "sendReceive.preferences",
             "Download Preferences",
             PR,
             "",
-            r#"{"mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool}"#,
+            cmds::PREFERENCES_PARAMS,
             always,
-            preferences,
+            cmds::preferences,
         ),
         spec(
             "sendReceive.workOffline",
@@ -290,51 +291,6 @@ fn show_progress(s: &mut Session, _: &Value) -> CmdResult {
     dialog(s, "sendReceiveProgress", json!({"tasks": tasks}))
 }
 
-fn download_headers(s: &mut Session, p: &Value) -> CmdResult {
-    let f = s.target_folder(p);
-    Ok(json!({"folder": f.0, "downloaded": 0}))
-}
-
-/// Header-only items: no body, no raw source and no stored blob.
-fn header_only(m: &MailItem) -> bool {
-    m.body.text.is_none() && m.body.html.is_none() && m.raw.is_none() && m.blob.is_none()
-}
-
-fn mark(s: &mut Session, p: &Value) -> CmdResult {
-    let ids: Vec<ItemId> = s.target_ids(p);
-    let marked: Vec<u64> =
-        ids.iter().filter(|id| s.mailbox.mail.get(id).is_some_and(header_only)).map(|id| id.0).collect();
-    Ok(json!({"marked": marked, "copy": opt_bool(p, "copy").unwrap_or(false)}))
-}
-
-fn unmark(s: &mut Session, p: &Value) -> CmdResult {
-    let all = opt_bool(p, "all").unwrap_or(false);
-    let ids: Vec<u64> = if all {
-        s.mailbox.mail.values().filter(|m| header_only(m)).map(|m| m.id.0).collect()
-    } else {
-        s.target_ids(p)
-            .iter()
-            .filter(|id| s.mailbox.mail.get(id).is_some_and(header_only))
-            .map(|id| id.0)
-            .collect()
-    };
-    Ok(json!({"unmarked": ids, "all": all}))
-}
-
-fn process_marked(s: &mut Session, p: &Value) -> CmdResult {
-    let all_folders = opt_bool(p, "allFolders").unwrap_or(false);
-    let f = s.target_folder(p);
-    Ok(json!({"allFolders": all_folders, "folder": f.0, "downloaded": 0}))
-}
-
-fn preferences(_: &mut Session, p: &Value) -> CmdResult {
-    let mode = opt_str(p, "mode").unwrap_or("full");
-    if !["full", "headersThenFull", "headers"].contains(&mode) {
-        return Err(CmdError::Params(format!("unknown mode `{mode}`")));
-    }
-    Ok(json!({"mode": mode, "slowHeadersOnly": opt_bool(p, "slowHeadersOnly").unwrap_or(false)}))
-}
-
 fn work_offline(s: &mut Session, p: &Value) -> CmdResult {
     let offline = !opt_bool(p, "offline").unwrap_or(s.view.work_offline);
     s.view.work_offline = offline;
@@ -350,7 +306,7 @@ fn work_offline(s: &mut Session, p: &Value) -> CmdResult {
 mod tests {
     use super::*;
     use crate::cmd::rules::tests::session;
-    use mailcraft_model::{Account, AccountKind, ServerSettings};
+    use mailcraft_model::{Account, AccountKind, MailItem, ServerSettings};
 
     #[test]
     fn send_all_reports_stuck_outbox() {
@@ -430,5 +386,26 @@ mod tests {
         let r = s.run("sendReceive.unmarkToDownload", &json!({"all": true})).unwrap();
         assert_eq!(r["unmarked"], json!([id.0]));
         assert_eq!(s.registry.by_shortcut("Mod+Alt+M").map(|c| c.id), Some("sendReceive.markToDownload"));
+    }
+
+    #[test]
+    fn download_preferences_are_kept_per_account() {
+        let (mut s, _, _) = session();
+        let id = s.mailbox.add_account(Account {
+            kind: AccountKind::Imap,
+            address: "me@example.net".into(),
+            display_name: "me@example.net".into(),
+            incoming: Some(ServerSettings::default()),
+            ..Default::default()
+        });
+        s.mailbox.create_default_folders(id);
+        let r = s
+            .run("sendReceive.preferences", &json!({"account": id.0, "mode": "headers", "push": false}))
+            .unwrap();
+        assert_eq!(r["changed"], true);
+        // Asked again without changes, the stored choice comes back (the old stub always said "full").
+        let r = s.run("sendReceive.preferences", &json!({"account": id.0})).unwrap();
+        assert_eq!(r["mode"], "headers");
+        assert_eq!(r["push"], false);
     }
 }

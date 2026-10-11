@@ -1424,7 +1424,7 @@ fn paint_compact(
         let t = Text::new(ui, "[Draft]", 14.0, false, th.draft, 60.0, 1);
         x = t.paint_left(&painter, line1, x) + 5.0;
     }
-    let searching = !app.s.view.search.trim().is_empty() && crate::dialogs::search_highlight_on(ui.ctx());
+    let searching = !app.s.view.search.trim().is_empty() && crate::dialogs::search_highlight_on(&app.s);
     let hl = |field: Field| searching.then_some((&app.s, field, th.search_hit));
     let who = Text::highlighted(
         ui,

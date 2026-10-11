@@ -168,7 +168,7 @@ fn module_role(m: Module) -> Option<FolderRole> {
 }
 
 /// Module that shows a folder of `kind`.
-fn module_for_kind(kind: FolderKind) -> Module {
+pub(crate) fn module_for_kind(kind: FolderKind) -> Module {
     match kind {
         FolderKind::Calendar => Module::Calendar,
         FolderKind::Contacts => Module::People,
@@ -178,8 +178,12 @@ fn module_for_kind(kind: FolderKind) -> Module {
     }
 }
 
-/// Marks the focused message read when the selection leaves it for `next`.
+/// Marks the focused message read when the selection leaves it for `next` (Reading Pane options › "Mark
+/// item as read when selection changes").
 fn leave_focus(s: &mut Session, next: Option<ItemId>) {
+    if !s.settings.bool("mail.readingPane.markReadOnSelectionChange") {
+        return;
+    }
     if let Some(cur) = s.selection.focus
         && Some(cur) != next
     {
@@ -506,6 +510,23 @@ mod tests {
         assert_eq!(s.selection.items.len(), crate::queries::view_item_ids(&s).len());
         assert!(s.run("nav.selectItem", &json!({"id": 999_999})).is_err());
         assert!(s.run("nav.selectItem", &json!({})).is_err());
+    }
+
+    #[test]
+    fn selection_change_marks_read_only_when_the_option_is_on() {
+        let mut s = sample_session();
+        let order = crate::queries::visible_item_ids(&s);
+        let (a, b) = (order[0], order[1]);
+        s.mailbox.set_read(&[a, b], false);
+        s.run("options.set", &json!({"key": "mail.readingPane.markReadOnSelectionChange", "value": false}))
+            .unwrap();
+        s.run("nav.selectItem", &json!({"id": a.0})).unwrap();
+        s.run("nav.nextItem", &json!({})).unwrap();
+        assert!(!s.mailbox.mail[&a].read, "option off: leaving the message keeps it unread");
+        s.run("options.set", &json!({"key": "mail.readingPane.markReadOnSelectionChange", "value": true}))
+            .unwrap();
+        s.run("nav.prevItem", &json!({})).unwrap();
+        assert!(s.mailbox.mail[&b].read);
     }
 
     #[test]

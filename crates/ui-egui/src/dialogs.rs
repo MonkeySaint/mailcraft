@@ -22,6 +22,7 @@ mod find;
 mod folders;
 mod general;
 mod items;
+mod junk;
 mod mailopts;
 mod options;
 mod print;
@@ -42,7 +43,16 @@ pub(crate) use common::{browse_folder, browse_open, browse_save};
 pub fn dialogs(ctx: &egui::Context, app: &mut App) {
     take_notices(app);
     assign_uids(ctx, app);
-    let list = app.ui.dialogs.clone();
+    // Requests the modules draw themselves stay queued for them (next pass), so no generic window flashes.
+    let (deferred, list): (Vec<_>, Vec<_>) = app
+        .ui
+        .dialogs
+        .clone()
+        .into_iter()
+        .partition(|(name, params)| crate::modules::takes_dialog(app, name, params));
+    if !deferred.is_empty() {
+        ctx.request_repaint();
+    }
     let n = list.len();
     let mut closed: Vec<u64> = Vec::new();
     let mut opened: Vec<(String, Value)> = Vec::new();
@@ -131,9 +141,9 @@ pub fn account_label(a: &mailcraft_model::Account) -> String {
     common::account_title(a)
 }
 
-/// File › Options › Search › "Highlight search terms in the results" (on unless turned off).
-pub fn search_highlight_on(ctx: &Context) -> bool {
-    common::pref(ctx, "options.search.highlight").and_then(|v| v.as_bool()).unwrap_or(true)
+/// File › Options › Search › "Highlight search terms in the results" (the profile setting `search.highlight`).
+pub fn search_highlight_on(s: &mailcraft_engine::Session) -> bool {
+    s.settings.bool("search.highlight")
 }
 
 /// Dialog ids with a dedicated renderer (everything the engine emits, plus the UI's own).
@@ -290,13 +300,10 @@ pub const KNOWN: &[&str] = &[
     "newContactGroup",
     "task",
     "newTask",
-    "taskRequest",
-    "newTaskRequest",
     "note",
     "newPost",
     "chooseForm",
     "forwardContact",
-    "mailMerge",
     "goToDate",
     "timeZone",
     "addCalendar",
@@ -341,6 +348,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return out;
     }
     if let Some(out) = find::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = junk::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = mailopts::show(ctx, app, d) {

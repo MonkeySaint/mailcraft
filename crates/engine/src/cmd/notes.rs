@@ -3,17 +3,23 @@
 //! Notes live in notes folders (`Mailbox.notes`); the first line of a note is its title. `notes.new` creates
 //! the note straight away (like a paper sticky note) and asks the UI to open it for editing.
 //!
-//! **View state.** As with the calendar, the Icon view arrangement lives in the UI: `notes.iconView` and
-//! `notes.lineUpIcons` take the current [`NotesViewState`] as `{"view": {...}}` and return the new one.
+//! **View state.** The notes folder's module view (`cmd::view::modules`) keeps the Icon view arrangement
+//! (Large Icons, Small Icons, List) and whether the icons are lined up: `notes.iconView` and
+//! `notes.lineUpIcons` update it (switching the folder to the Icon view) and return it as
+//! `{"view": NotesViewState}`. A `view` param overrides the stored state as the starting point.
 //! `notes.lineUpIcons` also returns the grid order of the notes in the current folder.
+//!
+//! `notes.forward` sends the note's text in a new message. [`view_rows`] is the list of the Notes views
+//! (Icon, Notes List, Last 7 Days).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cmd::calendar::{pim, pim::Kind};
 use crate::cmd::util::opt_str;
+use crate::cmd::view::modules::{self, ModuleKind, RowKind, ViewRow};
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
-use mailcraft_model::{ItemId, Note, NoteColor};
+use mailcraft_model::{FolderId, ItemId, Note, NoteColor};
 
 /// Icon view arrangement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,10 +40,28 @@ pub struct NotesViewState {
     pub lined_up: bool,
 }
 
-fn view_param(p: &Value) -> Result<NotesViewState, CmdError> {
+/// The starting view state: the `view` param, else the current notes folder's stored state.
+fn view_param(s: &Session, p: &Value) -> Result<NotesViewState, CmdError> {
     match p.get("view") {
-        None | Some(Value::Null) => Ok(NotesViewState::default()),
+        None | Some(Value::Null) => Ok(stored_view(s)),
         Some(v) => serde_json::from_value(v.clone()).map_err(|e| CmdError::Params(format!("`view`: {e}"))),
+    }
+}
+
+/// Icon arrangement stored for the current notes folder.
+pub fn stored_view(s: &Session) -> NotesViewState {
+    pim::current_folder(s, Kind::Note)
+        .map(|f| {
+            let st = modules::state(s, f, ModuleKind::Notes);
+            NotesViewState { icon_mode: st.icon_mode, lined_up: st.lined_up }
+        })
+        .unwrap_or_default()
+}
+
+/// Stores `v` for the current notes folder (which switches to the Icon view).
+fn store_view(s: &mut Session, v: &NotesViewState) {
+    if let Some(f) = pim::current_folder(s, Kind::Note) {
+        modules::set_icons(s, f, v.icon_mode, v.lined_up);
     }
 }
 
@@ -139,24 +163,85 @@ fn run_delete(s: &mut Session, p: &Value) -> CmdResult {
     pim::run_delete(s, p, Kind::Note)
 }
 fn run_copy(s: &mut Session, p: &Value) -> CmdResult {
+    if p.get("folder").is_none_or(Value::is_null) {
+        return crate::cmd::tasks::move_dialog(s, p, Kind::Note, true);
+    }
     pim::run_copy(s, p, Kind::Note)
 }
 fn run_move(s: &mut Session, p: &Value) -> CmdResult {
+    if p.get("folder").is_none_or(Value::is_null) {
+        return crate::cmd::tasks::move_dialog(s, p, Kind::Note, false);
+    }
     pim::run_move(s, p, Kind::Note)
+}
+fn run_all_categories(s: &mut Session, p: &Value) -> CmdResult {
+    crate::cmd::tasks::categories_dialog(s, p, Kind::Note)
+}
+
+/// Forward: a new message with the note's title as the subject and its text as the body (one message for
+/// all the selected notes).
+fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = pim::require_targets(s, p, Kind::Note)?;
+    let notes: Vec<Note> = ids.iter().filter_map(|i| s.mailbox.notes.get(i)).cloned().collect();
+    let subject = match notes.as_slice() {
+        [one] => title(one),
+        [first, rest @ ..] => format!("{} and {} more", title(first), rest.len()),
+        [] => String::new(),
+    };
+    let body = notes.iter().map(|n| n.text.trim_end().to_owned()).collect::<Vec<_>>().join("\n\n");
+    let mut compose = crate::compose::ComposeState {
+        subject: mailcraft_model::subject::forward_subject(&subject),
+        body: mailcraft_model::Doc::from_plain_text(&body),
+        dirty: true,
+        ..Default::default()
+    };
+    crate::compose::insert_default_signature(&s.mailbox, &mut compose);
+    let cid = s.open_compose(compose);
+    Ok(json!({ "compose": cid, "notes": notes.len() }))
+}
+
+fn note_selected(s: &Session) -> Option<&'static str> {
+    if pim::selected(s, Kind::Note).is_empty() { Some("select a note first") } else { None }
+}
+
+/// Rows of the selected Notes view of `folder`: Icon in grid order (oldest first), Notes List newest
+/// first, Last 7 Days the notes changed in the last seven days, newest first. Reverse Sort reverses.
+pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
+    let st = modules::state(s, folder, ModuleKind::Notes);
+    let since = s.now().unix.saturating_sub(7 * pim::DAY_SECS);
+    let mut v: Vec<(i64, ItemId)> = s
+        .mailbox
+        .notes
+        .values()
+        .filter(|n| n.folder == folder)
+        .filter(|n| st.view != "Last 7 Days" || n.modified.unix >= since)
+        .map(|n| (n.created.unix, n.id))
+        .collect();
+    v.sort();
+    if st.view != "Icon" {
+        v.reverse();
+    }
+    let mut out: Vec<ViewRow> =
+        v.into_iter().map(|(_, id)| ViewRow { id, kind: RowKind::Note, group: None }).collect();
+    if modules::reversed(s, folder) {
+        out.reverse();
+    }
+    out
 }
 fn run_categorize(s: &mut Session, p: &Value) -> CmdResult {
     pim::run_categorize(s, p, Kind::Note)
 }
 
-fn run_icon_view(_s: &mut Session, p: &Value) -> CmdResult {
+fn run_icon_view(s: &mut Session, p: &Value) -> CmdResult {
     let mode = match opt_str(p, "mode") {
         Some("large") => IconMode::Large,
         Some("small") => IconMode::Small,
         Some("list") => IconMode::List,
         _ => return Err(CmdError::Params("`mode` must be large|small|list".into())),
     };
-    let mut v = view_param(p)?;
+    let mut v = view_param(s, p)?;
     v.icon_mode = mode;
+    store_view(s, &v);
     Ok(json!({ "view": v }))
 }
 
@@ -176,11 +261,12 @@ fn notes_present(s: &Session) -> Option<&'static str> {
 }
 
 fn run_line_up(s: &mut Session, p: &Value) -> CmdResult {
-    let mut v = view_param(p)?;
+    let mut v = view_param(s, p)?;
     if v.icon_mode == IconMode::List {
         return Err(CmdError::Disabled("not available in the list arrangement".into()));
     }
     v.lined_up = true;
+    store_view(s, &v);
     Ok(json!({ "view": v, "order": pim::ids_json(&grid_order(s)) }))
 }
 
@@ -201,7 +287,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Icon Arrangement",
             "Notes › View › Arrangement",
             r#"{"mode": "large|small|list", "view"?: NotesViewState}"#,
-            false,
+            true,
             always,
             run_icon_view,
         ),
@@ -210,7 +296,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Line Up Icons",
             "Notes › View › Arrangement",
             r#"{"view"?: NotesViewState}"#,
-            false,
+            true,
             notes_present,
             run_line_up,
         ),
@@ -268,6 +354,24 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             run_categorize,
         ),
+        spec(
+            "notes.allCategories",
+            "All Categories",
+            "Notes › Home › Tags › Categorize",
+            r#"{"ids"?: [number]}"#,
+            false,
+            note_selected,
+            run_all_categories,
+        ),
+        spec(
+            "notes.forward",
+            "Forward",
+            "Notes › Home › Actions",
+            r#"{"ids"?: [number]}"#,
+            false,
+            note_selected,
+            run_forward,
+        ),
     ]
 }
 
@@ -323,6 +427,27 @@ mod tests {
             s.run("notes.lineUpIcons", &json!({"view": {"iconMode": "list"}})),
             Err(CmdError::Disabled(_))
         ));
+    }
+
+    #[test]
+    fn forward_note_and_dialogs() {
+        let mut s = session();
+        let id =
+            s.run("notes.new", &json!({"text": "Groceries\nmilk\neggs"})).unwrap()["id"].as_u64().unwrap();
+        s.selection = Selection {
+            folder: role(&s, FolderRole::Notes),
+            items: vec![ItemId(id)],
+            focus: Some(ItemId(id)),
+        };
+        let r = s.run("notes.forward", &json!({})).unwrap();
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.subject, "FW: Groceries");
+        assert!(c.body.to_plain_text().contains("eggs"));
+        assert_eq!(s.run("notes.move", &json!({})).unwrap()["dialog"], "pimMove");
+        assert_eq!(s.run("notes.allCategories", &json!({})).unwrap()["dialog"], "pimCategories");
+        s.selection.items.clear();
+        s.selection.focus = None;
+        assert!(matches!(s.run("notes.forward", &json!({})), Err(CmdError::Disabled(_))));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use rustls::ServerConfig;
 
 use crate::conn::Conn;
 use crate::store::Shared;
-use crate::{Config, Result, imap, smtp};
+use crate::{Config, Result, imap, jmap, pop3, smtp};
 
 /// Maximum simultaneous connections per listener.
 const MAX_CONNECTIONS: usize = 256;
@@ -19,6 +19,8 @@ const MAX_CONNECTIONS: usize = 256;
 enum Kind {
     Imap { tls: bool },
     Smtp { tls: bool },
+    Pop3 { tls: bool },
+    Jmap { tls: bool },
 }
 
 /// Everything a connection handler needs.
@@ -27,6 +29,7 @@ pub struct Ctx {
     pub shared: Arc<Shared>,
     pub stop: Arc<AtomicBool>,
     pub tls: Arc<ServerConfig>,
+    pub jmap: jmap::SharedJmap,
 }
 
 pub struct Running {
@@ -34,6 +37,10 @@ pub struct Running {
     pub imaps: SocketAddr,
     pub smtp: SocketAddr,
     pub smtps: SocketAddr,
+    pub pop3: SocketAddr,
+    pub pop3s: SocketAddr,
+    pub jmap: SocketAddr,
+    pub jmaps: SocketAddr,
     stop: Arc<AtomicBool>,
     accept_threads: Vec<JoinHandle<()>>,
     conn_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -50,13 +57,17 @@ impl Running {
             (bind(config.imaps_port)?, Kind::Imap { tls: true }),
             (bind(config.smtp_port)?, Kind::Smtp { tls: false }),
             (bind(config.smtps_port)?, Kind::Smtp { tls: true }),
+            (bind(config.pop3_port)?, Kind::Pop3 { tls: false }),
+            (bind(config.pop3s_port)?, Kind::Pop3 { tls: true }),
+            (bind(config.jmap_port)?, Kind::Jmap { tls: false }),
+            (bind(config.jmaps_port)?, Kind::Jmap { tls: true }),
         ];
         let mut addrs = Vec::new();
         for (l, _) in &listeners {
             addrs.push(l.local_addr()?);
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let ctx = Arc::new(Ctx { config, shared, stop: Arc::clone(&stop), tls });
+        let ctx = Arc::new(Ctx { config, shared, stop: Arc::clone(&stop), tls, jmap: Default::default() });
         let conn_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let mut accept_threads = Vec::new();
         for (listener, kind) in listeners {
@@ -75,6 +86,10 @@ impl Running {
             imaps: addr(1),
             smtp: addr(2),
             smtps: addr(3),
+            pop3: addr(4),
+            pop3s: addr(5),
+            jmap: addr(6),
+            jmaps: addr(7),
             stop,
             accept_threads,
             conn_threads,
@@ -106,7 +121,7 @@ fn accept_loop(listener: TcpListener, kind: Kind, ctx: Arc<Ctx>, threads: Arc<Mu
 
 fn handle(stream: TcpStream, kind: Kind, ctx: Arc<Ctx>) {
     let tls = match kind {
-        Kind::Imap { tls } | Kind::Smtp { tls } => tls,
+        Kind::Imap { tls } | Kind::Smtp { tls } | Kind::Pop3 { tls } | Kind::Jmap { tls } => tls,
     };
     let Ok(conn) =
         Conn::new(stream, Arc::clone(&ctx.stop), Arc::clone(&ctx.tls), tls, ctx.config.idle_timeout)
@@ -116,6 +131,8 @@ fn handle(stream: TcpStream, kind: Kind, ctx: Arc<Ctx>) {
     match kind {
         Kind::Imap { .. } => imap::serve(conn, &ctx),
         Kind::Smtp { .. } => smtp::serve(conn, &ctx),
+        Kind::Pop3 { .. } => pop3::serve(conn, &ctx),
+        Kind::Jmap { .. } => jmap::serve(conn, &ctx, &ctx.jmap),
     }
 }
 
@@ -123,7 +140,9 @@ impl Drop for Running {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         // Wake the blocking accept() calls.
-        for addr in [self.imap, self.imaps, self.smtp, self.smtps] {
+        for addr in
+            [self.imap, self.imaps, self.smtp, self.smtps, self.pop3, self.pop3s, self.jmap, self.jmaps]
+        {
             let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
         }
         for h in self.accept_threads.drain(..) {

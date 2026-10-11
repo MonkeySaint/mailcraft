@@ -1,9 +1,14 @@
 //! Window chrome: title bar (QAT, search box, account), tab row, module rail, status bar (shell area), and the
 //! main-window composition: bands from plan/outlook/layout.md, rounded panes on a backdrop, splitters and the
 //! narrow-window rules from plan/outlook/responsive.md.
+//!
+//! Options that act here (engine settings, read every frame): General › Theme ("Use system setting" follows
+//! the system), Advanced › animations, Quick Access Toolbar (show, position, labels), the pane sizes the
+//! splitters leave (saved with the profile), the F6 pane focus ring. The shell also persists the dialogs'
+//! own settings ([`sync_ui_prefs`]).
 
 use egui::{Align, Align2, Color32, CornerRadius, Layout, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use crate::responsive::Frame;
 use crate::theme::{Theme, size};
@@ -43,6 +48,145 @@ const MORE_APPS: [(Module, &str, &str, &str); 3] = [
     (Module::Folders, "nav.folders", "folders", "Folders"),
     (Module::Shortcuts, "nav.shortcuts", "shortcuts", "Shortcuts"),
 ];
+
+// ---------------------------------------------------------------------------------------------------------
+// Settings bridge
+
+/// Settings kept by dialogs for themselves (columns, folder descriptions, quick actions…) in egui memory
+/// (`dialogs::common::pref`); `rev` moves with every write so [`sync_ui_prefs`] can save them.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UiPrefs {
+    pub values: Map<String, Value>,
+    pub rev: u64,
+}
+
+/// egui memory id of [`UiPrefs`].
+pub(crate) const UI_PREFS_ID: &str = "mc-ui-prefs";
+
+/// Older dialog-pref names that code outside the settings area still reads: (setting, pref).
+const LEGACY_PREFS: [(&str, &str); 7] = [
+    ("mail.arrival.playSound", "options.mail.arrivalSound"),
+    ("mail.readingPane.markReadWhenViewed", "readingPane.markWhenViewed"),
+    ("mail.readingPane.markReadAfterSeconds", "readingPane.waitSeconds"),
+    ("mail.readingPane.markReadOnSelectionChange", "readingPane.markOnSelectionChange"),
+    ("mail.readingPane.spaceBarReading", "readingPane.singleKey"),
+    ("mail.readingPane.portraitFullScreen", "readingPane.portraitFullScreen"),
+    ("mail.readingPane.alwaysPreview", "readingPane.alwaysPreview"),
+];
+
+fn is_mirror(key: &str) -> bool {
+    key.starts_with("options.") || LEGACY_PREFS.iter().any(|(_, p)| *p == key)
+}
+
+/// What [`sync_ui_prefs`] last saw.
+#[derive(Clone, Copy, Debug, Default)]
+struct PrefSync {
+    loaded: bool,
+    settings_rev: Option<u64>,
+    prefs_rev: u64,
+}
+
+/// Keeps the dialogs' settings and the engine settings in step (once per frame): restores the saved dialog
+/// settings (`state.uiPrefs`) at start-up, mirrors every engine option in as `options.<key>` (read-only copies
+/// for code that still reads dialog prefs) and saves dialog settings that changed.
+pub(crate) fn sync_ui_prefs(ctx: &egui::Context, app: &mut App) {
+    let sync_id = egui::Id::new("mc-ui-prefs-sync");
+    let prefs_id = egui::Id::new(UI_PREFS_ID);
+    let mut sync = ctx.data_mut(|d| d.get_temp::<PrefSync>(sync_id)).unwrap_or_default();
+    let mut p = ctx.data_mut(|d| d.get_temp::<UiPrefs>(prefs_id)).unwrap_or_default();
+    let mut touched = false;
+    if !sync.loaded {
+        if let Some(Value::Object(saved)) = app.s.settings.get("state.uiPrefs") {
+            for (k, v) in saved {
+                if !is_mirror(&k) {
+                    p.values.entry(k).or_insert(v);
+                }
+            }
+        }
+        sync.loaded = true;
+        touched = true;
+    }
+    if touched || p.rev != sync.prefs_rev {
+        // A dialog changed its settings: save them with the profile.
+        let own: Map<String, Value> =
+            p.values.iter().filter(|(k, _)| !is_mirror(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+        let own = Value::Object(own);
+        if app.s.settings.get("state.uiPrefs").as_ref() != Some(&own)
+            && let Err(e) = app.s.set_option("state.uiPrefs", &own)
+        {
+            log::warn!("dialog settings not saved: {e}");
+        }
+        sync.prefs_rev = p.rev;
+    }
+    if sync.settings_rev != Some(app.s.settings.rev()) {
+        for d in mailcraft_engine::settings::DEFS {
+            if d.page == "state" {
+                continue;
+            }
+            if let Some(v) = app.s.option(d.key) {
+                if let Some((_, legacy)) = LEGACY_PREFS.iter().find(|(k, _)| *k == d.key) {
+                    p.values.insert((*legacy).to_owned(), v.clone());
+                }
+                p.values.insert(format!("options.{}", d.key), v);
+            }
+        }
+        sync.settings_rev = Some(app.s.settings.rev());
+        touched = true;
+    }
+    if touched {
+        p.rev = p.rev.wrapping_add(1);
+        sync.prefs_rev = p.rev;
+        ctx.data_mut(|d| d.insert_temp(prefs_id, p));
+    }
+    ctx.data_mut(|d| d.insert_temp(sync_id, sync));
+}
+
+/// Display settings applied by the shell: what was last installed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DisplayApplied {
+    animations: Option<(bool, bool)>,
+    /// A splitter moved; the sizes are saved once the pointer is released.
+    panes_dirty: bool,
+}
+
+fn display_id() -> egui::Id {
+    egui::Id::new("mc-display-settings")
+}
+
+/// General › Theme "Use system setting" (follows the system's light/dark preference) and Advanced › "Use
+/// animations when expanding conversations and groups".
+fn apply_display_settings(ctx: &egui::Context, app: &mut App) {
+    if app.s.settings.text("general.theme") == "system"
+        && let Some(sys) = ctx.system_theme()
+    {
+        let dark = sys == egui::Theme::Dark;
+        if app.s.view.dark != dark {
+            app.s.view.dark = dark;
+            ctx.request_repaint();
+        }
+    }
+    let anim = app.s.settings.bool("advanced.animations");
+    let mut st = ctx.data_mut(|d| d.get_temp::<DisplayApplied>(display_id())).unwrap_or_default();
+    // Installing a theme replaces the style, so animations are applied again after a theme change.
+    if st.animations != Some((anim, app.theme.dark)) {
+        let t = if anim { egui::Style::default().animation_time } else { 0.0 };
+        ctx.all_styles_mut(|s| s.animation_time = t);
+        st.animations = Some((anim, app.theme.dark));
+        ctx.data_mut(|d| d.insert_temp(display_id(), st));
+    }
+}
+
+/// Draws the F6 focus ring around `rect` when `name` is the focused pane.
+fn focus_ring(ui: &Ui, app: &App, name: &str, rect: Rect) {
+    if crate::keys::focused_pane(ui.ctx()).as_deref() == Some(name) {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            CornerRadius::same(size::PANE_RADIUS),
+            Stroke::new(2.0, app.theme.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
 
 /// Icon for a command shown as a toolbar button.
 pub fn command_icon(id: &str) -> &'static str {
@@ -97,6 +241,8 @@ fn chrome_visuals(ui: &mut Ui, theme: &Theme) {
 pub fn main_window(ui: &mut Ui, app: &mut App, frame: &Frame) {
     let full = ui.max_rect();
     let ctx = ui.ctx().clone();
+    sync_ui_prefs(&ctx, app);
+    apply_display_settings(&ctx, app);
     with_shell(&ctx, |st| {
         let prev = std::mem::take(&mut st.layout);
         st.prev_pane_rects = prev.rects;
@@ -133,6 +279,22 @@ pub fn main_window(ui: &mut Ui, app: &mut App, frame: &Frame) {
         ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, app.theme.separator));
         let mut c = child(ui, r, "mc_ribbon", Layout::left_to_right(Align::Center));
         crate::ribbon::ribbon(&mut c, app, Surface::Main, frame);
+        focus_ring(ui, app, "ribbon", r);
+    }
+    // Quick Access Toolbar › Toolbar Position: Below Ribbon.
+    if qat_below(app) {
+        let r = Rect::from_min_max(
+            pos2(full.left(), top),
+            pos2(full.right(), (top + size::TAB_ROW).min(full.bottom())),
+        );
+        top = r.bottom();
+        keep = keep.union(r);
+        ui.painter().rect_filled(r, CornerRadius::ZERO, app.theme.ribbon);
+        ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, app.theme.separator));
+        let mut c =
+            child(ui, r.shrink2(vec2(8.0, 0.0)), "mc_qat_below", Layout::left_to_right(Align::Center));
+        let theme = app.theme.clone();
+        qat_buttons(&mut c, app, &theme);
     }
     // A ribbon shown on demand hides again on the next click outside it.
     if reveal
@@ -150,6 +312,7 @@ pub fn main_window(ui: &mut Ui, app: &mut App, frame: &Frame) {
         bottom = r.top();
         let mut c = child(ui, r, "mc_status_bar", Layout::left_to_right(Align::Center));
         status_bar(&mut c, app, frame);
+        focus_ring(ui, app, "statusBar", r);
     }
 
     let rail = Rect::from_min_max(
@@ -186,25 +349,15 @@ pub fn title_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
         );
     }
 
-    // Quick Access Toolbar.
+    // Quick Access Toolbar (Options › Quick Access Toolbar: shown, above the ribbon).
     let qat_rect = Rect::from_min_max(pos2(bar.left() + 42.0, bar.top()), pos2(bar.right(), bar.bottom()));
     let mut qat = child(ui, qat_rect, "mc_qat", Layout::left_to_right(Align::Center));
-    qat.spacing_mut().item_spacing.x = 1.0;
-    let keytips = app.ui.keytips.as_deref() == Some("");
-    for (i, id) in app.s.view.quick_access.clone().into_iter().enumerate() {
-        let label = command_label(app, &id);
-        let enabled = app.s.enabled(&id).is_none();
-        let r = widgets::icon_only(&mut qat, app, command_icon(&id), &label, enabled);
-        if keytips && i < 9 {
-            keytip_badge(&qat, r.rect, &(i + 1).to_string(), &theme);
-        }
-        if r.clicked() {
-            app.run(&id, json!({}));
-        }
-    }
-    let custom = widgets::icon_only(&mut qat, app, "chevron-down", "Customize Quick Access Toolbar", true);
-    egui::Popup::menu(&custom).show(|ui| qat_menu(ui, app));
-    let qat_end = qat.min_rect().right();
+    let qat_end = if app.s.settings.bool("qat.show") && !qat_below(app) {
+        qat_buttons(&mut qat, app, &theme);
+        qat.min_rect().right()
+    } else {
+        qat_rect.left()
+    };
 
     // Right side: account button, then (full-screen ribbon mode) the show-ribbon button.
     let account = Rect::from_min_max(pos2(bar.right() - size::ACCOUNT_BUTTON_W, bar.top()), bar.max);
@@ -220,6 +373,35 @@ pub fn title_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
     }
 
     search_box(ui, app, frame, bar, qat_end, right_edge);
+}
+
+/// Options › Quick Access Toolbar › Toolbar Position: Below Ribbon (and the toolbar shown).
+fn qat_below(app: &App) -> bool {
+    app.s.settings.bool("qat.show") && app.s.settings.text("qat.position") == "below"
+}
+
+/// The Quick Access Toolbar's buttons and its customise menu (labels shown when the option says so).
+fn qat_buttons(qat: &mut Ui, app: &mut App, theme: &Theme) {
+    qat.spacing_mut().item_spacing.x = 1.0;
+    let keytips = app.ui.keytips.as_deref() == Some("");
+    let labels = app.s.settings.bool("qat.showLabels");
+    for (i, id) in app.s.view.quick_access.clone().into_iter().enumerate() {
+        let label = command_label(app, &id);
+        let enabled = app.s.enabled(&id).is_none();
+        let r = if labels {
+            widgets::icon_button(qat, app, command_icon(&id), &label, enabled)
+        } else {
+            widgets::icon_only(qat, app, command_icon(&id), &label, enabled)
+        };
+        if keytips && i < 9 {
+            keytip_badge(qat, r.rect, &(i + 1).to_string(), theme);
+        }
+        if r.clicked() {
+            app.run(&id, json!({}));
+        }
+    }
+    let custom = widgets::icon_only(qat, app, "chevron-down", "Customize Quick Access Toolbar", true);
+    egui::Popup::menu(&custom).show(|ui| qat_menu(ui, app));
 }
 
 fn app_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
@@ -970,6 +1152,7 @@ fn pane(
     ui.painter().rect(rect, CornerRadius::same(size::PANE_RADIUS), fill, stroke, egui::StrokeKind::Inside);
     let mut c = child(ui, rect, &salt, Layout::top_down(Align::Min));
     add(&mut c, app);
+    focus_ring(ui, app, name, rect);
 }
 
 /// A drag handle over the gap `rect`; returns the drag delta along its axis.
@@ -1035,13 +1218,19 @@ fn mail_panes(ui: &mut Ui, app: &mut App, frame: &Frame, area: Rect) {
     let ctx = ui.ctx().clone();
     let theme = app.theme.clone();
     let split = size::PANE_SPLIT;
+    // Pane sizes the splitters left last time (saved with the profile; 0 = default).
+    let saved = |key: &str| Some(app.s.settings.int(key)).filter(|v| *v > 0).map(|v| v as f32);
+    let saved_folder = saved("state.folderPaneWidth");
+    let saved_list = saved("state.listWidth");
+    let saved_frac = saved("state.listFractionPermille").map(|p| p / 1000.0);
     let (mut folder_w, mut list_w, mut list_frac) = with_shell(&ctx, |st| {
         (
-            st.folder_w.unwrap_or(size::FOLDER_PANE),
-            st.list_w.unwrap_or(size::LIST),
-            st.list_frac.unwrap_or(size::BOTTOM_LIST_FRACTION),
+            st.folder_w.or(saved_folder).unwrap_or(size::FOLDER_PANE),
+            st.list_w.or(saved_list).unwrap_or(size::LIST),
+            st.list_frac.or(saved_frac).unwrap_or(size::BOTTOM_LIST_FRACTION),
         )
     });
+    let before = (folder_w, list_w, list_frac);
 
     // Folder pane: Normal (draggable), minimised strip (user setting, ≤ 800 wide, Reading view) or off.
     let view = &app.s.view;
@@ -1129,6 +1318,36 @@ fn mail_panes(ui: &mut Ui, app: &mut App, frame: &Frame, area: Rect) {
         st.list_w = Some(list_w);
         st.list_frac = Some(list_frac);
     });
+    save_pane_sizes(&ctx, app, before != (folder_w, list_w, list_frac), (folder_w, list_w, list_frac));
+}
+
+/// Saves the splitter positions once a drag ends.
+fn save_pane_sizes(
+    ctx: &egui::Context,
+    app: &mut App,
+    moved: bool,
+    (folder_w, list_w, list_frac): (f32, f32, f32),
+) {
+    let mut st = ctx.data_mut(|d| d.get_temp::<DisplayApplied>(display_id())).unwrap_or_default();
+    if moved {
+        st.panes_dirty = true;
+    }
+    if st.panes_dirty && !ctx.input(|i| i.pointer.any_down()) {
+        st.panes_dirty = false;
+        let values = [
+            ("state.folderPaneWidth", json!(folder_w.round().clamp(0.0, 4000.0) as i64)),
+            ("state.listWidth", json!(list_w.round().clamp(0.0, 8000.0) as i64)),
+            ("state.listFractionPermille", json!((list_frac * 1000.0).round().clamp(1.0, 1000.0) as i64)),
+        ];
+        for (k, v) in values {
+            if app.s.option(k).as_ref() != Some(&v)
+                && let Err(e) = app.s.set_option(k, &v)
+            {
+                log::warn!("pane size not saved: {e}");
+            }
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(display_id(), st));
 }
 
 #[cfg(test)]
@@ -1149,6 +1368,58 @@ mod tests {
     fn clamp_never_panics_on_empty_range() {
         assert_eq!(clamp(5.0, 10.0, 2.0), 10.0);
         assert!((1.0..=2.0).contains(&clamp(f32::NAN, 1.0, 2.0)));
+    }
+
+    #[test]
+    fn dialog_settings_are_saved_and_options_mirrored() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(mailcraft_engine::sample::sample_session());
+        sync_ui_prefs(&ctx, &mut app);
+        // Engine options appear as read-only copies for older readers.
+        assert_eq!(crate::dialogs::ui_pref(&ctx, "options.search.highlight"), Some(json!(true)));
+        app.run("options.set", json!({"key": "search.highlight", "value": false}));
+        sync_ui_prefs(&ctx, &mut app);
+        assert_eq!(crate::dialogs::ui_pref(&ctx, "options.search.highlight"), Some(json!(false)));
+        assert!(!crate::dialogs::search_highlight_on(&app.s), "the list reads the setting itself");
+        assert_eq!(crate::dialogs::ui_pref(&ctx, "readingPane.singleKey"), Some(json!(true)));
+        // A dialog's own setting is saved in the profile settings (not the mirrors).
+        let id = egui::Id::new(UI_PREFS_ID);
+        let mut p = ctx.data_mut(|d| d.get_temp::<UiPrefs>(id)).unwrap_or_default();
+        p.values.insert("columns.7".into(), json!(["from", "subject"]));
+        p.rev += 1;
+        ctx.data_mut(|d| d.insert_temp(id, p));
+        sync_ui_prefs(&ctx, &mut app);
+        let saved = app.s.settings.get("state.uiPrefs").unwrap();
+        assert_eq!(saved["columns.7"], json!(["from", "subject"]));
+        assert!(saved.get("options.search.highlight").is_none());
+        // A new window (fresh egui memory) gets it back.
+        let ctx2 = egui::Context::default();
+        sync_ui_prefs(&ctx2, &mut app);
+        assert_eq!(crate::dialogs::ui_pref(&ctx2, "columns.7"), Some(json!(["from", "subject"])));
+    }
+
+    #[test]
+    fn quick_access_toolbar_options() {
+        let mut app = App::new(mailcraft_engine::sample::sample_session());
+        assert!(!qat_below(&app));
+        app.run("options.set", json!({"key": "qat.position", "value": "below"}));
+        assert!(qat_below(&app));
+        app.run("options.set", json!({"key": "qat.show", "value": false}));
+        assert!(!qat_below(&app));
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+            |ui, app: &mut App| {
+                let frame = Frame::compute(1200.0, 800.0);
+                main_window(ui, app, &frame);
+            },
+            app,
+        );
+        h.run();
+        use egui_kittest::kittest::Queryable;
+        assert!(h.query_by_label("Customize Quick Access Toolbar").is_none(), "hidden");
+        h.state_mut().run("options.set", json!({"key": "qat.show", "value": true}));
+        h.state_mut().run("options.set", json!({"key": "qat.showLabels", "value": true}));
+        h.run();
+        assert!(h.query_by_label("Customize Quick Access Toolbar").is_some());
     }
 
     #[test]

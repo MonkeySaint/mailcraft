@@ -11,29 +11,29 @@ People|Home › Current View|Card|view.changeView
 People|Home › Current View|Phone|view.changeView
 People|Home › Current View|List|view.changeView
 People|Home › Current View|Change View|view.changeView
-People|Home › Actions|Move|mail.move
+People|Home › Actions|Move|people.move
 People|Home › Actions|Mail Merge...|people.mailMerge
 People|Home › Actions|Send to OneNote|-|OneNote integration (Microsoft service)
 People|Home › Share|Forward Contact|people.forward
 People|Home › Share|Share Contacts|-|folder sharing invitation requires an Exchange/Microsoft 365 mailbox
 People|Home › Share|Open Shared Contacts|-|opening another user's shared folder requires an Exchange/Microsoft 365 mailbox
-People|Home › Tags|Categorize|mail.categorize
-People|Home › Tags|Follow Up|mail.flag
-People|Home › Tags|Private|mail.togglePrivate
+People|Home › Tags|Categorize|people.categorize
+People|Home › Tags|Follow Up|people.flag
+People|Home › Tags|Private|people.private
 People|Home › Groups|New Group|-|Microsoft 365 Groups (cloud tenant service)
 People|Home › Groups|Browse Groups|-|Microsoft 365 Groups (cloud tenant service)
 People|Home › Find|Search People|people.search
 People|Home › Find|Address Book...|compose.addressBook
 People|Home > New Items|E-mail Message|mail.newEmail
-People|Home > New Items|Appointment|mail.newItem
-People|Home > New Items|Meeting|mail.newItem
+People|Home > New Items|Appointment|calendar.newAppointment
+People|Home > New Items|Meeting|calendar.newMeeting
 People|Home > New Items|Group|-|Microsoft 365 Groups (cloud tenant service)
 People|Home > New Items|Contact|people.new
-People|Home > New Items|Task|mail.newItem
+People|Home > New Items|Task|tasks.new
 People|Home > New Items|Contact Group|people.newGroup
 People|Home > New Items|Contact from the Same Company|people.newFromSameCompany
 People|Home > New Items|More Items|mail.newItem
-People|Home > New Items > More Items|Task Request|mail.newItem
+People|Home > New Items > More Items|Task Request|tasks.assign
 People|Home > New Items > More Items|Internet Fax|-|third-party online fax service upsell
 People|Home > New Items > More Items|Choose Form...|mail.newItem
 People|Home > New Items > More Items|Outlook Data File...|file.newDataFile
@@ -54,29 +54,29 @@ People|Home > Change View|List|view.changeView
 People|Home > Change View|Manage Views...|view.manageViews
 People|Home > Change View|Save Current View As a New View...|view.saveViewAs
 People|Home > Change View|Apply Current View to Other Contact Folders...|view.applyViewTo
-People|Home > Move|Other Folder...|mail.move
-People|Home > Move|Copy to Folder...|mail.copy
+People|Home > Move|Other Folder...|people.move
+People|Home > Move|Copy to Folder...|people.copy
 People|Home > Forward Contact|As a Business Card|people.forward
 People|Home > Forward Contact|As an Outlook Contact|people.forward
-People|Home > Categorize|Clear All Categories|mail.clearCategories
-People|Home > Categorize|Blue category|mail.categorize
-People|Home > Categorize|Green category|mail.categorize
-People|Home > Categorize|Orange category|mail.categorize
-People|Home > Categorize|Purple category|mail.categorize
-People|Home > Categorize|Red category|mail.categorize
-People|Home > Categorize|Yellow category|mail.categorize
-People|Home > Categorize|All Categories...|mail.allCategories
-People|Home > Categorize|Set Quick Click...|categories.quickClick
-People|Home > Follow Up|Today|mail.flag
-People|Home > Follow Up|Tomorrow|mail.flag
-People|Home > Follow Up|This Week|mail.flag
-People|Home > Follow Up|Next Week|mail.flag
-People|Home > Follow Up|No Date|mail.flag
-People|Home > Follow Up|Custom...|mail.flagCustom
-People|Home > Follow Up|Add Reminder...|mail.addReminder
-People|Home > Follow Up|Mark Complete|mail.markComplete
-People|Home > Follow Up|Clear Flag|mail.clearFlag
-People|Home > Follow Up|Set Quick Click...|mail.flagQuickClick
+People|Home > Categorize|Clear All Categories|people.categorize
+People|Home > Categorize|Blue category|people.categorize
+People|Home > Categorize|Green category|people.categorize
+People|Home > Categorize|Orange category|people.categorize
+People|Home > Categorize|Purple category|people.categorize
+People|Home > Categorize|Red category|people.categorize
+People|Home > Categorize|Yellow category|people.categorize
+People|Home > Categorize|All Categories...|people.allCategories
+People|Home > Categorize|Set Quick Click...|categories.setQuickClick
+People|Home > Follow Up|Today|people.flag
+People|Home > Follow Up|Tomorrow|people.flag
+People|Home > Follow Up|This Week|people.flag
+People|Home > Follow Up|Next Week|people.flag
+People|Home > Follow Up|No Date|people.flag
+People|Home > Follow Up|Custom...|people.flag
+People|Home > Follow Up|Add Reminder...|people.flag
+People|Home > Follow Up|Mark Complete|people.flag
+People|Home > Follow Up|Clear Flag|people.flag
+People|Home > Follow Up|Set Quick Click...|mail.setQuickClickFlag
 People|Send / Receive › Send & Receive|Send/Receive All Folders|sendReceive.all
 People|Send / Receive › Send & Receive|Update Folder|sendReceive.folder
 People|Send / Receive › Send & Receive|Send All|sendReceive.sendAll
@@ -141,7 +141,7 @@ People|View > Folder Pane|Off|view.folderPane
 People|View > Reading Pane|Right|view.readingPane
 People|View > Reading Pane|Bottom|view.readingPane
 People|View > Reading Pane|Off|view.readingPane
-People|View > Reading Pane|Options...|options.open
+People|View > Reading Pane|Options...|view.readingPaneOptions
 People|View > To-Do Bar|Calendar|view.todoBar
 People|View > To-Do Bar|People|view.todoBar
 People|View > To-Do Bar|Tasks|view.todoBar
