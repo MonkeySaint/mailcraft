@@ -56,6 +56,7 @@ pub struct BodyView {
     pub find_requested: bool,
     /// Where the right-click menu was opened.
     menu_at: Option<TextPos>,
+    menu_link: Option<String>,
 }
 
 impl BodyView {
@@ -260,8 +261,10 @@ fn paint_and_interact(
             view.extra.clear();
         }
     }
-    if view.context_menu {
-        context_menu(ui, view, layout, doc, &resp, origin);
+    if view.context_menu
+        && let Some(href) = context_menu(ui, view, layout, doc, &resp, origin)
+    {
+        clicked_link = Some(href);
     }
     if resp.has_focus() {
         let (copy, select_all) = ui.input(|i| {
@@ -609,6 +612,8 @@ fn word_at(doc: &Doc, pos: &TextPos) -> Option<(TextPos, TextPos)> {
 
 /// Context-menu labels of the read-only body.
 pub const MENU_COPY: &str = "Copy";
+pub const MENU_COPY_LINK: &str = "Copy link address";
+pub const MENU_OPEN_LINK: &str = "Open link";
 pub const MENU_SELECT_ALL: &str = "Select All";
 pub const MENU_SIMILAR: &str = "Select Text With Similar Formatting";
 pub const MENU_FIND: &str = "Find...";
@@ -620,7 +625,7 @@ fn context_menu(
     doc: &Doc,
     resp: &egui::Response,
     origin: Pos2,
-) {
+) -> Option<String> {
     if resp.secondary_clicked()
         && let Some(p) = resp.interact_pointer_pos()
     {
@@ -635,12 +640,23 @@ fn context_menu(
             view.extra.clear();
         }
         view.menu_at = at;
+        view.menu_link =
+            layout.hit(mailcraft_geom::Point::new(p.x - origin.x, p.y - origin.y)).map(str::to_owned);
         resp.request_focus();
     }
     let has_selection = view.ordered_selection().is_some();
     let mut pick: Option<&'static str> = None;
     resp.context_menu(|ui| {
         ui.set_min_width(220.0);
+        if view.menu_link.is_some() {
+            if ui.button(MENU_OPEN_LINK).clicked() {
+                pick = Some(MENU_OPEN_LINK);
+            }
+            if ui.button(MENU_COPY_LINK).clicked() {
+                pick = Some(MENU_COPY_LINK);
+            }
+            ui.separator();
+        }
         if ui.add_enabled(has_selection, egui::Button::new(MENU_COPY)).clicked() {
             pick = Some(MENU_COPY);
         }
@@ -659,6 +675,12 @@ fn context_menu(
         }
     });
     match pick {
+        Some(MENU_OPEN_LINK) => return view.menu_link.clone(),
+        Some(MENU_COPY_LINK) => {
+            if let Some(href) = &view.menu_link {
+                ui.ctx().copy_text(href.clone());
+            }
+        }
         Some(MENU_COPY) => {
             if let Some(text) = selected_text_all(view, doc) {
                 ui.ctx().copy_text(text);
@@ -677,6 +699,7 @@ fn context_menu(
         Some(MENU_FIND) => view.find_requested = true,
         _ => {}
     }
+    None
 }
 
 /// Selects the whole body (Select All).
@@ -1525,5 +1548,52 @@ mod tests {
             _ => false,
         });
         assert!(textured, "the picture is drawn from its texture");
+    }
+    #[test]
+    fn links_click_open_and_copy_their_address_from_the_context_menu() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let href = "https://example.org/article?story=42";
+        let doc = mailcraft_html::html_to_doc(&format!("<p><a href='{href}'>Read article</a></p>"));
+        let mut harness = Harness::builder().with_size(Vec2::new(800.0, 400.0)).build_ui_state(
+            |ui, state: &mut (Doc, BodyView, Option<String>, Option<String>)| {
+                if let Some(href) = show_doc(ui, &mut state.1, &state.0, false) {
+                    state.2 = Some(href);
+                }
+                if let Some(text) = ui.ctx().output(|output| {
+                    output.commands.iter().find_map(|command| match command {
+                        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                }) {
+                    state.3 = Some(text);
+                }
+            },
+            (doc, BodyView { context_menu: true, ..Default::default() }, None, None),
+        );
+        harness.run();
+        let view = &harness.state().1;
+        let rect = view.layout.as_ref().unwrap().index.links.first().unwrap().rect;
+        let origin = view.origin.unwrap();
+        let pos = origin + Vec2::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        let click = |h: &Harness<'_, (Doc, BodyView, Option<String>, Option<String>)>, button| {
+            h.event(egui::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton { pos, button, pressed, modifiers: Default::default() });
+            }
+        };
+        click(&harness, egui::PointerButton::Primary);
+        harness.run();
+        assert_eq!(harness.state().2.as_deref(), Some(href));
+        click(&harness, egui::PointerButton::Secondary);
+        harness.run();
+        harness.get_by_label(MENU_COPY_LINK).click();
+        harness.run();
+        assert_eq!(harness.state().3.as_deref(), Some(href));
+        harness.state_mut().2 = None;
+        click(&harness, egui::PointerButton::Secondary);
+        harness.run();
+        harness.get_by_label(MENU_OPEN_LINK).click();
+        harness.run();
+        assert_eq!(harness.state().2.as_deref(), Some(href));
     }
 }

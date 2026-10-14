@@ -45,7 +45,7 @@ unicode-width = "0.2"
 # ui
 egui = "0.36"
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "accesskit"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "accesskit", "links"] }
 egui_kittest = "0.36"
 # Raster decoding (MIT OR Apache-2.0): PNG, JPEG (zune-jpeg) and GIF only, for contact pictures, pasted and
 # inline pictures, and screenshots in tests.
