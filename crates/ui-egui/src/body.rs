@@ -1526,4 +1526,61 @@ mod tests {
         });
         assert!(textured, "the picture is drawn from its texture");
     }
+    #[test]
+    fn centered_newsletter_tiles_share_a_row() {
+        let mut html = String::from(
+            "<div style='max-width:630px;margin:0 auto;background-color:white;text-align:center'>",
+        );
+        for name in ["morning", "noon", "evening"] {
+            html.push_str(&format!("<div style='display:inline-block;vertical-align:top'><table width='170'><tr><td><a href='https://example.org/{name}'><img src='cid:{name}' width='150' height='150'></a><h2>{name}</h2></td></tr></table></div>\n"));
+        }
+        html.push_str("</div>");
+        let doc = mailcraft_html::html_to_doc(&html);
+        let ctx = egui::Context::default();
+        let mut view = BodyView::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| {
+                show_doc(ui, &mut view, &doc, false);
+            },
+        );
+        output.textures_delta.clear();
+        let layout = view.layout.as_ref().unwrap();
+        let images: Vec<_> = layout
+            .display
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 3);
+        assert!((images[0].y - images[1].y).abs() < 0.01 && (images[0].y - images[2].y).abs() < 0.01);
+        assert!(images[0].right() < images[1].x && images[1].right() < images[2].x);
+        let page = layout
+            .display
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::FillRect { rect, color } if *color == Color::WHITE => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(page.w, 630.0);
+        assert!((page.x + page.w / 2.0 - view.width / 2.0).abs() < 0.01);
+        assert!(page.x > 100.0);
+        for link in &layout.index.links {
+            assert_eq!(
+                layout.hit(mailcraft_geom::Point::new(
+                    link.rect.x + link.rect.w / 2.0,
+                    link.rect.y + link.rect.h / 2.0
+                )),
+                Some(link.href.as_str())
+            );
+        }
+    }
 }

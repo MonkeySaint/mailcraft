@@ -63,6 +63,7 @@ struct BoxStyle {
     background: Option<Color>,
     width: Option<f32>,
     height: Option<f32>,
+    box_align: Option<Align>,
     hidden: bool,
     top_rule: bool,
     border: bool,
@@ -220,7 +221,26 @@ fn box_style(p: &Props, font_px: f32) -> BoxStyle {
         Some(Length::Px(v)) if v >= 0.0 => Some(v),
         _ => None,
     };
-    b.width = dim("width");
+    b.width = dim("width").or_else(|| dim("max-width"));
+    let margins: Vec<_> = p.get("margin").map_or(Vec::new(), |v| v.split_ascii_whitespace().collect());
+    let horizontal = match margins.as_slice() {
+        [all] => Some((*all, *all)),
+        [_, horizontal] | [_, horizontal, _] => Some((*horizontal, *horizontal)),
+        [_, right, _, left] => Some((*left, *right)),
+        _ => None,
+    };
+    let left = p.get("margin-left").or(horizontal.map(|s| s.0));
+    let right = p.get("margin-right").or(horizontal.map(|s| s.1));
+    if b.width.is_some() || p.get("display").is_some_and(|v| v.eq_ignore_ascii_case("table")) {
+        let left_auto = left.is_some_and(|v| v.eq_ignore_ascii_case("auto"));
+        let right_auto = right.is_some_and(|v| v.eq_ignore_ascii_case("auto"));
+        b.box_align = match (left_auto, right_auto) {
+            (true, true) => Some(Align::Center),
+            (true, false) => Some(Align::End),
+            (false, true) => Some(Align::Start),
+            _ => None,
+        };
+    }
     b.height = dim("height");
     b.hidden = p.get("display").is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
         || p.get("mso-hide").is_some_and(|v| v.trim().eq_ignore_ascii_case("all"));
@@ -627,9 +647,58 @@ impl Conv<'_> {
         if depth > MAX_WALK_DEPTH {
             return;
         }
-        for &c in self.dom.children(id) {
-            self.walk(c, ctx, sink, depth + 1);
+        let mut columns = Vec::new();
+        let flush_columns = |columns: &mut Vec<TableCell>, sink: &mut Sink| {
+            if !columns.is_empty() {
+                let table =
+                    Block::Table { rows: vec![std::mem::take(columns)], border: false, width_px: None };
+                if matches!(ctx.align, Align::Center | Align::End) {
+                    sink.push_block(Block::Container {
+                        style: ParaStyle { box_align: Some(ctx.align), ..Default::default() },
+                        blocks: vec![table],
+                    });
+                } else {
+                    sink.push_block(table);
+                }
+            }
+        };
+        for &child in self.dom.children(id) {
+            if let Some(NodeData::Text(text)) = self.dom.node(child).map(|node| &node.data)
+                && text.trim().is_empty()
+                && !columns.is_empty()
+            {
+                continue;
+            }
+            if let Some(NodeData::Element { name, attrs }) = self.dom.node(child).map(|node| &node.data) {
+                let props = self.props(name, attrs);
+                if matches!(name.as_str(), "div" | "section" | "article" | "aside")
+                    && props
+                        .get("display")
+                        .is_some_and(|display| display.eq_ignore_ascii_case("inline-block"))
+                {
+                    if columns.len() >= MAX_TABLE_COLS.min(128) {
+                        flush_columns(&mut columns, sink);
+                    }
+                    let Some((_, box_style)) = self.element_ctx(name, attrs, ctx) else { continue };
+                    let mut column = Sink::new(ctx.para(), &self.link_budget);
+                    self.walk(child, ctx, &mut column, depth + 1);
+                    columns.push(TableCell {
+                        blocks: column.finish(),
+                        colspan: 1,
+                        rowspan: 1,
+                        background: None,
+                        width_px: box_style.width,
+                    });
+                    continue;
+                }
+                if props.get("display").is_some_and(|display| display.eq_ignore_ascii_case("none")) {
+                    continue;
+                }
+            }
+            flush_columns(&mut columns, sink);
+            self.walk(child, ctx, sink, depth + 1);
         }
+        flush_columns(&mut columns, sink);
     }
 
     fn walk(&self, id: NodeId, ctx: &Ctx, sink: &mut Sink, depth: usize) {
@@ -727,16 +796,16 @@ impl Conv<'_> {
             sink.push_block(Block::Rule);
         }
         let space_before = bx.margin_top.unwrap_or(0.0).max(0.0);
-        if name != "p"
-            && let Some(bg) = bx.background
-        {
+        if name != "p" && (bx.background.is_some() || bx.width.is_some() || bx.box_align.is_some()) {
             let style = ParaStyle {
                 align: c.align,
                 indent_px: bx.indent.max(0.0),
                 space_before_px: space_before,
                 space_after_px: bx.margin_bottom.unwrap_or(0.0).max(0.0),
                 line_height: None,
-                background: Some(bg),
+                background: bx.background,
+                width_px: bx.width,
+                box_align: bx.box_align,
             };
             c.indent = 0.0;
             let blocks = self.flow_with(id, &c, c.para(), depth);
@@ -873,7 +942,20 @@ impl Conv<'_> {
         }
         sink.push_blocks(foster.finish());
         if !rows.is_empty() {
-            sink.push_block(Block::Table { rows, border, width_px: bx.width });
+            let table = Block::Table { rows, border, width_px: bx.width };
+            let box_align = attr(attrs, "align")
+                .and_then(parse_align)
+                .filter(|a| *a != Align::Justify)
+                .or(bx.box_align)
+                .or(if matches!(c.align, Align::Center | Align::End) { Some(c.align) } else { None });
+            if box_align.is_some() {
+                sink.push_block(Block::Container {
+                    style: ParaStyle { width_px: bx.width, box_align, ..Default::default() },
+                    blocks: vec![table],
+                });
+            } else {
+                sink.push_block(table);
+            }
         }
     }
 

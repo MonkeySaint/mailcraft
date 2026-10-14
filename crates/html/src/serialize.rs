@@ -81,7 +81,8 @@ fn align_css(a: Align) -> &'static str {
 
 fn para_css(s: &ParaStyle, inherited: Align) -> String {
     let mut css = String::new();
-    let (t, b, l) = (s.space_before_px, s.space_after_px, s.indent_px);
+    let (t, b, l) =
+        (s.space_before_px, s.space_after_px, if s.box_align.is_some() { 0.0 } else { s.indent_px });
     if t == 0.0 && b == 0.0 && l == 0.0 {
         css.push_str("margin:0");
     } else {
@@ -95,6 +96,23 @@ fn para_css(s: &ParaStyle, inherited: Align) -> String {
     }
     if let Some(bg) = s.background {
         let _ = write!(css, ";background-color:{}", bg.to_hex());
+    }
+    if let Some(width) = s.width_px {
+        let _ = write!(css, ";width:{}", px(width));
+    }
+    if let Some(align) = s.box_align {
+        if s.width_px.is_none() {
+            css.push_str(";display:table");
+        }
+        let (left, right) = match align {
+            Align::Center => ("auto", "auto"),
+            Align::End => ("auto", "0"),
+            _ => ("0", "auto"),
+        };
+        let _ = write!(css, ";margin-left:{left};margin-right:{right}");
+        if s.indent_px != 0.0 {
+            let _ = write!(css, ";padding-left:{}", px(s.indent_px));
+        }
     }
     css
 }
