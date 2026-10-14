@@ -44,6 +44,7 @@ pub(crate) struct Ctx<'a> {
     pub width: f32,
     pub default_color: Color,
     pub link_color: Color,
+    pub intrinsic_images: std::collections::BTreeMap<String, [usize; 2]>,
     /// Lines that may still be laid out (see [`MAX_LINES`]).
     pub lines_left: Cell<usize>,
 }
@@ -58,6 +59,7 @@ impl<'a> Ctx<'a> {
             width,
             default_color: opts.default_color,
             link_color: opts.link_color,
+            intrinsic_images: opts.intrinsic_images.clone(),
             lines_left: Cell::new(MAX_LINES),
         }
     }

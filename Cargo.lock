@@ -2302,6 +2302,7 @@ dependencies = [
  "mailcraft-layout",
  "mailcraft-mime",
  "mailcraft-model",
+ "mailcraft-net",
  "mailcraft-testmail",
  "resvg",
  "serde",

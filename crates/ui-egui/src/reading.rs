@@ -602,7 +602,9 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     let dark =
         app.theme.dark && !tg.light_bg.contains(&id) && !app.s.settings.bool("general.keepMessageBackground");
     // Trust Center › "Don't download pictures automatically" (on by default).
-    let allow_remote = !links_off && (tg.pictures.contains(&id) || !app.s.settings.bool("trust.blockImages"));
+    let allow_remote = !app.s.view.work_offline
+        && !links_off
+        && (tg.pictures.contains(&id) || !app.s.settings.bool("trust.blockImages"));
     let zoom = match app.s.view.zoom {
         0 => 1.0,
         z => f32::from(z) / 100.0,
