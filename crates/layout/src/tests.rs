@@ -1295,3 +1295,33 @@ fn table_borders_drawn_over_all_cell_backgrounds() {
     let first_stroke = items.iter().position(|i| matches!(i, DisplayItem::StrokeRect { .. })).unwrap();
     assert!(first_stroke > last_fill, "a later cell background paints over an earlier cell border");
 }
+
+#[test]
+fn decoded_image_sizes_preserve_aspect_ratio_and_explicit_dimensions() {
+    let d = doc(vec![para(vec![
+        Inline::Image { src: "cid:natural".into(), alt: String::new(), width: None, height: None },
+        Inline::Image { src: "cid:width".into(), alt: String::new(), width: Some(100.0), height: None },
+        Inline::Image { src: "cid:height".into(), alt: String::new(), width: None, height: Some(50.0) },
+        Inline::Image {
+            src: "cid:explicit".into(),
+            alt: String::new(),
+            width: Some(30.0),
+            height: Some(40.0),
+        },
+    ])]);
+    let mut opts = LayoutOptions { width: 1200.0, zoom: 2.0, ..Default::default() };
+    for name in ["natural", "width", "height", "explicit"] {
+        opts.intrinsic_images.insert(format!("cid:{name}"), [200, 100]);
+    }
+    let layout = lay_opts(&d, &opts);
+    let dimensions: Vec<_> = layout
+        .display
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            DisplayItem::Image { rect, .. } => Some((rect.w, rect.h)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dimensions, [(400.0, 200.0), (200.0, 100.0), (200.0, 100.0), (60.0, 80.0)]);
+}

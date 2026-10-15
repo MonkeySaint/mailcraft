@@ -107,10 +107,23 @@ impl Flat {
     }
 }
 
-/// Image natural size (zoom applied): both dims given → as is; one given → square; none → placeholder.
-pub(crate) fn image_size(width: Option<f32>, height: Option<f32>, zoom: f32) -> (f32, f32) {
+/// Explicit dimensions win; decoded size supplies missing dimensions and preserves aspect ratio.
+/// Until decoded dimensions are available, retain the square/16×16 placeholder behaviour.
+pub(crate) fn image_size(
+    width: Option<f32>,
+    height: Option<f32>,
+    zoom: f32,
+    natural: Option<[usize; 2]>,
+) -> (f32, f32) {
     let ok = |v: Option<f32>| v.filter(|x| x.is_finite() && *x > 0.0).map(|x| x.min(MAX_IMAGE));
-    let (w, h) = match (ok(width), ok(height)) {
+    let natural = natural.filter(|s| s[0] > 0 && s[1] > 0).map(|s| (s[0] as f32, s[1] as f32));
+    let (width, height) = match (ok(width), ok(height), natural) {
+        (Some(w), None, Some((nw, nh))) => (Some(w), ok(Some(w * nh / nw))),
+        (None, Some(h), Some((nw, nh))) => (ok(Some(h * nw / nh)), Some(h)),
+        (None, None, Some((nw, nh))) => (ok(Some(nw)), ok(Some(nh))),
+        (w, h, _) => (w, h),
+    };
+    let (w, h) = match (width, height) {
         (Some(w), Some(h)) => (w, h),
         (Some(w), None) => (w, w),
         (None, Some(h)) => (h, h),
@@ -182,7 +195,7 @@ fn push_leaf(ctx: &Ctx<'_>, inline: &Inline, parent: &TextStyle, link: Option<us
             if MAX_BLOCK_TEXT.saturating_sub(flat.text.len()) < '\u{FFFC}'.len_utf8() {
                 return;
             }
-            let (w, h) = image_size(*width, *height, ctx.zoom);
+            let (w, h) = image_size(*width, *height, ctx.zoom, ctx.intrinsic_images.get(src).copied());
             flat.images.push(ImageInfo { src: src.clone(), alt: alt.clone(), w, h });
             let idx = flat.images.len().saturating_sub(1);
             let r = ctx.resolve(parent);
@@ -553,10 +566,10 @@ mod tests {
 
     #[test]
     fn image_sizes() {
-        assert_eq!(image_size(None, None, 1.0), (16.0, 16.0));
-        assert_eq!(image_size(Some(10.0), None, 2.0), (20.0, 20.0));
-        assert_eq!(image_size(Some(f32::NAN), Some(-1.0), 1.0), (16.0, 16.0));
-        assert_eq!(image_size(Some(30.0), Some(20.0), 1.0), (30.0, 20.0));
+        assert_eq!(image_size(None, None, 1.0, None), (16.0, 16.0));
+        assert_eq!(image_size(Some(10.0), None, 2.0, None), (20.0, 20.0));
+        assert_eq!(image_size(Some(f32::NAN), Some(-1.0), 1.0, None), (16.0, 16.0));
+        assert_eq!(image_size(Some(30.0), Some(20.0), 1.0, None), (30.0, 20.0));
     }
 
     #[test]

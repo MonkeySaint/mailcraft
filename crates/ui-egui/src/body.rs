@@ -15,7 +15,7 @@
 //! - Images: `data:image/…;base64` pictures are decoded (PNG, JPEG, GIF; [`decode_image`], at most
 //!   [`MAX_IMAGE_SIDE`] pixels a side) and drawn in their box; `cid:` pictures are drawn once the owner hands
 //!   over the attachment bytes with [`provide_image`]. Anything else (undecodable data, unknown `cid:`,
-//!   `http(s):`, which has no loader) shows a framed placeholder with its alt text; remote pictures are
+//!   `http(s):`, unless consent permits desktop downloading) shows a framed placeholder with its alt text; remote pictures are
 //!   labelled blocked unless [`BodyOptions::allow_remote`]. Decoded pictures are kept as textures in a small
 //!   per-context cache ([`MAX_IMAGE_CACHE`] pictures).
 //! - Dark mode: colours are re-mapped by lightness (dark text becomes light, white backgrounds become dark) so
@@ -76,8 +76,7 @@ pub struct BodyOptions {
     pub dark: bool,
     /// Zoom factor (1.0 = 100 %).
     pub zoom: f32,
-    /// Remote (http/https) images allowed ("Download pictures"). Without a network loader they still show a
-    /// placeholder, but labelled as loading rather than blocked.
+    /// Remote (http/https) images allowed ("Download pictures"). Desktop downloads run in the background.
     pub allow_remote: bool,
     /// Paint the page background behind the body.
     pub paint_background: bool,
@@ -102,9 +101,11 @@ pub fn show_doc_with(ui: &mut Ui, view: &mut BodyView, doc: &Doc, opts: &BodyOpt
     let width = if width.is_finite() && width > 1.0 { width } else { 1.0 };
     let zoom = if opts.zoom.is_finite() && opts.zoom > 0.05 { opts.zoom.min(5.0) } else { 1.0 };
     let doc_key = opts.doc_key.unwrap_or_else(|| doc_hash(doc));
+    let intrinsic_images = intrinsic_image_sizes(ui.ctx(), doc, opts.allow_remote);
     let key = {
         let mut h = DefaultHasher::new();
         doc_key.hash(&mut h);
+        intrinsic_images.hash(&mut h);
         ((width * 2.0).round() as i64).hash(&mut h);
         zoom.to_bits().hash(&mut h);
         h.finish()
@@ -117,7 +118,7 @@ pub fn show_doc_with(ui: &mut Ui, view: &mut BodyView, doc: &Doc, opts: &BodyOpt
     }
     let db = font_db(ui.ctx());
     if view.key != key || view.layout.is_none() {
-        let lo = LayoutOptions { width, zoom, ..LayoutOptions::default() };
+        let lo = LayoutOptions { width, zoom, intrinsic_images, ..LayoutOptions::default() };
         view.layout = Some(layout_doc(doc, &db, &lo));
         view.width = width;
         view.key = key;
@@ -382,7 +383,7 @@ fn paint_and_interact(
             DisplayItem::Image { rect: r, src, alt } => {
                 let rr = rect_of(r);
                 if rr.intersects(clip) {
-                    match image_texture(&ctx, src) {
+                    match permitted_image_texture(&ctx, src, opts.allow_remote) {
                         Some(tex) => paint_texture(&painter, rr, &tex),
                         None => paint_image_placeholder(&painter, rr, src, alt, opts, &ctx),
                     }
@@ -1312,6 +1313,53 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     (to(r1), to(g1), to(b1))
 }
 
+fn intrinsic_image_sizes(
+    ctx: &egui::Context,
+    doc: &Doc,
+    allow_remote: bool,
+) -> std::collections::BTreeMap<String, [usize; 2]> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let remote = if allow_remote { crate::remote_images::cached_sizes(ctx) } else { Default::default() };
+    #[cfg(target_arch = "wasm32")]
+    let _ = allow_remote;
+    let mut sizes = std::collections::BTreeMap::new();
+    walk_inlines(&doc.blocks, 0, &mut |inline| {
+        if let Inline::Image { src, .. } = inline {
+            let size = if is_remote(src) {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    remote.get(src.trim()).copied()
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    None
+                }
+            } else {
+                image_texture(ctx, src).map(|texture| texture.size())
+            };
+            if let Some(size) = size {
+                sizes.insert(src.clone(), size);
+            }
+        }
+    });
+    sizes
+}
+fn permitted_image_texture(
+    ctx: &egui::Context,
+    src: &str,
+    allow_remote: bool,
+) -> Option<egui::TextureHandle> {
+    if is_remote(src) {
+        #[cfg(not(target_arch = "wasm32"))]
+        return crate::remote_images::image_texture(ctx, src, allow_remote);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = allow_remote;
+            return None;
+        }
+    }
+    image_texture(ctx, src)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,5 +1573,65 @@ mod tests {
             _ => false,
         });
         assert!(textured, "the picture is drawn from its texture");
+    }
+    #[test]
+    fn newsletter_images_reflow_when_intrinsic_sizes_arrive() {
+        let doc =
+            mailcraft_html::html_to_doc("<p><img src='cid:photo' width='100%' style='height:auto'></p>");
+        let ctx = egui::Context::default();
+        let mut view = BodyView::default();
+        let rect = |view: &BodyView| {
+            view.layout
+                .as_ref()
+                .unwrap()
+                .display
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Image { rect, .. } => Some((rect.w, rect.h)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            show_doc(ui, &mut view, &doc, false);
+        });
+        output.textures_delta.clear();
+        assert_eq!(rect(&view), (16.0, 16.0));
+        let original_doc_key = view.doc_key;
+        assert!(provide_image(&ctx, "cid:photo", &encoded(image::ImageFormat::Png, 558, 279)));
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            show_doc(ui, &mut view, &doc, false);
+        });
+        output.textures_delta.clear();
+        assert_eq!(rect(&view), (558.0, 279.0));
+        assert_eq!(view.doc_key, original_doc_key);
+    }
+
+    #[test]
+    fn retina_newsletter_image_keeps_authored_width_and_auto_height() {
+        let doc = mailcraft_html::html_to_doc(
+            "<p><img src='cid:photo' width='558' style='width:100%;height:auto'></p>",
+        );
+        let ctx = egui::Context::default();
+        assert!(provide_image(&ctx, "cid:photo", &encoded(image::ImageFormat::Png, 1116, 558)));
+        let mut view = BodyView::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            show_doc(ui, &mut view, &doc, false);
+        });
+        output.textures_delta.clear();
+        let dimensions = view
+            .layout
+            .as_ref()
+            .unwrap()
+            .display
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Image { rect, .. } => Some((rect.w, rect.h)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(dimensions, (558.0, 279.0));
     }
 }

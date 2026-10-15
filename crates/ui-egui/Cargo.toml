@@ -24,6 +24,9 @@ resvg.workspace = true
 # PNG / JPEG / GIF decoding for contact pictures and pictures in message bodies (MIT OR Apache-2.0).
 image.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mailcraft-net.workspace = true
+
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
 mailcraft-testmail.workspace = true

@@ -50,6 +50,8 @@ pub struct LayoutOptions {
     pub base: TextStyle,
     pub default_color: Color,
     pub link_color: Color,
+    /// Decoded image dimensions in pixels, keyed by source. Supplies missing HTML dimensions.
+    pub intrinsic_images: std::collections::BTreeMap<String, [usize; 2]>,
 }
 
 impl Default for LayoutOptions {
@@ -60,6 +62,7 @@ impl Default for LayoutOptions {
             base: TextStyle::default(),
             default_color: Color::BLACK,
             link_color: Color::hex(0x0563c1),
+            intrinsic_images: Default::default(),
         }
     }
 }

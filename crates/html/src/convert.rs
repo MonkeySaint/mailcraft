@@ -63,6 +63,7 @@ struct BoxStyle {
     background: Option<Color>,
     width: Option<f32>,
     height: Option<f32>,
+    width_is_full: bool,
     hidden: bool,
     top_rule: bool,
     border: bool,
@@ -221,6 +222,7 @@ fn box_style(p: &Props, font_px: f32) -> BoxStyle {
         _ => None,
     };
     b.width = dim("width");
+    b.width_is_full = matches!(p.get("width").and_then(|v| css::parse_length(v, font_px)), Some(Length::Percent(percent)) if percent == 100.0);
     b.height = dim("height");
     b.hidden = p.get("display").is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
         || p.get("mso-hide").is_some_and(|v| v.trim().eq_ignore_ascii_case("all"));
@@ -667,7 +669,18 @@ impl Conv<'_> {
             "img" => {
                 if let Some(src) = attr(attrs, "src").and_then(sanitize::safe_image_src) {
                     let alt = attr(attrs, "alt").map(normalize_ws).unwrap_or_default();
-                    sink.push_inline(Inline::Image { src, alt, width: bx.width, height: bx.height }, &c);
+                    // Newsletter images commonly specify a pixel width for retina assets and override it
+                    // with width:100%. Preserve that authored width while the rich model has no percent size.
+                    let width = bx.width.or_else(|| {
+                        if bx.width_is_full {
+                            attr(attrs, "width")
+                                .and_then(|v| v.parse::<f32>().ok())
+                                .filter(|v| v.is_finite() && *v > 0.0)
+                        } else {
+                            None
+                        }
+                    });
+                    sink.push_inline(Inline::Image { src, alt, width, height: bx.height }, &c);
                     sink.last_space = false;
                 }
             }

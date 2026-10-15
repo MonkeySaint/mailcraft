@@ -12,6 +12,8 @@ pub mod backstage;
 pub mod body;
 pub mod chrome;
 pub mod compose;
+#[cfg(not(target_arch = "wasm32"))]
+mod remote_images;
 // The control channel listens on a local TCP socket from background threads; browsers have neither.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
