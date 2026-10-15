@@ -1074,6 +1074,7 @@ fn arb_para_style() -> impl Strategy<Value = ParaStyle> {
             space_after_px: space,
             line_height,
             background: bg.then_some(Color::WHITE),
+            ..Default::default()
         },
     )
 }

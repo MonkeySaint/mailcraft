@@ -42,6 +42,11 @@ pub struct ParaStyle {
     /// Line height multiplier (1.0 = font default).
     pub line_height: Option<f32>,
     pub background: Option<Color>,
+    /// Container geometry, independently of the alignment of its text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_px: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_align: Option<Align>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -285,5 +290,20 @@ fn inlines_to_text(inlines: &[Inline], depth: usize, out: &mut String) {
             Inline::LineBreak => out.push('\n'),
             Inline::Image { alt, .. } => out.push_str(alt),
         }
+    }
+}
+
+#[cfg(test)]
+mod geometry_compatibility_tests {
+    use super::*;
+    #[test]
+    fn old_paragraph_styles_still_deserialize_and_serialize_without_new_fields() {
+        let old = r#"{"align":"Start","indent_px":0.0,"space_before_px":0.0,"space_after_px":0.0,"line_height":null,"background":null}"#;
+        let style: ParaStyle = serde_json::from_str(old).unwrap();
+        assert_eq!(style.width_px, None);
+        assert_eq!(style.box_align, None);
+        let serialized = serde_json::to_value(&style).unwrap();
+        assert!(serialized.get("width_px").is_none());
+        assert!(serialized.get("box_align").is_none());
     }
 }

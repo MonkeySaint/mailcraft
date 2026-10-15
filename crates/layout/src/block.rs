@@ -243,12 +243,29 @@ fn layout_block(
             let sb = ctx.px(style.space_before_px);
             let sa = ctx.px(style.space_after_px);
             let bg = style.background.map(|_| out.placeholder());
-            let inner = frame.inset(ctx.px(style.indent_px)).at_y(frame.y + sb).deeper();
+            let auto_width = if style.box_align.is_some() {
+                blocks_min_max(ctx, blocks, ts, frame.depth).1
+            } else {
+                frame.w
+            };
+            let width =
+                style.width_px.map(|w| ctx.px(w)).filter(|w| *w > 0.0).unwrap_or(auto_width).min(frame.w);
+            let slack = (frame.w - width).max(0.0);
+            let shift = match style.box_align {
+                Some(Align::Center) => slack / 2.0,
+                Some(Align::End) => slack,
+                _ => 0.0,
+            };
+            let box_frame = Frame { x: frame.x + shift, w: width, ..frame };
+            let inner = box_frame.inset(ctx.px(style.indent_px)).at_y(frame.y + sb).deeper();
             let h = layout_blocks(ctx, blocks, ts, path, inner, out);
             if let (Some(i), Some(color)) = (bg, style.background) {
                 out.set(
                     i,
-                    DisplayItem::FillRect { rect: Rect::new(frame.x, frame.y + sb, frame.w, h), color },
+                    DisplayItem::FillRect {
+                        rect: Rect::new(box_frame.x, frame.y + sb, box_frame.w, h),
+                        color,
+                    },
                 );
             }
             sb + h + sa
@@ -713,7 +730,12 @@ fn block_min_max(ctx: &Ctx<'_>, block: &Block, ts: &TextStyle, depth: usize) -> 
         Block::Table { rows, border, width_px } => table_min_max(ctx, rows, *border, *width_px, ts, d),
         Block::Rule => (0.0, 0.0),
         Block::Container { style, blocks } => {
-            plus(blocks_min_max(ctx, blocks, ts, d), ctx.px(style.indent_px))
+            let (min, max) = plus(blocks_min_max(ctx, blocks, ts, d), ctx.px(style.indent_px));
+            if let Some(width) = style.width_px.map(|w| ctx.px(w)).filter(|w| *w > 0.0) {
+                (min.min(width), width)
+            } else {
+                (min, max)
+            }
         }
     }
 }
