@@ -12,7 +12,7 @@
 //!   find hits ([`BodyView::marks`], from [`find_all`]) are painted on a highlight colour.
 //! - Where [`BodyView::context_menu`] is on (reading pane, read windows), right-click offers Copy, Select All,
 //!   Select Text With Similar Formatting and Find… (reported in [`BodyView::find_requested`]).
-//! - Images: `data:image/…;base64` pictures are decoded (PNG, JPEG, GIF; [`decode_image`], at most
+//! - Images: `data:image/…;base64` pictures are decoded (PNG, JPEG, GIF, WebP; [`decode_image`], at most
 //!   [`MAX_IMAGE_SIDE`] pixels a side) and drawn in their box; `cid:` pictures are drawn once the owner hands
 //!   over the attachment bytes with [`provide_image`]. Anything else (undecodable data, unknown `cid:`,
 //!   `http(s):`, which has no loader) shows a framed placeholder with its alt text; remote pictures are
@@ -1016,7 +1016,7 @@ const MAX_DECODE_ALLOC: u64 = 160 * 1024 * 1024;
 /// Most decoded pictures kept as textures per egui context (oldest dropped first).
 pub const MAX_IMAGE_CACHE: usize = 64;
 
-/// Decodes a PNG, JPEG or GIF picture (first frame) into an image; `None` for other formats, damaged data,
+/// Decodes a PNG, JPEG, GIF or WebP picture (first frame) into an image; `None` for other formats, damaged data,
 /// an empty picture, or one beyond [`MAX_IMAGE_BYTES`] / [`MAX_IMAGE_SIDE`]. Never panics: the decoders run
 /// with size limits, and a panic inside one is caught and treated as undecodable.
 pub fn decode_image(data: &[u8]) -> Option<egui::ColorImage> {
@@ -1024,7 +1024,13 @@ pub fn decode_image(data: &[u8]) -> Option<egui::ColorImage> {
         return None;
     }
     let format = image::guess_format(data).ok()?;
-    if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::Gif) {
+    if !matches!(
+        format,
+        image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP
+    ) {
         return None;
     }
     std::panic::catch_unwind(|| decode_limited(data, format)).ok().flatten()
@@ -1422,8 +1428,13 @@ mod tests {
     }
 
     #[test]
-    fn png_jpeg_and_gif_pictures_decode() {
-        for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg, image::ImageFormat::Gif] {
+    fn png_jpeg_gif_and_webp_pictures_decode() {
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Gif,
+            image::ImageFormat::WebP,
+        ] {
             let img = decode_image(&encoded(format, 5, 3)).unwrap_or_else(|| panic!("{format:?}"));
             assert_eq!(img.size, [5, 3], "{format:?}");
         }
