@@ -523,6 +523,79 @@ fn status_bar_shows_outbox_offline_and_retry() {
     assert_eq!(h.state().s.mailbox.mail.get(&ItemId(item.0)).map(|m| m.folder), Some(outbox));
 }
 
+/// Puts the status of account `id` in the middle of a first download (as the worker reports it).
+fn downloading(app: &mut App, id: u32) {
+    let d = mailcraft_engine::sync::SyncProgress {
+        folder: "Inbox".into(),
+        folder_index: 3,
+        folder_count: 12,
+        done: 1240,
+        total: 5000,
+        headers: false,
+    };
+    let st = &mut app.s.sync.status;
+    st.busy = true;
+    st.text = d.text();
+    st.detail = Some(d.clone());
+    let row = st.accounts.iter_mut().find(|a| a.account == id).unwrap();
+    row.busy = true;
+    row.progress = d.text();
+    row.detail = Some(d);
+}
+
+fn status_harness_at(app: App, width: f32) -> Harness<'static, App> {
+    let mut h = Harness::builder().with_size(egui::vec2(width, 40.0)).build_ui_state(
+        move |ui, app: &mut App| {
+            let frame = app.frame_for(width, 900.0);
+            ui.horizontal(|ui| crate::chrome::status_bar(ui, app, &frame));
+        },
+        app,
+    );
+    h.run_steps(2);
+    h
+}
+
+#[test]
+fn status_bar_and_progress_window_count_the_first_download() {
+    let full = "Downloading Inbox: 1,240 of 5,000 messages (folder 3 of 12)";
+    let mut app = sample_app();
+    let id = add_local_imap(&mut app, "pat@example.net");
+    app.s.poll_sync();
+    downloading(&mut app, id);
+    let h = status_harness(app);
+    assert!(h.query_by_label(full).is_some(), "the status bar says how far the download has got");
+
+    // A narrow window keeps the counts rather than cutting them off.
+    let mut app = sample_app();
+    let id = add_local_imap(&mut app, "pat@example.net");
+    app.s.poll_sync();
+    downloading(&mut app, id);
+    let h = status_harness_at(app, 600.0);
+    assert!(h.query_by_label(full).is_none());
+    assert!(h.query_by_label("Inbox: 1,240 of 5,000").is_some());
+
+    // Send/Receive Progress shows the same counts on the account's row.
+    let mut app = sample_app();
+    let id = add_local_imap(&mut app, "pat@example.net");
+    app.s.poll_sync();
+    app.run("sendReceive.showProgress", json!({})).unwrap();
+    downloading(&mut app, id);
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["sendReceiveProgress"]);
+    assert!(h.query_by_label(full).is_some());
+    assert!(h.query_by_label("0 of 1 tasks have completed successfully").is_some());
+    // Once the run is over the counts go away.
+    h.state_mut().s.sync.status.accounts.iter_mut().for_each(|a| {
+        a.busy = false;
+        a.detail = None;
+        a.progress.clear();
+    });
+    h.state_mut().s.sync.status.busy = false;
+    h.state_mut().s.sync.status.detail = None;
+    step(&mut h);
+    assert!(h.query_by_label(full).is_none());
+}
+
 #[test]
 fn status_bar_is_quiet_without_email_accounts() {
     let app = sample_app();

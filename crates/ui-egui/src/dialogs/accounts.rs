@@ -1566,11 +1566,24 @@ fn progress(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                     } else {
                                         "Not started".to_owned()
                                     };
-                                    ui.horizontal(|ui| {
-                                        if a.busy {
-                                            ui.add(egui::Spinner::new().size(12.0));
+                                    // While downloading: the counts, and a bar when the total is known.
+                                    let fraction =
+                                        a.detail.as_ref().filter(|_| a.busy).and_then(|d| d.fraction());
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            if a.busy {
+                                                ui.add(egui::Spinner::new().size(12.0));
+                                            }
+                                            ui.label(text);
+                                        });
+                                        if let Some(f) = fraction {
+                                            ui.add(
+                                                egui::ProgressBar::new(f)
+                                                    .desired_width(260.0)
+                                                    .desired_height(6.0)
+                                                    .fill(app.theme.accent),
+                                            );
                                         }
-                                        ui.label(text);
                                     });
                                     ui.label(if a.outbox > 0 { a.outbox.to_string() } else { String::new() });
                                     ui.end_row();

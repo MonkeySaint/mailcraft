@@ -420,3 +420,46 @@ fn results_of_a_removed_account_never_reach_a_new_one() {
     assert!(find(&s, role(&s, bob, FolderRole::Inbox), "For Bob").is_some());
     assert!(!s.mailbox.mail.values().any(|m| m.subject == "For Alice only"));
 }
+
+#[test]
+fn first_sync_status_counts_the_messages() {
+    let srv = servers();
+    for i in 0..180 {
+        let raw = message(BOB, ALICE, &format!("Bulk {i}"), &format!("bulk-{i}"));
+        srv.seed_message(ALICE, "INBOX", &raw, &[]).unwrap();
+    }
+    let mut s = session();
+    let acct = add_alice(&mut s, &srv, ALICE_PW);
+    run(&mut s, "sendReceive.all", json!({}));
+    // Watch the status as the UI does: every report seen counts towards the 180 messages of the Inbox.
+    let end = std::time::Instant::now() + WAIT;
+    let mut seen = Vec::new();
+    while s.sync_busy() {
+        s.poll_sync();
+        let st = s.sync_status();
+        if let Some(d) = st.detail.clone() {
+            assert!(st.busy && st.text == d.text(), "{st:?}");
+            seen.push(d);
+        }
+        assert!(std::time::Instant::now() < end, "timed out: {:?}", s.sync_status());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    settle(&mut s);
+    for d in seen.iter().filter(|d| d.folder == "Inbox" && d.total > 0) {
+        assert_eq!(d.total, 180, "{d:?}");
+        assert!(d.done <= 180 && d.folder_index == 1 && d.folder_count >= 1, "{d:?}");
+    }
+    assert!(seen.windows(2).all(|w| w[0].folder_index <= w[1].folder_index), "folders in order: {seen:?}");
+    let inbox = role(&s, acct, FolderRole::Inbox);
+    assert_eq!(
+        s.mailbox.mail.values().filter(|m| m.folder == inbox && m.subject.starts_with("Bulk ")).count(),
+        180
+    );
+    let st = s.sync_status();
+    assert!(st.detail.is_none() && st.accounts.iter().all(|a| a.detail.is_none()), "{st:?}");
+    assert_eq!(st.text, "All folders are up to date.");
+    // The control channel and MCP get the same fields (empty once the run is over).
+    let v = run(&mut s, "sendReceive.status", json!({}));
+    assert!(v["detail"].is_null() && v["accounts"][0]["detail"].is_null(), "{v}");
+    assert!(v.as_object().unwrap().contains_key("detail"), "{v}");
+}

@@ -115,8 +115,22 @@ pub struct SyncDelta {
     pub vanished: Vec<u32>,
     /// More new messages are waiting (see [`ImapSettings::max_new_per_sync`]).
     pub more: bool,
+    /// New messages the server had for this folder when the sync started, including those left for later
+    /// calls by [`ImapSettings::max_new_per_sync`] (so `waiting - new.len()` are still to come).
+    pub waiting: usize,
     /// State to pass to the next sync.
     pub state: FolderState,
+}
+
+/// How far a folder sync has got: reported once the new messages are counted and after every batch of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FetchProgress {
+    /// New messages downloaded so far by this call.
+    pub done: usize,
+    /// New messages this call downloads (at most [`ImapSettings::max_new_per_sync`]).
+    pub batch: usize,
+    /// New messages on the server, including those left for later calls (see [`SyncDelta::waiting`]).
+    pub waiting: usize,
 }
 
 /// One IMAP account, connecting lazily and reconnecting after connection loss.
@@ -261,19 +275,32 @@ impl ImapAccount {
 
     /// Brings a folder up to date relative to `since` (use `FolderState::default()` the first time).
     pub fn sync_folder(&mut self, name: &str, since: &FolderState) -> Result<SyncDelta> {
-        let batch = self.settings.fetch_batch.max(1);
-        let cap = self.settings.max_new_per_sync.max(1);
-        let window = self.settings.first_sync_since;
-        self.with_client(true, |c| sync_once(c, name, since, batch, cap, false, window))
+        self.sync_folder_with_progress(name, since, false, &mut |_| {})
     }
 
     /// [`Self::sync_folder`], but new messages come with their header only (`BODY.PEEK[HEADER]`, marked
     /// [`NewMessage::headers_only`]); download the rest later with [`Self::fetch_messages`].
     pub fn sync_folder_headers(&mut self, name: &str, since: &FolderState) -> Result<SyncDelta> {
+        self.sync_folder_with_progress(name, since, true, &mut |_| {})
+    }
+
+    /// [`Self::sync_folder`] (or [`Self::sync_folder_headers`] when `headers_only`), calling `progress` once
+    /// the new messages are counted (the count comes with the search that finds them: no extra round trip)
+    /// and after every batch of [`ImapSettings::fetch_batch`] messages. After a lost connection the sync
+    /// starts over, and so does the count.
+    pub fn sync_folder_with_progress(
+        &mut self,
+        name: &str,
+        since: &FolderState,
+        headers_only: bool,
+        progress: &mut dyn FnMut(FetchProgress),
+    ) -> Result<SyncDelta> {
         let batch = self.settings.fetch_batch.max(1);
         let cap = self.settings.max_new_per_sync.max(1);
         let window = self.settings.first_sync_since;
-        self.with_client(true, |c| sync_once(c, name, since, batch, cap, true, window))
+        self.with_client(true, |c| {
+            sync_once(c, name, since, Limits { batch, cap, headers_only, window }, &mut *progress)
+        })
     }
 
     /// Downloads whole messages by UID (for messages first downloaded as headers). UIDs no longer on the
@@ -476,15 +503,23 @@ pub fn months_before(now: i64, months: u32) -> (i64, u8, u8) {
     (year, month, day)
 }
 
-fn sync_once(
-    c: &mut ImapClient,
-    name: &str,
-    since: &FolderState,
+/// How one [`sync_once`] downloads.
+#[derive(Clone, Copy)]
+struct Limits {
     batch: usize,
     cap: usize,
     headers_only: bool,
     window: Option<(i64, u8, u8)>,
+}
+
+fn sync_once(
+    c: &mut ImapClient,
+    name: &str,
+    since: &FolderState,
+    limits: Limits,
+    progress: &mut dyn FnMut(FetchProgress),
 ) -> Result<SyncDelta> {
+    let Limits { batch, cap, headers_only, window } = limits;
     let info = c.select(name)?;
     let mut delta = SyncDelta::default();
     let mut since = since.clone();
@@ -515,10 +550,14 @@ fn sync_once(
             .collect()
     };
     new_uids.sort_unstable();
+    new_uids.dedup();
+    delta.waiting = new_uids.len();
     if new_uids.len() > cap {
         new_uids.truncate(cap);
         delta.more = true;
     }
+    let mut counts = FetchProgress { done: 0, batch: new_uids.len(), waiting: delta.waiting };
+    progress(counts);
 
     // Changes to known messages.
     let mut vanished: BTreeSet<u32> = BTreeSet::new();
@@ -571,7 +610,8 @@ fn sync_once(
     delta.changed.dedup_by_key(|(u, _)| *u);
 
     // Download new messages.
-    for chunk in SeqSet::chunks(&new_uids, batch) {
+    for ids in new_uids.chunks(batch) {
+        let chunk = SeqSet::from_ids(ids);
         let items = if headers_only { HEADER_ITEMS } else { BODY_ITEMS };
         for f in c.uid_fetch(&chunk, items)? {
             let raw = if headers_only { f.header } else { f.body };
@@ -588,6 +628,8 @@ fn sync_once(
                 headers_only,
             });
         }
+        counts.done = counts.done.saturating_add(ids.len()).min(counts.batch);
+        progress(counts);
     }
     delta.new.sort_by_key(|m| m.uid);
     delta.new.dedup_by_key(|m| m.uid);

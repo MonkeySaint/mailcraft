@@ -1162,11 +1162,20 @@ fn sync_status(ui: &mut Ui, app: &mut App, frame: &Frame) {
             app.run(retry, json!({}));
         }
     } else if !st.text.is_empty() {
-        let r = ui
-            .add(egui::Label::new(truncate_status(&st.text, frame.width)).sense(Sense::click()))
-            .on_hover_text("Send/Receive Progress");
+        let text = match st.detail.as_ref().filter(|_| st.busy) {
+            Some(d) => progress_status(d, &st.text, frame.width),
+            None => truncate_status(&st.text, frame.width),
+        };
+        let tip = if text == st.text { "Send/Receive Progress" } else { st.text.as_str() };
+        let r = ui.add(egui::Label::new(text).sense(Sense::click())).on_hover_text(tip);
         if r.clicked() {
             app.run("sendReceive.showProgress", json!({}));
+        }
+        if let Some(f) =
+            st.detail.as_ref().filter(|_| st.busy && frame.width >= 1000.0).and_then(|d| d.fraction())
+        {
+            let bar = egui::ProgressBar::new(f).desired_width(90.0).desired_height(8.0).fill(theme.accent);
+            ui.add(bar).on_hover_text(st.text.as_str());
         }
     }
     if outbox > 0 && error.is_none() {
@@ -1182,15 +1191,45 @@ fn sync_status(ui: &mut Ui, app: &mut App, frame: &Frame) {
     }
 }
 
+/// Download progress for the status bar: the whole text ("Downloading Inbox: 1,240 of 5,000 messages (folder
+/// 3 of 12)") when it fits, else the counts alone ("Inbox: 1,240 of 5,000"), so a narrow window still shows
+/// how far the download has got.
+fn progress_status(d: &mailcraft_engine::sync::SyncProgress, full: &str, width: f32) -> String {
+    let fits = truncate_status(full, width);
+    if fits == full || d.total == 0 {
+        return fits;
+    }
+    let counts = format!(
+        "{} of {}",
+        mailcraft_engine::sync::grouped(d.done.min(d.total)),
+        mailcraft_engine::sync::grouped(d.total)
+    );
+    if d.folder.is_empty() {
+        return truncate_status(&counts, width);
+    }
+    // A long folder name gives way to the counts.
+    let room = status_max(width).saturating_sub(counts.chars().count().saturating_add(2)).max(4);
+    format!("{}: {counts}", truncate_status_to(&d.folder, room))
+}
+
 /// Status text cut to fit narrow windows (char-safe).
 fn truncate_status(text: &str, width: f32) -> String {
-    let max = if width < 700.0 {
+    truncate_status_to(text, status_max(width))
+}
+
+/// Characters of status text that fit a window `width` px wide.
+fn status_max(width: f32) -> usize {
+    if width < 700.0 {
         28
     } else if width < 1000.0 {
         60
     } else {
         120
-    };
+    }
+}
+
+/// `text` cut to `max` characters, ending in "…" when cut (char-safe).
+fn truncate_status_to(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }

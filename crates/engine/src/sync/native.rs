@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 use mailcraft_net::oauth::{OAuthProvider, TokenSet};
 use mailcraft_net::pop3::{Pop3Client, Pop3Settings};
 use mailcraft_net::smtp::{SmtpClient, SmtpSettings};
-use mailcraft_net::sync::{FolderState, ImapAccount, ImapSettings, NewMessage, RemoteFolder, SyncDelta};
+use mailcraft_net::sync::{
+    FetchProgress, FolderState, ImapAccount, ImapSettings, NewMessage, RemoteFolder, SyncDelta,
+};
 use mailcraft_net::{ConnectOptions, Credentials, NetError};
 
 use super::*;
@@ -56,6 +58,27 @@ pub(super) const POP3_PREFIX: &str = "pop3:";
 const JMAP_PING: Duration = Duration::from_secs(60);
 /// How long one wait for JMAP push events lasts before the worker looks at its messages again.
 const JMAP_PUSH_SLICE: Duration = Duration::from_millis(250);
+/// Least time between two progress reports of a download (the first and the last always go out).
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Spaces out progress reports so a fast download does not flood the session with them.
+#[derive(Default)]
+pub(super) struct Throttle {
+    last: Option<Instant>,
+}
+
+impl Throttle {
+    /// True when a report should go out now (always when `force`).
+    pub(super) fn due(&mut self, force: bool) -> bool {
+        let now = Instant::now();
+        if force || self.last.is_none_or(|t| now.saturating_duration_since(t) >= PROGRESS_INTERVAL) {
+            self.last = Some(now);
+            return true;
+        }
+        false
+    }
+}
+
 /// Bytes a run must download before its transfer rate counts (smaller downloads mostly measure latency).
 const MIN_RATE_SAMPLE: u64 = 32 * 1024;
 
@@ -170,6 +193,7 @@ pub(super) enum Event {
     Progress {
         account: AccountId,
         text: String,
+        detail: Option<SyncProgress>,
     },
     OpDone {
         account: AccountId,
@@ -261,6 +285,14 @@ pub(super) enum Event {
 }
 
 impl Event {
+    /// A step without counts ("Connecting…").
+    pub(super) fn step(account: AccountId, text: impl Into<String>) -> Event {
+        Event::Progress { account, text: text.into(), detail: None }
+    }
+    /// A step with folder and message counts; the text says them.
+    pub(super) fn counted(account: AccountId, detail: &SyncProgress) -> Event {
+        Event::Progress { account, text: detail.text(), detail: Some(detail.clone()) }
+    }
     fn account(&self) -> AccountId {
         match self {
             Event::Progress { account, .. }
@@ -780,6 +812,7 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
     let run = s.sync.runs.entry(id).or_default();
     run.busy = Some(inflight);
     run.progress = progress.into();
+    run.detail = None;
     run.error = None;
     Ok(true)
 }
@@ -1196,7 +1229,7 @@ fn run_imap(
             cancel.store(true, Ordering::SeqCst);
         }
     };
-    let progress = |t: &str| send(Event::Progress { account, text: t.to_owned() });
+    let progress = |t: &str| send(Event::step(account, t));
     let cancelled = || cancel.load(Ordering::SeqCst);
     if slot.as_ref().is_some_and(|a| a.settings() != &settings)
         && let Some(mut old) = slot.take()
@@ -1293,22 +1326,43 @@ fn run_imap(
     }
     // 5. Folders.
     let Some(rcv) = &job.receive else { return error };
-    for (name, display) in todo {
+    let folder_count = todo.len();
+    for (i, (name, display)) in todo.into_iter().enumerate() {
         if cancelled() {
             return Some("Send/Receive was cancelled.".into());
         }
-        progress(&format!("Updating {display}…"));
+        // "Updating Inbox (folder 1 of 12)…", then "Downloading Inbox: 50 of 5,000 messages (…)" as batches
+        // arrive. The total is what the server has beyond the messages downloaded so far (the search that
+        // finds new mail counts it), so it holds across the rounds a large folder takes.
+        let mut detail = SyncProgress {
+            folder: display,
+            folder_index: i.saturating_add(1),
+            folder_count,
+            headers: job.headers_only,
+            ..SyncProgress::default()
+        };
+        send(Event::counted(account, &detail));
+        let mut throttle = Throttle::default();
+        let mut base = 0u64;
         let mut since = rcv.states.get(&name).cloned().unwrap_or_default();
         for _ in 0..MAX_ROUNDS_PER_FOLDER {
             let t0 = Instant::now();
-            let res = if job.headers_only {
-                imap.sync_folder_headers(&name, &since)
-            } else {
-                imap.sync_folder(&name, &since)
+            let mut report = |p: FetchProgress| {
+                let total = base.saturating_add(u64::try_from(p.waiting).unwrap_or(u64::MAX));
+                if total == 0 {
+                    return;
+                }
+                detail.done = base.saturating_add(u64::try_from(p.done).unwrap_or(u64::MAX)).min(total);
+                detail.total = total;
+                if throttle.due(p.done == 0 || p.done >= p.batch) {
+                    send(Event::counted(account, &detail));
+                }
             };
+            let res = imap.sync_folder_with_progress(&name, &since, job.headers_only, &mut report);
             match res {
                 Ok(delta) => {
                     meter.add(raw_len(&delta.new), t0.elapsed());
+                    base = base.saturating_add(u64::try_from(delta.new.len()).unwrap_or(u64::MAX));
                     let more = delta.more;
                     since = delta.state.clone();
                     let fresh: Vec<u32> = delta.new.iter().map(|m| m.uid).collect();
@@ -1364,7 +1418,7 @@ fn run_pop3(
             cancel.store(true, Ordering::SeqCst);
         }
     };
-    let progress = |t: &str| send(Event::Progress { account, text: t.to_owned() });
+    let progress = |t: &str| send(Event::step(account, t));
     let cancelled = || cancel.load(Ordering::SeqCst);
     let mut error: Option<String> = None;
     // The Outbox first: SMTP works even when the POP3 server does not.
@@ -1426,11 +1480,22 @@ fn run_pop3(
                 .filter(|(_, u)| !p.known.contains(u) && !deleted.contains(u))
                 .take(MAX_POP3_PER_RUN)
                 .collect();
+            // "Downloading Inbox: 120 of 400 messages" (the count comes with UIDL, no extra command).
+            let mut detail = SyncProgress {
+                folder: "Inbox".into(),
+                total: u64::try_from(fresh.len()).unwrap_or(u64::MAX),
+                headers: p.headers_only,
+                ..SyncProgress::default()
+            };
+            let mut throttle = Throttle::default();
             for (i, (n, u)) in fresh.iter().enumerate() {
                 if cancelled() {
                     return Err(NetError::Invalid("Send/Receive was cancelled.".into()));
                 }
-                progress(&format!("Receiving message {} of {}…", i.saturating_add(1), fresh.len()));
+                detail.done = u64::try_from(i).unwrap_or(u64::MAX);
+                if throttle.due(i == 0) {
+                    send(Event::counted(account, &detail));
+                }
                 let t0 = Instant::now();
                 let raw = if p.headers_only { client.top(*n, 0)? } else { client.retr(*n)? };
                 meter.add(raw.len(), t0.elapsed());
@@ -1441,6 +1506,10 @@ fn run_pop3(
                     size: sizes.get(n).copied(),
                     headers_only: p.headers_only,
                 });
+            }
+            if !fresh.is_empty() {
+                detail.done = detail.total;
+                send(Event::counted(account, &detail));
             }
         }
         Ok((present, deleted))
@@ -1480,7 +1549,7 @@ fn send_outgoing(
         }
         return;
     };
-    send(Event::Progress { account, text: "Sending…".into() });
+    send(Event::step(account, "Sending…"));
     let mut connected = SmtpClient::connect(&set);
     // An expired OAuth token shows as a sign-in failure: renew it once and sign in again.
     if job.conn.oauth.is_some() && matches!(connected, Err(NetError::Auth(_))) {
@@ -1507,10 +1576,7 @@ fn send_outgoing(
                 if cancel.load(Ordering::SeqCst) {
                     break;
                 }
-                send(Event::Progress {
-                    account,
-                    text: format!("Sending message {} of {n}…", i.saturating_add(1)),
-                });
+                send(Event::step(account, format!("Sending message {} of {n}…", i.saturating_add(1))));
                 let rcpts: Vec<&str> = m.rcpts.iter().map(String::as_str).collect();
                 let result = c.send(&m.from, &rcpts, &m.raw).map_err(|e| e.to_string());
                 send(Event::Sent { account, item: m.item, result });
@@ -1825,7 +1891,11 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
     let mut new_inbox: Vec<ItemId> = Vec::new();
     for ev in events {
         match ev {
-            Event::Progress { account, text } => s.sync.runs.entry(account).or_default().progress = text,
+            Event::Progress { account, text, detail } => {
+                let run = s.sync.runs.entry(account).or_default();
+                run.progress = text;
+                run.detail = detail;
+            }
             Event::OpDone { account, op, result } => op_done(s, account, op, result),
             Event::Folders { account, folders } => apply_folders(s, account, folders),
             Event::Delta { account, name, delta } => apply_delta(s, account, &name, delta, &mut new_inbox),
@@ -2238,6 +2308,7 @@ fn run_done(s: &mut Session, account: AccountId, error: Option<String>) {
     let run = s.sync.runs.entry(account).or_default();
     run.busy = None;
     run.progress.clear();
+    run.detail = None;
     match error {
         Some(e) => {
             run.error = Some(e);
@@ -2860,5 +2931,179 @@ mod tests {
         let safe = s.run("mail.junk", &json!({"action": "get"})).unwrap();
         let safe = safe.to_string();
         assert!(safe.contains("bo@example.org") && safe.contains("cy@example.org"), "{safe}");
+    }
+
+    // -----------------------------------------------------------------------------------------------
+    // Download progress against the local test servers (127.0.0.1, synthetic mail)
+
+    const PROGRESS_USER: &str = "alice@example.com";
+    const PROGRESS_PW: &str = "alice-progress-pw";
+
+    fn progress_servers() -> mailcraft_testmail::TestServers {
+        mailcraft_testmail::TestServers::start(mailcraft_testmail::Config {
+            users: vec![(PROGRESS_USER.into(), PROGRESS_PW.into())],
+            add_trace_headers: false,
+            ..mailcraft_testmail::Config::default()
+        })
+        .unwrap()
+    }
+
+    fn seed(srv: &mailcraft_testmail::TestServers, mailbox: &str, n: usize) {
+        for i in 0..n {
+            let raw = format!(
+                "From: bob@example.org\r\nTo: {PROGRESS_USER}\r\nSubject: Note {mailbox} {i}\r\n\
+                 Date: Mon, 5 Oct 2026 10:00:00 +0000\r\nMessage-ID: <{mailbox}-{i}@example.org>\r\n\r\nHi\r\n"
+            );
+            srv.seed_message(PROGRESS_USER, mailbox, raw.as_bytes(), &[]).unwrap();
+        }
+    }
+
+    fn progress_session(
+        srv: &mailcraft_testmail::TestServers,
+        incoming: Value,
+        kind: &str,
+    ) -> (Session, AccountId) {
+        let mut s = Session::new(Mailbox::new_local("Local Folders"));
+        s.view.auto_send_receive_minutes = 0;
+        let r = s
+            .run(
+                "accounts.add",
+                &json!({"kind": kind, "address": PROGRESS_USER, "incoming": incoming, "password": PROGRESS_PW,
+                    "outgoing": {"host": "127.0.0.1", "port": srv.smtp_port, "security": "starttls",
+                        "extraRootPem": srv.cert_pem}}),
+            )
+            .unwrap();
+        (s, AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap()))
+    }
+
+    /// Runs a full send/receive, keeping every event the worker sends until its run ends, then hands them to
+    /// the session as usual. Returns the counted progress reports in order.
+    fn sync_watching(s: &mut Session, id: AccountId) -> Vec<(String, SyncProgress)> {
+        assert_eq!(s.send_receive(&[id], Plan::all()).unwrap(), 1);
+        let mut events = Vec::new();
+        loop {
+            let (serial, e) = s.sync.rt.rx.recv_timeout(Duration::from_secs(30)).expect("worker event");
+            let done = matches!(e, Event::Done { .. });
+            events.push((serial, e));
+            if done {
+                break;
+            }
+        }
+        let counted = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::Progress { text, detail: Some(d), .. } => Some((text.clone(), d.clone())),
+                _ => None,
+            })
+            .collect();
+        for e in events {
+            s.sync.rt.tx.send(e).unwrap();
+        }
+        assert!(s.wait_for_sync(Duration::from_secs(30)), "{:?}", s.sync_status());
+        assert!(s.sync_status().detail.is_none(), "no counts once the run is over");
+        assert!(s.sync_status().accounts.iter().all(|a| a.detail.is_none()));
+        counted
+    }
+
+    fn assert_counts_climb(reports: &[&SyncProgress], total: u64) {
+        assert!(!reports.is_empty());
+        assert!(reports.iter().all(|d| d.total == total && d.done <= d.total), "{reports:?}");
+        assert!(reports.windows(2).all(|w| w[0].done <= w[1].done), "{reports:?}");
+        assert_eq!(reports.first().map(|d| d.done), Some(0), "the count shows before the first batch");
+        assert_eq!(reports.last().map(|d| d.done), Some(total), "the count reaches the total");
+    }
+
+    #[test]
+    fn imap_first_sync_reports_folder_and_message_counts() {
+        let srv = progress_servers();
+        seed(&srv, "INBOX", 130);
+        srv.create_mailbox(PROGRESS_USER, "Projects", None).unwrap();
+        seed(&srv, "Projects", 3);
+        let incoming = json!({"host": "127.0.0.1", "port": srv.imaps_port, "security": "tls",
+            "extraRootPem": srv.cert_pem});
+        let (mut s, id) = progress_session(&srv, incoming, "imap");
+        let counted = sync_watching(&mut s, id);
+
+        let inbox: Vec<&SyncProgress> =
+            counted.iter().map(|(_, d)| d).filter(|d| d.folder == "Inbox" && d.total > 0).collect();
+        assert_counts_climb(&inbox, 130);
+        let folders = inbox[0].folder_count;
+        assert!(folders >= 2, "{counted:?}");
+        assert!(inbox.iter().all(|d| d.folder_index == 1 && d.folder_count == folders));
+        assert!(
+            counted.iter().any(|(t, _)| t == &format!("Downloading Inbox: 130 of 130 messages (folder 1 of {folders})")),
+            "{counted:?}"
+        );
+        assert!(counted.iter().any(|(t, _)| t == &format!("Updating Inbox (folder 1 of {folders})…")));
+        let projects: Vec<&SyncProgress> =
+            counted.iter().map(|(_, d)| d).filter(|d| d.folder == "Projects" && d.total > 0).collect();
+        assert_counts_climb(&projects, 3);
+        assert!(projects.iter().all(|d| d.folder_index > 1 && d.folder_index <= folders));
+
+        let inbox_id = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+        assert_eq!(s.mailbox.mail.values().filter(|m| m.folder == inbox_id).count(), 130);
+        assert_eq!(s.sync_status().text, "All folders are up to date.");
+
+        // The next run finds nothing new: no message counts, only the folder steps.
+        let again = sync_watching(&mut s, id);
+        assert!(again.iter().all(|(_, d)| d.total == 0), "{again:?}");
+    }
+
+    #[test]
+    fn pop3_and_jmap_first_sync_report_message_counts() {
+        let srv = progress_servers();
+        seed(&srv, "INBOX", 12);
+        let incoming = json!({"host": "127.0.0.1", "port": srv.pop3s_port, "security": "tls",
+            "extraRootPem": srv.cert_pem});
+        let (mut s, id) = progress_session(&srv, incoming, "pop3");
+        let counted = sync_watching(&mut s, id);
+        let reports: Vec<&SyncProgress> = counted.iter().map(|(_, d)| d).collect();
+        assert_counts_climb(&reports, 12);
+        assert!(reports.iter().all(|d| d.folder == "Inbox" && d.folder_count == 0));
+        assert!(counted.iter().any(|(t, _)| t == "Downloading Inbox: 12 of 12 messages"), "{counted:?}");
+
+        let srv = progress_servers();
+        seed(&srv, "INBOX", 150);
+        let (mut s, id) =
+            progress_session(&srv, json!({"host": srv.jmap_url(), "extraRootPem": srv.cert_pem}), "jmap");
+        let counted = sync_watching(&mut s, id);
+        let reports: Vec<&SyncProgress> = counted.iter().map(|(_, d)| d).collect();
+        assert_counts_climb(&reports, 150);
+        assert!(counted.iter().any(|(t, _)| t == "Downloading 150 of 150 messages"), "{counted:?}");
+        assert_eq!(s.mailbox.mail.values().filter(|m| m.subject.starts_with("Note INBOX")).count(), 150);
+    }
+
+    #[test]
+    fn progress_text_and_throttle() {
+        let mut d = SyncProgress {
+            folder: "Inbox".into(),
+            folder_index: 3,
+            folder_count: 12,
+            done: 1240,
+            total: 5000,
+            headers: false,
+        };
+        assert_eq!(d.text(), "Downloading Inbox: 1,240 of 5,000 messages (folder 3 of 12)");
+        assert_eq!(d.fraction(), Some(0.248));
+        d.headers = true;
+        d.folder_count = 1;
+        d.done = 9_000;
+        assert_eq!(d.text(), "Downloading Inbox: 5,000 of 5,000 headers", "done never passes the total");
+        d.total = 0;
+        d.folder_count = 12;
+        assert_eq!(d.text(), "Updating Inbox (folder 3 of 12)…");
+        assert_eq!(d.fraction(), None);
+        let j = SyncProgress { done: 7, total: 1_234_567, ..SyncProgress::default() };
+        assert_eq!(j.text(), "Downloading 7 of 1,234,567 messages");
+        assert_eq!(SyncProgress::default().text(), "Updating messages…");
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1000), "1,000");
+        assert_eq!(grouped(u64::MAX), "18,446,744,073,709,551,615");
+
+        let mut t = Throttle::default();
+        assert!(t.due(false), "the first report goes out");
+        assert!(!t.due(false), "the next waits");
+        assert!(t.due(true), "forced reports always go out");
     }
 }

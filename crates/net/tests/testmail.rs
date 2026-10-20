@@ -416,3 +416,36 @@ fn idle_once_reports_new_mail_and_stops_on_request() {
     assert!(acc.idle_once("INBOX", Duration::from_secs(20), None).unwrap());
     let _srv = seeder.join().unwrap();
 }
+
+#[test]
+fn sync_reports_download_progress_per_batch() {
+    use mailcraft_net::sync::FetchProgress;
+    let s = servers(Config::default());
+    for i in 0..7 {
+        s.seed_message(USER, "INBOX", &msg(&format!("p{i}"), "x"), &[]).unwrap();
+    }
+    // Batches of 2, at most 5 per call: 7 waiting, 5 now and 2 next time.
+    let mut set = account(&s, Security::Tls).settings().clone();
+    set.max_new_per_sync = 5;
+    let mut acc = ImapAccount::new(set);
+    let mut seen: Vec<FetchProgress> = Vec::new();
+    let d1 = acc
+        .sync_folder_with_progress("INBOX", &FolderState::default(), false, &mut |p| seen.push(p))
+        .unwrap();
+    let done: Vec<usize> = seen.iter().map(|p| p.done).collect();
+    assert_eq!(done, [0, 2, 4, 5]);
+    assert!(seen.iter().all(|p| p.batch == 5 && p.waiting == 7), "{seen:?}");
+    assert_eq!((d1.new.len(), d1.waiting, d1.more), (5, 7, true));
+
+    seen.clear();
+    let d2 = acc.sync_folder_with_progress("INBOX", &d1.state, true, &mut |p| seen.push(p)).unwrap();
+    assert_eq!(seen.last(), Some(&FetchProgress { done: 2, batch: 2, waiting: 2 }));
+    assert_eq!((d2.new.len(), d2.waiting, d2.more), (2, 2, false));
+    assert!(d2.new.iter().all(|m| m.headers_only));
+
+    // Up to date: one report, nothing waiting.
+    seen.clear();
+    let d3 = acc.sync_folder_with_progress("INBOX", &d2.state, false, &mut |p| seen.push(p)).unwrap();
+    assert_eq!(seen, [FetchProgress::default()]);
+    assert_eq!(d3.waiting, 0);
+}

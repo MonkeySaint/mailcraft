@@ -103,8 +103,10 @@ pub struct AccountStatus {
     pub account: u32,
     pub name: String,
     pub busy: bool,
-    /// What the worker is doing ("Updating Inbox…").
+    /// What the worker is doing ("Updating Inbox…", "Downloading Inbox: 1,240 of 5,000 messages").
     pub progress: String,
+    /// The same as numbers (folder and message counts) while the worker downloads or updates folders.
+    pub detail: Option<SyncProgress>,
     pub error: Option<String>,
     /// Unix time of the last send/receive that finished without error.
     pub last_sync: Option<i64>,
@@ -114,6 +116,72 @@ pub struct AccountStatus {
     pub push: PushMode,
     /// The last measured transfer rate was below the slow-connection threshold.
     pub slow_connection: bool,
+}
+
+/// How far a send/receive run has got: the folder it updates (its place among the folders of the run) and
+/// the messages downloaded so far out of those the server has. Front ends draw bars and counts from it; its
+/// [`SyncProgress::text`] is the status text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProgress {
+    /// Display name of the folder ("Inbox"); empty when the step covers the whole account (JMAP).
+    pub folder: String,
+    /// 1-based position of the folder among the `folder_count` folders this run updates (0 = not counted).
+    pub folder_index: usize,
+    pub folder_count: usize,
+    /// New messages downloaded so far and how many there are (`total` 0 = none or not known yet).
+    pub done: u64,
+    pub total: u64,
+    /// Only the headers of new messages are downloaded.
+    pub headers: bool,
+}
+
+impl SyncProgress {
+    /// "Downloading Inbox: 1,240 of 5,000 messages (folder 3 of 12)", "Updating Archive (folder 4 of 12)…",
+    /// "Downloading 300 of 2,000 messages".
+    pub fn text(&self) -> String {
+        let of_folders = if self.folder_count > 1 && self.folder_index > 0 {
+            format!(" (folder {} of {})", self.folder_index, self.folder_count)
+        } else {
+            String::new()
+        };
+        let what = if self.headers { "headers" } else { "messages" };
+        let done = grouped(self.done.min(self.total));
+        if self.total > 0 && self.folder.is_empty() {
+            format!("Downloading {done} of {} {what}{of_folders}", grouped(self.total))
+        } else if self.total > 0 {
+            format!("Downloading {}: {done} of {} {what}{of_folders}", self.folder, grouped(self.total))
+        } else if self.folder.is_empty() {
+            "Updating messages…".into()
+        } else {
+            format!("Updating {}{of_folders}…", self.folder)
+        }
+    }
+
+    /// Share of the messages downloaded (0..=1), when the total is known.
+    pub fn fraction(&self) -> Option<f32> {
+        if self.total == 0 {
+            return None;
+        }
+        // Display only: the precision lost converting large counts does not matter.
+        #[allow(clippy::cast_precision_loss)]
+        let f = self.done.min(self.total) as f64 / self.total as f64;
+        #[allow(clippy::cast_possible_truncation)]
+        Some(f as f32)
+    }
+}
+
+/// `12345` → `"12,345"` (the separators the status bar uses for its counts).
+pub fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len().saturating_add(digits.len() / 3));
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && digits.len().saturating_sub(i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Whether new mail is pushed to an account (IMAP IDLE, JMAP event source) or found by polling.
@@ -184,6 +252,8 @@ pub struct SyncStatus {
     /// Right text: "Connected", "Working offline", "Disconnected".
     pub connection_text: String,
     pub busy: bool,
+    /// Folder and message counts behind `text` while an account downloads (see [`SyncProgress`]).
+    pub detail: Option<SyncProgress>,
     pub accounts: Vec<AccountStatus>,
 }
 
@@ -275,6 +345,7 @@ struct AccountRun {
     /// Another run requested while busy.
     again: Option<Plan>,
     progress: String,
+    detail: Option<SyncProgress>,
     error: Option<String>,
     last_sync: Option<i64>,
     /// Automatic runs wait until then after a run could not start.
@@ -623,6 +694,7 @@ fn refresh_status(s: &mut Session) {
             name: a.display_name.clone(),
             busy,
             progress: run.map(|r| r.progress.clone()).unwrap_or_default(),
+            detail: run.filter(|_| busy).and_then(|r| r.detail.clone()),
             error: run.and_then(|r| r.error.clone()),
             last_sync: run.and_then(|r| r.last_sync),
             pending_changes: a.sync.pending.len(),
@@ -632,6 +704,7 @@ fn refresh_status(s: &mut Session) {
         };
         if busy && busy_text.is_none() {
             busy_text = Some(row.progress.clone());
+            st.detail = row.detail.clone();
         }
         if let Some(e) = &row.error {
             any_error.get_or_insert_with(|| e.clone());
@@ -643,6 +716,7 @@ fn refresh_status(s: &mut Session) {
     if st.accounts.is_empty() {
         st.connection = Connection::Idle;
     } else if s.view.work_offline {
+        st.detail = None;
         st.connection = Connection::Offline;
         st.text = "Working offline".into();
     } else if let Some(t) = busy_text {

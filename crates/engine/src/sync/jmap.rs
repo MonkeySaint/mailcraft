@@ -277,7 +277,7 @@ pub(crate) fn run(
     cancel: &AtomicBool,
 ) -> Option<String> {
     let progress = |t: &str| {
-        events.send(Event::Progress { account, text: t.to_owned() });
+        events.send(Event::step(account, t));
     };
     let cancelled = || cancel.load(Ordering::SeqCst);
     progress("Connecting…");
@@ -419,6 +419,9 @@ pub(crate) fn run(
             let sort = json!([{ "property": "receivedAt", "isAscending": false }]);
             let mut position = 0u64;
             let mut seen: BTreeSet<String> = BTreeSet::new();
+            // "Downloading 1,500 of 5,000 messages": the query reports the total with its first page.
+            let mut detail = SyncProgress::default();
+            let mut throttle = super::native::Throttle::default();
             while position < MAX_INITIAL {
                 if cancelled() {
                     return Ok(());
@@ -428,14 +431,26 @@ pub(crate) fn run(
                 if page.is_empty() {
                     break;
                 }
-                progress(&format!("Downloading messages ({} so far)…", seen.len()));
+                let found = u64::try_from(seen.len()).unwrap_or(u64::MAX);
+                match q.total {
+                    Some(t) => detail.total = t.min(MAX_INITIAL).max(found),
+                    None => progress(&format!("Downloading messages ({} so far)…", super::grouped(found))),
+                }
                 let all: BTreeSet<String> = page.iter().cloned().collect();
                 for chunk in page.chunks(GET_BATCH) {
                     if cancelled() {
                         return Ok(());
                     }
+                    if detail.total > 0 && throttle.due(detail.done == 0) {
+                        events.send(Event::counted(account, &detail));
+                    }
                     let (list, _) = get_emails(&c, chunk, &all, cancel)?;
                     send(events, cancel, account, JmapEvent::Emails { list });
+                    let got = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                    detail.done = detail.done.saturating_add(got).min(detail.total);
+                }
+                if detail.total > 0 {
+                    events.send(Event::counted(account, &detail));
                 }
                 position = position.saturating_add(QUERY_PAGE);
                 if q.total.is_some_and(|t| position >= t) {
