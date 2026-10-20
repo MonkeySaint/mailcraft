@@ -1228,9 +1228,15 @@ fn oauth_section(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Optio
                             });
                         } else if let Some(u) = &f.auth_url {
                             ui.label("Finish signing in in your browser; MailCraft waits for it here.");
-                            if ui.link("Open the sign-in page again").clicked() {
-                                open_url = Some(u.clone());
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.link("Open the sign-in page again").clicked() {
+                                    open_url = Some(u.clone());
+                                }
+                                // When no browser starts, the page can still be opened by hand.
+                                if ui.button("Copy link").clicked() {
+                                    ui.ctx().copy_text(u.clone());
+                                }
+                            });
                         } else {
                             ui.label("Contacting the provider…");
                         }

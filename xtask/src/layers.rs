@@ -104,7 +104,38 @@ pub fn check(meta: &Metadata) -> Vec<String> {
         }
     }
     problems.extend(gui_leaks(meta));
+    problems.extend(desktop_links(meta));
     problems
+}
+
+/// The desktop app must be able to open links: egui-winit only does that with its `links` feature, which
+/// brings in `webbrowser`. Without it every `open_url` (message links, OAuth sign-in pages) is dropped.
+fn desktop_links(meta: &Metadata) -> Vec<String> {
+    let Some(resolve) = &meta.resolve else { return Vec::new() };
+    let Some(app) = meta.members().into_iter().find(|p| p.name == "mailcraft") else { return Vec::new() };
+    let graph: BTreeMap<&str, Vec<&str>> = resolve
+        .iter()
+        .map(|(id, deps)| {
+            (id.as_str(), deps.iter().filter(|d| d.non_dev()).map(|d| d.pkg.as_str()).collect())
+        })
+        .collect();
+    let mut seen: BTreeSet<&str> = BTreeSet::from([app.id.as_str()]);
+    let mut queue = VecDeque::from([app.id.as_str()]);
+    while let Some(id) = queue.pop_front() {
+        if meta.package(id).is_some_and(|p| p.name == "webbrowser") {
+            return Vec::new();
+        }
+        for &dep in graph.get(id).map(Vec::as_slice).unwrap_or(&[]) {
+            if seen.insert(dep) {
+                queue.push_back(dep);
+            }
+        }
+    }
+    vec![
+        "`mailcraft` does not depend on `webbrowser`: links and OAuth sign-in pages cannot open \
+         (enable eframe's `links` feature)"
+            .to_owned(),
+    ]
 }
 
 /// Crates below L6 that reach a GUI crate through normal/build edges, with the path.
@@ -213,6 +244,29 @@ mod tests {
             workspace_members: members.iter().map(|m| format!("id-{m}")).collect(),
             resolve: Some(resolve.into_iter().collect()),
         }
+    }
+
+    #[test]
+    fn desktop_app_must_reach_webbrowser() {
+        let without = meta(
+            vec![pkg("mailcraft", &[]), pkg("egui-winit", &[])],
+            &["mailcraft"],
+            &[("mailcraft", "egui-winit", None)],
+        );
+        assert!(desktop_links(&without).iter().any(|p| p.contains("webbrowser")));
+        let with = meta(
+            vec![pkg("mailcraft", &[]), pkg("egui-winit", &[]), pkg("webbrowser", &[])],
+            &["mailcraft"],
+            &[("mailcraft", "egui-winit", None), ("egui-winit", "webbrowser", None)],
+        );
+        assert!(desktop_links(&with).is_empty());
+        // Only as a dev-dependency does not count.
+        let dev_only = meta(
+            vec![pkg("mailcraft", &[]), pkg("webbrowser", &[])],
+            &["mailcraft"],
+            &[("mailcraft", "webbrowser", Some("dev"))],
+        );
+        assert!(!desktop_links(&dev_only).is_empty());
     }
 
     #[test]
