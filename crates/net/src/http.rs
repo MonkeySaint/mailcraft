@@ -1,7 +1,9 @@
 //! A small blocking HTTP/1.1 client (RFC 9110/9112) for JMAP and OAuth: one request per connection,
-//! Content-Length and chunked bodies, redirects, size caps. TLS via the shared transport.
+//! Content-Length and chunked bodies, redirects, size caps, an optional deadline for a whole request
+//! ([`HttpClient::get_once`]). TLS via the shared transport.
 
-use std::time::Duration;
+use std::borrow::Cow;
+use std::time::{Duration, Instant};
 
 use crate::error::{NetError, Result};
 use crate::transport::{Conn, ConnectOptions};
@@ -10,6 +12,41 @@ const MAX_HEADER_LINE: usize = 64 * 1024;
 const MAX_HEADERS: usize = 200;
 /// Most interim (1xx) responses skipped before the final one.
 const MAX_INTERIM: usize = 10;
+/// Body bytes read at once when a request has a deadline (the deadline is checked between pieces).
+const PIECE: usize = 64 * 1024;
+
+/// Time left before `deadline` (`None`: no deadline); a passed deadline is [`NetError::Timeout`].
+fn time_left(deadline: Option<Instant>) -> Result<Option<Duration>> {
+    let Some(d) = deadline else { return Ok(None) };
+    let left = d.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(NetError::Timeout("the HTTP request took too long".into()));
+    }
+    Ok(Some(left))
+}
+
+/// Before a read: fails once the deadline has passed, else caps the read timeout at the time left.
+fn arm(conn: &mut Conn, deadline: Option<Instant>) -> Result<()> {
+    if let Some(left) = time_left(deadline)? {
+        let t = left.min(conn.options().io_timeout);
+        conn.set_read_timeout(Some(t))?;
+    }
+    Ok(())
+}
+
+/// Reads exactly `n` bytes; with a deadline, in pieces with the deadline checked between them.
+fn read_n(conn: &mut Conn, n: usize, deadline: Option<Instant>) -> Result<Vec<u8>> {
+    if deadline.is_none() {
+        return conn.read_exact(n);
+    }
+    let mut out = Vec::with_capacity(n.min(PIECE));
+    while out.len() < n {
+        arm(conn, deadline)?;
+        let piece = conn.read_exact((n - out.len()).min(PIECE))?;
+        out.extend_from_slice(&piece);
+    }
+    Ok(out)
+}
 
 /// An `http` or `https` URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,6 +276,13 @@ impl HttpClient {
         self.request("GET", url, headers, None)
     }
 
+    /// One GET without following redirects (a 3xx comes back as the response), finished by `deadline`:
+    /// connecting, sending and every read wait at most the time left, and a request still running when it
+    /// passes fails with [`NetError::Timeout`] (checked between header lines and body pieces).
+    pub fn get_once(&self, url: &Url, headers: &[(&str, &str)], deadline: Instant) -> Result<HttpResponse> {
+        self.once("GET", url, headers, None, Some(deadline))
+    }
+
     /// POST a JSON value.
     pub fn post_json(
         &self,
@@ -287,7 +331,7 @@ impl HttpClient {
                 .copied()
                 .filter(|(k, _)| same_origin || !k.eq_ignore_ascii_case("authorization"))
                 .collect();
-            let resp = self.once(&method, &url, &hdrs, body.as_deref())?;
+            let resp = self.once(&method, &url, &hdrs, body.as_deref(), None)?;
             let is_redirect = matches!(resp.status, 301 | 302 | 303 | 307 | 308);
             let Some(loc) = resp.header("location").filter(|_| is_redirect).map(str::to_owned) else {
                 return Ok(resp);
@@ -317,7 +361,14 @@ impl HttpClient {
     }
 
     /// Connects and sends one request; returns the connection with the response unread.
-    fn send(&self, method: &str, url: &Url, headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<Conn> {
+    fn send(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        deadline: Option<Instant>,
+    ) -> Result<Conn> {
         if !method.bytes().all(|b| b.is_ascii_uppercase()) || method.is_empty() {
             return Err(NetError::Invalid(format!("HTTP method `{method}`")));
         }
@@ -353,7 +404,16 @@ impl HttpClient {
         if let Some(b) = body {
             data.extend_from_slice(b);
         }
-        let mut conn = Conn::connect(&url.host, url.port, url.https, &self.options)?;
+        let options = match time_left(deadline)? {
+            Some(left) => {
+                let mut o = self.options.clone();
+                o.connect_timeout = o.connect_timeout.min(left);
+                o.io_timeout = o.io_timeout.min(left);
+                Cow::Owned(o)
+            }
+            None => Cow::Borrowed(&self.options),
+        };
+        let mut conn = Conn::connect(&url.host, url.port, url.https, &options)?;
         conn.write_all(&data)?;
         Ok(conn)
     }
@@ -364,9 +424,10 @@ impl HttpClient {
         url: &Url,
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
+        deadline: Option<Instant>,
     ) -> Result<HttpResponse> {
-        let mut conn = self.send(method, url, headers, body)?;
-        let resp = self.read_response(&mut conn, method == "HEAD", url);
+        let mut conn = self.send(method, url, headers, body, deadline)?;
+        let resp = self.read_response(&mut conn, method == "HEAD", url, deadline);
         conn.shutdown();
         resp
     }
@@ -375,13 +436,13 @@ impl HttpClient {
     /// non-2xx answer is an error ([`NetError::Auth`] for 401/403, else [`NetError::Http`]).
     pub fn open_stream(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpStream> {
         let u = Url::parse(url)?;
-        let mut conn = self.send("GET", &u, headers, None)?;
-        let (status, hdrs) = read_head(&mut conn)?;
+        let mut conn = self.send("GET", &u, headers, None, None)?;
+        let (status, hdrs) = read_head(&mut conn, None)?;
         let get = |n: &str| hdrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
         let chunked = get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
         if !(200..300).contains(&status) {
             let body = if chunked {
-                self.read_chunked(&mut conn).unwrap_or_default()
+                self.read_chunked(&mut conn, None).unwrap_or_default()
             } else {
                 let n = get("content-length").and_then(|l| l.trim().parse::<usize>().ok()).unwrap_or(0);
                 conn.read_exact(n.min(64 * 1024)).unwrap_or_default()
@@ -408,29 +469,61 @@ impl HttpClient {
         })
     }
 
-    fn read_response(&self, conn: &mut Conn, head: bool, url: &Url) -> Result<HttpResponse> {
-        let (status, headers) = read_head(conn)?;
+    fn read_response(
+        &self,
+        conn: &mut Conn,
+        head: bool,
+        url: &Url,
+        deadline: Option<Instant>,
+    ) -> Result<HttpResponse> {
+        let (status, headers) = read_head(conn, deadline)?;
         let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
         let body = if head || status == 204 || status == 304 {
             Vec::new()
         } else if get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
-            self.read_chunked(conn)?
+            self.read_chunked(conn, deadline)?
         } else if let Some(len) = get("content-length") {
             let n: usize =
                 len.trim().parse().map_err(|_| NetError::Protocol(format!("bad Content-Length `{len}`")))?;
             if n > self.max_body {
                 return Err(NetError::TooLarge(format!("HTTP body of {n} bytes")));
             }
-            conn.read_exact(n)?
+            read_n(conn, n, deadline)?
         } else {
-            conn.read_to_end(self.max_body)?
+            self.read_until_close(conn, deadline)?
         };
         Ok(HttpResponse { status, headers, body, url: url.to_string() })
     }
 
-    fn read_chunked(&self, conn: &mut Conn) -> Result<Vec<u8>> {
+    /// A body delimited by the end of the connection, up to `max_body` bytes.
+    fn read_until_close(&self, conn: &mut Conn, deadline: Option<Instant>) -> Result<Vec<u8>> {
+        if deadline.is_none() {
+            return conn.read_to_end(self.max_body);
+        }
+        let mut body = Vec::new();
+        let mut want = PIECE;
+        loop {
+            arm(conn, deadline)?;
+            match conn.read_exact(want) {
+                Ok(piece) => {
+                    body.extend_from_slice(&piece);
+                    if body.len() > self.max_body {
+                        return Err(NetError::TooLarge(format!("body larger than {} bytes", self.max_body)));
+                    }
+                }
+                // Fewer than `want` bytes are left before the end: halve the piece until the buffered tail
+                // is taken (each retry sees the end of the stream again at once).
+                Err(NetError::Closed) if want > 1 => want /= 2,
+                Err(NetError::Closed) => return Ok(body),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn read_chunked(&self, conn: &mut Conn, deadline: Option<Instant>) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         loop {
+            arm(conn, deadline)?;
             let line = conn.read_line(MAX_HEADER_LINE)?;
             let line = String::from_utf8_lossy(&line);
             let hex = line.split(';').next().unwrap_or_default().trim();
@@ -442,6 +535,7 @@ impl HttpClient {
             if n == 0 {
                 // Trailers.
                 for _ in 0..MAX_HEADERS {
+                    arm(conn, deadline)?;
                     if conn.read_line(MAX_HEADER_LINE)?.is_empty() {
                         return Ok(body);
                     }
@@ -451,7 +545,8 @@ impl HttpClient {
             if body.len().saturating_add(n) > self.max_body {
                 return Err(NetError::TooLarge("chunked HTTP body".into()));
             }
-            body.extend_from_slice(&conn.read_exact(n)?);
+            body.extend_from_slice(&read_n(conn, n, deadline)?);
+            arm(conn, deadline)?;
             let crlf = conn.read_line(2)?;
             if !crlf.is_empty() {
                 return Err(NetError::Protocol("missing CRLF after chunk".into()));
@@ -461,9 +556,10 @@ impl HttpClient {
 }
 
 /// Reads a status line and headers, skipping interim (1xx) responses.
-fn read_head(conn: &mut Conn) -> Result<(u16, Vec<(String, String)>)> {
+fn read_head(conn: &mut Conn, deadline: Option<Instant>) -> Result<(u16, Vec<(String, String)>)> {
     let mut interim = 0usize;
     loop {
+        arm(conn, deadline)?;
         let line = conn.read_line(MAX_HEADER_LINE)?;
         let line = String::from_utf8_lossy(&line).into_owned();
         let mut parts = line.splitn(3, ' ');
@@ -478,6 +574,7 @@ fn read_head(conn: &mut Conn) -> Result<(u16, Vec<(String, String)>)> {
             .ok_or_else(|| NetError::Protocol(format!("bad status line `{line}`")))?;
         let mut headers = Vec::new();
         loop {
+            arm(conn, deadline)?;
             let h = conn.read_line(MAX_HEADER_LINE)?;
             if h.is_empty() {
                 break;

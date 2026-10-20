@@ -23,6 +23,7 @@ pub mod list;
 pub mod menus;
 pub mod modules;
 pub mod reading;
+pub mod remote_images;
 pub mod responsive;
 pub mod ribbon;
 pub mod theme;

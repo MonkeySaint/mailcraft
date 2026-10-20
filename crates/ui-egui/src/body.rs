@@ -14,14 +14,19 @@
 //!   Select Text With Similar Formatting and Find… (reported in [`BodyView::find_requested`]).
 //! - Images: `data:image/…;base64` pictures are decoded (PNG, JPEG, GIF; [`decode_image`], at most
 //!   [`MAX_IMAGE_SIDE`] pixels a side) and drawn in their box; `cid:` pictures are drawn once the owner hands
-//!   over the attachment bytes with [`provide_image`]. Anything else (undecodable data, unknown `cid:`,
-//!   `http(s):`, which has no loader) shows a framed placeholder with its alt text; remote pictures are
-//!   labelled blocked unless [`BodyOptions::allow_remote`]. Decoded pictures are kept as textures in a small
-//!   per-context cache ([`MAX_IMAGE_CACHE`] pictures).
+//!   over the attachment bytes with [`provide_image`]. Remote `http(s):` (and `//host/…`) pictures are
+//!   downloaded in the background by [`crate::remote_images`] only when [`BodyOptions::allow_remote`] is set
+//!   (the first [`crate::remote_images::MAX_PER_MESSAGE`] of a message), and never otherwise. Anything not
+//!   drawn (blocked, loading, failed, undecodable, unknown `cid:`) shows a framed placeholder with its alt
+//!   text. Decoded pictures are kept as textures in a small per-context cache ([`MAX_IMAGE_CACHE`] pictures).
+//! - Remote picture size: the `width`/`height` the message gives; a missing one follows the picture's aspect
+//!   ratio once it is downloaded, and a picture without either is laid out at its intrinsic size (a small
+//!   placeholder box until then). Pictures wider than the body are scaled down to fit by the layout.
 //! - Dark mode: colours are re-mapped by lightness (dark text becomes light, white backgrounds become dark) so
 //!   authored hues survive; pass `dark = false` for the "light background" toggle.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -56,6 +61,54 @@ pub struct BodyView {
     pub find_requested: bool,
     /// Where the right-click menu was opened.
     menu_at: Option<TextPos>,
+    /// The pictures of the doc last shown (rebuilt when the doc changes).
+    images: Arc<ImageIndex>,
+    /// The remote pictures of `images` were requested (pictures allowed).
+    remote_requested: bool,
+}
+
+/// Most remote pictures without both dimensions tracked per doc for intrinsic sizing.
+const MAX_UNSIZED: usize = 1000;
+
+/// The pictures of one doc.
+#[derive(Clone, Debug, Default)]
+struct ImageIndex {
+    doc_key: Option<u64>,
+    /// Remote pictures to load ([`crate::remote_images::key`]s), first ones in document order, at most
+    /// [`crate::remote_images::MAX_PER_MESSAGE`] distinct.
+    remote: Vec<String>,
+    remote_set: HashSet<String>,
+    /// Remote pictures missing a width or height (size keys).
+    unsized_images: Vec<u64>,
+}
+
+impl ImageIndex {
+    fn build(doc: &Doc, doc_key: u64) -> ImageIndex {
+        let mut ix = ImageIndex { doc_key: Some(doc_key), ..ImageIndex::default() };
+        let mut seen_unsized = HashSet::new();
+        walk_inlines(&doc.blocks, 0, &mut |i| {
+            let Inline::Image { src, width, height, .. } = i else { return };
+            if !is_remote(src) {
+                return;
+            }
+            let Some(key) = crate::remote_images::key(src) else { return };
+            if (dim(*width).is_none() || dim(*height).is_none()) && ix.unsized_images.len() < MAX_UNSIZED {
+                let sk = source_key(&key);
+                if seen_unsized.insert(sk) {
+                    ix.unsized_images.push(sk);
+                }
+            }
+            if ix.remote.len() < crate::remote_images::MAX_PER_MESSAGE && ix.remote_set.insert(key.clone()) {
+                ix.remote.push(key);
+            }
+        });
+        ix
+    }
+}
+
+/// A usable width or height (finite, positive).
+fn dim(v: Option<f32>) -> Option<f32> {
+    v.filter(|x| x.is_finite() && *x > 0.0)
 }
 
 impl BodyView {
@@ -102,11 +155,26 @@ pub fn show_doc_with(ui: &mut Ui, view: &mut BodyView, doc: &Doc, opts: &BodyOpt
     let width = if width.is_finite() && width > 1.0 { width } else { 1.0 };
     let zoom = if opts.zoom.is_finite() && opts.zoom > 0.05 { opts.zoom.min(5.0) } else { 1.0 };
     let doc_key = opts.doc_key.unwrap_or_else(|| doc_hash(doc));
+    let ctx = ui.ctx().clone();
+    crate::remote_images::pump(&ctx);
+    if view.images.doc_key != Some(doc_key) {
+        view.images = Arc::new(ImageIndex::build(doc, doc_key));
+        view.remote_requested = false;
+    }
+    if opts.allow_remote && !view.remote_requested {
+        // A message shown again retries pictures that failed before.
+        for url in &view.images.remote {
+            crate::remote_images::request(&ctx, url, true);
+        }
+        view.remote_requested = true;
+    }
+    let sizes = sizes_signature(&ctx, &view.images, opts.allow_remote);
     let key = {
         let mut h = DefaultHasher::new();
         doc_key.hash(&mut h);
         ((width * 2.0).round() as i64).hash(&mut h);
         zoom.to_bits().hash(&mut h);
+        sizes.hash(&mut h);
         h.finish()
     };
     if view.doc_key != doc_key {
@@ -118,7 +186,8 @@ pub fn show_doc_with(ui: &mut Ui, view: &mut BodyView, doc: &Doc, opts: &BodyOpt
     let db = font_db(ui.ctx());
     if view.key != key || view.layout.is_none() {
         let lo = LayoutOptions { width, zoom, ..LayoutOptions::default() };
-        view.layout = Some(layout_doc(doc, &db, &lo));
+        let sized = (sizes != 0).then(|| with_intrinsic_sizes(&ctx, doc, &view.images));
+        view.layout = Some(layout_doc(sized.as_ref().unwrap_or(doc), &db, &lo));
         view.width = width;
         view.key = key;
     }
@@ -382,9 +451,18 @@ fn paint_and_interact(
             DisplayItem::Image { rect: r, src, alt } => {
                 let rr = rect_of(r);
                 if rr.intersects(clip) {
-                    match image_texture(&ctx, src) {
+                    let remote = is_remote(src);
+                    let tex = if remote {
+                        remote_texture(&ctx, &view.images, src, opts.allow_remote)
+                    } else {
+                        image_texture(&ctx, src)
+                    };
+                    match tex {
                         Some(tex) => paint_texture(&painter, rr, &tex),
-                        None => paint_image_placeholder(&painter, rr, src, alt, opts, &ctx),
+                        None => {
+                            let label = placeholder_label(&ctx, src, remote, opts.allow_remote);
+                            paint_image_placeholder(&painter, rr, alt, label, dark, &ctx)
+                        }
                     }
                 }
             }
@@ -393,15 +471,47 @@ fn paint_and_interact(
     clicked_link
 }
 
+/// The texture of a remote picture, when pictures are allowed and it is one of the message's loaded ones.
+fn remote_texture(
+    ctx: &egui::Context,
+    images: &ImageIndex,
+    src: &str,
+    allow: bool,
+) -> Option<egui::TextureHandle> {
+    if !allow {
+        return None;
+    }
+    let key = crate::remote_images::key(src)?;
+    if !images.remote_set.contains(&key) {
+        return None;
+    }
+    crate::remote_images::texture(ctx, &key)
+}
+
+/// Placeholder text of a picture that is not drawn (when it has no alt text).
+fn placeholder_label(ctx: &egui::Context, src: &str, remote: bool, allow: bool) -> &'static str {
+    use crate::remote_images::Status;
+    if !remote {
+        return "Picture";
+    }
+    if !allow {
+        return "Picture blocked";
+    }
+    match crate::remote_images::key(src).and_then(|k| crate::remote_images::status(ctx, &k)) {
+        Some(Status::Loading) => "Loading picture...",
+        Some(Status::Failed) => "Picture not available",
+        _ => "Picture",
+    }
+}
+
 fn paint_image_placeholder(
     painter: &egui::Painter,
     r: Rect,
-    src: &str,
     alt: &str,
-    opts: &BodyOptions,
+    fallback: &str,
+    dark: bool,
     ctx: &egui::Context,
 ) {
-    let dark = opts.dark;
     let fill = if dark { Color32::from_rgb(0x2c, 0x30, 0x35) } else { Color32::from_rgb(0xf0, 0xf2, 0xf4) };
     let line = if dark { Color32::from_rgb(0x55, 0x5b, 0x63) } else { Color32::from_rgb(0xc4, 0xc9, 0xd0) };
     let ink = if dark { Color32::from_rgb(0xa8, 0xaf, 0xb8) } else { Color32::from_rgb(0x6a, 0x71, 0x7a) };
@@ -437,13 +547,7 @@ fn paint_image_placeholder(
             Stroke::new(1.0, ink),
         );
         if r.width() >= 60.0 && r.height() >= 40.0 {
-            let label = if !alt.trim().is_empty() {
-                alt.trim().to_owned()
-            } else if is_remote(src) && !opts.allow_remote {
-                "Picture blocked".to_owned()
-            } else {
-                "Picture".to_owned()
-            };
+            let label = if alt.trim().is_empty() { fallback.to_owned() } else { alt.trim().to_owned() };
             let galley = ctx.fonts_mut(|f| {
                 f.layout(label, egui::FontId::proportional(11.0), ink, (r.width() - 12.0).max(10.0))
             });
@@ -978,6 +1082,45 @@ fn walk_inlines(blocks: &[Block], depth: usize, f: &mut dyn FnMut(&Inline)) {
     }
 }
 
+/// [`walk_inlines`] with mutable access.
+fn walk_inlines_mut(blocks: &mut [Block], depth: usize, f: &mut dyn FnMut(&mut Inline)) {
+    if depth > 64 {
+        return;
+    }
+    for b in blocks {
+        match b {
+            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => {
+                walk_inline_list_mut(inlines, 0, f)
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    walk_inlines_mut(item, depth + 1, f);
+                }
+            }
+            Block::Quote { blocks } | Block::Container { blocks, .. } => {
+                walk_inlines_mut(blocks, depth + 1, f)
+            }
+            Block::Table { rows, .. } => {
+                for cell in rows.iter_mut().flatten() {
+                    walk_inlines_mut(&mut cell.blocks, depth + 1, f);
+                }
+            }
+            Block::Pre { .. } | Block::Rule => {}
+        }
+    }
+}
+
+fn walk_inline_list_mut(inlines: &mut [Inline], depth: usize, f: &mut dyn FnMut(&mut Inline)) {
+    for i in inlines {
+        f(i);
+        if let Inline::Link { children, .. } = i
+            && depth < 64
+        {
+            walk_inline_list_mut(children, depth + 1, f);
+        }
+    }
+}
+
 fn walk_inline_list(inlines: &[Inline], depth: usize, f: &mut dyn FnMut(&Inline)) {
     for i in inlines {
         f(i);
@@ -1116,6 +1259,115 @@ fn load_picture(ctx: &egui::Context, key: u64, data: &[u8]) -> Option<egui::Text
     decode_image(data).map(|img| {
         ctx.load_texture(format!("mailcraft-body-image-{key:016x}"), img, egui::TextureOptions::LINEAR)
     })
+}
+
+/// Cache key of a picture source string.
+pub(crate) fn source_key(src: &str) -> u64 {
+    fingerprint(src.as_bytes())
+}
+
+/// Most intrinsic picture sizes remembered per egui context (oldest forgotten first).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_IMAGE_SIZES: usize = 4096;
+
+/// Intrinsic sizes (pixels) of decoded pictures by size key.
+#[derive(Clone, Default)]
+struct ImageSizes {
+    map: HashMap<u64, [usize; 2]>,
+    /// Insertion order (the browser build never records sizes).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    order: VecDeque<u64>,
+}
+
+fn image_sizes_id() -> Id {
+    Id::new("mailcraft-body-image-sizes")
+}
+
+/// Records the intrinsic size of the remote picture at `url` (a [`crate::remote_images::key`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn record_image_size(ctx: &egui::Context, url: &str, size: [usize; 2]) {
+    let key = source_key(url);
+    if size[0] == 0 || size[1] == 0 {
+        return;
+    }
+    let changed = ctx.data_mut(|d| {
+        let s = d.get_temp_mut_or_default::<ImageSizes>(image_sizes_id());
+        match s.map.insert(key, size) {
+            Some(old) => old != size,
+            None => {
+                s.order.push_back(key);
+                while s.order.len() > MAX_IMAGE_SIZES {
+                    if let Some(k) = s.order.pop_front() {
+                        s.map.remove(&k);
+                    }
+                }
+                true
+            }
+        }
+    });
+    if changed {
+        // Pictures laid out at their intrinsic size need another layout pass.
+        ctx.request_repaint();
+    }
+}
+
+/// Fingerprint of the known intrinsic sizes of a doc's pictures that lack a width or height (0 when none is
+/// known): part of the layout key, so a picture that arrives re-lays the body out.
+fn sizes_signature(ctx: &egui::Context, images: &ImageIndex, allow_remote: bool) -> u64 {
+    if images.unsized_images.is_empty() || !allow_remote {
+        return 0;
+    }
+    ctx.data_mut(|d| {
+        let sizes = d.get_temp_mut_or_default::<ImageSizes>(image_sizes_id());
+        let mut h = DefaultHasher::new();
+        let mut any = false;
+        for (i, k) in images.unsized_images.iter().enumerate() {
+            if let Some(size) = sizes.map.get(k) {
+                (i, size).hash(&mut h);
+                any = true;
+            }
+        }
+        if any { h.finish() | 1 } else { 0 }
+    })
+}
+
+/// Largest picture dimension derived from an intrinsic size (px; the layout caps it too).
+const MAX_DERIVED_DIM: f32 = 20_000.0;
+
+/// A copy of `doc` whose loaded remote pictures (`images.remote_set`) without a width or height get them from
+/// their intrinsic size: both missing → the intrinsic size; one missing → derived from the other with the
+/// picture's aspect ratio.
+fn with_intrinsic_sizes(ctx: &egui::Context, doc: &Doc, images: &ImageIndex) -> Doc {
+    let sizes = ctx.data_mut(|d| d.get_temp_mut_or_default::<ImageSizes>(image_sizes_id()).map.clone());
+    let mut out = doc.clone();
+    walk_inlines_mut(&mut out.blocks, 0, &mut |i| {
+        let Inline::Image { src, width, height, .. } = i else { return };
+        let (w, h) = (dim(*width), dim(*height));
+        if w.is_some() && h.is_some() {
+            return;
+        }
+        if !is_remote(src) {
+            return;
+        }
+        let Some(url) = crate::remote_images::key(src).filter(|k| images.remote_set.contains(k)) else {
+            return;
+        };
+        let key = source_key(&url);
+        let Some(&[iw, ih]) = sizes.get(&key) else { return };
+        let (iw, ih) = (iw as f32, ih as f32);
+        if iw <= 0.0 || ih <= 0.0 {
+            return;
+        }
+        let (nw, nh) = match (w, h) {
+            (Some(w), None) => (w, w * ih / iw),
+            (None, Some(h)) => (h * iw / ih, h),
+            _ => (iw, ih),
+        };
+        let fit = |v: f32| if v.is_finite() { v.clamp(1.0, MAX_DERIVED_DIM) } else { 1.0 };
+        *width = Some(fit(nw));
+        *height = Some(fit(nh));
+    });
+    out
 }
 
 /// Hands over the bytes of the picture a body refers to as `src` (an inline attachment's `cid:…` URL), so

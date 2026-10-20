@@ -11,6 +11,7 @@ pub mod dns;
 pub mod error;
 pub mod eventsource;
 pub mod http;
+pub mod image_fetch;
 pub mod imap;
 pub mod jmap;
 pub mod keychain;
