@@ -1,6 +1,8 @@
 //! New mail: what happens to messages once send/receive has filed them in an Inbox, in this order.
 //!
-//! 1. The Junk Email filter ([`crate::junk::on_new_mail`]); what it moves or deletes goes no further.
+//! 1. The Junk Email filter ([`crate::junk::on_new_mail`]); what it moves or deletes goes no further. Voting
+//!    responses to my messages are then recorded on the message they answer
+//!    ([`crate::cmd::compose::record_vote`]), so the tally keeps them whatever happens to the responses.
 //! 2. Focused Inbox sender overrides: mail from a sender marked Always Move to Other is classified Other
 //!    ([`crate::cmd::mail::apply_focus_overrides`]).
 //! 3. The rules for received messages ([`crate::cmd::rules::exec::on_new_mail`]).
@@ -8,6 +10,10 @@
 //!    - meeting requests and cancellations go to File › Options › Calendar › Automatic accept or decline
 //!      (`calendar.autoRespond`, which does nothing while those options are off), whatever module is
 //!      showing;
+//!    - requests that are still unanswered go on the calendar as Tentative ([`calendar::place_tentative`]:
+//!      the account's calendar, the default reminder) while Options › Mail › Tracking › "Automatically
+//!      process meeting requests and responses to meeting requests and polls" is on; answering the request
+//!      later updates that copy, declining removes it;
 //!    - meeting responses update the meeting's tracking (`calendar.processReply`) while Options › Mail ›
 //!      Tracking › "Automatically process meeting requests and responses to meeting requests and polls" is
 //!      on;
@@ -54,6 +60,10 @@ pub struct ArrivalReport {
     pub responses_deleted: Vec<ItemId>,
     /// Read and delivery receipts moved to the receipts folder.
     pub receipts_moved: Vec<ItemId>,
+    /// Voting responses recorded on the message of mine they answer.
+    pub votes_recorded: Vec<ItemId>,
+    /// Meeting requests put on the calendar as Tentative until they are answered.
+    pub meetings_placed: Vec<ItemId>,
 }
 
 /// Processes newly arrived mail `ids` (see the module docs).
@@ -69,6 +79,8 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
     report.junk = junk.moved.iter().chain(junk.deleted.iter()).copied().collect();
     let gone: BTreeSet<ItemId> = report.junk.iter().copied().collect();
     let ids: Vec<ItemId> = ids.into_iter().filter(|i| !gone.contains(i)).collect();
+    // Votes are recorded before anything files the responses away (rules, Deleted Items).
+    report.votes_recorded = record_votes(s, &ids);
     report.focused_other = crate::cmd::mail::apply_focus_overrides(s, &ids);
     report.rules_matched = crate::cmd::rules::exec::on_new_mail(s, &ids).matched;
     // What the rules left outside Deleted Items and Junk Email, newest last.
@@ -81,6 +93,33 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
     scheduling(s, &ids, &mut report);
     tracking(s, &ids, &mut report);
     report
+}
+
+/// Voting responses among `ids` that answer a message of mine: each is recorded on that message
+/// ([`crate::cmd::compose::record_vote`]), so the tally keeps it after the response is deleted for good.
+fn record_votes(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
+    let replies: Vec<ItemId> = ids
+        .iter()
+        .copied()
+        .filter(|i| s.mailbox.mail.get(i).is_some_and(|m| !m.in_reply_to.is_empty()))
+        .take(MAX_PROCESSED)
+        .collect();
+    if replies.is_empty() {
+        return Vec::new();
+    }
+    let mine = my_message_ids(s);
+    if mine.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for id in replies {
+        let to_mine =
+            s.mailbox.mail.get(&id).is_some_and(|m| m.in_reply_to.iter().any(|r| mine.contains(&bare_id(r))));
+        if to_mine && crate::cmd::compose::record_vote(s, id).is_some() {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// True when `id` still exists in a mail folder outside Deleted Items and Junk Email.
@@ -140,6 +179,18 @@ fn scheduling(s: &mut Session, ids: &[ItemId], report: &mut ArrivalReport) {
                     );
                 }
                 Err(e) => log::warn!("automatic meeting responses: {e}"),
+            }
+        }
+    }
+    // Requests still unanswered go on the calendar as Tentative until the user answers them.
+    if auto_process {
+        let answered: BTreeSet<ItemId> = report.meetings_answered.iter().copied().collect();
+        for id in requests.iter().filter(|i| !answered.contains(i)) {
+            let Some(msg) = calendar::read_itip(s, *id) else { continue };
+            match calendar::place_tentative(s, *id, &msg) {
+                Ok(Some(_)) => report.meetings_placed.push(*id),
+                Ok(None) => {}
+                Err(e) => log::debug!("meeting request {}: {e}", id.0),
             }
         }
     }
@@ -553,5 +604,107 @@ mod tests {
         assert!(receipt_about(b"Content-Type: multipart/report\r\n\r\n").is_none());
         assert!(receipt_about(&[0xff, 0xfe, b':', b'\n']).is_none());
         assert!(receipt_about(b"").is_none());
+    }
+
+    fn copies(s: &Session, subject: &str) -> Vec<ItemId> {
+        s.mailbox.appointments.values().filter(|a| a.subject == subject).map(|a| a.id).collect()
+    }
+
+    #[test]
+    fn meeting_requests_wait_on_the_calendar_as_tentative() {
+        use mailcraft_model::BusyStatus;
+        let mut org = session();
+        let (_, cid) = invite(&mut org);
+        let mut ann = person("ann@example.com", "Ann Lee");
+        // Processing off: the request only waits in the Inbox.
+        set(&mut ann, "mail.tracking.autoProcessMeetings", json!(false));
+        let first = deliver(&org, cid, &mut ann);
+        assert!(on_new_mail(&mut ann, &[first]).meetings_placed.is_empty());
+        assert!(copies(&ann, "Design review").is_empty());
+        // On (the default): it goes on the calendar as Tentative, unanswered, with the default reminder; the
+        // message stays unread.
+        set(&mut ann, "mail.tracking.autoProcessMeetings", json!(true));
+        set(&mut ann, "calendar.reminderMinutes", json!(30));
+        let req = deliver(&org, cid, &mut ann);
+        let undo = ann.undo.undo.len();
+        assert_eq!(on_new_mail(&mut ann, &[req]).meetings_placed, vec![req]);
+        assert_eq!(ann.undo.undo.len(), undo, "automatic, not undoable");
+        let [id] = copies(&ann, "Design review")[..] else { panic!("one copy") };
+        let a = &ann.mailbox.appointments[&id];
+        assert_eq!(a.show_as, BusyStatus::Tentative);
+        assert_eq!(a.reminder_min, Some(30));
+        assert_eq!(a.folder, role(&ann, FolderRole::Calendar));
+        assert!(!ann.mailbox.mail[&req].read);
+        let info = ann.run("calendar.meetingInfo", &json!({"id": req.0})).unwrap();
+        assert_eq!((info["myResponse"].as_str(), info["appointment"].as_u64()), (Some("none"), Some(id.0)));
+        // The same meeting again is not placed twice.
+        assert!(on_new_mail(&mut ann, &[first]).meetings_placed.is_empty());
+        assert_eq!(copies(&ann, "Design review").len(), 1);
+        // Answering updates that copy: Accept shows the time as Busy.
+        ann.run("calendar.respond", &json!({"id": req.0, "response": "accept", "send": "none"})).unwrap();
+        assert_eq!(copies(&ann, "Design review"), vec![id]);
+        assert_eq!(ann.mailbox.appointments[&id].show_as, BusyStatus::Busy);
+        assert_eq!(ann.mailbox.appointments[&id].reminder_min, Some(30), "local reminder kept");
+        // Declining removes it; without default reminders (Options › Calendar) the copy has none.
+        let mut bob = person("bob@example.org", "Bob");
+        set(&mut bob, "calendar.defaultReminders", json!(false));
+        let req = deliver(&org, cid, &mut bob);
+        assert_eq!(on_new_mail(&mut bob, &[req]).meetings_placed, vec![req]);
+        let [b] = copies(&bob, "Design review")[..] else { panic!("one copy") };
+        assert_eq!(bob.mailbox.appointments[&b].reminder_min, None);
+        bob.run("calendar.respond", &json!({"id": req.0, "response": "decline", "send": "none"})).unwrap();
+        assert!(
+            copies(&bob, "Design review")
+                .iter()
+                .all(|i| bob.mailbox.appointments[i].folder != role(&bob, FolderRole::Calendar))
+        );
+        // Automatic accept answers it instead (no tentative step).
+        let mut cy = person("cy@example.net", "Cy");
+        set(&mut cy, "calendar.autoAccept", json!(true));
+        let req = deliver(&org, cid, &mut cy);
+        let r = on_new_mail(&mut cy, &[req]);
+        assert_eq!((r.meetings_answered.clone(), r.meetings_placed.clone()), (vec![req], vec![]));
+        // My own meeting request is not placed again.
+        let mut me = person("me@example.com", "Me Myself");
+        let mine = deliver(&org, cid, &mut me);
+        assert!(on_new_mail(&mut me, &[mine]).meetings_placed.is_empty());
+    }
+
+    #[test]
+    fn votes_keep_counting_after_deleted_items_is_emptied() {
+        let mut s = session();
+        let original = sent(&mut s, "vote-2@example.com", "X-MailCraft-Voting: Approve;Reject\n");
+        set(&mut s, "mail.tracking.deleteWithoutComments", json!(true));
+        let plain = |from: &str, choice: &str| {
+            format!(
+                "From: {from}\nSubject: {choice}: Budget\nIn-Reply-To: <vote-2@example.com>\n\
+                 X-MailCraft-Vote: {choice}\n\n"
+            )
+        };
+        let a = arrive(&mut s, &plain("ann@example.com", "Approve"));
+        let b = arrive(&mut s, &plain("bo@example.org", "Reject"));
+        let r = on_new_mail(&mut s, &[a, b]);
+        assert_eq!(r.votes_recorded, vec![a, b]);
+        assert_eq!(r.responses_deleted, vec![a, b]);
+        let tally = |s: &Session| crate::cmd::compose::tracking(s, original).unwrap().tally;
+        assert_eq!(tally(&s), vec![("Approve".to_owned(), 1), ("Reject".to_owned(), 1)]);
+        // Deleted Items emptied: the responses are gone, the tally is not.
+        s.run("folder.emptyDeleted", &json!({"confirm": true})).unwrap();
+        assert!(!s.mailbox.mail.contains_key(&a) && !s.mailbox.mail.contains_key(&b));
+        assert_eq!(tally(&s), vec![("Approve".to_owned(), 1), ("Reject".to_owned(), 1)]);
+        assert_eq!(s.mailbox.mail[&original].votes.len(), 2);
+        // A later vote from the same person replaces theirs; a vote from someone else's thread is not mine.
+        let c = arrive(&mut s, &plain("ann@example.com", "Reject"));
+        let d = arrive(
+            &mut s,
+            "From: cy@example.net\nSubject: Approve: X\nIn-Reply-To: <other@example.net>\nX-MailCraft-Vote: Approve\n\n",
+        );
+        assert_eq!(on_new_mail(&mut s, &[c, d]).votes_recorded, vec![c]);
+        assert_eq!(tally(&s), vec![("Approve".to_owned(), 0), ("Reject".to_owned(), 2)]);
+        // The stored record and the live response are one vote.
+        assert_eq!(crate::cmd::compose::tracking(&s, original).unwrap().responses.len(), 2);
+        // With "Automatically update original sent item with receipt information" off, none show.
+        set(&mut s, "mail.tracking.updateSentItem", json!(false));
+        assert_eq!(tally(&s), vec![("Approve".to_owned(), 0), ("Reject".to_owned(), 0)]);
     }
 }

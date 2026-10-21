@@ -1199,7 +1199,7 @@ fn run_action(ui: &Ui, app: &mut App, action: &str, id: u64) {
         "move" => "mail.move",
         // Without a name the Quick Click category is applied (or chosen first).
         "categorize" => "mail.categorize",
-        "pin" => "view.pin",
+        "pin" => "mail.pin",
         _ => return,
     };
     run_on_items(ui, app, cmd, &[id], json!({}));

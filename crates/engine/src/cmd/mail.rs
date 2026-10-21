@@ -14,9 +14,8 @@ use crate::{CmdError, CmdResult, CommandSpec, Notice, SearchScope, Session, alwa
 use mailcraft_model::dates::{local_day, weekday_of_day};
 use mailcraft_model::subject::strip_prefixes;
 use mailcraft_model::{
-    AccountId, AccountKind, BodyFormat, Category, CategoryColor, Conversation, DateTime, FlagState,
-    FocusClass, FolderId, FolderKind, FolderRole, Importance, ItemId, JunkLevel, JunkList, MailItem,
-    Sensitivity, thread,
+    AccountId, BodyFormat, Category, CategoryColor, Conversation, DateTime, FlagState, FocusClass, FolderId,
+    FolderKind, FolderRole, Importance, ItemId, JunkLevel, JunkList, MailItem, Sensitivity, thread,
 };
 
 // ---------------------------------------------------------------------------------------------------------
@@ -249,6 +248,16 @@ pub fn specs() -> Vec<CommandSpec> {
             true,
             always,
             new_item,
+        ),
+        spec(
+            "calendar.meetingWithAll",
+            "Meeting with All",
+            "Calendar › Home › New Items",
+            "",
+            r#"{"ids"?:[number]}"#,
+            false,
+            need_meeting_or_message,
+            meeting_with_all,
         ),
         // Delete group
         spec(
@@ -628,14 +637,14 @@ pub fn specs() -> Vec<CommandSpec> {
             view_source,
         ),
         spec(
-            "mail.recall",
-            "Recall This Message",
-            "Message › More Commands › Actions",
+            "mail.pin",
+            "Pin / Unpin",
+            "Message list › Quick Actions",
             "",
-            "",
-            false,
-            need_recallable,
-            recall,
+            r#"{"ids"?:[number],"on"?:bool}"#,
+            true,
+            always,
+            pin,
         ),
         spec(
             "mail.resend",
@@ -674,17 +683,6 @@ fn need_sent_item(s: &Session) -> Option<&'static str> {
         Some(id) if item_role(s, id) == Some(FolderRole::SentItems) => None,
         _ => Some("Only sent messages can be resent."),
     }
-}
-
-fn need_recallable(s: &Session) -> Option<&'static str> {
-    if need_sent_item(s).is_some() {
-        return Some("Only sent messages can be recalled.");
-    }
-    let exchange = primary_item(s, &Value::Null)
-        .and_then(|id| item_account(s, id))
-        .and_then(|a| s.mailbox.account(a))
-        .is_some_and(|a| a.kind == AccountKind::Exchange);
-    if exchange { None } else { Some("Recall needs a server that supports it.") }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -790,8 +788,32 @@ fn is_me(me: &[String], addr: &str) -> bool {
     !a.is_empty() && me.contains(&a)
 }
 
-/// New Items › Meeting with All: a meeting request to everybody on the selected meeting (organizer and
-/// attendees, without the user), or to the people on the selected message.
+/// Meeting with All is offered for a selected meeting or appointment that has other people on it (organizer
+/// or attendees besides the user), or a selected message (observed disabled with nothing selected).
+fn need_meeting_or_message(s: &Session) -> Option<&'static str> {
+    let me = my_addresses(s);
+    let others = |a: &mailcraft_model::Appointment| {
+        a.organizer
+            .iter()
+            .chain(
+                a.attendees
+                    .iter()
+                    .filter(|x| x.role != mailcraft_model::calendar::AttendeeRole::Resource)
+                    .map(|x| &x.mailbox),
+            )
+            .any(|m| !is_me(&me, &m.addr))
+    };
+    let meeting = s.target_ids(&Value::Null).iter().filter_map(|i| s.mailbox.appointments.get(i)).any(others);
+    if meeting || primary_item(s, &Value::Null).is_some() {
+        None
+    } else {
+        Some("Select a meeting or a message first.")
+    }
+}
+
+/// New Items › Meeting with All (`calendar.meetingWithAll`, also `mail.newItem {"kind": "meetingWithAll"}`):
+/// a meeting request to everybody on the selected meeting (organizer and attendees, without the user), or
+/// to the people on the selected message.
 fn meeting_with_all(s: &mut Session, p: &Value) -> CmdResult {
     let appointment = s.target_ids(p).into_iter().find_map(|id| s.mailbox.appointments.get(&id).cloned());
     let Some(a) = appointment else {
@@ -2251,11 +2273,32 @@ fn view_source(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"dialog": "viewSource", "source": source}))
 }
 
-fn recall(s: &mut Session, p: &Value) -> CmdResult {
-    let Some(focus) = primary_item(s, p) else {
+/// `mail.pin`: pins the target messages to the top of their folder's list, or unpins them when all are
+/// pinned (`on` sets the state). The pin is kept on the message (it follows it to another folder) and is
+/// local: servers have no pin flag.
+fn pin(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = mail_targets(s, p);
+    if ids.is_empty() {
         return Err(CmdError::Disabled("No message is selected.".into()));
+    }
+    let on = match p.get("on") {
+        None | Some(Value::Null) => !ids.iter().all(|i| s.mailbox.mail.get(i).is_some_and(|m| m.pinned)),
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(CmdError::Params("`on` must be true or false".into())),
     };
-    open_dialog(s, "recallMessage", json!({"id": focus.0}))
+    for id in &ids {
+        if let Some(m) = s.mailbox.mail.get_mut(id) {
+            m.pinned = on;
+        }
+    }
+    let max = crate::cmd::view::mail::MAX_PINNED;
+    let folders: BTreeSet<FolderId> =
+        ids.iter().filter_map(|i| s.mailbox.mail.get(i).map(|m| m.folder)).collect();
+    if on && folders.iter().any(|f| crate::cmd::view::mail::pinned_in(s, *f) > max) {
+        // The session rolls the change back.
+        return Err(CmdError::Params(format!("a folder keeps at most {max} pinned messages")));
+    }
+    Ok(json!({ "on": on, "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>() }))
 }
 
 /// Attachments with their data, from the item's stored source (none when no source is kept).
@@ -2428,7 +2471,7 @@ mod tests {
             "mail.newItem",
             "mail.private",
             "mail.quickPrint",
-            "mail.recall",
+            "mail.pin",
             "mail.report",
             "mail.resend",
             "mail.setQuickClickFlag",
@@ -2587,6 +2630,10 @@ mod tests {
         );
         f.s.selection.items = vec![id];
         f.s.selection.focus = Some(id);
+        // The Calendar's New Items › Meeting with All is the same, offered while such an item is selected.
+        assert!(f.s.enabled("calendar.meetingWithAll").is_none());
+        assert_eq!(f.s.run("calendar.meetingWithAll", &json!({})).unwrap()["dialog"], "newMeeting");
+        assert_eq!(last_dialog(&f.s, "newMeeting")["optional"], json!(["Frank <frank@example.com>"]));
         let r = f.s.run("mail.newItem", &json!({"kind": "meetingWithAll"})).unwrap();
         assert_eq!(r["dialog"], "newMeeting");
         let p = last_dialog(&f.s, "newMeeting");
@@ -2601,7 +2648,25 @@ mod tests {
         let p = last_dialog(&f.s, "newMeeting");
         assert_eq!(p["source"], f.c.0);
         assert!(p["attendees"].to_string().contains("alice@example.com"));
-        // Nothing selected.
+        // Nothing selected: disabled (as observed).
+        f.s.selection.items.clear();
+        f.s.selection.focus = None;
+        assert!(f.s.enabled("calendar.meetingWithAll").is_some());
+        // An appointment with nobody else on it.
+        let alone = ItemId(f.s.mailbox.alloc_id());
+        let cal = f.s.mailbox.appointments[&id].folder;
+        f.s.mailbox.appointments.insert(
+            alone,
+            mailcraft_model::Appointment {
+                id: alone,
+                folder: cal,
+                subject: "Dentist".into(),
+                ..Default::default()
+            },
+        );
+        f.s.selection.items = vec![alone];
+        f.s.selection.focus = Some(alone);
+        assert!(f.s.enabled("calendar.meetingWithAll").is_some());
         f.s.selection.items.clear();
         f.s.selection.focus = None;
         assert!(matches!(
@@ -3219,22 +3284,20 @@ mod tests {
     }
 
     #[test]
-    fn recall_and_resend_need_sent_items() {
+    fn resend_needs_sent_items_and_recall_is_gone() {
         let mut f = fx();
-        assert!(need_recallable(&f.s).is_some());
         assert!(need_sent_item(&f.s).is_some());
         let sent = role(&f.s, FolderRole::SentItems);
         f.s.mailbox.move_items(&[f.a], sent).unwrap();
         f.s.selection.folder = sent;
         assert!(need_sent_item(&f.s).is_none());
-        assert!(need_recallable(&f.s).is_some()); // local account
         let r = resend(&mut f.s, &Value::Null).unwrap();
         let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
         assert_eq!(c.subject, "Invoice");
         assert_eq!(c.to, "Test User <test.user@example.net>");
-        f.s.mailbox.accounts[0].kind = AccountKind::Exchange;
-        assert!(need_recallable(&f.s).is_none());
-        assert_eq!(recall(&mut f.s, &Value::Null).unwrap()["dialog"], "recallMessage");
+        // Message recall needs an Exchange server (its catalog row is not applicable): there is no command.
+        f.s.mailbox.accounts[0].kind = mailcraft_model::AccountKind::Exchange;
+        assert!(matches!(f.s.run("mail.recall", &Value::Null), Err(CmdError::Unknown(_))));
     }
 
     #[test]

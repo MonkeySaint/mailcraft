@@ -39,7 +39,8 @@ pub use dates::{DateGroup, ListTime};
 pub use folder::{Folder, FolderKind, FolderRole};
 pub use ids::{AccountId, FolderId, ItemId};
 pub use item::{
-    AttachmentMeta, Body, BodyFormat, FlagState, FocusClass, Importance, MailItem, ResponseState, Sensitivity,
+    AttachmentMeta, Body, BodyFormat, FlagState, FocusClass, Importance, MailItem, ResponseState,
+    Sensitivity, VoteRecord,
 };
 pub use junk::{JunkLevel, JunkList, JunkSettings};
 pub use mailbox::Mailbox;

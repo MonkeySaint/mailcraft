@@ -170,8 +170,7 @@ struct Mem {
     reveal: bool,
     /// Where the context menu was opened, and the menu's spelling suggestions.
     menu: Option<MenuAt>,
-    /// Image URIs already handed to egui's loaders.
-    images: Vec<String>,
+
     /// List markers patched into the cached layout (see [`patch_markers`]).
     markers: Vec<(Vec<usize>, usize, String, String)>,
     /// View Gridlines: cell rectangles of borderless tables, for (doc key, width, zoom).
@@ -1010,43 +1009,56 @@ pub(crate) fn is_followable(href: &str) -> bool {
     ["http://", "https://", "mailto:"].iter().any(|s| lower.starts_with(s) && lower.len() > s.len())
 }
 
-/// egui image URI and bytes of a body picture: `cid:` parts of the compose, `data:…;base64,` URIs.
-fn image_source(c: &ComposeState, cid: u64, src: &str) -> Option<(String, Vec<u8>)> {
-    let s = src.trim();
-    if let Some(content_id) = s.strip_prefix("cid:") {
-        let img = c.inline_images.iter().find(|i| i.content_id.eq_ignore_ascii_case(content_id))?;
-        if img.data.is_empty() {
-            return None;
-        }
-        let ext = img.filename.rsplit('.').next().unwrap_or("bin").to_ascii_lowercase();
-        return Some((format!("bytes://mailcraft/compose-{cid}/{content_id}.{ext}"), img.data.clone()));
-    }
-    let rest = s.strip_prefix("data:")?;
-    let (meta, payload) = rest.split_once(',')?;
-    if !meta.to_ascii_lowercase().ends_with(";base64") || payload.len() > 32 * 1024 * 1024 {
-        return None;
-    }
-    let data = mailcraft_mime::transfer::decode_base64(payload.as_bytes());
-    if data.is_empty() {
-        return None;
-    }
-    let ext = meta.split(';').next().and_then(|m| m.rsplit('/').next()).unwrap_or("bin").to_ascii_lowercase();
-    let key = crate::body::doc_hash(&Doc::from_plain_text(&payload.chars().take(4096).collect::<String>()));
-    Some((format!("bytes://mailcraft/data-{key:016x}-{}.{ext}", payload.len()), data))
+/// The picture data of a `cid:` source in the body: the compose's inline image with that content id.
+fn inline_picture<'a>(c: &'a ComposeState, src: &str) -> Option<&'a [u8]> {
+    let content_id = src.trim().strip_prefix("cid:")?;
+    c.inline_images
+        .iter()
+        .find(|i| i.content_id.eq_ignore_ascii_case(content_id))
+        .map(|i| i.data.as_slice())
+        .filter(|d| !d.is_empty())
 }
 
-/// Paints the compose's pictures over the body painter's placeholders where an egui image loader decodes
-/// them (SVG always; PNG / JPEG / GIF when the app installs those loaders).
-fn paint_images(
-    ui: &Ui,
+/// Most pictures handed over per frame (the decoded-picture cache holds [`crate::body::MAX_IMAGE_CACHE`]).
+const MAX_PROVIDED: usize = crate::body::MAX_IMAGE_CACHE / 2;
+
+/// Hands the compose's `cid:` pictures that the layout shows inside `clip` to the body painter
+/// ([`crate::body::provide_image`], the reading pane's path; `data:` pictures decode in the painter itself).
+/// Returns whether one was decoded just now: it draws from the next frame.
+fn provide_pictures(
+    ctx: &egui::Context,
     layout: &Layout,
     c: &ComposeState,
-    cid: u64,
     origin: Pos2,
-    seen: &mut Vec<String>,
-    hidden: (&[String], Color32),
-) {
-    let ctx = ui.ctx();
+    clip: Rect,
+) -> bool {
+    let mut fresh = false;
+    let mut handed = 0usize;
+    for item in &layout.display.items {
+        let DisplayItem::Image { rect, src, .. } = item else {
+            continue;
+        };
+        let r = Rect::from_min_size(pos2(origin.x + rect.x, origin.y + rect.y), vec2(rect.w, rect.h));
+        if !r.is_finite() || !r.intersects(clip) {
+            continue;
+        }
+        let Some(data) = inline_picture(c, src) else {
+            continue;
+        };
+        if handed >= MAX_PROVIDED {
+            break;
+        }
+        handed = handed.saturating_add(1);
+        fresh |= crate::body::provide_image_fresh(ctx, src, data);
+    }
+    fresh
+}
+
+/// Covers the pictures hidden in the Selection pane with the page colour (they stay in the message).
+fn cover_hidden_pictures(ui: &Ui, layout: &Layout, origin: Pos2, hidden: &[String], page: Color32) {
+    if hidden.is_empty() {
+        return;
+    }
     let clip = ui.clip_rect();
     let painter = ui.painter().with_clip_rect(clip);
     for item in &layout.display.items {
@@ -1054,34 +1066,8 @@ fn paint_images(
             continue;
         };
         let r = Rect::from_min_size(pos2(origin.x + rect.x, origin.y + rect.y), vec2(rect.w, rect.h));
-        if !r.intersects(clip) || !r.is_finite() || r.width() < 1.0 || r.height() < 1.0 {
-            continue;
-        }
-        // Hidden in the Selection pane: covered with the page colour (still in the message).
-        if hidden.0.contains(src) {
-            painter.rect_filled(r.expand(1.0), 0.0, hidden.1);
-            continue;
-        }
-        let Some((uri, data)) = image_source(c, cid, src) else {
-            continue;
-        };
-        if !seen.contains(&uri) {
-            ctx.include_bytes(uri.clone(), data);
-            if seen.len() < 512 {
-                seen.push(uri.clone());
-            }
-        }
-        match ctx.try_load_texture(&uri, egui::TextureOptions::LINEAR, egui::SizeHint::default()) {
-            Ok(egui::load::TexturePoll::Ready { texture }) => {
-                painter.image(
-                    texture.id,
-                    r,
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            }
-            Ok(egui::load::TexturePoll::Pending { .. }) => ctx.request_repaint(),
-            Err(_) => {}
+        if r.is_finite() && r.intersects(clip) && hidden.contains(src) {
+            painter.rect_filled(r.expand(1.0), 0.0, page);
         }
     }
 }
@@ -1557,7 +1543,12 @@ pub(crate) fn body_editor_in(
     }
     let hidden = super::panes::hidden_objects(&ctx, cid);
     if let Some(layout) = mem.view.layout.as_ref() {
-        paint_images(ui, layout, c, cid, origin, &mut mem.images, (&hidden, bg));
+        // The body painter drew the pictures it already has; the ones it lacks are handed over for the
+        // next frame.
+        if provide_pictures(&ctx, layout, c, origin, ui.clip_rect()) {
+            ctx.request_repaint();
+        }
+        cover_hidden_pictures(ui, layout, origin, &hidden, bg);
     }
     if c.editor.show_gridlines {
         let key = (mem.doc_key, text_w.to_bits(), zoom.to_bits());
@@ -1987,23 +1978,55 @@ mod tests {
         assert!(object_at(&layout, &c, mailcraft_geom::Point { x: r.x - 30.0, y: r.y - 30.0 }).is_none());
     }
 
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([10, 120, 200, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
     #[test]
-    fn picture_sources_resolve_cid_and_data_uris() {
+    fn compose_pictures_go_through_the_body_painter() {
         let mut c = ComposeState::default();
-        c.inline_images.push(mailcraft_engine::compose::InlineImage {
-            content_id: "image001@x".into(),
-            filename: "dot.svg".into(),
-            mime_type: "image/svg+xml".into(),
-            data: b"<svg/>".to_vec(),
-        });
-        let (uri, data) = image_source(&c, 3, "cid:image001@x").unwrap();
-        assert!(uri.starts_with("bytes://mailcraft/compose-3/") && uri.ends_with(".svg"), "{uri}");
-        assert_eq!(data, b"<svg/>");
-        assert!(image_source(&c, 3, "cid:missing").is_none());
-        let (uri, data) = image_source(&c, 3, "data:image/png;base64,aGVsbG8=").unwrap();
-        assert!(uri.ends_with(".png"));
-        assert_eq!(data, b"hello");
-        assert!(image_source(&c, 3, "data:text/plain,hello").is_none());
-        assert!(image_source(&c, 3, "https://example.com/a.png").is_none());
+        c.insert_text("ab");
+        for (cid, name, mime, data) in [
+            ("p1@x", "p.png", "image/png", png(6, 3)),
+            ("s1@x", "s.svg", "image/svg+xml", br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"><rect width="8" height="4" fill="red"/></svg>"#.to_vec()),
+            ("bad@x", "b.png", "image/png", b"junk".to_vec()),
+        ] {
+            c.insert_image(
+                mailcraft_engine::compose::InlineImage {
+                    content_id: cid.into(),
+                    filename: name.into(),
+                    mime_type: mime.into(),
+                    data,
+                },
+                "Pic",
+                Some(40.0),
+                Some(20.0),
+            );
+        }
+        assert_eq!(inline_picture(&c, "cid:P1@x").map(<[u8]>::len), Some(png(6, 3).len()));
+        assert!(inline_picture(&c, "cid:missing").is_none());
+        assert!(inline_picture(&c, "https://example.com/a.png").is_none());
+        let db = mailcraft_fonts::FontDb::bundled();
+        let layout = layout_doc(&c.body, &db, &LayoutOptions { width: 400.0, ..LayoutOptions::default() });
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        // Off screen: nothing is decoded.
+        assert!(!provide_pictures(&ctx, &layout, &c, pos2(0.0, 5_000.0), screen));
+        assert!(crate::body::image_texture(&ctx, "cid:p1@x").is_none());
+        // On screen: the PNG and the SVG are decoded once, into the cache the body painter draws from.
+        assert!(provide_pictures(&ctx, &layout, &c, Pos2::ZERO, screen));
+        assert_eq!(crate::body::image_texture(&ctx, "cid:p1@x").map(|t| t.size()), Some([6, 3]));
+        assert!(crate::body::image_texture(&ctx, "cid:s1@x").is_some_and(|t| t.size()[0] >= 8));
+        assert!(crate::body::image_texture(&ctx, "cid:bad@x").is_none(), "junk keeps the placeholder");
+        assert!(!provide_pictures(&ctx, &layout, &c, Pos2::ZERO, screen), "already decoded");
+        // An edited picture (same content id, new bytes) is decoded again.
+        if let Some(img) = c.inline_images.iter_mut().find(|i| i.content_id == "p1@x") {
+            img.data = png(2, 2);
+        }
+        assert!(provide_pictures(&ctx, &layout, &c, Pos2::ZERO, screen));
+        assert_eq!(crate::body::image_texture(&ctx, "cid:p1@x").map(|t| t.size()), Some([2, 2]));
     }
 }

@@ -1,6 +1,6 @@
 //! Small and informational dialogs: About, Help, What's New, Feedback, Contact Support, generic message,
-//! Exit, Save Changes, View Source, Reveal Path, search tools, Send/Receive progress, Recall, Ribbon Display
-//! Options, Quick Access Toolbar. (Quick steps: `quicksteps.rs`; the Reminders window: `modules`.)
+//! Exit, Save Changes, View Source, Reveal Path, search tools, Send/Receive progress, Ribbon Display Options,
+//! Quick Access Toolbar. (Quick steps: `quicksteps.rs`; the Reminders window: `modules`.)
 
 use egui::{Context, RichText, Sense, Vec2};
 use serde_json::{Value, json};
@@ -28,7 +28,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         }
         "searchTools" => search_tools(ctx, app, d),
         "indexingStatus" => indexing(ctx, app, d),
-        "recallMessage" => recall(ctx, app, d),
+
         "ribbonDisplayOptions" => ribbon_display(ctx, app, d),
         "quickAccess" => quick_access(ctx, app, d),
         _ => return None,
@@ -384,45 +384,6 @@ fn indexing(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         muted(ui, app, &format!("{} messages searchable.", app.s.mailbox.mail.len()));
         ok_only(ui, app)
     })
-}
-
-#[derive(Clone, Default)]
-struct RecallState {
-    replace: bool,
-    tell: bool,
-}
-
-fn recall(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    with_state(
-        ctx,
-        app,
-        uid,
-        |_: &App| RecallState { replace: false, tell: true },
-        |st, app| {
-            window(ctx, app, d, "Recall This Message", 420.0, |ui, app| {
-                muted(ui, app, "Recipients may already have read the message.");
-                ui.radio_value(&mut st.replace, false, "Delete unread copies of this message");
-                ui.radio_value(&mut st.replace, true, "Delete unread copies and replace with a new message");
-                ui.checkbox(&mut st.tell, "Tell me if recall succeeds or fails for each recipient");
-                match ok_cancel(ui, app, true) {
-                    Some(true) => {
-                        if st.replace {
-                            app.run("mail.resend", json!({"ids": [d.u64("id")]}));
-                            Out::Close
-                        } else {
-                            Out::close_open(
-                                "message",
-                                json!({"title": "Recall This Message", "text": "Recall needs a server that supports it. The message stays with its recipients."}),
-                            )
-                        }
-                    }
-                    Some(false) => Out::Close,
-                    None => Out::Keep,
-                }
-            })
-        },
-    )
 }
 
 #[derive(Clone, Default)]

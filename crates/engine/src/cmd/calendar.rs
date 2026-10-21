@@ -3212,6 +3212,42 @@ fn apply_response(
     Ok((Some(id), a, me))
 }
 
+/// Puts the meeting request `msg` (carried by `mail`) on the user's calendar as Tentative until it is
+/// answered (new mail with Options › Mail › Tracking › "Automatically process meeting requests and
+/// responses…" on): the copy goes to the account's calendar with the default reminder (Options ›
+/// Calendar), the user's response on it stays "none", so Accept / Tentative / Decline still apply and then
+/// update it (Decline removes it). Requests for a meeting already on the calendar, about one occurrence,
+/// organized by the user or without a UID are left alone, and the message stays unread. Returns the
+/// calendar item placed.
+pub fn place_tentative(s: &mut Session, mail: ItemId, msg: &ItipMessage) -> Result<Option<ItemId>, CmdError> {
+    let uid = msg.event.appointment.uid.trim();
+    if !matches!(msg.method, Method::Request | Method::Add)
+        || msg.event.recurrence_id.is_some()
+        || uid.is_empty()
+        || find_by_uid(s, uid).is_some()
+        || !meeting_message_from(s, mail, msg).can_respond
+    {
+        return Ok(None);
+    }
+    let was_read = s.mailbox.mail.get(&mail).is_some_and(|m| m.read);
+    let (item, ..) = apply_response(s, mail, msg, ResponseStatus::None)?;
+    if let Some(m) = s.mailbox.mail.get_mut(&mail) {
+        m.read = was_read;
+    }
+    if let Some(id) = item {
+        let mut ids = vec![id];
+        if let Some(a) = s.mailbox.appointments.get(&id) {
+            ids.extend(exceptions_of(s, a));
+        }
+        for i in ids {
+            if let Some(a) = s.mailbox.appointments.get_mut(&i) {
+                a.show_as = BusyStatus::Tentative;
+            }
+        }
+    }
+    Ok(item)
+}
+
 fn mark_read(s: &mut Session, mail: ItemId) {
     if let Some(m) = s.mailbox.mail.get_mut(&mail) {
         m.read = true;

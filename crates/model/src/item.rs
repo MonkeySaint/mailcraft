@@ -93,6 +93,24 @@ pub struct AttachmentMeta {
     pub inline: bool,
 }
 
+/// A voting response recorded on the message it answers (the sent original), so the tally keeps it after
+/// the response itself is deleted for good.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteRecord {
+    /// Responder's address (empty when the response named none).
+    pub from: String,
+    /// The voting choice, as the message offers it.
+    pub choice: String,
+    /// When the response was sent (else received).
+    pub when: DateTime,
+    /// The response message, while it exists.
+    #[serde(default)]
+    pub response: Option<ItemId>,
+}
+
+/// Most voting responses recorded on one message (one per responder).
+pub const MAX_VOTE_RECORDS: usize = 2_000;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailItem {
     pub id: ItemId,
@@ -134,6 +152,12 @@ pub struct MailItem {
     pub blob: Option<String>,
     /// Original RFC 5322 source when kept (needed for Forward as Attachment, View Source, export).
     pub raw: Option<Vec<u8>>,
+    /// Pinned to the top of its folder's list (Quick Action Pin / Unpin, `mail.pin`). Local only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// Voting responses to this message recorded as they arrived (latest per responder).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub votes: Vec<VoteRecord>,
 }
 
 impl MailItem {
@@ -242,6 +266,61 @@ impl MailItem {
     /// Size label as in the list/accessible name: "N KB" (rounded up, min 1).
     pub fn size_label(&self) -> String {
         format!("{} KB", self.size.div_ceil(1024).max(1))
+    }
+    /// Takes from `old` (the same message before it was downloaded again, e.g. a header-only item getting
+    /// its body) everything that is not read from the message source: id, folder, read, flag, categories,
+    /// response, draft, server id, arrival time, Focused, Ignore, conversation, pin and recorded votes.
+    pub fn keep_local_state(&mut self, old: &MailItem) {
+        // Every field is named, so a new one has to be sorted into "local" or "from the source" here.
+        let MailItem {
+            id,
+            folder,
+            message_id: _,
+            in_reply_to: _,
+            references: _,
+            subject: _,
+            from: _,
+            sender: _,
+            to: _,
+            cc: _,
+            bcc: _,
+            reply_to: _,
+            sent: _,
+            received,
+            size: _,
+            read,
+            importance: _,
+            sensitivity: _,
+            flag,
+            categories,
+            attachments: _,
+            preview: _,
+            body: _,
+            is_draft,
+            response,
+            focus,
+            conversation,
+            ignored,
+            remote_id,
+            blob: _,
+            raw: _,
+            pinned,
+            votes,
+        } = old;
+        self.id = *id;
+        self.folder = *folder;
+        self.received = *received;
+        self.read = *read;
+        self.flag = flag.clone();
+        self.categories = categories.clone();
+        self.is_draft = *is_draft;
+        self.response = response.clone();
+        self.focus = *focus;
+        self.conversation = *conversation;
+        self.ignored = *ignored;
+        self.remote_id = remote_id.clone();
+        self.pinned = *pinned;
+        self.votes = votes.clone();
     }
 }
 

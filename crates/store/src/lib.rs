@@ -408,8 +408,10 @@ impl Store {
         self.lock.refresh_if_due();
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_journal_cap(&mut self, cap: u64) {
+    /// Lowers the journal size cap ([`journal::MAX_STATE_BYTES`] by default): appends past it fail. Tests use
+    /// it to make a store write fail.
+    #[doc(hidden)]
+    pub fn set_journal_cap(&mut self, cap: u64) {
         self.journal_cap = cap;
     }
 

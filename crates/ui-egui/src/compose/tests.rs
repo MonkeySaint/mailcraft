@@ -1228,3 +1228,48 @@ fn paste_defaults_follow_where_the_text_was_copied() {
     });
     assert!(!bold, "kept text only: {:?}", c.body);
 }
+
+#[test]
+fn f6_cycles_header_fields_body_and_ribbon_in_a_compose_window() {
+    let (app, cid) = app_with_compose(false);
+    let mut h = Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+        |ui, app: &mut App| {
+            crate::keys::handle(ui.ctx(), app, crate::Surface::Main);
+            compose_windows(ui.ctx(), app);
+        },
+        app,
+    );
+    h.run_steps(3);
+    let focused = |h: &Harness<'_, App>| h.ctx.memory(|m| m.focused());
+    // A new message starts in To.
+    assert_eq!(focused(&h), Some(field_id(cid, Field::To)));
+    let surface = crate::Surface::Compose(cid);
+    let pane = |h: &Harness<'_, App>| crate::keys::window_pane(&h.ctx, surface);
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    assert_eq!((pane(&h).as_deref(), focused(&h)), (Some("body"), Some(editor_id(cid))));
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    assert_eq!(pane(&h).as_deref(), Some("ribbon"));
+    assert!(crate::keys::widget_focused(&h.ctx), "the selected ribbon tab has focus");
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    assert_eq!((pane(&h).as_deref(), focused(&h)), (Some("header"), Some(field_id(cid, Field::To))));
+    // Shift+F6 goes back; typing in To still works afterwards.
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F6);
+    h.run_steps(2);
+    assert_eq!(pane(&h).as_deref(), Some("ribbon"));
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F6);
+    h.run_steps(2);
+    assert_eq!((pane(&h).as_deref(), focused(&h)), (Some("body"), Some(editor_id(cid))));
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F6);
+    h.run_steps(2);
+    assert_eq!(focused(&h), Some(field_id(cid, Field::To)));
+    h.get_by_role_and_label(Role::TextInput, "To").type_text("ann@example.com");
+    h.run();
+    assert_eq!(compose(&h, cid).to, "ann@example.com");
+    // A click in the window ends the F6 ring.
+    h.get_by_label(BODY_LABEL).click();
+    h.run_steps(2);
+    assert_eq!(pane(&h), None);
+}

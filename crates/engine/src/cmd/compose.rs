@@ -242,12 +242,38 @@ fn valid_addr(addr: &str) -> bool {
         && !domain.starts_with('.')
 }
 
-/// Splits a recipient field at the `;` separators that are outside quoted names and angle brackets; the
-/// entries come back trimmed, empty ones dropped.
-pub(crate) fn split_recipients(field: &str) -> Vec<&str> {
-    let mut out = Vec::new();
+// ---------------------------------------------------------------------------------------------------------
+// Recipient fields
+//
+// A recipient field (To, Cc, Bcc, Direct Replies To) holds entries separated by `;` outside quoted names and
+// angle brackets, and each entry is one recipient: an address, "Name <address>", or a name still to be
+// resolved (Check Names). How commas are read depends on where the text comes from ([`RecipientInput`]):
+// - typed into the compose window's recipient boxes (`compose.setTo` / `setCc` / `setBcc` with
+//   `"typed": true`): a comma separates recipients only while File › Options › Mail › Send messages ›
+//   "Commas can be used to separate multiple message recipients" (`mail.send.commasSeparate`) is on. With it
+//   off, a comma belongs to the entry: "Rivera, Alice" is one name to resolve, and "a@example.com,
+//   b@example.com" is one entry that is not an address;
+// - anything else (CLI, MCP, the control channel, mailto: links, the Address Book: no `typed`) is an RFC 5322
+//   address list, so a comma always separates recipients.
+// A separating comma is stored as `;` (same length, so a text cursor stays put), which means a stored field
+// never uses commas as separators and [`parse_recipients`] reads one recipient per entry. One entry written
+// as "Last, First <address>" stays one recipient either way.
+
+/// Where the text of a recipient field comes from (see "Recipient fields" above).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecipientInput {
+    /// Typed into a recipient box: commas follow `mail.send.commasSeparate`.
+    Typed,
+    /// An RFC 5322 address list: commas separate.
+    List,
+}
+
+/// Byte offsets of the separators of a recipient field, in order: `;` outside quoted names and angle
+/// brackets and, when `commas`, `,` likewise (except inside a "Last, First <address>" entry).
+fn recipient_separators(field: &str, commas: bool) -> Vec<usize> {
+    let mut semis = Vec::new();
+    let mut comma_at = Vec::new();
     let (mut quoted, mut escaped, mut angle) = (false, false, false);
-    let mut start = 0usize;
     for (i, ch) in field.char_indices() {
         if escaped {
             escaped = false;
@@ -258,15 +284,84 @@ pub(crate) fn split_recipients(field: &str) -> Vec<&str> {
             '"' => quoted = !quoted,
             '<' if !quoted => angle = true,
             '>' if !quoted => angle = false,
-            ';' if !quoted && !angle => {
-                out.extend(field.get(start..i));
-                start = i.saturating_add(1);
-            }
+            ';' if !quoted && !angle => semis.push(i),
+            ',' if commas && !quoted && !angle => comma_at.push(i),
             _ => {}
         }
     }
+    if comma_at.is_empty() {
+        return semis;
+    }
+    // Commas inside an entry that is one comma-named mailbox stay part of its name.
+    let mut out = semis.clone();
+    let mut start = 0usize;
+    let mut pending = comma_at.iter().copied().peekable();
+    for end in semis.iter().copied().chain(std::iter::once(field.len())) {
+        let whole = field.get(start..end).is_some_and(|e| comma_named_mailbox(e).is_some());
+        while let Some(c) = pending.next_if(|&c| c < end) {
+            if !whole {
+                out.push(c);
+            }
+        }
+        start = end.saturating_add(1);
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Splits a recipient field at the `;` separators that are outside quoted names and angle brackets; the
+/// entries come back trimmed, empty ones dropped.
+pub(crate) fn split_recipients(field: &str) -> Vec<&str> {
+    split_recipients_with(field, false)
+}
+
+/// [`split_recipients`], also splitting at separating commas when `commas`.
+pub(crate) fn split_recipients_with(field: &str, commas: bool) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for i in recipient_separators(field, commas) {
+        out.extend(field.get(start..i));
+        start = i.saturating_add(1);
+    }
     out.extend(field.get(start..));
     out.into_iter().map(str::trim).filter(|x| !x.is_empty()).collect()
+}
+
+/// Whether commas separate recipients in text that came in as `input`.
+pub(crate) fn commas_separate(s: &Session, input: RecipientInput) -> bool {
+    match input {
+        RecipientInput::List => true,
+        RecipientInput::Typed => s.settings.bool("mail.send.commasSeparate"),
+    }
+}
+
+/// A recipient field as stored: its separating commas (when commas separate for `input`) turned into `;`.
+pub(crate) fn store_recipients(s: &Session, text: &str, input: RecipientInput) -> String {
+    if !commas_separate(s, input) || !text.contains(',') {
+        return text.to_owned();
+    }
+    let commas: Vec<usize> = recipient_separators(text, true)
+        .into_iter()
+        .filter(|&i| text.as_bytes().get(i) == Some(&b','))
+        .collect();
+    let mut out = String::with_capacity(text.len());
+    let mut start = 0usize;
+    for i in commas {
+        out.push_str(text.get(start..i).unwrap_or(""));
+        out.push(';');
+        start = i.saturating_add(1);
+    }
+    out.push_str(text.get(start..).unwrap_or(""));
+    out
+}
+
+/// The `typed` param of `compose.setTo` / `setCc` / `setBcc`.
+fn recipient_input(p: &Value) -> Result<RecipientInput, CmdError> {
+    match p.get("typed") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(RecipientInput::List),
+        Some(Value::Bool(true)) => Ok(RecipientInput::Typed),
+        Some(_) => Err(CmdError::Params("`typed` must be true or false".into())),
+    }
 }
 
 /// One entry written as an unquoted display name with commas and an angle address ("Rivera, Alice
@@ -296,8 +391,9 @@ pub(crate) fn parse_field_mailbox(text: &str) -> Option<mailcraft_mime::Mailbox>
     comma_named_mailbox(first).or_else(|| mailcraft_mime::addr::parse_mailbox(first))
 }
 
-/// Parses a recipient field ("a@b; Name <c@d>; Last, First <e@f>"). Returns the addresses, or the entries
-/// that are not valid addresses.
+/// Parses a stored recipient field ("a@b; Name <c@d>; Last, First <e@f>"): one recipient per `;` entry (see
+/// "Recipient fields" above). Returns the addresses, or the entries that are not valid addresses (an entry
+/// holding several addresses, "a@b, c@d" typed while commas do not separate, is one bad entry).
 pub(crate) fn parse_recipients(field: &str) -> Result<Vec<Address>, Vec<String>> {
     let mut out = Vec::new();
     let mut bad = Vec::new();
@@ -311,21 +407,29 @@ pub(crate) fn parse_recipients(field: &str) -> Result<Vec<Address>, Vec<String>>
             continue;
         }
         let list = parse_address_list(piece);
-        if list.is_empty() {
+        let [a] = list.as_slice() else {
             bad.push(piece.to_owned());
             continue;
-        }
-        for a in list {
-            if a.mailboxes().iter().all(|m| valid_addr(&m.addr)) {
-                out.push(a);
-            } else {
-                for m in a.mailboxes().iter().filter(|m| !valid_addr(&m.addr)) {
-                    bad.push(m.to_display_string());
-                }
+        };
+        if a.mailboxes().iter().all(|m| valid_addr(&m.addr)) {
+            out.push(a.clone());
+        } else {
+            for m in a.mailboxes().iter().filter(|m| !valid_addr(&m.addr)) {
+                bad.push(m.to_display_string());
             }
         }
     }
     if bad.is_empty() { Ok(out) } else { Err(bad) }
+}
+
+/// [`parse_recipients`] for building a message (sending checks the fields first; drafts keep what the user
+/// typed): an entry that is not one recipient is read as an address list, so "a@b, c@d" typed while commas
+/// do not separate keeps both addresses, and a name waiting for Check Names keeps its words.
+pub(crate) fn parse_recipients_lenient(field: &str) -> Vec<Address> {
+    split_recipients(field)
+        .into_iter()
+        .flat_map(|piece| parse_recipients(piece).unwrap_or_else(|_| parse_address_list(piece)))
+        .collect()
 }
 
 /// MIME type guessed from a file name's extension (table in [`crate::compose::mime_for_name`]).
@@ -589,10 +693,7 @@ pub(crate) fn build_message(
     account: Option<&Account>,
     for_draft: bool,
 ) -> MessageBuilder {
-    let lenient = |f: &str| match parse_recipients(f) {
-        Ok(v) => v,
-        Err(_) => parse_address_list(f),
-    };
+    let lenient = parse_recipients_lenient;
     let mut b = MessageBuilder::new();
     let from = account.filter(|a| !a.address.trim().is_empty()).map(|a| {
         let name = if a.sender_name.trim().is_empty() { a.display_name.trim() } else { a.sender_name.trim() };
@@ -1091,8 +1192,14 @@ fn field_value(p: &Value) -> Result<String, CmdError> {
         .ok_or_else(|| CmdError::Params("`value` (string) required".into()))
 }
 
+/// A recipient field's new text from `value`, read by the `typed` rule (see "Recipient fields").
+fn recipient_value(s: &Session, p: &Value) -> Result<String, CmdError> {
+    let input = recipient_input(p)?;
+    Ok(store_recipients(s, &field_value(p)?, input))
+}
+
 fn set_to(s: &mut Session, p: &Value) -> CmdResult {
-    let v = field_value(p)?;
+    let v = recipient_value(s, p)?;
     let c = compose_mut(s, p)?;
     c.to = v;
     c.dirty = true;
@@ -1100,7 +1207,7 @@ fn set_to(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn set_cc(s: &mut Session, p: &Value) -> CmdResult {
-    let v = field_value(p)?;
+    let v = recipient_value(s, p)?;
     let c = compose_mut(s, p)?;
     c.cc = v;
     c.dirty = true;
@@ -1108,7 +1215,7 @@ fn set_cc(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn set_bcc(s: &mut Session, p: &Value) -> CmdResult {
-    let v = field_value(p)?;
+    let v = recipient_value(s, p)?;
     let c = compose_mut(s, p)?;
     c.bcc = v;
     c.show_bcc = true;
@@ -1590,7 +1697,8 @@ fn direct_replies_to(s: &mut Session, p: &Value) -> CmdResult {
     let Some(addresses) = opt_str(p, "addresses") else {
         return dialog(s, "messageOptions", json!({"compose": compose_id(s, p)?, "focus": "replies"}));
     };
-    if let Err(bad) = parse_recipients(addresses) {
+    let addresses = store_recipients(s, addresses, RecipientInput::List);
+    if let Err(bad) = parse_recipients(&addresses) {
         return Err(CmdError::Params(format!("not valid email addresses: {}", bad.join("; "))));
     }
     let c = compose_mut(s, p)?;
@@ -2583,6 +2691,57 @@ fn vote_of(s: &Session, m: &MailItem, choices: &[String]) -> Option<String> {
     pick(head)
 }
 
+/// Records the voting response `response` on the message it answers (a message I sent with voting buttons),
+/// so the tally keeps the vote after the response is deleted and Deleted Items is emptied: one record per
+/// responder, the latest kept. Returns the original's id when the response was recorded.
+pub(crate) fn record_vote(s: &mut Session, response: ItemId) -> Option<ItemId> {
+    let x = s.mailbox.mail.get(&response)?;
+    if item_sent_by_me(s, x) {
+        return None;
+    }
+    let parents: Vec<String> = x.in_reply_to.iter().map(|r| bare_id(r)).filter(|r| !r.is_empty()).collect();
+    if parents.is_empty() {
+        return None;
+    }
+    let original = s
+        .mailbox
+        .mail
+        .values()
+        .filter(|m| m.id != response)
+        .find(|m| m.message_id.as_deref().map(bare_id).is_some_and(|mid| parents.contains(&mid)))
+        .filter(|m| item_sent_by_me(s, m))?;
+    let choices = stored_raw(s, original)
+        .and_then(|raw| raw_headers(&raw).text(VOTING_HEADER))
+        .map(|v| voting_choices(&v))
+        .unwrap_or_default();
+    if choices.is_empty() {
+        return None;
+    }
+    let choice = vote_of(s, x, &choices)?;
+    let from = x.from.as_ref().map(|f| f.addr.trim().to_owned()).unwrap_or_default();
+    let when = x.sent.unwrap_or(x.received);
+    let id = original.id;
+    let record = mailcraft_model::VoteRecord { from, choice, when, response: Some(response) };
+    let o = s.mailbox.mail.get_mut(&id)?;
+    let same = |v: &mailcraft_model::VoteRecord| {
+        v.response == Some(response) || (!record.from.is_empty() && v.from.eq_ignore_ascii_case(&record.from))
+    };
+    match o.votes.iter_mut().find(|v| same(v)) {
+        // An older response from the same person gives way; a newer one already recorded stays.
+        Some(old) if old.when <= record.when => *old = record,
+        Some(_) => {}
+        None => {
+            if o.votes.len() >= mailcraft_model::item::MAX_VOTE_RECORDS
+                && let Some(oldest) = o.votes.iter().enumerate().min_by_key(|(_, v)| v.when).map(|(i, _)| i)
+            {
+                o.votes.remove(oldest);
+            }
+            o.votes.push(record);
+        }
+    }
+    Some(id)
+}
+
 /// Tracking state of message `id` (voting buttons and responses, receipts, a pending read-receipt request).
 pub fn tracking(s: &Session, id: ItemId) -> Option<Tracking> {
     let m = s.mailbox.mail.get(&id)?;
@@ -2663,6 +2822,26 @@ pub fn tracking(s: &Session, id: ItemId) -> Option<Tracking> {
         {
             read_report(&msg, &mid, x.received, &mut t.receipts);
         }
+    }
+    // Votes recorded on the message as they arrived count too, also once their responses are gone for good
+    // (a response still in the mailbox and its record are one vote).
+    if t.sent_by_me && update_sent && !t.choices.is_empty() {
+        for v in m.votes.iter().take(mailcraft_model::item::MAX_VOTE_RECORDS) {
+            let response = v.response.map_or(0, |i| i.0);
+            let live = t.responses.iter_mut().find(|r| {
+                (response != 0 && r.item == response)
+                    || (!v.from.is_empty() && r.from.eq_ignore_ascii_case(&v.from))
+            });
+            let choice = t.choices.iter().find(|c| c.eq_ignore_ascii_case(&v.choice)).cloned();
+            let Some(choice) = choice else { continue };
+            let stored = VoteResponse { item: response, from: v.from.clone(), choice, when: v.when };
+            match live {
+                Some(r) if r.when < v.when => *r = stored,
+                Some(_) => {}
+                None => t.responses.push(stored),
+            }
+        }
+        t.responses.sort_by_key(|r| (r.when, r.item));
     }
     t.tally = t
         .choices
@@ -2880,7 +3059,9 @@ fn send_read_receipt(s: &mut Session, p: &Value) -> CmdResult {
     if automatic && t.read_receipt_ask {
         return Ok(json!({"sent": false, "ask": true}));
     }
-    if parse_recipients(&to).map(|v| v.is_empty()).unwrap_or(true) {
+    // The header is an RFC 5322 address list.
+    if parse_recipients(&store_recipients(s, &to, RecipientInput::List)).map(|v| v.is_empty()).unwrap_or(true)
+    {
         return Err(CmdError::Failed(format!("the read receipt address is not valid: {to}")));
     }
     let account = crate::cmd::mail::item_account(s, id)
@@ -3192,7 +3373,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "To",
             "Compose › Header",
             "",
-            r#"{"value":string}"#,
+            r#"{"value":string,"typed"?:bool (typed in the window: commas separate only with Options › Mail › "Commas can be used to separate multiple message recipients"; else an RFC 5322 list)}"#,
             false,
             has_compose,
             set_to,
@@ -3202,7 +3383,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Cc",
             "Compose › Header",
             "",
-            r#"{"value":string}"#,
+            r#"{"value":string,"typed"?:bool}"#,
             false,
             has_compose,
             set_cc,
@@ -3212,7 +3393,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Bcc",
             "Compose › Header",
             "",
-            r#"{"value":string}"#,
+            r#"{"value":string,"typed"?:bool}"#,
             false,
             has_compose,
             set_bcc,
@@ -4083,8 +4264,11 @@ Original-Message-ID: <{mid}>\nDisposition: manual-action/MDN-sent-manually; disp
                 (None, "c@example.net")
             ]
         );
-        // Comma-separated addresses typed into one field still split.
-        assert_eq!(parse_recipients("a@example.com, Bob <b@example.com>").unwrap().len(), 2);
+        // A stored field has one recipient per entry: commas that separated were stored as `;`.
+        assert_eq!(
+            parse_recipients("a@example.com, Bob <b@example.com>"),
+            Err(vec!["a@example.com, Bob <b@example.com>".to_owned()])
+        );
         assert!(parse_recipients("Rivera, Alice").is_err());
         assert!(parse_recipients("\"unterminated; x@example.com").is_err());
         // Check Names keeps such entries as resolved.
@@ -4094,6 +4278,95 @@ Original-Message-ID: <{mid}>\nDisposition: manual-action/MDN-sent-manually; disp
         let r = s.run("compose.checkNames", &json!({})).unwrap();
         assert_eq!(r["resolved"], 1, "{r}");
         assert_eq!(s.composes[&id].to, "Rivera, Alice <alice@example.com>");
+    }
+
+    #[test]
+    fn commas_in_recipient_fields_follow_the_rule() {
+        let mut s = session();
+        let id = open(&mut s);
+        let to = |s: &mut Session, v: Value| {
+            s.run("compose.setTo", &v).unwrap()["to"].as_str().unwrap().to_owned()
+        };
+        let list = "a@example.com, Bob <b@example.com>, Rivera, Alice <alice@example.com>; \"Doe, Jo\" <jo@example.org>";
+        // CLI / MCP / mailto: an RFC 5322 list, commas always separate (quoted names keep theirs; an unquoted
+        // name with a comma is whole only as an entry of its own).
+        assert_eq!(
+            to(&mut s, json!({"value": list})),
+            "a@example.com; Bob <b@example.com>; Rivera; Alice <alice@example.com>; \"Doe, Jo\" <jo@example.org>"
+        );
+        assert_eq!(parse_recipients(&s.composes[&id].to), Err(vec!["Rivera".to_owned()]));
+        assert_eq!(
+            to(&mut s, json!({"value": "a@example.com,b@example.com"})),
+            "a@example.com;b@example.com"
+        );
+        assert_eq!(parse_recipients(&s.composes[&id].to).unwrap().len(), 2);
+        assert_eq!(
+            to(&mut s, json!({"value": "Rivera, Alice <alice@example.com>"})),
+            "Rivera, Alice <alice@example.com>"
+        );
+        // Typed in the window with the option off (the default): commas are part of the entry.
+        let typed = json!({"value": "a@example.com, b@example.com; Smith, John", "typed": true});
+        assert_eq!(to(&mut s, typed.clone()), "a@example.com, b@example.com; Smith, John");
+        assert_eq!(
+            parse_recipients(&s.composes[&id].to),
+            Err(vec!["a@example.com, b@example.com".to_owned(), "Smith, John".to_owned()])
+        );
+        let r = s.run("compose.send", &json!({})).unwrap();
+        assert_eq!(r["sent"], false, "{r}");
+        // With "Commas can be used to separate multiple message recipients" on, they separate.
+        s.settings.set("mail.send.commasSeparate", &json!(true)).unwrap();
+        assert_eq!(to(&mut s, typed), "a@example.com; b@example.com; Smith; John");
+        assert_eq!(
+            to(
+                &mut s,
+                json!({"value": "Rivera, Alice <alice@example.com>; c@example.net, d@example.org", "typed": true})
+            ),
+            "Rivera, Alice <alice@example.com>; c@example.net; d@example.org"
+        );
+        // Same length, so the text cursor stays where it was.
+        assert_eq!(store_recipients(&s, "x@y.z ,w@v.u", RecipientInput::Typed).len(), "x@y.z ,w@v.u".len());
+        assert!(s.run("compose.setCc", &json!({"value": "a@example.com", "typed": "yes"})).is_err());
+        // Direct Replies To takes an RFC 5322 list.
+        s.run("compose.directRepliesTo", &json!({"addresses": "r1@example.com, r2@example.com"})).unwrap();
+        assert_eq!(s.composes[&id].reply_to, "r1@example.com; r2@example.com");
+        // Splitting with commas, for callers that read text from elsewhere.
+        assert_eq!(
+            split_recipients_with("a@x.org, b@y.org; \"c, d\" <c@z.org>", true),
+            ["a@x.org", "b@y.org", "\"c, d\" <c@z.org>"]
+        );
+        assert_eq!(split_recipients_with("a@x.org, b@y.org", false), ["a@x.org, b@y.org"]);
+        // Hostile text: never panics, multi-byte characters are kept.
+        for junk in ["\u{e9}, \"<,;", ",,,;;;", "<<<,>>>", "\"\\", "\u{1F600},\u{1F600}"] {
+            let _ = parse_recipients(&store_recipients(&s, junk, RecipientInput::List));
+            assert_eq!(store_recipients(&s, junk, RecipientInput::List).len(), junk.len());
+        }
+    }
+
+    #[test]
+    fn drafts_keep_recipients_that_are_not_resolved_yet() {
+        // Commas do not separate (the default): "a, b" typed in To is one entry that is not one recipient.
+        // Saving the draft must not lose its addresses.
+        let mut s = session();
+        open(&mut s);
+        let typed = "a@example.com, b@example.com; Rivera, Alice <alice@example.com>";
+        s.run("compose.setTo", &json!({"value": typed, "typed": true})).unwrap();
+        s.run("compose.setCc", &json!({"value": "c@example.org, d@example.org", "typed": true})).unwrap();
+        let d = s.run("compose.saveDraft", &json!({})).unwrap()["draft"].as_u64().unwrap();
+        let addrs = |list: &[mailcraft_model::Address]| -> Vec<String> {
+            list.iter().map(|m| m.addr.clone()).collect()
+        };
+        let draft = &s.mailbox.mail[&ItemId(d)];
+        assert_eq!(addrs(&draft.to), ["a@example.com", "b@example.com", "alice@example.com"]);
+        assert_eq!(draft.to.get(2).and_then(|m| m.name.as_deref()), Some("Rivera, Alice"));
+        assert_eq!(addrs(&draft.cc), ["c@example.org", "d@example.org"]);
+        // Close All Items › Save reads the fields the same way.
+        s.run("compose.setSubject", &json!({"value": "changed"})).unwrap();
+        let r = s.run("app.closeAllItems", &json!({"save": true})).unwrap();
+        let d = r["saved"][0].as_u64().unwrap();
+        let draft = &s.mailbox.mail[&ItemId(d)];
+        assert_eq!(draft.subject, "changed");
+        assert_eq!(addrs(&draft.to), ["a@example.com", "b@example.com", "alice@example.com"]);
+        assert_eq!(addrs(&draft.cc), ["c@example.org", "d@example.org"]);
     }
 
     #[test]

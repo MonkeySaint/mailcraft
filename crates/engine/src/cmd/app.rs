@@ -273,7 +273,8 @@ fn save_compose(s: &mut Session, cid: u64) -> Option<ItemId> {
     let drafts = s.mailbox.role_folder(account, FolderRole::Drafts)?;
     let me =
         s.mailbox.account(account).map(|a| mailcraft_mime::Mailbox::new(Some(&a.sender_name), &a.address));
-    let parse = |t: &str| -> Vec<Address> { mailcraft_mime::parse_address_list(&t.replace(';', ",")) };
+    // One recipient per `;` entry (`cmd::compose` › Recipient fields), so "Last, First <address>" stays whole.
+    let parse = |t: &str| -> Vec<Address> { crate::cmd::compose::parse_recipients_lenient(t) };
     let now = s.now();
     let mut b = MessageBuilder::new();
     b.from = me.filter(|m| !m.addr.is_empty());

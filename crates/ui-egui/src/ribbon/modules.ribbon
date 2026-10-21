@@ -228,6 +228,7 @@ item | Meeting | meeting | calendar.newMeeting | | E
 item | Contact | person | people.new | | C
 item | Task | task | tasks.new | | T
 item | All Day Event | appointment | calendar.newAppointment | {"form":true,"allDay":true} | V
+item | Meeting with All | meeting | calendar.meetingWithAll | | L
 sep
 sub | More Items | new-items | calendarMoreItems | | I
 

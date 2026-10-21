@@ -600,6 +600,7 @@ fn view_customized(s: &Session) -> Option<&'static str> {
     let custom = s.mailbox.views.get(&f).is_some_and(|v| *v != ViewSettings::default())
         || modules::customized(s, f)
         || mail::customized(s, f)
+        || !crate::cmd::notes::positions(s, f).is_empty()
         || s.view
             .collapsed_groups
             .get(&f)
@@ -656,13 +657,10 @@ fn reset_view(s: &mut Session, p: &Value) -> CmdResult {
     }
     let folder = current_folder(s, &Value::Null)?;
     s.mailbox.views.remove(&folder);
-    // Columns, rules, filter and collapsed groups go; pinned messages stay pinned.
-    if let Some(list) = s.view.collapsed_groups.get_mut(&folder) {
-        list.retain(|e| mail::kept_on_reset(e));
-        if list.is_empty() {
-            s.view.collapsed_groups.remove(&folder);
-        }
-    }
+    // Columns, rules, filter, collapsed groups and dragged note icons go; pinned messages (marked on the
+    // messages) stay pinned.
+    crate::cmd::notes::clear_positions(s, folder);
+    s.view.collapsed_groups.remove(&folder);
     Ok(json!({ "folder": folder.0, "reset": true }))
 }
 

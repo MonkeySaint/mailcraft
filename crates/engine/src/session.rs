@@ -307,6 +307,37 @@ impl Session {
         self.apply_settings();
         self.select_start_folder();
         self.settings_saved = self.settings_bytes();
+        if self.migrate_view_state() {
+            // The moved entries leave settings.json right away, so an older copy never brings them back.
+            if let Err(e) = self.save_settings() {
+                log::error!("{e}");
+            }
+        }
+    }
+
+    /// Moves what MailCraft 0.1 kept in the view state onto the items: note icon positions
+    /// (`Note::x` / `Note::y`) and pinned messages (`MailItem::pinned`). The mailbox change is journaled
+    /// (no undo step). Returns whether the old entries are gone from the view state, i.e. it had some and the
+    /// change reached the store. When the store write fails the entries stay (in memory, so settings.json
+    /// keeps them too) and the next start moves them again; moving is idempotent.
+    pub fn migrate_view_state(&mut self) -> bool {
+        let legacy = |e: &String| e.starts_with("\u{1}notes.pos=") || e.starts_with("\u{1}mail.pinned=");
+        if !self.view.collapsed_groups.values().any(|list| list.iter().any(legacy)) {
+            return false;
+        }
+        let entries = self.view.collapsed_groups.clone();
+        let notes = crate::cmd::notes::migrate_view_positions(self);
+        let pins = crate::cmd::view::mail::migrate_view_pins(self);
+        if notes > 0 || pins > 0 {
+            log::info!("moved {notes} note position(s) and {pins} pin(s) out of the view state");
+            self.journal(vec![Op::Replace(Box::new(self.mailbox.clone()))]);
+            if self.store.is_some() && !self.pending_ops.is_empty() {
+                log::warn!("the moved note positions and pins are not saved yet; keeping the old entries");
+                self.view.collapsed_groups = entries;
+                return false;
+            }
+        }
+        true
     }
 
     /// View state as loaded from disk, made safe: zoom in range, known Quick Access commands only, no active
@@ -973,5 +1004,75 @@ mod tests {
         // The same command run by the user is one undo step.
         s.run("mail.markUnread", &serde_json::json!({"ids": [id.0]})).unwrap();
         assert_eq!(s.undo.undo.len(), undo_before + 1);
+    }
+
+    #[test]
+    fn old_view_state_pins_and_note_positions_move_onto_the_items_when_opened() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let (msg, note) = {
+            let mut s = Session::open(dir.path()).unwrap();
+            let inbox = s.selection.folder;
+            let msg = s.mailbox.add_mail(mailcraft_model::MailItem {
+                folder: inbox,
+                subject: "keep".into(),
+                ..Default::default()
+            });
+            let notes = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Notes)).unwrap().id;
+            let note =
+                s.run("notes.new", &serde_json::json!({"text": "A", "folder": notes.0})).unwrap()["id"]
+                    .as_u64()
+                    .unwrap();
+            s.journal(vec![Op::Replace(Box::new(s.mailbox.clone()))]);
+            // What MailCraft 0.1 left in the view state.
+            s.view.collapsed_groups.insert(inbox, vec![format!("\u{1}mail.pinned=[{}]", msg.0)]);
+            s.view.collapsed_groups.insert(notes, vec![format!("\u{1}notes.pos={{\"{note}\":[12.0,34.0]}}")]);
+            s.save_settings().unwrap();
+            (msg, ItemId(note))
+        };
+        {
+            let s = Session::open(dir.path()).unwrap();
+            assert!(s.mailbox.mail[&msg].pinned);
+            assert_eq!(s.mailbox.notes[&note].position(), Some((12.0, 34.0)));
+            assert!(s.view.collapsed_groups.values().flatten().all(|e| !e.starts_with('\u{1}')));
+        }
+        // Saved with the mailbox, and gone from settings.json: unpinning sticks.
+        let mut s = Session::open(dir.path()).unwrap();
+        assert!(s.mailbox.mail[&msg].pinned);
+        s.run("mail.pin", &serde_json::json!({"ids": [msg.0]})).unwrap();
+        s.run("notes.setPosition", &serde_json::json!({"id": note.0, "position": null})).unwrap();
+        drop(s);
+        let s = Session::open(dir.path()).unwrap();
+        assert!(!s.mailbox.mail[&msg].pinned);
+        assert_eq!(s.mailbox.notes[&note].position(), None);
+    }
+
+    #[test]
+    fn old_view_state_entries_stay_until_the_moved_state_is_stored() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let settings = || std::fs::read_to_string(dir.path().join(settings::FILE_NAME)).unwrap();
+        let msg = {
+            let mut s = Session::open(dir.path()).unwrap();
+            let inbox = s.selection.folder;
+            let msg = s.mailbox.add_mail(mailcraft_model::MailItem { folder: inbox, ..Default::default() });
+            s.journal(vec![Op::Replace(Box::new(s.mailbox.clone()))]);
+            s.view.collapsed_groups.insert(inbox, vec![format!("\u{1}mail.pinned=[{}]", msg.0)]);
+            s.save_settings().unwrap();
+            // The store cannot take the change (disk full, I/O error): settings.json keeps the old pins.
+            s.store.as_mut().unwrap().set_journal_cap(1);
+            s.load_settings(dir.path());
+            assert!(s.mailbox.mail[&msg].pinned, "pinned in memory");
+            assert!(!s.pending_ops.is_empty());
+            assert!(s.view.collapsed_groups[&inbox].iter().any(|e| e.starts_with("\u{1}mail.pinned=")));
+            assert!(settings().contains("mail.pinned="), "{}", settings());
+            msg
+        };
+        // Next start (the store writes again): moved for good.
+        let s = Session::open(dir.path()).unwrap();
+        assert!(s.mailbox.mail[&msg].pinned);
+        assert!(!settings().contains("mail.pinned="));
     }
 }

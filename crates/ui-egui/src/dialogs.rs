@@ -210,7 +210,6 @@ pub const KNOWN: &[&str] = &[
     "readingPaneOptions",
     "junkOptions",
     "messageOptions",
-    "recallMessage",
     "viewSource",
     "saveChanges",
     "exit",

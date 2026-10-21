@@ -339,7 +339,7 @@ pub(super) fn address_field(
         if commas && let Some(t) = commas_to_semicolons(&text) {
             text = t;
         }
-        app.run(f.command(), json!({"compose": cid, "value": text}));
+        app.run(f.command(), json!({"compose": cid, "value": text, "typed": true}));
         ac.dismissed = false;
         ac.sel = 0;
         ac.items = if auto_complete_on(app) && !typed_entry(&text).is_empty() {
@@ -417,7 +417,7 @@ pub(super) fn address_field(
             current = t;
         }
         let new_text = complete_entry(&current, &s.entry());
-        app.run(f.command(), json!({"compose": cid, "value": new_text}));
+        app.run(f.command(), json!({"compose": cid, "value": new_text, "typed": true}));
         cursor_to_end(&ctx, fid, &new_text);
         ac = Ac { dismissed: true, ..Ac::default() };
         ctx.memory_mut(|m| m.request_focus(fid));

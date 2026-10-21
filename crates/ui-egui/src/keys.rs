@@ -18,7 +18,7 @@
 //! | Delete | Delete message | Delete contact / appointment / task / note | – (body editing) | Delete message |
 //! | F11 | Search People (ribbon) | People: Search People | – | – |
 //! | Space / Shift+Space | Page through the message, then next / previous item (option) | – | – | – |
-//! | F6 / Shift+F6 | Move keyboard focus to the next / previous pane | same | – | – |
+//! | F6 / Shift+F6 | Move keyboard focus to the next / previous pane | same | Header fields → body → ribbon | Header → body → info bar → ribbon |
 //! | Mod+F1 | Collapse / expand the ribbon | same | – | – |
 //! | Mod+< / Mod+> (Mod+, / Mod+.) | – | – | Previous / Next Item | Previous / Next Item |
 //!
@@ -37,7 +37,10 @@
 //!
 //! F6 moves egui keyboard focus itself (not only a highlight): the selected folder's row, the message list,
 //! the message body, the status bar's first control and the selected ribbon tab (Tab then walks the ribbon's
-//! controls). Panes with nothing focusable get the focus ring only.
+//! controls). Panes with nothing focusable get the focus ring only. Compose and read windows follow the
+//! same rule over their own stops ([`window_stops`]): the header fields (To first), the body, the info bars
+//! (read windows) and the ribbon's selected tab. Embedded windows share the main window's input; keys
+//! pressed while focus (or the F6 ring) is in one go to that window.
 //!
 //! Call [`handle`] once per frame per surface **before** drawing that surface's widgets, so consumed key
 //! events do not also reach the widgets.
@@ -695,6 +698,7 @@ fn resolve_compose(c: Chord, id: u64, _cx: &KeyContext) -> Option<Action> {
         (true, false, false, Key::V) => run_p("format.paste", p()),
         (true, false, true, Key::M) => run("mail.newEmail"),
         (false, false, false, Key::F9) => run("sendReceive.all"),
+        (false, false, back, Key::F6) => Some(Action::CyclePane(back)),
         _ => None,
     }
 }
@@ -716,6 +720,7 @@ fn resolve_read(c: Chord, item: u64, _cx: &KeyContext) -> Option<Action> {
         (true, false, true, Key::M) => run("mail.newEmail"),
         (true, false, true, Key::B) => run("compose.addressBook"),
         (false, false, false, Key::F9) => run("sendReceive.all"),
+        (false, false, back, Key::F6) => Some(Action::CyclePane(back)),
         (true, false, false, Key::Z) => run("app.undo"),
         _ => None,
     }
@@ -735,6 +740,28 @@ struct KeyMemory {
     menu_request: Option<(String, String)>,
     /// Pane focused with F6 ("folders", "list", "reading", …, "statusBar", "ribbon"), until the next click.
     pane: Option<String>,
+    /// Compose and read windows: the stop F6 moved to, by surface key ([`Surface::key`]), until the next
+    /// click in that window.
+    window_pane: BTreeMap<String, String>,
+    /// Compose and read windows: their F6 stops as drawn in the last frame, by surface key.
+    window_stops: BTreeMap<String, WindowStops>,
+}
+
+/// One F6 stop of a compose or read window: its name ("header", "body", "infoBar", "ribbon"), where it was
+/// drawn, and the widget F6 focuses there (else the first button inside, or the selected ribbon tab).
+#[derive(Clone, Debug)]
+pub struct WindowStop {
+    pub name: &'static str,
+    pub rect: egui::Rect,
+    pub target: Option<egui::Id>,
+}
+
+/// The F6 stops of a compose or read window, with the layer its widgets are drawn on (the window's own
+/// viewport, or an embedded window's layer).
+#[derive(Clone, Debug)]
+struct WindowStops {
+    layer: egui::LayerId,
+    stops: Vec<WindowStop>,
 }
 
 /// The pane F6 moved focus to, if any (the shell draws a focus ring around it).
@@ -883,6 +910,180 @@ fn cycle_pane(ctx: &egui::Context, app: &App, back: bool) -> Option<String> {
     Some(name)
 }
 
+/// Records the F6 stops a compose or read window drew this frame, in F6 order — the main window's rule
+/// (content panes in drawing order, then the status / info bar, then the ribbon): header fields, body,
+/// info bar, ribbon — and draws the focus ring around the stop F6 moved to. Stops with an empty rectangle
+/// are left out.
+pub fn window_stops(ui: &egui::Ui, app: &App, surface: Surface, stops: Vec<WindowStop>) {
+    if surface == Surface::Main {
+        return;
+    }
+    let ctx = ui.ctx();
+    let stops: Vec<WindowStop> = stops
+        .into_iter()
+        .filter(|s| s.rect.is_finite() && s.rect.width() >= 1.0 && s.rect.height() >= 1.0)
+        .collect();
+    let key = surface.key();
+    let ring = with_mem(ctx, |m| {
+        let ring =
+            m.window_pane.get(&key).and_then(|p| stops.iter().find(|s| s.name == p.as_str())).map(|s| s.rect);
+        m.window_stops.insert(key.clone(), WindowStops { layer: ui.layer_id(), stops });
+        ring
+    });
+    if let Some(r) = ring {
+        ui.painter().with_clip_rect(ui.clip_rect()).rect_stroke(
+            r.shrink(1.0),
+            egui::CornerRadius::same(crate::theme::size::PANE_RADIUS),
+            egui::Stroke::new(2.0, app.theme.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// The stop of a compose or read window F6 moved to, if any.
+pub fn window_pane(ctx: &egui::Context, surface: Surface) -> Option<String> {
+    let key = surface.key();
+    with_mem(ctx, |m| m.window_pane.get(&key).cloned())
+}
+
+/// The compose or read window an embedded window's keyboard focus (or F6 ring) is in: embedded windows
+/// share the main window's input, so the main handler hands such keys to that window.
+fn embedded_surface(ctx: &egui::Context, app: &App) -> Option<Surface> {
+    let focus = ctx.memory(|m| m.focused());
+    let layer = focus.and_then(|id| ctx.viewport(|v| v.prev_pass.widgets.get(id).map(|w| w.layer_id)));
+    let (stops, panes) = with_mem(ctx, |m| (m.window_stops.clone(), m.window_pane.clone()));
+    // Windows still open only (a closed window's last stops may linger).
+    let surface_of = |key: &str| {
+        let s = match key.split_once(':') {
+            Some(("compose", id)) => id.parse().ok().map(Surface::Compose),
+            Some(("read", id)) => id.parse().ok().map(Surface::Read),
+            _ => None,
+        }?;
+        let open = match s {
+            Surface::Compose(id) => app.s.composes.get(&id).is_some_and(|c| !c.inline),
+            Surface::Read(id) => app.ui.read_windows.contains(&id),
+            Surface::Main => false,
+        };
+        open.then_some(s)
+    };
+    if let Some(layer) = layer.filter(|l| *l != egui::LayerId::background()) {
+        return stops.iter().find(|(_, s)| s.layer == layer).and_then(|(k, _)| surface_of(k));
+    }
+    // A ring-only stop (nothing focusable there) still belongs to its window until the next click.
+    if focus.is_none() {
+        return panes
+            .keys()
+            .find(|k| stops.get(*k).is_some_and(|s| s.layer != egui::LayerId::background()))
+            .and_then(|k| surface_of(k));
+    }
+    None
+}
+
+/// Enabled, focusable, visible widgets drawn on `layer` in the previous frame, in drawing order.
+fn focusables_on(ctx: &egui::Context, layer: egui::LayerId) -> Vec<Focusable> {
+    ctx.viewport(|v| {
+        v.prev_pass
+            .widgets
+            .get_layer(layer)
+            .filter(|w| w.enabled && w.sense.is_focusable() && w.interact_rect.is_positive())
+            .map(|w| Focusable {
+                id: w.id,
+                rect: w.interact_rect,
+                click: w.sense.senses_click(),
+                drag: w.sense.senses_drag(),
+            })
+            .collect()
+    })
+}
+
+/// The widget F6 focuses in a window stop: its own target when drawn, the selected ribbon tab, the body's
+/// text area, else the first button inside.
+fn window_target(app: &App, surface: Surface, stop: &WindowStop, widgets: &[Focusable]) -> Option<egui::Id> {
+    let inside = |w: &&Focusable| stop.rect.contains(w.rect.center());
+    if let Some(t) = stop.target.filter(|t| widgets.iter().any(|w| w.id == *t)) {
+        return Some(t);
+    }
+    match stop.name {
+        "ribbon" => {
+            let band = egui::Rect::from_min_max(
+                stop.rect.min,
+                egui::pos2(
+                    stop.rect.right(),
+                    (stop.rect.top() + crate::theme::size::TAB_ROW).min(stop.rect.bottom()),
+                ),
+            );
+            let mut tabs: Vec<&Focusable> =
+                widgets.iter().filter(|w| w.click && band.contains(w.rect.center())).collect();
+            tabs.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+            let names = crate::ribbon::tabs(app, surface);
+            let selected = crate::ribbon::selected_tab(app, surface);
+            // The tab row may lead with File: the selected tab is counted from the right end.
+            let from_end = names.iter().rev().position(|t| *t == selected);
+            if let Some(w) =
+                from_end.and_then(|i| tabs.len().checked_sub(i.saturating_add(1))).and_then(|i| tabs.get(i))
+            {
+                return Some(w.id);
+            }
+        }
+        "body" => {
+            if let Some(w) = widgets.iter().filter(inside).find(|w| w.click && w.drag) {
+                return Some(w.id);
+            }
+        }
+        _ => {}
+    }
+    widgets
+        .iter()
+        .filter(inside)
+        .find(|w| w.click && !w.drag)
+        .or_else(|| widgets.iter().filter(inside).find(|w| w.click))
+        .map(|w| w.id)
+}
+
+/// F6 / Shift+F6 in a compose or read window: the next (previous) of its stops — header fields, body, info
+/// bar, ribbon — after the one F6 moved to, else after the one holding keyboard focus. Returns the stop now
+/// focused.
+fn cycle_window_pane(ctx: &egui::Context, app: &App, surface: Surface, back: bool) -> Option<String> {
+    let key = surface.key();
+    let (recorded, current) =
+        with_mem(ctx, |m| (m.window_stops.get(&key).cloned(), m.window_pane.get(&key).cloned()));
+    let WindowStops { layer, stops } = recorded?;
+    if stops.is_empty() {
+        return None;
+    }
+    let widgets = focusables_on(ctx, layer);
+    let holding = || {
+        let id = ctx.memory(|m| m.focused())?;
+        let w = widgets.iter().find(|w| w.id == id)?;
+        stops
+            .iter()
+            .find(|s| s.target == Some(id) || s.rect.contains(w.rect.center()))
+            .map(|s| s.name.to_owned())
+    };
+    let cur = current.or_else(holding).and_then(|p| stops.iter().position(|s| s.name == p.as_str()));
+    let n = stops.len();
+    let next = match (cur, back) {
+        (None, false) => 0,
+        (None, true) => n.saturating_sub(1),
+        (Some(i), false) => i.saturating_add(1) % n,
+        (Some(i), true) => i.checked_sub(1).unwrap_or(n.saturating_sub(1)),
+    };
+    let stop = stops.get(next)?;
+    let target = window_target(app, surface, stop, &widgets);
+    ctx.memory_mut(|m| match target {
+        Some(id) => m.request_focus(id),
+        None => {
+            if let Some(f) = m.focused() {
+                m.surrender_focus(f);
+            }
+        }
+    });
+    let name = stop.name.to_owned();
+    with_mem(ctx, |m| m.window_pane.insert(key, name.clone()));
+    ctx.request_repaint();
+    Some(name)
+}
+
 /// Keeps the F6 ring on the pane that holds keyboard focus once Tab has moved it into another pane.
 fn follow_focus(ctx: &egui::Context) {
     if with_mem(ctx, |m| m.pane.is_none()) || ctx.memory(|m| m.focused().is_none()) {
@@ -961,7 +1162,11 @@ pub fn apply(ctx: &egui::Context, app: &mut App, surface: Surface, action: Actio
             json!({"action": "spaceRead", "ok": ok})
         }
         Action::CyclePane(back) => {
-            let pane = cycle_pane(ctx, app, back);
+            let pane = if surface == Surface::Main {
+                cycle_pane(ctx, app, back)
+            } else {
+                cycle_window_pane(ctx, app, surface, back)
+            };
             json!({"action": "cyclePane", "pane": pane})
         }
         Action::ComposeStep(next) => compose_step(app, surface, next),
@@ -1202,12 +1407,19 @@ pub fn handle(ctx: &egui::Context, app: &mut App, surface: Surface) {
     // Typing in an inline response (or an embedded compose window) shares the main window's input: those
     // keys belong to the compose surface, not to the message list.
     let surface = match surface {
-        Surface::Main => crate::compose::focused_compose(ctx, app).map_or(Surface::Main, Surface::Compose),
+        Surface::Main => crate::compose::focused_compose(ctx, app)
+            .map(Surface::Compose)
+            .or_else(|| embedded_surface(ctx, app))
+            .unwrap_or(Surface::Main),
         other => other,
     };
     track_alt(ctx, app);
     if ctx.input(|i| i.pointer.any_pressed()) {
-        with_mem(ctx, |m| m.pane = None);
+        let key = surface.key();
+        with_mem(ctx, |m| {
+            m.pane = None;
+            m.window_pane.remove(&key);
+        });
     } else if surface == Surface::Main {
         follow_focus(ctx);
     }
@@ -1858,5 +2070,87 @@ mod tests {
         press(&mut h, egui::Modifiers::NONE, Key::Space);
         assert_ne!(crate::ribbon::selected_tab(h.state(), Surface::Main), now, "Space selected the next tab");
         assert_eq!(h.state().s.selection.focus, focus, "Space did not move to another message");
+    }
+
+    /// What a key press or a click changed, coarsely: selection, module, dialogs, windows, backstage,
+    /// ribbon tabs and the view state.
+    fn outcome(app: &App) -> String {
+        format!(
+            "{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{}",
+            app.s.selection,
+            app.s.view.module,
+            app.ui.dialogs.iter().map(|d| d.0.clone()).collect::<Vec<_>>(),
+            app.s.composes.len(),
+            app.ui.read_windows.len(),
+            app.ui.backstage.is_some(),
+            app.ui.ribbon_tab,
+            serde_json::to_string(&app.s.view).unwrap_or_default(),
+        )
+    }
+
+    fn module_shell(nav: &str) -> egui_kittest::Harness<'static, App> {
+        let mut h = shell(1400.0, 900.0);
+        h.state_mut().run(nav, json!({}));
+        h.run_steps(4);
+        h
+    }
+
+    #[test]
+    fn space_on_any_focused_button_does_what_a_click_does() {
+        // Every enabled button-like widget of the main window (a sample of each module's), focused the way
+        // Tab or F6 focuses it: Space presses it exactly as a click does. Text fields, the message list and the
+        // message body keep their own keys (list navigation, Space-bar reading) and are left out.
+        for (nav, most) in [("nav.mail", 40usize), ("nav.calendar", 20), ("nav.notes", 15)] {
+            let h = module_shell(nav);
+            let widgets: Vec<(egui::Id, egui::Rect)> = h.ctx.viewport(|v| {
+                v.prev_pass
+                    .widgets
+                    .get_layer(egui::LayerId::background())
+                    .filter(|w| {
+                        w.enabled
+                            && w.sense.is_focusable()
+                            && w.sense.senses_click()
+                            && !w.sense.senses_drag()
+                    })
+                    .filter(|w| w.interact_rect.is_positive() && w.id != crate::list::focus_id())
+                    .map(|w| (w.id, w.interact_rect))
+                    .collect()
+            });
+            drop(h);
+            assert!(widgets.len() > 10, "{nav}: {} buttons", widgets.len());
+            let step = widgets.len().div_ceil(most).max(1);
+            for (id, rect) in widgets.into_iter().step_by(step) {
+                let mut a = module_shell(nav);
+                a.ctx.memory_mut(|m| m.request_focus(id));
+                a.run_steps(2);
+                if a.ctx.memory(|m| m.focused()) != Some(id) {
+                    continue;
+                }
+                assert!(widget_focused(&a.ctx), "{nav}: {id:?} counts as a focused button");
+                let before = outcome(a.state());
+                press(&mut a, egui::Modifiers::NONE, Key::Space);
+                let space = outcome(a.state());
+                let mut b = module_shell(nav);
+                let p = rect.center();
+                b.event(egui::Event::PointerMoved(p));
+                b.run_steps(1);
+                for pressed in [true, false] {
+                    b.event(egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    b.run_steps(1);
+                }
+                b.run_steps(2);
+                let click = outcome(b.state());
+                assert_eq!(
+                    space != before,
+                    click != before,
+                    "{nav}: {id:?} at {rect:?}\n{before}\n{space}\n{click}"
+                );
+            }
+        }
     }
 }

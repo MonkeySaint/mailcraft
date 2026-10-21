@@ -13,7 +13,7 @@
 //! - Where [`BodyView::context_menu`] is on (reading pane, read windows), right-click offers Copy, Select All,
 //!   Select Text With Similar Formatting and Find… (reported in [`BodyView::find_requested`]).
 //! - Images: `data:image/…;base64` pictures are decoded (PNG, JPEG, GIF; [`decode_image`], at most
-//!   [`MAX_IMAGE_SIDE`] pixels a side) and drawn in their box; `cid:` pictures are drawn once the owner hands
+//!   [`MAX_IMAGE_SIDE`] pixels a side; plain SVG, [`decode_svg`]) and drawn in their box; `cid:` pictures are drawn once the owner hands
 //!   over the attachment bytes with [`provide_image`]. Remote `http(s):` (and `//host/…`) pictures are
 //!   downloaded in the background by [`crate::remote_images`] only when [`BodyOptions::allow_remote`] is set
 //!   (the first [`crate::remote_images::MAX_PER_MESSAGE`] of a message), and never otherwise. Anything not
@@ -1256,9 +1256,114 @@ fn image_cache_id() -> Id {
 }
 
 fn load_picture(ctx: &egui::Context, key: u64, data: &[u8]) -> Option<egui::TextureHandle> {
-    decode_image(data).map(|img| {
+    decode_image(data).or_else(|| decode_svg(data)).map(|img| {
         ctx.load_texture(format!("mailcraft-body-image-{key:016x}"), img, egui::TextureOptions::LINEAR)
     })
+}
+
+/// Longest side an SVG picture is drawn at (px).
+const MAX_SVG_SIDE: f32 = 2048.0;
+/// Largest SVG picture that is drawn (bytes). The compose window's shapes, icons and charts are a few KB.
+pub const MAX_SVG_BYTES: usize = 1024 * 1024;
+/// Most XML nodes (elements, text, comments) in an SVG picture that is drawn.
+const MAX_SVG_NODES: u32 = 20_000;
+const SVG_NS: &str = "http://www.w3.org/2000/svg";
+/// The SVG elements that are drawn: plain shapes, groups, text and gradients (what the compose window
+/// writes). Elements that repeat other parts (`use`, markers, patterns), draw through offscreen layers
+/// (filters, masks, clipping) or bring in data (`image`, `style`) make the picture show the placeholder:
+/// SVG in received mail can be built so that those cost seconds or gigabytes.
+const SVG_ELEMENTS: [&str; 18] = [
+    "svg",
+    "g",
+    "defs",
+    "title",
+    "desc",
+    "metadata",
+    "rect",
+    "circle",
+    "ellipse",
+    "line",
+    "polyline",
+    "polygon",
+    "path",
+    "text",
+    "tspan",
+    "linearGradient",
+    "radialGradient",
+    "stop",
+];
+/// Attributes (any namespace) that make an element draw through an offscreen layer, repeat its work or
+/// point elsewhere; `style` can carry any of them.
+const SVG_DENIED_ATTRIBUTES: [&str; 12] = [
+    "style",
+    "opacity",
+    "filter",
+    "mask",
+    "clip-path",
+    "mix-blend-mode",
+    "isolation",
+    "stroke-dasharray",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+    "href",
+];
+
+/// Whether a parsed SVG document holds only [`SVG_ELEMENTS`] without [`SVG_DENIED_ATTRIBUTES`], so drawing
+/// it costs about as much as its size.
+fn plain_svg(doc: &resvg::usvg::roxmltree::Document) -> bool {
+    doc.descendants().filter(|n| n.is_element()).all(|n| {
+        let tag = n.tag_name();
+        tag.namespace() == Some(SVG_NS)
+            && SVG_ELEMENTS.contains(&tag.name())
+            && n.attributes().all(|a| !SVG_DENIED_ATTRIBUTES.contains(&a.name()))
+    })
+}
+
+/// Draws an SVG picture (pictures the compose window makes: shapes, icons, charts) into pixels, at up to
+/// twice its own size and at most [`MAX_SVG_SIDE`] a side. Received mail can carry SVG too, so only plain
+/// SVG is drawn (see [`SVG_ELEMENTS`]): at most [`MAX_SVG_BYTES`] of UTF-8 text, no DTD, at most
+/// [`MAX_SVG_NODES`] nodes. Compressed SVG (svgz) is refused, since it can unpack to any size. Nothing
+/// outside the file is loaded: no files, no network, no embedded pictures.
+pub fn decode_svg(data: &[u8]) -> Option<egui::ColorImage> {
+    if data.is_empty() || data.len() > MAX_SVG_BYTES || data.starts_with(&[0x1f, 0x8b]) {
+        return None;
+    }
+    let head = String::from_utf8_lossy(data.get(..data.len().min(4096))?).to_ascii_lowercase();
+    if !head.contains("<svg") {
+        return None;
+    }
+    let text = std::str::from_utf8(data).ok()?;
+    let xml = resvg::usvg::roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: MAX_SVG_NODES };
+    let doc = resvg::usvg::roxmltree::Document::parse_with_options(text, xml).ok()?;
+    if !plain_svg(&doc) {
+        return None;
+    }
+    let opt = resvg::usvg::Options {
+        image_href_resolver: resvg::usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..resvg::usvg::Options::default()
+    };
+    let parse = std::panic::AssertUnwindSafe(|| resvg::usvg::Tree::from_xmltree(&doc, &opt).ok());
+    let tree = std::panic::catch_unwind(parse).ok().flatten()?;
+    let size = tree.size();
+    let (w, h) = (size.width(), size.height());
+    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+        return None;
+    }
+    let scale = (MAX_SVG_SIDE / w.max(h)).min(2.0);
+    let pw = (w * scale).round().clamp(1.0, MAX_SVG_SIDE);
+    let ph = (h * scale).round().clamp(1.0, MAX_SVG_SIDE);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(pw as u32, ph as u32)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(pw / w, ph / h);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        resvg::render(&tree, transform, &mut pixmap.as_mut())
+    }))
+    .ok()?;
+    let dims = [usize::try_from(pixmap.width()).ok()?, usize::try_from(pixmap.height()).ok()?];
+    Some(egui::ColorImage::from_rgba_premultiplied(dims, pixmap.data()))
 }
 
 /// Cache key of a picture source string.
@@ -1374,6 +1479,18 @@ fn with_intrinsic_sizes(ctx: &egui::Context, doc: &Doc, images: &ImageIndex) -> 
 /// bodies draw it instead of the placeholder. Decodes once per source and data; returns whether the picture
 /// could be decoded. Call it again when showing the message (pictures can drop out of the cache).
 pub fn provide_image(ctx: &egui::Context, src: &str, data: &[u8]) -> bool {
+    provide(ctx, src, data).0
+}
+
+/// [`provide_image`] telling whether the picture was decoded just now (`false` when the cache already had
+/// these bytes for `src`, or they do not decode): what a caller needs to know to repaint once.
+pub fn provide_image_fresh(ctx: &egui::Context, src: &str, data: &[u8]) -> bool {
+    let (ok, fresh) = provide(ctx, src, data);
+    ok && fresh
+}
+
+/// (decodes, decoded now).
+fn provide(ctx: &egui::Context, src: &str, data: &[u8]) -> (bool, bool) {
     let key = fingerprint(src.trim().as_bytes());
     let data_key = fingerprint(data);
     let cached = ctx.data_mut(|d| {
@@ -1383,12 +1500,12 @@ pub fn provide_image(ctx: &egui::Context, src: &str, data: &[u8]) -> bool {
             .map(|e| e.2.is_some())
     });
     if let Some(ok) = cached {
-        return ok;
+        return (ok, false);
     }
     let tex = load_picture(ctx, key, data);
     let ok = tex.is_some();
     ctx.data_mut(|d| d.get_temp_mut_or_default::<ImageCache>(image_cache_id()).put(key, data_key, tex));
-    ok
+    (ok, true)
 }
 
 /// The texture for a body picture: one handed over with [`provide_image`], or a `data:` picture (decoded on
@@ -1712,6 +1829,109 @@ mod tests {
         assert!(decode_image(&huge).is_none());
         // Other formats are not decoded.
         assert!(decode_image(b"BM\x3a\0\0\0\0\0\0\0\x36\0\0\0").is_none());
+    }
+
+    const SVG_OPEN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4">"#;
+
+    fn svg(body: &str) -> Vec<u8> {
+        format!("{SVG_OPEN}{body}</svg>").into_bytes()
+    }
+
+    /// A gzip stream whose header file name is `<svg` and whose deflate data unpacks to `matches` × 258 zero
+    /// bytes (fixed Huffman codes: one literal 0, then length-258 / distance-1 copies).
+    fn gzip_bomb(matches: usize) -> Vec<u8> {
+        struct Bits(Vec<u8>, usize);
+        impl Bits {
+            fn put(&mut self, value: u32, n: u32) {
+                for i in 0..n {
+                    if self.1.is_multiple_of(8) {
+                        self.0.push(0);
+                    }
+                    if (value >> i) & 1 == 1 {
+                        *self.0.last_mut().unwrap() |= 1 << (self.1 % 8);
+                    }
+                    self.1 += 1;
+                }
+            }
+            /// A Huffman code: most significant bit first.
+            fn code(&mut self, code: u32, n: u32) {
+                for i in (0..n).rev() {
+                    self.put((code >> i) & 1, 1);
+                }
+            }
+        }
+        let mut bits = Bits(Vec::new(), 0);
+        bits.put(1, 1); // final block
+        bits.put(1, 2); // fixed Huffman codes
+        bits.code(0x30, 8); // literal 0
+        for _ in 0..matches {
+            bits.code(0b1100_0101, 8); // length 258
+            bits.code(0, 5); // distance 1
+        }
+        bits.code(0, 7); // end of block
+        let mut out = vec![0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 3];
+        out.extend_from_slice(b"<svg\0");
+        out.extend(bits.0);
+        out.extend_from_slice(&[0; 8]);
+        out
+    }
+
+    #[test]
+    fn plain_svg_pictures_are_drawn() {
+        let img = decode_svg(&svg(r#"<rect width="8" height="4" fill="red"/>"#)).unwrap();
+        assert_eq!(img.size, [16, 8], "twice its own size");
+        assert_eq!(img.pixels.first().map(|p| p.r()), Some(255));
+        // What Insert › Chart writes: shapes, gradients and text.
+        let chart = svg(
+            r##"<defs><linearGradient id="g"><stop offset="0" stop-color="#fff"/></linearGradient></defs>
+            <g fill-opacity="0.5"><path d="M0 0 H8 V4 Z" fill="url(#g)"/><circle cx="4" cy="2" r="1"/>
+            <text x="1" y="3">Q3</text></g>"##,
+        );
+        assert!(decode_svg(&chart).is_some());
+        assert!(load_picture(&egui::Context::default(), 1, &svg("<rect width='8' height='4'/>")).is_some());
+    }
+
+    #[test]
+    fn svg_that_could_cost_too_much_is_refused() {
+        // svgz: a 25 MB deflate bomb behind a gzip file name of "<svg" is never unpacked.
+        let bomb = gzip_bomb(400_000);
+        assert!(bomb.len() < MAX_SVG_BYTES && String::from_utf8_lossy(&bomb).contains("<svg"));
+        let started = std::time::Instant::now();
+        assert!(decode_svg(&bomb).is_none());
+        assert!(load_picture(&egui::Context::default(), 2, &bomb).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Too big, not UTF-8, a DTD (entities), too many nodes.
+        let mut big = svg("");
+        big.splice(SVG_OPEN.len()..SVG_OPEN.len(), std::iter::repeat_n(b' ', MAX_SVG_BYTES));
+        assert!(decode_svg(&big).is_none());
+        assert!(decode_svg(&[SVG_OPEN.as_bytes(), b"\xff</svg>"].concat()).is_none());
+        let dtd = format!("<!DOCTYPE svg [<!ENTITY a \"aaaa\">]>{SVG_OPEN}<text>&a;&a;</text></svg>");
+        assert!(decode_svg(dtd.as_bytes()).is_none());
+        assert!(decode_svg(&svg(&"<g/>".repeat(30_000))).is_none());
+        // Elements that repeat work or draw offscreen layers, and attributes that do.
+        for body in [
+            r##"<rect id="r" width="1" height="1"/><use href="#r"/>"##,
+            r##"<filter id="f"><feTurbulence numOctaves="100000000"/></filter><rect filter="url(#f)"/>"##,
+            r##"<pattern id="p" width="99999" height="99999"/><rect fill="url(#p)"/>"##,
+            r##"<mask id="m"/><rect mask="url(#m)"/>"##,
+            r##"<clipPath id="c"/>"##,
+            r##"<marker id="k"/>"##,
+            r##"<image href="data:image/svg+xml;base64,AAAA"/>"##,
+            r##"<style>rect { opacity: 0.5 }</style>"##,
+            r##"<g opacity="0.5"><rect width="1" height="1"/></g>"##,
+            r##"<rect style="filter: blur(9px)" width="1" height="1"/>"##,
+            r##"<path d="M0 0 H99999" stroke="red" stroke-dasharray="0.001"/>"##,
+            r##"<x:rect xmlns:x="urn:example" width="1" height="1"/>"##,
+        ] {
+            assert!(decode_svg(&svg(body)).is_none(), "{body}");
+        }
+        // Junk and cut-off documents never panic.
+        let good = svg(r#"<rect width="8" height="4" fill="red"/>"#);
+        for cut in 0..good.len() {
+            let _ = decode_svg(good.get(..cut).unwrap());
+        }
+        assert!(decode_svg(b"<svg").is_none());
+        assert!(decode_svg(br#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"/>"#).is_none());
     }
 
     #[test]

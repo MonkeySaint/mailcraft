@@ -648,31 +648,40 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     }
     let shown = area.show(ui, |ui| {
         ui.add_space(12.0);
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
-            header(ui, app, &h, id, narrow, in_window);
+        let head = egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
+            let info_top = header(ui, app, &h, id, narrow, in_window);
             if cache.remote_images && !allow_remote {
                 pictures_bar(ui, app, id);
             }
+            info_top
         });
         ui.add_space(10.0);
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
-            let opts = BodyOptions {
-                dark,
-                zoom,
-                allow_remote,
-                paint_background: true,
-                doc_key: Some(cache.doc_key),
-            };
-            let doc = Arc::clone(&cache.doc);
-            clicked_link = body::show_doc_with(ui, &mut cache.view, &doc, &opts);
-            if reveal
-                && let Some(h) = bar.hits.get(bar.current)
-                && let Some(r) = body::range_rect(&cache.view, h)
-            {
-                ui.scroll_to_rect(r.expand(24.0), Some(Align::Center));
-            }
-        });
+        let body_frame =
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
+                let opts = BodyOptions {
+                    dark,
+                    zoom,
+                    allow_remote,
+                    paint_background: true,
+                    doc_key: Some(cache.doc_key),
+                };
+                let doc = Arc::clone(&cache.doc);
+                clicked_link = body::show_doc_with(ui, &mut cache.view, &doc, &opts);
+                if reveal
+                    && let Some(h) = bar.hits.get(bar.current)
+                    && let Some(r) = body::range_rect(&cache.view, h)
+                {
+                    ui.scroll_to_rect(r.expand(24.0), Some(Align::Center));
+                }
+            });
         ui.add_space(PAD);
+        // F6 stops (read windows): the header, its info bars, the body, as far as they show.
+        let (r, top) = (head.response.rect, head.inner);
+        let visible = ui.clip_rect();
+        let header = egui::Rect::from_x_y_ranges(r.x_range(), r.top()..=top.clamp(r.top(), r.bottom()));
+        let info = egui::Rect::from_x_y_ranges(r.x_range(), top.clamp(r.top(), r.bottom())..=r.bottom());
+        let stops = [header, info, body_frame.response.rect].map(|s| s.intersect(visible));
+        ctx.data_mut(|d| d.insert_temp(stops_id(surface), stops));
     });
     if surface == Surface::Main {
         let m = ReadScroll {
@@ -696,7 +705,9 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     }
 }
 
-fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, in_window: bool) {
+/// The message header (subject, people, categories, attachments, then the info bars). Returns where the
+/// info bars start (screen y), for the read window's F6 stops.
+fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, in_window: bool) -> f32 {
     let theme = app.theme.clone();
     // 1. Subject.
     let subject = if h.subject.trim().is_empty() { "(no subject)" } else { h.subject.as_str() };
@@ -787,6 +798,7 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
         });
     }
     // 5. Info bars.
+    let info_top = ui.cursor().top();
     for line in &h.info {
         ui.add_space(6.0);
         info_bar(ui, app, "info", line, None);
@@ -807,6 +819,17 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
     // 6. Meeting requests, responses, cancellations and proposals; task requests, responses and status
     // reports (nothing for ordinary mail).
     crate::modules::meeting_bar(ui, app, id);
+    info_top
+}
+
+fn stops_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("mailcraft.reading.stops", surface.key()))
+}
+
+/// Where the message view of `surface` drew its header, info bars and body in the last frame (visible
+/// parts; empty rectangles when there were none): the read window's F6 stops.
+fn view_stops(ctx: &egui::Context, surface: Surface) -> [egui::Rect; 3] {
+    ctx.data(|d| d.get_temp::<[egui::Rect; 3]>(stops_id(surface))).unwrap_or([egui::Rect::NOTHING; 3])
 }
 
 fn recipients_line(ui: &mut Ui, label: &str, names: &str, theme: &crate::theme::Theme) {
@@ -1155,11 +1178,23 @@ fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClas
             });
         }
         // A tiny window (responsive.md: 300×200) keeps the message and drops the ribbon, as compose does.
+        let ribbon_top = ui.cursor().top();
         if !frame.inspector_tiny {
             crate::ribbon::ribbon(ui, app, Surface::Read(id), &frame);
             ui.separator();
         }
+        let ribbon_bottom = ui.cursor().top().max(ribbon_top);
+        let ribbon = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), ribbon_top..=ribbon_bottom);
         message_view(ui, app, id, Surface::Read(id), narrow);
+        // F6 (the main window's rule): header, body, info bars, ribbon (the selected tab).
+        let [header, info, body] = view_stops(&ctx, Surface::Read(id));
+        let stop = |name, rect| crate::keys::WindowStop { name, rect, target: None };
+        crate::keys::window_stops(
+            ui,
+            app,
+            Surface::Read(id),
+            vec![stop("header", header), stop("body", body), stop("infoBar", info), stop("ribbon", ribbon)],
+        );
     });
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !egui::Popup::is_any_open(&ctx) {
         close = true;
@@ -1534,5 +1569,50 @@ mod tests {
         h.key_press(egui::Key::Escape);
         h.run();
         assert!(h.state().ui.read_windows.is_empty());
+    }
+
+    #[test]
+    fn f6_cycles_header_body_info_bar_and_ribbon_in_a_read_window() {
+        let mut s = sample_session();
+        // A message with an info bar (a follow-up flag).
+        let id = s.mailbox.mail.values().find(|m| m.body.html.is_some()).map(|m| m.id).unwrap();
+        s.selection.items = vec![id];
+        s.selection.focus = Some(id);
+        s.run("mail.flag", &json!({"ids": [id.0]})).unwrap();
+        let mut app = App::new(s);
+        app.ui.read_windows.push(id.0);
+        let mut h = Harness::builder().with_size(Vec2::new(1100.0, 900.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                let ctx = ui.ctx().clone();
+                crate::keys::handle(&ctx, app, Surface::Main);
+                read_windows(&ctx, app);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let surface = Surface::Read(id.0);
+        let ctx = h.ctx.clone();
+        // From nowhere: the first stop, the header.
+        crate::keys::apply(&ctx, h.state_mut(), surface, crate::keys::Action::CyclePane(false));
+        h.run_steps(2);
+        assert_eq!(crate::keys::window_pane(&h.ctx, surface).as_deref(), Some("header"));
+        let mut seen = vec!["header".to_owned()];
+        for _ in 0..3 {
+            h.key_press(egui::Key::F6);
+            h.run_steps(2);
+            seen.push(crate::keys::window_pane(&h.ctx, surface).unwrap_or_default());
+        }
+        assert_eq!(seen, ["header", "body", "infoBar", "ribbon"]);
+        assert!(crate::keys::widget_focused(&h.ctx), "a ribbon tab has focus");
+        // Round the corner and back.
+        h.key_press(egui::Key::F6);
+        h.run_steps(2);
+        assert_eq!(crate::keys::window_pane(&h.ctx, surface).as_deref(), Some("header"));
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F6);
+        h.run_steps(2);
+        assert_eq!(crate::keys::window_pane(&h.ctx, surface).as_deref(), Some("ribbon"));
+        // The main window's own F6 state is untouched.
+        assert_eq!(crate::keys::focused_pane(&h.ctx), None);
     }
 }

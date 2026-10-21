@@ -17,8 +17,9 @@
 //! View As a New View, Manage Views), the Quick Actions shown on a hovered row, and the status bar items
 //! hidden from the Customize Status Bar menu.
 //!
-//! **Pinned messages** (Quick Action Pin / Unpin, `view.pin`) are kept per folder (a reserved entry that Reset
-//! View keeps) and listed at the top of the folder's list.
+//! **Pinned messages** (Quick Action Pin / Unpin, `mail.pin`) are marked on the message (`MailItem::pinned`,
+//! which Reset View leaves alone) and listed at the top of the folder's list. MailCraft 0.1 kept them in a
+//! reserved entry of the folder's view state; [`migrate_view_pins`] moves those onto the messages.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::{dialog, parse_layout, settings};
-use crate::cmd::util::{mail_targets, opt_bool, opt_str, req_str};
+use crate::cmd::util::{opt_bool, opt_str, req_str};
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_model::{
     ArrangeBy, DateTime, FlagState, FolderId, FolderKind, FolderRole, Importance, ItemId, ListTime, MailItem,
@@ -590,11 +591,6 @@ pub fn customized(s: &Session, folder: FolderId) -> bool {
     reserved_json(s, folder, MAIL_STATE).is_some()
 }
 
-/// True for the reserved entries Reset View keeps (pinned messages).
-pub(crate) fn kept_on_reset(entry: &str) -> bool {
-    entry.starts_with(PINNED)
-}
-
 /// Columns of the folder's list, resolved (labels, formats, widths).
 pub fn columns(s: &Session, folder: FolderId) -> Vec<ColumnSpec> {
     let v = mail_view(s, folder);
@@ -755,24 +751,47 @@ pub fn cell_text(s: &Session, m: &MailItem, id: &str, format: &str) -> String {
 // ---------------------------------------------------------------------------------------------------------
 // Pinned messages
 
-fn pins_of(s: &Session, folder: FolderId) -> BTreeSet<u64> {
-    reserved_json(s, folder, PINNED)
-        .and_then(|j| serde_json::from_str::<BTreeSet<u64>>(j).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .take(MAX_PINNED)
-        .collect()
-}
-
 /// Every pinned message (of every folder).
 pub fn pinned(s: &Session) -> BTreeSet<ItemId> {
-    let mut out = BTreeSet::new();
-    for (f, list) in &s.view.collapsed_groups {
-        if list.iter().any(|e| e.starts_with(PINNED)) {
-            out.extend(pins_of(s, *f).into_iter().map(ItemId).filter(|i| s.mailbox.mail.contains_key(i)));
+    s.mailbox.mail.values().filter(|m| m.pinned).map(|m| m.id).collect()
+}
+
+/// Pinned messages in `folder`.
+pub fn pinned_in(s: &Session, folder: FolderId) -> usize {
+    s.mailbox.mail.values().filter(|m| m.pinned && m.folder == folder).count()
+}
+
+/// Moves the pins MailCraft 0.1 kept in the folders' view state (`PINNED` entries) onto the messages, and
+/// drops those entries. 0.1 showed a pinned message pinned wherever it was moved, so a listed message that
+/// is now in another folder stays pinned there too (at most [`MAX_PINNED`] per folder); pins of messages
+/// that are gone are dropped. Returns how many messages were pinned.
+pub(crate) fn migrate_view_pins(s: &mut Session) -> usize {
+    let folders: Vec<FolderId> = s
+        .view
+        .collapsed_groups
+        .iter()
+        .filter(|(_, list)| list.iter().any(|e| e.starts_with(PINNED)))
+        .map(|(f, _)| *f)
+        .collect();
+    let mut pinned = 0usize;
+    for folder in folders {
+        let ids: BTreeSet<u64> =
+            reserved_json(s, folder, PINNED).and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+        store_reserved(s, folder, PINNED, None);
+        for id in ids.into_iter().take(MAX_PINNED) {
+            let Some(now_in) = s.mailbox.mail.get(&ItemId(id)).filter(|m| !m.pinned).map(|m| m.folder) else {
+                continue;
+            };
+            if pinned_in(s, now_in) >= MAX_PINNED {
+                continue;
+            }
+            if let Some(m) = s.mailbox.mail.get_mut(&ItemId(id)) {
+                m.pinned = true;
+                pinned = pinned.saturating_add(1);
+            }
         }
     }
-    out
+    pinned
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -977,15 +996,6 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             false,
             mail_list,
             custom_filter_cmd,
-        ),
-        spec(
-            "view.pin",
-            "Pin / Unpin",
-            "Message list › Quick Actions",
-            r#"{"ids"?:[number],"on"?:bool}"#,
-            false,
-            crate::always,
-            pin,
         ),
     ]
 }
@@ -1230,48 +1240,6 @@ fn custom_filter_cmd(s: &mut Session, p: &Value) -> CmdResult {
     Ok(
         json!({ "on": f.is_some(), "filter": f.unwrap_or_default(), "description": custom_filter(s, folder).unwrap_or_default().describe() }),
     )
-}
-
-/// `view.pin`: pins the target messages to the top of their folder's list, or unpins them when all are
-/// pinned (`on` sets the state).
-fn pin(s: &mut Session, p: &Value) -> CmdResult {
-    let ids: Vec<ItemId> =
-        mail_targets(s, p).into_iter().filter(|i| s.mailbox.mail.contains_key(i)).collect();
-    if ids.is_empty() {
-        return Err(CmdError::Disabled("No message is selected.".into()));
-    }
-    let all = pinned(s);
-    let on = match p.get("on") {
-        None | Some(Value::Null) => !ids.iter().all(|i| all.contains(i)),
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return Err(CmdError::Params("`on` must be true or false".into())),
-    };
-    let mut by_folder: BTreeMap<FolderId, Vec<u64>> = BTreeMap::new();
-    for id in &ids {
-        if let Some(m) = s.mailbox.mail.get(id) {
-            by_folder.entry(m.folder).or_default().push(id.0);
-        }
-    }
-    for (folder, list) in by_folder {
-        // Pins of messages that left the folder are dropped on the way.
-        let mut pins: BTreeSet<u64> = pins_of(s, folder)
-            .into_iter()
-            .filter(|i| s.mailbox.mail.get(&ItemId(*i)).is_some_and(|m| m.folder == folder))
-            .collect();
-        for id in list {
-            if on {
-                pins.insert(id);
-            } else {
-                pins.remove(&id);
-            }
-        }
-        if pins.len() > MAX_PINNED {
-            return Err(CmdError::Params(format!("a folder keeps at most {MAX_PINNED} pinned messages")));
-        }
-        let json = if pins.is_empty() { None } else { serde_json::to_string(&pins).ok() };
-        store_reserved(s, folder, PINNED, json);
-    }
-    Ok(json!({ "on": on, "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>() }))
 }
 
 /// `view.statusBar`: shows or hides one status bar element (saved with the profile).
@@ -1814,7 +1782,7 @@ mod tests {
         );
         let new = add(&mut s, MailItem { subject: "new".into(), received: now, ..Default::default() });
         assert_eq!(crate::queries::visible_item_ids(&s), vec![new, old]);
-        run(&mut s, "view.pin", json!({"ids": [old.0]}));
+        run(&mut s, "mail.pin", json!({"ids": [old.0]}));
         assert!(pinned(&s).contains(&old));
         assert_eq!(crate::queries::visible_item_ids(&s), vec![old, new]);
         let rows = crate::queries::list_rows(&s);
@@ -1825,9 +1793,51 @@ mod tests {
         run(&mut s, "view.changeView", json!({"name": "Single"}));
         run(&mut s, "view.resetView", json!({}));
         assert!(pinned(&s).contains(&old));
-        run(&mut s, "view.pin", json!({"ids": [old.0]}));
+        run(&mut s, "mail.pin", json!({"ids": [old.0]}));
         assert!(pinned(&s).is_empty());
-        assert!(s.run("view.pin", &json!({"ids": [123_456]})).is_err());
+        assert!(s.run("mail.pin", &json!({"ids": [123_456]})).is_err());
+        assert!(matches!(s.run("mail.pin", &json!({"ids": [old.0], "on": "yes"})), Err(CmdError::Params(_))));
+        // The pin is on the message: saved with the mailbox, undoable, and it stays on top after a move.
+        run(&mut s, "mail.pin", json!({"ids": [old.0], "on": true}));
+        assert!(s.mailbox.mail[&old].pinned);
+        run(&mut s, "app.undo", json!({}));
+        assert!(!s.mailbox.mail[&old].pinned);
+        run(&mut s, "mail.pin", json!({"ids": [old.0, new.0]}));
+        run(&mut s, "mail.pin", json!({"ids": [old.0, new.0]}));
+        assert!(pinned(&s).is_empty(), "all pinned: the toggle unpins them");
+        run(&mut s, "mail.pin", json!({"ids": [old.0], "on": true}));
+        let other = s.mailbox.create_folder(s.selection.folder, "Kept").unwrap();
+        s.mailbox.move_items(&[old], other).unwrap();
+        s.selection.folder = other;
+        assert_eq!(crate::queries::visible_item_ids(&s), vec![old]);
+        assert!(pinned(&s).contains(&old));
+    }
+
+    #[test]
+    fn pins_move_over_from_the_old_view_state_entry() {
+        let mut s = session();
+        let f = s.selection.folder;
+        let now = s.now();
+        let a = add(&mut s, MailItem { subject: "a".into(), received: now, ..Default::default() });
+        let b = add(&mut s, MailItem { subject: "b".into(), received: now, ..Default::default() });
+        let elsewhere = s.mailbox.create_folder(f, "Elsewhere").unwrap();
+        s.mailbox.move_items(&[b], elsewhere).unwrap();
+        // MailCraft 0.1 kept the pins as a reserved entry of the folder's view state.
+        s.view.collapsed_groups.insert(f, vec!["Today".into(), format!("{PINNED}[{},{},424242]", a.0, b.0)]);
+        assert_eq!(migrate_view_pins(&mut s), 2);
+        assert!(s.mailbox.mail[&a].pinned);
+        // 0.1 showed a moved message pinned at the top of its new folder; it stays that way.
+        assert!(s.mailbox.mail[&b].pinned, "a message that left the folder keeps its pin");
+        assert_eq!(s.mailbox.mail[&b].folder, elsewhere);
+        s.selection.folder = elsewhere;
+        let later = DateTime { unix: now.unix + 60, ..now };
+        let c = add(&mut s, MailItem { subject: "c".into(), received: later, ..Default::default() });
+        assert_eq!(crate::queries::visible_item_ids(&s), vec![b, c], "on top of a newer message");
+        assert_eq!(s.view.collapsed_groups[&f], vec!["Today".to_owned()]);
+        assert_eq!(migrate_view_pins(&mut s), 0);
+        s.view.collapsed_groups.insert(f, vec![format!("{PINNED}not json")]);
+        assert_eq!(migrate_view_pins(&mut s), 0);
+        assert!(!s.view.collapsed_groups.contains_key(&f));
     }
 
     #[test]

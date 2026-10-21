@@ -2051,17 +2051,7 @@ fn fill_item(s: &mut Session, id: ItemId, raw: &[u8]) -> bool {
     let now = s.now();
     let Some(old) = s.mailbox.mail.get(&id).cloned() else { return false };
     let mut full = mailcraft_store::import::item_from_raw(raw, old.folder, now);
-    full.id = old.id;
-    full.read = old.read;
-    full.flag = old.flag.clone();
-    full.categories = old.categories.clone();
-    full.response = old.response.clone();
-    full.is_draft = old.is_draft;
-    full.remote_id = old.remote_id.clone();
-    full.received = old.received;
-    full.focus = old.focus;
-    full.ignored = old.ignored;
-    full.conversation = old.conversation;
+    full.keep_local_state(&old);
     s.mailbox.mail.insert(id, full);
     let p = crate::accounts::prefs(s);
     p.headers_only.remove(&id.0);
@@ -2810,6 +2800,52 @@ mod tests {
              Message-ID: <{uidl}@example.org>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHi.\r\n"
         );
         Event::Pop3New { account, uidl: uidl.into(), raw: raw.into_bytes(), size: None, headers_only: false }
+    }
+
+    #[test]
+    fn a_downloaded_body_keeps_the_pin_votes_and_other_local_state() {
+        let (mut s, _, _) = session();
+        let r = s
+            .run(
+                "accounts.add",
+                &json!({"kind": "pop3", "address": "me@example.net", "incoming": {"host": "pop.example.net"},
+                    "outgoing": {"host": "smtp.example.net"}, "password": "pw"}),
+            )
+            .unwrap();
+        let acct = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let Event::Pop3New { raw, .. } = pop3_new(acct, "h1", "Ann <ann@example.org>", "later") else {
+            unreachable!()
+        };
+        apply_all(
+            &mut s,
+            vec![Event::Pop3New {
+                account: acct,
+                uidl: "h1".into(),
+                raw: raw.clone(),
+                size: None,
+                headers_only: true,
+            }],
+        );
+        let id = find_pop3(&s, acct, "h1").unwrap();
+        assert!(s.mailbox.mail[&id].body.text.is_none(), "header only");
+        s.run("mail.pin", &json!({"ids": [id.0], "on": true})).unwrap();
+        let vote = mailcraft_model::VoteRecord {
+            from: "bo@example.org".into(),
+            choice: "Yes".into(),
+            ..Default::default()
+        };
+        if let Some(m) = s.mailbox.mail.get_mut(&id) {
+            m.votes.push(vote.clone());
+            m.categories = vec!["Blue".into()];
+        }
+        // Mark to Download: the whole message arrives for the same item.
+        apply_all(&mut s, vec![Event::Pop3Full { account: acct, uidl: "h1".into(), raw }]);
+        let m = &s.mailbox.mail[&id];
+        assert!(m.body.text.as_deref().is_some_and(|t| t.contains("Hi.")), "the body is filled in");
+        assert!(m.pinned, "still pinned");
+        assert_eq!(m.votes, [vote]);
+        assert_eq!(m.categories, ["Blue"]);
+        assert!(!crate::accounts::prefs(&mut s).headers_only.contains(&id.0));
     }
 
     #[test]

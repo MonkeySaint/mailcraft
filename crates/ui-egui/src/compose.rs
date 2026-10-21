@@ -336,18 +336,46 @@ fn compose_viewport(ui: &mut Ui, app: &mut App, cid: u64, class: ViewportClass) 
         if !tiny || embedded {
             quick_access(ui, app, cid, embedded, tiny);
         }
+        // Where the F6 stops are drawn (header fields, body, ribbon).
+        let band = |ui: &Ui, top: f32| {
+            Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top().max(top))
+        };
+        let ribbon_top = ui.cursor().top();
         if !tiny {
             tab_row(ui, app, cid);
             crate::ribbon::ribbon(ui, app, Surface::Compose(cid), &frame);
         }
+        let ribbon = band(ui, ribbon_top);
         if !app.s.composes.contains_key(&cid) {
             return;
         }
         ui.add_space(8.0);
+        let header_top = ui.cursor().top();
         header(ui, app, cid);
         attach::well(ui, app, cid, WELL_INDENT);
+        let head = band(ui, header_top);
         separator(ui, app);
+        let body_top = ui.cursor().top();
         panes::body_with_panes(ui, app, cid, 0.0, true);
+        let body =
+            Rect::from_x_y_ranges(ui.max_rect().x_range(), body_top..=ui.max_rect().bottom().max(body_top));
+        // F6 (the main window's rule): header fields (To first), body, ribbon (the selected tab).
+        let first_field =
+            if app.s.composes.get(&cid).is_some_and(|c| c.show_from) { Field::From } else { Field::To };
+        crate::keys::window_stops(
+            ui,
+            app,
+            Surface::Compose(cid),
+            vec![
+                crate::keys::WindowStop {
+                    name: "header",
+                    rect: head,
+                    target: Some(field_id(cid, first_field)),
+                },
+                crate::keys::WindowStop { name: "body", rect: body, target: Some(editor_id(cid)) },
+                crate::keys::WindowStop { name: "ribbon", rect: ribbon, target: None },
+            ],
+        );
     });
 
     save_prompt(&ctx, app, cid);

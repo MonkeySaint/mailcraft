@@ -28,7 +28,7 @@ Calendar|Home > New Items|Group|-|Microsoft 365 Groups (cloud-only)
 Calendar|Home > New Items|Contact|people.new
 Calendar|Home > New Items|Task|tasks.new
 Calendar|Home > New Items|All Day Event|calendar.newAppointment
-Calendar|Home > New Items|Meeting with All|mail.replyWithMeeting
+Calendar|Home > New Items|Meeting with All|calendar.meetingWithAll
 Calendar|Home > New Items|More Items|mail.newItem
 Calendar|Home > New Items > More Items|Recurring Appointment|calendar.newAppointment
 Calendar|Home > New Items > More Items|Recurring Meeting|calendar.newMeeting

@@ -10,9 +10,10 @@
 //! `notes.lineUpIcons` also returns the grid order of the notes in the current folder.
 //!
 //! **Icon positions.** Icons dragged off the grid keep their place: `notes.setPosition` stores the note's
-//! offset from the grid's top-left corner (points) with the folder's view state, which the profile saves,
-//! and [`positions`] reads them back. Line Up Icons drops them (the icons snap back to the grid), and so
-//! does Reset View.
+//! offset from the grid's top-left corner (points) on the note itself (`Note::x` / `Note::y`, saved with
+//! the mailbox and undoable), and [`positions`] reads them back. Line Up Icons drops them (the icons snap
+//! back to the grid), and so does Reset View. Positions MailCraft 0.1 kept in the folder's view state move
+//! onto the notes when the profile is loaded ([`migrate_view_positions`]).
 //!
 //! `notes.forward` sends the note's text in a new message. [`view_rows`] is the list of the Notes views
 //! (Icon, Notes List, Last 7 Days).
@@ -72,48 +73,78 @@ fn store_view(s: &mut Session, v: &NotesViewState) {
     }
 }
 
-/// Reserved entry of the folder's view state holding the icon positions (JSON after the prefix). The
-/// control character keeps it apart from group labels (`cmd::view::is_group_label`).
+/// Reserved entry of a folder's view state where MailCraft 0.1 kept the icon positions (JSON after the
+/// prefix); [`migrate_view_positions`] moves them onto the notes.
 const NOTE_POS: &str = "\u{1}notes.pos=";
-/// Most icon positions kept per folder.
+/// Most icon positions one folder's old view-state entry is read for.
 pub const MAX_POSITIONS: usize = 2_000;
 /// Largest offset accepted (points).
-pub const MAX_OFFSET: f32 = 100_000.0;
+pub const MAX_OFFSET: f32 = mailcraft_model::note::MAX_NOTE_OFFSET;
 
 fn valid_offset(v: f32) -> bool {
-    v.is_finite() && (0.0..=MAX_OFFSET).contains(&v)
+    mailcraft_model::note::valid_note_offset(v)
 }
 
 /// Icon positions of the notes of `folder` that were dragged off the grid: note id → (x, y) offset from the
-/// grid's top-left corner. Positions of notes no longer in the folder are left out.
+/// grid's top-left corner (kept on each note, `Note::x` / `Note::y`).
 pub fn positions(s: &Session, folder: FolderId) -> BTreeMap<u64, (f32, f32)> {
-    s.view
-        .collapsed_groups
-        .get(&folder)
-        .and_then(|list| list.iter().find_map(|e| e.strip_prefix(NOTE_POS)))
-        .and_then(|json| serde_json::from_str::<BTreeMap<u64, (f32, f32)>>(json).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(id, (x, y))| {
-            valid_offset(*x)
-                && valid_offset(*y)
-                && s.mailbox.notes.get(&ItemId(*id)).is_some_and(|n| n.folder == folder)
-        })
-        .take(MAX_POSITIONS)
+    s.mailbox
+        .notes
+        .values()
+        .filter(|n| n.folder == folder)
+        .filter_map(|n| n.position().map(|p| (n.id.0, p)))
         .collect()
 }
 
-fn store_positions(s: &mut Session, folder: FolderId, map: &BTreeMap<u64, (f32, f32)>) {
-    let list = s.view.collapsed_groups.entry(folder).or_default();
-    list.retain(|e| !e.starts_with(NOTE_POS));
-    if !map.is_empty()
-        && let Ok(json) = serde_json::to_string(map)
-    {
-        list.push(format!("{NOTE_POS}{json}"));
+/// Puts every icon of `folder` back on the grid (Line Up Icons, Reset View). Returns how many moved.
+pub(crate) fn clear_positions(s: &mut Session, folder: FolderId) -> usize {
+    let mut n = 0usize;
+    for note in s.mailbox.notes.values_mut().filter(|n| n.folder == folder) {
+        if note.x.is_some() || note.y.is_some() {
+            note.set_position(None);
+            n = n.saturating_add(1);
+        }
     }
-    if list.is_empty() {
-        s.view.collapsed_groups.remove(&folder);
+    n
+}
+
+/// Moves icon positions kept in the view state by MailCraft 0.1 (`NOTE_POS` entries) onto the notes, and
+/// drops those entries. A note that already has a position keeps it; positions of notes that are gone or in
+/// another folder are dropped. Returns how many notes got a position.
+pub(crate) fn migrate_view_positions(s: &mut Session) -> usize {
+    let mut moved = 0usize;
+    let folders: Vec<FolderId> = s
+        .view
+        .collapsed_groups
+        .iter()
+        .filter(|(_, list)| list.iter().any(|e| e.starts_with(NOTE_POS)))
+        .map(|(f, _)| *f)
+        .collect();
+    for folder in folders {
+        let Some(list) = s.view.collapsed_groups.get_mut(&folder) else { continue };
+        let old: BTreeMap<u64, (f32, f32)> = list
+            .iter()
+            .find_map(|e| e.strip_prefix(NOTE_POS))
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        list.retain(|e| !e.starts_with(NOTE_POS));
+        if list.is_empty() {
+            s.view.collapsed_groups.remove(&folder);
+        }
+        for (id, (x, y)) in old.into_iter().take(MAX_POSITIONS) {
+            if !valid_offset(x) || !valid_offset(y) {
+                continue;
+            }
+            if let Some(n) = s.mailbox.notes.get_mut(&ItemId(id))
+                && n.folder == folder
+                && n.position().is_none()
+            {
+                n.set_position(Some((x, y)));
+                moved = moved.saturating_add(1);
+            }
+        }
     }
+    moved
 }
 
 fn offset_param(p: &Value, key: &str) -> Result<f32, CmdError> {
@@ -133,22 +164,21 @@ fn run_set_position(s: &mut Session, p: &Value) -> CmdResult {
         .ok_or_else(|| CmdError::Params("no note given".into()))?;
     let folder =
         s.mailbox.notes.get(&id).map(|n| n.folder).ok_or_else(|| CmdError::Params("no note".into()))?;
-    let mut map = positions(s, folder);
-    if p.get("position").is_some_and(Value::is_null) {
-        map.remove(&id.0);
+    let pos = if p.get("position").is_some_and(Value::is_null) {
+        None
     } else {
-        let (x, y) = (offset_param(p, "x")?, offset_param(p, "y")?);
-        if !map.contains_key(&id.0) && map.len() >= MAX_POSITIONS {
-            return Err(CmdError::Params(format!("at most {MAX_POSITIONS} icons keep a position")));
-        }
-        map.insert(id.0, (x, y));
+        Some((offset_param(p, "x")?, offset_param(p, "y")?))
+    };
+    if let Some(n) = s.mailbox.notes.get_mut(&id) {
+        n.set_position(pos);
+    }
+    if pos.is_some() {
         let st = modules::state(s, folder, ModuleKind::Notes);
         if st.lined_up {
             modules::set_icons(s, folder, st.icon_mode, false);
         }
     }
-    store_positions(s, folder, &map);
-    Ok(json!({ "id": id.0, "folder": folder.0, "positions": map.len() }))
+    Ok(json!({ "id": id.0, "folder": folder.0, "positions": positions(s, folder).len() }))
 }
 
 fn parse_color(c: &str) -> Option<NoteColor> {
@@ -354,7 +384,7 @@ fn run_line_up(s: &mut Session, p: &Value) -> CmdResult {
     v.lined_up = true;
     store_view(s, &v);
     if let Some(f) = pim::current_folder(s, Kind::Note) {
-        store_positions(s, f, &BTreeMap::new());
+        clear_positions(s, f);
     }
     Ok(json!({ "view": v, "order": pim::ids_json(&grid_order(s)) }))
 }
@@ -577,12 +607,20 @@ mod tests {
         s.run("notes.setPosition", &json!({"id": a, "x": 420.5, "y": 30})).unwrap();
         s.run("notes.setPosition", &json!({"id": b, "x": 0, "y": 900})).unwrap();
         assert_eq!(positions(&s, folder).get(&a), Some(&(420.5, 30.0)));
+        assert_eq!(s.mailbox.notes[&ItemId(a)].position(), Some((420.5, 30.0)), "kept on the note");
         assert!(!stored_view(&s).lined_up, "dragging breaks the lined-up grid");
-        // The positions are not group labels and survive a settings round trip of the view state.
-        assert!(s.view.collapsed_groups[&folder].iter().all(|e| !crate::cmd::view::is_group_label(e)));
-        let view: crate::ViewState = serde_json::from_value(serde_json::to_value(&s.view).unwrap()).unwrap();
-        s.view = view;
+        // The positions travel with the mailbox (the store's snapshot), not with the view state.
+        assert!(
+            s.view.collapsed_groups.get(&folder).is_none_or(|l| l.iter().all(|e| !e.starts_with(NOTE_POS)))
+        );
+        let mb: mailcraft_model::Mailbox =
+            serde_json::from_value(serde_json::to_value(&s.mailbox).unwrap()).unwrap();
+        s.mailbox = mb;
         assert_eq!(positions(&s, folder).len(), 2);
+        // Undo puts a dragged icon back where it was.
+        s.run("notes.setPosition", &json!({"id": a, "x": 1, "y": 2})).unwrap();
+        s.run("app.undo", &json!({})).unwrap();
+        assert_eq!(positions(&s, folder).get(&a), Some(&(420.5, 30.0)));
         // Back to the grid one at a time, or all with Line Up Icons.
         s.run("notes.setPosition", &json!({"id": b, "position": null})).unwrap();
         assert_eq!(positions(&s, folder).keys().copied().collect::<Vec<_>>(), vec![a]);
@@ -598,12 +636,55 @@ mod tests {
         ] {
             assert!(s.run("notes.setPosition", &bad).is_err(), "{bad}");
         }
-        // A deleted note's position is dropped.
+        // A deleted note leaves the folder's positions.
         s.run("notes.setPosition", &json!({"id": a, "x": 5, "y": 5})).unwrap();
         s.run("notes.delete", &json!({"id": a})).unwrap();
         assert!(positions(&s, folder).is_empty());
-        // Damaged stored text reads as no positions.
-        s.view.collapsed_groups.insert(folder, vec![format!("{NOTE_POS}{{not json")]);
+        // Damaged values on a note read as "on the grid".
+        if let Some(n) = s.mailbox.notes.get_mut(&ItemId(b)) {
+            n.x = Some(f32::NAN);
+            n.y = Some(4.0);
+        }
         assert!(positions(&s, folder).is_empty());
+    }
+
+    #[test]
+    fn reset_view_puts_dragged_icons_back_on_the_grid() {
+        let mut s = session();
+        let folder = role(&s, FolderRole::Notes);
+        s.selection = Selection { folder, items: vec![], focus: None };
+        let a = s.run("notes.new", &json!({"text": "A"})).unwrap()["id"].as_u64().unwrap();
+        assert!(s.enabled("view.resetView").is_some(), "nothing to reset yet");
+        s.run("notes.setPosition", &json!({"id": a, "x": 40, "y": 50})).unwrap();
+        assert!(s.enabled("view.resetView").is_none(), "a dragged icon customises the view");
+        s.run("view.resetView", &json!({})).unwrap();
+        assert!(positions(&s, folder).is_empty());
+        assert_eq!(s.mailbox.notes[&ItemId(a)].x, None);
+    }
+
+    #[test]
+    fn positions_move_over_from_the_old_view_state_entry() {
+        let mut s = session();
+        let folder = role(&s, FolderRole::Notes);
+        let other = s.mailbox.create_folder(folder, "Ideas").unwrap();
+        let a = s.run("notes.new", &json!({"text": "A"})).unwrap()["id"].as_u64().unwrap();
+        let b = s.run("notes.new", &json!({"text": "B"})).unwrap()["id"].as_u64().unwrap();
+        let c = s.run("notes.new", &json!({"text": "C", "folder": other.0})).unwrap()["id"].as_u64().unwrap();
+        s.run("notes.setPosition", &json!({"id": b, "x": 7, "y": 8})).unwrap();
+        // MailCraft 0.1 kept them in the folder's view state, next to group labels.
+        let old = format!(
+            "{NOTE_POS}{{\"{a}\":[10.0,20.0],\"{b}\":[1.0,1.0],\"{c}\":[3.0,3.0],\"999999\":[1.0,1.0],\"{a}0\":[-5.0,1.0]}}"
+        );
+        s.view.collapsed_groups.insert(folder, vec!["Today".into(), old]);
+        assert_eq!(migrate_view_positions(&mut s), 1);
+        assert_eq!(positions(&s, folder).get(&a), Some(&(10.0, 20.0)));
+        assert_eq!(positions(&s, folder).get(&b), Some(&(7.0, 8.0)), "a newer position wins");
+        assert!(positions(&s, other).is_empty(), "a note in another folder is not moved");
+        assert_eq!(s.view.collapsed_groups[&folder], vec!["Today".to_owned()]);
+        // Nothing left to move; a damaged entry is dropped.
+        assert_eq!(migrate_view_positions(&mut s), 0);
+        s.view.collapsed_groups.insert(folder, vec![format!("{NOTE_POS}{{not json")]);
+        assert_eq!(migrate_view_positions(&mut s), 0);
+        assert!(!s.view.collapsed_groups.contains_key(&folder));
     }
 }
