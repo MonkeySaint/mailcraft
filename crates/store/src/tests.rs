@@ -894,9 +894,26 @@ fn recoverable_bin_round_trips_with_raw_in_blobs() {
     assert!(store.load_recoverable().unwrap().items.is_empty(), "no file yet");
     let mut bin = mailcraft_model::RecoverBin::default();
     bin.add(mailcraft_model::DeletedItem::Mail(Box::new(mail(7, "Gone", Some(RAW1)))), "Inbox", 100);
-    store.save_recoverable(&bin).unwrap();
+    store.save_recoverable(&mut bin).unwrap();
     let text = fs::read_to_string(d.path().join(crate::RECOVERABLE_FILE)).unwrap();
     assert!(!text.contains("First body"), "raw sources live in blobs");
+    // The bin in memory now holds the blob key, not the source: the next save does not store it again.
+    let saved_key = match bin.items.first().map(|e| &e.item) {
+        Some(mailcraft_model::DeletedItem::Mail(m)) => {
+            assert!(m.raw.is_none(), "the source left memory");
+            m.blob.clone().unwrap()
+        }
+        other => panic!("mail entry expected, got {other:?}"),
+    };
+    // A second entry with a source: only it is stored; the first keeps its key.
+    bin.add(mailcraft_model::DeletedItem::Mail(Box::new(mail(8, "Also gone", Some(RAW2)))), "Inbox", 101);
+    store.save_recoverable(&mut bin).unwrap();
+    assert!(bin.items.iter().all(|e| matches!(&e.item, mailcraft_model::DeletedItem::Mail(m)
+        if m.raw.is_none() && m.blob.is_some())));
+    assert!(matches!(bin.items.first().map(|e| &e.item),
+        Some(mailcraft_model::DeletedItem::Mail(m)) if m.blob.as_deref() == Some(saved_key.as_str())));
+    bin.items.truncate(1);
+    store.save_recoverable(&mut bin).unwrap();
     drop(store);
     let mut store = Store::open(d.path()).unwrap();
     let back = store.load_recoverable().unwrap();
@@ -907,8 +924,9 @@ fn recoverable_bin_round_trips_with_raw_in_blobs() {
     assert_eq!(m.subject, "Gone");
     let key = m.blob.clone().unwrap();
     assert_eq!(store.get_blob(&key).unwrap(), RAW1);
-    // The bin keeps its blob alive through a collection that only sees the (empty) mailbox.
-    assert_eq!(store.gc_blobs(&base_mailbox()).unwrap(), 0);
+    // The bin keeps its blob alive through a collection that only sees the (empty) mailbox; the blob of
+    // the entry that left the bin goes.
+    assert_eq!(store.gc_blobs(&base_mailbox()).unwrap(), 1);
     assert!(store.has_blob(&key));
 }
 

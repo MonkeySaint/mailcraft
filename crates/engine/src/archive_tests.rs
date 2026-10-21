@@ -47,6 +47,23 @@ fn set(s: &mut Session, key: &str, v: Value) {
     s.settings.set(key, &v).unwrap();
 }
 
+/// Scheduled AutoArchive runs as an automatic action (outside a top-level command): what it deletes for good
+/// must still reach the recoverable items.
+#[test]
+fn scheduled_delete_keeps_items_recoverable() {
+    let mut s = session();
+    let inbox = role(&s, FolderRole::Inbox);
+    let old = mail(&mut s, inbox, 400);
+    let new = mail(&mut s, inbox, 2);
+    run(&mut s, "options.autoArchive", json!({"run": true, "action": "delete", "olderThanMonths": 3}));
+    let r = run_scheduled(&mut s).unwrap();
+    assert_eq!(r["deleted"], 1, "{r}");
+    assert!(!s.mailbox.mail.contains_key(&old));
+    assert!(s.mailbox.mail.contains_key(&new));
+    let listed: Vec<ItemId> = crate::recover::listed(&s).iter().map(|e| e.item.id()).collect();
+    assert_eq!(listed, vec![old]);
+}
+
 #[test]
 fn months_are_calendar_months_clamped_to_the_month() {
     let at = |y, m, d| DateTime::from_unix(days_from_civil(y, m, d).unwrap() * DAY + 3600, 0);

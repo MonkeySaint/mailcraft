@@ -366,7 +366,14 @@ pub fn run(s: &mut Session, g: &SendReceiveGroup, user: bool, offline_ok: bool) 
             s.sync.force_headers.insert(id);
         }
         let plan = Plan { send: m.send, receive, folders: folders.filter(|_| receive), user };
-        match dispatch(s, id, plan) {
+        let result = dispatch(s, id, plan);
+        // Headers only applies to this group's run: when nothing was started or queued behind a busy run
+        // (an error, nothing to do), it must not carry over to the account's next run.
+        let queued = s.sync.runs.get(&id).is_some_and(|r| r.busy.is_some());
+        if !matches!(result, Ok(true)) && !queued {
+            s.sync.force_headers.remove(&id);
+        }
+        match result {
             Ok(true) => started = started.saturating_add(1),
             Ok(false) => {}
             Err(e) => {
@@ -434,5 +441,32 @@ pub(crate) fn tick(s: &mut Session) {
             log::info!("scheduled send/receive of group {}: {e}", g.name);
             s.sync.group_runs.insert(g.name.to_lowercase(), now);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mailcraft_model::{Account, AccountKind, Mailbox, ServerSettings};
+
+    #[test]
+    fn a_failed_headers_only_run_does_not_leave_headers_only_behind() {
+        let mut s = Session::new(Mailbox::new_local("Local Folders"));
+        // An IMAP account without a password: its run cannot start.
+        let id = s.mailbox.add_account(Account {
+            kind: AccountKind::Imap,
+            address: "me@example.net".into(),
+            display_name: "me@example.net".into(),
+            incoming: Some(ServerSettings { host: "127.0.0.1".into(), ..Default::default() }),
+            ..Default::default()
+        });
+        s.mailbox.create_default_folders(id);
+        let g = SendReceiveGroup {
+            name: "Headers".into(),
+            members: vec![GroupMember { account: id.0, headers_only: true, ..GroupMember::default() }],
+            ..SendReceiveGroup::default()
+        };
+        assert!(run(&mut s, &g, true, false).is_err());
+        assert!(!s.sync.force_headers.contains(&id), "the next run downloads full items again");
     }
 }

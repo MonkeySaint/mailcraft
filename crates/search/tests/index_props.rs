@@ -64,6 +64,8 @@ fn doc() -> impl Strategy<Value = Doc> {
                     ("sensitivity".to_owned(), if read { "Private" } else { "Normal" }.to_owned()),
                     ("duedate".to_owned(), format!("2026-10-{:02}", days % 28 + 1)),
                 ],
+                // Near midnight UTC, so the local day (UTC-4 in `ctx`) differs from the UTC one.
+                date_props: vec![("received".to_owned(), NOW - days * 86_400 + 3_600)],
             },
         )
 }
@@ -110,6 +112,8 @@ fn query() -> impl Strategy<Value = String> {
         Just("expires:<=tomorrow".to_owned()),
         Just("prop:\"Sensitivity=private\"".to_owned()),
         Just("prop:\"Due Date<2026-10-15\"".to_owned()),
+        Just("prop:\"Received<2026-10-15\"".to_owned()),
+        Just("prop:\"Received=2026-10-10\"".to_owned()),
         Just("prop:\"company!=\"".to_owned()),
     ];
     prop::collection::vec(

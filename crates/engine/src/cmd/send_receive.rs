@@ -208,10 +208,13 @@ fn all(s: &mut Session, p: &Value) -> CmdResult {
     let off = offline(s, p);
     let report = outbox_report(s, &ids, off);
     let mut out = start(s, &ids, Plan::all(), off, report)?;
-    // User-defined groups included in F9 (online, or set to run while working offline).
+    // User-defined groups included in F9 (online, or set to run while working offline). The `offline`
+    // parameter (no network at all) skips them too.
     let mut groups_started = 0usize;
     let mut group_names = Vec::new();
-    for g in crate::sync::groups::f9_groups(s) {
+    let groups =
+        if opt_bool(p, "offline") == Some(true) { Vec::new() } else { crate::sync::groups::f9_groups(s) };
+    for g in groups {
         match crate::sync::groups::run(s, &g, true, s.view.work_offline) {
             Ok(n) => groups_started = groups_started.saturating_add(n),
             Err(e) => log::info!("send/receive group {}: {e}", g.name),

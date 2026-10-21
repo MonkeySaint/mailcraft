@@ -104,14 +104,31 @@ impl QuickStep {
     }
     /// True when the step still needs its first-use setup (an unset target folder, or no actions at all).
     pub fn needs_setup(&self) -> bool {
-        self.actions.is_empty()
-            || self.actions.iter().any(|a| {
-                matches!(
-                    a,
-                    QuickStepAction::MoveTo(None)
-                        | QuickStepAction::CopyTo(None)
-                        | QuickStepAction::AlwaysMoveConversation(None)
-                ) || matches!(a, QuickStepAction::Forward(to) | QuickStepAction::NewMessageTo(to) if to.is_empty())
-            })
+        self.actions.is_empty() || self.needs_folder() || self.needs_recipients()
+    }
+
+    /// True when an action still asks for its folder on first use.
+    pub fn needs_folder(&self) -> bool {
+        self.actions.iter().any(|a| {
+            matches!(
+                a,
+                QuickStepAction::MoveTo(None)
+                    | QuickStepAction::CopyTo(None)
+                    | QuickStepAction::AlwaysMoveConversation(None)
+            )
+        })
+    }
+
+    /// True when an action still asks for its recipients on first use.
+    pub fn needs_recipients(&self) -> bool {
+        self.actions.iter().any(|a| {
+            matches!(
+                a,
+                QuickStepAction::Forward(to)
+                    | QuickStepAction::NewMessageTo(to)
+                    | QuickStepAction::ForwardAsAttachment(to)
+                    if to.is_empty()
+            )
+        })
     }
 }

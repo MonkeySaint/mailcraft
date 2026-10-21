@@ -82,6 +82,16 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
     if ids.is_empty() {
         return report;
     }
+    // What the filters and rules delete for good stays recoverable (this runs outside `Session::run`).
+    let before = (crate::recover::keep_days(s) > 0).then(|| s.mailbox.clone());
+    process(s, ids, &mut report);
+    if let Some(before) = before {
+        crate::recover::capture(s, &before);
+    }
+    report
+}
+
+fn process(s: &mut Session, ids: Vec<ItemId>, report: &mut ArrivalReport) {
     let junk = crate::junk::on_new_mail(s, &ids);
     report.junk = junk.moved.iter().chain(junk.deleted.iter()).copied().collect();
     let gone: BTreeSet<ItemId> = report.junk.iter().copied().collect();
@@ -101,13 +111,12 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
         let excess = ids.len().saturating_sub(MAX_PROCESSED);
         ids.drain(..excess);
     }
-    scheduling(s, &ids, &mut report);
-    tracking(s, &ids, &mut report);
+    scheduling(s, &ids, report);
+    tracking(s, &ids, report);
     // S/MIME: valid signers' certificates are remembered for encrypted replies.
     crate::smime::on_new_mail(s, &ids);
     // What is left (unread, outside Deleted Items and Junk Email) lights the new-mail envelope.
     crate::new_mail::note_arrivals(s, &ids);
-    report
 }
 
 /// Voting responses among `ids` that answer a message of mine: each is recorded on that message

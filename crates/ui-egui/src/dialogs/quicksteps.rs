@@ -18,7 +18,7 @@ use crate::dialogs::common::{
     self, Dlg, Out, btn, btn_en, child, folder_path, footer, muted, primary, take_replies, window, with_state,
 };
 use crate::dialogs::folders::last_error;
-use mailcraft_model::{FolderId, Importance, QuickStepAction};
+use mailcraft_model::{FolderId, Importance, QuickStep, QuickStepAction};
 
 pub(super) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
@@ -560,15 +560,29 @@ fn placeholder(name: &str) -> bool {
     name.contains('?')
 }
 
+/// What First Time Setup asks for: (a folder, recipients), as the engine's first-use check decides.
+fn first_use_needs(actions: &[QuickStepAction]) -> (bool, bool) {
+    let step = QuickStep { actions: actions.to_vec(), ..QuickStep::default() };
+    (step.needs_folder(), step.needs_recipients())
+}
+
+#[cfg(test)]
+#[test]
+fn first_use_asks_for_what_the_engine_needs() {
+    let needs = |a: QuickStepAction| first_use_needs(&[a]);
+    assert_eq!(needs(QuickStepAction::ForwardAsAttachment(Vec::new())), (false, true));
+    assert_eq!(needs(QuickStepAction::ForwardAsAttachment(vec!["a@example.com".into()])), (false, false));
+    assert_eq!(needs(QuickStepAction::AlwaysMoveConversation(None)), (true, false));
+    assert_eq!(needs(QuickStepAction::MoveTo(None)), (true, false));
+    assert_eq!(needs(QuickStepAction::Forward(Vec::new())), (false, true));
+    assert_eq!(needs(QuickStepAction::MarkRead), (false, false));
+}
+
 fn first_use(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let step = d.get("step").cloned().unwrap_or(Value::Null);
     let actions = parse_actions(step.get("actions"));
-    let needs_folder =
-        actions.iter().any(|a| matches!(a, QuickStepAction::MoveTo(None) | QuickStepAction::CopyTo(None)));
-    let needs_to = actions
-        .iter()
-        .any(|a| matches!(a, QuickStepAction::Forward(t) | QuickStepAction::NewMessageTo(t) if t.is_empty()));
+    let (needs_folder, needs_to) = first_use_needs(&actions);
     let init = |_: &App| FirstUse {
         name: step.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
         ..Default::default()

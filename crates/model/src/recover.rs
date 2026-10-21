@@ -3,6 +3,8 @@
 //! Deleted Items can put them back, independent of the undo history. The store keeps the bin in its own file
 //! (`mailcraft-store`); the engine fills it after each command and purges it on a schedule.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Appointment, Contact, FolderId, ItemId, MailItem, Mailbox, Note, Task};
@@ -160,11 +162,27 @@ impl RecoverBin {
     /// Adds a deleted item. An earlier entry for the same item (deleted, recovered, deleted again) is
     /// replaced; past [`MAX_RECOVERABLE`] the oldest entries go.
     pub fn add(&mut self, item: DeletedItem, folder_path: &str, now: i64) {
-        let id = item.id();
-        let kind = item.kind();
-        self.items.retain(|e| e.item.kind() != kind || (e.item.id() != id && e.restored_as != Some(id)));
-        let folder_path: String = folder_path.chars().take(MAX_PATH_CHARS).collect();
-        self.items.push(Recoverable { item, deleted: now, folder_path, restored_as: None });
+        self.add_all(vec![(item, folder_path.to_owned())], now);
+    }
+
+    /// Adds deleted items (with the folder path each was deleted from) in one pass: earlier entries for the
+    /// same items are replaced, and past [`MAX_RECOVERABLE`] the oldest entries go (of `items` only the
+    /// last [`MAX_RECOVERABLE`] are kept).
+    pub fn add_all(&mut self, items: Vec<(DeletedItem, String)>, now: i64) {
+        if items.is_empty() {
+            return;
+        }
+        let skip = items.len().saturating_sub(MAX_RECOVERABLE);
+        let items: Vec<(DeletedItem, String)> = items.into_iter().skip(skip).collect();
+        let new: HashSet<(&'static str, ItemId)> = items.iter().map(|(i, _)| (i.kind(), i.id())).collect();
+        self.items.retain(|e| {
+            let kind = e.item.kind();
+            !new.contains(&(kind, e.item.id())) && e.restored_as.is_none_or(|r| !new.contains(&(kind, r)))
+        });
+        for (item, folder_path) in items {
+            let folder_path: String = folder_path.chars().take(MAX_PATH_CHARS).collect();
+            self.items.push(Recoverable { item, deleted: now, folder_path, restored_as: None });
+        }
         if self.items.len() > MAX_RECOVERABLE {
             let excess = self.items.len().saturating_sub(MAX_RECOVERABLE);
             self.items.drain(..excess);
@@ -194,39 +212,60 @@ impl RecoverBin {
 
     /// Items that were in `before` and are gone from `after` (deleted for good by whatever ran in between).
     pub fn vanished(before: &Mailbox, after: &Mailbox) -> Vec<DeletedItem> {
+        RecoverBin::vanished_where(before, after, |_| true, usize::MAX)
+    }
+
+    /// Like [`RecoverBin::vanished`], limited to items whose folder passes `keep` and to at most `limit`
+    /// items (only those are copied).
+    pub fn vanished_where(
+        before: &Mailbox,
+        after: &Mailbox,
+        keep: impl Fn(FolderId) -> bool,
+        limit: usize,
+    ) -> Vec<DeletedItem> {
         let mut out: Vec<DeletedItem> = before
             .mail
             .values()
-            .filter(|m| !after.mail.contains_key(&m.id))
+            .filter(|m| !after.mail.contains_key(&m.id) && keep(m.folder))
+            .take(limit)
             .map(|m| DeletedItem::Mail(Box::new(m.clone())))
             .collect();
+        let room = |out: &Vec<DeletedItem>| limit.saturating_sub(out.len());
+        let n = room(&out);
         out.extend(
             before
                 .appointments
                 .values()
-                .filter(|a| !after.appointments.contains_key(&a.id))
+                .filter(|a| !after.appointments.contains_key(&a.id) && keep(a.folder))
+                .take(n)
                 .map(|a| DeletedItem::Appointment(Box::new(a.clone()))),
         );
+        let n = room(&out);
         out.extend(
             before
                 .contacts
                 .values()
-                .filter(|c| !after.contacts.contains_key(&c.id))
+                .filter(|c| !after.contacts.contains_key(&c.id) && keep(c.folder))
+                .take(n)
                 .map(|c| DeletedItem::Contact(Box::new(c.clone()))),
         );
+        let n = room(&out);
         out.extend(
             before
                 .tasks
                 .values()
-                .filter(|t| !after.tasks.contains_key(&t.id))
+                .filter(|t| !after.tasks.contains_key(&t.id) && keep(t.folder))
+                .take(n)
                 .map(|t| DeletedItem::Task(Box::new(t.clone()))),
         );
+        let n = room(&out);
         out.extend(
             before
                 .notes
                 .values()
-                .filter(|n| !after.notes.contains_key(&n.id))
-                .map(|n| DeletedItem::Note(Box::new(n.clone()))),
+                .filter(|x| !after.notes.contains_key(&x.id) && keep(x.folder))
+                .take(n)
+                .map(|x| DeletedItem::Note(Box::new(x.clone()))),
         );
         out
     }
@@ -251,6 +290,41 @@ mod tests {
             bin.add(note(100 + i, "x"), "", 30);
         }
         assert_eq!(bin.items.len(), MAX_RECOVERABLE);
+    }
+
+    #[test]
+    fn add_all_replaces_in_one_pass_and_keeps_the_newest() {
+        let mut bin = RecoverBin::default();
+        bin.add(note(1, "a"), "Notes", 10);
+        bin.items[0].restored_as = Some(ItemId(2));
+        bin.add(note(3, "c"), "Notes", 10);
+        // 1 again and its recovered copy 2: both replace the first entry.
+        bin.add_all(vec![(note(1, "a2"), "N".into()), (note(2, "b"), "N".into())], 20);
+        let ids: Vec<u64> = bin.items.iter().map(|e| e.item.id().0).collect();
+        assert_eq!(ids, vec![3, 1, 2]);
+        // More than the cap at once: the last ones stay.
+        let many: Vec<(DeletedItem, String)> =
+            (0..(MAX_RECOVERABLE as u64 + 5)).map(|i| (note(1_000 + i, "x"), String::new())).collect();
+        bin.add_all(many, 30);
+        assert_eq!(bin.items.len(), MAX_RECOVERABLE);
+        assert_eq!(bin.items.first().map(|e| e.item.id().0), Some(1_005));
+        bin.add_all(Vec::new(), 40);
+        assert_eq!(bin.items.len(), MAX_RECOVERABLE);
+    }
+
+    #[test]
+    fn vanished_where_filters_and_limits() {
+        let mut before = Mailbox::default();
+        for i in 1..=4u64 {
+            let folder = FolderId(if i % 2 == 0 { 2 } else { 1 });
+            before.notes.insert(ItemId(i), Note { id: ItemId(i), folder, ..Default::default() });
+        }
+        let after = Mailbox::default();
+        assert_eq!(RecoverBin::vanished(&before, &after).len(), 4);
+        let odd = RecoverBin::vanished_where(&before, &after, |f| f == FolderId(1), usize::MAX);
+        assert!(odd.iter().all(|i| i.id().0 % 2 == 1));
+        assert_eq!(odd.len(), 2);
+        assert_eq!(RecoverBin::vanished_where(&before, &after, |_| true, 3).len(), 3);
     }
 
     #[test]

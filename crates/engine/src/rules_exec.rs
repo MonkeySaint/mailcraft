@@ -1344,6 +1344,25 @@ mod tests {
         assert!(!s.mailbox.mail.contains_key(&a));
     }
 
+    /// Rules on arriving mail run outside `Session::run`: what they delete for good must still reach the
+    /// recoverable items.
+    #[test]
+    fn mail_a_rule_deletes_for_good_on_arrival_stays_recoverable() {
+        let (mut s, acc) = session();
+        let inbox = folder(&s, acc, FolderRole::Inbox);
+        let a = deliver(&mut s, inbox, &raw_message("bob@example.org", "Clearance offer", ""));
+        let kept = deliver(&mut s, inbox, &raw_message("ann@example.org", "Agenda", ""));
+        s.mailbox.rules = vec![rule(
+            vec![mailcraft_model::RuleCondition::SubjectContains(vec!["offer".into()])],
+            vec![RuleAction::PermanentlyDelete],
+        )];
+        crate::sync::arrival::on_new_mail(&mut s, &[a, kept]);
+        assert!(!s.mailbox.mail.contains_key(&a));
+        let listed: Vec<ItemId> = crate::recover::listed(&s).iter().map(|e| e.item.id()).collect();
+        assert_eq!(listed, vec![a]);
+        assert_eq!(crate::recover::listed(&s)[0].folder_path, "Inbox");
+    }
+
     #[test]
     fn header_editing() {
         let raw = b"From: a@example.org\r\nCc: x@example.org,\r\n y@example.org\r\nSubject: s\r\n\r\nbody\r\nCc: not a header\r\n";

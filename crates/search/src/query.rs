@@ -471,9 +471,23 @@ impl PropTest {
         Some(PropTest { name, label: label.to_owned(), op, value: value.to_owned() })
     }
 
-    /// True when the property in `props` satisfies the condition (a missing property is empty).
-    pub fn matches<K: AsRef<str>, V: AsRef<str>>(&self, props: &[(K, V)]) -> bool {
-        let actual = props.iter().find(|(k, _)| k.as_ref() == self.name).map_or("", |(_, v)| v.as_ref());
+    /// True when the property in `props` satisfies the condition (a missing property is empty). A date
+    /// property (`dates`, Unix seconds) is compared as its `YYYY-MM-DD` day on the local calendar
+    /// `tz_offset_min` minutes from UTC.
+    pub fn matches<K: AsRef<str>, V: AsRef<str>, D: AsRef<str>>(
+        &self,
+        props: &[(K, V)],
+        dates: &[(D, i64)],
+        tz_offset_min: i32,
+    ) -> bool {
+        let day;
+        let actual = match dates.iter().find(|(k, _)| k.as_ref() == self.name) {
+            Some((_, unix)) => {
+                day = crate::doc::local_day_text(*unix, tz_offset_min);
+                day.as_str()
+            }
+            None => props.iter().find(|(k, _)| k.as_ref() == self.name).map_or("", |(_, v)| v.as_ref()),
+        };
         let a = crate::fold::fold(actual.trim());
         let want = crate::fold::fold(&self.value);
         match self.op {

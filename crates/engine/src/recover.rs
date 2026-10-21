@@ -5,12 +5,16 @@
 //! a [`RecoverBin`] kept beside the mailbox: in the store's `recoverable.json` for a profile on disk, in
 //! memory otherwise. It survives restarts and does not depend on the undo history. Entries older than
 //! Options › Advanced › "Keep permanently deleted items recoverable for (days)" are purged when the
-//! profile opens and then hourly.
+//! profile opens and then hourly. `Session::run` captures what a command deletes; work that runs outside a
+//! command calls [`capture`] itself: new mail being processed (rules, the Junk Email filter) and scheduled
+//! AutoArchive.
 //!
-//! Commands that remove items without deleting them are not captured: sending a draft (the Outbox copy
-//! replaces it) and closing a data file (its items leave with it).
+//! Removals that are not deletions are not captured: sending a draft (the Outbox copy replaces it), closing
+//! a data file and removing an account (their items leave with them).
 
-use mailcraft_model::{ItemId, Mailbox, RecoverBin, Recoverable};
+use std::collections::{BTreeMap, BTreeSet};
+
+use mailcraft_model::{AccountId, FolderId, ItemId, MAX_RECOVERABLE, Mailbox, RecoverBin, Recoverable};
 
 use crate::{Notice, Session};
 
@@ -57,7 +61,7 @@ pub(crate) fn load(s: &mut Session) {
 /// Writes the bin to the store (no-op for in-memory sessions). Failures are logged and shown once.
 fn save(s: &mut Session) {
     let Some(store) = s.store.as_mut() else { return };
-    match store.save_recoverable(&s.recover.bin) {
+    match store.save_recoverable(&mut s.recover.bin) {
         Ok(()) => s.recover.save_error_shown = false,
         Err(e) => {
             log::error!("cannot write the recoverable items: {e}");
@@ -69,17 +73,30 @@ fn save(s: &mut Session) {
     }
 }
 
-/// Puts the items that are in `before` and gone from the session's mailbox into the bin.
+/// Puts the items that are in `before` and gone from the session's mailbox into the bin. Items of an
+/// account that is gone too (a removed account, a closed data file) left with it and are not captured; at
+/// most [`MAX_RECOVERABLE`] items are taken from one change.
 pub(crate) fn capture(s: &mut Session, before: &Mailbox) {
-    let gone = RecoverBin::vanished(before, &s.mailbox);
-    if gone.is_empty() || keep_days(s) == 0 {
+    if keep_days(s) == 0 {
+        return;
+    }
+    let live: BTreeSet<AccountId> = s.mailbox.accounts.iter().map(|a| a.id).collect();
+    let kept = |f: FolderId| before.folder(f).is_none_or(|folder| live.contains(&folder.account));
+    let gone = RecoverBin::vanished_where(before, &s.mailbox, kept, MAX_RECOVERABLE);
+    if gone.is_empty() {
         return;
     }
     let now = s.now().unix;
-    for item in gone {
-        let path = before.folder_path(item.folder());
-        s.recover.bin.add(item, &path, now);
-    }
+    let mut paths: BTreeMap<FolderId, String> = BTreeMap::new();
+    let items: Vec<_> = gone
+        .into_iter()
+        .map(|item| {
+            let path =
+                paths.entry(item.folder()).or_insert_with(|| before.folder_path(item.folder())).clone();
+            (item, path)
+        })
+        .collect();
+    s.recover.bin.add_all(items, now);
     save(s);
 }
 

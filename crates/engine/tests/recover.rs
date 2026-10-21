@@ -88,6 +88,61 @@ fn survives_restart_and_the_undo_limit_then_purges() {
 }
 
 #[test]
+fn an_unreadable_recover_file_is_set_aside_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Session::open(dir.path()).unwrap());
+    let file = dir.path().join(mailcraft_store::RECOVERABLE_FILE);
+    std::fs::write(&file, b"{\"items\": [garbled").unwrap();
+    let mut s = Session::open(dir.path()).unwrap();
+    assert!(!file.exists(), "the unreadable file is moved away");
+    let bad = dir.path().join(format!("{}.bad", mailcraft_store::RECOVERABLE_FILE));
+    assert_eq!(std::fs::read(&bad).unwrap(), b"{\"items\": [garbled", "kept as .bad for inspection");
+    assert!(
+        s.notices.iter().any(|n| matches!(n, Notice::Error(t) if t.contains("recoverable deleted items"))),
+        "the user is told: {:?}",
+        s.notices
+    );
+    assert!(listed(&mut s).is_empty());
+    // The bin works again from empty and reaches the disk.
+    at(&mut s, T0);
+    delete_for_good(&mut s, "After the damage");
+    assert!(file.exists());
+    drop(s);
+    let mut s = Session::open(dir.path()).unwrap();
+    at(&mut s, T0);
+    assert_eq!(listed(&mut s).len(), 1);
+}
+
+#[test]
+fn removing_an_account_does_not_fill_the_bin() {
+    use mailcraft_engine::model::{Account, AccountKind, ServerSettings};
+    let mut s = Session::new(mailcraft_engine::model::Mailbox::new_local("Local Folders"));
+    at(&mut s, T0);
+    let kept = delete_for_good(&mut s, "Deleted on purpose");
+    let id = s.mailbox.add_account(Account {
+        kind: AccountKind::Imap,
+        address: "old@example.net".into(),
+        display_name: "old@example.net".into(),
+        incoming: Some(ServerSettings::default()),
+        ..Default::default()
+    });
+    s.mailbox.create_default_folders(id);
+    let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+    for i in 0..50 {
+        s.mailbox.add_mail(MailItem {
+            folder: inbox,
+            subject: format!("Offline copy {i}"),
+            ..Default::default()
+        });
+    }
+    let r = run(&mut s, "accounts.remove", json!({"account": id.0, "confirm": true}));
+    assert_eq!(r["removed"], true);
+    let l = listed(&mut s);
+    assert_eq!(l.len(), 1, "only the item deleted on purpose: {l:?}");
+    assert_eq!(l[0]["id"], kept.0);
+}
+
+#[test]
 fn retention_option_and_purge_selected() {
     let mut s = Session::new(mailcraft_engine::model::Mailbox::new_local("Local Folders"));
     at(&mut s, T0);

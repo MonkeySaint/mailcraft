@@ -186,6 +186,11 @@ fn send_receive_groups_define_and_run() {
     assert_eq!(r["groups"], json!(["Bob"]));
     assert!(s.wait_for_sync(WAIT), "{:?}", s.sync_status());
     assert!(has(&s, bob, "For Bob"), "the Bob group ran with F9");
+    // `offline: true` connects nowhere, groups included.
+    let r = run(&mut s, "sendReceive.all", json!({"offline": true}));
+    assert_eq!(r["groups"], json!([]), "{r}");
+    assert_eq!(r["started"], 0, "{r}");
+    assert!(!s.sync_busy(), "nothing started");
 
     // The menu entry for a folder: the current account's Inbox.
     s.selection.folder = s.mailbox.role_folder(alice, FolderRole::Inbox).unwrap();

@@ -754,6 +754,24 @@ mod tests {
     }
 
     #[test]
+    fn forward_as_attachment_without_recipients_asks_on_first_use() {
+        let (mut s, inbox, _) = session();
+        let first = s.mailbox.items_in(inbox)[0].id;
+        s.run("quicksteps.new", &json!({"name": "Fwd att", "actions": [{"ForwardAsAttachment": []}]}))
+            .unwrap();
+        let composes = s.composes.len();
+        let r = s.run("quicksteps.run", &json!({"id": "fwd att", "ids": [first.0]})).unwrap();
+        assert_eq!(r["dialog"], "quickStepFirstUse");
+        assert_eq!(s.composes.len(), composes, "no forward opened with an empty To");
+        let r = s
+            .run("quicksteps.run", &json!({"id": "fwd att", "ids": [first.0], "to": ["pat@example.net"]}))
+            .unwrap();
+        let cid = r["composes"][0].as_u64().unwrap();
+        assert_eq!(s.composes[&cid].to, "pat@example.net");
+        assert!(!s.mailbox.quick_steps.last().unwrap().needs_setup(), "the recipients are remembered");
+    }
+
+    #[test]
     fn custom_actions() {
         let (mut s, inbox, _) = session();
         s.run(

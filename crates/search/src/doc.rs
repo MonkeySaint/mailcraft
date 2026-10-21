@@ -128,8 +128,11 @@ pub struct Doc {
     /// Unix seconds the item expires (mail: the `Expiry-Date` or `Expires` header, RFC 4021).
     pub expires: Option<i64>,
     /// Item properties for form-field conditions (`prop:` / `conversation:` terms): (property id, value as
-    /// text). Ids are [`prop_id`]s; dates are `YYYY-MM-DD` (UTC), numbers plain digits.
+    /// text). Ids are [`prop_id`]s; numbers are plain digits. Dates are in `date_props`.
     pub props: Vec<(String, String)>,
+    /// Date properties for form-field conditions: (property id, Unix seconds). A condition compares the
+    /// user's local day (`YYYY-MM-DD` in the evaluation context's time zone, [`local_day_text`]).
+    pub date_props: Vec<(String, i64)>,
 }
 
 /// A property id as conditions name it: lower case, without spaces, dashes or underscores ("Message
@@ -138,14 +141,18 @@ pub fn prop_id(name: &str) -> String {
     name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
-/// `YYYY-MM-DD` of a time (UTC).
-fn day_text(d: DateTime) -> String {
-    let c = d.civil(0);
+/// `YYYY-MM-DD` of a time on the local calendar `tz_offset_min` minutes from UTC.
+pub fn local_day_text(unix: i64, tz_offset_min: i32) -> String {
+    let c = DateTime::from_unix(unix, 0).civil(tz_offset_min);
     format!("{:04}-{:02}-{:02}", c.year, c.month, c.day)
 }
 
 fn prop(name: &str, value: impl Into<String>) -> (String, String) {
     (prop_id(name), value.into())
+}
+
+fn date(name: &str, d: DateTime) -> (String, i64) {
+    (prop_id(name), d.unix)
 }
 
 fn sensitivity_name(s: mailcraft_model::Sensitivity) -> &'static str {
@@ -250,6 +257,7 @@ impl Doc {
             has_attachments: m.has_attachments(),
             expires: m.raw.as_deref().and_then(expiry_of),
             props: mail_props(m),
+            date_props: mail_dates(m),
         }
     }
 
@@ -275,14 +283,13 @@ impl Doc {
                 prop("messageClass", "IPM.Appointment"),
                 prop("subject", a.subject.clone()),
                 prop("location", a.location.clone()),
-                prop("start", day_text(a.start)),
-                prop("end", day_text(a.end)),
                 prop("allDayEvent", if a.all_day { "Yes" } else { "No" }),
                 prop("recurring", if a.recurrence.is_some() { "Yes" } else { "No" }),
                 prop("sensitivity", if a.private { "Private" } else { "Normal" }),
                 prop("organizer", a.organizer.as_ref().map(|o| o.addr.clone()).unwrap_or_default()),
                 prop("categories", a.categories.join(", ")),
             ],
+            date_props: vec![date("start", a.start), date("end", a.end)],
             ..Doc::default()
         }
     }
@@ -332,6 +339,7 @@ impl Doc {
             received: t.due.or(t.start).map_or(0, |d| d.unix),
             read: true,
             props: task_props(t),
+            date_props: task_dates(t),
             ..Doc::default()
         }
     }
@@ -350,9 +358,9 @@ impl Doc {
             props: vec![
                 prop("messageClass", "IPM.StickyNote"),
                 prop("subject", n.text.lines().next().unwrap_or_default()),
-                prop("modified", day_text(n.modified)),
                 prop("categories", n.categories.join(", ")),
             ],
+            date_props: vec![date("modified", n.modified)],
             ..Doc::default()
         }
     }
@@ -366,15 +374,15 @@ fn mail_props(m: &MailItem) -> Vec<(String, String)> {
     } else {
         "IPM.Note"
     };
-    let (flag_status, flag_due, flag_start) = match &m.flag {
-        FlagState::None => ("", None, None),
-        FlagState::Flagged { due, start, .. } => ("Flagged", *due, *start),
-        FlagState::Complete { .. } => ("Completed", None, None),
+    let flag_status = match &m.flag {
+        FlagState::None => "",
+        FlagState::Flagged { .. } => "Flagged",
+        FlagState::Complete { .. } => "Completed",
     };
     let names = |l: &[mailcraft_model::Address]| {
         l.iter().map(|a| a.name.clone().unwrap_or_else(|| a.addr.clone())).collect::<Vec<_>>().join("; ")
     };
-    let mut out = vec![
+    vec![
         prop("messageClass", class),
         prop("subject", m.subject.clone()),
         prop("conversation", mailcraft_model::subject::conversation_topic(&m.subject)),
@@ -384,21 +392,23 @@ fn mail_props(m: &MailItem) -> Vec<(String, String)> {
         prop("sensitivity", sensitivity_name(m.sensitivity)),
         prop("importance", importance_name(m.importance)),
         prop("flagStatus", flag_status),
-        prop("received", day_text(m.received)),
         prop("size", m.size.to_string()),
         prop("read", if m.read { "Yes" } else { "No" }),
         prop("hasAttachments", if m.has_attachments() { "Yes" } else { "No" }),
         prop("categories", m.categories.join(", ")),
-    ];
-    if let Some(d) = m.sent {
-        out.push(prop("sent", day_text(d)));
-    }
-    if let Some(d) = flag_due {
-        out.push(prop("dueDate", day_text(d)));
-    }
-    if let Some(d) = flag_start {
-        out.push(prop("startDate", day_text(d)));
-    }
+    ]
+}
+
+/// Mail dates: received, sent, the flag's due and start dates.
+fn mail_dates(m: &MailItem) -> Vec<(String, i64)> {
+    let (flag_due, flag_start) = match &m.flag {
+        FlagState::Flagged { due, start, .. } => (*due, *start),
+        _ => (None, None),
+    };
+    let mut out = vec![date("received", m.received)];
+    out.extend(m.sent.map(|d| date("sent", d)));
+    out.extend(flag_due.map(|d| date("dueDate", d)));
+    out.extend(flag_start.map(|d| date("startDate", d)));
     out
 }
 
@@ -441,7 +451,7 @@ fn task_props(t: &Task) -> Vec<(String, String)> {
         TaskPriority::Normal => "Normal",
         TaskPriority::High => "High",
     };
-    let mut out = vec![
+    vec![
         prop("messageClass", "IPM.Task"),
         prop("subject", t.subject.clone()),
         prop("status", status),
@@ -451,15 +461,14 @@ fn task_props(t: &Task) -> Vec<(String, String)> {
         prop("sensitivity", if t.private { "Private" } else { "Normal" }),
         prop("owner", t.assigned_to.join("; ")),
         prop("categories", t.categories.join(", ")),
-    ];
-    if let Some(d) = t.due {
-        out.push(prop("dueDate", day_text(d)));
-    }
-    if let Some(d) = t.start {
-        out.push(prop("startDate", day_text(d)));
-    }
-    if let Some(d) = t.completed {
-        out.push(prop("dateCompleted", day_text(d)));
-    }
+    ]
+}
+
+/// Task dates: due, start, completed.
+fn task_dates(t: &Task) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    out.extend(t.due.map(|d| date("dueDate", d)));
+    out.extend(t.start.map(|d| date("startDate", d)));
+    out.extend(t.completed.map(|d| date("dateCompleted", d)));
     out
 }

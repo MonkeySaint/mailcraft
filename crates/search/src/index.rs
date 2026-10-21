@@ -146,6 +146,8 @@ struct Slot {
     categories: Box<[Box<[Box<str>]>]>,
     /// Item properties for form-field conditions (`Doc::props`).
     props: Box<[(Box<str>, Box<str>)]>,
+    /// Date properties (`Doc::date_props`).
+    date_props: Box<[(Box<str>, i64)]>,
     /// Term ids of every field in `field::ALL` order, `GAP` between segments.
     tokens: Box<[u32]>,
     /// End offset in `tokens` of each field.
@@ -349,6 +351,7 @@ impl Index {
                 .take(MAX_PROPS)
                 .map(|(k, v)| (k.as_str().into(), v.chars().take(MAX_PROP_VALUE).collect::<String>().into()))
                 .collect(),
+            date_props: doc.date_props.iter().take(MAX_PROPS).map(|(k, v)| (k.as_str().into(), *v)).collect(),
             tokens: tokens.into_boxed_slice(),
             ends,
         });
@@ -520,7 +523,7 @@ impl Index {
             }
             Term::Size(spec) => self.scan(|s| spec.contains(s.size)),
             Term::Kind(k) => self.scan(|s| s.kind == *k),
-            Term::Prop(p) => self.scan(|s| p.matches(&s.props)),
+            Term::Prop(p) => self.scan(|s| p.matches(&s.props, &s.date_props, ctx.tz_offset_min)),
             Term::Expires(v) => match Expiry::parse(v) {
                 Some(e) => self.scan(|s| ctx.expiry_matches(&e, s.expires)),
                 None => self.empty_bits(),
@@ -755,6 +758,38 @@ mod tests {
         for q in ["prop:\"Due Date<2026-12-01\"", "conversation:\"lunch\"", "prop:\"Company!=\""] {
             assert_eq!(parse(&parse(q).to_string()), parse(q), "{q}");
         }
+    }
+
+    #[test]
+    fn date_properties_compare_by_local_day() {
+        let mut ix = Index::new();
+        // 2026-10-21 01:00 UTC is the evening of 2026-10-20 at UTC-4; 2026-10-20 12:00 UTC is that
+        // afternoon.
+        let late = 1_792_544_400;
+        let noon = late - 13 * 3_600;
+        let mut docs = docs();
+        docs.truncate(2);
+        for (d, t) in docs.iter_mut().zip([late, noon]) {
+            d.date_props = vec![("received".to_owned(), t)];
+            ix.upsert(d);
+        }
+        let at = |tz: i32| Context { tz_offset_min: tz, ..ctx() };
+        for (q, tz, want) in [
+            ("prop:\"Received=2026-10-20\"", -240, vec![1, 2]),
+            ("prop:\"Received=2026-10-20\"", 0, vec![2]),
+            ("prop:\"Received=2026-10-21\"", 0, vec![1]),
+            ("prop:\"Received>2026-10-20\"", -240, vec![]),
+            ("prop:\"Received<2026-10-21\"", 120, vec![2]),
+        ] {
+            let mut got = ix.matching(&parse(q), &at(tz), &Filter::default());
+            got.sort_unstable();
+            assert_eq!(got, want, "{q} at {tz}");
+            let direct: Vec<u64> =
+                docs.iter().filter(|d| crate::eval::matches(&parse(q), d, &at(tz))).map(|d| d.id).collect();
+            assert_eq!(direct, want, "{q} at {tz} (direct)");
+        }
+        assert_eq!(crate::doc::local_day_text(late, -240), "2026-10-20");
+        assert_eq!(crate::doc::local_day_text(late, 0), "2026-10-21");
     }
 
     #[test]

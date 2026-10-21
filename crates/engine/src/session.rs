@@ -896,7 +896,7 @@ impl Session {
                 }
                 let ops = diff_ops(&before, &self.mailbox);
                 // Items this command deleted for good stay recoverable (not a draft replaced by its sent copy,
-                // nor the items of a data file being closed).
+                // nor the items of a data file being closed or of a removed account: `capture` skips those).
                 if !ops.is_empty()
                     && self.run_depth == 0
                     && !self.undo_barrier

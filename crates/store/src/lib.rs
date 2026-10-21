@@ -495,8 +495,9 @@ impl Store {
     }
 
     /// Writes the recoverable-items bin atomically. Raw message sources go to the blob store (the file keeps
-    /// blob keys only); `bin` itself is left as it is.
-    pub fn save_recoverable(&mut self, bin: &RecoverBin) -> Result<()> {
+    /// blob keys only). Once the file is written, the mail entries of `bin` hold their blob key instead of
+    /// the source, so later saves do not store it again (a failed write leaves `bin` as it was).
+    pub fn save_recoverable(&mut self, bin: &mut RecoverBin) -> Result<()> {
         let mut copy = bin.clone();
         for e in &mut copy.items {
             if let DeletedItem::Mail(m) = &mut e.item
@@ -512,7 +513,19 @@ impl Store {
                 format!("the recoverable items would take {} bytes, past the cap", bytes.len()),
             )));
         }
-        journal::write_atomic(&self.dir.join(RECOVERABLE_FILE), |w| w.write_all(&bytes))
+        journal::write_atomic(&self.dir.join(RECOVERABLE_FILE), |w| w.write_all(&bytes))?;
+        // The file now references these blobs (so collection keeps them): the sources can leave memory.
+        for (e, saved) in bin.items.iter_mut().zip(copy.items) {
+            if let (DeletedItem::Mail(m), DeletedItem::Mail(saved)) = (&mut e.item, saved.item)
+                && m.raw.is_some()
+                && m.id == saved.id
+                && saved.blob.is_some()
+            {
+                m.raw = None;
+                m.blob = saved.blob;
+            }
+        }
+        Ok(())
     }
 
     /// Deletes blobs not referenced by `mb` (which must be the complete current state) or by the

@@ -206,6 +206,8 @@ fn every_command_has_a_mapped_catalog_counterpart_or_is_known() {
     // Module commands act on the selected module item (the catalog maps some of these to mail.* ids).
     // Sign sits next to Encrypt once S/MIME is set up; the observed window had no digital ID to show it.
     // Delete on the Shape Format tab removes the selected drawing (the observed tab relied on the Delete key).
+    // Define Send/Receive Groups: the observation never reached that menu item (its dialog was seen only
+    // from Options › Advanced), so the catalog has no row for it.
     let ours = [
         "help.about",
         "app.toggleRibbonMode",
@@ -213,6 +215,7 @@ fn every_command_has_a_mapped_catalog_counterpart_or_is_known() {
         "mail.addReminder",
         "compose.sign",
         "drawing.delete",
+        "sendReceive.defineGroups",
     ];
     let module = |id: &str| ["people.", "tasks.", "notes.", "calendar."].iter().any(|p| id.starts_with(p));
     let mut odd = Vec::new();

@@ -158,7 +158,6 @@ Mail|Send / Receive › Preferences|Download Preferences|sendReceive.preferences
 Mail|Send / Receive › Preferences|Work Offline|sendReceive.workOffline
 Mail|Send / Receive > Send/Receive Groups|0|sendReceive.group
 Mail|Send / Receive > Send/Receive Groups|Inbox|sendReceive.group
-Mail|Send / Receive > Send/Receive Groups|Define Send/Receive Groups...|sendReceive.defineGroups
 Mail|Send / Receive > More Options|Mark to Download|sendReceive.markToDownload
 Mail|Send / Receive > More Options|Mark to Download Message Copy|sendReceive.markToDownload
 Mail|Send / Receive > More Options|Unmark to Download|sendReceive.unmarkToDownload

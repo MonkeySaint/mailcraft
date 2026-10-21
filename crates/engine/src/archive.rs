@@ -633,10 +633,11 @@ pub fn poll(s: &mut Session) -> Schedule {
 }
 
 /// Runs AutoArchive as an automatic action (no undo step), queueing the server changes it makes (items
-/// leaving synchronised folders) and journaling them.
+/// leaving synchronised folders) and journaling them. Items it deletes for good stay recoverable.
 pub fn run_scheduled(s: &mut Session) -> CmdResult {
     let before = s.mailbox.clone();
     let out = s.run_automatic("file.archive", &json!({ "all": true }))?;
+    crate::recover::capture(s, &before);
     let mid = s.mailbox.clone();
     crate::sync::queue_local_changes(s, &before);
     let ops = crate::session::diff_ops(&mid, &s.mailbox);
