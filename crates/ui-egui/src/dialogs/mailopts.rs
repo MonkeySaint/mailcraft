@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::common::{self, Dlg, Out, muted, ok_cancel, window, with_state};
 use crate::App;
+use mailcraft_engine::compose::SaveSentTo;
 use mailcraft_model::{Importance, ItemId, Sensitivity};
 
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
@@ -126,9 +127,46 @@ struct MsgOpts {
     replies: String,
     delay_on: bool,
     delay: String,
-    save_sent: usize,
+    /// "Save copy of sent message": the chosen place (a value, not a position in the folder list, which can
+    /// change while the dialog is open) and the one the message had when the dialog opened.
+    save_sent: SaveSentTo,
+    save_sent_was: SaveSentTo,
     /// "Do not AutoArchive this item" (received messages).
     no_archive: bool,
+}
+
+/// Most folders offered for "Save copy of sent message".
+const MAX_SAVE_FOLDERS: usize = 300;
+
+/// "Save copy of sent message" choices: the default Sent Items, not saving, then the mail folders (sorted,
+/// at most [`MAX_SAVE_FOLDERS`]). `current` is always among them, even past the limit or when its folder is
+/// gone.
+fn save_sent_choices(app: &App, current: SaveSentTo) -> Vec<(String, SaveSentTo)> {
+    let mut out = vec![
+        ("Sent Items (default)".to_owned(), SaveSentTo::Default),
+        ("Do not save".to_owned(), SaveSentTo::DoNotSave),
+    ];
+    let mut folders: Vec<(String, SaveSentTo)> = app
+        .s
+        .mailbox
+        .folders
+        .values()
+        .filter(|f| f.kind == mailcraft_model::FolderKind::Mail)
+        .map(|f| (format!("Folder: {}", app.s.mailbox.folder_path(f.id)), SaveSentTo::Folder(f.id)))
+        .collect();
+    folders.sort_by(|a, b| a.0.cmp(&b.0));
+    folders.truncate(MAX_SAVE_FOLDERS);
+    out.extend(folders);
+    if let SaveSentTo::Folder(id) = current
+        && !out.iter().any(|(_, t)| *t == current)
+    {
+        let label = match app.s.mailbox.folders.get(&id) {
+            Some(_) => format!("Folder: {}", app.s.mailbox.folder_path(id)),
+            None => "Folder: (no longer exists)".to_owned(),
+        };
+        out.push((label, current));
+    }
+    out
 }
 
 fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -154,7 +192,8 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         format!("{dd} {tt}")
                     })
                     .unwrap_or_else(|| format!("{} 17:00", common::today(a))),
-                save_sent: 0,
+                save_sent: c.save_sent,
+                save_sent_was: c.save_sent,
                 no_archive: false,
             }
         } else if let Some(m) = item.and_then(|i| a.s.mailbox.mail.get(&ItemId(i))) {
@@ -208,13 +247,14 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Save copy of sent message:");
-                    common::combo_idx(
-                        ui,
-                        ("mosave", uid),
-                        &mut st.save_sent,
-                        &["Sent Items (default)", "Do not save"],
-                        180.0,
-                    );
+                    let choices = save_sent_choices(app, st.save_sent);
+                    let labels: Vec<&str> = choices.iter().map(|(l, _)| l.as_str()).collect();
+                    let mut idx = choices.iter().position(|(_, t)| *t == st.save_sent).unwrap_or(0);
+                    if common::combo_idx(ui, ("mosave", uid), &mut idx, &labels, 260.0)
+                        && let Some((_, t)) = choices.get(idx)
+                    {
+                        st.save_sent = *t;
+                    }
                 });
             } else if let Some(m) = item.and_then(|i| app.s.mailbox.mail.get(&ItemId(i))) {
                 ui.checkbox(&mut st.no_archive, "Do not AutoArchive this item");
@@ -298,8 +338,14 @@ fn apply_compose(app: &mut App, c: u64, st: &MsgOpts, imp: &str, sens: &str) {
     } else if cs.delay_until.is_some() {
         app.run("compose.delayDelivery", json!({"compose": c, "at": null}));
     }
-    if st.save_sent == 1 {
-        app.run("compose.saveSentItemTo", json!({"compose": c, "mode": "none"}));
+    // Only a choice the person changed is applied (anything else keeps what the message has).
+    if st.save_sent != st.save_sent_was && st.save_sent != cs.save_sent {
+        let p = match st.save_sent {
+            SaveSentTo::Default => json!({"compose": c, "mode": "default"}),
+            SaveSentTo::DoNotSave => json!({"compose": c, "mode": "none"}),
+            SaveSentTo::Folder(f) => json!({"compose": c, "mode": "other", "folder": f.0}),
+        };
+        app.run("compose.saveSentItemTo", p);
     }
 }
 

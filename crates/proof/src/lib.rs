@@ -17,6 +17,8 @@
 //! - [`Speller::check_text`]: every [`Issue`] in a text: spelling, repeated words ("the the"), lower-case
 //!   sentence starts, double spaces.
 //!
+//! - [`thesaurus::lookup`]: related words from the bundled Moby Thesaurus II (Review › Thesaurus).
+//!
 //! Nothing here panics on any input: all offsets are byte offsets on char boundaries of the given text, word
 //! lengths are capped at [`MAX_WORD_CHARS`] and issue counts at [`MAX_ISSUES`].
 
@@ -24,6 +26,7 @@ mod dict;
 mod distance;
 mod grammar;
 mod speller;
+pub mod thesaurus;
 mod tokenize;
 
 pub use distance::keys_adjacent;

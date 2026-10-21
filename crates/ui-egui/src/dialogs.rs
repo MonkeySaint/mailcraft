@@ -23,6 +23,7 @@ mod find;
 mod folders;
 pub(crate) mod format_dlg;
 mod general;
+mod insert_dlg;
 mod items;
 mod junk;
 mod mailopts;
@@ -288,6 +289,9 @@ pub const KNOWN: &[&str] = &[
     "insertChart",
     "screenshot",
     "drawTable",
+    "convertTextToTable",
+    "screenClip",
+    "createBuildingBlock",
     "quickTables",
     "insertTable",
     "drawTextBox",
@@ -386,6 +390,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return out;
     }
     if let Some(out) = format_dlg::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = insert_dlg::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = compose_dlg::show(ctx, app, d) {

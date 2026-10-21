@@ -59,6 +59,12 @@ rfd = "0.17"
 # egui-winit. `image-data` reads clipboard pictures (adds the image crate and the platform graphics bindings,
 # all MIT/Apache-2.0/Zlib).
 arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+# Screen capture for Insert › Screenshot (apps/mailcraft only). Linux and the BSDs: the X11 window list and
+# GetImage (x11rb, pure Rust, MIT OR Apache-2.0; already in the tree through winit) and the XDG desktop portal
+# over D-Bus (zbus, MIT; already in the tree through keyring). Windows and macOS: xcap (Apache-2.0).
+x11rb = "0.13"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+xcap = "0.9"
 
 # web (wasm32 only; all MIT OR Apache-2.0)
 wasm-bindgen = "0.2.126"

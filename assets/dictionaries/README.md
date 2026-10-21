@@ -8,6 +8,7 @@ line, sorted, `\n` line ends, and are embedded in the binary with `include_str!`
 | `en-US.txt` | 130,891 lower-case English words (letters, at most one inner apostrophe) | Moby Words II: `crosswd.txt`, `crswd-d.txt`, the lower-case entries of `common.txt`, `freq.txt`; plus `en-US-supplement.txt` | Public domain |
 | `en-US-proper.txt` | 33,507 Capitalised proper nouns (given names, surnames, US places, other proper nouns), minus any whose lower-case form is in `en-US.txt` | Moby Words II: `names.txt`, `places.txt`, the Capitalised entries of `common.txt`; plus `en-US-supplement.txt` | Public domain |
 | `en-US-freq.txt` | 1,202 frequent words, most frequent first, used only to rank suggestions | Moby Words II: `freq-int.txt`, then `freq.txt` | Public domain |
+| `en-thesaurus.txt` | 23,641 English head words, each with its ten closest related words (`word\trelated,related,…`), for Review › Thesaurus | Moby Thesaurus II: `mthesaur.txt` (Project Gutenberg ebook #3202) | Public domain |
 | `en-US-supplement.txt` | Everyday words the 1990s lists lack (`email`, `website`, `login`…) and some proper nouns (Canadian places…) | Written for MailCraft | MIT OR Apache-2.0 |
 
 ## Source and licence
@@ -32,3 +33,15 @@ The builder keeps single words only: all-lower-case entries go to `en-US.txt`, C
 `en-US-proper.txt`, and everything else (phrases, hyphenated words, acronyms, non-ASCII names) is dropped.
 It also merges `en-US-supplement.txt`. Edit the
 supplement, not the generated files, to add words.
+
+The thesaurus comes from the Moby Thesaurus II, by the same author and also placed in the public domain
+(<https://www.gutenberg.org/ebooks/3202>). Download `mthesaur.txt` from
+<https://www.gutenberg.org/files/3202/files/> into an empty folder and run:
+
+```sh
+cargo run -p mailcraft-proof --example build_thesaurus -- <that folder>/mthesaur.txt assets/dictionaries
+```
+
+It keeps head words that are single words of `en-US.txt` and, for each, the ten related words closest to it
+(single words first, then by how many related words the two lists share, weighted by how common the word
+is).

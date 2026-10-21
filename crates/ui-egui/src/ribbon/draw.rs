@@ -456,6 +456,89 @@ fn menu_key_badge(ui: &Ui, app: &App, row: Rect, key: &str, sub: bool) {
     painter.galley(r.min + Vec2::new(3.0, 1.0), galley, app.theme.pane);
 }
 
+/// Accessible name of a size-picker cell ("3x2 Table": columns × rows).
+pub fn grid_cell_label(cols: usize, rows: usize) -> String {
+    format!("{cols}x{rows} Table")
+}
+
+/// The Table ▾ size picker: a `cols` × `rows` grid of cells; hovering highlights the block from the top-left
+/// corner to the cell under the pointer and names its size; a click runs `cmd` with that size.
+fn menu_grid(
+    ui: &mut Ui,
+    app: &mut App,
+    cx: &mut Cx,
+    (cols, rows): (usize, usize),
+    disabled: Option<&'static str>,
+    cmd: &CmdRef,
+) {
+    const CELL: f32 = 18.0;
+    const GAP: f32 = 3.0;
+    let t = app.theme.clone();
+    let (head, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(200.0), 22.0), Sense::hover());
+    let w = cols as f32 * (CELL + GAP) + GAP;
+    let h = rows as f32 * (CELL + GAP) + GAP;
+    let (area, _) = ui.allocate_exact_size(Vec2::new(w + 8.0, h), Sense::hover());
+    let enabled = disabled.is_none();
+    let mut hovered: Option<(usize, usize)> = None;
+    let mut picked: Option<(usize, usize)> = None;
+    let mut cells: Vec<(Rect, usize, usize)> = Vec::with_capacity(cols * rows);
+    for r in 0..rows {
+        for c in 0..cols {
+            let min = Pos2::new(
+                area.left() + 8.0 + GAP + c as f32 * (CELL + GAP),
+                area.top() + GAP + r as f32 * (CELL + GAP),
+            );
+            let rect = Rect::from_min_size(min, Vec2::splat(CELL));
+            let resp = ui.interact(
+                rect,
+                ui.id().with(("table-grid", c, r)),
+                if enabled { Sense::click() } else { Sense::hover() },
+            );
+            let label = grid_cell_label(c + 1, r + 1);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &label));
+            if resp.hovered() {
+                hovered = Some((c, r));
+            }
+            if resp.clicked() {
+                picked = Some((c + 1, r + 1));
+            }
+            cells.push((rect, c, r));
+        }
+    }
+    for (rect, c, r) in cells {
+        let lit = hovered.is_some_and(|(hc, hr)| c <= hc && r <= hr);
+        ui.painter().rect_filled(rect, CornerRadius::same(1), if lit { t.selected } else { t.pane });
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(1),
+            Stroke::new(1.0, if lit { t.accent } else { t.separator }),
+            StrokeKind::Inside,
+        );
+    }
+    let title = match hovered {
+        Some((c, r)) => grid_cell_label(c + 1, r + 1),
+        None => disabled.map_or_else(|| "Insert Table".to_owned(), str::to_owned),
+    };
+    ui.painter().text(
+        Pos2::new(head.left() + 10.0, head.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(TEXT),
+        if enabled { t.text } else { muted(t.text) },
+    );
+    if let Some((c, r)) = picked {
+        let act = state::action(
+            app,
+            cmd,
+            false,
+            None,
+            &[("$cols", serde_json::json!(c)), ("$rows", serde_json::json!(r))],
+        );
+        run(app, cx, &act);
+        ui.close();
+    }
+}
+
 fn menu_sep(ui: &mut Ui, app: &App) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(40.0), 7.0), Sense::hover());
     ui.painter().line_segment(
@@ -469,6 +552,9 @@ fn menu_entries(ui: &mut Ui, app: &mut App, cx: &mut Cx, entries: &[Resolved], d
     for e in entries {
         match e {
             Resolved::Sep => menu_sep(ui, app),
+            Resolved::Grid { cols, rows, disabled, cmd } => {
+                menu_grid(ui, app, cx, (*cols, *rows), *disabled, cmd)
+            }
             Resolved::Cmd { label, icon, swatch, on, disabled, action, key } => {
                 let resp = menu_row(ui, app, icon, *swatch, label, *on, disabled.is_none(), false);
                 menu_key_badge(ui, app, resp.rect, key, false);

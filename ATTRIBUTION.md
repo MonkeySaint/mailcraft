@@ -33,6 +33,7 @@ that each file under `assets/` has a row here.
 | assets/dictionaries/en-US.txt | Grady Ward (Moby Project); supplement by MailCraft contributors | https://www.gutenberg.org/ebooks/3201 (Moby Words II, filtered and merged by `crates/proof/examples/build_dictionary.rs`) | Public domain (supplement words MIT OR Apache-2.0) |
 | assets/dictionaries/en-US-proper.txt | Grady Ward (Moby Project); supplement by MailCraft contributors | https://www.gutenberg.org/ebooks/3201 (Moby Words II names, places, common) | Public domain (supplement words MIT OR Apache-2.0) |
 | assets/dictionaries/en-US-freq.txt | Grady Ward (Moby Project) | https://www.gutenberg.org/ebooks/3201 (Moby Words II freq-int.txt, freq.txt) | Public domain |
+| assets/dictionaries/en-thesaurus.txt | Grady Ward (Moby Project) | https://www.gutenberg.org/ebooks/3202 (Moby Thesaurus II mthesaur.txt, filtered and ranked by `crates/proof/examples/build_thesaurus.rs`) | Public domain |
 | assets/dictionaries/en-US-supplement.txt | MailCraft contributors | original | MIT OR Apache-2.0 |
 | assets/dictionaries/README.md | MailCraft contributors | original | MIT OR Apache-2.0 |
 | docs/images/*.png | MailCraft contributors | screenshots of MailCraft with its synthetic sample mailbox (`ui_shot`) | MIT OR Apache-2.0 |

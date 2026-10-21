@@ -13,7 +13,7 @@
 
 pub mod defs;
 mod draw;
-mod state;
+pub(crate) mod state;
 
 use crate::responsive::Frame;
 use crate::{App, Surface};

@@ -27,6 +27,7 @@ pub mod reading;
 pub mod remote_images;
 pub mod responsive;
 pub mod ribbon;
+pub mod speech;
 pub mod theme;
 pub mod widgets;
 
@@ -120,23 +121,6 @@ pub struct App {
     pub icons: icons::Icons,
     /// The platform's file dialogs (installed by the desktop app); `None` = dialogs show a path box instead.
     pub files: Option<Arc<dyn FileDialogs>>,
-    /// The platform's speech output (Read Aloud; installed by the desktop app); `None` = Read Aloud shows the
-    /// text only.
-    pub speech: Option<Arc<dyn Speech>>,
-}
-
-/// Speech output for Read Aloud: says one stretch of text at a time. The desktop app installs one in
-/// [`App::speech`] (a speech engine of the operating system); tests install fakes. Implementations must not
-/// panic and must not block the frame.
-pub trait Speech: Send + Sync {
-    /// Starts saying `text`, cutting off whatever is being said.
-    fn speak(&self, text: &str) -> Result<(), String>;
-    /// Stops speaking now.
-    fn stop(&self);
-    /// True while the last text is still being said.
-    fn speaking(&self) -> bool;
-    /// Name of the speech engine, shown in the Read Aloud window.
-    fn name(&self) -> String;
 }
 
 /// A file type offered by a file dialog: a name ("MBOX mailbox") and its extensions without the dot.
@@ -363,12 +347,7 @@ pub fn ui_semibold() -> egui::FontFamily {
 impl App {
     pub fn new(s: Session) -> App {
         let theme = theme::Theme::for_dark(s.view.dark);
-        App { s, ui: UiState::default(), theme, icons: icons::Icons::default(), files: None, speech: None }
-    }
-
-    /// Installs the platform's speech output (Read Aloud).
-    pub fn set_speech(&mut self, speech: Arc<dyn Speech>) {
-        self.speech = Some(speech);
+        App { s, ui: UiState::default(), theme, icons: icons::Icons::default(), files: None }
     }
 
     /// Installs the platform's file dialogs.

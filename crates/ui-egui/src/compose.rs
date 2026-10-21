@@ -29,9 +29,12 @@
 
 mod a11y;
 mod attach;
+pub(crate) mod capture;
 mod clipboard;
 mod editor;
 mod fonts;
+#[cfg(test)]
+mod insert_tests;
 mod mention;
 mod minibar;
 mod panes;
@@ -56,6 +59,11 @@ pub use a11y::BAR_LABEL as ACCESSIBILITY_BAR_LABEL;
 pub use attach::{
     DROP_HINT, FileHooks, MAX_RECENT, SAVE_TITLE, file_hooks, file_name as recent_label, recent_files,
     remember_file, set_file_hooks, size_text,
+};
+pub(crate) use capture::own_window_title;
+pub use capture::{
+    CaptureWindow, Captured, MAIN_WINDOW_TITLE, NO_BACKEND as NO_CAPTURE_BACKEND, ScreenCapture,
+    capture_backend, set_capture, window_items as screenshot_windows,
 };
 pub use clipboard::{
     ClipboardHooks, clipboard_hooks, clipboard_html, clipboard_image, clipboard_text, copy_html,
@@ -104,6 +112,36 @@ const FALLBACK_TABS: [&str; 6] = ["Message", "Insert", "Options", "Format Text",
 
 /// Save-changes prompt text (our wording).
 pub const SAVE_PROMPT: &str = "Do you want to save changes?";
+
+/// Most symbols kept in the Symbol menu's recently used list.
+pub const MAX_RECENT_SYMBOLS: usize = 20;
+
+static RECENT_SYMBOLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Symbols inserted recently, newest first (Insert › Symbol ▾).
+pub fn recent_symbols() -> Vec<String> {
+    RECENT_SYMBOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// Puts `symbol` (the text `insert.symbol` inserted) at the top of the recently used symbols.
+pub fn remember_symbol(symbol: &str) {
+    if symbol.is_empty() || symbol.chars().count() > 4 {
+        return;
+    }
+    let mut list = RECENT_SYMBOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    list.retain(|s| s != symbol);
+    list.insert(0, symbol.to_owned());
+    list.truncate(MAX_RECENT_SYMBOLS);
+}
+
+/// Runs `insert.symbol` for compose `cid` and remembers the symbol it inserted.
+pub(crate) fn insert_symbol(app: &mut App, cid: u64, ch: &str) -> bool {
+    let r = app.run("insert.symbol", json!({"compose": cid, "char": ch}));
+    if let Some(text) = r.as_ref().and_then(|v| v.get("inserted")).and_then(serde_json::Value::as_str) {
+        remember_symbol(text);
+    }
+    r.is_some()
+}
 
 /// The viewport of compose window `cid`.
 pub fn viewport_id(cid: u64) -> ViewportId {
@@ -221,6 +259,7 @@ fn request_close(ctx: &egui::Context, app: &mut App, cid: u64) {
 
 /// All open compose windows (non-inline composes in `app.s.composes`).
 pub fn compose_windows(ctx: &egui::Context, app: &mut App) {
+    capture::poll(ctx, app);
     let now = ctx.input(|i| i.time);
     auto_save_timer(ctx, app, now);
     let ids: Vec<u64> = app.s.composes.values().filter(|c| !c.inline).map(|c| c.id).collect();
@@ -666,7 +705,9 @@ pub fn focused_recipient_field(ctx: &egui::Context, app: &App) -> Option<u64> {
 /// - `options.open {"page": "signatures"}` (Signature ▾ › Signatures…) opens Signatures and Stationery itself
 ///   rather than the Options dialog;
 /// - `review.spelling` opens the Spelling and Grammar dialog;
-/// - `format.paste` with a `mode` (Paste ▾ menu) pastes the system clipboard with that mode.
+/// - `format.paste` with a `mode` (Paste ▾ menu) pastes the system clipboard with that mode;
+/// - the Insert and Options commands in [`insert_command`] (screen capture, native file pickers, recent
+///   symbols).
 pub(crate) fn ribbon_command(
     ctx: &egui::Context,
     app: &mut App,
@@ -742,6 +783,84 @@ pub(crate) fn ribbon_command(
             }
             handled
         }
+        _ => insert_command(ctx, app, cid, cmd, params),
+    }
+}
+
+/// Picks one file with the platform's open dialog (`None`: no dialog installed or cancelled).
+fn pick_one(app: &App, title: &str, filters: &[crate::FileFilter]) -> Option<String> {
+    let files = app.files.clone()?;
+    files.open_files(title, filters, false, None)?.into_iter().next().map(|p| p.display().to_string())
+}
+
+/// Insert and Options commands that need the window: Screenshot captures through the platform backend;
+/// This Device… (Pictures, 3D Models, Object), the saved screenshot, Browse for Themes and Save Current Theme
+/// use the platform's file dialogs when the app installed them (else the engine's typed-path forms open);
+/// symbols inserted from the menu join the recently used list. Returns true when handled.
+fn insert_command(
+    ctx: &egui::Context,
+    app: &mut App,
+    cid: u64,
+    cmd: &str,
+    params: &serde_json::Value,
+) -> bool {
+    use crate::FileFilter;
+    let no_file = params.get("path").is_none() && params.get("data_base64").is_none();
+    let picture_types =
+        || vec![FileFilter::new("Pictures", &["png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"])];
+    let picked = |app: &App, title: &str, filters: &[FileFilter]| -> Option<Option<String>> {
+        app.files.as_ref()?;
+        Some(pick_one(app, title, filters))
+    };
+    let run_with_path = |app: &mut App, cmd: &str, path: Option<String>| {
+        if let Some(path) = path {
+            let mut p = params.clone();
+            if let Some(o) = p.as_object_mut() {
+                o.insert("path".into(), json!(path));
+                o.insert("compose".into(), json!(cid));
+            }
+            app.run(cmd, p);
+        }
+        true
+    };
+    match cmd {
+        "insert.screenshot" if capture::ribbon_screenshot(ctx, app, cid, params) => true,
+        "insert.screenshot" if no_file && params.get("unavailable").is_none() => {
+            match picked(app, "Insert a Saved Screenshot", &picture_types()) {
+                Some(path) => run_with_path(app, cmd, path),
+                None => false,
+            }
+        }
+        "insert.picture" if no_file => match picked(app, "Insert Picture", &picture_types()) {
+            Some(path) => run_with_path(app, cmd, path),
+            None => false,
+        },
+        "insert.model3d" if no_file => {
+            match picked(app, "Insert 3D Model", &[FileFilter::new("3D models", &["obj", "stl"])]) {
+                Some(path) => run_with_path(app, cmd, path),
+                None => false,
+            }
+        }
+        "insert.object" if no_file => match picked(app, "Insert Object", &[]) {
+            Some(path) => run_with_path(app, cmd, path),
+            None => false,
+        },
+        "compose.theme"
+            if params.get("action").and_then(serde_json::Value::as_str) == Some("browse")
+                && params.get("path").is_none() =>
+        {
+            match picked(app, "Browse for Themes", &[FileFilter::new("MailCraft themes", &["json"])]) {
+                Some(path) => run_with_path(app, cmd, path),
+                None => false,
+            }
+        }
+        "insert.symbol" => match params.get("char").and_then(serde_json::Value::as_str) {
+            Some(ch) => {
+                insert_symbol(app, cid, ch);
+                true
+            }
+            None => false,
+        },
         _ => false,
     }
 }

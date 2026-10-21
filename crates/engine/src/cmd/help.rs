@@ -32,6 +32,30 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
+/// Where Feedback and Contact Support send a note: a new issue on the project's public tracker.
+pub const ISSUE_TRACKER: &str = "https://github.com/MonkeySaint/mailcraft/issues/new";
+/// Longest issue body put in the link (browsers and the tracker cut long URLs).
+const MAX_ISSUE_BODY: usize = 4000;
+
+fn url_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(char::from(b)),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// A link that opens a new issue on the tracker with `title` and `body` filled in (the body cut to
+/// [`MAX_ISSUE_BODY`] characters).
+pub fn issue_url(title: &str, body: &str) -> String {
+    let body: String = body.chars().take(MAX_ISSUE_BODY).collect();
+    let title: String = title.chars().take(200).collect();
+    format!("{ISSUE_TRACKER}?title={}&body={}", url_encode(&title), url_encode(&body))
+}
+
 fn about_json() -> Value {
     json!({
         "name": "MailCraft",
@@ -77,6 +101,14 @@ fn contact_support(s: &mut Session, _: &Value) -> CmdResult {
 mod tests {
     use super::*;
     use crate::cmd::rules::tests::session;
+
+    #[test]
+    fn issue_links_are_encoded_and_capped() {
+        let u = issue_url("Crash & burn", "a b\n#1?");
+        assert_eq!(u, format!("{ISSUE_TRACKER}?title=Crash%20%26%20burn&body=a%20b%0A%231%3F"));
+        let long = issue_url("t", &"é".repeat(10_000));
+        assert_eq!(long.matches("%C3%A9").count(), MAX_ISSUE_BODY);
+    }
 
     #[test]
     fn about_reports_version() {

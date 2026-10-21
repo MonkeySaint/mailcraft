@@ -507,6 +507,8 @@ menu businessCard
 item | Other Business Cards... | contact-group | insert.businessCard | | B
 
 menu link
+dyn | recentFiles | insert.link | {"path":"$path"}
+sep
 item | Insert Link... | link | insert.link | | I
 item | Remove Link | | insert.link | {"url":""} | R
 
@@ -529,10 +531,7 @@ item | Add Reminder... | bell | compose.followUp | {"kind":"reminder"} | R
 item | Clear Flag | | compose.followUp | {"kind":"clear"} | E
 
 menu table
-item | 2 x 2 Table | table | insert.table | {"rows":2,"cols":2} |
-item | 3 x 3 Table | table | insert.table | {"rows":3,"cols":3} |
-item | 4 x 4 Table | table | insert.table | {"rows":4,"cols":4} |
-item | 5 x 3 Table | table | insert.table | {"rows":3,"cols":5} |
+dyn | tableGrid | insert.table | {"rows":"$rows","cols":"$cols"}
 sep
 item | Insert Table... | table | insert.table | {"mode":"dialog"} | I
 item | Draw Table | format-painter | insert.table | {"mode":"draw"} | D
@@ -540,6 +539,8 @@ item | Convert Text to Table... | | insert.table | {"mode":"fromText"} | V
 sub | Quick Tables | table | quickTables | | T
 
 menu quickTables
+dyn | blocks:quickTables | insert.table | {"mode":"quick","name":"$name"}
+sep
 item | Quick Tables... | table | insert.table | {"mode":"quick"} | Q
 item | Save Selection to Quick Tables Gallery... | save | insert.saveToGallery | {"gallery":"quickTables"} | S
 
@@ -576,23 +577,30 @@ menu models3d
 item | This Device... | picture | insert.model3d | | D
 
 menu screenshot
+dyn | screenWindows | insert.screenshot | {"windowId":"$id","window":"$name"}
+sep
 item | Screen Clipping | picture | insert.screenshot | {"clip":true} | C
 item | Insert a Saved Screenshot... | folder-open | insert.screenshot | | F
 
 menu textBox
 item | Simple Text Box | note | insert.textBox | {"preset":"simple"} |
 item | Sidebar | note | insert.textBox | {"preset":"sidebar"} |
+dyn | blocks:textBoxes | insert.quickPart | {"gallery":"textBoxes","name":"$name"}
 sep
 item | Draw Text Box | format-painter | insert.textBox | {"preset":"draw"} | D
 item | Save Selection to Text Box Gallery | save | insert.saveToGallery | {"gallery":"textBoxes"} | S
 
 menu quickParts
+dyn | blocks:quickParts | insert.quickPart | {"gallery":"quickParts","name":"$name"}
+sep
 sub | AutoText | quick-steps | autoText | | A
 item | Insert Quick Part... | quick-steps | insert.quickPart | | Q
 sep
 item | Save Selection to Quick Part Gallery... | save | insert.saveToGallery | {"gallery":"quickParts"} | S
 
 menu autoText
+dyn | blocks:autoText | insert.quickPart | {"gallery":"autoText","name":"$name"}
+sep
 item | Insert AutoText... | quick-steps | insert.quickPart | {"gallery":"autoText"} | A
 item | Save Selection to AutoText Gallery | save | insert.saveToGallery | {"gallery":"autoText"} | S
 
@@ -619,10 +627,14 @@ item | Dropped | bold | insert.dropCap | {"kind":"dropped"} | D
 item | In Margin | bold | insert.dropCap | {"kind":"inMargin"} | M
 
 menu equation
+dyn | blocks:equations | insert.quickPart | {"gallery":"equations","name":"$name"}
+sep
 item | Insert New Equation | plus | insert.equation | | I
 item | Save Selection to Equation Gallery... | save | insert.saveToGallery | {"gallery":"equations"} | S
 
 menu symbol
+dyn | recentSymbols | insert.symbol | {"char":"$name"}
+sep
 item | Euro Sign | | insert.symbol | {"char":"€"} |
 item | Pound Sign | | insert.symbol | {"char":"£"} |
 item | Yen Sign | | insert.symbol | {"char":"¥"} |
@@ -657,6 +669,7 @@ item | Organic | view | compose.theme | {"name":"Organic"} |
 item | Retrospect | view | compose.theme | {"name":"Retrospect"} |
 item | Slice | view | compose.theme | {"name":"Slice"} |
 item | Wisp | view | compose.theme | {"name":"Wisp"} |
+dyn | savedThemes | compose.theme | {"name":"$name"}
 sep
 item | Reset to Theme from Template | undo | compose.theme | {"action":"reset"} | R
 item | Browse for Themes... | folder-open | compose.theme | {"action":"browse"} | B
@@ -687,6 +700,7 @@ item | Paper | | compose.theme | {"part":"colors","name":"Paper"} | | swatch=#a4
 item | Marquee | | compose.theme | {"part":"colors","name":"Marquee"} | | swatch=#438ab0
 item | Slipstream | | compose.theme | {"part":"colors","name":"Slipstream"} | | swatch=#5068c4
 item | Aspect | | compose.theme | {"part":"colors","name":"Aspect"} | | swatch=#eb800d
+dyn | customColors | compose.theme | {"part":"colors","name":"$name"}
 sep
 item | Customize Colors... | settings | compose.theme | {"part":"colors","action":"customize"} | C
 
@@ -717,6 +731,7 @@ item | Arial Black-Arial | | compose.theme | {"part":"fonts","name":"Arial Black
 item | Garamond-TrebuchetMs | | compose.theme | {"part":"fonts","name":"Garamond-TrebuchetMs"} |
 item | Gill Sans MT | | compose.theme | {"part":"fonts","name":"Gill Sans MT"} |
 item | TrebuchetMs, Heading Font: Trebuchet MS, Body Font: Trebuchet MS | | compose.theme | {"part":"fonts","name":"TrebuchetMs"} |
+dyn | customFonts | compose.theme | {"part":"fonts","name":"$name"}
 sep
 item | Customize Fonts... | settings | compose.theme | {"part":"fonts","action":"customize"} | C
 
@@ -740,6 +755,7 @@ item | Glossy | | compose.theme | {"part":"effects","name":"Glossy"} |
 menu pageColor
 dyn | themeColors | compose.pageColor | {"theme":"$theme","tint":"$tint"}
 sub | Theme Color Shades | font-color | pageColorShades | | T
+sub | Standard Colors | font-color | pageColorStandard | | S
 sep
 item | Light Gray | | compose.pageColor | {"color":"#f2f2f2"} | | swatch=#f2f2f2
 item | Light Yellow | | compose.pageColor | {"color":"#fff8dc"} | | swatch=#fff8dc
@@ -797,6 +813,18 @@ dyn | themeShades:accent5 | compose.pageColor | {"theme":"$theme","tint":"$tint"
 
 menu pageColorShades10
 dyn | themeShades:accent6 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorStandard
+item | Dark Red | | compose.pageColor | {"color":"#c00000"} | | swatch=#c00000
+item | Red | | compose.pageColor | {"color":"#ff0000"} | | swatch=#ff0000
+item | Orange | | compose.pageColor | {"color":"#ffc000"} | | swatch=#ffc000
+item | Yellow | | compose.pageColor | {"color":"#ffff00"} | | swatch=#ffff00
+item | Light Green | | compose.pageColor | {"color":"#92d050"} | | swatch=#92d050
+item | Green | | compose.pageColor | {"color":"#00b050"} | | swatch=#00b050
+item | Light Blue | | compose.pageColor | {"color":"#00b0f0"} | | swatch=#00b0f0
+item | Blue | | compose.pageColor | {"color":"#0070c0"} | | swatch=#0070c0
+item | Dark Blue | | compose.pageColor | {"color":"#002060"} | | swatch=#002060
+item | Purple | | compose.pageColor | {"color":"#7030a0"} | | swatch=#7030a0
 
 menu voting
 item | Approve;Reject | check | compose.votingButtons | {"choices":"Approve;Reject"} | | on=vote:Approve;Reject

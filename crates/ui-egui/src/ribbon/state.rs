@@ -411,10 +411,21 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 29] = [
+pub const SOURCES: [&str; 40] = [
     "themeFontNames",
     "fontNames",
     "styleSets",
+    "blocks:quickParts",
+    "blocks:autoText",
+    "blocks:textBoxes",
+    "blocks:quickTables",
+    "blocks:equations",
+    "screenWindows",
+    "recentSymbols",
+    "tableGrid",
+    "savedThemes",
+    "customColors",
+    "customFonts",
     "recentSearches",
     "searchCategories",
     "searchStores",
@@ -616,6 +627,75 @@ fn sorted_categories(app: &App) -> Vec<&mailcraft_model::Category> {
     v
 }
 
+/// Table ▾ grid: columns × rows (Insert › Table, `plan/reference/ribbon-compose.md`: 1x1 … 7x6).
+pub const TABLE_GRID: (usize, usize) = (7, 6);
+
+/// Building-block gallery entries saved in `gallery` (Quick Parts, AutoText, Text Box, Quick Tables,
+/// Equation menus).
+fn block_items(app: &App, surface: Surface, gallery: &str) -> Vec<DynItem> {
+    let Some(c) = compose(app, surface) else {
+        return Vec::new();
+    };
+    mailcraft_engine::cmd::insert::gallery_entries(&app.s, c.id, gallery)
+        .into_iter()
+        .map(|b| DynItem {
+            label: b.name.chars().take(60).collect(),
+            icon: "quick-steps",
+            swatch: None,
+            vars: vec![("$name", json!(b.name))],
+            on: false,
+        })
+        .collect()
+}
+
+/// Screenshot ▾: the windows the capture backend can see; when it cannot list them, one entry carrying the
+/// reason (`$id` null).
+fn window_items(app: &App, surface: Surface) -> Vec<DynItem> {
+    let own = compose(app, surface).and_then(|c| crate::compose::own_window_title(app, c.id));
+    match crate::compose::screenshot_windows(own.as_deref()) {
+        Ok(list) => list
+            .into_iter()
+            .map(|w| DynItem {
+                label: w.title.chars().take(70).collect(),
+                icon: "picture",
+                swatch: None,
+                vars: vec![("$id", json!(w.id)), ("$name", json!(w.title))],
+                on: false,
+            })
+            .collect(),
+        Err(reason) => vec![DynItem {
+            label: "Window capture is not available".into(),
+            icon: "",
+            swatch: None,
+            vars: vec![("$id", Value::Null), ("$name", json!(reason))],
+            on: false,
+        }],
+    }
+}
+
+/// Saved theme parts from the profile: `colors`, `fonts` or `themes`.
+fn saved_theme_items(app: &App, part: &str) -> Vec<DynItem> {
+    let saved = mailcraft_engine::cmd::compose::saved_themes(&app.s);
+    let item = |name: &str, swatch: Option<[u8; 3]>| DynItem {
+        label: name.to_owned(),
+        icon: if swatch.is_some() { "" } else { "view" },
+        swatch,
+        vars: vec![("$name", json!(name))],
+        on: false,
+    };
+    match part {
+        "colors" => saved
+            .colors
+            .iter()
+            .map(|c| {
+                item(&c.name, c.colors.get(mailcraft_engine::compose::ACCENT1).copied().and_then(swatch))
+            })
+            .collect(),
+        "fonts" => saved.fonts.iter().map(|c| item(&c.name, None)).collect(),
+        _ => saved.themes.iter().map(|t| item(&t.name, None)).collect(),
+    }
+}
+
 /// Items of a dynamic source.
 pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
     let plain = |label: &str, icon: &'static str| DynItem {
@@ -751,6 +831,28 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
         "themeFontNames" => theme_font_items(app, surface),
         "fontNames" => font_name_items(app, surface),
         "styleSets" => saved_style_set_items(app),
+        _ if source.starts_with("blocks:") => {
+            block_items(app, surface, source.strip_prefix("blocks:").unwrap_or(""))
+        }
+        "screenWindows" => window_items(app, surface),
+        "recentSymbols" => crate::compose::recent_symbols().into_iter().map(|s| plain(&s, "")).collect(),
+        "savedThemes" => saved_theme_items(app, "themes"),
+        "customColors" => saved_theme_items(app, "colors"),
+        "customFonts" => saved_theme_items(app, "fonts"),
+        // Drawn as a grid by the menu (see `Resolved::Grid`); as plain items: one per size.
+        "tableGrid" => {
+            let (cols, rows) = TABLE_GRID;
+            (1..=rows)
+                .flat_map(|r| (1..=cols).map(move |c| (c, r)))
+                .map(|(c, r)| DynItem {
+                    label: format!("{c}x{r} Table"),
+                    icon: "table",
+                    swatch: None,
+                    vars: vec![("$cols", json!(c)), ("$rows", json!(r))],
+                    on: false,
+                })
+                .collect()
+        }
         "views:mail" => mail_view_items(app),
         "themeColors" => theme_items(app, surface, None),
         "highlightPens" => highlight_pens(app, surface),
@@ -1021,6 +1123,15 @@ pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> V
                 menu: it.target.clone(),
                 key: it.key.clone(),
             }),
+            ItemKind::Dyn if it.target == "tableGrid" => {
+                let (cols, rows) = TABLE_GRID;
+                out.push(Resolved::Grid {
+                    cols,
+                    rows,
+                    disabled: disabled(app, surface, &it.cmd.id),
+                    cmd: it.cmd.clone(),
+                });
+            }
             ItemKind::Dyn => {
                 // Recent Searches with nothing in it shows its placeholder greyed out.
                 let empty = it.target == "recentSearches" && app.s.search.recent.is_empty();
@@ -1110,6 +1221,13 @@ pub enum Resolved {
         icon: String,
         menu: String,
         key: String,
+    },
+    /// A size picker (Table ▾): `cols` × `rows` cells; picking one runs `cmd` with `$cols` / `$rows`.
+    Grid {
+        cols: usize,
+        rows: usize,
+        disabled: Option<&'static str>,
+        cmd: CmdRef,
     },
     Sep,
 }

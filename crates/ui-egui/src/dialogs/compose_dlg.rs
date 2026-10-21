@@ -1,7 +1,7 @@
 //! Compose-window dialogs (Format Text, Insert, Options and Review tabs): Font, Paragraph, colours, lists,
-//! Find / Replace / Go To, pictures, links, tables, symbols, dates, Quick Parts, themes, language, thesaurus,
-//! word count, accessibility, read aloud, translate, plus the search Refine picker. Most are small forms built
-//! with [`run_form`] (also used by the item dialogs).
+//! Find / Replace / Go To, pictures, links, tables, dates, themes, word count, accessibility, translate, plus
+//! the search Refine picker. Most are small forms built with [`run_form`] (also used by the item dialogs).
+//! The Insert, Options and Review dialogs that need more than a form are in `insert_dlg`.
 
 use egui::{Context, RichText};
 use serde_json::{Map, Value, json};
@@ -591,20 +591,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 .map(|_| None)
             },
         ),
-        "screenshot" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Screenshot",
-                vec![f("n", "", Kind::Note(d.str("message"))), f("path", "Saved screenshot:", Kind::Text)],
-            )
-            .init("path", json!(format!("{}/", std::env::var("HOME").unwrap_or_default())))
-            .width(480.0)
-            .ok("Insert"),
-            |app, v| cmd(app, "insert.screenshot", with(json!({"path": v.s("path")}))).map(|_| None),
-        ),
-        "drawTable" | "insertTable" | "quickTables" => run_form(
+        "insertTable" => run_form(
             ctx,
             app,
             d,
@@ -613,15 +600,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 vec![
                     f("cols", "Number of columns:", Kind::Num { min: 1.0, max: 63.0 }),
                     f("rows", "Number of rows:", Kind::Num { min: 1.0, max: 200.0 }),
-                    f(
-                        "n",
-                        "",
-                        Kind::Note(if d.name == "drawTable" {
-                            "Drawing tables by hand is not available; this inserts a grid instead.".into()
-                        } else {
-                            String::new()
-                        }),
-                    ),
                 ],
             )
             .init("cols", json!(3))
@@ -675,7 +653,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                     .map(|_| None)
             })
         }
-        "symbol" => symbol(ctx, app, d),
         "dateTime" => run_form(
             ctx,
             app,
@@ -700,67 +677,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             ),
             |app, v| cmd(app, "insert.dateTime", with(json!({"format": v.s("format")}))).map(|_| None),
         ),
-        "quickParts" => {
-            let gallery = d.str("gallery");
-            let entries: Vec<(String, String, String)> = d
-                .arr("entries")
-                .iter()
-                .filter_map(|e| {
-                    let name = e.get("name").and_then(Value::as_str).or_else(|| e.as_str())?.to_owned();
-                    let g = e.get("gallery").and_then(Value::as_str).unwrap_or("quickParts").to_owned();
-                    let preview = e.get("preview").and_then(Value::as_str).unwrap_or("").to_owned();
-                    Some((name, g, preview))
-                })
-                .collect();
-            let labels: Vec<String> =
-                entries.iter().map(|(n, g, _)| format!("{n}  ({})", gallery_label(g))).collect();
-            let previews: Vec<String> = entries.iter().map(|(n, _, p)| format!("{n}: {p}")).collect();
-            let title = if gallery == "autoText" { "AutoText" } else { "Quick Parts" };
-            let save_gallery = if gallery.is_empty() { "quickParts".to_owned() } else { gallery.clone() };
-            run_form(
-                ctx,
-                app,
-                d,
-                Form::new(
-                    title,
-                    vec![
-                        f("entry", "Entry:", Kind::Combo(labels.clone())),
-                        f(
-                            "n",
-                            "",
-                            Kind::Note(if previews.is_empty() {
-                                "No saved entries yet: select text in the message and save it here.".into()
-                            } else {
-                                previews.join("\n")
-                            }),
-                        ),
-                        f("delete", "Delete this entry (Building Blocks Organizer)", Kind::Check),
-                        f("save", "Save the selection to the gallery under this name instead", Kind::Check),
-                        f("newName", "New entry name:", Kind::Text),
-                    ],
-                )
-                .width(480.0),
-                move |app, v| {
-                    if v.b("save") {
-                        return cmd(
-                            app,
-                            "insert.saveToGallery",
-                            with(json!({"gallery": save_gallery, "name": v.s("newName")})),
-                        )
-                        .map(|_| None);
-                    }
-                    let pick = v.s("entry");
-                    let Some((name, g, _)) =
-                        labels.iter().position(|l| *l == pick).and_then(|i| entries.get(i))
-                    else {
-                        return Err("Choose an entry.".into());
-                    };
-                    let action = if v.b("delete") { "delete" } else { "insert" };
-                    cmd(app, "insert.quickPart", with(json!({"name": name, "gallery": g, "action": action})))
-                        .map(|_| None)
-                },
-            )
-        }
         "insertBusinessCard" => {
             let contacts: Vec<String> =
                 app.s.mailbox.contacts.values().map(|c| format!("{} [{}]", c.full_name(), c.id.0)).collect();
@@ -829,31 +745,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 .width(480.0),
             |app, v| cmd(app, "compose.attachFile", with(json!({"path": v.s("path")}))).map(|_| None),
         ),
-        "attachItem" => {
-            let items: Vec<String> = app
-                .s
-                .mailbox
-                .items_in(app.s.selection.folder)
-                .iter()
-                .take(500)
-                .map(|m| {
-                    format!("{} [{}]", if m.subject.is_empty() { "(no subject)" } else { &m.subject }, m.id.0)
-                })
-                .collect();
-            run_form(
-                ctx,
-                app,
-                d,
-                Form::new("Insert Item", vec![f("item", "Item:", Kind::Combo(items))])
-                    .ok("Insert")
-                    .width(480.0),
-                |app, v| {
-                    let id =
-                        v.s("item").rsplit('[').next().unwrap_or_default().trim_end_matches(']').to_owned();
-                    cmd(app, "compose.attachItem", with(json!({"itemId": id}))).map(|_| None)
-                },
-            )
-        }
         "themes" | "customizeTheme" => {
             use mailcraft_engine::compose::{
                 COLOR_GALLERY_LEN, THEME_COLOR_SETS, THEME_EFFECTS, THEME_FONT_SETS, THEMES,
@@ -894,50 +785,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "browseThemes" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Browse for Themes",
-                vec![
-                    f("path", "Theme file:", Kind::Text),
-                    f(
-                        "n",
-                        "",
-                        Kind::Note("A theme saved with Save Current Theme (MailCraft theme, .json).".into()),
-                    ),
-                ],
-            )
-            .init("path", json!(format!("{}/", std::env::var("HOME").unwrap_or_default())))
-            .width(480.0)
-            .ok("Open"),
-            |app, v| {
-                cmd(app, "compose.theme", with(json!({"action": "browse", "path": v.s("path")})))
-                    .map(|_| None)
-            },
-        ),
-        "saveTheme" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Save Current Theme",
-                vec![f("name", "Theme name:", Kind::Text), f("path", "File name:", Kind::Text)],
-            )
-            .init("name", json!("Custom Theme"))
-            .init("path", json!(format!("{}/Custom Theme.json", std::env::var("HOME").unwrap_or_default())))
-            .width(480.0)
-            .ok("Save"),
-            |app, v| {
-                cmd(
-                    app,
-                    "compose.theme",
-                    with(json!({"action": "save", "name": v.s("name"), "path": v.s("path")})),
-                )
-                .map(|_| None)
-            },
-        ),
         "customizeColors" => customize_colors(ctx, app, d),
         "customizeFonts" => {
             let fonts: Vec<String> = THEME_FONT_CHOICES.iter().map(|s| (*s).to_owned()).collect();
@@ -967,39 +814,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "equation" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Equation",
-                vec![
-                    f("text", "Equation:", Kind::Text),
-                    f(
-                        "preset",
-                        "Or a built-in one:",
-                        Kind::Combo(
-                            std::iter::once(String::new())
-                                .chain(
-                                    mailcraft_engine::cmd::insert::EQUATION_PRESETS
-                                        .iter()
-                                        .map(|(_, n, _)| (*n).to_owned()),
-                                )
-                                .collect(),
-                        ),
-                    ),
-                ],
-            )
-            .ok("Insert"),
-            |app, v| {
-                let p = if v.s("preset").is_empty() {
-                    json!({"text": v.s("text")})
-                } else {
-                    json!({"preset": v.s("preset")})
-                };
-                cmd(app, "insert.equation", with(p)).map(|_| None)
-            },
-        ),
         "smartArt" => run_form(
             ctx,
             app,
@@ -1024,28 +838,9 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                     .map(|_| None)
             },
         ),
-        "language" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Language",
-                vec![f(
-                    "lang",
-                    "Mark selected text as:",
-                    combo(&[
-                        "en-US", "en-GB", "en-CA", "fr-CA", "fr-FR", "es-ES", "de-DE", "it-IT", "pt-BR",
-                        "nl-NL",
-                    ]),
-                )],
-            ),
-            |app, v| cmd(app, "review.language", with(json!({"lang": v.s("lang")}))).map(|_| None),
-        ),
-        "thesaurus" => thesaurus(ctx, app, d),
         "translate" => translate(ctx, app, d),
         "wordCount" => word_count(ctx, app, d),
         "accessibility" => accessibility(ctx, app, d),
-        "readAloud" => read_aloud(ctx, app, d),
         "searchRefine" => {
             let kinds: Vec<String> =
                 d.arr("kinds").iter().filter_map(Value::as_str).map(str::to_owned).collect();
@@ -1149,17 +944,6 @@ const THEME_FONT_CHOICES: [&str; 22] = [
     "Liberation Serif",
     "Liberation Mono",
 ];
-
-/// Display name of a building-block gallery.
-fn gallery_label(g: &str) -> &'static str {
-    match g {
-        "autoText" => "AutoText",
-        "textBoxes" => "Text Boxes",
-        "quickTables" => "Quick Tables",
-        "equations" => "Equations",
-        _ => "Quick Parts",
-    }
-}
 
 #[derive(Clone, Default)]
 struct ColorsState {
@@ -1314,93 +1098,8 @@ fn find_replace(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 #[derive(Clone, Default)]
-struct SymState {
-    code: String,
-}
-
-const SYMBOLS: &str = "©®™§¶†‡•…–—‘’“”«»‹›€£¥¢°±×÷≠≤≥≈∞√∑∏∂∫µπΩαβγδ←→↑↓↔⇒✓✗★☆♥♦♣♠☺☹½¼¾¹²³";
-
-fn symbol(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let compose = d.u64("compose");
-    with_state(
-        ctx,
-        app,
-        uid,
-        |_: &App| SymState::default(),
-        |st, app| {
-            window(ctx, app, d, "Symbol", 440.0, |ui, app| {
-                let mut out = Out::Keep;
-                ui.horizontal_wrapped(|ui| {
-                    for ch in SYMBOLS.chars() {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(ch.to_string()).size(18.0))
-                                    .min_size(egui::vec2(30.0, 30.0)),
-                            )
-                            .clicked()
-                        {
-                            app.run("insert.symbol", json!({"compose": compose, "char": ch.to_string()}));
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Character code:");
-                    ui.add(egui::TextEdit::singleline(&mut st.code).hint_text("U+00A9").desired_width(100.0));
-                    if btn_en(ui, !st.code.trim().is_empty(), "Insert") {
-                        app.run("insert.symbol", json!({"compose": compose, "char": st.code.trim()}));
-                    }
-                });
-                if footer(ui, |ui| btn(ui, "Close")) {
-                    out = Out::Close;
-                }
-                out
-            })
-        },
-    )
-}
-
-#[derive(Clone, Default)]
 struct PickState {
     pick: Option<String>,
-}
-
-fn thesaurus(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let word = d.str("word");
-    let syns: Vec<String> = d.arr("synonyms").iter().filter_map(Value::as_str).map(str::to_owned).collect();
-    with_state(
-        ctx,
-        app,
-        uid,
-        |_: &App| PickState::default(),
-        |st, app| {
-            window(ctx, app, d, "Thesaurus", 360.0, |ui, app| {
-                ui.label(RichText::new(&word).strong().size(16.0));
-                if syns.is_empty() {
-                    muted(ui, app, "No synonyms found.");
-                }
-                for s in &syns {
-                    if ui.selectable_label(st.pick.as_deref() == Some(s.as_str()), s).clicked() {
-                        st.pick = Some(s.clone());
-                    }
-                }
-                footer(ui, |ui| {
-                    if btn(ui, "Close") {
-                        return Out::Close;
-                    }
-                    if btn_en(ui, st.pick.is_some(), "Insert") {
-                        app.run(
-                            "review.thesaurus",
-                            json!({"compose": d.u64("compose"), "word": word, "replace": st.pick}),
-                        );
-                        return Out::Close;
-                    }
-                    Out::Keep
-                })
-            })
-        },
-    )
 }
 
 fn translate(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -1540,143 +1239,4 @@ fn accessibility(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         }
         footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
     })
-}
-
-/// Paragraphs Read Aloud says one after another (blank lines separate them; empty ones are skipped).
-pub(crate) fn speech_paragraphs(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            if !cur.trim().is_empty() {
-                out.push(std::mem::take(&mut cur).trim().to_owned());
-            }
-            cur.clear();
-        } else {
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(line.trim());
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_owned());
-    }
-    out
-}
-
-/// Where Read Aloud is: the paragraph being read and whether it is playing.
-#[derive(Clone, Default)]
-struct ReadAloudState {
-    at: usize,
-    playing: bool,
-    /// The current paragraph was handed to the speech engine.
-    started: bool,
-    error: String,
-}
-
-/// Read Aloud: plays the text paragraph by paragraph through the platform's speech output, with Previous,
-/// Play / Pause, Next and Stop; the paragraph being read is highlighted. Pause stops the voice and keeps the
-/// place (Play starts that paragraph again). Without a speech engine the text is shown.
-fn read_aloud(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let text = d.str("text");
-    let paras = speech_paragraphs(&text);
-    let speech = app.speech.clone();
-    with_state(
-        ctx,
-        app,
-        uid,
-        |_: &App| ReadAloudState::default(),
-        |st, app| {
-            // Advance when the engine finished the paragraph it was given.
-            if let Some(sp) = &speech
-                && st.playing
-            {
-                if st.started && !sp.speaking() {
-                    st.at = st.at.saturating_add(1);
-                    st.started = false;
-                }
-                if st.at >= paras.len() {
-                    st.playing = false;
-                    st.at = 0;
-                } else if !st.started {
-                    match paras.get(st.at).map(|p| sp.speak(p)) {
-                        Some(Ok(())) => st.started = true,
-                        Some(Err(e)) => {
-                            st.error = e;
-                            st.playing = false;
-                        }
-                        None => st.playing = false,
-                    }
-                }
-                ctx.request_repaint_after(std::time::Duration::from_millis(150));
-            }
-            let out = window(ctx, app, d, "Read Aloud", 480.0, |ui, app| {
-                match &speech {
-                    Some(sp) => muted(ui, app, &format!("Voice: {}", sp.name())),
-                    None => muted(
-                        ui,
-                        app,
-                        "No speech engine was found on this computer; the text that would be read is shown below.",
-                    ),
-                }
-                egui::ScrollArea::vertical().id_salt(("ra", uid)).max_height(220.0).show(ui, |ui| {
-                    for (i, p) in paras.iter().enumerate() {
-                        let current = speech.is_some() && i == st.at && (st.playing || st.started);
-                        let t = if current {
-                            RichText::new(p).background_color(app.theme.selected).strong()
-                        } else {
-                            RichText::new(p)
-                        };
-                        ui.label(t);
-                    }
-                });
-                if !st.error.is_empty() {
-                    ui.colored_label(app.theme.danger, &st.error);
-                }
-                footer(ui, |ui| {
-                    if btn(ui, "Stop") {
-                        if let Some(sp) = &speech {
-                            sp.stop();
-                        }
-                        return Out::Close;
-                    }
-                    if let Some(sp) = &speech {
-                        let n = paras.len();
-                        if btn_en(ui, st.at.saturating_add(1) < n, "Next") {
-                            sp.stop();
-                            st.at = st.at.saturating_add(1);
-                            st.started = false;
-                        }
-                        let label = if st.playing { "Pause" } else { "Play" };
-                        if btn_en(ui, n > 0, label) {
-                            if st.playing {
-                                sp.stop();
-                                st.playing = false;
-                                st.started = false;
-                            } else {
-                                st.error.clear();
-                                st.playing = true;
-                                st.started = false;
-                            }
-                        }
-                        if btn_en(ui, st.at > 0, "Previous") {
-                            sp.stop();
-                            st.at = st.at.saturating_sub(1);
-                            st.started = false;
-                        }
-                    }
-                    Out::Keep
-                })
-            });
-            // Closing the window any other way stops the voice too.
-            if !out.keeps()
-                && let Some(sp) = &speech
-            {
-                sp.stop();
-            }
-            out
-        },
-    )
 }

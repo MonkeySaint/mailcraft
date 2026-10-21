@@ -730,6 +730,10 @@ pub(crate) fn build_message(
         Importance::Low => Some("low".into()),
         Importance::Normal => None,
     };
+    // Review › Language: the message's language (RFC 3282).
+    if let Some(lang) = c.language.as_deref().map(str::trim).filter(|l| crate::cmd::review::valid_lang(l)) {
+        b.extra_headers.push(("Content-Language".into(), lang.to_owned()));
+    }
     let st = &s.settings;
     let mut text = c.plain_text_with_list_formats();
     if c.format == BodyFormat::PlainText && !for_draft {
@@ -1463,10 +1467,64 @@ fn item_id_param(p: &Value, key: &str) -> Option<ItemId> {
     v.as_u64().or_else(|| v.as_str().and_then(|t| t.trim().parse().ok())).map(ItemId)
 }
 
+/// Longest item text Insert Item › Text only puts in the body (characters).
+const MAX_ITEM_TEXT: usize = 200_000;
+
+/// An item as text for Insert Item › "Text only": a header block (who, when, where) and the body.
+fn item_as_text(s: &Session, id: ItemId) -> Option<String> {
+    let tz = s.tz_offset_min;
+    let when = |t: DateTime| crate::cmd::insert::format_date(t, tz, "dddd, MMMM d, yyyy h:mm tt");
+    let mut out = String::new();
+    let mut line = |label: &str, value: &str| {
+        if !value.trim().is_empty() {
+            out.push_str(&format!("{label}: {}\n", value.trim()));
+        }
+    };
+    if let Some(m) = s.mailbox.mail.get(&id) {
+        line("From", &m.from.as_ref().map(|f| f.to_display_string()).unwrap_or_default());
+        line("Sent", &when(m.received));
+        line("To", &m.to.iter().map(|a| a.to_display_string()).collect::<Vec<_>>().join("; "));
+        line("Subject", &m.subject);
+        out.push('\n');
+        out.push_str(&m.body_text());
+    } else if let Some(c) = s.mailbox.contacts.get(&id) {
+        line("Full name", &c.full_name());
+        line("Company", &c.company);
+        line("Job title", &c.job_title);
+        for e in &c.emails {
+            line("Email", e);
+        }
+        for (kind, number) in &c.phones {
+            line(kind, number);
+        }
+    } else if let Some(a) = s.mailbox.appointments.get(&id) {
+        line("Subject", &a.subject);
+        line("Location", &a.location);
+        line("Start", &when(a.start));
+        line("End", &when(a.end));
+    } else if let Some(t) = s.mailbox.tasks.get(&id) {
+        line("Subject", &t.subject);
+        line("Due date", &t.due.map(when).unwrap_or_default());
+    } else {
+        out.push_str(&s.mailbox.notes.get(&id)?.text);
+    }
+    Some(out.chars().take(MAX_ITEM_TEXT).collect())
+}
+
 fn attach_item(s: &mut Session, p: &Value) -> CmdResult {
     let Some(id) = item_id_param(p, "itemId") else {
         return dialog(s, "attachItem", json!({"compose": compose_id(s, p)?}));
     };
+    // Insert as › Text only: the item's text goes into the body instead of an attachment.
+    if opt_str(p, "as") == Some("text") {
+        let text =
+            item_as_text(s, id).ok_or_else(|| CmdError::Params(format!("no item with id {}", id.0)))?;
+        let c = compose_mut(s, p)?;
+        c.checkpoint();
+        c.insert_fragment(&Doc::from_plain_text(&text), crate::compose::PasteMode::TextOnly);
+        c.dirty = true;
+        return Ok(json!({"inserted": "text", "chars": text.chars().count()}));
+    }
     let now = s.now();
     let att = if let Some(m) = s.mailbox.mail.get(&id) {
         ComposeAttachment {
@@ -1921,17 +1979,122 @@ fn theme_state_json(c: &ComposeState) -> Value {
 }
 
 /// A theme file (Save Current Theme / Browse for Themes): MailCraft's own JSON format.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ThemeFile {
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ThemeFile {
     #[serde(rename = "mailcraftTheme")]
     version: u32,
-    name: String,
+    pub name: String,
     colors: Vec<String>,
     #[serde(rename = "headingFont")]
     heading_font: String,
     #[serde(rename = "bodyFont")]
     body_font: String,
     effects: String,
+}
+
+/// Profile file keeping custom colour and font sets and saved themes.
+const SAVED_THEMES_FILE: &str = "themes.json";
+/// Most entries kept per kind.
+const MAX_SAVED_THEME_PARTS: usize = 50;
+
+/// What Customize Colors, Customize Fonts and Save Current Theme made, kept in the profile so every message
+/// offers them in the Colors, Fonts and Themes galleries.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SavedThemes {
+    pub version: u32,
+    pub colors: Vec<crate::compose::CustomColors>,
+    pub fonts: Vec<crate::compose::CustomFonts>,
+    pub themes: Vec<ThemeFile>,
+}
+
+impl SavedThemes {
+    fn color_set(&self, name: &str) -> Option<&crate::compose::CustomColors> {
+        self.colors.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+    fn font_set(&self, name: &str) -> Option<&crate::compose::CustomFonts> {
+        self.fonts.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+    fn theme(&self, name: &str) -> Option<&ThemeFile> {
+        self.themes.iter().find(|t| t.name.eq_ignore_ascii_case(name))
+    }
+    /// Names of the saved colour sets, font sets and themes.
+    pub fn names(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            self.colors.iter().map(|c| c.name.clone()).collect(),
+            self.fonts.iter().map(|c| c.name.clone()).collect(),
+            self.themes.iter().map(|c| c.name.clone()).collect(),
+        )
+    }
+}
+
+/// Replaces the entry named like `item` (or appends it), keeping the newest [`MAX_SAVED_THEME_PARTS`].
+fn keep_named<T>(list: &mut Vec<T>, item: T, name: impl Fn(&T) -> &str) {
+    let n = name(&item).to_owned();
+    list.retain(|x| !name(x).eq_ignore_ascii_case(&n));
+    list.push(item);
+    let extra = list.len().saturating_sub(MAX_SAVED_THEME_PARTS);
+    list.drain(..extra);
+}
+
+/// The profile's saved theme parts (empty without a profile or when the file is missing or garbled).
+pub fn saved_themes(s: &Session) -> SavedThemes {
+    let Some(path) = s.store.as_ref().map(|st| st.dir.join(SAVED_THEMES_FILE)) else {
+        return SavedThemes::default();
+    };
+    THEMES_CACHE.get(&path, read_saved_themes).as_ref().clone()
+}
+
+/// Parsed saved-themes file of the profile (the Themes, Colors and Fonts menus list it every frame).
+static THEMES_CACHE: crate::cmd::util::FileCache<SavedThemes> = crate::cmd::util::FileCache::new();
+
+fn read_saved_themes(path: &std::path::Path) -> SavedThemes {
+    if std::fs::metadata(path).map(|m| m.len() > MAX_THEME_FILE * 16).unwrap_or(true) {
+        return SavedThemes::default();
+    }
+    let mut saved: SavedThemes =
+        std::fs::read(path).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
+    saved.colors.retain(|c| c.colors.len() == 12 && !c.name.trim().is_empty());
+    saved.fonts.retain(|c| !c.name.trim().is_empty());
+    saved.themes.retain(|t| t.colors.len() == 12 && !t.name.trim().is_empty());
+    for list_len in [saved.colors.len(), saved.fonts.len(), saved.themes.len()] {
+        if list_len > MAX_SAVED_THEME_PARTS {
+            saved.colors.truncate(MAX_SAVED_THEME_PARTS);
+            saved.fonts.truncate(MAX_SAVED_THEME_PARTS);
+            saved.themes.truncate(MAX_SAVED_THEME_PARTS);
+        }
+    }
+    saved
+}
+
+/// Writes the saved theme parts to the profile (atomically). Without a profile nothing is written.
+fn store_saved_themes(s: &Session, saved: &SavedThemes) -> Result<bool, CmdError> {
+    let Some(path) = s.store.as_ref().map(|st| st.dir.join(SAVED_THEMES_FILE)) else {
+        return Ok(false);
+    };
+    let text = serde_json::to_vec_pretty(&SavedThemes { version: 1, ..saved.clone() })
+        .map_err(|e| CmdError::Failed(e.to_string()))?;
+    let tmp = path.with_extension("json.tmp");
+    let written = std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| CmdError::Failed(format!("the theme could not be kept: {e}")));
+    THEMES_CACHE.forget(&path);
+    written.map(|()| true)
+}
+
+/// Sets `next` to the theme in `file` (its colours, fonts and effects as the custom sets).
+fn apply_theme_file(next: &mut crate::compose::ThemeState, file: &ThemeFile) -> Result<(), CmdError> {
+    let colors = palette_param(&json!(file.colors))?;
+    let name = clean_name(&file.name, "Custom Theme");
+    let heading = font_name(&file.heading_font).unwrap_or_else(|| "Aptos Display".into());
+    let body = font_name(&file.body_font).unwrap_or_else(|| "Aptos".into());
+    next.name = Some(name.clone());
+    next.colors = Some(name.clone());
+    next.fonts = Some(name.clone());
+    next.effects = crate::compose::effect_set(&file.effects).map(str::to_owned);
+    next.custom_colors = Some(crate::compose::CustomColors { name: name.clone(), colors });
+    next.custom_fonts = Some(crate::compose::CustomFonts { name, heading, body });
+    Ok(())
 }
 
 fn clean_name(v: &str, fallback: &str) -> String {
@@ -1974,9 +2137,14 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
             return dialog(s, "browseThemes", json!({"compose": cid}));
         }
         "save" => {
-            let Some(path) = opt_str(p, "path").map(str::to_owned) else {
-                return dialog(s, "saveTheme", json!({"compose": cid}));
-            };
+            // Save Current Theme: to a file (`path`) and into the Themes gallery; with only a `name`, into the
+            // gallery alone.
+            let path = opt_str(p, "path").map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
+            if path.is_none() && opt_str(p, "name").is_none_or(|n| n.trim().is_empty()) {
+                let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
+                let name = c.theme.name.clone().unwrap_or_else(|| "Custom Theme".into());
+                return dialog(s, "saveTheme", json!({"compose": cid, "name": name}));
+            }
             let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
             let r = c.theme_resolved();
             let file = ThemeFile {
@@ -1990,10 +2158,17 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
                 body_font: r.body_font,
                 effects: r.effects.to_owned(),
             };
-            let text = serde_json::to_string_pretty(&file).map_err(|e| CmdError::Failed(e.to_string()))?;
-            std::fs::write(&path, text)
-                .map_err(|e| CmdError::Failed(format!("the theme could not be saved: {e}")))?;
-            return Ok(json!({"saved": path, "name": file.name}));
+            if let Some(path) = &path {
+                let text =
+                    serde_json::to_string_pretty(&file).map_err(|e| CmdError::Failed(e.to_string()))?;
+                std::fs::write(path, text)
+                    .map_err(|e| CmdError::Failed(format!("the theme could not be saved: {e}")))?;
+            }
+            let name = file.name.clone();
+            let mut saved = saved_themes(s);
+            keep_named(&mut saved.themes, file, |t| t.name.as_str());
+            let kept = store_saved_themes(s, &saved)?;
+            return Ok(json!({"saved": path, "name": name, "gallery": kept}));
         }
         "customize" if p.get("colors").is_none() && p.get("heading").is_none() && p.get("body").is_none() => {
             let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
@@ -2012,6 +2187,8 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
     // Work out the new state first (errors leave the compose untouched).
     let mut next =
         s.composes.get(&cid).map(|c| c.theme.clone()).ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
+    let saved = saved_themes(s);
+    let mut keep: Option<SavedThemes> = None;
     match action {
         "reset" => next = Default::default(),
         "browse" => {
@@ -2019,16 +2196,11 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
             let (_, data) = read_file(path, MAX_THEME_FILE)?;
             let file: ThemeFile = serde_json::from_slice(&data)
                 .map_err(|e| CmdError::Failed(format!("this is not a MailCraft theme file: {e}")))?;
-            let colors = palette_param(&json!(file.colors))?;
-            let name = clean_name(&file.name, "Custom Theme");
-            let heading = font_name(&file.heading_font).unwrap_or_else(|| "Aptos Display".into());
-            let body = font_name(&file.body_font).unwrap_or_else(|| "Aptos".into());
-            next.name = Some(name.clone());
-            next.colors = Some(name.clone());
-            next.fonts = Some(name.clone());
-            next.effects = crate::compose::effect_set(&file.effects).map(str::to_owned);
-            next.custom_colors = Some(crate::compose::CustomColors { name: name.clone(), colors });
-            next.custom_fonts = Some(crate::compose::CustomFonts { name, heading, body });
+            apply_theme_file(&mut next, &file)?;
+            // An opened theme joins the Themes gallery.
+            let mut kept = saved.clone();
+            keep_named(&mut kept.themes, file, |t| t.name.as_str());
+            keep = Some(kept);
         }
         "customize" => {
             let name = clean_name(opt_str(p, "name").unwrap_or(""), "Custom 1");
@@ -2036,15 +2208,23 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
                 let heading = opt_str(p, "heading").and_then(font_name);
                 let body = opt_str(p, "body").and_then(font_name);
                 let cur = next.resolve();
-                next.custom_fonts = Some(crate::compose::CustomFonts {
+                let set = crate::compose::CustomFonts {
                     name: name.clone(),
                     heading: heading.unwrap_or(cur.heading_font),
                     body: body.unwrap_or(cur.body_font),
-                });
+                };
+                let mut kept = saved.clone();
+                keep_named(&mut kept.fonts, set.clone(), |c| c.name.as_str());
+                keep = Some(kept);
+                next.custom_fonts = Some(set);
                 next.fonts = Some(name);
             } else {
                 let colors = palette_param(p.get("colors").unwrap_or(&Value::Null))?;
-                next.custom_colors = Some(crate::compose::CustomColors { name: name.clone(), colors });
+                let set = crate::compose::CustomColors { name: name.clone(), colors };
+                let mut kept = saved.clone();
+                keep_named(&mut kept.colors, set.clone(), |c| c.name.as_str());
+                keep = Some(kept);
+                next.custom_colors = Some(set);
                 next.colors = Some(name);
             }
         }
@@ -2056,18 +2236,40 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
                     json!({"compose": cid, "part": part, "galleries": theme_galleries()}),
                 );
             };
-            let known = match part {
-                "colors" => {
-                    crate::compose::color_set(name).is_some()
-                        || next.custom_colors.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(name))
+            // Saved sets and themes from the profile (built-in names win).
+            let mut from_profile = false;
+            match part {
+                "colors" if crate::compose::color_set(name).is_none() => {
+                    if let Some(set) = saved.color_set(name) {
+                        next.custom_colors = Some(set.clone());
+                    }
                 }
-                "fonts" => {
-                    crate::compose::font_set(name).is_some()
-                        || next.custom_fonts.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(name))
+                "fonts" if crate::compose::font_set(name).is_none() => {
+                    if let Some(set) = saved.font_set(name) {
+                        next.custom_fonts = Some(set.clone());
+                    }
                 }
-                "effects" => crate::compose::effect_set(name).is_some(),
-                _ => crate::compose::named_theme(name).is_some(),
-            };
+                "all" if crate::compose::named_theme(name).is_none() => {
+                    if let Some(file) = saved.theme(name) {
+                        apply_theme_file(&mut next, file)?;
+                        from_profile = true;
+                    }
+                }
+                _ => {}
+            }
+            let known = from_profile
+                || match part {
+                    "colors" => {
+                        crate::compose::color_set(name).is_some()
+                            || next.custom_colors.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(name))
+                    }
+                    "fonts" => {
+                        crate::compose::font_set(name).is_some()
+                            || next.custom_fonts.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(name))
+                    }
+                    "effects" => crate::compose::effect_set(name).is_some(),
+                    _ => crate::compose::named_theme(name).is_some(),
+                };
             if !known {
                 return Err(CmdError::Params(format!(
                     "unknown {} `{name}`",
@@ -2076,6 +2278,7 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
             }
             let name = name.to_owned();
             match part {
+                "all" if from_profile => {}
                 "all" => {
                     next.name = Some(name);
                     next.colors = None;
@@ -2088,6 +2291,9 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
     }
+    if let Some(kept) = keep {
+        store_saved_themes(s, &kept)?;
+    }
     let c = compose_mut(s, p)?;
     c.checkpoint();
     let before = c.theme_resolved();
@@ -2096,15 +2302,25 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
     if c.style_set.is_some() {
         c.apply_style_set();
     }
+    // Shapes, SmartArt and WordArt already in the body take the new colours and effects.
+    let redrawn = crate::cmd::insert::redraw_generated(c);
     c.dirty = true;
-    Ok(theme_state_json(c))
+    let mut out = theme_state_json(c);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("redrawn".into(), json!(redrawn));
+    }
+    Ok(out)
 }
 
 fn page_color(s: &mut Session, p: &Value) -> CmdResult {
     let themed = crate::cmd::format::requested_theme_color(s, p)?;
     let color = match p.get("color") {
         _ if themed.is_some() => themed,
-        None => return dialog(s, "pageColor", json!({"compose": compose_id(s, p)?})),
+        None => {
+            let cid = compose_id(s, p)?;
+            let current = s.composes.get(&cid).and_then(|c| c.body.background).map(|c| c.to_hex());
+            return dialog(s, "pageColor", json!({"compose": cid, "color": current}));
+        }
         Some(Value::Null) => None,
         Some(v) => {
             let t = v
@@ -3201,7 +3417,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Attach Item",
             "Message › Include › Attach File; Insert › Include",
             "",
-            r#"{"itemId"?:string}"#,
+            r#"{"itemId"?:string,"as"?:"attachment"|"text"}"#,
             false,
             has_compose,
             attach_item,
@@ -3393,7 +3609,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Themes",
             "Options › Themes; Format Text › Styles › Change Styles",
             "",
-            r#"{"name"?:string,"part"?:"all"|"colors"|"fonts"|"effects","action"?:"apply"|"reset"|"browse"|"save"|"customize"}"#,
+            r#"{"name"?:string,"part"?:"all"|"colors"|"fonts"|"effects","action"?:"apply"|"reset"|"browse"|"save"|"customize","path"?:string}"#,
             false,
             rich_compose,
             theme,
@@ -4228,6 +4444,119 @@ Original-Message-ID: <{mid}>\nDisposition: manual-action/MDN-sent-manually; disp
         );
         assert_eq!(s.run("compose.theme", &json!({"action": "browse"})).unwrap()["dialog"], "browseThemes");
         assert_eq!(s.run("compose.theme", &json!({"action": "save"})).unwrap()["dialog"], "saveTheme");
+    }
+
+    #[test]
+    fn custom_sets_and_saved_themes_are_kept_in_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let pal: Vec<String> = (0..12).map(|i| format!("#00{:02x}00", i * 20)).collect();
+        {
+            let mut s = session();
+            s.store = Some(mailcraft_store::Store::open(dir.path()).unwrap());
+            open(&mut s);
+            s.run(
+                "compose.theme",
+                &json!({"action": "customize", "part": "colors", "colors": pal, "name": "Greens"}),
+            )
+            .unwrap();
+            s.run(
+                "compose.theme",
+                &json!({"action": "customize", "part": "fonts", "heading": "Georgia", "body": "Verdana", "name": "Pair"}),
+            )
+            .unwrap();
+            // Save Current Theme with a name only: into the gallery, no file.
+            let r = s.run("compose.theme", &json!({"action": "save", "name": "House Style"})).unwrap();
+            assert_eq!((r["gallery"].as_bool(), r["saved"].is_null()), (Some(true), true));
+            s.composes.clear();
+        }
+        // A new session offers them by name in every message.
+        let mut s = session();
+        s.store = Some(mailcraft_store::Store::open(dir.path()).unwrap());
+        let id = open(&mut s);
+        let saved = saved_themes(&s);
+        assert_eq!(
+            saved.names(),
+            (vec!["Greens".to_owned()], vec!["Pair".to_owned()], vec!["House Style".to_owned()])
+        );
+        s.run("compose.theme", &json!({"part": "colors", "name": "greens"})).unwrap();
+        assert_eq!(s.composes[&id].theme_resolved().color(5).to_hex(), "#006400");
+        s.run("compose.theme", &json!({"part": "fonts", "name": "Pair"})).unwrap();
+        assert_eq!(s.composes[&id].theme_resolved().heading_font, "Georgia");
+        s.run("compose.theme", &json!({"action": "reset"})).unwrap();
+        s.run("compose.theme", &json!({"name": "House Style"})).unwrap();
+        let r = s.composes[&id].theme_resolved();
+        assert_eq!((r.heading_font.as_str(), r.color(5).to_hex()), ("Georgia", "#006400".to_owned()));
+        assert!(s.run("compose.theme", &json!({"name": "Nope"})).is_err());
+        // Saving again under the same name replaces the entry; a garbled file reads as empty.
+        s.run("compose.theme", &json!({"action": "save", "name": "house style"})).unwrap();
+        assert_eq!(saved_themes(&s).themes.len(), 1);
+        std::fs::write(dir.path().join(SAVED_THEMES_FILE), "[oops").unwrap();
+        assert_eq!(saved_themes(&s), SavedThemes::default());
+        // Without a profile nothing is written, but the theme still applies.
+        let mut s = session();
+        open(&mut s);
+        let r = s.run("compose.theme", &json!({"action": "save", "name": "Temp"})).unwrap();
+        assert_eq!(r["gallery"], false);
+    }
+
+    #[test]
+    fn insert_item_as_text_puts_the_item_in_the_body() {
+        let mut s = session();
+        let id = open(&mut s);
+        let contact = s.mailbox.alloc_id();
+        s.mailbox.contacts.insert(
+            ItemId(contact),
+            mailcraft_model::Contact {
+                id: ItemId(contact),
+                first_name: "Ann".into(),
+                last_name: "Lee".into(),
+                company: "Example Ltd".into(),
+                emails: vec!["ann@example.org".into()],
+                ..Default::default()
+            },
+        );
+        let r = s.run("compose.attachItem", &json!({"itemId": contact.to_string(), "as": "text"})).unwrap();
+        assert_eq!(r["inserted"], "text");
+        let body = s.composes[&id].body.to_plain_text();
+        assert!(body.contains("Full name: Ann Lee") && body.contains("Email: ann@example.org"), "{body}");
+        assert!(s.composes[&id].attachments.is_empty(), "no attachment for Text only");
+        assert!(s.run("compose.attachItem", &json!({"itemId": "999999", "as": "text"})).is_err());
+        // A note's text as it is.
+        let note = s.mailbox.alloc_id();
+        let folder = s
+            .mailbox
+            .folders
+            .values()
+            .find(|f| f.kind == FolderKind::Notes)
+            .map(|f| f.id)
+            .unwrap_or_default();
+        s.mailbox.notes.insert(
+            ItemId(note),
+            mailcraft_model::Note {
+                id: ItemId(note),
+                folder,
+                text: "Buy milk\nand bread".into(),
+                ..Default::default()
+            },
+        );
+        s.run("compose.attachItem", &json!({"itemId": note.to_string(), "as": "text"})).unwrap();
+        assert!(s.composes[&id].body.to_plain_text().contains("Buy milk\nand bread"));
+    }
+
+    #[test]
+    fn page_color_from_the_theme_grid() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.pageColor", &json!({"theme": "accent1", "tint": 80})).unwrap();
+        let bg = s.composes[&id].body.background.unwrap();
+        assert!(bg.r > 200 && bg.g > 200, "a light tint: {}", bg.to_hex());
+        assert!(s.run("compose.pageColor", &json!({"theme": "nope"})).is_err());
+        s.run("compose.pageColor", &json!({})).unwrap();
+        assert_eq!(
+            crate::cmd::insert::tests::last_dialog(&s)["color"],
+            bg.to_hex(),
+            "More Colors starts from the page colour"
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use mailcraft_engine::Session;
 use mailcraft_ui_egui::App;
 
+mod capture;
 mod clipboard;
 mod file_dialogs;
 mod installed_fonts;
@@ -204,9 +205,10 @@ fn main() -> ExitCode {
         app.run("mail.newFromMailto", serde_json::json!({"url": url}));
     }
     file_dialogs::install(&mut app);
-    speech::install(&mut app);
     clipboard::install();
     installed_fonts::install();
+    capture::install();
+    speech::install();
     app.ui.control_port = args.control_port.or_else(|| {
         std::env::var("MAILCRAFT_CONTROL_PORT")
             .ok()
@@ -215,7 +217,7 @@ fn main() -> ExitCode {
     });
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_title("MailCraft")
+        .with_title(mailcraft_ui_egui::compose::MAIN_WINDOW_TITLE)
         .with_app_id("saint.dev.MailCraft")
         .with_inner_size([1440.0, 900.0])
         .with_min_inner_size(mailcraft_ui_egui::theme::size::MIN_WINDOW)

@@ -164,6 +164,13 @@ pub fn text_issues(sp: &Speller, text: &str) -> Vec<TextIssue> {
 /// it re-checked.
 /// A check under other proofing options (Options changed since) is always redone.
 pub fn spell_check(sp: &Speller, c: &mut ComposeState, force: bool, min_edits: u64) -> bool {
+    if proofing_off(c).is_some() {
+        // Not checked: no squiggles, nothing for F7.
+        let had = !c.spell_issues.is_empty();
+        c.spell_issues.clear();
+        c.spell_rev = Some(c.edit_rev);
+        return had;
+    }
     let key = options_key(sp.options());
     let due = force
         || c.spell_options_key != key
@@ -237,6 +244,7 @@ fn spelling(s: &mut Session, p: &Value) -> CmdResult {
         "grammar": grammar,
         "wordsChecked": words,
         "language": c.language.clone().unwrap_or_else(|| "en-US".into()),
+        "notChecked": proofing_off(c),
     }))
 }
 
@@ -359,7 +367,7 @@ pub fn accessibility_warning(s: &Session, cid: u64) -> Option<Value> {
     s.composes.get(&cid).map(|c| accessibility::status(s, c))
 }
 
-fn valid_lang(tag: &str) -> bool {
+pub(crate) fn valid_lang(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() <= 35
         && tag.split('-').all(|part| {
@@ -367,16 +375,60 @@ fn valid_lang(tag: &str) -> bool {
         })
 }
 
+/// Languages the bundled dictionary checks (US English word lists; other English variants use them too).
+pub fn has_dictionary(lang: &str) -> bool {
+    let l = lang.trim().to_ascii_lowercase();
+    l == "en" || l.starts_with("en-")
+}
+
+/// Why the message's spelling is not checked: "Do not check spelling or grammar", or a proofing language
+/// without a bundled dictionary.
+pub fn proofing_off(c: &ComposeState) -> Option<String> {
+    if c.no_proof {
+        return Some("Spelling and grammar are not checked in this message.".into());
+    }
+    match c.language.as_deref() {
+        Some(l) if !has_dictionary(l) => {
+            Some(format!("There is no dictionary for {l}; spelling is not checked."))
+        }
+        _ => None,
+    }
+}
+
+/// Set Proofing Language: the message's language (sent as Content-Language, RFC 3282) and whether spelling
+/// is checked. Languages without a bundled dictionary are not spell-checked.
 fn language(s: &mut Session, p: &Value) -> CmdResult {
+    let no_proof = opt_bool(p, "noProof");
     let Some(lang) = opt_str(p, "lang").map(str::to_owned) else {
-        return dialog(s, "language", json!({"compose": compose_id(s, p)?}));
+        if let Some(off) = no_proof {
+            let c = compose_mut(s, p)?;
+            c.no_proof = off;
+            c.spell_rev = None;
+            return Ok(json!({"language": c.language, "noProof": off}));
+        }
+        let cid = compose_id(s, p)?;
+        let (current, off) =
+            s.composes.get(&cid).map(|c| (c.language.clone(), c.no_proof)).unwrap_or_default();
+        return dialog(
+            s,
+            "language",
+            json!({"compose": cid, "lang": current.unwrap_or_else(|| "en-US".into()), "noProof": off}),
+        );
     };
     if !valid_lang(&lang) {
         return Err(CmdError::Params(format!("`{lang}` is not a language tag (e.g. en-US)")));
     }
     let c = compose_mut(s, p)?;
     c.language = Some(lang.clone());
-    Ok(json!({"language": lang}))
+    if let Some(off) = no_proof {
+        c.no_proof = off;
+    }
+    // Check again under the new language.
+    c.spell_rev = None;
+    c.dirty = true;
+    Ok(
+        json!({"language": lang, "noProof": c.no_proof, "dictionary": has_dictionary(&lang), "checked": proofing_off(c).is_none()}),
+    )
 }
 
 fn read_aloud(s: &mut Session, p: &Value) -> CmdResult {
@@ -390,7 +442,7 @@ fn read_aloud(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"dialog": "readAloud", "text": payload.get("text")}))
 }
 
-/// Small bundled thesaurus (common English words).
+/// MailCraft's own everyday replacements, offered before the bundled thesaurus's.
 const THESAURUS: &[(&str, &[&str])] = &[
     ("good", &["fine", "great", "excellent", "decent", "positive"]),
     ("bad", &["poor", "awful", "inferior", "faulty", "unpleasant"]),
@@ -434,10 +486,30 @@ const THESAURUS: &[(&str, &[&str])] = &[
     ("want", &["wish", "desire", "would like", "need"]),
 ];
 
-/// Synonyms for `word` (case-insensitive; empty when unknown).
+/// Most synonyms offered.
+const MAX_SYNONYMS: usize = 20;
+
+/// Synonyms for `word` (case-insensitive; empty when unknown): MailCraft's short list of everyday
+/// replacements first, then the bundled thesaurus (base forms too: "meetings" finds "meeting").
 pub fn synonyms(word: &str) -> Vec<&'static str> {
     let w = word.trim().to_lowercase();
-    THESAURUS.iter().find(|(k, _)| *k == w).map(|(_, v)| v.to_vec()).unwrap_or_default()
+    let mut out: Vec<&'static str> =
+        THESAURUS.iter().find(|(k, _)| *k == w).map(|(_, v)| v.to_vec()).unwrap_or_default();
+    if let Some((_, more)) = mailcraft_proof::thesaurus::lookup(&w) {
+        for m in more {
+            if !out.contains(&m) {
+                out.push(m);
+            }
+        }
+    }
+    out.truncate(MAX_SYNONYMS);
+    out
+}
+
+/// The head word the thesaurus used for `word` ("meeting" for "meetings"), when it differs.
+pub fn thesaurus_headword(word: &str) -> Option<&'static str> {
+    let (head, _) = mailcraft_proof::thesaurus::lookup(word)?;
+    (!head.eq_ignore_ascii_case(word.trim())).then_some(head)
 }
 
 fn thesaurus(s: &mut Session, p: &Value) -> CmdResult {
@@ -462,7 +534,8 @@ fn thesaurus(s: &mut Session, p: &Value) -> CmdResult {
         return Ok(json!({"word": word, "replacedWith": r}));
     }
     let cid = c.id;
-    let result = json!({"compose": cid, "word": word, "synonyms": list});
+    let result =
+        json!({"compose": cid, "word": word, "synonyms": list, "lookedUp": thesaurus_headword(&word)});
     let _ = dialog(s, "thesaurus", result.clone())?;
     Ok(result)
 }
@@ -543,7 +616,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Language",
             "Review › Language",
             "",
-            r#"{"lang"?:string}"#,
+            r#"{"lang"?:string,"noProof"?:bool}"#,
             false,
             has_compose,
             language,
@@ -664,9 +737,26 @@ mod tests {
         assert_eq!(issue["end"], json!({"path": [0], "offset": 18}));
         assert!(issue["suggestions"].as_array().unwrap().iter().any(|v| v == "the"), "{issue}");
         assert_eq!(r["language"], "en-US");
-        s.run("review.language", &json!({"lang": "fr-CA"})).unwrap();
+        // A language without a dictionary is not checked; Do not check spelling turns it off too.
+        let r = s.run("review.language", &json!({"lang": "fr-CA"})).unwrap();
+        assert_eq!((r["dictionary"].as_bool(), r["checked"].as_bool()), (Some(false), Some(false)));
+        let r = s.run("review.spelling", &json!({})).unwrap();
+        assert_eq!(r["count"], 0);
+        assert!(r["notChecked"].as_str().unwrap().contains("fr-CA"));
+        s.run("review.language", &json!({"lang": "en-GB"})).unwrap();
+        assert_eq!(
+            s.run("review.spelling", &json!({})).unwrap()["count"],
+            1,
+            "English variants use the dictionary"
+        );
+        s.run("review.language", &json!({"noProof": true})).unwrap();
+        assert_eq!(s.run("review.spelling", &json!({})).unwrap()["count"], 0);
+        s.run("review.language", &json!({"lang": "en-US", "noProof": false})).unwrap();
+        let b = crate::cmd::compose::build_message(&s, &s.composes[&id], None, false);
+        assert!(b.extra_headers.contains(&("Content-Language".to_owned(), "en-US".to_owned())));
         assert!(s.run("review.language", &json!({"lang": "not a tag"})).is_err());
         assert_eq!(s.run("review.language", &json!({})).unwrap()["dialog"], "language");
+        assert_eq!(crate::cmd::insert::tests::last_dialog(&s)["lang"], "en-US");
         // F7 selects the next issue; Change applies the first suggestion.
         let r = s.run("review.spelling", &json!({"next": true})).unwrap();
         assert_eq!(r["current"]["word"], "teh");
@@ -1056,6 +1146,12 @@ mod tests {
         s.run("review.thesaurus", &json!({"replace": "large"})).unwrap();
         assert_eq!(s.composes[&id].body.to_plain_text(), "a large plan");
         assert!(synonyms("zzz").is_empty());
+        // The bundled thesaurus covers words the short list does not, and base forms.
+        assert!(synonyms("predicament").len() >= 5);
+        assert!(synonyms("meetings").contains(&"gathering"));
+        assert_eq!(thesaurus_headword("Meetings"), Some("meeting"));
+        assert!(synonyms("big").len() <= MAX_SYNONYMS);
+        assert_eq!(synonyms("big").first(), Some(&"large"), "the short list comes first");
     }
 
     #[test]

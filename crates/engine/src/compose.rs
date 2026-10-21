@@ -172,6 +172,45 @@ pub struct BuildingBlock {
     pub gallery: String,
     pub name: String,
     pub blocks: Vec<Block>,
+    /// Category within the gallery (Create New Building Block; "General" when not given).
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Most columns Convert Text to Table makes.
+pub const MAX_TEXT_TABLE_COLS: usize = 63;
+
+/// Where Convert Text to Table splits each paragraph into cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextTableSplit {
+    /// Tabs when any paragraph has one, else commas.
+    Auto,
+    /// No split: each paragraph is one cell.
+    Paragraphs,
+    /// At this character (tab, comma, semicolon, or any other one).
+    At(char),
+}
+
+impl TextTableSplit {
+    /// The character to split `lines` at (`None` = one cell per paragraph).
+    pub fn separator(self, lines: &[String]) -> Option<char> {
+        match self {
+            TextTableSplit::Auto => Some(if lines.iter().any(|l| l.contains('\t')) { '\t' } else { ',' }),
+            TextTableSplit::Paragraphs => None,
+            TextTableSplit::At(c) => Some(c),
+        }
+    }
+}
+
+/// A generated picture in the body: its inline image's content id, the generator (`shape`, `smartArt`,
+/// `wordArt`) and the parameters it was drawn with (theme colours and effects are looked up again).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedPicture {
+    pub content_id: String,
+    pub kind: String,
+    pub spec: serde_json::Value,
 }
 
 /// Captured formatting while Format Painter is armed.
@@ -215,6 +254,8 @@ pub struct EditSnapshot {
     /// List formats (and the list count they were anchored at).
     pub list_formats: Vec<ListFormatEntry>,
     pub list_count: usize,
+    /// The theme (Undo of a theme change brings back the colours the body's pictures were drawn in).
+    pub theme: ThemeState,
 }
 
 /// Letter-case rewrite kinds (Change Case).
@@ -306,9 +347,14 @@ pub struct ComposeState {
     pub zoom: Option<u16>,
     pub signature: Option<SignatureBlock>,
     pub inline_images: Vec<InlineImage>,
+    /// Pictures MailCraft drew (shapes, SmartArt, WordArt) with what they were drawn from, so a theme change
+    /// redraws them (see `cmd::insert::redraw_generated`).
+    pub generated: Vec<GeneratedPicture>,
     pub bookmarks: Vec<Bookmark>,
     /// Proofing language (BCP 47 tag).
     pub language: Option<String>,
+    /// Review › Language › "Do not check spelling or grammar".
+    pub no_proof: bool,
     /// In-app clipboard history (newest last).
     pub clipboard: Vec<ClipEntry>,
     pub building_blocks: Vec<BuildingBlock>,
@@ -575,6 +621,7 @@ impl ComposeState {
             signature: self.signature.clone(),
             list_formats: self.list_formats.clone(),
             list_count: self.list_count,
+            theme: self.theme.clone(),
         }
     }
 
@@ -586,6 +633,7 @@ impl ComposeState {
             signature: std::mem::replace(&mut self.signature, snap.signature),
             list_formats: std::mem::replace(&mut self.list_formats, snap.list_formats),
             list_count: std::mem::replace(&mut self.list_count, snap.list_count),
+            theme: std::mem::replace(&mut self.theme, snap.theme),
         }
     }
 
@@ -1528,6 +1576,30 @@ impl ComposeState {
 
     /// Converts the selected paragraphs to a table (cells split at tabs, else commas).
     pub fn text_to_table(&mut self) -> bool {
+        self.text_to_table_with(TextTableSplit::Auto, None)
+    }
+
+    /// The paragraphs [`ComposeState::text_to_table_with`] would convert: their text, or `None` when the
+    /// selection is not a run of plain paragraphs.
+    pub fn text_table_lines(&self) -> Option<Vec<String>> {
+        let start = self.selection.start();
+        let end = self.selection.end();
+        let (&i, prefix) = start.path.split_last()?;
+        let j = if end.path.len() == start.path.len() && end.path.starts_with(prefix) {
+            end.path.get(prefix.len()).copied().unwrap_or(i).max(i)
+        } else {
+            i
+        };
+        let part = seq_ref(&self.body.blocks, prefix)?.get(i..=j)?;
+        part.iter()
+            .all(|b| matches!(b, Block::Paragraph { .. }))
+            .then(|| part.iter().map(|b| blocks_text(std::slice::from_ref(b))).collect())
+    }
+
+    /// Converts the selected paragraphs to a table, splitting each at `split` (Convert Text to Table). With
+    /// [`TextTableSplit::Paragraphs`] every paragraph is one cell, `cols` to a row; otherwise `cols` is the
+    /// least number of columns (rows are padded).
+    pub fn text_to_table_with(&mut self, split: TextTableSplit, cols: Option<usize>) -> bool {
         self.ensure_body();
         let start = self.selection.start().clone();
         let end = self.selection.end().clone();
@@ -1549,18 +1621,36 @@ impl ComposeState {
             return false;
         }
         let lines: Vec<String> = part.iter().map(|b| blocks_text(std::slice::from_ref(b))).collect();
-        let sep = if lines.iter().any(|l| l.contains('\t')) { '\t' } else { ',' };
-        let cols = lines.iter().map(|l| l.split(sep).count()).max().unwrap_or(1).max(1);
-        let rows: Vec<Vec<TableCell>> = lines
-            .iter()
-            .map(|l| {
-                let mut cells: Vec<TableCell> = l.split(sep).map(|c| table_cell(c.trim())).collect();
-                while cells.len() < cols {
-                    cells.push(table_cell(""));
-                }
-                cells
-            })
-            .collect();
+        let rows: Vec<Vec<TableCell>> = match split.separator(&lines) {
+            None => {
+                let cols = cols.unwrap_or(1).clamp(1, MAX_TEXT_TABLE_COLS);
+                lines
+                    .chunks(cols)
+                    .map(|chunk| {
+                        let mut cells: Vec<TableCell> = chunk.iter().map(|c| table_cell(c.trim())).collect();
+                        while cells.len() < cols {
+                            cells.push(table_cell(""));
+                        }
+                        cells
+                    })
+                    .collect()
+            }
+            Some(sep) => {
+                let found = lines.iter().map(|l| l.split(sep).count()).max().unwrap_or(1);
+                let cols = found.max(cols.unwrap_or(1)).clamp(1, MAX_TEXT_TABLE_COLS);
+                lines
+                    .iter()
+                    .map(|l| {
+                        let mut cells: Vec<TableCell> =
+                            l.split(sep).take(cols).map(|c| table_cell(c.trim())).collect();
+                        while cells.len() < cols {
+                            cells.push(table_cell(""));
+                        }
+                        cells
+                    })
+                    .collect()
+            }
+        };
         seq.splice(i..=j, std::iter::once(Block::Table { rows, border: true, width_px: None }));
         let mut target = prefix.to_vec();
         target.push(i);
@@ -3149,6 +3239,26 @@ fn block_at_mut<'a>(blocks: &'a mut [Block], path: &[usize]) -> Option<&'a mut B
             let (&r, rest) = rest.split_first()?;
             let (&c, rest) = rest.split_first()?;
             block_at_mut(&mut rows.get_mut(r)?.get_mut(c)?.blocks, rest)
+        }
+        _ => None,
+    }
+}
+
+/// Read-only [`seq_mut`].
+fn seq_ref<'a>(blocks: &'a [Block], prefix: &[usize]) -> Option<&'a [Block]> {
+    let Some((&first, rest)) = prefix.split_first() else {
+        return Some(blocks);
+    };
+    match blocks.get(first)? {
+        Block::List { items, .. } => {
+            let (&it, rest) = rest.split_first()?;
+            seq_ref(items.get(it)?, rest)
+        }
+        Block::Quote { blocks } | Block::Container { blocks, .. } => seq_ref(blocks, rest),
+        Block::Table { rows, .. } => {
+            let (&r, rest) = rest.split_first()?;
+            let (&c, rest) = rest.split_first()?;
+            seq_ref(&rows.get(r)?.get(c)?.blocks, rest)
         }
         _ => None,
     }

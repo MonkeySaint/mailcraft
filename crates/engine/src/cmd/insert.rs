@@ -9,6 +9,9 @@
 
 use std::fmt::Write as _;
 
+mod math;
+pub use math::{MAX_EQUATION, equation_png};
+
 use serde_json::{Value, json};
 
 use super::compose::{
@@ -267,7 +270,132 @@ fn shape(s: &mut Session, p: &Value) -> CmdResult {
     };
     let c = compose_mut(s, p)?;
     let cid = put_png(c, &kind, png, &kind, w, h)?;
+    // A shape in the theme's accent follows later colour changes; an explicit colour stays.
+    let fixed = opt_str(p, "color").map(|_| color.to_hex());
+    remember_generated(c, &cid, "shape", json!({"shape": kind, "color": fixed}));
     Ok(json!({"shape": kind, "cid": cid, "format": "png", "effects": theme.effects}))
+}
+
+/// Records how picture `cid` was drawn, so a theme change can draw it again.
+fn remember_generated(c: &mut ComposeState, cid: &str, kind: &str, spec: Value) {
+    c.generated.retain(|g| g.content_id != cid);
+    c.generated.push(crate::compose::GeneratedPicture {
+        content_id: cid.to_owned(),
+        kind: kind.to_owned(),
+        spec,
+    });
+    trim_generated(c);
+}
+
+/// Keeps at most [`MAX_GENERATED`] recipes: recipes of pictures no longer in the body (kept for Undo) go
+/// first, oldest first; then the oldest of the rest.
+fn trim_generated(c: &mut ComposeState) {
+    let mut extra = c.generated.len().saturating_sub(MAX_GENERATED);
+    if extra == 0 {
+        return;
+    }
+    let shown: std::collections::HashSet<String> = c
+        .images()
+        .into_iter()
+        .filter_map(|(src, _)| src.strip_prefix("cid:").map(str::to_ascii_lowercase))
+        .collect();
+    c.generated.retain(|g| {
+        if extra > 0 && !shown.contains(&g.content_id.to_ascii_lowercase()) {
+            extra -= 1;
+            return false;
+        }
+        true
+    });
+    c.generated.drain(..extra.min(c.generated.len()));
+}
+
+/// Most generated-picture recipes kept per message.
+const MAX_GENERATED: usize = 200;
+
+/// Draws generated picture `g` again with `theme`.
+fn redraw(g: &crate::compose::GeneratedPicture, theme: &crate::compose::ResolvedTheme) -> Option<Vec<u8>> {
+    let text = |k: &str| g.spec.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let png = match g.kind.as_str() {
+        "shape" => {
+            let color = g
+                .spec
+                .get("color")
+                .and_then(Value::as_str)
+                .and_then(mailcraft_html::parse_css_color)
+                .unwrap_or_else(|| theme.color(crate::compose::ACCENT1));
+            shape_png(&text("shape"), color, theme.effects)?.0
+        }
+        "smartArt" => {
+            let items: Vec<String> = g
+                .spec
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).take(30).collect())
+                .unwrap_or_default();
+            smart_art_png(&text("layout"), &items, theme)?.0
+        }
+        "wordArt" => wordart_png(&text("text"), &text("style"), theme)?.0,
+        _ => return None,
+    };
+    (!png.is_empty()).then_some(png)
+}
+
+/// Points every `cid:old` picture in `blocks` at `cid:new`.
+fn repoint_images(blocks: &mut [Block], old: &str, new: &str) {
+    fn inlines(list: &mut [Inline], old: &str, new: &str) {
+        for i in list {
+            match i {
+                Inline::Image { src, .. }
+                    if src.strip_prefix("cid:").is_some_and(|c| c.eq_ignore_ascii_case(old)) =>
+                {
+                    *src = format!("cid:{new}");
+                }
+                Inline::Link { children, .. } => inlines(children, old, new),
+                _ => {}
+            }
+        }
+    }
+    for b in blocks {
+        match b {
+            Block::Paragraph { inlines: l, .. } | Block::Heading { inlines: l, .. } => inlines(l, old, new),
+            Block::List { items, .. } => items.iter_mut().for_each(|it| repoint_images(it, old, new)),
+            Block::Quote { blocks } | Block::Container { blocks, .. } => repoint_images(blocks, old, new),
+            Block::Table { rows, .. } => {
+                rows.iter_mut().flatten().for_each(|cell| repoint_images(&mut cell.blocks, old, new))
+            }
+            Block::Pre { .. } | Block::Rule => {}
+        }
+    }
+}
+
+/// Redraws the shapes, SmartArt and WordArt of the body in the current theme (colours and effects). Each
+/// redrawn picture gets a new inline image; the old image and its recipe stay, so after Undo of the change
+/// (which brings back the old pictures and theme) a later theme change still redraws them. Returns how many
+/// were redrawn.
+pub(crate) fn redraw_generated(c: &mut ComposeState) -> usize {
+    let theme = c.theme_resolved();
+    let mut redrawn = 0;
+    let shown: Vec<String> = c.images().into_iter().map(|(src, _)| src).collect();
+    let recipes = c.generated.clone();
+    for g in recipes {
+        let Some(old) = c.inline_images.iter().find(|i| i.content_id == g.content_id).cloned() else {
+            continue;
+        };
+        // Pictures no longer in the body keep their recipe (Undo can bring them back) but are not redrawn.
+        let in_body = shown
+            .iter()
+            .any(|src| src.strip_prefix("cid:").is_some_and(|c| c.eq_ignore_ascii_case(&g.content_id)));
+        let Some(png) = redraw(&g, &theme).filter(|png| in_body && *png != old.data) else {
+            continue;
+        };
+        let cid = c.next_content_id();
+        c.inline_images.push(InlineImage { content_id: cid.clone(), data: png, ..old });
+        repoint_images(&mut c.body.blocks, &g.content_id, &cid);
+        c.generated.push(crate::compose::GeneratedPicture { content_id: cid, ..g });
+        redrawn += 1;
+    }
+    trim_generated(c);
+    redrawn
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1405,6 +1533,7 @@ fn smart_art(s: &mut Session, p: &Value) -> CmdResult {
     let alt = items.join(", ");
     let c = compose_mut(s, p)?;
     let cid = put_png(c, "smartart", png, &alt, w, h)?;
+    remember_generated(c, &cid, "smartArt", json!({"layout": layout, "items": items}));
     Ok(json!({"layout": layout, "items": items.len(), "cid": cid, "format": "png"}))
 }
 
@@ -1557,26 +1686,44 @@ fn model3d(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"inserted": name, "vertices": verts.len(), "edges": edges.len(), "cid": cid}))
 }
 
-/// Why Screenshot inserts a file instead of capturing (no screen capture without a platform library).
-pub const SCREENSHOT_UNAVAILABLE: &str = "MailCraft cannot capture the screen yet. Take the screenshot with your \
-system's screenshot tool, then choose the saved picture to insert it.";
+/// What Screenshot offers when nothing can capture the screen (the engine cannot; the desktop app captures
+/// through its platform backend and passes the picture in).
+pub const SCREENSHOT_UNAVAILABLE: &str = "Take the screenshot with your system's screenshot tool, then choose \
+the saved picture to insert it.";
 
-/// Screenshot: inserts a screenshot saved as a picture file (`path`, or `name` + `data_base64`); without
-/// one, a dialog explains that capturing is not available and offers to pick the file.
+/// Screenshot: inserts a captured or saved screenshot (`name` + `data_base64` from the app's capture
+/// backend, or a picture file `path`; `window` is only reported back, never put in the alt text). Without
+/// a picture a dialog offers a saved file instead, with the reason capture failed (`unavailable`) when known.
 fn screenshot(s: &mut Session, p: &Value) -> CmdResult {
+    let window = opt_str(p, "window").map(|w| w.trim().chars().take(120).collect::<String>());
     if p.get("path").is_some() || p.get("data_base64").is_some() {
-        let mut r = picture(s, p)?;
+        let mut q = p.clone();
+        // The alt text goes to the recipients but is not seen by the sender, and window titles often carry
+        // addresses, paths or other documents' names: a neutral alt text unless one is given. The window
+        // stays in the result only.
+        if opt_str(p, "alt").is_none_or(|a| a.trim().is_empty())
+            && let Some(o) = q.as_object_mut()
+        {
+            o.insert("alt".into(), json!("Screenshot"));
+        }
+        let mut r = picture(s, &q)?;
         if let Some(o) = r.as_object_mut() {
             o.insert("screenshot".into(), json!(true));
+            o.insert("window".into(), json!(window));
         }
         return Ok(r);
     }
-    let window = opt_str(p, "window");
     let clip = opt_bool(p, "clip").unwrap_or(false);
+    let message = match opt_str(p, "unavailable").map(str::trim).filter(|r| !r.is_empty()) {
+        Some(why) => format!("{why} {SCREENSHOT_UNAVAILABLE}"),
+        // Insert a Saved Screenshot…: nothing failed, just pick the file.
+        None if !clip && window.is_none() => "Choose a screenshot saved as a picture file.".to_owned(),
+        None => format!("Screen capture is not available here. {SCREENSHOT_UNAVAILABLE}"),
+    };
     dialog(
         s,
         "screenshot",
-        json!({"compose": compose_id(s, p)?, "window": window, "clip": clip, "capture": false, "message": SCREENSHOT_UNAVAILABLE}),
+        json!({"compose": compose_id(s, p)?, "window": window, "clip": clip, "capture": false, "message": message}),
     )
 }
 
@@ -1601,17 +1748,8 @@ fn table(s: &mut Session, p: &Value) -> CmdResult {
     let rows = count_param(p, "rows")?;
     let cols = count_param(p, "cols")?;
     match mode {
-        "draw" => return dialog(s, "drawTable", json!({"compose": compose_id(s, p)?})),
-        "fromText" => {
-            let c = compose_mut(s, p)?;
-            c.checkpoint();
-            if !c.text_to_table() {
-                c.undo_edit();
-                c.edit_redo.clear();
-                return Err(CmdError::Failed("select the paragraphs to convert first".into()));
-            }
-            return Ok(json!({"converted": true, "caret": caret(c)}));
-        }
+        "draw" => return draw_table(s, p),
+        "fromText" => return convert_text_to_table(s, p),
         "quick" => {
             let Some(name) = opt_str(p, "name") else {
                 return dialog(s, "quickTables", json!({"compose": compose_id(s, p)?}));
@@ -1635,6 +1773,93 @@ fn table(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"rows": rows, "cols": cols, "caret": caret(c)}))
 }
 
+/// Draw Table: the drawing pad (dialog) sends the column widths it drew (`widths`, px) and the number of
+/// rows; this makes that table, each column as wide as drawn.
+fn draw_table(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(widths) = p.get("widths") else {
+        return dialog(s, "drawTable", json!({"compose": compose_id(s, p)?}));
+    };
+    let widths: Vec<f32> = widths
+        .as_array()
+        .ok_or_else(|| CmdError::Params("`widths` must be a list of column widths".into()))?
+        .iter()
+        .map(|w| w.as_f64().filter(|w| w.is_finite() && *w > 0.0).map(|w| (w as f32).clamp(8.0, 2000.0)))
+        .collect::<Option<Vec<f32>>>()
+        .ok_or_else(|| CmdError::Params("column widths must be positive numbers".into()))?;
+    let rows = count_param(p, "rows")?.unwrap_or(1);
+    if widths.is_empty() || widths.len() > MAX_TABLE_COLS || rows > MAX_TABLE_ROWS {
+        return Err(CmdError::Params(format!(
+            "a drawn table has 1 to {MAX_TABLE_COLS} columns and at most {MAX_TABLE_ROWS} rows"
+        )));
+    }
+    let total: f32 = widths.iter().sum();
+    let table = Block::Table {
+        rows: (0..rows)
+            .map(|_| {
+                widths.iter().map(|w| TableCell { width_px: Some(w.round()), ..table_cell("") }).collect()
+            })
+            .collect(),
+        border: true,
+        width_px: Some(total.round()),
+    };
+    let c = compose_mut(s, p)?;
+    c.checkpoint();
+    c.insert_blocks(vec![table]);
+    Ok(json!({"rows": rows, "cols": widths.len(), "drawn": true, "caret": caret(c)}))
+}
+
+/// Convert Text to Table: without `separator` a dialog proposes one (tabs when the paragraphs have any,
+/// else commas) and the column count; with it the selected paragraphs become a table.
+fn convert_text_to_table(s: &mut Session, p: &Value) -> CmdResult {
+    use crate::compose::TextTableSplit;
+    let cid = compose_id(s, p)?;
+    let lines = s
+        .composes
+        .get(&cid)
+        .and_then(ComposeState::text_table_lines)
+        .ok_or_else(|| CmdError::Failed("select the paragraphs to convert first".into()))?;
+    let cols = count_param(p, "cols")?;
+    let split = match opt_str(p, "separator") {
+        None => {
+            let tabs = lines.iter().any(|l| l.contains('\t'));
+            let sep = if tabs { '\t' } else { ',' };
+            let found = lines.iter().map(|l| l.split(sep).count()).max().unwrap_or(1);
+            return dialog(
+                s,
+                "convertTextToTable",
+                json!({"compose": cid, "separator": if tabs { "tabs" } else { "commas" }, "cols": found, "rows": lines.len()}),
+            );
+        }
+        Some("tabs") => TextTableSplit::At('\t'),
+        Some("commas") => TextTableSplit::At(','),
+        Some("semicolons") => TextTableSplit::At(';'),
+        Some("paragraphs") => TextTableSplit::Paragraphs,
+        Some("auto") => TextTableSplit::Auto,
+        Some(other) => {
+            let mut chars = other.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if !c.is_control() => TextTableSplit::At(c),
+                _ => {
+                    return Err(CmdError::Params(format!(
+                        "unknown separator `{other}` (tabs, commas, semicolons, paragraphs or one character)"
+                    )));
+                }
+            }
+        }
+    };
+    if cols.is_some_and(|n| n > crate::compose::MAX_TEXT_TABLE_COLS) {
+        return Err(CmdError::Params(format!("at most {} columns", crate::compose::MAX_TEXT_TABLE_COLS)));
+    }
+    let c = compose_mut(s, p)?;
+    c.checkpoint();
+    if !c.text_to_table_with(split, cols) {
+        c.undo_edit();
+        c.edit_redo.clear();
+        return Err(CmdError::Failed("select the paragraphs to convert first".into()));
+    }
+    Ok(json!({"converted": true, "caret": caret(c)}))
+}
+
 fn horizontal_line(s: &mut Session, p: &Value) -> CmdResult {
     edit(s, p, |c| c.insert_blocks(vec![Block::Rule]))?;
     Ok(json!({"inserted": "rule"}))
@@ -1648,11 +1873,36 @@ fn text_box(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(name) = preset.strip_prefix("saved:") {
         return insert_building_block(s, p, "textBoxes", name);
     }
+    if !matches!(preset, "simple" | "sidebar") {
+        return Err(CmdError::Params(format!(
+            "unknown text box `{preset}` (simple, sidebar, draw, saved:<name>)"
+        )));
+    }
     let text = opt_str(p, "text").unwrap_or("").to_owned();
     let c = compose_mut(s, p)?;
     c.checkpoint();
-    let cell = TableCell { width_px: Some(240.0), ..table_cell(&text) };
-    c.insert_blocks(vec![Block::Table { rows: vec![vec![cell]], border: true, width_px: Some(240.0) }]);
+    let block = if preset == "sidebar" {
+        // A shaded, borderless side panel in a light tint of the accent colour, its text in the accent.
+        let accent = c.theme_resolved().color(crate::compose::ACCENT1);
+        let para = Block::Paragraph {
+            style: ParaStyle::default(),
+            inlines: vec![Inline::Text {
+                text: if text.is_empty() { "Sidebar".into() } else { text.clone() },
+                style: TextStyle { italic: Some(true), color: Some(accent), ..Default::default() },
+            }],
+        };
+        let cell = TableCell {
+            blocks: vec![para],
+            width_px: Some(200.0),
+            background: Some(lighten(accent, 0.85)),
+            ..table_cell("")
+        };
+        Block::Table { rows: vec![vec![cell]], border: false, width_px: Some(200.0) }
+    } else {
+        let cell = TableCell { width_px: Some(240.0), ..table_cell(&text) };
+        Block::Table { rows: vec![vec![cell]], border: true, width_px: Some(240.0) }
+    };
+    c.insert_blocks(vec![block]);
     Ok(json!({"textBox": preset, "caret": caret(c)}))
 }
 
@@ -1684,9 +1934,46 @@ pub fn normalize_url(url: &str) -> Option<String> {
     Some(format!("http://{u}"))
 }
 
+/// `file:` URL of a local path (percent-encoding what a URL cannot hold), for links to recent files.
+pub fn file_url(path: &str) -> String {
+    let mut out = String::from("file://");
+    let path = path.replace('\\', "/");
+    if !path.starts_with('/') {
+        out.push('/');
+    }
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(char::from(b))
+            }
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
 fn link(s: &mut Session, p: &Value) -> CmdResult {
-    let url = opt_str(p, "url");
-    let text = opt_str(p, "text").map(str::to_owned);
+    // Link ▾ › a recent file: a link to that file, named after it when nothing is selected.
+    let from_path = opt_str(p, "path").map(str::trim).filter(|t| !t.is_empty()).map(|path| {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_owned());
+        (file_url(path), name)
+    });
+    let url = match &from_path {
+        Some((u, _)) => Some(u.as_str()),
+        None => opt_str(p, "url"),
+    };
+    let collapsed = compose_id(s, p)
+        .ok()
+        .and_then(|cid| s.composes.get(&cid))
+        .is_some_and(|c| c.selection.is_collapsed());
+    let text = opt_str(p, "text")
+        .map(str::to_owned)
+        .or_else(|| from_path.as_ref().filter(|_| collapsed).map(|(_, n)| n.clone()));
     let Some(url) = url else {
         let cid = compose_id(s, p)?;
         let (sel, cur) =
@@ -1781,20 +2068,16 @@ fn symbol(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Built-in equations: key, gallery name, formula in plain math notation.
 pub const EQUATION_PRESETS: [(&str, &str, &str); 6] = [
-    ("areaOfCircle", "Area of Circle", "A = \u{3c0}r\u{b2}"),
+    ("areaOfCircle", "Area of Circle", "A=\u{3c0}r^2"),
     (
         "binomialTheorem",
         "Binomial Theorem",
-        "(x + a)\u{207f} = \u{3a3}\u{2096}\u{208c}\u{2080}\u{207f} C(n,k) x\u{1d4f} a\u{207f}\u{207b}\u{1d4f}",
+        "(x+a)^n=\u{2211}_(k=0)^n (n!/(k!(n\u{2212}k)!))x^k a^(n\u{2212}k)",
     ),
-    (
-        "expansionOfSum",
-        "Expansion of a Sum",
-        "(1 + x)\u{207f} = 1 + nx/1! + n(n \u{2212} 1)x\u{b2}/2! + \u{2026}",
-    ),
-    ("pythagoreanTheorem", "Pythagorean Theorem", "a\u{b2} + b\u{b2} = c\u{b2}"),
-    ("quadraticFormula", "Quadratic Formula", "x = (\u{2212}b \u{b1} \u{221a}(b\u{b2} \u{2212} 4ac)) / 2a"),
-    ("eulerIdentity", "Euler's Identity", "e^(i\u{3c0}) + 1 = 0"),
+    ("expansionOfSum", "Expansion of a Sum", "(1+x)^n=1+(nx)/(1!)+(n(n\u{2212}1)x^2)/(2!)+\u{2026}"),
+    ("pythagoreanTheorem", "Pythagorean Theorem", "a^2+b^2=c^2"),
+    ("quadraticFormula", "Quadratic Formula", "x=(\u{2212}b\u{b1}\u{221a}(b^2\u{2212}4ac))/(2a)"),
+    ("eulerIdentity", "Euler's Identity", "e^(i\u{3c0})+1=0"),
 ];
 
 /// A built-in equation by key ("areaOfCircle") or gallery name ("Area of Circle", any case/spacing).
@@ -1836,8 +2119,18 @@ fn equation(s: &mut Session, p: &Value) -> CmdResult {
             );
         }
     };
+    if text.chars().count() > MAX_EQUATION {
+        return Err(CmdError::Params(format!("an equation has at most {MAX_EQUATION} characters")));
+    }
+    // Drawn in two dimensions as a picture (alt text = the linear form); text that cannot be drawn goes in
+    // as a centred math-font paragraph.
+    if let Some((png, w, h)) = equation_png(&text) {
+        let c = compose_mut(s, p)?;
+        let cid = put_png(c, "equation", png, &text, w, h)?;
+        return Ok(json!({"equation": text, "cid": cid, "format": "png"}));
+    }
     edit(s, p, |c| c.insert_blocks(vec![equation_block(&text)]))?;
-    Ok(json!({"equation": text}))
+    Ok(json!({"equation": text, "format": "text"}))
 }
 
 const MONTHS: [&str; 12] = [
@@ -2016,16 +2309,29 @@ fn blocks_path(s: &Session) -> Option<std::path::PathBuf> {
     s.store.as_ref().map(|st| st.dir.join(BUILDING_BLOCKS_FILE))
 }
 
+/// Parsed building-block file of the profile (galleries are listed every frame while a menu or the organizer
+/// is open).
+static BLOCKS_CACHE: crate::cmd::util::FileCache<Vec<BuildingBlock>> = crate::cmd::util::FileCache::new();
+
 /// Saved building blocks from the profile (empty without a profile, or when the file is missing or garbled).
 pub fn load_building_blocks(s: &Session) -> Vec<BuildingBlock> {
+    profile_blocks(s).as_ref().clone()
+}
+
+/// [`load_building_blocks`], shared with the cache (parsed again only when the file changed).
+fn profile_blocks(s: &Session) -> std::sync::Arc<Vec<BuildingBlock>> {
     let Some(path) = blocks_path(s) else {
-        return Vec::new();
+        return std::sync::Arc::default();
     };
-    let too_big = std::fs::metadata(&path).map(|m| m.len() > MAX_BUILDING_BLOCKS_BYTES).unwrap_or(true);
+    BLOCKS_CACHE.get(&path, read_building_blocks)
+}
+
+fn read_building_blocks(path: &std::path::Path) -> Vec<BuildingBlock> {
+    let too_big = std::fs::metadata(path).map(|m| m.len() > MAX_BUILDING_BLOCKS_BYTES).unwrap_or(true);
     if too_big {
         return Vec::new();
     }
-    std::fs::read(&path)
+    std::fs::read(path)
         .ok()
         .and_then(|d| serde_json::from_slice::<BuildingBlocksFile>(&d).ok())
         .map(|f| {
@@ -2047,9 +2353,11 @@ fn save_building_blocks(s: &Session, entries: &[BuildingBlock]) -> Result<(), Cm
     let file = BuildingBlocksFile { version: 1, entries: entries.to_vec() };
     let text = serde_json::to_vec_pretty(&file).map_err(|e| CmdError::Failed(e.to_string()))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)
+    let written = std::fs::write(&tmp, text)
         .and_then(|()| std::fs::rename(&tmp, &path))
-        .map_err(|e| CmdError::Failed(format!("the building blocks could not be saved: {e}")))
+        .map_err(|e| CmdError::Failed(format!("the building blocks could not be saved: {e}")));
+    BLOCKS_CACHE.forget(&path);
+    written
 }
 
 /// Every building block: the profile's, then entries only on open composes (newer entries of the same
@@ -2062,10 +2370,16 @@ fn all_blocks(s: &Session, cid: u64) -> Vec<BuildingBlock> {
 
 /// [`all_blocks`] including the named list styles.
 fn every_block(s: &Session, cid: u64) -> Vec<BuildingBlock> {
-    let mut out = load_building_blocks(s);
+    merged_blocks(s, cid, |_| true)
+}
+
+/// The profile's building blocks that pass `keep`, then those only on open composes (newer entries of the
+/// same gallery and name win). Only the kept entries are copied.
+fn merged_blocks(s: &Session, cid: u64, keep: impl Fn(&BuildingBlock) -> bool) -> Vec<BuildingBlock> {
+    let mut out: Vec<BuildingBlock> = profile_blocks(s).iter().filter(|b| keep(b)).cloned().collect();
     let own = s.composes.get(&cid).into_iter();
     let others = s.composes.iter().filter(|(k, _)| **k != cid).map(|(_, c)| c);
-    for b in others.chain(own).flat_map(|c| c.building_blocks.iter()) {
+    for b in others.chain(own).flat_map(|c| c.building_blocks.iter()).filter(|b| keep(b)) {
         out.retain(|x| !(x.gallery == b.gallery && x.name.eq_ignore_ascii_case(&b.name)));
         out.push(b.clone());
     }
@@ -2109,6 +2423,7 @@ pub(crate) fn save_list_style(
         gallery: LIST_STYLES_GALLERY.to_owned(),
         name: name.clone(),
         blocks: vec![Block::Pre { text }],
+        ..Default::default()
     };
     let same = |b: &BuildingBlock| b.gallery == LIST_STYLES_GALLERY && b.name.eq_ignore_ascii_case(&name);
     for c in s.composes.values_mut() {
@@ -2172,12 +2487,17 @@ fn quick_part(s: &mut Session, p: &Value) -> CmdResult {
                     .chars()
                     .take(120)
                     .collect();
-                json!({"gallery": b.gallery, "name": b.name, "preview": preview})
+                let category = if b.category.is_empty() { DEFAULT_CATEGORY } else { b.category.as_str() };
+                json!({"gallery": b.gallery, "name": b.name, "preview": preview, "category": category,
+                       "description": b.description})
             })
             .collect();
         return dialog(s, "quickParts", json!({"compose": cid, "gallery": gallery, "entries": entries}));
     };
     let cid = compose_id(s, p)?;
+    if opt_str(p, "action") == Some("edit") {
+        return edit_block(s, p, cid, gallery, &name);
+    }
     if opt_str(p, "action") == Some("delete") {
         // Building Blocks Organizer › Delete.
         let matches = |b: &BuildingBlock| {
@@ -2217,48 +2537,141 @@ fn quick_part(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"inserted": found.name, "gallery": found.gallery}))
 }
 
-fn save_to_gallery(s: &mut Session, p: &Value) -> CmdResult {
-    let gallery = req_str(p, "gallery")?.to_owned();
-    if !GALLERIES.contains(&gallery.as_str()) {
-        return Err(CmdError::Params(format!("unknown gallery `{gallery}`")));
+/// Category of a building block saved without one.
+pub const DEFAULT_CATEGORY: &str = "General";
+/// Longest building-block name, category and description kept.
+const MAX_BLOCK_NAME: usize = 64;
+const MAX_BLOCK_DESCRIPTION: usize = 255;
+
+fn trimmed(p: &Value, key: &str, max: usize) -> Option<String> {
+    opt_str(p, key).map(str::trim).filter(|t| !t.is_empty()).map(|t| t.chars().take(max).collect())
+}
+
+/// The saved entries of `gallery`, oldest first (what its menu lists).
+pub fn gallery_entries(s: &Session, cid: u64, gallery: &str) -> Vec<BuildingBlock> {
+    merged_blocks(s, cid, |b| b.gallery == gallery)
+}
+
+/// Categories used in `gallery` ("General" first).
+fn gallery_categories(s: &Session, cid: u64, gallery: &str) -> Vec<String> {
+    let mut out = vec![DEFAULT_CATEGORY.to_owned()];
+    for b in gallery_entries(s, cid, gallery) {
+        if !b.category.is_empty() && !out.iter().any(|c| c.eq_ignore_ascii_case(&b.category)) {
+            out.push(b.category);
+        }
     }
-    let c = compose_mut(s, p)?;
-    if c.selection.is_collapsed() {
-        return Err(CmdError::Disabled("select what to save first".into()));
-    }
-    let frag = c.fragment();
-    let name = match opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
-        Some(n) => n.chars().take(64).collect::<String>(),
-        None => c
-            .selected_text()
-            .split_whitespace()
-            .take(4)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(64)
-            .collect(),
-    };
-    if name.is_empty() {
-        return Err(CmdError::Params("`name` required".into()));
-    }
-    let entry = BuildingBlock { gallery: gallery.clone(), name: name.clone(), blocks: frag.blocks };
+    out
+}
+
+/// Stores `entry` for every open compose and in the profile, replacing one of the same gallery and name.
+/// Returns (replaced an existing one, written to the profile).
+fn store_block(s: &mut Session, entry: BuildingBlock) -> Result<(bool, bool), CmdError> {
     let same = |b: &BuildingBlock| b.gallery == entry.gallery && b.name.eq_ignore_ascii_case(&entry.name);
+    let mut replaced = false;
     // Every open compose shares the galleries; the profile keeps them.
     for other in s.composes.values_mut() {
+        let n = other.building_blocks.len();
         other.building_blocks.retain(|b| !same(b));
+        replaced |= other.building_blocks.len() != n;
         other.building_blocks.push(entry.clone());
     }
     let mut saved = load_building_blocks(s);
+    let n = saved.len();
     saved.retain(|b| !same(b));
-    saved.push(entry.clone());
+    replaced |= saved.len() != n;
+    saved.push(entry);
     if saved.len() > MAX_BUILDING_BLOCKS {
         let extra = saved.len() - MAX_BUILDING_BLOCKS;
         saved.drain(..extra);
     }
     let persisted = blocks_path(s).is_some();
     save_building_blocks(s, &saved)?;
-    Ok(json!({"saved": name, "gallery": gallery, "persisted": persisted}))
+    Ok((replaced, persisted))
+}
+
+/// Save Selection to … Gallery: without a `name`, the Create New Building Block dialog (name proposed from
+/// the selection's first words, gallery, category, description); with one, saves the selection.
+fn save_to_gallery(s: &mut Session, p: &Value) -> CmdResult {
+    let gallery = req_str(p, "gallery")?.to_owned();
+    if !GALLERIES.contains(&gallery.as_str()) {
+        return Err(CmdError::Params(format!("unknown gallery `{gallery}`")));
+    }
+    let cid = compose_id(s, p)?;
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    if c.selection.is_collapsed() {
+        return Err(CmdError::Disabled("select what to save first".into()));
+    }
+    let Some(name) = trimmed(p, "name", MAX_BLOCK_NAME) else {
+        let suggested: String = c
+            .selected_text()
+            .split_whitespace()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(MAX_BLOCK_NAME)
+            .collect();
+        let existing: Vec<String> = gallery_entries(s, cid, &gallery).into_iter().map(|b| b.name).collect();
+        let categories = gallery_categories(s, cid, &gallery);
+        return dialog(
+            s,
+            "createBuildingBlock",
+            json!({"compose": cid, "gallery": gallery, "galleries": GALLERIES, "name": suggested,
+                   "category": DEFAULT_CATEGORY, "categories": categories, "existing": existing}),
+        );
+    };
+    let category = trimmed(p, "category", MAX_BLOCK_NAME).unwrap_or_else(|| DEFAULT_CATEGORY.to_owned());
+    let description = trimmed(p, "description", MAX_BLOCK_DESCRIPTION).unwrap_or_default();
+    let frag = c.fragment();
+    let entry = BuildingBlock {
+        gallery: gallery.clone(),
+        name: name.clone(),
+        blocks: frag.blocks,
+        category,
+        description,
+    };
+    let (replaced, persisted) = store_block(s, entry)?;
+    Ok(json!({"saved": name, "gallery": gallery, "persisted": persisted, "replaced": replaced}))
+}
+
+/// Building Blocks Organizer › Edit Properties: renames an entry, moves it to another gallery or changes its
+/// category and description.
+fn edit_block(s: &mut Session, p: &Value, cid: u64, gallery: Option<&str>, name: &str) -> CmdResult {
+    let found = find_block(s, cid, gallery, name)
+        .ok_or_else(|| CmdError::Params(format!("no saved entry `{name}`")))?;
+    let new_gallery = opt_str(p, "newGallery").unwrap_or(&found.gallery).to_owned();
+    if !GALLERIES.contains(&new_gallery.as_str()) {
+        return Err(CmdError::Params(format!("unknown gallery `{new_gallery}`")));
+    }
+    let new_name = trimmed(p, "newName", MAX_BLOCK_NAME).unwrap_or_else(|| found.name.clone());
+    let category = trimmed(p, "category", MAX_BLOCK_NAME).unwrap_or_else(|| {
+        if found.category.is_empty() { DEFAULT_CATEGORY.to_owned() } else { found.category.clone() }
+    });
+    let description = match p.get("description") {
+        Some(_) => trimmed(p, "description", MAX_BLOCK_DESCRIPTION).unwrap_or_default(),
+        None => found.description.clone(),
+    };
+    let moved = new_gallery != found.gallery || !new_name.eq_ignore_ascii_case(&found.name);
+    if moved && find_block(s, cid, Some(&new_gallery), &new_name).is_some() {
+        return Err(CmdError::Params(format!("an entry named `{new_name}` is already in that gallery")));
+    }
+    let old = (found.gallery.clone(), found.name.clone());
+    let is_old = |b: &BuildingBlock| b.gallery == old.0 && b.name.eq_ignore_ascii_case(&old.1);
+    let mut saved = load_building_blocks(s);
+    saved.retain(|b| !is_old(b));
+    save_building_blocks(s, &saved)?;
+    for c in s.composes.values_mut() {
+        c.building_blocks.retain(|b| !is_old(b));
+    }
+    let entry = BuildingBlock {
+        gallery: new_gallery.clone(),
+        name: new_name.clone(),
+        blocks: found.blocks,
+        category,
+        description,
+    };
+    store_block(s, entry)?;
+    Ok(json!({"edited": new_name, "gallery": new_gallery}))
 }
 
 /// WordArt: the selected text (or `text`, or "Your text here") drawn in the chosen style with the theme's
@@ -2285,6 +2698,7 @@ fn word_art(s: &mut Session, p: &Value) -> CmdResult {
     c.checkpoint();
     c.delete_selection();
     let cid = put_png(c, "wordart", png, &text, w, h)?;
+    remember_generated(c, &cid, "wordArt", json!({"text": text, "style": style}));
     Ok(json!({"wordArt": style, "text": text, "cid": cid, "format": "png"}))
 }
 
@@ -2568,7 +2982,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Link",
             "Message › Include; Insert › Links",
             "Mod+K",
-            r#"{"url"?:string,"text"?:string}  ("" url removes the link)"#,
+            r#"{"url"?:string,"text"?:string,"path"?:string}  ("" url removes the link; path links to a file)"#,
             false,
             rich_compose,
             link,
@@ -2608,7 +3022,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Quick Parts",
             "Insert › Text",
             "",
-            r#"{"name"?:string,"gallery"?:string,"action"?:"insert"|"delete"}"#,
+            r#"{"name"?:string,"gallery"?:string,"action"?:"insert"|"delete"|"edit","newName"?:string,"newGallery"?:string,"category"?:string,"description"?:string}  (newName, newGallery, category and description with "edit")"#,
             false,
             has_compose,
             quick_part,
@@ -2618,7 +3032,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save Selection to Gallery",
             "Insert › Text › Quick Parts / Text Box; Insert › Tables › Quick Tables; Insert › Symbols › Equation",
             "",
-            r#"{"gallery":"quickParts"|"autoText"|"textBoxes"|"quickTables"|"equations","name"?:string}"#,
+            r#"{"gallery":"quickParts"|"autoText"|"textBoxes"|"quickTables"|"equations","name"?:string,"category"?:string,"description"?:string}  (no name: the Create New Building Block dialog)"#,
             false,
             has_body_selection,
             save_to_gallery,
@@ -2628,7 +3042,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Screenshot",
             "Insert › Illustrations",
             "",
-            r#"{"path"?:string,"name"?:string,"data_base64"?:string,"window"?:string,"clip"?:bool}"#,
+            r#"{"path"?:string,"name"?:string,"data_base64"?:string,"alt"?:string,"window"?:string,"clip"?:bool,"unavailable"?:string}  (no picture: the saved-picture dialog, with the `unavailable` reason)"#,
             false,
             rich_compose,
             screenshot,
@@ -2668,7 +3082,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Table",
             "Insert › Tables",
             "",
-            r#"{"rows"?:number,"cols"?:number,"mode"?:"grid"|"dialog"|"draw"|"fromText"|"quick","name"?:string}"#,
+            r#"{"rows"?:number,"cols"?:number,"mode"?:"grid"|"dialog"|"draw"|"fromText"|"quick","name"?:string,"widths"?:[number],"separator"?:"tabs"|"commas"|"semicolons"|"paragraphs"|"auto"|string}  (widths with "draw", px per column; separator with "fromText")"#,
             false,
             rich_compose,
             table,
@@ -2697,7 +3111,7 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::compose::tests::{open, session};
     use super::*;
     use mailcraft_model::{Appointment, Contact};
@@ -2907,7 +3321,17 @@ mod tests {
         s.run("compose.select", &json!({"all": true})).unwrap();
         s.run("compose.insertText", &json!({"text": "a\tb\nc\td"})).unwrap();
         s.run("compose.select", &json!({"all": true})).unwrap();
-        s.run("insert.table", &json!({"mode": "fromText"})).unwrap();
+        // Convert Text to Table first asks (tabs proposed, two columns), then converts.
+        assert_eq!(
+            s.run("insert.table", &json!({"mode": "fromText"})).unwrap()["dialog"],
+            "convertTextToTable"
+        );
+        let d = last_dialog(&s);
+        assert_eq!(
+            (d["separator"].as_str(), d["cols"].as_u64(), d["rows"].as_u64()),
+            (Some("tabs"), Some(2), Some(2))
+        );
+        s.run("insert.table", &json!({"mode": "fromText", "separator": "tabs"})).unwrap();
         assert!(
             matches!(&s.composes[&id].body.blocks[0], Block::Table { rows, .. } if rows.len() == 2 && rows[1].len() == 2)
         );
@@ -2916,6 +3340,252 @@ mod tests {
         s.run("insert.textBox", &json!({"text": "boxed"})).unwrap();
         assert!(s.composes[&id].body.to_plain_text().contains("boxed"));
         assert_eq!(s.run("insert.textBox", &json!({"preset": "draw"})).unwrap()["dialog"], "drawTextBox");
+        assert!(s.run("insert.textBox", &json!({"preset": "nope"})).is_err());
+    }
+
+    fn tables(s: &Session, id: u64) -> Vec<Vec<Vec<TableCell>>> {
+        fn walk(blocks: &[Block], out: &mut Vec<Vec<Vec<TableCell>>>) {
+            for b in blocks {
+                match b {
+                    Block::Table { rows, .. } => {
+                        out.push(rows.clone());
+                        rows.iter().flatten().for_each(|c| walk(&c.blocks, out));
+                    }
+                    Block::Quote { blocks } | Block::Container { blocks, .. } => walk(blocks, out),
+                    Block::List { items, .. } => items.iter().for_each(|i| walk(i, out)),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&s.composes[&id].body.blocks, &mut out);
+        out
+    }
+
+    #[test]
+    fn convert_text_to_table_separators_and_columns() {
+        let (mut s, id) = setup();
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("compose.insertText", &json!({"text": "a;b;c\nd;e"})).unwrap();
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("insert.table", &json!({"mode": "fromText", "separator": "semicolons"})).unwrap();
+        let t = tables(&s, id);
+        assert_eq!(t[0].len(), 2);
+        assert_eq!(t[0][1].len(), 3, "short rows are padded");
+        s.run("compose.undo", &json!({})).ok();
+        s.run("format.undo", &json!({})).ok();
+        // One cell per paragraph, three to a row.
+        let (mut s, id) = setup();
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("compose.insertText", &json!({"text": "1\n2\n3\n4"})).unwrap();
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("insert.table", &json!({"mode": "fromText", "separator": "paragraphs", "cols": 3})).unwrap();
+        let t = tables(&s, id);
+        assert_eq!((t[0].len(), t[0][0].len()), (2, 3));
+        // Any single character, and columns beyond what the text has.
+        let (mut s, id) = setup();
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("compose.insertText", &json!({"text": "x-y"})).unwrap();
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        assert!(s.run("insert.table", &json!({"mode": "fromText", "separator": "ab"})).is_err());
+        assert!(s.run("insert.table", &json!({"mode": "fromText", "separator": "-", "cols": 99})).is_err());
+        s.run("insert.table", &json!({"mode": "fromText", "separator": "-", "cols": 4})).unwrap();
+        assert_eq!(tables(&s, id)[0][0].len(), 4);
+    }
+
+    #[test]
+    fn draw_table_uses_the_drawn_widths() {
+        let (mut s, id) = setup();
+        assert_eq!(s.run("insert.table", &json!({"mode": "draw"})).unwrap()["dialog"], "drawTable");
+        let r = s.run("insert.table", &json!({"mode": "draw", "widths": [100.0, 50.5], "rows": 3})).unwrap();
+        assert_eq!((r["rows"].as_u64(), r["cols"].as_u64()), (Some(3), Some(2)));
+        let t = tables(&s, id);
+        assert_eq!(t[0].len(), 3);
+        assert_eq!(t[0][0][1].width_px, Some(51.0));
+        for bad in [json!([]), json!([0]), json!([-3.0]), json!(["x"]), json!(5)] {
+            let r = s.run("insert.table", &json!({"mode": "draw", "widths": bad}));
+            assert!(r.is_err(), "widths {bad} are refused");
+        }
+        // A huge width is clamped, not refused.
+        let r = s.run("insert.table", &json!({"mode": "draw", "widths": [f64::MAX]})).unwrap();
+        assert_eq!(r["drawn"], true);
+        assert!(tables(&s, id).iter().any(|t| t[0][0].width_px == Some(2000.0)));
+        assert!(s.run("insert.table", &json!({"mode": "draw", "widths": [10.0], "rows": 5000})).is_err());
+        assert!(s.run("insert.table", &json!({"mode": "draw", "widths": vec![10.0; 64]})).is_err());
+    }
+
+    #[test]
+    fn sidebar_text_box_differs_from_simple() {
+        let (mut s, id) = setup();
+        s.run("insert.textBox", &json!({"preset": "simple", "text": "a"})).unwrap();
+        s.run("insert.textBox", &json!({"preset": "sidebar", "text": "b"})).unwrap();
+        let t = tables(&s, id);
+        let shaded: Vec<bool> = t.iter().map(|rows| rows[0][0].background.is_some()).collect();
+        assert!(shaded.contains(&true) && shaded.contains(&false), "{shaded:?}");
+    }
+
+    #[test]
+    fn links_to_recent_files() {
+        let (mut s, id) = setup();
+        assert_eq!(file_url("/home/u/My Report.pdf"), "file:///home/u/My%20Report.pdf");
+        assert_eq!(file_url("C:\\Docs\\a#b.txt"), "file:///C:/Docs/a%23b.txt");
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("compose.insertText", &json!({"text": ""})).unwrap();
+        let r = s.run("insert.link", &json!({"path": "/home/u/Plan 2.docx"})).unwrap();
+        assert_eq!(r["url"], "file:///home/u/Plan%202.docx");
+        assert!(s.composes[&id].body.to_plain_text().contains("Plan 2.docx"), "named after the file");
+    }
+
+    /// The `cid:` sources of the body's pictures.
+    fn image_srcs(c: &ComposeState) -> Vec<String> {
+        c.images().into_iter().map(|(src, ..)| src).collect()
+    }
+
+    #[test]
+    fn theme_changes_redraw_shapes_smart_art_and_word_art() {
+        let (mut s, id) = setup();
+        s.run("insert.shape", &json!({"kind": "oval"})).unwrap();
+        s.run("insert.shape", &json!({"kind": "rectangle", "color": "#ff0000"})).unwrap();
+        s.run("insert.smartArt", &json!({"layout": "process", "items": ["a", "b"]})).unwrap();
+        s.run("insert.wordArt", &json!({"style": "Fill: Dark Teal, Accent color 1; Shadow", "text": "Hi"}))
+            .unwrap();
+        assert_eq!(s.composes[&id].generated.len(), 4);
+        let before = image_srcs(&s.composes[&id]);
+        let data = |s: &Session, src: &str| {
+            let cid = src.trim_start_matches("cid:");
+            s.composes[&id]
+                .inline_images
+                .iter()
+                .find(|i| i.content_id == cid)
+                .map(|i| i.data.clone())
+                .unwrap()
+        };
+        let old_oval = data(&s, &before[0]);
+        let r = s.run("compose.theme", &json!({"part": "effects", "name": "Glossy"})).unwrap();
+        assert_eq!(r["redrawn"], 3, "shapes and SmartArt take the new effects (WordArt has its own)");
+        let after = image_srcs(&s.composes[&id]);
+        assert_eq!(after.len(), 4);
+        assert!(after.iter().zip(&before).take(3).all(|(a, b)| a != b), "new pictures replace the old ones");
+        assert_eq!(after.get(3), before.get(3));
+        assert_ne!(data(&s, &after[0]), old_oval);
+        // Colours: the accent-coloured shape changes, the explicit red one keeps its fill.
+        let red = data(&s, &after[1]);
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
+        assert_eq!(r["redrawn"], 3, "the fixed-colour shape is unchanged: {r}");
+        let now = image_srcs(&s.composes[&id]);
+        assert_eq!(data(&s, &now[1]), red);
+        // Undo of the body still finds the old pictures.
+        let c = &s.composes[&id];
+        assert!(
+            before.iter().all(|src| c.inline_images.iter().any(|i| format!("cid:{}", i.content_id) == *src))
+        );
+        // A deleted picture is no longer redrawn.
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("compose.insertText", &json!({"text": "plain"})).unwrap();
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Red"})).unwrap();
+        assert_eq!(r["redrawn"], 0, "pictures no longer in the body are not redrawn");
+        assert_eq!(s.composes[&id].generated.len(), 10, "every recipe stays for Undo (4 + 3 + 3 redrawn)");
+    }
+
+    #[test]
+    fn theme_change_then_undo_still_redraws_on_the_next_change() {
+        // Regression: the redraw moved each recipe to the new picture, so after Undo (old pictures back in
+        // the body) no recipe matched the body and later theme changes redrew nothing.
+        let (mut s, id) = setup();
+        s.run("insert.shape", &json!({"kind": "oval"})).unwrap();
+        s.run("insert.smartArt", &json!({"layout": "list", "items": ["a"]})).unwrap();
+        let before = image_srcs(&s.composes[&id]);
+        let theme_before = s.composes[&id].theme.clone();
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
+        assert_eq!(r["redrawn"], 2);
+        assert_ne!(image_srcs(&s.composes[&id]), before);
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(image_srcs(&s.composes[&id]), before, "Undo brings back the old pictures");
+        assert_eq!(s.composes[&id].theme, theme_before, "and the theme they were drawn in");
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Red"})).unwrap();
+        assert_eq!(r["redrawn"], 2, "the old pictures are redrawn again: {r}");
+        // Redo of the first change after a new change is gone; Undo twice returns to the start.
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(image_srcs(&s.composes[&id]), before);
+    }
+
+    #[test]
+    fn many_redraws_keep_the_recipes_of_pictures_in_the_body() {
+        let (mut s, id) = setup();
+        s.run("insert.shape", &json!({"kind": "oval"})).unwrap();
+        // The shape is the oldest recipe; many newer ones are of pictures no longer in the body.
+        let c = s.composes.get_mut(&id).unwrap();
+        for i in 0..MAX_GENERATED + 20 {
+            c.generated.push(crate::compose::GeneratedPicture {
+                content_id: format!("gone{i}@example.com"),
+                kind: "shape".into(),
+                spec: json!({"shape": "oval"}),
+            });
+        }
+        trim_generated(c);
+        assert_eq!(c.generated.len(), MAX_GENERATED);
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
+        assert_eq!(r["redrawn"], 1, "the shape in the body kept its recipe");
+        assert!(s.composes[&id].generated.len() <= MAX_GENERATED);
+    }
+
+    #[test]
+    fn create_building_block_dialog_categories_and_edit() {
+        let (mut s, id) = setup();
+        s.run("compose.select", &json!({"compose": id, "all": true})).unwrap();
+        // Without a name: the Create New Building Block dialog, the name proposed from the selection.
+        let r = s.run("insert.saveToGallery", &json!({"compose": id, "gallery": "autoText"})).unwrap();
+        assert_eq!(r["dialog"], "createBuildingBlock");
+        let d = last_dialog(&s);
+        assert_eq!((d["name"].as_str(), d["category"].as_str()), (Some("start"), Some(DEFAULT_CATEGORY)));
+        let r = s
+            .run(
+                "insert.saveToGallery",
+                &json!({"compose": id, "gallery": "autoText", "name": "Sig", "category": "Closings", "description": "short"}),
+            )
+            .unwrap();
+        assert_eq!(r["replaced"], false);
+        let r = s
+            .run("insert.saveToGallery", &json!({"compose": id, "gallery": "autoText", "name": "SIG"}))
+            .unwrap();
+        assert_eq!(r["replaced"], true);
+        let entries = gallery_entries(&s, id, "autoText");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].category, DEFAULT_CATEGORY,
+            "replacing without a category files it under General"
+        );
+        s.run(
+            "insert.saveToGallery",
+            &json!({"compose": id, "gallery": "autoText", "name": "Other", "category": "Closings"}),
+        )
+        .unwrap();
+        s.run("insert.saveToGallery", &json!({"compose": id, "gallery": "autoText"})).unwrap();
+        assert_eq!(last_dialog(&s)["categories"], json!(["General", "Closings"]));
+        // Edit Properties: rename and move to another gallery; a clash is refused.
+        assert!(
+            s.run("insert.quickPart", &json!({"compose": id, "action": "edit", "name": "Other", "gallery": "autoText", "newName": "sig"}))
+                .is_err()
+        );
+        s.run(
+            "insert.quickPart",
+            &json!({"compose": id, "action": "edit", "name": "Other", "gallery": "autoText", "newName": "Bye", "newGallery": "quickParts", "description": "d"}),
+        )
+        .unwrap();
+        let qp = gallery_entries(&s, id, "quickParts");
+        assert_eq!(
+            (qp[0].name.as_str(), qp[0].category.as_str(), qp[0].description.as_str()),
+            ("Bye", "Closings", "d")
+        );
+        assert_eq!(gallery_entries(&s, id, "autoText").len(), 1);
+        s.run("insert.quickPart", &json!({"compose": id, "name": "Bye", "gallery": "quickParts"})).unwrap();
+        assert!(
+            s.run("insert.quickPart", &json!({"compose": id, "action": "edit", "name": "Nope"})).is_err()
+        );
+        // Nothing selected: disabled.
+        s.run("compose.select", &json!({"compose": id, "anchor": {"path": [0], "offset": 0}})).unwrap();
+        assert!(s.composes[&id].selection.is_collapsed());
+        assert!(s.run("insert.saveToGallery", &json!({"compose": id, "gallery": "autoText"})).is_err());
     }
 
     #[test]
@@ -2942,7 +3612,7 @@ mod tests {
         assert!(s.composes[&id].body.to_plain_text().contains("©€"));
         assert_eq!(s.run("insert.symbol", &json!({})).unwrap()["dialog"], "symbol");
         s.run("insert.equation", &json!({"preset": "pythagoreanTheorem"})).unwrap();
-        assert!(s.composes[&id].body.to_plain_text().contains("a² + b² = c²"));
+        assert!(s.composes[&id].images().iter().any(|(_, alt)| alt == "a^2+b^2=c^2"));
         assert_eq!(s.run("insert.equation", &json!({})).unwrap()["dialog"], "equation");
     }
 
@@ -3050,15 +3720,38 @@ mod tests {
         {
             s.run("insert.equation", &json!({"preset": name})).unwrap();
         }
-        assert!(s.composes[&id].body.to_plain_text().contains("A = \u{3c0}r\u{b2}"));
+        let alts: Vec<String> = s.composes[&id].images().into_iter().map(|(_, alt)| alt).collect();
+        assert!(alts.contains(&"A=\u{3c0}r^2".to_owned()), "{alts:?}");
+        assert_eq!(alts.len(), 5, "each preset is drawn as a picture");
+        let r = s
+            .run("insert.equation", &json!({"text": "x=(\u{2212}b\u{b1}\u{221a}(b^2\u{2212}4ac))/(2a)"}))
+            .unwrap();
+        assert_eq!(r["format"], "png");
+        assert!(s.run("insert.equation", &json!({"text": "x".repeat(MAX_EQUATION + 1)})).is_err());
         s.run("insert.equation", &json!({})).unwrap();
         assert_eq!(last_dialog(&s)["presets"][0]["name"], "Area of Circle");
         // Screenshot inserts a saved picture.
+        let pictures = s.composes[&id].inline_images.len();
         let r = s.run("insert.screenshot", &json!({"name": "shot.png", "data_base64": PNG_1X1})).unwrap();
         assert_eq!(r["screenshot"], true);
-        assert_eq!(s.composes[&id].inline_images.len(), 1);
+        assert_eq!(s.composes[&id].inline_images.len(), pictures + 1);
+        assert_eq!(r["alt"], "Screenshot");
+        let r = s
+            .run(
+                "insert.screenshot",
+                &json!({"name": "shot.png", "data_base64": PNG_1X1, "window": "Notes - Editor"}),
+            )
+            .unwrap();
+        assert_eq!(r["alt"], "Screenshot", "the window title is not sent in the alt text");
+        assert_eq!(r["window"], "Notes - Editor");
         s.run("insert.screenshot", &json!({"window": "Inbox"})).unwrap();
-        assert!(last_dialog(&s)["message"].as_str().unwrap().contains("cannot capture"));
+        assert!(last_dialog(&s)["message"].as_str().unwrap().contains("not available here"));
+        s.run("insert.screenshot", &json!({})).unwrap();
+        assert!(last_dialog(&s)["message"].as_str().unwrap().starts_with("Choose a screenshot"));
+        s.run("insert.screenshot", &json!({"clip": true, "unavailable": "The portal said no."})).unwrap();
+        let d = last_dialog(&s);
+        assert!(d["message"].as_str().unwrap().starts_with("The portal said no."));
+        assert_eq!(d["clip"], true);
     }
 
     #[test]

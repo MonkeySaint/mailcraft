@@ -236,7 +236,7 @@ fn feedback(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 muted(
                     ui,
                     app,
-                    "MailCraft has no feedback service of its own. Write your note here, copy it and send it to the project's issue tracker.",
+                    "Write your note here, then open it as a new issue on the project's public issue tracker (in your browser), or copy it.",
                 );
                 ui.add(egui::TextEdit::multiline(&mut st.text).desired_rows(6).desired_width(f32::INFINITY));
                 ui.checkbox(&mut st.info, "Include version and system information");
@@ -247,17 +247,23 @@ fn feedback(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 if st.copied {
                     muted(ui, app, "Copied to the clipboard.");
                 }
+                let mut note = st.text.clone();
+                if st.info {
+                    note.push_str("\n\n");
+                    note.push_str(&about_line(&about));
+                }
                 footer(ui, |ui| {
                     if btn(ui, "Close") {
                         return Out::Close;
                     }
+                    if primary(ui, app, !st.text.trim().is_empty(), "Open Issue Tracker") {
+                        let first = st.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(title);
+                        let url = mailcraft_engine::cmd::help::issue_url(first, &note);
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        return Out::Close;
+                    }
                     if btn(ui, "Copy") {
-                        let mut t = st.text.clone();
-                        if st.info {
-                            t.push_str("\n\n");
-                            t.push_str(&about_line(&about));
-                        }
-                        ui.ctx().copy_text(t);
+                        ui.ctx().copy_text(note);
                         st.copied = true;
                     }
                     Out::Keep
