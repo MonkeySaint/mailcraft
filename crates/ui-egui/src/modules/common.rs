@@ -756,13 +756,14 @@ pub(crate) fn collapsed_labels(app: &App, folder: FolderId) -> BTreeSet<String> 
 
 /// Collapses or expands a group of a module view: the engine's group commands act on the selected item's
 /// group, so an item of the group (`first`) is selected first.
-pub(crate) fn toggle_group(app: &mut App, first: ItemId, collapsed: bool) {
+pub(crate) fn toggle_group(app: &mut App, first: ItemId, label: &str, collapsed: bool) {
     let inside = app.s.selection.focus == Some(first);
     if !inside {
         select_item(app, Some(first.0));
     }
     let id = if collapsed { "view.expandGroup" } else { "view.collapseGroup" };
-    app.run(id, serde_json::json!({}));
+    // The header names its group: an item filed under several categories has a row in each.
+    app.run(id, serde_json::json!({ "label": label }));
 }
 
 /// A group header row (▾/▸, label, item count); returns true when clicked.
@@ -819,7 +820,7 @@ pub(crate) fn pane_separator(ui: &Ui, app: &App, list: Rect, pane: Rect) {
 /// room; returns the rest of `rect`.
 pub(crate) fn todo_bar_strip(ui: &mut Ui, app: &mut App, rect: Rect) -> Rect {
     let w = super::TODO_BAR_WIDTH;
-    if !super::todo_bar_shown(ui.ctx()) || rect.width() < w + 420.0 {
+    if !super::todo_bar_shown(app) || rect.width() < w + 420.0 {
         return rect;
     }
     let bar = Rect::from_min_max(pos2(rect.max.x - w, rect.min.y), rect.max);

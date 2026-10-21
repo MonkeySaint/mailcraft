@@ -2,10 +2,11 @@
 //! Mail, People, Tasks and Notes modules with a month calendar and the selected day's (or the next days') appointments, a people
 //! search, and the To-Do List with "Type a new task".
 //!
-//! The shell calls [`set_todo_bar`] with the part `view.todoBar` returned and reserves [`TODO_BAR_WIDTH`]
-//! on the right for [`todo_bar`] while [`todo_bar_shown`]. The parts shown are kept with the profile: they
-//! go into the dialog settings (`todoBar.parts`), which the shell saves in the session settings
-//! (`state.uiPrefs`, `settings.json`) and restores at start-up, so the To-Do Bar comes back as it was left.
+//! The parts shown are session state (`ViewState::todo_bar`, changed by `view.todoBar` from the ribbon, the
+//! control channel, MCP or the CLI alike) and are saved with the profile's view state, so the To-Do Bar comes
+//! back as it was left. The shell reserves [`TODO_BAR_WIDTH`] on the right for [`todo_bar`] while
+//! [`todo_bar_shown`]. Older profiles kept the parts in the dialog settings (`todoBar.parts`); the shell takes
+//! them over once ([`saved_todo_bar`]).
 
 use egui::{
     Align2, Color32, CornerRadius, FontId, Id, Rect, RichText, ScrollArea, Sense, TextEdit, Ui, pos2, vec2,
@@ -28,55 +29,34 @@ const UPCOMING_DAYS: i64 = 7;
 /// Most rows per section.
 const MAX_ROWS: usize = 40;
 
-/// Parts shown and their UI state (egui memory).
+/// UI state of the To-Do Bar's parts (egui memory); which parts show is session state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct TodoBarState {
-    pub calendar: bool,
-    pub people: bool,
-    pub tasks: bool,
     /// Day picked in the month calendar (`None` = upcoming days from today).
     pub day: Option<i64>,
     /// Month shown when paged away from today's.
     pub month: Option<(i64, u8)>,
     pub search: String,
     pub new_task: String,
-    /// The saved parts were applied (or the user changed the parts before they could be).
-    pub restored: bool,
 }
 
-/// Dialog-settings key holding the parts shown (`["calendar", "people", "tasks"]`, any subset).
+/// Dialog-settings key where older profiles kept the parts shown (`["calendar", "people", "tasks"]`).
 pub(crate) const PREF_KEY: &str = "todoBar.parts";
 
-/// Saves the parts shown with the dialog settings (the shell writes them to the profile).
-fn persist(ctx: &egui::Context, st: &TodoBarState) {
-    let parts: Vec<&str> = [("calendar", st.calendar), ("people", st.people), ("tasks", st.tasks)]
-        .into_iter()
-        .filter(|(_, on)| *on)
-        .map(|(k, _)| k)
-        .collect();
-    let value = json!(parts);
-    ctx.data_mut(|d| {
-        let p = d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::new(crate::chrome::UI_PREFS_ID));
-        if p.values.get(PREF_KEY) != Some(&value) {
-            p.values.insert(PREF_KEY.to_owned(), value);
-            p.rev = p.rev.wrapping_add(1);
-        }
-    });
+/// The parts an older profile kept in the dialog settings, once those are loaded (`None` before, or when
+/// there are none).
+pub fn saved_todo_bar(ctx: &egui::Context) -> Option<mailcraft_engine::TodoBar> {
+    let Some(Value::Array(saved)) = crate::dialogs::ui_pref(ctx, PREF_KEY) else { return None };
+    let on = |k: &str| saved.iter().any(|v| v.as_str() == Some(k));
+    Some(mailcraft_engine::TodoBar { calendar: on("calendar"), people: on("people"), tasks: on("tasks") })
 }
 
-/// Applies the saved parts once they are available (the shell restores the dialog settings in its first
-/// frame).
-fn restore(ctx: &egui::Context, st: &mut TodoBarState) -> bool {
-    if st.restored {
-        return false;
-    }
-    let Some(Value::Array(saved)) = crate::dialogs::ui_pref(ctx, PREF_KEY) else { return false };
-    let on = |k: &str| saved.iter().any(|v| v.as_str() == Some(k));
-    st.calendar = on("calendar");
-    st.people = on("people");
-    st.tasks = on("tasks");
-    st.restored = true;
-    true
+/// Takes over the parts an older profile kept in the dialog settings, once: the old key is removed (and the
+/// dialog settings saved without it), so a bar turned off later stays off after a restart.
+pub fn take_saved_todo_bar(ctx: &egui::Context) -> Option<mailcraft_engine::TodoBar> {
+    let parts = saved_todo_bar(ctx);
+    crate::dialogs::take_ui_pref(ctx, PREF_KEY);
+    parts
 }
 
 fn state_id() -> Id {
@@ -84,11 +64,7 @@ fn state_id() -> Id {
 }
 
 pub(crate) fn load(ctx: &egui::Context) -> TodoBarState {
-    let mut st = ctx.data_mut(|d| d.get_temp::<TodoBarState>(state_id())).unwrap_or_default();
-    if restore(ctx, &mut st) {
-        ctx.data_mut(|d| d.insert_temp(state_id(), st.clone()));
-    }
-    st
+    ctx.data_mut(|d| d.get_temp::<TodoBarState>(state_id())).unwrap_or_default()
 }
 
 pub(crate) fn store(ctx: &egui::Context, st: TodoBarState) {
@@ -96,54 +72,40 @@ pub(crate) fn store(ctx: &egui::Context, st: TodoBarState) {
 }
 
 /// Applies View › To-Do Bar › `part` ("calendar", "people", "tasks" toggle that part; "off" hides the bar).
-pub fn set_todo_bar(ctx: &egui::Context, part: &str) {
-    let mut st = load(ctx);
-    match part {
-        "calendar" => st.calendar = !st.calendar,
-        "people" => st.people = !st.people,
-        "tasks" => st.tasks = !st.tasks,
-        "off" => {
-            st.calendar = false;
-            st.people = false;
-            st.tasks = false;
-        }
-        _ => return,
-    }
-    st.restored = true;
-    persist(ctx, &st);
-    store(ctx, st);
+pub fn set_todo_bar(app: &mut App, part: &str) {
+    app.run("view.todoBar", json!({ "part": part }));
 }
 
 /// Parts shown: (calendar, people, tasks).
-pub fn todo_bar_parts(ctx: &egui::Context) -> (bool, bool, bool) {
-    let st = load(ctx);
-    (st.calendar, st.people, st.tasks)
+pub fn todo_bar_parts(app: &App) -> (bool, bool, bool) {
+    let t = app.s.view.todo_bar;
+    (t.calendar, t.people, t.tasks)
 }
 
 /// True when any part is on.
-pub fn todo_bar_shown(ctx: &egui::Context) -> bool {
-    let st = load(ctx);
-    st.calendar || st.people || st.tasks
+pub fn todo_bar_shown(app: &App) -> bool {
+    app.s.view.todo_bar.shown()
 }
 
 /// Draws the To-Do Bar in `ui` (its whole rect).
 pub fn todo_bar(ui: &mut Ui, app: &mut App) {
     let ctx = ui.ctx().clone();
     let mut st = load(&ctx);
+    let parts = app.s.view.todo_bar;
     let rect = ui.max_rect();
     ui.painter().rect_filled(rect, CornerRadius::same(6), app.theme.pane);
     let inner = rect.shrink(8.0);
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).id_salt("mc-todo-bar"));
     ScrollArea::vertical().id_salt("mc-todo-bar-scroll").auto_shrink([false, false]).show(&mut child, |ui| {
-        if st.calendar {
+        if parts.calendar {
             calendar_part(ui, app, &mut st);
             ui.separator();
         }
-        if st.people {
+        if parts.people {
             people_part(ui, app, &mut st);
             ui.separator();
         }
-        if st.tasks {
+        if parts.tasks {
             tasks_part(ui, app, &mut st);
         }
     });
@@ -352,55 +314,72 @@ mod tests {
 
     #[test]
     fn parts_toggle_and_off() {
-        let ctx = egui::Context::default();
-        assert!(!todo_bar_shown(&ctx));
-        set_todo_bar(&ctx, "calendar");
-        set_todo_bar(&ctx, "tasks");
-        assert_eq!(todo_bar_parts(&ctx), (true, false, true));
-        set_todo_bar(&ctx, "calendar");
-        assert_eq!(todo_bar_parts(&ctx), (false, false, true));
-        set_todo_bar(&ctx, "junk");
-        assert!(todo_bar_shown(&ctx));
-        set_todo_bar(&ctx, "off");
-        assert!(!todo_bar_shown(&ctx));
+        let mut app = crate::App::new(mailcraft_engine::sample::sample_session());
+        assert!(!todo_bar_shown(&app));
+        set_todo_bar(&mut app, "calendar");
+        set_todo_bar(&mut app, "tasks");
+        assert_eq!(todo_bar_parts(&app), (true, false, true));
+        set_todo_bar(&mut app, "calendar");
+        assert_eq!(todo_bar_parts(&app), (false, false, true));
+        // A part that does not exist is refused and changes nothing.
+        set_todo_bar(&mut app, "junk");
+        assert!(todo_bar_shown(&app));
+        set_todo_bar(&mut app, "off");
+        assert!(!todo_bar_shown(&app));
     }
 
     #[test]
-    fn parts_are_saved_and_restored() {
+    fn parts_of_an_older_profile_are_taken_over() {
         let ctx = egui::Context::default();
-        set_todo_bar(&ctx, "people");
-        set_todo_bar(&ctx, "tasks");
-        let saved = crate::dialogs::ui_pref(&ctx, PREF_KEY).unwrap();
-        assert_eq!(saved, json!(["people", "tasks"]));
-        // A new run: the dialog settings come back from the profile, the To-Do Bar follows.
-        let next = egui::Context::default();
-        assert!(!todo_bar_shown(&next));
-        next.data_mut(|d| {
+        assert_eq!(saved_todo_bar(&ctx), None);
+        ctx.data_mut(|d| {
             let p = d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::new(crate::chrome::UI_PREFS_ID));
-            p.values.insert(PREF_KEY.to_owned(), saved.clone());
+            p.values.insert(PREF_KEY.to_owned(), json!(["people", "tasks"]));
         });
-        assert_eq!(todo_bar_parts(&next), (false, true, true));
-        // Once restored, toggling wins over the saved value and is saved in turn.
-        set_todo_bar(&next, "off");
-        assert!(!todo_bar_shown(&next));
-        assert_eq!(crate::dialogs::ui_pref(&next, PREF_KEY), Some(json!([])));
+        let t = saved_todo_bar(&ctx).unwrap();
+        assert_eq!((t.calendar, t.people, t.tasks), (false, true, true));
         // Junk in the saved value shows nothing rather than failing.
         let junk = egui::Context::default();
         junk.data_mut(|d| {
             let p = d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::new(crate::chrome::UI_PREFS_ID));
             p.values.insert(PREF_KEY.to_owned(), json!([1, null, "mail"]));
         });
-        assert!(!todo_bar_shown(&junk));
+        assert!(!saved_todo_bar(&junk).unwrap().shown());
     }
 
     #[test]
-    fn parts_reach_the_profile_settings() {
+    fn older_profile_parts_are_taken_over_once_and_off_stays_off() {
+        // Regression: the old key stayed in the saved dialog settings, so a bar turned off came back on at
+        // every start.
+        let mut s = mailcraft_engine::sample::sample_session();
+        s.set_option("state.uiPrefs", &json!({ "todoBar.parts": ["calendar"], "columns.7": ["from"] }))
+            .unwrap();
+        let mut app = crate::App::new(s);
         let ctx = egui::Context::default();
-        let mut app = crate::App::new(mailcraft_engine::sample::sample_session());
         crate::chrome::sync_ui_prefs(&ctx, &mut app);
-        set_todo_bar(&ctx, "calendar");
+        app.apply_todo_bar(&ctx);
+        assert_eq!(todo_bar_parts(&app), (true, false, false));
         crate::chrome::sync_ui_prefs(&ctx, &mut app);
         let saved = app.s.settings.get("state.uiPrefs").unwrap();
-        assert_eq!(saved[PREF_KEY], json!(["calendar"]));
+        assert!(saved.get(PREF_KEY).is_none(), "{saved}");
+        assert_eq!(saved["columns.7"], json!(["from"]), "other dialog settings stay");
+        set_todo_bar(&mut app, "off");
+        // A restart: a new window (fresh egui memory and UI state) on the same profile.
+        let mut app = crate::App::new(app.s);
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            crate::chrome::sync_ui_prefs(&ctx, &mut app);
+            app.apply_todo_bar(&ctx);
+        }
+        assert!(!todo_bar_shown(&app));
+    }
+
+    #[test]
+    fn scripts_change_the_bar_the_window_shows() {
+        // The control channel, MCP and the CLI run the same command: the window follows the session.
+        let mut app = crate::App::new(mailcraft_engine::sample::sample_session());
+        app.s.run("view.todoBar", &json!({"part": "people"})).unwrap();
+        assert_eq!(todo_bar_parts(&app), (false, true, false));
+        assert_eq!(app.s.run("view.todoBar", &json!({})).unwrap()["parts"]["people"], true);
     }
 }

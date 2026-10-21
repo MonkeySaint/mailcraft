@@ -141,12 +141,12 @@ group Manage Task | ZG
 button L | Mark Complete | flag-complete | tasks.markComplete | | C1
 button L | Remove from List | close | tasks.removeFromList | | RL
 group Follow Up | ZF | c1024=collapse
-button S | Today | flag | tasks.flag | {"kind":"today"} | T
-button S | Tomorrow | flag | tasks.flag | {"kind":"tomorrow"} | S
-button S | This Week | flag | tasks.flag | {"kind":"thisWeek"} | K
-button S | Next Week | flag | tasks.flag | {"kind":"nextWeek"} | W
-button S | No Date | flag | tasks.flag | {"kind":"noDate"} | N2
-button S | Custom... | flag | tasks.flag | {"kind":"custom"} | Q
+toggle S | Today | flag | tasks.flag | {"kind":"today"} | T | on=taskflag:today
+toggle S | Tomorrow | flag | tasks.flag | {"kind":"tomorrow"} | S | on=taskflag:tomorrow
+toggle S | This Week | flag | tasks.flag | {"kind":"thisWeek"} | K | on=taskflag:thisWeek
+toggle S | Next Week | flag | tasks.flag | {"kind":"nextWeek"} | W | on=taskflag:nextWeek
+toggle S | No Date | flag | tasks.flag | {"kind":"noDate"} | N2 | on=taskflag:noDate
+toggle S | Custom... | flag | tasks.flag | {"kind":"custom"} | Q | on=taskflag:custom
 group Current View | ZV | c900=collapse
 gallery L | Current View | view | | | CV | dyn=views:tasks menu=tasksChangeView w=220
 group Actions | ZA | c1024=collapse

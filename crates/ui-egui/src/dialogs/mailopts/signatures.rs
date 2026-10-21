@@ -93,6 +93,18 @@ impl EditorHost for SigEditor {
     }
 }
 
+impl crate::edit_message::EditorHostBar for SigEditor {
+    fn cid(&self) -> u64 {
+        self.cid
+    }
+    fn host(&self) -> &dyn EditorHost {
+        self
+    }
+    fn host_mut(&mut self) -> &mut dyn EditorHost {
+        self
+    }
+}
+
 #[derive(Clone)]
 struct SigState {
     tab: usize,
@@ -281,7 +293,7 @@ fn signature_tab(ui: &mut egui::Ui, app: &mut App, st: &mut SigState, uid: u64) 
         muted(ui, app, "Create a signature with New.");
         return;
     }
-    format_bar(ui, app, &mut ed);
+    ui.horizontal(|ui| crate::edit_message::format_bar(ui, app, &mut *ed));
     let cid = ed.cid;
     egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).show(ui, |ui| {
         egui::ScrollArea::vertical()
@@ -292,56 +304,6 @@ fn signature_tab(ui: &mut egui::Ui, app: &mut App, st: &mut SigState, uid: u64) 
                 body_editor_in(ui, &mut *ed, cid, 160.0);
             });
     });
-}
-
-/// Bold / Italic / Underline, alignment and bullets for the signature body.
-fn format_bar(ui: &mut egui::Ui, app: &mut App, ed: &mut SigEditor) {
-    let cid = ed.cid;
-    let (bold, italic, underline, align, bullets) = match ed.compose() {
-        Some(c) => (
-            c.selection_all(|s, h| s.bold == Some(true) || (h && s.bold != Some(false))),
-            c.selection_all(|s, _| s.italic == Some(true)),
-            c.selection_all(|s, _| s.underline == Some(true)),
-            c.para_at_caret().align,
-            matches!(c.list_at_caret(), Some((_, mailcraft_model::rich::ListKind::Bullet))),
-        ),
-        None => return,
-    };
-    use mailcraft_model::rich::Align;
-    let mut run: Option<(&str, Value)> = None;
-    ui.horizontal(|ui| {
-        let side = 26.0;
-        if crate::widgets::icon_toggle(ui, app, "bold", "Bold", bold, side).clicked() {
-            run = Some(("format.bold", json!({})));
-        }
-        if crate::widgets::icon_toggle(ui, app, "italic", "Italic", italic, side).clicked() {
-            run = Some(("format.italic", json!({})));
-        }
-        if crate::widgets::icon_toggle(ui, app, "underline", "Underline", underline, side).clicked() {
-            run = Some(("format.underline", json!({})));
-        }
-        ui.separator();
-        for (icon, label, kind, on) in [
-            ("align-left", "Align Left", "left", align == Align::Start),
-            ("align-center", "Center", "center", align == Align::Center),
-            ("align-right", "Align Right", "right", align == Align::End),
-        ] {
-            if crate::widgets::icon_toggle(ui, app, icon, label, on, side).clicked() {
-                run = Some(("format.align", json!({"kind": kind})));
-            }
-        }
-        ui.separator();
-        if crate::widgets::icon_toggle(ui, app, "bullets", "Bullets", bullets, side).clicked() {
-            run = Some(("format.bullets", json!({})));
-        }
-    });
-    if let Some((id, mut params)) = run {
-        if let Some(o) = params.as_object_mut() {
-            o.insert("compose".into(), json!(cid));
-        }
-        EditorHost::run(ed, id, params);
-        ui.ctx().memory_mut(|m| m.request_focus(crate::compose::editor_id(cid)));
-    }
 }
 
 /// The New / Rename name box.

@@ -27,6 +27,7 @@ mod session;
 pub mod settings;
 pub mod smime;
 pub mod sync;
+pub mod translate;
 pub mod troubleshoot;
 pub mod undo;
 
@@ -34,7 +35,9 @@ use serde_json::Value;
 
 pub use accounts::{FileSecretStore, MemorySecretStore, SecretStore};
 pub use mailcraft_model as model;
-pub use session::{DEFAULT_QUICK_ACCESS, Module, Notice, SearchScope, Selection, Session, ViewState};
+pub use session::{
+    DEFAULT_QUICK_ACCESS, Module, Notice, SearchScope, Selection, Session, TodoBar, ViewState,
+};
 pub use sync::{Connection, Plan, SyncStatus, TestReport};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]

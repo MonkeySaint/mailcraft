@@ -166,8 +166,10 @@ pub mod pim {
         mb.notes.remove(&id);
     }
 
+    /// Categories of a PIM item, or of a message (the To-Do List shows flagged messages beside tasks).
     pub fn categories(mb: &Mailbox, id: ItemId) -> Option<&Vec<String>> {
-        match kind_of(mb, id)? {
+        let Some(kind) = kind_of(mb, id) else { return mb.mail.get(&id).map(|m| &m.categories) };
+        match kind {
             Kind::Appointment => mb.appointments.get(&id).map(|a| &a.categories),
             Kind::Contact => mb.contacts.get(&id).map(|c| &c.categories),
             Kind::Task => mb.tasks.get(&id).map(|t| &t.categories),
@@ -176,7 +178,8 @@ pub mod pim {
     }
 
     pub fn categories_mut(mb: &mut Mailbox, id: ItemId) -> Option<&mut Vec<String>> {
-        match kind_of(mb, id)? {
+        let Some(kind) = kind_of(mb, id) else { return mb.mail.get_mut(&id).map(|m| &mut m.categories) };
+        match kind {
             Kind::Appointment => mb.appointments.get_mut(&id).map(|a| &mut a.categories),
             Kind::Contact => mb.contacts.get_mut(&id).map(|c| &mut c.categories),
             Kind::Task => mb.tasks.get_mut(&id).map(|t| &mut t.categories),
@@ -387,6 +390,12 @@ pub mod pim {
     /// Without `on`, toggles: removes the category when every target has it, else adds it to all.
     pub fn run_categorize(s: &mut Session, p: &Value, kind: Kind) -> CmdResult {
         let ids = require_targets(s, p, kind)?;
+        categorize_ids(s, p, &ids)
+    }
+
+    /// [`run_categorize`] on the items `ids` (PIM items and messages).
+    pub fn categorize_ids(s: &mut Session, p: &Value, ids: &[ItemId]) -> CmdResult {
+        let ids = ids.to_vec();
         if opt_bool(p, "clear") == Some(true) {
             for id in &ids {
                 if let Some(c) = categories_mut(&mut s.mailbox, *id) {

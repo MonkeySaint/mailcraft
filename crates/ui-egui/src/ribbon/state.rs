@@ -119,6 +119,16 @@ fn pim_on(app: &App, surface: Surface, arg: &str) -> bool {
             _ => false,
         };
     }
+    // A flagged message row of the To-Do List.
+    if let Some(m) = mb.mail.get(&id) {
+        return match arg {
+            "private" => m.sensitivity == mailcraft_model::Sensitivity::Private,
+            "high" => m.importance == Importance::High,
+            "low" => m.importance == Importance::Low,
+            "flagged" => matches!(m.flag, mailcraft_model::FlagState::Flagged { .. }),
+            _ => false,
+        };
+    }
     false
 }
 
@@ -185,6 +195,10 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
             None => current_view(app).preview_lines == n,
         }),
         "pim" => pim_on(app, surface, arg),
+        // Tasks Home › Follow Up: the entry the selected To-Do List row's dates came from.
+        "taskflag" => module_item(app, surface)
+            .and_then(|id| mailcraft_engine::cmd::tasks::follow_up_state(&app.s, id))
+            .is_some_and(|k| k == arg),
         // The arrangement of a contacts or tasks folder (the module's Arrange By menu).
         "marr" => module_here(app).is_some_and(|(k, st)| st.arrangement(k) == Some(arg)),
         "layout" => matches!(
@@ -204,7 +218,7 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
         "scope" => scope_name(v.search_scope) == arg,
         "searchDeleted" => app.s.search.include_deleted,
         "todo" => {
-            let (cal, people, tasks) = app.ui.todo_bar_parts;
+            let (cal, people, tasks) = crate::modules::todo_bar_parts(app);
             match arg {
                 "calendar" => cal,
                 "people" => people,
@@ -1241,6 +1255,9 @@ pub fn with_context(app: &App, surface: Surface, cmd: &str, params: Value) -> Va
     Value::Object(obj)
 }
 
+/// Commands a read window shows greyed out.
+const READ_GREYED: [&str; 1] = ["format.selectObjects"];
+
 /// Why a command is disabled on this surface (`None` = enabled).
 pub fn disabled(app: &App, surface: Surface, cmd: &str) -> Option<&'static str> {
     if cmd.is_empty() {
@@ -1249,12 +1266,19 @@ pub fn disabled(app: &App, surface: Surface, cmd: &str) -> Option<&'static str> 
     let Some(spec) = app.s.registry.get(cmd) else {
         return Some("not available");
     };
-    // In a read window the command targets the window's item, not the main selection.
+    // Shown but greyed out in read windows (as observed): a received message has no object-selection mode.
+    if matches!(surface, Surface::Read(_)) && READ_GREYED.contains(&cmd) {
+        return Some("not available in a received message");
+    }
+    // In a read window the command targets the window's item, not the main selection: its enabled check
+    // runs for that item.
     if let Surface::Read(item) = surface
-        && (spec.params.contains("\"ids\"") || spec.params.contains("\"id\""))
+        && (spec.params.contains("\"ids\"")
+            || (spec.params.contains("\"id\"") && cmd.split('.').next() == Some("review")))
     {
-        return if app.s.mailbox.mail.contains_key(&mailcraft_model::ItemId(item)) {
-            None
+        let item = mailcraft_model::ItemId(item);
+        return if app.s.mailbox.mail.contains_key(&item) {
+            app.s.enabled_for(cmd, &[item])
         } else {
             Some("the message is no longer available")
         };
@@ -1274,18 +1298,19 @@ pub fn run(ctx: &egui::Context, app: &mut App, surface: Surface, mem: &mut Mem, 
     if act.cmd.is_empty() {
         return;
     }
-    // Read-window commands without an ids/id parameter act on the main selection, and the engine checks
-    // enablement against the main selection even when ids are given: select the window's item first.
+    // Read-window commands with an ids/id parameter get the window's item (`with_context`), and the engine
+    // checks them against that item. A Mail command without one acts on the main selection: select the
+    // window's item first.
     if let Surface::Read(item) = surface {
+        let review = act.cmd.starts_with("review.");
         let takes_ids = app
             .s
             .registry
             .get(&act.cmd)
-            .is_some_and(|s| s.params.contains("\"ids\"") || s.params.contains("\"id\""));
+            .is_some_and(|s| s.params.contains("\"ids\"") || (review && s.params.contains("\"id\"")));
         let selected = app.s.selection.items.iter().any(|i| i.0 == item);
-        let blocked = app.s.enabled(&act.cmd).is_some();
         let exists = app.s.mailbox.mail.contains_key(&mailcraft_model::ItemId(item));
-        if (!takes_ids || blocked) && !selected && exists && act.cmd.starts_with("mail.") {
+        if !takes_ids && !selected && exists && act.cmd.starts_with("mail.") {
             let _ = app.run("nav.selectItem", json!({"id": item}));
         }
     }

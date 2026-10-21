@@ -93,6 +93,31 @@ pub(crate) struct FlagForm {
     pub reminder_on: bool,
     pub reminder_date: String,
     pub reminder_min: i64,
+    /// The dates the dialog opened with: OK on Tasks sends only the fields changed from these, so rows of a
+    /// multiple selection (which opens blank) keep their own dates.
+    pub initial: FlagDates,
+}
+
+/// The date fields of the Custom follow-up dialog.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FlagDates {
+    pub start: String,
+    pub due: String,
+    pub reminder_on: bool,
+    pub reminder_date: String,
+    pub reminder_min: i64,
+}
+
+impl FlagForm {
+    fn dates(&self) -> FlagDates {
+        FlagDates {
+            start: self.start.trim().to_owned(),
+            due: self.due.trim().to_owned(),
+            reminder_on: self.reminder_on,
+            reminder_date: self.reminder_date.trim().to_owned(),
+            reminder_min: self.reminder_min,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -207,16 +232,25 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
             copy: p.get("copy").and_then(Value::as_bool).unwrap_or(false),
             folder: None,
         },
-        "pimFlag" => Kind::Flag(FlagForm {
-            ids: ids_of(p),
-            area: str_of(p, "area"),
-            reminder_only: p.get("reminder").and_then(Value::as_bool).unwrap_or(false),
-            label: "Follow up".into(),
-            reminder_on: p.get("reminder").and_then(Value::as_bool).unwrap_or(false),
-            reminder_date: day_string(today(app)),
-            reminder_min: 16 * 60,
-            ..Default::default()
-        }),
+        "pimFlag" => {
+            // The current dates of the item (Tasks sends them), so None can clear one.
+            let at = super::super::common::parse_day_time(&str_of(p, "reminderAt"));
+            let (at_day, at_min) = (at.map(|(d, _)| day_string(d)), at.map(|(_, m)| m));
+            let mut f = FlagForm {
+                ids: ids_of(p),
+                area: str_of(p, "area"),
+                reminder_only: p.get("reminder").and_then(Value::as_bool).unwrap_or(false),
+                label: "Follow up".into(),
+                start: str_of(p, "start"),
+                due: str_of(p, "due"),
+                reminder_on: p.get("reminder").and_then(Value::as_bool).unwrap_or(false) || at_day.is_some(),
+                reminder_date: at_day.unwrap_or_else(|| day_string(today(app))),
+                reminder_min: at_min.unwrap_or(16 * 60),
+                initial: FlagDates::default(),
+            };
+            f.initial = f.dates();
+            Kind::Flag(f)
+        }
         "moduleViewSettings" => {
             let mut f = ViewForm {
                 module: str_of(p, "module"),
@@ -1084,13 +1118,29 @@ fn request_ui(ui: &mut Ui, app: &App, f: &mut RequestForm, nonce: u64) -> Btn {
     ok_cancel(ui, "Send", !f.to.trim().is_empty() && !f.subject.trim().is_empty())
 }
 
+/// Said after Move / Copy to Folder when `n` selected rows could not go into the folder chosen.
+fn skipped_note(n: usize, copy: bool) -> String {
+    let (what, pronoun) = if n == 1 { ("1 item".to_owned(), "it") } else { (format!("{n} items"), "they") };
+    let verb = if copy { "copied" } else { "moved" };
+    format!(
+        "{what} could not be {verb} to that folder (a tasks folder holds only tasks) and stayed where {pronoun} {}.",
+        if n == 1 { "was" } else { "were" }
+    )
+}
+
 /// OK / Send: runs the dialog's command. `Ok(true)` closes the dialog.
 fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
     match kind {
         Kind::Move { ids, area, copy, folder } => {
             let Some(folder) = folder else { return Ok(false) };
             let id = format!("{area}.{}", if *copy { "copy" } else { "move" });
-            run_checked(app, &id, json!({ "folder": folder, "ids": ids }))?;
+            let r = run_checked(app, &id, json!({ "folder": folder, "ids": ids }))?;
+            // Rows the folder cannot hold (flagged messages and contacts of the To-Do List) stay where they
+            // are: say so rather than leave them behind silently.
+            let skipped = r.get("skipped").and_then(Value::as_array).map_or(0, Vec::len);
+            if skipped > 0 {
+                app.ui.toast = Some((skipped_note(skipped, *copy), 0.0));
+            }
             Ok(true)
         }
         Kind::Flag(f) => {
@@ -1113,21 +1163,36 @@ fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
             if f.reminder_only && reminder.is_null() {
                 return Err("Choose when to be reminded.".into());
             }
-            if f.area == "tasks" && start.is_null() && due.is_null() && reminder.is_null() {
-                return Err("Enter a start date, a due date or a reminder.".into());
-            }
             let mut p = json!({ "ids": f.ids, "kind": if f.reminder_only { "reminder" } else { "custom" } });
+            // Tasks: only what was changed is sent (a field left out stays as each row has it; a field cleared
+            // is sent as null and clears it). Several rows open blank, so OK unchanged changes nothing.
+            let (now, was) = (f.dates(), &f.initial);
+            let tasks = f.area == "tasks";
+            let reminder_changed = now.reminder_on != was.reminder_on
+                || (now.reminder_on
+                    && (now.reminder_date != was.reminder_date || now.reminder_min != was.reminder_min));
             if let Some(o) = p.as_object_mut() {
                 if !f.reminder_only {
-                    o.insert("start".into(), start);
-                    o.insert("due".into(), due);
+                    if !tasks || now.start != was.start {
+                        o.insert("start".into(), start);
+                    }
+                    if !tasks || now.due != was.due {
+                        o.insert("due".into(), due);
+                    }
                     if f.area == "people" {
                         let label = if f.label.trim().is_empty() { "Follow up" } else { f.label.trim() };
                         o.insert("label".into(), json!(label));
                     }
                 }
-                if !reminder.is_null() {
+                // Unchecked: no reminder (a reminder the item had is removed).
+                if (!tasks && !reminder.is_null()) || (tasks && reminder_changed) {
                     o.insert("reminder".into(), reminder);
+                }
+                if tasks
+                    && !f.reminder_only
+                    && !["start", "due", "reminder"].iter().any(|k| o.contains_key(*k))
+                {
+                    return Ok(true);
                 }
             }
             run_checked(app, &format!("{}.flag", f.area), p)?;
@@ -1296,6 +1361,107 @@ mod tests {
         let mut k = Kind::Move { ids: vec![id.0], area: "tasks".into(), copy: false, folder: Some(sub.0) };
         assert_eq!(apply(&mut app, &mut k), Ok(true));
         assert_eq!(app.s.mailbox.tasks[&id].folder, sub);
+        assert!(app.ui.toast.is_none(), "nothing was left behind");
+    }
+
+    #[test]
+    fn move_of_a_mixed_selection_says_which_rows_stayed() {
+        let mut app = app();
+        let tasks =
+            app.s.mailbox.folders.values().find(|f| f.kind == FolderKind::Tasks).map(|f| f.id).unwrap();
+        let sub = app.s.mailbox.create_folder(tasks, "Errands").unwrap();
+        let t = app.s.mailbox.tasks.keys().next().copied().unwrap();
+        let m = app.s.mailbox.mail.keys().next().copied().unwrap();
+        if let Some(mail) = app.s.mailbox.mail.get_mut(&m) {
+            mail.flag = mailcraft_model::FlagState::Flagged {
+                label: "Follow up".into(),
+                start: None,
+                due: None,
+                reminder: None,
+            };
+        }
+        let folder_before = app.s.mailbox.mail[&m].folder;
+        let mut k =
+            Kind::Move { ids: vec![t.0, m.0], area: "tasks".into(), copy: false, folder: Some(sub.0) };
+        assert_eq!(apply(&mut app, &mut k), Ok(true));
+        assert_eq!(app.s.mailbox.tasks[&t].folder, sub);
+        assert_eq!(app.s.mailbox.mail[&m].folder, folder_before);
+        let toast = app.ui.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+        assert!(toast.starts_with("1 item could not be moved"), "{toast}");
+    }
+
+    /// Two tasks with their own dates (one with a reminder), as rows of the To-Do List.
+    fn two_dated_tasks(app: &mut App) -> (u64, u64) {
+        let mut new = |p: Value| app.s.run("tasks.new", &p).unwrap()["id"].as_u64().unwrap();
+        let a = new(
+            json!({"subject": "A", "start": "2026-10-05", "due": "2026-10-06", "reminder": "2026-10-06T09:00"}),
+        );
+        let b = new(json!({"subject": "B", "start": "2026-11-02", "due": "2026-11-09"}));
+        (a, b)
+    }
+
+    fn custom_dialog(app: &mut App, ids: &[u64]) -> ModState {
+        app.s.run("tasks.flag", &json!({"ids": ids, "kind": "custom"})).unwrap();
+        let Some(mailcraft_engine::Notice::OpenDialog(name, p)) = app.s.notices.last().cloned() else {
+            panic!("no dialog")
+        };
+        let mut st = ModState::default();
+        open(app, &mut st, &name, &p);
+        st
+    }
+
+    fn dates(app: &App, id: u64) -> (Option<i64>, Option<i64>, Option<i64>) {
+        let t = &app.s.mailbox.tasks[&mailcraft_model::ItemId(id)];
+        (t.start.map(|d| d.unix), t.due.map(|d| d.unix), t.reminder.map(|d| d.unix))
+    }
+
+    #[test]
+    fn custom_follow_up_on_several_rows_keeps_each_rows_dates() {
+        // Regression: the dialog opened with the first row's dates and OK sent them (and a cleared reminder)
+        // to every selected row.
+        let mut app = app();
+        let (a, b) = two_dated_tasks(&mut app);
+        let before = (dates(&app, a), dates(&app, b));
+        let mut st = custom_dialog(&mut app, &[a, b]);
+        let d = st.dialogs.open.first_mut().unwrap();
+        let Kind::Flag(f) = &d.kind else { panic!("not the flag dialog") };
+        assert!(f.start.is_empty() && f.due.is_empty() && !f.reminder_on, "several rows open blank");
+        assert_eq!(apply(&mut app, &mut d.kind), Ok(true));
+        assert_eq!((dates(&app, a), dates(&app, b)), before, "OK unchanged changes nothing");
+        // A due date typed in goes to both; their start dates and reminders stay.
+        let mut st = custom_dialog(&mut app, &[a, b]);
+        let d = st.dialogs.open.first_mut().unwrap();
+        if let Kind::Flag(f) = &mut d.kind {
+            f.due = "2026-12-01".into();
+        }
+        assert_eq!(apply(&mut app, &mut d.kind), Ok(true));
+        let (na, nb) = (dates(&app, a), dates(&app, b));
+        assert_eq!(na.1, nb.1);
+        assert_ne!(na.1, before.0.1);
+        assert_eq!((na.0, na.2), (before.0.0, before.0.2));
+        assert_eq!((nb.0, nb.2), (before.1.0, before.1.2));
+    }
+
+    #[test]
+    fn custom_follow_up_on_one_row_starts_from_its_dates_and_can_clear_them() {
+        let mut app = app();
+        let (a, _) = two_dated_tasks(&mut app);
+        let before = dates(&app, a);
+        let mut st = custom_dialog(&mut app, &[a]);
+        let d = st.dialogs.open.first_mut().unwrap();
+        let Kind::Flag(f) = &mut d.kind else { panic!("not the flag dialog") };
+        assert_eq!((f.start.as_str(), f.due.as_str(), f.reminder_on), ("2026-10-05", "2026-10-06", true));
+        assert_eq!(apply(&mut app, &mut d.kind), Ok(true));
+        assert_eq!(dates(&app, a), before);
+        // None and an unchecked reminder clear them.
+        let mut st = custom_dialog(&mut app, &[a]);
+        let d = st.dialogs.open.first_mut().unwrap();
+        if let Kind::Flag(f) = &mut d.kind {
+            f.start.clear();
+            f.reminder_on = false;
+        }
+        assert_eq!(apply(&mut app, &mut d.kind), Ok(true));
+        assert_eq!(dates(&app, a), (None, before.1, None));
     }
 
     #[test]

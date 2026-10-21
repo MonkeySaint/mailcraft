@@ -88,7 +88,9 @@ item | Translation Preferences... | settings | options.open | {"page":"language"
 menu readActions
 item | Edit Message | draft | mail.editMessage | | E
 item | Resend This Message... | send | mail.resend | | S
-sep
+sub | Other Actions | more | readOtherActions | | O
+
+menu readOtherActions
 item | View Source | info | mail.viewSource | | V
 
 menu readRelated
@@ -97,7 +99,9 @@ item | Messages from Sender | person | mail.findRelated | {"kind":"sender"} | S
 
 menu readSelect
 item | Select All | check | format.selectAll | | A
+item | Select Objects | | format.selectObjects | | O
 item | Select All Text With Similar Formatting | | format.selectSimilar | | S
+item | Selection Pane... | | format.selectionPane | | P
 
 menu moreRead
 sub | Junk | junk | readJunk | | J

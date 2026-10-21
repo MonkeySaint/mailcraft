@@ -2884,9 +2884,43 @@ pub fn pane_objects(c: &ComposeState) -> Vec<BodyObject> {
     out
 }
 
+/// The objects (pictures) of a document, as the selection pane lists them.
+pub fn doc_objects(doc: &Doc) -> Vec<BodyObject> {
+    let c = ComposeState { body: doc.clone(), ..ComposeState::default() };
+    body_objects(&c)
+}
+
 /// Selection pane: toggles (or `show`s) the pane; `list` only reports the objects; `select: n` selects
-/// object n (its picture, for copy, cut, delete or formatting).
+/// object n (its picture, for copy, cut, delete or formatting). On a received message (`ids`, a read
+/// window): lists the objects of its body in the message's Selection pane (`messageSelectionPane`), and
+/// `select: n` selects object n in the message view (for copying).
 fn selection_pane(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(id) = message_target(s, p)? {
+        let objects = s
+            .mailbox
+            .mail
+            .get(&mailcraft_model::ItemId(id))
+            .map(|m| doc_objects(&crate::cmd::mail::body_doc(m)))
+            .unwrap_or_default();
+        let names: Vec<&str> = objects.iter().map(|o| o.name.as_str()).collect();
+        if let Some(n) = opt_u64(p, "select") {
+            if usize::try_from(n).ok().and_then(|i| objects.get(i)).is_none() {
+                return Err(CmdError::Params(format!("no object {n}")));
+            }
+            s.notify(crate::Notice::OpenDialog(
+                "messageSelect".into(),
+                json!({"id": id, "what": "object", "index": n}),
+            ));
+            return Ok(json!({"item": id, "selected": n, "objects": names}));
+        }
+        if opt_bool(p, "list") != Some(true) {
+            s.notify(crate::Notice::OpenDialog(
+                "messageSelectionPane".into(),
+                json!({"id": id, "objects": names}),
+            ));
+        }
+        return Ok(json!({"item": id, "objects": names}));
+    }
     let c = compose_mut(s, p)?;
     let objects = pane_objects(c);
     if let Some(n) = opt_u64(p, "select") {
@@ -3297,9 +3331,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Selection Pane",
             "Format Text › Editing › Select",
             "",
-            r#"{"show"?:bool,"list"?:bool,"select"?:number}"#,
+            r#"{"show"?:bool,"list"?:bool,"select"?:number,"ids"?:[number]}  (ids: the received message's body)"#,
             false,
-            has_compose,
+            compose_or_message,
             selection_pane,
         ),
         spec(

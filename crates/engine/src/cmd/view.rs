@@ -342,7 +342,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "To-Do Bar",
             "View › Layout",
             "",
-            r#"{"part":"calendar"|"people"|"tasks"|"off"}"#,
+            r#"{"part"?:"calendar"|"people"|"tasks"|"off"} (no part = report the parts shown)"#,
             false,
             always,
             todo_bar,
@@ -642,6 +642,11 @@ fn view_customized(s: &Session) -> Option<&'static str> {
         return Some(why);
     }
     let f = s.selection.folder;
+    // Tasks folders offer Reset View on their views as they come (as observed); it then just puts the
+    // view's own settings back.
+    if modules::module_kind(s, f) == Some(modules::ModuleKind::Tasks) {
+        return None;
+    }
     // Conversation expansion is not a view customisation; collapsed groups and Conversation Settings are.
     let custom = s.mailbox.views.get(&f).is_some_and(|v| *v != ViewSettings::default())
         || modules::customized(s, f)
@@ -1346,17 +1351,39 @@ fn favorites(s: &mut Session, _p: &Value) -> CmdResult {
     Ok(json!({ "on": s.view.favorites_visible }))
 }
 
-/// To-Do Bar parts are drawn by the UI; the session keeps no To-Do Bar state yet, so the command validates
-/// and reports the requested part.
+/// The To-Do Bar's parts as JSON.
+pub fn todo_bar_json(t: crate::TodoBar) -> Value {
+    json!({ "calendar": t.calendar, "people": t.people, "tasks": t.tasks })
+}
+
+/// View › To-Do Bar: `part` (calendar, people, tasks) shows or hides that part, `off` hides the bar; the
+/// session keeps the parts ([`crate::ViewState::todo_bar`], saved with the profile), so every front end and
+/// script sees the same bar. Without `part` it reports the parts.
 fn todo_bar(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(part) = opt_str(p, "part") else {
+        return Ok(json!({ "parts": todo_bar_json(s.view.todo_bar) }));
+    };
+    if !["calendar", "people", "tasks", "off"].contains(&part) {
+        let shown: String = part.chars().take(40).collect();
+        return Err(CmdError::Params(format!("`part` must be calendar, people, tasks or off, not {shown}")));
+    }
+    // In the Calendar the calendar's view command applies it (with the calendar's view state).
     if let Some(r) = calendar_first(s, "view.todoBar", p) {
         return r;
     }
-    let part = req_str(p, "part")?;
-    if !["calendar", "people", "tasks", "off"].contains(&part) {
-        return Err(CmdError::Params(format!("`part` must be calendar, people, tasks or off, not {part}")));
+    toggle_todo_bar(s, part);
+    Ok(json!({ "todoBar": part, "parts": todo_bar_json(s.view.todo_bar) }))
+}
+
+/// Applies To-Do Bar `part` (a validated part name) to the session's view state.
+pub(crate) fn toggle_todo_bar(s: &mut Session, part: &str) {
+    let t = &mut s.view.todo_bar;
+    match part {
+        "calendar" => t.calendar = !t.calendar,
+        "people" => t.people = !t.people,
+        "tasks" => t.tasks = !t.tasks,
+        _ => *t = crate::TodoBar::default(),
     }
-    Ok(json!({ "todoBar": part }))
 }
 
 fn reading_view(s: &mut Session, _p: &Value) -> CmdResult {
@@ -1623,6 +1650,20 @@ mod tests {
         let mut s = session();
         assert_eq!(run(&mut s, "view.todoBar", json!({"part": "tasks"}))["todoBar"], "tasks");
         assert!(s.run("view.todoBar", &json!({"part": "mail"})).is_err());
+        // The session keeps the parts: scripts can read and change the bar.
+        run(&mut s, "view.todoBar", json!({"part": "calendar"}));
+        assert_eq!(
+            run(&mut s, "view.todoBar", json!({}))["parts"],
+            json!({"calendar": true, "people": false, "tasks": true})
+        );
+        run(&mut s, "view.todoBar", json!({"part": "tasks"}));
+        assert_eq!(s.view.todo_bar, crate::TodoBar { calendar: true, people: false, tasks: false });
+        run(&mut s, "view.todoBar", json!({"part": "off"}));
+        assert!(!s.view.todo_bar.shown());
+        // It is part of the saved view state.
+        s.view.todo_bar.people = true;
+        let v: crate::ViewState = serde_json::from_value(serde_json::to_value(&s.view).unwrap()).unwrap();
+        assert!(v.todo_bar.people);
         assert_eq!(
             run(&mut s, "view.statusBar", json!({"item": "zoomSlider", "show": false}))["show"],
             false

@@ -412,11 +412,11 @@ fn todo_bar_parts_render_and_add_tasks() {
     let mut h = Harness::builder()
         .with_size(vec2(300.0, 900.0))
         .build_ui_state(|ui: &mut egui::Ui, app: &mut App| super::todo_bar(ui, app), a);
-    super::set_todo_bar(&h.ctx, "calendar");
-    super::set_todo_bar(&h.ctx, "people");
-    super::set_todo_bar(&h.ctx, "tasks");
+    super::set_todo_bar(h.state_mut(), "calendar");
+    super::set_todo_bar(h.state_mut(), "people");
+    super::set_todo_bar(h.state_mut(), "tasks");
     h.run_ok();
-    assert!(super::todo_bar_shown(&h.ctx));
+    assert!(super::todo_bar_shown(h.state()));
     assert!(has(&h, "October 2026"));
     assert!(has_part(&h, "Website refresh kickoff"));
     assert!(has(&h, "Search people"));
@@ -826,10 +826,10 @@ fn todo_bar_shows_in_every_module() {
         let a = app();
         let mut h = harness(v, a, (1600.0, 900.0));
         assert!(!has(&h, "Search people"));
-        super::set_todo_bar(&h.ctx, "people");
+        super::set_todo_bar(h.state_mut(), "people");
         h.run_ok();
         assert!(has(&h, "Search people"), "the To-Do Bar shows next to the module");
-        super::set_todo_bar(&h.ctx, "off");
+        super::set_todo_bar(h.state_mut(), "off");
         h.run_ok();
     }
 }

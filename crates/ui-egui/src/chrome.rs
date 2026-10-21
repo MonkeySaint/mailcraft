@@ -1444,7 +1444,7 @@ fn content_area(ui: &mut Ui, app: &mut App, frame: &Frame) {
         Module::Mail | Module::Folders | Module::Shortcuts => {
             // To-Do Bar (View › Layout › To-Do Bar) on the right of the mail panes, when there is room.
             let bar_w = crate::modules::TODO_BAR_WIDTH;
-            if crate::modules::todo_bar_shown(ui.ctx()) && inner.width() >= bar_w + size::TODO_BAR_MIN_MAIL {
+            if crate::modules::todo_bar_shown(app) && inner.width() >= bar_w + size::TODO_BAR_MIN_MAIL {
                 let split_x = inner.right() - bar_w;
                 let mail = Rect::from_min_max(inner.min, pos2(split_x - gap, inner.bottom()));
                 let bar = Rect::from_min_max(pos2(split_x, inner.top()), inner.max);

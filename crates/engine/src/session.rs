@@ -79,6 +79,24 @@ pub struct ViewState {
     pub auto_send_receive_minutes: u32,
     /// Options › Advanced › "Send immediately when connected".
     pub send_immediately: bool,
+    /// View › Layout › To-Do Bar: the parts shown (`view.todoBar`).
+    pub todo_bar: TodoBar,
+}
+
+/// The parts of the To-Do Bar shown at the right of the main window (none = the bar is off).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TodoBar {
+    pub calendar: bool,
+    pub people: bool,
+    pub tasks: bool,
+}
+
+impl TodoBar {
+    /// Whether any part shows.
+    pub fn shown(self) -> bool {
+        self.calendar || self.people || self.tasks
+    }
 }
 
 /// Default Quick Access Toolbar: Send/Receive All Folders, Undo (`plan/reference/layout.md`).
@@ -119,6 +137,7 @@ impl Default for ViewState {
             work_offline: false,
             auto_send_receive_minutes: crate::sync::DEFAULT_AUTO_MINUTES,
             send_immediately: true,
+            todo_bar: TodoBar::default(),
         }
     }
 }
@@ -200,6 +219,11 @@ pub struct Session {
     /// Quick Print may go straight to the system's default printer. The desktop app turns it on; tests and
     /// tools leave it off, so nothing reaches a real printer by accident.
     pub direct_print: bool,
+    /// The machine translator an embedding app installed (opt-in: none by default, so no text leaves the
+    /// computer), see [`crate::translate`].
+    pub translator: Option<std::sync::Arc<dyn crate::translate::Translator>>,
+    /// Translations of received messages shown in place of their bodies (`review.translate`).
+    pub translations: BTreeMap<ItemId, crate::translate::Translation>,
     /// Profile folder holding `settings.json` (`None` = in-memory session: nothing is saved).
     settings_dir: Option<std::path::PathBuf>,
     /// Bytes last read from or written to `settings.json` (identical states are not rewritten).
@@ -207,6 +231,19 @@ pub struct Session {
     /// The command whose enabled check is running names its items in its params (`id` / `ids`), see
     /// [`Session::params_name_items`].
     params_name_items: bool,
+    /// While an enabled check runs for items other than the selection (the items a command's params name, or
+    /// a read window's message, [`Session::enabled_for`]): those items. [`Session::target_ids`] answers
+    /// with them, so "is something selected?" checks look at the items the command will act on.
+    check_scope: std::sync::Mutex<Option<Vec<ItemId>>>,
+}
+
+/// Clears [`Session::check_scope`] when dropped (also when an enabled check panics).
+struct ScopeGuard<'a>(&'a std::sync::Mutex<Option<Vec<ItemId>>>);
+
+impl Drop for ScopeGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 /// Longest wait for "Perform an automatic send/receive when exiting" (seconds).
@@ -255,9 +292,12 @@ impl Session {
             closed_data_files: Vec::new(),
             undo_barrier: false,
             direct_print: false,
+            translator: None,
+            translations: BTreeMap::new(),
             settings_dir: None,
             settings_saved: None,
             params_name_items: false,
+            check_scope: std::sync::Mutex::new(None),
         };
         s.refresh_me();
         s.select_default_folder();
@@ -693,7 +733,11 @@ impl Session {
             return Err(CmdError::Unknown(id.to_owned()));
         };
         let named = std::mem::replace(&mut self.params_name_items, names_items(params));
-        let enabled = catch_unwind(AssertUnwindSafe(|| (spec.enabled)(self)));
+        let scope = self.named_items(params);
+        let enabled = catch_unwind(AssertUnwindSafe(|| match scope {
+            Some(items) => self.enabled_for(id, &items),
+            None => (spec.enabled)(self),
+        }));
         self.params_name_items = named;
         match enabled {
             Ok(None) => {}
@@ -899,11 +943,16 @@ impl Session {
         }
         let mail = &self.mailbox.mail;
         self.clipboard.retain(|id| mail.contains_key(id));
+        // Translations of messages that are gone (deleted, or replaced by a sync) are dropped.
+        self.translations.retain(|id, _| mail.contains_key(id));
     }
 
     /// Item ids a command should act on: `params.ids` when present, else the selection (else the focus).
     pub fn target_ids(&self, params: &Value) -> Vec<ItemId> {
         if let Some(ids) = crate::cmd::util::opt_ids(params) {
+            return ids;
+        }
+        if let Some(ids) = self.check_scope() {
             return ids;
         }
         if !self.selection.items.is_empty() {
@@ -957,6 +1006,39 @@ impl Session {
             Some(spec) => (spec.enabled)(self),
             None => Some("unknown command"),
         }
+    }
+
+    /// Whether command `id` is enabled for `items` instead of the selection (a read window asks for its
+    /// own message): while the check runs, [`Session::target_ids`] and the "focused item" checks see
+    /// `items`. Nothing of the session changes.
+    pub fn enabled_for(&self, id: &str, items: &[ItemId]) -> Option<&'static str> {
+        let Some(spec) = self.registry.get(id) else { return Some("unknown command") };
+        *self.check_scope.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(items.to_vec());
+        let _guard = ScopeGuard(&self.check_scope);
+        (spec.enabled)(self)
+    }
+
+    /// The items an enabled check is scoped to ([`Session::enabled_for`]), if one is running.
+    pub fn check_scope(&self) -> Option<Vec<ItemId>> {
+        self.check_scope.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// The items command params name (`ids`, else `id`) when every one of them is an item of the mailbox
+    /// (a message, contact, appointment, task or note); `None` otherwise (ids of other things, or none).
+    fn named_items(&self, params: &Value) -> Option<Vec<ItemId>> {
+        let ids = match crate::cmd::util::opt_ids(params) {
+            Some(ids) => ids,
+            None => vec![ItemId(params.get("id").and_then(Value::as_u64)?)],
+        };
+        let mb = &self.mailbox;
+        let exists = |id: &ItemId| {
+            mb.mail.contains_key(id)
+                || mb.contacts.contains_key(id)
+                || mb.appointments.contains_key(id)
+                || mb.tasks.contains_key(id)
+                || mb.notes.contains_key(id)
+        };
+        (!ids.is_empty() && ids.len() <= 10_000 && ids.iter().all(exists)).then_some(ids)
     }
 }
 

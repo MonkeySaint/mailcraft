@@ -276,7 +276,7 @@ fn table_view(ui: &mut Ui, app: &mut App, st: &mut ModState, folder: Option<Fold
                 let count = rows.iter().skip(k).take_while(|x| x.group.as_deref() == Some(g)).count();
                 let shut = collapsed.contains(g);
                 if group_row(ui, app, g, count, shut) {
-                    toggle_group(app, r.id, shut);
+                    toggle_group(app, r.id, g, shut);
                 }
             }
             if r.group.as_ref().is_some_and(|g| collapsed.contains(g)) {

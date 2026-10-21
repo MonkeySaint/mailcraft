@@ -1409,7 +1409,13 @@ mod tests {
     fn manage_views_lists_module_views_and_reset_restores_defaults() {
         let mut s = session();
         let tasks = select_folder(&mut s, FolderRole::Tasks);
-        assert!(matches!(s.run("view.resetView", &json!({})), Err(CmdError::Disabled(_))));
+        // Tasks offer Reset View on an unchanged view too (as observed); it changes nothing then.
+        assert!(s.enabled("view.resetView").is_none());
+        run(&mut s, "view.resetView", json!({}));
+        assert_eq!(state(&s, tasks, ModuleKind::Tasks), ModuleView::defaults(ModuleKind::Tasks));
+        let contacts = select_folder(&mut s, FolderRole::Contacts);
+        assert!(matches!(s.run("view.resetView", &json!({})), Err(CmdError::Disabled(_))), "{contacts:?}");
+        select_folder(&mut s, FolderRole::Tasks);
         run(&mut s, "view.manageViews", json!({}));
         let Some(Notice::OpenDialog(name, p)) = s.notices.last() else { panic!("no dialog") };
         assert_eq!(name, "manageViews");
@@ -1486,6 +1492,34 @@ mod tests {
         let mut after = ids(&rows(&s, folder));
         after.reverse();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn tasks_arranged_by_categories_list_an_item_under_each_category() {
+        let mut s = session();
+        let folder = select_folder(&mut s, FolderRole::Tasks);
+        let both = task(&mut s, json!({"subject": "Both", "categories": ["Red category", "Blue category"]}));
+        let red = task(&mut s, json!({"subject": "Red", "categories": ["Red category"]}));
+        let none = task(&mut s, json!({"subject": "None"}));
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        run(&mut s, "view.arrangeBy", json!({"key": "categories"}));
+        let r = rows(&s, folder);
+        let pairs: Vec<(u64, Option<&str>)> = r.iter().map(|x| (x.id.0, x.group.as_deref())).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (both, Some("Blue category")),
+                (both, Some("Red category")),
+                (red, Some("Red category")),
+                (none, Some("(none)")),
+            ]
+        );
+        // Collapsing one header (named by its label) leaves the item's other group open.
+        select_item(&mut s, both);
+        run(&mut s, "view.collapseGroup", json!({"label": "Red category"}));
+        let collapsed = &s.view.collapsed_groups[&folder];
+        assert!(collapsed.iter().any(|g| g == "Red category"));
+        assert!(!collapsed.iter().any(|g| g == "Blue category"));
     }
 
     #[test]

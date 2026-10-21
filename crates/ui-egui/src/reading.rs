@@ -253,14 +253,32 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
         {
             ctx.data_mut(|d| d.insert_temp(folder_key, f));
         }
-        let left = match (current, opened_in) {
+        let mut left = match (current, opened_in) {
             (None, _) => true,
             (Some(now), Some(then)) => now != then,
             (Some(_), None) => false,
         };
+        // A message with unsaved Edit Message changes that was moved away (Move, Archive, Delete to Deleted
+        // Items, from this window, the main window or a script) keeps its window, now in the new folder, and
+        // the save question shows: its edits are never dropped without asking.
+        if left
+            && let Some(now) = current
+            && crate::edit_message::has_unsaved_edits(ctx, id)
+            && crate::edit_message::is_editing(app, id)
+        {
+            ctx.data_mut(|d| d.insert_temp(folder_key, now));
+            crate::edit_message::may_close(ctx, app, id);
+            left = false;
+        }
         let m = app.s.mailbox.mail.get(&ItemId(id)).filter(|_| !left);
         let Some(m) = m else {
             ctx.data_mut(|d| d.remove::<u64>(folder_key));
+            // The window shows another message now (or closes): an editor of this one goes with it. Edits can
+            // only be lost here when the message itself is gone (deleted for good elsewhere).
+            if crate::edit_message::has_unsaved_edits(ctx, id) {
+                app.ui.toast = Some((crate::edit_message::GONE_NOTE.to_owned(), 0.0));
+            }
+            crate::edit_message::stop(ctx, app, id);
             // Mail › "After moving or deleting an open item": open the previous / next item in this window, or
             // return to the folder (close).
             let neighbour = ctx.data_mut(|d| d.get_temp::<(Option<u64>, Option<u64>)>(neighbour_id(id)));
@@ -296,7 +314,7 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
             .with_title(title)
             .with_inner_size([960.0, 760.0])
             .with_min_inner_size([300.0, 200.0]);
-        let vid = egui::ViewportId::from_hash_of(("mailcraft.read-window", id));
+        let vid = read_viewport_id(id);
         let close = ctx.show_viewport_immediate(vid, builder, |ui, class| read_window_ui(ui, app, id, class));
         if close {
             closed.push(id);
@@ -310,8 +328,16 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
             }
             let key = cache_id(ctx, Surface::Read(id));
             ctx.data_mut(|d| d.remove::<MsgCache>(key));
+            if !app.ui.read_windows.contains(&id) {
+                crate::edit_message::stop(ctx, app, id);
+            }
         }
     }
+}
+
+/// The viewport of `item`'s read window.
+pub(crate) fn read_viewport_id(item: u64) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("mailcraft.read-window", item))
 }
 
 fn neighbour_id(item: u64) -> Id {
@@ -459,9 +485,14 @@ fn body_doc(b: &mailcraft_model::Body, plain: bool, unwrap: bool) -> Doc {
 /// What the engine asked a message view to do (Find…, Select All, Select Text With Similar Formatting).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
-    Find { text: String, match_case: bool },
+    Find {
+        text: String,
+        match_case: bool,
+    },
     SelectAll,
     SelectSimilar,
+    /// Selection Pane: object n (a picture) of the body.
+    SelectObject(usize),
 }
 
 /// Accessible names of the find bar's controls.
@@ -599,6 +630,19 @@ fn take_request(ctx: &egui::Context, surface: Surface, id: u64, bar: &mut FindBa
             }
             focus_body(ctx, &cache.view);
         }
+        Request::SelectObject(n) => {
+            let objects = mailcraft_engine::cmd::format::doc_objects(&cache.doc);
+            if let Some(o) = objects.get(n) {
+                let at = mailcraft_layout::TextPos { block_path: o.at.path.clone(), offset: o.at.offset };
+                let end = mailcraft_layout::TextPos {
+                    block_path: o.at.path.clone(),
+                    offset: o.at.offset.saturating_add(1),
+                };
+                cache.view.selection = Some((at, end));
+                cache.view.extra.clear();
+                focus_body(ctx, &cache.view);
+            }
+        }
     }
 }
 
@@ -725,14 +769,27 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     let links_off = mailcraft_engine::junk::links_disabled(&app.s, ItemId(id));
     let plain = app.s.settings.bool("trust.plainText") || links_off;
     let unwrap = app.s.settings.bool("mail.format.removeExtraLineBreaks");
+    // Translate Message: a translation shows in place of the body (Show Original switches back).
+    let translated = mailcraft_engine::translate::shown(&app.s, ItemId(id)).map(|t| t.text.clone());
+    let translated_key = translated.as_ref().map_or(0, |t| {
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        t.hash(&mut hs);
+        hs.finish() | 1
+    });
     if let Some(m) = mailcraft_engine::smime::display_item(&app.s, ItemId(id)) {
-        let sk = source_key(id, &m.body) ^ u64::from(plain) ^ (u64::from(unwrap) << 1);
+        let sk = source_key(id, &m.body)
+            ^ u64::from(plain)
+            ^ (u64::from(unwrap) << 1)
+            ^ translated_key.rotate_left(3);
         if cache.item != id || cache.source_key != sk {
             // Inline attachments, so `cid:` pictures draw instead of the placeholder.
             for (src, data) in queries::inline_pictures(&app.s, ItemId(id)) {
                 body::provide_image(&ctx, &src, &data);
             }
-            let doc = body_doc(&m.body, plain, unwrap);
+            let doc = match &translated {
+                Some(t) => Doc::from_plain_text(t),
+                None => body_doc(&m.body, plain, unwrap),
+            };
             cache = MsgCache {
                 item: id,
                 source_key: sk,
@@ -800,6 +857,7 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             if cache.remote_images && !allow_remote {
                 pictures_bar(ui, app, id);
             }
+            translation_bar(ui, app, id);
             info_top
         });
         ui.add_space(10.0);
@@ -1231,6 +1289,22 @@ fn security_bars(ui: &mut Ui, app: &mut App, id: u64) {
     }
 }
 
+/// Translate Message on a received message: which translation shows, with a switch to the original.
+fn translation_bar(ui: &mut Ui, app: &mut App, id: u64) {
+    let Some(t) = app.s.translations.get(&ItemId(id)).cloned() else { return };
+    let lang = mailcraft_engine::translate::language_name(&t.to).unwrap_or(t.to.as_str()).to_owned();
+    let (text, action) = if t.show_original {
+        (format!("This is the original message. A translation into {lang} is available."), "Show translation")
+    } else {
+        (format!("Translated into {lang} by {}.", t.by), "Show original")
+    };
+    ui.add_space(6.0);
+    if info_bar(ui, app, "email", &text, Some(action)) {
+        // Show Original switches between the translation and the original.
+        app.run("review.translate", json!({"id": id, "showOriginal": true}));
+    }
+}
+
 fn pictures_bar(ui: &mut Ui, app: &mut App, id: u64) {
     ui.add_space(6.0);
     if info_bar(
@@ -1356,7 +1430,9 @@ fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClas
     // Mail › "Close original message window when replying or forwarding".
     let responses = |app: &App| app.s.composes.values().filter(|c| c.source == Some(ItemId(id))).count();
     let responses_before = responses(app);
-    if !embedded {
+    // Edit Message: the message is edited in place; its keys belong to the editor, not the message commands.
+    let editing = crate::edit_message::is_editing(app, id);
+    if !embedded && !editing {
         // A real window has its own input; embedded ones share the main window's (handled there).
         crate::keys::handle(&ctx, app, Surface::Read(id));
         if !app.ui.read_windows.contains(&id) {
@@ -1380,11 +1456,23 @@ fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClas
         // A tiny window (responsive.md: 300×200) keeps the message and drops the ribbon, as compose does.
         let ribbon_top = ui.cursor().top();
         if !frame.inspector_tiny {
-            crate::ribbon::ribbon(ui, app, Surface::Read(id), &frame);
+            // Unsaved Edit Message changes: the window's commands wait until they are saved or discarded
+            // (Reply, Move or Delete would act on the stored message, not on what is being edited).
+            let unsaved =
+                crate::edit_message::is_editing(app, id) && crate::edit_message::has_unsaved_edits(&ctx, id);
+            ui.add_enabled_ui(!unsaved, |ui| crate::ribbon::ribbon(ui, app, Surface::Read(id), &frame))
+                .response
+                .on_disabled_hover_text(crate::edit_message::RIBBON_WAITS_NOTE);
             ui.separator();
         }
         let ribbon_bottom = ui.cursor().top().max(ribbon_top);
         let ribbon = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), ribbon_top..=ribbon_bottom);
+        if crate::edit_message::is_editing(app, id) {
+            if crate::edit_message::editor_ui(ui, app, id).close {
+                close = true;
+            }
+            return;
+        }
         message_view(ui, app, id, Surface::Read(id), narrow);
         // F6 (the main window's rule): header, body, info bars, ribbon (the selected tab).
         let [header, info, body] = view_stops(&ctx, Surface::Read(id));
@@ -1401,6 +1489,13 @@ fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClas
     }
     if responses(app) > responses_before && app.s.settings.bool("mail.reply.closeOriginal") {
         close = true;
+    }
+    // A message with unsaved edits asks before its window closes (the question shows in the window).
+    if close && !crate::edit_message::may_close(&ctx, app, id) {
+        if !embedded {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        close = false;
     }
     close
 }
@@ -1920,6 +2015,126 @@ mod tests {
             // Default "After moving or deleting an open item": return to the current folder.
             assert!(h.state().ui.read_windows.is_empty(), "{cmd} left the window open");
         }
+    }
+
+    /// A read window editing the first Inbox message, with a subject edit not saved yet.
+    fn editing_with_unsaved_edits(s: mailcraft_engine::Session) -> (Harness<'static, App>, ItemId) {
+        let inbox = s.selection.folder;
+        let id = s.mailbox.items_in(inbox).first().map(|m| m.id).unwrap();
+        let mut app = App::new(s);
+        crate::edit_message::start(&mut app, id.0);
+        let mut h = embedded_read_windows(app);
+        h.run_steps(2);
+        crate::edit_message::append_to_subject(&h.ctx, id.0, " (edited)");
+        h.run_steps(2);
+        assert!(crate::edit_message::has_unsaved_edits(&h.ctx, id.0));
+        (h, id)
+    }
+
+    fn other_mail_folder(s: &mailcraft_engine::Session) -> mailcraft_model::FolderId {
+        let inbox = s.selection.folder;
+        s.mailbox
+            .folders
+            .values()
+            .find(|f| f.kind == mailcraft_model::FolderKind::Mail && f.id != inbox && f.role.is_none())
+            .map(|f| f.id)
+            .unwrap()
+    }
+
+    #[test]
+    fn moving_a_message_with_unsaved_edits_keeps_its_window_and_asks() {
+        // Regression: Move, Delete or Archive while editing closed the window (or swapped it to the next
+        // message) and the edits went without a question.
+        let mut s = sample_session();
+        s.settings.set("mail.other.afterMoveOrDelete", &json!("openNext")).unwrap();
+        let target = other_mail_folder(&s);
+        let (mut h, id) = editing_with_unsaved_edits(s);
+        h.state_mut().s.run("mail.move", &json!({"ids": [id.0], "folder": target.0})).unwrap();
+        h.run_steps(2);
+        assert_eq!(h.state().ui.read_windows, [id.0], "the window stays on the edited message");
+        assert!(crate::edit_message::is_editing(h.state(), id.0));
+        h.get_by_label(crate::edit_message::SAVE_PROMPT);
+        h.get_by_label("Save").click();
+        h.run_steps(3);
+        let m = &h.state().s.mailbox.mail[&id];
+        assert_eq!(m.folder, target);
+        assert!(m.subject.ends_with(" (edited)"), "{}", m.subject);
+        assert!(h.state().ui.read_windows.is_empty());
+    }
+
+    #[test]
+    fn a_window_that_moves_on_drops_an_editor_with_nothing_unsaved() {
+        // Regression: the window swapped to the next message and left the editor of the old one behind.
+        let mut s = sample_session();
+        s.settings.set("mail.other.afterMoveOrDelete", &json!("openNext")).unwrap();
+        let first = queries::visible_item_ids(&s).first().copied().unwrap();
+        let mut app = App::new(s);
+        crate::edit_message::start(&mut app, first.0);
+        let mut h = embedded_read_windows(app);
+        h.run_steps(2);
+        h.state_mut().s.run("mail.delete", &json!({"ids": [first.0]})).unwrap();
+        h.run_steps(2);
+        assert_ne!(h.state().ui.read_windows, [first.0]);
+        assert!(h.state().ui.editing_messages.is_empty());
+    }
+
+    #[test]
+    fn the_ribbon_waits_while_edits_are_unsaved() {
+        use egui_kittest::kittest::NodeT;
+        let (h, _) = editing_with_unsaved_edits(sample_session());
+        let reply = h.get_all_by_label("Reply").next().expect("the Reply button");
+        assert!(reply.accesskit_node().is_disabled(), "ribbon commands wait for Save or Discard");
+    }
+
+    #[test]
+    fn exit_with_unsaved_edits_asks_first_and_stays_open() {
+        // Regression: File › Exit and the main window's close button closed MailCraft and dropped the edits.
+        let (mut h, id) = editing_with_unsaved_edits(sample_session());
+        let ctx = h.ctx.clone();
+        assert!(!crate::edit_message::may_exit(&ctx, h.state_mut()));
+        h.run_steps(2);
+        h.get_by_label(crate::edit_message::SAVE_PROMPT);
+        let toast = h.state().ui.toast.as_ref().map(|t| t.0.clone());
+        assert_eq!(toast.as_deref(), Some(crate::edit_message::EXIT_WAITS_NOTE));
+        assert!(crate::edit_message::is_editing(h.state(), id.0));
+        // Don't Save: nothing is left unsaved, so MailCraft may close.
+        h.get_by_label("Don't Save").click();
+        h.run_steps(2);
+        assert!(crate::edit_message::may_exit(&ctx, h.state_mut()));
+    }
+
+    #[test]
+    fn closing_the_main_window_with_unsaved_edits_is_cancelled() {
+        let s = sample_session();
+        let id = s.mailbox.items_in(s.selection.folder).first().map(|m| m.id).unwrap();
+        let mut app = App::new(s);
+        crate::edit_message::start(&mut app, id.0);
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 900.0))
+            .build_ui_state(|ui, app: &mut App| app.ui_root(ui), app);
+        h.run_steps(3);
+        crate::edit_message::append_to_subject(&h.ctx, id.0, "!");
+        h.run_steps(2);
+        let close = |h: &mut Harness<'static, App>| {
+            h.input_mut()
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            h.step();
+            h.output()
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose))
+        };
+        assert!(close(&mut h), "the close is cancelled while edits are unsaved");
+        h.run_steps(2);
+        h.get_by_label(crate::edit_message::SAVE_PROMPT);
+        h.get_by_label("Save").click();
+        h.run_steps(3);
+        assert!(h.state().s.mailbox.mail[&id].subject.ends_with('!'));
+        assert!(!close(&mut h), "nothing unsaved: MailCraft closes");
     }
 
     #[test]

@@ -30,7 +30,7 @@ pub(crate) fn mail_targets(s: &Session, p: &Value) -> Vec<ItemId> {
 
 /// The single item a command acts on: first of `params.ids`, else the focused item, else the first selected.
 pub(crate) fn primary_item(s: &Session, p: &Value) -> Option<ItemId> {
-    if let Some(ids) = crate::cmd::util::opt_ids(p) {
+    if let Some(ids) = crate::cmd::util::opt_ids(p).or_else(|| s.check_scope()) {
         return ids.into_iter().find(|id| s.mailbox.mail.contains_key(id));
     }
     s.selection
@@ -315,7 +315,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Clean Up Conversation",
             "Home › Delete › Clean Up",
             "",
-            "",
+            r#"{"ids"?:[number]}"#,
             true,
             need_items,
             clean_up_conversation,
@@ -376,7 +376,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move to Folder",
             "Home › Move › Move",
             "Mod+Shift+V",
-            r#"{"folder"?:number|string}"#,
+            r#"{"ids"?:[number],"folder"?:number|string}"#,
             true,
             need_items,
             move_to_folder,
@@ -386,7 +386,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Copy to Folder",
             "Home › Move › Move",
             "",
-            r#"{"folder"?:number|string}"#,
+            r#"{"ids"?:[number],"folder"?:number|string}"#,
             true,
             need_items,
             copy_to_folder,
@@ -396,7 +396,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Always Move Conversation",
             "Home › Move › Move",
             "",
-            r#"{"folder"?:number|string, "stop"?: bool} (no folder = choose one; stop: later messages stay)"#,
+            r#"{"ids"?:[number],"folder"?:number|string, "stop"?: bool} (no folder = choose one; stop: later messages stay)"#,
             true,
             need_one,
             always_move_conversation,
@@ -487,7 +487,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Follow Up",
             "Home › Tags › Follow Up",
             "Insert",
-            r#"{"kind"?:"today"|"tomorrow"|"thisWeek"|"nextWeek"|"noDate"|"complete"|"clear"}"#,
+            r#"{"ids"?:[number],"kind"?:"today"|"tomorrow"|"thisWeek"|"nextWeek"|"noDate"|"complete"|"clear"}"#,
             true,
             need_items,
             flag,
@@ -497,7 +497,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Custom Flag",
             "Home › Tags › Follow Up",
             "Mod+Shift+G",
-            r#"{"reminder"?:bool|number,"label"?:string,"start"?:number,"due"?:number}"#,
+            r#"{"ids"?:[number],"reminder"?:bool|number,"label"?:string,"start"?:number,"due"?:number}"#,
             true,
             need_items,
             flag_custom,
@@ -507,7 +507,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Reminder",
             "Home › Tags › Follow Up",
             "",
-            r#"{"at"?:number}"#,
+            r#"{"ids"?:[number],"at"?:number}"#,
             true,
             need_items,
             add_reminder,
@@ -517,12 +517,21 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mark Complete",
             "Home › Tags › Follow Up",
             "",
-            "",
+            r#"{"ids"?:[number]}"#,
             true,
             need_items,
             mark_complete,
         ),
-        spec("mail.clearFlag", "Clear Flag", "Home › Tags › Follow Up", "", "", true, need_items, clear_flag),
+        spec(
+            "mail.clearFlag",
+            "Clear Flag",
+            "Home › Tags › Follow Up",
+            "",
+            r#"{"ids"?:[number]}"#,
+            true,
+            need_items,
+            clear_flag,
+        ),
         spec(
             "mail.flagQuickClick",
             "Set Quick Click (flag)",
@@ -548,7 +557,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Categorize",
             "Home › Tags › Categorize",
             "",
-            r#"{"name"?:string}"#,
+            r#"{"ids"?:[number],"name"?:string}"#,
             true,
             need_items,
             categorize,
@@ -558,7 +567,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Clear All Categories",
             "Home › Tags › Categorize",
             "",
-            "",
+            r#"{"ids"?:[number]}"#,
             true,
             need_items,
             clear_categories,
@@ -568,7 +577,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "All Categories",
             "Home › Tags › Categorize",
             "",
-            "",
+            r#"{"ids"?:[number]}"#,
             false,
             always,
             all_categories,
@@ -578,7 +587,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Importance",
             "Home › Tags",
             "",
-            r#"{"level":"high"|"normal"|"low"}"#,
+            r#"{"ids"?:[number],"level":"high"|"normal"|"low"}"#,
             true,
             need_items,
             importance,
@@ -609,7 +618,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Find Related",
             "Message context › Find Related",
             "",
-            r#"{"kind":"conversation"|"sender"}"#,
+            r#"{"ids"?:[number],"kind":"conversation"|"sender"}"#,
             false,
             need_one,
             find_related,
@@ -650,7 +659,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Message",
             "Message › More Commands › Actions",
             "",
-            r#"{"subject"?:string,"text"?:string,"html"?:string}"#,
+            r#"{"ids"?:[number],"subject"?:string,"text"?:string,"html"?:string}"#,
             true,
             need_one,
             edit_message,
@@ -660,7 +669,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Message Options",
             "Message › Tags (dialog launcher)",
             "",
-            r#"{"importance"?:"high"|"normal"|"low","sensitivity"?:"normal"|"personal"|"private"|"confidential"}"#,
+            r#"{"ids"?:[number],"importance"?:"high"|"normal"|"low","sensitivity"?:"normal"|"personal"|"private"|"confidential"}"#,
             true,
             need_one,
             message_options,
@@ -670,7 +679,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "View Source",
             "Message › More Commands › Actions › Other Actions",
             "",
-            "",
+            r#"{"ids"?:[number]}"#,
             false,
             need_one,
             view_source,
@@ -690,7 +699,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Resend This Message",
             "Message › More Commands › Actions",
             "",
-            "",
+            r#"{"ids"?:[number],"confirm"?:bool (a message not in Sent Items asks first without it)}"#,
             false,
             need_sent_item,
             resend,
@@ -717,9 +726,12 @@ fn need_private_targets(s: &Session) -> Option<&'static str> {
     if any { None } else { Some("No item is selected.") }
 }
 
+/// Resend: a sent message; in a read window (an enabled check scoped to the window's item) any message, as
+/// observed (a message the user did not send asks first, see [`resend`]).
 fn need_sent_item(s: &Session) -> Option<&'static str> {
     match primary_item(s, &Value::Null) {
         Some(id) if item_role(s, id) == Some(FolderRole::SentItems) => None,
+        Some(_) if s.check_scope().is_some() => None,
         _ => Some("Only sent messages can be resent."),
     }
 }
@@ -2678,24 +2690,21 @@ fn quick_print(s: &mut Session, p: &Value) -> CmdResult {
     open_dialog(s, "print", json!({"ids": ids_json(&ids), "quick": true, "style": "memo"}))
 }
 
-/// Edit Message: with `subject`/`text`/`html` saves the edits to the stored item; otherwise opens the Edit
-/// Message window (`editMessage`: subject and text of the message, to edit and save).
+/// Edit Message: with `subject`/`text`/`html` saves the edits to the stored item (`html` replaces the HTML
+/// body and its text part; `text` a plain-text body); otherwise asks the UI to edit the message in place in
+/// its read window (`readWindow` with `edit: true`), where the body is the rich-text document of
+/// [`body_doc`] and saving sends it back as HTML, so the formatting stays.
 fn edit_message(s: &mut Session, p: &Value) -> CmdResult {
     let Some(focus) = primary_item(s, p) else {
         return Err(CmdError::Disabled("No message is selected.".into()));
     };
     let (subject, text, html) = (opt_str(p, "subject"), opt_str(p, "text"), opt_str(p, "html"));
     if subject.is_none() && text.is_none() && html.is_none() {
-        let Some(m) = s.mailbox.mail.get(&focus) else {
+        if !s.mailbox.mail.contains_key(&focus) {
             return Err(CmdError::Failed("message not found".into()));
-        };
-        let params = json!({
-            "id": focus.0,
-            "subject": m.subject,
-            "text": m.body_text(),
-            "html": m.body.html.is_some(),
-        });
-        return open_dialog(s, "editMessage", params);
+        }
+        s.notify(Notice::OpenDialog("readWindow".into(), json!({"id": focus.0, "edit": true})));
+        return Ok(json!({"dialog": "readWindow", "id": focus.0, "edit": true}));
     }
     if subject.is_some_and(|x| x.chars().count() > MAX_EDIT_SUBJECT_CHARS)
         || text.map_or(0, str::len).saturating_add(html.map_or(0, str::len)) > MAX_EDIT_BODY_BYTES
@@ -2724,6 +2733,8 @@ fn edit_message(s: &mut Session, p: &Value) -> CmdResult {
     m.refresh_preview();
     // The stored source no longer matches the edited item.
     m.raw = None;
+    // Nor does a translation of it: the edited message shows again (Translate makes a new one).
+    s.translations.remove(&focus);
     journal(s, &[focus]);
     Ok(ok())
 }
@@ -2889,8 +2900,8 @@ pub(crate) fn source_attachments(m: &MailItem) -> Vec<crate::compose::ComposeAtt
         .collect()
 }
 
-/// The item's body as a compose document.
-pub(crate) fn body_doc(m: &MailItem) -> mailcraft_model::Doc {
+/// A message body as a rich-text document: the HTML through `html_to_doc`, or the plain text.
+pub fn body_doc(m: &MailItem) -> mailcraft_model::Doc {
     match (&m.body.format, &m.body.html) {
         (BodyFormat::PlainText, _) | (_, None) => {
             mailcraft_model::Doc::from_plain_text(m.body.text.as_deref().unwrap_or_default())
@@ -2904,6 +2915,25 @@ fn resend(s: &mut Session, p: &Value) -> CmdResult {
     let Some(focus) = primary_item(s, p) else {
         return Err(CmdError::Disabled("No message is selected.".into()));
     };
+    if !s.mailbox.mail.contains_key(&focus) {
+        return Err(CmdError::Failed("message not found".into()));
+    }
+    // A message the user did not send (not in Sent Items) asks first, and the copy goes out from the user's
+    // own account rather than as the original sender.
+    let sent = item_role(s, focus) == Some(FolderRole::SentItems);
+    if !sent && opt_bool(p, "confirm") != Some(true) {
+        return open_dialog(
+            s,
+            "confirm",
+            json!({
+                "title": "Resend This Message",
+                "text": "You did not send this message. Resend it from your own account to the same recipients?",
+                "command": "mail.resend",
+                "params": {"ids": [focus.0], "confirm": true},
+            }),
+        );
+    }
+    let own_from = if sent { None } else { Some(account_from(s, item_account(s, focus))) };
     let Some(m) = s.mailbox.mail.get(&focus) else {
         return Err(CmdError::Failed("message not found".into()));
     };
@@ -2917,7 +2947,8 @@ fn resend(s: &mut Session, p: &Value) -> CmdResult {
         cc: join(&m.cc),
         bcc: join(&m.bcc),
         show_bcc: !m.bcc.is_empty(),
-        from: m.from.as_ref().map(crate::cmd::compose::field_mailbox).unwrap_or_default(),
+        from: own_from
+            .unwrap_or_else(|| m.from.as_ref().map(crate::cmd::compose::field_mailbox).unwrap_or_default()),
         subject: m.subject.clone(),
         body: body_doc(m),
         format: m.body.format,
@@ -4151,17 +4182,30 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
     #[test]
     fn edit_message_saves() {
         let mut f = fx();
-        assert_eq!(edit_message(&mut f.s, &Value::Null).unwrap()["dialog"], "editMessage");
-        let p = last_dialog(&f.s, "editMessage");
+        // Without edits: the message is edited in place in its read window.
+        assert_eq!(edit_message(&mut f.s, &Value::Null).unwrap()["dialog"], "readWindow");
+        let p = last_dialog(&f.s, "readWindow");
         assert_eq!(p["id"], f.a.0);
-        assert_eq!(p["subject"], "Invoice");
-        assert_eq!(p["text"], "Invoice attached.");
-        assert_eq!(p["html"], false);
+        assert_eq!(p["edit"], true);
         assert!(edit_message(&mut f.s, &json!({"subject": "x".repeat(MAX_EDIT_SUBJECT_CHARS + 1)})).is_err());
         edit_message(&mut f.s, &json!({"subject": "Invoice 7", "text": "Paid."})).unwrap();
         let m = &f.s.mailbox.mail[&f.a];
         assert_eq!(m.subject, "Invoice 7");
         assert_eq!(m.preview, "Paid.");
+        // The rich editor's document saved as HTML keeps its formatting (html_to_doc ⇄ doc_to_html).
+        let body = &mut f.s.mailbox.mail.get_mut(&f.a).unwrap().body;
+        body.html = Some("<p>Due <b>Friday</b></p>".into());
+        body.format = BodyFormat::Html;
+        let mut doc = body_doc(&f.s.mailbox.mail[&f.a]);
+        doc.blocks.insert(0, mailcraft_model::Doc::from_plain_text("Paid in full.").blocks.remove(0));
+        let html = mailcraft_html::doc_to_html(&doc);
+        edit_message(&mut f.s, &json!({"ids": [f.a.0], "html": html})).unwrap();
+        let m = &f.s.mailbox.mail[&f.a];
+        let stored = m.body.html.as_deref().unwrap();
+        assert!(stored.contains("Paid in full."), "{stored}");
+        assert!(mailcraft_html::html_to_doc(stored).to_plain_text().contains("Due Friday"), "{stored}");
+        assert!(stored.contains("<b>") || stored.contains("<strong>") || stored.contains("bold"), "{stored}");
+        assert!(m.body.text.as_deref().is_some_and(|t| t.contains("Paid in full.")));
     }
 
     #[test]
@@ -4185,6 +4229,17 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
         assert_eq!(c.subject, "Invoice");
         assert_eq!(c.to, "Test User <test.user@example.net>");
+        // A received message asks first, then goes out again from the user's own account.
+        let r = resend(&mut f.s, &json!({"ids": [f.b.0]})).unwrap();
+        assert_eq!(r["dialog"], "confirm");
+        let p = last_dialog(&f.s, "confirm");
+        assert_eq!(p["params"], json!({"ids": [f.b.0], "confirm": true}));
+        let r = resend(&mut f.s, &p["params"]).unwrap();
+        let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
+        let sender = f.s.mailbox.mail[&f.b].from.as_ref().unwrap().addr.clone();
+        assert!(!c.from.contains(&sender), "{}", c.from);
+        // A read window (a check scoped to its message) offers it for any message.
+        assert!(f.s.enabled_for("mail.resend", &[f.b]).is_none());
         // Message recall needs an Exchange server (its catalog row is not applicable): there is no command.
         f.s.mailbox.accounts[0].kind = mailcraft_model::AccountKind::Exchange;
         assert!(matches!(f.s.run("mail.recall", &Value::Null), Err(CmdError::Unknown(_))));

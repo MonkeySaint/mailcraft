@@ -289,12 +289,7 @@ pub(super) fn run_view_cmd(app: &mut App, st: &mut ModState, id: &str, params: V
     let out = if module_view {
         app.s.view.module = Module::Calendar;
         match engine_cal::module_view(&mut app.s, id, &params) {
-            Some(Ok(v)) => {
-                if let Some(part) = v.get("todoBar").and_then(Value::as_str) {
-                    app.ui.todo_bar_request = Some(part.to_owned());
-                }
-                v
-            }
+            Some(Ok(v)) => v,
             Some(Err(e)) => {
                 app.ui.toast = Some((e.to_string(), 0.0));
                 return None;
@@ -800,7 +795,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
     let (pane, mut main) = module_folder_pane(ui, app);
     // To-Do Bar (View › Layout › To-Do Bar) on the right, when there is room.
     let bar_w = super::TODO_BAR_WIDTH;
-    if super::todo_bar_shown(&ctx) && main.width() >= bar_w + 420.0 {
+    if super::todo_bar_shown(app) && main.width() >= bar_w + 420.0 {
         let bar = Rect::from_min_max(pos2(main.max.x - bar_w, main.min.y), main.max);
         main = Rect::from_min_max(main.min, pos2(bar.min.x - super::common::GAP, main.max.y));
         child(ui, bar, "mc-cal-todo-bar", |ui| super::todo_bar(ui, app));

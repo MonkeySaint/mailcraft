@@ -16,7 +16,10 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "feedback" | "contactSupport" => feedback(ctx, app, d),
         "message" | "notAvailable" => message(ctx, app, d),
         "exit" => {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // Unsaved Edit Message changes ask first (in their windows); MailCraft then stays open.
+            if crate::edit_message::may_exit(ctx, app) {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
             Out::Close
         }
         "saveChanges" => save_changes(ctx, app, d),

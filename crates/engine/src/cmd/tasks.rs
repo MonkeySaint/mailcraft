@@ -437,9 +437,10 @@ fn run_update_now(s: &mut Session, p: &Value) -> CmdResult {
 /// Delete. Deleting a task I accepted from someone else's task request first asks what to tell them
 /// (`request`): `decline` answers DECLINED, `complete` marks it complete and sends the completion report,
 /// `delete` just deletes. The answers are sent at once; one that cannot be sent stays open in a message
-/// window.
+/// window. Flagged messages and flagged contacts of the To-Do List are deleted as Mail and People delete them.
 fn run_delete(s: &mut Session, p: &Value) -> CmdResult {
-    let ids = pim::require_targets(s, p, Kind::Task)?;
+    let r = require_rows(s, p)?;
+    let ids = r.tasks.clone();
     let requested: Vec<ItemId> = ids
         .iter()
         .filter(|i| {
@@ -460,7 +461,7 @@ fn run_delete(s: &mut Session, p: &Value) -> CmdResult {
             return pim::dialog(
                 s,
                 "deleteTaskRequest",
-                json!({ "ids": pim::ids_json(&ids), "subject": subject, "requested": requested.len() }),
+                json!({ "ids": pim::ids_json(&r.all()), "subject": subject, "requested": requested.len() }),
             );
         }
         None | Some("delete") => {}
@@ -488,23 +489,96 @@ fn run_delete(s: &mut Session, p: &Value) -> CmdResult {
         }
         Some(_) => return Err(CmdError::Params("`request` must be decline, complete or delete".into())),
     }
-    let mut out = pim::run_delete(s, p, Kind::Task)?;
-    if let Some(o) = out.as_object_mut() {
-        o.insert("notified".into(), json!(notified));
+    let mut deleted = pim::delete(s, &ids);
+    if !r.mail.is_empty() {
+        route(s, "mail.delete", &r.mail, json!({}))?;
+        // Options › Mail › "Mark messages as read when deleted", as Mail's Delete does.
+        if s.settings.bool("mail.other.markReadOnDelete") {
+            s.mailbox.set_read(&r.mail, true);
+        }
+        deleted.extend(r.mail.iter().copied());
     }
-    Ok(out)
+    if !r.contacts.is_empty() {
+        route(s, "people.delete", &r.contacts, json!({}))?;
+        deleted.extend(r.contacts.iter().copied());
+    }
+    Ok(json!({
+        "deleted": pim::ids_json(&deleted),
+        "mail": pim::ids_json(&r.mail),
+        "contacts": pim::ids_json(&r.contacts),
+        "notified": notified,
+    }))
 }
 fn run_copy(s: &mut Session, p: &Value) -> CmdResult {
-    if p.get("folder").is_none_or(Value::is_null) {
-        return move_dialog(s, p, Kind::Task, true);
-    }
-    pim::run_copy(s, p, Kind::Task)
+    move_rows(s, p, true)
 }
 fn run_move(s: &mut Session, p: &Value) -> CmdResult {
-    if p.get("folder").is_none_or(Value::is_null) {
-        return move_dialog(s, p, Kind::Task, false);
+    move_rows(s, p, false)
+}
+
+/// Move / Copy to Folder on To-Do List rows. Without a folder: tasks (or a mix of rows) get the tasks
+/// folder picker; flagged messages alone get Mail's folder picker, flagged contacts alone People's. With a
+/// folder, the rows that folder can hold go there (tasks to a tasks folder, messages to a mail folder,
+/// contacts to a contacts folder); the others stay where they are and are reported as `skipped`.
+fn move_rows(s: &mut Session, p: &Value, copy: bool) -> CmdResult {
+    let r = require_rows(s, p)?;
+    let Some(folder) = crate::cmd::util::opt_folder(p) else {
+        return match (r.tasks.is_empty(), r.mail.is_empty(), r.contacts.is_empty()) {
+            (true, false, true) => route(s, if copy { "mail.copy" } else { "mail.move" }, &r.mail, json!({})),
+            (true, true, false) => {
+                route(s, if copy { "people.copy" } else { "people.move" }, &r.contacts, json!({}))
+            }
+            _ => {
+                let current = r.tasks.first().and_then(|i| pim::folder_of(&s.mailbox, *i)).map(|f| f.0);
+                pim::dialog(
+                    s,
+                    "pimMove",
+                    json!({ "ids": pim::ids_json(&r.all()), "area": "tasks", "copy": copy, "current": current }),
+                )
+            }
+        };
+    };
+    let kind = s
+        .mailbox
+        .folder(folder)
+        .map(|f| f.kind)
+        .ok_or_else(|| CmdError::Params(format!("no such folder {}", folder.0)))?;
+    let (fits, cmd, skipped): (&[ItemId], &str, Vec<ItemId>) = match kind {
+        mailcraft_model::FolderKind::Tasks => {
+            (&r.tasks, "", r.mail.iter().chain(&r.contacts).copied().collect())
+        }
+        mailcraft_model::FolderKind::Mail => (
+            &r.mail,
+            if copy { "mail.copy" } else { "mail.move" },
+            r.tasks.iter().chain(&r.contacts).copied().collect(),
+        ),
+        mailcraft_model::FolderKind::Contacts => (
+            &r.contacts,
+            if copy { "people.copy" } else { "people.move" },
+            r.tasks.iter().chain(&r.mail).copied().collect(),
+        ),
+        _ => (&[], "", r.all()),
+    };
+    if fits.is_empty() {
+        return Err(CmdError::Params(format!("folder {} cannot hold the selected items", folder.0)));
     }
-    pim::run_move(s, p, Kind::Task)
+    let fits = fits.to_vec();
+    let done = if cmd.is_empty() {
+        if copy {
+            pim::copy_to(s, &fits, folder, Kind::Task)?
+        } else {
+            pim::move_to(s, &fits, folder, Kind::Task)?
+        }
+    } else {
+        let out = route(s, cmd, &fits, json!({ "folder": folder.0 }))?;
+        ["ids", "copies", "moved"]
+            .iter()
+            .find_map(|k| out.get(*k).and_then(Value::as_array))
+            .map(|a| a.iter().filter_map(Value::as_u64).map(ItemId).collect())
+            .unwrap_or(fits)
+    };
+    let key = if copy { "copies" } else { "moved" };
+    Ok(json!({ key: pim::ids_json(&done), "skipped": pim::ids_json(&skipped), "folder": folder.0 }))
 }
 
 /// Move › Other Folder / Copy to Folder without a folder: the folder picker of the module (`pimMove`), which
@@ -545,11 +619,24 @@ pub(crate) fn area_of(kind: Kind) -> &'static str {
     }
 }
 
+/// All Categories on To-Do List rows (tasks, flagged messages and contacts): the Color Categories dialog.
 fn run_all_categories(s: &mut Session, p: &Value) -> CmdResult {
-    categories_dialog(s, p, Kind::Task)
+    let ids = require_rows(s, p)?.all();
+    let mut on: Vec<String> = Vec::new();
+    for id in &ids {
+        for c in pim::categories(&s.mailbox, *id).into_iter().flatten() {
+            if !on.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                on.push(c.clone());
+            }
+        }
+    }
+    pim::dialog(s, "colorCategories", json!({ "ids": pim::ids_json(&ids), "area": "tasks", "on": on }))
 }
+
+/// Categorize on To-Do List rows: tasks, flagged messages and flagged contacts alike.
 fn run_categorize(s: &mut Session, p: &Value) -> CmdResult {
-    let out = pim::run_categorize(s, p, Kind::Task)?;
+    let ids = require_rows(s, p)?.all();
+    let out = pim::categorize_ids(s, p, &ids)?;
     let now = s.now();
     for id in out.get("ids").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_u64) {
         if let Some(t) = s.mailbox.tasks.get_mut(&ItemId(id)) {
@@ -580,6 +667,100 @@ fn todo_targets(s: &Session, p: &Value) -> (Vec<ItemId>, Vec<ItemId>) {
 fn todo_selected(s: &Session) -> Option<&'static str> {
     let (t, m) = todo_targets(s, &Value::Null);
     if t.is_empty() && m.is_empty() { Some("nothing selected") } else { None }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// To-Do List rows: the Tasks Home ribbon on flagged messages and flagged contacts
+
+/// Kind of a To-Do List row a Tasks Home command acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowOf {
+    Task,
+    Mail,
+    Contact,
+}
+
+/// What a Tasks Home command acts on, split by row kind: tasks, and the flagged messages and flagged contacts
+/// the To-Do List shows beside them (a message or contact counts while it carries a flag, complete or not).
+/// `order` keeps the targets in the order given.
+#[derive(Clone, Debug, Default)]
+struct Rows {
+    tasks: Vec<ItemId>,
+    mail: Vec<ItemId>,
+    contacts: Vec<ItemId>,
+    order: Vec<(ItemId, RowOf)>,
+}
+
+impl Rows {
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+    fn first(&self) -> Option<(ItemId, RowOf)> {
+        self.order.first().copied()
+    }
+    fn all(&self) -> Vec<ItemId> {
+        self.order.iter().map(|(i, _)| *i).collect()
+    }
+}
+
+/// Kind of row `id` is in the To-Do List, if any.
+fn row_of(s: &Session, id: ItemId) -> Option<RowOf> {
+    if s.mailbox.tasks.contains_key(&id) {
+        Some(RowOf::Task)
+    } else if s.mailbox.mail.get(&id).is_some_and(|m| !matches!(m.flag, FlagState::None)) {
+        Some(RowOf::Mail)
+    } else if s.mailbox.contacts.get(&id).is_some_and(|c| !matches!(c.flag, FlagState::None)) {
+        Some(RowOf::Contact)
+    } else {
+        None
+    }
+}
+
+/// The rows a Tasks Home command acts on: `params.id`, else `params.ids`, else the selection (else focus).
+fn rows(s: &Session, p: &Value) -> Rows {
+    let ids = match crate::cmd::util::opt_u64(p, "id") {
+        Some(id) => vec![ItemId(id)],
+        None => s.target_ids(p),
+    };
+    let mut out = Rows::default();
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(kind) = row_of(s, id) else { continue };
+        match kind {
+            RowOf::Task => out.tasks.push(id),
+            RowOf::Mail => out.mail.push(id),
+            RowOf::Contact => out.contacts.push(id),
+        }
+        out.order.push((id, kind));
+    }
+    out
+}
+
+const NO_ROW: &str = "no task or flagged item selected (pass `id` or `ids`)";
+
+fn require_rows(s: &Session, p: &Value) -> Result<Rows, CmdError> {
+    let r = rows(s, p);
+    if r.is_empty() { Err(CmdError::Params(NO_ROW.into())) } else { Ok(r) }
+}
+
+/// Runs the Mail or People command that does for flagged messages / contacts what a Tasks Home command does
+/// for tasks, on `ids` with `extra` params (as part of the Tasks command: one undo step).
+fn route(s: &mut Session, cmd: &str, ids: &[ItemId], extra: Value) -> CmdResult {
+    let mut params = match extra {
+        Value::Object(o) => o,
+        _ => serde_json::Map::new(),
+    };
+    params.remove("id");
+    params.insert("ids".into(), pim::ids_json(ids));
+    crate::rules_exec::invoke(s, cmd, &Value::Object(params))
+}
+
+/// Enabled: a task, flagged message or flagged contact is selected.
+fn row_selected(s: &Session) -> Option<&'static str> {
+    if rows(s, &Value::Null).is_empty() { Some("select a task or a flagged item first") } else { None }
 }
 
 fn linked_tasks(s: &Session, mail: ItemId) -> Vec<ItemId> {
@@ -888,12 +1069,31 @@ pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
     };
     let arrange =
         if modules::show_groups(s, folder) { st.arrangement(kind).map(str::to_owned) } else { None };
+    // Arranged by Categories, an item with several categories is listed under each of them.
+    let entries: Vec<(Entry, Option<String>)> = entries
+        .into_iter()
+        .flat_map(|e| {
+            let mut cats: Vec<String> = Vec::new();
+            if arrange.as_deref() == Some("categories") {
+                for c in e.categories.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+                    if !cats.iter().any(|x| x.eq_ignore_ascii_case(c)) && cats.len() < pim::MAX_LIST {
+                        cats.push(c.to_owned());
+                    }
+                }
+            }
+            if cats.len() > 1 {
+                cats.into_iter().map(|c| (e.clone(), Some(c))).collect::<Vec<_>>()
+            } else {
+                vec![(e, cats.into_iter().next())]
+            }
+        })
+        .collect();
     let mut keyed: Vec<((u8, String), (i64, String, ItemId), ViewRow)> = entries
         .into_iter()
-        .map(|e| {
+        .map(|(e, cat)| {
             let group = arrange.as_deref().map(|a| match a {
-                "categories" => match e.categories.first() {
-                    Some(c) => (0, c.clone()),
+                "categories" => match cat {
+                    Some(c) => (0, c),
                     None => (1, "(none)".to_owned()),
                 },
                 "startDate" => {
@@ -963,46 +1163,127 @@ fn run_flag(s: &mut Session, p: &Value) -> CmdResult {
     with_reports(s, p, run_flag_now)
 }
 
+/// The flag of a flagged message or contact row.
+fn row_flag(s: &Session, id: ItemId) -> Option<&FlagState> {
+    s.mailbox.mail.get(&id).map(|m| &m.flag).or_else(|| s.mailbox.contacts.get(&id).map(|c| &c.flag))
+}
+
+fn set_row_flag(s: &mut Session, id: ItemId, flag: FlagState) {
+    if let Some(m) = s.mailbox.mail.get_mut(&id) {
+        m.flag = flag;
+    } else if let Some(c) = s.mailbox.contacts.get_mut(&id) {
+        c.flag = flag;
+    }
+}
+
+/// (start, due, reminder) of a row: a task's dates, or a flagged message's / contact's flag dates.
+fn row_dates(s: &Session, id: ItemId) -> (Option<DateTime>, Option<DateTime>, Option<DateTime>) {
+    if let Some(t) = s.mailbox.tasks.get(&id) {
+        return (t.start, t.due, t.reminder);
+    }
+    match row_flag(s, id) {
+        Some(FlagState::Flagged { start, due, reminder, .. }) => (*start, *due, *reminder),
+        _ => (None, None, None),
+    }
+}
+
+/// The Follow Up entry (`today` … `noDate`) the dates of To-Do List row `id` came from, for the checked
+/// state of the Tasks Home Follow Up buttons; `custom` for dates none of those entries gives; `None` for no
+/// row or a completed one.
+pub fn follow_up_state(s: &Session, id: ItemId) -> Option<&'static str> {
+    let done = match row_of(s, id)? {
+        RowOf::Task => s.mailbox.tasks.get(&id).is_some_and(Task::is_complete),
+        _ => !matches!(row_flag(s, id), Some(FlagState::Flagged { .. })),
+    };
+    if done {
+        return None;
+    }
+    let (start, due, _) = row_dates(s, id);
+    let flag = FlagState::Flagged { label: String::new(), start, due, reminder: None };
+    crate::cmd::mail::follow_up_kind(s, &flag).or(Some("custom"))
+}
+
 fn run_flag_now(s: &mut Session, p: &Value) -> CmdResult {
-    let ids = pim::require_targets(s, p, Kind::Task)?;
+    let r = require_rows(s, p)?;
+    let ids = r.tasks.clone();
+    let flagged: Vec<ItemId> = r.mail.iter().chain(&r.contacts).copied().collect();
     // No kind: the Quick Click flag (Options › Tasks › Quick Click).
     let quick = crate::cmd::mail::quick_click_kind(s);
     let kind = opt_str(p, "kind").unwrap_or(&quick);
+    let tz = s.tz_offset_min;
+    let now = s.now();
     if kind == "complete" {
-        let now = s.now();
         for id in &ids {
             if let Some(t) = s.mailbox.tasks.get_mut(id) {
                 set_complete(t, true, now);
             }
         }
-        return Ok(json!({ "flagged": pim::ids_json(&ids), "kind": "complete" }));
+        for id in &flagged {
+            set_row_flag(s, *id, FlagState::Complete { completed: Some(now) });
+        }
+        return Ok(json!({ "flagged": pim::ids_json(&r.all()), "kind": "complete" }));
     }
     if kind == "custom" {
         if !pim::has_any(p, &["start", "due", "reminder"]) {
-            return pim::dialog(s, "pimFlag", json!({ "ids": pim::ids_json(&ids), "area": "tasks" }));
+            // The Custom dialog starts from the dates of a single row; with several rows it opens blank
+            // (the dialog then sends only the fields changed, so every row keeps its other dates).
+            let all = r.all();
+            let (start, due, reminder) = match all.as_slice() {
+                [one] => row_dates(s, *one),
+                _ => (None, None, None),
+            };
+            return pim::dialog(
+                s,
+                "pimFlag",
+                json!({
+                    "ids": pim::ids_json(&all),
+                    "area": "tasks",
+                    "start": start.map(|d| pim::date_string(d, tz)),
+                    "due": due.map(|d| pim::date_string(d, tz)),
+                    "reminderAt": reminder.map(|d| pim::datetime_string(d, tz)),
+                }),
+            );
         }
+        // A field given as null clears it (the dialog's None); a field left out stays as it is.
+        let fields: serde_json::Map<String, Value> = ["start", "due", "reminder"]
+            .iter()
+            .filter_map(|k| p.get(*k).map(|v| ((*k).to_owned(), v.clone())))
+            .collect();
+        let fields = Value::Object(fields);
         let mut out = Vec::new();
         for id in &ids {
             let Some(mut t) = s.mailbox.tasks.get(id).cloned() else { continue };
-            let fields =
-                json!({ "start": p.get("start"), "due": p.get("due"), "reminder": p.get("reminder") });
-            let fields: serde_json::Map<String, Value> = fields
-                .as_object()
-                .map(|o| {
-                    o.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), v.clone())).collect()
-                })
-                .unwrap_or_default();
-            apply_task_fields(s, &mut t, &Value::Object(fields))?;
+            apply_task_fields(s, &mut t, &fields)?;
             out.push(*id);
             s.mailbox.tasks.insert(*id, t);
+        }
+        let day = |key: &str| -> Result<Option<Option<DateTime>>, CmdError> {
+            Ok(pim::date(&fields, key, tz)?.map(|d| d.map(|d| pim::local_midnight(d, tz))))
+        };
+        let (start, due, reminder) = (day("start")?, day("due")?, pim::date(&fields, "reminder", tz)?);
+        for id in &flagged {
+            let (label, old_start, old_due, old_reminder) = match row_flag(s, *id) {
+                Some(FlagState::Flagged { label, start, due, reminder }) => {
+                    (label.clone(), *start, *due, *reminder)
+                }
+                _ => ("Follow up".to_owned(), None, None, None),
+            };
+            let (start, due) = (start.unwrap_or(old_start), due.unwrap_or(old_due));
+            if let (Some(a), Some(b)) = (start, due)
+                && b.unix < a.unix
+            {
+                return Err(CmdError::Params("the due date is before the start date".into()));
+            }
+            let reminder = reminder.unwrap_or(old_reminder);
+            set_row_flag(s, *id, FlagState::Flagged { label, start, due, reminder });
+            out.push(*id);
         }
         return Ok(json!({ "flagged": pim::ids_json(&out), "kind": "custom" }));
     }
     let fk = parse_flag_kind(kind).ok_or_else(|| {
-        CmdError::Params("`kind` must be today|tomorrow|thisWeek|nextWeek|noDate|custom".into())
+        CmdError::Params("`kind` must be today|tomorrow|thisWeek|nextWeek|noDate|custom|complete".into())
     })?;
     let (start, due) = crate::cmd::mail::flag_dates(s, fk);
-    let now = s.now();
     for id in &ids {
         if let Some(t) = s.mailbox.tasks.get_mut(id) {
             t.start = start;
@@ -1010,9 +1291,16 @@ fn run_flag_now(s: &mut Session, p: &Value) -> CmdResult {
             t.modified = Some(now);
         }
     }
-    let tz = s.tz_offset_min;
+    // Flagged messages and contacts keep their flag text and reminder.
+    for id in &flagged {
+        let (label, reminder) = match row_flag(s, *id) {
+            Some(FlagState::Flagged { label, reminder, .. }) => (label.clone(), *reminder),
+            _ => ("Follow up".to_owned(), None),
+        };
+        set_row_flag(s, *id, FlagState::Flagged { label, start, due, reminder });
+    }
     Ok(json!({
-        "flagged": pim::ids_json(&ids),
+        "flagged": pim::ids_json(&r.all()),
         "kind": kind,
         "start": start.map(|d| pim::date_string(d, tz)),
         "due": due.map(|d| pim::date_string(d, tz)),
@@ -1020,36 +1308,76 @@ fn run_flag_now(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Private toggle (`on` sets it; without it, on unless every target is private already).
+/// Whether To-Do List row `id` is private (a task's or contact's Private, a message's Private sensitivity).
+fn row_private(s: &Session, id: ItemId) -> bool {
+    s.mailbox.tasks.get(&id).map(|t| t.private).unwrap_or_else(|| {
+        s.mailbox
+            .mail
+            .get(&id)
+            .map(|m| m.sensitivity == mailcraft_model::Sensitivity::Private)
+            .or_else(|| s.mailbox.contacts.get(&id).map(|c| c.private))
+            .unwrap_or(false)
+    })
+}
+
 fn run_private(s: &mut Session, p: &Value) -> CmdResult {
-    let ids = pim::require_targets(s, p, Kind::Task)?;
-    let all = ids.iter().all(|i| s.mailbox.tasks.get(i).is_some_and(|t| t.private));
+    let ids = require_rows(s, p)?.all();
+    let all = ids.iter().all(|i| row_private(s, *i));
     let on = opt_bool(p, "on").unwrap_or(!all);
     let now = s.now();
     for id in &ids {
         if let Some(t) = s.mailbox.tasks.get_mut(id) {
             t.private = on;
             t.modified = Some(now);
+        } else if let Some(m) = s.mailbox.mail.get_mut(id) {
+            m.sensitivity =
+                if on { mailcraft_model::Sensitivity::Private } else { mailcraft_model::Sensitivity::Normal };
+        } else if let Some(c) = s.mailbox.contacts.get_mut(id) {
+            c.private = on;
         }
     }
     Ok(json!({ "ids": pim::ids_json(&ids), "private": on }))
 }
 
-/// High / Low Importance (a task's priority): toggles back to Normal when every target already has it.
+/// Priority of a task row, or the importance of a flagged message (contacts have none: Normal).
+fn row_priority(s: &Session, id: ItemId) -> TaskPriority {
+    if let Some(t) = s.mailbox.tasks.get(&id) {
+        return t.priority;
+    }
+    match s.mailbox.mail.get(&id).map(|m| m.importance) {
+        Some(mailcraft_model::Importance::High) => TaskPriority::High,
+        Some(mailcraft_model::Importance::Low) => TaskPriority::Low,
+        _ => TaskPriority::Normal,
+    }
+}
+
+/// High / Low Importance (a task's priority, a flagged message's importance): toggles back to Normal when
+/// every target already has it. Flagged contacts have no importance and are left alone.
 fn run_importance(s: &mut Session, p: &Value) -> CmdResult {
-    let ids = pim::require_targets(s, p, Kind::Task)?;
+    let r = require_rows(s, p)?;
+    let ids: Vec<ItemId> = r.tasks.iter().chain(&r.mail).copied().collect();
+    if ids.is_empty() {
+        return Err(CmdError::Params("contacts have no importance".into()));
+    }
     let level = match opt_str(p, "level").unwrap_or("high") {
         "high" => TaskPriority::High,
         "low" => TaskPriority::Low,
         "normal" => TaskPriority::Normal,
         other => return Err(CmdError::Params(format!("`level` must be high|normal|low, not {other}"))),
     };
-    let all = ids.iter().all(|i| s.mailbox.tasks.get(i).is_some_and(|t| t.priority == level));
+    let all = ids.iter().all(|i| row_priority(s, *i) == level);
     let set = if all && p.get("on").is_none() { TaskPriority::Normal } else { level };
     let now = s.now();
     for id in &ids {
         if let Some(t) = s.mailbox.tasks.get_mut(id) {
             t.priority = set;
             t.modified = Some(now);
+        } else if let Some(m) = s.mailbox.mail.get_mut(id) {
+            m.importance = match set {
+                TaskPriority::High => mailcraft_model::Importance::High,
+                TaskPriority::Low => mailcraft_model::Importance::Low,
+                TaskPriority::Normal => mailcraft_model::Importance::Normal,
+            };
         }
     }
     Ok(json!({ "ids": pim::ids_json(&ids), "priority": priority_name(set) }))
@@ -1059,7 +1387,13 @@ fn task_selected(s: &Session) -> Option<&'static str> {
     if pim::selected(s, Kind::Task).is_empty() { Some("select a task first") } else { None }
 }
 
+/// Reply / Reply All: a flagged message row, or an assigned task or task request.
 fn task_request_selected(s: &Session) -> Option<&'static str> {
+    match rows(s, &Value::Null).first() {
+        Some((_, RowOf::Mail)) => return None,
+        Some((_, RowOf::Contact)) => return Some("a contact cannot be answered"),
+        _ => {}
+    }
     let any = pim::selected(s, Kind::Task).iter().any(|i| {
         s.mailbox.tasks.get(i).is_some_and(|t| t.requested_by.is_some() || !t.assigned_to.is_empty())
     });
@@ -1261,7 +1595,20 @@ fn run_reply_all(s: &mut Session, p: &Value) -> CmdResult {
     respond(s, p, true)
 }
 
+/// The first row of a Respond command when it is a flagged message or contact (they answer as Mail and
+/// People do); `None` for a task (or nothing).
+fn first_flagged(s: &Session, p: &Value) -> Option<(ItemId, RowOf)> {
+    rows(s, p).first().filter(|(_, k)| *k != RowOf::Task)
+}
+
 fn respond(s: &mut Session, p: &Value, all: bool) -> CmdResult {
+    match first_flagged(s, p) {
+        Some((id, RowOf::Mail)) => {
+            return route(s, if all { "mail.replyAll" } else { "mail.reply" }, &[id], json!({}));
+        }
+        Some(_) => return Err(CmdError::Disabled("a contact cannot be answered".into())),
+        None => {}
+    }
     let t = first_task(s, p)?;
     let to = reply_targets(s, &t, all);
     if to.is_empty() {
@@ -1275,8 +1622,21 @@ fn respond(s: &mut Session, p: &Value, all: bool) -> CmdResult {
 /// Forward: the task text and the task as a VTODO attachment; `{"as": "attachment"}` sends the attachment
 /// alone (Respond › More › Forward as Attachment).
 fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
-    let t = first_task(s, p)?;
     let text = opt_str(p, "as") != Some("attachment");
+    match first_flagged(s, p) {
+        Some((id, RowOf::Mail)) => {
+            return route(
+                s,
+                if text { "mail.forward" } else { "mail.forwardAsAttachment" },
+                &[id],
+                json!({}),
+            );
+        }
+        // A contact goes as its vCard, the way People's Forward Contact sends it.
+        Some((id, _)) => return route(s, "people.forward", &[id], json!({ "as": "contact" })),
+        None => {}
+    }
+    let t = first_task(s, p)?;
     let subject = mailcraft_model::subject::forward_subject(&t.subject);
     let cid = task_compose(s, &t, String::new(), subject, Some("PUBLISH"), true, text);
     Ok(json!({ "compose": cid, "task": t.id.0 }))
@@ -1284,6 +1644,11 @@ fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Meeting: a new meeting about the task (its subject and notes) with the requester and assignees.
 fn run_meeting(s: &mut Session, p: &Value) -> CmdResult {
+    match first_flagged(s, p) {
+        Some((id, RowOf::Mail)) => return route(s, "mail.replyWithMeeting", &[id], json!({})),
+        Some((id, _)) => return route(s, "people.meeting", &[id], json!({})),
+        None => {}
+    }
     let t = first_task(s, p)?;
     let attendees = reply_targets(s, &t, true);
     let mut params =
@@ -2159,7 +2524,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"kind"?: "today|tomorrow|thisWeek|nextWeek|noDate|custom|complete" (none = the Quick Click flag), "start"?, "due"?, "reminder"?, "ids"?: [number]} (custom without dates = open the Custom dialog)"#,
             true,
-            task_selected,
+            row_selected,
             run_flag,
         ),
         spec(
@@ -2169,7 +2534,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"on"?: bool, "ids"?: [number]}"#,
             true,
-            task_selected,
+            row_selected,
             run_private,
         ),
         spec(
@@ -2179,7 +2544,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"level": "high|low|normal", "on"?: bool, "ids"?: [number]} (toggles back to normal)"#,
             true,
-            task_selected,
+            row_selected,
             run_importance,
         ),
         spec(
@@ -2189,7 +2554,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"ids"?: [number]}"#,
             false,
-            task_selected,
+            row_selected,
             run_all_categories,
         ),
         spec(
@@ -2219,7 +2584,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"as"?: "text|attachment", "ids"?: [number]}"#,
             false,
-            task_selected,
+            row_selected,
             run_forward,
         ),
         spec(
@@ -2229,7 +2594,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"ids"?: [number], ...appointment fields}"#,
             true,
-            task_selected,
+            row_selected,
             run_meeting,
         ),
         spec(
@@ -3006,5 +3371,175 @@ ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.com\r\nEND:VTODO\r\n
             parse_task_message(b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", 0)
                 .is_none()
         );
+    }
+
+    /// Selects `id` the way the Tasks view does (the engine selection follows the To-Do List row).
+    fn select(s: &mut Session, id: ItemId) {
+        s.selection = Selection { folder: role(s, FolderRole::Tasks), items: vec![id], focus: Some(id) };
+    }
+
+    fn flag_of(s: &Session, id: ItemId) -> FlagState {
+        s.mailbox.mail.get(&id).map(|m| m.flag.clone()).unwrap_or(FlagState::None)
+    }
+
+    #[test]
+    fn tasks_home_follow_up_tags_and_categories_act_on_flagged_messages_and_contacts() {
+        let mut s = session();
+        let m = add_mail(&mut s, "Quarterly report", flagged());
+        let c = ItemId(s.run("people.new", &json!({"fullName": "Ann Lee"})).unwrap()["id"].as_u64().unwrap());
+        s.run("people.flag", &json!({"ids": [c.0], "kind": "today"})).unwrap();
+        select(&mut s, m);
+        // The ribbon's checks follow the To-Do List row, not only tasks.
+        for cmd in ["tasks.flag", "tasks.private", "tasks.importance", "tasks.allCategories", "tasks.forward"]
+        {
+            assert_eq!(s.enabled(cmd), None, "{cmd}");
+        }
+        // Follow Up › Tomorrow on a flagged message keeps its flag text and moves its dates.
+        s.run("tasks.flag", &json!({"kind": "tomorrow"})).unwrap();
+        let (start, due) = crate::cmd::mail::flag_dates(&s, crate::cmd::mail::FlagKind::Tomorrow);
+        assert_eq!(
+            flag_of(&s, m),
+            FlagState::Flagged { label: "Follow up".into(), start, due, reminder: None }
+        );
+        assert_eq!(follow_up_state(&s, m), Some("tomorrow"));
+        // Custom: a null date clears it, a date left out stays.
+        s.run("tasks.flag", &json!({"kind": "custom", "start": null, "due": "2026-10-20"})).unwrap();
+        let FlagState::Flagged { start, due, .. } = flag_of(&s, m) else { panic!("still flagged") };
+        assert_eq!(start, None);
+        assert_eq!(due.map(|d| pim::date_string(d, s.tz_offset_min)).as_deref(), Some("2026-10-20"));
+        assert_eq!(follow_up_state(&s, m), Some("custom"), "custom dates match no named Follow Up entry");
+        // The flagged contact too.
+        s.run("tasks.flag", &json!({"ids": [c.0], "kind": "nextWeek"})).unwrap();
+        assert_eq!(follow_up_state(&s, c), Some("nextWeek"));
+        // Categorize (and All Categories) on a message and a contact together.
+        let cat = s.mailbox.categories.first().map(|x| x.name.clone()).unwrap();
+        s.run("tasks.categorize", &json!({"ids": [m.0, c.0], "name": cat})).unwrap();
+        assert!(s.mailbox.mail[&m].categories.contains(&cat));
+        assert!(s.mailbox.contacts[&c].categories.contains(&cat));
+        assert_eq!(
+            s.run("tasks.allCategories", &json!({"ids": [m.0]})).unwrap()["dialog"],
+            "colorCategories"
+        );
+        s.run("tasks.categorize", &json!({"ids": [m.0], "name": "", "clear": true})).unwrap();
+        assert!(s.mailbox.mail[&m].categories.is_empty());
+        // Private and High Importance.
+        s.run("tasks.private", &json!({"ids": [m.0]})).unwrap();
+        assert_eq!(s.mailbox.mail[&m].sensitivity, mailcraft_model::Sensitivity::Private);
+        s.run("tasks.importance", &json!({"ids": [m.0], "level": "high"})).unwrap();
+        assert_eq!(s.mailbox.mail[&m].importance, mailcraft_model::Importance::High);
+        // Follow Up › Complete (the Quick Click when set to it) completes the message's flag.
+        s.run("tasks.flag", &json!({"ids": [m.0], "kind": "complete"})).unwrap();
+        assert!(matches!(flag_of(&s, m), FlagState::Complete { .. }));
+        // A message that is not flagged is not a To-Do List row.
+        let plain = add_mail(&mut s, "Plain", FlagState::None);
+        assert!(s.run("tasks.flag", &json!({"ids": [plain.0], "kind": "today"})).is_err());
+        assert_eq!(flag_of(&s, plain), FlagState::None);
+    }
+
+    #[test]
+    fn tasks_home_respond_move_and_delete_act_on_flagged_messages() {
+        let mut s = session();
+        let m = add_mail(&mut s, "Budget", flagged());
+        if let Some(x) = s.mailbox.mail.get_mut(&m) {
+            x.from = Some(mailcraft_model::Address::new(Some("Ann Lee"), "ann@example.com"));
+        }
+        select(&mut s, m);
+        assert_eq!(s.enabled("tasks.reply"), None);
+        // Reply / Reply All / Forward answer the message as Mail does.
+        let r = s.run("tasks.reply", &json!({})).unwrap();
+        let reply = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(reply.source, Some(m));
+        assert!(reply.to.contains("ann@example.com"), "{}", reply.to);
+        assert!(reply.subject.contains("Budget"));
+        let r = s.run("tasks.replyAll", &json!({"ids": [m.0]})).unwrap();
+        assert!(r["compose"].as_u64().is_some());
+        let r = s.run("tasks.forward", &json!({"ids": [m.0]})).unwrap();
+        let fwd = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert!(fwd.to.is_empty() && fwd.subject.contains("Budget"));
+        // Move without a folder: Mail's folder picker; with a mail folder: the message moves.
+        assert_eq!(s.run("tasks.move", &json!({"ids": [m.0]})).unwrap()["dialog"], "moveToFolder");
+        let inbox = role(&s, FolderRole::Inbox);
+        let archive = s.mailbox.create_folder(inbox, "Projects").unwrap();
+        let r = s.run("tasks.move", &json!({"ids": [m.0], "folder": archive.0})).unwrap();
+        assert_eq!(r["moved"], json!([m.0]));
+        assert_eq!(s.mailbox.mail[&m].folder, archive);
+        // A tasks folder cannot hold the message.
+        let tasks = role(&s, FolderRole::Tasks);
+        assert!(s.run("tasks.move", &json!({"ids": [m.0], "folder": tasks.0})).is_err());
+        // Delete: the message goes to Deleted Items (and leaves the To-Do List), in one undo step.
+        let r = s.run("tasks.delete", &json!({"ids": [m.0]})).unwrap();
+        assert_eq!(r["mail"], json!([m.0]));
+        assert_eq!(s.mailbox.mail[&m].folder, role(&s, FolderRole::DeletedItems));
+        assert!(todo_list(&s).is_empty());
+        s.run("app.undo", &json!({})).unwrap();
+        assert_eq!(s.mailbox.mail[&m].folder, archive);
+        // Nothing that is a To-Do List row: refused, nothing changes.
+        let plain = add_mail(&mut s, "Plain", FlagState::None);
+        assert!(s.run("tasks.delete", &json!({"ids": [plain.0]})).is_err());
+        assert_eq!(s.mailbox.mail[&plain].folder, inbox);
+    }
+
+    #[test]
+    fn tasks_home_on_a_flagged_contact_and_a_mixed_selection() {
+        let mut s = session();
+        let c = ItemId(
+            s.run("people.new", &json!({"fullName": "Ann Lee", "email": "ann@example.com"})).unwrap()["id"]
+                .as_u64()
+                .unwrap(),
+        );
+        s.run("people.flag", &json!({"ids": [c.0], "kind": "today"})).unwrap();
+        select(&mut s, c);
+        // A contact cannot be answered; it is forwarded as a contact card.
+        assert!(s.enabled("tasks.reply").is_some());
+        assert!(s.run("tasks.reply", &json!({"ids": [c.0]})).is_err());
+        let r = s.run("tasks.forward", &json!({"ids": [c.0]})).unwrap();
+        let fwd = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert!(fwd.attachments.iter().any(|a| a.filename.ends_with(".vcf")), "{:?}", fwd.attachments);
+        // A task and a flagged message moved to a tasks folder: the task moves, the message is skipped.
+        let t = ItemId(s.run("tasks.new", &json!({"subject": "Call"})).unwrap()["id"].as_u64().unwrap());
+        let m = add_mail(&mut s, "Notes", flagged());
+        let tasks = role(&s, FolderRole::Tasks);
+        let other = s.mailbox.create_folder(tasks, "Later").unwrap();
+        if let Some(f) = s.mailbox.folders.get_mut(&other) {
+            f.kind = mailcraft_model::FolderKind::Tasks;
+        }
+        let r = s.run("tasks.move", &json!({"ids": [t.0, m.0], "folder": other.0})).unwrap();
+        assert_eq!(r["moved"], json!([t.0]));
+        assert_eq!(r["skipped"], json!([m.0]));
+        // Without a folder a mixed selection gets the tasks folder picker with every row.
+        assert_eq!(s.run("tasks.move", &json!({"ids": [t.0, m.0]})).unwrap()["dialog"], "pimMove");
+        // Delete on a task, a message and a contact together.
+        let r = s.run("tasks.delete", &json!({"ids": [t.0, m.0, c.0]})).unwrap();
+        assert_eq!(r["deleted"].as_array().map(Vec::len), Some(3));
+        assert_eq!(s.mailbox.mail[&m].folder, role(&s, FolderRole::DeletedItems));
+        assert_eq!(s.mailbox.contacts.get(&c).map(|x| x.folder), Some(role(&s, FolderRole::DeletedItems)));
+    }
+
+    #[test]
+    fn custom_follow_up_dialog_starts_from_the_dates_and_can_clear_them() {
+        let mut s = session();
+        let t = ItemId(
+            s.run("tasks.new", &json!({"subject": "Plan", "start": "2026-10-09", "due": "2026-10-12", "reminder": "2026-10-12T09:00"}))
+                .unwrap()["id"]
+                .as_u64()
+                .unwrap(),
+        );
+        select(&mut s, t);
+        s.run("tasks.flag", &json!({"kind": "custom"})).unwrap();
+        let Some(crate::Notice::OpenDialog(name, p)) = s.notices.last().cloned() else { panic!("no dialog") };
+        assert_eq!(name, "pimFlag");
+        assert_eq!((p["start"].as_str(), p["due"].as_str()), (Some("2026-10-09"), Some("2026-10-12")));
+        assert_eq!(p["reminderAt"], "2026-10-12T09:00");
+        // The dialog's None (null) clears a date; a reminder unchecked (null) clears the reminder.
+        s.run("tasks.flag", &json!({"kind": "custom", "start": null, "due": "2026-10-12", "reminder": null}))
+            .unwrap();
+        let task = &s.mailbox.tasks[&t];
+        assert_eq!(task.start, None);
+        assert!(task.due.is_some());
+        assert_eq!(task.reminder, None);
+        // Dates no named entry gives check Custom.
+        assert_eq!(follow_up_state(&s, t), Some("custom"));
+        s.run("tasks.flag", &json!({"kind": "today"})).unwrap();
+        assert_eq!(follow_up_state(&s, t), Some("today"));
     }
 }

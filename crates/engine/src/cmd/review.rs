@@ -25,8 +25,12 @@ pub use accessibility::{A11yIssue, LARGE_AUDIENCE, Severity, auto_alt_text, chec
 
 /// Enabled: a compose is open or a message is selected.
 fn compose_or_message(s: &Session) -> Option<&'static str> {
-    let msg =
-        s.selection.focus.iter().chain(s.selection.items.iter()).any(|id| s.mailbox.mail.contains_key(id));
+    // The selection, or the message an enabled check is scoped to (a read window's).
+    let msg = s
+        .target_ids(&Value::Null)
+        .iter()
+        .chain(s.selection.focus.iter())
+        .any(|id| s.mailbox.mail.contains_key(id));
     if msg || !s.composes.is_empty() { None } else { Some("select a message first") }
 }
 
@@ -749,37 +753,43 @@ fn thesaurus(s: &mut Session, p: &Value) -> CmdResult {
     Ok(result)
 }
 
+/// Translate Message (see [`crate::translate`]). `showOriginal` switches a translated message being written,
+/// or a translated received message, between the translation and the original. With `text` the translation
+/// is given (by a caller that translated it itself) and applied; otherwise the installed translator
+/// translates into `to` (default Options › Language › "Translate messages into"). Without a translator the
+/// Translator window opens and says so: nothing is sent anywhere.
 fn translate(s: &mut Session, p: &Value) -> CmdResult {
-    // Show original / translated toggle for a compose that was translated.
     if opt_bool(p, "showOriginal").is_some() {
-        let c = compose_mut(s, p)?;
-        let Some(orig) = c.original_body.take() else {
-            return Err(CmdError::Failed("this message has not been translated".into()));
-        };
-        c.original_body = Some(std::mem::replace(&mut c.body, orig));
-        c.ensure_body();
-        return Ok(json!({"swapped": true}));
+        return show_original(s, p);
     }
-    let to = opt_str(p, "to").map(str::to_owned);
     let (target, text) = target_text(s, p)?;
-    let Some(to) = to else {
-        let mut payload = target;
-        if let Some(o) = payload.as_object_mut() {
-            o.insert("text".into(), Value::String(text));
-        }
-        return dialog(s, "translate", payload);
+    let to = match opt_str(p, "to") {
+        Some(t) => t.to_owned(),
+        None => s.settings.text("language.translateTo"),
     };
     if !valid_lang(&to) {
         return Err(CmdError::Params(format!("`{to}` is not a language tag")));
     }
-    let Some(translated) = opt_str(p, "text").map(str::to_owned) else {
-        // Hand the text to the translator backend; it calls back with {"to", "text"}.
-        let mut payload = target;
-        if let Some(o) = payload.as_object_mut() {
-            o.insert("text".into(), Value::String(text));
-            o.insert("to".into(), Value::String(to.clone()));
-        }
-        return dialog(s, "translate", payload);
+    let mut by = "the caller".to_owned();
+    let translated = match opt_str(p, "text") {
+        Some(t) => t.to_owned(),
+        None => match crate::translate::run(s, &text, &to) {
+            Some(Ok((t, name))) => {
+                by = name;
+                t
+            }
+            Some(Err(e)) => return Err(CmdError::Failed(format!("the translator could not translate: {e}"))),
+            None => {
+                // No translator installed: the Translator window explains (nothing leaves the computer).
+                let mut payload = target;
+                if let Some(o) = payload.as_object_mut() {
+                    o.insert("text".into(), Value::String(text));
+                    o.insert("to".into(), Value::String(to.clone()));
+                    o.insert("translator".into(), Value::Bool(false));
+                }
+                return dialog(s, "translate", payload);
+            }
+        },
     };
     if target.get("compose").is_some() {
         let c = compose_mut(s, p)?;
@@ -794,8 +804,49 @@ fn translate(s: &mut Session, p: &Value) -> CmdResult {
         c.dirty = true;
         return Ok(json!({"translated": true, "to": to}));
     }
-    // A received message is not changed; the UI shows the translation beside it.
-    Ok(json!({"translated": true, "to": to, "item": target.get("item"), "text": translated}))
+    // A received message is not changed: the reading pane and read windows show the translation instead.
+    let Some(item) = target.get("item").and_then(Value::as_u64) else {
+        return Err(CmdError::Disabled("select a message first".into()));
+    };
+    let shown = crate::translate::Translation {
+        to: to.clone(),
+        text: translated.chars().take(crate::translate::MAX_RESULT_CHARS).collect(),
+        by,
+        show_original: false,
+    };
+    s.translations.insert(ItemId(item), shown);
+    Ok(json!({"translated": true, "to": to, "item": item, "text": translated}))
+}
+
+/// Show Original: a translated message being written swaps its body with the original; a translated
+/// received message switches between its translation and its own body.
+fn show_original(s: &mut Session, p: &Value) -> CmdResult {
+    let item = p
+        .get("id")
+        .and_then(Value::as_u64)
+        .or_else(|| crate::cmd::util::opt_ids(p).and_then(|v| v.first().map(|i| i.0)))
+        .map(ItemId)
+        .or(s.selection.focus)
+        .or_else(|| s.selection.items.first().copied());
+    if p.get("compose").is_none()
+        && let Some(id) = item
+        && let Some(t) = s.translations.get_mut(&id)
+    {
+        let on = opt_bool(p, "showOriginal").unwrap_or(true);
+        // `true` toggles (the menu item); `false` goes back to the translation.
+        t.show_original = on && !t.show_original;
+        return Ok(json!({"item": id.0, "showOriginal": t.show_original}));
+    }
+    if p.get("compose").is_none() && item.is_some_and(|i| s.mailbox.mail.contains_key(&i)) {
+        return Err(CmdError::Failed("this message has not been translated".into()));
+    }
+    let c = compose_mut(s, p)?;
+    let Some(orig) = c.original_body.take() else {
+        return Err(CmdError::Failed("this message has not been translated".into()));
+    };
+    c.original_body = Some(std::mem::replace(&mut c.body, orig));
+    c.ensure_body();
+    Ok(json!({"swapped": true}))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -1541,5 +1592,84 @@ mod tests {
         s.run("review.translate", &json!({"compose": id, "showOriginal": true})).unwrap();
         assert_eq!(s.composes[&id].body.to_plain_text(), "Bonjour");
         assert!(s.run("review.translate", &json!({"compose": id, "to": "bad tag!"})).is_err());
+    }
+
+    /// A fake translator: upper-cases the text and records the languages asked for.
+    struct Upper(std::sync::Mutex<Vec<String>>);
+
+    impl crate::translate::Translator for Upper {
+        fn name(&self) -> String {
+            "Test translator".into()
+        }
+        fn translate(&self, text: &str, to: &str) -> Result<String, String> {
+            if let Ok(mut v) = self.0.lock() {
+                v.push(to.to_owned());
+            }
+            if to == "xx" { Err("unsupported language".into()) } else { Ok(text.to_uppercase()) }
+        }
+    }
+
+    #[test]
+    fn translator_hook_translates_received_messages_and_show_original_switches() {
+        let mut s = session();
+        let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
+        let mut m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
+        m.body.text = Some("hola mundo".into());
+        let mid = s.mailbox.add_mail(m);
+        s.selection.focus = Some(mid);
+        // No translator: the window explains, nothing is translated or kept.
+        let r = s.run("review.translate", &json!({"id": mid.0})).unwrap();
+        assert_eq!(r["dialog"], "translate");
+        assert!(s.translations.is_empty());
+        // Show Original on a message that was never translated is refused (also in a read window).
+        assert!(s.run("review.translate", &json!({"id": mid.0, "showOriginal": true})).is_err());
+        let t = std::sync::Arc::new(Upper(std::sync::Mutex::new(Vec::new())));
+        crate::translate::set_translator(&mut s, Some(t.clone()));
+        // The default target is Options › Language › "Translate messages into".
+        s.run("options.set", &json!({"key": "language.translateTo", "value": "fr"})).unwrap();
+        let r = s.run("review.translate", &json!({"id": mid.0})).unwrap();
+        assert_eq!(r["text"], "HOLA MUNDO");
+        assert_eq!(t.0.lock().unwrap().as_slice(), ["fr"]);
+        let shown = crate::translate::shown(&s, mid).unwrap();
+        assert_eq!((shown.to.as_str(), shown.by.as_str()), ("fr", "Test translator"));
+        // The message itself is not changed.
+        assert_eq!(s.mailbox.mail[&mid].body.text.as_deref(), Some("hola mundo"));
+        // Show Original switches to the message's own body and back.
+        let r = s.run("review.translate", &json!({"id": mid.0, "showOriginal": true})).unwrap();
+        assert_eq!(r["showOriginal"], true);
+        assert!(crate::translate::shown(&s, mid).is_none());
+        s.run("review.translate", &json!({"id": mid.0, "showOriginal": true})).unwrap();
+        assert!(crate::translate::shown(&s, mid).is_some());
+        // A translator error is reported, not a crash.
+        assert!(s.run("review.translate", &json!({"id": mid.0, "to": "xx"})).is_err());
+        // A message being written gets the translation as its body.
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"compose": id, "text": "bonjour"})).unwrap();
+        s.run("review.translate", &json!({"compose": id, "to": "en"})).unwrap();
+        assert_eq!(s.composes[&id].body.to_plain_text(), "BONJOUR");
+    }
+
+    #[test]
+    fn a_translation_goes_when_its_message_is_edited_or_deleted() {
+        // Regression: after Edit Message › Save the old translation still showed in place of the edited
+        // body, and translations of deleted messages were kept for the whole session.
+        let mut s = session();
+        let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
+        let add = |s: &mut Session, text: &str| {
+            let mut m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
+            m.body.text = Some(text.into());
+            s.mailbox.add_mail(m)
+        };
+        let (a, b) = (add(&mut s, "hola"), add(&mut s, "adios"));
+        for id in [a, b] {
+            s.run("review.translate", &json!({"id": id.0, "to": "en", "text": "hello"})).unwrap();
+            assert!(crate::translate::shown(&s, id).is_some());
+        }
+        s.run("mail.editMessage", &json!({"ids": [a.0], "text": "hola de nuevo"})).unwrap();
+        assert!(crate::translate::shown(&s, a).is_none(), "the edited message shows itself");
+        // A message gone from the mailbox (deleted for good, or replaced by a sync) loses its translation.
+        s.mailbox.mail.remove(&b);
+        s.tidy_selection();
+        assert!(!s.translations.contains_key(&b));
     }
 }

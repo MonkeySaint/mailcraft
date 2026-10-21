@@ -29,7 +29,10 @@ mod tasks_view;
 mod todo_bar;
 
 pub use meeting_bar::meeting_bar;
-pub use todo_bar::{TODO_BAR_WIDTH, set_todo_bar, todo_bar, todo_bar_parts, todo_bar_shown};
+pub use todo_bar::{
+    TODO_BAR_WIDTH, saved_todo_bar, set_todo_bar, take_saved_todo_bar, todo_bar, todo_bar_parts,
+    todo_bar_shown,
+};
 
 use serde_json::Value;
 

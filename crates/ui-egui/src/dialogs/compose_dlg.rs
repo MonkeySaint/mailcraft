@@ -414,15 +414,18 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         }
         "messageSelect" => {
             if let Some(id) = d.u64("id") {
-                let r = if d.str("what") == "similar" {
-                    crate::reading::Request::SelectSimilar
-                } else {
-                    crate::reading::Request::SelectAll
+                let r = match d.str("what").as_str() {
+                    "similar" => crate::reading::Request::SelectSimilar,
+                    "object" => crate::reading::Request::SelectObject(
+                        d.u64("index").and_then(|i| usize::try_from(i).ok()).unwrap_or(0),
+                    ),
+                    _ => crate::reading::Request::SelectAll,
                 };
                 crate::reading::request(ctx, app, id, r);
             }
             Out::Close
         }
+        "messageSelectionPane" => message_selection_pane(ctx, app, d),
         "multilevelGallery" => multilevel_gallery(ctx, app, d),
         "insert3dModel" => run_form(
             ctx,
@@ -899,14 +902,47 @@ struct PickState {
     pick: Option<String>,
 }
 
+/// Title of a received message's Selection pane.
+pub const MESSAGE_SELECTION_PANE: &str = "Selection";
+
+/// Selection Pane of a received message (read window › Select › Selection Pane…): the pictures in its body;
+/// clicking one selects it in the message (for copying).
+fn message_selection_pane(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let Some(id) = d.u64("id") else { return Out::Close };
+    let names: Vec<String> = d.arr("objects").iter().filter_map(Value::as_str).map(str::to_owned).collect();
+    window(ctx, app, d, MESSAGE_SELECTION_PANE, 300.0, |ui, app| {
+        if names.is_empty() {
+            muted(ui, app, "This message has no pictures or other objects.");
+        }
+        let mut pick = None;
+        egui::ScrollArea::vertical().id_salt(("msg-selpane", id)).max_height(320.0).show(ui, |ui| {
+            for (i, n) in names.iter().enumerate() {
+                if ui.selectable_label(false, n).clicked() {
+                    pick = Some(i);
+                }
+            }
+        });
+        if let Some(i) = pick {
+            app.run("format.selectionPane", json!({"ids": [id], "select": i}));
+        }
+        footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
+    })
+}
+
+/// What the Translator window says while no translator is installed.
+pub const TRANSLATOR_MISSING: &str = "MailCraft has no translator installed, so nothing was translated and \
+     the text was not sent anywhere. Translation works once a translator (for example one running on this \
+     computer) is set up in MailCraft.";
+
 fn translate(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let text = d.str("text");
+    let to = d.str("to");
     with_state(
         ctx,
         app,
         uid,
-        |_: &App| PickState { pick: Some("en".into()) },
+        move |_: &App| PickState { pick: Some(if to.is_empty() { "en".into() } else { to.clone() }) },
         |st, app| {
             window(ctx, app, d, "Translator", 460.0, |ui, app| {
                 ui.label(RichText::new("Text").strong());
@@ -917,20 +953,12 @@ fn translate(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 let mut lang = st.pick.clone().unwrap_or_default();
                 ui.horizontal(|ui| {
                     ui.label("Translate to:");
-                    common::combo(
-                        ui,
-                        ("trl", uid),
-                        &mut lang,
-                        &["en", "fr", "es", "de", "it", "pt", "nl", "ja", "zh"],
-                        100.0,
-                    );
+                    let tags: Vec<&str> =
+                        mailcraft_engine::translate::LANGUAGES.iter().map(|(t, _)| *t).collect();
+                    common::combo(ui, ("trl", uid), &mut lang, &tags, 100.0);
                 });
                 st.pick = Some(lang);
-                muted(
-                    ui,
-                    app,
-                    "No translation service is connected to MailCraft, so nothing can be translated yet.",
-                );
+                muted(ui, app, TRANSLATOR_MISSING);
                 footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
             })
         },

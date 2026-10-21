@@ -109,10 +109,14 @@ pub fn open(app: &mut App, name: &str, params: Value) {
             }
         }
         "readWindow" => {
-            if let Some(id) = params.get("id").and_then(Value::as_u64)
-                && !app.ui.read_windows.contains(&id)
-            {
-                app.ui.read_windows.push(id);
+            if let Some(id) = params.get("id").and_then(Value::as_u64) {
+                if !app.ui.read_windows.contains(&id) {
+                    app.ui.read_windows.push(id);
+                }
+                // Edit Message: the window edits its message in place.
+                if params.get("edit").and_then(Value::as_bool) == Some(true) {
+                    crate::edit_message::start(app, id);
+                }
             }
         }
         _ => {
@@ -153,6 +157,14 @@ pub fn take_notices(app: &mut App) {
 /// such as `readingPane.markWhenViewed`, junk lists, signatures…), for other areas to read.
 pub fn ui_pref(ctx: &egui::Context, key: &str) -> Option<Value> {
     common::pref(ctx, key)
+}
+
+/// Removes a UI-only setting (the shell then saves the dialog settings without it); its old value, if any.
+pub(crate) fn take_ui_pref(ctx: &egui::Context, key: &str) -> Option<Value> {
+    let mut p = common::prefs(ctx);
+    let old = p.values.remove(key)?;
+    common::set_prefs(ctx, p);
+    Some(old)
 }
 
 /// Gives form controls (text fields, check boxes, radio buttons, buttons) inside `ui` a visible border; the
@@ -291,6 +303,7 @@ pub const KNOWN: &[&str] = &[
     "applyStyles",
     "pasteSpecial",
     "find",
+    "messageSelectionPane",
     "replace",
     "goTo",
     "insertPicture",
@@ -338,7 +351,6 @@ pub const KNOWN: &[&str] = &[
     "task",
     "note",
     "newPost",
-    "editMessage",
     "closeAllItems",
     "chooseForm",
     "forwardContact",

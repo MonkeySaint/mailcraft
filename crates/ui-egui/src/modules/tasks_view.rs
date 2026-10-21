@@ -174,12 +174,8 @@ fn keyboard(ctx: &egui::Context, app: &mut App, st: &mut ModState, list: &[Row])
     }
     let Some(row) = selected(app, list).cloned() else { return };
     if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)) {
-        if row.flagged_item() {
-            app.run("tasks.removeFromList", json!({ "ids": [row.id.0] }));
-            select_item(app, None);
-        } else {
-            delete_row(app, row.id);
-        }
+        // Delete deletes the row's item, as the ribbon's Delete does (a flagged message goes to Deleted Items).
+        delete_row(app, row.id);
     } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
         open_row(app, st, &row);
     } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Insert)) {
@@ -192,7 +188,13 @@ fn keyboard(ctx: &egui::Context, app: &mut App, st: &mut ModState, list: &[Row])
 }
 
 fn step(app: &mut App, list: &[Row], row: &Row, delta: i64) {
-    let Some(pos) = list.iter().position(|r| r.id == row.id) else { return };
+    // An item filed under several categories has a row in each group: step past its other rows.
+    let pos = if delta < 0 {
+        list.iter().position(|r| r.id == row.id)
+    } else {
+        list.iter().rposition(|r| r.id == row.id)
+    };
+    let Some(pos) = pos else { return };
     let next = i64::try_from(pos).unwrap_or(0).saturating_add(delta);
     if let Some(r) = usize::try_from(next).ok().and_then(|i| list.get(i)) {
         select_item(app, Some(r.id.0));
@@ -329,7 +331,7 @@ fn task_list(
                 let count = list.iter().skip(i).take_while(|r| r.group.as_deref() == Some(g)).count();
                 let shut = collapsed.contains(g);
                 if group_row(ui, app, g, count, shut) {
-                    toggle_group(app, row.id, shut);
+                    toggle_group(app, row.id, g, shut);
                 }
             }
             if row.group.as_ref().is_some_and(|g| collapsed.contains(g)) {
@@ -417,8 +419,11 @@ fn row_ui(
         match l.col.id {
             "complete" => {
                 let cb = Rect::from_center_size(cell.center(), Vec2::splat(14.0));
-                let cb_resp =
-                    ui.interact(cb.expand(4.0), Id::new(("mc-task-check", row.id.0)), Sense::click());
+                let cb_resp = ui.interact(
+                    cb.expand(4.0),
+                    Id::new(("mc-task-check", row.id.0, row.group.as_deref())),
+                    Sense::click(),
+                );
                 a11y(&cb_resp, WidgetType::Checkbox, &format!("Complete {}", row.subject));
                 draw_check(ui, cb, row.done, app.theme.complete, app.theme.text_muted);
                 toggle |= cb_resp.clicked();
@@ -494,7 +499,8 @@ fn row_ui(
     if !body.is_empty() {
         let x = subject_x.unwrap_or(line.min.x + 52.0);
         let area = Rect::from_min_max(pos2(x, line.max.y - 2.0), rect.max);
-        let pr = ui.interact(area, Id::new(("mc-task-preview", row.id.0)), Sense::hover());
+        let pr =
+            ui.interact(area, Id::new(("mc-task-preview", row.id.0, row.group.as_deref())), Sense::hover());
         a11y(&pr, WidgetType::Label, &body);
         let galley = ui.painter().layout(
             body,
@@ -534,45 +540,46 @@ fn row_menu(ui: &mut Ui, app: &mut App, st: &mut ModState, r: &Row) {
         toggle_complete(app, r);
         ui.close();
     }
-    if !r.flagged_item() {
-        ui.menu_button("Follow Up", |ui| {
-            for (kind, label) in [
-                ("today", "Today"),
-                ("tomorrow", "Tomorrow"),
-                ("thisWeek", "This Week"),
-                ("nextWeek", "Next Week"),
-                ("noDate", "No Date"),
-                ("custom", "Custom..."),
-            ] {
-                if ui.button(label).clicked() {
-                    app.run("tasks.flag", json!({ "ids": [r.id.0], "kind": kind }));
-                    ui.close();
-                }
+    // Flagged messages and contacts take the same commands as tasks (the Tasks commands hand them to Mail
+    // and People).
+    ui.menu_button("Follow Up", |ui| {
+        let on = mailcraft_engine::cmd::tasks::follow_up_state(&app.s, r.id);
+        for (kind, label) in [
+            ("today", "Today"),
+            ("tomorrow", "Tomorrow"),
+            ("thisWeek", "This Week"),
+            ("nextWeek", "Next Week"),
+            ("noDate", "No Date"),
+            ("custom", "Custom..."),
+        ] {
+            if ui.add(egui::Button::new(label).selected(on == Some(kind))).clicked() {
+                app.run("tasks.flag", json!({ "ids": [r.id.0], "kind": kind }));
+                ui.close();
             }
-        });
-        ui.menu_button("Categorize", |ui| {
-            let cats: Vec<String> = app.s.mailbox.categories.iter().map(|c| c.name.clone()).collect();
-            for c in cats {
-                if ui.button(&c).clicked() {
-                    app.run("tasks.categorize", json!({ "ids": [r.id.0], "name": c }));
-                    ui.close();
-                }
+        }
+    });
+    ui.menu_button("Categorize", |ui| {
+        let cats: Vec<String> = app.s.mailbox.categories.iter().map(|c| c.name.clone()).collect();
+        for c in cats {
+            if ui.button(&c).clicked() {
+                app.run("tasks.categorize", json!({ "ids": [r.id.0], "name": c }));
+                ui.close();
             }
-        });
-        if ui.button("Forward").clicked() {
-            app.run("tasks.forward", json!({ "ids": [r.id.0] }));
-            ui.close();
         }
-        if ui.button("Move to Folder...").clicked() {
-            app.run("tasks.move", json!({ "ids": [r.id.0] }));
-            ui.close();
-        }
+    });
+    if ui.button("Forward").clicked() {
+        app.run("tasks.forward", json!({ "ids": [r.id.0] }));
+        ui.close();
+    }
+    if ui.button("Move to Folder...").clicked() {
+        app.run("tasks.move", json!({ "ids": [r.id.0] }));
+        ui.close();
     }
     if ui.button("Remove from List").clicked() {
         app.run("tasks.removeFromList", json!({ "ids": [r.id.0] }));
         ui.close();
     }
-    if !r.flagged_item() && ui.button("Delete").clicked() {
+    if ui.button("Delete").clicked() {
         delete_row(app, r.id);
         ui.close();
     }
@@ -615,8 +622,7 @@ fn details(ui: &mut Ui, app: &mut App, st: &mut ModState, row: &Row) {
                 app.run("tasks.removeFromList", json!({ "ids": [row.id.0] }));
                 select_item(app, None);
             }
-            if !row.flagged_item() && crate::widgets::icon_button(ui, app, "delete", "Delete", true).clicked()
-            {
+            if crate::widgets::icon_button(ui, app, "delete", "Delete", true).clicked() {
                 delete_row(app, row.id);
             }
         });

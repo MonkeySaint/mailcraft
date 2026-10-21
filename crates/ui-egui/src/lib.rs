@@ -16,6 +16,7 @@ pub mod compose;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
 pub mod dialogs;
+pub mod edit_message;
 pub mod explorer;
 pub mod folders;
 pub mod icons;
@@ -60,6 +61,8 @@ pub struct UiState {
     pub dialogs: Vec<(String, Value)>,
     /// Opened read windows (item ids).
     pub read_windows: Vec<u64>,
+    /// Read windows whose message is being edited in place (Edit Message), by item id.
+    pub editing_messages: Vec<u64>,
     /// More main windows opened with Open in New Window, each with its own folder and selection.
     pub explorers: Vec<explorer::ExplorerWindow>,
     /// The platform draws extra windows inside the main one (the web build, test harnesses): Open in New
@@ -87,10 +90,10 @@ pub struct UiState {
     /// Local control-channel port requested on the command line (`--control-port N`) or through
     /// `MAILCRAFT_CONTROL_PORT`; `None` = control channel off. Read by `control` (native builds only).
     pub control_port: Option<u16>,
-    /// A `view.todoBar` part waiting to be applied to the To-Do Bar (egui memory) at the next frame boundary.
-    pub todo_bar_request: Option<String>,
-    /// To-Do Bar parts shown (calendar, people, tasks), mirrored each frame for the ribbon's check marks.
+    /// To-Do Bar parts shown (calendar, people, tasks), mirrored each frame from the session's view state.
     pub todo_bar_parts: (bool, bool, bool),
+    /// The To-Do Bar parts an older profile kept in the dialog settings were taken over (and removed there).
+    pub todo_bar_migrated: bool,
 }
 
 impl Surface {
@@ -391,11 +394,8 @@ impl App {
         }
         match self.s.run(id, &params) {
             Ok(v) => {
-                // The session keeps no To-Do Bar state: the UI applies the part (see `apply_todo_bar`).
-                if id == "view.todoBar"
-                    && let Some(part) = v.get("todoBar").and_then(Value::as_str)
-                {
-                    self.ui.todo_bar_request = Some(part.to_owned());
+                if id == "view.todoBar" {
+                    self.ui.todo_bar_parts = modules::todo_bar_parts(self);
                 }
                 Some(v)
             }
@@ -454,6 +454,11 @@ impl App {
         let ctx = ui.ctx().clone();
         self.ui.egui_ctx = Some(ctx.clone());
         self.ui.embedded_viewports = ctx.embed_viewports();
+        // The main window was asked to close (its close button, or File › Exit): a message with unsaved
+        // Edit Message changes asks first and MailCraft stays open.
+        if ctx.input(|i| i.viewport().close_requested()) && !edit_message::may_exit(&ctx, self) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         egui_extras::install_image_loaders(&ctx);
         self.sync_theme(&ctx);
         // Control-channel requests (when `--control-port` asked for one) apply before drawing.
@@ -487,18 +492,21 @@ impl App {
         dialogs::dialogs(&ctx, self);
 
         self.drain_notices(&ctx);
-        if self.ui.todo_bar_request.is_some() {
-            ctx.request_repaint();
-        }
         self.draw_toasts(&ctx);
     }
 
-    /// Applies a pending `view.todoBar` part and mirrors the parts shown into [`UiState::todo_bar_parts`].
-    fn apply_todo_bar(&mut self, ctx: &egui::Context) {
-        if let Some(part) = self.ui.todo_bar_request.take() {
-            modules::set_todo_bar(ctx, &part);
+    /// Mirrors the To-Do Bar parts the session keeps into [`UiState::todo_bar_parts`]; parts an older profile
+    /// kept in the dialog settings are taken over once (the old setting is removed with that).
+    pub(crate) fn apply_todo_bar(&mut self, ctx: &egui::Context) {
+        if !self.ui.todo_bar_migrated
+            && let Some(old) = modules::take_saved_todo_bar(ctx)
+        {
+            self.ui.todo_bar_migrated = true;
+            if !self.s.view.todo_bar.shown() {
+                self.s.view.todo_bar = old;
+            }
         }
-        self.ui.todo_bar_parts = modules::todo_bar_parts(ctx);
+        self.ui.todo_bar_parts = modules::todo_bar_parts(self);
     }
 
     /// Installs bundled fonts into egui (Inter for UI; all bundled faces as named families for message bodies).

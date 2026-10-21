@@ -248,7 +248,9 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
                     "`part` must be calendar, people, tasks or off, not `{part}`"
                 )));
             }
+            crate::cmd::view::toggle_todo_bar(s, part);
             extra.insert("todoBar".into(), json!(part));
+            extra.insert("parts".into(), crate::cmd::view::todo_bar_json(s.view.todo_bar));
         }
         "view.tighterSpacing" => {
             v.tighter_spacing = pim::flag(p, "on")?.unwrap_or(!v.tighter_spacing);

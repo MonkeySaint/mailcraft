@@ -1410,8 +1410,9 @@ pub const DEFS: &[Def] = &[
         "language.translate",
         "Choose how to handle messages received in other languages:",
         Choice("ask", TRANSLATE),
-        // N: machine translation is a cloud service and MailCraft bundles no offline translator.
-        N,
+        // S: offering to translate on arrival needs language detection, which MailCraft does not have;
+        // Translate Message works on request through an installed translator (`crate::translate`).
+        S,
     ),
     d(
         "language",
@@ -1419,8 +1420,8 @@ pub const DEFS: &[Def] = &[
         "language.translateTo",
         "Translate messages into:",
         Choice("en", TRANSLATE_TO),
-        // N: see language.translate (no offline translator).
-        N,
+        // The language Translate Message translates into (with an installed translator).
+        A,
     ),
     // ---------------------------------------------------------------- Accessibility
     d(

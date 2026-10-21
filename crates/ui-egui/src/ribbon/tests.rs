@@ -450,6 +450,98 @@ fn read_window_quick_steps_act_on_the_window_message() {
 }
 
 #[test]
+fn read_window_commands_act_on_the_window_message_without_touching_the_list_selection() {
+    use mailcraft_model::{FlagState, ItemId};
+    let ctx = egui::Context::default();
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let inbox = app.s.selection.folder;
+    let open = app.s.mailbox.items_in(inbox).first().map(|m| m.id).unwrap();
+    // The main window shows another module with nothing selected.
+    app.s.selection.items.clear();
+    app.s.selection.focus = None;
+    let surface = Surface::Read(open.0);
+    for cmd in [
+        "mail.flag",
+        "mail.flagCustom",
+        "mail.addReminder",
+        "mail.markComplete",
+        "mail.categorize",
+        "mail.clearCategories",
+        "mail.move",
+        "mail.copy",
+        "mail.alwaysMoveConversation",
+        "mail.cleanUpConversation",
+        "mail.findRelated",
+        "mail.editMessage",
+        "mail.messageOptions",
+        "mail.viewSource",
+    ] {
+        assert_eq!(state::disabled(&app, surface, cmd), None, "{cmd} in a read window");
+        assert!(state::disabled(&app, Surface::Main, cmd).is_some(), "{cmd} with nothing selected");
+    }
+    // Resend is offered in the read window of a received message too (as observed); it asks first there.
+    assert_eq!(state::disabled(&app, surface, "mail.resend"), None);
+    assert!(state::disabled(&app, Surface::Main, "mail.resend").is_some());
+    let resend = state::Action { cmd: "mail.resend".into(), params: serde_json::json!({}), flip: None };
+    let composes = app.s.composes.len();
+    state::run(&ctx, &mut app, surface, &mut state::Mem::default(), &resend);
+    assert_eq!(app.s.composes.len(), composes, "nothing is resent before the question is answered");
+    assert!(
+        app.s.notices.iter().any(|n| matches!(n, mailcraft_engine::Notice::OpenDialog(d, p)
+            if d == "confirm" && p["params"]["ids"] == serde_json::json!([open.0]))),
+        "the question names the window's message"
+    );
+    // Follow Up › Today from the window flags the window's message; the main selection stays empty.
+    let act =
+        state::Action { cmd: "mail.flag".into(), params: serde_json::json!({"kind": "today"}), flip: None };
+    let mut mem = state::Mem::default();
+    state::run(&ctx, &mut app, surface, &mut mem, &act);
+    assert!(matches!(app.s.mailbox.mail[&ItemId(open.0)].flag, FlagState::Flagged { .. }));
+    assert!(app.s.selection.items.is_empty() && app.s.selection.focus.is_none());
+    assert!(state::is_on(&app, surface, &mem, "followup:today"));
+}
+
+#[test]
+fn tasks_follow_up_buttons_show_the_selected_rows_flag() {
+    use mailcraft_model::ItemId;
+    // Selects a To-Do List row as the Tasks view does.
+    fn pick(app: &mut App, id: u64) {
+        app.ui.module_selection = Some(id);
+        app.s.selection.items = vec![ItemId(id)];
+        app.s.selection.focus = Some(ItemId(id));
+    }
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    app.run("nav.tasks", serde_json::json!({}));
+    let id = app
+        .run("tasks.new", serde_json::json!({"subject": "Plan the trip"}))
+        .and_then(|r| r["id"].as_u64())
+        .unwrap();
+    pick(&mut app, id);
+    let mem = state::Mem::default();
+    assert!(!state::is_on(&app, Surface::Main, &mem, "taskflag:tomorrow"));
+    let act = state::Action {
+        cmd: "tasks.flag".into(),
+        params: serde_json::json!({"kind": "tomorrow"}),
+        flip: None,
+    };
+    let ctx = egui::Context::default();
+    state::run(&ctx, &mut app, Surface::Main, &mut state::Mem::default(), &act);
+    assert!(state::is_on(&app, Surface::Main, &mem, "taskflag:tomorrow"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "taskflag:today"));
+    // A flagged message row of the To-Do List: the buttons are enabled and show its flag.
+    let m = app.s.mailbox.mail.keys().next().copied().map(|i: ItemId| i.0).unwrap();
+    app.run("mail.flag", serde_json::json!({"ids": [m], "kind": "nextWeek"}));
+    pick(&mut app, m);
+    assert_eq!(state::disabled(&app, Surface::Main, "tasks.flag"), None);
+    assert!(state::is_on(&app, Surface::Main, &mem, "taskflag:nextWeek"));
+    // Dates none of the named entries gives: Custom... is the checked entry.
+    app.run("tasks.flag", serde_json::json!({"ids": [id], "kind": "custom", "due": "2031-02-03"}));
+    pick(&mut app, id);
+    assert!(state::is_on(&app, Surface::Main, &mem, "taskflag:custom"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "taskflag:tomorrow"));
+}
+
+#[test]
 fn keytips_select_tabs_and_run_commands() {
     let ctx = egui::Context::default();
     let mut app = App::new(mailcraft_engine::sample::sample_session());

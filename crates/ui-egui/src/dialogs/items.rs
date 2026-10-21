@@ -16,8 +16,8 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
         "note" => note(ctx, app, d),
         "newPost" => post(ctx, app, d),
-        "editMessage" => edit_message(ctx, app, d),
-        "closeAllItems" => close_item_windows(app),
+
+        "closeAllItems" => close_item_windows(ctx, app),
         "goToDate" => run_form(
             ctx,
             app,
@@ -137,51 +137,18 @@ fn post(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
-/// Edit Message: the subject and text of a received message, saved back to the stored item.
-fn edit_message(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let Some(id) = d.u64("id").filter(|i| app.s.mailbox.mail.contains_key(&ItemId(*i))) else {
-        return Out::Close;
-    };
-    let (subject, text) = (d.str("subject"), d.str("text"));
-    let mut fields = vec![f("subject", "Subject:", Kind::Text), f("body", "Message:", Kind::Multi)];
-    if d.bool("html") {
-        fields.push(f(
-            "n",
-            "",
-            Kind::Note("Saving changed text replaces the message's formatting with plain paragraphs.".into()),
-        ));
-    }
-    let form = Form::new("Edit Message", fields)
-        .init("subject", json!(subject))
-        .init("body", json!(text))
-        .ok("Save")
-        .width(560.0);
-    run_form(ctx, app, d, form, move |app, v| {
-        let body = v.0.get("body").and_then(Value::as_str).unwrap_or_default().to_owned();
-        let mut p = json!({"ids": [id]});
-        if let Some(o) = p.as_object_mut() {
-            if v.s("subject") != subject.trim() {
-                o.insert("subject".into(), json!(v.s("subject")));
-            }
-            // Untouched text keeps the message's own body (and its formatting).
-            if body.trim() != text.trim() {
-                o.insert("text".into(), json!(body));
-            }
-            if o.len() == 1 {
-                return Ok(None);
-            }
-        }
-        cmd(app, "mail.editMessage", p).map(|_| None)
-    })
-}
-
 /// Item windows Close All Items closes (besides the read windows).
-const ITEM_WINDOWS: [&str; 6] =
-    ["note", "newPost", "editMessage", "contactCard", "chooseContact", "forwardContact"];
+const ITEM_WINDOWS: [&str; 5] = ["note", "newPost", "contactCard", "chooseContact", "forwardContact"];
 
-/// Close All Items (`app.closeAllItems` asks for it): closes the read windows and the item windows here.
-fn close_item_windows(app: &mut App) -> Out {
-    app.ui.read_windows.clear();
+/// Close All Items (`app.closeAllItems` asks for it): closes the read windows and the item windows here. A
+/// read window editing its message with unsaved edits stays open and asks whether to save them.
+fn close_item_windows(ctx: &Context, app: &mut App) -> Out {
+    let windows = std::mem::take(&mut app.ui.read_windows);
+    for id in windows {
+        if !crate::edit_message::may_close(ctx, app, id) {
+            app.ui.read_windows.push(id);
+        }
+    }
     app.ui.dialogs.retain(|(name, _)| !ITEM_WINDOWS.contains(&name.as_str()));
     Out::Close
 }
@@ -595,26 +562,6 @@ mod tests {
     }
 
     #[test]
-    fn edit_message_saves_the_new_subject() {
-        let mut app = App::new(sample_session());
-        let folder = app.s.selection.folder;
-        let id = app.s.mailbox.items_in(folder).first().map(|m| m.id).unwrap();
-        let body = app.s.mailbox.mail[&id].body.clone();
-        app.run("nav.selectItem", json!({"id": id.0})).unwrap();
-        app.run("mail.editMessage", json!({})).unwrap();
-        let mut h = harness(app);
-        assert_eq!(names(&h), ["editMessage"]);
-        type_into(&mut h, 0, " (edited)");
-        h.get_by_label("Save").click();
-        h.run_steps(3);
-        assert!(names(&h).is_empty(), "{:?}", names(&h));
-        let m = &h.state().s.mailbox.mail[&id];
-        assert!(m.subject.contains("(edited)"), "{}", m.subject);
-        // The text was not touched: the body (and its formatting) stays as it was.
-        assert_eq!(m.body, body);
-    }
-
-    #[test]
     fn close_all_items_closes_read_and_item_windows() {
         let mut app = App::new(sample_session());
         let folder = app.s.selection.folder;
@@ -624,12 +571,16 @@ mod tests {
         app.run("nav.selectItem", json!({"id": id})).unwrap();
         app.run("mail.editMessage", json!({})).unwrap();
         let mut h = harness(app);
-        assert_eq!(names(&h), ["newPost", "editMessage"]);
+        // Edit Message edits the open read window's message in place.
+        assert_eq!(names(&h), ["newPost"]);
         assert_eq!(h.state().ui.read_windows, [id]);
+        assert_eq!(h.state().ui.editing_messages, [id]);
         h.state_mut().run("app.closeAllItems", json!({}));
         h.run_steps(3);
         assert!(names(&h).is_empty(), "{:?}", names(&h));
+        // Nothing was changed in the edited message, so its window closes too.
         assert!(h.state().ui.read_windows.is_empty());
+        assert!(h.state().ui.editing_messages.is_empty());
     }
     #[test]
     fn add_calendar_offers_only_supported_sources() {
