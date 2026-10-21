@@ -134,6 +134,120 @@ impl Default for ViewSettings {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Advanced View Settings shared by every table view: group levels, sort keys, Other Settings
+
+/// Most fields Group By nests (Group items by, then by, then by, then by).
+pub const MAX_GROUP_LEVELS: usize = 4;
+/// Most keys Sort orders by (Sort items by, then by, then by, then by).
+pub const MAX_SORT_KEYS: usize = 4;
+/// Joins the labels of nested groups into the key a row's group is collapsed by ("Categories: Red › Status:
+/// Not Started").
+pub const GROUP_SEP: &str = " \u{203a} ";
+/// Smallest and largest font size (points) Other Settings accepts for rows and column headings; 0 keeps
+/// the view's own size.
+pub const MIN_VIEW_FONT: u8 = 8;
+pub const MAX_VIEW_FONT: u8 = 24;
+
+/// Group By › Expand/collapse defaults: how the groups of a view show when the view is opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExpandDefault {
+    /// Every group open (each opening of the view forgets groups collapsed by hand).
+    #[default]
+    AllExpanded,
+    /// Every group closed when the view opens.
+    AllCollapsed,
+    /// Groups stay as they were left.
+    AsLastViewed,
+}
+
+impl ExpandDefault {
+    pub const ALL: [ExpandDefault; 3] =
+        [ExpandDefault::AllExpanded, ExpandDefault::AllCollapsed, ExpandDefault::AsLastViewed];
+
+    pub fn is_default(&self) -> bool {
+        *self == ExpandDefault::AllExpanded
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ExpandDefault::AllExpanded => "expanded",
+            ExpandDefault::AllCollapsed => "collapsed",
+            ExpandDefault::AsLastViewed => "lastViewed",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ExpandDefault::AllExpanded => "All expanded",
+            ExpandDefault::AllCollapsed => "All collapsed",
+            ExpandDefault::AsLastViewed => "As last viewed",
+        }
+    }
+
+    /// From a key or a label ("collapsed", "All collapsed").
+    pub fn parse(s: &str) -> Option<ExpandDefault> {
+        let want: String = s.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_lowercase();
+        ExpandDefault::ALL.into_iter().find(|e| {
+            let label: String =
+                e.label().chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_lowercase();
+            e.key().to_lowercase() == want || label == want || label.trim_start_matches("all") == want
+        })
+    }
+}
+
+/// View Settings › Other Settings of a table view: fonts of the rows and column headings, grid lines and
+/// AutoPreview.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TableOther {
+    /// Row font size in points (0 = the view's own).
+    pub row_font: u8,
+    /// Column heading font size in points (0 = the view's own).
+    pub column_font: u8,
+    /// No grid lines between rows.
+    pub no_grid: bool,
+    /// AutoPreview: a few lines of each item's text under its row.
+    pub auto_preview: bool,
+}
+
+impl TableOther {
+    pub fn is_default(&self) -> bool {
+        *self == TableOther::default()
+    }
+
+    /// Font sizes clamped into [`MIN_VIEW_FONT`]..=[`MAX_VIEW_FONT`] (0 stays 0).
+    pub fn sanitized(mut self) -> TableOther {
+        self.row_font = clamp_font(self.row_font);
+        self.column_font = clamp_font(self.column_font);
+        self
+    }
+
+    /// One-line description for View Settings.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.row_font > 0 {
+            parts.push(format!("rows {} pt", self.row_font));
+        }
+        if self.column_font > 0 {
+            parts.push(format!("headings {} pt", self.column_font));
+        }
+        if self.no_grid {
+            parts.push("no grid lines".into());
+        }
+        if self.auto_preview {
+            parts.push("AutoPreview".into());
+        }
+        if parts.is_empty() { "Default fonts and grid lines".to_owned() } else { parts.join(", ") }
+    }
+}
+
+/// A font size Other Settings accepts: 0 (the view's own) or within [`MIN_VIEW_FONT`]..=[`MAX_VIEW_FONT`].
+pub fn clamp_font(pt: u8) -> u8 {
+    if pt == 0 { 0 } else { pt.clamp(MIN_VIEW_FONT, MAX_VIEW_FONT) }
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Item views of the Calendar, People, Tasks and Notes modules: Filter and Conditional Formatting
 // ---------------------------------------------------------------------------------------------------------
 
@@ -395,6 +509,21 @@ mod item_view_tests {
         let many: Vec<ItemRule> =
             (0..100).map(|i| ItemRule { name: format!("r{i}"), ..Default::default() }).collect();
         assert_eq!(sanitize_rules(many).len(), MAX_ITEM_RULES);
+    }
+
+    #[test]
+    fn expand_defaults_and_other_settings() {
+        assert_eq!(ExpandDefault::parse("collapsed"), Some(ExpandDefault::AllCollapsed));
+        assert_eq!(ExpandDefault::parse("All expanded"), Some(ExpandDefault::AllExpanded));
+        assert_eq!(ExpandDefault::parse("As last viewed"), Some(ExpandDefault::AsLastViewed));
+        assert_eq!(ExpandDefault::parse("lastViewed"), Some(ExpandDefault::AsLastViewed));
+        assert_eq!(ExpandDefault::parse("sideways"), None);
+        assert!(ExpandDefault::default().is_default());
+        let o = TableOther { row_font: 200, column_font: 1, ..Default::default() }.sanitized();
+        assert_eq!((o.row_font, o.column_font), (MAX_VIEW_FONT, MIN_VIEW_FONT));
+        assert_eq!(clamp_font(0), 0);
+        assert!(o.describe().contains("24 pt"));
+        assert_eq!(TableOther::default().describe(), "Default fonts and grid lines");
     }
 
     #[test]

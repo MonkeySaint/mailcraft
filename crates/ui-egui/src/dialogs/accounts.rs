@@ -37,6 +37,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "confirmRemoveAccount" => confirm_remove(ctx, app, d),
         "sendReceiveProgress" => progress(ctx, app, d),
         "newDataFile" => new_data_file(ctx, app, d),
+        "dataFilePassword" => data_file_password(ctx, app, d),
         _ => return None,
     })
 }
@@ -46,10 +47,16 @@ struct DataFileState {
     name: String,
     error: String,
     focused: bool,
+    /// Kept in a file of its own at `path` (else with the profile's data).
+    own_file: bool,
+    path: String,
+    password: String,
+    verify: String,
 }
 
 /// New Data File (New Items › More Items › Data File..., File › Account Settings › Data Files): the data
-/// file's name; it is kept with this profile's data, whose folder the dialog shows (`file.newDataFile`).
+/// file's name, and where it is kept: with this profile's data (whose folder the dialog shows), or in a
+/// file of its own picked with the save dialog, optionally protected by a password (`file.newDataFile`).
 fn new_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let start = d.str("name");
@@ -60,8 +67,8 @@ fn new_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         uid,
         |_: &App| DataFileState { name: start.clone(), ..Default::default() },
         |st, app| {
-            window(ctx, app, d, "New Data File", 420.0, |ui, app| {
-                let l = ui.label("File name:");
+            window(ctx, app, d, "New Data File", 460.0, |ui, app| {
+                let l = ui.label("Name:");
                 let r = ui
                     .add(egui::TextEdit::singleline(&mut st.name).desired_width(f32::INFINITY))
                     .labelled_by(l.id);
@@ -69,18 +76,63 @@ fn new_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     r.request_focus();
                     st.focused = true;
                 }
-                if location.is_empty() {
-                    muted(ui, app, "Saved with this profile's data (this session keeps it in memory only).");
-                } else {
-                    muted(ui, app, &format!("Saved with this profile's data in {location}"));
+                ui.add_space(4.0);
+                ui.radio_value(&mut st.own_file, false, "Keep it with this profile's data");
+                if !st.own_file {
+                    if location.is_empty() {
+                        muted(ui, app, "This session keeps it in memory only.");
+                    } else {
+                        muted(ui, app, &format!("In {location}"));
+                    }
+                }
+                ui.radio_value(&mut st.own_file, true, "Save it as a file of its own");
+                if st.own_file {
+                    ui.horizontal(|ui| {
+                        let l = ui.label("File:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut st.path)
+                                .hint_text("Where to save the .mcdata file")
+                                .desired_width(280.0),
+                        )
+                        .labelled_by(l.id);
+                        if common::browse_button(ui, app) {
+                            let filters = [crate::FileFilter::new("MailCraft data file", &["mcdata"])];
+                            let suggest = if st.path.trim().is_empty() {
+                                format!("{}.mcdata", st.name.trim())
+                            } else {
+                                st.path.clone()
+                            };
+                            if let Some(p) = common::browse_save(app, "New Data File", &filters, &suggest) {
+                                st.path = p;
+                            }
+                        }
+                    });
+                    egui::Grid::new(("ndf-pw", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        grid_edit(ui, "Password (optional):", &mut st.password, "", true);
+                        grid_edit(ui, "Verify password:", &mut st.verify, "", true);
+                    });
+                    muted(
+                        ui,
+                        app,
+                        "The file can be closed, moved and opened again (File › Open & Export › Open Data \
+                         File). With a password the file is encrypted and cannot be opened without it. \
+                         While it is open, its items are kept unencrypted with this profile and its \
+                         password is remembered there.",
+                    );
+                }
+                let mismatch = st.own_file && st.password != st.verify;
+                if mismatch && !st.verify.is_empty() {
+                    ui.colored_label(app.theme.danger, "The passwords do not match.");
                 }
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
                 }
+                let ready =
+                    !st.name.trim().is_empty() && !mismatch && (!st.own_file || !st.path.trim().is_empty());
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                match ok_cancel(ui, app, !st.name.trim().is_empty()) {
+                match ok_cancel(ui, app, ready) {
                     Some(true) => create_data_file(app, st),
-                    _ if enter && !st.name.trim().is_empty() => create_data_file(app, st),
+                    _ if enter && ready => create_data_file(app, st),
                     Some(false) => Out::Close,
                     None => Out::Keep,
                 }
@@ -90,13 +142,122 @@ fn new_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 fn create_data_file(app: &mut App, st: &mut DataFileState) -> Out {
-    match try_run(app, "file.newDataFile", json!({ "name": st.name.trim() })) {
+    let p = if st.own_file {
+        let mut p = json!({ "name": st.name.trim(), "path": st.path.trim() });
+        if !st.password.is_empty()
+            && let Some(o) = p.as_object_mut()
+        {
+            o.insert("password".into(), json!(st.password));
+        }
+        p
+    } else {
+        json!({ "name": st.name.trim() })
+    };
+    let r = try_run(app, "file.newDataFile", p);
+    // The password leaves the dialog state either way.
+    st.password.clear();
+    st.verify.clear();
+    match r {
+        // An existing protected file at that path asks for its password in a dialog of its own.
+        Ok(v) if v.get("dialog").is_some() => Out::Close,
         Ok(_) => Out::Close,
         Err(e) => {
             st.error = e;
             Out::Keep
         }
     }
+}
+
+#[derive(Clone, Default)]
+struct PasswordState {
+    password: String,
+    verify: String,
+    error: String,
+    focused: bool,
+}
+
+/// The password of a protected data file, asked for when it is opened or written back (`command` with the
+/// dialog's `path` or `store`).
+fn data_file_password(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let path = d.str("path");
+    let command = d.str("command");
+    let store = d.u64("store");
+    // Closing a protected file whose file is gone: there is nothing to check the password against, so it is
+    // typed twice.
+    let twice = d.bool("verify");
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| PasswordState::default(),
+        |st, app| {
+            window(ctx, app, d, "Data File Password", 420.0, |ui, app| {
+                ui.label("This data file is protected by a password:");
+                muted(ui, app, &path);
+                let mut r = None;
+                egui::Grid::new(("dfpw", uid)).num_columns(2).show(ui, |ui| {
+                    r = Some(grid_edit(ui, "Password:", &mut st.password, "", true));
+                    if twice {
+                        grid_edit(ui, "Verify password:", &mut st.verify, "", true);
+                    }
+                });
+                if twice {
+                    muted(
+                        ui,
+                        app,
+                        "The file is no longer there, so this password cannot be checked: it becomes the \
+                         file's password when it is written again.",
+                    );
+                }
+                let mismatch = twice && st.password != st.verify;
+                if mismatch && !st.verify.is_empty() {
+                    ui.colored_label(app.theme.danger, "The passwords do not match.");
+                }
+                if !st.focused
+                    && let Some(r) = &r
+                {
+                    r.request_focus();
+                    st.focused = true;
+                }
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                let enter =
+                    r.is_some_and(|r| r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let ready = !st.password.is_empty() && !mismatch;
+                let go = match ok_cancel(ui, app, ready) {
+                    Some(true) => true,
+                    Some(false) => return Out::Close,
+                    None => enter && ready,
+                };
+                if !go {
+                    return Out::Keep;
+                }
+                let p = match (command.as_str(), store) {
+                    ("file.closeDataFile", Some(id)) if twice => {
+                        json!({"store": id, "confirm": true, "password": st.password, "verify": st.verify})
+                    }
+                    ("file.closeDataFile", Some(id)) => {
+                        json!({"store": id, "confirm": true, "password": st.password})
+                    }
+                    _ => json!({"path": path, "password": st.password}),
+                };
+                let cmd =
+                    if command == "file.closeDataFile" { "file.closeDataFile" } else { "file.openDataFile" };
+                let r = try_run(app, cmd, p);
+                st.password.clear();
+                st.verify.clear();
+                match r {
+                    Ok(_) => Out::Close,
+                    Err(e) => {
+                        st.error = e;
+                        Out::Keep
+                    }
+                }
+            })
+        },
+    )
 }
 
 /// Runs a command, returning its error text instead of raising a toast (dialogs show errors inline).
@@ -312,9 +473,13 @@ fn data_files_tab(ui: &mut Ui, app: &mut App, st: &mut SettingsState) -> Out {
         if ui.add_enabled(removable, egui::Button::new("Remove")).clicked()
             && let Some(a) = &sel
         {
+            let kept = match &a.data_file {
+                Some(l) => format!("it is saved to {}", l.path),
+                None => "the data file is kept".to_owned(),
+            };
             out = Out::open(
                 "confirm",
-                json!({"title": "Account Settings", "text": format!("Close the data file \"{}\"? Its folders leave the folder pane; the data file is kept and can be opened again from File › Open & Export › Open Data File.", a.display_name), "command": "file.closeDataFile", "params": {"store": a.id.0, "confirm": true}}),
+                json!({"title": "Account Settings", "text": format!("Close the data file \"{}\"? Its folders leave the folder pane; {kept} and can be opened again from File › Open & Export › Open Data File.", a.display_name), "command": "file.closeDataFile", "params": {"store": a.id.0, "confirm": true}}),
             );
         }
         if ui.add_enabled(app.s.store.is_some(), egui::Button::new("Open File Location...")).clicked() {

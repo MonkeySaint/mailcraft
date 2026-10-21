@@ -33,7 +33,10 @@ use super::{dialog, settings};
 use crate::cmd::notes::IconMode;
 use crate::{CmdError, CmdResult, Session};
 use mailcraft_model::dates::weekday_of_day;
-use mailcraft_model::view::{ItemFilter, ItemRule, sanitize_rules};
+use mailcraft_model::view::{
+    ExpandDefault, GROUP_SEP, ItemFilter, ItemRule, MAX_GROUP_LEVELS, MAX_SORT_KEYS, TableOther,
+    sanitize_rules,
+};
 use mailcraft_model::{FolderId, FolderKind, ItemId, ReadingPanePos, SortOrder, ViewSettings};
 
 const MOD_STATE: &str = "\u{1}mod.state=";
@@ -184,6 +187,22 @@ pub struct ModuleView {
     /// Notes View Settings › Other Settings: no grid lines between the rows of the table views.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub no_grid: bool,
+    /// Notes List / Last 7 Days: Sort › Then by, the keys after `sort` ([`NOTE_COLUMNS`] keys, each with its
+    /// own direction).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub then_sort: Vec<super::table::SortField>,
+    /// Notes List / Last 7 Days: Group By fields, outermost first ([`NOTE_COLUMNS`] keys).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<super::table::SortField>,
+    /// Notes tables: Group By › Expand/collapse defaults (People and Tasks keep theirs per view in `custom`).
+    #[serde(skip_serializing_if = "ExpandDefault::is_default")]
+    pub expand: ExpandDefault,
+    /// Notes tables: Format Columns (column key → label and alignment).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub formats: BTreeMap<String, super::mail::ColumnFormat>,
+    /// Notes tables: Other Settings fonts (grid lines and AutoPreview are `no_grid` and `no_preview`).
+    #[serde(skip_serializing_if = "TableOther::is_default")]
+    pub other: TableOther,
 }
 
 /// (key, label) columns of the Notes List and Last 7 Days tables (Show Columns, header sort).
@@ -245,6 +264,11 @@ impl ModuleView {
             rules: Vec::new(),
             no_preview: false,
             no_grid: false,
+            then_sort: Vec::new(),
+            group_by: Vec::new(),
+            expand: ExpandDefault::AllExpanded,
+            formats: BTreeMap::new(),
+            other: TableOther::default(),
         }
     }
 
@@ -269,9 +293,62 @@ impl ModuleView {
             if self.columns.iter().map(String::as_str).eq(NOTE_DEFAULT_COLUMNS) {
                 self.columns.clear();
             }
+            let note_field = |f: super::table::SortField| {
+                note_column(&f.column)
+                    .map(|c| super::table::SortField { column: c.to_owned(), descending: f.descending })
+            };
+            let first = if self.sort.is_empty() { "created".to_owned() } else { self.sort.clone() };
+            let mut used: Vec<String> = vec![first];
+            self.then_sort = std::mem::take(&mut self.then_sort)
+                .into_iter()
+                .filter_map(note_field)
+                .filter(|f| {
+                    let fresh = !used.contains(&f.column);
+                    used.push(f.column.clone());
+                    fresh
+                })
+                .take(MAX_SORT_KEYS.saturating_sub(1))
+                .collect();
+            let mut grouped: Vec<String> = Vec::new();
+            self.group_by = std::mem::take(&mut self.group_by)
+                .into_iter()
+                .filter_map(note_field)
+                .filter(|f| {
+                    let fresh = !grouped.contains(&f.column);
+                    grouped.push(f.column.clone());
+                    fresh
+                })
+                .take(MAX_GROUP_LEVELS)
+                .collect();
+            self.formats = std::mem::take(&mut self.formats)
+                .into_iter()
+                .filter_map(|(k, f)| {
+                    let key = note_column(&k)?;
+                    let label: String =
+                        f.label.trim().chars().filter(|c| !c.is_control()).take(MAX_VIEW_NAME).collect();
+                    let f = super::mail::ColumnFormat {
+                        label: if label == note_column_label(key) { String::new() } else { label },
+                        format: String::new(),
+                        align: if matches!(f.align.as_str(), "left" | "center" | "right") {
+                            f.align
+                        } else {
+                            String::new()
+                        },
+                    };
+                    (f != super::mail::ColumnFormat::default()).then(|| (key.to_owned(), f))
+                })
+                .collect();
+            let o = std::mem::take(&mut self.other).sanitized();
+            self.other =
+                TableOther { row_font: o.row_font, column_font: o.column_font, ..TableOther::default() };
         } else {
             self.sort.clear();
             self.columns.clear();
+            self.then_sort.clear();
+            self.group_by.clear();
+            self.expand = ExpandDefault::AllExpanded;
+            self.formats.clear();
+            self.other = TableOther::default();
         }
         self.filter = std::mem::take(&mut self.filter).sanitized();
         self.rules = sanitize_rules(std::mem::take(&mut self.rules));
@@ -336,7 +413,36 @@ pub enum RowKind {
 pub struct ViewRow {
     pub id: ItemId,
     pub kind: RowKind,
+    /// The group the row is collapsed by: its group labels joined with [`GROUP_SEP`] (one label unless Group
+    /// By nests several fields).
     pub group: Option<String>,
+    /// The row's group headers, outermost first (empty when the view is not shown in groups).
+    pub levels: Vec<String>,
+}
+
+impl ViewRow {
+    /// A row outside any group.
+    pub fn plain(id: ItemId, kind: RowKind) -> ViewRow {
+        ViewRow { id, kind, group: None, levels: Vec::new() }
+    }
+
+    /// A row under the nested groups `levels` (outermost first; none = no group).
+    pub fn grouped(id: ItemId, kind: RowKind, levels: Vec<String>) -> ViewRow {
+        let group = (!levels.is_empty()).then(|| levels.join(GROUP_SEP));
+        ViewRow { id, kind, group, levels }
+    }
+
+    /// The collapse key of the row's group at depth `depth` (0 = outermost): its labels up to that level.
+    pub fn group_key(&self, depth: usize) -> Option<String> {
+        let parts = self.levels.get(..=depth)?;
+        Some(parts.join(GROUP_SEP))
+    }
+}
+
+/// Whether a row with the group headers `levels` is hidden because it or one of its outer groups is
+/// collapsed (`collapsed` holds collapse keys, [`ViewRow::group_key`]).
+pub fn hidden_by(levels: &[String], collapsed: &dyn Fn(&str) -> bool) -> bool {
+    (0..levels.len()).any(|d| levels.get(..=d).is_some_and(|p| collapsed(&p.join(GROUP_SEP))))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -709,12 +815,19 @@ pub fn group_of(s: &Session, folder: FolderId, id: ItemId) -> Option<String> {
     rows(s, folder).into_iter().find(|r| r.id == id).and_then(|r| r.group)
 }
 
-/// Every group label of the folder's view, in order.
+/// Every group label of the folder's view, in order (with nested groups, each outer group's collapse key
+/// before the groups inside it).
 pub fn groups(s: &Session, folder: FolderId) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for g in rows(s, folder).into_iter().filter_map(|r| r.group) {
-        if !out.contains(&g) {
-            out.push(g);
+    let mut seen = std::collections::HashSet::new();
+    for r in rows(s, folder) {
+        // Nested groups (Group By on several fields): every outer group has a header of its own.
+        for d in 0..r.levels.len() {
+            if let Some(key) = r.group_key(d)
+                && seen.insert(key.clone())
+            {
+                out.push(key);
+            }
         }
     }
     out
@@ -753,6 +866,16 @@ pub fn view_json(s: &Session, folder: FolderId, kind: ModuleKind, st: &ModuleVie
         "rules": st.rules,
         "autoPreview": !st.no_preview,
         "gridLines": !st.no_grid,
+        "sortBy": if kind == ModuleKind::Notes && st.view != "Icon" {
+            super::table::fields_json(&note_sort_keys(st, v.order == SortOrder::Ascending))
+        } else {
+            json!([])
+        },
+        "groupBy": super::table::fields_json(&st.group_by),
+        "expandGroups": st.expand.key(),
+        "formats": st.formats,
+        "rowFont": st.other.row_font,
+        "columnFont": st.other.column_font,
     })
 }
 
@@ -799,7 +922,7 @@ pub(crate) fn change_view(s: &mut Session, folder: FolderId, kind: ModuleKind, n
         st.view = v.to_owned();
         st.name.clear();
         store(s, folder, kind, &st);
-        clear_groups(s, folder);
+        open_groups(s, folder);
         return Ok(json!({ "view": v, "module": kind.name() }));
     }
     let wanted = name.trim();
@@ -829,6 +952,11 @@ fn apply_saved(s: &mut Session, folder: FolderId, kind: ModuleKind, saved: &Save
     st.rules = sv.rules.clone();
     st.no_preview = sv.no_preview;
     st.no_grid = sv.no_grid;
+    st.then_sort = sv.then_sort.clone();
+    st.group_by = sv.group_by.clone();
+    st.expand = sv.expand;
+    st.formats = sv.formats.clone();
+    st.other = sv.other.clone();
     st.name = saved.name.clone();
     let key = format!("@{}", saved.name);
     match sv.custom.get(&super::table::active_key(sv)).or_else(|| sv.custom.get(&sv.view)) {
@@ -844,7 +972,7 @@ fn apply_saved(s: &mut Session, folder: FolderId, kind: ModuleKind, saved: &Save
         v.order = if saved.reverse { SortOrder::Ascending } else { SortOrder::Descending };
         v.show_in_groups = saved.groups;
     });
-    clear_groups(s, folder);
+    open_groups(s, folder);
 }
 
 /// `view.arrangeBy` in a module folder.
@@ -1159,6 +1287,11 @@ pub(crate) fn manage_views(s: &mut Session, folder: FolderId, kind: ModuleKind, 
                     st.rules = d.rules;
                     st.no_preview = d.no_preview;
                     st.no_grid = d.no_grid;
+                    st.then_sort = d.then_sort;
+                    st.group_by = d.group_by;
+                    st.expand = d.expand;
+                    st.formats = d.formats;
+                    st.other = d.other;
                 }
             }
             store(s, folder, kind, &st);
@@ -1229,11 +1362,64 @@ pub(crate) fn view_settings(s: &mut Session, folder: FolderId, kind: ModuleKind,
         return Ok(dialog(s, "moduleViewSettings", params));
     }
     if kind != ModuleKind::Notes {
-        let key = SETTINGS_KEYS.iter().find(|k| p.get(**k).is_some()).copied().unwrap_or("sort");
-        return Err(CmdError::Params(format!(
-            "`{key}` applies to notes folders; contact and task tables take view.columns, view.sort, \
-             view.customFilter and view.conditionalFormatting"
-        )));
+        if let Some(key) = NOTE_ONLY_KEYS.iter().find(|k| p.get(**k).is_some()) {
+            return Err(CmdError::Params(format!(
+                "`{key}` applies to notes folders; contact and task views take view.columns, view.sortBy, \
+                 view.customFilter, view.conditionalFormatting and view.formatColumns"
+            )));
+        }
+        super::table::apply_settings(s, folder, kind, p)?;
+        let st = state(s, folder, kind);
+        let mut out = view_json(s, folder, kind, &st);
+        if let Some(o) = out.as_object_mut() {
+            o.insert("table".into(), super::table::summary(folder, kind, &st));
+        }
+        return Ok(out);
+    }
+    let reverse_before = reversed(s, folder);
+    let mut reverse = reverse_before;
+    let expand_before = st.expand;
+    let groups_before = st.group_by.clone();
+    if let Some(v) = p.get("sortBy") {
+        let list = note_fields(v, MAX_SORT_KEYS, "sortBy")?;
+        let mut keys = list.into_iter();
+        match keys.next() {
+            Some(first) => {
+                // The first key is the view's sort column; Reverse Sort turns it the way asked for.
+                reverse = note_sort_descending(&first.column) != first.descending;
+                st.sort = first.column;
+            }
+            None => {
+                st.sort.clear();
+                reverse = false;
+            }
+        }
+        st.then_sort = keys.collect();
+    }
+    if let Some(v) = p.get("groupBy") {
+        st.group_by = note_fields(v, MAX_GROUP_LEVELS, "groupBy")?;
+    }
+    if let Some(v) = p.get("expandGroups") {
+        st.expand = v.as_str().and_then(ExpandDefault::parse).ok_or_else(|| {
+            CmdError::Params("`expandGroups` must be expanded, collapsed or lastViewed".into())
+        })?;
+    }
+    for (key, slot) in [("rowFont", &mut st.other.row_font), ("columnFont", &mut st.other.column_font)] {
+        if let Some(v) = p.get(key) {
+            let n = v.as_u64().ok_or_else(|| CmdError::Params(format!("`{key}` must be a font size")))?;
+            *slot = mailcraft_model::view::clamp_font(u8::try_from(n).unwrap_or(u8::MAX));
+        }
+    }
+    if let Some(v) = p.get("formats") {
+        st.formats = if v.is_null() {
+            BTreeMap::new()
+        } else {
+            serde_json::from_value::<BTreeMap<String, super::mail::ColumnFormat>>(v.clone())
+                .map_err(|e| CmdError::Params(format!("`formats`: {e}")))?
+        };
+        if st.formats.keys().any(|k| note_column(k).is_none()) {
+            return Err(CmdError::Params("`formats` names a column the Notes tables do not have".into()));
+        }
     }
     if let Some(v) = p.get("sort") {
         st.sort = match v {
@@ -1289,15 +1475,175 @@ pub(crate) fn view_settings(s: &mut Session, folder: FolderId, kind: ModuleKind,
     let mut st = st.sanitized(kind);
     // `sanitized` keeps a saved view's name only by its text; the stored state was already checked.
     st.name = state(s, folder, kind).name;
+    let regroup = st.group_by != groups_before || st.expand != expand_before;
     store(s, folder, kind, &st);
+    if reverse != reverse_before {
+        set_settings(s, folder, |v| {
+            v.order = if reverse { SortOrder::Ascending } else { SortOrder::Descending }
+        });
+    }
+    if regroup {
+        open_groups(s, folder);
+    }
     // While a saved view shows, the change is kept in that view too.
     sync_saved(s, folder)?;
     Ok(view_json(s, folder, kind, &st))
 }
 
-/// Keys of `view.viewSettings` that change a Notes view's advanced settings (without them the dialog
-/// opens).
-pub const SETTINGS_KEYS: [&str; 6] = ["sort", "columns", "filter", "rules", "autoPreview", "gridLines"];
+/// A list of Notes sort or group fields (`[{"field", "dir"}]` or plain keys of [`NOTE_COLUMNS`]): at most
+/// `max`, none twice.
+fn note_fields(v: &Value, max: usize, what: &str) -> Result<Vec<super::table::SortField>, CmdError> {
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let list = v.as_array().ok_or_else(|| CmdError::Params(format!("`{what}` must be a list of fields")))?;
+    if list.len() > max {
+        return Err(CmdError::Params(format!("`{what}` takes at most {max} fields")));
+    }
+    let mut out: Vec<super::table::SortField> = Vec::new();
+    for f in list {
+        let (id, dir) = super::table::field_entry(f, what)?;
+        let key = note_column(id)
+            .ok_or_else(|| CmdError::Params(format!("unknown Notes column `{}`", clip_key(id))))?;
+        let descending = match dir {
+            None => note_sort_descending(key),
+            Some("asc") => false,
+            Some("desc") => true,
+            Some(other) => {
+                return Err(CmdError::Params(format!(
+                    "`dir` must be asc or desc, not `{}`",
+                    clip_key(other)
+                )));
+            }
+        };
+        if out.iter().any(|x| x.column == key) {
+            return Err(CmdError::Params(format!("`{what}` names {} twice", note_column_label(key))));
+        }
+        out.push(super::table::SortField { column: key.to_owned(), descending });
+    }
+    Ok(out)
+}
+
+/// `view.formatColumns` in a Notes table: without `column` the Format Columns dialog opens; with it the
+/// column's `label` and `align` change (empty strings back to the defaults).
+pub(crate) fn note_format_columns(s: &mut Session, folder: FolderId, p: &Value) -> CmdResult {
+    let kind = ModuleKind::Notes;
+    let mut st = state(s, folder, kind);
+    let Some(id) = p.get("column").and_then(Value::as_str) else {
+        let list: Vec<Value> = note_shown(&st)
+            .into_iter()
+            .map(|(k, label, align)| {
+                json!({
+                    "id": k,
+                    "label": label,
+                    "defaultLabel": note_column_label(k),
+                    "format": "text",
+                    "formats": [{"id": "text", "label": "Text"}],
+                    "align": align,
+                    "custom": st.formats.contains_key(k),
+                })
+            })
+            .collect();
+        return Ok(dialog(
+            s,
+            "viewFormat",
+            json!({ "folder": folder.0, "kind": "columns", "columns": list, "module": kind.name() }),
+        ));
+    };
+    let key = note_column(id)
+        .ok_or_else(|| CmdError::Params(format!("unknown Notes column `{}`", clip_key(id))))?;
+    let mut f = st.formats.get(key).cloned().unwrap_or_default();
+    if let Some(label) = p.get("label").and_then(Value::as_str) {
+        if label.trim().chars().count() > MAX_VIEW_NAME {
+            return Err(CmdError::Params(format!("column labels are at most {MAX_VIEW_NAME} characters")));
+        }
+        f.label = label.trim().to_owned();
+    }
+    if let Some(align) = p.get("align").and_then(Value::as_str) {
+        if !matches!(align, "left" | "center" | "right" | "") {
+            return Err(CmdError::Params(format!(
+                "`align` must be left, center or right, not `{}`",
+                clip_key(align)
+            )));
+        }
+        f.align = align.to_owned();
+    }
+    st.formats.insert(key.to_owned(), f);
+    let name = st.name.clone();
+    let mut st = st.sanitized(kind);
+    st.name = name;
+    store(s, folder, kind, &st);
+    sync_saved(s, folder)?;
+    let now = note_shown(&st).into_iter().find(|(k, _, _)| *k == key);
+    Ok(json!({
+        "column": key,
+        "label": now.as_ref().map_or(note_column_label(key).to_owned(), |c| c.1.clone()),
+        "align": now.as_ref().map_or("left", |c| c.2),
+    }))
+}
+
+/// Keys of `view.viewSettings` that change a view's advanced settings (without them the dialog opens).
+pub const SETTINGS_KEYS: [&str; 12] = [
+    "sort",
+    "columns",
+    "filter",
+    "rules",
+    "autoPreview",
+    "gridLines",
+    "sortBy",
+    "groupBy",
+    "expandGroups",
+    "rowFont",
+    "columnFont",
+    "formats",
+];
+
+/// Keys only the Notes views take (People and Tasks views set these with their own commands).
+const NOTE_ONLY_KEYS: [&str; 5] = ["sort", "columns", "filter", "rules", "formats"];
+
+/// Notes List / Last 7 Days: the sort keys in effect, `(column, descending)`: the sort column (Created, newest
+/// first, unless one was picked; Reverse Sort turns it around), then the Then by keys.
+pub fn note_sort_keys(st: &ModuleView, reversed: bool) -> Vec<super::table::SortField> {
+    let first = if st.sort.is_empty() { "created" } else { st.sort.as_str() };
+    let mut out = vec![super::table::SortField {
+        column: first.to_owned(),
+        descending: note_sort_descending(&st.sort) != reversed,
+    }];
+    out.extend(st.then_sort.iter().cloned());
+    out
+}
+
+/// Whether a Notes table view shows Group By groups (fields set, Show in Groups on).
+pub fn notes_grouped(s: &Session, folder: FolderId, st: &ModuleView) -> bool {
+    st.view != "Icon" && !st.group_by.is_empty() && show_groups(s, folder)
+}
+
+/// Label of a Notes column in a group header ("Color" for the icon column, whose value is the colour).
+pub fn note_group_label(key: &str) -> &'static str {
+    if key == "icon" { "Color" } else { note_column_label(key) }
+}
+
+/// The Notes table columns as drawn: (key, label, alignment) with Format Columns applied.
+pub fn note_shown(st: &ModuleView) -> Vec<(&'static str, String, &'static str)> {
+    note_columns(st)
+        .into_iter()
+        .map(|k| {
+            let f = st.formats.get(k);
+            let label = f
+                .map(|f| f.label.clone())
+                .filter(|l| !l.trim().is_empty())
+                .unwrap_or_else(|| note_column_label(k).to_owned());
+            let align = match f.map(|f| f.align.as_str()) {
+                Some("center") => "center",
+                Some("right") => "right",
+                Some("left") => "left",
+                _ if k == "icon" => "center",
+                _ => "left",
+            };
+            (k, label, align)
+        })
+        .collect()
+}
 
 fn clip_key(k: &str) -> String {
     k.chars().take(40).collect()
@@ -1310,14 +1656,112 @@ fn set_settings(s: &mut Session, folder: FolderId, f: impl FnOnce(&mut ViewSetti
     }
 }
 
-/// Reset View over a folder's view state: the module view, collapsed groups and the other reserved entries
-/// go, but the custom views saved for the folder stay (they are views to choose from, not the current
+/// Whether Reset View has something to put back in the folder's current view: View Settings changes to it
+/// (columns, sort keys, groups, filter, rules, formats, Other Settings, an arrangement picked with Arrange
+/// By), Reverse Sort, Show in Groups or tighter spacing, collapsed groups, or Notes icons dragged off the
+/// grid. Which view is shown, the reading pane and the message preview are not part of it.
+pub fn view_customized(s: &Session, folder: FolderId) -> bool {
+    let Some((kind, st)) = current(s, folder) else { return false };
+    let collapsed =
+        s.view.collapsed_groups.get(&folder).is_some_and(|g| g.iter().any(|e| super::is_group_label(e)));
+    let dragged = kind == ModuleKind::Notes && !crate::cmd::notes::positions(s, folder).is_empty();
+    if !st.name.is_empty() && find_saved(s, folder, &st.name).is_some() {
+        // A saved view keeps every change made while it shows (`sync_saved`): only collapsed groups, tighter
+        // spacing and dragged Notes icons differ from it.
+        return collapsed || dragged || settings(s, folder).tighter_spacing;
+    }
+    let mut base = ModuleView::defaults(kind);
+    base.view = st.view.clone();
+    let own = !super::table::custom(&st).is_empty()
+        || st.arrange.is_some()
+        || st.sort != base.sort
+        || st.then_sort != base.then_sort
+        || st.group_by != base.group_by
+        || st.expand != base.expand
+        || st.columns != base.columns
+        || st.formats != base.formats
+        || st.filter != base.filter
+        || st.rules != base.rules
+        || st.no_preview != base.no_preview
+        || st.no_grid != base.no_grid
+        || st.other != base.other;
+    let v = settings(s, folder);
+    let d = ViewSettings::default();
+    let arranged = v.order != d.order || v.show_in_groups != d.show_in_groups || v.tighter_spacing;
+    own || arranged || collapsed || dragged
+}
+
+/// Reset View in a module folder: the current view loses its View Settings changes (see [`view_customized`])
+/// and the folder stays on it; the view chosen, the reading pane, the message preview, the Notes icon
+/// arrangement and the custom views saved for the folder stay. While a saved view shows, the folder goes back
+/// to that view as it was saved (with its groups opened as it says); the saved view itself is never changed.
+pub(crate) fn reset_current(s: &mut Session, folder: FolderId, kind: ModuleKind) -> Result<(), CmdError> {
+    let mut st = state(s, folder, kind);
+    if !st.name.is_empty()
+        && let Some(saved) = find_saved(s, folder, &st.name)
+    {
+        if kind == ModuleKind::Notes {
+            crate::cmd::notes::clear_positions(s, folder);
+        }
+        clear_groups(s, folder);
+        set_settings(s, folder, |v| v.tighter_spacing = false);
+        apply_saved(s, folder, kind, &saved);
+        return Ok(());
+    }
+    st.custom.remove(&super::table::active_key(&st));
+    st.arrange = None;
+    let d = ModuleView::defaults(kind);
+    st.sort = d.sort;
+    st.then_sort = d.then_sort;
+    st.group_by = d.group_by;
+    st.expand = d.expand;
+    st.columns = d.columns;
+    st.formats = d.formats;
+    st.filter = d.filter;
+    st.rules = d.rules;
+    st.no_preview = d.no_preview;
+    st.no_grid = d.no_grid;
+    st.other = d.other;
+    store(s, folder, kind, &st);
+    set_settings(s, folder, |v| {
+        let d = ViewSettings::default();
+        v.order = d.order;
+        v.show_in_groups = d.show_in_groups;
+        v.tighter_spacing = d.tighter_spacing;
+    });
+    if kind == ModuleKind::Notes {
+        crate::cmd::notes::clear_positions(s, folder);
+    }
+    clear_groups(s, folder);
+    sync_saved(s, folder)
+}
+
+/// Reset View over a mail folder's view state: the mail view, collapsed groups and the other reserved
+/// entries go, but custom views saved for the folder stay (they are views to choose from, not the current
 /// state).
 pub(crate) fn reset_keeping_saved(s: &mut Session, folder: FolderId) {
     if let Some(list) = s.view.collapsed_groups.get_mut(&folder) {
         list.retain(|e| e.starts_with(MOD_SAVED));
         if list.is_empty() {
             s.view.collapsed_groups.remove(&folder);
+        }
+    }
+}
+
+/// Opens a view's groups as its Expand/collapse default says: all expanded (collapsed groups forgotten), all
+/// collapsed, or as they were left.
+pub(crate) fn open_groups(s: &mut Session, folder: FolderId) {
+    let Some((kind, st)) = current(s, folder) else { return };
+    let expand = if kind == ModuleKind::Notes { st.expand } else { super::table::custom(&st).expand };
+    match expand {
+        ExpandDefault::AsLastViewed => {}
+        ExpandDefault::AllExpanded => clear_groups(s, folder),
+        ExpandDefault::AllCollapsed => {
+            clear_groups(s, folder);
+            let labels = groups(s, folder);
+            if !labels.is_empty() {
+                s.view.collapsed_groups.entry(folder).or_default().extend(labels);
+            }
         }
     }
 }
@@ -1424,7 +1868,41 @@ mod tests {
         run(&mut s, "view.changeView", json!({"name": "Detailed"}));
         assert!(s.enabled("view.resetView").is_none());
         run(&mut s, "view.resetView", json!({}));
-        assert_eq!(state(&s, tasks, ModuleKind::Tasks), ModuleView::defaults(ModuleKind::Tasks));
+        let mut detailed = ModuleView::defaults(ModuleKind::Tasks);
+        detailed.view = "Detailed".into();
+        assert_eq!(state(&s, tasks, ModuleKind::Tasks), detailed, "Reset View stays on the view");
+    }
+
+    /// Regression: Reset View in a tasks folder used to wipe the whole module state (the folder jumped back to
+    /// the To-Do List and lost its preview and reading pane). It now resets only the current view's
+    /// customisations, as Manage All Views › Reset does, and stays on that view.
+    #[test]
+    fn reset_view_in_tasks_resets_only_the_current_view() {
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        run(&mut s, "view.changeView", json!({"name": "Simple List"}));
+        run(&mut s, "view.columns", json!({"columns": ["subject", "dueDate"]}));
+        run(&mut s, "view.sortBy", json!({"field": "subject", "dir": "desc"}));
+        run(&mut s, "view.customFilter", json!({"filter": {"words": "x"}}));
+        run(&mut s, "view.arrangeBy", json!({"key": "importance"}));
+        run(&mut s, "view.messagePreview", json!({"lines": 2}));
+        run(&mut s, "view.readingPane", json!({"position": "bottom"}));
+        run(&mut s, "view.reverseSort", json!({}));
+        // Another view's changes are not touched.
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        run(&mut s, "view.columns", json!({"columns": ["subject"]}));
+        run(&mut s, "view.changeView", json!({"name": "Simple List"}));
+        let r = run(&mut s, "view.resetView", json!({}));
+        assert_eq!(r["view"], "Simple List");
+        let st = state(&s, tasks, ModuleKind::Tasks);
+        assert_eq!(st.view, "Simple List", "the folder stays on its view");
+        assert_eq!(st.arrange, None);
+        assert!(!st.custom.contains_key("Simple List"), "columns, sort and filter go");
+        assert_eq!(st.custom.get("Detailed").map(|c| c.columns.len()), Some(1), "other views keep theirs");
+        assert_eq!(st.preview_lines, 2, "the message preview stays");
+        assert_eq!(st.reading_pane, ReadingPanePos::Bottom, "the reading pane stays");
+        assert!(!reversed(&s, tasks), "Reverse Sort goes");
+        assert_eq!(super::super::table::columns(&s, tasks).len(), 5);
     }
 
     #[test]
@@ -1436,10 +1914,39 @@ mod tests {
         assert_eq!(saved_views(&s, tasks).len(), 1);
         run(&mut s, "view.changeView", json!({"name": "Simple List"}));
         run(&mut s, "view.resetView", json!({}));
-        assert_eq!(state(&s, tasks, ModuleKind::Tasks), ModuleView::defaults(ModuleKind::Tasks));
+        assert_eq!(state(&s, tasks, ModuleKind::Tasks).view, "Simple List");
         let saved = saved_views(&s, tasks);
         assert_eq!(saved.len(), 1, "Reset View must not delete saved views");
         assert_eq!(saved[0].name, "My tasks");
+    }
+
+    #[test]
+    fn reset_view_on_a_saved_view_goes_back_to_it_and_never_rewrites_it() {
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        run(&mut s, "view.changeView", json!({"name": "Simple List"}));
+        run(&mut s, "view.columns", json!({"columns": ["subject", "dueDate"]}));
+        run(&mut s, "view.sortBy", json!({"field": "subject", "dir": "desc"}));
+        run(&mut s, "view.customFilter", json!({"filter": {"words": "x"}}));
+        run(&mut s, "view.reverseSort", json!({}));
+        for everywhere in [false, true] {
+            let name = if everywhere { "Everywhere" } else { "Mine" };
+            let scope = if everywhere { "all" } else { "folder" };
+            run(&mut s, "view.saveViewAs", json!({"name": name, "scope": scope, "confirm": true}));
+            let before = find_saved(&s, tasks, name).unwrap();
+            run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+            run(&mut s, "view.changeView", json!({"name": name}));
+            assert_eq!(state(&s, tasks, ModuleKind::Tasks).name, name);
+            // Nothing differs from the saved view: Reset View has nothing to put back.
+            assert!(!view_customized(&s, tasks), "{name}");
+            run(&mut s, "view.resetView", json!({}));
+            let after = find_saved(&s, tasks, name).unwrap();
+            assert_eq!(after, before, "Reset View must not write defaults into the saved view {name}");
+            let st = state(&s, tasks, ModuleKind::Tasks);
+            assert_eq!(st.name, name, "the folder stays on the saved view");
+            assert_eq!(super::super::table::columns(&s, tasks).len(), 2, "with its columns");
+            assert!(reversed(&s, tasks), "and its Reverse Sort");
+        }
     }
 
     #[test]
@@ -1616,7 +2123,8 @@ mod tests {
         run(&mut s, "view.reverseSort", json!({}));
         run(&mut s, "view.saveViewAs", json!({"name": "Mine", "confirm": true}));
         run(&mut s, "view.changeView", json!({"name": "Detailed"}));
-        assert_eq!(run(&mut s, "view.changeView", json!({"name": "mine"}))["view"], "To-Do List");
+        // Reset View left the folder on Overdue, so that is the view saved as "Mine".
+        assert_eq!(run(&mut s, "view.changeView", json!({"name": "mine"}))["view"], "Overdue");
         run(&mut s, "view.manageViews", json!({}));
         let Some(Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
         assert_eq!(p["views"].as_array().unwrap().last().unwrap(), "Mine");

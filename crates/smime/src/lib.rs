@@ -12,6 +12,7 @@
 //! - [`trust`]: certificate chains and the status a signature gets (valid, untrusted, expired, invalid).
 //! - [`mime`]: whole messages: [`mime::protect`] (sign, encrypt, both) and [`mime::open`] (unwrap the layers).
 //! - [`ber`]: the BER reader that turns streamed CMS from other programs into DER.
+//! - [`seal`]: password protection (PBES2) for files MailCraft writes, such as a data file with a password.
 //!
 //! Everything is pure Rust (RustCrypto), so the browser build has it too. Every entry point is total: hostile
 //! input (messages, certificates, `.pfx` files) yields an error, never a panic. Sizes are capped
@@ -24,6 +25,7 @@ pub mod cms;
 pub mod key;
 pub mod mime;
 pub mod pkcs12;
+pub mod seal;
 pub mod trust;
 
 pub use cert::Cert;

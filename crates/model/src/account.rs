@@ -67,6 +67,20 @@ pub struct Account {
     /// namespaces): it signs in as the owner and lists only the folders below its root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared: Option<SharedStore>,
+    /// A data file kept in a file of its own (New Data File at a chosen path, or opened from one): where it
+    /// is written when it is closed or saved. Its password, if any, is in the engine's secret store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_file: Option<DataFileLink>,
+}
+
+/// Where a standalone data file lives on disk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DataFileLink {
+    /// The file's path.
+    pub path: String,
+    /// The file is encrypted under a password.
+    pub protected: bool,
 }
 
 /// Where an account's contacts, tasks and published calendars live on a WebDAV server.

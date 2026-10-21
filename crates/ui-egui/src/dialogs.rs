@@ -281,6 +281,7 @@ pub const KNOWN: &[&str] = &[
     "quickStepFirstUse",
     "sendReceiveProgress",
     "newDataFile",
+    "dataFilePassword",
     "searchBox",
     "searchTools",
     "indexingStatus",

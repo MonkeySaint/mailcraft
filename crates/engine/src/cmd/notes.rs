@@ -408,9 +408,64 @@ fn sort_key(n: &Note, col: &str) -> (i64, String) {
     }
 }
 
+fn color_label(c: NoteColor) -> &'static str {
+    match c {
+        NoteColor::Blue => "Blue",
+        NoteColor::Green => "Green",
+        NoteColor::Pink => "Pink",
+        NoteColor::Yellow => "Yellow",
+        NoteColor::White => "White",
+    }
+}
+
+/// Group headers of note `n` for the Group By field `col` (a Notes column): "Label: value" with its sort key.
+/// Categories give one header per category; the dates group by day; the icon column by colour.
+fn note_groups(s: &Session, n: &Note, col: &str) -> Vec<((i64, String), String)> {
+    let label = modules::note_group_label(col);
+    let tz = s.tz_offset_min;
+    let day = |t: mailcraft_model::DateTime| {
+        let text = format!(
+            "{} {}",
+            mailcraft_model::dates::LocalTime::of(t, tz).weekday.short(),
+            mailcraft_model::ListTime::date(t, tz)
+        );
+        ((t.day_number(tz), String::new()), format!("{label}: {text}"))
+    };
+    match col {
+        "categories" => {
+            let mut seen: Vec<String> = Vec::new();
+            let mut out = Vec::new();
+            for c in n.categories.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+                let key = c.to_lowercase();
+                if seen.contains(&key) || out.len() >= crate::cmd::view::table::MAX_ROW_GROUPS {
+                    continue;
+                }
+                seen.push(key.clone());
+                out.push(((0, key), format!("{label}: {c}")));
+            }
+            if out.is_empty() {
+                out.push(((0, String::new()), format!("{label}: (none)")));
+            }
+            out
+        }
+        "icon" => {
+            vec![((i64::from(n.color as u8), String::new()), format!("{label}: {}", color_label(n.color)))]
+        }
+        "modified" => vec![day(n.modified)],
+        "created" => vec![day(n.created)],
+        _ => {
+            let t = title(n);
+            let shown: String =
+                if t.is_empty() { "(none)".to_owned() } else { t.chars().take(255).collect() };
+            vec![((0, t.to_lowercase()), format!("{label}: {shown}"))]
+        }
+    }
+}
+
 /// Rows of the selected Notes view of `folder`: Icon in grid order (oldest first); Notes List and Last 7 Days
-/// (the notes changed in the last seven days) sorted by the view's sort column, newest first until a column
-/// header picks another. Reverse Sort reverses. The View Settings filter applies to every view.
+/// (the notes changed in the last seven days) sorted by the view's sort keys (newest first until a column
+/// header or View Settings › Sort picks others; Reverse Sort turns the first key around) and, with Group By
+/// fields and Show in Groups on, nested in groups. The View Settings filter applies to every view.
 pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
     let st = modules::state(s, folder, ModuleKind::Notes);
     let now = s.now().unix;
@@ -426,24 +481,63 @@ pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
         .collect();
     if st.view == "Icon" {
         v.sort_by_key(|n| (n.created.unix, n.id));
-    } else {
-        let col = if st.sort.is_empty() { "created" } else { st.sort.as_str() };
-        v.sort_by(|a, b| {
-            sort_key(a, col)
-                .cmp(&sort_key(b, col))
-                .then(a.created.unix.cmp(&b.created.unix))
-                .then(a.id.cmp(&b.id))
-        });
-        if modules::note_sort_descending(&st.sort) {
-            v.reverse();
+        let mut out: Vec<ViewRow> = v.into_iter().map(|n| ViewRow::plain(n.id, RowKind::Note)).collect();
+        if modules::reversed(s, folder) {
+            out.reverse();
         }
+        return out;
     }
-    let mut out: Vec<ViewRow> =
-        v.into_iter().map(|n| ViewRow { id: n.id, kind: RowKind::Note, group: None }).collect();
-    if modules::reversed(s, folder) {
-        out.reverse();
+    let keys = modules::note_sort_keys(&st, modules::reversed(s, folder));
+    let first_desc = keys.first().is_some_and(|k| k.descending);
+    let fields: Vec<(String, bool)> = if modules::notes_grouped(s, folder, &st) {
+        st.group_by.iter().map(|f| (f.column.clone(), f.descending)).collect()
+    } else {
+        Vec::new()
+    };
+    type Level = ((i64, String), String, bool);
+    let mut keyed: Vec<(Vec<Level>, &Note)> = Vec::with_capacity(v.len());
+    for n in v {
+        let mut paths: Vec<Vec<Level>> = vec![Vec::new()];
+        for (col, desc) in &fields {
+            let options = note_groups(s, n, col);
+            let mut next = Vec::new();
+            for p in &paths {
+                for (k, l) in &options {
+                    if next.len() >= crate::cmd::view::table::MAX_ROW_GROUPS {
+                        break;
+                    }
+                    let mut q = p.clone();
+                    q.push((k.clone(), l.clone(), *desc));
+                    next.push(q);
+                }
+            }
+            paths = next;
+        }
+        keyed.extend(paths.into_iter().map(|p| (p, n)));
     }
-    out
+    keyed.sort_by(|(ga, a), (gb, b)| {
+        use std::cmp::Ordering;
+        for (x, y) in ga.iter().zip(gb.iter()) {
+            let o = x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1));
+            let o = if x.2 { o.reverse() } else { o };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        for k in &keys {
+            let o = sort_key(a, &k.column).cmp(&sort_key(b, &k.column));
+            let o = if k.descending { o.reverse() } else { o };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        let o = a.created.unix.cmp(&b.created.unix).then(a.id.cmp(&b.id));
+        if first_desc { o.reverse() } else { o }
+    });
+    keyed
+        .into_iter()
+        .map(|(g, n)| ViewRow::grouped(n.id, RowKind::Note, g.into_iter().map(|(_, l, _)| l).collect()))
+        .collect()
 }
 fn run_categorize(s: &mut Session, p: &Value) -> CmdResult {
     pim::run_categorize(s, p, Kind::Note)

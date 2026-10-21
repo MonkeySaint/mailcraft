@@ -1296,3 +1296,142 @@ fn update_folder_fetches_an_internet_calendar_in_the_background_from_any_module(
     assert!(props::read(&a.s.mailbox, f).subscription.unwrap().last_error.is_some());
     assert!(a.ui.toast.as_ref().is_some_and(|t| t.0.contains("Feed")), "{:?}", a.ui.toast);
 }
+
+#[test]
+fn todo_list_flagged_mail_rows_preview_and_show_their_text() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
+    let linked: Vec<ItemId> = a.s.mailbox.tasks.values().filter_map(|t| t.from_mail).collect();
+    let m =
+        a.s.mailbox
+            .mail
+            .values()
+            .find(|m| m.is_flagged() && !linked.contains(&m.id) && !m.body_text().trim().is_empty())
+            .cloned()
+            .expect("the sample has a flagged message");
+    let first = m.body_text().lines().map(str::trim).find(|l| !l.is_empty()).unwrap().to_owned();
+    let mut h = harness(super::tasks, a, (1500.0, 900.0));
+    assert!(!has_part(&h, &first), "no preview yet");
+    run_cmd(&mut h, "view.messagePreview", json!({"lines": 1}));
+    assert!(has_part(&h, &first), "the flagged message's text shows under its row");
+    run_cmd(&mut h, "view.messagePreview", json!({"lines": 0}));
+    click(&h, &m.subject);
+    h.run_ok();
+    assert!(has(&h, "Open Message"), "the reading pane shows the flagged message");
+    assert!(has_part(&h, &first), "with its text");
+}
+
+/// A flagged message with a huge HTML body: only the start of it is read for the row preview and the
+/// reading pane (both are drawn every frame), and its first line still shows.
+#[test]
+fn todo_list_flagged_mail_with_a_huge_body_previews_its_start() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
+    let linked: Vec<ItemId> = a.s.mailbox.tasks.values().filter_map(|t| t.from_mail).collect();
+    let id =
+        a.s.mailbox.mail.values().find(|m| m.is_flagged() && !linked.contains(&m.id)).map(|m| m.id).unwrap();
+    let subject = {
+        let m = a.s.mailbox.mail.get_mut(&id).unwrap();
+        m.body.text = None;
+        m.body.html = Some(format!("<p>Opening words here</p>{}", "<div>filler text</div>".repeat(400_000)));
+        m.subject.clone()
+    };
+    let mut h = harness(super::tasks, a, (1500.0, 900.0));
+    run_cmd(&mut h, "view.messagePreview", json!({"lines": 1}));
+    assert!(has_part(&h, "Opening words here"), "the preview shows the start of the body");
+    run_cmd(&mut h, "view.messagePreview", json!({"lines": 0}));
+    click(&h, &subject);
+    h.run_ok();
+    assert!(has_part(&h, "Opening words here"), "and so does the reading pane");
+}
+
+#[test]
+fn task_tables_nest_group_by_fields_and_collapse_outer_groups() {
+    let mut a = app();
+    let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
+    let mut h = harness(super::tasks, a, (1500.0, 900.0));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Simple List"}));
+    run_cmd(&mut h, "view.viewSettings", json!({"groupBy": ["priority", "status"]}));
+    let rows = mailcraft_engine::cmd::view::modules::rows(&h.state().s, folder);
+    let n = rows.iter().filter(|r| r.levels.first().is_some_and(|l| l == "Priority: Normal")).count();
+    assert!(n > 0);
+    let outer = format!("Group Priority: Normal: {n} items, expanded");
+    assert!(has(&h, &outer), "outer header with every row inside it");
+    assert!(has_part(&h, "Group Status: Not Started"), "nested header");
+    click(&h, &outer);
+    h.run_ok();
+    assert!(has(&h, &format!("Group Priority: Normal: {n} items, collapsed")));
+    assert!(
+        h.state()
+            .s
+            .view
+            .collapsed_groups
+            .get(&folder)
+            .is_some_and(|g| g.iter().any(|x| x == "Priority: Normal")),
+        "the outer group's key is collapsed"
+    );
+    // Other Settings › fonts: the rows and the column headings grow with their font sizes.
+    click(&h, &format!("Group Priority: Normal: {n} items, collapsed"));
+    h.run_ok();
+    let first = rows.first().map(|r| r.id).unwrap();
+    let subject = h.state().s.mailbox.tasks.get(&first).map(|t| t.subject.clone()).unwrap();
+    let tallest = |h: &Harness<'_, App>, label: &str| {
+        h.get_all_by_label(label).map(|n| n.rect().height()).fold(0.0_f32, f32::max)
+    };
+    let (row_before, head_before) = (tallest(&h, &subject), tallest(&h, "Subject"));
+    assert!(row_before > 0.0 && head_before > 0.0);
+    run_cmd(&mut h, "view.viewSettings", json!({"rowFont": 24, "columnFont": 22, "gridLines": false}));
+    let (row_after, head_after) = (tallest(&h, &subject), tallest(&h, "Subject"));
+    assert!(row_after > row_before, "a larger row font makes taller rows ({row_before} -> {row_after})");
+    assert!(
+        head_after > head_before,
+        "a larger heading font makes a taller header ({head_before} -> {head_after})"
+    );
+    let other = mailcraft_engine::cmd::view::table::other(&h.state().s, folder);
+    assert!(other.no_grid, "grid lines are off for the view");
+}
+
+#[test]
+fn people_card_views_take_the_reading_pane() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 900.0));
+    for view in ["Card", "Business Card"] {
+        run_cmd(&mut h, "view.changeView", json!({"name": view}));
+        assert!(has(&h, "Meeting"), "{view}: the contact card shows beside the cards");
+    }
+    run_cmd(&mut h, "view.readingPane", json!({"position": "off"}));
+    assert!(!has(&h, "Meeting"), "Reading Pane › Off hides it");
+    assert!(has(&h, "Business card Rivera, Alice"));
+}
+
+#[test]
+fn notes_table_groups_by_colour_and_categories() {
+    let mut a = app();
+    let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Notes);
+    let mut h = harness(super::notes, a, (1500.0, 900.0));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Notes List"}));
+    run_cmd(&mut h, "view.viewSettings", json!({"groupBy": ["icon"]}));
+    assert!(has_part(&h, "Group Color: "), "colour groups");
+    run_cmd(&mut h, "view.viewSettings", json!({"groupBy": ["categories"]}));
+    let groups = mailcraft_engine::cmd::view::modules::groups(&h.state().s, folder);
+    let label = groups.first().cloned().unwrap();
+    assert!(has_part(&h, &format!("Group {label}:")));
+    run_cmd(&mut h, "view.formatColumns", json!({"column": "subject", "label": "Title"}));
+    assert!(has(&h, "Sort by Title"), "Format Columns renames the header");
+}
+
+#[test]
+fn module_view_settings_lists_group_by_and_other_settings() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 1000.0));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Card"}));
+    run_cmd(&mut h, "view.viewSettings", json!({}));
+    assert!(has(&h, "Fields..."), "the Card view's columns are its card fields");
+    assert!(has(&h, "Sort...") && has(&h, "Filter...") && has(&h, "Conditional Formatting..."));
+    assert!(has(&h, "Group By...") && has(&h, "Other Settings..."));
+    click(&h, "Sort...");
+    h.run_ok();
+    assert!(h.state().ui.dialogs.iter().any(|(d, _)| d == "viewSort"));
+}

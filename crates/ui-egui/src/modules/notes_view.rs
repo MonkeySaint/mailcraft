@@ -6,6 +6,8 @@
 //! filter come from the engine (`mailcraft_engine::cmd::notes::view_rows`), the view and the icon
 //! arrangement from the folder's module view.
 
+use std::collections::{HashMap, HashSet};
+
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Modifiers, Rect, ScrollArea, Sense,
     Stroke, TextEdit, Ui, Vec2, WidgetType, pos2, vec2,
@@ -14,14 +16,14 @@ use serde_json::{Value, json};
 
 use mailcraft_engine::cmd::calendar::pim::Kind;
 use mailcraft_engine::cmd::notes::{IconMode, NotesViewState, title};
-use mailcraft_engine::cmd::view::modules::{ModuleKind, ModuleView};
+use mailcraft_engine::cmd::view::modules::{ModuleKind, ModuleView, ViewRow};
 use mailcraft_model::{FolderKind, ItemId, ListTime, Note, NoteColor};
 
 use super::common::{
-    ModState, a11y, blend, change_view, child, current_folder, empty_message, folder_rows, group_header,
-    load, module_folder_pane, module_view, note_fill, paint_text_clipped, pane_bg, pane_separator,
-    reading_split, row_height, select_folder, select_item, store, sync_selection, todo_bar_strip,
-    view_switch,
+    ModState, a11y, blend, change_view, child, collapsed_labels, current_folder, empty_message, folder_rows,
+    group_header, load, module_folder_pane, module_view, nested_headers, note_fill, paint_text_clipped,
+    pane_bg, pane_separator, reading_split, row_height, select_folder, select_item, store, sync_selection,
+    todo_bar_strip, view_switch,
 };
 use crate::App;
 
@@ -65,10 +67,10 @@ fn legacy_request(app: &mut App, st: &mut ModState) {
     }
 }
 
-/// Notes of the current folder's view, in order.
-fn order(app: &App) -> Vec<ItemId> {
+/// Rows of the current folder's view, in order (a note may be listed under several groups).
+fn view_rows(app: &App) -> Vec<ViewRow> {
     current_folder(app, Kind::Note)
-        .map(|f| mailcraft_engine::cmd::notes::view_rows(&app.s, f).into_iter().map(|r| r.id).collect())
+        .map(|f| mailcraft_engine::cmd::notes::view_rows(&app.s, f))
         .unwrap_or_default()
 }
 
@@ -82,8 +84,11 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
         // Line Up Icons.
         st.note_pos.clear();
     }
-    let ids = order(app);
-    sync_selection(app, |_, id| ids.contains(&id));
+    // Worked out once per frame and shared by every part of the view.
+    let rows = view_rows(app);
+    let ids: Vec<ItemId> = rows.iter().map(|r| r.id).collect();
+    let listed: HashSet<ItemId> = ids.iter().copied().collect();
+    sync_selection(app, |_, id| listed.contains(&id));
     let full = ui.max_rect();
     let (pane, main) = module_folder_pane(ui, app);
     if let Some(p) = pane {
@@ -99,7 +104,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut App) {
     }
     let main = todo_bar_strip(ui, app, main);
     pane_bg(ui, main, app.theme.reading);
-    child(ui, main, "mc-notes-main", |ui| content(ui, app, &mut st, &view, &ids));
+    child(ui, main, "mc-notes-main", |ui| content(ui, app, &mut st, &view, &ids, &rows));
     keyboard(&ctx, app, &mut st);
     ui.expand_to_include_rect(full);
     store(&ctx, st);
@@ -159,7 +164,14 @@ fn icon_mode_name(m: IconMode) -> &'static str {
     }
 }
 
-fn content(ui: &mut Ui, app: &mut App, st: &mut ModState, view: &ModuleView, order: &[ItemId]) {
+fn content(
+    ui: &mut Ui,
+    app: &mut App,
+    st: &mut ModState,
+    view: &ModuleView,
+    order: &[ItemId],
+    rows: &[ViewRow],
+) {
     let rect = ui.max_rect();
     let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 44.0));
     child(ui, bar.shrink2(vec2(10.0, 7.0)), "mc-notes-bar", |ui| {
@@ -213,7 +225,7 @@ fn content(ui: &mut Ui, app: &mut App, st: &mut ModState, view: &ModuleView, ord
     let icons = view.view == "Icon" && view.icon_mode != IconMode::List;
     if view.view != "Icon" {
         // Notes List and Last 7 Days: a table with column headers.
-        table(ui, app, st, order, view, list_rect.shrink2(vec2(10.0, 6.0)));
+        table(ui, app, st, view, rows, list_rect.shrink2(vec2(10.0, 6.0)));
     } else {
         child(ui, list_rect.shrink(10.0), "mc-notes-body", |ui| {
             ScrollArea::vertical().id_salt("mc-notes-scroll").auto_shrink([false, false]).show(ui, |ui| {
@@ -542,20 +554,32 @@ fn preview_line(n: &Note) -> String {
 
 /// Notes List and Last 7 Days: column headers (click to sort, again to reverse) over one row per note, with
 /// AutoPreview, grid lines and Conditional Formatting from the folder's View Settings.
-fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &ModuleView, rect: Rect) {
-    use mailcraft_engine::cmd::view::modules::{self, note_column_label, note_columns, note_sort_descending};
+fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, view: &ModuleView, rows: &[ViewRow], rect: Rect) {
+    use mailcraft_engine::cmd::view::modules::{self, note_columns, note_shown, note_sort_descending};
     let folder = current_folder(app, Kind::Note);
+    // The first row of each note (a note listed under several groups is edited there only): one pass, not
+    // a search per row.
+    let mut first_rows: HashMap<ItemId, usize> = HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        first_rows.entry(r.id).or_insert(i);
+    }
+    let collapsed = folder.map(|f| collapsed_labels(app, f)).unwrap_or_default();
+    let shown = note_shown(view);
     let cols = column_layout(&note_columns(view), rect.width() - 14.0);
     let sort = if view.sort.is_empty() { "created" } else { view.sort.as_str() };
     let reversed = folder.is_some_and(|f| modules::reversed(&app.s, f));
     let descending = note_sort_descending(&view.sort) != reversed;
-    let head = Rect::from_min_size(rect.min, vec2(rect.width(), 26.0));
+    // Other Settings › fonts.
+    let head_font = if view.other.column_font > 0 { f32::from(view.other.column_font) } else { 12.5 };
+    let row_font = super::common::row_font(&view.other, 13.0);
+    let head = Rect::from_min_size(rect.min, vec2(rect.width(), 26.0_f32.max((head_font * 2.0).round())));
     let line = Stroke::new(1.0, app.theme.separator);
     ui.painter().rect_filled(head, CornerRadius::ZERO, blend(app.theme.reading, app.theme.backdrop, 0.3));
     for (key, x, w) in &cols {
         let r = Rect::from_min_size(pos2(head.min.x + x, head.min.y), vec2(*w, head.height()));
         let resp = ui.interact(r, Id::new(("mc-notes-head", *key)), Sense::click());
-        let label = note_column_label(key);
+        // Format Columns may rename a column.
+        let label = shown.iter().find(|(k, ..)| k == key).map_or("", |(_, l, _)| l.as_str());
         a11y(&resp, WidgetType::Button, &format!("Sort by {label}"));
         if resp.hovered() {
             ui.painter().rect_filled(r, CornerRadius::ZERO, app.theme.hover);
@@ -566,9 +590,9 @@ fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: 
         }
         paint_text_clipped(
             ui,
-            pos2(r.min.x + 6.0, r.min.y + 5.0),
+            pos2(r.min.x + 6.0, r.center().y - head_font * 0.6),
             &text,
-            FontId::proportional(12.5),
+            FontId::proportional(head_font),
             app.theme.text,
             w - 10.0,
         );
@@ -584,11 +608,27 @@ fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: 
     let preview = !view.no_preview;
     child(ui, body, "mc-notes-table", |ui| {
         ScrollArea::vertical().id_salt("mc-notes-table-scroll").auto_shrink([false, false]).show(ui, |ui| {
-            for &id in order {
+            for (i, r) in rows.iter().enumerate() {
+                // Group By: nested group headers; rows inside a collapsed group stay hidden.
+                let hidden = nested_headers(
+                    ui,
+                    app,
+                    rows,
+                    i,
+                    |x: &ViewRow| x.levels.as_slice(),
+                    |x: &ViewRow| x.id,
+                    &collapsed,
+                );
+                if hidden {
+                    continue;
+                }
+                let id = r.id;
                 let Some(n) = app.s.mailbox.notes.get(&id).cloned() else { continue };
-                let editing = st.note_edit.as_ref().is_some_and(|(e, _)| *e == id.0);
+                // A note listed under several groups is edited in its first row only.
+                let first_row = first_rows.get(&id) == Some(&i);
+                let editing = first_row && st.note_edit.as_ref().is_some_and(|(e, _)| *e == id.0);
                 let extra = preview && !preview_line(&n).is_empty();
-                let base = row_height(app, 24.0);
+                let base = row_height(app, 24.0).max((row_font * 1.85).round());
                 let h = if editing {
                     120.0
                 } else if extra {
@@ -597,6 +637,7 @@ fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: 
                     base
                 };
                 let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+                let resp = if first_row { resp } else { resp.on_hover_text("Listed in more than one group") };
                 a11y(&resp, WidgetType::Button, &cell_text(&n, "subject", tz));
                 let sel = app.ui.module_selection == Some(id.0);
                 if sel {
@@ -606,7 +647,7 @@ fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: 
                 }
                 let style = mailcraft_engine::cmd::notes::row_style(&app.s, view, &n);
                 let color = style.color.as_deref().and_then(hex_color).unwrap_or(app.theme.text);
-                let font = FontId::proportional(13.0);
+                let font = FontId::proportional(row_font);
                 for (key, x, w) in &cols {
                     let cx = row.min.x + x;
                     if *key == "icon" {
@@ -642,7 +683,15 @@ fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: 
                         overflow_character: Some('…'),
                     };
                     let galley = ui.painter().layout_job(job);
-                    let at = pos2(cx + 6.0, row.min.y + 4.0);
+                    // Format Columns › Alignment.
+                    let align = shown.iter().find(|(k, ..)| k == key).map_or("left", |(_, _, a)| *a);
+                    let gw = galley.size().x;
+                    let dx = match align {
+                        "right" => (w - 6.0 - gw).max(6.0),
+                        "center" => ((w - gw) / 2.0).max(6.0),
+                        _ => 6.0,
+                    };
+                    let at = pos2(cx + dx, row.min.y + 4.0);
                     ui.painter().galley(at, galley.clone(), c);
                     if style.bold {
                         // Faux bold: the same text one pixel to the right.
@@ -781,7 +830,7 @@ mod tests {
         legacy_request(&mut app, &mut st);
         let v = mailcraft_engine::cmd::view::modules::state(&app.s, notes, ModuleKind::Notes);
         assert_eq!(v.icon_mode, IconMode::Large);
-        assert_eq!(order(&app).len(), 2);
+        assert_eq!(view_rows(&app).len(), 2);
     }
 
     #[test]

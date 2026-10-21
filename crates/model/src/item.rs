@@ -283,6 +283,17 @@ impl MailItem {
             (None, None) => String::new(),
         }
     }
+    /// Like [`MailItem::body_text`], but reading at most `max_bytes` of the body (cut at a character
+    /// boundary): bounded work for something drawn every frame, however large the message is.
+    pub fn body_text_prefix(&self, max_bytes: usize) -> String {
+        let cut = |s: &str| crate::text::truncate_at_char(s, max_bytes).to_owned();
+        match (&self.body.text, &self.body.html) {
+            (Some(t), _) if !t.trim().is_empty() => cut(t),
+            (_, Some(h)) => crate::text::strip_html(crate::text::truncate_at_char(h, max_bytes)),
+            (Some(t), None) => cut(t),
+            (None, None) => String::new(),
+        }
+    }
     /// Recomputes `preview` from the body.
     pub fn refresh_preview(&mut self) {
         self.preview = make_preview(self.body.text.as_deref(), self.body.html.as_deref());

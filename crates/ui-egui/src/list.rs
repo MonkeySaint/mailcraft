@@ -1030,8 +1030,8 @@ fn body(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode, st: &mut
                 }
                 let r = Rect::from_min_size(origin + vec2(0.0, top), vec2(width, height_of(i)));
                 match rows.get(i) {
-                    Some(ListRow::Group { label, count, collapsed }) => {
-                        group_row(ui, app, r, label, *count, *collapsed);
+                    Some(ListRow::Group { label, count, collapsed, depth }) => {
+                        group_row(ui, app, r, label, *count, *collapsed, *depth);
                     }
                     Some(ListRow::Item(row)) => item_row(ui, app, c, r, row, mode, st, frame),
                     None => {}
@@ -1160,19 +1160,28 @@ fn toggle_group(ui: &Ui, app: &mut App, label: &str, collapsed: bool) {
     run(ui, app, id, json!({ "label": label }));
 }
 
-fn group_row(ui: &mut Ui, app: &mut App, r: Rect, label: &str, count: usize, collapsed: bool) {
+#[allow(clippy::too_many_arguments)]
+fn group_row(ui: &mut Ui, app: &mut App, r: Rect, label: &str, count: usize, collapsed: bool, depth: u8) {
     let th = app.theme.clone();
     let resp = ui.interact(r, Id::new(("mailcraft.list.group", label)), Sense::click());
     let painter = ui.painter().clone();
     let fill = if resp.hovered() { th.hover } else { th.group_header };
     painter.rect_filled(r.shrink2(vec2(0.0, 1.0)), 0.0, fill);
+    // A group nested by Group By is indented under the group around it and shows its own label.
+    let indent = 16.0 * f32::from(depth.min(6));
+    let title = queries::group_title(label);
     let chevron = if collapsed { "chevron-right" } else { "chevron-down" };
-    app.icons.paint(ui, icon_rect(pos2(r.left() + 14.0, r.center().y), 12.0), chevron, th.text_muted);
-    let t = Text::new(ui, label, 12.5, true, th.text, (r.width() - 40.0).max(1.0), 1);
-    t.paint_left(&painter, r, r.left() + 26.0);
+    app.icons.paint(
+        ui,
+        icon_rect(pos2(r.left() + 14.0 + indent, r.center().y), 12.0),
+        chevron,
+        th.text_muted,
+    );
+    let t = Text::new(ui, title, 12.5, true, th.text, (r.width() - 40.0 - indent).max(1.0), 1);
+    t.paint_left(&painter, r, r.left() + 26.0 + indent);
     let state = if collapsed { "collapsed" } else { "expanded" };
     resp.widget_info(|| {
-        WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("{label}: {count} items, {state}"))
+        WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("{title}: {count} items, {state}"))
     });
     if resp.clicked() {
         toggle_group(ui, app, label, collapsed);

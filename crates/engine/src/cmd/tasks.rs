@@ -1068,70 +1068,53 @@ pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
             .collect(),
         None => entries,
     };
-    let arrange =
-        if modules::show_groups(s, folder) { st.arrangement(kind).map(str::to_owned) } else { None };
-    // Arranged by Categories, an item with several categories is listed under each of them.
-    let entries: Vec<(Entry, Option<String>)> = entries
+    let grouped = modules::show_groups(s, folder);
+    let arrange = if grouped { st.arrangement(kind).map(str::to_owned) } else { None };
+    let rows: Vec<table::RowIn<(i64, String, ItemId)>> = entries
         .into_iter()
-        .flat_map(|e| {
-            let mut cats: Vec<String> = Vec::new();
-            if arrange.as_deref() == Some("categories") {
-                for c in e.categories.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
-                    if !cats.iter().any(|x| x.eq_ignore_ascii_case(c)) && cats.len() < pim::MAX_LIST {
-                        cats.push(c.to_owned());
+        .map(|e| {
+            let auto: Vec<(u8, String)> = match arrange.as_deref() {
+                None => Vec::new(),
+                // Arranged by Categories, an item with several categories is listed under each of them.
+                Some("categories") => {
+                    let mut cats: Vec<(u8, String)> = Vec::new();
+                    for c in e.categories.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+                        if !cats.iter().any(|x| x.1.eq_ignore_ascii_case(c)) && cats.len() < pim::MAX_LIST {
+                            cats.push((0, c.to_owned()));
+                        }
                     }
+                    if cats.is_empty() {
+                        cats.push((1, "(none)".to_owned()));
+                    }
+                    cats
                 }
-            }
-            if cats.len() > 1 {
-                cats.into_iter().map(|c| (e.clone(), Some(c))).collect::<Vec<_>>()
-            } else {
-                vec![(e, cats.into_iter().next())]
-            }
-        })
-        .collect();
-    let mut keyed: Vec<((u8, String), (i64, String, ItemId), ViewRow)> = entries
-        .into_iter()
-        .map(|(e, cat)| {
-            let group = arrange.as_deref().map(|a| match a {
-                "categories" => match cat {
-                    Some(c) => (0, c),
-                    None => (1, "(none)".to_owned()),
-                },
-                "startDate" => {
+                Some("startDate") => {
                     let (r, l) = modules::date_group(day(e.start), today, "Earlier");
-                    (r, l.to_owned())
+                    vec![(r, l.to_owned())]
                 }
-                "folder" => (0, s.mailbox.folder(e.folder).map(|f| f.name.clone()).unwrap_or_default()),
-                "type" => match e.kind {
+                Some("folder") => {
+                    vec![(0, s.mailbox.folder(e.folder).map(|f| f.name.clone()).unwrap_or_default())]
+                }
+                Some("type") => vec![match e.kind {
                     modules::RowKind::Mail => (1, "Flagged Message".to_owned()),
                     modules::RowKind::Contact => (2, "Contact".to_owned()),
                     _ => (0, "Task".to_owned()),
-                },
-                "importance" => match e.priority {
+                }],
+                Some("importance") => vec![match e.priority {
                     TaskPriority::High => (0, "High".to_owned()),
                     TaskPriority::Normal => (1, "Normal".to_owned()),
                     TaskPriority::Low => (2, "Low".to_owned()),
-                },
-                _ => {
+                }],
+                Some(_) => {
                     let (r, l) = modules::date_group(day(e.due), today, "Overdue");
-                    (r, l.to_owned())
+                    vec![(r, l.to_owned())]
                 }
-            });
-            let order = (e.due.map_or(i64::MAX, |d| d.unix), e.subject.to_lowercase(), e.id);
-            let row = ViewRow { id: e.id, kind: e.kind, group: group.as_ref().map(|g| g.1.clone()) };
-            (group.unwrap_or((0, String::new())), order, row)
+            };
+            let natural = (e.due.map_or(i64::MAX, |d| d.unix), e.subject.to_lowercase(), e.id);
+            table::RowIn { id: e.id, kind: e.kind, auto, natural }
         })
         .collect();
-    let by = |a: &ViewRow, b: &ViewRow| match (
-        &custom.sort,
-        table::item(s, a.kind, a.id),
-        table::item(s, b.kind, b.id),
-    ) {
-        (Some(f), Some(x), Some(y)) => table::compare(s, kind, f, x, y),
-        _ => std::cmp::Ordering::Equal,
-    };
-    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| by(&a.2, &b.2)).then_with(|| a.1.cmp(&b.1)));
-    let mut out: Vec<ViewRow> = keyed.into_iter().map(|(_, _, r)| r).collect();
+    let mut out = table::order_rows(s, kind, &st, grouped, rows);
     if modules::reversed(s, folder) {
         out.reverse();
     }

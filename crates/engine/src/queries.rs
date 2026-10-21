@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::cmd::view::{conversation_state, is_group_label};
 use crate::{Module, Session};
+use mailcraft_model::view::GROUP_SEP;
 use mailcraft_model::{
     ArrangeBy, Category, DateGroup, DateTime, FlagState, FocusClass, FolderId, FolderKind, FolderRole,
     Importance, ItemId, ListFilter, ListTime, MailItem, ResponseState, SortOrder, ViewSettings,
@@ -45,8 +46,26 @@ pub enum FolderRowKind {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ListRow {
-    Group { label: String, count: usize, collapsed: bool },
+    /// A group header. `label` is the key the group collapses by: with Group By fields the labels of the
+    /// group and the groups around it, outermost first, joined with [`GROUP_SEP`] ([`group_title`] is the
+    /// header text); `depth` is how deep the group is nested (0 = outermost).
+    Group {
+        label: String,
+        count: usize,
+        collapsed: bool,
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        depth: u8,
+    },
     Item(ItemRow),
+}
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
+}
+
+/// The header text of a group: its own label without the labels of the groups around it.
+pub fn group_title(label: &str) -> &str {
+    label.rsplit(GROUP_SEP).next().unwrap_or(label)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -717,32 +736,243 @@ fn group_of(s: &Session, m: &MailItem, arrange: ArrangeBy) -> (Key, String) {
 fn sort_items(s: &Session, vs: &ViewSettings, items: &mut [&MailItem]) {
     let arrange = vs.arrange_by;
     let descending = vs.order == SortOrder::Descending;
-    let mut keyed: Vec<(Key, i64, &MailItem)> = items
+    // Sort › Then by: further keys after the arrangement.
+    let then: Vec<crate::cmd::view::mail::MailField> =
+        if crate::cmd::view::mail::mail_list_folder(s, s.selection.folder) {
+            crate::cmd::view::mail::mail_view(s, s.selection.folder)
+                .then_by
+                .into_iter()
+                .filter(|f| f.key != arrange)
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let mut keyed: Vec<(Key, Vec<Key>, i64, &MailItem)> = items
         .iter()
         .map(|m| {
             let (k, _) = group_of(s, m, arrange);
+            let more: Vec<Key> = then.iter().map(|f| group_of(s, m, f.key).0).collect();
             let secondary = if arrange == ArrangeBy::Size {
                 i64::try_from(m.size).unwrap_or(i64::MAX)
             } else {
                 m.received.unix
             };
-            (k, secondary, *m)
+            (k, more, secondary, *m)
         })
         .collect();
     keyed.sort_by(|a, b| {
         let primary = a.0.cmp(&b.0);
         let primary = if descending { primary.reverse() } else { primary };
+        let mut more = std::cmp::Ordering::Equal;
+        for ((x, y), f) in a.1.iter().zip(b.1.iter()).zip(then.iter()) {
+            let o = if f.descending { y.cmp(x) } else { x.cmp(y) };
+            if o != std::cmp::Ordering::Equal {
+                more = o;
+                break;
+            }
+        }
         let secondary = match arrange {
             // Date and Size order every row by the sort direction.
-            ArrangeBy::Date | ArrangeBy::Size if !descending => a.1.cmp(&b.1),
+            ArrangeBy::Date | ArrangeBy::Size if !descending => a.2.cmp(&b.2),
             // Elsewhere rows inside a group stay newest first.
-            _ => b.1.cmp(&a.1),
+            _ => b.2.cmp(&a.2),
         };
-        primary.then(secondary).then(a.2.id.cmp(&b.2.id))
+        primary.then(more).then(secondary).then(a.3.id.cmp(&b.3.id))
     });
-    for (slot, (_, _, m)) in items.iter_mut().zip(keyed) {
+    for (slot, (_, _, _, m)) in items.iter_mut().zip(keyed) {
         *slot = m;
     }
+}
+
+/// Group By fields of the selected folder's list (empty: the list groups by its arrangement).
+fn manual_fields(s: &Session) -> Vec<crate::cmd::view::mail::MailField> {
+    if !crate::cmd::view::mail::mail_list_folder(s, s.selection.folder) {
+        return Vec::new();
+    }
+    crate::cmd::view::mail::mail_view(s, s.selection.folder).group_by
+}
+
+/// Most groups one message is listed under with Group By fields (many categories at several levels).
+const MAX_ITEM_GROUPS: usize = 16;
+
+/// Order of a date bucket for Group By on Date: newer buckets rank higher.
+fn date_rank(g: &DateGroup) -> i64 {
+    match g {
+        DateGroup::Future => 20,
+        DateGroup::Today => 19,
+        DateGroup::Yesterday => 18,
+        DateGroup::ThisWeek(w) => 10 + i64::from(w.0.min(6)),
+        DateGroup::LastWeek => 9,
+        DateGroup::TwoWeeksAgo => 8,
+        DateGroup::ThreeWeeksAgo => 7,
+        DateGroup::LastMonth => 6,
+        DateGroup::Older => 5,
+    }
+}
+
+/// Headers of message `m` for the Group By field `key` ("From: Alice Rivera"), with their order. Categories
+/// give a header per category; Date groups by the list's date buckets.
+fn field_headers(s: &Session, m: &MailItem, key: ArrangeBy) -> Vec<(Key, String)> {
+    let name = key.label();
+    match key {
+        ArrangeBy::Date => {
+            let g = DateGroup::of(m.received, s.now(), s.tz_offset_min);
+            vec![(Key::Num(date_rank(&g)), format!("{name}: {}", g.label()))]
+        }
+        ArrangeBy::Categories => {
+            let mut seen: Vec<String> = Vec::new();
+            let mut out = Vec::new();
+            for c in m.categories.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+                let k = c.to_lowercase();
+                if seen.contains(&k) || out.len() >= MAX_ITEM_GROUPS {
+                    continue;
+                }
+                seen.push(k.clone());
+                out.push((Key::Text(k), format!("{name}: {c}")));
+            }
+            if out.is_empty() {
+                out.push((Key::Text(String::new()), format!("{name}: {NONE_LABEL}")));
+            }
+            out
+        }
+        _ => {
+            let (k, label) = group_of(s, m, key);
+            vec![(k, format!("{name}: {label}"))]
+        }
+    }
+}
+
+/// Leaf groups of a list grouped by Group By fields: (labels outermost first, items) in list order. Items
+/// keep their sort order inside a group; pinned messages and top search results keep their own groups at
+/// the top.
+type Nested<'a> = Vec<(Vec<String>, Vec<&'a MailItem>)>;
+
+fn nested<'a>(
+    s: &Session,
+    fields: &[crate::cmd::view::mail::MailField],
+    items: Vec<&'a MailItem>,
+    pins: &BTreeSet<ItemId>,
+) -> Nested<'a> {
+    let top = top_results(s);
+    let mut out: Nested<'a> = Vec::new();
+    let mut entries: Vec<(Vec<(Key, String, bool)>, usize, &'a MailItem)> = Vec::new();
+    for (i, m) in items.into_iter().enumerate() {
+        let own = if top.contains(&m.id) && !pins.contains(&m.id) {
+            Some(TOP_RESULTS_LABEL)
+        } else if pins.contains(&m.id) {
+            Some(crate::cmd::view::mail::PINNED_LABEL)
+        } else {
+            None
+        };
+        if let Some(label) = own {
+            match out.last_mut() {
+                Some((l, list)) if l.len() == 1 && l.first().is_some_and(|x| x == label) => list.push(m),
+                _ => out.push((vec![label.to_owned()], vec![m])),
+            }
+            continue;
+        }
+        let mut paths: Vec<Vec<(Key, String, bool)>> = vec![Vec::new()];
+        for f in fields {
+            let options = field_headers(s, m, f.key);
+            let mut next = Vec::new();
+            for p in &paths {
+                for (k, l) in &options {
+                    if next.len() >= MAX_ITEM_GROUPS {
+                        break;
+                    }
+                    let mut q = p.clone();
+                    q.push((k.clone(), l.clone(), f.descending));
+                    next.push(q);
+                }
+            }
+            paths = next;
+        }
+        entries.extend(paths.into_iter().map(|p| (p, i, m)));
+    }
+    entries.sort_by(|a, b| {
+        for (x, y) in a.0.iter().zip(b.0.iter()) {
+            let o = x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1));
+            let o = if x.2 { o.reverse() } else { o };
+            if o != std::cmp::Ordering::Equal {
+                return o;
+            }
+        }
+        a.1.cmp(&b.1)
+    });
+    for (path, _, m) in entries {
+        let labels: Vec<String> = path.into_iter().map(|(_, l, _)| l).collect();
+        match out.last_mut() {
+            Some((l, list)) if *l == labels => list.push(m),
+            _ => out.push((labels, vec![m])),
+        }
+    }
+    out
+}
+
+/// Rows of nested groups: a header for each group as it starts (none inside a collapsed group), then the
+/// items of the leaf groups that are open (`items` pushes them, `count` counts a leaf group's rows).
+fn push_nested<'a>(
+    s: &Session,
+    rows: &mut Vec<ListRow>,
+    groups: &Nested<'a>,
+    mut items: impl FnMut(&mut Vec<ListRow>, &[&'a MailItem]),
+    count: impl Fn(&[&'a MailItem]) -> usize,
+) {
+    let collapsed = collapsed_labels(s);
+    let shut: HashSet<&str> = collapsed.iter().map(String::as_str).collect();
+    // An outer group counts the rows of the groups inside it.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (labels, list) in groups {
+        let n = count(list);
+        for d in 0..labels.len() {
+            if let Some(prefix) = labels.get(..=d) {
+                let e = counts.entry(prefix.join(GROUP_SEP)).or_insert(0);
+                *e = e.saturating_add(n);
+            }
+        }
+    }
+    let mut prev: &[String] = &[];
+    for (labels, list) in groups {
+        let mut hidden = false;
+        for d in 0..labels.len() {
+            let Some(prefix) = labels.get(..=d) else { break };
+            let key = prefix.join(GROUP_SEP);
+            if !hidden && prev.get(..=d) != Some(prefix) {
+                rows.push(ListRow::Group {
+                    label: key.clone(),
+                    count: counts.get(&key).copied().unwrap_or(0),
+                    collapsed: shut.contains(key.as_str()),
+                    depth: u8::try_from(d).unwrap_or(u8::MAX),
+                });
+            }
+            hidden |= shut.contains(key.as_str());
+        }
+        if !hidden {
+            items(rows, list);
+        }
+        prev = labels;
+    }
+}
+
+/// Every group of nested groups with its items, outer groups first: (collapse key, item ids) in list order.
+fn nested_ids(groups: &Nested<'_>, ids: impl Fn(&MailItem) -> Vec<ItemId>) -> Vec<(String, Vec<ItemId>)> {
+    let mut out: Vec<(String, Vec<ItemId>)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (labels, list) in groups {
+        let mine: Vec<ItemId> = list.iter().flat_map(|m| ids(m)).collect();
+        for d in 0..labels.len() {
+            let Some(prefix) = labels.get(..=d) else { break };
+            let key = prefix.join(GROUP_SEP);
+            let i = *index.entry(key.clone()).or_insert_with(|| {
+                out.push((key, Vec::new()));
+                out.len().saturating_sub(1)
+            });
+            if let Some((_, v)) = out.get_mut(i) {
+                v.extend(mine.iter().copied());
+            }
+        }
+    }
+    out
 }
 
 /// Splits sorted view items into list groups: `(header label, items)` in list order.
@@ -832,10 +1062,15 @@ fn category_groups<'a>(s: &Session, items: Vec<&'a MailItem>) -> Vec<(String, Ve
 /// messages of its conversations (header message first).
 fn group_ids(s: &Session) -> Vec<(String, Vec<ItemId>)> {
     let (vs, items) = view_items(s);
+    let fields = manual_fields(s);
     if vs.conversations {
         let convs = build_conversations(s, &vs, items);
         let by_sort: HashMap<ItemId, &ListConversation> = convs.iter().map(|c| (c.sort_item, c)).collect();
         let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
+        if !fields.is_empty() {
+            let groups = nested(s, &fields, reps, &BTreeSet::new());
+            return nested_ids(&groups, |m| by_sort.get(&m.id).map(|c| c.view_members()).unwrap_or_default());
+        }
         return grouped(s, vs.arrange_by, reps, &BTreeSet::new())
             .into_iter()
             .map(|(label, list)| {
@@ -849,6 +1084,9 @@ fn group_ids(s: &Session) -> Vec<(String, Vec<ItemId>)> {
             .collect();
     }
     let pins = list_pins(s, &vs);
+    if !fields.is_empty() {
+        return nested_ids(&nested(s, &fields, items, &pins), |m| vec![m.id]);
+    }
     grouped(s, vs.arrange_by, items, &pins)
         .into_iter()
         .map(|(label, list)| (label, list.into_iter().map(|m| m.id).collect()))
@@ -881,8 +1119,17 @@ fn header_only(s: &Session, m: &MailItem) -> bool {
 
 /// Header label of the group `item` falls in under the selected folder's arrangement.
 pub fn group_label(s: &Session, item: &MailItem) -> String {
-    group_ids(s)
-        .into_iter()
+    let ids = group_ids(s);
+    if !manual_fields(s).is_empty() {
+        // Nested groups: the innermost group holding the item (the one its row sits in).
+        return ids
+            .into_iter()
+            .filter(|(_, list)| list.contains(&item.id))
+            .max_by_key(|(label, _)| label.matches(GROUP_SEP).count())
+            .map(|(label, _)| label)
+            .unwrap_or_default();
+    }
+    ids.into_iter()
         .find(|(_, list)| list.contains(&item.id))
         .map(|(label, _)| label)
         .unwrap_or_else(|| group_of(s, item, view_settings(s, s.selection.folder).arrange_by).1)
@@ -1052,7 +1299,12 @@ fn other_item_rows(s: &Session, rows: &mut Vec<ListRow>) {
     let collapsed = collapsed_labels(s).iter().any(|l| l == OTHER_ITEMS_LABEL);
     let grouped = view_settings(s, s.selection.folder).show_in_groups;
     if grouped {
-        rows.push(ListRow::Group { label: OTHER_ITEMS_LABEL.to_owned(), count: others.len(), collapsed });
+        rows.push(ListRow::Group {
+            label: OTHER_ITEMS_LABEL.to_owned(),
+            count: others.len(),
+            collapsed,
+            depth: 0,
+        });
     }
     if !(grouped && collapsed) {
         rows.extend(others.into_iter().map(ListRow::Item));
@@ -1147,9 +1399,30 @@ fn undecorated_rows(s: &Session) -> Vec<ListRow> {
     let pins = list_pins(s, &vs);
     let mut rows = Vec::new();
     let mut shown: HashMap<ItemId, u16> = HashMap::new();
+    let fields = manual_fields(s);
+    if !fields.is_empty() {
+        // Group By fields: nested groups (a message under several categories gets a row in each).
+        let groups = nested(s, &fields, items, &pins);
+        push_nested(
+            s,
+            &mut rows,
+            &groups,
+            |rows, list| {
+                rows.extend(list.iter().map(|m| {
+                    let mut row = item_row(s, m);
+                    let n = shown.entry(m.id).or_insert(0);
+                    row.repeat = *n;
+                    *n = n.saturating_add(1);
+                    ListRow::Item(row)
+                }));
+            },
+            <[&MailItem]>::len,
+        );
+        return rows;
+    }
     for (label, list) in grouped(s, vs.arrange_by, items, &pins) {
         let is_collapsed = group_collapsed(s, &vs, &collapsed, &label, &list);
-        rows.push(ListRow::Group { label, count: list.len(), collapsed: is_collapsed });
+        rows.push(ListRow::Group { label, count: list.len(), collapsed: is_collapsed, depth: 0 });
         if !is_collapsed {
             rows.extend(list.into_iter().map(|m| {
                 let mut row = item_row(s, m);
@@ -1384,11 +1657,33 @@ fn conversation_rows(s: &Session, vs: &ViewSettings, items: Vec<&MailItem>) -> V
     let by_sort: HashMap<ItemId, &ListConversation> = convs.iter().map(|c| (c.sort_item, c)).collect();
     let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
     let collapsed = collapsed_labels(s);
+    let fields = manual_fields(s);
+    if !fields.is_empty() {
+        let groups = nested(s, &fields, reps, &BTreeSet::new());
+        let members = |list: &[&MailItem]| -> usize {
+            list.iter()
+                .filter_map(|m| by_sort.get(&m.id))
+                .map(|c| c.items.len().saturating_sub(c.other.len()))
+                .sum()
+        };
+        push_nested(
+            s,
+            &mut rows,
+            &groups,
+            |rows, list| {
+                for c in list.iter().filter_map(|m| by_sort.get(&m.id)) {
+                    push_conversation(rows, s, c, &settings);
+                }
+            },
+            members,
+        );
+        return rows;
+    }
     for (label, list) in grouped(s, vs.arrange_by, reps, &BTreeSet::new()) {
         let group: Vec<&ListConversation> = list.iter().filter_map(|m| by_sort.get(&m.id).copied()).collect();
         let is_collapsed = group_collapsed(s, vs, &collapsed, &label, &list);
         let count = group.iter().map(|c| c.items.len().saturating_sub(c.other.len())).sum();
-        rows.push(ListRow::Group { label, count, collapsed: is_collapsed });
+        rows.push(ListRow::Group { label, count, collapsed: is_collapsed, depth: 0 });
         if !is_collapsed {
             for c in group {
                 push_conversation(&mut rows, s, c, &settings);
@@ -2273,7 +2568,7 @@ mod tests {
         s.view.collapsed_groups.insert(folder, vec!["Today".into()]);
         let rows = list_rows(&s);
         match rows.first() {
-            Some(ListRow::Group { label, collapsed, count }) => {
+            Some(ListRow::Group { label, collapsed, count, .. }) => {
                 assert_eq!(label, "Today");
                 assert!(*collapsed && *count > 0);
             }

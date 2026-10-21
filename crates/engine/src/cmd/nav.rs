@@ -204,13 +204,18 @@ fn remember_folder(s: &mut Session) {
 /// Shows `folder` in the list (clears the selection and any search).
 fn show_folder(s: &mut Session, folder: FolderId) {
     leave_focus(s, None);
-    if s.selection.folder != folder {
+    let changed = s.selection.folder != folder;
+    if changed {
         s.view.search.clear();
     }
-    if s.selection.folder != folder || !s.view.folder_visits.contains_key(&folder) {
+    if changed || !s.view.folder_visits.contains_key(&folder) {
         note_visit(s, folder);
     }
     s.selection = Selection { folder, items: Vec::new(), focus: None };
+    if changed {
+        // Each opening of a view shows its groups as its Expand/collapse default says.
+        crate::cmd::view::opened(s, folder);
+    }
     crate::new_mail::seen_folder(s, folder);
     if s.settings.text("search.scope") == crate::session::INBOX_MAILBOX_SCOPE
         && matches!(s.view.search_scope, SearchScope::CurrentFolder | SearchScope::CurrentMailbox)

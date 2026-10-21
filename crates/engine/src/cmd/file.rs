@@ -88,7 +88,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.newDataFile",
             "New Data File",
             "Home › New Items › More Items",
-            r#"{"path"?: string, "name"?: string, "confirm"?: bool} (without a name or path the Create Data File prompt opens; confirm: true creates one with the default name)"#,
+            r#"{"path"?: string (a file of its own; .mcdata added without an extension; an existing data file there opens), "password"?: string (with path: encrypt the file), "name"?: string, "confirm"?: bool} (without a name or path the Create Data File prompt opens; confirm: true creates one kept with the profile)"#,
             true,
             always,
             new_data_file,
@@ -97,7 +97,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.closeDataFile",
             "Remove",
             ROOT,
-            r#"{"store": string|number (account id, name or address), "confirm"?: bool (without it the command only asks)}"#,
+            r#"{"store": string|number (account id, name or address), "confirm"?: bool (without it the command only asks), "password"?: string (a protected data file whose password is not kept; checked against its file), "verify"?: string (the password again, needed when its file is gone)}"#,
             true,
             has_secondary,
             close_data_file,
@@ -106,7 +106,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.openDataFile",
             "Open Data File",
             "File › Open & Export",
-            r#"{"path"?: string (a closed .mcdata file), "name"?: string (a closed data file of this profile)} (neither = list the closed data files)"#,
+            r#"{"path"?: string (a .mcdata file; one outside this profile's closed data files stays linked to it), "password"?: string (a protected file), "name"?: string (a closed data file of this profile)} (neither = list the closed data files)"#,
             true,
             always,
             open_data_file,
@@ -115,7 +115,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.dataFileProperties",
             "Data File Properties...",
             ROOT,
-            r#"{"store"?: string|number, "name"?: string (rename), "compact"?: bool (compact the profile's data now)} (no name or compact = open the dialog)"#,
+            r#"{"store"?: string|number, "name"?: string (rename), "compact"?: bool (compact the profile's data now), "save"?: bool (write a data file of its own to its file now)} (none of them = open the dialog)"#,
             true,
             has_accounts,
             data_file_properties,
@@ -631,29 +631,118 @@ fn cleanup_tools(s: &mut Session, _: &Value) -> CmdResult {
     dialog(s, "mailboxCleanup", json!({}))
 }
 
-fn new_data_file(s: &mut Session, p: &Value) -> CmdResult {
-    if s.mailbox.accounts.len() >= MAX_ACCOUNTS {
-        return Err(CmdError::Failed(format!("at most {MAX_ACCOUNTS} data files")));
-    }
-    let from_path = opt_str(p, "path").and_then(|path| Path::new(path).file_stem()).and_then(|n| n.to_str());
-    let clean = |n: &str| -> String { n.chars().filter(|c| !c.is_control()).take(255).collect() };
-    let base = opt_str(p, "name")
-        .or(from_path)
-        .map(|n| clean(n).trim().to_owned())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| LOCAL_ACCOUNT_FALLBACK_NAME.to_owned());
+/// `base`, numbered when another data file already has that name ("Archive (2)").
+fn free_name(s: &Session, base: &str) -> String {
     let taken = |n: &str| s.mailbox.accounts.iter().any(|a| a.display_name.eq_ignore_ascii_case(n));
-    let mut name = base.clone();
+    let mut name = base.to_owned();
     let mut k = 2u32;
     while taken(&name) && k < 10_000 {
         name = format!("{base} ({k})");
         k = k.saturating_add(1);
     }
+    name
+}
+
+/// Opens the data file read from `path` as a standalone data file (see `datafile::open_linked`).
+fn open_linked_cmd(s: &mut Session, path: &Path, bytes: &[u8], password: Option<&str>) -> CmdResult {
+    let id = crate::datafile::open_linked(s, path, bytes, password)?;
+    // The data file is now open from its file: an undo step would drop it while the file waits elsewhere.
+    s.undo_barrier = true;
+    let name = s.mailbox.account(id).map(|a| a.display_name.clone()).unwrap_or_default();
+    let (_, items, folders) = crate::datafile::usage(s, id);
+    let protected = s.mailbox.account(id).and_then(|a| a.data_file.as_ref()).is_some_and(|l| l.protected);
+    Ok(json!({
+        "account": id.0,
+        "name": name,
+        "items": items,
+        "folders": folders,
+        "path": path.display().to_string(),
+        "protected": protected,
+    }))
+}
+
+/// The data file password of a command (`password`; empty means none).
+fn password_param(p: &Value) -> Result<Option<String>, CmdError> {
+    match p.get("password") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(pw)) if pw.is_empty() => Ok(None),
+        Some(Value::String(pw)) => {
+            crate::datafile::check_password(pw)?;
+            Ok(Some(pw.clone()))
+        }
+        Some(_) => Err(CmdError::Params("`password` must be text".into())),
+    }
+}
+
+/// New Data File. With `path` the data file is a file of its own at that path (`.mcdata` is added when the
+/// name has no extension), written at once and encrypted under `password` when one is given; a data file
+/// that is already there is opened instead (Create or Open). Without a path it is kept with the profile's
+/// data. Without a name or path the Create Data File prompt opens.
+fn new_data_file(s: &mut Session, p: &Value) -> CmdResult {
+    if s.mailbox.accounts.len() >= MAX_ACCOUNTS {
+        return Err(CmdError::Failed(format!("at most {MAX_ACCOUNTS} data files")));
+    }
+    let password = password_param(p)?;
+    if let Some(raw) = opt_str(p, "path").map(str::trim).filter(|x| !x.is_empty()) {
+        if raw.chars().count() > 4096 || raw.chars().any(char::is_control) {
+            return Err(CmdError::Params("`path` is not a usable file name".into()));
+        }
+        // Kept absolute: the file is written again on close and exit, whatever the current folder is then.
+        let path = crate::datafile::absolute(&crate::datafile::with_extension(Path::new(raw)));
+        if Path::new(raw).is_dir() || path.is_dir() {
+            return Err(CmdError::Params(format!("{} is a folder; give a file name", path.display())));
+        }
+        if path.exists() {
+            // Create or Open: a data file already at that path opens.
+            let bytes = crate::datafile::read_file(&path)?;
+            if crate::datafile::is_sealed(&bytes) && password.is_none() {
+                return dialog(
+                    s,
+                    "dataFilePassword",
+                    json!({"path": path.display().to_string(), "command": "file.openDataFile"}),
+                );
+            }
+            return open_linked_cmd(s, &path, &bytes, password.as_deref());
+        }
+        let clean = |n: &str| -> String { n.chars().filter(|c| !c.is_control()).take(255).collect() };
+        let stem = path.file_stem().and_then(|n| n.to_str()).map(clean).unwrap_or_default();
+        let base = opt_str(p, "name")
+            .map(clean)
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+            .or_else(|| Some(stem.trim().to_owned()).filter(|n| !n.is_empty()))
+            .unwrap_or_else(|| LOCAL_ACCOUNT_FALLBACK_NAME.to_owned());
+        let name = free_name(s, &base);
+        let id = crate::datafile::create_linked(s, &name, &path, password.as_deref())?;
+        // The file now exists outside the mailbox: an undo step would leave it behind unopened.
+        s.undo_barrier = true;
+        return Ok(json!({
+            "account": id.0,
+            "name": name,
+            "path": path.display().to_string(),
+            "protected": password.is_some(),
+        }));
+    }
+    if password.is_some() {
+        return Err(CmdError::Params(
+            "a password protects a data file kept in a file of its own: give a `path`".into(),
+        ));
+    }
+    let clean = |n: &str| -> String { n.chars().filter(|c| !c.is_control()).take(255).collect() };
+    let base = opt_str(p, "name")
+        .map(|n| clean(n).trim().to_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| LOCAL_ACCOUNT_FALLBACK_NAME.to_owned());
+    let name = free_name(s, &base);
     // Without a name or a file, ask for one first (Create or Open Data File); `confirm` skips the prompt.
-    let named = opt_str(p, "name").is_some() || opt_str(p, "path").is_some();
+    let named = opt_str(p, "name").is_some();
     if !named && p.get("confirm").and_then(Value::as_bool) != Some(true) {
         let location = s.store.as_ref().map(|st| st.dir.display().to_string()).unwrap_or_default();
-        return dialog(s, "newDataFile", json!({ "name": name, "location": location }));
+        return dialog(
+            s,
+            "newDataFile",
+            json!({ "name": name, "location": location, "extension": crate::datafile::EXTENSION }),
+        );
     }
     let id = s.mailbox.add_account(Account {
         kind: AccountKind::Local,
@@ -676,6 +765,69 @@ fn close_data_file(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Disabled("the primary data file cannot be removed".into()));
     }
     let name = s.mailbox.account(id).map(|a| a.display_name.clone()).unwrap_or_default();
+    let link = s.mailbox.account(id).and_then(|a| a.data_file.clone());
+    if let Some(link) = link {
+        // A data file of its own goes back to its file.
+        if opt_bool(p, "confirm") != Some(true) {
+            return dialog(
+                s,
+                "confirm",
+                json!({
+                    "title": "Remove Data File",
+                    "text": format!("Close the data file \"{name}\"? Its folders leave the folder pane, and it is saved to {} so it can be opened again (or moved) later.", link.path),
+                    "command": "file.closeDataFile",
+                    "params": {"store": id.0, "confirm": true},
+                }),
+            );
+        }
+        if link.protected && s.secrets.get(&crate::datafile::secret_key(id)).is_none() {
+            // The password is checked against the file before anything is written with it: a typo must not
+            // leave the only copy encrypted under a password nobody knows.
+            let existing = Path::new(&link.path);
+            let sealed = existing
+                .is_file()
+                .then(|| crate::datafile::read_file(existing))
+                .transpose()?
+                .filter(|b| crate::datafile::is_sealed(b));
+            match password_param(p)? {
+                Some(pw) => {
+                    match &sealed {
+                        Some(bytes) => {
+                            crate::datafile::unseal(bytes, &pw)?;
+                        }
+                        // Nothing to check it against (the file is gone or not protected): it is typed twice.
+                        None if opt_str(p, "verify") != Some(pw.as_str()) => {
+                            return Err(CmdError::Params(
+                                "the file is not there to check the password against: type it twice (`verify`)"
+                                    .into(),
+                            ));
+                        }
+                        None => {}
+                    }
+                    s.secrets.set(&crate::datafile::secret_key(id), &pw).map_err(CmdError::Failed)?;
+                }
+                None => {
+                    return dialog(
+                        s,
+                        "dataFilePassword",
+                        json!({
+                            "path": link.path,
+                            "store": id.0,
+                            "command": "file.closeDataFile",
+                            "verify": sealed.is_none(),
+                        }),
+                    );
+                }
+            }
+        }
+        let (path, folders) = crate::datafile::close_linked(s, id)?;
+        s.undo_barrier = true;
+        // A protected data file's contents leave the profile's journal and snapshot with it.
+        s.checkpoint_after = link.protected;
+        return Ok(
+            json!({"removed": id.0, "folders": folders, "name": name, "path": path.display().to_string()}),
+        );
+    }
     if opt_bool(p, "confirm") != Some(true) {
         let kept = match crate::datafile::closed_dir(s) {
             Some(dir) => format!("It is kept in {} and can be opened again", dir.display()),
@@ -705,10 +857,24 @@ fn close_data_file(s: &mut Session, p: &Value) -> CmdResult {
 /// `<name>.mcdata.opened` once its contents are back, so it is not offered twice.
 fn open_data_file(s: &mut Session, p: &Value) -> CmdResult {
     let entries = crate::datafile::closed_entries(s);
+    let password = password_param(p)?;
     let (bytes, from_dir, memory) = if let Some(path) = opt_str(p, "path") {
-        let path = PathBuf::from(path);
+        let path = crate::datafile::absolute(Path::new(path));
         let in_dir = entries.iter().any(|e| e.path.as_deref() == Some(path.as_path()));
-        (crate::datafile::read_file(&path)?, in_dir.then_some(path), None)
+        let bytes = crate::datafile::read_file(&path)?;
+        if !in_dir {
+            // A data file of its own (anywhere but this profile's closed data files) opens from its file and
+            // goes back there when it is closed; a protected one asks for its password first.
+            if crate::datafile::is_sealed(&bytes) && password.is_none() {
+                return dialog(
+                    s,
+                    "dataFilePassword",
+                    json!({"path": path.display().to_string(), "command": "file.openDataFile"}),
+                );
+            }
+            return open_linked_cmd(s, &path, &bytes, password.as_deref());
+        }
+        (bytes, Some(path), None)
     } else if let Some(name) = opt_str(p, "name") {
         let Some(e) = entries.iter().find(|e| e.name.eq_ignore_ascii_case(name.trim())) else {
             return Err(CmdError::Params(format!("no closed data file named \"{name}\"")));
@@ -788,6 +954,11 @@ fn data_file_properties(s: &mut Session, p: &Value) -> CmdResult {
             json!({"account": id.0, "compacted": true, "journalBytes": before, "journalAfter": after}),
         );
     }
+    if opt_bool(p, "save") == Some(true) {
+        // A data file of its own: write its file now (it is written on close and on exit too).
+        let path = crate::datafile::save_linked(s, id)?;
+        return Ok(json!({"account": id.0, "saved": path.display().to_string()}));
+    }
     let Some(a) = s.mailbox.account(id).cloned() else {
         return Err(CmdError::Params("no such data file".into()));
     };
@@ -803,11 +974,24 @@ fn data_file_properties(s: &mut Session, p: &Value) -> CmdResult {
             "local": a.kind == AccountKind::Local,
             "default": a.is_default,
             "path": path,
+            "file": a.data_file.as_ref().map(|l| l.path.clone()),
+            "protected": a.data_file.as_ref().is_some_and(|l| l.protected),
             "bytes": bytes,
             "items": items,
             "folders": folders,
         }),
     )
+}
+
+/// Writes every data file kept in a file of its own back to its file (on exit). Returns the files that
+/// could not be written, with why.
+fn save_linked_files(s: &Session) -> Vec<String> {
+    let linked: Vec<AccountId> =
+        s.mailbox.accounts.iter().filter(|a| a.data_file.is_some()).map(|a| a.id).collect();
+    linked
+        .into_iter()
+        .filter_map(|id| crate::datafile::save_linked(s, id).err().map(|e| e.to_string()))
+        .collect()
 }
 
 fn open_file_location(s: &mut Session, p: &Value) -> CmdResult {
@@ -837,6 +1021,10 @@ fn exit(s: &mut Session, _: &Value) -> CmdResult {
     } else {
         // Nothing to write to (in-memory session): the queue only mirrors the mailbox.
         s.pending_ops.clear();
+    }
+    // Data files of their own are written back to their files.
+    for why in save_linked_files(s) {
+        s.notify(Notice::Error(format!("Could not save a data file: {why}")));
     }
     s.notify(Notice::OpenDialog("exit".into(), json!({})));
     Ok(json!({"exit": true}))
@@ -921,7 +1109,7 @@ mod tests {
     fn data_files() {
         let (mut s, _, _) = session();
         assert!(s.enabled("file.closeDataFile").is_some());
-        let r = s.run("file.newDataFile", &json!({"path": "/tmp/Archive 2026.pst"})).unwrap();
+        let r = s.run("file.newDataFile", &json!({"name": "Archive 2026"})).unwrap();
         assert_eq!(r["name"], "Archive 2026");
         let r2 = s.run("file.newDataFile", &json!({"name": "archive 2026"})).unwrap();
         assert_eq!(r2["name"], "archive 2026 (2)");
@@ -954,6 +1142,208 @@ mod tests {
         assert!(s.closed_data_files.is_empty());
         assert_eq!(s.mailbox.mail.len(), before);
         assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+    }
+
+    #[test]
+    fn new_data_file_at_a_path_is_a_file_that_closes_reopens_and_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _, _) = session();
+        let path = dir.path().join("Project Mail");
+        let r = s.run("file.newDataFile", &json!({"path": path.to_str().unwrap()})).unwrap();
+        let file = dir.path().join("Project Mail.mcdata");
+        assert_eq!(r["name"], "Project Mail");
+        assert_eq!(r["path"], file.to_str().unwrap());
+        assert!(file.is_file(), "the file is written when the data file is made");
+        let acct = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        assert!(s.mailbox.role_folder(acct, FolderRole::Inbox).is_some(), "with its default folders");
+        let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
+        s.mailbox.add_mail(MailItem { folder: inbox, subject: "Kept".into(), ..Default::default() });
+        // Properties name the file; Save writes it now.
+        s.run("file.dataFileProperties", &json!({"store": acct.0})).unwrap();
+        let Some(Notice::OpenDialog(_, d)) = s.notices.last() else { panic!("no dialog") };
+        assert_eq!(d["file"], file.to_str().unwrap());
+        s.run("file.dataFileProperties", &json!({"store": acct.0, "save": true})).unwrap();
+        let image = crate::datafile::parse(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(image.mail.len(), 1);
+        assert!(image.account.data_file.is_none(), "the file does not say where it was");
+        // Close writes it back to its file (not to the profile's closed data files).
+        let r = s.run("file.closeDataFile", &json!({"store": acct.0})).unwrap();
+        assert_eq!(r["dialog"], "confirm");
+        let r = s.run("file.closeDataFile", &json!({"store": acct.0, "confirm": true})).unwrap();
+        assert_eq!(r["path"], file.to_str().unwrap());
+        assert!(s.closed_data_files.is_empty());
+        assert!(s.mailbox.accounts.iter().all(|a| a.id != acct));
+        // Moved elsewhere, it opens from there and stays linked to its new place.
+        let moved = dir.path().join("moved.mcdata");
+        std::fs::rename(&file, &moved).unwrap();
+        let r = s.run("file.openDataFile", &json!({"path": moved.to_str().unwrap()})).unwrap();
+        assert_eq!((r["name"].as_str(), r["items"].as_u64()), (Some("Project Mail"), Some(1)));
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let link = s.mailbox.account(id).and_then(|a| a.data_file.clone()).unwrap();
+        assert_eq!(link.path, moved.to_str().unwrap());
+        assert!(moved.is_file(), "a linked file is not renamed away");
+        // It cannot be open twice; New Data File on an existing data file opens it (here: refused, it is open).
+        assert!(s.run("file.openDataFile", &json!({"path": moved.to_str().unwrap()})).is_err());
+        assert!(s.run("file.newDataFile", &json!({"path": moved.to_str().unwrap()})).is_err());
+        // Exit writes it back too.
+        let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+        s.mailbox.add_mail(MailItem { folder: inbox, subject: "Later".into(), ..Default::default() });
+        s.run("file.exit", &json!({})).unwrap();
+        let image = crate::datafile::parse(&std::fs::read(&moved).unwrap()).unwrap();
+        assert_eq!(image.mail.len(), 2);
+        // A folder is not a file name; junk is refused.
+        assert!(s.run("file.newDataFile", &json!({"path": dir.path().to_str().unwrap()})).is_err());
+        assert!(s.run("file.newDataFile", &json!({"path": "a\u{0}b"})).is_err());
+        let missing = dir.path().join("no-such-folder").join("x.mcdata");
+        let before = s.mailbox.accounts.len();
+        assert!(s.run("file.newDataFile", &json!({"path": missing.to_str().unwrap()})).is_err());
+        assert_eq!(s.mailbox.accounts.len(), before, "nothing is added when the file cannot be written");
+        assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+    }
+
+    #[test]
+    fn data_file_with_a_password_is_encrypted_and_asks_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _, _) = session();
+        let file = dir.path().join("Private.mcdata");
+        let p = file.to_str().unwrap();
+        assert!(s.run("file.newDataFile", &json!({"name": "x", "password": "pw"})).is_err(), "needs a path");
+        assert!(s.run("file.newDataFile", &json!({"path": p, "password": "a\u{7}b"})).is_err());
+        let r = s.run("file.newDataFile", &json!({"path": p, "password": "s3cret"})).unwrap();
+        assert_eq!(r["protected"], true);
+        let acct = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
+        s.mailbox.add_mail(MailItem {
+            folder: inbox,
+            subject: "Confidential plans".into(),
+            ..Default::default()
+        });
+        s.run("file.closeDataFile", &json!({"store": acct.0, "confirm": true})).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(crate::datafile::is_sealed(&bytes));
+        assert!(!String::from_utf8_lossy(&bytes).contains("Confidential"), "the file is encrypted");
+        assert!(crate::datafile::parse(&bytes).is_err());
+        // Opening asks for the password; a wrong one is refused; the right one opens it.
+        let r = s.run("file.openDataFile", &json!({"path": p})).unwrap();
+        assert_eq!(r["dialog"], "dataFilePassword");
+        let before = s.mailbox.accounts.len();
+        assert!(matches!(
+            s.run("file.openDataFile", &json!({"path": p, "password": "nope"})),
+            Err(CmdError::Params(_))
+        ));
+        assert_eq!(s.mailbox.accounts.len(), before);
+        let r = s.run("file.openDataFile", &json!({"path": p, "password": "s3cret"})).unwrap();
+        assert_eq!(r["items"], 1);
+        assert_eq!(r["protected"], true);
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        // Without the kept password, Close asks for it before writing.
+        s.secrets.remove(&crate::datafile::secret_key(id)).unwrap();
+        let r = s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true})).unwrap();
+        assert_eq!(r["dialog"], "dataFilePassword");
+        assert!(s.mailbox.account(id).is_some(), "nothing closed yet");
+        assert_eq!(r["params"]["verify"], false, "the file is there to check the password against");
+        // A mistyped password is checked against the file and refused: nothing is written or kept.
+        assert!(matches!(
+            s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true, "password": "s3cre"})),
+            Err(CmdError::Params(_))
+        ));
+        assert!(s.secrets.get(&crate::datafile::secret_key(id)).is_none(), "a wrong password is not kept");
+        assert!(s.mailbox.account(id).is_some());
+        assert!(crate::datafile::unseal(&std::fs::read(&file).unwrap(), "s3cret").is_ok(), "file untouched");
+        s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true, "password": "s3cret"})).unwrap();
+        assert!(s.mailbox.account(id).is_none());
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(crate::datafile::unseal(&bytes, "s3cret").is_ok());
+        // Damaged protected files are an error, never a panic.
+        let junk = br#"{"format":"mailcraft-data-file-sealed","version":1,"kdf":"pbkdf2-sha256","rounds":5,"salt":"!!","cipher":"aes-256-cbc","iv":"","data":""}"#;
+        assert!(crate::datafile::unseal(junk, "x").is_err());
+        assert!(crate::datafile::unseal(b"{", "x").is_err());
+    }
+
+    /// A relative path is kept absolute, so the file is written back to the same place from any folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_data_file_path_is_kept_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        // The temporary folder spelled relative to the current folder ("../../…").
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.push(dir.path().strip_prefix("/").unwrap());
+        rel.push("Relative");
+        assert!(rel.is_relative());
+        let (mut s, _, _) = session();
+        let r = s.run("file.newDataFile", &json!({"path": rel.to_str().unwrap()})).unwrap();
+        let want = dir.path().join("Relative.mcdata");
+        assert!(want.is_file());
+        assert!(Path::new(r["path"].as_str().unwrap()).is_absolute(), "{}", r["path"]);
+        let link = s.mailbox.accounts.iter().find_map(|a| a.data_file.clone()).unwrap();
+        assert!(Path::new(&link.path).is_absolute(), "{}", link.path);
+        assert!(crate::datafile::linked_to(&s, &want).is_some());
+        // Opening it by a relative path finds it open already.
+        let again = rel.with_extension("mcdata");
+        assert!(s.run("file.openDataFile", &json!({"path": again.to_str().unwrap()})).is_err());
+    }
+
+    #[test]
+    fn closing_a_protected_data_file_takes_its_items_out_of_the_profile_journal() {
+        let profile = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::open(profile.path()).unwrap();
+        let file = dir.path().join("Private.mcdata");
+        let r =
+            s.run("file.newDataFile", &json!({"path": file.to_str().unwrap(), "password": "pw-1"})).unwrap();
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+        s.mailbox.add_mail(MailItem {
+            folder: inbox,
+            subject: "Confidential plans".into(),
+            ..Default::default()
+        });
+        s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
+        let on_disk = |p: &Path| -> String {
+            ["journal.jsonl", "mailbox.json"]
+                .iter()
+                .map(|f| String::from_utf8_lossy(&std::fs::read(p.join(f)).unwrap_or_default()).into_owned())
+                .collect()
+        };
+        assert!(on_disk(profile.path()).contains("Confidential"), "open, its items live in the profile");
+        s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true})).unwrap();
+        assert!(!on_disk(profile.path()).contains("Confidential"), "closed, they leave the journal");
+        drop(s);
+        let s = Session::open(profile.path()).unwrap();
+        assert!(s.mailbox.account(id).is_none(), "and stay closed after a restart");
+    }
+
+    #[test]
+    fn closing_a_protected_data_file_whose_file_is_gone_asks_for_the_password_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _, _) = session();
+        let file = dir.path().join("Gone.mcdata");
+        let p = file.to_str().unwrap();
+        let r = s.run("file.newDataFile", &json!({"path": p, "password": "right-1"})).unwrap();
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        s.secrets.remove(&crate::datafile::secret_key(id)).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let r = s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true})).unwrap();
+        assert_eq!(r["dialog"], "dataFilePassword");
+        assert_eq!(r["params"]["verify"], true, "nothing to check the password against: it is typed twice");
+        for bad in [json!({}), json!({"verify": "right-2"})] {
+            let mut q = json!({"store": id.0, "confirm": true, "password": "right-1"});
+            if let (Some(o), Some(extra)) = (q.as_object_mut(), bad.as_object()) {
+                o.extend(extra.clone());
+            }
+            assert!(matches!(s.run("file.closeDataFile", &q), Err(CmdError::Params(_))), "{q}");
+            assert!(s.secrets.get(&crate::datafile::secret_key(id)).is_none());
+            assert!(s.mailbox.account(id).is_some());
+            assert!(!file.exists());
+        }
+        let ok = json!({"store": id.0, "confirm": true, "password": "right-1", "verify": "right-1"});
+        s.run("file.closeDataFile", &ok).unwrap();
+        assert!(s.mailbox.account(id).is_none());
+        assert!(crate::datafile::unseal(&std::fs::read(&file).unwrap(), "right-1").is_ok());
     }
 
     #[test]

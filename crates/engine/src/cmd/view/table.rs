@@ -1,11 +1,18 @@
-//! Module tables: the columns, sort field, filter and Conditional Formatting of the People Phone and List
-//! views and of the Tasks views (Add Columns / Show Columns, View Settings › Columns, Sort, Filter,
-//! Conditional Formatting).
+//! Module tables: the columns, sort keys, groups, filter, Conditional Formatting and Other Settings of the
+//! People views and of the Tasks views (Add Columns / Show Columns, View Settings › Columns, Group By, Sort,
+//! Filter, Other Settings, Conditional Formatting, Format Columns).
 //!
 //! **Per view.** Each built-in view of a contacts or tasks folder keeps its own [`ViewCustom`] inside the
 //! folder's [`ModuleView`] (`custom`, keyed by the view name), so switching from Phone to List and back keeps
 //! both column sets. Nothing is stored while a view keeps its defaults: [`default_columns`], the view's own
-//! order, no filter and [`default_rules`].
+//! order, no filter and [`default_rules`]. The tables (People › Phone and List, every Tasks view) take all of
+//! it; the People card views (People, Business Card, Card) take the sort keys, the filter and the
+//! Conditional Formatting, and the Card view shows its columns as the fields of each card.
+//!
+//! **Groups.** Without Group By fields a grouped view groups by its arrangement (Arrange By). Group By
+//! fields replace the arrangement: up to [`MAX_GROUP_LEVELS`] columns, each ascending or descending, nested
+//! outermost first; a row's headers read "Label: value" ([`order_rows`]). An item with several categories is
+//! listed under each of them.
 //!
 //! **Cells.** [`cell`] is the text of a column for a row (a contact in People; a task, a flagged message or
 //! a flagged contact in Tasks); [`sort_key`] orders rows by a column; [`matches`] applies a filter;
@@ -19,12 +26,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::mail::{self, ColumnFormat, CustomFilter, FormatRule, RuleFont};
-use super::modules::{self, ModuleKind, ModuleView, RowKind};
+use super::modules::{self, ModuleKind, ModuleView, RowKind, ViewRow};
 use crate::cmd::people::display_name;
 use crate::cmd::util::opt_bool;
 use crate::queries::RowStyle;
 use crate::{CmdError, CmdResult, Session};
 use mailcraft_model::dates::LocalTime;
+use mailcraft_model::task::TaskRequestState;
+use mailcraft_model::view::{ExpandDefault, MAX_GROUP_LEVELS, MAX_SORT_KEYS, TableOther};
 use mailcraft_model::{
     Contact, DateTime, FlagState, FolderId, Importance, ItemId, ListTime, MailItem, Task, TaskPriority,
     TaskStatus,
@@ -83,7 +92,7 @@ pub const CONTACT_COLUMNS: [TableColumn; 30] = [
 ];
 
 /// Columns a tasks table can show, in the dialog's order.
-pub const TASK_COLUMNS: [TableColumn; 16] = [
+pub const TASK_COLUMNS: [TableColumn; 23] = [
     col("icon", "Icon", 24, true),
     col("complete", "Complete", 22, true),
     col("priority", "Priority", 64, false),
@@ -100,7 +109,18 @@ pub const TASK_COLUMNS: [TableColumn; 16] = [
     col("modified", "Modified", 140, false),
     col("sensitivity", "Sensitivity", 80, false),
     col("flagStatus", "Flag Status", 26, true),
+    col("reminderOn", "Reminder", 70, false),
+    col("owner", "Owner", 140, false),
+    col("requestedBy", "Requested By", 140, false),
+    col("requestStatus", "Request Status", 130, false),
+    col("lastUpdate", "Last Update", 140, false),
+    col("recurring", "Recurring", 70, false),
+    col("notes", "Notes", 200, false),
 ];
+
+/// Fields a Card view shows on each card when nobody changed them.
+const CARD: [&str; 8] =
+    ["fullName", "company", "jobTitle", "email", "email2", "businessPhone", "mobilePhone", "homePhone"];
 
 const PHONE: [&str; 10] = [
     "icon",
@@ -166,11 +186,25 @@ pub fn has_table(kind: ModuleKind, view: &str) -> bool {
     }
 }
 
+/// Whether views of the module keep a [`ViewCustom`] (sort keys, groups, filter, Conditional Formatting):
+/// every People and Tasks view (the People card views use the sort keys, filter and rules).
+pub fn has_settings(kind: ModuleKind) -> bool {
+    matches!(kind, ModuleKind::People | ModuleKind::Tasks)
+}
+
+/// Whether `view` shows columns Show Columns picks: the tables, and the People Card view (the fields of
+/// each card).
+pub fn has_columns(kind: ModuleKind, view: &str) -> bool {
+    has_table(kind, view) || (kind == ModuleKind::People && view == "Card")
+}
+
 /// Columns of a view nobody changed.
 pub fn default_columns(kind: ModuleKind, view: &str) -> &'static [&'static str] {
     match (kind, view) {
         (ModuleKind::People, "Phone") => &PHONE,
-        (ModuleKind::People, _) => &LIST,
+        (ModuleKind::People, "Card") => &CARD,
+        (ModuleKind::People, "List") => &LIST,
+        (ModuleKind::People, _) => &[],
         (ModuleKind::Tasks, "Detailed") => &DETAILED,
         (ModuleKind::Tasks, "Prioritized") => &PRIORITIZED,
         (ModuleKind::Tasks, "Completed") => &COMPLETED,
@@ -196,6 +230,19 @@ pub struct ViewCustom {
     pub columns: Vec<String>,
     /// `None` = the view's own order (File As for contacts, due date then subject for tasks).
     pub sort: Option<SortField>,
+    /// Sort › Then by: the keys after `sort` (at most [`MAX_SORT_KEYS`] in all).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub then_by: Vec<SortField>,
+    /// Group By fields, outermost first (empty = group by the arrangement).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<SortField>,
+    /// Group By › Expand/collapse defaults.
+    #[serde(skip_serializing_if = "ExpandDefault::is_default")]
+    pub expand: ExpandDefault,
+    /// Other Settings: fonts, grid lines, AutoPreview (the Tasks views keep AutoPreview as their message
+    /// preview, [`ModuleView::preview_lines`]).
+    #[serde(skip_serializing_if = "TableOther::is_default")]
+    pub other: TableOther,
     pub filter: Option<CustomFilter>,
     /// `None` = [`default_rules`].
     pub rules: Option<Vec<FormatRule>>,
@@ -227,13 +274,45 @@ impl ViewCustom {
             .map(|c| c.id.to_owned())
             .collect();
         if let Some(view) = view
-            && self.columns.iter().map(String::as_str).eq(default_columns(kind, view).iter().copied())
+            && (!has_columns(kind, view)
+                || self.columns.iter().map(String::as_str).eq(default_columns(kind, view).iter().copied()))
         {
             self.columns.clear();
         }
-        self.sort = self.sort.and_then(|f| {
+        if view.is_some_and(|v| !has_table(kind, v)) {
+            self.formats.clear();
+        }
+        let clean = |f: SortField| {
             column(kind, &f.column).map(|c| SortField { column: c.id.to_owned(), descending: f.descending })
-        });
+        };
+        self.sort = self.sort.and_then(clean);
+        let mut used: Vec<String> = self.sort.iter().map(|f| f.column.clone()).collect();
+        self.then_by = std::mem::take(&mut self.then_by)
+            .into_iter()
+            .filter_map(clean)
+            .filter(|f| {
+                let fresh = !used.contains(&f.column);
+                used.push(f.column.clone());
+                fresh
+            })
+            .take(MAX_SORT_KEYS.saturating_sub(1))
+            .collect();
+        if self.sort.is_none() && !self.then_by.is_empty() {
+            // "Then by" keys need a first key: the first of them takes its place.
+            self.sort = Some(self.then_by.remove(0));
+        }
+        let mut grouped: Vec<String> = Vec::new();
+        self.group_by = std::mem::take(&mut self.group_by)
+            .into_iter()
+            .filter_map(clean)
+            .filter(|f| {
+                let fresh = !grouped.contains(&f.column);
+                grouped.push(f.column.clone());
+                fresh
+            })
+            .take(MAX_GROUP_LEVELS)
+            .collect();
+        self.other = std::mem::take(&mut self.other).sanitized();
         self.filter = self.filter.map(CustomFilter::sanitized).filter(|f| !f.is_empty());
         self.rules = self.rules.map(|r| {
             r.into_iter().filter_map(|r| sanitize_rule(kind, r)).take(mail::MAX_RULES).collect::<Vec<_>>()
@@ -280,7 +359,7 @@ pub(super) fn sanitize_custom(
                 return (ok && !c.is_empty()).then_some((key, c));
             }
             let v = modules::canonical_view(kind, &key)?;
-            if !has_table(kind, v) {
+            if !has_settings(kind) {
                 return None;
             }
             let c = c.sanitized(kind, Some(v));
@@ -319,9 +398,10 @@ pub fn active_key(st: &ModuleView) -> String {
     if st.name.is_empty() { st.view.clone() } else { format!("@{}", st.name) }
 }
 
-/// Columns of the current view of a module state (empty when the view is not a table).
+/// Columns of the current view of a module state (empty when the view shows no columns; the Card view's
+/// columns are the fields of each card).
 pub fn columns_of(kind: ModuleKind, st: &ModuleView) -> Vec<&'static TableColumn> {
-    if !has_table(kind, &st.view) {
+    if !has_columns(kind, &st.view) {
         return Vec::new();
     }
     let c = custom(st);
@@ -420,6 +500,16 @@ pub fn filter(s: &Session, folder: FolderId) -> Option<CustomFilter> {
 /// The sort field of the folder's current view.
 pub fn sort(s: &Session, folder: FolderId) -> Option<SortField> {
     modules::current(s, folder).and_then(|(_, st)| custom(&st).sort)
+}
+
+/// Every sort key of a view's customisation: Sort items by, then the Then by keys.
+pub fn sort_keys(c: &ViewCustom) -> Vec<SortField> {
+    c.sort.iter().chain(c.then_by.iter()).cloned().collect()
+}
+
+/// Other Settings of the folder's current view (fonts, grid lines, AutoPreview).
+pub fn other(s: &Session, folder: FolderId) -> TableOther {
+    modules::current(s, folder).map(|(_, st)| custom(&st).other).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -581,6 +671,20 @@ pub fn task_cell(s: &Session, it: Item<'_>, id: &str) -> String {
             "modified" => t.modified.map_or_else(String::new, |m| ListTime::short_date_time(m, tz)),
             "sensitivity" => if t.private { "Private" } else { "Normal" }.to_owned(),
             "flagStatus" => if t.is_complete() { "Completed" } else { "Flagged" }.to_owned(),
+            "reminderOn" => yes_no(t.reminder.is_some()),
+            "owner" if t.is_assigned_by_me() => t.assigned_to.join("; "),
+            "owner" => my_name(s),
+            "requestedBy" => t.requested_by.clone().unwrap_or_default(),
+            "requestStatus" => match t.request_state {
+                TaskRequestState::None => "",
+                TaskRequestState::Waiting => "Waiting for a response",
+                TaskRequestState::Accepted => "Accepted",
+                TaskRequestState::Declined => "Declined",
+            }
+            .to_owned(),
+            "lastUpdate" => t.last_report.map_or_else(String::new, |m| ListTime::short_date_time(m, tz)),
+            "recurring" => yes_no(t.recurrence.is_some()),
+            "notes" => first_line(&t.body),
             _ => String::new(),
         },
         Item::Mail(m) => {
@@ -608,6 +712,9 @@ pub fn task_cell(s: &Session, it: Item<'_>, id: &str) -> String {
                 }
                 .to_owned(),
                 "flagStatus" => flag_text(&m.flag).to_owned(),
+                "reminderOn" => yes_no(matches!(m.flag, FlagState::Flagged { reminder: Some(_), .. })),
+                "recurring" => yes_no(false),
+                "notes" => first_line(&m.preview),
                 _ => String::new(),
             }
         }
@@ -630,10 +737,36 @@ pub fn task_cell(s: &Session, it: Item<'_>, id: &str) -> String {
                 "categories" => c.categories.join(", "),
                 "sensitivity" => if c.private { "Private" } else { "Normal" }.to_owned(),
                 "flagStatus" => flag_text(&c.flag).to_owned(),
+                "reminderOn" => yes_no(matches!(c.flag, FlagState::Flagged { reminder: Some(_), .. })),
+                "recurring" => yes_no(false),
+                "notes" => first_line(&c.notes),
                 _ => String::new(),
             }
         }
     }
+}
+
+fn yes_no(b: bool) -> String {
+    if b { "Yes" } else { "No" }.to_owned()
+}
+
+/// The first line of a text with something on it (at most 255 characters).
+fn first_line(text: &str) -> String {
+    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default().chars().take(255).collect()
+}
+
+/// The profile owner's name for the Owner column: the default account's sender name, else its address or
+/// name.
+fn my_name(s: &Session) -> String {
+    let a = s.mailbox.accounts.iter().find(|a| a.is_default).or(s.mailbox.accounts.first());
+    a.map(|a| {
+        [a.sender_name.trim(), a.address.trim(), a.display_name.trim()]
+            .into_iter()
+            .find(|x| !x.is_empty())
+            .unwrap_or_default()
+            .to_owned()
+    })
+    .unwrap_or_default()
 }
 
 /// Text of column `id` for a row of a `kind` table.
@@ -684,6 +817,7 @@ pub fn sort_key(s: &Session, kind: ModuleKind, it: Item<'_>, id: &str) -> SortKe
         (Item::Task(t), "dateCompleted") => date_key(t.completed),
         (Item::Task(t), "reminder") => date_key(t.reminder),
         (Item::Task(t), "modified") => date_key(t.modified),
+        (Item::Task(t), "lastUpdate") => date_key(t.last_report),
         (Item::Task(t), "percentComplete") => SortKey::Num(i64::from(t.percent_complete)),
         (Item::Task(t), "priority") => SortKey::Num(priority_rank(t.priority)),
         (Item::Task(t), "complete" | "flagStatus") => SortKey::Num(i64::from(t.is_complete())),
@@ -695,7 +829,9 @@ pub fn sort_key(s: &Session, kind: ModuleKind, it: Item<'_>, id: &str) -> SortKe
         (Item::Contact(c), "startDate") if kind == ModuleKind::Tasks => date_key(flag_dates(&c.flag).0),
         (Item::Contact(c), "flagStatus" | "complete") => SortKey::Num(flag_rank(&c.flag)),
         (Item::Contact(_), "priority") if kind == ModuleKind::Tasks => SortKey::Num(1),
-        (_, "dueDate" | "startDate" | "dateCompleted" | "reminder" | "modified") => SortKey::Num(i64::MAX),
+        (_, "dueDate" | "startDate" | "dateCompleted" | "reminder" | "modified" | "lastUpdate") => {
+            SortKey::Num(i64::MAX)
+        }
         _ => SortKey::Text(cell(s, kind, it, id).to_lowercase()),
     }
 }
@@ -846,6 +982,143 @@ pub fn row_style(s: &Session, rules: &[FormatRule], it: Item<'_>) -> ModuleRowSt
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Groups and order
+
+/// Most groups one item is listed under (an item filed under many categories, at every Group By level).
+pub const MAX_ROW_GROUPS: usize = 16;
+
+/// A row of a module view before it is grouped and sorted: the row, its arrangement groups ((rank, label);
+/// several when it is listed under each of its categories; empty when the view is not grouped by its
+/// arrangement) and its place in the view's own order.
+pub(crate) struct RowIn<K> {
+    pub id: ItemId,
+    pub kind: RowKind,
+    pub auto: Vec<(u8, String)>,
+    pub natural: K,
+}
+
+/// Group headers of a Group By field for an item: "Label: value" with its sort key, "(none)" for an empty
+/// value. The Categories field gives one header per category.
+pub fn field_groups(
+    s: &Session,
+    kind: ModuleKind,
+    it: Item<'_>,
+    col: &TableColumn,
+) -> Vec<(SortKey, String)> {
+    if col.id == "categories" {
+        let mut seen: Vec<String> = Vec::new();
+        let mut out = Vec::new();
+        for c in categories_of(it).iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+            let key = c.to_lowercase();
+            if seen.contains(&key) || out.len() >= MAX_ROW_GROUPS {
+                continue;
+            }
+            seen.push(key.clone());
+            out.push((SortKey::Text(key), format!("{}: {c}", col.label)));
+        }
+        if out.is_empty() {
+            out.push((SortKey::Text(String::new()), format!("{}: (none)", col.label)));
+        }
+        return out;
+    }
+    let text = cell(s, kind, it, col.id);
+    let text = text.trim();
+    let text: String = if text.is_empty() { "(none)".to_owned() } else { text.chars().take(255).collect() };
+    vec![(sort_key(s, kind, it, col.id), format!("{}: {text}", col.label))]
+}
+
+/// Groups and sorts the rows of a module view. With `grouped` (Show in Groups on a view that groups), the
+/// Group By fields of the view nest the rows (an item under several categories gets a row in each group);
+/// without fields the rows group by their arrangement (`auto`). Inside the groups the rows follow the sort
+/// keys, then their natural order. Reverse Sort is left to the caller.
+pub(crate) fn order_rows<K: Ord + Clone>(
+    s: &Session,
+    kind: ModuleKind,
+    st: &ModuleView,
+    grouped: bool,
+    rows: Vec<RowIn<K>>,
+) -> Vec<ViewRow> {
+    struct Keyed<K> {
+        groups: Vec<(SortKey, String, bool)>,
+        sort: Vec<(SortKey, bool)>,
+        natural: K,
+        id: ItemId,
+        kind: RowKind,
+    }
+    let c = custom(st);
+    let fields: Vec<(&'static TableColumn, bool)> = if grouped {
+        c.group_by.iter().filter_map(|f| column(kind, &f.column).map(|col| (col, f.descending))).collect()
+    } else {
+        Vec::new()
+    };
+    let keys = sort_keys(&c);
+    let mut out: Vec<Keyed<K>> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let it = item(s, r.kind, r.id);
+        let sort: Vec<(SortKey, bool)> = match it {
+            Some(it) => keys.iter().map(|f| (sort_key(s, kind, it, &f.column), f.descending)).collect(),
+            None => Vec::new(),
+        };
+        let paths: Vec<Vec<(SortKey, String, bool)>> = match it {
+            Some(it) if !fields.is_empty() => {
+                let mut paths: Vec<Vec<(SortKey, String, bool)>> = vec![Vec::new()];
+                for (col, desc) in &fields {
+                    let options = field_groups(s, kind, it, col);
+                    let mut next = Vec::new();
+                    for p in &paths {
+                        for (k, l) in &options {
+                            if next.len() >= MAX_ROW_GROUPS {
+                                break;
+                            }
+                            let mut q = p.clone();
+                            q.push((k.clone(), l.clone(), *desc));
+                            next.push(q);
+                        }
+                    }
+                    paths = next;
+                }
+                paths
+            }
+            _ if grouped && fields.is_empty() && !r.auto.is_empty() => r
+                .auto
+                .iter()
+                .take(MAX_ROW_GROUPS)
+                .map(|(rank, l)| vec![(SortKey::Num(i64::from(*rank)), l.clone(), false)])
+                .collect(),
+            _ => vec![Vec::new()],
+        };
+        for groups in paths {
+            out.push(Keyed {
+                groups,
+                sort: sort.clone(),
+                natural: r.natural.clone(),
+                id: r.id,
+                kind: r.kind,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        for (x, y) in a.groups.iter().zip(b.groups.iter()) {
+            let o = x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1));
+            let o = if x.2 { o.reverse() } else { o };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        for (x, y) in a.sort.iter().zip(b.sort.iter()) {
+            let o = if x.1 { y.0.cmp(&x.0) } else { x.0.cmp(&y.0) };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        a.natural.cmp(&b.natural)
+    });
+    out.into_iter()
+        .map(|k| ViewRow::grouped(k.id, k.kind, k.groups.into_iter().map(|(_, l, _)| l).collect()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Commands (the `view.*` commands call these in contacts and tasks folders)
 
 /// Whether the selected folder shows a module table (People Phone / List, every Tasks view).
@@ -853,6 +1126,184 @@ pub fn table_here(s: &Session) -> Option<(FolderId, ModuleKind, ModuleView)> {
     let folder = s.selection.folder;
     let (kind, st) = modules::current(s, folder)?;
     has_table(kind, &st.view).then_some((folder, kind, st))
+}
+
+/// Whether the selected folder shows a view with sort keys, filter and Conditional Formatting (every People
+/// and Tasks view).
+pub fn settings_here(s: &Session) -> Option<(FolderId, ModuleKind, ModuleView)> {
+    let folder = s.selection.folder;
+    let (kind, st) = modules::current(s, folder)?;
+    has_settings(kind).then_some((folder, kind, st))
+}
+
+/// Whether the selected folder shows a view whose columns Show Columns picks (the tables, People › Card).
+pub fn columns_here(s: &Session) -> Option<(FolderId, ModuleKind, ModuleView)> {
+    let folder = s.selection.folder;
+    let (kind, st) = modules::current(s, folder)?;
+    has_columns(kind, &st.view).then_some((folder, kind, st))
+}
+
+/// One entry of a sort or group field list: a plain id, or `{"field": id, "dir"?: "asc" | "desc"}`
+/// (`column` and `key` are accepted for `field`). Returns the id and the direction text, if any.
+pub(crate) fn field_entry<'a>(f: &'a Value, what: &str) -> Result<(&'a str, Option<&'a str>), CmdError> {
+    let bad = || CmdError::Params(format!("`{what}` must be a list of fields"));
+    match f {
+        Value::String(id) => Ok((id.as_str(), None)),
+        Value::Object(o) => {
+            let id = ["field", "column", "key"]
+                .iter()
+                .find_map(|k| o.get(*k))
+                .and_then(Value::as_str)
+                .ok_or_else(bad)?;
+            let dir = match o.get("dir") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(d)) => Some(d.as_str()),
+                Some(_) => return Err(CmdError::Params("`dir` must be asc or desc".into())),
+            };
+            Ok((id, dir))
+        }
+        _ => Err(bad()),
+    }
+}
+
+/// A list of sort or group fields (`[{"field": id, "dir": "asc" | "desc"}]`, or plain ids): at most `max`,
+/// every id a column of the module, none twice. `null` is an empty list.
+pub(crate) fn parse_fields(
+    kind: ModuleKind,
+    v: &Value,
+    max: usize,
+    what: &str,
+) -> Result<Vec<SortField>, CmdError> {
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let list = v.as_array().ok_or_else(|| CmdError::Params(format!("`{what}` must be a list of fields")))?;
+    if list.len() > max {
+        return Err(CmdError::Params(format!("`{what}` takes at most {max} fields")));
+    }
+    let mut out: Vec<SortField> = Vec::new();
+    for f in list {
+        let (id, dir) = field_entry(f, what)?;
+        let def = column(kind, id).ok_or_else(|| unknown(id))?;
+        let descending = match dir {
+            None | Some("asc") => false,
+            Some("desc") => true,
+            Some(other) => {
+                return Err(CmdError::Params(format!(
+                    "`dir` must be asc or desc, not `{}`",
+                    clip(other, 20)
+                )));
+            }
+        };
+        if out.iter().any(|x| x.column == def.id) {
+            return Err(CmdError::Params(format!("`{what}` names {} twice", def.label)));
+        }
+        out.push(SortField { column: def.id.to_owned(), descending });
+    }
+    Ok(out)
+}
+
+/// Text of a sort or group field list for View Settings ("Due Date (ascending), Subject (descending)").
+pub fn describe_fields(kind: ModuleKind, list: &[SortField]) -> String {
+    list.iter()
+        .filter_map(|f| {
+            column(kind, &f.column)
+                .map(|d| format!("{} ({})", d.label, if f.descending { "descending" } else { "ascending" }))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Fields as JSON for the dialogs: `[{"field", "dir"}]`.
+pub fn fields_json(list: &[SortField]) -> Value {
+    Value::Array(
+        list.iter()
+            .map(|f| json!({"field": f.column, "dir": if f.descending { "desc" } else { "asc" }}))
+            .collect(),
+    )
+}
+
+/// Applies the advanced View Settings keys of a People or Tasks view (`sortBy`, `groupBy`, `expandGroups`,
+/// `rowFont`, `columnFont`, `gridLines`, `autoPreview`); see `view.viewSettings`.
+pub(crate) fn apply_settings(
+    s: &mut Session,
+    folder: FolderId,
+    kind: ModuleKind,
+    p: &Value,
+) -> Result<(), CmdError> {
+    let sort = p.get("sortBy").map(|v| parse_fields(kind, v, MAX_SORT_KEYS, "sortBy")).transpose()?;
+    let groups = p.get("groupBy").map(|v| parse_fields(kind, v, MAX_GROUP_LEVELS, "groupBy")).transpose()?;
+    let expand = match p.get("expandGroups") {
+        None => None,
+        Some(v) => Some(v.as_str().and_then(ExpandDefault::parse).ok_or_else(|| {
+            CmdError::Params("`expandGroups` must be expanded, collapsed or lastViewed".into())
+        })?),
+    };
+    let font = |key: &str| -> Result<Option<u8>, CmdError> {
+        match p.get(key) {
+            None => Ok(None),
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| CmdError::Params(format!("`{key}` must be a font size")))?;
+                Ok(Some(mailcraft_model::view::clamp_font(u8::try_from(n).unwrap_or(u8::MAX))))
+            }
+        }
+    };
+    let (row_font, column_font) = (font("rowFont")?, font("columnFont")?);
+    let flag = |key: &str| -> Result<Option<bool>, CmdError> {
+        match p.get(key) {
+            None => Ok(None),
+            Some(v) => v
+                .as_bool()
+                .map(Some)
+                .ok_or_else(|| CmdError::Params(format!("`{key}` must be true or false"))),
+        }
+    };
+    let (grid, preview) = (flag("gridLines")?, flag("autoPreview")?);
+    if kind == ModuleKind::Tasks
+        && let Some(on) = preview
+    {
+        // The Tasks views show AutoPreview as their message preview (the task notes under each row).
+        let mut st = modules::state(s, folder, kind);
+        st.preview_lines = match (on, st.preview_lines) {
+            (false, _) => 0,
+            (true, 0) => 3,
+            (true, n) => n,
+        };
+        modules::store(s, folder, kind, &st);
+    }
+    let expand_changed = expand.is_some_and(|e| custom(&modules::state(s, folder, kind)).expand != e);
+    let regroup = groups.is_some();
+    update(s, folder, kind, |c| {
+        if let Some(list) = sort {
+            let mut list = list.into_iter();
+            c.sort = list.next();
+            c.then_by = list.collect();
+        }
+        if let Some(g) = groups {
+            c.group_by = g;
+        }
+        if let Some(e) = expand {
+            c.expand = e;
+        }
+        if let Some(n) = row_font {
+            c.other.row_font = n;
+        }
+        if let Some(n) = column_font {
+            c.other.column_font = n;
+        }
+        if let Some(on) = grid {
+            c.other.no_grid = !on;
+        }
+        if kind != ModuleKind::Tasks
+            && let Some(on) = preview
+        {
+            c.other.auto_preview = on;
+        }
+    })?;
+    if regroup || expand_changed {
+        modules::open_groups(s, folder);
+    }
+    Ok(())
 }
 
 fn update(
@@ -942,8 +1393,24 @@ pub(crate) fn set_columns(s: &mut Session, folder: FolderId, kind: ModuleKind, p
     Ok(columns_json(s, folder, kind))
 }
 
-/// `view.sortBy` in a module table: `field` (a column id; null = the view's own order) and `dir`.
+/// `view.sortBy` in a People or Tasks view: `field` (a column id; null = the view's own order) and `dir`
+/// (a header click: one key), or `fields` (Sort items by, then by…: up to [`MAX_SORT_KEYS`]
+/// `{"field", "dir"}`).
 pub(crate) fn sort_by(s: &mut Session, folder: FolderId, kind: ModuleKind, p: &Value) -> CmdResult {
+    if let Some(v) = p.get("fields") {
+        let list = parse_fields(kind, v, MAX_SORT_KEYS, "fields")?;
+        let mut keys = list.clone().into_iter();
+        update(s, folder, kind, |c| {
+            c.sort = keys.next();
+            c.then_by = keys.collect();
+        })?;
+        return Ok(json!({
+            "fields": fields_json(&list),
+            "field": list.first().map(|f| f.column.clone()),
+            "dir": if list.first().is_some_and(|f| f.descending) { "desc" } else { "asc" },
+            "module": kind.name(),
+        }));
+    }
     let descending = match p.get("dir").and_then(Value::as_str) {
         None => false,
         Some("asc") => false,
@@ -960,7 +1427,11 @@ pub(crate) fn sort_by(s: &mut Session, folder: FolderId, kind: ModuleKind, p: &V
         }
         Some(_) => return Err(CmdError::Params("`field` must be a column id or null".into())),
     };
-    update(s, folder, kind, |c| c.sort = field.clone())?;
+    update(s, folder, kind, |c| {
+        // A header click sorts by that one column.
+        c.sort = field.clone();
+        c.then_by.clear();
+    })?;
     Ok(json!({
         "field": field.as_ref().map(|f| f.column.clone()),
         "dir": if field.as_ref().is_some_and(|f| f.descending) { "desc" } else { "asc" },
@@ -1113,17 +1584,40 @@ pub fn summary(folder: FolderId, kind: ModuleKind, st: &ModuleView) -> Value {
     let c = custom(st);
     let cols: Vec<&str> = columns_of(kind, st).iter().map(|c| c.label).collect();
     let rules = rules_of(kind, st);
-    let sort = c.sort.as_ref().and_then(|f| {
-        column(kind, &f.column)
-            .map(|d| format!("{} ({})", d.label, if f.descending { "descending" } else { "ascending" }))
-    });
+    let keys = sort_keys(&c);
+    let sort = if keys.is_empty() { "The view's own order".to_owned() } else { describe_fields(kind, &keys) };
+    let group = if c.group_by.is_empty() {
+        match st.arrangement(kind).map(|a| modules::arrange_label(kind, a)).filter(|l| !l.is_empty()) {
+            Some(l) if modules::grouped_view(kind, &st.view) => format!("{l} (automatic)"),
+            _ => "None".to_owned(),
+        }
+    } else {
+        describe_fields(kind, &c.group_by)
+    };
+    let mut other = c.other.clone();
+    if kind == ModuleKind::Tasks {
+        other.auto_preview = st.preview_lines > 0;
+    }
     json!({
         "folder": folder.0,
         "table": has_table(kind, &st.view),
+        "settings": has_settings(kind),
+        "hasColumns": has_columns(kind, &st.view),
+        "grouped": modules::grouped_view(kind, &st.view),
         "columns": cols.join(", "),
-        "sort": sort.unwrap_or_else(|| "The view's own order".to_owned()),
+        "sort": sort,
         "sortField": c.sort.as_ref().map(|f| f.column.clone()),
         "sortDescending": c.sort.as_ref().is_some_and(|f| f.descending),
+        "sortBy": fields_json(&keys),
+        "group": group,
+        "groupBy": fields_json(&c.group_by),
+        "expandGroups": c.expand.key(),
+        "other": other.describe(),
+        "rowFont": other.row_font,
+        "columnFont": other.column_font,
+        "gridLines": !other.no_grid,
+        "autoPreview": other.auto_preview,
+        "available": available(kind).iter().map(|c| json!({"id": c.id, "label": c.label})).collect::<Vec<_>>(),
         "filter": describe_filter(kind, &c.filter.unwrap_or_default()),
         "rules": format!("{} of {} rules on", rules.iter().filter(|r| r.on).count(), rules.len()),
         "formats": if c.formats.is_empty() { "Default formats".to_owned() } else { format!("{} columns formatted", c.formats.len()) },

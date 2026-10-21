@@ -255,9 +255,11 @@ fn show(s: &Session, limit: usize) -> String {
         }
         shown = shown.saturating_add(1);
         match row {
-            ListRow::Group { label, count, collapsed } => {
+            ListRow::Group { label, count, collapsed, depth } => {
                 let mark = if *collapsed { "+" } else { "-" };
-                text.push_str(&format!("{mark} {label} ({count})\n"));
+                let indent = "  ".repeat(usize::from(*depth).min(8));
+                let title = mailcraft_engine::queries::group_title(label);
+                text.push_str(&format!("{indent}{mark} {title} ({count})\n"));
             }
             ListRow::Item(m) => {
                 let marks = format!(

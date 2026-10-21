@@ -149,6 +149,13 @@ pub(crate) struct ViewForm {
     pub auto_preview: bool,
     pub grid_lines: bool,
     pub rules: Vec<ItemRule>,
+    /// Notes tables: Sort › Then by keys (column key, descending), Group By fields, Expand/collapse
+    /// defaults and fonts (0 = the view's own).
+    pub then_sort: Vec<(String, bool)>,
+    pub group_by: Vec<(String, bool)>,
+    pub expand: String,
+    pub row_font: u8,
+    pub column_font: u8,
     /// Values when the dialog opened (only changes are applied).
     pub initial: Box<Option<ViewForm>>,
 }
@@ -161,6 +168,36 @@ pub(crate) struct TableSummary {
     pub filter: String,
     pub rules: String,
     pub formats: String,
+    pub group: String,
+    pub other: String,
+    /// The view is a table (Columns, Other Settings and Format Columns apply).
+    pub table: bool,
+    /// The view shows columns Show Columns picks (a table, or the Card view's fields).
+    pub has_columns: bool,
+    /// The view groups (Group By applies).
+    pub grouped: bool,
+}
+
+impl TableSummary {
+    /// From the engine's table summary (`None` when the view keeps no table settings).
+    fn of(t: &Value) -> Option<TableSummary> {
+        if t.get("settings").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let flag = |k: &str| t.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Some(TableSummary {
+            columns: str_of(t, "columns"),
+            sort: str_of(t, "sort"),
+            filter: str_of(t, "filter"),
+            rules: str_of(t, "rules"),
+            formats: str_of(t, "formats"),
+            group: str_of(t, "group"),
+            other: str_of(t, "other"),
+            table: flag("table"),
+            has_columns: flag("hasColumns"),
+            grouped: flag("grouped"),
+        })
+    }
 }
 
 impl ViewForm {
@@ -172,7 +209,36 @@ impl ViewForm {
             || self.auto_preview != o.auto_preview
             || self.grid_lines != o.grid_lines
             || self.rules != o.rules
+            || self.group_by != o.group_by
+            || self.expand != o.expand
+            || self.row_font != o.row_font
+            || self.column_font != o.column_font
     }
+}
+
+/// `(field, descending)` pairs of an engine `[{"field", "dir"}]` list.
+fn fields_of(v: Option<&Value>) -> Vec<(String, bool)> {
+    v.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| {
+                    Some((
+                        f.get("field")?.as_str()?.to_owned(),
+                        f.get("dir").and_then(Value::as_str) == Some("desc"),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn fields_json(list: &[(String, bool)]) -> Value {
+    Value::Array(
+        list.iter()
+            .filter(|(k, _)| !k.is_empty())
+            .map(|(k, d)| json!({"field": k, "dir": if *d { "desc" } else { "asc" }}))
+            .collect(),
+    )
 }
 
 #[derive(Clone, Default)]
@@ -312,15 +378,7 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
                     .unwrap_or(0),
                 pane: str_of(p, "readingPane"),
                 spacing: p.get("tighterSpacing").and_then(Value::as_bool).unwrap_or(false),
-                table: p.get("table").filter(|t| t.get("table").and_then(Value::as_bool) == Some(true)).map(
-                    |t| TableSummary {
-                        columns: str_of(t, "columns"),
-                        sort: str_of(t, "sort"),
-                        filter: str_of(t, "filter"),
-                        rules: str_of(t, "rules"),
-                        formats: str_of(t, "formats"),
-                    },
-                ),
+                table: p.get("table").and_then(TableSummary::of),
                 saved_view: str_of(p, "savedView"),
                 current: str_of(p, "current"),
                 sort: str_of(p, "sort"),
@@ -349,6 +407,20 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
                     .get("rules")
                     .and_then(|v| serde_json::from_value::<Vec<ItemRule>>(v.clone()).ok())
                     .unwrap_or_default(),
+                // The first sort key is `sort` (and Reverse Sort); the rest are the Then by keys.
+                then_sort: fields_of(p.get("sortBy")).into_iter().skip(1).collect(),
+                group_by: fields_of(p.get("groupBy")),
+                expand: str_of(p, "expandGroups"),
+                row_font: p
+                    .get("rowFont")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u8::try_from(n).ok())
+                    .unwrap_or(0),
+                column_font: p
+                    .get("columnFont")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u8::try_from(n).ok())
+                    .unwrap_or(0),
                 initial: Box::new(None),
             };
             f.initial = Box::new(Some(f.clone()));
@@ -665,25 +737,37 @@ fn flag_ui(ui: &mut Ui, app: &App, f: &mut FlagForm, nonce: u64) -> Btn {
 
 const PANES: [(&str, &str); 3] = [("right", "Right"), ("bottom", "Bottom"), ("off", "Off")];
 
-/// The table parts of View Settings: a button per part (it opens that dialog) with what it is set to.
-fn table_parts(ui: &mut Ui, app: &mut App, t: &TableSummary, nonce: u64) {
-    let parts: [(&str, &str, Value, &str); 5] = [
-        ("Columns...", "view.addColumns", json!({}), &t.columns),
-        ("Sort...", "", json!({}), &t.sort),
-        ("Filter...", "view.customFilter", json!({}), &t.filter),
-        ("Conditional Formatting...", "view.conditionalFormatting", json!({}), &t.rules),
-        ("Format Columns...", "view.formatColumns", json!({}), &t.formats),
+/// The table parts of View Settings: a button per part (it opens that dialog) with what it is set to. Parts
+/// a view does not have are greyed out (a card view has no Format Columns; the Card view's columns are the
+/// fields of its cards).
+fn table_parts(ui: &mut Ui, app: &mut App, t: &TableSummary, nonce: u64, card: bool) {
+    let not_here = "Not available in this view".to_owned();
+    let or_not = |on: bool, s: &str| if on { s.to_owned() } else { not_here.clone() };
+    // (button, command or UI dialog ("@name"), description, enabled)
+    let parts: [(&str, &str, String, bool); 7] = [
+        (
+            if card { "Fields..." } else { "Columns..." },
+            "view.addColumns",
+            or_not(t.has_columns, &t.columns),
+            t.has_columns,
+        ),
+        ("Group By...", "@viewGroupBy", or_not(t.grouped, &t.group), t.grouped),
+        ("Sort...", "@viewSort", t.sort.clone(), true),
+        ("Filter...", "view.customFilter", t.filter.clone(), true),
+        ("Other Settings...", "@viewOtherSettings", or_not(t.table, &t.other), t.table),
+        ("Conditional Formatting...", "view.conditionalFormatting", t.rules.clone(), true),
+        ("Format Columns...", "view.formatColumns", or_not(t.table, &t.formats), t.table),
     ];
     egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).inner_margin(6.0).show(ui, |ui| {
         ui.label(RichText::new("Description").strong());
         egui::Grid::new(("mc-viewset-parts", nonce)).num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-            for (label, cmd, params, desc) in parts {
-                if ui.add(egui::Button::new(label).min_size(vec2(180.0, 22.0))).clicked() {
-                    if cmd.is_empty() {
+            for (label, cmd, desc, enabled) in parts {
+                if ui.add_enabled(enabled, egui::Button::new(label).min_size(vec2(180.0, 22.0))).clicked() {
+                    if let Some(name) = cmd.strip_prefix('@') {
                         let folder = app.s.selection.folder.0;
-                        crate::dialogs::open(app, "viewSort", json!({ "folder": folder }));
+                        crate::dialogs::open(app, name, json!({ "folder": folder }));
                     } else {
-                        app.run(cmd, params);
+                        app.run(cmd, json!({}));
                     }
                 }
                 ui.add(egui::Label::new(RichText::new(desc).color(app.theme.text_muted)).truncate());
@@ -701,17 +785,10 @@ fn view_ui(ui: &mut Ui, app: &mut App, f: &mut ViewForm, nonce: u64) -> Btn {
         let folder = app.s.selection.folder;
         let live = mailcraft_engine::cmd::view::modules::current(&app.s, folder)
             .map(|(kind, st)| mailcraft_engine::cmd::view::table::summary(folder, kind, &st));
-        let t = match live {
-            Some(v) if v.get("table").and_then(Value::as_bool) == Some(true) => TableSummary {
-                columns: str_of(&v, "columns"),
-                sort: str_of(&v, "sort"),
-                filter: str_of(&v, "filter"),
-                rules: str_of(&v, "rules"),
-                formats: str_of(&v, "formats"),
-            },
-            _ => t.clone(),
-        };
-        table_parts(ui, app, &t, nonce);
+        let t = live.as_ref().and_then(TableSummary::of).unwrap_or_else(|| t.clone());
+        let card = mailcraft_engine::cmd::view::modules::current(&app.s, folder)
+            .is_some_and(|(_, st)| st.view == "Card");
+        table_parts(ui, app, &t, nonce, card);
     }
     egui::Grid::new(("mc-viewset-grid", nonce)).num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
         ui.label("Current view");
@@ -791,7 +868,7 @@ fn view_ui(ui: &mut Ui, app: &mut App, f: &mut ViewForm, nonce: u64) -> Btn {
         ui.end_row();
     });
     if f.module == "notes" {
-        advanced_ui(ui, f, nonce);
+        advanced_ui(ui, app, f, nonce);
     }
     ui.separator();
     ui.horizontal(|ui| {
@@ -818,7 +895,49 @@ const RULE_COLORS: [(&str, &str); 7] = [
 ];
 
 /// Columns, Sort, Filter, Other Settings and Conditional Formatting of a Notes table view.
-fn advanced_ui(ui: &mut Ui, f: &mut ViewForm, nonce: u64) {
+/// Expand/collapse defaults (engine key, label).
+const EXPAND: [(&str, &str); 3] =
+    [("expanded", "All expanded"), ("collapsed", "All collapsed"), ("lastViewed", "As last viewed")];
+
+/// Up to `max` rows of (field, direction) for Notes Sort › Then by or Group By; an empty row ends the list
+/// (the rows after it are greyed out). `cols` are (key, label).
+fn note_levels(
+    ui: &mut Ui,
+    list: &mut Vec<(String, bool)>,
+    cols: &[(String, String)],
+    id: (&str, u64),
+    first: &str,
+    max: usize,
+) {
+    let mut rows: Vec<(String, bool)> = list.clone();
+    rows.resize(max, (String::new(), false));
+    let mut open = true;
+    egui::Grid::new(id).num_columns(3).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+        for (i, (key, desc)) in rows.iter_mut().enumerate() {
+            ui.label(if i == 0 { first } else { "Then by" });
+            let cur = cols.iter().find(|(k, _)| k == key).map_or("(none)".to_owned(), |(_, l)| l.clone());
+            ui.add_enabled_ui(open, |ui| {
+                ComboBox::from_id_salt((id.0, id.1, i)).selected_text(cur).width(170.0).show_ui(ui, |ui| {
+                    ui.selectable_value(key, String::new(), "(none)");
+                    for (k, l) in cols {
+                        ui.selectable_value(key, k.clone(), l);
+                    }
+                });
+            });
+            ui.add_enabled_ui(open && !key.is_empty(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.radio_value(desc, false, "Ascending");
+                    ui.radio_value(desc, true, "Descending");
+                });
+            });
+            ui.end_row();
+            open &= !key.is_empty();
+        }
+    });
+    *list = rows.into_iter().take_while(|(k, _)| !k.is_empty()).collect();
+}
+
+fn advanced_ui(ui: &mut Ui, app: &mut App, f: &mut ViewForm, nonce: u64) {
     let table = f.view != "Icon";
     egui::CollapsingHeader::new("Columns").id_salt(("mc-viewset-cols", nonce)).show(ui, |ui| {
         if !table {
@@ -860,6 +979,28 @@ fn advanced_ui(ui: &mut Ui, f: &mut ViewForm, nonce: u64) {
                     },
                 );
             });
+            let cols = f.all_columns.clone();
+            note_levels(ui, &mut f.then_sort, &cols, ("mc-viewset-then", nonce), "Then by", 3);
+        });
+    });
+    egui::CollapsingHeader::new("Group By").id_salt(("mc-viewset-group", nonce)).show(ui, |ui| {
+        ui.add_enabled_ui(table, |ui| {
+            // The icon column groups by the note colour.
+            let cols: Vec<(String, String)> = f
+                .all_columns
+                .iter()
+                .map(|(k, l)| (k.clone(), if k == "icon" { "Color".to_owned() } else { l.clone() }))
+                .collect();
+            note_levels(ui, &mut f.group_by, &cols, ("mc-viewset-groupby", nonce), "Group items by", 4);
+            ui.horizontal(|ui| {
+                ui.label("Expand/collapse defaults");
+                let cur = EXPAND.iter().find(|(k, _)| *k == f.expand).map_or("All expanded", |(_, l)| *l);
+                ComboBox::from_id_salt(("mc-viewset-expand", nonce)).selected_text(cur).show_ui(ui, |ui| {
+                    for (k, l) in EXPAND {
+                        ui.selectable_value(&mut f.expand, k.to_owned(), l);
+                    }
+                });
+            });
         });
     });
     let filter_title = format!("Filter: {}", f.filter.describe());
@@ -873,7 +1014,26 @@ fn advanced_ui(ui: &mut Ui, f: &mut ViewForm, nonce: u64) {
         ui.add_enabled_ui(table, |ui| {
             ui.checkbox(&mut f.auto_preview, "AutoPreview (the note text under each row)");
             ui.checkbox(&mut f.grid_lines, "Grid lines between rows");
+            for (label, slot, salt) in [
+                ("Column font", &mut f.column_font, "mc-viewset-colfont"),
+                ("Row font", &mut f.row_font, "mc-viewset-rowfont"),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let text = |pt: u8| if pt == 0 { "Default".to_owned() } else { format!("{pt} pt") };
+                    ComboBox::from_id_salt((salt, nonce)).selected_text(text(*slot)).show_ui(ui, |ui| {
+                        for pt in [0u8, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24] {
+                            ui.selectable_value(slot, pt, text(pt));
+                        }
+                    });
+                });
+            }
         });
+    });
+    ui.add_enabled_ui(table, |ui| {
+        if ui.button("Format Columns...").clicked() {
+            app.run("view.formatColumns", json!({}));
+        }
     });
     egui::CollapsingHeader::new("Conditional Formatting").id_salt(("mc-viewset-rules", nonce)).show(
         ui,
@@ -1443,21 +1603,34 @@ fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
             if f.spacing != init.spacing {
                 run_checked(app, "view.tighterSpacing", json!({}))?;
             }
-            if f.module == "notes" && f.advanced_changed(&init) {
+            if f.module == "notes" && (f.advanced_changed(&init) || f.then_sort != init.then_sort) {
                 let rules: Vec<ItemRule> =
                     f.rules.iter().filter(|r| !r.name.trim().is_empty()).cloned().collect();
-                run_checked(
-                    app,
-                    "view.viewSettings",
-                    json!({
-                        "sort": f.sort,
-                        "columns": f.columns,
-                        "filter": f.filter,
-                        "rules": rules,
-                        "autoPreview": f.auto_preview,
-                        "gridLines": f.grid_lines,
-                    }),
-                )?;
+                let mut p = json!({
+                    "sort": f.sort,
+                    "columns": f.columns,
+                    "filter": f.filter,
+                    "rules": rules,
+                    "autoPreview": f.auto_preview,
+                    "gridLines": f.grid_lines,
+                    "groupBy": fields_json(&f.group_by),
+                    "expandGroups": if f.expand.is_empty() { "expanded" } else { f.expand.as_str() },
+                    "rowFont": f.row_font,
+                    "columnFont": f.column_font,
+                });
+                if f.then_sort != init.then_sort
+                    && let Some(o) = p.as_object_mut()
+                {
+                    // Several keys: the sort column first (in the direction Reverse Sort now gives it).
+                    let first = if f.sort.is_empty() { "created" } else { f.sort.as_str() };
+                    let desc =
+                        mailcraft_engine::cmd::view::modules::note_sort_descending(&f.sort) != f.reverse;
+                    let mut keys = vec![(first.to_owned(), desc)];
+                    keys.extend(f.then_sort.iter().cloned());
+                    o.remove("sort");
+                    o.insert("sortBy".into(), fields_json(&keys));
+                }
+                run_checked(app, "view.viewSettings", p)?;
             }
             // Opened from Manage All Views › Modify: OK stores the view into that saved view. Otherwise a saved
             // view that shows keeps what was changed while it shows.

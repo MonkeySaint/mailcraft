@@ -20,9 +20,9 @@ use mailcraft_model::{FlagState, FolderId, FolderKind, ItemId, TaskPriority, Tas
 
 use super::common::{
     DAY, ModState, a11y, change_view, child, collapsed_labels, current_folder, day_string, draw_check,
-    empty_message, folder_rows, group_header, group_row, load, local_secs, long_date, module_folder_pane,
-    module_view, pane_bg, pane_separator, reading_split, row_height, select_folder, select_item, store,
-    sync_selection, today, todo_bar_strip, toggle_group, tz,
+    empty_message, folder_rows, group_header, load, local_secs, long_date, module_folder_pane, module_view,
+    nested_headers, pane_bg, pane_separator, reading_split, row_font, row_height, select_folder, select_item,
+    store, sync_selection, today, todo_bar_strip, tz,
 };
 use super::editors;
 use super::table as mt;
@@ -41,6 +41,8 @@ pub(super) struct Row {
     pub done: bool,
     pub priority: TaskPriority,
     pub group: Option<String>,
+    /// Group headers, outermost first (Group By may nest several).
+    pub levels: Vec<String>,
 }
 
 impl Row {
@@ -81,7 +83,16 @@ fn row_of(app: &App, r: &ViewRow) -> Option<Row> {
         }
         RowKind::Note => return None,
     };
-    Some(Row { id: r.id, kind: r.kind, subject, due, done, priority, group: r.group.clone() })
+    Some(Row {
+        id: r.id,
+        kind: r.kind,
+        subject,
+        due,
+        done,
+        priority,
+        group: r.group.clone(),
+        levels: r.levels.clone(),
+    })
 }
 
 /// Rows of the current tasks folder's view.
@@ -307,10 +318,12 @@ fn task_list(
     let cols = folder.map(|f| table::shown(&app.s, f)).unwrap_or_default();
     let sort = folder.and_then(|f| table::sort(&app.s, f));
     let rules = folder.map(|f| table::rules(&app.s, f)).unwrap_or_default();
+    let other = folder.map(|f| table::other(&app.s, f)).unwrap_or_default();
     let laid = mt::layout(ui.available_width(), &cols);
     if !laid.is_empty() {
-        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), mt::HEAD_H), Sense::hover());
-        if let Some(c) = mt::header(ui, app, head, &laid, sort.as_ref(), "mc-tasks") {
+        let head_h = mt::head_height(&other);
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), head_h), Sense::hover());
+        if let Some(c) = mt::header(ui, app, head, &laid, sort.as_ref(), "mc-tasks", &other) {
             mt::sort_by_column(app, sort.as_ref(), c);
         }
     }
@@ -322,35 +335,44 @@ fn task_list(
     }
     let collapsed = folder.map(|f| collapsed_labels(app, f)).unwrap_or_default();
     ScrollArea::vertical().id_salt("mc-tasks-scroll").auto_shrink([false, false]).show(ui, |ui| {
-        let mut last_group: Option<&str> = None;
         for (i, row) in list.iter().enumerate() {
-            if let Some(g) = row.group.as_deref()
-                && last_group != Some(g)
-            {
-                last_group = Some(g);
-                let count = list.iter().skip(i).take_while(|r| r.group.as_deref() == Some(g)).count();
-                let shut = collapsed.contains(g);
-                if group_row(ui, app, g, count, shut) {
-                    toggle_group(app, row.id, g, shut);
-                }
-            }
-            if row.group.as_ref().is_some_and(|g| collapsed.contains(g)) {
+            let hidden =
+                nested_headers(ui, app, list, i, |r: &Row| r.levels.as_slice(), |r: &Row| r.id, &collapsed);
+            if hidden {
                 continue;
             }
-            row_ui(ui, app, st, row, &laid, &rules, view.preview_lines);
+            row_ui(ui, app, st, row, &laid, &rules, view.preview_lines, &other);
         }
     });
 }
 
-fn preview_text(app: &App, row: &Row, lines: u8) -> String {
-    if lines == 0 || row.kind != RowKind::Task {
+/// Most bytes of a flagged message's body read for its preview lines under a row.
+const PREVIEW_BODY_BYTES: usize = 16 * 1024;
+/// Most bytes of a flagged message's body read for the reading pane (Open Message shows it all).
+const PANE_BODY_BYTES: usize = 256 * 1024;
+
+/// The message preview lines under a row: the task's notes, a flagged message's text (its preview when
+/// only the headers were downloaded) or a flagged contact's notes.
+pub(super) fn preview_text(app: &App, row: &Row, lines: u8) -> String {
+    if lines == 0 {
         return String::new();
     }
-    let body = app.s.mailbox.tasks.get(&row.id).map(|t| t.body.clone()).unwrap_or_default();
-    body.lines()
+    let text = match row.kind {
+        RowKind::Task => app.s.mailbox.tasks.get(&row.id).map(|t| t.body.clone()),
+        RowKind::Mail => app.s.mailbox.mail.get(&row.id).map(|m| {
+            // Only the start of the body is read: this runs for every row on every frame.
+            let body = m.body_text_prefix(PREVIEW_BODY_BYTES);
+            if body.trim().is_empty() { m.preview.clone() } else { body }
+        }),
+        RowKind::Contact => app.s.mailbox.contacts.get(&row.id).map(|c| c.notes.clone()),
+        RowKind::Note => None,
+    }
+    .unwrap_or_default();
+    text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .take(usize::from(lines))
+        .map(|l| l.chars().take(300).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -381,6 +403,7 @@ fn flag_look(app: &App, row: &Row) -> mt::FlagLook {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_ui(
     ui: &mut Ui,
     app: &mut App,
@@ -389,10 +412,13 @@ fn row_ui(
     laid: &[mt::Laid],
     rules: &[mailcraft_engine::cmd::view::mail::FormatRule],
     preview: u8,
+    other: &mailcraft_model::view::TableOther,
 ) {
     let body = preview_text(app, row, preview);
     let extra = if body.is_empty() { 0.0 } else { 15.0 * body.lines().count() as f32 + 2.0 };
-    let base = row_height(app, ROW_H);
+    let subject_size = row_font(other, 13.5);
+    let cell_size = row_font(other, 12.0);
+    let base = row_height(app, ROW_H).max((subject_size * 2.0).round());
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), base + extra), Sense::click());
     a11y(&resp, WidgetType::Button, &row.subject);
     let line = Rect::from_min_size(rect.min, vec2(rect.width(), base));
@@ -469,7 +495,7 @@ fn row_ui(
                 }
                 let text = if row.subject.trim().is_empty() { "(No subject)" } else { row.subject.as_str() };
                 let text_cell = Rect::from_min_max(pos2(x - 4.0, cell.min.y), cell.max);
-                mt::styled_cell(ui, text_cell, text, 13.5, look, color, l.align);
+                mt::styled_cell(ui, text_cell, text, subject_size, look, color, l.align);
             }
             "priority" => {
                 if row.priority != TaskPriority::Normal {
@@ -486,13 +512,13 @@ fn row_ui(
                     .map(|it| table::task_cell(&app.s, it, "priority"))
                     .unwrap_or_default();
                 let text_cell = Rect::from_min_max(pos2(cell.min.x + 18.0, cell.min.y), cell.max);
-                mt::styled_cell(ui, text_cell, &text, 12.0, look, muted, l.align);
+                mt::styled_cell(ui, text_cell, &text, cell_size, look, muted, l.align);
             }
             id => {
                 let text = table::item(&app.s, row.kind, row.id)
                     .map(|it| table::task_cell(&app.s, it, id))
                     .unwrap_or_default();
-                mt::styled_cell(ui, cell, &text, 12.0, look, muted, l.align);
+                mt::styled_cell(ui, cell, &text, cell_size, look, muted, l.align);
             }
         }
     }
@@ -510,7 +536,9 @@ fn row_ui(
         );
         ui.painter().with_clip_rect(area).galley(pos2(x, line.max.y - 2.0), galley, app.theme.text_muted);
     }
-    ui.painter().hline(rect.x_range(), rect.max.y, Stroke::new(0.5, app.theme.separator));
+    if !other.no_grid {
+        ui.painter().hline(rect.x_range(), rect.max.y, Stroke::new(0.5, app.theme.separator));
+    }
     if toggle {
         toggle_complete(app, row);
         return;
@@ -635,6 +663,7 @@ fn details(ui: &mut Ui, app: &mut App, st: &mut ModState, row: &Row) {
                 if row.kind == RowKind::Mail { "Flagged message" } else { "Flagged contact" },
             );
             info(ui, app, "Due", &row.due.map(long_date).unwrap_or_else(|| "None".into()));
+            flagged_body(ui, app, row);
             return;
         }
         let Some(t) = app.s.mailbox.tasks.get(&row.id).cloned() else { return };
@@ -719,6 +748,54 @@ fn details(ui: &mut Ui, app: &mut App, st: &mut ModState, row: &Row) {
             ui.label(RichText::new(&t.body).color(app.theme.text));
         }
     });
+}
+
+/// The reading pane of a flagged message (who sent it, when, and its text) or a flagged contact (its
+/// details and notes) in the To-Do List.
+fn flagged_body(ui: &mut Ui, app: &App, row: &Row) {
+    let tz = tz(app);
+    match row.kind {
+        RowKind::Mail => {
+            let Some(m) = app.s.mailbox.mail.get(&row.id) else { return };
+            let from =
+                m.from.as_ref().or(m.sender.as_ref()).map(|a| a.to_display_string()).unwrap_or_default();
+            info(ui, app, "From", &from);
+            let to = m.to.iter().map(|a| a.display().to_owned()).collect::<Vec<_>>().join("; ");
+            info(ui, app, "To", &to);
+            let s = local_secs(m.received, tz);
+            let when =
+                format!("{} {}", long_date(s.div_euclid(DAY)), super::common::clock(s.rem_euclid(DAY) / 60));
+            info(ui, app, "Received", &when);
+            if !m.categories.is_empty() {
+                info(ui, app, "Categories", &m.categories.join(", "));
+            }
+            ui.add_space(12.0);
+            // Drawn every frame: only the start of the body is read, however large the message is.
+            let body = m.body_text_prefix(PANE_BODY_BYTES);
+            let body = if body.trim().is_empty() { m.preview.clone() } else { body };
+            if body.trim().is_empty() {
+                ui.label(RichText::new("This message has no text.").color(app.theme.text_muted));
+            } else {
+                // Cap what is laid out at once (a very long message stays responsive); Open Message shows
+                // it all.
+                let shown: String = body.chars().take(20_000).collect();
+                ui.add(egui::Label::new(RichText::new(shown).color(app.theme.text)).wrap().selectable(true));
+            }
+        }
+        RowKind::Contact => {
+            let Some(c) = app.s.mailbox.contacts.get(&row.id) else { return };
+            info(ui, app, "Company", &c.company);
+            info(ui, app, "E-mail", c.emails.first().map_or("", String::as_str));
+            for (kind, n) in c.phones.iter().take(3) {
+                info(ui, app, kind, n);
+            }
+            if !c.notes.trim().is_empty() {
+                ui.add_space(12.0);
+                ui.label(RichText::new(&c.notes).color(app.theme.text));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Due-date group of the To-Do List (kept for the To-Do Bar and tests; the engine groups the views).

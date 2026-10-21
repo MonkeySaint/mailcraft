@@ -20,9 +20,9 @@ use mailcraft_model::{Contact, FlagState, FolderId, FolderKind, ItemId};
 
 use super::common::{
     ModState, a11y, change_view, child, collapsed_labels, current_folder, empty_message, folder_rows,
-    group_header, group_row, load, module_folder_pane, module_view, paint_text_clipped, pane_bg,
-    pane_separator, persona_fill, reading_split, row_height, select_folder, select_item, store,
-    sync_selection, todo_bar_strip, toggle_group, view_switch,
+    group_header, load, module_folder_pane, module_view, nested_headers, paint_text_clipped, pane_bg,
+    pane_separator, persona_fill, reading_split, row_font, row_height, select_folder, select_item, store,
+    sync_selection, todo_bar_strip, view_switch,
 };
 use super::editors;
 use super::table as mt;
@@ -212,18 +212,16 @@ fn content(
     let index = Rect::from_min_size(body.min, vec2(INDEX_W, body.height()));
     letter_index(ui, app, st, index, &ids);
     let rest = Rect::from_min_max(pos2(index.max.x, body.min.y), body.max);
-    match view.view.as_str() {
-        "Business Card" => return business_cards(ui, app, st, rest, &ids),
-        "Card" => return cards(ui, app, st, rest, &ids),
-        _ => {}
-    }
     let table = matches!(view.view.as_str(), "Phone" | "List");
-    let list_w = if table { (rest.width() * 0.62).max(420.0) } else { 300.0 };
+    let cards_view = matches!(view.view.as_str(), "Business Card" | "Card");
+    let list_w = if table || cards_view { (rest.width() * 0.62).max(420.0) } else { 300.0 };
+    // Every view takes the reading pane where the folder put it (the card views too).
     let (list, pane) = reading_split(rest, view.reading_pane, list_w, 0.55);
-    if table {
-        child(ui, list, "mc-people-table", |ui| table_view(ui, app, st, folder, rows));
-    } else {
-        child(ui, list, "mc-people-list", |ui| contact_list(ui, app, st, &ids));
+    match view.view.as_str() {
+        "Business Card" => business_cards(ui, app, st, list, &ids, folder),
+        "Card" => cards(ui, app, st, list, &ids, folder),
+        _ if table => child(ui, list, "mc-people-table", |ui| table_view(ui, app, st, folder, rows)),
+        _ => child(ui, list, "mc-people-list", |ui| contact_list(ui, app, st, &ids)),
     }
     if let Some(details) = pane {
         pane_separator(ui, app, list, details);
@@ -249,10 +247,11 @@ fn table_view(ui: &mut Ui, app: &mut App, st: &mut ModState, folder: Option<Fold
     let cols = folder.map(|f| table::shown(&app.s, f)).unwrap_or_default();
     let sort = folder.and_then(|f| table::sort(&app.s, f));
     let rules = folder.map(|f| table::rules(&app.s, f)).unwrap_or_default();
+    let other = folder.map(|f| table::other(&app.s, f)).unwrap_or_default();
     let width = ui.available_width();
     let laid = mt::layout(width, &cols);
-    let (head, _) = ui.allocate_exact_size(vec2(width, mt::HEAD_H), Sense::hover());
-    if let Some(c) = mt::header(ui, app, head, &laid, sort.as_ref(), "mc-people") {
+    let (head, _) = ui.allocate_exact_size(vec2(width, mt::head_height(&other)), Sense::hover());
+    if let Some(c) = mt::header(ui, app, head, &laid, sort.as_ref(), "mc-people", &other) {
         mt::sort_by_column(app, sort.as_ref(), c);
     }
     if rows.is_empty() {
@@ -265,31 +264,47 @@ fn table_view(ui: &mut Ui, app: &mut App, st: &mut ModState, folder: Option<Fold
         return;
     }
     let collapsed = folder.map(|f| collapsed_labels(app, f)).unwrap_or_default();
-    let row_h = row_height(app, 26.0);
+    let name_size = row_font(&other, 12.5);
+    let cell_size = row_font(&other, 12.0);
+    let row_h = row_height(app, 26.0).max((name_size * 2.0).round());
     ScrollArea::vertical().id_salt("mc-people-table-scroll").auto_shrink([false, false]).show(ui, |ui| {
-        let mut last: Option<&str> = None;
         for (k, r) in rows.iter().enumerate() {
-            if let Some(g) = r.group.as_deref()
-                && last != Some(g)
-            {
-                last = Some(g);
-                let count = rows.iter().skip(k).take_while(|x| x.group.as_deref() == Some(g)).count();
-                let shut = collapsed.contains(g);
-                if group_row(ui, app, g, count, shut) {
-                    toggle_group(app, r.id, g, shut);
-                }
-            }
-            if r.group.as_ref().is_some_and(|g| collapsed.contains(g)) {
+            let hidden = nested_headers(
+                ui,
+                app,
+                rows,
+                k,
+                |x: &ViewRow| x.levels.as_slice(),
+                |x: &ViewRow| x.id,
+                &collapsed,
+            );
+            if hidden {
                 continue;
             }
             let Some(c) = app.s.mailbox.contacts.get(&r.id).cloned() else { continue };
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+            // Other Settings › AutoPreview: the first lines of the contact's notes under the row.
+            let notes: String = if other.auto_preview {
+                c.notes
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(3)
+                    .map(|l| l.chars().take(300).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            let extra = if notes.is_empty() { 0.0 } else { 15.0 * notes.lines().count() as f32 + 2.0 };
+            let (full, resp) =
+                ui.allocate_exact_size(vec2(ui.available_width(), row_h + extra), Sense::click());
+            let rect = Rect::from_min_size(full.min, vec2(full.width(), row_h));
             let name = display_name(&c);
             a11y(&resp, WidgetType::Button, &name);
             if app.ui.module_selection == Some(r.id.0) {
-                ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.selected);
+                ui.painter().rect_filled(full, CornerRadius::same(3), app.theme.selected);
             } else if resp.hovered() {
-                ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.hover);
+                ui.painter().rect_filled(full, CornerRadius::same(3), app.theme.hover);
             }
             let style = table::row_style(&app.s, &rules, table::Item::Contact(&c));
             let (color, look) = mt::row_look(&style, app.theme.text, app.theme.danger, app.theme.text_muted);
@@ -324,14 +339,34 @@ fn table_view(ui: &mut Ui, app: &mut App, st: &mut ModState, folder: Option<Fold
                     }
                     id => {
                         let text = table::contact_cell(&c, id);
-                        let size = if id == "fullName" { 12.5 } else { 12.0 };
+                        let size = if id == "fullName" { name_size } else { cell_size };
                         let tint =
                             if id == "fullName" || color != app.theme.text { color } else { app.theme.text };
                         mt::styled_cell(ui, cell, &text, size, look, tint, l.align);
                     }
                 }
             }
-            ui.painter().hline(rect.x_range(), rect.max.y, Stroke::new(0.5, app.theme.separator));
+            if !notes.is_empty() {
+                let x = laid
+                    .iter()
+                    .find(|l| l.col.id == "fullName")
+                    .map_or(rect.min.x + 30.0, |l| rect.min.x + l.x + 4.0);
+                let area = Rect::from_min_max(pos2(x, rect.max.y - 2.0), full.max);
+                let galley = ui.painter().layout(
+                    notes,
+                    FontId::proportional(11.5),
+                    app.theme.text_muted,
+                    (full.max.x - x - 8.0).max(10.0),
+                );
+                ui.painter().with_clip_rect(area).galley(
+                    pos2(x, rect.max.y - 2.0),
+                    galley,
+                    app.theme.text_muted,
+                );
+            }
+            if !other.no_grid {
+                ui.painter().hline(full.x_range(), full.max.y, Stroke::new(0.5, app.theme.separator));
+            }
             if flag_click {
                 // Unflagged: the Quick Click flag; flagged: complete; complete: clear (like the mail list).
                 let kind = match c.flag {
@@ -790,12 +825,23 @@ fn contact_card(ui: &mut Ui, app: &mut App, st: &mut ModState, id: ItemId) {
     });
 }
 
-fn cards(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: &[ItemId]) {
+fn cards(
+    ui: &mut Ui,
+    app: &mut App,
+    st: &mut ModState,
+    rect: Rect,
+    ids: &[ItemId],
+    folder: Option<FolderId>,
+) {
     if ids.is_empty() {
         empty_message(ui, rect, app, "No contacts", "Add someone with New Contact.");
         return;
     }
     let target = jump_target(app, st, ids);
+    // The card's fields are the view's columns (View Settings › Fields); Conditional Formatting colours the
+    // name.
+    let fields = folder.map(|f| table::shown(&app.s, f)).unwrap_or_default();
+    let rules = folder.map(|f| table::rules(&app.s, f)).unwrap_or_default();
     child(ui, rect.shrink(8.0), "mc-people-cards", |ui| {
         ScrollArea::vertical().id_salt("mc-people-cards-scroll").auto_shrink([false, false]).show(ui, |ui| {
             let card_w = 236.0;
@@ -834,13 +880,17 @@ fn cards(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: &[ItemI
                     CornerRadius::same(3),
                     if sel { app.theme.selected } else { app.theme.group_header },
                 );
-                paint_text_clipped(
+                let style = table::row_style(&app.s, &rules, table::Item::Contact(&c));
+                let (color, look) =
+                    mt::row_look(&style, app.theme.text, app.theme.danger, app.theme.text_muted);
+                mt::styled_cell(
                     ui,
-                    pos2(head.min.x + 8.0, head.min.y + 6.0),
+                    Rect::from_min_size(pos2(head.min.x + 4.0, head.min.y), vec2(card_w - 8.0, 28.0)),
                     &name,
-                    FontId::proportional(13.5),
-                    app.theme.text,
-                    card_w - 16.0,
+                    13.5,
+                    look,
+                    color,
+                    "left",
                 );
                 let mut y = head.max.y + 6.0;
                 let mut line = |label: &str, value: &str| {
@@ -865,14 +915,8 @@ fn cards(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: &[ItemI
                     );
                     y += 18.0;
                 };
-                line("Full name", &c.full_name());
-                line("Company", &c.company);
-                line("Job title", &c.job_title);
-                for (i, e) in c.emails.iter().enumerate().take(2) {
-                    line(if i == 0 { "Email" } else { "Email 2" }, e);
-                }
-                for (kind, n) in c.phones.iter().take(2) {
-                    line(kind, n);
+                for f in fields.iter().filter(|f| f.col.id != "icon") {
+                    line(&f.label, &table::contact_cell(&c, f.col.id));
                 }
                 if target == Some(id) {
                     ui.scroll_to_rect(card, Some(Align::TOP));
@@ -893,12 +937,20 @@ fn cards(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: &[ItemI
 
 /// The Business Card view: each contact as a business card (picture, name, title, company, phones,
 /// addresses, web page).
-fn business_cards(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: &[ItemId]) {
+fn business_cards(
+    ui: &mut Ui,
+    app: &mut App,
+    st: &mut ModState,
+    rect: Rect,
+    ids: &[ItemId],
+    folder: Option<FolderId>,
+) {
     if ids.is_empty() {
         empty_message(ui, rect, app, "No contacts", "Add someone with New Contact.");
         return;
     }
     let target = jump_target(app, st, ids);
+    let rules = folder.map(|f| table::rules(&app.s, f)).unwrap_or_default();
     child(ui, rect.shrink(8.0), "mc-people-bcards", |ui| {
         ScrollArea::vertical().id_salt("mc-people-bcards-scroll").auto_shrink([false, false]).show(
             ui,
@@ -955,20 +1007,28 @@ fn business_cards(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids
                     };
                     let x = card.min.x + 86.0;
                     let mut y = card.min.y + 12.0;
+                    // Conditional Formatting styles the name line.
+                    let style = table::row_style(&app.s, &rules, table::Item::Contact(&c));
+                    let (name_color, look) =
+                        mt::row_look(&style, app.theme.text, app.theme.danger, app.theme.text_muted);
                     for (i, l) in lines.iter().enumerate() {
                         if y > card.max.y - 18.0 {
                             break;
                         }
-                        let (size, color) =
-                            if i == 0 { (15.0, app.theme.text) } else { (12.0, app.theme.text_muted) };
-                        paint_text_clipped(
-                            ui,
-                            pos2(x, y),
-                            l,
-                            FontId::proportional(size),
-                            color,
-                            card.max.x - x - 10.0,
-                        );
+                        if i == 0 {
+                            let band =
+                                Rect::from_min_size(pos2(x - 4.0, y - 2.0), vec2(card.max.x - x - 6.0, 22.0));
+                            mt::styled_cell(ui, band, l, 15.0, look, name_color, "left");
+                        } else {
+                            paint_text_clipped(
+                                ui,
+                                pos2(x, y),
+                                l,
+                                FontId::proportional(12.0),
+                                app.theme.text_muted,
+                                card.max.x - x - 10.0,
+                            );
+                        }
                         y += if i == 0 { 22.0 } else { 17.0 };
                     }
                     if target == Some(id) {

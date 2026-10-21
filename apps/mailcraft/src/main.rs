@@ -155,6 +155,18 @@ fn open_session(args: &Args) -> Session {
     }
 }
 
+/// Writes everything that outlives the window: queued changes folded into the profile's snapshot, and the
+/// data files kept in files of their own. A session without a profile (the sample, or a profile that could
+/// not be opened) still writes those data files, or what was added to them would be lost.
+fn save_on_exit(s: &mut Session) {
+    let own_files = s.mailbox.accounts.iter().any(|a| a.data_file.is_some());
+    if (s.store.is_some() || own_files)
+        && let Err(e) = s.run("file.exit", &serde_json::json!({}))
+    {
+        log::error!("saving on exit failed: {e}");
+    }
+}
+
 /// eframe adapter.
 struct MailCraft {
     app: App,
@@ -166,12 +178,7 @@ impl eframe::App for MailCraft {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Write any queued changes and fold the journal into a snapshot.
-        if self.app.s.store.is_some()
-            && let Err(e) = self.app.s.run("file.exit", &serde_json::json!({}))
-        {
-            log::error!("saving on exit failed: {e}");
-        }
+        save_on_exit(&mut self.app.s);
     }
 
     fn clear_color(&self, _visuals: &eframe::egui::Visuals) -> [f32; 4] {
@@ -274,6 +281,25 @@ mod tests {
         let v = version_line();
         assert!(v.starts_with(&format!("mailcraft {} (git ", env!("CARGO_PKG_VERSION"))), "{v}");
         assert!(v.ends_with(')'), "{v}");
+    }
+
+    #[test]
+    fn closing_the_window_writes_data_files_of_their_own_without_a_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Projects.mcdata");
+        let mut s = Session::new(mailcraft_engine::model::Mailbox::new_local("Data"));
+        assert!(s.store.is_none());
+        let r = s.run("file.newDataFile", &serde_json::json!({"path": file.to_str().unwrap()})).unwrap();
+        let id = mailcraft_engine::model::AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let inbox = s.mailbox.role_folder(id, mailcraft_engine::model::FolderRole::Inbox).unwrap();
+        s.mailbox.add_mail(mailcraft_engine::model::MailItem {
+            folder: inbox,
+            subject: "Added after it was made".into(),
+            ..Default::default()
+        });
+        save_on_exit(&mut s);
+        let saved = String::from_utf8(std::fs::read(&file).unwrap()).unwrap();
+        assert!(saved.contains("Added after it was made"), "what was added reaches the file");
     }
 
     #[test]

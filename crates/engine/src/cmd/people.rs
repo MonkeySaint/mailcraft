@@ -1913,13 +1913,11 @@ pub fn view_rows(s: &Session, folder: FolderId, query: &str) -> Vec<ViewRow> {
     let kind = ModuleKind::People;
     let st = modules::state(s, folder, kind);
     let q = query.trim();
-    let arrange = if modules::grouped_view(kind, &st.view) && modules::show_groups(s, folder) {
-        st.arrangement(kind).map(str::to_owned)
-    } else {
-        None
-    };
+    // The Phone and List tables group (by their arrangement or Group By fields); the card views only sort.
+    let grouped = modules::grouped_view(kind, &st.view) && modules::show_groups(s, folder);
+    let arrange = if grouped { st.arrangement(kind).map(str::to_owned) } else { None };
     let custom = crate::cmd::view::table::custom(&st);
-    let mut keyed: Vec<((u8, String), (String, ItemId), ViewRow)> = s
+    let rows: Vec<crate::cmd::view::table::RowIn<(String, ItemId)>> = s
         .mailbox
         .contacts
         .values()
@@ -1932,38 +1930,43 @@ pub fn view_rows(s: &Session, folder: FolderId, query: &str) -> Vec<ViewRow> {
                 let v = v.trim();
                 if v.is_empty() { (1, "(none)".to_owned()) } else { (0, v.to_owned()) }
             };
-            let group =
-                arrange.as_deref().map(|a| match a {
-                    "categories" => text(c.categories.first().map(String::as_str).unwrap_or("")),
-                    "location" => {
-                        let a = c
-                            .addresses
-                            .iter()
-                            .find(|a| a.kind.eq_ignore_ascii_case("Business"))
-                            .or(c.addresses.first());
-                        text(
-                            a.map(|a| {
-                                if a.country.trim().is_empty() { a.city.as_str() } else { a.country.as_str() }
-                            })
-                            .unwrap_or(""),
-                        )
+            let auto: Vec<(u8, String)> = match arrange.as_deref() {
+                None => Vec::new(),
+                // A contact with several categories is listed under each of them (as in Tasks and Mail).
+                Some("categories") => {
+                    let mut cats: Vec<(u8, String)> = Vec::new();
+                    for cat in c.categories.iter().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                        if !cats.iter().any(|x| x.1.eq_ignore_ascii_case(cat)) && cats.len() < pim::MAX_LIST {
+                            cats.push((0, cat.to_owned()));
+                        }
                     }
-                    _ => text(&c.company),
-                });
-            let row =
-                ViewRow { id: c.id, kind: RowKind::Contact, group: group.as_ref().map(|g| g.1.clone()) };
-            (group.unwrap_or((0, String::new())), (display_name(c).to_lowercase(), c.id), row)
+                    if cats.is_empty() {
+                        cats.push(text(""));
+                    }
+                    cats
+                }
+                Some("location") => {
+                    let a = c
+                        .addresses
+                        .iter()
+                        .find(|a| a.kind.eq_ignore_ascii_case("Business"))
+                        .or(c.addresses.first());
+                    vec![text(
+                        a.map(
+                            |a| {
+                                if a.country.trim().is_empty() { a.city.as_str() } else { a.country.as_str() }
+                            },
+                        )
+                        .unwrap_or(""),
+                    )]
+                }
+                Some(_) => vec![text(&c.company)],
+            };
+            let natural = (display_name(c).to_lowercase(), c.id);
+            crate::cmd::view::table::RowIn { id: c.id, kind: RowKind::Contact, auto, natural }
         })
         .collect();
-    let by =
-        |a: &ItemId, b: &ItemId| match (&custom.sort, s.mailbox.contacts.get(a), s.mailbox.contacts.get(b)) {
-            (Some(f), Some(x), Some(y)) => {
-                crate::cmd::view::table::compare(s, kind, f, Item::Contact(x), Item::Contact(y))
-            }
-            _ => std::cmp::Ordering::Equal,
-        };
-    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| by(&a.2.id, &b.2.id)).then_with(|| a.1.cmp(&b.1)));
-    let mut out: Vec<ViewRow> = keyed.into_iter().map(|(_, _, r)| r).collect();
+    let mut out = crate::cmd::view::table::order_rows(s, kind, &st, grouped, rows);
     if modules::reversed(s, folder) {
         out.reverse();
     }

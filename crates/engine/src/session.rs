@@ -256,6 +256,10 @@ pub struct Session {
     /// (closing or opening a data file): the undo history is cleared instead of recording a step, since any
     /// older snapshot would bring back or drop that data file too.
     pub(crate) undo_barrier: bool,
+    /// Set by a command that took data out of the profile which must not linger in its journal (closing a
+    /// password-protected data file): once the command's changes are written, the journal is folded into a
+    /// fresh snapshot.
+    pub(crate) checkpoint_after: bool,
     /// Quick Print may go straight to the system's default printer. The desktop app turns it on; tests and
     /// tools leave it off, so nothing reaches a real printer by accident.
     pub direct_print: bool,
@@ -332,6 +336,7 @@ impl Session {
             recover: crate::recover::RecoverState::default(),
             closed_data_files: Vec::new(),
             undo_barrier: false,
+            checkpoint_after: false,
             direct_print: false,
             translator: None,
             translations: BTreeMap::new(),
@@ -422,6 +427,7 @@ impl Session {
         self.apply_settings();
         self.select_start_folder();
         crate::cmd::nav::note_visit(self, self.selection.folder);
+        crate::cmd::view::opened(self, self.selection.folder);
         self.settings_saved = self.settings_bytes();
         if self.migrate_view_state() {
             // The moved entries leave settings.json right away, so an older copy never brings them back.
@@ -927,6 +933,9 @@ impl Session {
             }
             self.flush_pending();
         }
+        if self.run_depth == 0 && std::mem::take(&mut self.checkpoint_after) {
+            self.checkpoint_now();
+        }
         self.tidy_selection();
         self.sync_settings_from_session();
         if let Err(e) = self.save_settings() {
@@ -985,6 +994,21 @@ impl Session {
                     log::error!("could not fold the journal into a snapshot: {e}");
                 }
             }
+        }
+    }
+
+    /// Folds the journal into a fresh snapshot of the mailbox now (when a store is attached and every queued
+    /// change is written), so items that left the mailbox leave the journal and snapshot too. Message sources
+    /// (content-addressed files next to the snapshot) are not touched.
+    pub(crate) fn checkpoint_now(&mut self) {
+        if !self.pending_ops.is_empty() {
+            self.flush_pending();
+        }
+        if let Some(store) = self.store.as_mut()
+            && self.pending_ops.is_empty()
+            && let Err(e) = store.checkpoint(&self.mailbox)
+        {
+            log::error!("could not fold the journal into a snapshot: {e}");
         }
     }
 

@@ -286,7 +286,9 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
     match name {
         "mem" => mem_flag(mem, arg),
         "rp" => {
-            let pos = current_view(app).reading_pane;
+            // People, Tasks and Notes folders keep their own reading pane (a fresh Notes folder has it off).
+            let pos =
+                module_here(app).map_or_else(|| current_view(app).reading_pane, |(_, st)| st.reading_pane);
             matches!(
                 (arg, pos),
                 ("right", ReadingPanePos::Right)

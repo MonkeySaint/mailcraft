@@ -438,9 +438,19 @@ fn data_file_properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         ui.label(d.str("address"));
                         ui.end_row();
                     }
-                    ui.label("Location:");
-                    let path = d.str("path");
-                    ui.label(if path.is_empty() { "In memory, not saved".to_owned() } else { path });
+                    let file = d.str("file");
+                    if file.is_empty() {
+                        ui.label("Location:");
+                        let path = d.str("path");
+                        ui.label(if path.is_empty() { "In memory, not saved".to_owned() } else { path });
+                    } else {
+                        // A data file of its own: where its file is, and whether a password protects it.
+                        ui.label("File:");
+                        ui.label(file);
+                        ui.end_row();
+                        ui.label("Password:");
+                        ui.label(if d.bool("protected") { "Protected by a password" } else { "None" });
+                    }
                     ui.end_row();
                     ui.label("Size:");
                     ui.label(common::size_text(d.u64("bytes").unwrap_or(0)));
@@ -459,6 +469,12 @@ fn data_file_properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     if btn_en(ui, can, "Compact Now") {
                         match app.run("file.dataFileProperties", json!({"store": account, "compact": true})) {
                             Some(_) => st.note = "The data file was compacted.".into(),
+                            None => st.error = last_error(app),
+                        }
+                    }
+                    if !d.str("file").is_empty() && btn(ui, "Save to File Now") {
+                        match app.run("file.dataFileProperties", json!({"store": account, "save": true})) {
+                            Some(_) => st.note = "The file is up to date.".into(),
                             None => st.error = last_error(app),
                         }
                     }

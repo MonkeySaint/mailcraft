@@ -15,6 +15,22 @@
 //!
 //! Closing and opening a data file cannot be undone with Undo: the closed data file lives outside the
 //! mailbox, so both clear the undo history instead of recording a step.
+//!
+//! **Standalone data files.** New Data File with a path ([`create_linked`]) writes the new data file to
+//! that file at once, and Open Data File from a file outside the profile ([`open_linked`]) reads one; such a
+//! data file stays linked to its file (`Account::data_file`). While it is open its items live in the profile
+//! like any other data file; Close writes it back to its file ([`close_linked`]) and Data File Properties ›
+//! Save writes it there on demand ([`save_linked`]), so the file can be copied, moved and opened in another
+//! profile. A data file can be protected by a password: the file is then encrypted ([`seal`]: PBES2,
+//! PBKDF2-HMAC-SHA256 and AES-256-CBC, RFC 8018), and the password is kept in the session's secret store,
+//! never in the mailbox. The encryption covers the file only: while the data file is open its items live
+//! unencrypted in the profile like any other data file's, and its password is remembered in the profile's
+//! secret store (the OS keyring where there is one, the profile's secrets file otherwise). Closing it forgets
+//! the password and folds the profile's journal into a fresh snapshot so the items leave both (the raw
+//! message sources the profile stored for them stay in its `blobs` folder, shared by content with other
+//! data files, so they are not deleted here); a password
+//! typed to close it while none is remembered is checked against the file first (or typed twice when the
+//! file is gone).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -79,9 +95,11 @@ pub struct ClosedEntry {
 /// The data file of `account` as an image; message sources kept in the store's blobs are inlined, because
 /// the blobs go once nothing in the mailbox refers to them.
 pub fn image_of(s: &Session, account: AccountId) -> Result<DataFileImage, CmdError> {
-    let Some(acct) = s.mailbox.account(account).cloned() else {
+    let Some(mut acct) = s.mailbox.account(account).cloned() else {
         return Err(CmdError::Params(format!("no such data file {}", account.0)));
     };
+    // Where the file sits on this computer is no part of it (it can be moved).
+    acct.data_file = None;
     let folders: Vec<Folder> = s.mailbox.folders.values().filter(|f| f.account == account).cloned().collect();
     let ids: BTreeSet<FolderId> = folders.iter().map(|f| f.id).collect();
     let mut mail = Vec::new();
@@ -396,6 +414,8 @@ pub fn attach(s: &mut Session, image: DataFileImage) -> Result<AccountId, CmdErr
         credential: CredentialKind::default(),
         server_saves_sent: false,
         sync: AccountSync::default(),
+        // The caller links the data file to the file it came from, if it stays one.
+        data_file: None,
         ..account
     });
 
@@ -494,6 +514,263 @@ pub fn attach(s: &mut Session, image: DataFileImage) -> Result<AccountId, CmdErr
     s.mailbox.create_default_folders(id);
     dedupe_sibling_names(s, id);
     Ok(id)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Standalone data files
+
+/// `format` of a data file protected by a password: the data file, encrypted ([`seal`]).
+pub const SEALED_FORMAT: &str = "mailcraft-data-file-sealed";
+/// PBKDF2 rounds a data file's password is stretched with (unit tests use fewer to stay fast; the file says
+/// how many it used).
+const SEAL_ROUNDS: u32 = if cfg!(test) { 1_000 } else { 200_000 };
+/// Longest data file password (characters).
+pub const MAX_PASSWORD_CHARS: usize = 256;
+
+/// A password-protected data file on disk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct SealedFile {
+    format: String,
+    version: u32,
+    /// "pbkdf2-sha256" (RFC 8018).
+    kdf: String,
+    rounds: u32,
+    /// Base64.
+    salt: String,
+    /// "aes-256-cbc".
+    cipher: String,
+    /// Base64.
+    iv: String,
+    /// Base64 of the encrypted data file.
+    data: String,
+}
+
+/// Key of a standalone data file's password in the session's secret store.
+pub fn secret_key(account: AccountId) -> String {
+    format!("datafile:{}", account.0)
+}
+
+/// Whether `bytes` is a password-protected data file (only the start is looked at; [`unseal`] checks the
+/// rest).
+pub fn is_sealed(bytes: &[u8]) -> bool {
+    let head = bytes.get(..bytes.len().min(256)).unwrap_or_default();
+    String::from_utf8_lossy(head).contains(SEALED_FORMAT)
+}
+
+/// A password that can protect a data file: 1 to [`MAX_PASSWORD_CHARS`] characters, no control characters.
+pub fn check_password(password: &str) -> Result<(), CmdError> {
+    let n = password.chars().count();
+    if n == 0 || n > MAX_PASSWORD_CHARS || password.chars().any(char::is_control) {
+        return Err(CmdError::Params(format!(
+            "a data file password is 1 to {MAX_PASSWORD_CHARS} characters without control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// The data file `bytes` encrypted under `password`.
+pub fn seal(bytes: &[u8], password: &str) -> Result<Vec<u8>, CmdError> {
+    use base64::Engine;
+    check_password(password)?;
+    let sealed = mailcraft_smime::seal::seal(bytes, password, SEAL_ROUNDS)
+        .map_err(|e| CmdError::Failed(format!("cannot protect the data file: {e}")))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let file = SealedFile {
+        format: SEALED_FORMAT.to_owned(),
+        version: VERSION,
+        kdf: "pbkdf2-sha256".to_owned(),
+        rounds: sealed.rounds,
+        salt: b64.encode(sealed.salt),
+        cipher: "aes-256-cbc".to_owned(),
+        iv: b64.encode(sealed.iv),
+        data: b64.encode(&sealed.data),
+    };
+    serde_json::to_vec(&file).map_err(|e| CmdError::Failed(format!("cannot write the data file: {e}")))
+}
+
+/// The data file inside a password-protected one.
+pub fn unseal(bytes: &[u8], password: &str) -> Result<Vec<u8>, CmdError> {
+    use base64::Engine;
+    let damaged = || CmdError::Failed("this protected data file is damaged".into());
+    let file: SealedFile = serde_json::from_slice(bytes).map_err(|_| damaged())?;
+    if file.format != SEALED_FORMAT || file.kdf != "pbkdf2-sha256" || file.cipher != "aes-256-cbc" {
+        return Err(CmdError::Failed("this data file is protected in a way MailCraft cannot open".into()));
+    }
+    if file.version == 0 || file.version > VERSION {
+        return Err(CmdError::Failed(format!(
+            "this data file was written by a newer MailCraft (format {})",
+            file.version
+        )));
+    }
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let bytes16 = |t: &str| -> Result<[u8; 16], CmdError> {
+        let v = b64.decode(t.trim()).map_err(|_| damaged())?;
+        <[u8; 16]>::try_from(v.as_slice()).map_err(|_| damaged())
+    };
+    let sealed = mailcraft_smime::seal::Sealed {
+        rounds: file.rounds,
+        salt: bytes16(&file.salt)?,
+        iv: bytes16(&file.iv)?,
+        data: b64.decode(file.data.trim()).map_err(|_| damaged())?,
+    };
+    match mailcraft_smime::seal::open(&sealed, password) {
+        Ok(plain) => Ok(plain.to_vec()),
+        Err(mailcraft_smime::SmimeError::Password) => {
+            Err(CmdError::Params("the password is wrong, or the data file is damaged".into()))
+        }
+        Err(e) => Err(CmdError::Failed(format!("cannot open the protected data file: {e}"))),
+    }
+}
+
+/// `path` made absolute against the current folder (as it is now), so a data file linked to a relative
+/// path is written back to the same file even when MailCraft later runs from elsewhere.
+pub fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `path` with the data file extension added when it has none.
+pub fn with_extension(path: &Path) -> PathBuf {
+    if path.extension().is_some() { path.to_path_buf() } else { path.with_extension(EXTENSION) }
+}
+
+/// Writes `bytes` to `path` through a temporary file next to it and a rename, so a failed write leaves the
+/// old file (or nothing) rather than half a file.
+pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), CmdError> {
+    let fail = |e: std::io::Error| CmdError::Failed(format!("cannot write {}: {e}", path.display()));
+    let Some(name) = path.file_name() else {
+        return Err(CmdError::Params(format!("{} is not a file name", path.display())));
+    };
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    std::fs::write(&tmp, bytes).map_err(fail)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(fail(e));
+    }
+    Ok(())
+}
+
+/// The same file as `a` and `b` (resolved when both exist; compared as written otherwise).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// The open data file kept in the file at `path`, if any.
+pub fn linked_to(s: &Session, path: &Path) -> Option<AccountId> {
+    s.mailbox
+        .accounts
+        .iter()
+        .find(|a| a.data_file.as_ref().is_some_and(|l| same_file(Path::new(&l.path), path)))
+        .map(|a| a.id)
+}
+
+/// Writes standalone data file `account` to its file now (encrypted when it has a password). Returns the
+/// path.
+pub fn save_linked(s: &Session, account: AccountId) -> Result<PathBuf, CmdError> {
+    let Some(link) = s.mailbox.account(account).and_then(|a| a.data_file.clone()) else {
+        return Err(CmdError::Params(
+            "this data file is kept with the profile, not in a file of its own".into(),
+        ));
+    };
+    let image = image_of(s, account)?;
+    let bytes = serde_json::to_vec(&image)
+        .map_err(|e| CmdError::Failed(format!("cannot write the data file: {e}")))?;
+    let bytes = if link.protected {
+        let Some(pw) = s.secrets.get(&secret_key(account)) else {
+            return Err(CmdError::Params("the data file's password is needed to write it".into()));
+        };
+        seal(&bytes, &pw)?
+    } else {
+        bytes
+    };
+    let path = PathBuf::from(&link.path);
+    write_file(&path, &bytes)?;
+    Ok(path)
+}
+
+/// Creates a standalone data file called `name` in the file at `path` (with its default folders, and
+/// encrypted under `password` when one is given) and writes it there at once. Nothing is added when the
+/// file cannot be written.
+pub fn create_linked(
+    s: &mut Session,
+    name: &str,
+    path: &Path,
+    password: Option<&str>,
+) -> Result<AccountId, CmdError> {
+    if let Some(pw) = password {
+        check_password(pw)?;
+    }
+    let path = &absolute(path);
+    let id = s.mailbox.add_account(Account {
+        kind: AccountKind::Local,
+        display_name: name.to_owned(),
+        is_default: false,
+        data_file: Some(mailcraft_model::account::DataFileLink {
+            path: path.display().to_string(),
+            protected: password.is_some(),
+        }),
+        ..Default::default()
+    });
+    s.mailbox.create_default_folders(id);
+    let stored = match password {
+        Some(pw) => s.secrets.set(&secret_key(id), pw).map_err(CmdError::Failed),
+        None => Ok(()),
+    };
+    let written = stored.and_then(|()| save_linked(s, id).map(|_| ()));
+    if let Err(e) = written {
+        let _ = s.secrets.remove(&secret_key(id));
+        crate::accounts::remove_account_data(s, id);
+        return Err(e);
+    }
+    Ok(id)
+}
+
+/// Opens the data file in `bytes` (read from `path`, decrypted with `password` when it is protected) and
+/// keeps it linked to that file, so closing it writes it back there.
+pub fn open_linked(
+    s: &mut Session,
+    path: &Path,
+    bytes: &[u8],
+    password: Option<&str>,
+) -> Result<AccountId, CmdError> {
+    let path = &absolute(path);
+    if let Some(other) = linked_to(s, path) {
+        let name = s.mailbox.account(other).map(|a| a.display_name.clone()).unwrap_or_default();
+        return Err(CmdError::Params(format!("{} is already open as \"{name}\"", path.display())));
+    }
+    let protected = is_sealed(bytes);
+    let plain = match (protected, password) {
+        (true, Some(pw)) => unseal(bytes, pw)?,
+        (true, None) => return Err(CmdError::Params("this data file is protected by a password".into())),
+        (false, _) => bytes.to_vec(),
+    };
+    let image = parse(&plain)?;
+    let id = attach(s, image)?;
+    if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == id) {
+        a.data_file =
+            Some(mailcraft_model::account::DataFileLink { path: path.display().to_string(), protected });
+    }
+    if let (true, Some(pw)) = (protected, password)
+        && let Err(e) = s.secrets.set(&secret_key(id), pw)
+    {
+        log::warn!("could not keep the data file password: {e}");
+    }
+    Ok(id)
+}
+
+/// Closes standalone data file `account`: writes it to its file, then takes it out of the mailbox (nothing is
+/// removed when the write fails). Returns the file and the number of folders that left.
+pub fn close_linked(s: &mut Session, account: AccountId) -> Result<(PathBuf, usize), CmdError> {
+    let path = save_linked(s, account)?;
+    let _ = s.secrets.remove(&secret_key(account));
+    crate::sync::forget_account(s, account);
+    let folders = crate::accounts::remove_account_data(s, account);
+    Ok((path, folders))
 }
 
 /// Total size of a data file's messages (bytes, as the messages give it) and its item and folder counts.

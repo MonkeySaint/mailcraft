@@ -9,6 +9,7 @@ use egui::{Color32, CornerRadius, FontId, Id, Rect, Sense, Stroke, Ui, Vec2, Wid
 use serde_json::json;
 
 use mailcraft_engine::cmd::view::table::{ModuleRowStyle, ShownColumn, SortField, TableColumn};
+use mailcraft_model::view::TableOther;
 
 use super::common::{a11y, paint_text_clipped};
 use crate::App;
@@ -82,6 +83,18 @@ pub(crate) fn layout(width: f32, cols: &[ShownColumn]) -> Vec<Laid> {
 
 /// Header height.
 pub(crate) const HEAD_H: f32 = 24.0;
+/// Column heading text size when Other Settings leaves it alone.
+const HEAD_FONT: f32 = 11.5;
+
+/// Column heading text size: Other Settings › Column font, else the table's own.
+pub(crate) fn head_font(other: &TableOther) -> f32 {
+    if other.column_font > 0 { f32::from(other.column_font) } else { HEAD_FONT }
+}
+
+/// Header height for the column heading font.
+pub(crate) fn head_height(other: &TableOther) -> f32 {
+    HEAD_H.max((head_font(other) * 2.0).round())
+}
 
 /// Draws the column header across `rect`; returns the column clicked (to sort by it).
 pub(crate) fn header(
@@ -91,7 +104,9 @@ pub(crate) fn header(
     laid: &[Laid],
     sort: Option<&SortField>,
     salt: &str,
+    other: &TableOther,
 ) -> Option<&'static str> {
+    let font = head_font(other);
     let mut clicked = None;
     for l in laid {
         let cell = Rect::from_min_size(pos2(rect.min.x + l.x, rect.min.y), vec2(l.w.max(1.0), rect.height()));
@@ -124,9 +139,9 @@ pub(crate) fn header(
         } else {
             paint_text_clipped(
                 ui,
-                pos2(cell.min.x + 4.0, cell.center().y - 7.0),
+                pos2(cell.min.x + 4.0, cell.center().y - font * 0.6),
                 text,
-                FontId::proportional(11.5),
+                FontId::proportional(font),
                 app.theme.text_muted,
                 l.w - (if sorted.is_some() { 18.0 } else { 6.0 }),
             );

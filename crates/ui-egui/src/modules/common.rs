@@ -838,19 +838,28 @@ pub(crate) fn toggle_group(app: &mut App, first: ItemId, label: &str, collapsed:
     app.run(id, serde_json::json!({ "label": label }));
 }
 
-/// A group header row (▾/▸, label, item count); returns true when clicked.
-pub(crate) fn group_row(ui: &mut Ui, app: &mut App, label: &str, count: usize, collapsed: bool) -> bool {
+/// A group header row (▾/▸, label, item count) nested `depth` levels deep (Group By on several fields), indented under its outer
+/// group; returns true when clicked.
+pub(crate) fn group_row_at(
+    ui: &mut Ui,
+    app: &mut App,
+    label: &str,
+    count: usize,
+    collapsed: bool,
+    depth: usize,
+) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
     let state = if collapsed { "collapsed" } else { "expanded" };
     a11y(&resp, WidgetType::Button, &format!("Group {label}: {count} items, {state}"));
     if resp.hovered() {
         ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.hover);
     }
-    let chev = Rect::from_center_size(pos2(rect.min.x + 10.0, rect.center().y), Vec2::splat(12.0));
+    let indent = 16.0 * depth.min(6) as f32;
+    let chev = Rect::from_center_size(pos2(rect.min.x + 10.0 + indent, rect.center().y), Vec2::splat(12.0));
     app.icons.paint(ui, chev, if collapsed { "chevron-right" } else { "chevron-down" }, app.theme.text_muted);
     let text = format!("{label}: {count}");
     ui.painter().text(
-        pos2(rect.min.x + 22.0, rect.center().y),
+        pos2(rect.min.x + 22.0 + indent, rect.center().y),
         Align2::LEFT_CENTER,
         text,
         FontId::proportional(12.5),
@@ -858,6 +867,45 @@ pub(crate) fn group_row(ui: &mut Ui, app: &mut App, label: &str, count: usize, c
     );
     ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, app.theme.separator));
     resp.clicked()
+}
+
+/// The group headers due before row `i` of a grouped module view (`levels` gives each row's group labels,
+/// outermost first): one per group that starts at this row, nested and indented, none inside a collapsed
+/// group. A click on a header collapses or expands that group (selecting its first item, as the group
+/// commands need). Returns true when the row itself is hidden inside a collapsed group.
+pub(crate) fn nested_headers<T>(
+    ui: &mut Ui,
+    app: &mut App,
+    rows: &[T],
+    i: usize,
+    levels: impl Fn(&T) -> &[String],
+    id: impl Fn(&T) -> ItemId,
+    collapsed: &BTreeSet<String>,
+) -> bool {
+    use mailcraft_model::view::GROUP_SEP;
+    let Some(row) = rows.get(i) else { return true };
+    let mine = levels(row);
+    let prev: &[String] = i.checked_sub(1).and_then(|p| rows.get(p)).map_or(&[], &levels);
+    let mut hidden = false;
+    for d in 0..mine.len() {
+        let Some(prefix) = mine.get(..=d) else { break };
+        let key = prefix.join(GROUP_SEP);
+        let shut = collapsed.contains(&key);
+        if !hidden && prev.get(..=d) != Some(prefix) {
+            let count = rows.iter().skip(i).take_while(|r| levels(r).get(..=d) == Some(prefix)).count();
+            let title = prefix.last().map_or("", String::as_str);
+            if group_row_at(ui, app, title, count, shut, d) {
+                toggle_group(app, id(row), &key, shut);
+            }
+        }
+        hidden |= shut;
+    }
+    hidden
+}
+
+/// A module row's text size in points: Other Settings › Row font when set, else the view's own `base`.
+pub(crate) fn row_font(other: &mailcraft_model::view::TableOther, base: f32) -> f32 {
+    if other.row_font > 0 { f32::from(other.row_font) } else { base }
 }
 
 /// Splits a module's content into the item list and the reading pane by the folder's reading pane position

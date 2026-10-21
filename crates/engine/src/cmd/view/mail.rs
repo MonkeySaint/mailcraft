@@ -29,6 +29,7 @@ use serde_json::{Map, Value, json};
 use super::{dialog, parse_layout, settings};
 use crate::cmd::util::{opt_bool, opt_str, req_str};
 use crate::{CmdError, CmdResult, CommandSpec, Session};
+use mailcraft_model::view::{ExpandDefault, MAX_GROUP_LEVELS, MAX_SORT_KEYS, SortOrder, TableOther};
 use mailcraft_model::{
     ArrangeBy, DateTime, FlagState, FolderId, FolderKind, FolderRole, Importance, ItemId, ListTime, MailItem,
     Sensitivity, ViewLayout, ViewSettings,
@@ -126,7 +127,7 @@ const fn col(
 }
 
 /// Every column (Show Columns › Available columns), in the dialog's order.
-pub const COLUMNS: [ColumnDef; 18] = [
+pub const COLUMNS: [ColumnDef; 28] = [
     col("importance", "Importance", 22, Some(ArrangeBy::Importance), ColumnKind::Icon, true),
     col("reminder", "Reminder", 22, None, ColumnKind::Icon, false),
     col("icon", "Icon", 24, Some(ArrangeBy::Type), ColumnKind::Icon, true),
@@ -145,7 +146,39 @@ pub const COLUMNS: [ColumnDef; 18] = [
     col("flagDue", "Due Date", 110, Some(ArrangeBy::FlagDueDate), ColumnKind::Date, false),
     col("sensitivity", "Sensitivity", 90, None, ColumnKind::Text, false),
     col("inFolder", "In Folder", 110, None, ColumnKind::Text, false),
+    // Further fields (Show Columns › All Mail fields).
+    col("bcc", "Bcc", 120, None, ColumnKind::Person, false),
+    col("replyTo", "Reply To", 120, None, ColumnKind::Person, false),
+    col("sender", "Sender", 120, None, ColumnKind::Person, false),
+    col("read", "Read", 50, None, ColumnKind::Text, false),
+    col("conversation", "Conversation", 160, None, ColumnKind::Text, false),
+    col("messageClass", "Message Class", 150, None, ColumnKind::Text, false),
+    col("followUpFlag", "Follow Up Flag", 110, None, ColumnKind::Text, false),
+    col("flagCompleted", "Date Completed", 110, None, ColumnKind::Date, false),
+    col("response", "Response", 100, None, ColumnKind::Text, false),
+    col("responseTime", "Response Time", 130, None, ColumnKind::Date, false),
 ];
+
+/// Columns of the "Frequently-used fields" set of Show Columns (the others are only under "All Mail
+/// fields").
+pub const FREQUENT_COLUMNS: usize = 18;
+
+/// Field sets Show Columns lists columns from: (key, label, how many of [`COLUMNS`] it holds).
+pub const FIELD_SETS: [(&str, &str, usize); 2] =
+    [("frequent", "Frequently-used fields", FREQUENT_COLUMNS), ("all", "All Mail fields", COLUMNS.len())];
+
+/// The "message class" of a message, after its kind ([`crate::queries::item_type`]).
+fn message_class(m: &MailItem) -> &'static str {
+    match crate::queries::item_type(m).1 {
+        "Draft" | "Message" => "IPM.Note",
+        "Meeting Request" => "IPM.Schedule.Meeting.Request",
+        "Meeting Response" => "IPM.Schedule.Meeting.Resp",
+        "Meeting Cancellation" => "IPM.Schedule.Meeting.Canceled",
+        "Read Receipt" => "REPORT.IPM.Note.IPNRN",
+        "Delivery Report" => "REPORT.IPM.Note.NDR",
+        _ => "IPM.Note",
+    }
+}
 
 /// Columns of a view nobody changed (the bottom reading pane layout of `plan/reference/responsive.md`).
 pub const DEFAULT_COLUMNS: [&str; 11] = [
@@ -529,6 +562,223 @@ pub struct MailView {
     pub filter: Option<CustomFilter>,
     /// Saved view the folder shows (empty = a built-in view).
     pub name: String,
+    /// Sort › Then by: the keys after the arrangement (Sort items by), at most [`MAX_SORT_KEYS`] - 1.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub then_by: Vec<MailField>,
+    /// Group By fields, outermost first (empty: "Automatically group according to arrangement").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<MailField>,
+    /// Group By › Expand/collapse defaults.
+    #[serde(skip_serializing_if = "ExpandDefault::is_default")]
+    pub expand: ExpandDefault,
+    /// Other Settings: row and column heading fonts and grid lines of the column layout.
+    #[serde(skip_serializing_if = "TableOther::is_default")]
+    pub other: TableOther,
+}
+
+/// A field the mail list sorts or groups by (one of the arrangements) and its direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailField {
+    pub key: ArrangeBy,
+    pub descending: bool,
+}
+
+/// The arrangement named `key` (its key or label, any case: "flagDue", "Flag: Due Date").
+pub fn arrangement(key: &str) -> Option<ArrangeBy> {
+    let k = key.trim();
+    ArrangeBy::ALL
+        .into_iter()
+        .find(|a| super::arrange_name(*a).eq_ignore_ascii_case(k) || a.label().eq_ignore_ascii_case(k))
+}
+
+/// A list of mail sort or group fields (`[{"field", "dir"}]` or plain arrangement keys): at most `max`,
+/// none twice. `null` is an empty list.
+fn parse_mail_fields(v: &Value, max: usize, what: &str) -> Result<Vec<MailField>, CmdError> {
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let list = v.as_array().ok_or_else(|| CmdError::Params(format!("`{what}` must be a list of fields")))?;
+    if list.len() > max {
+        return Err(CmdError::Params(format!("`{what}` takes at most {max} fields")));
+    }
+    let mut out: Vec<MailField> = Vec::new();
+    for f in list {
+        let (id, dir) = super::table::field_entry(f, what)?;
+        let key = arrangement(id).ok_or_else(|| {
+            CmdError::Params(format!("the list cannot be sorted or grouped by `{}`", clip(id, 40)))
+        })?;
+        let descending = match dir {
+            None => key == ArrangeBy::Date,
+            Some("asc") => false,
+            Some("desc") => true,
+            Some(other) => {
+                return Err(CmdError::Params(format!(
+                    "`dir` must be asc or desc, not `{}`",
+                    clip(other, 20)
+                )));
+            }
+        };
+        if out.iter().any(|x| x.key == key) {
+            return Err(CmdError::Params(format!("`{what}` names {} twice", key.label())));
+        }
+        out.push(MailField { key, descending });
+    }
+    Ok(out)
+}
+
+/// Fields as JSON for the dialogs: `[{"field", "label", "dir"}]`.
+pub fn mail_fields_json(list: &[MailField]) -> Value {
+    Value::Array(
+        list.iter()
+            .map(|f| {
+                json!({
+                    "field": super::arrange_name(f.key),
+                    "label": f.key.label(),
+                    "dir": if f.descending { "desc" } else { "asc" },
+                })
+            })
+            .collect(),
+    )
+}
+
+/// "From (ascending), Size (descending)".
+pub fn describe_mail_fields(list: &[MailField]) -> String {
+    list.iter()
+        .map(|f| format!("{} ({})", f.key.label(), if f.descending { "descending" } else { "ascending" }))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Every sort key of the folder's list: the arrangement (Sort items by) and the Then by keys.
+pub fn sort_keys(s: &Session, folder: FolderId) -> Vec<MailField> {
+    let vs = settings(s, folder);
+    let mut out = vec![MailField { key: vs.arrange_by, descending: vs.order == SortOrder::Descending }];
+    out.extend(mail_view(s, folder).then_by.into_iter().filter(|f| f.key != vs.arrange_by));
+    out
+}
+
+/// `view.sortBy` with `fields` in a mail folder: the first key becomes the arrangement and its direction, the
+/// others the Then by keys.
+pub(super) fn sort_fields(s: &mut Session, p: &Value) -> CmdResult {
+    let folder = mail_folder(s)?;
+    let list = parse_mail_fields(p.get("fields").unwrap_or(&Value::Null), MAX_SORT_KEYS, "fields")?;
+    set_sort(s, folder, &list)?;
+    Ok(json!({ "fields": mail_fields_json(&sort_keys(s, folder)) }))
+}
+
+fn set_sort(s: &mut Session, folder: FolderId, list: &[MailField]) -> Result<(), CmdError> {
+    let mut keys = list.iter().copied();
+    let first = keys.next();
+    let vs = settings(s, folder);
+    let mut v = vs.clone();
+    match first {
+        Some(f) => {
+            v.arrange_by = f.key;
+            v.order = if f.descending { SortOrder::Descending } else { SortOrder::Ascending };
+        }
+        None => {
+            let d = ViewSettings::default();
+            v.arrange_by = d.arrange_by;
+            v.order = d.order;
+        }
+    }
+    if v != vs {
+        if v == ViewSettings::default() {
+            s.mailbox.views.remove(&folder);
+        } else {
+            s.mailbox.views.insert(folder, v.clone());
+        }
+    }
+    let mut mv = mail_view(s, folder);
+    mv.then_by = keys.collect();
+    store_view(s, folder, &mv);
+    if v.arrange_by != vs.arrange_by {
+        // Group labels change meaning with the arrangement.
+        super::modules::clear_groups(s, folder);
+        open_groups(s, folder);
+    }
+    Ok(())
+}
+
+/// Opens the list's groups as Group By › Expand/collapse defaults says: all expanded (collapsed groups
+/// forgotten), all collapsed, or as they were left. The folder must be the selected one.
+pub(crate) fn open_groups(s: &mut Session, folder: FolderId) {
+    if s.selection.folder != folder {
+        return;
+    }
+    match mail_view(s, folder).expand {
+        ExpandDefault::AsLastViewed => {}
+        ExpandDefault::AllExpanded => super::modules::clear_groups(s, folder),
+        ExpandDefault::AllCollapsed => {
+            super::modules::clear_groups(s, folder);
+            let labels = crate::queries::group_labels(s);
+            if !labels.is_empty() {
+                s.view.collapsed_groups.entry(folder).or_default().extend(labels);
+            }
+        }
+    }
+}
+
+/// Keys of `view.viewSettings` that change a mail view's advanced settings.
+pub const SETTINGS_KEYS: [&str; 6] =
+    ["sortBy", "groupBy", "expandGroups", "rowFont", "columnFont", "gridLines"];
+
+/// `view.viewSettings` with advanced keys in a mail folder: `sortBy` (Sort: up to four fields, the first
+/// the arrangement), `groupBy` (Group By fields; empty or null: group automatically by the arrangement),
+/// `expandGroups`, `rowFont`, `columnFont` (points, 0 = default) and `gridLines`.
+pub(super) fn apply_settings(s: &mut Session, folder: FolderId, p: &Value) -> CmdResult {
+    let sort = p.get("sortBy").map(|v| parse_mail_fields(v, MAX_SORT_KEYS, "sortBy")).transpose()?;
+    let groups = p.get("groupBy").map(|v| parse_mail_fields(v, MAX_GROUP_LEVELS, "groupBy")).transpose()?;
+    let expand = match p.get("expandGroups") {
+        None => None,
+        Some(v) => Some(v.as_str().and_then(ExpandDefault::parse).ok_or_else(|| {
+            CmdError::Params("`expandGroups` must be expanded, collapsed or lastViewed".into())
+        })?),
+    };
+    let font = |key: &str| -> Result<Option<u8>, CmdError> {
+        match p.get(key) {
+            None => Ok(None),
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| CmdError::Params(format!("`{key}` must be a font size")))?;
+                Ok(Some(mailcraft_model::view::clamp_font(u8::try_from(n).unwrap_or(u8::MAX))))
+            }
+        }
+    };
+    let (row_font, column_font) = (font("rowFont")?, font("columnFont")?);
+    let grid = match p.get("gridLines") {
+        None => None,
+        Some(v) => {
+            Some(v.as_bool().ok_or_else(|| CmdError::Params("`gridLines` must be true or false".into()))?)
+        }
+    };
+    if let Some(list) = &sort {
+        set_sort(s, folder, list)?;
+    }
+    let mut v = mail_view(s, folder);
+    let before = (v.group_by.clone(), v.expand);
+    if let Some(g) = groups {
+        v.group_by = g;
+    }
+    if let Some(e) = expand {
+        v.expand = e;
+    }
+    if let Some(n) = row_font {
+        v.other.row_font = n;
+    }
+    if let Some(n) = column_font {
+        v.other.column_font = n;
+    }
+    if let Some(on) = grid {
+        v.other.no_grid = !on;
+    }
+    let regroup = (v.group_by.clone(), v.expand) != before;
+    store_view(s, folder, &v);
+    if regroup {
+        super::modules::clear_groups(s, folder);
+        open_groups(s, folder);
+    }
+    Ok(summary(s, folder))
 }
 
 impl MailView {
@@ -570,6 +820,22 @@ impl MailView {
         self.rules = self.rules.map(|r| r.into_iter().filter_map(sanitize_rule).take(MAX_RULES).collect());
         self.filter = self.filter.map(CustomFilter::sanitized).filter(|f| !f.is_empty());
         self.name = clip(self.name.trim(), MAX_NAME);
+        let mut seen: Vec<ArrangeBy> = Vec::new();
+        self.then_by.retain(|f| {
+            let fresh = !seen.contains(&f.key);
+            seen.push(f.key);
+            fresh
+        });
+        self.then_by.truncate(MAX_SORT_KEYS.saturating_sub(1));
+        let mut seen: Vec<ArrangeBy> = Vec::new();
+        self.group_by.retain(|f| {
+            let fresh = !seen.contains(&f.key);
+            seen.push(f.key);
+            fresh
+        });
+        self.group_by.truncate(MAX_GROUP_LEVELS);
+        self.other = std::mem::take(&mut self.other).sanitized();
+        self.other.auto_preview = false;
         if self.columns.iter().map(String::as_str).eq(DEFAULT_COLUMNS) {
             self.columns.clear();
         }
@@ -749,6 +1015,43 @@ pub fn cell_text(s: &Session, m: &MailItem, id: &str, format: &str) -> String {
         }
         .to_owned(),
         "inFolder" => s.mailbox.folder(m.folder).map(|f| f.name.clone()).unwrap_or_default(),
+        "bcc" => person_text(&m.bcc.iter().collect::<Vec<_>>(), format),
+        "replyTo" => person_text(&m.reply_to.iter().collect::<Vec<_>>(), format),
+        "sender" => person_text(&m.sender.iter().chain(m.from.iter()).take(1).collect::<Vec<_>>(), format),
+        "read" => if m.read { "Yes" } else { "No" }.to_owned(),
+        "conversation" => mailcraft_model::subject::strip_prefixes(&m.subject).trim().to_owned(),
+        "messageClass" => message_class(m).to_owned(),
+        "followUpFlag" => match &m.flag {
+            FlagState::Flagged { label, .. } if label.trim().is_empty() => "Follow up".to_owned(),
+            FlagState::Flagged { label, .. } => label.chars().take(MAX_TEXT).collect(),
+            FlagState::Complete { .. } => "Completed".to_owned(),
+            FlagState::None => String::new(),
+        },
+        "flagCompleted" => date_text(
+            s,
+            match &m.flag {
+                FlagState::Complete { completed } => *completed,
+                _ => None,
+            },
+            format,
+        ),
+        "response" => match m.response {
+            mailcraft_model::ResponseState::None => "",
+            mailcraft_model::ResponseState::Replied(_) => "Replied",
+            mailcraft_model::ResponseState::RepliedAll(_) => "Replied to All",
+            mailcraft_model::ResponseState::Forwarded(_) => "Forwarded",
+        }
+        .to_owned(),
+        "responseTime" => date_text(
+            s,
+            match m.response {
+                mailcraft_model::ResponseState::None => None,
+                mailcraft_model::ResponseState::Replied(t)
+                | mailcraft_model::ResponseState::RepliedAll(t)
+                | mailcraft_model::ResponseState::Forwarded(t) => Some(t),
+            },
+            format,
+        ),
         "importance" if format == "text" => match m.importance {
             Importance::High => "High",
             Importance::Normal => "",
@@ -988,7 +1291,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "View › Current View › View Settings › Columns",
             r#"{"columns"?:[string],"add"?:string,"remove"?:string,"widths"?:{string:number|null},"reset"?:bool}"#,
             false,
-            mail_or_table,
+            mail_or_columns,
             set_columns,
         ),
         spec(
@@ -997,7 +1300,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "View › Current View › View Settings › Format Columns",
             r#"{"column"?:string,"label"?:string,"format"?:string,"align"?:"left"|"center"|"right"}"#,
             false,
-            mail_or_table,
+            mail_or_formats,
             format_columns,
         ),
         spec(
@@ -1006,7 +1309,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "View › Current View › View Settings › Conditional Formatting",
             r#"{"rules"?:[{"name":string,"on":bool,"kind":"unread"|"overdue"|"expired"|"completed"|"custom","condition"?:object,"font"?:{"bold"?:bool,"italic"?:bool,"underline"?:bool,"strike"?:bool,"color"?:string}}],"reset"?:bool} (module tables: overdue, completed and custom rules)"#,
             false,
-            mail_or_table,
+            mail_or_settings,
             conditional_formatting,
         ),
         spec(
@@ -1015,7 +1318,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "View › Current View › View Settings › Filter",
             r#"{"filter"?:{"words"?:string,"inBody"?:bool,"from"?:string,"sentTo"?:string,"read"?:"unread"|"read","importance"?:"high"|"normal"|"low","hasAttachments"?:bool,"flagged"?:bool,"category"?:string,"days"?:number}|null} (module tables: words, inBody, importance, flagged, category, days = modified)"#,
             false,
-            mail_or_table,
+            mail_or_settings,
             custom_filter_cmd,
         ),
     ]
@@ -1033,6 +1336,30 @@ pub(super) fn mail_list(s: &Session) -> Option<&'static str> {
 /// Mail and search folders, and the module tables (People Phone and List, the Tasks views).
 pub(super) fn mail_or_table(s: &Session) -> Option<&'static str> {
     if super::table::table_here(s).is_some() { None } else { mail_list(s) }
+}
+
+/// Show Columns: mail and search folders, the module tables and the People Card view (its card fields).
+fn mail_or_columns(s: &Session) -> Option<&'static str> {
+    if super::table::columns_here(s).is_some() { None } else { mail_list(s) }
+}
+
+/// Filter and Conditional Formatting: mail and search folders and every People and Tasks view.
+fn mail_or_settings(s: &Session) -> Option<&'static str> {
+    if super::table::settings_here(s).is_some() { None } else { mail_list(s) }
+}
+
+/// Format Columns: mail and search folders, the module tables and the Notes tables.
+fn mail_or_formats(s: &Session) -> Option<&'static str> {
+    if notes_table_here(s).is_some() { None } else { mail_or_table(s) }
+}
+
+/// The selected folder when it is a notes folder showing a table (Notes List, Last 7 Days).
+fn notes_table_here(s: &Session) -> Option<FolderId> {
+    let folder = s.selection.folder;
+    match super::modules::current(s, folder) {
+        Some((super::modules::ModuleKind::Notes, st)) if st.view != "Icon" => Some(folder),
+        _ => None,
+    }
 }
 
 /// `folder` is a mail or search folder (it has a mail view).
@@ -1057,14 +1384,18 @@ fn columns_json(s: &Session, folder: FolderId) -> Value {
     json!({
         "columns": shown,
         "widths": v.widths,
-        "available": COLUMNS.iter().map(|c| json!({"id": c.id, "label": c.label})).collect::<Vec<_>>(),
+        "available": COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(i, c)| json!({"id": c.id, "label": c.label, "frequent": i < FREQUENT_COLUMNS}))
+            .collect::<Vec<_>>(),
     })
 }
 
 /// `view.columns`: sets the folder's columns (`columns`: the shown ids in order; `add` / `remove` one;
 /// `widths`: px per column, null back to automatic; `reset`: the default columns and widths).
 fn set_columns(s: &mut Session, p: &Value) -> CmdResult {
-    if let Some((folder, kind, _)) = super::table::table_here(s) {
+    if let Some((folder, kind, _)) = super::table::columns_here(s) {
         return super::table::set_columns(s, folder, kind, p);
     }
     let folder = mail_folder(s)?;
@@ -1163,6 +1494,9 @@ fn format_columns(s: &mut Session, p: &Value) -> CmdResult {
     if let Some((folder, kind, _)) = super::table::table_here(s) {
         return super::table::format_columns(s, folder, kind, p);
     }
+    if let Some(folder) = notes_table_here(s) {
+        return super::modules::note_format_columns(s, folder, p);
+    }
     let folder = mail_folder(s)?;
     let Some(id) = opt_str(p, "column") else {
         let params = formats_json(s, folder);
@@ -1222,7 +1556,7 @@ fn format_columns(s: &mut Session, p: &Value) -> CmdResult {
 /// `view.conditionalFormatting`: without `rules` (or `reset`) the Conditional Formatting dialog opens;
 /// `rules` replaces the folder's rules, `reset` restores the defaults.
 fn conditional_formatting(s: &mut Session, p: &Value) -> CmdResult {
-    if let Some((folder, kind, _)) = super::table::table_here(s) {
+    if let Some((folder, kind, _)) = super::table::settings_here(s) {
         return super::table::set_rules(s, folder, kind, p);
     }
     let folder = mail_folder(s)?;
@@ -1256,7 +1590,7 @@ fn conditional_formatting(s: &mut Session, p: &Value) -> CmdResult {
 /// `view.customFilter`: without `filter` the Filter dialog opens; `filter` sets the View Settings filter
 /// (null or an empty filter turns it off).
 fn custom_filter_cmd(s: &mut Session, p: &Value) -> CmdResult {
-    if let Some((folder, kind, _)) = super::table::table_here(s) {
+    if let Some((folder, kind, _)) = super::table::settings_here(s) {
         return super::table::set_filter(s, folder, kind, p);
     }
     let folder = mail_folder(s)?;
@@ -1409,6 +1743,7 @@ fn apply_saved(s: &mut Session, folder: FolderId, saved: &SavedView) {
     v.name = saved.name.clone();
     store_view(s, folder, &v);
     super::modules::clear_groups(s, folder);
+    open_groups(s, folder);
 }
 
 /// `view.changeView` with the name of a saved view usable in this folder (`None` = no such view).
@@ -1561,17 +1896,41 @@ fn rename_in_folders(s: &mut Session, old: &str, new: &str) {
     }
 }
 
+/// View Settings summary of the folder's mail view, for the dialogs (see [`summary`]).
+pub fn summary_of(s: &Session, folder: FolderId) -> Value {
+    summary(s, folder)
+}
+
 /// View Settings summary of the folder's mail view (the dialog's descriptions).
 pub(super) fn summary(s: &Session, folder: FolderId) -> Value {
     let cols: Vec<String> = columns(s, folder).into_iter().map(|c| c.label).collect();
     let rules = rules(s, folder);
     let on = rules.iter().filter(|r| r.on).count();
+    let v = mail_view(s, folder);
+    let vs = settings(s, folder);
+    let group = if !vs.show_in_groups {
+        "Off".to_owned()
+    } else if v.group_by.is_empty() {
+        format!("{} (automatic)", vs.arrange_by.label())
+    } else {
+        describe_mail_fields(&v.group_by)
+    };
+    let keys = sort_keys(s, folder);
     json!({
         "columns": cols,
         "filter": custom_filter(s, folder).unwrap_or_default().describe(),
         "rules": format!("{on} of {} rules on", rules.len()),
-        "formats": mail_view(s, folder).formats.len(),
+        "formats": v.formats.len(),
         "view": current_view_name(s, folder),
+        "group": group,
+        "groupBy": mail_fields_json(&v.group_by),
+        "sort": describe_mail_fields(&keys),
+        "sortBy": mail_fields_json(&keys),
+        "expandGroups": v.expand.key(),
+        "other": v.other.describe(),
+        "rowFont": v.other.row_font,
+        "columnFont": v.other.column_font,
+        "gridLines": !v.other.no_grid,
     })
 }
 

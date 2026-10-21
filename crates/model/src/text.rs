@@ -129,7 +129,8 @@ fn find_close_tag(hay: &str, name: &str) -> Option<usize> {
     None
 }
 
-fn truncate_at_char(s: &str, max: usize) -> &str {
+/// The first `max` bytes of `s`, cut back to a character boundary.
+pub fn truncate_at_char(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }

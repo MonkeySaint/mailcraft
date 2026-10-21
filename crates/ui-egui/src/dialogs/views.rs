@@ -98,16 +98,19 @@ fn advanced(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             let fixed = "Not available in this view".to_owned();
             (fixed.clone(), fixed.clone(), fixed.clone(), fixed)
         };
+        let summary = if mail { mailview_summary(app, folder) } else { Value::Null };
+        let group = summary.get("group").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| {
+            if v.show_in_groups { format!("{} (automatic)", v.arrange_by.label()) } else { "Off".into() }
+        });
+        let sort_text = summary
+            .get("sort")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{} ({order})", v.arrange_by.label()));
         let rows: [(&str, &str, &str, String, bool); 7] = [
             ("Columns...", "showColumns", "", cols, mail),
-            (
-                "Group By...",
-                "viewGroupBy",
-                "",
-                if v.show_in_groups { format!("{} (automatic)", v.arrange_by.label()) } else { "Off".into() },
-                true,
-            ),
-            ("Sort...", "viewSort", "", format!("{} ({order})", v.arrange_by.label()), true),
+            ("Group By...", "viewGroupBy", "", group, true),
+            ("Sort...", "viewSort", "", sort_text, true),
             ("Filter...", "viewFilter", "", filter, mail),
             (
                 "Other Settings...",
@@ -160,48 +163,129 @@ fn advanced(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
-#[derive(Clone, Default)]
-struct SortState {
+/// One level of Sort or Group By: the field picked (an index into the dialog's choices, 0 = "(none)") and
+/// its direction.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Level {
     key: usize,
     desc: bool,
 }
 
+/// Sort and Group By keep at most this many levels (Sort items by / Group items by, then three Then by).
+const LEVELS: usize = mailcraft_model::view::MAX_SORT_KEYS;
+
+/// The level rows of Sort or Group By: `first` names the first row ("Sort items by"), the others read "Then
+/// by". `choices` starts with "(none)"; a row after an empty one is greyed out. Returns the levels picked,
+/// in order (choice index, descending).
+fn levels_ui(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug + Copy,
+    levels: &mut [Level],
+    choices: &[&str],
+    first: &str,
+    enabled: bool,
+) {
+    let mut open = enabled;
+    egui::Grid::new(("levels", id)).num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
+        for (i, l) in levels.iter_mut().enumerate() {
+            ui.label(if i == 0 { first } else { "Then by" });
+            ui.add_enabled_ui(open, |ui| {
+                common::combo_idx(ui, ("level", id, i), &mut l.key, choices, 200.0);
+            });
+            ui.add_enabled_ui(open && l.key > 0, |ui| {
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut l.desc, false, "Ascending");
+                    ui.radio_value(&mut l.desc, true, "Descending");
+                });
+            });
+            ui.end_row();
+            open &= l.key > 0;
+        }
+    });
+}
+
+/// The levels in effect: the rows up to the first empty one.
+fn picked(levels: &[Level]) -> Vec<Level> {
+    levels.iter().take_while(|l| l.key > 0).copied().collect()
+}
+
+/// `count` rows filled from `(choice index, descending)` pairs.
+fn levels_from(start: impl IntoIterator<Item = (usize, bool)>) -> Vec<Level> {
+    let mut out: Vec<Level> = start
+        .into_iter()
+        .filter(|(k, _)| *k > 0)
+        .map(|(key, desc)| Level { key, desc })
+        .take(LEVELS)
+        .collect();
+    out.resize(LEVELS, Level::default());
+    out
+}
+
+/// A `[{"field", "dir"}]` list of the levels picked (`keys[i - 1]` is the field of choice `i`).
+fn levels_json(levels: &[Level], keys: &[&str]) -> Value {
+    Value::Array(
+        picked(levels)
+            .into_iter()
+            .filter_map(|l| {
+                let key = keys.get(l.key.checked_sub(1)?)?;
+                Some(json!({"field": key, "dir": if l.desc { "desc" } else { "asc" }}))
+            })
+            .collect(),
+    )
+}
+
+/// `(choice index, descending)` of each `{"field", "dir"}` of a summary list (`keys[i - 1]` is choice `i`).
+fn levels_of(list: &Value, keys: &[&str]) -> Vec<(usize, bool)> {
+    list.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| {
+                    let field = f.get("field")?.as_str()?;
+                    let i = keys.iter().position(|k| k.eq_ignore_ascii_case(field))?;
+                    Some((i + 1, f.get("dir").and_then(Value::as_str) == Some("desc")))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const EXPAND_CHOICES: [(&str, &str); 3] =
+    [("expanded", "All expanded"), ("collapsed", "All collapsed"), ("lastViewed", "As last viewed")];
+
+#[derive(Clone, Default)]
+struct SortState {
+    levels: Vec<Level>,
+}
+
+/// Sort: up to four keys (Sort items by, then by…), each ascending or descending. In a mail folder the first
+/// key is the arrangement; People and Tasks views sort by their columns (`view.sortBy` with `fields`).
 fn sort(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    if let Some((_, kind, _)) = table::table_here(&app.s) {
+    if let Some((_, kind, _)) = table::settings_here(&app.s) {
         return module_sort(ctx, app, d, kind);
     }
     let uid = d.uid;
     let folder = folder_of(app, d);
     let init = |a: &App| {
-        let v = view_settings(&a.s, folder);
-        SortState {
-            key: ArrangeBy::ALL.iter().position(|x| *x == v.arrange_by).unwrap_or(0),
-            desc: v.order == SortOrder::Descending,
-        }
+        let keys = mailview::sort_keys(&a.s, folder);
+        let start = keys
+            .iter()
+            .filter_map(|f| ArrangeBy::ALL.iter().position(|x| *x == f.key).map(|i| (i + 1, f.descending)));
+        SortState { levels: levels_from(start) }
     };
     with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Sort", 380.0, |ui, app| {
-            ui.label("Sort items by");
-            let labels: Vec<&str> = ArrangeBy::ALL.iter().map(|a| a.label()).collect();
-            ui.horizontal(|ui| {
-                common::combo_idx(ui, ("sortk", uid), &mut st.key, &labels, 180.0);
-                ui.vertical(|ui| {
-                    ui.radio_value(&mut st.desc, false, "Ascending");
-                    ui.radio_value(&mut st.desc, true, "Descending");
-                });
-            });
-            match ok_cancel(ui, app, true) {
+        window(ctx, app, d, "Sort", 520.0, |ui, app| {
+            let mut choices: Vec<&str> = vec!["(none)"];
+            choices.extend(ArrangeBy::ALL.iter().map(|a| a.label()));
+            levels_ui(ui, uid, &mut st.levels, &choices, "Sort items by", true);
+            muted(ui, app, "The first key is the list's arrangement; the others order items it leaves tied.");
+            match ok_cancel(ui, app, st.levels.first().is_some_and(|l| l.key > 0)) {
                 Some(true) => {
-                    let v = view_settings(&app.s, folder);
-                    let key = ARRANGE_KEYS.get(st.key).copied().unwrap_or("date");
-                    if ArrangeBy::ALL.get(st.key) != Some(&v.arrange_by) {
-                        app.run("view.arrangeBy", json!({"key": key}));
+                    let fields = levels_json(&st.levels, &ARRANGE_KEYS);
+                    if app.run("view.sortBy", json!({ "fields": fields })).is_some() {
+                        Out::Close
+                    } else {
+                        Out::Keep
                     }
-                    let now = view_settings(&app.s, folder);
-                    if (now.order == SortOrder::Descending) != st.desc {
-                        app.run("view.sortOrder", json!({"dir": if st.desc { "desc" } else { "asc" }}));
-                    }
-                    Out::Close
                 }
                 Some(false) => Out::Close,
                 None => Out::Keep,
@@ -211,36 +295,91 @@ fn sort(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 #[derive(Clone, Default)]
-struct OnState {
-    on: bool,
+struct GroupState {
+    /// "Automatically group according to arrangement".
+    auto: bool,
+    levels: Vec<Level>,
+    /// Index into [`EXPAND_CHOICES`].
+    expand: usize,
 }
 
+/// Group By: automatically by the arrangement, or by up to four fields nested in each other (each ascending
+/// or descending), with how the groups show when the view opens (`view.viewSettings` with `groupBy` and
+/// `expandGroups`). People and Tasks views group by their columns.
 fn group_by(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = folder_of(app, d);
-    with_state(
-        ctx,
-        app,
-        uid,
-        |a: &App| OnState { on: view_settings(&a.s, folder).show_in_groups },
-        |st, app| {
-            window(ctx, app, d, "Group By", 380.0, |ui, app| {
-                ui.checkbox(&mut st.on, "Automatically group according to arrangement");
-                let v = view_settings(&app.s, folder);
-                muted(ui, app, &format!("Items are arranged by {}.", v.arrange_by.label()));
-                match ok_cancel(ui, app, true) {
-                    Some(true) => {
-                        if view_settings(&app.s, folder).show_in_groups != st.on {
-                            app.run("view.showInGroups", json!({}));
-                        }
-                        Out::Close
+    let module = table::settings_here(&app.s).map(|(_, kind, st)| (kind, st));
+    let keys: Vec<&'static str> = match &module {
+        Some((kind, _)) => table::available(*kind).iter().map(|c| c.id).collect(),
+        None => ARRANGE_KEYS.to_vec(),
+    };
+    let labels: Vec<&'static str> = match &module {
+        Some((kind, _)) => table::available(*kind).iter().map(|c| c.label).collect(),
+        None => ArrangeBy::ALL.iter().map(|a| a.label()).collect(),
+    };
+    let summary = match &module {
+        Some((kind, st)) => table::summary(folder, *kind, st),
+        None => mailview_summary(app, folder),
+    };
+    let arranged = match &module {
+        Some((kind, st)) => st
+            .arrangement(*kind)
+            .map(|a| mailcraft_engine::cmd::view::modules::arrange_label(*kind, a).to_owned())
+            .filter(|l| !l.is_empty()),
+        None => Some(view_settings(&app.s, folder).arrange_by.label().to_owned()),
+    };
+    let init = |a: &App| {
+        let start = levels_of(summary.get("groupBy").unwrap_or(&Value::Null), &keys);
+        let on = view_settings(&a.s, folder).show_in_groups;
+        let expand = EXPAND_CHOICES
+            .iter()
+            .position(|(k, _)| Some(*k) == summary.get("expandGroups").and_then(Value::as_str))
+            .unwrap_or(0);
+        GroupState { auto: on && start.is_empty(), levels: levels_from(start), expand }
+    };
+    with_state(ctx, app, uid, init, |st, app| {
+        window(ctx, app, d, "Group By", 540.0, |ui, app| {
+            ui.checkbox(&mut st.auto, "Automatically group according to arrangement");
+            match &arranged {
+                Some(a) => muted(ui, app, &format!("Items are arranged by {a}.")),
+                None => muted(ui, app, "This view has no arrangement of its own."),
+            }
+            let mut choices: Vec<&str> = vec!["(none)"];
+            choices.extend(labels.iter().copied());
+            levels_ui(ui, uid, &mut st.levels, &choices, "Group items by", !st.auto);
+            ui.horizontal(|ui| {
+                ui.label("Expand/collapse defaults:");
+                let names: Vec<&str> = EXPAND_CHOICES.iter().map(|x| x.1).collect();
+                ui.add_enabled_ui(!st.auto, |ui| {
+                    common::combo_idx(ui, ("grp-expand", uid), &mut st.expand, &names, 160.0);
+                });
+            });
+            match ok_cancel(ui, app, true) {
+                Some(true) => {
+                    let fields = if st.auto { Value::Null } else { levels_json(&st.levels, &keys) };
+                    let expand = EXPAND_CHOICES.get(st.expand).map_or("expanded", |x| x.0);
+                    let grouped = st.auto || fields.as_array().is_some_and(|a| !a.is_empty());
+                    let fields = if grouped { fields } else { Value::Null };
+                    let ok = app
+                        .run("view.viewSettings", json!({ "groupBy": fields, "expandGroups": expand }))
+                        .is_some();
+                    // No fields and no automatic groups: the view shows no groups.
+                    if ok && view_settings(&app.s, folder).show_in_groups != grouped {
+                        app.run("view.showInGroups", json!({}));
                     }
-                    Some(false) => Out::Close,
-                    None => Out::Keep,
+                    if ok { Out::Close } else { Out::Keep }
                 }
-            })
-        },
-    )
+                Some(false) => Out::Close,
+                None => Out::Keep,
+            }
+        })
+    })
+}
+
+/// The mail view summary of `folder` (what View Settings shows), from the engine.
+fn mailview_summary(app: &App, folder: FolderId) -> Value {
+    mailcraft_engine::cmd::view::mail::summary_of(&app.s, folder)
 }
 
 #[derive(Clone, Default)]
@@ -255,7 +394,7 @@ const IMPORTANCE_CHOICES: [(&str, &str); 4] =
 
 /// View Settings › Filter: the conditions an item must meet to show in this view (`view.customFilter`).
 fn filter(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    if let Some((_, kind, _)) = table::table_here(&app.s) {
+    if let Some((_, kind, _)) = table::settings_here(&app.s) {
         return module_filter(ctx, app, d, kind);
     }
     let uid = d.uid;
@@ -350,6 +489,9 @@ struct OtherState {
 }
 
 fn other(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    if let Some((_, kind, _)) = table::settings_here(&app.s) {
+        return module_other(ctx, app, d, kind);
+    }
     let uid = d.uid;
     let folder = folder_of(app, d);
     let init = |a: &App| {
@@ -452,7 +594,7 @@ fn rule_condition_text(r: &FormatRule) -> String {
 /// Conditional Formatting: rules that change the font of matching rows, applied top to bottom
 /// (`view.conditionalFormatting`). The built-in rules can be turned off but not removed.
 fn rules(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    if let Some((_, kind, _)) = table::table_here(&app.s) {
+    if let Some((_, kind, _)) = table::settings_here(&app.s) {
         return module_rules(ctx, app, d, kind);
     }
     let uid = d.uid;
@@ -613,6 +755,26 @@ fn format_columns(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = app.s.selection.folder;
     let init = |a: &App| {
+        if let Some((mailcraft_engine::cmd::view::modules::ModuleKind::Notes, st)) =
+            mailcraft_engine::cmd::view::modules::current(&a.s, folder)
+        {
+            // Notes tables: label and alignment of their columns.
+            return FormatState {
+                cols: mailcraft_engine::cmd::view::modules::note_shown(&st)
+                    .into_iter()
+                    .map(|(id, label, align)| ColFormat {
+                        id: id.to_owned(),
+                        default_label: mailcraft_engine::cmd::view::modules::note_column_label(id).to_owned(),
+                        formats: vec![("text".to_owned(), "Text".to_owned())],
+                        start: (label.clone(), "text".to_owned(), align.to_owned()),
+                        label,
+                        format: "text".to_owned(),
+                        align: align.to_owned(),
+                    })
+                    .collect(),
+                pick: 0,
+            };
+        }
         if table::table_here(&a.s).is_some() {
             // Module tables: label and alignment only (one display format).
             return FormatState {
@@ -723,6 +885,8 @@ struct ColState {
     start_widths: Vec<(String, u16)>,
     pick_avail: Option<String>,
     pick_shown: Option<usize>,
+    /// Field set the available columns come from (index into `FIELD_SETS`).
+    set: usize,
 }
 
 fn col_label(id: &str) -> &'static str {
@@ -734,7 +898,7 @@ fn col_label(id: &str) -> &'static str {
 fn columns(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = app.s.selection.folder;
-    if let Some((_, kind, _)) = table::table_here(&app.s) {
+    if let Some((_, kind, _)) = table::columns_here(&app.s) {
         return module_columns(ctx, app, d, kind);
     }
     if !mailview::mail_list_folder(&app.s, folder) {
@@ -759,12 +923,30 @@ fn columns(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(170.0);
+                    // Select available columns from: a field set (the frequently used fields, or every mail
+                    // field).
+                    ui.label("Select available columns from:");
+                    let sets: Vec<&str> = mailview::FIELD_SETS.iter().map(|x| x.1).collect();
+                    common::combo_idx(ui, ("cols-set", uid), &mut st.set, &sets, 165.0);
+                    let n = mailview::FIELD_SETS.get(st.set).map_or(mailview::COLUMNS.len(), |x| x.2);
                     ui.label("Available columns:");
-                    for c in mailview::COLUMNS.iter().filter(|c| !st.shown.iter().any(|s| s == c.id)) {
-                        if ui.selectable_label(st.pick_avail.as_deref() == Some(c.id), c.label).clicked() {
-                            st.pick_avail = Some(c.id.to_owned());
-                        }
-                    }
+                    egui::ScrollArea::vertical().id_salt(("cols-avail", uid)).max_height(300.0).show(
+                        ui,
+                        |ui| {
+                            for c in mailview::COLUMNS
+                                .iter()
+                                .take(n)
+                                .filter(|c| !st.shown.iter().any(|s| s == c.id))
+                            {
+                                if ui
+                                    .selectable_label(st.pick_avail.as_deref() == Some(c.id), c.label)
+                                    .clicked()
+                                {
+                                    st.pick_avail = Some(c.id.to_owned());
+                                }
+                            }
+                        },
+                    );
                 });
                 ui.vertical(|ui| {
                     if btn_en(ui, st.pick_avail.is_some() && st.shown.len() < mailview::MAX_COLUMNS, "Add ->")
@@ -1506,6 +1688,116 @@ mod tests {
         h.run_steps(3);
     }
 
+    /// Opens a dialog of the UI's own (Sort, Group By, Other Settings) as View Settings' buttons do.
+    fn open_ui(h: &mut Harness<'static, App>, name: &str) {
+        let folder = h.state().s.selection.folder.0;
+        crate::dialogs::open(h.state_mut(), name, json!({ "folder": folder }));
+        h.run_steps(3);
+    }
+
+    #[test]
+    fn group_by_dialog_turns_automatic_groups_off_and_on() {
+        let mut h = harness();
+        let folder = h.state().s.selection.folder;
+        let shown = |h: &Harness<'static, App>| super::view_settings(&h.state().s, folder).show_in_groups;
+        assert!(shown(&h));
+        open_ui(&mut h, "viewGroupBy");
+        assert!(h.query_by_label("Group items by").is_some());
+        assert_eq!(h.query_all_by_label("Then by").count(), 3);
+        // Automatic grouping off and no field: the list shows no groups.
+        h.get_by_label("Automatically group according to arrangement").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        assert!(!shown(&h));
+        open_ui(&mut h, "viewGroupBy");
+        h.get_by_label("Automatically group according to arrangement").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        assert!(shown(&h));
+    }
+
+    #[test]
+    fn sort_dialog_keeps_the_then_by_keys() {
+        let mut h = harness();
+        let folder = h.state().s.selection.folder;
+        h.state_mut()
+            .run("view.sortBy", json!({"fields": [{"field": "from"}, {"field": "size", "dir": "desc"}]}))
+            .unwrap();
+        open_ui(&mut h, "viewSort");
+        assert!(h.query_by_label("Sort items by").is_some());
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        let keys = mailview::sort_keys(&h.state().s, folder);
+        assert_eq!(keys.len(), 2, "OK keeps the keys the dialog showed");
+        assert!(keys.get(1).is_some_and(|k| k.descending));
+    }
+
+    #[test]
+    fn level_helpers_round_trip() {
+        let keys = ["date", "from", "size"];
+        let levels = super::levels_from(vec![(2, false), (3, true), (0, false)]);
+        assert_eq!(levels.len(), super::LEVELS);
+        assert_eq!(super::picked(&levels).len(), 2);
+        let j = super::levels_json(&levels, &keys);
+        assert_eq!(j, json!([{"field": "from", "dir": "asc"}, {"field": "size", "dir": "desc"}]));
+        assert_eq!(super::levels_of(&j, &keys), vec![(2, false), (3, true)]);
+        // A gap ends the list; unknown fields are skipped.
+        let gap = [
+            super::Level { key: 1, desc: false },
+            super::Level::default(),
+            super::Level { key: 2, desc: true },
+        ];
+        assert_eq!(super::picked(&gap).len(), 1);
+        assert!(super::levels_of(&json!([{"field": "nope"}]), &keys).is_empty());
+    }
+
+    #[test]
+    fn show_columns_offers_every_mail_field_on_request() {
+        let mut h = harness();
+        open(&mut h, "view.addColumns", json!({}));
+        assert!(h.query_by_label("Message Class").is_none(), "frequently used fields first");
+        assert!(h.query_by_label("Select available columns from:").is_some());
+        // Switching the field set to every mail field offers the rest, and they can be added.
+        let combo = h.query_all_by_role(egui::accesskit::Role::ComboBox).next().unwrap();
+        combo.click();
+        h.run_steps(2);
+        h.get_by_label("All Mail fields").click();
+        h.run_steps(2);
+        h.get_by_label("Message Class").click();
+        h.run();
+        h.get_by_label("Add ->").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        let s = &h.state().s;
+        let ids: Vec<&str> = mailview::columns(s, s.selection.folder).iter().map(|c| c.id).collect();
+        assert_eq!(ids.last(), Some(&"messageClass"));
+    }
+
+    /// A font size set outside the dialog (a command, the CLI) that the list does not offer shows as it is,
+    /// and OK keeps it rather than putting the default back.
+    #[test]
+    fn other_settings_keeps_a_font_size_it_does_not_list() {
+        let mut h = harness();
+        let s = &mut h.state_mut().s;
+        let tasks =
+            s.mailbox.folders.values().find(|f| f.kind == mailcraft_model::FolderKind::Tasks).unwrap().id;
+        s.run("nav.selectFolder", &json!({"folder": tasks.0})).unwrap();
+        s.run("view.changeView", &json!({"name": "Simple List"})).unwrap();
+        s.run("view.viewSettings", &json!({"rowFont": 13, "columnFont": 15})).unwrap();
+        h.run_steps(2);
+        open_ui(&mut h, "viewOtherSettings");
+        let shown: Vec<String> =
+            h.query_all_by_role(egui::accesskit::Role::ComboBox).filter_map(|c| c.value()).collect();
+        assert_eq!(shown, ["15 pt", "13 pt"], "column and row fonts show as set");
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        let o = mailcraft_engine::cmd::view::table::other(&h.state().s, tasks);
+        assert_eq!((o.row_font, o.column_font), (13, 15), "OK keeps both sizes");
+    }
+
     #[test]
     fn show_columns_adds_a_column() {
         let mut h = harness();
@@ -1722,46 +2014,120 @@ fn module_columns(ctx: &Context, app: &mut App, d: &Dlg<'_>, kind: ModuleKind) -
     })
 }
 
-#[derive(Clone, Default)]
-struct ModuleSortState {
-    /// Index into the choices (0 = the view's own order).
-    key: usize,
-    desc: bool,
-}
-
-/// Sort for a module table: a column (or the view's own order) and the direction (`view.sortBy`).
+/// Sort for a People or Tasks view: up to four columns (Sort items by, then by…), each ascending or
+/// descending; none = the view's own order (`view.sortBy` with `fields`).
 fn module_sort(ctx: &Context, app: &mut App, d: &Dlg<'_>, kind: ModuleKind) -> Out {
     let uid = d.uid;
     let folder = app.s.selection.folder;
     let cols = table::available(kind);
-    let init = |a: &App| match table::sort(&a.s, folder) {
-        Some(f) => ModuleSortState {
-            key: cols.iter().position(|c| c.id == f.column).map_or(0, |i| i + 1),
-            desc: f.descending,
-        },
-        None => ModuleSortState::default(),
+    let keys: Vec<&'static str> = cols.iter().map(|c| c.id).collect();
+    let init = |a: &App| {
+        let start = mailcraft_engine::cmd::view::modules::current(&a.s, folder)
+            .map(|(_, st)| table::sort_keys(&table::custom(&st)))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|f| keys.iter().position(|k| *k == f.column).map(|i| (i + 1, f.descending)))
+            .collect::<Vec<_>>();
+        SortState { levels: levels_from(start) }
     };
     with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Sort", 380.0, |ui, app| {
-            ui.label("Sort items by");
+        window(ctx, app, d, "Sort", 520.0, |ui, app| {
             let mut labels: Vec<&str> = vec!["(the view's own order)"];
             labels.extend(cols.iter().map(|c| c.label));
-            ui.horizontal(|ui| {
-                common::combo_idx(ui, ("msortk", uid), &mut st.key, &labels, 200.0);
-                ui.add_enabled_ui(st.key > 0, |ui| {
-                    ui.vertical(|ui| {
-                        ui.radio_value(&mut st.desc, false, "Ascending");
-                        ui.radio_value(&mut st.desc, true, "Descending");
-                    });
-                });
-            });
+            levels_ui(ui, uid, &mut st.levels, &labels, "Sort items by", true);
             muted(ui, app, "Items sort inside their groups; Reverse Sort turns the whole list around.");
             match ok_cancel(ui, app, true) {
                 Some(true) => {
-                    let field = st.key.checked_sub(1).and_then(|i| cols.get(i)).map(|c| c.id);
-                    let dir = if st.desc { "desc" } else { "asc" };
-                    app.run("view.sortBy", json!({"field": field, "dir": dir}));
-                    Out::Close
+                    let fields = levels_json(&st.levels, &keys);
+                    if app.run("view.sortBy", json!({ "fields": fields })).is_some() {
+                        Out::Close
+                    } else {
+                        Out::Keep
+                    }
+                }
+                Some(false) => Out::Close,
+                None => Out::Keep,
+            }
+        })
+    })
+}
+
+/// Font sizes Other Settings offers (0 = the view's own).
+const FONT_SIZES: [u8; 11] = [0, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24];
+
+fn font_label(pt: u8) -> String {
+    if pt == 0 { "Default".to_owned() } else { format!("{pt} pt") }
+}
+
+#[derive(Clone, Default)]
+struct ModuleOtherState {
+    /// The sizes offered: [`FONT_SIZES`] plus a size set elsewhere (a command, the CLI) that is not among
+    /// them, so the dialog shows it and OK keeps it.
+    sizes: Vec<u8>,
+    row_font: usize,
+    column_font: usize,
+    grid: bool,
+    preview: bool,
+}
+
+/// Other Settings for a People or Tasks view: the fonts of the rows and column headings, grid lines and
+/// AutoPreview (the Tasks views show it as their message preview) (`view.viewSettings`).
+fn module_other(ctx: &Context, app: &mut App, d: &Dlg<'_>, kind: ModuleKind) -> Out {
+    let uid = d.uid;
+    let folder = app.s.selection.folder;
+    let init = |a: &App| {
+        let st = mailcraft_engine::cmd::view::modules::current(&a.s, folder).map(|(_, st)| st);
+        let o = table::other(&a.s, folder);
+        let mut sizes = FONT_SIZES.to_vec();
+        for pt in [o.row_font, o.column_font] {
+            if !sizes.contains(&pt) {
+                sizes.push(pt);
+            }
+        }
+        sizes.sort_unstable();
+        let at = |pt: u8| sizes.iter().position(|x| *x == pt).unwrap_or(0);
+        ModuleOtherState {
+            row_font: at(o.row_font),
+            column_font: at(o.column_font),
+            grid: !o.no_grid,
+            preview: if kind == ModuleKind::Tasks {
+                st.is_some_and(|s| s.preview_lines > 0)
+            } else {
+                o.auto_preview
+            },
+            sizes,
+        }
+    };
+    with_state(ctx, app, uid, init, |st, app| {
+        window(ctx, app, d, "Other Settings", 420.0, |ui, app| {
+            let sizes: Vec<String> = st.sizes.iter().map(|p| font_label(*p)).collect();
+            let sizes: Vec<&str> = sizes.iter().map(String::as_str).collect();
+            common::heading(ui, app, "Column headings and rows");
+            egui::Grid::new(("mod-other", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Column font:");
+                common::combo_idx(ui, ("mo-col", uid), &mut st.column_font, &sizes, 120.0);
+                ui.end_row();
+                ui.label("Row font:");
+                common::combo_idx(ui, ("mo-row", uid), &mut st.row_font, &sizes, 120.0);
+                ui.end_row();
+            });
+            common::heading(ui, app, "Grid lines and AutoPreview");
+            ui.checkbox(&mut st.grid, "Grid lines between rows");
+            let preview = if kind == ModuleKind::Tasks {
+                "AutoPreview (the task notes and message text under each row)"
+            } else {
+                "AutoPreview (the contact notes under each row)"
+            };
+            ui.checkbox(&mut st.preview, preview);
+            match ok_cancel(ui, app, true) {
+                Some(true) => {
+                    let p = json!({
+                        "rowFont": st.sizes.get(st.row_font).copied().unwrap_or(0),
+                        "columnFont": st.sizes.get(st.column_font).copied().unwrap_or(0),
+                        "gridLines": st.grid,
+                        "autoPreview": st.preview,
+                    });
+                    if app.run("view.viewSettings", p).is_some() { Out::Close } else { Out::Keep }
                 }
                 Some(false) => Out::Close,
                 None => Out::Keep,

@@ -953,17 +953,97 @@ fn new_data_file_asks_for_a_name() {
     app.run("file.newDataFile", json!({})).unwrap();
     let mut h = harness(app);
     assert_eq!(names(&h), ["newDataFile"]);
-    let field = h.get_by_label("File name:");
+    let field = h.get_by_label("Name:");
     field.focus();
     step(&mut h);
     h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
-    h.get_by_label("File name:").type_text("Receipts archive");
+    h.get_by_label("Name:").type_text("Receipts archive");
     step(&mut h);
     h.get_by_label("OK").click();
     step(&mut h);
     assert!(names(&h).is_empty());
     assert_eq!(h.state().s.mailbox.accounts.len(), before + 1);
     assert!(h.state().s.mailbox.accounts.iter().any(|a| a.display_name == "Receipts archive"));
+}
+
+#[test]
+fn new_data_file_saves_a_file_of_its_own_with_a_password() {
+    let dir = scratch_dir("newdatafile");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("Projects.mcdata");
+    let mut app = sample_app();
+    app.run("file.newDataFile", json!({})).unwrap();
+    let mut h = harness(app);
+    h.get_by_label("Save it as a file of its own").click();
+    step(&mut h);
+    h.get_by_label("File:").focus();
+    step(&mut h);
+    h.get_by_label("File:").type_text(file.to_str().unwrap());
+    h.get_by_label("Password (optional):").focus();
+    step(&mut h);
+    h.get_by_label("Password (optional):").type_text("pw-123");
+    h.get_by_label("Verify password:").focus();
+    step(&mut h);
+    h.get_by_label("Verify password:").type_text("pw-12");
+    step(&mut h);
+    assert!(h.query_by_label("The passwords do not match.").is_some());
+    h.get_by_label("Verify password:").type_text("3");
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", names(&h));
+    assert!(file.is_file(), "the file is written at once");
+    let bytes = std::fs::read(&file).unwrap();
+    assert!(mailcraft_engine::datafile::is_sealed(&bytes), "and encrypted");
+    let a = h.state().s.mailbox.accounts.iter().find(|a| a.data_file.is_some()).cloned().unwrap();
+    // Closing a protected file whose password is not kept asks for it in its own dialog.
+    h.state_mut().s.secrets.remove(&mailcraft_engine::datafile::secret_key(a.id)).unwrap();
+    h.state_mut().run("file.closeDataFile", json!({"store": a.id.0, "confirm": true}));
+    step(&mut h);
+    assert_eq!(names(&h), ["dataFilePassword"]);
+    h.get_by_label("Password:").focus();
+    step(&mut h);
+    h.get_by_label("Password:").type_text("pw-123");
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", names(&h));
+    assert!(h.state().s.mailbox.account(a.id).is_none(), "closed and written to its file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Closing a protected data file whose file is gone and whose password is not remembered: nothing can check
+/// the password, so the dialog asks for it twice and only a matching pair writes the file.
+#[test]
+fn closing_a_protected_data_file_without_its_file_asks_for_the_password_twice() {
+    let dir = scratch_dir("closegone");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("Gone.mcdata");
+    let mut app = sample_app();
+    app.run("file.newDataFile", json!({"path": file.to_str().unwrap(), "password": "pw-123"})).unwrap();
+    let id = app.s.mailbox.accounts.iter().find(|a| a.data_file.is_some()).map(|a| a.id).unwrap();
+    app.s.secrets.remove(&mailcraft_engine::datafile::secret_key(id)).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    app.run("file.closeDataFile", json!({"store": id.0, "confirm": true}));
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["dataFilePassword"]);
+    h.get_by_label("Password:").focus();
+    step(&mut h);
+    h.get_by_label("Password:").type_text("pw-123");
+    h.get_by_label("Verify password:").focus();
+    step(&mut h);
+    h.get_by_label("Verify password:").type_text("pw-12");
+    step(&mut h);
+    assert!(h.query_by_label("The passwords do not match.").is_some());
+    h.get_by_label("Verify password:").type_text("3");
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", names(&h));
+    assert!(h.state().s.mailbox.account(id).is_none(), "closed");
+    let bytes = std::fs::read(&file).unwrap();
+    assert!(mailcraft_engine::datafile::unseal(&bytes, "pw-123").is_ok(), "written under the typed password");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

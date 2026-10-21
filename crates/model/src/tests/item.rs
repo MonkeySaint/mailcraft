@@ -132,3 +132,17 @@ fn body_text_falls_back_to_html_when_text_is_blank() {
     let only_blank = MailItem { body: Body { text: Some("  ".into()), ..Default::default() }, ..mail("x") };
     assert_eq!(only_blank.body_text(), "  ");
 }
+
+#[test]
+fn body_text_prefix_reads_only_the_start_of_a_huge_body() {
+    let html = format!("<p>First line</p>{}", "<b>é</b>".repeat(500_000));
+    let m = MailItem { body: Body { html: Some(html), ..Default::default() }, ..mail("x") };
+    let short = m.body_text_prefix(1000);
+    assert!(short.contains("First line"));
+    assert!(short.len() < 1000);
+    // Text bodies are cut at a character boundary, never inside one.
+    let text = MailItem { body: Body { text: Some("é".repeat(10)), ..Default::default() }, ..mail("x") };
+    assert_eq!(text.body_text_prefix(5), "éé");
+    assert_eq!(text.body_text_prefix(1000), "é".repeat(10));
+    assert_eq!(MailItem { body: Body::default(), ..mail("x") }.body_text_prefix(10), "");
+}

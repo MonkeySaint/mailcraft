@@ -16,6 +16,8 @@
 
 pub mod mail;
 pub mod modules;
+#[cfg(test)]
+mod settings_tests;
 pub mod table;
 
 use serde_json::{Value, json};
@@ -53,7 +55,7 @@ fn spec(
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        spec("view.addColumns", "Add Columns", "View › Arrangement", "", "", false, list_view, add_columns),
+        spec("view.addColumns", "Add Columns", "View › Arrangement", "", "", false, columns_view, add_columns),
         spec(
             "view.applyViewTo",
             "Apply View to Folders",
@@ -312,7 +314,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Sort",
             "View › Current View › View Settings › Sort; a click on a column header",
             "",
-            r#"{"field":string|null,"dir"?:"asc"|"desc"}"#,
+            r#"{"field"?:string|null,"dir"?:"asc"|"desc","fields"?:[{"field":string,"dir"?:"asc"|"desc"}]} (fields: up to 4 sort keys, Sort items by then Then by)"#,
             true,
             has_folder,
             sort_by,
@@ -352,7 +354,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "View Settings",
             "View › Current View",
             "",
-            r#"{} (opens the dialog) | module folders: {"sort"?:string,"columns"?:[string],"filter"?:{"words"?:string,"inBody"?:bool,"category"?:string,"days"?:number}|null,"rules"?:[{"name":string,"on":bool,"filter":object,"bold"?:bool,"italic"?:bool,"strike"?:bool,"color"?:string}],"autoPreview"?:bool,"gridLines"?:bool} | calendar: {"view"?:object,"sort"?,"ascending"?,"timeScale"?,"readingPane"?,"tighterSpacing"?,"dailyTaskList"?,"columns"?,"groupBy"?,"filter"?,"rules"?,"autoPreview"?,"gridLines"?}"#,
+            r#"{} (opens the dialog) | every list: {"sortBy"?:[{"field":string,"dir"?:"asc"|"desc"}],"groupBy"?:[{"field":string,"dir"?:"asc"|"desc"}]|null,"expandGroups"?:"expanded"|"collapsed"|"lastViewed","rowFont"?:number,"columnFont"?:number,"gridLines"?:bool} (up to 4 sort keys and 4 group levels; mail fields are arrangement keys, module fields column ids) | module folders also: {"autoPreview"?:bool} | notes folders also: {"sort"?:string,"columns"?:[string],"filter"?:{"words"?:string,"inBody"?:bool,"category"?:string,"days"?:number}|null,"rules"?:[{"name":string,"on":bool,"filter":object,"bold"?:bool,"italic"?:bool,"strike"?:bool,"color"?:string}],"formats"?:{string:{"label"?:string,"align"?:string}}|null} | calendar: {"view"?:object,"sort"?,"ascending"?,"timeScale"?,"readingPane"?,"tighterSpacing"?,"dailyTaskList"?,"columns"?,"groupBy"?,"filter"?,"rules"?,"autoPreview"?,"gridLines"?}"#,
             false,
             has_folder,
             view_settings,
@@ -581,6 +583,11 @@ fn list_view(s: &Session) -> Option<&'static str> {
     }
 }
 
+/// Add Columns: the list views, and the People Card view (its card fields).
+fn columns_view(s: &Session) -> Option<&'static str> {
+    if table::columns_here(s).is_some() { None } else { list_view(s) }
+}
+
 /// Message Preview: mail and tasks folders (not contacts, calendar or notes).
 fn preview_view(s: &Session) -> Option<&'static str> {
     match s.mailbox.folder(s.selection.folder).map(|f| f.kind) {
@@ -593,6 +600,13 @@ fn preview_view(s: &Session) -> Option<&'static str> {
 }
 
 fn groups_shown(s: &Session) -> Option<&'static str> {
+    let folder = s.selection.folder;
+    // A Notes table grouped with Group By has groups to open and close.
+    let notes_grouped = modules::current(s, folder)
+        .is_some_and(|(k, st)| k == ModuleKind::Notes && modules::notes_grouped(s, folder, &st));
+    if notes_grouped {
+        return None;
+    }
     if let Some(why) = list_view(s) {
         return Some(why);
     }
@@ -643,9 +657,17 @@ fn view_customized(s: &Session) -> Option<&'static str> {
     }
     let f = s.selection.folder;
     // Tasks folders offer Reset View on their views as they come (as observed); it then just puts the
-    // view's own settings back.
-    if modules::module_kind(s, f) == Some(modules::ModuleKind::Tasks) {
-        return None;
+    // view's own settings back. The other module folders offer it once the current view has changes.
+    match modules::module_kind(s, f) {
+        Some(modules::ModuleKind::Tasks) => return None,
+        Some(_) => {
+            return if modules::view_customized(s, f) {
+                None
+            } else {
+                Some("the view already has its default settings")
+            };
+        }
+        None => {}
     }
     // Conversation expansion is not a view customisation; collapsed groups and Conversation Settings are.
     let custom = s.mailbox.views.get(&f).is_some_and(|v| *v != ViewSettings::default())
@@ -708,10 +730,16 @@ fn reset_view(s: &mut Session, p: &Value) -> CmdResult {
         return r;
     }
     let folder = current_folder(s, &Value::Null)?;
+    if let Some(kind) = modules::module_kind(s, folder) {
+        // A People, Tasks or Notes folder stays on its view: only that view's changes go (as Manage All
+        // Views › Reset does), with Reverse Sort, Show in Groups and collapsed groups.
+        modules::reset_current(s, folder, kind)?;
+        let view = modules::current_view_name(s, folder);
+        return Ok(json!({ "folder": folder.0, "reset": true, "view": view, "module": kind.name() }));
+    }
     s.mailbox.views.remove(&folder);
-    // Columns, rules, filter, collapsed groups and dragged note icons go; pinned messages (marked on the
+    // Columns, rules, filter, groups, sort keys and collapsed groups go; pinned messages (marked on the
     // messages) stay pinned.
-    crate::cmd::notes::clear_positions(s, folder);
     modules::reset_keeping_saved(s, folder);
     Ok(json!({ "folder": folder.0, "reset": true }))
 }
@@ -744,6 +772,9 @@ fn view_settings(s: &mut Session, p: &Value) -> CmdResult {
         return modules::view_settings(s, folder, kind, p);
     }
     let folder = current_folder(s, &Value::Null)?;
+    if mail::mail_list(s).is_none() && mail::SETTINGS_KEYS.iter().any(|k| p.get(*k).is_some()) {
+        return mail::apply_settings(s, folder, p);
+    }
     let current = serde_json::to_value(settings(s, folder)).unwrap_or(Value::Null);
     let mut params = json!({ "folder": folder.0, "settings": current });
     if mail::mail_list(s).is_none()
@@ -763,8 +794,9 @@ fn add_columns(s: &mut Session, p: &Value) -> CmdResult {
     }
     let folder = current_folder(s, &Value::Null)?;
     if mail::mail_list(s).is_some() {
-        // Module tables (Tasks, People › Phone and List) have their own columns.
-        let Some((folder, kind, _)) = table::table_here(s) else {
+        // Module tables (Tasks, People › Phone and List) have their own columns, the People Card view its
+        // card fields.
+        let Some((folder, kind, _)) = table::columns_here(s) else {
             return Err(CmdError::Disabled("not available in this view".into()));
         };
         let mut params = table::columns_json(s, folder, kind);
@@ -774,11 +806,16 @@ fn add_columns(s: &mut Session, p: &Value) -> CmdResult {
         return Ok(dialog(s, "showColumns", params));
     }
     let shown: Vec<&str> = mail::columns(s, folder).iter().map(|c| c.id).collect();
-    let available: Vec<Value> = mail::COLUMNS.iter().map(|c| json!({"id": c.id, "label": c.label})).collect();
+    let available: Vec<Value> = mail::COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| json!({"id": c.id, "label": c.label, "frequent": i < mail::FREQUENT_COLUMNS}))
+        .collect();
+    let sets: Vec<Value> = mail::FIELD_SETS.iter().map(|(k, l, _)| json!({"key": k, "label": l})).collect();
     Ok(dialog(
         s,
         "showColumns",
-        json!({ "folder": folder.0, "mail": true, "columns": shown, "available": available }),
+        json!({ "folder": folder.0, "mail": true, "columns": shown, "available": available, "sets": sets }),
     ))
 }
 
@@ -850,6 +887,7 @@ fn arrange_by(s: &mut Session, p: &Value) -> CmdResult {
     })?;
     // Group labels change meaning with the arrangement (reserved state entries stay).
     modules::clear_groups(s, folder);
+    mail::open_groups(s, folder);
     Ok(r)
 }
 
@@ -881,11 +919,27 @@ fn sort_order(s: &mut Session, p: &Value) -> CmdResult {
 /// `view.sortBy`: sorts the list by a column. In a module table the column (`null`: the view's own order)
 /// orders the rows inside their groups; in a mail folder the column's arrangement is used.
 fn sort_by(s: &mut Session, p: &Value) -> CmdResult {
-    if let Some((folder, kind, _)) = table::table_here(s) {
+    if let Some((folder, kind, _)) = table::settings_here(s) {
         return table::sort_by(s, folder, kind, p);
+    }
+    if let Some((folder, ModuleKind::Notes)) = module_here(s)
+        && modules::state(s, folder, ModuleKind::Notes).view != "Icon"
+    {
+        // The Notes tables sort through their View Settings (the sort column, then the Then by keys).
+        let fields = match p.get("fields") {
+            Some(f) => f.clone(),
+            None => match p.get("field") {
+                None | Some(Value::Null) => json!([]),
+                Some(f) => json!([{ "field": f, "dir": p.get("dir").cloned().unwrap_or(json!("asc")) }]),
+            },
+        };
+        return modules::view_settings(s, folder, ModuleKind::Notes, &json!({ "sortBy": fields }));
     }
     if module_here(s).is_some() || s.view.module == Module::Calendar {
         return Err(CmdError::Disabled("not available in this view".into()));
+    }
+    if p.get("fields").is_some() {
+        return mail::sort_fields(s, p);
     }
     let field = req_str(p, "field")?;
     let clipped: String = field.chars().take(40).collect();
@@ -906,7 +960,14 @@ fn sort_by(s: &mut Session, p: &Value) -> CmdResult {
         }
         json!({ "arrangeBy": arrange_name(arrange), "order": order_name(v.order) })
     })?;
+    // A header click sorts by that one column: the Then by keys go.
+    let mut mv = mail::mail_view(s, folder);
+    if !mv.then_by.is_empty() {
+        mv.then_by.clear();
+        mail::store_view(s, folder, &mv);
+    }
     modules::clear_groups(s, folder);
+    mail::open_groups(s, folder);
     Ok(r)
 }
 
@@ -1136,6 +1197,16 @@ pub struct ConversationState {
     /// The selected conversation collapsed by hand: (conversation key, message focused then). It stays
     /// collapsed while that message keeps the focus.
     pub collapsed: Option<(u64, ItemId)>,
+}
+
+/// Opening `folder` (selecting it, or at start-up): its view's groups open as its Group By › Expand/collapse
+/// default says (all expanded, all collapsed, or as they were left).
+pub(crate) fn opened(s: &mut Session, folder: FolderId) {
+    if modules::module_kind(s, folder).is_some() {
+        modules::open_groups(s, folder);
+    } else if s.mailbox.folder(folder).is_some() {
+        mail::open_groups(s, folder);
+    }
 }
 
 /// True for real group labels in `ViewState::collapsed_groups` (false for the reserved conversation and
