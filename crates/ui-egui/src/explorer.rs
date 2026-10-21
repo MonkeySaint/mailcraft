@@ -30,6 +30,8 @@ pub struct ExplorerWindow {
     pub search_text: String,
     pub search_active: bool,
     pub module_selection: Option<u64>,
+    /// The calendar arrangement the ribbon shows for the window (see `UiState::calendar_view`).
+    pub calendar_view: String,
 }
 
 /// Swaps the window's state with the session's (twice restores both).
@@ -40,6 +42,7 @@ fn swap(app: &mut App, w: &mut ExplorerWindow) {
     std::mem::swap(&mut app.ui.search_text, &mut w.search_text);
     std::mem::swap(&mut app.ui.search_active, &mut w.search_active);
     std::mem::swap(&mut app.ui.module_selection, &mut w.module_selection);
+    std::mem::swap(&mut app.ui.calendar_view, &mut w.calendar_view);
 }
 
 /// Runs `f` with explorer window `id`'s state in the session (`None` when there is no such window).
@@ -69,6 +72,7 @@ pub fn open(app: &mut App, folder: FolderId) -> Option<u64> {
         id,
         selection: app.s.selection.clone(),
         module: app.s.view.module,
+        calendar_view: app.ui.calendar_view.clone(),
         ..Default::default()
     };
     app.ui.explorers.push(w);
@@ -128,6 +132,7 @@ pub fn explorer_windows(ctx: &egui::Context, app: &mut App) {
         app.ui.explorers.retain(|w| !closed.contains(&w.id));
         for id in closed {
             crate::reading::forget_viewport(ctx, viewport_id(id));
+            crate::modules::forget_window(ctx, viewport_id(id));
         }
     }
 }

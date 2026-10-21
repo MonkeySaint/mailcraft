@@ -19,12 +19,12 @@
 //! the contact's flag; [`due_reminders`], [`next_reminder_after`], [`dismiss_reminder`] and
 //! [`snooze_reminder`] are what the reminders scan uses for contacts.
 //!
-//! **Mail Merge** (`people.mailMerge`) merges the contacts into E-mail messages: `{{Field}}` placeholders
-//! ([`MERGE_FIELDS`]) in the subject and body are replaced with each contact's fields, a preview shows one
-//! merged message, and Send puts one message per contact with an address in the Outbox. Merging to Form
-//! Letters, Mailing Labels or Envelopes needs a word processor document, which MailCraft does not have:
-//! those document types are listed but off (the command answers that they are not available), and E-mail
-//! is the default.
+//! **Mail Merge** (`people.mailMerge`) merges the contacts into E-mail messages or documents: `{{Field}}`
+//! placeholders ([`MERGE_FIELDS`]) in the subject and text are replaced with each contact's fields and a
+//! preview shows one merged record. E-mail puts one message per contact with an address in the Outbox; Form
+//! Letters, Mailing Labels and Envelopes are laid out by `mailcraft_render::print` and written as a new PDF
+//! document or sent to a printer. The merged contacts' fields can also be saved as a contact data file
+//! (CSV).
 //!
 //! **Assign Task** (`people.assignTask`) sends a task request (VTODO) to the selected contacts
 //! (`tasks::assign`).
@@ -1102,6 +1102,21 @@ pub const MERGE_FIELDS: [&str; 24] = [
 pub const MAX_MERGE_TEMPLATE: usize = 256 * 1024;
 /// Most messages one merge sends.
 pub const MAX_MERGE_MESSAGES: usize = 5_000;
+/// Longest merged text of one contact (bytes): fields can make it longer than its template.
+pub const MAX_MERGED_TEXT: usize = 1024 * 1024;
+/// Most merged text one merge produces over all its contacts (bytes).
+pub const MAX_MERGE_TOTAL: usize = 64 * 1024 * 1024;
+
+/// Adds `len` merged bytes to the running `total` of a merge; refuses once it passes [`MAX_MERGE_TOTAL`].
+fn add_merged(total: &mut usize, len: usize) -> Result<(), CmdError> {
+    *total = total.saturating_add(len);
+    if *total > MAX_MERGE_TOTAL {
+        return Err(CmdError::Params(
+            "the merge would make too much text; merge fewer contacts or shorten the text".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Value of merge field `name` for contact `c` ("" when the contact has none).
 pub fn merge_field(c: &Contact, name: &str) -> Option<String> {
@@ -1146,13 +1161,20 @@ pub fn merge_field(c: &Contact, name: &str) -> Option<String> {
 }
 
 /// `template` with every `{{Field}}` replaced by the contact's value. Unknown fields are an error naming them;
-/// an unclosed `{{` is kept as text.
+/// an unclosed `{{` is kept as text. A result longer than [`MAX_MERGED_TEXT`] is an error.
 pub fn merge_text(template: &str, c: &Contact) -> Result<String, CmdError> {
-    let mut out = String::with_capacity(template.len());
+    fn push(out: &mut String, s: &str) -> Result<(), CmdError> {
+        if out.len().saturating_add(s.len()) > MAX_MERGED_TEXT {
+            return Err(CmdError::Params("the merged text of one contact is too long".into()));
+        }
+        out.push_str(s);
+        Ok(())
+    }
+    let mut out = String::with_capacity(template.len().min(MAX_MERGED_TEXT));
     let mut rest = template;
     while let Some(open) = rest.find("{{") {
         let (before, after) = rest.split_at(open);
-        out.push_str(before);
+        push(&mut out, before)?;
         let inner = after.get(2..).unwrap_or("");
         match inner.find("}}") {
             Some(close) => {
@@ -1160,25 +1182,70 @@ pub fn merge_text(template: &str, c: &Contact) -> Result<String, CmdError> {
                 let value = merge_field(c, name).ok_or_else(|| {
                     CmdError::Params(format!("unknown merge field {{{{{}}}}}", name.trim()))
                 })?;
-                out.push_str(&value);
+                push(&mut out, &value)?;
                 rest = inner.get(close.saturating_add(2)..).unwrap_or("");
             }
             None => {
-                out.push_str(after);
+                push(&mut out, after)?;
                 rest = "";
             }
         }
     }
-    out.push_str(rest);
+    push(&mut out, rest)?;
     Ok(out)
 }
 
+/// Envelope sizes Mail Merge offers (id, label).
+pub const MERGE_ENVELOPES: [(&str, &str); 2] =
+    [("10", "Envelope #10 (4 1/8 x 9 1/2 in)"), ("dl", "Envelope DL (110 x 220 mm)")];
+/// The address block Mailing Labels and Envelopes print when no text is given.
+pub const ADDRESS_BLOCK: &str =
+    "{{Full Name}}\n{{Company}}\n{{Street}}\n{{City}}, {{State}} {{Postal Code}}\n{{Country}}";
+/// Longest return address (bytes).
+const MAX_RETURN_ADDRESS: usize = 4 * 1024;
+
+/// A merged address block tidied up: blank lines dropped, stray separators left by empty fields ("Town, "
+/// or ", 12345") and doubled spaces removed.
+pub fn tidy_address(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let joined = l.split_whitespace().collect::<Vec<_>>().join(" ").replace(" ,", ",");
+            let mut t = joined.trim_matches(|c: char| c == ',' || c.is_whitespace()).to_owned();
+            while t.contains(",,") {
+                t = t.replace(",,", ",");
+            }
+            t
+        })
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The Mail Merge contact data file: a header row of [`MERGE_FIELDS`], then one row per contact (CSV,
+/// RFC 4180).
+pub fn merge_data_csv(contacts: &[Contact]) -> String {
+    let mut rows: Vec<Vec<String>> = vec![MERGE_FIELDS.iter().map(|f| (*f).to_owned()).collect()];
+    for c in contacts {
+        rows.push(MERGE_FIELDS.iter().map(|f| merge_field(c, f).unwrap_or_default()).collect());
+    }
+    mailcraft_formats::csv::write(&rows, ',')
+}
+
 /// Mail Merge. `contacts`: all (the current contacts folder, in list order) or selected; `output`: email
-/// (default), letters, labels or envelopes. Only E-mail can be produced: form letters, labels and envelopes
-/// need a word processor document, so they are off (the window lists them disabled and merging to them is
-/// refused as not available). Without `action` the Mail Merge window opens. With `action`:
-/// - `preview` {subject, body, index?}: the merged message for one contact (with an address),
-/// - `send` {subject, body}: one message per contact with an address, sent to the Outbox.
+/// (default), letters (Form Letters), labels (Mailing Labels) or envelopes. Without `action` the Mail Merge
+/// window opens. With `action`:
+/// - `preview` {subject?, body, index?}: one merged record (the message for E-mail, the text otherwise),
+/// - `send` (E-mail) {subject, body}: one message per contact with an address, sent to the Outbox,
+/// - `merge` (documents) {body, to?: document|printer, path?, printer?, labels?, envelope?, returnAddress?}:
+///   form letters (one per contact, each on a new page), labels (the address block on a label sheet, see
+///   `labels`) or envelopes (one per contact, `envelope` size, with `returnAddress`) written as a PDF at
+///   `path` (New Document) or sent to `printer` (Printer, default the system's default printer). Labels and
+///   envelopes print [`ADDRESS_BLOCK`] when `body` is empty,
+/// - `dataFile` {dataFile}: only the contact data file.
+///
+/// `dataFile` (a path) with `send` or `merge` also writes the contact data file: the merge fields of the
+/// merged contacts as CSV ([`merge_data_csv`]). Contact groups are never merged; E-mail also skips contacts
+/// without an address.
 fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
     let contacts = match opt_str(p, "contacts") {
         None | Some("all") => "all",
@@ -1197,68 +1264,102 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
     };
     let action = opt_str(p, "action");
     let Some(action) = action else {
+        let labels: Vec<Value> = mailcraft_render::print::LABEL_SHEETS
+            .iter()
+            .map(|(id, label, _)| json!({ "id": id, "label": label }))
+            .collect();
+        let envelopes: Vec<Value> =
+            MERGE_ENVELOPES.iter().map(|(id, label)| json!({ "id": id, "label": label })).collect();
         return pim::dialog(
             s,
             "mailMerge",
-            json!({ "contacts": contacts, "output": output, "ids": pim::ids_json(&ids), "fields": MERGE_FIELDS }),
+            json!({
+                "contacts": contacts, "output": opt_str(p, "output"), "ids": pim::ids_json(&ids), "fields": MERGE_FIELDS,
+                "labels": labels, "envelopes": envelopes, "addressBlock": ADDRESS_BLOCK,
+            }),
         );
     };
-    if output != "email" {
-        return Err(CmdError::Disabled(
-            "Form letters, mailing labels and envelopes need a word processor; choose E-mail to merge into messages."
-                .into(),
-        ));
+    let email = output == "email";
+    match (action, email) {
+        ("preview" | "dataFile", _) | ("send", true) | ("merge", false) => {}
+        ("send", false) => {
+            return Err(CmdError::Params(
+                "`send` merges to E-mail; use `merge` for form letters, labels and envelopes".into(),
+            ));
+        }
+        ("merge", true) => return Err(CmdError::Params("E-mail merges are sent with `send`".into())),
+        (other, _) => {
+            let other: String = other.chars().take(32).collect();
+            return Err(CmdError::Params(format!(
+                "`action` must be preview|send|merge|dataFile, not {other}"
+            )));
+        }
     }
     let subject = pim::text(p, "subject")?.unwrap_or_default();
-    let body = pim::text(p, "body")?.unwrap_or_default();
+    let mut body = pim::text(p, "body")?.unwrap_or_default();
     if subject.len().saturating_add(body.len()) > MAX_MERGE_TEMPLATE {
         return Err(CmdError::Params("the merge text is too long".into()));
     }
-    // Contacts that can receive mail (groups and contacts without an address are skipped).
-    let recipients: Vec<Contact> = ids
+    let address = matches!(output, "labels" | "envelopes");
+    if address && body.trim().is_empty() {
+        body = ADDRESS_BLOCK.to_owned();
+    }
+    // The contacts merged: never groups; E-mail only those with an address.
+    let records: Vec<Contact> = ids
         .iter()
         .filter_map(|i| s.mailbox.contacts.get(i))
-        .filter(|c| !is_group(c) && !contact_addresses(c).is_empty())
+        .filter(|c| !is_group(c) && (!email || !contact_addresses(c).is_empty()))
         .cloned()
         .collect();
-    let skipped = ids.len().saturating_sub(recipients.len());
+    let skipped = ids.len().saturating_sub(records.len());
+    let data_file = pim::text(p, "dataFile")?.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+    let merged = |c: &Contact| merge_record(&body, address, c);
     match action {
         "preview" => {
             let index =
                 crate::cmd::util::opt_u64(p, "index").and_then(|i| usize::try_from(i).ok()).unwrap_or(0);
-            let Some(c) = recipients.get(index) else {
-                return Ok(json!({ "count": recipients.len(), "skipped": skipped, "preview": Value::Null }));
+            let Some(c) = records.get(index) else {
+                return Ok(json!({ "count": records.len(), "skipped": skipped, "preview": Value::Null }));
             };
-            Ok(json!({
-                "count": recipients.len(),
-                "skipped": skipped,
-                "index": index,
-                "preview": {
+            let preview = if email {
+                json!({
                     "to": contact_addresses(c).join("; "),
                     "subject": merge_text(&subject, c)?,
                     "body": merge_text(&body, c)?,
-                },
-            }))
+                })
+            } else {
+                json!({ "text": merged(c)? })
+            };
+            Ok(json!({ "count": records.len(), "skipped": skipped, "index": index, "preview": preview }))
+        }
+        "dataFile" => {
+            let path = data_file
+                .ok_or_else(|| CmdError::Params("`dataFile` (the file to write) is required".into()))?;
+            let written = write_data_file(s, &path, &records)?;
+            Ok(json!({ "dataFile": written, "records": records.len(), "skipped": skipped }))
         }
         "send" => {
             if subject.trim().is_empty() {
                 return Err(CmdError::Params("enter the message subject line".into()));
             }
-            if recipients.len() > MAX_MERGE_MESSAGES {
+            if records.len() > MAX_MERGE_MESSAGES {
                 return Err(CmdError::Params(format!("a merge sends at most {MAX_MERGE_MESSAGES} messages")));
             }
-            // Merge everything first so a bad field sends nothing.
-            let mut merged = Vec::new();
-            for c in &recipients {
-                merged.push((
-                    contact_addresses(c).join("; "),
-                    merge_text(&subject, c)?,
-                    merge_text(&body, c)?,
-                ));
+            // Merge everything first so a bad field (or too much text) sends nothing.
+            let mut messages = Vec::new();
+            let mut total = 0usize;
+            for c in &records {
+                let (subj, text) = (merge_text(&subject, c)?, merge_text(&body, c)?);
+                add_merged(&mut total, subj.len().saturating_add(text.len()))?;
+                messages.push((contact_addresses(c).join("; "), subj, text));
             }
+            let written = match &data_file {
+                Some(path) => Some(write_data_file(s, path, &records)?),
+                None => None,
+            };
             let mut sent = 0usize;
             let mut errors: Vec<String> = Vec::new();
-            for (to, subj, text) in merged {
+            for (to, subj, text) in messages {
                 let mut compose = crate::compose::ComposeState {
                     to,
                     subject: subj,
@@ -1282,10 +1383,292 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
             if sent == 0 && !errors.is_empty() {
                 return Err(CmdError::Failed(errors.join(" ")));
             }
-            Ok(json!({ "sent": sent, "skipped": skipped, "errors": errors }))
+            Ok(json!({ "sent": sent, "skipped": skipped, "errors": errors, "dataFile": written }))
         }
-        other => Err(CmdError::Params(format!("`action` must be preview|send, not {other}"))),
+        _ => {
+            let job = MergeJob {
+                output,
+                records: &records,
+                body: &body,
+                address,
+                skipped,
+                data_file: data_file.as_deref(),
+            };
+            merge_document(s, p, job)
+        }
     }
+}
+
+/// Writes the contact data file of `records` at `path`; returns the path written.
+fn write_data_file(s: &mut Session, path: &str, records: &[Contact]) -> Result<String, CmdError> {
+    let path = crate::cmd::print::output_path(path)?;
+    crate::cmd::rules::write_file(&path, merge_data_csv(records).as_bytes())?;
+    let shown = path.display().to_string();
+    s.notify(crate::Notice::Info(format!(
+        "Saved the contact data of {} contact(s) to {shown}.",
+        records.len()
+    )));
+    Ok(shown)
+}
+
+/// One contact's merged text for a document: `body` merged, tidied as an address block when `address`.
+fn merge_record(body: &str, address: bool, c: &Contact) -> Result<String, CmdError> {
+    let t = merge_text(body, c)?;
+    Ok(if address { tidy_address(&t) } else { t })
+}
+
+/// A merge to a document: the document type, the contacts, the text merged for each (an address block when
+/// `address`), how many were left out and the contact data file to write.
+struct MergeJob<'a> {
+    output: &'a str,
+    records: &'a [Contact],
+    body: &'a str,
+    address: bool,
+    skipped: usize,
+    data_file: Option<&'a str>,
+}
+
+/// Page setup without the header and footer (merge documents print only the merged text).
+fn blank_setup() -> mailcraft_render::print::PageSetup {
+    mailcraft_render::print::PageSetup { footer: Default::default(), ..Default::default() }
+}
+
+/// Mail Merge to a document (`merge`): lays the merged records out as form letters, labels or envelopes and
+/// writes them as a PDF or sends them to a printer.
+fn merge_document(s: &mut Session, p: &Value, job: MergeJob<'_>) -> CmdResult {
+    use mailcraft_render::print::{
+        LABEL_SHEETS, MAX_PAGES, MAX_RECORDS, Margins, MergeDoc, MergeStyle, Orientation, PageSetup, Paper,
+        PrintContext, label_sheet, max_records, paginate_merge,
+    };
+    if job.output == "letters" && opt_str(p, "body").is_none_or(|b| b.trim().is_empty()) {
+        return Err(CmdError::Params("type the text of the letter".into()));
+    }
+    if job.records.is_empty() {
+        return Err(CmdError::Failed("there are no contacts to merge".into()));
+    }
+    if job.records.len() > MAX_RECORDS {
+        return Err(CmdError::Params(format!("a merge takes at most {MAX_RECORDS} contacts")));
+    }
+    let to = match opt_str(p, "to") {
+        None | Some("document") => "document",
+        Some("printer") => "printer",
+        Some(_) => return Err(CmdError::Params("`to` must be document|printer".into())),
+    };
+    let paper = match opt_str(p, "paper") {
+        None => Paper::Letter,
+        Some(x) => Paper::parse(x)
+            .filter(|x| matches!(x, Paper::Letter | Paper::Legal | Paper::A4 | Paper::A5))
+            .ok_or_else(|| CmdError::Params("`paper` must be Letter, Legal, A4 or A5".into()))?,
+    };
+    let inch = 96.0;
+    let (style, setup, title) = match job.output {
+        "letters" => {
+            let margins = Margins { top: inch, bottom: inch, left: inch, right: inch };
+            (MergeStyle::Letters, PageSetup { paper, margins, ..blank_setup() }, "Form Letters")
+        }
+        "labels" => {
+            let id = opt_str(p, "labels").unwrap_or("30");
+            let sheet = label_sheet(id).ok_or_else(|| {
+                let ids: Vec<&str> = LABEL_SHEETS.iter().map(|x| x.0).collect();
+                CmdError::Params(format!("`labels` must be one of {}", ids.join(", ")))
+            })?;
+            (MergeStyle::Labels(sheet), PageSetup { paper: sheet.paper, ..blank_setup() }, "Mailing Labels")
+        }
+        _ => {
+            let paper = match opt_str(p, "envelope").unwrap_or("10") {
+                "10" => Paper::Envelope10,
+                "dl" | "DL" => Paper::EnvelopeDl,
+                _ => return Err(CmdError::Params("`envelope` must be 10 or dl".into())),
+            };
+            let m = 0.4 * inch;
+            let margins = Margins { top: m, bottom: m, left: m, right: m };
+            let setup = PageSetup { paper, orientation: Orientation::Landscape, margins, ..blank_setup() };
+            (MergeStyle::Envelopes, setup, "Envelopes")
+        }
+    };
+    // Never more contacts than the document's pages can hold: refused before anything is merged.
+    let room = max_records(&style);
+    if job.records.len() > room {
+        return Err(CmdError::Params(format!(
+            "{title} hold at most {room} contacts in one merge ({MAX_PAGES} pages), and {} were chosen; \
+             merge fewer contacts at a time",
+            job.records.len()
+        )));
+    }
+    let return_address = pim::text(p, "returnAddress")?.unwrap_or_default();
+    if return_address.len() > MAX_RETURN_ADDRESS {
+        return Err(CmdError::Params("the return address is too long".into()));
+    }
+    let (printer, path) = if to == "document" {
+        let path = opt_str(p, "path").map(str::trim).filter(|x| !x.is_empty()).ok_or_else(|| {
+            CmdError::Params("`path` (the PDF file of the new document) is required".into())
+        })?;
+        (crate::cmd::print::SAVE_AS_PDF, Some(path))
+    } else {
+        let printer = opt_str(p, "printer")
+            .map(str::trim)
+            .filter(|x| !x.is_empty() && !x.eq_ignore_ascii_case(crate::cmd::print::SAVE_AS_PDF))
+            .unwrap_or(crate::cmd::print::DEFAULT_PRINTER);
+        (printer, None)
+    };
+    let mut texts = Vec::with_capacity(job.records.len());
+    let mut total = 0usize;
+    for c in job.records {
+        let t = merge_record(job.body, job.address, c)?;
+        add_merged(&mut total, t.len())?;
+        texts.push(t);
+    }
+    let doc = MergeDoc { style, records: texts, return_address: tidy_address(&return_address) };
+    let fonts = mailcraft_fonts::FontDb::bundled();
+    let ctx = PrintContext { title: title.to_owned(), ..Default::default() };
+    let (pages, placed) = paginate_merge(&doc, &setup, &ctx, &fonts);
+    // Long letters can fill the pages before every contact has one: nothing is written then.
+    if placed < job.records.len() {
+        return Err(CmdError::Params(format!(
+            "the {MAX_PAGES}-page limit is reached after {placed} of {} contacts; merge fewer contacts or \
+             shorten the letter",
+            job.records.len()
+        )));
+    }
+    let written = match job.data_file {
+        Some(path) => Some(write_data_file(s, path, job.records)?),
+        None => None,
+    };
+    let mut out = crate::cmd::print::output_pages(s, &pages, title, printer, path)?;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("merged".into(), json!(job.records.len()));
+        o.insert("skipped".into(), json!(job.skipped));
+        o.insert("output".into(), json!(job.output));
+        o.insert("dataFile".into(), json!(written));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Address books (Folder › Properties › Address Book of a contacts folder)
+
+/// Setting holding the Address Book properties of contacts folders: folder id → `{"show", "name"}` (a
+/// folder not listed is shown under its own name).
+pub const ADDRESS_BOOKS_KEY: &str = "people.addressBooks";
+/// Longest address book name (characters).
+pub const MAX_BOOK_NAME: usize = 128;
+
+/// How a contacts folder takes part in the e-mail address book.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddressBook {
+    /// Show this folder as an e-mail address book: its contacts are offered as recipients (Address Book,
+    /// Check Names, Auto-Complete suggestions).
+    pub show: bool,
+    /// The name the address book shows it under ("" = the folder's name).
+    pub name: String,
+}
+
+/// Address Book properties of contacts folder `folder` (shown under the folder's name unless changed).
+pub fn address_book(s: &Session, folder: FolderId) -> AddressBook {
+    let stored = s.settings.get(ADDRESS_BOOKS_KEY).and_then(|v| v.get(folder.0.to_string()).cloned());
+    let show = stored.as_ref().and_then(|v| v.get("show")).and_then(Value::as_bool).unwrap_or(true);
+    let name = stored
+        .as_ref()
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str)
+        .map(|n| n.chars().filter(|c| !c.is_control()).take(MAX_BOOK_NAME).collect::<String>())
+        .unwrap_or_default();
+    AddressBook { show, name: name.trim().to_owned() }
+}
+
+/// True when the contacts of `folder` are offered as recipients.
+pub fn in_address_book(s: &Session, folder: FolderId) -> bool {
+    address_book(s, folder).show
+}
+
+/// The contacts folders shown as e-mail address books: (folder, name shown), sorted by name.
+pub fn address_books(s: &Session) -> Vec<(FolderId, String)> {
+    let mut out: Vec<(FolderId, String)> = s
+        .mailbox
+        .folders
+        .values()
+        .filter(|f| f.kind == mailcraft_model::FolderKind::Contacts)
+        .filter_map(|f| {
+            let b = address_book(s, f.id);
+            b.show.then(|| (f.id, if b.name.is_empty() { f.name.clone() } else { b.name }))
+        })
+        .collect();
+    out.sort_by_key(|(f, n)| (n.to_lowercase(), f.0));
+    out
+}
+
+/// The contacts folders left out of the address book, read once for a pass over many contacts.
+pub struct BookFilter {
+    hidden: std::collections::BTreeSet<u64>,
+}
+
+impl BookFilter {
+    pub fn new(s: &Session) -> BookFilter {
+        let hidden = match s.settings.get(ADDRESS_BOOKS_KEY) {
+            Some(Value::Object(o)) => o
+                .iter()
+                .filter(|(_, v)| v.get("show").and_then(Value::as_bool) == Some(false))
+                .filter_map(|(k, _)| k.parse::<u64>().ok())
+                .collect(),
+            _ => std::collections::BTreeSet::new(),
+        };
+        BookFilter { hidden }
+    }
+
+    /// True when contacts of `folder` are offered as recipients.
+    pub fn shows(&self, folder: FolderId) -> bool {
+        !self.hidden.contains(&folder.0)
+    }
+}
+
+/// `people.addressBook {folder?, show?, name?}`: the Address Book tab of a contacts folder's Properties.
+/// Without `show` and `name` it only answers the folder's settings.
+fn run_address_book(s: &mut Session, p: &Value) -> CmdResult {
+    let folder = match crate::cmd::util::opt_folder(p) {
+        Some(f) => f,
+        None => s.selection.folder,
+    };
+    if !pim::is_kind_folder(s, folder, Kind::Contact) {
+        return Err(CmdError::Params("choose a contacts folder".into()));
+    }
+    let mut b = address_book(s, folder);
+    let show = opt_bool(p, "show");
+    let name = pim::text(p, "name")?;
+    if show.is_some() || name.is_some() {
+        if let Some(on) = show {
+            b.show = on;
+        }
+        if let Some(n) = name {
+            if n.chars().count() > MAX_BOOK_NAME {
+                return Err(CmdError::Params(format!("the name is longer than {MAX_BOOK_NAME} characters")));
+            }
+            b.name = n.trim().chars().filter(|c| !c.is_control()).collect();
+        }
+        let folder_name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
+        let mut all = match s.settings.get(ADDRESS_BOOKS_KEY) {
+            Some(Value::Object(o)) => o,
+            _ => serde_json::Map::new(),
+        };
+        // Folders that no longer exist leave the list.
+        all.retain(|k, _| {
+            k.parse::<u64>()
+                .ok()
+                .and_then(|id| s.mailbox.folder(FolderId(id)))
+                .is_some_and(|f| f.kind == mailcraft_model::FolderKind::Contacts)
+        });
+        if b.show && (b.name.is_empty() || b.name == folder_name) {
+            all.remove(&folder.0.to_string());
+        } else {
+            all.insert(folder.0.to_string(), json!({ "show": b.show, "name": b.name }));
+        }
+        s.settings.set(ADDRESS_BOOKS_KEY, &Value::Object(all))?;
+    }
+    let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
+    Ok(json!({
+        "folder": folder.0,
+        "show": b.show,
+        "name": if b.name.is_empty() { name } else { b.name },
+    }))
 }
 
 /// Addresses of the target contacts (groups expand to members), de-duplicated.
@@ -1588,6 +1971,8 @@ pub fn view_rows(s: &Session, folder: FolderId, query: &str) -> Vec<ViewRow> {
 }
 
 /// Contact prefilled from `c`: company, business address and business phone numbers.
+/// A new contact at the same company as `c`: the company, its business address, its business phone and fax
+/// numbers, the company's main number and the web page.
 fn same_company(c: &Contact, folder: FolderId) -> Contact {
     Contact {
         folder,
@@ -1596,9 +1981,13 @@ fn same_company(c: &Contact, folder: FolderId) -> Contact {
         phones: c
             .phones
             .iter()
-            .filter(|(k, _)| k.to_ascii_lowercase().starts_with("business"))
+            .filter(|(k, _)| {
+                let k = k.to_ascii_lowercase();
+                k.starts_with("business") || k.starts_with("company")
+            })
             .cloned()
             .collect(),
+        web_page: c.web_page.clone(),
         ..Default::default()
     }
 }
@@ -1622,6 +2011,7 @@ fn run_new_from_same_company(s: &mut Session, p: &Value) -> CmdResult {
                 "postalCode": a.postal_code, "country": a.country,
             })),
             "phones": c.phones.iter().map(|(k, n)| (k.clone(), json!(n))).collect::<serde_json::Map<_, _>>(),
+            "webPage": c.web_page,
         });
         return pim::dialog(
             s,
@@ -1766,11 +2156,21 @@ pub fn specs() -> Vec<CommandSpec> {
             run_forward,
         ),
         spec(
+            "people.addressBook",
+            "Show This Folder as an E-mail Address Book",
+            "Folder › Properties › Address Book (contacts folders)",
+            "",
+            r#"{"folder"?: number, "show"?: bool, "name"?: string} (neither = the folder's settings)"#,
+            true,
+            always,
+            run_address_book,
+        ),
+        spec(
             "people.mailMerge",
             "Mail Merge",
             "People › Home › Actions",
             "",
-            r#"{"contacts": "all|selected", "output"?: "email|letters|labels|envelopes" (only email merges), "action"?: "preview|send", "subject"?: string, "body"?: string ({{Field}} placeholders), "index"?: number, "ids"?: [number]} (no action = open the Mail Merge window)"#,
+            r#"{"contacts": "all|selected", "output"?: "email|letters|labels|envelopes", "action"?: "preview|send (email)|merge (documents)|dataFile", "subject"?: string, "body"?: string ({{Field}} placeholders), "index"?: number, "ids"?: [number], "to"?: "document|printer", "path"?: "new PDF document", "printer"?: string, "labels"?: "30|14|10|21", "envelope"?: "10|dl", "returnAddress"?: string, "paper"?: string, "dataFile"?: "contact data file (CSV)"} (no action = open the Mail Merge window)"#,
             true,
             always,
             run_mail_merge,
@@ -2160,11 +2560,14 @@ mod tests {
         assert_eq!(r["dialog"], "mailMerge");
         assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(_, p)) if p["ids"] == json!([a])));
         assert!(matches!(s.run("people.mailMerge", &json!({"output": "fax"})), Err(CmdError::Params(_))));
-        // Labels cannot be produced; only E-mail merges.
+        // Labels are merged into a document (`merge`), not sent.
         let r = s.run("people.mailMerge", &json!({"output": "labels", "action": "send", "subject": "x"}));
-        assert!(matches!(r, Err(CmdError::Disabled(_))));
-        // E-mail is the default document type.
+        assert!(matches!(r, Err(CmdError::Params(_))));
+        assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(_, p)) if p["labels"][0]["id"] == "30"));
+        // The window chooses the document type (Form Letters first) unless the caller named one.
         s.run("people.mailMerge", &json!({})).unwrap();
+        assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(_, p)) if p["output"].is_null()));
+        s.run("people.mailMerge", &json!({"output": "email"})).unwrap();
         assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(_, p)) if p["output"] == "email"));
     }
 
@@ -2353,6 +2756,209 @@ mod tests {
     }
 
     #[test]
+    fn address_book_tab_controls_recipient_resolution() {
+        let mut s = session();
+        let contacts = role(&s, FolderRole::Contacts);
+        let club = s.mailbox.create_folder(contacts, "Club").unwrap();
+        if let Some(f) = s.mailbox.folders.get_mut(&club) {
+            f.kind = mailcraft_model::FolderKind::Contacts;
+        }
+        let ab = |s: &mut Session, p: Value| s.run("people.addressBook", &p).unwrap();
+        s.run("people.new", &json!({"fullName": "Zed Quill", "email": "zed@example.net", "folder": club.0}))
+            .unwrap();
+        // Shown by default, under the folder's name.
+        let r = ab(&mut s, json!({"folder": club.0}));
+        assert_eq!((r["show"].as_bool(), r["name"].as_str()), (Some(true), Some("Club")));
+        assert!(address_books(&s).iter().any(|(f, n)| *f == club && n == "Club"));
+        let suggest = |s: &Session| crate::queries::address_suggestions(s, "zed", 10).len();
+        assert_eq!(suggest(&s), 1);
+        // Renamed, then hidden: its contacts are no longer offered as recipients.
+        ab(&mut s, json!({"folder": club.0, "name": "Club Members"}));
+        assert!(address_books(&s).iter().any(|(f, n)| *f == club && n == "Club Members"));
+        s.run("folder.properties", &json!({"folder": club.0})).unwrap();
+        assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(d, p))
+            if d == "folderProperties" && p["addressBook"]["name"] == "Club Members" && p["addressBook"]["show"] == true));
+        ab(&mut s, json!({"folder": club.0, "show": false}));
+        assert!(!in_address_book(&s, club));
+        assert!(!address_books(&s).iter().any(|(f, _)| *f == club));
+        assert_eq!(suggest(&s), 0);
+        let cid = s.open_compose(crate::compose::ComposeState::default());
+        s.run("compose.setTo", &json!({"compose": cid, "value": "Zed Quill"})).unwrap();
+        let r = s.run("compose.checkNames", &json!({"compose": cid})).unwrap();
+        assert_eq!(r["resolved"], 0, "a hidden address book does not resolve names");
+        // Shown again under its own name: the setting is dropped.
+        ab(&mut s, json!({"folder": club.0, "show": true, "name": ""}));
+        assert_eq!(s.settings.get(ADDRESS_BOOKS_KEY), Some(json!({})));
+        assert_eq!(suggest(&s), 1);
+        // Only contacts folders have an address book; names are capped.
+        let inbox = role(&s, FolderRole::Inbox);
+        assert!(s.run("people.addressBook", &json!({"folder": inbox.0, "show": false})).is_err());
+        let long = "x".repeat(MAX_BOOK_NAME + 1);
+        assert!(s.run("people.addressBook", &json!({"folder": club.0, "name": long})).is_err());
+    }
+
+    #[test]
+    fn tidy_address_drops_empty_fields() {
+        assert_eq!(
+            tidy_address("Ann Lee\n\n1 Main St\nTown,  ST 12345\n"),
+            "Ann Lee\n1 Main St\nTown, ST 12345"
+        );
+        assert_eq!(tidy_address("Bo\n,  \n, ST 9\nTown, \n"), "Bo\nST 9\nTown");
+        assert_eq!(tidy_address(""), "");
+    }
+
+    #[test]
+    fn mail_merge_to_letters_labels_envelopes_and_a_data_file() {
+        let mut s = session();
+        let a = add(
+            &mut s,
+            json!({"fullName": "Ann Lee", "company": "Example Co", "email": "ann@example.com",
+                   "businessAddress": {"street": "1 Main St", "city": "Town", "region": "ST", "postalCode": "12345"}}),
+        );
+        add(&mut s, json!({"fullName": "Bo Ek"}));
+        s.run("people.newGroup", &json!({"name": "Team", "members": ["ann@example.com"]})).unwrap();
+        select(&mut s, &[a]);
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let path = |n: &str| dir.path().join(n).display().to_string();
+        // Labels preview the tidied address block (no body = the standard block).
+        let r = s
+            .run(
+                "people.mailMerge",
+                &json!({"contacts": "selected", "output": "labels", "action": "preview"}),
+            )
+            .unwrap();
+        assert_eq!(r["preview"]["text"], "Ann Lee\nExample Co\n1 Main St\nTown, ST 12345");
+        // Form letters need text; every contact (not the group) gets a page, with or without an address.
+        let letters = json!({"output": "letters", "action": "merge", "path": path("letters.pdf"),
+                             "body": "Dear {{First Name}},\nThank you.", "dataFile": path("data.csv")});
+        let r = s.run("people.mailMerge", &letters).unwrap();
+        assert_eq!(
+            (r["merged"].as_u64(), r["skipped"].as_u64(), r["pages"].as_u64()),
+            (Some(2), Some(1), Some(2))
+        );
+        let pdf = std::fs::read(dir.path().join("letters.pdf")).unwrap();
+        assert!(pdf.starts_with(b"%PDF"));
+        let csv = std::fs::read_to_string(dir.path().join("data.csv")).unwrap();
+        let rows = mailcraft_formats::csv::parse(&csv, ',');
+        assert_eq!(rows.len(), 3, "header + two contacts: {csv}");
+        assert_eq!(rows[0][0], "Full Name");
+        assert!(
+            rows.iter()
+                .any(|r| r.first().map(String::as_str) == Some("Ann Lee") && r.contains(&"Town".to_owned()))
+        );
+        let mut no_text = letters.clone();
+        no_text["body"] = json!(" ");
+        assert!(matches!(s.run("people.mailMerge", &no_text), Err(CmdError::Params(_))));
+        // Labels on a sheet of 30, envelopes one per page.
+        let r = s
+            .run(
+                "people.mailMerge",
+                &json!({"output": "labels", "action": "merge", "path": path("labels.pdf"), "labels": "30"}),
+            )
+            .unwrap();
+        assert_eq!(r["pages"], 1);
+        assert!(matches!(
+            s.run(
+                "people.mailMerge",
+                &json!({"output": "labels", "action": "merge", "path": path("x.pdf"), "labels": "99"})
+            ),
+            Err(CmdError::Params(_))
+        ));
+        let env = json!({"output": "envelopes", "action": "merge", "path": path("env.pdf"), "envelope": "dl",
+                         "returnAddress": "Pat Example\n9 Sender Rd"});
+        assert_eq!(s.run("people.mailMerge", &env).unwrap()["pages"], 2);
+        // The new document needs a file; a missing folder is refused; E-mail cannot `merge`.
+        let mut no_path = env.clone();
+        no_path["path"] = Value::Null;
+        assert!(matches!(s.run("people.mailMerge", &no_path), Err(CmdError::Params(_))));
+        let mut bad_dir = env.clone();
+        bad_dir["path"] = json!(path("missing/env.pdf"));
+        assert!(matches!(s.run("people.mailMerge", &bad_dir), Err(CmdError::Failed(_))));
+        assert!(matches!(
+            s.run("people.mailMerge", &json!({"output": "email", "action": "merge"})),
+            Err(CmdError::Params(_))
+        ));
+        // Only the contact data file.
+        let r = s
+            .run(
+                "people.mailMerge",
+                &json!({"output": "email", "action": "dataFile", "dataFile": path("only.csv")}),
+            )
+            .unwrap();
+        assert_eq!(r["records"], 1, "E-mail merges only contacts with an address");
+        assert!(dir.path().join("only.csv").exists());
+        assert!(matches!(
+            s.run("people.mailMerge", &json!({"action": "dataFile"})),
+            Err(CmdError::Params(_))
+        ));
+    }
+
+    /// Regression: a merge never silently prints fewer contacts than chosen (the page limit), and merged text
+    /// is bounded (a long template times many contacts used to be merged in full before anything else).
+    #[test]
+    fn mail_merge_refuses_documents_its_pages_cannot_hold() {
+        use mailcraft_render::print::MAX_PAGES;
+        let mut s = session();
+        let folder = role(&s, FolderRole::Contacts);
+        let many = |s: &mut Session, n: usize| {
+            for i in 0..n {
+                let id = ItemId(s.mailbox.alloc_id());
+                let c = Contact {
+                    id,
+                    folder,
+                    first_name: format!("Pat{i}"),
+                    last_name: "Example".into(),
+                    emails: vec![format!("pat{i}@example.com")],
+                    ..Default::default()
+                };
+                s.mailbox.contacts.insert(id, c);
+            }
+        };
+        many(&mut s, MAX_PAGES + 1);
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let path = |n: &str| dir.path().join(n).display().to_string();
+        // One envelope per page: 2,001 contacts do not fit, and nothing is written.
+        let env = json!({"output": "envelopes", "action": "merge", "path": path("env.pdf")});
+        let e = s.run("people.mailMerge", &env).unwrap_err();
+        assert!(matches!(e, CmdError::Params(_)) && e.to_string().contains("at most 2000"), "{e}");
+        assert!(!dir.path().join("env.pdf").exists());
+        // Labels hold a sheet per page: the same contacts fit on labels.
+        let r = s
+            .run(
+                "people.mailMerge",
+                &json!({"output": "labels", "action": "merge", "path": path("labels.pdf"), "labels": "30"}),
+            )
+            .unwrap();
+        assert_eq!(r["merged"], MAX_PAGES + 1);
+        assert_eq!(r["pages"], (MAX_PAGES + 1).div_ceil(30));
+        // Letters that run over several pages: refused when the last contacts would be left out.
+        let mut s = session();
+        many(&mut s, 30);
+        let long = "A line of the letter.\n".repeat(4_000);
+        let letters =
+            json!({"output": "letters", "action": "merge", "path": path("letters.pdf"), "body": long});
+        let e = s.run("people.mailMerge", &letters).unwrap_err();
+        assert!(e.to_string().contains("page limit"), "{e}");
+        assert!(!dir.path().join("letters.pdf").exists());
+        // A template whose fields make one contact's text too long is refused.
+        let huge = "{{Full Name}}".repeat(MAX_MERGE_TEMPLATE / 13);
+        let mut c = Contact { first_name: "x".repeat(200), ..Default::default() };
+        assert!(merge_text(&huge, &c).is_err());
+        c.first_name = "Al".into();
+        assert!(merge_text("Dear {{First Name}}", &c).is_ok());
+        let p = json!({"output": "letters", "action": "merge", "path": path("big.pdf"), "body": huge});
+        assert!(matches!(s.run("people.mailMerge", &p), Err(CmdError::Params(_))));
+        // The running total stops a merge before it makes too much text.
+        let mut total = 0usize;
+        assert!(add_merged(&mut total, MAX_MERGE_TOTAL).is_ok());
+        assert!(add_merged(&mut total, 1).is_err());
+    }
+
+    #[test]
     fn people_view_rows_search_and_reverse() {
         let mut s = session();
         let folder = role(&s, FolderRole::Contacts);
@@ -2373,6 +2979,11 @@ mod tests {
             json!({"fullName": "Ann Lee", "company": "Example Co", "phones": {"Business": "1", "Mobile": "2"},
                    "businessAddress": {"street": "1 Main", "city": "Town"}}),
         );
+        let b = add(
+            &mut s,
+            json!({"fullName": "Cy Dee", "company": "Example Co", "webPage": "https://www.example.com",
+                   "phones": {"Business": "5", "Business Fax": "6", "Company Main": "7", "Home": "8"}}),
+        );
         select(&mut s, &[]);
         assert!(matches!(s.run("people.newFromSameCompany", &json!({})), Err(CmdError::Disabled(_))));
         select(&mut s, &[a]);
@@ -2386,6 +2997,18 @@ mod tests {
         assert_eq!(c.company, "Example Co");
         assert_eq!(c.phones.len(), 1);
         assert_eq!(c.addresses.len(), 1);
+        // Business fax, the company's main number and the web page come along; home numbers do not.
+        select(&mut s, &[b]);
+        let r = s.run("people.newFromSameCompany", &json!({})).unwrap();
+        assert_eq!(r["dialog"], "contact");
+        assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(_, p))
+            if p["prefill"]["webPage"] == "https://www.example.com"
+               && p["prefill"]["phones"] == json!({"Business": "5", "Business Fax": "6", "Company Main": "7"})));
+        let r = s.run("people.newFromSameCompany", &json!({"fullName": "Di Eve"})).unwrap();
+        let c = &s.mailbox.contacts[&ItemId(r["id"].as_u64().unwrap())];
+        assert_eq!(c.web_page, "https://www.example.com");
+        assert_eq!(c.phones.len(), 3);
+        select(&mut s, &[a]);
         // Notes cannot turn the new contact into a contact group (same rule as people.new).
         let before = s.mailbox.contacts.len();
         let r = s.run("people.newFromSameCompany", &json!({"fullName": "Cy", "notes": "Contact Group\nx"}));

@@ -287,6 +287,10 @@ pub struct CalendarViewState {
     pub no_grid: bool,
     /// View Settings › Format Columns: header labels set by hand (column name → label).
     pub labels: std::collections::BTreeMap<String, String>,
+    /// View Settings › Other Settings (Day, Week and Month views): show end times in Month view.
+    pub month_end_time: bool,
+    /// View Settings › Other Settings: mark the days that have items in the Date Navigator (on by default).
+    pub nav_marks: bool,
 }
 
 /// Longest Format Columns label (characters).
@@ -349,6 +353,8 @@ impl Default for CalendarViewState {
             rules: Vec::new(),
             no_grid: false,
             labels: std::collections::BTreeMap::new(),
+            month_end_time: false,
+            nav_marks: true,
         }
     }
 }
@@ -400,6 +406,10 @@ pub struct CalendarTimeZones {
     /// IANA id of the second zone shown in day and week views.
     pub second_zone: String,
     pub second_label: String,
+    /// A third zone shown in day and week views (with the second one).
+    pub show_third: bool,
+    pub third_zone: String,
+    pub third_label: String,
 }
 
 /// Per-calendar-folder settings: colour, source (and subscription), saved view.

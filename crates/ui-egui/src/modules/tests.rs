@@ -588,6 +588,10 @@ fn mail_merge_window_previews_and_sends() {
     let mut h = harness(super::people, a, (1500.0, 1000.0));
     run_cmd(&mut h, "people.mailMerge", json!({"contacts": "all", "output": "letters"}));
     assert!(has(&h, "Mail Merge Contacts"));
+    // Form letters go to a new document unless E-mail is chosen.
+    assert!(h.query_by_label("Message subject line").is_none());
+    click(&h, "E-mail");
+    h.run_ok();
     h.get_by_label("Message subject line").focus();
     h.run_ok();
     h.get_by_label("Message subject line").type_text("Hello");
@@ -616,6 +620,111 @@ fn mail_merge_window_previews_and_sends() {
         .collect();
     assert_eq!(outbox.iter().filter(|s| *s == "Hello").count(), 6, "{outbox:?}");
     assert!(!has(&h, "Mail Merge Contacts"));
+}
+
+#[test]
+fn mail_merge_window_writes_letters_and_the_contact_data_file() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 1000.0));
+    // Scratch files go under the cargo target dir (`<target>/tmp`, found from the test binary's path).
+    let dir = std::env::current_exe()
+        .unwrap()
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .join("tmp")
+        .join(format!("mc-merge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf = dir.join("letters.pdf");
+    let csv = dir.join("data.csv");
+    run_cmd(&mut h, "people.mailMerge", json!({"contacts": "all"}));
+    assert!(has(&h, "Mail Merge Contacts"));
+    assert!(has_part(&h, "Dear Bob,"), "the preview merges the first contact's letter");
+    h.get_by_label("New document (PDF)").focus();
+    h.run_ok();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run_ok();
+    h.get_by_label("New document (PDF)").type_text(&pdf.display().to_string());
+    h.run_ok();
+    click(&h, "Save the contact data to a file");
+    h.run_ok();
+    h.get_by_label("File:").focus();
+    h.run_ok();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run_ok();
+    h.get_by_label("File:").type_text(&csv.display().to_string());
+    h.run_ok();
+    click(&h, "Merge");
+    h.run_ok();
+    assert!(!has(&h, "Mail Merge Contacts"), "the window closes after the merge");
+    assert!(std::fs::read(&pdf).unwrap().starts_with(b"%PDF"));
+    let text = std::fs::read_to_string(&csv).unwrap();
+    assert!(text.starts_with("Full Name,"), "{text}");
+    // Mailing labels: E-mail is not offered for them.
+    run_cmd(&mut h, "people.mailMerge", json!({"contacts": "all", "output": "labels"}));
+    assert!(has(&h, "Labels"), "the label sheet choice shows");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: switching the window to Mailing Labels or Envelopes used to keep the letter greeting, so every
+/// label printed only "Dear …,". The untouched text now follows the document type.
+#[test]
+fn mail_merge_labels_from_the_window_print_the_address_block() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 1000.0));
+    let dir = std::env::current_exe()
+        .unwrap()
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .join("tmp")
+        .join(format!("mc-merge-labels-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf = dir.join("labels.pdf");
+    // Opens the Document type combo (shown with its current choice) and picks `to`.
+    let pick = |h: &mut Harness<'_, App>, from: &str, to: &str| {
+        h.get_by_value(from).click();
+        h.run_ok();
+        click(h, to);
+        h.run_ok();
+    };
+    run_cmd(&mut h, "people.mailMerge", json!({"contacts": "all"}));
+    assert!(has_part(&h, "Dear Bob,"));
+    pick(&mut h, "Form Letters", "Mailing Labels");
+    assert!(!has_part(&h, "Dear Bob,"), "the greeting is gone");
+    assert!(has_part(&h, "Bob Chen\nExample Org"), "the preview shows the address block");
+    pick(&mut h, "Mailing Labels", "Envelopes");
+    assert!(has_part(&h, "Bob Chen\nExample Org"));
+    pick(&mut h, "Envelopes", "Form Letters");
+    assert!(has_part(&h, "Dear Bob,"), "back to letters: the greeting returns");
+    pick(&mut h, "Form Letters", "Mailing Labels");
+    // Merged from the window: the engine gets the address block (not a blank or the greeting).
+    h.get_by_label("New document (PDF)").focus();
+    h.run_ok();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run_ok();
+    h.get_by_label("New document (PDF)").type_text(&pdf.display().to_string());
+    h.run_ok();
+    click(&h, "Merge");
+    h.run_ok();
+    assert!(!has(&h, "Mail Merge Contacts"), "the window closes after the merge");
+    assert!(std::fs::read(&pdf).unwrap().starts_with(b"%PDF"));
+    let toast = h.state().ui.toast.clone().map(|t| t.0).unwrap_or_default();
+    assert!(toast.contains("6 contact(s), 1 page(s)"), "{toast}");
+    // The same text merged by the engine is the address, not a greeting.
+    let r = h
+        .state_mut()
+        .s
+        .run(
+            "people.mailMerge",
+            &json!({"contacts": "all", "output": "labels", "action": "preview",
+                    "body": mailcraft_engine::cmd::people::ADDRESS_BLOCK}),
+        )
+        .unwrap();
+    assert_eq!(r["preview"]["text"], "Bob Chen\nExample Org");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -1429,7 +1429,8 @@ fn lookup_contacts(s: &Session, query: &str) -> Vec<String> {
             v.push((line, addr.to_owned()));
         }
     };
-    for c in s.mailbox.contacts.values() {
+    let books = crate::cmd::people::BookFilter::new(s);
+    for c in s.mailbox.contacts.values().filter(|c| books.shows(c.folder)) {
         let emails: Vec<&str> = c.emails.iter().map(|e| e.trim()).filter(|e| !e.is_empty()).collect();
         if emails.is_empty() {
             continue;

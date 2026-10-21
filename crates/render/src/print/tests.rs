@@ -435,3 +435,122 @@ fn hostile_setup_and_content_do_not_panic() {
         CalendarData { style: CalendarStyle::Daily, first_day: 0, last_day: i64::MAX, ..Default::default() };
     assert!(paginate(&PrintContent::Calendar(cal), &PageSetup::default(), &ctx(), &f).len() <= MAX_PAGES);
 }
+
+fn merge(style: MergeStyle, records: &[&str]) -> PrintContent {
+    PrintContent::Merge(MergeDoc {
+        style,
+        records: records.iter().map(|r| (*r).to_owned()).collect(),
+        return_address: "Pat Example\n1 Sender Way\nTown".into(),
+    })
+}
+
+fn blank() -> PageSetup {
+    PageSetup { footer: Default::default(), ..PageSetup::default() }
+}
+
+#[test]
+fn form_letters_start_each_record_on_a_new_page() {
+    let f = fonts();
+    let long = format!("Dear Bo,\n\n{}", "A long letter line that wraps. ".repeat(400));
+    let pages = paginate(&merge(MergeStyle::Letters, &["Dear Ann,\nHello.", &long]), &blank(), &ctx(), &f);
+    assert!(pages.len() >= 3, "the second letter runs over more than one page: {}", pages.len());
+    assert_eq!(texts(&pages[0]), ["Dear Ann,", "Hello."]);
+    assert_eq!(texts(&pages[1]).first(), Some(&"Dear Bo,"));
+    // An empty merge still makes one page.
+    assert_eq!(paginate(&merge(MergeStyle::Letters, &[]), &blank(), &ctx(), &f).len(), 1);
+}
+
+#[test]
+fn mailing_labels_fill_the_sheet_cells_in_order() {
+    let f = fonts();
+    let sheet = label_sheet("30").unwrap();
+    assert_eq!(sheet.per_sheet(), 30);
+    let recs: Vec<String> = (0..31).map(|i| format!("Person {i}\n{i} Main St\nTown")).collect();
+    let refs: Vec<&str> = recs.iter().map(String::as_str).collect();
+    let pages = paginate(&merge(MergeStyle::Labels(sheet), &refs), &blank(), &ctx(), &f);
+    assert_eq!(pages.len(), 2, "31 labels need two sheets of 30");
+    assert_eq!(texts(&pages[1]), ["Person 30", "30 Main St", "Town"]);
+    // The second label sits in the second column, right of the first.
+    let pos = |p: &Page, t: &str| {
+        p.display.items.iter().find_map(|i| match i {
+            DisplayItem::Text { text, origin, .. } if text == t => Some((origin.x, origin.y)),
+            _ => None,
+        })
+    };
+    let (x0, y0) = pos(&pages[0], "Person 0").unwrap();
+    let (x1, y1) = pos(&pages[0], "Person 1").unwrap();
+    let (x3, y3) = pos(&pages[0], "Person 3").unwrap();
+    assert!(x1 > x0 + 200.0 && (y1 - y0).abs() < 0.5);
+    assert!((x3 - x0).abs() < 0.5 && y3 > y0 + 80.0, "the fourth label starts the second row");
+    // A label never prints outside its cell, even with many lines.
+    let many = "line\n".repeat(40);
+    let pages = paginate(&merge(MergeStyle::Labels(sheet), &[&many]), &blank(), &ctx(), &f);
+    let cell = sheet.cell(0);
+    for i in &pages[0].display.items {
+        if let DisplayItem::Text { origin, .. } = i {
+            assert!(origin.y > cell.y && origin.y < cell.y + cell.h, "{} outside the label", origin.y);
+        }
+    }
+    assert!(label_sheet("nope").is_none());
+    assert_eq!(label_sheet("21").unwrap().paper, Paper::A4);
+}
+
+#[test]
+fn envelopes_put_one_address_per_envelope_with_the_return_address() {
+    let f = fonts();
+    let setup = PageSetup { paper: Paper::Envelope10, orientation: Orientation::Landscape, ..blank() };
+    let recs = ["Ann Lee\n2 Elm Rd", "Bo Ek\n3 Oak Ave"];
+    let pages = paginate(&merge(MergeStyle::Envelopes, &recs), &setup, &ctx(), &f);
+    assert_eq!(pages.len(), 2);
+    assert!((pages[0].width - 9.5 * 96.0).abs() < 0.5 && (pages[0].height - 4.125 * 96.0).abs() < 0.5);
+    assert_eq!(texts(&pages[1]), ["Pat Example", "1 Sender Way", "Town", "Bo Ek", "3 Oak Ave"]);
+    assert_eq!(Paper::parse("envelope dl"), Some(Paper::EnvelopeDl));
+    let pdf = write_pdf(&pages, &f, &PdfInfo::default()).unwrap();
+    assert!(pdf.starts_with(b"%PDF"));
+}
+
+#[test]
+fn hostile_merge_records_do_not_panic() {
+    let f = fonts();
+    let junk = format!("{}\u{0}\u{202e}{}", "x".repeat(100_000), "\n".repeat(10_000));
+    for style in [MergeStyle::Letters, MergeStyle::Labels(label_sheet("10").unwrap()), MergeStyle::Envelopes]
+    {
+        let pages = paginate(&merge(style, &[&junk, "", &junk]), &blank(), &ctx(), &f);
+        assert!(!pages.is_empty() && pages.len() <= MAX_PAGES);
+    }
+    let odd = LabelSheet { cols: 0, rows: 0, w_in: -1.0, h_in: f32::NAN, ..label_sheet("30").unwrap() };
+    let _ = paginate(&merge(MergeStyle::Labels(odd), &["a", "b"]), &blank(), &ctx(), &f);
+}
+
+/// Regression: a merge reports how many records its pages hold, so a cut-short document is never taken for
+/// a complete one.
+#[test]
+fn merge_documents_report_the_records_they_hold() {
+    let f = fonts();
+    let doc = |style, n: usize, text: &str| MergeDoc {
+        style,
+        records: (0..n).map(|i| format!("{text} {i}")).collect(),
+        return_address: String::new(),
+    };
+    let setup = PageSetup { paper: Paper::Envelope10, orientation: Orientation::Landscape, ..blank() };
+    // Every record fits: all are counted.
+    let (pages, placed) = paginate_merge(&doc(MergeStyle::Envelopes, 3, "Ann"), &setup, &ctx(), &f);
+    assert_eq!((pages.len(), placed), (3, 3));
+    // One envelope per page: the page limit holds MAX_PAGES of them.
+    assert_eq!(max_records(&MergeStyle::Envelopes), MAX_PAGES);
+    let (pages, placed) =
+        paginate_merge(&doc(MergeStyle::Envelopes, MAX_PAGES + 5, "Ann"), &setup, &ctx(), &f);
+    assert_eq!((pages.len(), placed), (MAX_PAGES, MAX_PAGES));
+    // Labels: a sheet per page.
+    let sheet = label_sheet("10").unwrap();
+    assert_eq!(max_records(&MergeStyle::Labels(sheet)), 10 * MAX_PAGES);
+    let (_, placed) = paginate_merge(&doc(MergeStyle::Labels(sheet), 25, "Bo"), &blank(), &ctx(), &f);
+    assert_eq!(placed, 25);
+    // Letters that run over several pages: a letter cut at the page limit does not count.
+    let long = "line\n".repeat(4_000);
+    let (pages, placed) = paginate_merge(&doc(MergeStyle::Letters, 40, &long), &blank(), &ctx(), &f);
+    assert_eq!(pages.len(), MAX_PAGES);
+    assert!(placed < 40 && placed > 0, "{placed}");
+    let (_, placed) = paginate_merge(&doc(MergeStyle::Letters, 2, &long), &blank(), &ctx(), &f);
+    assert_eq!(placed, 2);
+}

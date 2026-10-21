@@ -12,7 +12,8 @@
 //! (View › Overlay). Items take their first category's colour, else their calendar's colour (View › Color).
 //! In day and week views appointments are dragged to move them and their top or bottom edge is dragged to
 //! change their length (`calendar.moveItem` / `calendar.resize`; one occurrence of a series becomes an
-//! exception). Day and week views show the second time zone (Change Time Zone) in a second ruler.
+//! exception). Day and week views show the second and third time zones (Change Time Zone) in rulers of
+//! their own.
 //!
 //! Windows the calendar draws itself (Change Time Zone, Add Calendar From Internet / From File / Create New
 //! Blank Calendar, View Settings, Share Calendar, Manage Views, Save View As, Apply View) and the internet
@@ -103,7 +104,9 @@ const VIEW_COMMANDS: [&str; 8] = [
 // Calendar UI state (egui memory, separate from the shared ModState)
 // ---------------------------------------------------------------------------------------------------------
 
-/// What the calendar keeps between frames besides `ModState`.
+/// What the calendar keeps between frames besides `ModState`. The saved views seen, the drag, the scroll
+/// keys and the calendar's own windows belong to the window (egui viewport) drawing the calendar
+/// ([`WindowUi`]); the internet calendar fetches and the timers are shared by all windows.
 #[derive(Clone, Default)]
 struct CalUi {
     /// Saved-view number last adopted, per calendar folder.
@@ -121,16 +124,68 @@ struct CalUi {
     auto_seen: BTreeSet<u64>,
 }
 
+/// The per-window part of [`CalUi`] (windows other than the main one).
+#[derive(Clone, Default)]
+struct WindowUi {
+    seen: BTreeMap<u64, u64>,
+    drag: Option<Drag>,
+    scroll_keys: BTreeMap<usize, String>,
+    windows: windows::Windows,
+}
+
+impl WindowUi {
+    fn of(cu: &CalUi) -> WindowUi {
+        WindowUi {
+            seen: cu.seen.clone(),
+            drag: cu.drag.clone(),
+            scroll_keys: cu.scroll_keys.clone(),
+            windows: cu.windows.clone(),
+        }
+    }
+
+    fn apply(self, cu: &mut CalUi) {
+        cu.seen = self.seen;
+        cu.drag = self.drag;
+        cu.scroll_keys = self.scroll_keys;
+        cu.windows = self.windows;
+    }
+}
+
 fn ui_id() -> Id {
     Id::new("mailcraft.modules.calendar.ui")
 }
 
-fn load_ui(ctx: &egui::Context) -> CalUi {
-    ctx.data_mut(|d| d.get_temp::<CalUi>(ui_id())).unwrap_or_default()
+fn window_ui_id(viewport: egui::ViewportId) -> Id {
+    Id::new(("mailcraft.modules.calendar.ui.window", viewport))
 }
 
-fn store_ui(ctx: &egui::Context, cu: CalUi) {
+fn load_ui(ctx: &egui::Context) -> CalUi {
+    let mut cu = ctx.data_mut(|d| d.get_temp::<CalUi>(ui_id())).unwrap_or_default();
+    let vp = ctx.viewport_id();
+    if vp != egui::ViewportId::ROOT {
+        // A new window starts with no windows open and nothing being dragged.
+        let own = ctx
+            .data_mut(|d| d.get_temp::<WindowUi>(window_ui_id(vp)))
+            .unwrap_or_else(|| WindowUi { seen: cu.seen.clone(), ..Default::default() });
+        own.apply(&mut cu);
+    }
+    cu
+}
+
+fn store_ui(ctx: &egui::Context, mut cu: CalUi) {
+    let vp = ctx.viewport_id();
+    if vp != egui::ViewportId::ROOT {
+        let main = ctx.data_mut(|d| d.get_temp::<CalUi>(ui_id())).unwrap_or_default();
+        let own = WindowUi::of(&cu);
+        WindowUi::of(&main).apply(&mut cu);
+        ctx.data_mut(|d| d.insert_temp(window_ui_id(vp), own));
+    }
     ctx.data_mut(|d| d.insert_temp(ui_id(), cu));
+}
+
+/// Drops what the calendar kept for a closed window.
+pub(super) fn forget_window(ctx: &egui::Context, viewport: egui::ViewportId) {
+    ctx.data_mut(|d| d.remove::<WindowUi>(window_ui_id(viewport)));
 }
 
 /// A drag in progress: which block, what part, and where it started.
@@ -165,6 +220,8 @@ struct Look {
     slot_h: f32,
     /// Second time zone: (label, offset at the first visible day).
     second: Option<(String, i32)>,
+    /// Third time zone, shown left of the second one.
+    third: Option<(String, i32)>,
     /// The calendar's own offset then (the second ruler shows the difference).
     primary_off: i32,
     primary_label: String,
@@ -196,6 +253,7 @@ impl Look {
             work: engine_cal::work_hours(&mut app.s),
             slot_h: if st.cal.tighter_spacing { SLOT_H_TIGHT } else { SLOT_H },
             second: engine_cal::second_zone(&mut app.s, noon),
+            third: engine_cal::third_zone(&mut app.s, noon),
             primary_off,
             primary_label: views::primary_zone_label(&app.s),
             preview: st.cal.current == CalendarCurrentView::Preview,
@@ -204,6 +262,13 @@ impl Look {
             week_rule: views::first_week_rule(&app.s),
             schedule_free: app.s.settings.bool("calendar.scheduleShowFree"),
         }
+    }
+}
+
+impl Look {
+    /// The time zones shown left of the calendar's own ruler, leftmost first: the third, then the second.
+    fn extra_zones(&self) -> Vec<(String, i32)> {
+        self.third.iter().chain(self.second.iter()).take(2).cloned().collect()
     }
 }
 
@@ -242,6 +307,10 @@ fn adopt_saved(app: &mut App, st: &mut ModState, cu: &mut CalUi) {
         return;
     }
     cu.seen.insert(folder.0, seq);
+    // Saved by a view command of this or another window: each window keeps its own view.
+    if st.cal_ui_seq.get(&folder.0) == Some(&seq) {
+        return;
+    }
     let (date, days) = (st.cal.date.clone(), st.cal.days);
     let same_mode = saved.mode == st.cal.mode;
     st.cal = saved;
@@ -255,9 +324,20 @@ fn own_window(id: &str, p: &Value) -> Option<&'static str> {
     let has = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
     match id {
         "calendar.changeTimeZone"
-            if !["offsetMin", "zone", "label", "secondZone", "secondLabel", "showSecond", "swap"]
-                .iter()
-                .any(|k| has(k)) =>
+            if ![
+                "offsetMin",
+                "zone",
+                "label",
+                "secondZone",
+                "secondLabel",
+                "showSecond",
+                "thirdZone",
+                "thirdLabel",
+                "showThird",
+                "swap",
+            ]
+            .iter()
+            .any(|k| has(k)) =>
         {
             Some(windows::TZ_DIALOG)
         }
@@ -305,6 +385,15 @@ pub(super) fn run_view_cmd(app: &mut App, st: &mut ModState, id: &str, params: V
     {
         st.cal = v;
         app.ui.calendar_view = st.cal.mode.name().to_owned();
+        // The view this window just saved is not an outside change for the other windows.
+        if let (Some(folder), Some((_, seq))) =
+            (current_folder(app, Kind::Appointment), engine_cal::saved_view(&app.s))
+        {
+            if st.cal_ui_seq.len() > 1_000 {
+                st.cal_ui_seq.clear();
+            }
+            st.cal_ui_seq.insert(folder.0, seq);
+        }
     }
     Some(out)
 }
@@ -1032,7 +1121,7 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64
             FontId::proportional(11.5),
             color,
         );
-        if busy.contains(&d) && in_month {
+        if st.cal.nav_marks && busy.contains(&d) && in_month {
             let dot = pos2(rect.center().x, rect.max.y - 3.0);
             ui.painter().circle_filled(dot, 1.6, if d == now { Color32::WHITE } else { app.theme.accent });
         }
@@ -1481,7 +1570,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
                     p.rect_filled(chip, CornerRadius::same(3), fill);
                 }
                 p.circle_filled(pos2(chip.min.x + 6.0, chip.center().y), 3.5, bar);
-                let text = format!("{} {}", clock(o.start.rem_euclid(DAY) / 60), o.label());
+                let text = month_chip_text(o, st.cal.month_end_time);
                 paint_text_clipped(
                     ui,
                     pos2(chip.min.x + 13.0, chip.min.y + 2.0),
@@ -1699,8 +1788,8 @@ fn time_grid_view(
     let now = today(app);
     let scroll_w = 12.0;
     let k = pane.key;
-    let rulers = if look.second.is_some() { 2.0 } else { 1.0 };
-    let ruler_w = RULER_W * rulers;
+    let extra = look.extra_zones();
+    let ruler_w = RULER_W * (1 + extra.len()) as f32;
     let col_w = ((rect.width() - ruler_w - scroll_w) / n).max(20.0);
     let p = ui.painter().clone();
     let line = Stroke::new(1.0, app.theme.separator);
@@ -1708,7 +1797,7 @@ fn time_grid_view(
 
     // Day headers (and the zone labels over the rulers).
     let head_h = 44.0;
-    if look.second.is_none() && !look.primary_label.is_empty() {
+    if extra.is_empty() && !look.primary_label.is_empty() {
         // File › Options › Calendar › Time zones › Label, over the ruler.
         paint_text_clipped(
             ui,
@@ -1719,10 +1808,12 @@ fn time_grid_view(
             RULER_W - 8.0,
         );
     }
-    if let Some((label2, _)) = &look.second {
+    if !extra.is_empty() {
         let primary =
             if look.primary_label.is_empty() { "Local".to_owned() } else { look.primary_label.clone() };
-        for (i, text) in [label2.as_str(), primary.as_str()].iter().enumerate() {
+        let labels: Vec<&str> =
+            extra.iter().map(|(l, _)| l.as_str()).chain(std::iter::once(primary.as_str())).collect();
+        for (i, text) in labels.iter().enumerate() {
             paint_text_clipped(
                 ui,
                 pos2(rect.min.x + 4.0 + RULER_W * i as f32, rect.min.y + head_h - 16.0),
@@ -1865,7 +1956,9 @@ fn time_grid_view(
         cu.scroll_keys.insert(k, key);
     }
     let now_min = now_minute(app);
-    let second_shift = look.second.as_ref().map(|(_, off)| i64::from(*off) - i64::from(look.primary_off));
+    // Minutes each extra ruler is ahead of the calendar's own clock (leftmost ruler first).
+    let shifts: Vec<i64> =
+        extra.iter().map(|(_, off)| i64::from(*off) - i64::from(look.primary_off)).collect();
     let salt = format!("mc-cal-grid-area-{k}");
     child(ui, grid, &salt, |ui| {
         area.show(ui, |ui| {
@@ -1894,8 +1987,8 @@ fn time_grid_view(
                 }
                 p.vline(col.min.x, col.y_range(), line);
             }
-            if second_shift.is_some() {
-                p.vline(area_rect.min.x + RULER_W, area_rect.y_range(), line);
+            for i in 0..shifts.len() {
+                p.vline(area_rect.min.x + RULER_W * (i + 1) as f32, area_rect.y_range(), line);
             }
             if let Some((sd, sm)) = st.cal_slot
                 && let Some(i) = days.iter().position(|&d| d == sd)
@@ -1923,9 +2016,9 @@ fn time_grid_view(
                         FontId::proportional(11.0),
                         app.theme.text_muted,
                     );
-                    if let Some(shift) = second_shift {
+                    for (i, shift) in shifts.iter().enumerate() {
                         p.text(
-                            pos2(area_rect.min.x + RULER_W - 6.0, y + 2.0),
+                            pos2(area_rect.min.x + RULER_W * (i + 1) as f32 - 6.0, y + 2.0),
                             Align2::RIGHT_TOP,
                             ruler_label(m + shift),
                             FontId::proportional(11.0),
@@ -2195,45 +2288,151 @@ fn task_strip(
     }
 }
 
+/// A timed item's line in Month view: its start time (and end time, with View Settings › Show end times in
+/// Month view) and its subject.
+fn month_chip_text(o: &Occ, end_time: bool) -> String {
+    let start = clock(o.start.rem_euclid(DAY) / 60);
+    if end_time {
+        format!("{start} - {} {}", clock(o.end.rem_euclid(DAY) / 60), o.label())
+    } else {
+        format!("{start} {}", o.label())
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Schedule view
 // ---------------------------------------------------------------------------------------------------------
 
-fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rect: Rect) {
-    let sel = selected_day(app, st);
-    let label_w = 190.0_f32.min(rect.width() / 3.0);
-    let hour_w = 80.0;
-    let head_h = 30.0;
-    let row_h = 46.0;
-    let shown = shown_calendars(app, st);
-    let rows: Vec<(String, FolderId)> = ordered(app, &shown)
+/// Width of one time slot in Schedule View (the Time Scale sets how long a slot is).
+const SCHEDULE_SLOT_W: f32 = 40.0;
+
+/// Schedule View's time axis: the minutes shown (all day, or the working hours with Working Hours on) and
+/// the width of a minute (one [`SCHEDULE_SLOT_W`] slot per Time Scale step).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScheduleAxis {
+    from: i64,
+    to: i64,
+    slot: i64,
+    px_per_min: f32,
+}
+
+impl ScheduleAxis {
+    fn of(v: &CalendarViewState, work: (i64, i64)) -> ScheduleAxis {
+        let (from, to) = if v.working_hours && work.0 < work.1 {
+            (work.0.clamp(0, 24 * 60), work.1.clamp(0, 24 * 60))
+        } else {
+            (0, 24 * 60)
+        };
+        let (from, to) = if to > from { (from, to) } else { (0, 24 * 60) };
+        let slot = i64::from(v.time_scale.clamp(5, 60));
+        ScheduleAxis { from, to, slot, px_per_min: SCHEDULE_SLOT_W / slot as f32 }
+    }
+
+    fn width(&self) -> f32 {
+        (self.to - self.from) as f32 * self.px_per_min
+    }
+
+    /// X offset of minute `m` of the day (clamped to the axis).
+    fn x(&self, m: f32) -> f32 {
+        (m.clamp(self.from as f32, self.to as f32) - self.from as f32) * self.px_per_min
+    }
+
+    /// The slot start (minute of the day) at x offset `dx`.
+    fn minute_at(&self, dx: f32) -> i64 {
+        let m = self.from + (dx.max(0.0) / self.px_per_min) as i64;
+        let m = (m.div_euclid(self.slot)) * self.slot;
+        m.clamp(self.from, (self.to - self.slot).max(self.from))
+    }
+
+    /// Minutes of the day where a column line falls (each slot), and whether it starts an hour.
+    fn lines(&self) -> Vec<(i64, bool)> {
+        let first = (self.from + self.slot - 1).div_euclid(self.slot) * self.slot;
+        (0..)
+            .map(|i| first + i * self.slot)
+            .take_while(|m| *m <= self.to)
+            .take(24 * 60 / 5 + 1)
+            .map(|m| (m, m % 60 == 0))
+            .collect()
+    }
+}
+
+/// Most lanes one Schedule View row splits into; items that would need more are counted in "+N more".
+const MAX_SCHEDULE_LANES: usize = 6;
+/// Most items one Schedule View row looks at (a hostile calendar can hold thousands on one day).
+const MAX_SCHEDULE_ROW_ITEMS: usize = 500;
+
+/// Lanes for overlapping blocks in one Schedule View row: the lane of each (start, end) interval (given in
+/// start order; `None` when all `max` lanes are taken at its start) and the number of lanes used.
+fn lanes(spans: &[(i64, i64)], max: usize) -> (Vec<Option<usize>>, usize) {
+    let max = max.max(1);
+    let mut ends: Vec<i64> = Vec::new();
+    let mut out = Vec::with_capacity(spans.len());
+    for (s, e) in spans {
+        let lane = match ends.iter().position(|end| *end <= *s) {
+            Some(i) => Some(i),
+            None if ends.len() < max => {
+                ends.push(i64::MIN);
+                Some(ends.len() - 1)
+            }
+            None => None,
+        };
+        if let Some(slot) = lane.and_then(|l| ends.get_mut(l)) {
+            *slot = (*e).max(*s);
+        }
+        out.push(lane);
+    }
+    (out, ends.len().max(1))
+}
+
+/// Schedule View rows: one per shown calendar, or (Overlay) one row with every shown calendar.
+fn schedule_rows(app: &App, shown: &BTreeSet<FolderId>, overlay: bool) -> Vec<(String, Vec<FolderId>)> {
+    let rows: Vec<(String, FolderId)> = ordered(app, shown)
         .into_iter()
         .filter_map(|f| app.s.mailbox.folder(f).map(|x| (x.name.clone(), f)))
         .collect();
+    if overlay && rows.len() > 1 {
+        let names: Vec<String> = rows.iter().map(|(n, _)| n.clone()).collect();
+        return vec![(names.join(", "), rows.into_iter().map(|(_, f)| f).collect())];
+    }
+    rows.into_iter().map(|(n, f)| (n, vec![f])).collect()
+}
+
+fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rect: Rect) {
+    let sel = selected_day(app, st);
+    let label_w = 190.0_f32.min(rect.width() / 3.0);
+    let axis = ScheduleAxis::of(&st.cal, look.work);
+    let head_h = 30.0;
+    let row_h = 46.0;
+    let shown = shown_calendars(app, st);
+    let rows = schedule_rows(app, &shown, st.cal.overlay);
     if rows.is_empty() {
         empty_message(ui, rect, app, "No calendar selected", "Tick a calendar under My Calendars.");
         return;
     }
     let p = ui.painter().clone();
     let line = Stroke::new(1.0, app.theme.separator);
+    let faint = Stroke::new(1.0, blend(app.theme.separator, app.theme.reading, 0.6));
     // Free items show only when File › Options › Calendar asks for them.
     let mut occs = gather(app, &shown, sel, sel + 1);
     if !look.schedule_free {
         occs.retain(|o| o.show_as != BusyStatus::Free);
     }
-    // Calendar names.
+    // Calendar names (an overlaid row shows a colour bar per calendar).
     let labels = Rect::from_min_size(rect.min, vec2(label_w, rect.height()));
     p.rect_filled(labels, CornerRadius::ZERO, blend(app.theme.reading, app.theme.backdrop, 0.3));
-    for (k, (name, folder)) in rows.iter().enumerate() {
+    for (k, (name, folders)) in rows.iter().enumerate() {
         let r = Rect::from_min_size(
             pos2(labels.min.x, labels.min.y + head_h + row_h * k as f32),
             vec2(label_w, row_h),
         );
-        p.rect_filled(
-            Rect::from_min_size(pos2(r.min.x + 4.0, r.min.y + 6.0), vec2(4.0, row_h - 12.0)),
-            CornerRadius::same(2),
-            calendar_color32(app, *folder),
-        );
+        let bar_h = ((row_h - 12.0) / folders.len().max(1) as f32).max(2.0);
+        for (i, folder) in folders.iter().enumerate() {
+            p.rect_filled(
+                Rect::from_min_size(pos2(r.min.x + 4.0, r.min.y + 6.0 + bar_h * i as f32), vec2(4.0, bar_h)),
+                CornerRadius::same(2),
+                calendar_color32(app, *folder),
+            );
+        }
         paint_text_clipped(
             ui,
             pos2(r.min.x + 14.0, r.center().y - 8.0),
@@ -2245,40 +2444,63 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
         p.hline(labels.x_range(), r.max.y, line);
     }
     let timeline = Rect::from_min_max(pos2(rect.min.x + label_w + 1.0, rect.min.y), rect.max);
-    let key = format!("schedule|{}", st.cal.date);
+    let key = format!("schedule|{}|{}|{}|{}", st.cal.date, axis.slot, axis.from, axis.to);
     let mut area = ScrollArea::horizontal().id_salt("mc-cal-schedule").auto_shrink([false, false]);
     if st.cal_scroll_key != key {
-        area = area.horizontal_scroll_offset(8.0 * hour_w);
+        // Opens on the working day (all day: from 8 AM).
+        let start = if axis.from > 0 { axis.from } else { look.work.0.clamp(0, 23 * 60).min(8 * 60) };
+        area = area.horizontal_scroll_offset(axis.x(start as f32));
         st.cal_scroll_key = key;
     }
     let now = today(app);
     let now_min = now_minute(app);
     child(ui, timeline, "mc-cal-schedule-area", |ui| {
         area.show(ui, |ui| {
-            let total_w = hour_w * 24.0;
+            let total_w = axis.width();
             let height = head_h + row_h * rows.len() as f32;
             let (area_rect, resp) =
                 ui.allocate_exact_size(vec2(total_w, height.max(timeline.height() - 14.0)), Sense::click());
             let p = ui.painter().clone();
-            for h in 0..24 {
-                let x = area_rect.min.x + hour_w * h as f32;
-                let work = (look.work.0..look.work.1).contains(&(h * 60 + 30))
-                    && look.work_days.contains(&weekday(sel));
-                let col = Rect::from_min_size(
-                    pos2(x, area_rect.min.y + head_h),
-                    vec2(hour_w, row_h * rows.len() as f32),
-                );
+            let body_h = row_h * rows.len() as f32;
+            // Working time shading, slot by slot.
+            let working_day = look.work_days.contains(&weekday(sel));
+            for (m, _) in axis.lines() {
+                if m >= axis.to {
+                    break;
+                }
+                let x = area_rect.min.x + axis.x(m as f32);
+                let w = (axis.slot as f32 * axis.px_per_min).min(area_rect.max.x - x).max(0.0);
+                let work = working_day && (look.work.0..look.work.1).contains(&(m + axis.slot / 2));
                 p.rect_filled(
-                    col,
+                    Rect::from_min_size(pos2(x, area_rect.min.y + head_h), vec2(w, body_h)),
                     CornerRadius::ZERO,
                     if work { app.theme.reading } else { blend(app.theme.reading, app.theme.backdrop, 0.3) },
                 );
-                p.vline(x, area_rect.y_range(), line);
+            }
+            // Column lines: each slot (faint), each hour with its label; slots of a fine scale get their
+            // minutes when there is room.
+            for (m, hour) in axis.lines() {
+                let x = area_rect.min.x + axis.x(m as f32);
+                if hour {
+                    p.vline(x, area_rect.y_range(), line);
+                } else {
+                    p.vline(x, (area_rect.min.y + head_h * 0.6)..=area_rect.max.y, faint);
+                }
+                if m >= axis.to {
+                    continue;
+                }
+                let text = if hour {
+                    hour_label(m / 60)
+                } else if axis.slot as f32 * axis.px_per_min >= 36.0 {
+                    format!(":{:02}", m % 60)
+                } else {
+                    continue;
+                };
                 p.text(
                     pos2(x + 6.0, area_rect.min.y + head_h / 2.0),
                     Align2::LEFT_CENTER,
-                    hour_label(h),
-                    FontId::proportional(11.5),
+                    text,
+                    FontId::proportional(if hour { 11.5 } else { 10.0 }),
                     app.theme.text_muted,
                 );
             }
@@ -2289,35 +2511,91 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
                 && let Some(pos) = resp.interact_pointer_pos()
             {
                 let k = ((pos.y - area_rect.min.y - head_h) / row_h).floor();
-                let minute = (((pos.x - area_rect.min.x) / hour_w * 60.0) as i64 / 30) * 30;
+                let minute = axis.minute_at(pos.x - area_rect.min.x);
                 if k >= 0.0
-                    && let Some((_, folder)) = rows.get(k as usize)
+                    && let Some((_, folders)) = rows.get(k as usize)
                 {
-                    st.cal_slot = Some((sel, minute.clamp(0, 23 * 60 + 30)));
+                    st.cal_slot = Some((sel, minute));
                     app.ui.module_selection = None;
                     if resp.double_clicked() {
-                        let f = writable(app, Some(*folder));
+                        // An overlaid row adds to the calendar in use.
+                        let target = if folders.len() == 1 { folders.first().copied() } else { None };
+                        let f = writable(app, target);
                         forms::new_at(app, st, f, sel, minute, false);
                     }
                 }
             }
-            for (k, (_, folder)) in rows.iter().enumerate() {
+            let (ds, de) = (sel * DAY, (sel + 1) * DAY);
+            let (vs, ve) = (ds + axis.from * 60, ds + axis.to * 60);
+            for (k, (_, folders)) in rows.iter().enumerate() {
                 let y = area_rect.min.y + head_h + row_h * k as f32;
-                for o in occs.iter().filter(|o| o.folder == *folder) {
-                    let (ds, de) = (sel * DAY, (sel + 1) * DAY);
-                    let (s, e) = (o.start.max(ds), o.end.min(de).max(o.start.max(ds) + 900));
-                    let x0 = area_rect.min.x + ((s - ds) as f32 / 3600.0) * hour_w;
-                    let x1 = area_rect.min.x + ((e - ds) as f32 / 3600.0) * hour_w;
-                    let r = Rect::from_min_max(pos2(x0 + 1.0, y + 4.0), pos2(x1 - 1.0, y + row_h - 4.0));
-                    let resp = ui.interact(r, Id::new(("mc-cal-sched", o.id.0, o.start)), Sense::click());
+                // Items inside the time shown, in start order, in lanes where they overlap.
+                let mut row: Vec<&Occ> = occs
+                    .iter()
+                    .filter(|o| folders.contains(&o.folder) && o.end.min(de) > vs && o.start.max(ds) < ve)
+                    .collect();
+                row.sort_by_key(|o| (o.start, o.end));
+                let mut hidden = row.len().saturating_sub(MAX_SCHEDULE_ROW_ITEMS);
+                row.truncate(MAX_SCHEDULE_ROW_ITEMS);
+                let spans: Vec<(i64, i64)> = row
+                    .iter()
+                    .map(|o| {
+                        let s = o.start.max(ds);
+                        (s, o.end.min(de).max(s + 900))
+                    })
+                    .collect();
+                let (lane_of, count) = lanes(&spans, MAX_SCHEDULE_LANES);
+                let lane_h = (row_h - 8.0) / count as f32;
+                // Where the first item without a lane starts ("+N more" goes there).
+                let mut more_at: Option<i64> = None;
+                for ((o, (s, e)), lane) in row.iter().zip(&spans).zip(&lane_of) {
+                    let Some(lane) = lane else {
+                        hidden = hidden.saturating_add(1);
+                        more_at = Some(more_at.map_or(*s, |m| m.min(*s)));
+                        continue;
+                    };
+                    let x0 = area_rect.min.x + axis.x((s - ds) as f32 / 60.0);
+                    let x1 = area_rect.min.x + axis.x((e - ds) as f32 / 60.0);
+                    let top = y + 4.0 + lane_h * *lane as f32;
+                    let r = Rect::from_min_max(
+                        pos2(x0 + 1.0, top),
+                        pos2((x1 - 1.0).max(x0 + 3.0), top + lane_h - 1.0),
+                    );
+                    let resp = ui.interact(r, Id::new(("mc-cal-sched", o.id.0, o.start, k)), Sense::click());
                     a11y(&resp, WidgetType::Button, &occ_a11y(o));
                     let selected = app.ui.module_selection == Some(o.id.0);
                     paint_block(ui, app, r, o, selected, false);
                     occ_interact(app, st, &resp, o);
                 }
+                if hidden > 0 {
+                    // Too many overlapping items for the row: the rest are counted, and the count opens the
+                    // day in Day view.
+                    let at = more_at.unwrap_or(vs).clamp(vs, ve);
+                    let x = area_rect.min.x + axis.x((at - ds) as f32 / 60.0);
+                    let text = format!("+{hidden} more");
+                    let more = Rect::from_min_size(pos2(x + 2.0, y + row_h - 18.0), vec2(80.0, 16.0));
+                    let resp = ui.interact(more, Id::new(("mc-cal-sched-more", k, sel)), Sense::click());
+                    a11y(&resp, WidgetType::Button, &text);
+                    p.rect_filled(more, CornerRadius::same(3), app.theme.reading);
+                    p.text(
+                        pos2(more.min.x + 4.0, more.center().y),
+                        Align2::LEFT_CENTER,
+                        &text,
+                        FontId::proportional(11.5),
+                        app.theme.link,
+                    );
+                    if resp.clicked() {
+                        run_view_cmd(
+                            app,
+                            st,
+                            "calendar.goToDate",
+                            json!({ "date": day_string(sel), "mode": "day" }),
+                        );
+                    }
+                }
             }
-            if sel == now {
-                let x = area_rect.min.x + now_min as f32 / 60.0 * hour_w;
+            if sel == now && (axis.from..axis.to).contains(&now_min) {
+                let x = area_rect.min.x + axis.x(now_min as f32);
                 p.vline(x, area_rect.y_range(), Stroke::new(2.0, app.theme.danger));
             }
         });
@@ -2328,6 +2606,81 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
 mod tests {
     use super::*;
     use mailcraft_model::Recurrence;
+
+    #[test]
+    fn schedule_axis_follows_working_hours_and_time_scale() {
+        let mut v = CalendarViewState::default();
+        let work = (8 * 60 + 30, 17 * 60);
+        let a = ScheduleAxis::of(&v, work);
+        assert_eq!((a.from, a.to, a.slot), (0, 24 * 60, 30));
+        assert!((a.width() - 48.0 * SCHEDULE_SLOT_W).abs() < 0.01, "a slot per half hour");
+        v.working_hours = true;
+        let a = ScheduleAxis::of(&v, work);
+        assert_eq!((a.from, a.to), work, "Working Hours shows the working day only");
+        assert_eq!(a.x(0.0), 0.0, "times before the working day are clamped");
+        assert_eq!(a.minute_at(0.0), 8 * 60 + 30);
+        assert_eq!(a.minute_at(SCHEDULE_SLOT_W * 1.5), 9 * 60, "clicks snap to the slot");
+        assert_eq!(a.minute_at(1e9), 16 * 60 + 30, "the last slot");
+        assert_eq!(a.lines().first(), Some(&(8 * 60 + 30, false)), "the first line is the working day start");
+        v.time_scale = 15;
+        v.working_hours = false;
+        let a = ScheduleAxis::of(&v, work);
+        assert!((a.width() - 96.0 * SCHEDULE_SLOT_W).abs() < 0.01, "a 15-minute scale is twice as wide");
+        assert_eq!(a.lines().iter().filter(|(_, h)| *h).count(), 25);
+        // Broken working hours fall back to the whole day.
+        v.working_hours = true;
+        assert_eq!(ScheduleAxis::of(&v, (17 * 60, 9 * 60)).from, 0);
+        v.time_scale = 0;
+        assert_eq!(ScheduleAxis::of(&v, work).slot, 5);
+    }
+
+    #[test]
+    fn a_view_saved_by_one_window_is_not_adopted_by_another() {
+        let mut app = App::new(mailcraft_engine::sample::sample_session());
+        app.s.view.module = Module::Calendar;
+        let mut a = ModState::default();
+        sync_mode(&mut app, &mut a);
+        let mut b = a.clone();
+        let mut cu_b = CalUi::default();
+        adopt_saved(&mut app, &mut b, &mut cu_b);
+        // Window A changes its arrangement; window B (sharing the rest of the state) keeps Month.
+        run_view_cmd(&mut app, &mut a, "calendar.arrange", json!({"mode": "week"}));
+        assert_eq!(a.cal.mode, CalendarMode::Week);
+        b.cal_ui_seq = a.cal_ui_seq.clone();
+        adopt_saved(&mut app, &mut b, &mut cu_b);
+        assert_eq!(b.cal.mode, CalendarMode::Month, "another window's view is not mirrored");
+        // A change from outside the windows (a command run without a view) reaches the window.
+        app.s.run("calendar.arrange", &json!({"mode": "day"})).unwrap();
+        adopt_saved(&mut app, &mut b, &mut cu_b);
+        assert_eq!(b.cal.mode, CalendarMode::Day);
+    }
+
+    #[test]
+    fn overlapping_schedule_items_get_their_own_lanes() {
+        let l = |spans: &[(i64, i64)]| {
+            let (lanes, n) = lanes(spans, MAX_SCHEDULE_LANES);
+            (lanes.into_iter().map(|x| x.unwrap()).collect::<Vec<_>>(), n)
+        };
+        assert_eq!(l(&[]), (vec![], 1));
+        assert_eq!(l(&[(0, 10), (10, 20)]), (vec![0, 0], 1), "touching items share a lane");
+        assert_eq!(l(&[(0, 10), (5, 15), (12, 20)]), (vec![0, 1, 0], 2));
+        assert_eq!(l(&[(0, 100), (10, 20), (15, 30), (40, 50)]), (vec![0, 1, 2, 1], 3));
+    }
+
+    /// Regression: thousands of overlapping items (a hostile subscribed calendar) used to make as many lanes,
+    /// each a fraction of a pixel high, at quadratic cost every frame. Lanes are capped; the rest are counted.
+    #[test]
+    fn schedule_lanes_are_capped() {
+        let spans: Vec<(i64, i64)> = (0..5_000).map(|i| (i, 100_000)).collect();
+        let (lane_of, n) = lanes(&spans, MAX_SCHEDULE_LANES);
+        assert_eq!(n, MAX_SCHEDULE_LANES);
+        assert_eq!(lane_of.iter().filter(|x| x.is_some()).count(), MAX_SCHEDULE_LANES);
+        assert_eq!(lane_of.iter().filter(|x| x.is_none()).count(), 5_000 - MAX_SCHEDULE_LANES);
+        // A freed lane is used again by a later item.
+        let (lane_of, n) = lanes(&[(0, 10), (0, 10), (0, 10), (10, 20)], 2);
+        assert_eq!((lane_of, n), (vec![Some(0), Some(1), None, Some(0)], 2));
+        assert_eq!(lanes(&[(0, 10), (5, 10)], 0).0, vec![Some(0), None], "at least one lane");
+    }
 
     fn appt(start: &str, end: &str, rrule: Option<&str>) -> Appointment {
         let s = mailcraft_engine::cmd::calendar::pim::parse_local(start, 0).unwrap();

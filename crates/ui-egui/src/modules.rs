@@ -7,7 +7,8 @@
 //! mailbox.
 //!
 //! UI-only state (the calendar view state the engine's view commands take and return, the selected day,
-//! search text, open editors…) lives in egui memory under one id (see `common::ModState`).
+//! search text, open editors…) lives in egui memory under one id (see `common::ModState`); the calendar's
+//! view state is kept per window, so an explorer window (Open in New Window) shows its own calendar view.
 //!
 //! Item windows (appointment, contact, contact group, task, note, Go to Date) and the Reminders window are
 //! local egui windows drawn by [`pim_windows`]. [`meeting_bar`] is the reading pane's meeting area and
@@ -82,6 +83,18 @@ pub fn pim_windows(ctx: &egui::Context, app: &mut App) {
     if first {
         reminders::show(ctx, app);
     }
+}
+
+/// Tests: the folder of the open contact window (`None` when no contact window is open).
+#[cfg(test)]
+pub(crate) fn contact_window_folder(ctx: &egui::Context) -> Option<Option<u64>> {
+    common::load(ctx).editors.contact.as_ref().map(|e| e.folder)
+}
+
+/// Forgets what the module views kept for a closed explorer window (its calendar view and windows).
+pub fn forget_window(ctx: &egui::Context, viewport: egui::ViewportId) {
+    common::forget_window(ctx, viewport);
+    calendar_view::forget_window(ctx, viewport);
 }
 
 /// Opens the Reminders window (View › Window › Reminders Window, the status bar's reminder button).

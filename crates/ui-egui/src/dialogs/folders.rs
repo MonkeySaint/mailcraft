@@ -595,6 +595,10 @@ struct PropState {
     show_size: bool,
     /// The AutoArchive tab.
     archive: super::archive::FolderForm,
+    /// The calendar tab (calendar folders).
+    cal: CalForm,
+    /// The Address Book tab (contacts folders).
+    book: BookForm,
     error: String,
 }
 
@@ -633,10 +637,89 @@ fn folder_size_list(ui: &mut egui::Ui, app: &App, d: &Dlg<'_>, uid: u64) {
     });
 }
 
+/// The calendar tab of a calendar's Properties: colour, internet calendar address and update interval,
+/// read-only.
+#[derive(Clone, Default, PartialEq)]
+struct CalForm {
+    color: String,
+    url: String,
+    refresh: String,
+    read_only: bool,
+    internet: bool,
+    /// Status after Update Now.
+    info: String,
+}
+
+impl CalForm {
+    fn of(c: &Value) -> CalForm {
+        let text = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        CalForm {
+            color: text("color"),
+            url: text("url"),
+            refresh: c.get("refreshMin").and_then(Value::as_u64).map(|m| m.to_string()).unwrap_or_default(),
+            read_only: c.get("readOnly").and_then(Value::as_bool).unwrap_or(false),
+            internet: text("source") == "internet",
+            info: String::new(),
+        }
+    }
+
+    /// The `calendar.setProperties` params for what changed since `init` (`None` = nothing changed).
+    fn changes(&self, init: &CalForm, folder: u64) -> Result<Option<Value>, String> {
+        let mut p = serde_json::Map::new();
+        if self.color != init.color {
+            p.insert("color".into(), json!(self.color));
+        }
+        if self.internet {
+            if self.url.trim() != init.url.trim() {
+                p.insert("url".into(), json!(self.url.trim()));
+            }
+            if self.refresh.trim() != init.refresh.trim() {
+                let m: u64 = self
+                    .refresh
+                    .trim()
+                    .parse()
+                    .map_err(|_| "Enter the minutes between updates as a number.".to_owned())?;
+                p.insert("refreshMin".into(), json!(m));
+            }
+        } else if self.read_only != init.read_only {
+            p.insert("readOnly".into(), json!(self.read_only));
+        }
+        if p.is_empty() {
+            return Ok(None);
+        }
+        p.insert("folder".into(), json!(folder));
+        Ok(Some(Value::Object(p)))
+    }
+}
+
+/// The Address Book tab of a contacts folder's Properties.
+#[derive(Clone, Default, PartialEq)]
+struct BookForm {
+    show: bool,
+    name: String,
+}
+
+/// Properties tabs: General, then the folder kind's own tab, then AutoArchive (not for contacts folders).
+fn prop_tabs(kind: &str) -> Vec<&'static str> {
+    match kind {
+        "calendar" => vec!["General", "Calendar Settings", "AutoArchive"],
+        "contacts" => vec!["General", "Address Book"],
+        _ => vec!["General", "AutoArchive"],
+    }
+}
+
 fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = d.u64("folder");
     let key = format!("folder.{}.", folder.unwrap_or(0));
+    let cal_init = d.get("calendar").map(CalForm::of).unwrap_or_default();
+    let book_init = d
+        .get("addressBook")
+        .map(|b| BookForm {
+            show: b.get("show").and_then(Value::as_bool).unwrap_or(true),
+            name: b.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        })
+        .unwrap_or_default();
     let init = |a: &App| PropState {
         name: d.str("name"),
         description: common::pref(ctx, &format!("{key}description"))
@@ -644,6 +727,8 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             .unwrap_or_default(),
         show_total: common::pref(ctx, &format!("{key}showTotal")).and_then(|v| v.as_bool()).unwrap_or(false),
         archive: folder.map(|f| super::archive::FolderForm::load(a, f)).unwrap_or_default(),
+        cal: cal_init.clone(),
+        book: book_init.clone(),
         ..Default::default()
     };
     let kind = d.str("kind");
@@ -651,6 +736,7 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let kind_type = d.str("type");
     let query = d.str("query");
     let calendar = d.get("calendar").map(calendar_rows).unwrap_or_default();
+    let tabs = prop_tabs(&kind);
     with_state(ctx, app, uid, init, |st, app| {
         for (k, v) in take_replies(ctx, uid) {
             if k == "archiveTarget" {
@@ -660,7 +746,7 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         let title = format!("{} Properties", d.str("name"));
         window(ctx, app, d, &title, 420.0, |ui, app| {
             ui.horizontal(|ui| {
-                for (i, t) in ["General", "AutoArchive"].iter().enumerate() {
+                for (i, t) in tabs.iter().enumerate() {
                     if ui.selectable_label(st.tab == i, *t).clicked() {
                         st.tab = i;
                     }
@@ -670,58 +756,87 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             let is_default = folder
                 .and_then(|f| app.s.mailbox.folder(FolderId(f)))
                 .is_some_and(mailcraft_model::Folder::is_default);
-            if st.tab == 0 {
-                egui::Grid::new(("props", uid)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    ui.label("Name:");
-                    ui.add_enabled(
-                        !is_default,
-                        egui::TextEdit::singleline(&mut st.name).desired_width(240.0),
+            match tabs.get(st.tab).copied().unwrap_or("General") {
+                "Calendar Settings" => calendar_tab(ui, app, &mut st.cal, folder, uid),
+                "Address Book" => {
+                    ui.checkbox(&mut st.book.show, "Show this folder as an e-mail Address Book");
+                    ui.add_enabled_ui(st.book.show, |ui| {
+                        ui.horizontal(|ui| {
+                            let l = ui.label("Name of the address book:");
+                            ui.add(egui::TextEdit::singleline(&mut st.book.name).desired_width(220.0))
+                                .labelled_by(l.id);
+                        });
+                    });
+                    muted(
+                        ui,
+                        app,
+                        "Contacts in an address book are offered when you address messages (Address Book, \
+                         Check Names, suggestions).",
                     );
-                    ui.end_row();
-                    ui.label("Type:");
-                    ui.label(if kind_type.is_empty() { "Mail and post items" } else { kind_type.as_str() });
-                    ui.end_row();
-                    ui.label("Location:");
-                    ui.label(d.str("path"));
-                    ui.end_row();
-                    if !query.is_empty() {
-                        ui.label("Search:");
-                        ui.label(&query);
-                        ui.end_row();
+                }
+                "AutoArchive" => {
+                    if let Some(f) = folder {
+                        let out =
+                            super::archive::folder_form(ui, app, &mut st.archive, f, uid, "archiveTarget");
+                        if !matches!(out, Out::Keep) {
+                            return out;
+                        }
                     }
-                    ui.label("Description:");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut st.description).desired_rows(3).desired_width(240.0),
-                    );
-                    ui.end_row();
+                }
+                _ => {
+                    egui::Grid::new(("props", uid)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Name:");
+                        ui.add_enabled(
+                            !is_default,
+                            egui::TextEdit::singleline(&mut st.name).desired_width(240.0),
+                        );
+                        ui.end_row();
+                        ui.label("Type:");
+                        ui.label(if kind_type.is_empty() {
+                            "Mail and post items"
+                        } else {
+                            kind_type.as_str()
+                        });
+                        ui.end_row();
+                        ui.label("Location:");
+                        ui.label(d.str("path"));
+                        ui.end_row();
+                        if !query.is_empty() {
+                            ui.label("Search:");
+                            ui.label(&query);
+                            ui.end_row();
+                        }
+                        ui.label("Description:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut st.description)
+                                .desired_rows(3)
+                                .desired_width(240.0),
+                        );
+                        ui.end_row();
+                        if is_mail {
+                            ui.label("Unread items:");
+                            ui.label(d.u64("unread").unwrap_or(0).to_string());
+                            ui.end_row();
+                        }
+                        ui.label("Total items:");
+                        ui.label(d.u64("total").unwrap_or(0).to_string());
+                        ui.end_row();
+                        for (label, value) in &calendar {
+                            ui.label(*label);
+                            ui.label(value);
+                            ui.end_row();
+                        }
+                    });
                     if is_mail {
-                        ui.label("Unread items:");
-                        ui.label(d.u64("unread").unwrap_or(0).to_string());
-                        ui.end_row();
+                        ui.radio_value(&mut st.show_total, false, "Show number of unread items");
+                        ui.radio_value(&mut st.show_total, true, "Show total number of items");
                     }
-                    ui.label("Total items:");
-                    ui.label(d.u64("total").unwrap_or(0).to_string());
-                    ui.end_row();
-                    for (label, value) in &calendar {
-                        ui.label(*label);
-                        ui.label(value);
-                        ui.end_row();
+                    if btn(ui, "Folder Size...") {
+                        st.show_size = !st.show_size;
                     }
-                });
-                if is_mail {
-                    ui.radio_value(&mut st.show_total, false, "Show number of unread items");
-                    ui.radio_value(&mut st.show_total, true, "Show total number of items");
-                }
-                if btn(ui, "Folder Size...") {
-                    st.show_size = !st.show_size;
-                }
-                if st.show_size {
-                    folder_size_list(ui, app, d, uid);
-                }
-            } else if let Some(f) = folder {
-                let out = super::archive::folder_form(ui, app, &mut st.archive, f, uid, "archiveTarget");
-                if !matches!(out, Out::Keep) {
-                    return out;
+                    if st.show_size {
+                        folder_size_list(ui, app, d, uid);
+                    }
                 }
             }
             if !st.error.is_empty() {
@@ -741,11 +856,38 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         st.error = last_error(app);
                         return Out::Keep;
                     }
+                    let tab_of = |name: &str| tabs.iter().position(|t| *t == name).unwrap_or(0);
+                    if let Some(f) = folder {
+                        match st.cal.changes(&cal_init, f) {
+                            Ok(Some(p)) => {
+                                if app.run("calendar.setProperties", p).is_none() {
+                                    st.tab = tab_of("Calendar Settings");
+                                    st.error = last_error(app);
+                                    return Out::Keep;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                st.tab = tab_of("Calendar Settings");
+                                st.error = e;
+                                return Out::Keep;
+                            }
+                        }
+                        if kind == "contacts" && st.book != book_init {
+                            let p = json!({"folder": f, "show": st.book.show, "name": st.book.name.trim()});
+                            if app.run("people.addressBook", p).is_none() {
+                                st.tab = tab_of("Address Book");
+                                st.error = last_error(app);
+                                return Out::Keep;
+                            }
+                        }
+                    }
                     if let Some(f) = folder
+                        && kind != "contacts"
                         && st.archive != super::archive::FolderForm::load(app, f)
                         && let Err(e) = st.archive.save(app, f)
                     {
-                        st.tab = 1;
+                        st.tab = tab_of("AutoArchive");
                         st.error = e;
                         return Out::Keep;
                     }
@@ -756,6 +898,57 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             }
         })
     })
+}
+
+/// The calendar tab: colour, then the internet calendar's address, update interval and Update Now, or the
+/// read-only switch of any other calendar.
+fn calendar_tab(ui: &mut egui::Ui, app: &mut App, f: &mut CalForm, folder: Option<u64>, uid: u64) {
+    egui::Grid::new(("cal-props", uid)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Color:");
+        egui::ComboBox::from_id_salt(("cal-props-color", uid)).selected_text(f.color.clone()).show_ui(
+            ui,
+            |ui| {
+                for c in mailcraft_engine::cmd::calendar::CALENDAR_COLORS {
+                    ui.selectable_value(&mut f.color, c.to_owned(), c);
+                }
+            },
+        );
+        ui.end_row();
+        if f.internet {
+            ui.label("Address:");
+            ui.add(egui::TextEdit::singleline(&mut f.url).desired_width(260.0));
+            ui.end_row();
+            ui.label("Update every:");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut f.refresh).desired_width(60.0));
+                ui.label("minutes");
+            });
+            ui.end_row();
+        }
+    });
+    if f.internet {
+        ui.label("An internet calendar is read-only: its items come from the address above.");
+        ui.horizontal(|ui| {
+            if btn(ui, "Update Now")
+                && let Some(folder) = folder
+            {
+                f.info = match app.run("calendar.setProperties", json!({"folder": folder, "updateNow": true}))
+                {
+                    Some(r) => match r.get("update").and_then(Value::as_str) {
+                        Some("offline") => "MailCraft is working offline.".to_owned(),
+                        Some("failed") => "The update failed.".to_owned(),
+                        _ => "Updating the calendar...".to_owned(),
+                    },
+                    None => last_error(app),
+                };
+            }
+            if !f.info.is_empty() {
+                muted(ui, app, &f.info);
+            }
+        });
+    } else {
+        ui.checkbox(&mut f.read_only, "Read-only (the calendar's items cannot be changed)");
+    }
 }
 
 /// Calendar Properties rows (label, value) from the `calendar` part of the folderProperties params.

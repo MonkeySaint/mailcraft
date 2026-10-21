@@ -1974,6 +1974,14 @@ pub const DEFS: &[Def] = &[
         Text("", 512),
         A,
     ),
+    d(
+        "state",
+        "Address books",
+        "people.addressBooks",
+        "Contacts folders' Address Book properties: folder id → {show, name}",
+        Object(64 * 1024),
+        A,
+    ),
     // Format Text › Change Styles › Set as Default / Save as a New Style Set.
     d(
         "state",

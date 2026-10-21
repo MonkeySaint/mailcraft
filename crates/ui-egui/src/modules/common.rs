@@ -68,18 +68,90 @@ pub(crate) struct ModState {
     pub dialogs: ModuleDialogs,
     /// Last egui pass the item windows were drawn in.
     pub windows_pass: Option<u64>,
+    /// Saved-view numbers (per calendar folder) that came from the calendar's own view commands in any
+    /// window: a window does not adopt them as outside changes (each window keeps its own view).
+    pub cal_ui_seq: BTreeMap<u64, u64>,
+}
+
+/// The calendar view's part of [`ModState`], kept per window (egui viewport): an explorer window (Open in New
+/// Window) keeps its own arrangement, date and shown calendars instead of mirroring the main window.
+#[derive(Clone, Default)]
+struct CalSlice {
+    cal: CalendarViewState,
+    nav_month: Option<(i64, u8)>,
+    cal_shown: BTreeSet<u64>,
+    cal_group_collapsed: bool,
+    cal_slot: Option<(i64, i64)>,
+    cal_scroll_key: String,
+}
+
+impl CalSlice {
+    fn of(st: &ModState) -> CalSlice {
+        CalSlice {
+            cal: st.cal.clone(),
+            nav_month: st.nav_month,
+            cal_shown: st.cal_shown.clone(),
+            cal_group_collapsed: st.cal_group_collapsed,
+            cal_slot: st.cal_slot,
+            cal_scroll_key: st.cal_scroll_key.clone(),
+        }
+    }
+
+    fn apply(self, st: &mut ModState) {
+        st.cal = self.cal;
+        st.nav_month = self.nav_month;
+        st.cal_shown = self.cal_shown;
+        st.cal_group_collapsed = self.cal_group_collapsed;
+        st.cal_slot = self.cal_slot;
+        st.cal_scroll_key = self.cal_scroll_key;
+    }
 }
 
 fn state_id() -> Id {
     Id::new("mailcraft.modules.state")
 }
 
-pub(crate) fn load(ctx: &egui::Context) -> ModState {
-    ctx.data_mut(|d| d.get_temp::<ModState>(state_id())).unwrap_or_default()
+/// Where the calendar part of a window other than the main one is kept.
+fn slice_id(viewport: egui::ViewportId) -> Id {
+    Id::new(("mailcraft.modules.calendar.window", viewport))
 }
 
+/// The module state as the window being drawn sees it: the shared state with that window's calendar part
+/// (a new window starts from the main window's).
+pub(crate) fn load(ctx: &egui::Context) -> ModState {
+    load_for(ctx, ctx.viewport_id())
+}
+
+/// [`load`] for window `vp`.
+pub(crate) fn load_for(ctx: &egui::Context, vp: egui::ViewportId) -> ModState {
+    let mut st = ctx.data_mut(|d| d.get_temp::<ModState>(state_id())).unwrap_or_default();
+    if vp != egui::ViewportId::ROOT
+        && let Some(slice) = ctx.data_mut(|d| d.get_temp::<CalSlice>(slice_id(vp)))
+    {
+        slice.apply(&mut st);
+    }
+    st
+}
+
+/// Stores `st`: the calendar part for the window being drawn, everything else shared.
 pub(crate) fn store(ctx: &egui::Context, st: ModState) {
+    store_for(ctx, ctx.viewport_id(), st);
+}
+
+/// [`store`] for window `vp`.
+pub(crate) fn store_for(ctx: &egui::Context, vp: egui::ViewportId, mut st: ModState) {
+    if vp != egui::ViewportId::ROOT {
+        let main = ctx.data_mut(|d| d.get_temp::<ModState>(state_id())).unwrap_or_default();
+        let own = CalSlice::of(&st);
+        CalSlice::of(&main).apply(&mut st);
+        ctx.data_mut(|d| d.insert_temp(slice_id(vp), own));
+    }
     ctx.data_mut(|d| d.insert_temp(state_id(), st));
+}
+
+/// Drops the calendar part kept for a closed window.
+pub(crate) fn forget_window(ctx: &egui::Context, viewport: egui::ViewportId) {
+    ctx.data_mut(|d| d.remove::<CalSlice>(slice_id(viewport)));
 }
 
 /// Runs a command and returns its error text (from the toast) on failure.
@@ -850,6 +922,36 @@ pub(crate) fn view_switch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_window_keeps_its_own_calendar_view() {
+        use mailcraft_engine::cmd::calendar::CalendarMode;
+        let ctx = egui::Context::default();
+        let other = egui::ViewportId::from_hash_of("explorer-1");
+        let mut main = load_for(&ctx, egui::ViewportId::ROOT);
+        main.cal.mode = CalendarMode::Week;
+        main.cal_shown.insert(7);
+        main.people_search = "ann".into();
+        store_for(&ctx, egui::ViewportId::ROOT, main);
+        // A new window starts from the main window's calendar, then goes its own way.
+        let mut w = load_for(&ctx, other);
+        assert_eq!(w.cal.mode, CalendarMode::Week);
+        w.cal.mode = CalendarMode::Month;
+        w.cal.date = "2026-12-01".into();
+        w.cal_shown.clear();
+        w.people_search = "bo".into();
+        store_for(&ctx, other, w);
+        let main = load_for(&ctx, egui::ViewportId::ROOT);
+        assert_eq!(main.cal.mode, CalendarMode::Week, "the main window keeps its arrangement");
+        assert!(main.cal_shown.contains(&7));
+        assert_eq!(main.people_search, "bo", "the rest of the module state is shared");
+        let w = load_for(&ctx, other);
+        assert_eq!((w.cal.mode, w.cal.date.as_str()), (CalendarMode::Month, "2026-12-01"));
+        assert!(w.cal_shown.is_empty());
+        // A closed window's calendar is forgotten (a new one starts from the main window again).
+        forget_window(&ctx, other);
+        assert_eq!(load_for(&ctx, other).cal.mode, CalendarMode::Week);
+    }
 
     #[test]
     fn dates_round_trip() {

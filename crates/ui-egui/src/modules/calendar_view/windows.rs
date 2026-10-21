@@ -112,6 +112,9 @@ struct TzForm {
     show_second: bool,
     second_label: String,
     second_zone: String,
+    show_third: bool,
+    third_label: String,
+    third_zone: String,
     error: String,
 }
 
@@ -155,6 +158,9 @@ struct SettingsForm {
     grid_lines: bool,
     rules: Vec<ItemRule>,
     labels: std::collections::BTreeMap<String, String>,
+    /// Other Settings of the Day, Week and Month views: end times in Month view, Date Navigator marks.
+    month_end_time: bool,
+    nav_marks: bool,
     /// Manage Views › Modify: the saved view that takes the settings on OK.
     modify: Option<String>,
 }
@@ -226,7 +232,9 @@ fn table_settings(ui: &mut Ui, f: &mut SettingsForm) {
             }
         });
     egui::CollapsingHeader::new("Other Settings...").id_salt("mc-cal-settings-other").show(ui, |ui| {
-        ui.checkbox(&mut f.grid_lines, "Grid lines between rows");
+        ui.checkbox(&mut f.grid_lines, "Grid lines between rows (List, Active)");
+        ui.checkbox(&mut f.month_end_time, "Show end times in Month view");
+        ui.checkbox(&mut f.nav_marks, "Mark days with items in the Date Navigator");
     });
     egui::CollapsingHeader::new("Conditional Formatting...").id_salt("mc-cal-settings-rules").show(
         ui,
@@ -325,6 +333,9 @@ fn open(app: &mut App, cu: &mut CalUi, name: &str, p: &Value) {
                 show_second: z.show_second,
                 second_label: z.second_label,
                 second_zone: z.second_zone,
+                show_third: z.show_third,
+                third_label: z.third_label,
+                third_zone: z.third_zone,
                 error: String::new(),
             });
         }
@@ -475,6 +486,18 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                     std::mem::swap(&mut f.zone, &mut f.second_zone);
                     std::mem::swap(&mut f.label, &mut f.second_label);
                 }
+                ui.add_space(6.0);
+                ui.checkbox(&mut f.show_third, "Show a third time zone");
+                ui.add_enabled_ui(f.show_third, |ui| {
+                    egui::Grid::new("mc-cal-tz-grid3").num_columns(2).show(ui, |ui| {
+                        ui.label("Label:");
+                        ui.add(TextEdit::singleline(&mut f.third_label).desired_width(300.0));
+                        ui.end_row();
+                        ui.label("Time zone:");
+                        zone_combo(ui, "mc-cal-tz-zone3", &mut f.third_zone, now, false);
+                        ui.end_row();
+                    });
+                });
             });
             error_line(ui, app, &f.error);
             ui.add_space(6.0);
@@ -493,6 +516,12 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                 }
                 if f.show_second || !f.second_zone.is_empty() {
                     put(&mut p, "secondZone", json!(f.second_zone));
+                }
+                let third = f.show_second && f.show_third;
+                put(&mut p, "showThird", json!(third));
+                put(&mut p, "thirdLabel", json!(f.third_label.trim()));
+                if third || !f.third_zone.is_empty() {
+                    put(&mut p, "thirdZone", json!(f.third_zone));
                 }
                 if app.run("calendar.changeTimeZone", p).is_some() {
                     keep = false;
@@ -664,6 +693,8 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
             grid_lines: !st.cal.no_grid,
             rules: st.cal.rules.clone(),
             labels: st.cal.labels.clone(),
+            month_end_time: st.cal.month_end_time,
+            nav_marks: st.cal.nav_marks,
             modify: cu.windows.modify.take(),
         });
     }
@@ -767,6 +798,8 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                             "groupBy": f.group_by.map(CalendarColumn::name),
                             "filter": f.filter,
                             "gridLines": f.grid_lines,
+                            "monthEndTime": f.month_end_time,
+                            "navMarks": f.nav_marks,
                             "rules": rules,
                             "labels": labels,
                         });

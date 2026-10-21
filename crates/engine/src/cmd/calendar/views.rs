@@ -527,7 +527,9 @@ fn calendar_targets(s: &Session, list: &Value) -> Result<Vec<FolderId>, CmdError
 }
 
 /// Keys of `view.viewSettings` in the Calendar (without any, the View Settings window opens).
-pub const SETTINGS_KEYS: [&str; 12] = [
+pub const SETTINGS_KEYS: [&str; 14] = [
+    "monthEndTime",
+    "navMarks",
     "sort",
     "ascending",
     "timeScale",
@@ -593,6 +595,12 @@ fn apply_settings(v: &mut CalendarViewState, p: &Value) -> Result<(), CmdError> 
     }
     if let Some(g) = pim::flag(p, "gridLines")? {
         v.no_grid = !g;
+    }
+    if let Some(e) = pim::flag(p, "monthEndTime")? {
+        v.month_end_time = e;
+    }
+    if let Some(m) = pim::flag(p, "navMarks")? {
+        v.nav_marks = m;
     }
     if let Some(l) = p.get("labels").filter(|x| !x.is_null()) {
         let map = l.as_object().ok_or_else(|| CmdError::Params("`labels` must be an object".into()))?;
@@ -667,6 +675,17 @@ pub fn saved_view(s: &Session) -> Option<(CalendarViewState, u64)> {
     let f = pim::current_folder(s, Kind::Appointment)?;
     let p = props::read(&s.mailbox, f);
     p.view.map(|v| (v, p.view_seq))
+}
+
+/// True when the current calendar's saved view differs from the default view, its date and day count aside
+/// (View › Reset View is then available).
+pub fn view_customized(s: &Session) -> bool {
+    saved_view(s).is_some_and(|(mut v, _)| {
+        let d = CalendarViewState::default();
+        (v.date, v.days) = (d.date.clone(), d.days);
+        v.sanitize_table();
+        v != d
+    })
 }
 
 /// Saves `v` (without its date) on the current calendar folder with a new sequence number; journaled without
@@ -833,6 +852,18 @@ pub fn second_zone(s: &mut Session, unix: i64) -> Option<(String, i32)> {
         return Some((label, off));
     }
     None
+}
+
+/// The third time zone shown in day and week views at `unix` (label, offset in minutes), when Change Time
+/// Zone shows one (only with a second zone).
+pub fn third_zone(s: &mut Session, unix: i64) -> Option<(String, i32)> {
+    let z = time_zones(s);
+    if !(z.show_second && z.show_third) {
+        return None;
+    }
+    let off = tz::offset_at(&z.third_zone, unix)?;
+    let label = if z.third_label.trim().is_empty() { short_zone_name(&z.third_zone) } else { z.third_label };
+    Some((label, off))
 }
 
 /// "Toronto" for "America/Toronto".

@@ -620,10 +620,25 @@ pub fn copy_folder_tree(
                 favorite_pos: None,
                 manual_pos: if is_root { None } else { of.manual_pos },
                 search_query: of.search_query.clone(),
-                remote_name: None,
+                // A calendar keeps its properties there (colour, saved views); other kinds keep the
+                // server's name, which the copy does not have.
+                remote_name: if kind == FolderKind::Calendar { of.remote_name.clone() } else { None },
                 auto_archive: of.auto_archive,
             },
         );
+        if kind == FolderKind::Calendar {
+            // The copy is an ordinary calendar: not a subscription (its items are copies), not the default
+            // calendar's time zones.
+            super::calendar::props::update(mb, id, |x| {
+                if x.subscription.take().is_some()
+                    || x.source == mailcraft_model::calendar::CalendarSource::Internet
+                {
+                    x.source = mailcraft_model::calendar::CalendarSource::Local;
+                    x.read_only = false;
+                }
+                x.time_zones = None;
+            });
+        }
         if let Some(v) = mb.views.get(old).cloned() {
             mb.views.insert(id, v);
         }
@@ -1096,7 +1111,8 @@ fn kind_id(kind: FolderKind) -> &'static str {
 }
 
 /// Folder Properties (Calendar Properties for a calendar): name, type, location, item counts and size; a
-/// calendar adds its colour, source and Internet subscription, a search folder its query.
+/// calendar adds its colour, source and Internet subscription (changed with `calendar.setProperties`), a
+/// contacts folder its Address Book settings (`people.addressBook`), a search folder its query.
 fn properties(s: &mut Session, p: &Value) -> CmdResult {
     let id = current_folder(s, p)?;
     let mb = &s.mailbox;
@@ -1121,24 +1137,12 @@ fn properties(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(o) = params.as_object_mut() {
         match kind {
             FolderKind::Calendar => {
-                let props = super::calendar::props::read(mb, id);
-                let source = match props.source {
-                    mailcraft_model::calendar::CalendarSource::Local => "local",
-                    mailcraft_model::calendar::CalendarSource::Internet => "internet",
-                    mailcraft_model::calendar::CalendarSource::File => "file",
-                };
-                o.insert(
-                    "calendar".into(),
-                    json!({
-                        "color": props.color.unwrap_or_else(|| "Automatic".into()),
-                        "source": source,
-                        "readOnly": props.read_only,
-                        "url": props.subscription.as_ref().map(|x| x.url.clone()),
-                        "refreshMin": props.subscription.as_ref().map(|x| x.refresh_min),
-                        "lastUpdate": props.subscription.as_ref().and_then(|x| x.last_update),
-                        "lastError": props.subscription.as_ref().and_then(|x| x.last_error.clone()),
-                    }),
-                );
+                o.insert("calendar".into(), super::calendar::calendar_properties_json(mb, id));
+            }
+            FolderKind::Contacts => {
+                let b = super::people::address_book(s, id);
+                let name = if b.name.is_empty() { folder.name.clone() } else { b.name };
+                o.insert("addressBook".into(), json!({ "show": b.show, "name": name }));
             }
             FolderKind::Search => {
                 o.insert("query".into(), json!(folder.search_query.clone().unwrap_or_default()));
@@ -1414,6 +1418,30 @@ mod tests {
         assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
         assert_eq!(run(&mut s, "folder.copy", json!({}))["dialog"], "copyFolder");
         let _ = inbox;
+    }
+
+    #[test]
+    fn copy_calendar_keeps_its_colour_and_views_but_not_the_subscription() {
+        let mut s = session();
+        let cal = role(&s, FolderRole::Calendar);
+        let data = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//T//EN\r\nBEGIN:VEVENT\r\nUID:a@example.org\r\nDTSTAMP:20261001T000000Z\r\nDTSTART:20261020T080000Z\r\nDURATION:PT1H\r\nSUMMARY:Feed item\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let r = run(
+            &mut s,
+            "calendar.addCalendar",
+            json!({"source": "internet", "url": "https://cal.example.org/f.ics", "data": data, "name": "Feed"}),
+        );
+        let feed = FolderId(r["folder"].as_u64().unwrap());
+        run(&mut s, "calendar.color", json!({"folder": feed.0, "color": "Teal"}));
+        let r = run(&mut s, "folder.copy", json!({"folder": feed.0, "parent": cal.0}));
+        let copy = FolderId(r["folder"].as_u64().unwrap());
+        let p = crate::cmd::calendar::props::read(&s.mailbox, copy);
+        assert_eq!(p.color.as_deref(), Some("Teal"), "the colour comes along");
+        assert!(p.subscription.is_none() && !p.read_only, "the copy is an ordinary, editable calendar");
+        assert_eq!(p.source, mailcraft_model::calendar::CalendarSource::Local);
+        assert_eq!(s.mailbox.appointments.values().filter(|a| a.folder == copy).count(), 1);
+        // The original is still the subscription.
+        assert!(crate::cmd::calendar::props::read(&s.mailbox, feed).subscription.is_some());
+        assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
     }
 
     #[test]

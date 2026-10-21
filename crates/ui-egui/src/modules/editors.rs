@@ -146,6 +146,9 @@ pub(crate) struct ContactEditor {
     pub phone_home: String,
     pub phone_fax: String,
     pub phone_other: String,
+    /// Phone numbers of other kinds (Company Main, Business 2, Assistant…): shown under their own kind and
+    /// saved back as they are.
+    pub other_phones: Vec<(String, String)>,
     pub street: String,
     pub city: String,
     pub region: String,
@@ -437,6 +440,7 @@ pub(crate) fn open_contact(app: &App, st: &mut ModState, id: ItemId) {
     };
     let business = c.addresses.iter().find(|a| a.kind.eq_ignore_ascii_case("Business"));
     let home = c.addresses.iter().find(|a| a.kind.eq_ignore_ascii_case("Home"));
+    let other_phones = other_phone_kinds(c.phones.iter().map(|(k, n)| (k.as_str(), n.as_str())));
     let other_addresses = c
         .addresses
         .iter()
@@ -479,6 +483,7 @@ pub(crate) fn open_contact(app: &App, st: &mut ModState, id: ItemId) {
         phone_home: phone("Home"),
         phone_fax: phone("Business Fax"),
         phone_other: phone("Other"),
+        other_phones,
         street,
         city,
         region,
@@ -630,11 +635,20 @@ fn open_from_dialog(app: &mut App, st: &mut ModState, name: &str, p: &Value) {
                     ed.country = f("country");
                 }
                 if let Some(ph) = pre.get("phones").and_then(Value::as_object) {
-                    for (k, v) in ph {
-                        if k.to_ascii_lowercase().starts_with("business") {
-                            ed.phone_business = v.as_str().unwrap_or("").to_owned();
+                    let pairs: Vec<(&str, &str)> =
+                        ph.iter().map(|(k, v)| (k.as_str(), v.as_str().unwrap_or(""))).collect();
+                    for (k, n) in &pairs {
+                        match k.to_ascii_lowercase().as_str() {
+                            "business" => ed.phone_business = (*n).to_owned(),
+                            "business fax" => ed.phone_fax = (*n).to_owned(),
+                            _ => {}
                         }
                     }
+                    // The company's other numbers (Company Main…) keep their own kind.
+                    ed.other_phones = other_phone_kinds(pairs.iter().copied());
+                }
+                if let Some(w) = pre.get("webPage").and_then(Value::as_str) {
+                    ed.web = w.to_owned();
                 }
             }
         }
@@ -722,12 +736,44 @@ fn appt_key(e: &ApptEditor) -> String {
     )
 }
 
+/// Phone kinds the contact window has its own field for.
+const PHONE_FIELDS: [&str; 5] = ["Business", "Mobile", "Home", "Business Fax", "Other"];
+/// Most phone numbers of other kinds the contact window shows.
+const MAX_OTHER_PHONES: usize = 16;
+
+/// The non-empty numbers of `phones` whose kind has no field of its own (the first of each kind).
+fn other_phone_kinds<'a>(phones: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, n) in phones {
+        let kind = k.trim();
+        if kind.is_empty()
+            || n.trim().is_empty()
+            || PHONE_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(kind))
+            || out.iter().any(|(o, _)| o.eq_ignore_ascii_case(kind))
+        {
+            continue;
+        }
+        if out.len() >= MAX_OTHER_PHONES {
+            break;
+        }
+        out.push((kind.chars().take(64).collect(), n.trim().to_owned()));
+    }
+    out
+}
+
 fn contact_key(e: &ContactEditor) -> String {
     format!(
         "{:?}",
         (
             (&e.full_name, &e.name_parts, &e.file_as, &e.company, &e.job_title, &e.department, &e.email),
-            (&e.phone_business, &e.phone_mobile, &e.phone_home, &e.phone_fax, &e.phone_other),
+            (
+                &e.phone_business,
+                &e.phone_mobile,
+                &e.phone_home,
+                &e.phone_fax,
+                &e.phone_other,
+                &e.other_phones
+            ),
             (&e.street, &e.city, &e.region, &e.postal, &e.country, &e.home),
             (&e.web, &e.im, &e.birthday, &e.notes, &e.members, &e.categories, &e.details, &e.anniversary),
             e.picture_changed,
@@ -1497,7 +1543,10 @@ fn preview_contact(ed: &ContactEditor) -> Contact {
         ("Home", &ed.phone_home),
         ("Business Fax", &ed.phone_fax),
         ("Other", &ed.phone_other),
-    ] {
+    ]
+    .into_iter()
+    .chain(ed.other_phones.iter().map(|(k, n)| (k.as_str(), n)))
+    {
         if !n.trim().is_empty() {
             c.phones.push((kind.into(), n.trim().into()));
         }
@@ -1751,6 +1800,9 @@ fn contact_page(ui: &mut Ui, app: &App, ed: &mut ContactEditor) {
                     field(ui, "Business fax", &mut ed.phone_fax, "");
                     field(ui, "Mobile phone", &mut ed.phone_mobile, "");
                     field(ui, "Other phone", &mut ed.phone_other, "");
+                    for (kind, number) in &mut ed.other_phones {
+                        field(ui, kind, number, "");
+                    }
                     ui.label("Birthday");
                     date_field(ui, &mut ed.birthday, "mc-contact-bday");
                     ui.end_row();
@@ -2217,11 +2269,17 @@ pub(crate) fn save_contact_checked(app: &mut App, ed: &ContactEditor) -> Result<
         ] {
             p.insert(k.into(), json!(v.trim()));
         }
-        p.insert(
-            "phones".into(),
-            json!({ "Business": ed.phone_business.trim(), "Mobile": ed.phone_mobile.trim(), "Home": ed.phone_home.trim(),
-                    "Business Fax": ed.phone_fax.trim(), "Other": ed.phone_other.trim() }),
-        );
+        let mut phones = serde_json::Map::new();
+        for (kind, n) in ed.other_phones.iter().map(|(k, n)| (k.as_str(), n)).chain([
+            ("Business", &ed.phone_business),
+            ("Mobile", &ed.phone_mobile),
+            ("Home", &ed.phone_home),
+            ("Business Fax", &ed.phone_fax),
+            ("Other", &ed.phone_other),
+        ]) {
+            phones.insert(kind.to_owned(), json!(n.trim()));
+        }
+        p.insert("phones".into(), Value::Object(phones));
         let mut addresses: Vec<Value> = Vec::new();
         addresses
             .extend(address_json("Business", [&ed.street, &ed.city, &ed.region, &ed.postal, &ed.country]));
@@ -3029,6 +3087,65 @@ mod tests {
         ed.reminder_on = false;
         follow_due_date(&mut ed);
         assert!(!ed.reminder_on);
+    }
+
+    /// Regression: New Contact from Same Company pre-fills the company's other numbers (Company Main), and
+    /// the window used to drop them because it has no field of their kind.
+    #[test]
+    fn new_contact_from_same_company_keeps_the_company_main_number() {
+        let mut app = app();
+        let mut st = ModState::default();
+        let r = app
+            .s
+            .run(
+                "people.new",
+                &json!({"fullName": "Ann Lee", "company": "Example Co",
+                        "phones": {"Business": "+1 555 0105", "Company Main": "+1 555 0100", "Mobile": "+1 555 0109"}}),
+            )
+            .unwrap();
+        let ann = ItemId(r["id"].as_u64().unwrap());
+        let folder = app.s.mailbox.contacts[&ann].folder;
+        app.s.selection = mailcraft_engine::Selection { folder, items: vec![ann], focus: Some(ann) };
+        app.s.run("people.newFromSameCompany", &json!({})).unwrap();
+        let p = app
+            .s
+            .notices
+            .iter()
+            .rev()
+            .find_map(|n| match n {
+                mailcraft_engine::Notice::OpenDialog(d, p) if d == "contact" => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap();
+        open_from_dialog(&mut app, &mut st, "contact", &p);
+        let mut ed = st.editors.contact.clone().unwrap();
+        assert_eq!(ed.phone_business, "+1 555 0105");
+        assert_eq!(ed.phone_mobile, "", "personal numbers are not copied");
+        assert_eq!(ed.other_phones, vec![("Company Main".to_owned(), "+1 555 0100".to_owned())]);
+        assert!(business_card_lines(&preview_contact(&ed)).iter().any(|l| l.contains("+1 555 0100")));
+        ed.full_name = "Bo Ek".into();
+        let id = save_contact(&mut app, &ed).unwrap().unwrap();
+        let c = &app.s.mailbox.contacts[&ItemId(id)];
+        assert_eq!(c.company, "Example Co");
+        assert!(c.phones.contains(&("Company Main".to_owned(), "+1 555 0100".to_owned())), "{:?}", c.phones);
+        assert!(c.phones.contains(&("Business".to_owned(), "+1 555 0105".to_owned())));
+        // Reopened, the number shows under its own kind; cleared, it is removed.
+        open_contact(&app, &mut st, ItemId(id));
+        let mut ed = st.editors.contact.clone().unwrap();
+        assert_eq!(ed.other_phones, vec![("Company Main".to_owned(), "+1 555 0100".to_owned())]);
+        ed.other_phones[0].1.clear();
+        save_contact(&mut app, &ed).unwrap();
+        assert!(!app.s.mailbox.contacts[&ItemId(id)].phones.iter().any(|(k, _)| k == "Company Main"));
+        // Hostile input: blank kinds and numbers are skipped, the five own fields never repeat, the list is
+        // capped.
+        let many: Vec<(String, String)> = (0..40).map(|i| (format!("Line {i}"), "1".to_owned())).collect();
+        let shown = other_phone_kinds(
+            [("", "1"), ("Pager", " "), ("business", "2"), ("Other", "3")]
+                .into_iter()
+                .chain(many.iter().map(|(k, n)| (k.as_str(), n.as_str()))),
+        );
+        assert_eq!(shown.len(), MAX_OTHER_PHONES);
+        assert_eq!(shown[0].0, "Line 0");
     }
 
     #[test]

@@ -195,6 +195,45 @@ fn views_are_saved_per_calendar_with_rising_numbers() {
     assert!(saved_view(&s).is_none());
 }
 
+#[test]
+fn reset_view_is_enabled_once_the_calendar_view_changes() {
+    let mut s = session();
+    s.view.module = Module::Calendar;
+    s.selection.folder = cal(&s);
+    assert!(s.enabled("view.resetView").is_some(), "the default view has nothing to reset");
+    // Moving to another day is not a view change.
+    run(&mut s, "calendar.goToDate", json!({"date": "2026-11-02"}));
+    assert!(s.enabled("view.resetView").is_some());
+    run(&mut s, "calendar.arrange", json!({"mode": "week"}));
+    assert_eq!(s.enabled("view.resetView"), None, "an arrangement change enables Reset View");
+    run(&mut s, "view.resetView", json!({}));
+    assert!(s.enabled("view.resetView").is_some(), "reset to the defaults again");
+    run(&mut s, "view.viewSettings", json!({"timeScale": 15}));
+    assert_eq!(s.enabled("view.resetView"), None, "a time scale change enables Reset View");
+    run(&mut s, "view.resetView", json!({}));
+    run(&mut s, "view.viewSettings", json!({"gridLines": false}));
+    assert_eq!(s.enabled("view.resetView"), None, "a View Settings change enables Reset View");
+    // Other Settings of the calendar views: end times in Month view, Date Navigator marks.
+    run(&mut s, "view.resetView", json!({}));
+    let r = run(&mut s, "view.viewSettings", json!({"monthEndTime": true, "navMarks": false}));
+    assert_eq!(
+        (r["view"]["monthEndTime"].as_bool(), r["view"]["navMarks"].as_bool()),
+        (Some(true), Some(false))
+    );
+    assert_eq!(s.enabled("view.resetView"), None);
+    let r = run(&mut s, "view.resetView", json!({}));
+    assert_eq!(
+        (r["view"]["monthEndTime"].as_bool(), r["view"]["navMarks"].as_bool()),
+        (Some(false), Some(true))
+    );
+    assert!(s.run("view.viewSettings", &json!({"navMarks": "maybe"})).is_err());
+    // Next 7 Days shows the Day arrangement.
+    run(&mut s, "calendar.next7Days", json!({}));
+    let (v, _) = saved_view(&s).unwrap();
+    assert_eq!(v.mode, CalendarMode::Day);
+    assert_eq!(s.enabled("view.resetView"), None, "Next 7 Days shows the Day arrangement");
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Time zones
 
@@ -235,6 +274,29 @@ fn named_time_zone_and_second_zone() {
     let r = run(&mut s, "calendar.changeTimeZone", json!({"offsetMin": -300}));
     assert_eq!(r["timeZones"]["zone"], "");
     assert_eq!(s.tz_offset_min, -300);
+}
+
+#[test]
+fn a_third_time_zone_shows_with_the_second() {
+    let mut s = session();
+    let now = s.now().unix;
+    assert!(third_zone(&mut s, now).is_none());
+    // A third zone needs a second one and a known zone.
+    let only_third = json!({"showThird": true, "thirdZone": "Asia/Tokyo"});
+    assert!(s.run("calendar.changeTimeZone", &only_third).is_err());
+    assert!(s.run("calendar.changeTimeZone", &json!({"showSecond": true, "secondZone": "Europe/Paris", "showThird": true, "thirdZone": "Nowhere/City"})).is_err());
+    let r = run(
+        &mut s,
+        "calendar.changeTimeZone",
+        json!({"showSecond": true, "secondZone": "Europe/Paris", "showThird": true, "thirdZone": "Asia/Tokyo", "thirdLabel": "Tokyo office"}),
+    );
+    assert_eq!(r["timeZones"]["thirdZone"], "Asia/Tokyo");
+    assert_eq!(third_zone(&mut s, now), Some(("Tokyo office".to_owned(), 540)));
+    // Without a label the zone's city names it; hiding the second zone hides the third.
+    run(&mut s, "calendar.changeTimeZone", json!({"thirdLabel": ""}));
+    assert_eq!(third_zone(&mut s, now).map(|z| z.0), Some("Tokyo".to_owned()));
+    run(&mut s, "calendar.changeTimeZone", json!({"showSecond": false, "showThird": false}));
+    assert!(third_zone(&mut s, now).is_none());
 }
 
 #[test]
@@ -550,6 +612,65 @@ fn subscribe_and_refresh_over_http_with_etag() {
     assert!(props::read(&s.mailbox, f).subscription.unwrap().last_error.is_some());
     assert_eq!(s.mailbox.appointments.values().filter(|a| a.folder == f).count(), 2);
     t.join().unwrap();
+}
+
+#[test]
+fn calendar_properties_change_colour_address_interval_and_read_only() {
+    let mut s = session();
+    let r = run(
+        &mut s,
+        "calendar.addCalendar",
+        json!({"source": "internet", "url": "https://h.example.net/x.ics", "fetch": false}),
+    );
+    let f = FolderId(r["folder"].as_u64().unwrap());
+    let data = ics(&[("z@example.net", "20261020T080000Z", "Z")], "");
+    run(&mut s, "calendar.refreshCalendar", json!({"folder": f.0, "data": data, "etag": "\"e1\""}));
+    assert!(subscribe::subscriptions(&s, false).is_empty(), "just fetched");
+    // Colour and update interval (kept within the allowed range).
+    let r = run(&mut s, "calendar.setProperties", json!({"folder": f.0, "color": "teal", "refreshMin": 5}));
+    assert_eq!(r["color"], "Teal");
+    assert_eq!(r["refreshMin"], props::MIN_REFRESH_MIN);
+    assert!(r["lastUpdate"].is_i64());
+    // A new address is downloaded on the next update (it is due at once), webcal is accepted.
+    let r = run(
+        &mut s,
+        "calendar.setProperties",
+        json!({"folder": f.0, "url": "webcal://feeds.example.org/b.ics"}),
+    );
+    assert_eq!(r["url"], "http://feeds.example.org/b.ics");
+    assert!(r["lastUpdate"].is_null());
+    assert_eq!(props::read(&s.mailbox, f).subscription.unwrap().etag, None);
+    assert_eq!(subscribe::subscriptions(&s, false).len(), 1);
+    assert!(s.run("calendar.setProperties", &json!({"folder": f.0, "url": "ftp://x.example.org/"})).is_err());
+    // An internet calendar stays read-only.
+    assert!(s.run("calendar.setProperties", &json!({"folder": f.0, "readOnly": false})).is_err());
+    // Update Now queues the download for the UI's workers.
+    s.sync.background_calendars = true;
+    let r = run(&mut s, "calendar.setProperties", json!({"folder": f.0, "updateNow": true}));
+    assert_eq!(r["update"], "updating");
+    assert_eq!(s.sync.calendar_requests.len(), 1);
+    // A local calendar can be made read-only (and back); its items then cannot change.
+    let c = cal(&s);
+    let a =
+        run(&mut s, "calendar.newAppointment", json!({"subject": "Dentist", "start": "2026-10-12T09:00"}));
+    assert!(
+        s.run("calendar.setProperties", &json!({"folder": c.0, "url": "https://x.example.org/"})).is_err()
+    );
+    assert!(s.run("calendar.setProperties", &json!({"folder": c.0, "updateNow": true})).is_err());
+    let r = run(&mut s, "calendar.setProperties", json!({"folder": c.0, "readOnly": true}));
+    assert_eq!(r["readOnly"], true);
+    let e = s.run("calendar.update", &json!({"id": a["id"], "subject": "Moved"})).unwrap_err();
+    assert!(e.to_string().contains("read-only"), "{e}");
+    run(&mut s, "calendar.setProperties", json!({"folder": c.0, "readOnly": false}));
+    run(&mut s, "calendar.update", json!({"id": a["id"], "subject": "Moved"}));
+    // Folder Properties shows the same details.
+    run(&mut s, "folder.properties", json!({"folder": f.0}));
+    let shown = s.notices.iter().rev().find_map(|n| match n {
+        crate::Notice::OpenDialog(d, p) if d == "folderProperties" => Some(p.clone()),
+        _ => None,
+    });
+    assert_eq!(shown.unwrap()["calendar"]["color"], "Teal");
+    assert!(s.run("calendar.setProperties", &json!({"folder": f.0, "color": "plaid"})).is_err());
 }
 
 #[test]

@@ -3,7 +3,8 @@
 //!
 //! Styles (observed names): Memo Style (one item after another: user-name band, bold-label header block, rule,
 //! body laid out with `mailcraft-layout`), Table Style (the message list as columns, header repeated on every
-//! page), Calendar Daily / Weekly / Monthly (grids), and Card / Small Booklet / Phone Directory for contacts.
+//! page), Calendar Daily / Weekly / Monthly (grids), Card / Small Booklet / Phone Directory for contacts, and
+//! the Mail Merge documents (form letters, mailing labels, envelopes).
 //!
 //! Units: page coordinates are logical px (1/96 in) with the origin at the top-left corner of the page, like
 //! every other display list. The PDF writer converts to points.
@@ -18,6 +19,7 @@ mod calendar;
 mod cards;
 mod flow;
 mod memo;
+mod merge;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -30,6 +32,7 @@ use mailcraft_layout::{DisplayItem, DisplayList};
 pub use calendar::{CalendarData, CalendarEvent, CalendarStyle};
 pub use cards::{ContactCard, ContactStyle};
 pub use memo::MemoItem;
+pub use merge::{LABEL_SHEETS, LabelSheet, MAX_RECORDS, MergeDoc, MergeStyle, label_sheet, max_records};
 pub use table::{TableColumn, TableData};
 
 use crate::Canvas;
@@ -68,10 +71,15 @@ pub enum Paper {
     Legal,
     A4,
     A5,
+    /// Envelope #10 (4 1/8 × 9 1/2 in).
+    Envelope10,
+    /// Envelope DL (110 × 220 mm).
+    EnvelopeDl,
 }
 
 impl Paper {
-    pub const ALL: [Paper; 4] = [Paper::Letter, Paper::Legal, Paper::A4, Paper::A5];
+    pub const ALL: [Paper; 6] =
+        [Paper::Letter, Paper::Legal, Paper::A4, Paper::A5, Paper::Envelope10, Paper::EnvelopeDl];
 
     /// Portrait width × height in logical px.
     pub fn size_px(self) -> (f32, f32) {
@@ -81,6 +89,8 @@ impl Paper {
             Paper::Legal => (8.5 * PX_PER_IN, 14.0 * PX_PER_IN),
             Paper::A4 => mm(210.0, 297.0),
             Paper::A5 => mm(148.0, 210.0),
+            Paper::Envelope10 => (4.125 * PX_PER_IN, 9.5 * PX_PER_IN),
+            Paper::EnvelopeDl => mm(110.0, 220.0),
         }
     }
 
@@ -90,6 +100,8 @@ impl Paper {
             Paper::Legal => "Legal",
             Paper::A4 => "A4",
             Paper::A5 => "A5",
+            Paper::Envelope10 => "Envelope #10",
+            Paper::EnvelopeDl => "Envelope DL",
         }
     }
 
@@ -199,7 +211,12 @@ pub enum PrintContent {
     Memo(Vec<MemoItem>),
     Table(TableData),
     Calendar(CalendarData),
-    Contacts { style: ContactStyle, cards: Vec<ContactCard> },
+    Contacts {
+        style: ContactStyle,
+        cards: Vec<ContactCard>,
+    },
+    /// Mail Merge: form letters, mailing labels or envelopes.
+    Merge(MergeDoc),
 }
 
 /// One laid-out page (logical px, origin top-left).
@@ -217,21 +234,52 @@ pub(crate) struct Frame {
 
 /// Lays `content` out into pages.
 pub fn paginate(content: &PrintContent, setup: &PageSetup, ctx: &PrintContext, fonts: &FontDb) -> Vec<Page> {
-    let (w, h) = setup.page_size();
-    let m = setup.margins();
-    let hf = Style::new(fonts, HF_PT, false).color(Color::rgb(0x40, 0x40, 0x40));
-    let band = hf.line_height(fonts);
-    let has = |slots: &[String; 3]| slots.iter().any(|s| !s.trim().is_empty());
-    let head = if has(&setup.header) { band + HF_GAP } else { 0.0 };
-    let foot = if has(&setup.footer) { band + HF_GAP } else { 0.0 };
-    let body_h = (h - m.top - m.bottom - head - foot).max(MIN_BODY / 2.0);
-    let frame = Frame { body: Rect::new(m.left, m.top + head, (w - m.left - m.right).max(1.0), body_h) };
-    let mut bodies = match content {
+    let frame = frame(setup, fonts);
+    let bodies = match content {
         PrintContent::Memo(items) => memo::pages(items, setup, ctx, &frame, fonts),
         PrintContent::Table(t) => table::pages(t, &frame, fonts),
         PrintContent::Calendar(c) => calendar::pages(c, &frame, fonts),
         PrintContent::Contacts { style, cards } => cards::pages(*style, cards, &frame, fonts),
+        PrintContent::Merge(doc) => merge::pages(doc, &frame, fonts).0,
     };
+    finish(bodies, setup, ctx, fonts)
+}
+
+/// Lays a Mail Merge document out into pages; also returns how many of its records the pages hold in full
+/// (fewer than all when the document reached [`MAX_PAGES`]).
+pub fn paginate_merge(
+    doc: &MergeDoc,
+    setup: &PageSetup,
+    ctx: &PrintContext,
+    fonts: &FontDb,
+) -> (Vec<Page>, usize) {
+    let (bodies, placed) = merge::pages(doc, &frame(setup, fonts), fonts);
+    (finish(bodies, setup, ctx, fonts), placed)
+}
+
+/// The body area of `setup`'s pages.
+fn frame(setup: &PageSetup, fonts: &FontDb) -> Frame {
+    let (w, h) = setup.page_size();
+    let m = setup.margins();
+    let band = Style::new(fonts, HF_PT, false).line_height(fonts);
+    let has = |slots: &[String; 3]| slots.iter().any(|s| !s.trim().is_empty());
+    let head = if has(&setup.header) { band + HF_GAP } else { 0.0 };
+    let foot = if has(&setup.footer) { band + HF_GAP } else { 0.0 };
+    let body_h = (h - m.top - m.bottom - head - foot).max(MIN_BODY / 2.0);
+    Frame { body: Rect::new(m.left, m.top + head, (w - m.left - m.right).max(1.0), body_h) }
+}
+
+/// Page bodies made into pages: at most [`MAX_PAGES`], each with the header and footer.
+fn finish(
+    mut bodies: Vec<Vec<DisplayItem>>,
+    setup: &PageSetup,
+    ctx: &PrintContext,
+    fonts: &FontDb,
+) -> Vec<Page> {
+    let (w, h) = setup.page_size();
+    let m = setup.margins();
+    let hf = Style::new(fonts, HF_PT, false).color(Color::rgb(0x40, 0x40, 0x40));
+    let band = hf.line_height(fonts);
     bodies.truncate(MAX_PAGES);
     if bodies.is_empty() {
         bodies.push(Vec::new());

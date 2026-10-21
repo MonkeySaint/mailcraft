@@ -69,7 +69,7 @@ pub(crate) enum Kind {
         all_text: String,
         all: bool,
     },
-    MailMerge(MergeForm),
+    MailMerge(Box<MergeForm>),
     TaskRequest(RequestForm),
     /// Deleting a task accepted from a task request: decline, mark complete and notify, or just delete.
     DeleteRequest {
@@ -179,12 +179,30 @@ impl ViewForm {
 pub(crate) struct MergeForm {
     /// "all" (the contacts of the current view) or "selected".
     pub contacts: String,
-    pub output: String,
+    /// Document type: "letters", "labels" or "envelopes".
+    pub doc: String,
+    /// Merge to: "document" (a new PDF), "printer" or "email" (form letters only).
+    pub to: String,
+    /// The new document's file, the printer.
+    pub path: String,
+    pub printer: String,
+    pub printers: Vec<String>,
+    /// Label sheet and envelope size ids, and the choices (id, label).
+    pub labels: String,
+    pub envelope: String,
+    pub label_sheets: Vec<(String, String)>,
+    pub envelope_sizes: Vec<(String, String)>,
+    pub return_address: String,
+    /// Save the contact data file, and where.
+    pub data_file_on: bool,
+    pub data_file: String,
     /// The contacts selected when the window opened.
     pub selected: Vec<u64>,
     pub fields: Vec<String>,
     pub subject: String,
     pub body: String,
+    /// The standard address block labels and envelopes start from.
+    pub address_block: String,
     pub index: usize,
     pub preview: Option<Value>,
     pub result: Option<String>,
@@ -214,6 +232,20 @@ fn ids_of(p: &Value) -> Vec<u64> {
 
 fn str_of(p: &Value, key: &str) -> String {
     p.get(key).and_then(Value::as_str).unwrap_or_default().to_owned()
+}
+
+/// `[{"id", "label"}]` entries as (id, label) pairs.
+fn pairs_of(p: &Value, key: &str) -> Vec<(String, String)> {
+    p.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    Some((x.get("id")?.as_str()?.to_owned(), x.get("label")?.as_str()?.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn strings_of(p: &Value, key: &str) -> Vec<String> {
@@ -342,23 +374,42 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
             all_text: str_of(p, "allFolders"),
             all: false,
         },
-        "mailMerge" => Kind::MailMerge(MergeForm {
-            contacts: if str_of(p, "contacts") == "selected" { "selected".into() } else { "all".into() },
-            // E-mail is the output MailCraft can produce.
-            output: "email".into(),
-            selected: app
-                .s
-                .selection
-                .items
-                .iter()
-                .filter(|i| app.s.mailbox.contacts.contains_key(i))
-                .map(|i| i.0)
-                .collect(),
-            fields: strings_of(p, "fields"),
-            subject: String::new(),
-            body: "Dear {{First Name}},\n\n".into(),
-            ..Default::default()
-        }),
+        "mailMerge" => Kind::MailMerge(Box::new({
+            let doc = match str_of(p, "output").as_str() {
+                o @ ("labels" | "envelopes") => o.to_owned(),
+                _ => "letters".to_owned(),
+            };
+            let address_block = Some(str_of(p, "addressBlock"))
+                .filter(|b| !b.trim().is_empty())
+                .unwrap_or_else(|| mailcraft_engine::cmd::people::ADDRESS_BLOCK.to_owned());
+            let body = if doc == "letters" { LETTER_START.to_owned() } else { address_block.clone() };
+            MergeForm {
+                contacts: if str_of(p, "contacts") == "selected" { "selected".into() } else { "all".into() },
+                // Form letters to a new document unless E-mail was asked for.
+                doc,
+                to: if str_of(p, "output") == "email" { "email".into() } else { "document".into() },
+                path: format!("{}/Mail Merge.pdf", crate::backstage::home()),
+                printer: mailcraft_engine::cmd::print::DEFAULT_PRINTER.to_owned(),
+                labels: "30".into(),
+                envelope: "10".into(),
+                label_sheets: pairs_of(p, "labels"),
+                envelope_sizes: pairs_of(p, "envelopes"),
+                data_file: format!("{}/Mail Merge Data.csv", crate::backstage::home()),
+                selected: app
+                    .s
+                    .selection
+                    .items
+                    .iter()
+                    .filter(|i| app.s.mailbox.contacts.contains_key(i))
+                    .map(|i| i.0)
+                    .collect(),
+                fields: strings_of(p, "fields"),
+                subject: String::new(),
+                body,
+                address_block,
+                ..Default::default()
+            }
+        })),
         "deleteTaskRequest" => Kind::DeleteRequest {
             ids: ids_of(p),
             subject: str_of(p, "subject"),
@@ -942,23 +993,108 @@ fn merge_ui(ui: &mut Ui, app: &mut App, f: &mut MergeForm, nonce: u64) -> Btn {
     });
     ui.add_space(6.0);
     ui.label(RichText::new("Merge options").strong());
-    ui.horizontal(|ui| {
+    egui::Grid::new(("mc-merge-opts", nonce)).num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
         ui.label("Document type");
-        for (k, l) in [("letters", "Form Letters"), ("labels", "Mailing Labels"), ("envelopes", "Envelopes")]
-        {
-            ui.add_enabled(false, egui::RadioButton::new(f.output == k, l))
-                .on_disabled_hover_text("Needs a word processor; merge to E-mail instead.");
+        let doc_label = MERGE_DOCS.iter().find(|(k, _)| *k == f.doc).map_or("Form Letters", |(_, l)| *l);
+        let before = f.doc.clone();
+        ComboBox::from_id_salt(("mc-merge-doc", nonce)).selected_text(doc_label).width(200.0).show_ui(
+            ui,
+            |ui| {
+                for (k, l) in MERGE_DOCS {
+                    changed |= ui.selectable_value(&mut f.doc, k.to_owned(), l).changed();
+                }
+            },
+        );
+        if f.doc != before {
+            switch_merge_text(f, &before);
         }
-    });
-    ui.horizontal(|ui| {
-        ui.label("Merge to");
-        ui.radio_value(&mut f.output, "email".to_owned(), "E-mail");
-    });
-    egui::Grid::new(("mc-merge-grid", nonce)).num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
-        let l = ui.label("Message subject line");
-        changed |=
-            ui.add(TextEdit::singleline(&mut f.subject).desired_width(320.0)).labelled_by(l.id).changed();
         ui.end_row();
+        if f.doc != "letters" && f.to == "email" {
+            // E-mail merges are messages: only form letters can be mailed.
+            f.to = "document".into();
+            changed = true;
+        }
+        ui.label("Merge to");
+        ui.horizontal(|ui| {
+            changed |= ui.radio_value(&mut f.to, "document".to_owned(), "New Document").changed();
+            changed |= ui.radio_value(&mut f.to, "printer".to_owned(), "Printer").changed();
+            ui.add_enabled_ui(f.doc == "letters", |ui| {
+                changed |= ui.radio_value(&mut f.to, "email".to_owned(), "E-mail").changed();
+            });
+        });
+        ui.end_row();
+        if f.doc == "labels" && !f.label_sheets.is_empty() {
+            ui.label("Labels");
+            let cur = f.label_sheets.iter().find(|(k, _)| *k == f.labels).map_or("", |(_, l)| l.as_str());
+            ComboBox::from_id_salt(("mc-merge-labels", nonce)).selected_text(cur).width(280.0).show_ui(
+                ui,
+                |ui| {
+                    for (k, l) in &f.label_sheets {
+                        changed |= ui.selectable_value(&mut f.labels, k.clone(), l).changed();
+                    }
+                },
+            );
+            ui.end_row();
+        }
+        if f.doc == "envelopes" && !f.envelope_sizes.is_empty() {
+            ui.label("Envelope size");
+            let cur = f.envelope_sizes.iter().find(|(k, _)| *k == f.envelope).map_or("", |(_, l)| l.as_str());
+            ComboBox::from_id_salt(("mc-merge-env", nonce)).selected_text(cur).width(280.0).show_ui(
+                ui,
+                |ui| {
+                    for (k, l) in &f.envelope_sizes {
+                        changed |= ui.selectable_value(&mut f.envelope, k.clone(), l).changed();
+                    }
+                },
+            );
+            ui.end_row();
+            let l = ui.label("Return address");
+            ui.add(TextEdit::multiline(&mut f.return_address).desired_rows(3).desired_width(280.0))
+                .labelled_by(l.id);
+            ui.end_row();
+        }
+        match f.to.as_str() {
+            "email" => {
+                let l = ui.label("Message subject line");
+                changed |= ui
+                    .add(TextEdit::singleline(&mut f.subject).desired_width(320.0))
+                    .labelled_by(l.id)
+                    .changed();
+                ui.end_row();
+            }
+            "printer" => {
+                if f.printers.is_empty() {
+                    f.printers = printer_names(app);
+                }
+                ui.label("Printer");
+                ComboBox::from_id_salt(("mc-merge-printer", nonce))
+                    .selected_text(f.printer.clone())
+                    .width(280.0)
+                    .show_ui(ui, |ui| {
+                        for p in f.printers.clone() {
+                            ui.selectable_value(&mut f.printer, p.clone(), p);
+                        }
+                    });
+                ui.end_row();
+            }
+            _ => {
+                let l = ui.label("New document (PDF)");
+                ui.horizontal(|ui| {
+                    ui.add(TextEdit::singleline(&mut f.path).desired_width(240.0)).labelled_by(l.id);
+                    if crate::dialogs::browse_button(ui, app)
+                        && let Some(p) = crate::dialogs::browse_save(
+                            app,
+                            "New Document",
+                            &[crate::FileFilter::new("PDF document", &["pdf"])],
+                            &f.path,
+                        )
+                    {
+                        f.path = p;
+                    }
+                });
+                ui.end_row();
+            }
+        }
         ui.label("Insert merge field");
         ComboBox::from_id_salt(("mc-merge-field", nonce)).selected_text("Choose…").width(200.0).show_ui(
             ui,
@@ -973,14 +1109,32 @@ fn merge_ui(ui: &mut Ui, app: &mut App, f: &mut MergeForm, nonce: u64) -> Btn {
         );
         ui.end_row();
     });
+    let hint = match f.doc.as_str() {
+        "letters" if f.to == "email" => "Message text",
+        "letters" => "Letter text",
+        _ => "Address (blank = the standard address block)",
+    };
     changed |= ui
-        .add(
-            TextEdit::multiline(&mut f.body)
-                .desired_rows(6)
-                .desired_width(f32::INFINITY)
-                .hint_text("Message text"),
-        )
+        .add(TextEdit::multiline(&mut f.body).desired_rows(6).desired_width(f32::INFINITY).hint_text(hint))
         .changed();
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut f.data_file_on, "Save the contact data to a file");
+        ui.add_enabled_ui(f.data_file_on, |ui| {
+            let l = ui.label("File:");
+            ui.add(TextEdit::singleline(&mut f.data_file).desired_width(220.0).hint_text("contacts.csv"))
+                .labelled_by(l.id);
+            if crate::dialogs::browse_button(ui, app)
+                && let Some(p) = crate::dialogs::browse_save(
+                    app,
+                    "Contact Data File",
+                    &[crate::FileFilter::new("CSV file", &["csv"])],
+                    &f.data_file,
+                )
+            {
+                f.data_file = p;
+            }
+        });
+    });
     if changed {
         f.preview = None;
     }
@@ -1011,12 +1165,16 @@ fn merge_ui(ui: &mut Ui, app: &mut App, f: &mut MergeForm, nonce: u64) -> Btn {
                     f.preview = None;
                 }
                 if skipped > 0 {
-                    ui.label(RichText::new(format!("{skipped} without an email address skipped")).weak());
+                    let why = if f.to == "email" { "without an email address" } else { "(contact groups)" };
+                    ui.label(RichText::new(format!("{skipped} {why} skipped")).weak());
                 }
             });
             if let Some(m) = pv.get("preview").filter(|m| !m.is_null()) {
-                ui.label(format!("To: {}", m.get("to").and_then(Value::as_str).unwrap_or("")));
-                ui.label(format!("Subject: {}", m.get("subject").and_then(Value::as_str).unwrap_or("")));
+                if f.to == "email" {
+                    ui.label(format!("To: {}", m.get("to").and_then(Value::as_str).unwrap_or("")));
+                    ui.label(format!("Subject: {}", m.get("subject").and_then(Value::as_str).unwrap_or("")));
+                }
+                let text = m.get("body").or_else(|| m.get("text")).and_then(Value::as_str).unwrap_or("");
                 egui::Frame::new()
                     .stroke(egui::Stroke::new(1.0, app.theme.separator))
                     .inner_margin(6.0)
@@ -1024,7 +1182,7 @@ fn merge_ui(ui: &mut Ui, app: &mut App, f: &mut MergeForm, nonce: u64) -> Btn {
                         ScrollArea::vertical().id_salt(("mc-merge-preview", nonce)).max_height(140.0).show(
                             ui,
                             |ui| {
-                                ui.label(m.get("body").and_then(Value::as_str).unwrap_or(""));
+                                ui.label(text);
                             },
                         );
                     });
@@ -1035,7 +1193,12 @@ fn merge_ui(ui: &mut Ui, app: &mut App, f: &mut MergeForm, nonce: u64) -> Btn {
         ui.label(RichText::new(r).color(app.theme.accent));
     }
     ui.horizontal(|ui| {
-        let b = ok_cancel(ui, "Send", !f.subject.trim().is_empty());
+        let (label, ready) = match f.to.as_str() {
+            "email" => ("Send", !f.subject.trim().is_empty()),
+            "printer" => ("Print", true),
+            _ => ("Merge", !f.path.trim().is_empty()),
+        };
+        let b = ok_cancel(ui, label, ready && (!f.data_file_on || !f.data_file.trim().is_empty()));
         if b != Btn::None {
             out = b;
         }
@@ -1043,14 +1206,71 @@ fn merge_ui(ui: &mut Ui, app: &mut App, f: &mut MergeForm, nonce: u64) -> Btn {
     out
 }
 
+/// Printers a merge can go to: the system's default printer, then the others (not Save as PDF: that is New
+/// Document).
+fn printer_names(app: &mut App) -> Vec<String> {
+    use mailcraft_engine::cmd::print::{DEFAULT_PRINTER, SAVE_AS_PDF};
+    let mut out = vec![DEFAULT_PRINTER.to_owned()];
+    let listed = app
+        .s
+        .run("print.printers", &json!({}))
+        .ok()
+        .and_then(|v| v.get("printers").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    out.extend(
+        listed
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|p| !p.eq_ignore_ascii_case(SAVE_AS_PDF) && !p.eq_ignore_ascii_case(DEFAULT_PRINTER))
+            .map(str::to_owned),
+    );
+    out
+}
+
+/// The text a form letter starts with.
+const LETTER_START: &str = "Dear {{First Name}},\n\n";
+
+/// After the document type changed from `before`: text the user has not changed follows the new type
+/// (labels and envelopes get the address block, letters the greeting); edited text stays.
+fn switch_merge_text(f: &mut MergeForm, before: &str) {
+    let letters = |d: &str| d == "letters";
+    if letters(before) == letters(&f.doc) {
+        return;
+    }
+    let untouched =
+        f.body.trim().is_empty() || f.body == LETTER_START || f.body.trim() == f.address_block.trim();
+    if untouched {
+        f.body = if letters(&f.doc) { LETTER_START.to_owned() } else { f.address_block.clone() };
+    }
+}
+
+/// Mail Merge document types (output id, label).
+const MERGE_DOCS: [(&str, &str); 3] =
+    [("letters", "Form Letters"), ("labels", "Mailing Labels"), ("envelopes", "Envelopes")];
+
 fn merge_params(f: &MergeForm, extra: &[(&str, Value)]) -> Value {
     let mut p = serde_json::Map::new();
+    let output = if f.to == "email" { "email" } else { f.doc.as_str() };
     p.insert("contacts".into(), json!(f.contacts));
-    p.insert("output".into(), json!(f.output));
+    p.insert("output".into(), json!(output));
     p.insert("subject".into(), json!(f.subject));
     p.insert("body".into(), json!(f.body));
     if f.contacts == "selected" {
         p.insert("ids".into(), json!(f.selected));
+    }
+    if output != "email" {
+        p.insert("to".into(), json!(f.to));
+        p.insert("labels".into(), json!(f.labels));
+        p.insert("envelope".into(), json!(f.envelope));
+        p.insert("returnAddress".into(), json!(f.return_address));
+        if f.to == "printer" {
+            p.insert("printer".into(), json!(f.printer));
+        } else {
+            p.insert("path".into(), json!(f.path.trim()));
+        }
+    }
+    if f.data_file_on && !f.data_file.trim().is_empty() {
+        p.insert("dataFile".into(), json!(f.data_file.trim()));
     }
     for (k, v) in extra {
         p.insert((*k).to_owned(), v.clone());
@@ -1265,10 +1485,25 @@ fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
             Ok(true)
         }
         Kind::MailMerge(f) => {
-            let p = merge_params(f, &[("action", json!("send"))]);
+            let action = if f.to == "email" { "send" } else { "merge" };
+            let p = merge_params(f, &[("action", json!(action))]);
             let r = run_checked(app, "people.mailMerge", p)?;
-            let sent = r.get("sent").and_then(Value::as_u64).unwrap_or(0);
-            app.ui.toast = Some((format!("Mail Merge: {sent} message(s) sent to the Outbox."), 0.0));
+            let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let text = match f.to.as_str() {
+                "email" => format!("Mail Merge: {} message(s) sent to the Outbox.", n("sent")),
+                "printer" => format!(
+                    "Mail Merge: {} contact(s), {} page(s) sent to the printer.",
+                    n("merged"),
+                    n("pages")
+                ),
+                _ => format!(
+                    "Mail Merge: {} contact(s), {} page(s) saved to {}.",
+                    n("merged"),
+                    n("pages"),
+                    r.get("path").and_then(Value::as_str).unwrap_or_default()
+                ),
+            };
+            app.ui.toast = Some((text, 0.0));
             Ok(true)
         }
         Kind::DeleteRequest { ids, choice, done, .. } => {

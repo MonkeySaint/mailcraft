@@ -22,7 +22,7 @@ toggle L | Month | month | calendar.arrange | {"mode":"month"} | T | on=cal:mont
 toggle L | Schedule View | schedule | calendar.arrange | {"mode":"schedule"} | SV | on=cal:schedule
 button S | Calendar Options... | settings | options.open | {"page":"calendar"} | CO
 group Work Location | Z1 | c1180=collapse
-button L | Work Hours and Location Settings | work-week | options.open | {"page":"calendar"} | CS
+button L | Work Hours and Location Settings | work-week | options.open | {"page":"workHours"} | CS
 group Manage Calendars | ZC | c900=collapse
 drop L | Add Calendar | plus | | | OC | menu=addCalendar
 drop L | Share Calendar | calendar | | | SC | menu=shareCalendar
@@ -276,16 +276,16 @@ sep
 item | Change Time Zone... | location | calendar.changeTimeZone | | Z
 
 menu calendarColor
-item | Automatic | | calendar.color | {"color":"Automatic"} | A
-item | Blue | | calendar.color | {"color":"Blue"} | | swatch=#3b78c2
-item | Green | | calendar.color | {"color":"Green"} | | swatch=#4f9a4a
-item | Orange | | calendar.color | {"color":"Orange"} | | swatch=#e0883a
-item | Navy Blue | | calendar.color | {"color":"Navy Blue"} | | swatch=#2b3f7a
-item | Yellow | | calendar.color | {"color":"Yellow"} | | swatch=#e6c339
-item | Teal | | calendar.color | {"color":"Teal"} | | swatch=#2a8c8c
-item | Magenta | | calendar.color | {"color":"Magenta"} | | swatch=#b44b9a
-item | Brown | | calendar.color | {"color":"Brown"} | | swatch=#8a5a3a
-item | Dark Red | | calendar.color | {"color":"Dark Red"} | | swatch=#9a2a2a
+item | Automatic | | calendar.color | {"color":"Automatic"} | A | on=calcolor:Automatic
+item | Blue | | calendar.color | {"color":"Blue"} | | swatch=#3b78c2 on=calcolor:Blue
+item | Green | | calendar.color | {"color":"Green"} | | swatch=#4f9a4a on=calcolor:Green
+item | Orange | | calendar.color | {"color":"Orange"} | | swatch=#e0883a on=calcolor:Orange
+item | Navy Blue | | calendar.color | {"color":"Navy Blue"} | | swatch=#2b3f7a on=calcolor:Navy_Blue
+item | Yellow | | calendar.color | {"color":"Yellow"} | | swatch=#e6c339 on=calcolor:Yellow
+item | Teal | | calendar.color | {"color":"Teal"} | | swatch=#2a8c8c on=calcolor:Teal
+item | Magenta | | calendar.color | {"color":"Magenta"} | | swatch=#b44b9a on=calcolor:Magenta
+item | Brown | | calendar.color | {"color":"Brown"} | | swatch=#8a5a3a on=calcolor:Brown
+item | Dark Red | | calendar.color | {"color":"Dark Red"} | | swatch=#9a2a2a on=calcolor:Dark_Red
 
 menu dailyTaskList
 item | Normal | | calendar.dailyTaskList | {"mode":"normal"} | N | on=calview:dailyTaskList.normal
@@ -339,7 +339,7 @@ item | Custom... | flag | people.flag | {"kind":"custom"} | C
 sep
 item | Add Reminder... | bell | people.flag | {"kind":"reminder"} | R
 item | Mark Complete | flag-complete | people.flag | {"kind":"complete"} | M
-item | Clear Flag | | people.flag | {"kind":"clear"} | E
+item | Clear Flag | | people.flag | {"kind":"clear"} | E | en=pim:hasFlag
 sep
 item | Set Quick Click... | | mail.setQuickClickFlag | | Q
 
@@ -355,7 +355,7 @@ item | As a Contact | person | people.forward | {"as":"contact"} | O
 menu peopleCategorize
 dyn | categories | people.categorize | {"name":"$name"}
 sep
-item | Clear All Categories | | people.categorize | {"name":"","clear":true} | C
+item | Clear All Categories | | people.categorize | {"name":"","clear":true} | C | en=pim:hasCategories
 item | All Categories... | category-tag | people.allCategories | | A
 item | Set Quick Click... | | categories.setQuickClick | | Q
 

@@ -388,28 +388,42 @@ struct BookState {
     bcc: String,
     loaded: bool,
     info: String,
+    /// Search the names only (false) or every column (name, address, company).
+    all_columns: bool,
+    /// New Entry asked what to make.
+    new_entry: bool,
 }
 
 /// One address book entry: name, address, company, contact id (`None` for a recent recipient).
 type Entry = (String, String, String, Option<u64>);
 
-/// Address books: every contacts folder together, each contacts folder, the recent recipients.
+/// Address books: every address book together, each contacts folder shown as an e-mail address book (Folder
+/// Properties › Address Book, under the name given there), the recent recipients.
 fn books(app: &App) -> Vec<(String, String)> {
-    let mut v = vec![(String::new(), "Contacts (all folders)".to_owned())];
-    let mut folders: Vec<(String, String)> = app
-        .s
-        .mailbox
-        .folders
-        .values()
-        .filter(|f| f.kind == mailcraft_model::FolderKind::Contacts)
-        .map(|f| (f.id.0.to_string(), app.s.mailbox.folder_path(f.id)))
+    let mut v = vec![(String::new(), "Contacts (all address books)".to_owned())];
+    let folders: Vec<(String, String)> = mailcraft_engine::cmd::people::address_books(&app.s)
+        .into_iter()
+        .map(|(f, name)| (f.0.to_string(), name))
         .collect();
-    folders.sort_by_key(|(_, p)| p.to_lowercase());
     if folders.len() > 1 {
         v.extend(folders);
     }
     v.push(("recent".to_owned(), "Recent Recipients".to_owned()));
     v
+}
+
+/// True when entry `e` matches the search `q` (lower case): the name (Name only), or the name, address or
+/// company (All columns).
+pub(super) fn entry_matches(e: &Entry, q: &str, all_columns: bool) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let hit = |t: &str| t.to_lowercase().contains(q);
+    if all_columns {
+        hit(&e.0) || hit(&e.1) || hit(&e.2)
+    } else {
+        hit(&e.0) || (e.0.trim().is_empty() && hit(&e.1))
+    }
 }
 
 /// Entries of address book `book` (see [`books`]), sorted by name.
@@ -424,11 +438,12 @@ fn entries(app: &App, book: &str) -> Vec<Entry> {
             .collect()
     } else {
         let folder = book.parse::<u64>().ok();
+        let shown = mailcraft_engine::cmd::people::BookFilter::new(&app.s);
         app.s
             .mailbox
             .contacts
             .values()
-            .filter(|c| folder.is_none_or(|f| c.folder.0 == f))
+            .filter(|c| folder.map_or_else(|| shown.shows(c.folder), |f| c.folder.0 == f))
             .flat_map(|c| {
                 let name = c.full_name();
                 let name = if name.trim().is_empty() { c.file_as.clone() } else { name };
@@ -493,8 +508,12 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             window(ctx, app, d, &format!("Address Book: {book_name}"), 660.0, |ui, app| {
                 let mut out = Out::Keep;
                 ui.horizontal(|ui| {
-                    ui.label("Search:");
-                    ui.add(egui::TextEdit::singleline(&mut st.search).desired_width(220.0));
+                    ui.radio_value(&mut st.all_columns, false, "Name only");
+                    ui.radio_value(&mut st.all_columns, true, "All columns");
+                });
+                ui.horizontal(|ui| {
+                    let l = ui.label("Search:");
+                    ui.add(egui::TextEdit::singleline(&mut st.search).desired_width(220.0)).labelled_by(l.id);
                     ui.label("Address Book:");
                     egui::ComboBox::from_id_salt(("ab-book", uid)).selected_text(book_name.clone()).show_ui(
                         ui,
@@ -542,13 +561,11 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                             muted(ui, app, empty);
                                             ui.end_row();
                                         }
-                                        for (name, addr, company, id) in &list {
-                                            if !q.is_empty()
-                                                && !name.to_lowercase().contains(&q)
-                                                && !addr.to_lowercase().contains(&q)
-                                            {
+                                        for e in &list {
+                                            if !entry_matches(e, &q, st.all_columns) {
                                                 continue;
                                             }
+                                            let (name, addr, company, id) = e;
                                             let text = entry_text(name, addr);
                                             let r = ui.selectable_label(
                                                 st.selected.as_deref() == Some(text.as_str()),
@@ -596,10 +613,28 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                             super::folders::last_error(app)
                         };
                     }
+                    if btn(ui, "New Entry") {
+                        st.new_entry = !st.new_entry;
+                    }
                     if !st.info.is_empty() {
                         muted(ui, app, &st.info);
                     }
                 });
+                if st.new_entry {
+                    // New Entry: a contact or a contact group, in the address book shown (else Contacts).
+                    let folder = st.book.parse::<u64>().ok();
+                    ui.horizontal(|ui| {
+                        ui.label("Make a new:");
+                        if btn(ui, "Contact") {
+                            st.new_entry = false;
+                            app.run("people.new", json!({"folder": folder}));
+                        }
+                        if btn(ui, "Contact Group") {
+                            st.new_entry = false;
+                            app.run("people.newGroup", json!({"folder": folder}));
+                        }
+                    });
+                }
                 if pick.is_some() {
                     ui.horizontal(|ui| {
                         if ui

@@ -165,6 +165,11 @@ pub fn take_notices(app: &mut App) {
     }
 }
 
+/// A Browse... button, shown when the platform has file dialogs (true when clicked).
+pub(crate) fn browse_button(ui: &mut egui::Ui, app: &App) -> bool {
+    common::browse_button(ui, app)
+}
+
 /// A UI-only setting kept by the dialogs (Options values the engine does not hold yet, Reading Pane options
 /// such as `readingPane.markWhenViewed`, junk lists, signatures…), for other areas to read.
 pub fn ui_pref(ctx: &egui::Context, key: &str) -> Option<Value> {

@@ -652,6 +652,7 @@ fn view_customized(s: &Session) -> Option<&'static str> {
         || modules::customized(s, f)
         || mail::customized(s, f)
         || !crate::cmd::notes::positions(s, f).is_empty()
+        || (s.view.module == Module::Calendar && crate::cmd::calendar::views::view_customized(s))
         || s.view
             .collapsed_groups
             .get(&f)

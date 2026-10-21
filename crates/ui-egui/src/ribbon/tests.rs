@@ -370,6 +370,37 @@ fn tabs_per_surface_and_mode() {
 }
 
 #[test]
+fn calendar_colour_and_contact_tag_states() {
+    use serde_json::json;
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let mem = state::Mem::default();
+    app.s.view.module = mailcraft_engine::Module::Calendar;
+    assert!(state::is_on(&app, Surface::Main, &mem, "calcolor:Automatic"));
+    app.run("calendar.color", json!({"color": "Navy Blue"}));
+    assert!(state::is_on(&app, Surface::Main, &mem, "calcolor:Navy_Blue"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "calcolor:Automatic"));
+    // Clear Flag and Clear All Categories need a flagged / categorised contact.
+    let id = app.run("people.new", json!({"fullName": "Tag Test"})).unwrap()["id"].as_u64().unwrap();
+    app.s.view.module = mailcraft_engine::Module::People;
+    app.ui.module_selection = Some(id);
+    app.s.selection.items = vec![mailcraft_model::ItemId(id)];
+    assert!(!state::is_on(&app, Surface::Main, &mem, "pim:hasFlag"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "pim:hasCategories"));
+    app.run("people.flag", json!({"ids": [id], "kind": "today"})).expect("flag");
+    app.run("people.categorize", json!({"ids": [id], "name": "Red category"})).expect("categorize");
+    assert!(state::is_on(&app, Surface::Main, &mem, "pim:hasFlag"));
+    assert!(state::is_on(&app, Surface::Main, &mem, "pim:hasCategories"));
+    // The menu items carry the rules.
+    let d = defs();
+    let item = |menu: &str, label: &str| {
+        d.menus.get(menu).and_then(|m| m.iter().find(|i| i.label == label)).cloned().unwrap()
+    };
+    assert_eq!(item("peopleFollowUp", "Clear Flag").en.as_deref(), Some("pim:hasFlag"));
+    assert_eq!(item("peopleCategorize", "Clear All Categories").en.as_deref(), Some("pim:hasCategories"));
+    assert_eq!(item("calendarColor", "Dark Red").on.as_deref(), Some("calcolor:Dark_Red"));
+}
+
+#[test]
 fn toggles_reflect_state() {
     let mut app = App::new(mailcraft_engine::sample::sample_session());
     let mem = state::Mem::default();

@@ -430,3 +430,76 @@ fn calendar_views_saved_by_name() {
     let inbox = role(&s, mailcraft_model::FolderRole::Inbox);
     assert!(mv(&mut s, "view.applyViewTo", json!({"folders": [inbox.0]})).is_err());
 }
+
+/// Regression: a local calendar marked read-only (Calendar Properties) also refuses the changes meeting
+/// messages make: answering a request, removing a canceled meeting, recording a response, canceling, and
+/// the automatic accept / decline pass.
+#[test]
+fn a_read_only_calendar_refuses_meeting_changes() {
+    use mailcraft_model::FolderRole;
+    let read_only = |s: &mut Session, on: bool| {
+        let c = role(s, FolderRole::Calendar);
+        s.run("calendar.setProperties", &json!({"folder": c.0, "readOnly": on})).unwrap();
+    };
+    let mut org = session();
+    let (meeting, cid) = invite(&mut org);
+    let uid = org.mailbox.appointments[&meeting].uid.clone();
+    let mut ann = person("ann@example.com", "Ann Lee");
+    let mail = deliver(&org, cid, &mut ann);
+    read_only(&mut ann, true);
+    let before = ann.mailbox.appointments.len();
+    let e = ann
+        .run("calendar.respond", &json!({"id": mail.0, "response": "accept", "send": "none"}))
+        .unwrap_err();
+    assert!(e.to_string().contains("read-only"), "{e}");
+    assert!(
+        ann.run(
+            "calendar.proposeNewTime",
+            &json!({"id": mail.0, "start": "2026-10-13T16:00", "end": "2026-10-13T17:00", "send": "none"})
+        )
+        .is_err()
+    );
+    assert_eq!(ann.mailbox.appointments.len(), before, "nothing was added");
+    assert!(find_by_uid(&ann, &uid).is_none());
+    // Automatic accept leaves the request for the user, and it is not placed as Tentative either.
+    set(&mut ann, "calendar.autoAccept", json!(true));
+    assert_eq!(ann.run("calendar.autoRespond", &json!({"ids": [mail.0]})).unwrap()["handled"], json!([]));
+    let msg = read_itip(&ann, mail).unwrap();
+    assert!(place_tentative(&mut ann, mail, &msg).is_err());
+    assert!(find_by_uid(&ann, &uid).is_none());
+
+    // Accepted while writable, then made read-only: Decline and Remove from Calendar keep it.
+    read_only(&mut ann, false);
+    set(&mut ann, "calendar.autoAccept", json!(false));
+    ann.run("calendar.respond", &json!({"id": mail.0, "response": "accept", "send": "none"})).unwrap();
+    let copy = find_by_uid(&ann, &uid).unwrap();
+    read_only(&mut ann, true);
+    assert!(
+        ann.run("calendar.respond", &json!({"id": mail.0, "response": "decline", "send": "none"})).is_err()
+    );
+    assert_eq!(ann.mailbox.appointments[&copy].folder, role(&ann, FolderRole::Calendar));
+    let r = org.run("calendar.cancelMeeting", &json!({"id": meeting.0, "send": "edit"})).unwrap();
+    let cancel = deliver(&org, r["compose"].as_u64().unwrap(), &mut ann);
+    let e = ann.run("calendar.removeFromCalendar", &json!({"id": cancel.0})).unwrap_err();
+    assert!(e.to_string().contains("read-only"), "{e}");
+    set(&mut ann, "calendar.autoAccept", json!(true));
+    assert_eq!(ann.run("calendar.autoRespond", &json!({"ids": [cancel.0]})).unwrap()["handled"], json!([]));
+    assert_eq!(ann.mailbox.appointments[&copy].folder, role(&ann, FolderRole::Calendar));
+
+    // The organizer's read-only calendar: responses are not recorded and the meeting cannot be canceled.
+    let mut org = session();
+    let (meeting, cid) = invite(&mut org);
+    let mut bob = person("bob@example.org", "Bob");
+    let mail = deliver(&org, cid, &mut bob);
+    let r =
+        bob.run("calendar.respond", &json!({"id": mail.0, "response": "accept", "send": "edit"})).unwrap();
+    let reply = deliver(&bob, r["compose"].as_u64().unwrap(), &mut org);
+    read_only(&mut org, true);
+    assert!(org.run("calendar.processReply", &json!({"id": reply.0})).is_err());
+    let t = org.run("calendar.tracking", &json!({"id": meeting.0})).unwrap();
+    assert_eq!(t["accepted"], 0);
+    assert!(org.run("calendar.cancelMeeting", &json!({"id": meeting.0, "send": "none"})).is_err());
+    assert_eq!(org.mailbox.appointments[&meeting].folder, role(&org, FolderRole::Calendar));
+    read_only(&mut org, false);
+    assert_eq!(org.run("calendar.processReply", &json!({"id": reply.0})).unwrap()["updated"], 1);
+}

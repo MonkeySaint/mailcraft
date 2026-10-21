@@ -33,7 +33,7 @@ pub mod subscribe;
 pub mod tz;
 pub mod views;
 
-pub use views::{module_view, saved_view, second_zone, work_hours, work_week};
+pub use views::{module_view, saved_view, second_zone, third_zone, work_hours, work_week};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -834,11 +834,101 @@ fn run_color(s: &mut Session, p: &Value) -> CmdResult {
     }))
 }
 
+/// Calendar Properties (the calendar tab of Folder › Properties): `color` (as View › Color), and for an
+/// internet calendar its address (`url`, http(s) or webcal) and `refreshMin` (minutes between updates,
+/// kept within the allowed range); for any other calendar `readOnly` (its items cannot be changed until it is
+/// turned off again; an internet calendar is always read-only). `updateNow` downloads an internet calendar
+/// again (like Update Folder). A new address forgets what the old one sent and is downloaded on the next
+/// update. Returns the calendar's properties as Folder › Properties shows them.
+fn run_set_properties(s: &mut Session, p: &Value) -> CmdResult {
+    let folder = target_calendar(s, p)?;
+    let mut x = props::read(&s.mailbox, folder);
+    if let Some(c) = opt_str(p, "color") {
+        let color = CALENDAR_COLORS.iter().find(|x| x.eq_ignore_ascii_case(c.trim())).ok_or_else(|| {
+            CmdError::Params(format!("`color` must be one of {}", CALENDAR_COLORS.join(", ")))
+        })?;
+        x.color = (*color != "Automatic").then(|| (*color).to_owned());
+    }
+    let internet = x.source == mailcraft_model::calendar::CalendarSource::Internet;
+    if let Some(url) = pim::text(p, "url")? {
+        let sub = x
+            .subscription
+            .as_mut()
+            .filter(|_| internet)
+            .ok_or_else(|| CmdError::Params("only an internet calendar has an address".into()))?;
+        let url = props::normalize_url(&url).ok_or_else(|| {
+            CmdError::Params("the address must start with http://, https:// or webcal://".into())
+        })?;
+        if url != sub.url {
+            *sub = Subscription { url, refresh_min: sub.refresh_min, ..Default::default() };
+        }
+    }
+    if let Some(m) = opt_u64(p, "refreshMin") {
+        let sub =
+            x.subscription.as_mut().filter(|_| internet).ok_or_else(|| {
+                CmdError::Params("only an internet calendar is updated on a schedule".into())
+            })?;
+        let m = u32::try_from(m).unwrap_or(u32::MAX);
+        sub.refresh_min = m.clamp(props::MIN_REFRESH_MIN, props::MAX_REFRESH_MIN);
+    }
+    if let Some(ro) = pim::flag(p, "readOnly")? {
+        if internet && !ro {
+            return Err(CmdError::Params("an internet calendar is always read-only".into()));
+        }
+        x.read_only = ro || internet;
+    }
+    props::write(&mut s.mailbox, folder, &x);
+    let mut out = calendar_properties_json(&s.mailbox, folder);
+    if pim::flag(p, "updateNow")? == Some(true) {
+        if !internet {
+            return Err(CmdError::Params("only an internet calendar can be updated".into()));
+        }
+        let r = s.run("sendReceive.folder", &json!({ "folder": folder.0 }))?;
+        if let Some(o) = out.as_object_mut() {
+            o.insert("update".into(), r.get("status").cloned().unwrap_or(Value::Null));
+        }
+    }
+    Ok(out)
+}
+
+/// A calendar's properties as Folder › Properties shows them: colour, source, read-only, and for an
+/// internet calendar its address, update interval and last update.
+pub fn calendar_properties_json(mb: &mailcraft_model::Mailbox, folder: FolderId) -> Value {
+    let x = props::read(mb, folder);
+    let source = match x.source {
+        mailcraft_model::calendar::CalendarSource::Local => "local",
+        mailcraft_model::calendar::CalendarSource::Internet => "internet",
+        mailcraft_model::calendar::CalendarSource::File => "file",
+    };
+    let sub = x.subscription.as_ref();
+    json!({
+        "folder": folder.0,
+        "color": x.color.clone().unwrap_or_else(|| "Automatic".into()),
+        "source": source,
+        "readOnly": x.read_only,
+        "url": sub.map(|x| x.url.clone()),
+        "refreshMin": sub.map(|x| x.refresh_min),
+        "lastUpdate": sub.and_then(|x| x.last_update),
+        "lastError": sub.and_then(|x| x.last_error.clone()),
+    })
+}
+
 /// Change Time Zone: `{zone}` (IANA id) or `{offsetMin}` sets the calendar's zone; `label`, `secondZone`,
 /// `secondLabel`, `showSecond` set the labels and the second zone shown in day and week views. No params =
 /// open the dialog.
 fn run_change_time_zone(s: &mut Session, p: &Value) -> CmdResult {
-    let keys = ["offsetMin", "zone", "label", "secondZone", "secondLabel", "showSecond", "swap"];
+    let keys = [
+        "offsetMin",
+        "zone",
+        "label",
+        "secondZone",
+        "secondLabel",
+        "showSecond",
+        "thirdZone",
+        "thirdLabel",
+        "showThird",
+        "swap",
+    ];
     if !pim::has_any(p, &keys) {
         let z = views::time_zones(s);
         let now = s.now().unix;
@@ -879,6 +969,15 @@ fn run_change_time_zone(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(on) = pim::flag(p, "showSecond")? {
         z.show_second = on;
     }
+    if let Some(zone) = zone_param("thirdZone")? {
+        z.third_zone = zone;
+    }
+    if let Some(l) = text("thirdLabel")? {
+        z.third_label = l;
+    }
+    if let Some(on) = pim::flag(p, "showThird")? {
+        z.show_third = on;
+    }
     if pim::flag(p, "swap")? == Some(true) {
         if !tz::known(&z.zone) || !tz::known(&z.second_zone) {
             return Err(CmdError::Params("swapping needs two named time zones".into()));
@@ -888,6 +987,12 @@ fn run_change_time_zone(s: &mut Session, p: &Value) -> CmdResult {
     }
     if z.show_second && !tz::known(&z.second_zone) {
         return Err(CmdError::Params("choose the second time zone (`secondZone`)".into()));
+    }
+    if z.show_third && !tz::known(&z.third_zone) {
+        return Err(CmdError::Params("choose the third time zone (`thirdZone`)".into()));
+    }
+    if z.show_third && !z.show_second {
+        return Err(CmdError::Params("a third time zone is shown with a second one (`showSecond`)".into()));
     }
     let now = s.now().unix;
     let offset = match p.get("offsetMin") {
@@ -1958,13 +2063,19 @@ fn run_categorize(s: &mut Session, p: &Value) -> CmdResult {
     pim::run_categorize(s, p, Kind::Appointment)
 }
 
-/// Refuses changes to the items of a read-only calendar (an internet subscription).
+/// Refuses changes to the items of a read-only calendar (an internet subscription, or a calendar marked
+/// read-only in Calendar Properties).
 fn check_writable(s: &Session, folder: FolderId) -> Result<(), CmdError> {
     if props::is_read_only(&s.mailbox, folder) {
         let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
-        return Err(CmdError::Disabled(format!(
-            "\"{name}\" is a subscribed internet calendar; its items cannot be changed"
-        )));
+        let why = if props::read(&s.mailbox, folder).source
+            == mailcraft_model::calendar::CalendarSource::Internet
+        {
+            "is a subscribed internet calendar"
+        } else {
+            "is read-only (Calendar Properties)"
+        };
+        return Err(CmdError::Disabled(format!("\"{name}\" {why}; its items cannot be changed")));
     }
     Ok(())
 }
@@ -1974,6 +2085,34 @@ fn check_items_writable(s: &Session, ids: &[ItemId]) -> Result<(), CmdError> {
         if let Some(a) = s.mailbox.appointments.get(id) {
             check_writable(s, a.folder)?;
         }
+    }
+    Ok(())
+}
+
+/// Refuses what a scheduling message would change on a read-only calendar: the user's copy of the meeting
+/// `uid` (with its exceptions, and the one for occurrence `rid`) and, when there is no copy yet and `placing`,
+/// the calendar a new copy from `mail` would go to.
+fn check_meeting_writable(
+    s: &Session,
+    mail: ItemId,
+    uid: &str,
+    rid: Option<DateTime>,
+    placing: bool,
+) -> Result<(), CmdError> {
+    let existing = find_by_uid(s, uid);
+    let mut ids: Vec<ItemId> = Vec::new();
+    if let Some(id) = existing {
+        ids.push(id);
+        if let Some(a) = s.mailbox.appointments.get(&id) {
+            ids.extend(exceptions_of(s, a));
+        }
+    }
+    if let Some(x) = rid.and_then(|rid| find_instance(s, uid, rid)) {
+        ids.push(x);
+    }
+    check_items_writable(s, &ids)?;
+    if existing.is_none() && placing {
+        check_writable(s, meeting_folder(s, mail)?)?;
     }
     Ok(())
 }
@@ -3162,6 +3301,8 @@ fn apply_response(
         let seed = ItemId(s.mailbox.alloc_id());
         a.uid = new_uid(s, seed, s.now().unix);
     }
+    // Nothing changes when the calendar holding the meeting (or receiving it) is read-only.
+    check_meeting_writable(s, mail, &a.uid, msg.event.recurrence_id, response != ResponseStatus::Declined)?;
     let existing = find_by_uid(s, &a.uid);
     let series = existing.filter(|id| s.mailbox.appointments.get(id).is_some_and(|x| x.recurrence.is_some()));
     if let Some(rid) = msg.event.recurrence_id {
@@ -3381,6 +3522,7 @@ fn run_process_reply(s: &mut Session, p: &Value) -> CmdResult {
         .ok_or_else(|| CmdError::Params("the meeting is not on your Calendar".into()))?;
     let mut a =
         s.mailbox.appointments.get(&id).cloned().ok_or_else(|| CmdError::Failed("no meeting".into()))?;
+    check_writable(s, a.folder)?;
     let n = itip::apply_reply(&mut a, &msg);
     let tracking = tracking_json(&a);
     s.mailbox.appointments.insert(id, a);
@@ -3389,13 +3531,14 @@ fn run_process_reply(s: &mut Session, p: &Value) -> CmdResult {
 
 /// `calendar.removeFromCalendar {id}`: applies a CANCEL (the meeting, or the one canceled occurrence).
 fn run_remove_canceled(s: &mut Session, p: &Value) -> CmdResult {
-    let (_, msg) = req_meeting_mail(s, p)?;
+    let (mail, msg) = req_meeting_mail(s, p)?;
     if msg.method != Method::Cancel {
         return Err(CmdError::Params("the message is not a meeting cancellation".into()));
     }
     let uid = msg.event.appointment.uid.clone();
     let id =
         find_by_uid(s, &uid).ok_or_else(|| CmdError::Params("the meeting is not on your Calendar".into()))?;
+    check_meeting_writable(s, mail, &uid, msg.event.recurrence_id, false)?;
     if let Some(occ) = msg.event.recurrence_id {
         // One occurrence: the series loses it, and an exception for it goes.
         let mut series = false;
@@ -3470,6 +3613,12 @@ pub fn auto_respond_candidates(s: &Session) -> Vec<ItemId> {
 
 /// What the automatic options do with a scheduling message (`None` = leave it to the user).
 fn auto_decision(s: &Session, mail: ItemId, msg: &ItipMessage) -> Option<&'static str> {
+    // A meeting on (or bound for) a read-only calendar is left to the user.
+    let placing = matches!(msg.method, Method::Request | Method::Add);
+    let uid = msg.event.appointment.uid.trim();
+    if !uid.is_empty() && check_meeting_writable(s, mail, uid, msg.event.recurrence_id, placing).is_err() {
+        return None;
+    }
     let info = meeting_message_from(s, mail, msg);
     match msg.method {
         Method::Request | Method::Add => {
@@ -3537,13 +3686,14 @@ fn run_auto_respond(s: &mut Session, p: &Value) -> CmdResult {
 
 /// `calendar.acceptProposal {id}`: the organizer takes a COUNTER's time and sends the update.
 fn run_accept_proposal(s: &mut Session, p: &Value) -> CmdResult {
-    let (_, msg) = req_meeting_mail(s, p)?;
+    let (mail, msg) = req_meeting_mail(s, p)?;
     if msg.method != Method::Counter {
         return Err(CmdError::Params("the message does not propose a new time".into()));
     }
     let uid = msg.event.appointment.uid.clone();
     let found =
         find_by_uid(s, &uid).ok_or_else(|| CmdError::Params("the meeting is not on your Calendar".into()))?;
+    check_meeting_writable(s, mail, &uid, msg.event.recurrence_id, false)?;
     // A proposal for one occurrence moves only that occurrence (its exception, made here if need be).
     let id = match msg.event.recurrence_id {
         Some(rid) => match find_instance(s, &uid, rid) {
@@ -3616,6 +3766,7 @@ fn run_cancel_meeting(s: &mut Session, p: &Value) -> CmdResult {
     if a.attendees.is_empty() {
         return Err(CmdError::Params("the appointment has no attendees".into()));
     }
+    check_writable(s, a.folder)?;
     let mode = send_mode(p, SendMode::Edit)?;
     let comment = pim::text(p, "comment")?.unwrap_or_default();
     let to = a.attendees.iter().map(|x| x.mailbox.to_display_string()).collect::<Vec<_>>().join("; ");
@@ -3665,7 +3816,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Change Time Zone",
             "View › Time Scale",
             "",
-            r#"{"zone"?: "IANA id", "offsetMin"?: number, "label"?: string, "secondZone"?: "IANA id", "secondLabel"?: string, "showSecond"?: bool, "swap"?: bool} (no params = open the dialog)"#,
+            r#"{"zone"?: "IANA id", "offsetMin"?: number, "label"?: string, "secondZone"?: "IANA id", "secondLabel"?: string, "showSecond"?: bool, "thirdZone"?: "IANA id", "thirdLabel"?: string, "showThird"?: bool, "swap"?: bool} (no params = open the dialog)"#,
             true,
             run_change_time_zone,
         ),
@@ -3677,6 +3828,15 @@ pub fn specs() -> Vec<CommandSpec> {
             r#"{"color": "Automatic|Blue|Green|Orange|Navy Blue|Yellow|Teal|Magenta|Brown|Dark Red", "calendar"?: string, "folder"?: number}"#,
             true,
             run_color,
+        ),
+        spec(
+            "calendar.setProperties",
+            "Calendar Properties",
+            "Folder › Properties (calendars)",
+            "",
+            r#"{"folder"?: number, "calendar"?: string, "color"?: "Automatic|Blue|…", "url"?: string (internet calendars), "refreshMin"?: number (internet calendars), "readOnly"?: bool (other calendars), "updateNow"?: bool (internet calendars)}"#,
+            true,
+            run_set_properties,
         ),
         spec(
             "calendar.dailyTaskList",

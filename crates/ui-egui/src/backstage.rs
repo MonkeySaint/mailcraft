@@ -776,7 +776,7 @@ fn open_export(ui: &mut Ui, app: &mut App, st: &mut PageState) {
     }
 }
 
-fn home() -> String {
+pub(crate) fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| ".".into())
 }
 

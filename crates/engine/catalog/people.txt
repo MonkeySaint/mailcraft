@@ -12,8 +12,8 @@ People|Home › Current View|Phone|view.changeView
 People|Home › Current View|List|view.changeView
 People|Home › Current View|Change View|view.changeView
 People|Home › Actions|Move|people.move
-# Mail Merge merges to E-mail only: Form Letters, Mailing Labels and Envelopes need a word processor document
-# and are listed but off (people.mailMerge answers Disabled for them).
+# Mail Merge: E-mail, or Form Letters, Mailing Labels and Envelopes to a new (PDF) document or a printer, plus the
+# contact data file (CSV).
 People|Home › Actions|Mail Merge...|people.mailMerge
 People|Home › Actions|Send to OneNote|-|OneNote integration (Microsoft service)
 People|Home › Share|Forward Contact|people.forward

@@ -17,7 +17,7 @@ const KEYS: &[&str] = &[
 ];
 
 /// Keys that may name files on disk: never given a writable path.
-const PATH_KEYS: &[&str] = &["path", "file", "dir", "folder_path", "filename"];
+const PATH_KEYS: &[&str] = &["path", "file", "dir", "folder_path", "filename", "dataFile"];
 
 fn long_string() -> String {
     "A\u{1F600}\0é".repeat(2_500)

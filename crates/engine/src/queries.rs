@@ -1821,7 +1821,8 @@ pub fn address_suggestions(s: &Session, prefix: &str, limit: usize) -> Vec<Sugge
         }
     }
     let mut contacts: Vec<(String, String)> = Vec::new();
-    for c in s.mailbox.contacts.values() {
+    let books = crate::cmd::people::BookFilter::new(s);
+    for c in s.mailbox.contacts.values().filter(|c| books.shows(c.folder)) {
         let full = c.full_name();
         let shown = if full.trim().is_empty() { c.file_as.trim().to_owned() } else { full.clone() };
         let name_hit = [&full, &c.file_as, &c.first_name, &c.last_name, &c.company]

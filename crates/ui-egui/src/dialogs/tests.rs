@@ -1064,3 +1064,99 @@ fn custom_flag_due_date_from_the_month_picker() {
         other => panic!("no due date: {other:?}"),
     }
 }
+
+#[test]
+fn calendar_properties_tab_saves_colour_and_read_only() {
+    let mut app = sample_app();
+    let acct = app.s.mailbox.accounts.first().map(|a| a.id).unwrap();
+    let cal = app.s.mailbox.role_folder(acct, mailcraft_model::FolderRole::Calendar).unwrap();
+    app.run("folder.properties", json!({"folder": cal.0})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["folderProperties"]);
+    assert!(h.query_by_label("AutoArchive").is_some(), "calendars keep the AutoArchive tab");
+    h.get_by_label("Calendar Settings").click();
+    step(&mut h);
+    h.get_by_label("Read-only (the calendar's items cannot be changed)").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert!(mailcraft_engine::cmd::calendar::props::read(&h.state().s.mailbox, cal).read_only);
+}
+
+#[test]
+fn contacts_properties_have_an_address_book_tab_and_no_autoarchive() {
+    let mut app = sample_app();
+    let acct = app.s.mailbox.accounts.first().map(|a| a.id).unwrap();
+    let contacts = app.s.mailbox.role_folder(acct, mailcraft_model::FolderRole::Contacts).unwrap();
+    app.run("folder.properties", json!({"folder": contacts.0})).unwrap();
+    let mut h = harness(app);
+    assert!(h.query_by_label("AutoArchive").is_none(), "AutoArchive does not apply to contacts");
+    h.get_by_label("Address Book").click();
+    step(&mut h);
+    h.get_by_label("Show this folder as an e-mail Address Book").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert!(!mailcraft_engine::cmd::people::in_address_book(&h.state().s, contacts));
+}
+
+#[test]
+fn address_book_entry_matching() {
+    use super::find::entry_matches;
+    let e = ("Bob Chen".to_owned(), "bob@example.org".to_owned(), "Example Org".to_owned(), Some(1));
+    // A company-only hit counts with All columns, not with Name only.
+    assert!(entry_matches(&e, "example org", true));
+    assert!(!entry_matches(&e, "example org", false));
+    // An address-only hit likewise (unless the entry has no name).
+    assert!(entry_matches(&e, "bob@", true));
+    assert!(!entry_matches(&e, "bob@", false));
+    let unnamed = (String::new(), "dee@example.net".to_owned(), String::new(), None);
+    assert!(entry_matches(&unnamed, "dee@", false));
+    // The name always counts; an empty search shows everything.
+    assert!(entry_matches(&e, "chen", false) && entry_matches(&e, "chen", true));
+    assert!(entry_matches(&e, "", false));
+    assert!(!entry_matches(&e, "zed", true));
+}
+
+#[test]
+fn address_book_searches_names_or_all_columns() {
+    let mut app = sample_app();
+    // A second contacts folder, shown as its own address book.
+    let acct = app.s.mailbox.accounts.first().map(|a| a.id).unwrap();
+    let contacts = app.s.mailbox.role_folder(acct, mailcraft_model::FolderRole::Contacts).unwrap();
+    let club = app.s.mailbox.create_folder(contacts, "Club").unwrap();
+    app.run("compose.addressBook", json!({})).unwrap();
+    let mut h = harness(app);
+    let shown = |h: &Harness<'_, App>| {
+        ["Alice Rivera", "Bob Chen", "Erin Walsh", "Grace Kim"]
+            .into_iter()
+            .filter(|n| h.query_by_label(n).is_some())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shown(&h).len(), 4, "every contact before a search");
+    // A company name: Name only finds nobody, All columns finds that company's people.
+    h.get_by_label("Search:").focus();
+    step(&mut h);
+    h.get_by_label("Search:").type_text("Example Org");
+    step(&mut h);
+    assert!(shown(&h).is_empty(), "{:?}", shown(&h));
+    h.get_by_label("All columns").click();
+    step(&mut h);
+    assert_eq!(shown(&h), ["Bob Chen", "Erin Walsh", "Grace Kim"]);
+    h.get_by_label("Name only").click();
+    step(&mut h);
+    assert!(shown(&h).is_empty());
+    // New Entry › Contact opens the contact window in the address book shown.
+    h.get_by_value("Contacts (all address books)").click();
+    step(&mut h);
+    h.get_by_label("Club").click();
+    step(&mut h);
+    h.get_by_label("New Entry").click();
+    step(&mut h);
+    assert!(h.query_by_label("Contact Group").is_some(), "New Entry offers a contact or a contact group");
+    h.get_by_label("Contact").click();
+    step(&mut h);
+    assert_eq!(crate::modules::contact_window_folder(&h.ctx), Some(Some(club.0)));
+}

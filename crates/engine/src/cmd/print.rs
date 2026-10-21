@@ -737,6 +737,54 @@ pub fn pdf_bytes(s: &Session, p: &Value) -> Result<(Vec<u8>, usize, String), Cmd
     Ok((bytes, pages.len(), job.ctx.title))
 }
 
+/// The file `path` names, refused when its folder does not exist.
+pub(crate) fn output_path(path: &str) -> Result<std::path::PathBuf, CmdError> {
+    let path = std::path::PathBuf::from(path.trim());
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && !dir.is_dir()
+    {
+        return Err(CmdError::Failed(format!("{}: folder not found", dir.display())));
+    }
+    Ok(path)
+}
+
+/// Sends laid-out `pages` to `printer`: [`SAVE_AS_PDF`] writes them as a PDF at `path`; any other name (or
+/// [`DEFAULT_PRINTER`]) goes to the system print service. Returns `{"printer", "pages", "path"?}`.
+pub(crate) fn output_pages(
+    s: &mut Session,
+    pages: &[Page],
+    title: &str,
+    printer: &str,
+    path: Option<&str>,
+) -> CmdResult {
+    let fonts = FontDb::bundled();
+    let info = mailcraft_render::pdf::PdfInfo { title: title.to_owned(), author: String::new() };
+    let pdf = |pages: &[Page]| {
+        mailcraft_render::pdf::write_pdf(pages, &fonts, &info).map_err(|e| CmdError::Failed(e.to_string()))
+    };
+    if printer.eq_ignore_ascii_case(SAVE_AS_PDF) {
+        let path = path
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| CmdError::Params("`path` (the PDF file to write) is required".into()))?;
+        let path = output_path(path)?;
+        let bytes = pdf(pages)?;
+        write_file(&path, &bytes)?;
+        let shown = path.display().to_string();
+        s.notices.push(Notice::Info(format!("Saved {} page(s) to {shown}.", pages.len())));
+        return Ok(
+            json!({"printer": SAVE_AS_PDF, "path": shown, "pages": pages.len(), "bytes": bytes.len()}),
+        );
+    }
+    if printer.starts_with('-') || printer.chars().any(char::is_control) || printer.len() > 256 {
+        return Err(CmdError::Params("bad printer name".into()));
+    }
+    let bytes = pdf(pages)?;
+    let job = system_print(printer, title, 1, &bytes)?;
+    s.notices.push(Notice::Info(format!("Sent {} page(s) to {printer}.", pages.len())));
+    Ok(json!({"printer": printer, "pages": pages.len(), "job": job}))
+}
+
 fn print(s: &mut Session, p: &Value) -> CmdResult {
     let printer = opt_str(p, "printer").map(str::trim).filter(|v| !v.is_empty()).unwrap_or(SAVE_AS_PDF);
     if printer.eq_ignore_ascii_case(SAVE_AS_PDF) {
@@ -747,12 +795,7 @@ fn print(s: &mut Session, p: &Value) -> CmdResult {
             .ok_or_else(|| {
                 CmdError::Params("`path` (the PDF file to write) required for Save as PDF".into())
             })?;
-        let path = std::path::PathBuf::from(path);
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
-            && !dir.is_dir()
-        {
-            return Err(CmdError::Failed(format!("{}: folder not found", dir.display())));
-        }
+        let path = output_path(path)?;
         let (bytes, pages, _) = pdf_bytes(s, p)?;
         write_file(&path, &bytes)?;
         let shown = path.display().to_string();

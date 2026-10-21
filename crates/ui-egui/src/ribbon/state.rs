@@ -99,7 +99,8 @@ fn module_item(app: &App, surface: Surface) -> Option<mailcraft_model::ItemId> {
     app.ui.module_selection.map(mailcraft_model::ItemId)
 }
 
-/// Tags state of the selected contact or task (`pim:private`, `pim:high`, `pim:low`, `pim:flagged`).
+/// Tags state of the selected contact or task (`pim:private`, `pim:high`, `pim:low`, `pim:flagged`; contacts
+/// also `pim:hasFlag`, `pim:hasCategories`).
 fn pim_on(app: &App, surface: Surface, arg: &str) -> bool {
     let Some(id) = module_item(app, surface) else { return false };
     let mb = &app.s.mailbox;
@@ -113,9 +114,14 @@ fn pim_on(app: &App, surface: Surface, arg: &str) -> bool {
         };
     }
     if let Some(c) = mb.contacts.get(&id) {
+        // Clear Flag / Clear All Categories: some selected contact has a flag / a category.
+        let selected =
+            || std::iter::once(c).chain(app.s.selection.items.iter().filter_map(|i| mb.contacts.get(i)));
         return match arg {
             "private" => c.private,
             "flagged" => matches!(c.flag, mailcraft_model::FlagState::Flagged { .. }),
+            "hasFlag" => selected().any(|c| c.flag != mailcraft_model::FlagState::None),
+            "hasCategories" => selected().any(|c| !c.categories.is_empty()),
             _ => false,
         };
     }
@@ -130,6 +136,15 @@ fn pim_on(app: &App, surface: Surface, arg: &str) -> bool {
         };
     }
     false
+}
+
+/// View › Color in the Calendar: the current calendar's colour (`calcolor:<Name>`, spaces as `_`; Automatic
+/// when none is set).
+fn calcolor_on(app: &App, arg: &str) -> bool {
+    use mailcraft_engine::cmd::calendar::{pim, props};
+    let Some(f) = pim::current_folder(&app.s, pim::Kind::Appointment) else { return false };
+    let color = props::read(&app.s.mailbox, f).color.unwrap_or_else(|| "Automatic".to_owned());
+    color.replace(' ', "_").eq_ignore_ascii_case(arg)
 }
 
 fn focused_mail(app: &App, surface: Surface) -> Option<&mailcraft_model::MailItem> {
@@ -239,6 +254,7 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
                 || (app.ui.calendar_view.is_empty() && arg == "month")
         }
         "calview" => calview_on(app, arg),
+        "calcolor" => calcolor_on(app, arg),
         "notesIcon" => notes_icon_on(app, arg),
         // Review › Spelling and Grammar ▾: the remembered mode.
         "spellmode" => app.s.settings.text("state.review.spellingMode") == arg,
