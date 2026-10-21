@@ -46,6 +46,7 @@ proptest! {
             ignore_words_with_numbers: !caps,
             ignore_internet_and_file_addresses: grammar,
             flag_repeated_words: true,
+            main_dictionary_only: caps,
         });
         for issue in s.check_text_with_suggestions(&text, 2) {
             prop_assert!(issue.start <= issue.end);

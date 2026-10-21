@@ -14,15 +14,14 @@ use super::compose::{
 };
 use crate::cmd::util::{dialog, opt_bool, opt_str};
 use crate::compose::{ComposeState, DocPos, SpellIssue, TextIssue};
+use crate::settings::Settings;
 use crate::{CmdError, CmdResult, CommandSpec, Session};
-use mailcraft_geom::Color;
 use mailcraft_model::{Doc, ItemId};
-use mailcraft_proof::{IssueKind, Speller};
+use mailcraft_proof::{IssueKind, SpellOptions, Speller};
 
-/// Minimum contrast ratio for body text (WCAG 2.x AA, normal text).
-const MIN_CONTRAST: f32 = 4.5;
-/// Paragraph count above which a body without headings is flagged.
-const HEADINGS_AFTER_PARAGRAPHS: usize = 12;
+mod accessibility;
+
+pub use accessibility::{A11yIssue, LARGE_AUDIENCE, Severity, auto_alt_text, check as accessibility_issues};
 
 /// Enabled: a compose is open or a message is selected.
 fn compose_or_message(s: &Session) -> Option<&'static str> {
@@ -61,11 +60,75 @@ const SUGGEST_FIRST: usize = 50;
 static BASE_SPELLER: OnceLock<Speller> = OnceLock::new();
 
 /// The session's speller: bundled US English plus the custom dictionary (File › Options › Mail › Editor
-/// Options › Custom Dictionaries).
+/// Options › Custom Dictionaries), checking with the Editor Options proofing settings ([`spell_options`]).
 pub fn speller(s: &Session) -> Speller {
     let mut sp = BASE_SPELLER.get_or_init(Speller::bundled_en_us).clone();
     sp.set_user_words(s.mailbox.custom_dictionary.iter());
+    sp.set_options(spell_options(&s.settings));
     sp
+}
+
+/// Options › Mail › Editor Options › Proofing as checker options: "Ignore words in UPPERCASE", "Ignore words
+/// that contain numbers", "Ignore Internet and file addresses", "Flag repeated words" and "Suggest from main
+/// dictionary only". The grammar checks always run: the Spelling and Grammar dialog has its own switch, and
+/// "Mark grammar errors as you type" only decides what the editor underlines ([`live_proofing`]).
+pub fn spell_options(st: &Settings) -> SpellOptions {
+    SpellOptions {
+        ignore_uppercase: st.bool("mail.editor.ignoreUppercase"),
+        ignore_words_with_numbers: st.bool("mail.editor.ignoreNumbers"),
+        ignore_internet_and_file_addresses: st.bool("mail.editor.ignoreInternet"),
+        flag_repeated_words: st.bool("mail.editor.flagRepeated"),
+        check_grammar: true,
+        main_dictionary_only: st.bool("mail.editor.mainDictionaryOnly"),
+    }
+}
+
+/// What the body editor marks while you type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveProofing {
+    /// Squiggles under misspelled and repeated words ("Check spelling as you type"; "Flag repeated words" is
+    /// a spelling option, and the Spelling dialog and the check before sending count them as spelling too).
+    pub spelling: bool,
+    /// Blue underlines under grammar issues: sentence capitals, extra spaces ("Mark grammar errors as you
+    /// type").
+    pub grammar: bool,
+}
+
+impl LiveProofing {
+    /// Whether the editor checks the body as you type at all.
+    pub fn any(self) -> bool {
+        self.spelling || self.grammar
+    }
+
+    /// Whether an issue of `kind` (a [`SpellIssue::kind`]) is underlined.
+    pub fn marks(self, kind: &str) -> bool {
+        if matches!(kind, "spelling" | "repeated") { self.spelling } else { self.grammar }
+    }
+}
+
+/// Options › Mail › Editor Options › "Check spelling as you type" / "Mark grammar errors as you type". F7 and
+/// Review › Spelling and Grammar check either way.
+pub fn live_proofing(s: &Session) -> LiveProofing {
+    LiveProofing {
+        spelling: s.settings.bool("mail.editor.spellAsYouType"),
+        grammar: s.settings.bool("mail.editor.grammarAsYouType"),
+    }
+}
+
+/// Fingerprint of checking options (cached issues found under other options are stale). Never 0, the key of
+/// a compose that was never checked. Dictionary changes need no key: Add to Dictionary drops the word from
+/// every compose's cached issues itself.
+fn options_key(o: &SpellOptions) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    o.hash(&mut h);
+    h.finish() | 1
+}
+
+/// Whether compose `c`'s cached spelling issues are out of date: the body changed since the last check, or
+/// the Editor Options proofing settings did (cheap: no speller is built).
+pub fn spelling_stale(s: &Session, c: &ComposeState) -> bool {
+    c.spelling_stale() || c.spell_options_key != options_key(&spell_options(&s.settings))
 }
 
 fn kind_label(k: IssueKind) -> &'static str {
@@ -99,8 +162,11 @@ pub fn text_issues(sp: &Speller, text: &str) -> Vec<TextIssue> {
 /// Re-checks a compose's body when it changed since the last check (or with `force`); `min_edits` debounces
 /// checking while typing (re-check only after that many edits; 0 or 1 = after every edit). Returns whether
 /// it re-checked.
+/// A check under other proofing options (Options changed since) is always redone.
 pub fn spell_check(sp: &Speller, c: &mut ComposeState, force: bool, min_edits: u64) -> bool {
+    let key = options_key(sp.options());
     let due = force
+        || c.spell_options_key != key
         || match c.spell_rev {
             None => true,
             Some(r) => c.edit_rev.wrapping_sub(r) >= min_edits.max(1),
@@ -108,6 +174,7 @@ pub fn spell_check(sp: &Speller, c: &mut ComposeState, force: bool, min_edits: u
     if !due {
         return false;
     }
+    c.spell_options_key = key;
     c.refresh_spelling(true, &mut |t: &str| text_issues(sp, t))
 }
 
@@ -270,35 +337,26 @@ fn accessibility(s: &mut Session, p: &Value) -> CmdResult {
     let Some(c) = s.composes.get(&cid) else {
         return Err(CmdError::Disabled("no message is being composed".into()));
     };
-    let mut issues = Vec::new();
-    for (src, alt) in c.images() {
-        if alt.trim().is_empty() {
-            issues.push(json!({"kind": "missingAltText", "severity": "error", "message": "A picture has no alternative text.", "target": src}));
-        }
-    }
-    let paragraphs = c.word_count().paragraphs;
-    let has_heading = c.body.blocks.iter().any(|b| matches!(b, mailcraft_model::Block::Heading { .. }));
-    if paragraphs > HEADINGS_AFTER_PARAGRAPHS && !has_heading {
-        issues.push(json!({"kind": "noHeadings", "severity": "tip", "message": "Long messages are easier to navigate with headings."}));
-    }
-    let bg = c.body.background.unwrap_or(Color::WHITE);
-    for color in c.text_colors() {
-        if color.contrast(&bg) < MIN_CONTRAST {
-            issues.push(json!({"kind": "lowContrast", "severity": "warning", "message": "Some text is hard to read against the background.", "color": color.to_hex()}));
-        }
-    }
-    let tables_without_border = c
-        .body
-        .blocks
-        .iter()
-        .filter(|b| matches!(b, mailcraft_model::Block::Table { rows, .. } if rows.len() > 1 && rows.first().is_some_and(|r| r.len() > 1)))
-        .count();
-    if tables_without_border > 0 {
-        issues.push(json!({"kind": "tableHeader", "severity": "tip", "message": "Check that tables have a header row."}));
-    }
+    let issues: Vec<Value> = accessibility::check(c).iter().map(A11yIssue::to_json).collect();
     let report = json!({"compose": cid, "issues": issues});
     let _ = dialog(s, "accessibility", report.clone())?;
     Ok(report)
+}
+
+/// The accessibility warning of a compose (Options › Accessibility › Accessibility checker options): whether
+/// it shows now, why, and how many issues the checker finds.
+fn accessibility_status(s: &mut Session, p: &Value) -> CmdResult {
+    let cid = compose_id(s, p)?;
+    let Some(c) = s.composes.get(&cid) else {
+        return Err(CmdError::Disabled("no message is being composed".into()));
+    };
+    Ok(accessibility::status(s, c))
+}
+
+/// `review.accessibilityStatus` for the UI (no command run): `{"show", "checked", "reasons", "errors",
+/// "warnings", "tips"}`.
+pub fn accessibility_warning(s: &Session, cid: u64) -> Option<Value> {
+    s.composes.get(&cid).map(|c| accessibility::status(s, c))
 }
 
 fn valid_lang(tag: &str) -> bool {
@@ -469,6 +527,16 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             rich_compose,
             accessibility,
+        ),
+        spec(
+            "review.accessibilityStatus",
+            "Accessibility Warnings",
+            "Compose › status (File › Options › Accessibility)",
+            "",
+            r#"{"compose"?:number}"#,
+            false,
+            has_compose,
+            accessibility_status,
         ),
         spec(
             "review.language",
@@ -707,6 +775,273 @@ mod tests {
         assert!(kinds.contains(&"missingAltText"), "{kinds:?}");
         assert!(kinds.contains(&"lowContrast"));
         assert_eq!(s.composes[&id].images().len(), 2);
+    }
+
+    fn set(s: &mut Session, key: &str, v: Value) {
+        s.run("options.set", &json!({"key": key, "value": v})).unwrap();
+    }
+
+    fn words(r: &Value, kind: &str) -> Vec<String> {
+        r["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["kind"] == kind)
+            .map(|i| i["word"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn editor_proofing_options_change_what_is_flagged() {
+        let mut s = session();
+        open(&mut s);
+        s.run(
+            "compose.insertText",
+            &json!({"text": "Send QZXV the the b4x to see www.qzexample.com/zzqq now"}),
+        )
+        .unwrap();
+        let r = s.run("review.spelling", &json!({})).unwrap();
+        assert!(words(&r, "spelling").is_empty(), "{r}");
+        assert_eq!(words(&r, "repeated").len(), 1);
+        // Each option, turned off, flags what it skipped; the cached check is redone without an edit.
+        set(&mut s, "mail.editor.ignoreUppercase", json!(false));
+        assert_eq!(words(&s.run("review.spelling", &json!({})).unwrap(), "spelling"), ["QZXV"]);
+        set(&mut s, "mail.editor.ignoreNumbers", json!(false));
+        assert_eq!(words(&s.run("review.spelling", &json!({})).unwrap(), "spelling"), ["QZXV", "b4x"]);
+        set(&mut s, "mail.editor.ignoreInternet", json!(false));
+        let r = s.run("review.spelling", &json!({})).unwrap();
+        assert!(words(&r, "spelling").len() > 2, "{r}");
+        set(&mut s, "mail.editor.flagRepeated", json!(false));
+        assert!(words(&s.run("review.spelling", &json!({})).unwrap(), "repeated").is_empty());
+        // Suggest from main dictionary only: dictionary words still pass but are not suggested.
+        s.run("review.addToDictionary", &json!({"word": "zorbleflax"})).unwrap();
+        assert!(speller(&s).suggest("zorbleflx", 5).contains(&"zorbleflax".to_owned()));
+        set(&mut s, "mail.editor.mainDictionaryOnly", json!(true));
+        assert!(!speller(&s).suggest("zorbleflx", 5).contains(&"zorbleflax".to_owned()));
+        assert!(speller(&s).check("zorbleflax"));
+    }
+
+    #[test]
+    fn live_proofing_follows_the_options() {
+        let mut s = session();
+        let id = open(&mut s);
+        assert_eq!(live_proofing(&s), LiveProofing { spelling: true, grammar: true });
+        set(&mut s, "mail.editor.spellAsYouType", json!(false));
+        let live = live_proofing(&s);
+        // Repeated words are spelling, as in the Spelling dialog and the check before sending.
+        assert!(
+            live.any() && !live.marks("spelling") && !live.marks("repeated") && live.marks("capitalization")
+        );
+        set(&mut s, "mail.editor.grammarAsYouType", json!(false));
+        assert!(!live_proofing(&s).any());
+        set(&mut s, "mail.editor.spellAsYouType", json!(true));
+        let live = live_proofing(&s);
+        assert!(live.marks("spelling") && live.marks("repeated") && !live.marks("capitalization"));
+        // Staleness: an edit, or an option change since the last check.
+        s.run("compose.insertText", &json!({"text": "Hi wrold"})).unwrap();
+        assert!(spelling_stale(&s, &s.composes[&id]));
+        let sp = speller(&s);
+        spell_check(&sp, s.composes.get_mut(&id).unwrap(), false, 1);
+        assert!(!spelling_stale(&s, &s.composes[&id]));
+        set(&mut s, "mail.editor.ignoreUppercase", json!(false));
+        assert!(spelling_stale(&s, &s.composes[&id]));
+    }
+
+    fn table(rows: Vec<Vec<(&str, bool)>>) -> mailcraft_model::Block {
+        use mailcraft_model::rich::TableCell;
+        mailcraft_model::Block::Table {
+            rows: rows
+                .into_iter()
+                .map(|r| {
+                    r.into_iter()
+                        .map(|(t, bold)| TableCell {
+                            blocks: vec![mailcraft_model::Block::Paragraph {
+                                style: Default::default(),
+                                inlines: vec![mailcraft_model::Inline::Text {
+                                    text: t.into(),
+                                    style: mailcraft_model::TextStyle {
+                                        bold: bold.then_some(true),
+                                        ..Default::default()
+                                    },
+                                }],
+                            }],
+                            colspan: 1,
+                            rowspan: 1,
+                            background: None,
+                            width_px: None,
+                        })
+                        .collect()
+                })
+                .collect(),
+            border: true,
+            width_px: None,
+        }
+    }
+
+    fn kinds(r: &Value) -> Vec<String> {
+        r["issues"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap().to_owned()).collect()
+    }
+
+    #[test]
+    fn accessibility_checks_tables_links_headings_and_blanks() {
+        use mailcraft_model::{Block, Inline};
+        let mut s = session();
+        let id = open(&mut s);
+        let c = s.composes.get_mut(&id).unwrap();
+        let link = |text: &str, href: &str| Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Link {
+                href: href.into(),
+                children: vec![Inline::Text { text: text.into(), style: Default::default() }],
+            }],
+        };
+        let mut merged =
+            table(vec![vec![("Name", true), ("Phone", true)], vec![("Ann", false), ("", false)]]);
+        if let Block::Table { rows, .. } = &mut merged {
+            rows[1][0].colspan = 2;
+        }
+        c.body.blocks = vec![
+            table(vec![vec![("Name", false), ("Phone", false)], vec![("Ann", false), ("555", false)]]),
+            table(vec![vec![("Name", true), ("Phone", true)], vec![("Ann", false), ("555", false)]]),
+            merged,
+            table(vec![vec![("Item", true), ("Cost", true)], vec![("", false), ("", false)]]),
+            link("Click here", "https://example.com/a"),
+            link("the release notes", "https://example.com/b"),
+            link(
+                "https://example.com/a/very/long/address/that/is/bare",
+                "https://example.com/a/very/long/address/that/is/bare",
+            ),
+            link("@Ann", "mailto:ann@example.org"),
+            Block::Heading {
+                level: 1,
+                style: Default::default(),
+                inlines: vec![Inline::Text { text: "Top".into(), style: Default::default() }],
+            },
+            Block::Heading {
+                level: 3,
+                style: Default::default(),
+                inlines: vec![Inline::Text { text: "Deep".into(), style: Default::default() }],
+            },
+            mailcraft_model::Block::text_paragraph(""),
+            mailcraft_model::Block::text_paragraph(""),
+            mailcraft_model::Block::text_paragraph("Lined   up"),
+            Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Image {
+                    src: "cid:x".into(),
+                    alt: "IMG_0001.JPG".into(),
+                    width: None,
+                    height: None,
+                }],
+            },
+        ];
+        c.ensure_body();
+        let r = s.run("review.accessibility", &json!({})).unwrap();
+        let k = kinds(&r);
+        let count = |kind: &str| k.iter().filter(|x| *x == kind).count();
+        assert_eq!(count("tableHeader"), 1, "{k:?}");
+        assert_eq!(count("mergedCells"), 1);
+        assert_eq!(count("blankTableRows"), 1);
+        assert_eq!(count("unclearLinkText"), 2, "click here and the bare address; not the mention");
+        assert_eq!(count("headingOrder"), 1);
+        assert_eq!(count("emptyParagraphs"), 1);
+        assert_eq!(count("repeatedSpaces"), 1);
+        assert_eq!(count("altTextIsFileName"), 1);
+        // Most serious first; issues point at their place.
+        let sev: Vec<&str> =
+            r["issues"].as_array().unwrap().iter().map(|i| i["severity"].as_str().unwrap()).collect();
+        let mut sorted = sev.clone();
+        sorted.sort_by_key(|x| match *x {
+            "error" => 0,
+            "warning" => 1,
+            _ => 2,
+        });
+        assert_eq!(sev, sorted);
+        let header = r["issues"].as_array().unwrap().iter().find(|i| i["kind"] == "tableHeader").unwrap();
+        assert_eq!(header["at"]["path"], json!([0]));
+    }
+
+    fn picture(s: &mut Session) {
+        s.run("insert.picture", &json!({"name": "p.gif", "data_base64": "R0lGODlhAQABAAAAACw="})).unwrap();
+    }
+
+    #[test]
+    fn accessibility_warnings_follow_the_checker_options() {
+        let mut s = session();
+        let id = open(&mut s);
+        let status = |s: &mut Session| s.run("review.accessibilityStatus", &json!({})).unwrap();
+        // Nothing to warn about.
+        set(&mut s, "accessibility.warnings", json!("whileWorking"));
+        assert_eq!(status(&mut s)["show"], false);
+        picture(&mut s);
+        let st = status(&mut s);
+        assert_eq!((st["show"].clone(), st["errors"].clone()), (json!(true), json!(1)), "{st}");
+        assert_eq!(st["checked"], true);
+        // Only when I open the checker: the checker does not even run.
+        set(&mut s, "accessibility.warnings", json!("checkerOnly"));
+        let st = status(&mut s);
+        assert_eq!(
+            (st["show"].clone(), st["checked"].clone(), st["errors"].clone()),
+            (json!(false), json!(false), json!(0))
+        );
+        // "When": only while a ticked condition holds (and only then is the body checked).
+        set(&mut s, "accessibility.warnings", json!("when"));
+        let st = status(&mut s);
+        assert_eq!(
+            (st["show"].clone(), st["checked"].clone()),
+            (json!(false), json!(false)),
+            "no condition holds"
+        );
+        s.composes.get_mut(&id).unwrap().importance = mailcraft_model::Importance::High;
+        let st = status(&mut s);
+        assert_eq!((st["show"].clone(), st["checked"].clone()), (json!(true), json!(true)));
+        assert_eq!(st["reasons"], json!(["highImportance"]));
+        set(&mut s, "accessibility.warnHighImportance", json!(false));
+        assert_eq!(status(&mut s)["show"], false);
+        // Outside my organization (the account is at example.com).
+        s.run("compose.setTo", &json!({"value": "pat@mail.example.com"})).unwrap();
+        assert_eq!(status(&mut s)["show"], false, "a subdomain is inside");
+        s.run("compose.setTo", &json!({"value": "pat@mail.example.com; lee@example.org"})).unwrap();
+        assert_eq!(status(&mut s)["reasons"], json!(["outsideOrganization"]));
+        set(&mut s, "accessibility.warnOutsideOrganization", json!(false));
+        assert_eq!(status(&mut s)["show"], false);
+        // A large audience.
+        let many: Vec<String> = (0..LARGE_AUDIENCE).map(|i| format!("p{i}@example.com")).collect();
+        s.run("compose.setTo", &json!({"value": many.join("; ")})).unwrap();
+        assert_eq!(status(&mut s)["reasons"], json!(["largeAudience"]));
+        set(&mut s, "accessibility.warnLargeAudience", json!(false));
+        assert_eq!(status(&mut s)["show"], false);
+        // A dark background (dark mode, or a dark page colour).
+        s.view.dark = true;
+        assert_eq!(status(&mut s)["reasons"], json!(["darkBackground"]));
+        s.composes.get_mut(&id).unwrap().light_canvas = true;
+        assert_eq!(status(&mut s)["show"], false, "Switch Background shows it light");
+        s.composes.get_mut(&id).unwrap().body.background = Some(mailcraft_geom::Color::rgb(20, 20, 30));
+        assert_eq!(status(&mut s)["reasons"], json!(["darkBackground"]));
+        set(&mut s, "accessibility.warnDarkBackground", json!(false));
+        assert_eq!(status(&mut s)["show"], false);
+        assert_eq!(status(&mut s)["mode"], "when");
+    }
+
+    #[test]
+    fn automatic_alt_text_names_inserted_pictures() {
+        let mut s = session();
+        let id = open(&mut s);
+        let gif = "R0lGODlhAQABAAAAACw=";
+        // On by default, as observed.
+        let r = s.run("insert.picture", &json!({"name": "team-lunch.gif", "data_base64": gif})).unwrap();
+        assert_eq!(r["alt"], "Team lunch");
+        let r = s.run("insert.picture", &json!({"name": "IMG_2041.gif", "data_base64": gif})).unwrap();
+        assert_eq!(r["alt"], "", "no description from a camera name");
+        let r =
+            s.run("insert.picture", &json!({"name": "x.gif", "alt": "My own", "data_base64": gif})).unwrap();
+        assert_eq!(r["alt"], "My own");
+        // Turned off: the picture has no alternative text until I write one.
+        set(&mut s, "accessibility.autoAltText", json!(false));
+        let r = s.run("insert.picture", &json!({"name": "team-lunch.gif", "data_base64": gif})).unwrap();
+        assert_eq!(r["alt"], "");
+        let alts: Vec<String> = s.composes[&id].images().into_iter().map(|(_, a)| a).collect();
+        assert_eq!(alts, ["Team lunch", "", "My own", ""]);
     }
 
     #[test]

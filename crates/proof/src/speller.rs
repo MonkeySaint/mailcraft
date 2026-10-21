@@ -9,7 +9,7 @@ use crate::distance::{self, MAX_LEN};
 use crate::tokenize::looks_like_address;
 
 /// Which words the checker skips, mirroring the proofing options of the classic client.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SpellOptions {
     /// Skip words written entirely in capitals (`NASA`, `FYI`).
     pub ignore_uppercase: bool,
@@ -21,6 +21,9 @@ pub struct SpellOptions {
     pub flag_repeated_words: bool,
     /// Run the grammar checks (sentence capitals, double spaces) in [`Speller::check_text`].
     pub check_grammar: bool,
+    /// Suggest from the main dictionary only: user-dictionary words still pass the check but are never
+    /// offered as replacements ([`Speller::suggest`]).
+    pub main_dictionary_only: bool,
 }
 
 impl Default for SpellOptions {
@@ -31,6 +34,7 @@ impl Default for SpellOptions {
             ignore_internet_and_file_addresses: true,
             flag_repeated_words: true,
             check_grammar: true,
+            main_dictionary_only: false,
         }
     }
 }
@@ -366,7 +370,8 @@ impl Speller {
     /// Up to `n` replacement suggestions for `word`, best first: words within two edits (insertions,
     /// deletions, substitutions, swaps of neighbours), ranked by a weighted distance that makes keyboard
     /// slips cheap, then by word frequency. Suggestions follow the case of `word` (`Teh` → `The`,
-    /// `TEH` → `THE`); proper nouns keep their capital. User-dictionary words are suggested too.
+    /// `TEH` → `THE`); proper nouns keep their capital. User-dictionary words are suggested too, unless
+    /// [`SpellOptions::main_dictionary_only`] is set.
     pub fn suggest(&self, word: &str, n: usize) -> Vec<String> {
         let word = normalize_apostrophes(word.trim());
         let word = word.trim_matches('\'');
@@ -416,8 +421,10 @@ impl Speller {
             let (display, proper) = self.dict.entry(id);
             consider(display, proper, &mut scored);
         }
-        for u in &self.user {
-            consider(u, u.chars().any(char::is_uppercase), &mut scored);
+        if !self.options.main_dictionary_only {
+            for u in &self.user {
+                consider(u, u.chars().any(char::is_uppercase), &mut scored);
+            }
         }
         // Two words run together ("alot" → "a lot", "thankyou" → "thank you").
         for (score, rank, split) in self.splits(&query) {

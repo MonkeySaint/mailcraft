@@ -11,13 +11,18 @@
 //! `compose.select`, clipboard → `format.copy` / `format.cut` / `format.paste`, Ctrl+B/I/U → `format.bold` /
 //! `format.italic` / `format.underline`, Ctrl+L/E/R/J → `format.align`, Ctrl+Z / Ctrl+Y → `compose.editUndo` /
 //! `compose.editRedo`, Tab / Shift+Tab → next / previous table cell (`compose.tableCell`) or, in a list,
-//! `format.indent` / `format.outdent`; F7 opens the spelling dialog. Keys the editor handles are removed from
+//! `format.indent` / `format.outdent`; F7 opens the spelling dialog; Ctrl+Shift+. / Ctrl+Shift+, (Ctrl+> /
+//! Ctrl+<) → `format.growFont` / `format.shrinkFont`. Keys the editor handles are removed from
 //! the frame's input so the compose-surface shortcut handler (`crate::keys::handle`) does not run them a
 //! second time.
 //!
 //! On top of the painted body the editor draws:
 //! - red wavy underlines under misspelled words and blue double underlines under grammar issues, from the
-//!   compose's cached spelling issues (re-checked when the body changed and the user paused typing);
+//!   compose's cached spelling issues (re-checked when the body or the Editor Options proofing settings
+//!   changed and the user paused typing; "Check spelling as you type" / "Mark grammar errors as you type"
+//!   decide which are drawn, and with both off nothing is checked while typing);
+//! - Live Preview: while a gallery choice is under the pointer (`request_live_preview`), the body as that
+//!   choice would leave it (`compose.livePreview`), instead of the body;
 //! - inline pictures (`cid:` parts of the compose and `data:` URIs) through egui's image loaders, over the
 //!   body painter's placeholder (the placeholder stays when no loader decodes the format);
 //! - the caret;
@@ -35,6 +40,9 @@
 //! word; Open / Copy / Remove Link on a link; table rows and columns in a table; Cut / Copy / Paste. Ctrl+click
 //! follows a link (http, https, mailto; `#bookmark` jumps inside the message).
 //!
+//! Above the body: the Mini Toolbar over a mouse selection (`minibar`) and the @mention list under the caret
+//! (`mention`).
+//!
 //! The editor works through [`EditorHost`], so the same widget edits a signature in Signatures and Stationery
 //! (a private session) as well as a compose window body.
 
@@ -44,6 +52,7 @@ use egui::{
 };
 use serde_json::{Value, json};
 
+use mailcraft_engine::cmd::review::LiveProofing;
 use mailcraft_engine::compose::{ComposeState, DocPos, SpellIssue};
 use mailcraft_layout::{DisplayItem, Layout, LayoutOptions, LineBox, TextPos, layout_doc};
 use mailcraft_model::{Block, Doc, Inline};
@@ -98,6 +107,11 @@ pub(crate) trait EditorHost {
     fn proofing(&self) -> bool {
         false
     }
+    /// What the editor underlines while you type (Options › Mail › Editor Options: "Check spelling as you
+    /// type", "Mark grammar errors as you type").
+    fn live_proofing(&self) -> LiveProofing {
+        LiveProofing::default()
+    }
     /// Re-checks the spelling of compose `cid` when its body changed since the last check.
     fn refresh_spelling(&mut self, _cid: u64) {}
     /// Spelling suggestions for `word`.
@@ -115,6 +129,21 @@ pub(crate) trait EditorHost {
     fn paste_options(&self) -> bool {
         true
     }
+    /// Options › Mail › "Suggest names to mention when I use the @ symbol in a message".
+    fn mentions(&self) -> bool {
+        false
+    }
+    /// People to mention for what was typed after `@`: (name, address).
+    fn mention_suggestions(&self, _query: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Options › General › "Show Mini Toolbar on selection".
+    fn mini_toolbar(&self) -> bool {
+        false
+    }
+    /// Live Preview: shows `choice` (a gallery command and its parameters) in compose `cid`'s body, or stops
+    /// previewing (`None`).
+    fn live_preview(&mut self, _cid: u64, _choice: Option<(String, Value)>) {}
 }
 
 impl EditorHost for App {
@@ -130,12 +159,23 @@ impl EditorHost for App {
     fn proofing(&self) -> bool {
         true
     }
+    fn live_proofing(&self) -> LiveProofing {
+        mailcraft_engine::cmd::review::live_proofing(&self.s)
+    }
     fn refresh_spelling(&mut self, cid: u64) {
-        if !self.s.composes.get(&cid).is_some_and(ComposeState::spelling_stale) {
+        // Nothing is checked while typing when nothing is marked; F7 checks on demand.
+        if !self.live_proofing().any()
+            || !self
+                .s
+                .composes
+                .get(&cid)
+                .is_some_and(|c| mailcraft_engine::cmd::review::spelling_stale(&self.s, c))
+        {
             return;
         }
         let sp = mailcraft_engine::cmd::review::speller(&self.s);
         if let Some(c) = self.s.composes.get_mut(&cid) {
+            // Stale after an edit, or checked under proofing options that changed since.
             mailcraft_engine::cmd::review::spell_check(&sp, c, false, 1);
         }
     }
@@ -152,6 +192,72 @@ impl EditorHost for App {
     fn paste_options(&self) -> bool {
         self.s.settings.bool("mail.other.pasteOptions")
     }
+    fn mentions(&self) -> bool {
+        mailcraft_engine::cmd::compose::mentions_enabled(&self.s).is_none()
+    }
+    fn mention_suggestions(&self, query: &str) -> Vec<(String, String)> {
+        mailcraft_engine::queries::address_suggestions(&self.s, query, super::mention::MAX_PEOPLE)
+            .into_iter()
+            .map(|g| (g.display, g.address))
+            .collect()
+    }
+    fn mini_toolbar(&self) -> bool {
+        self.s.settings.bool("general.miniToolbar")
+    }
+    fn live_preview(&mut self, cid: u64, choice: Option<(String, Value)>) {
+        let previewing = self.s.composes.get(&cid).is_some_and(|c| c.preview.is_some());
+        // Errors (a choice that does not apply here) only mean there is nothing to preview: no toast.
+        match choice {
+            Some((command, params)) if mailcraft_engine::cmd::compose::live_preview_on(&self.s) => {
+                let p = json!({"compose": cid, "command": command, "params": params});
+                let _ = self.s.run("compose.livePreview", &p);
+            }
+            _ if previewing => {
+                let _ = self.s.run("compose.livePreview", &json!({"compose": cid, "clear": true}));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Live Preview requests from galleries (see [`request_live_preview`]).
+#[derive(Clone, Debug)]
+struct PreviewRequest {
+    command: String,
+    params: Value,
+    /// The pass it was made in.
+    pass: u64,
+}
+
+fn preview_request_id(cid: u64) -> Id {
+    Id::new(("mailcraft-compose-live-preview", cid))
+}
+
+/// Live Preview (File › Options › General › "Enable Live Preview"): a gallery calls this every frame the
+/// pointer rests on one of its choices (`command` with `params`, e.g. `format.style {"name": "Heading 1"}`);
+/// the body editor of compose `cid` then shows the body with that choice applied, without applying it, and
+/// stops as soon as no request comes.
+pub fn request_live_preview(ctx: &egui::Context, cid: u64, command: &str, params: &Value) {
+    if !mailcraft_engine::cmd::compose::PREVIEW_COMMANDS.contains(&command) {
+        return;
+    }
+    let req = PreviewRequest {
+        command: command.to_owned(),
+        params: params.clone(),
+        pass: ctx.cumulative_pass_nr(),
+    };
+    ctx.data_mut(|d| d.insert_temp(preview_request_id(cid), req));
+}
+
+/// The gallery choice to preview this frame (the ribbon and its menus draw before the body, so a choice still
+/// under the pointer was requested in this pass; an older request means the pointer moved on).
+fn take_preview_request(ctx: &egui::Context, cid: u64) -> Option<(String, Value)> {
+    let req: PreviewRequest = ctx.data(|d| d.get_temp(preview_request_id(cid)))?;
+    if req.pass != ctx.cumulative_pass_nr() {
+        ctx.data_mut(|d| d.remove::<PreviewRequest>(preview_request_id(cid)));
+        return None;
+    }
+    Some((req.command, req.params))
 }
 
 /// Per-editor state kept in egui temp memory (taken out for the frame, put back at the end).
@@ -703,6 +809,9 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::E if cmd && !m.shift && !m.alt => Some(Act::Cmd("format.align", json!({"kind": "center"}))),
         Key::R if cmd && !m.shift && !m.alt => Some(Act::Cmd("format.align", json!({"kind": "right"}))),
         Key::J if cmd && !m.shift && !m.alt => Some(Act::Cmd("format.align", json!({"kind": "justify"}))),
+        // Ctrl+> / Ctrl+< (Ctrl+Shift+. and Ctrl+Shift+, on a US layout): Grow Font / Shrink Font.
+        Key::Period if cmd && m.shift && !m.alt => Some(Act::Cmd("format.growFont", json!({}))),
+        Key::Comma if cmd && m.shift && !m.alt => Some(Act::Cmd("format.shrinkFont", json!({}))),
         // Clipboard keys arrive as Copy / Cut / Paste events; swallow the key so it is not run twice.
         Key::V if cmd && !m.shift && !m.alt => Some(Act::PasteKey),
         Key::C | Key::X if cmd && !m.shift && !m.alt => Some(Act::Cmd("", Value::Null)),
@@ -1338,7 +1447,10 @@ fn menu_target(host: &dyn EditorHost, cid: u64, pos: &DocPos, link: Option<Strin
     let Some(c) = host.compose(cid) else {
         return MenuAt::default();
     };
-    let issue = if host.proofing() { c.spell_issue_at(pos).cloned() } else { None };
+    // Only what is underlined (a check from F7 may have found issues that are not marked as you type).
+    let live = host.live_proofing();
+    let issue =
+        if host.proofing() { c.spell_issue_at(pos).filter(|i| live.marks(&i.kind)).cloned() } else { None };
     let mut suggestions = issue.as_ref().map(|i| i.suggestions.clone()).unwrap_or_default();
     if let Some(i) = &issue
         && suggestions.is_empty()
@@ -1484,7 +1596,11 @@ pub(crate) fn body_editor_in(
 ) -> Option<egui::Response> {
     let ctx = ui.ctx().clone();
     let id = editor_id(cid);
+    let choice = take_preview_request(&ctx, cid);
+    host.live_preview(cid, choice);
     let c = host.compose(cid)?;
+    // Live Preview: the body as the gallery choice under the pointer would leave it.
+    let shown = c.preview.as_ref().unwrap_or(&c.body);
     let theme_dark = host.theme().dark;
     let theme_text = host.theme().text;
     let dark = theme_dark && !c.light_canvas;
@@ -1493,9 +1609,9 @@ pub(crate) fn body_editor_in(
     let width = if avail.is_finite() { avail.max(MIN_TEXT_W + 2.0 * PAD) } else { 800.0 };
     let text_w = (width - 2.0 * PAD).max(MIN_TEXT_W);
     let mut mem: Mem = ctx.data_mut(|d| d.remove_temp::<Mem>(id)).unwrap_or_default();
-    if mem.doc.as_ref() != Some(&c.body) {
-        mem.doc_key = crate::body::doc_hash(&c.body);
-        mem.doc = Some(c.body.clone());
+    if mem.doc.as_ref() != Some(shown) {
+        mem.doc_key = crate::body::doc_hash(shown);
+        mem.doc = Some(shown.clone());
     }
     let painted_rev = c.edit_rev;
     let line_h = EMPTY_LINE_H * zoom;
@@ -1532,7 +1648,7 @@ pub(crate) fn body_editor_in(
             paint_background: false,
             doc_key: Some(mem.doc_key),
         };
-        let _link = crate::body::show_doc_with(&mut child, &mut mem.view, &c.body, &opts);
+        let _link = crate::body::show_doc_with(&mut child, &mut mem.view, shown, &opts);
     }
     if !mem.markers.is_empty()
         && let Some(layout) = mem.view.layout.as_mut()
@@ -1693,6 +1809,8 @@ pub(crate) fn body_editor_in(
                 EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false },
             );
         });
+        // The @mention list takes its keys first (Up / Down / Enter / Tab / Esc while it is open).
+        super::mention::take_keys(ui, host, cid);
         let acts = take_actions(ui);
         let page = (ui.clip_rect().height() - 2.0 * line_h).max(line_h);
         let geo = Geo { painted: layout, text_w, zoom, page };
@@ -1705,7 +1823,8 @@ pub(crate) fn body_editor_in(
 
     // Spelling: re-check once typing pauses (a frame without edits), then underline what the check found
     // when it matches the painted text.
-    if host.proofing() {
+    let live = host.live_proofing();
+    if host.proofing() && live.any() {
         if !acted {
             host.refresh_spelling(cid);
         }
@@ -1714,7 +1833,18 @@ pub(crate) fn body_editor_in(
             && c.spell_rev == Some(c.edit_rev)
             && !c.spell_issues.is_empty()
         {
-            paint_squiggles(ui, layout, &c.spell_issues, origin, zoom);
+            if live.spelling && live.grammar {
+                paint_squiggles(ui, layout, &c.spell_issues, origin, zoom);
+            } else {
+                let marked: Vec<SpellIssue> = c
+                    .spell_issues
+                    .iter()
+                    .filter(|i| live.marks(&i.kind))
+                    .take(MAX_SQUIGGLES)
+                    .cloned()
+                    .collect();
+                paint_squiggles(ui, layout, &marked, origin, zoom);
+            }
         }
     }
 
@@ -1741,6 +1871,25 @@ pub(crate) fn body_editor_in(
         });
     }
     paste_options_button(ui, host, cid, rect);
+
+    // Mini Toolbar over a mouse selection; the @mention list under the caret.
+    let mouse_selected = resp.drag_stopped()
+        || resp.double_clicked()
+        || resp.triple_clicked()
+        || (resp.clicked() && mods.shift);
+    let selected_at = mouse_selected.then(|| ctx.pointer_latest_pos()).flatten();
+    super::minibar::track(&ctx, &*host, cid, selected_at, acted);
+    super::minibar::show(&ctx, host, cid);
+    let caret_now = host.compose(cid).map(|c| c.selection.focus.clone());
+    let caret_rect = caret_now.and_then(|f| {
+        mem.view
+            .layout
+            .as_ref()
+            .and_then(|l| l.caret_rect(&to_text(&f)))
+            .map(|r| Rect::from_min_size(pos2(r.x, r.y), vec2(1.0, r.h)).translate(origin.to_vec2()))
+    });
+    super::mention::popup(&ctx, host, cid, caret_rect, resp.has_focus());
+
     if changed {
         ctx.request_repaint();
     }

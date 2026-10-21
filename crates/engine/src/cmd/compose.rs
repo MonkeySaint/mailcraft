@@ -15,8 +15,18 @@
 //! `compose.editRedo`) drive the editor model in [`crate::compose`] for agents and tests; they change only the
 //! compose (not the mailbox), so they do not record mailbox undo (`mutates: false`) and use the compose's own
 //! editor undo instead.
+//!
+//! Writing aids (@mentions, Live Preview of gallery choices) and the Message format options that reshape
+//! text (reduce message size, remove extra line breaks) are in `assist`.
 
 use serde_json::{Value, json};
+
+mod assist;
+
+pub use assist::{
+    LIVE_PREVIEW_OFF, MENTIONS_OFF, PREVIEW_COMMANDS, live_preview_on, mentions_enabled, reduce_formatting,
+    remove_extra_line_breaks,
+};
 
 use crate::cmd::mail::{FlagKind, flag_dates};
 use crate::cmd::util::{dialog, opt_bool, opt_str, opt_u64, req_str};
@@ -734,7 +744,14 @@ pub(crate) fn build_message(
         && !for_draft
         && st.text("mail.format.richTextToInternet") == "plain";
     if c.format != BodyFormat::PlainText && !rich_as_plain {
-        b.html = Some(c.apply_list_formats_html(&mailcraft_html::doc_to_html(&c.body)));
+        // Options › Mail › Message format › "Reduce message size by removing format information not
+        // necessary to display the message" (sent messages; drafts keep the body as edited).
+        let html = if st.bool("mail.format.reduceSize") && !for_draft {
+            mailcraft_html::doc_to_html(&reduce_formatting(&c.body))
+        } else {
+            mailcraft_html::doc_to_html(&c.body)
+        };
+        b.html = Some(c.apply_list_formats_html(&html));
     }
     b.attachments = c
         .attachments
@@ -3588,6 +3605,9 @@ pub fn specs() -> Vec<CommandSpec> {
             table_edit,
         ),
     ]
+    .into_iter()
+    .chain(assist::specs())
+    .collect()
 }
 
 #[cfg(test)]

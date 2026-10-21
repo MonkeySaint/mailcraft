@@ -23,11 +23,16 @@
 //! Check Names), `attach` (attachments well, Browse This PC…, recent files, drag and drop, file hooks),
 //! `spelling` (the F7 Spelling and Grammar dialog), `clipboard` (the system clipboard's HTML flavour for rich
 //! paste and copy, and a picture reader for picture paste), `voting` (reading-pane voting, read-receipt and
-//! tracking bars) and `panes` (the Clipboard, Styles and Selection panes beside the body).
+//! tracking bars), `panes` (the Clipboard, Styles and Selection panes beside the body), `minibar` (the Mini
+//! Toolbar over a mouse selection), `mention` (the @mention list) and `a11y` (the accessibility warning bar
+//! under the header).
 
+mod a11y;
 mod attach;
 mod clipboard;
 mod editor;
+mod mention;
+mod minibar;
 mod panes;
 mod recipients;
 mod spelling;
@@ -46,6 +51,7 @@ use mailcraft_engine::compose::{ComposeKind, ComposeState};
 use crate::responsive::Frame;
 use crate::{App, Surface};
 
+pub use a11y::BAR_LABEL as ACCESSIBILITY_BAR_LABEL;
 pub use attach::{
     DROP_HINT, FileHooks, MAX_RECENT, SAVE_TITLE, file_hooks, file_name as recent_label, recent_files,
     remember_file, set_file_hooks, size_text,
@@ -54,8 +60,12 @@ pub use clipboard::{
     ClipboardHooks, clipboard_hooks, clipboard_html, clipboard_image, clipboard_text, copy_html,
     html_for_paste, set_clipboard_hooks, set_clipboard_image_reader,
 };
-pub use editor::{BODY_LABEL, NO_SUGGESTIONS, PASTE_MODES, body_focused, editor_id, request_paste};
+pub use editor::{
+    BODY_LABEL, NO_SUGGESTIONS, PASTE_MODES, body_focused, editor_id, request_live_preview, request_paste,
+};
 pub(crate) use editor::{EditorHost, body_editor_in};
+pub use mention::{LIST_LABEL as MENTION_LIST_LABEL, is_open as mention_list_open};
+pub use minibar::{LABEL as MINI_TOOLBAR_LABEL, is_showing as mini_toolbar_showing};
 pub use panes::{
     CLIPBOARD_EMPTY, CLIPBOARD_TITLE, NO_OBJECTS, PANE_W, SELECTION_TITLE, STYLES_TITLE, clip_label,
     hidden_objects,
@@ -289,6 +299,7 @@ pub fn inline_compose(ui: &mut Ui, app: &mut App, id: u64) {
         }
         header(ui, app, id);
         attach::well(ui, app, id, WELL_INDENT);
+        a11y::bar(ui, app, id);
         separator(ui, app);
         let h = ui.available_height();
         let min_h = if h.is_finite() && h < 4000.0 { h.max(160.0) } else { 240.0 };
@@ -354,6 +365,7 @@ fn compose_viewport(ui: &mut Ui, app: &mut App, cid: u64, class: ViewportClass) 
         header(ui, app, cid);
         attach::well(ui, app, cid, WELL_INDENT);
         let head = band(ui, header_top);
+        a11y::bar(ui, app, cid);
         separator(ui, app);
         let body_top = ui.cursor().top();
         panes::body_with_panes(ui, app, cid, 0.0, true);

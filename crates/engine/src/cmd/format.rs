@@ -1298,7 +1298,7 @@ fn copy_selection(s: &mut Session, p: &Value) -> Result<ClipEntry, CmdError> {
     if c.selection.is_collapsed() {
         return Err(CmdError::Disabled("select some text first".into()));
     }
-    let entry = ClipEntry { text: c.selected_text(), doc: c.fragment() };
+    let entry = ClipEntry { text: c.selected_text(), doc: c.fragment(), source: c.id };
     for other in s.composes.values_mut() {
         other.push_clipboard(entry.clone());
     }
@@ -1581,8 +1581,9 @@ fn paste_mode_name(m: PasteMode) -> &'static str {
 }
 
 /// Where a paste without an explicit `mode` comes from: `origin`, else another program when the content is
-/// given (`html` / `text`, the system clipboard), else the in-app clipboard — the same message while only one
-/// message is being written (copies come from compose bodies), between messages otherwise.
+/// given (`html` / `text`, the system clipboard), else the in-app clipboard — the same message when its newest
+/// entry was copied from the message pasted into, between messages otherwise (an entry of unknown origin
+/// counts as the same message while only one message is being written).
 fn paste_origin(s: &Session, p: &Value) -> Result<PasteOrigin, CmdError> {
     if let Some(o) = opt_str(p, "origin") {
         return PasteOrigin::parse(o).ok_or_else(|| {
@@ -1592,7 +1593,10 @@ fn paste_origin(s: &Session, p: &Value) -> Result<PasteOrigin, CmdError> {
     if opt_str(p, "html").is_some() || opt_str(p, "text").is_some() {
         return Ok(PasteOrigin::OtherProgram);
     }
-    Ok(if s.composes.len() <= 1 { PasteOrigin::SameMessage } else { PasteOrigin::OtherMessage })
+    let cid = compose_id(s, p)?;
+    let source = s.composes.get(&cid).and_then(|c| c.clipboard.last()).map_or(0, |e| e.source);
+    let same = if source == 0 { s.composes.len() <= 1 } else { source == cid };
+    Ok(if same { PasteOrigin::SameMessage } else { PasteOrigin::OtherMessage })
 }
 
 /// Paste: `mode` when given (Paste Options, the ribbon's Paste menu), else the default for where the content
@@ -2867,9 +2871,17 @@ mod tests {
             _ => 0,
         };
         assert_eq!(bolds, 1, "only the original run is bold");
-        // With a second message open, the in-app clipboard pastes between messages.
+        // With a second message open, the in-app clipboard pastes between messages …
         let other = open(&mut s);
         assert_eq!(mode(&mut s, json!({"compose": other})), "merge");
+        // … and still within the message it was copied from.
+        assert_eq!(mode(&mut s, json!({"compose": id})), "textOnly");
+        // Copied in the second message: pasting it back into the first is between messages.
+        s.run("compose.insertText", &json!({"compose": other, "text": " more"})).unwrap();
+        s.run("compose.select", &json!({"compose": other, "all": true})).unwrap();
+        s.run("format.copy", &json!({"compose": other})).unwrap();
+        assert_eq!(mode(&mut s, json!({"compose": id})), "merge");
+        assert_eq!(mode(&mut s, json!({"compose": other})), "textOnly");
         // Junk origins are refused.
         assert!(matches!(
             s.run("format.paste", &json!({"text": "x", "origin": "elsewhere"})),

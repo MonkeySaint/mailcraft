@@ -1273,3 +1273,272 @@ fn f6_cycles_header_fields_body_and_ribbon_in_a_compose_window() {
     h.run_steps(2);
     assert_eq!(pane(&h), None);
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Compose and proofing options: proofing as you type, Mini Toolbar, @mentions, accessibility warnings,
+// Live Preview.
+
+fn set_option(h: &mut Harness<'_, App>, key: &str, value: serde_json::Value) {
+    assert!(h.state_mut().run("options.set", json!({"key": key, "value": value})).is_some(), "{key}");
+}
+
+#[test]
+fn proofing_as_you_type_follows_the_editor_options() {
+    let (mut h, cid) = typed_body("Recieve QZXV the the end");
+    let flagged = |h: &Harness<'_, App>| -> Vec<String> {
+        compose(h, cid).spell_issues.iter().map(|i| i.word.trim().to_owned()).collect()
+    };
+    assert_eq!(flagged(&h), ["Recieve", "the"], "a spelling and a repeated word");
+    // An option change re-checks the body without an edit.
+    set_option(&mut h, "mail.editor.ignoreUppercase", json!(false));
+    h.run();
+    assert_eq!(flagged(&h), ["Recieve", "QZXV", "the"]);
+    set_option(&mut h, "mail.editor.flagRepeated", json!(false));
+    h.run();
+    assert_eq!(flagged(&h), ["Recieve", "QZXV"]);
+    // Check spelling as you type off: no spelling marks and no spelling suggestions on right-click.
+    set_option(&mut h, "mail.editor.spellAsYouType", json!(false));
+    h.run();
+    let p = body_point(&h, 8.0);
+    click_at(&mut h, p, PointerButton::Secondary, Modifiers::NONE);
+    assert!(h.query_by_label("Ignore All").is_none(), "no spelling menu for unmarked words");
+    h.key_press(Key::Escape);
+    h.run();
+    // Neither marked: typing is not checked at all, F7 still is.
+    set_option(&mut h, "mail.editor.grammarAsYouType", json!(false));
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    h.key_press_modifiers(Modifiers::COMMAND, Key::End);
+    h.run();
+    h.get_by_label(BODY_LABEL).type_text(" wrold");
+    h.run();
+    h.run();
+    assert!(compose(&h, cid).body.to_plain_text().contains("wrold"));
+    assert!(!flagged(&h).contains(&"wrold".to_owned()));
+    let r = h.state_mut().run("review.spelling", json!({"compose": cid})).unwrap();
+    assert!(r["issues"].as_array().unwrap().iter().any(|i| i["word"] == "wrold"), "{r}");
+}
+
+/// An inline response whose body is `text`, focused.
+fn inline_body(text: &str) -> (Harness<'static, App>, u64) {
+    let (app, cid) = app_with_compose(true);
+    let mut h = inline_harness(app, cid);
+    h.run();
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    h.get_by_label(BODY_LABEL).type_text(text);
+    h.run();
+    (h, cid)
+}
+
+/// Drags the mouse across the first line of the body from `dx0` to `dx1`.
+fn drag_select(h: &mut Harness<'_, App>, dx0: f32, dx1: f32) {
+    let (a, b) = (body_point(h, dx0), body_point(h, dx1));
+    push(h, Event::PointerMoved(a));
+    push(
+        h,
+        Event::PointerButton {
+            pos: a,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+    );
+    h.step();
+    // Steps, not runs: the editor repaints while a drag selects.
+    for i in 1..=4 {
+        push(h, Event::PointerMoved(a + (b - a) * (i as f32 / 4.0)));
+        h.step();
+    }
+    push(
+        h,
+        Event::PointerButton {
+            pos: b,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        },
+    );
+    h.run();
+    h.run();
+}
+
+#[test]
+fn mini_toolbar_appears_over_a_mouse_selection() {
+    let (mut h, cid) = inline_body("Make this bold please");
+    drag_select(&mut h, 0.0, 60.0);
+    assert!(!compose(&h, cid).selection.is_collapsed());
+    assert!(mini_toolbar_showing(&h.ctx, cid));
+    h.get_by_label(MINI_TOOLBAR_LABEL);
+    h.get_by_label("Bold").click();
+    h.run();
+    let c = compose(&h, cid);
+    assert!(c.selection_all(|st, _| st.bold == Some(true)), "the selection is bold");
+    // Typing hides it.
+    h.get_by_label(BODY_LABEL).type_text("X");
+    h.run();
+    assert!(!mini_toolbar_showing(&h.ctx, cid));
+    // Turned off: a mouse selection shows nothing.
+    set_option(&mut h, "general.miniToolbar", json!(false));
+    drag_select(&mut h, 0.0, 60.0);
+    assert!(!compose(&h, cid).selection.is_collapsed());
+    assert!(!mini_toolbar_showing(&h.ctx, cid));
+    assert!(h.query_by_label(MINI_TOOLBAR_LABEL).is_none());
+}
+
+#[test]
+fn at_mentions_suggest_people_and_add_them_to_to() {
+    let (app, cid) = people_app();
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    h.get_by_label(BODY_LABEL).type_text("Thanks @bo");
+    h.run();
+    assert!(mention_list_open(&h.ctx, cid));
+    h.get_by_label(MENTION_LIST_LABEL);
+    h.get_by_label("Bob Stone <bob@example.net>");
+    h.key_press(Key::Enter);
+    h.run();
+    let c = compose(&h, cid);
+    assert_eq!(c.body.to_plain_text().trim_end(), "Thanks @Bob Stone", "Enter picked, no new paragraph");
+    assert_eq!(c.to, "Bob Stone <bob@example.net>");
+    assert!(!mention_list_open(&h.ctx, cid));
+    // An e-mail address is not a mention; Esc closes the list for that @.
+    h.get_by_label(BODY_LABEL).type_text(" mail ann@al");
+    h.run();
+    assert!(!mention_list_open(&h.ctx, cid));
+    h.get_by_label(BODY_LABEL).type_text(" @al");
+    h.run();
+    assert!(mention_list_open(&h.ctx, cid));
+    h.key_press(Key::Escape);
+    h.run();
+    assert!(!mention_list_open(&h.ctx, cid));
+    assert!(h.state().s.composes.contains_key(&cid), "Esc closed the list, not the window");
+    // Turned off: nothing is offered.
+    set_option(&mut h, "mail.send.mentions", json!(false));
+    h.get_by_label(BODY_LABEL).type_text(" @bo");
+    h.run();
+    assert!(!mention_list_open(&h.ctx, cid));
+    assert_eq!(compose(&h, cid).to, "Bob Stone <bob@example.net>");
+}
+
+#[test]
+fn accessibility_warning_bar_follows_the_checker_options() {
+    let (mut app, cid) = app_with_compose(true);
+    app.run(
+        "insert.picture",
+        json!({"compose": cid, "name": "p.gif", "data_base64": "R0lGODlhAQABAAAAACw="}),
+    );
+    let mut h = inline_harness(app, cid);
+    h.run();
+    assert!(h.query_by_label(ACCESSIBILITY_BAR_LABEL).is_none(), "no condition holds");
+    h.state_mut().s.composes.get_mut(&cid).unwrap().importance = mailcraft_model::Importance::High;
+    h.run();
+    h.get_by_label(ACCESSIBILITY_BAR_LABEL);
+    h.get_by_label_contains("1 issue to check (high importance)");
+    h.get_by_label("Check Accessibility").click();
+    h.run();
+    assert!(
+        h.state().s.notices.iter().any(|n| matches!(n, Notice::OpenDialog(d, _) if d == "accessibility"))
+    );
+    set_option(&mut h, "accessibility.warnings", json!("checkerOnly"));
+    h.run();
+    assert!(h.query_by_label(ACCESSIBILITY_BAR_LABEL).is_none());
+    set_option(&mut h, "accessibility.warnings", json!("whileWorking"));
+    set_option(&mut h, "accessibility.warnHighImportance", json!(false));
+    h.run();
+    h.get_by_label(ACCESSIBILITY_BAR_LABEL);
+}
+
+#[test]
+fn live_preview_paints_the_gallery_choice_until_the_pointer_moves_on() {
+    let (mut h, cid) = inline_body("Preview me");
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run();
+    let body = compose(&h, cid).body;
+    let ctx = h.ctx.clone();
+    request_live_preview(&ctx, cid, "format.highlight", &json!({"color": "#ffff00"}));
+    h.step();
+    let c = compose(&h, cid);
+    assert!(c.preview.is_some(), "previewed");
+    assert_eq!(c.body, body, "not applied");
+    // No request this frame: back to the body.
+    h.step();
+    assert!(compose(&h, cid).preview.is_none());
+    // Commands without a Live Preview are ignored.
+    request_live_preview(&ctx, cid, "compose.send", &json!({}));
+    h.step();
+    assert!(compose(&h, cid).preview.is_none());
+    // Turned off: nothing is previewed.
+    set_option(&mut h, "general.livePreview", json!(false));
+    request_live_preview(&ctx, cid, "format.highlight", &json!({"color": "#ffff00"}));
+    h.step();
+    assert!(compose(&h, cid).preview.is_none());
+    assert_eq!(compose(&h, cid).body, body);
+}
+
+#[test]
+fn ctrl_shift_angle_brackets_grow_and_shrink_the_font_in_the_body() {
+    let (app, cid) = app_with_compose(false);
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    h.get_by_label(BODY_LABEL).type_text("abc");
+    h.run();
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run();
+    // The size of the first run (0 = inherited).
+    let size = |h: &Harness<'_, App>| match compose(h, cid).body.blocks.first() {
+        Some(mailcraft_model::Block::Paragraph { inlines, .. }) => inlines
+            .iter()
+            .find_map(|i| match i {
+                mailcraft_model::Inline::Text { style, .. } => Some(style.size_pt.unwrap_or(0.0)),
+                _ => None,
+            })
+            .unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let before = size(&h);
+    // Ctrl+> (Ctrl+Shift+.) grows, Ctrl+< (Ctrl+Shift+,) shrinks: the body leaves them to the window keys.
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Period);
+    h.run();
+    let grown = size(&h);
+    assert!(grown > before, "{before:?} → {grown:?}");
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Comma);
+    h.run();
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Comma);
+    h.run();
+    assert!(size(&h) < grown);
+    assert_eq!(compose(&h, cid).body.to_plain_text().trim_end(), "abc", "no text typed");
+}
+
+#[test]
+fn hovering_a_colour_in_the_font_colour_menu_previews_it() {
+    let (mut app, cid) = app_with_compose(false);
+    app.s.view.simplified_ribbon = false;
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    h.get_by_label(BODY_LABEL).type_text("Colour me");
+    h.run();
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run();
+    let body = compose(&h, cid).body;
+    h.get_by_label("Font Color options").click();
+    h.run();
+    h.get_by_label("Orange, Accent 2").hover();
+    h.run();
+    let c = compose(&h, cid);
+    let preview = c.preview.clone().expect("previewed while the pointer rests on the colour");
+    assert_ne!(preview, body);
+    assert_eq!(c.body, body, "nothing applied");
+    // The pointer moves off the menu.
+    let p = body_point(&h, 300.0) + egui::vec2(0.0, 200.0);
+    push(&mut h, Event::PointerMoved(p));
+    h.run();
+    assert!(compose(&h, cid).preview.is_none());
+    assert_eq!(compose(&h, cid).body, body);
+}

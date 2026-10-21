@@ -321,9 +321,9 @@ pub const DEFS: &[Def] = &[
         "general.miniToolbar",
         "Show Mini Toolbar on selection",
         Bool(true),
-        E,
+        A,
     ),
-    d("general", "User Interface options", "general.livePreview", "Enable Live Preview", Bool(true), S),
+    d("general", "User Interface options", "general.livePreview", "Enable Live Preview", Bool(true), A),
     d(
         "general",
         "User Interface options",
@@ -643,7 +643,7 @@ pub const DEFS: &[Def] = &[
         "mail.send.mentions",
         "Suggest names to mention when I use the @ symbol in a message",
         Bool(true),
-        S,
+        A,
     ),
     d(
         "mail",
@@ -716,7 +716,7 @@ pub const DEFS: &[Def] = &[
         "mail.format.reduceSize",
         "Reduce message size by removing format information not necessary to display the message",
         Bool(true),
-        S,
+        A,
     ),
     d(
         "mail",
@@ -740,7 +740,7 @@ pub const DEFS: &[Def] = &[
         "mail.format.removeExtraLineBreaks",
         "Remove extra line breaks in plain text messages",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -792,23 +792,23 @@ pub const DEFS: &[Def] = &[
         E,
     ),
     // Mail › Editor Options... (Proofing; Advanced › Cut, copy, and paste)
-    d("mail", EDITOR_PROOFING, "mail.editor.spellAsYouType", "Check spelling as you type", Bool(true), E),
+    d("mail", EDITOR_PROOFING, "mail.editor.spellAsYouType", "Check spelling as you type", Bool(true), A),
     d(
         "mail",
         EDITOR_PROOFING,
         "mail.editor.grammarAsYouType",
         "Mark grammar errors as you type",
         Bool(true),
-        E,
+        A,
     ),
-    d("mail", EDITOR_PROOFING, "mail.editor.ignoreUppercase", "Ignore words in UPPERCASE", Bool(true), E),
+    d("mail", EDITOR_PROOFING, "mail.editor.ignoreUppercase", "Ignore words in UPPERCASE", Bool(true), A),
     d(
         "mail",
         EDITOR_PROOFING,
         "mail.editor.ignoreNumbers",
         "Ignore words that contain numbers",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -816,16 +816,16 @@ pub const DEFS: &[Def] = &[
         "mail.editor.ignoreInternet",
         "Ignore Internet and file addresses",
         Bool(true),
-        E,
+        A,
     ),
-    d("mail", EDITOR_PROOFING, "mail.editor.flagRepeated", "Flag repeated words", Bool(true), E),
+    d("mail", EDITOR_PROOFING, "mail.editor.flagRepeated", "Flag repeated words", Bool(true), A),
     d(
         "mail",
         EDITOR_PROOFING,
         "mail.editor.mainDictionaryOnly",
         "Suggest from main dictionary only",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -833,7 +833,7 @@ pub const DEFS: &[Def] = &[
         "mail.editor.pasteWithinMessage",
         "Pasting within the same message:",
         Choice("keepSource", PASTE_MODES),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -841,7 +841,7 @@ pub const DEFS: &[Def] = &[
         "mail.editor.pasteBetweenMessages",
         "Pasting between messages:",
         Choice("keepSource", PASTE_MODES),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -1351,7 +1351,8 @@ pub const DEFS: &[Def] = &[
         "language.translate",
         "Choose how to handle messages received in other languages:",
         Choice("ask", TRANSLATE),
-        E,
+        // N: machine translation is a cloud service and MailCraft bundles no offline translator.
+        N,
     ),
     d(
         "language",
@@ -1359,7 +1360,8 @@ pub const DEFS: &[Def] = &[
         "language.translateTo",
         "Translate messages into:",
         Choice("en", TRANSLATE_TO),
-        E,
+        // N: see language.translate (no offline translator).
+        N,
     ),
     // ---------------------------------------------------------------- Accessibility
     d(
@@ -1368,7 +1370,7 @@ pub const DEFS: &[Def] = &[
         "accessibility.warnings",
         "Accessibility warnings:",
         Choice("when", ACCESS_WARNINGS),
-        E,
+        A,
     ),
     d(
         "accessibility",
@@ -1376,7 +1378,9 @@ pub const DEFS: &[Def] = &[
         "accessibility.warnPrefersAccessible",
         "At least one recipient prefers accessible content",
         Bool(true),
-        E,
+        // N: a recipient's accessible-content preference is published by a cloud directory service;
+        // MailCraft has no source for it.
+        N,
     ),
     d(
         "accessibility",
@@ -1384,7 +1388,7 @@ pub const DEFS: &[Def] = &[
         "accessibility.warnDarkBackground",
         "Using a dark background to compose a message",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "accessibility",
@@ -1392,7 +1396,7 @@ pub const DEFS: &[Def] = &[
         "accessibility.warnLargeAudience",
         "Composing a message to a large audience",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "accessibility",
@@ -1400,7 +1404,7 @@ pub const DEFS: &[Def] = &[
         "accessibility.warnOutsideOrganization",
         "At least one recipient is outside my organization",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "accessibility",
@@ -1408,7 +1412,7 @@ pub const DEFS: &[Def] = &[
         "accessibility.warnHighImportance",
         "Composing a message with high importance",
         Bool(true),
-        E,
+        A,
     ),
     // N: MailCraft has no audio output (no sound library in its dependencies), so feedback sounds cannot play.
     d(
@@ -1441,8 +1445,8 @@ pub const DEFS: &[Def] = &[
         "Automatic Alt Text",
         "accessibility.autoAltText",
         "Automatically generate alt text for me",
-        Bool(false),
-        S,
+        Bool(true),
+        A,
     ),
     // ---------------------------------------------------------------- Advanced
     d("advanced", "MailCraft panes", "advanced.showApps", "Show Apps in MailCraft", Bool(true), N),

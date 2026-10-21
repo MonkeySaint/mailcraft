@@ -114,6 +114,14 @@ fn run(app: &mut App, cx: &mut Cx, act: &Action) {
     state::run(&ctx, app, cx.surface, &mut cx.mem, act);
 }
 
+/// Live Preview: the compose body shows the gallery choice under the pointer (formatting galleries only; see
+/// `crate::compose::request_live_preview`).
+fn hover_preview(cx: &Cx, act: &Action) {
+    if let Surface::Compose(cid) = cx.surface {
+        crate::compose::request_live_preview(&cx.ctx, cid, &act.cmd, &act.params);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Button painting
 // ---------------------------------------------------------------------------------------------------------
@@ -468,6 +476,9 @@ fn menu_entries(ui: &mut Ui, app: &mut App, cx: &mut Cx, entries: &[Resolved], d
                     Some(why) => resp.on_hover_text(*why),
                     None => resp,
                 };
+                if resp.hovered() && disabled.is_none() {
+                    hover_preview(cx, action);
+                }
                 if resp.clicked() {
                     run(app, cx, action);
                     ui.close();
@@ -769,11 +780,16 @@ fn gallery(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, id: Id, rect: Rect,
         } else {
             button(ui, app, id.with(i), cell, look, &item.label, disabled)
         };
-        if resp.clicked()
-            && let Some(tpl) = template
+        if let Some(tpl) = template
+            && disabled.is_none()
+            && (resp.hovered() || resp.clicked())
         {
             let act = state::action(app, tpl, item.on, None, &item.vars);
-            run(app, cx, &act);
+            if resp.clicked() {
+                run(app, cx, &act);
+            } else {
+                hover_preview(cx, &act);
+            }
         }
     }
     if placed == 0 && !st.narrow {

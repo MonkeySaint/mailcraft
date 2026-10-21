@@ -364,18 +364,28 @@ fn source_key(id: u64, b: &mailcraft_model::Body) -> u64 {
     h.finish()
 }
 
-fn body_doc(b: &mailcraft_model::Body, plain: bool) -> Doc {
+/// The body to show. `unwrap`: Options › Mail › Message format › "Remove extra line breaks in plain text
+/// messages" (plain-text messages only).
+fn body_doc(b: &mailcraft_model::Body, plain: bool, unwrap: bool) -> Doc {
+    let text_doc = |text: &str| {
+        let joined = if unwrap && b.format == BodyFormat::PlainText {
+            mailcraft_engine::cmd::compose::remove_extra_line_breaks(text)
+        } else {
+            None
+        };
+        Doc::from_plain_text(joined.as_deref().unwrap_or(text))
+    };
     if plain {
         // Trust Center › "Read all standard mail in plain text".
         return match (&b.text, &b.html) {
-            (Some(text), _) => Doc::from_plain_text(text),
+            (Some(text), _) => text_doc(text),
             (None, Some(html)) => Doc::from_plain_text(&mailcraft_html::html_to_doc(html).to_plain_text()),
             (None, None) => Doc::default(),
         };
     }
     match (&b.html, &b.text, b.format) {
         (Some(html), _, BodyFormat::Html | BodyFormat::RichText) => mailcraft_html::html_to_doc(html),
-        (_, Some(text), _) => Doc::from_plain_text(text),
+        (_, Some(text), _) => text_doc(text),
         (Some(html), None, _) => mailcraft_html::html_to_doc(html),
         (None, None, _) => Doc::default(),
     }
@@ -633,14 +643,15 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     // Email is shown as plain text, without pictures, and its links do not open.
     let links_off = mailcraft_engine::junk::links_disabled(&app.s, ItemId(id));
     let plain = app.s.settings.bool("trust.plainText") || links_off;
+    let unwrap = app.s.settings.bool("mail.format.removeExtraLineBreaks");
     if let Some(m) = app.s.mailbox.mail.get(&ItemId(id)) {
-        let sk = source_key(id, &m.body) ^ u64::from(plain);
+        let sk = source_key(id, &m.body) ^ u64::from(plain) ^ (u64::from(unwrap) << 1);
         if cache.item != id || cache.source_key != sk {
             // Inline attachments, so `cid:` pictures draw instead of the placeholder.
             for (src, data) in queries::inline_pictures(&app.s, ItemId(id)) {
                 body::provide_image(&ctx, &src, &data);
             }
-            let doc = body_doc(&m.body, plain);
+            let doc = body_doc(&m.body, plain, unwrap);
             cache = MsgCache {
                 item: id,
                 source_key: sk,
@@ -1402,8 +1413,32 @@ mod tests {
                 html: Some("<p>Hi <b>there</b></p>".into()),
             },
             true,
+            true,
         );
         assert!(plain.to_plain_text().contains("Hi there"));
+    }
+
+    #[test]
+    fn extra_line_breaks_in_plain_text_follow_the_option() {
+        let text = "A plain text message that the sender's mail program wrapped at a\n\
+                    fixed width, so its lines end in the middle of sentences here.\n\nBye";
+        let body = |format| mailcraft_model::Body { format, text: Some(text.into()), html: None };
+        let paragraphs = |doc: &Doc| doc.to_plain_text().lines().count();
+        // On (the default): one paragraph, a blank line, the sign-off.
+        let on = body_doc(&body(BodyFormat::PlainText), false, true);
+        assert_eq!(paragraphs(&on), 3, "{}", on.to_plain_text());
+        assert!(on.to_plain_text().contains("wrapped at a fixed width"));
+        // Off, or an HTML message's text part: the breaks stay.
+        assert_eq!(paragraphs(&body_doc(&body(BodyFormat::PlainText), false, false)), 4);
+        assert_eq!(paragraphs(&body_doc(&body(BodyFormat::Html), true, true)), 4);
+        // The reading pane follows the option.
+        let (app, _) = app_with_text(text);
+        let mut h = harness(app);
+        h.run();
+        h.get_by_label_contains("wrapped at a fixed width");
+        h.state_mut().run("options.set", json!({"key": "mail.format.removeExtraLineBreaks", "value": false}));
+        h.run();
+        assert!(h.query_by_label_contains("wrapped at a fixed width").is_none());
     }
 
     #[test]

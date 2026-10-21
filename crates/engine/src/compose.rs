@@ -160,6 +160,10 @@ pub struct Bookmark {
 pub struct ClipEntry {
     pub text: String,
     pub doc: Doc,
+    /// The compose it was copied from (0 = unknown), for "Pasting within the same message" versus "Pasting
+    /// between messages".
+    #[serde(default)]
+    pub source: u64,
 }
 
 /// A saved reusable block (Quick Parts, AutoText, text boxes, quick tables, equations).
@@ -356,6 +360,19 @@ pub struct ComposeState {
     /// Unix seconds since when the compose has had unsaved changes, as seen by the auto-save check.
     #[serde(skip)]
     pub dirty_since: Option<i64>,
+
+    // --- compose and proofing settings ---
+    /// Fingerprint of the proofing options the cached spelling issues were found with (0 = never checked);
+    /// see `cmd::review::spell_check`.
+    #[serde(skip)]
+    pub spell_options_key: u64,
+    /// Live Preview: the body as it would look with the gallery choice under the pointer (painted instead of
+    /// `body` while set; `compose.livePreview`).
+    #[serde(skip)]
+    pub preview: Option<Doc>,
+    /// What `preview` previews: the command and its parameters as JSON.
+    #[serde(skip)]
+    pub preview_key: Option<String>,
 }
 
 /// Edits that share one undo step while they follow each other at the caret (typing a word, holding

@@ -232,10 +232,15 @@ fn picture(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Failed(format!("{name} is not a picture this editor can show")));
     };
     let size = display_size(image_size(&data));
-    let alt = opt_str(p, "alt").unwrap_or("").to_owned();
+    let given = opt_str(p, "alt").map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned);
+    // Options › Accessibility › "Automatically generate alt text for me" (from the file name, offline).
+    let auto = given.is_none() && s.settings.bool("accessibility.autoAltText");
+    let alt = given
+        .or_else(|| auto.then(|| crate::cmd::review::auto_alt_text(&name)).flatten())
+        .unwrap_or_default();
     let c = compose_mut(s, p)?;
     let cid = put_image(c, &name, mime, data, &alt, size);
-    Ok(json!({"inserted": name, "cid": cid, "width": size.0, "height": size.1}))
+    Ok(json!({"inserted": name, "cid": cid, "width": size.0, "height": size.1, "alt": alt}))
 }
 
 // ---------------------------------------------------------------------------------------------------------

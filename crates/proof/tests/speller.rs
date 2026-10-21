@@ -149,8 +149,11 @@ fn user_dictionary_and_ignore() {
 
     s.set_user_words(["alpha", "", "bad word", "betaxq"]);
     assert_eq!(s.user_words().collect::<Vec<_>>(), ["alpha", "betaxq"]);
-    // User words are suggested.
+    // User words are suggested, except with "Suggest from main dictionary only" (they still pass).
     assert!(s.suggest("betaxw", 5).contains(&"betaxq".to_owned()));
+    s.options_mut().main_dictionary_only = true;
+    assert!(!s.suggest("betaxw", 5).contains(&"betaxq".to_owned()));
+    assert!(s.check("betaxq"));
 }
 
 #[test]

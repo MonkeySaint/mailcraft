@@ -5,7 +5,8 @@
 //!   (`assets/dictionaries/`, about 131,000 words plus 33,000 proper nouns).
 //! - [`Speller::check`]: one word, with case rules (Capitalised and ALL-CAPS forms of a word are accepted,
 //!   proper nouns only capitalised), apostrophes (contractions, possessives, curly quotes), hyphenated parts,
-//!   and the options to skip words in capitals, words with digits, and Internet/file addresses.
+//!   and the options to skip words in capitals, words with digits, and Internet/file addresses
+//!   ([`SpellOptions`], which also switch repeated words, the grammar checks and user-dictionary suggestions).
 //! - [`Speller::suggest`]: ranked replacements within two edits (optimal-string-alignment distance), weighted
 //!   so keyboard slips, doubled letters and swapped letters come first, then by word frequency. A deletion
 //!   index is built on first use (about 1.3 million entries, ~10 MB, well under a second).

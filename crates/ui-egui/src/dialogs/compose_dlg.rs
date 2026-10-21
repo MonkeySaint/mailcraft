@@ -1718,8 +1718,16 @@ fn accessibility(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 continue;
             }
             common::heading(ui, app, title);
-            for i in list {
-                ui.label(format!("•  {}", i.get("message").and_then(Value::as_str).unwrap_or_default()));
+            for (n, i) in list.into_iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("•  {}", i.get("message").and_then(Value::as_str).unwrap_or_default()));
+                    // Go to: selects the start of the paragraph or table the issue is in.
+                    if let (Some(at), Some(cid)) = (i.get("at"), d.u64("compose"))
+                        && ui.push_id((sev, n), |ui| ui.link("Go to")).inner.clicked()
+                    {
+                        app.run("compose.select", json!({"compose": cid, "anchor": at, "focus": at}));
+                    }
+                });
             }
         }
         footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
