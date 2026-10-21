@@ -351,6 +351,7 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
         "tok" => token_on(&v.search, arg),
         "scope" => scope_name(v.search_scope) == arg,
         "searchDeleted" => app.s.search.include_deleted,
+        "olderResults" => app.s.sync.older.on,
         "todo" => {
             let (cal, people, tasks) = crate::modules::todo_bar_parts(app);
             match arg {
@@ -632,7 +633,7 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 92] = [
+pub const SOURCES: [&str; 93] = [
     "multilevelGallery",
     "shadingThemeColors",
     "shadingColors",
@@ -695,6 +696,7 @@ pub const SOURCES: [&str; 92] = [
     "srGroups",
     "senderDomain",
     "recentNoteFolders",
+    "recentTaskFolders",
     "arrange",
     "styles",
     "views:mail",
@@ -1364,9 +1366,14 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
             };
             vec![DynItem { label, icon: "", swatch: None, vars: Vec::new(), on: false }]
         }
-        // Notes › Move: the notes folders notes were last moved to.
-        "recentNoteFolders" => {
-            mailcraft_engine::recent_move_folders(&app.s, mailcraft_model::FolderKind::Notes)
+        // Notes › Move and Tasks › Move: the folders notes (tasks) were last moved to.
+        "recentNoteFolders" | "recentTaskFolders" => {
+            let kind = if source == "recentTaskFolders" {
+                mailcraft_model::FolderKind::Tasks
+            } else {
+                mailcraft_model::FolderKind::Notes
+            };
+            mailcraft_engine::recent_move_folders(&app.s, kind)
                 .into_iter()
                 .filter_map(|f| app.s.mailbox.folder(f).map(|x| (f, x.name.clone())))
                 .map(|(f, name)| DynItem {

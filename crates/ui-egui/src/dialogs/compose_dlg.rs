@@ -921,10 +921,10 @@ fn message_selection_pane(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
-/// What the Translator window says while no translator is installed.
-pub const TRANSLATOR_MISSING: &str = "MailCraft has no translator installed, so nothing was translated and \
-     the text was not sent anywhere. Translation works once a translator (for example one running on this \
-     computer) is set up in MailCraft.";
+/// What the Translator window says while no translator is set up.
+pub const TRANSLATOR_MISSING: &str = "No translation server is set up, so nothing was translated and the \
+     text was not sent anywhere. To translate, enter a LibreTranslate-compatible server (for example one \
+     running on this computer) in Translation Preferences.";
 
 fn translate(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
@@ -951,7 +951,16 @@ fn translate(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 });
                 st.pick = Some(lang);
                 muted(ui, app, TRANSLATOR_MISSING);
-                footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
+                footer(ui, |ui| {
+                    if btn(ui, "Close") {
+                        return Out::Close;
+                    }
+                    if btn(ui, "Translation Preferences...") {
+                        app.run("options.open", json!({"page": "translation"}));
+                        return Out::Close;
+                    }
+                    Out::Keep
+                })
             })
         },
     )

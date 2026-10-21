@@ -465,6 +465,11 @@ pub struct SyncState {
     pub calendar_requests: Vec<crate::cmd::calendar::subscribe::Due>,
     /// Newly arrived mail not looked at yet (the new-mail envelope, see `new_mail.rs`).
     pub(crate) new_mail: BTreeSet<ItemId>,
+    /// Search › Include Older Results and the server matches of the current search (`older.rs`).
+    pub older: older::OlderResults,
+    /// Server searches waiting for each account's next run.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) older_requests: BTreeMap<AccountId, older::Request>,
     #[cfg(not(target_arch = "wasm32"))]
     rt: native::Runtime,
 }
@@ -554,10 +559,12 @@ impl Session {
     /// Applies finished worker results (new folders and messages, flag changes, removed messages, sent
     /// messages, completed server changes), runs rules on new Inbox mail, queues the server changes rules
     /// made, starts automatic runs that are due, and journals everything. Returns true when the mailbox or
-    /// the status changed. Never panics: a panic while applying results restores the mailbox.
+    /// the status changed. Never panics: a panic while applying results restores the mailbox. Translations
+    /// that finished in the background are applied here too (`translate::poll`).
     pub fn poll_sync(&mut self) -> bool {
         let status_before = self.sync.status.clone();
-        let mailbox_changed = poll_events(self);
+        let translated = crate::translate::poll(self);
+        let mailbox_changed = poll_events(self) || translated;
         tick(self);
         groups::tick(self);
         crate::recover::tick(self);
@@ -1654,6 +1661,7 @@ pub mod groups;
 mod jmap;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
+pub mod older;
 pub mod pim;
 pub mod shared;
 

@@ -105,6 +105,12 @@ const NOTES: &[(&str, &str, &str)] = &[
         "Email Security",
         "Signing and encryption use S/MIME digital IDs (certificates with their private keys).",
     ),
+    (
+        "language",
+        "Translation",
+        "Translating a message sends its text to the translation server above. Leave the address empty and \
+         no message text leaves this computer. Messages in other languages are recognised on this computer.",
+    ),
 ];
 
 /// Choice settings shown as radio buttons (the rest are drop-downs).
@@ -202,6 +208,10 @@ struct OptState {
     note: String,
     /// Settings refused on OK (key: reason).
     errors: Vec<String>,
+    /// The translation server API key typed (`None` = unchanged; "" removes it).
+    api_key: Option<String>,
+    /// What the translation server's Test button reported.
+    translator_test: String,
 }
 
 fn current(app: &App, st: &OptState, d: &Def) -> Value {
@@ -321,8 +331,62 @@ fn apply(ctx: &Context, app: &mut App, st: &OptState) -> Vec<String> {
             errors.push(format!("{label}: {e}"));
         }
     }
+    if let Some(k) = &st.api_key
+        && let Err(e) = app.s.run("options.translator", &json!({"apiKey": k}))
+    {
+        errors.push(format!("Translation server API key: {e}"));
+    }
     common::sync_mirror(ctx, app);
     errors
+}
+
+/// Options › Language › Translation: the server's API key (kept in the secret store, never shown) and a
+/// Test button that translates a sample through the address and key as typed.
+fn translator_ui(ui: &mut egui::Ui, app: &mut App, st: &mut OptState) {
+    let stored = app.s.secrets.get(mailcraft_engine::translate::KEY_SECRET).is_some();
+    let mut key = st.api_key.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        let l = ui.label("API key (if the server asks for one):");
+        let hint = if stored { "(stored; type to replace)" } else { "" };
+        let te = egui::TextEdit::singleline(&mut key).password(true).desired_width(200.0).hint_text(hint);
+        if ui.add(te).labelled_by(l.id).changed() {
+            st.api_key = Some(key.clone());
+        }
+        if stored && ui.button("Remove Key").clicked() {
+            st.api_key = Some(String::new());
+        }
+    });
+    // The test runs on a worker thread (a slow server must not freeze the window): its answer arrives later.
+    let field = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let tested =
+        |r: &Value| format!("The server translated the sample into {}: {}", field(r, "to"), field(r, "text"));
+    if let Some(r) = mailcraft_engine::translate::take_test_result(&mut app.s) {
+        st.translator_test = match r {
+            Ok(v) => tested(&v),
+            Err(e) => format!("Test failed: {e}"),
+        };
+    }
+    let testing = mailcraft_engine::translate::testing(&app.s);
+    ui.horizontal(|ui| {
+        let url = current_key(app, st, mailcraft_engine::translate::URL_SETTING);
+        let url = url.as_str().unwrap_or_default().trim().to_owned();
+        if ui.add_enabled(!url.is_empty() && !testing, egui::Button::new("Test")).clicked() {
+            let mut p = json!({"test": true, "url": url});
+            if let (Some(k), Some(o)) = (&st.api_key, p.as_object_mut()) {
+                o.insert("apiKey".into(), json!(k));
+            }
+            st.translator_test = match app.s.run("options.translator", &p) {
+                Ok(r) if r.get("testing").and_then(Value::as_bool) == Some(true) => {
+                    "Testing the server…".to_owned()
+                }
+                Ok(r) => tested(&r),
+                Err(e) => format!("Test failed: {e}"),
+            };
+        }
+        if !st.translator_test.is_empty() {
+            ui.label(RichText::new(&st.translator_test).size(12.0));
+        }
+    });
 }
 
 fn page_ui(ui: &mut egui::Ui, app: &mut App, uid: u64, st: &mut OptState, pid: &str) -> Option<Out> {
@@ -337,6 +401,9 @@ fn page_ui(ui: &mut egui::Ui, app: &mut App, uid: u64, st: &mut OptState, pid: &
         for d in &sec.defs {
             let on = enabled(app, st, d.key);
             ui.add_enabled_ui(on, |ui| setting_ui(ui, app, uid, st, d));
+        }
+        if pid == "language" && sec.heading == "Translation" {
+            translator_ui(ui, app, st);
         }
         for (_, _, text) in NOTES.iter().filter(|(p, s, _)| *p == pid && *s == sec.heading) {
             muted(ui, app, text);
@@ -569,5 +636,19 @@ mod tests {
         assert_eq!(tz_label(-300), "(UTC-05:00) Eastern Time");
         assert_eq!(tz_label(345), "(UTC+05:45)");
         assert_eq!(tz_label(-30), "(UTC-00:30)");
+    }
+
+    /// Options › Language › Translation: the server address, an API key field (never shown back) and the note
+    /// that translating sends the message text to that server.
+    #[test]
+    fn the_language_page_sets_up_the_translation_server() {
+        let mut app = App::new(sample_session());
+        app.run("options.open", json!({"page": "language"})).unwrap();
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.query_by_label("Translation server address (LibreTranslate-compatible):").is_some());
+        assert!(h.query_by_label("API key (if the server asks for one):").is_some());
+        assert!(h.query_by_label_contains("sends its text to the translation server").is_some());
+        assert!(h.query_by_label("Ask me before translating").is_some());
     }
 }

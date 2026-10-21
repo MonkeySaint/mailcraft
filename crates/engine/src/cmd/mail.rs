@@ -45,6 +45,19 @@ pub(crate) fn need_items(s: &Session) -> Option<&'static str> {
     if mail_targets(s, &Value::Null).is_empty() { Some("No message is selected.") } else { None }
 }
 
+/// Clear All Categories: grey while none of the targeted messages has a category (as observed).
+fn need_categorized(s: &Session) -> Option<&'static str> {
+    let ids = mail_targets(s, &Value::Null);
+    if ids.is_empty() {
+        return Some("No message is selected.");
+    }
+    if ids.iter().any(|i| s.mailbox.mail.get(i).is_some_and(|m| !m.categories.is_empty())) {
+        None
+    } else {
+        Some("The selected messages have no categories.")
+    }
+}
+
 /// Enabled when a message is focused/selected.
 pub(crate) fn need_one(s: &Session) -> Option<&'static str> {
     if primary_item(s, &Value::Null).is_some() { None } else { Some("No message is selected.") }
@@ -569,7 +582,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"ids"?:[number]}"#,
             true,
-            need_items,
+            need_categorized,
             clear_categories,
         ),
         spec(
@@ -683,6 +696,26 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             need_one,
             view_source,
+        ),
+        spec(
+            "mail.viewInBrowser",
+            "View in Browser",
+            "Message › More Commands › Actions › Other Actions",
+            "",
+            r#"{"ids"?:[number], "dir"?: string (folder for the page; default the profile's)} (writes the message as a cleaned-up web page and returns its path and file URL for the browser)"#,
+            false,
+            need_one,
+            view_in_browser,
+        ),
+        spec(
+            "mail.encoding",
+            "Encoding",
+            "Message › More Commands › Actions › Other Actions › Encoding",
+            "",
+            r#"{"charset": "auto"|string (a character set such as iso-8859-1, windows-1252, shift_jis), "ids"?:[number]} (decodes the message body again from its source with that character set; "auto" = as the message says)"#,
+            true,
+            need_one,
+            encoding,
         ),
         spec(
             "mail.pin",
@@ -932,7 +965,16 @@ pub fn template_files(dir: &std::path::Path) -> Vec<(String, String)> {
 /// `list: true` only returns those templates. With `path` the template file (.oft, .msg or .eml) opens as a
 /// new message with its recipients, subject, body and attachments.
 fn choose_form(s: &mut Session, p: &Value) -> CmdResult {
-    let dir = opt_str(p, "dir").map(std::path::PathBuf::from).or_else(|| templates_dir(s));
+    // Look In › Personal Forms Library: the templates kept with the profile (whatever `dir` says).
+    let personal = opt_str(p, "look") == Some("personal");
+    if personal && templates_dir(s).is_none() {
+        return Err(CmdError::Disabled(
+            "personal forms are kept with a saved profile; this one is not saved to disk".into(),
+        ));
+    }
+    let dir = if personal { templates_dir(s) } else { None }
+        .or_else(|| opt_str(p, "dir").map(std::path::PathBuf::from))
+        .or_else(|| templates_dir(s));
     let Some(path) = opt_str(p, "path").map(std::path::PathBuf::from) else {
         let templates: Vec<Value> = dir
             .as_deref()
@@ -2774,7 +2816,13 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     // Opening a message reads it.
     let changed = s.mailbox.set_read(&[focus], true);
     journal(s, &changed);
-    open_dialog(s, "readWindow", json!({"id": focus.0}))
+    // A message found on the server (Include Older Results) downloads in full when opened.
+    let downloading = crate::sync::older::opened(s, focus);
+    let mut v = open_dialog(s, "readWindow", json!({"id": focus.0}))?;
+    if downloading && let Some(o) = v.as_object_mut() {
+        o.insert("downloading".into(), json!(true));
+    }
+    Ok(v)
 }
 
 fn print(s: &mut Session, p: &Value) -> CmdResult {
@@ -2975,6 +3023,139 @@ fn view_source(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"dialog": "viewSource", "source": source}))
 }
 
+/// Character sets the Encoding menu offers: (charset, label). "auto" decodes as the message declares.
+pub const ENCODINGS: [(&str, &str); 14] = [
+    ("auto", "Auto-Select"),
+    ("utf-8", "Unicode (UTF-8)"),
+    ("iso-8859-1", "Western European (ISO)"),
+    ("windows-1252", "Western European (Windows)"),
+    ("iso-8859-2", "Central European (ISO)"),
+    ("windows-1250", "Central European (Windows)"),
+    ("koi8-r", "Cyrillic (KOI8-R)"),
+    ("windows-1251", "Cyrillic (Windows)"),
+    ("iso-8859-7", "Greek (ISO)"),
+    ("shift_jis", "Japanese (Shift-JIS)"),
+    ("iso-2022-jp", "Japanese (JIS)"),
+    ("gbk", "Chinese Simplified (GBK)"),
+    ("big5", "Chinese Traditional (Big5)"),
+    ("euc-kr", "Korean (EUC)"),
+];
+
+/// Other Actions › Encoding: decodes the body again from the message source with another character set
+/// (for mail labelled with the wrong one, or none). Undoable; the source itself is not changed.
+fn encoding(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(focus) = primary_item(s, p) else {
+        return Err(CmdError::Disabled("No message is selected.".into()));
+    };
+    let charset = opt_str(p, "charset").map(str::trim).unwrap_or("auto").to_ascii_lowercase();
+    if charset != "auto" && !mailcraft_mime::charset::is_known(&charset) {
+        let shown: String = charset.chars().take(40).collect();
+        return Err(CmdError::Params(format!("`{shown}` is not a character set MailCraft knows")));
+    }
+    let Some(raw) = s.mailbox.mail.get(&focus).and_then(|m| m.raw.clone()).filter(|r| !r.is_empty()) else {
+        return Err(CmdError::Failed("the source of this message is not available".into()));
+    };
+    let msg = mailcraft_mime::parse(&raw)
+        .map_err(|e| CmdError::Failed(format!("the message cannot be read: {e}")))?;
+    let (text, html) =
+        if charset == "auto" { (msg.text_body(), msg.html_body()) } else { msg.bodies_as(&charset) };
+    let Some(m) = s.mailbox.mail.get_mut(&focus) else {
+        return Err(CmdError::Failed("message not found".into()));
+    };
+    let changed = m.body.text != text || m.body.html != html;
+    if changed {
+        m.body.text = text;
+        m.body.html = html;
+        m.refresh_preview();
+        journal(s, &[focus]);
+    }
+    Ok(json!({"id": focus.0, "charset": charset, "changed": changed}))
+}
+
+/// Longest page View in Browser writes (bytes).
+const MAX_BROWSER_PAGE: usize = 32 * 1024 * 1024;
+
+/// View in Browser: writes the message as a web page (its HTML cleaned up the way the reading pane shows it:
+/// no scripts, forms or active content; a plain-text body as text) with a header of its sender, recipients,
+/// date and subject, and returns where. The page forbids loading anything from the network unless Trust
+/// Center allows pictures.
+fn view_in_browser(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(focus) = primary_item(s, p) else {
+        return Err(CmdError::Disabled("No message is selected.".into()));
+    };
+    let Some(m) = s.mailbox.mail.get(&focus) else {
+        return Err(CmdError::Failed("message not found".into()));
+    };
+    let esc =
+        |t: &str| t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let body = match (&m.body.html, &m.body.text) {
+        (Some(h), _) => mailcraft_html::doc_to_html(&mailcraft_html::html_to_doc(h)),
+        (None, Some(t)) => mailcraft_html::text_to_html(t),
+        (None, None) => String::new(),
+    };
+    let people = |list: &[mailcraft_model::Address]| {
+        list.iter().map(|a| esc(&a.to_display_string())).collect::<Vec<_>>().join("; ")
+    };
+    let mut head = String::new();
+    if let Some(f) = &m.from {
+        head.push_str(&format!("<div><b>From:</b> {}</div>", esc(&f.to_display_string())));
+    }
+    let when = m.sent.unwrap_or(m.received);
+    let tz = s.tz_offset_min;
+    let sent = format!(
+        "{} {}",
+        mailcraft_model::ListTime::long_date(when, tz),
+        mailcraft_model::ListTime::clock(when, tz)
+    );
+    head.push_str(&format!("<div><b>Sent:</b> {}</div>", esc(&sent)));
+    if !m.to.is_empty() {
+        head.push_str(&format!("<div><b>To:</b> {}</div>", people(&m.to)));
+    }
+    if !m.cc.is_empty() {
+        head.push_str(&format!("<div><b>Cc:</b> {}</div>", people(&m.cc)));
+    }
+    head.push_str(&format!("<div><b>Subject:</b> {}</div>", esc(&m.subject)));
+    let images = if s.settings.bool("trust.blockImages") { "data: cid:" } else { "data: cid: https: http:" };
+    let page = format!(
+        "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src {images}; style-src 'unsafe-inline'\">\n\
+         <title>{}</title></head><body>\n<div style=\"font-family:sans-serif;border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:12px\">{head}</div>\n{body}\n</body></html>\n",
+        esc(&m.subject)
+    );
+    if page.len() > MAX_BROWSER_PAGE {
+        return Err(CmdError::Failed("the message is too large to show in a browser".into()));
+    }
+    if cfg!(target_arch = "wasm32") {
+        return Err(CmdError::Disabled("View in Browser is not available in the web version".into()));
+    }
+    // A folder the caller names (tools, tests) is used as is; otherwise the session's own private folder,
+    // whose pages go when their message does and when the session ends (`browser.rs`).
+    let given = opt_str(p, "dir").map(str::trim).filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
+    let dir = match &given {
+        Some(d) => {
+            std::fs::create_dir_all(d).map_err(|e| CmdError::Failed(format!("{}: {e}", d.display())))?;
+            d.clone()
+        }
+        None => {
+            let base = match s.store.as_ref() {
+                Some(st) => st.dir.join("browser"),
+                None => std::env::temp_dir(),
+            };
+            s.browser_pages.dir(&base).map_err(CmdError::Failed)?
+        }
+    };
+    let path = dir.join(format!("message-{}.html", focus.0));
+    crate::cmd::rules::write_file(&path, page.as_bytes())?;
+    if given.is_none() {
+        s.browser_pages.written(focus, path.clone());
+    }
+    let shown = path.display().to_string();
+    let url = crate::browser::file_url(&path);
+    // The front end opens it in the system browser.
+    s.notify(Notice::OpenDialog("openUrl".into(), json!({"url": url})));
+    Ok(json!({"id": focus.0, "path": shown, "url": url}))
+}
+
 /// `mail.pin`: pins the target messages to the top of their folder's list, or unpins them when all are
 /// pinned (`on` sets the state). The pin is kept on the message (it follows it to another folder) and is
 /// local: servers have no pin flag.
@@ -3149,6 +3330,98 @@ mod tests {
     fn role(s: &Session, r: FolderRole) -> FolderId {
         let acc = s.mailbox.default_account().map(|a| a.id).unwrap();
         s.mailbox.role_folder(acc, r).unwrap()
+    }
+
+    /// Other Actions › Encoding decodes the body again with another character set (undoable), and View in
+    /// Browser writes a cleaned-up page that loads nothing from the network.
+    #[test]
+    fn encoding_and_view_in_browser() {
+        let mut f = fx();
+        let mut raw = b"From: Ann <ann@example.com>\r\nTo: me@example.net\r\nSubject: Gr<u>sse\r\n\
+                        Content-Type: text/plain; charset=utf-8\r\n\r\nGr"
+            .to_vec();
+        raw.extend_from_slice(&[0xFC, 0xDF, b'e', b'\r', b'\n']);
+        let id = f.s.mailbox.add_mail(mailcraft_store::import::item_from_raw(&raw, f.inbox, at(20735, 9)));
+        f.s.selection.items = vec![id];
+        f.s.selection.focus = Some(id);
+        assert!(f.s.mailbox.mail[&id].body.text.as_deref().unwrap().contains('\u{FFFD}'));
+        let r = f.s.run("mail.encoding", &json!({"charset": "ISO-8859-1"})).unwrap();
+        assert_eq!(r["changed"], true);
+        assert_eq!(f.s.mailbox.mail[&id].body.text.as_deref(), Some("Grüße\n"));
+        f.s.run("app.undo", &json!({})).unwrap();
+        assert!(f.s.mailbox.mail[&id].body.text.as_deref().unwrap().contains('\u{FFFD}'));
+        f.s.run("mail.encoding", &json!({"charset": "windows-1252"})).unwrap();
+        f.s.run("mail.encoding", &json!({"charset": "auto"})).unwrap();
+        assert!(f.s.mailbox.mail[&id].body.text.as_deref().unwrap().contains('\u{FFFD}'));
+        assert!(matches!(f.s.run("mail.encoding", &json!({"charset": "klingon"})), Err(CmdError::Params(_))));
+        // A message without its source cannot be decoded again.
+        f.s.selection.items = vec![f.a];
+        f.s.selection.focus = Some(f.a);
+        assert!(matches!(f.s.run("mail.encoding", &json!({"charset": "utf-8"})), Err(CmdError::Failed(_))));
+        // View in Browser: HTML cleaned, a header, nothing remote unless pictures are allowed.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.body.html = Some("<p onclick=\"x()\">Hi<script>alert(1)</script><img src=\"https://img.example.com/t.png\"></p>".into());
+        }
+        let r = f.s.run("mail.viewInBrowser", &json!({"dir": dir.path().display().to_string()})).unwrap();
+        let path = r["path"].as_str().unwrap();
+        assert!(r["url"].as_str().unwrap().starts_with("file:///"));
+        let page = std::fs::read_to_string(path).unwrap();
+        assert!(page.contains("Content-Security-Policy"));
+        assert!(page.contains("img-src data: cid:;"), "{page}");
+        assert!(!page.contains("<script") && !page.contains("onclick"), "{page}");
+        assert!(page.contains("<b>From:</b> Alice Rivera &lt;"), "{page}");
+        f.s.run("options.set", &json!({"key": "trust.blockImages", "value": false})).unwrap();
+        f.s.run("mail.viewInBrowser", &json!({"dir": dir.path().display().to_string()})).unwrap();
+        assert!(std::fs::read_to_string(path).unwrap().contains("img-src data: cid: https: http:;"));
+        // The subject of the other message is escaped.
+        f.s.selection.items = vec![id];
+        f.s.selection.focus = Some(id);
+        let r = f.s.run("mail.viewInBrowser", &json!({"dir": dir.path().display().to_string()})).unwrap();
+        let page = std::fs::read_to_string(r["path"].as_str().unwrap()).unwrap();
+        assert!(page.contains("<title>Gr&lt;u&gt;sse</title>"), "{page}");
+    }
+
+    /// Regression: View in Browser kept every page forever in a shared, fixed-name folder, and built its
+    /// `file:` URL without percent-encoding. Pages now live in a private folder of the session, go when their
+    /// message is gone and when the session ends, and the URL names exactly the file.
+    #[test]
+    fn view_in_browser_pages_are_private_and_cleaned_up() {
+        let mut f = fx();
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let base = tempfile::tempdir_in(base).unwrap();
+        let dir = f.s.browser_pages.dir(base.path()).unwrap();
+        assert!(dir.starts_with(base.path()) && dir != base.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "only this user can open the folder");
+        }
+        f.s.selection.items = vec![f.a];
+        f.s.selection.focus = Some(f.a);
+        let r = f.s.run("mail.viewInBrowser", &json!({})).unwrap();
+        let page = std::path::PathBuf::from(r["path"].as_str().unwrap());
+        assert!(page.starts_with(&dir) && page.is_file());
+        assert_eq!(f.s.browser_pages.page(f.a), Some(page.as_path()));
+        // The message goes for good: so does its page.
+        f.s.mailbox.mail.remove(&f.a);
+        f.s.tidy_selection();
+        assert!(!page.exists(), "the page of a deleted message is removed");
+        assert_eq!(f.s.browser_pages.page(f.a), None);
+        // The session ends: its folder goes.
+        drop(f);
+        assert!(!dir.exists(), "the session's pages are removed when it ends");
+        // URLs: characters with a meaning in URLs are encoded.
+        let url = crate::browser::file_url(std::path::Path::new("/home/me/a #1%/b?.html"));
+        assert_eq!(url, "file:///home/me/a%20%231%25/b%3F.html");
+        assert_eq!(
+            crate::browser::file_url(std::path::Path::new(r"C:\Users\me\x.html")),
+            "file:///C:/Users/me/x.html"
+        );
     }
 
     fn folder_of(s: &Session, id: ItemId) -> FolderId {
@@ -4401,6 +4674,28 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         let r = f.s.run("mail.newItem", &json!({"kind": "fromForm", "path": path})).unwrap();
         let cid = r["compose"].as_u64().unwrap();
         assert_eq!(f.s.composes[&cid].format, BodyFormat::Html);
+    }
+
+    /// Choose Form › Look In › Personal Forms Library: the templates kept with the profile, whatever folder
+    /// User Templates in File System last showed.
+    #[test]
+    fn choose_form_lists_the_personal_forms_library() {
+        let mut f = fx();
+        let r = f.s.run("mail.newItem", &json!({"kind": "fromForm", "look": "personal", "list": true}));
+        assert!(matches!(r, Err(CmdError::Disabled(_))), "an in-memory profile keeps no personal forms");
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::open(dir.path()).unwrap();
+        let forms = templates_dir(&s).unwrap();
+        std::fs::create_dir_all(&forms).unwrap();
+        std::fs::write(forms.join("Weekly report.eml"), "Subject: Weekly report\r\n\r\nNotes\r\n").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("Other.eml"), "Subject: Other\r\n\r\nx\r\n").unwrap();
+        let p = json!({"kind": "fromForm", "look": "personal", "list": true, "dir": other.path()});
+        let r = s.run("mail.newItem", &p).unwrap();
+        assert_eq!(r["templates"].as_array().unwrap().len(), 1);
+        assert_eq!(r["templates"][0]["name"], "Weekly report");
+        let p = json!({"kind": "fromForm", "list": true, "dir": other.path()});
+        assert_eq!(s.run("mail.newItem", &p).unwrap()["templates"][0]["name"], "Other");
     }
 
     #[test]

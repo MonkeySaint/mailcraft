@@ -80,6 +80,49 @@ pub(crate) struct JmapJob {
     imports: Vec<(ItemId, String, Vec<String>, Vec<u8>)>,
 }
 
+/// A server search (Search › Include Older Results, see `older.rs`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct JmapSearch {
+    generation: u64,
+    /// The Email/query filter.
+    filter: Value,
+    /// Mailbox ids searched (empty = the whole account).
+    mailboxes: Vec<String>,
+    /// Email ids already held here.
+    known: BTreeSet<String>,
+}
+
+/// Most mailboxes one search names (more: the whole account is searched).
+const MAX_SEARCH_MAILBOXES: usize = 64;
+/// Most ids asked of one search query.
+const SEARCH_LIMIT: u64 = 2_000;
+
+/// The JMAP part of a server search for account `a` over `folders`; `None` when the criteria have no filter.
+pub(crate) fn build_search(s: &Session, a: &Account, req: &super::older::Request) -> Option<JmapSearch> {
+    let filter = req.criterion.jmap_filter().ok().flatten()?;
+    let all: Vec<&mailcraft_model::Folder> = s
+        .mailbox
+        .folders
+        .values()
+        .filter(|f| f.account == a.id && f.kind == FolderKind::Mail && f.remote_name.is_some())
+        .collect();
+    let chosen: Vec<String> =
+        all.iter().filter(|f| req.folders.contains(&f.id)).filter_map(|f| f.remote_name.clone()).collect();
+    let mailboxes =
+        if chosen.len() == all.len() || chosen.len() > MAX_SEARCH_MAILBOXES { Vec::new() } else { chosen };
+    if mailboxes.is_empty() && !req.folders.iter().any(|f| all.iter().any(|x| x.id == *f)) {
+        return None;
+    }
+    let known: BTreeSet<String> = s
+        .mailbox
+        .mail
+        .values()
+        .filter(|m| s.mailbox.folder(m.folder).is_some_and(|f| f.account == a.id))
+        .filter_map(|m| m.remote_id.clone())
+        .collect();
+    Some(JmapSearch { generation: req.generation, filter, mailboxes, known })
+}
+
 /// One email as downloaded.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct JEmail {
@@ -118,6 +161,13 @@ pub(crate) enum JmapEvent {
     },
     /// The server cannot report changes since our state: start over.
     Reset,
+    /// Server search `generation` found these emails (old mail: no new-mail handling); `total` matched that
+    /// were not here.
+    Found {
+        generation: u64,
+        list: Vec<JEmail>,
+        total: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -272,6 +322,7 @@ pub(crate) fn run(
     account: AccountId,
     conn: &JmapConn,
     job: Option<&JmapJob>,
+    search: Option<&JmapSearch>,
     outgoing: &[Outgoing],
     events: &Events,
     cancel: &AtomicBool,
@@ -357,6 +408,27 @@ pub(crate) fn run(
                 };
                 events.send(Event::Sent { account, item: m.item, result });
             }
+        }
+        // Server search (Include Older Results): matches not here yet, newest first, downloaded whole.
+        if let Some(sr) = search
+            && !cancelled()
+        {
+            progress("Searching the server…");
+            let mut filter = sr.filter.clone();
+            if !sr.mailboxes.is_empty() {
+                let boxes: Vec<Value> = sr.mailboxes.iter().map(|m| json!({ "inMailbox": m })).collect();
+                filter = json!({ "operator": "AND", "conditions": [
+                    filter, { "operator": "OR", "conditions": boxes },
+                ]});
+            }
+            let sort = json!([{ "property": "receivedAt", "isAscending": false }]);
+            let q = c.query_emails(filter, sort, 0, SEARCH_LIMIT)?;
+            let fresh: Vec<String> = q.ids.into_iter().filter(|id| !sr.known.contains(id)).collect();
+            let total = fresh.len();
+            let take: Vec<String> = fresh.into_iter().take(super::older::MAX_PER_ACCOUNT).collect();
+            let all: BTreeSet<String> = take.iter().cloned().collect();
+            let (list, _) = get_emails(&c, &take, &all, cancel)?;
+            send(events, cancel, account, JmapEvent::Found { generation: sr.generation, list, total });
         }
         // 3. Receive.
         let Some(j) = job.filter(|j| j.receive) else { return Ok(()) };
@@ -694,6 +766,14 @@ pub(crate) fn apply(s: &mut Session, account: AccountId, ev: JmapEvent, new_inbo
         JmapEvent::Reset => {
             let st = prefs(s).jmap.entry(account.0).or_default();
             st.email_state.clear();
+        }
+        JmapEvent::Found { generation, list, total } => {
+            let ids: Vec<String> = list.iter().map(|e| e.id.clone()).collect();
+            // Older mail found on the server: filed like any download, but not handled as new mail.
+            let mut not_new = Vec::new();
+            apply_emails(s, account, list, &mut not_new);
+            let items: Vec<ItemId> = ids.iter().filter_map(|id| item_of(s, account, id)).collect();
+            super::older::found(s, generation, &items, total);
         }
     }
 }

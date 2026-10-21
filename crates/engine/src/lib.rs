@@ -11,6 +11,7 @@
 
 pub mod accounts;
 pub mod archive;
+pub mod browser;
 pub mod catalog;
 pub mod cmd;
 pub mod compose;

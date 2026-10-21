@@ -227,6 +227,8 @@ fn every_command_has_a_mapped_catalog_counterpart_or_is_known() {
     // Delete on the Shape Format tab removes the selected drawing (the observed tab relied on the Delete key).
     // Define Send/Receive Groups: the observation never reached that menu item (its dialog was seen only
     // from Options › Advanced), so the catalog has no row for it.
+    // Other Actions in a read window: the notes name the submenu but did not capture its entries; View in
+    // Browser and Encoding sit there beside View Source.
     let ours = [
         "help.about",
         "app.toggleRibbonMode",
@@ -235,6 +237,8 @@ fn every_command_has_a_mapped_catalog_counterpart_or_is_known() {
         "compose.sign",
         "drawing.delete",
         "sendReceive.defineGroups",
+        "mail.viewInBrowser",
+        "mail.encoding",
     ];
     let module = |id: &str| ["people.", "tasks.", "notes.", "calendar."].iter().any(|p| id.starts_with(p));
     let mut odd = Vec::new();
@@ -460,6 +464,16 @@ fn params_templates_fill() {
     assert_eq!(v, serde_json::json!({"ids": [9]}));
 }
 
+/// Message › Zoom in a read window zooms that window: the button passes the window's message.
+#[test]
+fn read_window_zoom_names_the_window_message() {
+    let app = App::new(mailcraft_engine::sample::sample_session());
+    let v = state::with_context(&app, Surface::Read(9), "view.zoom", serde_json::json!({}));
+    assert_eq!(v, serde_json::json!({"ids": [9]}));
+    let v = state::with_context(&app, Surface::Main, "view.zoom", serde_json::json!({}));
+    assert_eq!(v, serde_json::json!({}));
+}
+
 #[test]
 fn read_window_quick_steps_act_on_the_window_message() {
     use mailcraft_model::ItemId;
@@ -509,6 +523,10 @@ fn read_window_commands_act_on_the_window_message_without_touching_the_list_sele
     let mut app = App::new(mailcraft_engine::sample::sample_session());
     let inbox = app.s.selection.folder;
     let open = app.s.mailbox.items_in(inbox).first().map(|m| m.id).unwrap();
+    // Clear All Categories needs a category to clear.
+    if let Some(m) = app.s.mailbox.mail.get_mut(&open) {
+        m.categories = vec!["Red Category".into()];
+    }
     // The main window shows another module with nothing selected.
     app.s.selection.items.clear();
     app.s.selection.focus = None;
@@ -1533,4 +1551,32 @@ fn share_calendar_menu_lists_each_calendar() {
     let id = team.vars.iter().find(|(k, _)| *k == "$id").map(|(_, v)| v.clone()).unwrap();
     let folder = mailcraft_model::FolderId(id.as_u64().unwrap());
     assert_eq!(app.s.mailbox.folder(folder).map(|f| f.name.as_str()), Some("Team"));
+}
+
+/// People has its own Folder and Send / Receive tabs (as observed): no mail-only groups such as New Search
+/// Folder or the Server group, and the modules' Folder Pane menu has no Favorites.
+#[test]
+fn people_tabs_and_the_module_folder_pane_menu() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    app.s.view.module = mailcraft_engine::Module::People;
+    let labels = |app: &App, name: &str| -> Vec<String> {
+        resolve_tab(app, Surface::Main, name)
+            .unwrap()
+            .groups
+            .iter()
+            .flat_map(|g| g.ctls.iter().map(|c| c.label.clone()))
+            .collect()
+    };
+    let folder = labels(&app, "Folder");
+    assert!(folder.contains(&"New Folder...".to_owned()) && folder.contains(&"Folder Properties".to_owned()));
+    assert!(!folder.contains(&"New Search Folder...".to_owned()), "{folder:?}");
+    let sr = labels(&app, "Send / Receive");
+    assert!(sr.contains(&"Work Offline".to_owned()) && sr.contains(&"Download Preferences".to_owned()));
+    assert!(!sr.contains(&"Download Headers".to_owned()), "{sr:?}");
+    // Mail keeps its own.
+    app.s.view.module = mailcraft_engine::Module::Mail;
+    assert!(labels(&app, "Folder").contains(&"New Search Folder...".to_owned()));
+    let menu = defs().menus.get("moduleFolderPane").unwrap();
+    assert!(menu.iter().all(|i| i.label != "Favorites"));
+    assert_eq!(menu.len(), 3);
 }

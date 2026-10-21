@@ -245,7 +245,18 @@ fn fields_json(list: &[(String, bool)]) -> Value {
 pub(crate) struct MergeForm {
     /// "all" (the contacts of the current view) or "selected".
     pub contacts: String,
-    /// Document type: "letters", "labels" or "envelopes".
+    /// The People search the view shows when the window opened ("All contacts in current view" honours it).
+    pub query: String,
+    /// Fields to merge: "all" (every contact field) or "view" (the fields of the current view).
+    pub fields_choice: String,
+    pub all_fields: Vec<String>,
+    pub view_fields: Vec<String>,
+    /// Document file: an existing document whose text is merged ("" = type the text here).
+    pub template: String,
+    pub use_template: bool,
+    /// The document whose text is in `body` (loaded with Load or Browse).
+    pub template_loaded: String,
+    /// Document type: "letters", "labels", "envelopes" or "catalog".
     pub doc: String,
     /// Merge to: "document" (a new PDF), "printer" or "email" (form letters only).
     pub to: String,
@@ -448,13 +459,13 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
         },
         "mailMerge" => Kind::MailMerge(Box::new({
             let doc = match str_of(p, "output").as_str() {
-                o @ ("labels" | "envelopes") => o.to_owned(),
+                o @ ("labels" | "envelopes" | "catalog") => o.to_owned(),
                 _ => "letters".to_owned(),
             };
             let address_block = Some(str_of(p, "addressBlock"))
                 .filter(|b| !b.trim().is_empty())
                 .unwrap_or_else(|| mailcraft_engine::cmd::people::ADDRESS_BLOCK.to_owned());
-            let body = if doc == "letters" { LETTER_START.to_owned() } else { address_block.clone() };
+            let body = start_text(&doc, &address_block);
             MergeForm {
                 contacts: if str_of(p, "contacts") == "selected" { "selected".into() } else { "all".into() },
                 // Form letters to a new document unless E-mail was asked for.
@@ -476,6 +487,10 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
                     .map(|i| i.0)
                     .collect(),
                 fields: strings_of(p, "fields"),
+                fields_choice: if str_of(p, "fieldsChoice") == "view" { "view".into() } else { "all".into() },
+                all_fields: strings_of(p, "allFields"),
+                view_fields: strings_of(p, "viewFields"),
+                query: st.people_search.trim().to_owned(),
                 subject: String::new(),
                 body,
                 address_block,
@@ -1151,6 +1166,55 @@ fn merge_ui(ui: &mut Ui, app: &mut App, f: &mut MergeForm, nonce: u64) -> Btn {
     ui.add_enabled_ui(!f.selected.is_empty(), |ui| {
         changed |= ui.radio_value(&mut f.contacts, "selected".to_owned(), "Only selected contacts").changed();
     });
+    if f.contacts == "all" && !f.query.is_empty() {
+        ui.label(RichText::new(format!("The view is searched for \u{201c}{}\u{201d}.", f.query)).weak());
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new("Fields to merge").strong());
+    ui.horizontal(|ui| {
+        let before = f.fields_choice.clone();
+        ui.radio_value(&mut f.fields_choice, "all".to_owned(), "All contact fields");
+        ui.add_enabled_ui(!f.view_fields.is_empty(), |ui| {
+            ui.radio_value(&mut f.fields_choice, "view".to_owned(), "Contact fields in current view");
+        });
+        if f.fields_choice != before {
+            f.fields = if f.fields_choice == "view" { f.view_fields.clone() } else { f.all_fields.clone() };
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(RichText::new("Document file").strong());
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut f.use_template, false, "New document");
+        ui.radio_value(&mut f.use_template, true, "Existing document");
+    });
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(f.use_template, |ui| {
+            let l = ui.label("Document:");
+            changed |= ui
+                .add(TextEdit::singleline(&mut f.template).desired_width(260.0).hint_text("letter.txt"))
+                .labelled_by(l.id)
+                .changed();
+            if crate::dialogs::browse_button(ui, app)
+                && let Some(path) = crate::dialogs::browse_open(
+                    app,
+                    "Existing Document",
+                    &[crate::FileFilter::new(
+                        "Text, web page or message",
+                        &["txt", "htm", "html", "eml", "md"],
+                    )],
+                    &f.template,
+                )
+            {
+                f.template = path;
+                load_template(app, f);
+                changed = true;
+            }
+            if ui.add_enabled(!f.template.trim().is_empty(), egui::Button::new("Load")).clicked() {
+                load_template(app, f);
+                changed = true;
+            }
+        });
+    });
     ui.add_space(6.0);
     ui.label(RichText::new("Merge options").strong());
     egui::Grid::new(("mc-merge-opts", nonce)).num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
@@ -1272,6 +1336,7 @@ fn merge_ui(ui: &mut Ui, app: &mut App, f: &mut MergeForm, nonce: u64) -> Btn {
     let hint = match f.doc.as_str() {
         "letters" if f.to == "email" => "Message text",
         "letters" => "Letter text",
+        "catalog" => "Text for each contact",
         _ => "Address (blank = the standard address block)",
     };
     changed |= ui
@@ -1389,32 +1454,76 @@ fn printer_names(app: &mut App) -> Vec<String> {
 
 /// The text a form letter starts with.
 const LETTER_START: &str = "Dear {{First Name}},\n\n";
+/// What a catalog starts with: one line per contact.
+const CATALOG_START: &str = "{{Full Name}}, {{Company}}, {{Business Phone}}";
+
+/// The text a document type starts with.
+fn start_text(doc: &str, address_block: &str) -> String {
+    match doc {
+        "letters" => LETTER_START.to_owned(),
+        "catalog" => CATALOG_START.to_owned(),
+        _ => address_block.to_owned(),
+    }
+}
 
 /// After the document type changed from `before`: text the user has not changed follows the new type
-/// (labels and envelopes get the address block, letters the greeting); edited text stays.
+/// (labels and envelopes get the address block, letters the greeting, catalogs a line per contact); edited
+/// text stays.
 fn switch_merge_text(f: &mut MergeForm, before: &str) {
-    let letters = |d: &str| d == "letters";
-    if letters(before) == letters(&f.doc) {
+    if start_text(before, &f.address_block) == start_text(&f.doc, &f.address_block) {
         return;
     }
-    let untouched =
-        f.body.trim().is_empty() || f.body == LETTER_START || f.body.trim() == f.address_block.trim();
+    let untouched = f.body.trim().is_empty()
+        || f.body == LETTER_START
+        || f.body == CATALOG_START
+        || f.body.trim() == f.address_block.trim();
     if untouched {
-        f.body = if letters(&f.doc) { LETTER_START.to_owned() } else { f.address_block.clone() };
+        f.body = start_text(&f.doc, &f.address_block);
+    }
+}
+
+/// Reads the existing document into the merge text (and the subject, for a saved message).
+fn load_template(app: &mut App, f: &mut MergeForm) {
+    let p = json!({"action": "template", "template": f.template.trim()});
+    match app.s.run("people.mailMerge", &p) {
+        Ok(r) => {
+            f.body = r.get("body").and_then(Value::as_str).unwrap_or_default().to_owned();
+            f.template_loaded = f.template.trim().to_owned();
+            if let Some(subj) = r.get("subject").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                f.subject = subj.to_owned();
+            }
+            f.result = None;
+        }
+        Err(e) => f.result = Some(format!("The document could not be read: {e}")),
     }
 }
 
 /// Mail Merge document types (output id, label).
-const MERGE_DOCS: [(&str, &str); 3] =
-    [("letters", "Form Letters"), ("labels", "Mailing Labels"), ("envelopes", "Envelopes")];
+const MERGE_DOCS: [(&str, &str); 4] = [
+    ("letters", "Form Letters"),
+    ("labels", "Mailing Labels"),
+    ("envelopes", "Envelopes"),
+    ("catalog", "Catalog"),
+];
 
 fn merge_params(f: &MergeForm, extra: &[(&str, Value)]) -> Value {
     let mut p = serde_json::Map::new();
     let output = if f.to == "email" { "email" } else { f.doc.as_str() };
     p.insert("contacts".into(), json!(f.contacts));
     p.insert("output".into(), json!(output));
+    p.insert("fields".into(), json!(f.fields_choice));
+    if f.contacts == "all" && !f.query.is_empty() {
+        p.insert("query".into(), json!(f.query));
+    }
     p.insert("subject".into(), json!(f.subject));
-    p.insert("body".into(), json!(f.body));
+    let template = f.template.trim();
+    if f.use_template && !template.is_empty() && template != f.template_loaded {
+        // An existing document typed but not loaded yet: the engine reads it.
+        p.insert("template".into(), json!(template));
+        p.insert("body".into(), json!(""));
+    } else {
+        p.insert("body".into(), json!(f.body));
+    }
     if f.contacts == "selected" {
         p.insert("ids".into(), json!(f.selected));
     }

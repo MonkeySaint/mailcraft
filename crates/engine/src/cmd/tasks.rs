@@ -572,7 +572,10 @@ fn move_rows(s: &mut Session, p: &Value, copy: bool) -> CmdResult {
         if copy {
             pim::copy_to(s, &fits, folder, Kind::Task)?
         } else {
-            pim::move_to(s, &fits, folder, Kind::Task)?
+            let moved = pim::move_to(s, &fits, folder, Kind::Task)?;
+            // The Move menu offers the tasks folders tasks were last moved to.
+            crate::session::note_recent_move(s, folder);
+            moved
         }
     } else {
         let out = route(s, cmd, &fits, json!({ "folder": folder.0 }))?;
@@ -2437,7 +2440,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"ids"?: [number]}"#,
             true,
-            always,
+            row_selected,
             run_mark_complete,
         ),
         spec(
@@ -2457,7 +2460,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"id"?: number, "ids"?: [number], "request"?: "decline"|"complete"|"delete"} (a task accepted from a task request: what to tell the person who assigned it; without it the Delete dialog asks)"#,
             true,
-            always,
+            row_selected,
             run_delete,
         ),
         spec(
@@ -2467,7 +2470,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"folder": number, "id"?: number, "ids"?: [number]}"#,
             true,
-            always,
+            row_selected,
             run_copy,
         ),
         spec(
@@ -2477,7 +2480,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"folder": number, "id"?: number, "ids"?: [number]}"#,
             true,
-            always,
+            row_selected,
             run_move,
         ),
         spec(
@@ -2487,7 +2490,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"name": string, "on"?: bool, "clear"?: bool, "id"?: number, "ids"?: [number]}"#,
             true,
-            always,
+            row_selected,
             run_categorize,
         ),
         spec(
@@ -2772,9 +2775,19 @@ mod tests {
         let id = s.run("tasks.new", &json!({"subject": "T"})).unwrap()["id"].as_u64().unwrap();
         let root = role(&s, FolderRole::Tasks);
         let sub = s.mailbox.create_folder(root, "Home").unwrap();
+        // With nothing selected these are grey, as observed (they used to look enabled and then fail).
+        s.selection.items.clear();
+        s.selection.focus = None;
+        for cmd in ["tasks.delete", "tasks.markComplete", "tasks.move", "tasks.copy", "tasks.categorize"] {
+            assert!(s.enabled(cmd).is_some(), "{cmd}");
+        }
         s.run("tasks.copy", &json!({"id": id, "folder": sub.0})).unwrap();
+        assert!(crate::recent_move_folders(&s, mailcraft_model::FolderKind::Tasks).is_empty());
         s.run("tasks.move", &json!({"id": id, "folder": sub.0})).unwrap();
         assert_eq!(s.mailbox.tasks[&ItemId(id)].folder, sub);
+        // The Move menu now offers that folder (a copy does not count).
+        s.selection.folder = root;
+        assert_eq!(crate::recent_move_folders(&s, mailcraft_model::FolderKind::Tasks), vec![sub]);
         s.run("tasks.categorize", &json!({"id": id, "name": "Green category"})).unwrap();
         assert_eq!(s.mailbox.tasks[&ItemId(id)].categories.len(), 1);
         s.run("tasks.delete", &json!({"id": id})).unwrap();

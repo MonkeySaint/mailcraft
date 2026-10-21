@@ -85,7 +85,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mark to Download",
             SV,
             "Mod+Alt+M",
-            r#"{"copy"?: bool, "ids"?: [number]}"#,
+            r#"{"copy"?: bool, "ids"?: [number], "now"?: bool (download them now)}"#,
             need_selection,
             cmds::mark,
         ),

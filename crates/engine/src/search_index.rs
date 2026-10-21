@@ -401,8 +401,39 @@ pub fn searched_stores(s: &Session) -> BTreeSet<mailcraft_model::AccountId> {
     s.mailbox.accounts.iter().filter(|a| !excluded.contains(&store_key(a))).map(|a| a.id).collect()
 }
 
+/// Search Tools › Indexing Status: what is searchable and what is still to come. `remaining`: items not
+/// indexed yet (the next search indexes them), `kinds`: the items of each kind (mail, calendar, contacts,
+/// tasks, notes), `downloading`: while a send/receive is still bringing mail in, its progress (`done`,
+/// `total`, `text`); new mail is indexed as it arrives.
+pub fn indexing_status(s: &Session) -> serde_json::Value {
+    let mb = &s.mailbox;
+    let kinds = [
+        ("mail", "Mail", mb.mail.len()),
+        ("calendar", "Calendar", mb.appointments.len()),
+        ("contacts", "Contacts", mb.contacts.len()),
+        ("tasks", "Tasks", mb.tasks.len()),
+        ("notes", "Notes", mb.notes.len()),
+    ];
+    let st = s.sync_status();
+    let downloading = st.busy.then(|| {
+        let d = st.detail.as_ref();
+        serde_json::json!({
+            "text": st.text,
+            "done": d.map_or(0, |d| d.done),
+            "total": d.map_or(0, |d| d.total),
+        })
+    });
+    serde_json::json!({
+        "remaining": s.search.pending(mb),
+        "items": kinds.iter().map(|k| k.2).sum::<usize>(),
+        "kinds": kinds.iter().map(|(id, label, n)| serde_json::json!({"kind": id, "label": label, "count": n})).collect::<Vec<_>>(),
+        "downloading": downloading,
+    })
+}
+
 /// Folders the active search covers. Mailbox-wide scopes leave out non-mail folders and (unless Include
-/// Deleted Items is on) Deleted Items; All Items covers every folder. All Mailboxes and All Items cover the
+/// Deleted Items is on) Deleted Items; All Items covers every kind of folder, again without Deleted Items
+/// unless Include Deleted Items is on. All Mailboxes and All Items cover the
 /// stores checked in Locations to Search ([`searched_stores`]).
 pub fn scope_folders(s: &Session) -> Vec<FolderId> {
     let mb = &s.mailbox;
@@ -428,8 +459,13 @@ pub fn scope_folders(s: &Session) -> Vec<FolderId> {
                 .collect()
         }
         SearchScope::AllItems => {
+            // Every kind of folder, but Deleted Items (and its subfolders) only with Include Deleted Items.
             let stores = searched_stores(s);
-            mb.folders.values().filter(|f| stores.contains(&f.account)).map(|f| f.id).collect()
+            mb.folders
+                .values()
+                .filter(|f| stores.contains(&f.account) && !deleted.contains(&f.id))
+                .map(|f| f.id)
+                .collect()
         }
     }
 }
@@ -520,7 +556,22 @@ pub fn results(s: &Session) -> Vec<ItemId> {
     if s.view.search.trim().is_empty() {
         return Vec::new();
     }
-    hits(s, &s.view.search, &scope_filter(s)).into_iter().map(|h| ItemId(h.id)).collect()
+    let mut out: Vec<ItemId> =
+        hits(s, &s.view.search, &scope_filter(s)).into_iter().map(|h| ItemId(h.id)).collect();
+    // Search › Include Older Results: what the servers found (their text is not all here, so the local
+    // index alone may not match them).
+    let extra = crate::sync::older::extra_results(s);
+    if !extra.is_empty() {
+        let scope: BTreeSet<FolderId> = scope_folders(s).into_iter().collect();
+        let have: BTreeSet<ItemId> = out.iter().copied().collect();
+        out.extend(
+            extra
+                .into_iter()
+                .filter(|i| !have.contains(i))
+                .filter(|i| s.mailbox.mail.get(i).is_some_and(|m| scope.contains(&m.folder))),
+        );
+    }
+    out
 }
 
 /// Items of a search folder (its saved query live over its account's mail), best first.
@@ -700,11 +751,16 @@ mod tests {
         // Removal through a command.
         s.run("mail.delete", &json!({"ids": [c.0]})).unwrap();
         assert!(results(&s).is_empty());
+        // All Items leaves Deleted Items out too until Include Deleted Items is on (regression: it used to
+        // search Deleted Items whatever the toggle said).
         s.view.search_scope = SearchScope::AllItems;
-        assert_eq!(results(&s), [c]);
+        assert!(results(&s).is_empty());
         s.search.include_deleted = true;
+        assert_eq!(results(&s), [c]);
         s.view.search_scope = SearchScope::AllMailboxes;
         assert_eq!(results(&s), [c]);
+        s.search.include_deleted = false;
+        assert!(results(&s).is_empty());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Mail Merge documents: Form Letters (each merged letter starts on a new page and flows onto more pages when
-//! it is long), Mailing Labels (one address per label, filling the cells of a label sheet row by row) and
+//! it is long), Catalog (the merged records one after the other, a blank line apart, flowing from page to
+//! page), Mailing Labels (one address per label, filling the cells of a label sheet row by row) and
 //! Envelopes (one envelope per page: the return address in the top-left corner, the delivery address in the
 //! middle). The merged text of each record comes ready-made from the caller; this module only places it.
 //!
@@ -139,6 +140,8 @@ pub fn label_sheet(id: &str) -> Option<LabelSheet> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MergeStyle {
     Letters,
+    /// Every record follows the previous one on the same page.
+    Catalog,
     Labels(LabelSheet),
     Envelopes,
 }
@@ -157,6 +160,7 @@ pub struct MergeDoc {
 pub fn max_records(style: &MergeStyle) -> usize {
     let n = match style {
         MergeStyle::Letters | MergeStyle::Envelopes => MAX_PAGES,
+        MergeStyle::Catalog => MAX_RECORDS,
         MergeStyle::Labels(sheet) => sheet.per_sheet().max(1).saturating_mul(MAX_PAGES),
     };
     n.min(MAX_RECORDS)
@@ -168,6 +172,7 @@ pub(crate) fn pages(doc: &MergeDoc, frame: &Frame, fonts: &FontDb) -> (Vec<Vec<D
     let records = doc.records.get(..doc.records.len().min(MAX_RECORDS)).unwrap_or(&[]);
     match doc.style {
         MergeStyle::Letters => letters(records, frame, fonts),
+        MergeStyle::Catalog => catalog(records, frame, fonts),
         MergeStyle::Labels(sheet) => labels(records, &sheet, fonts),
         MergeStyle::Envelopes => envelopes(records, &doc.return_address, frame, fonts),
     }
@@ -202,6 +207,48 @@ fn letters(records: &[String], frame: &Frame, fonts: &FontDb) -> (Vec<Vec<Displa
         pages.push(cur);
         placed = placed.saturating_add(1);
     }
+    (pages, placed)
+}
+
+/// Catalog: the records flow one after the other, a blank line between two, onto as many pages as they take.
+/// A record counts as placed once its last line is on a page.
+fn catalog(records: &[String], frame: &Frame, fonts: &FontDb) -> (Vec<Vec<DisplayItem>>, usize) {
+    let body = frame.body;
+    let st = Style::new(fonts, LETTER_PT, false);
+    let lh = st.line_height(fonts);
+    let mut pages: Vec<Vec<DisplayItem>> = Vec::new();
+    let mut cur = Vec::new();
+    let mut y = body.y;
+    let mut placed = 0usize;
+    for (i, rec) in records.iter().enumerate() {
+        let mut lines = letter_lines(fonts, &st, rec, body.w);
+        // Trailing blank lines of a record would double the gap.
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        if i > 0 {
+            lines.insert(0, String::new());
+        }
+        for line in lines {
+            if y + lh > body.y + body.h && y > body.y {
+                pages.push(std::mem::take(&mut cur));
+                if pages.len() >= MAX_PAGES {
+                    return (pages, placed);
+                }
+                y = body.y;
+                if line.is_empty() {
+                    // No blank line at the top of a page.
+                    continue;
+                }
+            }
+            if !line.is_empty() {
+                cur.push(st.text_at(fonts, body.x, y, &line));
+            }
+            y += lh;
+        }
+        placed = placed.saturating_add(1);
+    }
+    pages.push(cur);
     (pages, placed)
 }
 

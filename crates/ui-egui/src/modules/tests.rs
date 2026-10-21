@@ -1451,3 +1451,45 @@ fn module_view_settings_lists_group_by_and_other_settings() {
     h.run_ok();
     assert!(h.state().ui.dialogs.iter().any(|(d, _)| d == "viewSort"));
 }
+
+/// Mail Merge window: Fields to merge (all contact fields or the view's), the Catalog document type, and an
+/// existing document whose text is merged.
+#[test]
+fn mail_merge_window_offers_fields_catalog_and_an_existing_document() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 1000.0));
+    let dir = std::env::current_exe()
+        .unwrap()
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .join("tmp")
+        .join(format!("mc-merge-catalog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc = dir.join("letter.txt");
+    std::fs::write(&doc, "Hello {{Full Name}}, from a saved letter.").unwrap();
+    run_cmd(&mut h, "people.mailMerge", json!({"contacts": "all"}));
+    assert!(has(&h, "All contact fields") && has(&h, "Contact fields in current view"));
+    // Catalog: one line per contact by default.
+    h.get_by_value("Form Letters").click();
+    h.run_ok();
+    click(&h, "Catalog");
+    h.run_ok();
+    assert!(has_part(&h, "Bob Chen, Example Org"), "the catalog line previews");
+    // An existing document replaces the text.
+    click(&h, "Existing document");
+    h.run_ok();
+    h.get_by_label("Document:").focus();
+    h.run_ok();
+    h.get_by_label("Document:").type_text(&doc.display().to_string());
+    h.run_ok();
+    assert!(has_part(&h, "Hello Bob Chen, from a saved letter."), "typed, not loaded: the merge reads it");
+    h.get_by_label("Load").click();
+    h.run_ok();
+    assert!(has_part(&h, "Hello Bob Chen, from a saved letter."));
+    // Fields in current view: the insert-field list follows (the view's columns).
+    click(&h, "Contact fields in current view");
+    h.run_ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}

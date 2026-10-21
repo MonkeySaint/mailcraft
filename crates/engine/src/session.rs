@@ -276,6 +276,21 @@ pub struct Session {
     pub translator: Option<std::sync::Arc<dyn crate::translate::Translator>>,
     /// Translations of received messages shown in place of their bodies (`review.translate`).
     pub translations: BTreeMap<ItemId, crate::translate::Translation>,
+    /// Zoom of read windows zoomed on their own (message → percent; the others use `view.zoom`).
+    pub read_zoom: BTreeMap<ItemId, u16>,
+    /// Messages Options › Language › Always translate already tried to translate this session.
+    pub translate_tried: std::collections::BTreeSet<ItemId>,
+    /// Connection settings for the translation server (`None` = its defaults; tests trust a local server).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub translator_options: Option<mailcraft_net::ConnectOptions>,
+    /// Translations (and the Options translation test) run on a worker thread and are applied when
+    /// [`Session::poll_sync`] sees them finish, so a slow server never holds up the caller. The desktop app
+    /// turns it on; tools and tests leave it off and get the result from the command itself.
+    pub background_translate: bool,
+    /// Translations running on worker threads (see [`crate::translate`]).
+    pub(crate) translate_jobs: crate::translate::Jobs,
+    /// Pages View in Browser wrote this session (deleted with their message and when the session ends).
+    pub browser_pages: crate::browser::BrowserPages,
     /// Profile folder holding `settings.json` (`None` = in-memory session: nothing is saved).
     settings_dir: Option<std::path::PathBuf>,
     /// Bytes last read from or written to `settings.json` (identical states are not rewritten).
@@ -348,6 +363,13 @@ impl Session {
             direct_print: false,
             translator: None,
             translations: BTreeMap::new(),
+            translate_tried: std::collections::BTreeSet::new(),
+            read_zoom: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            translator_options: None,
+            background_translate: false,
+            translate_jobs: crate::translate::Jobs::default(),
+            browser_pages: crate::browser::BrowserPages::default(),
             settings_dir: None,
             settings_saved: None,
             params_name_items: false,
@@ -1069,6 +1091,8 @@ impl Session {
         self.clipboard.retain(|id| mail.contains_key(id));
         // Translations of messages that are gone (deleted, or replaced by a sync) are dropped.
         self.translations.retain(|id, _| mail.contains_key(id));
+        // So are their View in Browser pages.
+        self.browser_pages.prune(|id| mail.contains_key(&id));
     }
 
     /// Item ids a command should act on: `params.ids` when present, else the selection (else the focus).

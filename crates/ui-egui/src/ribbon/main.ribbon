@@ -519,7 +519,7 @@ menu recentSearches
 dyn | recentSearches | search.recent | {"index":"$id"}
 
 menu searchTools
-item | Include Older Results | | search.includeOlderResults | {"on":"$!on"} | I | on=mem:olderResults
+item | Include Older Results | | search.includeOlderResults | {"on":"$!on"} | I | on=olderResults
 item | Indexing Status... | info | search.searchTools | {"tool":"indexingStatus"} | N
 sub | Locations to Search | account | searchLocations | | L
 item | Advanced Find... | search | search.advancedFind | | F

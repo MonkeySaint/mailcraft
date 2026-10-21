@@ -338,8 +338,11 @@ const STANDARD_FORMS: [(&str, &str); 12] = [
 
 #[derive(Clone, Default)]
 struct FormsState {
-    /// Look In: false = Standard Forms Library, true = User Templates in File System.
-    user: bool,
+    /// Look In: the Standard Forms Library, the Personal Forms Library (templates kept with the profile) or
+    /// User Templates in File System (a folder).
+    look: Look,
+    /// The Personal Forms Library was listed.
+    personal_listed: bool,
     /// The selected standard form (index) or template (path).
     standard: usize,
     template: Option<String>,
@@ -369,6 +372,43 @@ fn list_templates(app: &mut App, st: &mut FormsState) {
     }
     if st.template.as_ref().is_some_and(|t| !st.templates.iter().any(|(_, p)| p == t)) {
         st.template = None;
+    }
+}
+
+/// Where Choose Form looks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Look {
+    #[default]
+    Standard,
+    Personal,
+    User,
+}
+
+impl Look {
+    fn label(self) -> &'static str {
+        match self {
+            Look::Standard => "Standard Forms Library",
+            Look::Personal => "Personal Forms Library",
+            Look::User => "User Templates in File System",
+        }
+    }
+}
+
+/// Lists the Personal Forms Library: the templates kept with the profile.
+fn list_personal(app: &mut App, st: &mut FormsState) {
+    st.personal_listed = true;
+    st.error.clear();
+    match app.run("mail.newItem", json!({"kind": "fromForm", "look": "personal", "list": true})) {
+        Some(v) => {
+            st.templates = templates_of(&v);
+            if st.templates.is_empty() {
+                st.error = "No personal forms yet: save a message as a template to keep it here.".into();
+            }
+        }
+        None => {
+            st.templates.clear();
+            st.error = super::folders::last_error(app);
+        }
     }
 }
 
@@ -403,36 +443,53 @@ fn choose_form(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         },
         |st, app| {
             window(ctx, app, d, "Choose Form", 460.0, |ui, app| {
+                let before = st.look;
                 ui.horizontal(|ui| {
                     ui.label("Look In:");
-                    let cur =
-                        if st.user { "User Templates in File System" } else { "Standard Forms Library" };
-                    egui::ComboBox::from_id_salt(("forms-look", uid)).selected_text(cur).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut st.user, false, "Standard Forms Library");
-                        ui.selectable_value(&mut st.user, true, "User Templates in File System");
-                    });
+                    egui::ComboBox::from_id_salt(("forms-look", uid)).selected_text(st.look.label()).show_ui(
+                        ui,
+                        |ui| {
+                            for look in [Look::Standard, Look::Personal, Look::User] {
+                                ui.selectable_value(&mut st.look, look, look.label());
+                            }
+                        },
+                    );
                 });
+                if st.look != before {
+                    st.template = None;
+                    st.error.clear();
+                    st.templates.clear();
+                    st.personal_listed = false;
+                    st.pending = st.look == Look::User && !st.dir.trim().is_empty();
+                }
+                if st.look == Look::Personal && !st.personal_listed {
+                    list_personal(app, st);
+                }
                 let mut open = false;
-                if st.user {
-                    ui.horizontal(|ui| {
-                        let typed = ui.add(
-                            egui::TextEdit::singleline(&mut st.dir).desired_width(260.0).hint_text("Folder"),
-                        );
-                        if typed.changed() {
-                            // The message was about the folder named before.
-                            st.error.clear();
-                        }
-                        if btn(ui, "Browse...")
-                            && let Some(dir) = common::browse_folder(app, "Templates folder", &st.dir)
-                        {
-                            st.dir = dir;
-                            st.templates.clear();
-                            st.pending = true;
-                        }
-                        if btn(ui, "Show") || st.pending && !st.dir.trim().is_empty() {
-                            list_templates(app, st);
-                        }
-                    });
+                if st.look != Look::Standard {
+                    if st.look == Look::User {
+                        ui.horizontal(|ui| {
+                            let typed = ui.add(
+                                egui::TextEdit::singleline(&mut st.dir)
+                                    .desired_width(260.0)
+                                    .hint_text("Folder"),
+                            );
+                            if typed.changed() {
+                                // The message was about the folder named before.
+                                st.error.clear();
+                            }
+                            if btn(ui, "Browse...")
+                                && let Some(dir) = common::browse_folder(app, "Templates folder", &st.dir)
+                            {
+                                st.dir = dir;
+                                st.templates.clear();
+                                st.pending = true;
+                            }
+                            if btn(ui, "Show") || st.pending && !st.dir.trim().is_empty() {
+                                list_templates(app, st);
+                            }
+                        });
+                    }
                     egui::ScrollArea::vertical().id_salt(("forms-list", uid)).max_height(220.0).show(
                         ui,
                         |ui| {
@@ -469,7 +526,7 @@ fn choose_form(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
                 }
-                let can = !st.user || st.template.is_some();
+                let can = st.look == Look::Standard || st.template.is_some();
                 let pressed = footer(ui, |ui| {
                     if btn(ui, "Cancel") {
                         return Some(false);
@@ -482,7 +539,7 @@ fn choose_form(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 match (pressed, open) {
                     (Some(false), _) => Out::Close,
                     (Some(true), _) | (None, true) if can => {
-                        let p = if st.user {
+                        let p = if st.look != Look::Standard {
                             json!({"kind": "fromForm", "path": st.template})
                         } else {
                             let kind = STANDARD_FORMS.get(st.standard).map_or("email", |(k, _)| *k);
@@ -594,7 +651,7 @@ mod tests {
 
 #[cfg(test)]
 mod choose_form_tests {
-    use super::{FormsState, list_templates};
+    use super::{FormsState, list_personal, list_templates};
     use crate::App;
     use mailcraft_engine::sample::sample_session;
 
@@ -630,5 +687,24 @@ mod choose_form_tests {
         assert!(st.templates.is_empty() && st.template.is_none() && !st.error.is_empty());
         let _ = std::fs::remove_dir_all(&empty);
         let _ = std::fs::remove_dir_all(&full);
+    }
+
+    /// Look In › Personal Forms Library lists the profile's templates; an in-memory profile has none to keep.
+    #[test]
+    fn the_personal_forms_library_lists_the_profile_templates() {
+        let mut app = App::new(sample_session());
+        let mut st = FormsState::default();
+        list_personal(&mut app, &mut st);
+        assert!(st.templates.is_empty() && st.error.contains("saved profile"), "{}", st.error);
+        let dir = scratch("profile");
+        let mut app = App::new(mailcraft_engine::Session::open(&dir).unwrap());
+        let forms = dir.join("templates");
+        std::fs::create_dir_all(&forms).unwrap();
+        std::fs::write(forms.join("Status.eml"), "Subject: Status\r\n\r\nBody\r\n").unwrap();
+        let mut st = FormsState::default();
+        list_personal(&mut app, &mut st);
+        assert_eq!(st.templates.len(), 1, "{}", st.error);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -65,6 +65,13 @@ struct FindState {
     results: Vec<u64>,
     searched: bool,
     selected: Option<u64>,
+    /// Advanced tab, "Define more criteria": the field, condition and value being entered (indexes into
+    /// the engine's form fields and the field's conditions), and the criteria added (shown text, term).
+    crit_field: usize,
+    crit_cond: usize,
+    crit_value: String,
+    criteria: Vec<(String, String)>,
+    crit_error: String,
 }
 
 fn advanced_find(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -118,54 +125,74 @@ fn advanced_find(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         }
                     });
                     ui.separator();
-                    egui::Grid::new(("af", uid, st.tab)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| match st.tab {
-                        0 => {
-                            ui.label("Search for the word(s):");
-                            ui.add(egui::TextEdit::singleline(&mut st.words).desired_width(300.0));
-                            ui.end_row();
-                            ui.label("In:");
-                            common::combo_idx(ui, ("afin", uid), &mut st.in_field, &IN_FIELDS, 300.0);
-                            ui.end_row();
-                            ui.label("From...");
-                            ui.add(egui::TextEdit::singleline(&mut st.from).desired_width(300.0));
-                            ui.end_row();
-                            ui.label("Sent To...");
-                            ui.add(egui::TextEdit::singleline(&mut st.sent_to).desired_width(300.0));
-                            ui.end_row();
-                            ui.label("Time: received");
-                            let names: Vec<&str> = TIMES.iter().map(|t| t.0).collect();
-                            ui.horizontal(|ui| {
-                                common::combo_idx(ui, ("aftime", uid), &mut st.time, &names, 160.0);
-                                if st.time == 8 {
-                                    ui.add(egui::DragValue::new(&mut st.older_days).range(1..=3650).suffix(" days"));
-                                }
-                            });
-                            ui.end_row();
-                        }
-                        1 => {
-                            ui.label("Categories:");
-                            ui.add(egui::TextEdit::singleline(&mut st.categories).hint_text("any category name").desired_width(260.0));
-                            ui.end_row();
-                            ui.label("Only items that are:");
-                            common::combo_idx(ui, ("afread", uid), &mut st.read, &["read or unread", "unread", "read"], 160.0);
-                            ui.end_row();
-                            ui.label("");
-                            ui.checkbox(&mut st.attachments, "Only items with one or more attachments");
-                            ui.end_row();
-                            ui.label("Whose importance is:");
-                            common::combo_idx(ui, ("afimp", uid), &mut st.importance, &["any", "high", "normal", "low"], 160.0);
-                            ui.end_row();
-                            ui.label("Size (kilobytes): larger than");
-                            ui.add(egui::DragValue::new(&mut st.larger_kb).range(0..=1_000_000));
-                            ui.end_row();
-                        }
-                        _ => {
-                            ui.label("Search text:");
-                            ui.label(RichText::new(build_query(st)).monospace());
-                            ui.end_row();
-                            ui.label("");
-                            muted(ui, app, "Combine terms such as from:, to:, subject:, body:, category:, isread:, hasattachments:, importance:, received:.");
-                            ui.end_row();
+                    egui::Grid::new(("af", uid, st.tab)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        match st.tab {
+                            0 => {
+                                ui.label("Search for the word(s):");
+                                ui.add(egui::TextEdit::singleline(&mut st.words).desired_width(300.0));
+                                ui.end_row();
+                                ui.label("In:");
+                                common::combo_idx(ui, ("afin", uid), &mut st.in_field, &IN_FIELDS, 300.0);
+                                ui.end_row();
+                                ui.label("From...");
+                                ui.add(egui::TextEdit::singleline(&mut st.from).desired_width(300.0));
+                                ui.end_row();
+                                ui.label("Sent To...");
+                                ui.add(egui::TextEdit::singleline(&mut st.sent_to).desired_width(300.0));
+                                ui.end_row();
+                                ui.label("Time: received");
+                                let names: Vec<&str> = TIMES.iter().map(|t| t.0).collect();
+                                ui.horizontal(|ui| {
+                                    common::combo_idx(ui, ("aftime", uid), &mut st.time, &names, 160.0);
+                                    if st.time == 8 {
+                                        ui.add(
+                                            egui::DragValue::new(&mut st.older_days)
+                                                .range(1..=3650)
+                                                .suffix(" days"),
+                                        );
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            1 => {
+                                ui.label("Categories:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut st.categories)
+                                        .hint_text("any category name")
+                                        .desired_width(260.0),
+                                );
+                                ui.end_row();
+                                ui.label("Only items that are:");
+                                common::combo_idx(
+                                    ui,
+                                    ("afread", uid),
+                                    &mut st.read,
+                                    &["read or unread", "unread", "read"],
+                                    160.0,
+                                );
+                                ui.end_row();
+                                ui.label("");
+                                ui.checkbox(&mut st.attachments, "Only items with one or more attachments");
+                                ui.end_row();
+                                ui.label("Whose importance is:");
+                                common::combo_idx(
+                                    ui,
+                                    ("afimp", uid),
+                                    &mut st.importance,
+                                    &["any", "high", "normal", "low"],
+                                    160.0,
+                                );
+                                ui.end_row();
+                                ui.label("Size (kilobytes): larger than");
+                                ui.add(egui::DragValue::new(&mut st.larger_kb).range(0..=1_000_000));
+                                ui.end_row();
+                            }
+                            _ => {
+                                criteria_ui(ui, app, uid, st);
+                                ui.label("Search text:");
+                                ui.label(RichText::new(build_query(st)).monospace());
+                                ui.end_row();
+                            }
                         }
                     });
                 });
@@ -207,7 +234,8 @@ fn build_query(st: &FindState) -> String {
         terms.push(token("from", st.from.trim()));
     }
     if !st.sent_to.trim().is_empty() {
-        terms.push(token("to", st.sent_to.trim()));
+        // Sent To finds the name in To or Cc, as the engine's Advanced Find does.
+        terms.push(token("tocc", st.sent_to.trim()));
     }
     if let Some((_, v)) = TIMES.get(st.time)
         && !v.is_empty()
@@ -230,7 +258,88 @@ fn build_query(st: &FindState) -> String {
     if let Some(i) = ["", "high", "normal", "low"].get(st.importance).filter(|i| !i.is_empty()) {
         terms.push(format!("importance:{i}"));
     }
+    terms.extend(st.criteria.iter().map(|(_, t)| t.clone()));
     terms.join(" ")
+}
+
+/// Advanced tab: "Define more criteria" (a field, a condition and a value, added to the list below) over the
+/// form fields the engine knows (`search.refine` kind field uses the same ones).
+fn criteria_ui(ui: &mut egui::Ui, app: &App, uid: u64, st: &mut FindState) {
+    use mailcraft_engine::cmd::search::{FORM_FIELDS, FieldType, conditions_of, field_term};
+    ui.label(RichText::new("Define more criteria:").strong());
+    ui.end_row();
+    let labels: Vec<&str> = FORM_FIELDS.iter().map(|(_, l, _)| *l).collect();
+    ui.label("Field:");
+    if common::combo_idx(ui, ("afcf", uid), &mut st.crit_field, &labels, 220.0) {
+        st.crit_cond = 0;
+        st.crit_value.clear();
+    }
+    ui.end_row();
+    let Some((_, label, ftype)) = FORM_FIELDS.get(st.crit_field).copied() else { return };
+    let conds = conditions_of(ftype);
+    let cond_labels: Vec<&str> = conds.iter().map(|(_, l, _)| *l).collect();
+    ui.label("Condition:");
+    common::combo_idx(ui, ("afcc", uid), &mut st.crit_cond, &cond_labels, 220.0);
+    ui.end_row();
+    let cond = conds.get(st.crit_cond).map(|(id, _, _)| *id);
+    let no_value = matches!(cond, Some("isEmpty" | "isNotEmpty"));
+    let l = ui.label("Value:");
+    ui.add_enabled_ui(!no_value, |ui| match ftype {
+        FieldType::Choice(choices) => {
+            let mut i = choices.iter().position(|c| *c == st.crit_value).unwrap_or(0);
+            common::combo_idx(ui, ("afcv", uid), &mut i, choices, 220.0);
+            st.crit_value = choices.get(i).map(|c| (*c).to_owned()).unwrap_or_default();
+        }
+        FieldType::Date => {
+            let te =
+                egui::TextEdit::singleline(&mut st.crit_value).hint_text("YYYY-MM-DD").desired_width(220.0);
+            ui.add(te).labelled_by(l.id);
+        }
+        _ => {
+            ui.add(egui::TextEdit::singleline(&mut st.crit_value).desired_width(220.0)).labelled_by(l.id);
+        }
+    });
+    ui.end_row();
+    ui.label("");
+    if ui.button("Add to List").clicked() {
+        match field_term(label, cond, &st.crit_value) {
+            Ok(term) => {
+                let shown = format!(
+                    "{label} {} {}",
+                    conds.get(st.crit_cond).map_or("", |(_, l, _)| *l),
+                    if no_value { "" } else { st.crit_value.trim() }
+                );
+                if !st.criteria.iter().any(|(_, t)| *t == term) {
+                    st.criteria.push((shown.trim().to_owned(), term));
+                }
+                st.crit_value.clear();
+                st.crit_error.clear();
+            }
+            Err(e) => st.crit_error = e.to_string(),
+        }
+    }
+    ui.end_row();
+    if !st.crit_error.is_empty() {
+        ui.label("");
+        ui.label(RichText::new(&st.crit_error).color(app.theme.danger));
+        ui.end_row();
+    }
+    let mut remove = None;
+    for (i, (shown, _)) in st.criteria.iter().enumerate() {
+        ui.label(if i == 0 { "Criteria:" } else { "" });
+        ui.horizontal(|ui| {
+            ui.label(shown);
+            if ui.small_button("Remove").clicked() {
+                remove = Some(i);
+            }
+        });
+        ui.end_row();
+    }
+    if let Some(i) = remove
+        && i < st.criteria.len()
+    {
+        st.criteria.remove(i);
+    }
 }
 
 fn run_find(app: &mut App, st: &mut FindState) {
@@ -814,5 +923,25 @@ fn apply_names(app: &mut App, compose: u64, unresolved: &[Value], picks: &[usize
         if *old != new {
             app.run(cmd, json!({"compose": compose, "value": new}));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: Sent To searched only To; it finds the name in To or Cc, like the engine's Advanced Find.
+    /// The Advanced tab's criteria join the query.
+    #[test]
+    fn sent_to_covers_cc_and_criteria_join_the_query() {
+        let st = FindState { sent_to: "bob".into(), ..Default::default() };
+        assert_eq!(build_query(&st), "tocc:bob");
+        let st = FindState {
+            words: "plan".into(),
+            in_field: 1,
+            criteria: vec![("Size more than 100".into(), "prop:\"Size>100\"".into())],
+            ..Default::default()
+        };
+        assert_eq!(build_query(&st), "plan prop:\"Size>100\"");
     }
 }

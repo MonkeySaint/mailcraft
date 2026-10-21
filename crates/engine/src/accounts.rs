@@ -403,6 +403,8 @@ impl Session {
         for a in &self.mailbox.accounts {
             keys.extend(account_secret_keys(a.id));
         }
+        // The translation server's API key (Options › Language).
+        keys.push(crate::translate::KEY_SECRET.to_owned());
         keys.sort();
         keys.dedup();
         let mut moved = Vec::new();

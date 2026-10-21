@@ -949,31 +949,62 @@ fn translate(s: &mut Session, p: &Value) -> CmdResult {
     let mut by = "the caller".to_owned();
     let translated = match opt_str(p, "text") {
         Some(t) => t.to_owned(),
-        None => match crate::translate::run(s, &text, &to) {
-            Some(Ok((t, name))) => {
-                by = name;
-                t
-            }
-            Some(Err(e)) => return Err(CmdError::Failed(format!("the translator could not translate: {e}"))),
-            None => {
-                // No translator installed: the Translator window explains (nothing leaves the computer).
-                let mut payload = target;
-                if let Some(o) = payload.as_object_mut() {
-                    o.insert("text".into(), Value::String(text));
-                    o.insert("to".into(), Value::String(to.clone()));
-                    o.insert("translator".into(), Value::Bool(false));
+        None => {
+            // The desktop app translates on a worker thread: a slow server must not freeze the window. The
+            // result is applied when it arrives (`translate::poll`).
+            if s.background_translate
+                && !cfg!(target_arch = "wasm32")
+                && let Some(t) = crate::translate::translator(s)
+            {
+                crate::translate::start(s, t, target.clone(), &text, &to).map_err(CmdError::Failed)?;
+                let mut out = target;
+                if let Some(o) = out.as_object_mut() {
+                    o.insert("translating".into(), Value::Bool(true));
+                    o.insert("to".into(), Value::String(to));
                 }
-                return dialog(s, "translate", payload);
+                return Ok(out);
             }
-        },
+            match crate::translate::run(s, &text, &to) {
+                Some(Ok((t, name))) => {
+                    by = name;
+                    t
+                }
+                Some(Err(e)) => {
+                    return Err(CmdError::Failed(format!("the translator could not translate: {e}")));
+                }
+                None => {
+                    // No translator installed: the Translator window explains (nothing leaves the computer).
+                    let mut payload = target;
+                    if let Some(o) = payload.as_object_mut() {
+                        o.insert("text".into(), Value::String(text));
+                        o.insert("to".into(), Value::String(to.clone()));
+                        o.insert("translator".into(), Value::Bool(false));
+                    }
+                    return dialog(s, "translate", payload);
+                }
+            }
+        }
     };
+    apply_translation(s, &target, &to, &translated, by)
+}
+
+/// Puts translation `translated` (into `to`, made by `by`) in place: a message being written (`target`
+/// `{"compose": id}`) gets it as its body; a received message (`{"item": id}`) shows it instead of its body.
+pub(crate) fn apply_translation(
+    s: &mut Session,
+    target: &Value,
+    to: &str,
+    translated: &str,
+    by: String,
+) -> CmdResult {
+    let to = to.to_owned();
     if target.get("compose").is_some() {
-        let c = compose_mut(s, p)?;
+        let c = compose_mut(s, target)?;
         c.checkpoint();
         if c.original_body.is_none() {
             c.original_body = Some(c.body.clone());
         }
-        c.body = Doc::from_plain_text(&translated);
+        c.body = Doc::from_plain_text(translated);
         c.translated_to = Some(to.clone());
         c.selection = Default::default();
         c.ensure_body();
@@ -1893,6 +1924,92 @@ mod tests {
         s.run("compose.insertText", &json!({"compose": id, "text": "bonjour"})).unwrap();
         s.run("review.translate", &json!({"compose": id, "to": "en"})).unwrap();
         assert_eq!(s.composes[&id].body.to_plain_text(), "BONJOUR");
+    }
+
+    /// A translator that waits for a go-ahead before answering (a slow server).
+    struct Gated(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+
+    impl crate::translate::Translator for Gated {
+        fn name(&self) -> String {
+            "Slow translator".into()
+        }
+        fn translate(&self, text: &str, to: &str) -> Result<String, String> {
+            if let Ok(rx) = self.0.lock() {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if to == "xx" { Err("unsupported language".into()) } else { Ok(text.to_uppercase()) }
+        }
+    }
+
+    /// Polls until no translation runs in the background (at most 20 s).
+    fn settle(s: &mut Session) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while crate::translate::busy(s) && std::time::Instant::now() < end {
+            s.poll_sync();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!crate::translate::busy(s), "the translation did not finish");
+    }
+
+    /// Regression: the desktop app translated on its UI thread, so a slow translation server froze the
+    /// window (up to about 70 s per message). In background mode the command returns at once and the
+    /// translation is applied when it arrives.
+    #[test]
+    fn background_translations_do_not_block_and_arrive_later() {
+        let mut s = session();
+        s.background_translate = true;
+        let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
+        let mut m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
+        m.body.text = Some("hola mundo".into());
+        let mid = s.mailbox.add_mail(m);
+        let (go, rx) = std::sync::mpsc::channel();
+        crate::translate::set_translator(&mut s, Some(std::sync::Arc::new(Gated(std::sync::Mutex::new(rx)))));
+
+        let r = s.run("review.translate", &json!({"id": mid.0, "to": "en"})).unwrap();
+        assert_eq!(r["translating"], true, "returned while the translator still works");
+        assert!(crate::translate::pending(&s, mid));
+        assert!(crate::translate::shown(&s, mid).is_none());
+        // Asking again while it runs does not start a second translation.
+        s.run("review.translate", &json!({"id": mid.0, "to": "en"})).unwrap();
+        go.send(()).unwrap();
+        settle(&mut s);
+        let t = crate::translate::shown(&s, mid).unwrap();
+        assert_eq!((t.text.as_str(), t.by.as_str()), ("HOLA MUNDO", "Slow translator"));
+
+        // A failure becomes an error notice.
+        s.notices.clear();
+        s.run("review.translate", &json!({"id": mid.0, "to": "xx"})).unwrap();
+        go.send(()).unwrap();
+        settle(&mut s);
+        assert!(
+            s.notices
+                .iter()
+                .any(|n| matches!(n, crate::Notice::Error(e) if e.contains("unsupported language"))),
+            "{:?}",
+            s.notices
+        );
+
+        // A message being written gets the translation, unless it was changed in the meantime.
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"compose": id, "text": "bonjour"})).unwrap();
+        s.run("review.translate", &json!({"compose": id, "to": "en"})).unwrap();
+        go.send(()).unwrap();
+        settle(&mut s);
+        assert_eq!(s.composes[&id].body.to_plain_text(), "BONJOUR");
+        s.run("review.translate", &json!({"compose": id, "to": "fr"})).unwrap();
+        s.run("compose.insertText", &json!({"compose": id, "text": " encore"})).unwrap();
+        go.send(()).unwrap();
+        settle(&mut s);
+        assert!(s.composes[&id].body.to_plain_text().contains("encore"), "typing is not overwritten");
+        assert!(s.notices.iter().any(|n| matches!(n, crate::Notice::Info(i) if i.contains("changed while"))));
+
+        // A message deleted while it was translated: the result is dropped.
+        s.run("review.translate", &json!({"id": mid.0, "to": "de"})).unwrap();
+        s.mailbox.mail.remove(&mid);
+        s.tidy_selection();
+        go.send(()).unwrap();
+        settle(&mut s);
+        assert!(!s.translations.contains_key(&mid));
     }
 
     #[test]

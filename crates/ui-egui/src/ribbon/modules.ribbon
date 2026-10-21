@@ -1,6 +1,7 @@
 # Module ribbons (plan/reference/modules.md): Home tabs for Calendar, People, Tasks and Notes, plus the module
-# View tabs that differ from Mail (Calendar, Notes) and the Calendar Folder tab. Only the Classic ribbon was
-# observed; the Simplified ribbon is derived. Tabs a module does not define fall back to the Mail ones.
+# View tabs that differ from Mail (Calendar, Notes), the Calendar and People Folder tabs and the People Send /
+# Receive tab. Only the Classic ribbon was observed; the Simplified ribbon is derived. Tabs a module does not
+# define fall back to the Mail ones.
 
 surface calendar
 mode classic
@@ -99,6 +100,30 @@ toggle S | Private | private | people.private | {"on":"$!on"} | V | on=pim:priva
 group Find | ZN | c800=collapse
 edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=140
 button S | Address Book... | address-book | compose.addressBook | | AB
+
+tab Send / Receive | JS
+group Send & Receive | ZS1
+button L | Send/Receive All Folders | sync | sendReceive.all | | S
+button S | Update Folder | folder-open | sendReceive.folder | | D
+button S | Send All | send | sendReceive.sendAll | | A
+drop S | Send/Receive Groups | sync | | | G | menu=sendReceiveGroups
+group Download | ZD
+button L | Show Progress... | info | sendReceive.showProgress | | P
+button L | Cancel All | close | sendReceive.cancelAll | | C
+group Preferences | ZP
+drop L | Download Preferences | settings | | | L | menu=downloadPreferences
+toggle L | Work Offline | warning | sendReceive.workOffline | {"offline":"$on"} | W | on=offline
+
+tab Folder | O
+group New | ZN
+button L | New Folder... | folder | folder.new | | N
+group Actions | ZA
+button L | Rename Folder | folder | folder.rename | | RN
+button S | Copy Folder | copy | folder.copy | | CF
+button S | Move Folder | move | folder.move | | MF
+button S | Delete Folder | delete | folder.delete | | DF
+group Properties | ZP
+button L | Folder Properties | settings | folder.properties | | P
 
 tab View | V
 group Current View | ZV1
@@ -388,6 +413,7 @@ item | Save Current View As a New View... | save | view.saveViewAs | | S
 item | Apply Current View to Other Task Folders... | | view.applyViewTo | | A
 
 menu tasksMove
+dyn | recentTaskFolders | tasks.move | {"folder":"$id"}
 item | Other Folder... | folder | tasks.move | | O
 item | Copy to Folder... | copy | tasks.copy | | C
 

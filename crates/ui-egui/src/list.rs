@@ -361,6 +361,9 @@ fn fingerprint(s: &Session) -> u64 {
     s.tz_offset_min.hash(&mut h);
     // Quick Actions and saved views live in the settings.
     s.settings.rev().hash(&mut h);
+    // Include Older Results: server matches and the search's progress.
+    let o = &s.sync.older;
+    (o.on, o.generation, o.pending.len(), o.hits.len(), o.found, o.error.is_some()).hash(&mut h);
     h.finish()
 }
 

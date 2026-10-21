@@ -56,6 +56,9 @@ pub(crate) use common::{Pick, browse_folder, browse_open, browse_save, folder_tr
 
 pub fn dialogs(ctx: &egui::Context, app: &mut App) {
     take_notices(app);
+    for url in std::mem::take(&mut app.ui.open_urls) {
+        ctx.open_url(egui::OpenUrl::new_tab(url));
+    }
     assign_uids(ctx, app);
     // Requests the modules draw themselves stay queued for them (next pass), so no generic window flashes.
     let (deferred, list): (Vec<_>, Vec<_>) = app
@@ -102,6 +105,13 @@ pub fn open(app: &mut App, name: &str, params: Value) {
             let surface =
                 params.get("compose").and_then(Value::as_u64).map_or(Surface::Main, Surface::Compose);
             app.ui.backstage = Some((surface, page));
+        }
+        // View in Browser: the page the engine wrote, in the system browser.
+        "openUrl" => {
+            if let Some(url) = params.get("url").and_then(Value::as_str).filter(|u| u.starts_with("file://"))
+            {
+                app.ui.open_urls.push(url.to_owned());
+            }
         }
         "mainWindow" => {
             // Open in New Window: another main window on the folder (or, past the limit, the folder here).
@@ -222,6 +232,7 @@ pub const KNOWN: &[&str] = &[
     "archive",
     "autoArchivePrompt",
     "mainWindow",
+    "openUrl",
     "confirm",
     "dataFileProperties",
     "openDataFile",

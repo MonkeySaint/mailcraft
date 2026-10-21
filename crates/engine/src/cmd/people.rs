@@ -20,11 +20,14 @@
 //! [`snooze_reminder`] are what the reminders scan uses for contacts.
 //!
 //! **Mail Merge** (`people.mailMerge`) merges the contacts into E-mail messages or documents: `{{Field}}`
-//! placeholders ([`MERGE_FIELDS`]) in the subject and text are replaced with each contact's fields and a
-//! preview shows one merged record. E-mail puts one message per contact with an address in the Outbox; Form
-//! Letters, Mailing Labels and Envelopes are laid out by `mailcraft_render::print` and written as a new PDF
-//! document or sent to a printer. The merged contacts' fields can also be saved as a contact data file
-//! (CSV).
+//! placeholders ([`MERGE_FIELDS`] and [`MORE_MERGE_FIELDS`]) in the subject and text are replaced with each
+//! contact's fields and a preview shows one merged record. The contacts are those of the current view (its
+//! filter and the People search applied, in view order) or the selected ones. The text can come from an
+//! existing document (plain text, HTML or a saved message). E-mail puts one message per contact with an
+//! address in the Outbox; Form Letters, Mailing Labels, Envelopes and Catalog (every record one after the
+//! other) are laid out by `mailcraft_render::print` and written as a new PDF document or sent to a printer.
+//! The merged contacts' fields (all contact fields, or the fields of the current view) can also be saved as
+//! a contact data file (CSV).
 //!
 //! **Assign Task** (`people.assignTask`) sends a task request (VTODO) to the selected contacts
 //! (`tasks::assign`).
@@ -1098,6 +1101,67 @@ pub const MERGE_FIELDS: [&str; 24] = [
     "Web Page",
     "Birthday",
 ];
+/// More contact fields usable as `{{Field}}` placeholders: (name, People table column).
+pub const MORE_MERGE_FIELDS: [(&str, &str); 12] = [
+    ("Nickname", "nickname"),
+    ("Office", "office"),
+    ("Profession", "profession"),
+    ("Manager's Name", "manager"),
+    ("Assistant's Name", "assistant"),
+    ("Spouse/Partner", "spouse"),
+    ("Anniversary", "anniversary"),
+    ("IM Address", "imAddress"),
+    ("Business Address", "businessAddress"),
+    ("Home Address", "homeAddress"),
+    ("Categories", "categories"),
+    ("Sensitivity", "sensitivity"),
+];
+
+/// Every merge field ("Fields to merge: All contact fields"), in order.
+pub fn all_merge_fields() -> Vec<&'static str> {
+    MERGE_FIELDS.iter().copied().chain(MORE_MERGE_FIELDS.iter().map(|(n, _)| *n)).collect()
+}
+
+/// The merge field shown in a People table column (`None` for the icon and flag columns).
+fn merge_field_of_column(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "fullName" => "Full Name",
+        "fileAs" => "File As",
+        "company" => "Company",
+        "jobTitle" => "Job Title",
+        "department" => "Department",
+        "businessPhone" => "Business Phone",
+        "businessFax" => "Business Fax",
+        "homePhone" => "Home Phone",
+        "mobilePhone" => "Mobile Phone",
+        "email" => "Email",
+        "email2" => "Email 2",
+        "email3" => "Email 3",
+        "city" => "City",
+        "country" => "Country",
+        "webPage" => "Web Page",
+        "birthday" => "Birthday",
+        other => return MORE_MERGE_FIELDS.iter().find(|(_, c)| *c == other).map(|(n, _)| *n),
+    })
+}
+
+/// The fields of the contacts folder's current view ("Fields to merge: Contact fields in current view"):
+/// the columns of its table (the List columns for the card views), as merge fields.
+pub fn view_merge_fields(s: &Session, folder: FolderId) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for c in crate::cmd::view::table::columns(s, folder) {
+        if let Some(f) = merge_field_of_column(c.id)
+            && !out.contains(&f)
+        {
+            out.push(f);
+        }
+    }
+    if out.is_empty() {
+        out.push("Full Name");
+    }
+    out
+}
+
 /// Longest merged subject + body template (bytes).
 pub const MAX_MERGE_TEMPLATE: usize = 256 * 1024;
 /// Most messages one merge sends.
@@ -1130,6 +1194,9 @@ pub fn merge_field(c: &Contact, name: &str) -> Option<String> {
     let addr = c.addresses.iter().find(|a| a.kind.eq_ignore_ascii_case("Business")).or(c.addresses.first());
     let a = |f: fn(&PostalAddress) -> &String| addr.map(|x| f(x).clone()).unwrap_or_default();
     let email = |i: usize| c.emails.get(i).cloned().unwrap_or_default();
+    if let Some((_, column)) = MORE_MERGE_FIELDS.iter().find(|(f, _)| f.eq_ignore_ascii_case(name.trim())) {
+        return Some(crate::cmd::view::table::contact_cell(c, column));
+    }
     let canonical = MERGE_FIELDS.iter().find(|f| f.eq_ignore_ascii_case(name.trim()))?;
     Some(match *canonical {
         "Full Name" => c.full_name(),
@@ -1221,19 +1288,66 @@ pub fn tidy_address(text: &str) -> String {
         .join("\n")
 }
 
-/// The Mail Merge contact data file: a header row of [`MERGE_FIELDS`], then one row per contact (CSV,
-/// RFC 4180).
-pub fn merge_data_csv(contacts: &[Contact]) -> String {
-    let mut rows: Vec<Vec<String>> = vec![MERGE_FIELDS.iter().map(|f| (*f).to_owned()).collect()];
+/// The Mail Merge contact data file: a header row of `fields`, then one row per contact (CSV, RFC 4180).
+pub fn merge_data_csv(contacts: &[Contact], fields: &[&str]) -> String {
+    let mut rows: Vec<Vec<String>> = vec![fields.iter().map(|f| (*f).to_owned()).collect()];
     for c in contacts {
-        rows.push(MERGE_FIELDS.iter().map(|f| merge_field(c, f).unwrap_or_default()).collect());
+        rows.push(fields.iter().map(|f| merge_field(c, f).unwrap_or_default()).collect());
     }
     mailcraft_formats::csv::write(&rows, ',')
 }
 
-/// Mail Merge. `contacts`: all (the current contacts folder, in list order) or selected; `output`: email
-/// (default), letters (Form Letters), labels (Mailing Labels) or envelopes. Without `action` the Mail Merge
-/// window opens. With `action`:
+/// Largest existing document Mail Merge reads its text from (bytes).
+const MAX_TEMPLATE_FILE: u64 = 4 * 1024 * 1024;
+
+/// The text of an existing document for Mail Merge: plain text (`.txt`, `.text`, `.md` or anything else that
+/// is text), HTML (`.htm`, `.html`; its text) or a saved message (`.eml`: its subject and text). Returns
+/// (subject, text).
+pub fn merge_template(path: &str) -> Result<(String, String), CmdError> {
+    let path = std::path::Path::new(path.trim());
+    let meta = std::fs::metadata(path)
+        .map_err(|e| CmdError::Failed(format!("cannot open {}: {e}", path.display())))?;
+    if !meta.is_file() {
+        return Err(CmdError::Params(format!("{} is not a file", path.display())));
+    }
+    if meta.len() > MAX_TEMPLATE_FILE {
+        return Err(CmdError::Params("the document is too large for a merge".into()));
+    }
+    let data =
+        std::fs::read(path).map_err(|e| CmdError::Failed(format!("cannot read {}: {e}", path.display())))?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let (subject, text) = match ext.as_str() {
+        "htm" | "html" => (String::new(), mailcraft_html::html_to_text(&String::from_utf8_lossy(&data))),
+        "eml" => {
+            let item = mailcraft_store::import::item_from_raw(
+                &data,
+                FolderId(0),
+                mailcraft_model::DateTime::default(),
+            );
+            (item.subject.clone(), item.body_text())
+        }
+        _ => {
+            if data.iter().take(8_192).any(|b| *b == 0) {
+                return Err(CmdError::Params(
+                    "this document is not text; save it as plain text, HTML or a message (.eml) first".into(),
+                ));
+            }
+            (String::new(), String::from_utf8_lossy(&data).into_owned())
+        }
+    };
+    let text = text.replace("\r\n", "\n");
+    if subject.len().saturating_add(text.len()) > MAX_MERGE_TEMPLATE {
+        return Err(CmdError::Params("the document's text is too long for a merge".into()));
+    }
+    Ok((subject, text))
+}
+
+/// Mail Merge. `contacts`: all (the contacts of the current view: its filter and the People search `query`
+/// applied, in view order) or selected; `output`: email (default), letters (Form Letters), labels (Mailing
+/// Labels), envelopes or catalog (every record one after the other on the same pages); `fields`: the fields
+/// offered and written to the data file, all (every contact field) or view (the fields of the current
+/// view); `template`: an existing document whose text is merged when no `body` is given. Without `action`
+/// the Mail Merge window opens. With `action`:
 /// - `preview` {subject?, body, index?}: one merged record (the message for E-mail, the text otherwise),
 /// - `send` (E-mail) {subject, body}: one message per contact with an address, sent to the Outbox,
 /// - `merge` (documents) {body, to?: document|printer, path?, printer?, labels?, envelope?, returnAddress?}:
@@ -1241,7 +1355,8 @@ pub fn merge_data_csv(contacts: &[Contact]) -> String {
 ///   `labels`) or envelopes (one per contact, `envelope` size, with `returnAddress`) written as a PDF at
 ///   `path` (New Document) or sent to `printer` (Printer, default the system's default printer). Labels and
 ///   envelopes print [`ADDRESS_BLOCK`] when `body` is empty,
-/// - `dataFile` {dataFile}: only the contact data file.
+/// - `dataFile` {dataFile}: only the contact data file,
+/// - `template` {template}: reads the existing document and returns its subject and text.
 ///
 /// `dataFile` (a path) with `send` or `merge` also writes the contact data file: the merge fields of the
 /// merged contacts as CSV ([`merge_data_csv`]). Contact groups are never merged; E-mail also skips contacts
@@ -1254,15 +1369,36 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
     };
     let output = match opt_str(p, "output") {
         None | Some("email") => "email",
-        Some(o @ ("letters" | "labels" | "envelopes")) => o,
-        Some(_) => return Err(CmdError::Params("`output` must be letters|email|labels|envelopes".into())),
+        Some(o @ ("letters" | "labels" | "envelopes" | "catalog")) => o,
+        Some(_) => {
+            return Err(CmdError::Params("`output` must be letters|email|labels|envelopes|catalog".into()));
+        }
+    };
+    let folder = pim::current_folder(s, Kind::Contact);
+    let fields_choice = match opt_str(p, "fields") {
+        None | Some("all") => "all",
+        Some("view") => "view",
+        Some(_) => return Err(CmdError::Params("`fields` must be all|view".into())),
+    };
+    let fields: Vec<&'static str> = match (fields_choice, folder) {
+        ("view", Some(f)) => view_merge_fields(s, f),
+        _ => all_merge_fields(),
     };
     let ids = if contacts == "selected" {
         pim::require_targets(s, p, Kind::Contact)?
     } else {
-        pim::current_folder(s, Kind::Contact).map(|f| ordered(s, f)).unwrap_or_default()
+        // The current view as shown: its filter, the People search and its order.
+        let query = opt_str(p, "query").unwrap_or("");
+        folder.map(|f| view_rows(s, f, query).into_iter().map(|r| r.id).collect()).unwrap_or_default()
     };
     let action = opt_str(p, "action");
+    if action == Some("template") {
+        let path = opt_str(p, "template")
+            .filter(|t| !t.trim().is_empty())
+            .ok_or_else(|| CmdError::Params("`template` (the document to read) is required".into()))?;
+        let (subject, body) = merge_template(path)?;
+        return Ok(json!({ "template": path, "subject": subject, "body": body }));
+    }
     let Some(action) = action else {
         let labels: Vec<Value> = mailcraft_render::print::LABEL_SHEETS
             .iter()
@@ -1274,7 +1410,9 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
             s,
             "mailMerge",
             json!({
-                "contacts": contacts, "output": opt_str(p, "output"), "ids": pim::ids_json(&ids), "fields": MERGE_FIELDS,
+                "contacts": contacts, "output": opt_str(p, "output"), "ids": pim::ids_json(&ids), "fields": fields,
+                "fieldsChoice": fields_choice, "allFields": all_merge_fields(),
+                "viewFields": folder.map(|f| view_merge_fields(s, f)).unwrap_or_default(),
                 "labels": labels, "envelopes": envelopes, "addressBlock": ADDRESS_BLOCK,
             }),
         );
@@ -1295,8 +1433,18 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
             )));
         }
     }
-    let subject = pim::text(p, "subject")?.unwrap_or_default();
+    let mut subject = pim::text(p, "subject")?.unwrap_or_default();
     let mut body = pim::text(p, "body")?.unwrap_or_default();
+    // An existing document: its text, when no text was typed.
+    if let Some(path) = opt_str(p, "template").filter(|t| !t.trim().is_empty())
+        && body.trim().is_empty()
+    {
+        let (t_subject, t_body) = merge_template(path)?;
+        body = t_body;
+        if subject.trim().is_empty() {
+            subject = t_subject;
+        }
+    }
     if subject.len().saturating_add(body.len()) > MAX_MERGE_TEMPLATE {
         return Err(CmdError::Params("the merge text is too long".into()));
     }
@@ -1335,8 +1483,8 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
         "dataFile" => {
             let path = data_file
                 .ok_or_else(|| CmdError::Params("`dataFile` (the file to write) is required".into()))?;
-            let written = write_data_file(s, &path, &records)?;
-            Ok(json!({ "dataFile": written, "records": records.len(), "skipped": skipped }))
+            let written = write_data_file(s, &path, &records, &fields)?;
+            Ok(json!({ "dataFile": written, "records": records.len(), "skipped": skipped, "fields": fields }))
         }
         "send" => {
             if subject.trim().is_empty() {
@@ -1354,7 +1502,7 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
                 messages.push((contact_addresses(c).join("; "), subj, text));
             }
             let written = match &data_file {
-                Some(path) => Some(write_data_file(s, path, &records)?),
+                Some(path) => Some(write_data_file(s, path, &records, &fields)?),
                 None => None,
             };
             let mut sent = 0usize;
@@ -1393,6 +1541,7 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
                 address,
                 skipped,
                 data_file: data_file.as_deref(),
+                fields: &fields,
             };
             merge_document(s, p, job)
         }
@@ -1400,9 +1549,14 @@ fn run_mail_merge(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Writes the contact data file of `records` at `path`; returns the path written.
-fn write_data_file(s: &mut Session, path: &str, records: &[Contact]) -> Result<String, CmdError> {
+fn write_data_file(
+    s: &mut Session,
+    path: &str,
+    records: &[Contact],
+    fields: &[&str],
+) -> Result<String, CmdError> {
     let path = crate::cmd::print::output_path(path)?;
-    crate::cmd::rules::write_file(&path, merge_data_csv(records).as_bytes())?;
+    crate::cmd::rules::write_file(&path, merge_data_csv(records, fields).as_bytes())?;
     let shown = path.display().to_string();
     s.notify(crate::Notice::Info(format!(
         "Saved the contact data of {} contact(s) to {shown}.",
@@ -1426,6 +1580,8 @@ struct MergeJob<'a> {
     address: bool,
     skipped: usize,
     data_file: Option<&'a str>,
+    /// Columns of the contact data file.
+    fields: &'a [&'static str],
 }
 
 /// Page setup without the header and footer (merge documents print only the merged text).
@@ -1440,8 +1596,8 @@ fn merge_document(s: &mut Session, p: &Value, job: MergeJob<'_>) -> CmdResult {
         LABEL_SHEETS, MAX_PAGES, MAX_RECORDS, Margins, MergeDoc, MergeStyle, Orientation, PageSetup, Paper,
         PrintContext, label_sheet, max_records, paginate_merge,
     };
-    if job.output == "letters" && opt_str(p, "body").is_none_or(|b| b.trim().is_empty()) {
-        return Err(CmdError::Params("type the text of the letter".into()));
+    if matches!(job.output, "letters" | "catalog") && job.body.trim().is_empty() {
+        return Err(CmdError::Params("type the text of the document, or choose an existing document".into()));
     }
     if job.records.is_empty() {
         return Err(CmdError::Failed("there are no contacts to merge".into()));
@@ -1465,6 +1621,10 @@ fn merge_document(s: &mut Session, p: &Value, job: MergeJob<'_>) -> CmdResult {
         "letters" => {
             let margins = Margins { top: inch, bottom: inch, left: inch, right: inch };
             (MergeStyle::Letters, PageSetup { paper, margins, ..blank_setup() }, "Form Letters")
+        }
+        "catalog" => {
+            let margins = Margins { top: inch, bottom: inch, left: inch, right: inch };
+            (MergeStyle::Catalog, PageSetup { paper, margins, ..blank_setup() }, "Catalog")
         }
         "labels" => {
             let id = opt_str(p, "labels").unwrap_or("30");
@@ -1531,7 +1691,7 @@ fn merge_document(s: &mut Session, p: &Value, job: MergeJob<'_>) -> CmdResult {
         )));
     }
     let written = match job.data_file {
-        Some(path) => Some(write_data_file(s, path, job.records)?),
+        Some(path) => Some(write_data_file(s, path, job.records, job.fields)?),
         None => None,
     };
     let mut out = crate::cmd::print::output_pages(s, &pages, &fonts, title, printer, path)?;
@@ -2173,7 +2333,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mail Merge",
             "People › Home › Actions",
             "",
-            r#"{"contacts": "all|selected", "output"?: "email|letters|labels|envelopes", "action"?: "preview|send (email)|merge (documents)|dataFile", "subject"?: string, "body"?: string ({{Field}} placeholders), "index"?: number, "ids"?: [number], "to"?: "document|printer", "path"?: "new PDF document", "printer"?: string, "labels"?: "30|14|10|21", "envelope"?: "10|dl", "returnAddress"?: string, "paper"?: string, "dataFile"?: "contact data file (CSV)"} (no action = open the Mail Merge window)"#,
+            r#"{"contacts": "all|selected", "query"?: string (People search applied to all), "output"?: "email|letters|labels|envelopes|catalog", "fields"?: "all|view", "template"?: "existing document (.txt, .html, .eml)", "action"?: "preview|send (email)|merge (documents)|dataFile|template", "subject"?: string, "body"?: string ({{Field}} placeholders), "index"?: number, "ids"?: [number], "to"?: "document|printer", "path"?: "new PDF document", "printer"?: string, "labels"?: "30|14|10|21", "envelope"?: "10|dl", "returnAddress"?: string, "paper"?: string, "dataFile"?: "contact data file (CSV)"} (no action = open the Mail Merge window)"#,
             true,
             always,
             run_mail_merge,
@@ -2896,6 +3056,121 @@ mod tests {
             s.run("people.mailMerge", &json!({"action": "dataFile"})),
             Err(CmdError::Params(_))
         ));
+    }
+
+    /// Mail Merge: "All contacts in current view" follows the view's filter and the People search (it used to
+    /// take the whole folder), Fields to merge (all fields or the view's), an existing document as the text,
+    /// and the Catalog document type.
+    #[test]
+    fn mail_merge_follows_the_view_and_takes_fields_documents_and_catalogs() {
+        let mut s = session();
+        let ann = add(
+            &mut s,
+            json!({"fullName": "Ann Lee", "company": "Example Co", "email": "ann@example.com",
+                                     "nickname": "Annie", "jobTitle": "Buyer"}),
+        );
+        add(&mut s, json!({"fullName": "Bo Ek", "company": "Other Ltd", "email": "bo@example.org"}));
+        add(&mut s, json!({"fullName": "Cy Ng", "company": "Example Co", "email": "cy@example.net"}));
+        select(&mut s, &[ann]);
+        let count = |s: &mut Session, extra: Value| {
+            let mut p = json!({"contacts": "all", "output": "letters", "action": "preview", "body": "x"});
+            for (k, v) in extra.as_object().unwrap() {
+                p[k] = v.clone();
+            }
+            s.run("people.mailMerge", &p).unwrap()["count"].as_u64().unwrap()
+        };
+        assert_eq!(count(&mut s, json!({})), 3);
+        // The People search box.
+        assert_eq!(count(&mut s, json!({"query": "example co"})), 2);
+        // The view's filter (View Settings › Filter).
+        s.run("view.changeView", &json!({"name": "List"})).unwrap();
+        s.run("view.customFilter", &json!({"filter": {"words": "Other"}})).unwrap();
+        assert_eq!(count(&mut s, json!({})), 1, "only the contacts the view shows");
+        s.run("view.customFilter", &json!({"filter": null})).unwrap();
+        // Fields to merge: every contact field, or the fields of the current view (List here).
+        let r = s.run("people.mailMerge", &json!({"contacts": "all", "fields": "view"})).unwrap();
+        assert_eq!(r["dialog"], "mailMerge");
+        let shown = s.notices.iter().rev().find_map(|n| match n {
+            Notice::OpenDialog(name, p) if name == "mailMerge" => Some(p.clone()),
+            _ => None,
+        });
+        let shown = shown.unwrap();
+        assert_eq!(shown["fieldsChoice"], "view");
+        assert_eq!(
+            shown["fields"],
+            json!([
+                "Full Name",
+                "Job Title",
+                "Company",
+                "File As",
+                "Department",
+                "Business Phone",
+                "Email",
+                "Categories"
+            ])
+        );
+        assert!(shown["allFields"].as_array().unwrap().len() > shown["fields"].as_array().unwrap().len());
+        assert!(matches!(s.run("people.mailMerge", &json!({"fields": "some"})), Err(CmdError::Params(_))));
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let path = |n: &str| dir.path().join(n).display().to_string();
+        let r = s
+            .run(
+                "people.mailMerge",
+                &json!({"contacts": "selected", "action": "dataFile", "fields": "view", "dataFile": path("v.csv")}),
+            )
+            .unwrap();
+        assert_eq!(r["records"], 1);
+        let rows = mailcraft_formats::csv::parse(&std::fs::read_to_string(path("v.csv")).unwrap(), ',');
+        assert_eq!(rows[0].len(), 8, "the view's columns only");
+        assert_eq!(rows[1][1], "Buyer");
+        s.run(
+            "people.mailMerge",
+            &json!({"contacts": "selected", "action": "dataFile", "dataFile": path("a.csv")}),
+        )
+        .unwrap();
+        let rows = mailcraft_formats::csv::parse(&std::fs::read_to_string(path("a.csv")).unwrap(), ',');
+        assert_eq!(rows[0].len(), all_merge_fields().len());
+        let nick = rows[0].iter().position(|h| h == "Nickname").unwrap();
+        assert_eq!(rows[1][nick], "Annie");
+        // An existing document: plain text, HTML or a saved message.
+        std::fs::write(path("letter.txt"), "Dear {{Nickname}},\r\nSee you soon.").unwrap();
+        std::fs::write(path("letter.html"), "<p>Hello <b>{{First Name}}</b></p>").unwrap();
+        std::fs::write(
+            path("note.eml"),
+            "From: me@example.com\r\nSubject: News for {{First Name}}\r\n\r\nHi {{First Name}}.\r\n",
+        )
+        .unwrap();
+        let r = s
+            .run("people.mailMerge", &json!({"action": "template", "template": path("letter.txt")}))
+            .unwrap();
+        assert_eq!(r["body"], "Dear {{Nickname}},\nSee you soon.");
+        let pv = json!({"contacts": "selected", "output": "letters", "action": "preview", "template": path("letter.html")});
+        assert_eq!(
+            s.run("people.mailMerge", &pv).unwrap()["preview"]["text"].as_str().unwrap().trim(),
+            "Hello Ann"
+        );
+        let pv = json!({"contacts": "selected", "output": "email", "action": "preview", "template": path("note.eml")});
+        let r = s.run("people.mailMerge", &pv).unwrap();
+        assert_eq!(r["preview"]["subject"], "News for Ann");
+        assert!(r["preview"]["body"].as_str().unwrap().starts_with("Hi Ann."));
+        std::fs::write(path("bin.doc"), [0u8, 1, 2, 3]).unwrap();
+        assert!(
+            s.run("people.mailMerge", &json!({"action": "template", "template": path("bin.doc")})).is_err()
+        );
+        assert!(
+            s.run("people.mailMerge", &json!({"action": "template", "template": path("none.txt")})).is_err()
+        );
+        // Catalog: every contact one after the other.
+        let cat = json!({"contacts": "all", "output": "catalog", "action": "merge", "path": path("cat.pdf"),
+                         "body": "{{Full Name}} ({{Company}})"});
+        let r = s.run("people.mailMerge", &cat).unwrap();
+        assert_eq!((r["merged"].as_u64(), r["pages"].as_u64()), (Some(3), Some(1)));
+        assert!(std::fs::read(path("cat.pdf")).unwrap().starts_with(b"%PDF"));
+        let mut empty = cat.clone();
+        empty["body"] = json!("");
+        assert!(matches!(s.run("people.mailMerge", &empty), Err(CmdError::Params(_))));
     }
 
     /// Regression: a merge never silently prints fewer contacts than chosen (the page limit), and merged text

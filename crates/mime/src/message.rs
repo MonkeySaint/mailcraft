@@ -466,9 +466,16 @@ impl Part {
     /// Leaf data decoded with the part's charset (HTML `<meta charset>` sniffed when the header has none),
     /// CRLF normalised to LF. `None` for containers.
     pub fn text(&self) -> Option<String> {
+        self.text_as(None)
+    }
+    /// [`Part::text`], decoded with `charset` instead of the one the part declares (`None`: as declared). An
+    /// unknown charset decodes as the part declares.
+    pub fn text_as(&self, charset: Option<&str>) -> Option<String> {
         let data = self.data()?;
-        let charset = match self.content_type.param("charset") {
-            Some(c) if !c.trim().is_empty() => c.to_owned(),
+        let forced = charset.map(str::trim).filter(|c| !c.is_empty() && crate::charset::is_known(c));
+        let charset = match (forced, self.content_type.param("charset")) {
+            (Some(f), _) => f.to_owned(),
+            (None, Some(c)) if !c.trim().is_empty() => c.to_owned(),
             _ if self.content_type.mime_type == "text/html" => {
                 sniff_html_charset(data).unwrap_or_else(|| "utf-8".into())
             }
@@ -717,6 +724,13 @@ impl Message {
     /// Best HTML body, charset-decoded.
     pub fn html_body(&self) -> Option<String> {
         find_body(&self.root, true).and_then(Part::text)
+    }
+    /// The plain-text and HTML bodies decoded with `charset` instead of the declared ones (a message
+    /// labelled with the wrong character set, or none: View › Encoding).
+    pub fn bodies_as(&self, charset: &str) -> (Option<String>, Option<String>) {
+        let text = find_body(&self.root, false).and_then(|p| p.text_as(Some(charset)));
+        let html = find_body(&self.root, true).and_then(|p| p.text_as(Some(charset)));
+        (text, html)
     }
     /// Attachments and inline files (everything that is not the chosen text/html body).
     pub fn attachments(&self) -> Vec<Attachment> {

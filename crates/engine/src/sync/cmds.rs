@@ -88,11 +88,48 @@ pub fn download_headers(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"folder": f.0, "account": account.0, "started": started, "downloaded": 0}))
 }
 
-/// Mark to Download (`copy`: Mark to Download Message Copy) on the selected header-only items.
+/// Downloads header-only items in full now (their accounts' workers fetch them at once, as Process Marked
+/// Headers does for marked ones). Returns how many runs started; items that are not header-only, or whose
+/// account has no mail server, are left alone.
+pub fn download_now(s: &mut Session, ids: &[ItemId]) -> Result<usize, CmdError> {
+    crate::accounts::load_prefs(s);
+    let mut by_account: std::collections::BTreeMap<AccountId, Vec<ItemId>> = Default::default();
+    for id in ids {
+        if !is_header_only(s, *id) {
+            continue;
+        }
+        let Some(acct) = s.mailbox.mail.get(id).and_then(|m| s.mailbox.folder(m.folder)).map(|f| f.account)
+        else {
+            continue;
+        };
+        if server_account(s, acct) {
+            by_account.entry(acct).or_default().push(*id);
+        }
+    }
+    let mut started = 0usize;
+    for (acct, ids) in by_account {
+        let list = s.sync.fetch.entry(acct).or_default();
+        for i in ids {
+            if !list.contains(&i) {
+                list.push(i);
+            }
+        }
+        let plan = Plan { send: false, receive: false, folders: Some(Vec::<FolderId>::new()), user: true };
+        started = started.saturating_add(s.send_receive(&[acct], plan)?);
+    }
+    Ok(started)
+}
+
+/// Mark to Download (`copy`: Mark to Download Message Copy) on the selected header-only items. `now`: download
+/// them at once instead (the reading pane's "Download the rest of this message").
 pub fn mark(s: &mut Session, p: &Value) -> CmdResult {
     crate::accounts::load_prefs(s);
     let copy = opt_bool(p, "copy").unwrap_or(false);
     let ids: Vec<ItemId> = s.target_ids(p).into_iter().filter(|i| is_header_only(s, *i)).collect();
+    if opt_bool(p, "now") == Some(true) {
+        let started = download_now(s, &ids)?;
+        return Ok(json!({"downloading": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "started": started}));
+    }
     let pr = prefs(s);
     for i in &ids {
         pr.marked.insert(i.0, copy);

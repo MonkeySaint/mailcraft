@@ -589,14 +589,37 @@ fn search_tools(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 fn indexing(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let _ = d.u64("remaining");
     window(ctx, app, d, "Indexing Status", 380.0, |ui, app| {
-        let n = d.u64("remaining").unwrap_or(0);
+        // Live: mail still arriving from a send/receive is counted as it comes.
+        let st = mailcraft_engine::search_index::indexing_status(&app.s);
+        let n = st.get("remaining").and_then(Value::as_u64).unwrap_or(0);
         if n == 0 {
             ui.label("All items are indexed.");
         } else {
-            ui.label(format!("{n} items remain to be indexed."));
+            ui.label(format!("{n} items remain to be indexed; they are indexed by the next search."));
         }
-        muted(ui, app, &format!("{} messages searchable.", app.s.mailbox.mail.len()));
+        let kinds = st.get("kinds").and_then(Value::as_array).cloned().unwrap_or_default();
+        egui::Grid::new(("mc-indexing", d.uid)).num_columns(2).show(ui, |ui| {
+            for k in &kinds {
+                ui.label(k.get("label").and_then(Value::as_str).unwrap_or_default());
+                ui.label(format!("{} items", k.get("count").and_then(Value::as_u64).unwrap_or(0)));
+                ui.end_row();
+            }
+        });
+        if let Some(dl) = st.get("downloading").filter(|v| !v.is_null()) {
+            let (done, total) = (
+                dl.get("done").and_then(Value::as_u64).unwrap_or(0),
+                dl.get("total").and_then(Value::as_u64).unwrap_or(0),
+            );
+            let text = if total > 0 {
+                format!("Mail is still being downloaded ({done} of {total}); it is indexed as it arrives.")
+            } else {
+                "Mail is still being downloaded; it is indexed as it arrives.".to_owned()
+            };
+            muted(ui, app, &text);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
         ok_only(ui, app)
     })
 }

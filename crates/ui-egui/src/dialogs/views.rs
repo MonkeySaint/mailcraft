@@ -1087,6 +1087,7 @@ fn conversation(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 #[derive(Clone, Default)]
 struct ZoomState {
     pct: u32,
+    remember: bool,
 }
 
 fn zoom(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -1099,7 +1100,10 @@ fn zoom(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 d.u64("pct").and_then(|v| u32::try_from(v).ok()).unwrap_or_else(|| u32::from(a.s.view.zoom))
             }
         },
+        remember: false,
     };
+    // Opened from a read window: zoom that window (Remember my preference: every window).
+    let read_window = d.u64("id");
     with_state(ctx, app, uid, init, |st, app| {
         window(ctx, app, d, "Zoom", 300.0, |ui, app| {
             ui.label("Zoom to");
@@ -1123,11 +1127,18 @@ fn zoom(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     }
                 });
             }
+            if read_window.is_some() {
+                ui.checkbox(&mut st.remember, "Remember my preference");
+            }
             match ok_cancel(ui, app, true) {
                 Some(true) => {
                     match compose {
                         Some(c) => app.run("format.zoom", json!({"compose": c, "pct": st.pct})),
-                        None => app.run("view.zoom", json!({"pct": st.pct})),
+                        None => match read_window {
+                            Some(id) => app
+                                .run("view.zoom", json!({"pct": st.pct, "id": id, "remember": st.remember})),
+                            None => app.run("view.zoom", json!({"pct": st.pct})),
+                        },
                     };
                     Out::Close
                 }

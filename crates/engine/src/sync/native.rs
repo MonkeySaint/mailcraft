@@ -168,6 +168,27 @@ struct Job {
     jmap: Option<super::jmap::JmapJob>,
     /// Contacts and tasks (CardDAV / CalDAV) and calendar publishing.
     dav: Option<super::dav::DavJob>,
+    /// IMAP: a server search (Search › Include Older Results).
+    search: Option<ImapSearch>,
+    /// JMAP: a server search.
+    jmap_search: Option<super::jmap::JmapSearch>,
+}
+
+/// An IMAP server search: the criteria and, per server folder, its known UIDVALIDITY, the highest UID its
+/// sync has covered (matches above it are new mail for the next sync) and the UIDs held here (those are not
+/// downloaded again).
+struct ImapSearch {
+    generation: u64,
+    criterion: mailcraft_net::search::Criterion,
+    folders: Vec<SearchFolder>,
+}
+
+/// One server folder of an [`ImapSearch`].
+struct SearchFolder {
+    name: String,
+    uidvalidity: u32,
+    up_to: u32,
+    known: Vec<u32>,
 }
 
 /// What a worker listens to between jobs.
@@ -220,6 +241,19 @@ pub(super) enum Event {
         account: AccountId,
         name: String,
         delta: SyncDelta,
+    },
+    /// Headers of messages a server search found in IMAP folder `name` (`total`: matches not held here).
+    Found {
+        account: AccountId,
+        name: String,
+        generation: u64,
+        msgs: Vec<NewMessage>,
+        total: usize,
+    },
+    /// A server search could not run.
+    SearchFailed {
+        account: AccountId,
+        error: String,
     },
     /// Whole messages for items first downloaded as headers (IMAP folder name and UIDs).
     Bodies {
@@ -322,6 +356,8 @@ impl Event {
             | Event::Sent { account, .. }
             | Event::Folders { account, .. }
             | Event::Delta { account, .. }
+            | Event::Found { account, .. }
+            | Event::SearchFailed { account, .. }
             | Event::Bodies { account, .. }
             | Event::FolderFailed { account, .. }
             | Event::Done { account, .. }
@@ -833,7 +869,11 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         pop3: None,
         jmap: None,
         dav,
+        search: None,
+        jmap_search: None,
     };
+    // Search › Include Older Results: a server search waiting for this account.
+    let older = s.sync.older_requests.get(&id).cloned();
     match &mut job.conn.incoming {
         Incoming::Imap(settings) => {
             settings.first_sync_since = window;
@@ -844,11 +884,20 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
             job.then_full =
                 job.headers_only && !force_headers && !slow && opts.download == DownloadMode::HeadersThenFull;
             job.fetch = imap_fetch_list(s, id, &fetch_items);
+            job.search = older.as_ref().and_then(|r| imap_search(s, &a, r));
         }
         Incoming::Pop3(_) => {
             job.pop3 = pop3_job(s, &a, plan.receive, force_headers || slow, &fetch_items, now);
         }
-        Incoming::Jmap(_) => job.jmap = super::jmap::build_job(s, &a, &plan, window),
+        Incoming::Jmap(_) => {
+            job.jmap = super::jmap::build_job(s, &a, &plan, window);
+            job.jmap_search = older.as_ref().and_then(|r| super::jmap::build_search(s, &a, r));
+        }
+    }
+    if older.is_some() && job.search.is_none() && job.jmap_search.is_none() {
+        // Nothing of this account to search after all (no folder of it in the scope).
+        s.sync.older_requests.remove(&id);
+        super::older::run_ended(s, id, None);
     }
     if job.ops.is_empty()
         && job.outgoing.is_empty()
@@ -857,6 +906,8 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         && job.pop3.is_none()
         && job.jmap.is_none()
         && job.dav.is_none()
+        && job.search.is_none()
+        && job.jmap_search.is_none()
     {
         s.sync.fetch.remove(&id);
         s.sync.force_headers.remove(&id);
@@ -873,6 +924,7 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         || job.dav.is_some();
     let progress = if receiving || !job.fetch.is_empty() { "Connecting…" } else { "Sending…" };
     s.sync.rt.submit(id, job)?;
+    s.sync.older_requests.remove(&id);
     s.sync.fetch.remove(&id);
     s.sync.force_headers.remove(&id);
     let run = s.sync.runs.entry(id).or_default();
@@ -1266,7 +1318,9 @@ fn run_job(
         || !job.outgoing.is_empty()
         || !job.fetch.is_empty()
         || job.pop3.is_some()
-        || job.jmap.is_some();
+        || job.jmap.is_some()
+        || job.search.is_some()
+        || job.jmap_search.is_some();
     let res = if !mail_part {
         None
     } else {
@@ -1282,7 +1336,15 @@ fn run_job(
                 if let Some(mut old) = slot.take() {
                     old.disconnect();
                 }
-                super::jmap::run(account, &conn, job.jmap.as_ref(), &job.outgoing, events, cancel)
+                super::jmap::run(
+                    account,
+                    &conn,
+                    job.jmap.as_ref(),
+                    job.jmap_search.as_ref(),
+                    &job.outgoing,
+                    events,
+                    cancel,
+                )
             }
         }
     };
@@ -1417,6 +1479,33 @@ fn run_imap(
                 send(Event::FolderFailed { account, name: name.clone(), error: e.to_string() });
                 if lost {
                     return Some(e.to_string());
+                }
+            }
+        }
+    }
+    // Server search (Search › Include Older Results): headers of the matches not held here.
+    if let Some(sj) = &job.search {
+        progress("Searching the server…");
+        let mut left = super::older::MAX_PER_ACCOUNT;
+        for SearchFolder { name, uidvalidity, up_to, known } in &sj.folders {
+            if cancelled() {
+                return Some("Send/Receive was cancelled.".into());
+            }
+            let max = super::older::MAX_PER_FOLDER.min(left);
+            let t0 = Instant::now();
+            match imap.search_folder(name, &sj.criterion, known, *uidvalidity, *up_to, max) {
+                Ok((msgs, total)) => {
+                    meter.add(raw_len(&msgs), t0.elapsed());
+                    left = left.saturating_sub(msgs.len());
+                    let generation = sj.generation;
+                    send(Event::Found { account, name: name.clone(), generation, msgs, total });
+                }
+                Err(e) => {
+                    let lost = e.is_connection_lost();
+                    send(Event::SearchFailed { account, error: format!("{name}: {e}") });
+                    if lost {
+                        return Some(e.to_string());
+                    }
                 }
             }
         }
@@ -1952,6 +2041,7 @@ pub(super) fn poll_events(s: &mut Session) -> bool {
                 | Event::Folders { .. }
                 | Event::Delta { .. }
                 | Event::Bodies { .. }
+                | Event::Found { .. }
                 | Event::Pop3New { .. }
                 | Event::Pop3Full { .. }
                 | Event::Jmap { .. }
@@ -1999,6 +2089,13 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
             Event::Folders { account, folders } => apply_folders(s, account, folders),
             Event::Delta { account, name, delta } => apply_delta(s, account, &name, delta, &mut new_inbox),
             Event::Bodies { account, name, msgs } => apply_bodies(s, account, &name, msgs),
+            Event::Found { account, name, generation, msgs, total } => {
+                apply_found(s, account, &name, generation, msgs, total);
+            }
+            Event::SearchFailed { account, error } => {
+                log::warn!("server search of account {}: {error}", account.0);
+                s.sync.older.error = Some(error);
+            }
             Event::FolderFailed { account, name, error } => {
                 log::warn!("send/receive: folder {name} of account {}: {error}", account.0);
                 s.sync.runs.entry(account).or_default().error = Some(format!("{name}: {error}"));
@@ -2179,6 +2276,97 @@ fn strip_to_header(s: &mut Session, item: &mut MailItem, size: Option<u64>) {
         item.size = n;
     }
     let _ = s;
+}
+
+/// The IMAP part of a server search for account `a`: the folders of the request that are on the server and
+/// have been synced, with what is known of each.
+///
+/// The next sync of a folder downloads only UIDs above the highest one known (held here or referred to by a
+/// queued change), so a match above that must not be filed here: the sync would then skip every unmatched
+/// message below it. Such matches are new mail the next sync brings anyway. A folder not synced yet has no
+/// such bound and is left out.
+fn imap_search(s: &Session, a: &Account, req: &super::older::Request) -> Option<ImapSearch> {
+    let mut uids: BTreeMap<FolderId, Vec<u32>> = BTreeMap::new();
+    for m in s.mailbox.mail.values() {
+        if req.folders.contains(&m.folder)
+            && let Some(u) = uid_of(m)
+        {
+            uids.entry(m.folder).or_default().push(u);
+        }
+    }
+    let mut queued: BTreeMap<&str, u32> = BTreeMap::new();
+    for p in &a.sync.pending {
+        if let RemoteOp::Flags { folder, uid, .. }
+        | RemoteOp::Move { folder, uid, .. }
+        | RemoteOp::Expunge { folder, uid } = &p.op
+        {
+            let top = queued.entry(folder.as_str()).or_default();
+            *top = (*top).max(*uid);
+        }
+    }
+    let mut folders: Vec<SearchFolder> = Vec::new();
+    for f in s.mailbox.folders.values() {
+        if f.account != a.id || f.kind != FolderKind::Mail || !req.folders.contains(&f.id) {
+            continue;
+        }
+        let Some(name) = &f.remote_name else { continue };
+        let Some(st) = a.sync.folders.get(&f.id).filter(|st| st.uidvalidity != 0) else { continue };
+        let known = uids.remove(&f.id).unwrap_or_default();
+        let mut up_to =
+            known.iter().copied().max().unwrap_or(0).max(queued.get(name.as_str()).copied().unwrap_or(0));
+        if st.uidnext > 0 {
+            up_to = up_to.min(st.uidnext.saturating_sub(1));
+        }
+        if up_to == 0 {
+            continue;
+        }
+        folders.push(SearchFolder { name: name.clone(), uidvalidity: st.uidvalidity, up_to, known });
+    }
+    // Inbox first, then in name order.
+    folders.sort_by_key(|f| (!f.name.eq_ignore_ascii_case("INBOX"), f.name.clone()));
+    (!folders.is_empty()).then(|| ImapSearch {
+        generation: req.generation,
+        criterion: req.criterion.clone(),
+        folders,
+    })
+}
+
+/// Headers a server search found in folder `name`: filed as header-only messages (their bodies download
+/// when opened) and added to the search's results. Old mail: no rules or new-mail alerts.
+fn apply_found(
+    s: &mut Session,
+    account: AccountId,
+    name: &str,
+    generation: u64,
+    msgs: Vec<NewMessage>,
+    total: usize,
+) {
+    let Some(fid) = find_by_remote(&s.mailbox, account, name) else { return };
+    let now = s.now();
+    let mut by_uid: BTreeMap<u32, ItemId> = s
+        .mailbox
+        .mail
+        .values()
+        .filter(|m| m.folder == fid)
+        .filter_map(|m| Some((uid_of(m)?, m.id)))
+        .collect();
+    let mut ids = Vec::new();
+    for nm in msgs {
+        if let Some(id) = by_uid.get(&nm.uid) {
+            ids.push(*id);
+            continue;
+        }
+        let mut item = mailcraft_store::import::item_from_raw(&nm.raw, fid, now);
+        item.remote_id = Some(nm.uid.to_string());
+        apply_server_flags(&mut item, &nm.flags, now);
+        strip_to_header(s, &mut item, nm.size);
+        let id = s.mailbox.add_mail(item);
+        crate::accounts::prefs(s).headers_only.insert(id.0);
+        s.sync.track.created.insert(id);
+        by_uid.insert(nm.uid, id);
+        ids.push(id);
+    }
+    super::older::found(s, generation, &ids, total);
 }
 
 fn apply_bodies(s: &mut Session, account: AccountId, name: &str, msgs: Vec<NewMessage>) {
@@ -2405,6 +2593,7 @@ fn message_sent(s: &mut Session, account: AccountId, item: ItemId, result: Resul
 }
 
 fn run_done(s: &mut Session, account: AccountId, error: Option<String>) {
+    super::older::run_ended(s, account, error.as_deref());
     let now = s.now().unix;
     let run = s.sync.runs.entry(account).or_default();
     run.busy = None;

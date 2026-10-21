@@ -135,6 +135,8 @@ enum Seg {
 pub struct Command {
     segs: Vec<Seg>,
     cur: Vec<u8>,
+    /// The next item follows without a space (just after an opening parenthesis).
+    tight: bool,
 }
 
 fn atom_safe(s: &[u8]) -> bool {
@@ -146,13 +148,50 @@ fn atom_safe(s: &[u8]) -> bool {
 
 impl Command {
     pub fn new(name: &str) -> Command {
-        Command { segs: Vec::new(), cur: name.as_bytes().to_vec() }
+        Command { segs: Vec::new(), cur: name.as_bytes().to_vec(), tight: false }
+    }
+    /// The space before the next item (none right after [`Command::open`]).
+    fn space(&mut self) {
+        if !std::mem::take(&mut self.tight) {
+            self.cur.push(b' ');
+        }
     }
     /// Appends ` raw` verbatim (atoms, sets, parenthesised lists). CR/LF is rejected when sent.
     pub fn raw(mut self, s: &str) -> Command {
-        self.cur.push(b' ');
+        self.space();
         self.cur.extend_from_slice(s.as_bytes());
         self
+    }
+    /// Opens a parenthesised list: ` (`; the next item follows without a space.
+    pub fn open(mut self) -> Command {
+        self.space();
+        self.cur.push(b'(');
+        self.tight = true;
+        self
+    }
+    /// Closes a parenthesised list: `)` right after the last item.
+    pub fn close(mut self) -> Command {
+        self.tight = false;
+        self.cur.push(b')');
+        self
+    }
+    /// The command as it would go on the wire (each literal inline as `{n}` CRLF data), for tests and logs.
+    pub fn wire_preview(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for s in &self.segs {
+            match s {
+                Seg::Text(t) => out.extend_from_slice(t),
+                Seg::Literal { data, binary } => {
+                    if *binary {
+                        out.push(b'~');
+                    }
+                    out.extend_from_slice(format!("{{{}}}\r\n", data.len()).as_bytes());
+                    out.extend_from_slice(data);
+                }
+            }
+        }
+        out.extend_from_slice(&self.cur);
+        out
     }
     /// Appends a string as an atom, quoted string or literal, whichever is valid.
     pub fn string(mut self, s: &[u8], utf8: bool) -> Command {
@@ -160,10 +199,11 @@ impl Command {
             && s.iter().all(|&b| b != 0 && b != b'\r' && b != b'\n')
             && (s.is_ascii() || (utf8 && std::str::from_utf8(s).is_ok()));
         if atom_safe(s) {
-            self.cur.push(b' ');
+            self.space();
             self.cur.extend_from_slice(s);
         } else if quotable {
-            self.cur.extend_from_slice(b" \"");
+            self.space();
+            self.cur.push(b'"');
             for &b in s {
                 if b == b'"' || b == b'\\' {
                     self.cur.push(b'\\');
@@ -178,7 +218,7 @@ impl Command {
     }
     /// Appends a literal (`{n}` or, for `binary`, `~{n}`).
     pub fn literal(mut self, data: &[u8], binary: bool) -> Command {
-        self.cur.push(b' ');
+        self.space();
         let text = std::mem::take(&mut self.cur);
         self.segs.push(Seg::Text(text));
         self.segs.push(Seg::Literal { data: data.to_vec(), binary });
@@ -311,7 +351,7 @@ impl ImapClient {
 
     /// UTF-8 mailbox names and quoted strings: UTF8=ACCEPT (RFC 6855) or IMAP4rev2 (RFC 9051 section 5.1)
     /// enabled. Merely advertising IMAP4rev2 leaves the session in IMAP4rev1 mode.
-    fn utf8(&self) -> bool {
+    pub fn utf8(&self) -> bool {
         self.is_enabled("UTF8=ACCEPT") || self.is_enabled("UTF8=ONLY") || self.is_enabled("IMAP4rev2")
     }
 
@@ -987,8 +1027,14 @@ impl ImapClient {
 
     /// UID SEARCH with raw criteria (`ALL`, `UNSEEN`, `UID 10:*`, `MODSEQ 1234`…).
     pub fn uid_search(&mut self, criteria: &str) -> Result<Vec<u32>> {
+        self.uid_search_command(Command::new("UID SEARCH").raw(criteria))
+    }
+
+    /// A prepared `UID SEARCH` command, its strings already quoted or sent as literals (see
+    /// `crate::search::Criterion::imap_command`).
+    pub fn uid_search_command(&mut self, cmd: Command) -> Result<Vec<u32>> {
         self.require_selected()?;
-        let done = self.run(Command::new("UID SEARCH").raw(criteria))?;
+        let done = self.run(cmd)?;
         let mut ids: Vec<u32> = done
             .untagged
             .into_iter()

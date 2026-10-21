@@ -59,9 +59,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Include Older Results",
             "Search › Options › Search Tools",
             "",
-            r#"{"on"?:bool}"#,
+            r#"{"on"?:bool,"refresh"?:bool} (default: toggle; on with a search in the box searches the servers of the accounts in scope that keep older mail there)"#,
             false,
-            all_local,
+            older_available,
             include_older_results,
         ),
         spec(
@@ -222,15 +222,16 @@ fn summary(s: &Session) -> Value {
         "includeDeleted": s.search.include_deleted,
         "results": hits.len(),
         "hits": top,
+        "older": crate::sync::older::state_json(s),
     })
 }
 
 // ---------------------------------------------------------------------------------------------------------
 // Enabled predicates
 
-/// Every item is held locally (no server-side window), so there are never older results to include.
-fn all_local(_s: &Session) -> Option<&'static str> {
-    Some("all items are already available locally")
+/// Include Older Results needs an online account that keeps older mail on its server (a download window).
+fn older_available(s: &Session) -> Option<&'static str> {
+    crate::sync::older::unavailable(s)
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -245,6 +246,10 @@ fn query(s: &mut Session, p: &Value) -> CmdResult {
     if opt_bool(p, "commit").unwrap_or(false) {
         let q = s.view.search.clone();
         s.search.remember(&q);
+        // Include Older Results: a committed search also goes to the servers.
+        if s.sync.older.on && crate::sync::older::unavailable(s).is_none() {
+            let _ = crate::sync::older::start(s, false);
+        }
     }
     Ok(summary(s))
 }
@@ -281,24 +286,28 @@ fn recent(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "items": items, "placeholder": placeholder, "max": MAX_RECENT }))
 }
 
-fn include_older_results(_s: &mut Session, _p: &Value) -> CmdResult {
-    Ok(json!({ "on": false }))
+fn include_older_results(s: &mut Session, p: &Value) -> CmdResult {
+    crate::sync::older::toggle(s, p)
 }
 
 fn search_tools(s: &mut Session, p: &Value) -> CmdResult {
     match opt_str(p, "tool") {
         None => Ok(dialog(s, "searchTools", json!({}))),
         Some("indexingStatus") => {
-            let remaining = s.search.pending(&s.mailbox);
+            let before = s.search.pending(&s.mailbox);
             let stats = s.search.stats(&s.mailbox);
-            let params =
-                json!({ "remaining": 0, "items": stats.items, "terms": stats.terms, "before": remaining });
-            let mut v = dialog(s, "indexingStatus", params);
-            if let Some(o) = v.as_object_mut() {
-                // `stats` indexed everything that was waiting.
-                o.insert("remaining".into(), json!(0));
-                o.insert("items".into(), json!(stats.items));
+            // `stats` indexed everything that was waiting; the window keeps reporting while mail arrives.
+            let mut params = search_index::indexing_status(s);
+            if let Some(o) = params.as_object_mut() {
+                o.insert("before".into(), json!(before));
                 o.insert("terms".into(), json!(stats.terms));
+                o.insert("indexed".into(), json!(stats.items));
+            }
+            let mut v = dialog(s, "indexingStatus", params.clone());
+            if let (Some(o), Some(p)) = (v.as_object_mut(), params.as_object()) {
+                for (k, x) in p {
+                    o.insert(k.clone(), x.clone());
+                }
             }
             Ok(v)
         }
@@ -701,7 +710,32 @@ pub fn field_conditions(query: &str) -> Vec<Value> {
 /// `search.refine {"kind": "field", "field", "condition", "value"}`: adds (or with `replace`, swaps in) a
 /// form-field condition.
 fn add_field_condition(s: &mut Session, p: &Value) -> CmdResult {
-    let name = opt_str(p, "field").map(str::trim).unwrap_or_default();
+    let term = field_term(
+        opt_str(p, "field").unwrap_or_default(),
+        opt_str(p, "condition"),
+        opt_str(p, "value").unwrap_or_default(),
+    )?;
+    let mut list = terms(&s.view.search);
+    if let Some(old) = opt_str(p, "replace").map(str::trim).filter(|r| !r.is_empty()) {
+        list.retain(|t| !t.eq_ignore_ascii_case(old));
+    }
+    if !list.iter().any(|t| t.eq_ignore_ascii_case(&term)) {
+        list.push(term.clone());
+    }
+    s.view.search = list.join(" ");
+    let mut out = summary(s);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("term".into(), json!(term));
+        o.insert("on".into(), json!(true));
+    }
+    Ok(out)
+}
+
+/// The query term of a form-field condition (`prop:"Field<op>value"`): field label from [`FORM_FIELDS`],
+/// condition id from [`conditions_of`] (default: the type's first), value checked for the field's type.
+/// Advanced Find's "Define more criteria" builds its terms with it too.
+pub fn field_term(field: &str, condition: Option<&str>, value: &str) -> Result<String, CmdError> {
+    let name = field.trim();
     let Some((_, label, ftype)) = FORM_FIELDS.iter().find(|(_, l, _)| {
         l.eq_ignore_ascii_case(name)
             || mailcraft_search::doc::prop_id(l) == mailcraft_search::doc::prop_id(name)
@@ -711,7 +745,7 @@ fn add_field_condition(s: &mut Session, p: &Value) -> CmdResult {
             name.chars().take(60).collect::<String>()
         )));
     };
-    let cond = opt_str(p, "condition").unwrap_or(match ftype {
+    let cond = condition.unwrap_or(match ftype {
         FieldType::Text => "contains",
         FieldType::Date => "on",
         FieldType::Number => "equals",
@@ -721,7 +755,7 @@ fn add_field_condition(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params(format!("`{label}` has no condition `{cond}`")));
     };
     let no_value = matches!(*cid, "isEmpty" | "isNotEmpty");
-    let raw = opt_str(p, "value").map(str::trim).unwrap_or_default().replace('"', "");
+    let raw = value.trim().replace('"', "");
     let value = if no_value { String::new() } else { raw };
     if !no_value && value.is_empty() {
         return Err(CmdError::Params(format!("`{label}` {cond} needs a value")));
@@ -738,21 +772,7 @@ fn add_field_condition(s: &mut Session, p: &Value) -> CmdResult {
         },
         _ => value,
     };
-    let term = format!("prop:\"{label}{op}{value}\"");
-    let mut list = terms(&s.view.search);
-    if let Some(old) = opt_str(p, "replace").map(str::trim).filter(|r| !r.is_empty()) {
-        list.retain(|t| !t.eq_ignore_ascii_case(old));
-    }
-    if !list.iter().any(|t| t.eq_ignore_ascii_case(&term)) {
-        list.push(term.clone());
-    }
-    s.view.search = list.join(" ");
-    let mut out = summary(s);
-    if let Some(o) = out.as_object_mut() {
-        o.insert("term".into(), json!(term));
-        o.insert("on".into(), json!(true));
-    }
-    Ok(out)
+    Ok(format!("prop:\"{label}{op}{value}\""))
 }
 
 /// A date as `YYYY-MM-DD` (accepts `YYYY-M-D` and `YYYY/MM/DD`).
@@ -1181,11 +1201,16 @@ mod tests {
         s.view.search = "budget".into();
         s.view.search_scope = SearchScope::CurrentMailbox;
         assert!(results(&s).is_empty());
+        // All Items too (regression: it searched Deleted Items whatever Include Deleted Items said).
         s.view.search_scope = SearchScope::AllItems;
-        assert_eq!(results(&s).len(), 1);
+        assert!(results(&s).is_empty());
         s.view.search_scope = SearchScope::CurrentMailbox;
         run(&mut s, "search.scope", json!({"includeDeleted": true, "scope": "currentMailbox"}));
         assert_eq!(results(&s).len(), 1);
+        run(&mut s, "search.scope", json!({"scope": "allItems"}));
+        assert_eq!(results(&s).len(), 1, "Include Deleted Items on: All Items finds it");
+        run(&mut s, "search.scope", json!({"includeDeleted": false}));
+        assert!(results(&s).is_empty());
     }
 
     #[test]
@@ -1542,7 +1567,11 @@ mod tests {
         assert_eq!(run(&mut s, "search.searchTools", json!({}))["dialog"], "searchTools");
         let r = run(&mut s, "search.searchTools", json!({"tool": "indexingStatus"}));
         assert_eq!(r["remaining"], 0);
-        assert_eq!(r["items"], 1);
+        // Per kind, not only the mail (regression: the window showed the message count alone).
+        assert_eq!(r["kinds"][0], json!({"kind": "mail", "label": "Mail", "count": 1}));
+        assert_eq!(r["kinds"].as_array().unwrap().len(), 5);
+        assert_eq!(r["items"], r["indexed"]);
+        assert!(r["downloading"].is_null(), "nothing is being downloaded");
         assert!(matches!(s.notices.last(), Some(Notice::OpenDialog(n, _)) if n == "indexingStatus"));
         assert!(s.run("search.searchTools", &json!({"tool": "x"})).is_err());
         assert!(matches!(s.run("search.includeOlderResults", &json!({})), Err(CmdError::Disabled(_))));

@@ -79,7 +79,150 @@ pub fn specs() -> Vec<CommandSpec> {
             get,
         ),
         spec("options.reset", "Reset Options", r#"{"key"?: string} (no key = every option)"#, reset),
+        spec(
+            "options.translator",
+            "Translation Server",
+            r#"{"url"?: string ("" = none), "apiKey"?: string|null (null or "" removes it), "test"?: bool (translate a sample through `url`/`apiKey` as given, else the stored ones; stores nothing)}"#,
+            translator,
+        ),
     ]
+}
+
+/// Longest translation server API key (characters).
+const MAX_API_KEY: usize = 512;
+
+/// Options › Language › Translation server. Without `test`: `url` sets the server address (checked first;
+/// "" means none) and `apiKey` stores the API key in the secret store (`null` or "" removes it). With
+/// `test`: translates a short sample through the server given (`url`, `apiKey`), else the stored one, and
+/// reports the result; nothing is stored. The key itself is never returned.
+fn translator(s: &mut Session, p: &Value) -> CmdResult {
+    let url = opt_str(p, "url").map(|u| u.trim().to_owned());
+    let key: Option<Option<String>> = match p.get("apiKey") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(k)) => {
+            let k = k.trim();
+            if k.chars().count() > MAX_API_KEY || k.chars().any(char::is_control) {
+                return Err(CmdError::Params("the API key is not valid".into()));
+            }
+            Some((!k.is_empty()).then(|| k.to_owned()))
+        }
+        Some(_) => return Err(CmdError::Params("`apiKey` must be a string or null".into())),
+    };
+    if let Some(u) = &url
+        && !u.is_empty()
+    {
+        check_translator_url(s, u)?;
+    }
+    if opt_bool(p, "test") == Some(true) {
+        return test_translator(s, url.as_deref(), key);
+    }
+    if let Some(u) = &url {
+        set_option(s, crate::translate::URL_SETTING, &json!(u))?;
+    }
+    if let Some(k) = key {
+        let r = match k {
+            Some(k) => s.secrets.set(crate::translate::KEY_SECRET, &k),
+            None => s.secrets.remove(crate::translate::KEY_SECRET),
+        };
+        r.map_err(|e| CmdError::Failed(format!("the API key could not be stored: {e}")))?;
+    }
+    Ok(json!({
+        "url": s.settings.text(crate::translate::URL_SETTING),
+        "apiKey": s.secrets.get(crate::translate::KEY_SECRET).is_some(),
+        "keyStore": s.secrets.location(),
+    }))
+}
+
+/// The translation server address changed from `old`: the stored API key was for that server, so it is
+/// removed rather than sent to the new one (the user enters the new server's key if it needs one).
+fn forget_key_of_old_server(s: &mut Session, old: &str) {
+    let now = s.settings.text(crate::translate::URL_SETTING);
+    if old.trim().is_empty()
+        || same_translator(old, &now)
+        || s.secrets.get(crate::translate::KEY_SECRET).is_none()
+    {
+        return;
+    }
+    match s.secrets.remove(crate::translate::KEY_SECRET) {
+        Ok(()) => s.notify(crate::Notice::Info(
+            "The translation server changed, so the API key kept for the old one was removed. Enter the new \
+             server's key if it needs one."
+                .into(),
+        )),
+        Err(e) => s.notify(crate::Notice::Error(format!(
+            "The translation server changed but the old server's API key could not be removed: {e}"
+        ))),
+    }
+}
+
+/// Refuses a translation server address that cannot be used (not http(s), or plain http to another computer).
+#[cfg(not(target_arch = "wasm32"))]
+fn check_translator_url(_s: &Session, url: &str) -> Result<(), CmdError> {
+    let o = mailcraft_net::translate::LibreTranslate::default_options();
+    mailcraft_net::translate::LibreTranslate::new(url, None, o)
+        .map(|_| ())
+        .map_err(|e| CmdError::Params(format!("translation server: {e}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn check_translator_url(_s: &Session, _url: &str) -> Result<(), CmdError> {
+    Err(CmdError::Disabled("a translation server cannot be used in the browser".into()))
+}
+
+/// A sample sentence the Test button translates.
+#[cfg(not(target_arch = "wasm32"))]
+const TEST_TEXT: &str = "Thank you for your message. I will reply tomorrow.";
+
+/// True when two translation server addresses name the same server (ignoring surrounding spaces and a
+/// trailing slash).
+pub(crate) fn same_translator(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/')
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn test_translator(s: &mut Session, url: Option<&str>, key: Option<Option<String>>) -> CmdResult {
+    let stored = s.settings.text(crate::translate::URL_SETTING);
+    let url = url.map_or_else(|| stored.clone(), str::to_owned);
+    if url.trim().is_empty() {
+        return Err(CmdError::Params("enter the address of a translation server first".into()));
+    }
+    // The stored key belongs to the stored server: a different address is tested with the key typed for it
+    // (or none), never with that one.
+    let key = match key {
+        Some(k) => k,
+        None if same_translator(&url, &stored) => s.secrets.get(crate::translate::KEY_SECRET),
+        None => None,
+    };
+    let options = s
+        .translator_options
+        .clone()
+        .unwrap_or_else(mailcraft_net::translate::LibreTranslate::default_options);
+    let lt = mailcraft_net::translate::LibreTranslate::new(&url, key.as_deref(), options)
+        .map_err(|e| CmdError::Params(format!("translation server: {e}")))?;
+    let mut to = s.settings.text("language.translateTo");
+    if to.split(['-', '_']).next().is_some_and(|p| p.eq_ignore_ascii_case("en")) {
+        to = "fr".into();
+    }
+    let work = move || {
+        let (text, _) = lt
+            .translate(TEST_TEXT, &to)
+            .map_err(|e| format!("the translation server did not translate: {e}"))?;
+        Ok(
+            json!({"ok": true, "to": to, "sample": TEST_TEXT, "text": text.chars().take(500).collect::<String>()}),
+        )
+    };
+    if s.background_translate {
+        // The desktop app: the answer comes later (`translate::take_test_result`), the window stays usable.
+        crate::translate::start_test(s, work).map_err(CmdError::Failed)?;
+        return Ok(json!({"testing": true}));
+    }
+    work().map_err(CmdError::Failed)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn test_translator(_s: &mut Session, _url: Option<&str>, _key: Option<Option<String>>) -> CmdResult {
+    Err(CmdError::Disabled("a translation server cannot be used in the browser".into()))
 }
 
 fn open(s: &mut Session, p: &Value) -> CmdResult {
@@ -206,8 +349,17 @@ pub fn set_option(s: &mut Session, key: &str, v: &Value) -> Result<Value, CmdErr
             if settings::def(key).is_none() {
                 return Err(CmdError::Disabled(format!("option `{}` is not supported", clip(key))));
             }
+            let translator_was = (key == crate::translate::URL_SETTING).then(|| s.settings.text(key));
+            if key == crate::translate::URL_SETTING
+                && let Some(u) = v.as_str().map(str::trim).filter(|u| !u.is_empty())
+            {
+                check_translator_url(s, u)?;
+            }
             s.settings.set(key, v)?;
             s.apply_setting(key);
+            if let Some(old) = translator_was {
+                forget_key_of_old_server(s, &old);
+            }
         }
     }
     if let Err(e) = s.save_settings() {

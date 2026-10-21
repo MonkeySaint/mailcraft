@@ -601,3 +601,24 @@ fn pdf_never_embeds_a_restricted_font() {
     assert!(has(&pdf_with(0x0006), b"LiberationMono"));
     assert!(!has(&pdf_with(0x0200), b"LiberationMono"), "bitmap embedding only");
 }
+
+#[test]
+fn catalog_runs_the_records_on_from_page_to_page() {
+    let f = fonts();
+    let recs: Vec<String> = (0..60).map(|i| format!("Person {i}\n555-01{i:02}\n")).collect();
+    let refs: Vec<&str> = recs.iter().map(String::as_str).collect();
+    let pages = paginate(&merge(MergeStyle::Catalog, &refs), &blank(), &ctx(), &f);
+    // Records share a page, a blank line apart, and run on to the next page.
+    assert_eq!(texts(&pages[0])[..4], ["Person 0", "555-0100", "Person 1", "555-0101"]);
+    assert!(pages.len() >= 2 && pages.len() < 60, "{} pages", pages.len());
+    let all: Vec<String> = pages.iter().flat_map(|p| texts(p).into_iter().map(str::to_owned)).collect();
+    assert_eq!(all.len(), 120, "every line of every record is printed once");
+    assert_eq!(max_records(&MergeStyle::Catalog), MAX_RECORDS);
+    let doc = MergeDoc { style: MergeStyle::Catalog, records: recs.clone(), return_address: String::new() };
+    assert_eq!(paginate_merge(&doc, &blank(), &ctx(), &f).1, 60);
+    // Hostile records still stop at the page limit.
+    let long = "line\n".repeat(4_000);
+    let big = MergeDoc { style: MergeStyle::Catalog, records: vec![long; 40], return_address: String::new() };
+    let (pages, placed) = paginate_merge(&big, &blank(), &ctx(), &f);
+    assert!(pages.len() <= MAX_PAGES && placed < 40 && placed > 0, "{placed}");
+}

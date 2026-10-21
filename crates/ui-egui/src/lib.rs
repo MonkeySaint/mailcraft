@@ -80,6 +80,8 @@ pub struct UiState {
     pub single_pane_reading: bool,
     /// Toast / status message and when it expires (seconds, egui time).
     pub toast: Option<(String, f64)>,
+    /// Pages to open in the system browser (View in Browser), opened at the next frame.
+    pub open_urls: Vec<String>,
     /// Keytip mode (Alt pressed): typed sequence so far.
     pub keytips: Option<String>,
     /// Hovered list row (for hover quick actions).
@@ -372,6 +374,9 @@ impl App {
     pub fn new(mut s: Session) -> App {
         // Internet calendars are fetched on the UI's worker threads (`modules::calendar_background`).
         s.sync.background_calendars = true;
+        // Translations go to the translation server on a worker thread, so a slow server never freezes the
+        // window (`mailcraft_engine::translate`).
+        s.background_translate = true;
         let theme = theme::Theme::for_dark(s.view.dark);
         App { s, ui: UiState::default(), theme, icons: icons::Icons::default(), files: None }
     }
@@ -388,7 +393,7 @@ impl App {
         if self.s.poll_sync() {
             ctx.request_repaint();
         }
-        if self.s.sync_busy() {
+        if self.s.sync_busy() || mailcraft_engine::translate::busy(&self.s) {
             ctx.request_repaint_after(std::time::Duration::from_millis(SYNC_BUSY_REPAINT_MS));
         } else if !self.s.sync_status().accounts.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_secs(SYNC_IDLE_REPAINT_SECS));

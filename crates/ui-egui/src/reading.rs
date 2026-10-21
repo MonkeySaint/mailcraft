@@ -757,6 +757,10 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     // S/MIME: a signed or encrypted message is shown opened (verified, decrypted); a valid signer's
     // certificate is remembered for encrypted replies.
     mailcraft_engine::smime::on_view(&mut app.s, ItemId(id));
+    // A message a server search found (Include Older Results) downloads in full when it is opened.
+    mailcraft_engine::sync::older::opened(&mut app.s, ItemId(id));
+    // Options › Language › Always translate: a message in another language is translated when first shown.
+    mailcraft_engine::translate::auto_translate(&mut app.s, ItemId(id));
     let Some(h) = queries::reading_header(&app.s, ItemId(id)) else {
         empty_state(ui, app);
         return;
@@ -806,7 +810,12 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
         app.theme.dark && !tg.light_bg.contains(&id) && !app.s.settings.bool("general.keepMessageBackground");
     // Trust Center › "Don't download pictures automatically" (on by default).
     let allow_remote = !links_off && (tg.pictures.contains(&id) || !app.s.settings.bool("trust.blockImages"));
-    let zoom = match app.s.view.zoom {
+    // A read window can be zoomed on its own (Message › Zoom); the reading pane uses the shared zoom.
+    let pct = match surface {
+        Surface::Read(_) => mailcraft_engine::cmd::view::read_zoom(&app.s, ItemId(id)),
+        _ => app.s.view.zoom,
+    };
+    let zoom = match pct {
         0 => 1.0,
         z => f32::from(z) / 100.0,
     };
@@ -857,7 +866,9 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             if cache.remote_images && !allow_remote {
                 pictures_bar(ui, app, id);
             }
+            header_only_bar(ui, app, id);
             translation_bar(ui, app, id);
+            translate_offer_bar(ui, app, id);
             info_top
         });
         ui.add_space(10.0);
@@ -1291,6 +1302,12 @@ fn security_bars(ui: &mut Ui, app: &mut App, id: u64) {
 
 /// Translate Message on a received message: which translation shows, with a switch to the original.
 fn translation_bar(ui: &mut Ui, app: &mut App, id: u64) {
+    if mailcraft_engine::translate::pending(&app.s, ItemId(id)) {
+        // The translation server is working on it (on a worker thread; the window stays usable).
+        ui.add_space(6.0);
+        info_bar(ui, app, "email", "Translating this message…", None);
+        return;
+    }
     let Some(t) = app.s.translations.get(&ItemId(id)).cloned() else { return };
     let lang = mailcraft_engine::translate::language_name(&t.to).unwrap_or(t.to.as_str()).to_owned();
     let (text, action) = if t.show_original {
@@ -1302,6 +1319,31 @@ fn translation_bar(ui: &mut Ui, app: &mut App, id: u64) {
     if info_bar(ui, app, "email", &text, Some(action)) {
         // Show Original switches between the translation and the original.
         app.run("review.translate", json!({"id": id, "showOriginal": true}));
+    }
+}
+
+/// A message of which only the header was downloaded: say so, with a link that downloads the rest now.
+fn header_only_bar(ui: &mut Ui, app: &mut App, id: u64) {
+    if !queries::is_server_header_only(&app.s, ItemId(id)) {
+        return;
+    }
+    ui.add_space(6.0);
+    let text = "Only the header of this message has been downloaded.";
+    if info_bar(ui, app, "sync", text, Some("Download the rest of the message")) {
+        app.run("sendReceive.markToDownload", json!({"ids": [id], "now": true}));
+    }
+}
+
+/// Options › Language › Ask me before translating: a message that seems to be in another language offers
+/// a translation (the language is told on this computer; nothing is sent until the link is clicked).
+fn translate_offer_bar(ui: &mut Ui, app: &mut App, id: u64) {
+    let Some((from, to)) = mailcraft_engine::translate::offer(&app.s, ItemId(id)) else { return };
+    let name = |t: &str| mailcraft_engine::translate::language_name(t).unwrap_or(t).to_owned();
+    let text = format!("This message seems to be in {}.", name(from));
+    let link = format!("Translate it into {}", name(&to));
+    ui.add_space(6.0);
+    if info_bar(ui, app, "email", &text, Some(&link)) {
+        app.run("review.translate", json!({"id": id}));
     }
 }
 
@@ -2201,5 +2243,29 @@ mod tests {
         assert_eq!(crate::keys::window_pane(&h.ctx, surface).as_deref(), Some("ribbon"));
         // The main window's own F6 state is untouched.
         assert_eq!(crate::keys::focused_pane(&h.ctx), None);
+    }
+
+    /// Options › Language › Ask me before translating: a message in another language offers a translation,
+    /// but only once a translation server is set up (nothing is offered or sent by default).
+    #[test]
+    fn a_message_in_another_language_offers_a_translation_once_a_server_is_set_up() {
+        let french = "Bonjour, merci pour votre message. Nous avons reçu les documents et nous vous \
+                      répondrons dans la semaine avec une proposition pour le projet.";
+        let (app, _) = app_with_text(french);
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("seems to be in French").is_none(), "no server: no offer");
+        let mut app = h.into_state();
+        // A local address; nothing is sent until the link is clicked.
+        app.run("options.translator", json!({"url": "http://127.0.0.1:9"})).unwrap();
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.query_by_label("This message seems to be in French.").is_some());
+        assert!(h.query_by_label("Translate it into English").is_some());
+        let mut app = h.into_state();
+        app.run("options.set", json!({"key": "language.translate", "value": "never"})).unwrap();
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("seems to be in French").is_none());
     }
 }

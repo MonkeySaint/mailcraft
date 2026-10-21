@@ -1367,3 +1367,43 @@ fn add_holidays_window_adds_the_chosen_countries() {
     assert!(s.mailbox.appointments.values().any(|a| a.subject == "Canada Day" && a.location == "Canada"));
     assert!(h.query_by_label_contains("holidays were added").is_some());
 }
+
+/// Advanced Find › Advanced: "Define more criteria" adds form-field conditions (the engine's fields and
+/// conditions) to the search instead of only showing the query.
+#[test]
+fn advanced_find_defines_more_criteria() {
+    let mut app = sample_app();
+    app.run("search.advancedFind", json!({})).unwrap();
+    let mut h = harness(app);
+    h.get_by_label("Advanced").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Define more criteria:").is_some());
+    // Subject contains (the first field and condition) with an empty value is refused…
+    h.get_by_label("Add to List").click();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("needs a value").is_some());
+    // …a value adds the criterion, shown in the list and in the search text.
+    h.get_by_label("Value:").focus();
+    h.run_steps(1);
+    h.get_by_label("Value:").type_text("quarterly");
+    h.run_steps(1);
+    h.get_by_label("Add to List").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Subject contains quarterly").is_some());
+    assert!(h.query_by_label_contains("prop:\"Subject~quarterly\"").is_some());
+    h.get_by_label("Remove").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Subject contains quarterly").is_none());
+}
+
+/// View in Browser: the engine's page opens in the system browser (only local files are accepted).
+#[test]
+fn view_in_browser_opens_the_written_page() {
+    let mut app = sample_app();
+    crate::dialogs::open(&mut app, "openUrl", json!({"url": "file:///home/user/page.html"}));
+    crate::dialogs::open(&mut app, "openUrl", json!({"url": "https://example.com/"}));
+    assert_eq!(app.ui.open_urls, ["file:///home/user/page.html"]);
+    let mut h = harness(app);
+    h.run_steps(1);
+    assert!(h.state().ui.open_urls.is_empty(), "opened at the next frame");
+}

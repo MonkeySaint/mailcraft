@@ -533,6 +533,11 @@ fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value 
                 if after.is_some_and(|a| t < a) || before.is_some_and(|b| t >= b) {
                     continue;
                 }
+                if let Some(f) = args.get("filter")
+                    && !filter_matches(f, m, &mailbox_id(&mb.name), 0)
+                {
+                    continue;
+                }
                 let id = email_id(&m.raw, &m.internal_date);
                 if seen.insert(id.clone()) {
                     all.push((m.internal_date.unix, id));
@@ -557,6 +562,53 @@ fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value 
     let ids: Vec<String> = all.into_iter().skip(pos).take(limit).map(|(_, i)| i).collect();
     json!({"accountId": ACCOUNT, "queryState": "q0", "canCalculateChanges": false, "position": pos,
         "ids": ids, "total": total})
+}
+
+/// RFC 8621 section 4.4.1 filters, as far as tests need them: FilterOperator (AND, OR, NOT) and the
+/// conditions text, from, to, cc, subject, body (case-insensitive substring of the header field or the
+/// whole message), hasKeyword / notKeyword, inMailbox, minSize / maxSize. `after` / `before` are applied by
+/// the caller. Unknown conditions match.
+fn filter_matches(f: &Value, m: &crate::store::Msg, mailbox: &str, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    if let Some(op) = f.get("operator").and_then(Value::as_str) {
+        let list: Vec<&Value> =
+            f.get("conditions").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
+        let mut hits = list.iter().map(|c| filter_matches(c, m, mailbox, depth + 1));
+        return match op {
+            "AND" => hits.all(|x| x),
+            "OR" => hits.any(|x| x),
+            "NOT" => !hits.any(|x| x),
+            _ => false,
+        };
+    }
+    let raw = String::from_utf8_lossy(&m.raw).to_lowercase();
+    let header_end = raw.find("\r\n\r\n").or_else(|| raw.find("\n\n")).unwrap_or(raw.len());
+    let (head, body) = raw.split_at(header_end);
+    let field = |name: &str| -> String {
+        head.lines()
+            .filter(|l| l.starts_with(&format!("{name}:")))
+            .map(|l| l.get(name.len() + 1..).unwrap_or("").to_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let has_kw = |k: &str| m.has_flag(&keyword_to_flag(k));
+    let obj = f.as_object().cloned().unwrap_or_default();
+    obj.iter().all(|(k, v)| {
+        let text = v.as_str().map(str::to_lowercase).unwrap_or_default();
+        match k.as_str() {
+            "text" => raw.contains(&text),
+            "from" | "to" | "cc" | "subject" => field(k).contains(&text),
+            "body" => body.contains(&text),
+            "hasKeyword" => has_kw(&text),
+            "notKeyword" => !has_kw(&text),
+            "inMailbox" => v.as_str() == Some(mailbox),
+            "minSize" => v.as_u64().is_none_or(|n| m.raw.len() as u64 >= n),
+            "maxSize" => v.as_u64().is_none_or(|n| (m.raw.len() as u64) < n),
+            _ => true,
+        }
+    })
 }
 
 /// A JMAP `UTCDate` (`2026-10-05T00:00:00Z`) as Unix seconds.

@@ -307,6 +307,127 @@ fn first_download_takes_the_past_months_only() {
     assert!(find(&s, ib, "Fresh").is_some() && find(&s, ib, "Old news").is_some());
 }
 
+/// Search › Include Older Results: with a download window, mail older than the window is only on the server;
+/// a search with the toggle on finds it there (IMAP UID SEARCH, JMAP Email/query), adds it to the results,
+/// and opening an IMAP match (headers only) downloads the whole message.
+#[test]
+fn include_older_results_searches_the_server() {
+    let srv = servers(Config::default());
+    let now = DateTime::now().unix;
+    let old = DateTime::from_unix(now - 200 * 86_400);
+    srv.seed_message_at(ALICE, "INBOX", &message("Old budget", "The archived figures."), &[], old).unwrap();
+    srv.seed_message_at(ALICE, "INBOX", &message("Old lunch", "Nothing to see."), &[], old).unwrap();
+    srv.seed_message(ALICE, "INBOX", &message("Fresh budget", "From today."), &[]).unwrap();
+
+    let mut s = session();
+    // No server account with a window yet: unavailable, as observed.
+    assert!(s.enabled("search.includeOlderResults").is_some());
+    let a = add_imap(&mut s, &srv, json!({"downloadMonths": 3}));
+    sync(&mut s);
+    let ib = inbox(&s, a);
+    assert!(find(&s, ib, "Old budget").is_none());
+    assert!(s.enabled("search.includeOlderResults").is_none(), "an account keeps older mail on its server");
+
+    s.selection.folder = ib;
+    run(&mut s, "search.scope", json!({"scope": "currentFolder"}));
+    run(&mut s, "search.query", json!({"text": "budget", "commit": true}));
+    let fresh = find(&s, ib, "Fresh budget").unwrap();
+    assert_eq!(mailcraft_engine::search_index::results(&s), [fresh]);
+
+    let r = run(&mut s, "search.includeOlderResults", json!({"on": true}));
+    assert_eq!(r["on"], true);
+    assert_eq!(r["started"], 1);
+    assert!(s.wait_for_sync(WAIT), "server search timed out: {:?}", s.sync_status());
+    let old_id = find(&s, ib, "Old budget").expect("the server match was added");
+    assert!(find(&s, ib, "Old lunch").is_none(), "only matches come back");
+    assert!(cmds::is_header_only(&s, old_id), "found mail arrives as headers");
+    let results = mailcraft_engine::search_index::results(&s);
+    assert!(results.contains(&fresh) && results.contains(&old_id), "{results:?}");
+    let st = run(&mut s, "search.query", json!({"text": "budget"}));
+    assert_eq!(st["older"]["hits"], 1, "{st}");
+    assert_eq!(st["older"]["searching"], false);
+
+    // Searching again does not download the same match twice.
+    run(&mut s, "search.includeOlderResults", json!({"on": true, "refresh": true}));
+    assert!(s.wait_for_sync(WAIT));
+    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Old budget").count(), 1);
+
+    // Opening it downloads the whole message.
+    s.selection.items = vec![old_id];
+    s.selection.focus = Some(old_id);
+    let r = run(&mut s, "mail.open", json!({"ids": [old_id.0]}));
+    assert_eq!(r["downloading"], true);
+    assert!(s.wait_for_sync(WAIT));
+    assert!(!cmds::is_header_only(&s, old_id));
+    assert!(s.mailbox.mail[&old_id].body.text.as_deref().unwrap_or_default().contains("archived figures"));
+
+    // Off again; the downloaded message now matches locally on its body text.
+    assert_eq!(run(&mut s, "search.includeOlderResults", json!({"on": false}))["on"], false);
+    run(&mut s, "search.query", json!({"text": "archived", "commit": true}));
+    assert_eq!(mailcraft_engine::search_index::results(&s), [old_id], "now held locally in full");
+
+    // JMAP: Email/query with the same window.
+    let mut s = session();
+    let j = id_of(&run(
+        &mut s,
+        "accounts.add",
+        json!({"kind": "jmap", "address": ALICE, "incoming": {"host": srv.jmap_url(), "extraRootPem": srv.cert_pem},
+               "password": ALICE_PW, "downloadMonths": 3}),
+    ));
+    sync(&mut s);
+    let ib = inbox(&s, j);
+    assert!(find(&s, ib, "Old lunch").is_none());
+    s.selection.folder = ib;
+    run(&mut s, "search.query", json!({"text": "lunch", "commit": true}));
+    assert!(mailcraft_engine::search_index::results(&s).is_empty());
+    run(&mut s, "search.includeOlderResults", json!({"on": true}));
+    assert!(s.wait_for_sync(WAIT), "JMAP search timed out: {:?}", s.sync_status());
+    let lunch = find(&s, ib, "Old lunch").expect("JMAP match added");
+    assert!(find(&s, ib, "Old budget").is_none());
+    assert_eq!(mailcraft_engine::search_index::results(&s), [lunch]);
+    assert!(!cmds::is_header_only(&s, lunch), "JMAP matches arrive whole");
+
+    // Working offline: unavailable.
+    s.view.work_offline = true;
+    assert!(s.enabled("search.includeOlderResults").is_some());
+}
+
+/// Regression: a server search must not file mail that arrived after the last sync. The next sync fetches
+/// only UIDs above the highest one held, so a new match filed by the search made it skip the new messages
+/// below it that did not match ("New lunch" never arrived).
+#[test]
+fn include_older_results_leaves_new_mail_to_the_sync() {
+    let srv = servers(Config::default());
+    let now = DateTime::now().unix;
+    let old = DateTime::from_unix(now - 200 * 86_400);
+    srv.seed_message_at(ALICE, "INBOX", &message("Old budget", "The archived figures."), &[], old).unwrap();
+    srv.seed_message(ALICE, "INBOX", &message("Fresh notes", "From today."), &[]).unwrap();
+
+    let mut s = session();
+    let a = add_imap(&mut s, &srv, json!({"downloadMonths": 3}));
+    sync(&mut s);
+    let ib = inbox(&s, a);
+    assert!(find(&s, ib, "Fresh notes").is_some() && find(&s, ib, "Old budget").is_none());
+
+    // New mail after the sync: one message that does not match, then one that does (higher UID).
+    srv.seed_message(ALICE, "INBOX", &message("New lunch", "Nothing to see."), &[]).unwrap();
+    srv.seed_message(ALICE, "INBOX", &message("New budget", "Next year."), &[]).unwrap();
+
+    s.selection.folder = ib;
+    run(&mut s, "search.scope", json!({"scope": "currentFolder"}));
+    run(&mut s, "search.query", json!({"text": "budget", "commit": true}));
+    run(&mut s, "search.includeOlderResults", json!({"on": true}));
+    assert!(s.wait_for_sync(WAIT), "server search timed out: {:?}", s.sync_status());
+    assert!(find(&s, ib, "Old budget").is_some(), "the old match is found");
+    assert!(find(&s, ib, "New budget").is_none(), "new mail is left to the sync");
+
+    sync(&mut s);
+    assert!(find(&s, ib, "New lunch").is_some(), "the unmatched new message still downloads");
+    let new_budget = find(&s, ib, "New budget").expect("the new match downloads with the sync");
+    assert!(!cmds::is_header_only(&s, new_budget));
+    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "New budget").count(), 1);
+}
+
 #[test]
 fn slow_connections_download_only_headers() {
     let srv = servers(Config::default());

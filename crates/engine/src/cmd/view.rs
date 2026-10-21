@@ -359,7 +359,16 @@ pub fn specs() -> Vec<CommandSpec> {
             has_folder,
             view_settings,
         ),
-        spec("view.zoom", "Zoom", "Message › Zoom", "", r#"{"pct"?:number}"#, false, always, zoom),
+        spec(
+            "view.zoom",
+            "Zoom",
+            "Message › Zoom",
+            "",
+            r#"{"pct"?:number, "ids"?:[number] (a read window's message: zoom that window only), "remember"?:bool (also the reading pane's and every window's default)}"#,
+            false,
+            always,
+            zoom,
+        ),
     ]
     .into_iter()
     .chain(mail::specs())
@@ -1485,10 +1494,30 @@ fn normal_view(s: &mut Session, _p: &Value) -> CmdResult {
     Ok(json!({ "readingView": false, "shown": pinned_panes(s) }))
 }
 
+/// Zoom of the read window of message `id` (its own zoom, else the shared one).
+pub fn read_zoom(s: &Session, id: mailcraft_model::ItemId) -> u16 {
+    s.read_zoom.get(&id).copied().unwrap_or(s.view.zoom)
+}
+
+/// Most read windows with a zoom of their own remembered.
+const MAX_READ_ZOOMS: usize = 256;
+
+/// Zoom: the reading pane and every read window share `view.zoom`; with `id` (a read window) only that
+/// window changes, unless `remember` (Remember my preference) makes it everyone's default too.
 fn zoom(s: &mut Session, p: &Value) -> CmdResult {
+    let window = p
+        .get("id")
+        .and_then(Value::as_u64)
+        .or_else(|| crate::cmd::util::opt_ids(p).and_then(|v| v.first().map(|i| i.0)))
+        .map(mailcraft_model::ItemId)
+        .filter(|i| s.mailbox.mail.contains_key(i));
     let Some(pct) = p.get("pct").filter(|v| !v.is_null()) else {
-        let current = s.view.zoom;
-        return Ok(dialog(s, "zoom", json!({ "pct": current })));
+        let current = window.map_or(s.view.zoom, |i| read_zoom(s, i));
+        let mut params = json!({ "pct": current });
+        if let (Some(i), Some(o)) = (window, params.as_object_mut()) {
+            o.insert("id".into(), json!(i.0));
+        }
+        return Ok(dialog(s, "zoom", params));
     };
     let pct = pct
         .as_f64()
@@ -1497,9 +1526,25 @@ fn zoom(s: &mut Session, p: &Value) -> CmdResult {
         .filter(|f| (f64::from(ZOOM_MIN)..=f64::from(ZOOM_MAX)).contains(f))
         .ok_or_else(|| CmdError::Params(format!("`pct` must be between {ZOOM_MIN} and {ZOOM_MAX}")))?;
     // In range 10..=500 after the check above, so the conversion cannot truncate.
-    let pct = pct as u16;
-    s.view.zoom = pct.clamp(ZOOM_MIN, ZOOM_MAX);
-    Ok(json!({ "pct": s.view.zoom }))
+    let pct = (pct as u16).clamp(ZOOM_MIN, ZOOM_MAX);
+    let remember = p.get("remember").and_then(Value::as_bool).unwrap_or(false);
+    match window {
+        Some(id) if !remember => {
+            if s.read_zoom.len() >= MAX_READ_ZOOMS && !s.read_zoom.contains_key(&id) {
+                s.read_zoom.pop_first();
+            }
+            s.read_zoom.insert(id, pct);
+            Ok(json!({ "pct": pct, "id": id.0 }))
+        }
+        _ => {
+            s.view.zoom = pct;
+            // Remember my preference: windows zoomed on their own follow the new default too.
+            if remember {
+                s.read_zoom.clear();
+            }
+            Ok(json!({ "pct": s.view.zoom }))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1702,6 +1747,25 @@ mod tests {
         assert!(s.run("view.zoom", &json!({"pct": 5})).is_err());
         assert!(s.run("view.zoom", &json!({"pct": 501})).is_err());
         assert_eq!(run(&mut s, "view.zoom", json!({}))["dialog"], "zoom");
+        // A read window zooms on its own; Remember my preference makes it everyone's default.
+        let id = s
+            .mailbox
+            .add_mail(mailcraft_model::MailItem { folder: s.selection.folder, ..Default::default() });
+        run(&mut s, "view.zoom", json!({"pct": 200, "id": id.0}));
+        assert_eq!((read_zoom(&s, id), s.view.zoom), (200, 150));
+        let shown = s.notices.iter().rev().find_map(|n| match n {
+            Notice::OpenDialog(d, p) if d == "zoom" => Some(p.clone()),
+            _ => None,
+        });
+        assert_eq!(shown.unwrap()["pct"], 150);
+        run(&mut s, "view.zoom", json!({"ids": [id.0]}));
+        let shown = s.notices.iter().rev().find_map(|n| match n {
+            Notice::OpenDialog(d, p) if d == "zoom" => Some(p.clone()),
+            _ => None,
+        });
+        assert_eq!(shown.unwrap(), json!({"pct": 200, "id": id.0}));
+        run(&mut s, "view.zoom", json!({"pct": 120, "id": id.0, "remember": true}));
+        assert_eq!((read_zoom(&s, id), s.view.zoom), (120, 120));
         assert_eq!(run(&mut s, "view.tighterSpacing", json!({}))["on"], true);
         let other = s.mailbox.folders.keys().copied().find(|f| *f != s.selection.folder).unwrap();
         assert!(settings(&s, other).tighter_spacing);

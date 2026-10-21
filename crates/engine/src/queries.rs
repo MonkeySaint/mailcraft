@@ -611,7 +611,14 @@ pub fn top_results(s: &Session) -> Vec<ItemId> {
 /// cannot be indexed), the notice shown above the results. `None` without such messages, without a search
 /// or when the option is off.
 pub fn search_notice(s: &Session) -> Option<String> {
-    if s.view.search.trim().is_empty() || !s.settings.bool("search.notifyIncomplete") {
+    if s.view.search.trim().is_empty() {
+        return None;
+    }
+    // Search › Include Older Results: how the server search is going.
+    if let Some(t) = older_notice(s) {
+        return Some(t);
+    }
+    if !s.settings.bool("search.notifyIncomplete") {
         return None;
     }
     let folders: BTreeSet<FolderId> = crate::search_index::scope_folders(s).into_iter().collect();
@@ -628,6 +635,29 @@ pub fn search_notice(s: &Session) -> Option<String> {
              isn't searched."
         )),
     }
+}
+
+/// The state of the server search of Include Older Results for the search in the box, if it is on.
+pub fn older_notice(s: &Session) -> Option<String> {
+    let o = &s.sync.older;
+    if !o.on || o.query.trim() != s.view.search.trim() {
+        return None;
+    }
+    if !o.pending.is_empty() {
+        return Some("Searching the server for older results…".to_owned());
+    }
+    if let Some(e) = &o.error {
+        return Some(format!("Older results could not be searched on the server: {e}"));
+    }
+    let shown = crate::sync::older::extra_results(s).len();
+    Some(match (shown, o.found) {
+        (0, 0) => "No older results on the server.".to_owned(),
+        (n, f) if f > n => format!(
+            "Showing {n} of {f} older results found on the server (the newest). Narrow the search to see others."
+        ),
+        (1, _) => "Including 1 older result from the server.".to_owned(),
+        (n, _) => format!("Including {n} older results from the server."),
+    })
 }
 
 /// Primary sort / group key.
@@ -1107,6 +1137,11 @@ pub fn header_items_in_view(s: &Session) -> usize {
         return 0;
     }
     view_items(s).1.into_iter().filter(|m| header_only(s, m)).count()
+}
+
+/// Only the header of message `id` was downloaded and its account has a mail server to get the rest from.
+pub fn is_server_header_only(s: &Session, id: ItemId) -> bool {
+    s.mailbox.mail.get(&id).is_some_and(|m| header_only(s, m))
 }
 
 /// Only the header of `m` was downloaded (an item of a server account; local items never are).

@@ -1035,3 +1035,19 @@ fn review_cid_references_match_whole_ids() {
         vec![(Some("a".into()), false), (Some("abc".into()), true), (Some("logo@example".into()), true)]
     );
 }
+
+/// View › Encoding: a body labelled with the wrong character set decodes again with the one chosen.
+#[test]
+fn bodies_decode_again_with_another_charset() {
+    // "Grüße" in ISO-8859-1, labelled as UTF-8.
+    let mut raw =
+        b"From: a@example.com\r\nSubject: x\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nGr".to_vec();
+    raw.extend_from_slice(&[0xFC, 0xDF, b'e', b'\r', b'\n']);
+    let msg = parse(&raw).unwrap();
+    assert_eq!(msg.text_body().as_deref(), Some("Gr\u{FFFD}\u{FFFD}e\n"));
+    let (text, html) = msg.bodies_as("iso-8859-1");
+    assert_eq!(text.as_deref(), Some("Grüße\n"));
+    assert!(html.is_none());
+    // An unknown charset keeps the declared one.
+    assert_eq!(msg.bodies_as("no-such-charset").0, msg.text_body());
+}

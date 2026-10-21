@@ -92,6 +92,25 @@ sub | Other Actions | more | readOtherActions | | O
 
 menu readOtherActions
 item | View Source | info | mail.viewSource | | V
+item | View in Browser | link | mail.viewInBrowser | | B
+sub | Encoding | | readEncoding | | E
+
+menu readEncoding
+item | Auto-Select | | mail.encoding | {"charset":"auto"} | A
+sep
+item | Unicode (UTF-8) | | mail.encoding | {"charset":"utf-8"} | U
+item | Western European (ISO) | | mail.encoding | {"charset":"iso-8859-1"} | W
+item | Western European (Windows) | | mail.encoding | {"charset":"windows-1252"} | N
+item | Central European (ISO) | | mail.encoding | {"charset":"iso-8859-2"} | C
+item | Central European (Windows) | | mail.encoding | {"charset":"windows-1250"} | E
+item | Cyrillic (KOI8-R) | | mail.encoding | {"charset":"koi8-r"} | K
+item | Cyrillic (Windows) | | mail.encoding | {"charset":"windows-1251"} | Y
+item | Greek (ISO) | | mail.encoding | {"charset":"iso-8859-7"} | G
+item | Japanese (Shift-JIS) | | mail.encoding | {"charset":"shift_jis"} | J
+item | Japanese (JIS) | | mail.encoding | {"charset":"iso-2022-jp"} | I
+item | Chinese Simplified (GBK) | | mail.encoding | {"charset":"gbk"} | S
+item | Chinese Traditional (Big5) | | mail.encoding | {"charset":"big5"} | T
+item | Korean (EUC) | | mail.encoding | {"charset":"euc-kr"} | O
 
 menu readRelated
 item | Messages in this Conversation | conversation | mail.findRelated | {"kind":"conversation"} | C

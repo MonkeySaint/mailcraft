@@ -78,8 +78,12 @@ fn move_flag_categorize_and_undo_each() {
     s.run("mail.clearFlag", &json!({})).expect("clear flag");
     assert_eq!(s.mailbox.mail[&id].flag, FlagState::None);
 
+    // Clear All Categories is grey until the message has a category (as observed).
+    s.mailbox.mail.get_mut(&id).expect("item").categories.clear();
+    assert!(s.enabled("mail.clearCategories").is_some());
     s.run("mail.categorize", &json!({"name": "Red category"})).expect("categorize");
     assert!(s.mailbox.mail[&id].categories.iter().any(|c| c == "Red category"));
+    assert!(s.enabled("mail.clearCategories").is_none());
     let row = list_rows(&s)
         .into_iter()
         .find_map(|r| match r {

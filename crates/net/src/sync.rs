@@ -524,6 +524,71 @@ impl ImapAccount {
         })
     }
 
+    /// Searches folder `folder` on the server (`UID SEARCH`, RFC 3501/9051 section 6.4.4) and downloads the
+    /// headers of the newest matches that are not in `skip` (messages already held locally), at most `max`
+    /// of them. Returns those headers (marked [`NewMessage::headers_only`]) and how many matches the server
+    /// had beyond `skip`. `uidvalidity`: the folder's UIDVALIDITY the caller knows; when the server reports
+    /// another one the UIDs mean other messages and nothing is returned. `up_to`: the highest UID the
+    /// folder's own sync has covered. Matches above it are left out: they are new mail the next sync
+    /// downloads, and filing one here would make that sync skip the unmatched messages below it. A folder not
+    /// synced yet (`uidvalidity` or `up_to` 0) is not searched.
+    pub fn search_folder(
+        &mut self,
+        folder: &str,
+        criteria: &crate::search::Criterion,
+        skip: &[u32],
+        uidvalidity: u32,
+        up_to: u32,
+        max: usize,
+    ) -> Result<(Vec<NewMessage>, usize)> {
+        criteria.check()?;
+        if uidvalidity == 0 || up_to == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let batch = self.settings.fetch_batch.max(1);
+        let skip: HashSet<u32> = skip.iter().copied().collect();
+        self.with_client(true, |c| {
+            let info = Self::select(c, folder, false)?;
+            if info.uidvalidity != uidvalidity {
+                return Ok((Vec::new(), 0));
+            }
+            if info.exists == 0 {
+                return Ok((Vec::new(), 0));
+            }
+            let cmd = criteria.imap_command(c.utf8())?;
+            let mut found: Vec<u32> = c
+                .uid_search_command(cmd)?
+                .into_iter()
+                .filter(|u| *u > 0 && *u <= up_to && !skip.contains(u))
+                .collect();
+            found.sort_unstable();
+            found.dedup();
+            let total = found.len();
+            // The newest matches (UIDs grow with arrival).
+            let keep: Vec<u32> = found.iter().rev().take(max).rev().copied().collect();
+            let mut out = Vec::new();
+            for chunk in SeqSet::chunks(&keep, batch) {
+                for f in c.uid_fetch(&chunk, HEADER_ITEMS)? {
+                    let (Some(uid), Some(raw)) = (f.uid, f.header) else { continue };
+                    if !chunk.contains(uid) {
+                        continue;
+                    }
+                    out.push(NewMessage {
+                        uid,
+                        raw,
+                        flags: f.flags.unwrap_or_default(),
+                        internal_date: f.internal_date,
+                        size: f.size,
+                        headers_only: true,
+                    });
+                }
+            }
+            out.sort_by_key(|m| m.uid);
+            out.dedup_by_key(|m| m.uid);
+            Ok((out, total))
+        })
+    }
+
     /// Adds and removes flags on messages.
     pub fn push_flags(&mut self, folder: &str, uids: &[u32], add: &[&str], remove: &[&str]) -> Result<()> {
         let set = SeqSet::from_ids(uids);

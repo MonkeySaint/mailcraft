@@ -1437,9 +1437,10 @@ pub const DEFS: &[Def] = &[
         "language.translate",
         "Choose how to handle messages received in other languages:",
         Choice("ask", TRANSLATE),
-        // S: offering to translate on arrival needs language detection, which MailCraft does not have;
-        // Translate Message works on request through an installed translator (`crate::translate`).
-        S,
+        // Ask offers to translate a message whose language (detected on this computer) differs from
+        // "Translate messages into"; Always translates it when shown; both need a translator
+        // (`crate::translate`: the server below, or one installed by the app).
+        A,
     ),
     d(
         "language",
@@ -1448,6 +1449,16 @@ pub const DEFS: &[Def] = &[
         "Translate messages into:",
         Choice("en", TRANSLATE_TO),
         // The language Translate Message translates into (with an installed translator).
+        A,
+    ),
+    d(
+        "language",
+        "Translation",
+        "language.translatorUrl",
+        "Translation server address (LibreTranslate-compatible):",
+        // Empty: no translation server, nothing is sent anywhere. The API key is kept in the secret store
+        // (`options.translator`).
+        Text("", 512),
         A,
     ),
     // ---------------------------------------------------------------- Accessibility
