@@ -35,27 +35,28 @@ unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release).
 Two numbers, kept separate on purpose:
 
 - **Catalog coverage** (mechanical, `cargo xtask parity` → [docs/parity.md](docs/parity.md)): every observed
-  Outlook command row maps to a MailCraft command id that exists in the registry. Today 1,512 of 1,512 applicable
-  rows (100 %); 131 rows are not applicable (cloud-only Microsoft services). This only proves an id exists.
-- **Honest parity** (re-audited 2026-10-10 at commit 14): each of the 1,512 rows classified by what its command
-  really does: REAL (works and is reachable), DIALOG-OK (opens a dialog that works), DIALOG-STUB (opens a dialog
-  that doesn't do the thing), PARTIAL (works, but clearly less than observed), STUB (no-op, echo or error).
-  Honest % = (REAL + DIALOG-OK + ½ PARTIAL) / rows. **Overall: 87.1 %** (80.2 % counting only REAL + DIALOG-OK),
-  up from 61.9 % at commit 10. Six Exchange-only calendar rows moved to not applicable and 76 rows were re-mapped
-  to the command that now implements them.
+  Outlook command row maps to a MailCraft command id that exists in the registry. Today 1,511 of 1,511 applicable
+  rows (100 %); 132 rows are not applicable (cloud-only Microsoft services). This only proves an id exists.
+- **Honest parity** (re-audited 2026-10-20 after round 4): each of the 1,510 audited rows classified by what its
+  command really does: REAL (works and is reachable), DIALOG-OK (opens a dialog that works), DIALOG-STUB (opens a
+  dialog that doesn't do the thing), PARTIAL (works, but clearly less than observed), STUB (no-op, echo or
+  error). Honest % = (REAL + DIALOG-OK + ½ PARTIAL) / rows. **Overall: 87.4 %** (78.5 % counting only REAL +
+  DIALOG-OK). Its auditors judged each row against the observation notes and were stricter than the
+  commit-14 audit (87.1 %): areas that grew since, such as the Read window, score lower, so the two figures
+  are not directly comparable. The per-row evidence of this audit sets the next rounds' work.
 
 | Catalog area | Rows | REAL | DIALOG-OK | DIALOG-STUB | PARTIAL | STUB | Honest |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Mail (main window) | 262 | 200 | 23 | 7 | 28 | 4 | 90.5 % |
-| Context menus | 205 | 156 | 23 | 7 | 7 | 12 | 89.0 % |
-| Read window | 85 | 65 | 7 | 5 | 2 | 6 | 85.9 % |
-| Search | 40 | 29 | 3 | 0 | 2 | 6 | 82.5 % |
-| Compose | 448 | 286 | 40 | 9 | 88 | 25 | 82.6 % |
-| Calendar | 122 | 78 | 13 | 3 | 25 | 3 | 84.8 % |
-| People | 142 | 99 | 14 | 3 | 25 | 1 | 88.4 % |
-| Notes | 64 | 44 | 8 | 0 | 12 | 0 | 90.6 % |
-| Tasks | 144 | 116 | 9 | 1 | 18 | 0 | 93.1 % |
-| **Total** | **1,512** | **1,073** | **140** | **35** | **207** | **57** | **87.1 %** |
+| Mail (main window) | 262 | 179 | 45 | 7 | 30 | 1 | 91.2 % |
+| Context menus | 205 | 142 | 42 | 1 | 15 | 5 | 93.4 % |
+| Read window | 84 | 35 | 17 | 3 | 27 | 2 | 78.0 % |
+| Search | 40 | 27 | 3 | 1 | 4 | 5 | 80.0 % |
+| Compose | 447 | 271 | 55 | 11 | 101 | 9 | 84.2 % |
+| Calendar | 122 | 87 | 19 | 4 | 11 | 1 | 91.4 % |
+| People | 142 | 91 | 14 | 2 | 34 | 1 | 85.9 % |
+| Notes | 64 | 35 | 7 | 0 | 21 | 1 | 82.0 % |
+| Tasks | 144 | 108 | 8 | 1 | 26 | 1 | 89.6 % |
+| **Total** | **1,510** | **975** | **210** | **30** | **269** | **26** | **87.4 %** |
 
 ### By functional area (judgement, with evidence)
 
@@ -63,7 +64,7 @@ Two numbers, kept separate on purpose:
 |---|---|---|
 | Message list and folders | ~80 % | grouping, Focused/Other, arrange/sort/filter, folder CRUD, favourites, Bottom-pane columns, hover actions; saved views, Add Columns, conditional formatting, Quick Actions settings missing; AutoArchive (scheduled and manual, per-folder settings) |
 | Reading pane | ~90 % | header, info bars, inline reply, mark-as-read timing, Space-bar reading, find in a received message (Find…, F4), preview and portrait reading options, read-window Next / Previous links |
-| Compose | ~80 % | editing, styles, themes, list formats, rich paste, voting, receipts, Save Sent Item To; Clipboard/Styles/Selection panes, ¶ marks, bitmap paste missing |
+| Compose | ~82 % | editing, styles, themes, list formats, rich paste, voting, receipts, Save Sent Item To, S/MIME sign and encrypt, accessibility checker, @mentions, Mini Toolbar, Live Preview; ribbon clipboard, Format Painter, Paragraph dialog, building blocks and Screenshot partial |
 | Ribbon, menus, shortcuts | ~88 % | data-driven ribbons with width rules and keytips; a few Calendar buttons route through Mail commands |
 | Rules and quick steps | ~80 % | 31 conditions, 25 actions, wizard and manage dialogs, Quick Steps |
 | Search | ~82 % | indexed query language, refiners, Advanced Find, search folders; scopes and Expiring Soon partial |
@@ -73,18 +74,22 @@ Two numbers, kept separate on purpose:
 | Tasks | ~70 % | editor, recurrence, views, module actions; incoming task requests not processed |
 | Notes | ~85 % | create/edit/colour/views; positions kept on the note |
 | Import/export and print | ~65 % | EML/MSG/MBOX/Maildir/ICS/VCF/CSV, PDF everywhere, CUPS; no PST, no Windows printing |
-| Options dialog | ~50 % | every setting persists in the profile; 178 of 227 take effect (round 4, `settings::effect_counts`); re-audit pending |
+| Options dialog | ~80 % | every setting persists in the profile; 178 of 227 take effect, 28 are not applicable (round 4, `settings::effect_counts`) |
 | Responsive behaviour | ~97 % | 29 of 30 observed behaviours (Classic Respond group at 1024 px) |
 | Keyboard | ~99 % | Space on a focused button; F6 cycles compose and read windows |
 
-### Biggest gaps (ranked by user impact)
+### Biggest gaps (ranked by user impact, from the 2026-10-20 audit)
 
-1. Options: settings that persist but don't take effect yet (49 of 227).
-2. Import/export: PST; printing on Windows.
-3. S/MIME: when several people sign one message, only the first signer is graded.
-
-The table above is from the commit-14 re-audit; commits 15–23 closed most of its listed gaps, and the next
-re-audit (commits 24–26) will refresh the numbers.
+1. Data safety: Close All Items drops unsaved edits in appointment, task, contact and note windows; Reset View
+   also deletes saved custom views; removing a data file from its context menu deletes its contents unasked.
+2. Read window: Quick Steps act on the main window's selection; deleting or moving the open item leaves it shown.
+3. Compose: ribbon Cut/Copy/Paste bypass the system clipboard; Format Painter, the Paragraph dialog, style sets,
+   building blocks (Quick Parts, Text Box, Quick Tables) and Screenshot are partial.
+4. Mail: Focused Inbox does not classify new mail by itself; Ignore does not catch later mail of the
+   conversation; Open in New Window does not open a second window.
+5. People and Tasks: views lack the observed column sets and clickable flag and category cells.
+6. Options: 21 of 227 settings still persist without effect (28 more are not applicable). Import/export:
+   PST; printing on Windows.
 
 The full audit (per-row classification) is regenerated before each release; the commits after 14 and the
 milestones after v0.3.0 work down this list until every area is ≥ 95 %.
