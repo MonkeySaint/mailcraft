@@ -125,6 +125,24 @@ pub struct Folder {
     /// The folder's own AutoArchive properties (Properties › AutoArchive); `None` = the default settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_archive: Option<FolderArchive>,
+    /// Properties › General › Description.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Properties › General: the folder pane shows the total number of items (`Some(true)`) or the number of
+    /// unread items (`Some(false)`); `None` = the folder's usual count (total for Drafts, Outbox, Junk Email
+    /// and the like, unread for the rest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_total: Option<bool>,
+}
+
+/// Longest folder description kept (chars).
+pub const MAX_FOLDER_DESCRIPTION: usize = 4_000;
+
+impl Folder {
+    /// The folder pane counts every item of this folder (else only the unread ones).
+    pub fn counts_total(&self) -> bool {
+        self.show_total.unwrap_or_else(|| self.role.is_some_and(FolderRole::shows_total_count))
+    }
 }
 
 /// How a folder takes part in AutoArchive.

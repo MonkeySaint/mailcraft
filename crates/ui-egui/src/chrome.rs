@@ -1776,6 +1776,28 @@ mod tests {
     }
 
     #[test]
+    fn reading_view_hides_the_pinned_todo_bar_and_normal_view_brings_it_back() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = App::new(mailcraft_engine::sample::sample_session());
+        app.run("view.todoBar", json!({"part": "tasks"}));
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 900.0)).build_ui_state(
+            |ui, app: &mut App| {
+                let frame = Frame::compute(1600.0, 900.0);
+                main_window(ui, app, &frame);
+            },
+            app,
+        );
+        h.run();
+        assert!(h.query_by_label("Type a new task").is_some(), "the pinned To-Do Bar shows");
+        h.state_mut().run("view.readingView", json!({}));
+        h.run();
+        assert!(h.query_by_label("Type a new task").is_none(), "Reading View hides it");
+        h.state_mut().run("view.normalView", json!({}));
+        h.run();
+        assert!(h.query_by_label("Type a new task").is_some(), "Normal View shows it again");
+    }
+
+    #[test]
     fn quick_access_toolbar_options() {
         let mut app = App::new(mailcraft_engine::sample::sample_session());
         assert!(!qat_below(&app));

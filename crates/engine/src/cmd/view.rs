@@ -1449,6 +1449,7 @@ fn todo_bar(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Applies To-Do Bar `part` (a validated part name) to the session's view state.
 pub(crate) fn toggle_todo_bar(s: &mut Session, part: &str) {
+    let before = s.view.todo_bar;
     let t = &mut s.view.todo_bar;
     match part {
         "calendar" => t.calendar = !t.calendar,
@@ -1456,16 +1457,32 @@ pub(crate) fn toggle_todo_bar(s: &mut Session, part: &str) {
         "tasks" => t.tasks = !t.tasks,
         _ => *t = crate::TodoBar::default(),
     }
+    // Pinning a part in Reading View (which hides pinned panes) goes back to Normal View, so it shows.
+    let added =
+        (t.calendar && !before.calendar) || (t.people && !before.people) || (t.tasks && !before.tasks);
+    if added {
+        s.view.reading_view = false;
+    }
 }
 
+/// The panes Reading View hides, as the status bar's button describes them.
+fn pinned_panes(s: &Session) -> Value {
+    json!({
+        "folderPane": s.view.folder_pane != mailcraft_model::FolderPaneState::Off,
+        "todoBar": s.view.todo_bar.shown(),
+    })
+}
+
+/// Reading View: the folder pane is minimised and every pinned pane (the To-Do Bar) is hidden; their
+/// settings stay, so Normal View brings them back.
 fn reading_view(s: &mut Session, _p: &Value) -> CmdResult {
     s.view.reading_view = true;
-    Ok(json!({ "readingView": true }))
+    Ok(json!({ "readingView": true, "hidden": pinned_panes(s) }))
 }
 
 fn normal_view(s: &mut Session, _p: &Value) -> CmdResult {
     s.view.reading_view = false;
-    Ok(json!({ "readingView": false }))
+    Ok(json!({ "readingView": false, "shown": pinned_panes(s) }))
 }
 
 fn zoom(s: &mut Session, p: &Value) -> CmdResult {
@@ -1649,6 +1666,28 @@ mod tests {
         assert_eq!(s.view.folder_pane, FolderPaneState::Minimized);
         assert_eq!(run(&mut s, "view.favorites", json!({}))["on"], false);
         assert!(!s.view.favorites_visible);
+    }
+
+    #[test]
+    fn reading_view_hides_pinned_panes_until_normal_view() {
+        let mut s = session();
+        run(&mut s, "view.todoBar", json!({"part": "tasks"}));
+        assert!(s.view.todo_bar_visible());
+        let r = run(&mut s, "view.readingView", json!({}));
+        assert_eq!(r["hidden"]["todoBar"], true);
+        assert!(!s.view.todo_bar_visible(), "Reading View hides the pinned To-Do Bar");
+        assert!(s.view.todo_bar.tasks, "its setting stays");
+        run(&mut s, "view.normalView", json!({}));
+        assert!(s.view.todo_bar_visible(), "Normal View shows it again");
+        // Pinning another part while reading goes back to Normal View, so the bar shows.
+        run(&mut s, "view.readingView", json!({}));
+        run(&mut s, "view.todoBar", json!({"part": "calendar"}));
+        assert!(!s.view.reading_view);
+        assert!(s.view.todo_bar_visible());
+        // Turning the bar off keeps Reading View.
+        run(&mut s, "view.readingView", json!({}));
+        run(&mut s, "view.todoBar", json!({"part": "off"}));
+        assert!(s.view.reading_view);
     }
 
     #[test]

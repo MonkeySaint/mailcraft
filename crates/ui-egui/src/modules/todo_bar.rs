@@ -82,9 +82,9 @@ pub fn todo_bar_parts(app: &App) -> (bool, bool, bool) {
     (t.calendar, t.people, t.tasks)
 }
 
-/// True when any part is on.
+/// True when the bar is on screen: a part is on and Reading View (which hides pinned panes) is off.
 pub fn todo_bar_shown(app: &App) -> bool {
-    app.s.view.todo_bar.shown()
+    app.s.view.todo_bar_visible()
 }
 
 /// Draws the To-Do Bar in `ui` (its whole rect).

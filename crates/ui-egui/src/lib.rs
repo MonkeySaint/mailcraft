@@ -22,6 +22,7 @@ pub mod folders;
 pub mod icons;
 pub mod keys;
 pub mod list;
+pub mod menu_keys;
 pub mod menus;
 pub mod modules;
 pub mod reading;
@@ -409,6 +410,9 @@ impl App {
                 compose::flush_drawing_text(&ctx, self, cid);
             }
         }
+        if let Some(asked) = self.confirm_purge(id, &params) {
+            return Some(asked);
+        }
         match self.s.run(id, &params) {
             Ok(v) => {
                 if id == "view.todoBar" {
@@ -427,6 +431,34 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Delete on messages already in Deleted Items removes them for good: with Advanced › "Prompt for
+    /// confirmation before permanently deleting items" on, it asks first (as Shift+Delete does), wherever
+    /// Delete came from (ribbon, menus, keys). Returns the reply when it asked.
+    fn confirm_purge(&mut self, id: &str, params: &Value) -> Option<Value> {
+        if id != "mail.delete"
+            || params.get("confirm").and_then(Value::as_bool) == Some(true)
+            || !self.s.settings.bool("advanced.confirmPermanentDelete")
+            || (self.s.enabled(id).is_some() && params.get("ids").is_none())
+        {
+            return None;
+        }
+        let ids = self.s.target_ids(params);
+        let purged = mailcraft_engine::cmd::mail::purged_by_delete(&self.s, &ids);
+        if purged == 0 {
+            return None;
+        }
+        let text = if ids.len() == 1 {
+            "The selected item will be permanently deleted.".to_owned()
+        } else if purged == ids.len() {
+            format!("The {} selected items will be permanently deleted.", ids.len())
+        } else {
+            format!("{purged} of the {} selected items will be permanently deleted.", ids.len())
+        };
+        let list: Vec<u64> = ids.iter().map(|i| i.0).collect();
+        dialogs::confirm(self, "MailCraft", &text, id, json!({"ids": list, "confirm": true}));
+        Some(json!({"dialog": "confirm"}))
     }
 
     /// Effective reading pane position of the selected folder (its saved view, else the window default).

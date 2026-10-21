@@ -164,7 +164,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Search Folder",
             "Folder › New",
             "Mod+Shift+P",
-            r#"{"name"?:string,"query"?:string,"template"?:"unread|flagged|unreadOrFlagged|important|fromAndTo|from|toMe|toGroup|categorized|large|old|attachments|words|custom","value"?:string}"#,
+            r#"{"name"?:string,"query"?:string,"template"?:"unread|flagged|unreadOrFlagged|important|fromAndTo|from|toMe|toGroup|categorized|large|old|attachments|words|custom","value"?:string,"account"?:number} (account: the mailbox searched, default the current one)"#,
             true,
             always,
             new_search_folder,
@@ -188,6 +188,16 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             has_folder,
             properties,
+        ),
+        spec(
+            "folder.setProperties",
+            "Folder Properties: General",
+            "Folder › Properties › General",
+            "",
+            r#"{"folder"?: number, "description"?: string, "showTotal"?: bool|null} (showTotal: the folder pane counts every item, false = unread items, null = the folder's usual count)"#,
+            true,
+            has_folder,
+            set_properties,
         ),
         spec(
             "folder.recoverDeleted",
@@ -624,6 +634,8 @@ pub fn copy_folder_tree(
                 // server's name, which the copy does not have.
                 remote_name: if kind == FolderKind::Calendar { of.remote_name.clone() } else { None },
                 auto_archive: of.auto_archive,
+                description: of.description.clone(),
+                show_total: of.show_total,
             },
         );
         if kind == FolderKind::Calendar {
@@ -1082,11 +1094,20 @@ fn new_search_folder(s: &mut Session, p: &Value) -> CmdResult {
             return Ok(dialog(s, "newSearchFolder", json!({ "templates": templates })));
         }
     };
-    let account = s.current_account().ok_or_else(|| CmdError::Disabled("no account".into()))?;
+    // "Search mail in": the mailbox (account or data file) whose mail the folder searches.
+    let account = match p.get("account").filter(|v| !v.is_null()) {
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .map(AccountId)
+            .filter(|a| s.mailbox.accounts.iter().any(|x| x.id == *a))
+            .ok_or_else(|| CmdError::Params(format!("no such account {v}")))?,
+        None => s.current_account().ok_or_else(|| CmdError::Disabled("no account".into()))?,
+    };
     let root = s
         .mailbox
         .role_folder(account, FolderRole::SearchFolders)
-        .ok_or_else(|| CmdError::Failed("this account has no Search Folders folder".into()))?;
+        .ok_or_else(|| CmdError::Failed("this mailbox has no Search Folders folder".into()))?;
     let id = s.mailbox.create_folder(root, name)?;
     if let Some(f) = s.mailbox.folders.get_mut(&id) {
         f.kind = FolderKind::Search;
@@ -1148,6 +1169,8 @@ fn properties(s: &mut Session, p: &Value) -> CmdResult {
         "total": mb.total_count(id).saturating_add(pim),
         "sizeKb": size.div_ceil(1024),
         "sizes": folder_sizes(mb, id),
+        "description": folder.description,
+        "showTotal": show_total_of(s, id),
     });
     if let Some(o) = params.as_object_mut() {
         match kind {
@@ -1166,6 +1189,52 @@ fn properties(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     Ok(dialog(s, "folderProperties", params))
+}
+
+/// Whether the folder pane shows folder `id`'s total number of items (else its unread count): the
+/// folder's Properties choice, else (profiles from before it was kept with the folder) the window's saved
+/// dialog setting, else the folder's usual count.
+pub fn show_total_of(s: &Session, id: FolderId) -> bool {
+    let Some(f) = s.mailbox.folder(id) else { return false };
+    match f.show_total {
+        Some(v) => v,
+        None => crate::queries::show_total_folders(s).contains(&id.0) || f.counts_total(),
+    }
+}
+
+/// Properties › General: the folder's Description and "Show number of unread items" / "Show total number
+/// of items" (`showTotal`; null = the folder's usual count).
+fn set_properties(s: &mut Session, p: &Value) -> CmdResult {
+    let id = current_folder(s, p)?;
+    let description = match p.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(d)) => {
+            if d.chars().count() > mailcraft_model::folder::MAX_FOLDER_DESCRIPTION {
+                return Err(CmdError::Params(format!(
+                    "the description is longer than {} characters",
+                    mailcraft_model::folder::MAX_FOLDER_DESCRIPTION
+                )));
+            }
+            Some(d.trim_end().to_owned())
+        }
+        Some(_) => return Err(CmdError::Params("`description` must be text".into())),
+    };
+    let show_total = match p.get("showTotal") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::Bool(b)) => Some(Some(*b)),
+        Some(_) => return Err(CmdError::Params("`showTotal` must be true, false or null".into())),
+    };
+    let Some(f) = s.mailbox.folders.get_mut(&id) else {
+        return Err(CmdError::Params("no such folder".into()));
+    };
+    if let Some(d) = description {
+        f.description = d;
+    }
+    if let Some(t) = show_total {
+        f.show_total = t;
+    }
+    Ok(json!({"folder": id.0, "description": f.description, "showTotal": f.counts_total()}))
 }
 
 /// Most rows the Folder Size list shows.
@@ -1290,6 +1359,45 @@ mod tests {
 
     fn run(s: &mut Session, id: &str, p: Value) -> Value {
         s.run(id, &p).unwrap_or_else(|e| panic!("{id}: {e}"))
+    }
+
+    #[test]
+    fn properties_count_choice_and_description_live_in_the_folder() {
+        let mut s = session();
+        let inbox = s.selection.folder;
+        mail(&mut s, inbox, "One", "a@example.com");
+        let read = mail(&mut s, inbox, "Two", "b@example.com");
+        if let Some(m) = s.mailbox.mail.get_mut(&read) {
+            m.read = true;
+        }
+        assert_eq!(s.mailbox.badge(inbox).as_deref(), Some("1"));
+        run(
+            &mut s,
+            "folder.setProperties",
+            json!({"folder": inbox.0, "showTotal": true, "description": "Work"}),
+        );
+        assert_eq!(s.mailbox.badge(inbox).as_deref(), Some("[2]"), "every item counts");
+        assert!(s.mailbox.folder_accessible_name(inbox).ends_with("2 items"));
+        let r = run(&mut s, "folder.properties", json!({"folder": inbox.0}));
+        assert_eq!(r["dialog"], "folderProperties");
+        let Some(Notice::OpenDialog(_, p)) = s.notices.last() else { panic!() };
+        assert_eq!((p["description"].as_str(), p["showTotal"].as_bool()), (Some("Work"), Some(true)));
+        // Drafts counts every item by default; unread can be asked for, and null goes back.
+        let drafts = role(&s, FolderRole::Drafts);
+        run(&mut s, "folder.setProperties", json!({"folder": drafts.0, "showTotal": false}));
+        assert!(!s.mailbox.folder(drafts).unwrap().counts_total());
+        run(&mut s, "folder.setProperties", json!({"folder": drafts.0, "showTotal": null}));
+        assert!(s.mailbox.folder(drafts).unwrap().counts_total());
+        // Undo puts the old choice back; junk is refused.
+        run(&mut s, "app.undo", json!({}));
+        assert!(!s.mailbox.folder(drafts).unwrap().counts_total());
+        assert!(s.run("folder.setProperties", &json!({"folder": inbox.0, "showTotal": "yes"})).is_err());
+        let long = "x".repeat(mailcraft_model::folder::MAX_FOLDER_DESCRIPTION + 1);
+        assert!(s.run("folder.setProperties", &json!({"folder": inbox.0, "description": long})).is_err());
+        // The folder pane row follows the folder's choice.
+        let rows = crate::queries::folder_rows(&s);
+        let row = rows.iter().find(|r| r.id == Some(inbox)).unwrap();
+        assert!(row.badge_total);
     }
 
     fn dialogs(s: &Session) -> Vec<String> {
@@ -1805,6 +1913,18 @@ mod tests {
         assert_eq!(f.kind, FolderKind::Search);
         assert_eq!(f.parent, Some(role(&s, FolderRole::SearchFolders)));
         assert_eq!(f.search_query.as_deref(), Some("isread:no"));
+        // Search mail in another mailbox: the folder goes under that mailbox's Search Folders.
+        let other = s.mailbox.add_account(mailcraft_model::Account {
+            display_name: "Archive file".into(),
+            address: "archive@example.org".into(),
+            ..Default::default()
+        });
+        s.mailbox.create_default_folders(other);
+        let r = run(&mut s, "folder.newSearchFolder", json!({"template": "unread", "account": other.0}));
+        let f = s.mailbox.folder(FolderId(r["folder"].as_u64().unwrap())).unwrap();
+        assert_eq!(f.account, other);
+        assert!(s.run("folder.newSearchFolder", &json!({"template": "unread", "account": 99_999})).is_err());
+        assert!(s.run("folder.newSearchFolder", &json!({"template": "unread", "account": "x"})).is_err());
     }
 
     #[test]

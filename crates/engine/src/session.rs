@@ -107,6 +107,14 @@ impl TodoBar {
     }
 }
 
+impl ViewState {
+    /// Whether the To-Do Bar is on screen: a part is pinned (View › To-Do Bar) and Reading View, which hides
+    /// every pinned pane, is off. Normal View shows it again as it was.
+    pub fn todo_bar_visible(&self) -> bool {
+        self.todo_bar.shown() && !self.reading_view
+    }
+}
+
 /// Most recent Search People texts kept.
 pub const MAX_RECENT_PEOPLE_SEARCHES: usize = 10;
 

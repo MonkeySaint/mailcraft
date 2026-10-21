@@ -18,7 +18,7 @@ use crate::dialogs::common::{
     self, Dlg, Out, btn, btn_en, child, folder_path, footer, muted, primary, take_replies, window, with_state,
 };
 use crate::dialogs::folders::last_error;
-use mailcraft_model::{FolderId, Importance, QuickStep, QuickStepAction};
+use mailcraft_model::{FolderId, Importance, MessageAction, QuickStep, QuickStepAction};
 
 pub(super) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
@@ -118,12 +118,16 @@ pub(super) fn action_text(app: &App, a: &QuickStepAction) -> String {
         }
         QuickStepAction::ClearFlag => "Clear flags on message".into(),
         QuickStepAction::MarkComplete => "Mark complete".into(),
-        QuickStepAction::NewMessageTo(to) => format!("New message to: {}", people(to)),
-        QuickStepAction::Forward(to) => format!("Forward to: {}", people(to)),
+        QuickStepAction::NewMessageTo(m) => format!("New message to: {}{}", people(&m.to), options_text(m)),
+        QuickStepAction::Forward(m) => format!("Forward to: {}{}", people(&m.to), options_text(m)),
         QuickStepAction::Reply => "Reply".into(),
         QuickStepAction::ReplyAll => "Reply All".into(),
-        QuickStepAction::NewMeeting => "New meeting".into(),
-        QuickStepAction::ForwardAsAttachment(to) => format!("Forward as attachment to: {}", people(to)),
+        // No attendees: the step opens a meeting with nobody invited yet (no first-use setup).
+        QuickStepAction::NewMeeting(to) if to.is_empty() => "New meeting (no one invited yet)".into(),
+        QuickStepAction::NewMeeting(to) => format!("New meeting with: {}", to.join("; ")),
+        QuickStepAction::ForwardAsAttachment(m) => {
+            format!("Forward as attachment to: {}{}", people(&m.to), options_text(m))
+        }
         QuickStepAction::ReplyWithMeeting => "Reply with meeting".into(),
         QuickStepAction::CreateTask => "Create a task with the message text".into(),
         QuickStepAction::CreateAppointment => "Create an appointment with the message text".into(),
@@ -132,6 +136,34 @@ pub(super) fn action_text(app: &App, a: &QuickStepAction) -> String {
         QuickStepAction::MoveToFocused => "Move to Focused".into(),
         QuickStepAction::MoveToOther => "Move to Other".into(),
     }
+}
+
+/// The options of a message action, for the Description pane (", Cc: …, subject …"); empty without any.
+fn options_text(m: &MessageAction) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !m.cc.is_empty() {
+        parts.push(format!("Cc: {}", m.cc.join("; ")));
+    }
+    if !m.bcc.is_empty() {
+        parts.push(format!("Bcc: {}", m.bcc.join("; ")));
+    }
+    if !m.subject.trim().is_empty() {
+        parts.push(format!("subject \"{}\"", m.subject.trim()));
+    }
+    if let Some(f) = m.flag.as_deref() {
+        let label = FLAGS.iter().find(|(k, _)| *k == f).map_or(f, |(_, l)| l);
+        parts.push(format!("flag {label}"));
+    }
+    if let Some(i) = m.importance {
+        parts.push(format!("{} importance", imp_label(i)));
+    }
+    if !m.text.trim().is_empty() {
+        parts.push("with text".into());
+    }
+    if m.auto_send {
+        parts.push("sent automatically".into());
+    }
+    if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) }
 }
 
 fn imp_label(i: Importance) -> &'static str {
@@ -279,6 +311,8 @@ struct Act {
     text: String,
     /// Importance / flag choice.
     choice: usize,
+    /// Message options (New Message, Forward, Forward as Attachment).
+    msg: MsgOptions,
 }
 
 impl Act {
@@ -309,14 +343,12 @@ impl Act {
             },
             QuickStepAction::ClearFlag => k(10),
             QuickStepAction::MarkComplete => k(11),
-            QuickStepAction::NewMessageTo(to) => Act { kind: 12, text: to.join("; "), ..Default::default() },
-            QuickStepAction::Forward(to) => Act { kind: 13, text: to.join("; "), ..Default::default() },
+            QuickStepAction::NewMessageTo(m) => Act::message(12, m),
+            QuickStepAction::Forward(m) => Act::message(13, m),
             QuickStepAction::Reply => k(14),
             QuickStepAction::ReplyAll => k(15),
-            QuickStepAction::NewMeeting => k(16),
-            QuickStepAction::ForwardAsAttachment(to) => {
-                Act { kind: 17, text: to.join("; "), ..Default::default() }
-            }
+            QuickStepAction::NewMeeting(to) => Act { kind: 16, text: to.join("; "), ..Default::default() },
+            QuickStepAction::ForwardAsAttachment(m) => Act::message(17, m),
             QuickStepAction::ReplyWithMeeting => k(18),
             QuickStepAction::CreateTask => k(19),
             QuickStepAction::CreateAppointment => k(20),
@@ -347,11 +379,11 @@ impl Act {
             9 => QuickStepAction::Flag(FLAGS.get(self.choice).map_or("today", |(k, _)| k).to_owned()),
             10 => QuickStepAction::ClearFlag,
             11 => QuickStepAction::MarkComplete,
-            12 => QuickStepAction::NewMessageTo(common::split_list(&self.text)),
-            13 => QuickStepAction::Forward(common::split_list(&self.text)),
+            12 => QuickStepAction::NewMessageTo(self.build_message()),
+            13 => QuickStepAction::Forward(self.build_message()),
             14 => QuickStepAction::Reply,
             15 => QuickStepAction::ReplyAll,
-            17 => QuickStepAction::ForwardAsAttachment(common::split_list(&self.text)),
+            17 => QuickStepAction::ForwardAsAttachment(self.build_message()),
             18 => QuickStepAction::ReplyWithMeeting,
             19 => QuickStepAction::CreateTask,
             20 => QuickStepAction::CreateAppointment,
@@ -359,9 +391,97 @@ impl Act {
             22 => QuickStepAction::AlwaysMoveConversation(self.folder.map(FolderId)),
             23 => QuickStepAction::MoveToFocused,
             24 => QuickStepAction::MoveToOther,
-            _ => QuickStepAction::NewMeeting,
+            _ => QuickStepAction::NewMeeting(common::split_list(&self.text)),
         }
     }
+
+    /// A message action's row: To in `text`, the options in `msg` (shown when any is set).
+    fn message(kind: usize, m: &MessageAction) -> Act {
+        Act {
+            kind,
+            text: m.to.join("; "),
+            msg: MsgOptions {
+                shown: m.has_options(),
+                cc: m.cc.join("; "),
+                bcc: m.bcc.join("; "),
+                subject: m.subject.clone(),
+                body: m.text.clone(),
+                importance: match m.importance {
+                    Some(Importance::Low) => 1,
+                    Some(Importance::High) => 2,
+                    _ => 0,
+                },
+                flag: m
+                    .flag
+                    .as_deref()
+                    .and_then(|f| FLAGS.iter().position(|(k, _)| *k == f))
+                    .map_or(0, |i| i.saturating_add(1)),
+                auto_send: m.auto_send,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn build_message(&self) -> MessageAction {
+        let o = &self.msg;
+        MessageAction {
+            to: common::split_list(&self.text),
+            cc: common::split_list(&o.cc),
+            bcc: common::split_list(&o.bcc),
+            subject: o.subject.trim().to_owned(),
+            text: o.body.trim_end().to_owned(),
+            importance: match o.importance {
+                1 => Some(Importance::Low),
+                2 => Some(Importance::High),
+                _ => None,
+            },
+            flag: o.flag.checked_sub(1).and_then(|i| FLAGS.get(i)).map(|(k, _)| (*k).to_owned()),
+            auto_send: o.auto_send,
+        }
+    }
+}
+
+/// Show Options of a New Message / Forward / Forward as Attachment row.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct MsgOptions {
+    /// The options are shown (Show Options / Hide Options).
+    shown: bool,
+    cc: String,
+    bcc: String,
+    subject: String,
+    /// Text put at the top of the message.
+    body: String,
+    /// Index in [`MSG_IMPORTANCE`].
+    importance: usize,
+    /// 0 = no flag, else 1 + index in [`FLAGS`].
+    flag: usize,
+    auto_send: bool,
+}
+
+/// Importance choices of a message action: the usual Normal, Low, High.
+const MSG_IMPORTANCE: [&str; 3] = ["Normal", "Low", "High"];
+
+/// The Show Options fields of a message action row.
+fn message_options(ui: &mut Ui, uid: u64, i: usize, o: &mut MsgOptions) {
+    egui::Grid::new(("qs-msg-opts", uid, i)).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+        for (label, value) in [("Cc:", &mut o.cc), ("Bcc:", &mut o.bcc), ("Subject:", &mut o.subject)] {
+            ui.label(label);
+            ui.add(egui::TextEdit::singleline(value).desired_width(300.0));
+            ui.end_row();
+        }
+        ui.label("Flag:");
+        let mut flags: Vec<&str> = vec!["No flag"];
+        flags.extend(FLAGS.iter().map(|(_, l)| *l));
+        common::combo_idx(ui, ("qs-msg-flag", uid, i), &mut o.flag, &flags, 140.0);
+        ui.end_row();
+        ui.label("Importance:");
+        common::combo_idx(ui, ("qs-msg-imp", uid, i), &mut o.importance, &MSG_IMPORTANCE, 140.0);
+        ui.end_row();
+        ui.label("Text:");
+        ui.add(egui::TextEdit::multiline(&mut o.body).desired_rows(3).desired_width(300.0));
+        ui.end_row();
+    });
+    ui.checkbox(&mut o.auto_send, "Send it without opening, one minute after the quick step runs");
 }
 
 #[derive(Clone, Default)]
@@ -492,6 +612,17 @@ fn action_rows(ui: &mut Ui, app: &mut App, uid: u64, st: &mut EditState) -> Out 
                             .hint_text("To (empty: ask on first use)")
                             .desired_width(170.0),
                     );
+                    let label = if a.msg.shown { "Hide Options" } else { "Show Options" };
+                    if ui.link(label).clicked() {
+                        a.msg.shown = !a.msg.shown;
+                    }
+                }
+                16 => {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut a.text)
+                            .hint_text("Attendees (empty: ask on first use)")
+                            .desired_width(170.0),
+                    );
                 }
                 _ => {}
             }
@@ -506,6 +637,9 @@ fn action_rows(ui: &mut Ui, app: &mut App, uid: u64, st: &mut EditState) -> Out 
                 remove = Some(i);
             }
         });
+        if matches!(a.kind, 12 | 13 | 17) && a.msg.shown {
+            ui.indent(("qs-msg-indent", uid, i), |ui| message_options(ui, uid, i, &mut a.msg));
+        }
     }
     if let Some((a, b)) = swap
         && a < st.acts.len()
@@ -570,12 +704,68 @@ fn first_use_needs(actions: &[QuickStepAction]) -> (bool, bool) {
 #[test]
 fn first_use_asks_for_what_the_engine_needs() {
     let needs = |a: QuickStepAction| first_use_needs(&[a]);
-    assert_eq!(needs(QuickStepAction::ForwardAsAttachment(Vec::new())), (false, true));
-    assert_eq!(needs(QuickStepAction::ForwardAsAttachment(vec!["a@example.com".into()])), (false, false));
+    let to = |a: &str| MessageAction::to(vec![a.to_owned()]);
+    assert_eq!(needs(QuickStepAction::ForwardAsAttachment(MessageAction::default())), (false, true));
+    assert_eq!(needs(QuickStepAction::ForwardAsAttachment(to("a@example.com"))), (false, false));
     assert_eq!(needs(QuickStepAction::AlwaysMoveConversation(None)), (true, false));
     assert_eq!(needs(QuickStepAction::MoveTo(None)), (true, false));
-    assert_eq!(needs(QuickStepAction::Forward(Vec::new())), (false, true));
+    assert_eq!(needs(QuickStepAction::Forward(MessageAction::default())), (false, true));
+    // A meeting without attendees runs as it is (an empty meeting form).
+    assert_eq!(needs(QuickStepAction::NewMeeting(Vec::new())), (false, false));
     assert_eq!(needs(QuickStepAction::MarkRead), (false, false));
+}
+
+#[cfg(test)]
+#[test]
+fn editor_rows_keep_message_options() {
+    let m = MessageAction {
+        to: vec!["a@example.com".into()],
+        cc: vec!["b@example.org".into()],
+        subject: "Status".into(),
+        text: "Hello".into(),
+        importance: Some(Importance::High),
+        flag: Some("nextWeek".into()),
+        auto_send: true,
+        ..MessageAction::default()
+    };
+    for a in [
+        QuickStepAction::NewMessageTo(m.clone()),
+        QuickStepAction::Forward(m.clone()),
+        QuickStepAction::ForwardAsAttachment(m.clone()),
+        QuickStepAction::NewMeeting(vec!["c@example.net".into()]),
+        QuickStepAction::Forward(MessageAction::to(vec!["d@example.com".into()])),
+    ] {
+        let row = Act::from(&a);
+        assert_eq!(row.build(), a);
+    }
+    assert!(Act::from(&QuickStepAction::Forward(m)).msg.shown, "options set: shown");
+    assert!(!Act::from(&QuickStepAction::Forward(MessageAction::default())).msg.shown);
+}
+
+#[cfg(test)]
+#[test]
+fn show_options_edits_a_forward_step() {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let id = app.s.mailbox.quick_steps.iter().find(|q| q.name == "To Manager").map(|q| q.id).unwrap();
+    app.run("quicksteps.edit", json!({"id": id}));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(900.0, 900.0))
+        .build_ui_state(|ui, app: &mut App| crate::dialogs::dialogs(&ui.ctx().clone(), app), app);
+    h.run();
+    assert!(h.query_by_label("Subject:").is_none(), "options hidden until asked for");
+    h.get_by_label("Show Options").click();
+    h.run();
+    h.get_by_label("Subject:");
+    h.get_by_label("Send it without opening, one minute after the quick step runs").click();
+    h.run();
+    h.get_by_label("Hide Options");
+    h.get_by_label("Finish").click();
+    h.run();
+    let step = h.state().s.mailbox.quick_steps.iter().find(|q| q.id == id).cloned().unwrap();
+    let Some(QuickStepAction::Forward(m)) = step.actions.first() else { panic!("{:?}", step.actions) };
+    assert!(m.auto_send);
 }
 
 fn first_use(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {

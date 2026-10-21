@@ -428,10 +428,21 @@ fn paint_note(ui: &Ui, app: &App, card: Rect, n: &Note, selected: bool, small: b
     );
 }
 
+/// Card width, card height and the gap between cards of the Icon view: Large or Small Icons, and View › Use
+/// Tighter Spacing (smaller cards closer together).
+pub(crate) fn grid_metrics(small: bool, tight: bool) -> (f32, f32, f32) {
+    match (small, tight) {
+        (true, false) => (160.0, 64.0, 16.0),
+        (true, true) => (148.0, 52.0, 6.0),
+        (false, false) => (200.0, 180.0, 16.0),
+        (false, true) => (180.0, 156.0, 6.0),
+    }
+}
+
 fn grid(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &ModuleView) {
     let small = view.icon_mode == IconMode::Small;
-    let (w, h) = if small { (160.0, 64.0) } else { (200.0, 180.0) };
-    let gap = 16.0;
+    let tight = mailcraft_engine::queries::view_settings(&app.s, app.s.selection.folder).tighter_spacing;
+    let (w, h, gap) = grid_metrics(small, tight);
     let cols = ((ui.available_width() + gap) / (w + gap)).floor().max(1.0) as usize;
     let rows = order.len().div_ceil(cols);
     // Room for icons dragged below or right of the grid.

@@ -1153,6 +1153,8 @@ fn recover_deleted_items_purges_selected() {
     let mut h = harness(app);
     assert!(h.query_by_label("Old memo").is_some());
     assert!(h.query_by_label("Purge Selected Items").is_some());
+    // The dialog says what it cannot bring back (server-side and other programs' deletions).
+    assert!(h.query_by_label(super::folders::RECOVER_SCOPE_NOTE).is_some());
     h.get_by_label("Select All").click();
     step(&mut h);
     h.get_by_label("Purge Selected Items").click();
@@ -1199,6 +1201,76 @@ fn calendar_properties_tab_saves_colour_and_read_only() {
     step(&mut h);
     assert!(names(&h).is_empty());
     assert!(mailcraft_engine::cmd::calendar::props::read(&h.state().s.mailbox, cal).read_only);
+}
+
+#[test]
+fn new_search_folder_searches_the_chosen_mailbox() {
+    let mut app = sample_app();
+    let other = app.s.mailbox.add_account(mailcraft_model::Account {
+        display_name: "Second".into(),
+        address: "second@example.org".into(),
+        ..Default::default()
+    });
+    app.s.mailbox.create_default_folders(other);
+    app.run("folder.newSearchFolder", json!({})).unwrap();
+    let mut h = harness(app);
+    h.get_by_label("Search mail in:");
+    // The mailbox list (showing the current mailbox) offers the second one; pick it and create there.
+    h.get_all_by_role(egui::accesskit::Role::ComboBox).next().unwrap().click();
+    step(&mut h);
+    h.get_all_by_label_contains("second@example.org").last().unwrap().click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    let made = h.state().s.mailbox.folders.values().filter(|f| f.kind == mailcraft_model::FolderKind::Search);
+    assert!(made.clone().any(|f| f.account == other), "{:?}", made.map(|f| f.account).collect::<Vec<_>>());
+}
+
+#[test]
+fn folder_properties_keep_the_count_choice_and_description_in_the_folder() {
+    let mut app = sample_app();
+    let inbox = app.s.selection.folder;
+    app.run("folder.properties", json!({"folder": inbox.0})).unwrap();
+    let mut h = harness(app);
+    h.get_by_label("Show total number of items").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    let f = h.state().s.mailbox.folder(inbox).unwrap().clone();
+    assert_eq!(f.show_total, Some(true));
+    let total = h.state().s.mailbox.total_count(inbox);
+    assert_eq!(h.state().s.mailbox.badge(inbox), Some(format!("[{total}]")));
+    // Reopened, the dialog shows the folder's choice.
+    h.state_mut().run("folder.properties", json!({"folder": inbox.0}));
+    step(&mut h);
+    let Some((_, p)) = h.state().ui.dialogs.last() else { panic!("no dialog") };
+    assert_eq!(p["showTotal"], true);
+}
+
+#[test]
+fn folder_description_from_an_older_profile_moves_once_and_can_be_cleared() {
+    // Regression: the old dialog-settings copy of a description was used whenever the folder's own was
+    // empty and never removed, so a cleared description came back on the next OK.
+    let app = sample_app();
+    let inbox = app.s.selection.folder;
+    let mut h = harness(app);
+    let key = format!("folder.{}.description", inbox.0);
+    super::common::set_pref(&h.ctx, &key, json!("Old note"));
+    h.state_mut().run("folder.properties", json!({"folder": inbox.0}));
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert_eq!(h.state().s.mailbox.folder(inbox).unwrap().description, "Old note");
+    assert!(super::common::pref(&h.ctx, &key).is_none(), "the old copy is gone");
+    // Cleared later, it stays cleared through another Properties + OK.
+    h.state_mut().run("folder.setProperties", json!({"folder": inbox.0, "description": ""}));
+    h.state_mut().run("folder.properties", json!({"folder": inbox.0}));
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert_eq!(h.state().s.mailbox.folder(inbox).unwrap().description, "");
 }
 
 #[test]

@@ -47,7 +47,7 @@ pub use item::{
 pub use junk::{JunkLevel, JunkList, JunkSettings};
 pub use mailbox::Mailbox;
 pub use note::{Note, NoteColor};
-pub use quickstep::{QuickStep, QuickStepAction};
+pub use quickstep::{MessageAction, QuickStep, QuickStepAction};
 pub use recover::{DeletedItem, MAX_RECOVERABLE, RecoverBin, Recoverable};
 pub use rich::{
     Block, BorderEdge, BorderJoin, BorderLine, Doc, Drawing, DrawingKind, Inline, LineRule, ParaBorders,

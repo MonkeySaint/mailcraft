@@ -589,11 +589,11 @@ impl Mailbox {
     pub fn total_count(&self, folder: FolderId) -> usize {
         self.mail.values().filter(|m| m.folder == folder).count()
     }
-    /// Folder-pane badge text: "[8]" for total-count roles when non-zero, "778" unread for others, `None`
-    /// when nothing to show.
+    /// Folder-pane badge text: "[8]" for a folder that counts every item (total-count roles, or Properties ›
+    /// "Show total number of items") when non-zero, "778" unread for others, `None` when nothing to show.
     pub fn badge(&self, folder: FolderId) -> Option<String> {
         let f = self.folders.get(&folder)?;
-        if f.role.is_some_and(FolderRole::shows_total_count) {
+        if f.counts_total() {
             let n = self.total_count(folder);
             return (n > 0).then(|| format!("[{n}]"));
         }
@@ -605,7 +605,7 @@ impl Mailbox {
         let Some(f) = self.folders.get(&folder) else {
             return String::new();
         };
-        if f.role.is_some_and(FolderRole::shows_total_count) {
+        if f.counts_total() {
             match self.total_count(folder) {
                 0 => f.name.clone(),
                 1 => format!("{}: 1 item", f.name),

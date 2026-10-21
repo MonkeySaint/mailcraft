@@ -181,6 +181,22 @@ fn notes_grid_list_and_new_note() {
 }
 
 #[test]
+fn tighter_spacing_packs_the_note_icons() {
+    let mut a = app();
+    a.run("nav.notes", json!({}));
+    let mut h = harness(super::notes, a, (1400.0, 900.0));
+    let card = |h: &Harness<'_, App>, label: &str| h.get_by_label(label).rect();
+    let (first, second) = (card(&h, "Wi-Fi for guests"), card(&h, "Retro ideas"));
+    let spread = (second.min.x - first.min.x).abs() + (second.min.y - first.min.y).abs();
+    h.state_mut().run("view.tighterSpacing", json!({}));
+    h.run_ok();
+    let (first_t, second_t) = (card(&h, "Wi-Fi for guests"), card(&h, "Retro ideas"));
+    let spread_t = (second_t.min.x - first_t.min.x).abs() + (second_t.min.y - first_t.min.y).abs();
+    assert!(first_t.width() < first.width(), "smaller cards: {first_t:?} vs {first:?}");
+    assert!(spread_t < spread, "closer together: {spread_t} vs {spread}");
+}
+
+#[test]
 fn every_view_survives_dark_narrow_and_empty() {
     for (dark, size) in [(false, (1400.0, 900.0)), (true, (640.0, 420.0)), (false, (200.0, 120.0))] {
         for mode in ["day", "workWeek", "week", "month", "schedule", "junk"] {

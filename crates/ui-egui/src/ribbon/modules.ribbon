@@ -64,7 +64,7 @@ drop L | Color | font-color | | | CR | menu=calendarColor
 group Layout | ZS
 toggle S | Use Tighter Spacing | view | view.tighterSpacing | {"on":"$!on"} | U | on=calview:tighter
 drop L | Daily Task List | tasks | | | D | menu=dailyTaskList
-drop L | Folder Pane | folder-pane | | | F | menu=folderPane
+drop L | Folder Pane | folder-pane | | | F | menu=moduleFolderPane
 drop L | Reading Pane | reading-pane | | | PN | menu=calendarReadingPane
 drop L | To-Do Bar | tasks | | | B | menu=todoBar
 group Window | ZW
@@ -113,7 +113,7 @@ button S | Add Columns | table | view.addColumns | | AC
 drop S | Expand/Collapse | collapse-ribbon | | | E | menu=expandCollapse
 group Layout | ZS
 toggle L | Use Tighter Spacing | view | view.tighterSpacing | | U | on=tighter
-drop L | Folder Pane | folder-pane | | | F | menu=folderPane
+drop L | Folder Pane | folder-pane | | | F | menu=moduleFolderPane
 drop L | Reading Pane | reading-pane | | | PN | menu=readingPane
 drop L | To-Do Bar | tasks | | | B | menu=todoBar
 group Window | ZW
@@ -173,7 +173,7 @@ button S | Add Columns | table | view.addColumns | | AC
 drop S | Expand/Collapse | collapse-ribbon | | | E | menu=expandCollapse
 group Layout | ZS
 toggle L | Use Tighter Spacing | view | view.tighterSpacing | | U | on=tighter
-drop L | Folder Pane | folder-pane | | | F | menu=folderPane
+drop L | Folder Pane | folder-pane | | | F | menu=moduleFolderPane
 drop L | Reading Pane | reading-pane | | | PN | menu=readingPane
 drop L | To-Do Bar | tasks | | | B | menu=todoBar
 group Window | ZW
@@ -213,7 +213,7 @@ toggle L | List | bullets | notes.iconView | {"mode":"list"} | T | on=notesIcon:
 button L | Line Up Icons | align-left | notes.lineUpIcons | | I
 group Layout | ZS
 toggle L | Use Tighter Spacing | view | view.tighterSpacing | | U | on=tighter
-drop L | Folder Pane | folder-pane | | | F | menu=folderPane
+drop L | Folder Pane | folder-pane | | | F | menu=moduleFolderPane
 drop L | Reading Pane | reading-pane | | | PN | menu=readingPane
 drop L | To-Do Bar | tasks | | | B | menu=todoBar
 group Window | ZW
@@ -223,6 +223,12 @@ button L | Close All Items | close | app.closeAllItems | | CA
 
 # ------------------------------------------------------------------------------------------------------------
 # Menus
+
+# View › Folder Pane in Calendar, People, Tasks and Notes: no Favorites (the Mail menu's last entry).
+menu moduleFolderPane
+item | Normal | | view.folderPane | {"mode":"normal"} | N | on=fp:normal
+item | Minimized | | view.folderPane | {"mode":"minimized"} | M | on=fp:minimized
+item | Off | | view.folderPane | {"mode":"off"} | O | on=fp:off
 
 menu calendarNewItems
 item | E-mail Message | mail | mail.newEmail | | M

@@ -6,6 +6,25 @@ use super::defs::{CmdRef, ItemKind, Kind, defs};
 use super::*;
 use crate::App;
 
+#[test]
+fn module_folder_pane_menus_have_no_favorites() {
+    // Calendar, People, Tasks and Notes offer Normal, Minimized and Off only; Mail adds Favorites.
+    for surface in ["calendar", "people", "tasks", "notes"] {
+        let tab = defs().tab(surface, true, "View").or_else(|| defs().tab(surface, false, "View")).unwrap();
+        let menu = tab
+            .groups
+            .iter()
+            .flat_map(|g| g.ctls.iter())
+            .find(|c| c.label == "Folder Pane")
+            .and_then(|c| c.menu.clone())
+            .unwrap();
+        let labels: Vec<&str> = defs().menu(&menu).unwrap().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Normal", "Minimized", "Off"], "{surface}");
+    }
+    let mail: Vec<&str> = defs().menu("folderPane").unwrap().iter().map(|i| i.label.as_str()).collect();
+    assert!(mail.contains(&"Favorites"));
+}
+
 /// Shared icon names (assets/icons, drawn by the icons area).
 const ICONS: &[&str] = &[
     "certificate",

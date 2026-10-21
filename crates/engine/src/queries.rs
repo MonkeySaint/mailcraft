@@ -188,7 +188,9 @@ fn folder_row(
     totals: &BTreeSet<u64>,
 ) -> Option<FolderRow> {
     let f = s.mailbox.folder(id)?;
-    let show_total = totals.contains(&id.0) || f.role.is_some_and(FolderRole::shows_total_count);
+    // The folder's own Properties choice; profiles from before it was kept with the folder have it in the
+    // saved dialog settings.
+    let show_total = f.show_total.unwrap_or_else(|| totals.contains(&id.0) || f.counts_total());
     let (badge, accessible) = if f.kind == FolderKind::Search {
         // Search folders count their live results (unread), not the items filed in them (none).
         let unread = crate::search_index::search_folder_counts(s, id).unread;

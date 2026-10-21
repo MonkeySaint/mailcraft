@@ -159,6 +159,14 @@ pub(crate) fn set_pref(ctx: &Context, key: &str, v: Value) {
     set_prefs(ctx, p);
 }
 
+/// Removes a dialog setting (nothing happens, and nothing is saved, when it is not there).
+pub(crate) fn remove_pref(ctx: &Context, key: &str) {
+    let mut p = prefs(ctx);
+    if p.values.remove(key).is_some() {
+        set_prefs(ctx, p);
+    }
+}
+
 /// Sets engine options (validated, saved with the profile); returns the first error, if any.
 pub(crate) fn set_options(app: &mut App, values: &[(&str, Value)]) -> Option<String> {
     let mut first = None;

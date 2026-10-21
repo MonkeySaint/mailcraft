@@ -450,9 +450,17 @@ fn function_key_number(k: Key) -> Option<u8> {
     })
 }
 
+/// Keys an open popup or context menu takes itself: letters and digits (its access keys, alone or with Alt),
+/// Enter and Space (they run the focused entry). Shortcuts with Ctrl / Cmd still apply.
+fn popup_takes(c: Chord, cx: &KeyContext) -> bool {
+    cx.popup
+        && !c.cmd
+        && (is_letter(c.key) || digit_of(c.key).is_some() || matches!(c.key, Key::Enter | Key::Space))
+}
+
 /// Resolves a chord with the built-in bindings (no registry fallback). Honours the text-focus rule.
 pub fn resolve(c: Chord, cx: &KeyContext) -> Option<Action> {
-    if !allowed_in(c, cx) {
+    if !allowed_in(c, cx) || popup_takes(c, cx) {
         return None;
     }
     if cx.widget_focus && goes_to_focused_widget(c) {
@@ -487,7 +495,7 @@ pub fn resolve_with(c: Chord, cx: &KeyContext, registry: &Registry) -> Option<Ac
     if matches!(cx.surface, Surface::Compose(_)) && !cx.ctrl_enter_sends && c == Chord::cmd(Key::Enter) {
         return None;
     }
-    if !allowed_in(c, cx) {
+    if !allowed_in(c, cx) || popup_takes(c, cx) {
         return None;
     }
     if cx.widget_focus && goes_to_focused_widget(c) {

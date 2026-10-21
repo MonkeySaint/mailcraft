@@ -13,7 +13,7 @@ use crate::cmd::util::{opt_folder, opt_str};
 use crate::compose::{ComposeKind, ComposeState};
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
 use mailcraft_model::subject::{forward_subject, reply_subject};
-use mailcraft_model::{FlagState, FolderKind, ItemId, QuickStep, QuickStepAction};
+use mailcraft_model::{Block, FlagState, FolderKind, ItemId, MessageAction, QuickStep, QuickStepAction};
 
 /// Most quick steps kept.
 const MAX_STEPS: usize = 200;
@@ -145,6 +145,19 @@ fn check_actions(s: &Session, actions: &[QuickStepAction]) -> Result<(), CmdErro
                 None => return Err(CmdError::Params(format!("no such folder {}", f.0))),
             }
         }
+        if let Some(why) = a.message().and_then(MessageAction::problem) {
+            return Err(CmdError::Params(why));
+        }
+        if let Some(flag) = a.message().and_then(|m| m.flag.as_deref())
+            && !FLAG_KEYS.iter().any(|(k, _)| *k == flag)
+        {
+            return Err(CmdError::Params(format!("unknown flag `{flag}` (use a Follow Up key)")));
+        }
+        if let QuickStepAction::NewMeeting(to) = a
+            && let Some(why) = mailcraft_model::quickstep::recipients_problem("attendee", to)
+        {
+            return Err(CmdError::Params(why));
+        }
     }
     Ok(())
 }
@@ -194,17 +207,20 @@ fn complete_setup(step: &mut QuickStep, p: &Value) -> bool {
                     changed = true;
                 }
             }
-            QuickStepAction::Forward(list)
-            | QuickStepAction::NewMessageTo(list)
-            | QuickStepAction::ForwardAsAttachment(list)
-                if list.is_empty() =>
-            {
+            QuickStepAction::NewMeeting(list) if list.is_empty() => {
                 if let Some(to) = &to {
                     *list = to.clone();
                     changed = true;
                 }
             }
-            _ => {}
+            other => {
+                if let Some(m) = other.message_mut().filter(|m| m.has_no_recipients())
+                    && let Some(to) = &to
+                {
+                    m.to = to.clone();
+                    changed = true;
+                }
+            }
         }
     }
     changed
@@ -236,7 +252,91 @@ pub fn blocked_for(step: &QuickStep, count: usize, group: bool) -> Option<&'stat
 }
 
 fn needs_items(a: &QuickStepAction) -> bool {
-    !matches!(a, QuickStepAction::NewMessageTo(_) | QuickStepAction::NewMeeting)
+    !matches!(a, QuickStepAction::NewMessageTo(_) | QuickStepAction::NewMeeting(_))
+}
+
+/// Applies a message action's options to the compose it opened: Cc / Bcc are added, To replaces the opened
+/// To only when `replace_to` (a forward as attachment starts with nobody), the subject, importance and flag
+/// replace the usual ones, and the text goes at the top of the body.
+fn apply_message_options(s: &mut Session, cid: u64, m: &MessageAction, replace_to: bool) {
+    let flag = m.flag.as_deref().map(|k| flag_of(s, k));
+    let Some(c) = s.composes.get_mut(&cid) else { return };
+    let join = |current: &str, extra: &[String]| {
+        let extra = extra.join("; ");
+        if extra.is_empty() {
+            current.to_owned()
+        } else if current.trim().is_empty() {
+            extra
+        } else {
+            format!("{current}; {extra}")
+        }
+    };
+    c.to = if replace_to { m.to.join("; ") } else { join(&c.to, &m.to) };
+    c.cc = join(&c.cc, &m.cc);
+    c.bcc = join(&c.bcc, &m.bcc);
+    if !m.bcc.is_empty() {
+        c.show_bcc = true;
+    }
+    if !m.subject.trim().is_empty() {
+        c.subject = m.subject.trim().to_owned();
+    }
+    if let Some(i) = m.importance {
+        c.importance = i;
+    }
+    if let Some((label, start, due)) = flag {
+        c.flag = FlagState::Flagged { label, start, due, reminder: None };
+    }
+    if !m.text.trim().is_empty() {
+        // Above the caret line the compose opened with (and so above the signature and forwarded text).
+        let mut blocks: Vec<Block> = m.text.trim_end().lines().map(Block::text_paragraph).collect();
+        let caret_line = blocks.len();
+        blocks.push(Block::text_paragraph(""));
+        blocks.append(&mut c.body.blocks);
+        c.body.blocks = blocks;
+        // The caret on the empty line under the text.
+        c.selection = crate::compose::BodySelection::caret(crate::compose::DocPos::new(vec![caret_line], 0));
+        c.extra_ranges.clear();
+    }
+    c.dirty = true;
+}
+
+/// Delay before an automatically sent quick-step message leaves the Outbox.
+const AUTO_SEND_DELAY_SECS: i64 = 60;
+
+/// Sends the compose a message action opened ("send automatically"): it waits in the Outbox for a minute,
+/// so it can still be opened and stopped. Returns an error text when it could not be sent; the compose then
+/// stays open without the delay (the user did not ask for Delay Delivery).
+fn auto_send(s: &mut Session, cid: u64) -> Option<String> {
+    let now = s.now();
+    let at = mailcraft_model::DateTime {
+        unix: now.unix.saturating_add(AUTO_SEND_DELAY_SECS),
+        offset_min: now.offset_min,
+    };
+    let before = s.composes.get_mut(&cid).map(|c| c.delay_until.replace(at));
+    let why = match invoke(s, "compose.send", &json!({"compose": cid})) {
+        Ok(r) if r.get("sent").and_then(Value::as_bool) == Some(true) => return None,
+        Ok(r) => not_sent_text(&r),
+        Err(e) => format!("{e}; the message is open for you"),
+    };
+    if let (Some(before), Some(c)) = (before, s.composes.get_mut(&cid)) {
+        c.delay_until = before;
+    }
+    Some(why)
+}
+
+/// What the user is told when compose.send stopped an automatic send (`r`: its result).
+fn not_sent_text(r: &Value) -> String {
+    if let Some(e) = r.get("error").and_then(Value::as_str).filter(|e| !e.trim().is_empty()) {
+        return format!("{e}; the message is open for you");
+    }
+    let why = match r.get("reason").and_then(Value::as_str) {
+        Some("spelling") => "The message has spelling issues",
+        Some("checkNames") => "A recipient name matches more than one contact",
+        Some("missingCertificates") => "Some recipients have no certificate to encrypt for",
+        Some("attachmentReminder") => "The message mentions an attachment but has none",
+        _ => "The message could not be sent automatically",
+    };
+    format!("{why}, so it was not sent; it is open for you")
 }
 
 /// Runs another command's implementation as part of this quick step. Unlike [`Session::run`] it skips the
@@ -252,13 +352,7 @@ fn invoke(s: &mut Session, id: &str, params: &Value) -> CmdResult {
 
 /// Opens a reply/forward for `id` through the mail commands (falls back to a plain compose state when that
 /// command is not registered). Returns the compose id opened, if any.
-fn respond(
-    s: &mut Session,
-    cmd: &str,
-    kind: ComposeKind,
-    ids: &[ItemId],
-    to: &[String],
-) -> Result<Option<u64>, CmdError> {
+fn respond(s: &mut Session, cmd: &str, kind: ComposeKind, ids: &[ItemId]) -> Result<Option<u64>, CmdError> {
     let Some(id) = ids.first().copied() else {
         return Ok(None);
     };
@@ -286,14 +380,7 @@ fn respond(
     if s.next_compose == before {
         return Ok(None);
     }
-    let cid = s.next_compose;
-    if !to.is_empty()
-        && let Some(c) = s.composes.get_mut(&cid)
-    {
-        let extra = to.join("; ");
-        c.to = if c.to.trim().is_empty() { extra } else { format!("{}; {extra}", c.to) };
-    }
-    Ok(Some(cid))
+    Ok(Some(s.next_compose))
 }
 
 /// True for the gallery's fixed Create New entry (`"id": "new"`, or its name when no step is called that).
@@ -350,15 +437,14 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Disabled(why.into()));
     }
     let mut touched: Vec<ItemId> = Vec::new();
-    let mut composes: Vec<u64> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
+    let mut out = RunOut::default();
     let now = s.now();
     for action in &step.actions {
         let live: Vec<ItemId> = ids.iter().copied().filter(|id| s.mailbox.mail.contains_key(id)).collect();
         match action {
             QuickStepAction::MoveTo(Some(f)) => match s.mailbox.move_items(&live, *f) {
                 Ok(moved) => touched.extend(moved),
-                Err(e) => errors.push(e.to_string()),
+                Err(e) => out.errors.push(e.to_string()),
             },
             QuickStepAction::CopyTo(Some(f)) => {
                 if s.mailbox.folder(*f).is_some_and(|x| x.kind == FolderKind::Mail) {
@@ -370,13 +456,13 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                         }
                     }
                 } else {
-                    errors.push(format!("no such mail folder {}", f.0));
+                    out.errors.push(format!("no such mail folder {}", f.0));
                 }
             }
             QuickStepAction::MoveTo(None) | QuickStepAction::CopyTo(None) => {}
             QuickStepAction::Delete => match s.mailbox.delete_items(&live) {
                 Ok(_) => touched.extend(live.iter().copied()),
-                Err(e) => errors.push(e.to_string()),
+                Err(e) => out.errors.push(e.to_string()),
             },
             QuickStepAction::PermanentlyDelete => {
                 for id in &live {
@@ -442,16 +528,16 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                     }
                 }
             }
-            QuickStepAction::NewMessageTo(to) => {
-                let c = ComposeState { kind: ComposeKind::New, to: to.join("; "), ..Default::default() };
+            QuickStepAction::NewMessageTo(m) => {
+                let c = ComposeState { kind: ComposeKind::New, ..Default::default() };
                 let cid = s.open_compose(crate::compose::with_default_signature(&s.mailbox, c));
-                composes.push(cid);
+                finish_message(s, cid, m, true, &mut out);
             }
             QuickStepAction::Reply | QuickStepAction::ReplyAll | QuickStepAction::Forward(_) => {
-                let (cmd, kind, to) = match action {
-                    QuickStepAction::Reply => ("mail.reply", ComposeKind::Reply, &[][..]),
-                    QuickStepAction::ReplyAll => ("mail.replyAll", ComposeKind::ReplyAll, &[][..]),
-                    QuickStepAction::Forward(to) => ("mail.forward", ComposeKind::Forward, to.as_slice()),
+                let (cmd, kind) = match action {
+                    QuickStepAction::Reply => ("mail.reply", ComposeKind::Reply),
+                    QuickStepAction::ReplyAll => ("mail.replyAll", ComposeKind::ReplyAll),
+                    QuickStepAction::Forward(_) => ("mail.forward", ComposeKind::Forward),
                     _ => continue,
                 };
                 // A reply goes to one message (several are refused above); a forward of several messages is
@@ -459,21 +545,19 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                 // When the response cannot be made, the step stops: the run fails and is rolled back, so a
                 // later Delete or Move never acts on messages that were not answered or forwarded.
                 if !live.is_empty()
-                    && let Some(cid) = respond(s, cmd, kind, &live, to)?
+                    && let Some(cid) = respond(s, cmd, kind, &live)?
                 {
-                    composes.push(cid);
+                    match action {
+                        QuickStepAction::Forward(m) => finish_message(s, cid, m, false, &mut out),
+                        _ => out.composes.push(cid),
+                    }
                 }
             }
-            QuickStepAction::ForwardAsAttachment(to) => {
+            QuickStepAction::ForwardAsAttachment(m) => {
                 if !live.is_empty() {
                     let r = invoke(s, "mail.forwardAsAttachment", &json!({"ids": ids_json(&live)}))?;
                     if let Some(cid) = r.get("compose").and_then(Value::as_u64) {
-                        if !to.is_empty()
-                            && let Some(c) = s.composes.get_mut(&cid)
-                        {
-                            c.to = to.join("; ");
-                        }
-                        composes.push(cid);
+                        finish_message(s, cid, m, !m.to.is_empty(), &mut out);
                     }
                 }
             }
@@ -496,7 +580,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                         )
                     };
                     if let Err(e) = r {
-                        errors.push(e.to_string());
+                        out.errors.push(e.to_string());
                     }
                 }
             }
@@ -504,7 +588,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                 if !live.is_empty() {
                     match invoke(s, "mail.ignore", &json!({"ids": ids_json(&live), "confirm": true})) {
                         Ok(_) => touched.extend(live.iter().copied()),
-                        Err(e) => errors.push(e.to_string()),
+                        Err(e) => out.errors.push(e.to_string()),
                     }
                 }
             }
@@ -513,7 +597,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                     let p = json!({"ids": ids_json(&live), "folder": f.0});
                     match invoke(s, "mail.alwaysMoveConversation", &p) {
                         Ok(_) => touched.extend(live.iter().copied()),
-                        Err(e) => errors.push(e.to_string()),
+                        Err(e) => out.errors.push(e.to_string()),
                     }
                 }
             }
@@ -527,22 +611,59 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                 if !live.is_empty() {
                     match invoke(s, cmd, &json!({"ids": ids_json(&live)})) {
                         Ok(_) => touched.extend(live.iter().copied()),
-                        Err(e) => errors.push(e.to_string()),
+                        Err(e) => out.errors.push(e.to_string()),
                     }
                 }
             }
-            QuickStepAction::NewMeeting => match invoke(s, "calendar.newMeeting", &json!({})) {
-                Ok(_) => {}
-                Err(CmdError::Unknown(_)) => {
-                    dialog(s, "newMeeting", json!({}))?;
+            QuickStepAction::NewMeeting(to) => {
+                let p = if to.is_empty() { json!({}) } else { json!({"attendees": to}) };
+                match invoke(s, "calendar.newMeeting", &p) {
+                    Ok(_) => {}
+                    Err(CmdError::Unknown(_)) => {
+                        dialog(s, "newMeeting", p)?;
+                    }
+                    Err(e) => out.errors.push(e.to_string()),
                 }
-                Err(e) => errors.push(e.to_string()),
-            },
+            }
         }
     }
     touched.sort();
     touched.dedup();
-    Ok(json!({"step": step.id, "items": touched.len(), "composes": composes, "errors": errors}))
+    Ok(json!({
+        "step": step.id,
+        "items": touched.len(),
+        "composes": out.composes,
+        "sent": out.sent,
+        "errors": out.errors,
+    }))
+}
+
+/// What a run made besides changed items: messages opened, messages sent automatically, problems.
+#[derive(Default)]
+struct RunOut {
+    composes: Vec<u64>,
+    sent: usize,
+    errors: Vec<String>,
+}
+
+/// Applies a message action's options to the compose `cid` it opened and, when the action says so, sends
+/// it (the compose then does not open). A message that cannot be sent stays open with the reason noted.
+fn finish_message(s: &mut Session, cid: u64, m: &MessageAction, replace_to: bool, out: &mut RunOut) {
+    apply_message_options(s, cid, m, replace_to);
+    if !m.auto_send {
+        out.composes.push(cid);
+        return;
+    }
+    match auto_send(s, cid) {
+        None => {
+            out.sent = out.sent.saturating_add(1);
+            s.notices.retain(|n| !matches!(n, crate::Notice::Compose(c) if *c == cid));
+        }
+        Some(why) => {
+            out.errors.push(why);
+            out.composes.push(cid);
+        }
+    }
 }
 
 fn ids_json(ids: &[ItemId]) -> Value {
@@ -597,9 +718,9 @@ fn template(s: &Session, name: &str) -> Result<(&'static str, Vec<QuickStepActio
         "flagMove" => {
             ("Flag & Move", vec![QuickStepAction::Flag("today".into()), QuickStepAction::MoveTo(None)])
         }
-        "newEmailTo" => ("New email to", vec![QuickStepAction::NewMessageTo(Vec::new())]),
-        "forwardTo" => ("Forward to", vec![QuickStepAction::Forward(Vec::new())]),
-        "newMeeting" => ("New meeting", vec![QuickStepAction::NewMeeting]),
+        "newEmailTo" => ("New email to", vec![QuickStepAction::NewMessageTo(MessageAction::default())]),
+        "forwardTo" => ("Forward to", vec![QuickStepAction::Forward(MessageAction::default())]),
+        "newMeeting" => ("New meeting", vec![QuickStepAction::NewMeeting(Vec::new())]),
         "custom" => ("My Quick Step", Vec::new()),
         other => return Err(CmdError::Params(format!("unknown template `{other}`"))),
     })
@@ -861,19 +982,194 @@ mod tests {
     #[test]
     fn new_meeting_step_opens_the_meeting_form() {
         let (mut s, _, _) = session();
-        s.run("quicksteps.new", &json!({"name": "Meet", "actions": ["NewMeeting"]})).unwrap();
+        s.run("quicksteps.new", &json!({"name": "Meet", "actions": [{"NewMeeting": ["ann@example.com"]}]}))
+            .unwrap();
         let undo_before = s.undo.undo.len();
         let appointments_before = s.mailbox.appointments.len();
         let r = s.run("quicksteps.run", &json!({"id": "Meet"})).unwrap();
         assert_eq!(r["errors"], json!([]), "{r}");
-        // New Meeting opens the meeting form; nothing is saved (and nothing to undo) until it is sent.
+        // New Meeting opens the meeting form with the step's attendees; nothing is saved (and nothing to
+        // undo) until it is sent.
         assert!(
-            s.notices.iter().any(|n| matches!(n, crate::Notice::OpenDialog(_, p) if p["meeting"] == true)),
+            s.notices.iter().any(|n| matches!(n, crate::Notice::OpenDialog(_, p)
+                if p["meeting"] == true && p["attendees"].to_string().contains("ann@example.com"))),
             "{:?}",
             s.notices
         );
         assert_eq!(s.mailbox.appointments.len(), appointments_before);
         assert_eq!(s.undo.undo.len(), undo_before);
+    }
+
+    #[test]
+    fn new_meeting_step_without_attendees_opens_an_empty_meeting() {
+        // Regression: an older profile's step (no attendees) went to First Time Setup, which would not
+        // save without attendees, so a meeting step with nobody invited could not run at all.
+        let (mut s, _, _) = session();
+        s.run("quicksteps.new", &json!({"name": "Meet", "actions": ["NewMeeting"]})).unwrap();
+        let step = s.mailbox.quick_steps.iter().find(|q| q.name == "Meet").unwrap();
+        assert!(!step.needs_setup());
+        s.notices.clear();
+        let r = s.run("quicksteps.run", &json!({"id": "Meet"})).unwrap();
+        assert!(r["dialog"].is_null(), "{r}");
+        assert_eq!(r["errors"], json!([]), "{r}");
+        assert!(
+            s.notices.iter().any(|n| matches!(n, crate::Notice::OpenDialog(_, p)
+                if p["meeting"] == true && p["attendees"].as_array().is_none_or(Vec::is_empty))),
+            "{:?}",
+            s.notices
+        );
+        let step = s.mailbox.quick_steps.iter().find(|q| q.name == "Meet").unwrap();
+        assert_eq!(step.actions, vec![QuickStepAction::NewMeeting(Vec::new())]);
+    }
+
+    #[test]
+    fn meeting_attendees_and_recipients_are_size_capped() {
+        let (mut s, _, _) = session();
+        let long = "x".repeat(mailcraft_model::quickstep::MAX_ACTION_RECIPIENT_CHARS + 1);
+        let r = s.run("quicksteps.new", &json!({"name": "Big", "actions": [{"NewMeeting": [long]}]}));
+        assert!(r.is_err(), "{r:?}");
+        let fwd = QuickStepAction::Forward(MessageAction::to(vec![long.clone()]));
+        assert!(s.run("quicksteps.new", &json!({"name": "Big", "actions": [fwd]})).is_err());
+        assert!(!s.mailbox.quick_steps.iter().any(|q| q.name == "Big"));
+    }
+
+    #[test]
+    fn stopped_auto_send_keeps_no_delay_and_says_why() {
+        // Regression: a stopped automatic send left the one-minute delay on the open message (a later Send
+        // was held in the Outbox) and reported the internal reason id ("spelling").
+        let mut s = crate::cmd::compose::tests::session();
+        s.run("options.set", &json!({"key": "mail.compose.spellBeforeSend", "value": true})).unwrap();
+        let m = MessageAction {
+            to: vec!["team@example.com".into()],
+            text: "Teh recieved wrod".into(),
+            auto_send: true,
+            ..MessageAction::default()
+        };
+        s.run("quicksteps.new", &json!({"name": "Note", "actions": [QuickStepAction::NewMessageTo(m)]}))
+            .unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "Note"})).unwrap();
+        assert_eq!(r["sent"], 0, "{r}");
+        let cid = r["composes"][0].as_u64().unwrap();
+        assert_eq!(s.composes[&cid].delay_until, None);
+        let why = r["errors"][0].as_str().unwrap();
+        assert!(why.contains("spelling issues") && why.contains("open for you"), "{why}");
+        assert_eq!(not_sent_text(&json!({"reason": "checkNames"})).split(',').count(), 2);
+        assert!(not_sent_text(&json!({})).contains("could not be sent"));
+    }
+
+    #[test]
+    fn new_message_options_fill_the_message() {
+        let (mut s, _, _) = session();
+        let m = MessageAction {
+            to: vec!["team@example.com".into()],
+            cc: vec!["lead@example.org".into()],
+            bcc: vec!["audit@example.net".into()],
+            subject: "Weekly status".into(),
+            text: "Hello team,\nhere is the status.".into(),
+            importance: Some(Importance::High),
+            flag: Some("tomorrow".into()),
+            auto_send: false,
+        };
+        s.run("quicksteps.new", &json!({"name": "Status", "actions": [QuickStepAction::NewMessageTo(m)]}))
+            .unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "Status"})).unwrap();
+        let cid = r["composes"][0].as_u64().unwrap();
+        let c = &s.composes[&cid];
+        assert_eq!(c.to, "team@example.com");
+        assert_eq!(c.cc, "lead@example.org");
+        assert_eq!(c.bcc, "audit@example.net");
+        assert!(c.show_bcc);
+        assert_eq!(c.subject, "Weekly status");
+        assert_eq!(c.importance, Importance::High);
+        assert!(matches!(&c.flag, FlagState::Flagged { due: Some(_), .. }), "{:?}", c.flag);
+        assert!(c.body.to_plain_text().starts_with("Hello team,\nhere is the status."));
+    }
+
+    #[test]
+    fn forward_options_add_to_the_forward_and_can_send_it() {
+        let (mut s, inbox, _) = session();
+        let first = s.mailbox.items_in(inbox)[0].id;
+        let subject = s.mailbox.mail[&first].subject.clone();
+        let m = MessageAction {
+            to: vec!["boss@example.com".into()],
+            cc: vec!["me2@example.org".into()],
+            text: "FYI".into(),
+            ..MessageAction::default()
+        };
+        s.run("quicksteps.new", &json!({"name": "Fwd", "actions": [QuickStepAction::Forward(m.clone())]}))
+            .unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "Fwd", "ids": [first.0]})).unwrap();
+        let cid = r["composes"][0].as_u64().unwrap();
+        let c = &s.composes[&cid];
+        assert_eq!(c.to, "boss@example.com");
+        assert_eq!(c.cc, "me2@example.org");
+        assert!(c.subject.ends_with(&subject), "the usual forward subject: {}", c.subject);
+        assert!(c.body.to_plain_text().starts_with("FYI\n"));
+        assert_eq!(c.source, Some(first));
+
+        // Send automatically without an account to send from: the forward stays open, with the reason.
+        let auto = MessageAction { auto_send: true, subject: "Passing on".into(), ..m };
+        let fwd_now = json!({"name": "Fwd now", "actions": [QuickStepAction::Forward(auto)]});
+        s.run("quicksteps.new", &fwd_now).unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "Fwd now", "ids": [first.0]})).unwrap();
+        assert_eq!((r["sent"].as_u64(), r["composes"].as_array().map(Vec::len)), (Some(0), Some(1)), "{r}");
+        assert_eq!(r["errors"].as_array().map(Vec::len), Some(1));
+        let open = r["composes"][0].as_u64().unwrap();
+        assert_eq!(s.composes[&open].delay_until, None, "the delay goes with the failed send");
+
+        // With a sending account: no compose stays open; the message waits a minute in the Outbox.
+        let mut s = crate::cmd::compose::tests::session();
+        let inbox = s.mailbox.folders.values().find(|f| f.role == Some(mailcraft_model::FolderRole::Inbox));
+        let inbox = inbox.unwrap().id;
+        let first = s.mailbox.add_mail(mailcraft_model::MailItem {
+            folder: inbox,
+            subject: "Badges".into(),
+            from: Some(mailcraft_model::Address::new(None, "ann@example.com")),
+            ..Default::default()
+        });
+        s.run("quicksteps.new", &fwd_now).unwrap();
+        let open_before = s.composes.len();
+        s.notices.clear();
+        let r = s.run("quicksteps.run", &json!({"id": "Fwd now", "ids": [first.0]})).unwrap();
+        assert_eq!(r["sent"], 1, "{r}");
+        assert_eq!(r["composes"], json!([]));
+        assert_eq!(s.composes.len(), open_before);
+        assert!(!s.notices.iter().any(|n| matches!(n, crate::Notice::Compose(_))), "no window opens");
+        let account = s.current_account().unwrap();
+        let outbox = s.mailbox.role_folder(account, mailcraft_model::FolderRole::Outbox).unwrap();
+        let queued = s.mailbox.items_in(outbox);
+        let sent = queued.iter().find(|m| m.subject == "Passing on").expect("queued in the Outbox");
+        assert!(sent.sent.unwrap().unix > s.now().unix, "held for the delay");
+    }
+
+    #[test]
+    fn forward_as_attachment_options_and_bad_options() {
+        let (mut s, inbox, _) = session();
+        let first = s.mailbox.items_in(inbox)[0].id;
+        let m = MessageAction {
+            to: vec!["pat@example.net".into()],
+            subject: "Evidence".into(),
+            importance: Some(Importance::Low),
+            ..MessageAction::default()
+        };
+        s.run(
+            "quicksteps.new",
+            &json!({"name": "Att", "actions": [QuickStepAction::ForwardAsAttachment(m)]}),
+        )
+        .unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "Att", "ids": [first.0]})).unwrap();
+        let c = &s.composes[&r["composes"][0].as_u64().unwrap()];
+        assert_eq!(
+            (c.to.as_str(), c.subject.as_str(), c.importance),
+            ("pat@example.net", "Evidence", Importance::Low)
+        );
+        assert_eq!(c.attachments.len(), 1);
+
+        // Hostile options are refused, not stored.
+        let huge = json!({"Forward": {"to": ["a@example.com"], "text": "x".repeat(70_000)}});
+        assert!(s.run("quicksteps.new", &json!({"name": "Big", "actions": [huge]})).is_err());
+        let flag = json!({"NewMessageTo": {"to": ["a@example.com"], "flag": "someday"}});
+        assert!(s.run("quicksteps.new", &json!({"name": "Bad flag", "actions": [flag]})).is_err());
     }
 
     #[test]
@@ -921,7 +1217,7 @@ mod tests {
         // Without the mail commands the quick step builds the reply itself.
         s.registry.specs.retain(|c| c.id != "mail.reply");
         let target = s.selection.items[0];
-        let cid = respond(&mut s, "mail.reply", ComposeKind::Reply, &[target], &[]).unwrap().unwrap();
+        let cid = respond(&mut s, "mail.reply", ComposeKind::Reply, &[target]).unwrap().unwrap();
         let c = &s.composes[&cid];
         assert_eq!(c.source, Some(target));
         assert_eq!(c.signature.as_ref().map(|g| g.name.as_str()), Some("Re"));

@@ -12,7 +12,7 @@ use super::common::{
 };
 use crate::App;
 use mailcraft_engine::search_index::SEARCH_FOLDER_TEMPLATES;
-use mailcraft_model::FolderId;
+use mailcraft_model::{FolderId, FolderRole};
 
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
@@ -738,10 +738,14 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         .unwrap_or_default();
     let init = |a: &App| PropState {
         name: d.str("name"),
-        description: common::pref(ctx, &format!("{key}description"))
-            .and_then(|v| v.as_str().map(str::to_owned))
+        // Kept with the folder; profiles from before that have them in the saved dialog settings.
+        description: Some(d.str("description"))
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                common::pref(ctx, &format!("{key}description")).and_then(|v| v.as_str().map(str::to_owned))
+            })
             .unwrap_or_default(),
-        show_total: common::pref(ctx, &format!("{key}showTotal")).and_then(|v| v.as_bool()).unwrap_or(false),
+        show_total: d.get("showTotal").and_then(Value::as_bool).unwrap_or(false),
         archive: folder.map(|f| super::archive::FolderForm::load(a, f)).unwrap_or_default(),
         cal: cal_init.clone(),
         book: book_init.clone(),
@@ -860,8 +864,32 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             }
             match ok_cancel(ui, app, true) {
                 Some(true) => {
-                    common::set_pref(ctx, &format!("{key}description"), json!(st.description));
-                    common::set_pref(ctx, &format!("{key}showTotal"), json!(st.show_total));
+                    // Description and the count choice live in the folder (undoable, saved with it).
+                    // Profiles from before keep them in the dialog settings: the first OK moves them into
+                    // the folder and drops the old copies, so a description cleared later stays cleared.
+                    let old_total = d.get("showTotal").and_then(Value::as_bool).unwrap_or(false);
+                    let old_text = d.str("description");
+                    let legacy_text = format!("{key}description");
+                    let legacy_total = format!("{key}showTotal");
+                    let has_legacy_text = common::pref(ctx, &legacy_text).is_some();
+                    let write_total =
+                        is_mail && (st.show_total != old_total || common::pref(ctx, &legacy_total).is_some());
+                    if let Some(f) = folder
+                        && (write_total || has_legacy_text || st.description.trim_end() != old_text)
+                    {
+                        let mut p = json!({"folder": f, "description": st.description.trim_end()});
+                        if write_total && let Some(o) = p.as_object_mut() {
+                            o.insert("showTotal".into(), json!(st.show_total));
+                        }
+                        if app.run("folder.setProperties", p).is_none() {
+                            st.error = last_error(app);
+                            return Out::Keep;
+                        }
+                        common::remove_pref(ctx, &legacy_text);
+                        if write_total {
+                            common::remove_pref(ctx, &legacy_total);
+                        }
+                    }
                     if !is_default
                         && st.name.trim() != d.str("name")
                         && !st.name.trim().is_empty()
@@ -1004,6 +1032,8 @@ struct SearchFolderState {
     text: String,
     name: String,
     error: String,
+    /// Search mail in: the mailbox (account id).
+    account: Option<u32>,
 }
 
 fn new_search_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -1068,13 +1098,30 @@ fn new_search_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 } else {
                     muted(ui, app, "No options to set.");
                 }
-                let acct = app
+                // Search mail in: the mailboxes (accounts, data files) that have a Search Folders folder.
+                let boxes: Vec<(u32, String)> = app
                     .s
-                    .current_account()
-                    .and_then(|a| app.s.mailbox.account(a))
-                    .map(common::account_title)
-                    .unwrap_or_default();
-                muted(ui, app, &format!("Search mail in: {acct}"));
+                    .mailbox
+                    .accounts
+                    .iter()
+                    .filter(|a| app.s.mailbox.role_folder(a.id, FolderRole::SearchFolders).is_some())
+                    .map(|a| (a.id.0, common::account_title(a)))
+                    .collect();
+                if st.account.is_none_or(|a| !boxes.iter().any(|(id, _)| *id == a)) {
+                    let current = app.s.current_account().map(|a| a.0);
+                    st.account = boxes
+                        .iter()
+                        .find(|(id, _)| Some(*id) == current)
+                        .or(boxes.first())
+                        .map(|(id, _)| *id);
+                }
+                let mut pick = boxes.iter().position(|(id, _)| Some(*id) == st.account).unwrap_or(0);
+                let labels: Vec<&str> = boxes.iter().map(|(_, l)| l.as_str()).collect();
+                ui.horizontal(|ui| {
+                    ui.label("Search mail in:");
+                    common::combo_idx(ui, ("sf-box", uid), &mut pick, &labels, 240.0);
+                });
+                st.account = boxes.get(pick).map(|(id, _)| *id);
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
                 }
@@ -1087,9 +1134,9 @@ fn new_search_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 match ok_cancel(ui, app, ready) {
                     Some(true) => {
                         let params = if custom {
-                            json!({"template": template, "value": text, "name": st.name.trim()})
+                            json!({"template": template, "value": text, "name": st.name.trim(), "account": st.account})
                         } else {
-                            json!({"template": template, "value": text})
+                            json!({"template": template, "value": text, "account": st.account})
                         };
                         if app.run("folder.newSearchFolder", params).is_some() {
                             Out::Close
@@ -1142,6 +1189,7 @@ fn recover(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         ),
                     );
                 }
+                muted(ui, app, RECOVER_SCOPE_NOTE);
                 let tz = app.s.tz_offset_min;
                 egui::ScrollArea::vertical().id_salt(("rec", uid)).max_height(260.0).show(ui, |ui| {
                     egui::Grid::new(("recg", uid)).num_columns(6).striped(true).show(ui, |ui| {
@@ -1223,6 +1271,12 @@ fn recover(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         },
     )
 }
+
+/// What Recover Deleted Items can bring back: what was deleted for good in MailCraft on this computer. An
+/// IMAP server keeps no copy of messages it expunged, so those (and ones deleted with another program)
+/// cannot be listed here.
+pub(crate) const RECOVER_SCOPE_NOTE: &str = "Only items deleted for good in MailCraft on this computer are \
+     listed. Messages removed on the mail server, or deleted with another program, cannot be recovered here.";
 
 /// Item type shown in the Recover Deleted Items list.
 fn kind_label(kind: &str) -> &'static str {

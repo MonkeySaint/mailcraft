@@ -1159,6 +1159,22 @@ fn delete(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"deleted": touched.len(), "ids": ids_json(&touched)}))
 }
 
+/// How many of `ids` Delete would remove for good rather than move to Deleted Items: messages already in
+/// Deleted Items (or a folder under it), or in an account without one. The window asks first for those
+/// (Advanced › "Prompt for confirmation before permanently deleting items").
+pub fn purged_by_delete(s: &Session, ids: &[ItemId]) -> usize {
+    ids.iter()
+        .filter_map(|id| s.mailbox.mail.get(id))
+        .filter(|m| {
+            let deleted = s
+                .mailbox
+                .folder_account(m.folder)
+                .and_then(|a| s.mailbox.role_folder(a, FolderRole::DeletedItems));
+            deleted.is_none_or(|d| s.mailbox.is_in_subtree(m.folder, d))
+        })
+        .count()
+}
+
 fn permanent_delete(s: &mut Session, p: &Value) -> CmdResult {
     let ids = mail_targets(s, p);
     let order = list_order(s);
@@ -2482,18 +2498,89 @@ fn junk(s: &mut Session, p: &Value) -> CmdResult {
     }
 }
 
-/// The group or mailing list a message came through: its List-Post address, else the first To/Cc address
-/// that is not one of the user's own.
+/// The group or mailing list a message came through (`None` = it shows no sign of one, and Never Block this
+/// Group or Mailing List is unavailable):
+/// - its List-Post `mailto:` address (RFC 2369);
+/// - else, with a List-Id (RFC 2919, `<label.namespace>`), the To/Cc address that list id names (local part
+///   one of its labels, domain its tail), or `label@namespace` built from the id when none is addressed;
+/// - else the Sender, when it differs from the author and is not someone the user knows (a contact, or the
+///   author of other mail): groups send on their members' behalf, delegates are people.
+///
+/// Recipients are never picked just for being there: a cross-posted copy or a delegate's message does not
+/// put a colleague on the Safe Recipients List.
 fn list_entry(s: &Session, item: &MailItem) -> Option<String> {
     if let Some(a) = crate::junk::list_address(item) {
         return Some(a);
     }
     let mine = my_addresses(s);
-    item.to
-        .iter()
-        .chain(item.cc.iter())
-        .map(|a| a.addr.trim().to_lowercase())
-        .find(|a| !a.is_empty() && !mine.contains(a))
+    let own = |a: &str| a.is_empty() || mine.iter().any(|m| m == a);
+    let from = item.from.as_ref().map(|a| a.addr.trim().to_lowercase()).unwrap_or_default();
+    let list_id = item
+        .raw
+        .as_deref()
+        .and_then(|raw| crate::rules_exec::header_value(raw, "List-Id"))
+        .and_then(|v| list_id_of(&v));
+    if let Some(id) = list_id {
+        let named = item
+            .to
+            .iter()
+            .chain(item.cc.iter())
+            .map(|a| a.addr.trim().to_lowercase())
+            .find(|a| !own(a) && *a != from && names_list_id(a, &id));
+        return named.or_else(|| list_id_address(&id));
+    }
+    let sender =
+        item.sender.as_ref().map(|a| a.addr.trim().to_lowercase()).filter(|a| !own(a) && *a != from)?;
+    (!known_person(s, &sender)).then_some(sender)
+}
+
+/// The identifier of a List-Id field value (`Dev list <dev.lists.example.org>` → `dev.lists.example.org`),
+/// lower-cased; `None` when it is not a dotted name.
+fn list_id_of(value: &str) -> Option<String> {
+    let inner = match value.rfind('<') {
+        Some(open) => value.get(open.saturating_add(1)..)?.split('>').next()?,
+        None => value,
+    };
+    let id = inner.trim().to_lowercase();
+    let ok = id.chars().count() <= mailcraft_model::junk::MAX_ENTRY_CHARS
+        && id.contains('.')
+        && !id.starts_with('.')
+        && !id.ends_with('.')
+        && !id.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '<' | '>' | ','));
+    ok.then_some(id)
+}
+
+/// Whether address `addr` is the one list id `id` names: its domain is the id's tail and its local part one
+/// of the labels in front (`dev@lists.example.org` for `dev.lists.example.org`).
+fn names_list_id(addr: &str, id: &str) -> bool {
+    let Some((local, domain)) = addr.rsplit_once('@') else {
+        return false;
+    };
+    if local.is_empty() || domain.is_empty() {
+        return false;
+    }
+    id.strip_suffix(domain)
+        .and_then(|head| head.strip_suffix('.'))
+        .is_some_and(|head| head.split('.').any(|label| label == local))
+}
+
+/// The address a list id stands for when no recipient carries it: `label.namespace` → `label@namespace`.
+fn list_id_address(id: &str) -> Option<String> {
+    let (label, namespace) = id.split_once('.')?;
+    (!label.is_empty() && namespace.contains('.')).then(|| format!("{label}@{namespace}"))
+}
+
+/// Whether `addr` belongs to someone the user knows: a contact, or the author of mail in the mailbox.
+fn known_person(s: &Session, addr: &str) -> bool {
+    let is = |a: &str| a.trim().eq_ignore_ascii_case(addr);
+    s.mailbox.contacts.values().flat_map(|c| c.emails.iter()).any(|e| is(e))
+        || s.mailbox.mail.values().any(|m| m.from.as_ref().is_some_and(|f| is(&f.addr)))
+}
+
+/// The group or mailing list address Never Block this Group or Mailing List would trust for message `id`
+/// (`None`: the message came through none, and the entry is greyed out).
+pub fn list_entry_of(s: &Session, id: ItemId) -> Option<String> {
+    s.mailbox.mail.get(&id).and_then(|m| list_entry(s, m))
 }
 
 /// Block Sender adds the sender to the Blocked Senders List and moves the selection to Junk Email. Never
@@ -4031,6 +4118,111 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         // Undo restores the previous lists.
         f.s.run("app.undo", &json!({})).unwrap();
         assert!(f.s.mailbox.junk.safe_recipients.is_empty());
+    }
+
+    #[test]
+    fn never_block_list_needs_a_list_and_never_trusts_a_plain_recipient() {
+        // Regression: a message without list headers offered its first other recipient, so a colleague
+        // in Cc ended up on the Safe Recipients List.
+        let mut f = fx();
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.cc = vec![Address::new(None, "colleague@example.org")];
+            m.raw = Some(b"From: carol@example.com\r\nCc: colleague@example.org\r\n\r\nx".to_vec());
+        }
+        assert_eq!(list_entry_of(&f.s, f.a), None);
+        assert!(f.s.run("mail.block", &json!({"ids": [f.a.0], "kind": "neverList"})).is_err());
+        assert!(f.s.mailbox.junk.safe_recipients.is_empty());
+        // A List-Id message to the list: the list's address.
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.to = vec![
+                Address::new(None, "test.user@example.net"),
+                Address::new(None, "dev@lists.example.org"),
+            ];
+            m.cc.clear();
+            m.raw =
+                Some(b"From: carol@example.com\r\nList-Id: Dev <dev.lists.example.org>\r\n\r\nx".to_vec());
+        }
+        assert_eq!(list_entry_of(&f.s, f.a).as_deref(), Some("dev@lists.example.org"));
+        // Sent by a group on the author's behalf, to the user only: the group (the Sender).
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.to = vec![Address::new(None, "test.user@example.net")];
+            m.sender = Some(Address::new(None, "staff@groups.example.com"));
+            m.raw = None;
+        }
+        assert_eq!(list_entry_of(&f.s, f.a).as_deref(), Some("staff@groups.example.com"));
+    }
+
+    #[test]
+    fn never_block_list_skips_delegates_and_cross_posted_recipients() {
+        // Regression: once a message had a Sender or any List-* field, the first other To/Cc address was
+        // offered, so a delegate's message or a cross-post put a person on the Safe Recipients List.
+        let mut f = fx();
+        // A delegate (known: a contact) sends for the author, to the user and a colleague.
+        let cid = f.s.mailbox.alloc_id();
+        f.s.mailbox.contacts.insert(
+            ItemId(cid),
+            mailcraft_model::Contact {
+                id: ItemId(cid),
+                emails: vec!["assistant@example.com".into()],
+                ..Default::default()
+            },
+        );
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.from = Some(Address::new(None, "boss@example.com"));
+            m.sender = Some(Address::new(None, "assistant@example.com"));
+            m.to = vec![
+                Address::new(None, "test.user@example.net"),
+                Address::new(None, "colleague@example.org"),
+            ];
+            m.raw = None;
+        }
+        assert_eq!(list_entry_of(&f.s, f.a), None);
+        assert!(f.s.run("mail.block", &json!({"ids": [f.a.0], "kind": "neverList"})).is_err());
+        assert!(f.s.mailbox.junk.safe_recipients.is_empty());
+        // Same with a delegate who is not a contact but wrote other mail in the mailbox (alice wrote c).
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.sender = Some(Address::new(None, "alice@example.com"));
+        }
+        assert_eq!(list_entry_of(&f.s, f.a), None);
+        // A cross-post: a person comes first in To, the list (named by List-Id) second.
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.from = Some(Address::new(None, "carol@example.com"));
+            m.sender = None;
+            m.to = vec![Address::new(None, "alice@example.com"), Address::new(None, "dev@lists.example.org")];
+            m.raw = Some(
+                b"From: carol@example.com\r\nTo: alice@example.com, dev@lists.example.org\r\n\
+                  List-Id: Developers <dev.lists.example.org>\r\n\r\nx"
+                    .to_vec(),
+            );
+        }
+        assert_eq!(list_entry_of(&f.s, f.a).as_deref(), Some("dev@lists.example.org"));
+        // The list reached the user by Bcc: the address comes from the List-Id, never from alice.
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.to = vec![Address::new(None, "alice@example.com")];
+        }
+        assert_eq!(list_entry_of(&f.s, f.a).as_deref(), Some("dev@lists.example.org"));
+        // Only a List-Unsubscribe field (a newsletter to the user): no group to trust.
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.raw = Some(
+                b"From: carol@example.com\r\nList-Unsubscribe: <mailto:off@example.com>\r\n\r\nx".to_vec(),
+            );
+        }
+        assert_eq!(list_entry_of(&f.s, f.a), None);
+    }
+
+    #[test]
+    fn list_id_parsing_is_bounded_and_matches_labels() {
+        assert_eq!(list_id_of("Dev <dev.lists.example.org>").as_deref(), Some("dev.lists.example.org"));
+        assert_eq!(list_id_of("dev.example.org").as_deref(), Some("dev.example.org"));
+        assert_eq!(list_id_of("<>"), None);
+        assert_eq!(list_id_of("<a b.example.org>"), None);
+        assert_eq!(list_id_of("<x@example.org>"), None);
+        assert_eq!(list_id_of(&format!("<{}.example.org>", "a".repeat(400))), None);
+        assert!(names_list_id("news@example.com", "news.list-id.example.com"));
+        assert!(!names_list_id("alice@example.com", "dev.lists.example.org"));
+        assert!(!names_list_id("dev@example.org", "dev.lists.example.org.evil"));
+        assert_eq!(list_id_address("dev.lists.example.org").as_deref(), Some("dev@lists.example.org"));
+        assert_eq!(list_id_address("example.org"), None);
     }
 
     #[test]
