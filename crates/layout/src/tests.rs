@@ -1026,16 +1026,45 @@ fn arb_style() -> impl Strategy<Value = TextStyle> {
         proptest::option::of(prop_oneof![Just(-1.0f32), Just(f32::NAN), 4.0f32..24.0]),
         proptest::option::of(any::<bool>()),
         proptest::option::of(any::<u32>().prop_map(Color::hex)),
+        (
+            proptest::option::of(any::<bool>()),
+            proptest::option::of(0usize..5),
+            proptest::option::of(any::<bool>()),
+            proptest::option::of(any::<bool>()),
+            proptest::option::of(prop_oneof![Just(f32::NAN), Just(f32::INFINITY), -50.0f32..30.0]),
+            proptest::option::of(prop_oneof![Just(f32::NAN), -300.0f32..300.0]),
+        ),
     )
-        .prop_map(|(bold, italic, superscript, size_pt, monospace, highlight)| TextStyle {
-            bold,
-            italic,
-            superscript,
-            size_pt,
-            monospace,
-            highlight,
-            ..Default::default()
-        })
+        .prop_map(
+            |(
+                bold,
+                italic,
+                superscript,
+                size_pt,
+                monospace,
+                highlight,
+                (u, kind, small, caps, spacing, pos),
+            )| {
+                TextStyle {
+                    bold,
+                    italic,
+                    superscript,
+                    size_pt,
+                    monospace,
+                    highlight,
+                    underline: u,
+                    underline_kind: kind
+                        .and_then(|k| mailcraft_model::UnderlineKind::ALL.get(k))
+                        .map(|(k, _)| *k),
+                    double_strike: small.map(|s| !s),
+                    small_caps: small,
+                    all_caps: caps,
+                    spacing_pt: spacing,
+                    position_pt: pos,
+                    ..Default::default()
+                }
+            },
+        )
 }
 
 fn arb_text() -> impl Strategy<Value = String> {
@@ -1061,8 +1090,11 @@ fn arb_inline() -> impl Strategy<Value = Inline> {
 }
 
 fn arb_para_style() -> impl Strategy<Value = ParaStyle> {
-    (0u8..4, -5.0f32..60.0, -5.0f32..20.0, proptest::option::of(0.0f32..3.0), any::<bool>()).prop_map(
-        |(a, indent_px, space, line_height, bg)| ParaStyle {
+    (
+        (0u8..4, -5.0f32..60.0, -5.0f32..20.0, proptest::option::of(0.0f32..3.0), any::<bool>()),
+        (-5.0f32..400.0, -400.0f32..400.0, proptest::option::of((-5.0f32..80.0, any::<bool>()))),
+    )
+        .prop_map(|((a, indent_px, space, line_height, bg), (right, first, fixed))| ParaStyle {
             align: match a {
                 0 => Align::Start,
                 1 => Align::Center,
@@ -1074,8 +1106,20 @@ fn arb_para_style() -> impl Strategy<Value = ParaStyle> {
             space_after_px: space,
             line_height,
             background: bg.then_some(Color::WHITE),
-        },
-    )
+            right_indent_px: right,
+            first_line_px: first,
+            line_px: fixed.map(|(px, exact)| {
+                (
+                    px,
+                    if exact {
+                        mailcraft_model::LineRule::Exactly
+                    } else {
+                        mailcraft_model::LineRule::AtLeast
+                    },
+                )
+            }),
+            ..ParaStyle::default()
+        })
 }
 
 fn arb_block() -> impl Strategy<Value = Block> {
@@ -1294,4 +1338,149 @@ fn table_borders_drawn_over_all_cell_backgrounds() {
     let last_fill = items.iter().rposition(|i| matches!(i, DisplayItem::FillRect { .. })).unwrap();
     let first_stroke = items.iter().position(|i| matches!(i, DisplayItem::StrokeRect { .. })).unwrap();
     assert!(first_stroke > last_fill, "a later cell background paints over an earlier cell border");
+}
+
+// ---------------------------------------------------------------- Font dialog effects, Paragraph dialog
+
+fn lines_of(l: &Layout) -> Vec<&crate::LineBox> {
+    l.index.lines.iter().collect()
+}
+
+#[test]
+fn small_caps_and_all_caps_keep_offsets() {
+    let sc = TextStyle { small_caps: Some(true), ..Default::default() };
+    let l = lay(&doc(vec![para(vec![styled("Hello", sc)])]), 400.0);
+    let runs = l.text_runs();
+    assert_eq!(joined(&l), "HELLO");
+    let sizes: Vec<f32> = runs.iter().map(|r| r.size_px).collect();
+    assert!(sizes.len() >= 2 && sizes[0] > sizes[1], "{sizes:?}");
+    // Caret stops still count the stored text's chars.
+    assert_eq!(l.index.lines[0].end, 5);
+    let caps = TextStyle { all_caps: Some(true), ..Default::default() };
+    let l = lay(&doc(vec![para(vec![styled("straße", caps)])]), 400.0);
+    assert_eq!(joined(&l), "STRAßE", "one char stays one char");
+    assert_eq!(l.index.lines[0].end, 6);
+}
+
+#[test]
+fn letter_spacing_widens_and_position_raises() {
+    let plain = lay(&doc(vec![para_s("spacing")]), 600.0);
+    let wide_style = TextStyle { spacing_pt: Some(3.0), ..Default::default() };
+    let wide = lay(&doc(vec![para(vec![styled("spacing", wide_style)])]), 600.0);
+    let w = |l: &Layout| l.text_runs().iter().map(|r| r.rect.x + r.rect.w).fold(0.0f32, f32::max);
+    assert!(w(&wide) > w(&plain) + 20.0, "{} vs {}", w(&wide), w(&plain));
+    assert_eq!(wide.text_runs().len(), 7, "spaced characters are drawn one by one");
+    let up = TextStyle { position_pt: Some(6.0), ..Default::default() };
+    let raised = lay(&doc(vec![para(vec![text("a"), styled("b", up)])]), 600.0);
+    let runs = raised.text_runs();
+    assert!(runs[1].origin.y < runs[0].origin.y - 5.0);
+}
+
+#[test]
+fn underline_styles_and_double_strike_draw_lines() {
+    let count_lines =
+        |l: &Layout| l.display.items.iter().filter(|i| matches!(i, DisplayItem::Line { .. })).count();
+    for (kind, min) in [
+        (mailcraft_model::UnderlineKind::Double, 2),
+        (mailcraft_model::UnderlineKind::Dotted, 3),
+        (mailcraft_model::UnderlineKind::Dashed, 2),
+        (mailcraft_model::UnderlineKind::Wavy, 3),
+    ] {
+        let st = TextStyle { underline: Some(true), underline_kind: Some(kind), ..Default::default() };
+        let l = lay(&doc(vec![para(vec![styled("underlined words", st)])]), 600.0);
+        assert!(count_lines(&l) >= min, "{kind:?}");
+        assert!(!l.text_runs()[0].underline, "drawn as lines instead");
+    }
+    let coloured = TextStyle {
+        underline: Some(true),
+        underline_color: Some(Color::rgb(255, 0, 0)),
+        ..Default::default()
+    };
+    let l = lay(&doc(vec![para(vec![styled("red line", coloured)])]), 600.0);
+    assert!(
+        l.display
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Line { color, .. } if *color == Color::rgb(255, 0, 0)))
+    );
+    let ds = TextStyle { double_strike: Some(true), strike: Some(true), ..Default::default() };
+    let l = lay(&doc(vec![para(vec![styled("struck", ds)])]), 600.0);
+    assert_eq!(count_lines(&l), 2);
+    assert!(!l.text_runs()[0].strike);
+}
+
+#[test]
+fn indents_first_line_and_fixed_line_heights() {
+    let long = "word ".repeat(40);
+    let base = lay(&doc(vec![para_s(&long)]), 300.0);
+    let base_lines = lines_of(&base);
+    let style = ParaStyle {
+        indent_px: 40.0,
+        right_indent_px: 30.0,
+        first_line_px: -20.0,
+        line_px: Some((40.0, mailcraft_model::LineRule::Exactly)),
+        ..Default::default()
+    };
+    let d = doc(vec![Block::Paragraph { style, inlines: vec![text(&long)] }]);
+    let l = lay(&d, 300.0);
+    let lines = lines_of(&l);
+    assert!(lines.len() > base_lines.len(), "narrower, so more lines");
+    // Hanging: the first line starts 20 px left of the others.
+    assert!((lines[0].rect.x - 20.0).abs() < 0.5, "{}", lines[0].rect.x);
+    assert!((lines[1].rect.x - 40.0).abs() < 0.5, "{}", lines[1].rect.x);
+    assert!(lines[1].rect.x + lines[1].rect.w <= 270.5);
+    // Exactly 40 px per line.
+    for ln in &lines {
+        assert!((ln.rect.h - 40.0).abs() < 0.01, "{}", ln.rect.h);
+    }
+    // At least: never smaller than the text, at least the value.
+    let at_least =
+        ParaStyle { line_px: Some((4.0, mailcraft_model::LineRule::AtLeast)), ..Default::default() };
+    let l = lay(&doc(vec![Block::Paragraph { style: at_least, inlines: vec![text("x")] }]), 300.0);
+    assert!((l.index.lines[0].rect.h - base_lines[0].rect.h).abs() < 0.01);
+    // A first-line indent bigger than the width does not break layout.
+    let silly = ParaStyle { first_line_px: 1.0e9, right_indent_px: f32::NAN, ..Default::default() };
+    let l = lay(&doc(vec![Block::Paragraph { style: silly, inlines: vec![text("x y z")] }]), 300.0);
+    assert!(!l.index.lines.is_empty());
+}
+
+/// Regression (found by `random_docs_stay_in_bounds`): a numbered list in the last cell of a table whose
+/// other cells hold paragraphs with large right indents drew its marker past the table's right edge.
+#[test]
+fn list_marker_in_a_squeezed_table_cell_stays_in_bounds() {
+    let indented = |left: f32, right: f32| Block::Paragraph {
+        style: ParaStyle { indent_px: left, right_indent_px: right, ..Default::default() },
+        inlines: Vec::new(),
+    };
+    let list = Block::List { kind: ListKind::Numbered { start: 99 }, items: vec![Vec::new(), Vec::new()] };
+    let mut cells = vec![cell(vec![indented(0.0, 363.61353)]), cell(vec![indented(35.99469, 243.26234)])];
+    cells.push(cell(vec![list]));
+    for c in &mut cells {
+        c.colspan = 0;
+        c.rowspan = 0;
+    }
+    let d = doc(vec![Block::Table { rows: vec![cells], border: false, width_px: None }]);
+    for width in [400.0f32, 250.0, 120.0] {
+        let l = lay(&d, width);
+        for r in item_bounds(&l) {
+            assert!(r.x >= -EPS && r.right() <= width + EPS, "{r:?} outside 0..{width}");
+        }
+    }
+}
+
+/// Regression (found by `random_docs_stay_in_bounds`): a hanging first line in a frame narrower than the
+/// paragraph's left indent reached back by the whole indent, past the frame's left edge.
+#[test]
+fn hanging_first_line_in_a_narrow_cell_stays_in_bounds() {
+    let style = ParaStyle { indent_px: 47.207813, first_line_px: -138.05956, ..Default::default() };
+    let image = Inline::Image { src: "cid:x".into(), alt: "x".into(), width: None, height: None };
+    let para = Block::Paragraph { style, inlines: vec![image, text("word")] };
+    let table = Block::Table { rows: vec![vec![cell(vec![para])]], border: false, width_px: Some(34.061012) };
+    let l = lay(&doc(vec![table]), 400.0);
+    for r in item_bounds(&l) {
+        assert!(r.x >= -EPS && r.right() <= 400.0 + EPS, "{r:?} outside 0..400");
+    }
+    for line in &l.index.lines {
+        assert!(line.rect.x >= -EPS, "{:?}", line.rect);
+    }
 }

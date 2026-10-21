@@ -2101,7 +2101,9 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn page_color(s: &mut Session, p: &Value) -> CmdResult {
+    let themed = crate::cmd::format::requested_theme_color(s, p)?;
     let color = match p.get("color") {
+        _ if themed.is_some() => themed,
         None => return dialog(s, "pageColor", json!({"compose": compose_id(s, p)?})),
         Some(Value::Null) => None,
         Some(v) => {
@@ -2154,7 +2156,13 @@ fn select(s: &mut Session, p: &Value) -> CmdResult {
             Some(v) => pos_param(v)?,
             None => anchor.clone(),
         };
-        c.set_selection(anchor, focus);
+        // `paint: false`: a mouse selection still being made; an armed Format Painter or highlighter pen
+        // waits for `format.formatPainter {"apply": true}`.
+        if opt_bool(p, "paint") == Some(false) {
+            c.select_range(anchor, focus);
+        } else {
+            c.set_selection(anchor, focus);
+        }
     }
     Ok(
         json!({"anchor": pos_json(&c.selection.anchor), "focus": pos_json(&c.selection.focus), "text": c.selected_text()}),
@@ -3315,7 +3323,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Page Color",
             "Options › Themes",
             "",
-            r#"{"color"?:string|null}"#,
+            r#"{"color"?:string|null} | {"theme":string,"tint"?:number}  (no colour: the colour picker)"#,
             false,
             rich_compose,
             page_color,
@@ -3511,7 +3519,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select",
             "Compose › Body",
             "",
-            r#"{"anchor":{"path":[number],"offset":number},"focus"?:{..}} | {"all":true}"#,
+            r#"{"anchor":{"path":[number],"offset":number},"focus"?:{..},"paint"?:bool} | {"all":true}"#,
             false,
             has_compose,
             select,

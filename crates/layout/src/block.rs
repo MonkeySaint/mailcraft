@@ -4,10 +4,10 @@ use std::cell::Cell;
 
 use mailcraft_fonts::FontDb;
 use mailcraft_geom::{Color, Point, Rect};
-use mailcraft_model::rich::{Align, ListKind};
-use mailcraft_model::{Block, Inline, ParaStyle, TextStyle};
+use mailcraft_model::rich::{Align, LineRule, ListKind};
+use mailcraft_model::{Block, Inline, ParaStyle, TextStyle, UnderlineKind};
 
-use crate::inline::{Flat, GKind, Glyph, LineRange, advance, break_lines, flatten, glyphs, min_max};
+use crate::inline::{Flat, GKind, Glyph, LineRange, advance, break_lines_indented, flatten, glyphs, min_max};
 use crate::style::{RStyle, merge, resolve, sane, size_pt};
 use crate::table::{layout_table, table_min_max};
 use crate::{CaretStop, DisplayItem, LayoutIndex, LayoutOptions, LineBox, LinkBox, RunBox};
@@ -87,6 +87,16 @@ impl Frame {
     pub(crate) fn inset(self, left: f32) -> Frame {
         let left = left.clamp(0.0, self.w.max(0.0));
         Frame { x: self.x + left, w: (self.w - left).max(0.0), ..self }
+    }
+    /// Narrower by `right` on the right (clamped to the width).
+    pub(crate) fn inset_right(self, right: f32) -> Frame {
+        let right = right.clamp(0.0, self.w.max(0.0));
+        Frame { w: (self.w - right).max(0.0), ..self }
+    }
+    /// Moved right by `dx` (left when negative) and as much narrower; `dx` is kept within the frame.
+    pub(crate) fn shifted(self, dx: f32) -> Frame {
+        let dx = if dx.is_finite() { dx.min(self.w.max(0.0)) } else { 0.0 };
+        Frame { x: self.x + dx, w: (self.w - dx).max(0.0), ..self }
     }
     pub(crate) fn at_y(self, y: f32) -> Frame {
         Frame { y, ..self }
@@ -278,8 +288,24 @@ fn layout_para(
     let bg = style.background.map(|_| out.placeholder());
     let mut flat = Flat::new(ctx, ts);
     flatten(ctx, inlines, ts, None, &mut flat, 0);
-    let inner = frame.inset(ctx.px(style.indent_px)).at_y(frame.y + sb);
-    let h = layout_flat(ctx, &mut flat, style.align, style.line_height, path, inner, out, true);
+    let left = ctx.px(style.indent_px);
+    let inner = frame.inset(left).inset_right(ctx.px(style.right_indent_px)).at_y(frame.y + sb);
+    // A hanging indent may reach back to the paragraph's own left edge, no further: by at most the indent
+    // actually applied (a narrow frame clamps the indent, e.g. in a squeezed table cell).
+    let first = style.first_line_px;
+    let applied = (inner.x - frame.x).max(0.0);
+    let first_dx = if first < 0.0 { -ctx.px(-first).min(left).min(applied) } else { ctx.px(first) };
+    let spacing = match style.line_px {
+        Some((px, rule)) if px.is_finite() && px > 0.0 => {
+            let px = ctx.px(px.clamp(1.0, MAX_LINE_PX));
+            match rule {
+                LineRule::Exactly => Spacing::Exactly(px),
+                LineRule::AtLeast => Spacing::AtLeast(px),
+            }
+        }
+        _ => Spacing::multiple(style.line_height),
+    };
+    let h = layout_lines(ctx, &mut flat, style.align, spacing, first_dx, path, inner, out, true);
     if let (Some(i), Some(color)) = (bg, style.background) {
         out.set(i, DisplayItem::FillRect { rect: Rect::new(frame.x, frame.y + sb, frame.w, h), color });
     }
@@ -309,6 +335,32 @@ fn glyph_chars(flat: &Flat, g: &Glyph) -> usize {
     flat.text.get(g.start..g.end).map(|t| t.chars().count()).unwrap_or(0)
 }
 
+/// Largest fixed line height accepted from the model (px, before zoom).
+const MAX_LINE_PX: f32 = 2_000.0;
+
+/// How tall the lines of a block are.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Spacing {
+    /// The fonts' own line height.
+    Auto,
+    /// A multiple of it (never less than the ink).
+    Multiple(f32),
+    /// Exactly this many px.
+    Exactly(f32),
+    /// At least this many px.
+    AtLeast(f32),
+}
+
+impl Spacing {
+    /// A line-height multiple (`None`, zero, negative or non-finite = the fonts' own).
+    pub(crate) fn multiple(m: Option<f32>) -> Spacing {
+        match m.filter(|m| m.is_finite() && *m > 0.0) {
+            Some(m) => Spacing::Multiple(m.clamp(0.25, 10.0)),
+            None => Spacing::Auto,
+        }
+    }
+}
+
 /// Lays out the lines of one inline block at `frame`; returns the height used.
 pub(crate) fn layout_flat(
     ctx: &Ctx<'_>,
@@ -320,13 +372,32 @@ pub(crate) fn layout_flat(
     out: &mut Out,
     wrap: bool,
 ) -> f32 {
+    layout_lines(ctx, flat, align, Spacing::multiple(line_height), 0.0, path, frame, out, wrap)
+}
+
+/// [`layout_flat`] with a line spacing rule and the first line moved by `first_dx` (first-line indent,
+/// negative = hanging).
+pub(crate) fn layout_lines(
+    ctx: &Ctx<'_>,
+    flat: &mut Flat,
+    align: Align,
+    spacing: Spacing,
+    first_dx: f32,
+    path: &[usize],
+    frame: Frame,
+    out: &mut Out,
+    wrap: bool,
+) -> f32 {
     let budget = ctx.lines_left.get();
     if budget == 0 {
         return 0.0;
     }
-    fit_images(flat, frame.w);
+    // A first-line indent takes at most half the line; pictures fit the narrower first line too.
+    let first_dx = if first_dx.is_finite() { first_dx.min(frame.w * 0.5) } else { 0.0 };
+    let first_frame = frame.shifted(first_dx);
+    fit_images(flat, frame.w.min(first_frame.w));
     let gl = glyphs(ctx, flat);
-    let mut lines = break_lines(flat, &gl, frame.w, wrap, budget);
+    let mut lines = break_lines_indented(flat, &gl, frame.w, first_frame.w, wrap, budget);
     // A final hard break opens an empty last line (where the caret goes after it). Preformatted text follows
     // HTML, where a trailing newline does not.
     if wrap && lines.len() < budget && ends_with_hard_break(flat, &gl) {
@@ -336,12 +407,12 @@ pub(crate) fn layout_flat(
         lines.push(LineRange { start: gl.len(), end: gl.len(), hard: false });
     }
     ctx.lines_left.set(budget.saturating_sub(lines.len()));
-    let mult = line_height.filter(|m| m.is_finite() && *m > 0.0).map(|m| m.clamp(0.25, 10.0));
     let nlines = lines.len();
     let mut y = frame.y;
     for (li, lr) in lines.iter().enumerate() {
         let is_last = li.saturating_add(1) == nlines;
-        y += emit_line(flat, &gl, *lr, is_last, align, mult, path, frame, y, out, wrap);
+        let f = if li == 0 { first_frame } else { frame };
+        y += emit_line(flat, &gl, *lr, is_last, align, spacing, path, f, y, out, wrap);
     }
     y - frame.y
 }
@@ -365,7 +436,7 @@ fn emit_line(
     lr: LineRange,
     is_last: bool,
     align: Align,
-    mult: Option<f32>,
+    spacing: Spacing,
     path: &[usize],
     frame: Frame,
     top: f32,
@@ -391,10 +462,13 @@ fn emit_line(
         }
     }
     let content = asc + desc;
-    let total = match mult {
+    let total = match spacing {
         // Tight spacing never shrinks the box below its ink so lines cannot overlap.
-        Some(m) => ((content + gap) * m).max(content),
-        None => content + gap,
+        Spacing::Multiple(m) => ((content + gap) * m).max(content),
+        Spacing::Auto => content + gap,
+        // Exactly: that tall, but (as for tight multiples) never below the ink, so lines cannot overlap.
+        Spacing::Exactly(px) => px.max(content),
+        Spacing::AtLeast(px) => (content + gap).max(px),
     };
     let baseline = top + (total - content) / 2.0 + asc;
 
@@ -459,7 +533,10 @@ fn emit_line(
                 // Extend the run while the span and kind allow.
                 let from = j;
                 let mut to = j + 1;
-                let ends_here = |k: usize| justify && slice.get(k).is_some_and(|g| g.kind == GKind::Space);
+                // Spaced (or condensed) characters are drawn one by one at their own positions.
+                let spaced = span_style(flat, g).is_some_and(|s| s.letter_spacing != 0.0);
+                let ends_here =
+                    |k: usize| spaced || (justify && slice.get(k).is_some_and(|g| g.kind == GKind::Space));
                 if !ends_here(from) {
                     while let Some(n) = slice.get(to) {
                         if n.span != g.span || !matches!(n.kind, GKind::Normal | GKind::Space) {
@@ -497,6 +574,10 @@ fn emit_line(
                         .links
                         .push(LinkBox { rect: Rect::new(gx, top, width, line_rect_h), href: href.clone() });
                 }
+                // Plain single underlines in the text colour are the renderers' own; other underline styles,
+                // underline colours and double strikethrough are drawn as lines here.
+                let drawn_underline =
+                    s.underline && (s.underline_kind != UnderlineKind::Single || s.underline_color.is_some());
                 fg.push(Pending {
                     item: DisplayItem::Text {
                         origin: Point::new(gx, by),
@@ -504,12 +585,25 @@ fn emit_line(
                         font: s.font,
                         size_px: s.size_px,
                         color: s.color,
-                        underline: s.underline,
+                        underline: s.underline && !drawn_underline,
                         strike: s.strike,
                         link,
                     },
                     run_rect: Some(rect),
                 });
+                // Letter spacing: the run is one character, so the decoration spans its spaced advance.
+                let deco_w = width;
+                if drawn_underline {
+                    let color = s.underline_color.unwrap_or(s.color);
+                    for item in decoration(s, s.underline_kind, gx, by, deco_w, color, true) {
+                        fg.push(Pending { item, run_rect: None });
+                    }
+                }
+                if s.double_strike {
+                    for item in decoration(s, UnderlineKind::Double, gx, by, deco_w, s.color, false) {
+                        fg.push(Pending { item, run_rect: None });
+                    }
+                }
             }
         }
     }
@@ -562,6 +656,76 @@ fn emit_line(
         stops,
     });
     total
+}
+
+/// Most line segments one decoration is drawn with (dotted, dashed and wavy lines on very wide runs).
+const MAX_DECORATION_SEGMENTS: usize = 2_000;
+
+/// Lines that draw an underline (`under`) or strikethrough of `kind` under / through a run of width `w` at
+/// (`x`, baseline `by`). Positions match the renderers' own underline (12 % of the size below the
+/// baseline) and strikethrough (30 % above it).
+fn decoration(
+    s: &RStyle,
+    kind: UnderlineKind,
+    x: f32,
+    by: f32,
+    w: f32,
+    color: Color,
+    under: bool,
+) -> Vec<DisplayItem> {
+    let size = if s.size_px.is_finite() { s.size_px.clamp(0.0, 400.0) } else { 0.0 };
+    let w = if w.is_finite() { w.clamp(0.0, 1.0e6) } else { 0.0 };
+    if size <= 0.0 || w <= 0.0 {
+        return Vec::new();
+    }
+    let thick = (size / 14.0).max(1.0);
+    let y = if under { by + (size * 0.12).max(1.0) } else { by - size * 0.3 };
+    let line = |x0: f32, y0: f32, x1: f32, y1: f32| DisplayItem::Line {
+        from: Point::new(x0, y0),
+        to: Point::new(x1, y1),
+        color,
+        width: thick,
+    };
+    let dashes = |on: f32, off: f32| -> Vec<DisplayItem> {
+        let mut v = Vec::new();
+        let mut at = x;
+        while at < x + w && v.len() < MAX_DECORATION_SEGMENTS {
+            v.push(line(at, y, (at + on).min(x + w), y));
+            at += on + off;
+        }
+        v
+    };
+    match kind {
+        UnderlineKind::Single => vec![line(x, y, x + w, y)],
+        UnderlineKind::Double => {
+            let gap = thick * 1.5;
+            if under {
+                vec![line(x, y, x + w, y), line(x, y + gap, x + w, y + gap)]
+            } else {
+                vec![
+                    line(x, y - gap / 2.0, x + w, y - gap / 2.0),
+                    line(x, y + gap / 2.0, x + w, y + gap / 2.0),
+                ]
+            }
+        }
+        UnderlineKind::Dotted => dashes(thick, thick),
+        UnderlineKind::Dashed => dashes(thick * 4.0, thick * 2.0),
+        UnderlineKind::Wavy => {
+            let step = (thick * 2.0).max(1.5);
+            let amp = thick;
+            let mut v = Vec::new();
+            let mut at = x;
+            let mut up = true;
+            while at < x + w && v.len() < MAX_DECORATION_SEGMENTS {
+                let next = (at + step).min(x + w);
+                let (y0, y1) = if up { (y + amp, y - amp) } else { (y - amp, y + amp) };
+                v.push(line(at, y0, next, y1));
+                at = next;
+                up = !up;
+            }
+            v
+        }
+    }
 }
 
 fn wrap_ok(slack: f32) -> bool {
@@ -683,7 +847,7 @@ fn block_min_max(ctx: &Ctx<'_>, block: &Block, ts: &TextStyle, depth: usize) -> 
     let plus = |(a, b): (f32, f32), v: f32| (a + v, b + v);
     match block {
         Block::Paragraph { style, inlines } => {
-            plus(inline_min_max(ctx, inlines, ts), ctx.px(style.indent_px))
+            plus(inline_min_max(ctx, inlines, ts), ctx.px(style.indent_px) + ctx.px(style.right_indent_px))
         }
         Block::Heading { level, style, inlines } => {
             plus(inline_min_max(ctx, inlines, &heading_style(ts, *level)), ctx.px(style.indent_px))

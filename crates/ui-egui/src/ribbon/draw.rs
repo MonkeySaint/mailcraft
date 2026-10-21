@@ -508,9 +508,20 @@ fn show_menu(app: &mut App, cx: &mut Cx, resp: &Response, menu: Option<&str>) {
     popup_for(resp).show(|ui| {
         ui.set_min_width(200.0);
         let entries = state::expand_items(app, cx.surface, &cx.mem, items);
-        menu_entries(ui, app, cx, &entries, 0);
+        // Long lists (the Font list with every installed font) scroll within the window.
+        if entries.len() > LONG_MENU {
+            let max_h = (ui.ctx().content_rect().height() * 0.7).max(200.0);
+            egui::ScrollArea::vertical()
+                .max_height(max_h)
+                .show(ui, |ui| menu_entries(ui, app, cx, &entries, 0));
+        } else {
+            menu_entries(ui, app, cx, &entries, 0);
+        }
     });
 }
+
+/// Menus with more entries than this scroll.
+const LONG_MENU: usize = 32;
 
 /// Opens a popup now if a keytip asked for this control.
 fn honour_open_request(ui: &Ui, cx: &mut Cx, key: &str, resp: &Response) {
@@ -640,7 +651,12 @@ fn draw_ctl(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, rect: Rect, st: St
     match c.kind {
         Kind::Button | Kind::Toggle | Kind::Check => {
             let resp = button(ui, app, id, rect, look, &c.label, why);
-            if resp.clicked() {
+            // The second click of a double-click runs the `dbl=` command instead (its first click already ran
+            // the plain one).
+            if let Some(dbl) = c.dblcmd.as_ref().filter(|_| resp.double_clicked()) {
+                let act = state::action(app, dbl, ctl_on(app, cx, c), None, &[]);
+                run(app, cx, &act);
+            } else if resp.clicked() {
                 let act = ctl_action(app, cx, c, None);
                 run(app, cx, &act);
             }

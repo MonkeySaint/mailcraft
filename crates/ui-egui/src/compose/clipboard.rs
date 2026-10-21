@@ -27,6 +27,7 @@ pub struct ClipboardHooks {
     pub write_html: Option<fn(html: &str, text: &str) -> bool>,
 }
 
+#[cfg(not(test))]
 static HOOKS: RwLock<ClipboardHooks> =
     RwLock::new(ClipboardHooks { read_html: None, read_text: None, write_html: None });
 
@@ -55,6 +56,7 @@ pub fn clipboard_image() -> Option<Vec<u8>> {
 pub const MAX_CLIPBOARD_HTML: usize = 8 * 1024 * 1024;
 
 /// Installs the platform clipboard hooks (call once at start-up).
+#[cfg(not(test))]
 pub fn set_clipboard_hooks(h: ClipboardHooks) {
     if let Ok(mut g) = HOOKS.write() {
         *g = h;
@@ -62,8 +64,32 @@ pub fn set_clipboard_hooks(h: ClipboardHooks) {
 }
 
 /// The installed hooks.
+#[cfg(not(test))]
 pub fn clipboard_hooks() -> ClipboardHooks {
     HOOKS.read().map(|g| *g).unwrap_or_default()
+}
+
+// Unit tests run in parallel threads, each with its own UI: their hooks are per thread so one test's fake
+// clipboard never reaches another's paste.
+#[cfg(test)]
+thread_local! {
+    static TEST_HOOKS: std::cell::Cell<ClipboardHooks> = const { std::cell::Cell::new(ClipboardHooks {
+        read_html: None,
+        read_text: None,
+        write_html: None,
+    }) };
+}
+
+/// Installs the platform clipboard hooks (call once at start-up).
+#[cfg(test)]
+pub fn set_clipboard_hooks(h: ClipboardHooks) {
+    TEST_HOOKS.with(|c| c.set(h));
+}
+
+/// The installed hooks.
+#[cfg(test)]
+pub fn clipboard_hooks() -> ClipboardHooks {
+    TEST_HOOKS.with(std::cell::Cell::get)
 }
 
 /// The clipboard's HTML, when a reader is installed and it holds some (capped).

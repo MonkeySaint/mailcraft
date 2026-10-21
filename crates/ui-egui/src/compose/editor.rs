@@ -276,6 +276,9 @@ struct Mem {
     reveal: bool,
     /// Where the context menu was opened, and the menu's spelling suggestions.
     menu: Option<MenuAt>,
+    /// A click (or double-click) the armed Format Painter / pen paints once no further click of the same
+    /// gesture can follow: (input time it is due, whether it was a plain click that paints the word).
+    paint_due: Option<(f64, bool)>,
 
     /// List markers patched into the cached layout (see [`patch_markers`]).
     markers: Vec<(Vec<usize>, usize, String, String)>,
@@ -884,6 +887,75 @@ pub(crate) fn paste_origin(ctx: &egui::Context, cid: u64, t: &str) -> &'static s
     }
 }
 
+/// Puts what `format.copy` / `format.cut` returned (`text`, `html`) on the system clipboard: HTML with the
+/// text as its alternative where the platform takes it, else the text. Remembers the copy for the paste
+/// defaults ([`paste_origin`]). Returns whether anything was put there.
+pub(crate) fn put_copy_on_clipboard(ctx: &egui::Context, cid: u64, r: &Value) -> bool {
+    let Some(t) = r.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    ctx.data_mut(|d| d.insert_temp(last_copy_id(), LastCopy { cid, text: t.to_owned() }));
+    let html = r.get("html").and_then(Value::as_str).unwrap_or_default();
+    if html.trim().is_empty() || !super::clipboard::copy_html(html, t) {
+        ctx.copy_text(t.to_owned());
+    }
+    true
+}
+
+/// Pastes text `t` read from the system clipboard (with its HTML flavour `html`, when it matches) into
+/// compose `cid`: with `mode` (the ribbon's Paste menu), else with the Options default for where the text
+/// was copied. Offers the Paste Options button after a rich paste. Returns whether it pasted.
+pub(crate) fn paste_clipboard(
+    ctx: &egui::Context,
+    host: &mut dyn EditorHost,
+    cid: u64,
+    t: &str,
+    html: Option<String>,
+    mode: Option<&str>,
+) -> bool {
+    let mut p = json!({"compose": cid, "text": t});
+    if let Some(o) = p.as_object_mut() {
+        match mode {
+            Some(m) => o.insert("mode".into(), json!(m)),
+            None => o.insert("origin".into(), json!(paste_origin(ctx, cid, t))),
+        };
+        if let Some(h) = &html {
+            o.insert("html".into(), json!(h));
+        }
+    }
+    let Some(r) = host.run("format.paste", p) else {
+        return false;
+    };
+    if html.is_some() && host.paste_options() {
+        let mode = r
+            .get("mode")
+            .and_then(Value::as_str)
+            .map_or_else(|| mode.map_or_else(|| host.paste_mode().to_owned(), str::to_owned), str::to_owned);
+        let rev = host.compose(cid).map_or(0, |c| c.edit_rev);
+        ctx.data_mut(|d| {
+            d.insert_temp(last_paste_id(cid), LastPaste { html, text: t.to_owned(), mode, rev });
+        });
+    }
+    true
+}
+
+fn refocus_id(cid: u64) -> Id {
+    Id::new(("mailcraft-compose-refocus", cid))
+}
+
+/// Gives the body editor of compose `cid` keyboard focus again once the click that ran a ribbon command is
+/// over (that click took the focus away from the body; the caret and selection stay where they were).
+pub fn refocus_body(ctx: &egui::Context, cid: u64) {
+    ctx.data_mut(|d| d.insert_temp(refocus_id(cid), true));
+}
+
+/// Takes a pending [`refocus_body`] request in a frame without pointer presses or clicks (a click in the
+/// same frame would take the focus away again).
+fn take_refocus(ctx: &egui::Context, cid: u64) -> bool {
+    let busy = ctx.input(|i| i.pointer.any_pressed() || i.pointer.any_click() || i.pointer.any_down());
+    !busy && ctx.data_mut(|d| d.remove_temp::<bool>(refocus_id(cid))).unwrap_or(false)
+}
+
 fn with_compose(cid: u64, mut v: Value) -> Value {
     if let Some(o) = v.as_object_mut() {
         o.insert("compose".into(), json!(cid));
@@ -893,16 +965,30 @@ fn with_compose(cid: u64, mut v: Value) -> Value {
     }
 }
 
-/// Runs `compose.select` when the selection differs.
+/// Runs `compose.select` when the selection differs. An armed Format Painter or highlighter pen is not
+/// applied here: the editor applies it once a mouse selection is finished ([`apply_armed_tools`]).
 fn select(host: &mut dyn EditorHost, cid: u64, anchor: &DocPos, focus: &DocPos) {
     let same =
         host.compose(cid).is_some_and(|c| c.selection.anchor == *anchor && c.selection.focus == *focus);
     if !same {
         host.run(
             "compose.select",
-            json!({"compose": cid, "anchor": pos_json(anchor), "focus": pos_json(focus)}),
+            json!({"compose": cid, "anchor": pos_json(anchor), "focus": pos_json(focus), "paint": false}),
         );
     }
+}
+
+/// Whether compose `cid` has Format Painter or the highlighter pen armed.
+fn tools_armed(host: &dyn EditorHost, cid: u64) -> bool {
+    host.compose(cid).is_some_and(|c| c.painter.is_some() || c.highlight_pen.is_some())
+}
+
+/// Paints a finished mouse selection with the armed Format Painter or highlighter pen. A plain click paints
+/// the word under it with Format Painter. Returns whether the command ran.
+fn apply_armed_tools(host: &mut dyn EditorHost, cid: u64, plain_click: bool) -> bool {
+    let painter = host.compose(cid).is_some_and(|c| c.painter.is_some());
+    host.run("format.formatPainter", json!({"compose": cid, "apply": true, "word": plain_click && painter}))
+        .is_some()
 }
 
 /// Layout and geometry the frame's actions work with.
@@ -952,46 +1038,15 @@ fn apply(
                 // copied (the same message, another message, another program), which the engine applies.
                 let pending: Option<&'static str> = ctx.data_mut(|d| d.remove_temp(paste_mode_id(cid)));
                 let html = super::clipboard::html_for_paste(&t);
-                let mut p = json!({"compose": cid, "text": t});
-                if let Some(o) = p.as_object_mut() {
-                    match pending {
-                        Some(mode) => o.insert("mode".into(), json!(mode)),
-                        None => o.insert("origin".into(), json!(paste_origin(&ctx, cid, &t))),
-                    };
-                    if let Some(h) = &html {
-                        o.insert("html".into(), json!(h));
-                    }
-                }
-                if let Some(r) = host.run("format.paste", p)
-                    && html.is_some()
-                    && host.paste_options()
-                {
-                    let mode = r.get("mode").and_then(Value::as_str).map_or_else(
-                        || pending.unwrap_or_else(|| host.paste_mode()).to_owned(),
-                        str::to_owned,
-                    );
-                    let rev = host.compose(cid).map_or(0, |c| c.edit_rev);
-                    ctx.data_mut(|d| {
-                        d.insert_temp(last_paste_id(cid), LastPaste { html, text: t.clone(), mode, rev });
-                    });
-                }
+                paste_clipboard(&ctx, host, cid, &t, html, pending);
             }
             Act::Copy | Act::Cut => {
                 if c.selection.is_collapsed() {
                     continue;
                 }
                 let id = if act == Act::Copy { "format.copy" } else { "format.cut" };
-                if let Some(r) = host.run(id, json!({"compose": cid}))
-                    && let Some(t) = r.get("text").and_then(Value::as_str)
-                {
-                    ctx.data_mut(|d| {
-                        d.insert_temp(last_copy_id(), LastCopy { cid, text: t.to_owned() });
-                    });
-                    // HTML (with the text as its alternative) where the platform takes it, else text.
-                    let html = r.get("html").and_then(Value::as_str).unwrap_or_default();
-                    if !super::clipboard::copy_html(html, t) {
-                        ctx.copy_text(t.to_owned());
-                    }
+                if let Some(r) = host.run(id, json!({"compose": cid})) {
+                    put_copy_on_clipboard(&ctx, cid, &r);
                 }
             }
             Act::Delete { back, word } => {
@@ -1550,13 +1605,8 @@ fn apply_pick(ctx: &egui::Context, host: &mut dyn EditorHost, cid: u64, pick: Pi
         }
         Pick::Cut | Pick::Copy => {
             let id = if pick == Pick::Copy { "format.copy" } else { "format.cut" };
-            if let Some(r) = host.run(id, json!({"compose": cid}))
-                && let Some(t) = r.get("text").and_then(Value::as_str)
-            {
-                let html = r.get("html").and_then(Value::as_str).unwrap_or_default();
-                if !super::clipboard::copy_html(html, t) {
-                    ctx.copy_text(t.to_owned());
-                }
+            if let Some(r) = host.run(id, json!({"compose": cid})) {
+                put_copy_on_clipboard(ctx, cid, &r);
             }
         }
         Pick::Paste => {
@@ -1620,6 +1670,9 @@ pub(crate) fn body_editor_in(
     let height = (est_h + 2.0 * PAD).max(min_height).max(line_h + 2.0 * PAD);
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let origin = rect.min + vec2(PAD, PAD);
+    if take_refocus(&ctx, cid) {
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
     let focused_before = ctx.memory(|m| m.has_focus(id));
 
     // Background and body (the body painter draws the selection handed to it).
@@ -1687,7 +1740,7 @@ pub(crate) fn body_editor_in(
     let resp = ui.interact(rect, id, Sense::click_and_drag());
     resp.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, BODY_LABEL));
     let body_start = c.body_start();
-    let Mem { view, doc, preferred_x, drag_anchor, reveal, menu, .. } = &mut mem;
+    let Mem { view, doc, preferred_x, drag_anchor, reveal, menu, paint_due, .. } = &mut mem;
     let layout = view.layout.as_ref();
     let local = |p: Pos2| mailcraft_geom::Point { x: p.x - origin.x, y: p.y - origin.y };
     let hit = |p: Pos2| -> DocPos {
@@ -1761,6 +1814,53 @@ pub(crate) fn body_editor_in(
     }
     if resp.clicked() && !resp.has_focus() {
         resp.request_focus();
+    }
+    // Format Painter / highlighter pen: the selection is painted when the mouse button is released.
+    // A click or double-click waits until no further click of the same gesture can come (egui reports the
+    // first click of a triple-click as a plain click), so a one-shot painter is not used up on the word
+    // before the triple-click selects the paragraph.
+    if !select_objects && tools_armed(&*host, cid) {
+        let now = ui.input(|i| i.time);
+        let window = ctx.options(|o| o.input_options.max_double_click_delay).clamp(0.0, 2.0);
+        let finished = resp.drag_stopped() || resp.triple_clicked() || (resp.clicked() && mods.shift);
+        if finished {
+            *paint_due = None;
+            if apply_armed_tools(host, cid, false) {
+                changed = true;
+            }
+        } else if resp.double_clicked() {
+            // A third click may follow within two click intervals of the first.
+            *paint_due = Some((now + 2.0 * window, false));
+        } else if resp.clicked() && !mods.command {
+            *paint_due = Some((now + window, true));
+        }
+        // While the button is down a drag or the next click decides.
+        if let Some((due, word)) = *paint_due
+            && !down
+        {
+            if now >= due {
+                *paint_due = None;
+                if apply_armed_tools(host, cid, word) {
+                    changed = true;
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64((due - now).clamp(0.0, 4.0)));
+            }
+        }
+        if resp.hovered()
+            && let Some(p) = resp.hover_pos()
+        {
+            // A brush (or pen) by the pointer shows what the next selection does.
+            let icon = if host.compose(cid).is_some_and(|c| c.painter.is_some()) {
+                "format-painter"
+            } else {
+                "highlight"
+            };
+            let r = Rect::from_min_size(p + vec2(8.0, 6.0), vec2(14.0, 14.0));
+            crate::icons::Icons::image(icon, 14.0, host.theme().accent).paint_at(ui, r);
+        }
+    } else {
+        *paint_due = None;
     }
     if let Some(href) = &hover_link
         && !mods.command

@@ -171,8 +171,14 @@ fn push_leaf(ctx: &Ctx<'_>, inline: &Inline, parent: &TextStyle, link: Option<us
                 ts.color = Some(style.color.unwrap_or(ctx.link_color));
                 ts.underline = Some(style.underline.unwrap_or(true));
             }
-            let r = ctx.resolve(&ts);
-            flat.push(text, r, link, SpanKind::Text);
+            if ts.small_caps.unwrap_or(false) {
+                push_small_caps(ctx, text, &ts, link, flat);
+            } else if ts.all_caps.unwrap_or(false) {
+                flat.push(&upper_same_length(text), ctx.resolve(&ts), link, SpanKind::Text);
+            } else {
+                let r = ctx.resolve(&ts);
+                flat.push(text, r, link, SpanKind::Text);
+            }
         }
         Inline::LineBreak => {
             let r = ctx.resolve(parent);
@@ -189,6 +195,48 @@ fn push_leaf(ctx: &Ctx<'_>, inline: &Inline, parent: &TextStyle, link: Option<us
             flat.push("\u{FFFC}", r, link, SpanKind::Image(idx));
         }
         Inline::Link { .. } => {}
+    }
+}
+
+/// Size of small capitals relative to the text size.
+const SMALL_CAPS_SCALE: f32 = 0.8;
+
+/// `text` in capitals, char for char: a letter whose capital is more than one char (ß) stays as it is, so
+/// caret offsets keep matching the stored text.
+pub(crate) fn upper_same_length(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let mut up = c.to_uppercase();
+            match (up.next(), up.next()) {
+                (Some(u), None) => u,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// Small caps: lower-case letters become capitals at [`SMALL_CAPS_SCALE`] of the size, the rest keeps it.
+fn push_small_caps(ctx: &Ctx<'_>, text: &str, ts: &TextStyle, link: Option<usize>, flat: &mut Flat) {
+    let full = ctx.resolve(ts);
+    let small_ts = TextStyle { size_pt: Some(crate::style::size_pt(ts) * SMALL_CAPS_SCALE), ..ts.clone() };
+    let small = ctx.resolve(&small_ts);
+    let mut run = String::new();
+    let mut run_small = false;
+    for c in text.chars() {
+        let is_small = c.is_lowercase();
+        if is_small != run_small && !run.is_empty() {
+            let style = if run_small { small.clone() } else { full.clone() };
+            flat.push(&std::mem::take(&mut run), style, link, SpanKind::Text);
+        }
+        run_small = is_small;
+        if is_small {
+            run.push_str(&upper_same_length(c.encode_utf8(&mut [0u8; 4])));
+        } else {
+            run.push(c);
+        }
+    }
+    if !run.is_empty() {
+        flat.push(&run, if run_small { small } else { full }, link, SpanKind::Text);
     }
 }
 
@@ -263,7 +311,9 @@ pub(crate) fn glyphs(ctx: &Ctx<'_>, flat: &Flat) -> Vec<Glyph> {
         for (bi, g) in text.grapheme_indices(true) {
             let kind = if span.kind == SpanKind::Break { GKind::Control } else { classify(g) };
             let width = match kind {
-                GKind::Normal | GKind::Space => sane(ctx.fonts.measure(style.font, g, style.size_px)),
+                GKind::Normal | GKind::Space => {
+                    sane(ctx.fonts.measure(style.font, g, style.size_px) + style.letter_spacing)
+                }
                 _ => 0.0,
             };
             let start = span.start.saturating_add(bi);
@@ -332,10 +382,23 @@ pub(crate) struct LineRange {
 
 /// Greedy line breaking. `wrap = false` honours only mandatory breaks (preformatted text). At most `max_lines`
 /// lines are returned; the text after them is dropped.
+#[cfg(test)]
 pub(crate) fn break_lines(
     flat: &Flat,
     glyphs: &[Glyph],
     avail: f32,
+    wrap: bool,
+    max_lines: usize,
+) -> Vec<LineRange> {
+    break_lines_indented(flat, glyphs, avail, avail, wrap, max_lines)
+}
+
+/// [`break_lines`] with a different width for the first line (a first-line or hanging indent).
+pub(crate) fn break_lines_indented(
+    flat: &Flat,
+    glyphs: &[Glyph],
+    avail: f32,
+    first_avail: f32,
     wrap: bool,
     max_lines: usize,
 ) -> Vec<LineRange> {
@@ -349,6 +412,8 @@ pub(crate) fn break_lines(
         return lines;
     }
     let avail = if avail.is_finite() { avail.max(0.0) } else { f32::MAX };
+    let first_avail = if first_avail.is_finite() { first_avail.max(0.0) } else { avail };
+    let width_of = |lines: &Vec<LineRange>| if lines.is_empty() { first_avail } else { avail };
     let mut line_start = 0usize;
     let mut i = 0usize;
     let mut x = 0.0f32;
@@ -376,7 +441,7 @@ pub(crate) fn break_lines(
             i += 1;
             continue;
         }
-        if x + w > avail && i > line_start {
+        if x + w > width_of(&lines) && i > line_start {
             let end = last_break.filter(|&b| b > line_start).unwrap_or(i);
             lines.push(LineRange { start: line_start, end, hard: false });
             if lines.len() >= max_lines {

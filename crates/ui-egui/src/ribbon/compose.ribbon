@@ -10,7 +10,7 @@ group Clipboard | ZL | c1440=nolabel launch=format.clipboardPane
 split L | Paste | paste | format.paste | | V | menu=paste
 button S | Cut | cut | format.cut | | X
 button S | Copy | copy | format.copy | | C1
-toggle S | Format Painter | format-painter | format.formatPainter | | FP | on=painter
+toggle S | Format Painter | format-painter | format.formatPainter | | FP | on=painter dbl=format.formatPainter{"sticky":true}
 group Basic Text | ZB | c900=collapse rows launch=format.fontDialog
 combo S | Font | | format.font | {"family":"$value"} | FF | menu=fonts w=118 on=value:font
 combo S | Font Size | | format.fontSize | {"pt":"$value"} | FS | menu=fontSizes w=44 on=value:size
@@ -105,7 +105,7 @@ group Clipboard | ZL | c1440=nolabel launch=format.clipboardPane
 split L | Paste | paste | format.paste | | V | menu=paste
 button S | Cut | cut | format.cut | | X
 button S | Copy | copy | format.copy | | C
-toggle S | Format Painter | format-painter | format.formatPainter | | FP | on=painter
+toggle S | Format Painter | format-painter | format.formatPainter | | FP | on=painter dbl=format.formatPainter{"sticky":true}
 group Format | ZO
 toggle S | HTML | email | compose.format | {"kind":"html"} | TH | on=fmt:html
 toggle S | Plain Text | note | compose.format | {"kind":"plain"} | TP | on=fmt:plain
@@ -177,12 +177,9 @@ item | Paste Special... | paste | format.pasteSpecial | | S
 item | Set Default Paste... | settings | options.open | {"page":"editorAdvanced"} | A
 
 menu fonts
-item | Aptos | | format.font | {"family":"Aptos"} |
-item | Inter | | format.font | {"family":"Inter"} |
-item | Carlito | | format.font | {"family":"Carlito"} |
-item | Liberation Sans | | format.font | {"family":"Liberation Sans"} |
-item | Liberation Serif | | format.font | {"family":"Liberation Serif"} |
-item | Liberation Mono | | format.font | {"family":"Liberation Mono"} |
+dyn | themeFontNames | format.font | {"family":"$name"}
+sep
+dyn | fontNames | format.font | {"family":"$name"}
 sep
 item | Font... | settings | format.fontDialog | | N
 
@@ -269,6 +266,7 @@ sep
 dyn | highlightPens | format.highlight | {"color":"$color"}
 sep
 item | No Color | | format.highlight | {"color":null} | N
+item | Stop Highlighting | | format.highlight | {"stop":true} | S | en=pen
 
 menu fontColor
 item | Automatic | font-color | format.color | {"color":"automatic"} | A
@@ -431,12 +429,14 @@ item | Add Space After Paragraph | | format.paragraphSpacing | {"after":12} | A
 menu styles
 dyn | styles | format.style | {"name":"$name"}
 sep
-item | Create a Style | plus | format.style | {"name":"New Style","action":"create"} | S
+item | Create a Style | plus | format.style | {"action":"create"} | S
 item | Clear Formatting | format-painter | format.clearFormatting | | C
 item | Apply Styles... | settings | format.stylesPane | {"apply":true} | A
 
 menu changeStyles
 sub | Style Set | view | styleSet | | Y
+sub | Colors | font-color | themeColors | | C
+sub | Fonts | bold | themeFonts | | F
 sub | Paragraph Spacing | numbering | paragraphSpacingPreset | | P
 sep
 item | Set as Default | check | format.styleSet | {"action":"setDefault"} | D
@@ -462,6 +462,8 @@ item | Word 2003 | | format.styleSet | {"name":"Word 2003"} |
 item | Word 2010 | | format.styleSet | {"name":"Word 2010"} |
 item | Word 2013 | | format.styleSet | {"name":"Word 2013"} |
 sep
+dyn | styleSets | format.styleSet | {"name":"$name"}
+sep
 item | Reset to the Default Style Set | undo | format.styleSet | {"action":"reset"} | R
 item | Save as a New Style Set... | save | format.styleSet | {"action":"save"} | S
 
@@ -474,7 +476,7 @@ item | Open | | format.styleSet | {"paragraphSpacing":"open"} |
 item | Relaxed | | format.styleSet | {"paragraphSpacing":"relaxed"} |
 item | Double | | format.styleSet | {"paragraphSpacing":"double"} |
 sep
-item | Custom Paragraph Spacing... | settings | format.paragraphDialog | | C
+item | Custom Paragraph Spacing... | settings | format.styleSet | {"paragraphSpacing":"custom"} | C
 
 menu find
 item | Find... | search | format.find | | F
@@ -736,14 +738,65 @@ item | Extreme Shadow | | compose.theme | {"part":"effects","name":"Extreme Shad
 item | Glossy | | compose.theme | {"part":"effects","name":"Glossy"} |
 
 menu pageColor
-item | No Color | | compose.pageColor | {"color":null} | N
+dyn | themeColors | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+sub | Theme Color Shades | font-color | pageColorShades | | T
+sep
 item | Light Gray | | compose.pageColor | {"color":"#f2f2f2"} | | swatch=#f2f2f2
 item | Light Yellow | | compose.pageColor | {"color":"#fff8dc"} | | swatch=#fff8dc
 item | Light Green | | compose.pageColor | {"color":"#eaf6e4"} | | swatch=#eaf6e4
 item | Light Blue | | compose.pageColor | {"color":"#e6f0fa"} | | swatch=#e6f0fa
 item | Light Pink | | compose.pageColor | {"color":"#fbe9ef"} | | swatch=#fbe9ef
+item | Dark Red | | compose.pageColor | {"color":"#a01c1c"} | | swatch=#a01c1c
+item | Orange | | compose.pageColor | {"color":"#ef8a17"} | | swatch=#ef8a17
+item | Yellow | | compose.pageColor | {"color":"#f2c94c"} | | swatch=#f2c94c
+item | Green | | compose.pageColor | {"color":"#2e8b46"} | | swatch=#2e8b46
+item | Blue | | compose.pageColor | {"color":"#1f5fbf"} | | swatch=#1f5fbf
+item | Purple | | compose.pageColor | {"color":"#6b3fa0"} | | swatch=#6b3fa0
 sep
+item | No Color | | compose.pageColor | {"color":null} | N
 item | More Colors... | font-color | compose.pageColor | | M
+
+menu pageColorShades
+sub | White, Background 1 | | pageColorShades1 |
+sub | Black, Text 1 | | pageColorShades2 |
+sub | Light Gray, Background 2 | | pageColorShades3 |
+sub | Dark Blue, Text 2 | | pageColorShades4 |
+sub | Dark Teal, Accent 1 | | pageColorShades5 |
+sub | Orange, Accent 2 | | pageColorShades6 |
+sub | Dark Green, Accent 3 | | pageColorShades7 |
+sub | Turquoise, Accent 4 | | pageColorShades8 |
+sub | Plum, Accent 5 | | pageColorShades9 |
+sub | Green, Accent 6 | | pageColorShades10 |
+
+menu pageColorShades1
+dyn | themeShades:bg1 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades2
+dyn | themeShades:tx1 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades3
+dyn | themeShades:bg2 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades4
+dyn | themeShades:tx2 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades5
+dyn | themeShades:accent1 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades6
+dyn | themeShades:accent2 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades7
+dyn | themeShades:accent3 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades8
+dyn | themeShades:accent4 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades9
+dyn | themeShades:accent5 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
+
+menu pageColorShades10
+dyn | themeShades:accent6 | compose.pageColor | {"theme":"$theme","tint":"$tint"}
 
 menu voting
 item | Approve;Reject | check | compose.votingButtons | {"choices":"Approve;Reject"} | | on=vote:Approve;Reject

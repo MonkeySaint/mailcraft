@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 mailcraft-engine.workspace = true
 mailcraft-ui-egui.workspace = true
+# Family names of installed fonts (the compose Font list).
+mailcraft-fonts.workspace = true
 eframe.workspace = true
 log.workspace = true
 # Native open/save/folder dialogs (MIT).

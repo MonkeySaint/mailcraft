@@ -541,6 +541,10 @@ impl Session {
                 if c.language.is_none() && lang != "en-US" && !lang.is_empty() {
                     c.language = Some(lang);
                 }
+                // Change Styles › Set as Default.
+                if c.style_set.is_none() && c.paragraph_spacing_preset.is_none() {
+                    crate::cmd::format::apply_default_style_set(self, c);
+                }
             }
             _ => {}
         }

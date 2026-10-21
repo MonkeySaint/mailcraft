@@ -81,17 +81,45 @@ fn align_css(a: Align) -> &'static str {
 
 fn para_css(s: &ParaStyle, inherited: Align) -> String {
     let mut css = String::new();
-    let (t, b, l) = (s.space_before_px, s.space_after_px, s.indent_px);
-    if t == 0.0 && b == 0.0 && l == 0.0 {
+    let (t, b, l, r) = (s.space_before_px, s.space_after_px, s.indent_px, s.right_indent_px);
+    if t == 0.0 && b == 0.0 && l == 0.0 && r == 0.0 {
         css.push_str("margin:0");
     } else {
-        let _ = write!(css, "margin:{} 0 {} {}", px(t), px(b), px(l));
+        let _ = write!(css, "margin:{} {} {} {}", px(t), px(r), px(b), px(l));
     }
     if s.align != inherited {
         let _ = write!(css, ";text-align:{}", align_css(s.align));
     }
-    if let Some(lh) = s.line_height {
-        let _ = write!(css, ";line-height:{}", num(lh));
+    // A hanging first line reaches back to the paragraph's left edge, no further (as the editor lays it
+    // out): a negative indent past the margin would put the text outside the recipient's content area.
+    let first = if s.first_line_px < 0.0 { s.first_line_px.max(-l.max(0.0)) } else { s.first_line_px };
+    if first.is_finite() && first != 0.0 {
+        let _ = write!(css, ";text-indent:{}px", num(first));
+    }
+    match s.line_px {
+        // Word-made mail marks fixed line heights this way; other programs read the plain line-height.
+        Some((h, rule)) if h.is_finite() && h > 0.0 => {
+            let rule = match rule {
+                mailcraft_model::LineRule::Exactly => "exactly",
+                mailcraft_model::LineRule::AtLeast => "at-least",
+            };
+            let _ = write!(css, ";line-height:{}px;mso-line-height-rule:{rule}", num(h));
+        }
+        _ => {
+            if let Some(lh) = s.line_height {
+                let _ = write!(css, ";line-height:{}", num(lh));
+            }
+        }
+    }
+    for (on, decl) in [
+        (s.keep_with_next, "page-break-after:avoid"),
+        (s.keep_together, "page-break-inside:avoid"),
+        (s.page_break_before, "page-break-before:always"),
+        (s.no_widow_control, "widows:1;orphans:1"),
+    ] {
+        if on {
+            let _ = write!(css, ";{decl}");
+        }
     }
     if let Some(bg) = s.background {
         let _ = write!(css, ";background-color:{}", bg.to_hex());
@@ -126,6 +154,32 @@ pub(crate) fn text_css(s: &TextStyle) -> String {
     }
     if s.superscript == Some(false) || s.subscript == Some(false) {
         parts.push("vertical-align:baseline".into());
+    } else if let Some(pt) = s.position_pt.filter(|v| v.is_finite() && *v != 0.0)
+        && s.superscript != Some(true)
+        && s.subscript != Some(true)
+    {
+        parts.push(format!("vertical-align:{}pt", num(pt)));
+    }
+    if s.small_caps == Some(true) {
+        parts.push("font-variant:small-caps".into());
+    }
+    if s.all_caps == Some(true) {
+        parts.push("text-transform:uppercase".into());
+    }
+    if let Some(pt) = s.spacing_pt.filter(|v| v.is_finite() && *v != 0.0) {
+        parts.push(format!("letter-spacing:{}pt", num(pt)));
+    }
+    parts.join(";")
+}
+
+/// The `style` of the `<u>` tag for a styled or coloured underline ("" for a plain one).
+fn underline_css(s: &TextStyle) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(k) = s.underline_kind.filter(|k| *k != mailcraft_model::UnderlineKind::Single) {
+        parts.push(format!("text-decoration-style:{}", k.name()));
+    }
+    if let Some(c) = s.underline_color {
+        parts.push(format!("text-decoration-color:{}", c.to_hex()));
     }
     parts.join(";")
 }
@@ -325,11 +379,12 @@ impl Writer {
     fn text(&mut self, text: &str, style: &TextStyle) {
         let css = text_css(style);
         let mut tags: Vec<&str> = Vec::new();
+        let strike = if style.double_strike == Some(true) { Some(true) } else { style.strike };
         for (on, tag) in [
             (style.bold, "b"),
             (style.italic, "i"),
             (style.underline, "u"),
-            (style.strike, "s"),
+            (strike, "s"),
             (style.superscript, "sup"),
             (style.subscript, "sub"),
             (style.monospace, "code"),
@@ -345,7 +400,19 @@ impl Writer {
             self.out.push('>');
         }
         for t in &tags {
-            let _ = write!(self.out, "<{t}>");
+            // Decoration styles do not inherit in CSS: they go on the tag that draws the line.
+            let tag_css = match *t {
+                "u" => underline_css(style),
+                "s" if style.double_strike == Some(true) => "text-decoration-style:double".to_owned(),
+                _ => String::new(),
+            };
+            if tag_css.is_empty() {
+                let _ = write!(self.out, "<{t}>");
+            } else {
+                let _ = write!(self.out, "<{t} style=");
+                self.attr_value(&tag_css);
+                self.out.push('>');
+            }
         }
         escape_text(text, &mut self.prev_space, &mut self.out);
         for t in tags.iter().rev() {

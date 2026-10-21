@@ -945,3 +945,95 @@ fn followup_menu_entries_send_the_engine_params() {
     // Message recall is not offered: IMAP, SMTP and JMAP cannot withdraw delivered mail.
     assert!(all_cmds().iter().all(|(_, c)| c.id != "mail.recall"));
 }
+
+fn compose_app() -> (App, u64) {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let cid = app.run("mail.newEmail", serde_json::Value::Null).and_then(|v| v["compose"].as_u64()).unwrap();
+    (app, cid)
+}
+
+fn entry_disabled(app: &App, surface: Surface, menu: &str, label: &str) -> Option<&'static str> {
+    let items = defs().menu(menu).unwrap();
+    state::expand_items(app, surface, &state::Mem::default(), items)
+        .into_iter()
+        .find_map(|r| match r {
+            state::Resolved::Cmd { label: l, disabled, .. } if l == label => Some(disabled),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn stop_highlighting_is_offered_only_while_the_pen_is_out() {
+    let (mut app, cid) = compose_app();
+    let s = Surface::Compose(cid);
+    assert!(entry_disabled(&app, s, "highlight", "Stop Highlighting").is_some());
+    // Highlight with nothing selected takes the pen.
+    app.run("format.highlight", serde_json::json!({"compose": cid, "color": "#ffff00"})).unwrap();
+    assert!(entry_disabled(&app, s, "highlight", "Stop Highlighting").is_none());
+    run_entry(&mut app, s, "highlight", "Stop Highlighting");
+    assert!(app.s.composes.get(&cid).unwrap().highlight_pen.is_none());
+}
+
+#[test]
+fn format_painter_double_click_is_sticky() {
+    let ctl = defs()
+        .tabs
+        .iter()
+        .filter(|t| t.surface == "compose")
+        .flat_map(|t| t.groups.iter())
+        .flat_map(|g| g.ctls.iter())
+        .find(|c| c.cmd.id == "format.formatPainter")
+        .unwrap();
+    let dbl = ctl.dblcmd.as_ref().expect("double-click command");
+    assert_eq!(dbl.id, "format.formatPainter");
+    assert!(dbl.params.contains("sticky"));
+}
+
+#[test]
+fn font_list_has_theme_fonts_and_known_and_installed_fonts() {
+    let (mut app, cid) = compose_app();
+    let s = Surface::Compose(cid);
+    let labels: Vec<String> = menu_entries(&app, s, "fonts").into_iter().map(|(l, ..)| l).collect();
+    assert!(labels.iter().any(|l| l.ends_with("(Headings)")) && labels.iter().any(|l| l.ends_with("(Body)")));
+    assert!(labels.len() > 30, "{labels:?}");
+    for name in ["Calibri", "Times New Roman", "Courier New", "Font..."] {
+        assert!(labels.iter().any(|l| l == name), "{name}");
+    }
+    // Picking a theme font sets that family.
+    let body = labels.iter().find(|l| l.ends_with("(Body)")).unwrap().clone();
+    run_entry(&mut app, s, "fonts", &body);
+    let family = app.s.composes.get(&cid).unwrap().style_at_caret().font_family.unwrap_or_default();
+    assert!(body.starts_with(&family), "{body} / {family}");
+}
+
+#[test]
+fn change_styles_offers_colors_fonts_and_saved_style_sets() {
+    let (mut app, cid) = compose_app();
+    let s = Surface::Compose(cid);
+    let subs: Vec<String> = defs()
+        .menu("changeStyles")
+        .unwrap()
+        .iter()
+        .filter(|i| i.kind == ItemKind::Sub)
+        .map(|i| i.label.clone())
+        .collect();
+    assert!(subs.contains(&"Colors".to_owned()) && subs.contains(&"Fonts".to_owned()), "{subs:?}");
+    app.run("format.styleSet", serde_json::json!({"compose": cid, "name": "Minimalist"})).unwrap();
+    app.run("format.styleSet", serde_json::json!({"compose": cid, "action": "save", "name": "Ours"}))
+        .unwrap();
+    assert!(menu_entries(&app, s, "styleSet").iter().any(|(l, ..)| l == "Ours"));
+    run_entry(&mut app, s, "styleSet", "Ours");
+    assert_eq!(app.s.composes.get(&cid).unwrap().style_set.as_deref(), Some("Minimalist"));
+}
+
+#[test]
+fn page_color_menu_has_theme_and_standard_colours() {
+    let (mut app, cid) = compose_app();
+    let s = Surface::Compose(cid);
+    let entries = menu_entries(&app, s, "pageColor");
+    assert!(entries.iter().filter(|(_, _, sw)| sw.is_some()).count() >= 20);
+    let first_theme = entries.iter().find(|(_, a, _)| a.params.get("theme").is_some()).unwrap().0.clone();
+    run_entry(&mut app, s, "pageColor", &first_theme);
+    assert!(app.s.composes.get(&cid).unwrap().body.background.is_some());
+}

@@ -56,6 +56,72 @@ pub const UI_FAMILY: &str = "Inter";
 pub const BODY_FAMILY: &str = "Aptos";
 pub const BODY_SIZE_PT: f32 = 12.0;
 
+/// Font names the compose Font list offers besides installed fonts: the bundled families and the common mail
+/// fonts MailCraft draws with a bundled stand-in (recipients see the named font where it is installed).
+pub const MENU_FAMILIES: &[&str] = &[
+    "Aptos",
+    "Aptos Display",
+    "Aptos Mono",
+    "Aptos Narrow",
+    "Aptos Serif",
+    "Arial",
+    "Arial Black",
+    "Arial Narrow",
+    "Book Antiqua",
+    "Bookman Old Style",
+    "Calibri",
+    "Calibri Light",
+    "Cambria",
+    "Candara",
+    "Carlito",
+    "Century Gothic",
+    "Century Schoolbook",
+    "Consolas",
+    "Constantia",
+    "Corbel",
+    "Courier New",
+    "Franklin Gothic Book",
+    "Garamond",
+    "Georgia",
+    "Gill Sans MT",
+    "Helvetica",
+    "Inter",
+    "Liberation Mono",
+    "Liberation Sans",
+    "Liberation Serif",
+    "Lucida Console",
+    "Lucida Sans Unicode",
+    "Palatino Linotype",
+    "Rockwell",
+    "Segoe UI",
+    "Tahoma",
+    "Times New Roman",
+    "Trebuchet MS",
+    "Verdana",
+];
+
+/// Longest font file read when listing installed fonts (bigger files, such as large CJK collections, are
+/// skipped).
+pub const MAX_FONT_FILE: usize = 64 * 1024 * 1024;
+
+/// The family name a font file declares (its English name, else the first one), for listing installed
+/// fonts. `None` for data that is not a font or names no family. Collections give their first face's name.
+pub fn family_name(data: &[u8]) -> Option<String> {
+    use skrifa::MetadataProvider;
+    use skrifa::string::StringId;
+    if data.len() > MAX_FONT_FILE {
+        return None;
+    }
+    let font = skrifa::FontRef::from_index(data, 0).ok()?;
+    let pick =
+        |id: StringId| font.localized_strings(id).english_or_first().map(|s| s.chars().collect::<String>());
+    // The typographic family groups weights under one name ("Noto Sans" rather than "Noto Sans Light").
+    let name = pick(StringId::TYPOGRAPHIC_FAMILY_NAME).or_else(|| pick(StringId::FAMILY_NAME))?;
+    let name: String = name.chars().filter(|c| !c.is_control()).take(128).collect();
+    let name = name.trim();
+    (!name.is_empty() && !name.starts_with('.')).then(|| name.to_owned())
+}
+
 mod face;
 mod resolve;
 #[cfg(test)]

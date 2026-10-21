@@ -233,6 +233,7 @@ fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str
         "delay" => c.delay_until.is_some(),
         "replyto" => !c.reply_to.trim().is_empty(),
         "painter" => c.painter.is_some(),
+        "pen" => c.highlight_pen.is_some(),
         "marks" => c.editor.show_marks,
         "gridlines" => c.editor.show_gridlines,
         "selobj" => c.editor.select_objects,
@@ -410,7 +411,10 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 26] = [
+pub const SOURCES: [&str; 29] = [
+    "themeFontNames",
+    "fontNames",
+    "styleSets",
     "recentSearches",
     "searchCategories",
     "searchStores",
@@ -528,6 +532,64 @@ fn style_items(app: &App, surface: Surface) -> Vec<DynItem> {
         }
     }
     out
+}
+
+/// The caret's font in a compose window ("" elsewhere).
+fn caret_font(app: &App, surface: Surface) -> String {
+    compose(app, surface).and_then(|c| c.style_at_caret().font_family).unwrap_or_default()
+}
+
+/// Font list › Theme Fonts: the theme's heading and body fonts ("Aptos Display (Headings)").
+fn theme_font_items(app: &App, surface: Surface) -> Vec<DynItem> {
+    let fallback;
+    let c = match compose(app, surface) {
+        Some(c) => c,
+        None => {
+            fallback = mailcraft_engine::compose::ComposeState::default();
+            &fallback
+        }
+    };
+    let theme = c.theme_resolved();
+    let current = caret_font(app, surface);
+    [(theme.heading_font, "Headings"), (theme.body_font, "Body")]
+        .into_iter()
+        .map(|(family, role)| DynItem {
+            label: format!("{family} ({role})"),
+            icon: "",
+            swatch: None,
+            on: family.eq_ignore_ascii_case(&current),
+            vars: vec![("$name", json!(family))],
+        })
+        .collect()
+}
+
+/// Font list › All Fonts: known stand-ins and installed fonts (checked: the caret's font).
+fn font_name_items(app: &App, surface: Surface) -> Vec<DynItem> {
+    let current = caret_font(app, surface);
+    crate::compose::font_names()
+        .into_iter()
+        .map(|name| DynItem {
+            on: name.eq_ignore_ascii_case(&current),
+            vars: vec![("$name", json!(name))],
+            label: name,
+            icon: "",
+            swatch: None,
+        })
+        .collect()
+}
+
+/// Change Styles › Style Set: the sets saved with Save as a New Style Set.
+fn saved_style_set_items(app: &App) -> Vec<DynItem> {
+    mailcraft_engine::cmd::format::saved_style_sets(&app.s)
+        .into_iter()
+        .map(|set| DynItem {
+            vars: vec![("$name", json!(set.name))],
+            label: set.name,
+            icon: "view",
+            swatch: None,
+            on: false,
+        })
+        .collect()
 }
 
 /// Change View: the saved views usable in the selected mail folder (checked: the one it shows).
@@ -686,6 +748,9 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 .collect()
         }
         "styles" => style_items(app, surface),
+        "themeFontNames" => theme_font_items(app, surface),
+        "fontNames" => font_name_items(app, surface),
+        "styleSets" => saved_style_set_items(app),
         "views:mail" => mail_view_items(app),
         "themeColors" => theme_items(app, surface, None),
         "highlightPens" => highlight_pens(app, surface),
@@ -922,6 +987,14 @@ pub fn run(ctx: &egui::Context, app: &mut App, surface: Surface, mem: &mut Mem, 
     if let Some(flag) = &act.flip {
         flip_mem(mem, flag);
     }
+    // Formatting from the ribbon leaves the caret in the body, so typing goes on where it was (a command
+    // that opened a dialog leaves the focus to the dialog).
+    if let Surface::Compose(cid) = surface
+        && result.get("dialog").is_none()
+        && matches!(act.cmd.split('.').next(), Some("format" | "insert" | "review"))
+    {
+        crate::compose::refocus_body(ctx, cid);
+    }
     match act.cmd.as_str() {
         "search.close" => {
             app.ui.search_active = false;
@@ -981,7 +1054,9 @@ pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> V
                     swatch: it.swatch,
                     key: it.key.clone(),
                     on,
-                    disabled: disabled(app, surface, &it.cmd.id),
+                    disabled: disabled(app, surface, &it.cmd.id).or_else(|| {
+                        it.en.as_deref().filter(|s| !is_on(app, surface, mem, s)).map(|_| "not available now")
+                    }),
                     action,
                 });
             }

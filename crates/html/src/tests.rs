@@ -1121,3 +1121,159 @@ fn stylesheet_work_is_budgeted_per_document() {
     let d = timed("budgeted cascade", 10_000, || html_to_doc(&format!("<style>{css}</style>{body}")));
     assert!(!runs(&d).is_empty());
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Font dialog effects and Paragraph dialog properties
+
+#[test]
+fn font_effects_survive_a_round_trip() {
+    use mailcraft_model::UnderlineKind;
+    let st = TextStyle {
+        underline: Some(true),
+        underline_kind: Some(UnderlineKind::Wavy),
+        underline_color: Some(Color::rgb(255, 0, 0)),
+        small_caps: Some(true),
+        spacing_pt: Some(1.5),
+        position_pt: Some(3.0),
+        ..TextStyle::default()
+    };
+    let d = Doc {
+        blocks: vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            inlines: vec![
+                Inline::Text { text: "fancy".into(), style: st.clone() },
+                Inline::Text {
+                    text: " gone".into(),
+                    style: TextStyle {
+                        double_strike: Some(true),
+                        all_caps: Some(true),
+                        ..TextStyle::default()
+                    },
+                },
+            ],
+        }],
+        ..Doc::default()
+    };
+    let html = doc_to_html(&d);
+    assert!(
+        html.contains("text-decoration-style:wavy") && html.contains("text-decoration-color:#ff0000"),
+        "{html}"
+    );
+    assert!(html.contains("font-variant:small-caps") && html.contains("letter-spacing:1.5pt"), "{html}");
+    assert!(html.contains("vertical-align:3pt") && html.contains("text-transform:uppercase"), "{html}");
+    let back = html_to_doc(&html);
+    let fancy = run_style(&back, "fancy");
+    assert_eq!(fancy.underline_kind, Some(UnderlineKind::Wavy));
+    assert_eq!(fancy.underline_color, Some(Color::rgb(255, 0, 0)));
+    assert_eq!((fancy.small_caps, fancy.spacing_pt, fancy.position_pt), (Some(true), Some(1.5), Some(3.0)));
+    let gone = run_style(&back, "gone");
+    assert_eq!((gone.double_strike, gone.all_caps), (Some(true), Some(true)));
+    assert_ne!(gone.strike, Some(true), "a double line, not a single one too");
+    assert_eq!(doc_to_html(&back), html, "stable");
+}
+
+#[test]
+fn underline_with_double_strikethrough_survives_a_round_trip() {
+    // Regression: `<u style=dotted><s style=double>` read back as a double underline and a single strike,
+    // because the strike's decoration style was given to the inherited underline.
+    use mailcraft_model::UnderlineKind;
+    let st = TextStyle {
+        underline: Some(true),
+        underline_kind: Some(UnderlineKind::Dotted),
+        double_strike: Some(true),
+        ..TextStyle::default()
+    };
+    let d = Doc {
+        blocks: vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            inlines: vec![Inline::Text { text: "both".into(), style: st }],
+        }],
+        ..Doc::default()
+    };
+    let html = doc_to_html(&d);
+    let back = run_style(&html_to_doc(&html), "both");
+    assert_eq!((back.underline, back.underline_kind), (Some(true), Some(UnderlineKind::Dotted)), "{html}");
+    assert_eq!(back.double_strike, Some(true), "{html}");
+    assert_ne!(back.strike, Some(true), "{html}");
+    // The same when the strike is declared in CSS rather than by its tag, and the other way round.
+    let d =
+        doc(r#"<p><u><span style="text-decoration:line-through;text-decoration-style:double">x</span></u>
+        <s><span style="text-decoration-line:underline;text-decoration-style:wavy">y</span></s></p>"#);
+    let x = run_style(&d, "x");
+    assert_eq!((x.double_strike, x.underline_kind), (Some(true), None));
+    let y = run_style(&d, "y");
+    assert_eq!((y.underline_kind, y.double_strike, y.strike), (Some(UnderlineKind::Wavy), None, Some(true)));
+}
+
+#[test]
+fn a_hanging_first_line_never_reaches_left_of_the_paragraph() {
+    // Regression: a hang with no left indent was written as `margin:0;text-indent:-24px`, drawing the first
+    // line outside the recipient's content area.
+    let para = |indent_px: f32| Doc {
+        blocks: vec![Block::Paragraph {
+            style: ParaStyle { indent_px, first_line_px: -24.0, ..ParaStyle::default() },
+            inlines: vec![Inline::Text { text: "hang".into(), style: TextStyle::default() }],
+        }],
+        ..Doc::default()
+    };
+    let none = doc_to_html(&para(0.0));
+    assert!(!none.contains("text-indent"), "{none}");
+    let some = doc_to_html(&para(12.0));
+    assert!(some.contains("text-indent:-12px"), "{some}");
+    let full = doc_to_html(&para(48.0));
+    assert!(full.contains("48px") && full.contains("text-indent:-24px"), "{full}");
+}
+
+#[test]
+fn css_decoration_shorthands_and_hostile_values() {
+    let d = doc(r#"<p><span style="text-decoration: underline dotted blue">a</span>
+        <span style="letter-spacing: 9999px; vertical-align: -1e30pt">b</span>
+        <span style="letter-spacing: normal; font-variant: normal; text-transform: none">c</span></p>"#);
+    let a = run_style(&d, "a");
+    assert_eq!((a.underline, a.underline_kind), (Some(true), Some(mailcraft_model::UnderlineKind::Dotted)));
+    assert_eq!(a.underline_color, Some(Color::rgb(0, 0, 255)));
+    let b = run_style(&d, "b");
+    assert!(b.spacing_pt.is_some_and(|v| v <= 200.0) && b.position_pt.is_none_or(|v| v >= -200.0));
+    let c = run_style(&d, "c");
+    assert_eq!((c.small_caps, c.all_caps, c.spacing_pt), (Some(false), Some(false), None));
+}
+
+#[test]
+fn paragraph_indents_line_rules_and_breaks_round_trip() {
+    use mailcraft_model::LineRule;
+    for (rule, word) in [(LineRule::Exactly, "exactly"), (LineRule::AtLeast, "at-least")] {
+        let ps = ParaStyle {
+            indent_px: 48.0,
+            right_indent_px: 24.0,
+            first_line_px: -24.0,
+            line_px: Some((20.0, rule)),
+            keep_with_next: true,
+            keep_together: true,
+            page_break_before: true,
+            no_widow_control: true,
+            ..ParaStyle::default()
+        };
+        let d = Doc {
+            blocks: vec![Block::Paragraph {
+                style: ps.clone(),
+                inlines: vec![Inline::Text { text: "p".into(), style: TextStyle::default() }],
+            }],
+            ..Doc::default()
+        };
+        let html = doc_to_html(&d);
+        assert!(html.contains(&format!("mso-line-height-rule:{word}")), "{html}");
+        assert!(html.contains("text-indent:-24px") && html.contains("page-break-before:always"), "{html}");
+        let back = html_to_doc(&html);
+        let (got, _) = first_para(&back);
+        assert_eq!(got.right_indent_px, 24.0);
+        assert_eq!(got.first_line_px, -24.0);
+        assert_eq!(got.line_px, Some((20.0, rule)));
+        assert!(got.keep_with_next && got.keep_together && got.page_break_before && got.no_widow_control);
+    }
+    // A plain absolute line height (no rule) keeps meaning a multiple, as before.
+    let d = doc(r#"<p style="line-height:24px;font-size:12pt;text-indent:9999999px">x</p>"#);
+    let (ps, _) = first_para(&d);
+    assert_eq!(ps.line_px, None);
+    assert!(ps.line_height.is_some());
+    assert!(ps.first_line_px <= 2000.0, "text indents are capped");
+}

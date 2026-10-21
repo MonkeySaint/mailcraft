@@ -271,7 +271,12 @@ pub(crate) fn layout_table(
         }
         // Vertically centred, as in HTML's default for table cells.
         let free = (ch - pad * 2.0 - h).max(0.0);
-        out.append(content, cx + pad, cy + pad + free / 2.0);
+        // A column squeezed below its content's minimum (the table's minimum is wider than the page) can
+        // hold something that cannot wrap, such as a list marker: it moves left so it stays inside the table.
+        let dx = cx + pad;
+        let over = (dx + content_right(&content) - (frame.x + table_w)).max(0.0);
+        let dx = if over.is_finite() { (dx - over).max(frame.x) } else { dx };
+        out.append(content, dx, cy + pad + free / 2.0);
         if border {
             borders.push(DisplayItem::StrokeRect { rect, color: BORDER_COLOR, width: stroke });
         }
@@ -287,6 +292,13 @@ pub(crate) fn layout_table(
         });
     }
     table_h
+}
+
+/// Rightmost edge of the laid-out text and lines in `o` (0 when it holds none).
+fn content_right(o: &Out) -> f32 {
+    let runs = o.index.runs.iter().map(|r| r.rect.right());
+    let lines = o.index.lines.iter().map(|l| l.rect.right());
+    runs.chain(lines).filter(|x| x.is_finite()).fold(0.0f32, f32::max)
 }
 
 #[cfg(test)]

@@ -1354,16 +1354,22 @@ fn module_params(app: &App, surface: Surface, id: &str, params: Value) -> Option
     Some(Value::Object(obj))
 }
 
-/// Side effects of some commands on the UI (clipboard text).
+/// Side effects of some commands on the UI (the system clipboard: HTML and text for a body copy, where the
+/// platform takes HTML).
 fn after_run(ctx: &egui::Context, id: &str, r: Option<&Value>) {
     let Some(r) = r else { return };
-    let text = match id {
-        "format.copy" | "format.cut" => r.get("text").and_then(Value::as_str),
-        "app.copy" => r.get("copied_text").and_then(Value::as_str),
-        _ => None,
+    let (text, html) = match id {
+        "format.copy" | "format.cut" => {
+            (r.get("text").and_then(Value::as_str), r.get("html").and_then(Value::as_str))
+        }
+        "app.copy" => (r.get("copied_text").and_then(Value::as_str), None),
+        _ => (None, None),
     };
     if let Some(t) = text.filter(|t| !t.is_empty()) {
-        ctx.copy_text(t.to_owned());
+        let rich = html.is_some_and(|h| !h.trim().is_empty() && crate::compose::copy_html(h, t));
+        if !rich {
+            ctx.copy_text(t.to_owned());
+        }
     }
 }
 
@@ -1382,6 +1388,14 @@ fn escape(app: &mut App, surface: Surface) -> &'static str {
         return "backstage";
     }
     match surface {
+        // Escape first puts away an armed Format Painter or highlighter pen.
+        Surface::Compose(id)
+            if app.s.composes.get(&id).is_some_and(|c| c.painter.is_some() || c.highlight_pen.is_some()) =>
+        {
+            app.run("format.formatPainter", json!({"compose": id, "cancel": true}));
+            app.run("format.highlight", json!({"compose": id, "stop": true}));
+            "painter"
+        }
         // Escape closes a compose window (with the save prompt), not an inline response.
         Surface::Compose(id) if app.s.composes.get(&id).is_some_and(|c| !c.inline) => {
             app.run("compose.close", json!({"compose": id}));
@@ -1807,6 +1821,13 @@ fn fire_keytip(
                 }
                 (_, p) => p,
             };
+            // The compose window's own handling of a few ribbon commands (system clipboard Cut / Copy /
+            // Paste, file picker, Spelling dialog) applies to their keytips too.
+            if let Surface::Compose(cid) = surface
+                && crate::compose::ribbon_command(ctx, app, cid, &id, &params)
+            {
+                return json!({"keytip": t.label, "command": id, "ok": true});
+            }
             let r = app.run(&id, params);
             after_run(ctx, &id, r.as_ref());
             json!({"keytip": t.label, "command": id, "ok": r.is_some()})

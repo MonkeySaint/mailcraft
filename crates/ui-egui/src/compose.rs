@@ -31,6 +31,7 @@ mod a11y;
 mod attach;
 mod clipboard;
 mod editor;
+mod fonts;
 mod mention;
 mod minibar;
 mod panes;
@@ -61,9 +62,13 @@ pub use clipboard::{
     html_for_paste, set_clipboard_hooks, set_clipboard_image_reader,
 };
 pub use editor::{
-    BODY_LABEL, NO_SUGGESTIONS, PASTE_MODES, body_focused, editor_id, request_live_preview, request_paste,
+    BODY_LABEL, NO_SUGGESTIONS, PASTE_MODES, body_focused, editor_id, refocus_body, request_live_preview,
+    request_paste,
 };
 pub(crate) use editor::{EditorHost, body_editor_in};
+pub use fonts::{
+    InstalledFonts, MAX_FONT_NAMES, font_names, installed_fonts, merge_font_names, set_installed_fonts_reader,
+};
 pub use mention::{LIST_LABEL as MENTION_LIST_LABEL, is_open as mention_list_open};
 pub use minibar::{LABEL as MINI_TOOLBAR_LABEL, is_showing as mini_toolbar_showing};
 pub use panes::{
@@ -687,21 +692,89 @@ pub(crate) fn ribbon_command(
             spelling::open_with(ctx, app, cid, grammar);
             true
         }
-        // Paste ▾ › Keep Source Formatting / Merge Formatting / Keep Text Only: paste the system clipboard
-        // (HTML when it has some) with that mode, like Ctrl+V.
-        "format.paste" if params.get("text").is_none() && params.get("html").is_none() => {
+        // Cut / Copy: like Ctrl+X / Ctrl+C, the selection goes on the system clipboard too (HTML and text).
+        "format.copy" | "format.cut" => {
+            if let Some(r) = app.run(cmd, params.clone()) {
+                editor::put_copy_on_clipboard(ctx, cid, &r);
+            }
+            editor::refocus_body(ctx, cid);
+            true
+        }
+        // Paste (and Paste ▾ › Keep Source Formatting / Merge Formatting / Keep Text Only): paste the system
+        // clipboard (HTML when it has some) like Ctrl+V, with the chosen mode or the Options default.
+        "format.paste"
+            if params.get("text").is_none()
+                && params.get("html").is_none()
+                && params.get("image").is_none() =>
+        {
             let wanted = params.get("mode").and_then(serde_json::Value::as_str);
-            match PASTE_MODES.iter().map(|(m, _)| *m).find(|m| Some(*m) == wanted) {
-                Some(mode) => {
-                    request_paste(ctx, cid, mode);
+            let mode = PASTE_MODES.iter().map(|(m, _)| *m).find(|m| Some(*m) == wanted);
+            if wanted.is_some() && mode.is_none() {
+                // An unknown mode: the engine reports it.
+                return false;
+            }
+            let system = clipboard_hooks().read_text.map(|_| {
+                let text = clipboard_text().unwrap_or_default();
+                let image = if text.is_empty() { clipboard_image() } else { None };
+                (text, image)
+            });
+            let handled = match (system, mode) {
+                (Some((text, image)), _) if !text.is_empty() || image.is_some() => {
+                    let html = if text.is_empty() { None } else { html_for_paste(&text) };
+                    paste_system_clipboard(ctx, app, cid, &text, html, image, mode);
                     true
                 }
-                None => false,
+                // The system clipboard is empty or could not be read (a Wayland session without
+                // data-control, a clipboard whose owner has exited): the engine pastes what Copy / Cut
+                // put on the in-app clipboard, or says there is nothing to paste.
+                (Some(_), _) => false,
+                // No clipboard reader: ask the platform for a paste event, which the body editor takes
+                // with the mode.
+                (None, Some(m)) => {
+                    request_paste(ctx, cid, m);
+                    true
+                }
+                // Without a reader and a mode the in-app clipboard is all there is: the engine pastes it.
+                (None, None) => false,
+            };
+            if handled {
+                editor::refocus_body(ctx, cid);
             }
+            handled
         }
         _ => false,
     }
 }
+
+/// Pastes what the system clipboard holds into compose `cid`: its text `text` (with the matching HTML
+/// flavour `html`), or, when it holds no text, its picture `image`. Returns whether something was pasted.
+pub(crate) fn paste_system_clipboard(
+    ctx: &egui::Context,
+    app: &mut App,
+    cid: u64,
+    text: &str,
+    html: Option<String>,
+    image: Option<Vec<u8>>,
+    mode: Option<&str>,
+) -> bool {
+    if text.len() > MAX_PASTE_TEXT {
+        app.s.notify(mailcraft_engine::Notice::Error("The clipboard holds too much text to paste.".into()));
+        return false;
+    }
+    if !text.is_empty() {
+        return editor::paste_clipboard(ctx, app, cid, text, html, mode);
+    }
+    match image {
+        Some(data) => {
+            let b64 = mailcraft_mime::transfer::encode_base64_flat(&data);
+            app.run("format.paste", json!({"compose": cid, "image": b64})).is_some()
+        }
+        None => false,
+    }
+}
+
+/// Most clipboard text the ribbon's Paste takes (bigger content is refused with a message).
+pub const MAX_PASTE_TEXT: usize = 8 * 1024 * 1024;
 
 /// Send + address rows + Subject (shared by windows and inline responses).
 fn header(ui: &mut Ui, app: &mut App, cid: u64) {

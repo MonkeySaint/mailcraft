@@ -1545,3 +1545,358 @@ fn hovering_a_colour_in_the_font_colour_menu_previews_it() {
     assert!(compose(&h, cid).preview.is_none());
     assert_eq!(compose(&h, cid).body, body);
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Ribbon clipboard, Format Painter and the Format Text dialogs
+
+fn copied(h: &Harness<'_, App>) -> Vec<String> {
+    h.output()
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn classic_body(text: &str) -> (Harness<'static, App>, u64) {
+    let (mut app, cid) = app_with_compose(false);
+    app.s.view.simplified_ribbon = false;
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label(BODY_LABEL).click();
+    h.run();
+    h.get_by_label(BODY_LABEL).type_text(text);
+    h.run();
+    (h, cid)
+}
+
+#[test]
+fn ribbon_copy_and_cut_reach_the_system_clipboard() {
+    let (mut h, cid) = classic_body("alpha beta");
+    select_range(h.state_mut(), cid, 0, 5);
+    h.run();
+    h.get_by_label("Copy").click();
+    h.step();
+    assert_eq!(copied(&h), vec!["alpha".to_owned()], "the ribbon's Copy fills the system clipboard");
+    h.run();
+    select_range(h.state_mut(), cid, 6, 10);
+    h.run();
+    h.get_by_label("Cut").click();
+    h.step();
+    assert_eq!(copied(&h), vec!["beta".to_owned()]);
+    h.run();
+    assert_eq!(compose(&h, cid).body.to_plain_text().trim_end(), "alpha");
+    // The body has the keyboard again: typing goes on at the caret.
+    push(&mut h, Event::Text("!".into()));
+    h.run();
+    assert_eq!(compose(&h, cid).body.to_plain_text().trim_end(), "alpha !");
+}
+
+#[test]
+fn ribbon_paste_takes_the_system_clipboard() {
+    let (mut app, cid) = app_with_compose(false);
+    let ctx = egui::Context::default();
+    // Text copied in another program.
+    assert!(paste_system_clipboard(&ctx, &mut app, cid, "from elsewhere", None, None, None));
+    assert!(app.s.composes[&cid].body.to_plain_text().contains("from elsewhere"));
+    // Its HTML flavour, with a mode.
+    let html = Some("<p><b>loud</b></p>".to_owned());
+    assert!(paste_system_clipboard(&ctx, &mut app, cid, "loud", html, None, Some("keepSource")));
+    let bold = app.s.composes[&cid].body.blocks.iter().any(|b| match b {
+        mailcraft_model::Block::Paragraph { inlines, .. } => inlines.iter().any(|i| {
+            matches!(i, mailcraft_model::Inline::Text { text, style } if text.contains("loud") && style.bold == Some(true))
+        }),
+        _ => false,
+    });
+    assert!(bold);
+    // Only a picture on the clipboard.
+    let png = mailcraft_mime::transfer::decode_base64(PNG_B64.as_bytes());
+    let pictures = app.s.composes[&cid].inline_images.len();
+    assert!(paste_system_clipboard(&ctx, &mut app, cid, "", None, Some(png), None));
+    assert_eq!(app.s.composes[&cid].inline_images.len(), pictures + 1);
+    // Nothing at all, or far too much text: nothing happens.
+    let before = app.s.composes[&cid].body.clone();
+    assert!(!paste_system_clipboard(&ctx, &mut app, cid, "", None, None, None));
+    assert!(!paste_system_clipboard(&ctx, &mut app, cid, &"x".repeat(MAX_PASTE_TEXT + 1), None, None, None));
+    assert_eq!(app.s.composes[&cid].body, before);
+}
+
+fn elsewhere_text() -> Option<String> {
+    Some("from elsewhere".into())
+}
+
+fn unreadable_text() -> Option<String> {
+    None
+}
+
+#[test]
+fn ribbon_paste_button_reads_the_system_clipboard() {
+    let (mut h, cid) = classic_body("x ");
+    set_clipboard_hooks(ClipboardHooks { read_text: Some(elsewhere_text), ..ClipboardHooks::default() });
+    h.get_by_label("Paste").click();
+    h.run();
+    h.run();
+    set_clipboard_hooks(ClipboardHooks::default());
+    assert!(
+        compose(&h, cid).body.to_plain_text().contains("from elsewhere"),
+        "{}",
+        compose(&h, cid).body.to_plain_text()
+    );
+}
+
+#[test]
+fn ribbon_paste_falls_back_to_the_in_app_clipboard_when_the_system_one_cannot_be_read() {
+    // Regression: with a reader installed that could not read the clipboard, Paste pasted nothing and
+    // never used what the ribbon's Copy had just put on the in-app clipboard.
+    let (mut h, cid) = classic_body("alpha beta");
+    select_range(h.state_mut(), cid, 0, 5);
+    h.run();
+    h.get_by_label("Copy").click();
+    h.run();
+    select_range(h.state_mut(), cid, 10, 10);
+    h.run();
+    set_clipboard_hooks(ClipboardHooks { read_text: Some(unreadable_text), ..ClipboardHooks::default() });
+    h.get_by_label("Paste").click();
+    h.run();
+    h.run();
+    set_clipboard_hooks(ClipboardHooks::default());
+    let text = compose(&h, cid).body.to_plain_text();
+    assert_eq!(text.matches("alpha").count(), 2, "{text}");
+}
+
+/// Clicks `n` times at `pos`, one click per frame (frames are a quarter second apart, inside egui's
+/// double-click interval), then runs the harness.
+fn multi_click(h: &mut Harness<'_, App>, pos: Pos2, n: usize) {
+    push(h, Event::PointerMoved(pos));
+    for _ in 0..n {
+        for pressed in [true, false] {
+            push(
+                h,
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                },
+            );
+        }
+        h.step();
+    }
+    h.run();
+}
+
+#[test]
+fn one_shot_format_painter_paints_a_triple_clicked_paragraph() {
+    // Regression: the first click of the triple-click painted the word under it and used the painter up,
+    // so the paragraph the triple-click selected was never painted.
+    let (mut h, cid) = inline_body("Make this bold please and the rest too");
+    select_range(h.state_mut(), cid, 0, 4);
+    h.state_mut().run("format.bold", json!({"compose": cid})).unwrap();
+    select_range(h.state_mut(), cid, 1, 1);
+    h.state_mut().run("format.formatPainter", json!({"compose": cid})).unwrap();
+    h.run();
+    let at = body_point(&h, 120.0);
+    multi_click(&mut h, at, 3);
+    let c = compose(&h, cid);
+    assert!(c.painter.is_none(), "a one-shot painter is used up");
+    let plain = c.body.to_plain_text();
+    assert!(
+        c.selection.focus.offset.abs_diff(c.selection.anchor.offset) + 1 >= plain.trim_end().chars().count()
+    );
+    assert!(c.selection_all(|st, _| st.bold == Some(true)), "the whole paragraph is painted");
+    // A single click still paints the word under it, once the double-click interval has passed.
+    let (mut h, cid) = inline_body("Make this bold please");
+    select_range(h.state_mut(), cid, 0, 4);
+    h.state_mut().run("format.bold", json!({"compose": cid})).unwrap();
+    select_range(h.state_mut(), cid, 1, 1);
+    h.state_mut().run("format.formatPainter", json!({"compose": cid})).unwrap();
+    h.run();
+    let at = body_point(&h, 120.0);
+    multi_click(&mut h, at, 1);
+    for _ in 0..4 {
+        h.step();
+    }
+    let c = compose(&h, cid);
+    assert!(c.painter.is_none());
+    let bold: String = c
+        .body
+        .blocks
+        .iter()
+        .flat_map(|b| match b {
+            mailcraft_model::Block::Paragraph { inlines, .. } => inlines.clone(),
+            _ => Vec::new(),
+        })
+        .filter_map(|i| match i {
+            mailcraft_model::Inline::Text { text, style } if style.bold == Some(true) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        bold.contains("Make") && bold.len() > "Make".len() && bold.len() < c.body.to_plain_text().len(),
+        "{bold}"
+    );
+}
+
+#[test]
+fn double_clicking_the_format_painter_button_keeps_it_armed() {
+    let (mut h, cid) = classic_body("alpha beta");
+    select_range(h.state_mut(), cid, 1, 1);
+    h.run();
+    let at = h.get_by_label("Format Painter").rect().center();
+    multi_click(&mut h, at, 2);
+    let c = compose(&h, cid);
+    assert!(c.painter.as_ref().is_some_and(|p| p.sticky), "{:?}", c.painter);
+}
+
+#[test]
+fn format_painter_paints_the_whole_drag_and_esc_disarms_it() {
+    let (mut h, cid) = inline_body("Make this bold please");
+    select_range(h.state_mut(), cid, 0, 4);
+    h.state_mut().run("format.bold", json!({"compose": cid})).unwrap();
+    select_range(h.state_mut(), cid, 1, 1);
+    h.state_mut().run("format.formatPainter", json!({"compose": cid})).unwrap();
+    h.run();
+    drag_select(&mut h, 60.0, 160.0);
+    let c = compose(&h, cid);
+    assert!(c.painter.is_none(), "a one-shot painter is used up");
+    assert!(c.selection.focus.offset > c.selection.anchor.offset + 3, "{:?}", c.selection);
+    assert!(
+        c.selection_all(|st, _| st.bold == Some(true)),
+        "every dragged character is painted, not just the first"
+    );
+    // Esc puts an armed painter (or pen) away and leaves the window open.
+    h.state_mut().run("format.formatPainter", json!({"compose": cid, "sticky": true})).unwrap();
+    let ctx = h.ctx.clone();
+    let r =
+        crate::keys::apply(&ctx, h.state_mut(), crate::Surface::Compose(cid), crate::keys::Action::Escape);
+    assert_eq!(r["closed"], "painter");
+    assert!(compose(&h, cid).painter.is_none());
+}
+
+#[test]
+fn font_dialog_applies_effects_from_its_tabs() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "fancy words"})).unwrap();
+    select_range(&mut app, cid, 0, 5);
+    let mut h = full_harness(app);
+    h.run();
+    h.state_mut().run("format.fontDialog", json!({"compose": cid})).unwrap();
+    h.run();
+    h.get_by_label("Small caps").click();
+    h.run();
+    h.get_by_label("Advanced").click();
+    h.run();
+    h.get_by_label("OK").click();
+    h.run();
+    let c = compose(&h, cid);
+    assert!(c.selection_all(|st, _| st.small_caps == Some(true)));
+    assert!(h.query_by_label("Small caps").is_none(), "closed");
+}
+
+#[test]
+fn paragraph_dialog_ok_keeps_what_it_opened_with() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "spaced out"})).unwrap();
+    app.run("format.align", json!({"compose": cid, "kind": "right"})).unwrap();
+    app.run("format.paragraphSpacing", json!({"compose": cid, "before": 12, "after": 24})).unwrap();
+    let before = app.s.composes[&cid].para_at_caret();
+    let mut h = full_harness(app);
+    h.run();
+    h.state_mut().run("format.paragraphDialog", json!({"compose": cid})).unwrap();
+    h.run();
+    h.get_by_label("Line and Page Breaks").click();
+    h.run();
+    h.get_by_label("Keep with next").click();
+    h.run();
+    h.get_by_label("OK").click();
+    h.run();
+    let after = compose(&h, cid).para_at_caret();
+    assert_eq!(
+        (after.align, after.space_before_px, after.space_after_px),
+        (before.align, before.space_before_px, before.space_after_px),
+        "OK no longer resets alignment and spacing"
+    );
+    assert!(after.keep_with_next);
+}
+
+#[test]
+fn paragraph_dialog_over_several_paragraphs_changes_only_what_was_changed() {
+    // Regression: OK sent every field with the caret paragraph's values, so ticking one box over two
+    // paragraphs gave the second the first one's spacing and an explicit line height.
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "first\nsecond"})).unwrap();
+    app.run(
+        "compose.select",
+        json!({"compose": cid, "anchor": {"path": [1], "offset": 0}, "focus": {"path": [1], "offset": 6}}),
+    )
+    .unwrap();
+    app.run("format.paragraphSpacing", json!({"compose": cid, "before": 12, "after": 24})).unwrap();
+    app.run("format.selectAll", json!({"compose": cid})).unwrap();
+    let paras = |c: &ComposeState| -> Vec<mailcraft_model::rich::ParaStyle> {
+        c.body
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                mailcraft_model::Block::Paragraph { style, .. } => Some(style.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let before = paras(&app.s.composes[&cid]);
+    assert_ne!(before[0].space_before_px, before[1].space_before_px);
+    let mut h = full_harness(app);
+    h.run();
+    h.state_mut().run("format.paragraphDialog", json!({"compose": cid, "tab": "breaks"})).unwrap();
+    h.run();
+    h.get_by_label("Keep with next").click();
+    h.run();
+    h.get_by_label("OK").click();
+    h.run();
+    let after = paras(&compose(&h, cid));
+    for (a, b) in after.iter().zip(&before) {
+        assert!(a.keep_with_next);
+        assert_eq!(
+            (a.space_before_px, a.space_after_px, a.indent_px, a.line_height),
+            (b.space_before_px, b.space_after_px, b.indent_px, b.line_height)
+        );
+    }
+}
+
+#[test]
+fn more_colors_picks_from_the_standard_grid() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "tinted"})).unwrap();
+    select_range(&mut app, cid, 0, 6);
+    let mut h = full_harness(app);
+    h.run();
+    h.state_mut().run("format.color", json!({"compose": cid, "custom": true})).unwrap();
+    h.run();
+    h.get_by_label("Custom").click();
+    h.run();
+    h.get_by_label("Standard").click();
+    h.run();
+    // A swatch other than the starting colour, so the grid itself is what sets it.
+    let pick = crate::dialogs::format_dlg::standard_palette().get(39).copied().unwrap();
+    let label = format!("#{:02x}{:02x}{:02x}", pick[0], pick[1], pick[2]);
+    assert_ne!(label, "#1f5fbf");
+    h.get_by_label(&label).click();
+    h.run();
+    h.get_by_label("OK").click();
+    h.run();
+    let c = compose(&h, cid);
+    assert!(c.selection_all(|st, _| st.color == mailcraft_geom::Color::parse_hex(&label)), "{label}");
+    // Page Color › More Colors... uses the same picker, with No Color.
+    h.state_mut().run("compose.pageColor", json!({"compose": cid})).unwrap();
+    h.run();
+    h.get_by_label("OK").click();
+    h.run();
+    assert!(compose(&h, cid).body.background.is_some());
+    h.state_mut().run("compose.pageColor", json!({"compose": cid})).unwrap();
+    h.run();
+    h.get_by_label("No Color").click();
+    h.run();
+    assert!(compose(&h, cid).body.background.is_none());
+}

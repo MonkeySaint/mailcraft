@@ -47,7 +47,7 @@ pub use junk::{JunkLevel, JunkList, JunkSettings};
 pub use mailbox::Mailbox;
 pub use note::{Note, NoteColor};
 pub use quickstep::{QuickStep, QuickStepAction};
-pub use rich::{Block, Doc, Inline, ParaStyle, TextStyle};
+pub use rich::{Block, Doc, Inline, LineRule, ParaStyle, TextStyle, UnderlineKind};
 pub use rule::{Rule, RuleAction, RuleCondition};
 pub use signature::{AccountSignatures, RecentRecipient, Signature};
 pub use task::{Task, TaskPriority, TaskStatus};

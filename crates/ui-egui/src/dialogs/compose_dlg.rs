@@ -6,7 +6,7 @@
 use egui::{Context, RichText};
 use serde_json::{Map, Value, json};
 
-use super::common::{self, Dlg, Out, btn, btn_en, footer, muted, ok_cancel, primary, window, with_state};
+use super::common::{self, Dlg, Out, btn, btn_en, footer, muted, primary, window, with_state};
 use super::folders::last_error;
 use crate::App;
 
@@ -199,28 +199,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         p
     };
     Some(match d.name {
-        "font" => font(ctx, app, d),
-        "colors" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Colors",
-                vec![
-                    f("color", "Color (#rrggbb or name):", Kind::Text),
-                    f("n", "", Kind::Note("Examples: #1f4e5f, red, automatic".into())),
-                ],
-            )
-            .init("color", json!("#000000")),
-            |app, v| {
-                let target = match d.str("target").as_str() {
-                    "highlight" => "format.highlight",
-                    "shading" => "format.shading",
-                    _ => "format.color",
-                };
-                cmd(app, target, with(json!({"color": v.s("color")}))).map(|_| None)
-            },
-        ),
         "bordersAndShading" => run_form(
             ctx,
             app,
@@ -388,54 +366,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "paragraph" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Paragraph",
-                vec![
-                    f("align", "Alignment:", combo(&["left", "center", "right", "justify"])),
-                    f("indent", "Indentation level:", Kind::Num { min: 0.0, max: 8.0 }),
-                    f("before", "Spacing before (pt):", Kind::Num { min: 0.0, max: 200.0 }),
-                    f("after", "Spacing after (pt):", Kind::Num { min: 0.0, max: 200.0 }),
-                    f(
-                        "line",
-                        "Line spacing (multiple):",
-                        combo(&["1.0", "1.15", "1.5", "2.0", "2.5", "3.0"]),
-                    ),
-                ],
-            )
-            .init("line", json!("1.0"))
-            .init("after", json!(8)),
-            |app, v| {
-                cmd(app, "format.align", with(json!({"kind": v.s("align")})))?;
-                cmd(
-                    app,
-                    "format.paragraphSpacing",
-                    with(json!({"before": v.n("before"), "after": v.n("after")})),
-                )?;
-                cmd(
-                    app,
-                    "format.lineSpacing",
-                    with(json!({"multiple": v.s("line").parse::<f64>().unwrap_or(1.0)})),
-                )?;
-                if v.n("indent") > 0.0 {
-                    cmd(app, "format.indent", with(json!({"level": v.n("indent") as u64})))?;
-                }
-                Ok(None)
-            },
-        ),
-        "saveStyleSet" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new("Save as a New Style Set", vec![f("name", "File name:", Kind::Text)]),
-            |app, v| {
-                cmd(app, "format.styleSet", with(json!({"name": v.s("name"), "action": "save"})))
-                    .map(|_| None)
-            },
-        ),
         "applyStyles" => run_form(
             ctx,
             app,
@@ -1037,20 +967,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "pageColor" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Page Color",
-                vec![f("color", "Color (#rrggbb or name):", Kind::Text), f("none", "No Color", Kind::Check)],
-            ),
-            |app, v| {
-                let color =
-                    if v.b("none") || v.s("color").is_empty() { Value::Null } else { json!(v.s("color")) };
-                cmd(app, "compose.pageColor", with(json!({"color": color}))).map(|_| None)
-            },
-        ),
         "equation" => run_form(
             ctx,
             app,
@@ -1322,114 +1238,6 @@ fn customize_colors(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-
-const FAMILIES: [&str; 6] =
-    ["Inter", "Carlito", "Liberation Sans", "Liberation Serif", "Liberation Mono", "Caladea"];
-const SIZES: [&str; 16] =
-    ["8", "9", "10", "10.5", "11", "12", "14", "16", "18", "20", "22", "24", "28", "36", "48", "72"];
-
-#[derive(Clone, Default)]
-struct FontState {
-    family: String,
-    size: String,
-    color: String,
-    flags: [bool; 6],
-    initial: [bool; 6],
-}
-
-const FLAG_CMDS: [(&str, &str); 6] = [
-    ("Bold", "format.bold"),
-    ("Italic", "format.italic"),
-    ("Underline", "format.underline"),
-    ("Strikethrough", "format.strike"),
-    ("Superscript", "format.sup"),
-    ("Subscript", "format.sub"),
-];
-
-fn font(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let compose = d.u64("compose");
-    let init = |_: &App| {
-        let s = d.get("style").cloned().unwrap_or(Value::Null);
-        let b = |k: &str| s.get(k).and_then(Value::as_bool).unwrap_or(false);
-        let flags = [b("bold"), b("italic"), b("underline"), b("strike"), b("superscript"), b("subscript")];
-        FontState {
-            family: s.get("font_family").and_then(Value::as_str).unwrap_or("Inter").to_owned(),
-            size: s
-                .get("size_pt")
-                .and_then(Value::as_f64)
-                .map_or_else(|| "11".to_owned(), |n| format!("{n}")),
-            color: String::new(),
-            flags,
-            initial: flags,
-        }
-    };
-    with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Font", 460.0, |ui, app| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label("Font:");
-                    common::combo(ui, ("ffam", uid), &mut st.family, &FAMILIES, 200.0);
-                });
-                ui.vertical(|ui| {
-                    ui.label("Size:");
-                    common::combo(ui, ("fsize", uid), &mut st.size, &SIZES, 70.0);
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Font color:");
-                ui.add(egui::TextEdit::singleline(&mut st.color).hint_text("Automatic").desired_width(120.0));
-            });
-            common::heading(ui, app, "Effects");
-            egui::Grid::new(("feff", uid)).num_columns(2).show(ui, |ui| {
-                for (i, (label, _)) in FLAG_CMDS.iter().enumerate() {
-                    if let Some(f) = st.flags.get_mut(i) {
-                        ui.checkbox(f, *label);
-                    }
-                    if i % 2 == 1 {
-                        ui.end_row();
-                    }
-                }
-            });
-            common::heading(ui, app, "Preview");
-            let mut rt = RichText::new(if st.family.is_empty() { "Inter" } else { &st.family })
-                .size(st.size.parse::<f32>().unwrap_or(11.0).clamp(6.0, 40.0));
-            if st.flags[0] {
-                rt = rt.strong();
-            }
-            if st.flags[1] {
-                rt = rt.italics();
-            }
-            if st.flags[2] {
-                rt = rt.underline();
-            }
-            if st.flags[3] {
-                rt = rt.strikethrough();
-            }
-            ui.label(rt);
-            match ok_cancel(ui, app, true) {
-                Some(true) => {
-                    let c = json!(compose);
-                    app.run("format.font", json!({"compose": c, "family": st.family}));
-                    if let Ok(pt) = st.size.parse::<f64>() {
-                        app.run("format.fontSize", json!({"compose": c, "pt": pt}));
-                    }
-                    if !st.color.trim().is_empty() {
-                        app.run("format.color", json!({"compose": c, "color": st.color.trim()}));
-                    }
-                    for (i, (_, id)) in FLAG_CMDS.iter().enumerate() {
-                        if st.flags.get(i) != st.initial.get(i) {
-                            app.run(id, json!({"compose": c}));
-                        }
-                    }
-                    Out::Close
-                }
-                Some(false) => Out::Close,
-                None => Out::Keep,
-            }
-        })
-    })
-}
 
 #[derive(Clone, Default)]
 struct FindState {

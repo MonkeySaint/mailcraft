@@ -156,6 +156,8 @@ pub struct Ctl {
     pub on: Option<String>,
     /// Command run instead of `cmd` while the toggle is on.
     pub oncmd: Option<CmdRef>,
+    /// Command run on a double-click instead of the click's (`dbl=`: Format Painter stays on).
+    pub dblcmd: Option<CmdRef>,
     /// Dynamic item source for galleries.
     pub source: Option<String>,
     /// Fixed width for edits, combos and galleries.
@@ -229,6 +231,8 @@ pub struct Item {
     pub target: String,
     /// Colour swatch drawn instead of an icon.
     pub swatch: Option<[u8; 3]>,
+    /// State predicate that enables the entry (`en=`; disabled while it is false).
+    pub en: Option<String>,
 }
 
 impl Item {
@@ -242,6 +246,7 @@ impl Item {
             on: None,
             target: String::new(),
             swatch: None,
+            en: None,
         }
     }
 }
@@ -484,6 +489,8 @@ fn parse_into(d: &mut Defs, file: &str, text: &str) {
                         for tok in opt_tokens(&field(&f, 5)) {
                             if let Some(s) = tok.strip_prefix("on=") {
                                 item.on = Some(s.to_owned());
+                            } else if let Some(s) = tok.strip_prefix("en=") {
+                                item.en = Some(s.to_owned());
                             } else if let Some(s) = tok.strip_prefix("swatch=") {
                                 item.swatch = parse_hex(s);
                                 if item.swatch.is_none() {
@@ -534,6 +541,7 @@ fn parse_into(d: &mut Defs, file: &str, text: &str) {
                     menu: None,
                     on: None,
                     oncmd: None,
+                    dblcmd: None,
                     source: None,
                     width: None,
                     rules: Vec::new(),
@@ -546,6 +554,8 @@ fn parse_into(d: &mut Defs, file: &str, text: &str) {
                         c.on = Some(s.to_owned());
                     } else if let Some(s) = tok.strip_prefix("oncmd=") {
                         c.oncmd = Some(CmdRef::parse(s));
+                    } else if let Some(s) = tok.strip_prefix("dbl=") {
+                        c.dblcmd = Some(CmdRef::parse(s));
                     } else if let Some(s) = tok.strip_prefix("dyn=") {
                         c.source = Some(s.to_owned());
                     } else if let Some(s) = tok.strip_prefix("w=") {

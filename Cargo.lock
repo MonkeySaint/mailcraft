@@ -2376,6 +2376,7 @@ dependencies = [
  "image",
  "log",
  "mailcraft-engine",
+ "mailcraft-fonts",
  "mailcraft-ui-egui",
  "rfd",
  "serde_json",

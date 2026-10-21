@@ -1852,6 +1852,31 @@ pub const DEFS: &[Def] = &[
         A,
     ),
     d("state", "Folder pane", "state.showAllFoldersAZ", "Show all folders A to Z", Bool(false), A),
+    // Format Text › Change Styles › Set as Default / Save as a New Style Set.
+    d(
+        "state",
+        "Styles",
+        "state.compose.defaultStyleSet",
+        "Style set of new messages (empty = none)",
+        Text("", 64),
+        A,
+    ),
+    d(
+        "state",
+        "Styles",
+        "state.compose.defaultParagraphSpacing",
+        "Paragraph spacing of new messages (empty = none)",
+        Text("", 32),
+        A,
+    ),
+    d(
+        "state",
+        "Styles",
+        "state.compose.styleSets",
+        "Saved style sets: name → {base, paragraphSpacing}",
+        Object(64 * 1024),
+        A,
+    ),
     d(
         "state",
         "Dialogs",

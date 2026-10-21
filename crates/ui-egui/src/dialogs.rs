@@ -21,6 +21,7 @@ mod compose_dlg;
 pub(crate) mod files;
 mod find;
 mod folders;
+pub(crate) mod format_dlg;
 mod general;
 mod items;
 mod junk;
@@ -382,6 +383,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return out;
     }
     if let Some(out) = views::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = format_dlg::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = compose_dlg::show(ctx, app, d) {

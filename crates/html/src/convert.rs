@@ -9,7 +9,9 @@ use crate::css::{self, CascadeKey, DEFAULT_PT, Length, Props, Stylesheet};
 use crate::dom::{self, Dom, Node, NodeData, NodeId, attr};
 use crate::sanitize;
 use mailcraft_geom::Color;
-use mailcraft_model::rich::{Align, Block, Doc, Inline, ListKind, ParaStyle, TableCell, TextStyle};
+use mailcraft_model::rich::{
+    Align, Block, Doc, Inline, LineRule, ListKind, ParaStyle, TableCell, TextStyle, UnderlineKind,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -18,6 +20,10 @@ const MAX_TABLE_ROWS: usize = 10_000;
 const MAX_TABLE_COLS: usize = 1_000;
 /// Recursion guard (the tree itself is already capped at `MAX_DEPTH`).
 const MAX_WALK_DEPTH: usize = crate::MAX_DEPTH + 64;
+/// Largest text indent and fixed line height taken from mail (px).
+const MAX_TEXT_INDENT: f32 = 2_000.0;
+/// Largest letter spacing and baseline shift taken from mail (pt).
+const MAX_SHIFT_PT: f32 = 200.0;
 /// Inline `style` attributes longer than this are truncated.
 const MAX_STYLE_ATTR: usize = 64 * 1024;
 /// Total bytes of link targets copied into `Inline::Link`s. A link spanning many paragraphs needs one copy per
@@ -67,6 +73,32 @@ struct BoxStyle {
     top_rule: bool,
     border: bool,
     preserve_ws: Option<bool>,
+    /// margin-right + padding-right.
+    right: f32,
+    /// text-indent (negative = hanging).
+    text_indent: f32,
+    /// An absolute line-height with `mso-line-height-rule` (exactly / at-least), as Word-made mail has it.
+    line_px: Option<(f32, LineRule)>,
+    keep_with_next: bool,
+    keep_together: bool,
+    page_break_before: bool,
+    no_widow_control: bool,
+}
+
+impl BoxStyle {
+    /// The paragraph properties of this box on top of `para`.
+    fn para_extras(&self, para: ParaStyle) -> ParaStyle {
+        ParaStyle {
+            right_indent_px: self.right.max(0.0),
+            first_line_px: self.text_indent,
+            line_px: self.line_px,
+            keep_with_next: self.keep_with_next,
+            keep_together: self.keep_together,
+            page_break_before: self.page_break_before,
+            no_widow_control: self.no_widow_control,
+            ..para
+        }
+    }
 }
 
 fn is_block(name: &str) -> bool {
@@ -211,6 +243,45 @@ fn box_style(p: &Props, font_px: f32) -> BoxStyle {
     b.margin_bottom = mb;
     b.indent = ml.unwrap_or(0.0) + pl.unwrap_or(0.0);
     b.line_height = p.get("line-height").and_then(|v| parse_line_height(v, font_px));
+    let (mut mr, mut pr) = (None, None);
+    if let Some([_, r, _, _]) = p.get("margin").and_then(|v| box_sides(v, font_px)) {
+        mr = Some(r);
+    }
+    if let Some([_, r, _, _]) = p.get("padding").and_then(|v| box_sides(v, font_px)) {
+        pr = Some(r);
+    }
+    b.right =
+        (len("margin-right").or(mr).unwrap_or(0.0) + len("padding-right").or(pr).unwrap_or(0.0)).max(0.0);
+    b.text_indent = p
+        .get("text-indent")
+        .and_then(|v| css::length_px(v, font_px))
+        .filter(|v| v.is_finite())
+        .map_or(0.0, |v| v.clamp(-MAX_TEXT_INDENT, MAX_TEXT_INDENT));
+    let rule = p.get("mso-line-height-rule").map(|v| v.trim().to_ascii_lowercase());
+    let rule = match rule.as_deref() {
+        Some("exactly") => Some(LineRule::Exactly),
+        Some("at-least") => Some(LineRule::AtLeast),
+        _ => None,
+    };
+    if let (Some(rule), Some(Length::Px(px))) =
+        (rule, p.get("line-height").and_then(|v| css::parse_length(v, font_px)))
+        && px.is_finite()
+        && px > 0.0
+    {
+        b.line_px = Some((px.min(MAX_TEXT_INDENT), rule));
+    }
+    let is = |props: &[&str], words: &[&str]| {
+        props.iter().any(|k| {
+            p.get(k).is_some_and(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                words.iter().any(|w| v == *w)
+            })
+        })
+    };
+    b.keep_with_next = is(&["page-break-after", "break-after"], &["avoid", "avoid-page"]);
+    b.keep_together = is(&["page-break-inside", "break-inside"], &["avoid", "avoid-page"]);
+    b.page_break_before = is(&["page-break-before", "break-before"], &["always", "page"]);
+    b.no_widow_control = is(&["widows"], &["1"]) && is(&["orphans"], &["1"]);
     b.background = p
         .get("background-color")
         .and_then(css::parse_color)
@@ -306,7 +377,7 @@ fn apply_font_shorthand(ts: &mut TextStyle, v: &str, parent_pt: f32) {
     }
 }
 
-fn apply_text_props(ts: &mut TextStyle, p: &Props, parent_pt: f32, inline: bool) {
+fn apply_text_props(ts: &mut TextStyle, p: &Props, tag: &str, parent_pt: f32, inline: bool) {
     if let Some(v) = p.get("font") {
         apply_font_shorthand(ts, v, parent_pt);
     }
@@ -322,6 +393,10 @@ fn apply_text_props(ts: &mut TextStyle, p: &Props, parent_pt: f32, inline: bool)
     if let Some(v) = p.get("font-style") {
         apply_font_style(ts, v);
     }
+    // Which line this element itself draws: a decoration style belongs to that line, never to one
+    // inherited from an ancestor (`<u><s style="text-decoration-style:double">` is a double strike).
+    let (mut own_underline, mut own_strike) =
+        (matches!(tag, "u" | "ins"), matches!(tag, "s" | "strike" | "del"));
     for key in ["text-decoration", "text-decoration-line"] {
         if let Some(v) = p.get(key) {
             let v = v.to_ascii_lowercase();
@@ -331,10 +406,59 @@ fn apply_text_props(ts: &mut TextStyle, p: &Props, parent_pt: f32, inline: bool)
             }
             if v.contains("underline") {
                 ts.underline = Some(true);
+                own_underline = true;
             }
             if v.contains("line-through") {
                 ts.strike = Some(true);
+                own_strike = true;
             }
+        }
+    }
+    // Underline style and colour, double strikethrough: the longhands, or words of the shorthand.
+    let deco = |k: &str| p.get(k).map(str::to_ascii_lowercase);
+    let style_word = deco("text-decoration-style").or_else(|| deco("text-decoration")).and_then(|v| {
+        v.split_ascii_whitespace().find_map(|t| UnderlineKind::from_name(t).filter(|_| t != "single"))
+    });
+    if let Some(kind) = style_word {
+        let on_strike = if own_strike != own_underline {
+            own_strike
+        } else {
+            // Neither (or both) declared here: the line that is on, the underline when both are.
+            ts.strike == Some(true) && ts.underline != Some(true)
+        };
+        if on_strike {
+            if kind == UnderlineKind::Double {
+                ts.double_strike = Some(true);
+                ts.strike = None;
+            }
+        } else {
+            ts.underline_kind = Some(kind);
+        }
+    }
+    let deco_color = p.get("text-decoration-color").and_then(css::parse_color).or_else(|| {
+        p.get("text-decoration")
+            .filter(|v| v.to_ascii_lowercase().contains("underline"))
+            .and_then(css::color_in_shorthand)
+    });
+    if let Some(c) = deco_color.and_then(opaque) {
+        ts.underline_color = Some(c);
+    }
+    match deco("font-variant").as_deref().map(str::trim) {
+        Some("small-caps") => ts.small_caps = Some(true),
+        Some("normal") => ts.small_caps = Some(false),
+        _ => {}
+    }
+    match deco("text-transform").as_deref().map(str::trim) {
+        Some("uppercase") => ts.all_caps = Some(true),
+        Some("none") => ts.all_caps = Some(false),
+        _ => {}
+    }
+    let font_px = ts.size_pt.unwrap_or(parent_pt) * 4.0 / 3.0;
+    if let Some(v) = p.get("letter-spacing") {
+        if v.trim().eq_ignore_ascii_case("normal") {
+            ts.spacing_pt = None;
+        } else if let Some(px) = css::length_px(v, font_px).filter(|v| v.is_finite()) {
+            ts.spacing_pt = Some((px * 0.75).clamp(-MAX_SHIFT_PT, MAX_SHIFT_PT));
         }
     }
     if let Some(c) = p.get("color").and_then(css::parse_color) {
@@ -355,7 +479,13 @@ fn apply_text_props(ts: &mut TextStyle, p: &Props, parent_pt: f32, inline: bool)
                 ts.superscript = Some(false);
                 ts.subscript = Some(false);
             }
-            _ => {}
+            // A length raises (or, negative, lowers) the text: Font › Advanced › Position.
+            Some(v) => {
+                if let Some(px) = css::length_px(v, font_px).filter(|v| v.is_finite() && *v != 0.0) {
+                    ts.position_pt = Some((px * 0.75).clamp(-MAX_SHIFT_PT, MAX_SHIFT_PT));
+                }
+            }
+            None => {}
         }
     }
 }
@@ -601,7 +731,7 @@ impl Conv<'_> {
         let props = self.props(name, attrs);
         let mut c = ctx.clone();
         tag_text_style(name, attrs, &mut c.text, parent_pt);
-        apply_text_props(&mut c.text, &props, parent_pt, is_inline(name));
+        apply_text_props(&mut c.text, &props, name, parent_pt, is_inline(name));
         let font_px = c.text.size_pt.unwrap_or(self.base_pt) * 4.0 / 3.0;
         let bx = box_style(&props, font_px);
         if bx.hidden {
@@ -700,12 +830,12 @@ impl Conv<'_> {
             h if dom::is_heading(h) => {
                 let level = h.strip_prefix('h').and_then(|d| d.parse::<u8>().ok()).unwrap_or(1).clamp(1, 6);
                 c.indent = (c.indent + bx.indent).max(0.0);
-                let para = ParaStyle {
+                let para = bx.para_extras(ParaStyle {
                     space_before_px: bx.margin_top.unwrap_or(0.0).max(0.0),
                     space_after_px: bx.margin_bottom.unwrap_or(0.0).max(0.0),
                     background: bx.background,
                     ..c.para()
-                };
+                });
                 let blocks = self.flow_with(id, &c, para, depth);
                 sink.push_blocks(
                     blocks
@@ -737,6 +867,7 @@ impl Conv<'_> {
                 space_after_px: bx.margin_bottom.unwrap_or(0.0).max(0.0),
                 line_height: None,
                 background: Some(bg),
+                ..ParaStyle::default()
             };
             c.indent = 0.0;
             let blocks = self.flow_with(id, &c, c.para(), depth);
@@ -747,12 +878,12 @@ impl Conv<'_> {
         }
         c.indent = (c.indent + bx.indent).max(0.0);
         let default_after = if name == "p" { self.font_px(&c) } else { 0.0 };
-        let para = ParaStyle {
+        let para = bx.para_extras(ParaStyle {
             space_before_px: space_before,
             space_after_px: bx.margin_bottom.unwrap_or(default_after).max(0.0),
             background: if name == "p" { bx.background } else { None },
             ..c.para()
-        };
+        });
         let blocks = self.flow_with(id, &c, para, depth);
         sink.push_blocks(blocks);
     }
@@ -947,7 +1078,7 @@ pub(crate) fn dom_to_doc(dom: &Dom) -> Doc {
     };
     let body = conv.props("body", &dom.body_attrs);
     let mut base = TextStyle::default();
-    apply_text_props(&mut base, &body, DEFAULT_PT, false);
+    apply_text_props(&mut base, &body, "body", DEFAULT_PT, false);
     conv.base_pt = base.size_pt.unwrap_or(DEFAULT_PT);
     let bx = box_style(&body, conv.base_pt * 4.0 / 3.0);
     let ctx = Ctx {

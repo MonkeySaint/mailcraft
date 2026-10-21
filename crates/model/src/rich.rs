@@ -20,6 +20,71 @@ pub struct TextStyle {
     pub size_pt: Option<f32>,
     pub color: Option<Color>,
     pub highlight: Option<Color>,
+    /// How underlined text is underlined (`None` = a single line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline_kind: Option<UnderlineKind>,
+    /// Underline colour (`None` = the text colour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline_color: Option<Color>,
+    /// Two lines through the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_strike: Option<bool>,
+    /// Lower-case letters drawn as smaller capitals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub small_caps: Option<bool>,
+    /// Letters drawn as capitals (the text itself keeps its case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all_caps: Option<bool>,
+    /// Extra space between characters in points (negative = condensed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacing_pt: Option<f32>,
+    /// Baseline shift in points (positive = raised, negative = lowered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_pt: Option<f32>,
+}
+
+/// Underline styles (Font dialog › Underline style). Each has a CSS `text-decoration-style` equivalent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnderlineKind {
+    #[default]
+    Single,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
+impl UnderlineKind {
+    /// Every kind with its name (as `format.fontDialog` takes it).
+    pub const ALL: [(UnderlineKind, &'static str); 5] = [
+        (UnderlineKind::Single, "single"),
+        (UnderlineKind::Double, "double"),
+        (UnderlineKind::Dotted, "dotted"),
+        (UnderlineKind::Dashed, "dashed"),
+        (UnderlineKind::Wavy, "wavy"),
+    ];
+
+    /// The kind called `name` (`single`, `double`, `dotted`, `dashed`, `wavy`; case-insensitive).
+    pub fn from_name(name: &str) -> Option<UnderlineKind> {
+        Self::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(name.trim())).map(|(k, _)| *k)
+    }
+
+    /// The kind's name.
+    pub fn name(self) -> &'static str {
+        Self::ALL.iter().find(|(k, _)| *k == self).map_or("single", |(_, n)| n)
+    }
+}
+
+/// Line spacing rule of a paragraph with a fixed line height ([`ParaStyle::line_px`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LineRule {
+    /// Every line is exactly that tall.
+    #[default]
+    Exactly,
+    /// Lines are at least that tall (taller text makes them taller).
+    AtLeast,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +107,33 @@ pub struct ParaStyle {
     /// Line height multiplier (1.0 = font default).
     pub line_height: Option<f32>,
     pub background: Option<Color>,
+    /// Right indent in px.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub right_indent_px: f32,
+    /// First-line indent in px from the left indent (negative = a hanging indent).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub first_line_px: f32,
+    /// Fixed line height in px with its rule (Exactly / At least); wins over `line_height`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_px: Option<(f32, LineRule)>,
+    /// Line and Page Breaks: keep with the next paragraph, keep the lines together, page break before,
+    /// and widow/orphan control turned off (it is on by default). They matter when the message is printed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keep_with_next: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keep_together: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub page_break_before: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_widow_control: bool,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

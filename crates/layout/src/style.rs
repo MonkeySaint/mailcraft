@@ -2,7 +2,7 @@
 
 use mailcraft_fonts::{BODY_FAMILY, BODY_SIZE_PT, FontDb, FontId, LineMetrics};
 use mailcraft_geom::{Color, pt_to_px};
-use mailcraft_model::TextStyle;
+use mailcraft_model::{TextStyle, UnderlineKind};
 
 /// Family list used for monospace text (`Pre`, `monospace: Some(true)`).
 pub(crate) const MONO_FAMILY: &str = "Consolas, Courier New, monospace";
@@ -39,7 +39,30 @@ pub(crate) fn merge(parent: &TextStyle, child: &TextStyle) -> TextStyle {
         size_pt: child.size_pt.filter(|v| valid_pt(*v)).or(parent.size_pt),
         color: child.color.or(parent.color),
         highlight: child.highlight.or(parent.highlight),
+        underline_kind: child.underline_kind.or(parent.underline_kind),
+        underline_color: child.underline_color.or(parent.underline_color),
+        double_strike: child.double_strike.or(parent.double_strike),
+        small_caps: child.small_caps.or(parent.small_caps),
+        all_caps: child.all_caps.or(parent.all_caps),
+        spacing_pt: child.spacing_pt.filter(|v| v.is_finite()).or(parent.spacing_pt),
+        position_pt: child.position_pt.filter(|v| v.is_finite()).or(parent.position_pt),
     }
+}
+
+/// Character spacing and baseline position are kept within this many points.
+const MAX_SHIFT_PT: f32 = 200.0;
+
+/// Letter spacing `v` kept within half an em narrower and one em wider (0 when not finite).
+fn sane_spacing(v: f32, em: f32) -> f32 {
+    if !v.is_finite() || !em.is_finite() {
+        return 0.0;
+    }
+    v.max(-em * 0.5).min(em)
+}
+
+/// A finite point value within ±[`MAX_SHIFT_PT`], else 0.
+fn shift_pt(v: Option<f32>) -> f32 {
+    v.filter(|v| v.is_finite()).map_or(0.0, |v| v.clamp(-MAX_SHIFT_PT, MAX_SHIFT_PT))
 }
 
 /// Effective point size of a (merged) style, clamped to a sane range.
@@ -55,6 +78,13 @@ pub(crate) struct RStyle {
     pub color: Color,
     pub underline: bool,
     pub strike: bool,
+    /// Underline style and colour (`None` = the text colour); drawn as lines by the layout unless a plain
+    /// single underline in the text colour.
+    pub underline_kind: UnderlineKind,
+    pub underline_color: Option<Color>,
+    pub double_strike: bool,
+    /// Extra advance after every character in px (negative = condensed).
+    pub letter_spacing: f32,
     pub highlight: Option<Color>,
     /// Baseline shift in px, positive = up (superscript).
     pub shift: f32,
@@ -114,6 +144,7 @@ pub(crate) fn resolve(fonts: &FontDb, ts: &TextStyle, zoom: f32, default_color: 
         shift = -size_px * SUB_SHIFT;
         size_px *= SCRIPT_SCALE;
     }
+    shift += pt_to_px(shift_pt(ts.position_pt)) * zoom;
     let metrics = safe_metrics(fonts, font, size_px);
     let space_w = sane(fonts.advance(font, ' ', size_px));
     RStyle {
@@ -121,7 +152,11 @@ pub(crate) fn resolve(fonts: &FontDb, ts: &TextStyle, zoom: f32, default_color: 
         size_px,
         color: ts.color.unwrap_or(default_color),
         underline: ts.underline.unwrap_or(false),
-        strike: ts.strike.unwrap_or(false),
+        strike: ts.strike.unwrap_or(false) && !ts.double_strike.unwrap_or(false),
+        underline_kind: ts.underline_kind.unwrap_or_default(),
+        underline_color: ts.underline_color,
+        double_strike: ts.double_strike.unwrap_or(false),
+        letter_spacing: sane_spacing(pt_to_px(shift_pt(ts.spacing_pt)) * zoom, size_px),
         highlight: ts.highlight,
         shift,
         metrics,

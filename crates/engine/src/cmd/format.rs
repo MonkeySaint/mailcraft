@@ -15,7 +15,7 @@ use crate::compose::{
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_geom::Color;
 use mailcraft_model::rich::ListKind;
-use mailcraft_model::{Doc, ParaStyle, TextStyle};
+use mailcraft_model::{Doc, LineRule, ParaStyle, TextStyle, UnderlineKind};
 
 /// Font sizes stepped through by Grow / Shrink Font.
 pub const FONT_SIZES: [f32; 16] =
@@ -276,7 +276,7 @@ pub fn color_gallery(c: &ComposeState) -> Value {
 
 /// The colour a Font Color / Shading call names: `{"theme": key, "tint": n}` (from the compose's theme) or
 /// `{"color": …}` (`Ok(None)` when neither is given).
-fn requested_theme_color(s: &Session, p: &Value) -> Result<Option<Color>, CmdError> {
+pub(crate) fn requested_theme_color(s: &Session, p: &Value) -> Result<Option<Color>, CmdError> {
     let Some(key) = opt_str(p, "theme") else {
         return Ok(None);
     };
@@ -335,6 +335,11 @@ fn highlight(s: &mut Session, p: &Value) -> CmdResult {
     };
     let list = opt_bool(p, "list") == Some(true);
     let c = compose_mut(s, p)?;
+    // Stop Highlighting (and Esc): the highlighter pen is put away.
+    if opt_bool(p, "stop") == Some(true) {
+        c.highlight_pen = None;
+        return Ok(json!({"pen": false}));
+    }
     if let Some(v) = hc {
         c.editor.high_contrast_only = v;
         if chosen.is_none() && !list {
@@ -364,6 +369,16 @@ fn highlight(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some(v) = col {
         c.last_highlight = Some(v);
+    }
+    // Nothing selected: the button arms a highlighter pen that marks each text selected next (clicking it
+    // again with the pen armed puts the pen away). `typing: true` highlights what is typed instead.
+    if !c.has_selection() && c.extra_ranges.is_empty() && opt_bool(p, "typing") != Some(true) {
+        if chosen.is_none() && c.highlight_pen.is_some() {
+            c.highlight_pen = None;
+            return Ok(json!({"pen": false}));
+        }
+        c.highlight_pen = Some(col);
+        return Ok(json!({"pen": true, "highlight": col.map(|x| x.to_hex())}));
     }
     c.checkpoint();
     c.apply_text_style(|st| st.highlight = col);
@@ -403,24 +418,193 @@ fn change_case(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"text": c.selected_text()}))
 }
 
+/// Font dialog: opens it with the caret's formatting and the theme fonts; `apply` (its OK button) sets every
+/// given property of the selection in one step (see [`apply_font_dialog`]).
 fn font_dialog(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(a) = p.get("apply") {
+        return apply_font_dialog(s, p, a);
+    }
     let cid = compose_id(s, p)?;
-    let style = s.composes.get(&cid).map(ComposeState::style_at_caret).unwrap_or_default();
-    dialog(s, "font", json!({"compose": cid, "style": style}))
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let style = c.style_at_caret();
+    let theme = c.theme_resolved();
+    let tab = opt_str(p, "tab").unwrap_or("font");
+    dialog(
+        s,
+        "font",
+        json!({"compose": cid, "style": style, "headingFont": theme.heading_font, "bodyFont": theme.body_font, "tab": tab}),
+    )
 }
 
+/// Character spacing and position accepted by the Font dialog (points either way).
+const MAX_FONT_SHIFT_PT: f64 = 1584.0;
+
+/// The Font dialog's OK: `apply` holds any of `family`, `pt`, `color` ("automatic" or a colour), `bold`,
+/// `italic`, `underline` (`none`, `single`, `double`, `dotted`, `dashed`, `wavy`), `underlineColor`
+/// ("automatic" or a colour), `strike`, `doubleStrike`, `superscript`, `subscript`, `smallCaps`, `allCaps`,
+/// `spacing` and `position` (points; 0 = normal). Everything is checked before anything changes; one undo
+/// step.
+fn apply_font_dialog(s: &mut Session, p: &Value, a: &Value) -> CmdResult {
+    if !a.is_object() {
+        return Err(CmdError::Params("`apply` must be an object".into()));
+    }
+    let flag = |k: &str| -> Result<Option<bool>, CmdError> {
+        match a.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                v.as_bool().map(Some).ok_or_else(|| CmdError::Params(format!("`{k}` must be true or false")))
+            }
+        }
+    };
+    let colour = |k: &str| -> Result<Option<Option<Color>>, CmdError> {
+        match a.get(k).and_then(Value::as_str) {
+            None => Ok(None),
+            Some(t) if t.eq_ignore_ascii_case("automatic") || t.eq_ignore_ascii_case("auto") => {
+                Ok(Some(None))
+            }
+            Some(t) => parse_color(t).map(|c| Some(Some(c))),
+        }
+    };
+    let points = |k: &str, lo: f64, hi: f64| -> Result<Option<f32>, CmdError> {
+        match a.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                let n = v.as_f64().filter(|n| n.is_finite() && (lo..=hi).contains(n));
+                #[allow(clippy::cast_possible_truncation)]
+                n.map(|n| Some(n as f32))
+                    .ok_or_else(|| CmdError::Params(format!("`{k}` must be {lo}..{hi} points")))
+            }
+        }
+    };
+    let family = match a.get("family").and_then(Value::as_str).map(str::trim) {
+        Some(f) if f.len() > 256 => return Err(CmdError::Params("`family` must be a font name".into())),
+        Some(f) if !f.is_empty() => Some(f.to_owned()),
+        _ => None,
+    };
+    let pt = points("pt", 1.0, 1638.0)?;
+    let color = colour("color")?;
+    let underline_color = colour("underlineColor")?;
+    let underline: Option<Option<UnderlineKind>> = match a.get("underline") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(b.then_some(UnderlineKind::Single)),
+        Some(Value::String(n)) if n.eq_ignore_ascii_case("none") => Some(None),
+        Some(Value::String(n)) => Some(Some(
+            UnderlineKind::from_name(n)
+                .ok_or_else(|| CmdError::Params(format!("unknown underline style `{n}`")))?,
+        )),
+        Some(_) => return Err(CmdError::Params("`underline` must be a style name or true/false".into())),
+    };
+    let (bold, italic, strike, dstrike) =
+        (flag("bold")?, flag("italic")?, flag("strike")?, flag("doubleStrike")?);
+    let (sup, sub, small, caps) =
+        (flag("superscript")?, flag("subscript")?, flag("smallCaps")?, flag("allCaps")?);
+    if sup == Some(true) && sub == Some(true) {
+        return Err(CmdError::Params("text cannot be both superscript and subscript".into()));
+    }
+    let spacing = points("spacing", -MAX_FONT_SHIFT_PT, MAX_FONT_SHIFT_PT)?;
+    let position = points("position", -MAX_FONT_SHIFT_PT, MAX_FONT_SHIFT_PT)?;
+    let c = compose_mut(s, p)?;
+    c.checkpoint();
+    let some_if = |b: bool| if b { Some(true) } else { None };
+    c.apply_text_style(|st| {
+        if let Some(f) = &family {
+            st.font_family = Some(f.clone());
+        }
+        if let Some(v) = pt {
+            st.size_pt = Some(v);
+        }
+        if let Some(v) = color {
+            st.color = v;
+        }
+        if let Some(v) = bold {
+            st.bold = Some(v);
+        }
+        if let Some(v) = italic {
+            st.italic = Some(v);
+        }
+        if let Some(u) = underline {
+            st.underline = Some(u.is_some());
+            st.underline_kind = u.filter(|k| *k != UnderlineKind::Single);
+        }
+        if let Some(v) = underline_color {
+            st.underline_color = v;
+        }
+        if let Some(v) = strike {
+            st.strike = Some(v);
+            if v {
+                st.double_strike = None;
+            }
+        }
+        if let Some(v) = dstrike {
+            st.double_strike = some_if(v);
+            if v {
+                st.strike = None;
+            }
+        }
+        if let Some(v) = sup {
+            st.superscript = Some(v);
+            if v {
+                st.subscript = None;
+            }
+        }
+        if let Some(v) = sub {
+            st.subscript = Some(v);
+            if v {
+                st.superscript = None;
+            }
+        }
+        if let Some(v) = small {
+            st.small_caps = some_if(v);
+        }
+        if let Some(v) = caps {
+            st.all_caps = some_if(v);
+        }
+        if let Some(v) = spacing {
+            st.spacing_pt = (v != 0.0).then_some(v);
+        }
+        if let Some(v) = position {
+            st.position_pt = (v != 0.0).then_some(v);
+        }
+    });
+    if let Some(v) = color.flatten() {
+        c.last_font_color = Some(v);
+    }
+    c.dirty = true;
+    Ok(json!({"style": c.style_at_caret()}))
+}
+
+/// Format Painter. A click arms it with the caret's formatting (or disarms it); `sticky` (a double-click on the
+/// button) keeps it armed after each use, also when the first click of that double-click already armed it.
+/// `apply` paints the selection (the word at the caret when nothing is selected) once a mouse selection is
+/// finished; `cancel` (Esc) disarms it.
 fn format_painter(s: &mut Session, p: &Value) -> CmdResult {
     let c = compose_mut(s, p)?;
-    if c.painter.is_some() {
+    let state = |c: &crate::compose::ComposeState| json!({"armed": c.painter.is_some(), "sticky": c.painter.as_ref().is_some_and(|p| p.sticky)});
+    if opt_bool(p, "cancel") == Some(true) {
         c.painter = None;
-        return Ok(json!({"armed": false}));
+        return Ok(state(c));
     }
-    c.painter = Some(PainterState {
-        style: c.style_at_caret(),
-        para: c.para_at_caret(),
-        sticky: opt_bool(p, "sticky") == Some(true),
-    });
-    Ok(json!({"armed": true}))
+    if opt_bool(p, "apply") == Some(true) {
+        let armed = c.painter.is_some() || c.highlight_pen.is_some();
+        if armed && !c.has_selection() && opt_bool(p, "word") != Some(false) {
+            c.select_word_at_caret();
+        }
+        let applied = armed && c.apply_armed_tools();
+        let mut r = state(c);
+        if let Some(o) = r.as_object_mut() {
+            o.insert("applied".into(), json!(applied));
+        }
+        return Ok(r);
+    }
+    let sticky = opt_bool(p, "sticky") == Some(true);
+    match c.painter.as_mut() {
+        Some(armed) if sticky => armed.sticky = true,
+        Some(_) => c.painter = None,
+        None => {
+            c.painter = Some(PainterState { style: c.style_at_caret(), para: c.para_at_caret(), sticky });
+        }
+    }
+    Ok(state(c))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -483,8 +667,11 @@ fn shading(s: &mut Session, p: &Value) -> CmdResult {
         return dialog(s, "colors", json!({"compose": compose_id(s, p)?, "target": "shading"}));
     }
     let themed = requested_theme_color(s, p)?;
+    let last = s.composes.get(&compose_id(s, p)?).and_then(|c| c.last_shading);
     let col = match p.get("color") {
         _ if themed.is_some() => themed,
+        // The button face shades with the colour chosen last; before one is chosen it opens the form.
+        None if last.is_some() => last,
         None => {
             return dialog(s, "bordersAndShading", json!({"compose": compose_id(s, p)?, "tab": "shading"}));
         }
@@ -497,6 +684,9 @@ fn shading(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     let c = compose_mut(s, p)?;
+    if col.is_some() {
+        c.last_shading = col;
+    }
     c.checkpoint();
     let target = if let Some(cell) = c.cell_at_caret_mut() {
         cell.background = col;
@@ -865,10 +1055,187 @@ fn sort(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"sorted": true, "descending": desc}))
 }
 
+/// Paragraph dialog: opens it with the caret paragraph's formatting (`tab`: `indents` or `breaks`);
+/// `apply` (its OK button) sets every given property of the selected paragraphs in one step (see
+/// [`apply_paragraph_dialog`]).
 fn paragraph_dialog(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(a) = p.get("apply") {
+        return apply_paragraph_dialog(s, p, a);
+    }
     let cid = compose_id(s, p)?;
     let para = s.composes.get(&cid).map(ComposeState::para_at_caret).unwrap_or_default();
-    dialog(s, "paragraph", json!({"compose": cid, "paragraph": para}))
+    let tab = opt_str(p, "tab").unwrap_or("indents");
+    dialog(s, "paragraph", json!({"compose": cid, "paragraph": paragraph_json(&para), "tab": tab}))
+}
+
+/// Points of a px value, rounded to 0.1 pt.
+fn px_to_pt(px: f32) -> f64 {
+    (f64::from(px) * 0.75 * 10.0).round() / 10.0
+}
+
+/// A paragraph's formatting as the Paragraph dialog shows it (points, named rules).
+pub fn paragraph_json(ps: &ParaStyle) -> Value {
+    let align = match ps.align {
+        mailcraft_model::rich::Align::Start => "left",
+        mailcraft_model::rich::Align::Center => "center",
+        mailcraft_model::rich::Align::End => "right",
+        mailcraft_model::rich::Align::Justify => "justify",
+    };
+    let (special, by) = match ps.first_line_px {
+        v if v > 0.0 => ("firstLine", px_to_pt(v)),
+        v if v < 0.0 => ("hanging", px_to_pt(-v)),
+        _ => ("none", 0.0),
+    };
+    let (line, at) = match (ps.line_px, ps.line_height) {
+        (Some((px, LineRule::Exactly)), _) => ("exactly", px_to_pt(px)),
+        (Some((px, LineRule::AtLeast)), _) => ("atLeast", px_to_pt(px)),
+        (None, None) => ("single", 1.0),
+        (None, Some(m)) if (m - 1.0).abs() < 0.001 => ("single", 1.0),
+        (None, Some(m)) if (m - 1.5).abs() < 0.001 => ("1.5", 1.5),
+        (None, Some(m)) if (m - 2.0).abs() < 0.001 => ("double", 2.0),
+        (None, Some(m)) => ("multiple", (f64::from(m) * 100.0).round() / 100.0),
+    };
+    json!({
+        "align": align,
+        "left": px_to_pt(ps.indent_px),
+        "right": px_to_pt(ps.right_indent_px),
+        "special": special,
+        "by": by,
+        "before": px_to_pt(ps.space_before_px),
+        "after": px_to_pt(ps.space_after_px),
+        "line": line,
+        "at": at,
+        "widowControl": !ps.no_widow_control,
+        "keepWithNext": ps.keep_with_next,
+        "keepTogether": ps.keep_together,
+        "pageBreakBefore": ps.page_break_before,
+    })
+}
+
+/// Largest indent the Paragraph dialog takes (points; 22 inches).
+const MAX_INDENT_PT: f64 = 1584.0;
+
+/// The Paragraph dialog's OK: `apply` holds any of `align` (`left`, `center`, `right`, `justify`), `left`
+/// and `right` indents, `special` (`none`, `firstLine`, `hanging`) with `by`, `before` and `after` spacing
+/// (points), `line` (`single`, `1.5`, `double`, `atLeast`, `exactly`, `multiple`) with `at` (points, or the
+/// multiple), and the Line and Page Breaks switches `widowControl`, `keepWithNext`, `keepTogether`,
+/// `pageBreakBefore`. Everything is checked before anything changes; one undo step.
+fn apply_paragraph_dialog(s: &mut Session, p: &Value, a: &Value) -> CmdResult {
+    if !a.is_object() {
+        return Err(CmdError::Params("`apply` must be an object".into()));
+    }
+    let num = |k: &str, lo: f64, hi: f64| -> Result<Option<f64>, CmdError> {
+        match a.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                let n = v.as_f64().or_else(|| v.as_str().and_then(|t| t.trim().parse::<f64>().ok()));
+                n.filter(|n| n.is_finite() && (lo..=hi).contains(n))
+                    .map(Some)
+                    .ok_or_else(|| CmdError::Params(format!("`{k}` must be {lo}..{hi}")))
+            }
+        }
+    };
+    let flag = |k: &str| -> Result<Option<bool>, CmdError> {
+        match a.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                v.as_bool().map(Some).ok_or_else(|| CmdError::Params(format!("`{k}` must be true or false")))
+            }
+        }
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let px = |pt: f64| pt_to_px(pt as f32);
+    let align = match a.get("align").and_then(Value::as_str) {
+        Some(k) => Some(align_of(k).ok_or_else(|| CmdError::Params(format!("unknown alignment `{k}`")))?),
+        None => None,
+    };
+    let left = num("left", -MAX_INDENT_PT, MAX_INDENT_PT)?;
+    let right = num("right", -MAX_INDENT_PT, MAX_INDENT_PT)?;
+    let by = num("by", 0.0, MAX_INDENT_PT)?;
+    let first: Option<f32> = match a.get("special").and_then(Value::as_str) {
+        None => None,
+        Some("none") => Some(0.0),
+        Some("firstLine") => Some(px(by.unwrap_or(36.0))),
+        Some("hanging") => Some(-px(by.unwrap_or(36.0))),
+        Some(other) => return Err(CmdError::Params(format!("unknown special indent `{other}`"))),
+    };
+    let before = num("before", 0.0, 1584.0)?;
+    let after = num("after", 0.0, 1584.0)?;
+    let at = num("at", 0.0, 1584.0)?;
+    // (multiple, fixed line height).
+    let line: Option<(Option<f32>, Option<(f32, LineRule)>)> = match a.get("line").and_then(Value::as_str) {
+        None => None,
+        Some("single") => Some((Some(1.0), None)),
+        Some("1.5") => Some((Some(1.5), None)),
+        Some("double") => Some((Some(2.0), None)),
+        Some(rule @ ("atLeast" | "exactly")) => {
+            let pt = at
+                .filter(|v| *v >= 1.0)
+                .ok_or_else(|| CmdError::Params("`at` (1..1584 points) required".into()))?;
+            let r = if rule == "exactly" { LineRule::Exactly } else { LineRule::AtLeast };
+            Some((None, Some((px(pt), r))))
+        }
+        Some("multiple") => {
+            let m = at
+                .filter(|v| (0.25..=10.0).contains(v))
+                .ok_or_else(|| CmdError::Params("`at` (0.25..10) required".into()))?;
+            #[allow(clippy::cast_possible_truncation)]
+            Some((Some(m as f32), None))
+        }
+        Some(other) => return Err(CmdError::Params(format!("unknown line spacing `{other}`"))),
+    };
+    let (widow, keep_next, keep_together, break_before) =
+        (flag("widowControl")?, flag("keepWithNext")?, flag("keepTogether")?, flag("pageBreakBefore")?);
+    let c = compose_mut(s, p)?;
+    c.checkpoint();
+    c.set_para_style(|ps| {
+        if let Some(v) = align {
+            ps.align = v;
+        }
+        // Negative indents reach into the margin in the original; mail has none to reach into.
+        if let Some(v) = left {
+            ps.indent_px = px(v.max(0.0));
+        }
+        if let Some(v) = right {
+            ps.right_indent_px = px(v.max(0.0));
+        }
+        if let Some(v) = first {
+            ps.first_line_px = v;
+        }
+        // A hanging first line may not start left of the paragraph (mail has no margin to reach into):
+        // a new hang moves the following lines in by it; a smaller left indent shortens the hang.
+        if ps.first_line_px < 0.0 && -ps.first_line_px > ps.indent_px {
+            if first.is_some_and(|v| v < 0.0) {
+                ps.indent_px = -ps.first_line_px;
+            } else {
+                ps.first_line_px = -ps.indent_px;
+            }
+        }
+        if let Some(v) = before {
+            ps.space_before_px = px(v);
+        }
+        if let Some(v) = after {
+            ps.space_after_px = px(v);
+        }
+        if let Some((m, fixed)) = line {
+            ps.line_height = m;
+            ps.line_px = fixed;
+        }
+        if let Some(v) = widow {
+            ps.no_widow_control = !v;
+        }
+        if let Some(v) = keep_next {
+            ps.keep_with_next = v;
+        }
+        if let Some(v) = keep_together {
+            ps.keep_together = v;
+        }
+        if let Some(v) = break_before {
+            ps.page_break_before = v;
+        }
+    });
+    c.dirty = true;
+    Ok(json!({"paragraph": paragraph_json(&c.para_at_caret())}))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -954,6 +1321,7 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
             c.set_para_style(|ps| {
                 ps.align = mailcraft_model::rich::Align::Center;
                 ps.indent_px = 48.0;
+                ps.right_indent_px = 48.0;
             });
             c.with_whole_paragraphs(|c| {
                 c.apply_text_style(|st| {
@@ -979,17 +1347,23 @@ fn apply_builtin_style(c: &mut ComposeState, name: &str) -> bool {
             });
         }
         "strong" => char_style(c, &|st| st.bold = Some(true)),
-        "subtle reference" => char_style(c, &|st| st.color = Some(SUBTLE_REF)),
+        "subtle reference" => char_style(c, &|st| {
+            st.color = Some(SUBTLE_REF);
+            st.small_caps = Some(true);
+        }),
         "intense reference" => {
             let accent = accent(c);
             char_style(c, &|st| {
                 st.bold = Some(true);
                 st.color = Some(accent);
+                st.small_caps = Some(true);
+                st.spacing_pt = Some(0.25);
             });
         }
         "book title" => char_style(c, &|st| {
             st.bold = Some(true);
             st.italic = Some(true);
+            st.spacing_pt = Some(0.5);
         }),
         n => {
             let Some(level) = n
@@ -1105,6 +1479,17 @@ pub fn styles_list(c: &ComposeState) -> Vec<Value> {
 }
 
 fn style(s: &mut Session, p: &Value) -> CmdResult {
+    // Create a Style without a name: the naming dialog, with the next free "StyleN" suggested.
+    if opt_str(p, "action") == Some("create") && opt_str(p, "name").is_none_or(|n| n.trim().is_empty()) {
+        let cid = compose_id(s, p)?;
+        let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+        let taken = |n: &str| c.custom_styles.iter().any(|x| x.name.eq_ignore_ascii_case(n));
+        let suggestion = (1..=MAX_CUSTOM_STYLES.saturating_add(1))
+            .map(|k| format!("Style{k}"))
+            .find(|n| !taken(n))
+            .unwrap_or_else(|| "Style".to_owned());
+        return dialog(s, "createStyle", json!({"compose": cid, "name": suggestion}));
+    }
     let raw = req_str(p, "name")?;
     let name: String = raw.trim_start_matches('¶').trim().chars().take(MAX_STYLE_NAME).collect();
     if name.is_empty() {
@@ -1212,60 +1597,253 @@ fn spacing_preset(name: &str) -> Option<(f32, f32)> {
     }
 }
 
+/// Custom Paragraph Spacing values: before and after (points) and the line multiple; `None` leaves that
+/// property as it is.
+type CustomSpacing = (Option<f32>, Option<f32>, Option<f32>);
+
+/// How a message, a saved style set and the default remember custom spacing: `custom:<before>,<after>,<line>`.
+const CUSTOM_SPACING_PREFIX: &str = "custom:";
+
+fn custom_spacing_token((before, after, line): CustomSpacing) -> String {
+    let f = |v: Option<f32>| v.map(|v| ((v * 100.0).round() / 100.0).to_string()).unwrap_or_default();
+    format!("{CUSTOM_SPACING_PREFIX}{},{},{}", f(before), f(after), f(line))
+}
+
+/// The values of a custom spacing token (checked like Custom Paragraph Spacing checks them), or `None`.
+fn custom_spacing_of(token: &str) -> Option<CustomSpacing> {
+    let rest = token.strip_prefix(CUSTOM_SPACING_PREFIX)?;
+    let mut parts = rest.split(',');
+    let mut field = |lo: f32, hi: f32| -> Result<Option<f32>, ()> {
+        match parts.next().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(t) => {
+                t.parse::<f32>().ok().filter(|v| v.is_finite() && (lo..=hi).contains(v)).map(Some).ok_or(())
+            }
+        }
+    };
+    let vals = (field(0.0, 1584.0).ok()?, field(0.0, 1584.0).ok()?, field(0.25, 10.0).ok()?);
+    if parts.next().is_some() || vals == (None, None, None) {
+        return None;
+    }
+    Some(vals)
+}
+
+/// A paragraph spacing a style set can keep: a preset name or a custom spacing token.
+fn spacing_known(token: &str) -> bool {
+    spacing_preset(token).is_some() || custom_spacing_of(token).is_some()
+}
+
+/// Sets custom paragraph spacing on every paragraph of `c`.
+fn apply_custom_spacing(c: &mut ComposeState, (before, after, line): CustomSpacing) {
+    c.with_whole_body(|c| {
+        c.set_para_style(|ps| {
+            if let Some(b) = before {
+                ps.space_before_px = pt_to_px(b);
+            }
+            if let Some(a) = after {
+                ps.space_after_px = pt_to_px(a);
+            }
+            if let Some(l) = line {
+                ps.line_height = Some(l);
+                ps.line_px = None;
+            }
+        });
+    });
+}
+
+/// Settings keys of the style set defaults and the saved style sets.
+pub const DEFAULT_STYLE_SET_KEY: &str = "state.compose.defaultStyleSet";
+pub const DEFAULT_SPACING_KEY: &str = "state.compose.defaultParagraphSpacing";
+pub const SAVED_STYLE_SETS_KEY: &str = "state.compose.styleSets";
+/// Most saved style sets, and the longest name.
+const MAX_SAVED_STYLE_SETS: usize = 50;
+const MAX_STYLE_SET_NAME: usize = 64;
+
+/// A style set saved with Save as a New Style Set: the built-in set and the paragraph spacing it was made of.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedStyleSet {
+    pub name: String,
+    pub base: Option<String>,
+    pub spacing: Option<String>,
+}
+
+/// The saved style sets (Change Styles › Style Set lists them after the built-in ones), by name.
+pub fn saved_style_sets(s: &Session) -> Vec<SavedStyleSet> {
+    let Some(obj) = s.settings.get(SAVED_STYLE_SETS_KEY).and_then(|v| v.as_object().cloned()) else {
+        return Vec::new();
+    };
+    let text =
+        |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned).filter(|t| !t.is_empty());
+    let mut out: Vec<SavedStyleSet> = obj
+        .iter()
+        .take(MAX_SAVED_STYLE_SETS)
+        .map(|(name, v)| SavedStyleSet {
+            name: name.clone(),
+            base: text(v, "base").filter(|b| crate::compose::style_set(b).is_some()),
+            spacing: text(v, "paragraphSpacing").filter(|sp| spacing_known(sp)),
+        })
+        .collect();
+    out.sort_by_key(|x| x.name.to_lowercase());
+    out
+}
+
+/// Applies a style set and / or paragraph spacing preset to compose `c` (names already checked).
+fn apply_set_and_spacing(c: &mut ComposeState, set: Option<&str>, spacing: Option<&str>) {
+    if let Some(n) = set {
+        c.style_set = crate::compose::style_set(n).map(|x| x.name.to_owned());
+        c.apply_style_set();
+    }
+    if let Some(sp) = spacing {
+        if let Some((after, line)) = spacing_preset(sp) {
+            c.with_whole_body(|c| {
+                c.set_para_style(|ps| {
+                    ps.space_after_px = pt_to_px(after);
+                    ps.line_height = Some(line);
+                });
+            });
+        } else if let Some(custom) = custom_spacing_of(sp) {
+            apply_custom_spacing(c, custom);
+        }
+        c.paragraph_spacing_preset = Some(sp.to_owned());
+    }
+}
+
+/// New messages: the style set and paragraph spacing chosen with Set as Default. Leaves the message
+/// unchanged (not dirty).
+pub fn apply_default_style_set(s: &Session, c: &mut ComposeState) {
+    let name = s.settings.text(DEFAULT_STYLE_SET_KEY);
+    let spacing = s.settings.text(DEFAULT_SPACING_KEY);
+    let (mut set, mut sp) = (None, Some(spacing).filter(|sp| spacing_known(sp)));
+    if crate::compose::style_set(&name).is_some() {
+        set = Some(name);
+    } else if let Some(saved) = saved_style_sets(s).into_iter().find(|x| x.name.eq_ignore_ascii_case(&name)) {
+        set = saved.base;
+        sp = sp.or(saved.spacing);
+    }
+    if set.is_none() && sp.is_none() {
+        return;
+    }
+    let dirty = c.dirty;
+    apply_set_and_spacing(c, set.as_deref(), sp.as_deref());
+    c.dirty = dirty;
+}
+
+/// Custom Paragraph Spacing: `after` (and `before`, points) and `line` (multiple) for every paragraph.
+fn custom_spacing(s: &mut Session, p: &Value) -> CmdResult {
+    let read = |k: &str, hi: f64| -> Result<Option<f32>, CmdError> {
+        match p.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                let n = v.as_f64().filter(|n| n.is_finite() && (0.0..=hi).contains(n));
+                #[allow(clippy::cast_possible_truncation)]
+                n.map(|n| Some(n as f32)).ok_or_else(|| CmdError::Params(format!("`{k}` must be 0..{hi}")))
+            }
+        }
+    };
+    let (before, after, line) = (read("before", 1584.0)?, read("after", 1584.0)?, read("line", 10.0)?);
+    let cid = compose_id(s, p)?;
+    if before.is_none() && after.is_none() && line.is_none() {
+        let para = s.composes.get(&cid).map(ComposeState::para_at_caret).unwrap_or_default();
+        return dialog(s, "customSpacing", json!({"compose": cid, "paragraph": paragraph_json(&para)}));
+    }
+    if line.is_some_and(|l| l < 0.25) {
+        return Err(CmdError::Params("`line` must be 0.25..10".into()));
+    }
+    let c = compose_mut(s, p)?;
+    c.checkpoint();
+    apply_custom_spacing(c, (before, after, line));
+    // Remembered with the values (merged over earlier custom ones) so Save as a New Style Set and Set as
+    // Default keep them.
+    let (b0, a0, l0) = c.paragraph_spacing_preset.as_deref().and_then(custom_spacing_of).unwrap_or_default();
+    c.paragraph_spacing_preset = Some(custom_spacing_token((before.or(b0), after.or(a0), line.or(l0))));
+    c.dirty = true;
+    Ok(json!({"paragraphSpacing": "custom"}))
+}
+
+/// Change Styles › Style Set / Paragraph Spacing / Set as Default, Reset, Save as a New Style Set.
 fn style_set(s: &mut Session, p: &Value) -> CmdResult {
     let action = opt_str(p, "action").unwrap_or("apply");
     match action {
-        "save" => return dialog(s, "saveStyleSet", json!({"compose": compose_id(s, p)?})),
-        "apply" | "reset" | "setDefault" => {}
+        "save" => return save_style_set(s, p),
+        "setDefault" => {
+            let cid = compose_id(s, p)?;
+            let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+            let (set, spacing) = (c.style_set.clone(), c.paragraph_spacing_preset.clone());
+            let spacing = spacing.filter(|sp| spacing_known(sp));
+            s.settings.set(DEFAULT_STYLE_SET_KEY, &json!(set.clone().unwrap_or_default()))?;
+            s.settings.set(DEFAULT_SPACING_KEY, &json!(spacing.clone().unwrap_or_default()))?;
+            return Ok(json!({"default": set, "paragraphSpacing": spacing}));
+        }
+        "apply" | "reset" => {}
         other => return Err(CmdError::Params(format!("unknown action `{other}`"))),
     }
-    let name = opt_str(p, "name").map(str::to_owned);
-    let spacing = opt_str(p, "paragraphSpacing").map(str::to_owned);
+    if opt_str(p, "paragraphSpacing") == Some("custom") {
+        return custom_spacing(s, p);
+    }
+    let mut name = opt_str(p, "name").map(str::to_owned);
+    let mut spacing = opt_str(p, "paragraphSpacing").map(str::to_owned);
     if let Some(sp) = &spacing
         && spacing_preset(sp).is_none()
     {
         return Err(CmdError::Params(format!("unknown paragraph spacing `{sp}`")));
     }
+    // A saved style set stands for the built-in set and spacing it was saved from.
+    let mut saved_name = None;
+    if let Some(n) = name.clone()
+        && crate::compose::style_set(&n).is_none()
+    {
+        let Some(saved) = saved_style_sets(s).into_iter().find(|x| x.name.eq_ignore_ascii_case(&n)) else {
+            return Err(CmdError::Params(format!("unknown style set `{n}`")));
+        };
+        name = saved.base;
+        spacing = spacing.or(saved.spacing);
+        saved_name = Some(saved.name);
+    }
     let c = compose_mut(s, p)?;
-    c.checkpoint();
-    match action {
-        "reset" => {
-            c.style_set = Some("Default".to_owned());
-            c.apply_style_set();
-            c.style_set = None;
-            c.paragraph_spacing_preset = None;
+    if action == "reset" {
+        c.checkpoint();
+        c.style_set = Some("Default".to_owned());
+        c.apply_style_set();
+        c.style_set = None;
+        c.paragraph_spacing_preset = None;
+    } else {
+        if name.is_none() && spacing.is_none() && saved_name.is_none() {
+            return Err(CmdError::Params("`name` or `paragraphSpacing` required".into()));
         }
-        "setDefault" => {
-            return Ok(json!({"default": c.style_set, "paragraphSpacing": c.paragraph_spacing_preset}));
-        }
-        _ => {
-            if name.is_none() && spacing.is_none() {
-                return Err(CmdError::Params("`name` or `paragraphSpacing` required".into()));
-            }
-            if let Some(n) = &name {
-                let Some(set) = crate::compose::style_set(n) else {
-                    c.undo_edit();
-                    c.edit_redo.clear();
-                    return Err(CmdError::Params(format!("unknown style set `{n}`")));
-                };
-                c.style_set = Some(set.name.to_owned());
-                c.apply_style_set();
-            }
-            if let Some(sp) = spacing {
-                if let Some((after, line)) = spacing_preset(&sp) {
-                    c.with_whole_body(|c| {
-                        c.set_para_style(|ps| {
-                            ps.space_after_px = pt_to_px(after);
-                            ps.line_height = Some(line);
-                        });
-                    });
-                }
-                c.paragraph_spacing_preset = Some(sp);
-            }
-        }
+        c.checkpoint();
+        apply_set_and_spacing(c, name.as_deref(), spacing.as_deref());
     }
     c.dirty = true;
-    Ok(json!({"styleSet": c.style_set, "paragraphSpacing": c.paragraph_spacing_preset}))
+    Ok(json!({"styleSet": c.style_set, "paragraphSpacing": c.paragraph_spacing_preset, "saved": saved_name}))
+}
+
+/// Save as a New Style Set: without a `name` opens the dialog; with one keeps the message's style set and
+/// paragraph spacing under that name (replacing a saved set of the same name).
+fn save_style_set(s: &mut Session, p: &Value) -> CmdResult {
+    let cid = compose_id(s, p)?;
+    let name: String =
+        opt_str(p, "name").unwrap_or_default().trim().chars().take(MAX_STYLE_SET_NAME).collect();
+    if name.is_empty() {
+        return dialog(s, "saveStyleSet", json!({"compose": cid}));
+    }
+    if crate::compose::style_set(&name).is_some() {
+        return Err(CmdError::Failed(format!("`{name}` is a built-in style set; choose another name")));
+    }
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let base = c.style_set.clone();
+    let spacing = c.paragraph_spacing_preset.clone().filter(|sp| spacing_known(sp));
+    if base.is_none() && spacing.is_none() {
+        return Err(CmdError::Failed("choose a style set or paragraph spacing first".into()));
+    }
+    let mut obj =
+        s.settings.get(SAVED_STYLE_SETS_KEY).and_then(|v| v.as_object().cloned()).unwrap_or_default();
+    obj.retain(|k, _| !k.eq_ignore_ascii_case(&name));
+    if obj.len() >= MAX_SAVED_STYLE_SETS {
+        return Err(CmdError::Failed("too many saved style sets".into()));
+    }
+    obj.insert(name.clone(), json!({"base": base, "paragraphSpacing": spacing}));
+    s.settings.set(SAVED_STYLE_SETS_KEY, &Value::Object(obj))?;
+    Ok(json!({"saved": name, "base": base, "paragraphSpacing": spacing}))
 }
 
 /// Styles pane: toggles (or `show`s) the pane; `list` only reports the styles; `apply` opens Apply Styles.
@@ -2128,7 +2706,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Font Dialog",
             "Message › Basic Text; Format Text › Font",
             "",
-            "",
+            r#"{"tab"?:"font"|"advanced"} | {"apply":{"family"?,"pt"?,"color"?,"bold"?,"italic"?,"underline"?:"none"|"single"|"double"|"dotted"|"dashed"|"wavy","underlineColor"?,"strike"?,"doubleStrike"?,"superscript"?,"subscript"?,"smallCaps"?,"allCaps"?,"spacing"?:pt,"position"?:pt}}"#,
             false,
             rich_compose,
             font_dialog,
@@ -2148,7 +2726,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Format Painter",
             "Message › Clipboard; Format Text › Clipboard",
             "",
-            r#"{"sticky"?:bool}"#,
+            r#"{"sticky"?:bool} | {"apply":true,"word"?:bool} | {"cancel":true}"#,
             false,
             rich_compose,
             format_painter,
@@ -2178,7 +2756,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Highlight Color",
             "Message › Basic Text; Format Text › Font",
             "",
-            r#"{"color"?:string|null,"highContrastOnly"?:bool,"list"?:bool}"#,
+            r#"{"color"?:string|null,"highContrastOnly"?:bool,"list"?:bool,"typing"?:bool} | {"stop":true}"#,
             false,
             rich_compose,
             highlight,
@@ -2248,7 +2826,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paragraph Dialog",
             "Format Text › Paragraph",
             "",
-            "",
+            r#"{"tab"?:"indents"|"breaks"} | {"apply":{"align"?,"left"?:pt,"right"?:pt,"special"?:"none"|"firstLine"|"hanging","by"?:pt,"before"?:pt,"after"?:pt,"line"?:"single"|"1.5"|"double"|"atLeast"|"exactly"|"multiple","at"?:number,"widowControl"?,"keepWithNext"?,"keepTogether"?,"pageBreakBefore"?}}"#,
             false,
             rich_compose,
             paragraph_dialog,
@@ -2399,7 +2977,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Styles",
             "Format Text › Styles",
             "",
-            r#"{"name":string,"action"?:"apply"|"create"|"modify"|"rename"|"delete","newName"?:string}"#,
+            r#"{"name":string,"action"?:"apply"|"create"|"modify"|"rename"|"delete","newName"?:string} | {"action":"create"}  (no name: the naming dialog)"#,
             false,
             rich_compose,
             style,
@@ -2409,7 +2987,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Change Styles",
             "Format Text › Styles",
             "",
-            r#"{"name"?:string,"paragraphSpacing"?:"default"|"noParagraphSpace"|"compact"|"tight"|"open"|"relaxed"|"double","action"?:"apply"|"reset"|"save"|"setDefault"}"#,
+            r#"{"name"?:string,"paragraphSpacing"?:"default"|"noParagraphSpace"|"compact"|"tight"|"open"|"relaxed"|"double"|"custom","before"?:pt,"after"?:pt,"line"?:number,"action"?:"apply"|"reset"|"save"|"setDefault"}"#,
             false,
             rich_compose,
             style_set,
@@ -3666,5 +4244,421 @@ mod pane_tests {
         assert!(s.run("format.find", &json!({"ids": [999_999_999]})).is_err());
         assert!(s.run("format.find", &json!({"ids": "x"})).is_err());
         assert!(s.composes.is_empty(), "no compose involved");
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    //! Format Painter on mouse release, the highlighter pen, the Font and Paragraph dialogs' apply, style
+    //! set defaults and saved sets, custom spacing, Create a Style naming, Shading's last colour.
+
+    use super::super::compose::tests::{open, session};
+    use super::*;
+    use crate::Notice;
+    use mailcraft_model::{Block, Inline};
+
+    fn with_text(text: &str) -> (Session, u64) {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": text})).unwrap();
+        (s, id)
+    }
+
+    fn select(s: &mut Session, a: usize, b: usize, paint: bool) {
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": [0], "offset": a}, "focus": {"path": [0], "offset": b}, "paint": paint}),
+        )
+        .unwrap();
+    }
+
+    /// Text runs of the first paragraph with their styles.
+    fn runs(s: &Session, id: u64) -> Vec<(String, TextStyle)> {
+        match &s.composes[&id].body.blocks[0] {
+            Block::Paragraph { inlines, .. } => inlines
+                .iter()
+                .filter_map(|i| match i {
+                    Inline::Text { text, style } => Some((text.clone(), style.clone())),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn style_of(s: &Session, id: u64, word: &str) -> TextStyle {
+        runs(s, id).into_iter().find(|(t, _)| t.contains(word)).map(|(_, st)| st).unwrap()
+    }
+
+    fn last_dialog(s: &Session) -> Option<(String, Value)> {
+        s.notices.iter().rev().find_map(|n| match n {
+            Notice::OpenDialog(name, p) => Some((name.clone(), p.clone())),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn format_painter_waits_for_the_finished_selection() {
+        let (mut s, id) = with_text("bold plain words");
+        select(&mut s, 0, 4, true);
+        s.run("format.bold", &json!({})).unwrap();
+        select(&mut s, 1, 1, true);
+        s.run("format.formatPainter", &json!({})).unwrap();
+        // A drag in progress: the selection grows without painting.
+        select(&mut s, 5, 6, false);
+        select(&mut s, 5, 10, false);
+        assert!(s.composes[&id].painter.is_some(), "still armed during the drag");
+        assert_ne!(style_of(&s, id, "plain").bold, Some(true));
+        // Released: the whole selection is painted and a one-shot painter disarms.
+        let r = s.run("format.formatPainter", &json!({"apply": true})).unwrap();
+        assert_eq!((r["applied"].as_bool(), r["armed"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(style_of(&s, id, "plain").bold, Some(true));
+        // Applying with nothing armed does nothing.
+        let r = s.run("format.formatPainter", &json!({"apply": true})).unwrap();
+        assert_eq!(r["applied"], false);
+    }
+
+    #[test]
+    fn double_click_keeps_format_painter_on_and_esc_puts_it_away() {
+        let (mut s, id) = with_text("bold one two");
+        select(&mut s, 0, 4, true);
+        s.run("format.bold", &json!({})).unwrap();
+        select(&mut s, 1, 1, true);
+        // The double-click's first click arms it, the second (sticky) keeps it armed.
+        assert_eq!(s.run("format.formatPainter", &json!({})).unwrap()["armed"], true);
+        let r = s.run("format.formatPainter", &json!({"sticky": true})).unwrap();
+        assert_eq!((r["armed"].as_bool(), r["sticky"].as_bool()), (Some(true), Some(true)));
+        // A click on a word paints that word; the painter stays armed.
+        select(&mut s, 6, 6, false);
+        s.run("format.formatPainter", &json!({"apply": true, "word": true})).unwrap();
+        assert_eq!(style_of(&s, id, "one").bold, Some(true));
+        select(&mut s, 9, 12, false);
+        s.run("format.formatPainter", &json!({"apply": true})).unwrap();
+        assert_eq!(style_of(&s, id, "two").bold, Some(true));
+        assert!(s.composes[&id].painter.is_some());
+        s.run("format.formatPainter", &json!({"cancel": true})).unwrap();
+        assert!(s.composes[&id].painter.is_none());
+        // Sticky from nothing arms a sticky painter; a plain click then disarms it.
+        assert_eq!(s.run("format.formatPainter", &json!({"sticky": true})).unwrap()["sticky"], true);
+        assert_eq!(s.run("format.formatPainter", &json!({})).unwrap()["armed"], false);
+    }
+
+    #[test]
+    fn highlight_with_nothing_selected_arms_a_pen_until_stopped() {
+        let (mut s, id) = with_text("mark these words");
+        select(&mut s, 2, 2, true);
+        let r = s.run("format.highlight", &json!({"color": "#00ff00"})).unwrap();
+        assert_eq!(r["pen"], true);
+        assert!(s.composes[&id].highlight_pen.is_some());
+        // Every selection made while it is armed is highlighted.
+        select(&mut s, 0, 4, false);
+        s.run("format.formatPainter", &json!({"apply": true})).unwrap();
+        assert_eq!(style_of(&s, id, "mark").highlight, Some(Color::rgb(0, 255, 0)));
+        select(&mut s, 11, 16, true);
+        assert_eq!(style_of(&s, id, "words").highlight, Some(Color::rgb(0, 255, 0)), "API selections too");
+        // Stop Highlighting.
+        assert_eq!(s.run("format.highlight", &json!({"stop": true})).unwrap()["pen"], false);
+        select(&mut s, 5, 10, true);
+        assert_eq!(style_of(&s, id, "these").highlight, None);
+        // The button again with the pen armed puts it away.
+        select(&mut s, 0, 0, true);
+        s.run("format.highlight", &json!({})).unwrap();
+        assert_eq!(s.run("format.highlight", &json!({})).unwrap()["pen"], false);
+        // `typing` highlights what is typed next instead of arming the pen.
+        assert!(s.run("format.highlight", &json!({"typing": true})).unwrap().get("pen").is_none());
+        assert!(s.composes[&id].highlight_pen.is_none());
+    }
+
+    #[test]
+    fn font_dialog_applies_effects_in_one_step() {
+        let (mut s, id) = with_text("effects here");
+        select(&mut s, 0, 7, true);
+        let r = s.run("format.fontDialog", &json!({})).unwrap();
+        assert_eq!(r["dialog"], "font");
+        let (_, p) = last_dialog(&s).unwrap();
+        assert!(p["headingFont"].as_str().is_some_and(|f| !f.is_empty()));
+        let apply = json!({"apply": {
+            "family": "Georgia", "pt": 14, "underline": "double", "underlineColor": "#ff0000",
+            "doubleStrike": true, "smallCaps": true, "spacing": 1.5, "position": 3, "color": "automatic"
+        }});
+        s.run("format.fontDialog", &apply).unwrap();
+        let st = style_of(&s, id, "effects");
+        assert_eq!(st.font_family.as_deref(), Some("Georgia"));
+        assert_eq!(st.size_pt, Some(14.0));
+        assert_eq!((st.underline, st.underline_kind), (Some(true), Some(UnderlineKind::Double)));
+        assert_eq!(st.underline_color, Some(Color::rgb(255, 0, 0)));
+        assert_eq!((st.double_strike, st.small_caps), (Some(true), Some(true)));
+        assert_eq!((st.spacing_pt, st.position_pt), (Some(1.5), Some(3.0)));
+        assert_ne!(style_of(&s, id, "here").small_caps, Some(true), "only the selection");
+        // One undo step takes all of it back.
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(style_of(&s, id, "effects").small_caps, None);
+        // Bad values change nothing.
+        for bad in [
+            json!({"underline": "zigzag"}),
+            json!({"pt": 0}),
+            json!({"superscript": true, "subscript": true}),
+            json!({"spacing": "wide"}),
+            json!("x"),
+        ] {
+            assert!(s.run("format.fontDialog", &json!({"apply": bad})).is_err(), "{bad}");
+        }
+        assert_eq!(style_of(&s, id, "effects").small_caps, None);
+        // Single underline, no double strikethrough and normal spacing clear the effects again.
+        s.run(
+            "format.fontDialog",
+            &json!({"apply": {"underline": "double", "doubleStrike": true, "spacing": 2}}),
+        )
+        .unwrap();
+        s.run(
+            "format.fontDialog",
+            &json!({"apply": {"underline": "single", "doubleStrike": false, "spacing": 0}}),
+        )
+        .unwrap();
+        let st = style_of(&s, id, "effects");
+        assert_eq!(
+            (st.underline, st.underline_kind, st.double_strike, st.spacing_pt),
+            (Some(true), None, None, None)
+        );
+    }
+
+    #[test]
+    fn paragraph_dialog_opens_with_the_paragraph_and_applies_everything() {
+        let (mut s, id) = with_text("a paragraph");
+        s.run("format.align", &json!({"kind": "center"})).unwrap();
+        s.run("format.paragraphSpacing", &json!({"before": 6, "after": 18})).unwrap();
+        s.run("format.paragraphDialog", &json!({"tab": "breaks"})).unwrap();
+        let (name, p) = last_dialog(&s).unwrap();
+        assert_eq!(name, "paragraph");
+        assert_eq!(p["tab"], "breaks");
+        let para = p["paragraph"].clone();
+        assert_eq!(
+            (para["align"].as_str(), para["before"].as_f64(), para["after"].as_f64()),
+            (Some("center"), Some(6.0), Some(18.0))
+        );
+        assert_eq!(para["widowControl"], true);
+        // OK with what it opened with changes nothing (the form used to reset spacing and alignment).
+        let before = s.composes[&id].para_at_caret();
+        s.run("format.paragraphDialog", &json!({"apply": para})).unwrap();
+        let after = s.composes[&id].para_at_caret();
+        assert_eq!(
+            (after.align, after.space_before_px, after.space_after_px),
+            (before.align, before.space_before_px, before.space_after_px)
+        );
+        // Indents, a hanging first line, exact line spacing and the break switches.
+        let r = s
+            .run(
+                "format.paragraphDialog",
+                &json!({"apply": {"left": 36, "right": 18, "special": "hanging", "by": 18, "line": "exactly",
+                                  "at": 15, "keepWithNext": true, "keepTogether": true, "pageBreakBefore": true,
+                                  "widowControl": false}}),
+            )
+            .unwrap();
+        let ps = s.composes[&id].para_at_caret();
+        assert_eq!((ps.indent_px, ps.right_indent_px, ps.first_line_px), (48.0, 24.0, -24.0));
+        assert_eq!(ps.line_px, Some((20.0, LineRule::Exactly)));
+        assert!(ps.keep_with_next && ps.keep_together && ps.page_break_before && ps.no_widow_control);
+        assert_eq!(r["paragraph"]["special"], "hanging");
+        assert_eq!(r["paragraph"]["line"], "exactly");
+        assert_eq!(r["paragraph"]["at"], 15.0);
+        // At least, multiple, and back to single.
+        s.run("format.paragraphDialog", &json!({"apply": {"line": "atLeast", "at": 20}})).unwrap();
+        assert_eq!(s.composes[&id].para_at_caret().line_px.map(|l| l.1), Some(LineRule::AtLeast));
+        s.run("format.paragraphDialog", &json!({"apply": {"line": "multiple", "at": 1.25}})).unwrap();
+        let ps = s.composes[&id].para_at_caret();
+        assert_eq!((ps.line_px, ps.line_height), (None, Some(1.25)));
+        for bad in [
+            json!({"line": "exactly"}),
+            json!({"line": "multiple", "at": 50}),
+            json!({"special": "sideways"}),
+            json!({"align": "middle"}),
+            json!({"left": 1.0e9}),
+            json!({"keepWithNext": "yes"}),
+        ] {
+            assert!(s.run("format.paragraphDialog", &json!({"apply": bad})).is_err(), "{bad}");
+        }
+    }
+
+    fn para_styles(s: &Session, id: u64) -> Vec<ParaStyle> {
+        s.composes[&id]
+            .body
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { style, .. } => Some(style.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paragraph_dialog_changing_one_field_keeps_each_paragraphs_own_spacing() {
+        // Regression: the dialog sent every field, so a change of alignment over two paragraphs gave the
+        // second the caret paragraph's spacing. Only the fields given change.
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "one\ntwo"})).unwrap();
+        s.run("format.selectAll", &json!({})).unwrap();
+        s.run("format.paragraphDialog", &json!({"apply": {"before": 6, "after": 6}})).unwrap();
+        s.run(
+            "compose.select",
+            &json!({"anchor": {"path": [1], "offset": 0}, "focus": {"path": [1], "offset": 3}}),
+        )
+        .unwrap();
+        s.run("format.paragraphDialog", &json!({"apply": {"before": 24, "left": 18}})).unwrap();
+        s.run("format.selectAll", &json!({})).unwrap();
+        s.run("format.paragraphDialog", &json!({"apply": {"align": "center"}})).unwrap();
+        let ps = para_styles(&s, id);
+        assert_eq!(ps.len(), 2);
+        assert_eq!((ps[0].space_before_px, ps[0].indent_px), (8.0, 0.0));
+        assert_eq!((ps[1].space_before_px, ps[1].indent_px), (32.0, 24.0));
+        assert!(ps.iter().all(|p| p.align == mailcraft_model::rich::Align::Center));
+        assert!(ps.iter().all(|p| p.line_height.is_none()), "an untouched line rule stays inherited");
+    }
+
+    #[test]
+    fn hanging_indent_on_a_plain_paragraph_moves_the_following_lines_in() {
+        // Regression: Hanging 18 pt with Left 0 stored only `first_line_px = -24`, which the editor clamped
+        // away and the sent HTML drew left of the paragraph (`margin-left:0;text-indent:-24px`).
+        let (mut s, id) = with_text("a paragraph long enough to wrap");
+        s.run("format.paragraphDialog", &json!({"apply": {"special": "hanging", "by": 18}})).unwrap();
+        let ps = s.composes[&id].para_at_caret();
+        assert_eq!((ps.indent_px, ps.first_line_px), (24.0, -24.0));
+        assert!(ps.indent_px + ps.first_line_px >= 0.0);
+        s.run("format.paragraphDialog", &json!({})).unwrap();
+        let (_, p) = last_dialog(&s).unwrap();
+        assert_eq!(
+            (p["paragraph"]["left"].as_f64(), p["paragraph"]["by"].as_f64()),
+            (Some(18.0), Some(18.0))
+        );
+        // A smaller left indent afterwards shortens the hang rather than pushing the first line out.
+        s.run("format.paragraphDialog", &json!({"apply": {"left": 6}})).unwrap();
+        let ps = s.composes[&id].para_at_caret();
+        assert_eq!((ps.indent_px, ps.first_line_px), (8.0, -8.0));
+    }
+
+    #[test]
+    fn style_sets_can_be_the_default_and_saved_under_a_name() {
+        let (mut s, id) = with_text("Body");
+        s.run("format.styleSet", &json!({"name": "Shaded", "paragraphSpacing": "open"})).unwrap();
+        let r = s.run("format.styleSet", &json!({"action": "setDefault"})).unwrap();
+        assert_eq!((r["default"].as_str(), r["paragraphSpacing"].as_str()), (Some("Shaded"), Some("open")));
+        assert_eq!(s.settings.text(DEFAULT_STYLE_SET_KEY), "Shaded");
+        // A new message starts with it, unchanged (no save prompt).
+        let other = open(&mut s);
+        let c = &s.composes[&other];
+        assert_eq!(
+            (c.style_set.as_deref(), c.paragraph_spacing_preset.as_deref()),
+            (Some("Shaded"), Some("open"))
+        );
+        assert!(!c.dirty);
+        assert_eq!(c.para_at_caret().line_height, Some(1.15));
+        // Save as a New Style Set: the dialog first, then the name.
+        s.run("format.styleSet", &json!({"compose": id, "action": "save"})).unwrap();
+        assert_eq!(last_dialog(&s).map(|d| d.0).as_deref(), Some("saveStyleSet"));
+        assert!(s.run("format.styleSet", &json!({"compose": id, "action": "save", "name": "Word"})).is_err());
+        s.run("format.styleSet", &json!({"compose": id, "action": "save", "name": "Team Look"})).unwrap();
+        let saved = saved_style_sets(&s);
+        assert_eq!(saved.len(), 1);
+        assert_eq!((saved[0].base.as_deref(), saved[0].spacing.as_deref()), (Some("Shaded"), Some("open")));
+        // Applying the saved set in another message gives its set and spacing.
+        let third = s.open_compose(ComposeState::default());
+        s.run("format.styleSet", &json!({"compose": third, "action": "reset"})).unwrap();
+        let r = s.run("format.styleSet", &json!({"compose": third, "name": "team look"})).unwrap();
+        assert_eq!(r["saved"], "Team Look");
+        assert_eq!(s.composes[&third].style_set.as_deref(), Some("Shaded"));
+        assert!(s.run("format.styleSet", &json!({"compose": id, "name": "Nope"})).is_err());
+        // Hostile stored values are ignored.
+        s.settings
+            .set(SAVED_STYLE_SETS_KEY, &json!({"Bad": {"base": "Nope", "paragraphSpacing": 5}}))
+            .unwrap();
+        let bad = saved_style_sets(&s);
+        assert_eq!((bad[0].base.clone(), bad[0].spacing.clone()), (None, None));
+    }
+
+    #[test]
+    fn custom_paragraph_spacing_covers_the_whole_message() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "one\ntwo"})).unwrap();
+        s.run("format.styleSet", &json!({"paragraphSpacing": "custom"})).unwrap();
+        assert_eq!(last_dialog(&s).map(|d| d.0).as_deref(), Some("customSpacing"));
+        s.run(
+            "format.styleSet",
+            &json!({"paragraphSpacing": "custom", "before": 3, "after": 9, "line": 1.5}),
+        )
+        .unwrap();
+        let paras: Vec<&ParaStyle> = s.composes[&id]
+            .body
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { style, .. } => Some(style),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paras.len(), 2);
+        for st in paras {
+            assert_eq!((st.space_before_px, st.space_after_px, st.line_height), (4.0, 12.0, Some(1.5)));
+        }
+        assert!(s.run("format.styleSet", &json!({"paragraphSpacing": "custom", "line": 0.1})).is_err());
+    }
+
+    #[test]
+    fn custom_paragraph_spacing_is_kept_by_saved_sets_and_the_default() {
+        // Regression: Save as a New Style Set and Set as Default dropped custom spacing ("choose a style set
+        // or paragraph spacing first" with no style set; silently left out with one).
+        let (mut s, id) = with_text("Body");
+        s.run("format.styleSet", &json!({"paragraphSpacing": "custom", "before": 3, "after": 9})).unwrap();
+        s.run("format.styleSet", &json!({"paragraphSpacing": "custom", "line": 1.5})).unwrap();
+        let r = s.run("format.styleSet", &json!({"compose": id, "action": "save", "name": "Airy"})).unwrap();
+        assert_eq!(r["paragraphSpacing"], "custom:3,9,1.5");
+        let saved = saved_style_sets(&s);
+        assert_eq!((saved[0].base.as_deref(), saved[0].spacing.as_deref()), (None, Some("custom:3,9,1.5")));
+        // Applying the saved set elsewhere sets the custom values.
+        let other = s.open_compose(ComposeState::default());
+        s.run("format.styleSet", &json!({"compose": other, "name": "Airy"})).unwrap();
+        let ps = s.composes[&other].para_at_caret();
+        assert_eq!((ps.space_before_px, ps.space_after_px, ps.line_height), (4.0, 12.0, Some(1.5)));
+        // Set as Default: new messages start with them.
+        let r = s.run("format.styleSet", &json!({"compose": id, "action": "setDefault"})).unwrap();
+        assert_eq!(r["paragraphSpacing"], "custom:3,9,1.5");
+        let third = open(&mut s);
+        let ps = s.composes[&third].para_at_caret();
+        assert_eq!((ps.space_before_px, ps.space_after_px, ps.line_height), (4.0, 12.0, Some(1.5)));
+        assert!(!s.composes[&third].dirty);
+        // Hostile tokens are ignored.
+        for bad in ["custom:", "custom:,,", "custom:1e9,1,1", "custom:1,1,99", "custom:x", "custom:1,2,3,4"] {
+            assert!(custom_spacing_of(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn create_a_style_asks_for_its_name() {
+        let (mut s, id) = with_text("x");
+        let r = s.run("format.style", &json!({"action": "create"})).unwrap();
+        assert_eq!(r["dialog"], "createStyle");
+        assert_eq!(last_dialog(&s).unwrap().1["name"], "Style1");
+        s.run("format.style", &json!({"action": "create", "name": "Style1"})).unwrap();
+        s.run("format.style", &json!({"action": "create"})).unwrap();
+        assert_eq!(last_dialog(&s).unwrap().1["name"], "Style2");
+        assert_eq!(s.composes[&id].custom_styles.len(), 1);
+    }
+
+    #[test]
+    fn shading_button_reuses_the_last_colour_and_references_use_small_caps() {
+        let (mut s, id) = with_text("shade me");
+        assert_eq!(s.run("format.shading", &json!({})).unwrap()["dialog"], "bordersAndShading");
+        s.run("format.shading", &json!({"color": "#ccddee"})).unwrap();
+        s.run("format.shading", &json!({"color": null})).unwrap();
+        assert_eq!(s.composes[&id].para_at_caret().background, None);
+        let r = s.run("format.shading", &json!({})).unwrap();
+        assert_eq!(r["shading"], "#ccddee");
+        // Page colour from a theme slot.
+        let r = s.run("compose.pageColor", &json!({"theme": "accent1", "tint": 80})).unwrap();
+        assert!(r["pageColor"].as_str().is_some());
+        select(&mut s, 0, 5, true);
+        s.run("format.style", &json!({"name": "Subtle Reference"})).unwrap();
+        assert_eq!(style_of(&s, id, "shade").small_caps, Some(true));
     }
 }

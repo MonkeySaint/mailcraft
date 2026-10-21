@@ -9,9 +9,11 @@
 #   group <Name> | <keytip> | <opts>    opts: s<W>=<act> c<W>=<act> (width rules), icon=, launch=<cmd>{json}, rows
 #   <kind> <size> | <label> | <icon> | <cmd> | <params> | <keytip> | <opts>
 #        kind: button split drop toggle check gallery combo edit;  size: L large, S small, I small icon-only
-#        opts: menu=<name> on=<state> dyn=<source> w=<px> s<W>=<act> c<W>=<act>
+#        opts: menu=<name> on=<state> oncmd=<cmd>{json} dbl=<cmd>{json} (double-click) dyn=<source> w=<px>
+#              s<W>=<act> c<W>=<act>
 #   br                                  next row (groups with the `rows` option, Classic)
 #   menu <name>                         then: item | label | icon | cmd | params | keytip | opts
+#                                             (opts: on=<state> en=<state> swatch=#rrggbb)
 #                                             sub | label | icon | <menu> | | keytip
 #                                             dyn | <source> | cmd | params template
 #                                             sep

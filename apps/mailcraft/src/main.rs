@@ -22,6 +22,7 @@ use mailcraft_ui_egui::App;
 
 mod clipboard;
 mod file_dialogs;
+mod installed_fonts;
 mod speech;
 
 const USAGE: &str = "\
@@ -205,6 +206,7 @@ fn main() -> ExitCode {
     file_dialogs::install(&mut app);
     speech::install(&mut app);
     clipboard::install();
+    installed_fonts::install();
     app.ui.control_port = args.control_port.or_else(|| {
         std::env::var("MAILCRAFT_CONTROL_PORT")
             .ok()

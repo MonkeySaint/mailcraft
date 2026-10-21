@@ -317,9 +317,14 @@ pub struct ComposeState {
     /// Number of lists in the body when `list_formats` was last anchored.
     pub list_count: usize,
     pub painter: Option<PainterState>,
+    /// Highlighter pen (Text Highlight Color with nothing selected): every new selection is highlighted
+    /// with this colour (`None` inside = the No Color eraser) until Stop Highlighting.
+    pub highlight_pen: Option<Option<Color>>,
     pub editor: EditorFlags,
     pub last_font_color: Option<Color>,
     pub last_highlight: Option<Color>,
+    /// Shading colour last chosen (the Shading button applies it again).
+    pub last_shading: Option<Color>,
     /// Body before Translate Message replaced it (show original toggle).
     pub original_body: Option<Doc>,
     pub translated_to: Option<String>,
@@ -474,17 +479,31 @@ impl ComposeState {
     }
 
     /// Moves the selection (normalised). Clears the typing style and Select Similar ranges; applies an armed
-    /// Format Painter to a non-empty new selection.
+    /// Format Painter or highlighter pen to a non-empty new selection ([`Self::apply_armed_tools`]).
     pub fn set_selection(&mut self, anchor: DocPos, focus: DocPos) {
+        self.select_range(anchor, focus);
+        self.apply_armed_tools();
+    }
+
+    /// Moves the selection (normalised) without applying an armed Format Painter or highlighter pen (the
+    /// editor while a mouse selection is still being dragged; it applies them once the button is released).
+    pub fn select_range(&mut self, anchor: DocPos, focus: DocPos) {
         ensure_leaf(&mut self.body);
         self.selection =
             BodySelection { anchor: normalize(&self.body, &anchor), focus: normalize(&self.body, &focus) };
         self.pending_style = None;
         self.extra_ranges.clear();
-        if self.has_selection()
-            && let Some(p) = self.painter.clone()
-        {
-            self.checkpoint();
+    }
+
+    /// Applies an armed Format Painter (then disarms it unless it is sticky) and an armed highlighter pen
+    /// (which stays armed) to the selection. Does nothing for a collapsed selection. Returns whether it
+    /// changed anything.
+    pub fn apply_armed_tools(&mut self) -> bool {
+        if !self.has_selection() || (self.painter.is_none() && self.highlight_pen.is_none()) {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(p) = self.painter.clone() {
             let style = p.style.clone();
             self.restyle_ranges(&mut |s| *s = style.clone());
             let para = p.para.clone();
@@ -492,8 +511,12 @@ impl ComposeState {
             if !p.sticky {
                 self.painter = None;
             }
-            self.dirty = true;
         }
+        if let Some(pen) = self.highlight_pen {
+            self.restyle_ranges(&mut |s| s.highlight = pen);
+        }
+        self.dirty = true;
+        true
     }
 
     /// Collapses the selection to `pos`.
