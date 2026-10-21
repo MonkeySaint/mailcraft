@@ -37,7 +37,7 @@ fn new_local_account() {
     assert!(!acct.can_send());
     assert_eq!(m.default_account().map(|x| x.id), Some(a));
     assert_eq!(m.categories.len(), 6);
-    assert_eq!(m.quick_steps.len(), 6);
+    assert_eq!(m.quick_steps.len(), 5);
     assert!(m.validate().is_empty(), "{:?}", m.validate());
 }
 

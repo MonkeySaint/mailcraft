@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::cmd::view::{conversation_state, is_group_label};
 use crate::{Module, Session};
@@ -92,6 +92,14 @@ pub struct ItemRow {
     /// Marked to download (`Some(true)`: Mark to Download Message Copy).
     #[serde(default)]
     pub marked: Option<bool>,
+    /// How many earlier rows of the list show the same item (Arrange by Categories lists a message under
+    /// each of its categories), so each row can have its own widget id.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repeat: u16,
+    /// A search result that is not a message (Search › All Items): the item window that opens it
+    /// (`appointment`, `contact`, `task`, `note`). `None` for messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// Font effects of a list row (Conditional Formatting). The default is plain text in the list's colours.
@@ -750,6 +758,7 @@ fn grouped<'a>(
     pins: &BTreeSet<ItemId>,
 ) -> Vec<(String, Vec<&'a MailItem>)> {
     let mut out: Vec<(Key, String, Vec<&'a MailItem>)> = Vec::new();
+    let mut categorized: Vec<&'a MailItem> = Vec::new();
     // Top search results (first in `items` after the pins) form a group of their own too.
     let top = top_results(s);
     for m in items {
@@ -769,6 +778,10 @@ fn grouped<'a>(
             }
             continue;
         }
+        if arrange == ArrangeBy::Categories {
+            categorized.push(m);
+            continue;
+        }
         let (key, label) = group_of(s, m, arrange);
         let id = if arrange == ArrangeBy::Date { Key::Text(label.clone()) } else { key };
         match out.last_mut() {
@@ -776,7 +789,43 @@ fn grouped<'a>(
             _ => out.push((id, label, vec![m])),
         }
     }
-    out.into_iter().map(|(_, label, list)| (label, list)).collect()
+    let mut out: Vec<(String, Vec<&'a MailItem>)> =
+        out.into_iter().map(|(_, label, list)| (label, list)).collect();
+    if arrange == ArrangeBy::Categories {
+        out.extend(category_groups(s, categorized));
+    }
+    out
+}
+
+/// Arrange by Categories: a message with several categories is listed under each of them, a message with
+/// none under "(none)". Groups follow the sort direction by name; inside a group the newest come first.
+fn category_groups<'a>(s: &Session, items: Vec<&'a MailItem>) -> Vec<(String, Vec<&'a MailItem>)> {
+    let mut groups: BTreeMap<String, (String, Vec<&'a MailItem>)> = BTreeMap::new();
+    for m in items {
+        let mut seen: Vec<String> = Vec::new();
+        for c in m.categories.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+            let key = c.to_lowercase();
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key.clone());
+            groups.entry(key).or_insert_with(|| (c.to_owned(), Vec::new())).1.push(m);
+        }
+        if seen.is_empty() {
+            groups.entry(String::new()).or_insert_with(|| (NONE_LABEL.to_owned(), Vec::new())).1.push(m);
+        }
+    }
+    let mut out: Vec<(String, Vec<&'a MailItem>)> = groups
+        .into_values()
+        .map(|(label, mut list)| {
+            list.sort_by(|a, b| b.received.unix.cmp(&a.received.unix).then(a.id.cmp(&b.id)));
+            (label, list)
+        })
+        .collect();
+    if view_settings(s, s.selection.folder).order == SortOrder::Descending {
+        out.reverse();
+    }
+    out
 }
 
 /// List groups in list order: `(header label, item ids)`. In conversation view a group holds the view's
@@ -857,8 +906,9 @@ pub fn visible_item_ids(s: &Session) -> Vec<ItemId> {
     list_rows(s)
         .into_iter()
         .filter_map(|r| match r {
-            ListRow::Item(i) => Some(i.id),
-            ListRow::Group { .. } => None,
+            // Non-mail results open their own windows; the message keys do not walk onto them.
+            ListRow::Item(i) if i.kind.is_none() => Some(i.id),
+            ListRow::Item(_) | ListRow::Group { .. } => None,
         })
         .filter(|id| seen.insert(*id))
         .collect()
@@ -961,6 +1011,8 @@ fn item_row(s: &Session, m: &MailItem) -> ItemRow {
         pinned: false,
         header_only: false,
         marked: None,
+        repeat: 0,
+        kind: None,
     }
 }
 
@@ -969,7 +1021,95 @@ fn item_row(s: &Session, m: &MailItem) -> ItemRow {
 pub fn list_rows(s: &Session) -> Vec<ListRow> {
     let mut rows = undecorated_rows(s);
     decorate(s, &mut rows);
+    other_item_rows(s, &mut rows);
     rows
+}
+
+/// Group header of the non-mail results of an All Items search.
+pub const OTHER_ITEMS_LABEL: &str = "Other Items";
+
+/// Most non-mail results listed under [`OTHER_ITEMS_LABEL`].
+const MAX_OTHER_ITEMS: usize = 500;
+
+/// Search › All Items finds appointments, contacts, tasks and notes too: they follow the messages under
+/// their own header ([`OTHER_ITEMS_LABEL`]), best match first, each row saying what it is and which item
+/// window opens it ([`ItemRow::kind`]).
+fn other_item_rows(s: &Session, rows: &mut Vec<ListRow>) {
+    if s.view.search.trim().is_empty() || s.view.search_scope != crate::SearchScope::AllItems {
+        return;
+    }
+    let hits = crate::search_index::hits(s, &s.view.search, &crate::search_index::scope_filter(s));
+    let others: Vec<ItemRow> = hits
+        .iter()
+        .map(|h| ItemId(h.id))
+        .filter(|id| !s.mailbox.mail.contains_key(id))
+        .filter_map(|id| pim_row(s, id))
+        .take(MAX_OTHER_ITEMS)
+        .collect();
+    if others.is_empty() {
+        return;
+    }
+    let collapsed = collapsed_labels(s).iter().any(|l| l == OTHER_ITEMS_LABEL);
+    let grouped = view_settings(s, s.selection.folder).show_in_groups;
+    if grouped {
+        rows.push(ListRow::Group { label: OTHER_ITEMS_LABEL.to_owned(), count: others.len(), collapsed });
+    }
+    if !(grouped && collapsed) {
+        rows.extend(others.into_iter().map(ListRow::Item));
+    }
+}
+
+/// A list row for a non-mail item (appointment, contact, task, note).
+fn pim_row(s: &Session, id: ItemId) -> Option<ItemRow> {
+    let mb = &s.mailbox;
+    let tz = s.tz_offset_min;
+    let (kind, who, subject, time, preview, categories) = if let Some(a) = mb.appointments.get(&id) {
+        let who = if a.is_meeting { "Meeting" } else { "Appointment" };
+        let when = ListTime::short_date_time(a.start, tz);
+        ("appointment", who, a.subject.clone(), when, a.location.clone(), a.categories.clone())
+    } else if let Some(c) = mb.contacts.get(&id) {
+        let name = c.full_name();
+        let name = if name.trim().is_empty() { c.file_as.clone() } else { name };
+        let detail = c.emails.first().cloned().unwrap_or_else(|| c.company.clone());
+        ("contact", "Contact", name, String::new(), detail, c.categories.clone())
+    } else if let Some(t) = mb.tasks.get(&id) {
+        let due = t.due.map(|d| format!("Due {}", ListTime::date(d, tz))).unwrap_or_default();
+        ("task", "Task", t.subject.clone(), due, String::new(), t.categories.clone())
+    } else {
+        let n = mb.notes.get(&id)?;
+        let first = n.text.lines().next().unwrap_or_default().trim().to_owned();
+        let rest: String = n.text.lines().skip(1).collect::<Vec<_>>().join(" ").chars().take(255).collect();
+        ("note", "Note", first, String::new(), rest, n.categories.clone())
+    };
+    let subject: String = subject.chars().take(255).collect();
+    let accessible = format!("{who}, {subject}, {time}, ");
+    Some(ItemRow {
+        id,
+        who: who.to_owned(),
+        subject,
+        time,
+        preview: preview.chars().take(255).collect(),
+        unread: false,
+        selected: false,
+        draft_marker: false,
+        has_attachments: false,
+        importance_high: false,
+        importance_low: false,
+        flagged: false,
+        flag_complete: false,
+        categories: categories.iter().map(|c| category_hex(s, c)).collect(),
+        replied: false,
+        forwarded: false,
+        conversation_depth: 0,
+        accessible,
+        conversation: None,
+        style: RowStyle::default(),
+        pinned: false,
+        header_only: false,
+        marked: None,
+        repeat: 0,
+        kind: Some(kind.to_owned()),
+    })
 }
 
 /// Conditional Formatting, pins and download state of every item row.
@@ -1006,14 +1146,25 @@ fn undecorated_rows(s: &Session) -> Vec<ListRow> {
     let collapsed = collapsed_labels(s);
     let pins = list_pins(s, &vs);
     let mut rows = Vec::new();
+    let mut shown: HashMap<ItemId, u16> = HashMap::new();
     for (label, list) in grouped(s, vs.arrange_by, items, &pins) {
         let is_collapsed = group_collapsed(s, &vs, &collapsed, &label, &list);
         rows.push(ListRow::Group { label, count: list.len(), collapsed: is_collapsed });
         if !is_collapsed {
-            rows.extend(list.into_iter().map(|m| ListRow::Item(item_row(s, m))));
+            rows.extend(list.into_iter().map(|m| {
+                let mut row = item_row(s, m);
+                let n = shown.entry(m.id).or_insert(0);
+                row.repeat = *n;
+                *n = n.saturating_add(1);
+                ListRow::Item(row)
+            }));
         }
     }
     rows
+}
+
+fn is_zero(n: &u16) -> bool {
+    *n == 0
 }
 
 /// Collapsed group labels of the selected folder (conversation state entries left out).
@@ -1038,7 +1189,10 @@ fn group_collapsed(
         && (collapsed.iter().any(|c| c == label)
             // The pinned and top-results groups go by their own label only (their items belong to other
             // groups too).
-            || label != crate::cmd::view::mail::PINNED_LABEL && label != TOP_RESULTS_LABEL && list.iter().any(|m| {
+            // Arrange by Categories lists a message under each of its categories: only the header's own label
+            // collapses it.
+            || vs.arrange_by != ArrangeBy::Categories
+                && label != crate::cmd::view::mail::PINNED_LABEL && label != TOP_RESULTS_LABEL && list.iter().any(|m| {
                 let other = crate::cmd::view::group_label(s, m, vs.arrange_by);
                 collapsed.contains(&other)
             }))
@@ -2028,7 +2182,12 @@ mod tests {
                     v.order = order;
                 });
                 let rows = list_rows(&s);
-                assert_eq!(items(&rows).len(), total, "{key:?}");
+                // Arrange by Categories lists a message once per category: count each message once.
+                let once: HashSet<ItemId> = items(&rows).iter().map(|i| i.id).collect();
+                assert_eq!(once.len(), total, "{key:?}");
+                if key != ArrangeBy::Categories {
+                    assert_eq!(items(&rows).len(), total, "{key:?}");
+                }
                 let g = groups(&rows);
                 let mut uniq = g.clone();
                 uniq.sort();
@@ -2564,5 +2723,106 @@ mod tests {
             })
             .collect();
         assert!(!shown.is_empty() && shown.iter().all(|i| i.unread));
+    }
+
+    #[test]
+    fn arrange_by_categories_lists_a_message_under_each_category() {
+        let mut s = sample_session();
+        set_view(&mut s, |v| v.focused_inbox = false);
+        let inbox = s.selection.folder;
+        let ids: Vec<ItemId> = s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
+        for id in &ids {
+            s.mailbox.mail.get_mut(id).unwrap().categories.clear();
+        }
+        let both = ids[0];
+        let red = ids[1];
+        s.mailbox.mail.get_mut(&both).unwrap().categories =
+            vec!["Red category".into(), "Blue category".into()];
+        s.mailbox.mail.get_mut(&red).unwrap().categories = vec!["red category".into()];
+        s.run("view.arrangeBy", &serde_json::json!({"key": "categories"})).unwrap();
+        s.run("view.sort", &serde_json::json!({"order": "ascending"})).ok();
+        let groups = |s: &Session| -> Vec<(String, Vec<ItemId>, bool)> {
+            let mut out: Vec<(String, Vec<ItemId>, bool)> = Vec::new();
+            for r in list_rows(s) {
+                match r {
+                    ListRow::Group { label, collapsed, .. } => out.push((label, Vec::new(), collapsed)),
+                    ListRow::Item(i) => {
+                        if let Some(g) = out.last_mut() {
+                            g.1.push(i.id);
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let g = groups(&s);
+        let labels: Vec<&str> = g.iter().map(|x| x.0.as_str()).collect();
+        assert!(labels.contains(&"Red category") && labels.contains(&"Blue category"), "{labels:?}");
+        assert!(!labels.iter().any(|l| l.contains(", ")), "no joined groups: {labels:?}");
+        let members = |name: &str| g.iter().find(|x| x.0 == name).map(|x| x.1.clone()).unwrap_or_default();
+        assert!(members("Red category").contains(&both) && members("Red category").contains(&red));
+        assert_eq!(members("Blue category"), vec![both]);
+        assert!(members(NONE_LABEL).len() == ids.len() - 2);
+        // The repeated row has its own repeat count; keys visit the message once.
+        let repeats: Vec<u16> = list_rows(&s)
+            .into_iter()
+            .filter_map(|r| match r {
+                ListRow::Item(i) if i.id == both => Some(i.repeat),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(repeats, vec![0, 1]);
+        assert_eq!(visible_item_ids(&s).iter().filter(|i| **i == both).count(), 1);
+        // Collapsing Red leaves Blue open even though its message's first category is Red.
+        s.view.collapsed_groups.entry(inbox).or_default().push("Red category".into());
+        let g = groups(&s);
+        assert!(g.iter().find(|x| x.0 == "Red category").unwrap().2);
+        assert!(!g.iter().find(|x| x.0 == "Blue category").unwrap().2);
+        assert_eq!(g.iter().find(|x| x.0 == "Blue category").unwrap().1, vec![both]);
+    }
+
+    #[test]
+    fn all_items_search_lists_appointments_contacts_tasks_and_notes() {
+        let mut s = sample_session();
+        let subject = s.mailbox.appointments.values().next().map(|a| a.subject.clone()).unwrap();
+        let word = subject.split_whitespace().next().unwrap().to_owned();
+        s.run("search.query", &serde_json::json!({"text": word})).unwrap();
+        let kinds = |s: &Session| -> Vec<Option<String>> {
+            list_rows(s)
+                .into_iter()
+                .filter_map(|r| match r {
+                    ListRow::Item(i) => Some(i.kind),
+                    ListRow::Group { .. } => None,
+                })
+                .collect()
+        };
+        // Mailbox scopes: messages only.
+        s.run("search.scope", &serde_json::json!({"scope": "allMailboxes"})).unwrap();
+        assert!(kinds(&s).iter().all(Option::is_none));
+        // All Items: the other kinds follow under their own header, and keys skip them.
+        s.run("search.scope", &serde_json::json!({"scope": "allItems"})).unwrap();
+        let rows = list_rows(&s);
+        assert!(rows.iter().any(|r| matches!(r, ListRow::Group { label, .. } if label == OTHER_ITEMS_LABEL)));
+        let other: Vec<ItemRow> = rows
+            .into_iter()
+            .filter_map(|r| match r {
+                ListRow::Item(i) if i.kind.is_some() => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert!(other.iter().any(|i| i.kind.as_deref() == Some("appointment") && i.subject == subject));
+        assert!(other.iter().all(|i| !s.mailbox.mail.contains_key(&i.id)));
+        let visible = visible_item_ids(&s);
+        assert!(other.iter().all(|i| !visible.contains(&i.id)));
+        // Every kind gets a row.
+        let task = s.mailbox.tasks.keys().next().copied().unwrap();
+        let note = s.mailbox.notes.keys().next().copied();
+        let contact = s.mailbox.contacts.keys().next().copied().unwrap();
+        assert_eq!(pim_row(&s, task).unwrap().kind.as_deref(), Some("task"));
+        assert_eq!(pim_row(&s, contact).unwrap().kind.as_deref(), Some("contact"));
+        if let Some(n) = note {
+            assert_eq!(pim_row(&s, n).unwrap().kind.as_deref(), Some("note"));
+        }
+        assert!(pim_row(&s, ItemId(u64::MAX)).is_none());
     }
 }

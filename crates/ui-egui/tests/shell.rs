@@ -7,6 +7,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use mailcraft_engine::queries::{self, ListRow};
 use mailcraft_engine::sample::sample_session;
+use mailcraft_model::{Address, Body, BodyFormat, DateTime, MailItem};
 use mailcraft_ui_egui::App;
 use serde_json::json;
 
@@ -228,4 +229,84 @@ fn todo_bar_follows_the_view_command() {
     h.run_steps(3);
     assert!(!App::shell_layout(&h.ctx).panes.contains(&"todoBar"));
     assert_eq!(h.state().ui.todo_bar_parts, (false, false, false));
+}
+
+#[test]
+fn from_refiner_puts_the_caret_between_the_quotes() {
+    let mut h = harness(1600.0, 900.0);
+    h.state_mut().run("search.query", json!({"text": "budget"})).unwrap();
+    h.run_steps(2);
+    let r = h.state_mut().run("search.refine", json!({"kind": "from"})).unwrap();
+    assert_eq!(r["edit"], json!([13, 13]));
+    h.run_steps(4);
+    assert!(h.state().ui.search_active);
+    assert_eq!(h.state().ui.search_text, "budget from:\"\"");
+    let box_id = egui::Id::new("mailcraft_search_box");
+    assert!(h.ctx.memory(|m| m.has_focus(box_id)), "the search box has the keyboard focus");
+    let state = egui::TextEdit::load_state(&h.ctx, box_id).expect("search box state");
+    let range = state.cursor.char_range().expect("caret");
+    let caret = egui::text::CCursor::new(13);
+    assert_eq!((range.primary, range.secondary), (caret, caret));
+}
+
+#[test]
+fn bulk_folder_actions_and_ignore_ask_first() {
+    let mut h = harness(1600.0, 900.0);
+    let inbox = h.state().s.selection.folder;
+    let count = h.state().s.mailbox.total_count(inbox);
+    let first = queries::visible_item_ids(&h.state().s).first().copied().unwrap();
+    h.state_mut().run("nav.selectItem", json!({"id": first.0})).unwrap();
+    h.state_mut().run("mail.ignore", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(has_label(&h, "Ignore Conversation"), "the confirmation is up");
+    assert!(has_label(&h, "Don't ask me again"));
+    assert!(!h.state().s.mailbox.mail[&first].ignored, "nothing ignored before the answer");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Ignore Conversation").click();
+    h.run_steps(3);
+    assert!(h.state().s.mailbox.mail[&first].ignored);
+    assert!(h.state().s.mailbox.total_count(inbox) <= count);
+    // A message whose whole text is quoted in a later reply: Clean Up would move it.
+    let redundant = {
+        let s = &mut h.state_mut().s;
+        let now = s.now();
+        let item = |subject: &str, text: &str, unix: i64| MailItem {
+            folder: inbox,
+            subject: subject.into(),
+            from: Some(Address::new(Some("Ann Lee"), "ann@example.com")),
+            received: DateTime { unix, ..now },
+            read: true,
+            body: Body { format: BodyFormat::PlainText, text: Some(text.into()), html: None },
+            ..Default::default()
+        };
+        let mut original = item("Picnic", "Shall we meet at noon by the lake?", now.unix - 120);
+        original.message_id = Some("picnic-1@example.com".into());
+        let mut reply =
+            item("RE: Picnic", "Yes, see you there.\n\n> Shall we meet at noon by the lake?", now.unix - 60);
+        reply.in_reply_to = vec!["picnic-1@example.com".into()];
+        reply.references = vec!["picnic-1@example.com".into()];
+        let id = s.mailbox.add_mail(original);
+        s.mailbox.add_mail(reply);
+        id
+    };
+    let ids_in = |h: &Harness<'_, App>| {
+        let mut ids: Vec<u64> = h.state().s.mailbox.items_in(inbox).iter().map(|m| m.id.0).collect();
+        ids.sort_unstable();
+        ids
+    };
+    let before = ids_in(&h);
+    let before_count = h.state().s.mailbox.total_count(inbox);
+    h.state_mut().run("mail.cleanUpFolder", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(has_label(&h, "Clean Up Folder"), "Clean Up asks first");
+    assert_eq!(ids_in(&h), before, "nothing moves before the answer");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Cancel").click();
+    h.run_steps(3);
+    assert_eq!(ids_in(&h), before, "Cancel leaves the folder alone");
+    assert_eq!(h.state().s.mailbox.total_count(inbox), before_count);
+    // Answering yes does clean up, so the checks above are not vacuous.
+    h.state_mut().run("mail.cleanUpFolder", json!({})).unwrap();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Clean Up Folder").click();
+    h.run_steps(3);
+    assert!(!ids_in(&h).contains(&redundant.0), "the quoted message was cleaned up");
 }

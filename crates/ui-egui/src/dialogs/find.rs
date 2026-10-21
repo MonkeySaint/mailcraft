@@ -34,9 +34,21 @@ const TIMES: [(&str, &str); 9] = [
     ("older than…", "older"),
 ];
 
+/// Look for: (label, `search.advancedFind` lookFor).
+const LOOK_FOR: [(&str, &str); 6] = [
+    ("Messages", "messages"),
+    ("Any type of item", "any"),
+    ("Appointments and meetings", "appointments"),
+    ("Contacts", "contacts"),
+    ("Tasks", "tasks"),
+    ("Notes", "notes"),
+];
+
 #[derive(Clone, Default)]
 struct FindState {
     tab: usize,
+    /// Index into [`LOOK_FOR`].
+    look_for: usize,
     folder: Option<u64>,
     subfolders: bool,
     words: String,
@@ -82,7 +94,9 @@ fn advanced_find(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         window(ctx, app, d, "Advanced Find", 680.0, |ui, app| {
             let mut out = Out::Keep;
             ui.horizontal(|ui| {
-                ui.label("Look for: Messages");
+                ui.label("Look for:");
+                let names: Vec<&str> = LOOK_FOR.iter().map(|l| l.0).collect();
+                common::combo_idx(ui, ("aflook", uid), &mut st.look_for, &names, 190.0);
                 ui.label("In:");
                 ui.label(RichText::new(folder_path(app, st.folder)).strong());
                 if btn(ui, "Browse...") {
@@ -219,8 +233,24 @@ fn build_query(st: &FindState) -> String {
     terms.join(" ")
 }
 
-fn run_find(app: &App, st: &mut FindState) {
+fn run_find(app: &mut App, st: &mut FindState) {
     let query = build_query(st);
+    // Other item kinds go through the engine's Advanced Find, which searches every kind.
+    if let Some((_, kind)) = LOOK_FOR.get(st.look_for).filter(|l| l.1 != "messages") {
+        let mut p = json!({"query": query, "lookFor": kind, "subfolders": st.subfolders, "limit": 5_000});
+        if let (Some(f), Some(o)) = (st.folder, p.as_object_mut()) {
+            o.insert("folder".into(), json!(f));
+        }
+        let found = app.run("search.advancedFind", p);
+        st.results = found
+            .as_ref()
+            .and_then(|r| r.get("items"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|i| i.get("id").and_then(Value::as_u64)).collect())
+            .unwrap_or_default();
+        st.searched = true;
+        return;
+    }
     let folders: Vec<FolderId> = match st.folder {
         Some(f) if st.subfolders => app.s.mailbox.subtree(FolderId(f)),
         Some(f) => vec![FolderId(f)],
@@ -256,26 +286,90 @@ fn results_table(ui: &mut egui::Ui, app: &mut App, uid: u64, st: &mut FindState)
             }
             ui.end_row();
             for id in st.results.clone() {
-                let Some(m) = app.s.mailbox.mail.get(&ItemId(id)) else { continue };
-                let from = m.from.as_ref().map(|f| f.display().to_owned()).unwrap_or_default();
-                let subject =
-                    if m.subject.is_empty() { "(no subject)".to_owned() } else { m.subject.clone() };
-                let when = mailcraft_model::ListTime::short_date_time(m.received, app.s.tz_offset_min);
-                let folder = app.s.mailbox.folder(m.folder).map(|f| f.name.clone()).unwrap_or_default();
-                let r = ui.selectable_label(st.selected == Some(id), from);
-                ui.label(subject);
-                ui.label(when);
-                ui.label(folder);
+                let Some(hit) = found_row(app, ItemId(id)) else { continue };
+                let r = ui.selectable_label(st.selected == Some(id), hit.from);
+                ui.label(hit.subject);
+                ui.label(hit.when);
+                ui.label(hit.folder);
                 ui.end_row();
                 if r.clicked() {
                     st.selected = Some(id);
                 }
                 if r.double_clicked() {
-                    app.run("mail.open", json!({"ids": [id]}));
+                    match hit.window {
+                        None => {
+                            app.run("mail.open", json!({"ids": [id]}));
+                        }
+                        Some(window) => super::open(app, window, json!({"id": id})),
+                    }
                 }
             }
         });
     });
+}
+
+/// One Advanced Find result: the From / Subject / Received / In Folder cells and the item window a
+/// double-click opens (`None` = the message's read window).
+struct FoundRow {
+    from: String,
+    subject: String,
+    when: String,
+    folder: String,
+    window: Option<&'static str>,
+}
+
+fn found_row(app: &App, id: ItemId) -> Option<FoundRow> {
+    let mb = &app.s.mailbox;
+    let tz = app.s.tz_offset_min;
+    let folder = |f: FolderId| mb.folder(f).map(|f| f.name.clone()).unwrap_or_default();
+    let untitled =
+        |t: &str| if t.trim().is_empty() { "(no subject)".to_owned() } else { t.trim().to_owned() };
+    if let Some(m) = mb.mail.get(&id) {
+        return Some(FoundRow {
+            from: m.from.as_ref().map(|f| f.display().to_owned()).unwrap_or_default(),
+            subject: untitled(&m.subject),
+            when: mailcraft_model::ListTime::short_date_time(m.received, tz),
+            folder: folder(m.folder),
+            window: None,
+        });
+    }
+    if let Some(a) = mb.appointments.get(&id) {
+        let kind = if a.is_meeting { "Meeting" } else { "Appointment" };
+        return Some(FoundRow {
+            from: kind.to_owned(),
+            subject: untitled(&a.subject),
+            when: mailcraft_model::ListTime::short_date_time(a.start, tz),
+            folder: folder(a.folder),
+            window: Some("appointment"),
+        });
+    }
+    if let Some(c) = mb.contacts.get(&id) {
+        let name = c.full_name();
+        return Some(FoundRow {
+            from: "Contact".to_owned(),
+            subject: if name.trim().is_empty() { c.file_as.clone() } else { name },
+            when: String::new(),
+            folder: folder(c.folder),
+            window: Some("contact"),
+        });
+    }
+    if let Some(t) = mb.tasks.get(&id) {
+        return Some(FoundRow {
+            from: "Task".to_owned(),
+            subject: untitled(&t.subject),
+            when: t.due.map(|d| mailcraft_model::ListTime::short_date_time(d, tz)).unwrap_or_default(),
+            folder: folder(t.folder),
+            window: Some("task"),
+        });
+    }
+    let n = mb.notes.get(&id)?;
+    Some(FoundRow {
+        from: "Note".to_owned(),
+        subject: untitled(n.text.lines().next().unwrap_or_default()),
+        when: String::new(),
+        folder: folder(n.folder),
+        window: Some("note"),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------------------

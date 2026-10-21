@@ -242,7 +242,11 @@ fn new_items_from_mail_do_not_pass_the_mail_folder() {
             _ => None,
         });
         let params = params.expect("dialog opened");
-        assert!(params.get("folder").is_none(), "{kind}: {params}");
+        // The module's own folder (the window the module opens), never the selected mail folder.
+        let folder = params.get("folder").and_then(|f| f.as_u64()).map(mailcraft_model::FolderId);
+        let kind_of = folder.and_then(|f| s.mailbox.folder(f)).map(|f| f.kind);
+        assert!(kind_of.is_some_and(|k| k != mailcraft_model::FolderKind::Mail), "{kind}: {params}");
+        assert_ne!(folder, Some(s.selection.folder), "{kind}");
     }
     s.notices.clear();
     s.run("mail.newItem", &json!({"kind": "post"})).unwrap();

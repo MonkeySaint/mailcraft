@@ -98,7 +98,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Collapse This Group",
             "View › Arrangement › Expand/Collapse",
             "",
-            r#"{"conversation"?:bool,"id"?:number}"#,
+            r#"{"conversation"?:bool,"id"?:number,"label"?:string}"#,
             false,
             group_or_conversation_selected,
             collapse_group,
@@ -138,7 +138,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Expand This Group",
             "View › Arrangement › Expand/Collapse",
             "",
-            r#"{"conversation"?:bool,"id"?:number}"#,
+            r#"{"conversation"?:bool,"id"?:number,"label"?:string}"#,
             false,
             group_or_conversation_selected,
             expand_group,
@@ -837,10 +837,31 @@ fn set_group(s: &mut Session, p: &Value, collapsed: bool) -> CmdResult {
     if opt_bool(p, "conversation").unwrap_or(false) {
         return set_conversation(s, p, collapsed);
     }
-    if let Some(why) = group_selected(s) {
-        return Err(CmdError::Disabled(why.into()));
-    }
-    let label = selected_group(s).ok_or_else(|| CmdError::Disabled("no item is selected".into()))?;
+    let label = match opt_str(p, "label") {
+        // A header names its own group: an item listed under several groups (Arrange by Categories) would
+        // otherwise resolve to its first one.
+        Some(name) => {
+            if let Some(why) = groups_shown(s) {
+                return Err(CmdError::Disabled(why.into()));
+            }
+            let folder = s.selection.folder;
+            let labels = if modules::module_kind(s, folder).is_some() {
+                modules::groups(s, folder)
+            } else {
+                crate::queries::group_labels(s)
+            };
+            labels
+                .into_iter()
+                .find(|l| l == name)
+                .ok_or_else(|| CmdError::Params(format!("no group \"{name}\" in this view")))?
+        }
+        None => {
+            if let Some(why) = group_selected(s) {
+                return Err(CmdError::Disabled(why.into()));
+            }
+            selected_group(s).ok_or_else(|| CmdError::Disabled("no item is selected".into()))?
+        }
+    };
     let list = s.view.collapsed_groups.entry(s.selection.folder).or_default();
     list.retain(|g| *g != label);
     if collapsed {

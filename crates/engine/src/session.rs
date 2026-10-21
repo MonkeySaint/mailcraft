@@ -268,6 +268,7 @@ impl Session {
         // adding to a list relies on it being sorted.
         mailbox.junk.sanitize();
         mailbox.rename_legacy_local_account();
+        mailbox.drop_legacy_create_new_step();
         if mailbox.accounts.is_empty() && mailbox.folders.is_empty() {
             mailbox = Mailbox::new_local(mailcraft_model::mailbox::LOCAL_ACCOUNT_FALLBACK_NAME);
             store.checkpoint(&mailbox).map_err(|e| {

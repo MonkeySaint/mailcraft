@@ -198,6 +198,8 @@ pub(crate) struct ShellState {
     pub toasts: Vec<(String, f64, bool)>,
     /// Focus the search box on the next frame.
     pub focus_search: bool,
+    /// Text the search box selects when it takes that focus (char range; caret when empty).
+    pub search_select: Option<(usize, usize)>,
     /// Ribbon temporarily shown while the display mode hides it (Show tabs only / Full-screen mode).
     pub ribbon_reveal: bool,
     /// Splitters: folder pane width, message list width (reading pane Right), list share (reading pane Bottom).
@@ -249,6 +251,15 @@ pub(crate) fn with_shell<R>(ctx: &egui::Context, f: impl FnOnce(&mut ShellState)
     let vp = ctx.viewport_id();
     let id = if vp == egui::ViewportId::ROOT { shell_id() } else { shell_id().with(vp) };
     ctx.data_mut(|d| f(d.get_temp_mut_or_default::<ShellState>(id)))
+}
+
+/// The `select` char range of a `searchBox` request (`[start, end]`, kept in order and within the query).
+pub(crate) fn search_select(params: &Value) -> Option<(usize, usize)> {
+    let a = params.pointer("/select/0")?.as_u64()?;
+    let b = params.pointer("/select/1").and_then(Value::as_u64).unwrap_or(a);
+    let len = params.get("query").and_then(Value::as_str).map_or(0, |q| q.chars().count());
+    let clamp = |n: u64| usize::try_from(n).unwrap_or(usize::MAX).min(len);
+    Some((clamp(a.min(b)), clamp(a.max(b))))
 }
 
 /// The bundled app icon (our own artwork).
@@ -618,9 +629,14 @@ impl App {
             modules::open_reminders(ctx, self);
         } else if id == "searchBox" {
             // `search.focus` (Ctrl+E / F3): focus the title-bar search box and bring up the Search tab.
+            // A refiner that waits for a value (`select`: char range) puts the caret between its quotes.
             self.ui.search_active = true;
             self.ui.set_tab(Surface::Main, "Search");
-            with_shell(ctx, |st| st.focus_search = true);
+            let select = search_select(&params);
+            with_shell(ctx, |st| {
+                st.focus_search = true;
+                st.search_select = select;
+            });
         } else {
             // Everything else (incl. backstage, readWindow, exit) is routed by the dialogs area.
             dialogs::open(self, &id, params);

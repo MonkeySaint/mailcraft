@@ -70,8 +70,9 @@ pub fn flip_mem(mem: &mut Mem, spec: &str) {
     mem.flags.insert(key.to_owned(), !now);
 }
 
+/// Whether `term` is one of the query's terms (quoted values with spaces count as one term).
 fn token_on(search: &str, term: &str) -> bool {
-    search.split_whitespace().any(|t| t.eq_ignore_ascii_case(term))
+    mailcraft_engine::cmd::search::terms(search).iter().any(|t| t.eq_ignore_ascii_case(term))
 }
 
 fn current_view(app: &App) -> mailcraft_model::ViewSettings {
@@ -160,6 +161,10 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
                 _ => false,
             }
         }
+        // Send / Receive › Download Preferences: the mode every server account uses (`dl:<mode>`) and On Slow
+        // Connections Download Only Headers.
+        "dl" => download_options(app).iter().all(|o| o.download.name() == arg),
+        "slowHeaders" => download_options(app).iter().all(|o| o.slow_headers_only),
         "ignored" => focused_mail(app, surface).is_some_and(|m| m.ignored),
         "cat" => focused_mail(app, surface)
             .is_some_and(|m| m.categories.iter().any(|c| c.eq_ignore_ascii_case(arg))),
@@ -169,6 +174,19 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
         }
         _ => compose(app, surface).is_some_and(|c| compose_on(c, name, arg)),
     }
+}
+
+/// Download options of the server accounts (the default options when there are none).
+fn download_options(app: &App) -> Vec<mailcraft_engine::accounts::AccountOptions> {
+    let v: Vec<_> = app
+        .s
+        .mailbox
+        .accounts
+        .iter()
+        .filter(|a| a.kind != mailcraft_model::AccountKind::Local)
+        .map(|a| mailcraft_engine::accounts::account_options(&app.s, a.id))
+        .collect();
+    if v.is_empty() { vec![mailcraft_engine::accounts::AccountOptions::default()] } else { v }
 }
 
 fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str) -> bool {
@@ -392,8 +410,10 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 24] = [
+pub const SOURCES: [&str; 26] = [
     "recentSearches",
+    "searchCategories",
+    "searchStores",
     "signatures",
     "recentFiles",
     "quicksteps",
@@ -527,6 +547,13 @@ fn mail_view_items(app: &App) -> Vec<DynItem> {
         .collect()
 }
 
+/// The master category list by name (the Categorize and Categorized menus list it alphabetically).
+fn sorted_categories(app: &App) -> Vec<&mailcraft_model::Category> {
+    let mut v: Vec<&mailcraft_model::Category> = app.s.mailbox.categories.iter().collect();
+    v.sort_by_cached_key(|c| c.name.to_lowercase());
+    v
+}
+
 /// Items of a dynamic source.
 pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
     let plain = |label: &str, icon: &'static str| DynItem {
@@ -562,6 +589,7 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 })
                 .collect()
         }
+        // The stored steps, then the gallery's fixed Create New entry (`quicksteps.run {"id": "new"}`).
         "quicksteps" => app
             .s
             .mailbox
@@ -574,13 +602,18 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 vars: vec![("$id", json!(q.id)), ("$name", json!(q.name))],
                 on: false,
             })
+            .chain(std::iter::once(DynItem {
+                label: mailcraft_model::QuickStep::CREATE_NEW.to_owned(),
+                icon: "plus",
+                swatch: None,
+                vars: vec![("$id", json!("new")), ("$name", json!(mailcraft_model::QuickStep::CREATE_NEW))],
+                on: false,
+            }))
             .collect(),
         "categories" => {
             let item = focused_mail(app, surface);
-            // Alphabetical, as the original lists them.
-            let mut cats: Vec<&mailcraft_model::Category> = app.s.mailbox.categories.iter().collect();
-            cats.sort_by_key(|c| c.name.to_lowercase());
-            cats.into_iter()
+            sorted_categories(app)
+                .into_iter()
                 .map(|c| {
                     let rgb = c.color.rgb();
                     DynItem {
@@ -594,6 +627,32 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 })
                 .collect()
         }
+        // Search › Categorized: checked while the query holds that category's `category:` term.
+        "searchCategories" => sorted_categories(app)
+            .into_iter()
+            .map(|c| {
+                let rgb = c.color.rgb();
+                let term = mailcraft_engine::cmd::search::token("category", &c.name);
+                DynItem {
+                    label: c.name.clone(),
+                    icon: "category-tag",
+                    swatch: Some([rgb.r, rgb.g, rgb.b]),
+                    vars: vec![("$name", json!(c.name))],
+                    on: token_on(&app.s.view.search, &term),
+                }
+            })
+            .collect(),
+        // Search Tools › Locations to Search: checked = All Mailboxes / All Items search the store.
+        "searchStores" => mailcraft_engine::cmd::search::locations(&app.s)
+            .into_iter()
+            .map(|(key, label, on)| DynItem {
+                label,
+                icon: "account",
+                swatch: None,
+                vars: vec![("$name", json!(key))],
+                on,
+            })
+            .collect(),
         "accounts" => app
             .s
             .mailbox
@@ -890,6 +949,8 @@ pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> V
                 key: it.key.clone(),
             }),
             ItemKind::Dyn => {
+                // Recent Searches with nothing in it shows its placeholder greyed out.
+                let empty = it.target == "recentSearches" && app.s.search.recent.is_empty();
                 for d in dyn_items(app, surface, &it.target) {
                     let action = action(app, &it.cmd, d.on, None, &d.vars);
                     let disabled = disabled(app, surface, &it.cmd.id).or_else(|| {
@@ -905,7 +966,7 @@ pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> V
                         swatch: d.swatch,
                         key: String::new(),
                         on: Some(d.on),
-                        disabled,
+                        disabled: if empty { Some("no recent searches") } else { disabled },
                         action,
                     });
                 }

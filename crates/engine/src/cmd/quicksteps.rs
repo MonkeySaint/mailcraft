@@ -38,9 +38,10 @@ pub fn specs() -> Vec<CommandSpec> {
             "quicksteps.run",
             "Run Quick Step",
             Q,
-            r#"{"id": number|string, "ids"?: [number], "group"?: bool, "folder"?: number, "to"?: [string], "name"?: string} (folder/to/name complete a first-use setup; group = the items of a list group)"#,
+            r#"{"id": number|string, "ids"?: [number], "group"?: bool, "folder"?: number, "to"?: [string], "name"?: string} (folder/to/name complete a first-use setup; group = the items of a list group; id "new" = Create New)"#,
             true,
-            has_steps,
+            // The gallery's Create New entry works with no stored step; other ids are checked when run.
+            always,
             run,
         ),
         spec(
@@ -282,7 +283,21 @@ fn respond(
     Ok(Some(cid))
 }
 
+/// True for the gallery's fixed Create New entry (`"id": "new"`, or its name when no step is called that).
+fn is_create_new(s: &Session, p: &Value) -> bool {
+    let Some(v) = p.get("id").and_then(Value::as_str).map(str::trim) else { return false };
+    v.eq_ignore_ascii_case("new")
+        || (v.eq_ignore_ascii_case(QuickStep::CREATE_NEW) && find_step(s, p).is_err())
+}
+
 fn run(s: &mut Session, p: &Value) -> CmdResult {
+    // Create New: the editor for a new custom step (Finish adds it; nothing is replaced).
+    if is_create_new(s, p) {
+        return new_step(s, &json!({"template": "custom"}));
+    }
+    if let Some(why) = has_steps(s) {
+        return Err(CmdError::Disabled(why.into()));
+    }
     let idx = find_step(s, p)?;
     let Some(mut step) = s.mailbox.quick_steps.get(idx).cloned() else {
         return Err(CmdError::Params("no such quick step".into()));
@@ -796,7 +811,7 @@ mod tests {
         s.run("quicksteps.moveUp", &json!({"id": "Copy of Finished"})).unwrap();
         assert_eq!(s.mailbox.quick_steps[3].name, "Copy of Finished");
         s.run("quicksteps.delete", &json!({"id": "Copy of Finished"})).unwrap();
-        assert_eq!(s.mailbox.quick_steps.len(), 6);
+        assert_eq!(s.mailbox.quick_steps.len(), 5);
         s.run("quicksteps.reset", &json!({})).unwrap();
         assert_eq!(s.mailbox.quick_steps, QuickStep::defaults());
     }
@@ -804,18 +819,22 @@ mod tests {
     #[test]
     fn create_new_opens_editor() {
         let (mut s, _, _) = session();
-        let r = s.run("quicksteps.run", &json!({"id": "Create New"})).unwrap();
-        assert_eq!(r["dialog"], "editQuickStep");
-        // The editor opens on a new step (no step id), so saving adds a step and keeps "Create New".
-        let Some(crate::Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
-        assert!(p.get("step").is_none(), "{p}");
-        assert_eq!(p["template"], "custom");
-        assert_eq!(p["name"], "My Quick Step");
-        let before = s.mailbox.quick_steps.len();
-        s.run("quicksteps.new", &json!({"template": "custom", "name": "Mine", "actions": ["MarkRead"]}))
-            .unwrap();
-        assert_eq!(s.mailbox.quick_steps.len(), before + 1);
-        assert!(s.mailbox.quick_steps.iter().any(|q| q.name == "Create New"));
+        let before = s.mailbox.quick_steps.clone();
+        assert!(before.iter().all(|q| q.name != QuickStep::CREATE_NEW), "not a stored step");
+        for id in ["new", "Create New"] {
+            let r = s.run("quicksteps.run", &json!({"id": id})).unwrap();
+            assert_eq!(r["dialog"], "editQuickStep");
+        }
+        // The editor is for a new step: Finish adds one and replaces nothing.
+        let r =
+            s.run("quicksteps.new", &json!({"template": "custom", "name": "Mine", "actions": ["MarkRead"]}));
+        assert!(r.is_ok());
+        assert_eq!(s.mailbox.quick_steps.len(), before.len() + 1);
+        assert_eq!(&s.mailbox.quick_steps[..before.len()], &before[..]);
+        // A step the user named Create New is run like any other.
+        s.run("quicksteps.edit", &json!({"id": "Mine", "name": "Create New"})).unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "Create New"}));
+        assert!(r.map(|v| v.get("dialog").is_none()).unwrap_or(true));
     }
 
     #[test]
@@ -925,6 +944,21 @@ mod tests {
     }
 
     #[test]
+    fn create_new_works_with_no_quick_steps() {
+        let (mut s, _, _) = session();
+        let ids: Vec<u64> = s.mailbox.quick_steps.iter().map(|q| q.id).collect();
+        for id in ids {
+            s.run("quicksteps.delete", &json!({"id": id})).unwrap();
+        }
+        assert!(s.mailbox.quick_steps.is_empty());
+        assert_eq!(s.enabled("quicksteps.run"), None, "the gallery's Create New entry stays enabled");
+        let r = s.run("quicksteps.run", &json!({"id": "new"})).unwrap();
+        assert_eq!(r["dialog"], "editQuickStep");
+        // Any other step is gone.
+        assert!(matches!(s.run("quicksteps.run", &json!({"id": 1})), Err(CmdError::Disabled(_))));
+    }
+
+    #[test]
     fn first_use_setup_can_rename_the_step() {
         let (mut s, _, proj) = session();
         s.run("quicksteps.run", &json!({"id": 1, "folder": proj.0, "name": "Projects"})).unwrap();
@@ -954,6 +988,6 @@ mod tests {
         }
         s.run("quicksteps.run", &json!({"id": "Undated"})).unwrap();
         assert!(matches!(&s.mailbox.mail[&id].flag, FlagState::Flagged { due: None, start: None, .. }));
-        assert_eq!(s.run("quicksteps.list", &json!({})).unwrap()["steps"].as_array().unwrap().len(), 8);
+        assert_eq!(s.run("quicksteps.list", &json!({})).unwrap()["steps"].as_array().unwrap().len(), 7);
     }
 }

@@ -358,8 +358,27 @@ fn deleted_folders(mb: &Mailbox) -> BTreeSet<FolderId> {
         .collect()
 }
 
+/// Setting listing the accounts and data files Search › Search Tools › Locations to Search leaves out of
+/// All Mailboxes and All Items (store keys, see [`store_key`]).
+pub const EXCLUDED_STORES_SETTING: &str = "search.excludedStores";
+
+/// The key Locations to Search knows an account or data file by: its address, else its name (lower case).
+pub fn store_key(a: &mailcraft_model::Account) -> String {
+    let name = if a.address.trim().is_empty() { a.display_name.trim() } else { a.address.trim() };
+    name.to_lowercase()
+}
+
+/// Accounts and data files that All Mailboxes and All Items search (Locations to Search: every store,
+/// less the ones the user unchecked).
+pub fn searched_stores(s: &Session) -> BTreeSet<mailcraft_model::AccountId> {
+    let excluded: BTreeSet<String> =
+        s.settings.list(EXCLUDED_STORES_SETTING).iter().map(|k| k.trim().to_lowercase()).collect();
+    s.mailbox.accounts.iter().filter(|a| !excluded.contains(&store_key(a))).map(|a| a.id).collect()
+}
+
 /// Folders the active search covers. Mailbox-wide scopes leave out non-mail folders and (unless Include
-/// Deleted Items is on) Deleted Items; All Items covers every folder.
+/// Deleted Items is on) Deleted Items; All Items covers every folder. All Mailboxes and All Items cover the
+/// stores checked in Locations to Search ([`searched_stores`]).
 pub fn scope_folders(s: &Session) -> Vec<FolderId> {
     let mb = &s.mailbox;
     let sel = s.selection.folder;
@@ -375,8 +394,18 @@ pub fn scope_folders(s: &Session) -> Vec<FolderId> {
             let account = mb.folder_account(sel).or_else(|| s.current_account());
             mb.folders.values().filter(|f| Some(f.account) == account && mail_like(f)).map(|f| f.id).collect()
         }
-        SearchScope::AllMailboxes => mb.folders.values().filter(|f| mail_like(f)).map(|f| f.id).collect(),
-        SearchScope::AllItems => mb.folders.keys().copied().collect(),
+        SearchScope::AllMailboxes => {
+            let stores = searched_stores(s);
+            mb.folders
+                .values()
+                .filter(|f| stores.contains(&f.account) && mail_like(f))
+                .map(|f| f.id)
+                .collect()
+        }
+        SearchScope::AllItems => {
+            let stores = searched_stores(s);
+            mb.folders.values().filter(|f| stores.contains(&f.account)).map(|f| f.id).collect()
+        }
     }
 }
 

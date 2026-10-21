@@ -77,7 +77,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Delete Folder",
             "Folder › Actions",
             "",
-            r#"{"folder"?:number|string,"confirm"?:bool (without it the command only asks)}"#,
+            r#"{"folder"?: number|string, "confirm"?: bool} (asks first unless confirm: true)"#,
             true,
             user_folder,
             delete,
@@ -87,7 +87,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Delete All",
             "Folder › Clean Up",
             "",
-            r#"{"folder"?:number|string,"confirm"?:bool (without it the command only asks)}"#,
+            r#"{"folder"?: number|string, "confirm"?: bool} (asks first unless confirm: true)"#,
             true,
             folder_has_items,
             delete_all,
@@ -641,7 +641,32 @@ fn move_(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "folder": id.0, "path": s.mailbox.folder_path(id) }))
 }
 
-/// True when `id` sits in its account's Deleted Items (deleting there is for good).
+/// Commands that destroy many items at once ask first: without `confirm: true` they put a `confirm` dialog
+/// up (its Yes runs `command` again with the folder fixed and `confirm: true`) and return
+/// `{"asked": true}` (`Some`); with it they go ahead (`None`).
+pub(crate) fn ask_first(
+    s: &mut Session,
+    p: &Value,
+    command: &str,
+    folder: FolderId,
+    title: &str,
+    text: String,
+    yes: &str,
+) -> Option<CmdResult> {
+    if opt_bool(p, "confirm") == Some(true) {
+        return None;
+    }
+    let mut params = p.as_object().cloned().unwrap_or_default();
+    params.insert("folder".into(), json!(folder.0));
+    params.insert("confirm".into(), json!(true));
+    s.notify(Notice::OpenDialog(
+        "confirm".into(),
+        json!({"title": title, "text": text, "command": command, "params": params, "yes": yes, "no": "Cancel"}),
+    ));
+    Some(Ok(json!({"asked": true, "folder": folder.0, "dialog": "confirm"})))
+}
+
+/// True when `id` is (inside) its account's Deleted Items, where deleting is for good.
 fn in_deleted_items(s: &Session, id: FolderId) -> bool {
     s.mailbox
         .folder_account(id)
@@ -649,27 +674,17 @@ fn in_deleted_items(s: &Session, id: FolderId) -> bool {
         .is_some_and(|d| s.mailbox.is_in_subtree(id, d))
 }
 
-/// Asks before a bulk delete: a Yes/No that runs `cmd` on `folder` again with `confirm`.
-fn ask(s: &mut Session, cmd: &str, folder: FolderId, title: &str, text: String) -> CmdResult {
-    Ok(dialog(
-        s,
-        "confirm",
-        json!({"title": title, "text": text, "command": cmd, "params": {"folder": folder.0, "confirm": true}}),
-    ))
-}
-
+/// Delete Folder (asks first, see [`ask_first`]).
 fn delete(s: &mut Session, p: &Value) -> CmdResult {
     let id = current_folder(s, p)?;
-    if opt_bool(p, "confirm") != Some(true) {
-        let name = s.mailbox.folder(id).map(|f| f.name.clone()).unwrap_or_default();
-        let text = if in_deleted_items(s, id) {
-            format!(
-                "Delete the folder \"{name}\" and everything in it for good? This cannot be undone once MailCraft closes."
-            )
-        } else {
-            format!("Delete the folder \"{name}\" and move everything in it to Deleted Items?")
-        };
-        return ask(s, "folder.delete", id, "Delete Folder", text);
+    let name = s.mailbox.folder(id).map(|f| f.name.clone()).unwrap_or_default();
+    let text = if in_deleted_items(s, id) {
+        format!("Permanently delete the folder \"{name}\" and everything in it? This can't be undone.")
+    } else {
+        format!("Move the folder \"{name}\" and everything in it to Deleted Items?")
+    };
+    if let Some(asked) = ask_first(s, p, "folder.delete", id, "Delete Folder", text, "Delete") {
+        return asked;
     }
     let parent = s.mailbox.folder(id).and_then(|f| f.parent);
     s.mailbox.delete_folder(id)?;
@@ -684,16 +699,17 @@ fn delete(s: &mut Session, p: &Value) -> CmdResult {
 // ---------------------------------------------------------------------------------------------------------
 // Clean up
 
+/// Delete All: every item of the folder goes to Deleted Items (asks first, see [`ask_first`]).
 fn delete_all(s: &mut Session, p: &Value) -> CmdResult {
     let id = current_folder(s, p)?;
-    if opt_bool(p, "confirm") != Some(true) {
-        let name = s.mailbox.folder(id).map(|f| f.name.clone()).unwrap_or_default();
-        let text = if in_deleted_items(s, id) {
-            format!("Delete everything in \"{name}\" for good? This cannot be undone once MailCraft closes.")
-        } else {
-            format!("Move everything in \"{name}\" to Deleted Items?")
-        };
-        return ask(s, "folder.deleteAll", id, "Delete All", text);
+    let name = s.mailbox.folder(id).map(|f| f.name.clone()).unwrap_or_default();
+    let text = if in_deleted_items(s, id) {
+        format!("Permanently delete everything in \"{name}\"? This can't be undone.")
+    } else {
+        format!("Move everything in \"{name}\" to Deleted Items?")
+    };
+    if let Some(asked) = ask_first(s, p, "folder.deleteAll", id, "Delete All", text, "Delete All") {
+        return asked;
     }
     let ids: Vec<ItemId> = s.mailbox.items_in(id).iter().map(|m| m.id).collect();
     let removed = s.mailbox.delete_items(&ids)?;
@@ -1427,9 +1443,42 @@ mod tests {
         run(&mut s, "folder.move", json!({"parent": "Archive"}));
         assert_eq!(s.mailbox.folder(a).unwrap().parent, Some(archive));
         assert_eq!(run(&mut s, "folder.move", json!({}))["dialog"], "moveFolder");
-        // Delete Folder asks first; nothing moves until the answer.
-        assert_eq!(run(&mut s, "folder.delete", json!({}))["dialog"], "confirm");
-        assert_eq!(s.mailbox.folder(a).unwrap().parent, Some(archive));
+        // Asked first; the answer names the folder.
+        let r = run(&mut s, "folder.delete", json!({}));
+        assert_eq!(r["asked"], true);
+        assert!(s.mailbox.folder(a).is_some());
+        let question = s
+            .notices
+            .iter()
+            .rev()
+            .find_map(|n| match n {
+                Notice::OpenDialog(d, p) if d == "confirm" => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(question["text"].as_str().unwrap().contains("\"A\""), "{question}");
+        assert_eq!(question["params"]["folder"], a.0);
+        let r = run(&mut s, "folder.delete", question["params"].clone());
+        assert_eq!(r["permanent"], false);
+        s.selection.folder = a;
+        let deleted = role(&s, FolderRole::DeletedItems);
+        assert_eq!(s.mailbox.folder(a).unwrap().parent, Some(deleted));
+        let r = run(&mut s, "folder.delete", json!({}));
+        assert!(r["asked"] == true && s.mailbox.folder(a).is_some());
+        let r = run(&mut s, "folder.delete", json!({"confirm": true}));
+        assert_eq!(r["permanent"], true);
+        assert!(s.mailbox.folder(a).is_none());
+        assert_ne!(s.selection.folder, a);
+        // Default folders cannot be deleted.
+        s.selection.folder = role(&s, FolderRole::Inbox);
+        assert!(matches!(s.run("folder.delete", &json!({"confirm": true})), Err(CmdError::Disabled(_))));
+    }
+
+    #[test]
+    fn deleting_a_deleted_folder_is_for_good() {
+        let mut s = session();
+        let a = FolderId(run(&mut s, "folder.new", json!({"name": "A"}))["folder"].as_u64().unwrap());
+        s.selection.folder = a;
         let r = run(&mut s, "folder.delete", json!({"confirm": true}));
         assert_eq!(r["permanent"], false);
         let deleted = role(&s, FolderRole::DeletedItems);
@@ -1440,7 +1489,7 @@ mod tests {
         assert_ne!(s.selection.folder, a);
         // Default folders cannot be deleted.
         s.selection.folder = role(&s, FolderRole::Inbox);
-        assert!(matches!(s.run("folder.delete", &json!({})), Err(CmdError::Disabled(_))));
+        assert!(matches!(s.run("folder.delete", &json!({"confirm": true})), Err(CmdError::Disabled(_))));
     }
 
     #[test]
@@ -1458,7 +1507,7 @@ mod tests {
         assert_eq!(s.mailbox.total_count(inbox), 0);
         assert!(s.selection.items.is_empty());
         assert_eq!(s.mailbox.total_count(role(&s, FolderRole::DeletedItems)), 2);
-        assert!(matches!(s.run("folder.deleteAll", &json!({})), Err(CmdError::Disabled(_))));
+        assert!(matches!(s.run("folder.deleteAll", &json!({"confirm": true})), Err(CmdError::Disabled(_))));
     }
 
     #[test]

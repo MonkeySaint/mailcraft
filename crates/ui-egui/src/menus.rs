@@ -435,6 +435,7 @@ pub fn message_row_menu(ui: &mut Ui, app: &mut App, item: u64) {
     sub(ui, app, "move", "Move", true, |ui, app| move_menu(ui, app, &t, conversation));
     if focused_inbox_active(app, folder) {
         ui.separator();
+        // The tab showing decides the way: Focused offers Other, Other offers Focused.
         if app.s.view.focused_tab {
             cmd(ui, app, "", "Move to Other", "mail.moveToOther", t.params());
             cmd(ui, app, "", "Always Move to Other", "mail.alwaysMoveToOther", t.params());

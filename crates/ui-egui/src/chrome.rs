@@ -760,6 +760,16 @@ fn search_box(ui: &mut Ui, app: &mut App, _frame: &Frame, bar: Rect, qat_end: f3
     let focus_requested = with_shell(&ctx, |st| std::mem::take(&mut st.focus_search));
     if focus_requested {
         edit.request_focus();
+        // A refiner waiting for a value: the caret (or selection) goes inside its quotes.
+        if let Some((a, b)) = with_shell(&ctx, |st| st.search_select.take()) {
+            let mut state = egui::TextEdit::load_state(&ctx, edit_id).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(a),
+                egui::text::CCursor::new(b),
+            )));
+            state.store(&ctx, edit_id);
+            ctx.request_repaint();
+        }
     }
     if edit.gained_focus() {
         app.ui.search_active = true;

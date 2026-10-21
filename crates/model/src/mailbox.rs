@@ -75,6 +75,14 @@ impl Mailbox {
         changed
     }
 
+    /// Drops the "Create New" placeholder step older profiles stored among their quick steps (the gallery
+    /// shows Create New itself now). Returns how many were dropped.
+    pub fn drop_legacy_create_new_step(&mut self) -> usize {
+        let before = self.quick_steps.len();
+        self.quick_steps.retain(|q| !q.is_legacy_create_new());
+        before.saturating_sub(self.quick_steps.len())
+    }
+
     pub fn new_local(display_name: &str) -> Mailbox {
         let mut mb = Mailbox::default();
         let name = display_name.trim();

@@ -934,3 +934,60 @@ ATTENDEE;CN=\"Ann Lee\";PARTSTAT=IN-PROCESS:mailto:ann@example.com\r\nEND:VTODO\
     assert_eq!(t.percent_complete, 40);
     assert_eq!(t.request_state, mailcraft_model::task::TaskRequestState::Accepted);
 }
+
+/// The shell's order in the Mail module: the modules' item windows, then the dialogs area.
+fn mail_window(ui: &mut egui::Ui, app: &mut App) {
+    let ctx = ui.ctx().clone();
+    super::pim_windows(&ctx, app);
+    crate::dialogs::dialogs(&ctx, app);
+}
+
+#[test]
+fn mail_new_items_open_the_full_module_windows() {
+    let mut a = app();
+    assert_eq!(a.s.view.module, mailcraft_engine::Module::Mail);
+    // Appointment: the calendar's own window (pages, recurrence, Scheduling Assistant).
+    a.run("mail.newItem", json!({"kind": "appointment"})).unwrap();
+    let mut h = harness(mail_window, a, (1400.0, 1000.0));
+    h.run_ok();
+    assert!(has(&h, "Untitled - Appointment"));
+    assert!(has(&h, "Scheduling Assistant"));
+    assert!(h.state().ui.dialogs.is_empty(), "{:?}", h.state().ui.dialogs);
+    click(&h, "Save & Close");
+    h.run_ok();
+    // Meeting (also Reply with Meeting): the meeting window.
+    h.state_mut().run("mail.newItem", json!({"kind": "recurringMeeting"}));
+    h.run_ok();
+    h.run_ok();
+    assert!(has(&h, "Untitled - Meeting"));
+    assert!(has(&h, "Appointment Recurrence"), "recurring kinds open the Recurrence dialog");
+    // Contact, contact group and task: the People and Tasks windows.
+    for (kind, title) in [
+        ("contact", "Untitled - Contact"),
+        ("contactGroup", "Untitled - Contact Group"),
+        ("task", "Untitled - Task"),
+    ] {
+        h.state_mut().run("mail.newItem", json!({"kind": kind}));
+        h.run_ok();
+        h.run_ok();
+        assert!(has(&h, title), "{kind}");
+    }
+    assert!(h.state().ui.dialogs.is_empty(), "{:?}", h.state().ui.dialogs);
+}
+
+#[test]
+fn reply_with_meeting_opens_the_meeting_window_prefilled() {
+    let mut a = app();
+    let folder = a.s.selection.folder;
+    let id = a.s.mailbox.items_in(folder).iter().find(|m| m.from.is_some()).map(|m| m.id).unwrap();
+    let subject = a.s.mailbox.mail[&id].subject.clone();
+    a.run("nav.selectItem", json!({"id": id.0})).unwrap();
+    a.run("mail.replyWithMeeting", json!({})).unwrap();
+    let mut h = harness(mail_window, a, (1400.0, 1000.0));
+    h.run_ok();
+    assert!(has(&h, &format!("{} - Meeting", subject.trim())), "{subject}");
+    assert!(has(&h, "Scheduling Assistant"));
+    let st = super::common::load(&h.ctx);
+    let ed = st.editors.appt.as_ref().expect("meeting window");
+    assert!(ed.meeting && !ed.attendees.trim().is_empty(), "{}", ed.attendees);
+}

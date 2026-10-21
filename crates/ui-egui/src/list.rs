@@ -1119,8 +1119,10 @@ fn page(ui: &Ui, app: &mut App, c: &Cached, delta: isize, extend: bool) {
         .rows
         .iter()
         .filter_map(|r| match r {
-            ListRow::Item(i) => Some(i.id.0),
-            ListRow::Group { .. } => None,
+            // Non-mail results of an All Items search open their own windows; the keys skip them, as
+            // `queries::visible_item_ids` does.
+            ListRow::Item(i) if i.kind.is_none() => Some(i.id.0),
+            ListRow::Item(_) | ListRow::Group { .. } => None,
         })
         .collect();
     // A conversation header and its first child are the same message.
@@ -1143,8 +1145,10 @@ fn page(ui: &Ui, app: &mut App, c: &Cached, delta: isize, extend: bool) {
     }
 }
 
-/// Collapses or expands a group. The engine's group commands act on the focused item's group, so an item
-/// of the group is focused first when the focus lies elsewhere.
+/// Collapses or expands the group under header `label`. The group is named explicitly: under Arrange by
+/// Categories a message sits in every group of its categories, so its focus alone does not say which header
+/// was clicked. The commands need a selected item, so an item of the group is focused first when the focus
+/// lies elsewhere.
 fn toggle_group(ui: &Ui, app: &mut App, label: &str, collapsed: bool) {
     let ids = queries::group_items(&app.s, label);
     let Some(first) = ids.first() else { return };
@@ -1153,7 +1157,7 @@ fn toggle_group(ui: &Ui, app: &mut App, label: &str, collapsed: bool) {
         run(ui, app, "nav.selectItem", json!({ "id": first.0 }));
     }
     let id = if collapsed { "view.expandGroup" } else { "view.collapseGroup" };
-    run(ui, app, id, json!({}));
+    run(ui, app, id, json!({ "label": label }));
 }
 
 fn group_row(ui: &mut Ui, app: &mut App, r: Rect, label: &str, count: usize, collapsed: bool) {
@@ -1331,11 +1335,13 @@ fn item_row(
     let th = app.theme.clone();
     let id = row.id.0;
     // A conversation header shows the same message as its first child row: give it its own widget ids.
-    let part: u8 = if row.conversation.as_ref().is_some_and(|c| c.header) { 1 } else { 0 };
+    // A message listed again (under each of its categories) gets its own ids too.
+    let part: u32 =
+        if row.conversation.as_ref().is_some_and(|c| c.header) { 1 } else { 0 } + 2 * u32::from(row.repeat);
     let resp = ui.interact(r, Id::new(("mailcraft.list.row", id, part)), Sense::click_and_drag());
     let hovered = resp.contains_pointer() && !egui::DragAndDrop::has_any_payload(ui.ctx());
     // The hovered message for hover shortcuts; header rows leave it to the message's own (child) row.
-    if part == 0 {
+    if part.is_multiple_of(2) && row.kind.is_none() {
         if hovered {
             app.ui.hover_row = Some(id);
         } else if app.ui.hover_row == Some(id) {
@@ -1370,6 +1376,16 @@ fn item_row(
         [pos2(r.left() + 8.0, r.bottom() - 0.5), pos2(r.right(), r.bottom() - 0.5)],
         Stroke::new(0.5, th.separator),
     );
+
+    // A non-mail result of an All Items search opens its own item window; message actions do not apply.
+    if let Some(window) = row.kind.as_deref() {
+        let accessible = row.accessible.trim_end_matches([',', ' ']).to_owned();
+        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &accessible));
+        if resp.double_clicked() || (resp.clicked() && frame.single_pane) {
+            crate::dialogs::open(app, window, json!({ "id": id }));
+        }
+        return;
+    }
 
     // Quick actions sit on top of the row (added after it, so they take the click).
     if let (Some(g), Some(cv)) = (glyph, conv) {
@@ -2100,6 +2116,80 @@ mod tests {
         h.run();
         let rows = queries::list_rows(&h.state().s);
         assert!(matches!(rows.first(), Some(ListRow::Group { collapsed: false, .. })));
+    }
+
+    #[test]
+    fn category_header_click_collapses_that_category() {
+        let mut s = sample_session();
+        let _ = s.run("view.focusedInbox", &json!({"on": false}));
+        let inbox = s.selection.folder;
+        let ids: Vec<mailcraft_model::ItemId> = s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
+        let newest = s.mailbox.items_in(inbox).iter().map(|m| m.received.unix).max().unwrap();
+        for id in &ids {
+            s.mailbox.mail.get_mut(id).unwrap().categories.clear();
+        }
+        // The newest message is in Red and Blue, so it is the first item under the Red header too.
+        let both = ids[0];
+        let m = s.mailbox.mail.get_mut(&both).unwrap();
+        m.categories = vec!["Red category".into(), "Blue category".into()];
+        m.received.unix = newest + 60;
+        s.mailbox.mail.get_mut(&ids[1]).unwrap().categories = vec!["Red category".into()];
+        s.run("view.arrangeBy", &json!({"key": "categories"})).unwrap();
+        let _ = s.run("view.sort", &json!({"order": "ascending"}));
+        assert_eq!(queries::group_items(&s, "Red category").first(), Some(&both));
+        let collapsed = |s: &Session, name: &str| {
+            queries::list_rows(s)
+                .into_iter()
+                .any(|r| matches!(r, ListRow::Group { label, collapsed: true, .. } if label == name))
+        };
+        let mut h = harness(App::new(s), vec2(420.0, 1400.0));
+        h.run();
+        h.query_all_by_label_contains("Red category: ").next().unwrap().click();
+        h.run();
+        assert!(collapsed(&h.state().s, "Red category"), "the clicked header collapses");
+        assert!(!collapsed(&h.state().s, "Blue category"), "the other category stays open");
+        h.query_all_by_label_contains("Red category: ").next().unwrap().click();
+        h.run();
+        assert!(!collapsed(&h.state().s, "Red category"));
+        // The engine checks a named group exists.
+        assert!(h.state_mut().s.run("view.collapseGroup", &json!({"label": "No such group"})).is_err());
+    }
+
+    #[test]
+    fn page_keys_stay_on_mail_in_an_all_items_search() {
+        let mut s = sample_session();
+        let subject = s.mailbox.appointments.values().next().map(|a| a.subject.clone()).unwrap();
+        let word = subject.split_whitespace().next().unwrap().to_owned();
+        s.run("search.query", &json!({"text": word})).unwrap();
+        s.run("search.scope", &json!({"scope": "allItems"})).unwrap();
+        let rows = queries::list_rows(&s);
+        let last_row_is_other = rows.iter().rev().find_map(|r| match r {
+            ListRow::Item(i) => Some(i.kind.is_some()),
+            ListRow::Group { .. } => None,
+        });
+        assert_eq!(last_row_is_other, Some(true), "non-mail hits are listed last");
+        let mail = queries::visible_item_ids(&s);
+        let first = *mail.first().expect("the search finds mail too");
+        let folder = s.selection.folder;
+        let mut h = harness(App::new(s), vec2(420.0, 1400.0));
+        h.run();
+        h.state_mut().run("nav.selectItem", json!({"id": first.0}));
+        let subject = h.state().s.mailbox.mail[&first].subject.clone();
+        h.query_all_by_label_contains(&format!("Subject {subject}")).next().unwrap().click();
+        h.run();
+        for (mods, key) in [
+            (Modifiers::SHIFT, Key::End),
+            (Modifiers::NONE, Key::PageDown),
+            (Modifiers::SHIFT, Key::PageDown),
+        ] {
+            h.key_press_modifiers(mods, key);
+            h.run();
+            let st = &h.state().s;
+            assert_eq!(st.selection.folder, folder, "{key:?} keeps the search results");
+            let focus = st.selection.focus.unwrap();
+            assert!(st.mailbox.mail.contains_key(&focus), "{key:?} stays on mail");
+            assert_eq!(Some(&focus), mail.last());
+        }
     }
 
     #[test]

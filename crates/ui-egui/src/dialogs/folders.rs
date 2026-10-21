@@ -46,6 +46,8 @@ pub(crate) fn last_error(app: &App) -> String {
 struct PickState {
     sel: Option<u64>,
     error: String,
+    /// Always Move Conversation: keep moving the conversation (unchecked = stop).
+    keep: bool,
 }
 
 fn picker(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -77,7 +79,7 @@ fn picker(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         ctx,
         app,
         uid,
-        |_: &App| PickState { sel: initial, error: String::new() },
+        |_: &App| PickState { sel: initial, error: String::new(), keep: true },
         |st, app| {
             for (key, v) in take_replies(ctx, uid) {
                 if key == "newFolder" {
@@ -89,7 +91,22 @@ fn picker(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 if d.name == "moveFolder" || d.name == "copyFolder" {
                     muted(ui, app, &format!("Folder: {}", d.str("path")));
                 }
-                let ev = folder_tree(ui, app, &mut st.sel, pick, ("pick", uid), 260.0);
+                let always = d.name == "alwaysMoveConversation";
+                let ev = ui
+                    .add_enabled_ui(!always || st.keep, |ui| {
+                        folder_tree(ui, app, &mut st.sel, pick, ("pick", uid), 260.0)
+                    })
+                    .inner;
+                if always {
+                    ui.checkbox(&mut st.keep, "Keep moving new messages in this conversation");
+                    let path = d.str("currentPath");
+                    if d.bool("active") && !path.is_empty() {
+                        muted(ui, app, &format!("New messages in this conversation go to: {path}"));
+                    } else {
+                        muted(ui, app, "This conversation is not being moved yet.");
+                    }
+                }
+                let can_ok = st.sel.is_some() || (always && !st.keep);
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
                 }
@@ -103,19 +120,31 @@ fn picker(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         out =
                             Out::open("createFolder", child(uid, "newFolder", json!({"parent": new_parent})));
                     }
-                    primary(ui, app, st.sel.is_some(), "OK")
+                    primary(ui, app, can_ok, "OK")
                 });
-                let enter = st.sel.is_some() && common::enter_pressed(ui);
-                if (ok || ev.activated || enter)
-                    && matches!(out, Out::Keep)
-                    && let Some(f) = st.sel
-                {
-                    out = finish_pick(ctx, app, d, f, &mut st.error);
+                let enter = can_ok && common::enter_pressed(ui);
+                if (ok || ev.activated || enter) && matches!(out, Out::Keep) {
+                    if always && !st.keep {
+                        out = stop_always_move(app, d, &mut st.error);
+                    } else if let Some(f) = st.sel {
+                        out = finish_pick(ctx, app, d, f, &mut st.error);
+                    }
                 }
                 out
             })
         },
     )
+}
+
+/// Always Move Conversation with its box unchecked: later messages of the conversation stay where they
+/// arrive (the messages already moved stay in their folder).
+fn stop_always_move(app: &mut App, d: &Dlg<'_>, error: &mut String) -> Out {
+    if app.run("mail.alwaysMoveConversation", json!({"ids": d.ids(), "stop": true})).is_some() {
+        Out::Close
+    } else {
+        *error = last_error(app);
+        Out::Keep
+    }
 }
 
 fn finish_pick(ctx: &Context, app: &mut App, d: &Dlg<'_>, f: u64, error: &mut String) -> Out {
@@ -307,11 +336,17 @@ fn rename_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     )
 }
 
-/// Yes/No confirmation: Yes runs `command` with `params`. With `dontAsk` (a profile setting key) it offers
-/// "Don't ask me again", which turns that setting on when the answer is Yes.
+/// A yes/no question: Yes runs `command` with `params`. `yes` / `no` rename the buttons. `dontAsk` adds
+/// "Don't ask me again": with `dontAsk: true` its state goes to the command as `dontAskAgain`; with a
+/// profile setting key, Yes turns that setting on.
 fn confirm(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let title = if d.str("title").is_empty() { "MailCraft".to_owned() } else { d.str("title") };
+    let label =
+        |key: &str, default: &str| if d.str(key).is_empty() { default.to_owned() } else { d.str(key) };
+    let (yes, no) = (label("yes", "Yes"), label("no", "No"));
+    let pass_on = d.get("dontAsk").and_then(Value::as_bool).unwrap_or(false);
     let dont_ask_key = d.str("dontAsk");
+    let offer = pass_on || !dont_ask_key.is_empty();
     let state_id = egui::Id::new(("mc-confirm-dont-ask", d.uid));
     let mut dont_ask = ctx.data(|m| m.get_temp::<bool>(state_id)).unwrap_or(false);
     let out = window(ctx, app, d, &title, 380.0, |ui, app| {
@@ -320,20 +355,27 @@ fn confirm(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             app.icons.paint(ui, r, "warning", app.theme.flag);
             ui.label(d.str("text"));
         });
-        if !dont_ask_key.is_empty() {
+        if offer {
             ui.checkbox(&mut dont_ask, "Don't ask me again");
         }
         footer(ui, |ui| {
-            if btn(ui, "No") {
+            if btn(ui, &no) {
                 return Out::Close;
             }
-            if primary(ui, app, true, "Yes") {
+            if primary(ui, app, true, &yes) {
                 if dont_ask && !dont_ask_key.is_empty() {
                     app.run("options.set", json!({"key": dont_ask_key, "value": true}));
                 }
                 let cmd = d.str("command");
                 if !cmd.is_empty() {
-                    app.run(&cmd, d.get("params").cloned().unwrap_or(json!({})));
+                    let mut params = d.get("params").cloned().unwrap_or(json!({}));
+                    if pass_on
+                        && dont_ask
+                        && let Some(o) = params.as_object_mut()
+                    {
+                        o.insert("dontAskAgain".into(), json!(true));
+                    }
+                    app.run(&cmd, params);
                 }
                 if let Some((to, key)) = d.reply_to() {
                     send_reply(ctx, to, &key, json!(true));

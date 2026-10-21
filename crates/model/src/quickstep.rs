@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{FolderId, Importance};
 
-/// Quick Steps actions (Home › Quick Steps). Defaults: Move to ?, To Manager, Team Email, Done, Reply & Delete,
-/// Create New.
+/// Quick Steps actions (Home › Quick Steps). Defaults: Move to ?, To Manager, Team Email, Done, Reply & Delete
+/// (the gallery adds a fixed Create New entry, which is not a stored step).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuickStepAction {
     /// `None` = ask for the folder on first use.
@@ -76,8 +76,16 @@ impl QuickStep {
                 vec![QuickStepAction::Reply, QuickStepAction::Delete],
                 "Opens a reply and moves the original to Deleted Items.",
             ),
-            step(6, "Create New", Vec::new(), "Sets up a new quick step."),
         ]
+    }
+
+    /// The gallery's fixed "Create New" entry. Profiles made by MailCraft 0.1.x stored it as a step of its
+    /// own (no actions); [`crate::Mailbox::drop_legacy_create_new_step`] removes that copy.
+    pub const CREATE_NEW: &'static str = "Create New";
+
+    /// True for the stored "Create New" placeholder of an older profile.
+    pub fn is_legacy_create_new(&self) -> bool {
+        self.actions.is_empty() && self.name.trim().eq_ignore_ascii_case(Self::CREATE_NEW)
     }
     /// True when the step still needs its first-use setup (an unset target folder, or no actions at all).
     pub fn needs_setup(&self) -> bool {

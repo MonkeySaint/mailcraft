@@ -231,6 +231,39 @@ fn move_to_folder_picker_moves_the_selection() {
 }
 
 #[test]
+fn always_move_conversation_can_be_stopped_from_its_dialog() {
+    let mut app = sample_app();
+    let item = select_first(&mut app);
+    let target = projects(&app);
+    app.run("mail.alwaysMoveConversation", json!({})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["alwaysMoveConversation"]);
+    assert!(h.query_by_label("This conversation is not being moved yet.").is_some());
+    h.get_by_label("Projects").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    let marked =
+        |h: &Harness<'_, App>| h.state().s.mailbox.mail.get(&ItemId(item)).and_then(|m| m.always_move_to);
+    assert_eq!(marked(&h), Some(FolderId(target)));
+    // Opened again: it says where the conversation goes and unticking the box stops it.
+    h.state_mut().run("mail.alwaysMoveConversation", json!({"ids": [item]})).unwrap();
+    step(&mut h);
+    assert_eq!(names(&h), ["alwaysMoveConversation"]);
+    let path = h.state().s.mailbox.folder_path(FolderId(target));
+    assert!(h.query_by_label(&format!("New messages in this conversation go to: {path}")).is_some());
+    h.get_by_label("Keep moving new messages in this conversation").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert_eq!(marked(&h), None);
+    // The message already moved stays where it went.
+    assert_eq!(h.state().s.mailbox.mail.get(&ItemId(item)).map(|m| m.folder.0), Some(target));
+}
+
+#[test]
 fn new_folder_dialog_creates_a_folder() {
     let mut app = sample_app();
     app.run("folder.new", json!({})).unwrap();
@@ -620,7 +653,7 @@ fn ignore_prompt_offers_dont_ask_again() {
     assert_eq!(names(&h), ["confirm"]);
     h.get_by_label("Don't ask me again").click();
     step(&mut h);
-    h.get_by_label("Yes").click();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Ignore Conversation").click();
     step(&mut h);
     let app = h.state();
     assert!(app.s.mailbox.mail[&ItemId(item)].ignored);

@@ -140,7 +140,9 @@ fn collapse_this_group_and_collapse_all_work_for_every_arrangement() {
             groups(&rows)
         );
         s.run("view.expandAll", &json!({})).expect("expand all");
-        assert_eq!(item_rows(&list_rows(&s)).len(), view_item_ids(&s).len());
+        // Arrange by Categories lists a message under each of its categories: count each once.
+        let shown: std::collections::BTreeSet<_> = item_rows(&list_rows(&s)).iter().map(|i| i.id).collect();
+        assert_eq!(shown.len(), view_item_ids(&s).len());
     }
 }
 

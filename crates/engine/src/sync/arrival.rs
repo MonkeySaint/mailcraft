@@ -3,10 +3,11 @@
 //! 1. The Junk Email filter ([`crate::junk::on_new_mail`]); what it moves or deletes goes no further. Voting
 //!    responses to my messages are then recorded on the message they answer
 //!    ([`crate::cmd::compose::record_vote`]), so the tally keeps them whatever happens to the responses.
-//!    Messages joining a conversation the user ignores (`mail.ignore`) are marked ignored and go to Deleted
-//!    Items, and go no further.
-//! 2. Focused Inbox sender overrides: mail from a sender marked Always Move to Other is classified Other
-//!    ([`crate::cmd::mail::apply_focus_overrides`]).
+//!    Mail in a conversation the user chose to Ignore goes straight to Deleted Items (marked ignored too)
+//!    and goes no further ([`crate::cmd::mail::ignore_arrivals`]); mail in a conversation the user chose
+//!    to Always Move goes to its folder ([`crate::cmd::mail::always_move_arrivals`]).
+//! 2. Focused Inbox: each message is classified Focused or Other ([`super::focus`]: the user's Always Move
+//!    to Focused / Other senders first, then replies to me and people I know, then bulk-mail signals).
 //! 3. The rules for received messages ([`crate::cmd::rules::exec::on_new_mail`]).
 //! 4. Scheduling messages, over what is still outside Deleted Items and Junk Email:
 //!    - meeting requests and cancellations go to File › Options › Calendar › Automatic accept or decline
@@ -48,7 +49,11 @@ pub const MAX_PROCESSED: usize = 5_000;
 pub struct ArrivalReport {
     /// Moved to Junk Email or deleted by the junk filter.
     pub junk: Vec<ItemId>,
-    /// Classified Other by a sender override.
+    /// In an ignored conversation: moved to Deleted Items.
+    pub ignored: Vec<ItemId>,
+    /// In a conversation the user chose to Always Move: moved to its folder.
+    pub conversation_moved: Vec<ItemId>,
+    /// Classified Other (Focused Inbox).
     pub focused_other: Vec<ItemId>,
     /// Items that matched a receive rule.
     pub rules_matched: usize,
@@ -66,8 +71,6 @@ pub struct ArrivalReport {
     pub votes_recorded: Vec<ItemId>,
     /// Meeting requests put on the calendar as Tentative until they are answered.
     pub meetings_placed: Vec<ItemId>,
-    /// Messages in an ignored conversation, moved to Deleted Items.
-    pub ignored: Vec<ItemId>,
 }
 
 /// Processes newly arrived mail `ids` (see the module docs).
@@ -83,13 +86,13 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
     report.junk = junk.moved.iter().chain(junk.deleted.iter()).copied().collect();
     let gone: BTreeSet<ItemId> = report.junk.iter().copied().collect();
     let ids: Vec<ItemId> = ids.into_iter().filter(|i| !gone.contains(i)).collect();
-    // Votes are recorded before anything files the responses away (rules, Deleted Items).
+    // Votes are recorded before anything files the responses away (Ignore, rules, Deleted Items).
     report.votes_recorded = record_votes(s, &ids);
-    // Ignored conversations: later messages go straight to Deleted Items.
     report.ignored = crate::cmd::mail::ignore_arrivals(s, &ids);
     let gone: BTreeSet<ItemId> = report.ignored.iter().copied().collect();
     let ids: Vec<ItemId> = ids.into_iter().filter(|i| !gone.contains(i)).collect();
-    report.focused_other = crate::cmd::mail::apply_focus_overrides(s, &ids);
+    report.conversation_moved = crate::cmd::mail::always_move_arrivals(s, &ids);
+    report.focused_other = super::focus::on_new_mail(s, &ids);
     report.rules_matched = crate::cmd::rules::exec::on_new_mail(s, &ids).matched;
     // What the rules left outside Deleted Items and Junk Email, newest last.
     let mut ids: Vec<ItemId> = ids.into_iter().filter(|i| still_in_mail(s, *i)).collect();
@@ -511,6 +514,104 @@ mod tests {
         assert_eq!(s.mailbox.mail[&ann].focus, FocusClass::Focused);
         assert!(s.mailbox.mail[&spam].categories.is_empty(), "rules skip junk");
         assert_eq!(on_new_mail(&mut s, &[]), ArrivalReport::default());
+    }
+
+    #[test]
+    fn mail_in_an_ignored_conversation_goes_to_deleted_items() {
+        let mut s = session();
+        let first = arrive(
+            &mut s,
+            "From: ann@example.com\nSubject: Party plans\nMessage-ID: <p1@example.com>\n\nx\n",
+        );
+        let other = arrive(&mut s, "From: bo@example.org\nSubject: Budget\n\nx\n");
+        on_new_mail(&mut s, &[first, other]);
+        // Ignore asks first; the answer (with "don't ask again") ignores and remembers.
+        s.selection.items = vec![first];
+        s.selection.focus = Some(first);
+        let r = s.run("mail.ignore", &json!({})).unwrap();
+        assert_eq!(r["asked"], true);
+        let r =
+            s.run("mail.ignore", &json!({"ids": [first.0], "confirm": true, "dontAskAgain": true})).unwrap();
+        assert_eq!(r["ignored"], true);
+        assert!(s.settings.bool(crate::cmd::mail::IGNORE_DONT_ASK));
+        let deleted = role(&s, FolderRole::DeletedItems);
+        assert_eq!(s.mailbox.mail[&first].folder, deleted);
+        // A reply (by References) follows it, and so does a reply to that reply. Mail that only shares the
+        // subject (no header link to the ignored messages) stays in the Inbox, as does unrelated mail.
+        let reply = arrive(
+            &mut s,
+            "From: cy@example.net\nSubject: RE: Party plans\nMessage-ID: <p2@example.net>\n\
+             References: <p1@example.com>\n\nx\n",
+        );
+        let same_topic = arrive(&mut s, "From: dee@example.com\nSubject: FW: Party plans\n\nx\n");
+        let unrelated = arrive(&mut s, "From: ann@example.com\nSubject: Lunch\n\nx\n");
+        let r = on_new_mail(&mut s, &[reply, same_topic, unrelated]);
+        assert_eq!(r.ignored, vec![reply]);
+        assert_eq!(s.mailbox.mail[&reply].folder, deleted);
+        assert!(s.mailbox.mail[&reply].ignored);
+        let inbox = role(&s, FolderRole::Inbox);
+        for id in [same_topic, unrelated] {
+            assert_eq!(s.mailbox.mail[&id].folder, inbox);
+            assert!(!s.mailbox.mail[&id].ignored);
+        }
+        assert_eq!(r.rules_matched, 0);
+        let second = arrive(
+            &mut s,
+            "From: eve@example.org\nSubject: RE: Party plans\nIn-Reply-To: <p2@example.net>\n\nx\n",
+        );
+        assert_eq!(on_new_mail(&mut s, &[second]).ignored, vec![second], "linked through the first reply");
+        // With "don't ask again" on, the next Ignore runs at once.
+        s.selection.items = vec![unrelated];
+        s.selection.focus = Some(unrelated);
+        assert_eq!(s.run("mail.ignore", &json!({})).unwrap()["ignored"], true);
+        // Nothing ignored: no work and nothing caught.
+        let mut fresh = session();
+        let m = arrive(&mut fresh, "From: ann@example.com\nSubject: Party plans\n\nx\n");
+        assert!(on_new_mail(&mut fresh, &[m]).ignored.is_empty());
+    }
+
+    #[test]
+    fn ignored_mail_that_cannot_move_stays_in_the_pipeline() {
+        let mut s = session();
+        let first = arrive(
+            &mut s,
+            "From: ann@example.com\nSubject: Party plans\nMessage-ID: <p1@example.com>\n\nx\n",
+        );
+        s.selection.items = vec![first];
+        s.selection.focus = Some(first);
+        s.run("mail.ignore", &json!({"ids": [first.0], "confirm": true})).unwrap();
+        // The account loses its Deleted Items folder.
+        let deleted = role(&s, FolderRole::DeletedItems);
+        s.mailbox.folders.get_mut(&deleted).unwrap().role = None;
+        s.run(
+            "rules.create",
+            &json!({"name": "Party", "conditions": [{"SubjectContains": ["party"]}],
+                    "actions": [{"AssignCategory": "Red category"}]}),
+        )
+        .unwrap();
+        let reply = arrive(
+            &mut s,
+            "From: cy@example.net\nSubject: RE: Party plans\nReferences: <p1@example.com>\n\nx\n",
+        );
+        let r = on_new_mail(&mut s, &[reply]);
+        assert!(r.ignored.is_empty(), "not reported as ignored: it is still in the Inbox");
+        assert_eq!(s.mailbox.mail[&reply].folder, role(&s, FolderRole::Inbox));
+        assert_eq!(r.rules_matched, 1, "the rules still see it");
+        assert_eq!(s.mailbox.mail[&reply].categories, vec!["Red category".to_string()]);
+    }
+
+    #[test]
+    fn bulk_mail_is_classified_other_on_arrival() {
+        let mut s = session();
+        let news = arrive(
+            &mut s,
+            "From: letters@example.org\nList-Id: <letters.example.org>\nSubject: Weekly\n\nx\n",
+        );
+        let ann = arrive(&mut s, "From: ann@example.com\nSubject: Hi\n\nx\n");
+        let r = on_new_mail(&mut s, &[news, ann]);
+        assert_eq!(r.focused_other, vec![news]);
+        assert_eq!(s.mailbox.mail[&news].focus, FocusClass::Other);
+        assert_eq!(s.mailbox.mail[&ann].focus, FocusClass::Focused);
     }
 
     #[test]

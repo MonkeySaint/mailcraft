@@ -375,11 +375,11 @@ item | Process Marked Headers | sync | sendReceive.processMarked | | P
 item | Process Marked Headers in All Folders | | sendReceive.processMarked | {"allFolders":true} | O
 
 menu downloadPreferences
-item | Download Full Items | | sendReceive.preferences | {"mode":"full"} | F
-item | Download Headers and Then Full Items | | sendReceive.preferences | {"mode":"headersThenFull"} | D
-item | Download Headers | | sendReceive.preferences | {"mode":"headers"} | H
+item | Download Full Items | | sendReceive.preferences | {"mode":"full"} | F | on=dl:full
+item | Download Headers and Then Full Items | | sendReceive.preferences | {"mode":"headersThenFull"} | D | on=dl:headersThenFull
+item | Download Headers | | sendReceive.preferences | {"mode":"headers"} | H | on=dl:headers
 sep
-item | On Slow Connections Download Only Headers | | sendReceive.preferences | {"slowHeadersOnly":"toggle"} | S
+item | On Slow Connections Download Only Headers | | sendReceive.preferences | {"slowHeadersOnly":"toggle"} | S | on=slowHeaders
 
 menu moreSendReceive
 item | Download Headers | envelope-open | sendReceive.downloadHeaders | | H
@@ -466,7 +466,7 @@ menu moreHelp
 item | About MailCraft | info | help.about | | A
 
 menu searchCategorized
-dyn | categories | search.refine | {"kind":"categorized","value":"$name"}
+dyn | searchCategories | search.refine | {"kind":"categorized","value":"$name"}
 sep
 item | Any Category | | search.refine | {"kind":"categorized","value":"any"} | A | on=tok:category:any
 item | No Categories | | search.refine | {"kind":"categorized","value":"none"} | N | on=tok:category:none
@@ -499,7 +499,7 @@ sub | Size | | searchSize | | Z
 item | Folder | folder | search.refine | {"kind":"folder"} | O
 sep
 item | View Items Expiring Soon | | search.refine | {"kind":"expiringSoon"} | V | on=tok:expires:soon
-item | Add Form Field... | plus | search.refine | | A
+item | Add Form Field... | plus | search.refine | {"kind":"formField"} | A
 
 menu searchSize
 item | Tiny | | search.refine | {"kind":"size","value":"tiny"} | T | on=tok:size:tiny
@@ -520,7 +520,7 @@ item | Advanced Find... | search | search.advancedFind | | F
 item | Search Options... | settings | options.open | {"page":"search"} | O
 
 menu searchLocations
-dyn | accounts | search.scope | {"store":"$name","on":true}
+dyn | searchStores | search.scope | {"store":"$name","on":"$!on"}
 
 menu moreSearch
 item | Advanced Find... | search | search.advancedFind | | F

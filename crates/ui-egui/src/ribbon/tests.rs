@@ -732,6 +732,48 @@ fn search_tab_recent_searches_and_toggles() {
 }
 
 #[test]
+fn search_tools_locations_categories_and_empty_recent_searches() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let mem = state::Mem::default();
+    // No Recent Searches is a greyed-out placeholder.
+    let recent = state::expand_items(&app, Surface::Main, &mem, &defs().menus["recentSearches"]);
+    assert!(matches!(recent.first(), Some(state::Resolved::Cmd { disabled: Some(_), .. })), "{recent:?}");
+    // Locations to Search: every store checked; a click leaves it out, the next puts it back.
+    let menu = &defs().menus["searchLocations"];
+    let stores = state::expand_items(&app, Surface::Main, &mem, menu);
+    let Some(state::Resolved::Cmd { on, action, .. }) = stores.first().cloned() else { panic!("{stores:?}") };
+    assert_eq!(on, Some(true));
+    assert_eq!(action.params["on"], false);
+    assert!(app.run(&action.cmd, action.params.clone()).is_some());
+    let stores = state::expand_items(&app, Surface::Main, &mem, menu);
+    let Some(state::Resolved::Cmd { on, action, .. }) = stores.first().cloned() else { panic!("{stores:?}") };
+    assert_eq!(on, Some(false));
+    assert_eq!(action.params["on"], true);
+    // Categorized: alphabetical, checked from the query's category: terms (not the focused message).
+    let cats = state::dyn_items(&app, Surface::Main, "searchCategories");
+    let names: Vec<String> = cats.iter().map(|d| d.label.to_lowercase()).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+    assert!(cats.iter().all(|d| !d.on));
+    let first = cats.first().map(|d| d.label.clone()).unwrap();
+    app.run("search.refine", serde_json::json!({"kind": "categorized", "value": first}));
+    let cats = state::dyn_items(&app, Surface::Main, "searchCategories");
+    assert!(cats.first().is_some_and(|d| d.on), "{}", app.s.view.search);
+    assert!(cats.iter().skip(1).all(|d| !d.on));
+    let names: Vec<String> =
+        state::dyn_items(&app, Surface::Main, "categories").iter().map(|d| d.label.to_lowercase()).collect();
+    assert_eq!(names, sorted, "Categorize lists categories alphabetically too");
+    // Quick Steps: the stored steps, then the fixed Create New entry.
+    let steps = state::dyn_items(&app, Surface::Main, "quicksteps");
+    assert_eq!(steps.last().map(|d| d.label.as_str()), Some("Create New"));
+    assert_eq!(steps.iter().filter(|d| d.label == "Create New").count(), 1);
+    // Download Preferences show their state.
+    assert!(state::is_on(&app, Surface::Main, &mem, "dl:full"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "dl:headers"));
+}
+
+#[test]
 fn module_view_galleries_and_calendar_view_commands() {
     let mut app = App::new(mailcraft_engine::sample::sample_session());
     let tasks: Vec<String> =

@@ -161,6 +161,10 @@ pub struct MailItem {
     /// Properties › "Do not AutoArchive this item": AutoArchive leaves it where it is.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_auto_archive: bool,
+    /// Always Move Conversation: later messages of this item's conversation go to this folder on arrival.
+    /// Local only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_move_to: Option<FolderId>,
 }
 
 impl MailItem {
@@ -310,6 +314,7 @@ impl MailItem {
             pinned,
             votes,
             no_auto_archive,
+            always_move_to,
         } = old;
         self.id = *id;
         self.folder = *folder;
@@ -326,6 +331,7 @@ impl MailItem {
         self.pinned = *pinned;
         self.votes = votes.clone();
         self.no_auto_archive = *no_auto_archive;
+        self.always_move_to = *always_move_to;
     }
 }
 

@@ -1546,6 +1546,7 @@ fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
 
 pub mod arrival;
 pub mod cmds;
+pub mod focus;
 #[cfg(not(target_arch = "wasm32"))]
 mod jmap;
 #[cfg(not(target_arch = "wasm32"))]

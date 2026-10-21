@@ -104,14 +104,26 @@ fn default_categories() {
 fn default_quick_steps() {
     let q = QuickStep::defaults();
     let names: Vec<&str> = q.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["Move to: ?", "To Manager", "Team Email", "Done", "Reply & Delete", "Create New"]);
+    assert_eq!(names, ["Move to: ?", "To Manager", "Team Email", "Done", "Reply & Delete"]);
     let ids: HashSet<u64> = q.iter().map(|s| s.id).collect();
-    assert_eq!(ids.len(), 6);
+    assert_eq!(ids.len(), 5);
+    assert!(q.iter().all(|s| !s.is_legacy_create_new()));
+    // An older profile's stored Create New step is dropped on load; a real step of that name stays.
+    let mut mb = crate::Mailbox { quick_steps: q.clone(), ..Default::default() };
+    mb.quick_steps.push(QuickStep { id: 6, name: "Create New".into(), ..Default::default() });
+    mb.quick_steps.push(QuickStep {
+        id: 7,
+        name: "Create New".into(),
+        actions: vec![QuickStepAction::MarkRead],
+        ..Default::default()
+    });
+    assert_eq!(mb.drop_legacy_create_new_step(), 1);
+    assert_eq!(mb.quick_steps.len(), 6);
+    assert_eq!(mb.drop_legacy_create_new_step(), 0);
     assert!(q.iter().all(|s| !s.tooltip.is_empty()));
     assert!(q[0].actions.contains(&QuickStepAction::MoveTo(None)));
     assert_eq!(q[4].actions, vec![QuickStepAction::Reply, QuickStepAction::Delete]);
     assert!(q[0].needs_setup());
     assert!(q[1].needs_setup());
     assert!(!q[4].needs_setup());
-    assert!(q[5].needs_setup());
 }
