@@ -2,21 +2,21 @@
 
 What changed in each MailCraft release. Help › What's New shows the newest entries from this file.
 
-## Unreleased
+## 0.2.0
 
-- Notes: the Notes List and Last 7 Days views are tables with Subject, Created, Modified and Categories
-  columns; click a header to sort.
-- Notes and Calendar views: View Settings has columns, sort, filter, other settings and conditional
-  formatting; the Calendar's List and Active views also group by a column and rename column headers.
-- Saved views show in Change View with the current view checked; Manage Views can make, rename, modify and
-  delete them, for one folder or every folder of the module.
-- Forwarding a note attaches it as a text file.
-- Update Folder and Send/Receive All Folders download internet calendars again.
-- Create New Folder makes calendar, contact, task, note and journal folders anywhere, and Create New Blank
-  Calendar asks where the calendar goes.
-- The Calendar ribbon shows Go to Date and Calendar Options, and its toggles follow the calendar's own view.
-- New Data File asks for a name first.
-- Help: topics for every module with search, a step-by-step training, and links to the issue tracker.
+- Data files: Remove keeps the data file so File › Open Data File can open it again; Data File Properties.
+- Close All Items asks before closing edited appointment, contact and task windows.
+- Open in New Window opens a second main window; read windows close or move on when their item is deleted
+  or moved.
+- Focused Inbox sorts new mail by itself; Ignore and Always Move Conversation also catch later replies.
+- Compose: Cut, Copy and Paste on the ribbon use the system clipboard; Format Painter, full Font and
+  Paragraph dialogs, More Colors, style sets, building blocks, screenshots, equations, a thesaurus and
+  Read Aloud.
+- People, Tasks, Notes and Calendar have table views with column sets, sorting, filters, conditional
+  formatting and saved views.
+- Update Folder and Send/Receive All Folders download internet calendars again; Create New Folder makes
+  calendar, contact, task, note and journal folders.
+- Help: topics for every module with search, a training tour and What's New.
 - AutoArchive, S/MIME signing and encryption, and many more File › Options settings take effect.
 
 ## 0.1.1

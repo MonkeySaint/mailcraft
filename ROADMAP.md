@@ -4,8 +4,8 @@ MailCraft is a clean-room, open-source desktop mail client in Rust, modelled on 
 workflow. This file tracks what is done, what is next, and an honest estimate of how close each area is to
 Outlook. It is updated with every commit.
 
-Status: **pre-alpha** (2026-10-11). Repository: https://github.com/MonkeySaint/mailcraft. Tags: v0.1.0 (commit 23,
-unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release).
+Status: **pre-alpha** (2026-10-21). Repository: https://github.com/MonkeySaint/mailcraft. Tags: v0.1.0 (commit 23,
+unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release), v0.2.0 (after round 5).
 
 ## Milestones
 
