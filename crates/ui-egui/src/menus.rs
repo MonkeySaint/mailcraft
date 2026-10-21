@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use egui::{Atom, Button, Color32, Id, Rect, Ui, vec2};
 use serde_json::{Value, json};
 
+use mailcraft_engine::cmd::quicksteps;
 use mailcraft_engine::queries;
 use mailcraft_model::{AccountId, ArrangeBy, FlagState, FolderId, FolderRole, ItemId, ListFilter, SortOrder};
 
@@ -152,6 +153,8 @@ struct Targets {
     common: BTreeSet<String>,
     any_flag: bool,
     all_complete: bool,
+    /// The Follow Up entry every target's flag came from (checked in the menu).
+    follow_up: Option<&'static str>,
 }
 
 impl Targets {
@@ -165,7 +168,14 @@ impl Targets {
                 Some(c) => c.intersection(&set).cloned().collect(),
             });
         }
+        let kinds: Vec<Option<&'static str>> =
+            items.iter().map(|m| mailcraft_engine::cmd::mail::follow_up_kind(&app.s, &m.flag)).collect();
+        let follow_up = match kinds.first() {
+            Some(Some(k)) if kinds.iter().all(|x| *x == Some(*k)) => Some(*k),
+            _ => None,
+        };
         Targets {
+            follow_up,
             any_category: items.iter().any(|m| !m.categories.is_empty()),
             common: common.unwrap_or_default(),
             any_flag: items.iter().any(|m| !matches!(m.flag, FlagState::None)),
@@ -198,6 +208,9 @@ fn categorize_menu(ui: &mut Ui, app: &mut App, t: &Targets) {
             (c.name.clone(), Color32::from_rgba_unmultiplied(rgb.r, rgb.g, rgb.b, rgb.a))
         })
         .collect();
+    // Alphabetical, as the original lists them.
+    let mut cats = cats;
+    cats.sort_by_key(|(name, _)| name.to_lowercase());
     for (name, color) in cats {
         let on = t.common.contains(&name.to_lowercase());
         let glyph = if on { Glyph::Check(true) } else { Glyph::Swatch(color) };
@@ -218,7 +231,10 @@ fn follow_up_menu(ui: &mut Ui, app: &mut App, t: &Targets) {
         ("Next Week", "nextWeek"),
         ("No Date", "noDate"),
     ] {
-        cmd(ui, app, "flag", label, "mail.flag", t.with(json!({"kind": kind})));
+        let glyph = if t.follow_up == Some(kind) { Glyph::Check(true) } else { Glyph::Icon("flag") };
+        if row(ui, app, glyph, label, true) {
+            app.run("mail.flag", t.with(json!({"kind": kind})));
+        }
     }
     cmd(ui, app, "flag", "Custom...", "mail.flagCustom", t.params());
     ui.separator();
@@ -240,11 +256,20 @@ fn follow_up_menu(ui: &mut Ui, app: &mut App, t: &Targets) {
     cmd(ui, app, "", "Set Quick Actions...", "view.quickActions", json!({}));
 }
 
-fn quick_steps_menu(ui: &mut Ui, app: &mut App, t: &Targets) {
-    let steps: Vec<(u64, String)> =
-        app.s.mailbox.quick_steps.iter().map(|q| (q.id, q.name.clone())).collect();
-    for (id, name) in steps {
-        cmd(ui, app, "quick-steps", &name, "quicksteps.run", t.with(json!({"id": id})));
+/// The Quick Steps submenu of the message and group-header menus. A step that replies is greyed out for
+/// several messages or a group, one that forwards for a group (`quicksteps::blocked_for`).
+fn quick_steps_menu(ui: &mut Ui, app: &mut App, t: &Targets, group: bool) {
+    let count = t.ids.len();
+    let steps: Vec<(u64, String, bool)> = app
+        .s
+        .mailbox
+        .quick_steps
+        .iter()
+        .map(|q| (q.id, q.name.clone(), quicksteps::blocked_for(q, count, group).is_none()))
+        .collect();
+    for (id, name, ok) in steps {
+        let params = if group { t.with(json!({"id": id, "group": true})) } else { t.with(json!({"id": id})) };
+        cmd_if(ui, app, "quick-steps", &name, ok, "quicksteps.run", params);
     }
     if !app.s.mailbox.quick_steps.is_empty() {
         ui.separator();
@@ -404,14 +429,19 @@ pub fn message_row_menu(ui: &mut Ui, app: &mut App, item: u64) {
         );
     });
     ui.separator();
-    sub(ui, app, "quick-steps", "Quick Steps", true, |ui, app| quick_steps_menu(ui, app, &t));
+    sub(ui, app, "quick-steps", "Quick Steps", true, |ui, app| quick_steps_menu(ui, app, &t, false));
     cmd(ui, app, "", "Set Quick Actions...", "view.quickActions", json!({}));
     sub(ui, app, "rules", "Rules", true, |ui, app| rules_menu(ui, app, &t, sender.as_deref()));
     sub(ui, app, "move", "Move", true, |ui, app| move_menu(ui, app, &t, conversation));
     if focused_inbox_active(app, folder) {
         ui.separator();
-        cmd(ui, app, "", "Move to Other", "mail.moveToOther", t.params());
-        cmd(ui, app, "", "Always Move to Other", "mail.alwaysMoveToOther", t.params());
+        if app.s.view.focused_tab {
+            cmd(ui, app, "", "Move to Other", "mail.moveToOther", t.params());
+            cmd(ui, app, "", "Always Move to Other", "mail.alwaysMoveToOther", t.params());
+        } else {
+            cmd(ui, app, "", "Move to Focused", "mail.moveToFocused", t.params());
+            cmd(ui, app, "", "Always Move to Focused", "mail.alwaysMoveToFocused", t.params());
+        }
     }
     ui.separator();
     check_cmd(ui, app, ignored, "Ignore", "mail.ignore", t.params());
@@ -536,7 +566,9 @@ pub fn group_header_menu(ui: &mut Ui, app: &mut App, label: &str) {
     sub(ui, app, "categorize", "Categorize", !t.ids.is_empty(), |ui, app| categorize_menu(ui, app, &t));
     sub(ui, app, "flag", "Follow Up", !t.ids.is_empty(), |ui, app| follow_up_menu(ui, app, &t));
     ui.separator();
-    sub(ui, app, "quick-steps", "Quick Steps", !t.ids.is_empty(), |ui, app| quick_steps_menu(ui, app, &t));
+    sub(ui, app, "quick-steps", "Quick Steps", !t.ids.is_empty(), |ui, app| {
+        quick_steps_menu(ui, app, &t, true)
+    });
     cmd(ui, app, "", "Set Quick Actions...", "view.quickActions", json!({}));
     sub(ui, app, "rules", "Rules", true, |ui, app| rules_menu(ui, app, &t, None));
     sub(ui, app, "move", "Move", !t.ids.is_empty(), |ui, app| move_menu(ui, app, &t, false));
@@ -704,23 +736,12 @@ pub fn account_menu(ui: &mut Ui, app: &mut App, account: u32) {
     cmd(ui, app, "folder-open", "Open File Location", "file.openFileLocation", store.clone());
     cmd_if(ui, app, "close", "Remove", !is_default, "file.closeDataFile", store);
     ui.separator();
-    cmd(ui, app, "folder", "New Folder...", "folder.new", json!({}));
+    cmd(ui, app, "folder", "New Folder...", "folder.new", json!({"account": account}));
     cmd(ui, app, "favorites", "Add to Favorites", "folder.addFavorite", json!({"account": account}));
     cmd(ui, app, "sort", "Sort Subfolders A to Z", "folder.sortAZ", json!({"account": account}));
     ui.separator();
     cmd(ui, app, "account", "Account Properties...", "file.accountSettings", json!({"account": account}));
-    if let Some(inbox) = inbox {
-        folder_row(
-            ui,
-            app,
-            inbox,
-            "info",
-            "Data File Properties...",
-            true,
-            "folder.properties",
-            json!({"folder": inbox.0}),
-        );
-    }
+    cmd(ui, app, "info", "Data File Properties...", "file.dataFileProperties", json!({"store": account}));
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -821,6 +842,10 @@ pub fn status_bar_menu(ui: &mut Ui, app: &mut App) {
             "itemsInView" => thousands(in_view),
             "unreadItems" => thousands(unread),
             "zoom" => format!("{}%", app.s.view.zoom),
+            "reminders" => {
+                let n = crate::chrome::reminders_due(app);
+                if n > 0 { thousands(n) } else { String::new() }
+            }
             _ => String::new(),
         };
         let on = items.shown(key);

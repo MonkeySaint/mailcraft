@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::cmd::rules::{dialog, focused_item, need_selection, write_file};
-use crate::cmd::util::{opt_str, req_str};
+use crate::cmd::util::{opt_bool, opt_str, req_str};
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Session, always};
 use mailcraft_model::mailbox::LOCAL_ACCOUNT_FALLBACK_NAME;
 use mailcraft_model::{Account, AccountId, AccountKind, FolderId, FolderKind, FolderRole, ItemId, MailItem};
@@ -16,7 +16,7 @@ use mailcraft_model::{Account, AccountId, AccountKind, FolderId, FolderKind, Fol
 /// Most attachments written by one Save Attachments run.
 const MAX_SAVED_ATTACHMENTS: usize = 10_000;
 /// Most data files (accounts) in one profile.
-const MAX_ACCOUNTS: usize = 256;
+pub(crate) const MAX_ACCOUNTS: usize = 256;
 /// Largest file read by an import (each format applies its own, smaller cap).
 const MAX_IMPORT_FILE: u64 = 100 * 1024 * 1024;
 
@@ -97,10 +97,28 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.closeDataFile",
             "Remove",
             ROOT,
-            r#"{"store": string|number (account id, name or address)}"#,
+            r#"{"store": string|number (account id, name or address), "confirm"?: bool (without it the command only asks)}"#,
             true,
             has_secondary,
             close_data_file,
+        ),
+        spec(
+            "file.openDataFile",
+            "Open Data File",
+            "File › Open & Export",
+            r#"{"path"?: string (a closed .mcdata file), "name"?: string (a closed data file of this profile)} (neither = list the closed data files)"#,
+            true,
+            always,
+            open_data_file,
+        ),
+        spec(
+            "file.dataFileProperties",
+            "Data File Properties...",
+            ROOT,
+            r#"{"store"?: string|number, "name"?: string (rename), "compact"?: bool (compact the profile's data now)} (no name or compact = open the dialog)"#,
+            true,
+            has_accounts,
+            data_file_properties,
         ),
         spec(
             "file.openFileLocation",
@@ -651,9 +669,139 @@ fn close_data_file(s: &mut Session, p: &Value) -> CmdResult {
     if is_primary {
         return Err(CmdError::Disabled("the primary data file cannot be removed".into()));
     }
-    crate::sync::forget_account(s, id);
-    let folders = crate::accounts::remove_account_data(s, id);
-    Ok(json!({"removed": id.0, "folders": folders}))
+    let name = s.mailbox.account(id).map(|a| a.display_name.clone()).unwrap_or_default();
+    if opt_bool(p, "confirm") != Some(true) {
+        let kept = match crate::datafile::closed_dir(s) {
+            Some(dir) => format!("It is kept in {} and can be opened again", dir.display()),
+            None => "It is kept until MailCraft closes and can be opened again".to_owned(),
+        };
+        return dialog(
+            s,
+            "confirm",
+            json!({
+                "title": "Remove Data File",
+                "text": format!("Close the data file \"{name}\"? Its folders leave the folder pane. {kept} from File › Open & Export › Open Data File."),
+                "command": "file.closeDataFile",
+                "params": {"store": id.0, "confirm": true},
+            }),
+        );
+    }
+    let (path, folders) = crate::datafile::detach(s, id)?;
+    // The closed data file now holds the data: an undo step would bring the data file back while the
+    // closed copy stays, so opening that later would add it twice.
+    s.undo_barrier = true;
+    let path = path.map(|p| p.display().to_string());
+    Ok(json!({"removed": id.0, "folders": folders, "name": name, "path": path}))
+}
+
+/// Opens a closed data file again: from a path, or by name among this profile's closed data files; with
+/// neither, lists them (`openDataFile` dialog). A file from the profile's closed-data-files folder is renamed
+/// `<name>.mcdata.opened` once its contents are back, so it is not offered twice.
+fn open_data_file(s: &mut Session, p: &Value) -> CmdResult {
+    let entries = crate::datafile::closed_entries(s);
+    let (bytes, from_dir, memory) = if let Some(path) = opt_str(p, "path") {
+        let path = PathBuf::from(path);
+        let in_dir = entries.iter().any(|e| e.path.as_deref() == Some(path.as_path()));
+        (crate::datafile::read_file(&path)?, in_dir.then_some(path), None)
+    } else if let Some(name) = opt_str(p, "name") {
+        let Some(e) = entries.iter().find(|e| e.name.eq_ignore_ascii_case(name.trim())) else {
+            return Err(CmdError::Params(format!("no closed data file named \"{name}\"")));
+        };
+        match &e.path {
+            Some(path) => (crate::datafile::read_file(path)?, Some(path.clone()), None),
+            None => {
+                let i = s.closed_data_files.iter().position(|c| c.name.eq_ignore_ascii_case(&e.name));
+                let Some(c) = i.and_then(|i| s.closed_data_files.get(i)) else {
+                    return Err(CmdError::Params(format!("no closed data file named \"{name}\"")));
+                };
+                (c.bytes.clone(), None, i)
+            }
+        }
+    } else {
+        let files: Vec<Value> = entries
+            .iter()
+            .map(|e| json!({"name": e.name, "path": e.path.as_ref().map(|p| p.display().to_string()), "bytes": e.bytes}))
+            .collect();
+        let dir = crate::datafile::closed_dir(s).map(|d| d.display().to_string());
+        return dialog(s, "openDataFile", json!({"files": files, "dir": dir}));
+    };
+    let image = crate::datafile::parse(&bytes)?;
+    let id = crate::datafile::attach(s, image)?;
+    // The closed data file is consumed below (set aside or dropped): an undo step would take the data file
+    // out of the mailbox with nothing left to open it from.
+    s.undo_barrier = true;
+    if let Some(i) = memory
+        && i < s.closed_data_files.len()
+    {
+        s.closed_data_files.remove(i);
+    }
+    if let Some(path) = from_dir {
+        let done = path.with_extension(format!("{}.opened", crate::datafile::EXTENSION));
+        if let Err(e) = std::fs::rename(&path, &done) {
+            s.notify(Notice::Info(format!(
+                "The data file is open again, but {} could not be renamed: {e}",
+                path.display()
+            )));
+        }
+    }
+    let name = s.mailbox.account(id).map(|a| a.display_name.clone()).unwrap_or_default();
+    let (_, items, folders) = crate::datafile::usage(s, id);
+    Ok(json!({"account": id.0, "name": name, "items": items, "folders": folders}))
+}
+
+/// Data File Properties: the data file's name (renamed with `name`), where it is kept, its size and counts;
+/// `compact` folds the profile's change journal into a fresh snapshot.
+fn data_file_properties(s: &mut Session, p: &Value) -> CmdResult {
+    let id = find_account(s, p, "store")?;
+    if let Some(name) = opt_str(p, "name") {
+        let clean: String = name.chars().filter(|c| !c.is_control()).take(255).collect();
+        let clean = clean.trim().to_owned();
+        if clean.is_empty() {
+            return Err(CmdError::Params("a data file needs a name".into()));
+        }
+        if s.mailbox.accounts.iter().any(|a| a.id != id && a.display_name.eq_ignore_ascii_case(&clean)) {
+            return Err(CmdError::Params(format!("another data file is already called \"{clean}\"")));
+        }
+        if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == id) {
+            a.display_name = clean.clone();
+        }
+        return Ok(json!({"account": id.0, "name": clean}));
+    }
+    if opt_bool(p, "compact") == Some(true) {
+        let Some(st) = s.store.as_mut() else {
+            return Err(CmdError::Disabled("this session has no data file on disk".into()));
+        };
+        let before = st.journal_bytes();
+        let res = st.append(&s.pending_ops).and_then(|()| {
+            s.pending_ops.clear();
+            st.checkpoint(&s.mailbox)
+        });
+        res.map_err(|e| CmdError::Failed(format!("could not compact the data file: {e}")))?;
+        let after = st.journal_bytes();
+        return Ok(
+            json!({"account": id.0, "compacted": true, "journalBytes": before, "journalAfter": after}),
+        );
+    }
+    let Some(a) = s.mailbox.account(id).cloned() else {
+        return Err(CmdError::Params("no such data file".into()));
+    };
+    let (bytes, items, folders) = crate::datafile::usage(s, id);
+    let path = s.store.as_ref().map(|st| st.dir.display().to_string());
+    dialog(
+        s,
+        "dataFileProperties",
+        json!({
+            "account": id.0,
+            "name": a.display_name,
+            "address": a.address,
+            "local": a.kind == AccountKind::Local,
+            "default": a.is_default,
+            "path": path,
+            "bytes": bytes,
+            "items": items,
+            "folders": folders,
+        }),
+    )
 }
 
 fn open_file_location(s: &mut Session, p: &Value) -> CmdResult {
@@ -776,13 +924,30 @@ mod tests {
         s.mailbox.add_mail(MailItem { folder: inbox, ..Default::default() });
         s.selection.folder = inbox;
         let before = s.mailbox.mail.len();
+        // Remove asks first and changes nothing until confirmed.
         let r = s.run("file.closeDataFile", &json!({"store": "Archive 2026"})).unwrap();
+        assert_eq!(r["dialog"], "confirm");
+        assert_eq!(s.mailbox.mail.len(), before);
+        let r = s.run("file.closeDataFile", &json!({"store": "Archive 2026", "confirm": true})).unwrap();
         assert_eq!(r["removed"], acct.0);
         assert_eq!(s.mailbox.mail.len(), before - 1);
         assert!(s.mailbox.folders.values().all(|f| f.account != acct));
         assert_ne!(s.selection.folder, inbox);
         assert!(s.mailbox.validate().is_empty());
-        assert!(matches!(s.run("file.closeDataFile", &json!({"store": "Test"})), Err(CmdError::Disabled(_))));
+        assert!(matches!(
+            s.run("file.closeDataFile", &json!({"store": "Test", "confirm": true})),
+            Err(CmdError::Disabled(_))
+        ));
+        // The closed data file is kept (in memory here) and opens again with its item.
+        assert_eq!(s.closed_data_files.len(), 1);
+        let r = s.run("file.openDataFile", &json!({})).unwrap();
+        assert_eq!(r["dialog"], "openDataFile");
+        let r = s.run("file.openDataFile", &json!({"name": "archive 2026"})).unwrap();
+        assert_eq!(r["name"], "Archive 2026");
+        assert_eq!(r["items"], 1);
+        assert!(s.closed_data_files.is_empty());
+        assert_eq!(s.mailbox.mail.len(), before);
+        assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
     }
 
     #[test]
@@ -811,10 +976,371 @@ mod tests {
         s.run("rules.create", &json!({"name": "File it", "actions": [{"MoveTo": target.0}]})).unwrap();
         s.run("quicksteps.edit", &json!({"id": 1, "actions": [{"MoveTo": target.0}]})).unwrap();
         s.mailbox.add_favorite(target).unwrap();
-        s.run("file.closeDataFile", &json!({"store": "Old"})).unwrap();
+        s.run("file.closeDataFile", &json!({"store": "Old", "confirm": true})).unwrap();
         assert!(!s.mailbox.rules[0].enabled, "a rule moving into a removed data file must be turned off");
         assert!(s.mailbox.quick_steps[0].needs_setup(), "the quick step must ask for a folder again");
         assert!(!s.mailbox.favorites().contains(&target));
+    }
+
+    #[test]
+    fn closed_data_file_stays_on_disk_and_reopens_with_its_folders_and_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::open(dir.path()).unwrap();
+        let r = s.run("file.newDataFile", &json!({"name": "Old/Mail"})).unwrap();
+        let acct = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
+        let sub = s.mailbox.create_folder(inbox, "Receipts").unwrap();
+        let item = s.mailbox.add_mail(MailItem {
+            folder: sub,
+            subject: "Report: Q3/Q4".into(),
+            raw: Some(EML.to_vec()),
+            ..Default::default()
+        });
+        // The source moves to the blob store, as it does for downloaded mail.
+        s.store.as_mut().unwrap().checkpoint_mut(&mut s.mailbox, true).unwrap();
+        assert!(s.mailbox.mail[&item].raw.is_none());
+        let r = s.run("file.closeDataFile", &json!({"store": acct.0, "confirm": true})).unwrap();
+        let path = std::path::PathBuf::from(r["path"].as_str().unwrap());
+        assert!(path.starts_with(dir.path().join(crate::datafile::CLOSED_DIR)));
+        assert_eq!(path.file_name().unwrap(), "Old_Mail.mcdata");
+        assert!(path.exists());
+        assert!(s.mailbox.account(acct).is_none());
+        assert_eq!(crate::datafile::closed_entries(&s).len(), 1);
+        let r = s.run("file.openDataFile", &json!({"name": "Old_Mail"})).unwrap();
+        let back = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        assert_eq!(r["name"], "Old/Mail");
+        let inbox2 = s.mailbox.role_folder(back, FolderRole::Inbox).unwrap();
+        let kids = s.mailbox.children(back, Some(inbox2));
+        assert_eq!(kids.len(), 1);
+        let m = s.mailbox.items_in(kids[0])[0];
+        assert_eq!(m.subject, "Report: Q3/Q4");
+        assert_eq!(m.raw.as_deref(), Some(EML), "the source travels with the closed data file");
+        assert!(!path.exists(), "an opened file is not offered again");
+        assert!(crate::datafile::closed_entries(&s).is_empty());
+        assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+    }
+
+    #[test]
+    fn hostile_closed_data_files_are_refused_or_repaired() {
+        use crate::datafile::{DataFileImage, FORMAT, attach, parse};
+        use mailcraft_model::Folder;
+        let (mut s, _, _) = session();
+        assert!(parse(b"not json").is_err());
+        assert!(parse(br#"{"format":"other","version":1}"#).is_err());
+        assert!(parse(br#"{"format":"mailcraft-data-file","version":99}"#).is_err());
+        let folder = |id: u64, parent: Option<u64>, name: &str, role: Option<FolderRole>| Folder {
+            id: FolderId(id),
+            account: AccountId(9),
+            parent: parent.map(FolderId),
+            name: name.into(),
+            role,
+            kind: FolderKind::Mail,
+            ..Default::default()
+        };
+        // A parent cycle, a parent outside the file, a duplicate role and an item outside the file's folders.
+        let image = DataFileImage {
+            format: FORMAT.into(),
+            version: 1,
+            account: Account { display_name: "Test".into(), is_default: true, ..Default::default() },
+            folders: vec![
+                folder(1, Some(2), "A", None),
+                folder(2, Some(1), "B", None),
+                folder(3, Some(77), "C", Some(FolderRole::Inbox)),
+                folder(4, None, "D", Some(FolderRole::Inbox)),
+            ],
+            mail: vec![
+                MailItem { id: ItemId(5), folder: FolderId(3), subject: "kept".into(), ..Default::default() },
+                MailItem {
+                    id: ItemId(6),
+                    folder: FolderId(99),
+                    subject: "orphan".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&image).unwrap();
+        let id = attach(&mut s, parse(&bytes).unwrap()).unwrap();
+        let a = s.mailbox.account(id).unwrap();
+        assert_eq!(a.display_name, "Test (2)");
+        assert!(!a.is_default, "an opened data file never takes over as the default");
+        assert!(s.mailbox.mail.values().any(|m| m.subject == "kept"));
+        assert!(!s.mailbox.mail.values().any(|m| m.subject == "orphan"));
+        let inboxes =
+            s.mailbox.folders.values().filter(|f| f.account == id && f.role == Some(FolderRole::Inbox));
+        assert_eq!(inboxes.count(), 1);
+        assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+    }
+
+    fn account_of(r: &Value) -> AccountId {
+        AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap())
+    }
+
+    /// Regression: a server account's data file reopened as a server account with its old sync state, so
+    /// the next command queued an upload of every folder and message (and replayed stale queued ops).
+    #[test]
+    fn reopened_server_account_is_a_local_data_file_and_queues_nothing() {
+        use mailcraft_model::account::{AccountSync, PendingOp, RemoteFolderState, RemoteOp};
+        use mailcraft_model::{Security, ServerSettings};
+        let (mut s, _, _) = session();
+        let server = |host: &str| ServerSettings {
+            host: host.into(),
+            port: 993,
+            security: Security::Tls,
+            username: "me@example.net".into(),
+            ..Default::default()
+        };
+        let acct = s.mailbox.add_account(Account {
+            kind: AccountKind::Imap,
+            display_name: "me@example.net".into(),
+            address: "me@example.net".into(),
+            incoming: Some(server("imap.example.net")),
+            outgoing: Some(server("smtp.example.net")),
+            ..Default::default()
+        });
+        s.mailbox.create_default_folders(acct);
+        let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
+        s.mailbox.folders.get_mut(&inbox).unwrap().remote_name = Some("INBOX".into());
+        let item = s.mailbox.add_mail(MailItem {
+            folder: inbox,
+            subject: "Synced".into(),
+            remote_id: Some("7".into()),
+            ..Default::default()
+        });
+        let sync = AccountSync {
+            delimiter: Some('/'),
+            folders: [(inbox, RemoteFolderState { uidvalidity: 1, uidnext: 8, highest_modseq: 0 })].into(),
+            pending: vec![PendingOp {
+                id: 1,
+                op: RemoteOp::Flags {
+                    folder: "INBOX".into(),
+                    uid: 7,
+                    add: vec!["\\Seen".into()],
+                    remove: vec![],
+                },
+                attempts: 0,
+                not_before: 0,
+                last_error: None,
+            }],
+            next_op: 1,
+        };
+        s.mailbox.accounts.iter_mut().find(|a| a.id == acct).unwrap().sync = sync;
+        let _ = item;
+        s.run("file.closeDataFile", &json!({"store": acct.0, "confirm": true})).unwrap();
+        let r = s.run("file.openDataFile", &json!({"name": "me@example.net"})).unwrap();
+        let back = account_of(&r);
+        let a = s.mailbox.account(back).unwrap();
+        assert_eq!(a.kind, AccountKind::Local);
+        assert!(a.incoming.is_none() && a.outgoing.is_none());
+        assert_eq!(a.sync, AccountSync::default());
+        // Later changes stay local too.
+        let inbox2 = s.mailbox.role_folder(back, FolderRole::Inbox).unwrap();
+        let moved = s.mailbox.items_in(inbox2)[0].id;
+        s.run("mail.markRead", &json!({"ids": [moved.0]})).ok();
+        s.run("folder.new", &json!({"parent": inbox2.0, "name": "Later"})).ok();
+        assert!(
+            s.mailbox.accounts.iter().all(|a| a.sync.pending.is_empty()),
+            "nothing is queued for a server"
+        );
+        assert!(s.mailbox.folders.values().filter(|f| f.account == back).all(|f| f.remote_name.is_none()));
+        assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+    }
+
+    /// Regression: Undo after Open Data File dropped the data file while its closed copy was already set
+    /// aside (or gone, in memory), and Undo after Remove brought it back while the closed copy stayed.
+    #[test]
+    fn removing_and_opening_a_data_file_clear_the_undo_history() {
+        let (mut s, _, _) = session();
+        let acct = account_of(&s.run("file.newDataFile", &json!({"name": "Old"})).unwrap());
+        let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
+        s.mailbox.add_mail(MailItem { folder: inbox, subject: "keep me".into(), ..Default::default() });
+        assert!(s.undo.can_undo());
+        s.run("file.closeDataFile", &json!({"store": "Old", "confirm": true})).unwrap();
+        assert!(!s.undo.can_undo(), "Remove is not undoable");
+        assert!(s.run("app.undo", &json!({})).is_err() || s.mailbox.account(acct).is_none());
+        assert!(s.mailbox.accounts.iter().all(|a| a.display_name != "Old"));
+        s.run("file.openDataFile", &json!({"name": "Old"})).unwrap();
+        assert!(!s.undo.can_undo(), "Open Data File is not undoable");
+        let _ = s.run("app.undo", &json!({}));
+        let copies = s.mailbox.accounts.iter().filter(|a| a.display_name == "Old").count();
+        assert_eq!(copies, 1);
+        assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "keep me").count(), 1);
+        // Later commands record undo steps again.
+        let id = s.mailbox.mail.values().find(|m| m.subject == "keep me").unwrap().id;
+        s.run("mail.markUnread", &json!({"ids": [id.0]})).ok();
+        s.run("mail.markRead", &json!({"ids": [id.0]})).unwrap();
+        assert!(s.undo.can_undo());
+    }
+
+    /// Regression: the 65th Remove in a session without a store silently threw away the oldest closed data
+    /// file and its mail.
+    #[test]
+    fn in_memory_closed_data_files_are_never_evicted() {
+        let (mut s, _, _) = session();
+        for i in 0..64 {
+            s.run("file.newDataFile", &json!({"name": format!("File {i}")})).unwrap();
+            s.run("file.closeDataFile", &json!({"store": format!("File {i}"), "confirm": true})).unwrap();
+        }
+        assert_eq!(s.closed_data_files.len(), 64);
+        s.run("file.newDataFile", &json!({"name": "One too many"})).unwrap();
+        let r = s.run("file.closeDataFile", &json!({"store": "One too many", "confirm": true}));
+        assert!(matches!(r, Err(CmdError::Failed(_))), "{r:?}");
+        assert!(s.mailbox.accounts.iter().any(|a| a.display_name == "One too many"), "nothing was removed");
+        assert_eq!(s.closed_data_files.len(), 64);
+        assert_eq!(s.closed_data_files[0].name, "File 0", "the oldest closed data file is kept");
+    }
+
+    /// Regression: a long folder chain cost a full parent walk per folder (quadratic), the tree had no
+    /// depth cap, and invalid or duplicate sibling names got through.
+    #[test]
+    fn opened_data_file_folders_are_capped_in_depth_and_named_validly() {
+        use crate::datafile::{DataFileImage, FORMAT, attach};
+        use mailcraft_model::Folder;
+        let (mut s, _, _) = session();
+        let folder = |id: u64, parent: Option<u64>, name: &str| Folder {
+            id: FolderId(id),
+            account: AccountId(9),
+            parent: parent.map(FolderId),
+            name: name.into(),
+            kind: FolderKind::Mail,
+            ..Default::default()
+        };
+        const N: u64 = 20_000;
+        let mut folders: Vec<Folder> =
+            (1..=N).map(|i| folder(i, if i == 1 { None } else { Some(i - 1) }, "Level")).collect();
+        folders.push(folder(N + 1, None, "Dup"));
+        folders.push(folder(N + 2, None, "dup"));
+        folders.push(folder(N + 3, None, "Inbox"));
+        folders.push(folder(N + 4, None, "a\\b"));
+        let image = DataFileImage {
+            format: FORMAT.into(),
+            version: 1,
+            account: Account { display_name: "Deep".into(), ..Default::default() },
+            folders,
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let id = attach(&mut s, image).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "opening is not quadratic");
+        let mine: Vec<&Folder> = s.mailbox.folders.values().filter(|f| f.account == id).collect();
+        for f in &mine {
+            let mut depth = 0usize;
+            let mut cur = f.parent;
+            while let Some(p) = cur {
+                depth += 1;
+                assert!(depth <= 64, "folder nested deeper than the cap");
+                cur = s.mailbox.folders[&p].parent;
+            }
+            assert!(!f.name.contains('\\'), "{}", f.name);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for f in &mine {
+            assert!(seen.insert((f.parent, f.name.to_lowercase())), "duplicate sibling name {}", f.name);
+        }
+        let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+        assert_eq!(s.mailbox.folders[&inbox].name, "Inbox", "the default folder keeps its name");
+        assert!(mine.iter().any(|f| f.name == "Inbox (2)"));
+        assert!(mine.iter().any(|f| f.name == "a_b"));
+    }
+
+    /// Regression: ids stored inside an opened data file (AutoArchive folder, the message a task came from,
+    /// voting responses) kept their old values, which point at unrelated folders and mail here.
+    #[test]
+    fn opened_data_file_links_follow_the_new_ids() {
+        use crate::datafile::{DataFileImage, FORMAT, attach};
+        use mailcraft_model::folder::FolderArchive;
+        use mailcraft_model::{Folder, Task, VoteRecord};
+        let (mut s, _, _) = session();
+        let folder = |id: u64, target: Option<u64>| Folder {
+            id: FolderId(id),
+            account: AccountId(9),
+            name: format!("F{id}"),
+            kind: FolderKind::Mail,
+            auto_archive: Some(FolderArchive { target: target.map(FolderId), ..Default::default() }),
+            ..Default::default()
+        };
+        let vote = |r: u64| VoteRecord {
+            from: "a@example.com".into(),
+            response: Some(ItemId(r)),
+            ..Default::default()
+        };
+        let image = DataFileImage {
+            format: FORMAT.into(),
+            version: 1,
+            account: Account { display_name: "Links".into(), ..Default::default() },
+            folders: vec![folder(1, Some(2)), folder(2, Some(4242)), folder(3, None)],
+            mail: vec![
+                MailItem {
+                    id: ItemId(10),
+                    folder: FolderId(1),
+                    subject: "Vote".into(),
+                    votes: vec![vote(11), vote(9999)],
+                    ..Default::default()
+                },
+                MailItem {
+                    id: ItemId(11),
+                    folder: FolderId(1),
+                    subject: "Response".into(),
+                    ..Default::default()
+                },
+            ],
+            tasks: vec![
+                Task {
+                    id: ItemId(20),
+                    folder: FolderId(3),
+                    from_mail: Some(ItemId(10)),
+                    ..Default::default()
+                },
+                Task {
+                    id: ItemId(21),
+                    folder: FolderId(3),
+                    from_mail: Some(ItemId(5555)),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let id = attach(&mut s, image).unwrap();
+        let by_name = |n: &str| s.mailbox.folders.values().find(|f| f.account == id && f.name == n).unwrap();
+        let (f1, f2) = (by_name("F1"), by_name("F2"));
+        assert_eq!(f1.auto_archive.unwrap().target, Some(f2.id));
+        assert_eq!(f2.auto_archive.unwrap().target, None, "a folder outside the file is not a target");
+        let mail = |n: &str| s.mailbox.mail.values().find(|m| m.subject == n).unwrap();
+        let (voted, response) = (mail("Vote"), mail("Response"));
+        assert_eq!(voted.votes[0].response, Some(response.id));
+        assert_eq!(voted.votes[1].response, None);
+        let mut links: Vec<Option<ItemId>> = s
+            .mailbox
+            .tasks
+            .values()
+            .filter(|t| s.mailbox.folder_account(t.folder) == Some(id))
+            .map(|t| t.from_mail)
+            .collect();
+        links.sort();
+        assert_eq!(links, vec![None, Some(voted.id)]);
+    }
+
+    #[test]
+    fn data_file_properties_rename_and_compact() {
+        let (mut s, _, _) = session();
+        let acct = s.mailbox.accounts[0].id;
+        let r = s.run("file.dataFileProperties", &json!({"store": acct.0})).unwrap();
+        assert_eq!(r["dialog"], "dataFileProperties");
+        let Some(Notice::OpenDialog(_, d)) = s.notices.last() else { panic!("no dialog") };
+        assert_eq!(d["items"], 3);
+        assert_eq!(d["name"], "Test");
+        s.run("file.dataFileProperties", &json!({"store": acct.0, "name": " Mine "})).unwrap();
+        assert_eq!(s.mailbox.accounts[0].display_name, "Mine");
+        assert!(s.run("file.dataFileProperties", &json!({"store": acct.0, "name": "  "})).is_err());
+        assert!(matches!(
+            s.run("file.dataFileProperties", &json!({"store": acct.0, "compact": true})),
+            Err(CmdError::Disabled(_))
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::open(dir.path()).unwrap();
+        s.run("file.newDataFile", &json!({"name": "Extra"})).unwrap();
+        let r = s.run("file.dataFileProperties", &json!({"store": "Extra", "compact": true})).unwrap();
+        assert_eq!(r["compacted"], true);
     }
 
     #[test]

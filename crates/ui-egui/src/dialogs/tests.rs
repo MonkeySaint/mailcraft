@@ -540,3 +540,154 @@ fn conversation_settings_dialog_follows_the_engine() {
     assert!(!view_settings(s, folder).conversations);
     assert!(h.state().ui.toast.is_none(), "{:?}", h.state().ui.toast);
 }
+
+/// A speech engine that records what it was asked to say; `busy` says whether it is still speaking.
+#[derive(Default)]
+struct FakeSpeech {
+    said: std::sync::Mutex<Vec<String>>,
+    busy: std::sync::atomic::AtomicBool,
+    stops: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::Speech for FakeSpeech {
+    fn speak(&self, text: &str) -> Result<(), String> {
+        self.said.lock().unwrap().push(text.to_owned());
+        self.busy.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn stop(&self) {
+        self.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn speaking(&self) -> bool {
+        self.busy.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn name(&self) -> String {
+        "Test voice".into()
+    }
+}
+
+#[test]
+fn read_aloud_speaks_paragraph_by_paragraph() {
+    use std::sync::atomic::Ordering;
+    assert_eq!(
+        crate::dialogs::compose_dlg::speech_paragraphs("One line\nmore\n\n\nTwo\n  \nThree"),
+        ["One line more", "Two", "Three"]
+    );
+    let fake = std::sync::Arc::new(FakeSpeech::default());
+    let mut app = sample_app();
+    app.set_speech(fake.clone());
+    crate::dialogs::open(&mut app, "readAloud", json!({"text": "First part.\n\nSecond part."}));
+    let mut h = harness(app);
+    assert!(h.query_all_by_label_contains("Test voice").next().is_some());
+    h.get_by_label("Play").click();
+    step(&mut h);
+    assert_eq!(*fake.said.lock().unwrap(), ["First part."]);
+    // The engine finishes the paragraph: the next one follows.
+    fake.busy.store(false, Ordering::SeqCst);
+    step(&mut h);
+    assert_eq!(*fake.said.lock().unwrap(), ["First part.", "Second part."]);
+    h.get_by_label("Pause").click();
+    step(&mut h);
+    assert!(fake.stops.load(Ordering::SeqCst) >= 1);
+    h.get_by_label("Previous").click();
+    step(&mut h);
+    h.get_by_label("Play").click();
+    step(&mut h);
+    assert_eq!(fake.said.lock().unwrap().last().map(String::as_str), Some("First part."));
+    h.get_by_label("Stop").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert!(!fake.busy.load(Ordering::SeqCst), "Stop silences the voice");
+}
+
+#[test]
+fn read_aloud_without_a_speech_engine_shows_the_text() {
+    let mut app = sample_app();
+    crate::dialogs::open(&mut app, "readAloud", json!({"text": "Just text."}));
+    let h = harness(app);
+    assert!(h.query_all_by_label_contains("No speech engine").next().is_some());
+    assert!(h.query_by_label("Play").is_none());
+}
+
+#[test]
+fn ignore_prompt_offers_dont_ask_again() {
+    let mut app = sample_app();
+    let item = select_first(&mut app);
+    app.run("mail.ignore", json!({"ids": [item]}));
+    crate::dialogs::take_notices(&mut app);
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["confirm"]);
+    h.get_by_label("Don't ask me again").click();
+    step(&mut h);
+    h.get_by_label("Yes").click();
+    step(&mut h);
+    let app = h.state();
+    assert!(app.s.mailbox.mail[&ItemId(item)].ignored);
+    assert!(app.s.settings.bool(mailcraft_engine::cmd::mail::IGNORE_DONT_ASK));
+}
+
+#[test]
+fn remove_data_file_asks_then_keeps_it_for_open_data_file() {
+    let mut app = sample_app();
+    app.run("file.newDataFile", json!({"name": "Old Mail"}));
+    let acct = app.s.mailbox.accounts.iter().find(|a| a.display_name == "Old Mail").map(|a| a.id.0).unwrap();
+    app.run("file.closeDataFile", json!({"store": acct}));
+    crate::dialogs::take_notices(&mut app);
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["confirm"]);
+    assert!(h.state().s.mailbox.accounts.iter().any(|a| a.id.0 == acct), "nothing removed before Yes");
+    h.get_by_label("Yes").click();
+    step(&mut h);
+    assert!(!h.state().s.mailbox.accounts.iter().any(|a| a.display_name == "Old Mail"));
+    // File › Open & Export › Open Data File lists it; opening brings it back.
+    h.state_mut().run("file.openDataFile", json!({}));
+    crate::dialogs::take_notices(h.state_mut());
+    step(&mut h);
+    assert_eq!(names(&h), ["openDataFile"]);
+    h.get_by_label_contains("Old Mail").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", h.state().ui.toast);
+    assert!(h.state().s.mailbox.accounts.iter().any(|a| a.display_name == "Old Mail"));
+}
+
+#[test]
+fn data_file_properties_renames_the_data_file() {
+    let mut app = sample_app();
+    let acct = app.s.mailbox.accounts[0].id.0;
+    app.run("file.dataFileProperties", json!({"store": acct}));
+    crate::dialogs::take_notices(&mut app);
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["dataFileProperties"]);
+    assert!(h.query_all_by_label_contains("items in").next().is_some());
+    let field = h.get_by_role(egui::accesskit::Role::TextInput);
+    field.focus();
+    step(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+    h.get_by_role(egui::accesskit::Role::TextInput).type_text("Renamed");
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert_eq!(h.state().s.mailbox.accounts[0].display_name, "Renamed");
+}
+
+#[test]
+fn new_folder_from_the_account_root_goes_to_the_top_level() {
+    let mut app = sample_app();
+    let acct = app.s.mailbox.accounts[0].id;
+    app.run("folder.new", json!({"account": acct.0}));
+    crate::dialogs::take_notices(&mut app);
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["createFolder"]);
+    h.get_by_role(egui::accesskit::Role::TextInput).type_text("Top");
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    let s = &h.state().s;
+    let f = s.mailbox.folders.values().find(|f| f.name == "Top").expect("created");
+    assert_eq!(f.parent, None);
+    assert_eq!(f.account, acct);
+}

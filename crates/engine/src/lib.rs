@@ -14,6 +14,7 @@ pub mod archive;
 pub mod catalog;
 pub mod cmd;
 pub mod compose;
+pub mod datafile;
 pub mod intl;
 pub mod junk;
 pub mod new_mail;

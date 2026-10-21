@@ -186,6 +186,26 @@ fn notices_become_dialogs_and_toasts() {
 }
 
 #[test]
+fn recent_searches_answer_the_arrow_keys() {
+    let mut h = harness(1400.0, 900.0);
+    h.state_mut().s.search.recent = vec!["alpha".into(), "beta".into(), "gamma".into()];
+    h.state_mut().run("search.focus", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(has_label(&h, "Recent Searches"), "focusing the empty box lists recent searches");
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(1);
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(1);
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(1);
+    h.key_press(egui::Key::ArrowUp);
+    h.run_steps(1);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().s.view.search, "beta");
+}
+
+#[test]
 fn tiny_window_does_not_panic() {
     let mut h = harness(400.0, 400.0);
     h.state_mut().run("view.readingPane", json!({ "position": "bottom" })).unwrap();

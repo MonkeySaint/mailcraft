@@ -375,6 +375,41 @@ impl Mailbox {
             .insert(id, Folder { id, account, parent: Some(parent), name, kind, ..Default::default() });
         Ok(id)
     }
+    /// Creates a user folder holding `kind` items directly under `parent`, or at the top of `account`'s folder
+    /// list when `parent` is `None` (the account root). `kind` must be an item kind (mail, calendar, contacts,
+    /// tasks, notes, journal); search folders and their container are made elsewhere. Errors as
+    /// [`Mailbox::create_folder`], plus an unknown account, or a parent of another account or under Search
+    /// Folders.
+    pub fn create_folder_in(
+        &mut self,
+        account: AccountId,
+        parent: Option<FolderId>,
+        name: &str,
+        kind: FolderKind,
+    ) -> Result<FolderId> {
+        if matches!(kind, FolderKind::Search | FolderKind::SearchRoot) {
+            return Err(ModelError::NotAllowed("search folders are made with New Search Folder".into()));
+        }
+        if self.account(account).is_none() {
+            return Err(ModelError::Invalid(format!("no such account {}", account.0)));
+        }
+        if let Some(pid) = parent {
+            let p = self.folders.get(&pid).ok_or(ModelError::NoFolder(pid))?;
+            if p.account != account {
+                return Err(ModelError::Invalid("the parent folder belongs to another account".into()));
+            }
+            if matches!(p.kind, FolderKind::Search | FolderKind::SearchRoot) {
+                return Err(ModelError::NotAllowed("search folders cannot contain other folders".into()));
+            }
+        }
+        let name = Self::valid_name(name)?;
+        if self.name_taken_under(account, parent, &name, None) {
+            return Err(ModelError::Invalid(format!("a folder named \"{name}\" already exists here")));
+        }
+        let id = FolderId(self.alloc_id());
+        self.folders.insert(id, Folder { id, account, parent, name, kind, ..Default::default() });
+        Ok(id)
+    }
     /// Rename (default folders: NotAllowed).
     pub fn rename_folder(&mut self, id: FolderId, name: &str) -> Result<()> {
         let f = self.folders.get(&id).ok_or(ModelError::NoFolder(id))?;

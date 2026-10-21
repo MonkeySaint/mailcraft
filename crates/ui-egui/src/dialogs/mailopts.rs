@@ -4,7 +4,7 @@
 
 mod signatures;
 
-use egui::{Context, RichText};
+use egui::Context;
 use serde_json::{Value, json};
 
 use super::common::{self, Dlg, Out, muted, ok_cancel, window, with_state};
@@ -219,17 +219,26 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             } else if let Some(m) = item.and_then(|i| app.s.mailbox.mail.get(&ItemId(i))) {
                 ui.checkbox(&mut st.no_archive, "Do not AutoArchive this item");
                 common::heading(ui, app, "Internet headers");
-                let mut hdr = String::new();
-                if let Some(f) = &m.from {
-                    hdr.push_str(&format!("From: {}\n", f.to_display_string()));
+                // The message's own header block as received (the engine reads it from the source).
+                let mut hdr = d.str("headers");
+                if hdr.is_empty() {
+                    if let Some(f) = &m.from {
+                        hdr.push_str(&format!("From: {}\n", f.to_display_string()));
+                    }
+                    hdr.push_str(&format!("Subject: {}\n", m.subject));
+                    if let Some(id) = &m.message_id {
+                        hdr.push_str(&format!("Message-ID: {id}\n"));
+                    }
                 }
-                hdr.push_str(&format!("Subject: {}\n", m.subject));
-                if let Some(id) = &m.message_id {
-                    hdr.push_str(&format!("Message-ID: {id}\n"));
-                }
-                hdr.push_str(&format!("Size: {}\n", common::size_text(m.size)));
-                egui::ScrollArea::vertical().id_salt(("hdr", uid)).max_height(120.0).show(ui, |ui| {
-                    ui.label(RichText::new(hdr).monospace());
+                muted(ui, app, &format!("Size: {}", common::size_text(m.size)));
+                egui::ScrollArea::both().id_salt(("hdr", uid)).max_height(160.0).show(ui, |ui| {
+                    // Read-only but selectable, so the headers can be copied for diagnostics.
+                    ui.add(
+                        egui::TextEdit::multiline(&mut hdr.as_str())
+                            .code_editor()
+                            .desired_rows(8)
+                            .desired_width(f32::INFINITY),
+                    );
                 });
             }
             match ok_cancel(ui, app, true) {

@@ -697,6 +697,15 @@ fn open_export(ui: &mut Ui, app: &mut App, st: &mut PageState) {
     if tile(
         ui,
         app,
+        "folder-open",
+        "Open Data File...",
+        "Open a data file you removed earlier, or a MailCraft data file from another profile.",
+    ) {
+        app.run("file.openDataFile", json!({}));
+    }
+    if tile(
+        ui,
+        app,
         "sync",
         "Import/Export",
         "Import mail (EML, MSG, MBOX, Maildir), calendars (iCalendar) or contacts (vCard, CSV), or export them.",

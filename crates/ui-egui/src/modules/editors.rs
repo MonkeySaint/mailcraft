@@ -22,7 +22,7 @@
 
 pub(crate) mod dialogs;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{
     Align, Color32, ComboBox, CornerRadius, Id, Layout, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui,
@@ -60,6 +60,11 @@ pub(crate) struct Editors {
     pub occ_prompt: Option<OccPrompt>,
     /// Makes every newly opened window a fresh egui window (position/size not inherited).
     pub nonce: u64,
+    /// What each item window held when it opened (its nonce and content key), to tell edited windows from
+    /// untouched ones ([`dirty_editors`]).
+    pub baseline: BTreeMap<&'static str, (u64, String)>,
+    /// Close All Items found edited item windows: "Save changes?" is showing for them.
+    pub save_prompt: bool,
 }
 
 impl Editors {
@@ -669,9 +674,10 @@ pub(crate) fn show(ctx: &egui::Context, app: &mut App) {
     }
     st.windows_pass = Some(pass);
     // Close All Items (`app.closeAllItems`): the item windows here close with the read windows; the request
-    // stays for the dialogs area, which closes those.
+    // stays for the dialogs area, which closes those. Notes save themselves; edited appointment, contact and
+    // task windows stay open behind a "Save changes?" prompt.
     if app.ui.dialogs.iter().any(|(name, _)| name == CLOSE_ITEM_WINDOWS) {
-        close_item_windows(&mut st);
+        close_all_item_windows(app, &mut st);
     }
     let mut i = 0;
     while let Some((name, params)) = app.ui.dialogs.get(i).cloned() {
@@ -691,18 +697,236 @@ pub(crate) fn show(ctx: &egui::Context, app: &mut App) {
     task_window(ctx, app, &mut st);
     note_window(ctx, app, &mut st);
     go_to_window(ctx, app, &mut st);
+    save_items_prompt(ctx, app, &mut st);
     dialogs::show(ctx, app, &mut st);
+    track_baselines(&mut st);
     store(ctx, st);
 }
 
-/// Closes the item windows (appointment, contact, task and note editors, and the recurring-item prompt) for
-/// Close All Items. Unsaved edits in them are dropped, as the engine closes read and item windows right away.
-pub(crate) fn close_item_windows(st: &mut ModState) {
-    st.editors.appt = None;
-    st.editors.contact = None;
-    st.editors.task = None;
-    st.editors.note = None;
+// ---------------------------------------------------------------------------------------------------------
+// Unsaved item windows (Close All Items)
+// ---------------------------------------------------------------------------------------------------------
+
+/// What an appointment window holds that saving would change.
+fn appt_key(e: &ApptEditor) -> String {
+    format!(
+        "{:?}",
+        (
+            (&e.subject, &e.location, &e.body, &e.start_date, e.start_min, &e.end_date, e.end_min),
+            (e.all_day, &e.show_as, e.reminder, e.private, &e.categories, &e.recurrence),
+            (&e.attendees, &e.optional, e.meeting),
+        )
+    )
+}
+
+fn contact_key(e: &ContactEditor) -> String {
+    format!(
+        "{:?}",
+        (
+            (&e.full_name, &e.name_parts, &e.file_as, &e.company, &e.job_title, &e.department, &e.email),
+            (&e.phone_business, &e.phone_mobile, &e.phone_home, &e.phone_fax, &e.phone_other),
+            (&e.street, &e.city, &e.region, &e.postal, &e.country, &e.home),
+            (&e.web, &e.im, &e.birthday, &e.notes, &e.members, &e.categories, &e.details, &e.anniversary),
+            e.picture_changed,
+        )
+    )
+}
+
+fn task_key(e: &TaskEditor) -> String {
+    format!(
+        "{:?}",
+        (
+            (&e.subject, &e.start, &e.due, &e.status, &e.priority, e.percent),
+            (e.reminder_on, &e.reminder_date, e.reminder_min, &e.body, &e.categories),
+            (&e.recurrence, e.regenerate_days, e.private),
+        )
+    )
+}
+
+/// Content keys of the open appointment, contact and task windows: (kind, nonce, key).
+fn editor_keys(st: &ModState) -> Vec<(&'static str, u64, String)> {
+    let mut out = Vec::new();
+    if let Some(e) = &st.editors.appt {
+        out.push(("appointment", e.nonce, appt_key(e)));
+    }
+    if let Some(e) = &st.editors.contact {
+        out.push(("contact", e.nonce, contact_key(e)));
+    }
+    if let Some(e) = &st.editors.task {
+        out.push(("task", e.nonce, task_key(e)));
+    }
+    out
+}
+
+/// Records what newly opened item windows hold (after their first frame, so a window that tidies its own
+/// fields while it first draws does not count as edited), and forgets closed ones.
+fn track_baselines(st: &mut ModState) {
+    let keys = editor_keys(st);
+    st.editors.baseline.retain(|kind, (nonce, _)| keys.iter().any(|(k, n, _)| k == kind && n == nonce));
+    for (kind, nonce, key) in keys {
+        st.editors.baseline.entry(kind).or_insert((nonce, key));
+    }
+}
+
+/// Item windows whose contents changed since they opened ("appointment", "contact", "task"). A window
+/// opened this frame (no baseline yet) counts as unchanged.
+pub(crate) fn dirty_editors(st: &ModState) -> Vec<&'static str> {
+    editor_keys(st)
+        .into_iter()
+        .filter(|(kind, nonce, key)| {
+            st.editors.baseline.get(kind).is_some_and(|(n, base)| n == nonce && base != key)
+        })
+        .map(|(kind, _, _)| kind)
+        .collect()
+}
+
+/// Close All Items over the item windows here: notes are saved and closed, untouched windows close, and
+/// edited ones stay open behind the "Save changes?" prompt ([`save_items_prompt`]).
+fn close_all_item_windows(app: &mut App, st: &mut ModState) {
+    if let Some(ed) = st.editors.note.take() {
+        save_note(app, &ed);
+    }
+    // A note being edited in place in the Notes view keeps its text too.
+    if let Some((id, text)) = st.note_edit.take()
+        && app.s.mailbox.notes.get(&ItemId(id)).is_some_and(|n| n.text != text)
+    {
+        app.run("notes.update", json!({ "id": id, "text": text }));
+    }
+    let dirty = dirty_editors(st);
+    if !dirty.contains(&"appointment") {
+        st.editors.appt = None;
+    }
+    if !dirty.contains(&"contact") {
+        st.editors.contact = None;
+    }
+    if !dirty.contains(&"task") {
+        st.editors.task = None;
+    }
     st.editors.occ_prompt = None;
+    if !dirty.is_empty() {
+        st.editors.save_prompt = true;
+    }
+}
+
+/// Saves a note window's text, colour and categories (notes save as they close).
+fn save_note(app: &mut App, ed: &NoteEditor) -> bool {
+    if !app.s.mailbox.notes.contains_key(&ItemId(ed.id)) {
+        return false;
+    }
+    let color_key = super::notes_view::COLORS
+        .iter()
+        .find(|(c, _, _)| *c == ed.color)
+        .map(|(_, k, _)| *k)
+        .unwrap_or("yellow");
+    let p = json!({ "id": ed.id, "text": ed.text, "color": color_key, "categories": ed.categories });
+    run_checked(app, "notes.update", p).is_ok()
+}
+
+/// Saves the edited item windows (Yes in the Close All Items prompt). Windows that fail to save (a missing
+/// subject, a bad date) stay open with their error; the rest close.
+pub(crate) fn save_dirty_items(app: &mut App, st: &mut ModState) -> usize {
+    let dirty = dirty_editors(st);
+    let mut failed = 0usize;
+    if dirty.contains(&"appointment")
+        && let Some(mut ed) = st.editors.appt.take()
+        && let Err(e) = save_appointment(app, &ed)
+    {
+        ed.error = Some(e);
+        st.editors.appt = Some(ed);
+        failed = failed.saturating_add(1);
+    }
+    if dirty.contains(&"contact")
+        && let Some(mut ed) = st.editors.contact.take()
+        && let Err(e) = save_contact(app, &ed)
+    {
+        ed.error = Some(e);
+        st.editors.contact = Some(ed);
+        failed = failed.saturating_add(1);
+    }
+    if dirty.contains(&"task")
+        && let Some(mut ed) = st.editors.task.take()
+        && let Err(e) = save_task(app, &ed)
+    {
+        ed.error = Some(e);
+        st.editors.task = Some(ed);
+        failed = failed.saturating_add(1);
+    }
+    failed
+}
+
+/// "Save changes to the open items?" after Close All Items found edited windows: Yes saves them, No closes
+/// them without saving, Cancel keeps them open.
+fn save_items_prompt(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
+    if !st.editors.save_prompt {
+        return;
+    }
+    let dirty = dirty_editors(st);
+    if dirty.is_empty() {
+        st.editors.save_prompt = false;
+        return;
+    }
+    let mut names: Vec<String> = Vec::new();
+    if dirty.contains(&"appointment")
+        && let Some(e) = &st.editors.appt
+    {
+        names.push(if e.subject.trim().is_empty() {
+            "Untitled appointment".into()
+        } else {
+            e.subject.clone()
+        });
+    }
+    if dirty.contains(&"contact")
+        && let Some(e) = &st.editors.contact
+    {
+        names.push(if e.full_name.trim().is_empty() {
+            "Untitled contact".into()
+        } else {
+            e.full_name.clone()
+        });
+    }
+    if dirty.contains(&"task")
+        && let Some(e) = &st.editors.task
+    {
+        names.push(if e.subject.trim().is_empty() { "Untitled task".into() } else { e.subject.clone() });
+    }
+    let mut answer: Option<Option<bool>> = None;
+    window("MailCraft".into(), ("mc-save-items", 0)).default_width(380.0).resizable(false).show(ctx, |ui| {
+        crate::dialogs::form_visuals(ui, &app.theme);
+        ui.label("Do you want to save your changes to these items before they close?");
+        for n in &names {
+            ui.label(format!("• {n}"));
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Yes").clicked() {
+                answer = Some(Some(true));
+            }
+            if ui.button("No").clicked() {
+                answer = Some(Some(false));
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(None);
+            }
+        });
+    });
+    match answer {
+        Some(Some(true)) => {
+            save_dirty_items(app, st);
+            st.editors.save_prompt = false;
+        }
+        Some(Some(false)) => {
+            for kind in dirty {
+                match kind {
+                    "appointment" => st.editors.appt = None,
+                    "contact" => st.editors.contact = None,
+                    _ => st.editors.task = None,
+                }
+            }
+            st.editors.save_prompt = false;
+        }
+        Some(None) => st.editors.save_prompt = false,
+        None => {}
+    }
 }
 
 fn window<'a>(title: String, id: (&'static str, u64)) -> egui::Window<'a> {
@@ -1928,7 +2152,6 @@ fn address_json(kind: &str, f: [&String; 5]) -> Option<Value> {
 }
 
 /// Saves the contact editor; returns the item id (a detected duplicate is an error here).
-#[cfg(test)]
 pub(crate) fn save_contact(app: &mut App, ed: &ContactEditor) -> Result<Option<u64>, String> {
     match save_contact_checked(app, ed)? {
         ContactSaved::Saved(id) => Ok(id),
@@ -2874,6 +3097,49 @@ mod tests {
         app.ui.dialogs.push(("appointment".into(), json!({"id": id.0})));
         draw(&ctx, &mut app);
         assert_eq!(load(&ctx).editors.appt.unwrap().id, Some(id.0));
+    }
+
+    #[test]
+    fn close_all_items_keeps_edited_item_windows_and_saves_notes() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let note = app.s.run("notes.new", &json!({"text": "Idea"})).unwrap()["id"].as_u64().unwrap();
+        app.ui.dialogs.push(("task".into(), json!({})));
+        app.ui.dialogs.push(("contact".into(), json!({})));
+        app.ui.dialogs.push(("appointment".into(), json!({"subject": "Lunch"})));
+        draw(&ctx, &mut app);
+        let mut st = load(&ctx);
+        open_note(&app, &mut st, ItemId(note));
+        store(&ctx, st);
+        draw(&ctx, &mut app);
+        let mut st = load(&ctx);
+        assert!(st.editors.note.is_some(), "the note window opened");
+        assert!(dirty_editors(&st).is_empty(), "nothing typed yet");
+        // Edit the task and the note; leave the contact and the appointment alone.
+        if let Some(t) = st.editors.task.as_mut() {
+            t.subject = "Call the printer".into();
+        }
+        if let Some(n) = st.editors.note.as_mut() {
+            n.text = "Idea, refined".into();
+        }
+        store(&ctx, st);
+        assert_eq!(dirty_editors(&load(&ctx)), ["task"]);
+        let tasks_before = app.s.mailbox.tasks.len();
+        app.s.run("app.closeAllItems", &json!({})).unwrap();
+        forward_dialogs(&mut app);
+        draw(&ctx, &mut app);
+        let st = load(&ctx);
+        assert!(st.editors.contact.is_none() && st.editors.appt.is_none(), "untouched windows close");
+        assert!(st.editors.task.is_some(), "the edited task waits for an answer");
+        assert!(st.editors.save_prompt);
+        assert!(st.editors.note.is_none());
+        assert_eq!(app.s.mailbox.notes[&ItemId(note)].text, "Idea, refined", "notes save as they close");
+        // Yes saves the task and closes it.
+        let mut st = load(&ctx);
+        assert_eq!(save_dirty_items(&mut app, &mut st), 0);
+        assert!(st.editors.task.is_none());
+        assert_eq!(app.s.mailbox.tasks.len(), tasks_before + 1);
+        assert!(app.s.mailbox.tasks.values().any(|t| t.subject == "Call the printer"));
     }
 
     #[test]

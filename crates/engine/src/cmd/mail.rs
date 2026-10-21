@@ -295,12 +295,21 @@ pub fn specs() -> Vec<CommandSpec> {
             "Archive",
             "Home › Delete",
             "",
-            r#"{"folder"?:number|string}"#,
+            r#"{"folder"?:number|string,"ids"?:[number],"remember"?:bool (make the folder the account's Archive folder when it has none)}"#,
             true,
             need_items,
             archive,
         ),
-        spec("mail.ignore", "Ignore", "Home › Delete", "Mod+Delete", "", true, need_one, ignore),
+        spec(
+            "mail.ignore",
+            "Ignore",
+            "Home › Delete",
+            "Mod+Delete",
+            r#"{"ids"?:[number],"confirm"?:bool} (turning Ignore on asks first unless confirm is true or the prompt was switched off)"#,
+            true,
+            need_one,
+            ignore,
+        ),
         spec(
             "mail.cleanUpConversation",
             "Clean Up Conversation",
@@ -316,7 +325,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Clean Up Folder",
             "Home › Delete › Clean Up; Folder › Clean Up › Clean Up Folder",
             "",
-            r#"{"folder"?:number|string}"#,
+            r#"{"folder"?:number|string,"confirm"?:bool (asks first without it, unless the prompt was switched off)}"#,
             true,
             need_mail_folder,
             clean_up_folder,
@@ -356,7 +365,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Report",
             "Home › Report",
             "",
-            r#"{"kind"?:"junk"|"phishing"}"#,
+            r#"{"kind"?:"junk"|"phishing","ids"?:[number],"confirm"?:bool (phishing asks first without it)}"#,
             true,
             need_items,
             report,
@@ -411,6 +420,26 @@ pub fn specs() -> Vec<CommandSpec> {
             true,
             need_one,
             always_move_to_other,
+        ),
+        spec(
+            "mail.moveToFocused",
+            "Move to Focused",
+            "Message context menu (Focused Inbox, Other tab)",
+            "",
+            "",
+            true,
+            need_items,
+            move_to_focused,
+        ),
+        spec(
+            "mail.alwaysMoveToFocused",
+            "Always Move to Focused",
+            "Message context menu (Focused Inbox, Other tab)",
+            "",
+            "",
+            true,
+            need_one,
+            always_move_to_focused,
         ),
         // Tags group
         spec(
@@ -999,11 +1028,26 @@ fn permanent_delete(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"deleted": removed.len(), "ids": ids_json(&removed)}))
 }
 
+/// Archive: the messages go to their account's Archive folder. An account without one asks for a folder
+/// (`archiveFolder`); the folder picked there (`remember`) becomes the account's Archive folder, so later
+/// archives need no question.
 fn archive(s: &mut Session, p: &Value) -> CmdResult {
     let ids = mail_targets(s, p);
     if let Some(folder) = param_folder(s, p)? {
+        let mut remembered = false;
+        if opt_bool(p, "remember") == Some(true)
+            && let Some(account) = s.mailbox.folder_account(folder)
+            && s.mailbox.role_folder(account, FolderRole::Archive).is_none()
+            && let Some(f) = s.mailbox.folders.get_mut(&folder)
+            && f.role.is_none()
+            && f.kind == FolderKind::Mail
+        {
+            f.role = Some(FolderRole::Archive);
+            remembered = true;
+            journal_mailbox(s);
+        }
         let moved = move_and_reselect(s, &ids, folder)?;
-        return Ok(json!({"moved": moved.len(), "folder": folder.0}));
+        return Ok(json!({"moved": moved.len(), "folder": folder.0, "remembered": remembered}));
     }
     let missing = ids.iter().any(|id| role_folder_of(s, *id, FolderRole::Archive).is_none());
     if missing {
@@ -1045,6 +1089,23 @@ fn copy_to_folder(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"copied": copies.len(), "folder": folder.0, "ids": ids_json(&copies)}))
 }
 
+/// Most Message-IDs an Always Move Conversation rule lists.
+const MAX_CONVERSATION_IDS: usize = 50;
+
+/// Message-IDs (without brackets) of the conversations' messages, newest first, without duplicates.
+fn members_ids(s: &Session, convs: &[Conversation]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in convs.iter().flat_map(|c| c.items.iter()) {
+        if let Some(mid) = s.mailbox.mail.get(id).and_then(|m| m.message_id.as_deref()) {
+            let mid = mid.trim().trim_start_matches('<').trim_end_matches('>').trim();
+            if !mid.is_empty() && !mid.contains(['<', '>']) && !out.iter().any(|x| x == mid) {
+                out.push(mid.to_owned());
+            }
+        }
+    }
+    out
+}
+
 fn always_move_conversation(s: &mut Session, p: &Value) -> CmdResult {
     let Some(focus) = primary_item(s, p) else {
         return Err(CmdError::Disabled("No message is selected.".into()));
@@ -1065,17 +1126,26 @@ fn always_move_conversation(s: &mut Session, p: &Value) -> CmdResult {
             )
         })
         .collect();
+    // Future messages: a rule keeps moving them. It recognises the conversation by its Message-IDs, which
+    // replies carry in In-Reply-To / References, so unrelated mail with the same subject stays put; only a
+    // conversation whose messages carry no Message-ID falls back to the subject.
+    let mut ids: Vec<String> = members_ids(s, &convs);
+    ids.truncate(MAX_CONVERSATION_IDS);
     let moved = move_and_reselect(s, &movable, folder)?;
-    // Future messages: a rule on the conversation topic keeps moving them.
     if !topic.trim().is_empty() {
         let name = format!("Always move conversation: {topic}");
         let rule_id = s.mailbox.rules.iter().map(|r| r.id).max().unwrap_or(0).saturating_add(1);
         s.mailbox.rules.retain(|r| r.name != name);
+        let condition = if ids.is_empty() {
+            mailcraft_model::RuleCondition::SubjectContains(vec![topic.clone()])
+        } else {
+            mailcraft_model::RuleCondition::HeaderContains(ids.iter().map(|i| format!("<{i}>")).collect())
+        };
         s.mailbox.rules.push(mailcraft_model::Rule {
             id: rule_id,
             name,
             enabled: true,
-            conditions: vec![mailcraft_model::RuleCondition::SubjectContains(vec![topic.clone()])],
+            conditions: vec![condition],
             actions: vec![
                 mailcraft_model::RuleAction::MoveTo(folder),
                 mailcraft_model::RuleAction::StopProcessingMoreRules,
@@ -1123,31 +1193,68 @@ pub fn other_senders(s: &Session) -> Vec<String> {
     s.settings.list(OTHER_SENDERS_SETTING)
 }
 
-/// The Focused Inbox class a sender override gives `m` (`None` = no override: the default classification
-/// applies). New mail goes through [`apply_focus_overrides`].
-pub fn focus_override(senders: &[String], m: &MailItem) -> Option<FocusClass> {
-    let from = m.from.as_ref()?.addr.trim().to_lowercase();
-    (!from.is_empty() && senders.contains(&from)).then_some(FocusClass::Other)
+/// Setting holding the senders whose mail always goes to Focused (Always Move to Focused).
+pub const FOCUSED_SENDERS_SETTING: &str = "mail.focused.focusedSenders";
+
+/// Senders whose mail always goes to Focused (lower-case addresses).
+pub fn focused_senders(s: &Session) -> Vec<String> {
+    s.settings.list(FOCUSED_SENDERS_SETTING)
 }
 
-/// Applies the sender overrides (Always Move to Other) to `ids`, e.g. newly arrived mail; returns the items
-/// whose class changed (journaled).
+/// The Focused Inbox class a sender override gives `m` (`None` = no override: the default classification
+/// applies): `other` holds the Always Move to Other senders. New mail goes through [`apply_focus_overrides`],
+/// which also applies the Always Move to Focused senders.
+pub fn focus_override(other: &[String], m: &MailItem) -> Option<FocusClass> {
+    let from = m.from.as_ref()?.addr.trim().to_lowercase();
+    (!from.is_empty() && other.contains(&from)).then_some(FocusClass::Other)
+}
+
+/// Applies the sender overrides (Always Move to Other, Always Move to Focused) to `ids`, e.g. newly arrived
+/// mail; returns the items whose class changed (journaled).
 pub fn apply_focus_overrides(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
-    let senders = other_senders(s);
-    if senders.is_empty() {
+    let other_list = other_senders(s);
+    let focused_list = focused_senders(s);
+    if other_list.is_empty() && focused_list.is_empty() {
         return Vec::new();
     }
-    let other: Vec<ItemId> = ids
-        .iter()
-        .copied()
-        .filter(|id| s.mailbox.mail.get(id).and_then(|m| focus_override(&senders, m)).is_some())
-        .collect();
-    set_focus_class(s, &other, FocusClass::Other)
+    let sender = |m: &MailItem| m.from.as_ref().map(|a| a.addr.trim().to_lowercase()).unwrap_or_default();
+    let mut other = Vec::new();
+    let mut focused = Vec::new();
+    for id in ids {
+        let Some(m) = s.mailbox.mail.get(id) else { continue };
+        let from = sender(m);
+        if from.is_empty() {
+            continue;
+        }
+        if other_list.contains(&from) {
+            other.push(*id);
+        } else if focused_list.contains(&from) {
+            focused.push(*id);
+        }
+    }
+    let mut changed = set_focus_class(s, &other, FocusClass::Other);
+    changed.extend(set_focus_class(s, &focused, FocusClass::Focused));
+    changed
 }
 
-/// Always Move to Other: every message from the sender in this folder goes to Other now, and
-/// the sender is remembered so later mail from them is classified Other too ([`apply_focus_overrides`]).
+fn move_to_focused(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = mail_targets(s, p);
+    let changed = set_focus_class(s, &ids, FocusClass::Focused);
+    Ok(json!({"changed": changed.len(), "ids": ids_json(&changed)}))
+}
+
 fn always_move_to_other(s: &mut Session, p: &Value) -> CmdResult {
+    always_move_sender(s, p, FocusClass::Other)
+}
+
+fn always_move_to_focused(s: &mut Session, p: &Value) -> CmdResult {
+    always_move_sender(s, p, FocusClass::Focused)
+}
+
+/// Always Move to Other / Focused: every message from the sender in this folder goes to that tab now, and
+/// the sender is remembered (and dropped from the other tab's list) so later mail from them is classified
+/// the same way ([`apply_focus_overrides`]).
+fn always_move_sender(s: &mut Session, p: &Value, class: FocusClass) -> CmdResult {
     let Some(focus) = primary_item(s, p) else {
         return Err(CmdError::Disabled("No message is selected.".into()));
     };
@@ -1159,7 +1266,7 @@ fn always_move_to_other(s: &mut Session, p: &Value) -> CmdResult {
     else {
         return Err(CmdError::Failed("message not found".into()));
     };
-    // Every message from the sender in this folder (the Focused Inbox) goes to Other.
+    // Every message from the sender in this folder (the Focused Inbox) goes to that tab.
     let mut ids: Vec<ItemId> = vec![focus];
     if !sender.is_empty() {
         ids.extend(
@@ -1173,15 +1280,24 @@ fn always_move_to_other(s: &mut Session, p: &Value) -> CmdResult {
                 .map(|m| m.id),
         );
     }
-    let changed = set_focus_class(s, &ids, FocusClass::Other);
+    let changed = set_focus_class(s, &ids, class);
+    let (keep, drop) = match class {
+        FocusClass::Other => (OTHER_SENDERS_SETTING, FOCUSED_SENDERS_SETTING),
+        _ => (FOCUSED_SENDERS_SETTING, OTHER_SENDERS_SETTING),
+    };
     let mut persisted = false;
-    if !sender.is_empty() && crate::settings::def(OTHER_SENDERS_SETTING).is_some() {
-        let mut list = other_senders(s);
+    if !sender.is_empty() && crate::settings::def(keep).is_some() {
+        let mut list = s.settings.list(keep);
         list.retain(|x| *x != sender);
         list.push(sender.clone());
         let excess = list.len().saturating_sub(MAX_OTHER_SENDERS);
         list.drain(..excess);
-        persisted = s.settings.set(OTHER_SENDERS_SETTING, &json!(list)).is_ok();
+        persisted = s.settings.set(keep, &json!(list)).is_ok();
+        let mut other = s.settings.list(drop);
+        if other.contains(&sender) {
+            other.retain(|x| *x != sender);
+            persisted &= s.settings.set(drop, &json!(other)).is_ok();
+        }
     }
     Ok(json!({"changed": changed.len(), "sender": sender, "persisted": persisted}))
 }
@@ -1260,6 +1376,24 @@ impl FlagKind {
 ///
 /// Today/Tomorrow: start = due = that day. This Week: due = this week's Friday (today when already past
 /// it), start = two days from today but not after the due date. Next Week: Monday to Friday of next week.
+/// The Follow Up menu entry ("today", "tomorrow", "thisWeek", "nextWeek", "noDate") whose dates `flag`
+/// carries as of today, for the menu's check marks; `None` for no flag, a completed one or custom dates.
+pub fn follow_up_kind(s: &Session, flag: &FlagState) -> Option<&'static str> {
+    let FlagState::Flagged { start, due, .. } = flag else { return None };
+    let day = |d: Option<DateTime>| d.map(|t| local_day(t, s.tz_offset_min));
+    let kinds = [
+        ("today", FlagKind::Today),
+        ("tomorrow", FlagKind::Tomorrow),
+        ("thisWeek", FlagKind::ThisWeek),
+        ("nextWeek", FlagKind::NextWeek),
+        ("noDate", FlagKind::NoDate),
+    ];
+    kinds.into_iter().find_map(|(key, kind)| {
+        let (ks, kd) = flag_dates(s, kind);
+        (day(*start) == day(ks) && day(*due) == day(kd)).then_some(key)
+    })
+}
+
 pub(crate) fn flag_dates(s: &Session, kind: FlagKind) -> (Option<DateTime>, Option<DateTime>) {
     let today = local_day(s.now(), s.tz_offset_min);
     let weekday = i64::from(weekday_of_day(today).0); // Sunday = 0
@@ -1589,6 +1723,19 @@ fn ignore(s: &mut Session, p: &Value) -> CmdResult {
     };
     let members: Vec<ItemId> = conversations_of(s, &[focus]).iter().flat_map(|c| c.items.clone()).collect();
     let currently = members.iter().any(|id| s.mailbox.mail.get(id).is_some_and(|m| m.ignored));
+    if !currently && opt_bool(p, "confirm") != Some(true) && !s.settings.bool(IGNORE_DONT_ASK) {
+        return open_dialog(
+            s,
+            "confirm",
+            json!({
+                "title": "Ignore Conversation",
+                "text": "The selected conversation and any messages that arrive in it later go to Deleted Items.",
+                "command": "mail.ignore",
+                "params": {"ids": [focus.0], "confirm": true},
+                "dontAsk": IGNORE_DONT_ASK,
+            }),
+        );
+    }
     let order = list_order(s);
     let mut touched = Vec::new();
     if currently {
@@ -1622,6 +1769,83 @@ fn ignore(s: &mut Session, p: &Value) -> CmdResult {
     reselect(s, &order);
     Ok(json!({"ignored": !currently, "changed": touched.len()}))
 }
+
+/// Setting that switches the Ignore Conversation prompt off ("Don't show this message again").
+pub const IGNORE_DONT_ASK: &str = "state.confirm.ignoreDontAsk";
+
+/// New mail that joins an ignored conversation: marked ignored and moved to its account's Deleted Items, as
+/// the earlier members were (`mail.ignore`). Runs on arrival ([`crate::sync::arrival::on_new_mail`]); returns
+/// the items moved. Costs nothing while no item is ignored.
+///
+/// A new message joins an ignored conversation only through Message-IDs: its In-Reply-To or References name
+/// an ignored message of its account (or an ignored message names it). The subject never counts, so after
+/// ignoring "Invoice" or "Weekly report", someone else's message with the same subject still arrives.
+pub(crate) fn ignore_arrivals(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
+    if ids.is_empty() || !s.mailbox.mail.values().any(|m| m.ignored) {
+        return Vec::new();
+    }
+    fn norm(id: &str) -> Option<String> {
+        let t = id.trim().trim_start_matches('<').trim_end_matches('>').trim();
+        (!t.is_empty()).then(|| t.to_owned())
+    }
+    let new: BTreeSet<ItemId> = ids.iter().copied().collect();
+    // Per account: Message-IDs of ignored messages, and the ids ignored messages refer to.
+    let mut ignored_ids: BTreeSet<(AccountId, String)> = BTreeSet::new();
+    let mut referred: BTreeSet<(AccountId, String)> = BTreeSet::new();
+    for m in s.mailbox.mail.values().filter(|m| m.ignored && !new.contains(&m.id)) {
+        let Some(a) = s.mailbox.folder_account(m.folder) else { continue };
+        if let Some(mid) = m.message_id.as_deref().and_then(norm) {
+            ignored_ids.insert((a, mid));
+        }
+        for r in m.in_reply_to.iter().chain(&m.references).take(MAX_LINKS_PER_MESSAGE) {
+            if let Some(r) = norm(r) {
+                referred.insert((a, r));
+            }
+        }
+    }
+    // New messages can link to each other (a reply arriving with its parent): repeat until nothing joins.
+    let mut out = Vec::new();
+    let mut pending: Vec<ItemId> = ids.to_vec();
+    loop {
+        let mut joined = Vec::new();
+        for id in &pending {
+            let Some(m) = s.mailbox.mail.get(id) else { continue };
+            let Some(a) = s.mailbox.folder_account(m.folder) else { continue };
+            let own = m.message_id.as_deref().and_then(norm);
+            let links = m
+                .in_reply_to
+                .iter()
+                .chain(&m.references)
+                .take(MAX_LINKS_PER_MESSAGE)
+                .filter_map(|r| norm(r))
+                .any(|r| ignored_ids.contains(&(a, r)));
+            let named = own.as_ref().is_some_and(|o| referred.contains(&(a, o.clone())));
+            if links || named {
+                joined.push((*id, a, own));
+            }
+        }
+        if joined.is_empty() {
+            break;
+        }
+        for (id, a, own) in joined {
+            pending.retain(|p| *p != id);
+            if let Some(own) = own {
+                ignored_ids.insert((a, own));
+            }
+            let Some(deleted) = role_folder_of(s, id, FolderRole::DeletedItems) else { continue };
+            if let Some(m) = s.mailbox.mail.get_mut(&id) {
+                m.ignored = true;
+            }
+            if s.mailbox.move_items(&[id], deleted).is_ok() {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Most In-Reply-To / References entries looked at per message when matching ignored conversations.
+const MAX_LINKS_PER_MESSAGE: usize = 200;
 
 /// Body text normalised for "fully quoted" comparison: quote markers removed, whitespace collapsed.
 fn normalised_text(m: &MailItem) -> String {
@@ -1870,8 +2094,25 @@ fn clean_up_folders(s: &mut Session, folders: Vec<FolderId>, root: Option<Folder
     clean_up(s, &convs, &|m: &MailItem| folders.contains(&m.folder), root)
 }
 
+/// Setting that switches the Clean Up Folder prompt off.
+pub const CLEAN_UP_DONT_ASK: &str = "state.confirm.cleanUpDontAsk";
+
 fn clean_up_folder(s: &mut Session, p: &Value) -> CmdResult {
     let folder = param_folder(s, p)?.unwrap_or(s.selection.folder);
+    if opt_bool(p, "confirm") != Some(true) && !s.settings.bool(CLEAN_UP_DONT_ASK) {
+        let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
+        return open_dialog(
+            s,
+            "confirm",
+            json!({
+                "title": "Clean Up Folder",
+                "text": format!("Clean up \"{name}\"? Messages whose whole text is quoted in a later reply in the same conversation go to Deleted Items."),
+                "command": "mail.cleanUpFolder",
+                "params": {"folder": folder.0, "confirm": true},
+                "dontAsk": CLEAN_UP_DONT_ASK,
+            }),
+        );
+    }
     clean_up_folders(s, vec![folder], None)
 }
 
@@ -2142,16 +2383,104 @@ fn block(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Report Junk / Report Phishing: marks the messages read and moves them to Junk Email.
+/// Setting: where reported messages are forwarded (as attachments) for the mail provider's abuse desk.
+pub const REPORT_ADDRESS: &str = "mail.report.address";
+
+/// Report Junk: the messages are marked read and go to Junk Email. Report Phishing (after a confirmation):
+/// they are marked read and go to Deleted Items, and their senders are blocked so later mail from them is
+/// treated as junk. With an abuse address set (Options › Mail › Report), a new message to that address
+/// opens with the reported messages attached, ready to send.
 fn report(s: &mut Session, p: &Value) -> CmdResult {
     let kind = opt_str(p, "kind").unwrap_or("junk");
     if !matches!(kind, "junk" | "phishing") {
         return Err(CmdError::Params(format!("unknown report kind `{kind}`")));
     }
     let ids = mail_targets(s, p);
+    if ids.is_empty() {
+        return Err(CmdError::Disabled("No message is selected.".into()));
+    }
+    if kind == "phishing" && opt_bool(p, "confirm") != Some(true) {
+        let n = ids.len();
+        let what = if n == 1 { "this message".to_owned() } else { format!("these {n} messages") };
+        return open_dialog(
+            s,
+            "confirm",
+            json!({
+                "title": "Report Phishing",
+                "text": format!("Report {what} as phishing? It goes to Deleted Items and its sender is blocked."),
+                "command": "mail.report",
+                "params": {"kind": "phishing", "ids": ids_json(&ids), "confirm": true},
+            }),
+        );
+    }
+    // The report copy is made before the messages move (the forward reads them where they are).
+    let address = s.settings.text(REPORT_ADDRESS).trim().to_owned();
+    let mut compose = None;
+    let mut report_error = None;
+    if !address.is_empty()
+        && let Some(run) = s.registry.get("mail.forwardAsAttachment").map(|c| c.run)
+    {
+        // The messages are reported even when the copy for the abuse desk cannot be made (too many or too
+        // large to attach): the user hears why.
+        match run(s, &json!({"ids": ids_json(&ids)})) {
+            Ok(r) => {
+                if let Some(cid) = r.get("compose").and_then(Value::as_u64)
+                    && let Some(c) = s.composes.get_mut(&cid)
+                {
+                    c.to = address.clone();
+                    let label = if kind == "phishing" { "Phishing report" } else { "Junk report" };
+                    c.subject = format!("{label}: {}", c.subject.trim_start_matches("FW: "));
+                    compose = Some(cid);
+                }
+            }
+            Err(e) => {
+                let why = format!("The report to {address} was not prepared: {e}");
+                s.notify(Notice::Info(why.clone()));
+                report_error = Some(why);
+            }
+        }
+    }
     let read = s.mailbox.set_read(&ids, true);
     journal(s, &read);
-    let moved = move_to_role(s, &ids, FolderRole::JunkEmail)?;
-    Ok(json!({"reported": kind, "moved": moved.len()}))
+    let mut blocked = Vec::new();
+    let mut not_blocked = Vec::new();
+    let role = if kind == "phishing" {
+        // Phishing often forges the user's own address as the sender: blocking it would send the user's
+        // own mail (notes to self, copies to self) to Junk from then on, so own addresses are left alone.
+        let mine = my_addresses(s);
+        for id in &ids {
+            let sender = s
+                .mailbox
+                .mail
+                .get(id)
+                .and_then(|m| m.from.as_ref())
+                .map(|a| a.addr.trim().to_lowercase())
+                .unwrap_or_default();
+            if sender.is_empty() || blocked.contains(&sender) || not_blocked.contains(&sender) {
+                continue;
+            }
+            if mine.contains(&sender) {
+                not_blocked.push(sender);
+                continue;
+            }
+            s.mailbox.junk.remove(JunkList::SafeSenders, &sender);
+            if s.mailbox.junk.add(JunkList::BlockedSenders, &sender).is_ok() {
+                blocked.push(sender);
+            }
+        }
+        FolderRole::DeletedItems
+    } else {
+        FolderRole::JunkEmail
+    };
+    let moved = move_to_role(s, &ids, role)?;
+    Ok(json!({
+        "reported": kind,
+        "moved": moved.len(),
+        "blocked": blocked,
+        "notBlocked": not_blocked,
+        "compose": compose,
+        "reportError": report_error,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -2203,10 +2532,20 @@ fn print(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Quick Print: Memo Style straight to `printer` (or a PDF `path`) when given; otherwise the Print page with
 /// Memo Style picked (there is no silent default printer: Save as PDF needs a file name).
+/// Quick Print: the messages in Memo style straight to the system's default printer (where the session
+/// allows direct printing and a default printer exists), else the Print page with Memo chosen. A printer or
+/// PDF path in the params prints there.
 fn quick_print(s: &mut Session, p: &Value) -> CmdResult {
     let ids = mail_targets(s, p);
     let raw: Vec<u64> = ids.iter().map(|i| i.0).collect();
-    if ["printer", "path", "pdf_path"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+    let explicit = ["printer", "path", "pdf_path"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null()));
+    if !explicit && !raw.is_empty() && s.direct_print && crate::cmd::print::has_default_printer() {
+        let params = json!({"ids": raw, "style": "memo", "printer": crate::cmd::print::DEFAULT_PRINTER});
+        if let Some(done) = crate::cmd::print::forward(s, &params, &raw) {
+            return done;
+        }
+    }
+    if explicit {
         let mut params = p.as_object().cloned().unwrap_or_default();
         params.entry("style").or_insert_with(|| json!("memo"));
         let params = Value::Object(params);
@@ -2285,7 +2624,8 @@ fn message_options(s: &mut Session, p: &Value) -> CmdResult {
     let imp = opt_str(p, "importance").map(parse_importance).transpose()?;
     let sens = opt_str(p, "sensitivity").map(parse_sensitivity).transpose()?;
     if imp.is_none() && sens.is_none() {
-        return open_dialog(s, "messageOptions", json!({"id": focus.0}));
+        let headers = s.mailbox.mail.get(&focus).map(|m| internet_headers(s, m)).unwrap_or_default();
+        return open_dialog(s, "messageOptions", json!({"id": focus.0, "headers": headers}));
     }
     if let Some(m) = s.mailbox.mail.get_mut(&focus) {
         if let Some(i) = imp {
@@ -2297,6 +2637,42 @@ fn message_options(s: &mut Session, p: &Value) -> CmdResult {
     }
     journal(s, &[focus]);
     Ok(ok())
+}
+
+/// Longest header block shown by Message Options (bytes).
+const MAX_HEADER_BYTES: usize = 256 * 1024;
+
+/// The Internet headers of a message, as received: the header block of its source (the stored original or
+/// its blob in the store; a message without either gets the headers rebuilt from its fields). Unfolded
+/// lines are kept as they are; the text is capped at [`MAX_HEADER_BYTES`].
+pub(crate) fn internet_headers(s: &Session, m: &MailItem) -> String {
+    let stored = match &s.store {
+        Some(st) if m.raw.is_none() => st.head_of(m, MAX_HEADER_BYTES).ok().flatten(),
+        _ => m.raw.as_ref().map(|r| r.get(..r.len().min(MAX_HEADER_BYTES)).unwrap_or_default().to_vec()),
+    };
+    let raw = match stored {
+        Some(r) if !r.is_empty() => r,
+        _ => item_source(m),
+    };
+    header_block(&raw)
+}
+
+/// The header block of an RFC 5322 message (everything before the first empty line), as text.
+fn header_block(raw: &[u8]) -> String {
+    let mut end = raw.len().min(MAX_HEADER_BYTES);
+    let head = raw.get(..end).unwrap_or_default();
+    for (i, w) in head.windows(2).enumerate() {
+        if w == b"\n\n" {
+            end = i.saturating_add(1);
+            break;
+        }
+        if w == b"\n\r" && head.get(i.saturating_add(2)) == Some(&b'\n') {
+            end = i.saturating_add(1);
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(raw.get(..end).unwrap_or_default()).replace("\r\n", "\n");
+    text.trim_end_matches('\n').to_owned()
 }
 
 /// RFC 5322 source of an item: the stored original, else one rebuilt from its fields.
@@ -2634,6 +3010,27 @@ mod tests {
         assert_eq!(r["dialog"], "alwaysMoveConversation");
     }
 
+    #[test]
+    fn always_move_conversation_rule_follows_message_ids_not_the_subject() {
+        let mut f = fx();
+        f.s.mailbox.mail.get_mut(&f.c).unwrap().message_id = Some("lunch-1@example.com".into());
+        let proj = f.s.mailbox.create_folder(f.inbox, "Lunch stuff").unwrap();
+        f.s.selection.items = vec![f.c];
+        f.s.selection.focus = Some(f.c);
+        always_move_conversation(&mut f.s, &json!({"folder": proj.0})).unwrap();
+        let rule = f.s.mailbox.rules.last().unwrap().clone();
+        assert_eq!(
+            rule.conditions,
+            vec![mailcraft_model::RuleCondition::HeaderContains(vec!["<lunch-1@example.com>".into()])]
+        );
+        let ctx = mailcraft_model::rule::RuleContext::default();
+        let mut reply = msg(f.inbox, "Re: Lunch", "dan@example.com", "Count me in", at(20736, 9));
+        reply.references = vec!["lunch-1@example.com".into()];
+        assert!(rule.conditions[0].matches(&reply, &ctx));
+        let unrelated = msg(f.inbox, "Lunch", "erin@example.com", "Different lunch", at(20736, 10));
+        assert!(!rule.conditions[0].matches(&unrelated, &ctx), "same subject, other conversation");
+    }
+
     /// Params of the last `name` dialog the session asked for.
     fn last_dialog(s: &Session, name: &str) -> Value {
         s.notices
@@ -2819,6 +3216,29 @@ mod tests {
     }
 
     #[test]
+    fn focused_sender_override_wins_back_a_sender() {
+        let mut f = fx();
+        f.s.selection.items = vec![f.c];
+        f.s.selection.focus = Some(f.c);
+        f.s.run("mail.alwaysMoveToOther", &json!({})).unwrap();
+        assert_eq!(f.s.mailbox.mail[&f.c].focus, FocusClass::Other);
+        // From the Other tab: Move to Focused moves one message, Always Move to Focused the sender.
+        f.s.run("mail.moveToFocused", &json!({"ids": [f.c.0]})).unwrap();
+        assert_eq!(f.s.mailbox.mail[&f.c].focus, FocusClass::Focused);
+        f.s.run("mail.moveToOther", &json!({"ids": [f.c.0]})).unwrap();
+        let r = f.s.run("mail.alwaysMoveToFocused", &json!({"ids": [f.c.0]})).unwrap();
+        assert_eq!(r["persisted"], true);
+        assert_eq!(f.s.mailbox.mail[&f.c].focus, FocusClass::Focused);
+        assert!(other_senders(&f.s).is_empty(), "the sender leaves the Other list");
+        assert_eq!(focused_senders(&f.s), vec!["alice@example.com".to_owned()]);
+        let later =
+            f.s.mailbox.add_mail(msg(f.inbox, "Lunch again", "Alice@Example.com", "Tuesday?", at(20736, 9)));
+        f.s.mailbox.mail.get_mut(&later).unwrap().focus = FocusClass::Other;
+        assert_eq!(apply_focus_overrides(&mut f.s, &[later]), vec![later]);
+        assert_eq!(f.s.mailbox.mail[&later].focus, FocusClass::Focused);
+    }
+
+    #[test]
     fn other_tab() {
         let mut f = fx();
         move_to_other(&mut f.s, &Value::Null).unwrap();
@@ -2976,7 +3396,11 @@ mod tests {
         let mut f = fx();
         f.s.selection.items = vec![f.c];
         f.s.selection.focus = Some(f.c);
+        // Turning Ignore on asks first; nothing changes until the answer comes back.
         let r = ignore(&mut f.s, &Value::Null).unwrap();
+        assert_eq!(r["dialog"], "confirm");
+        assert!(!f.s.mailbox.mail[&f.b].ignored);
+        let r = ignore(&mut f.s, &json!({"confirm": true})).unwrap();
         assert_eq!(r["ignored"], true);
         let deleted = role(&f.s, FolderRole::DeletedItems);
         assert_eq!(folder_of(&f.s, f.b), deleted);
@@ -2988,6 +3412,73 @@ mod tests {
         assert_eq!(r["ignored"], false);
         assert_eq!(folder_of(&f.s, f.b), f.inbox);
         assert!(!f.s.mailbox.mail[&f.c].ignored);
+    }
+
+    #[test]
+    fn message_options_shows_the_received_headers() {
+        let mut f = fx();
+        let raw = b"Received: from mx.example.net by mail.example.org\r\n\tid 42; Thu, 8 Oct 2026 07:30:00 +0000\r\nFrom: Ann <ann@example.com>\r\nSubject: Hi\r\nX-Spam-Score: 0.1\r\n\r\nBody text\r\nFrom: not a header\r\n";
+        f.s.mailbox.mail.get_mut(&f.a).unwrap().raw = Some(raw.to_vec());
+        message_options(&mut f.s, &json!({"ids": [f.a.0]})).unwrap();
+        let Some(Notice::OpenDialog(name, p)) = f.s.notices.last() else { panic!("no dialog") };
+        assert_eq!(name, "messageOptions");
+        let h = p["headers"].as_str().unwrap();
+        assert!(h.starts_with("Received: from mx.example.net"), "{h}");
+        assert!(h.contains("\tid 42;"), "folded lines stay");
+        assert!(h.contains("X-Spam-Score: 0.1"));
+        assert!(!h.contains("Body text") && !h.contains("not a header"), "{h}");
+        // Without a stored source the headers are rebuilt from the item.
+        message_options(&mut f.s, &json!({"ids": [f.b.0]})).unwrap();
+        let Some(Notice::OpenDialog(_, p)) = f.s.notices.last() else { panic!("no dialog") };
+        assert!(p["headers"].as_str().unwrap().contains("Subject: "), "{p}");
+        assert_eq!(header_block(b"A: 1\nB: 2\n\nbody"), "A: 1\nB: 2");
+        assert_eq!(header_block(b""), "");
+    }
+
+    #[test]
+    fn archive_remembers_the_folder_picked_for_an_account_without_one() {
+        let mut f = fx();
+        let archive_role = role(&f.s, FolderRole::Archive);
+        f.s.mailbox.folders.get_mut(&archive_role).unwrap().role = None;
+        let r = archive(&mut f.s, &json!({"ids": [f.a.0]})).unwrap();
+        assert_eq!(r["dialog"], "archiveFolder");
+        let keep = f.s.mailbox.create_folder(f.inbox, "Kept").unwrap();
+        let r = archive(&mut f.s, &json!({"ids": [f.a.0], "folder": keep.0, "remember": true})).unwrap();
+        assert_eq!(r["remembered"], true);
+        assert_eq!(folder_of(&f.s, f.a), keep);
+        // The next archive goes straight there.
+        let r = archive(&mut f.s, &json!({"ids": [f.b.0]})).unwrap();
+        assert_eq!(r["moved"], 1);
+        assert_eq!(folder_of(&f.s, f.b), keep);
+        // An account that has an Archive folder keeps it.
+        let other = f.s.mailbox.create_folder(f.inbox, "Other").unwrap();
+        let r = archive(&mut f.s, &json!({"ids": [f.c.0], "folder": other.0, "remember": true})).unwrap();
+        assert_eq!(r["remembered"], false);
+        assert!(f.s.mailbox.folder(other).unwrap().role.is_none());
+    }
+
+    #[test]
+    fn follow_up_kind_names_the_menu_entry_a_flag_came_from() {
+        let mut f = fx();
+        assert_eq!(follow_up_kind(&f.s, &FlagState::None), None);
+        for key in ["today", "nextWeek", "noDate"] {
+            f.s.run("mail.flag", &json!({"ids": [f.a.0], "kind": key})).unwrap();
+            assert_eq!(follow_up_kind(&f.s, &f.s.mailbox.mail[&f.a].flag), Some(key), "{key}");
+        }
+        assert_eq!(follow_up_kind(&f.s, &FlagState::Complete { completed: None }), None);
+    }
+
+    #[test]
+    fn ignore_prompt_can_be_switched_off() {
+        let mut f = fx();
+        let r = ignore(&mut f.s, &json!({"ids": [f.c.0]})).unwrap();
+        assert_eq!(r["dialog"], "confirm");
+        let Some(Notice::OpenDialog(_, p)) = f.s.notices.last() else { panic!("no dialog") };
+        assert_eq!(p["command"], "mail.ignore");
+        assert_eq!(p["params"]["confirm"], true);
+        assert_eq!(p["dontAsk"], IGNORE_DONT_ASK);
+        f.s.settings.set(IGNORE_DONT_ASK, &json!(true)).unwrap();
+        assert_eq!(ignore(&mut f.s, &json!({"ids": [f.c.0]})).unwrap()["ignored"], true);
     }
 
     #[test]
@@ -3005,9 +3496,11 @@ mod tests {
     fn clean_up_keeps_flagged_and_categorized() {
         let mut f = fx();
         f.s.mailbox.mail.get_mut(&f.c).unwrap().categories.push("Red category".into());
-        let r = clean_up_folder(&mut f.s, &Value::Null).unwrap();
+        assert_eq!(clean_up_folder(&mut f.s, &Value::Null).unwrap()["dialog"], "confirm", "asks first");
+        let r = clean_up_folder(&mut f.s, &json!({"confirm": true})).unwrap();
         assert_eq!(r["moved"], 0);
         f.s.mailbox.mail.get_mut(&f.c).unwrap().categories.clear();
+        f.s.settings.set(CLEAN_UP_DONT_ASK, &json!(true)).unwrap();
         let sub = f.s.mailbox.create_folder(f.inbox, "Sub").unwrap();
         f.s.mailbox.move_items(&[f.c], sub).unwrap();
         // Folder-only clean up of Inbox no longer sees c; subfolders variant does.
@@ -3137,10 +3630,100 @@ mod tests {
         assert_eq!(folder_of(&f.s, f.b), junkf);
         junk(&mut f.s, &json!({"ids": [f.b.0], "action": "notJunk"})).unwrap();
         assert_eq!(folder_of(&f.s, f.b), f.inbox);
-        report(&mut f.s, &json!({"ids": [f.c.0], "kind": "phishing"})).unwrap();
+        report(&mut f.s, &json!({"ids": [f.c.0], "kind": "junk"})).unwrap();
         assert_eq!(folder_of(&f.s, f.c), junkf);
         assert!(f.s.mailbox.mail[&f.c].read);
         assert!(block(&mut f.s, &json!({"kind": "everyone"})).is_err());
+    }
+
+    #[test]
+    fn report_phishing_asks_then_deletes_and_blocks_and_can_forward_a_copy() {
+        let mut f = fx();
+        let sender = f.s.mailbox.mail[&f.c].from.as_ref().unwrap().addr.to_lowercase();
+        let r = report(&mut f.s, &json!({"ids": [f.c.0], "kind": "phishing"})).unwrap();
+        assert_eq!(r["dialog"], "confirm");
+        assert_eq!(folder_of(&f.s, f.c), f.inbox, "nothing happens before the answer");
+        f.s.settings.set(REPORT_ADDRESS, &json!("abuse@example.net")).unwrap();
+        let r = report(&mut f.s, &json!({"ids": [f.c.0], "kind": "phishing", "confirm": true})).unwrap();
+        assert_eq!(folder_of(&f.s, f.c), role(&f.s, FolderRole::DeletedItems));
+        assert!(f.s.mailbox.mail[&f.c].read);
+        assert_eq!(r["blocked"], json!([sender]));
+        assert!(f.s.mailbox.junk.list(JunkList::BlockedSenders).contains(&sender));
+        let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.to, "abuse@example.net");
+        assert!(c.subject.starts_with("Phishing report: "), "{}", c.subject);
+        assert_eq!(c.attachments.len(), 1);
+        assert_eq!(c.attachments[0].mime_type, "message/rfc822");
+    }
+
+    /// Regression: reporting phishing that forged the user's own address blocked that address, sending the
+    /// user's own mail to Junk from then on.
+    #[test]
+    fn report_phishing_never_blocks_my_own_address() {
+        let mut f = fx();
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.c) {
+            m.from = Some(mailcraft_model::Address::new(Some("Me"), "Test.User@example.net"));
+        }
+        f.s.run(
+            "mail.junk",
+            &json!({"action": "add", "list": "safeSenders", "entry": "test.user@example.net"}),
+        )
+        .unwrap();
+        let r =
+            report(&mut f.s, &json!({"ids": [f.c.0, f.a.0], "kind": "phishing", "confirm": true})).unwrap();
+        assert_eq!(r["blocked"], json!(["carol@example.com"]));
+        assert_eq!(r["notBlocked"], json!(["test.user@example.net"]));
+        assert!(
+            !f.s.mailbox.junk.list(JunkList::BlockedSenders).contains(&"test.user@example.net".to_owned())
+        );
+        assert!(f.s.mailbox.junk.list(JunkList::SafeSenders).contains(&"test.user@example.net".to_owned()));
+        assert_eq!(folder_of(&f.s, f.c), role(&f.s, FolderRole::DeletedItems), "it is still reported");
+    }
+
+    /// Regression: the abuse-desk copy of a message whose source had moved to the store's blobs was rebuilt
+    /// from the stored fields, without the Received / Authentication-Results headers the desk needs.
+    #[test]
+    fn report_forwards_the_original_source_from_the_store() {
+        const RAW: &[u8] = b"Received: from mx.example.org by mail.example.net; Thu, 08 Oct 2026 07:30:00 +0000\r\n\
+Authentication-Results: mail.example.net; spf=fail\r\nFrom: Bank <bank@example.org>\r\nTo: me@example.net\r\n\
+Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@example.org>\r\n\r\nClick.\r\n";
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::open(dir.path()).unwrap();
+        let acct = s.mailbox.default_account().map(|a| a.id).unwrap();
+        let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
+        let msg = mailcraft_mime::parse(RAW).unwrap();
+        let mut item = MailItem::from_message(&msg, RAW, s.now());
+        item.folder = inbox;
+        item.raw = Some(RAW.to_vec());
+        let id = s.mailbox.add_mail(item);
+        s.store.as_mut().unwrap().checkpoint_mut(&mut s.mailbox, true).unwrap();
+        assert!(s.mailbox.mail[&id].raw.is_none(), "the source lives in the store now");
+        s.settings.set(REPORT_ADDRESS, &json!("abuse@example.net")).unwrap();
+        s.selection.folder = inbox;
+        s.selection.items = vec![id];
+        s.selection.focus = Some(id);
+        let r = s.run("mail.report", &json!({"ids": [id.0], "kind": "phishing", "confirm": true})).unwrap();
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.attachments[0].data, RAW, "the original source, every header included");
+    }
+
+    /// Too many messages for the abuse-desk copy: the messages are still reported, and the user is told.
+    #[test]
+    fn report_still_reports_when_the_copy_cannot_be_attached() {
+        let mut f = fx();
+        f.s.settings.set(REPORT_ADDRESS, &json!("abuse@example.net")).unwrap();
+        let mut ids = vec![f.a.0];
+        for i in 0..=crate::cmd::respond::MAX_FORWARD_ITEMS {
+            ids.push(
+                f.s.mailbox
+                    .add_mail(msg(f.inbox, &format!("Spam {i}"), "spam@example.org", "x", at(20735, 9)))
+                    .0,
+            );
+        }
+        let r = report(&mut f.s, &json!({"ids": ids, "kind": "junk"})).unwrap();
+        assert!(r["compose"].is_null());
+        assert!(r["reportError"].as_str().unwrap().contains("at most"));
+        assert_eq!(r["moved"], ids.len());
     }
 
     #[test]

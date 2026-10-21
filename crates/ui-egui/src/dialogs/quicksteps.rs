@@ -596,6 +596,12 @@ fn first_use(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         if needs_to {
                             o.insert("to".into(), json!(common::split_list(&st.to)));
                         }
+                        // The items the step was run on (a read window's message, a group's items).
+                        for key in ["ids", "group"] {
+                            if let Some(v) = d.get(key) {
+                                o.insert(key.into(), v.clone());
+                            }
+                        }
                     }
                     app.run("quicksteps.run", p);
                     return Out::Close;

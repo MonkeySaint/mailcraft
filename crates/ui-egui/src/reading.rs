@@ -139,7 +139,7 @@ pub const NEXT_LINK: &str = "Next message";
 
 /// Reading Pane options › "Mark items as read when viewed in the Reading Pane" after the wait in seconds.
 fn mark_read_timer(ctx: &egui::Context, app: &mut App, id: u64) {
-    let key = Id::new("mailcraft.reading.read-timer");
+    let key = per_viewport(ctx, Id::new("mailcraft.reading.read-timer"));
     let st = &app.s.settings;
     let unread = app.s.mailbox.mail.get(&ItemId(id)).is_some_and(|m| !m.read);
     if !st.bool("mail.readingPane.markReadWhenViewed") || !unread {
@@ -173,12 +173,45 @@ struct ReadScroll {
     view: f32,
 }
 
-fn scroll_id() -> Id {
-    Id::new("mailcraft.reading.scroll-metrics")
+fn scroll_id(ctx: &egui::Context) -> Id {
+    per_viewport(ctx, Id::new("mailcraft.reading.scroll-metrics"))
 }
 
-fn pending_scroll_id() -> Id {
-    Id::new("mailcraft.reading.scroll-to")
+fn pending_scroll_id(ctx: &egui::Context) -> Id {
+    per_viewport(ctx, Id::new("mailcraft.reading.scroll-to"))
+}
+
+/// `base` for the window being drawn: the main window keeps `base`, each explorer window (a second main
+/// window, its own viewport) gets its own id, so their reading panes never share caches or find bars.
+fn per_viewport(ctx: &egui::Context, base: Id) -> Id {
+    salted(base, ctx.viewport_id())
+}
+
+/// `base` for viewport `vp` (see [`per_viewport`]).
+fn salted(base: Id, vp: egui::ViewportId) -> Id {
+    if vp == egui::ViewportId::ROOT { base } else { base.with(vp) }
+}
+
+/// [`per_viewport`] for the main surface (read windows already have ids of their own).
+fn surface_id(ctx: &egui::Context, base: Id, surface: Surface) -> Id {
+    if surface == Surface::Main { per_viewport(ctx, base) } else { base }
+}
+
+/// Drops the reading-pane state an explorer window kept (it closed).
+pub(crate) fn forget_viewport(ctx: &egui::Context, vp: egui::ViewportId) {
+    if vp == egui::ViewportId::ROOT {
+        return;
+    }
+    let salt = |base: Id| salted(base, vp);
+    ctx.data_mut(|d| {
+        d.remove::<MsgCache>(salt(Id::new(("mailcraft.reading.cache", Surface::Main))));
+        d.remove::<FindBar>(salt(Id::new(("mailcraft.reading.find", Surface::Main))));
+        d.remove::<(u64, Request)>(salt(Id::new(("mailcraft.reading.request", Surface::Main))));
+        d.remove::<ReadScroll>(salt(Id::new("mailcraft.reading.scroll-metrics")));
+        d.remove::<f32>(salt(Id::new("mailcraft.reading.scroll-to")));
+        d.remove::<(u64, f64)>(salt(Id::new("mailcraft.reading.read-timer")));
+        d.remove::<[egui::Rect; 3]>(salt(egui::Id::new(("mailcraft.reading.stops", Surface::Main.key()))));
+    });
 }
 
 /// Space-bar reading (Reading Pane options › "Single key reading using space bar"): pages the reading pane
@@ -186,14 +219,17 @@ fn pending_scroll_id() -> Id {
 /// Returns whether anything happened.
 pub fn space_read(ctx: &egui::Context, app: &mut App, back: bool) -> bool {
     let focus = focused_mail(app);
-    let m = ctx.data_mut(|d| d.get_temp::<ReadScroll>(scroll_id()));
+    // Ids are made before `data` locks the context (making one reads the context).
+    let key = scroll_id(ctx);
+    let m = ctx.data_mut(|d| d.get_temp::<ReadScroll>(key));
     if let Some(m) = m.filter(|m| Some(m.item) == focus && m.view > 0.0) {
         let max = (m.content - m.view).max(0.0);
         let page = (m.view * 0.9).max(20.0);
         let at_end = if back { m.offset <= 0.5 } else { m.offset >= max - 0.5 };
         if !at_end {
             let target = if back { m.offset - page } else { m.offset + page };
-            ctx.data_mut(|d| d.insert_temp(pending_scroll_id(), target.clamp(0.0, max)));
+            let key = pending_scroll_id(ctx);
+            ctx.data_mut(|d| d.insert_temp(key, target.clamp(0.0, max)));
             ctx.request_repaint();
             return true;
         }
@@ -207,7 +243,24 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
     let mut closed: Vec<u64> = Vec::new();
     let after = app.s.settings.text("mail.other.afterMoveOrDelete");
     for id in ids {
-        let Some(m) = app.s.mailbox.mail.get(&ItemId(id)) else {
+        // The folder the item was in when the window first showed it: deleting, archiving or moving the item
+        // takes it out of that folder, which counts as the item leaving the window.
+        let folder_key = folder_id(id);
+        let current = app.s.mailbox.mail.get(&ItemId(id)).map(|m| m.folder.0);
+        let opened_in = ctx.data_mut(|d| d.get_temp::<u64>(folder_key));
+        if opened_in.is_none()
+            && let Some(f) = current
+        {
+            ctx.data_mut(|d| d.insert_temp(folder_key, f));
+        }
+        let left = match (current, opened_in) {
+            (None, _) => true,
+            (Some(now), Some(then)) => now != then,
+            (Some(_), None) => false,
+        };
+        let m = app.s.mailbox.mail.get(&ItemId(id)).filter(|_| !left);
+        let Some(m) = m else {
+            ctx.data_mut(|d| d.remove::<u64>(folder_key));
             // Mail › "After moving or deleting an open item": open the previous / next item in this window, or
             // return to the folder (close).
             let neighbour = ctx.data_mut(|d| d.get_temp::<(Option<u64>, Option<u64>)>(neighbour_id(id)));
@@ -217,6 +270,7 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
                 _ => None,
             }
             .filter(|n| app.s.mailbox.mail.contains_key(&ItemId(*n)) && !app.ui.read_windows.contains(n));
+            let next = next.filter(|n| *n != id);
             match next {
                 Some(n) => {
                     if let Some(slot) = app.ui.read_windows.iter_mut().find(|w| **w == id) {
@@ -251,7 +305,10 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
     if !closed.is_empty() {
         app.ui.read_windows.retain(|i| !closed.contains(i));
         for id in closed {
-            let key = cache_id(Surface::Read(id));
+            if !app.ui.read_windows.contains(&id) {
+                ctx.data_mut(|d| d.remove::<u64>(folder_id(id)));
+            }
+            let key = cache_id(ctx, Surface::Read(id));
             ctx.data_mut(|d| d.remove::<MsgCache>(key));
         }
     }
@@ -259,6 +316,11 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
 
 fn neighbour_id(item: u64) -> Id {
     Id::new(("mailcraft.read-window.neighbours", item))
+}
+
+/// Folder a read window's item was in when the window opened on it.
+fn folder_id(item: u64) -> Id {
+    Id::new(("mailcraft.read-window.folder", item))
 }
 
 /// "<subject> - Message (HTML)".
@@ -342,8 +404,8 @@ struct MsgCache {
     view: BodyView,
 }
 
-fn cache_id(surface: Surface) -> Id {
-    Id::new(("mailcraft.reading.cache", surface))
+fn cache_id(ctx: &egui::Context, surface: Surface) -> Id {
+    surface_id(ctx, Id::new(("mailcraft.reading.cache", surface)), surface)
 }
 
 /// Cheap identity of a stored body (no full-content hash per frame).
@@ -410,23 +472,37 @@ pub const FIND_CLOSE: &str = "Close find";
 /// Shown when nothing matches.
 pub const NO_MATCHES: &str = "No results";
 
-fn request_id(surface: Surface) -> Id {
-    Id::new(("mailcraft.reading.request", surface))
+fn request_id(ctx: &egui::Context, surface: Surface) -> Id {
+    surface_id(ctx, Id::new(("mailcraft.reading.request", surface)), surface)
 }
 
-fn find_id(surface: Surface) -> Id {
-    Id::new(("mailcraft.reading.find", surface))
+fn find_id(ctx: &egui::Context, surface: Surface) -> Id {
+    surface_id(ctx, Id::new(("mailcraft.reading.find", surface)), surface)
 }
 
-fn find_field_id(surface: Surface) -> Id {
-    Id::new(("mailcraft.reading.find-field", surface))
+fn find_field_id(ctx: &egui::Context, surface: Surface) -> Id {
+    surface_id(ctx, Id::new(("mailcraft.reading.find-field", surface)), surface)
 }
 
 /// Hands a Find / Select request for message `item` to the view showing it: its read window when one is
 /// open, else the reading pane.
 pub fn request(ctx: &egui::Context, app: &App, item: u64, r: Request) {
     let surface = if app.ui.read_windows.contains(&item) { Surface::Read(item) } else { Surface::Main };
-    ctx.data_mut(|d| d.insert_temp(request_id(surface), (item, r)));
+    // Made from a dialog of the main window: explorer windows showing the item get it too (the view that
+    // shows the item takes it; the others leave it).
+    if surface == Surface::Main && ctx.viewport_id() == egui::ViewportId::ROOT {
+        for w in &app.ui.explorers {
+            if w.selection.focus == Some(ItemId(item)) || w.selection.items.contains(&ItemId(item)) {
+                let id = salted(
+                    Id::new(("mailcraft.reading.request", Surface::Main)),
+                    crate::explorer::viewport_id(w.id),
+                );
+                ctx.data_mut(|d| d.insert_temp(id, (item, r.clone())));
+            }
+        }
+    }
+    let key = request_id(ctx, surface);
+    ctx.data_mut(|d| d.insert_temp(key, (item, r)));
     ctx.request_repaint();
 }
 
@@ -448,7 +524,8 @@ struct FindBar {
 }
 
 fn find_bar_state(ctx: &egui::Context, surface: Surface) -> FindBar {
-    ctx.data(|d| d.get_temp::<FindBar>(find_id(surface))).unwrap_or_default()
+    let key = find_id(ctx, surface);
+    ctx.data(|d| d.get_temp::<FindBar>(key)).unwrap_or_default()
 }
 
 /// Recomputes the matches when the text, case or message changed; keeps the current match in range.
@@ -489,13 +566,14 @@ fn take_request(ctx: &egui::Context, surface: Surface, id: u64, bar: &mut FindBa
             bar.text = t.chars().take(200).collect();
         }
     }
-    let Some((item, r)) = ctx.data(|d| d.get_temp::<(u64, Request)>(request_id(surface))) else {
+    let key = request_id(ctx, surface);
+    let Some((item, r)) = ctx.data(|d| d.get_temp::<(u64, Request)>(key)) else {
         return;
     };
     if item != id {
         return;
     }
-    ctx.data_mut(|d| d.remove::<(u64, Request)>(request_id(surface)));
+    ctx.data_mut(|d| d.remove::<(u64, Request)>(key));
     match r {
         Request::Find { text, match_case } => {
             bar.open = true;
@@ -544,7 +622,7 @@ fn find_bar(ui: &mut Ui, app: &App, surface: Surface, bar: &mut FindBar) {
                 let field_w = (ui.available_width() - 260.0).clamp(80.0, 320.0);
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut bar.text)
-                        .id(find_field_id(surface))
+                        .id(find_field_id(ui.ctx(), surface))
                         .hint_text("Find")
                         .desired_width(field_w),
                 );
@@ -640,7 +718,7 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
         return;
     };
     let ctx = ui.ctx().clone();
-    let key = cache_id(surface);
+    let key = cache_id(&ctx, surface);
     let mut cache: MsgCache = ctx.data_mut(|d| d.remove_temp::<MsgCache>(key)).unwrap_or_default();
     // Junk Email Options › "Disable links and other functionality in phishing messages": a message in Junk
     // Email is shown as plain text, without pictures, and its links do not open.
@@ -709,8 +787,9 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     let mut area = egui::ScrollArea::vertical()
         .id_salt(("mailcraft.reading.scroll", surface, id))
         .auto_shrink([false, false]);
+    let pending_scroll = pending_scroll_id(&ctx);
     if surface == Surface::Main
-        && let Some(y) = ctx.data_mut(|d| d.remove_temp::<f32>(pending_scroll_id()))
+        && let Some(y) = ctx.data_mut(|d| d.remove_temp::<f32>(pending_scroll))
     {
         area = area.vertical_scroll_offset(y);
     }
@@ -749,7 +828,8 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
         let header = egui::Rect::from_x_y_ranges(r.x_range(), r.top()..=top.clamp(r.top(), r.bottom()));
         let info = egui::Rect::from_x_y_ranges(r.x_range(), top.clamp(r.top(), r.bottom())..=r.bottom());
         let stops = [header, info, body_frame.response.rect].map(|s| s.intersect(visible));
-        ctx.data_mut(|d| d.insert_temp(stops_id(surface), stops));
+        let key = stops_id(&ctx, surface);
+        ctx.data_mut(|d| d.insert_temp(key, stops));
     });
     if surface == Surface::Main {
         let m = ReadScroll {
@@ -758,13 +838,15 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             content: shown.content_size.y,
             view: shown.inner_rect.height(),
         };
-        ctx.data_mut(|d| d.insert_temp(scroll_id(), m));
+        let key = scroll_id(&ctx);
+        ctx.data_mut(|d| d.insert_temp(key, m));
     }
     // The body's Find… (right-click) opens the bar on the next frame.
     if cache.view.find_requested {
         ctx.request_repaint();
     }
-    ctx.data_mut(|d| d.insert_temp(find_id(surface), bar));
+    let find_key = find_id(&ctx, surface);
+    ctx.data_mut(|d| d.insert_temp(find_key, bar));
     ctx.data_mut(|d| d.insert_temp(key, cache));
     if let Some(href) = clicked_link
         && !links_off
@@ -923,14 +1005,15 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
     info_top
 }
 
-fn stops_id(surface: Surface) -> egui::Id {
-    egui::Id::new(("mailcraft.reading.stops", surface.key()))
+fn stops_id(ctx: &egui::Context, surface: Surface) -> egui::Id {
+    surface_id(ctx, egui::Id::new(("mailcraft.reading.stops", surface.key())), surface)
 }
 
 /// Where the message view of `surface` drew its header, info bars and body in the last frame (visible
 /// parts; empty rectangles when there were none): the read window's F6 stops.
 fn view_stops(ctx: &egui::Context, surface: Surface) -> [egui::Rect; 3] {
-    ctx.data(|d| d.get_temp::<[egui::Rect; 3]>(stops_id(surface))).unwrap_or([egui::Rect::NOTHING; 3])
+    let key = stops_id(ctx, surface);
+    ctx.data(|d| d.get_temp::<[egui::Rect; 3]>(key)).unwrap_or([egui::Rect::NOTHING; 3])
 }
 
 fn recipients_line(ui: &mut Ui, label: &str, names: &str, theme: &crate::theme::Theme) {
@@ -1558,6 +1641,40 @@ mod tests {
         (App::new(s), id.0)
     }
 
+    /// Regression: an explorer window's reading pane shared the main window's cache slot, so with two
+    /// different messages shown each frame threw the other's parsed body and selection away.
+    #[test]
+    fn main_and_explorer_reading_panes_keep_their_own_caches() {
+        let s = sample_session();
+        let mut bodies = s.mailbox.mail.values().filter(|m| m.body.html.is_some() || m.body.text.is_some());
+        let (a, b) = (bodies.next().unwrap().id, bodies.next().unwrap().id);
+        let mut app = App::new(s);
+        let ctx = egui::Context::default();
+        let explorer = crate::explorer::viewport_id(1);
+        let frame = Frame { width: 1400.0, height: 900.0, ..Frame::default() };
+        let base = Id::new(("mailcraft.reading.cache", Surface::Main));
+        let draw = |app: &mut App, vp: egui::ViewportId, item: ItemId| {
+            app.s.selection.items = vec![item];
+            app.s.selection.focus = Some(item);
+            let mut input = egui::RawInput { viewport_id: vp, ..Default::default() };
+            input.viewports.insert(vp, egui::ViewportInfo::default());
+            let mut out = ctx.run_ui(input, |ui| reading_pane(ui, app, &frame));
+            out.textures_delta.clear();
+            ctx.data(|d| d.get_temp::<MsgCache>(salted(base, vp))).unwrap()
+        };
+        let main1 = draw(&mut app, egui::ViewportId::ROOT, a);
+        let other1 = draw(&mut app, explorer, b);
+        let main2 = draw(&mut app, egui::ViewportId::ROOT, a);
+        let other2 = draw(&mut app, explorer, b);
+        assert_eq!((main2.item, other2.item), (a.0, b.0));
+        assert!(Arc::ptr_eq(&main1.doc, &main2.doc), "the main window's body was not parsed again");
+        assert!(Arc::ptr_eq(&other1.doc, &other2.doc), "the explorer window's body was not parsed again");
+        // Closing the explorer window drops its state.
+        forget_viewport(&ctx, explorer);
+        assert!(ctx.data(|d| d.get_temp::<MsgCache>(salted(base, explorer))).is_none());
+        assert!(ctx.data(|d| d.get_temp::<MsgCache>(base)).is_some());
+    }
+
     #[test]
     fn find_bar_highlights_steps_and_closes() {
         let (app, id) = app_with_text("apple pie and apple tart\nno more Apple");
@@ -1598,16 +1715,17 @@ mod tests {
         let ctx = h.ctx.clone();
         request(&ctx, h.state(), id, Request::SelectAll);
         h.run();
-        let cache = ctx.data(|d| d.get_temp::<MsgCache>(cache_id(Surface::Main))).unwrap();
+        let (main_key, req_key) = (cache_id(&ctx, Surface::Main), request_id(&ctx, Surface::Main));
+        let cache = ctx.data(|d| d.get_temp::<MsgCache>(main_key)).unwrap();
         assert_eq!(body::selected_text(&cache.view, &cache.doc).as_deref(), Some("first line\nsecond line"));
         request(&ctx, h.state(), id, Request::SelectSimilar);
         h.run();
-        let cache = ctx.data(|d| d.get_temp::<MsgCache>(cache_id(Surface::Main))).unwrap();
+        let cache = ctx.data(|d| d.get_temp::<MsgCache>(main_key)).unwrap();
         assert!(cache.view.ordered_selection().is_some());
         // A request for another message is left alone.
         request(&ctx, h.state(), id + 999, Request::SelectAll);
         h.run();
-        assert!(ctx.data(|d| d.get_temp::<(u64, Request)>(request_id(Surface::Main))).is_some());
+        assert!(ctx.data(|d| d.get_temp::<(u64, Request)>(req_key)).is_some());
     }
 
     #[test]
@@ -1636,7 +1754,8 @@ mod tests {
         for _ in 0..3 {
             h.run();
         }
-        let cache = h.ctx.data(|d| d.get_temp::<MsgCache>(cache_id(Surface::Read(id)))).unwrap();
+        let key = cache_id(&h.ctx, Surface::Read(id));
+        let cache = h.ctx.data(|d| d.get_temp::<MsgCache>(key)).unwrap();
         assert_eq!(body::selected_text(&cache.view, &cache.doc).as_deref(), Some("pear and pear"));
     }
 
@@ -1758,6 +1877,70 @@ mod tests {
         h.key_press(egui::Key::Escape);
         h.run();
         assert!(h.state().ui.read_windows.is_empty());
+    }
+
+    fn embedded_read_windows(app: App) -> Harness<'static, App> {
+        Harness::builder().with_size(Vec2::new(1000.0, 800.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                let ctx = ui.ctx().clone();
+                read_windows(&ctx, app);
+            },
+            app,
+        )
+    }
+
+    #[test]
+    fn deleting_or_moving_the_open_item_closes_its_window() {
+        for cmd in ["mail.delete", "mail.move"] {
+            let s = sample_session();
+            let inbox = s.selection.folder;
+            let id = s.mailbox.items_in(inbox).first().map(|m| m.id).unwrap();
+            let target = s
+                .mailbox
+                .folders
+                .values()
+                .find(|f| f.kind == mailcraft_model::FolderKind::Mail && f.id != inbox && f.role.is_none())
+                .map(|f| f.id)
+                .unwrap_or(inbox);
+            let mut app = App::new(s);
+            app.ui.read_windows.push(id.0);
+            let mut h = embedded_read_windows(app);
+            h.run();
+            assert_eq!(h.state().ui.read_windows, [id.0]);
+            let params = match cmd {
+                "mail.move" => json!({"ids": [id.0], "folder": target.0}),
+                _ => json!({"ids": [id.0]}),
+            };
+            h.state_mut().s.selection.items = vec![id];
+            h.state_mut().s.selection.focus = Some(id);
+            h.state_mut().s.run(cmd, &params).unwrap();
+            assert!(h.state().s.mailbox.mail.contains_key(&id), "{cmd}: the item still exists elsewhere");
+            h.run();
+            // Default "After moving or deleting an open item": return to the current folder.
+            assert!(h.state().ui.read_windows.is_empty(), "{cmd} left the window open");
+        }
+    }
+
+    #[test]
+    fn moving_the_open_item_can_open_the_next_one() {
+        let mut s = sample_session();
+        s.settings.set("mail.other.afterMoveOrDelete", &json!("openNext")).unwrap();
+        let inbox = s.selection.folder;
+        let items: Vec<ItemId> = s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
+        let order = queries::visible_item_ids(&s);
+        let first = order.first().copied().unwrap();
+        let second = order.get(1).copied().unwrap();
+        assert!(items.contains(&first));
+        let mut app = App::new(s);
+        app.ui.read_windows.push(first.0);
+        let mut h = embedded_read_windows(app);
+        h.run();
+        h.state_mut().s.selection.items = vec![first];
+        h.state_mut().s.selection.focus = Some(first);
+        h.state_mut().s.run("mail.delete", &json!({"ids": [first.0]})).unwrap();
+        h.run();
+        assert_eq!(h.state().ui.read_windows, [second.0]);
     }
 
     #[test]

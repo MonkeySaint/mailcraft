@@ -15,8 +15,6 @@ use crate::{CmdError, CmdResult, CommandSpec, Session, always};
 use mailcraft_model::subject::{forward_subject, reply_subject};
 use mailcraft_model::{FlagState, FolderKind, ItemId, QuickStep, QuickStepAction};
 
-/// Most compose windows a single run opens (reply/forward per selected item).
-const MAX_COMPOSES_PER_RUN: usize = 20;
 /// Most quick steps kept.
 const MAX_STEPS: usize = 200;
 
@@ -40,7 +38,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "quicksteps.run",
             "Run Quick Step",
             Q,
-            r#"{"id": number|string, "folder"?: number, "to"?: [string], "name"?: string} (folder/to/name complete a first-use setup)"#,
+            r#"{"id": number|string, "ids"?: [number], "group"?: bool, "folder"?: number, "to"?: [string], "name"?: string} (folder/to/name complete a first-use setup; group = the items of a list group)"#,
             true,
             has_steps,
             run,
@@ -202,6 +200,27 @@ fn complete_setup(step: &mut QuickStep, p: &Value) -> bool {
     changed
 }
 
+/// Why step `step` cannot run on `count` items (`None` = it can). A step that replies works on one message
+/// at a time (it would otherwise open a reply per message and then act on all of them), and a step that
+/// forwards is unavailable on a list group's header; a plain multi-selection is forwarded as one message
+/// with the messages attached. The gallery and the context menus grey such steps out.
+pub fn blocked_for(step: &QuickStep, count: usize, group: bool) -> Option<&'static str> {
+    let replies =
+        step.actions.iter().any(|a| matches!(a, QuickStepAction::Reply | QuickStepAction::ReplyAll));
+    let forwards = step.actions.iter().any(|a| matches!(a, QuickStepAction::Forward(_)));
+    if replies && (count > 1 || group) {
+        return Some("this quick step replies, so it works on one message at a time");
+    }
+    if forwards && group {
+        return Some("this quick step forwards, so it works on selected messages, not a group");
+    }
+    // Refused before anything runs, so the step's other actions never act on messages it did not forward.
+    if forwards && count > crate::cmd::respond::MAX_FORWARD_ITEMS {
+        return Some("this quick step forwards, so it works on at most 100 messages at a time");
+    }
+    None
+}
+
 fn needs_items(a: &QuickStepAction) -> bool {
     !matches!(a, QuickStepAction::NewMessageTo(_) | QuickStepAction::NewMeeting)
 }
@@ -223,11 +242,15 @@ fn respond(
     s: &mut Session,
     cmd: &str,
     kind: ComposeKind,
-    id: ItemId,
+    ids: &[ItemId],
     to: &[String],
 ) -> Result<Option<u64>, CmdError> {
+    let Some(id) = ids.first().copied() else {
+        return Ok(None);
+    };
     let before = s.next_compose;
-    match invoke(s, cmd, &json!({"ids": [id.0]})) {
+    let list: Vec<u64> = ids.iter().map(|i| i.0).collect();
+    match invoke(s, cmd, &json!({"ids": list})) {
         Ok(_) => {}
         Err(CmdError::Unknown(_)) => {
             let Some(m) = s.mailbox.mail.get(&id) else {
@@ -265,7 +288,9 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params("no such quick step".into()));
     };
     if step.actions.is_empty() {
-        return dialog(s, "editQuickStep", json!({"step": step_json(&step), "template": "custom"}));
+        // An empty step ("Create New") stays in the gallery: it opens the editor on a new step.
+        let (name, actions) = template(s, "custom")?;
+        return dialog(s, "editQuickStep", json!({"template": "custom", "name": name, "actions": actions}));
     }
     if step.needs_setup() && complete_setup(&mut step, p) {
         check_actions(s, &step.actions)?;
@@ -279,11 +304,23 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     if step.needs_setup() {
-        return dialog(s, "quickStepFirstUse", json!({"step": step_json(&step)}));
+        // The items it was run on go with the setup, so the step acts on them once it is set up (a read
+        // window's message, a group's items), not on whatever the list selects by then.
+        let mut params = json!({"step": step_json(&step)});
+        for key in ["ids", "group"] {
+            if let (Some(v), Some(o)) = (p.get(key).filter(|v| !v.is_null()), params.as_object_mut()) {
+                o.insert(key.to_owned(), v.clone());
+            }
+        }
+        return dialog(s, "quickStepFirstUse", params);
     }
     let ids: Vec<ItemId> = s.target_ids(p).into_iter().filter(|id| s.mailbox.mail.contains_key(id)).collect();
     if ids.is_empty() && step.actions.iter().any(needs_items) {
         return Err(CmdError::Disabled("no message selected".into()));
+    }
+    let group = p.get("group").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(why) = blocked_for(&step, ids.len(), group) {
+        return Err(CmdError::Disabled(why.into()));
     }
     let mut touched: Vec<ItemId> = Vec::new();
     let mut composes: Vec<u64> = Vec::new();
@@ -390,12 +427,14 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                     QuickStepAction::Forward(to) => ("mail.forward", ComposeKind::Forward, to.as_slice()),
                     _ => continue,
                 };
-                for id in live.iter().take(MAX_COMPOSES_PER_RUN) {
-                    match respond(s, cmd, kind, *id, to) {
-                        Ok(Some(cid)) => composes.push(cid),
-                        Ok(None) => {}
-                        Err(e) => errors.push(e.to_string()),
-                    }
+                // A reply goes to one message (several are refused above); a forward of several messages is
+                // one new message with all of them attached (more than the forward cap are refused above).
+                // When the response cannot be made, the step stops: the run fails and is rolled back, so a
+                // later Delete or Move never acts on messages that were not answered or forwarded.
+                if !live.is_empty()
+                    && let Some(cid) = respond(s, cmd, kind, &live, to)?
+                {
+                    composes.push(cid);
                 }
             }
             QuickStepAction::NewMeeting => match invoke(s, "calendar.newMeeting", &json!({})) {
@@ -607,6 +646,16 @@ mod tests {
     }
 
     #[test]
+    fn first_use_setup_keeps_the_items_it_was_run_on() {
+        let (mut s, inbox, _) = session();
+        let other = s.mailbox.items_in(inbox)[2].id;
+        s.run("quicksteps.run", &json!({"id": 1, "ids": [other.0]})).unwrap();
+        let Some(crate::Notice::OpenDialog(name, p)) = s.notices.last() else { panic!("no dialog") };
+        assert_eq!(name, "quickStepFirstUse");
+        assert_eq!(p["ids"], json!([other.0]));
+    }
+
+    #[test]
     fn custom_actions() {
         let (mut s, inbox, _) = session();
         s.run(
@@ -716,7 +765,7 @@ mod tests {
         // Without the mail commands the quick step builds the reply itself.
         s.registry.specs.retain(|c| c.id != "mail.reply");
         let target = s.selection.items[0];
-        let cid = respond(&mut s, "mail.reply", ComposeKind::Reply, target, &[]).unwrap().unwrap();
+        let cid = respond(&mut s, "mail.reply", ComposeKind::Reply, &[target], &[]).unwrap().unwrap();
         let c = &s.composes[&cid];
         assert_eq!(c.source, Some(target));
         assert_eq!(c.signature.as_ref().map(|g| g.name.as_str()), Some("Re"));
@@ -757,6 +806,122 @@ mod tests {
         let (mut s, _, _) = session();
         let r = s.run("quicksteps.run", &json!({"id": "Create New"})).unwrap();
         assert_eq!(r["dialog"], "editQuickStep");
+        // The editor opens on a new step (no step id), so saving adds a step and keeps "Create New".
+        let Some(crate::Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
+        assert!(p.get("step").is_none(), "{p}");
+        assert_eq!(p["template"], "custom");
+        assert_eq!(p["name"], "My Quick Step");
+        let before = s.mailbox.quick_steps.len();
+        s.run("quicksteps.new", &json!({"template": "custom", "name": "Mine", "actions": ["MarkRead"]}))
+            .unwrap();
+        assert_eq!(s.mailbox.quick_steps.len(), before + 1);
+        assert!(s.mailbox.quick_steps.iter().any(|q| q.name == "Create New"));
+    }
+
+    #[test]
+    fn reply_steps_refuse_several_messages_and_delete_nothing() {
+        let (mut s, inbox, _) = session();
+        let all: Vec<u64> = s.mailbox.items_in(inbox).iter().map(|m| m.id.0).collect();
+        assert_eq!(all.len(), 3);
+        let r = s.run("quicksteps.run", &json!({"id": "Reply & Delete", "ids": all}));
+        assert!(matches!(r, Err(CmdError::Disabled(_))), "{r:?}");
+        assert_eq!(s.mailbox.total_count(inbox), 3, "nothing may be deleted");
+        assert!(s.composes.is_empty());
+        // A group header refuses it even for one item.
+        let one = json!({"id": "Reply & Delete", "ids": [all[0]], "group": true});
+        assert!(matches!(s.run("quicksteps.run", &one), Err(CmdError::Disabled(_))));
+        let step = s.mailbox.quick_steps.iter().find(|q| q.name == "Reply & Delete").unwrap().clone();
+        assert!(blocked_for(&step, 1, false).is_none());
+        assert!(blocked_for(&step, 2, false).is_some());
+    }
+
+    #[test]
+    fn forward_step_sends_several_messages_as_one_forward_with_attachments() {
+        let (mut s, inbox, _) = session();
+        let all: Vec<u64> = s.mailbox.items_in(inbox).iter().map(|m| m.id.0).collect();
+        let r = s
+            .run("quicksteps.run", &json!({"id": "To Manager", "ids": all, "to": "boss@example.com"}))
+            .unwrap();
+        let composes = r["composes"].as_array().unwrap();
+        assert_eq!(composes.len(), 1, "{r}");
+        let c = &s.composes[&composes[0].as_u64().unwrap()];
+        assert_eq!(c.attachments.len(), 3);
+        assert!(c.to.contains("boss@example.com"));
+        // Not on a list group's header.
+        let group = json!({"id": "To Manager", "ids": all, "group": true});
+        assert!(matches!(s.run("quicksteps.run", &group), Err(CmdError::Disabled(_))));
+    }
+
+    /// Regression: a Forward + Delete step on more than 20 messages forwarded the first 20 and deleted all.
+    #[test]
+    fn forward_and_delete_forwards_every_message_it_deletes() {
+        let (mut s, inbox, _) = session();
+        for i in 0..25 {
+            s.mailbox.add_mail(mailcraft_model::MailItem {
+                folder: inbox,
+                subject: format!("Extra {i}"),
+                ..Default::default()
+            });
+        }
+        let r = s
+            .run(
+                "quicksteps.new",
+                &json!({"name": "Forward & Delete", "actions": [{"Forward": ["boss@example.com"]}, "Delete"]}),
+            )
+            .unwrap();
+        let step = r["id"].clone();
+        let all: Vec<u64> = s.mailbox.items_in(inbox).iter().map(|m| m.id.0).collect();
+        assert_eq!(all.len(), 28);
+        let r = s.run("quicksteps.run", &json!({"id": step, "ids": all})).unwrap();
+        let cid = r["composes"][0].as_u64().unwrap();
+        assert_eq!(s.composes[&cid].attachments.len(), 28, "every deleted message was forwarded");
+        assert_eq!(s.mailbox.total_count(inbox), 0);
+        // Over the forward cap: refused before anything runs.
+        for i in 0..=crate::cmd::respond::MAX_FORWARD_ITEMS {
+            s.mailbox.add_mail(mailcraft_model::MailItem {
+                folder: inbox,
+                subject: format!("Many {i}"),
+                ..Default::default()
+            });
+        }
+        let many: Vec<u64> = s.mailbox.items_in(inbox).iter().map(|m| m.id.0).collect();
+        let composes = s.composes.len();
+        let r = s.run("quicksteps.run", &json!({"id": step, "ids": many}));
+        assert!(matches!(r, Err(CmdError::Disabled(_))), "{r:?}");
+        assert_eq!(s.mailbox.total_count(inbox), many.len(), "nothing was deleted");
+        assert_eq!(s.composes.len(), composes);
+        // A forward that cannot be built (too large) stops the step: nothing is deleted.
+        let big = s.mailbox.add_mail(mailcraft_model::MailItem {
+            folder: inbox,
+            subject: "Huge".into(),
+            size: 60 * 1024 * 1024,
+            ..Default::default()
+        });
+        let r = s.run("quicksteps.run", &json!({"id": step, "ids": [big.0, many[0]]}));
+        assert!(r.is_err(), "{r:?}");
+        assert!(s.mailbox.mail.contains_key(&big));
+        assert_eq!(s.mailbox.mail[&big].folder, inbox);
+        assert_eq!(s.composes.len(), composes);
+        // The cap and the message in `blocked_for` agree.
+        assert!(
+            blocked_for(
+                &s.mailbox.quick_steps.iter().find(|q| q.name == "Forward & Delete").unwrap().clone(),
+                100,
+                false
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn run_acts_on_the_given_ids_not_the_selection() {
+        let (mut s, inbox, proj) = session();
+        let items: Vec<ItemId> = s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
+        s.selection.items = vec![items[0]];
+        s.selection.focus = Some(items[0]);
+        s.run("quicksteps.run", &json!({"id": 1, "folder": proj.0, "ids": [items[2].0]})).unwrap();
+        assert_eq!(s.mailbox.mail[&items[2]].folder, proj);
+        assert_eq!(s.mailbox.mail[&items[0]].folder, inbox);
     }
 
     #[test]

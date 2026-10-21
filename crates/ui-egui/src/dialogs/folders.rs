@@ -31,12 +31,8 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "newSearchFolder" => new_search_folder(ctx, app, d),
         "recoverDeletedItems" => recover(ctx, app, d),
         "confirm" => confirm(ctx, app, d),
-        "mainWindow" => {
-            if let Some(f) = d.u64("folder") {
-                app.run("nav.selectFolder", json!({"folder": f}));
-            }
-            Out::Close
-        }
+        "dataFileProperties" => data_file_properties(ctx, app, d),
+        "openDataFile" => open_data_file(ctx, app, d),
         _ => return None,
     })
 }
@@ -131,7 +127,7 @@ fn finish_pick(ctx: &Context, app: &mut App, d: &Dlg<'_>, f: u64, error: &mut St
     let res = match d.name {
         "moveToFolder" => app.run("mail.move", json!({"folder": f, "ids": ids})),
         "copyToFolder" => app.run("mail.copy", json!({"folder": f, "ids": ids})),
-        "archiveFolder" => app.run("mail.archive", json!({"folder": f, "ids": ids})),
+        "archiveFolder" => app.run("mail.archive", json!({"folder": f, "ids": ids, "remember": true})),
         "alwaysMoveConversation" => app.run("mail.alwaysMoveConversation", json!({"folder": f, "ids": ids})),
         "selectFolder" if d.str("purpose") == "saveSentItemTo" => app.run(
             "compose.saveSentItemTo",
@@ -175,14 +171,33 @@ struct NewFolderState {
 const CONTAINS: [&str; 6] =
     ["Mail and Post Items", "Calendar Items", "Contact Items", "Journal Items", "Note Items", "Task Items"];
 
+/// Engine names of [`CONTAINS`] ("Journal Items" is kept for completeness).
+const CONTAINS_KEYS: [&str; 6] = ["mail", "calendar", "contacts", "journal", "notes", "tasks"];
+
+/// The "Folder contains" choice that matches a folder's kind.
+fn contains_index(app: &App, folder: Option<u64>) -> usize {
+    use mailcraft_model::FolderKind;
+    match folder.and_then(|f| app.s.mailbox.folder(FolderId(f))).map(|f| f.kind) {
+        Some(FolderKind::Calendar) => 1,
+        Some(FolderKind::Contacts) => 2,
+        Some(FolderKind::Journal) => 3,
+        Some(FolderKind::Notes) => 4,
+        Some(FolderKind::Tasks) => 5,
+        _ => 0,
+    }
+}
+
+/// Create New Folder: name, what the folder holds, and where it goes (a folder, or the top of an account
+/// when the dialog was opened from the account's root with `account`).
 fn create_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let parent = d.u64("parent").or(Some(app.s.selection.folder.0));
+    let account = d.u64("account").filter(|_| d.u64("parent").is_none());
+    let parent = if account.is_some() { None } else { d.u64("parent").or(Some(app.s.selection.folder.0)) };
     with_state(
         ctx,
         app,
         uid,
-        |_: &App| NewFolderState { sel: parent, ..Default::default() },
+        |a: &App| NewFolderState { sel: parent, contains: contains_index(a, parent), ..Default::default() },
         |st, app| {
             window(ctx, app, d, "Create New Folder", 340.0, |ui, app| {
                 ui.label("Name:");
@@ -192,20 +207,35 @@ fn create_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     st.focused = true;
                 }
                 ui.label("Folder contains:");
-                ui.add_enabled_ui(false, |ui| {
-                    common::combo_idx(ui, ("contains", uid), &mut st.contains, &CONTAINS, 300.0);
-                })
-                .response
-                .on_disabled_hover_text("New folders hold mail and post items.");
+                common::combo_idx(ui, ("contains", uid), &mut st.contains, &CONTAINS, 300.0);
                 ui.label("Select where to place the folder:");
+                let account_name = account
+                    .and_then(|a| app.s.mailbox.accounts.iter().find(|x| u64::from(x.id.0) == a))
+                    .map(common::account_title);
+                if let Some(name) = &account_name {
+                    // From the account's root: at the top of its folder list, or under a folder picked below.
+                    let top = st.sel.is_none();
+                    if ui.selectable_label(top, format!("{name} (top level)")).clicked() {
+                        st.sel = None;
+                    }
+                }
+                let before = st.sel;
                 folder_tree(ui, app, &mut st.sel, Pick::Parent, ("nf", uid), 200.0);
+                if st.sel != before {
+                    st.contains = contains_index(app, st.sel);
+                }
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
                 }
-                let can = !st.name.trim().is_empty() && st.sel.is_some();
+                let can = !st.name.trim().is_empty() && (st.sel.is_some() || account_name.is_some());
                 match ok_cancel(ui, app, can) {
                     Some(true) => {
-                        match app.run("folder.new", json!({"name": st.name.trim(), "parent": st.sel})) {
+                        let contains = CONTAINS_KEYS.get(st.contains).copied().unwrap_or("mail");
+                        let p = match st.sel {
+                            Some(f) => json!({"name": st.name.trim(), "contains": contains, "parent": f}),
+                            None => json!({"name": st.name.trim(), "contains": contains, "account": account}),
+                        };
+                        match app.run("folder.new", p) {
                             Some(v) => {
                                 if let (Some((to, key)), Some(id)) =
                                     (d.reply_to(), v.get("folder").and_then(Value::as_u64))
@@ -277,19 +307,30 @@ fn rename_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     )
 }
 
+/// Yes/No confirmation: Yes runs `command` with `params`. With `dontAsk` (a profile setting key) it offers
+/// "Don't ask me again", which turns that setting on when the answer is Yes.
 fn confirm(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let title = if d.str("title").is_empty() { "MailCraft".to_owned() } else { d.str("title") };
-    window(ctx, app, d, &title, 380.0, |ui, app| {
+    let dont_ask_key = d.str("dontAsk");
+    let state_id = egui::Id::new(("mc-confirm-dont-ask", d.uid));
+    let mut dont_ask = ctx.data(|m| m.get_temp::<bool>(state_id)).unwrap_or(false);
+    let out = window(ctx, app, d, &title, 380.0, |ui, app| {
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(egui::Vec2::splat(28.0), egui::Sense::hover());
             app.icons.paint(ui, r, "warning", app.theme.flag);
             ui.label(d.str("text"));
         });
+        if !dont_ask_key.is_empty() {
+            ui.checkbox(&mut dont_ask, "Don't ask me again");
+        }
         footer(ui, |ui| {
             if btn(ui, "No") {
                 return Out::Close;
             }
             if primary(ui, app, true, "Yes") {
+                if dont_ask && !dont_ask_key.is_empty() {
+                    app.run("options.set", json!({"key": dont_ask_key, "value": true}));
+                }
                 let cmd = d.str("command");
                 if !cmd.is_empty() {
                     app.run(&cmd, d.get("params").cloned().unwrap_or(json!({})));
@@ -301,7 +342,191 @@ fn confirm(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             }
             Out::Keep
         })
-    })
+    });
+    if matches!(out, Out::Keep) {
+        ctx.data_mut(|m| m.insert_temp(state_id, dont_ask));
+    } else {
+        ctx.data_mut(|m| m.remove::<bool>(state_id));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Data files
+
+#[derive(Clone, Default)]
+struct DataFileState {
+    name: String,
+    note: String,
+    error: String,
+}
+
+/// Data File Properties: the data file's name (editable), where it is kept, its size and counts, and
+/// Compact Now (`file.dataFileProperties`).
+fn data_file_properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let account = d.u64("account");
+    let original = d.str("name");
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| DataFileState { name: original.clone(), ..Default::default() },
+        |st, app| {
+            window(ctx, app, d, "Data File Properties", 420.0, |ui, app| {
+                egui::Grid::new(("dfp", uid)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("Name:");
+                    ui.add(egui::TextEdit::singleline(&mut st.name).desired_width(260.0));
+                    ui.end_row();
+                    if !d.str("address").is_empty() {
+                        ui.label("Account:");
+                        ui.label(d.str("address"));
+                        ui.end_row();
+                    }
+                    ui.label("Location:");
+                    let path = d.str("path");
+                    ui.label(if path.is_empty() { "In memory, not saved".to_owned() } else { path });
+                    ui.end_row();
+                    ui.label("Size:");
+                    ui.label(common::size_text(d.u64("bytes").unwrap_or(0)));
+                    ui.end_row();
+                    ui.label("Contents:");
+                    ui.label(format!(
+                        "{} items in {} folders",
+                        d.u64("items").unwrap_or(0),
+                        d.u64("folders").unwrap_or(0)
+                    ));
+                    ui.end_row();
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let can = !d.str("path").is_empty();
+                    if btn_en(ui, can, "Compact Now") {
+                        match app.run("file.dataFileProperties", json!({"store": account, "compact": true})) {
+                            Some(_) => st.note = "The data file was compacted.".into(),
+                            None => st.error = last_error(app),
+                        }
+                    }
+                    if !st.note.is_empty() {
+                        muted(ui, app, &st.note);
+                    }
+                });
+                muted(ui, app, "Compacting writes the data file afresh, folding in the changes made since.");
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                match ok_cancel(ui, app, !st.name.trim().is_empty()) {
+                    Some(true) => {
+                        if st.name.trim() == original.trim() {
+                            return Out::Close;
+                        }
+                        let p = json!({"store": account, "name": st.name.trim()});
+                        if app.run("file.dataFileProperties", p).is_some() {
+                            Out::Close
+                        } else {
+                            st.error = last_error(app);
+                            Out::Keep
+                        }
+                    }
+                    Some(false) => Out::Close,
+                    None => Out::Keep,
+                }
+            })
+        },
+    )
+}
+
+#[derive(Clone, Default)]
+struct OpenDataState {
+    sel: Option<usize>,
+    path: String,
+    error: String,
+}
+
+/// Open Data File: the data files closed in this profile (Remove keeps them), or a .mcdata file picked by
+/// path (`file.openDataFile`).
+fn open_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let files: Vec<(String, u64)> = d
+        .arr("files")
+        .iter()
+        .map(|f| {
+            (
+                f.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                f.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+            )
+        })
+        .collect();
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| OpenDataState::default(),
+        |st, app| {
+            window(ctx, app, d, "Open Data File", 420.0, |ui, app| {
+                if files.is_empty() {
+                    muted(
+                        ui,
+                        app,
+                        "No closed data files. Data files you remove are kept here to open again.",
+                    );
+                } else {
+                    ui.label("Closed data files:");
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, app.theme.separator))
+                        .inner_margin(4.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            for (i, (name, bytes)) in files.iter().enumerate() {
+                                let label = format!("{name}  ({})", common::size_text(*bytes));
+                                if ui.selectable_label(st.sel == Some(i), label).clicked() {
+                                    st.sel = Some(i);
+                                    st.path.clear();
+                                }
+                            }
+                        });
+                }
+                ui.label("Or a data file on disk:");
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut st.path)
+                            .hint_text("Path to a .mcdata file")
+                            .desired_width(280.0),
+                    );
+                    if r.changed() && !st.path.is_empty() {
+                        st.sel = None;
+                    }
+                    if common::browse_button(ui, app) {
+                        let filters = [crate::FileFilter::new("MailCraft data file", &["mcdata"])];
+                        if let Some(p) = common::browse_open(app, "Open Data File", &filters, &st.path) {
+                            st.path = p;
+                            st.sel = None;
+                        }
+                    }
+                });
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                let can = st.sel.is_some() || !st.path.trim().is_empty();
+                match ok_cancel(ui, app, can) {
+                    Some(true) => {
+                        let p = match st.sel.and_then(|i| files.get(i)) {
+                            Some((name, _)) => json!({"name": name}),
+                            None => json!({"path": st.path.trim()}),
+                        };
+                        if app.run("file.openDataFile", p).is_some() {
+                            Out::Close
+                        } else {
+                            st.error = last_error(app);
+                            Out::Keep
+                        }
+                    }
+                    Some(false) => Out::Close,
+                    None => Out::Keep,
+                }
+            })
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------------------------------------

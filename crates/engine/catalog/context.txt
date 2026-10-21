@@ -21,7 +21,7 @@ Context|account-root|Add to Favorites|folder.addFavorite
 Context|account-root|Sort Subfolders A to Z|folder.sortAZ
 Context|account-root|Account Properties...|file.accountSettings
 Context|account-root|Folder Permissions|-|Exchange server folder delegation permissions; no server-side permission model locally
-Context|account-root|Data File Properties...|folder.properties
+Context|account-root|Data File Properties...|file.dataFileProperties
 Context|favorites-root|Mail|nav.mail
 Context|favorites-root|Calendar|nav.calendar
 Context|favorites-root|Copilot|-|Copilot is a Microsoft cloud AI service
@@ -117,7 +117,7 @@ Context|ctx message-row > Follow Up|This Week|mail.flag
 Context|ctx message-row > Follow Up|Next Week|mail.flag
 Context|ctx message-row > Follow Up|No Date|mail.flag
 Context|ctx message-row > Follow Up|Custom...|mail.flagCustom
-Context|ctx message-row > Follow Up|Add Reminder...|mail.flagCustom
+Context|ctx message-row > Follow Up|Add Reminder...|mail.addReminder
 Context|ctx message-row > Follow Up|Mark Complete|mail.markComplete
 Context|ctx message-row > Follow Up|Clear Flag|mail.clearFlag
 Context|ctx message-row > Follow Up|Set Quick Click...|mail.setQuickClickFlag
@@ -158,7 +158,7 @@ Context|status-bar|Header Items in View|view.statusBar
 Context|status-bar|Unread Items in View 777|view.statusBar
 Context|status-bar|Unseen Items in View|view.statusBar
 Context|status-bar|Reminders 13|view.statusBar
-Context|status-bar|Group Notifications|view.statusBar
+Context|status-bar|Group Notifications|-|Group notifications come from Microsoft 365 Groups, a cloud service MailCraft does not connect to
 Context|status-bar|View Shortcuts|view.statusBar
 Context|status-bar|Zoom Slider|view.statusBar
 Context|status-bar|Zoom 10%|view.statusBar
@@ -190,7 +190,7 @@ Context|ctx group-header > Follow Up|This Week|mail.flag
 Context|ctx group-header > Follow Up|Next Week|mail.flag
 Context|ctx group-header > Follow Up|No Date|mail.flag
 Context|ctx group-header > Follow Up|Custom...|mail.flagCustom
-Context|ctx group-header > Follow Up|Add Reminder...|mail.flagCustom
+Context|ctx group-header > Follow Up|Add Reminder...|mail.addReminder
 Context|ctx group-header > Follow Up|Mark Complete|mail.markComplete
 Context|ctx group-header > Follow Up|Clear Flag|mail.clearFlag
 Context|ctx group-header > Follow Up|Set Quick Click...|mail.setQuickClickFlag

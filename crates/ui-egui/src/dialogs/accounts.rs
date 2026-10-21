@@ -250,7 +250,7 @@ fn data_files_tab(ui: &mut Ui, app: &mut App, st: &mut SettingsState) -> Out {
         {
             out = Out::open(
                 "confirm",
-                json!({"title": "Account Settings", "text": format!("Close the data file \"{}\"? Its folders and items are removed from this profile.", a.display_name), "command": "file.closeDataFile", "params": {"store": a.id.0}}),
+                json!({"title": "Account Settings", "text": format!("Close the data file \"{}\"? Its folders leave the folder pane; the data file is kept and can be opened again from File › Open & Export › Open Data File.", a.display_name), "command": "file.closeDataFile", "params": {"store": a.id.0, "confirm": true}}),
             );
         }
         if ui.add_enabled(app.s.store.is_some(), egui::Button::new("Open File Location...")).clicked() {

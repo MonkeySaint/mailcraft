@@ -616,6 +616,18 @@ fn set_settings(s: &mut Session, folder: FolderId, f: impl FnOnce(&mut ViewSetti
     }
 }
 
+/// Reset View over a folder's view state: the module view, collapsed groups and the other reserved entries
+/// go, but the custom views saved for the folder stay (they are views to choose from, not the current
+/// state).
+pub(crate) fn reset_keeping_saved(s: &mut Session, folder: FolderId) {
+    if let Some(list) = s.view.collapsed_groups.get_mut(&folder) {
+        list.retain(|e| e.starts_with(MOD_SAVED));
+        if list.is_empty() {
+            s.view.collapsed_groups.remove(&folder);
+        }
+    }
+}
+
 /// Group labels change meaning with the view or arrangement: drops collapsed groups (keeps reserved state).
 pub(crate) fn clear_groups(s: &mut Session, folder: FolderId) {
     if let Some(list) = s.view.collapsed_groups.get_mut(&folder) {
@@ -713,6 +725,21 @@ mod tests {
         assert!(s.enabled("view.resetView").is_none());
         run(&mut s, "view.resetView", json!({}));
         assert_eq!(state(&s, tasks, ModuleKind::Tasks), ModuleView::defaults(ModuleKind::Tasks));
+    }
+
+    #[test]
+    fn reset_view_keeps_saved_custom_views() {
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        run(&mut s, "view.saveViewAs", json!({"name": "My tasks", "confirm": true}));
+        assert_eq!(saved_views(&s, tasks).len(), 1);
+        run(&mut s, "view.changeView", json!({"name": "Simple List"}));
+        run(&mut s, "view.resetView", json!({}));
+        assert_eq!(state(&s, tasks, ModuleKind::Tasks), ModuleView::defaults(ModuleKind::Tasks));
+        let saved = saved_views(&s, tasks);
+        assert_eq!(saved.len(), 1, "Reset View must not delete saved views");
+        assert_eq!(saved[0].name, "My tasks");
     }
 
     #[test]
@@ -857,7 +884,7 @@ mod tests {
         assert!(s.run("view.saveViewAs", &json!({"name": "Detailed", "confirm": true})).is_err());
         assert!(s.run("view.saveViewAs", &json!({"name": " ", "confirm": true})).is_err());
         run(&mut s, "view.resetView", json!({}));
-        assert!(saved_views(&s, tasks).is_empty(), "Reset View drops the folder's saved views too");
+        assert_eq!(saved_views(&s, tasks).len(), 1, "Reset View keeps the folder's saved views");
         run(&mut s, "view.saveViewAs", json!({"name": "Mine", "confirm": true}));
         run(&mut s, "view.changeView", json!({"name": "Detailed"}));
         assert_eq!(run(&mut s, "view.changeView", json!({"name": "mine"}))["view"], "To-Do List");

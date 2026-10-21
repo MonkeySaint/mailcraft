@@ -660,7 +660,7 @@ fn reset_view(s: &mut Session, p: &Value) -> CmdResult {
     // Columns, rules, filter, collapsed groups and dragged note icons go; pinned messages (marked on the
     // messages) stay pinned.
     crate::cmd::notes::clear_positions(s, folder);
-    s.view.collapsed_groups.remove(&folder);
+    modules::reset_keeping_saved(s, folder);
     Ok(json!({ "folder": folder.0, "reset": true }))
 }
 

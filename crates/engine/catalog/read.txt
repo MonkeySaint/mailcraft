@@ -67,7 +67,7 @@ Read|Message > Follow Up|This Week|mail.flag
 Read|Message > Follow Up|Next Week|mail.flag
 Read|Message > Follow Up|No Date|mail.flag
 Read|Message > Follow Up|Custom...|mail.flagCustom
-Read|Message > Follow Up|Add Reminder...|mail.flagCustom
+Read|Message > Follow Up|Add Reminder...|mail.addReminder
 Read|Message > Follow Up|Mark Complete|mail.markComplete
 Read|Message > Translate|Translate Message|review.translate
 Read|Message > Translate|Translation Preferences...|options.open

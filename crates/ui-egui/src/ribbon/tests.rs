@@ -401,6 +401,48 @@ fn params_templates_fill() {
 }
 
 #[test]
+fn read_window_quick_steps_act_on_the_window_message() {
+    use mailcraft_model::ItemId;
+    let ctx = egui::Context::default();
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let inbox = app.s.selection.folder;
+    let items: Vec<ItemId> = app.s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
+    let (selected, open) = (items[0], items[1]);
+    app.s.selection.items = vec![selected];
+    app.s.selection.focus = Some(selected);
+    let v = state::with_context(&app, Surface::Read(open.0), "quicksteps.run", serde_json::json!({"id": 4}));
+    assert_eq!(v["ids"], serde_json::json!([open.0]));
+    // Done (step 4) after its folder is chosen: the window's message moves, the list selection stays.
+    let done = app.s.mailbox.quick_steps.iter().find(|q| q.name == "Done").map(|q| q.id).unwrap();
+    let archive = app
+        .s
+        .mailbox
+        .folders
+        .values()
+        .find(|f| f.role == Some(mailcraft_model::FolderRole::Archive))
+        .map(|f| f.id)
+        .unwrap();
+    let act = state::Action {
+        cmd: "quicksteps.run".into(),
+        params: serde_json::json!({"id": done, "folder": archive.0}),
+        flip: None,
+    };
+    let mut mem = state::Mem::default();
+    state::run(&ctx, &mut app, Surface::Read(open.0), &mut mem, &act);
+    assert_eq!(app.s.mailbox.mail[&open].folder, archive);
+    assert_eq!(app.s.mailbox.mail[&selected].folder, inbox);
+    // Reply & Delete is greyed out for a multi-selection in the main window, not in a read window.
+    app.s.selection.items = items.iter().take(2).copied().collect();
+    let reply = app.s.mailbox.quick_steps.iter().find(|q| q.name == "Reply & Delete").map(|q| q.id).unwrap();
+    let blocked = |app: &App, surface| {
+        let vars = [("$id", serde_json::json!(reply))];
+        state::quick_step_blocked(app, surface, &vars)
+    };
+    assert!(blocked(&app, Surface::Main).is_some());
+    assert!(blocked(&app, Surface::Read(selected.0)).is_none());
+}
+
+#[test]
 fn keytips_select_tabs_and_run_commands() {
     let ctx = egui::Context::default();
     let mut app = App::new(mailcraft_engine::sample::sample_session());

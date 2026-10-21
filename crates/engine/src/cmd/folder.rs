@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use super::util::{opt_bool, opt_str};
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Selection, Session, always};
 use mailcraft_model::{
-    Appointment, Contact, Folder, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox, Note, Rule,
-    Task,
+    AccountId, Appointment, Contact, Folder, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox,
+    Note, Rule, Task,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -72,13 +72,22 @@ pub fn specs() -> Vec<CommandSpec> {
             copyable,
             copy,
         ),
-        spec("folder.delete", "Delete Folder", "Folder › Actions", "", "", true, user_folder, delete),
+        spec(
+            "folder.delete",
+            "Delete Folder",
+            "Folder › Actions",
+            "",
+            r#"{"folder"?:number|string,"confirm"?:bool (without it the command only asks)}"#,
+            true,
+            user_folder,
+            delete,
+        ),
         spec(
             "folder.deleteAll",
             "Delete All",
             "Folder › Clean Up",
             "",
-            "",
+            r#"{"folder"?:number|string,"confirm"?:bool (without it the command only asks)}"#,
             true,
             folder_has_items,
             delete_all,
@@ -148,7 +157,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Folder",
             "Folder › New",
             "Mod+Shift+E",
-            r#"{"name"?:string,"parent"?:string}"#,
+            r#"{"name"?:string,"parent"?:string|number,"account"?:number (with no parent: at the top of this account's folders),"contains"?:"mail"|"calendar"|"contacts"|"tasks"|"notes"|"journal" (default: what the parent holds)}"#,
             true,
             always,
             new_folder,
@@ -442,17 +451,71 @@ fn deleted_has_content(s: &Session) -> Option<&'static str> {
 // ---------------------------------------------------------------------------------------------------------
 // Create / rename / copy / move / delete
 
+/// "Folder contains" choice of New Folder.
+fn folder_kind(v: &str) -> Option<FolderKind> {
+    Some(match v.trim().to_ascii_lowercase().as_str() {
+        "mail" | "post" => FolderKind::Mail,
+        "calendar" => FolderKind::Calendar,
+        "contacts" | "contact" => FolderKind::Contacts,
+        "tasks" | "task" => FolderKind::Tasks,
+        "notes" | "note" => FolderKind::Notes,
+        "journal" => FolderKind::Journal,
+        _ => return None,
+    })
+}
+
 fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
+    let account = match p.get("account").filter(|v| !v.is_null()) {
+        Some(v) => {
+            let id = v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .map(AccountId)
+                .filter(|a| s.mailbox.account(*a).is_some())
+                .ok_or_else(|| CmdError::Params(format!("no such account: {v}")))?;
+            Some(id)
+        }
+        None => None,
+    };
     let parent = match param_folder(s, p, "parent")? {
-        Some(f) => f,
-        None => current_folder(s, &Value::Null)?,
+        Some(f) => Some(f),
+        // The account root: a top-level folder of that account.
+        None if account.is_some() => None,
+        None => Some(current_folder(s, &Value::Null)?),
+    };
+    let contains = match opt_str(p, "contains") {
+        Some(v) => {
+            Some(folder_kind(v).ok_or_else(|| CmdError::Params(format!("unknown folder contents `{v}`")))?)
+        }
+        None => None,
     };
     let Some(name) = opt_str(p, "name") else {
-        let path = s.mailbox.folder_path(parent);
-        return Ok(dialog(s, "createFolder", json!({ "parent": parent.0, "path": path })));
+        let path = parent.map(|f| s.mailbox.folder_path(f)).unwrap_or_default();
+        let params = match parent {
+            Some(f) => json!({ "parent": f.0, "path": path }),
+            None => json!({ "account": account.map(|a| a.0), "path": path }),
+        };
+        return Ok(dialog(s, "createFolder", params));
     };
-    let id = s.mailbox.create_folder(parent, name)?;
-    if let Some(f) = s.mailbox.folders.get_mut(&parent) {
+    let id = match (parent, contains) {
+        (Some(parent), None) => s.mailbox.create_folder(parent, name)?,
+        (parent, kind) => {
+            let acct = match parent {
+                Some(f) => s.mailbox.folder_account(f),
+                None => account,
+            }
+            .ok_or_else(|| CmdError::Params("no account for the new folder".into()))?;
+            let kind = match (kind, parent.and_then(|f| s.mailbox.folder(f))) {
+                (Some(k), _) => k,
+                (None, Some(f)) => f.kind,
+                (None, None) => FolderKind::Mail,
+            };
+            s.mailbox.create_folder_in(acct, parent, name, kind)?
+        }
+    };
+    if let Some(parent) = parent
+        && let Some(f) = s.mailbox.folders.get_mut(&parent)
+    {
         f.expanded = true;
     }
     Ok(json!({ "folder": id.0, "path": s.mailbox.folder_path(id) }))
@@ -578,8 +641,36 @@ fn move_(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "folder": id.0, "path": s.mailbox.folder_path(id) }))
 }
 
+/// True when `id` sits in its account's Deleted Items (deleting there is for good).
+fn in_deleted_items(s: &Session, id: FolderId) -> bool {
+    s.mailbox
+        .folder_account(id)
+        .and_then(|a| s.mailbox.role_folder(a, FolderRole::DeletedItems))
+        .is_some_and(|d| s.mailbox.is_in_subtree(id, d))
+}
+
+/// Asks before a bulk delete: a Yes/No that runs `cmd` on `folder` again with `confirm`.
+fn ask(s: &mut Session, cmd: &str, folder: FolderId, title: &str, text: String) -> CmdResult {
+    Ok(dialog(
+        s,
+        "confirm",
+        json!({"title": title, "text": text, "command": cmd, "params": {"folder": folder.0, "confirm": true}}),
+    ))
+}
+
 fn delete(s: &mut Session, p: &Value) -> CmdResult {
     let id = current_folder(s, p)?;
+    if opt_bool(p, "confirm") != Some(true) {
+        let name = s.mailbox.folder(id).map(|f| f.name.clone()).unwrap_or_default();
+        let text = if in_deleted_items(s, id) {
+            format!(
+                "Delete the folder \"{name}\" and everything in it for good? This cannot be undone once MailCraft closes."
+            )
+        } else {
+            format!("Delete the folder \"{name}\" and move everything in it to Deleted Items?")
+        };
+        return ask(s, "folder.delete", id, "Delete Folder", text);
+    }
     let parent = s.mailbox.folder(id).and_then(|f| f.parent);
     s.mailbox.delete_folder(id)?;
     let permanent = !s.mailbox.folders.contains_key(&id);
@@ -595,6 +686,15 @@ fn delete(s: &mut Session, p: &Value) -> CmdResult {
 
 fn delete_all(s: &mut Session, p: &Value) -> CmdResult {
     let id = current_folder(s, p)?;
+    if opt_bool(p, "confirm") != Some(true) {
+        let name = s.mailbox.folder(id).map(|f| f.name.clone()).unwrap_or_default();
+        let text = if in_deleted_items(s, id) {
+            format!("Delete everything in \"{name}\" for good? This cannot be undone once MailCraft closes.")
+        } else {
+            format!("Move everything in \"{name}\" to Deleted Items?")
+        };
+        return ask(s, "folder.deleteAll", id, "Delete All", text);
+    }
     let ids: Vec<ItemId> = s.mailbox.items_in(id).iter().map(|m| m.id).collect();
     let removed = s.mailbox.delete_items(&ids)?;
     // Calendar, contacts, tasks and notes folders hold other kinds of items; Delete All covers them too.
@@ -1252,6 +1352,31 @@ mod tests {
     }
 
     #[test]
+    fn new_folder_at_the_account_root_and_of_another_kind() {
+        let mut s = session();
+        let inbox = s.selection.folder;
+        let acct = s.mailbox.folder_account(inbox).unwrap();
+        let r = run(&mut s, "folder.new", json!({"account": acct.0}));
+        assert_eq!(r["dialog"], "createFolder");
+        let r = run(&mut s, "folder.new", json!({"name": "Projects", "account": acct.0}));
+        let top = FolderId(r["folder"].as_u64().unwrap());
+        assert_eq!(s.mailbox.folder(top).unwrap().parent, None);
+        assert_eq!(s.mailbox.folder(top).unwrap().kind, FolderKind::Mail);
+        assert!(s.run("folder.new", &json!({"name": "projects", "account": acct.0})).is_err());
+        let r = run(&mut s, "folder.new", json!({"name": "Team", "account": acct.0, "contains": "calendar"}));
+        let cal = FolderId(r["folder"].as_u64().unwrap());
+        assert_eq!(s.mailbox.folder(cal).unwrap().kind, FolderKind::Calendar);
+        let r =
+            run(&mut s, "folder.new", json!({"name": "People", "parent": inbox.0, "contains": "contacts"}));
+        let people = FolderId(r["folder"].as_u64().unwrap());
+        assert_eq!(s.mailbox.folder(people).unwrap().parent, Some(inbox));
+        assert_eq!(s.mailbox.folder(people).unwrap().kind, FolderKind::Contacts);
+        assert!(s.run("folder.new", &json!({"name": "X", "account": 999})).is_err());
+        assert!(s.run("folder.new", &json!({"name": "X", "account": acct.0, "contains": "search"})).is_err());
+        assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+    }
+
+    #[test]
     fn rename_only_user_folders() {
         let mut s = session();
         assert!(s.run("folder.rename", &json!({"name": "X"})).is_err());
@@ -1302,11 +1427,14 @@ mod tests {
         run(&mut s, "folder.move", json!({"parent": "Archive"}));
         assert_eq!(s.mailbox.folder(a).unwrap().parent, Some(archive));
         assert_eq!(run(&mut s, "folder.move", json!({}))["dialog"], "moveFolder");
-        let r = run(&mut s, "folder.delete", json!({}));
+        // Delete Folder asks first; nothing moves until the answer.
+        assert_eq!(run(&mut s, "folder.delete", json!({}))["dialog"], "confirm");
+        assert_eq!(s.mailbox.folder(a).unwrap().parent, Some(archive));
+        let r = run(&mut s, "folder.delete", json!({"confirm": true}));
         assert_eq!(r["permanent"], false);
         let deleted = role(&s, FolderRole::DeletedItems);
         assert_eq!(s.mailbox.folder(a).unwrap().parent, Some(deleted));
-        let r = run(&mut s, "folder.delete", json!({}));
+        let r = run(&mut s, "folder.delete", json!({"confirm": true}));
         assert_eq!(r["permanent"], true);
         assert!(s.mailbox.folder(a).is_none());
         assert_ne!(s.selection.folder, a);
@@ -1324,7 +1452,9 @@ mod tests {
         s.selection.items = vec![a];
         assert_eq!(run(&mut s, "folder.markAllRead", json!({}))["changed"], 2);
         assert_eq!(s.mailbox.unread_count(inbox), 0);
-        assert_eq!(run(&mut s, "folder.deleteAll", json!({}))["deleted"], 2);
+        assert_eq!(run(&mut s, "folder.deleteAll", json!({}))["dialog"], "confirm");
+        assert_eq!(s.mailbox.total_count(inbox), 2, "Delete All asks first");
+        assert_eq!(run(&mut s, "folder.deleteAll", json!({"confirm": true}))["deleted"], 2);
         assert_eq!(s.mailbox.total_count(inbox), 0);
         assert!(s.selection.items.is_empty());
         assert_eq!(s.mailbox.total_count(role(&s, FolderRole::DeletedItems)), 2);
@@ -1375,11 +1505,11 @@ mod tests {
         let note = s.run("notes.new", &json!({"text": "x"})).unwrap()["id"].as_u64().unwrap();
         s.selection.folder = notes;
         assert_eq!(s.enabled("folder.deleteAll"), None);
-        assert_eq!(run(&mut s, "folder.deleteAll", json!({}))["deleted"], 1);
+        assert_eq!(run(&mut s, "folder.deleteAll", json!({"confirm": true}))["deleted"], 1);
         assert_eq!(s.mailbox.notes[&ItemId(note)].folder, deleted);
         // Delete All in Deleted Items removes permanently.
         s.selection.folder = deleted;
-        assert_eq!(run(&mut s, "folder.deleteAll", json!({}))["deleted"], 1);
+        assert_eq!(run(&mut s, "folder.deleteAll", json!({"confirm": true}))["deleted"], 1);
         assert!(s.mailbox.notes.is_empty());
     }
 

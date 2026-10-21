@@ -3,6 +3,8 @@
 //! 1. The Junk Email filter ([`crate::junk::on_new_mail`]); what it moves or deletes goes no further. Voting
 //!    responses to my messages are then recorded on the message they answer
 //!    ([`crate::cmd::compose::record_vote`]), so the tally keeps them whatever happens to the responses.
+//!    Messages joining a conversation the user ignores (`mail.ignore`) are marked ignored and go to Deleted
+//!    Items, and go no further.
 //! 2. Focused Inbox sender overrides: mail from a sender marked Always Move to Other is classified Other
 //!    ([`crate::cmd::mail::apply_focus_overrides`]).
 //! 3. The rules for received messages ([`crate::cmd::rules::exec::on_new_mail`]).
@@ -64,6 +66,8 @@ pub struct ArrivalReport {
     pub votes_recorded: Vec<ItemId>,
     /// Meeting requests put on the calendar as Tentative until they are answered.
     pub meetings_placed: Vec<ItemId>,
+    /// Messages in an ignored conversation, moved to Deleted Items.
+    pub ignored: Vec<ItemId>,
 }
 
 /// Processes newly arrived mail `ids` (see the module docs).
@@ -81,6 +85,10 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
     let ids: Vec<ItemId> = ids.into_iter().filter(|i| !gone.contains(i)).collect();
     // Votes are recorded before anything files the responses away (rules, Deleted Items).
     report.votes_recorded = record_votes(s, &ids);
+    // Ignored conversations: later messages go straight to Deleted Items.
+    report.ignored = crate::cmd::mail::ignore_arrivals(s, &ids);
+    let gone: BTreeSet<ItemId> = report.ignored.iter().copied().collect();
+    let ids: Vec<ItemId> = ids.into_iter().filter(|i| !gone.contains(i)).collect();
     report.focused_other = crate::cmd::mail::apply_focus_overrides(s, &ids);
     report.rules_matched = crate::cmd::rules::exec::on_new_mail(s, &ids).matched;
     // What the rules left outside Deleted Items and Junk Email, newest last.
@@ -410,6 +418,73 @@ mod tests {
         let folder = role(s, FolderRole::SentItems);
         s.mailbox.move_items(&[item], folder).unwrap();
         item
+    }
+
+    #[test]
+    fn new_mail_in_an_ignored_conversation_goes_to_deleted_items() {
+        let mut s = session();
+        let first = arrive(
+            &mut s,
+            "From: ann@example.com\nSubject: Parking rota\nMessage-ID: <rota-1@example.com>\n\nx\n",
+        );
+        let other =
+            arrive(&mut s, "From: ann@example.com\nSubject: Lunch\nMessage-ID: <l-1@example.com>\n\nx\n");
+        s.selection.items = vec![first];
+        s.selection.focus = Some(first);
+        s.run("mail.ignore", &json!({"ids": [first.0], "confirm": true})).unwrap();
+        let deleted = role(&s, FolderRole::DeletedItems);
+        assert_eq!(s.mailbox.mail[&first].folder, deleted);
+        // A reply that only links through References (its subject changed) and an unrelated message.
+        let reply = arrive(
+            &mut s,
+            "From: bob@example.com\nSubject: new subject\nMessage-ID: <rota-2@example.com>\n\
+             References: <rota-1@example.com>\nIn-Reply-To: <rota-1@example.com>\n\ny\n",
+        );
+        let fresh = arrive(&mut s, "From: cy@example.com\nSubject: Agenda\n\nz\n");
+        let r = on_new_mail(&mut s, &[reply, fresh]);
+        assert_eq!(r.ignored, vec![reply]);
+        assert_eq!(s.mailbox.mail[&reply].folder, deleted);
+        assert!(s.mailbox.mail[&reply].ignored);
+        let inbox = role(&s, FolderRole::Inbox);
+        assert_eq!(s.mailbox.mail[&fresh].folder, inbox);
+        assert_eq!(s.mailbox.mail[&other].folder, inbox);
+        // Regression: the same subject from someone else, linked by no Message-ID, is not part of the
+        // ignored conversation (it used to be threaded in by subject and deleted on arrival).
+        let same_subject = arrive(
+            &mut s,
+            "From: zed@example.org\nSubject: Parking rota\nMessage-ID: <z-1@example.org>\n\nnew rota\n",
+        );
+        let reply_subject = arrive(
+            &mut s,
+            "From: zed@example.org\nSubject: RE: Parking rota\nMessage-ID: <z-2@example.org>\n\nagain\n",
+        );
+        assert!(on_new_mail(&mut s, &[same_subject, reply_subject]).ignored.is_empty());
+        assert_eq!(s.mailbox.mail[&same_subject].folder, inbox);
+        assert!(!s.mailbox.mail[&same_subject].ignored);
+        assert_eq!(s.mailbox.mail[&reply_subject].folder, inbox);
+        // A reply and its own reply arriving together both follow the ignored conversation.
+        let r1 = arrive(
+            &mut s,
+            "From: bob@example.com\nSubject: Re: Parking rota\nMessage-ID: <rota-3@example.com>\n\
+             In-Reply-To: <rota-2@example.com>\n\ny\n",
+        );
+        let r2 = arrive(
+            &mut s,
+            "From: cy@example.com\nSubject: Re: Parking rota\nMessage-ID: <rota-4@example.com>\n\
+             In-Reply-To: <rota-3@example.com>\n\ny\n",
+        );
+        let got = on_new_mail(&mut s, &[r2, r1]).ignored;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(s.mailbox.mail[&r2].folder, deleted);
+        // Nothing ignored: nothing moves.
+        s.run("mail.ignore", &json!({"ids": [first.0]})).unwrap();
+        assert!(!s.mailbox.mail.values().any(|m| m.ignored));
+        let again = arrive(
+            &mut s,
+            "From: bob@example.com\nSubject: Re: Parking rota\nReferences: <rota-1@example.com>\n\nw\n",
+        );
+        assert!(on_new_mail(&mut s, &[again]).ignored.is_empty());
+        assert_eq!(s.mailbox.mail[&again].folder, inbox);
     }
 
     #[test]

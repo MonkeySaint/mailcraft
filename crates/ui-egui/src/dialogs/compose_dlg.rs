@@ -1734,16 +1734,141 @@ fn accessibility(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
+/// Paragraphs Read Aloud says one after another (blank lines separate them; empty ones are skipped).
+pub(crate) fn speech_paragraphs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !cur.trim().is_empty() {
+                out.push(std::mem::take(&mut cur).trim().to_owned());
+            }
+            cur.clear();
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(line.trim());
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_owned());
+    }
+    out
+}
+
+/// Where Read Aloud is: the paragraph being read and whether it is playing.
+#[derive(Clone, Default)]
+struct ReadAloudState {
+    at: usize,
+    playing: bool,
+    /// The current paragraph was handed to the speech engine.
+    started: bool,
+    error: String,
+}
+
+/// Read Aloud: plays the text paragraph by paragraph through the platform's speech output, with Previous,
+/// Play / Pause, Next and Stop; the paragraph being read is highlighted. Pause stops the voice and keeps the
+/// place (Play starts that paragraph again). Without a speech engine the text is shown.
 fn read_aloud(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let text = d.str("text");
-    window(ctx, app, d, "Read Aloud", 460.0, |ui, app| {
-        muted(
-            ui,
-            app,
-            "Speech output is not available in this build; the text that would be read is shown below.",
-        );
-        egui::ScrollArea::vertical().id_salt(("ra", uid)).max_height(200.0).show(ui, |ui| ui.label(&text));
-        footer(ui, |ui| if btn(ui, "Stop") { Out::Close } else { Out::Keep })
-    })
+    let paras = speech_paragraphs(&text);
+    let speech = app.speech.clone();
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| ReadAloudState::default(),
+        |st, app| {
+            // Advance when the engine finished the paragraph it was given.
+            if let Some(sp) = &speech
+                && st.playing
+            {
+                if st.started && !sp.speaking() {
+                    st.at = st.at.saturating_add(1);
+                    st.started = false;
+                }
+                if st.at >= paras.len() {
+                    st.playing = false;
+                    st.at = 0;
+                } else if !st.started {
+                    match paras.get(st.at).map(|p| sp.speak(p)) {
+                        Some(Ok(())) => st.started = true,
+                        Some(Err(e)) => {
+                            st.error = e;
+                            st.playing = false;
+                        }
+                        None => st.playing = false,
+                    }
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(150));
+            }
+            let out = window(ctx, app, d, "Read Aloud", 480.0, |ui, app| {
+                match &speech {
+                    Some(sp) => muted(ui, app, &format!("Voice: {}", sp.name())),
+                    None => muted(
+                        ui,
+                        app,
+                        "No speech engine was found on this computer; the text that would be read is shown below.",
+                    ),
+                }
+                egui::ScrollArea::vertical().id_salt(("ra", uid)).max_height(220.0).show(ui, |ui| {
+                    for (i, p) in paras.iter().enumerate() {
+                        let current = speech.is_some() && i == st.at && (st.playing || st.started);
+                        let t = if current {
+                            RichText::new(p).background_color(app.theme.selected).strong()
+                        } else {
+                            RichText::new(p)
+                        };
+                        ui.label(t);
+                    }
+                });
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                footer(ui, |ui| {
+                    if btn(ui, "Stop") {
+                        if let Some(sp) = &speech {
+                            sp.stop();
+                        }
+                        return Out::Close;
+                    }
+                    if let Some(sp) = &speech {
+                        let n = paras.len();
+                        if btn_en(ui, st.at.saturating_add(1) < n, "Next") {
+                            sp.stop();
+                            st.at = st.at.saturating_add(1);
+                            st.started = false;
+                        }
+                        let label = if st.playing { "Pause" } else { "Play" };
+                        if btn_en(ui, n > 0, label) {
+                            if st.playing {
+                                sp.stop();
+                                st.playing = false;
+                                st.started = false;
+                            } else {
+                                st.error.clear();
+                                st.playing = true;
+                                st.started = false;
+                            }
+                        }
+                        if btn_en(ui, st.at > 0, "Previous") {
+                            sp.stop();
+                            st.at = st.at.saturating_sub(1);
+                            st.started = false;
+                        }
+                    }
+                    Out::Keep
+                })
+            });
+            // Closing the window any other way stops the voice too.
+            if !out.keeps()
+                && let Some(sp) = &speech
+            {
+                sp.stop();
+            }
+            out
+        },
+    )
 }

@@ -626,7 +626,24 @@ fn recent_searches_popup(ctx: &egui::Context, app: &mut App, edit: &egui::Respon
     if !app.ui.search_text.is_empty() || app.s.search.recent.is_empty() {
         open = false;
     }
+    // Up / Down move a highlight through the list while the box has the keyboard; Enter runs the highlighted
+    // search.
+    let hi_id = id.with("highlight");
+    let mut hi = ctx.data(|d| d.get_temp::<Option<usize>>(hi_id)).flatten();
     if open {
+        let n = app.s.search.recent.len();
+        if edit.has_focus() || edit.lost_focus() {
+            let (down, up) =
+                ctx.input(|i| (i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::ArrowUp)));
+            if down {
+                hi = Some(hi.map_or(0, |h| h.saturating_add(1).min(n.saturating_sub(1))));
+            }
+            if up {
+                hi = hi.and_then(|h| h.checked_sub(1));
+            }
+        }
+        hi = hi.filter(|h| *h < n);
+        let enter = hi.filter(|_| ctx.input(|i| i.key_pressed(egui::Key::Enter)));
         let shown = egui::Area::new(id.with("area"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos2(rect.left(), rect.bottom() + 2.0))
@@ -638,7 +655,8 @@ fn recent_searches_popup(ctx: &egui::Context, app: &mut App, edit: &egui::Respon
                         let mut picked = None;
                         for (i, q) in app.s.search.recent.iter().enumerate() {
                             let label: String = q.chars().take(80).collect();
-                            if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                            let button = egui::Button::new(label).frame(false).selected(hi == Some(i));
+                            if ui.add(button).clicked() {
                                 picked = Some(i);
                             }
                         }
@@ -646,7 +664,7 @@ fn recent_searches_popup(ctx: &egui::Context, app: &mut App, edit: &egui::Respon
                     })
                     .inner
             });
-        if let Some(i) = shown.inner {
+        if let Some(i) = shown.inner.or(enter) {
             app.run("search.recent", json!({ "index": i }));
             app.ui.search_text = app.s.view.search.clone();
             app.ui.search_active = true;
@@ -660,7 +678,13 @@ fn recent_searches_popup(ctx: &egui::Context, app: &mut App, edit: &egui::Respon
             }
         }
     }
-    ctx.data_mut(|d| d.insert_temp(id, open));
+    if !open {
+        hi = None;
+    }
+    ctx.data_mut(|d| {
+        d.insert_temp(id, open);
+        d.insert_temp(hi_id, hi);
+    });
 }
 
 /// Leaves search: clears the query, drops the Search tab.

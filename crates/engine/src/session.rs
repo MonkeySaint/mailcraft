@@ -188,6 +188,15 @@ pub struct Session {
     /// S/MIME: digital IDs, other people's certificates, trusted certificates and opened messages (see
     /// `smime.rs`).
     pub smime: crate::smime::SmimeSlot,
+    /// Data files closed in a session without a store, ready to be opened again (`datafile.rs`).
+    pub closed_data_files: Vec<crate::datafile::ClosedDataFile>,
+    /// Set by a command whose effect reaches outside the mailbox where an undo snapshot cannot put it back
+    /// (closing or opening a data file): the undo history is cleared instead of recording a step, since any
+    /// older snapshot would bring back or drop that data file too.
+    pub(crate) undo_barrier: bool,
+    /// Quick Print may go straight to the system's default printer. The desktop app turns it on; tests and
+    /// tools leave it off, so nothing reaches a real printer by accident.
+    pub direct_print: bool,
     /// Profile folder holding `settings.json` (`None` = in-memory session: nothing is saved).
     settings_dir: Option<std::path::PathBuf>,
     /// Bytes last read from or written to `settings.json` (identical states are not rewritten).
@@ -236,6 +245,9 @@ impl Session {
             search: crate::search_index::SearchState::default(),
             smime: crate::smime::SmimeSlot::default(),
             settings: Settings::default(),
+            closed_data_files: Vec::new(),
+            undo_barrier: false,
+            direct_print: false,
             settings_dir: None,
             settings_saved: None,
         };
@@ -740,14 +752,20 @@ impl Session {
                     crate::sync::queue_local_changes(self, &before);
                 }
                 let ops = diff_ops(&before, &self.mailbox);
+                if self.undo_barrier {
+                    self.undo.clear();
+                }
                 if !ops.is_empty() {
-                    if self.automatic_depth == 0 {
+                    if self.automatic_depth == 0 && !self.undo_barrier {
                         self.undo.push(UndoEntry { label: spec.label.to_owned(), before: Box::new(before) });
                     }
                     self.journal(ops);
                 }
             }
             self.refresh_me();
+        }
+        if self.run_depth == 0 {
+            self.undo_barrier = false;
         }
         if self.pending_ops.len() > pending_before {
             // Ops a command queued directly (without a mailbox diff, e.g. view-only changes, or Open marking

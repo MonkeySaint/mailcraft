@@ -814,6 +814,35 @@ fn system_print(_printer: &str, _title: &str, _copies: u64, _pdf: &[u8]) -> Resu
     )))
 }
 
+/// The system default destination named in `lpstat -d` output ("system default destination: NAME"), if
+/// any ("no system default destination" and anything else: none).
+pub fn parse_default_destination(out: &str) -> Option<String> {
+    out.lines().find_map(|l| {
+        let (head, name) = l.split_once(':')?;
+        let name = name.trim();
+        (head.trim().eq_ignore_ascii_case("system default destination")
+            && !name.is_empty()
+            && !name.chars().any(char::is_control))
+        .then(|| name.to_owned())
+    })
+}
+
+/// True when the system has a default printer (CUPS `lpstat -d`; other platforms: no).
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+pub fn has_default_printer() -> bool {
+    use std::process::{Command, Stdio};
+    let Ok(out) = Command::new("lpstat").arg("-d").stdin(Stdio::null()).stderr(Stdio::null()).output() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(out.stdout.get(..out.stdout.len().min(4096)).unwrap_or(&[]));
+    out.status.success() && parse_default_destination(&text).is_some()
+}
+
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+pub fn has_default_printer() -> bool {
+    false
+}
+
 /// Printers: Save as PDF first, then the system's destinations (CUPS `lpstat -e`), if any.
 pub fn printers() -> Vec<String> {
     let mut out = vec![SAVE_AS_PDF.to_owned()];
@@ -1030,6 +1059,24 @@ mod tests {
                 Err(CmdError::Params(_))
             ));
         }
+    }
+
+    #[test]
+    fn default_destination_is_read_from_lpstat() {
+        assert_eq!(
+            parse_default_destination("system default destination: Office_Laser\n").as_deref(),
+            Some("Office_Laser")
+        );
+        assert_eq!(parse_default_destination("no system default destination\n"), None);
+        assert_eq!(parse_default_destination(""), None);
+        assert_eq!(parse_default_destination("system default destination: \n"), None);
+        // Quick Print without direct printing (tests, tools) opens the Print page even with a printer.
+        let mut s = sample_session();
+        let id = first_mail(&s);
+        s.selection.items = vec![mailcraft_model::ItemId(id)];
+        s.selection.focus = Some(mailcraft_model::ItemId(id));
+        assert!(!s.direct_print);
+        assert_eq!(s.run("mail.quickPrint", &json!({"ids": [id]})).unwrap()["dialog"], "print");
     }
 
     #[test]

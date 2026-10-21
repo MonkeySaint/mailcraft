@@ -97,7 +97,12 @@ fn reply_all(s: &mut Session, p: &Value) -> CmdResult {
     respond(s, p, ComposeKind::ReplyAll)
 }
 
+/// Forward: one message forwards with its text included; several selected messages go out as one new
+/// message with them attached, as Forward as Attachment does.
 fn forward(s: &mut Session, p: &Value) -> CmdResult {
+    if super::mail::mail_targets(s, p).len() > 1 {
+        return forward_as_attachment(s, p);
+    }
     respond(s, p, ComposeKind::Forward)
 }
 
@@ -304,14 +309,21 @@ fn preface_name(s: &Session, id: ItemId) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
-/// The original message as an attached .eml item.
-fn original_attachment(m: &MailItem) -> ComposeAttachment {
-    ComposeAttachment {
-        filename: eml_name(&m.subject),
-        mime_type: "message/rfc822".into(),
-        data: item_source(m),
-    }
+/// The original message as an attached .eml item with `data` as its source.
+fn eml_attachment(m: &MailItem, data: Vec<u8>) -> ComposeAttachment {
+    ComposeAttachment { filename: eml_name(&m.subject), mime_type: "message/rfc822".into(), data }
 }
+
+/// The message's own source as received (kept in memory or in the store's blobs), so a forwarded copy
+/// keeps every original header (Received, Authentication-Results, DKIM-Signature); rebuilt from the
+/// stored fields only when no source is kept.
+fn received_source(s: &Session, m: &MailItem) -> Vec<u8> {
+    crate::cmd::compose::stored_raw(s, m).filter(|r| !r.is_empty()).unwrap_or_else(|| item_source(m))
+}
+
+/// Most messages one forward attaches, and their largest total size.
+pub(crate) const MAX_FORWARD_ITEMS: usize = 100;
+pub(crate) const MAX_FORWARD_BYTES: usize = 50 * 1024 * 1024;
 
 /// Builds the compose state for a Reply / Reply All / Forward of item `id` (None when it does not exist),
 /// following Options › Mail: what happens to the original text (include, omit, attach, indent, prefix),
@@ -327,7 +339,14 @@ pub fn build_response(s: &Session, id: ItemId, kind: ComposeKind, inline: bool) 
     let (to, cc) = response_recipients(s, m, kind);
     let subject = if forward { forward_subject(&m.subject) } else { reply_subject(&m.subject) };
     let attachments = match mode {
-        OriginalText::Attach => vec![original_attachment(m)],
+        // The opened form of an S/MIME message is what is attached; other mail goes as received.
+        OriginalText::Attach => {
+            let data = match &shown {
+                std::borrow::Cow::Owned(_) => item_source(m),
+                std::borrow::Cow::Borrowed(_) => received_source(s, m),
+            };
+            vec![eml_attachment(m, data)]
+        }
         _ if forward => source_attachments(m),
         _ => Vec::new(),
     };
@@ -409,14 +428,38 @@ fn forward_as_attachment(s: &mut Session, p: &Value) -> CmdResult {
     let Some(first) = ids.first().copied() else {
         return Err(CmdError::Disabled("No message is selected.".into()));
     };
+    // Every attachment is a full copy of its message in memory: the number and the total size are capped.
+    if ids.len() > MAX_FORWARD_ITEMS {
+        return Err(CmdError::Failed(format!(
+            "A forward can attach at most {MAX_FORWARD_ITEMS} messages ({} are selected).",
+            ids.len()
+        )));
+    }
+    let too_big = || {
+        CmdError::Failed(format!(
+            "The selected messages are too large to forward together (more than {} MB).",
+            MAX_FORWARD_BYTES / (1024 * 1024)
+        ))
+    };
+    let listed: u64 =
+        ids.iter().filter_map(|id| s.mailbox.mail.get(id)).map(|m| m.size).fold(0, u64::saturating_add);
+    if usize::try_from(listed).map_or(true, |n| n > MAX_FORWARD_BYTES) {
+        return Err(too_big());
+    }
     let mut attachments = Vec::new();
     let mut subject = String::new();
+    let mut total = 0usize;
     for id in &ids {
         if let Some(m) = s.mailbox.mail.get(id) {
             if subject.is_empty() {
                 subject = forward_subject(&m.subject);
             }
-            attachments.push(original_attachment(m));
+            let data = received_source(s, m);
+            total = total.saturating_add(data.len());
+            if total > MAX_FORWARD_BYTES {
+                return Err(too_big());
+            }
+            attachments.push(eml_attachment(m, data));
         }
     }
     let c = ComposeState {
@@ -725,6 +768,20 @@ The badge reader is down. Please use the side door today.";
     }
 
     #[test]
+    fn forward_of_several_messages_attaches_them_all() {
+        let mut f = fx();
+        let r = forward(&mut f.s, &json!({"ids": [f.plain.0, f.html.0]})).unwrap();
+        let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(r["attached"], 2);
+        assert_eq!(c.attachments.len(), 2);
+        assert_eq!(c.kind, ComposeKind::Forward);
+        // One message keeps the inline forward.
+        let r = forward(&mut f.s, &json!({"ids": [f.plain.0]})).unwrap();
+        let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
+        assert!(c.attachments.iter().all(|a| a.mime_type != "message/rfc822"));
+    }
+
+    #[test]
     fn forward_as_attachment_attaches_eml() {
         let mut f = fx();
         f.s.selection.items = vec![f.plain, f.html];
@@ -739,6 +796,36 @@ The badge reader is down. Please use the side door today.";
         let parsed = mailcraft_mime::parse(&c.attachments[0].data).unwrap();
         assert_eq!(parsed.subject(), "URGENT: server room access");
         assert_eq!(eml_name("  "), "message.eml");
+    }
+
+    /// Regression: Forward (or Report with an abuse address) on a whole folder copied every message into one
+    /// compose in memory, without limit.
+    #[test]
+    fn forward_attaches_a_capped_number_and_size_of_messages() {
+        let mut f = fx();
+        let folder = f.s.mailbox.mail[&f.plain].folder;
+        let mut ids = Vec::new();
+        for i in 0..=MAX_FORWARD_ITEMS {
+            ids.push(
+                f.s.mailbox.add_mail(MailItem { folder, subject: format!("M{i}"), ..Default::default() }).0,
+            );
+        }
+        let r = forward(&mut f.s, &json!({"ids": ids}));
+        assert!(matches!(r, Err(CmdError::Failed(ref e)) if e.contains("at most")), "{r:?}");
+        assert!(f.s.composes.is_empty());
+        let ok = forward(&mut f.s, &json!({"ids": ids[..MAX_FORWARD_ITEMS].to_vec()})).unwrap();
+        assert_eq!(ok["attached"], MAX_FORWARD_ITEMS);
+        // Too large in total (as listed, or once the sources are read).
+        let huge = f.s.mailbox.add_mail(MailItem { folder, size: 51 * 1024 * 1024, ..Default::default() });
+        let r = forward_as_attachment(&mut f.s, &json!({"ids": [huge.0, f.plain.0]}));
+        assert!(matches!(r, Err(CmdError::Failed(ref e)) if e.contains("too large")), "{r:?}");
+        let big = vec![b'x'; MAX_FORWARD_BYTES / 2 + 1];
+        let (b1, b2) = (
+            f.s.mailbox.add_mail(MailItem { folder, raw: Some(big.clone()), ..Default::default() }),
+            f.s.mailbox.add_mail(MailItem { folder, raw: Some(big), ..Default::default() }),
+        );
+        let r = forward_as_attachment(&mut f.s, &json!({"ids": [b1.0, b2.0]}));
+        assert!(matches!(r, Err(CmdError::Failed(ref e)) if e.contains("too large")), "{r:?}");
     }
 
     #[test]

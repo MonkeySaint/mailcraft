@@ -91,6 +91,14 @@ pub fn open(app: &mut App, name: &str, params: Value) {
                 params.get("compose").and_then(Value::as_u64).map_or(Surface::Main, Surface::Compose);
             app.ui.backstage = Some((surface, page));
         }
+        "mainWindow" => {
+            // Open in New Window: another main window on the folder (or, past the limit, the folder here).
+            if let Some(f) = params.get("folder").and_then(Value::as_u64)
+                && crate::explorer::open(app, mailcraft_model::FolderId(f)).is_none()
+            {
+                app.run("nav.selectFolder", json!({"folder": f}));
+            }
+        }
         "readWindow" => {
             if let Some(id) = params.get("id").and_then(Value::as_u64)
                 && !app.ui.read_windows.contains(&id)
@@ -176,6 +184,8 @@ pub const KNOWN: &[&str] = &[
     "autoArchivePrompt",
     "mainWindow",
     "confirm",
+    "dataFileProperties",
+    "openDataFile",
     "pickFolder",
     // categories / flags
     "colorCategories",

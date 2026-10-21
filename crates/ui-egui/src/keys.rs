@@ -1205,7 +1205,12 @@ pub fn apply(ctx: &egui::Context, app: &mut App, surface: Surface, action: Actio
                 .map(|q| q.id);
             match step {
                 Some(id) => {
-                    let r = app.run("quicksteps.run", json!({"id": id}));
+                    // In a read window the step acts on the window's message.
+                    let params = match surface {
+                        Surface::Read(item) => json!({"id": id, "ids": [item]}),
+                        _ => json!({"id": id}),
+                    };
+                    let r = app.run("quicksteps.run", params);
                     json!({"action": "quickStep", "id": id, "ok": r.is_some(), "result": r})
                 }
                 None => {

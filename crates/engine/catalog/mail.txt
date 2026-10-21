@@ -123,7 +123,7 @@ Mail|Home > Follow Up|This Week|mail.flag
 Mail|Home > Follow Up|Next Week|mail.flag
 Mail|Home > Follow Up|No Date|mail.flag
 Mail|Home > Follow Up|Custom...|mail.flagCustom
-Mail|Home > Follow Up|Add Reminder...|mail.flagCustom
+Mail|Home > Follow Up|Add Reminder...|mail.addReminder
 Mail|Home > Follow Up|Mark Complete|mail.markComplete
 Mail|Home > Follow Up|Clear Flag|mail.clearFlag
 Mail|Home > Follow Up|Set Quick Click...|mail.setQuickClickFlag

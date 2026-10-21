@@ -115,6 +115,10 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
                 | ("off", FolderPaneState::Off)
         ),
         "favorites" => v.favorites_visible,
+        // Follow Up › Today … No Date: checked for the entry the item's flag came from.
+        "followup" => focused_mail(app, surface)
+            .and_then(|m| mailcraft_engine::cmd::mail::follow_up_kind(&app.s, &m.flag))
+            .is_some_and(|k| k == arg),
         // Folder › Show All Folders A to Z, as the engine keeps it.
         "allaz" => mailcraft_engine::cmd::folder::show_all_az_on(&app.s),
         "favorite" => {
@@ -573,10 +577,10 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
             .collect(),
         "categories" => {
             let item = focused_mail(app, surface);
-            app.s
-                .mailbox
-                .categories
-                .iter()
+            // Alphabetical, as the original lists them.
+            let mut cats: Vec<&mailcraft_model::Category> = app.s.mailbox.categories.iter().collect();
+            cats.sort_by_key(|c| c.name.to_lowercase());
+            cats.into_iter()
                 .map(|c| {
                     let rgb = c.color.rgb();
                     DynItem {
@@ -888,13 +892,20 @@ pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> V
             ItemKind::Dyn => {
                 for d in dyn_items(app, surface, &it.target) {
                     let action = action(app, &it.cmd, d.on, None, &d.vars);
+                    let disabled = disabled(app, surface, &it.cmd.id).or_else(|| {
+                        if it.target == "quicksteps" {
+                            quick_step_blocked(app, surface, &d.vars)
+                        } else {
+                            None
+                        }
+                    });
                     out.push(Resolved::Cmd {
                         label: d.label,
                         icon: d.icon.to_owned(),
                         swatch: d.swatch,
                         key: String::new(),
                         on: Some(d.on),
-                        disabled: disabled(app, surface, &it.cmd.id),
+                        disabled,
                         action,
                     });
                 }
@@ -927,6 +938,22 @@ pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> V
         cleaned.pop();
     }
     cleaned
+}
+
+/// Why the quick step named by `vars` (`$id`) cannot run on this surface's items: a read window acts on its
+/// one message, the main window on the selection (see `mailcraft_engine::cmd::quicksteps::blocked_for`).
+pub(crate) fn quick_step_blocked(
+    app: &App,
+    surface: Surface,
+    vars: &[(&'static str, Value)],
+) -> Option<&'static str> {
+    let id = vars.iter().find(|(k, _)| *k == "$id").and_then(|(_, v)| v.as_u64())?;
+    let step = app.s.mailbox.quick_steps.iter().find(|q| q.id == id)?;
+    let count = match surface {
+        Surface::Read(_) => 1,
+        _ => app.s.selection.items.len().max(usize::from(app.s.selection.focus.is_some())),
+    };
+    mailcraft_engine::cmd::quicksteps::blocked_for(step, count, false)
 }
 
 /// A menu entry ready to draw.

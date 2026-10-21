@@ -16,6 +16,7 @@ pub mod compose;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
 pub mod dialogs;
+pub mod explorer;
 pub mod folders;
 pub mod icons;
 pub mod keys;
@@ -58,6 +59,12 @@ pub struct UiState {
     pub dialogs: Vec<(String, Value)>,
     /// Opened read windows (item ids).
     pub read_windows: Vec<u64>,
+    /// More main windows opened with Open in New Window, each with its own folder and selection.
+    pub explorers: Vec<explorer::ExplorerWindow>,
+    /// The platform draws extra windows inside the main one (the web build, test harnesses): Open in New
+    /// Window then shows the folder in the main window instead (an embedded second main window would clash
+    /// with the first). Mirrored from the context every frame.
+    pub embedded_viewports: bool,
     /// Search box has focus (shows the Search contextual tab).
     pub search_active: bool,
     pub search_text: String,
@@ -113,6 +120,23 @@ pub struct App {
     pub icons: icons::Icons,
     /// The platform's file dialogs (installed by the desktop app); `None` = dialogs show a path box instead.
     pub files: Option<Arc<dyn FileDialogs>>,
+    /// The platform's speech output (Read Aloud; installed by the desktop app); `None` = Read Aloud shows the
+    /// text only.
+    pub speech: Option<Arc<dyn Speech>>,
+}
+
+/// Speech output for Read Aloud: says one stretch of text at a time. The desktop app installs one in
+/// [`App::speech`] (a speech engine of the operating system); tests install fakes. Implementations must not
+/// panic and must not block the frame.
+pub trait Speech: Send + Sync {
+    /// Starts saying `text`, cutting off whatever is being said.
+    fn speak(&self, text: &str) -> Result<(), String>;
+    /// Stops speaking now.
+    fn stop(&self);
+    /// True while the last text is still being said.
+    fn speaking(&self) -> bool;
+    /// Name of the speech engine, shown in the Read Aloud window.
+    fn name(&self) -> String;
 }
 
 /// A file type offered by a file dialog: a name ("MBOX mailbox") and its extensions without the dot.
@@ -165,6 +189,9 @@ pub(crate) struct ShellState {
     /// Window state last pushed to the OS window (None = first frame, nothing pushed yet).
     pub applied_maximized: Option<bool>,
     pub applied_minimized: bool,
+    /// The OS reported the window minimized since the last Minimize was pushed (so a later "not minimized"
+    /// means the person restored it).
+    pub seen_minimized: bool,
     /// Focused item last frame (single-pane switching).
     pub last_focus: Option<ItemId>,
     /// Toasts on screen: text, expiry (egui seconds), error?
@@ -216,8 +243,12 @@ pub(crate) fn shell_id() -> egui::Id {
 }
 
 /// Reads and updates the shell state of `ctx`.
+///
+/// Each OS window (viewport) has its own: an explorer window (`explorer.rs`) lays out its own panes.
 pub(crate) fn with_shell<R>(ctx: &egui::Context, f: impl FnOnce(&mut ShellState) -> R) -> R {
-    ctx.data_mut(|d| f(d.get_temp_mut_or_default::<ShellState>(shell_id())))
+    let vp = ctx.viewport_id();
+    let id = if vp == egui::ViewportId::ROOT { shell_id() } else { shell_id().with(vp) };
+    ctx.data_mut(|d| f(d.get_temp_mut_or_default::<ShellState>(id)))
 }
 
 /// The bundled app icon (our own artwork).
@@ -321,7 +352,12 @@ pub fn ui_semibold() -> egui::FontFamily {
 impl App {
     pub fn new(s: Session) -> App {
         let theme = theme::Theme::for_dark(s.view.dark);
-        App { s, ui: UiState::default(), theme, icons: icons::Icons::default(), files: None }
+        App { s, ui: UiState::default(), theme, icons: icons::Icons::default(), files: None, speech: None }
+    }
+
+    /// Installs the platform's speech output (Read Aloud).
+    pub fn set_speech(&mut self, speech: Arc<dyn Speech>) {
+        self.speech = Some(speech);
     }
 
     /// Installs the platform's file dialogs.
@@ -408,6 +444,7 @@ impl App {
     /// builds it from the context). The main window always covers the whole viewport.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.ui.embedded_viewports = ctx.embed_viewports();
         egui_extras::install_image_loaders(&ctx);
         self.sync_theme(&ctx);
         // Control-channel requests (when `--control-port` asked for one) apply before drawing.
@@ -430,6 +467,7 @@ impl App {
         chrome::main_window(&mut window, self, &frame);
 
         reading::read_windows(&ctx, self);
+        explorer::explorer_windows(&ctx, self);
         compose::compose_windows(&ctx, self);
         backstage::backstage(&ctx, self);
         // Item windows (appointment, contact, task, Go to Date) take their requests out of `ui.dialogs`
@@ -491,6 +529,19 @@ impl App {
     /// Pushes Maximize / Minimize changes made by commands to the OS window (not on the first frame, so the
     /// window keeps the size the app opened it with).
     fn sync_window(&mut self, ctx: &egui::Context) {
+        // The OS restored a window minimized by `app.minimize`: the view state follows, so the next Minimize
+        // (from the control channel or MCP) is pushed again.
+        let os_min = ctx.input(|i| i.viewport().minimized);
+        let seen = with_shell(ctx, |st| {
+            if os_min == Some(true) {
+                st.seen_minimized = true;
+            }
+            st.seen_minimized
+        });
+        if self.s.view.minimized && seen && os_min == Some(false) {
+            self.s.view.minimized = false;
+            with_shell(ctx, |st| st.seen_minimized = false);
+        }
         let (max, min) = (self.s.view.maximized, self.s.view.minimized);
         let (applied_max, applied_min) = with_shell(ctx, |st| (st.applied_maximized, st.applied_minimized));
         if let Some(prev) = applied_max
@@ -500,6 +551,7 @@ impl App {
         }
         if min && !applied_min {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            with_shell(ctx, |st| st.seen_minimized = false);
         }
         with_shell(ctx, |st| {
             st.applied_maximized = Some(max);

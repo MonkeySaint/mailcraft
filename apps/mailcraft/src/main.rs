@@ -22,6 +22,7 @@ use mailcraft_ui_egui::App;
 
 mod clipboard;
 mod file_dialogs;
+mod speech;
 
 const USAGE: &str = "\
 Usage: mailcraft [OPTIONS]
@@ -194,12 +195,15 @@ fn main() -> ExitCode {
     }
     mailcraft_ui_egui::backstage::set_build_info(BUILD_INFO);
 
-    let session = open_session(&args);
+    let mut session = open_session(&args);
+    // Quick Print goes straight to the default printer in the desktop app.
+    session.direct_print = true;
     let mut app = App::new(session);
     if let Some(url) = &args.mailto {
         app.run("mail.newFromMailto", serde_json::json!({"url": url}));
     }
     file_dialogs::install(&mut app);
+    speech::install(&mut app);
     clipboard::install();
     app.ui.control_port = args.control_port.or_else(|| {
         std::env::var("MAILCRAFT_CONTROL_PORT")

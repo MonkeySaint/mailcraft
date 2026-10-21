@@ -321,11 +321,11 @@ item | All Categories... | category-tag | mail.allCategories | | A
 item | Set Quick Click... | | categories.setQuickClick | | Q
 
 menu followUp
-item | Today | flag | mail.flag | {"kind":"today"} | T
-item | Tomorrow | flag | mail.flag | {"kind":"tomorrow"} | O
-item | This Week | flag | mail.flag | {"kind":"thisWeek"} | W
-item | Next Week | flag | mail.flag | {"kind":"nextWeek"} | N
-item | No Date | flag | mail.flag | {"kind":"noDate"} | A
+item | Today | flag | mail.flag | {"kind":"today"} | T | on=followup:today
+item | Tomorrow | flag | mail.flag | {"kind":"tomorrow"} | O | on=followup:tomorrow
+item | This Week | flag | mail.flag | {"kind":"thisWeek"} | W | on=followup:thisWeek
+item | Next Week | flag | mail.flag | {"kind":"nextWeek"} | N | on=followup:nextWeek
+item | No Date | flag | mail.flag | {"kind":"noDate"} | A | on=followup:noDate
 item | Custom... | flag | mail.flagCustom | | C
 sep
 item | Add Reminder... | bell | mail.addReminder | | R

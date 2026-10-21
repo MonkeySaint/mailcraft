@@ -140,14 +140,28 @@ fn kind_visible(kind: FolderKind, module: Module) -> bool {
     }
 }
 
+/// Folders whose Properties › General › "Show total number of items" is on (kept with the window-wide
+/// dialog settings, `state.uiPrefs`, as `folder.<id>.showTotal`).
+pub fn show_total_folders(s: &Session) -> BTreeSet<u64> {
+    let Some(serde_json::Value::Object(m)) = s.settings.get("state.uiPrefs") else {
+        return BTreeSet::new();
+    };
+    m.iter()
+        .filter(|(_, v)| v.as_bool() == Some(true))
+        .filter_map(|(k, _)| k.strip_prefix("folder.")?.strip_suffix(".showTotal")?.parse().ok())
+        .collect()
+}
+
 fn folder_row(
     s: &Session,
     id: FolderId,
     kind: FolderRowKind,
     depth: u32,
     has_children: bool,
+    totals: &BTreeSet<u64>,
 ) -> Option<FolderRow> {
     let f = s.mailbox.folder(id)?;
+    let show_total = totals.contains(&id.0) || f.role.is_some_and(FolderRole::shows_total_count);
     let (badge, accessible) = if f.kind == FolderKind::Search {
         // Search folders count their live results (unread), not the items filed in them (none).
         let unread = crate::search_index::search_folder_counts(s, id).unread;
@@ -155,6 +169,13 @@ fn folder_row(
             0 => (String::new(), f.name.clone()),
             1 => ("1".to_owned(), format!("{}: 1 unread message", f.name)),
             n => (n.to_string(), format!("{}: {n} unread messages", f.name)),
+        }
+    } else if show_total {
+        // The folder's own choice: the number of items, unread or not.
+        match s.mailbox.total_count(id) {
+            0 => (String::new(), f.name.clone()),
+            1 => ("[1]".to_owned(), format!("{}: 1 item", f.name)),
+            n => (format!("[{n}]"), format!("{}: {n} items", f.name)),
         }
     } else {
         (s.mailbox.badge(id).unwrap_or_default(), s.mailbox.folder_accessible_name(id))
@@ -167,7 +188,7 @@ fn folder_row(
         has_children,
         expanded: f.expanded,
         badge,
-        badge_total: f.role.is_some_and(FolderRole::shows_total_count),
+        badge_total: show_total && f.kind != FolderKind::Search,
         selected: s.selection.folder == id,
         accessible,
     })
@@ -180,6 +201,7 @@ fn folder_row(
 pub fn folder_rows(s: &Session) -> Vec<FolderRow> {
     let mb = &s.mailbox;
     let module = s.view.module;
+    let totals = show_total_folders(s);
     let mut rows = Vec::new();
     if s.view.favorites_visible && module == Module::Mail {
         let favs = mb.favorites();
@@ -197,7 +219,8 @@ pub fn folder_rows(s: &Session) -> Vec<FolderRow> {
                 accessible: "Favorites".to_owned(),
             });
             rows.extend(
-                favs.into_iter().filter_map(|id| folder_row(s, id, FolderRowKind::Favorite, 1, false)),
+                favs.into_iter()
+                    .filter_map(|id| folder_row(s, id, FolderRowKind::Favorite, 1, false, &totals)),
             );
         }
     }
@@ -235,7 +258,7 @@ pub fn folder_rows(s: &Session) -> Vec<FolderRow> {
                 .into_iter()
                 .filter(|k| mb.folder(*k).is_some_and(|f| kind_visible(f.kind, module)))
                 .collect();
-            let Some(row) = folder_row(s, id, FolderRowKind::Folder, depth, !kids.is_empty()) else {
+            let Some(row) = folder_row(s, id, FolderRowKind::Folder, depth, !kids.is_empty(), &totals) else {
                 continue;
             };
             let expanded = row.expanded;
@@ -249,37 +272,223 @@ pub fn folder_rows(s: &Session) -> Vec<FolderRow> {
     rows
 }
 
+/// The kind of item a message is, for Arrange By › Type: drafts, meeting requests, responses and
+/// cancellations (an iCalendar part; the response kind from the subject the organizer's client gives it),
+/// read receipts and delivery reports (RFC 8098 / RFC 3464 parts), signed and encrypted messages (S/MIME,
+/// RFC 8551), else a plain message. Reads only the item's part list and subject, so grouping a large folder
+/// stays cheap. Returns (group order, label).
+pub fn item_type(m: &MailItem) -> (i64, &'static str) {
+    if m.is_draft {
+        return (1, "Draft");
+    }
+    let has = |types: &[&str]| {
+        m.attachments.iter().any(|a| {
+            let t = a.mime_type.trim().to_ascii_lowercase();
+            types.iter().any(|x| t.starts_with(x))
+        })
+    };
+    if has(&["text/calendar", "application/ics"]) {
+        let subject = m.subject.trim_start().to_lowercase();
+        let response = ["accepted:", "declined:", "tentative:", "new time proposed:"];
+        if response.iter().any(|p| subject.starts_with(p)) {
+            return (3, "Meeting Response");
+        }
+        if subject.starts_with("canceled:") || subject.starts_with("cancelled:") {
+            return (4, "Meeting Cancellation");
+        }
+        return (2, "Meeting Request");
+    }
+    if has(&["message/disposition-notification"]) {
+        return (5, "Read Receipt");
+    }
+    if has(&["message/delivery-status", "message/global-delivery-status"]) {
+        return (6, "Delivery Report");
+    }
+    if has(&["application/pkcs7-mime", "application/x-pkcs7-mime"]) {
+        return (8, "Encrypted Message");
+    }
+    if has(&["application/pkcs7-signature", "application/x-pkcs7-signature"]) {
+        return (7, "Signed Message");
+    }
+    (0, "Message")
+}
+
 /// View settings of a folder (defaults when none were saved).
 pub fn view_settings(s: &Session, folder: FolderId) -> ViewSettings {
     s.mailbox.views.get(&folder).cloned().unwrap_or_default()
 }
 
-/// Lower-case strings whose presence in a body means "I was mentioned": my addresses, "@" + their local part
-/// and "@" + each account's sender name.
-fn mention_needles(s: &Session) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// What marks me as mentioned in a message, lower-case: my addresses (for mailto links) and the "@" tokens
+/// that address me ("@" + each address's local part, "@" + each account's sender name).
+#[derive(Clone, Debug, Default)]
+pub struct MentionNeedles {
+    pub addresses: Vec<String>,
+    pub tokens: Vec<String>,
+}
+
+fn mention_needles(s: &Session) -> MentionNeedles {
+    let mut out = MentionNeedles::default();
     for addr in &s.me {
-        out.push(addr.clone());
+        let addr = addr.trim().to_lowercase();
         if let Some((local, _)) = addr.split_once('@')
             && !local.is_empty()
         {
-            out.push(format!("@{local}"));
+            out.tokens.push(format!("@{local}"));
+        }
+        if !addr.is_empty() {
+            out.addresses.push(addr);
         }
     }
     for a in &s.mailbox.accounts {
+        let addr = a.address.trim().to_lowercase();
+        if !addr.is_empty() && !out.addresses.contains(&addr) {
+            out.addresses.push(addr);
+        }
         let name = a.sender_name.trim();
         if !name.is_empty() {
-            out.push(format!("@{}", name.to_lowercase()));
+            out.tokens.push(format!("@{}", name.to_lowercase()));
         }
     }
     out
 }
 
-/// Mentioned Mail: the body contains one of my addresses (or "@my name").
+/// Most body bytes examined for mentions.
+const MAX_MENTION_SCAN: usize = 256 * 1024;
+/// Most mailto links examined per message, and how far after one its address and text are looked for.
+const MAX_MENTION_LINKS: usize = 200;
+const MENTION_LINK_WINDOW: usize = 1024;
+
+/// The first `max` bytes of `s` or fewer, cut on a character boundary.
+fn scan_head(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    s.get(..end).unwrap_or_default()
+}
+
+/// Where the quoted history of a reply or forward starts in plain text: a separator line ("-----Original
+/// Message-----", "________"), a quoted header block line ("From: …" followed by "Sent:"/"Date:"/"To:"), an
+/// "On … wrote:" line, or the first ">" quoted line. Mentions only count before it.
+fn history_start(text: &str) -> usize {
+    let lines: Vec<(usize, &str)> = {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        for line in text.split_inclusive('\n') {
+            out.push((pos, line));
+            pos = pos.saturating_add(line.len());
+        }
+        out
+    };
+    for (i, (pos, line)) in lines.iter().enumerate() {
+        let t = line.trim();
+        let lower = t.to_lowercase();
+        let next = lines.get(i.saturating_add(1)).map(|(_, l)| l.trim().to_lowercase()).unwrap_or_default();
+        let separator = (t.starts_with("-----") && lower.contains("original message"))
+            || (t.len() >= 8 && t.chars().all(|c| c == '_'));
+        let header_block = lower.starts_with("from:")
+            && (next.starts_with("sent:") || next.starts_with("date:") || next.starts_with("to:"));
+        let wrote = lower.starts_with("on ") && lower.ends_with("wrote:");
+        if separator || header_block || wrote || t.starts_with('>') {
+            return *pos;
+        }
+    }
+    text.len()
+}
+
+/// True when `token` ("@name") occurs in `hay` as a word of its own: not glued to a letter or digit before
+/// (an address such as "x@name.org" is not a mention) and not running on into one after.
+fn has_token(hay: &str, token: &str) -> bool {
+    if token.len() < 2 {
+        return false;
+    }
+    let mut from = 0usize;
+    while let Some(i) = hay.get(from..).and_then(|h| h.find(token)) {
+        let at = from.saturating_add(i);
+        let end = at.saturating_add(token.len());
+        let before = hay.get(..at).and_then(|h| h.chars().next_back());
+        let after = hay.get(end..).and_then(|h| h.chars().next());
+        let glued_before = before.is_some_and(|c| c.is_alphanumeric() || c == '.' || c == '_');
+        let glued_after = after.is_some_and(|c| c.is_alphanumeric() || c == '@');
+        if !glued_before && !glued_after {
+            return true;
+        }
+        // Step past the match on a char boundary.
+        from = at.saturating_add(token.chars().next().map_or(1, char::len_utf8));
+    }
+    false
+}
+
+/// HTML mentions: a mailto link to one of my addresses whose text starts with "@" (how mail clients mark
+/// an @mention), before the quoted history (a reply header block, a blockquote or a horizontal rule).
+fn html_mentions(html: &str, addresses: &[String]) -> bool {
+    // Capped before anything else, on a character boundary (a cut inside a character must not fall back to
+    // the whole body).
+    let lower = scan_head(html, MAX_MENTION_SCAN).to_lowercase();
+    let lower = lower.as_str();
+    let cut = ["id=\"divrplyfwdmsg\"", "<blockquote", "<hr", "-----original message-----"]
+        .iter()
+        .filter_map(|m| lower.find(m))
+        .min()
+        .unwrap_or(lower.len());
+    let own = lower.get(..cut).unwrap_or(lower);
+    let mut from = 0usize;
+    let mut links = 0usize;
+    while let Some(i) = own.get(from..).and_then(|h| h.find("mailto:")) {
+        links = links.saturating_add(1);
+        if links > MAX_MENTION_LINKS {
+            break;
+        }
+        let start = from.saturating_add(i).saturating_add("mailto:".len());
+        // Everything about one link is looked for in a small window after it, so many links without a
+        // closing tag stay linear.
+        let rest = scan_head(own.get(start..).unwrap_or_default(), MENTION_LINK_WINDOW);
+        let addr_end = rest.find(['"', '\'', '?', '>', ' ']).unwrap_or(rest.len());
+        let addr = rest.get(..addr_end).unwrap_or_default().trim();
+        let text = rest
+            .find('>')
+            .and_then(|gt| rest.get(gt.saturating_add(1)..))
+            .map(|t| t.split("</a").next().unwrap_or_default())
+            .unwrap_or_default();
+        // The link text without tags inside it (<span>@Name</span>).
+        let mut plain = String::new();
+        let mut in_tag = false;
+        for c in text.chars().take(200) {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => plain.push(c),
+                _ => {}
+            }
+        }
+        if addresses.iter().any(|a| a == addr) && plain.trim().starts_with('@') {
+            return true;
+        }
+        from = start;
+    }
+    false
+}
+
+/// Mentioned Mail: the sender @mentioned me. In HTML, a mailto link to one of my addresses written as
+/// "@Name"; in text, "@" + my name or my address's local part as a word of its own. Only what the sender
+/// wrote counts: quoted reply history (where my address appears in every header block) is left out.
 pub fn mentions_me(s: &Session, item: &MailItem) -> bool {
-    let needles = mention_needles(s);
-    let body = item.body_text().to_lowercase();
-    needles.iter().any(|n| body.contains(n.as_str()))
+    mentions_with(&mention_needles(s), item)
+}
+
+fn mentions_with(needles: &MentionNeedles, item: &MailItem) -> bool {
+    if let Some(html) = &item.body.html
+        && html_mentions(html, &needles.addresses)
+    {
+        return true;
+    }
+    let text = item.body_text();
+    let text = scan_head(&text, MAX_MENTION_SCAN);
+    let own = text.get(..history_start(text)).unwrap_or(text).to_lowercase();
+    needles.tokens.iter().any(|t| has_token(&own, t))
 }
 
 /// Items the message list shows for the selected folder after search, Focused/Other and the filter, sorted
@@ -310,10 +519,7 @@ fn view_items(s: &Session) -> (ViewSettings, Vec<&MailItem>) {
         ListFilter::Flagged => items.retain(|m| m.is_flagged()),
         ListFilter::Mentioned => {
             let needles = mention_needles(s);
-            items.retain(|m| {
-                let body = m.body_text().to_lowercase();
-                needles.iter().any(|n| body.contains(n.as_str()))
-            });
+            items.retain(|m| mentions_with(&needles, m));
         }
     }
     // View Settings › Filter.
@@ -473,11 +679,8 @@ fn group_of(s: &Session, m: &MailItem, arrange: ArrangeBy) -> (Key, String) {
             }
         }
         ArrangeBy::Type => {
-            if m.is_draft {
-                (Key::Num(1), "Draft".to_owned())
-            } else {
-                (Key::Num(0), "Message".to_owned())
-            }
+            let (order, label) = item_type(m);
+            (Key::Num(order), label.to_owned())
         }
         ArrangeBy::Attachments => {
             if m.has_attachments() {
@@ -1936,6 +2139,102 @@ mod tests {
     }
 
     #[test]
+    fn mentions_ignore_quoted_history_and_plain_addresses() {
+        let s = sample_session();
+        let needles = mention_needles(&s);
+        let mail = |text: &str, html: Option<&str>| MailItem {
+            body: mailcraft_model::Body {
+                text: Some(text.into()),
+                html: html.map(str::to_owned),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // A reply quoting a header block that names me is not a mention.
+        let reply = mail(
+            "Sounds good.\n\n-----Original Message-----\nFrom: Jordan Lee <jordan.lee@example.net>\nSent: Monday\n\n@Jordan Lee see below\n",
+            None,
+        );
+        assert!(!mentions_with(&needles, &reply));
+        let quoted = mail("Agreed.\n\nOn Mon, Grace wrote:\n> thanks @jordan.lee\n", None);
+        assert!(!mentions_with(&needles, &quoted));
+        // My address in the text is not an @mention; "@Jordan Lee" and "@jordan.lee" are.
+        assert!(!mentions_with(&needles, &mail("Write to jordan.lee@example.net for access.", None)));
+        assert!(mentions_with(&needles, &mail("Thanks, @Jordan Lee!", None)));
+        assert!(mentions_with(&needles, &mail("cc @jordan.lee: please check", None)));
+        assert!(!mentions_with(&needles, &mail("ask @jordan.leeson instead", None)));
+        // HTML: a mailto link to me shown as "@Name", before the history.
+        let html = mail(
+            "",
+            Some(r#"<p>Hi <a href="mailto:Jordan.Lee@example.net"><span>@Jordan</span></a>, see this.</p>"#),
+        );
+        assert!(mentions_with(&needles, &html));
+        let plain_link = mail("", Some(r#"<p>Mail <a href="mailto:jordan.lee@example.net">Jordan</a>.</p>"#));
+        assert!(!mentions_with(&needles, &plain_link));
+        let in_history = mail(
+            "",
+            Some(
+                r#"<p>Ok</p><div id="divRplyFwdMsg"><a href="mailto:jordan.lee@example.net">@Jordan</a></div>"#,
+            ),
+        );
+        assert!(!mentions_with(&needles, &in_history));
+        assert!(
+            !has_token("", "@x") && !has_token("é@jordan", "@jordan") && has_token("(@jordan)", "@jordan")
+        );
+    }
+
+    /// Regression: hostile HTML (a megabyte of `mailto:` with no closing tag, a multibyte character at the
+    /// scan cap) made the Mentioned filter quadratic and let the cap fall back to the whole body.
+    #[test]
+    fn mention_scan_is_bounded_on_hostile_bodies() {
+        let s = sample_session();
+        let needles = mention_needles(&s);
+        let mail = |text: &str, html: Option<String>| MailItem {
+            body: mailcraft_model::Body { text: Some(text.into()), html, ..Default::default() },
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let flood = "<a href=\"mailto:x".repeat(1024 * 1024 / 17);
+        assert!(!mentions_with(&needles, &mail("", Some(flood))));
+        // A multibyte character straddling the cap, then a mention past it: not scanned, no panic.
+        let mut padded = "a".repeat(MAX_MENTION_SCAN - 1);
+        padded.push('é');
+        padded.push_str(r#"<a href="mailto:jordan.lee@example.net">@Jordan</a>"#);
+        assert!(!mentions_with(&needles, &mail("", Some(padded.clone()))));
+        let mut text = "b".repeat(MAX_MENTION_SCAN - 1);
+        text.push('é');
+        text.push_str(" @jordan.lee");
+        assert!(!mentions_with(&needles, &mail(&text, None)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "the scan is bounded");
+        assert_eq!(scan_head("aé", 2), "a");
+        assert_eq!(scan_head("aé", 3), "aé");
+        assert_eq!(scan_head("é", 1), "");
+    }
+
+    #[test]
+    fn arrange_by_type_tells_item_kinds_apart() {
+        let with = |subject: &str, mime: &str| MailItem {
+            subject: subject.into(),
+            attachments: vec![mailcraft_model::AttachmentMeta {
+                filename: "part".into(),
+                mime_type: mime.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(item_type(&MailItem::default()).1, "Message");
+        assert_eq!(item_type(&MailItem { is_draft: true, ..Default::default() }).1, "Draft");
+        assert_eq!(item_type(&with("Planning", "text/calendar; method=REQUEST")).1, "Meeting Request");
+        assert_eq!(item_type(&with("Accepted: Planning", "text/calendar")).1, "Meeting Response");
+        assert_eq!(item_type(&with("Canceled: Planning", "text/calendar")).1, "Meeting Cancellation");
+        assert_eq!(item_type(&with("Read: Hi", "message/disposition-notification")).1, "Read Receipt");
+        assert_eq!(item_type(&with("Delivered", "message/delivery-status")).1, "Delivery Report");
+        assert_eq!(item_type(&with("Hi", "application/pkcs7-signature")).1, "Signed Message");
+        assert_eq!(item_type(&with("Hi", "application/pkcs7-mime")).1, "Encrypted Message");
+        assert_eq!(item_type(&with("Hi", "application/pdf")).1, "Message");
+    }
+
+    #[test]
     fn folder_pane() {
         let s = sample_session();
         let rows = folder_rows(&s);
@@ -1952,6 +2251,26 @@ mod tests {
         assert_eq!(drafts.accessible, "Drafts: 2 items");
         let projects = rows[root + 1..].iter().find(|r| r.name == "Projects").unwrap();
         assert_eq!(projects.depth, 2);
+    }
+
+    #[test]
+    fn show_total_number_of_items_changes_the_folder_badge() {
+        let mut s = sample_session();
+        let rows = folder_rows(&s);
+        let inbox_row = rows.iter().find(|r| r.name == "Inbox" && r.kind == FolderRowKind::Folder).unwrap();
+        let inbox = inbox_row.id.unwrap();
+        assert!(!inbox_row.badge_total);
+        let key = format!("folder.{}.showTotal", inbox.0);
+        s.settings
+            .set("state.uiPrefs", &serde_json::json!({ key: true, "folder.x.showTotal": true }))
+            .unwrap();
+        assert_eq!(show_total_folders(&s), BTreeSet::from([inbox.0]));
+        let rows = folder_rows(&s);
+        let inbox_row = rows.iter().find(|r| r.id == Some(inbox) && r.kind == FolderRowKind::Folder).unwrap();
+        assert!(inbox_row.badge_total);
+        let n = s.mailbox.total_count(inbox);
+        assert_eq!(inbox_row.badge, format!("[{n}]"));
+        assert_eq!(inbox_row.accessible, format!("Inbox: {n} items"));
     }
 
     #[test]
@@ -2232,7 +2551,7 @@ mod tests {
         let folder = FolderId(r["folder"].as_u64().unwrap());
         let counts = crate::search_index::search_folder_counts(&s, folder);
         assert!(counts.unread > 0 && counts.unread == counts.total, "{counts:?}");
-        let row = folder_row(&s, folder, FolderRowKind::Folder, 1, false).unwrap();
+        let row = folder_row(&s, folder, FolderRowKind::Folder, 1, false, &BTreeSet::new()).unwrap();
         assert_eq!(row.badge, counts.unread.to_string());
         assert!(row.accessible.contains("unread"), "{}", row.accessible);
         s.selection.folder = folder;
