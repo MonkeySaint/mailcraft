@@ -46,8 +46,9 @@ const DESCRIPTIONS: [(&str, &str); 14] = [
 const NEEDS_SERVER: &str = "Needs a mail server; not available for local data files.";
 
 /// Sections with no settings of their own, shown after another section: (page, after section, heading).
-const EXTRA_SECTIONS: [(&str, &str, &str); 3] = [
+const EXTRA_SECTIONS: [(&str, &str, &str); 4] = [
     ("mail", "Compose messages", "MailCraft panes"),
+    ("advanced", "Start and exit", "AutoArchive"),
     ("advanced", "Reminders", "Export"),
     ("addIns", "", "Add-ins"),
 ];
@@ -66,7 +67,7 @@ const BUTTONS: &[(&str, &str, &str, Act)] = &[
     ("accessibility", "Application display options", "Stationery and Fonts...", Dialog("stationery")),
     ("advanced", "MailCraft panes", "Reading Pane...", Dialog("readingPaneOptions")),
     ("advanced", "Start and exit", "Browse...", PickFolder("advanced.startFolder")),
-    ("advanced", "AutoArchive", "AutoArchive Settings...", Cmd("folder.autoArchiveSettings")),
+    ("advanced", "AutoArchive", "AutoArchive Settings...", Cmd("options.autoArchive")),
     ("advanced", "Export", "Export", Cmd("file.openExport")),
     ("advanced", "Send and receive", "Send/Receive...", Cmd("sendReceive.showProgress")),
     ("advanced", "Other", "Quick Click...", Cmd("categories.setQuickClick")),
@@ -85,6 +86,11 @@ const NOTES: &[(&str, &str, &str)] = &[
         "groups",
         "User Interface options",
         "Groups are a service of hosted mail systems; MailCraft has none to show yet.",
+    ),
+    (
+        "advanced",
+        "AutoArchive",
+        "Keep folders small: old items move to an archive folder, or are deleted, on a schedule.",
     ),
     ("customizeRibbon", "Ribbon", "Adding tabs, groups and commands to the ribbon is not available yet."),
     ("addIns", "Add-ins", "No add-ins are installed. MailCraft does not load add-ins."),

@@ -1,13 +1,14 @@
 //! Folder pickers (Move/Copy Items, Move/Copy Folder, Go to Folder, Archive, Always Move…), Create New
-//! Folder, Rename, Properties, New Search Folder, Recover Deleted Items, AutoArchive, and the generic
-//! Yes/No confirmation (plan/reference/dialogs.md: new-folder, new-search-folder).
+//! Folder, Rename, Properties (its AutoArchive tab is `super::archive`'s form), New Search Folder, Recover
+//! Deleted Items, and the generic Yes/No confirmation (plan/reference/dialogs.md: new-folder,
+//! new-search-folder).
 
 use egui::{Context, RichText};
 use serde_json::{Value, json};
 
 use super::common::{
-    self, Dlg, Out, Pick, btn, btn_en, child, folder_path, folder_tree, footer, muted, ok_cancel, primary,
-    send_reply, take_replies, window, with_state,
+    self, Dlg, Out, Pick, btn, btn_en, child, folder_tree, footer, muted, ok_cancel, primary, send_reply,
+    take_replies, window, with_state,
 };
 use crate::App;
 use mailcraft_engine::search_index::SEARCH_FOLDER_TEMPLATES;
@@ -29,7 +30,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "folderProperties" => properties(ctx, app, d),
         "newSearchFolder" => new_search_folder(ctx, app, d),
         "recoverDeletedItems" => recover(ctx, app, d),
-        "autoArchiveSettings" => auto_archive(ctx, app, d),
         "confirm" => confirm(ctx, app, d),
         "mainWindow" => {
             if let Some(f) = d.u64("folder") {
@@ -313,6 +313,8 @@ struct PropState {
     description: String,
     show_total: bool,
     show_size: bool,
+    /// The AutoArchive tab.
+    archive: super::archive::FolderForm,
     error: String,
 }
 
@@ -320,12 +322,13 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = d.u64("folder");
     let key = format!("folder.{}.", folder.unwrap_or(0));
-    let init = |_: &App| PropState {
+    let init = |a: &App| PropState {
         name: d.str("name"),
         description: common::pref(ctx, &format!("{key}description"))
             .and_then(|v| v.as_str().map(str::to_owned))
             .unwrap_or_default(),
         show_total: common::pref(ctx, &format!("{key}showTotal")).and_then(|v| v.as_bool()).unwrap_or(false),
+        archive: folder.map(|f| super::archive::FolderForm::load(a, f)).unwrap_or_default(),
         ..Default::default()
     };
     let kind = d.str("kind");
@@ -334,6 +337,11 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let query = d.str("query");
     let calendar = d.get("calendar").map(calendar_rows).unwrap_or_default();
     with_state(ctx, app, uid, init, |st, app| {
+        for (k, v) in take_replies(ctx, uid) {
+            if k == "archiveTarget" {
+                st.archive.target = v.as_u64();
+            }
+        }
         let title = format!("{} Properties", d.str("name"));
         window(ctx, app, d, &title, 420.0, |ui, app| {
             ui.horizontal(|ui| {
@@ -395,10 +403,10 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 if st.show_size {
                     muted(ui, app, &format!("Size: {} KB", d.u64("sizeKb").unwrap_or(0)));
                 }
-            } else {
-                ui.label("AutoArchive settings for this folder.");
-                if btn(ui, "AutoArchive Settings...") {
-                    return Out::open("autoArchiveSettings", json!({"folder": folder}));
+            } else if let Some(f) = folder {
+                let out = super::archive::folder_form(ui, app, &mut st.archive, f, uid, "archiveTarget");
+                if !matches!(out, Out::Keep) {
+                    return out;
                 }
             }
             if !st.error.is_empty() {
@@ -416,6 +424,14 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                             .is_none()
                     {
                         st.error = last_error(app);
+                        return Out::Keep;
+                    }
+                    if let Some(f) = folder
+                        && st.archive != super::archive::FolderForm::load(app, f)
+                        && let Err(e) = st.archive.save(app, f)
+                    {
+                        st.tab = 1;
+                        st.error = e;
                         return Out::Keep;
                     }
                     Out::Close
@@ -662,69 +678,4 @@ fn kind_label(kind: &str) -> &'static str {
         "note" => "Note",
         _ => "Message",
     }
-}
-
-#[derive(Clone, Default)]
-struct ArchiveState {
-    mode: usize,
-    months: u32,
-    delete: bool,
-    target: Option<u64>,
-}
-
-fn auto_archive(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let key = format!("autoArchive.{}", d.u64("folder").unwrap_or(0));
-    let saved = common::pref(ctx, &key);
-    let init = |_: &App| {
-        let g = |k: &str| saved.as_ref().and_then(|v| v.get(k)).cloned();
-        ArchiveState {
-            mode: g("mode").and_then(|v| v.as_u64()).and_then(|v| usize::try_from(v).ok()).unwrap_or(1),
-            months: g("months").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()).unwrap_or(6),
-            delete: g("delete").and_then(|v| v.as_bool()).unwrap_or(false),
-            target: g("target").and_then(|v| v.as_u64()),
-        }
-    };
-    with_state(ctx, app, uid, init, |st, app| {
-        for (k, v) in take_replies(ctx, uid) {
-            if k == "target" {
-                st.target = v.as_u64();
-            }
-        }
-        window(ctx, app, d, "AutoArchive", 420.0, |ui, app| {
-            ui.radio_value(&mut st.mode, 0, "Do not archive items in this folder");
-            ui.radio_value(&mut st.mode, 1, "Archive items in this folder using the default settings");
-            ui.radio_value(&mut st.mode, 2, "Archive this folder using these settings:");
-            let mut out = Out::Keep;
-            ui.add_enabled_ui(st.mode == 2, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Clean out items older than");
-                    ui.add(egui::DragValue::new(&mut st.months).range(1..=60));
-                    ui.label("months");
-                });
-                ui.radio_value(&mut st.delete, false, "Move old items to:");
-                ui.horizontal(|ui| {
-                    let path = folder_path(app, st.target);
-                    ui.label(if path.is_empty() { "Archive".to_owned() } else { path });
-                    if btn(ui, "Browse...") {
-                        out = Out::open("pickFolder", child(uid, "target", json!({})));
-                    }
-                });
-                ui.radio_value(&mut st.delete, true, "Permanently delete old items");
-            });
-            muted(ui, app, "Archiving runs when you choose File › Info › Tools.");
-            match ok_cancel(ui, app, true) {
-                Some(true) => {
-                    common::set_pref(
-                        ctx,
-                        &key,
-                        json!({"mode": st.mode, "months": st.months, "delete": st.delete, "target": st.target}),
-                    );
-                    Out::Close
-                }
-                Some(false) => Out::Close,
-                None => out,
-            }
-        })
-    })
 }

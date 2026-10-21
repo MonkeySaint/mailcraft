@@ -10,6 +10,7 @@
 //! [`CmdResult`], [`Session`] (see session.rs), [`queries`] (read-only views the UI renders), [`catalog`].
 
 pub mod accounts;
+pub mod archive;
 pub mod catalog;
 pub mod cmd;
 pub mod compose;

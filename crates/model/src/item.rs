@@ -158,6 +158,9 @@ pub struct MailItem {
     /// Voting responses to this message recorded as they arrived (latest per responder).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub votes: Vec<VoteRecord>,
+    /// Properties › "Do not AutoArchive this item": AutoArchive leaves it where it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_auto_archive: bool,
 }
 
 impl MailItem {
@@ -306,6 +309,7 @@ impl MailItem {
             raw: _,
             pinned,
             votes,
+            no_auto_archive,
         } = old;
         self.id = *id;
         self.folder = *folder;
@@ -321,6 +325,7 @@ impl MailItem {
         self.remote_id = remote_id.clone();
         self.pinned = *pinned;
         self.votes = votes.clone();
+        self.no_auto_archive = *no_auto_archive;
     }
 }
 

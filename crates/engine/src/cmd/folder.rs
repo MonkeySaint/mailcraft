@@ -47,8 +47,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "AutoArchive Settings",
             "Folder › Properties",
             "",
-            "",
-            false,
+            r#"{"folder"?:string} (dialog) | {"folder"?:string,"mode"?:"default"|"never"|"custom","age"?:number,"unit"?:"days"|"weeks"|"months","action"?:"move"|"delete","target"?:string|null}"#,
+            true,
             has_folder,
             auto_archive_settings,
         ),
@@ -516,6 +516,7 @@ pub fn copy_folder_tree(
                 manual_pos: if is_root { None } else { of.manual_pos },
                 search_query: of.search_query.clone(),
                 remote_name: None,
+                auto_archive: of.auto_archive,
             },
         );
         if let Some(v) = mb.views.get(old).cloned() {
@@ -1105,9 +1106,9 @@ fn properties(s: &mut Session, p: &Value) -> CmdResult {
     Ok(dialog(s, "folderProperties", params))
 }
 
+/// The folder's AutoArchive properties: opens the dialog, or saves them (see `crate::archive`).
 fn auto_archive_settings(s: &mut Session, p: &Value) -> CmdResult {
-    let id = current_folder(s, p)?;
-    Ok(dialog(s, "autoArchiveSettings", json!({ "folder": id.0 })))
+    crate::archive::folder_settings(s, p)
 }
 
 fn open_in_new_window(s: &mut Session, p: &Value) -> CmdResult {

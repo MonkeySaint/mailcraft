@@ -414,6 +414,7 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         control::frame(&ctx, self);
         self.poll_sync(&ctx);
+        dialogs::auto_archive_tick(&ctx, self);
         keys::handle(&ctx, self, Surface::Main);
         self.drain_notices(&ctx);
         self.sync_window(&ctx);

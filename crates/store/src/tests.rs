@@ -93,6 +93,25 @@ fn journal_round_trip_moves_raw_to_blobs() {
 }
 
 #[test]
+fn head_of_reads_the_start_of_the_source() {
+    let d = tmp();
+    let a = mail(10, "One", Some(RAW1));
+    let mut store = Store::open(d.path()).unwrap();
+    store.append(&[Op::PutMail(Box::new(a.clone()))]).unwrap();
+    assert_eq!(store.head_of(&a, 5).unwrap().as_deref(), Some(&RAW1[..5]), "kept raw");
+    let got = stored(a);
+    assert_eq!(store.head_of(&got, 5).unwrap().as_deref(), Some(&RAW1[..5]), "from the blob");
+    assert_eq!(store.head_of(&got, usize::MAX).unwrap().as_deref(), Some(RAW1), "capped by the blob");
+    assert_eq!(store.head_of(&mail(11, "none", None), 5).unwrap(), None);
+    let bad = MailItem { blob: Some("not a key".into()), ..mail(12, "bad", None) };
+    assert!(store.head_of(&bad, 5).is_err());
+    // A truncated blob is corrupt, not a short header.
+    let key = BlobKey::parse(got.blob.as_deref().unwrap()).unwrap();
+    fs::write(key.path(d.path()), &RAW1[..3]).unwrap();
+    assert!(store.head_of(&got, 64).is_err());
+}
+
+#[test]
 fn checkpoint_snapshot_excludes_raw_and_resets_journal() {
     let d = tmp();
     let mut mb = base_mailbox();

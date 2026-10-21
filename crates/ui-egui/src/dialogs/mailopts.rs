@@ -127,6 +127,8 @@ struct MsgOpts {
     delay_on: bool,
     delay: String,
     save_sent: usize,
+    /// "Do not AutoArchive this item" (received messages).
+    no_archive: bool,
 }
 
 fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -153,11 +155,13 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     })
                     .unwrap_or_else(|| format!("{} 17:00", common::today(a))),
                 save_sent: 0,
+                no_archive: false,
             }
         } else if let Some(m) = item.and_then(|i| a.s.mailbox.mail.get(&ItemId(i))) {
             MsgOpts {
                 importance: imp_idx(m.importance),
                 sensitivity: sens_idx(m.sensitivity),
+                no_archive: m.no_auto_archive,
                 ..Default::default()
             }
         } else {
@@ -213,6 +217,7 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     );
                 });
             } else if let Some(m) = item.and_then(|i| app.s.mailbox.mail.get(&ItemId(i))) {
+                ui.checkbox(&mut st.no_archive, "Do not AutoArchive this item");
                 common::heading(ui, app, "Internet headers");
                 let mut hdr = String::new();
                 if let Some(f) = &m.from {
@@ -234,7 +239,17 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     match compose {
                         Some(c) => apply_compose(app, c, st, &imp, &sens),
                         None => {
-                            app.run("mail.messageOptions", json!({"ids": item.into_iter().collect::<Vec<_>>(), "importance": imp, "sensitivity": sens}));
+                            let ids: Vec<u64> = item.into_iter().collect();
+                            app.run(
+                                "mail.messageOptions",
+                                json!({"ids": ids, "importance": imp, "sensitivity": sens}),
+                            );
+                            let was = item
+                                .and_then(|i| app.s.mailbox.mail.get(&ItemId(i)))
+                                .is_some_and(|m| m.no_auto_archive);
+                            if !ids.is_empty() && was != st.no_archive {
+                                app.run("mail.doNotAutoArchive", json!({"ids": ids, "on": st.no_archive}));
+                            }
                         }
                     }
                     Out::Close

@@ -397,6 +397,31 @@ impl Store {
         }
     }
 
+    /// The first `cap` bytes of `item`'s raw source (its in-memory `raw`, else its blob), for a header scan
+    /// that should not read whole messages. Unlike [`Store::raw_of`] the bytes are not checked against the
+    /// blob key (that needs the whole file); a blob shorter than its key says is reported as corrupt.
+    /// `Ok(None)` when the item has no source.
+    pub fn head_of(&self, item: &MailItem, cap: usize) -> Result<Option<Vec<u8>>> {
+        if let Some(raw) = &item.raw {
+            return Ok(Some(raw.get(..raw.len().min(cap)).unwrap_or_default().to_vec()));
+        }
+        let Some(key) = &item.blob else { return Ok(None) };
+        let parsed = BlobKey::parse(key)
+            .ok_or_else(|| StoreError::Corrupt(format!("invalid blob key {:?}", trunc(key))))?;
+        let f = match File::open(parsed.path(&self.dir)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let want = parsed.len.min(u64::try_from(cap).unwrap_or(u64::MAX));
+        let mut buf = Vec::with_capacity(usize::try_from(want).unwrap_or(0));
+        std::io::Read::read_to_end(&mut std::io::Read::take(f, want), &mut buf)?;
+        if u64::try_from(buf.len()).unwrap_or(u64::MAX) < want {
+            return Err(StoreError::Corrupt(format!("blob {parsed} is shorter than its key says")));
+        }
+        Ok(Some(buf))
+    }
+
     /// Current size of the journal file in bytes (0 when it cannot be read).
     pub fn journal_bytes(&self) -> u64 {
         self.journal.metadata().map_or(0, |m| m.len())

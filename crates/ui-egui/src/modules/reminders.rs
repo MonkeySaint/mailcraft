@@ -4,6 +4,12 @@
 //! acts); when a reminder comes due that has not been shown yet the window opens by itself. Dismiss,
 //! Dismiss All, Snooze and Open Item run the `calendar.dismissReminder`, `calendar.snoozeReminder` and
 //! `calendar.openReminderItem` commands with the reminder state this module keeps in egui memory.
+//!
+//! Options › Advanced › Reminders: with "Show reminders" off the window never opens by itself (View ›
+//! Reminders Window still opens it); with "Show reminders on top of other windows" on, a pop-up brings the
+//! main window forward and keeps it above other windows until the Reminders window closes. The first scan
+//! records when watching began ([`ReminderState::since`]), so reminders of events that end while the app runs
+//! stay overdue unless "Automatically dismiss reminders for past calendar events" is on.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -41,6 +47,8 @@ pub(crate) struct RemindersUi {
     pub wake_at: f64,
     /// Opens the window on new reminders (off in tests that do not want pop-ups).
     pub no_popup: bool,
+    /// The main window was put above other windows for this pop-up ("Show reminders on top").
+    pub on_top: bool,
 }
 
 fn state_id() -> Id {
@@ -58,12 +66,13 @@ pub(crate) fn store(ctx: &egui::Context, st: RemindersUi) {
 /// Scans now; opens the window when something new came due.
 fn scan(app: &App, st: &mut RemindersUi, now: f64) {
     st.last_poll = Some(now);
+    st.state.since.get_or_insert(app.s.now().unix);
     st.list = reminders::due(&app.s, &st.state);
     let wait = reminders::next_due_after(&app.s, &st.state, POLL_SECS as i64)
         .map_or(POLL_SECS, |t| (t.saturating_sub(app.s.now().unix).max(1) as f64).min(POLL_SECS));
     st.wake_at = now + wait;
     let fresh = st.list.iter().any(|r| !st.shown.contains(&r.key));
-    if fresh && !st.no_popup {
+    if fresh && !st.no_popup && reminders::popups_on(&app.s) {
         st.open = true;
     }
     st.shown = st.list.iter().map(|r| r.key.clone()).collect();
@@ -94,13 +103,25 @@ pub fn due_count(ctx: &egui::Context) -> usize {
 pub(crate) fn show(ctx: &egui::Context, app: &mut App) {
     let mut st = load(ctx);
     let now = ctx.input(|i| i.time);
+    let was_open = st.open;
     if st.last_poll.is_none_or(|t| now >= st.wake_at || now < t) {
         scan(app, &mut st, now);
+    }
+    if st.open && !was_open && reminders::on_top(&app.s) {
+        // A pop-up: bring the main window forward and keep it on top while the reminders are up.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        st.on_top = true;
     }
     // Wake up for the next scan even when nothing else repaints.
     ctx.request_repaint_after(Duration::from_secs_f64((st.wake_at - now).clamp(0.5, POLL_SECS)));
     if st.open {
         window(ctx, app, &mut st);
+    }
+    if st.on_top && !st.open {
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        st.on_top = false;
     }
     store(ctx, st);
 }
@@ -345,5 +366,85 @@ mod tests {
         store(&ctx, st);
         ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), &mut app)).textures_delta.clear();
         assert!(!load(&ctx).open);
+    }
+
+    /// Adds a task whose reminder came due an hour ago and forces a scan at the next frame.
+    fn due_task(ctx: &egui::Context, app: &mut App, subject: &str) {
+        let at = mailcraft_engine::cmd::calendar::pim::datetime_string(
+            mailcraft_engine::cmd::calendar::pim::add_secs(app.s.now(), -3600),
+            0,
+        );
+        app.run("tasks.new", json!({ "subject": subject, "reminder": at })).unwrap();
+        let mut st = load(ctx);
+        st.last_poll = None;
+        store(ctx, st);
+    }
+
+    #[test]
+    fn show_reminders_off_keeps_the_window_closed() {
+        let mut app = App::new(sample_session());
+        app.s.set_option("advanced.showReminders", &json!(false)).unwrap();
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), &mut app)).textures_delta.clear();
+        due_task(&ctx, &mut app, "Pay rent");
+        ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), &mut app)).textures_delta.clear();
+        let st = load(&ctx);
+        assert!(!st.open, "no pop-up");
+        assert_eq!(st.list.len(), 1, "still counted for the status bar");
+        // The window still opens on request.
+        open(&ctx, &app);
+        assert!(load(&ctx).open);
+    }
+
+    fn levels(out: &egui::FullOutput) -> Vec<egui::WindowLevel> {
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| {
+                v.commands
+                    .iter()
+                    .filter_map(|c| match c {
+                        egui::ViewportCommand::WindowLevel(l) => Some(*l),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn reminders_on_top_raises_the_window_while_they_show() {
+        let mut app = App::new(sample_session());
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), &mut app)).textures_delta.clear();
+        // Off (the default): a pop-up leaves the window level alone.
+        due_task(&ctx, &mut app, "Pay rent");
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), &mut app));
+        out.textures_delta.clear();
+        assert!(load(&ctx).open);
+        assert!(levels(&out).is_empty());
+        let mut st = load(&ctx);
+        st.open = false;
+        store(&ctx, st);
+        // On: the pop-up puts the window on top, closing it puts it back.
+        app.s.set_option("advanced.remindersOnTop", &json!(true)).unwrap();
+        due_task(&ctx, &mut app, "Call the bank");
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), &mut app));
+        out.textures_delta.clear();
+        assert!(load(&ctx).open);
+        assert_eq!(levels(&out), [egui::WindowLevel::AlwaysOnTop]);
+        let mut st = load(&ctx);
+        st.open = false;
+        store(&ctx, st);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), &mut app));
+        out.textures_delta.clear();
+        assert_eq!(levels(&out), [egui::WindowLevel::Normal]);
+    }
+
+    #[test]
+    fn first_scan_starts_watching_for_past_events() {
+        let mut app = App::new(sample_session());
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), &mut app)).textures_delta.clear();
+        assert_eq!(load(&ctx).state.since, Some(app.s.now().unix));
     }
 }

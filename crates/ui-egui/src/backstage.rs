@@ -510,7 +510,7 @@ fn info(ui: &mut Ui, app: &mut App, st: &mut PageState) {
             json!({}),
         ),
         Some(_) => {
-            app.run("folder.autoArchiveSettings", json!({}));
+            app.run("file.archive", json!({}));
         }
         None => {}
     }

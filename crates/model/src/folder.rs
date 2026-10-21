@@ -122,6 +122,71 @@ pub struct Folder {
     pub search_query: Option<String>,
     /// Remote name/path on the server (IMAP mailbox name), if synced.
     pub remote_name: Option<String>,
+    /// The folder's own AutoArchive properties (Properties › AutoArchive); `None` = the default settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_archive: Option<FolderArchive>,
+}
+
+/// How a folder takes part in AutoArchive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ArchiveMode {
+    /// Archive items with the default settings (File › Options › Advanced › AutoArchive Settings).
+    #[default]
+    Default,
+    /// Do not archive items in this folder.
+    Never,
+    /// Archive items with this folder's own age and action.
+    Custom,
+}
+
+/// Unit of an AutoArchive age ("Clean out items older than 6 Months").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgeUnit {
+    Days,
+    Weeks,
+    #[default]
+    Months,
+}
+
+/// What AutoArchive does with old items.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ArchiveAction {
+    /// Move them to the archive folder.
+    #[default]
+    Move,
+    /// Permanently delete them.
+    Delete,
+}
+
+/// Longest AutoArchive age accepted in any unit.
+pub const MAX_ARCHIVE_AGE: u32 = 999;
+
+/// A folder's own AutoArchive properties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FolderArchive {
+    pub mode: ArchiveMode,
+    /// Age past which items are old (in `unit`), 1..=[`MAX_ARCHIVE_AGE`].
+    pub age: u32,
+    pub unit: AgeUnit,
+    pub action: ArchiveAction,
+    /// Folder old items move to (`None` = the archive folder, mirroring the folder hierarchy).
+    pub target: Option<FolderId>,
+}
+
+impl Default for FolderArchive {
+    fn default() -> Self {
+        FolderArchive {
+            mode: ArchiveMode::Default,
+            age: 6,
+            unit: AgeUnit::Months,
+            action: ArchiveAction::Move,
+            target: None,
+        }
+    }
 }
 
 impl Folder {

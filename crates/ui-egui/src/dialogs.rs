@@ -14,6 +14,7 @@
 mod account_tests;
 mod accounts;
 mod alerts;
+mod archive;
 mod categories;
 mod common;
 mod compose_dlg;
@@ -105,6 +106,12 @@ pub fn open(app: &mut App, name: &str, params: Value) {
     }
 }
 
+/// The AutoArchive scheduler: checks when AutoArchive is due and runs it (or asks first) while the app is
+/// idle. The shell calls it every frame.
+pub fn auto_archive_tick(ctx: &egui::Context, app: &mut App) {
+    archive::tick(ctx, app);
+}
+
 /// Opens a Yes/No confirmation; Yes runs `command` with `params`.
 pub fn confirm(app: &mut App, title: &str, text: &str, command: &str, params: Value) {
     open(app, "confirm", json!({"title": title, "text": text, "command": command, "params": params}));
@@ -163,6 +170,9 @@ pub const KNOWN: &[&str] = &[
     "newSearchFolder",
     "recoverDeletedItems",
     "autoArchiveSettings",
+    "autoArchiveOptions",
+    "archive",
+    "autoArchivePrompt",
     "mainWindow",
     "confirm",
     "pickFolder",
@@ -319,6 +329,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return Out::Close;
     }
     if let Some(out) = folders::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = archive::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = categories::show(ctx, app, d) {

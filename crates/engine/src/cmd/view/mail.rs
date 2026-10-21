@@ -428,11 +428,16 @@ pub fn is_overdue(s: &Session, m: &MailItem) -> bool {
 }
 
 /// Longest header block scanned for an expiry date.
-const HEADER_SCAN: usize = 64 * 1024;
+pub const HEADER_SCAN: usize = 64 * 1024;
 
-/// The message's expiry date (`Expiry-Date` or `Expires`, RFC 4021) from its kept source, if any.
+/// The message's expiry date (`Expiry-Date` or `Expires`, RFC 4021) from its kept source, if any. Mail loaded
+/// from the store keeps its source in a blob; [`stored_expiry`] reads it from there.
 pub fn expiry(m: &MailItem) -> Option<DateTime> {
-    let raw = m.raw.as_deref()?;
+    expiry_in(m.raw.as_deref()?)
+}
+
+/// The expiry date of the message whose source is (or starts with) `raw`.
+pub fn expiry_in(raw: &[u8]) -> Option<DateTime> {
     let head = raw.get(..raw.len().min(HEADER_SCAN))?;
     let text = String::from_utf8_lossy(head);
     let mut value: Option<String> = None;
@@ -456,6 +461,22 @@ pub fn expiry(m: &MailItem) -> Option<DateTime> {
         }
     }
     DateTime::parse_rfc5322(value?.trim()).ok()
+}
+
+/// The message's expiry date read from its kept source, else from the start of its blob in the store (a file
+/// read: for batch work such as AutoArchive, not for painting rows).
+pub fn stored_expiry(s: &Session, m: &MailItem) -> Option<DateTime> {
+    if m.raw.is_some() {
+        return expiry(m);
+    }
+    let store = s.store.as_ref()?;
+    match store.head_of(m, HEADER_SCAN) {
+        Ok(head) => expiry_in(&head?),
+        Err(e) => {
+            log::warn!("cannot read the source of message {}: {e}", m.id.0);
+            None
+        }
+    }
 }
 
 /// The message carries an expiry date that has passed.

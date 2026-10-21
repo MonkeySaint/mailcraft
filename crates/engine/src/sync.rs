@@ -56,7 +56,7 @@ const BACKOFF_MAX_SECS: i64 = 3600;
 /// Wait after a send/receive could not even start (no password, bad settings) before trying automatically.
 const BLOCKED_RETRY_SECS: i64 = 300;
 /// Most queued server changes kept per account (oldest dropped beyond it).
-const MAX_PENDING: usize = 50_000;
+pub(crate) const MAX_PENDING: usize = 50_000;
 /// Below this measured transfer rate (bytes per second; 128 kbit/s) a connection counts as slow for
 /// Download Preferences › On Slow Connections Download Only Headers.
 pub const SLOW_LINK_BYTES_PER_SEC: u64 = 16_000;
@@ -971,6 +971,22 @@ fn synced_folder(mb: &Mailbox, fid: FolderId) -> Option<(AccountId, String)> {
 
 fn uid_of(m: &MailItem) -> Option<u32> {
     m.remote_id.as_deref()?.parse().ok().filter(|u| *u > 0)
+}
+
+/// The account whose server change queue moving or deleting `m` feeds (`None` for mail no server holds).
+pub(crate) fn queue_account(mb: &Mailbox, m: &MailItem) -> Option<AccountId> {
+    uid_of(m)?;
+    synced_folder(mb, m.folder).map(|(a, _)| a)
+}
+
+/// The account holding `folder` on its server (`None` for local folders).
+pub(crate) fn synced_account(mb: &Mailbox, folder: FolderId) -> Option<AccountId> {
+    synced_folder(mb, folder).map(|(a, _)| a)
+}
+
+/// Server changes queued for `account`.
+pub(crate) fn pending_len(mb: &Mailbox, account: AccountId) -> usize {
+    mb.account(account).map_or(0, |a| a.sync.pending.len())
 }
 
 /// IMAP flags that mirror an item's state (`\Draft` only matters when uploading).

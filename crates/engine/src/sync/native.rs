@@ -3183,4 +3183,28 @@ mod tests {
         assert!(!t.due(false), "the next waits");
         assert!(t.due(true), "forced reports always go out");
     }
+
+    #[test]
+    fn filling_a_header_only_item_keeps_its_state() {
+        // Regression: "Do not AutoArchive this item" was lost when a header-only message was downloaded in
+        // full, so the next AutoArchive run could move or delete it.
+        let (mut s, folder, _) = session();
+        let id = s.mailbox.add_mail(MailItem {
+            folder,
+            subject: "Headers only".into(),
+            remote_id: Some("5".into()),
+            ignored: true,
+            no_auto_archive: true,
+            read: true,
+            ..Default::default()
+        });
+        crate::accounts::prefs(&mut s).headers_only.insert(id.0);
+        let raw = b"From: a@example.com\r\nSubject: Headers only\r\n\r\nThe whole body\r\n";
+        assert!(fill_item(&mut s, id, raw));
+        let m = &s.mailbox.mail[&id];
+        assert_eq!(m.body.text.as_deref().map(str::trim), Some("The whole body"));
+        assert!(m.no_auto_archive && m.ignored && m.read);
+        assert_eq!(m.remote_id.as_deref(), Some("5"));
+        assert!(!crate::sync::cmds::is_header_only(&s, id));
+    }
 }

@@ -81,9 +81,9 @@ fn cleanup(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Move old items to the archive file.");
+                    ui.label("Move old items to the archive folder (AutoArchive).");
                     if btn(ui, "AutoArchive") {
-                        app.run("folder.autoArchiveSettings", json!({}));
+                        app.run("file.archive", json!({"all": true}));
                     }
                 });
                 ui.separator();

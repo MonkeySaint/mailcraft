@@ -16,6 +16,15 @@
 //!
 //! Keys identify a reminder: `appointment:<id>:<occurrence start, unix>`, `task:<id>`, `mail:<id>`,
 //! `contact:<id>`.
+//!
+//! **Options › Advanced › Reminders.** "Show reminders" ([`popups_on`]) lets the Reminders window open by
+//! itself; "Show reminders on top of other windows" ([`on_top`]) brings MailCraft's window to the front and
+//! keeps it there while the Reminders window is up. "Automatically dismiss reminders for past calendar
+//! events" decides what happens to an appointment's reminder once the event has ended: on, it drops out; off
+//! (the default) it stays, overdue, until dismissed or snoozed. Only reminders that came due while the
+//! scanner was watching stay ([`ReminderState::since`]; the UI sets it at its first scan), so starting the
+//! app does not bring back every past event, and none for events that ended more than
+//! [`MAX_OVERDUE_DAYS`] ago.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,6 +47,24 @@ pub const MAX_REMINDERS: usize = 500;
 pub const MAX_STATE_KEYS: usize = 5_000;
 /// Most occurrences of one series examined per scan.
 const MAX_OCCURRENCES: usize = 64;
+/// Oldest ended event whose reminder stays (with "Automatically dismiss reminders for past calendar events"
+/// off), in days.
+pub const MAX_OVERDUE_DAYS: i64 = 30;
+
+/// Options › Advanced › "Show reminders": the Reminders window opens by itself when reminders come due.
+pub fn popups_on(s: &Session) -> bool {
+    s.settings.bool("advanced.showReminders")
+}
+
+/// Options › Advanced › "Show reminders on top of other windows".
+pub fn on_top(s: &Session) -> bool {
+    s.settings.bool("advanced.remindersOnTop")
+}
+
+/// Options › Advanced › "Automatically dismiss reminders for past calendar events".
+pub fn dismisses_past(s: &Session) -> bool {
+    s.settings.bool("advanced.dismissPastReminders")
+}
 
 /// What a reminder is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -78,6 +105,10 @@ pub struct ReminderState {
     pub dismissed: BTreeSet<String>,
     /// Snoozed reminders: key → unix time they come back.
     pub snoozed: BTreeMap<String, i64>,
+    /// Since when (unix) reminders have been watched: appointment reminders that came due from then on stay
+    /// after their event ends, unless past events are dismissed automatically. `None` = none stay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
 }
 
 impl ReminderState {
@@ -157,16 +188,34 @@ pub fn due(s: &Session, st: &ReminderState) -> Vec<Reminder> {
     let now = s.now();
     let mb = &s.mailbox;
     let mut out = Vec::new();
+    // Ended events keep reminders that came due while watched, back to `MAX_OVERDUE_DAYS`.
+    let keep_from = st
+        .since
+        .filter(|_| !dismisses_past(s))
+        .map(|t| t.max(now.unix.saturating_sub(MAX_OVERDUE_DAYS.saturating_mul(86_400))));
     for a in mb.appointments.values() {
         let Some(m) = a.reminder_min else { continue };
         if !in_kind(mb, a.folder, FolderKind::Calendar) {
             continue;
         }
         let lead = i64::from(m).saturating_mul(60);
+        let reminder = |start: DateTime, end: DateTime, key: String| Reminder {
+            key,
+            kind: ReminderKind::Appointment,
+            item: a.id.0,
+            subject: a.subject.clone(),
+            location: a.location.clone(),
+            remind_at: start.unix.saturating_sub(lead),
+            due: Some(start.unix),
+            end: Some(end.unix),
+            all_day: a.all_day,
+            recurring: a.recurrence.is_some(),
+        };
         let to = pim::add_secs(now, lead.saturating_add(1));
+        let mut shown = false;
         for (start, end) in occurrences(a, now, to, MAX_OCCURRENCES) {
             let remind_at = start.unix.saturating_sub(lead);
-            // Ended occurrences drop out; a zero-length one stays until its start passes.
+            // Ended occurrences are past events (below); a zero-length one runs until its start passes.
             let running = end.unix > now.unix || (end.unix == start.unix && start.unix >= now.unix);
             if remind_at > now.unix || !running {
                 continue;
@@ -175,20 +224,28 @@ pub fn due(s: &Session, st: &ReminderState) -> Vec<Reminder> {
             if st.hidden(&key, now.unix) {
                 continue;
             }
-            out.push(Reminder {
-                key,
-                kind: ReminderKind::Appointment,
-                item: a.id.0,
-                subject: a.subject.clone(),
-                location: a.location.clone(),
-                remind_at,
-                due: Some(start.unix),
-                end: Some(end.unix),
-                all_day: a.all_day,
-                recurring: a.recurrence.is_some(),
-            });
+            out.push(reminder(start, end, key));
+            shown = true;
             // A series reminds of one occurrence at a time.
             break;
+        }
+        // A past event: the latest ended occurrence whose reminder came due while watched.
+        if let Some(from) = keep_from.filter(|_| !shown) {
+            let past =
+                occurrences(a, DateTime::from_unix(from.saturating_add(lead), 0), now, MAX_OCCURRENCES)
+                    .into_iter()
+                    .filter(|(start, end)| {
+                        end.unix <= now.unix
+                            && start.unix < now.unix
+                            && start.unix.saturating_sub(lead) >= from
+                    })
+                    .max_by_key(|(start, _)| start.unix);
+            if let Some((start, end)) = past {
+                let key = Key::Appointment(a.id, start.unix).text();
+                if !st.hidden(&key, now.unix) {
+                    out.push(reminder(start, end, key));
+                }
+            }
         }
     }
     for t in mb.tasks.values() {
@@ -636,6 +693,63 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_ne!(d[0].key, first);
         assert_eq!(d[0].due, Some(at(&s, 60 + 24 * 60).unix));
+    }
+
+    #[test]
+    fn past_event_reminders_stay_overdue_unless_dismissed_automatically() {
+        let mut s = session(); // 10:07
+        let base = s.now();
+        let id = appt(&mut s, 20, 30, Some(15), None); // 10:27–10:57, reminds at 10:12
+        let watched = ReminderState { since: Some(base.unix), ..Default::default() };
+        s.fixed_now = Some(pim::add_secs(base, 60 * 60)); // 11:07: the meeting has ended
+        let d = due(&s, &watched);
+        assert_eq!(d.len(), 1, "the default keeps it");
+        assert_eq!(d[0].item, id);
+        assert_eq!(due_in_text(&d[0], s.now().unix), "40 minutes overdue");
+        // Without a watch start (no state kept), or when it came due before watching began: gone.
+        assert!(due(&s, &ReminderState::default()).is_empty());
+        let late = ReminderState { since: Some(pim::add_secs(base, 10 * 60).unix), ..Default::default() };
+        assert!(due(&s, &late).is_empty());
+        // Options › Advanced › "Automatically dismiss reminders for past calendar events".
+        s.settings.set("advanced.dismissPastReminders", &json!(true)).unwrap();
+        assert!(dismisses_past(&s));
+        assert!(due(&s, &watched).is_empty());
+        s.settings.set("advanced.dismissPastReminders", &json!(false)).unwrap();
+        // Dismissing it for real clears it.
+        let mut st = watched.clone();
+        let key = d[0].key.clone();
+        assert_eq!(dismiss(&mut s, &mut st, &[key]), 1);
+        assert!(due(&s, &st).is_empty());
+        assert_eq!(s.mailbox.appointments[&ItemId(id)].reminder_min, None);
+        // Events that ended long ago drop out anyway.
+        let old = appt(&mut s, 0, 30, Some(15), None);
+        s.fixed_now = Some(pim::add_secs(base, (MAX_OVERDUE_DAYS + 1) * 86_400));
+        let ancient = ReminderState { since: Some(base.unix - 3600), ..Default::default() };
+        assert!(due(&s, &ancient).iter().all(|r| r.item != old));
+    }
+
+    #[test]
+    fn a_past_series_reminds_of_its_latest_ended_occurrence() {
+        let mut s = session(); // 10:07
+        let base = s.now();
+        let id = appt(&mut s, -3 * 24 * 60, 30, Some(15), Some("FREQ=DAILY;COUNT=3"));
+        let mut st = ReminderState { since: Some(base.unix - 4 * 86_400), ..Default::default() };
+        let d = due(&s, &st);
+        assert_eq!(d.len(), 1, "one reminder per series");
+        assert_eq!((d[0].item, d[0].due), (id, Some(base.unix - 86_400)));
+        // Dismissing that occurrence does not bring back the older ones.
+        let key = d[0].key.clone();
+        dismiss(&mut s, &mut st, &[key]);
+        assert!(due(&s, &st).is_empty());
+    }
+
+    #[test]
+    fn reminder_options_are_read_from_the_settings() {
+        let mut s = session();
+        assert!(popups_on(&s) && !on_top(&s) && !dismisses_past(&s), "the observed defaults");
+        s.settings.set("advanced.showReminders", &json!(false)).unwrap();
+        s.settings.set("advanced.remindersOnTop", &json!(true)).unwrap();
+        assert!(!popups_on(&s) && on_top(&s));
     }
 
     #[test]

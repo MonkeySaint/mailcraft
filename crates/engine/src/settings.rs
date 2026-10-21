@@ -1,6 +1,6 @@
 //! Profile settings: every File › Options setting (`plan/reference/options.md`, all 14 pages), the settings
-//! of the option dialogs reached from them (Reading Pane, Junk Email Options, Stationery and Fonts) and UI
-//! state that outlives a session, as typed key/value pairs with defaults.
+//! of the option dialogs reached from them (Reading Pane, Junk Email Options, Stationery and Fonts,
+//! AutoArchive) and UI state that outlives a session, as typed key/value pairs with defaults.
 //!
 //! - [`DEFS`] is the schema: key, Options page and section, label, kind (with default and range) and how far
 //!   the setting reaches today ([`Effect`]). The Options window is generated from it.
@@ -63,8 +63,8 @@ pub enum Effect {
 pub struct Def {
     pub key: &'static str,
     /// Options page id (`general`, `mail`… as in `options.open`), or a dialog reached from one
-    /// (`readingPane`, `stationery`), or `state` (UI state, not shown in Options). Junk Email Options live in
-    /// the mailbox (`mail.junk`), not here.
+    /// (`readingPane`, `stationery`, `autoArchive`), or `state` (UI state, not shown in Options). Junk Email
+    /// Options live in the mailbox (`mail.junk`), not here.
     pub page: &'static str,
     /// Section heading on the page.
     pub section: &'static str,
@@ -1469,60 +1469,68 @@ pub const DEFS: &[Def] = &[
         A,
     ),
     d(
-        "advanced",
+        "autoArchive",
         "AutoArchive",
         "advanced.autoArchive.run",
         "Run AutoArchive every number of days",
         Bool(false),
-        E,
+        A,
     ),
     d(
-        "advanced",
+        "autoArchive",
         "AutoArchive",
         "advanced.autoArchive.everyDays",
         "Days between AutoArchive runs:",
         Int(14, 1, 60),
-        E,
+        A,
     ),
     d(
-        "advanced",
+        "autoArchive",
         "AutoArchive",
         "advanced.autoArchive.prompt",
         "Prompt before AutoArchive runs",
         Bool(false),
-        E,
+        A,
     ),
     d(
-        "advanced",
+        "autoArchive",
         "AutoArchive",
         "advanced.autoArchive.deleteExpired",
         "Delete expired items (email folders only)",
         Bool(false),
-        E,
+        A,
     ),
     d(
-        "advanced",
+        "autoArchive",
         "AutoArchive",
         "advanced.autoArchive.olderThanMonths",
         "Clean out items older than (months):",
         Int(6, 1, 60),
-        E,
+        A,
     ),
     d(
-        "advanced",
+        "autoArchive",
         "AutoArchive",
         "advanced.autoArchive.action",
         "When cleaning out old items:",
         Choice("move", AUTO_ARCHIVE_ACTION),
-        E,
+        A,
     ),
     d(
-        "advanced",
+        "autoArchive",
         "AutoArchive",
         "advanced.autoArchive.folder",
-        "Move old items to this folder (empty = Archive):",
+        "Move old items to this folder (empty = Archives):",
         Text("", 512),
-        E,
+        A,
+    ),
+    d(
+        "state",
+        "AutoArchive",
+        "state.autoArchive.lastRun",
+        "Last AutoArchive run (unix seconds, 0 = never)",
+        Int(0, 0, 32_503_680_000),
+        A,
     ),
     d(
         "advanced",
@@ -1542,7 +1550,7 @@ pub const DEFS: &[Def] = &[
         Choice("default", OPEN_LINKS),
         N,
     ),
-    d("advanced", "Reminders", "advanced.showReminders", "Show reminders", Bool(true), E),
+    d("advanced", "Reminders", "advanced.showReminders", "Show reminders", Bool(true), A),
     d("advanced", "Reminders", "advanced.reminderSound", "Play reminder sound", Bool(true), E),
     d(
         "advanced",
@@ -1558,7 +1566,7 @@ pub const DEFS: &[Def] = &[
         "advanced.remindersOnTop",
         "Show reminders on top of other windows",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "advanced",
@@ -1566,7 +1574,7 @@ pub const DEFS: &[Def] = &[
         "advanced.dismissPastReminders",
         "Automatically dismiss reminders for past calendar events",
         Bool(false),
-        E,
+        A,
     ),
     // N: MailCraft has no RSS feeds.
     d(
@@ -2435,6 +2443,7 @@ mod tests {
             assert!(
                 d.page == "state"
                     || d.page == "readingPane"
+                    || d.page == "autoArchive"
                     || d.page == "stationery"
                     || PAGES.iter().any(|(p, _)| *p == d.page),
                 "{}: unknown page {}",
