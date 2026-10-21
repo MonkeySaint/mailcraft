@@ -292,7 +292,10 @@ pub struct ComposeState {
     /// This compose answers a voting message with this choice (sent as the vote header).
     pub vote_response: Option<String>,
     pub save_sent: SaveSentTo,
+    /// Encrypt with S/MIME on Send (Options › Encrypt).
     pub encrypt: bool,
+    /// Sign with S/MIME on Send (Options › Sign).
+    pub sign: bool,
     pub theme: ThemeState,
     pub style_set: Option<String>,
     pub paragraph_spacing_preset: Option<String>,

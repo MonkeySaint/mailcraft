@@ -185,6 +185,9 @@ pub struct Session {
     /// Profile settings: File › Options and the option dialogs (see `settings.rs`). Saved with the view state
     /// to `settings.json` in the profile folder after every command that changes them.
     pub settings: Settings,
+    /// S/MIME: digital IDs, other people's certificates, trusted certificates and opened messages (see
+    /// `smime.rs`).
+    pub smime: crate::smime::SmimeSlot,
     /// Profile folder holding `settings.json` (`None` = in-memory session: nothing is saved).
     settings_dir: Option<std::path::PathBuf>,
     /// Bytes last read from or written to `settings.json` (identical states are not rewritten).
@@ -231,6 +234,7 @@ impl Session {
             secrets: Box::new(crate::accounts::MemorySecretStore::default()),
             sync: crate::sync::SyncState::default(),
             search: crate::search_index::SearchState::default(),
+            smime: crate::smime::SmimeSlot::default(),
             settings: Settings::default(),
             settings_dir: None,
             settings_saved: None,
@@ -271,6 +275,7 @@ impl Session {
             }
         }
         s.load_settings(dir);
+        crate::smime::load(&mut s);
         // A named calendar time zone (Calendar › Time Zones) sets the display offset for today's DST rules.
         crate::cmd::calendar::views::refresh_time_zone(&mut s);
         Ok(s)
@@ -490,6 +495,8 @@ impl Session {
         }
         c.request_delivery_receipt |= st.bool("mail.tracking.requestDelivery");
         c.request_read_receipt |= st.bool("mail.tracking.requestRead");
+        // Trust Center › Email Security: Sign / Encrypt by default; replies to encrypted mail stay encrypted.
+        crate::smime::compose_defaults(self, c);
         if c.save_sent == SaveSentTo::Default && !st.bool("mail.save.sentCopies") {
             c.save_sent = SaveSentTo::DoNotSave;
         }

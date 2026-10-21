@@ -24,6 +24,7 @@ pub mod sample;
 pub mod search_index;
 mod session;
 pub mod settings;
+pub mod smime;
 pub mod sync;
 pub mod troubleshoot;
 pub mod undo;

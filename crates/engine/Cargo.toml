@@ -18,6 +18,7 @@ mailcraft-proof.workspace = true
 mailcraft-formats.workspace = true
 mailcraft-search.workspace = true
 mailcraft-render.workspace = true
+mailcraft-smime.workspace = true
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -32,6 +33,7 @@ mailcraft-net.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 mailcraft-testmail.workspace = true
+mailcraft-smime = { workspace = true, features = ["testkit"] }
 
 [lints]
 workspace = true

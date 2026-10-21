@@ -632,6 +632,9 @@ fn empty_state(ui: &mut Ui, app: &mut App) {
 
 /// Header + body of one message (reading pane or read window).
 fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: bool) {
+    // S/MIME: a signed or encrypted message is shown opened (verified, decrypted); a valid signer's
+    // certificate is remembered for encrypted replies.
+    mailcraft_engine::smime::on_view(&mut app.s, ItemId(id));
     let Some(h) = queries::reading_header(&app.s, ItemId(id)) else {
         empty_state(ui, app);
         return;
@@ -644,7 +647,7 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     let links_off = mailcraft_engine::junk::links_disabled(&app.s, ItemId(id));
     let plain = app.s.settings.bool("trust.plainText") || links_off;
     let unwrap = app.s.settings.bool("mail.format.removeExtraLineBreaks");
-    if let Some(m) = app.s.mailbox.mail.get(&ItemId(id)) {
+    if let Some(m) = mailcraft_engine::smime::display_item(&app.s, ItemId(id)) {
         let sk = source_key(id, &m.body) ^ u64::from(plain) ^ (u64::from(unwrap) << 1);
         if cache.item != id || cache.source_key != sk {
             // Inline attachments, so `cid:` pictures draw instead of the placeholder.
@@ -894,8 +897,9 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
             }
         });
     }
-    // 5. Info bars.
+    // 5. Info bars. S/MIME first: encryption and the digital signature, with Details.
     let info_top = ui.cursor().top();
+    security_bars(ui, app, id);
     for line in &h.info {
         ui.add_space(6.0);
         info_bar(ui, app, "info", line, None);
@@ -1121,6 +1125,27 @@ fn info_bar(ui: &mut Ui, app: &mut App, icon: &str, text: &str, link: Option<&st
             });
         });
     clicked
+}
+
+/// The S/MIME info bars of message `id`: "Encrypted…" or why it cannot be opened, and who signed it with the
+/// signature's status; Details opens the signature details (`mail.signatureDetails`).
+fn security_bars(ui: &mut Ui, app: &mut App, id: u64) {
+    let Some(sec) = mailcraft_engine::smime::security(&app.s, ItemId(id)) else { return };
+    let lines = mailcraft_engine::smime::info_lines(&sec);
+    let last = lines.len().saturating_sub(1);
+    for (i, (kind, text)) in lines.iter().enumerate() {
+        let icon = match *kind {
+            "ok" => "certificate",
+            "info" => "private",
+            "warning" => "warning",
+            _ => "error",
+        };
+        ui.add_space(6.0);
+        let link = (i == last).then_some("Details...");
+        if info_bar(ui, app, icon, text, link) {
+            app.run("mail.signatureDetails", json!({"id": id}));
+        }
+    }
 }
 
 fn pictures_bar(ui: &mut Ui, app: &mut App, id: u64) {
@@ -1439,6 +1464,54 @@ mod tests {
         h.state_mut().run("options.set", json!({"key": "mail.format.removeExtraLineBreaks", "value": false}));
         h.run();
         assert!(h.query_by_label_contains("wrapped at a fixed width").is_none());
+    }
+
+    #[test]
+    fn smime_info_bars_and_details() {
+        use mailcraft_smime::testkit;
+        let mut s = sample_session();
+        let me = s.mailbox.default_account().unwrap().address.clone();
+        let my_id = testkit::identity("Sample Me", &me);
+        let pfx = mailcraft_smime::pkcs12::build(&my_id, "pw", "").unwrap();
+        let data = mailcraft_mime::transfer::encode_base64_flat(&pfx);
+        s.run("options.importDigitalId", &json!({"data": data, "password": "pw", "trustIssuer": true}))
+            .unwrap();
+        // Ann signs and encrypts a message to me.
+        let ann = testkit::identity("Ann Lee", "ann@example.org");
+        let msg = format!(
+            "From: Ann Lee <ann@example.org>\r\nTo: {me}\r\nSubject: Sealed\r\nMIME-Version: 1.0\r\n\
+             Content-Type: text/plain\r\n\r\nThe code is 4711.\r\n"
+        );
+        let to = [my_id.cert.clone()];
+        let p = mailcraft_smime::mime::Protect {
+            sign: Some(&ann),
+            encrypt_to: &to,
+            clear_signed: true,
+            now: testkit::NOW,
+        };
+        let raw = mailcraft_smime::mime::protect(msg.as_bytes(), &p).unwrap();
+        let parsed = mailcraft_mime::parse(&raw).unwrap();
+        let mut item = mailcraft_model::MailItem::from_message(&parsed, &raw, s.now());
+        item.folder = s.selection.folder;
+        let id = s.mailbox.add_mail(item);
+        s.selection.items = vec![id];
+        s.selection.focus = Some(id);
+        let mut h = harness(App::new(s));
+        h.run_steps(2);
+        assert!(h.query_by_label("Encrypted: only the recipients of this message can read it.").is_some());
+        let signed = "Signed by Ann Lee <ann@example.org>. The digital signature is valid.";
+        assert!(h.query_by_label(signed).is_some());
+        assert!(
+            h.query_by_label("smime.p7m").is_none(),
+            "the encrypted part is not offered as an attachment"
+        );
+        h.get_by_label("Details...").click();
+        h.run_steps(2);
+        let app = h.into_state();
+        assert!(app.s.notices.iter().any(|n| matches!(n,
+            mailcraft_engine::Notice::OpenDialog(d, p) if d == "messageSecurity" && p["status"] == "valid")));
+        // Ann's certificate was remembered from the valid signature.
+        assert!(mailcraft_engine::smime::cert_for(&app.s, "ann@example.org").is_some());
     }
 
     #[test]

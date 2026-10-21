@@ -318,7 +318,9 @@ fn original_attachment(m: &MailItem) -> ComposeAttachment {
 /// prefaced comments, proofing of the original, where the sent copy of a forward or of a reply to a message
 /// outside the Inbox is saved.
 pub fn build_response(s: &Session, id: ItemId, kind: ComposeKind, inline: bool) -> Option<ComposeState> {
-    let m = s.mailbox.mail.get(&id)?;
+    // An S/MIME original is answered from its opened form (decrypted text, its own attachments).
+    let shown = crate::smime::display_item(s, id)?;
+    let m = shown.as_ref();
     let forward = kind == ComposeKind::Forward;
     let st = &s.settings;
     let mode = st.original_text(forward);

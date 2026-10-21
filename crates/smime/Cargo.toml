@@ -1,0 +1,44 @@
+[package]
+name = "mailcraft-smime"
+description = "S/MIME for MailCraft: sign, verify, encrypt and decrypt mail (RFC 8551, CMS RFC 5652, X.509 RFC 5280, PKCS #12)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Synthetic certificate authorities and digital IDs for tests of other crates (dev-dependencies only).
+testkit = []
+
+[dependencies]
+mailcraft-mime.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+der.workspace = true
+spki.workspace = true
+const-oid.workspace = true
+x509-cert.workspace = true
+cms.workspace = true
+pkcs8.workspace = true
+pkcs5.workspace = true
+pkcs12.workspace = true
+rsa.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+aes.workspace = true
+cbc.workspace = true
+des.workspace = true
+rc2.workspace = true
+rand_core.workspace = true
+zeroize.workspace = true
+
+# The browser has no OS random source: getrandom reaches the Web Crypto API through its `js` feature.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -92,6 +92,8 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
     }
     scheduling(s, &ids, &mut report);
     tracking(s, &ids, &mut report);
+    // S/MIME: valid signers' certificates are remembered for encrypted replies.
+    crate::smime::on_new_mail(s, &ids);
     // What is left (unread, outside Deleted Items and Junk Email) lights the new-mail envelope.
     crate::new_mail::note_arrivals(s, &ids);
     report

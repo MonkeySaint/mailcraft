@@ -1295,11 +1295,12 @@ const MAX_INLINE_PICTURES: usize = 32;
 /// HTML body shows with `<img src="cid:…">`. Empty when the message has none or its source is unavailable;
 /// the parse only runs for messages whose attachment list names a Content-ID.
 pub fn inline_pictures(s: &Session, id: ItemId) -> Vec<(String, Vec<u8>)> {
-    let Some(m) = s.mailbox.mail.get(&id) else { return Vec::new() };
+    // S/MIME messages show the pictures of the opened message.
+    let Some(m) = crate::smime::display_item(s, id) else { return Vec::new() };
     if !m.attachments.iter().any(|a| a.content_id.is_some()) {
         return Vec::new();
     }
-    let raw = crate::cmd::file::raw_source(s, m);
+    let raw = crate::smime::open_source(s, &m);
     let Ok(msg) = mailcraft_mime::parse(&raw) else { return Vec::new() };
     msg.attachments()
         .into_iter()
@@ -1310,7 +1311,9 @@ pub fn inline_pictures(s: &Session, id: ItemId) -> Vec<(String, Vec<u8>)> {
 }
 
 pub fn reading_header(s: &Session, id: ItemId) -> Option<ReadingHeader> {
-    let m = s.mailbox.mail.get(&id)?;
+    // S/MIME messages list the attachments of the opened message (not the signature or the encrypted part).
+    let shown = crate::smime::display_item(s, id)?;
+    let m = shown.as_ref();
     let from_box = m.from.as_ref().or(m.sender.as_ref());
     let (from, from_initials, persona) = match from_box {
         Some(f) => (f.to_display_string(), initials(f.name.as_deref(), &f.addr), persona_color(&f.addr)),

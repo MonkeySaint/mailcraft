@@ -39,6 +39,7 @@ icon_table![
     "calendar-reminder",
     "categorize",
     "category-tag",
+    "certificate",
     "check",
     "check-names",
     "chevron-down",
@@ -311,7 +312,7 @@ mod tests {
         align-left align-center align-right justify paste cut format-painter spelling reading-pane \
         folder-pane view conversation quick-steps person contact-group appointment task note today day \
         work-week week month schedule info warning error pin overflow collapse-ribbon ribbon-display \
-        envelope-open bell calendar-reminder location private recurrence category-tag phone email \
+        envelope-open bell calendar-reminder location private recurrence category-tag phone email certificate \
         ellipsis";
 
     #[test]
@@ -327,7 +328,7 @@ mod tests {
         let shared: Vec<_> = SHARED.split_whitespace().collect();
         let set: BTreeSet<_> = shared.iter().collect();
         assert_eq!(set.len(), shared.len(), "duplicate in shared list");
-        assert_eq!(shared.len(), 133);
+        assert_eq!(shared.len(), 134);
     }
 
     #[test]

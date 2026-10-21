@@ -59,6 +59,7 @@ pub fn all_specs() -> Vec<crate::CommandSpec> {
     v.extend(options::specs());
     v.extend(help::specs());
     v.extend(crate::archive::specs());
+    v.extend(crate::smime::specs());
     v
 }
 

@@ -26,6 +26,7 @@ mailcraft-proof = { path = "crates/proof" }
 mailcraft-net = { path = "crates/net" }
 mailcraft-formats = { path = "crates/formats" }
 mailcraft-search = { path = "crates/search" }
+mailcraft-smime = { path = "crates/smime" }
 mailcraft-testmail = { path = "crates/testmail" }
 mailcraft-web = { path = "apps/mailcraft-web" }
 
@@ -75,6 +76,28 @@ ring = "0.17.14"
 keyring = "4.2.0"
 # test servers: self-signed certificates (ring backend)
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
+# S/MIME (RFC 8551) over CMS (RFC 5652) and X.509 (RFC 5280): pure-Rust RustCrypto crates, all
+# MIT OR Apache-2.0. No OpenSSL and no C code, so the browser build keeps them.
+der = { version = "0.7.10", features = ["alloc", "derive", "oid", "pem", "zeroize"] }
+spki = { version = "0.7.3", features = ["alloc"] }
+const-oid = { version = "0.9.6", features = ["db"] }
+x509-cert = { version = "0.2.5", default-features = false, features = ["std", "pem"] }
+cms = { version = "0.2.3", features = ["std"] }
+pkcs8 = { version = "0.10.2", features = ["std", "encryption", "pem", "3des", "sha1-insecure"] }
+pkcs5 = { version = "0.7.1", features = ["alloc", "pbes2", "3des", "sha1-insecure"] }
+pkcs12 = { version = "0.1.0", features = ["kdf"] }
+rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", "u64_digit", "sha1", "sha2"] }
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+hmac = "0.12.1"
+aes = "0.8.4"
+cbc = { version = "0.1.2", features = ["alloc", "block-padding"] }
+des = "0.8.1"
+rc2 = "0.8.1"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+getrandom = "0.2.17"
+zeroize = "1.8"
 
 # file formats: Compound File Binary container ([MS-CFB]) for .msg (MIT)
 cfb = "0.14"

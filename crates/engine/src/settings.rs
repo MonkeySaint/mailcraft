@@ -1780,6 +1780,24 @@ pub const DEFS: &[Def] = &[
         Bool(false),
         A,
     ),
+    // Email Security: S/MIME defaults for new messages (smime.rs). Labels are MailCraft's own.
+    d(
+        "trustCenter",
+        "Email Security",
+        "trust.smime.encrypt",
+        "Encrypt the contents and attachments of messages I send",
+        Bool(false),
+        A,
+    ),
+    d("trustCenter", "Email Security", "trust.smime.sign", "Sign messages I send digitally", Bool(false), A),
+    d(
+        "trustCenter",
+        "Email Security",
+        "trust.smime.clearSigned",
+        "Send signed messages as clear text, readable without S/MIME",
+        Bool(true),
+        A,
+    ),
     // ---------------------------------------------------------------- UI state (not in Options)
     d("state", "Panes", "state.folderPaneWidth", "Folder pane width (0 = default)", Int(0, 0, 4000), A),
     d("state", "Panes", "state.listWidth", "Message list width (0 = default)", Int(0, 0, 8000), A),

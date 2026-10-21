@@ -109,6 +109,11 @@ fn system_roots() -> &'static [CertificateDer<'static>] {
     })
 }
 
+/// The operating system's trusted root certificates (DER), loaded once; S/MIME grades signatures against them.
+pub fn system_root_ders() -> Vec<Vec<u8>> {
+    system_roots().iter().map(|c| c.as_ref().to_vec()).collect()
+}
+
 fn client_config(opts: &TlsOptions) -> Result<Arc<ClientConfig>> {
     let provider = provider();
     let builder = ClientConfig::builder_with_provider(provider.clone())

@@ -22,6 +22,7 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("mailcraft-formats", 3),
     ("mailcraft-search", 3),
     ("mailcraft-proof", 3),
+    ("mailcraft-smime", 3),
     ("mailcraft-engine", 4),
     ("mailcraft-mcp", 5),
     ("mailcraft-ui-egui", 6),

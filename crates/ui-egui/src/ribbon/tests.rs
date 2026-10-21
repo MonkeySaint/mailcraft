@@ -8,6 +8,7 @@ use crate::App;
 
 /// Shared icon names (assets/icons, drawn by the icons area).
 const ICONS: &[&str] = &[
+    "certificate",
     "mail",
     "calendar",
     "people",
@@ -203,7 +204,9 @@ fn every_command_has_a_mapped_catalog_counterpart_or_is_known() {
     let catalog: BTreeSet<&str> =
         mailcraft_engine::catalog::catalog_rows().iter().filter_map(|r| r.id).collect();
     // Module commands act on the selected module item (the catalog maps some of these to mail.* ids).
-    let ours = ["help.about", "app.toggleRibbonMode", "rules.alwaysMoveFrom", "mail.addReminder"];
+    // Sign sits next to Encrypt once S/MIME is set up; the observed window had no digital ID to show it.
+    let ours =
+        ["help.about", "app.toggleRibbonMode", "rules.alwaysMoveFrom", "mail.addReminder", "compose.sign"];
     let module = |id: &str| ["people.", "tasks.", "notes.", "calendar."].iter().any(|p| id.starts_with(p));
     let mut odd = Vec::new();
     for (at, c) in all_cmds() {

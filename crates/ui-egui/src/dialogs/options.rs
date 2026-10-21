@@ -72,6 +72,7 @@ const BUTTONS: &[(&str, &str, &str, Act)] = &[
     ("advanced", "Send and receive", "Send/Receive...", Cmd("sendReceive.showProgress")),
     ("advanced", "Other", "Quick Click...", Cmd("categories.setQuickClick")),
     ("customizeRibbon", "Ribbon", "Ribbon Display Options...", Cmd("app.toggleRibbonMode")),
+    ("trustCenter", "Email Security", "Digital IDs...", Cmd("options.digitalIds")),
     (
         "quickAccessToolbar",
         "Quick Access Toolbar",
@@ -98,6 +99,11 @@ const NOTES: &[(&str, &str, &str)] = &[
         "trustCenter",
         "Security & more",
         "MailCraft never loads remote content in messages unless you allow it.",
+    ),
+    (
+        "trustCenter",
+        "Email Security",
+        "Signing and encryption use S/MIME digital IDs (certificates with their private keys).",
     ),
 ];
 

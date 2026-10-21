@@ -4,11 +4,9 @@
 use serde_json::{Value, json};
 
 use crate::cmd::util::{dialog, mail_targets, opt_folder};
-use crate::compose::ComposeKind;
 use crate::queries;
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
-use mailcraft_mime::{Address, AttachmentSpec, MessageBuilder};
-use mailcraft_model::{BodyFormat, FolderKind, FolderRole, Importance, ItemId, MailItem};
+use mailcraft_model::{FolderKind, ItemId, MailItem};
 
 /// Longest text accepted by Copy (characters); longer text is truncated.
 const MAX_CLIPBOARD_CHARS: usize = 1_000_000;
@@ -266,79 +264,6 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"pasted": new_ids.len(), "ids": new_ids, "folder": folder.0}))
 }
 
-/// Saves a compose window as a draft in the account's Drafts folder (updating its existing draft).
-fn save_compose(s: &mut Session, cid: u64) -> Option<ItemId> {
-    let c = s.composes.get(&cid)?.clone();
-    let account = s.current_account()?;
-    let drafts = s.mailbox.role_folder(account, FolderRole::Drafts)?;
-    let me =
-        s.mailbox.account(account).map(|a| mailcraft_mime::Mailbox::new(Some(&a.sender_name), &a.address));
-    // One recipient per `;` entry (`cmd::compose` › Recipient fields), so "Last, First <address>" stays whole.
-    let parse = |t: &str| -> Vec<Address> { crate::cmd::compose::parse_recipients_lenient(t) };
-    let now = s.now();
-    let mut b = MessageBuilder::new();
-    b.from = me.filter(|m| !m.addr.is_empty());
-    b.to = parse(&c.to);
-    b.cc = parse(&c.cc);
-    b.bcc = parse(&c.bcc);
-    b.keep_bcc = true;
-    b.subject = c.subject.clone();
-    b.date = Some(now);
-    b.text = Some(c.body.to_plain_text());
-    if c.format != BodyFormat::PlainText {
-        b.html = Some(mailcraft_html::doc_to_html(&c.body));
-    }
-    b.importance = match c.importance {
-        Importance::High => Some("high".into()),
-        Importance::Low => Some("low".into()),
-        Importance::Normal => None,
-    };
-    if let Some(src) = c.source.and_then(|id| s.mailbox.mail.get(&id))
-        && matches!(c.kind, ComposeKind::Reply | ComposeKind::ReplyAll | ComposeKind::Forward)
-        && let Some(mid) = &src.message_id
-    {
-        b.in_reply_to = vec![mid.clone()];
-        let mut refs = src.references.clone();
-        refs.push(mid.clone());
-        b.references = refs;
-    }
-    b.attachments = c
-        .attachments
-        .iter()
-        .map(|a| AttachmentSpec {
-            filename: a.filename.clone(),
-            mime_type: a.mime_type.clone(),
-            data: a.data.clone(),
-            content_id: None,
-        })
-        .collect();
-    b.extra_headers.push(("X-Unsent".into(), "1".into()));
-    let raw = b.build();
-    let mut item = match mailcraft_mime::parse(&raw) {
-        Ok(msg) => MailItem::from_message(&msg, &raw, now),
-        Err(_) => MailItem { subject: c.subject.clone(), ..Default::default() },
-    };
-    item.folder = drafts;
-    item.received = now;
-    item.read = true;
-    item.is_draft = true;
-    item.sent = None;
-    item.body.format = c.format;
-    let id = match c.draft.filter(|d| s.mailbox.mail.contains_key(d)) {
-        Some(existing) => {
-            item.id = existing;
-            s.mailbox.mail.insert(existing, item);
-            existing
-        }
-        None => s.mailbox.add_mail(item),
-    };
-    if let Some(c) = s.composes.get_mut(&cid) {
-        c.draft = Some(id);
-        c.dirty = false;
-    }
-    Some(id)
-}
-
 /// Dialog request that asks the UI to close its read windows and item windows (Close All Items); compose
 /// windows are closed here.
 pub const CLOSE_ITEM_WINDOWS: &str = "closeAllItems";
@@ -365,14 +290,8 @@ fn close_all_items(s: &mut Session, p: &Value) -> CmdResult {
         }
         Some(true) => {
             for cid in &dirty {
-                match save_compose(s, *cid) {
-                    Some(id) => saved.push(id.0),
-                    None => {
-                        return Err(CmdError::Failed(
-                            "the draft could not be saved: there is no Drafts folder".into(),
-                        ));
-                    }
-                }
+                // Saved like any draft (the draft of an encrypted message stays encrypted).
+                saved.push(crate::cmd::compose::save_draft(s, *cid)?.0);
             }
         }
         _ => {}

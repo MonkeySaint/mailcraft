@@ -8,8 +8,8 @@
 //! (`mailcraft_net::smtp`), and that [`file_sent_copy`] reads when the send completes; voting buttons are
 //! MailCraft's own `X-MailCraft-Voting` field, answered with `X-MailCraft-Vote` replies (`compose.vote`) and
 //! tallied on the sent item ([`tracking`], `compose.tracking`). `compose.sendReadReceipt` answers a received
-//! read-receipt request with an RFC 8098 disposition notification. S/MIME encryption is not implemented:
-//! `compose.encrypt` explains that and stays off.
+//! read-receipt request with an RFC 8098 disposition notification. Sign and Encrypt (`compose.sign`,
+//! `compose.encrypt`) protect the message with S/MIME when it is sent ([`crate::smime::protect_for_send`]).
 //!
 //! Body-edit commands here (`compose.select`, `compose.insertText`, `compose.deleteText`, `compose.editUndo`,
 //! `compose.editRedo`) drive the editor model in [`crate::compose`] for agents and tests; they change only the
@@ -910,7 +910,11 @@ pub(crate) fn uuencode(name: &str, data: &[u8]) -> String {
 
 /// A stored item for a built message.
 fn item_from(b: &MessageBuilder, now: DateTime) -> (MailItem, Vec<u8>) {
-    let raw = b.build();
+    item_from_raw(b, b.build(), now)
+}
+
+/// A stored item for the finished message `raw` built from `b`.
+fn item_from_raw(b: &MessageBuilder, raw: Vec<u8>, now: DateTime) -> (MailItem, Vec<u8>) {
     let item = match mailcraft_mime::parse(&raw) {
         Ok(msg) => MailItem::from_message(&msg, &raw, now),
         Err(_) => MailItem {
@@ -948,7 +952,15 @@ pub fn save_draft(s: &mut Session, cid: u64) -> Result<ItemId, CmdError> {
     };
     let now = s.now();
     let b = build_message(s, &c, account.as_ref(), true);
-    let (mut item, _) = item_from(&b, now);
+    let (mut item, _) = if crate::smime::draft_must_be_encrypted(s, &c) {
+        // To be encrypted, or answering an encrypted message: the draft is kept encrypted to the user's own
+        // digital ID, so its text never reaches the mailbox, the journal or the server in the clear.
+        let from = account.as_ref().map(|a| a.address.clone()).unwrap_or_default();
+        let raw = crate::smime::protect_draft(s, &from, b.build()).map_err(CmdError::Failed)?;
+        item_from_raw(&b, raw, now)
+    } else {
+        item_from(&b, now)
+    };
     item.folder = drafts;
     item.is_draft = true;
     item.read = true;
@@ -1058,12 +1070,6 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     let Some(account) = sending_account(s, &c, true) else {
         return fail(s, NO_ACCOUNT.into());
     };
-    if c.encrypt {
-        return fail(
-            s,
-            "This message cannot be encrypted: no certificate is configured for the sending account.".into(),
-        );
-    }
     let Some(outbox) = s.mailbox.role_folder(account.id, FolderRole::Outbox) else {
         return fail(s, format!("The account {} has no Outbox folder.", account.address));
     };
@@ -1072,7 +1078,22 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     }
     let now = s.now();
     let b = build_message(s, &c, Some(&account), false);
-    let (mut item, _) = item_from(&b, now);
+    let (mut item, _) = if c.sign || c.encrypt {
+        // S/MIME: Sign / Encrypt the finished message (may stop the send: no digital ID, or recipients
+        // without certificates, which the user is asked about).
+        let recipients: Vec<String> = [&b.to, &b.cc, &b.bcc]
+            .into_iter()
+            .flatten()
+            .flat_map(Address::mailboxes)
+            .map(|m| m.addr.trim().to_ascii_lowercase())
+            .collect();
+        match crate::smime::protect_for_send(s, cid, &c, &account.address, &recipients, b.build(), p) {
+            Ok(raw) => item_from_raw(&b, raw, now),
+            Err(stop) => return Ok(stop),
+        }
+    } else {
+        item_from(&b, now)
+    };
     item.folder = outbox;
     item.is_draft = false;
     item.read = true;
@@ -1769,12 +1790,9 @@ fn save_sent_item_to(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"mode": mode, "folder": folder}))
 }
 
-/// Why Encrypt is unavailable (S/MIME needs certificates, which MailCraft cannot manage yet).
-pub const ENCRYPT_UNAVAILABLE: &str = "Encryption is not available yet: MailCraft cannot use S/MIME certificates. \
-This message will be sent without encryption; don't include anything that must stay confidential.";
-
-/// Encrypt: S/MIME is not implemented, so the option explains that and stays off (Send keeps working).
-/// Turning it off (for a draft saved with it on) works.
+/// Encrypt (Options › Encrypt): toggles S/MIME encryption of this message (`on` sets it). Send then needs a
+/// certificate for every recipient and a digital ID for the sending address; `missing` lists the recipients
+/// no certificate is known for yet.
 fn encrypt(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(m) = opt_str(p, "mode")
         && m != "smime"
@@ -1782,15 +1800,39 @@ fn encrypt(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params(format!("unknown encryption mode `{m}`")));
     }
     let c = compose_mut(s, p)?;
-    let want = opt_bool(p, "on").unwrap_or(!c.encrypt);
-    if c.encrypt && !want {
-        c.encrypt = false;
+    let on = opt_bool(p, "on").unwrap_or(!c.encrypt);
+    if c.encrypt != on {
+        c.encrypt = on;
         c.dirty = true;
     }
-    if want {
-        s.notify(Notice::Info(ENCRYPT_UNAVAILABLE.into()));
+    let c = c.clone();
+    let missing = if on { missing_certificates(s, &c) } else { Vec::new() };
+    Ok(json!({"encrypt": on, "available": true, "missing": missing}))
+}
+
+/// Sign (Options › Sign): toggles the S/MIME digital signature of this message (`on` sets it).
+fn sign(s: &mut Session, p: &Value) -> CmdResult {
+    let c = compose_mut(s, p)?;
+    let on = opt_bool(p, "on").unwrap_or(!c.sign);
+    if c.sign != on {
+        c.sign = on;
+        c.dirty = true;
     }
-    Ok(json!({"encrypt": false, "available": false, "message": if want { ENCRYPT_UNAVAILABLE } else { "" }}))
+    Ok(json!({"sign": on}))
+}
+
+/// Recipients of `c` (valid addresses only) that no certificate is known for.
+fn missing_certificates(s: &Session, c: &ComposeState) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for field in [&c.to, &c.cc, &c.bcc] {
+        for a in parse_recipients(field).unwrap_or_default().iter().flat_map(Address::mailboxes) {
+            let addr = a.addr.trim().to_ascii_lowercase();
+            if crate::smime::cert_for(s, &addr).is_none() && !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    out
 }
 
 fn message_options(s: &mut Session, p: &Value) -> CmdResult {
@@ -1808,6 +1850,7 @@ fn message_options(s: &mut Session, p: &Value) -> CmdResult {
         "replyTo": c.reply_to,
         "delayUntil": c.delay_until.map(|d| d.to_rfc3339()),
         "encrypt": c.encrypt,
+        "sign": c.sign,
     });
     dialog(s, "messageOptions", state)
 }
@@ -3226,6 +3269,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_compose,
             encrypt,
         ),
+        spec("compose.sign", "Sign", "Options › Encrypt", "", r#"{"on"?:bool}"#, false, has_compose, sign),
         spec(
             "compose.followUp",
             "Follow Up",
@@ -3773,8 +3817,10 @@ pub(crate) mod tests {
         assert_eq!(s.composes[&id].importance, Importance::Normal);
         s.run("compose.deliveryReceipt", &json!({})).unwrap();
         let r = s.run("compose.encrypt", &json!({})).unwrap();
-        assert_eq!(r["encrypt"], false);
-        assert!(s.notices.contains(&Notice::Info(ENCRYPT_UNAVAILABLE.into())));
+        assert_eq!(r["encrypt"], true);
+        assert_eq!(s.run("compose.encrypt", &json!({})).unwrap()["encrypt"], false);
+        assert_eq!(s.run("compose.sign", &json!({"on": true})).unwrap()["sign"], true);
+        assert_eq!(s.run("compose.sign", &json!({})).unwrap()["sign"], false);
         s.run("compose.votingButtons", &json!({"choices": "Yes;No"})).unwrap();
         s.run("compose.directRepliesTo", &json!({"addresses": "r@example.com"})).unwrap();
         assert!(s.run("compose.directRepliesTo", &json!({"addresses": "nope"})).is_err());
@@ -3794,10 +3840,12 @@ pub(crate) mod tests {
         }
         s.run("compose.followUp", &json!({"kind": "clear"})).unwrap();
         assert_eq!(s.composes[&id].flag, FlagState::None);
-        // Encrypt stays off, so Send works; a draft saved with Encrypt on is refused until it is turned off.
+        // Encrypt without a digital ID: Send stops and says why; turned off, the message can go.
         s.run("compose.setTo", &json!({"value": "x@example.com"})).unwrap();
-        s.composes.get_mut(&id).unwrap().encrypt = true;
-        assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], false);
+        s.run("compose.encrypt", &json!({"on": true})).unwrap();
+        let r = s.run("compose.send", &json!({})).unwrap();
+        assert_eq!(r["sent"], false);
+        assert_eq!(r["reason"], "noDigitalId", "{r}");
         s.run("compose.encrypt", &json!({"on": false})).unwrap();
         assert!(!s.composes[&id].encrypt);
         assert_eq!(s.run("compose.messageOptions", &json!({})).unwrap()["dialog"], "messageOptions");

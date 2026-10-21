@@ -29,6 +29,7 @@ mod options;
 mod print;
 mod quicksteps;
 mod rules;
+mod security;
 mod views;
 
 #[cfg(test)]
@@ -237,6 +238,10 @@ pub const KNOWN: &[&str] = &[
     "signatures",
     "notAvailable",
     "message",
+    // S/MIME
+    "digitalIds",
+    "messageSecurity",
+    "encryptionProblem",
     // views
     "advancedViewSettings",
     "conversationSettings",
@@ -374,6 +379,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return out;
     }
     if let Some(out) = compose_dlg::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = security::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = items::show(ctx, app, d) {

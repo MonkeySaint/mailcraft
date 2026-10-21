@@ -31,6 +31,7 @@ mailcraft-net.workspace = true
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
 mailcraft-testmail.workspace = true
+mailcraft-smime = { workspace = true, features = ["testkit"] }
 
 [lints]
 workspace = true

@@ -536,14 +536,16 @@ fn save_attachments(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Disabled("no attachments in the selection".into()));
     }
     let Some(dir) = opt_str(p, "dir") else {
+        // S/MIME messages offer the attachments of the opened message.
         let files: Vec<Value> = ids
             .iter()
-            .filter_map(|id| s.mailbox.mail.get(id))
+            .filter_map(|id| crate::smime::display_item(s, *id))
             .flat_map(|m| {
                 m.attachments
                     .iter()
                     .filter(|a| !a.inline)
                     .map(|a| json!({"item": m.id.0, "filename": a.filename, "size": a.size}))
+                    .collect::<Vec<_>>()
             })
             .collect();
         return dialog(s, "saveAttachments", json!({"files": files}));
@@ -560,7 +562,7 @@ fn save_attachments(s: &mut Session, p: &Value) -> CmdResult {
             missing = missing.saturating_add(1);
             continue;
         }
-        let raw = raw_source(s, m);
+        let raw = crate::smime::open_source(s, m);
         let Ok(msg) = mailcraft_mime::parse(&raw) else {
             missing = missing.saturating_add(1);
             continue;

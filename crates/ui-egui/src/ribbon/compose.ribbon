@@ -90,6 +90,7 @@ toggle L | Bcc | person | compose.showBcc | {"on":"$!on"} | B | on=bcc
 toggle L | From | account | compose.showFrom | {"on":"$!on"} | F | on=from
 group Encrypt | ZP1
 toggle L | Encrypt | private | compose.encrypt | {"on":"$!on"} | PM | on=encrypt
+toggle L | Sign | certificate | compose.sign | {"on":"$!on"} | PG | on=sign
 group Tracking | ZK | launch=compose.messageOptions
 drop L | Use Voting Buttons | check | | | V | menu=voting
 check S | Request a Delivery Receipt | check | compose.deliveryReceipt | {"on":"$!on"} | U | on=dr

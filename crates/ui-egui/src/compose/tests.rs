@@ -244,7 +244,10 @@ fn file_opens_the_backstage_inside_the_compose_window() {
     // The page is drawn in the window (it used to stay blank when the window was embedded).
     h.get_by_role_and_label(Role::Button, "Encrypt").click();
     h.run();
-    // S/MIME is not available: Encrypt explains that and stays off, so Send keeps working.
+    // The Encrypt tile toggles S/MIME encryption of the message.
+    assert!(compose(&h, cid).encrypt);
+    h.get_by_role_and_label(Role::Button, "Encrypt").click();
+    h.run();
     assert!(!compose(&h, cid).encrypt);
     // Escape goes back to the message.
     h.key_press(egui::Key::Escape);

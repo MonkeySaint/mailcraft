@@ -186,6 +186,39 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nFN:F\r\nPHOTO:data:text/plain;base64,{b64}\r\nEND:
 }
 
 #[test]
+fn certificates_in_key_round_trip() {
+    // A stand-in certificate: any DER SEQUENCE longer than 64 bytes is kept (the engine checks it).
+    let mut der = vec![0x30, 0x81, 100];
+    der.extend((0..100u8).map(|i| i.wrapping_mul(7)));
+    let b64 = mailcraft_mime::transfer::encode_base64_flat(&der);
+    for (version, key) in [
+        ("4.0", format!("KEY:data:application/pkix-cert;base64,{b64}")),
+        ("3.0", format!("KEY;ENCODING=b;TYPE=X509:{b64}")),
+        ("2.1", format!("KEY;X509;ENCODING=BASE64:{b64}")),
+    ] {
+        let text = format!(
+            "BEGIN:VCARD\r\nVERSION:{version}\r\nFN:Ann Lee\r\nEMAIL:ann@example.com\r\n{key}\r\nEND:VCARD\r\n"
+        );
+        let cs = vcf::read(text.as_bytes()).unwrap();
+        assert_eq!(cs[0].certificates, vec![b64.clone()], "{version}");
+        for v in [Version::V3, Version::V4] {
+            let back = vcf::read(vcf::write(&cs, v).as_bytes()).unwrap();
+            assert_eq!(back[0].certificates, vec![b64.clone()], "{version} written as {v:?}");
+        }
+    }
+    // PGP keys, key URLs and junk are not certificates.
+    for key in [
+        "KEY;TYPE=PGP;ENCODING=b:AAAA",
+        "KEY:https://example.com/key.asc",
+        "KEY:data:application/pgp-keys;base64,AAAA",
+        "KEY;ENCODING=b:!!!!",
+    ] {
+        let text = format!("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:X\r\n{key}\r\nEND:VCARD\r\n");
+        assert!(vcf::read(text.as_bytes()).unwrap()[0].certificates.is_empty(), "{key}");
+    }
+}
+
+#[test]
 fn reads_details_from_other_address_books() {
     let text = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ann Lee\r\nNICKNAME:Annie\r\nROLE:Surveyor\r\n\
 X-MS-MANAGER:Max Power\r\nX-EVOLUTION-ASSISTANT:Ada\r\nX-KADDRESSBOOK-X-OFFICE:B4\r\n\

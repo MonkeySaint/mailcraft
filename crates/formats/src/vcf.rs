@@ -19,6 +19,10 @@
 //! - Read also: the `X-` names other address books use for these fields (`X-MS-…`, `X-EVOLUTION-…`,
 //!   `X-KADDRESSBOOK-X-…`, plain `X-MANAGER` and similar), and grouped `X-ABRELATEDNAMES` / `X-ABDATE` values
 //!   with an `X-ABLABEL` naming the relation or date.
+//! - KEY with an X.509 certificate → certificates (S/MIME, at most [`MAX_KEYS`] of [`MAX_KEY_BYTES`] each):
+//!   an RFC 6350 `data:application/pkix-cert;base64,` URI, or an RFC 2426 / 2.1 `ENCODING=b|BASE64` value with
+//!   `TYPE=X509` (or no type). Written as a `data:` URI (4.0) or `ENCODING=b;TYPE=X509` (3.0). PGP keys and
+//!   key URLs are not read.
 
 use mailcraft_model::Contact;
 use mailcraft_model::contact::{ContactPicture, MAX_PICTURE_BYTES, PostalAddress};
@@ -34,6 +38,10 @@ pub const MAX_CARDS: usize = 100_000;
 pub const MAX_PROPS_PER_CARD: usize = 10_000;
 /// Longest side of a PHOTO kept (pixels; the contact window's limit).
 pub const MAX_PHOTO_SIDE: u32 = 4096;
+/// Most certificates (KEY) kept per card.
+pub const MAX_KEYS: usize = 8;
+/// Largest certificate kept (bytes).
+pub const MAX_KEY_BYTES: usize = 64 * 1024;
 
 /// vCard version to write.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -232,6 +240,41 @@ fn photo(cl: &ContentLine) -> Option<ContactPicture> {
     (w > 0 && h > 0 && w <= MAX_PHOTO_SIDE && h <= MAX_PHOTO_SIDE).then_some(pic)
 }
 
+/// A KEY value holding an X.509 certificate, as base64 DER (see the module docs). Other keys give `None`.
+fn certificate(cl: &ContentLine) -> Option<String> {
+    let value = cl.value.trim();
+    let inline_b64 = cl
+        .param_values("ENCODING")
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case("b") || e.eq_ignore_ascii_case("base64"));
+    let payload = if inline_b64 {
+        let types = cl.param_values("TYPE");
+        let x509 = types.is_empty() || types.iter().any(|t| t.eq_ignore_ascii_case("x509"));
+        // vCard 2.1 writes the type as a bare parameter (`KEY;X509;ENCODING=BASE64:`).
+        if !x509 && !cl.has_type("x509") {
+            return None;
+        }
+        value
+    } else {
+        let rest = value.get(..5).filter(|p| p.eq_ignore_ascii_case("data:")).and(value.get(5..))?;
+        let (meta, payload) = rest.split_once(',')?;
+        let mut parts = meta.split(';').map(str::trim);
+        let mime = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let cert = ["application/pkix-cert", "application/x-x509-ca-cert", "application/x-x509-user-cert"]
+            .contains(&mime.as_str());
+        if !cert || !parts.any(|x| x.eq_ignore_ascii_case("base64")) {
+            return None;
+        }
+        payload
+    };
+    if payload.len() / 4 * 3 > MAX_KEY_BYTES {
+        return None;
+    }
+    let der = mailcraft_mime::transfer::decode_base64(payload.as_bytes());
+    // A DER certificate is a SEQUENCE; anything else is not one.
+    (der.first() == Some(&0x30) && der.len() > 64).then(|| mailcraft_mime::transfer::encode_base64_flat(&der))
+}
+
 /// TYPE value for a picture's MIME type (3.0 PHOTO).
 fn photo_type(mime: &str) -> &'static str {
     match mime {
@@ -355,6 +398,13 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
                 c.anniversary = birthday(&text_value(cl));
             }
             "PHOTO" if c.picture.is_none() => c.picture = photo(cl),
+            "KEY" if c.certificates.len() < MAX_KEYS => {
+                if let Some(cert) = certificate(cl)
+                    && !c.certificates.contains(&cert)
+                {
+                    c.certificates.push(cert);
+                }
+            }
             "EMAIL" => {
                 let v = text_value(cl);
                 let v = strip_scheme(&v, "mailto:").trim().to_owned();
@@ -601,6 +651,14 @@ pub fn write_one(c: &Contact, version: Version, out: &mut String) {
         } else {
             let params = vec![("ENCODING", "b".to_owned()), ("TYPE", photo_type(&p.mime).to_owned())];
             lines.push(line("PHOTO", params, b64));
+        }
+    }
+    for cert in c.certificates.iter().take(MAX_KEYS).filter(|k| !k.trim().is_empty()) {
+        let b64: String = cert.chars().filter(|ch| !ch.is_whitespace()).collect();
+        if v4 {
+            lines.push(line("KEY", vec![], format!("data:application/pkix-cert;base64,{b64}")));
+        } else {
+            lines.push(line("KEY", vec![("ENCODING", "b".to_owned()), ("TYPE", "X509".to_owned())], b64));
         }
     }
     if !c.notes.is_empty() {

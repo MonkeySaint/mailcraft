@@ -207,6 +207,7 @@ fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str
         "rr" => c.request_read_receipt,
         "dr" => c.request_delivery_receipt,
         "encrypt" => c.encrypt,
+        "sign" => c.sign,
         "delay" => c.delay_until.is_some(),
         "replyto" => !c.reply_to.trim().is_empty(),
         "painter" => c.painter.is_some(),

@@ -197,6 +197,10 @@ pub struct Contact {
     /// The contact's picture.
     #[serde(default)]
     pub picture: Option<ContactPicture>,
+    /// S/MIME certificates (base64 DER X.509), e.g. from a vCard `KEY`: encrypted mail to the contact uses
+    /// them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<String>,
 }
 
 impl Contact {
