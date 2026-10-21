@@ -177,8 +177,13 @@ fn in_kind(mb: &Mailbox, folder: mailcraft_model::FolderId, kind: FolderKind) ->
 }
 
 fn in_deleted(mb: &Mailbox, folder: mailcraft_model::FolderId) -> bool {
+    in_role(mb, folder, FolderRole::DeletedItems)
+}
+
+/// Whether `folder` is the account's `role` folder or inside it.
+fn in_role(mb: &Mailbox, folder: mailcraft_model::FolderId, role: FolderRole) -> bool {
     mb.folder_account(folder)
-        .and_then(|a| mb.role_folder(a, FolderRole::DeletedItems))
+        .and_then(|a| mb.role_folder(a, role))
         .is_some_and(|d| mb.is_in_subtree(folder, d))
 }
 
@@ -273,7 +278,8 @@ pub fn due(s: &Session, st: &ReminderState) -> Vec<Reminder> {
     }
     for m in mb.mail.values() {
         let FlagState::Flagged { reminder: Some(r), due: flag_due, .. } = &m.flag else { continue };
-        if r.unix > now.unix || in_deleted(mb, m.folder) {
+        // Junk Email never pops a window: a sender-set reminder there is a way to grab attention.
+        if r.unix > now.unix || in_deleted(mb, m.folder) || in_role(mb, m.folder, FolderRole::JunkEmail) {
             continue;
         }
         let key = Key::Mail(m.id).text();
@@ -769,6 +775,29 @@ mod tests {
         let r = s.run("calendar.reminders", &json!({ "state": st })).unwrap();
         assert_eq!(r["reminders"].as_array().unwrap().len(), 1);
         assert!(r["state"]["snoozed"].as_object().unwrap().is_empty(), "spent snoozes are dropped");
+    }
+
+    #[test]
+    fn flagged_mail_in_junk_never_reminds() {
+        let mut s = session();
+        let junk = role(&s, FolderRole::JunkEmail);
+        let flag = FlagState::Flagged {
+            label: "Act now".into(),
+            start: None,
+            due: None,
+            reminder: Some(at(&s, -1)),
+        };
+        let id = s.mailbox.add_mail(MailItem {
+            folder: junk,
+            subject: "You won".into(),
+            flag,
+            ..Default::default()
+        });
+        assert!(due(&s, &ReminderState::default()).is_empty());
+        // Moved back to the Inbox (not junk after all), its reminder comes due.
+        let inbox = role(&s, FolderRole::Inbox);
+        s.mailbox.mail.get_mut(&id).unwrap().folder = inbox;
+        assert_eq!(due(&s, &ReminderState::default()).len(), 1);
     }
 
     #[test]

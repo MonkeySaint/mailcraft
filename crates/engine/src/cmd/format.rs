@@ -299,9 +299,40 @@ pub(crate) fn requested_theme_color(s: &Session, p: &Value) -> Result<Option<Col
         .ok_or_else(|| CmdError::Params(format!("unknown theme colour `{key}`")))
 }
 
+/// The standard Font Color swatches (name, hex).
+pub const FONT_COLORS: [(&str, &str); 10] = [
+    ("Dark Red", "#a01c1c"),
+    ("Red", "#e02424"),
+    ("Orange", "#ef8a17"),
+    ("Yellow", "#f2c94c"),
+    ("Light Green", "#7ac74f"),
+    ("Green", "#2e8b46"),
+    ("Light Blue", "#3fa7d6"),
+    ("Blue", "#1f5fbf"),
+    ("Dark Blue", "#14286b"),
+    ("Purple", "#6b3fa0"),
+];
+
+/// Contrast a font colour needs against the white page for Font Color › High-contrast only (the WCAG AA
+/// ratio for body text).
+const READABLE_TEXT: f32 = 4.5;
+
+/// Whether text in colour `c` stays easy to read on the white page (Font Color › High-contrast only).
+pub fn is_readable_text(c: Color) -> bool {
+    c.contrast(&Color::WHITE) >= READABLE_TEXT
+}
+
 fn color(s: &mut Session, p: &Value) -> CmdResult {
     if opt_bool(p, "custom") == Some(true) {
         return dialog(s, "colors", json!({"compose": compose_id(s, p)?, "target": "font"}));
+    }
+    // Font Color ▾ › High-contrast only: the menu offers only colours that stay readable on the page.
+    if let Some(v) = opt_bool(p, "highContrastOnly") {
+        let c = compose_mut(s, p)?;
+        c.editor.font_high_contrast_only = v;
+        if p.get("color").is_none() && p.get("theme").is_none() {
+            return Ok(json!({"highContrastOnly": v}));
+        }
     }
     if opt_bool(p, "list") == Some(true) {
         let cid = compose_id(s, p)?;
@@ -324,6 +355,16 @@ fn color(s: &mut Session, p: &Value) -> CmdResult {
         Some(v) => v,
         None => Some(c.last_font_color.unwrap_or(DEFAULT_FONT_COLOR)),
     };
+    if let Some(v) = col
+        && chosen.is_some()
+        && c.editor.font_high_contrast_only
+        && !is_readable_text(v)
+    {
+        return Err(CmdError::Disabled(format!(
+            "{} is hard to read on the page; turn off High-contrast only to use it",
+            v.to_hex()
+        )));
+    }
     if let Some(v) = col {
         c.last_font_color = Some(v);
     }
@@ -1929,8 +1970,123 @@ fn copy_selection(s: &mut Session, p: &Value) -> Result<ClipEntry, CmdError> {
     for other in s.composes.values_mut() {
         other.push_clipboard(entry.clone());
     }
+    push_history(s, entry.clone());
     s.clipboard_text = Some(entry.text.clone());
     Ok(entry)
+}
+
+/// Longest text collected from the system clipboard or the reading pane (chars).
+pub const MAX_COLLECT_CHARS: usize = 200_000;
+
+/// The text with runs of whitespace made single spaces (copies of the same text compare equal whether
+/// they came with HTML line breaks or plain ones).
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_history(s: &mut Session, entry: ClipEntry) {
+    s.clip_history.push(entry);
+    if s.clip_history.len() > crate::compose::MAX_CLIPBOARD {
+        let extra = s.clip_history.len().saturating_sub(crate::compose::MAX_CLIPBOARD);
+        s.clip_history.drain(..extra);
+    }
+}
+
+/// Adds a copy made outside a message body (another program while MailCraft runs, or the reading pane) to
+/// the Clipboard history, following the pane's options: copies from other programs only with
+/// `state.clipboard.collectOther`, and with every Clipboard pane closed only with
+/// `state.clipboard.collectHidden`. The same text as the newest item is not added again. Returns whether
+/// it was added and whether the pane was opened for it ("Open the Clipboard pane by itself…").
+pub fn collect_clip(s: &mut Session, text: &str, html: Option<&str>, other_program: bool) -> (bool, bool) {
+    if other_program && !s.settings.bool("state.clipboard.collectOther") {
+        return (false, false);
+    }
+    let pane_open = s.composes.values().any(|c| c.editor.clipboard_pane);
+    if !pane_open && !s.settings.bool("state.clipboard.collectHidden") {
+        return (false, false);
+    }
+    let text: String = text.chars().take(MAX_COLLECT_CHARS).collect();
+    if text.trim().is_empty() {
+        return (false, false);
+    }
+    let key = squash(&text);
+    if s.clip_history.last().is_some_and(|e| squash(&e.text) == key) {
+        return (false, false);
+    }
+    let doc = match html.filter(|h| !h.trim().is_empty() && h.len() <= MAX_COLLECT_CHARS.saturating_mul(4)) {
+        Some(h) => mailcraft_html::html_to_doc(h),
+        None => Doc::from_plain_text(&text),
+    };
+    let entry = ClipEntry { text, doc, source: 0 };
+    for c in s.composes.values_mut() {
+        c.push_clipboard(entry.clone());
+    }
+    push_history(s, entry);
+    let mut shown = false;
+    if s.settings.bool("state.clipboard.showAuto")
+        && s.clip_history.len() >= 2
+        && !pane_open
+        && let Some(c) = s.composes.values_mut().next_back()
+    {
+        c.editor.clipboard_pane = true;
+        shown = true;
+    }
+    (true, shown)
+}
+
+/// Drops the newest history item when it holds `text` and came from outside a message body (a password
+/// manager that clears the clipboard after a while takes its copy back out of the history too). Returns
+/// whether one was dropped.
+pub fn forget_clip(s: &mut Session, text: &str) -> bool {
+    let key = squash(text);
+    if key.is_empty() || !s.clip_history.last().is_some_and(|e| e.source == 0 && squash(&e.text) == key) {
+        return false;
+    }
+    s.clip_history.pop();
+    for c in s.composes.values_mut() {
+        if c.clipboard.last().is_some_and(|e| e.source == 0 && squash(&e.text) == key) {
+            c.clipboard.pop();
+        }
+    }
+    true
+}
+
+/// Clipboard pane: a copy made in another program (the UI watches the system clipboard while MailCraft
+/// runs) or in the reading pane joins the history (`source`: "other" or "app"). `forget: true` instead takes
+/// the newest such item back out when it holds `text` (the other program cleared the clipboard).
+fn clipboard_collect(s: &mut Session, p: &Value) -> CmdResult {
+    let text = req_str(p, "text")?.to_owned();
+    if opt_bool(p, "forget") == Some(true) {
+        let forgotten = forget_clip(s, &text);
+        return Ok(json!({"forgotten": forgotten, "count": s.clip_history.len()}));
+    }
+    let html = opt_str(p, "html").map(str::to_owned);
+    let other = match opt_str(p, "source").unwrap_or("other") {
+        "other" => true,
+        "app" => false,
+        x => return Err(CmdError::Params(format!("unknown source `{x}`"))),
+    };
+    let (collected, shown) = collect_clip(s, &text, html.as_deref(), other);
+    Ok(json!({"collected": collected, "shown": shown, "count": s.clip_history.len()}))
+}
+
+/// Clipboard pane ▾ Options: `collectOther` (collect what is copied in other programs), `collectHidden`
+/// (collect while the pane is closed), `showAuto` (open the pane by itself on the second item).
+fn clipboard_options(s: &mut Session, p: &Value) -> CmdResult {
+    for (param, key) in [
+        ("collectOther", "state.clipboard.collectOther"),
+        ("collectHidden", "state.clipboard.collectHidden"),
+        ("showAuto", "state.clipboard.showAuto"),
+    ] {
+        if let Some(v) = opt_bool(p, param) {
+            s.settings.set(key, &json!(v))?;
+        }
+    }
+    Ok(json!({
+        "collectOther": s.settings.bool("state.clipboard.collectOther"),
+        "collectHidden": s.settings.bool("state.clipboard.collectHidden"),
+        "showAuto": s.settings.bool("state.clipboard.showAuto"),
+    }))
 }
 
 fn copy(s: &mut Session, p: &Value) -> CmdResult {
@@ -2279,12 +2435,15 @@ fn clipboard_pane(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
     // The history is shared by every open message; a message opened after the copies picks it up.
     if s.composes.get(&cid).is_some_and(|c| c.clipboard.is_empty()) {
-        let shared = s
-            .composes
-            .iter()
-            .rev()
-            .find(|(k, c)| **k != cid && !c.clipboard.is_empty())
-            .map(|(_, c)| c.clipboard.clone());
+        let shared = if s.clip_history.is_empty() {
+            s.composes
+                .iter()
+                .rev()
+                .find(|(k, c)| **k != cid && !c.clipboard.is_empty())
+                .map(|(_, c)| c.clipboard.clone())
+        } else {
+            Some(s.clip_history.clone())
+        };
         if let (Some(h), Some(c)) = (shared, s.composes.get_mut(&cid)) {
             c.clipboard = h;
         }
@@ -2303,12 +2462,16 @@ fn clipboard_pane(s: &mut Session, p: &Value) -> CmdResult {
         for c in s.composes.values_mut() {
             c.clipboard.clear();
         }
+        s.clip_history.clear();
     } else if let Some(n) = opt_u64(p, "delete") {
         let entry = nth(s, n)?;
         for c in s.composes.values_mut() {
             if let Some(i) = c.clipboard.iter().rposition(|e| *e == entry) {
                 c.clipboard.remove(i);
             }
+        }
+        if let Some(i) = s.clip_history.iter().rposition(|e| *e == entry) {
+            s.clip_history.remove(i);
         }
     } else if let Some(n) = opt_u64(p, "paste") {
         let entry = nth(s, n)?;
@@ -2848,6 +3011,26 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             has_compose,
             clipboard_pane,
+        ),
+        spec(
+            "format.clipboardCollect",
+            "Collect Clipboard Item",
+            "Message › Clipboard (system clipboard watch)",
+            "",
+            r#"{"text":string,"html"?:string,"source"?:"other"|"app","forget"?:bool}"#,
+            false,
+            crate::always,
+            clipboard_collect,
+        ),
+        spec(
+            "format.clipboardOptions",
+            "Clipboard Options",
+            "Message › Clipboard pane › Options",
+            "",
+            r#"{"collectOther"?:bool,"collectHidden"?:bool,"showAuto"?:bool}"#,
+            false,
+            crate::always,
+            clipboard_options,
         ),
         spec(
             "format.color",
@@ -4164,6 +4347,89 @@ mod pane_tests {
     }
 
     #[test]
+    fn clipboard_collects_other_programs_and_the_reading_pane() {
+        let (mut s, id) = with_text("one two");
+        sel(&mut s, (&[0], 0), (&[0], 3));
+        s.run("format.copy", &json!({})).unwrap();
+        // By default nothing is collected while every Clipboard pane is closed.
+        assert!(!s.settings.bool("state.clipboard.collectHidden"));
+        assert_eq!(s.run("format.clipboardCollect", &json!({"text": "secret"})).unwrap()["collected"], false);
+        assert_eq!(s.clip_history.len(), 1);
+        s.run("format.clipboardPane", &json!({"compose": id, "show": true})).unwrap();
+        // A copy made in another program while MailCraft runs.
+        let r = s
+            .run(
+                "format.clipboardCollect",
+                &json!({"text": "from a browser", "html": "<b>from</b> a browser"}),
+            )
+            .unwrap();
+        assert_eq!(r["collected"], true);
+        // The same text again (the system clipboard still holds it) is not added twice; nor is a compose copy
+        // seen again on the system clipboard.
+        assert_eq!(
+            s.run("format.clipboardCollect", &json!({"text": "from  a\nbrowser"})).unwrap()["collected"],
+            false
+        );
+        let r = s.run("format.clipboardPane", &json!({"list": true})).unwrap();
+        let texts: Vec<&str> =
+            r["items"].as_array().unwrap().iter().map(|e| e["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["from a browser", "one"]);
+        // Pasting it keeps the formatting it was copied with.
+        sel(&mut s, (&[0], 7), (&[0], 7));
+        s.run("format.clipboardPane", &json!({"paste": 0})).unwrap();
+        assert!(s.composes[&id].body.to_plain_text().contains("from a browser"));
+        // The reading pane's copies join too.
+        s.run("app.copy", &json!({"text": "quoted line"})).unwrap();
+        assert_eq!(s.clip_history.last().unwrap().text, "quoted line");
+        // A message opened later starts with the history.
+        let id2 = s.open_compose(ComposeState::default());
+        let r = s.run("format.clipboardPane", &json!({"compose": id2, "list": true})).unwrap();
+        assert_eq!(r["items"].as_array().unwrap().len(), 3);
+        // The other program cleared the clipboard (a password manager): its newest copy is taken back out.
+        s.run("format.clipboardCollect", &json!({"text": "hunter2"})).unwrap();
+        let r = s.run("format.clipboardCollect", &json!({"text": "hunter2", "forget": true})).unwrap();
+        assert_eq!(r["forgotten"], true);
+        assert!(s.clip_history.iter().all(|e| e.text != "hunter2"));
+        assert!(s.composes.values().all(|c| c.clipboard.iter().all(|e| e.text != "hunter2")));
+        // Only the newest, and never a copy made in a message.
+        let r = s.run("format.clipboardCollect", &json!({"text": "one", "forget": true})).unwrap();
+        assert_eq!(r["forgotten"], false);
+        // The message state never carries the clipboard.
+        let v = serde_json::to_value(&s.composes[&id]).unwrap();
+        assert!(v.get("clipboard").is_none());
+        // Options: not from other programs; not while every pane is closed.
+        s.run("format.clipboardPane", &json!({"compose": id, "show": false})).unwrap();
+        s.run("format.clipboardOptions", &json!({"collectHidden": true})).unwrap();
+        let r = s.run("format.clipboardOptions", &json!({"collectOther": false})).unwrap();
+        assert_eq!(r["collectOther"], false);
+        assert_eq!(
+            s.run("format.clipboardCollect", &json!({"text": "elsewhere"})).unwrap()["collected"],
+            false
+        );
+        assert_eq!(
+            s.run("format.clipboardCollect", &json!({"text": "in app", "source": "app"})).unwrap()["collected"],
+            true
+        );
+        s.run("format.clipboardOptions", &json!({"collectOther": true, "collectHidden": false})).unwrap();
+        assert!(s.composes.values().all(|c| !c.editor.clipboard_pane));
+        assert_eq!(s.run("format.clipboardCollect", &json!({"text": "hidden"})).unwrap()["collected"], false);
+        s.run("format.clipboardPane", &json!({"compose": id2, "show": true})).unwrap();
+        assert_eq!(s.run("format.clipboardCollect", &json!({"text": "shown"})).unwrap()["collected"], true);
+        // Open the pane by itself once a second item is collected.
+        s.run("format.clipboardPane", &json!({"compose": id2, "show": false})).unwrap();
+        s.run("format.clipboardOptions", &json!({"collectHidden": true, "showAuto": true})).unwrap();
+        let r = s.run("format.clipboardCollect", &json!({"text": "auto"})).unwrap();
+        assert_eq!(r["shown"], true);
+        assert!(s.composes[&id2].editor.clipboard_pane);
+        // Clear All empties the shared history; bad input is refused, empty text ignored.
+        s.run("format.clipboardPane", &json!({"compose": id2, "clear": true})).unwrap();
+        assert!(s.clip_history.is_empty());
+        assert!(s.run("format.clipboardCollect", &json!({"text": "x", "source": "moon"})).is_err());
+        assert!(s.run("format.clipboardCollect", &json!({})).is_err());
+        assert_eq!(s.run("format.clipboardCollect", &json!({"text": "   "})).unwrap()["collected"], false);
+    }
+
+    #[test]
     fn clipboard_pane_lists_pastes_deletes_and_clears() {
         let (mut s, id) = with_text("one two three");
         for (a, b) in [(0, 3), (4, 7), (8, 13)] {
@@ -4301,6 +4567,27 @@ mod pane_tests {
     }
 
     #[test]
+    fn font_color_high_contrast_only() {
+        let (mut s, id) = with_text("hello");
+        sel(&mut s, (&[0], 0), (&[0], 5));
+        assert!(is_readable_text(Color::BLACK) && !is_readable_text(Color::WHITE));
+        let r = s.run("format.color", &json!({"highContrastOnly": true})).unwrap();
+        assert_eq!(r["highContrastOnly"], true);
+        assert!(s.composes[&id].editor.font_high_contrast_only);
+        // Yellow on white is refused; dark blue is fine.
+        assert!(matches!(s.run("format.color", &json!({"color": "#f2c94c"})), Err(CmdError::Disabled(_))));
+        s.run("format.color", &json!({"color": "#14286b"})).unwrap();
+        s.run("format.color", &json!({"highContrastOnly": false})).unwrap();
+        s.run("format.color", &json!({"color": "#f2c94c"})).unwrap();
+        let readable: Vec<&str> = FONT_COLORS
+            .iter()
+            .filter(|(_, h)| parse_color(h).is_ok_and(is_readable_text))
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(readable.contains(&"Dark Blue") && !readable.contains(&"Yellow"), "{readable:?}");
+    }
+
+    #[test]
     fn highlighter_pens_and_high_contrast_only() {
         let (mut s, id) = with_text("hello");
         sel(&mut s, (&[0], 0), (&[0], 5));
@@ -4371,7 +4658,9 @@ mod pane_tests {
             Notice::OpenDialog(d, p) if d == "quickParts" => Some(p.clone()),
             _ => None,
         });
-        assert!(listed.unwrap()["entries"].as_array().unwrap().is_empty());
+        // (Only the AutoText entries every profile starts with: the user's name and initials.)
+        let entries = listed.unwrap()["entries"].as_array().unwrap().clone();
+        assert!(entries.iter().all(|e| e["gallery"] == "autoText"), "{entries:?}");
     }
 
     #[test]

@@ -1,10 +1,15 @@
 //! Side panes of the compose window: Clipboard on the left (Message › Clipboard / Format Text › Clipboard
-//! launcher, `format.clipboardPane`), Styles (`format.stylesPane`) and Selection (`format.selectionPane`) on
-//! the right, stacked when both are open. Each pane is a column beside the body editor with a title and a
+//! launcher, `format.clipboardPane`), Editor (`review.editor`), Styles (`format.stylesPane`) and Selection
+//! (`format.selectionPane`) on the right, stacked when more than one is open. Each pane is a column beside the body editor with a title and a
 //! close button; on a window too narrow to keep a usable body the panes are left out.
 //!
-//! - Clipboard: the last 24 items copied or cut in MailCraft, newest first. Click an item to paste it; its
-//!   menu pastes or deletes it; Paste All / Clear All.
+//! - Clipboard: the last 24 items copied or cut in MailCraft, copied from the reading pane and (while
+//!   MailCraft runs) copied in other programs, newest first. Click an item to paste it; its menu pastes or
+//!   deletes it; Paste All / Clear All; Clipboard Options (collect from other programs, collect while the
+//!   pane is closed, open the pane by itself).
+//! - Editor: the Editor score and the issue counts by group (spelling and grammar corrections; clarity,
+//!   conciseness, clichés, formality and inclusiveness refinements). Pick a group to step through its
+//!   issues: click one to select it in the message, apply a suggestion, or ignore it.
 //! - Styles: the built-in styles and the ones created in this message, the caret's style marked. Click to
 //!   apply; a style's menu updates it to match the selection, renames or deletes a created style (or reverts
 //!   a modified built-in one); New Style… creates one from the selection; Clear All clears the formatting.
@@ -30,8 +35,18 @@ const MIN_BODY_W: f32 = 280.0;
 pub const CLIPBOARD_TITLE: &str = "Clipboard";
 pub const STYLES_TITLE: &str = "Styles";
 pub const SELECTION_TITLE: &str = "Selection";
+pub const EDITOR_TITLE: &str = "Editor";
 /// Shown when the clipboard history is empty.
-pub const CLIPBOARD_EMPTY: &str = "Nothing copied yet. Items you copy or cut in a message collect here.";
+pub const CLIPBOARD_EMPTY: &str =
+    "Nothing copied yet. What you copy or cut in MailCraft, or copy in other programs, collects here.";
+/// The Clipboard pane's Options menu.
+pub const CLIPBOARD_OPTIONS: &str = "Clipboard Options";
+/// Options menu entries: (`format.clipboardOptions` parameter, setting, label).
+pub const CLIPBOARD_OPTION_ITEMS: [(&str, &str, &str); 3] = [
+    ("collectOther", "state.clipboard.collectOther", "Collect text copied in other programs"),
+    ("collectHidden", "state.clipboard.collectHidden", "Collect while the pane is closed"),
+    ("showAuto", "state.clipboard.showAuto", "Open the pane by itself on the second item"),
+];
 /// Name field of New Style… in the Styles pane.
 pub const NEW_STYLE_NAME: &str = "Style name";
 /// Shown when the message has no objects.
@@ -41,7 +56,7 @@ pub const NO_OBJECTS: &str = "There are no pictures or shapes in this message.";
 /// 0 for a column that is closed or has no room.
 pub fn widths(c: &ComposeState, width: f32) -> (f32, f32) {
     let left_on = c.editor.clipboard_pane;
-    let right_on = c.editor.styles_pane || c.editor.selection_pane;
+    let right_on = c.editor.styles_pane || c.editor.selection_pane || c.editor.editor_pane;
     let width = if width.is_finite() { width } else { 0.0 };
     let mut lw = if left_on { PANE_W } else { 0.0 };
     let mut rw = if right_on { PANE_W } else { 0.0 };
@@ -101,29 +116,53 @@ pub fn body_with_panes(ui: &mut Ui, app: &mut App, cid: u64, min_h: f32, scroll:
         pane_frame(ui, app, r, ("mc-pane-clip", cid), |ui, app| clipboard_pane(ui, app, cid));
     }
     if rw > 0.0 {
-        let both = app.s.composes.get(&cid).is_some_and(|c| c.editor.styles_pane && c.editor.selection_pane);
+        // The open right-hand panes share the column, top to bottom: Editor, Styles, Selection.
+        let open: Vec<RightPane> = app.s.composes.get(&cid).map(right_panes).unwrap_or_default();
         let r = Rect::from_min_size(right.min, vec2(rw, used.height()));
-        let (top, bottom) = if both {
-            let mid_y = r.center().y;
-            (
-                Rect::from_min_max(r.min, pos2(r.right(), mid_y)),
-                Some(Rect::from_min_max(pos2(r.left(), mid_y), r.max)),
-            )
-        } else {
-            (r, None)
-        };
-        let styles = app.s.composes.get(&cid).is_some_and(|c| c.editor.styles_pane);
-        if styles {
-            pane_frame(ui, app, top, ("mc-pane-styles", cid), |ui, app| styles_pane(ui, app, cid));
-        }
-        let selection_rect = if styles { bottom } else { Some(top) };
-        if let Some(sr) = selection_rect
-            && app.s.composes.get(&cid).is_some_and(|c| c.editor.selection_pane)
-        {
-            pane_frame(ui, app, sr, ("mc-pane-selection", cid), |ui, app| selection_pane(ui, app, cid));
+        let n = open.len().max(1) as f32;
+        let h = r.height() / n;
+        for (i, pane) in open.into_iter().enumerate() {
+            let top = r.top() + h * i as f32;
+            let rect = Rect::from_min_max(pos2(r.left(), top), pos2(r.right(), top + h));
+            match pane {
+                RightPane::Editor => {
+                    pane_frame(ui, app, rect, ("mc-pane-editor", cid), |ui, app| editor_pane(ui, app, cid));
+                }
+                RightPane::Styles => {
+                    pane_frame(ui, app, rect, ("mc-pane-styles", cid), |ui, app| styles_pane(ui, app, cid));
+                }
+                RightPane::Selection => {
+                    pane_frame(ui, app, rect, ("mc-pane-selection", cid), |ui, app| {
+                        selection_pane(ui, app, cid)
+                    });
+                }
+            }
         }
     }
     ui.advance_cursor_after_rect(used);
+}
+
+/// A pane of the right-hand column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightPane {
+    Editor,
+    Styles,
+    Selection,
+}
+
+/// The open right-hand panes of `c`, top to bottom.
+pub fn right_panes(c: &ComposeState) -> Vec<RightPane> {
+    let mut out = Vec::new();
+    if c.editor.editor_pane {
+        out.push(RightPane::Editor);
+    }
+    if c.editor.styles_pane {
+        out.push(RightPane::Styles);
+    }
+    if c.editor.selection_pane {
+        out.push(RightPane::Selection);
+    }
+    out
 }
 
 fn body(ui: &mut Ui, app: &mut App, cid: u64, h: f32, scroll: bool) {
@@ -225,6 +264,7 @@ fn clipboard_pane(ui: &mut Ui, app: &mut App, cid: u64) {
         })
         .unwrap_or_default();
     let mut action: Option<serde_json::Value> = None;
+    let mut options: Option<serde_json::Value> = None;
     ui.horizontal(|ui| {
         if ui.add_enabled(!items.is_empty(), egui::Button::new("Paste All")).clicked() {
             action = Some(json!({"pasteAll": true}));
@@ -232,7 +272,21 @@ fn clipboard_pane(ui: &mut Ui, app: &mut App, cid: u64) {
         if ui.add_enabled(!items.is_empty(), egui::Button::new("Clear All")).clicked() {
             action = Some(json!({"clear": true}));
         }
+        ui.menu_button(CLIPBOARD_OPTIONS, |ui| {
+            for (param, key, label) in CLIPBOARD_OPTION_ITEMS {
+                let mut on = app.s.settings.bool(key);
+                if ui.checkbox(&mut on, label).clicked() {
+                    let mut m = serde_json::Map::new();
+                    m.insert(param.to_owned(), json!(on));
+                    options = Some(serde_json::Value::Object(m));
+                    ui.close();
+                }
+            }
+        });
     });
+    if let Some(o) = options {
+        app.run("format.clipboardOptions", o);
+    }
     ui.add_space(4.0);
     if items.is_empty() {
         muted(ui, app, CLIPBOARD_EMPTY);
@@ -476,4 +530,200 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
         app.run("format.selectionPane", json!({"compose": cid, "select": i}));
         ctx.memory_mut(|m| m.request_focus(super::editor_id(cid)));
     }
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// Editor
+
+/// Most issues listed for one group.
+const MAX_LISTED: usize = 60;
+
+/// The Editor pane's view state: the group being stepped through, and the last `review.editor` result with
+/// what it was computed for (body edit counter, check counter, group).
+#[derive(Clone, Debug, Default)]
+struct EditorPaneState {
+    category: Option<String>,
+    cache: Option<(u64, Option<u64>, Option<String>, serde_json::Value)>,
+    /// The body revision last seen and when (seconds): the pane re-asks once typing pauses.
+    seen: Option<(u64, f64)>,
+}
+
+/// How long typing must pause before the Editor pane re-checks the body itself (seconds), when the editor's
+/// own as-you-type check has not caught up.
+pub const EDITOR_PANE_PAUSE: f64 = 0.8;
+
+fn editor_state_id(cid: u64) -> Id {
+    Id::new(("mc-editor-pane", cid))
+}
+
+/// The score line: "Editor score 92%".
+pub fn score_label(score: u64) -> String {
+    format!("Editor score {score}%")
+}
+
+/// A group row: "Grammar  3" or "Clarity  no suggestions".
+pub fn group_label(title: &str, n: u64) -> String {
+    match n {
+        0 => format!("{title}: nothing to fix"),
+        1 => format!("{title}: 1 suggestion"),
+        n => format!("{title}: {n} suggestions"),
+    }
+}
+
+fn editor_pane(ui: &mut Ui, app: &mut App, cid: u64) {
+    use mailcraft_engine::cmd::review::EDITOR_CATEGORIES;
+    if title_row(ui, app, EDITOR_TITLE) {
+        app.run("review.editor", json!({"compose": cid, "show": false}));
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    let mut st: EditorPaneState = ctx.data(|d| d.get_temp(editor_state_id(cid))).unwrap_or_default();
+    let Some((edit_rev, spell_rev)) = app.s.composes.get(&cid).map(|c| (c.edit_rev, c.spell_rev)) else {
+        return;
+    };
+    // Re-ask the engine only when the body or the check changed, or another group is shown. While typing,
+    // the last result stays up: the pane re-asks once the editor's as-you-type check caught up with the body,
+    // or typing paused for EDITOR_PANE_PAUSE (proofing as you type off), never on every keystroke.
+    let now = ctx.input(|i| i.time);
+    if st.seen.is_none_or(|(rev, _)| rev != edit_rev) {
+        st.seen = Some((edit_rev, now));
+    }
+    let fresh = st.cache.as_ref().is_some_and(|(e, r, cat, _)| {
+        *e == edit_rev && (r.is_none() || *r == spell_rev) && *cat == st.category
+    });
+    let same_group = st.cache.as_ref().is_some_and(|(_, _, cat, _)| *cat == st.category);
+    let checked_now = spell_rev == Some(edit_rev);
+    let paused = st.seen.is_some_and(|(_, at)| now - at >= EDITOR_PANE_PAUSE);
+    let typing = same_group && !checked_now && !paused;
+    if !fresh && typing {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(EDITOR_PANE_PAUSE));
+    }
+    if !fresh && !typing {
+        let mut p = json!({"compose": cid, "list": true});
+        if let (Some(cat), Some(o)) = (&st.category, p.as_object_mut()) {
+            o.insert("category".into(), json!(cat));
+        }
+        let r = app.run("review.editor", p).unwrap_or(serde_json::Value::Null);
+        let spell_rev = app.s.composes.get(&cid).and_then(|c| c.spell_rev);
+        st.cache = Some((edit_rev, spell_rev, st.category.clone(), r));
+    }
+    let r = st.cache.as_ref().map(|(_, _, _, v)| v.clone()).unwrap_or(serde_json::Value::Null);
+    let mut run: Option<(&'static str, serde_json::Value)> = None;
+    let mut pick: Option<Option<String>> = None;
+    if let Some(why) = r.get("notChecked").and_then(serde_json::Value::as_str) {
+        muted(ui, app, &format!("This message is not checked: {why}"));
+    } else {
+        let score = r.get("score").and_then(serde_json::Value::as_u64).unwrap_or(100);
+        ui.label(RichText::new(score_label(score)).strong().size(18.0).color(app.theme.text));
+        let corrections = r.get("corrections").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let refinements = r.get("refinements").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        muted(ui, app, &format!("{corrections} corrections \u{b7} {refinements} refinements"));
+        ui.add_space(6.0);
+        match st.category.clone() {
+            None => {
+                for (heading, refine) in [("Corrections", false), ("Refinements", true)] {
+                    ui.label(RichText::new(heading).strong().color(app.theme.text));
+                    for (id, title, is_refine) in EDITOR_CATEGORIES {
+                        if is_refine != refine {
+                            continue;
+                        }
+                        let n = r
+                            .get("counts")
+                            .and_then(|c| c.get(id))
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let b = egui::Button::new(group_label(title, n))
+                            .min_size(vec2(ui.available_width(), 24.0));
+                        if ui.add_enabled(n > 0, b).clicked() {
+                            pick = Some(Some(id.to_owned()));
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
+            }
+            Some(cat) => {
+                let title = EDITOR_CATEGORIES.iter().find(|(id, ..)| *id == cat).map_or("", |(_, t, _)| *t);
+                ui.horizontal(|ui| {
+                    if ui.button("\u{2190} All groups").clicked() {
+                        pick = Some(None);
+                    }
+                    ui.label(RichText::new(title).strong().color(app.theme.text));
+                });
+                let issues: Vec<serde_json::Value> = r
+                    .get("issues")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| a.iter().take(MAX_LISTED).cloned().collect())
+                    .unwrap_or_default();
+                if issues.is_empty() {
+                    muted(ui, app, "Nothing left to look at here.");
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt(("mc-editor-list", cid))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (i, issue) in issues.iter().enumerate() {
+                            editor_issue(ui, app, cid, i, issue, &mut run);
+                        }
+                    });
+            }
+        }
+    }
+    if let Some(p) = pick {
+        st.category = p;
+        st.cache = None;
+    }
+    if let Some((cmd, p)) = run {
+        app.run(cmd, p);
+        st.cache = None;
+        ctx.memory_mut(|m| m.request_focus(super::editor_id(cid)));
+        ctx.request_repaint();
+    }
+    ctx.data_mut(|d| d.insert_temp(editor_state_id(cid), st));
+}
+
+/// One issue of the Editor pane's group list: the flagged text and what is wrong (click: select it in the
+/// message), its suggestions and Ignore.
+fn editor_issue(
+    ui: &mut Ui,
+    app: &App,
+    cid: u64,
+    i: usize,
+    issue: &serde_json::Value,
+    run: &mut Option<(&'static str, serde_json::Value)>,
+) {
+    let word = issue.get("word").and_then(serde_json::Value::as_str).unwrap_or("");
+    let message = issue.get("message").and_then(serde_json::Value::as_str).unwrap_or("");
+    let at = issue.get("start").cloned().unwrap_or(serde_json::Value::Null);
+    ui.push_id(("mc-editor-issue", i), |ui| {
+        egui::Frame::new().stroke(Stroke::new(1.0, app.theme.separator)).inner_margin(6.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let shown: String = word.chars().take(80).collect();
+            let r = ui
+                .add(egui::Button::new(RichText::new(shown).strong()).frame(false))
+                .on_hover_text("Show in the message");
+            if r.clicked() {
+                *run = Some(("review.editor", json!({"compose": cid, "select": at})));
+            }
+            let note = if message.is_empty() { "Not in the dictionary." } else { message };
+            muted(ui, app, note);
+            ui.horizontal_wrapped(|ui| {
+                let suggestions: Vec<&str> = issue
+                    .get("suggestions")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| a.iter().filter_map(serde_json::Value::as_str).take(4).collect())
+                    .unwrap_or_default();
+                for sugg in suggestions {
+                    let label = if sugg.is_empty() { "(remove)" } else { sugg };
+                    if ui.button(label).clicked() {
+                        *run =
+                            Some(("review.correct", json!({"compose": cid, "at": at, "replacement": sugg})));
+                    }
+                }
+                if ui.button("Ignore").clicked() {
+                    *run = Some(("review.ignore", json!({"compose": cid, "at": at})));
+                }
+            });
+        });
+    });
+    ui.add_space(4.0);
 }

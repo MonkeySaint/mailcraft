@@ -833,7 +833,21 @@ pub(crate) fn build_message(
             b.extra_headers.push(("Sensitivity".into(), "Company-Confidential".into()))
         }
     }
-    if !for_draft && let Some(days) = st.expire_days() {
+    if !for_draft && let Some(r) = &c.recipient_flag {
+        // Flag for Recipients: the label (the de-facto `X-Message-Flag` header), the due date as the RFC 2156
+        // reply-by date, and the reminder in MailCraft's own header.
+        b.extra_headers.push(("X-Message-Flag".into(), mailcraft_mime::encoded::encode_words(&r.label)));
+        if let Some(due) = r.due {
+            b.extra_headers.push(("Reply-By".into(), due.to_rfc5322()));
+        }
+        if let Some(at) = r.reminder {
+            b.extra_headers.push((crate::compose::RECIPIENT_REMINDER_HEADER.into(), at.to_rfc5322()));
+        }
+    }
+    if !for_draft && let Some(at) = c.expires {
+        // Properties › "Expires after" for this message.
+        b.extra_headers.push(("Expiry-Date".into(), at.to_rfc5322()));
+    } else if !for_draft && let Some(days) = st.expire_days() {
         // Options › Mail › Send messages › "Mark messages as expired after this many days": the expiry
         // travels with the message (RFC 4021 Expiry-Date).
         let sent = c.delay_until.unwrap_or_else(|| s.now());
@@ -986,6 +1000,10 @@ pub fn save_draft(s: &mut Session, cid: u64) -> Result<ItemId, CmdError> {
     item.received = now;
     item.sensitivity = c.sensitivity;
     item.flag = c.flag.clone();
+    // Properties: categories, linked contacts and "Do not AutoArchive" stay with the copy.
+    item.categories = c.categories.clone();
+    item.contacts = crate::cmd::util::split_names(&c.contacts);
+    item.no_auto_archive = c.no_auto_archive;
     item.body.format = c.format;
     let id = match existing {
         Some((id, _)) => {
@@ -1121,6 +1139,10 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     item.bcc = b.bcc.iter().flat_map(Address::mailboxes).collect();
     item.sensitivity = c.sensitivity;
     item.flag = c.flag.clone();
+    // Properties: categories, linked contacts and "Do not AutoArchive" stay with the copy.
+    item.categories = c.categories.clone();
+    item.contacts = crate::cmd::util::split_names(&c.contacts);
+    item.no_auto_archive = c.no_auto_archive;
     let id = s.mailbox.add_mail(item);
     // Auto-Complete list (most recently used first).
     s.mailbox.record_recipients(&c.recipients(), now);
@@ -1726,12 +1748,24 @@ fn follow_up(s: &mut Session, p: &Value) -> CmdResult {
         "noDate" => (None, None),
         "clear" => {
             let c = compose_mut(s, p)?;
+            if c.flag == FlagState::None && c.recipient_flag.is_none() {
+                return Err(CmdError::Disabled("the message is not flagged".into()));
+            }
             c.flag = FlagState::None;
+            c.recipient_flag = None;
             c.dirty = true;
-            return Ok(json!({"flag": "none"}));
+            return Ok(json!({"flag": "none", "recipients": null}));
+        }
+        "custom" | "reminder"
+            if p.get("at").is_none()
+                && ["label", "start", "due", "reminder", "recipients", "flagMe"]
+                    .iter()
+                    .any(|k| p.get(*k).is_some()) =>
+        {
+            return custom_flag(s, p);
         }
         "custom" | "reminder" => {
-            let at = opt_str(p, "at").or_else(|| opt_str(p, "due"));
+            let at = opt_str(p, "at");
             let Some(at) = at else {
                 let name = if kind == "custom" { "customFlag" } else { "addReminder" };
                 return dialog(s, name, json!({"compose": compose_id(s, p)?}));
@@ -1755,6 +1789,85 @@ fn follow_up(s: &mut Session, p: &Value) -> CmdResult {
     c.flag = FlagState::Flagged { label, start, due, reminder: None };
     c.dirty = true;
     Ok(json!({"flag": kind, "start": start.map(|d| d.to_rfc3339()), "due": due.map(|d| d.to_rfc3339())}))
+}
+
+/// A flag label as typed: control characters dropped, trimmed, at most
+/// [`mailcraft_model::item::MAX_FLAG_LABEL_CHARS`] chars; empty = "Follow up".
+fn flag_label(text: &str) -> String {
+    let clean: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(mailcraft_model::item::MAX_FLAG_LABEL_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if clean.is_empty() { "Follow up".to_owned() } else { clean }
+}
+
+/// An optional date parameter: absent or null or "" or "none" = no date; anything else must parse.
+fn flag_date(s: &Session, v: Option<&Value>, name: &str) -> Result<Option<DateTime>, CmdError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(|unix| Some(DateTime { unix, offset_min: s.tz_offset_min }))
+            .ok_or_else(|| CmdError::Params(format!("`{name}` must be a date"))),
+        Some(Value::String(t)) if t.trim().is_empty() || t.trim().eq_ignore_ascii_case("none") => Ok(None),
+        Some(Value::String(t)) => parse_when(s, t)
+            .map(Some)
+            .ok_or_else(|| CmdError::Params(format!("cannot read the {name} date `{t}`"))),
+        Some(_) => Err(CmdError::Params(format!("`{name}` must be a date"))),
+    }
+}
+
+/// Follow Up › Custom with values (the Custom dialog's OK): sets the whole flag at once. `label`, `start`,
+/// `due` and `reminder` are the sender's own flag ("Flag for Me"; `flagMe: false` leaves the message
+/// unflagged for the sender); `recipients` (`{"label", "due"?, "reminder"?}`, or null / false for none) is
+/// the Flag for Recipients sent with the message.
+fn custom_flag(s: &mut Session, p: &Value) -> CmdResult {
+    let flag_me = opt_bool(p, "flagMe").unwrap_or(true);
+    let start = flag_date(s, p.get("start"), "start")?;
+    let due = flag_date(s, p.get("due"), "due")?;
+    let reminder = flag_date(s, p.get("reminder"), "reminder")?;
+    if let (Some(a), Some(b)) = (start, due)
+        && a.unix > b.unix
+    {
+        return Err(CmdError::Params("the start date is after the due date".into()));
+    }
+    let recipients = match p.get("recipients") {
+        None => None,
+        Some(Value::Null | Value::Bool(false)) => Some(None),
+        Some(Value::Object(o)) => {
+            let label = flag_label(o.get("label").and_then(Value::as_str).unwrap_or(""));
+            let due = flag_date(s, o.get("due"), "recipients' due")?;
+            let reminder = flag_date(s, o.get("reminder"), "recipients' reminder")?;
+            Some(Some(crate::compose::RecipientFlag { label, due, reminder }))
+        }
+        Some(_) => return Err(CmdError::Params("`recipients` must be an object or null".into())),
+    };
+    let c = compose_mut(s, p)?;
+    let old_label = match &c.flag {
+        FlagState::Flagged { label, .. } => label.clone(),
+        _ => "Follow up".to_owned(),
+    };
+    let label = opt_str(p, "label").map_or(old_label, flag_label);
+    c.flag = if flag_me { FlagState::Flagged { label, start, due, reminder } } else { FlagState::None };
+    if let Some(r) = recipients {
+        c.recipient_flag = r;
+    }
+    c.dirty = true;
+    let time = |d: Option<DateTime>| d.map(|d| d.to_rfc3339());
+    let me = match &c.flag {
+        FlagState::Flagged { label, start, due, reminder } => {
+            json!({"label": label, "start": time(*start), "due": time(*due), "reminder": time(*reminder)})
+        }
+        _ => Value::Null,
+    };
+    let them = c
+        .recipient_flag
+        .as_ref()
+        .map(|r| json!({"label": r.label, "due": time(r.due), "reminder": time(r.reminder)}));
+    Ok(json!({"flag": "custom", "me": me, "recipients": them}))
 }
 
 fn read_receipt(s: &mut Session, p: &Value) -> CmdResult {
@@ -1908,7 +2021,59 @@ fn missing_certificates(s: &Session, c: &ComposeState) -> Vec<String> {
     out
 }
 
+/// Most categories on one message.
+const MAX_MESSAGE_CATEGORIES: usize = 100;
+
+/// Properties values that have no command of their own: `expires` (date, or null / "" for the Options
+/// default), `categories` (names, or a "a; b" string), `contacts` (as typed) and `noAutoArchive`.
+fn set_message_properties(s: &mut Session, p: &Value) -> CmdResult {
+    let expires = match p.get("expires") {
+        None => None,
+        Some(v) => Some(flag_date(s, Some(v), "expiry")?),
+    };
+    let categories: Option<Vec<String>> = match p.get("categories") {
+        None => None,
+        Some(Value::String(t)) => Some(crate::cmd::util::split_names(t)),
+        Some(Value::Array(a)) => {
+            let joined: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+            Some(crate::cmd::util::split_names(&joined.join(";")))
+        }
+        Some(Value::Null) => Some(Vec::new()),
+        Some(_) => return Err(CmdError::Params("`categories` must be a list of names".into())),
+    };
+    let contacts = match p.get("contacts") {
+        None => None,
+        Some(Value::String(t)) => Some(crate::cmd::util::split_names(t).join("; ")),
+        Some(Value::Null) => Some(String::new()),
+        Some(_) => return Err(CmdError::Params("`contacts` must be text".into())),
+    };
+    let c = compose_mut(s, p)?;
+    if let Some(e) = expires {
+        c.expires = e;
+    }
+    if let Some(mut cats) = categories {
+        cats.truncate(MAX_MESSAGE_CATEGORIES);
+        c.categories = cats;
+    }
+    if let Some(t) = contacts {
+        c.contacts = t;
+    }
+    if let Some(on) = opt_bool(p, "noAutoArchive") {
+        c.no_auto_archive = on;
+    }
+    c.dirty = true;
+    Ok(json!({
+        "expires": c.expires.map(|d| d.to_rfc3339()),
+        "categories": c.categories,
+        "contacts": c.contacts,
+        "noAutoArchive": c.no_auto_archive,
+    }))
+}
+
 fn message_options(s: &mut Session, p: &Value) -> CmdResult {
+    if ["expires", "categories", "contacts", "noAutoArchive"].iter().any(|k| p.get(*k).is_some()) {
+        return set_message_properties(s, p);
+    }
     let cid = compose_id(s, p)?;
     let Some(c) = s.composes.get(&cid) else {
         return Err(CmdError::Disabled(NO_COMPOSE.into()));
@@ -1924,6 +2089,11 @@ fn message_options(s: &mut Session, p: &Value) -> CmdResult {
         "delayUntil": c.delay_until.map(|d| d.to_rfc3339()),
         "encrypt": c.encrypt,
         "sign": c.sign,
+        "expires": c.expires.map(|d| d.to_rfc3339()),
+        "categories": c.categories,
+        "contacts": c.contacts,
+        "noAutoArchive": c.no_auto_archive,
+        "focus": opt_str(p, "focus"),
     });
     dialog(s, "messageOptions", state)
 }
@@ -3524,7 +3694,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Follow Up",
             "Message › Tags",
             "",
-            r#"{"kind":"today"|"tomorrow"|"thisWeek"|"nextWeek"|"noDate"|"custom"|"reminder"|"clear","at"?:string}"#,
+            r#"{"kind":"today"|"tomorrow"|"thisWeek"|"nextWeek"|"noDate"|"custom"|"reminder"|"clear","at"?:string,"label"?:string,"start"?:string,"due"?:string,"reminder"?:string,"flagMe"?:bool,"recipients"?:{"label":string,"due"?:string,"reminder"?:string}|null}"#,
             false,
             has_compose,
             follow_up,
@@ -3554,7 +3724,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Message Options",
             "Message › Tags; Options › Tracking",
             "",
-            "",
+            r#"{"expires"?:string|null,"categories"?:[string],"contacts"?:string,"noAutoArchive"?:bool}  (none: open Properties)"#,
             false,
             has_compose,
             message_options,
@@ -5481,5 +5651,131 @@ Original-Message-ID: <{mid}>\r\nDisposition: manual-action/MDN-sent-manually; di
         assert!(tracking(&s, sent).unwrap().receipts.is_empty());
         set(&mut s, "mail.tracking.updateSentItem", json!(true));
         assert_eq!(tracking(&s, sent).unwrap().receipts.len(), 1);
+    }
+
+    #[test]
+    fn custom_flag_keeps_label_dates_and_reminder_and_flags_recipients() {
+        let mut s = session();
+        let id = open(&mut s);
+        // Nothing flagged yet: Clear Flag is disabled.
+        assert!(matches!(s.run("compose.followUp", &json!({"kind": "clear"})), Err(CmdError::Disabled(_))));
+        let r = s
+            .run(
+                "compose.followUp",
+                &json!({"kind": "custom", "label": "Review", "start": "2026-10-12", "due": "2026-10-14",
+                        "reminder": "2026-10-13 09:30",
+                        "recipients": {"label": "Reply", "due": "2026-10-15", "reminder": "2026-10-15 08:00"}}),
+            )
+            .unwrap();
+        assert_eq!(r["me"]["label"], "Review");
+        match &s.composes[&id].flag {
+            FlagState::Flagged { label, start: Some(a), due: Some(b), reminder: Some(r) } => {
+                assert_eq!(label, "Review");
+                assert_eq!(
+                    (a.civil(0).day, b.civil(0).day, r.civil(0).day, r.civil(0).hour),
+                    (12, 14, 13, 9)
+                );
+            }
+            f => panic!("{f:?}"),
+        }
+        let rf = s.composes[&id].recipient_flag.clone().unwrap();
+        assert_eq!(rf.label, "Reply");
+        // A start after the due date is refused; bad dates too.
+        assert!(
+            s.run("compose.followUp", &json!({"kind": "custom", "start": "2026-10-20", "due": "2026-10-14"}))
+                .is_err()
+        );
+        assert!(s.run("compose.followUp", &json!({"kind": "custom", "due": "someday"})).is_err());
+        assert!(s.run("compose.followUp", &json!({"kind": "custom", "recipients": 7})).is_err());
+        // Sent: the recipients' flag travels in the headers and the sent copy keeps the sender's own flag.
+        s.run("compose.setTo", &json!({"value": "ann@example.org"})).unwrap();
+        s.run("compose.setSubject", &json!({"value": "Budget"})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        let raw = outbox_raw(&s);
+        assert!(raw.contains("X-Message-Flag: Reply\r\n"), "{raw}");
+        assert!(raw.contains("Reply-By: Thu, 15 Oct 2026"), "{raw}");
+        assert!(raw.contains("X-MailCraft-Flag-Reminder: Thu, 15 Oct 2026 08:00"), "{raw}");
+        let sent = &s.mailbox.mail[in_role(&s, FolderRole::Outbox).iter().max().unwrap()];
+        assert!(matches!(&sent.flag, FlagState::Flagged { label, .. } if label == "Review"));
+        // Received, the message is flagged for follow-up with the due date and reminder.
+        let msg = mailcraft_mime::parse(raw.as_bytes()).unwrap();
+        let got = MailItem::from_message(&msg, raw.as_bytes(), s.now());
+        match got.flag {
+            FlagState::Flagged { label, due: Some(d), reminder: Some(r), .. } => {
+                assert_eq!(label, "Reply");
+                assert_eq!((d.civil(0).day, r.civil(0).hour), (15, 8));
+            }
+            f => panic!("{f:?}"),
+        }
+        // A reminder time from before the message arrived would pop a window the moment it lands: dropped,
+        // the flag stays.
+        let early = "From: x@example.net\r\nTo: ann@example.org\r\nDate: Fri, 09 Oct 2026 12:00:00 +0000\r\n\
+                     X-Message-Flag: Urgent\r\nX-MailCraft-Flag-Reminder: Mon, 05 Oct 2026 08:00:00 +0000\r\n\
+                     Subject: Act now\r\n\r\nHi\r\n";
+        let msg = mailcraft_mime::parse(early.as_bytes()).unwrap();
+        let got = MailItem::from_message(&msg, early.as_bytes(), s.now());
+        assert!(matches!(got.flag, FlagState::Flagged { reminder: None, .. }), "{:?}", got.flag);
+    }
+
+    #[test]
+    fn flag_for_recipients_only_and_clear() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run("compose.followUp", &json!({"kind": "custom", "flagMe": false, "recipients": {"label": "  "}}))
+            .unwrap();
+        assert_eq!(s.composes[&id].flag, FlagState::None);
+        assert_eq!(s.composes[&id].recipient_flag.as_ref().unwrap().label, "Follow up", "empty label");
+        s.run("compose.followUp", &json!({"kind": "clear"})).unwrap();
+        assert!(s.composes[&id].recipient_flag.is_none());
+        // The legacy single-date form still works.
+        s.run("compose.followUp", &json!({"kind": "reminder", "at": "2026-10-10 16:00"})).unwrap();
+        assert!(matches!(s.composes[&id].flag, FlagState::Flagged { reminder: Some(_), .. }));
+        // Without values the dialog opens.
+        assert_eq!(s.run("compose.followUp", &json!({"kind": "custom"})).unwrap()["dialog"], "customFlag");
+        // A drafted message carries no recipient flag headers.
+        s.run("compose.followUp", &json!({"kind": "custom", "recipients": {"label": "Read"}})).unwrap();
+        let draft = save_draft(&mut s, id).unwrap();
+        let raw = String::from_utf8_lossy(s.mailbox.mail[&draft].raw.as_ref().unwrap()).into_owned();
+        assert!(!raw.contains("X-Message-Flag"), "{raw}");
+    }
+
+    #[test]
+    fn properties_expiry_categories_contacts_and_archive() {
+        let mut s = session();
+        let id = open(&mut s);
+        let r = s
+            .run(
+                "compose.messageOptions",
+                &json!({"expires": "2026-10-30 17:00", "categories": ["Red", "red", "Blue"],
+                        "contacts": "Ann Lee; Bo Ek;", "noAutoArchive": true}),
+            )
+            .unwrap();
+        assert_eq!(r["categories"], json!(["Red", "Blue"]));
+        assert_eq!(r["contacts"], "Ann Lee; Bo Ek");
+        let c = &s.composes[&id];
+        assert!(c.no_auto_archive && c.expires.is_some());
+        // The dialog shows them.
+        s.run("compose.messageOptions", &json!({})).unwrap();
+        let shown = s.notices.iter().rev().find_map(|n| match n {
+            Notice::OpenDialog(name, p) if name == "messageOptions" => Some(p.clone()),
+            _ => None,
+        });
+        assert_eq!(shown.unwrap()["contacts"], "Ann Lee; Bo Ek");
+        s.run("compose.setTo", &json!({"value": "ann@example.org"})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        assert!(
+            outbox_raw(&s).contains("Expiry-Date: Fri, 30 Oct 2026 17:00:00 +0000"),
+            "{}",
+            outbox_raw(&s)
+        );
+        let sent = &s.mailbox.mail[in_role(&s, FolderRole::Outbox).iter().max().unwrap()];
+        assert_eq!(sent.categories, ["Red", "Blue"]);
+        assert_eq!(sent.contacts, ["Ann Lee", "Bo Ek"]);
+        assert!(sent.no_auto_archive);
+        let id2 = open(&mut s);
+        assert!(s.run("compose.messageOptions", &json!({"compose": id2, "expires": "never"})).is_err());
+        assert!(s.run("compose.messageOptions", &json!({"compose": id2, "categories": 4})).is_err());
+        s.run("compose.messageOptions", &json!({"compose": id2, "expires": null})).unwrap();
+        assert!(s.composes[&id2].expires.is_none());
     }
 }

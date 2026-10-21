@@ -1,5 +1,6 @@
-//! Whole-text checking: spelling issues plus three simple grammar checks (repeated words, a capital letter at
-//! the start of a sentence, more than one space between words).
+//! Whole-text checking: spelling issues, the mechanical checks (repeated words, a capital letter at the start
+//! of a sentence, more than one space between words), the grammar rules of [`crate::rules`] (agreement,
+//! punctuation, commonly confused words) and the writing refinements of [`crate::refine`].
 
 use crate::speller::{Case, Speller, title_case};
 use crate::tokenize::{Token, looks_like_address, tokenize};
@@ -15,12 +16,98 @@ pub enum IssueKind {
     Capitalization,
     /// Two or more spaces between words.
     DoubleSpace,
+    /// Article or subject-verb agreement ("a apple", "she don't").
+    Agreement,
+    /// Spacing around punctuation, doubled marks ("word ,", "one,two", ",,").
+    Punctuation,
+    /// A commonly confused word ("could of", "their is", "better then").
+    ConfusedWord,
+    /// Refinement (conciseness): a wordy phrase ("in order to").
+    Wordiness,
+    /// Refinement (clarity): passive voice ("was sent by").
+    PassiveVoice,
+    /// Refinement: a cliché ("at the end of the day").
+    Cliche,
+    /// Refinement: an informal word or texting abbreviation ("gonna", "thx", "!!").
+    Formality,
+    /// Refinement: wording that leaves people out ("chairman", "manpower").
+    Inclusive,
 }
 
 impl IssueKind {
-    /// Whether the editor draws it as a spelling (red) or grammar (blue) squiggle.
+    /// Every kind, in Editor pane order.
+    pub const ALL: [IssueKind; 12] = [
+        IssueKind::Spelling,
+        IssueKind::RepeatedWord,
+        IssueKind::Capitalization,
+        IssueKind::DoubleSpace,
+        IssueKind::Agreement,
+        IssueKind::Punctuation,
+        IssueKind::ConfusedWord,
+        IssueKind::PassiveVoice,
+        IssueKind::Wordiness,
+        IssueKind::Cliche,
+        IssueKind::Formality,
+        IssueKind::Inclusive,
+    ];
+
+    /// Whether the editor draws it as a grammar (blue) rather than a spelling (red) squiggle: every
+    /// correction that is not a misspelling. Refinements are neither ([`IssueKind::is_refinement`]).
     pub fn is_grammar(self) -> bool {
-        !matches!(self, IssueKind::Spelling)
+        !matches!(self, IssueKind::Spelling) && !self.is_refinement()
+    }
+
+    /// Whether it is a writing refinement (advice) rather than a correction.
+    pub fn is_refinement(self) -> bool {
+        matches!(
+            self,
+            IssueKind::Wordiness
+                | IssueKind::PassiveVoice
+                | IssueKind::Cliche
+                | IssueKind::Formality
+                | IssueKind::Inclusive
+        )
+    }
+
+    /// Stable identifier ("spelling", "repeated", "agreement", "passive"…).
+    pub fn id(self) -> &'static str {
+        match self {
+            IssueKind::Spelling => "spelling",
+            IssueKind::RepeatedWord => "repeated",
+            IssueKind::Capitalization => "capitalization",
+            IssueKind::DoubleSpace => "doubleSpace",
+            IssueKind::Agreement => "agreement",
+            IssueKind::Punctuation => "punctuation",
+            IssueKind::ConfusedWord => "confused",
+            IssueKind::Wordiness => "wordiness",
+            IssueKind::PassiveVoice => "passive",
+            IssueKind::Cliche => "cliche",
+            IssueKind::Formality => "formality",
+            IssueKind::Inclusive => "inclusive",
+        }
+    }
+
+    /// The kind with identifier `id` ([`IssueKind::id`]).
+    pub fn from_id(id: &str) -> Option<IssueKind> {
+        IssueKind::ALL.into_iter().find(|k| k.id() == id)
+    }
+
+    /// The Editor pane group: "spelling" and "grammar" (corrections), "clarity", "conciseness", "cliches",
+    /// "formality", "inclusiveness" (refinements).
+    pub fn category(self) -> &'static str {
+        match self {
+            IssueKind::Spelling | IssueKind::RepeatedWord => "spelling",
+            IssueKind::Capitalization
+            | IssueKind::DoubleSpace
+            | IssueKind::Agreement
+            | IssueKind::Punctuation
+            | IssueKind::ConfusedWord => "grammar",
+            IssueKind::PassiveVoice => "clarity",
+            IssueKind::Wordiness => "conciseness",
+            IssueKind::Cliche => "cliches",
+            IssueKind::Formality => "formality",
+            IssueKind::Inclusive => "inclusiveness",
+        }
     }
 }
 
@@ -90,11 +177,38 @@ impl Speller {
         if self.options().check_grammar {
             sentence_capitals(text, &tokens, &mut issues);
             double_spaces(text, &mut issues);
+            crate::rules::check(text, &tokens, self.options().confused_words, &mut issues);
         }
+        crate::refine::check(text, &tokens, self.options().refinements, &mut issues);
         issues.truncate(MAX_ISSUES);
-        issues.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
-        issues
+        dedupe(issues)
     }
+}
+
+/// Sorts issues by position and drops a grammar issue that overlaps a kept one, and a refinement that
+/// overlaps a kept correction or refinement (a misspelling inside either is kept: both are useful).
+fn dedupe(mut issues: Vec<Issue>) -> Vec<Issue> {
+    let rank = |k: IssueKind| match k {
+        IssueKind::Spelling => 0,
+        k if k.is_refinement() => 2,
+        _ => 1,
+    };
+    issues
+        .sort_by(|a, b| rank(a.kind).cmp(&rank(b.kind)).then(a.start.cmp(&b.start)).then(a.end.cmp(&b.end)));
+    let mut kept: Vec<Issue> = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let clash = rank(issue.kind) > 0
+            && kept.iter().any(|k| {
+                rank(k.kind) > 0
+                    && k.start < issue.end.max(issue.start.saturating_add(1))
+                    && issue.start < k.end.max(k.start.saturating_add(1))
+            });
+        if !clash {
+            kept.push(issue);
+        }
+    }
+    kept.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+    kept
 }
 
 fn is_word(w: &str) -> bool {

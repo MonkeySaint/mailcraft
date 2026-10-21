@@ -15,7 +15,9 @@
 //! - [`tokenize`]: `(start, end, word)` byte ranges on Unicode word boundaries (UAX #29), with addresses kept
 //!   whole.
 //! - [`Speller::check_text`]: every [`Issue`] in a text: spelling, repeated words ("the the"), lower-case
-//!   sentence starts, double spaces.
+//!   sentence starts, double spaces, grammar rules (article and pronoun-verb agreement, punctuation spacing,
+//!   commonly confused words) and the writing refinements switched on in [`SpellOptions::refinements`]
+//!   (passive voice, wordy phrases, clichés, informal words, inclusive language).
 //!
 //! - [`thesaurus::lookup`]: related words from the bundled Moby Thesaurus II (Review › Thesaurus).
 //!
@@ -25,11 +27,14 @@
 mod dict;
 mod distance;
 mod grammar;
+mod refine;
+mod rules;
 mod speller;
 pub mod thesaurus;
 mod tokenize;
 
 pub use distance::keys_adjacent;
 pub use grammar::{Issue, IssueKind, MAX_ISSUES};
+pub use refine::Refinements;
 pub use speller::{MAX_USER_WORDS, MAX_WORD_CHARS, SpellOptions, Speller};
 pub use tokenize::{Token, looks_like_address, tokenize};

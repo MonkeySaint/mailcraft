@@ -1075,6 +1075,7 @@ The badge reader is down. Please use the side door today.";
                     end: i + 5,
                     kind: String::new(),
                     suggestions: vec![],
+                    message: String::new(),
                 })
                 .into_iter()
                 .collect()
@@ -1088,6 +1089,7 @@ The badge reader is down. Please use the side door today.";
                     end: i + 5,
                     kind: String::new(),
                     suggestions: vec![],
+                    message: String::new(),
                 })
                 .into_iter()
                 .collect()

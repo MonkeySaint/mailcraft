@@ -20,16 +20,22 @@ pub mod icons;
 #[cfg(test)]
 mod link_tests;
 mod math;
+mod send_calendar;
 pub mod shapes;
 pub mod smartart;
 mod table_draw;
+
 pub use math::{MAX_EQUATION, equation_png};
+use send_calendar::calendar;
+pub use send_calendar::{
+    DETAILS as CALENDAR_DETAILS, LAYOUTS as CALENDAR_LAYOUTS, RANGES as CALENDAR_RANGES, calendar_folders,
+};
 
 use serde_json::{Value, json};
 
 use super::compose::{
-    add_bookmark, compose_id, compose_mut, file_param, has_body_selection, has_compose, mime_for, parse_when,
-    pos_json, rich_compose, safe_name, spec, vcard,
+    add_bookmark, compose_id, compose_mut, file_param, has_body_selection, has_compose, mime_for, pos_json,
+    rich_compose, safe_name, spec, vcard,
 };
 use crate::cmd::util::{dialog, opt_bool, opt_str, req_str};
 use crate::compose::{
@@ -37,9 +43,8 @@ use crate::compose::{
 };
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_geom::Color;
-use mailcraft_model::dates::ListTime;
 use mailcraft_model::rich::{Align, TableCell};
-use mailcraft_model::{Block, BusyStatus, DateTime, Doc, FolderKind, Inline, ItemId, ParaStyle, TextStyle};
+use mailcraft_model::{Block, BusyStatus, DateTime, Doc, Inline, ItemId, ParaStyle, TextStyle};
 
 /// Largest picture / object file accepted.
 pub const MAX_PICTURE_BYTES: u64 = 50 * 1024 * 1024;
@@ -2716,7 +2721,11 @@ fn every_block(s: &Session, cid: u64) -> Vec<BuildingBlock> {
 /// The profile's building blocks that pass `keep`, then those only on open composes (newer entries of the
 /// same gallery and name win). Only the kept entries are copied.
 fn merged_blocks(s: &Session, cid: u64, keep: impl Fn(&BuildingBlock) -> bool) -> Vec<BuildingBlock> {
-    let mut out: Vec<BuildingBlock> = profile_blocks(s).iter().filter(|b| keep(b)).cloned().collect();
+    let mut out: Vec<BuildingBlock> = builtin_auto_text(s).into_iter().filter(|b| keep(b)).collect();
+    for b in profile_blocks(s).iter().filter(|b| keep(b)) {
+        out.retain(|x| !(x.gallery == b.gallery && x.name.eq_ignore_ascii_case(&b.name)));
+        out.push(b.clone());
+    }
     let own = s.composes.get(&cid).into_iter();
     let others = s.composes.iter().filter(|(k, _)| **k != cid).map(|(_, c)| c);
     for b in others.chain(own).flat_map(|c| c.building_blocks.iter()).filter(|b| keep(b)) {
@@ -2724,6 +2733,164 @@ fn merged_blocks(s: &Session, cid: u64, keep: impl Fn(&BuildingBlock) -> bool) -
         out.push(b.clone());
     }
     out
+}
+
+/// The user's name: General › User name, else the default account's sender name.
+pub fn user_name(s: &Session) -> String {
+    let name = s.settings.text("general.userName");
+    if !name.trim().is_empty() {
+        return name.trim().to_owned();
+    }
+    s.mailbox
+        .accounts
+        .iter()
+        .find(|a| a.is_default)
+        .or_else(|| s.mailbox.accounts.first())
+        .map(|a| a.sender_name.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// The user's initials: General › Initials, else the first letter of each word of [`user_name`].
+pub fn user_initials(s: &Session) -> String {
+    let initials = s.settings.text("general.initials");
+    if !initials.trim().is_empty() {
+        return initials.trim().to_owned();
+    }
+    user_name(s)
+        .split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .flat_map(char::to_uppercase)
+        .take(8)
+        .collect()
+}
+
+/// Setting that lists the built-in AutoText entries the user deleted or renamed (a JSON list of names).
+const HIDDEN_BUILTINS_KEY: &str = "state.autoText.hiddenBuiltins";
+
+/// Names of the built-in AutoText entries the user deleted or renamed.
+fn hidden_builtins(s: &Session) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(&s.settings.text(HIDDEN_BUILTINS_KEY)).unwrap_or_default()
+}
+
+/// Hides the built-in AutoText entry `name` (Building Blocks Organizer › Delete or Edit Properties of it), so
+/// it does not come back. Returns whether there was one to hide.
+fn hide_builtin(s: &mut Session, name: &str) -> Result<bool, CmdError> {
+    if !builtin_auto_text(s).iter().any(|b| b.name.eq_ignore_ascii_case(name)) {
+        return Ok(false);
+    }
+    let mut hidden = hidden_builtins(s);
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    hidden.push(name.trim().to_owned());
+    // The list keeps the newest names when it runs long (the names follow General › User name).
+    let text = loop {
+        let text = serde_json::to_string(&hidden).unwrap_or_default();
+        if text.chars().count() <= MAX_HIDDEN_BUILTINS_CHARS || hidden.is_empty() {
+            break text;
+        }
+        hidden.remove(0);
+    };
+    s.settings.set(HIDDEN_BUILTINS_KEY, &json!(text))?;
+    Ok(true)
+}
+
+/// Longest [`HIDDEN_BUILTINS_KEY`] value (chars).
+const MAX_HIDDEN_BUILTINS_CHARS: usize = 512;
+
+/// AutoText entries every profile starts with: the user's name and initials (General › User name and
+/// Initials). Saving an entry of the same name replaces one; deleting or renaming one hides it for good.
+fn builtin_auto_text(s: &Session) -> Vec<BuildingBlock> {
+    let hidden = hidden_builtins(s);
+    let mut out = Vec::new();
+    for text in [user_name(s), user_initials(s)] {
+        let text: String = text.chars().take(MAX_BLOCK_NAME).collect();
+        if text.is_empty()
+            || out.iter().any(|b: &BuildingBlock| b.name.eq_ignore_ascii_case(&text))
+            || hidden.iter().any(|h| h.eq_ignore_ascii_case(text.trim()))
+        {
+            continue;
+        }
+        out.push(BuildingBlock {
+            gallery: "autoText".into(),
+            name: text.clone(),
+            blocks: vec![Block::text_paragraph(&text)],
+            category: DEFAULT_CATEGORY.into(),
+            description: String::new(),
+        });
+    }
+    out
+}
+
+/// Shortest typed start that finds an AutoText entry by the beginning of its name.
+pub const AUTO_TEXT_MIN_PREFIX: usize = 4;
+
+/// The AutoText entry the word before the caret names: the entry of that name, else the only entry whose
+/// name starts with it (at least [`AUTO_TEXT_MIN_PREFIX`] chars typed).
+pub fn auto_text_match(s: &Session, cid: u64) -> Option<(usize, String, BuildingBlock)> {
+    let (offset, before) = s.composes.get(&cid)?.text_before_caret(MAX_BLOCK_NAME)?;
+    let before: Vec<char> = before.chars().collect();
+    let entries = gallery_entries(s, cid, "autoText");
+    // For each entry, the longest run of typed text that starts a word and begins the entry's name (the
+    // whole name, or at least AUTO_TEXT_MIN_PREFIX chars of it).
+    let mut best: Option<(usize, &BuildingBlock)> = None;
+    let mut tie = false;
+    for b in entries.iter().rev() {
+        let name: Vec<char> = b.name.chars().flat_map(char::to_lowercase).collect();
+        let fits = (1..=name.len().min(before.len())).rev().find(|&k| {
+            let start = before.len().saturating_sub(k);
+            let at_word =
+                start == 0 || before.get(start.saturating_sub(1)).is_some_and(|c| !c.is_alphanumeric());
+            let typed: Vec<char> =
+                before.get(start..).unwrap_or_default().iter().flat_map(|c| c.to_lowercase()).collect();
+            at_word
+                && name.get(..typed.len()) == Some(typed.as_slice())
+                && (k == name.len() || k >= AUTO_TEXT_MIN_PREFIX)
+        });
+        let Some(k) = fits else { continue };
+        match best {
+            Some((bk, _)) if bk > k => {}
+            Some((bk, _)) if bk == k => tie = true,
+            _ => {
+                best = Some((k, b));
+                tie = false;
+            }
+        }
+    }
+    let (k, b) = best?;
+    // Two entries that start the same way are ambiguous unless one is typed out in full.
+    if tie && b.name.chars().count() != k {
+        return None;
+    }
+    let start = before.len().saturating_sub(k);
+    let word: String = before.get(start..).unwrap_or_default().iter().collect();
+    Some((offset.saturating_add(start), word, b.clone()))
+}
+
+/// Insert › Quick Parts › AutoText while typing (F3): the word before the caret becomes the AutoText entry
+/// it names. `peek` only reports the entry (for a typing tip).
+fn auto_text(s: &mut Session, p: &Value) -> CmdResult {
+    let cid = compose_id(s, p)?;
+    let Some((start, word, block)) = auto_text_match(s, cid) else {
+        return Err(CmdError::Failed("no AutoText entry matches the word before the cursor".into()));
+    };
+    if opt_bool(p, "peek") == Some(true) {
+        return Ok(json!({"word": word, "name": block.name}));
+    }
+    let c = compose_mut(s, p)?;
+    c.checkpoint();
+    let focus = c.selection.focus.clone();
+    c.selection = crate::compose::BodySelection { anchor: DocPos::new(focus.path.clone(), start), focus };
+    c.delete_selection();
+    let single = matches!(block.blocks.as_slice(), [Block::Paragraph { .. }]);
+    if single {
+        c.insert_fragment(
+            &Doc { blocks: block.blocks.clone(), ..Default::default() },
+            crate::compose::PasteMode::KeepSource,
+        );
+    } else {
+        c.insert_blocks(block.blocks.clone());
+    }
+    c.dirty = true;
+    Ok(json!({"word": word, "inserted": block.name, "caret": caret(c)}))
 }
 
 /// Named list styles (Define New List Style): name and level formats, oldest first. Entries that do not
@@ -2848,16 +3015,20 @@ fn quick_part(s: &mut Session, p: &Value) -> CmdResult {
         let mut saved = load_building_blocks(s);
         let before = saved.len();
         saved.retain(|b| !matches(b));
-        let mut removed = before - saved.len();
+        let mut removed = before.saturating_sub(saved.len());
         for c in s.composes.values_mut() {
             let n = c.building_blocks.len();
             c.building_blocks.retain(|b| !matches(b));
-            removed = removed.max(n - c.building_blocks.len());
+            removed = removed.max(n.saturating_sub(c.building_blocks.len()));
         }
-        if removed == 0 {
+        // A built-in entry of that name (the user's name or initials) goes too, and stays gone.
+        let builtin = gallery.is_none_or(|g| g == "autoText") && hide_builtin(s, &name)?;
+        if removed == 0 && !builtin {
             return Err(CmdError::Params(format!("no saved entry `{name}`")));
         }
-        save_building_blocks(s, &saved)?;
+        if removed > 0 {
+            save_building_blocks(s, &saved)?;
+        }
         return Ok(json!({"deleted": name}));
     }
     let found = find_block(s, cid, gallery, &name)
@@ -2996,6 +3167,10 @@ fn edit_block(s: &mut Session, p: &Value, cid: u64, gallery: Option<&str>, name:
         return Err(CmdError::Params(format!("an entry named `{new_name}` is already in that gallery")));
     }
     let old = (found.gallery.clone(), found.name.clone());
+    // Renaming or moving a built-in entry replaces it: the built-in one is hidden, not left as a duplicate.
+    if moved && old.0 == "autoText" {
+        hide_builtin(s, &old.1)?;
+    }
     let is_old = |b: &BuildingBlock| b.gallery == old.0 && b.name.eq_ignore_ascii_case(&old.1);
     let mut saved = load_building_blocks(s);
     saved.retain(|b| !is_old(b));
@@ -3126,96 +3301,6 @@ fn busy_label(b: BusyStatus) -> &'static str {
         BusyStatus::Busy => "Busy",
         BusyStatus::OutOfOffice => "Out of Office",
     }
-}
-
-fn calendar(s: &mut Session, p: &Value) -> CmdResult {
-    let (Some(from), Some(to)) = (opt_str(p, "from"), opt_str(p, "to").or_else(|| opt_str(p, "from"))) else {
-        return dialog(s, "insertCalendar", json!({"compose": compose_id(s, p)?}));
-    };
-    let start =
-        parse_when(s, from).ok_or_else(|| CmdError::Params(format!("cannot read the date `{from}`")))?;
-    let end_day =
-        parse_when(s, to).ok_or_else(|| CmdError::Params(format!("cannot read the date `{to}`")))?;
-    let tz = s.tz_offset_min;
-    let (d0, d1) = (start.day_number(tz), end_day.day_number(tz));
-    if d1 < d0 || d1.saturating_sub(d0) > 366 {
-        return Err(CmdError::Params("the date range must run forwards and span at most a year".into()));
-    }
-    let detail = opt_str(p, "detail").unwrap_or("limited");
-    if !matches!(detail, "availability" | "limited" | "full") {
-        return Err(CmdError::Params(format!("unknown detail `{detail}`")));
-    }
-    let cal_filter = opt_str(p, "calendar");
-    let folders: Vec<mailcraft_model::FolderId> = s
-        .mailbox
-        .folders
-        .values()
-        .filter(|f| f.kind == FolderKind::Calendar)
-        .filter(|f| cal_filter.is_none_or(|c| f.name.eq_ignore_ascii_case(c) || f.id.0.to_string() == c))
-        .map(|f| f.id)
-        .collect();
-    if folders.is_empty() {
-        return Err(CmdError::Params("no such calendar".into()));
-    }
-    let cal_name = cal_filter.unwrap_or("Calendar").to_owned();
-    let mut appts: Vec<&mailcraft_model::Appointment> = s
-        .mailbox
-        .appointments
-        .values()
-        .filter(|a| folders.contains(&a.folder))
-        .filter(|a| a.end.day_number(tz) >= d0 && a.start.day_number(tz) <= d1)
-        .collect();
-    appts.sort_by_key(|a| a.start.unix);
-    let bold = |t: String| Block::Paragraph {
-        style: ParaStyle::default(),
-        inlines: vec![Inline::Text { text: t, style: TextStyle { bold: Some(true), ..Default::default() } }],
-    };
-    let mut blocks = vec![bold(cal_name)];
-    blocks.push(Block::text_paragraph(&if d0 == d1 {
-        ListTime::long_date(start, tz)
-    } else {
-        format!("{} \u{2013} {}", ListTime::long_date(start, tz), ListTime::long_date(end_day, tz))
-    }));
-    for day in d0..=d1 {
-        let today: Vec<_> =
-            appts.iter().filter(|a| a.start.day_number(tz) <= day && a.end.day_number(tz) >= day).collect();
-        if today.is_empty() {
-            continue;
-        }
-        let day_t = DateTime::from_unix(
-            day.saturating_mul(86_400).saturating_sub(i64::from(tz).saturating_mul(60)),
-            tz,
-        );
-        blocks.push(bold(ListTime::long_date(day_t, tz)));
-        let mut items = Vec::new();
-        for a in today {
-            let when = if a.all_day {
-                "All day".to_owned()
-            } else {
-                format!("{} \u{2013} {}", ListTime::clock(a.start, tz), ListTime::clock(a.end, tz))
-            };
-            let line = match detail {
-                "availability" => format!("{when}  {}", busy_label(a.show_as)),
-                _ if a.private => format!("{when}  {}  Private", busy_label(a.show_as)),
-                "limited" => format!("{when}  {}", a.subject),
-                _ => {
-                    let mut l = format!("{when}  {}", a.subject);
-                    if !a.location.is_empty() {
-                        let _ = write!(l, " ({})", a.location);
-                    }
-                    if !a.body.trim().is_empty() {
-                        let _ = write!(l, " \u{2014} {}", a.body.trim().replace('\n', " "));
-                    }
-                    l
-                }
-            };
-            items.push(vec![Block::text_paragraph(&line)]);
-        }
-        blocks.push(Block::List { kind: mailcraft_model::rich::ListKind::Bullet, items });
-    }
-    let n = appts.len();
-    edit(s, p, |c| c.insert_blocks(blocks))?;
-    Ok(json!({"appointments": n, "detail": detail}))
 }
 
 /// A file shown as an icon with its name under it (PNG, logical width × height).
@@ -3355,11 +3440,21 @@ pub fn specs() -> Vec<CommandSpec> {
             business_card,
         ),
         spec(
+            "insert.autoText",
+            "AutoText",
+            "Insert › Quick Parts › AutoText (typing)",
+            "F3",
+            r#"{"peek"?:bool}"#,
+            false,
+            has_compose,
+            auto_text,
+        ),
+        spec(
             "insert.calendar",
             "Calendar",
             "Insert › Include",
             "",
-            r#"{"calendar"?:string,"from"?:string,"to"?:string,"detail"?:"availability"|"limited"|"full"}"#,
+            r#"{"calendar"?:string|number,"range"?:"today"|"tomorrow"|"next7"|"next14"|"next30"|"thisMonth"|"nextMonth","from"?:string,"to"?:string,"detail"?:"availability"|"limited"|"full","layout"?:"schedule"|"list","workingHours"?:bool,"includePrivate"?:bool,"ics"?:bool}"#,
             false,
             rich_compose,
             calendar,
@@ -3575,6 +3670,10 @@ pub(crate) mod tests {
 
     fn setup() -> (Session, u64) {
         let mut s = session();
+        // No user name: the AutoText gallery starts empty.
+        for a in &mut s.mailbox.accounts {
+            a.sender_name.clear();
+        }
         let id = open(&mut s);
         s.run("compose.insertText", &json!({"text": "start"})).unwrap();
         (s, id)
@@ -4366,6 +4465,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn auto_text_starts_with_the_user_and_expands_while_typing() {
+        let mut s = session();
+        s.settings.set("general.userName", &json!("Ann Example")).unwrap();
+        let id = open(&mut s);
+        let names: Vec<String> = gallery_entries(&s, id, "autoText").into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["Ann Example", "AE"], "seeded from General > User name and initials");
+        // F3 after the start of an entry name expands it; the exact name too.
+        s.run("compose.insertText", &json!({"text": "Regards, An"})).unwrap();
+        assert!(s.run("insert.autoText", &json!({})).is_err(), "too short to pick by its start");
+        s.run("compose.insertText", &json!({"text": "n Exa"})).unwrap();
+        let r = s.run("insert.autoText", &json!({"peek": true})).unwrap();
+        assert_eq!(r["name"], "Ann Example");
+        assert_eq!(r["word"], "Ann Exa", "a name of several words is matched across them");
+        assert!(s.composes[&id].body.to_plain_text().trim_end().ends_with("Ann Exa"), "peek inserts nothing");
+        s.run("insert.autoText", &json!({})).unwrap();
+        assert_eq!(s.composes[&id].body.to_plain_text().trim_end(), "Regards, Ann Example");
+        s.run("compose.insertText", &json!({"text": " ae"})).unwrap();
+        s.run("insert.autoText", &json!({})).unwrap();
+        assert_eq!(s.composes[&id].body.to_plain_text().trim_end(), "Regards, Ann Example AE");
+        // Undo puts the typed word back.
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert!(s.composes[&id].body.to_plain_text().trim_end().ends_with(" ae"));
+        // Nothing before the caret.
+        s.run("compose.insertText", &json!({"text": " "})).unwrap();
+        assert!(s.run("insert.autoText", &json!({})).is_err());
+    }
+
+    #[test]
+    fn built_in_auto_text_can_be_deleted_and_renamed() {
+        let mut s = session();
+        s.settings.set("general.userName", &json!("Ann Example")).unwrap();
+        let id = open(&mut s);
+        let names = |s: &Session| -> Vec<String> {
+            gallery_entries(s, id, "autoText").into_iter().map(|b| b.name).collect()
+        };
+        // Delete a seeded entry: it goes, and stays gone.
+        let r = s.run("insert.quickPart", &json!({"name": "AE", "gallery": "autoText", "action": "delete"}));
+        assert_eq!(r.unwrap()["deleted"], "AE");
+        assert_eq!(names(&s), ["Ann Example"]);
+        // Saved under the same name and deleted again: the seeded one does not come back.
+        s.run("compose.insertText", &json!({"text": "AE"})).unwrap();
+        s.run("compose.select", &json!({"compose": id, "all": true})).unwrap();
+        s.run("insert.saveToGallery", &json!({"gallery": "autoText", "name": "AE"})).unwrap();
+        assert_eq!(names(&s), ["Ann Example", "AE"]);
+        s.run("insert.quickPart", &json!({"name": "AE", "action": "delete"})).unwrap();
+        assert_eq!(names(&s), ["Ann Example"]);
+        // Rename the other: one entry under the new name, no duplicate under the old one.
+        s.run(
+            "insert.quickPart",
+            &json!({"name": "Ann Example", "gallery": "autoText", "action": "edit", "newName": "Sign-off"}),
+        )
+        .unwrap();
+        assert_eq!(names(&s), ["Sign-off"]);
+        // Nothing of that name left to delete.
+        assert!(s.run("insert.quickPart", &json!({"name": "Ann Example", "action": "delete"})).is_err());
+        // A hostile setting value is ignored, not trusted.
+        s.settings.set("state.autoText.hiddenBuiltins", &json!("not a list")).unwrap();
+        assert_eq!(names(&s), ["Ann Example", "AE", "Sign-off"]);
+    }
+
+    #[test]
     fn building_blocks_roundtrip() {
         let (mut s, id) = setup();
         let other = open(&mut s);
@@ -4399,6 +4559,9 @@ pub(crate) mod tests {
         assert!(dir.path().join(BUILDING_BLOCKS_FILE).exists());
         // A new session (all compose windows closed) still has the entry.
         let mut s = session();
+        for a in &mut s.mailbox.accounts {
+            a.sender_name.clear();
+        }
         s.store = Some(mailcraft_store::Store::open(dir.path()).unwrap());
         let id = open(&mut s);
         s.run("insert.quickPart", &json!({"gallery": "autoText"})).unwrap();
@@ -4478,7 +4641,13 @@ pub(crate) mod tests {
         assert!(c.body.to_plain_text().contains("Acme"));
         assert_eq!(s.run("insert.businessCard", &json!({})).unwrap()["dialog"], "insertBusinessCard");
 
-        let cal = s.mailbox.folders.values().find(|f| f.kind == FolderKind::Calendar).map(|f| f.id).unwrap();
+        let cal = s
+            .mailbox
+            .folders
+            .values()
+            .find(|f| f.kind == mailcraft_model::FolderKind::Calendar)
+            .map(|f| f.id)
+            .unwrap();
         let aid = s.mailbox.alloc_id();
         let st = DateTime::from_civil(2026, 10, 12, 9, 0, 0, 0).unwrap();
         s.mailbox.appointments.insert(

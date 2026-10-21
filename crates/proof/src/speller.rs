@@ -19,8 +19,14 @@ pub struct SpellOptions {
     pub ignore_internet_and_file_addresses: bool,
     /// Report "the the" (see [`Speller::check_text`]).
     pub flag_repeated_words: bool,
-    /// Run the grammar checks (sentence capitals, double spaces) in [`Speller::check_text`].
+    /// Run the grammar checks (sentence capitals, double spaces, agreement, punctuation, confused words) in
+    /// [`Speller::check_text`].
     pub check_grammar: bool,
+    /// "Frequently confused words": with [`SpellOptions::check_grammar`], flag "could of", "their is",
+    /// "better then", "your welcome" and the like.
+    pub confused_words: bool,
+    /// Writing refinements reported by [`Speller::check_text`] (all on by default).
+    pub refinements: crate::Refinements,
     /// Suggest from the main dictionary only: user-dictionary words still pass the check but are never
     /// offered as replacements ([`Speller::suggest`]).
     pub main_dictionary_only: bool,
@@ -34,6 +40,8 @@ impl Default for SpellOptions {
             ignore_internet_and_file_addresses: true,
             flag_repeated_words: true,
             check_grammar: true,
+            confused_words: true,
+            refinements: crate::Refinements::ALL,
             main_dictionary_only: false,
         }
     }

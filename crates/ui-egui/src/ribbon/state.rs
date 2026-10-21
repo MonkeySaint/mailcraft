@@ -226,6 +226,8 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
         }
         "calview" => calview_on(app, arg),
         "notesIcon" => notes_icon_on(app, arg),
+        // Review › Spelling and Grammar ▾: the remembered mode.
+        "spellmode" => app.s.settings.text("state.review.spellingMode") == arg,
         _ => compose(app, surface).is_some_and(|c| compose_on(c, name, arg)),
     }
 }
@@ -280,6 +282,9 @@ fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str
         "selobj" => c.editor.select_objects,
         "selpane" => c.editor.selection_pane,
         "hc" => c.editor.high_contrast_only,
+        "fhc" => c.editor.font_high_contrast_only,
+        "editorpane" => c.editor.editor_pane,
+        "flagged" => c.flag != mailcraft_model::FlagState::None || c.recipient_flag.is_some(),
         "lightcanvas" => c.light_canvas,
         "vote" => c.voting.eq_ignore_ascii_case(arg),
         "save" => {
@@ -456,7 +461,7 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 49] = [
+pub const SOURCES: [&str; 61] = [
     "shapes:Lines",
     "shapes:Rectangles",
     "shapes:Basic Shapes",
@@ -495,6 +500,8 @@ pub const SOURCES: [&str; 49] = [
     "views:tasks",
     "views:notes",
     "themeColors",
+    "fontThemeColors",
+    "fontColors",
     "themeShades:bg1",
     "themeShades:tx1",
     "themeShades:bg2",
@@ -505,6 +512,16 @@ pub const SOURCES: [&str; 49] = [
     "themeShades:accent4",
     "themeShades:accent5",
     "themeShades:accent6",
+    "fontThemeShades:bg1",
+    "fontThemeShades:tx1",
+    "fontThemeShades:bg2",
+    "fontThemeShades:tx2",
+    "fontThemeShades:accent1",
+    "fontThemeShades:accent2",
+    "fontThemeShades:accent3",
+    "fontThemeShades:accent4",
+    "fontThemeShades:accent5",
+    "fontThemeShades:accent6",
     "highlightPens",
 ];
 
@@ -567,6 +584,36 @@ fn paragraph_spacing_items(app: &App, surface: Surface) -> Vec<DynItem> {
         }
     };
     vec![item(true, para.space_before_px > 0.0), item(false, para.space_after_px > 0.0)]
+}
+
+/// The standard Font Color swatches.
+fn font_colors() -> Vec<DynItem> {
+    mailcraft_engine::cmd::format::FONT_COLORS
+        .iter()
+        .filter_map(|(name, hex)| {
+            let col = mailcraft_geom::Color::parse_hex(hex)?;
+            Some(DynItem {
+                label: (*name).to_owned(),
+                icon: "",
+                swatch: swatch(col),
+                vars: vec![("$color", json!(hex))],
+                on: false,
+            })
+        })
+        .collect()
+}
+
+/// Font Color items; with the menu's High-contrast only on, the colours that are hard to read on the page
+/// are left out.
+fn readable_only(app: &App, surface: Surface, items: Vec<DynItem>) -> Vec<DynItem> {
+    use mailcraft_engine::cmd::format::is_readable_text;
+    if !compose(app, surface).is_some_and(|c| c.editor.font_high_contrast_only) {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|i| i.swatch.is_none_or(|[r, g, b]| is_readable_text(mailcraft_geom::Color::rgb(r, g, b))))
+        .collect()
 }
 
 /// Text Highlight Color pens; with High-contrast only on, the pens that leave text hard to read are hidden.
@@ -1041,10 +1088,16 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
         }
         "views:mail" => mail_view_items(app),
         "themeColors" => theme_items(app, surface, None),
+        "fontThemeColors" => readable_only(app, surface, theme_items(app, surface, None)),
+        "fontColors" => readable_only(app, surface, font_colors()),
         "highlightPens" => highlight_pens(app, surface),
         "paragraphSpacing" => paragraph_spacing_items(app, surface),
         _ if source.starts_with("themeShades:") => {
             theme_items(app, surface, source.strip_prefix("themeShades:"))
+        }
+        // Font Color › Theme Color Shades: High-contrast only applies to the shades too.
+        _ if source.starts_with("fontThemeShades:") => {
+            readable_only(app, surface, theme_items(app, surface, source.strip_prefix("fontThemeShades:")))
         }
         // Signature ▾: the saved signatures (checked: the one in this message).
         "signatures" => {

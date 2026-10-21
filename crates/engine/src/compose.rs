@@ -163,6 +163,21 @@ pub struct Bookmark {
     pub pos: DocPos,
 }
 
+/// Flag for Recipients (Follow Up › Custom): the follow-up flag sent with the message. It travels as
+/// `X-Message-Flag` (the label), RFC 2156 `Reply-By` (the due date) and [`RECIPIENT_REMINDER_HEADER`] (the
+/// reminder), so MailCraft and other clients that read these headers flag the received copy.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecipientFlag {
+    /// "Follow up", "For Your Information", "Reply"…
+    pub label: String,
+    pub due: Option<DateTime>,
+    pub reminder: Option<DateTime>,
+}
+
+/// Header carrying a Flag for Recipients reminder time (RFC 5322 date).
+pub const RECIPIENT_REMINDER_HEADER: &str = mailcraft_model::item::RECIPIENT_REMINDER_HEADER;
+
 /// One in-app clipboard entry.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClipEntry {
@@ -240,6 +255,7 @@ pub struct NamedStyle {
 
 /// Editor-only view toggles.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EditorFlags {
     pub show_marks: bool,
     pub show_gridlines: bool,
@@ -249,6 +265,10 @@ pub struct EditorFlags {
     pub clipboard_pane: bool,
     /// Highlight palette shows only high-contrast colours.
     pub high_contrast_only: bool,
+    /// Font Color palette shows only high-contrast colours.
+    pub font_high_contrast_only: bool,
+    /// The Editor pane (Review › Editor): issue counts, score, corrections and refinements.
+    pub editor_pane: bool,
 }
 
 /// One editor undo step.
@@ -336,6 +356,17 @@ pub struct ComposeState {
     pub delay_until: Option<DateTime>,
     /// Follow-up flag set on the outgoing message.
     pub flag: FlagState,
+    /// Flag for Recipients: the flag the recipients' copies carry (`None` = no flag for them).
+    pub recipient_flag: Option<RecipientFlag>,
+    /// Properties › "Expires after": the message is marked expired after this time (RFC 4021
+    /// `Expiry-Date`); `None` = the Options default ("Mark messages as expired after this many days").
+    pub expires: Option<DateTime>,
+    /// Properties › Categories: categories of the sent copy (and of the draft).
+    pub categories: Vec<String>,
+    /// Properties › Contacts: people this message is linked to, as typed ("Ann Lee; Bo Ek").
+    pub contacts: String,
+    /// Properties › "Do not AutoArchive this item" (the sent copy keeps it).
+    pub no_auto_archive: bool,
     /// Voting button choices ("Yes;No"), empty = none.
     pub voting: String,
     /// This compose answers a voting message with this choice (sent as the vote header).
@@ -367,7 +398,9 @@ pub struct ComposeState {
     pub language: Option<String>,
     /// Review › Language › "Do not check spelling or grammar".
     pub no_proof: bool,
-    /// In-app clipboard history (newest last).
+    /// In-app clipboard history (newest last). Never saved with the message state: it can hold what was
+    /// copied in other programs.
+    #[serde(skip)]
     pub clipboard: Vec<ClipEntry>,
     pub building_blocks: Vec<BuildingBlock>,
     /// Marker formats of the body's lists (see [`ListFormatEntry`]).
@@ -482,6 +515,9 @@ pub struct SpellIssue {
     pub kind: String,
     /// Replacement suggestions (best first; may be empty, filled lazily by the checker).
     pub suggestions: Vec<String>,
+    /// What the checker says about it (empty for a plain misspelling).
+    #[serde(default)]
+    pub message: String,
 }
 
 /// One issue a spelling checker reports for a text: char range `[start, end)` and kind.
@@ -491,6 +527,8 @@ pub struct TextIssue {
     pub end: usize,
     pub kind: String,
     pub suggestions: Vec<String>,
+    /// What the checker says about it.
+    pub message: String,
 }
 
 /// Table cell navigation (Tab / Shift+Tab / arrow keys between rows).
@@ -1154,6 +1192,34 @@ impl ComposeState {
             store_leaf(&mut self.body.blocks, &path, &flat);
         }
         self.dirty = true;
+    }
+
+    /// The word that ends at a collapsed caret (letters, digits, apostrophes and hyphens), with the char
+    /// offset where it starts in the caret's paragraph; `None` with a selection or nothing typed before it.
+    pub fn word_before_caret(&self) -> Option<(usize, String)> {
+        let (start, text) = self.text_before_caret(usize::MAX)?;
+        let is_word = |c: char| c.is_alphanumeric() || c == '\'' || c == '-';
+        let chars: Vec<char> = text.chars().collect();
+        let mut s = chars.len();
+        while s > 0 && chars.get(s.saturating_sub(1)).is_some_and(|c| is_word(*c)) {
+            s = s.saturating_sub(1);
+        }
+        let word: String = chars.get(s..)?.iter().collect();
+        (!word.is_empty()).then_some((start.saturating_add(s), word))
+    }
+
+    /// Up to `max` chars of the caret's paragraph before a collapsed caret, with the char offset where they
+    /// start; `None` with a selection.
+    pub fn text_before_caret(&self, max: usize) -> Option<(usize, String)> {
+        if !self.selection.is_collapsed() {
+            return None;
+        }
+        let pos = &self.selection.focus;
+        let (_, flat) = leaf(&self.body.blocks, &pos.path)?;
+        let chars: Vec<char> = flat.text().chars().collect();
+        let end = pos.offset.min(chars.len());
+        let start = end.saturating_sub(max);
+        Some((start, chars.get(start..end)?.iter().collect()))
     }
 
     /// Extends a collapsed selection to the word around the caret.
@@ -2631,6 +2697,7 @@ impl ComposeState {
                     word,
                     kind: if ti.kind.is_empty() { "spelling".into() } else { ti.kind },
                     suggestions: ti.suggestions,
+                    message: ti.message,
                 });
                 if out.len() >= MAX_SPELL_ISSUES {
                     break 'leaves;
@@ -2642,11 +2709,14 @@ impl ComposeState {
         true
     }
 
-    /// The cached issue at `pos` (inside or at either end of its range).
+    /// The cached issue at `pos`: the one starting there, else one containing it (inside or at either end of
+    /// its range).
     pub fn spell_issue_at(&self, pos: &DocPos) -> Option<&SpellIssue> {
-        self.spell_issues
-            .iter()
-            .find(|i| i.start.path == pos.path && i.start.offset <= pos.offset && pos.offset <= i.end.offset)
+        self.spell_issues.iter().find(|i| i.start == *pos).or_else(|| {
+            self.spell_issues.iter().find(|i| {
+                i.start.path == pos.path && i.start.offset <= pos.offset && pos.offset <= i.end.offset
+            })
+        })
     }
 
     /// The first cached issue after the selection, wrapping to the first one (F7 / Next).
@@ -6584,6 +6654,7 @@ mod depth_tests {
                     end: i + 3,
                     kind: String::new(),
                     suggestions: vec!["the".into()],
+                    message: String::new(),
                 });
                 i += 3;
             } else {
@@ -6888,7 +6959,13 @@ mod review_tests {
         let mut c = state(vec![para("teh cat")]);
         c.refresh_spelling(true, &mut |t: &str| {
             if t.starts_with("teh") {
-                vec![TextIssue { start: 0, end: 3, kind: "spelling".into(), suggestions: vec![] }]
+                vec![TextIssue {
+                    start: 0,
+                    end: 3,
+                    kind: "spelling".into(),
+                    suggestions: vec![],
+                    message: String::new(),
+                }]
             } else {
                 Vec::new()
             }
@@ -6919,7 +6996,13 @@ mod review_tests {
         assert_eq!(c.quoted_start(), Some(3));
         c.refresh_spelling(true, &mut |t: &str| {
             if t.starts_with("teh") {
-                vec![TextIssue { start: 0, end: 3, kind: "spelling".into(), suggestions: vec![] }]
+                vec![TextIssue {
+                    start: 0,
+                    end: 3,
+                    kind: "spelling".into(),
+                    suggestions: vec![],
+                    message: String::new(),
+                }]
             } else {
                 Vec::new()
             }
@@ -7019,6 +7102,7 @@ mod review_tests {
                         end: i + 2,
                         kind: "doubleSpace".into(),
                         suggestions: vec![" ".into()],
+                        message: String::new(),
                     });
                     i += 2;
                 } else {

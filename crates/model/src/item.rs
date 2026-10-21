@@ -39,6 +39,12 @@ pub enum FlagState {
     },
 }
 
+/// Header carrying the reminder time of a flag set for the recipients (RFC 5322 date; MailCraft's own).
+pub const RECIPIENT_REMINDER_HEADER: &str = "X-MailCraft-Flag-Reminder";
+
+/// Longest flag label kept from a received message.
+pub const MAX_FLAG_LABEL_CHARS: usize = 255;
+
 /// Last response sent for this message (drives the replied/forwarded row icon and the info bar).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResponseState {
@@ -165,6 +171,9 @@ pub struct MailItem {
     /// Local only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always_move_to: Option<FolderId>,
+    /// Properties › Contacts: people the message is linked to (names or addresses as typed). Local only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacts: Vec<String>,
 }
 
 impl MailItem {
@@ -208,10 +217,18 @@ impl MailItem {
                 seen
             })
             .unwrap_or_default();
+        // A flag the sender set for its recipients: the label, the RFC 2156 reply-by date as the due date,
+        // and the reminder MailCraft sends with it. A reminder time before the message arrived is the
+        // sender's way to pop a window the moment it lands, so it is dropped (the flag stays).
+        let date_header = |name: &str| msg.headers.get(name).and_then(|v| DateTime::parse_rfc5322(v).ok());
+        let reminder = date_header(RECIPIENT_REMINDER_HEADER).filter(|r| r.unix >= received.unix);
         let flag = match header("X-Message-Flag") {
-            Some(label) if !label.is_empty() => {
-                FlagState::Flagged { label, start: None, due: None, reminder: None }
-            }
+            Some(label) if !label.is_empty() => FlagState::Flagged {
+                label: label.chars().filter(|c| !c.is_control()).take(MAX_FLAG_LABEL_CHARS).collect(),
+                start: None,
+                due: date_header("Reply-By"),
+                reminder,
+            },
             _ => FlagState::None,
         };
         let is_draft = header("X-Unsent").is_some_and(|v| v == "1");
@@ -276,7 +293,8 @@ impl MailItem {
     }
     /// Takes from `old` (the same message before it was downloaded again, e.g. a header-only item getting
     /// its body) everything that is not read from the message source: id, folder, read, flag, categories,
-    /// response, draft, server id, arrival time, Focused, Ignore, conversation, pin and recorded votes.
+    /// response, draft, server id, arrival time, Focused, Ignore, conversation, pin, recorded votes and linked
+    /// contacts.
     pub fn keep_local_state(&mut self, old: &MailItem) {
         // Every field is named, so a new one has to be sorted into "local" or "from the source" here.
         let MailItem {
@@ -315,6 +333,7 @@ impl MailItem {
             votes,
             no_auto_archive,
             always_move_to,
+            contacts,
         } = old;
         self.id = *id;
         self.folder = *folder;
@@ -328,6 +347,7 @@ impl MailItem {
         self.conversation = *conversation;
         self.ignored = *ignored;
         self.remote_id = remote_id.clone();
+        self.contacts = contacts.clone();
         self.pinned = *pinned;
         self.votes = votes.clone();
         self.no_auto_archive = *no_auto_archive;

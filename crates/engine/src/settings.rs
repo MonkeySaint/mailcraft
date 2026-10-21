@@ -287,8 +287,15 @@ const PASTE_MODES: &[(&str, &str)] = &[
 ];
 /// Section of the Editor Options proofing settings (Mail page).
 pub const EDITOR_PROOFING: &str = "Editor Options › Proofing";
+/// Section of the Writing Style settings (Editor Options › Proofing › Writing Style › Settings…): which
+/// refinements "Grammar & Refinements" checks.
+pub const EDITOR_WRITING_STYLE: &str = "Editor Options › Proofing › Writing Style settings";
+/// Writing Style choices: grammar only, or grammar and refinements.
+const WRITING_STYLES: &[(&str, &str)] =
+    &[("grammar", "Grammar"), ("grammarRefinements", "Grammar & Refinements")];
 /// Section of the Editor Options paste defaults (Mail page; Set Default Paste opens it).
 pub const EDITOR_PASTE: &str = "Editor Options › Cut, copy, and paste";
+const SPELLING_MODES: &[(&str, &str)] = &[("spelling", "Spelling"), ("grammar", "Spelling and Grammar")];
 const QAT_POSITION: &[(&str, &str)] = &[("above", "Above Ribbon"), ("below", "Below Ribbon")];
 const AUTO_ARCHIVE_ACTION: &[(&str, &str)] =
     &[("move", "Move old items to the archive folder"), ("delete", "Permanently delete old items")];
@@ -827,12 +834,56 @@ pub const DEFS: &[Def] = &[
         A,
     ),
     d("mail", EDITOR_PROOFING, "mail.editor.flagRepeated", "Flag repeated words", Bool(true), A),
+    d("mail", EDITOR_PROOFING, "mail.editor.confusedWords", "Frequently confused words", Bool(true), A),
     d(
         "mail",
         EDITOR_PROOFING,
         "mail.editor.mainDictionaryOnly",
         "Suggest from main dictionary only",
         Bool(false),
+        A,
+    ),
+    // Writing Style: grammar alone, or grammar and the writing refinements (the Editor pane's suggestions
+    // beyond corrections); which refinements are checked sits behind its Settings… button.
+    d(
+        "mail",
+        EDITOR_PROOFING,
+        "mail.editor.writingStyle",
+        "Writing Style:",
+        Choice("grammarRefinements", WRITING_STYLES),
+        A,
+    ),
+    d(
+        "mail",
+        EDITOR_WRITING_STYLE,
+        "mail.editor.refine.clarity",
+        "Refinements: clarity (passive voice)",
+        Bool(true),
+        A,
+    ),
+    d(
+        "mail",
+        EDITOR_WRITING_STYLE,
+        "mail.editor.refine.conciseness",
+        "Refinements: conciseness (wordy phrases)",
+        Bool(true),
+        A,
+    ),
+    d("mail", EDITOR_WRITING_STYLE, "mail.editor.refine.cliches", "Refinements: clich\u{e9}s", Bool(true), A),
+    d(
+        "mail",
+        EDITOR_WRITING_STYLE,
+        "mail.editor.refine.formality",
+        "Refinements: formality (informal words)",
+        Bool(true),
+        A,
+    ),
+    d(
+        "mail",
+        EDITOR_WRITING_STYLE,
+        "mail.editor.refine.inclusiveness",
+        "Refinements: inclusive language",
+        Bool(true),
         A,
     ),
     d(
@@ -1852,6 +1903,49 @@ pub const DEFS: &[Def] = &[
         A,
     ),
     d("state", "Folder pane", "state.showAllFoldersAZ", "Show all folders A to Z", Bool(false), A),
+    // Review › Spelling and Grammar ▾: what the button (and F7) checks, as last chosen in its menu.
+    d(
+        "state",
+        "Proofing",
+        "state.review.spellingMode",
+        "The Spelling and Grammar button checks:",
+        Choice("spelling", SPELLING_MODES),
+        A,
+    ),
+    // Clipboard pane ▾ Options.
+    d(
+        "state",
+        "Clipboard",
+        "state.clipboard.collectOther",
+        "Collect text copied in other programs",
+        Bool(true),
+        A,
+    ),
+    d(
+        "state",
+        "Clipboard",
+        "state.clipboard.collectHidden",
+        "Collect copies while the Clipboard pane is closed",
+        Bool(false),
+        A,
+    ),
+    d(
+        "state",
+        "Clipboard",
+        "state.clipboard.showAuto",
+        "Open the Clipboard pane by itself when a second item is collected",
+        Bool(false),
+        A,
+    ),
+    // Building Blocks Organizer: built-in AutoText entries (the user's name and initials) deleted or renamed.
+    d(
+        "state",
+        "AutoText",
+        "state.autoText.hiddenBuiltins",
+        "Built-in AutoText entries removed",
+        Text("", 512),
+        A,
+    ),
     // Format Text › Change Styles › Set as Default / Save as a New Style Set.
     d(
         "state",

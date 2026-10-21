@@ -37,7 +37,7 @@ Compose|Message › Tags|Message Options...|compose.messageOptions
 Compose|Message › Voice|Dictate|-|Dictate is cloud speech recognition (Microsoft speech service)
 Compose|Message › Apps|All Apps|-|All Apps opens the Office add-ins store
 Compose|Message › Sensitivity|Sensitivity|-|sensitivity labels require a Microsoft Purview tenant policy
-Compose|Message › Editor|Editor|review.spelling
+Compose|Message › Editor|Editor|review.editor
 Compose|Message › Dark Mode|Switch Background|compose.switchBackground
 Compose|Message › Immersive|Immersive Reader|-|Immersive Reader is a Microsoft cloud reading service
 Compose|Message › Add-in|Viva Insights|-|Viva Insights is a Microsoft 365 cloud add-in
@@ -512,7 +512,7 @@ Compose|Format Text > Select|Select Objects|format.selectObjects
 Compose|Format Text > Select|Select All Text With Similar Formatting (No Data)|format.selectSimilar
 Compose|Format Text > Select|Selection Pane...|format.selectionPane
 Compose|Review › Editor|Spelling and Grammar|review.spelling
-Compose|Review › Editor|Editor|review.spelling
+Compose|Review › Editor|Editor|review.editor
 Compose|Review › Editor|Thesaurus...|review.thesaurus
 Compose|Review › Editor|Word Count|review.wordCount
 Compose|Review › Speech|Read Aloud|review.readAloud

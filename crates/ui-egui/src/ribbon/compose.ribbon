@@ -42,7 +42,7 @@ drop S | Follow Up | flag | | | W | menu=composeFollowUp
 toggle S | High Importance | importance-high | compose.importance | {"level":"high"} | H | on=imp:high oncmd=compose.importance{"level":"normal"}
 toggle S | Low Importance | importance-low | compose.importance | {"level":"low"} | L1 | on=imp:low oncmd=compose.importance{"level":"normal"}
 group Editor | Z5
-button L | Editor | spelling | review.spelling | | C2
+toggle L | Editor | spelling | review.editor | | C2 | on=editorpane
 group Dark Mode | Z6
 toggle L | Switch Background | view | compose.switchBackground | | B | on=lightcanvas
 
@@ -155,7 +155,7 @@ button L | Zoom... | zoom-in | format.zoom | | Q
 tab Review | V
 group Editor | ZP
 split L | Spelling and Grammar | spelling | review.spelling | | Q | menu=spelling
-button L | Editor | spelling | review.spelling | {"grammar":true} | C
+toggle L | Editor | spelling | review.editor | | C | on=editorpane
 button L | Thesaurus... | address-book | review.thesaurus | | E
 button L | Word Count | numbering | review.wordCount | | W
 group Speech | Z1
@@ -272,21 +272,13 @@ item | No Color | | format.highlight | {"color":null} | N
 item | Stop Highlighting | | format.highlight | {"stop":true} | S | en=pen
 
 menu fontColor
+item | High-contrast only | | format.color | {"highContrastOnly":"$!on"} | H | on=fhc
 item | Automatic | font-color | format.color | {"color":"automatic"} | A
 sep
-dyn | themeColors | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeColors | format.color | {"theme":"$theme","tint":"$tint"}
 sub | Theme Color Shades | font-color | fontColorShades | | T
 sep
-item | Dark Red | | format.color | {"color":"#a01c1c"} | | swatch=#a01c1c
-item | Red | | format.color | {"color":"#e02424"} | | swatch=#e02424
-item | Orange | | format.color | {"color":"#ef8a17"} | | swatch=#ef8a17
-item | Yellow | | format.color | {"color":"#f2c94c"} | | swatch=#f2c94c
-item | Light Green | | format.color | {"color":"#7ac74f"} | | swatch=#7ac74f
-item | Green | | format.color | {"color":"#2e8b46"} | | swatch=#2e8b46
-item | Light Blue | | format.color | {"color":"#3fa7d6"} | | swatch=#3fa7d6
-item | Blue | | format.color | {"color":"#1f5fbf"} | | swatch=#1f5fbf
-item | Dark Blue | | format.color | {"color":"#14286b"} | | swatch=#14286b
-item | Purple | | format.color | {"color":"#6b3fa0"} | | swatch=#6b3fa0
+dyn | fontColors | format.color | {"color":"$color"}
 sep
 item | More Colors... | font-color | format.color | {"custom":true} | M
 
@@ -303,34 +295,34 @@ sub | Plum, Accent 5 | | fontColorShades9 |
 sub | Green, Accent 6 | | fontColorShades10 |
 
 menu fontColorShades1
-dyn | themeShades:bg1 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:bg1 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades2
-dyn | themeShades:tx1 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:tx1 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades3
-dyn | themeShades:bg2 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:bg2 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades4
-dyn | themeShades:tx2 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:tx2 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades5
-dyn | themeShades:accent1 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:accent1 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades6
-dyn | themeShades:accent2 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:accent2 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades7
-dyn | themeShades:accent3 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:accent3 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades8
-dyn | themeShades:accent4 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:accent4 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades9
-dyn | themeShades:accent5 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:accent5 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu fontColorShades10
-dyn | themeShades:accent6 | format.color | {"theme":"$theme","tint":"$tint"}
+dyn | fontThemeShades:accent6 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu shading
 item | No Color | | format.shading | {"color":null} | N
@@ -530,7 +522,7 @@ item | No Date | flag | compose.followUp | {"kind":"noDate"} | A
 item | Custom... | flag | compose.followUp | {"kind":"custom"} | C
 sep
 item | Add Reminder... | bell | compose.followUp | {"kind":"reminder"} | R
-item | Clear Flag | | compose.followUp | {"kind":"clear"} | E
+item | Clear Flag | | compose.followUp | {"kind":"clear"} | E | en=flagged
 
 menu table
 dyn | tableGrid | insert.table | {"rows":"$rows","cols":"$cols"}
@@ -643,6 +635,7 @@ item | Greek Small Letter Beta | | insert.symbol | {"char":"β"} |
 item | Greek Small Letter Pi | | insert.symbol | {"char":"π"} |
 item | Ohm Sign | | insert.symbol | {"char":"Ω"} |
 item | N-Ary Summation | | insert.symbol | {"char":"∑"} |
+item | White Smiling Face | | insert.symbol | {"char":"☺"} |
 sep
 item | More Symbols... | info | insert.symbol | | M
 
@@ -828,8 +821,8 @@ item | Use Default Folder | sent | compose.saveSentItemTo | {"mode":"default"} |
 item | Do Not Save | | compose.saveSentItemTo | {"mode":"none"} | D | on=save:none
 
 menu spelling
-item | Spelling | spelling | review.spelling | {"grammar":false} | S
-item | Spelling and Grammar | spelling | review.spelling | {"grammar":true} | G
+item | Spelling | spelling | review.spelling | {"grammar":false} | S | on=spellmode:spelling
+item | Spelling and Grammar | spelling | review.spelling | {"grammar":true} | G | on=spellmode:grammar
 
 menu language
 item | Set Proofing Language... | email | review.language | | L

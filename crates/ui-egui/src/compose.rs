@@ -79,8 +79,9 @@ pub use capture::{
     capture_backend, set_capture, window_items as screenshot_windows,
 };
 pub use clipboard::{
-    ClipboardHooks, clipboard_hooks, clipboard_html, clipboard_image, clipboard_text, copy_html,
-    html_for_paste, set_clipboard_hooks, set_clipboard_image_reader,
+    ClipboardHooks, WATCH_SECS as CLIPBOARD_WATCH_SECS, clipboard_hooks, clipboard_html, clipboard_image,
+    clipboard_text, clipboard_watch, copy_html, html_for_paste, set_clipboard_hooks,
+    set_clipboard_image_reader,
 };
 pub use editor::{
     BODY_LABEL, NO_SUGGESTIONS, PASTE_MODES, body_focused, editor_id, refocus_body, request_live_preview,
@@ -721,7 +722,8 @@ pub fn focused_recipient_field(ctx: &egui::Context, app: &App) -> Option<u64> {
 ///   with a `path` it attaches and remembers the file for the recent list;
 /// - `options.open {"page": "signatures"}` (Signature ▾ › Signatures…) opens Signatures and Stationery itself
 ///   rather than the Options dialog;
-/// - `review.spelling` opens the Spelling and Grammar dialog;
+/// - `review.spelling` opens the Spelling and Grammar dialog (spelling only or with grammar, as last picked in
+///   the button's menu);
 /// - `format.paste` with a `mode` (Paste ▾ menu) pastes the system clipboard with that mode;
 /// - the Insert and Options commands in [`insert_command`] (screen capture, native file pickers, recent
 ///   symbols).
@@ -746,7 +748,11 @@ pub(crate) fn ribbon_command(
             true
         }
         "review.spelling" => {
-            let grammar = params.get("grammar").and_then(serde_json::Value::as_bool).unwrap_or(true);
+            // Without a choice (the button, F7) the mode last picked in the button's menu.
+            let grammar = params
+                .get("grammar")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| mailcraft_engine::cmd::review::grammar_mode(&app.s));
             spelling::open_with(ctx, app, cid, grammar);
             true
         }

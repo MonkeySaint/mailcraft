@@ -1046,6 +1046,183 @@ fn compose_panes_paste_apply_styles_and_hide_pictures() {
 }
 
 #[test]
+fn editor_pane_shows_the_score_and_groups_and_applies_a_suggestion() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run(
+        "compose.insertText",
+        json!({"compose": cid, "text": "We met in order to plan. Their is a problem."}),
+    )
+    .unwrap();
+    let r = app.run("review.editor", json!({"compose": cid})).unwrap();
+    assert_eq!(r["editorPane"], true);
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label(&format!("Close {} pane", panes::EDITOR_TITLE));
+    assert!(h.query_by_label_contains("Editor score").is_some());
+    h.get_by_label(&panes::group_label("Conciseness", 1)).click();
+    h.run();
+    h.get_by_label("in order to");
+    h.get_by_role_and_label(Role::Button, "to").click();
+    h.run();
+    assert!(
+        compose(&h, cid).body.to_plain_text().starts_with("We met to plan."),
+        "{}",
+        compose(&h, cid).body.to_plain_text()
+    );
+    h.get_by_label("\u{2190} All groups").click();
+    h.run();
+    h.get_by_label(&panes::group_label("Grammar", 1)).click();
+    h.run();
+    h.get_by_role_and_label(Role::Button, "There").click();
+    h.run();
+    assert!(compose(&h, cid).body.to_plain_text().contains("There is a problem."));
+    h.get_by_label(&format!("Close {} pane", panes::EDITOR_TITLE)).click();
+    h.run();
+    assert!(!compose(&h, cid).editor.editor_pane);
+    assert_eq!(panes::score_label(90), "Editor score 90%");
+    assert_eq!(panes::group_label("Clarity", 0), "Clarity: nothing to fix");
+}
+
+#[test]
+fn editor_pane_rechecks_once_typing_pauses() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "Hello there."})).unwrap();
+    app.run("review.editor", json!({"compose": cid})).unwrap();
+    // Nothing is checked as you type, so only the pane would check the body.
+    for key in ["mail.editor.spellAsYouType", "mail.editor.grammarAsYouType"] {
+        app.run("options.set", json!({"key": key, "value": false})).unwrap();
+    }
+    let mut h = window_harness(app);
+    h.run();
+    let rev = |h: &Harness<'_, App>| {
+        let c = compose(h, cid);
+        (c.edit_rev, c.spell_rev)
+    };
+    let (edit, spell) = rev(&h);
+    assert_eq!(spell, Some(edit), "the pane checked the body when it opened");
+    // A keystroke: the pane keeps its last result for that frame instead of re-checking the whole body.
+    h.state_mut().run("compose.insertText", json!({"compose": cid, "text": " Wrold"})).unwrap();
+    h.step();
+    let (edit, spell) = rev(&h);
+    assert_ne!(spell, Some(edit), "no full re-check on the keystroke's frame");
+    // Once typing pauses, it catches up.
+    h.run_steps(240);
+    let (edit, spell) = rev(&h);
+    assert_eq!(spell, Some(edit));
+    assert!(compose(&h, cid).spell_issues.iter().any(|i| i.word == "Wrold"));
+}
+
+thread_local! {
+    static SYSTEM_CLIP: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn system_clip() -> Option<String> {
+    Some(SYSTEM_CLIP.with(|c| c.borrow().clone()))
+}
+
+#[test]
+fn clipboard_watch_collects_copies_from_other_programs() {
+    set_clipboard_hooks(ClipboardHooks { read_text: Some(system_clip), ..Default::default() });
+    SYSTEM_CLIP.with(|c| *c.borrow_mut() = "copied before start".into());
+    let (mut app, cid) = app_with_compose(false);
+    app.run("format.clipboardPane", json!({"compose": cid})).unwrap();
+    let mut h = Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+        |ui, app: &mut App| {
+            clipboard_watch(ui.ctx(), app);
+            compose_windows(ui.ctx(), app);
+        },
+        app,
+    );
+    h.run_steps(5);
+    assert!(compose(&h, cid).clipboard.is_empty(), "what was there at start is not collected");
+    SYSTEM_CLIP.with(|c| *c.borrow_mut() = "from the browser".into());
+    h.run_steps(120);
+    let c = compose(&h, cid);
+    assert_eq!(c.clipboard.last().map(|e| e.text.as_str()), Some("from the browser"));
+    h.get_by_label("from the browser");
+    // Options: stop collecting from other programs.
+    h.get_by_label(panes::CLIPBOARD_OPTIONS).click();
+    h.run_steps(2);
+    h.get_by_label("Collect text copied in other programs").click();
+    h.run_steps(2);
+    assert!(!h.state().s.settings.bool("state.clipboard.collectOther"));
+    SYSTEM_CLIP.with(|c| *c.borrow_mut() = "not collected".into());
+    h.run_steps(120);
+    assert_eq!(compose(&h, cid).clipboard.len(), 1);
+    set_clipboard_hooks(ClipboardHooks::default());
+}
+
+thread_local! {
+    static CLIP_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn counted_clip() -> Option<String> {
+    CLIP_READS.with(|n| n.set(n.get() + 1));
+    system_clip()
+}
+
+#[test]
+fn clipboard_watch_reads_nothing_while_the_pane_is_closed_and_skips_secrets() {
+    set_clipboard_hooks(ClipboardHooks { read_text: Some(counted_clip), ..Default::default() });
+    SYSTEM_CLIP.with(|c| *c.borrow_mut() = "at start".into());
+    let (app, cid) = app_with_compose(false);
+    let mut h = Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+        |ui, app: &mut App| {
+            clipboard_watch(ui.ctx(), app);
+            compose_windows(ui.ctx(), app);
+        },
+        app,
+    );
+    // Default settings, pane closed: the system clipboard is never read and nothing is collected.
+    assert!(!h.state().s.settings.bool("state.clipboard.collectHidden"));
+    h.run_steps(5);
+    SYSTEM_CLIP.with(|c| *c.borrow_mut() = "copied in a browser".into());
+    h.run_steps(120);
+    assert_eq!(CLIP_READS.with(std::cell::Cell::get), 0);
+    assert!(h.state().s.clip_history.is_empty());
+    assert!(compose(&h, cid).clipboard.is_empty());
+    // Opening the pane starts the watch afresh: what was copied meanwhile is not collected.
+    h.state_mut().run("format.clipboardPane", json!({"compose": cid, "show": true})).unwrap();
+    h.run_steps(120);
+    assert!(CLIP_READS.with(std::cell::Cell::get) > 0);
+    assert!(h.state().s.clip_history.is_empty());
+    // A password or a one-time code is never collected.
+    for secret in ["Xq7!pL2#vR9z", "482913"] {
+        SYSTEM_CLIP.with(|c| *c.borrow_mut() = secret.into());
+        h.run_steps(120);
+        assert!(h.state().s.clip_history.is_empty(), "{secret} collected");
+    }
+    // A copy that its program clears again leaves the history with it.
+    SYSTEM_CLIP.with(|c| *c.borrow_mut() = "meeting notes".into());
+    h.run_steps(120);
+    assert_eq!(h.state().s.clip_history.len(), 1);
+    SYSTEM_CLIP.with(|c| c.borrow_mut().clear());
+    h.run_steps(120);
+    assert!(h.state().s.clip_history.is_empty());
+    assert!(compose(&h, cid).clipboard.is_empty());
+    set_clipboard_hooks(ClipboardHooks::default());
+}
+
+#[test]
+fn secret_looking_copies() {
+    use super::clipboard::looks_secret;
+    for s in ["Xq7!pL2#vR9z", "123456", "Tr0ub4dor&3", "aB3$efgh"] {
+        assert!(looks_secret(s), "{s}");
+    }
+    for s in [
+        "hello world",
+        "ann@example.com",
+        "https://example.com/Path/A1",
+        "12",
+        "12345678901234",
+        "invoice",
+        "Q3-report",
+    ] {
+        assert!(!looks_secret(s), "{s}");
+    }
+}
+
+#[test]
 fn styles_pane_creates_a_style_from_the_selection() {
     let (mut app, cid) = app_with_compose(false);
     app.run("compose.insertText", json!({"compose": cid, "text": "plain words"})).unwrap();
@@ -1286,6 +1463,29 @@ fn f6_cycles_header_fields_body_and_ribbon_in_a_compose_window() {
 
 fn set_option(h: &mut Harness<'_, App>, key: &str, value: serde_json::Value) {
     assert!(h.state_mut().run("options.set", json!({"key": key, "value": value})).is_some(), "{key}");
+}
+
+#[test]
+fn writing_style_grammar_drops_refinement_marks_with_spelling_and_grammar_on() {
+    let (mut h, cid) = typed_body("We met in order to plan. Their is a problem.");
+    let kinds = |h: &Harness<'_, App>| -> Vec<String> {
+        compose(h, cid).spell_issues.iter().map(|i| i.kind.clone()).collect()
+    };
+    assert!(kinds(&h).iter().any(|k| k == "wordiness"), "{:?}", kinds(&h));
+    // Spelling and grammar still marked as you type; Writing Style "Grammar" leaves out the refinements.
+    set_option(&mut h, "mail.editor.writingStyle", json!("grammar"));
+    h.run();
+    h.run();
+    let live = mailcraft_engine::cmd::review::live_proofing(&h.state().s);
+    assert!(live.spelling && live.grammar && !live.refinements);
+    let k = kinds(&h);
+    assert!(k.iter().all(|k| !mailcraft_engine::cmd::review::is_refinement(k)), "{k:?}");
+    assert!(k.iter().any(|k| k == "confused"), "grammar is still marked: {k:?}");
+    // Frequently confused words off: that mark goes too.
+    set_option(&mut h, "mail.editor.confusedWords", json!(false));
+    h.run();
+    h.run();
+    assert!(kinds(&h).iter().all(|k| k != "confused"), "{:?}", kinds(&h));
 }
 
 #[test]

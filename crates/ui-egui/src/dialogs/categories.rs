@@ -1,8 +1,9 @@
 //! Color Categories (master list with checkboxes; New / Rename / Delete / Color / Shortcut Key), New and
-//! Rename Category, Set Quick Click, and the Custom flag dialog (Flag to, Start/Due date, Reminder).
+//! Rename Category, Set Quick Click, and the Custom flag dialog (Flag to, Start/Due date, Reminder; for a
+//! message being written also Flag for Me / Flag for Recipients).
 
-use egui::{Align, Color32, Context, Layout, RichText, Sense, Vec2};
-use serde_json::json;
+use egui::{Align, Color32, Context, Layout, RichText, Sense, Ui, Vec2};
+use serde_json::{Value, json};
 
 use super::common::{
     self, Dlg, Out, btn, btn_en, child, footer, muted, ok_cancel, send_reply, take_replies, window,
@@ -431,13 +432,37 @@ const FLAG_TO: [&str; 10] = [
 
 #[derive(Clone, Default)]
 struct FlagDlg {
+    /// Flag for Me (a message being written can be flagged for its recipients only).
+    flag_me: bool,
     label: String,
     start: String,
     due: String,
     reminder: bool,
     rdate: String,
     rtime: String,
+    /// Flag for Recipients (messages being written only).
+    rec_on: bool,
+    rec_label: String,
+    rec_due: String,
+    rec_reminder: bool,
+    rec_rdate: String,
+    rec_rtime: String,
     error: String,
+}
+
+/// The "Flag to" box with its menu of standard labels.
+fn flag_to(ui: &mut Ui, id: (&'static str, u64), label: &mut String) {
+    ui.horizontal(|ui| {
+        let r = ui.add(egui::TextEdit::singleline(label).desired_width(180.0));
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Flag to"));
+        egui::ComboBox::from_id_salt(id).selected_text("").width(24.0).show_ui(ui, |ui| {
+            for f in FLAG_TO {
+                if ui.selectable_label(label == f, f).clicked() {
+                    *label = f.to_owned();
+                }
+            }
+        });
+    });
 }
 
 fn custom_flag(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -446,9 +471,12 @@ fn custom_flag(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let ids = d.ids();
     let init = |app: &App| {
         let mut st = FlagDlg {
+            flag_me: true,
             label: "Follow up".into(),
             reminder: d.bool("reminder") || d.name == "addReminder",
             rtime: "16:00".into(),
+            rec_label: "Follow up".into(),
+            rec_rtime: "16:00".into(),
             ..Default::default()
         };
         let flag = match compose {
@@ -465,54 +493,109 @@ fn custom_flag(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 st.rdate = dd;
                 st.rtime = tt;
             }
+        } else if let Some(c) = compose.and_then(|c| app.s.composes.get(&c))
+            && c.recipient_flag.is_some()
+        {
+            // Only the recipients are flagged.
+            st.flag_me = false;
+        }
+        if let Some(r) = compose.and_then(|c| app.s.composes.get(&c)).and_then(|c| c.recipient_flag.clone()) {
+            st.rec_on = true;
+            st.rec_label = r.label;
+            st.rec_due = r.due.map(|t| common::date_parts(app, t.unix).0).unwrap_or_default();
+            if let Some(at) = r.reminder {
+                st.rec_reminder = true;
+                let (dd, tt) = common::date_parts(app, at.unix);
+                st.rec_rdate = dd;
+                st.rec_rtime = tt;
+            }
         }
         if st.rdate.is_empty() {
             st.rdate = common::today(app);
         }
+        if st.rec_rdate.is_empty() {
+            st.rec_rdate = common::today(app);
+        }
         st
     };
+    // Clear Flag is offered only when there is a flag to clear.
+    let flagged = match compose {
+        Some(c) => {
+            app.s.composes.get(&c).is_some_and(|c| c.flag != FlagState::None || c.recipient_flag.is_some())
+        }
+        None => {
+            ids.iter().any(|i| app.s.mailbox.mail.get(&ItemId(*i)).is_some_and(|m| m.flag != FlagState::None))
+        }
+    };
     with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "Custom", 400.0, |ui, app| {
+        window(ctx, app, d, "Custom", if compose.is_some() { 440.0 } else { 400.0 }, |ui, app| {
             muted(ui, app, "A flag adds the item to your to-do list until you mark it complete.");
-            egui::Grid::new(("flag", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Flag to");
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut st.label).desired_width(180.0));
-                    egui::ComboBox::from_id_salt(("flagto", uid)).selected_text("").width(24.0).show_ui(
-                        ui,
-                        |ui| {
-                            for f in FLAG_TO {
-                                if ui.selectable_label(st.label == f, f).clicked() {
-                                    st.label = f.to_owned();
-                                }
-                            }
-                        },
-                    );
+            if compose.is_some() {
+                ui.checkbox(&mut st.flag_me, "Flag for Me");
+            }
+            ui.add_enabled_ui(st.flag_me, |ui| {
+                egui::Grid::new(("flag", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Flag to");
+                    flag_to(ui, ("flagto", uid), &mut st.label);
+                    ui.end_row();
+                    ui.label("Start date");
+                    common::date_box(ui, app, ("fstart", uid), &mut st.start, "None", "Start date");
+                    ui.end_row();
+                    ui.label("Due date");
+                    common::date_box(ui, app, ("fdue", uid), &mut st.due, "None", "Due date");
+                    ui.end_row();
+                    ui.checkbox(&mut st.reminder, "Reminder");
+                    ui.add_enabled_ui(st.reminder, |ui| {
+                        ui.horizontal(|ui| {
+                            common::date_box(ui, app, ("frdate", uid), &mut st.rdate, "", "Reminder date");
+                            common::time_box(ui, ("frtime", uid), &mut st.rtime, "Reminder time");
+                        });
+                    });
+                    ui.end_row();
                 });
-                ui.end_row();
-                ui.label("Start date");
-                ui.add(
-                    egui::TextEdit::singleline(&mut st.start)
-                        .hint_text("None (YYYY-MM-DD)")
-                        .desired_width(180.0),
-                );
-                ui.end_row();
-                ui.label("Due date");
-                ui.add(
-                    egui::TextEdit::singleline(&mut st.due)
-                        .hint_text("None (YYYY-MM-DD)")
-                        .desired_width(180.0),
-                );
-                ui.end_row();
-                ui.checkbox(&mut st.reminder, "Reminder");
-                ui.add_enabled_ui(st.reminder, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut st.rdate).desired_width(100.0));
-                        ui.add(egui::TextEdit::singleline(&mut st.rtime).desired_width(60.0));
+            });
+            if compose.is_some() {
+                ui.separator();
+                ui.checkbox(&mut st.rec_on, "Flag for Recipients");
+                ui.add_enabled_ui(st.rec_on, |ui| {
+                    egui::Grid::new(("flagrec", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("Flag to");
+                        flag_to(ui, ("recflagto", uid), &mut st.rec_label);
+                        ui.end_row();
+                        ui.label("Due date");
+                        common::date_box(
+                            ui,
+                            app,
+                            ("rdue", uid),
+                            &mut st.rec_due,
+                            "None",
+                            "Recipients' due date",
+                        );
+                        ui.end_row();
+                        ui.checkbox(&mut st.rec_reminder, "Reminder");
+                        ui.add_enabled_ui(st.rec_reminder, |ui| {
+                            ui.horizontal(|ui| {
+                                common::date_box(
+                                    ui,
+                                    app,
+                                    ("rrdate", uid),
+                                    &mut st.rec_rdate,
+                                    "",
+                                    "Recipients' reminder date",
+                                );
+                                common::time_box(
+                                    ui,
+                                    ("rrtime", uid),
+                                    &mut st.rec_rtime,
+                                    "Recipients' reminder time",
+                                );
+                            });
+                        });
+                        ui.end_row();
                     });
                 });
-                ui.end_row();
-            });
+                muted(ui, app, "Recipients' copies arrive flagged with this label, due date and reminder.");
+            }
             if !st.error.is_empty() {
                 ui.colored_label(app.theme.danger, &st.error);
             }
@@ -522,7 +605,7 @@ fn custom_flag(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     out = Out::Close;
                 }
                 let ok = common::primary(ui, app, true, "OK");
-                if btn(ui, "Clear Flag") {
+                if common::btn_en(ui, flagged, "Clear Flag") {
                     match compose {
                         Some(c) => app.run("compose.followUp", json!({"compose": c, "kind": "clear"})),
                         None => app.run("mail.clearFlag", json!({"ids": ids})),
@@ -539,21 +622,31 @@ fn custom_flag(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
+/// "YYYY-MM-DD" (or empty / "none") → a date, or the message to show.
+fn flag_day(app: &App, s: &str) -> Result<Option<i64>, String> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    common::parse_date(app, s, "")
+        .map(Some)
+        .ok_or_else(|| format!("\u{201C}{s}\u{201D} is not a date (YYYY-MM-DD)."))
+}
+
 fn apply_flag(app: &mut App, st: &mut FlagDlg, compose: Option<u64>, ids: &[u64]) -> Out {
-    let date = |app: &App, s: &str| -> Result<Option<i64>, String> {
-        let s = s.trim();
-        if s.is_empty() || s.eq_ignore_ascii_case("none") {
-            return Ok(None);
-        }
-        common::parse_date(app, s, "").map(Some).ok_or_else(|| format!("\"{s}\" is not a date (YYYY-MM-DD)."))
-    };
-    let (start, due) = match (date(app, &st.start), date(app, &st.due)) {
+    let (start, due) = match (flag_day(app, &st.start), flag_day(app, &st.due)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
             st.error = e;
             return Out::Keep;
         }
     };
+    if let (Some(a), Some(b)) = (start, due)
+        && a > b
+    {
+        st.error = "The start date is after the due date.".into();
+        return Out::Keep;
+    }
     let reminder = if st.reminder {
         match common::parse_date(app, &st.rdate, &st.rtime) {
             Some(t) => Some(t),
@@ -567,22 +660,34 @@ fn apply_flag(app: &mut App, st: &mut FlagDlg, compose: Option<u64>, ids: &[u64]
     };
     let res = match compose {
         Some(c) => {
-            let (kind, at) = match (reminder, due.or(start)) {
-                (Some(_), _) => ("reminder", format!("{} {}", st.rdate.trim(), st.rtime.trim())),
-                (None, _) => (
-                    "custom",
-                    if st.due.trim().is_empty() {
-                        st.start.trim().to_owned()
-                    } else {
-                        st.due.trim().to_owned()
-                    },
-                ),
+            let rec_due = match flag_day(app, &st.rec_due) {
+                Ok(d) => d,
+                Err(e) => {
+                    st.error = e;
+                    return Out::Keep;
+                }
             };
-            if at.trim().is_empty() {
-                app.run("compose.followUp", json!({"compose": c, "kind": "noDate"}))
+            let rec_reminder = if st.rec_on && st.rec_reminder {
+                match common::parse_date(app, &st.rec_rdate, &st.rec_rtime) {
+                    Some(t) => Some(t),
+                    None => {
+                        st.error = "The recipients' reminder date or time is not valid.".into();
+                        return Out::Keep;
+                    }
+                }
             } else {
-                app.run("compose.followUp", json!({"compose": c, "kind": kind, "at": at}))
-            }
+                None
+            };
+            let recipients = if st.rec_on {
+                json!({"label": st.rec_label.trim(), "due": rec_due, "reminder": rec_reminder})
+            } else {
+                Value::Null
+            };
+            app.run(
+                "compose.followUp",
+                json!({"compose": c, "kind": "custom", "flagMe": st.flag_me, "label": st.label.trim(),
+                       "start": start, "due": due, "reminder": reminder, "recipients": recipients}),
+            )
         }
         None => {
             let mut p = json!({"ids": ids, "label": st.label.trim()});

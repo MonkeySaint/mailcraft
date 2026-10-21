@@ -41,6 +41,26 @@ pub fn ok() -> Value {
     json!({"ok": true})
 }
 
+/// Most names kept from a typed list.
+pub const MAX_NAMES: usize = 200;
+
+/// "Ann Lee; Bo Ek, c@example.com" → trimmed non-empty names (control characters dropped, at most
+/// [`MAX_NAMES`], each at most 320 chars), duplicates (ignoring case) dropped.
+pub fn split_names(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in text.split([';', ',', '\n']) {
+        let name: String =
+            part.chars().filter(|c| !c.is_control()).take(320).collect::<String>().trim().to_owned();
+        if !name.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&name)) {
+            out.push(name);
+        }
+        if out.len() >= MAX_NAMES {
+            break;
+        }
+    }
+    out
+}
+
 /// Queues `Notice::OpenDialog(name, params)` and returns `{"dialog": name}` (commands whose effect is a dialog).
 pub fn dialog(s: &mut crate::Session, name: &str, params: Value) -> crate::CmdResult {
     s.notify(crate::Notice::OpenDialog(name.to_owned(), params));

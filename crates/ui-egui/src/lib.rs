@@ -462,6 +462,7 @@ impl App {
         self.poll_sync(&ctx);
         modules::calendar_background(&ctx, self);
         dialogs::auto_archive_tick(&ctx, self);
+        compose::clipboard_watch(&ctx, self);
         keys::handle(&ctx, self, Surface::Main);
         self.drain_notices(&ctx);
         self.sync_window(&ctx);

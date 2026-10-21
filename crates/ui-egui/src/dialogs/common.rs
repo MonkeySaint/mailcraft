@@ -358,6 +358,150 @@ pub(crate) fn field(ui: &mut Ui, label: &str, value: &mut String, width: f32) ->
     .inner
 }
 
+/// "YYYY-MM-DD" → (year, month, day) of a real date.
+pub(crate) fn parse_ymd(text: &str) -> Option<(i64, u8, u8)> {
+    let mut parts = text.trim().splitn(3, '-');
+    let y: i64 = parts.next()?.trim().parse().ok()?;
+    let m: u8 = parts.next()?.trim().parse().ok()?;
+    let d: u8 = parts.next()?.trim().parse().ok()?;
+    mailcraft_model::dates::days_from_civil(y, m, d).map(|_| (y, m, d))
+}
+
+/// Month shown by a date box's calendar (year, month), kept while it is open.
+fn shown_month(ui: &Ui, id: Id) -> Option<(i64, u8)> {
+    ui.ctx().data(|d| d.get_temp::<(i64, u8)>(id))
+}
+
+/// Month names for the date box's calendar.
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// A date box: a "YYYY-MM-DD" field (empty = none; shown in red while it is not a date) with a ▾ button
+/// that opens a month calendar to pick from. Returns true when the date changed.
+pub(crate) fn date_box(
+    ui: &mut Ui,
+    app: &App,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    text: &mut String,
+    hint: &str,
+    label: &str,
+) -> bool {
+    let id = Id::new(("mc-date-box", id));
+    let before = text.clone();
+    ui.horizontal(|ui| {
+        let ok = text.trim().is_empty() || parse_ymd(text).is_some();
+        let mut edit = egui::TextEdit::singleline(text).hint_text(hint).desired_width(104.0).id_salt(id);
+        if !ok {
+            edit = edit.text_color(app.theme.danger);
+        }
+        let r = ui.add(edit).on_hover_text("Date as YYYY-MM-DD");
+        r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, label));
+        let pick = ui.menu_button("\u{25BE}", |ui| {
+            let today = parse_ymd(&today(app)).unwrap_or((2026, 1, 1));
+            let (y, m) = shown_month(ui, id)
+                .or_else(|| parse_ymd(text).map(|(y, m, _)| (y, m)))
+                .unwrap_or((today.0, today.1));
+            let mut month = (y, m);
+            ui.horizontal(|ui| {
+                if ui.small_button("\u{25C0}").on_hover_text("Previous month").clicked() {
+                    month = if m == 1 { (y.saturating_sub(1), 12) } else { (y, m - 1) };
+                }
+                let name = MONTHS.get(usize::from(m.saturating_sub(1))).copied().unwrap_or("");
+                ui.label(RichText::new(format!("{name} {y}")).strong());
+                if ui.small_button("\u{25B6}").on_hover_text("Next month").clicked() {
+                    month = if m == 12 { (y.saturating_add(1), 1) } else { (y, m + 1) };
+                }
+            });
+            ui.ctx().data_mut(|d| d.insert_temp(id, month));
+            let Some(first) = mailcraft_model::dates::days_from_civil(y, m, 1) else { return };
+            let lead = i64::from(mailcraft_model::dates::weekday_of_day(first).0);
+            let len = i64::from(mailcraft_model::dates::days_in_month(y, m));
+            let chosen = parse_ymd(text);
+            egui::Grid::new((id, "grid")).spacing([2.0, 2.0]).show(ui, |ui| {
+                for w in ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"] {
+                    ui.label(RichText::new(w).small());
+                }
+                ui.end_row();
+                let cells = (lead + len + 6) / 7 * 7;
+                for cell in 0..cells {
+                    let day = cell - lead + 1;
+                    if (1..=len).contains(&day) {
+                        let d = u8::try_from(day).unwrap_or(1);
+                        let on = chosen == Some((y, m, d));
+                        let mut t = RichText::new(format!("{day:>2}"));
+                        if (y, m, d) == today {
+                            t = t.strong().color(app.theme.accent);
+                        }
+                        if ui.add(egui::Button::selectable(on, t).min_size(Vec2::new(24.0, 20.0))).clicked() {
+                            *text = format!("{y:04}-{m:02}-{d:02}");
+                            ui.ctx().data_mut(|dd| dd.remove::<(i64, u8)>(id));
+                            ui.close();
+                        }
+                    } else {
+                        ui.label("");
+                    }
+                    if cell % 7 == 6 {
+                        ui.end_row();
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("Today").clicked() {
+                    *text = format!("{:04}-{:02}-{:02}", today.0, today.1, today.2);
+                    ui.ctx().data_mut(|dd| dd.remove::<(i64, u8)>(id));
+                    ui.close();
+                }
+                if ui.small_button("None").clicked() {
+                    text.clear();
+                    ui.ctx().data_mut(|dd| dd.remove::<(i64, u8)>(id));
+                    ui.close();
+                }
+            });
+        });
+        pick.response.on_hover_text("Pick a date");
+    });
+    *text != before
+}
+
+/// A time box ("HH:MM") with a menu of half-hour times. Returns true when it changed.
+pub(crate) fn time_box(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    text: &mut String,
+    label: &str,
+) -> bool {
+    let before = text.clone();
+    let id = Id::new(("mc-time-box", id));
+    ui.horizontal(|ui| {
+        let r = ui.add(egui::TextEdit::singleline(text).desired_width(52.0).id_salt(id));
+        r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, label));
+        ui.menu_button("\u{25BE}", |ui| {
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for half in 0..48u32 {
+                    let t = format!("{:02}:{:02}", half / 2, (half % 2) * 30);
+                    if ui.selectable_label(*text == t, &t).clicked() {
+                        *text = t;
+                        ui.close();
+                    }
+                }
+            });
+        });
+    });
+    *text != before
+}
+
 /// Combo box over string choices; returns true when changed.
 pub(crate) fn combo(
     ui: &mut Ui,

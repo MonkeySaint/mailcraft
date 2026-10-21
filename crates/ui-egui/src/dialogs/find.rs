@@ -462,7 +462,12 @@ fn append(field: &mut String, item: &str) {
 
 fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let compose = d.u64("compose").filter(|c| app.s.composes.contains_key(c));
+    // Select Names for another dialog's address box (Properties › Have replies sent to): one box, and OK
+    // hands its text back.
+    let pick = d.reply_to();
+    let pick_label = if d.str("pickLabel").is_empty() { "Add ->".to_owned() } else { d.str("pickLabel") };
+    let pick_value = d.str("value");
+    let compose = d.u64("compose").filter(|c| app.s.composes.contains_key(c) && pick.is_none());
     with_state(
         ctx,
         app,
@@ -470,6 +475,9 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         |_: &App| BookState::default(),
         |st, app| {
             if !st.loaded {
+                if pick.is_some() {
+                    st.to.clone_from(&pick_value);
+                }
                 if let Some(c) = compose.and_then(|c| app.s.composes.get(&c)) {
                     st.to.clone_from(&c.to);
                     st.cc.clone_from(&c.cc);
@@ -554,7 +562,7 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                                 st.entry = Some((name.clone(), addr.clone(), *id));
                                                 st.info.clear();
                                             }
-                                            if r.double_clicked() && compose.is_some() {
+                                            if r.double_clicked() && (compose.is_some() || pick.is_some()) {
                                                 append(&mut st.to, &text);
                                             }
                                         }
@@ -592,7 +600,21 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         muted(ui, app, &st.info);
                     }
                 });
-                if compose.is_some() {
+                if pick.is_some() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                st.selected.is_some(),
+                                egui::Button::new(pick_label.as_str()).min_size(egui::Vec2::new(60.0, 22.0)),
+                            )
+                            .clicked()
+                            && let Some(s) = &st.selected
+                        {
+                            append(&mut st.to, s);
+                        }
+                        ui.add(egui::TextEdit::singleline(&mut st.to).desired_width(f32::INFINITY));
+                    });
+                } else if compose.is_some() {
                     ui.label("Message Recipients");
                     for (label, field) in
                         [("To ->", &mut st.to), ("Cc ->", &mut st.cc), ("Bcc ->", &mut st.bcc)]
@@ -614,6 +636,16 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 }
                 if !matches!(out, Out::Keep) {
                     return out;
+                }
+                if let Some((to, key)) = &pick {
+                    return match ok_cancel(ui, app, true) {
+                        Some(true) => {
+                            super::common::send_reply(ctx, *to, key, json!(st.to.trim()));
+                            Out::Close
+                        }
+                        Some(false) => Out::Close,
+                        None => Out::Keep,
+                    };
                 }
                 match compose {
                     Some(c) => match ok_cancel(ui, app, true) {

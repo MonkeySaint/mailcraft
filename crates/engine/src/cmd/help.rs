@@ -138,7 +138,9 @@ fn help(s: &mut Session, p: &Value) -> CmdResult {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(|t| t.chars().take(64).collect::<String>());
-    let topic = topic.or_else(|| {
+    // From a message being written (its ribbon or F1 there): the Writing topic.
+    let from_compose = p.get("compose").is_some_and(|v| !v.is_null());
+    let topic = topic.or_else(|| from_compose.then(|| "writing".to_owned())).or_else(|| {
         match s.view.module {
             crate::Module::Calendar => Some("calendar"),
             crate::Module::People => Some("people"),
@@ -241,6 +243,8 @@ mod tests {
         s.view.module = crate::Module::Calendar;
         assert_eq!(s.run("help.help", &json!({})).unwrap()["params"]["topic"], "calendar");
         assert_eq!(s.run("help.help", &json!({"topic": "rules"})).unwrap()["params"]["topic"], "rules");
+        // From a message being written: Writing mail.
+        assert_eq!(s.run("help.help", &json!({"compose": 7})).unwrap()["params"]["topic"], "writing");
     }
 
     #[test]

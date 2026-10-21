@@ -96,7 +96,7 @@ fn about(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 /// Built-in help topics (our own text): (key, title, text).
-const TOPICS: [(&str, &str, &str); 13] = [
+const TOPICS: [(&str, &str, &str); 14] = [
     (
         "getting-started",
         "Getting started",
@@ -115,7 +115,12 @@ const TOPICS: [(&str, &str, &str); 13] = [
     (
         "writing",
         "Writing mail",
-        "Choose New Email (Ctrl+Shift+M) to write a message. Reply, Reply All and Forward start a response in the reading pane; Pop Out moves it to its own window. Drafts are saved automatically.",
+        "Choose New Email (Ctrl+Shift+M) to write a message. Reply, Reply All and Forward start a response in the reading pane; Pop Out moves it to its own window. Drafts are saved automatically.\n\nMessage › Follow Up › Custom flags the message for you (label, start and due dates, reminder) and, under Flag for Recipients, for the people you send it to: their copies arrive flagged with your label, due date and reminder. The Tags group's launcher opens Properties: importance, sensitivity, encryption and signing, voting buttons, receipts, where replies go (Select Names picks the address), Do not deliver before, Expires after, where the sent copy is saved, contacts and categories.\n\nInsert › Calendar puts one of your calendars into the message, for today, the next days or dates you choose, as a daily schedule or a list, with as much detail as you pick, and can attach it as an iCalendar file. The Clipboard pane (Clipboard group launcher) collects what you copy in messages, in the reading pane and in other programs while MailCraft runs; its Options decide what it collects. Type the start of an AutoText entry (your name and initials are there from the start) and press F3 to insert it.",
+    ),
+    (
+        "proofing",
+        "Spelling, grammar and the Editor",
+        "MailCraft marks misspelled words in red, grammar in blue (agreement such as \u{201C}she don't\u{201D}, punctuation spacing, commonly confused words such as \u{201C}could of\u{201D} or \u{201C}their is\u{201D}) and writing refinements with a dotted line. Review › Spelling and Grammar (F7) steps through the corrections; its menu chooses whether it checks spelling only or grammar too, and the choice is remembered. Review › Editor opens the Editor pane: a score for the message and the suggestions grouped as spelling, grammar, clarity (passive voice), conciseness (wordy phrases), clich\u{e9}s, formality and inclusive language. Pick a group to go through it, apply a suggestion or ignore it. File › Options › Mail › Editor Options turns each refinement group on or off.",
     ),
     (
         "calendar",

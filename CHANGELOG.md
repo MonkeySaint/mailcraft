@@ -2,6 +2,23 @@
 
 What changed in each MailCraft release. Help › What's New shows the newest entries from this file.
 
+## Unreleased
+
+- Proofing: grammar checks for article and verb agreement, punctuation spacing and commonly confused words,
+  and writing refinements (passive voice, wordy phrases, clichés, informal words, inclusive language).
+- Review › Editor opens the Editor pane with a score and the suggestions by group; Spelling and Grammar
+  remembers whether it checks spelling only or grammar too.
+- Follow Up › Custom keeps the label, start and due dates and the reminder together, and can flag the
+  message for its recipients.
+- Properties: encryption and signing, Expires after, categories, contacts, Do not AutoArchive, date pickers,
+  Select Names for replies and voting presets.
+- Insert › Calendar: any calendar, date-range presets, working hours only, a daily schedule or list layout
+  and an attached .ics file.
+- The Clipboard pane collects copies from the reading pane and other programs, with an Options menu.
+- AutoText starts with your name and initials; F3 in a message inserts the entry you started typing.
+- Font Color has High-contrast only; Insert › Symbol has the smiling face; F1 in a message opens Writing
+  mail help.
+
 ## 0.2.0
 
 - Data files: Remove keeps the data file so File › Open Data File can open it again; Data File Properties.

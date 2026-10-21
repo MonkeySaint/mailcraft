@@ -10,6 +10,11 @@ use super::common::{self, Dlg, Out, btn, footer, muted, primary, window, with_st
 use super::folders::last_error;
 use crate::App;
 
+/// Send a Calendar: limit the times shown to the working hours of Options › Calendar.
+pub const SEND_CALENDAR_WORKING_HOURS: &str = "Working hours only";
+/// Send a Calendar: show the details of private items too.
+pub const SEND_CALENDAR_PRIVATE: &str = "Show details of private items";
+
 // ---------------------------------------------------------------------------------------------------------
 // Generic form
 
@@ -561,29 +566,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "insertCalendar" => {
-            let today = common::today(app);
-            run_form(
-                ctx,
-                app,
-                d,
-                Form::new(
-                    "Send a Calendar via Email",
-                    vec![
-                        f("calendar", "Calendar:", combo(&["Calendar"])),
-                        f("from", "From (YYYY-MM-DD):", Kind::Text),
-                        f("to", "To (YYYY-MM-DD):", Kind::Text),
-                        f("detail", "Detail:", combo(&["availability", "limited", "full"])),
-                    ],
-                )
-                .init("from", json!(today))
-                .init("to", json!(today))
-                .ok("Insert"),
-                |app, v| {
-                    cmd(app, "insert.calendar", with(json!({"calendar": v.s("calendar"), "from": v.s("from"), "to": v.s("to"), "detail": v.s("detail")}))).map(|_| None)
-                },
-            )
-        }
+        "insertCalendar" => send_calendar(ctx, app, d),
         "attachFile" => run_form(
             ctx,
             app,
@@ -1074,4 +1057,142 @@ fn accessibility(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         }
         footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
     })
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Send a Calendar via Email
+
+/// The Send a Calendar dialog's choices.
+#[derive(Clone, Default)]
+struct SendCalendar {
+    /// Index into the calendars offered.
+    calendar: usize,
+    /// Index into the date-range presets; one past the end = "Specify dates".
+    range: usize,
+    from: String,
+    to: String,
+    detail: usize,
+    working_hours: bool,
+    include_private: bool,
+    layout: usize,
+    ics: bool,
+    error: String,
+}
+
+/// "Specify dates" (the last Date Range choice).
+pub(crate) const SPECIFY_DATES: &str = "Specify dates";
+
+fn send_calendar(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    use mailcraft_engine::cmd::insert::{
+        CALENDAR_DETAILS, CALENDAR_LAYOUTS, CALENDAR_RANGES, calendar_folders,
+    };
+    let uid = d.uid;
+    let compose = d.u64("compose");
+    let calendars = calendar_folders(&app.s);
+    let today = common::today(app);
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| SendCalendar {
+            from: today.clone(),
+            to: today.clone(),
+            detail: 1,
+            ics: true,
+            ..Default::default()
+        },
+        |st, app| {
+            window(ctx, app, d, "Send a Calendar via Email", 470.0, |ui, app| {
+                muted(ui, app, "Choose the calendar and how much of it to put in the message.");
+                let names: Vec<&str> = calendars.iter().map(|(_, n)| n.as_str()).collect();
+                let mut ranges: Vec<&str> = CALENDAR_RANGES.iter().map(|(_, l)| *l).collect();
+                ranges.push(SPECIFY_DATES);
+                let details: Vec<&str> = CALENDAR_DETAILS.iter().map(|(_, l)| *l).collect();
+                let layouts: Vec<&str> = CALENDAR_LAYOUTS.iter().map(|(_, l)| *l).collect();
+                egui::Grid::new(("sendcal", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Calendar:");
+                    if names.is_empty() {
+                        ui.label("(no calendars)");
+                    } else {
+                        common::combo_idx(ui, ("sc-cal", uid), &mut st.calendar, &names, 260.0);
+                    }
+                    ui.end_row();
+                    ui.label("Date Range:");
+                    common::combo_idx(ui, ("sc-range", uid), &mut st.range, &ranges, 180.0);
+                    ui.end_row();
+                    if st.range >= CALENDAR_RANGES.len() {
+                        ui.label("Start:");
+                        common::date_box(ui, app, ("sc-from", uid), &mut st.from, "", "Start date");
+                        ui.end_row();
+                        ui.label("End:");
+                        common::date_box(ui, app, ("sc-to", uid), &mut st.to, "", "End date");
+                        ui.end_row();
+                    }
+                    ui.label("Detail:");
+                    common::combo_idx(ui, ("sc-detail", uid), &mut st.detail, &details, 180.0);
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut st.working_hours, SEND_CALENDAR_WORKING_HOURS);
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut st.include_private, SEND_CALENDAR_PRIVATE);
+                    ui.end_row();
+                    ui.label("Email Layout:");
+                    common::combo_idx(ui, ("sc-layout", uid), &mut st.layout, &layouts, 180.0);
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut st.ics, "Attach the calendar as an iCalendar (.ics) file");
+                    ui.end_row();
+                });
+                let hint = match CALENDAR_DETAILS.get(st.detail).map(|(id, _)| *id) {
+                    Some("availability") => "Shows only when you are free or busy.",
+                    Some("full") => "Shows subjects, locations and notes.",
+                    _ => "Shows times and subjects.",
+                };
+                muted(ui, app, hint);
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                let mut out = Out::Keep;
+                let ok = footer(ui, |ui| {
+                    if btn(ui, "Cancel") {
+                        out = Out::Close;
+                    }
+                    primary(ui, app, !calendars.is_empty(), "OK")
+                });
+                if ok && matches!(out, Out::Keep) {
+                    let mut p = json!({
+                        "detail": CALENDAR_DETAILS.get(st.detail).map_or("limited", |(id, _)| *id),
+                        "layout": CALENDAR_LAYOUTS.get(st.layout).map_or("list", |(id, _)| *id),
+                        "workingHours": st.working_hours,
+                        "includePrivate": st.include_private,
+                        "ics": st.ics,
+                    });
+                    if let Some(o) = p.as_object_mut() {
+                        if let Some(c) = compose {
+                            o.insert("compose".into(), json!(c));
+                        }
+                        if let Some((id, _)) = calendars.get(st.calendar) {
+                            o.insert("calendar".into(), json!(id.0));
+                        }
+                        match CALENDAR_RANGES.get(st.range) {
+                            Some((id, _)) => {
+                                o.insert("range".into(), json!(id));
+                            }
+                            None => {
+                                o.insert("from".into(), json!(st.from.trim()));
+                                o.insert("to".into(), json!(st.to.trim()));
+                            }
+                        }
+                    }
+                    if app.run("insert.calendar", p).is_some() {
+                        out = Out::Close;
+                    } else {
+                        st.error = last_error(app);
+                    }
+                }
+                out
+            })
+        },
+    )
 }

@@ -108,6 +108,113 @@ pub fn copy_html(html: &str, text: &str) -> bool {
     clipboard_hooks().write_html.is_some_and(|w| w(html, text))
 }
 
+/// How often the system clipboard is looked at while MailCraft runs (seconds).
+pub const WATCH_SECS: f64 = 1.5;
+
+/// What the clipboard watch saw last.
+#[derive(Clone, Debug, Default)]
+struct Watch {
+    last_check: Option<f64>,
+    last_text: Option<String>,
+    /// The last text collected from another program (taken back out when that program clears the clipboard).
+    collected: Option<String>,
+}
+
+/// Whether `text` looks like a password or a one-time code (a password manager's copy): one short token
+/// with no spaces that is either 4 to 10 numerals or mixes at least three of lower case, upper case,
+/// numerals and symbols without a word-like run of lower-case letters. Addresses (`://`, `@`) are not secrets. Such copies are never collected: password
+/// managers mark them as concealed on the clipboard, a mark the plain-text reader cannot see.
+pub fn looks_secret(text: &str) -> bool {
+    let t = text.trim();
+    let n = t.chars().count();
+    if !(4..=128).contains(&n) || t.chars().any(char::is_whitespace) || t.contains("://") || t.contains('@') {
+        return false;
+    }
+    if t.chars().all(|c| c.is_ascii_digit()) {
+        return n <= 10;
+    }
+    let classes = [
+        t.chars().any(char::is_lowercase),
+        t.chars().any(char::is_uppercase),
+        t.chars().any(|c| c.is_ascii_digit()),
+        t.chars().any(|c| !c.is_alphanumeric()),
+    ];
+    // Written words ("Q3-report") have runs of lower-case letters; generated secrets rarely do.
+    let mut run = 0usize;
+    let mut longest = 0usize;
+    for c in t.chars() {
+        run = if c.is_lowercase() { run.saturating_add(1) } else { 0 };
+        longest = longest.max(run);
+    }
+    n >= 8 && longest < 5 && classes.iter().filter(|b| **b).count() >= 3
+}
+
+/// Whether the watch reads the system clipboard at all: a reader is installed, "Collect text copied in
+/// other programs" is on, and a Clipboard pane is open unless "Collect copies while the Clipboard pane is
+/// closed" is on (off by default).
+pub fn watching(app: &crate::App) -> bool {
+    let pane_open = app.s.composes.values().any(|c| c.editor.clipboard_pane);
+    clipboard_hooks().read_text.is_some()
+        && app.s.settings.bool("state.clipboard.collectOther")
+        && (pane_open || app.s.settings.bool("state.clipboard.collectHidden"))
+}
+
+/// The Clipboard pane collects what is copied in other programs while MailCraft runs: every
+/// [`WATCH_SECS`] the system clipboard's text is compared with what was there before, and a new copy that
+/// MailCraft did not make itself goes to `format.clipboardCollect`. What was on the clipboard when the watch
+/// started is not collected, and neither is anything that [`looks_secret`]. The clipboard is read only while
+/// [`watching`]. When the other program clears the clipboard, the copy it had put there leaves the history
+/// again.
+pub fn clipboard_watch(ctx: &egui::Context, app: &mut crate::App) {
+    let id = egui::Id::new("mailcraft-clipboard-watch");
+    if !watching(app) {
+        // Start afresh next time: what was copied meanwhile is not collected when the pane opens.
+        ctx.data_mut(|d| d.remove_temp::<Watch>(id));
+        return;
+    }
+    let now = ctx.input(|i| i.time);
+    let mut w: Watch = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
+    ctx.request_repaint_after(std::time::Duration::from_secs_f64(WATCH_SECS));
+    if w.last_check.is_some_and(|t| now - t < WATCH_SECS) {
+        return;
+    }
+    w.last_check = Some(now);
+    let text = clipboard_text().unwrap_or_default();
+    let first = w.last_text.is_none();
+    let changed = w.last_text.as_deref() != Some(text.as_str());
+    if changed {
+        w.last_text = Some(text.clone());
+    }
+    // Cleared by the program that put it there: take that copy back out.
+    let forget = if changed && text.trim().is_empty() { w.collected.take() } else { None };
+    if changed && !text.trim().is_empty() {
+        w.collected = None;
+    }
+    // MailCraft's own copies (Copy in a message, the reading pane) are in the history already.
+    let own = app.s.clipboard_text.as_deref().is_some_and(|t| t.trim() == text.trim());
+    let collect = !(first || !changed || own || text.trim().is_empty() || looks_secret(&text));
+    if collect {
+        w.collected = Some(text.clone());
+    }
+    ctx.data_mut(|d| d.insert_temp(id, w));
+    if let Some(gone) = forget {
+        if app.run("format.clipboardCollect", serde_json::json!({"text": gone, "forget": true})).is_some() {
+            ctx.request_repaint();
+        }
+        return;
+    }
+    if !collect {
+        return;
+    }
+    let mut p = serde_json::json!({"text": text, "source": "other"});
+    if let (Some(html), Some(o)) = (html_for_paste(&text), p.as_object_mut()) {
+        o.insert("html".into(), serde_json::json!(html));
+    }
+    if app.run("format.clipboardCollect", p).is_some() {
+        ctx.request_repaint();
+    }
+}
+
 /// Letters and digits of `s`, lower-cased (list markers, punctuation and spacing differ between the HTML
 /// and text flavours of the same copy).
 fn letters(s: &str) -> String {

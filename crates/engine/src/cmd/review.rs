@@ -17,7 +17,7 @@ use crate::compose::{ComposeState, DocPos, SpellIssue, TextIssue};
 use crate::settings::Settings;
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_model::{Doc, ItemId};
-use mailcraft_proof::{IssueKind, SpellOptions, Speller};
+use mailcraft_proof::{IssueKind, Refinements, SpellOptions, Speller};
 
 mod accessibility;
 
@@ -68,17 +68,32 @@ pub fn speller(s: &Session) -> Speller {
     sp
 }
 
+/// Whether Writing Style is "Grammar & Refinements" (else "Grammar": no refinements are checked).
+pub fn refinements_on(st: &Settings) -> bool {
+    st.text("mail.editor.writingStyle") == "grammarRefinements"
+}
+
 /// Options › Mail › Editor Options › Proofing as checker options: "Ignore words in UPPERCASE", "Ignore words
-/// that contain numbers", "Ignore Internet and file addresses", "Flag repeated words" and "Suggest from main
-/// dictionary only". The grammar checks always run: the Spelling and Grammar dialog has its own switch, and
-/// "Mark grammar errors as you type" only decides what the editor underlines ([`live_proofing`]).
+/// that contain numbers", "Ignore Internet and file addresses", "Flag repeated words", "Frequently confused
+/// words", "Suggest from main dictionary only" and the Writing Style with its settings (which refinements).
+/// The grammar checks always run: the Spelling and Grammar dialog has its own switch, and "Mark grammar
+/// errors as you type" only decides what the editor underlines ([`live_proofing`]).
 pub fn spell_options(st: &Settings) -> SpellOptions {
+    let refine = refinements_on(st);
     SpellOptions {
         ignore_uppercase: st.bool("mail.editor.ignoreUppercase"),
         ignore_words_with_numbers: st.bool("mail.editor.ignoreNumbers"),
         ignore_internet_and_file_addresses: st.bool("mail.editor.ignoreInternet"),
         flag_repeated_words: st.bool("mail.editor.flagRepeated"),
         check_grammar: true,
+        confused_words: st.bool("mail.editor.confusedWords"),
+        refinements: Refinements {
+            clarity: refine && st.bool("mail.editor.refine.clarity"),
+            conciseness: refine && st.bool("mail.editor.refine.conciseness"),
+            cliches: refine && st.bool("mail.editor.refine.cliches"),
+            formality: refine && st.bool("mail.editor.refine.formality"),
+            inclusiveness: refine && st.bool("mail.editor.refine.inclusiveness"),
+        },
         main_dictionary_only: st.bool("mail.editor.mainDictionaryOnly"),
     }
 }
@@ -89,20 +104,32 @@ pub struct LiveProofing {
     /// Squiggles under misspelled and repeated words ("Check spelling as you type"; "Flag repeated words" is
     /// a spelling option, and the Spelling dialog and the check before sending count them as spelling too).
     pub spelling: bool,
-    /// Blue underlines under grammar issues: sentence capitals, extra spaces ("Mark grammar errors as you
-    /// type").
+    /// Blue underlines under grammar issues: sentence capitals, extra spaces, agreement, punctuation,
+    /// confused words ("Mark grammar errors as you type").
     pub grammar: bool,
+    /// Dotted underlines under writing refinements: grammar marked as you type with Writing Style "Grammar &
+    /// Refinements".
+    pub refinements: bool,
 }
 
 impl LiveProofing {
+    /// Whether every kind of issue is underlined (the editor can paint the cached issues as they are).
+    pub fn all(self) -> bool {
+        self.spelling && self.grammar && self.refinements
+    }
+
     /// Whether the editor checks the body as you type at all.
     pub fn any(self) -> bool {
-        self.spelling || self.grammar
+        self.spelling || self.grammar || self.refinements
     }
 
     /// Whether an issue of `kind` (a [`SpellIssue::kind`]) is underlined.
     pub fn marks(self, kind: &str) -> bool {
-        if matches!(kind, "spelling" | "repeated") { self.spelling } else { self.grammar }
+        match kind {
+            "spelling" | "repeated" => self.spelling,
+            k if is_refinement(k) => self.refinements,
+            _ => self.grammar,
+        }
     }
 }
 
@@ -112,8 +139,31 @@ pub fn live_proofing(s: &Session) -> LiveProofing {
     LiveProofing {
         spelling: s.settings.bool("mail.editor.spellAsYouType"),
         grammar: s.settings.bool("mail.editor.grammarAsYouType"),
+        refinements: s.settings.bool("mail.editor.grammarAsYouType") && refinements_on(&s.settings),
     }
 }
+
+/// Whether issue kind `kind` (a [`SpellIssue::kind`]) is a writing refinement rather than a correction.
+pub fn is_refinement(kind: &str) -> bool {
+    IssueKind::from_id(kind).is_some_and(IssueKind::is_refinement)
+}
+
+/// The Editor pane group of issue kind `kind`: "spelling", "grammar", "clarity", "conciseness", "cliches",
+/// "formality" or "inclusiveness".
+pub fn issue_category(kind: &str) -> &'static str {
+    IssueKind::from_id(kind).map_or("spelling", IssueKind::category)
+}
+
+/// Editor pane groups in order: (id, title, refinement).
+pub const EDITOR_CATEGORIES: [(&str, &str, bool); 7] = [
+    ("spelling", "Spelling", false),
+    ("grammar", "Grammar", false),
+    ("clarity", "Clarity", true),
+    ("conciseness", "Conciseness", true),
+    ("cliches", "Clich\u{e9}s", true),
+    ("formality", "Formality", true),
+    ("inclusiveness", "Inclusiveness", true),
+];
 
 /// Fingerprint of checking options (cached issues found under other options are stale). Never 0, the key of
 /// a compose that was never checked. Dictionary changes need no key: Add to Dictionary drops the word from
@@ -131,15 +181,6 @@ pub fn spelling_stale(s: &Session, c: &ComposeState) -> bool {
     c.spelling_stale() || c.spell_options_key != options_key(&spell_options(&s.settings))
 }
 
-fn kind_label(k: IssueKind) -> &'static str {
-    match k {
-        IssueKind::Spelling => "spelling",
-        IssueKind::RepeatedWord => "repeated",
-        IssueKind::Capitalization => "capitalization",
-        IssueKind::DoubleSpace => "doubleSpace",
-    }
-}
-
 /// Issues in one paragraph's text as char ranges (the checker reports byte ranges).
 pub fn text_issues(sp: &Speller, text: &str) -> Vec<TextIssue> {
     let starts: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
@@ -152,8 +193,9 @@ pub fn text_issues(sp: &Speller, text: &str) -> Vec<TextIssue> {
             Some(TextIssue {
                 start: char_of(i.start)?,
                 end: char_of(i.end)?,
-                kind: kind_label(i.kind).to_owned(),
+                kind: i.kind.id().to_owned(),
                 suggestions: i.suggestions,
+                message: if i.kind == IssueKind::Spelling { String::new() } else { i.message },
             })
         })
         .collect()
@@ -195,7 +237,21 @@ fn fill_suggestions(sp: &Speller, c: &mut ComposeState, n: usize) {
 }
 
 fn issue_json(i: &SpellIssue) -> Value {
-    json!({"start": pos_json(&i.start), "end": pos_json(&i.end), "word": i.word, "kind": i.kind, "suggestions": i.suggestions})
+    json!({
+        "start": pos_json(&i.start),
+        "end": pos_json(&i.end),
+        "word": i.word,
+        "kind": i.kind,
+        "category": issue_category(&i.kind),
+        "message": i.message,
+        "suggestions": i.suggestions,
+    })
+}
+
+/// Whether the Spelling and Grammar button (and F7) checks grammar too, as last chosen in its menu
+/// (`state.review.spellingMode`; spelling only until the person picks Spelling and Grammar).
+pub fn grammar_mode(s: &Session) -> bool {
+    s.settings.text("state.review.spellingMode") == "grammar"
 }
 
 /// Checks the target compose (when stale) and returns it.
@@ -208,13 +264,28 @@ fn checked<'a>(s: &'a mut Session, p: &Value) -> Result<(&'a mut ComposeState, S
 }
 
 fn spelling(s: &mut Session, p: &Value) -> CmdResult {
-    let grammar = opt_bool(p, "grammar").unwrap_or(true);
+    let grammar = match opt_bool(p, "grammar") {
+        Some(g) => {
+            // The menu's choice is remembered: the button and F7 check the same way next time.
+            let mode = if g { "grammar" } else { "spelling" };
+            if s.settings.text("state.review.spellingMode") != mode {
+                s.settings.set("state.review.spellingMode", &json!(mode))?;
+            }
+            g
+        }
+        None => grammar_mode(s),
+    };
     let next = opt_bool(p, "next") == Some(true);
     let (c, sp) = checked(s, p)?;
     fill_suggestions(&sp, c, SUGGEST_FIRST);
     let words = c.word_count().words;
-    let shown: Vec<&SpellIssue> =
-        c.spell_issues.iter().filter(|i| grammar || i.kind == "spelling" || i.kind == "repeated").collect();
+    // The dialog steps through corrections; writing refinements are the Editor pane's.
+    let shown: Vec<&SpellIssue> = c
+        .spell_issues
+        .iter()
+        .filter(|i| !is_refinement(&i.kind))
+        .filter(|i| grammar || i.kind == "spelling" || i.kind == "repeated")
+        .collect();
     let issues: Vec<Value> = shown.iter().map(|i| issue_json(i)).collect();
     let count = issues.len();
     // F7: select the next issue after the selection.
@@ -281,6 +352,88 @@ fn drawing_spelling(sp: &Speller, c: &ComposeState, grammar: bool) -> Vec<Value>
         }
     }
     out
+}
+
+/// The Editor score (0–100): 100 for a message with nothing flagged, minus 4 points per correction and 2 per
+/// refinement for every 100 words (counted as at least 50 words, so one slip in a short note does not sink
+/// it). MailCraft's own measure; it only ranks how much the pane has to say.
+pub fn editor_score(corrections: usize, refinements: usize, words: usize) -> u32 {
+    let weight = corrections.saturating_mul(4).saturating_add(refinements.saturating_mul(2));
+    let penalty = weight.saturating_mul(100) / words.max(50);
+    u32::try_from(100usize.saturating_sub(penalty)).unwrap_or(0)
+}
+
+/// Review › Editor: the Editor pane. Without parameters toggles the pane (`show` sets it); either way returns
+/// the score, the counts per group ([`EDITOR_CATEGORIES`]) and the issues (only one group's with
+/// `category`). `select` selects an issue's text in the body (`{"path", "offset"}` of its start).
+fn editor(s: &mut Session, p: &Value) -> CmdResult {
+    let toggle =
+        p.get("category").is_none() && p.get("select").is_none() && opt_bool(p, "list") != Some(true);
+    let category = opt_str(p, "category").map(str::to_owned);
+    if let Some(c) = &category
+        && !EDITOR_CATEGORIES.iter().any(|(id, _, _)| id == c)
+    {
+        return Err(CmdError::Params(format!("unknown Editor category `{c}`")));
+    }
+    let select = match p.get("select") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(pos_param(v)?),
+    };
+    let (c, sp) = checked(s, p)?;
+    if let Some(on) = opt_bool(p, "show") {
+        c.editor.editor_pane = on;
+    } else if toggle {
+        c.editor.editor_pane = !c.editor.editor_pane;
+    }
+    let mut selected = Value::Null;
+    if let Some(at) = select {
+        let Some(issue) = c.spell_issue_at(&at).cloned() else {
+            return Err(CmdError::Failed("there is no issue there".into()));
+        };
+        c.selection = crate::compose::BodySelection { anchor: issue.start.clone(), focus: issue.end.clone() };
+        c.pending_style = None;
+        if issue.suggestions.is_empty() && issue.kind == "spelling" {
+            let sugg = sp.suggest(&issue.word, SUGGESTIONS);
+            if let Some(cached) = c.spell_issues.iter_mut().find(|x| x.start == issue.start) {
+                cached.suggestions = sugg;
+            }
+        }
+        selected = c.spell_issues.iter().find(|x| x.start == issue.start).map_or(Value::Null, issue_json);
+    }
+    // Suggestions for the misspellings the pane lists (the overview shows counts only, so none there).
+    let listed = |i: &SpellIssue| category.as_deref().is_none_or(|cat| issue_category(&i.kind) == cat);
+    if category.is_some() {
+        for issue in
+            c.spell_issues.iter_mut().filter(|i| i.kind == "spelling" && listed(i)).take(SUGGEST_FIRST)
+        {
+            if issue.suggestions.is_empty() {
+                issue.suggestions = sp.suggest(&issue.word, SUGGESTIONS);
+            }
+        }
+    }
+    let mut counts = serde_json::Map::new();
+    for (id, _, _) in EDITOR_CATEGORIES {
+        let n = c.spell_issues.iter().filter(|i| issue_category(&i.kind) == id).count();
+        counts.insert(id.to_owned(), json!(n));
+    }
+    let refinements = c.spell_issues.iter().filter(|i| is_refinement(&i.kind)).count();
+    let corrections = c.spell_issues.len().saturating_sub(refinements);
+    let words = c.word_count().words;
+    let issues: Vec<Value> = c.spell_issues.iter().filter(|i| listed(i)).map(issue_json).collect();
+    Ok(json!({
+        "compose": c.id,
+        "editorPane": c.editor.editor_pane,
+        "score": editor_score(corrections, refinements, words),
+        "corrections": corrections,
+        "refinements": refinements,
+        "counts": counts,
+        "category": category,
+        "issues": issues,
+        "selected": selected,
+        "words": words,
+        "language": c.language.clone().unwrap_or_else(|| "en-US".into()),
+        "notChecked": proofing_off(c),
+    }))
 }
 
 /// `{"at": {path, offset}}` when given.
@@ -698,6 +851,16 @@ pub fn specs() -> Vec<CommandSpec> {
             spelling,
         ),
         spec(
+            "review.editor",
+            "Editor",
+            "Review › Editor; Message › Editor",
+            "",
+            r#"{"show"?:bool,"list"?:bool,"category"?:"spelling"|"grammar"|"clarity"|"conciseness"|"cliches"|"formality"|"inclusiveness","select"?:{"path":[number],"offset":number}}"#,
+            false,
+            has_compose,
+            editor,
+        ),
+        spec(
             "review.thesaurus",
             "Thesaurus",
             "Review › Editor",
@@ -829,7 +992,7 @@ mod tests {
         let mut s = session();
         let id = open(&mut s);
         s.run("compose.insertText", &json!({"text": "this is is Zorbleflax.\nZorbleflax again"})).unwrap();
-        let r = s.run("review.spelling", &json!({})).unwrap();
+        let r = s.run("review.spelling", &json!({"grammar": true})).unwrap();
         let kinds: Vec<&str> =
             r["issues"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap()).collect();
         assert!(kinds.contains(&"capitalization") && kinds.contains(&"repeated"), "{kinds:?}");
@@ -863,6 +1026,89 @@ mod tests {
         // Undo of the dictionary addition.
         s.run("app.undo", &json!({})).unwrap();
         assert!(!s.mailbox.in_dictionary("zorbleflax"));
+    }
+
+    #[test]
+    fn spelling_mode_is_remembered() {
+        let mut s = session();
+        open(&mut s);
+        s.run("compose.insertText", &json!({"text": "she don't know Zorbleflax."})).unwrap();
+        // Spelling only until Spelling and Grammar is picked (as observed: Spelling [On]).
+        let r = s.run("review.spelling", &json!({})).unwrap();
+        assert_eq!(r["grammar"], false);
+        assert!(r["issues"].as_array().unwrap().iter().all(|i| i["kind"] == "spelling"), "{r}");
+        s.run("review.spelling", &json!({"grammar": true})).unwrap();
+        assert!(grammar_mode(&s));
+        let r = s.run("review.spelling", &json!({})).unwrap();
+        let kinds: Vec<&str> =
+            r["issues"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"agreement") && kinds.contains(&"capitalization"), "{kinds:?}");
+        let agreement = r["issues"].as_array().unwrap().iter().find(|i| i["kind"] == "agreement").unwrap();
+        assert_eq!(agreement["suggestions"][0], "doesn't");
+        assert_eq!(agreement["category"], "grammar");
+        assert!(!agreement["message"].as_str().unwrap().is_empty());
+        s.run("review.spelling", &json!({"grammar": false})).unwrap();
+        assert!(!grammar_mode(&s));
+    }
+
+    #[test]
+    fn editor_pane_counts_scores_filters_and_selects() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run(
+            "compose.insertText",
+            &json!({"text": "We met in order to plan. The report was written by the chairman. Their is a Zorbleflax."}),
+        )
+        .unwrap();
+        let r = s.run("review.editor", &json!({})).unwrap();
+        assert_eq!(r["editorPane"], true);
+        assert!(s.composes[&id].editor.editor_pane);
+        let counts = &r["counts"];
+        assert_eq!(counts["spelling"], 1, "{r}");
+        assert_eq!(counts["grammar"], 1, "{r}");
+        assert_eq!(counts["conciseness"], 1, "{r}");
+        assert_eq!(counts["clarity"], 1, "{r}");
+        assert_eq!(counts["inclusiveness"], 1, "{r}");
+        assert_eq!(r["corrections"], 2);
+        assert_eq!(r["refinements"], 3);
+        let score = r["score"].as_u64().unwrap();
+        assert!(score < 100 && score > 50, "{score}");
+        // The overview shows counts only: no suggestions are looked up for it.
+        assert!(
+            s.composes[&id].spell_issues.iter().all(|i| i.suggestions.is_empty() || i.kind != "spelling")
+        );
+        // One group, with suggestions for misspellings.
+        let r = s.run("review.editor", &json!({"category": "spelling"})).unwrap();
+        let issues = r["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(
+            !issues[0]["suggestions"].as_array().unwrap().is_empty() || issues[0]["word"] == "Zorbleflax"
+        );
+        assert_eq!(r["editorPane"], true, "listing does not toggle the pane");
+        let r = s.run("review.editor", &json!({"category": "conciseness"})).unwrap();
+        let wordy = r["issues"][0].clone();
+        assert_eq!(wordy["word"], "in order to");
+        assert_eq!(wordy["suggestions"][0], "to");
+        // Select it, then apply the suggestion.
+        let r = s.run("review.editor", &json!({"select": wordy["start"]})).unwrap();
+        assert_eq!(r["selected"]["word"], "in order to");
+        assert_eq!(s.composes[&id].selected_text(), "in order to");
+        s.run("review.correct", &json!({"at": wordy["start"], "replacement": "to"})).unwrap();
+        assert!(s.composes[&id].body.to_plain_text().starts_with("We met to plan."));
+        // The Spelling and Grammar dialog leaves refinements to the pane.
+        let r = s.run("review.spelling", &json!({"grammar": true})).unwrap();
+        assert!(r["issues"].as_array().unwrap().iter().all(|i| !is_refinement(i["kind"].as_str().unwrap())));
+        // Refinement groups follow the options.
+        set(&mut s, "mail.editor.refine.inclusiveness", json!(false));
+        let r = s.run("review.editor", &json!({"list": true})).unwrap();
+        assert_eq!(r["counts"]["inclusiveness"], 0);
+        assert!(s.run("review.editor", &json!({"category": "style"})).is_err());
+        assert!(s.run("review.editor", &json!({"select": {"path": [9], "offset": 0}})).is_err());
+        let r = s.run("review.editor", &json!({"show": false})).unwrap();
+        assert_eq!(r["editorPane"], false);
+        assert_eq!(editor_score(0, 0, 10), 100);
+        assert_eq!(editor_score(1, 0, 10), 92);
+        assert_eq!(editor_score(1000, 1000, 10), 0);
     }
 
     #[test]
@@ -1021,15 +1267,27 @@ mod tests {
     fn live_proofing_follows_the_options() {
         let mut s = session();
         let id = open(&mut s);
-        assert_eq!(live_proofing(&s), LiveProofing { spelling: true, grammar: true });
+        assert_eq!(live_proofing(&s), LiveProofing { spelling: true, grammar: true, refinements: true });
         set(&mut s, "mail.editor.spellAsYouType", json!(false));
         let live = live_proofing(&s);
         // Repeated words are spelling, as in the Spelling dialog and the check before sending.
         assert!(
             live.any() && !live.marks("spelling") && !live.marks("repeated") && live.marks("capitalization")
         );
+        // Writing Style "Grammar": refinements are neither checked nor marked; grammar still is.
+        set(&mut s, "mail.editor.writingStyle", json!("grammar"));
+        let live = live_proofing(&s);
+        assert!(live.marks("agreement") && !live.marks("passive") && !live.all());
+        assert_eq!(spell_options(&s.settings).refinements, mailcraft_proof::Refinements::NONE);
+        set(&mut s, "mail.editor.writingStyle", json!("grammarRefinements"));
+        assert!(live_proofing(&s).marks("passive"));
+        // Grammar not marked as you type: refinements are not either.
         set(&mut s, "mail.editor.grammarAsYouType", json!(false));
         assert!(!live_proofing(&s).any());
+        // Frequently confused words off: the check leaves them alone.
+        assert!(spell_options(&s.settings).confused_words);
+        set(&mut s, "mail.editor.confusedWords", json!(false));
+        assert!(!spell_options(&s.settings).confused_words);
         set(&mut s, "mail.editor.spellAsYouType", json!(true));
         let live = live_proofing(&s);
         assert!(live.marks("spelling") && live.marks("repeated") && !live.marks("capitalization"));

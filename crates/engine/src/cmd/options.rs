@@ -18,11 +18,12 @@ pub const PAGES: [(&str, &str); 14] = settings::PAGES;
 
 /// Pages opened from elsewhere that land on a section of a page: (alias, page, section). Set Default Paste
 /// (Message › Paste) opens `editorAdvanced`: the paste defaults.
-const ALIASES: [(&str, &str, &str); 8] = [
+const ALIASES: [(&str, &str, &str); 9] = [
     ("signatures", "mail", "signatures"),
     ("editorAdvanced", "mail", settings::EDITOR_PASTE),
     ("setDefaultPaste", "mail", settings::EDITOR_PASTE),
     ("editorProofing", "mail", settings::EDITOR_PROOFING),
+    ("writingStyle", "mail", settings::EDITOR_WRITING_STYLE),
     ("readingPane", "mail", "readingPane"),
     ("sendReceive", "advanced", "sendReceive"),
     ("workHours", "calendar", "Work time"),
@@ -67,7 +68,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "options.open",
             "Options",
-            r#"{"page"?: "general"|"mail"|…|"signatures"|"editorAdvanced"|"setDefaultPaste"|"editorProofing"|"language"}"#,
+            r#"{"page"?: "general"|"mail"|…|"signatures"|"editorAdvanced"|"setDefaultPaste"|"editorProofing"|"writingStyle"|"language"}"#,
             open,
         ),
         spec("options.set", "Set Option", r#"{"key": string, "value": any}"#, set),

@@ -2,7 +2,7 @@
 
 use egui::Key;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::{Value, json};
 
 use crate::{App, Surface};
@@ -362,6 +362,107 @@ fn options_apply_engine_settings_on_ok() {
     h.get_by_label("OK").click();
     step(&mut h);
     assert!(!h.state().s.settings.bool("mail.arrival.playSound"));
+}
+
+fn new_compose(app: &mut App) -> u64 {
+    app.run("mail.newEmail", json!({})).and_then(|v| v.get("compose").and_then(Value::as_u64)).unwrap()
+}
+
+#[test]
+fn custom_flag_for_a_new_message_flags_the_recipients_and_clears() {
+    let mut app = sample_app();
+    let c = new_compose(&mut app);
+    app.run("compose.followUp", json!({"compose": c, "kind": "custom"})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["customFlag"]);
+    // Nothing is flagged yet: Clear Flag is greyed out.
+    assert!(h.get_by_label("Clear Flag").accesskit_node().is_disabled());
+    h.get_by_label("Flag for Recipients").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", names(&h));
+    let cs = h.state().s.composes[&c].clone();
+    assert!(matches!(cs.flag, FlagState::Flagged { .. }));
+    assert_eq!(cs.recipient_flag.as_ref().map(|r| r.label.as_str()), Some("Follow up"));
+    // Reopened, the dialog shows both and Clear Flag clears both.
+    h.state_mut().run("compose.followUp", json!({"compose": c, "kind": "custom"}));
+    step(&mut h);
+    assert!(!h.get_by_label("Clear Flag").accesskit_node().is_disabled());
+    h.get_by_label("Clear Flag").click();
+    step(&mut h);
+    let cs = h.state().s.composes[&c].clone();
+    assert_eq!(cs.flag, FlagState::None);
+    assert!(cs.recipient_flag.is_none());
+}
+
+#[test]
+fn properties_dialog_sets_security_expiry_and_archive() {
+    let mut app = sample_app();
+    let c = new_compose(&mut app);
+    app.run("compose.messageOptions", json!({"compose": c})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["messageOptions"]);
+    for label in [
+        super::mailopts::PROPERTIES_ENCRYPT,
+        super::mailopts::PROPERTIES_SIGN,
+        "Expires after",
+        "Do not AutoArchive this item",
+    ] {
+        h.get_by_label(label).click();
+        step(&mut h);
+    }
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", names(&h));
+    let cs = h.state().s.composes[&c].clone();
+    assert!(cs.encrypt && cs.sign && cs.no_auto_archive);
+    assert!(cs.expires.is_some());
+}
+
+#[test]
+fn properties_select_names_fills_the_reply_address() {
+    let mut app = sample_app();
+    let c = new_compose(&mut app);
+    app.run("compose.messageOptions", json!({"compose": c})).unwrap();
+    let mut h = harness(app);
+    h.get_by_label("Have replies sent to").click();
+    step(&mut h);
+    h.get_by_label("Select Names...").click();
+    step(&mut h);
+    assert_eq!(names(&h), ["messageOptions", "addressBook"]);
+    // The address book's one box (last text box) takes the address; OK hands it back.
+    let boxes = h.query_all_by_role(egui::accesskit::Role::TextInput).count();
+    h.query_all_by_role(egui::accesskit::Role::TextInput).nth(boxes - 1).unwrap().focus();
+    step(&mut h);
+    h.query_all_by_role(egui::accesskit::Role::TextInput)
+        .nth(boxes - 1)
+        .unwrap()
+        .type_text("reply@example.com");
+    step(&mut h);
+    h.query_all_by_label("OK").last().unwrap().click();
+    step(&mut h);
+    assert_eq!(names(&h), ["messageOptions"]);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert_eq!(h.state().s.composes[&c].reply_to, "reply@example.com");
+}
+
+#[test]
+fn send_a_calendar_inserts_the_chosen_calendar_with_an_ics() {
+    let mut app = sample_app();
+    let c = new_compose(&mut app);
+    app.run("insert.calendar", json!({"compose": c})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["insertCalendar"]);
+    h.get_by_label(super::compose_dlg::SEND_CALENDAR_WORKING_HOURS).click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", names(&h));
+    let cs = h.state().s.composes[&c].clone();
+    assert!(cs.body.to_plain_text().contains("Working hours only"), "{}", cs.body.to_plain_text());
+    assert!(cs.attachments.iter().any(|a| a.filename.ends_with(".ics")));
 }
 
 #[test]

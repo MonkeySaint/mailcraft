@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 
-use crate::cmd::util::{dialog, mail_targets, opt_folder};
+use crate::cmd::util::{dialog, mail_targets, opt_folder, opt_str};
 use crate::queries;
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
 use mailcraft_model::{FolderKind, ItemId, MailItem};
@@ -224,6 +224,8 @@ fn copy(s: &mut Session, p: &Value) -> CmdResult {
         let text = text.as_str().ok_or_else(|| CmdError::Params("`text` must be a string".into()))?;
         let text: String = text.chars().take(MAX_CLIPBOARD_CHARS).collect();
         let chars = text.chars().count();
+        // Copies from the reading pane join the Clipboard pane's history too.
+        crate::cmd::format::collect_clip(s, &text, opt_str(p, "html"), false);
         s.clipboard_text = Some(text);
         return Ok(json!({"copied_text": chars}));
     }

@@ -1439,6 +1439,8 @@ fn editable_picture(layout: &Layout, c: &ComposeState, p: mailcraft_geom::Point)
 const SPELLING_INK: Color32 = Color32::from_rgb(0xd8, 0x2c, 0x2c);
 /// Grammar underline colour.
 const GRAMMAR_INK: Color32 = Color32::from_rgb(0x2b, 0x5c, 0xd6);
+/// Dotted underline of writing refinements (Editor pane suggestions).
+const REFINE_INK: Color32 = Color32::from_rgb(0x8a, 0x3f, 0xb8);
 
 /// x of char offset `off` on `line`, or the line's right end when `off` is past its last stop.
 fn x_end(line: &LineBox, off: usize) -> f32 {
@@ -1446,6 +1448,16 @@ fn x_end(line: &LineBox, off: usize) -> f32 {
         Some(s) => s.x,
         None => line.stops.iter().map(|s| s.x).fold(line.rect.x, f32::max),
     }
+}
+
+/// The cached issues the editor underlines under `live` (all of them only when every kind is marked).
+fn marked_issues(live: LiveProofing, issues: &[SpellIssue]) -> std::borrow::Cow<'_, [SpellIssue]> {
+    if live.all() {
+        return std::borrow::Cow::Borrowed(issues);
+    }
+    std::borrow::Cow::Owned(
+        issues.iter().filter(|i| live.marks(&i.kind)).take(MAX_SQUIGGLES).cloned().collect(),
+    )
 }
 
 /// Screen spans `(x0, x1, baseline_y)` of the issues, per line, in layout coordinates.
@@ -1474,13 +1486,33 @@ fn issue_spans(layout: &Layout, issues: &[SpellIssue]) -> Vec<(f32, f32, f32, bo
     out
 }
 
-/// Red wavy underlines (spelling) and blue double underlines (grammar).
+/// Red wavy underlines (spelling), blue double underlines (grammar) and purple dotted underlines (writing
+/// refinements).
 fn paint_squiggles(ui: &Ui, layout: &Layout, issues: &[SpellIssue], origin: Pos2, zoom: f32) {
     let clip = ui.clip_rect();
     let painter = ui.painter().with_clip_rect(clip);
     let amp = (1.2 * zoom).clamp(0.8, 3.0);
     let step = (2.0 * zoom).clamp(1.5, 6.0);
-    for (x0, x1, base, spelling) in issue_spans(layout, issues) {
+    let (refine, issues): (Vec<SpellIssue>, Vec<SpellIssue>) = issues
+        .iter()
+        .take(MAX_SQUIGGLES)
+        .cloned()
+        .partition(|i| mailcraft_engine::cmd::review::is_refinement(&i.kind));
+    for (x0, x1, base, _) in issue_spans(layout, &refine) {
+        let y = origin.y + base + (2.5 * zoom).max(2.0);
+        if y < clip.top() - 4.0 || y > clip.bottom() + 4.0 {
+            continue;
+        }
+        let dot = (1.0 * zoom).clamp(0.8, 2.0);
+        let mut x = origin.x + x0;
+        let mut n = 0;
+        while x <= origin.x + x1 && n < 4096 {
+            painter.circle_filled(pos2(x, y + 1.0), dot * 0.6, REFINE_INK);
+            x += dot * 3.0;
+            n += 1;
+        }
+    }
+    for (x0, x1, base, spelling) in issue_spans(layout, &issues) {
         let y = origin.y + base + (2.5 * zoom).max(2.0);
         let (x0, x1) = (origin.x + x0, origin.x + x1);
         if y < clip.top() - 4.0 || y > clip.bottom() + 4.0 {
@@ -1549,6 +1581,10 @@ fn menu_ui(ui: &mut Ui, at: &MenuAt, has_selection: bool) -> Option<Pick> {
     let mut pick = None;
     ui.set_min_width(200.0);
     if let Some(issue) = &at.issue {
+        // What the checker says (grammar and refinements; a misspelling needs no words).
+        if !issue.message.is_empty() {
+            ui.add(egui::Label::new(egui::RichText::new(&issue.message).weak()).wrap());
+        }
         if at.suggestions.is_empty() {
             ui.add_enabled(false, egui::Button::new(NO_SUGGESTIONS));
         }
@@ -1990,18 +2026,7 @@ pub(crate) fn body_editor_in(
             && c.spell_rev == Some(c.edit_rev)
             && !c.spell_issues.is_empty()
         {
-            if live.spelling && live.grammar {
-                paint_squiggles(ui, layout, &c.spell_issues, origin, zoom);
-            } else {
-                let marked: Vec<SpellIssue> = c
-                    .spell_issues
-                    .iter()
-                    .filter(|i| live.marks(&i.kind))
-                    .take(MAX_SQUIGGLES)
-                    .cloned()
-                    .collect();
-                paint_squiggles(ui, layout, &marked, origin, zoom);
-            }
+            paint_squiggles(ui, layout, &marked_issues(live, &c.spell_issues), origin, zoom);
         }
     }
 
@@ -2189,6 +2214,30 @@ mod tests {
     }
 
     #[test]
+    fn only_the_marked_kinds_are_underlined() {
+        let issue = |kind: &str| SpellIssue {
+            start: DocPos::new(vec![0], 0),
+            end: DocPos::new(vec![0], 2),
+            word: String::new(),
+            kind: kind.into(),
+            suggestions: Vec::new(),
+            message: String::new(),
+        };
+        let all = [issue("spelling"), issue("agreement"), issue("wordiness"), issue("passive")];
+        let kinds = |live: LiveProofing| -> Vec<String> {
+            marked_issues(live, &all).iter().map(|i| i.kind.clone()).collect()
+        };
+        assert_eq!(kinds(LiveProofing { spelling: true, grammar: true, refinements: true }).len(), 4);
+        // Spelling and grammar marked, refinements not: no refinement underlines.
+        assert_eq!(
+            kinds(LiveProofing { spelling: true, grammar: true, refinements: false }),
+            ["spelling", "agreement"]
+        );
+        assert_eq!(kinds(LiveProofing { spelling: false, grammar: true, refinements: false }), ["agreement"]);
+        assert!(kinds(LiveProofing::default()).is_empty());
+    }
+
+    #[test]
     fn squiggles_span_the_flagged_word() {
         let doc = Doc::from_plain_text("Helo world\nfine wrld");
         let db = mailcraft_fonts::FontDb::bundled();
@@ -2199,6 +2248,7 @@ mod tests {
             word: String::new(),
             kind: "spelling".into(),
             suggestions: Vec::new(),
+            message: String::new(),
         };
         let spans = issue_spans(&layout, &[issue(0, 0, 4), issue(1, 5, 9)]);
         assert_eq!(spans.len(), 2);

@@ -714,6 +714,10 @@ fn resolve_compose(c: Chord, id: u64, _cx: &KeyContext) -> Option<Action> {
         (true, false, false, Key::S) => run_p("compose.saveDraft", p()),
         (true, false, true, Key::B) => run_p("compose.addressBook", p()),
         (false, false, false, Key::F7) => run_p("review.spelling", p()),
+        // Help from a message being written opens at Writing mail.
+        (false, false, false, Key::F1) => run_p("help.help", p()),
+        // AutoText: the word before the caret becomes the entry it names.
+        (false, false, false, Key::F3) => run_p("insert.autoText", p()),
         (true, false, false, Key::Z) => run_p("compose.editUndo", p()),
         (true, false, false, Key::Y) => run_p("compose.editRedo", p()),
         (true, false, false, Key::A) => run_p("format.selectAll", p()),

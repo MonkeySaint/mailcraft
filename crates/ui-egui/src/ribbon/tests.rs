@@ -977,6 +977,35 @@ fn high_contrast_only_hides_low_contrast_pens() {
 }
 
 #[test]
+fn font_high_contrast_only_also_filters_the_theme_shades() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let cid = app.run("mail.newEmail", serde_json::Value::Null).and_then(|v| v["compose"].as_u64()).unwrap();
+    let s = Surface::Compose(cid);
+    let shades = |app: &App| -> Vec<String> {
+        menu_entries(app, s, "fontColorShades1")
+            .into_iter()
+            .filter(|(_, a, sw)| a.cmd == "format.color" && sw.is_some())
+            .map(|(l, ..)| l)
+            .collect()
+    };
+    let all = shades(&app);
+    assert_eq!(all.len(), 5, "{all:?}");
+    run_entry(&mut app, s, "fontColor", "High-contrast only");
+    assert!(app.s.composes.get(&cid).unwrap().editor.font_high_contrast_only);
+    // White, Background 1 and its light tints are hard to read on the page: gone.
+    let shown = shades(&app);
+    assert!(shown.len() < all.len(), "{shown:?}");
+    for label in &shown {
+        let (_, act, _) =
+            menu_entries(&app, s, "fontColorShades1").into_iter().find(|(l, ..)| l == label).unwrap();
+        let params = state::with_context(&app, s, &act.cmd, act.params.clone());
+        assert!(app.s.run(&act.cmd, &params).is_ok(), "{label}");
+    }
+    // The Shading menu's shades are not font colours: left alone.
+    assert_eq!(state::dyn_items(&app, s, "themeShades:bg1").len(), 5);
+}
+
+#[test]
 fn styles_gallery_lists_created_styles() {
     let mut app = App::new(mailcraft_engine::sample::sample_session());
     let cid = app.run("mail.newEmail", serde_json::Value::Null).and_then(|v| v["compose"].as_u64()).unwrap();

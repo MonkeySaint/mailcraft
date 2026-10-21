@@ -149,7 +149,11 @@ fn kind_heading(kind: &str) -> &'static str {
         "repeated" => "Repeated word:",
         "capitalization" => "Capitalization:",
         "doubleSpace" => "Extra space:",
-        _ => "Not in dictionary:",
+        "agreement" => "Agreement:",
+        "punctuation" => "Punctuation:",
+        "confused" => "Commonly confused word:",
+        "spelling" => "Not in dictionary:",
+        _ => "Writing suggestion:",
     }
 }
 
@@ -359,6 +363,8 @@ mod tests {
         assert_eq!(parse_pos(&json!({"offset": 4})), None);
         assert_eq!(kind_heading("spelling"), "Not in dictionary:");
         assert_eq!(kind_heading("repeated"), "Repeated word:");
+        assert_eq!(kind_heading("agreement"), "Agreement:");
+        assert_eq!(kind_heading("confused"), "Commonly confused word:");
         assert_eq!(language_name("en-US"), "English (United States)");
         assert_eq!(language_name("fr-CA"), "fr-CA");
     }

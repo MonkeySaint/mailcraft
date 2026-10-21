@@ -42,11 +42,13 @@ proptest! {
         let mut s = speller().clone();
         s.set_options(SpellOptions {
             check_grammar: grammar,
+            confused_words: !caps,
             ignore_uppercase: caps,
             ignore_words_with_numbers: !caps,
             ignore_internet_and_file_addresses: grammar,
             flag_repeated_words: true,
             main_dictionary_only: caps,
+            refinements: if caps { mailcraft_proof::Refinements::ALL } else { mailcraft_proof::Refinements::NONE },
         });
         for issue in s.check_text_with_suggestions(&text, 2) {
             prop_assert!(issue.start <= issue.end);

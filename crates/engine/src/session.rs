@@ -161,6 +161,9 @@ pub struct Session {
     pub clipboard: Vec<ItemId>,
     /// Text copied from the reading pane.
     pub clipboard_text: Option<String>,
+    /// The Clipboard pane's history (newest last): copies made in messages, the reading pane and, while
+    /// MailCraft runs, other programs. Every open message's pane shows it.
+    pub clip_history: Vec<crate::compose::ClipEntry>,
     /// Last folder shown in each module (restored when switching back).
     pub module_folders: Vec<(Module, FolderId)>,
     /// Journal size in bytes past which a write folds the journal into a fresh snapshot (0 = never). Undo,
@@ -237,6 +240,7 @@ impl Session {
             next_compose: 0,
             clipboard: Vec::new(),
             clipboard_text: None,
+            clip_history: Vec::new(),
             module_folders: Vec::new(),
             checkpoint_bytes: mailcraft_store::Autosave::DEFAULT_CHECKPOINT_BYTES,
             journal_calls: 0,
