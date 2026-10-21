@@ -1430,7 +1430,7 @@ fn editable_picture(layout: &Layout, c: &ComposeState, p: mailcraft_geom::Point)
             .iter()
             .any(|g| {
                 g.content_id.eq_ignore_ascii_case(cid)
-                    && matches!(g.kind.as_str(), "chart" | "smartArt" | "model3d")
+                    && matches!(g.kind.as_str(), "chart" | "smartArt" | "model3d" | "equation")
             })
             .then(|| cid.to_owned())
     })
@@ -1751,7 +1751,8 @@ pub(crate) fn body_editor_in(
     let bg = crate::body::map_color(c.body.background.unwrap_or(mailcraft_geom::Color::WHITE), dark);
     ui.painter().rect_filled(rect, 0.0, bg);
     // Drawings behind the text.
-    super::drawing::paint(ui, &*host, cid, origin, zoom, true);
+    let behind_shown = super::drawing::displayed(c, mem.view.layout.as_ref(), zoom);
+    super::drawing::paint(ui, &*host, cid, origin, zoom, true, &behind_shown);
     let sel = c.selection.clone();
     mem.view.doc_key = mem.doc_key;
     mem.view.selection = Some((to_text(&sel.anchor), to_text(&sel.focus)));
@@ -1812,7 +1813,8 @@ pub(crate) fn body_editor_in(
         paint_marks(ui, layout, &c.body, origin, zoom);
     }
     // Drawings in front of the text, the selected one's handles and the object being drawn.
-    super::drawing::paint(ui, &*host, cid, origin, zoom, false);
+    let shown_drawings = super::drawing::displayed(c, mem.view.layout.as_ref(), zoom);
+    super::drawing::paint(ui, &*host, cid, origin, zoom, false, &shown_drawings);
     let select_objects = c.editor.select_objects;
 
     // The editor's interaction, on top of the painted body.
@@ -1827,7 +1829,8 @@ pub(crate) fn body_editor_in(
     };
     let link_under = |p: Pos2| -> Option<String> { layout.and_then(|l| l.hit(local(p))).map(str::to_owned) };
     // Drawings take the pointer (and their keys) first: drawing tools, selecting, moving, sizing, typing.
-    let on_drawing = super::drawing::interact(ui, host, cid, &resp, origin, zoom, select_objects, &hit);
+    let on_drawing =
+        super::drawing::interact(ui, host, cid, &resp, origin, zoom, select_objects, &hit, &shown_drawings);
     let (pressed, down, mods) =
         ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers));
     let hover_link = resp.hover_pos().and_then(link_under);

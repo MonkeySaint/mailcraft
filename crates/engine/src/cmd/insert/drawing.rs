@@ -9,7 +9,7 @@
 //! paragraphs where they were drawn. SVG pictures of the message are turned into PNG at the same time.
 
 use mailcraft_geom::Color;
-use mailcraft_model::rich::{Align, Drawing, DrawingKind, VAlign};
+use mailcraft_model::rich::{Align, Drawing, DrawingKind, ShapeEffects, VAlign, WrapStyle};
 use mailcraft_model::{Block, Doc, Inline, ParaStyle, TextStyle};
 
 use super::shapes::{self, Geometry, P};
@@ -18,6 +18,9 @@ use super::{
     lighten, translate, wordart_img,
 };
 use crate::compose::{ComposeState, InlineImage, ResolvedTheme};
+
+pub mod fx;
+pub use fx::{BEVELS, DASHES, GRADIENT_DIRECTIONS, WARPS, store_picture, valid_gradient};
 
 /// Largest drawing side (px).
 pub const MAX_DRAWING_SIDE: f32 = 1000.0;
@@ -31,10 +34,18 @@ pub const MAX_DRAWINGS: usize = 500;
 pub const MAX_DRAWING_TEXT: usize = 10_000;
 /// Most hand-drawn points kept for a freeform or scribble.
 pub const MAX_POINTS: usize = 2_000;
+/// Most points of a wrap outline.
+pub const MAX_WRAP_POINTS: usize = 256;
+/// Largest picture fill kept on a drawing (base64 chars).
+pub const MAX_PICTURE_FILL: usize = 3 << 20;
+/// Longest side a picture fill is stored at (px).
+pub const PICTURE_FILL_SIDE: u32 = 512;
+/// Most stops of a gradient.
+pub const MAX_GRADIENT_STOPS: usize = 10;
+/// Default text box margins (left, top, right, bottom px).
+pub const TEXT_BOX_INSET: [f32; 4] = [8.0, 4.0, 8.0, 4.0];
 /// Shape effects offered by Shape Format › Shape Effects (`""` = the theme's effect style).
 pub const EFFECTS: [&str; 7] = ["", "none", "shadow", "glow", "reflection", "bevel", "softEdges"];
-/// Gradient fills offered by Shape Fill › Gradient (`""` = solid).
-pub const GRADIENTS: [&str; 6] = ["", "down", "up", "right", "left", "center"];
 /// Text effects offered by WordArt Styles › Text Effects (`""` = a WordArt style's own).
 pub const TEXT_EFFECTS: [&str; 6] = ["", "none", "shadow", "glow", "reflection", "bevel"];
 /// Longest side of a sent drawing group's picture (device px).
@@ -99,12 +110,95 @@ pub fn sanitize(d: &mut Drawing) {
     if d.shape.is_empty() || shapes::canonical(&d.shape).is_none() {
         d.shape = "rectangle".into();
     }
-    if !GRADIENTS.contains(&d.gradient.as_str()) {
+    if !valid_gradient(&d.gradient) {
         d.gradient.clear();
     }
     if !TEXT_EFFECTS.contains(&d.text_effect.as_str()) {
         d.text_effect.clear();
     }
+    let unit = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+    d.transparency = unit(d.transparency);
+    d.line_transparency = unit(d.line_transparency);
+    if !DASHES.contains(&d.line_dash.as_str()) {
+        d.line_dash.clear();
+    }
+    if !DASHES.contains(&d.text_outline_dash.as_str()) {
+        d.text_outline_dash.clear();
+    }
+    d.text_outline_px = finite(d.text_outline_px, 0.0, 12.0, 0.0);
+    if !matches!(d.text_flow.as_str(), "" | "up" | "stacked") {
+        d.text_flow.clear();
+    }
+    if !d.text_flow.is_empty() {
+        d.vertical = false;
+    }
+    if !WARPS.iter().any(|(id, _)| *id == d.warp) {
+        d.warp.clear();
+    }
+    if let Some(inset) = d.inset.as_mut() {
+        for v in inset.iter_mut() {
+            *v = finite(*v, 0.0, MAX_DRAWING_SIDE / 2.0, 0.0);
+        }
+    }
+    d.wrap_points.truncate(MAX_WRAP_POINTS);
+    d.wrap_points.retain(|(x, y)| x.is_finite() && y.is_finite());
+    for p in &mut d.wrap_points {
+        *p = (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0));
+    }
+    if d.fill_picture.len() > MAX_PICTURE_FILL {
+        d.fill_picture.clear();
+    }
+    if let Some(g) = d.gradient_fill.as_mut() {
+        g.stops.truncate(MAX_GRADIENT_STOPS);
+        g.stops.retain(|s| s.pos.is_finite());
+        for s in &mut g.stops {
+            s.pos = s.pos.clamp(0.0, 1.0);
+        }
+        g.angle = if g.angle.is_finite() { g.angle.rem_euclid(360.0) } else { 0.0 };
+    }
+    if d.gradient_fill.as_ref().is_some_and(|g| g.stops.is_empty()) {
+        d.gradient_fill = None;
+    }
+    for fx in [d.fx.as_deref_mut(), d.text_fx.as_deref_mut()].into_iter().flatten() {
+        sanitize_fx(fx);
+    }
+    if d.fx.as_deref().is_some_and(ShapeEffects::is_empty) {
+        d.fx = None;
+    }
+    if d.text_fx.as_deref().is_some_and(ShapeEffects::is_empty) {
+        d.text_fx = None;
+    }
+    d.name = d.name.chars().take(80).collect();
+}
+
+/// Keeps effect options in range.
+fn sanitize_fx(fx: &mut ShapeEffects) {
+    let num = |v: &mut f32, hi: f32| *v = if v.is_finite() { v.clamp(0.0, hi) } else { 0.0 };
+    if let Some(s) = fx.shadow.as_mut() {
+        num(&mut s.transparency, 1.0);
+        num(&mut s.blur, 60.0);
+        num(&mut s.distance, 200.0);
+        s.angle = if s.angle.is_finite() { s.angle.rem_euclid(360.0) } else { 45.0 };
+    }
+    if let Some(r) = fx.reflection.as_mut() {
+        num(&mut r.transparency, 1.0);
+        num(&mut r.size, 1.0);
+        num(&mut r.distance, 100.0);
+        num(&mut r.blur, 20.0);
+    }
+    if let Some(g) = fx.glow.as_mut() {
+        num(&mut g.size, 60.0);
+        num(&mut g.transparency, 1.0);
+    }
+    num(&mut fx.soft_edges, 50.0);
+    num(&mut fx.bevel_size, 30.0);
+    if !BEVELS.contains(&fx.bevel.as_str()) {
+        fx.bevel.clear();
+    }
+    for v in [&mut fx.rot_x, &mut fx.rot_y] {
+        *v = if v.is_finite() { v.rem_euclid(360.0) } else { 0.0 };
+    }
+    num(&mut fx.perspective, 120.0);
 }
 
 /// `c` lightened toward white by `t` (0..=1).
@@ -117,28 +211,16 @@ pub fn darken_color(c: Color, t: f32) -> Color {
     darken(c, t)
 }
 
-/// The colour of a gradient fill at device pixel (`x`, `y`) of a box from (`x0`, `y0`) to (`x1`, `y1`).
-fn gradient_at(kind: &str, color: Color, (x0, y0, x1, y1): (f32, f32, f32, f32), x: f32, y: f32) -> Color {
-    let light = lighten(color, 0.65);
-    let along = |v: f32, lo: f32, hi: f32| ((v - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
-    let t = match kind {
-        "down" => along(y, y0, y1),
-        "up" => 1.0 - along(y, y0, y1),
-        "right" => along(x, x0, x1),
-        "left" => 1.0 - along(x, x0, x1),
-        "center" => {
-            let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-            let (rx, ry) = (((x1 - x0) / 2.0).max(1.0), ((y1 - y0) / 2.0).max(1.0));
-            (((x - cx) / rx).powi(2) + ((y - cy) / ry).powi(2)).sqrt().clamp(0.0, 1.0)
-        }
-        _ => return color,
-    };
-    light.lerp(color, t)
-}
-
-/// The effects a WordArt style gets from the drawing: its own text outline and text effect.
+/// The effects a WordArt style gets from the drawing: its own text outline, text effect (or text effects
+/// with options) and warp.
 fn wordart_overrides(d: &Drawing) -> super::WordArtOverrides {
-    super::WordArtOverrides { outline: d.text_outline, effect: d.text_effect.clone() }
+    super::WordArtOverrides {
+        outline: d.text_outline,
+        effect: d.text_effect.clone(),
+        fx: d.text_fx.as_deref().cloned(),
+        warp: d.warp.clone(),
+        outline_px: d.text_outline_px,
+    }
 }
 
 /// The effect a drawing is drawn with: its own, or the theme's effect style.
@@ -276,16 +358,21 @@ pub fn default_text_color(d: &Drawing, theme: &ResolvedTheme) -> Color {
     }
 }
 
-/// Coverage of the drawing's text laid out in its text area, with the drawing's corner at (`m`, `m`) on a
-/// `dw`×`dh` device canvas.
-fn text_mask(d: &Drawing, theme: &ResolvedTheme, m: f32, dw: usize, dh: usize) -> Option<Mask> {
-    if d.text.trim().is_empty() {
-        return None;
+/// The area the text of `d` is laid out in: (x, y, w, h) px from the drawing's corner. Text boxes keep
+/// their margins ([`Drawing::inset`], default [`TEXT_BOX_INSET`]); shapes their shape's text area unless
+/// margins were set.
+pub fn text_area(d: &Drawing) -> (f32, f32, f32, f32) {
+    let boxed = |[l, t, r, b]: [f32; 4]| (l, t, (d.w - l - r).max(4.0), (d.h - t - b).max(4.0));
+    match (d.inset, d.kind) {
+        (Some(inset), _) => boxed(inset),
+        (None, DrawingKind::TextBox | DrawingKind::Canvas | DrawingKind::Group) => boxed(TEXT_BOX_INSET),
+        (None, _) => shapes::text_rect(&d.shape, d.w, d.h),
     }
-    let (tx, ty, tw, th) = match d.kind {
-        DrawingKind::TextBox | DrawingKind::Canvas => (8.0, 4.0, (d.w - 16.0).max(4.0), (d.h - 8.0).max(4.0)),
-        _ => shapes::text_rect(&d.shape, d.w, d.h),
-    };
+}
+
+/// The drawing's text as a document laid out `width` px wide (lines split at `\n`; stacked text has one
+/// letter per line).
+pub fn text_layout(d: &Drawing, theme: &ResolvedTheme, width: f32) -> mailcraft_layout::Layout {
     let style = TextStyle {
         font_family: d.text_style.font_family.clone().or_else(|| Some(theme.body_font.clone())),
         size_pt: d.text_style.size_pt.or(Some(11.0)),
@@ -296,10 +383,24 @@ fn text_mask(d: &Drawing, theme: &ResolvedTheme, m: f32, dw: usize, dh: usize) -
         DrawingKind::Shape if d.align == Align::Start && d.text_style == TextStyle::default() => {
             Align::Center
         }
+        _ if d.text_flow == "stacked" => Align::Center,
         _ => d.align,
     };
-    let blocks = d
-        .text
+    let stacked: String;
+    let text = if d.text_flow == "stacked" {
+        stacked = d
+            .text
+            .chars()
+            .filter(|c| *c != '\n')
+            .take(2_000)
+            .map(String::from)
+            .collect::<Vec<_>>()
+            .join("\n");
+        stacked.as_str()
+    } else {
+        d.text.as_str()
+    };
+    let blocks = text
         .split('\n')
         .map(|line| Block::Paragraph {
             style: ParaStyle { align, ..ParaStyle::default() },
@@ -311,10 +412,43 @@ fn text_mask(d: &Drawing, theme: &ResolvedTheme, m: f32, dw: usize, dh: usize) -
         })
         .collect();
     let doc = Doc { blocks, ..Doc::default() };
-    // Vertical text is laid out along the box's height and turned 90° clockwise into place.
-    let (tw, th) = if d.vertical { (th, tw) } else { (tw, th) };
-    let lo = mailcraft_layout::LayoutOptions { width: tw, ..Default::default() };
-    let layout = mailcraft_layout::layout_doc(&doc, fonts(), &lo);
+    let lo = mailcraft_layout::LayoutOptions { width, ..Default::default() };
+    mailcraft_layout::layout_doc(&doc, fonts(), &lo)
+}
+
+/// Whether the text of `d` runs across the box's height (turned a quarter).
+fn turned_text(d: &Drawing) -> bool {
+    d.vertical || d.text_flow == "up"
+}
+
+/// Height (px) `d` needs for all of its text (Resize Shape to Fit Text): the text's height plus the
+/// margins around the text area.
+pub fn fitted_height(d: &Drawing, theme: &ResolvedTheme) -> Option<f32> {
+    if d.text.trim().is_empty()
+        || matches!(d.kind, DrawingKind::WordArt | DrawingKind::Canvas | DrawingKind::Group)
+    {
+        return None;
+    }
+    if turned_text(d) {
+        return None;
+    }
+    let (_, _, tw, th) = text_area(d);
+    let extra = (d.h - th).max(0.0);
+    let h = text_layout(d, theme, tw).height;
+    h.is_finite().then(|| (h + extra).clamp(MIN_DRAWING_SIDE, MAX_DRAWING_SIDE))
+}
+
+/// Coverage of the drawing's text laid out in its text area, with the drawing's corner at (`m`, `m`) on a
+/// `dw`×`dh` device canvas.
+fn text_mask(d: &Drawing, theme: &ResolvedTheme, m: f32, dw: usize, dh: usize) -> Option<Mask> {
+    if d.text.trim().is_empty() {
+        return None;
+    }
+    let (tx, ty, tw, th) = text_area(d);
+    // Turned text is laid out along the box's height and turned a quarter into place.
+    let turned = turned_text(d);
+    let (tw, th) = if turned { (th, tw) } else { (tw, th) };
+    let layout = text_layout(d, theme, tw);
     let valign = match (d.kind, d.valign) {
         // Text in shapes is centred vertically unless asked otherwise.
         (DrawingKind::Shape, VAlign::Top) if d.text_style == TextStyle::default() => VAlign::Middle,
@@ -327,30 +461,33 @@ fn text_mask(d: &Drawing, theme: &ResolvedTheme, m: f32, dw: usize, dh: usize) -
     };
     let mut list = layout.display;
     list.items.retain(|i| !matches!(i, mailcraft_layout::DisplayItem::FillRect { .. }));
-    if d.vertical {
+    let mask = if turned {
         // The text on its own canvas (run direction across), then each device pixel of the text area
-        // takes the pixel it came from before the turn.
+        // takes the pixel it came from before the turn (clockwise for top to bottom, the other way for
+        // bottom to top).
         translate(&mut list, 0.0, dy);
         let (sw, sh) = (dev(tw), dev(th));
         let flat = Mask::from_list(&list, sw, sh, fonts());
         let (x0, y0) = (((m + tx) * RASTER_SCALE) as i64, ((m + ty) * RASTER_SCALE) as i64);
         let (w_dev, h_dev) = (i64::try_from(sh).unwrap_or(0), i64::try_from(sw).unwrap_or(0));
-        let turned = Mask::new(dw, dh).map(|x, y| {
+        let up = d.text_flow == "up";
+        Mask::new(dw, dh).map(|x, y| {
             let (lx, ly) = (x - x0, y - y0);
             if lx < 0 || ly < 0 || lx >= w_dev || ly >= h_dev {
                 return 0;
             }
-            flat.get(ly, w_dev - 1 - lx)
-        });
-        return Some(turned);
-    }
-    translate(&mut list, m + tx, m + ty + dy);
-    let mask = Mask::from_list(&list, dw, dh, fonts());
-    // Text stays inside the drawing's box.
-    let (x0, y0) = (((m + tx) * RASTER_SCALE) as i64, ((m + ty) * RASTER_SCALE) as i64);
-    let (x1, y1) =
-        (((m + tx + tw) * RASTER_SCALE).ceil() as i64, ((m + ty + th) * RASTER_SCALE).ceil() as i64);
-    Some(mask.map(|x, y| if x >= x0 && x < x1 && y >= y0 && y < y1 { mask.get(x, y) } else { 0 }))
+            if up { flat.get(h_dev - 1 - ly, lx) } else { flat.get(ly, w_dev - 1 - lx) }
+        })
+    } else {
+        translate(&mut list, m + tx, m + ty + dy);
+        let mask = Mask::from_list(&list, dw, dh, fonts());
+        // Text stays inside the drawing's box.
+        let (x0, y0) = (((m + tx) * RASTER_SCALE) as i64, ((m + ty) * RASTER_SCALE) as i64);
+        let (x1, y1) =
+            (((m + tx + tw) * RASTER_SCALE).ceil() as i64, ((m + ty + th) * RASTER_SCALE).ceil() as i64);
+        mask.map(|x, y| if x >= x0 && x < x1 && y >= y0 && y < y1 { mask.get(x, y) } else { 0 })
+    };
+    Some(if d.warp.is_empty() { mask } else { fx::warp(&mask, &d.warp) })
 }
 
 /// Pixels of `d` in `theme` (with or without its text: the editor leaves the text out while it is being
@@ -358,6 +495,10 @@ fn text_mask(d: &Drawing, theme: &ResolvedTheme, m: f32, dw: usize, dh: usize) -
 pub fn raster(d: &Drawing, theme: &ResolvedTheme, with_text: bool) -> Option<Raster> {
     let mut d = d.clone();
     sanitize(&mut d);
+    if d.kind == DrawingKind::Group {
+        // A group draws nothing itself: its members do.
+        return None;
+    }
     let img = if d.kind == DrawingKind::WordArt {
         let text = if with_text { d.text.as_str() } else { "" };
         let text = if text.trim().is_empty() { " " } else { text };
@@ -367,6 +508,16 @@ pub fn raster(d: &Drawing, theme: &ResolvedTheme, with_text: bool) -> Option<Ras
         shape_img(&d, theme, with_text)?
     };
     let (mut img, mut left, mut top) = img;
+    // 3-D Rotation turns the whole picture (WordArt: its Text Effects' 3-D rotation).
+    let turn3d = if d.kind == DrawingKind::WordArt { d.text_fx.as_deref() } else { d.fx.as_deref() };
+    if let Some(fx3) = turn3d {
+        let (cx, cy) = ((d.w / 2.0 - left) * RASTER_SCALE, (d.h / 2.0 - top) * RASTER_SCALE);
+        if let Some((turned, ox, oy)) = fx::rotate_3d(&img, fx3, cx, cy) {
+            img = turned;
+            left += ox / RASTER_SCALE;
+            top += oy / RASTER_SCALE;
+        }
+    }
     if d.rotation.abs() > 0.01 {
         let (cx, cy) = (d.w / 2.0 - left, d.h / 2.0 - top);
         let (rot, ox, oy) = rotate(&img, d.rotation, cx * RASTER_SCALE, cy * RASTER_SCALE);
@@ -439,17 +590,79 @@ fn rotate(img: &Img, deg: f32, cx: f32, cy: f32) -> (Img, f32, f32) {
     (out, x0, y0)
 }
 
+/// Mirrors geometry `g` of a `w`×`h` box left to right and / or top to bottom.
+fn flip_geometry(g: &mut Geometry, w: f32, h: f32, fh: bool, fv: bool) {
+    let f = |p: &mut P| {
+        if fh {
+            p.0 = w - p.0;
+        }
+        if fv {
+            p.1 = h - p.1;
+        }
+    };
+    g.fill.iter_mut().flatten().for_each(f);
+    g.faces.iter_mut().flat_map(|(p, _)| p.iter_mut()).for_each(f);
+    g.lines.iter_mut().flatten().for_each(f);
+    for (a, b) in &mut g.arrows {
+        f(a);
+        f(b);
+    }
+}
+
+/// Room (px) the effects with options need around a `d.h` px tall drawing.
+fn fx_room(fx: &ShapeEffects, h: f32) -> f32 {
+    let mut r: f32 = 0.0;
+    if let Some(s) = fx.shadow {
+        r = r.max(s.distance + s.blur + 2.0);
+        if s.kind == mailcraft_model::rich::ShadowKind::Perspective {
+            r = r.max(h * 0.7 + s.distance);
+        }
+    }
+    if let Some(g) = fx.glow {
+        r = r.max(g.size + 2.0);
+    }
+    r.min(MAX_DRAWING_SIDE / 2.0)
+}
+
+/// `c` with `transparency` (0..=1) more see-through.
+fn faded(c: Color, transparency: f32) -> Color {
+    let a = f32::from(c.a) * (1.0 - transparency.clamp(0.0, 1.0));
+    c.with_alpha(a.round().clamp(0.0, 255.0) as u8)
+}
+
+/// Stripes that cut an outline into dashes where no path is at hand (text outlines): coverage at (`x`, `y`).
+fn dash_stripes(dash: &str, x: i64, y: i64) -> bool {
+    let (on, off) = match dash {
+        "roundDot" | "squareDot" => (2, 2),
+        "dash" | "dashDot" => (6, 4),
+        "longDash" | "longDashDot" | "longDashDotDot" => (12, 4),
+        _ => return true,
+    };
+    (x + y).rem_euclid(on + off) < on
+}
+
 /// A shape, text box or canvas drawn: the picture and its corner relative to the drawing's (px).
 fn shape_img(d: &Drawing, theme: &ResolvedTheme, with_text: bool) -> Option<(Img, f32, f32)> {
     let shape = if d.kind == DrawingKind::TextBox { "textBox" } else { d.shape.as_str() };
-    let g: Geometry = shapes::geometry(shape, d.w, d.h, &d.points)?;
-    let fx = effect_of(d, theme);
-    let m = EFFECT_MARGIN + d.outline_px;
-    let extra = if fx.reflection { d.h * 0.5 } else { 0.0 };
+    let mut g: Geometry = shapes::geometry(shape, d.w, d.h, &d.points)?;
+    if d.flip_h || d.flip_v {
+        flip_geometry(&mut g, d.w, d.h, d.flip_h, d.flip_v);
+    }
+    // Effects with options replace the effect preset and the theme's effect style.
+    let own: Option<&ShapeEffects> = d.fx.as_deref();
+    let fx = if own.is_some() { Effect { opacity: 1.0, ..Effect::default() } } else { effect_of(d, theme) };
+    let m = EFFECT_MARGIN.max(own.map_or(0.0, |o| fx_room(o, d.h))) + d.outline_px;
+    let extra = match own.and_then(|o| o.reflection) {
+        Some(r) => fx::reflection_room(&r, d.h),
+        None if fx.reflection => d.h * 0.5,
+        None => 0.0,
+    };
     let (w, h) = (d.w + 2.0 * m, d.h + 2.0 * m + extra);
     let (dw, dh) = (dev(w), dev(h));
     let mut img = Img::new(dw, dh);
-    let fill = d.fill.filter(|_| !g.is_line());
+    let fill = d.fill.filter(|_| !g.is_line()).map(|c| faded(c, d.transparency));
+    let picture =
+        (!g.is_line() && !d.fill_picture.is_empty()).then(|| fx::Picture::decode(&d.fill_picture)).flatten();
     let mut area_list = mailcraft_layout::DisplayList::default();
     fill_list(&g.fill, m, m, &mut area_list);
     let area = Mask::from_list(&area_list, dw, dh, fonts());
@@ -462,23 +675,53 @@ fn shape_img(d: &Drawing, theme: &ResolvedTheme, with_text: bool) -> Option<(Img
     // The whole area (fill and faces) for the outline and effects.
     let whole =
         face_masks.iter().fold(area.clone(), |acc, (f, _)| acc.map(|x, y| acc.get(x, y).max(f.get(x, y))));
+    let whole = match own {
+        Some(o) if o.soft_edges > 0.0 => fx::soften(&whole, o),
+        _ => whole,
+    };
     let s = RASTER_SCALE;
+    let outline = d.outline.filter(|_| d.outline_px > 0.0).map(|c| faded(c, d.line_transparency));
+    let dashes = !d.line_dash.is_empty();
     let ring = |mask: &Mask| mask.minus(&mask.eroded(((d.outline_px * s / 2.0).round() as i64).max(1)));
-    let outline_on = d.outline.is_some() && d.outline_px > 0.0;
     let mut strokes = mailcraft_layout::DisplayList::default();
     let lw = d.outline_px.max(0.5);
-    line_list(&g.lines, lw, m, m, &mut strokes);
+    line_list(&fx::dashed(&g.lines, false, &d.line_dash, lw), lw, m, m, &mut strokes);
     let heads = arrow_paths(&g.arrows, lw);
     fill_list(&heads, m, m, &mut strokes);
     let stroke_mask = (!strokes.items.is_empty()).then(|| Mask::from_list(&strokes, dw, dh, fonts()));
-    match fill {
+    // A dashed outline follows the shape's outline path; a solid one is the ring inside its edge.
+    let outline_mask = |whole: &Mask| -> Mask {
+        if !dashes {
+            return ring(whole);
+        }
+        // Dashes along the edge, kept inside it like the solid ring.
+        let mut l = mailcraft_layout::DisplayList::default();
+        line_list(&fx::dashed(&g.fill, true, &d.line_dash, lw), lw, m, m, &mut l);
+        let dashes = Mask::from_list(&l, dw, dh, fonts());
+        dashes.map(|x, y| dashes.get(x, y).min(whole.get(x, y)))
+    };
+    let bx = (m * s, m * s, (m + d.w) * s, (m + d.h) * s);
+    match fill.or(picture.as_ref().map(|_| Color::WHITE)) {
         Some(color) => {
-            composite(&mut img, (0, 0), &whole, color, &fx);
-            if !d.gradient.is_empty() {
-                let s = RASTER_SCALE;
-                let bx = (m * s, m * s, (m + d.w) * s, (m + d.h) * s);
+            if let Some(o) = own {
+                fx::paint_under(&mut img, &whole, color, o);
+                img.paint(&whole, 1.0, &|_, _| color);
+            } else {
+                composite(&mut img, (0, 0), &whole, color, &fx);
+            }
+            if let Some(gf) = &d.gradient_fill {
+                let t = d.transparency;
+                img.paint(&whole, 1.0, &|x, y| faded(fx::stops_gradient(gf, bx, x as f32, y as f32), t));
+            } else if !d.gradient.is_empty() {
                 let kind = d.gradient.as_str();
-                img.paint(&whole, 1.0, &|x, y| gradient_at(kind, color, bx, x as f32, y as f32));
+                img.paint(&whole, 1.0, &|x, y| fx::preset_gradient(kind, color, bx, x as f32, y as f32));
+            }
+            if let Some(pic) = &picture {
+                let (bw, bh) = ((bx.2 - bx.0).max(1.0), (bx.3 - bx.1).max(1.0));
+                let t = d.transparency;
+                img.paint(&whole, 1.0, &|x, y| {
+                    faded(pic.sample((x as f32 - bx.0) / bw, (y as f32 - bx.1) / bh), t)
+                });
             }
             for (mask, tint) in &face_masks {
                 let c = if *tint > 0.0 {
@@ -493,41 +736,82 @@ fn shape_img(d: &Drawing, theme: &ResolvedTheme, with_text: bool) -> Option<(Img
         }
         None if d.kind != DrawingKind::Canvas => {
             // No fill: the effects follow the outline (or the lines).
-            if let Some(o) = d.outline.filter(|_| outline_on) {
-                let mut base = if g.is_line() { Mask::new(dw, dh) } else { ring(&whole) };
+            if let Some(o) = outline {
+                let mut base = if g.is_line() { Mask::new(dw, dh) } else { outline_mask(&whole) };
                 if let Some(sm) = &stroke_mask {
                     base = base.map(|x, y| base.get(x, y).max(sm.get(x, y)));
                 }
-                composite(&mut img, (0, 0), &base, o, &Effect { gradient: 0.0, gloss: false, ..fx });
+                match own {
+                    Some(fo) => fx::paint_under(&mut img, &base, o, fo),
+                    None => {
+                        composite(&mut img, (0, 0), &base, o, &Effect { gradient: 0.0, gloss: false, ..fx })
+                    }
+                }
             }
         }
         None => {}
     }
-    if let Some(o) = d.outline.filter(|_| outline_on) {
+    if let Some(o) = outline {
         if !g.is_line() {
-            img.paint(&ring(&whole), 1.0, &|_, _| o);
+            img.paint(&outline_mask(&whole), 1.0, &|_, _| o);
         }
         if let Some(sm) = &stroke_mask {
             img.paint(sm, 1.0, &|_, _| o);
         }
     }
+    if let Some(o) = own {
+        let base = fill.or(outline).unwrap_or_else(|| theme.color(crate::compose::ACCENT1));
+        let shape_mask = if fill.is_some() || picture.is_some() { whole.clone() } else { area.clone() };
+        fx::paint_over(&mut img, &shape_mask, base, o);
+    }
     if with_text && let Some(tm) = text_mask(d, theme, m, dw, dh) {
-        let col = d.text_style.color.unwrap_or_else(|| default_text_color(d, theme));
-        let px = |v: f32| (v * s).round() as i64;
-        match d.text_effect.as_str() {
+        paint_text(&mut img, &tm, d, theme);
+    }
+    if let Some(r) = own.and_then(|o| o.reflection) {
+        let (top, axis) = ((m * s) as usize, ((m + d.h) * s).round() as usize);
+        fx::reflect(&mut img, top, axis, &r);
+    }
+    Some((img, -m, -m))
+}
+
+/// Paints text coverage `tm` of drawing `d` with its colour, outline and text effects.
+fn paint_text(img: &mut Img, tm: &Mask, d: &Drawing, theme: &ResolvedTheme) {
+    let s = RASTER_SCALE;
+    let col = d.text_style.color.unwrap_or_else(|| default_text_color(d, theme));
+    let px = |v: f32| (v * s).round() as i64;
+    let tfx = d.text_fx.as_deref().map(|t| ShapeEffects {
+        // Bevels on letters are narrow.
+        bevel_size: if t.bevel_size > 0.0 { t.bevel_size.min(3.0) } else { 0.8 },
+        reflection: None,
+        ..t.clone()
+    });
+    match &tfx {
+        Some(t) => fx::paint_under(img, tm, col, t),
+        None => match d.text_effect.as_str() {
             "shadow" => img.paint(&tm.shifted(px(1.5), px(1.5)).blurred(px(1.0)), 0.45, &|_, _| Color::BLACK),
             "glow" => img.paint(&tm.dilated(px(2.0)).blurred(px(1.5)), 0.6, &|_, _| lighten(col, 0.5)),
             _ => {}
-        }
-        if let Some(o) = d.text_outline {
-            img.paint(&tm.dilated(px(0.75).max(1)), 1.0, &|_, _| o);
-        }
-        img.paint(&tm, 1.0, &|_, _| col);
-        if d.text_effect == "bevel" {
+        },
+    }
+    if let Some(o) = d.text_outline {
+        let weight = if d.text_outline_px > 0.0 { d.text_outline_px / 2.0 } else { 0.75 };
+        let ring = tm.dilated(px(weight).max(1));
+        let ring = if d.text_outline_dash.is_empty() {
+            ring
+        } else {
+            let dash = d.text_outline_dash.as_str();
+            ring.map(|x, y| if dash_stripes(dash, x, y) || tm.get(x, y) > 0 { ring.get(x, y) } else { 0 })
+        };
+        img.paint(&ring, 1.0, &|_, _| o);
+    }
+    img.paint(tm, 1.0, &|_, _| col);
+    match &tfx {
+        Some(t) => fx::paint_over(img, tm, col, t),
+        None if d.text_effect == "bevel" => {
             img.paint(&tm.minus(&tm.shifted(px(0.6), px(0.6))), 0.7, &|_, _| Color::WHITE);
         }
+        None => {}
     }
-    Some((img, -m, -m))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -606,14 +890,17 @@ pub fn fit_word_art(d: &mut Drawing, theme: &ResolvedTheme) {
     }
     let text = if d.text.trim().is_empty() { " " } else { d.text.as_str() };
     if let Some((_, w, h)) = wordart_img(text, &d.word_art, theme, &d.text_style, &wordart_overrides(d)) {
-        let refl = if d.text_effect.is_empty() {
-            super::parse_wordart(&d.word_art, theme).reflection
-        } else {
-            d.text_effect == "reflection"
+        // The picture is the letters, the margins and any reflection below.
+        let refl = match d.text_fx.as_deref() {
+            Some(f) => f.reflection.map(|r| fx::reflection_room(&r, 1.0).clamp(0.05, 1.2)),
+            None if d.text_effect.is_empty() => {
+                super::parse_wordart(&d.word_art, theme).reflection.then_some(0.6)
+            }
+            None => (d.text_effect == "reflection").then_some(0.6),
         };
         let m = EFFECT_MARGIN;
         let ink_h = h - 2.0 * m;
-        let ink_h = if refl { ink_h / 1.6 } else { ink_h };
+        let ink_h = ink_h / (1.0 + refl.unwrap_or(0.0));
         d.w = (w - 2.0 * m).clamp(MIN_DRAWING_SIDE, MAX_DRAWING_SIDE);
         d.h = ink_h.clamp(MIN_DRAWING_SIDE, MAX_DRAWING_SIDE);
     }
@@ -665,7 +952,7 @@ pub fn add(
     d.canvas = canvas_around(&c.body.drawings, &d);
     let id = d.id;
     c.body.drawings.push(d);
-    c.selected_drawing = Some(id);
+    c.select_drawing(Some(id));
     c.draw_tool = None;
     c.dirty = true;
     Ok(id)
@@ -675,8 +962,9 @@ pub fn add(
 // Sending: drawings and SVG pictures become PNG pictures in the text
 // ---------------------------------------------------------------------------------------------------------
 
-/// Groups of drawings whose pictures overlap (indexes into `rasters`), each in back-to-front order.
-fn groups(boxes: &[(f32, f32, f32, f32)]) -> Vec<Vec<usize>> {
+/// Groups of drawings whose pictures overlap or that are in the same group (`keys`: the outermost group of
+/// each, if any), as indexes into `boxes`, each in back-to-front order.
+fn groups(boxes: &[(f32, f32, f32, f32)], keys: &[Option<u32>]) -> Vec<Vec<usize>> {
     let n = boxes.len();
     let mut parent: Vec<usize> = (0..n).collect();
     fn root(parent: &mut [usize], mut i: usize) -> usize {
@@ -694,7 +982,8 @@ fn groups(boxes: &[(f32, f32, f32, f32)]) -> Vec<Vec<usize>> {
         for j in (i + 1)..n {
             let (Some(a), Some(b)) = (boxes.get(i), boxes.get(j)) else { continue };
             let overlap = a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
-            if overlap {
+            let grouped = matches!((keys.get(i), keys.get(j)), (Some(Some(x)), Some(Some(y))) if x == y);
+            if overlap || grouped {
                 let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
                 if let Some(p) = parent.get_mut(ri) {
                     *p = rj;
@@ -802,6 +1091,35 @@ fn group_picture(
     (!png.is_empty()).then_some((png, (b.0, b.1, bw, bh), alt))
 }
 
+/// A drawing's picture cut to what it paints: PNG and its size in px.
+fn cropped_png(r: &Raster) -> Option<(Vec<u8>, f32, f32)> {
+    let (w, h) = (r.width as usize, r.height as usize);
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if r.rgba.get((y * w + x) * 4 + 3).is_some_and(|a| *a > 0) {
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+            }
+        }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    let mut px = Vec::with_capacity(cw.checked_mul(ch)?.checked_mul(4)?);
+    for y in y0..y1 {
+        let from = (y * w + x0) * 4;
+        px.extend_from_slice(r.rgba.get(from..from + cw * 4)?);
+    }
+    let png = mailcraft_render::Canvas {
+        width: u32::try_from(cw).ok()?,
+        height: u32::try_from(ch).ok()?,
+        pixels: px,
+    }
+    .to_png();
+    (!png.is_empty()).then(|| (png, cw as f32 / r.scale, ch as f32 / r.scale))
+}
+
 /// Tops (px) of the body's top-level blocks laid out at `width` (`None` for blocks without lines).
 fn block_tops(doc: &Doc, width: f32) -> Vec<Option<f32>> {
     let lo = mailcraft_layout::LayoutOptions { width, ..Default::default() };
@@ -841,8 +1159,31 @@ pub fn flattened(c: &ComposeState) -> Option<ComposeState> {
         return Some(f);
     }
     let theme = c.theme_resolved();
+    // Linked text boxes show their share of the text.
+    let drawings = crate::cmd::drawing::flow_text(&drawings, &theme);
+    // In line with the text: the drawing's picture takes the place of its placeholder.
+    for d in drawings.iter().filter(|d| d.wrap == WrapStyle::Inline) {
+        let src = d.inline_src();
+        let Some((png, w, h)) = raster(d, &theme, true).and_then(|r| cropped_png(&r)) else {
+            crate::compose::remove_placeholders(&mut f.body.blocks, d.id);
+            continue;
+        };
+        let cid = f.next_content_id();
+        f.inline_images.push(InlineImage {
+            content_id: cid.clone(),
+            filename: format!("drawing{:03}.png", f.inline_images.len().saturating_add(1)),
+            mime_type: "image/png".into(),
+            data: png,
+        });
+        crate::compose::resize_src(&mut f.body.blocks, &src, w.round().max(1.0), h.round().max(1.0));
+        crate::compose::replace_src(&mut f.body.blocks, &src, &format!("cid:{cid}"));
+    }
+    // Placeholders whose drawing is gone send nothing.
+    for id in crate::compose::placeholder_ids(&f.body.blocks) {
+        crate::compose::remove_placeholders(&mut f.body.blocks, id);
+    }
     let mut kept: Vec<(&Drawing, Raster)> = Vec::new();
-    for d in &drawings {
+    for d in drawings.iter().filter(|d| d.wrap != WrapStyle::Inline) {
         if let Some(r) = raster(d, &theme, true) {
             kept.push((d, r));
         }
@@ -854,10 +1195,13 @@ pub fn flattened(c: &ComposeState) -> Option<ComposeState> {
             (d.x + r.left, d.y + r.top, d.x + r.left + w, d.y + r.top + h)
         })
         .collect();
+    // Drawings in one group go in one picture even when apart.
+    let keys: Vec<Option<u32>> =
+        kept.iter().map(|(d, _)| d.group.map(|_| crate::cmd::drawing::root_of(&drawings, d.id))).collect();
     let width = c.view_width.filter(|w| w.is_finite() && *w > 40.0).unwrap_or(DEFAULT_VIEW_WIDTH);
     let tops = block_tops(&f.body, width);
     let mut placed: Vec<(usize, f32, Block)> = Vec::new();
-    for group in groups(&boxes) {
+    for group in groups(&boxes, &keys) {
         let ds: Vec<&Drawing> = group.iter().filter_map(|i| kept.get(*i).map(|k| k.0)).collect();
         let rs: Vec<&Raster> = group.iter().filter_map(|i| kept.get(*i).map(|k| &k.1)).collect();
         let Some((png, (x, y, w, h), alt)) = group_picture(&ds, &rs) else { continue };
@@ -991,12 +1335,15 @@ mod tests {
 
     #[test]
     fn overlapping_drawings_form_one_group() {
-        let g = groups(&[
-            (0.0, 0.0, 10.0, 10.0),
-            (50.0, 50.0, 60.0, 60.0),
-            (5.0, 5.0, 55.0, 55.0),
-            (100.0, 0.0, 110.0, 5.0),
-        ]);
+        let g = groups(
+            &[
+                (0.0, 0.0, 10.0, 10.0),
+                (50.0, 50.0, 60.0, 60.0),
+                (5.0, 5.0, 55.0, 55.0),
+                (100.0, 0.0, 110.0, 5.0),
+            ],
+            &[],
+        );
         assert_eq!(g, vec![vec![0, 1, 2], vec![3]]);
     }
 }

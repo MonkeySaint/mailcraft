@@ -1,16 +1,25 @@
-//! Floating drawing objects in the compose body editor (text boxes, shapes, WordArt, drawing canvases; see
-//! `mailcraft_engine::cmd::drawing`).
+//! Floating drawing objects in the compose body editor (text boxes, shapes, WordArt, drawing canvases,
+//! groups; see `mailcraft_engine::cmd::drawing`).
 //!
 //! The editor paints each drawing from the engine's pixels (`cmd::insert::drawing::raster`, the same picture
 //! the recipient gets), behind the text or in front of it, and handles the pointer before the text does:
 //! - with a drawing tool armed (Insert › Shapes, Draw Text Box, New Drawing Canvas), a drag draws the object
-//!   (a click puts one of the default size there; a scribble follows the pointer);
-//! - a click selects a drawing (frame and eight size handles), a drag moves it (a canvas carries what is
-//!   in it), a handle drag resizes it; each ends in one command (`drawing.move`, `drawing.size`);
+//!   (a click puts one of the default size there; a scribble follows the pointer); with Create Text Box
+//!   Link armed, a click on an empty text box links it;
+//! - a click selects a drawing (a drawing in a group selects the group; frame and eight size handles);
+//!   Shift-click adds one to the selection, Ctrl-click adds or takes one out; a drag moves the selection (a
+//!   canvas carries what is in it), a handle drag resizes it; each ends in one command (`drawing.move`,
+//!   `drawing.size`); a drawing in line with the text is dropped at a place in the text;
+//! - a drag from an empty place with Select Objects on, or inside a selected canvas, selects the drawings
+//!   it goes round;
+//! - with Edit Points on, the shape's points show and can be dragged; a double-click (or Ctrl-click) on an
+//!   edge adds one, Delete removes the point clicked last (never the drawing), Ctrl-click a point also
+//!   removes it;
 //! - a double-click (or Enter, F2, or typing) edits the text inside, in place; leaving the text commits it
-//!   (`drawing.text`); a new text box or WordArt placeholder starts in this mode;
-//! - with a drawing selected: Delete removes it, the arrow keys nudge it (Ctrl: by one pixel), Esc
-//!   deselects; Esc also disarms a drawing tool.
+//!   (`drawing.text`); a new text box or WordArt placeholder starts in this mode; linked text boxes edit
+//!   the chain's text;
+//! - with drawings selected: Delete removes them, the arrow keys nudge them (Ctrl: by one pixel), Esc
+//!   deselects (or ends Edit Points); Esc also disarms a drawing tool.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -18,19 +27,25 @@ use std::hash::{Hash, Hasher};
 use egui::{Color32, Event, Id, Key, Pos2, Rect, Response, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
 
+use mailcraft_engine::cmd::drawing as engine_cmd;
 use mailcraft_engine::cmd::insert::drawing::{self as engine_drawing, Raster};
 use mailcraft_engine::cmd::insert::shapes;
-use mailcraft_engine::compose::DocPos;
-use mailcraft_model::rich::{Align, Drawing, DrawingKind};
+use mailcraft_engine::compose::{ComposeState, DocPos};
+use mailcraft_layout::{DisplayItem, Layout};
+use mailcraft_model::rich::{Align, Drawing, DrawingKind, WrapStyle};
 
 use super::editor::EditorHost;
 
 /// Side of a size handle (px on screen).
 const HANDLE: f32 = 8.0;
+/// Side of an Edit Points handle (px on screen).
+const POINT: f32 = 7.0;
 /// Pointer travel below which a press is a click, not a drag (px on screen).
 const CLICK_SLOP: f32 = 4.0;
 /// Most drawing textures kept per compose.
 const MAX_TEXTURES: usize = 400;
+/// A press this close to a selected canvas's edge moves it; further in, a drag selects what is in it.
+const CANVAS_EDGE: f32 = 8.0;
 
 /// Where a size handle sits on the box: (x, y) as 0, 0.5 or 1 of the width / height.
 const HANDLES: [(f32, f32); 8] =
@@ -40,6 +55,8 @@ const HANDLES: [(f32, f32); 8] =
 enum DragKind {
     Move,
     Resize(usize),
+    /// An Edit Points point.
+    Point(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +69,10 @@ struct Drag {
     /// The box now.
     cur: [f32; 4],
     moved: bool,
+    /// What a move carries along (the selection, with group members and canvas contents).
+    moving: Vec<u32>,
+    /// The drawings a move moves (the selection's top-level drawings).
+    targets: Vec<u32>,
 }
 
 /// Text being typed into a drawing.
@@ -70,10 +91,14 @@ struct Mem {
     drag: Option<Drag>,
     /// Drawing a new object: where the drag started and the points it passed (screen).
     rubber: Option<Vec<Pos2>>,
+    /// Selecting by dragging round drawings: from, to (screen), and whether it adds to the selection.
+    marquee: Option<(Pos2, Pos2, bool)>,
     editing: Option<Editing>,
     /// Drawing ids seen last frame (a new one that is selected starts in text mode).
     known: Option<HashSet<u32>>,
     max_id: u32,
+    /// Edit Points: the point clicked last (drawing, point), which Delete removes.
+    point: Option<(u32, usize)>,
 }
 
 fn mem_id(cid: u64) -> Id {
@@ -96,6 +121,9 @@ fn key_of(d: &Drawing, theme: &mailcraft_engine::compose::ResolvedTheme, with_te
     shape.x = 0.0;
     shape.y = 0.0;
     shape.id = 0;
+    shape.name.clear();
+    shape.group = None;
+    shape.link_next = None;
     serde_json::to_string(&shape).unwrap_or_default().hash(&mut h);
     format!("{:?}{}{}", theme.colors, theme.effects, theme.body_font).hash(&mut h);
     with_text.hash(&mut h);
@@ -138,6 +166,41 @@ fn texture(
     Some(entry)
 }
 
+/// The drawings as the editor shows them: linked text boxes with their share of the text, drawings in
+/// line with the text where `layout` (laid out at `zoom`) put their place. In-line drawings whose place is
+/// not laid out are left out.
+pub(crate) fn displayed(c: &ComposeState, layout: Option<&Layout>, zoom: f32) -> Vec<Drawing> {
+    if c.body.drawings.is_empty() {
+        return Vec::new();
+    }
+    let theme = c.theme_resolved();
+    let mut v = engine_cmd::flow_text(&c.body.drawings, &theme);
+    if v.iter().any(|d| d.wrap == WrapStyle::Inline) {
+        let zoom = if zoom.is_finite() && zoom > 0.0 { zoom } else { 1.0 };
+        let mut places: HashMap<u32, [f32; 4]> = HashMap::new();
+        for item in layout.map(|l| l.display.items.as_slice()).unwrap_or_default() {
+            if let DisplayItem::Image { rect, src, .. } = item
+                && let Some(id) = mailcraft_model::rich::inline_drawing_id(src)
+            {
+                places.entry(id).or_insert([rect.x / zoom, rect.y / zoom, rect.w / zoom, rect.h / zoom]);
+            }
+        }
+        v.retain_mut(|d| {
+            if d.wrap != WrapStyle::Inline {
+                return true;
+            }
+            match places.get(&d.id) {
+                Some(b) => {
+                    (d.x, d.y) = (b[0], b[1]);
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+    v
+}
+
 /// Screen rectangle of a box (px at 100 %) laid over the body at `origin`, zoomed.
 fn screen(b: [f32; 4], origin: Pos2, zoom: f32) -> Rect {
     Rect::from_min_size(origin + vec2(b[0], b[1]) * zoom, vec2(b[2], b[3]) * zoom)
@@ -148,35 +211,58 @@ fn bounds(d: &Drawing) -> [f32; 4] {
 }
 
 /// The box a drawing is shown at this frame (its drag preview while dragging).
-fn shown_box(m: &Mem, d: &Drawing, all: &[Drawing]) -> [f32; 4] {
+fn shown_box(m: &Mem, d: &Drawing) -> [f32; 4] {
     let Some(drag) = &m.drag else { return bounds(d) };
-    if drag.id == d.id {
-        return drag.cur;
+    match drag.kind {
+        DragKind::Resize(_) if drag.id == d.id => drag.cur,
+        DragKind::Move if drag.moving.contains(&d.id) => {
+            let (dx, dy) = (drag.cur[0] - drag.orig[0], drag.cur[1] - drag.orig[1]);
+            [d.x + dx, d.y + dy, d.w, d.h]
+        }
+        _ => bounds(d),
     }
-    // A canvas being moved carries what was drawn in it.
-    if drag.kind == DragKind::Move
-        && d.canvas == Some(drag.id)
-        && all.iter().any(|c| c.id == drag.id && c.kind == DrawingKind::Canvas)
-    {
-        let (dx, dy) = (drag.cur[0] - drag.orig[0], drag.cur[1] - drag.orig[1]);
-        return [d.x + dx, d.y + dy, d.w, d.h];
-    }
-    bounds(d)
 }
 
-/// Paints the drawings of compose `cid` behind the text (`behind`) or in front of it.
-pub(crate) fn paint(ui: &Ui, host: &dyn EditorHost, cid: u64, origin: Pos2, zoom: f32, behind: bool) {
+/// The selected drawings of `c` among `shown`, the one picked last first.
+fn selection(c: &ComposeState, shown: &[Drawing]) -> Vec<u32> {
+    c.selected_drawings().into_iter().filter(|id| shown.iter().any(|d| d.id == *id)).collect()
+}
+
+/// The points of a drawing being point-edited, on screen.
+fn point_handles(d: &Drawing, b: [f32; 4], origin: Pos2, zoom: f32) -> Vec<Pos2> {
+    d.points.iter().map(|(fx, fy)| origin + vec2(b[0] + fx * b[2], b[1] + fy * b[3]) * zoom).collect()
+}
+
+/// Paints the drawings of compose `cid` (as [`displayed`] gives them) behind the text (`behind`) or in front
+/// of it.
+pub(crate) fn paint(
+    ui: &Ui,
+    host: &dyn EditorHost,
+    cid: u64,
+    origin: Pos2,
+    zoom: f32,
+    behind: bool,
+    shown: &[Drawing],
+) {
     let ctx = ui.ctx().clone();
     let Some(c) = host.compose(cid) else { return };
-    if c.body.drawings.is_empty() {
+    if shown.is_empty() {
         return;
     }
     let m: Mem = ctx.data(|d| d.get_temp::<Mem>(mem_id(cid))).unwrap_or_default();
     let theme = c.theme_resolved();
     let mut used = HashSet::new();
     let hidden = super::panes::hidden_objects(&ctx, cid);
-    for d in c.body.drawings.iter().filter(|d| d.behind_text == behind && !is_hidden(&hidden, d.id)) {
-        let b = shown_box(&m, d, &c.body.drawings);
+    let hidden_ids: HashSet<u32> = shown
+        .iter()
+        .filter(|d| {
+            is_hidden(&hidden, d.id)
+                || d.group.is_some_and(|_| is_hidden(&hidden, engine_cmd::root_of(shown, d.id)))
+        })
+        .map(|d| d.id)
+        .collect();
+    for d in shown.iter().filter(|d| d.behind_text == behind && !hidden_ids.contains(&d.id)) {
+        let b = shown_box(&m, d);
         let editing_this = m.editing.as_ref().is_some_and(|e| e.id == d.id);
         // While the text is typed, the picture is drawn without it (the text edit shows it).
         if let Some((tex, pic)) = texture(&ctx, cid, d, &theme, !editing_this, &mut used) {
@@ -199,41 +285,83 @@ pub(crate) fn paint(ui: &Ui, host: &dyn EditorHost, cid: u64, origin: Pos2, zoom
             ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_gray(0xb0)), StrokeKind::Inside);
         }
     }
-    if !behind {
-        // The selection frame and handles.
-        if let Some(sel) = c.selected_drawing.and_then(|id| c.body.drawings.iter().find(|d| d.id == id)) {
-            let r = screen(shown_box(&m, sel, &c.body.drawings), origin, zoom);
-            let accent = host.theme().accent;
-            ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, accent), StrokeKind::Outside);
-            if m.editing.is_none() {
-                for (hx, hy) in HANDLES {
-                    let at = pos2(r.left() + r.width() * hx, r.top() + r.height() * hy);
-                    let hr = Rect::from_center_size(at, vec2(HANDLE, HANDLE));
-                    ui.painter().rect_filled(hr, 1.0, Color32::WHITE);
-                    ui.painter().rect_stroke(hr, 1.0, Stroke::new(1.0, accent), StrokeKind::Inside);
-                }
+    if behind {
+        return;
+    }
+    let accent = host.theme().accent;
+    // The selection: a frame round each selected drawing; handles on one picked alone.
+    let selected = selection(c, shown);
+    for (k, id) in selected.iter().enumerate() {
+        let Some(sel) = shown.iter().find(|d| d.id == *id) else { continue };
+        let b = shown_box(&m, sel);
+        let r = screen(b, origin, zoom);
+        let stroke = if sel.kind == DrawingKind::Group {
+            Stroke::new(1.0, accent.gamma_multiply(0.8))
+        } else {
+            Stroke::new(1.0, accent)
+        };
+        ui.painter().rect_stroke(r, 0.0, stroke, StrokeKind::Outside);
+        if c.edit_points == Some(*id) {
+            // Edit Points: the outline and its points.
+            let pts = point_handles(sel, b, origin, zoom);
+            let closed = sel.shape == "freeform";
+            let mut line = pts.clone();
+            if closed && let Some(first) = pts.first() {
+                line.push(*first);
+            }
+            ui.painter().add(egui::Shape::dashed_line(&line, Stroke::new(1.0, accent), 4.0, 3.0));
+            for p in pts {
+                let hr = Rect::from_center_size(p, vec2(POINT, POINT));
+                ui.painter().rect_filled(hr, 0.0, Color32::BLACK);
+                ui.painter().rect_stroke(hr, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
+            }
+            continue;
+        }
+        if k == 0 && selected.len() == 1 && m.editing.is_none() {
+            for (hx, hy) in HANDLES {
+                let at = pos2(r.left() + r.width() * hx, r.top() + r.height() * hy);
+                let hr = Rect::from_center_size(at, vec2(HANDLE, HANDLE));
+                ui.painter().rect_filled(hr, 1.0, Color32::WHITE);
+                ui.painter().rect_stroke(hr, 1.0, Stroke::new(1.0, accent), StrokeKind::Inside);
             }
         }
-        // The object being drawn.
-        if let Some(pts) = &m.rubber
-            && let (Some(a), Some(b)) = (pts.first(), pts.last())
-        {
-            let accent = host.theme().accent;
-            let tool = c.draw_tool.as_deref().unwrap_or_default();
-            if tool.ends_with("scribble") || tool.ends_with("freeform") {
-                ui.painter().add(egui::Shape::line(pts.clone(), Stroke::new(2.0, accent)));
-            } else if tool == "tablePencil" {
-                ui.painter().line_segment([*a, *b], Stroke::new(1.5, accent));
-            } else if tool == "tableEraser" {
-                ui.painter().circle_stroke(*b, 6.0, Stroke::new(1.5, accent));
-            } else {
-                ui.painter().rect_stroke(
-                    Rect::from_two_pos(*a, *b),
-                    0.0,
-                    Stroke::new(1.0, accent),
-                    StrokeKind::Inside,
-                );
-            }
+    }
+    // Linked text boxes: a small mark where the text goes on.
+    if let Some(first) = selected.first().and_then(|id| shown.iter().find(|d| d.id == *id))
+        && let Some(next) = first.link_next.and_then(|n| shown.iter().find(|d| d.id == n))
+    {
+        let (a, b) = (screen(bounds(first), origin, zoom), screen(bounds(next), origin, zoom));
+        ui.painter().add(egui::Shape::dashed_line(
+            &[a.right_bottom(), b.left_top()],
+            Stroke::new(1.0, accent.gamma_multiply(0.6)),
+            5.0,
+            4.0,
+        ));
+    }
+    // The drag round drawings that selects them.
+    if let Some((a, b, _)) = m.marquee {
+        let r = Rect::from_two_pos(a, b);
+        ui.painter().rect_filled(r, 0.0, accent.gamma_multiply(0.12));
+        ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, accent), StrokeKind::Inside);
+    }
+    // The object being drawn.
+    if let Some(pts) = &m.rubber
+        && let (Some(a), Some(b)) = (pts.first(), pts.last())
+    {
+        let tool = c.draw_tool.as_deref().unwrap_or_default();
+        if tool.ends_with("scribble") || tool.ends_with("freeform") {
+            ui.painter().add(egui::Shape::line(pts.clone(), Stroke::new(2.0, accent)));
+        } else if tool == "tablePencil" {
+            ui.painter().line_segment([*a, *b], Stroke::new(1.5, accent));
+        } else if tool == "tableEraser" {
+            ui.painter().circle_stroke(*b, 6.0, Stroke::new(1.5, accent));
+        } else {
+            ui.painter().rect_stroke(
+                Rect::from_two_pos(*a, *b),
+                0.0,
+                Stroke::new(1.0, accent),
+                StrokeKind::Inside,
+            );
         }
     }
     if !used.is_empty() {
@@ -253,11 +381,15 @@ fn is_hidden(hidden: &[String], id: u32) -> bool {
 }
 
 /// The drawing under screen point `p` (front first; drawings behind the text only in Select Objects mode).
+/// Groups draw nothing themselves: the drawing in them is hit.
 fn hit(drawings: &[Drawing], p: Pos2, origin: Pos2, zoom: f32, behind_too: bool) -> Option<u32> {
     let lx = (p.x - origin.x) / zoom;
     let ly = (p.y - origin.y) / zoom;
     let slack = 4.0 / zoom;
     let inside = |d: &Drawing| {
+        if d.kind == DrawingKind::Group {
+            return false;
+        }
         // Thin lines get a wider target.
         let (w, h) = (d.w.max(8.0 / zoom), d.h.max(8.0 / zoom));
         let (x, y) = (d.x + (d.w - w) / 2.0, d.y + (d.h - h) / 2.0);
@@ -279,6 +411,27 @@ fn handle_at(b: [f32; 4], p: Pos2, origin: Pos2, zoom: f32) -> Option<usize> {
         let at = pos2(r.left() + r.width() * hx, r.top() + r.height() * hy);
         Rect::from_center_size(at, vec2(HANDLE + 4.0, HANDLE + 4.0)).contains(p)
     })
+}
+
+/// The point of a point-edited drawing under `p`.
+fn point_at(pts: &[Pos2], p: Pos2) -> Option<usize> {
+    pts.iter().position(|q| Rect::from_center_size(*q, vec2(POINT + 4.0, POINT + 4.0)).contains(p))
+}
+
+/// The edge of a point-edited drawing nearest `p` (within a few px): the point it starts from.
+fn edge_at(pts: &[Pos2], closed: bool, p: Pos2) -> Option<usize> {
+    let n = pts.len();
+    let last = if closed { n } else { n.saturating_sub(1) };
+    (0..last)
+        .filter_map(|i| {
+            let (a, b) = (*pts.get(i)?, *pts.get((i + 1) % n)?);
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+            let d = (a + ab * t).distance(p);
+            (d <= 5.0).then_some((i, d))
+        })
+        .min_by(|x, y| x.1.total_cmp(&y.1))
+        .map(|(i, _)| i)
 }
 
 /// The box after dragging handle `h` by (`dx`, `dy`) px at 100 %.
@@ -374,10 +527,12 @@ pub(crate) fn text_focused(ctx: &egui::Context) -> bool {
     text_focus_compose(ctx).is_some()
 }
 
-/// Starts typing into drawing `id`.
+/// Starts typing into drawing `id` (a linked text box: into its chain's text, kept in the first box).
 fn start_editing(host: &dyn EditorHost, cid: u64, m: &mut Mem, id: u32, select_all: bool) {
-    let Some(d) = host.compose(cid).and_then(|c| c.body.drawings.iter().find(|d| d.id == id)) else { return };
-    if d.kind == DrawingKind::Canvas {
+    let Some(c) = host.compose(cid) else { return };
+    let id = engine_cmd::chain_head(&c.body.drawings, id);
+    let Some(d) = c.body.drawings.iter().find(|d| d.id == id) else { return };
+    if matches!(d.kind, DrawingKind::Canvas | DrawingKind::Group) {
         return;
     }
     m.editing = Some(Editing { id, text: d.text.clone(), original: d.text.clone(), focus: true, select_all });
@@ -454,8 +609,31 @@ fn table_stroke(
     );
 }
 
-/// Handles the pointer and keys for the drawings of compose `cid`. Returns true when the pointer belongs to
-/// the drawings this frame (the text does not see the press, drag or click).
+/// What a move of the drawings `targets` carries: them and what goes with them.
+fn moving_set(all: &[Drawing], targets: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    for t in targets {
+        for id in std::iter::once(*t).chain(engine_cmd::descendants(all, *t)) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// The top-level drawings (not in a group) wholly inside the screen rectangle `r`, not hidden.
+fn inside_rect(shown: &[Drawing], r: Rect, origin: Pos2, zoom: f32, hidden: &[String]) -> Vec<u32> {
+    shown
+        .iter()
+        .filter(|d| d.group.is_none() && !is_hidden(hidden, d.id) && d.wrap != WrapStyle::Inline)
+        .filter(|d| r.contains_rect(screen(bounds(d), origin, zoom)))
+        .map(|d| d.id)
+        .collect()
+}
+
+/// Handles the pointer and keys for the drawings of compose `cid` ([`displayed`] as `shown`). Returns true
+/// when the pointer belongs to the drawings this frame (the text does not see the press, drag or click).
 pub(crate) fn interact(
     ui: &mut Ui,
     host: &mut dyn EditorHost,
@@ -465,19 +643,22 @@ pub(crate) fn interact(
     zoom: f32,
     select_objects: bool,
     text_at: &dyn Fn(Pos2) -> DocPos,
+    shown_all: &[Drawing],
 ) -> bool {
     let ctx = ui.ctx().clone();
     let mut m: Mem = ctx.data(|d| d.get_temp::<Mem>(mem_id(cid))).unwrap_or_default();
     let Some(c) = host.compose(cid) else { return false };
-    let drawings = c.body.drawings.clone();
+    let drawings = shown_all.to_vec();
     // Drawings hidden in the Selection pane are not picked by the pointer.
     let hidden = super::panes::hidden_objects(&ctx, cid);
     let shown: Vec<Drawing> = drawings.iter().filter(|d| !is_hidden(&hidden, d.id)).cloned().collect();
     let tool = c.draw_tool.clone();
-    let selected = c.selected_drawing.filter(|id| drawings.iter().any(|d| d.id == *id));
+    let edit_points = c.edit_points;
+    let selected = selection(c, &drawings);
+    let primary = selected.first().copied();
     // A new text box or WordArt placeholder, just inserted and selected, starts in text mode.
-    let ids: HashSet<u32> = drawings.iter().map(|d| d.id).collect();
-    if let (Some(known), Some(sel)) = (&m.known, selected)
+    let ids: HashSet<u32> = c.body.drawings.iter().map(|d| d.id).collect();
+    if let (Some(known), Some(sel)) = (&m.known, c.selected_drawing)
         && !known.contains(&sel)
         && sel > m.max_id
         && let Some(d) = drawings.iter().find(|d| d.id == sel)
@@ -500,6 +681,32 @@ pub(crate) fn interact(
     });
     let pointer = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.interact_pos()));
     let mut consumed = false;
+
+    // Create Text Box Link: the next click on a text box links it.
+    if let Some(from) =
+        tool.as_deref().and_then(|t| t.strip_prefix("link:")).and_then(|n| n.parse::<u32>().ok())
+    {
+        if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::Alias);
+        }
+        if pressed
+            && resp.hovered()
+            && let Some(p) = pointer
+        {
+            commit(host, cid, &mut m);
+            match hit(&shown, p, origin, zoom, true) {
+                Some(to) => host.run("drawing.linkTextBox", with_compose(cid, json!({"id": from, "to": to}))),
+                None => host.run("drawing.tool", with_compose(cid, json!({"tool": null}))),
+            };
+            resp.request_focus();
+            consumed = true;
+        }
+        if resp.has_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            host.run("drawing.tool", with_compose(cid, json!({"tool": null})));
+        }
+        store(&ctx, cid, m);
+        return consumed;
+    }
 
     // Drawing a new object.
     if let Some(t) = tool.as_deref() {
@@ -541,7 +748,7 @@ pub(crate) fn interact(
         && pressed
         && let Some(p) = pointer
     {
-        if hit(&shown, p, origin, zoom, true) == Some(e.id) {
+        if hit(&shown, p, origin, zoom, true).is_some_and(|h| engine_cmd::chain_head(&drawings, h) == e.id) {
             consumed = true;
         } else {
             commit(host, cid, &mut m);
@@ -549,30 +756,133 @@ pub(crate) fn interact(
     }
 
     if tool.is_none() && m.editing.is_none() {
-        // Press: a handle of the selection, else a drawing, else the text (deselects).
+        let sel_box = |id: Option<u32>| id.and_then(|id| drawings.iter().find(|d| d.id == id)).map(bounds);
+        let point_edit = edit_points
+            .filter(|e| primary == Some(*e))
+            .and_then(|e| drawings.iter().find(|d| d.id == e))
+            .map(|d| (d.id, point_handles(d, bounds(d), origin, zoom), d.shape == "freeform"));
+        // Press: an Edit Points point, a handle of the selection, else a drawing, else the text (deselects).
         if pressed
             && resp.hovered()
             && let Some(p) = pointer
         {
-            let sel_box = selected.and_then(|id| drawings.iter().find(|d| d.id == id)).map(bounds);
-            if let (Some(id), Some(b), Some(h)) =
-                (selected, sel_box, sel_box.and_then(|b| handle_at(b, p, origin, zoom)))
-            {
-                m.drag =
-                    Some(Drag { id, kind: DragKind::Resize(h), start: p, orig: b, cur: b, moved: false });
-                consumed = true;
-            } else if let Some(id) = hit(&shown, p, origin, zoom, select_objects) {
-                if selected != Some(id) {
-                    host.run("drawing.select", with_compose(cid, json!({"id": id})));
+            let add = mods.shift;
+            let toggle = mods.command || mods.ctrl;
+            let on_point = point_edit.as_ref().and_then(|(id, pts, _)| point_at(pts, p).map(|i| (*id, i)));
+            let on_edge = point_edit
+                .as_ref()
+                .filter(|_| toggle && on_point.is_none())
+                .and_then(|(id, pts, closed)| edge_at(pts, *closed, p).map(|i| (*id, i)));
+            let handle = (selected.len() == 1 && point_edit.is_none())
+                .then(|| sel_box(primary).and_then(|b| handle_at(b, p, origin, zoom)))
+                .flatten();
+            let local = ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom);
+            if let Some((id, i)) = on_point {
+                if toggle {
+                    m.point = None;
+                    host.run("drawing.editPoints", with_compose(cid, json!({"id": id, "delete": i})));
+                } else {
+                    m.point = Some((id, i));
+                    let b = sel_box(Some(id)).unwrap_or_default();
+                    m.drag = Some(Drag {
+                        id,
+                        kind: DragKind::Point(i),
+                        start: p,
+                        orig: b,
+                        cur: b,
+                        moved: false,
+                        moving: Vec::new(),
+                        targets: Vec::new(),
+                    });
                 }
-                let b = drawings.iter().find(|d| d.id == id).map(bounds).unwrap_or_default();
-                m.drag = Some(Drag { id, kind: DragKind::Move, start: p, orig: b, cur: b, moved: false });
                 consumed = true;
-            } else if selected.is_some() {
+            } else if let Some((id, i)) = on_edge {
+                host.run(
+                    "drawing.editPoints",
+                    with_compose(cid, json!({"id": id, "insert": i, "x": local.0, "y": local.1})),
+                );
+                consumed = true;
+            } else if let (Some(id), Some(b), Some(h)) = (primary, sel_box(primary), handle) {
+                m.drag = Some(Drag {
+                    id,
+                    kind: DragKind::Resize(h),
+                    start: p,
+                    orig: b,
+                    cur: b,
+                    moved: false,
+                    moving: vec![id],
+                    targets: vec![id],
+                });
+                consumed = true;
+            } else if let Some(leaf) = hit(&shown, p, origin, zoom, select_objects) {
+                let id = engine_cmd::root_of(&drawings, leaf);
+                let d = drawings.iter().find(|d| d.id == id).cloned().unwrap_or_default();
+                // Inside a selected canvas (away from its edge) a drag selects what is in it.
+                let canvas_inner = d.kind == DrawingKind::Canvas
+                    && selected.contains(&id)
+                    && leaf == id
+                    && screen(bounds(&d), origin, zoom).shrink(CANVAS_EDGE).contains(p);
+                if canvas_inner && !add && !toggle {
+                    m.marquee = Some((p, p, false));
+                } else {
+                    let targets = if add || toggle {
+                        let p = if toggle {
+                            json!({"id": leaf, "toggle": true})
+                        } else {
+                            json!({"id": leaf, "add": true})
+                        };
+                        host.run("drawing.select", with_compose(cid, p));
+                        host.compose(cid).map(ComposeState::selected_drawings).unwrap_or_default()
+                    } else if selected.contains(&id) {
+                        selected.clone()
+                    } else {
+                        host.run("drawing.select", with_compose(cid, json!({"id": leaf})));
+                        vec![id]
+                    };
+                    if targets.contains(&id) {
+                        let moving = moving_set(&drawings, &targets);
+                        m.drag = Some(Drag {
+                            id,
+                            kind: DragKind::Move,
+                            start: p,
+                            orig: bounds(&d),
+                            cur: bounds(&d),
+                            moved: false,
+                            moving,
+                            targets,
+                        });
+                    }
+                }
+                consumed = true;
+            } else if select_objects {
+                // Select Objects: a drag on an empty place selects the drawings it goes round.
+                m.marquee = Some((p, p, add || toggle));
+                consumed = true;
+            } else if !selected.is_empty() {
                 host.run("drawing.select", with_compose(cid, json!({"id": null})));
             }
             if consumed {
                 resp.request_focus();
+            }
+        }
+        if let Some((a, _, add)) = m.marquee {
+            consumed = true;
+            if let Some(p) = pointer {
+                m.marquee = Some((a, p, add));
+            }
+            if released || !down {
+                let (a, b, add) = m.marquee.take().unwrap_or((a, a, add));
+                let r = Rect::from_two_pos(a, b);
+                if r.width() >= CLICK_SLOP || r.height() >= CLICK_SLOP {
+                    let ids = inside_rect(&drawings, r, origin, zoom, &hidden);
+                    if ids.is_empty() && !add {
+                        host.run("drawing.select", with_compose(cid, json!({"id": null})));
+                    } else if !ids.is_empty() {
+                        host.run("drawing.select", with_compose(cid, json!({"ids": ids, "add": add})));
+                    }
+                } else if !add {
+                    host.run("drawing.select", with_compose(cid, json!({"id": null})));
+                }
             }
         }
         if let Some(drag) = m.drag.as_mut() {
@@ -584,7 +894,9 @@ pub(crate) fn interact(
                 }
                 if drag.moved {
                     drag.cur = match drag.kind {
-                        DragKind::Move => [drag.orig[0] + dx, drag.orig[1] + dy, drag.orig[2], drag.orig[3]],
+                        DragKind::Move | DragKind::Point(_) => {
+                            [drag.orig[0] + dx, drag.orig[1] + dy, drag.orig[2], drag.orig[3]]
+                        }
                         DragKind::Resize(h) => {
                             let wordart =
                                 drawings.iter().any(|d| d.id == drag.id && d.kind == DrawingKind::WordArt);
@@ -597,31 +909,77 @@ pub(crate) fn interact(
                 let d = m.drag.take();
                 if let Some(d) = d.filter(|d| d.moved && d.cur != d.orig) {
                     let [x, y, w, h] = d.cur;
+                    let inline = drawings.iter().any(|x| x.id == d.id && x.wrap == WrapStyle::Inline);
                     match d.kind {
-                        DragKind::Move => {
-                            host.run("drawing.move", with_compose(cid, json!({"id": d.id, "x": x, "y": y})))
+                        DragKind::Move if inline => {
+                            // Dropped at a place in the text.
+                            let at = pointer
+                                .map_or((x, y), |p| ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom));
+                            host.run(
+                                "drawing.move",
+                                with_compose(cid, json!({"id": d.id, "x": at.0, "y": at.1})),
+                            )
                         }
+                        DragKind::Move => host.run(
+                            "drawing.move",
+                            with_compose(
+                                cid,
+                                json!({"ids": d.targets, "dx": x - d.orig[0], "dy": y - d.orig[1]}),
+                            ),
+                        ),
                         DragKind::Resize(_) => host.run(
                             "drawing.size",
                             with_compose(cid, json!({"id": d.id, "x": x, "y": y, "w": w, "h": h})),
                         ),
+                        DragKind::Point(i) => {
+                            let to = pointer.map(|p| ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom));
+                            to.and_then(|(px, py)| {
+                                host.run(
+                                    "drawing.editPoints",
+                                    with_compose(cid, json!({"id": d.id, "point": i, "x": px, "y": py})),
+                                )
+                            })
+                        }
                     };
                 }
             }
         }
         if resp.double_clicked()
             && let Some(p) = pointer
-            && let Some(id) = hit(&shown, p, origin, zoom, select_objects)
         {
-            m.drag = None;
-            start_editing(&*host, cid, &mut m, id, false);
-            consumed = true;
+            // Edit Points: a double-click on an edge adds a point there; one on a point keeps it picked.
+            let on_points = point_edit
+                .as_ref()
+                .map(|(id, pts, closed)| (*id, point_at(pts, p), edge_at(pts, *closed, p)))
+                .filter(|(_, pt, edge)| pt.is_some() || edge.is_some());
+            if let Some((id, pt, edge)) = on_points {
+                m.drag = None;
+                if let (None, Some(i)) = (pt, edge) {
+                    let local = ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom);
+                    host.run(
+                        "drawing.editPoints",
+                        with_compose(cid, json!({"id": id, "insert": i, "x": local.0, "y": local.1})),
+                    );
+                    m.point = None;
+                }
+                consumed = true;
+            } else if let Some(id) = hit(&shown, p, origin, zoom, select_objects) {
+                m.drag = None;
+                start_editing(&*host, cid, &mut m, id, false);
+                consumed = true;
+            }
         }
         if resp.hovered()
             && let Some(p) = resp.hover_pos()
         {
-            let sel_box = selected.and_then(|id| drawings.iter().find(|d| d.id == id)).map(bounds);
-            if let Some(h) = sel_box.and_then(|b| handle_at(b, p, origin, zoom)) {
+            let on_point = point_edit.as_ref().is_some_and(|(_, pts, _)| point_at(pts, p).is_some());
+            let handle = (selected.len() == 1 && point_edit.is_none())
+                .then(|| sel_box(primary).and_then(|b| handle_at(b, p, origin, zoom)))
+                .flatten();
+            if on_point {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                consumed = true;
+            } else if let Some(h) = handle {
                 let icon = match h {
                     0 | 4 => egui::CursorIcon::ResizeNwSe,
                     2 | 6 => egui::CursorIcon::ResizeNeSw,
@@ -635,11 +993,9 @@ pub(crate) fn interact(
                 consumed = true;
             }
         }
-        // Keys with a drawing selected (and the body focused).
-        if let Some(id) = selected
-            && resp.has_focus()
-        {
-            keys(ui, host, cid, &mut m, id, mods);
+        // Keys with drawings selected (and the body focused).
+        if !selected.is_empty() && resp.has_focus() {
+            keys(ui, host, cid, &mut m, &selected, edit_points.is_some(), mods);
         }
     }
     if tool.is_some() && resp.has_focus() {
@@ -649,19 +1005,29 @@ pub(crate) fn interact(
             host.run("drawing.tool", with_compose(cid, json!({"tool": null})));
         }
     }
-    edit_text(ui, host, cid, &mut m, origin, zoom);
+    edit_text(ui, host, cid, &mut m, origin, zoom, &drawings);
     store(&ctx, cid, m);
     consumed
 }
 
-/// Delete, arrows, Esc, Enter / F2 and typing with drawing `id` selected. Only these keys with their own
-/// modifiers are taken (Ctrl+Enter still sends, Ctrl+Delete still reaches the body); typing is taken only by a
-/// drawing that holds text.
-fn keys(ui: &mut Ui, host: &mut dyn EditorHost, cid: u64, m: &mut Mem, id: u32, mods: egui::Modifiers) {
-    let holds_text = host
-        .compose(cid)
-        .and_then(|c| c.body.drawings.iter().find(|d| d.id == id))
-        .is_some_and(|d| d.kind != DrawingKind::Canvas);
+/// Delete, arrows, Esc, Enter / F2 and typing with drawings `selected` (the one picked last first). Only
+/// these keys with their own modifiers are taken (Ctrl+Enter still sends, Ctrl+Delete still reaches the
+/// body); typing is taken only by a drawing that holds text.
+fn keys(
+    ui: &mut Ui,
+    host: &mut dyn EditorHost,
+    cid: u64,
+    m: &mut Mem,
+    selected: &[u32],
+    editing_points: bool,
+    mods: egui::Modifiers,
+) {
+    let Some(&id) = selected.first() else { return };
+    let holds_text = selected.len() == 1
+        && host
+            .compose(cid)
+            .and_then(|c| c.body.drawings.iter().find(|d| d.id == id))
+            .is_some_and(|d| !matches!(d.kind, DrawingKind::Canvas | DrawingKind::Group));
     let mut acts: Vec<(&str, serde_json::Value)> = Vec::new();
     let mut edit = false;
     let mut typed = String::new();
@@ -674,16 +1040,27 @@ fn keys(ui: &mut Ui, host: &mut dyn EditorHost, cid: u64, m: &mut Mem, id: u32, 
         Key::Enter => plain(m) && holds_text,
         _ => false,
     };
+    let ids = json!(selected);
+    // Edit Points: Delete takes away the point clicked last, never the drawing.
+    let point = m.point.filter(|(pid, _)| *pid == id).map(|(_, i)| i);
     ui.input_mut(|i| {
         i.events.retain(|e| match e {
             Event::Key { key, pressed: true, modifiers, .. } if ours(key, modifiers) => {
                 let step = if modifiers.command { 1.0 } else { 8.0 };
                 match key {
-                    Key::Delete | Key::Backspace => acts.push(("drawing.delete", json!({"id": id}))),
-                    Key::ArrowLeft => acts.push(("drawing.move", json!({"id": id, "dx": -step}))),
-                    Key::ArrowRight => acts.push(("drawing.move", json!({"id": id, "dx": step}))),
-                    Key::ArrowUp => acts.push(("drawing.move", json!({"id": id, "dy": -step}))),
-                    Key::ArrowDown => acts.push(("drawing.move", json!({"id": id, "dy": step}))),
+                    Key::Delete | Key::Backspace if editing_points => {
+                        if let Some(at) = point {
+                            acts.push(("drawing.editPoints", json!({"id": id, "delete": at})));
+                        }
+                    }
+                    Key::Delete | Key::Backspace => acts.push(("drawing.delete", json!({"ids": ids}))),
+                    Key::ArrowLeft => acts.push(("drawing.move", json!({"ids": ids, "dx": -step}))),
+                    Key::ArrowRight => acts.push(("drawing.move", json!({"ids": ids, "dx": step}))),
+                    Key::ArrowUp => acts.push(("drawing.move", json!({"ids": ids, "dy": -step}))),
+                    Key::ArrowDown => acts.push(("drawing.move", json!({"ids": ids, "dy": step}))),
+                    Key::Escape if editing_points => {
+                        acts.push(("drawing.editPoints", json!({"id": id, "on": false})));
+                    }
                     Key::Escape => acts.push(("drawing.select", json!({"id": null}))),
                     _ => edit = true,
                 }
@@ -698,9 +1075,13 @@ fn keys(ui: &mut Ui, host: &mut dyn EditorHost, cid: u64, m: &mut Mem, id: u32, 
         })
     });
     for (cmd, p) in acts {
+        if p.get("delete").is_some() {
+            // The points after it moved down one: nothing is picked now.
+            m.point = None;
+        }
         host.run(cmd, with_compose(cid, p));
     }
-    if edit || !typed.is_empty() {
+    if (edit || !typed.is_empty()) && holds_text {
         start_editing(&*host, cid, m, id, false);
         if let Some(e) = m.editing.as_mut() {
             e.text.push_str(&typed);
@@ -709,18 +1090,29 @@ fn keys(ui: &mut Ui, host: &mut dyn EditorHost, cid: u64, m: &mut Mem, id: u32, 
 }
 
 /// The text edit laid over a drawing whose text is being typed.
-fn edit_text(ui: &mut Ui, host: &mut dyn EditorHost, cid: u64, m: &mut Mem, origin: Pos2, zoom: f32) {
+fn edit_text(
+    ui: &mut Ui,
+    host: &mut dyn EditorHost,
+    cid: u64,
+    m: &mut Mem,
+    origin: Pos2,
+    zoom: f32,
+    shown: &[Drawing],
+) {
     let Some(e) = m.editing.as_mut() else { return };
     let Some(c) = host.compose(cid) else { return };
-    let Some(d) = c.body.drawings.iter().find(|d| d.id == e.id).cloned() else {
+    let Some(mut d) = c.body.drawings.iter().find(|d| d.id == e.id).cloned() else {
         m.editing = None;
         return;
     };
+    // Where it is shown (in-line drawings sit where the text put them).
+    if let Some(s) = shown.iter().find(|s| s.id == d.id) {
+        (d.x, d.y) = (s.x, s.y);
+    }
     let theme = c.theme_resolved();
     let (tx, ty, tw, th) = match d.kind {
-        DrawingKind::TextBox | DrawingKind::Canvas => (8.0, 4.0, (d.w - 16.0).max(4.0), (d.h - 8.0).max(4.0)),
         DrawingKind::WordArt => (0.0, 0.0, d.w.max(40.0), d.h),
-        DrawingKind::Shape => shapes::text_rect(&d.shape, d.w, d.h),
+        _ => engine_drawing::text_area(&d),
     };
     let r = Rect::from_min_size(origin + vec2(d.x + tx, d.y + ty) * zoom, vec2(tw, th) * zoom);
     let pt = d.text_style.size_pt.unwrap_or(if d.kind == DrawingKind::WordArt { 36.0 } else { 11.0 });
@@ -796,7 +1188,16 @@ mod tests {
         let line = Drawing { id: 3, x: 300.0, y: 10.0, w: 100.0, h: 0.0, ..Drawing::default() };
         let behind =
             Drawing { id: 4, x: 500.0, y: 0.0, w: 50.0, h: 50.0, behind_text: true, ..Drawing::default() };
-        let all = vec![a, b, line, behind];
+        let group = Drawing {
+            id: 5,
+            kind: DrawingKind::Group,
+            x: 0.0,
+            y: 0.0,
+            w: 600.0,
+            h: 600.0,
+            ..Drawing::default()
+        };
+        let all = vec![a, b, line, behind, group];
         let o = pos2(0.0, 0.0);
         assert_eq!(hit(&all, pos2(75.0, 75.0), o, 1.0, false), Some(2));
         assert_eq!(hit(&all, pos2(10.0, 10.0), o, 1.0, false), Some(1));
@@ -804,10 +1205,74 @@ mod tests {
         assert_eq!(
             hit(&all, pos2(520.0, 20.0), o, 1.0, false),
             None,
-            "behind the text: the text gets the click"
+            "behind the text: the text gets the click (a group draws nothing to hit)"
         );
         assert_eq!(hit(&all, pos2(520.0, 20.0), o, 1.0, true), Some(4), "Select Objects reaches it");
         assert_eq!(hit(&all, pos2(150.0, 20.0), pos2(100.0, 0.0), 2.0, false), Some(1), "origin and zoom");
         assert_eq!(handle_at([0.0, 0.0, 100.0, 50.0], pos2(101.0, 51.0), o, 1.0), Some(4));
+    }
+
+    #[test]
+    fn edit_points_find_points_and_edges() {
+        let pts = [pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0)];
+        assert_eq!(point_at(&pts, pos2(99.0, 2.0)), Some(1));
+        assert_eq!(point_at(&pts, pos2(50.0, 50.0)), None);
+        assert_eq!(edge_at(&pts, false, pos2(50.0, 2.0)), Some(0));
+        assert_eq!(edge_at(&pts, true, pos2(50.0, 49.0)), Some(2), "the closing edge");
+        assert_eq!(edge_at(&pts, false, pos2(50.0, 49.0)), None);
+    }
+
+    /// Presses Delete with drawing `id` selected (`editing_points`: Edit Points is on).
+    fn press_delete(app: &mut crate::App, cid: u64, m: &mut Mem, id: u32, editing_points: bool) {
+        let mut input = egui::RawInput::default();
+        input.events.push(Event::Key {
+            key: Key::Delete,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let ctx = egui::Context::default();
+        let mut out =
+            ctx.run_ui(input, |ui| keys(ui, app, cid, m, &[id], editing_points, egui::Modifiers::NONE));
+        out.textures_delta.clear();
+    }
+
+    /// Regression: Delete in Edit Points deleted the whole drawing.
+    #[test]
+    fn delete_in_edit_points_takes_a_point_not_the_drawing() {
+        use mailcraft_engine::compose::{ComposeKind, ComposeState};
+        let mut app = crate::App::new(mailcraft_engine::sample::sample_session());
+        let cid = app.s.open_compose(ComposeState { kind: ComposeKind::New, ..ComposeState::default() });
+        let r = app.run("insert.shape", json!({"compose": cid, "kind": "rectangle", "x": 0, "y": 0}));
+        let id = r.and_then(|r| r["drawing"].as_u64()).unwrap() as u32;
+        app.run("drawing.editPoints", json!({"compose": cid, "id": id, "on": true}));
+        let points = |app: &crate::App| {
+            app.s.composes[&cid].body.drawings.iter().find(|d| d.id == id).map(|d| d.points.len())
+        };
+        let before = points(&app).unwrap();
+        assert!(before >= 4);
+        let mut m = Mem::default();
+        press_delete(&mut app, cid, &mut m, id, true);
+        assert_eq!(points(&app), Some(before), "no point picked: the drawing and its points stay");
+        m.point = Some((id, 1));
+        press_delete(&mut app, cid, &mut m, id, true);
+        assert_eq!(points(&app), Some(before - 1), "the point clicked last goes");
+        assert!(m.point.is_none());
+        // Without Edit Points, Delete deletes the drawing.
+        press_delete(&mut app, cid, &mut m, id, false);
+        assert_eq!(points(&app), None);
+    }
+
+    #[test]
+    fn a_marquee_picks_the_drawings_it_goes_round() {
+        let a = Drawing { id: 1, x: 10.0, y: 10.0, w: 20.0, h: 20.0, ..Drawing::default() };
+        let b = Drawing { id: 2, x: 100.0, y: 10.0, w: 20.0, h: 20.0, ..Drawing::default() };
+        let member =
+            Drawing { id: 3, x: 12.0, y: 12.0, w: 5.0, h: 5.0, group: Some(9), ..Drawing::default() };
+        let all = vec![a, b, member];
+        let r = Rect::from_min_max(pos2(0.0, 0.0), pos2(50.0, 50.0));
+        assert_eq!(inside_rect(&all, r, pos2(0.0, 0.0), 1.0, &[]), vec![1]);
+        assert!(inside_rect(&all, r, pos2(0.0, 0.0), 1.0, &["drawing:1".into()]).is_empty());
     }
 }

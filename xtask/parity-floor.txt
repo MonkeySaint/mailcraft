@@ -1,4 +1,4 @@
-# Set to 99.6 in round 6: five observed Shape Format features that are not built yet (Edit Points, Create
-# Text Box Link, Group Objects, Distribute, Text Wrap Gallery) had been marked not applicable and now count
-# as missing. Raise it as they are built.
-99.6
+# Back to 100.0 in round 7: the five observed Shape Format features that round 6 counted as missing (Edit
+# Points, Create Text Box Link, Group Objects, Distribute, Text Wrap Gallery) are built. Every mapped
+# catalog row has a registered command.
+100.0

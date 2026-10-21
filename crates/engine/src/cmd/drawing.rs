@@ -1,13 +1,30 @@
 //! `drawing.*`: the floating drawing objects of the compose body (text boxes, shapes, WordArt, drawing
-//! canvases; see [`mailcraft_model::Drawing`]) and the Shape Format tab that edits them: select, move and
-//! size (the editor's drag handles end in `drawing.move` / `drawing.size`), text, Shape Fill, Shape Outline,
-//! Shape Effects, Shape Quick Styles, gradient fills, Text Fill, Text Outline, Text Effects, WordArt Quick
-//! Styles, Text Direction, Align Text, Change Shape, Bring Forward / Send Backward,
-//! Align, Rotate, Alt Text, Size and Position, Delete, and the drawing tool (the next drag in the body draws
-//! the armed shape, text box, canvas or scribble).
+//! canvases, groups; see [`mailcraft_model::Drawing`]) and the Shape Format tab that edits them: select
+//! (one or several), move and size (the editor's drag handles end in `drawing.move` / `drawing.size`), text,
+//! Shape Fill (colours, gradients, pictures), Shape Outline (colour, weight, dashes), Shape Effects (with
+//! galleries and options), Shape Quick Styles, Text Fill, Text Outline, Text Effects (with Transform), WordArt
+//! Quick Styles, Text Direction, Align Text, Change Shape, Edit Points, Create Text Box Link, Bring Forward /
+//! Send Backward, Wrap Text and Position, Align and Distribute, Group, Rotate and Flip, Alt Text, Format Shape,
+//! Delete, and the drawing tool (the next drag in the body draws the armed shape, text box, canvas or
+//! scribble).
 //!
-//! Every command acts on `{"id": n}` or, without it, on the compose's selected drawing; each change is one
-//! editor undo step. Moving a drawing canvas moves the drawings drawn in it (`Drawing::canvas`).
+//! Every command acts on `{"id": n}` (or `{"ids": [..]}`) or, without it, on the selected drawings; each
+//! change is one editor undo step. Formatting a group formats the drawings in it; moving, sizing, rotating
+//! and deleting a group does so to all of it. Moving a drawing canvas moves the drawings drawn in it
+//! (`Drawing::canvas`).
+
+mod fx;
+mod group;
+mod link;
+mod points;
+mod props;
+#[cfg(test)]
+mod tests;
+mod wrap;
+
+pub use fx::{GLOW_SIZES, PRESETS, REFLECTIONS, ROTATIONS, SHADOWS, SOFT_EDGES, preset_of};
+pub use link::{chain_head, flow_text};
+pub use wrap::{inline_boxes, wrap_name};
 
 use serde_json::{Value, json};
 
@@ -18,7 +35,10 @@ use crate::cmd::util::{dialog, opt_bool, opt_str};
 use crate::compose::ComposeState;
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_geom::Color;
-use mailcraft_model::rich::{Align, Drawing, DrawingKind, VAlign};
+use mailcraft_model::rich::{Align, Drawing, DrawingKind, VAlign, WrapStyle};
+
+/// Deepest group nesting followed.
+const MAX_NEST: usize = 32;
 
 /// Enabled: an open compose has drawings.
 fn has_drawings(s: &Session) -> Option<&'static str> {
@@ -36,57 +56,261 @@ fn any_compose(s: &Session) -> Option<&'static str> {
     if s.composes.is_empty() { Some("no message is being composed") } else { None }
 }
 
-/// The drawing a command acts on: `id`, else the selected one.
-fn target(s: &Session, p: &Value) -> Result<(u64, u32), CmdError> {
+/// A drawing id parameter.
+fn parse_id(v: &Value) -> Result<u32, CmdError> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|t| t.trim().parse().ok()))
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| CmdError::Params("`id` must be a drawing id".into()))
+}
+
+/// The drawings named by `id` or `ids`, if any.
+fn explicit_ids(p: &Value) -> Result<Option<Vec<u32>>, CmdError> {
+    if let Some(v) = p.get("id").filter(|v| !v.is_null()) {
+        return Ok(Some(vec![parse_id(v)?]));
+    }
+    match p.get("ids") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) => {
+            let mut out = Vec::new();
+            for v in a.iter().take(draw::MAX_DRAWINGS) {
+                let id = parse_id(v)?;
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(CmdError::Params("`ids` must be a list of drawing ids".into())),
+    }
+}
+
+pub fn find(ds: &[Drawing], id: u32) -> Option<&Drawing> {
+    ds.iter().find(|d| d.id == id)
+}
+
+/// The drawings a command acts on: `id` / `ids`, else the selected drawings (the one picked last first).
+pub(crate) fn targets(s: &Session, p: &Value) -> Result<(u64, Vec<u32>), CmdError> {
     let cid = compose_id(s, p)?;
     let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
-    let id = match p.get("id") {
-        Some(v) if !v.is_null() => v
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| CmdError::Params("`id` must be a drawing id".into()))?,
-        _ => c.selected_drawing.ok_or_else(|| CmdError::Disabled("select a drawing first".into()))?,
+    let ids = match explicit_ids(p)? {
+        Some(ids) => ids,
+        None => c.selected_drawings(),
     };
-    if !c.body.drawings.iter().any(|d| d.id == id) {
-        return Err(CmdError::Params(format!("no drawing with id {id}")));
+    if ids.is_empty() {
+        return Err(CmdError::Disabled("select a drawing first".into()));
     }
+    for id in &ids {
+        if find(&c.body.drawings, *id).is_none() {
+            return Err(CmdError::Params(format!("no drawing with id {id}")));
+        }
+    }
+    Ok((cid, ids))
+}
+
+/// The drawing a command acts on alone: `id`, else the selected one.
+fn target(s: &Session, p: &Value) -> Result<(u64, u32), CmdError> {
+    let (cid, ids) = targets(s, p)?;
+    let id = ids.first().copied().ok_or_else(|| CmdError::Disabled("select a drawing first".into()))?;
     Ok((cid, id))
 }
 
-/// Applies `f` to the target drawing as one undo step (no step when nothing changed).
+/// The outermost group drawing `id` is in (itself when it is in none).
+pub fn root_of(ds: &[Drawing], id: u32) -> u32 {
+    let mut at = id;
+    for _ in 0..MAX_NEST {
+        match find(ds, at).and_then(|d| d.group).filter(|g| find(ds, *g).is_some()) {
+            Some(g) if g != at => at = g,
+            _ => break,
+        }
+    }
+    at
+}
+
+/// Everything that goes with drawing `id` when it moves or is deleted: the members of a group (and of
+/// groups in it) and the drawings drawn in a canvas. Not `id` itself.
+pub fn descendants(ds: &[Drawing], id: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    let mut todo = vec![(id, 0usize)];
+    while let Some((at, depth)) = todo.pop() {
+        if depth > MAX_NEST || out.len() > draw::MAX_DRAWINGS {
+            break;
+        }
+        let Some(d) = find(ds, at) else { continue };
+        for o in ds {
+            let member = (d.kind == DrawingKind::Group && o.group == Some(at))
+                || (d.kind == DrawingKind::Canvas && o.canvas == Some(at));
+            if member && o.id != id && !out.contains(&o.id) {
+                out.push(o.id);
+                todo.push((o.id, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// `ids` with every group replaced by the drawings in it (what formatting applies to).
+pub(crate) fn leaves(ds: &[Drawing], ids: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(d) = find(ds, *id) else { continue };
+        if d.kind == DrawingKind::Group {
+            for m in descendants(ds, *id) {
+                if find(ds, m).is_some_and(|x| x.kind != DrawingKind::Group) && !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+        } else if !out.contains(id) {
+            out.push(*id);
+        }
+    }
+    out
+}
+
+/// The box around drawings `ids` (x0, y0, x1, y1).
+pub(crate) fn bounds(ds: &[Drawing], ids: &[u32]) -> Option<(f32, f32, f32, f32)> {
+    let mut b: Option<(f32, f32, f32, f32)> = None;
+    for d in ids.iter().filter_map(|id| find(ds, *id)) {
+        let r = (d.x, d.y, d.x + d.w, d.y + d.h);
+        b = Some(match b {
+            None => r,
+            Some(o) => (o.0.min(r.0), o.1.min(r.1), o.2.max(r.2), o.3.max(r.3)),
+        });
+    }
+    b
+}
+
+/// After drawings changed: groups take the box of their members (a group left with fewer than two members
+/// dissolves), and links and group references to drawings that are gone are dropped.
+pub(crate) fn tidy(ds: &mut Vec<Drawing>) {
+    for _ in 0..MAX_NEST {
+        let lonely = ds.iter().find(|g| {
+            g.kind == DrawingKind::Group && ds.iter().filter(|m| m.group == Some(g.id)).count() < 2
+        });
+        let Some((gid, parent)) = lonely.map(|g| (g.id, g.group)) else { break };
+        for m in ds.iter_mut().filter(|m| m.group == Some(gid)) {
+            m.group = parent;
+        }
+        ds.retain(|d| d.id != gid);
+    }
+    let ids: Vec<u32> = ds.iter().map(|d| d.id).collect();
+    let groups: Vec<u32> = ds.iter().filter(|d| d.kind == DrawingKind::Group).map(|d| d.id).collect();
+    for d in ds.iter_mut() {
+        if d.group.is_some_and(|g| !groups.contains(&g) || g == d.id) {
+            d.group = None;
+        }
+        if d.link_next.is_some_and(|l| !ids.contains(&l) || l == d.id) {
+            d.link_next = None;
+        }
+    }
+    // Boxes from the innermost groups out.
+    for _ in 0..MAX_NEST {
+        let mut changed = false;
+        for gid in &groups {
+            let members: Vec<u32> = ds.iter().filter(|m| m.group == Some(*gid)).map(|m| m.id).collect();
+            let Some((x0, y0, x1, y1)) = bounds(ds, &members) else { continue };
+            let canvas = {
+                let first = members.first().and_then(|m| find(ds, *m)).and_then(|m| m.canvas);
+                members
+                    .iter()
+                    .all(|m| find(ds, *m).is_some_and(|d| d.canvas == first))
+                    .then_some(first)
+                    .flatten()
+            };
+            if let Some(g) = ds.iter_mut().find(|g| g.id == *gid) {
+                let nb =
+                    (x0, y0, (x1 - x0).max(draw::MIN_DRAWING_SIDE), (y1 - y0).max(draw::MIN_DRAWING_SIDE));
+                if (g.x, g.y, g.w, g.h) != nb || g.canvas != canvas {
+                    (g.x, g.y, g.w, g.h) = nb;
+                    g.canvas = canvas;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Moves drawings `ids` by (`dx`, `dy`).
+pub(crate) fn shift(ds: &mut [Drawing], ids: &[u32], dx: f32, dy: f32) {
+    for d in ds.iter_mut().filter(|d| ids.contains(&d.id)) {
+        d.x += dx;
+        d.y += dy;
+        draw::sanitize(d);
+    }
+}
+
+/// Applies `f` to every target drawing (groups: the drawings in them) as one undo step (no step when
+/// nothing changed). A drawing `f` refuses is left alone; when it refuses all of them, its error is the
+/// command's.
 fn change(
     s: &mut Session,
     p: &Value,
-    f: impl FnOnce(&mut Drawing, &ComposeState) -> Result<(), CmdError>,
+    f: impl Fn(&mut Drawing, &ComposeState) -> Result<(), CmdError>,
 ) -> CmdResult {
-    let (cid, id) = target(s, p)?;
+    let (cid, ids) = targets(s, p)?;
+    let explicit = explicit_ids(p)?.is_some();
     let c = s.composes.get_mut(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
-    let Some(before) = c.body.drawings.iter().find(|d| d.id == id).cloned() else {
-        return Err(CmdError::Params(format!("no drawing with id {id}")));
-    };
-    let mut d = before.clone();
-    f(&mut d, c)?;
-    draw::sanitize(&mut d);
-    if d.kind == DrawingKind::WordArt {
-        draw::fit_word_art(&mut d, &c.theme_resolved());
+    let theme = c.theme_resolved();
+    let mut updated: Vec<Drawing> = Vec::new();
+    let mut first_err: Option<CmdError> = None;
+    let mut ok = 0usize;
+    for id in leaves(&c.body.drawings, &ids) {
+        let Some(before) = find(&c.body.drawings, id).cloned() else { continue };
+        let mut d = before.clone();
+        if let Err(e) = f(&mut d, c) {
+            first_err.get_or_insert(e);
+            continue;
+        }
+        ok += 1;
+        draw::sanitize(&mut d);
+        if d.kind == DrawingKind::WordArt {
+            draw::fit_word_art(&mut d, &theme);
+        }
+        if d.autofit
+            && let Some(h) = draw::fitted_height(&d, &theme)
+        {
+            d.h = h;
+        }
+        if d != before {
+            updated.push(d);
+        }
     }
-    let changed = d != before;
+    if ok == 0 {
+        return Err(first_err.unwrap_or_else(|| CmdError::Disabled("select a drawing first".into())));
+    }
+    let changed = !updated.is_empty();
     if changed {
         c.checkpoint();
-        if let Some(slot) = c.body.drawings.iter_mut().find(|x| x.id == id) {
-            *slot = d.clone();
+        for d in updated {
+            let id = d.id;
+            if let Some(slot) = c.body.drawings.iter_mut().find(|x| x.id == id) {
+                *slot = d;
+            }
+            rejoin(c, id);
         }
-        rejoin(c, id);
+        tidy(&mut c.body.drawings);
+        // In-line drawings: their place in the text takes their new size.
+        c.sync_inline_drawings();
         c.dirty = true;
     }
-    c.selected_drawing = Some(id);
-    Ok(json!({"drawing": id, "changed": changed, "x": d.x, "y": d.y, "w": d.w, "h": d.h}))
+    let primary = ids.first().copied().unwrap_or(0);
+    if explicit && !c.selected_drawings().contains(&primary) {
+        c.select_drawing(Some(primary));
+    }
+    let d = find(&c.body.drawings, primary).cloned().unwrap_or_default();
+    Ok(json!({"drawing": primary, "changed": changed, "x": d.x, "y": d.y, "w": d.w, "h": d.h}))
 }
 
 /// After drawing `id` (not a canvas) moved or changed size: it belongs to the canvas that now holds it, if
 /// any (moved out of its canvas, it leaves it; moved into one, it joins it).
 fn rejoin(c: &mut ComposeState, id: u32) {
-    let Some(d) = c.body.drawings.iter().find(|d| d.id == id) else { return };
+    let Some(d) = find(&c.body.drawings, id) else { return };
+    if d.wrap == WrapStyle::Inline {
+        return;
+    }
     let canvas = draw::canvas_around(&c.body.drawings, d);
     if let Some(d) = c.body.drawings.iter_mut().find(|d| d.id == id) {
         d.canvas = canvas;
@@ -136,22 +360,40 @@ fn color_dialog(s: &mut Session, p: &Value, target_name: &str, current: Option<C
 
 fn select(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
-    let id = match p.get("id") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(
-            v.as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| CmdError::Params("`id` must be a drawing id or null".into()))?,
-        ),
+    let ids = match p.get("id") {
+        Some(Value::Null) => Some(Vec::new()),
+        _ => explicit_ids(p)?,
     };
+    let (add, toggle, member) = (
+        opt_bool(p, "add") == Some(true),
+        opt_bool(p, "toggle") == Some(true),
+        opt_bool(p, "member") == Some(true),
+    );
     let c = compose_mut(s, p)?;
-    if let Some(id) = id
-        && !c.body.drawings.iter().any(|d| d.id == id)
-    {
-        return Err(CmdError::Params(format!("no drawing with id {id}")));
+    let ids = ids.unwrap_or_default();
+    for id in &ids {
+        if find(&c.body.drawings, *id).is_none() {
+            return Err(CmdError::Params(format!("no drawing with id {id}")));
+        }
     }
-    c.selected_drawing = id;
-    Ok(json!({"compose": cid, "selected": id}))
+    // A click on a drawing in a group picks the group (`member`: the drawing itself).
+    let picked: Vec<u32> =
+        ids.iter().map(|id| if member { *id } else { root_of(&c.body.drawings, *id) }).collect();
+    let mut set = if add || toggle { c.selected_drawings() } else { Vec::new() };
+    for id in picked {
+        if toggle && set.contains(&id) {
+            set.retain(|x| *x != id);
+        } else {
+            set.retain(|x| *x != id);
+            set.insert(0, id);
+        }
+    }
+    c.selected_drawing = set.first().copied();
+    c.also_selected = set.get(1..).map(<[u32]>::to_vec).unwrap_or_default();
+    if c.edit_points.is_some_and(|e| c.selected_drawing != Some(e)) {
+        c.edit_points = None;
+    }
+    Ok(json!({"compose": cid, "selected": c.selected_drawing, "selection": set}))
 }
 
 /// Names a drawing tool can have.
@@ -179,7 +421,8 @@ fn tool(s: &mut Session, p: &Value) -> CmdResult {
     };
     let c = compose_mut(s, p)?;
     if tool.is_some() {
-        c.selected_drawing = None;
+        c.select_drawing(None);
+        c.edit_points = None;
     }
     c.draw_tool.clone_from(&tool);
     Ok(json!({"armed": tool}))
@@ -189,7 +432,8 @@ fn list(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
     let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
     let drawings = serde_json::to_value(&c.body.drawings).unwrap_or(Value::Null);
-    Ok(json!({"compose": cid, "drawings": drawings, "selected": c.selected_drawing, "tool": c.draw_tool}))
+    Ok(json!({"compose": cid, "drawings": drawings, "selected": c.selected_drawing,
+              "selection": c.selected_drawings(), "tool": c.draw_tool, "editPoints": c.edit_points}))
 }
 
 fn move_to(s: &mut Session, p: &Value) -> CmdResult {
@@ -197,40 +441,77 @@ fn move_to(s: &mut Session, p: &Value) -> CmdResult {
     if x.is_none() && y.is_none() && dx.is_none() && dy.is_none() {
         return Err(CmdError::Params("give `x` / `y` or `dx` / `dy`".into()));
     }
-    let (cid, id) = target(s, p)?;
+    let (cid, ids) = targets(s, p)?;
+    let explicit = explicit_ids(p)?.is_some();
     let c = s.composes.get_mut(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
-    let Some(d) = c.body.drawings.iter().find(|d| d.id == id).cloned() else {
-        return Err(CmdError::Params(format!("no drawing with id {id}")));
+    let primary = ids.first().copied().unwrap_or(0);
+    let Some(d) = find(&c.body.drawings, primary).cloned() else {
+        return Err(CmdError::Params(format!("no drawing with id {primary}")));
     };
-    let nx = x.unwrap_or(d.x) + dx.unwrap_or(0.0);
-    let ny = y.unwrap_or(d.y) + dy.unwrap_or(0.0);
-    let mut moved = d.clone();
-    moved.x = nx;
-    moved.y = ny;
-    draw::sanitize(&mut moved);
-    let (ox, oy) = (moved.x - d.x, moved.y - d.y);
-    if ox == 0.0 && oy == 0.0 {
-        c.selected_drawing = Some(id);
-        return Ok(json!({"drawing": id, "changed": false, "x": d.x, "y": d.y}));
+    if d.wrap == WrapStyle::Inline {
+        // In line with the text: it moves to the place in the text it is dropped on.
+        let (ix, iy) = wrap::inline_box(c, primary).map_or((d.x, d.y), |b| (b.0, b.1));
+        let at = (x.unwrap_or(ix) + dx.unwrap_or(0.0), y.unwrap_or(iy) + dy.unwrap_or(0.0));
+        let moved = wrap::move_inline(c, primary, at);
+        return Ok(json!({"drawing": primary, "changed": moved, "inline": true}));
     }
-    // A canvas carries the drawings drawn in it.
-    let members: Vec<u32> = if d.kind == DrawingKind::Canvas {
-        c.body.drawings.iter().filter(|o| o.id != id && o.canvas == Some(id)).map(|o| o.id).collect()
-    } else {
-        Vec::new()
-    };
-    c.checkpoint();
-    for o in &mut c.body.drawings {
-        if o.id == id || members.contains(&o.id) {
-            o.x += ox;
-            o.y += oy;
-            draw::sanitize(o);
+    let mut probe = d.clone();
+    probe.x = x.unwrap_or(d.x) + dx.unwrap_or(0.0);
+    probe.y = y.unwrap_or(d.y) + dy.unwrap_or(0.0);
+    draw::sanitize(&mut probe);
+    let (ox, oy) = (probe.x - d.x, probe.y - d.y);
+    if explicit {
+        let keep = c.selected_drawings();
+        if !keep.contains(&primary) {
+            c.select_drawing(Some(primary));
         }
     }
-    rejoin(c, id);
-    c.selected_drawing = Some(id);
+    if ox == 0.0 && oy == 0.0 {
+        return Ok(json!({"drawing": primary, "changed": false, "x": d.x, "y": d.y}));
+    }
+    // Each target with what goes with it (group members, a canvas's drawings); in-line drawings stay.
+    let mut moving: Vec<u32> = Vec::new();
+    for id in &ids {
+        if find(&c.body.drawings, *id).is_some_and(|t| t.wrap == WrapStyle::Inline) {
+            continue;
+        }
+        for m in std::iter::once(*id).chain(descendants(&c.body.drawings, *id)) {
+            if !moving.contains(&m) {
+                moving.push(m);
+            }
+        }
+    }
+    c.checkpoint();
+    shift(&mut c.body.drawings, &moving, ox, oy);
+    for id in &moving {
+        if find(&c.body.drawings, *id).is_some_and(|d| d.kind != DrawingKind::Canvas) {
+            rejoin(c, *id);
+        }
+    }
+    tidy(&mut c.body.drawings);
     c.dirty = true;
-    Ok(json!({"drawing": id, "changed": true, "x": moved.x, "y": moved.y, "moved": members.len() + 1}))
+    let d = find(&c.body.drawings, primary).cloned().unwrap_or_default();
+    Ok(json!({"drawing": primary, "changed": true, "x": d.x, "y": d.y, "moved": moving.len()}))
+}
+
+/// Scales group `gid`'s members from its old box to `to` (x, y, w, h).
+fn scale_group(c: &mut ComposeState, gid: u32, to: (f32, f32, f32, f32)) {
+    let Some(g) = find(&c.body.drawings, gid).cloned() else { return };
+    let (kx, ky) = (to.2 / g.w.max(1.0), to.3 / g.h.max(1.0));
+    let members = descendants(&c.body.drawings, gid);
+    let theme = c.theme_resolved();
+    for d in c.body.drawings.iter_mut().filter(|d| members.contains(&d.id)) {
+        d.x = to.0 + (d.x - g.x) * kx;
+        d.y = to.1 + (d.y - g.y) * ky;
+        d.w *= kx;
+        d.h *= ky;
+        if d.kind == DrawingKind::WordArt {
+            let pt = d.text_style.size_pt.unwrap_or(36.0);
+            d.text_style.size_pt = Some((pt * kx.min(ky)).clamp(4.0, 400.0));
+            draw::fit_word_art(d, &theme);
+        }
+        draw::sanitize(d);
+    }
 }
 
 fn size(s: &mut Session, p: &Value) -> CmdResult {
@@ -239,7 +520,52 @@ fn size(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params("give `w` and / or `h` (and optionally `x`, `y`)".into()));
     }
     let keep = opt_bool(p, "keepRatio").unwrap_or(false);
-    change(s, p, |d, _| {
+    let (cid, ids) = targets(s, p)?;
+    // Groups scale what is in them.
+    let groups: Vec<u32> = {
+        let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+        ids.iter()
+            .copied()
+            .filter(|id| find(&c.body.drawings, *id).is_some_and(|d| d.kind == DrawingKind::Group))
+            .collect()
+    };
+    if !groups.is_empty() {
+        let c = s.composes.get_mut(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+        c.checkpoint();
+        for gid in &groups {
+            let Some(g) = find(&c.body.drawings, *gid).cloned() else { continue };
+            let (ow, oh) = (g.w.max(1.0), g.h.max(1.0));
+            let (mut nw, mut nh) = (w.unwrap_or(g.w), h.unwrap_or(g.h));
+            if keep {
+                match (w, h) {
+                    (Some(_), None) => nh = oh * nw / ow,
+                    (None, Some(_)) => nw = ow * nh / oh,
+                    _ => {}
+                }
+            }
+            let to = (
+                x.unwrap_or(g.x),
+                y.unwrap_or(g.y),
+                nw.clamp(draw::MIN_DRAWING_SIDE, draw::MAX_DRAWING_SIDE),
+                nh.clamp(draw::MIN_DRAWING_SIDE, draw::MAX_DRAWING_SIDE),
+            );
+            scale_group(c, *gid, to);
+        }
+        tidy(&mut c.body.drawings);
+        c.dirty = true;
+        let primary = ids.first().copied().unwrap_or(0);
+        let d = find(&c.body.drawings, primary).cloned().unwrap_or_default();
+        if ids.iter().all(|id| groups.contains(id)) {
+            return Ok(json!({"drawing": primary, "changed": true, "x": d.x, "y": d.y, "w": d.w, "h": d.h}));
+        }
+    }
+    let rest: Vec<Value> = ids.iter().filter(|id| !groups.contains(id)).map(|id| json!(id)).collect();
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        o.remove("id");
+        o.insert("ids".into(), Value::Array(rest));
+    }
+    change(s, &q, |d, _| {
         let (ow, oh) = (d.w.max(1.0), d.h.max(1.0));
         let (mut nw, mut nh) = (w.unwrap_or(d.w), h.unwrap_or(d.h));
         if keep {
@@ -274,25 +600,40 @@ fn text(s: &mut Session, p: &Value) -> CmdResult {
         .ok_or_else(|| CmdError::Params("`text` (string) required".into()))?
         .replace("\r\n", "\n")
         .replace('\r', "\n");
-    change(s, p, |d, _| {
-        if d.kind == DrawingKind::Canvas {
-            return Err(CmdError::Failed("a drawing canvas holds drawings, not text".into()));
+    // Linked text boxes share one text: it belongs to the first box of the chain.
+    let (cid, id) = target(s, p)?;
+    let head = s.composes.get(&cid).map_or(id, |c| link::chain_head(&c.body.drawings, id));
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        o.insert("id".into(), json!(head));
+        o.remove("ids");
+    }
+    change(s, &q, |d, _| {
+        if matches!(d.kind, DrawingKind::Canvas | DrawingKind::Group) {
+            return Err(CmdError::Failed("a drawing canvas or group holds drawings, not text".into()));
         }
         if d.kind == DrawingKind::WordArt && d.alt == d.text {
-            d.alt = t.clone();
+            d.alt.clone_from(&t);
         }
-        d.text = t;
+        d.text.clone_from(&t);
         Ok(())
     })
 }
 
+/// The drawing whose formatting the Shape Format galleries show for compose `c`: the selected drawing, or
+/// for a group the first drawing in it (a group's format is its members').
+pub fn format_source(c: &ComposeState) -> Option<&Drawing> {
+    let id = c.selected_drawing?;
+    let leaf = leaves(&c.body.drawings, &[id]).first().copied().unwrap_or(id);
+    find(&c.body.drawings, leaf).or_else(|| find(&c.body.drawings, id))
+}
+
 fn current(s: &Session, p: &Value) -> Result<Drawing, CmdError> {
     let (cid, id) = target(s, p)?;
-    s.composes
-        .get(&cid)
-        .and_then(|c| c.body.drawings.iter().find(|d| d.id == id))
-        .cloned()
-        .ok_or_else(|| CmdError::Params(format!("no drawing with id {id}")))
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    // A group's format is its first drawing's.
+    let id = leaves(&c.body.drawings, &[id]).first().copied().unwrap_or(id);
+    find(&c.body.drawings, id).cloned().ok_or_else(|| CmdError::Params(format!("no drawing with id {id}")))
 }
 
 fn fill(s: &mut Session, p: &Value) -> CmdResult {
@@ -300,93 +641,188 @@ fn fill(s: &mut Session, p: &Value) -> CmdResult {
         let cur = current(s, p)?.fill;
         return color_dialog(s, p, "shapeFill", cur);
     }
+    if opt_bool(p, "moreGradients") == Some(true) {
+        return props::format_dialog(s, p, "fill");
+    }
+    let picture = props::picture_param(p)?;
     let gradient = match p.get("gradient") {
         None | Some(Value::Null) => None,
-        Some(Value::String(g)) if draw::GRADIENTS.contains(&g.as_str()) => Some(g.clone()),
+        Some(Value::String(g)) if draw::valid_gradient(g) => Some(g.clone()),
         Some(other) => {
             return Err(CmdError::Params(format!(
-                "unknown gradient {other} (down, up, right, left, center, or \"\" for a solid fill)"
+                "unknown gradient {other} (down, up, right, left, center, downRight, downLeft, upRight, upLeft, each also as dark:<direction>, or \"\" for a solid fill)"
             )));
         }
     };
+    let stops = props::gradient_param(p)?;
+    let transparency = props::unit_param(p, "transparency")?;
     let col = color_choice(s, p)?;
-    if col.is_none() && gradient.is_none() {
+    if col.is_none() && gradient.is_none() && stops.is_none() && picture.is_none() && transparency.is_none() {
         return Err(CmdError::Params(
-            "give `color` (null for No Fill), `theme` and `tint`, or `gradient`".into(),
+            "give `color` (null for No Fill), `theme` and `tint`, `gradient`, `stops`, `picture` or `transparency`"
+                .into(),
         ));
     }
     change(s, p, |d, c| {
-        if d.kind == DrawingKind::WordArt && gradient.as_deref().is_some_and(|g| !g.is_empty()) {
+        if matches!(d.kind, DrawingKind::WordArt)
+            && (gradient.as_deref().is_some_and(|g| !g.is_empty()) || stops.is_some())
+        {
             return Err(CmdError::Failed("WordArt takes its gradient from its style".into()));
         }
         if let Some(col) = col {
             d.fill = col;
+            d.gradient_fill = None;
+            d.fill_picture.clear();
             if col.is_none() {
                 d.gradient.clear();
             }
         }
-        if let Some(g) = gradient {
+        if let Some(g) = &gradient {
             if !g.is_empty() && d.fill.is_none() {
                 // A gradient needs a colour to shade: the theme's first accent.
                 d.fill = Some(c.theme_resolved().color(crate::compose::ACCENT1));
             }
-            d.gradient = g;
+            d.gradient.clone_from(g);
+            d.gradient_fill = None;
+            d.fill_picture.clear();
+        }
+        if let Some(gf) = &stops {
+            d.gradient_fill = gf.clone();
+            if d.fill.is_none() {
+                d.fill = Some(c.theme_resolved().color(crate::compose::ACCENT1));
+            }
+            d.fill_picture.clear();
+        }
+        if let Some(pic) = &picture {
+            d.fill_picture.clone_from(pic);
+            if !pic.is_empty() {
+                d.gradient_fill = None;
+                d.gradient.clear();
+                if d.fill.is_none() {
+                    d.fill = Some(Color::WHITE);
+                }
+            }
+        }
+        if let Some(t) = transparency {
+            d.transparency = t;
         }
         Ok(())
     })
 }
 
-/// Text Outline: a colour (null = none) drawn around the letters of the text.
+/// Text Outline: a colour (null = none) drawn around the letters of the text, its weight and dashes.
 fn text_outline(s: &mut Session, p: &Value) -> CmdResult {
     if opt_bool(p, "custom") == Some(true) {
         let cur = current(s, p)?.text_outline;
         return color_dialog(s, p, "textOutline", cur);
     }
-    let Some(col) = color_choice(s, p)? else {
-        return Err(CmdError::Params("give `color` (null for No Outline) or `theme` and `tint`".into()));
-    };
-    change(s, p, |d, _| {
-        if d.kind == DrawingKind::Canvas {
+    let col = color_choice(s, p)?;
+    let weight = num(p, "weight")?;
+    let dash = props::dash_param(p)?;
+    if col.is_none() && weight.is_none() && dash.is_none() {
+        return Err(CmdError::Params(
+            "give `color` (null for No Outline), `theme` and `tint`, `weight` or `dash`".into(),
+        ));
+    }
+    change(s, p, |d, c| {
+        if matches!(d.kind, DrawingKind::Canvas | DrawingKind::Group) {
             return Err(CmdError::Failed("a drawing canvas has no text".into()));
         }
-        d.text_outline = col;
+        if let Some(col) = col {
+            d.text_outline = col;
+        }
+        let needs = weight.is_some_and(|w| w > 0.0) || dash.as_deref().is_some_and(|x| !x.is_empty());
+        if needs && d.text_outline.is_none() {
+            d.text_outline = Some(c.theme_resolved().color(0));
+        }
+        if let Some(w) = weight {
+            d.text_outline_px = w;
+        }
+        if let Some(x) = &dash {
+            d.text_outline_dash.clone_from(x);
+        }
         Ok(())
     })
 }
 
-/// Text Effects: one effect on the letters (`""` gives WordArt back its style's effects).
+/// Text Effects: one effect on the letters (`""` gives WordArt back its style's effects), effects with
+/// options (as Shape Effects), and Transform (`transform`: a warp of the text).
 fn text_effect(s: &mut Session, p: &Value) -> CmdResult {
-    let e = opt_str(p, "effect").unwrap_or("").to_owned();
-    if !draw::TEXT_EFFECTS.contains(&e.as_str()) {
+    let legacy = opt_str(p, "effect").map(str::to_owned);
+    if let Some(e) = &legacy
+        && !draw::TEXT_EFFECTS.contains(&e.as_str())
+    {
         return Err(CmdError::Params(format!(
             "unknown text effect `{e}` (none, shadow, glow, reflection, bevel, or \"\" for the WordArt style's)"
         )));
     }
-    change(s, p, |d, _| {
+    let transform = opt_str(p, "transform").map(str::to_owned);
+    if let Some(t) = &transform
+        && !draw::WARPS.iter().any(|(id, _)| id == t)
+    {
+        return Err(CmdError::Params(format!("unknown transform `{t}`")));
+    }
+    let options = fx::has_options(p);
+    if legacy.is_none() && transform.is_none() && !options {
+        return Err(CmdError::Params("give `effect`, `transform` or effect options".into()));
+    }
+    change(s, p, |d, c| {
         match d.kind {
-            DrawingKind::Canvas => return Err(CmdError::Failed("a drawing canvas has no text".into())),
+            DrawingKind::Canvas | DrawingKind::Group => {
+                return Err(CmdError::Failed("a drawing canvas has no text".into()));
+            }
             DrawingKind::WordArt => {}
-            _ if e == "reflection" => {
+            _ if legacy.as_deref() == Some("reflection")
+                || p.get("reflection").is_some_and(|v| !v.is_null()) =>
+            {
                 return Err(CmdError::Failed("only WordArt text can have a reflection".into()));
             }
             _ => {}
         }
-        d.text_effect = e;
+        if let Some(e) = &legacy {
+            d.text_effect.clone_from(e);
+            d.text_fx = None;
+        }
+        if options {
+            let mut t = d.text_fx.as_deref().cloned().unwrap_or_else(|| fx::from_legacy(&d.text_effect));
+            let accent = c.theme_resolved().color(crate::compose::ACCENT1);
+            fx::apply(&mut t, p, c, accent)?;
+            d.text_fx = Some(Box::new(t));
+            if d.text_effect.is_empty() {
+                // Options replace a WordArt style's own effects.
+                d.text_effect = "none".into();
+            }
+        }
+        if let Some(t) = &transform {
+            d.warp.clone_from(t);
+        }
         Ok(())
     })
 }
 
-/// Text Direction: the text of a text box or shape runs left to right, or top to bottom.
+/// Text Direction: the text of a text box or shape runs left to right, top to bottom, bottom to top, or
+/// stacked one letter under another.
 fn text_direction(s: &mut Session, p: &Value) -> CmdResult {
-    let vertical = match p.get("vertical").and_then(Value::as_bool) {
-        Some(v) => v,
-        None => !current(s, p)?.vertical,
+    let dir = match (opt_str(p, "direction"), p.get("vertical").and_then(Value::as_bool)) {
+        (Some(d @ ("horizontal" | "down" | "up" | "stacked")), _) => d.to_owned(),
+        (Some(other), _) => {
+            return Err(CmdError::Params(format!(
+                "unknown direction `{other}` (horizontal, down, up, stacked)"
+            )));
+        }
+        (None, Some(true)) => "down".into(),
+        (None, Some(false)) => "horizontal".into(),
+        (None, None) => {
+            let d = current(s, p)?;
+            if d.vertical || !d.text_flow.is_empty() { "horizontal".into() } else { "down".into() }
+        }
     };
     change(s, p, |d, _| {
-        if matches!(d.kind, DrawingKind::Canvas | DrawingKind::WordArt) {
+        if matches!(d.kind, DrawingKind::Canvas | DrawingKind::WordArt | DrawingKind::Group) {
             return Err(CmdError::Failed("only text boxes and shapes can turn their text".into()));
         }
-        d.vertical = vertical;
+        d.vertical = dir == "down";
+        d.text_flow = if matches!(dir.as_str(), "up" | "stacked") { dir.clone() } else { String::new() };
         Ok(())
     })
 }
@@ -407,7 +843,7 @@ fn shape_style(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params("`accent` is 0 (text colour) to 6".into()));
     }
     change(s, p, |d, c| {
-        if matches!(d.kind, DrawingKind::Canvas | DrawingKind::WordArt) {
+        if matches!(d.kind, DrawingKind::Canvas | DrawingKind::WordArt | DrawingKind::Group) {
             return Err(CmdError::Failed("only shapes and text boxes take a shape style".into()));
         }
         let theme = c.theme_resolved();
@@ -418,6 +854,9 @@ fn shape_style(s: &mut Session, p: &Value) -> CmdResult {
         let (dark, light) = (theme.color(0), theme.color(1));
         let line = shapes::is_line_shape(&d.shape);
         d.gradient.clear();
+        d.gradient_fill = None;
+        d.fill_picture.clear();
+        d.fx = None;
         d.effect = "none".into();
         d.outline_px = d.outline_px.max(1.0);
         match style.as_str() {
@@ -454,9 +893,12 @@ fn outline(s: &mut Session, p: &Value) -> CmdResult {
     }
     let col = color_choice(s, p)?;
     let weight = num(p, "weight")?;
-    if col.is_none() && weight.is_none() {
+    let dash = props::dash_param(p)?;
+    let transparency = props::unit_param(p, "transparency")?;
+    if col.is_none() && weight.is_none() && dash.is_none() && transparency.is_none() {
         return Err(CmdError::Params(
-            "give `color` (null for No Outline), `theme` and `tint`, or `weight`".into(),
+            "give `color` (null for No Outline), `theme` and `tint`, `weight`, `dash` or `transparency`"
+                .into(),
         ));
     }
     change(s, p, |d, _| {
@@ -469,19 +911,51 @@ fn outline(s: &mut Session, p: &Value) -> CmdResult {
                 d.outline = Some(Color::BLACK);
             }
         }
+        if let Some(x) = &dash {
+            d.line_dash.clone_from(x);
+            if d.outline.is_none() && !x.is_empty() {
+                d.outline = Some(Color::BLACK);
+            }
+        }
+        if let Some(t) = transparency {
+            d.line_transparency = t;
+        }
         Ok(())
     })
 }
 
+/// Shape Effects: a preset effect (`effect`, `""` = the theme's), or effects with options (`shadow`,
+/// `reflection`, `glow`, `softEdges`, `bevel`, `rotation3d`, `preset`; see [`fx::apply`]).
 fn effect(s: &mut Session, p: &Value) -> CmdResult {
-    let e = opt_str(p, "effect").unwrap_or("").to_owned();
-    if !EFFECTS.contains(&e.as_str()) {
+    let legacy = opt_str(p, "effect").map(str::to_owned);
+    if let Some(e) = &legacy
+        && !EFFECTS.contains(&e.as_str())
+    {
         return Err(CmdError::Params(format!(
             "unknown effect `{e}` (none, shadow, glow, reflection, bevel, softEdges, or \"\" for the theme's)"
         )));
     }
-    change(s, p, |d, _| {
-        d.effect = e;
+    let options = fx::has_options(p);
+    if legacy.is_none() && !options {
+        return Err(CmdError::Params("give `effect` or effect options".into()));
+    }
+    change(s, p, |d, c| {
+        if d.kind == DrawingKind::Group {
+            return Err(CmdError::Failed("a group has no effects of its own".into()));
+        }
+        if let Some(e) = &legacy {
+            d.effect.clone_from(e);
+            d.fx = None;
+        }
+        if options {
+            let mut f = d.fx.as_deref().cloned().unwrap_or_else(|| fx::from_legacy(&d.effect));
+            let accent =
+                d.fill.or(d.outline).unwrap_or_else(|| c.theme_resolved().color(crate::compose::ACCENT1));
+            fx::apply(&mut f, p, c, accent)?;
+            // Options take over from the theme's effect style.
+            d.effect = "none".into();
+            d.fx = (!f.is_empty()).then(|| Box::new(f));
+        }
         Ok(())
     })
 }
@@ -511,8 +985,11 @@ fn font(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params("give `family`, `size`, `bold`, `italic` or `underline`".into()));
     }
     change(s, p, |d, _| {
-        if let Some(f) = family {
-            d.text_style.font_family = Some(f);
+        if matches!(d.kind, DrawingKind::Canvas | DrawingKind::Group) {
+            return Err(CmdError::Failed("a drawing canvas has no text".into()));
+        }
+        if let Some(f) = &family {
+            d.text_style.font_family = Some(f.clone());
         }
         if let Some(sz) = size {
             d.text_style.size_pt = Some(sz.clamp(1.0, 400.0));
@@ -546,7 +1023,7 @@ fn word_art_style(s: &mut Session, p: &Value) -> CmdResult {
             }
             return Ok(());
         }
-        if d.kind == DrawingKind::Canvas {
+        if matches!(d.kind, DrawingKind::Canvas | DrawingKind::Group) {
             return Err(CmdError::Failed("a drawing canvas has no text to style".into()));
         }
         if d.kind != DrawingKind::WordArt {
@@ -558,7 +1035,7 @@ fn word_art_style(s: &mut Session, p: &Value) -> CmdResult {
                 d.text = "Your text here".into();
             }
         }
-        d.word_art = style;
+        d.word_art.clone_from(&style);
         Ok(())
     })
 }
@@ -608,7 +1085,7 @@ fn change_shape(s: &mut Session, p: &Value) -> CmdResult {
         .ok_or_else(|| CmdError::Params(format!("unknown shape `{raw}`")))?;
     change(s, p, |d, c| {
         match d.kind {
-            DrawingKind::Canvas | DrawingKind::WordArt => {
+            DrawingKind::Canvas | DrawingKind::WordArt | DrawingKind::Group => {
                 return Err(CmdError::Failed("only shapes and text boxes can change shape".into()));
             }
             DrawingKind::TextBox => d.kind = DrawingKind::Shape,
@@ -625,82 +1102,127 @@ fn change_shape(s: &mut Session, p: &Value) -> CmdResult {
         if !matches!(shape, "freeform" | "scribble") {
             d.points.clear();
         }
+        if matches!(d.wrap, WrapStyle::Tight | WrapStyle::Through) {
+            d.wrap_points = wrap::outline_points(d);
+        }
         Ok(())
     })
 }
 
-fn arrange(s: &mut Session, p: &Value) -> CmdResult {
-    let action = opt_str(p, "action").unwrap_or("").to_owned();
-    let (cid, id) = target(s, p)?;
+/// Moves drawing `id` (with what goes with it) in the back-to-front order: `bringForward`,
+/// `bringToFront`, `sendBackward`, `sendToBack`; `behindText` / `inFrontOfText` put it behind or in front
+/// of the body text. One undo step; returns whether anything changed.
+pub(crate) fn arrange_id(s: &mut Session, cid: u64, id: u32, action: &str) -> Result<bool, CmdError> {
     let c = s.composes.get_mut(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
-    let Some(at) = c.body.drawings.iter().position(|d| d.id == id) else {
-        return Err(CmdError::Params(format!("no drawing with id {id}")));
-    };
-    let last = c.body.drawings.len().saturating_sub(1);
+    let changed = arrange_in(c, &[id], action)?;
+    Ok(changed)
+}
+
+fn arrange_in(c: &mut ComposeState, ids: &[u32], action: &str) -> Result<bool, CmdError> {
+    if !matches!(
+        action,
+        "bringForward" | "bringToFront" | "sendBackward" | "sendToBack" | "behindText" | "inFrontOfText"
+    ) {
+        return Err(CmdError::Params(format!(
+            "unknown arrangement `{action}` (bringForward, bringToFront, sendBackward, sendToBack, behindText, inFrontOfText)"
+        )));
+    }
     let before = c.body.drawings.clone();
     let mut list = c.body.drawings.clone();
-    match action.as_str() {
-        "bringForward" => list.swap(at, (at + 1).min(last)),
-        "sendBackward" => list.swap(at, at.saturating_sub(1)),
-        "bringToFront" => {
-            let d = list.remove(at);
-            list.push(d);
-        }
-        "sendToBack" => {
-            let d = list.remove(at);
-            list.insert(0, d);
-        }
-        "behindText" | "inFrontOfText" => {
-            if let Some(d) = list.get_mut(at) {
-                d.behind_text = action == "behindText";
+    let mut inline_out: Vec<u32> = Vec::new();
+    // Front moves go front-most first, back moves back-most first, so the targets keep their order.
+    let mut order: Vec<u32> = ids.to_vec();
+    let pos = |l: &[Drawing], id: u32| l.iter().position(|d| d.id == id).unwrap_or(0);
+    order.sort_by_key(|id| pos(&list, *id));
+    if matches!(action, "bringForward" | "bringToFront") {
+        order.reverse();
+    }
+    for id in order {
+        let block: Vec<u32> = std::iter::once(id).chain(descendants(&list, id)).collect();
+        match action {
+            "behindText" | "inFrontOfText" => {
+                for d in list.iter_mut().filter(|d| block.contains(&d.id)) {
+                    d.behind_text = action == "behindText";
+                    if d.id == id && d.wrap != WrapStyle::Front {
+                        if d.wrap == WrapStyle::Inline {
+                            inline_out.push(d.id);
+                        }
+                        d.wrap = WrapStyle::Front;
+                    }
+                }
             }
-        }
-        other => {
-            return Err(CmdError::Params(format!(
-                "unknown arrangement `{other}` (bringForward, bringToFront, sendBackward, sendToBack, behindText, inFrontOfText)"
-            )));
+            _ => {
+                let at = list.iter().position(|d| block.contains(&d.id)).unwrap_or(0);
+                let (moving, mut rest): (Vec<Drawing>, Vec<Drawing>) =
+                    list.into_iter().partition(|d| block.contains(&d.id));
+                let to = match action {
+                    "bringToFront" => rest.len(),
+                    "sendToBack" => 0,
+                    // Past the next drawing (and what goes with it) in that direction.
+                    "bringForward" => {
+                        let mut k = at;
+                        if let Some(next) = rest.get(k) {
+                            let skip = std::iter::once(next.id).chain(descendants(&rest, next.id)).count();
+                            k = (k + skip).min(rest.len());
+                        }
+                        k
+                    }
+                    _ => at.saturating_sub(1),
+                };
+                let to = to.min(rest.len());
+                rest.splice(to..to, moving);
+                list = rest;
+            }
         }
     }
     let changed = list != before;
     if changed {
+        // In line with the text before: the drawing stays where it was shown.
+        let boxes: Vec<(u32, (f32, f32, f32, f32))> =
+            inline_out.iter().filter_map(|id| wrap::inline_box(c, *id).map(|b| (*id, b))).collect();
         c.checkpoint();
         c.body.drawings = list;
+        for (id, b) in boxes {
+            if let Some(d) = c.body.drawings.iter_mut().find(|d| d.id == id) {
+                (d.x, d.y) = (b.0, b.1);
+            }
+            crate::compose::remove_placeholders(&mut c.body.blocks, id);
+        }
         c.dirty = true;
     }
-    c.selected_drawing = Some(id);
-    let order: Vec<u32> = c.body.drawings.iter().map(|d| d.id).collect();
-    Ok(json!({"drawing": id, "changed": changed, "order": order}))
+    Ok(changed)
 }
 
-fn align(s: &mut Session, p: &Value) -> CmdResult {
-    let kind = opt_str(p, "kind").unwrap_or("").to_owned();
-    if !matches!(kind.as_str(), "left" | "center" | "right" | "top" | "middle" | "bottom") {
-        return Err(CmdError::Params(format!(
-            "unknown alignment `{kind}` (left, center, right, top, middle, bottom)"
-        )));
+fn arrange(s: &mut Session, p: &Value) -> CmdResult {
+    let action = opt_str(p, "action").unwrap_or("").to_owned();
+    let (cid, ids) = targets(s, p)?;
+    let explicit = explicit_ids(p)?.is_some();
+    let c = s.composes.get_mut(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let changed = arrange_in(c, &ids, &action)?;
+    let primary = ids.first().copied().unwrap_or(0);
+    if explicit {
+        c.select_drawing(Some(primary));
     }
-    change(s, p, |d, c| {
-        let width = c.view_width.filter(|w| w.is_finite() && *w > 40.0).unwrap_or(draw::DEFAULT_VIEW_WIDTH);
-        let lo = mailcraft_layout::LayoutOptions { width, ..Default::default() };
-        let fonts = mailcraft_fonts::FontDb::bundled();
-        let height = mailcraft_layout::layout_doc(&c.body, &fonts, &lo).height.max(d.y + d.h);
-        match kind.as_str() {
-            "left" => d.x = 0.0,
-            "center" => d.x = ((width - d.w) / 2.0).max(0.0),
-            "right" => d.x = (width - d.w).max(0.0),
-            "top" => d.y = 0.0,
-            "middle" => d.y = ((height - d.h) / 2.0).max(0.0),
-            _ => d.y = (height - d.h).max(0.0),
-        }
-        Ok(())
-    })
+    let order: Vec<u32> = c.body.drawings.iter().map(|d| d.id).collect();
+    Ok(json!({"drawing": primary, "changed": changed, "order": order}))
 }
 
+/// Turns drawings `ids` by `by` degrees (or to `degrees`); groups turn as one, about their middle.
 fn rotate(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(flip) = opt_str(p, "flip") {
+        return group::flip(s, p, flip);
+    }
     let by = num(p, "by")?;
     let to = num(p, "degrees")?;
     if by.is_none() && to.is_none() {
-        return Err(CmdError::Params("give `by` (degrees to turn) or `degrees`".into()));
+        return Err(CmdError::Params("give `by` (degrees to turn) or `degrees`, or `flip`".into()));
+    }
+    let (cid, ids) = targets(s, p)?;
+    let has_group = s.composes.get(&cid).is_some_and(|c| {
+        ids.iter().any(|id| find(&c.body.drawings, *id).is_some_and(|d| d.kind == DrawingKind::Group))
+    });
+    if has_group {
+        return group::rotate(s, p, by, to);
     }
     change(s, p, |d, _| {
         d.rotation = to.unwrap_or(d.rotation) + by.unwrap_or(0.0);
@@ -709,94 +1231,59 @@ fn rotate(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn delete(s: &mut Session, p: &Value) -> CmdResult {
-    let (cid, id) = target(s, p)?;
+    let (cid, ids) = targets(s, p)?;
     let c = s.composes.get_mut(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
-    let Some(d) = c.body.drawings.iter().find(|d| d.id == id).cloned() else {
-        return Err(CmdError::Params(format!("no drawing with id {id}")));
-    };
-    // Deleting a canvas deletes what was drawn in it.
-    let gone: Vec<u32> = c
-        .body
-        .drawings
-        .iter()
-        .filter(|o| o.id == id || (d.kind == DrawingKind::Canvas && o.canvas == Some(id)))
-        .map(|o| o.id)
-        .collect();
+    // A group goes with its members, a canvas with what was drawn in it.
+    let mut gone: Vec<u32> = Vec::new();
+    for id in &ids {
+        for g in std::iter::once(*id).chain(descendants(&c.body.drawings, *id)) {
+            if !gone.contains(&g) {
+                gone.push(g);
+            }
+        }
+    }
+    let order: Vec<u32> = c.body.drawings.iter().map(|d| d.id).filter(|id| gone.contains(id)).collect();
     c.checkpoint();
+    for id in &order {
+        crate::compose::remove_placeholders(&mut c.body.blocks, *id);
+    }
     c.body.drawings.retain(|o| !gone.contains(&o.id));
-    c.selected_drawing = None;
+    tidy(&mut c.body.drawings);
+    c.select_drawing(None);
+    if c.edit_points.is_some_and(|e| gone.contains(&e)) {
+        c.edit_points = None;
+    }
     c.dirty = true;
-    Ok(json!({"deleted": gone}))
+    Ok(json!({"deleted": order}))
 }
 
 fn alt_text(s: &mut Session, p: &Value) -> CmdResult {
     let Some(alt) = opt_str(p, "alt") else {
-        let d = current(s, p)?;
-        let cid = compose_id(s, p)?;
-        return dialog(s, "drawingAltText", json!({"compose": cid, "id": d.id, "alt": d.alt}));
+        let (cid, id) = target(s, p)?;
+        let alt = s
+            .composes
+            .get(&cid)
+            .and_then(|c| find(&c.body.drawings, id))
+            .map(|d| d.alt.clone())
+            .unwrap_or_default();
+        return dialog(s, "drawingAltText", json!({"compose": cid, "id": id, "alt": alt}));
     };
     let alt: String = alt.trim().chars().take(2000).collect();
-    change(s, p, |d, _| {
-        d.alt = alt;
-        Ok(())
-    })
-}
-
-fn format(s: &mut Session, p: &Value) -> CmdResult {
-    let keys = ["x", "y", "w", "h", "rotation", "outlineWidth", "alt", "text", "behindText"];
-    if !keys.iter().any(|k| p.get(*k).is_some()) {
-        let d = current(s, p)?;
-        let cid = compose_id(s, p)?;
-        return dialog(
-            s,
-            "formatShape",
-            json!({"compose": cid, "id": d.id, "kind": d.kind, "x": d.x, "y": d.y, "w": d.w, "h": d.h,
-                   "rotation": d.rotation, "outlineWidth": d.outline_px, "alt": d.alt, "text": d.text,
-                   "behindText": d.behind_text}),
-        );
+    let (cid, ids) = targets(s, p)?;
+    // Alt text describes the object picked: a group keeps its own.
+    let c = s.composes.get_mut(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let changed = ids.iter().any(|id| find(&c.body.drawings, *id).is_some_and(|d| d.alt != alt));
+    if changed {
+        c.checkpoint();
+        for d in c.body.drawings.iter_mut().filter(|d| ids.contains(&d.id)) {
+            d.alt.clone_from(&alt);
+        }
+        c.dirty = true;
     }
-    let (x, y, w, h) = (num(p, "x")?, num(p, "y")?, num(p, "w")?, num(p, "h")?);
-    let (rot, ow) = (num(p, "rotation")?, num(p, "outlineWidth")?);
-    let alt = opt_str(p, "alt").map(|a| a.trim().chars().take(2000).collect::<String>());
-    let txt = opt_str(p, "text").map(|t| t.replace("\r\n", "\n"));
-    let behind = opt_bool(p, "behindText");
-    change(s, p, |d, _| {
-        if let Some(v) = x {
-            d.x = v;
-        }
-        if let Some(v) = y {
-            d.y = v;
-        }
-        if d.kind == DrawingKind::WordArt {
-            if let Some(nh) = h {
-                let k = nh / d.h.max(1.0);
-                d.text_style.size_pt = Some((d.text_style.size_pt.unwrap_or(36.0) * k).clamp(4.0, 400.0));
-            }
-        } else {
-            if let Some(v) = w {
-                d.w = v;
-            }
-            if let Some(v) = h {
-                d.h = v;
-            }
-        }
-        if let Some(v) = rot {
-            d.rotation = v;
-        }
-        if let Some(v) = ow {
-            d.outline_px = v;
-        }
-        if let Some(a) = alt {
-            d.alt = a;
-        }
-        if let Some(t) = txt.filter(|_| d.kind != DrawingKind::Canvas) {
-            d.text = t;
-        }
-        if let Some(b) = behind {
-            d.behind_text = b;
-        }
-        Ok(())
-    })
+    if explicit_ids(p)?.is_some() {
+        c.select_drawing(ids.first().copied());
+    }
+    Ok(json!({"drawing": ids.first(), "changed": changed}))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -804,9 +1291,9 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "drawing.select",
             "Select Drawing",
-            "Compose body (click a drawing)",
+            "Compose body (click a drawing; Shift- or Ctrl-click adds one; drag around drawings)",
             "",
-            r#"{"id"?:number|null}  (null selects none)"#,
+            r#"{"id"?:number|null,"ids"?:[number],"add"?:bool,"toggle"?:bool,"member"?:bool}  (null selects none; a drawing in a group selects the group unless member)"#,
             false,
             any_compose,
             select,
@@ -827,7 +1314,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move Drawing",
             "Compose body (drag a drawing; arrow keys)",
             "",
-            r#"{"id"?:number,"x"?:number,"y"?:number,"dx"?:number,"dy"?:number}"#,
+            r#"{"id"?:number,"ids"?:[number],"x"?:number,"y"?:number,"dx"?:number,"dy"?:number}  (several drawings move together)"#,
             true,
             has_drawings,
             move_to,
@@ -837,7 +1324,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Size",
             "Shape Format › Size (Height, Width; drag a handle)",
             "",
-            r#"{"id"?:number,"w"?:number,"h"?:number,"x"?:number,"y"?:number,"keepRatio"?:bool}"#,
+            r#"{"id"?:number,"w"?:number|string,"h"?:number|string,"x"?:number,"y"?:number,"keepRatio"?:bool}  ("120 px" typed in the box works)"#,
             true,
             has_drawings,
             size,
@@ -857,7 +1344,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shape Fill",
             "Shape Format › Shape Styles",
             "",
-            r#"{"id"?:number,"color"?:string|null,"theme"?:string,"tint"?:number,"gradient"?:""|"down"|"up"|"right"|"left"|"center","custom"?:bool}  (null = No Fill)"#,
+            r#"{"id"?:number,"color"?:string|null,"theme"?:string,"tint"?:number,"gradient"?:string,"stops"?:[{"pos":number,"color":string}],"angle"?:number,"radial"?:bool,"picture"?:bool|null,"path"?:string,"data_base64"?:string,"transparency"?:number,"custom"?:bool,"moreGradients"?:bool}  (null = No Fill)"#,
             true,
             has_drawings,
             fill,
@@ -867,7 +1354,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shape Outline",
             "Shape Format › Shape Styles",
             "",
-            r#"{"id"?:number,"color"?:string|null,"theme"?:string,"tint"?:number,"weight"?:number,"custom"?:bool}  (null = No Outline)"#,
+            r#"{"id"?:number,"color"?:string|null,"theme"?:string,"tint"?:number,"weight"?:number,"dash"?:string,"transparency"?:number,"custom"?:bool}  (null = No Outline)"#,
             true,
             has_drawings,
             outline,
@@ -877,7 +1364,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shape Effects",
             "Shape Format › Shape Styles",
             "",
-            r#"{"id"?:number,"effect":""|"none"|"shadow"|"glow"|"reflection"|"bevel"|"softEdges"}"#,
+            r#"{"id"?:number,"effect"?:""|"none"|"shadow"|"glow"|"reflection"|"bevel"|"softEdges","shadow"?:string|object|null,"reflection"?:string|object|null,"glow"?:object|null,"softEdges"?:number,"bevel"?:string,"bevelSize"?:number,"rotation3d"?:string|object|null,"preset"?:number}"#,
             true,
             has_drawings,
             effect,
@@ -887,7 +1374,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Outline",
             "Shape Format › WordArt Styles",
             "",
-            r#"{"id"?:number,"color"?:string|null,"theme"?:string,"tint"?:number,"custom"?:bool}  (null = No Outline)"#,
+            r#"{"id"?:number,"color"?:string|null,"theme"?:string,"tint"?:number,"weight"?:number,"dash"?:string,"custom"?:bool}  (null = No Outline)"#,
             true,
             has_drawings,
             text_outline,
@@ -897,7 +1384,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Effects",
             "Shape Format › WordArt Styles",
             "",
-            r#"{"id"?:number,"effect":""|"none"|"shadow"|"glow"|"reflection"|"bevel"}  (reflection: WordArt)"#,
+            r#"{"id"?:number,"effect"?:""|"none"|"shadow"|"glow"|"reflection"|"bevel","transform"?:string,"shadow"?:string|object|null,"reflection"?:string|object|null,"glow"?:object|null,"bevel"?:string,"rotation3d"?:string|object|null}  (reflection: WordArt)"#,
             true,
             has_drawings,
             text_effect,
@@ -907,7 +1394,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Direction",
             "Shape Format › Text",
             "",
-            r#"{"id"?:number,"vertical"?:bool}  (no vertical: turns it the other way)"#,
+            r#"{"id"?:number,"direction"?:"horizontal"|"down"|"up"|"stacked","vertical"?:bool}  (nothing: turns it the other way)"#,
             true,
             has_drawings,
             text_direction,
@@ -937,7 +1424,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Drawing Font",
             "Shape Format › Text",
             "",
-            r#"{"id"?:number,"family"?:string,"size"?:number,"bold"?:bool,"italic"?:bool,"underline"?:bool}"#,
+            r#"{"id"?:number,"family"?:string,"size"?:number|string,"bold"?:bool,"italic"?:bool,"underline"?:bool}"#,
             true,
             has_drawings,
             font,
@@ -973,6 +1460,26 @@ pub fn specs() -> Vec<CommandSpec> {
             change_shape,
         ),
         spec(
+            "drawing.editPoints",
+            "Edit Points",
+            "Shape Format › Insert Shapes › Edit Shape",
+            "",
+            r#"{"id"?:number,"on"?:bool,"point"?:number,"x"?:number,"y"?:number,"insert"?:number,"delete"?:number,"points"?:[[number,number]]}  (on: drag the corner points; x, y in the body)"#,
+            true,
+            has_drawings,
+            points::edit_points,
+        ),
+        spec(
+            "drawing.linkTextBox",
+            "Create Text Box Link",
+            "Shape Format › Text",
+            "",
+            r#"{"id"?:number,"to"?:number,"break"?:bool}  (no to: the next click on an empty text box links it)"#,
+            true,
+            has_drawings,
+            link::link_text_box,
+        ),
+        spec(
             "drawing.arrange",
             "Arrange",
             "Shape Format › Arrange (Bring Forward, Send Backward)",
@@ -983,21 +1490,61 @@ pub fn specs() -> Vec<CommandSpec> {
             arrange,
         ),
         spec(
+            "drawing.wrapText",
+            "Wrap Text",
+            "Shape Format › Arrange",
+            "",
+            r#"{"id"?:number,"wrap":"inline"|"square"|"tight"|"through"|"topBottom"|"behind"|"front"}"#,
+            true,
+            has_drawings,
+            wrap::wrap_text,
+        ),
+        spec(
+            "drawing.position",
+            "Position",
+            "Command only (CLI, MCP, control channel): not on the Shape Format tab",
+            "",
+            r#"{"id"?:number,"at":"inline"|"topLeft"|"topCenter"|"topRight"|"middleLeft"|"middleCenter"|"middleRight"|"bottomLeft"|"bottomCenter"|"bottomRight"}  (with text wrapping)"#,
+            true,
+            has_drawings,
+            wrap::position,
+        ),
+        spec(
             "drawing.align",
             "Align",
             "Shape Format › Arrange",
             "",
-            r#"{"id"?:number,"kind":"left"|"center"|"right"|"top"|"middle"|"bottom"}  (to the margins)"#,
+            r#"{"id"?:number,"ids"?:[number],"kind"?:"left"|"center"|"right"|"top"|"middle"|"bottom","relative"?:"margin"|"selected"}  (several selected: to each other unless Align to Margin)"#,
             true,
             has_drawings,
-            align,
+            group::align,
+        ),
+        spec(
+            "drawing.distribute",
+            "Distribute",
+            "Shape Format › Arrange › Align",
+            "",
+            r#"{"ids"?:[number],"axis":"horizontal"|"vertical"}  (three or more selected: between the outer ones; else across the margins)"#,
+            true,
+            has_drawings,
+            group::distribute,
+        ),
+        spec(
+            "drawing.group",
+            "Group Objects",
+            "Shape Format › Arrange",
+            "",
+            r#"{"ids"?:[number],"id"?:number,"action"?:"group"|"ungroup"|"regroup"}  (group: the selected drawings)"#,
+            true,
+            has_drawings,
+            group::group,
         ),
         spec(
             "drawing.rotate",
             "Rotate",
             "Shape Format › Arrange",
             "",
-            r#"{"id"?:number,"by"?:number,"degrees"?:number}"#,
+            r#"{"id"?:number,"by"?:number,"degrees"?:number,"flip"?:"horizontal"|"vertical"}"#,
             true,
             has_drawings,
             rotate,
@@ -1007,7 +1554,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Delete Drawing",
             "Compose body (Delete with a drawing selected)",
             "",
-            r#"{"id"?:number}"#,
+            r#"{"id"?:number,"ids"?:[number]}"#,
             true,
             has_drawings,
             delete,
@@ -1024,371 +1571,13 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec(
             "drawing.format",
-            "Size and Position",
-            "Shape Format › Size (dialog launcher); Format Shape",
+            "Format Shape",
+            "Shape Format › Shape Styles / Size (dialog launchers); Size and Position",
             "",
-            r#"{"id"?:number,"x"?:number,"y"?:number,"w"?:number,"h"?:number,"rotation"?:number,"outlineWidth"?:number,"alt"?:string,"text"?:string,"behindText"?:bool}  (nothing: the dialog)"#,
+            r#"{"id"?:number,"page"?:"fill"|"effects"|"layout"|"size","x"?,"y"?,"w"?,"h"?,"rotation"?,"fill"?:string|null,"transparency"?,"gradient"?,"stops"?,"angle"?,"radial"?,"picture"?,"outline"?:string|null,"outlineWidth"?,"dash"?,"lineTransparency"?,"effects"?:{..drawing.effect},"textEffects"?:{..drawing.textEffect},"inset"?:[l,t,r,b]|null,"autofit"?:bool,"valign"?,"wrap"?,"behindText"?,"alt"?,"text"?,"name"?}  (nothing: the Format Shape pane)"#,
             true,
             has_drawings,
-            format,
+            props::format,
         ),
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::compose::tests::{open, session};
-    use super::*;
-
-    fn drawings(s: &Session, cid: u64) -> Vec<Drawing> {
-        s.composes[&cid].body.drawings.clone()
-    }
-
-    #[test]
-    fn shapes_are_floating_objects_that_move_size_and_undo() {
-        let mut s = session();
-        let cid = open(&mut s);
-        let r = s.run("insert.shape", &json!({"compose": cid, "kind": "oval", "x": 40, "y": 30})).unwrap();
-        let id = r["drawing"].as_u64().unwrap() as u32;
-        let d = &drawings(&s, cid)[0];
-        assert_eq!((d.x, d.y, d.w, d.h), (40.0, 30.0, 100.0, 100.0));
-        assert_eq!(s.composes[&cid].selected_drawing, Some(id));
-        assert!(d.fill.is_some() && d.outline.is_some());
-        s.run("drawing.move", &json!({"compose": cid, "dx": 10, "dy": -5})).unwrap();
-        s.run("drawing.size", &json!({"compose": cid, "w": 200, "keepRatio": true})).unwrap();
-        let d = &drawings(&s, cid)[0];
-        assert_eq!((d.x, d.y, d.w, d.h), (50.0, 25.0, 200.0, 200.0));
-        s.run("compose.editUndo", &json!({"compose": cid})).unwrap();
-        assert_eq!(drawings(&s, cid)[0].w, 100.0, "one undo step per change");
-        s.run("compose.editUndo", &json!({"compose": cid})).unwrap();
-        assert_eq!(drawings(&s, cid)[0].x, 40.0);
-        // Junk is refused, not crashed on.
-        assert!(s.run("drawing.move", &json!({"compose": cid, "x": "far"})).is_err());
-        assert!(s.run("drawing.size", &json!({"compose": cid, "id": 999, "w": 5})).is_err());
-        s.run("drawing.size", &json!({"compose": cid, "w": 1e30, "h": -4})).unwrap();
-        let d = &drawings(&s, cid)[0];
-        assert_eq!((d.w, d.h), (draw::MAX_DRAWING_SIDE, draw::MIN_DRAWING_SIDE));
-    }
-
-    #[test]
-    fn shape_format_commands_change_the_selected_drawing() {
-        let mut s = session();
-        let cid = open(&mut s);
-        s.run("insert.shape", &json!({"compose": cid, "kind": "rectangle", "x": 0, "y": 0})).unwrap();
-        s.run("drawing.fill", &json!({"compose": cid, "color": "#ff0000"})).unwrap();
-        s.run("drawing.outline", &json!({"compose": cid, "color": null})).unwrap();
-        s.run("drawing.effect", &json!({"compose": cid, "effect": "shadow"})).unwrap();
-        s.run("drawing.text", &json!({"compose": cid, "text": "Inside\r\nthe box"})).unwrap();
-        s.run("drawing.textColor", &json!({"compose": cid, "theme": "accent2", "tint": 0})).unwrap();
-        s.run("drawing.alignText", &json!({"compose": cid, "h": "right", "v": "bottom"})).unwrap();
-        s.run("drawing.font", &json!({"compose": cid, "size": 20, "bold": true})).unwrap();
-        s.run("drawing.rotate", &json!({"compose": cid, "by": -90})).unwrap();
-        s.run("drawing.altText", &json!({"compose": cid, "alt": "A red box"})).unwrap();
-        let d = &drawings(&s, cid)[0];
-        assert_eq!(d.fill, Some(Color::rgb(255, 0, 0)));
-        assert_eq!(d.outline, None);
-        assert_eq!(d.effect, "shadow");
-        assert_eq!(d.text, "Inside\nthe box");
-        assert_eq!(d.text_style.color, crate::cmd::format::theme_color(&s.composes[&cid], "accent2", 0));
-        assert_eq!((d.align, d.valign), (Align::End, VAlign::Bottom));
-        assert_eq!((d.text_style.size_pt, d.text_style.bold), (Some(20.0), Some(true)));
-        assert_eq!(d.rotation, 270.0);
-        assert_eq!(d.alt, "A red box");
-        assert!(s.run("drawing.effect", &json!({"compose": cid, "effect": "sparkles"})).is_err());
-        // Custom colours and the alt text / size dialogs.
-        for (cmd, p) in [
-            ("drawing.fill", json!({"compose": cid, "custom": true})),
-            ("drawing.altText", json!({"compose": cid})),
-            ("drawing.format", json!({"compose": cid})),
-        ] {
-            assert!(s.run(cmd, &p).unwrap().get("dialog").is_some(), "{cmd}");
-        }
-        s.run("drawing.changeShape", &json!({"compose": cid, "shape": "Arrow: Right"})).unwrap();
-        assert_eq!(drawings(&s, cid)[0].shape, "rightArrow");
-        s.run(
-            "drawing.format",
-            &json!({"compose": cid, "x": 5, "y": 6, "w": 70, "h": 80, "behindText": true}),
-        )
-        .unwrap();
-        let d = &drawings(&s, cid)[0];
-        assert_eq!((d.x, d.y, d.w, d.h, d.behind_text), (5.0, 6.0, 70.0, 80.0, true));
-    }
-
-    #[test]
-    fn arrange_align_delete_and_canvas_contents() {
-        let mut s = session();
-        let cid = open(&mut s);
-        s.run("insert.shape", &json!({"compose": cid, "kind": "canvas", "x": 0, "y": 0, "w": 300, "h": 200}))
-            .unwrap();
-        s.run("insert.shape", &json!({"compose": cid, "kind": "oval", "x": 20, "y": 20, "w": 50, "h": 50}))
-            .unwrap();
-        s.run("insert.shape", &json!({"compose": cid, "kind": "star5", "x": 400, "y": 0})).unwrap();
-        let ids: Vec<u32> = drawings(&s, cid).iter().map(|d| d.id).collect();
-        assert_eq!(drawings(&s, cid)[0].kind, DrawingKind::Canvas);
-        s.run("drawing.arrange", &json!({"compose": cid, "id": ids[2], "action": "sendToBack"})).unwrap();
-        assert_eq!(drawings(&s, cid)[0].id, ids[2]);
-        s.run("drawing.arrange", &json!({"compose": cid, "id": ids[2], "action": "bringForward"})).unwrap();
-        assert_eq!(drawings(&s, cid)[1].id, ids[2]);
-        // Moving the canvas carries the oval drawn inside it, not the star outside it.
-        s.run("drawing.move", &json!({"compose": cid, "id": ids[0], "dx": 10, "dy": 100})).unwrap();
-        let by_id = |s: &Session, id: u32| drawings(s, cid).into_iter().find(|d| d.id == id).unwrap();
-        assert_eq!((by_id(&s, ids[1]).x, by_id(&s, ids[1]).y), (30.0, 120.0));
-        assert_eq!((by_id(&s, ids[2]).x, by_id(&s, ids[2]).y), (400.0, 0.0));
-        s.composes.get_mut(&cid).unwrap().view_width = Some(500.0);
-        s.run("drawing.align", &json!({"compose": cid, "id": ids[2], "kind": "right"})).unwrap();
-        assert_eq!(by_id(&s, ids[2]).x, 400.0);
-        s.run("drawing.align", &json!({"compose": cid, "id": ids[2], "kind": "center"})).unwrap();
-        assert_eq!(by_id(&s, ids[2]).x, 200.0);
-        // Deleting the canvas deletes what is in it.
-        let r = s.run("drawing.delete", &json!({"compose": cid, "id": ids[0]})).unwrap();
-        assert_eq!(r["deleted"].as_array().unwrap().len(), 2);
-        assert_eq!(drawings(&s, cid).len(), 1);
-        assert_eq!(s.composes[&cid].selected_drawing, None);
-        assert!(s.run("drawing.fill", &json!({"compose": cid, "color": "red"})).is_err(), "nothing selected");
-        s.run("drawing.select", &json!({"compose": cid, "id": ids[2]})).unwrap();
-        s.run("drawing.fill", &json!({"compose": cid, "color": "red"})).unwrap();
-        assert!(s.run("drawing.select", &json!({"compose": cid, "id": 77})).is_err());
-    }
-
-    /// Regression: a canvas took in, moved and deleted every drawing that happened to lie inside its box,
-    /// including ones drawn before it.
-    #[test]
-    fn a_canvas_drawn_over_existing_drawings_does_not_take_them() {
-        let mut s = session();
-        let cid = open(&mut s);
-        s.run("insert.shape", &json!({"compose": cid, "kind": "oval", "x": 20, "y": 20, "w": 50, "h": 50}))
-            .unwrap();
-        s.run("insert.shape", &json!({"compose": cid, "kind": "canvas", "x": 0, "y": 0, "w": 300, "h": 200}))
-            .unwrap();
-        s.run("insert.shape", &json!({"compose": cid, "kind": "star5", "x": 100, "y": 20, "w": 50, "h": 50}))
-            .unwrap();
-        let ids: Vec<u32> = drawings(&s, cid).iter().map(|d| d.id).collect();
-        let by_id = |s: &Session, id: u32| drawings(s, cid).into_iter().find(|d| d.id == id).unwrap();
-        assert_eq!(by_id(&s, ids[0]).canvas, None, "drawn before the canvas");
-        assert_eq!(by_id(&s, ids[2]).canvas, Some(ids[1]), "drawn in the canvas");
-        s.run("drawing.move", &json!({"compose": cid, "id": ids[1], "dx": 10, "dy": 0})).unwrap();
-        assert_eq!(by_id(&s, ids[0]).x, 20.0, "the older oval stays put");
-        assert_eq!(by_id(&s, ids[2]).x, 110.0, "the star moves with its canvas");
-        // A member moved out of the canvas leaves it; the oval moved into it joins.
-        s.run("drawing.move", &json!({"compose": cid, "id": ids[2], "x": 500, "y": 0})).unwrap();
-        assert_eq!(by_id(&s, ids[2]).canvas, None);
-        s.run("drawing.move", &json!({"compose": cid, "id": ids[0], "x": 40, "y": 40})).unwrap();
-        assert_eq!(by_id(&s, ids[0]).canvas, Some(ids[1]));
-        let r = s.run("drawing.delete", &json!({"compose": cid, "id": ids[1]})).unwrap();
-        assert_eq!(r["deleted"], json!([ids[0], ids[1]]));
-        assert_eq!(drawings(&s, cid).iter().map(|d| d.id).collect::<Vec<_>>(), vec![ids[2]]);
-    }
-
-    /// Alpha-weighted brightness of the raster's pixel at (`fx`, `fy`) as fractions of its size.
-    fn shade(r: &draw::Raster, fx: f32, fy: f32) -> u32 {
-        let x = ((r.width as f32 - 1.0) * fx) as usize;
-        let y = ((r.height as f32 - 1.0) * fy) as usize;
-        let i = (y * r.width as usize + x) * 4;
-        r.rgba[i..i + 3].iter().map(|v| u32::from(*v)).sum()
-    }
-
-    fn raster_of(s: &Session, cid: u64, id: u32) -> draw::Raster {
-        let c = &s.composes[&cid];
-        let d = c.body.drawings.iter().find(|d| d.id == id).unwrap();
-        draw::raster(d, &c.theme_resolved(), true).unwrap()
-    }
-
-    #[test]
-    fn gradient_fill_shades_from_light_to_the_fill() {
-        let mut s = session();
-        let cid = open(&mut s);
-        let r = s
-            .run(
-                "insert.shape",
-                &json!({"compose": cid, "kind": "rectangle", "x": 0, "y": 0, "w": 200, "h": 200}),
-            )
-            .unwrap();
-        let id = r["drawing"].as_u64().unwrap() as u32;
-        s.run("drawing.effect", &json!({"compose": cid, "effect": "none"})).unwrap();
-        let solid = raster_of(&s, cid, id);
-        assert!(shade(&solid, 0.5, 0.2).abs_diff(shade(&solid, 0.5, 0.8)) < 6, "a solid fill is even");
-        s.run("drawing.fill", &json!({"compose": cid, "gradient": "down"})).unwrap();
-        let g = raster_of(&s, cid, id);
-        assert!(shade(&g, 0.5, 0.2) > shade(&g, 0.5, 0.8) + 60, "lighter at the top");
-        s.run("drawing.fill", &json!({"compose": cid, "gradient": "right"})).unwrap();
-        let g = raster_of(&s, cid, id);
-        assert!(shade(&g, 0.2, 0.5) > shade(&g, 0.8, 0.5) + 60, "lighter at the left");
-        assert!(s.run("drawing.fill", &json!({"compose": cid, "gradient": "spiral"})).is_err());
-        // No Fill drops the gradient; a gradient on an unfilled shape gives it the accent colour.
-        s.run("drawing.fill", &json!({"compose": cid, "color": null})).unwrap();
-        assert_eq!(drawings(&s, cid)[0].gradient, "");
-        s.run("drawing.fill", &json!({"compose": cid, "gradient": "center"})).unwrap();
-        let d = &drawings(&s, cid)[0];
-        assert!(d.fill.is_some() && d.gradient == "center");
-    }
-
-    #[test]
-    fn vertical_text_runs_top_to_bottom() {
-        let mut s = session();
-        let cid = open(&mut s);
-        let r =
-            s.run("insert.textBox", &json!({"compose": cid, "preset": "draw", "vertical": true})).unwrap();
-        assert_eq!(r["armed"], "verticalTextBox");
-        let r = s
-            .run(
-                "insert.textBox",
-                &json!({"compose": cid, "text": "WWWWWWWWWW", "x": 0, "y": 0, "w": 300, "h": 300, "vertical": true}),
-            )
-            .unwrap();
-        let id = r["drawing"].as_u64().unwrap() as u32;
-        assert!(drawings(&s, cid)[0].vertical);
-        s.run("drawing.outline", &json!({"compose": cid, "color": null})).unwrap();
-        s.run("drawing.fill", &json!({"compose": cid, "color": null})).unwrap();
-        // The ink of a long word is tall and narrow when vertical, wide and short when not.
-        let ink = |r: &draw::Raster| {
-            let (w, h) = (r.width as usize, r.height as usize);
-            let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
-            for y in 0..h {
-                for x in 0..w {
-                    if r.rgba[(y * w + x) * 4 + 3] > 128 {
-                        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
-                    }
-                }
-            }
-            (x1.saturating_sub(x0), y1.saturating_sub(y0))
-        };
-        let (w, h) = ink(&raster_of(&s, cid, id));
-        assert!(h > w * 3, "vertical: {w}x{h}");
-        s.run("drawing.textDirection", &json!({"compose": cid, "vertical": false})).unwrap();
-        let (w, h) = ink(&raster_of(&s, cid, id));
-        assert!(w > h * 3, "horizontal: {w}x{h}");
-        // Without `vertical` it turns the other way.
-        s.run("drawing.textDirection", &json!({"compose": cid})).unwrap();
-        assert!(drawings(&s, cid)[0].vertical);
-        s.run("insert.wordArt", &json!({"compose": cid, "style": "Fill: Black, Text color 1", "text": "Hi"}))
-            .unwrap();
-        assert!(s.run("drawing.textDirection", &json!({"compose": cid, "vertical": true})).is_err());
-    }
-
-    #[test]
-    fn text_outline_effects_and_shape_styles() {
-        let mut s = session();
-        let cid = open(&mut s);
-        let r = s
-            .run(
-                "insert.textBox",
-                &json!({"compose": cid, "text": "Outlined", "x": 0, "y": 0, "w": 200, "h": 60}),
-            )
-            .unwrap();
-        let id = r["drawing"].as_u64().unwrap() as u32;
-        let plain = raster_of(&s, cid, id);
-        s.run("drawing.textOutline", &json!({"compose": cid, "color": "#ff0000"})).unwrap();
-        assert_eq!(drawings(&s, cid)[0].text_outline, Some(Color::rgb(0xff, 0, 0)));
-        assert_ne!(raster_of(&s, cid, id).rgba, plain.rgba);
-        s.run("drawing.textOutline", &json!({"compose": cid, "color": null})).unwrap();
-        assert_eq!(raster_of(&s, cid, id).rgba, plain.rgba, "No Outline");
-        s.run("drawing.textEffect", &json!({"compose": cid, "effect": "shadow"})).unwrap();
-        assert_ne!(raster_of(&s, cid, id).rgba, plain.rgba);
-        assert!(
-            s.run("drawing.textEffect", &json!({"compose": cid, "effect": "reflection"})).is_err(),
-            "reflections are for WordArt"
-        );
-        assert!(s.run("drawing.textEffect", &json!({"compose": cid, "effect": "sparkle"})).is_err());
-        // WordArt: Text Effects replaces the style's effects; reflection makes it taller.
-        let r = s
-            .run(
-                "insert.wordArt",
-                &json!({"compose": cid, "style": "Fill: Black, Text color 1; Shadow", "text": "Big"}),
-            )
-            .unwrap();
-        let wa = r["drawing"].as_u64().unwrap() as u32;
-        let before = raster_of(&s, cid, wa);
-        s.run("drawing.textEffect", &json!({"compose": cid, "id": wa, "effect": "reflection"})).unwrap();
-        let after = raster_of(&s, cid, wa);
-        assert!(after.height > before.height, "the reflection adds height");
-        s.run("drawing.textOutline", &json!({"compose": cid, "id": wa, "theme": "accent2", "tint": 0}))
-            .unwrap();
-        assert_ne!(raster_of(&s, cid, wa).rgba, after.rgba);
-        // Shape Quick Styles.
-        let r = s.run("insert.shape", &json!({"compose": cid, "kind": "oval", "x": 300, "y": 0})).unwrap();
-        let oval = r["drawing"].as_u64().unwrap() as u32;
-        let theme = s.composes[&cid].theme_resolved();
-        let accent3 = theme.color(crate::compose::ACCENT1 + 2);
-        s.run("drawing.shapeStyle", &json!({"compose": cid, "style": "outline", "accent": 3})).unwrap();
-        let d = drawings(&s, cid).into_iter().find(|d| d.id == oval).unwrap();
-        assert_eq!((d.fill, d.outline), (Some(theme.color(1)), Some(accent3)));
-        s.run("drawing.shapeStyle", &json!({"compose": cid, "style": "strong", "accent": 3})).unwrap();
-        let d = drawings(&s, cid).into_iter().find(|d| d.id == oval).unwrap();
-        assert_eq!((d.fill, d.outline, d.effect.as_str()), (Some(accent3), None, "shadow"));
-        assert!(s.run("drawing.shapeStyle", &json!({"compose": cid, "style": "loud"})).is_err());
-        assert!(s.run("drawing.shapeStyle", &json!({"compose": cid, "style": "fill", "accent": 9})).is_err());
-        assert!(s.run("drawing.shapeStyle", &json!({"compose": cid, "id": wa, "style": "fill"})).is_err());
-    }
-
-    /// Saving a draft stores the drawings as pictures (what other mail programs can show) and leaves the
-    /// open message's drawings editable.
-    #[test]
-    fn saving_a_draft_keeps_the_drawings_editable_in_the_open_message() {
-        let mut s = session();
-        let cid = open(&mut s);
-        s.run("compose.insertText", &json!({"compose": cid, "text": "Body"})).unwrap();
-        s.run("insert.textBox", &json!({"compose": cid, "text": "Inside", "x": 10, "y": 40})).unwrap();
-        let before = drawings(&s, cid);
-        let r = s.run("compose.saveDraft", &json!({"compose": cid})).unwrap();
-        let draft = crate::model::ItemId(r["draft"].as_u64().unwrap());
-        assert_eq!(drawings(&s, cid), before, "still floating, with their text");
-        let html = s.mailbox.mail[&draft].body.html.clone().unwrap_or_default();
-        assert!(html.contains("<img"), "the draft holds the drawing as a picture: {html}");
-        s.run("drawing.text", &json!({"compose": cid, "text": "Changed"})).unwrap();
-        assert_eq!(drawings(&s, cid)[0].text, "Changed");
-    }
-
-    #[test]
-    fn tools_arm_and_drawn_shapes_disarm() {
-        let mut s = session();
-        let cid = open(&mut s);
-        s.run("insert.shape", &json!({"compose": cid, "kind": "heart", "draw": true})).unwrap();
-        assert_eq!(s.composes[&cid].draw_tool.as_deref(), Some("shape:heart"));
-        assert!(drawings(&s, cid).is_empty());
-        s.run("insert.shape", &json!({"compose": cid, "kind": "heart", "x": 1, "y": 2, "w": 30, "h": 40}))
-            .unwrap();
-        assert_eq!(s.composes[&cid].draw_tool, None);
-        s.run("insert.textBox", &json!({"compose": cid, "preset": "draw"})).unwrap();
-        assert_eq!(s.composes[&cid].draw_tool.as_deref(), Some("textBox"));
-        s.run("drawing.tool", &json!({"compose": cid, "tool": null})).unwrap();
-        assert_eq!(s.composes[&cid].draw_tool, None);
-        assert!(s.run("drawing.tool", &json!({"compose": cid, "tool": "shape:nonsense"})).is_err());
-        s.run("drawing.tool", &json!({"compose": cid, "tool": "scribble"})).unwrap();
-        let pts = json!([[0.0, 0.0], [0.5, 1.0], [1.0, 0.2]]);
-        s.run(
-            "insert.shape",
-            &json!({"compose": cid, "kind": "scribble", "x": 0, "y": 0, "w": 80, "h": 40, "points": pts}),
-        )
-        .unwrap();
-        assert_eq!(drawings(&s, cid)[1].points.len(), 3);
-        let listed = s.run("drawing.list", &json!({"compose": cid})).unwrap();
-        assert_eq!(listed["drawings"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn word_art_is_editable_text_that_fits_its_box() {
-        let mut s = session();
-        let cid = open(&mut s);
-        s.run("insert.wordArt", &json!({"compose": cid, "style": "Fill: Black, Text color 1; Shadow"}))
-            .unwrap();
-        let d = drawings(&s, cid)[0].clone();
-        assert_eq!(d.kind, DrawingKind::WordArt);
-        assert_eq!(d.text, "Your text here");
-        s.run("drawing.text", &json!({"compose": cid, "text": "Hi"})).unwrap();
-        let short = drawings(&s, cid)[0].clone();
-        assert!(short.w < d.w, "the box fits the shorter text");
-        s.run("drawing.size", &json!({"compose": cid, "h": short.h * 2.0})).unwrap();
-        let big = drawings(&s, cid)[0].clone();
-        assert!(big.text_style.size_pt.unwrap() > 60.0 && big.w > short.w * 1.5, "{big:?}");
-        s.run(
-            "drawing.wordArt",
-            &json!({"compose": cid, "style": "Gradient Fill: Plum, Accent color 5; Reflection"}),
-        )
-        .unwrap();
-        assert!(drawings(&s, cid)[0].word_art.starts_with("Gradient"));
-        s.run("drawing.wordArt", &json!({"compose": cid, "style": ""})).unwrap();
-        let cleared = drawings(&s, cid)[0].clone();
-        assert_eq!(cleared.kind, DrawingKind::TextBox);
-        assert_eq!(cleared.text, "Hi");
-    }
 }

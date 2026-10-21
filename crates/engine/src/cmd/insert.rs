@@ -294,7 +294,7 @@ fn shape(s: &mut Session, p: &Value) -> CmdResult {
         let tool = if kind == "canvas" { "canvas".to_owned() } else { format!("shape:{kind}") };
         let c = compose_mut(s, p)?;
         c.draw_tool = Some(tool.clone());
-        c.selected_drawing = None;
+        c.select_drawing(None);
         return Ok(json!({"armed": tool}));
     }
     let at = point_param(p)?;
@@ -395,6 +395,7 @@ fn redraw(g: &crate::compose::GeneratedPicture, theme: &crate::compose::Resolved
         "wordArt" => wordart_png(&text("text"), &text("style"), theme)?.0,
         "chart" => chart::png(&serde_json::from_value::<chart::ChartSpec>(g.spec.clone()).ok()?, theme)?,
         "model3d" => model_recipe_png(&g.spec, theme)?,
+        "equation" => equation_png(&text("text"))?.0,
         _ => return None,
     };
     (!png.is_empty()).then_some(png)
@@ -1183,6 +1184,12 @@ struct WordArtOverrides {
     outline: Option<Color>,
     /// `""` (the style's effects), `none`, `shadow`, `glow`, `reflection`, `bevel`.
     effect: String,
+    /// Text Effects with options: replace the style's effects (and `effect`).
+    fx: Option<mailcraft_model::rich::ShapeEffects>,
+    /// Text Effects › Transform warp (`""` none).
+    warp: String,
+    /// Outline weight (px; 0 = the style's).
+    outline_px: f32,
 }
 
 fn wordart_img(
@@ -1220,23 +1227,35 @@ fn wordart_img(
     if over.outline.is_some() {
         ws.outline = over.outline;
     }
-    if !over.effect.is_empty() {
-        // Text Effects replaces the style's effects with one.
-        ws.shadow = over.effect == "shadow";
+    if !over.effect.is_empty() || over.fx.is_some() {
+        // Text Effects replaces the style's effects with one (or with its effects with options).
+        ws.shadow = over.effect == "shadow" && over.fx.is_none();
         ws.hard_shadow = None;
         ws.inner_shadow = false;
-        ws.glow = (over.effect == "glow").then(|| theme.color(crate::compose::ACCENT1));
-        ws.bevel = (over.effect == "bevel").then_some(false);
-        ws.reflection = over.effect == "reflection";
+        ws.glow = (over.effect == "glow" && over.fx.is_none()).then(|| theme.color(crate::compose::ACCENT1));
+        ws.bevel = (over.effect == "bevel" && over.fx.is_none()).then_some(false);
+        ws.reflection = match &over.fx {
+            Some(f) => f.reflection.is_some(),
+            None => over.effect == "reflection",
+        };
     }
     let m = EFFECT_MARGIN;
-    let extra = if ws.reflection { th * 0.6 } else { 0.0 };
+    let refl_size = over
+        .fx
+        .as_ref()
+        .and_then(|f| f.reflection)
+        .map_or(0.6, |r| drawing::fx::reflection_room(&r, 1.0).clamp(0.05, 1.2));
+    let extra = if ws.reflection { th * refl_size } else { 0.0 };
     let (w, h) = ((tw + 2.0 * m).min(MAX_RASTER_SIDE), (th + 2.0 * m + extra).min(MAX_RASTER_SIDE));
     translate(&mut list, m - x0, m - y0);
     let mask = Mask::from_list(&list, dev(w), dev(h), &fonts);
+    let mask = if over.warp.is_empty() { mask } else { drawing::fx::warp(&mask, &over.warp) };
     let mut img = Img::new(dev(w), dev(h));
     let s = RASTER_SCALE;
     let d = |v: f32| (v * s).round() as i64;
+    if let Some(f) = &over.fx {
+        drawing::fx::paint_under(&mut img, &mask, ws.fill, f);
+    }
     if ws.shadow {
         img.paint(&mask.shifted(d(2.0), d(2.0)).blurred(d(1.5)), 0.45, &|_, _| Color::BLACK);
     }
@@ -1247,7 +1266,8 @@ fn wordart_img(
         img.paint(&mask.dilated(d(3.0)).blurred(d(2.0)), 0.6, &|_, _| lighten(g, 0.3));
     }
     if let Some(o) = ws.outline {
-        img.paint(&mask.dilated(d(1.0)), 1.0, &|_, _| o);
+        let weight = if over.outline_px > 0.0 { (over.outline_px / 2.0).min(6.0) } else { 1.0 };
+        img.paint(&mask.dilated(d(weight).max(1)), 1.0, &|_, _| o);
     }
     let (y_top, y_bot) = mask.bounds().map_or((0, mask.h), |(_, a, _, b)| (a, b.max(a + 1)));
     let fill = ws.fill;
@@ -1268,9 +1288,20 @@ fn wordart_img(
         img.paint(&mask.minus(&mask.shifted(d(r), d(r))), hi, &|_, _| Color::WHITE);
         img.paint(&mask.minus(&mask.shifted(-d(r), -d(r))), lo, &|_, _| darken(fill, 0.5));
     }
-    if ws.reflection {
-        let r = mask.reflected(i64::try_from(y_bot).unwrap_or(0) + d(1.0), d(th * 0.6));
-        img.paint(&r, 1.0, &|_, _| fill);
+    if let Some(f) = &over.fx {
+        let narrow = mailcraft_model::rich::ShapeEffects {
+            bevel_size: if f.bevel_size > 0.0 { f.bevel_size.min(3.0) } else { 1.2 },
+            ..f.clone()
+        };
+        drawing::fx::paint_over(&mut img, &mask, fill, &narrow);
+    }
+    match over.fx.as_ref().and_then(|f| f.reflection) {
+        Some(r) if ws.reflection => drawing::fx::reflect(&mut img, y_top, y_bot.saturating_add(1), &r),
+        _ if ws.reflection => {
+            let r = mask.reflected(i64::try_from(y_bot).unwrap_or(0) + d(1.0), d(th * 0.6));
+            img.paint(&r, 1.0, &|_, _| fill);
+        }
+        _ => {}
     }
     Some((img, w, h))
 }
@@ -1512,6 +1543,7 @@ fn edit_picture(s: &mut Session, p: &Value) -> CmdResult {
         "chart" => chart(s, &q),
         "smartArt" => smart_art(s, &q),
         "model3d" => model3d(s, &q),
+        "equation" => equation(s, &q),
         _ => Err(CmdError::Params("this picture cannot be edited".into())),
     }
 }
@@ -1654,9 +1686,27 @@ pub fn parse_model(data: &[u8]) -> Option<(Vec<[f64; 3]>, Vec<(usize, usize)>)> 
 /// Most model edges kept with a 3D model picture (so it can be turned later); more are sampled.
 const MAX_MODEL_EDGES: usize = 3_000;
 
-/// The model fitted into a unit cube around the origin, with at most [`MAX_MODEL_EDGES`] edges (sampled
-/// evenly) and only the vertices they use.
-fn model_recipe(verts: &[[f64; 3]], edges: &[(usize, usize)]) -> (Vec<[f64; 3]>, Vec<(usize, usize)>) {
+/// The model fitted into a unit cube around the origin, with at most [`MAX_MODEL_EDGES`] edges and
+/// [`MAX_MODEL_TRIS`] faces (sampled evenly) and only the vertices they use.
+type ModelRecipe = (Vec<[f64; 3]>, Vec<(usize, usize)>, Vec<[usize; 3]>);
+fn model_recipe(verts: &[[f64; 3]], edges: &[(usize, usize)]) -> ModelRecipe {
+    let (out_v, out_e, mut map, fit) = model_edges(verts, edges);
+    let mut out_v = out_v;
+    let tris = recipe_tris(verts, edges, &mut out_v, &mut map, &fit);
+    (out_v, out_e, tris)
+}
+
+/// The edge part of [`model_recipe`]: vertices, edges, the vertex map and the fitting.
+#[allow(clippy::type_complexity)]
+fn model_edges(
+    verts: &[[f64; 3]],
+    edges: &[(usize, usize)],
+) -> (
+    Vec<[f64; 3]>,
+    Vec<(usize, usize)>,
+    std::collections::HashMap<usize, usize>,
+    impl Fn(&[f64; 3]) -> [f64; 3],
+) {
     let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
     for v in verts {
         for ((l, h), x) in lo.iter_mut().zip(hi.iter_mut()).zip(v) {
@@ -1670,17 +1720,16 @@ fn model_recipe(verts: &[[f64; 3]], edges: &[(usize, usize)]) -> (Vec<[f64; 3]>,
     let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut out_v: Vec<[f64; 3]> = Vec::new();
     let mut out_e = Vec::new();
+    let fit = move |v: &[f64; 3]| {
+        let round = |x: f64| (x * 1000.0).round() / 1000.0;
+        [round((v[0] - mid[0]) / span), round((v[1] - mid[1]) / span), round((v[2] - mid[2]) / span)]
+    };
     let mut keep = |i: usize, out_v: &mut Vec<[f64; 3]>| -> Option<usize> {
         if let Some(k) = map.get(&i) {
             return Some(*k);
         }
         let v = verts.get(i)?;
-        let round = |x: f64| (x * 1000.0).round() / 1000.0;
-        out_v.push([
-            round((v[0] - mid[0]) / span),
-            round((v[1] - mid[1]) / span),
-            round((v[2] - mid[2]) / span),
-        ]);
+        out_v.push(fit(v));
         map.insert(i, out_v.len() - 1);
         Some(out_v.len() - 1)
     };
@@ -1689,7 +1738,165 @@ fn model_recipe(verts: &[[f64; 3]], edges: &[(usize, usize)]) -> (Vec<[f64; 3]>,
             out_e.push((a, b));
         }
     }
-    (out_v, out_e)
+    (out_v, out_e, map, fit)
+}
+
+/// Most triangles kept with a 3D model picture (more are sampled evenly).
+const MAX_MODEL_TRIS: usize = 6_000;
+
+/// The faces of a model whose edges go round each face in turn (as the readers give them: a triangle as
+/// a→b, b→c, c→a), as triangles (larger faces fanned out).
+fn faces_from_edges(edges: &[(usize, usize)]) -> Vec<[usize; 3]> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < edges.len() && out.len() < 2_000_000 {
+        let Some(&(start, _)) = edges.get(i) else { break };
+        let mut j = i;
+        while j + 1 < edges.len()
+            && j - i < 64
+            && edges.get(j).map(|e| e.1) == edges.get(j + 1).map(|e| e.0)
+            && edges.get(j).map(|e| e.1) != Some(start)
+        {
+            j += 1;
+        }
+        let closes = edges.get(j).is_some_and(|e| e.1 == start);
+        if closes && j >= i + 2 {
+            let ring: Vec<usize> =
+                edges.get(i..=j).map(|s| s.iter().map(|e| e.0).collect()).unwrap_or_default();
+            for k in 1..ring.len().saturating_sub(1) {
+                if let (Some(b), Some(c)) = (ring.get(k), ring.get(k + 1)) {
+                    out.push([start, *b, *c]);
+                }
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The faces of a model as a recipe's triangles: sampled to [`MAX_MODEL_TRIS`], over the recipe's
+/// vertices `out_v` (taken from `verts` fitted by `fit`; added when not there yet, `map` keeps track).
+fn recipe_tris(
+    verts: &[[f64; 3]],
+    edges: &[(usize, usize)],
+    out_v: &mut Vec<[f64; 3]>,
+    map: &mut std::collections::HashMap<usize, usize>,
+    fit: &dyn Fn(&[f64; 3]) -> [f64; 3],
+) -> Vec<[usize; 3]> {
+    let tris = faces_from_edges(edges);
+    let stride = tris.len().div_ceil(MAX_MODEL_TRIS).max(1);
+    let mut out = Vec::new();
+    for t in tris.iter().step_by(stride) {
+        let mut k = [0usize; 3];
+        let mut ok = true;
+        for (slot, i) in k.iter_mut().zip(t) {
+            match map.get(i) {
+                Some(x) => *slot = *x,
+                None => match verts.get(*i) {
+                    Some(v) => {
+                        out_v.push(fit(v));
+                        map.insert(*i, out_v.len() - 1);
+                        *slot = out_v.len() - 1;
+                    }
+                    None => ok = false,
+                },
+            }
+        }
+        if ok {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// A shaded model: its triangles turned `yaw` / `pitch` degrees, lit from the upper left and drawn back to
+/// front in `color` on white, as a `size`-px square PNG.
+pub fn model_shaded_png(
+    verts: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    size: f32,
+    yaw: f32,
+    pitch: f32,
+    color: Color,
+) -> Option<Vec<u8>> {
+    let size = if size.is_finite() { size.clamp(64.0, 800.0) } else { 320.0 };
+    let (ay, ax) = (f64::from(yaw).to_radians(), f64::from(pitch).to_radians());
+    // Turned into view space: x right, y up, z towards the viewer.
+    let view: Vec<[f64; 3]> = verts
+        .iter()
+        .map(|[x, y, z]| {
+            let x1 = x * ay.cos() + z * ay.sin();
+            let z1 = -x * ay.sin() + z * ay.cos();
+            let y1 = y * ax.cos() - z1 * ax.sin();
+            let z2 = y * ax.sin() + z1 * ax.cos();
+            [x1, y1, z2]
+        })
+        .collect();
+    let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for [x, y, _] in &view {
+        minx = minx.min(*x);
+        maxx = maxx.max(*x);
+        miny = miny.min(-*y);
+        maxy = maxy.max(-*y);
+    }
+    if !(minx.is_finite() && maxx.is_finite() && miny.is_finite() && maxy.is_finite()) {
+        return None;
+    }
+    let span = (maxx - minx).max(maxy - miny).max(f64::MIN_POSITIVE);
+    let margin = 8.0f64;
+    let scale = (f64::from(size) - 2.0 * margin) / span;
+    let (ox, oy) = (
+        margin + (f64::from(size) - 2.0 * margin - (maxx - minx) * scale) / 2.0,
+        margin + (f64::from(size) - 2.0 * margin - (maxy - miny) * scale) / 2.0,
+    );
+    let light = {
+        let l = [-0.45f64, 0.6, 0.66];
+        let n = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
+        [l[0] / n, l[1] / n, l[2] / n]
+    };
+    // Back to front by the middle of each triangle.
+    let mut order: Vec<(f64, [usize; 3])> = tris
+        .iter()
+        .filter_map(|t| {
+            let z = t.iter().map(|i| view.get(*i).map(|v| v[2])).sum::<Option<f64>>()? / 3.0;
+            z.is_finite().then_some((z, *t))
+        })
+        .collect();
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut list = mailcraft_layout::DisplayList::default();
+    for (_, [a, b, c]) in order {
+        let (Some(pa), Some(pb), Some(pc)) = (view.get(a), view.get(b), view.get(c)) else { continue };
+        let (u, v) =
+            ([pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]], [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]]);
+        let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if !(len.is_finite() && len > 1e-12) {
+            continue;
+        }
+        // Lit on either side (models do not always wind their faces the same way).
+        let lambert = ((n[0] * light[0] + n[1] * light[1] + n[2] * light[2]) / len).abs();
+        let shade = (0.3 + 0.7 * lambert) as f32;
+        let col = color.lerp(Color::BLACK, 1.0 - shade).lerp(Color::WHITE, (lambert as f32 - 0.85).max(0.0));
+        let pt = |p: &[f64; 3]| ((ox + (p[0] - minx) * scale) as f32, (oy + (-p[1] - miny) * scale) as f32);
+        let mut poly = mailcraft_layout::DisplayList::default();
+        polygon_list(&[pt(pa), pt(pb), pt(pc)], &mut poly);
+        for item in poly.items {
+            if let mailcraft_layout::DisplayItem::FillRect { rect, .. } = item {
+                // A hair wider so neighbouring faces leave no seams.
+                let rect = mailcraft_geom::Rect::new(rect.x - 0.25, rect.y, rect.w + 0.5, rect.h);
+                list.items.push(mailcraft_layout::DisplayItem::FillRect { rect, color: col });
+            }
+        }
+        if list.items.len() > 4_000_000 {
+            break;
+        }
+    }
+    let fonts = mailcraft_fonts::FontDb::bundled();
+    let d = u32::try_from(dev(size)).ok()?;
+    let png = mailcraft_render::render(&list, &fonts, d, d, RASTER_SCALE, Color::WHITE, &|_| None).to_png();
+    (!png.is_empty()).then_some(png)
 }
 
 /// Wireframe of a model turned `yaw` degrees about the vertical axis and tilted `pitch` degrees towards the
@@ -1744,11 +1951,24 @@ pub fn model_png(
     (!png.is_empty()).then_some(png)
 }
 
-/// Draws a 3D model recipe (`verts`, `edges`, `yaw`, `pitch`, `size`) in the theme's first accent.
+/// Draws a 3D model recipe (`verts`, `tris` or `edges`, `yaw`, `pitch`, `size`) in the theme's first
+/// accent: shaded faces, or a wireframe for a model without faces (only lines) or an older recipe.
 fn model_recipe_png(spec: &Value, theme: &crate::compose::ResolvedTheme) -> Option<Vec<u8>> {
     let verts: Vec<[f64; 3]> = serde_json::from_value(spec.get("verts")?.clone()).ok()?;
-    let edges: Vec<(usize, usize)> = serde_json::from_value(spec.get("edges")?.clone()).ok()?;
     let f = |k: &str, d: f32| spec.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32);
+    let tris: Vec<[usize; 3]> =
+        spec.get("tris").and_then(|t| serde_json::from_value(t.clone()).ok()).unwrap_or_default();
+    if !tris.is_empty() {
+        return model_shaded_png(
+            &verts,
+            &tris,
+            f("size", 320.0),
+            f("yaw", 35.0),
+            f("pitch", 25.0),
+            theme.color(crate::compose::ACCENT1),
+        );
+    }
+    let edges: Vec<(usize, usize)> = serde_json::from_value(spec.get("edges")?.clone()).ok()?;
     model_png(
         &verts,
         &edges,
@@ -1806,8 +2026,8 @@ fn model3d(s: &mut Session, p: &Value) -> CmdResult {
     let Some((verts, edges)) = parse_model(&data) else {
         return Err(CmdError::Failed(format!("{name}: only OBJ, STL, PLY and glTF models can be shown")));
     };
-    let (rv, re) = model_recipe(&verts, &edges);
-    let spec = json!({"verts": rv, "edges": re, "yaw": 35.0, "pitch": 25.0, "size": 320.0});
+    let (rv, re, rt) = model_recipe(&verts, &edges);
+    let spec = json!({"verts": rv, "edges": re, "tris": rt, "yaw": 35.0, "pitch": 25.0, "size": 320.0});
     let theme = s
         .composes
         .get(&cid)
@@ -1947,7 +2167,7 @@ fn draw_table(s: &mut Session, p: &Value) -> CmdResult {
         // The pencil: strokes in the body draw tables and split cells (Esc puts it away).
         let c = compose_mut(s, p)?;
         c.draw_tool = Some("tablePencil".into());
-        c.selected_drawing = None;
+        c.select_drawing(None);
         return Ok(json!({"armed": "tablePencil"}));
     };
     let widths: Vec<f32> = widths
@@ -2057,7 +2277,7 @@ fn text_box(s: &mut Session, p: &Value) -> CmdResult {
         let tool = if vertical { "verticalTextBox" } else { "textBox" };
         let c = compose_mut(s, p)?;
         c.draw_tool = Some(tool.into());
-        c.selected_drawing = None;
+        c.select_drawing(None);
         return Ok(json!({"armed": tool}));
     }
     let text = opt_str(p, "text").unwrap_or("").replace("\r\n", "\n");
@@ -2494,10 +2714,51 @@ fn equation_block(text: &str) -> Block {
     }
 }
 
+/// The Equation dialog's structures: (group, label, linear form with `□` for the places to fill in).
+pub const EQUATION_STRUCTURES: [(&str, &str, &str); 24] = [
+    ("Fraction", "Stacked fraction", "(\u{25a1})/(\u{25a1})"),
+    ("Fraction", "Fraction of x and y", "x/y"),
+    ("Fraction", "One half", "1/2"),
+    ("Script", "Superscript", "\u{25a1}^\u{25a1}"),
+    ("Script", "Subscript", "\u{25a1}_\u{25a1}"),
+    ("Script", "Subscript and superscript", "\u{25a1}_\u{25a1}^\u{25a1}"),
+    ("Script", "x squared", "x^2"),
+    ("Radical", "Square root", "\u{221a}(\u{25a1})"),
+    ("Radical", "Square root of a sum of squares", "\u{221a}(a^2+b^2)"),
+    ("Integral", "Integral", "\u{222b}\u{25a1}"),
+    ("Integral", "Definite integral", "\u{222b}_\u{25a1}^\u{25a1} \u{25a1}"),
+    ("Integral", "Integral from 0 to 1", "\u{222b}_0^1 f(x)dx"),
+    ("Large Operator", "Summation", "\u{2211}_\u{25a1}^\u{25a1} \u{25a1}"),
+    ("Large Operator", "Sum from k = 1 to n", "\u{2211}_(k=1)^n k"),
+    ("Large Operator", "Product", "\u{220f}_\u{25a1}^\u{25a1} \u{25a1}"),
+    ("Bracket", "Parentheses", "(\u{25a1})"),
+    ("Bracket", "Square brackets", "[\u{25a1}]"),
+    ("Bracket", "Braces", "{\u{25a1}}"),
+    ("Function", "Sine", "sin \u{25a1}"),
+    ("Function", "Natural logarithm", "ln \u{25a1}"),
+    ("Function", "Limit", "lim_(n\u{2192}\u{221e}) \u{25a1}"),
+    ("Operator", "Plus or minus", "\u{b1}"),
+    ("Operator", "Not equal to", "\u{2260}"),
+    ("Operator", "Approximately", "\u{2248}"),
+];
+
 fn equation(s: &mut Session, p: &Value) -> CmdResult {
+    let cid_compose = compose_id(s, p)?;
+    // `edit`: an equation picture of the body (a double-click on it).
+    let edit_pic = opt_str(p, "edit").map(|e| e.trim_start_matches("cid:").to_owned());
+    let current = match &edit_pic {
+        Some(e) => {
+            let c = s.composes.get(&cid_compose).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+            let spec = recipe(c, e, "equation")
+                .filter(|_| in_body(c, e))
+                .ok_or_else(|| CmdError::Params(format!("`{e}` is not an equation in this message")))?;
+            Some(spec.get("text").and_then(Value::as_str).unwrap_or_default().to_owned())
+        }
+        None => None,
+    };
     let text = match (opt_str(p, "preset"), opt_str(p, "text")) {
         (_, Some(t)) if !t.trim().is_empty() => t.trim().to_owned(),
-        (Some(name), _) => {
+        (Some(name), _) if edit_pic.is_none() => {
             if let Some(t) = equation_preset(name) {
                 t.to_owned()
             } else {
@@ -2505,22 +2766,40 @@ fn equation(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
         _ => {
+            let structures: Vec<Value> = EQUATION_STRUCTURES
+                .iter()
+                .map(|(g, n, f)| json!({"group": g, "name": n, "formula": f}))
+                .collect();
             return dialog(
                 s,
                 "equation",
-                json!({"compose": compose_id(s, p)?, "presets": EQUATION_PRESETS.iter().map(|(k, n, f)| json!({"key": k, "name": n, "formula": f})).collect::<Vec<_>>()}),
+                json!({"compose": cid_compose,
+                       "presets": EQUATION_PRESETS.iter().map(|(k, n, f)| json!({"key": k, "name": n, "formula": f})).collect::<Vec<_>>(),
+                       "structures": structures, "edit": edit_pic, "text": current}),
             );
         }
     };
     if text.chars().count() > MAX_EQUATION {
         return Err(CmdError::Params(format!("an equation has at most {MAX_EQUATION} characters")));
     }
-    // Drawn in two dimensions as a picture (alt text = the linear form); text that cannot be drawn goes in
-    // as a centred math-font paragraph.
+    // Drawn in two dimensions as a picture (alt text = the linear form) that remembers its text, so a
+    // double-click opens it in the Equation dialog again; text that cannot be drawn goes in as a centred
+    // math-font paragraph.
     if let Some((png, w, h)) = equation_png(&text) {
         let c = compose_mut(s, p)?;
-        let cid = put_png(c, "equation", png, &text, w, h)?;
-        return Ok(json!({"equation": text, "cid": cid, "format": "png"}));
+        let spec = json!({"text": text});
+        let cid = match &edit_pic {
+            Some(old) => replace_picture(c, old, "equation", png, &text, (w, h), "equation", spec),
+            None => {
+                let cid = put_png(c, "equation", png, &text, w, h)?;
+                remember_generated(c, &cid, "equation", spec);
+                cid
+            }
+        };
+        return Ok(json!({"equation": text, "cid": cid, "format": "png", "edited": edit_pic.is_some()}));
+    }
+    if edit_pic.is_some() {
+        return Err(CmdError::Failed("this equation cannot be drawn; check its brackets".into()));
     }
     edit(s, p, |c| c.insert_blocks(vec![equation_block(&text)]))?;
     Ok(json!({"equation": text, "format": "text"}))
@@ -3542,7 +3821,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Equation",
             "Insert › Symbols",
             "",
-            r#"{"preset"?:string,"text"?:string}"#,
+            r#"{"preset"?:string,"text"?:string,"edit"?:string}  (edit: an equation picture of the body; nothing: the Equation dialog)"#,
             false,
             rich_compose,
             equation,
@@ -3896,6 +4175,34 @@ pub(crate) mod tests {
         assert_ne!(a.0, b.0);
         assert!(b.2 > a.2, "the reflection adds height");
         assert!(wordart_png("", "Fill: Black", &theme).is_none());
+    }
+
+    #[test]
+    fn models_are_drawn_shaded_from_their_faces() {
+        // A cube from its six quad faces.
+        let obj = b"v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 0 0 1\nv 1 0 1\nv 1 1 1\nv 0 1 1\n\
+f 1 2 3 4\nf 5 6 7 8\nf 1 2 6 5\nf 2 3 7 6\nf 3 4 8 7\nf 4 1 5 8\n";
+        let (v, e) = parse_model(obj).unwrap();
+        assert_eq!(faces_from_edges(&e).len(), 12, "each quad is two triangles");
+        let (rv, _, rt) = model_recipe(&v, &e);
+        assert_eq!(rt.len(), 12);
+        assert!(rt.iter().flatten().all(|i| *i < rv.len()));
+        let png = model_shaded_png(&rv, &rt, 120.0, 35.0, 25.0, Color::rgb(0, 0, 200)).unwrap();
+        let canvas = mailcraft_render::svg::decode_png(&png).unwrap();
+        // Filled faces in more than one shade (lit differently), not just lines.
+        let mut shades = std::collections::HashSet::new();
+        let mut filled = 0usize;
+        for px in canvas.pixels.chunks(4) {
+            if px[2] > 60 && px[0] < 120 {
+                filled += 1;
+                shades.insert(px[2] / 16);
+            }
+        }
+        assert!(filled > canvas.pixels.len() / 4 / 8, "{filled}");
+        assert!(shades.len() >= 2, "{shades:?}");
+        // Junk does not crash.
+        assert!(faces_from_edges(&[(0, 1), (1, 0)]).is_empty());
+        let _ = model_shaded_png(&[], &[[0, 1, 2]], f32::NAN, f32::NAN, 0.0, Color::BLACK);
     }
 
     #[test]

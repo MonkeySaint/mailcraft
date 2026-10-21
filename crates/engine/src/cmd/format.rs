@@ -3284,6 +3284,10 @@ pub fn body_objects(c: &ComposeState) -> Vec<BodyObject> {
             if out.len() >= MAX_OBJECTS {
                 return out;
             }
+            // An In Line with Text drawing's place: the drawing itself is listed with the drawings.
+            if mailcraft_model::rich::inline_drawing_id(&src).is_some() {
+                continue;
+            }
             let n = out.len().saturating_add(1);
             let alt = alt.trim();
             let name = if alt.is_empty() { format!("Picture {n}") } else { alt.chars().take(80).collect() };
@@ -3294,7 +3298,7 @@ pub fn body_objects(c: &ComposeState) -> Vec<BodyObject> {
 }
 
 /// The floating drawings of a compose body, front-most first (as the Selection pane lists them): named by
-/// their alternative text, else their text, else their kind and number.
+/// the name given in the pane, else their alternative text, else their text, else their kind and number.
 pub fn drawing_objects(c: &ComposeState) -> Vec<BodyObject> {
     use mailcraft_model::rich::DrawingKind;
     c.body
@@ -3308,9 +3312,13 @@ pub fn drawing_objects(c: &ComposeState) -> Vec<BodyObject> {
                 DrawingKind::TextBox => "Text Box".to_owned(),
                 DrawingKind::WordArt => "WordArt".to_owned(),
                 DrawingKind::Canvas => "Drawing Canvas".to_owned(),
+                DrawingKind::Group => "Group".to_owned(),
                 DrawingKind::Shape => crate::cmd::insert::shapes::label(&d.shape).to_owned(),
             };
-            let name = first_line(&d.alt)
+            let named = first_line(&d.name);
+            let described = if d.kind == DrawingKind::Group { None } else { first_line(&d.alt) };
+            let name = named
+                .or(described)
                 .or_else(|| first_line(&d.text))
                 .unwrap_or_else(|| format!("{kind} {}", d.id))
                 .chars()
@@ -3399,7 +3407,8 @@ fn selection_pane(s: &mut Session, p: &Value) -> CmdResult {
         return Ok(json!({"moved": id, "index": at}));
     }
     let c = compose_mut(s, p)?;
-    // Rename an object (an empty name gives back the generated one).
+    // Rename an object (an empty name gives back the generated one). A drawing keeps its name itself (the
+    // Format Shape pane shows it, and undo covers it); a picture in the text is named in the pane only.
     if let Some(n) = opt_u64(p, "rename") {
         let objects = pane_objects(c);
         let obj = usize::try_from(n)
@@ -3413,29 +3422,73 @@ fn selection_pane(s: &mut Session, p: &Value) -> CmdResult {
             .take(MAX_OBJECT_NAME)
             .collect();
         let name = name.trim().to_owned();
-        c.object_names.retain(|(src, _)| *src != obj.src);
-        if !name.is_empty() {
-            if c.object_names.len() >= MAX_OBJECT_NAMES {
-                return Err(CmdError::Failed("too many named objects".into()));
+        if let Some(id) = obj.drawing {
+            let pane_named = c.object_names.iter().any(|(src, _)| *src == obj.src);
+            if pane_named || c.body.drawings.iter().any(|d| d.id == id && d.name != name) {
+                c.checkpoint();
+                c.object_names.retain(|(src, _)| *src != obj.src);
+                if let Some(d) = c.body.drawings.iter_mut().find(|d| d.id == id) {
+                    d.name.clone_from(&name);
+                }
+                c.dirty = true;
             }
-            c.object_names.push((obj.src.clone(), name.clone()));
+        } else {
+            c.object_names.retain(|(src, _)| *src != obj.src);
+            if !name.is_empty() {
+                if c.object_names.len() >= MAX_OBJECT_NAMES {
+                    return Err(CmdError::Failed("too many named objects".into()));
+                }
+                c.object_names.push((obj.src.clone(), name.clone()));
+            }
+            c.dirty = true;
         }
-        c.dirty = true;
-        return Ok(
-            json!({"renamed": n, "name": pane_objects(c).get(usize::try_from(n).unwrap_or(usize::MAX)).map(|o| o.name.clone())}),
-        );
+        let objects = pane_objects(c);
+        let names: Vec<String> = objects.iter().map(|o| o.name.clone()).collect();
+        return Ok(json!({
+            "renamed": n,
+            "name": usize::try_from(n).ok().and_then(|i| objects.get(i)).map(|o| o.name.clone()),
+            "objects": names,
+        }));
     }
     let objects = pane_objects(c);
-    if let Some(n) = opt_u64(p, "select") {
-        let obj = usize::try_from(n)
-            .ok()
-            .and_then(|i| objects.get(i))
-            .ok_or_else(|| CmdError::Params(format!("no object {n}")))?;
+    let object = |key: &str| -> Result<Option<&BodyObject>, CmdError> {
+        match opt_u64(p, key) {
+            None => Ok(None),
+            Some(n) => usize::try_from(n)
+                .ok()
+                .and_then(|i| objects.get(i))
+                .map(Some)
+                .ok_or_else(|| CmdError::Params(format!("no object {n}"))),
+        }
+    };
+    if let Some(obj) = object("reorder")? {
+        // Bring Forward (`by` > 0) / Send Backward (`by` < 0) from the pane.
+        let id = obj.drawing.ok_or_else(|| CmdError::Failed("only drawings can be reordered".into()))?;
+        let action = if p.get("by").and_then(Value::as_i64).unwrap_or(1) > 0 {
+            "bringForward"
+        } else {
+            "sendBackward"
+        };
+        let cid = c.id;
+        crate::cmd::drawing::arrange_id(s, cid, id, action)?;
+        let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+        let names: Vec<String> = pane_objects(c).into_iter().map(|o| o.name).collect();
+        return Ok(json!({"reordered": id, "objects": names}));
+    } else if let Some(obj) = object("select")? {
+        let add = opt_bool(p, "add") == Some(true);
         if let Some(id) = obj.drawing {
-            c.selected_drawing = Some(id);
+            let mut set = if add { c.selected_drawings() } else { Vec::new() };
+            if add && set.contains(&id) {
+                // Ctrl-click a selected one: it leaves the selection.
+                set.retain(|x| *x != id);
+            } else {
+                set.insert(0, id);
+            }
+            c.selected_drawing = set.first().copied();
+            c.also_selected = set.get(1..).map(<[u32]>::to_vec).unwrap_or_default();
         } else {
             let end = DocPos::new(obj.at.path.clone(), obj.at.offset.saturating_add(1));
-            c.selected_drawing = None;
+            c.select_drawing(None);
             c.set_selection(obj.at.clone(), end);
         }
     } else if opt_bool(p, "list") != Some(true) {
@@ -3864,7 +3917,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Selection Pane",
             "Format Text › Editing › Select",
             "",
-            r#"{"show"?:bool,"list"?:bool,"select"?:number,"ids"?:[number]}  (ids: the received message's body) | {"rename":n,"name":string} | {"move":n,"dir":"forward"|"backward"}"#,
+            r#"{"show"?:bool,"list"?:bool,"select"?:number,"add"?:bool,"ids"?:[number]}  (add: Ctrl-click; ids: the received message's body) | {"rename":n,"name":string} | {"move":n,"dir":"forward"|"backward"} | {"reorder":n,"by":1|-1}"#,
             false,
             compose_or_message,
             selection_pane,

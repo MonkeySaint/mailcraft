@@ -450,6 +450,10 @@ fn paint_and_interact(
             }
             DisplayItem::Image { rect: r, src, alt } => {
                 let rr = rect_of(r);
+                // The place of a drawing in line with the text: the compose editor paints the drawing.
+                if mailcraft_model::rich::inline_drawing_id(src).is_some() {
+                    continue;
+                }
                 if rr.intersects(clip) {
                     let remote = is_remote(src);
                     let tex = if remote {

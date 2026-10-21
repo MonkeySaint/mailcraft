@@ -472,6 +472,184 @@ pub enum DrawingKind {
     WordArt,
     /// A drawing canvas: a frame that keeps the drawings placed inside it together.
     Canvas,
+    /// A group of drawings ([`Drawing::group`] of each member names it): it moves, sizes and is deleted as
+    /// one object. Its box is the box around its members; it draws nothing itself.
+    Group,
+}
+
+/// Prefix of the `src` of a picture in the text that holds the place of an In Line with Text drawing
+/// (`drawing:<id>`); such pictures are drawn by the compose editor, never fetched.
+pub const INLINE_DRAWING_PREFIX: &str = "drawing:";
+
+/// The drawing id an In Line with Text placeholder `src` names.
+pub fn inline_drawing_id(src: &str) -> Option<u32> {
+    src.strip_prefix(INLINE_DRAWING_PREFIX)?.parse().ok()
+}
+
+/// How the body text flows around a floating drawing (Wrap Text). Behind Text is
+/// [`Drawing::behind_text`] with the default [`WrapStyle::Front`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WrapStyle {
+    /// In front of the text (or behind it): the text does not make room.
+    #[default]
+    Front,
+    /// The text wraps around the drawing's box.
+    Square,
+    /// The text wraps close to the drawing's outline ([`Drawing::wrap_points`]).
+    Tight,
+    /// Like Tight, also into open areas of the outline.
+    Through,
+    /// The text stops above the drawing and goes on below it.
+    TopBottom,
+    /// The drawing sits in a line of text like a character: a `drawing:<id>` picture in the text holds its
+    /// place.
+    Inline,
+}
+
+impl WrapStyle {
+    /// Whether the body text makes room for a drawing with this wrapping (Square, Tight, Through, Top and
+    /// Bottom).
+    pub fn wraps(self) -> bool {
+        matches!(self, WrapStyle::Square | WrapStyle::Tight | WrapStyle::Through | WrapStyle::TopBottom)
+    }
+}
+
+/// Kind of a drawing's shadow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShadowKind {
+    #[default]
+    Outer,
+    Inner,
+    /// Cast on the ground behind the drawing (squashed and slanted).
+    Perspective,
+}
+
+/// A shadow effect (Shape Effects › Shadow, Shadow Options).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Shadow {
+    pub kind: ShadowKind,
+    /// `None` = black.
+    pub color: Option<Color>,
+    /// 0 (opaque) to 1 (invisible).
+    pub transparency: f32,
+    /// Blur radius (px).
+    pub blur: f32,
+    /// Direction the shadow falls, degrees clockwise from the right (45 = down and to the right).
+    pub angle: f32,
+    /// How far it falls (px).
+    pub distance: f32,
+}
+
+impl Default for Shadow {
+    fn default() -> Self {
+        Shadow {
+            kind: ShadowKind::Outer,
+            color: None,
+            transparency: 0.6,
+            blur: 4.0,
+            angle: 45.0,
+            distance: 3.0,
+        }
+    }
+}
+
+/// A reflection below the drawing (Reflection Options).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Reflection {
+    /// 0 (opaque) to 1 (invisible) where the reflection starts.
+    pub transparency: f32,
+    /// How much of the drawing is reflected (0..=1 of its height).
+    pub size: f32,
+    /// Gap between the drawing and its reflection (px).
+    pub distance: f32,
+    /// Blur (px).
+    pub blur: f32,
+}
+
+impl Default for Reflection {
+    fn default() -> Self {
+        Reflection { transparency: 0.5, size: 0.5, distance: 0.0, blur: 0.5 }
+    }
+}
+
+/// A glow around the drawing (Glow Options).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Glow {
+    /// `None` = a light tint of the drawing's own colour.
+    pub color: Option<Color>,
+    /// Radius (px).
+    pub size: f32,
+    /// 0 (opaque) to 1 (invisible).
+    pub transparency: f32,
+}
+
+impl Default for Glow {
+    fn default() -> Self {
+        Glow { color: None, size: 8.0, transparency: 0.4 }
+    }
+}
+
+/// Shape Effects (or Text Effects) with their options. Any combination may be on at once.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ShapeEffects {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<Shadow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<Reflection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glow: Option<Glow>,
+    /// Soft edges: the drawing fades out over this many px at its edge (0 = none).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub soft_edges: f32,
+    /// Bevel: `""` (none), `circle`, `relaxedInset`, `cross`, `coolSlant`, `angle`, `softRound`, `convex`,
+    /// `slope`, `divot`, `riblet`, `hardEdge`, `artDeco`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bevel: String,
+    /// Bevel width (px; 0 = the bevel's own).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bevel_size: f32,
+    /// 3-D Rotation about the vertical axis (degrees).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rot_x: f32,
+    /// 3-D Rotation about the horizontal axis (degrees).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rot_y: f32,
+    /// Perspective (degrees of field of view; 0 = parallel, no perspective).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub perspective: f32,
+}
+
+impl ShapeEffects {
+    /// Whether no effect is on.
+    pub fn is_empty(&self) -> bool {
+        *self == ShapeEffects::default()
+    }
+}
+
+/// A gradient stop: where along the gradient (0..=1) and its colour (alpha = opacity).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GradientStop {
+    pub pos: f32,
+    pub color: Color,
+}
+
+/// A gradient fill set up stop by stop (Format Shape › Fill › Gradient fill, More Gradients).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Gradient {
+    /// From the middle outwards instead of along a line.
+    #[serde(skip_serializing_if = "is_false")]
+    pub radial: bool,
+    /// Direction of a linear gradient, degrees clockwise from left-to-right (90 = top to bottom).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub angle: f32,
+    pub stops: Vec<GradientStop>,
 }
 
 /// Vertical placement of the text inside a drawing.
@@ -551,6 +729,73 @@ pub struct Drawing {
     /// `reflection` (WordArt only), `bevel`.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub text_effect: String,
+    /// How the body text flows around the drawing.
+    #[serde(skip_serializing_if = "is_front")]
+    pub wrap: WrapStyle,
+    /// Outline the text wraps to with Tight and Through wrapping, as fractions (0..=1) of the box (empty:
+    /// the box).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wrap_points: Vec<(f32, f32)>,
+    /// The group drawing ([`DrawingKind::Group`]) this drawing belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+    /// The text box the text that does not fit in this one flows on into (Create Text Box Link).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_next: Option<u32>,
+    /// Name in the Selection pane (empty: made from its kind and text).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Mirrored left to right.
+    #[serde(skip_serializing_if = "is_false")]
+    pub flip_h: bool,
+    /// Mirrored top to bottom.
+    #[serde(skip_serializing_if = "is_false")]
+    pub flip_v: bool,
+    /// Fill transparency, 0 (opaque) to 1 (clear).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub transparency: f32,
+    /// Outline transparency, 0 (opaque) to 1 (clear).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub line_transparency: f32,
+    /// Outline dashes: `""` (solid), `roundDot`, `squareDot`, `dash`, `dashDot`, `longDash`, `longDashDot`,
+    /// `longDashDotDot`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub line_dash: String,
+    /// A gradient fill set up stop by stop; wins over [`Drawing::gradient`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gradient_fill: Option<Gradient>,
+    /// Picture fill: a PNG (base64) stretched over the shape; wins over the fill colour.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub fill_picture: String,
+    /// Text box margins (left, top, right, bottom px); `None` = the default margins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inset: Option<[f32; 4]>,
+    /// Resize Shape to Fit Text: the drawing grows or shrinks in height to its text.
+    #[serde(skip_serializing_if = "is_false")]
+    pub autofit: bool,
+    /// Other text directions: `up` (turned 270°, bottom to top) or `stacked` (letters one under the other).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub text_flow: String,
+    /// Shape Effects with options (shadow, reflection, glow, soft edges, bevel, 3-D rotation); wins over
+    /// [`Drawing::effect`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fx: Option<Box<ShapeEffects>>,
+    /// Text Effects with options; wins over [`Drawing::text_effect`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_fx: Option<Box<ShapeEffects>>,
+    /// Text Effects › Transform: the warp of the text (`""` none; see the engine's list of warps).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub warp: String,
+    /// Weight of the text outline (px; 0 = thin).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub text_outline_px: f32,
+    /// Dashes of the text outline (as [`Drawing::line_dash`]).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub text_outline_dash: String,
+}
+
+fn is_front(w: &WrapStyle) -> bool {
+    *w == WrapStyle::Front
 }
 
 impl Default for Drawing {
@@ -581,6 +826,26 @@ impl Default for Drawing {
             vertical: false,
             text_outline: None,
             text_effect: String::new(),
+            wrap: WrapStyle::Front,
+            wrap_points: Vec::new(),
+            group: None,
+            link_next: None,
+            name: String::new(),
+            flip_h: false,
+            flip_v: false,
+            transparency: 0.0,
+            line_transparency: 0.0,
+            line_dash: String::new(),
+            gradient_fill: None,
+            fill_picture: String::new(),
+            inset: None,
+            autofit: false,
+            text_flow: String::new(),
+            fx: None,
+            text_fx: None,
+            warp: String::new(),
+            text_outline_px: 0.0,
+            text_outline_dash: String::new(),
         }
     }
 }
@@ -589,6 +854,11 @@ impl Drawing {
     /// Whether the point (`px`, `py`) lies in the drawing's box (rotation ignored).
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px <= self.x + self.w && py >= self.y && py <= self.y + self.h
+    }
+
+    /// The `src` of the picture in the text that holds an In Line with Text drawing's place.
+    pub fn inline_src(&self) -> String {
+        format!("{INLINE_DRAWING_PREFIX}{}", self.id)
     }
 
     /// Whether this drawing's box lies wholly inside `other`'s box.

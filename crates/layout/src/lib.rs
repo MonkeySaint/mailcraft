@@ -34,6 +34,7 @@ mod style;
 mod table;
 #[cfg(test)]
 mod tests;
+mod wrap;
 
 use mailcraft_fonts::{FontDb, FontId};
 use mailcraft_geom::{Color, Point, Rect};
@@ -287,12 +288,13 @@ impl Layout {
 
 /// Lays out `doc` within `opts.width`.
 pub fn layout_doc(doc: &Doc, fonts: &FontDb, opts: &LayoutOptions) -> Layout {
-    let ctx = Ctx::new(fonts, opts);
+    let mut ctx = Ctx::new(fonts, opts);
+    ctx.floats = wrap::Floats::of(doc, ctx.zoom);
     let mut out = Out::default();
     let bg = doc.background.map(|_| out.placeholder());
     let base = style::merge(&opts.base, &doc.base);
     let mut path = Vec::new();
-    let frame = Frame { x: 0.0, y: 0.0, w: ctx.width, depth: 0, list_depth: 0 };
+    let frame = Frame { x: 0.0, y: 0.0, w: ctx.width, depth: 0, list_depth: 0, floats: true };
     let height = layout_blocks(&ctx, &doc.blocks, &base, &mut path, frame, &mut out);
     if let (Some(i), Some(color)) = (bg, doc.background) {
         out.set(i, DisplayItem::FillRect { rect: Rect::new(0.0, 0.0, ctx.width, height), color });

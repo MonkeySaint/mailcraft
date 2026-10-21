@@ -162,6 +162,123 @@ fn compose(app: &App, surface: Surface) -> Option<&mailcraft_engine::compose::Co
     }
 }
 
+/// The drawing a message's Shape Format tab works on.
+fn selected_drawing(c: &mailcraft_engine::compose::ComposeState) -> Option<&mailcraft_model::rich::Drawing> {
+    c.selected_drawing.and_then(|id| mailcraft_engine::cmd::drawing::find(&c.body.drawings, id))
+}
+
+/// Shape Effects and Text Effects galleries (`fx:presets`, `fx:shadows`, `fx:reflections`, `fx:glows`,
+/// `fx:softEdges`, `fx:bevels`, `fx:rotations`, `fx:warps`), checked against the selected drawing's shape
+/// effects, or its text effects with `text` (a group's: its first drawing's, which formatting goes to).
+fn fx_items(app: &App, surface: Surface, kind: &str, text: bool) -> Vec<DynItem> {
+    use mailcraft_engine::cmd::drawing as dr;
+    use mailcraft_engine::cmd::insert::drawing as ins;
+    let c = compose(app, surface);
+    let d = c.and_then(dr::format_source);
+    let preset = c.zip(d).and_then(|(c, d)| dr::preset_of(d, c, text));
+    let fx = d
+        .and_then(|d| if text { d.text_fx.as_deref() } else { d.fx.as_deref() })
+        .cloned()
+        .unwrap_or_default();
+    let named = |id: &str, label: &str, on: bool| DynItem {
+        label: label.to_owned(),
+        icon: "favorites",
+        swatch: None,
+        vars: vec![("$name", json!(id))],
+        on,
+    };
+    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+    match kind {
+        "presets" => (1..=dr::PRESETS)
+            .map(|n| DynItem {
+                label: format!("Preset {n}"),
+                icon: "favorites",
+                swatch: None,
+                vars: vec![("$id", json!(n))],
+                on: preset == Some(n as u64),
+            })
+            .collect(),
+        "shadows" => dr::SHADOWS
+            .iter()
+            .map(|(id, label, k, angle, dist, _)| {
+                let on = fx
+                    .shadow
+                    .as_ref()
+                    .is_some_and(|s| s.kind == *k && near(s.angle, *angle) && near(s.distance, *dist));
+                named(id, label, on)
+            })
+            .collect(),
+        "reflections" => dr::REFLECTIONS
+            .iter()
+            .map(|(id, label, size, dist)| {
+                let on =
+                    fx.reflection.as_ref().is_some_and(|r| near(r.size, *size) && near(r.distance, *dist));
+                named(id, label, on)
+            })
+            .collect(),
+        "glows" => (1..=6)
+            .flat_map(|a| dr::GLOW_SIZES.iter().map(move |sz| (a, *sz)))
+            .map(|(a, size)| {
+                let key = format!("accent{a}");
+                let col = c.and_then(|c| mailcraft_engine::cmd::format::theme_color(c, &key, 0));
+                let on = fx
+                    .glow
+                    .as_ref()
+                    .is_some_and(|g| near(g.size, size) && g.color.is_some() && g.color == col);
+                DynItem {
+                    label: format!("{size} px glow, Accent color {a}"),
+                    icon: "",
+                    swatch: col.map(|k| [k.r, k.g, k.b]),
+                    vars: vec![("$theme", json!(key)), ("$size", json!(size))],
+                    on,
+                }
+            })
+            .collect(),
+        "softEdges" => dr::SOFT_EDGES
+            .iter()
+            .map(|size| DynItem {
+                label: format!("{size} px"),
+                icon: "",
+                swatch: None,
+                vars: vec![("$size", json!(size))],
+                on: near(fx.soft_edges, *size),
+            })
+            .collect(),
+        "bevels" => ins::BEVELS
+            .iter()
+            .filter(|b| !b.is_empty())
+            .map(|b| named(b, &bevel_label(b), fx.bevel == *b))
+            .collect(),
+        "rotations" => dr::ROTATIONS
+            .iter()
+            .map(|(id, label, x, y, p)| {
+                named(id, label, near(fx.rot_x, *x) && near(fx.rot_y, *y) && near(fx.perspective, *p))
+            })
+            .collect(),
+        "warps" => {
+            let warp = d.map(|d| d.warp.clone()).unwrap_or_default();
+            ins::WARPS.iter().map(|(id, label)| named(id, label, warp == *id)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// "relaxedInset" → "Relaxed Inset".
+pub(crate) fn bevel_label(id: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in id.chars().enumerate() {
+        if i == 0 {
+            out.extend(ch.to_uppercase());
+        } else if ch.is_uppercase() {
+            out.push(' ');
+            out.push(ch);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Whether a state predicate is on. Unknown predicates are off.
 pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
     let (name, arg) = spec.split_once(':').unwrap_or((spec, ""));
@@ -324,6 +441,20 @@ fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str
         }
         "flagged" => c.flag != mailcraft_model::FlagState::None || c.recipient_flag.is_some(),
         "lightcanvas" => c.light_canvas,
+        // Shape Format: the selected drawing's layout, text direction and point editing.
+        "editPoints" => c.edit_points.is_some(),
+        "alignMargin" => c.align_to_margin,
+        "alignSelected" => !c.align_to_margin,
+        "wrap" => selected_drawing(c).is_some_and(|d| mailcraft_engine::cmd::drawing::wrap_name(d) == arg),
+        "textDir" => mailcraft_engine::cmd::drawing::format_source(c).is_some_and(|d| {
+            let now = match (d.vertical, d.text_flow.as_str()) {
+                (_, "up") => "up",
+                (_, "stacked") => "stacked",
+                (true, _) => "down",
+                _ => "horizontal",
+            };
+            now == arg
+        }),
         "vote" => c.voting.eq_ignore_ascii_case(arg),
         "save" => {
             use mailcraft_engine::compose::SaveSentTo;
@@ -499,7 +630,7 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 79] = [
+pub const SOURCES: [&str; 92] = [
     "multilevelGallery",
     "shadingThemeColors",
     "shadingColors",
@@ -514,6 +645,19 @@ pub const SOURCES: [&str; 79] = [
     "shadingThemeShades:accent5",
     "shadingThemeShades:accent6",
     "recentFilesLink",
+    "fx:presets",
+    "fx:shadows",
+    "fx:reflections",
+    "fx:glows",
+    "fx:softEdges",
+    "fx:bevels",
+    "fx:rotations",
+    "textFx:shadows",
+    "textFx:reflections",
+    "textFx:glows",
+    "textFx:bevels",
+    "textFx:rotations",
+    "textFx:warps",
     "shapes:Lines",
     "shapes:Rectangles",
     "shapes:Basic Shapes",
@@ -1290,6 +1434,12 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 })
                 .collect()
         }
+        _ if source.starts_with("fx:") => {
+            fx_items(app, surface, source.strip_prefix("fx:").unwrap_or(""), false)
+        }
+        _ if source.starts_with("textFx:") => {
+            fx_items(app, surface, source.strip_prefix("textFx:").unwrap_or(""), true)
+        }
         "styles" => style_items(app, surface),
         "themeFontNames" => theme_font_items(app, surface),
         "fontNames" => font_name_items(app, surface),
@@ -1973,5 +2123,66 @@ mod compose_state_tests {
         assert!(link[0].vars.iter().any(|(k, _)| *k == HEADING_VAR), "a heading says what picking does");
         assert!(link.iter().any(|d| d.label == "notes.txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shape_format_galleries_and_states_follow_the_selected_drawing() {
+        let (mut app, cid) = app_with(mailcraft_model::Doc::from_plain_text("x"));
+        let s = Surface::Compose(cid);
+        let mem = Mem::default();
+        app.run("insert.shape", json!({"compose": cid, "kind": "rectangle"}));
+        let checked = |app: &App, src: &str| -> Vec<String> {
+            dyn_items(app, s, src).into_iter().filter(|d| d.on).map(|d| d.label).collect()
+        };
+        assert!(checked(&app, "fx:shadows").is_empty());
+        app.run("drawing.effect", json!({"compose": cid, "shadow": "innerTop", "bevel": "circle"}));
+        assert_eq!(checked(&app, "fx:shadows"), ["Inner: Top"]);
+        assert_eq!(checked(&app, "fx:bevels"), ["Circle"]);
+        assert!(checked(&app, "textFx:shadows").is_empty(), "text effects are their own");
+        // Every gallery item runs: glows carry their accent colour as a swatch.
+        let glows = dyn_items(&app, s, "fx:glows");
+        assert_eq!(glows.len(), 24);
+        assert!(glows.iter().all(|g| g.swatch.is_some()));
+        assert_eq!(dyn_items(&app, s, "fx:presets").len(), mailcraft_engine::cmd::drawing::PRESETS);
+        // Wrap Text and Text Direction check the current choice.
+        assert!(is_on(&app, s, &mem, "wrap:front"));
+        app.run("drawing.wrapText", json!({"compose": cid, "wrap": "square"}));
+        assert!(is_on(&app, s, &mem, "wrap:square") && !is_on(&app, s, &mem, "wrap:front"));
+        assert!(is_on(&app, s, &mem, "textDir:horizontal"));
+        app.run("drawing.textDirection", json!({"compose": cid, "direction": "stacked"}));
+        assert!(is_on(&app, s, &mem, "textDir:stacked"));
+        assert!(is_on(&app, s, &mem, "alignSelected") && !is_on(&app, s, &mem, "alignMargin"));
+        app.run("drawing.align", json!({"compose": cid, "relative": "margin"}));
+        assert!(is_on(&app, s, &mem, "alignMargin"));
+        assert_eq!(bevel_label("relaxedInset"), "Relaxed Inset");
+    }
+
+    #[test]
+    fn effect_presets_are_checked_and_a_group_shows_its_drawings_effects() {
+        let (mut app, cid) = app_with(mailcraft_model::Doc::from_plain_text("x"));
+        let s = Surface::Compose(cid);
+        let checked = |app: &App, src: &str| -> Vec<String> {
+            dyn_items(app, s, src).into_iter().filter(|d| d.on).map(|d| d.label).collect()
+        };
+        let a = app.run("insert.shape", json!({"compose": cid, "kind": "rectangle", "x": 0, "y": 0}));
+        let a = a.and_then(|r| r["drawing"].as_u64()).unwrap();
+        assert!(checked(&app, "fx:presets").is_empty());
+        app.run("drawing.effect", json!({"compose": cid, "preset": 4}));
+        assert_eq!(checked(&app, "fx:presets"), ["Preset 4"], "the glow takes the shape's colour");
+        app.run("drawing.effect", json!({"compose": cid, "shadow": "outerTop"}));
+        assert!(checked(&app, "fx:presets").is_empty(), "a changed preset is no longer that preset");
+        app.run("drawing.effect", json!({"compose": cid, "preset": 1}));
+        // A group: the galleries show what its drawings have.
+        let b = app.run("insert.shape", json!({"compose": cid, "kind": "oval", "x": 200, "y": 0}));
+        let b = b.and_then(|r| r["drawing"].as_u64()).unwrap();
+        app.run("drawing.select", json!({"compose": cid, "ids": [a, b]}));
+        app.run("drawing.effect", json!({"compose": cid, "preset": 1}));
+        app.run("drawing.group", json!({"compose": cid}));
+        let c = &app.s.composes[&cid];
+        let g = c.selected_drawing.unwrap();
+        let kind = mailcraft_engine::cmd::drawing::find(&c.body.drawings, g).unwrap().kind;
+        assert_eq!(kind, mailcraft_model::rich::DrawingKind::Group);
+        assert_eq!(checked(&app, "fx:presets"), ["Preset 1"]);
+        assert_eq!(checked(&app, "fx:shadows"), ["Outer: Down and Right"]);
     }
 }

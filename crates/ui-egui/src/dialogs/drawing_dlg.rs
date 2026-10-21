@@ -2,7 +2,7 @@
 //! categories and search), Insert Chart (chart types and a data sheet, with a preview; also edits a chart
 //! in the body), SmartArt (layout gallery and text pane, with a preview; also edits a graphic in the body),
 //! 3D Model Views (turning a model picture), Object (as an icon, as text, or linked), and for a drawing
-//! object Alt Text and Size and Position. Every action goes through `app.run`; wording is our own.
+//! object Alt Text and Format Shape (`format_shape`). Every action goes through `app.run`; wording is our own.
 
 use egui::{Color32, Context, Sense, Ui, Vec2, vec2};
 use serde_json::{Value, json};
@@ -12,6 +12,8 @@ use super::compose_dlg::cmd;
 use crate::App;
 use mailcraft_engine::cmd::insert::{chart, icons, smartart};
 
+mod format_shape;
+
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     let out = match d.name {
         "icons" => insert_icons(ctx, app, d),
@@ -20,7 +22,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "model3dView" => model_view(ctx, app, d),
         "insertObject" => object(ctx, app, d),
         "drawingAltText" => alt_text(ctx, app, d),
-        "formatShape" => format_shape(ctx, app, d),
+        "formatShape" => format_shape::format_shape(ctx, app, d),
         _ => return None,
     };
     if !out.keeps() {
@@ -697,105 +699,6 @@ fn alt_text(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 match ok_cancel_plain(ui, app, "OK", true) {
                     Some(true) => {
                         match cmd(app, "drawing.altText", json!({"compose": cid, "id": id, "alt": st.alt})) {
-                            Ok(_) => Out::Close,
-                            Err(e) => {
-                                st.error = e;
-                                Out::Keep
-                            }
-                        }
-                    }
-                    Some(false) => Out::Close,
-                    None => Out::Keep,
-                }
-            })
-        },
-    )
-}
-
-#[derive(Clone)]
-struct FormatState {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    rotation: f32,
-    outline: f32,
-    behind: bool,
-    lock_ratio: bool,
-    alt: String,
-    error: String,
-}
-
-/// Size and Position (Format Shape): position, size, rotation, outline weight, in front of / behind the
-/// text, and alt text, applied as one change.
-fn format_shape(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let cid = compose_of(d);
-    let id = d.u64("id");
-    let f = |k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
-    let init = FormatState {
-        x: f("x"),
-        y: f("y"),
-        w: f("w"),
-        h: f("h"),
-        rotation: f("rotation"),
-        outline: f("outlineWidth"),
-        behind: d.bool("behindText"),
-        lock_ratio: d.str("kind") == "wordArt",
-        alt: d.str("alt"),
-        error: String::new(),
-    };
-    with_state(
-        ctx,
-        app,
-        d.uid,
-        move |_: &App| init,
-        |st, app| {
-            window(ctx, app, d, "Size and Position", 400.0, |ui, app| {
-                heading(ui, app, "Size");
-                let (ow, oh) = (st.w.max(1.0), st.h.max(1.0));
-                egui::Grid::new(("fmt-size", d.uid)).num_columns(2).show(ui, |ui| {
-                    ui.label("Height (px):");
-                    let hr = ui.add(egui::DragValue::new(&mut st.h).range(1.0..=1000.0));
-                    ui.end_row();
-                    ui.label("Width (px):");
-                    let wr = ui.add(egui::DragValue::new(&mut st.w).range(1.0..=1000.0));
-                    ui.end_row();
-                    if st.lock_ratio {
-                        if hr.changed() {
-                            st.w = (ow * st.h / oh).clamp(1.0, 1000.0);
-                        } else if wr.changed() {
-                            st.h = (oh * st.w / ow).clamp(1.0, 1000.0);
-                        }
-                    }
-                    ui.label("Rotation (°):");
-                    ui.add(egui::DragValue::new(&mut st.rotation).range(-360.0..=360.0));
-                    ui.end_row();
-                });
-                ui.checkbox(&mut st.lock_ratio, "Keep the proportions");
-                heading(ui, app, "Position (from the top-left of the message text)");
-                egui::Grid::new(("fmt-pos", d.uid)).num_columns(2).show(ui, |ui| {
-                    ui.label("Across (px):");
-                    ui.add(egui::DragValue::new(&mut st.x).range(-1000.0..=100_000.0));
-                    ui.end_row();
-                    ui.label("Down (px):");
-                    ui.add(egui::DragValue::new(&mut st.y).range(-1000.0..=100_000.0));
-                    ui.end_row();
-                });
-                ui.checkbox(&mut st.behind, "Behind the text");
-                heading(ui, app, "Line and alt text");
-                ui.horizontal(|ui| {
-                    ui.label("Outline weight (px):");
-                    ui.add(egui::DragValue::new(&mut st.outline).range(0.0..=24.0).speed(0.25));
-                });
-                super::common::field(ui, "Alt text:", &mut st.alt, 260.0);
-                if !st.error.is_empty() {
-                    ui.colored_label(app.theme.danger, &st.error);
-                }
-                match super::common::ok_cancel(ui, app, true) {
-                    Some(true) => {
-                        let p = json!({"compose": cid, "id": id, "x": st.x, "y": st.y, "w": st.w, "h": st.h,
-                        "rotation": st.rotation, "outlineWidth": st.outline, "behindText": st.behind, "alt": st.alt});
-                        match cmd(app, "drawing.format", p) {
                             Ok(_) => Out::Close,
                             Err(e) => {
                                 st.error = e;

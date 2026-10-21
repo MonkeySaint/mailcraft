@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 
 mod anchors;
+mod drawings;
+pub use drawings::{placeholder_ids, remove_placeholders, replace_src, repoint_placeholders, resize_src};
 mod find;
 mod sort;
 pub use find::{
@@ -506,17 +508,32 @@ pub struct ComposeState {
     pub preview_key: Option<String>,
 
     // --- floating drawing objects (`cmd::drawing`) ---
-    /// The selected drawing object of the body (its [`mailcraft_model::Drawing::id`]).
+    /// The selected drawing object of the body (its [`mailcraft_model::Drawing::id`]); with more than one
+    /// selected, the one picked last (the others are in `also_selected`).
     pub selected_drawing: Option<u32>,
-    /// Names given in the Selection pane: (object source, name), see `format.selectionPane` `rename`.
+    /// The other selected drawings (Shift- or Ctrl-click, a drag around them, the Selection pane).
+    #[serde(skip)]
+    pub also_selected: Vec<u32>,
+    /// Names given in the Selection pane to pictures in the text: (object source, name), see
+    /// `format.selectionPane` `rename` (a drawing keeps its own name).
     pub object_names: Vec<(String, String)>,
     /// The armed drawing tool: the next drag in the body draws it (`shape:<name>`, `textBox`, `canvas`,
-    /// `scribble`, `tablePencil`, `tableEraser`).
+    /// `scribble`, `freeform`, `tablePencil`, `tableEraser`, `link:<id>` for Create Text Box Link).
     #[serde(skip)]
     pub draw_tool: Option<String>,
     /// Width of the body's text area as last shown (px at 100 %), for placing and aligning drawings.
     #[serde(skip)]
     pub view_width: Option<f32>,
+    /// Align › Align to Margin: alignment is to the margins even with several drawings selected (else
+    /// several drawings align to each other).
+    #[serde(skip)]
+    pub align_to_margin: bool,
+    /// The drawing whose points are being edited (Edit Points).
+    #[serde(skip)]
+    pub edit_points: Option<u32>,
+    /// The members of the group last ungrouped (Regroup).
+    #[serde(skip)]
+    pub last_ungrouped: Vec<u32>,
 }
 
 /// Edits that share one undo step while they follow each other at the caret (typing a word, holding
@@ -734,6 +751,7 @@ impl ComposeState {
 
     /// Records an editor undo step (call before changing the body).
     pub fn checkpoint(&mut self) {
+        self.sync_inline_drawings();
         self.sync_bookmarks();
         self.sync_list_formats();
         self.mark_edited();
@@ -761,6 +779,7 @@ impl ComposeState {
         let before = self.snapshot();
         let dirty = self.dirty;
         f(self);
+        self.sync_inline_drawings();
         self.sync_bookmarks();
         if self.body == before.body {
             self.dirty = dirty;
@@ -1704,7 +1723,9 @@ impl ComposeState {
                 _ => Block::Rule,
             });
         }
-        Doc { blocks, base: self.body.base.clone(), background: None, drawings: Vec::new() }
+        let mut frag = Doc { blocks, base: self.body.base.clone(), background: None, drawings: Vec::new() };
+        frag.drawings = self.fragment_drawings(&frag);
+        frag
     }
 
     /// Pastes a document fragment at the caret.
@@ -1714,6 +1735,16 @@ impl ComposeState {
             self.insert_text(&frag.to_plain_text());
             return;
         }
+        // In Line with Text drawings come along with their placeholders, under new ids.
+        let adopted;
+        let frag = if frag.drawings.is_empty() {
+            frag
+        } else {
+            let mut f = frag.clone();
+            self.adopt_fragment_drawings(&mut f);
+            adopted = f;
+            &adopted
+        };
         let single = match frag.blocks.as_slice() {
             [Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. }] => Some(inlines),
             _ => None,

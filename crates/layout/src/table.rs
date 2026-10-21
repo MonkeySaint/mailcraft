@@ -217,7 +217,14 @@ pub(crate) fn layout_table(
         let mut tmp = Out::default();
         path.push(p.ri);
         path.push(p.ci);
-        let inner = Frame { x: 0.0, y: 0.0, w: inner_w, depth: frame.depth.saturating_add(1), list_depth: 0 };
+        let inner = Frame {
+            x: 0.0,
+            y: 0.0,
+            w: inner_w,
+            depth: frame.depth.saturating_add(1),
+            list_depth: 0,
+            floats: false,
+        };
         let h = layout_blocks(ctx, &p.cell.blocks, ts, path, inner, &mut tmp);
         path.pop();
         path.pop();

@@ -362,18 +362,57 @@ fn equation_texture(ctx: &Context, text: &str) -> Option<egui::TextureHandle> {
     tex
 }
 
-/// Insert New Equation: the equation typed in linear form with a live two-dimensional preview, the
-/// built-in equations to start from, and a short guide to the notation.
+/// Inserts `piece` into `text` at the caret of text box `id` (the end when it has none) and puts the caret
+/// after it.
+fn insert_at_caret(ctx: &Context, id: egui::Id, text: &mut String, piece: &str) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::text_edit::TextEditState::load(ctx, id);
+    let chars = text.chars().count();
+    let at = state
+        .as_ref()
+        .and_then(|s| s.cursor.char_range())
+        .map_or(chars, |r| usize::from(r.primary.index).min(usize::from(r.secondary.index)))
+        .min(chars);
+    let byte = text.char_indices().nth(at).map_or(text.len(), |(b, _)| b);
+    text.insert_str(byte, piece);
+    if let Some(s) = state.as_mut() {
+        let after = at.saturating_add(piece.chars().count());
+        s.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(after))));
+    }
+    if let Some(s) = state {
+        s.store(ctx, id);
+    }
+}
+
+/// Insert New Equation, or Edit Equation for an equation in the body (`edit`, prefilled with its `text`):
+/// the equation typed in linear form with a live two-dimensional preview, the built-in equations to start
+/// from, the structures gallery (fractions, scripts, radicals, integrals, large operators, brackets,
+/// functions, accents, limits and operators) and a short guide to the notation.
 fn equation(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     use mailcraft_engine::cmd::insert::EQUATION_PRESETS;
     let cid = compose_of(d);
+    let edit = d.get("edit").and_then(serde_json::Value::as_str).map(str::to_owned).filter(|e| !e.is_empty());
+    let text = d.str("text");
+    // (group, [(name, formula)]) in the order the engine lists them.
+    let mut structures: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for s in d.arr("structures") {
+        let field = |k: &str| s.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        let (group, name, formula) = (field("group"), field("name"), field("formula"));
+        match structures.iter_mut().find(|(g, _)| *g == group) {
+            Some((_, items)) => items.push((name, formula)),
+            None => structures.push((group, vec![(name, formula)])),
+        }
+    }
+    let editing = edit.is_some();
+    let edit_id = egui::Id::new(("equation-text", d.uid));
     with_state(
         ctx,
         app,
         d.uid,
-        |_: &App| EquationState::default(),
+        move |_: &App| EquationState { text, error: String::new() },
         |st, app| {
-            window(ctx, app, d, "Equation", 560.0, |ui, app| {
+            let title = if editing { "Edit Equation" } else { "Equation" };
+            window(ctx, app, d, title, 560.0, |ui, app| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Start from:");
                     for (_, name, formula) in EQUATION_PRESETS {
@@ -382,8 +421,25 @@ fn equation(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         }
                     }
                 });
+                if !structures.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Structures:");
+                        for (group, items) in &structures {
+                            ui.menu_button(group, |ui| {
+                                for (name, formula) in items {
+                                    let r = ui.button(format!("{formula}   {name}"));
+                                    if r.clicked() {
+                                        insert_at_caret(ctx, edit_id, &mut st.text, formula);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
                 ui.add(
                     egui::TextEdit::singleline(&mut st.text)
+                        .id(edit_id)
                         .hint_text("Type an equation, e.g. x=(−b±√(b^2−4ac))/(2a)")
                         .desired_width(f32::INFINITY),
                 );
@@ -397,7 +453,7 @@ fn equation(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         ["π", "θ", "α", "β", "∞", "±", "×", "÷", "≤", "≥", "≠", "≈", "√", "∑", "∏", "∫", "→"]
                     {
                         if ui.small_button(sym).clicked() {
-                            st.text.push_str(sym);
+                            insert_at_caret(ctx, edit_id, &mut st.text, sym);
                         }
                     }
                 });
@@ -427,10 +483,14 @@ fn equation(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     if btn(ui, "Cancel") {
                         out = Out::Close;
                     }
-                    go = primary(ui, app, !st.text.trim().is_empty(), "Insert");
+                    go = primary(ui, app, !st.text.trim().is_empty(), if editing { "OK" } else { "Insert" });
                 });
                 if go {
-                    match cmd(app, "insert.equation", json!({"compose": cid, "text": st.text.trim()})) {
+                    let mut p = json!({"compose": cid, "text": st.text.trim()});
+                    if let (Some(e), Some(o)) = (&edit, p.as_object_mut()) {
+                        o.insert("edit".into(), json!(e));
+                    }
+                    match cmd(app, "insert.equation", p) {
                         Ok(_) => out = Out::Close,
                         Err(e) => st.error = e,
                     }

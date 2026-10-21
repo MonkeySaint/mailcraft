@@ -50,6 +50,8 @@ pub(crate) struct Ctx<'a> {
     pub link_color: Color,
     /// Lines that may still be laid out (see [`MAX_LINES`]).
     pub lines_left: Cell<usize>,
+    /// Bands blocked by drawings the text wraps around ([`crate::wrap`]).
+    pub floats: crate::wrap::Floats,
 }
 
 impl<'a> Ctx<'a> {
@@ -63,6 +65,7 @@ impl<'a> Ctx<'a> {
             default_color: Cell::new(opts.default_color),
             link_color: opts.link_color,
             lines_left: Cell::new(MAX_LINES),
+            floats: crate::wrap::Floats::default(),
         }
     }
     pub(crate) fn resolve(&self, ts: &TextStyle) -> RStyle {
@@ -85,6 +88,8 @@ pub(crate) struct Frame {
     pub w: f32,
     pub depth: usize,
     pub list_depth: usize,
+    /// Lines here wrap around floating drawings (page-level text; not table cells, laid out apart).
+    pub floats: bool,
 }
 
 impl Frame {
@@ -448,6 +453,9 @@ pub(crate) fn layout_lines(
     let first_frame = frame.shifted(first_dx);
     fit_images(flat, frame.w.min(first_frame.w));
     let gl = glyphs(ctx, flat);
+    if frame.floats && wrap && !ctx.floats.is_empty() {
+        return wrap_lines(ctx, flat, &gl, align, spacing, first_dx, path, frame, out, budget);
+    }
     let mut lines = break_lines_indented(flat, &gl, frame.w, first_frame.w, wrap, budget);
     // A final hard break opens an empty last line (where the caret goes after it). Preformatted text follows
     // HTML, where a trailing newline does not.
@@ -466,6 +474,159 @@ pub(crate) fn layout_lines(
         y += emit_line(flat, &gl, *lr, is_last, align, spacing, path, f, y, out, wrap);
     }
     y - frame.y
+}
+
+/// Ascent, ink height (ascent + descent) and full height of a line holding `slice`: the block's strut and
+/// every run on the line.
+fn line_metrics(flat: &Flat, slice: &[Glyph], spacing: Spacing) -> (f32, f32, f32) {
+    let (mut asc, mut desc, mut gap) = flat
+        .strut
+        .as_ref()
+        .map(|s| (s.metrics.ascent, s.metrics.descent, s.metrics.line_gap))
+        .unwrap_or((0.0, 0.0, 0.0));
+    for g in slice {
+        if let GKind::Image(ii) = g.kind {
+            if let Some(img) = flat.images.get(ii) {
+                asc = asc.max(img.h);
+            }
+        } else if let Some(s) = span_style(flat, g) {
+            asc = asc.max(s.metrics.ascent + s.shift);
+            desc = desc.max(s.metrics.descent - s.shift);
+            gap = gap.max(s.metrics.line_gap);
+        }
+    }
+    let content = asc + desc;
+    let total = match spacing {
+        // Tight spacing never shrinks the box below its ink so lines cannot overlap.
+        Spacing::Multiple(m) => ((content + gap) * m).max(content),
+        Spacing::Auto => content + gap,
+        // Exactly: that tall, but (as for tight multiples) never below the ink, so lines cannot overlap.
+        Spacing::Exactly(px) => px.max(content),
+        Spacing::AtLeast(px) => (content + gap).max(px),
+    };
+    (asc, content, total)
+}
+
+/// Most times one block's lines step down past drawings in the way (hostile layouts).
+const MAX_WRAP_STEPS: usize = 20_000;
+
+/// [`layout_lines`] around floating drawings: each line is broken for the widest free stretch of its band
+/// ([`crate::wrap::Floats::stretch`]); bands without room are skipped down past the drawing.
+fn wrap_lines(
+    ctx: &Ctx<'_>,
+    flat: &Flat,
+    gl: &[Glyph],
+    align: Align,
+    spacing: Spacing,
+    first_dx: f32,
+    path: &[usize],
+    frame: Frame,
+    out: &mut Out,
+    budget: usize,
+) -> f32 {
+    let n = gl.len();
+    let strut_h = line_metrics(flat, &[], spacing).2.max(1.0);
+    let hard_end = ends_with_hard_break(flat, gl);
+    let mut y = frame.y;
+    let mut start = 0usize;
+    let mut lines = 0usize;
+    let mut steps = 0usize;
+    let mut last_h = strut_h;
+    // The empty line after a final hard break is still to come.
+    let mut tail = false;
+    while lines < budget && steps < MAX_WRAP_STEPS {
+        steps += 1;
+        let base = if lines == 0 { frame.shifted(first_dx.max(0.0)) } else { frame };
+        let est = last_h.max(1.0);
+        let (sx, sw) = match ctx.floats.stretch(base.x, base.x + base.w, y, y + est) {
+            Ok(s) => s,
+            Err(next) => {
+                y = next.max(y + 1.0);
+                continue;
+            }
+        };
+        let mut seg = Frame { x: sx, w: sw, ..base };
+        if lines == 0 && first_dx < 0.0 {
+            seg = seg.shifted(first_dx);
+        }
+        let mut lr = if tail {
+            LineRange { start: n, end: n, hard: false }
+        } else {
+            break_one(flat, gl, start, seg.w)
+        };
+        let mut total = line_metrics(flat, gl.get(lr.start..lr.end).unwrap_or(&[]), spacing).2;
+        if total > est + 0.5 && !tail {
+            // A taller line than expected: it needs the room over its whole height.
+            match ctx.floats.stretch(base.x, base.x + base.w, y, y + total) {
+                Ok((x2, w2)) if w2 < seg.w - 0.5 => {
+                    seg = Frame { x: x2, w: w2, ..base };
+                    lr = break_one(flat, gl, start, seg.w);
+                    total = line_metrics(flat, gl.get(lr.start..lr.end).unwrap_or(&[]), spacing).2;
+                }
+                Ok(_) => {}
+                Err(next) => {
+                    last_h = total;
+                    y = next.max(y + 1.0);
+                    continue;
+                }
+            }
+        }
+        let ends_text = lr.end >= n;
+        if ends_text && !tail && hard_end {
+            lr.hard = true;
+        }
+        let is_last = tail || (ends_text && !hard_end);
+        y += emit_line(flat, gl, lr, is_last, align, spacing, path, seg, y, out, true);
+        lines += 1;
+        last_h = total.max(1.0);
+        if is_last {
+            break;
+        }
+        if ends_text {
+            tail = true;
+        }
+        // A line always takes at least one glyph, so the text runs out.
+        start = if lr.end > start { lr.end } else { start.saturating_add(1).min(n) };
+    }
+    ctx.lines_left.set(budget.saturating_sub(lines));
+    y - frame.y
+}
+
+/// The next line of `gl` from glyph `line_start` in `avail` px (greedy, as [`break_lines_indented`]).
+fn break_one(flat: &Flat, gl: &[Glyph], line_start: usize, avail: f32) -> LineRange {
+    use crate::inline::Brk;
+    let n = gl.len();
+    if line_start >= n {
+        return LineRange { start: n, end: n, hard: false };
+    }
+    let avail = if avail.is_finite() { avail.max(0.0) } else { f32::MAX };
+    let mut i = line_start;
+    let mut x = 0.0f32;
+    let mut last_break: Option<usize> = None;
+    while i < n {
+        let Some(g) = gl.get(i) else { break };
+        if i > line_start {
+            if g.brk == Brk::Mandatory {
+                return LineRange { start: line_start, end: i, hard: true };
+            }
+            if g.brk == Brk::Allowed {
+                last_break = Some(i);
+            }
+        }
+        let w = advance(flat, g, x);
+        if g.is_space() {
+            x += w;
+            i += 1;
+            continue;
+        }
+        if x + w > avail && i > line_start {
+            let end = last_break.filter(|&b| b > line_start).unwrap_or(i);
+            return LineRange { start: line_start, end, hard: false };
+        }
+        x += w;
+        i += 1;
+    }
+    LineRange { start: line_start, end: n, hard: false }
 }
 
 /// Whether the block text ends with a mandatory line break character (UAX #14 BK, CR, LF, NL).
@@ -495,32 +656,7 @@ fn emit_line(
     wrap: bool,
 ) -> f32 {
     let slice: &[Glyph] = gl.get(lr.start..lr.end).unwrap_or(&[]);
-    // Vertical metrics: strut + every run on the line.
-    let (mut asc, mut desc, mut gap) = flat
-        .strut
-        .as_ref()
-        .map(|s| (s.metrics.ascent, s.metrics.descent, s.metrics.line_gap))
-        .unwrap_or((0.0, 0.0, 0.0));
-    for g in slice {
-        if let GKind::Image(ii) = g.kind {
-            if let Some(img) = flat.images.get(ii) {
-                asc = asc.max(img.h);
-            }
-        } else if let Some(s) = span_style(flat, g) {
-            asc = asc.max(s.metrics.ascent + s.shift);
-            desc = desc.max(s.metrics.descent - s.shift);
-            gap = gap.max(s.metrics.line_gap);
-        }
-    }
-    let content = asc + desc;
-    let total = match spacing {
-        // Tight spacing never shrinks the box below its ink so lines cannot overlap.
-        Spacing::Multiple(m) => ((content + gap) * m).max(content),
-        Spacing::Auto => content + gap,
-        // Exactly: that tall, but (as for tight multiples) never below the ink, so lines cannot overlap.
-        Spacing::Exactly(px) => px.max(content),
-        Spacing::AtLeast(px) => (content + gap).max(px),
-    };
+    let (asc, content, total) = line_metrics(flat, slice, spacing);
     let baseline = top + (total - content) / 2.0 + asc;
 
     // Natural positions.

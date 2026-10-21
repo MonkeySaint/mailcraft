@@ -611,21 +611,41 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
     };
     let objects = mailcraft_engine::cmd::format::pane_objects(c);
     let sel = c.selection.clone();
+    let selected_drawings = c.selected_drawings();
     let sel_drawing = c.selected_drawing;
     let ctx = ui.ctx().clone();
     let mut hidden = hidden_objects(&ctx, cid);
     let before = hidden.clone();
-    let mut select: Option<usize> = None;
+    // (index, Ctrl held)
+    let mut select: Option<(usize, bool)> = None;
+    let mut reorder: Option<(usize, i64)> = None;
     let rename_id = Id::new(("mc-selection-rename", cid));
     let mut renaming: Option<(usize, String)> = ctx.data(|d| d.get_temp(rename_id));
     let mut run: Option<serde_json::Value> = None;
-    let count = objects.len();
+    let current = objects.iter().position(|o| o.drawing.is_some() && o.drawing == sel_drawing);
     ui.horizontal(|ui| {
         if ui.add_enabled(!objects.is_empty(), egui::Button::new("Show All")).clicked() {
             hidden.clear();
         }
         if ui.add_enabled(!objects.is_empty(), egui::Button::new("Hide All")).clicked() {
             hidden = objects.iter().map(|o| o.src.clone()).collect();
+        }
+        // Reorder: moves the selected drawing one step up (in front) or down (behind) the list.
+        let up =
+            ui.add_enabled(current.is_some(), egui::Button::new("▲").small()).on_hover_text("Bring Forward");
+        up.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Bring Forward"));
+        if up.clicked()
+            && let Some(i) = current
+        {
+            reorder = Some((i, 1));
+        }
+        let down =
+            ui.add_enabled(current.is_some(), egui::Button::new("▼").small()).on_hover_text("Send Backward");
+        down.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Send Backward"));
+        if down.clicked()
+            && let Some(i) = current
+        {
+            reorder = Some((i, -1));
         }
     });
     ui.add_space(4.0);
@@ -637,7 +657,7 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
         |ui| {
             for (i, o) in objects.iter().enumerate() {
                 let selected = match o.drawing {
-                    Some(id) => sel_drawing == Some(id),
+                    Some(id) => selected_drawings.contains(&id),
                     None => {
                         sel_drawing.is_none()
                             && sel.start() == &o.at
@@ -660,10 +680,12 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
                             hidden.push(o.src.clone());
                         }
                     }
+                    // Double-click (or Rename on the menu) to rename; Enter keeps it, Escape cancels, and an
+                    // empty name gives the generated one back.
                     if let Some((at, name)) = renaming.as_mut()
                         && *at == i
                     {
-                        let r = ui.add(egui::TextEdit::singleline(name).desired_width(120.0));
+                        let r = ui.add(egui::TextEdit::singleline(name).desired_width(140.0));
                         r.widget_info(|| {
                             egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Object name")
                         });
@@ -680,11 +702,11 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
                     let text =
                         if is_hidden { RichText::new(&o.name).italics() } else { RichText::new(&o.name) };
                     let r = ui.add(egui::Button::selectable(selected, text));
-                    if r.clicked() {
-                        select = Some(i);
-                    }
                     if r.double_clicked() {
                         renaming = Some((i, o.name.clone()));
+                    } else if r.clicked() {
+                        let add = ui.input(|inp| inp.modifiers.command || inp.modifiers.shift);
+                        select = Some((i, add && o.drawing.is_some()));
                     }
                     r.context_menu(|ui| {
                         if ui.button("Rename").clicked() {
@@ -692,29 +714,6 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
                             ui.close();
                         }
                     });
-                    // Bring Forward / Send Backward (drawings; pictures sit in the text).
-                    if o.drawing.is_some() {
-                        let up = ui.add_enabled(i > 0, egui::Button::new("\u{25B2}").small());
-                        let up_label = format!("Bring {} forward", o.name);
-                        up.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::WidgetType::Button, i > 0, up_label.clone())
-                        });
-                        if up.on_hover_text("Bring Forward").clicked() {
-                            run = Some(json!({"compose": cid, "move": i, "dir": "forward"}));
-                        }
-                        let down = ui.add_enabled(i + 1 < count, egui::Button::new("\u{25BC}").small());
-                        let down_label = format!("Send {} backward", o.name);
-                        down.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                i + 1 < count,
-                                down_label.clone(),
-                            )
-                        });
-                        if down.on_hover_text("Send Backward").clicked() {
-                            run = Some(json!({"compose": cid, "move": i, "dir": "backward"}));
-                        }
-                    }
                 });
             }
         },
@@ -732,8 +731,16 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
         set_hidden(&ctx, cid, hidden);
         ctx.request_repaint();
     }
-    if let Some(i) = select {
-        app.run("format.selectionPane", json!({"compose": cid, "select": i}));
+    if let Some((i, by)) = reorder {
+        app.run("format.selectionPane", json!({"compose": cid, "reorder": i, "by": by}));
+    }
+    if let Some((i, add)) = select {
+        let p = if add {
+            json!({"compose": cid, "select": i, "add": true})
+        } else {
+            json!({"compose": cid, "select": i})
+        };
+        app.run("format.selectionPane", p);
         ctx.memory_mut(|m| m.request_focus(super::editor_id(cid)));
     }
 }

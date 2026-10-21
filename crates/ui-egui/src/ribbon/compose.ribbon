@@ -823,13 +823,13 @@ tab Shape Format | JD
 group Insert Shapes | ZI
 drop L | Shapes | new-items | | | SH | menu=shapes
 split S | Text Box | note | insert.textBox | {"preset":"draw"} | TX | menu=drawTextBox
-drop S | Edit Shape | new-items | | | E | menu=changeShape
-group Shape Styles | ZS | launch=drawing.format
+drop S | Edit Shape | new-items | | | E | menu=editShape
+group Shape Styles | ZS | launch=drawing.format{"page":"fill"}
 drop L | Shape Styles | favorites | | | SS | menu=shapeQuickStyles
 drop S | Shape Fill | highlight | | | SF | menu=shapeFill
 drop S | Shape Outline | font-color | | | SO | menu=shapeOutline
 drop S | Shape Effects | favorites | | | SE | menu=shapeEffects
-group WordArt Styles | ZW
+group WordArt Styles | ZW | launch=drawing.format{"page":"effects"}
 drop L | Quick Styles | font-color | | | Q | menu=wordArtStyles
 drop S | Text Fill | font-color | | | TI | menu=textFill
 drop S | Text Outline | font-color | | | TO | menu=textOutline
@@ -838,18 +838,21 @@ group Text | ZT
 drop S | Text Direction | sort | | | TD | menu=textDirection
 drop S | Align Text | align-left | | | AT | menu=alignText
 drop S | Font | bold | | | FN | menu=drawingFont
+split S | Create Link | link | drawing.linkTextBox | | K | menu=textBoxLink
 group Accessibility | ZA
 button L | Alt Text | info | drawing.altText | | AA
 group Arrange | ZR
+drop S | Wrap Text | sort | | | TW | menu=wrapText
 split S | Bring Forward | chevron-up | drawing.arrange | {"action":"bringForward"} | AF | menu=bringForward
 split S | Send Backward | chevron-down | drawing.arrange | {"action":"sendBackward"} | AE | menu=sendBackward
 button S | Selection Pane | sort | format.selectionPane | | AP
 drop S | Align | align-center | | | AL | menu=alignObjects
+drop S | Group | new-items | | | G | menu=groupObjects
 drop S | Rotate | redo | | | AY | menu=rotate
 button S | Delete | delete | drawing.delete | | D
-group Size | ZZ | launch=drawing.format
-combo S | Height | | | | H | menu=drawHeights w=70 on=value:drawH
-combo S | Width | | | | W | menu=drawWidths w=70 on=value:drawW
+group Size | ZZ | launch=drawing.format{"page":"size"}
+combo S | Height | | drawing.size | {"h":"$value"} | H | menu=drawHeights w=70 on=value:drawH
+combo S | Width | | drawing.size | {"w":"$value"} | W | menu=drawWidths w=70 on=value:drawW
 
 menu shapesLines
 dyn | shapes:Lines | insert.shape | {"kind":"$name","draw":true}
@@ -874,6 +877,10 @@ dyn | shapes:Stars and Banners | insert.shape | {"kind":"$name","draw":true}
 
 menu shapesCallouts
 dyn | shapes:Callouts | insert.shape | {"kind":"$name","draw":true}
+
+menu editShape
+sub | Change Shape | new-items | changeShape | | N
+item | Edit Points | new-items | drawing.editPoints | | E | on=editPoints
 
 menu changeShape
 sub | Rectangles | table | changeRectangles | | R
@@ -956,6 +963,7 @@ dyn | themeColors | drawing.fill | {"theme":"$theme","tint":"$tint"}
 sep
 item | No Fill | close | drawing.fill | {"color":null} | N
 item | More Fill Colors... | highlight | drawing.fill | {"custom":true} | M
+item | Picture... | picture | drawing.format | {"page":"fill"} | P
 sub | Gradient | highlight | shapeGradients | | G
 
 menu shapeGradients
@@ -966,6 +974,22 @@ item | Light at the Bottom | chevron-up | drawing.fill | {"gradient":"up"} | B
 item | Light at the Left | chevron-right | drawing.fill | {"gradient":"right"} | L
 item | Light at the Right | chevron-left | drawing.fill | {"gradient":"left"} | R
 item | Light in the Middle | favorites | drawing.fill | {"gradient":"center"} | M
+item | Light at the Top Left | chevron-down | drawing.fill | {"gradient":"downRight"} |
+item | Light at the Top Right | chevron-down | drawing.fill | {"gradient":"downLeft"} |
+item | Light at the Bottom Left | chevron-up | drawing.fill | {"gradient":"upRight"} |
+item | Light at the Bottom Right | chevron-up | drawing.fill | {"gradient":"upLeft"} |
+sep
+item | Dark at the Bottom | chevron-down | drawing.fill | {"gradient":"dark:down"} | D
+item | Dark at the Top | chevron-up | drawing.fill | {"gradient":"dark:up"} |
+item | Dark at the Right | chevron-right | drawing.fill | {"gradient":"dark:right"} |
+item | Dark at the Left | chevron-left | drawing.fill | {"gradient":"dark:left"} |
+item | Dark at the Edges | favorites | drawing.fill | {"gradient":"dark:center"} |
+item | Dark at the Bottom Right | chevron-down | drawing.fill | {"gradient":"dark:downRight"} |
+item | Dark at the Bottom Left | chevron-down | drawing.fill | {"gradient":"dark:downLeft"} |
+item | Dark at the Top Right | chevron-up | drawing.fill | {"gradient":"dark:upRight"} |
+item | Dark at the Top Left | chevron-up | drawing.fill | {"gradient":"dark:upLeft"} |
+sep
+item | More Gradients... | settings | drawing.fill | {"moreGradients":true} | O
 
 menu shapeOutline
 dyn | themeColors | drawing.outline | {"theme":"$theme","tint":"$tint"}
@@ -973,6 +997,18 @@ sep
 item | No Outline | close | drawing.outline | {"color":null} | N
 item | More Outline Colors... | font-color | drawing.outline | {"custom":true} | M
 sub | Weight | minus | outlineWeights | | W
+sub | Dashes | minus | outlineDashes | | S
+item | More Lines... | settings | drawing.format | {"page":"fill"} | L
+
+menu outlineDashes
+item | Solid | minus | drawing.outline | {"dash":"solid"} |
+item | Round Dot | minus | drawing.outline | {"dash":"roundDot"} |
+item | Square Dot | minus | drawing.outline | {"dash":"squareDot"} |
+item | Dash | minus | drawing.outline | {"dash":"dash"} |
+item | Dash Dot | minus | drawing.outline | {"dash":"dashDot"} |
+item | Long Dash | minus | drawing.outline | {"dash":"longDash"} |
+item | Long Dash Dot | minus | drawing.outline | {"dash":"longDashDot"} |
+item | Long Dash Dot Dot | minus | drawing.outline | {"dash":"longDashDotDot"} |
 
 menu outlineWeights
 item | 1/2 px | minus | drawing.outline | {"weight":0.5} |
@@ -987,11 +1023,56 @@ menu shapeEffects
 item | Theme Effect | favorites | drawing.effect | {"effect":""} | T
 item | No Effect | close | drawing.effect | {"effect":"none"} | N
 sep
-item | Shadow | favorites | drawing.effect | {"effect":"shadow"} | S
-item | Reflection | favorites | drawing.effect | {"effect":"reflection"} | R
-item | Glow | favorites | drawing.effect | {"effect":"glow"} | G
-item | Soft Edges | favorites | drawing.effect | {"effect":"softEdges"} | E
-item | Bevel | favorites | drawing.effect | {"effect":"bevel"} | B
+sub | Preset | favorites | effectPresets | | P
+sub | Shadow | favorites | effectShadows | | S
+sub | Reflection | favorites | effectReflections | | R
+sub | Glow | favorites | effectGlows | | G
+sub | Soft Edges | favorites | effectSoftEdges | | E
+sub | Bevel | favorites | effectBevels | | B
+sub | 3-D Rotation | redo | effectRotations | | D
+
+menu effectPresets
+item | No Presets | close | drawing.effect | {"preset":0} | N
+dyn | fx:presets | drawing.effect | {"preset":"$id"}
+sep
+item | 3-D Options... | settings | drawing.format | {"page":"effects"} | O
+
+menu effectShadows
+item | No Shadow | close | drawing.effect | {"shadow":null} | N
+dyn | fx:shadows | drawing.effect | {"shadow":"$name"}
+sep
+item | Shadow Options... | settings | drawing.format | {"page":"effects"} | O
+
+menu effectReflections
+item | No Reflection | close | drawing.effect | {"reflection":null} | N
+dyn | fx:reflections | drawing.effect | {"reflection":"$name"}
+sep
+item | Reflection Options... | settings | drawing.format | {"page":"effects"} | O
+
+menu effectGlows
+item | No Glow | close | drawing.effect | {"glow":null} | N
+dyn | fx:glows | drawing.effect | {"glow":{"theme":"$theme","size":"$size"}}
+sep
+item | More Glow Colors... | font-color | drawing.format | {"page":"effects"} | M
+item | Glow Options... | settings | drawing.format | {"page":"effects"} | O
+
+menu effectSoftEdges
+item | No Soft Edges | close | drawing.effect | {"softEdges":0} | N
+dyn | fx:softEdges | drawing.effect | {"softEdges":"$size"}
+sep
+item | Soft Edges Options... | settings | drawing.format | {"page":"effects"} | O
+
+menu effectBevels
+item | No Bevel | close | drawing.effect | {"bevel":null} | N
+dyn | fx:bevels | drawing.effect | {"bevel":"$name"}
+sep
+item | 3-D Options... | settings | drawing.format | {"page":"effects"} | O
+
+menu effectRotations
+item | No Rotation | close | drawing.effect | {"rotation3d":null} | N
+dyn | fx:rotations | drawing.effect | {"rotation3d":"$name"}
+sep
+item | 3-D Rotation Options... | settings | drawing.format | {"page":"effects"} | O
 
 menu wordArtStyles
 item | Fill: Black, Text color 1; Shadow | font-color | drawing.wordArt | {"style":"Fill: Black, Text color 1; Shadow"} |
@@ -1024,19 +1105,67 @@ dyn | themeColors | drawing.textOutline | {"theme":"$theme","tint":"$tint"}
 sep
 item | No Outline | close | drawing.textOutline | {"color":null} | N
 item | More Outline Colors... | font-color | drawing.textOutline | {"custom":true} | M
+sub | Weight | minus | textOutlineWeights | | W
+sub | Dashes | minus | textOutlineDashes | | S
+
+menu textOutlineWeights
+item | 1/2 px | minus | drawing.textOutline | {"weight":0.5} |
+item | 1 px | minus | drawing.textOutline | {"weight":1} |
+item | 2 px | minus | drawing.textOutline | {"weight":2} |
+item | 3 px | minus | drawing.textOutline | {"weight":3} |
+item | 4 px | minus | drawing.textOutline | {"weight":4} |
+item | 6 px | minus | drawing.textOutline | {"weight":6} |
+
+menu textOutlineDashes
+item | Solid | minus | drawing.textOutline | {"dash":"solid"} |
+item | Round Dot | minus | drawing.textOutline | {"dash":"roundDot"} |
+item | Square Dot | minus | drawing.textOutline | {"dash":"squareDot"} |
+item | Dash | minus | drawing.textOutline | {"dash":"dash"} |
+item | Long Dash | minus | drawing.textOutline | {"dash":"longDash"} |
 
 menu textEffects
 item | No Effect | close | drawing.textEffect | {"effect":"none"} | N
 item | WordArt Style's Effects | font-color | drawing.textEffect | {"effect":""} | W
 sep
-item | Shadow | favorites | drawing.textEffect | {"effect":"shadow"} | S
-item | Reflection (WordArt) | favorites | drawing.textEffect | {"effect":"reflection"} | R
-item | Glow | favorites | drawing.textEffect | {"effect":"glow"} | G
-item | Bevel | favorites | drawing.textEffect | {"effect":"bevel"} | B
+sub | Shadow | favorites | textShadows | | S
+sub | Reflection (WordArt) | favorites | textReflections | | R
+sub | Glow | favorites | textGlows | | G
+sub | Bevel | favorites | textBevels | | B
+sub | 3-D Rotation | redo | textRotations | | D
+sub | Transform | font-color | textTransforms | | T
+
+menu textShadows
+item | No Shadow | close | drawing.textEffect | {"shadow":null} | N
+dyn | textFx:shadows | drawing.textEffect | {"shadow":"$name"}
+sep
+item | Shadow Options... | settings | drawing.format | {"page":"effects"} | O
+
+menu textReflections
+item | No Reflection | close | drawing.textEffect | {"reflection":null} | N
+dyn | textFx:reflections | drawing.textEffect | {"reflection":"$name"}
+
+menu textGlows
+item | No Glow | close | drawing.textEffect | {"glow":null} | N
+dyn | textFx:glows | drawing.textEffect | {"glow":{"theme":"$theme","size":"$size"}}
+sep
+item | Glow Options... | settings | drawing.format | {"page":"effects"} | O
+
+menu textBevels
+item | No Bevel | close | drawing.textEffect | {"bevel":null} | N
+dyn | textFx:bevels | drawing.textEffect | {"bevel":"$name"}
+
+menu textRotations
+item | No Rotation | close | drawing.textEffect | {"rotation3d":null} | N
+dyn | textFx:rotations | drawing.textEffect | {"rotation3d":"$name"}
+
+menu textTransforms
+dyn | textFx:warps | drawing.textEffect | {"transform":"$name"}
 
 menu textDirection
-item | Horizontal | align-left | drawing.textDirection | {"vertical":false} | H
-item | Top to Bottom | sort | drawing.textDirection | {"vertical":true} | V
+item | Horizontal | align-left | drawing.textDirection | {"direction":"horizontal"} | H | on=textDir:horizontal
+item | Top to Bottom | sort | drawing.textDirection | {"direction":"down"} | V | on=textDir:down
+item | Bottom to Top | sort | drawing.textDirection | {"direction":"up"} | U | on=textDir:up
+item | Stacked | sort | drawing.textDirection | {"direction":"stacked"} | S | on=textDir:stacked
 
 menu alignText
 item | Top | chevron-up | drawing.alignText | {"v":"top"} | T
@@ -1047,6 +1176,9 @@ item | Align Left | align-left | drawing.alignText | {"h":"left"} | L
 item | Center | align-center | drawing.alignText | {"h":"center"} | C
 item | Align Right | align-right | drawing.alignText | {"h":"right"} | R
 
+menu drawingFontNames
+dyn | fontNames | drawing.font | {"family":"$name"}
+
 menu drawingFont
 item | Bold | bold | drawing.font | {"bold":true} | B
 item | Not Bold | bold | drawing.font | {"bold":false} |
@@ -1055,6 +1187,7 @@ item | Not Italic | italic | drawing.font | {"italic":false} |
 item | Underline | underline | drawing.font | {"underline":true} | U
 item | No Underline | underline | drawing.font | {"underline":false} |
 sep
+sub | Font | font-color | drawingFontNames | | F
 item | 9 pt | | drawing.font | {"size":9} |
 item | 11 pt | | drawing.font | {"size":11} |
 item | 14 pt | | drawing.font | {"size":14} |
@@ -1079,13 +1212,41 @@ item | Align Right | align-right | drawing.align | {"kind":"right"} | R
 item | Align Top | chevron-up | drawing.align | {"kind":"top"} | T
 item | Align Middle | align-center | drawing.align | {"kind":"middle"} | M
 item | Align Bottom | chevron-down | drawing.align | {"kind":"bottom"} | B
+sep
+item | Distribute Horizontally | align-center | drawing.distribute | {"axis":"horizontal"} | H
+item | Distribute Vertically | align-center | drawing.distribute | {"axis":"vertical"} | V
+sep
+item | Align to Margin | view | drawing.align | {"relative":"margin"} | G | on=alignMargin
+item | Align Selected Objects | view | drawing.align | {"relative":"selected"} | O | on=alignSelected
 
 menu rotate
 item | Rotate Right 90° | redo | drawing.rotate | {"by":90} | R
 item | Rotate Left 90° | undo | drawing.rotate | {"by":-90} | L
+item | Flip Vertical | sort | drawing.rotate | {"flip":"vertical"} | V
+item | Flip Horizontal | sort | drawing.rotate | {"flip":"horizontal"} | H
 item | No Rotation | close | drawing.rotate | {"degrees":0} | N
 sep
-item | More Rotation Options... | settings | drawing.format | | M
+item | More Rotation Options... | settings | drawing.format | {"page":"size"} | M
+
+menu textBoxLink
+item | Create Text Box Link | link | drawing.linkTextBox | | C
+item | Break Link | close | drawing.linkTextBox | {"break":true} | B
+
+menu wrapText
+item | In Line with Text | align-left | drawing.wrapText | {"wrap":"inline"} | I | on=wrap:inline
+item | Square | table | drawing.wrapText | {"wrap":"square"} | S | on=wrap:square
+item | Tight | new-items | drawing.wrapText | {"wrap":"tight"} | T | on=wrap:tight
+item | Through | new-items | drawing.wrapText | {"wrap":"through"} | H | on=wrap:through
+item | Top and Bottom | justify | drawing.wrapText | {"wrap":"topBottom"} | O | on=wrap:topBottom
+item | Behind Text | chevron-down | drawing.wrapText | {"wrap":"behind"} | D | on=wrap:behind
+item | In Front of Text | chevron-up | drawing.wrapText | {"wrap":"front"} | N | on=wrap:front
+sep
+item | More Layout Options... | settings | drawing.format | {"page":"layout"} | L
+
+menu groupObjects
+item | Group | new-items | drawing.group | {"action":"group"} | G
+item | Ungroup | new-items | drawing.group | {"action":"ungroup"} | U
+item | Regroup | new-items | drawing.group | {"action":"regroup"} | E
 
 menu drawHeights
 item | 24 px | | drawing.size | {"h":24} |
