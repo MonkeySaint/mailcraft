@@ -19,6 +19,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "importExport" => import_export(ctx, app, d),
         "saveAs" => save_as(ctx, app, d),
         "saveAttachments" => save_attachments(ctx, app, d),
+        mailcraft_engine::cmd::calendar::SAVE_ITEM_FILE => save_item_file(ctx, app, d),
         _ => return None,
     })
 }
@@ -562,6 +563,58 @@ fn save_as(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         let kind = SAVE_TYPES.get(st.kind).map_or("eml", |t| t.0);
                         let p = json!({"path": st.path.trim(), "ids": ids, "type": kind});
                         if app.run("file.saveAs", p).is_some() {
+                            return Out::Close;
+                        }
+                        st.error = last_error(app);
+                    }
+                    Out::Keep
+                })
+            })
+        },
+    )
+}
+
+/// Save Attachment for one file of a calendar item (`calendar.saveAttachment` without a path): the file and
+/// a path box (Browse... where the platform has file dialogs).
+fn save_item_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let name = d.str("name");
+    let size = d.u64("size").unwrap_or(0);
+    let (id, index) = (d.u64("id"), d.u64("index"));
+    let suggested = if name.trim().is_empty() { "attachment".to_owned() } else { name.clone() };
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| PathState { path: format!("{}/{suggested}", home()), ..Default::default() },
+        |st, app| {
+            window(ctx, app, d, "Save Attachment", 480.0, |ui, app| {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+                    app.icons.paint(ui, r, "paperclip", app.theme.text_muted);
+                    ui.label(&suggested);
+                    ui.label(RichText::new(common::size_text(size)).color(app.theme.text_muted));
+                });
+                let l = ui.label("Save to:");
+                ui.horizontal(|ui| {
+                    let browse = common::browse_button(ui, app);
+                    ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(ui.available_width()))
+                        .labelled_by(l.id);
+                    if browse && let Some(p) = common::browse_save(app, "Save Attachment", &[], &st.path) {
+                        st.path = p;
+                    }
+                });
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                footer(ui, |ui| {
+                    if btn(ui, "Cancel") {
+                        return Out::Close;
+                    }
+                    let ready = id.is_some() && !st.path.trim().is_empty();
+                    if primary(ui, app, ready, "Save") {
+                        let p = json!({"id": id, "index": index, "name": name, "path": st.path.trim()});
+                        if app.run("calendar.saveAttachment", p).is_some() {
                             return Out::Close;
                         }
                         st.error = last_error(app);

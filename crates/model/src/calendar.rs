@@ -1,7 +1,42 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use crate::{DateTime, FolderId, ItemId};
+use crate::{DateTime, FolderId, Importance, ItemId, RemoteRef};
 use mailcraft_mime::Mailbox;
+
+/// A file attached to an appointment or meeting (the item window's Attach File): kept with the item and sent
+/// with its invitation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemAttachment {
+    pub filename: String,
+    /// MIME type ("application/pdf"); empty = unknown.
+    #[serde(default)]
+    pub mime_type: String,
+    /// The file's bytes (stored as base64 text). Shared, so copying an appointment (undo, item windows,
+    /// sync fingerprints) never copies its files.
+    #[serde(with = "shared_b64")]
+    pub data: Arc<[u8]>,
+}
+
+mod shared_b64 {
+    use std::sync::Arc;
+
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        crate::contact::b64::serialize(data, s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<[u8]>, D::Error> {
+        crate::contact::b64::deserialize(d).map(Arc::from)
+    }
+}
+
+/// Most files attached to one appointment.
+pub const MAX_ITEM_ATTACHMENTS: usize = 50;
+/// Most bytes of files attached to one appointment (all files together).
+pub const MAX_ITEM_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BusyStatus {
@@ -73,12 +108,39 @@ pub struct Appointment {
     /// recurrences expand in this zone's wall-clock time (DST-correct). `None` = the start's fixed offset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tz: Option<String>,
+    /// IANA zone of the end time when it differs from the start's (the window's Time Zones: a flight that
+    /// leaves in one zone and lands in another). `None` = the start's zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_tz: Option<String>,
+    /// Importance (Tags › High / Low Importance), sent with invitations.
+    #[serde(default, skip_serializing_if = "is_normal")]
+    pub importance: Importance,
+    /// The notes as formatted text (HTML, sanitised when shown); `body` keeps their plain text. `None` = the
+    /// notes are plain text only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
+    /// Files attached to the item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ItemAttachment>,
+    /// Its copy on a CalDAV server (RFC 4791) when the calendar synchronises with one. Held by the series (or
+    /// the first instance) of a UID: the server keeps a series and its exceptions as one resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteRef>,
+}
+
+fn is_normal(i: &Importance) -> bool {
+    *i == Importance::Normal
 }
 
 impl Appointment {
     /// The IANA zone the appointment's times were entered in, when it names one (trimmed, non-empty).
     pub fn zone(&self) -> Option<&str> {
         self.tz.as_deref().map(str::trim).filter(|z| !z.is_empty())
+    }
+
+    /// The IANA zone of the end time: its own when set, else the start's.
+    pub fn end_zone(&self) -> Option<&str> {
+        self.end_tz.as_deref().map(str::trim).filter(|z| !z.is_empty()).or_else(|| self.zone())
     }
 }
 

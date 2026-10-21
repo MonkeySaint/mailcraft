@@ -36,7 +36,11 @@ pub fn publication_ics(s: &Session, folder: FolderId, p: &Publication) -> Result
     let window = share_window(s, range, &Value::Null)?;
     let detail = if p.detail.is_empty() { "full" } else { p.detail.as_str() };
     share_detail(detail)?;
-    let appts = share_items(s, folder, window, detail, p.include_private);
+    let mut appts = share_items(s, folder, window, detail, p.include_private);
+    // A published calendar carries no attached files (anyone with the address reads it).
+    for a in &mut appts {
+        a.attachments.clear();
+    }
     let refs: Vec<&Appointment> = appts.iter().collect();
     let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
     let with_header = |text: String| -> String {

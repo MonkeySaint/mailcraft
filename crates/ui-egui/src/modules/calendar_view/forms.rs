@@ -125,6 +125,21 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
     }
     ed.attendees = required;
     ed.optional = people(p, "optional");
+    ed.resources = people(p, "resources");
+    let importance = text(p, "importance");
+    if !importance.is_empty() {
+        ed.importance = importance;
+    }
+    ed.body_html =
+        p.get("bodyHtml").and_then(Value::as_str).filter(|h| !h.trim().is_empty()).map(str::to_owned);
+    // A request in other time zones: its times are in them (the engine sends them so).
+    if !all_day && flag(p, "zonesShown") {
+        let start_zone = text(p, "timeZone");
+        let end_zone = text(p, "endTimeZone");
+        ed.zones_shown = true;
+        ed.tz_end = if end_zone.is_empty() { start_zone.clone() } else { end_zone };
+        ed.tz_start = start_zone;
+    }
     ed.meeting = name == MEETING_FORM || flag(p, "meeting");
     if flag(p, "recurring") {
         ed.recurrence_dlg = Some(RecurrenceDialog::new(

@@ -318,38 +318,70 @@ fn folder(s: &mut Session, p: &Value) -> CmdResult {
             "status": status,
         }));
     }
-    // Contacts and Tasks folders synchronise with the account's contacts and tasks server (CardDAV /
-    // CalDAV), not with the mail server.
+    // Contacts, Tasks and Calendar folders synchronise with the account's contacts, tasks and calendar
+    // server (CardDAV / CalDAV), not with the mail server. A published calendar also goes up to its
+    // publishing location with its publishing account's run.
     let pim_kind = folder_kind(s, f).and_then(crate::sync::pim::PimKind::of);
     if let Some(kind) = pim_kind {
-        let synced = crate::sync::pim::is_synced_folder(&s.mailbox, f)
-            && crate::sync::server_accounts(s).contains(&account);
-        let mut started = 0;
-        if synced && !off {
-            let plan = Plan { send: false, receive: true, folders: Some(vec![f]), user: true };
-            started = s.send_receive(&[account], plan).unwrap_or(0);
+        let servers = crate::sync::server_accounts(s);
+        let synced = crate::sync::pim::is_synced_folder(&s.mailbox, f) && servers.contains(&account);
+        let mut publishers: Vec<mailcraft_model::AccountId> = Vec::new();
+        if kind == crate::sync::pim::PimKind::Calendar {
+            let p = crate::cmd::calendar::props::read(&s.mailbox, f);
+            let accounts =
+                p.publication.iter().map(|x| x.account).chain(p.withdrawals.iter().map(|w| w.account));
+            for a in accounts {
+                if servers.contains(&a) && !publishers.contains(&a) && !(synced && a == account) {
+                    publishers.push(a);
+                }
+            }
         }
-        let status = if !synced {
+        let on_server = synced || !publishers.is_empty();
+        let mut started = 0usize;
+        if !off {
+            let plan = Plan { send: false, receive: true, folders: Some(vec![f]), user: true };
+            if synced {
+                started = started.saturating_add(s.send_receive(&[account], plan.clone()).unwrap_or(0));
+            }
+            if !publishers.is_empty() {
+                started = started.saturating_add(s.send_receive(&publishers, plan).unwrap_or(0));
+            }
+        }
+        let status = if !on_server {
             "local folder"
         } else if off {
             "offline"
         } else {
             "updating"
         };
-        if !synced {
-            s.notify(Notice::Info(format!(
-                "\"{name}\" is kept on this computer only. To keep {} on a server, set up a contacts and tasks \
-                 server (CardDAV / CalDAV) in Account Settings.",
-                kind.label()
-            )));
+        if !on_server {
+            let msg = match kind {
+                crate::sync::pim::PimKind::Calendar => format!(
+                    "\"{name}\" is kept on this computer only. To keep it on a server, turn on calendar \
+                     synchronisation with a CalDAV server in Account Settings, or publish the calendar online."
+                ),
+                other => format!(
+                    "\"{name}\" is kept on this computer only. To keep {} on a server, set up a contacts and \
+                     tasks server (CardDAV / CalDAV) in Account Settings.",
+                    other.label()
+                ),
+            };
+            s.notify(Notice::Info(msg));
         }
+        let server = if synced {
+            "dav"
+        } else if on_server {
+            "publish"
+        } else {
+            "none"
+        };
         return Ok(json!({
             "folder": f.0,
             "name": name,
             "started": started,
             "offline": off,
             "status": status,
-            "server": if synced { "dav" } else { "none" },
+            "server": server,
         }));
     }
     let remote = crate::sync::server_accounts(s).contains(&account);

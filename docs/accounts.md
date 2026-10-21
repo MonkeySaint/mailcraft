@@ -84,16 +84,21 @@ Every account belongs to **All Accounts** unless excluded; F9 and scheduled runs
 Each account can have its own send/receive interval. These options and the sync bookkeeping are kept in
 `account-options.json` next to the data file (it holds no secrets).
 
-## Contacts, tasks and published calendars
+## Contacts, tasks, calendars and published calendars
 
-An IMAP or JMAP account can also keep its **Contacts** and **Tasks** folders on a server: in Account
-Settings › Change › **Contacts, Tasks and Calendar Server**, enter the server's address (a CardDAV / CalDAV
-server, principal or collection URL; the account's password signs in, or a separate user name). Send/Receive
-All Folders and **Update Folder** on Contacts or Tasks then synchronise both ways (CardDAV, RFC 6352;
-CalDAV tasks, RFC 4791):
+An IMAP or JMAP account can also keep its **Contacts**, **Tasks** and **Calendar** folders on a server: in
+Account Settings › Change › **Contacts, Tasks and Calendar Server**, enter the server's address (a CardDAV /
+CalDAV server, principal or collection URL; the account's password signs in, or a separate user name), and
+tick what to keep there. Send/Receive All Folders and **Update Folder** on Contacts, Tasks or Calendar then
+synchronise both ways (CardDAV, RFC 6352; CalDAV tasks and events, RFC 4791):
 
-- the Contacts folder takes the server's first address book and the Tasks folder its first task list; more
-  address books and task lists get folders of their own below them;
+- the Contacts folder takes the server's first address book, the Tasks folder its first task list and the
+  Calendar its first calendar of events; more address books, task lists and calendars get folders of their
+  own below them;
+- a recurring series and its changed occurrences are one resource on the server (RECURRENCE-ID overrides);
+  editing one occurrence here uploads the series again, and a server change to one occurrence arrives as
+  that occurrence; a calendar collection that holds tasks too is shared by the Calendar and Tasks folders,
+  each taking its own kind of item;
 - an item changed here is uploaded with `If-Match`, a new one with `If-None-Match: *`, one deleted here is
   deleted there; changes and deletions made on the server arrive here; when both sides changed an item the
   copy changed here wins (a change made on the server during the run is never overwritten unseen);
@@ -105,6 +110,8 @@ CalDAV tasks, RFC 4791):
   uploading them again;
 - the account's password or token is only sent to the contacts server and the publishing location; an
   address a server answers with that points elsewhere is not followed.
+
+Update Folder on a calendar kept on this computer only says so, and how to keep it on a server.
 
 The same section takes a **publishing location**, a WebDAV collection. **Share Calendar** (one entry per
 calendar) can then publish a calendar there and write a sharing invitation with its `webcal://` address;

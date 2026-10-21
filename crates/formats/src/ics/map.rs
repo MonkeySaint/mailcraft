@@ -5,9 +5,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use mailcraft_mime::Mailbox;
-use mailcraft_model::calendar::{AttendeeRole, ResponseStatus};
+use mailcraft_model::calendar::{
+    AttendeeRole, ItemAttachment, MAX_ITEM_ATTACHMENT_BYTES, MAX_ITEM_ATTACHMENTS, ResponseStatus,
+};
 use mailcraft_model::{
-    Appointment, Attendee, BusyStatus, DateTime, Recurrence, Task, TaskPriority, TaskStatus,
+    Appointment, Attendee, BusyStatus, DateTime, Importance, Recurrence, Task, TaskPriority, TaskStatus,
 };
 
 use super::parse::Component;
@@ -255,7 +257,12 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
         TimeValue::Utc(u) => (*u, None),
         TimeValue::Local { secs, tzid } => (*secs, tzid.clone().filter(|t| ctx.knows_zone(t))),
     };
-    let end = if let Some((_, e)) = ctx.time(c, "DTEND") {
+    let dtend = ctx.time(c, "DTEND");
+    let end_tzid = match dtend.as_ref().map(|(tv, _)| tv) {
+        Some(TimeValue::Local { tzid: Some(t), .. }) if ctx.knows_zone(t) => Some(t.clone()),
+        _ => None,
+    };
+    let end = if let Some((_, e)) = dtend {
         e
     } else if let Some(d) = c.prop("DURATION").and_then(|p| value::parse_duration(&p.value)) {
         DateTime::from_unix(start.unix.saturating_add(d), start.offset_min)
@@ -298,6 +305,21 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
     let year = value::civil(start_local).0;
     let tz =
         if all_day { None } else { tzid.as_deref().and_then(|t| ctx.named_zone(t, year)).map(str::to_owned) };
+    // An end written in another zone than the start (Time Zones in the item window).
+    let end_tz = if all_day {
+        None
+    } else {
+        end_tzid
+            .as_deref()
+            .and_then(|t| ctx.named_zone(t, year))
+            .map(str::to_owned)
+            .filter(|e| Some(e) != tz.as_ref())
+    };
+    let importance = match c.text("PRIORITY").and_then(|p| p.trim().parse::<u8>().ok()) {
+        Some(1..=4) => Importance::High,
+        Some(6..=9) => Importance::Low,
+        _ => Importance::Normal,
+    };
     let appointment = Appointment {
         uid,
         // An override replaces one instance; it never carries its own rule.
@@ -316,7 +338,11 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
         categories: categories_of(c),
         private: class == "PRIVATE" || class == "CONFIDENTIAL",
         body: text_or_empty(c, "DESCRIPTION"),
+        body_html: html_description(c),
+        attachments: attachments_of(c),
+        importance,
         tz,
+        end_tz,
         ..Default::default()
     };
     Some(Event {
@@ -328,6 +354,51 @@ pub(crate) fn event_from(c: &Component, ctx: &Ctx<'_>) -> Option<Event> {
         recurrence_id,
         rdates: ctx.time_list(c, "RDATE"),
     })
+}
+
+/// Most bytes of formatted notes kept from one event.
+const MAX_HTML_NOTES: usize = 1024 * 1024;
+
+/// The formatted notes of an event: `X-ALT-DESC;FMTTYPE=text/html` ([MS-OXCICAL] section 2.1.3.1.1.20.3),
+/// or an RFC 9073 `STYLED-DESCRIPTION` with `FMTTYPE=text/html`.
+fn html_description(c: &Component) -> Option<String> {
+    let html = |name: &'static str| {
+        c.props_named(name)
+            .find(|p| p.param("FMTTYPE").is_some_and(|f| f.trim().eq_ignore_ascii_case("text/html")))
+    };
+    let p = html("X-ALT-DESC").or_else(|| html("STYLED-DESCRIPTION"))?;
+    let text = crate::text::unescape(&p.value);
+    (!text.trim().is_empty() && text.len() <= MAX_HTML_NOTES).then_some(text)
+}
+
+/// Files carried inline by an event (`ATTACH;VALUE=BINARY;ENCODING=BASE64`, RFC 5545 section 3.8.1.1), up to
+/// the per-item limits. Attachments by URI are not fetched.
+fn attachments_of(c: &Component) -> Vec<ItemAttachment> {
+    let mut out: Vec<ItemAttachment> = Vec::new();
+    let mut total = 0usize;
+    for p in c.props_named("ATTACH") {
+        if out.len() >= MAX_ITEM_ATTACHMENTS {
+            break;
+        }
+        let base64 = p.param("ENCODING").is_some_and(|e| e.trim().eq_ignore_ascii_case("BASE64"));
+        if !base64 {
+            continue;
+        }
+        let data = mailcraft_mime::transfer::decode_base64(p.value.as_bytes());
+        if data.is_empty() || total.saturating_add(data.len()) > MAX_ITEM_ATTACHMENT_BYTES {
+            continue;
+        }
+        total = total.saturating_add(data.len());
+        let name = ["X-FILENAME", "FILENAME", "X-APPLE-FILENAME"]
+            .iter()
+            .find_map(|n| p.param(n))
+            .map(|n| n.trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("attachment{}", out.len().saturating_add(1)));
+        let mime_type = p.param("FMTTYPE").map(|m| m.trim().to_ascii_lowercase()).unwrap_or_default();
+        out.push(ItemAttachment { filename: name, mime_type, data: data.into() });
+    }
+    out
 }
 
 /// Overridden instances (RECURRENCE-ID) become EXDATEs on their series.
@@ -516,6 +587,12 @@ pub(crate) struct EventOut<'a> {
     pub only_attendee: Option<(&'a Mailbox, ResponseStatus)>,
     pub no_alarm: bool,
     pub rsvp: bool,
+    /// Leave the attached files out (an invitation carries them as message attachments instead).
+    pub no_attachments: bool,
+    /// Stored on a CalDAV server, not sent: ORGANIZER and ATTENDEE carry SCHEDULE-AGENT=CLIENT (RFC 6638
+    /// section 7.1), so a server that schedules does not mail the attendees itself. MailCraft sends the
+    /// invitations, updates and replies.
+    pub schedule_client: bool,
 }
 
 pub(crate) fn event_component(
@@ -534,6 +611,13 @@ pub(crate) fn event_component(
         Some(z) => zoned_line(name, t, z, zones),
         None => time_line(name, t, all_day, off, zones),
     };
+    // An end in another zone (Time Zones in the item window) is written in that zone.
+    let end_named = match (a.all_day, a.end_tz.as_deref().map(str::trim).filter(|z| !z.is_empty())) {
+        (false, Some(z)) if Some(z) != a.zone() => {
+            builtin_name(z).and_then(builtin).map(|z| ZoneLookup::new(Cow::Owned(z)))
+        }
+        _ => None,
+    };
     let uid = if a.uid.trim().is_empty() {
         format!("{:016x}@mailcraft.local", uid_hash(a))
     } else {
@@ -546,13 +630,37 @@ pub(crate) fn event_component(
     }
     c.props.push(time_line("DTSTART", a.start, a.all_day, off, offsets));
     let end = if a.end.unix < a.start.unix { a.start } else { a.end };
-    c.props.push(time_line("DTEND", end, a.all_day, off, offsets));
+    match &end_named {
+        Some(z) => c.props.push(zoned_line("DTEND", end, z, offsets)),
+        None => c.props.push(time_line("DTEND", end, a.all_day, off, offsets)),
+    }
     c.props.push(line("SUMMARY", vec![], escape(&a.subject)));
     if !a.location.is_empty() {
         c.props.push(line("LOCATION", vec![], escape(&a.location)));
     }
     if !a.body.is_empty() {
         c.props.push(line("DESCRIPTION", vec![], escape(&a.body)));
+    }
+    if let Some(html) = a.body_html.as_deref().filter(|h| !h.trim().is_empty() && h.len() <= MAX_HTML_NOTES) {
+        c.props.push(line("X-ALT-DESC", vec![("FMTTYPE", "text/html".into())], escape(html)));
+    }
+    match a.importance {
+        Importance::High => c.props.push(line("PRIORITY", vec![], "1")),
+        Importance::Low => c.props.push(line("PRIORITY", vec![], "9")),
+        Importance::Normal => {}
+    }
+    if !o.no_attachments {
+        for f in a.attachments.iter().take(MAX_ITEM_ATTACHMENTS) {
+            let mut params = vec![
+                ("ENCODING", "BASE64".to_owned()),
+                ("VALUE", "BINARY".to_owned()),
+                ("X-FILENAME", no_breaks(&f.filename)),
+            ];
+            if !f.mime_type.trim().is_empty() {
+                params.insert(0, ("FMTTYPE", no_breaks(f.mime_type.trim())));
+            }
+            c.props.push(line("ATTACH", params, mailcraft_mime::transfer::encode_base64_flat(&f.data)));
+        }
     }
     if let Some(s) = o.status {
         c.props.push(line("STATUS", vec![], s));
@@ -570,8 +678,14 @@ pub(crate) fn event_component(
         BusyStatus::OutOfOffice => "OOF",
     };
     c.props.push(line("X-MICROSOFT-CDO-BUSYSTATUS", vec![], busy));
+    let client = |mut l: ContentLine| {
+        if o.schedule_client {
+            l.params.push(("SCHEDULE-AGENT".to_owned(), vec!["CLIENT".to_owned()]));
+        }
+        l
+    };
     if let Some(org) = &a.organizer {
-        c.props.push(line("ORGANIZER", cn(org), mailto(org)));
+        c.props.push(client(line("ORGANIZER", cn(org), mailto(org))));
     }
     match o.only_attendee {
         Some((who, response)) => {
@@ -581,11 +695,11 @@ pub(crate) fn event_component(
                 role: found.map(|f| f.role).unwrap_or_default(),
                 response,
             };
-            c.props.push(attendee_line(&att, false));
+            c.props.push(client(attendee_line(&att, false)));
         }
         None => {
             for att in &a.attendees {
-                c.props.push(attendee_line(att, o.rsvp));
+                c.props.push(client(attendee_line(att, o.rsvp)));
             }
         }
     }

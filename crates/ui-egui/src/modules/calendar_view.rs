@@ -573,6 +573,10 @@ pub(super) struct Occ {
     pub reminder: bool,
     /// In a read-only (internet) calendar.
     pub read_only: bool,
+    /// View Settings › Conditional Formatting: the text's font effects (the colour is in `base`).
+    pub bold: bool,
+    pub italic: bool,
+    pub strike: bool,
 }
 
 impl Occ {
@@ -640,7 +644,27 @@ fn preview_text(body: &str) -> String {
 /// Occurrences of appointments in `calendars` over days `[from, to)`, sorted by start. Items take their
 /// first category's colour, else their calendar's.
 pub(super) fn gather(app: &App, calendars: &BTreeSet<FolderId>, from: i64, to: i64) -> Vec<Occ> {
+    gather_in(app, calendars, from, to, None)
+}
+
+/// [`gather`] as view `view` shows the items: its View Settings filter leaves out the items it does not
+/// match, and its Conditional Formatting rules colour the items they match (a later rule's colour wins)
+/// and set their text's font effects.
+pub(super) fn gather_in(
+    app: &App,
+    calendars: &BTreeSet<FolderId>,
+    from: i64,
+    to: i64,
+    view: Option<&CalendarViewState>,
+) -> Vec<Occ> {
+    use mailcraft_model::view::{FilterText, ItemStyle, rule_style, rules_active, rules_need_body};
     let clock = cal_clock(app);
+    let now = app.s.now().unix;
+    let filter = view.map(|v| &v.filter).filter(|f| !f.is_empty());
+    let rules: &[mailcraft_model::view::ItemRule] = view.map_or(&[], |v| v.rules.as_slice());
+    // Each item's text is lowercased once, and only when the filter or a rule needs it.
+    let want_text = filter.is_some() || rules_active(rules);
+    let want_body = filter.is_some_and(|f| f.needs_body()) || rules_need_body(rules);
     let looks: BTreeMap<FolderId, (Color32, bool)> = calendars
         .iter()
         .map(|f| (*f, (calendar_color32(app, *f), props::is_read_only(&app.s.mailbox, *f))))
@@ -648,7 +672,22 @@ pub(super) fn gather(app: &App, calendars: &BTreeSet<FolderId>, from: i64, to: i
     let mut out = Vec::new();
     for a in app.s.mailbox.appointments.values() {
         let Some(&(cal_color, read_only)) = looks.get(&a.folder) else { continue };
-        let base = category_color(app, &a.categories).unwrap_or(cal_color);
+        let text = want_text.then(|| FilterText::new(&a.subject, &a.body, want_body));
+        if let (Some(f), Some(t)) = (filter, &text)
+            && !f.matches_text(t, &a.categories, a.start.unix, now)
+        {
+            continue;
+        }
+        let style = match &text {
+            Some(t) => rule_style(rules, |f| f.matches_text(t, &a.categories, a.start.unix, now)),
+            None => ItemStyle::default(),
+        };
+        let base = style
+            .color
+            .as_deref()
+            .and_then(hex_color)
+            .or_else(|| category_color(app, &a.categories))
+            .unwrap_or(cal_color);
         for (start, end, start_unix) in expand_on(a, &clock, from, to) {
             out.push(Occ {
                 id: a.id,
@@ -667,11 +706,46 @@ pub(super) fn gather(app: &App, calendars: &BTreeSet<FolderId>, from: i64, to: i
                 meeting: a.is_meeting,
                 reminder: a.reminder_min.is_some(),
                 read_only,
+                bold: style.bold,
+                italic: style.italic,
+                strike: style.strike,
             });
         }
     }
     out.sort_by_key(|o| (o.start, std::cmp::Reverse(o.end), o.id));
     out
+}
+
+/// An occurrence's text, truncated to `width`, with its Conditional Formatting font effects (bold is drawn
+/// twice, a little apart).
+fn paint_occ_text(
+    ui: &Ui,
+    pos: egui::Pos2,
+    text: &str,
+    o: &Occ,
+    font: FontId,
+    color: Color32,
+    width: f32,
+) -> Rect {
+    if !(o.bold || o.italic || o.strike) {
+        return paint_text_clipped(ui, pos, text, font, color, width);
+    }
+    let format = egui::TextFormat {
+        font_id: font,
+        color,
+        italics: o.italic,
+        strikethrough: if o.strike { Stroke::new(1.0, color) } else { Stroke::NONE },
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::single_section(text.to_owned(), format);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(4.0));
+    let galley = ui.painter().layout_job(job);
+    let rect = Rect::from_min_size(pos, galley.size());
+    if o.bold {
+        ui.painter().galley(pos2(pos.x + 0.6, pos.y), galley.clone(), color);
+    }
+    ui.painter().galley(pos, galley, color);
+    rect
 }
 
 /// Fill and bar colours of an occurrence block.
@@ -784,10 +858,11 @@ fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool, prev
         }
     }
     let w = inner.max.x - x;
-    let sub = paint_text_clipped(
+    let sub = paint_occ_text(
         ui,
         pos2(x, inner.min.y),
         &o.label(),
+        o,
         FontId::proportional(12.5),
         app.theme.text,
         w,
@@ -1463,7 +1538,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
             if strong { app.theme.accent } else { app.theme.text_muted },
         );
     }
-    let occs = gather(app, &pane.cals, start, start + weeks * 7);
+    let occs = gather_in(app, &pane.cals, start, start + weeks * 7, Some(&st.cal));
     let shaded = blend(app.theme.reading, app.theme.backdrop, 0.45);
     let line = Stroke::new(1.0, app.theme.separator);
     for i in 0..weeks * 7 {
@@ -1557,10 +1632,11 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
                     CornerRadius::same(2),
                     bar,
                 );
-                paint_text_clipped(
+                paint_occ_text(
                     ui,
                     pos2(chip.min.x + 7.0, chip.min.y + 2.0),
                     &o.label(),
+                    o,
                     FontId::proportional(12.0),
                     app.theme.text,
                     chip.width() - 10.0,
@@ -1571,10 +1647,11 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
                 }
                 p.circle_filled(pos2(chip.min.x + 6.0, chip.center().y), 3.5, bar);
                 let text = month_chip_text(o, st.cal.month_end_time);
-                paint_text_clipped(
+                paint_occ_text(
                     ui,
                     pos2(chip.min.x + 13.0, chip.min.y + 2.0),
                     &text,
+                    o,
                     FontId::proportional(12.0),
                     app.theme.text,
                     chip.width() - 15.0,
@@ -1873,7 +1950,7 @@ fn time_grid_view(
     }
 
     // All-day strip.
-    let occs = gather(app, &pane.cals, first, last + 1);
+    let occs = gather_in(app, &pane.cals, first, last + 1, Some(&st.cal));
     let lanes = banner_lanes(&occs, first, last);
     let nlanes = lanes.iter().map(|(_, l)| l + 1).max().unwrap_or(0).min(4);
     let strip_h = LANE_H * nlanes.max(1) as f32 + 6.0;
@@ -2413,7 +2490,7 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
     let line = Stroke::new(1.0, app.theme.separator);
     let faint = Stroke::new(1.0, blend(app.theme.separator, app.theme.reading, 0.6));
     // Free items show only when File › Options › Calendar asks for them.
-    let mut occs = gather(app, &shown, sel, sel + 1);
+    let mut occs = gather_in(app, &shown, sel, sel + 1, Some(&st.cal));
     if !look.schedule_free {
         occs.retain(|o| o.show_as != BusyStatus::Free);
     }
@@ -2653,6 +2730,65 @@ mod tests {
         app.s.run("calendar.arrange", &json!({"mode": "day"})).unwrap();
         adopt_saved(&mut app, &mut b, &mut cu_b);
         assert_eq!(b.cal.mode, CalendarMode::Day);
+    }
+
+    /// View Settings › Filter and Conditional Formatting apply to the day, week, month and schedule grids,
+    /// not only to the List views.
+    #[test]
+    fn grid_views_follow_the_view_filter_and_conditional_formatting() {
+        use mailcraft_model::view::{ItemFilter, ItemRule};
+        let mut app = App::new(mailcraft_engine::sample::sample_session());
+        let cal = app.s.mailbox.appointments.values().next().map(|a| a.folder).unwrap();
+        for subject in ["Budget review", "Lunch"] {
+            app.s
+                .run(
+                    "calendar.newAppointment",
+                    &json!({"folder": cal.0, "subject": subject, "start": "2026-10-14T12:00", "end": "2026-10-14T13:00"}),
+                )
+                .unwrap();
+        }
+        let cals: BTreeSet<FolderId> = [cal].into_iter().collect();
+        let (from, to) = (day("2026-10-14"), day("2026-10-15"));
+        let all = gather(&app, &cals, from, to);
+        assert!(all.iter().any(|o| o.subject == "Lunch") && all.iter().any(|o| o.subject == "Budget review"));
+        let mut v = CalendarViewState {
+            filter: ItemFilter { words: "budget".into(), ..Default::default() },
+            ..Default::default()
+        };
+        let shown = gather_in(&app, &cals, from, to, Some(&v));
+        assert!(
+            shown.iter().all(|o| o.subject.to_lowercase().contains("budget")),
+            "the filter leaves Lunch out"
+        );
+        assert!(shown.iter().any(|o| o.subject == "Budget review"));
+        v.filter = ItemFilter::default();
+        v.rules = vec![ItemRule {
+            name: "Lunch".into(),
+            on: true,
+            filter: ItemFilter { words: "lunch".into(), ..Default::default() },
+            bold: true,
+            strike: true,
+            color: "#ff0000".into(),
+            ..Default::default()
+        }];
+        let styled = gather_in(&app, &cals, from, to, Some(&v));
+        let lunch = styled.iter().find(|o| o.subject == "Lunch").unwrap();
+        assert!(lunch.bold && lunch.strike && !lunch.italic);
+        assert_eq!(lunch.base, Color32::from_rgb(0xff, 0, 0));
+        let budget = styled.iter().find(|o| o.subject == "Budget review").unwrap();
+        assert!(!budget.bold);
+        assert_ne!(budget.base, Color32::from_rgb(0xff, 0, 0));
+        // The grids draw the styled items (every arrangement, in a small window too).
+        let ctx = egui::Context::default();
+        for mode in ["day", "week", "month", "schedule"] {
+            let mut st = load(&ctx);
+            st.cal = v.clone();
+            store(&ctx, st);
+            app.s.run("calendar.arrange", &json!({"mode": mode})).unwrap();
+            app.s.view.module = Module::Calendar;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(ui, &mut app));
+            out.textures_delta.clear();
+        }
     }
 
     #[test]

@@ -223,6 +223,9 @@ fn published_calendar_follows_changes_and_can_be_withdrawn() {
         Appointment {
             id,
             folder: cal,
+            // With a UID of its own (an event without one gets one when the calendar first goes to the CalDAV
+            // server, which changes the published file once).
+            uid: "team-review@example.com".into(),
             subject: "Team review".into(),
             start: DateTime::from_unix(1_790_000_000, 0),
             end: DateTime::from_unix(1_790_003_600, 0),
@@ -512,4 +515,160 @@ fn publishing_stays_on_the_publishing_server_and_moves_cleanly() {
     run(&mut s, "calendar.publish", json!({"folder": cal.0, "stop": true}));
     settle(&mut s);
     assert!(names().is_empty());
+}
+
+const SERIES: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\nBEGIN:VEVENT\r\nUID:series-1\r\n\
+DTSTAMP:20261001T000000Z\r\nDTSTART:20261012T140000Z\r\nDTEND:20261012T150000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n\
+SUMMARY:Weekly sync\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:series-1\r\nDTSTAMP:20261001T000000Z\r\n\
+RECURRENCE-ID:20261019T140000Z\r\nDTSTART:20261019T160000Z\r\nDTEND:20261019T170000Z\r\nSUMMARY:Weekly sync (moved)\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+fn at(y: i32, mo: u8, d: u8, h: u8) -> i64 {
+    DateTime::from_civil(y, mo, d, h, 0, 0, 0).unwrap().unix
+}
+
+fn calendar_items(s: &Session, folder: FolderId) -> Vec<&Appointment> {
+    s.mailbox.appointments.values().filter(|a| a.folder == folder).collect()
+}
+
+#[test]
+fn calendar_events_synchronise_with_caldav() {
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "contacts": false, "tasks": false}));
+    let cal = role(&s, alice, FolderRole::Calendar);
+    srv.put_dav_item(ALICE, "calendar", "series-1.ics", SERIES).unwrap();
+    let r = run(
+        &mut s,
+        "calendar.newAppointment",
+        json!({"folder": cal.0, "subject": "Dentist", "start": at(2026, 10, 14, 9), "end": at(2026, 10, 14, 10),
+               "importance": "high"}),
+    );
+    let dentist = ItemId(r["id"].as_u64().unwrap());
+
+    // Update Folder on the calendar talks to the CalDAV server.
+    let r = update_folder(&mut s, cal);
+    assert_eq!(r["server"], "dav", "{r}");
+    let here = calendar_items(&s, cal);
+    let series = here.iter().find(|a| a.recurrence.is_some()).expect("the series arrived");
+    let moved = here.iter().find(|a| a.recurrence_id.is_some()).expect("its exception arrived");
+    assert_eq!((series.uid.as_str(), moved.uid.as_str()), ("series-1", "series-1"));
+    assert_eq!(moved.subject, "Weekly sync (moved)");
+    assert_eq!(moved.start.unix, at(2026, 10, 19, 16));
+    assert!(series.recurrence.as_ref().unwrap().exdates.iter().any(|x| x.unix == at(2026, 10, 19, 14)));
+    assert!(series.remote.is_some() && moved.remote.is_none(), "the series holds the server link");
+    let (series_id, moved_id) = (series.id, moved.id);
+    let items = srv.dav_items(ALICE, "calendar");
+    assert_eq!(items.len(), 2, "{items:?}");
+    let (dentist_name, dentist_data) =
+        items.iter().find(|(_, d)| d.contains("SUMMARY:Dentist")).cloned().expect("the local event went up");
+    assert!(dentist_data.contains("PRIORITY:1"), "{dentist_data}");
+    assert!(s.mailbox.appointments[&dentist].remote.is_some());
+    // Nothing reached the task list.
+    assert!(srv.dav_items(ALICE, "tasks").is_empty());
+
+    // A second run with no changes moves nothing.
+    let puts = || srv.dav_requests().iter().filter(|r| r.starts_with("PUT")).count();
+    let before = puts();
+    update_folder(&mut s, cal);
+    assert_eq!(puts(), before);
+    assert_eq!(calendar_items(&s, cal).len(), 3);
+
+    // Changed here: the series goes up with its exception, which is no EXDATE of it.
+    run(&mut s, "calendar.update", json!({"id": series_id.0, "location": "Room 2"}));
+    update_folder(&mut s, cal);
+    let (_, data) = srv.dav_items(ALICE, "calendar").into_iter().find(|(n, _)| n == "series-1.ics").unwrap();
+    assert!(data.contains("LOCATION:Room 2"), "{data}");
+    assert!(data.contains("RECURRENCE-ID"), "{data}");
+    assert!(!data.contains("EXDATE"), "an overridden instance is not excluded: {data}");
+    assert!(data.contains("UID:series-1"), "{data}");
+
+    // Editing one more occurrence here adds it to the same resource.
+    run(
+        &mut s,
+        "calendar.editOccurrence",
+        json!({"id": series_id.0, "occurrence": at(2026, 10, 26, 14), "subject": "Weekly sync (short)"}),
+    );
+    update_folder(&mut s, cal);
+    let (_, data) = srv.dav_items(ALICE, "calendar").into_iter().find(|(n, _)| n == "series-1.ics").unwrap();
+    assert_eq!(data.matches("RECURRENCE-ID").count(), 2, "{data}");
+    assert!(data.contains("Weekly sync (short)"), "{data}");
+    assert_eq!(calendar_items(&s, cal).len(), 4, "no duplicates after the upload");
+
+    // Changed there: downloaded, keeping the item ids.
+    let edited = SERIES.replace("SUMMARY:Weekly sync (moved)", "SUMMARY:Weekly sync (moved again)");
+    srv.put_dav_item(ALICE, "calendar", "series-1.ics", &edited).unwrap();
+    update_folder(&mut s, cal);
+    assert_eq!(s.mailbox.appointments[&moved_id].subject, "Weekly sync (moved again)");
+    assert!(s.mailbox.appointments.contains_key(&series_id));
+    assert_eq!(calendar_items(&s, cal).len(), 3, "the server's copy has one exception now");
+
+    // Deleted here (with its exceptions): deleted there. Deleted there: deleted here.
+    run(&mut s, "calendar.delete", json!({"id": series_id.0}));
+    srv.delete_dav_item(ALICE, "calendar", &dentist_name);
+    update_folder(&mut s, cal);
+    assert!(srv.dav_items(ALICE, "calendar").is_empty(), "{:?}", srv.dav_items(ALICE, "calendar"));
+    assert!(calendar_items(&s, cal).is_empty());
+
+    // Undo brings the series back here, and the next run brings it back there.
+    run(&mut s, "app.undo", json!({}));
+    assert!(s.mailbox.appointments.contains_key(&series_id));
+    assert!(!s.mailbox.appointments.contains_key(&dentist), "the server's deletion is not undone");
+    update_folder(&mut s, cal);
+    let items = srv.dav_items(ALICE, "calendar");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].1.contains("UID:series-1"));
+}
+
+#[test]
+fn a_copied_event_is_a_server_item_of_its_own() {
+    // Regression: a copy kept the original's server link, so once it was the only item holding it (the
+    // original deleted here) it went up over the original's resource under the original's UID.
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "contacts": false, "tasks": false}));
+    let cal = role(&s, alice, FolderRole::Calendar);
+    let r = run(
+        &mut s,
+        "calendar.newAppointment",
+        json!({"folder": cal.0, "subject": "Dentist", "start": at(2026, 10, 14, 9), "end": at(2026, 10, 14, 10)}),
+    );
+    let original = ItemId(r["id"].as_u64().unwrap());
+    update_folder(&mut s, cal);
+    let first = srv.dav_items(ALICE, "calendar");
+    assert_eq!(first.len(), 1, "{first:?}");
+    let original_uid = server_uid(&first[0].1);
+    let r = run(&mut s, "calendar.copy", json!({"id": original.0, "folder": cal.0}));
+    let copy = ItemId(r["copies"][0].as_u64().unwrap());
+    assert!(s.mailbox.appointments[&copy].remote.is_none());
+    update_folder(&mut s, cal);
+    let both = srv.dav_items(ALICE, "calendar");
+    assert_eq!(both.len(), 2, "{both:?}");
+    let copy_uid = s.mailbox.appointments[&copy].remote.as_ref().unwrap().uid.clone();
+    assert_ne!(copy_uid, original_uid);
+    // The original goes; the copy stays on the server under its own UID.
+    run(&mut s, "calendar.delete", json!({"id": original.0}));
+    update_folder(&mut s, cal);
+    update_folder(&mut s, cal);
+    let left = srv.dav_items(ALICE, "calendar");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(server_uid(&left[0].1), copy_uid, "{left:?}");
+    assert!(s.mailbox.appointments.contains_key(&copy));
+}
+
+#[test]
+fn a_collection_with_events_and_tasks_is_shared_by_calendar_and_tasks() {
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "contacts": false}));
+    let cal = role(&s, alice, FolderRole::Calendar);
+    // A task stored in the events calendar (as some servers allow) is neither an error nor deleted.
+    srv.put_dav_item(ALICE, "calendar", "todo-x.ics", TODO).unwrap();
+    srv.put_dav_item(ALICE, "calendar", "series-1.ics", SERIES).unwrap();
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(s.sync_status().accounts.iter().find_map(|a| a.error.clone()), None);
+    assert_eq!(calendar_items(&s, cal).len(), 2);
+    update_folder(&mut s, cal);
+    assert_eq!(srv.dav_items(ALICE, "calendar").len(), 2, "the task stays on the server");
 }

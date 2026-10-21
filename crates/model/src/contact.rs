@@ -80,7 +80,7 @@ impl ContactPicture {
 }
 
 /// Base64 (RFC 4648, standard alphabet, padded) for the picture bytes, so the stored mailbox stays compact.
-mod b64 {
+pub(crate) mod b64 {
     use serde::{Deserialize, Deserializer, Serializer};
 
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

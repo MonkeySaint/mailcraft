@@ -79,6 +79,8 @@ pub struct DavSettings {
     pub contacts: bool,
     /// Synchronise the Tasks folder with the server's task list (CalDAV VTODO, RFC 4791).
     pub tasks: bool,
+    /// Synchronise the Calendar with the server's calendar of events (CalDAV VEVENT, RFC 4791).
+    pub calendar: bool,
     /// WebDAV collection calendars are published into (empty: publishing is not set up).
     pub publish_url: String,
     /// User name for the DAV server (empty: the incoming server's).

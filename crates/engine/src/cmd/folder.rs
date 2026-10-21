@@ -637,6 +637,10 @@ pub fn copy_folder_tree(
                     x.read_only = false;
                 }
                 x.time_zones = None;
+                // Nor the original's publication: publishing it would overwrite the original's published file,
+                // and the original's pending removals are not the copy's to carry out.
+                x.publication = None;
+                x.withdrawals.clear();
             });
         }
         if let Some(v) = mb.views.get(old).cloned() {
@@ -670,6 +674,17 @@ pub fn copy_folder_tree(
     copy_items!(contacts);
     copy_items!(tasks);
     copy_items!(notes);
+    // The copies are new items: none of them is the server copy of its original.
+    let copied: BTreeSet<FolderId> = map.values().copied().collect();
+    for a in mb.appointments.values_mut().filter(|a| copied.contains(&a.folder)) {
+        a.remote = None;
+    }
+    for c in mb.contacts.values_mut().filter(|c| copied.contains(&c.folder)) {
+        c.remote = None;
+    }
+    for t in mb.tasks.values_mut().filter(|t| copied.contains(&t.folder)) {
+        t.remote = None;
+    }
     let root = map.get(&src).copied().ok_or_else(|| CmdError::Failed("copy failed".into()))?;
     Ok((root, map.len(), items))
 }

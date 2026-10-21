@@ -5,9 +5,12 @@
 //! `tasks.*` or `notes.*` command (new or update). A failed save keeps the window open and shows the
 //! command's error.
 //!
-//! The appointment window has three pages: Appointment (subject, attendees, location, start/end with time
-//! pickers, all day, recurrence, show as, reminder, categories, private, notes), Scheduling Assistant (see
-//! `scheduling`) and Tracking (attendee responses of a meeting). Opening one occurrence of a recurring series
+//! The appointment window has three pages: Appointment (subject, attendees, rooms and equipment, location,
+//! start/end with time pickers, Time Zones (a zone for the start and one for the end), all day, recurrence,
+//! show as, reminder, categories, importance, private, attached files, and the notes in the compose body
+//! editor with their formatting), Scheduling Assistant (see `scheduling`) and Tracking (attendee responses of
+//! a meeting). Send on a new meeting sends its invitation from the window (`calendar.newMeeting` with
+//! `send: "now"`): nothing is saved when the window is closed instead, or when sending fails. Opening one occurrence of a recurring series
 //! first asks whether to open the occurrence or the series; saving an occurrence makes it an exception
 //! (`calendar.editOccurrence`).
 //!
@@ -21,6 +24,7 @@
 //! follow up, module view settings, Mail Merge, Task Request) are in [`dialogs`].
 
 pub(crate) mod dialogs;
+pub(crate) mod notes;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,6 +104,22 @@ pub(crate) struct ApptEditor {
     pub attendees: String,
     /// Optional attendees.
     pub optional: String,
+    /// Rooms and equipment (invited as resources).
+    pub resources: String,
+    /// `low`, `normal` or `high`.
+    pub importance: String,
+    /// Time Zones shown: the start and end times are in `tz_start` / `tz_end` (empty = the calendar's clock).
+    pub zones_shown: bool,
+    pub tz_start: String,
+    pub tz_end: String,
+    /// Files attached to the item.
+    pub attachments: Vec<mailcraft_model::calendar::ItemAttachment>,
+    /// The notes' formatting as they came (HTML), when they have any.
+    pub body_html: Option<String>,
+    /// The notes editor (made when the window first draws).
+    pub notes: Option<notes::SharedNotes>,
+    /// Attach File without a file picker: the path box.
+    pub attach_path: Option<String>,
     pub meeting: bool,
     /// The user organizes this meeting (Send Update / Cancel Meeting apply).
     pub organizer_me: bool,
@@ -117,7 +137,15 @@ pub(crate) struct ApptEditor {
 
 impl ApptEditor {
     fn is_meeting(&self) -> bool {
-        self.meeting || !self.attendees.trim().is_empty() || !self.optional.trim().is_empty()
+        self.meeting
+            || !self.attendees.trim().is_empty()
+            || !self.optional.trim().is_empty()
+            || !self.resources.trim().is_empty()
+    }
+
+    /// The notes edited since the window opened.
+    fn notes_dirty(&self) -> bool {
+        self.notes.as_ref().is_some_and(|n| n.lock().is_ok_and(|n| n.dirty()))
     }
 }
 
@@ -299,7 +327,7 @@ pub(crate) struct OccPrompt {
 fn attendee_list(a: &mailcraft_model::Appointment, role: AttendeeRole) -> String {
     a.attendees
         .iter()
-        .filter(|x| x.role == role || (role == AttendeeRole::Required && x.role == AttendeeRole::Resource))
+        .filter(|x| x.role == role)
         .map(|x| x.mailbox.to_display_string())
         .collect::<Vec<_>>()
         .join("; ")
@@ -318,14 +346,23 @@ pub(crate) fn open_appointment(app: &App, st: &mut ModState, id: ItemId) {
 /// Opens an appointment; with `occurrence` (unix start) only that occurrence of its series.
 pub(crate) fn open_appointment_at(app: &App, st: &mut ModState, id: ItemId, occurrence: Option<(i64, i64)>) {
     let Some(a) = app.s.mailbox.appointments.get(&id) else { return };
-    // Times on the calendar's clock (its named zone across daylight-saving changes), as saving reads them.
-    let clock = mailcraft_engine::cmd::calendar::tz::Clock::of(&app.s);
+    // Times on the calendar's clock (its named zone across daylight-saving changes), as saving reads them;
+    // an item in other zones shows its Time Zones with the times in them.
+    use mailcraft_engine::cmd::calendar::tz;
+    let clock = tz::Clock::of(&app.s);
+    let zones_shown = mailcraft_engine::cmd::calendar::zones_differ(&clock, a);
     let (start, end) = match occurrence {
         Some((s, e)) => (s, e),
         None => (a.start.unix, a.end.unix),
     };
-    let s = clock.local(start);
-    let mut e = clock.local(end).max(s);
+    let fixed = tz(app);
+    let start_clock = a.zone().filter(|_| zones_shown).map(|z| tz::Clock::named(z, fixed));
+    let end_clock = a.end_zone().filter(|_| zones_shown).map(|z| tz::Clock::named(z, fixed));
+    let s = start_clock.as_ref().unwrap_or(&clock).local(start);
+    let mut e = end_clock.as_ref().unwrap_or(&clock).local(end).max(s);
+    let calendar_zone = clock.zone_id().unwrap_or_default().to_owned();
+    let tz_start = a.zone().map_or_else(|| calendar_zone.clone(), str::to_owned);
+    let tz_end = a.end_zone().map_or_else(|| tz_start.clone(), str::to_owned);
     if a.all_day {
         // Shown with the inclusive last day.
         e = (e - DAY).max(s);
@@ -349,6 +386,13 @@ pub(crate) fn open_appointment_at(app: &App, st: &mut ModState, id: ItemId, occu
         recurrence: a.recurrence.as_ref().map(|r| r.rrule.clone()).unwrap_or_default(),
         attendees: attendee_list(a, AttendeeRole::Required),
         optional: attendee_list(a, AttendeeRole::Optional),
+        resources: attendee_list(a, AttendeeRole::Resource),
+        importance: mailcraft_engine::cmd::calendar::importance_name(a.importance).to_owned(),
+        zones_shown,
+        tz_start,
+        tz_end,
+        attachments: a.attachments.clone(),
+        body_html: a.body_html.clone(),
         meeting: a.is_meeting,
         organizer_me: a.organizer.as_ref().is_none_or(|o| is_my_address(app, &o.addr)),
         occurrence: occurrence.map(|(s, _)| s),
@@ -402,6 +446,8 @@ pub(crate) fn new_appointment(
     let start = day * 24 * 60 + minute;
     let end = start + dur.max(0);
     let nonce = st.editors.next();
+    let zone =
+        mailcraft_engine::cmd::calendar::tz::Clock::of(&app.s).zone_id().unwrap_or_default().to_owned();
     st.editors.appt = Some(ApptEditor {
         folder: folder.map(|f| f.0),
         start_date: day_string(day),
@@ -412,6 +458,9 @@ pub(crate) fn new_appointment(
         show_as: if all_day { "free" } else { "busy" }.to_owned(),
         reminder: Some(if all_day { 18 * 60 } else { 15 }),
         organizer_me: true,
+        importance: "normal".to_owned(),
+        tz_start: zone.clone(),
+        tz_end: zone,
         nonce,
         focus: true,
         ..Default::default()
@@ -726,12 +775,15 @@ pub(crate) fn show(ctx: &egui::Context, app: &mut App) {
 
 /// What an appointment window holds that saving would change.
 fn appt_key(e: &ApptEditor) -> String {
+    let files: Vec<(&str, usize)> =
+        e.attachments.iter().map(|f| (f.filename.as_str(), f.data.len())).collect();
     format!(
         "{:?}",
         (
             (&e.subject, &e.location, &e.body, &e.start_date, e.start_min, &e.end_date, e.end_min),
             (e.all_day, &e.show_as, e.reminder, e.private, &e.categories, &e.recurrence),
-            (&e.attendees, &e.optional, e.meeting),
+            (&e.attendees, &e.optional, &e.resources, e.meeting),
+            (&e.importance, e.zones_shown, &e.tz_start, &e.tz_end, files, e.notes_dirty()),
         )
     )
 }
@@ -878,7 +930,7 @@ pub(crate) fn save_dirty_items(app: &mut App, st: &mut ModState) -> usize {
     let mut failed = 0usize;
     if dirty.contains(&"appointment")
         && let Some(mut ed) = st.editors.appt.take()
-        && let Err(e) = save_appointment(app, &ed)
+        && let Err(e) = save_appointment_as(app, &ed, false)
     {
         ed.error = Some(e);
         st.editors.appt = Some(ed);
@@ -1208,7 +1260,7 @@ fn appointment_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
                 act = Act::CancelMeeting;
             }
             let primary = match (meeting && ed.organizer_me, ed.id.is_some()) {
-                (true, false) => "Send Invitation",
+                (true, false) => "Send",
                 (true, true) => "Send Update",
                 _ => "Save & Close",
             };
@@ -1251,7 +1303,7 @@ fn appointment_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
                     app.ui.module_selection = Some(id);
                     // An occurrence's update goes out for its exception (RECURRENCE-ID), the rest for the series.
                     if act == Act::SaveSend && ed.id.is_some() && ed.is_meeting() {
-                        app.run("calendar.sendUpdate", json!({ "id": id }));
+                        app.run("calendar.sendUpdate", json!({ "id": id, "send": "now" }));
                     }
                 }
                 return;
@@ -1306,6 +1358,7 @@ fn appointment_page(ui: &mut Ui, app: &mut App, ed: &mut ApptEditor) {
         if ed.is_meeting() || ed.id.is_none() {
             field(ui, "Required", &mut ed.attendees, "Name <address>; …  (invites are sent as a meeting)");
             field(ui, "Optional", &mut ed.optional, "Name <address>; …");
+            field(ui, RESOURCES_LABEL, &mut ed.resources, "Rooms or equipment: Name <address>; …");
         }
         field(ui, "Location", &mut ed.location, "Add a location");
         ui.label("Start");
@@ -1313,9 +1366,18 @@ fn appointment_page(ui: &mut Ui, app: &mut App, ed: &mut ApptEditor) {
             date_field(ui, &mut ed.start_date, "mc-appt-sd");
             if !ed.all_day {
                 time_combo(ui, "mc-appt-st", &mut ed.start_min);
+                if ed.zones_shown {
+                    zone_combo(ui, app, "mc-appt-tzs", &mut ed.tz_start);
+                }
             }
             if ui.checkbox(&mut ed.all_day, "All day").changed() {
                 ed.show_as = if ed.all_day { "free" } else { "busy" }.into();
+            }
+            if !ed.all_day {
+                let label = if ed.zones_shown { "Hide Time Zones" } else { TIME_ZONES_LABEL };
+                if ui.button(label).on_hover_text("A time zone for the start and one for the end").clicked() {
+                    toggle_zones(app, ed);
+                }
             }
         });
         ui.end_row();
@@ -1324,6 +1386,9 @@ fn appointment_page(ui: &mut Ui, app: &mut App, ed: &mut ApptEditor) {
             date_field(ui, &mut ed.end_date, "mc-appt-ed");
             if !ed.all_day {
                 time_combo(ui, "mc-appt-et", &mut ed.end_min);
+                if ed.zones_shown {
+                    zone_combo(ui, app, "mc-appt-tze", &mut ed.tz_end);
+                }
             }
         });
         ui.end_row();
@@ -1393,12 +1458,33 @@ fn appointment_page(ui: &mut Ui, app: &mut App, ed: &mut ApptEditor) {
         ui.label("Categories");
         categories_menu(ui, app, &mut ed.categories);
         ui.end_row();
-        ui.label("");
-        ui.checkbox(&mut ed.private, "Private");
+        ui.label("Tags");
+        ui.horizontal(|ui| {
+            for (key, label, hint) in [
+                ("high", "! High Importance", "Mark the item important"),
+                ("low", "↓ Low Importance", "Mark the item of low importance"),
+            ] {
+                let on = ed.importance == key;
+                if ui.selectable_label(on, label).on_hover_text(hint).clicked() {
+                    ed.importance = if on { "normal" } else { key }.to_owned();
+                }
+            }
+            ui.checkbox(&mut ed.private, "Private");
+        });
+        ui.end_row();
+        ui.label(ATTACHMENTS_LABEL);
+        attachments_row(ui, app, ed);
         ui.end_row();
     });
     ui.add_space(4.0);
-    ui.add(TextEdit::multiline(&mut ed.body).hint_text("Notes").desired_rows(5).desired_width(f32::INFINITY));
+    if ed.notes.is_none() {
+        ed.notes = Some(notes::NotesEditor::shared(app, ed.nonce, &ed.body, ed.body_html.as_deref()));
+    }
+    if let Some(n) = ed.notes.clone()
+        && let Ok(mut n) = n.lock()
+    {
+        n.show(ui, app, ed.nonce);
+    }
     // Moving the start keeps the duration.
     let after = parse_day(&ed.start_date).map(|d| d * 24 * 60 + if ed.all_day { 0 } else { ed.start_min });
     if let (Some(b), Some(a), Some(end_day)) = (before, after, parse_day(&ed.end_date))
@@ -1410,6 +1496,188 @@ fn appointment_page(ui: &mut Ui, app: &mut App, ed: &mut ApptEditor) {
             ed.end_min = end.rem_euclid(24 * 60);
         }
     }
+}
+
+/// Label of the rooms and equipment field.
+pub(crate) const RESOURCES_LABEL: &str = "Resources";
+/// The button that shows the start and end time zones.
+pub(crate) const TIME_ZONES_LABEL: &str = "Time Zones";
+/// Label of the attached files row.
+pub(crate) const ATTACHMENTS_LABEL: &str = "Attachments";
+
+/// A time zone picker: the calendar's zones list (with `zone` when it is not on it).
+fn zone_combo(ui: &mut Ui, app: &App, id: &str, zone: &mut String) {
+    use mailcraft_engine::cmd::calendar::tz;
+    let now = app.s.now().unix;
+    let shown = if zone.trim().is_empty() { "(calendar time)".to_owned() } else { tz::label(zone, now) };
+    ComboBox::from_id_salt(id).selected_text(shown).width(230.0).show_ui(ui, |ui| {
+        let mut list: Vec<String> = tz::ZONES.iter().map(|z| (*z).to_owned()).collect();
+        if !zone.trim().is_empty() && !list.iter().any(|z| z == zone) {
+            list.insert(0, zone.clone());
+        }
+        for z in list {
+            let label = tz::label(&z, now);
+            ui.selectable_value(zone, z, label);
+        }
+    });
+}
+
+/// The wall-clock times of the window (date, minute) on `from` read again on `to` (the same instants).
+fn convert_times(ed: &mut ApptEditor, app: &App, from: (&str, &str), to: (&str, &str)) {
+    use mailcraft_engine::cmd::calendar::tz;
+    let fixed = tz(app);
+    let clock =
+        |z: &str| if z.trim().is_empty() { tz::Clock::of(&app.s) } else { tz::Clock::named(z, fixed) };
+    let mv = |date: &mut String, min: &mut i64, a: &tz::Clock, b: &tz::Clock| {
+        if let Some(day) = parse_day(date) {
+            let local = day.saturating_mul(DAY).saturating_add(min.saturating_mul(60));
+            let t = a.from_local(local);
+            let l = b.local(t.unix);
+            *date = day_string(l.div_euclid(DAY));
+            *min = l.rem_euclid(DAY) / 60;
+        }
+    };
+    let (fs, fe, ts, te) = (clock(from.0), clock(from.1), clock(to.0), clock(to.1));
+    mv(&mut ed.start_date, &mut ed.start_min, &fs, &ts);
+    mv(&mut ed.end_date, &mut ed.end_min, &fe, &te);
+}
+
+/// Time Zones: shows the start and end zones (the calendar's to begin with), or hides them again, putting
+/// the times back on the calendar's clock.
+fn toggle_zones(app: &App, ed: &mut ApptEditor) {
+    let calendar =
+        mailcraft_engine::cmd::calendar::tz::Clock::of(&app.s).zone_id().unwrap_or_default().to_owned();
+    if ed.zones_shown {
+        let (s, e) = (ed.tz_start.clone(), ed.tz_end.clone());
+        convert_times(ed, app, (&s, &e), ("", ""));
+        ed.tz_start = calendar.clone();
+        ed.tz_end = calendar;
+        ed.zones_shown = false;
+    } else {
+        if ed.tz_start.trim().is_empty() {
+            ed.tz_start = calendar.clone();
+        }
+        if ed.tz_end.trim().is_empty() {
+            ed.tz_end = ed.tz_start.clone();
+        }
+        let (s, e) = (ed.tz_start.clone(), ed.tz_end.clone());
+        convert_times(ed, app, ("", ""), (&s, &e));
+        ed.zones_shown = true;
+    }
+}
+
+/// Adds the file at `path` to the window's attachments (errors show in the window).
+pub(crate) fn attach_to_window(ed: &mut ApptEditor, path: &str) {
+    use mailcraft_model::calendar::{MAX_ITEM_ATTACHMENT_BYTES, MAX_ITEM_ATTACHMENTS};
+    match mailcraft_engine::cmd::calendar::attachment_from_path(path) {
+        Ok(f) => {
+            let total: usize = ed.attachments.iter().map(|x| x.data.len()).sum();
+            if ed.attachments.len() >= MAX_ITEM_ATTACHMENTS
+                || total.saturating_add(f.data.len()) > MAX_ITEM_ATTACHMENT_BYTES
+            {
+                ed.error = Some("The attached files are too large.".into());
+            } else {
+                ed.attachments.push(f);
+                ed.error = None;
+            }
+        }
+        Err(e) => ed.error = Some(e.to_string()),
+    }
+}
+
+/// The attached files (name, size, Save As… for a saved item, remove) and Attach File.
+fn attachments_row(ui: &mut Ui, app: &mut App, ed: &mut ApptEditor) {
+    ui.vertical(|ui| {
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
+            for (i, f) in ed.attachments.iter().enumerate() {
+                // Save As… is for files the saved item holds: its index there (the files are shared, so this
+                // compares pointers, not contents).
+                let stored = ed.id.and_then(|id| {
+                    let a = app.s.mailbox.appointments.get(&ItemId(id))?;
+                    a.attachments
+                        .iter()
+                        .position(|x| std::sync::Arc::ptr_eq(&x.data, &f.data) && x.filename == f.filename)
+                        .map(|index| (id, index))
+                });
+                ui.menu_button(
+                    format!("📎 {} ({})", f.filename, crate::compose::size_text(f.data.len())),
+                    |ui| {
+                        if let Some((id, index)) = stored
+                            && ui.button("Save As…").clicked()
+                        {
+                            let path = app
+                                .files
+                                .as_ref()
+                                .and_then(|d| d.save_file("Save Attachment", &f.filename, &[], None));
+                            let p = json!({"id": id, "index": index, "name": f.filename});
+                            match path {
+                                Some(path) => {
+                                    let mut p = p;
+                                    if let Some(o) = p.as_object_mut() {
+                                        o.insert("path".into(), json!(path.to_string_lossy()));
+                                    }
+                                    app.run("calendar.saveAttachment", p);
+                                }
+                                // No file picker here: the Save Attachment window asks for the path.
+                                None if app.files.is_none() => {
+                                    app.run("calendar.saveAttachment", p);
+                                }
+                                None => {}
+                            }
+                            ui.close();
+                        }
+                        if ui.button("Remove").clicked() {
+                            remove = Some(i);
+                            ui.close();
+                        }
+                    },
+                );
+            }
+            if ui.button("Attach File…").clicked() {
+                let picked = app
+                    .files
+                    .as_ref()
+                    .map(|d| d.open_files("Attach File", &[], true, None))
+                    .or_else(|| crate::compose::file_hooks().pick_files.map(|pick| pick()));
+                match picked {
+                    Some(Some(paths)) => {
+                        for p in paths.into_iter().take(mailcraft_model::calendar::MAX_ITEM_ATTACHMENTS) {
+                            attach_to_window(ed, &p.to_string_lossy());
+                        }
+                    }
+                    Some(None) => {}
+                    None => ed.attach_path = Some(String::new()),
+                }
+            }
+        });
+        if let Some(i) = remove
+            && i < ed.attachments.len()
+        {
+            ed.attachments.remove(i);
+        }
+        // No file picker on this platform: a path box.
+        let mut done = None;
+        if let Some(path) = ed.attach_path.as_mut() {
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(path).hint_text("Path of the file to attach").desired_width(260.0),
+                );
+                if ui.button("Attach").clicked() {
+                    done = Some(Some(path.clone()));
+                }
+                if ui.button("Cancel").clicked() {
+                    done = Some(None);
+                }
+            });
+        }
+        if let Some(d) = done {
+            ed.attach_path = None;
+            if let Some(p) = d.filter(|p| !p.trim().is_empty()) {
+                attach_to_window(ed, p.trim());
+            }
+        }
+    });
 }
 
 fn response_label(r: ResponseStatus) -> &'static str {
@@ -1462,8 +1730,14 @@ fn tracking_page(ui: &mut Ui, app: &App, ed: &ApptEditor) {
     );
 }
 
-/// Saves the appointment editor; returns the item id.
+/// Saves the appointment editor (a new meeting's invitation is sent); returns the item id.
 pub(crate) fn save_appointment(app: &mut App, ed: &ApptEditor) -> Result<Option<u64>, String> {
+    save_appointment_as(app, ed, true)
+}
+
+/// Saves the appointment editor; returns the item id. A new meeting is sent with `send`; without (Close All
+/// Items › Save) its invitation opens in a compose instead, and discarding that removes the meeting.
+pub(crate) fn save_appointment_as(app: &mut App, ed: &ApptEditor, send: bool) -> Result<Option<u64>, String> {
     let sd = parse_day(&ed.start_date).ok_or("Enter the start date as YYYY-MM-DD.")?;
     let end_day = parse_day(&ed.end_date).ok_or("Enter the end date as YYYY-MM-DD.")?;
     let (start, end) = if ed.all_day {
@@ -1479,23 +1753,64 @@ pub(crate) fn save_appointment(app: &mut App, ed: &ApptEditor) -> Result<Option<
     };
     let attendees = split_list(&ed.attendees);
     let optional = split_list(&ed.optional);
+    let resources = split_list(&ed.resources);
+    let importance = if ed.importance.is_empty() { "normal" } else { ed.importance.as_str() };
+    let files: Vec<Value> = ed
+        .attachments
+        .iter()
+        .map(|f| {
+            json!({
+                "name": f.filename,
+                "mime_type": f.mime_type,
+                "data_base64": mailcraft_mime::transfer::encode_base64_flat(&f.data),
+            })
+        })
+        .collect();
     let mut p = json!({
         "subject": ed.subject,
         "location": ed.location,
-        "body": ed.body,
         "start": start,
         "end": end,
         "allDay": ed.all_day,
         "showAs": ed.show_as,
         "reminderMin": ed.reminder,
+        "importance": importance,
         "private": ed.private,
         "categories": ed.categories,
+        "attachments": files,
     });
     let Some(o) = p.as_object_mut() else { return Err("internal error".into()) };
-    let meeting = ed.meeting || !attendees.is_empty() || !optional.is_empty();
+    // The notes: as edited (with their formatting), else as they came.
+    let edited = ed.notes.as_ref().and_then(|n| n.lock().ok().filter(|n| n.dirty()).map(|n| n.html()));
+    match (edited, &ed.body_html) {
+        (Some(html), _) => o.insert("bodyHtml".into(), json!(html)),
+        (None, Some(html)) => o.insert("bodyHtml".into(), json!(html)),
+        (None, None) => o.insert("body".into(), json!(ed.body)),
+    };
+    // Time Zones: the times are in the zones shown.
+    if ed.zones_shown && !ed.all_day {
+        o.insert("timeZone".into(), json!(ed.tz_start.trim()));
+        let end_zone = if ed.tz_end.trim() == ed.tz_start.trim() { "" } else { ed.tz_end.trim() };
+        o.insert("endTimeZone".into(), json!(end_zone));
+    } else if !ed.all_day {
+        // Hide Time Zones on an item that had zones of its own: the times are on the calendar's clock now,
+        // and so are the item's zones (else it would keep its old ones and show them again).
+        use mailcraft_engine::cmd::calendar::{tz, zones_differ};
+        let clock = tz::Clock::of(&app.s);
+        let had_zones = ed
+            .id
+            .and_then(|id| app.s.mailbox.appointments.get(&ItemId(id)))
+            .is_some_and(|a| zones_differ(&clock, a));
+        if had_zones {
+            o.insert("timeZone".into(), json!(clock.zone_id().unwrap_or_default()));
+            o.insert("endTimeZone".into(), json!(""));
+        }
+    }
+    let meeting = ed.meeting || !attendees.is_empty() || !optional.is_empty() || !resources.is_empty();
     if meeting {
         o.insert("attendees".into(), json!(attendees));
         o.insert("optional".into(), json!(optional));
+        o.insert("resources".into(), json!(resources));
     }
     if let (Some(id), Some(occ)) = (ed.id, ed.occurrence) {
         o.insert("id".into(), json!(id));
@@ -1514,6 +1829,10 @@ pub(crate) fn save_appointment(app: &mut App, ed: &ApptEditor) -> Result<Option<
             o.insert("folder".into(), json!(f));
         }
         let cmd = if meeting { "calendar.newMeeting" } else { "calendar.newAppointment" };
+        if meeting && ed.organizer_me && send {
+            // Send: the invitation goes from the window; a failed send saves nothing.
+            o.insert("send".into(), json!("now"));
+        }
         let out = run_checked(app, cmd, p)?;
         Ok(out.get("id").and_then(Value::as_u64))
     }
@@ -2853,6 +3172,24 @@ mod tests {
         App::new(sample_session())
     }
 
+    /// Makes the default account one that sends (messages wait in the Outbox; nothing connects).
+    fn sending_account(app: &mut App) {
+        let id = a_account(app);
+        app.s.view.send_immediately = false;
+        if let Some(a) = app.s.mailbox.accounts.iter_mut().find(|a| a.id == id) {
+            a.kind = mailcraft_model::AccountKind::Imap;
+            a.address = "me@example.com".into();
+            a.outgoing = Some(mailcraft_model::ServerSettings {
+                host: "smtp.example.com".into(),
+                ..Default::default()
+            });
+        }
+    }
+
+    fn a_account(app: &App) -> mailcraft_model::AccountId {
+        app.s.mailbox.default_account().map(|a| a.id).unwrap()
+    }
+
     #[test]
     fn new_appointment_saves_through_command() {
         let mut app = app();
@@ -2892,14 +3229,28 @@ mod tests {
         ed.subject = "Review".into();
         ed.attendees = "Ann Lee <ann@example.com>".into();
         ed.optional = "bob@example.org".into();
+        ed.resources = "Room 4 <room4@example.com>".into();
+        let before = app.s.mailbox.appointments.len();
+        // Without an account that sends, Send fails in the window and nothing is saved.
+        let e = save_appointment(&mut app, &ed).unwrap_err();
+        assert!(e.contains("not sent"), "{e}");
+        assert_eq!(app.s.mailbox.appointments.len(), before);
+        assert!(app.s.composes.is_empty());
+        // With one, the invitation goes straight out: no second compose to send.
+        sending_account(&mut app);
         let id = save_appointment(&mut app, &ed).unwrap().unwrap();
         let a = &app.s.mailbox.appointments[&ItemId(id)];
         assert!(a.is_meeting);
         assert_eq!(a.attendees.iter().filter(|x| x.role == AttendeeRole::Optional).count(), 1);
-        assert!(!app.s.composes.is_empty(), "the invitation opens");
+        assert_eq!(a.attendees.iter().filter(|x| x.role == AttendeeRole::Resource).count(), 1);
+        assert!(app.s.composes.is_empty(), "no compose opens");
+        let outbox = app.s.mailbox.role_folder(a_account(&app), mailcraft_model::FolderRole::Outbox).unwrap();
+        assert!(app.s.mailbox.mail.values().any(|m| m.folder == outbox && m.subject == "Review"));
         open_appointment(&app, &mut st, ItemId(id));
         let ed = st.editors.appt.clone().unwrap();
         assert_eq!(ed.optional, "bob@example.org");
+        assert_eq!(ed.resources, "Room 4 <room4@example.com>");
+        assert_eq!(ed.attendees, "Ann Lee <ann@example.com>", "rooms are not required attendees");
         assert!(ed.organizer_me);
     }
 
@@ -3193,6 +3544,79 @@ mod tests {
     fn draw(ctx: &egui::Context, app: &mut App) {
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(ui.ctx(), app));
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn appointment_window_zones_notes_files_and_importance() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let mut st = ModState::default();
+        new_appointment(&app, &mut st, None, parse_day("2026-11-02").unwrap(), 18 * 60, 60, false);
+        store(&ctx, st);
+        // The window draws with its new rows (rooms, Time Zones, tags, attachments, the notes editor).
+        draw(&ctx, &mut app);
+        let mut st = load(&ctx);
+        let mut ed = st.editors.appt.clone().unwrap();
+        assert!(ed.notes.is_some(), "the notes editor is made when the window draws");
+        ed.subject = "Flight".into();
+        // Time Zones: shown with the calendar's zone, then the start in Toronto and the end in London.
+        toggle_zones(&app, &mut ed);
+        assert!(ed.zones_shown);
+        ed.tz_start = "America/Toronto".into();
+        ed.tz_end = "Europe/London".into();
+        ed.end_date = "2026-11-03".into();
+        ed.end_min = 6 * 60;
+        ed.importance = "high".into();
+        // A file, and formatted notes typed into the editor.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("mailcraft-appt-ui-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("boarding.txt");
+        std::fs::write(&file, b"seat 12A").unwrap();
+        attach_to_window(&mut ed, &file.to_string_lossy());
+        attach_to_window(&mut ed, &dir.join("missing.txt").to_string_lossy());
+        assert!(ed.error.is_some(), "a missing file is reported");
+        ed.error = None;
+        ed.notes.as_ref().unwrap().lock().unwrap().type_text("Gate 4");
+        assert!(ed.notes_dirty());
+        let id = save_appointment(&mut app, &ed).unwrap().unwrap();
+        let a = app.s.mailbox.appointments[&ItemId(id)].clone();
+        assert_eq!(a.zone(), Some("America/Toronto"));
+        assert_eq!(a.end_tz.as_deref(), Some("Europe/London"));
+        assert_eq!(a.end.unix - a.start.unix, 7 * 3600, "18:00 Toronto to 06:00 London");
+        assert_eq!(a.importance, mailcraft_model::Importance::High);
+        assert_eq!(a.attachments.len(), 1);
+        assert_eq!(&*a.attachments[0].data, b"seat 12A");
+        assert!(a.body_html.is_some());
+        assert!(a.body.contains("Gate 4"), "{}", a.body);
+        // Opened again: the zones show with the times in them, and the notes keep their formatting.
+        open_appointment(&app, &mut st, ItemId(id));
+        let ed = st.editors.appt.clone().unwrap();
+        assert!(ed.zones_shown);
+        assert_eq!((ed.tz_start.as_str(), ed.tz_end.as_str()), ("America/Toronto", "Europe/London"));
+        assert_eq!((ed.start_min, ed.end_date.as_str(), ed.end_min), (18 * 60, "2026-11-03", 6 * 60));
+        assert_eq!(ed.importance, "high");
+        assert_eq!(ed.attachments.len(), 1);
+        assert!(ed.body_html.is_some());
+        // Saving untouched changes nothing.
+        save_appointment(&mut app, &ed).unwrap();
+        let b = &app.s.mailbox.appointments[&ItemId(id)];
+        assert_eq!((b.start.unix, b.end.unix, &b.body_html), (a.start.unix, a.end.unix, &a.body_html));
+        // Hiding the zones puts the times back on the calendar's clock (the same instants).
+        let mut ed = ed;
+        toggle_zones(&app, &mut ed);
+        assert!(!ed.zones_shown);
+        save_appointment(&mut app, &ed).unwrap();
+        let c = app.s.mailbox.appointments[&ItemId(id)].clone();
+        assert_eq!((c.start.unix, c.end.unix), (a.start.unix, a.end.unix));
+        // Regression: hidden zones are gone from the item (they came back when it was opened again).
+        let clock = mailcraft_engine::cmd::calendar::tz::Clock::of(&app.s);
+        assert_eq!(c.end_tz, None);
+        assert_eq!(c.zone(), clock.zone_id());
+        open_appointment(&app, &mut st, ItemId(id));
+        assert!(!st.editors.appt.as_ref().unwrap().zones_shown);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

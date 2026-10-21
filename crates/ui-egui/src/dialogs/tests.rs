@@ -547,6 +547,43 @@ fn import_export_wizard_exports_mbox() {
 }
 
 #[test]
+fn calendar_item_file_saves_through_its_own_window_without_a_file_picker() {
+    // Regression: the appointment window's Save As… (no native file dialog, as on the web) opened the mail
+    // Save Attachments window, which listed "attachment 0 B" and saved the selected message's files.
+    let dir = scratch_dir("item-file");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("agenda copy.txt");
+    let mut app = sample_app();
+    select_first(&mut app);
+    assert!(app.files.is_none());
+    let id = app
+        .run(
+            "calendar.newAppointment",
+            json!({"subject": "Review", "start": "2026-11-02T09:00", "end": "2026-11-02T10:00",
+                   "attachments": [{"name": "agenda.txt", "data_base64": "aXRlbSAx"}]}),
+        )
+        .unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    // What the window's Save As… runs here.
+    app.run("calendar.saveAttachment", json!({"id": id, "index": 0, "name": "agenda.txt"})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["saveItemFile"]);
+    assert!(h.query_by_label("agenda.txt").is_some());
+    h.get_by_role(egui::accesskit::Role::TextInput).focus();
+    step(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+    h.get_by_role(egui::accesskit::Role::TextInput).type_text(out.to_str().unwrap());
+    step(&mut h);
+    h.get_by_label("Save").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", h.state().ui.toast);
+    assert_eq!(std::fs::read(&out).unwrap(), b"item 1");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "only the item's file was written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn backstage_pages_navigate_and_switch_theme() {
     let mut app = sample_app();
     select_first(&mut app);
@@ -1159,4 +1196,22 @@ fn address_book_searches_names_or_all_columns() {
     h.get_by_label("Contact").click();
     step(&mut h);
     assert_eq!(crate::modules::contact_window_folder(&h.ctx), Some(Some(club.0)));
+}
+
+#[test]
+fn add_holidays_window_adds_the_chosen_countries() {
+    let mut app = sample_app();
+    let before = app.s.mailbox.appointments.len();
+    app.run("calendar.addHolidays", json!({}));
+    crate::dialogs::take_notices(&mut app);
+    let mut h = harness(app);
+    assert!(h.query_by_label(super::holidays::TITLE).is_some() || h.query_by_label("Canada").is_some());
+    h.get_by_label("Canada").click();
+    h.run_steps(2);
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let s = &h.state().s;
+    assert!(s.mailbox.appointments.len() > before + 30, "three years of Canada's holidays");
+    assert!(s.mailbox.appointments.values().any(|a| a.subject == "Canada Day" && a.location == "Canada"));
+    assert!(h.query_by_label_contains("holidays were added").is_some());
 }

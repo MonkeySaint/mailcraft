@@ -27,6 +27,7 @@ mod folders;
 mod form_field;
 pub(crate) mod format_dlg;
 mod general;
+mod holidays;
 mod insert_dlg;
 mod items;
 mod junk;
@@ -260,6 +261,7 @@ pub const KNOWN: &[&str] = &[
     "importExport",
     "saveAs",
     "saveAttachments",
+    "saveItemFile",
     "revealPath",
     "print",
     "pageSetup",
@@ -418,6 +420,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return out;
     }
     if let Some(out) = general::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = holidays::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = print::show(ctx, app, d) {

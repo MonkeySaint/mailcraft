@@ -1,4 +1,4 @@
-//! Native side of contacts and tasks synchronisation (CardDAV / CalDAV) and calendar publishing: the DAV
+//! Native side of contacts, tasks and calendar synchronisation (CardDAV / CalDAV) and calendar publishing: the DAV
 //! part of a send/receive job is built on the session thread ([`build_job`]) and run on the account's worker
 //! thread after its mail ([`run`]); results come back as [`PimEvent`]s (see `pim.rs` for the rules).
 //!
@@ -32,16 +32,21 @@ pub(super) struct DavJob {
     held: BTreeSet<String>,
     auth: DavAuth,
     options: ConnectOptions,
-    /// Look for address books / task lists (a full run, or a folder not mapped yet).
+    /// Look for address books / task lists / calendars (a full run, or a folder not mapped yet).
     discover_contacts: bool,
     discover_tasks: bool,
+    discover_calendars: bool,
     folders: Vec<FolderJob>,
     publish: Vec<PublishJob>,
 }
 
 impl DavJob {
     pub(super) fn is_empty(&self) -> bool {
-        self.folders.is_empty() && self.publish.is_empty() && !self.discover_contacts && !self.discover_tasks
+        self.folders.is_empty()
+            && self.publish.is_empty()
+            && !self.discover_contacts
+            && !self.discover_tasks
+            && !self.discover_calendars
     }
 }
 
@@ -125,7 +130,13 @@ pub(super) fn build_job(s: &Session, a: &Account, plan: &Plan) -> Option<DavJob>
     let start = dav.url.trim().to_owned();
     let discover_contacts = !start.is_empty() && dav.contacts && (full || unmapped(PimKind::Contacts));
     let discover_tasks = !start.is_empty() && dav.tasks && (full || unmapped(PimKind::Tasks));
-    if folders.is_empty() && publish.is_empty() && !discover_contacts && !discover_tasks {
+    let discover_calendars = !start.is_empty() && dav.calendar && (full || unmapped(PimKind::Calendar));
+    if folders.is_empty()
+        && publish.is_empty()
+        && !discover_contacts
+        && !discover_tasks
+        && !discover_calendars
+    {
         return None;
     }
     let inc = a.incoming.as_ref();
@@ -150,7 +161,18 @@ pub(super) fn build_job(s: &Session, a: &Account, plan: &Plan) -> Option<DavJob>
         .map(str::to_owned)
         .collect();
     let held: BTreeSet<String> = a.sync.dav.values().map(|st| canon(&st.collection)).collect();
-    Some(DavJob { start, trust, held, auth, options, discover_contacts, discover_tasks, folders, publish })
+    Some(DavJob {
+        start,
+        trust,
+        held,
+        auth,
+        options,
+        discover_contacts,
+        discover_tasks,
+        discover_calendars,
+        folders,
+        publish,
+    })
 }
 
 /// Errors that end the DAV part of a run (the others only affect one item).
@@ -180,10 +202,11 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &At
         job.trust.iter().fold(DavClient::new(job.options.clone(), job.auth.clone()), |c, u| c.trust(u));
     let mut error: Option<String> = None;
     let mut found: BTreeMap<&'static str, Vec<(String, String)>> = BTreeMap::new();
-    if job.discover_contacts || job.discover_tasks {
-        progress("Looking for address books and task lists…");
+    if job.discover_contacts || job.discover_tasks || job.discover_calendars {
+        progress("Looking for address books, task lists and calendars…");
         let mut contacts = None;
         let mut tasks = None;
+        let mut calendars = None;
         if job.discover_contacts {
             match client.discover(&wire(&job.start), Service::Contacts) {
                 Ok(list) => {
@@ -196,22 +219,31 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &At
                 Err(e) => error = Some(format!("address books: {}", user_error(&e))),
             }
         }
-        if job.discover_tasks && !cancelled() {
+        if (job.discover_tasks || job.discover_calendars) && !cancelled() {
             match client.discover(&wire(&job.start), Service::Calendars) {
                 Ok(list) => {
-                    let l: Vec<(String, String)> = list
-                        .into_iter()
-                        .filter(|c| c.holds_tasks())
-                        .map(|c| (canon(&c.url), c.name))
-                        .collect();
-                    found.insert("tasks", l.clone());
-                    tasks = Some(l);
+                    let pick = |events: bool| -> Vec<(String, String)> {
+                        list.iter()
+                            .filter(|c| if events { c.holds_events() } else { c.holds_tasks() })
+                            .map(|c| (canon(&c.url), c.name.clone()))
+                            .collect()
+                    };
+                    if job.discover_tasks {
+                        let l = pick(false);
+                        found.insert("tasks", l.clone());
+                        tasks = Some(l);
+                    }
+                    if job.discover_calendars {
+                        let l = pick(true);
+                        found.insert("calendars", l.clone());
+                        calendars = Some(l);
+                    }
                 }
                 Err(e) if fatal(&e) => return Some(user_error(&e)),
-                Err(e) => error = Some(format!("task lists: {}", user_error(&e))),
+                Err(e) => error = Some(format!("calendars and task lists: {}", user_error(&e))),
             }
         }
-        send(PimEvent::Collections { contacts, tasks });
+        send(PimEvent::Collections { contacts, tasks, calendars });
     }
     // Collections taken by a folder of this run that had none yet.
     let mut held = job.held.clone();
@@ -231,6 +263,7 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &At
                 let k = match f.kind {
                     PimKind::Contacts => "contacts",
                     PimKind::Tasks => "tasks",
+                    PimKind::Calendar => "calendars",
                 };
                 let free = found.get(k).and_then(|l| free_collection(l, &held));
                 if let Some(c) = &free {
@@ -243,6 +276,7 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &At
             let what = match f.kind {
                 PimKind::Contacts => "No address book was found on the contacts server.",
                 PimKind::Tasks => "No task list was found on the server.",
+                PimKind::Calendar => "No calendar was found on the server.",
             };
             send(PimEvent::FolderFailed { folder: f.folder, error: what.into() });
             error.get_or_insert_with(|| what.to_owned());
@@ -307,7 +341,7 @@ fn sync_folder(client: &DavClient, job: &FolderJob, collection: &str) -> Result<
     let kind = job.kind;
     let service = match kind {
         PimKind::Contacts => Service::Contacts,
-        PimKind::Tasks => Service::Calendars,
+        PimKind::Tasks | PimKind::Calendar => Service::Calendars,
     };
     let coll_wire = wire(collection);
     let listing = client.list(&coll_wire)?;

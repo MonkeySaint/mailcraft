@@ -28,6 +28,8 @@
 //! ([`tz`]); its times are then entered in that zone and its recurrences expand in that zone's wall-clock
 //! time across daylight-saving changes.
 
+pub mod agenda;
+pub mod holidays;
 pub mod props;
 pub mod publish;
 pub mod subscribe;
@@ -46,10 +48,12 @@ use crate::{CmdError, CmdResult, CommandSpec, Module, Session, always};
 pub use mailcraft_formats::ics::itip::ItipMessage;
 use mailcraft_formats::ics::itip::{self, Method};
 use mailcraft_formats::ics::{ImportOptions, rrule};
-use mailcraft_model::calendar::{AttendeeRole, ResponseStatus};
+use mailcraft_model::calendar::{
+    AttendeeRole, ItemAttachment, MAX_ITEM_ATTACHMENT_BYTES, MAX_ITEM_ATTACHMENTS, ResponseStatus,
+};
 use mailcraft_model::{
-    Address, Appointment, Attendee, BusyStatus, DateTime, Doc, FolderId, FolderKind, FolderRole, ItemId,
-    ListTime, MailItem, Recurrence,
+    Address, Appointment, Attendee, BusyStatus, DateTime, Doc, FolderId, FolderKind, FolderRole, Importance,
+    ItemId, ListTime, MailItem, Recurrence, Sensitivity,
 };
 
 /// The reminders scanner (`crate::reminders`).
@@ -315,6 +319,8 @@ pub mod pim {
                         a.uid = uid.clone();
                         // A copied exception stands alone (it has a new UID, so no series).
                         a.recurrence_id = None;
+                        // A copy is a new item: it goes to the server as one (never over the original).
+                        a.remote = None;
                         mb.appointments.insert(new, a);
                     }
                 }
@@ -1348,6 +1354,8 @@ pub(crate) fn share_items(
         let hidden = a.private && !include_private;
         if detail != "full" || hidden {
             a.body.clear();
+            a.body_html = None;
+            a.attachments.clear();
             a.attendees.clear();
             a.organizer = None;
             a.categories.clear();
@@ -1356,8 +1364,9 @@ pub(crate) fn share_items(
             a.subject = show_as_label(a.show_as).to_owned();
             a.location.clear();
         }
-        // The copy is not the user's item: no alarms go out with it.
+        // The copy is not the user's item: no alarms go out with it, nor its server link.
         a.reminder_min = None;
+        a.remote = None;
     }
     appts
 }
@@ -1381,10 +1390,31 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
     let detail = opt_str(p, "detail").unwrap_or("full");
     share_detail(detail)?;
     let include_private = pim::flag(p, "includePrivate")?.unwrap_or(false);
-    let appts = share_items(s, folder, window, detail, include_private);
+    // Advanced: the body's layout, working hours only, and the items' attached files.
+    let layout = match opt_str(p, "layout") {
+        None => agenda::Layout::DailySchedule,
+        Some(l) => agenda::Layout::parse(l)
+            .ok_or_else(|| CmdError::Params("`layout` must be dailySchedule|listOfEvents".into()))?,
+    };
+    let working_hours_only = pim::flag(p, "workingHoursOnly")?.unwrap_or(false);
+    let include_attachments = pim::flag(p, "includeAttachments")?.unwrap_or(false);
+    let mut appts = share_items(s, folder, window, detail, include_private);
+    if !include_attachments {
+        for a in &mut appts {
+            a.attachments.clear();
+        }
+    }
     let refs: Vec<&Appointment> = appts.iter().collect();
     let ics = ics_calendar(Some("PUBLISH"), &refs, s.now());
     let events = appts.len();
+    let work = views::work_hours(s);
+    let html = agenda::agenda_html(
+        &format!("{name} calendar"),
+        &appts,
+        window,
+        &clock,
+        agenda::Options { layout, working_hours_only, work },
+    );
     let calendars: Vec<Value> = s
         .mailbox
         .folders
@@ -1394,6 +1424,9 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
         .collect();
     let mut compose = ComposeState {
         subject: name.clone(),
+        body: mailcraft_html::html_to_doc(&html),
+        format: mailcraft_model::BodyFormat::Html,
+        format_explicit: true,
         attachments: vec![ComposeAttachment {
             filename: format!("{}.ics", file_safe(&name)),
             mime_type: "text/calendar".into(),
@@ -1412,6 +1445,9 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
         "calendars": calendars,
         "range": range,
         "detail": detail,
+        "layout": layout.name(),
+        "workingHoursOnly": working_hours_only,
+        "includeAttachments": include_attachments,
         "from": window.map(|(f, _)| clock.datetime_string(f)),
         "to": window.map(|(_, t)| clock.datetime_string(t)),
     }))
@@ -1446,7 +1482,7 @@ pub const DEFAULT_REMINDER_MIN: u32 = 15;
 /// Longest appointment accepted (seconds; ten years).
 const MAX_SPAN_SECS: i64 = 10 * 366 * pim::DAY_SECS;
 
-const APPT_FIELDS: [&str; 16] = [
+const APPT_FIELDS: [&str; 20] = [
     "subject",
     "location",
     "body",
@@ -1463,7 +1499,136 @@ const APPT_FIELDS: [&str; 16] = [
     "resources",
     "recurrence",
     "timeZone",
+    "endTimeZone",
+    "importance",
+    "bodyHtml",
+    "attachments",
 ];
+
+/// Longest formatted notes accepted (bytes of HTML).
+const MAX_NOTES_HTML: usize = 1024 * 1024;
+
+fn parse_importance(v: &str) -> Option<Importance> {
+    match v {
+        "low" => Some(Importance::Low),
+        "normal" => Some(Importance::Normal),
+        "high" => Some(Importance::High),
+        _ => None,
+    }
+}
+
+/// `low` / `normal` / `high`.
+pub fn importance_name(i: Importance) -> &'static str {
+    match i {
+        Importance::Low => "low",
+        Importance::Normal => "normal",
+        Importance::High => "high",
+    }
+}
+
+/// An IANA zone param (`null` / empty = none).
+fn zone_param(p: &Value, key: &str) -> Result<Option<Option<String>>, CmdError> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(z)) if z.trim().is_empty() => Ok(Some(None)),
+        Some(Value::String(z)) => tz::canonical(z)
+            .map(|c| Some(Some(c)))
+            .ok_or_else(|| CmdError::Params(format!("`{key}`: unknown time zone `{z}`"))),
+        Some(_) => Err(CmdError::Params(format!("`{key}` must be an IANA time zone name"))),
+    }
+}
+
+/// The files of an `attachments` param: each `{"path"}` (a local file) or `{"name", "data_base64",
+/// "mime_type"?}`, within the per-item limits.
+pub fn attachments_param(p: &Value) -> Result<Option<Vec<ItemAttachment>>, CmdError> {
+    let list = match p.get("attachments") {
+        None => return Ok(None),
+        Some(Value::Null) => return Ok(Some(Vec::new())),
+        Some(Value::Array(a)) => a,
+        Some(_) => return Err(CmdError::Params("`attachments` must be a list of files".into())),
+    };
+    if list.len() > MAX_ITEM_ATTACHMENTS {
+        return Err(CmdError::Params(format!("at most {MAX_ITEM_ATTACHMENTS} files can be attached")));
+    }
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for v in list {
+        if !v.is_object() {
+            return Err(CmdError::Params("each attachment must be {path} or {name, data_base64}".into()));
+        }
+        let cap = u64::try_from(MAX_ITEM_ATTACHMENT_BYTES.saturating_sub(total)).unwrap_or(0);
+        let (name, data) = crate::cmd::compose::file_param(v, cap)?.ok_or_else(|| {
+            CmdError::Params("each attachment must be {path} or {name, data_base64}".into())
+        })?;
+        total = total.saturating_add(data.len());
+        if total > MAX_ITEM_ATTACHMENT_BYTES {
+            return Err(CmdError::Failed("the attached files are too large".into()));
+        }
+        let filename: String = name.chars().filter(|c| !c.is_control()).take(255).collect();
+        let mime_type = opt_str(v, "mime_type")
+            .or_else(|| opt_str(v, "mimeType"))
+            .map(|m| m.trim().to_ascii_lowercase())
+            .filter(|m| !m.is_empty() && m.len() <= 200)
+            .unwrap_or_else(|| crate::cmd::compose::mime_for(&filename).to_owned());
+        out.push(ItemAttachment { filename, mime_type, data: data.into() });
+    }
+    Ok(Some(out))
+}
+
+/// The file at `path` as an attachment for the item window (size-capped; its type from its name).
+pub fn attachment_from_path(path: &str) -> Result<ItemAttachment, CmdError> {
+    let cap = u64::try_from(MAX_ITEM_ATTACHMENT_BYTES).unwrap_or(u64::MAX);
+    let (name, data) = crate::cmd::compose::read_file(path, cap)?;
+    let filename: String = name.chars().filter(|c| !c.is_control()).take(255).collect();
+    let mime_type = crate::cmd::compose::mime_for(&filename).to_owned();
+    Ok(ItemAttachment { filename, mime_type, data: data.into() })
+}
+
+/// `calendar.saveAttachment {id, index | name, path}`: writes a file attached to an appointment to `path`
+/// (atomically). `index` picks the file (two files may share a name); `name` alone picks the first file so
+/// named, and with `index` it must match. Without `path` the Save Attachment window asks for one.
+fn run_save_attachment(s: &mut Session, p: &Value) -> CmdResult {
+    let id = pim::require_targets(s, p, Kind::Appointment)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CmdError::Params("`id` is required".into()))?;
+    let a = s.mailbox.appointments.get(&id).ok_or_else(|| CmdError::Params("no such appointment".into()))?;
+    let name = opt_str(p, "name");
+    let by_name = |n: &str| a.attachments.iter().enumerate().find(|(_, f)| f.filename == n);
+    let found = match (opt_u64(p, "index"), name) {
+        (Some(i), _) => usize::try_from(i)
+            .ok()
+            .and_then(|i| a.attachments.get(i).map(|f| (i, f)))
+            // An index from a window opened before the item changed: the name decides then.
+            .filter(|(_, f)| name.is_none_or(|n| f.filename == n))
+            .or_else(|| name.and_then(by_name)),
+        (None, Some(n)) => by_name(n),
+        (None, None) => return Err(CmdError::Params("`index` or `name` of the file is required".into())),
+    };
+    let (index, file) = found.ok_or_else(|| CmdError::Params("the appointment has no such file".into()))?;
+    let Some(path) = opt_str(p, "path").map(str::trim).filter(|x| !x.is_empty()) else {
+        let params = json!({"id": id.0, "index": index, "name": file.filename, "size": file.data.len()});
+        return pim::dialog(s, SAVE_ITEM_FILE, params);
+    };
+    let (name, size, data) = (file.filename.clone(), file.data.len(), file.data.clone());
+    crate::cmd::rules::write_file(std::path::Path::new(path), &data)?;
+    Ok(json!({"saved": path, "name": name, "index": index, "size": size}))
+}
+
+/// Dialog id of the Save Attachment window for a file of a calendar item (a path box; its Save runs
+/// `calendar.saveAttachment` with the path).
+pub const SAVE_ITEM_FILE: &str = "saveItemFile";
+
+/// Attachments as results list them (no file contents).
+fn attachments_json(a: &Appointment) -> Value {
+    Value::Array(
+        a.attachments
+            .iter()
+            .map(|f| json!({"name": f.filename, "mimeType": f.mime_type, "size": f.data.len()}))
+            .collect(),
+    )
+}
 
 /// Start of the next half-hour slot after `now` (local time).
 pub fn next_half_hour(now: DateTime, tz: i32) -> DateTime {
@@ -1578,6 +1743,42 @@ pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> 
     }
     if let Some(v) = pim::text(p, "body")? {
         a.body = v;
+        // Plain notes replace formatted ones unless formatted notes come with them.
+        if p.get("bodyHtml").is_none() {
+            a.body_html = None;
+        }
+    }
+    match p.get("bodyHtml") {
+        None => {}
+        Some(Value::Null) => a.body_html = None,
+        Some(Value::String(h)) => {
+            if h.len() > MAX_NOTES_HTML {
+                return Err(CmdError::Params("`bodyHtml` is too long".into()));
+            }
+            if h.trim().is_empty() {
+                a.body_html = None;
+            } else {
+                // Kept as the notes' formatting; their plain text (search, list, invitation text) follows.
+                let doc = mailcraft_html::html_to_doc(h);
+                a.body_html = Some(mailcraft_html::doc_to_html(&doc));
+                if p.get("body").is_none() {
+                    a.body = mailcraft_html::doc_to_text(&doc).trim_end().to_owned();
+                }
+            }
+        }
+        Some(_) => return Err(CmdError::Params("`bodyHtml` must be HTML text or null".into())),
+    }
+    match p.get("importance") {
+        None | Some(Value::Null) => {}
+        Some(v) => {
+            a.importance = v
+                .as_str()
+                .and_then(parse_importance)
+                .ok_or_else(|| CmdError::Params("`importance` must be low|normal|high".into()))?;
+        }
+    }
+    if let Some(files) = attachments_param(p)? {
+        a.attachments = files;
     }
     let old_len = a.end.unix.saturating_sub(a.start.unix).max(0);
     let all_day = pim::flag(p, "allDay")?;
@@ -1596,6 +1797,10 @@ pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> 
         }
         Some(_) => return Err(CmdError::Params("`timeZone` must be an IANA time zone name".into())),
     }
+    let end_zone = zone_param(p, "endTimeZone")?;
+    if let Some(z) = &end_zone {
+        a.end_tz = z.clone();
+    }
     // Wall-clock times are read in the zone named by this call's `timeZone` (timed appointments), else on the
     // calendar's clock (its named zone, daylight-saving aware, else the session's offset), the clock the
     // calendar views and the appointment window show times on.
@@ -1604,13 +1809,19 @@ pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> 
         _ => None,
     };
     let clock = explicit.map_or_else(|| tz::Clock::of(s), |z| tz::Clock::named(&z, tz));
+    // The end is read in its own zone when this call names one (Time Zones in the item window).
+    let own_end_clock = match &end_zone {
+        Some(Some(z)) if !a.all_day => Some(tz::Clock::named(z, tz)),
+        _ => None,
+    };
+    let end_clock = own_end_clock.as_ref().unwrap_or(&clock);
     let start = clock.date_param(p, "start")?;
     match start {
         Some(Some(t)) => a.start = t,
         Some(None) => return Err(CmdError::Params("`start` cannot be cleared".into())),
         None => {}
     }
-    let end = clock.date_param(p, "end")?;
+    let end = end_clock.date_param(p, "end")?;
     let duration = match p.get("durationMin") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -1634,12 +1845,18 @@ pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> 
     if a.end.unix < a.start.unix {
         return Err(CmdError::Params("the end time is before the start time".into()));
     }
-    // A zoned appointment's times carry its zone's offset (the same instants).
-    if !a.all_day
-        && let Some(z) = a.zone().map(str::to_owned)
-    {
-        a.start = tz::in_zone(&z, a.start).unwrap_or(a.start);
-        a.end = tz::in_zone(&z, a.end).unwrap_or(a.end);
+    // An end zone equal to the start's is no separate zone.
+    if a.all_day || a.end_tz.as_deref().map(str::trim) == a.zone() {
+        a.end_tz = None;
+    }
+    // A zoned appointment's times carry their zone's offset (the same instants).
+    if !a.all_day {
+        if let Some(z) = a.zone().map(str::to_owned) {
+            a.start = tz::in_zone(&z, a.start).unwrap_or(a.start);
+        }
+        if let Some(z) = a.end_zone().map(str::to_owned) {
+            a.end = tz::in_zone(&z, a.end).unwrap_or(a.end);
+        }
     }
     if a.end.unix.saturating_sub(a.start.unix) > MAX_SPAN_SECS {
         return Err(CmdError::Params("the appointment is too long".into()));
@@ -1804,6 +2021,12 @@ fn appointment_json_on(a: &Appointment, clock: &tz::Clock) -> Value {
         "organizer": a.organizer.as_ref().map(Address::to_display_string),
         "tracking": tracking_json(a),
         "timeZone": a.zone(),
+        "endTimeZone": a.end_tz.as_deref().map(str::trim).filter(|z| !z.is_empty()),
+        "importance": importance_name(a.importance),
+        "private": a.private,
+        "formattedNotes": a.body_html.is_some(),
+        "attachments": attachments_json(a),
+        "server": a.remote.is_some(),
     })
 }
 
@@ -1869,10 +2092,17 @@ fn wants_form(p: &Value, default: bool) -> Result<bool, CmdError> {
 fn open_item_form(s: &mut Session, folder: FolderId, p: &Value, meeting: bool) -> CmdResult {
     let a = draft_appointment(s, folder, p, meeting)?;
     let clock = tz::Clock::of(s);
+    // Times in the item's own zones when they are not the calendar's (the window then shows Time Zones).
+    let zones_shown = zones_differ(&clock, &a);
     let (start, end) = if a.all_day {
         // The window shows an all-day event's inclusive last day.
         let last = pim::add_secs(a.end, -1).unix.max(a.start.unix);
         (clock.datetime_string(a.start), clock.datetime_string(DateTime::from_unix(last, a.end.offset_min)))
+    } else if zones_shown {
+        let fallback = s.tz_offset_min;
+        let start_clock = a.zone().map_or_else(|| tz::Clock::of(s), |z| tz::Clock::named(z, fallback));
+        let end_clock = a.end_zone().map_or_else(|| tz::Clock::of(s), |z| tz::Clock::named(z, fallback));
+        (start_clock.datetime_string(a.start), end_clock.datetime_string(a.end))
     } else {
         (clock.datetime_string(a.start), clock.datetime_string(a.end))
     };
@@ -1900,9 +2130,23 @@ fn open_item_form(s: &mut Session, folder: FolderId, p: &Value, meeting: bool) -
         "optional": names(AttendeeRole::Optional),
         "resources": names(AttendeeRole::Resource),
         "timeZone": if a.all_day { None } else { a.tz.clone() },
+        "endTimeZone": if a.all_day { None } else { a.end_tz.clone() },
+        "zonesShown": zones_shown,
+        "importance": importance_name(a.importance),
+        "bodyHtml": a.body_html,
         "focus": if a.subject.trim().is_empty() { "subject" } else { "body" },
     });
     pim::dialog(s, if a.is_meeting { MEETING_FORM } else { APPOINTMENT_FORM }, params)
+}
+
+/// True when a timed appointment's zones are not just the calendar's own: it has an end zone, or a start zone
+/// other than the calendar's. The item window then shows its Time Zones with times in those zones.
+pub fn zones_differ(calendar: &tz::Clock, a: &Appointment) -> bool {
+    if a.all_day {
+        return false;
+    }
+    a.end_tz.as_deref().is_some_and(|z| !z.trim().is_empty())
+        || a.zone().is_some_and(|z| calendar.zone_id().is_none_or(|c| !c.eq_ignore_ascii_case(z)))
 }
 
 /// Dialog id of the appointment window.
@@ -1931,15 +2175,63 @@ pub fn create_meeting(s: &mut Session, p: &Value) -> CmdResult {
     if wants_form(p, !explicit)? {
         return open_item_form(s, folder, p, true);
     }
+    let mode = send_mode(p, SendMode::Edit)?;
+    if mode == SendMode::None {
+        return Err(CmdError::Params("a new meeting is sent: `send` must be now|edit".into()));
+    }
     let id = create_appointment(s, folder, p, true)?;
     let compose =
         meeting_compose(s, id).ok_or_else(|| CmdError::Failed("the meeting could not be created".into()))?;
+    // Until the invitation goes out, discarding it removes the meeting.
+    if let Some(c) = s.composes.get_mut(&compose) {
+        c.pending_meeting = Some(id);
+    }
     let mut out =
         s.mailbox.appointments.get(&id).map_or_else(|| json!({ "id": id.0 }), |a| appointment_summary(s, a));
+    let sent = if mode == SendMode::Now { send_invitation(s, id, compose)? } else { None };
     if let Some(o) = out.as_object_mut() {
-        o.insert("compose".into(), json!(compose));
+        match sent {
+            Some(r) => {
+                o.insert("sent".into(), r.get("sent").cloned().unwrap_or(Value::Bool(false)));
+                if r.get("sent").and_then(Value::as_bool) != Some(true) {
+                    // Stopped for a question in the invitation (S/MIME): it stays open to answer.
+                    o.insert("compose".into(), json!(compose));
+                    if let Some(reason) = r.get("reason") {
+                        o.insert("reason".into(), reason.clone());
+                    }
+                }
+            }
+            None => {
+                o.insert("compose".into(), json!(compose));
+            }
+        }
     }
     Ok(out)
+}
+
+/// Sends the invitation of new meeting `id` from compose `compose` straight away (the meeting window's Send).
+/// A send that fails (no account, a bad address) takes the compose and the meeting away again and reports
+/// the reason, so nothing unsent stays behind.
+fn send_invitation(s: &mut Session, id: ItemId, compose: u64) -> Result<Option<Value>, CmdError> {
+    let notices = s.notices.len();
+    let r = s.run("compose.send", &json!({ "compose": compose, "checkNames": false, "spellCheck": false }));
+    let failure = match &r {
+        Ok(v) if v.get("sent").and_then(Value::as_bool) == Some(true) => None,
+        Ok(v) => v.get("error").and_then(Value::as_str).map(str::to_owned),
+        Err(e) => Some(e.to_string()),
+    };
+    match failure {
+        Some(msg) => {
+            // The window shows the reason; the send's own error notice would repeat it.
+            if s.notices.len() > notices {
+                s.notices.truncate(notices);
+            }
+            s.composes.remove(&compose);
+            s.mailbox.appointments.remove(&id);
+            Err(CmdError::Failed(format!("The meeting was not sent: {msg}")))
+        }
+        None => Ok(r.ok()),
+    }
 }
 
 fn run_new_meeting(s: &mut Session, p: &Value) -> CmdResult {
@@ -1972,9 +2264,24 @@ pub fn meeting_compose_seq(s: &mut Session, id: ItemId, sequence: u32) -> Option
     if !a.location.trim().is_empty() {
         text.push_str(&format!("Where: {}\n", a.location.trim()));
     }
-    if !a.body.trim().is_empty() {
-        text.push('\n');
-        text.push_str(&a.body);
+    // The notes follow, with their formatting when they have it.
+    let mut body = match a.body_html.as_deref() {
+        Some(html) => {
+            text.push('\n');
+            let mut doc = Doc::from_plain_text(&text);
+            doc.blocks.extend(mailcraft_html::html_to_doc(html).blocks);
+            doc
+        }
+        None => {
+            if !a.body.trim().is_empty() {
+                text.push('\n');
+                text.push_str(&a.body);
+            }
+            Doc::from_plain_text(&text)
+        }
+    };
+    if body.blocks.is_empty() {
+        body = Doc::from_plain_text(" ");
     }
     let mut ics = itip::request(&a, sequence, s.now());
     // Options › Calendar › "Allow attendees to propose new times for meetings" off: the request says so
@@ -1987,13 +2294,30 @@ pub fn meeting_compose_seq(s: &mut Session, id: ItemId, sequence: u32) -> Option
         cc,
         from: a.organizer.as_ref().map(Address::to_display_string).unwrap_or_default(),
         subject: a.subject.clone(),
-        body: Doc::from_plain_text(&text),
-        attachments: vec![ComposeAttachment {
-            filename: "invite.ics".into(),
-            mime_type: "text/calendar; method=REQUEST".into(),
-            data: ics.into_bytes(),
-        }],
+        body,
+        // The item's files go with the invitation, then the calendar part.
+        attachments: a
+            .attachments
+            .iter()
+            .map(|f| ComposeAttachment {
+                filename: f.filename.clone(),
+                mime_type: if f.mime_type.trim().is_empty() {
+                    "application/octet-stream".into()
+                } else {
+                    f.mime_type.clone()
+                },
+                data: f.data.to_vec(),
+            })
+            .chain(std::iter::once(ComposeAttachment {
+                filename: "invite.ics".into(),
+                mime_type: "text/calendar; method=REQUEST".into(),
+                data: ics.into_bytes(),
+            }))
+            .collect(),
+        importance: a.importance,
+        sensitivity: if a.private { Sensitivity::Private } else { Sensitivity::Normal },
         dirty: true,
+        meeting: Some(id),
         ..Default::default()
     };
     // Options › Mail › Signatures: the new-messages signature, below the When/Where text.
@@ -2772,6 +3096,8 @@ fn run_edit_occurrence(s: &mut Session, p: &Value) -> CmdResult {
     let (start, end) = occurrence_param(s, &a, p)?;
     let mut ex = a.clone();
     ex.recurrence = None;
+    // The series holds the server link; the exception goes up inside the series' resource.
+    ex.remote = None;
     ex.start = start;
     ex.end = end;
     apply_appointment_fields(s, &mut ex, p)?;
@@ -2812,6 +3138,7 @@ fn split_occurrence(s: &mut Session, series: ItemId, rid: DateTime) -> Option<It
     let mut ex = a.clone();
     ex.id = id;
     ex.recurrence = None;
+    ex.remote = None;
     ex.recurrence_id = Some(start);
     ex.start = start;
     ex.end = end;
@@ -3243,10 +3570,12 @@ fn set_my_response(a: &mut Appointment, me: &Address, response: ResponseStatus) 
     }
 }
 
-/// Keeps what the user set on their copy `old` (folder, reminder, categories, private) on the update `a`.
+/// Keeps what the user set on their copy `old` (folder, reminder, categories, private) on the update `a`, and
+/// its server link, so a synchronised calendar updates the server copy in place.
 fn keep_local(a: &mut Appointment, old: &Appointment) {
     a.id = old.id;
     a.folder = old.folder;
+    a.remote = old.remote.clone();
     a.reminder_min = old.reminder_min;
     a.categories = old.categories.clone();
     a.private = old.private || a.private;
@@ -3307,6 +3636,8 @@ fn store_instance(
         }
         (None, Some(series)) => {
             keep_local(&mut a, &series);
+            // A new exception: the series keeps the server link.
+            a.remote = None;
             ItemId(s.mailbox.alloc_id())
         }
         (None, None) => {
@@ -3795,8 +4126,21 @@ fn run_send_update(s: &mut Session, p: &Value) -> CmdResult {
     if a.attendees.is_empty() {
         return Err(CmdError::Params("the appointment has no attendees".into()));
     }
+    let mode = send_mode(p, SendMode::Edit)?;
+    if mode == SendMode::None {
+        return Err(CmdError::Params("`send` must be now|edit".into()));
+    }
     let compose = meeting_compose_seq(s, a.id, update_sequence(s.now()))
         .ok_or_else(|| CmdError::Failed("the update could not be created".into()))?;
+    if mode == SendMode::Now {
+        let r =
+            s.run("compose.send", &json!({ "compose": compose, "checkNames": false, "spellCheck": false }))?;
+        if r.get("sent").and_then(Value::as_bool) == Some(true) {
+            return Ok(json!({ "id": a.id.0, "sent": true }));
+        }
+        // Not sent: the update stays open to fix and send.
+        return Ok(json!({ "id": a.id.0, "compose": compose, "sent": false, "error": r.get("error") }));
+    }
     Ok(json!({ "id": a.id.0, "compose": compose }))
 }
 
@@ -3921,7 +4265,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Share Calendar",
             "Home › Manage Calendars; Folder › Share",
             "",
-            r#"{"calendar"?: "<calendar name>", "folder"?: number, "range"?: "all|today|tomorrow|next7|next30|custom", "from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD" (custom), "detail"?: "full|limited|availability", "includePrivate"?: bool, "publish"?: bool (publish online and send a sharing invitation with the address instead of a copy; see calendar.publish), "recipients"?: string (invitation recipients)}"#,
+            r#"{"calendar"?: "<calendar name>", "folder"?: number, "range"?: "all|today|tomorrow|next7|next30|custom", "from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD" (custom), "detail"?: "full|limited|availability", "includePrivate"?: bool, "layout"?: "dailySchedule|listOfEvents" (the message body; default dailySchedule), "workingHoursOnly"?: bool, "includeAttachments"?: bool (the items' files go inside the attached calendar), "publish"?: bool (publish online and send a sharing invitation with the address instead of a copy; see calendar.publish), "recipients"?: string (invitation recipients)}"#,
             true,
             run_share,
         ),
@@ -4002,7 +4346,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Appointment",
             "Calendar › Home › New",
             "",
-            r#"{"subject"?, "location"?, "body"?, "start"?: "YYYY-MM-DDTHH:MM", "end"?, "durationMin"?, "timeZone"?: "IANA id", "allDay"?: bool, "showAs"?: "free|workingElsewhere|tentative|busy|outOfOffice", "reminderMin"?: number|null, "private"?: bool, "categories"?: [string], "recurrence"?: "RRULE", "folder"?: number, "form"?: bool, "recurring"?: bool} (no fields or form: true = open the appointment window prefilled; recurring: with the Recurrence dialog)"#,
+            r#"{"subject"?, "location"?, "body"?, "bodyHtml"?: string (formatted notes), "start"?: "YYYY-MM-DDTHH:MM", "end"?, "durationMin"?, "timeZone"?: "IANA id" (start zone), "endTimeZone"?: "IANA id" (end zone, times read in it), "allDay"?: bool, "showAs"?: "free|workingElsewhere|tentative|busy|outOfOffice", "reminderMin"?: number|null, "importance"?: "low|normal|high", "private"?: bool, "categories"?: [string], "attachments"?: [{"path"} | {"name", "data_base64", "mime_type"?}], "recurrence"?: "RRULE", "folder"?: number, "form"?: bool, "recurring"?: bool} (no fields or form: true = open the appointment window prefilled; recurring: with the Recurrence dialog)"#,
             true,
             run_new_appointment,
         ),
@@ -4011,7 +4355,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Meeting",
             "Calendar › Home › New",
             "",
-            r#"{"attendees"?: [string], "optional"?: [string], "resources"?: [string], ...appointment fields, "form"?: bool, "recurring"?: bool} (no start = open the meeting window prefilled; nothing is saved until it is sent)"#,
+            r#"{"attendees"?: [string], "optional"?: [string], "resources"?: [string] (rooms and equipment, invited as RESOURCE attendees), ...appointment fields, "form"?: bool, "recurring"?: bool, "send"?: "edit" (default: the invitation opens in a compose; discarding it removes the meeting) | "now" (send the invitation at once; a failed send saves nothing)} (no start = open the meeting window prefilled; nothing is saved until it is sent)"#,
             true,
             run_new_meeting,
         ),
@@ -4154,12 +4498,30 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec("calendar.tracking", "Tracking", "Meeting › Show", "", r#"{"id": number}"#, false, run_tracking),
         spec(
+            "calendar.addHolidays",
+            "Add Holidays",
+            "File › Options › Calendar › Calendar options",
+            "",
+            r#"{"countries"?: [string] (country codes or names; without: the Add Holidays window), "from"?: year, "to"?: year (default this year and the next two), "folder"?: number}"#,
+            true,
+            holidays::run_add_holidays,
+        ),
+        spec(
+            "calendar.saveAttachment",
+            "Save Attachment",
+            "Appointment › Attachments",
+            "",
+            r#"{"id": number, "name"?: string, "index"?: number, "path"?: string (without: the save dialog)}"#,
+            false,
+            run_save_attachment,
+        ),
+        spec(
             "calendar.sendUpdate",
             "Send Update",
             "Meeting › Actions",
             "",
-            r#"{"id": number}"#,
-            false,
+            r#"{"id": number, "send"?: "edit" (default: open the update in a compose) | "now"}"#,
+            true,
             run_send_update,
         ),
         spec(
@@ -4215,6 +4577,8 @@ pub fn specs() -> Vec<CommandSpec> {
 mod depth_tests;
 #[cfg(test)]
 mod settings_tests;
+#[cfg(test)]
+mod window_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -5020,6 +5384,60 @@ pub(crate) mod tests {
         assert_eq!(msg.event.appointment.organizer.as_ref().unwrap().addr, "me@example.com");
         let ics = String::from_utf8(att.data.clone()).unwrap().replace("\r\n ", "");
         assert!(ics.contains("RSVP=TRUE"), "{ics}");
+    }
+
+    #[test]
+    fn server_links_stay_with_the_item_they_name() {
+        // Regression: a copy and a new exception carried the original's server link (a synchronised calendar
+        // then overwrote the original on the server), while an organizer's update dropped the meeting's link
+        // (its server copy was deleted and uploaded again under the same UID).
+        let link = |n: &str| mailcraft_model::RemoteRef {
+            url: format!("https://dav.example.com/c/{n}.ics"),
+            uid: n.into(),
+            ..Default::default()
+        };
+        let mut org = session();
+        let (meeting, cid) = invite(&mut org);
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let mail = deliver(&org, cid, &mut ann);
+        let r = ann
+            .run("calendar.respond", &json!({"id": mail.0, "response": "accept", "send": "none"}))
+            .unwrap();
+        let appt = ItemId(r["appointment"].as_u64().unwrap());
+        ann.mailbox.appointments.get_mut(&appt).unwrap().remote = Some(link("m"));
+        org.run("calendar.update", &json!({"id": meeting.0, "location": "Room 5"})).unwrap();
+        let up =
+            org.run("calendar.sendUpdate", &json!({"id": meeting.0})).unwrap()["compose"].as_u64().unwrap();
+        let upd = deliver(&org, up, &mut ann);
+        ann.run("calendar.respond", &json!({"id": upd.0, "response": "accept", "send": "none"})).unwrap();
+        assert_eq!(ann.mailbox.appointments[&appt].location, "Room 5");
+        assert_eq!(ann.mailbox.appointments[&appt].remote, Some(link("m")), "the update keeps the link");
+        // A copy in the same calendar is a new server item.
+        let cal = role(&ann, FolderRole::Calendar);
+        let copy = ann.run("calendar.copy", &json!({"id": appt.0, "folder": cal.0})).unwrap()["copies"][0]
+            .as_u64()
+            .unwrap();
+        assert_eq!(ann.mailbox.appointments[&ItemId(copy)].remote, None);
+        // An exception of a synchronised series goes up inside the series: it has no link of its own.
+        let series = ann
+            .run(
+                "calendar.newAppointment",
+                &json!({"subject": "Gym", "start": "2026-10-12T07:00", "durationMin": 60, "recurrence": "FREQ=DAILY;COUNT=5"}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        ann.mailbox.appointments.get_mut(&ItemId(series)).unwrap().remote = Some(link("gym"));
+        let ex = ann
+            .run(
+                "calendar.editOccurrence",
+                &json!({"id": series, "occurrence": "2026-10-13T07:00", "subject": "Gym (late)"}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(ann.mailbox.appointments[&ItemId(ex)].remote, None);
+        assert_eq!(ann.mailbox.appointments[&ItemId(series)].remote, Some(link("gym")));
     }
 
     #[test]

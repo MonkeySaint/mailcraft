@@ -534,6 +534,14 @@ pub struct ComposeState {
     /// The members of the group last ungrouped (Regroup).
     #[serde(skip)]
     pub last_ungrouped: Vec<u32>,
+
+    // --- meeting invitations ---
+    /// The new meeting this compose invites to, not yet sent: discarding or closing the compose without
+    /// sending removes the meeting too, so no unsent meeting stays on the calendar.
+    pub pending_meeting: Option<ItemId>,
+    /// The meeting whose invitation or update this compose carries: once it is sent, the attendees have the
+    /// meeting, so no other compose's [`Self::pending_meeting`] takes it off the calendar any more.
+    pub meeting: Option<ItemId>,
 }
 
 /// Edits that share one undo step while they follow each other at the caret (typing a word, holding

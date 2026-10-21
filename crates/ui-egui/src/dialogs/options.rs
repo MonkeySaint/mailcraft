@@ -60,7 +60,7 @@ const BUTTONS: &[(&str, &str, &str, Act)] = &[
     ("mail", "MailCraft panes", "Reading Pane...", Dialog("readingPaneOptions")),
     ("mail", "Conversation Clean Up", "Browse...", PickFolder("mail.cleanup.folder")),
     ("mail", "Send messages", "Empty Auto-Complete List", Cmd("compose.emptyAutoComplete")),
-    ("calendar", "Calendar options", "Add Holidays...", Info("Holiday calendars are not bundled yet.")),
+    ("calendar", "Calendar options", "Add Holidays...", Cmd("calendar.addHolidays")),
     ("calendar", "Calendar options", "Free/Busy Options...", Info(NEEDS_SERVER)),
     ("tasks", "Task options", "Quick Click...", Cmd("mail.setQuickClickFlag")),
     ("search", "Results", "Indexing Options...", Cmd("search.searchTools")),

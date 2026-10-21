@@ -447,6 +447,7 @@ struct Extra {
     dav_url: String,
     dav_contacts: bool,
     dav_tasks: bool,
+    dav_calendar: bool,
     dav_publish: String,
     dav_user: String,
 }
@@ -482,6 +483,7 @@ impl Extra {
             dav_url: String::new(),
             dav_contacts: true,
             dav_tasks: true,
+            dav_calendar: true,
             dav_publish: String::new(),
             dav_user: String::new(),
         }
@@ -491,11 +493,13 @@ impl Extra {
         let d = d.cloned().unwrap_or(mailcraft_model::DavSettings {
             contacts: true,
             tasks: true,
+            calendar: true,
             ..Default::default()
         });
         self.dav_url = d.url;
         self.dav_contacts = d.contacts;
         self.dav_tasks = d.tasks;
+        self.dav_calendar = d.calendar;
         self.dav_publish = d.publish_url;
         self.dav_user = d.username;
     }
@@ -509,6 +513,7 @@ impl Extra {
             "url": self.dav_url.trim(),
             "contacts": self.dav_contacts,
             "tasks": self.dav_tasks,
+            "calendar": self.dav_calendar,
             "publishUrl": self.dav_publish.trim(),
             "username": self.dav_user.trim(),
         })
@@ -1219,8 +1224,8 @@ fn more_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
     });
 }
 
-/// Contacts, tasks and calendar server: the CardDAV / CalDAV address Send/Receive keeps the Contacts and
-/// Tasks folders in step with, the WebDAV location calendars are published to, and (IMAP) the other users'
+/// Contacts, tasks and calendar server: the CardDAV / CalDAV address Send/Receive keeps the Contacts, Tasks
+/// and Calendar folders in step with, the WebDAV location calendars are published to, and (IMAP) the other users'
 /// and shared mailboxes the login can open as mailboxes of their own.
 fn pim_server_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
     egui::CollapsingHeader::new("Contacts, Tasks and Calendar Server").id_salt(("mc-wiz-dav", uid)).show(ui, |ui| {
@@ -1232,6 +1237,7 @@ fn pim_server_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut e.dav_contacts, "Keep Contacts on the server");
                 ui.checkbox(&mut e.dav_tasks, "Keep Tasks on the server");
+                ui.checkbox(&mut e.dav_calendar, "Keep Calendar on the server");
             });
             ui.end_row();
             grid_edit(ui, "Publish calendars to:", &mut e.dav_publish, "https://dav.example.com/public/", false);
@@ -1240,7 +1246,7 @@ fn pim_server_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
             ui.end_row();
         });
         ui.label(
-            RichText::new("The server's password is the account's. Send/Receive updates contacts, tasks and published calendars.")
+            RichText::new("The server's password is the account's. Send/Receive updates contacts, tasks, calendars and published calendars.")
                 .color(app.theme.text_muted),
         );
     });

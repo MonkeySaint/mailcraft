@@ -827,7 +827,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.add",
             "Add Account",
-            r#"{"kind": "imap"|"jmap", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL)"#,
+            r#"{"kind": "imap"|"jmap", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL)"#,
             true,
             always,
             add,
@@ -835,7 +835,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.edit",
             "Change Account",
-            r#"{"account": number|string, "displayName"?, "senderName"?, "address"?, "incoming"?: server, "outgoing"?: server|null, "password"?, "outgoingPassword"?, "oauthToken"?, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string}|null}"#,
+            r#"{"account": number|string, "displayName"?, "senderName"?, "address"?, "incoming"?: server, "outgoing"?: server|null, "password"?, "outgoingPassword"?, "oauthToken"?, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string}|null}"#,
             true,
             has_server_account,
             edit,
@@ -1034,6 +1034,7 @@ fn dav_json(d: &DavSettings) -> Value {
         "url": d.url,
         "contacts": d.contacts,
         "tasks": d.tasks,
+        "calendar": d.calendar,
         "publishUrl": d.publish_url,
         "username": d.username,
     })
@@ -1061,7 +1062,12 @@ fn parse_dav(p: &Value, old: Option<&DavSettings>) -> Result<Option<Option<DavSe
     if !v.is_object() {
         return Err(CmdError::Params("`dav` must be an object or null".into()));
     }
-    let mut d = old.cloned().unwrap_or(DavSettings { contacts: true, tasks: true, ..Default::default() });
+    let mut d = old.cloned().unwrap_or(DavSettings {
+        contacts: true,
+        tasks: true,
+        calendar: true,
+        ..Default::default()
+    });
     if let Some(u) = str_field(v, &["url"])? {
         d.url = dav_url("the contacts and tasks server", u)?;
     }
@@ -1076,6 +1082,9 @@ fn parse_dav(p: &Value, old: Option<&DavSettings>) -> Result<Option<Option<DavSe
     }
     if let Some(b) = opt_bool(v, "tasks") {
         d.tasks = b;
+    }
+    if let Some(b) = opt_bool(v, "calendar") {
+        d.calendar = b;
     }
     if d.url.is_empty() && d.publish_url.is_empty() {
         return Ok(Some(None));
@@ -1096,6 +1105,9 @@ fn forget_dav(s: &mut Session, id: AccountId) {
     }
     for t in s.mailbox.tasks.values_mut().filter(|t| own.contains(&t.folder)) {
         t.remote = None;
+    }
+    for a in s.mailbox.appointments.values_mut().filter(|a| own.contains(&a.folder)) {
+        a.remote = None;
     }
     if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == id) {
         a.sync.dav.clear();

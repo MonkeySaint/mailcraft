@@ -1158,6 +1158,12 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     s.composes.remove(&cid);
+    // A meeting's invitation or update went out: another unsent invitation for it no longer owns it.
+    if let Some(m) = c.meeting {
+        for other in s.composes.values_mut().filter(|o| o.pending_meeting == Some(m)) {
+            other.pending_meeting = None;
+        }
+    }
     // Rules for sent messages (Cc, defer delivery, sensitivity…) edit the Outbox copy before it goes out.
     crate::rules_exec::on_send(s, &[id]);
     // Delay Delivery or a deferring rule: the message waits in the Outbox until its send time.
@@ -1235,26 +1241,46 @@ fn auto_save_tick(s: &mut Session, _p: &Value) -> CmdResult {
 fn discard(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
     let c = s.composes.remove(&cid);
+    let meeting = c.as_ref().and_then(|c| c.pending_meeting);
     let draft = c.and_then(|c| c.draft);
     if let Some(d) = draft {
         s.mailbox.mail.remove(&d);
     }
-    Ok(json!({"discarded": cid, "draftRemoved": draft.map(|d| d.0)}))
+    let removed = drop_pending_meeting(s, meeting);
+    Ok(json!({"discarded": cid, "draftRemoved": draft.map(|d| d.0), "meetingRemoved": removed.map(|m| m.0)}))
+}
+
+/// A new meeting whose invitation was never sent leaves the calendar with its compose. Returns the meeting
+/// removed.
+fn drop_pending_meeting(s: &mut Session, meeting: Option<ItemId>) -> Option<ItemId> {
+    let id = meeting?;
+    // Another compose may still carry the invitation (none does today, but never strand one).
+    if s.composes.values().any(|c| c.pending_meeting == Some(id)) {
+        return None;
+    }
+    s.mailbox.appointments.remove(&id).map(|_| id)
 }
 
 fn close(s: &mut Session, p: &Value) -> CmdResult {
     let cid = compose_id(s, p)?;
     let dirty = s.composes.get(&cid).is_some_and(|c| c.dirty);
+    // An invitation never saved to Drafts: closing it without saving takes its meeting off the calendar.
+    let unsaved_invitation =
+        s.composes.get(&cid).is_some_and(|c| c.pending_meeting.is_some() && c.draft.is_none());
     match opt_bool(p, "save") {
         None if dirty => dialog(s, "saveChanges", json!({"compose": cid})),
-        Some(true) if dirty => {
+        Some(true) if dirty || unsaved_invitation => {
             let id = save_draft(s, cid)?;
+            // The invitation stays as a draft: the meeting waits on the calendar for it.
             s.composes.remove(&cid);
             Ok(json!({"closed": cid, "draft": id.0}))
         }
         _ => {
-            s.composes.remove(&cid);
-            Ok(json!({"closed": cid}))
+            // A saved invitation (Save, or auto-save) waits in Drafts, and its meeting on the calendar.
+            let meeting =
+                s.composes.remove(&cid).and_then(|c| c.pending_meeting).filter(|_| unsaved_invitation);
+            let removed = drop_pending_meeting(s, meeting);
+            Ok(json!({"closed": cid, "meetingRemoved": removed.map(|m| m.0)}))
         }
     }
 }

@@ -68,8 +68,20 @@ struct ShareForm {
     include_private: bool,
     /// Publish online (WebDAV) and send a sharing invitation with the address instead of a copy.
     publish: bool,
+    /// Advanced shown.
+    advanced: bool,
+    /// The message body's layout: `dailySchedule` or `listOfEvents`.
+    layout: String,
+    /// Only timed events inside the work hours.
+    working_hours_only: bool,
+    /// Include the items' attached files.
+    include_attachments: bool,
     error: String,
 }
+
+/// Layouts of the shared events in the message (engine id, label).
+pub(crate) const SHARE_LAYOUTS: [(&str, &str); 2] =
+    [("dailySchedule", "Daily schedule"), ("listOfEvents", "List of events")];
 
 /// Date ranges Share Calendar offers (engine id, label).
 const SHARE_RANGES: [(&str, &str); 6] = [
@@ -372,6 +384,7 @@ fn open(app: &mut App, cu: &mut CalUi, name: &str, p: &Value) {
                 from: day.clone(),
                 to: day,
                 detail: "availability".into(),
+                layout: "dailySchedule".into(),
                 ..Default::default()
             });
         }
@@ -762,7 +775,14 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                     ui.end_row();
                 });
                 ui.add_space(4.0);
-                ui.label(RichText::new("List and Active views").strong());
+                ui.label(RichText::new("Columns, filter and formatting").strong());
+                ui.label(
+                    RichText::new(
+                        "The filter and conditional formatting apply to the Day, Week, Month and Schedule views \
+                         too; columns, grouping and grid lines to the List and Active views.",
+                    )
+                    .color(app.theme.text_muted),
+                );
                 table_settings(ui, &mut f);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -932,6 +952,40 @@ fn share_window(ctx: &egui::Context, app: &mut App, cu: &mut CalUi) {
                 );
                 ui.end_row();
             }
+            // Advanced: how the events read in the message itself.
+            if !f.publish {
+                ui.label("");
+                let label = if f.advanced { "Hide Advanced" } else { "Advanced…" };
+                if ui.button(label).clicked() {
+                    f.advanced = !f.advanced;
+                }
+                ui.end_row();
+                if f.advanced {
+                    ui.label("E-mail layout:");
+                    let label = SHARE_LAYOUTS.iter().find(|(k, _)| *k == f.layout).map_or("", |(_, l)| *l);
+                    ComboBox::from_id_salt("mc-cal-share-layout").selected_text(label).width(240.0).show_ui(
+                        ui,
+                        |ui| {
+                            for (k, l) in SHARE_LAYOUTS {
+                                ui.selectable_value(&mut f.layout, k.to_owned(), l);
+                            }
+                        },
+                    );
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut f.working_hours_only, "Only times inside my work hours");
+                    ui.end_row();
+                    ui.label("");
+                    ui.add_enabled(
+                        f.detail == "full",
+                        egui::Checkbox::new(
+                            &mut f.include_attachments,
+                            "Put the items' files in the attached calendar",
+                        ),
+                    );
+                    ui.end_row();
+                }
+            }
             let published = mailcraft_engine::cmd::calendar::props::read(&app.s.mailbox, FolderId(f.folder))
                 .publication
                 .filter(|x| !x.withdraw);
@@ -966,6 +1020,12 @@ fn share_window(ctx: &egui::Context, app: &mut App, cu: &mut CalUi) {
                 "detail": f.detail,
                 "includePrivate": f.include_private && f.detail != "availability",
             });
+            if !f.publish {
+                let layout = if f.layout.is_empty() { "dailySchedule" } else { f.layout.as_str() };
+                put(&mut p, "layout", json!(layout));
+                put(&mut p, "workingHoursOnly", json!(f.working_hours_only));
+                put(&mut p, "includeAttachments", json!(f.include_attachments && f.detail == "full"));
+            }
             if f.publish {
                 if f.range == "custom" {
                     f.error =

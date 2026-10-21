@@ -373,6 +373,28 @@ fn share_and_view_windows_are_the_calendars_own() {
 }
 
 #[test]
+fn share_window_advanced_options_shape_the_message() {
+    let mut h = harness(app());
+    let mut st = load(&h.ctx);
+    super::run_view_cmd(h.state_mut(), &mut st, "calendar.share", json!({}));
+    store(&h.ctx, st);
+    h.run_ok();
+    h.get_by_label("Advanced…").click();
+    h.run_ok();
+    assert!(has(&h, "Only times inside my work hours"));
+    assert!(has(&h, "Put the items' files in the attached calendar"));
+    h.get_by_label("Only times inside my work hours").click();
+    h.run_ok();
+    h.get_by_label("OK").click();
+    h.run_ok();
+    let s = &h.state().s;
+    let c = s.composes.values().last().expect("the calendar went into a message");
+    let body = mailcraft_html::doc_to_text(&c.body);
+    assert!(body.contains("working hours"), "{body}");
+    assert!(c.attachments.iter().any(|a| a.filename.ends_with(".ics")));
+}
+
+#[test]
 fn saved_view_from_the_save_window_is_listed() {
     let mut h = harness(app());
     let mut st = load(&h.ctx);

@@ -277,6 +277,27 @@ fn sample_appointment() -> Appointment {
 }
 
 #[test]
+fn stored_events_leave_scheduling_to_the_client() {
+    // Regression: events kept on a CalDAV server carried plain ORGANIZER / ATTENDEE, so a server that
+    // schedules (RFC 6638) mailed the attendees itself, next to the invitations MailCraft sends.
+    let a = sample_appointment();
+    let now = utc(2026, 10, 1, 0, 0);
+    let unfold = |t: String| t.replace("\r\n ", "");
+    let stored = unfold(ics::write_stored(&[&a], now));
+    let people: Vec<&str> =
+        stored.split("\r\n").filter(|l| l.starts_with("ORGANIZER") || l.starts_with("ATTENDEE")).collect();
+    assert_eq!(people.len(), 4, "{stored}");
+    assert!(people.iter().all(|l| l.contains(";SCHEDULE-AGENT=CLIENT")), "{people:?}");
+    // It reads back the same; exports and invitations do not carry the parameter.
+    let back = ics::read(stored.as_bytes(), ImportOptions::default()).unwrap();
+    let e = &back.events[0].appointment;
+    assert_eq!(e.organizer.as_ref().unwrap().addr, "ann@example.com");
+    assert_eq!(e.attendees.len(), 3);
+    assert!(!unfold(ics::write(&[&a], &[], None, now)).contains("SCHEDULE-AGENT"));
+    assert!(!unfold(itip::request(&a, 1, now)).contains("SCHEDULE-AGENT"));
+}
+
+#[test]
 fn appointments_round_trip() {
     let a = sample_appointment();
     let all_day = Appointment {
@@ -626,4 +647,66 @@ fn named_zone_vtimezone_round_trips() {
         }
         assert_eq!(tz::equivalent_builtin(&back, 2026).map(tz::builtin_name), Some(tz::builtin_name(name)));
     }
+}
+
+#[test]
+fn item_window_details_round_trip() {
+    use mailcraft_model::Importance;
+    use mailcraft_model::calendar::ItemAttachment;
+    // A flight: leaves Toronto, lands in London (an end in another zone), with formatted notes, a file and
+    // high importance.
+    let a = Appointment {
+        uid: "flight@example.com".into(),
+        subject: "Flight".into(),
+        start: utc(2026, 11, 2, 23, 0),
+        end: utc(2026, 11, 3, 6, 0),
+        tz: Some("America/Toronto".into()),
+        end_tz: Some("Europe/London".into()),
+        importance: Importance::High,
+        body: "Gate 4".into(),
+        body_html: Some("<p>Gate <b>4</b>; seat 12A</p>".into()),
+        attachments: vec![ItemAttachment {
+            filename: "boarding pass, final.pdf".into(),
+            mime_type: "application/pdf".into(),
+            data: b"%PDF-1.4 synthetic".as_slice().into(),
+        }],
+        ..Default::default()
+    };
+    let low = Appointment {
+        uid: "low@example.com".into(),
+        start: utc(2026, 1, 2, 3, 4),
+        end: utc(2026, 1, 2, 4, 4),
+        importance: Importance::Low,
+        ..Default::default()
+    };
+    let text = ics::write(&[&a, &low], &[], None, utc(2026, 10, 1, 0, 0));
+    assert!(text.contains("DTSTART;TZID=America/Toronto:20261102T180000"), "{text}");
+    assert!(text.contains("DTEND;TZID=Europe/London:20261103T060000"), "{text}");
+    assert!(text.contains("PRIORITY:1"), "{text}");
+    assert!(text.contains("PRIORITY:9"), "{text}");
+    assert!(text.contains("X-ALT-DESC;FMTTYPE=text/html:"), "{text}");
+    let back = ics::read_str(&text, ImportOptions::default()).unwrap().appointments();
+    let b = back.iter().find(|x| x.uid == "flight@example.com").unwrap();
+    assert_eq!((b.start.unix, b.end.unix), (a.start.unix, a.end.unix));
+    assert_eq!(b.tz.as_deref(), Some("America/Toronto"));
+    assert_eq!(b.end_tz.as_deref(), Some("Europe/London"));
+    assert_eq!(b.end_zone(), Some("Europe/London"));
+    assert_eq!(b.importance, Importance::High);
+    assert_eq!(b.body_html, a.body_html);
+    assert_eq!(b.attachments, a.attachments);
+    let l = back.iter().find(|x| x.uid == "low@example.com").unwrap();
+    assert_eq!(l.importance, Importance::Low);
+    assert_eq!(l.end_tz, None);
+    // Invitations carry the files as message attachments, not inside the calendar data.
+    let invite = itip::request(&a, 0, utc(2026, 10, 1, 0, 0));
+    assert!(!invite.contains("ATTACH"), "{invite}");
+    assert!(invite.contains("PRIORITY:1"), "{invite}");
+    // Hostile input: junk base64 and notes that are not HTML are dropped, never a panic.
+    let junk = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:j\r\nDTSTART:20260101T000000Z\r\n\
+ATTACH;ENCODING=BASE64;VALUE=BINARY:@@@@\r\nATTACH:https://example.com/x.pdf\r\nPRIORITY:x\r\n\
+X-ALT-DESC;FMTTYPE=text/plain:not html\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let j = ics::read_str(junk, ImportOptions::default()).unwrap().appointments();
+    assert!(j[0].attachments.is_empty(), "{:?}", j[0].attachments);
+    assert_eq!(j[0].body_html, None);
+    assert_eq!(j[0].importance, Importance::Normal);
 }

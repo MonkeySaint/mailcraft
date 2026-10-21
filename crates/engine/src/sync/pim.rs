@@ -1,15 +1,23 @@
-//! Contacts and tasks kept on a CardDAV (RFC 6352) / CalDAV (RFC 4791) server, and calendars published to a
-//! WebDAV server: everything here except the network (the native worker side is `sync/dav.rs`).
+//! Contacts, tasks and events kept on a CardDAV (RFC 6352) / CalDAV (RFC 4791) server, and calendars
+//! published to a WebDAV server: everything here except the network (the native worker side is
+//! `sync/dav.rs`).
 //!
 //! **Mapping.** An account's DAV settings ([`mailcraft_model::DavSettings`]) name the server; send/receive
-//! discovers its address books and task lists. The account's Contacts folder takes the first address book and
-//! its Tasks folder the first task list; further collections get folders of their own below them. The mapping
-//! (collection URL and the ETags seen at the last synchronisation) lives in `AccountSync::dav`.
+//! discovers its address books, task lists and calendars. The account's Contacts folder takes the first
+//! address book, its Tasks folder the first task list and its Calendar the first calendar of events; further
+//! collections get folders of their own below them. The mapping (collection URL and the ETags seen at the
+//! last synchronisation) lives in `AccountSync::dav`.
 //!
 //! **Items.** A synchronised contact or task carries a [`RemoteRef`]: resource URL, ETag, UID and the
 //! fingerprint of the item as last synchronised. The fingerprint is a hash of the vCard / VTODO MailCraft
 //! writes for the item, so an edit of anything the server keeps marks it changed; local-only details (a
 //! contact's follow-up flag, a task's link to the mail it came from) do not.
+//!
+//! **Events.** The server keeps a recurring series and its exceptions (RECURRENCE-ID) as one resource; here
+//! they are separate appointments sharing a UID ([`event_groups`]). The group's lead (the series, else its
+//! first instance) holds the [`RemoteRef`]; the fingerprint covers the whole group, so editing one occurrence
+//! uploads the resource again. A collection holding both events and tasks is shared by the Calendar and the
+//! Tasks folder: each takes its own kind of object and leaves the other's alone.
 //!
 //! **Rules.** Changed here and unchanged there: uploaded with `If-Match`. Changed there: the server copy
 //! replaces the local one unless the item was also changed here, in which case the local copy is uploaded
@@ -25,7 +33,8 @@ use mailcraft_formats::vcf;
 use mailcraft_model::account::DavFolderState;
 use mailcraft_model::task::TaskRecurrence;
 use mailcraft_model::{
-    AccountId, Contact, DateTime, Folder, FolderId, FolderKind, FolderRole, ItemId, Mailbox, RemoteRef, Task,
+    AccountId, Appointment, Contact, DateTime, Folder, FolderId, FolderKind, FolderRole, ItemId, Mailbox,
+    RemoteRef, Task,
 };
 
 use super::Plan;
@@ -39,6 +48,8 @@ pub const MAX_ITEMS: usize = 20_000;
 pub enum PimKind {
     Contacts,
     Tasks,
+    /// Events (VEVENT) of a calendar.
+    Calendar,
 }
 
 impl PimKind {
@@ -46,6 +57,7 @@ impl PimKind {
         match kind {
             FolderKind::Contacts => Some(PimKind::Contacts),
             FolderKind::Tasks => Some(PimKind::Tasks),
+            FolderKind::Calendar => Some(PimKind::Calendar),
             _ => None,
         }
     }
@@ -53,25 +65,27 @@ impl PimKind {
         match self {
             PimKind::Contacts => FolderKind::Contacts,
             PimKind::Tasks => FolderKind::Tasks,
+            PimKind::Calendar => FolderKind::Calendar,
         }
     }
     pub fn role(self) -> FolderRole {
         match self {
             PimKind::Contacts => FolderRole::Contacts,
             PimKind::Tasks => FolderRole::Tasks,
+            PimKind::Calendar => FolderRole::Calendar,
         }
     }
     /// File name extension of a resource.
     pub fn extension(self) -> &'static str {
         match self {
             PimKind::Contacts => "vcf",
-            PimKind::Tasks => "ics",
+            PimKind::Tasks | PimKind::Calendar => "ics",
         }
     }
     pub fn content_type(self) -> &'static str {
         match self {
             PimKind::Contacts => "text/vcard; charset=utf-8",
-            PimKind::Tasks => "text/calendar; charset=utf-8",
+            PimKind::Tasks | PimKind::Calendar => "text/calendar; charset=utf-8",
         }
     }
     /// Progress wording ("Updating contacts…").
@@ -79,9 +93,21 @@ impl PimKind {
         match self {
             PimKind::Contacts => "contacts",
             PimKind::Tasks => "tasks",
+            PimKind::Calendar => "calendars",
+        }
+    }
+    /// Whether the account's DAV settings turn this kind on.
+    pub fn enabled(self, d: &mailcraft_model::DavSettings) -> bool {
+        match self {
+            PimKind::Contacts => d.contacts,
+            PimKind::Tasks => d.tasks,
+            PimKind::Calendar => d.calendar,
         }
     }
 }
+
+/// Most appointments read from one server resource (a series and its exceptions).
+pub const MAX_GROUP: usize = 2_000;
 
 /// FNV-1a 64: a stable fingerprint (the same on every build and platform).
 pub fn fnv(data: &[u8]) -> u64 {
@@ -129,6 +155,124 @@ pub fn task_fingerprint(t: &Task) -> u64 {
     let mut plain = t.clone();
     plain.uid.clear();
     fnv(task_calendar(&plain, "", DateTime::from_unix(0, 0)).as_bytes())
+}
+
+/// Appointments of one folder that the server keeps as one resource: a series (or a lone event) with the
+/// exceptions sharing its UID, or the instances of a series that is not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventGroup {
+    /// The series, else the first instance: it holds the server link.
+    pub lead: ItemId,
+    /// Every appointment of the group, the lead first.
+    pub members: Vec<ItemId>,
+    /// The UID the group shares (empty when the lead has none, or another series of the folder already uses
+    /// it: the group then goes up under a new one).
+    pub uid: String,
+}
+
+/// The event groups of `folder`, in item order. A second series with a UID already taken (a copy) is a group
+/// of its own without a UID.
+pub fn event_groups(mb: &Mailbox, folder: FolderId) -> Vec<EventGroup> {
+    let mut items: Vec<&Appointment> = mb.appointments.values().filter(|a| a.folder == folder).collect();
+    items.sort_by_key(|a| a.id);
+    let mut groups: Vec<EventGroup> = Vec::new();
+    let mut by_uid: BTreeMap<String, usize> = BTreeMap::new();
+    for a in items.iter().filter(|a| a.recurrence_id.is_none()) {
+        let uid = a.uid.trim();
+        if !uid.is_empty() && !by_uid.contains_key(uid) {
+            by_uid.insert(uid.to_owned(), groups.len());
+            groups.push(EventGroup { lead: a.id, members: vec![a.id], uid: uid.to_owned() });
+        } else {
+            groups.push(EventGroup { lead: a.id, members: vec![a.id], uid: String::new() });
+        }
+    }
+    for a in items.iter().filter(|a| a.recurrence_id.is_some()) {
+        let uid = a.uid.trim();
+        match by_uid.get(uid).and_then(|&i| groups.get_mut(i)) {
+            Some(g) if !uid.is_empty() => g.members.push(a.id),
+            _ => {
+                if !uid.is_empty() {
+                    by_uid.insert(uid.to_owned(), groups.len());
+                }
+                groups.push(EventGroup { lead: a.id, members: vec![a.id], uid: uid.to_owned() });
+            }
+        }
+    }
+    groups
+}
+
+/// The members of every event group of `folder`, by lead (one scan of the calendar).
+fn groups_by_lead(mb: &Mailbox, folder: FolderId) -> BTreeMap<ItemId, Vec<ItemId>> {
+    event_groups(mb, folder).into_iter().map(|g| (g.lead, g.members)).collect()
+}
+
+/// The iCalendar object MailCraft uploads for a group of appointments (all under `uid`): the series first,
+/// then its exceptions. An instance the group overrides is not also an EXDATE of the series (RFC 5545:
+/// RECURRENCE-ID names an instance of the set). Organizer and attendees say the client schedules
+/// (SCHEDULE-AGENT=CLIENT): MailCraft mails the invitations, so the server must not send its own.
+pub fn event_calendar(items: &[&Appointment], uid: &str, now: DateTime) -> String {
+    stored_events(items, uid, now, false)
+}
+
+/// [`event_calendar`]; with `digest_files` each attached file is written as its length and hash instead of
+/// its contents (for fingerprints: no base64 of large files on every run).
+fn stored_events(items: &[&Appointment], uid: &str, now: DateTime, digest_files: bool) -> String {
+    let uid = clean_uid(uid);
+    let overridden: BTreeSet<i64> = items.iter().filter_map(|a| a.recurrence_id.map(|r| r.unix)).collect();
+    let mut plain: Vec<Appointment> = items
+        .iter()
+        .take(MAX_GROUP)
+        .map(|a| {
+            let mut x = (*a).clone();
+            x.remote = None;
+            x.uid = uid.clone();
+            if let Some(r) = x.recurrence.as_mut() {
+                r.exdates.retain(|d| !overridden.contains(&d.unix));
+            }
+            if digest_files {
+                for f in &mut x.attachments {
+                    let digest = format!("{}:{:016x}", f.data.len(), fnv(&f.data));
+                    f.data = std::sync::Arc::from(digest.as_bytes());
+                }
+            }
+            x
+        })
+        .collect();
+    plain.sort_by_key(|a| (a.recurrence_id.is_some(), a.recurrence_id.map(|r| r.unix), a.start.unix, a.id));
+    let refs: Vec<&Appointment> = plain.iter().collect();
+    ics::write_stored(&refs, now)
+}
+
+/// Fingerprint of a group of appointments (what the server keeps of them; not the UID).
+pub fn event_fingerprint(items: &[&Appointment]) -> u64 {
+    fnv(stored_events(items, "fingerprint", DateTime::from_unix(0, 0), true).as_bytes())
+}
+
+/// The appointments of a server object (the events sharing its first event's UID) and that UID; `None` when
+/// it holds no event.
+pub fn read_events(data: &str, tz_offset_min: i32) -> Option<(Vec<Appointment>, String)> {
+    let cal = ics::read_str(data, ImportOptions { local_offset_min: tz_offset_min }).ok()?;
+    let uid = cal.events.first().map(|e| e.appointment.uid.trim().to_owned())?;
+    let list: Vec<Appointment> = cal
+        .events
+        .into_iter()
+        .filter(|e| e.appointment.uid.trim() == uid)
+        .take(MAX_GROUP)
+        .map(|e| e.appointment)
+        .collect();
+    Some((list, uid))
+}
+
+/// True when `data` is an iCalendar object of the other calendar kind: a task (VTODO) without events for a
+/// calendar folder, an event without tasks for a tasks folder. A collection holding both is shared.
+fn other_kind(kind: PimKind, data: &str) -> bool {
+    let comps = ics::parse::parse(data);
+    let has = |name: &'static str| comps.iter().any(|c| c.children_named(name).next().is_some());
+    match kind {
+        PimKind::Calendar => has("VTODO") && !has("VEVENT"),
+        PimKind::Tasks => has("VEVENT") && !has("VTODO"),
+        PimKind::Contacts => false,
+    }
 }
 
 /// Unfolded content lines (RFC 6350 / 5545 line folding).
@@ -247,11 +391,12 @@ pub fn server_identity(kind: PimKind, data: &str) -> (String, Option<u64>) {
             Some((c, uid)) => (uid, Some(contact_fingerprint(&c))),
             None => (String::new(), None),
         },
-        PimKind::Tasks => {
+        PimKind::Tasks | PimKind::Calendar => {
+            let name = if kind == PimKind::Tasks { "VTODO" } else { "VEVENT" };
             let comps = ics::parse::parse(data);
             let uid = comps
                 .iter()
-                .flat_map(|c| c.children_named("VTODO"))
+                .flat_map(|c| c.children_named(name))
                 .next()
                 .and_then(|c| c.text("UID"))
                 .map(|u| u.trim().to_owned())
@@ -349,6 +494,7 @@ pub enum PimEvent {
     Collections {
         contacts: Option<Vec<(String, String)>>,
         tasks: Option<Vec<(String, String)>>,
+        calendars: Option<Vec<(String, String)>>,
     },
     Folder(Box<FolderOutcome>),
     FolderFailed {
@@ -375,8 +521,8 @@ pub fn synced_folders(mb: &Mailbox, account: AccountId) -> Vec<(FolderId, PimKin
     let Some(a) = mb.account(account) else { return Vec::new() };
     let Some(dav) = a.dav.as_ref().filter(|d| !d.url.trim().is_empty()) else { return Vec::new() };
     let mut out: Vec<(FolderId, PimKind)> = Vec::new();
-    for (on, kind) in [(dav.contacts, PimKind::Contacts), (dav.tasks, PimKind::Tasks)] {
-        if !on {
+    for kind in [PimKind::Contacts, PimKind::Tasks, PimKind::Calendar] {
+        if !kind.enabled(dav) {
             continue;
         }
         if let Some(f) = mb.role_folder(account, kind.role()) {
@@ -409,6 +555,7 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
     let count = match kind {
         PimKind::Contacts => s.mailbox.contacts.values().filter(|c| c.folder == folder).count(),
         PimKind::Tasks => s.mailbox.tasks.values().filter(|t| t.folder == folder).count(),
+        PimKind::Calendar => s.mailbox.appointments.values().filter(|a| a.folder == folder).count(),
     };
     if count > MAX_ITEMS {
         job.too_many = true;
@@ -471,6 +618,25 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
                 job.items.push(item);
             }
         }
+        PimKind::Calendar => {
+            for g in event_groups(&s.mailbox, folder) {
+                let items: Vec<&Appointment> =
+                    g.members.iter().filter_map(|id| s.mailbox.appointments.get(id)).collect();
+                let Some(lead) = items.first() else { continue };
+                let remote = keep(&lead.remote);
+                let uid = match remote.as_ref().map(|r| r.uid.clone()).filter(|u| !u.is_empty()) {
+                    Some(u) => u,
+                    None if !g.uid.is_empty() => g.uid.clone(),
+                    None => new_uid(account, lead.id, now.unix),
+                };
+                let fingerprint = event_fingerprint(&items);
+                let mut item = LocalItem { id: lead.id, remote, uid, body: String::new(), fingerprint };
+                if item.changed() {
+                    item.body = event_calendar(&items, &item.uid, now);
+                }
+                job.items.push(item);
+            }
+        }
     }
     job
 }
@@ -502,13 +668,16 @@ pub fn plan_has_mail(s: &Session, account: AccountId, plan: &Plan) -> bool {
 /// Applies one event of `account`'s DAV run.
 pub(super) fn apply(s: &mut Session, account: AccountId, ev: PimEvent) {
     match ev {
-        PimEvent::Collections { contacts, tasks } => {
+        PimEvent::Collections { contacts, tasks, calendars } => {
             let mut new_folders = Vec::new();
             if let Some(list) = contacts {
                 new_folders.extend(map_collections(s, account, PimKind::Contacts, &list));
             }
             if let Some(list) = tasks {
                 new_folders.extend(map_collections(s, account, PimKind::Tasks, &list));
+            }
+            if let Some(list) = calendars {
+                new_folders.extend(map_collections(s, account, PimKind::Calendar, &list));
             }
             if !new_folders.is_empty() {
                 // Synchronise the new folders right after this run.
@@ -523,7 +692,7 @@ pub(super) fn apply(s: &mut Session, account: AccountId, ev: PimEvent) {
         PimEvent::Folder(out) => apply_folder(s, account, *out),
         PimEvent::FolderFailed { folder, error } => {
             let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
-            log::warn!("contacts/tasks sync of folder {name}: {error}");
+            log::warn!("DAV sync of folder {name}: {error}");
             s.sync.runs.entry(account).or_default().error = Some(format!("{name}: {error}"));
         }
         PimEvent::Published { folder, url, fingerprint, withdrawn, result } => {
@@ -542,10 +711,7 @@ fn map_collections(
     list: &[(String, String)],
 ) -> Vec<FolderId> {
     let Some(default) = s.mailbox.role_folder(account, kind.role()) else { return Vec::new() };
-    let on = s.mailbox.account(account).and_then(|a| a.dav.as_ref()).is_some_and(|d| match kind {
-        PimKind::Contacts => d.contacts,
-        PimKind::Tasks => d.tasks,
-    });
+    let on = s.mailbox.account(account).and_then(|a| a.dav.as_ref()).is_some_and(|d| kind.enabled(d));
     if !on || list.is_empty() {
         return Vec::new();
     }
@@ -634,6 +800,9 @@ fn unmap(s: &mut Session, account: AccountId, folder: FolderId) {
     for t in s.mailbox.tasks.values_mut().filter(|t| t.folder == folder) {
         t.remote = None;
     }
+    for a in s.mailbox.appointments.values_mut().filter(|a| a.folder == folder) {
+        a.remote = None;
+    }
 }
 
 /// A contact from the server, keeping what only lives here (the follow-up flag).
@@ -692,6 +861,16 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
                     t.remote = Some(r);
                 }
             }
+            PimKind::Calendar => {
+                if let Some(a) = s.mailbox.appointments.get_mut(&id) {
+                    // A lead that went up under a new UID (it had none, or another series' UID) takes it; it
+                    // had no instances of its own.
+                    if !r.uid.is_empty() {
+                        a.uid = r.uid.clone();
+                    }
+                    a.remote = Some(r);
+                }
+            }
         }
     }
     let mut problems = out.errors;
@@ -711,6 +890,19 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
             .filter(|t| t.folder == folder)
             .filter_map(|t| t.remote.as_ref().map(|r| r.url.clone()))
             .collect(),
+        PimKind::Calendar => s
+            .mailbox
+            .appointments
+            .values()
+            .filter(|a| a.folder == folder)
+            .filter_map(|a| a.remote.as_ref().map(|r| r.url.clone()))
+            .collect(),
+    };
+    // The calendar's event groups, found once (not per item: a calendar may hold thousands of events) and
+    // kept up to date as server objects replace them.
+    let mut groups = match kind {
+        PimKind::Calendar => groups_by_lead(&s.mailbox, folder),
+        PimKind::Contacts | PimKind::Tasks => BTreeMap::new(),
     };
     for inc in out.incoming {
         let remote = |uid: String, synced: u64| RemoteRef {
@@ -753,7 +945,10 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
             }
             PimKind::Tasks => {
                 let Some((task, uid)) = read_task(&inc.data, tz) else {
-                    problems.push(format!("{} is not a task", inc.url));
+                    // An event in a collection shared with the calendar is the calendar's.
+                    if !other_kind(kind, &inc.data) {
+                        problems.push(format!("{} is not a task", inc.url));
+                    }
                     known.remove(&inc.url);
                     continue;
                 };
@@ -782,6 +977,54 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
                     }
                 }
             }
+            PimKind::Calendar => {
+                let Some((events, uid)) = read_events(&inc.data, tz) else {
+                    // A task in a collection shared with the tasks folder is the tasks folder's.
+                    if !other_kind(kind, &inc.data) {
+                        problems.push(format!("{} is not an event", inc.url));
+                    }
+                    known.remove(&inc.url);
+                    continue;
+                };
+                let old = inc.local.and_then(|(id, fp)| {
+                    let members = groups.get(&id).cloned().unwrap_or_default();
+                    let items: Vec<&Appointment> =
+                        members.iter().filter_map(|m| s.mailbox.appointments.get(m)).collect();
+                    let unchanged = event_fingerprint(&items) == fp;
+                    (!items.is_empty()).then_some((id, members, unchanged))
+                });
+                match old {
+                    Some((lead, members, true)) => {
+                        let placed = place_events(s, folder, events, Some(lead), &members);
+                        let fp = group_synced(s, &placed);
+                        if let Some(a) = placed.first().and_then(|l| s.mailbox.appointments.get_mut(l)) {
+                            a.remote = Some(remote(uid, fp));
+                        }
+                        groups.remove(&lead);
+                        if let Some(&l) = placed.first() {
+                            groups.insert(l, placed);
+                        }
+                    }
+                    Some((lead, _, false)) => {
+                        // Changed here while the run went on: this copy wins on the next run.
+                        let synced = event_fingerprint(&events.iter().collect::<Vec<_>>());
+                        if let Some(a) = s.mailbox.appointments.get_mut(&lead) {
+                            a.remote = Some(remote(uid, synced));
+                        }
+                    }
+                    None if claimed.contains(&inc.url) => {}
+                    None => {
+                        let placed = place_events(s, folder, events, None, &[]);
+                        let fp = group_synced(s, &placed);
+                        if let Some(a) = placed.first().and_then(|l| s.mailbox.appointments.get_mut(l)) {
+                            a.remote = Some(remote(uid, fp));
+                        }
+                        if let Some(&l) = placed.first() {
+                            groups.insert(l, placed);
+                        }
+                    }
+                }
+            }
         }
     }
     for (id, fp) in out.removed {
@@ -804,6 +1047,20 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
                     t.remote = None;
                 }
             }
+            PimKind::Calendar => {
+                let members = groups.remove(&id).unwrap_or_default();
+                let items: Vec<&Appointment> =
+                    members.iter().filter_map(|m| s.mailbox.appointments.get(m)).collect();
+                let unchanged = !items.is_empty() && event_fingerprint(&items) == fp;
+                if unchanged {
+                    for m in members {
+                        s.mailbox.appointments.remove(&m);
+                        s.sync.track.pim_removed.insert(m);
+                    }
+                } else if let Some(a) = s.mailbox.appointments.get_mut(&id) {
+                    a.remote = None;
+                }
+            }
         }
     }
     // Items moved out of the folder keep no link to the server copy this run deleted.
@@ -816,6 +1073,9 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
         for t in s.mailbox.tasks.values_mut().filter(|t| t.folder != folder && hit(&t.remote)) {
             t.remote = None;
         }
+        for a in s.mailbox.appointments.values_mut().filter(|a| a.folder != folder && hit(&a.remote)) {
+            a.remote = None;
+        }
     }
     if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
         a.sync.dav.insert(folder, DavFolderState { collection: out.collection, known });
@@ -823,12 +1083,74 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
     if !problems.is_empty() {
         let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
         for p in problems.iter().take(5) {
-            log::warn!("contacts/tasks sync of {name}: {p}");
+            log::warn!("DAV sync of {name}: {p}");
         }
         let first = problems.first().cloned().unwrap_or_default();
         s.sync.runs.entry(account).or_default().error =
             Some(format!("{name}: {} item(s) could not be synchronised ({first})", problems.len()));
     }
+}
+
+/// Puts a server object's appointments into `folder` in place of `members` (the group they update; empty for
+/// a new one): the series takes the `lead` id, an exception the id of the local instance with the same
+/// RECURRENCE-ID; the rest get new ids, and members left over go. Returns the placed ids, the lead first.
+fn place_events(
+    s: &mut Session,
+    folder: FolderId,
+    events: Vec<Appointment>,
+    lead: Option<ItemId>,
+    members: &[ItemId],
+) -> Vec<ItemId> {
+    let mut free: Vec<ItemId> = members.iter().copied().filter(|m| Some(*m) != lead).collect();
+    let mut lead = lead;
+    let mut placed: Vec<ItemId> = Vec::new();
+    let mut events = events;
+    // The series first (it takes the lead's id), then the instances in time order.
+    events.sort_by_key(|a| (a.recurrence_id.is_some(), a.recurrence_id.map(|r| r.unix), a.start.unix));
+    for mut a in events {
+        let reuse = match a.recurrence_id {
+            None => lead.take(),
+            Some(rid) => {
+                let same = free.iter().position(|m| {
+                    s.mailbox
+                        .appointments
+                        .get(m)
+                        .and_then(|x| x.recurrence_id)
+                        .is_some_and(|r| r.unix == rid.unix)
+                });
+                match same {
+                    Some(i) => Some(free.remove(i)),
+                    None => lead.take(),
+                }
+            }
+        };
+        let id = match reuse {
+            Some(id) => id,
+            None => {
+                let id = ItemId(s.mailbox.alloc_id());
+                s.sync.track.pim_created.insert(id);
+                id
+            }
+        };
+        a.id = id;
+        a.folder = folder;
+        a.remote = None;
+        s.mailbox.appointments.insert(id, a);
+        placed.push(id);
+    }
+    // Instances the server copy no longer has (and a lead it left without a place).
+    for m in free.into_iter().chain(lead) {
+        if s.mailbox.appointments.remove(&m).is_some() {
+            s.sync.track.pim_removed.insert(m);
+        }
+    }
+    placed
+}
+
+/// The fingerprint of placed appointments.
+fn group_synced(s: &Session, ids: &[ItemId]) -> u64 {
+    let items: Vec<&Appointment> = ids.iter().filter_map(|id| s.mailbox.appointments.get(id)).collect();
+    event_fingerprint(&items)
 }
 
 /// Records the outcome of publishing (or removing) calendar `folder`'s file at `url`. A result for a
@@ -943,6 +1265,12 @@ pub(super) fn carry_over(
         {
             restored.tasks.insert(*id, t.clone());
         }
+        if let Some(a) = live.appointments.get(id)
+            && !restored.appointments.contains_key(id)
+            && restored.folders.contains_key(&a.folder)
+        {
+            restored.appointments.insert(*id, a.clone());
+        }
     }
     for id in removed {
         if !live.contacts.contains_key(id) {
@@ -950,6 +1278,9 @@ pub(super) fn carry_over(
         }
         if !live.tasks.contains_key(id) {
             restored.tasks.remove(id);
+        }
+        if !live.appointments.contains_key(id) {
+            restored.appointments.remove(id);
         }
     }
     // An item the undone command removed comes back: its server copy may be gone meanwhile, so it counts as
@@ -971,6 +1302,17 @@ pub(super) fn carry_over(
             Some(l) => t.remote = l.remote.clone(),
             None => {
                 if let Some(r) = t.remote.as_mut() {
+                    r.synced = 0;
+                }
+            }
+        }
+    }
+    for (id, a) in restored.appointments.iter_mut() {
+        match live.appointments.get(id) {
+            Some(_) if keeps_links.contains(&a.folder) => {}
+            Some(l) => a.remote = l.remote.clone(),
+            None => {
+                if let Some(r) = a.remote.as_mut() {
                     r.synced = 0;
                 }
             }

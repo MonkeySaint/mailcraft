@@ -555,8 +555,9 @@ fn column_param(v: &Value, key: &str) -> Result<CalendarColumn, CmdError> {
 
 /// View Settings fields: sort column and order, time scale, reading pane, spacing, daily task list, and the
 /// List / Active table's columns (`columns`, names in order; [] = the defaults), `groupBy` (a column or
-/// null), `filter` (an `ItemFilter` or null), `rules` (Conditional Formatting), `gridLines` and `labels`
-/// (Format Columns: column name → header label, "" = the column's own).
+/// null), `filter` (an `ItemFilter` or null; it also applies to the Day, Week, Month and Schedule grids),
+/// `rules` (Conditional Formatting, in every arrangement), `gridLines` and `labels` (Format Columns: column
+/// name → header label, "" = the column's own).
 fn apply_settings(v: &mut CalendarViewState, p: &Value) -> Result<(), CmdError> {
     if let Some(c) = p.get("columns").filter(|x| !x.is_null()) {
         let list = c.as_array().ok_or_else(|| CmdError::Params("`columns` must be a list".into()))?;

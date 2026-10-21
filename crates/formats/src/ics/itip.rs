@@ -101,8 +101,14 @@ fn one_event(a: &Appointment, method: Method, o: &EventOut<'_>, now: DateTime) -
 
 /// METHOD:REQUEST invitation (attendees asked to RSVP; no alarm).
 pub fn request(a: &Appointment, sequence: u32, now: DateTime) -> String {
-    let o =
-        EventOut { sequence, status: Some("CONFIRMED"), rsvp: true, no_alarm: true, ..Default::default() };
+    let o = EventOut {
+        sequence,
+        status: Some("CONFIRMED"),
+        rsvp: true,
+        no_alarm: true,
+        no_attachments: true,
+        ..Default::default()
+    };
     one_event(a, Method::Request, &o, now)
 }
 
@@ -118,6 +124,7 @@ pub fn reply(
         sequence,
         only_attendee: Some((attendee, response)),
         no_alarm: true,
+        no_attachments: true,
         ..Default::default()
     };
     one_event(a, Method::Reply, &o, now)
@@ -125,7 +132,13 @@ pub fn reply(
 
 /// METHOD:CANCEL for the whole meeting.
 pub fn cancel(a: &Appointment, sequence: u32, now: DateTime) -> String {
-    let o = EventOut { sequence, status: Some("CANCELLED"), no_alarm: true, ..Default::default() };
+    let o = EventOut {
+        sequence,
+        status: Some("CANCELLED"),
+        no_alarm: true,
+        no_attachments: true,
+        ..Default::default()
+    };
     one_event(a, Method::Cancel, &o, now)
 }
 

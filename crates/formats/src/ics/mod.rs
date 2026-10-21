@@ -250,11 +250,29 @@ pub fn write(
     method: Option<&Method>,
     now: DateTime,
 ) -> String {
+    write_with(appointments, tasks, method, now, &map::EventOut::default())
+}
+
+/// Writes appointments as the calendar object a CalDAV server stores (RFC 4791): like [`write`], with
+/// SCHEDULE-AGENT=CLIENT on the organizer and attendees, so a server that does scheduling (RFC 6638) leaves
+/// the invitations to the client that sends them.
+pub fn write_stored(appointments: &[&Appointment], now: DateTime) -> String {
+    let out = map::EventOut { schedule_client: true, ..Default::default() };
+    write_with(appointments, &[], None, now, &out)
+}
+
+fn write_with(
+    appointments: &[&Appointment],
+    tasks: &[&Task],
+    method: Option<&Method>,
+    now: DateTime,
+    event_out: &map::EventOut<'_>,
+) -> String {
     let mut cal = map::calendar_shell(method);
     let mut offsets = map::UsedZones::default();
     let mut children = Vec::new();
     for a in appointments {
-        children.push(map::event_component(a, &map::EventOut::default(), now, &mut offsets));
+        children.push(map::event_component(a, event_out, now, &mut offsets));
     }
     for t in tasks {
         children.push(map::task_component(t, now, &mut offsets));
