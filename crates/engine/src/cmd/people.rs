@@ -1015,6 +1015,7 @@ pub fn business_card_doc(cards: &[Contact]) -> mailcraft_model::Doc {
             None => cell(vec![para(Vec::new())], Some(accent), Some(10.0)),
         };
         blocks.push(Block::Table {
+            borders: None,
             rows: vec![vec![side, cell(text, Some(Color::WHITE), None)]],
             border: true,
             width_px: Some(360.0),

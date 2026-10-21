@@ -13,12 +13,20 @@
 
 use serde::{Deserialize, Serialize};
 
+mod anchors;
+mod find;
+mod sort;
+pub use find::{
+    FindDirection, FindFormat, FindOptions, MAX_FIND_ALL, MAX_FIND_CHARS, check_find, expand_replacement,
+};
+pub use sort::{SortKind, SortSpec};
+
 use mailcraft_geom::Color;
 use mailcraft_layout::TextPos;
 use mailcraft_model::rich::{Align, ListKind, TableCell};
 use mailcraft_model::{
-    Block, BodyFormat, DateTime, Doc, FlagState, FolderId, Importance, Inline, ItemId, ParaStyle,
-    Sensitivity, TextStyle,
+    Block, BodyFormat, BorderEdge, BorderLine, DateTime, Doc, FlagState, FolderId, Importance, Inline,
+    ItemId, ParaBorders, ParaStyle, Sensitivity, TableBorders, TextStyle,
 };
 
 /// Deepest block path accepted from callers.
@@ -351,6 +359,10 @@ pub struct ComposeState {
     /// redraws them (see `cmd::insert::redraw_generated`).
     pub generated: Vec<GeneratedPicture>,
     pub bookmarks: Vec<Bookmark>,
+    /// The text of each leaf when the bookmarks were last placed, to move them with later edits (see
+    /// [`ComposeState::sync_bookmarks`]); `None` without bookmarks.
+    #[serde(skip)]
+    pub bookmark_base: Option<anchors::LeafTexts>,
     /// Proofing language (BCP 47 tag).
     pub language: Option<String>,
     /// Review › Language › "Do not check spelling or grammar".
@@ -371,11 +383,22 @@ pub struct ComposeState {
     pub last_highlight: Option<Color>,
     /// Shading colour last chosen (the Shading button applies it again).
     pub last_shading: Option<Color>,
+    /// Border line last chosen (style, colour, width): the Borders menu draws with it.
+    pub last_border: Option<BorderEdge>,
+    /// The heading numbers a numbered style set wrote ("1 ", "1.1 "): applying a set again takes exactly
+    /// these off (a heading the user started with a number of their own keeps it).
+    pub heading_numbers: Vec<String>,
+    /// The line a Lines style set last drew under the headings: applying a set again takes exactly that
+    /// line off (a bottom border the user drew, or one a quoted heading came with, stays).
+    pub style_set_rule: Option<BorderEdge>,
     /// Body before Translate Message replaced it (show original toggle).
     pub original_body: Option<Doc>,
     pub translated_to: Option<String>,
     /// Last Find text (Find Next continues with it).
     pub find_text: String,
+    /// Highlight All: the matches drawn on a highlight colour until the find is cleared.
+    #[serde(skip)]
+    pub find_marks: Vec<BodySelection>,
     #[serde(skip)]
     pub edit_undo: Vec<EditSnapshot>,
     #[serde(skip)]
@@ -639,8 +662,11 @@ impl ComposeState {
 
     /// Records an editor undo step (call before changing the body).
     pub fn checkpoint(&mut self) {
+        self.sync_bookmarks();
         self.sync_list_formats();
         self.mark_edited();
+        // Highlight All marks places in the text as it was.
+        self.find_marks.clear();
         self.edit_undo.push(self.snapshot());
         if self.edit_undo.len() > MAX_EDIT_UNDO {
             self.edit_undo.remove(0);
@@ -658,10 +684,12 @@ impl ComposeState {
             && self.edit_run.as_ref().is_some_and(|(k, at, rev)| {
                 Some(*k) == run && *at == self.selection.focus && *rev == self.edit_rev
             });
+        self.sync_bookmarks();
         self.sync_list_formats();
         let before = self.snapshot();
         let dirty = self.dirty;
         f(self);
+        self.sync_bookmarks();
         if self.body == before.body {
             self.dirty = dirty;
             if self.selection != before.selection {
@@ -686,7 +714,9 @@ impl ComposeState {
         let Some(snap) = self.edit_undo.pop() else {
             return false;
         };
+        self.sync_bookmarks();
         let cur = self.restore(snap);
+        self.sync_bookmarks();
         self.edit_redo.push(cur);
         self.dirty = true;
         self.mark_edited();
@@ -699,7 +729,9 @@ impl ComposeState {
         let Some(snap) = self.edit_redo.pop() else {
             return false;
         };
+        self.sync_bookmarks();
         let cur = self.restore(snap);
+        self.sync_bookmarks();
         self.edit_undo.push(cur);
         self.dirty = true;
         self.mark_edited();
@@ -1028,6 +1060,12 @@ impl ComposeState {
     }
 
     fn set_link_on_selection(&mut self, href: Option<&str>) {
+        self.set_link_and_tip_on_selection(href, None);
+    }
+
+    /// Links the selection to `href` (`None` unlinks it); `tip` sets the ScreenTip (`Some(None)` clears
+    /// it, `None` keeps the one each run has).
+    fn set_link_and_tip_on_selection(&mut self, href: Option<&str>, tip: Option<Option<&str>>) {
         let (a, b) = (self.selection.start().clone(), self.selection.end().clone());
         for (path, from, to) in leaf_ranges(&self.body.blocks, &a, &b) {
             let Some((kind, mut flat)) = leaf(&self.body.blocks, &path) else {
@@ -1036,10 +1074,46 @@ impl ComposeState {
             if matches!(kind, LeafKind::Pre | LeafKind::Rule) {
                 continue;
             }
-            flat.restyle(from, to, &mut |r| r.link = href.map(str::to_owned));
+            flat.restyle(from, to, &mut |r| {
+                r.link = href.map(str::to_owned);
+                if href.is_none() {
+                    r.tip = None;
+                } else if let Some(t) = tip {
+                    r.tip = t.map(str::to_owned);
+                }
+            });
             store_leaf(&mut self.body.blocks, &path, &flat);
         }
         self.dirty = true;
+    }
+
+    /// Insert Hyperlink with a ScreenTip: as [`ComposeState::set_link`], then the ScreenTip of the link
+    /// made (`None` or empty: no ScreenTip).
+    pub fn set_link_with_tip(&mut self, href: Option<&str>, text: Option<&str>, tip: Option<&str>) {
+        let tip = tip.map(str::trim).filter(|t| !t.is_empty());
+        let start = self.selection.start().clone();
+        let collapsed = self.selection.is_collapsed();
+        self.set_link(href, text);
+        if href.is_none() {
+            return;
+        }
+        // The linked text is the selection now, or (inserted at a collapsed caret) runs from where the
+        // caret was to where it is.
+        let saved = self.selection.clone();
+        if collapsed {
+            self.selection = BodySelection { anchor: start, focus: saved.focus.clone() };
+        }
+        self.set_link_and_tip_on_selection(href, Some(tip));
+        self.selection = saved;
+    }
+
+    /// ScreenTip of the link at the caret, if any.
+    pub fn link_tip_at_caret(&self) -> Option<String> {
+        let pos = &self.selection.focus;
+        let (_, flat) = leaf(&self.body.blocks, &pos.path)?;
+        let i = pos.offset.min(flat.len());
+        let atom = i.checked_sub(1).and_then(|j| flat.atoms.get(j)).or_else(|| flat.atoms.get(i))?;
+        flat.attrs.get(atom.attr)?.tip.clone()
     }
 
     /// Link target at the caret, if any.
@@ -1231,6 +1305,29 @@ impl ComposeState {
         }
     }
 
+    /// Set Numbering Value › carry on from the list above: the numbered list at the caret starts where the
+    /// numbered list before it (in the same place: the body, a cell, a quote) ends. The new start, or
+    /// `None` when the caret is not in a numbered list or there is no list before it.
+    pub fn continue_previous_list(&mut self) -> Option<u32> {
+        let (path, kind) = self.list_at_caret()?;
+        if !matches!(kind, ListKind::Numbered { .. }) {
+            return None;
+        }
+        let (&i, prefix) = path.split_last()?;
+        let seq = seq_mut(&mut self.body.blocks, prefix)?;
+        let next = seq.get(..i)?.iter().rev().find_map(|b| match b {
+            Block::List { kind: ListKind::Numbered { start }, items } => {
+                Some(start.saturating_add(u32::try_from(items.len()).unwrap_or(u32::MAX)))
+            }
+            _ => None,
+        })?;
+        if let Some(Block::List { kind, .. }) = seq.get_mut(i) {
+            *kind = ListKind::Numbered { start: next };
+        }
+        self.dirty = true;
+        Some(next)
+    }
+
     /// Increase Indent: demotes list items one level, indents other paragraphs by one step.
     pub fn indent(&mut self) {
         self.shift_level(true, None);
@@ -1318,6 +1415,12 @@ impl ComposeState {
 
     /// Sorts the selected paragraphs (or the rows of the table / items of the list holding the selection).
     pub fn sort_selection(&mut self, descending: bool) {
+        self.sort_selection_with(&SortSpec::text(descending));
+    }
+
+    /// Sort Text: sorts the selected paragraphs, or the rows of the table / items of the list holding the
+    /// selection, as `spec` says.
+    pub fn sort_selection_with(&mut self, spec: &SortSpec) {
         self.ensure_body();
         let start = self.selection.start().clone();
         let end = self.selection.end().clone();
@@ -1329,18 +1432,26 @@ impl ComposeState {
                 if t1 == t2 =>
             {
                 if let Some(Block::Table { rows, .. }) = block_at_mut(&mut self.body.blocks, &t1) {
-                    rows.sort_by(|a, b| {
-                        let ka = a.first().map(|c| blocks_text(&c.blocks)).unwrap_or_default();
-                        let kb = b.first().map(|c| blocks_text(&c.blocks)).unwrap_or_default();
-                        sort_cmp(&ka, &kb, descending)
-                    });
+                    let col = spec.field.unwrap_or(0);
+                    let key =
+                        |r: &Vec<TableCell>| r.get(col).map(|c| blocks_text(&c.blocks)).unwrap_or_default();
+                    let from = usize::from(spec.header).min(rows.len());
+                    if let Some(part) = rows.get_mut(from..) {
+                        part.sort_by(|a, b| spec.cmp(&key(a), &key(b)));
+                    }
                 }
             }
             (Some((Owner::ListItem { list: l1, .. }, _)), Some((Owner::ListItem { list: l2, .. }, _)))
                 if l1 == l2 =>
             {
                 if let Some(Block::List { items, .. }) = block_at_mut(&mut self.body.blocks, &l1) {
-                    items.sort_by(|a, b| sort_cmp(&blocks_text(a), &blocks_text(b), descending));
+                    let from = usize::from(spec.header).min(items.len());
+                    if let Some(part) = items.get_mut(from..) {
+                        part.sort_by(|a, b| {
+                            let (ta, tb) = (blocks_text(a), blocks_text(b));
+                            spec.cmp(spec.key(&ta), spec.key(&tb))
+                        });
+                    }
                 }
             }
             _ => {
@@ -1352,15 +1463,14 @@ impl ComposeState {
                 } else {
                     i
                 };
+                let i = if spec.header && j > i { i.saturating_add(1) } else { i };
                 if let Some(seq) = seq_mut(&mut self.body.blocks, prefix)
                     && let Some(part) = seq.get_mut(i..=j)
                 {
                     part.sort_by(|a, b| {
-                        sort_cmp(
-                            &blocks_text(std::slice::from_ref(a)),
-                            &blocks_text(std::slice::from_ref(b)),
-                            descending,
-                        )
+                        let ta = blocks_text(std::slice::from_ref(a));
+                        let tb = blocks_text(std::slice::from_ref(b));
+                        spec.cmp(spec.key(&ta), spec.key(&tb))
                     });
                 }
             }
@@ -1651,7 +1761,10 @@ impl ComposeState {
                     .collect()
             }
         };
-        seq.splice(i..=j, std::iter::once(Block::Table { rows, border: true, width_px: None }));
+        seq.splice(
+            i..=j,
+            std::iter::once(Block::Table { borders: None, rows, border: true, width_px: None }),
+        );
         let mut target = prefix.to_vec();
         target.push(i);
         if let Some(p) = leaves(&self.body.blocks).into_iter().find(|p| p.starts_with(&target)) {
@@ -1948,47 +2061,112 @@ impl ComposeState {
         out
     }
 
-    /// Adds (`on`) or removes a horizontal rule directly above the first / below the last selected
-    /// paragraph (paragraph top / bottom borders). Returns whether the body changed.
-    pub fn set_para_rule(&mut self, above: bool, on: bool) -> bool {
-        self.ensure_body();
-        let ords = self.selection_ords();
-        let path =
-            if above { self.selection.start().path.clone() } else { self.selection.end().path.clone() };
-        let Some((&idx, prefix)) = path.split_last() else {
-            return false;
-        };
-        let Some(seq) = seq_mut(&mut self.body.blocks, prefix) else {
-            return false;
-        };
-        let neighbour = if above { idx.checked_sub(1) } else { Some(idx.saturating_add(1)) };
-        let has_rule = neighbour.and_then(|n| seq.get(n)).is_some_and(|b| matches!(b, Block::Rule));
-        let changed = match (on, has_rule, neighbour) {
-            (true, false, _) => {
-                let at = if above { idx } else { idx.saturating_add(1) }.min(seq.len());
-                seq.insert(at, Block::Rule);
-                true
+    /// Moves the named places (anchors) of the body into [`ComposeState::bookmarks`]: a reopened draft or a
+    /// new message with bookmarks keeps them as bookmarks to edit, go to and link to. Anchors past
+    /// [`MAX_BOOKMARKS`], or with a name already taken, stay in the body as they were, so `#links` to them
+    /// keep working in the message sent.
+    pub fn adopt_anchors(&mut self) {
+        self.sync_bookmarks();
+        let mut left = Vec::new();
+        for (path, offset, name) in self.body.take_anchors() {
+            if self.bookmarks.len() >= MAX_BOOKMARKS || self.bookmarks.iter().any(|b| b.name == name) {
+                left.push((path, offset, name));
+                continue;
             }
-            (false, true, Some(n)) if n < seq.len() => {
-                seq.remove(n);
-                true
-            }
-            _ => false,
-        };
-        if changed {
-            let shift = |(k, off): (usize, usize)| {
-                if !above {
-                    (k, off)
-                } else if on {
-                    (k.saturating_add(1), off)
-                } else {
-                    (k.saturating_sub(1), off)
-                }
-            };
-            self.restore_ords((shift(ords.0), shift(ords.1)));
-            self.dirty = true;
+            self.bookmarks.push(Bookmark { name, pos: DocPos::new(path, offset) });
         }
+        // Back in from the last, so earlier ones at the same place keep their order.
+        for (path, offset, name) in left.into_iter().rev() {
+            self.body.insert_anchor(&path, offset, &name);
+        }
+        self.sync_bookmarks();
+    }
+
+    /// The body with every bookmark written in as an anchor where it is: what drafts and sent messages
+    /// carry, so `#name` links keep working for recipients and in a reopened draft.
+    pub fn body_with_anchors(&self) -> Doc {
+        let mut d = self.body.clone();
+        for b in &self.current_bookmarks() {
+            let pos = normalize(&self.body, &b.pos);
+            d.insert_anchor(&pos.path, pos.offset, &b.name);
+        }
+        d
+    }
+
+    /// The headings of the body in order: (path, level, text) (Insert Hyperlink › a place in this message).
+    pub fn headings(&self) -> Vec<(Vec<usize>, u8, String)> {
+        leaves(&self.body.blocks)
+            .into_iter()
+            .filter_map(|p| match block_at(&self.body.blocks, &p) {
+                Some(Block::Heading { level, inlines, .. }) => {
+                    let text = Flat::from_inlines(inlines).plain();
+                    Some((p, *level, text))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Borders of the paragraph at the caret (empty without any).
+    pub fn para_borders_at_caret(&self) -> ParaBorders {
+        self.para_at_caret().borders.map(|b| *b).unwrap_or_default()
+    }
+
+    /// Edits the borders of every selected paragraph and heading (`f` gets each one's borders; no line
+    /// left removes them). Returns whether anything changed.
+    pub fn edit_para_borders(&mut self, mut f: impl FnMut(&mut ParaBorders)) -> bool {
+        let mut changed = false;
+        self.set_para_style(|ps| {
+            let mut b = ps.borders.take().map(|b| *b).unwrap_or_default();
+            let before = b.clone();
+            f(&mut b);
+            changed |= b != before;
+            ps.borders = (!b.is_empty()).then(|| Box::new(b));
+        });
         changed
+    }
+
+    /// Borders of the table holding the caret as per-edge borders (a plain grid as thin grey lines on every
+    /// edge); `None` when the caret is not in a table.
+    pub fn table_borders_at_caret(&self) -> Option<TableBorders> {
+        let path = self.table_at_caret()?;
+        match block_at(&self.body.blocks, &path)? {
+            Block::Table { borders: Some(b), .. } => Some((**b).clone()),
+            Block::Table { border: true, .. } => Some(TableBorders::all(&table_grid_edge())),
+            Block::Table { .. } => Some(TableBorders::default()),
+            _ => None,
+        }
+    }
+
+    /// Edits the borders of the table holding the caret. A result equal to the plain grid is stored as the
+    /// plain grid, and no edges as no border. False when the caret is not in a table or nothing changed.
+    pub fn edit_table_borders(&mut self, f: impl FnOnce(&mut TableBorders)) -> bool {
+        let Some(mut b) = self.table_borders_at_caret() else {
+            return false;
+        };
+        let before = b.clone();
+        f(&mut b);
+        if b == before {
+            return false;
+        }
+        let Some(path) = self.table_at_caret() else {
+            return false;
+        };
+        if let Some(Block::Table { border, borders, .. }) = block_at_mut(&mut self.body.blocks, &path) {
+            if b.is_empty() {
+                *border = false;
+                *borders = None;
+            } else if b == TableBorders::all(&table_grid_edge()) {
+                *border = true;
+                *borders = None;
+            } else {
+                *border = false;
+                *borders = Some(Box::new(b));
+            }
+            self.dirty = true;
+            return true;
+        }
+        false
     }
 
     fn selection_ords(&self) -> ((usize, usize), (usize, usize)) {
@@ -2172,6 +2350,24 @@ impl ComposeState {
     /// The innermost table cell holding the caret: (table path, row, column).
     pub fn cell_at_caret(&self) -> Option<(Vec<usize>, usize, usize)> {
         cell_of(&self.body.blocks, &self.selection.focus.path)
+    }
+
+    /// Cells in the first row of the table holding the caret.
+    pub fn table_columns_at_caret(&self) -> Option<usize> {
+        let path = self.table_at_caret()?;
+        match block_at(&self.body.blocks, &path)? {
+            Block::Table { rows, .. } => rows.first().map(Vec::len),
+            _ => None,
+        }
+    }
+
+    /// Shading of the table cell holding the caret.
+    pub fn cell_background_at_caret(&self) -> Option<Color> {
+        let (table, row, col) = self.cell_at_caret()?;
+        match block_at(&self.body.blocks, &table)? {
+            Block::Table { rows, .. } => rows.get(row)?.get(col)?.background,
+            _ => None,
+        }
     }
 
     /// Moves to another cell of the table holding the caret and selects its content (Tab / Shift+Tab /
@@ -2813,7 +3009,12 @@ pub fn with_default_signature(mb: &mailcraft_model::Mailbox, mut c: ComposeState
 struct RunAttr {
     style: TextStyle,
     link: Option<String>,
+    /// The link's ScreenTip.
+    tip: Option<String>,
 }
+
+/// The link a run is inside: its target and ScreenTip.
+type LinkRef<'a> = Option<(&'a str, Option<&'a str>)>;
 
 #[derive(Clone, Debug, PartialEq)]
 enum AtomKind {
@@ -2852,27 +3053,33 @@ impl Flat {
         f
     }
 
-    fn push_inlines(&mut self, inlines: &[Inline], link: Option<&str>, depth: usize) {
+    fn push_inlines(&mut self, inlines: &[Inline], link: LinkRef<'_>, depth: usize) {
         if depth > MAX_INLINE_DEPTH {
             return;
         }
+        let attr = |style: TextStyle| RunAttr {
+            style,
+            link: link.map(|(h, _)| h.to_owned()),
+            tip: link.and_then(|(_, t)| t).map(str::to_owned),
+        };
         for inline in inlines {
             match inline {
                 Inline::Text { text, style } => {
-                    let a = self.intern(RunAttr { style: style.clone(), link: link.map(str::to_owned) });
+                    let a = self.intern(attr(style.clone()));
                     self.atoms.extend(text.chars().map(|c| Atom { kind: AtomKind::Char(c), attr: a }));
                 }
-                Inline::Link { href, children } => {
-                    self.push_inlines(children, Some(href), depth.saturating_add(1))
+                Inline::Link { title, href, children } => {
+                    self.push_inlines(children, Some((href, title.as_deref())), depth.saturating_add(1))
                 }
                 Inline::LineBreak => {
-                    let a =
-                        self.intern(RunAttr { style: TextStyle::default(), link: link.map(str::to_owned) });
+                    let a = self.intern(attr(TextStyle::default()));
                     self.atoms.push(Atom { kind: AtomKind::Break, attr: a });
                 }
+                // Bookmarks are kept by the compose (`bookmarks`), not in the text being edited; an anchor left in
+                // the body (a quoted original's) goes when its paragraph is edited.
+                Inline::Anchor { .. } => {}
                 Inline::Image { src, alt, width, height } => {
-                    let a =
-                        self.intern(RunAttr { style: TextStyle::default(), link: link.map(str::to_owned) });
+                    let a = self.intern(attr(TextStyle::default()));
                     self.atoms.push(Atom {
                         kind: AtomKind::Image {
                             src: src.clone(),
@@ -2903,14 +3110,20 @@ impl Flat {
         self.atoms.get(i).and_then(|a| self.attrs.get(a.attr)).and_then(|r| r.link.as_deref())
     }
 
+    /// The link and its ScreenTip at atom `i`.
+    fn link_ref_at(&self, i: usize) -> LinkRef<'_> {
+        let r = self.atoms.get(i).and_then(|a| self.attrs.get(a.attr))?;
+        r.link.as_deref().map(|h| (h, r.tip.as_deref()))
+    }
+
     fn to_inlines(&self) -> Vec<Inline> {
         let mut out = Vec::new();
         let n = self.atoms.len();
         let mut i = 0usize;
         while i < n {
-            let link = self.link_at(i);
+            let link = self.link_ref_at(i);
             let mut group: Vec<Inline> = Vec::new();
-            while i < n && self.link_at(i) == link {
+            while i < n && self.link_ref_at(i) == link {
                 let Some(atom) = self.atoms.get(i) else {
                     break;
                 };
@@ -2944,7 +3157,11 @@ impl Flat {
                 }
             }
             match link {
-                Some(h) => out.push(Inline::Link { href: h.to_owned(), children: group }),
+                Some((h, tip)) => out.push(Inline::Link {
+                    href: h.to_owned(),
+                    children: group,
+                    title: tip.map(str::to_owned),
+                }),
                 None => out.extend(group),
             }
         }
@@ -3504,20 +3721,20 @@ fn blocks_text(blocks: &[Block]) -> String {
     Doc { blocks: blocks.to_vec(), ..Default::default() }.to_plain_text()
 }
 
-fn sort_cmp(a: &str, b: &str, descending: bool) -> std::cmp::Ordering {
-    let ord = match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a.to_lowercase().cmp(&b.to_lowercase()),
-    };
-    if descending { ord.reverse() } else { ord }
-}
-
 fn same_list_kind(a: &ListKind, b: &ListKind) -> bool {
     matches!(
         (a, b),
         (ListKind::Bullet, ListKind::Bullet) | (ListKind::Numbered { .. }, ListKind::Numbered { .. })
     )
 }
+
+/// The line of a plain table grid (a table's `border` without per-edge borders), as the layout draws it.
+pub fn table_grid_edge() -> BorderEdge {
+    BorderEdge::new(BorderLine::Single, Some(Color::hex(0x808080)), 0.75)
+}
+
+/// Bookmarks kept per message at most.
+pub const MAX_BOOKMARKS: usize = 1_000;
 
 /// One table cell holding a paragraph with `text`.
 pub fn table_cell(text: &str) -> TableCell {
@@ -3533,7 +3750,7 @@ pub fn table_cell(text: &str) -> TableCell {
 /// An empty bordered table.
 pub fn empty_table(rows: usize, cols: usize) -> Block {
     let rows = (0..rows.max(1)).map(|_| (0..cols.max(1)).map(|_| table_cell("")).collect()).collect();
-    Block::Table { rows, border: true, width_px: None }
+    Block::Table { borders: None, rows, border: true, width_px: None }
 }
 
 // =======================================================================================================
@@ -3611,6 +3828,7 @@ fn insert_chars(doc: &mut Doc, pos: &DocPos, text: &str, style: Option<&TextStyl
         RunAttr {
             style: style.cloned().unwrap_or(base.style),
             link: if inside_link { base.link } else { None },
+            tip: if inside_link { base.tip } else { None },
         }
     };
     let a = flat.intern(attr);
@@ -4443,6 +4661,12 @@ pub struct StyleSet {
     /// Paragraph space after (pt) and line height multiple for body paragraphs.
     pub space_after_pt: f32,
     pub line_height: f32,
+    /// Headings in capitals.
+    pub caps: bool,
+    /// A line under the headings, this wide (points), in the heading colour.
+    pub rule_pt: Option<f32>,
+    /// Headings numbered 1, 1.1, 1.1.1.
+    pub numbered: bool,
 }
 
 /// Style sets drawn for MailCraft (names as observed).
@@ -4457,6 +4681,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.08,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Document",
@@ -4468,6 +4695,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.08,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Basic (Elegant)",
@@ -4479,6 +4709,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 10.0,
         line_height: 1.15,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Basic (Simple)",
@@ -4490,6 +4723,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.15,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Basic (Stylish)",
@@ -4501,6 +4737,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 10.0,
         line_height: 1.2,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Black & White (Capitalized)",
@@ -4512,6 +4751,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.08,
+        caps: true,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Black & White (Classic)",
@@ -4523,6 +4765,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.15,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Black & White (Numbered)",
@@ -4534,6 +4779,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 6.0,
         line_height: 1.08,
+        caps: false,
+        rule_pt: None,
+        numbered: true,
     },
     StyleSet {
         name: "Black & White (Word 2013)",
@@ -4545,6 +4793,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.08,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Casual",
@@ -4556,6 +4807,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 10.0,
         line_height: 1.2,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Centered",
@@ -4567,6 +4821,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.15,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Lines (Distinctive)",
@@ -4578,6 +4835,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.15,
+        caps: false,
+        rule_pt: Some(2.25),
+        numbered: false,
     },
     StyleSet {
         name: "Lines (Simple)",
@@ -4589,6 +4849,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.08,
+        caps: false,
+        rule_pt: Some(0.5),
+        numbered: false,
     },
     StyleSet {
         name: "Lines (Stylish)",
@@ -4600,6 +4863,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 10.0,
         line_height: 1.15,
+        caps: false,
+        rule_pt: Some(1.0),
+        numbered: false,
     },
     StyleSet {
         name: "Minimalist",
@@ -4611,6 +4877,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 12.0,
         line_height: 1.25,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Shaded",
@@ -4622,6 +4891,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: true,
         space_after_pt: 8.0,
         line_height: 1.15,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Word",
@@ -4633,6 +4905,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.08,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Word 2003",
@@ -4644,6 +4919,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 0.0,
         line_height: 1.0,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Word 2010",
@@ -4655,6 +4933,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 10.0,
         line_height: 1.15,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
     StyleSet {
         name: "Word 2013",
@@ -4666,6 +4947,9 @@ pub const STYLE_SETS: &[StyleSet] = &[
         shaded: false,
         space_after_pt: 8.0,
         line_height: 1.08,
+        caps: false,
+        rule_pt: None,
+        numbered: false,
     },
 ];
 
@@ -4812,17 +5096,33 @@ impl ComposeState {
         let theme = self.theme_resolved();
         let styles: Vec<TextStyle> = (1..=6).map(|l| self.heading_text_style(l)).collect();
         let after_px = set.space_after_pt * 96.0 / 72.0;
+        let rule_color = set.color.map(|slot| theme.color(slot));
+        let old_rule = self.style_set_rule.take();
+        let new_rule = set.rule_pt.map(|w| BorderEdge::new(BorderLine::Single, rule_color, w));
         for_each_block_mut(&mut self.body.blocks, 0, &mut |b| match b {
             Block::Heading { level, style, inlines } => {
                 let hs = styles.get(usize::from(*level).saturating_sub(1)).cloned().unwrap_or_default();
                 style.align = if set.centered { Align::Center } else { Align::Start };
                 style.background = (set.shaded && *level == 1).then(|| theme.color(ACCENT1));
+                // The Lines sets draw a line under each heading; applying a set takes off only the line a set
+                // drew before (other edges, and bottom borders drawn some other way, stay).
+                let mut b = style.borders.take().map(|b| *b).unwrap_or_default();
+                if old_rule.is_some() && b.bottom == old_rule {
+                    b.bottom = None;
+                }
+                if let Some(edge) = &new_rule
+                    && b.bottom.is_none()
+                {
+                    b.bottom = Some(edge.clone());
+                }
+                style.borders = (!b.is_empty()).then(|| Box::new(b));
                 for_each_run_style(inlines, 0, &mut |st| {
                     st.size_pt = hs.size_pt;
                     st.bold = hs.bold;
                     st.italic = hs.italic;
                     st.color = hs.color;
                     st.font_family = hs.font_family.clone();
+                    st.all_caps = set.caps.then_some(true);
                 });
             }
             Block::Paragraph { style, .. } => {
@@ -4831,9 +5131,73 @@ impl ComposeState {
             }
             _ => {}
         });
+        self.style_set_rule = new_rule;
+        self.number_headings(set.numbered);
         self.dirty = true;
     }
+
+    /// Numbers the headings 1, 1.1, 1.1.1 (by level) as text at their start, or takes such numbers off.
+    /// Numbers written before are replaced, so applying the set again renumbers.
+    pub fn number_headings(&mut self, on: bool) {
+        let mut counters = [0u64; 6];
+        let mut written: Vec<String> = Vec::new();
+        let paths = leaves(&self.body.blocks);
+        for path in paths {
+            let Some(Block::Heading { level, inlines, .. }) = block_at_mut(&mut self.body.blocks, &path)
+            else {
+                continue;
+            };
+            let l = usize::from((*level).clamp(1, 6)).saturating_sub(1);
+            let mut flat = Flat::from_inlines(inlines);
+            // A number written before ("1.2 ") comes off first.
+            let text = flat.text();
+            let old = heading_number_len(&text);
+            let ours = text.chars().take(old).collect::<String>();
+            if old > 0 && self.heading_numbers.contains(&ours) {
+                flat.replace_range(0, old, "");
+            }
+            if on {
+                if let Some(c) = counters.get_mut(l) {
+                    *c = c.saturating_add(1);
+                }
+                for c in counters.iter_mut().skip(l.saturating_add(1)) {
+                    *c = 0;
+                }
+                let number: Vec<String> =
+                    counters.iter().take(l.saturating_add(1)).map(|c| (*c).max(1).to_string()).collect();
+                let prefix = format!("{} ", number.join("."));
+                flat.replace_range(0, 0, &prefix);
+                if !written.contains(&prefix) && written.len() < MAX_HEADING_NUMBERS {
+                    written.push(prefix);
+                }
+            }
+            *inlines = flat.to_inlines();
+        }
+        self.heading_numbers = written;
+        self.ensure_body();
+    }
 }
+
+/// Heading numbers remembered at most.
+const MAX_HEADING_NUMBERS: usize = 10_000;
+
+/// Chars of a heading number ("1.2.3 ") at the start of `text` (0 when there is none).
+fn heading_number_len(text: &str) -> usize {
+    let mut n = 0usize;
+    let mut digits = false;
+    for c in text.chars() {
+        match c {
+            '0'..='9' => digits = true,
+            '.' if digits => {}
+            ' ' if digits => return n.saturating_add(1),
+            _ => return 0,
+        }
+        n = n.saturating_add(1);
+    }
+    0
+}
+
+impl ComposeState {}
 
 // =======================================================================================================
 // List formats (Bullets / Numbering galleries, Define New Bullet / Number Format, Multilevel List)
@@ -5127,6 +5491,15 @@ pub fn multilevel_formats(key: &str) -> Option<Vec<ListFormat>> {
         "outline" | "legal" => {
             (0..9).map(|i| if i == 0 { n(Decimal, "", ".") } else { chained(Decimal) }).collect()
         }
+        // 1 / 1.1 / 1.1.1 (no closing period).
+        "outlinePlain" => (0..9)
+            .map(|i| ListFormat::Number {
+                style: Decimal,
+                prefix: String::new(),
+                suffix: String::new(),
+                chain: i > 0,
+            })
+            .collect(),
         // Article I. / Section 1.01 / (a) / (i) / …
         "article" => vec![
             n(UpperRoman, "Article ", "."),
@@ -5407,6 +5780,18 @@ impl ComposeState {
         self.list_count = lists.len();
         self.dirty = true;
         true
+    }
+
+    /// The level formats of the outermost formatted list holding the caret (Define New Multilevel List
+    /// opens with them); `None` outside a formatted list.
+    pub fn list_levels_at_caret(&self) -> Option<Vec<ListFormat>> {
+        let caret = &self.selection.focus.path;
+        let lists = self.lists();
+        lists
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| caret.len() > l.path.len() && caret.starts_with(&l.path))
+            .find_map(|(i, _)| self.list_formats.iter().find(|e| e.ordinal == i).map(|e| e.levels.clone()))
     }
 
     /// The format of the innermost list holding the caret.
@@ -5882,7 +6267,8 @@ mod tests {
                         c.apply_text_style(|s| s.italic = Some(true));
                     }
                     Op::ParaRule(a, on) => {
-                        c.set_para_rule(a, on);
+                        let edge = on.then(BorderEdge::default);
+                        c.edit_para_borders(|b| if a { b.top = edge.clone() } else { b.bottom = edge.clone() });
                     }
                 }
                 c.ensure_body();

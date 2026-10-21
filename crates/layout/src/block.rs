@@ -5,7 +5,9 @@ use std::cell::Cell;
 use mailcraft_fonts::FontDb;
 use mailcraft_geom::{Color, Point, Rect};
 use mailcraft_model::rich::{Align, LineRule, ListKind};
-use mailcraft_model::{Block, Inline, ParaStyle, TextStyle, UnderlineKind};
+use mailcraft_model::{Block, BorderJoin, Inline, ParaStyle, TextStyle, UnderlineKind};
+
+use crate::border::{draw_para_box, para_insets};
 
 use crate::inline::{Flat, GKind, Glyph, LineRange, advance, break_lines_indented, flatten, glyphs, min_max};
 use crate::style::{RStyle, merge, resolve, sane, size_pt};
@@ -182,7 +184,9 @@ pub(crate) fn layout_blocks(
     let mut y = frame.y;
     for (i, block) in blocks.iter().enumerate() {
         path.push(i);
-        y += layout_block(ctx, block, ts, path, frame.at_y(y), out);
+        // Consecutive paragraphs with equal borders share one box.
+        let joined = BorderJoin::of(blocks, i);
+        y += layout_block(ctx, block, ts, path, frame.at_y(y), joined, out);
         path.pop();
     }
     y - frame.y
@@ -208,14 +212,17 @@ fn layout_block(
     ts: &TextStyle,
     path: &mut Vec<usize>,
     frame: Frame,
+    joined: BorderJoin,
     out: &mut Out,
 ) -> f32 {
     match block {
-        Block::Paragraph { style, inlines } => layout_para(ctx, inlines, style, ts, None, path, frame, out),
+        Block::Paragraph { style, inlines } => {
+            layout_para(ctx, inlines, style, ts, None, path, frame, joined, out)
+        }
         Block::Heading { level, style, inlines } => {
             let hts = heading_style(ts, *level);
             let margin = ctx.resolve(&hts).size_px * HEADING_MARGIN;
-            layout_para(ctx, inlines, style, &hts, Some(margin), path, frame, out)
+            layout_para(ctx, inlines, style, &hts, Some(margin), path, frame, joined, out)
         }
         Block::List { kind, items } => layout_list(ctx, kind, items, ts, path, frame, out),
         Block::Quote { blocks } => {
@@ -234,8 +241,8 @@ fn layout_block(
             flat.push_text(text, ctx.resolve(&pts));
             layout_flat(ctx, &mut flat, Align::Start, None, path, frame, out, false)
         }
-        Block::Table { rows, border, width_px } => {
-            layout_table(ctx, rows, *border, *width_px, ts, path, frame.deeper(), out)
+        Block::Table { rows, border, width_px, borders } => {
+            layout_table(ctx, rows, *border, borders.as_deref(), *width_px, ts, path, frame.deeper(), out)
         }
         Block::Rule => {
             let m = ctx.px(RULE_MARGIN);
@@ -274,6 +281,7 @@ fn layout_para(
     default_margin: Option<f32>,
     path: &[usize],
     frame: Frame,
+    joined: BorderJoin,
     out: &mut Out,
 ) -> f32 {
     let mut sb = ctx.px(style.space_before_px);
@@ -305,11 +313,31 @@ fn layout_para(
         }
         _ => Spacing::multiple(style.line_height),
     };
-    let h = layout_lines(ctx, &mut flat, style.align, spacing, first_dx, path, inner, out, true);
+    let Some(borders) = style.borders.as_deref().filter(|b| !b.is_empty()) else {
+        let h = layout_lines(ctx, &mut flat, style.align, spacing, first_dx, path, inner, out, true);
+        if let (Some(i), Some(color)) = (bg, style.background) {
+            out.set(i, DisplayItem::FillRect { rect: Rect::new(frame.x, frame.y + sb, frame.w, h), color });
+        }
+        return sb + h + sa;
+    };
+    // A border box from the left to the right indent; the text sits inside it, past the lines and their
+    // padding. Paragraphs sharing the box run it through the space between them.
+    let ins = para_insets(ctx, borders, joined);
+    let x0 = inner.x;
+    let x1 = inner.x + inner.w;
+    let text = inner.inset(ins.left).inset_right(ins.right).at_y(frame.y + sb + ins.top);
+    let h = layout_lines(ctx, &mut flat, style.align, spacing, first_dx, path, text, out, true);
+    let y0 = if joined.above { frame.y } else { frame.y + sb };
+    let content_bottom = frame.y + sb + ins.top + h;
+    let y1 = if joined.below { content_bottom + sa } else { content_bottom + ins.bottom };
     if let (Some(i), Some(color)) = (bg, style.background) {
-        out.set(i, DisplayItem::FillRect { rect: Rect::new(frame.x, frame.y + sb, frame.w, h), color });
+        out.set(
+            i,
+            DisplayItem::FillRect { rect: Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)), color },
+        );
     }
-    sb + h + sa
+    draw_para_box(ctx, out, borders, joined, (x0, x1), (y0, y1), Some(content_bottom + sa / 2.0));
+    sb + ins.top + h + ins.bottom + sa
 }
 
 /// Scales images wider than `w` down to fit (aspect preserved).
@@ -835,6 +863,14 @@ pub(crate) fn blocks_min_max(ctx: &Ctx<'_>, blocks: &[Block], ts: &TextStyle, de
     })
 }
 
+/// Width the left and right borders of a paragraph take (lines and padding).
+fn border_width(ctx: &Ctx<'_>, style: &ParaStyle) -> f32 {
+    style.borders.as_deref().map_or(0.0, |b| {
+        let i = para_insets(ctx, b, BorderJoin::default());
+        i.left + i.right
+    })
+}
+
 fn inline_min_max(ctx: &Ctx<'_>, inlines: &[Inline], ts: &TextStyle) -> (f32, f32) {
     let mut flat = Flat::new(ctx, ts);
     flatten(ctx, inlines, ts, None, &mut flat, 0);
@@ -846,12 +882,14 @@ fn block_min_max(ctx: &Ctx<'_>, block: &Block, ts: &TextStyle, depth: usize) -> 
     let d = depth.saturating_add(1);
     let plus = |(a, b): (f32, f32), v: f32| (a + v, b + v);
     match block {
-        Block::Paragraph { style, inlines } => {
-            plus(inline_min_max(ctx, inlines, ts), ctx.px(style.indent_px) + ctx.px(style.right_indent_px))
-        }
-        Block::Heading { level, style, inlines } => {
-            plus(inline_min_max(ctx, inlines, &heading_style(ts, *level)), ctx.px(style.indent_px))
-        }
+        Block::Paragraph { style, inlines } => plus(
+            inline_min_max(ctx, inlines, ts),
+            ctx.px(style.indent_px) + ctx.px(style.right_indent_px) + border_width(ctx, style),
+        ),
+        Block::Heading { level, style, inlines } => plus(
+            inline_min_max(ctx, inlines, &heading_style(ts, *level)),
+            ctx.px(style.indent_px) + border_width(ctx, style),
+        ),
         Block::List { kind, items } => {
             let (mut mn, mut mx) = (0.0f32, 0.0f32);
             for item in items {
@@ -874,7 +912,7 @@ fn block_min_max(ctx: &Ctx<'_>, block: &Block, ts: &TextStyle, depth: usize) -> 
             let (_, mx) = min_max(&flat, &gl);
             (mx, mx)
         }
-        Block::Table { rows, border, width_px } => table_min_max(ctx, rows, *border, *width_px, ts, d),
+        Block::Table { rows, width_px, .. } => table_min_max(ctx, rows, *width_px, ts, d),
         Block::Rule => (0.0, 0.0),
         Block::Container { style, blocks } => {
             plus(blocks_min_max(ctx, blocks, ts, d), ctx.px(style.indent_px))

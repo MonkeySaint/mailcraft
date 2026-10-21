@@ -928,6 +928,11 @@ impl Session {
     /// Registers a compose state and returns its id (also queues `Notice::Compose`).
     pub fn open_compose(&mut self, mut c: ComposeState) -> u64 {
         self.apply_compose_defaults(&mut c);
+        // Named places in a reopened draft or a new message become bookmarks. A reply or forward leaves the
+        // ones in the quoted original where they are (they belong to that message, not to the user).
+        if matches!(c.kind, crate::compose::ComposeKind::New | crate::compose::ComposeKind::Draft) {
+            c.adopt_anchors();
+        }
         self.next_compose = self.next_compose.saturating_add(1);
         c.id = self.next_compose;
         self.composes.insert(c.id, c);

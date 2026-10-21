@@ -15,18 +15,22 @@ mod account_tests;
 mod accounts;
 mod alerts;
 mod archive;
+mod borders_dlg;
 mod categories;
 mod common;
 mod compose_dlg;
 pub(crate) mod files;
 mod find;
+mod find_replace_dlg;
 mod folders;
 pub(crate) mod format_dlg;
 mod general;
 mod insert_dlg;
 mod items;
 mod junk;
+mod link_dlg;
 mod mailopts;
+mod multilevel_dlg;
 mod options;
 mod print;
 mod quicksteps;
@@ -34,6 +38,8 @@ mod rules;
 mod security;
 mod views;
 
+#[cfg(test)]
+mod paragraph_tests;
 #[cfg(test)]
 mod tests;
 
@@ -273,6 +279,7 @@ pub const KNOWN: &[&str] = &[
     "font",
     "colors",
     "bordersAndShading",
+    "sortText",
     "setNumberingValue",
     "defineNewBullet",
     "defineNewNumberFormat",

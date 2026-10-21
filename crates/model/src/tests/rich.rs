@@ -83,6 +83,7 @@ fn tables_rules_quotes_pre() {
     let d = Doc {
         blocks: vec![
             Block::Table {
+                borders: None,
                 rows: vec![vec![cell("Name"), cell("Qty")], vec![cell("Apples"), cell("3")]],
                 border: true,
                 width_px: None,
@@ -108,7 +109,12 @@ fn table_cell_with_tabs_and_paragraphs_flattens() {
         width_px: None,
     };
     let d = Doc {
-        blocks: vec![Block::Table { rows: vec![vec![c, cell("d")]], border: false, width_px: None }],
+        blocks: vec![Block::Table {
+            borders: None,
+            rows: vec![vec![c, cell("d")]],
+            border: false,
+            width_px: None,
+        }],
         ..Default::default()
     };
     assert_eq!(d.to_plain_text(), "a b c\td");
@@ -122,9 +128,13 @@ fn inline_kinds() {
                 style: ParaStyle::default(),
                 inlines: vec![
                     text("Go to "),
-                    Inline::Link { href: "https://a.example".into(), children: vec![text("our site")] },
+                    Inline::Link {
+                        title: None,
+                        href: "https://a.example".into(),
+                        children: vec![text("our site")],
+                    },
                     text(" or "),
-                    Inline::Link { href: "https://b.example".into(), children: vec![] },
+                    Inline::Link { title: None, href: "https://b.example".into(), children: vec![] },
                     Inline::LineBreak,
                     Inline::Image { src: "cid:x".into(), alt: "[logo]".into(), width: None, height: None },
                 ],

@@ -6,6 +6,8 @@ use mailcraft_geom::Color;
 use mailcraft_model::rich::{Align, Block, Inline, ListKind, ParaStyle, TableCell, TextStyle};
 use proptest::prelude::*;
 
+mod borders;
+
 fn doc(html: &str) -> Doc {
     html_to_doc(html)
 }
@@ -18,6 +20,7 @@ fn inline_plain(inlines: &[Inline]) -> String {
             Inline::Link { children, .. } => s.push_str(&inline_plain(children)),
             Inline::LineBreak => s.push('\n'),
             Inline::Image { alt, .. } => s.push_str(&format!("[img:{alt}]")),
+            Inline::Anchor { name } => s.push_str(&format!("[#{name}]")),
         }
     }
     s
@@ -196,7 +199,7 @@ fn tables() {
                  <tr bgcolor=red><td rowspan=0 width=50%>a<td style='background:#00ff00;width:120px'>b<td>c</tr>\
                  junk</table>");
     assert_eq!(para_texts(&d), vec!["junk"]);
-    let Block::Table { rows, border, width_px } = &d.blocks[1] else { panic!("{:#?}", d.blocks) };
+    let Block::Table { borders: _, rows, border, width_px } = &d.blocks[1] else { panic!("{:#?}", d.blocks) };
     assert!(*border);
     assert_eq!(*width_px, Some(600.0));
     assert_eq!(rows.len(), 2);
@@ -225,7 +228,7 @@ fn links_and_images() {
                  <img src='data:text/html,x'></p>",
     );
     let (_, inl) = first_para(&d);
-    assert!(matches!(&inl[0], Inline::Link { href, children }
+    assert!(matches!(&inl[0], Inline::Link { title: _, href, children }
         if href == "https://x.test/a?b=1&c=2" && inline_plain(children) == "go now"));
     let images: Vec<&Inline> = inl.iter().filter(|i| matches!(i, Inline::Image { .. })).collect();
     assert_eq!(images.len(), 2);
@@ -239,7 +242,8 @@ fn links_and_images() {
         }
     );
     assert!(matches!(images[1], Inline::Image { width: Some(w), .. } if *w == 10.0));
-    assert_eq!(inline_plain(inl), "go now bad anchor [img:Logo] [img:]");
+    // `<a name>` is a bookmark: kept as an anchor where it starts.
+    assert_eq!(inline_plain(inl), "go now bad [#top]anchor [img:Logo] [img:]");
     assert!(!inl.iter().any(|i| matches!(i, Inline::Link { href, .. } if href.contains("javascript"))));
 }
 
@@ -392,6 +396,7 @@ fn serializer_sanitises_hand_built_docs() {
             style: ParaStyle::default(),
             inlines: vec![
                 Inline::Link {
+                    title: None,
                     href: "javascript:alert(1)".into(),
                     children: vec![Inline::Text { text: "x".into(), style: TextStyle::default() }],
                 },
@@ -583,6 +588,7 @@ fn doc_to_html_shape() {
                 }],
             },
             Block::Table {
+                borders: None,
                 rows: vec![vec![TableCell {
                     blocks: vec![],
                     colspan: 2,

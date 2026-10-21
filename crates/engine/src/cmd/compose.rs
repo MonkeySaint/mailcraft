@@ -46,7 +46,7 @@ pub const NO_ACCOUNT: &str = "No valid email accounts are configured. Add an acc
 /// Largest file Attach File accepts.
 pub const MAX_ATTACHMENT_BYTES: u64 = 150 * 1024 * 1024;
 /// Most attachments on one draft.
-const MAX_ATTACHMENTS: usize = 500;
+pub(crate) const MAX_ATTACHMENTS: usize = 500;
 
 // =======================================================================================================
 // Shared helpers (used by format/insert/review too)
@@ -92,6 +92,8 @@ pub(crate) fn compose_mut<'a>(s: &'a mut Session, p: &Value) -> Result<&'a mut C
     let id = compose_id(s, p)?;
     let c = s.composes.get_mut(&id).ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
     c.ensure_body();
+    // Bookmarks catch up with any edit made since they were last placed.
+    c.sync_bookmarks();
     Ok(c)
 }
 
@@ -750,10 +752,13 @@ pub(crate) fn build_message(
     if c.format != BodyFormat::PlainText && !rich_as_plain {
         // Options › Mail › Message format › "Reduce message size by removing format information not
         // necessary to display the message" (sent messages; drafts keep the body as edited).
+        // Bookmarks go into the message as named anchors, so `#name` links work for the recipients and
+        // the bookmarks come back when a draft is opened again.
+        let body = c.body_with_anchors();
         let html = if st.bool("mail.format.reduceSize") && !for_draft {
-            mailcraft_html::doc_to_html(&reduce_formatting(&c.body))
+            mailcraft_html::doc_to_html(&reduce_formatting(&body))
         } else {
-            mailcraft_html::doc_to_html(&c.body)
+            mailcraft_html::doc_to_html(&body)
         };
         b.html = Some(c.apply_list_formats_html(&html));
     }
@@ -2430,8 +2435,18 @@ fn edit_redo(s: &mut Session, p: &Value) -> CmdResult {
 /// Keeps bookmarks typed into the compose (used by insert.bookmark / format.goTo).
 pub(crate) fn add_bookmark(c: &mut ComposeState, name: &str) {
     let pos = c.selection.focus.clone();
+    add_bookmark_at(c, name, pos);
+}
+
+/// Keeps a bookmark called `name` at `pos` (replacing one of that name).
+pub(crate) fn add_bookmark_at(c: &mut ComposeState, name: &str, pos: DocPos) {
+    // Places are kept against the body as it is now: earlier edits move the other bookmarks first.
+    c.sync_bookmarks();
     c.bookmarks.retain(|b| b.name != name);
-    c.bookmarks.push(Bookmark { name: name.to_owned(), pos });
+    if c.bookmarks.len() < crate::compose::MAX_BOOKMARKS {
+        c.bookmarks.push(Bookmark { name: name.to_owned(), pos });
+    }
+    c.sync_bookmarks();
 }
 
 // =======================================================================================================

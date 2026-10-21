@@ -557,6 +557,7 @@ fn ctrl_click_follows_a_bookmark_link() {
     let link = Block::Paragraph {
         style: Default::default(),
         inlines: vec![Inline::Link {
+            title: None,
             href: "#end".into(),
             children: vec![Inline::Text { text: "Jump to the end".into(), style: Default::default() }],
         }],

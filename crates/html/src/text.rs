@@ -23,6 +23,7 @@ fn inline_text(inlines: &[Inline], out: &mut String, depth: usize) {
             Inline::Link { children, .. } => inline_text(children, out, depth + 1),
             Inline::LineBreak => out.push('\n'),
             Inline::Image { alt, .. } => out.push_str(alt),
+            Inline::Anchor { .. } => {}
         }
     }
 }

@@ -7,6 +7,7 @@
 
 use crate::{css, sanitize};
 use mailcraft_model::rich::{Align, Block, Doc, Inline, ListKind, ParaStyle, TableCell, TextStyle};
+use mailcraft_model::{BorderEdge, BorderJoin, ParaBorders};
 use std::fmt::Write as _;
 
 /// Blocks nested deeper than this are not written (documents from the importer never get close).
@@ -79,14 +80,83 @@ fn align_css(a: Align) -> &'static str {
     }
 }
 
-fn para_css(s: &ParaStyle, inherited: Align) -> String {
+/// A CSS border value (`1px solid #c00000`; no colour = the text colour).
+pub(crate) fn border_value(e: &BorderEdge) -> String {
+    let mut v = format!("{}px {}", num(e.thickness_px()), e.line.css());
+    if let Some(c) = e.color {
+        let _ = write!(v, " {}", c.to_hex());
+    }
+    v
+}
+
+/// Paragraph borders as CSS. Paragraphs sharing one box (see [`BorderJoin`]) leave out the lines between
+/// them, keeping each in a Word-style `mso-border-…-alt` declaration so the importer can restore it, and
+/// move the space between them inside the box (padding) so the side lines run through.
+fn para_border_css(bd: &ParaBorders, join: BorderJoin, t: &mut f32, b: &mut f32, css: &mut String) {
+    let mut pad = [0.0f32; 4];
+    if join.above {
+        pad[0] = *t;
+        *t = 0.0;
+    } else if bd.top.is_some() {
+        pad[0] = ParaBorders::PAD_Y_PX;
+    }
+    if join.below {
+        pad[2] = *b;
+        *b = 0.0;
+    } else if bd.bottom.is_some() {
+        pad[2] = ParaBorders::PAD_Y_PX;
+    }
+    if bd.right.is_some() {
+        pad[1] = ParaBorders::PAD_X_PX;
+    }
+    if bd.left.is_some() {
+        pad[3] = ParaBorders::PAD_X_PX;
+    }
+    let _ = write!(css, ";padding:{} {} {} {}", px(pad[0]), px(pad[1]), px(pad[2]), px(pad[3]));
+    for (side, edge, hidden) in [
+        ("top", &bd.top, join.above),
+        ("right", &bd.right, false),
+        ("bottom", &bd.bottom, join.below),
+        ("left", &bd.left, false),
+    ] {
+        match (edge, hidden) {
+            (Some(e), false) => {
+                let _ = write!(css, ";border-{side}:{}", border_value(e));
+            }
+            (Some(e), true) => {
+                let _ = write!(css, ";mso-border-{side}-alt:{}", border_value(e));
+            }
+            (None, true) => {
+                let _ = write!(css, ";mso-border-{side}-alt:none");
+            }
+            (None, false) => {}
+        }
+    }
+    // The line between paragraphs sharing the box is drawn as the bottom border of all but the last.
+    if let Some(e) = &bd.between {
+        if join.below {
+            let _ = write!(css, ";border-bottom:{}", border_value(e));
+        }
+        let _ = write!(css, ";mso-border-between:{}", border_value(e));
+    }
+    if bd.shadow && !join.below {
+        css.push_str(";box-shadow:3px 3px 0 #808080");
+    }
+}
+
+fn para_css(s: &ParaStyle, inherited: Align, join: BorderJoin) -> String {
     let mut css = String::new();
-    let (t, b, l, r) = (s.space_before_px, s.space_after_px, s.indent_px, s.right_indent_px);
+    let (mut t, mut b, l, r) = (s.space_before_px, s.space_after_px, s.indent_px, s.right_indent_px);
+    let mut borders = String::new();
+    if let Some(bd) = s.borders.as_deref().filter(|bd| !bd.is_empty()) {
+        para_border_css(bd, join, &mut t, &mut b, &mut borders);
+    }
     if t == 0.0 && b == 0.0 && l == 0.0 && r == 0.0 {
         css.push_str("margin:0");
     } else {
         let _ = write!(css, "margin:{} {} {} {}", px(t), px(r), px(b), px(l));
     }
+    css.push_str(&borders);
     if s.align != inherited {
         let _ = write!(css, ";text-align:{}", align_css(s.align));
     }
@@ -201,14 +271,14 @@ impl Writer {
         if depth > MAX_DEPTH {
             return;
         }
-        for b in blocks {
-            self.block(b, inherited, depth);
+        for (i, b) in blocks.iter().enumerate() {
+            self.block(b, inherited, depth, BorderJoin::of(blocks, i));
         }
     }
 
-    fn para_open(&mut self, tag: &str, style: &ParaStyle, inherited: Align) {
+    fn para_open(&mut self, tag: &str, style: &ParaStyle, inherited: Align, join: BorderJoin) {
         let _ = write!(self.out, "<{tag} style=");
-        self.attr_value(&para_css(style, inherited));
+        self.attr_value(&para_css(style, inherited, join));
         self.out.push('>');
         self.prev_space = true;
     }
@@ -220,16 +290,16 @@ impl Writer {
         }
     }
 
-    fn block(&mut self, b: &Block, inherited: Align, depth: usize) {
+    fn block(&mut self, b: &Block, inherited: Align, depth: usize, join: BorderJoin) {
         match b {
             Block::Paragraph { style, inlines } => {
-                self.para_open("p", style, inherited);
+                self.para_open("p", style, inherited, join);
                 self.para_body(inlines);
                 self.out.push_str("</p>\n");
             }
             Block::Heading { level, style, inlines } => {
                 let tag = format!("h{}", (*level).clamp(1, 6));
-                self.para_open(&tag, style, inherited);
+                self.para_open(&tag, style, inherited, join);
                 self.para_body(inlines);
                 let _ = writeln!(self.out, "</{tag}>");
             }
@@ -278,9 +348,10 @@ impl Writer {
                 }
                 self.out.push_str("</pre>\n");
             }
-            Block::Table { rows, border, width_px } => {
+            Block::Table { rows, border, width_px, borders } => {
+                let grid = borders.as_deref();
                 self.out.push_str("<table");
-                if *border {
+                if *border && grid.is_none() {
                     self.out.push_str(" border=\"1\"");
                 }
                 self.out.push_str(" cellspacing=\"0\" cellpadding=\"4\" style=\"border-collapse:collapse");
@@ -288,10 +359,30 @@ impl Writer {
                     let _ = write!(self.out, ";width:{}px", num(*w));
                 }
                 self.out.push_str("\">\n");
-                for row in rows {
+                let nrows = rows.len();
+                let ncols = rows.iter().map(|r| span_sum(r)).max().unwrap_or(0);
+                for (ri, row) in rows.iter().enumerate() {
                     self.out.push_str("<tr>");
+                    let mut col = 0usize;
                     for cell in row {
-                        self.cell(cell, inherited, depth);
+                        let span = usize::try_from(cell.colspan.max(1)).unwrap_or(1);
+                        let rspan = usize::try_from(cell.rowspan.max(1)).unwrap_or(1);
+                        let edges = grid.map(|g| CellEdges {
+                            top: if ri == 0 { g.top.as_ref() } else { g.inside_h.as_ref() },
+                            bottom: if ri.saturating_add(rspan) >= nrows {
+                                g.bottom.as_ref()
+                            } else {
+                                g.inside_h.as_ref()
+                            },
+                            left: if col == 0 { g.left.as_ref() } else { g.inside_v.as_ref() },
+                            right: if col.saturating_add(span) >= ncols {
+                                g.right.as_ref()
+                            } else {
+                                g.inside_v.as_ref()
+                            },
+                        });
+                        self.cell(cell, inherited, depth, edges);
+                        col = col.saturating_add(span);
                     }
                     self.out.push_str("</tr>\n");
                 }
@@ -299,7 +390,7 @@ impl Writer {
             }
             Block::Rule => self.out.push_str("<hr>\n"),
             Block::Container { style, blocks } => {
-                self.para_open("div", style, inherited);
+                self.para_open("div", style, inherited, BorderJoin::default());
                 self.out.push('\n');
                 self.blocks(blocks, style.align, depth + 1);
                 self.out.push_str("</div>\n");
@@ -307,7 +398,7 @@ impl Writer {
         }
     }
 
-    fn cell(&mut self, cell: &TableCell, inherited: Align, depth: usize) {
+    fn cell(&mut self, cell: &TableCell, inherited: Align, depth: usize, edges: Option<CellEdges<'_>>) {
         self.out.push_str("<td");
         if cell.colspan > 1 {
             let _ = write!(self.out, " colspan=\"{}\"", cell.colspan);
@@ -321,6 +412,19 @@ impl Writer {
         }
         if let Some(w) = cell.width_px {
             let _ = write!(css, ";width:{}px", num(w));
+        }
+        // Per-edge table borders go on the cells (they collapse into one line between two cells).
+        if let Some(e) = edges {
+            for (side, edge) in [("top", e.top), ("right", e.right), ("bottom", e.bottom), ("left", e.left)] {
+                match edge {
+                    Some(edge) => {
+                        let _ = write!(css, ";border-{side}:{}", border_value(edge));
+                    }
+                    None => {
+                        let _ = write!(css, ";border-{side}:none");
+                    }
+                }
+            }
         }
         self.out.push_str(" style=");
         self.attr_value(&css);
@@ -341,11 +445,15 @@ impl Writer {
         }
         match i {
             Inline::Text { text, style } => self.text(text, style),
-            Inline::Link { href, children } => {
+            Inline::Link { href, children, title } => {
                 let safe = if allow_link { sanitize::safe_href(href) } else { None };
                 if let Some(href) = &safe {
                     self.out.push_str("<a href=");
                     self.attr_value(href);
+                    if let Some(t) = title.as_deref().filter(|t| !t.trim().is_empty()) {
+                        self.out.push_str(" title=");
+                        self.attr_value(t);
+                    }
                     self.out.push('>');
                 }
                 for c in children {
@@ -372,6 +480,15 @@ impl Writer {
                 }
                 self.out.push('>');
                 self.prev_space = false;
+            }
+            Inline::Anchor { name } => {
+                // A bookmark: `id` for current readers, `name` for older mail programs.
+                let Some(name) = mailcraft_model::rich::clean_anchor_name(name) else { return };
+                self.out.push_str("<a id=");
+                self.attr_value(&name);
+                self.out.push_str(" name=");
+                self.attr_value(&name);
+                self.out.push_str("></a>");
             }
         }
     }
@@ -422,6 +539,20 @@ impl Writer {
             self.out.push_str("</span>");
         }
     }
+}
+
+/// The edges of one table cell (per-edge table borders).
+#[derive(Clone, Copy)]
+struct CellEdges<'a> {
+    top: Option<&'a BorderEdge>,
+    bottom: Option<&'a BorderEdge>,
+    left: Option<&'a BorderEdge>,
+    right: Option<&'a BorderEdge>,
+}
+
+/// Columns a row spans.
+fn span_sum(row: &[TableCell]) -> usize {
+    row.iter().map(|c| usize::try_from(c.colspan.max(1)).unwrap_or(1)).fold(0usize, usize::saturating_add)
 }
 
 pub(crate) fn doc_to_html(doc: &Doc) -> String {

@@ -126,6 +126,233 @@ pub struct ParaStyle {
     pub page_break_before: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_widow_control: bool,
+    /// Paragraph borders (Borders and Shading). Consecutive paragraphs with equal borders share one box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub borders: Option<Box<ParaBorders>>,
+}
+
+/// Line style of a border (Borders and Shading › Style). Each has a CSS `border-style` equivalent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BorderLine {
+    #[default]
+    Single,
+    Dotted,
+    Dashed,
+    Double,
+    /// 3-D, carved in (CSS `groove`).
+    Groove,
+    /// 3-D, raised (CSS `ridge`).
+    Ridge,
+    Inset,
+    Outset,
+}
+
+impl BorderLine {
+    /// Every style with its name (as `format.borders` takes it) and its CSS keyword.
+    pub const ALL: [(BorderLine, &'static str, &'static str); 8] = [
+        (BorderLine::Single, "single", "solid"),
+        (BorderLine::Dotted, "dotted", "dotted"),
+        (BorderLine::Dashed, "dashed", "dashed"),
+        (BorderLine::Double, "double", "double"),
+        (BorderLine::Groove, "groove", "groove"),
+        (BorderLine::Ridge, "ridge", "ridge"),
+        (BorderLine::Inset, "inset", "inset"),
+        (BorderLine::Outset, "outset", "outset"),
+    ];
+
+    /// The style called `name` (its own name or its CSS keyword; case-insensitive).
+    pub fn from_name(name: &str) -> Option<BorderLine> {
+        let n = name.trim();
+        Self::ALL
+            .iter()
+            .find(|(_, a, b)| a.eq_ignore_ascii_case(n) || b.eq_ignore_ascii_case(n))
+            .map(|(k, _, _)| *k)
+    }
+
+    /// The style's name.
+    pub fn name(self) -> &'static str {
+        Self::ALL.iter().find(|(k, _, _)| *k == self).map_or("single", |(_, n, _)| n)
+    }
+
+    /// The CSS `border-style` keyword.
+    pub fn css(self) -> &'static str {
+        Self::ALL.iter().find(|(k, _, _)| *k == self).map_or("solid", |(_, _, c)| c)
+    }
+}
+
+/// One side of a border.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BorderEdge {
+    pub line: BorderLine,
+    /// `None` = Automatic (the text colour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
+    /// Line width in points ([`BorderEdge::MIN_WIDTH_PT`]..=[`BorderEdge::MAX_WIDTH_PT`]).
+    pub width_pt: f32,
+}
+
+impl Default for BorderEdge {
+    fn default() -> Self {
+        BorderEdge { line: BorderLine::Single, color: None, width_pt: BorderEdge::DEFAULT_WIDTH_PT }
+    }
+}
+
+impl BorderEdge {
+    pub const MIN_WIDTH_PT: f32 = 0.25;
+    pub const MAX_WIDTH_PT: f32 = 6.0;
+    pub const DEFAULT_WIDTH_PT: f32 = 0.5;
+    /// The widths the Borders and Shading dialog offers (points).
+    pub const WIDTHS_PT: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.25, 3.0, 4.5, 6.0];
+
+    /// An edge of `line` style, `width_pt` wide (kept within the allowed range) in `color`.
+    pub fn new(line: BorderLine, color: Option<Color>, width_pt: f32) -> BorderEdge {
+        BorderEdge { line, color, width_pt: Self::clamp_width(width_pt) }
+    }
+
+    /// `w` within the allowed widths (non-finite → the default).
+    pub fn clamp_width(w: f32) -> f32 {
+        if w.is_finite() { w.clamp(Self::MIN_WIDTH_PT, Self::MAX_WIDTH_PT) } else { Self::DEFAULT_WIDTH_PT }
+    }
+
+    /// The line width in px.
+    pub fn width_px(&self) -> f32 {
+        Self::clamp_width(self.width_pt) * 4.0 / 3.0
+    }
+
+    /// The room the edge takes in px (CSS `border-width`): a double line has room for both lines and the
+    /// gap between them.
+    pub fn thickness_px(&self) -> f32 {
+        let w = self.width_px();
+        match self.line {
+            BorderLine::Double => w * 3.0,
+            _ => w,
+        }
+    }
+
+    /// The edge drawn by a CSS border `thickness` px wide (the inverse of [`BorderEdge::thickness_px`]).
+    pub fn from_thickness(line: BorderLine, color: Option<Color>, thickness_px: f32) -> BorderEdge {
+        let w = match line {
+            BorderLine::Double => thickness_px / 3.0,
+            _ => thickness_px,
+        };
+        // Points, rounded to the quarter point the dialog works in.
+        let pt = (w * 0.75 * 4.0).round() / 4.0;
+        BorderEdge::new(line, color, pt)
+    }
+}
+
+/// Paragraph borders: each side may have its own line. `shadow` draws a shadow below and to the right of
+/// a box (the Shadow setting).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ParaBorders {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<BorderEdge>,
+    /// The line between paragraphs sharing one box (Inside Horizontal Border on paragraphs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub between: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shadow: bool,
+}
+
+impl ParaBorders {
+    /// Space between a border line and the paragraph text, above / below and left / right (px). The HTML
+    /// writer puts it in the paragraph's `padding`; the importer takes it back out.
+    pub const PAD_Y_PX: f32 = 1.0;
+    pub const PAD_X_PX: f32 = 5.0;
+
+    /// A box: every side drawn with `edge`.
+    pub fn boxed(edge: &BorderEdge) -> ParaBorders {
+        ParaBorders {
+            top: Some(edge.clone()),
+            bottom: Some(edge.clone()),
+            left: Some(edge.clone()),
+            right: Some(edge.clone()),
+            between: None,
+            shadow: false,
+        }
+    }
+
+    /// No line drawn.
+    pub fn is_empty(&self) -> bool {
+        self.top.is_none()
+            && self.bottom.is_none()
+            && self.left.is_none()
+            && self.right.is_none()
+            && self.between.is_none()
+    }
+
+    /// Side by name (`top`, `bottom`, `left`, `right`, `between`); `None` for an unknown name.
+    pub fn side_mut(&mut self, name: &str) -> Option<&mut Option<BorderEdge>> {
+        match name {
+            "top" => Some(&mut self.top),
+            "bottom" => Some(&mut self.bottom),
+            "left" => Some(&mut self.left),
+            "right" => Some(&mut self.right),
+            "between" | "insideH" => Some(&mut self.between),
+            _ => None,
+        }
+    }
+}
+
+/// Table borders: the outside edges and the lines between rows (`inside_h`) and columns (`inside_v`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TableBorders {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_h: Option<BorderEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_v: Option<BorderEdge>,
+}
+
+impl TableBorders {
+    /// Every edge (a full grid) drawn with `edge`.
+    pub fn all(edge: &BorderEdge) -> TableBorders {
+        TableBorders {
+            top: Some(edge.clone()),
+            bottom: Some(edge.clone()),
+            left: Some(edge.clone()),
+            right: Some(edge.clone()),
+            inside_h: Some(edge.clone()),
+            inside_v: Some(edge.clone()),
+        }
+    }
+
+    /// No edge drawn.
+    pub fn is_empty(&self) -> bool {
+        self.top.is_none()
+            && self.bottom.is_none()
+            && self.left.is_none()
+            && self.right.is_none()
+            && self.inside_h.is_none()
+            && self.inside_v.is_none()
+    }
+
+    /// Edge by name (`top`, `bottom`, `left`, `right`, `insideH`, `insideV`); `None` for an unknown name.
+    pub fn edge_mut(&mut self, name: &str) -> Option<&mut Option<BorderEdge>> {
+        match name {
+            "top" => Some(&mut self.top),
+            "bottom" => Some(&mut self.bottom),
+            "left" => Some(&mut self.left),
+            "right" => Some(&mut self.right),
+            "insideH" => Some(&mut self.inside_h),
+            "insideV" => Some(&mut self.inside_v),
+            _ => None,
+        }
+    }
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -145,6 +372,9 @@ pub enum Inline {
     Link {
         href: String,
         children: Vec<Inline>,
+        /// ScreenTip: the text shown when pointing at the link (HTML `title`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     LineBreak,
     /// Image by URL (`cid:…`, `data:…`, `https:…`); remote URLs are blocked by default at display time.
@@ -154,6 +384,22 @@ pub enum Inline {
         width: Option<f32>,
         height: Option<f32>,
     },
+    /// A named place in the text (a bookmark), the target of `#name` links: written as
+    /// `<a id="name" name="name"></a>`. It takes no room and no caret position.
+    Anchor {
+        name: String,
+    },
+}
+
+/// Longest anchor (bookmark) name kept.
+pub const MAX_ANCHOR_NAME: usize = 100;
+
+/// An anchor name as kept: without control characters or white space, at most [`MAX_ANCHOR_NAME`] chars;
+/// `None` when nothing is left.
+pub fn clean_anchor_name(name: &str) -> Option<String> {
+    let n: String =
+        name.chars().filter(|c| !c.is_control() && !c.is_whitespace()).take(MAX_ANCHOR_NAME).collect();
+    (!n.is_empty()).then_some(n)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -197,8 +443,12 @@ pub enum Block {
     },
     Table {
         rows: Vec<Vec<TableCell>>,
+        /// A plain grid border (every edge a thin grey line); `borders` wins when set.
         border: bool,
         width_px: Option<f32>,
+        /// Per-edge borders (Borders and Shading, the Borders menu in a table).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        borders: Option<Box<TableBorders>>,
     },
     /// Horizontal rule (the HTML reply separator).
     Rule,
@@ -268,6 +518,175 @@ impl Doc {
         }
         out
     }
+
+    /// Removes every anchor from the paragraphs and headings and returns where each was: (block path of
+    /// the paragraph, char offset, name), in document order. Paths follow the layout convention (lists add
+    /// `[item, block]`, quotes and containers `[child]`, tables `[row, cell, block]`); offsets count chars
+    /// with a line break or a picture as one.
+    pub fn take_anchors(&mut self) -> Vec<(Vec<usize>, usize, String)> {
+        let mut out = Vec::new();
+        let mut path = Vec::new();
+        take_block_anchors(&mut self.blocks, &mut path, &mut out);
+        out
+    }
+
+    /// Puts an anchor called `name` into the paragraph or heading at `path`, `offset` chars in (past the
+    /// end = at the end). False when `path` is not a paragraph or heading or the name is empty.
+    pub fn insert_anchor(&mut self, path: &[usize], offset: usize, name: &str) -> bool {
+        let Some(name) = clean_anchor_name(name) else {
+            return false;
+        };
+        let Some(inlines) = leaf_inlines_mut(&mut self.blocks, path, 0) else {
+            return false;
+        };
+        insert_inline_at(inlines, offset, Inline::Anchor { name }, 0);
+        true
+    }
+}
+
+/// Inline content of the paragraph or heading at `path` (layout path convention).
+fn leaf_inlines_mut<'a>(
+    blocks: &'a mut [Block],
+    path: &[usize],
+    depth: usize,
+) -> Option<&'a mut Vec<Inline>> {
+    if depth > MAX_PLAIN_DEPTH {
+        return None;
+    }
+    let (&first, rest) = path.split_first()?;
+    match blocks.get_mut(first)? {
+        Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } if rest.is_empty() => Some(inlines),
+        Block::List { items, .. } => {
+            let (&item, rest) = rest.split_first()?;
+            leaf_inlines_mut(items.get_mut(item)?, rest, depth + 1)
+        }
+        Block::Quote { blocks } | Block::Container { blocks, .. } => {
+            leaf_inlines_mut(blocks, rest, depth + 1)
+        }
+        Block::Table { rows, .. } => {
+            let (&r, rest) = rest.split_first()?;
+            let (&c, rest) = rest.split_first()?;
+            leaf_inlines_mut(&mut rows.get_mut(r)?.get_mut(c)?.blocks, rest, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Chars an inline counts for in offsets (line break and picture: one; anchor: none).
+fn inline_len(i: &Inline, depth: usize) -> usize {
+    match i {
+        Inline::Text { text, .. } => text.chars().count(),
+        Inline::Link { children, .. } if depth <= MAX_PLAIN_DEPTH => {
+            children.iter().map(|c| inline_len(c, depth + 1)).fold(0usize, usize::saturating_add)
+        }
+        Inline::Link { .. } | Inline::Anchor { .. } => 0,
+        Inline::LineBreak | Inline::Image { .. } => 1,
+    }
+}
+
+/// Inserts `new` `offset` chars into `inlines`, splitting a text run or going into a link when the offset
+/// falls inside one; an offset past the end appends it.
+fn insert_inline_at(inlines: &mut Vec<Inline>, offset: usize, new: Inline, depth: usize) {
+    let mut left = offset;
+    let mut i = 0usize;
+    while i < inlines.len() {
+        if left == 0 {
+            inlines.insert(i, new);
+            return;
+        }
+        let Some(cur) = inlines.get_mut(i) else { break };
+        let len = inline_len(cur, depth);
+        if left < len {
+            match cur {
+                Inline::Text { text, style } => {
+                    let at = text.char_indices().nth(left).map_or(text.len(), |(b, _)| b);
+                    let tail = text.split_off(at);
+                    let style = style.clone();
+                    inlines.insert(i.saturating_add(1), new);
+                    inlines.insert(i.saturating_add(2), Inline::Text { text: tail, style });
+                    return;
+                }
+                Inline::Link { children, .. } if depth < MAX_PLAIN_DEPTH => {
+                    insert_inline_at(children, left, new, depth + 1);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        left = left.saturating_sub(len);
+        i = i.saturating_add(1);
+    }
+    inlines.push(new);
+}
+
+fn take_block_anchors(
+    blocks: &mut [Block],
+    path: &mut Vec<usize>,
+    out: &mut Vec<(Vec<usize>, usize, String)>,
+) {
+    if path.len() > MAX_PLAIN_DEPTH {
+        return;
+    }
+    for (i, b) in blocks.iter_mut().enumerate() {
+        path.push(i);
+        match b {
+            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => {
+                let mut offset = 0usize;
+                take_inline_anchors(inlines, &mut offset, path, out, 0);
+            }
+            Block::List { items, .. } => {
+                for (k, item) in items.iter_mut().enumerate() {
+                    path.push(k);
+                    take_block_anchors(item, path, out);
+                    path.pop();
+                }
+            }
+            Block::Quote { blocks } | Block::Container { blocks, .. } => {
+                take_block_anchors(blocks, path, out)
+            }
+            Block::Table { rows, .. } => {
+                for (r, row) in rows.iter_mut().enumerate() {
+                    for (c, cell) in row.iter_mut().enumerate() {
+                        path.push(r);
+                        path.push(c);
+                        take_block_anchors(&mut cell.blocks, path, out);
+                        path.pop();
+                        path.pop();
+                    }
+                }
+            }
+            Block::Pre { .. } | Block::Rule => {}
+        }
+        path.pop();
+    }
+}
+
+fn take_inline_anchors(
+    inlines: &mut Vec<Inline>,
+    offset: &mut usize,
+    path: &[usize],
+    out: &mut Vec<(Vec<usize>, usize, String)>,
+    depth: usize,
+) {
+    if depth > MAX_PLAIN_DEPTH {
+        return;
+    }
+    let mut i = 0usize;
+    while i < inlines.len() {
+        match inlines.get_mut(i) {
+            Some(Inline::Anchor { name }) => {
+                out.push((path.to_vec(), *offset, std::mem::take(name)));
+                inlines.remove(i);
+                continue;
+            }
+            Some(Inline::Link { children, .. }) => {
+                take_inline_anchors(children, offset, path, out, depth + 1)
+            }
+            Some(other) => *offset = offset.saturating_add(inline_len(other, depth)),
+            None => break,
+        }
+        i = i.saturating_add(1);
+    }
 }
 
 impl Block {
@@ -279,6 +698,50 @@ impl Block {
             vec![Inline::Text { text: text.to_string(), style: TextStyle::default() }]
         };
         Block::Paragraph { style: ParaStyle::default(), inlines }
+    }
+
+    /// The borders of a paragraph or heading (`None` without any, and for other blocks).
+    pub fn para_borders(&self) -> Option<&ParaBorders> {
+        match self {
+            Block::Paragraph { style, .. } | Block::Heading { style, .. } => {
+                style.borders.as_deref().filter(|b| !b.is_empty())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this paragraph and `next` (the block after it) share one border box: both have the same
+    /// borders and the same indents, so no line is drawn between them.
+    pub fn shares_border_box(&self, next: &Block) -> bool {
+        let indents = |b: &Block| match b {
+            Block::Paragraph { style, .. } | Block::Heading { style, .. } => {
+                Some((style.indent_px.to_bits(), style.right_indent_px.to_bits()))
+            }
+            _ => None,
+        };
+        self.para_borders().is_some()
+            && self.para_borders() == next.para_borders()
+            && indents(self) == indents(next)
+    }
+}
+
+/// Where a paragraph's border box joins the paragraphs around it (see [`Block::shares_border_box`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BorderJoin {
+    pub above: bool,
+    pub below: bool,
+}
+
+impl BorderJoin {
+    /// How block `i` of `blocks` joins its neighbours.
+    pub fn of(blocks: &[Block], i: usize) -> BorderJoin {
+        let Some(me) = blocks.get(i) else {
+            return BorderJoin::default();
+        };
+        BorderJoin {
+            above: i.checked_sub(1).and_then(|j| blocks.get(j)).is_some_and(|p| p.shares_border_box(me)),
+            below: blocks.get(i.saturating_add(1)).is_some_and(|n| me.shares_border_box(n)),
+        }
     }
 }
 
@@ -367,7 +830,7 @@ fn inlines_to_text(inlines: &[Inline], depth: usize, out: &mut String) {
     for inline in inlines {
         match inline {
             Inline::Text { text, .. } => out.push_str(text),
-            Inline::Link { href, children } => {
+            Inline::Link { href, children, .. } => {
                 let before = out.len();
                 inlines_to_text(children, depth + 1, out);
                 if out.len() == before {
@@ -376,6 +839,7 @@ fn inlines_to_text(inlines: &[Inline], depth: usize, out: &mut String) {
             }
             Inline::LineBreak => out.push('\n'),
             Inline::Image { alt, .. } => out.push_str(alt),
+            Inline::Anchor { .. } => {}
         }
     }
 }

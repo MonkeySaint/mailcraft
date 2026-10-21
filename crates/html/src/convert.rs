@@ -12,6 +12,7 @@ use mailcraft_geom::Color;
 use mailcraft_model::rich::{
     Align, Block, Doc, Inline, LineRule, ListKind, ParaStyle, TableCell, TextStyle, UnderlineKind,
 };
+use mailcraft_model::{BorderEdge, ParaBorders, TableBorders};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -24,6 +25,8 @@ const MAX_WALK_DEPTH: usize = crate::MAX_DEPTH + 64;
 const MAX_TEXT_INDENT: f32 = 2_000.0;
 /// Largest letter spacing and baseline shift taken from mail (pt).
 const MAX_SHIFT_PT: f32 = 200.0;
+/// Longest link ScreenTip (`title`) kept, in chars.
+const MAX_LINK_TITLE: usize = 1_000;
 /// Inline `style` attributes longer than this are truncated.
 const MAX_STYLE_ATTR: usize = 64 * 1024;
 /// Total bytes of link targets copied into `Inline::Link`s. A link spanning many paragraphs needs one copy per
@@ -43,6 +46,8 @@ struct Ctx {
     indent: f32,
     line_height: Option<f32>,
     link: Option<Rc<str>>,
+    /// ScreenTip of the enclosing link (`title`).
+    link_title: Option<Rc<str>>,
     preserve_ws: bool,
 }
 
@@ -83,9 +88,60 @@ struct BoxStyle {
     keep_together: bool,
     page_break_before: bool,
     no_widow_control: bool,
+    /// Border edges in CSS box order (top, right, bottom, left).
+    edges: [Option<BorderEdge>; 4],
+    /// Lines a shared paragraph box leaves out (`mso-border-top-alt`, `mso-border-bottom-alt`).
+    alt_top: Option<Option<BorderEdge>>,
+    alt_bottom: Option<Option<BorderEdge>>,
+    between: Option<BorderEdge>,
+    shadow: bool,
+    /// Padding in CSS box order, and the left / right margins (a bordered paragraph's padding is the room
+    /// between its lines and its text, not indent).
+    pad: [f32; 4],
+    margin_left: f32,
+    margin_right: f32,
+}
+
+/// A bordered paragraph's borders and spacing with the border padding taken back out.
+struct BorderedPara {
+    borders: ParaBorders,
+    /// Space added above / below (padding past the border padding: the space a shared box moves inside).
+    before: f32,
+    after: f32,
+    indent: f32,
+    right: f32,
 }
 
 impl BoxStyle {
+    /// The borders of a `p` or heading, if it has any.
+    fn bordered_para(&self) -> Option<BorderedPara> {
+        let [top, right, bottom, left] = self.edges.clone();
+        let drawn_top = top.is_some() && self.alt_top.is_none();
+        let drawn_bottom = bottom.is_some() && self.alt_bottom.is_none();
+        // A shared box keeps the lines it leaves out (and the bottom it draws a between line over) in
+        // `mso-border-…-alt`.
+        let borders = ParaBorders {
+            top: self.alt_top.clone().unwrap_or(top),
+            bottom: self.alt_bottom.clone().unwrap_or(bottom),
+            left,
+            right,
+            between: self.between.clone(),
+            shadow: self.shadow,
+        };
+        if borders.is_empty() {
+            return None;
+        }
+        let less = |pad: f32, on: bool, by: f32| (pad - if on { by } else { 0.0 }).max(0.0);
+        let [pt, pr, pb, pl] = self.pad;
+        Some(BorderedPara {
+            before: less(pt, drawn_top, ParaBorders::PAD_Y_PX),
+            after: less(pb, drawn_bottom, ParaBorders::PAD_Y_PX),
+            indent: (self.margin_left + less(pl, borders.left.is_some(), ParaBorders::PAD_X_PX)).max(0.0),
+            right: (self.margin_right + less(pr, borders.right.is_some(), ParaBorders::PAD_X_PX)).max(0.0),
+            borders,
+        })
+    }
+
     /// The paragraph properties of this box on top of `para`.
     fn para_extras(&self, para: ParaStyle) -> ParaStyle {
         ParaStyle {
@@ -232,9 +288,12 @@ fn box_style(p: &Props, font_px: f32) -> BoxStyle {
     if let Some([t, _, bt, l]) = p.get("margin").and_then(|v| box_sides(v, font_px)) {
         (mt, mb, ml) = (Some(t), Some(bt), Some(l));
     }
-    if let Some([_, _, _, l]) = p.get("padding").and_then(|v| box_sides(v, font_px)) {
-        pl = Some(l);
+    let (mut pt, mut pb) = (None, None);
+    if let Some([t, _, bt, l]) = p.get("padding").and_then(|v| box_sides(v, font_px)) {
+        (pt, pb, pl) = (Some(t), Some(bt), Some(l));
     }
+    pt = len("padding-top").or(pt);
+    pb = len("padding-bottom").or(pb);
     mt = len("margin-top").or(mt);
     mb = len("margin-bottom").or(mb);
     ml = len("margin-left").or(ml);
@@ -252,6 +311,16 @@ fn box_style(p: &Props, font_px: f32) -> BoxStyle {
     }
     b.right =
         (len("margin-right").or(mr).unwrap_or(0.0) + len("padding-right").or(pr).unwrap_or(0.0)).max(0.0);
+    let pos = |v: Option<f32>| v.filter(|v| v.is_finite()).unwrap_or(0.0).clamp(0.0, MAX_TEXT_INDENT);
+    b.pad = [pos(pt), pos(len("padding-right").or(pr)), pos(pb), pos(pl)];
+    b.margin_left = ml.filter(|v| v.is_finite()).unwrap_or(0.0).clamp(-MAX_TEXT_INDENT, MAX_TEXT_INDENT);
+    b.margin_right =
+        len("margin-right").or(mr).filter(|v| v.is_finite()).unwrap_or(0.0).clamp(0.0, MAX_TEXT_INDENT);
+    b.edges = crate::borders::edges(p, font_px);
+    b.alt_top = crate::borders::alt_edge(p, "top", font_px);
+    b.alt_bottom = crate::borders::alt_edge(p, "bottom", font_px);
+    b.between = crate::borders::between_edge(p, font_px);
+    b.shadow = crate::borders::has_shadow(p);
     b.text_indent = p
         .get("text-indent")
         .and_then(|v| css::length_px(v, font_px))
@@ -544,16 +613,23 @@ impl<'a> Sink<'a> {
     fn push_inline(&mut self, inline: Inline, ctx: &Ctx) {
         match &ctx.link {
             Some(href) => {
-                if let Some(Inline::Link { href: h, children }) = self.inlines.last_mut()
+                let title = ctx.link_title.as_deref();
+                if let Some(Inline::Link { href: h, children, title: t }) = self.inlines.last_mut()
                     && h.as_str() == &**href
+                    && t.as_deref() == title
                 {
                     push_merge(children, inline);
                     return;
                 }
                 let left = self.link_budget.get();
-                if left >= href.len() {
-                    self.link_budget.set(left - href.len());
-                    self.inlines.push(Inline::Link { href: href.to_string(), children: vec![inline] });
+                let cost = href.len().saturating_add(title.map_or(0, str::len));
+                if left >= cost {
+                    self.link_budget.set(left - cost);
+                    self.inlines.push(Inline::Link {
+                        href: href.to_string(),
+                        children: vec![inline],
+                        title: title.map(str::to_owned),
+                    });
                 } else {
                     push_merge(&mut self.inlines, inline);
                 }
@@ -628,6 +704,12 @@ impl<'a> Sink<'a> {
         if inlines.is_empty() {
             return;
         }
+        // Bookmarks with no text of their own (`<a name="x"></a>` between blocks) go with the next
+        // paragraph instead of making an empty one.
+        if inlines.iter().all(|i| matches!(i, Inline::Anchor { .. })) {
+            self.inlines = inlines;
+            return;
+        }
         if matches!(inlines.as_slice(), [Inline::LineBreak]) {
             inlines.clear();
         } else if matches!(inlines.last(), Some(Inline::LineBreak)) {
@@ -637,17 +719,31 @@ impl<'a> Sink<'a> {
     }
 
     fn push_block(&mut self, b: Block) {
-        self.flush();
-        self.blocks.push(b);
+        self.push_blocks(vec![b]);
     }
 
-    fn push_blocks(&mut self, bs: Vec<Block>) {
+    fn push_blocks(&mut self, mut bs: Vec<Block>) {
         self.flush();
+        // Bookmarks waiting for a paragraph go to the start of the first one pushed.
+        if !self.inlines.is_empty()
+            && let Some(Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. }) = bs.first_mut()
+        {
+            let pending = std::mem::take(&mut self.inlines);
+            inlines.splice(0..0, pending);
+        }
         self.blocks.extend(bs);
     }
 
     fn finish(mut self) -> Vec<Block> {
         self.flush();
+        // Bookmarks left at the end join the last paragraph.
+        let pending = std::mem::take(&mut self.inlines);
+        if !pending.is_empty()
+            && let Some(Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. }) =
+                self.blocks.last_mut()
+        {
+            inlines.extend(pending);
+        }
         self.blocks
     }
 }
@@ -802,8 +898,19 @@ impl Conv<'_> {
                 }
             }
             "a" => {
+                // A named place (bookmark): `<a name>` or `<a id>`.
+                if let Some(name) = attr(attrs, "name")
+                    .or_else(|| attr(attrs, "id"))
+                    .and_then(mailcraft_model::rich::clean_anchor_name)
+                {
+                    sink.push_inline(Inline::Anchor { name }, &Ctx { link: None, ..c.clone() });
+                }
                 if let Some(href) = attr(attrs, "href").and_then(sanitize::safe_href) {
                     c.link = Some(href.into());
+                    c.link_title = attr(attrs, "title")
+                        .map(|t| normalize_ws(t).chars().take(MAX_LINK_TITLE).collect::<String>())
+                        .filter(|t| !t.is_empty())
+                        .map(Into::into);
                 }
                 self.walk_children(id, &c, sink, depth);
             }
@@ -829,13 +936,17 @@ impl Conv<'_> {
             "table" => self.table(id, attrs, &bx, c, sink, depth),
             h if dom::is_heading(h) => {
                 let level = h.strip_prefix('h').and_then(|d| d.parse::<u8>().ok()).unwrap_or(1).clamp(1, 6);
-                c.indent = (c.indent + bx.indent).max(0.0);
-                let para = bx.para_extras(ParaStyle {
+                let bordered = bx.bordered_para();
+                c.indent = (c.indent + bordered.as_ref().map_or(bx.indent, |b| b.indent)).max(0.0);
+                let mut para = bx.para_extras(ParaStyle {
                     space_before_px: bx.margin_top.unwrap_or(0.0).max(0.0),
                     space_after_px: bx.margin_bottom.unwrap_or(0.0).max(0.0),
                     background: bx.background,
                     ..c.para()
                 });
+                if let Some(b) = bordered {
+                    b.apply(&mut para);
+                }
                 let blocks = self.flow_with(id, &c, para, depth);
                 sink.push_blocks(
                     blocks
@@ -853,7 +964,8 @@ impl Conv<'_> {
     }
 
     fn block(&self, id: NodeId, name: &str, bx: &BoxStyle, mut c: Ctx, sink: &mut Sink, depth: usize) {
-        if bx.top_rule && matches!(name, "div" | "p") {
+        let bordered = if name == "p" { bx.bordered_para() } else { None };
+        if bx.top_rule && name == "div" {
             sink.push_block(Block::Rule);
         }
         let space_before = bx.margin_top.unwrap_or(0.0).max(0.0);
@@ -876,14 +988,17 @@ impl Conv<'_> {
             }
             return;
         }
-        c.indent = (c.indent + bx.indent).max(0.0);
+        c.indent = (c.indent + bordered.as_ref().map_or(bx.indent, |b| b.indent)).max(0.0);
         let default_after = if name == "p" { self.font_px(&c) } else { 0.0 };
-        let para = bx.para_extras(ParaStyle {
+        let mut para = bx.para_extras(ParaStyle {
             space_before_px: space_before,
             space_after_px: bx.margin_bottom.unwrap_or(default_after).max(0.0),
             background: if name == "p" { bx.background } else { None },
             ..c.para()
         });
+        if let Some(b) = bordered {
+            b.apply(&mut para);
+        }
         let blocks = self.flow_with(id, &c, para, depth);
         sink.push_blocks(blocks);
     }
@@ -977,9 +1092,9 @@ impl Conv<'_> {
     ) {
         c.indent = 0.0;
         let border = attr(attrs, "border").is_some_and(|b| parse_uint(b).is_none_or(|v| v > 0)) || bx.border;
-        let mut rows: Vec<Vec<TableCell>> = Vec::new();
+        let mut rows: Vec<Vec<(TableCell, CellEdges)>> = Vec::new();
         let mut foster = Sink::new(c.para(), &self.link_budget);
-        let mut loose: Vec<TableCell> = Vec::new();
+        let mut loose: Vec<(TableCell, CellEdges)> = Vec::new();
         for &ch in self.dom.children(id) {
             match self.dom.node(ch).map(|n| &n.data) {
                 Some(NodeData::Element { name, attrs: a }) if name == "tr" => {
@@ -1004,7 +1119,9 @@ impl Conv<'_> {
         }
         sink.push_blocks(foster.finish());
         if !rows.is_empty() {
-            sink.push_block(Block::Table { rows, border, width_px: bx.width });
+            let borders = if border { None } else { table_borders(&rows) };
+            let rows = rows.into_iter().map(|r| r.into_iter().map(|(cell, _)| cell).collect()).collect();
+            sink.push_block(Block::Table { rows, border, width_px: bx.width, borders });
         }
     }
 
@@ -1016,7 +1133,7 @@ impl Conv<'_> {
         table_bg: Option<Color>,
         foster: &mut Sink,
         depth: usize,
-    ) -> Option<Vec<TableCell>> {
+    ) -> Option<Vec<(TableCell, CellEdges)>> {
         let (rc, bx) = self.element_ctx("tr", attrs, c)?;
         let bg = bx.background.or(table_bg);
         let mut cells = Vec::new();
@@ -1043,7 +1160,7 @@ impl Conv<'_> {
         c: &Ctx,
         bg: Option<Color>,
         depth: usize,
-    ) -> Option<TableCell> {
+    ) -> Option<(TableCell, CellEdges)> {
         let (mut cc, bx) = self.element_ctx(name, attrs, c)?;
         if name == "th" && bx.align.is_none() {
             cc.align = Align::Center;
@@ -1052,7 +1169,50 @@ impl Conv<'_> {
         let colspan = attr(attrs, "colspan").and_then(parse_uint).unwrap_or(1).clamp(1, 1000);
         let rowspan = attr(attrs, "rowspan").and_then(parse_uint).unwrap_or(1).clamp(1, 65_534);
         let blocks = self.flow_with(id, &cc, cc.para(), depth);
-        Some(TableCell { blocks, colspan, rowspan, background: bx.background.or(bg), width_px: bx.width })
+        let cell =
+            TableCell { blocks, colspan, rowspan, background: bx.background.or(bg), width_px: bx.width };
+        Some((cell, bx.edges))
+    }
+}
+
+/// A table cell's border edges in CSS box order (top, right, bottom, left).
+type CellEdges = [Option<BorderEdge>; 4];
+
+/// Per-edge table borders read back from the cells' borders (as the serializer writes them: the outside
+/// edges on the outer cells, the inside lines between cells); `None` when no cell has a border.
+fn table_borders(rows: &[Vec<(TableCell, CellEdges)>]) -> Option<Box<TableBorders>> {
+    if !rows.iter().flatten().any(|(_, e)| e.iter().any(Option::is_some)) {
+        return None;
+    }
+    let edge = |r: Option<&Vec<(TableCell, CellEdges)>>, first: bool, side: usize| {
+        let row = r?;
+        let cell = if first { row.first() } else { row.last() };
+        cell.and_then(|(_, e)| e.get(side).cloned().flatten())
+    };
+    let first = rows.first();
+    let second = rows.get(1);
+    let wide = first.is_some_and(|r| r.len() > 1);
+    Some(Box::new(TableBorders {
+        top: edge(first, true, 0),
+        right: edge(first, false, 1),
+        bottom: edge(rows.last(), true, 2),
+        left: edge(first, true, 3),
+        inside_h: if second.is_some() {
+            edge(second, true, 0).or_else(|| edge(first, true, 2))
+        } else {
+            None
+        },
+        inside_v: if wide { edge(first, true, 1) } else { None },
+    }))
+}
+
+impl BorderedPara {
+    /// Puts the borders and their spacing on `para`.
+    fn apply(self, para: &mut ParaStyle) {
+        para.space_before_px += self.before;
+        para.space_after_px += self.after;
+        para.right_indent_px = self.right;
+        para.borders = Some(Box::new(self.borders));
     }
 }
 

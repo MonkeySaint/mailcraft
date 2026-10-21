@@ -9,6 +9,8 @@ use proptest::prelude::*;
 
 use crate::{DisplayItem, Layout, LayoutOptions, TextPos, layout_doc};
 
+mod borders;
+
 fn text(s: &str) -> Inline {
     Inline::Text { text: s.into(), style: TextStyle::default() }
 }
@@ -633,7 +635,7 @@ fn wide_image_scaled_to_fit() {
 fn links_coloured_underlined_and_hittable() {
     let d = doc(vec![para(vec![
         text("see "),
-        Inline::Link { href: "https://example.com/".into(), children: vec![text("example")] },
+        Inline::Link { title: None, href: "https://example.com/".into(), children: vec![text("example")] },
         text(" here"),
     ])]);
     let opts = LayoutOptions { link_color: Color::rgb(0, 0, 200), ..Default::default() };
@@ -653,7 +655,11 @@ fn links_coloured_underlined_and_hittable() {
 #[test]
 fn link_explicit_colour_wins() {
     let style = TextStyle { color: Some(Color::rgb(1, 1, 1)), underline: Some(false), ..Default::default() };
-    let d = doc(vec![para(vec![Inline::Link { href: "x".into(), children: vec![styled("t", style)] }])]);
+    let d = doc(vec![para(vec![Inline::Link {
+        title: None,
+        href: "x".into(),
+        children: vec![styled("t", style)],
+    }])]);
     let l = lay(&d, 300.0);
     let r = l.text_runs()[0];
     assert_eq!(r.color, Color::rgb(1, 1, 1));
@@ -663,6 +669,7 @@ fn link_explicit_colour_wins() {
 #[test]
 fn wrapped_link_hittable_on_every_line() {
     let d = doc(vec![para(vec![Inline::Link {
+        title: None,
         href: "mailto:a@b".into(),
         children: vec![text("one two three four five six seven")],
     }])]);
@@ -676,6 +683,7 @@ fn wrapped_link_hittable_on_every_line() {
 #[test]
 fn image_link_hittable() {
     let d = doc(vec![para(vec![Inline::Link {
+        title: None,
         href: "https://img".into(),
         children: vec![Inline::Image {
             src: "cid:x".into(),
@@ -785,6 +793,7 @@ fn caret_with_center_alignment_offset() {
 
 fn simple_table(border: bool, width_px: Option<f32>) -> Block {
     Block::Table {
+        borders: None,
         rows: vec![
             vec![cell(vec![para_s("Name")]), cell(vec![para_s("A much longer description cell")])],
             vec![cell(vec![para_s("x")]), cell(vec![para_s("y")])],
@@ -870,6 +879,7 @@ fn table_colspan() {
     let mut wide_cell = cell(vec![para_s("spanning header")]);
     wide_cell.colspan = 2;
     let d = doc(vec![Block::Table {
+        borders: None,
         rows: vec![vec![wide_cell], vec![cell(vec![para_s("a")]), cell(vec![para_s("b")])]],
         border: true,
         width_px: None,
@@ -886,6 +896,7 @@ fn table_rowspan() {
     let mut tall = cell(vec![para_s("tall")]);
     tall.rowspan = 2;
     let d = doc(vec![Block::Table {
+        borders: None,
         rows: vec![vec![tall, cell(vec![para_s("r1")])], vec![cell(vec![para_s("r2")])]],
         border: true,
         width_px: None,
@@ -904,6 +915,7 @@ fn table_cell_background_and_width_hint() {
     c.background = Some(Color::rgb(7, 7, 7));
     c.width_px = Some(200.0);
     let d = doc(vec![Block::Table {
+        borders: None,
         rows: vec![vec![c, cell(vec![para_s("y")])]],
         border: false,
         width_px: None,
@@ -925,6 +937,7 @@ fn table_cell_background_and_width_hint() {
 fn nested_table_fits() {
     let inner = simple_table(true, None);
     let d = doc(vec![Block::Table {
+        borders: None,
         rows: vec![vec![cell(vec![inner]), cell(vec![para_s("side")])]],
         border: true,
         width_px: None,
@@ -939,9 +952,11 @@ fn nested_table_fits() {
 
 #[test]
 fn empty_table_and_ragged_rows() {
-    let l = lay(&doc(vec![Block::Table { rows: vec![], border: true, width_px: None }]), 300.0);
+    let l =
+        lay(&doc(vec![Block::Table { borders: None, rows: vec![], border: true, width_px: None }]), 300.0);
     assert_eq!(l.height, 0.0);
     let d = doc(vec![Block::Table {
+        borders: None,
         rows: vec![vec![cell(vec![para_s("a")])], vec![], vec![cell(vec![]), cell(vec![para_s("c")])]],
         border: true,
         width_px: Some(f32::NAN),
@@ -979,16 +994,17 @@ fn deep_nesting_does_not_overflow() {
 fn deep_link_nesting_keeps_content() {
     // Content below the inline nesting limit is still laid out, styled as a link and hittable.
     let mut inl = Inline::Link {
+        title: None,
         href: "x".into(),
         children: vec![
             text("deep"),
             Inline::LineBreak,
             Inline::Image { src: "cid:i".into(), alt: String::new(), width: Some(10.0), height: Some(10.0) },
-            Inline::Link { href: "y".into(), children: vec![text("er")] },
+            Inline::Link { title: None, href: "y".into(), children: vec![text("er")] },
         ],
     };
     for _ in 0..1000 {
-        inl = Inline::Link { href: "x".into(), children: vec![inl] };
+        inl = Inline::Link { title: None, href: "x".into(), children: vec![inl] };
     }
     let l = lay(&doc(vec![para(vec![inl])]), 600.0);
     assert_eq!(joined(&l), "deeper");
@@ -1084,8 +1100,11 @@ fn arb_inline() -> impl Strategy<Value = Inline> {
             .prop_map(|(width, height)| Inline::Image { src: "cid:x".into(), alt: "x".into(), width, height }),
     ];
     leaf.prop_recursive(2, 8, 3, |inner| {
-        proptest::collection::vec(inner, 0..3)
-            .prop_map(|children| Inline::Link { href: "https://l/".into(), children })
+        proptest::collection::vec(inner, 0..3).prop_map(|children| Inline::Link {
+            title: None,
+            href: "https://l/".into(),
+            children,
+        })
     })
 }
 
@@ -1163,7 +1182,12 @@ fn arb_block() -> impl Strategy<Value = Block> {
                 any::<bool>(),
                 proptest::option::of(-10.0f32..2000.0)
             )
-                .prop_map(|(rows, border, width_px)| Block::Table { rows, border, width_px }),
+                .prop_map(|(rows, border, width_px)| Block::Table {
+                    borders: None,
+                    rows,
+                    border,
+                    width_px
+                }),
         ]
     })
 }
@@ -1233,7 +1257,7 @@ proptest! {
     #[test]
     fn table_widths_sum_within(ncols in 1usize..6, nrows in 1usize..4, width in 0.0f32..800.0, words in "[a-z]{1,30}( [a-z]{1,12}){0,6}") {
         let rows = (0..nrows).map(|_| (0..ncols).map(|_| cell(vec![para_s(&words)])).collect()).collect();
-        let l = lay(&doc(vec![Block::Table { rows, border: true, width_px: None }]), width);
+        let l = lay(&doc(vec![Block::Table { borders: None, rows, border: true, width_px: None }]), width);
         let outer = *stroke_rects(&l).last().unwrap();
         prop_assert!(outer.w <= width + 1e-3);
     }
@@ -1333,7 +1357,10 @@ fn table_borders_drawn_over_all_cell_backgrounds() {
     a.background = Some(Color::rgb(1, 1, 1));
     let mut b = cell(vec![para_s("b")]);
     b.background = Some(Color::rgb(2, 2, 2));
-    let l = lay(&doc(vec![Block::Table { rows: vec![vec![a, b]], border: true, width_px: None }]), 300.0);
+    let l = lay(
+        &doc(vec![Block::Table { borders: None, rows: vec![vec![a, b]], border: true, width_px: None }]),
+        300.0,
+    );
     let items = &l.display.items;
     let last_fill = items.iter().rposition(|i| matches!(i, DisplayItem::FillRect { .. })).unwrap();
     let first_stroke = items.iter().position(|i| matches!(i, DisplayItem::StrokeRect { .. })).unwrap();
@@ -1459,7 +1486,7 @@ fn list_marker_in_a_squeezed_table_cell_stays_in_bounds() {
         c.colspan = 0;
         c.rowspan = 0;
     }
-    let d = doc(vec![Block::Table { rows: vec![cells], border: false, width_px: None }]);
+    let d = doc(vec![Block::Table { borders: None, rows: vec![cells], border: false, width_px: None }]);
     for width in [400.0f32, 250.0, 120.0] {
         let l = lay(&d, width);
         for r in item_bounds(&l) {
@@ -1475,7 +1502,12 @@ fn hanging_first_line_in_a_narrow_cell_stays_in_bounds() {
     let style = ParaStyle { indent_px: 47.207813, first_line_px: -138.05956, ..Default::default() };
     let image = Inline::Image { src: "cid:x".into(), alt: "x".into(), width: None, height: None };
     let para = Block::Paragraph { style, inlines: vec![image, text("word")] };
-    let table = Block::Table { rows: vec![vec![cell(vec![para])]], border: false, width_px: Some(34.061012) };
+    let table = Block::Table {
+        borders: None,
+        rows: vec![vec![cell(vec![para])]],
+        border: false,
+        width_px: Some(34.061012),
+    };
     let l = lay(&doc(vec![table]), 400.0);
     for r in item_bounds(&l) {
         assert!(r.x >= -EPS && r.right() <= 400.0 + EPS, "{r:?} outside 0..400");

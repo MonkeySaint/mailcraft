@@ -9,6 +9,8 @@
 
 use std::fmt::Write as _;
 
+#[cfg(test)]
+mod link_tests;
 mod math;
 pub use math::{MAX_EQUATION, equation_png};
 
@@ -1794,6 +1796,7 @@ fn draw_table(s: &mut Session, p: &Value) -> CmdResult {
     }
     let total: f32 = widths.iter().sum();
     let table = Block::Table {
+        borders: None,
         rows: (0..rows)
             .map(|_| {
                 widths.iter().map(|w| TableCell { width_px: Some(w.round()), ..table_cell("") }).collect()
@@ -1897,10 +1900,10 @@ fn text_box(s: &mut Session, p: &Value) -> CmdResult {
             background: Some(lighten(accent, 0.85)),
             ..table_cell("")
         };
-        Block::Table { rows: vec![vec![cell]], border: false, width_px: Some(200.0) }
+        Block::Table { borders: None, rows: vec![vec![cell]], border: false, width_px: Some(200.0) }
     } else {
         let cell = TableCell { width_px: Some(240.0), ..table_cell(&text) };
-        Block::Table { rows: vec![vec![cell]], border: true, width_px: Some(240.0) }
+        Block::Table { borders: None, rows: vec![vec![cell]], border: true, width_px: Some(240.0) }
     };
     c.insert_blocks(vec![block]);
     Ok(json!({"textBox": preset, "caret": caret(c)}))
@@ -1954,45 +1957,202 @@ pub fn file_url(path: &str) -> String {
     out
 }
 
-fn link(s: &mut Session, p: &Value) -> CmdResult {
-    // Link ▾ › a recent file: a link to that file, named after it when nothing is selected.
-    let from_path = opt_str(p, "path").map(str::trim).filter(|t| !t.is_empty()).map(|path| {
-        let name = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_owned());
-        (file_url(path), name)
-    });
-    let url = match &from_path {
-        Some((u, _)) => Some(u.as_str()),
-        None => opt_str(p, "url"),
+/// Percent-encodes a `mailto:` header value (RFC 6068: everything but unreserved characters).
+fn mailto_encode(v: &str) -> String {
+    let mut out = String::new();
+    for b in v.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(char::from(b)),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Decodes `%XX` escapes (invalid ones are kept as they are).
+fn percent_decode(v: &str) -> String {
+    let bytes = v.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes.get(i).copied().unwrap_or(0);
+        if b == b'%'
+            && let Some(h) = bytes.get(i.saturating_add(1)..i.saturating_add(3))
+            && let Ok(n) = u8::from_str_radix(std::str::from_utf8(h).unwrap_or("x"), 16)
+        {
+            out.push(n);
+            i = i.saturating_add(3);
+            continue;
+        }
+        out.push(b);
+        i = i.saturating_add(1);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `mailto:` link to `address` with an optional subject.
+pub fn mailto_url(address: &str, subject: &str) -> Option<String> {
+    let a = address.trim().trim_start_matches("mailto:").trim();
+    if a.is_empty() || a.chars().any(|c| c.is_control() || c.is_whitespace()) || !a.contains('@') {
+        return None;
+    }
+    let subject = subject.trim();
+    Some(if subject.is_empty() {
+        format!("mailto:{a}")
+    } else {
+        format!("mailto:{a}?subject={}", mailto_encode(subject))
+    })
+}
+
+/// The address and subject of a `mailto:` link.
+fn mailto_parts(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("mailto:")?;
+    let (addr, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let subject = query
+        .split('&')
+        .find_map(|kv| kv.split_once('=').filter(|(k, _)| k.eq_ignore_ascii_case("subject")).map(|(_, v)| v))
+        .map(percent_decode)
+        .unwrap_or_default();
+    Some((percent_decode(addr), subject))
+}
+
+/// A hidden bookmark name for a heading (`_` + its words joined by `_`), unique in `c` unless it already
+/// marks `pos`.
+fn heading_bookmark_name(c: &ComposeState, text: &str, pos: &DocPos) -> String {
+    let words: Vec<String> =
+        text.split(|ch: char| !ch.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_owned).collect();
+    let mut base: String = format!("_{}", words.join("_")).chars().take(40).collect();
+    if base == "_" {
+        base = "_Heading".into();
+    }
+    let free = |n: &str| c.bookmarks.iter().all(|b| b.name != n || b.pos == *pos);
+    if free(&base) {
+        return base;
+    }
+    (2..1000).map(|k| format!("{base}_{k}")).find(|n| free(n)).unwrap_or(base)
+}
+
+/// Insert Hyperlink's other targets: a bookmark (`bookmark`), a heading (`heading`: 1-based, marked with a
+/// hidden bookmark), the top of the message (`top`) or an e-mail address (`email` + `subject`). `Ok(None)`
+/// when none is given.
+fn link_target(s: &mut Session, p: &Value) -> Result<Option<String>, CmdError> {
+    if let Some(name) = opt_str(p, "bookmark").map(str::trim).filter(|n| !n.is_empty()) {
+        let c = compose_mut(s, p)?;
+        if !c.bookmarks.iter().any(|b| b.name == name) {
+            return Err(CmdError::Params(format!("no bookmark `{name}`")));
+        }
+        return Ok(Some(format!("#{name}")));
+    }
+    if let Some(v) = p.get("heading") {
+        let n = v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| n.checked_sub(1))
+            .ok_or_else(|| CmdError::Params("`heading` is the heading's number, from 1".into()))?;
+        let c = compose_mut(s, p)?;
+        let (path, _, text) = c
+            .headings()
+            .into_iter()
+            .nth(n)
+            .ok_or_else(|| CmdError::Params(format!("no heading {}", n + 1)))?;
+        let pos = DocPos::new(path, 0);
+        let name = heading_bookmark_name(c, &text, &pos);
+        super::compose::add_bookmark_at(c, &name, pos);
+        return Ok(Some(format!("#{name}")));
+    }
+    if opt_bool(p, "top") == Some(true) {
+        let c = compose_mut(s, p)?;
+        let start = c.body_start();
+        super::compose::add_bookmark_at(c, "_top", start);
+        return Ok(Some("#_top".into()));
+    }
+    if let Some(addr) = opt_str(p, "email") {
+        let subject = opt_str(p, "subject").unwrap_or("");
+        return mailto_url(addr, subject)
+            .map(Some)
+            .ok_or_else(|| CmdError::Params(format!("`{addr}` is not an e-mail address")));
+    }
+    Ok(None)
+}
+
+/// What the Insert Hyperlink dialog opens with: the text, the link and ScreenTip at the caret, and the
+/// places it can link to in this message.
+fn link_dialog_state(c: &ComposeState, text: Option<String>) -> Value {
+    let url = c.link_at_caret();
+    let (email, subject) = url.as_deref().and_then(mailto_parts).unwrap_or_default();
+    let bookmarks: Vec<&str> =
+        c.bookmarks.iter().map(|b| b.name.as_str()).filter(|n| !n.starts_with('_')).collect();
+    let headings: Vec<Value> = c
+        .headings()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, level, text))| json!({"index": i + 1, "level": level, "text": text}))
+        .collect();
+    let mode = match url.as_deref() {
+        Some(u) if u.starts_with("mailto:") => "email",
+        Some(u) if u.starts_with('#') => "place",
+        _ => "web",
     };
-    let collapsed = compose_id(s, p)
-        .ok()
-        .and_then(|cid| s.composes.get(&cid))
-        .is_some_and(|c| c.selection.is_collapsed());
-    let text = opt_str(p, "text")
-        .map(str::to_owned)
-        .or_else(|| from_path.as_ref().filter(|_| collapsed).map(|(_, n)| n.clone()));
+    json!({
+        "compose": c.id,
+        "text": text.unwrap_or_else(|| c.selected_text()),
+        "url": url,
+        "screenTip": c.link_tip_at_caret(),
+        "mode": mode,
+        "email": email,
+        "subject": subject,
+        "bookmarks": bookmarks,
+        "headings": headings,
+    })
+}
+
+fn link(s: &mut Session, p: &Value) -> CmdResult {
+    // Link ▾ › a recent file: the file is attached to the message. A link to a file on this computer
+    // would not open for the people the message goes to.
+    if let Some(path) = opt_str(p, "path").map(str::trim).filter(|t| !t.is_empty()) {
+        let (name, data) = super::compose::read_file(path, super::compose::MAX_ATTACHMENT_BYTES)?;
+        let c = compose_mut(s, p)?;
+        if c.attachments.len() >= super::compose::MAX_ATTACHMENTS {
+            return Err(CmdError::Failed("too many attachments".into()));
+        }
+        let i = c.attach_bytes(&name, None, data).map_err(CmdError::Failed)?;
+        let name = c.attachments.get(i).map(|a| a.filename.clone()).unwrap_or(name);
+        return Ok(json!({"attached": name, "index": i, "count": c.attachments.len()}));
+    }
+    let text = opt_str(p, "text").map(str::to_owned);
+    let tip = opt_str(p, "screenTip").map(str::to_owned);
+    let target = link_target(s, p)?;
+    let url = target.as_deref().or_else(|| opt_str(p, "url")).map(str::to_owned);
     let Some(url) = url else {
         let cid = compose_id(s, p)?;
-        let (sel, cur) =
-            s.composes.get(&cid).map(|c| (c.selected_text(), c.link_at_caret())).unwrap_or_default();
-        return dialog(s, "insertLink", json!({"compose": cid, "text": text.unwrap_or(sel), "url": cur}));
+        let state = s.composes.get(&cid).map(|c| link_dialog_state(c, text)).unwrap_or(Value::Null);
+        return dialog(s, "insertLink", state);
     };
     let href = if url.trim().is_empty() {
         None
     } else {
         Some(
-            normalize_url(url)
+            normalize_url(&url)
                 .ok_or_else(|| CmdError::Params(format!("`{url}` is not a usable link address")))?,
         )
     };
+    if tip.as_deref().is_some_and(|t| t.chars().count() > MAX_SCREEN_TIP) {
+        return Err(CmdError::Params(format!("a ScreenTip has at most {MAX_SCREEN_TIP} characters")));
+    }
     let c = compose_mut(s, p)?;
     c.checkpoint();
-    c.set_link(href.as_deref(), text.as_deref());
-    Ok(json!({"url": href, "caret": caret(c)}))
+    if p.get("screenTip").is_some() {
+        c.set_link_with_tip(href.as_deref(), text.as_deref(), tip.as_deref());
+    } else {
+        c.set_link(href.as_deref(), text.as_deref());
+    }
+    Ok(json!({"url": href, "screenTip": c.link_tip_at_caret(), "caret": caret(c)}))
 }
+
+/// Longest ScreenTip accepted (characters).
+const MAX_SCREEN_TIP: usize = 255;
 
 fn valid_bookmark(name: &str) -> bool {
     let mut chars = name.chars();
@@ -2004,10 +2164,11 @@ fn valid_bookmark(name: &str) -> bool {
 fn bookmark(s: &mut Session, p: &Value) -> CmdResult {
     let Some(name) = opt_str(p, "name").map(str::to_owned) else {
         let cid = compose_id(s, p)?;
+        // Hidden bookmarks (`_…`, made for links to headings and the top) are not listed.
         let names: Vec<String> = s
             .composes
             .get(&cid)
-            .map(|c| c.bookmarks.iter().map(|b| b.name.clone()).collect())
+            .map(|c| c.bookmarks.iter().map(|b| b.name.clone()).filter(|n| !n.starts_with('_')).collect())
             .unwrap_or_default();
         return dialog(s, "bookmark", json!({"compose": cid, "bookmarks": names}));
     };
@@ -2731,6 +2892,7 @@ fn business_card(s: &mut Session, p: &Value) -> CmdResult {
         blocks.push(Block::Paragraph {
             style: ParaStyle::default(),
             inlines: vec![Inline::Link {
+                title: None,
                 href: format!("mailto:{e}"),
                 children: vec![Inline::Text { text: e.clone(), style: TextStyle::default() }],
             }],
@@ -2740,6 +2902,7 @@ fn business_card(s: &mut Session, p: &Value) -> CmdResult {
         blocks.push(Block::text_paragraph(&format!("{kind}: {num}")));
     }
     let card = Block::Table {
+        borders: None,
         rows: vec![vec![TableCell {
             blocks,
             colspan: 1,
@@ -2982,7 +3145,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Link",
             "Message › Include; Insert › Links",
             "Mod+K",
-            r#"{"url"?:string,"text"?:string,"path"?:string}  ("" url removes the link; path links to a file)"#,
+            r#"{"url"?:string,"text"?:string,"screenTip"?:string,"bookmark"?:string,"heading"?:number,"top"?:bool,"email"?:string,"subject"?:string,"path"?:string}  ("" url removes the link; bookmark / heading / top: a place in this message; email + subject: a mailto link; path: attaches that file)"#,
             false,
             rich_compose,
             link,
@@ -3431,9 +3594,21 @@ pub(crate) mod tests {
         assert_eq!(file_url("C:\\Docs\\a#b.txt"), "file:///C:/Docs/a%23b.txt");
         s.run("compose.select", &json!({"all": true})).unwrap();
         s.run("compose.insertText", &json!({"text": ""})).unwrap();
-        let r = s.run("insert.link", &json!({"path": "/home/u/Plan 2.docx"})).unwrap();
-        assert_eq!(r["url"], "file:///home/u/Plan%202.docx");
-        assert!(s.composes[&id].body.to_plain_text().contains("Plan 2.docx"), "named after the file");
+        // A recent file is attached (a file: link would not open for the recipients).
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let tmp = tempfile::tempdir_in(base).unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Plan 2.txt");
+        std::fs::write(&path, b"plan").unwrap();
+        let r = s.run("insert.link", &json!({"path": path.to_string_lossy()})).unwrap();
+        assert_eq!(r["attached"], "Plan 2.txt");
+        let c = &s.composes[&id];
+        assert_eq!(c.attachments.last().map(|a| a.data.clone()), Some(b"plan".to_vec()));
+        assert!(!mailcraft_html::doc_to_html(&c.body).contains("file:"), "no link to a local file");
+        assert!(s.run("insert.link", &json!({"path": dir.join("missing.txt").to_string_lossy()})).is_err());
+        drop(tmp);
     }
 
     /// The `cid:` sources of the body's pictures.

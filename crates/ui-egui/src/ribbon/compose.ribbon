@@ -229,10 +229,13 @@ item | Define New Number Format... | | format.numbering | {"style":"define"} | D
 item | Set Numbering Value... | | format.numbering | {"style":"setValue"} | V
 
 menu multilevel
+sub | All | filter | multilevelFilter | |
+sep
 item | None | | format.multilevel | {"style":"none"} |
 item | 1. a. i. | numbering | format.multilevel | {"style":"numbered"} |
 item | 1) a) i) | numbering | format.multilevel | {"style":"numberedParen"} |
 item | 1. 1.1. 1.1.1. | numbering | format.multilevel | {"style":"outline"} |
+item | 1 / 1.1 / 1.1.1 | numbering | format.multilevel | {"style":"outlinePlain"} |
 item | I. A. 1. a) | numbering | format.multilevel | {"style":"outlineRoman"} |
 item | Article I. / Section 1.01 | numbering | format.multilevel | {"style":"article"} |
 item | Chapter 1 / 1.1 | numbering | format.multilevel | {"style":"chapter"} |
@@ -423,8 +426,7 @@ item | 2.5 | | format.lineSpacing | {"multiple":2.5} |
 item | 3.0 | | format.lineSpacing | {"multiple":3.0} |
 sep
 item | Line Spacing Options... | settings | format.paragraphDialog | |
-item | Add Space Before Paragraph | | format.paragraphSpacing | {"before":12} | B
-item | Add Space After Paragraph | | format.paragraphSpacing | {"after":12} | A
+dyn | paragraphSpacing | format.paragraphSpacing | {"before":"$before","after":"$after"}
 
 menu styles
 dyn | styles | format.style | {"name":"$name"}

@@ -291,6 +291,7 @@ fn reduce_inlines(inlines: &mut Vec<Inline>, base: &TextStyle, heading: bool, de
     for i in inlines.iter_mut() {
         match i {
             Inline::Text { style, .. } => reduce_style(style, base, Context { heading, link: false }),
+            Inline::Anchor { .. } => {}
             Inline::Link { children, .. } => {
                 for ch in children.iter_mut() {
                     if let Inline::Text { style, .. } = ch {
@@ -496,7 +497,7 @@ mod tests {
         for b in &doc.blocks {
             if let Block::Paragraph { inlines, .. } = b {
                 for i in inlines {
-                    if let Inline::Link { href, children } = i {
+                    if let Inline::Link { title: _, href, children } = i {
                         let text: String = children
                             .iter()
                             .filter_map(|c| match c {
@@ -702,6 +703,7 @@ mod tests {
                         run("two ", same.clone()),
                         run("red", red.clone()),
                         Inline::Link {
+                            title: None,
                             href: "https://example.com".into(),
                             children: vec![run("link", TextStyle { underline: Some(false), ..same.clone() })],
                         },

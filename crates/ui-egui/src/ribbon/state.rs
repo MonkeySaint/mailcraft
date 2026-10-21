@@ -452,7 +452,8 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 40] = [
+pub const SOURCES: [&str; 41] = [
+    "paragraphSpacing",
     "themeFontNames",
     "fontNames",
     "styleSets",
@@ -535,6 +536,25 @@ fn theme_items(app: &App, surface: Surface, key: Option<&str>) -> Vec<DynItem> {
             .flat_map(|(k, _, name, tints)| tints.iter().map(|t| item(k, name, *t)).collect::<Vec<_>>())
             .collect(),
     }
+}
+
+/// Line and Paragraph Spacing › Add / Remove Space Before / After Paragraph: "Remove" when the caret's
+/// paragraph already has that space.
+fn paragraph_spacing_items(app: &App, surface: Surface) -> Vec<DynItem> {
+    let para = compose(app, surface).map(|c| c.para_at_caret()).unwrap_or_default();
+    let item = |before: bool, has: bool| {
+        let (verb, val) = if has { ("Remove", 0) } else { ("Add", 12) };
+        let side = if before { "Before" } else { "After" };
+        let (b, a) = if before { (json!(val), Value::Null) } else { (Value::Null, json!(val)) };
+        DynItem {
+            label: format!("{verb} Space {side} Paragraph"),
+            icon: "",
+            swatch: None,
+            vars: vec![("$before", b), ("$after", a)],
+            on: false,
+        }
+    };
+    vec![item(true, para.space_before_px > 0.0), item(false, para.space_after_px > 0.0)]
 }
 
 /// Text Highlight Color pens; with High-contrast only on, the pens that leave text hard to read are hidden.
@@ -991,6 +1011,7 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
         "views:mail" => mail_view_items(app),
         "themeColors" => theme_items(app, surface, None),
         "highlightPens" => highlight_pens(app, surface),
+        "paragraphSpacing" => paragraph_spacing_items(app, surface),
         _ if source.starts_with("themeShades:") => {
             theme_items(app, surface, source.strip_prefix("themeShades:"))
         }

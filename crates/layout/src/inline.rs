@@ -133,7 +133,7 @@ pub(crate) fn flatten(
             return;
         }
         match inline {
-            Inline::Link { href, children } if depth < MAX_INLINE_DEPTH => {
+            Inline::Link { href, children, .. } if depth < MAX_INLINE_DEPTH => {
                 flat.links.push(href.clone());
                 let idx = Some(flat.links.len().saturating_sub(1));
                 flatten(ctx, children, parent, idx, flat, depth.saturating_add(1));
@@ -194,7 +194,7 @@ fn push_leaf(ctx: &Ctx<'_>, inline: &Inline, parent: &TextStyle, link: Option<us
             let r = ctx.resolve(parent);
             flat.push("\u{FFFC}", r, link, SpanKind::Image(idx));
         }
-        Inline::Link { .. } => {}
+        Inline::Link { .. } | Inline::Anchor { .. } => {}
     }
 }
 

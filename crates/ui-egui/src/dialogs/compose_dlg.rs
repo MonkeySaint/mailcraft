@@ -6,7 +6,7 @@
 use egui::{Context, RichText};
 use serde_json::{Map, Value, json};
 
-use super::common::{self, Dlg, Out, btn, btn_en, footer, muted, primary, window, with_state};
+use super::common::{self, Dlg, Out, btn, footer, muted, primary, window, with_state};
 use super::folders::last_error;
 use crate::App;
 
@@ -199,46 +199,37 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         p
     };
     Some(match d.name {
-        "bordersAndShading" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Borders and Shading",
-                vec![
-                    f(
-                        "border",
-                        "Border:",
-                        combo(&[
-                            "bottom", "top", "left", "right", "all", "outside", "inside", "insideH",
-                            "insideV", "none",
-                        ]),
-                    ),
-                    f("shading", "Shading color:", Kind::Text),
-                    f("n", "", Kind::Note("Leave shading empty to keep it as it is.".into())),
-                ],
-            )
-            .init("border", json!(if d.str("tab") == "shading" { "none" } else { "bottom" })),
-            |app, v| {
-                if d.str("tab") != "shading" || v.s("border") != "none" {
-                    cmd(app, "format.borders", with(json!({"kind": v.s("border")})))?;
-                }
-                if !v.s("shading").is_empty() {
-                    cmd(app, "format.shading", with(json!({"color": v.s("shading")})))?;
-                }
-                Ok(None)
-            },
-        ),
+        "bordersAndShading" => super::borders_dlg::show(ctx, app, d),
         "setNumberingValue" => run_form(
             ctx,
             app,
             d,
             Form::new(
                 "Set Numbering Value",
-                vec![f("start", "Set value to:", Kind::Num { min: 1.0, max: 9999.0 })],
+                vec![
+                    f("how", "", combo(&["Number from a new start", "Carry on from the list above"])),
+                    f("advance", "Skip ahead to the number below", Kind::Check),
+                    f("start", "Number:", Kind::Num { min: 1.0, max: 9999.0 }),
+                    f(
+                        "n",
+                        "",
+                        Kind::Note(
+                            "Carrying on counts this list on from the list above it; Skip ahead lets you pick the number to go on from."
+                                .into(),
+                        ),
+                    ),
+                ],
             )
+            .init("how", json!("Number from a new start"))
             .init("start", json!(1)),
-            |app, v| cmd(app, "format.numbering", with(json!({"start": v.n("start") as u64}))).map(|_| None),
+            |app, v| {
+                let p = if v.s("how") == "Carry on from the list above" && !v.b("advance") {
+                    json!({"continue": true})
+                } else {
+                    json!({"start": v.n("start") as u64})
+                };
+                cmd(app, "format.numbering", with(p)).map(|_| None)
+            },
         ),
         "defineNewBullet" => {
             let cur = d
@@ -309,63 +300,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "defineNewMultilevelList" | "defineNewListStyle" => {
-            let style_form = d.name == "defineNewListStyle";
-            let title = if style_form { "Define New List Style" } else { "Define New Multilevel List" };
-            let labels: Vec<String> = MULTILEVEL.iter().map(|(_, l)| (*l).to_owned()).collect();
-            let mut fields = Vec::new();
-            if style_form {
-                fields.push(f("name", "Name:", Kind::Text));
-            }
-            run_form(
-                ctx,
-                app,
-                d,
-                Form::new(
-                    title,
-                    fields.into_iter().chain([
-                        f("start", "Start from:", Kind::Combo(labels)),
-                        f("l1", "Level 1 format:", Kind::Text),
-                        f("l2", "Level 2 format:", Kind::Text),
-                        f("l3", "Level 3 format:", Kind::Text),
-                        f("chain", "Include the numbers of the levels above (1.1, 1.1.1)", Kind::Check),
-                        f("n", "", Kind::Note("Leave the levels empty to use the list chosen above. A format with no number (\u{2022}, \u{2013}) is a bullet.".into())),
-                    ]).collect(),
-                )
-                .width(480.0),
-                move |app, v| {
-                    let name = v.s("name");
-                    if style_form && name.is_empty() {
-                        return Err("Type a name for the list style.".to_owned());
-                    }
-                    let levels: Vec<Value> = ["l1", "l2", "l3"]
-                        .iter()
-                        .map(|k| v.s(k))
-                        .take_while(|t| !t.is_empty())
-                        .enumerate()
-                        .map(|(i, t)| {
-                            let has_number = t.chars().any(|c| c.is_ascii_digit() || matches!(c, 'a' | 'A' | 'i' | 'I'));
-                            if has_number {
-                                json!({"pattern": t, "chain": i > 0 && v.b("chain")})
-                            } else {
-                                json!({"glyph": t})
-                            }
-                        })
-                        .collect();
-                    let mut p = if levels.is_empty() {
-                        let label = v.s("start");
-                        let key = MULTILEVEL.iter().find(|(_, l)| *l == label).map_or("numbered", |(k, _)| *k);
-                        json!({"style": key})
-                    } else {
-                        json!({"levels": levels})
-                    };
-                    if style_form && let Some(o) = p.as_object_mut() {
-                        o.insert("name".into(), json!(name));
-                    }
-                    cmd(app, "format.multilevel", with(p)).map(|_| None)
-                },
-            )
-        }
+        "defineNewMultilevelList" | "defineNewListStyle" => super::multilevel_dlg::show(ctx, app, d),
         "applyStyles" => run_form(
             ctx,
             app,
@@ -462,7 +397,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "find" | "replace" => find_replace(ctx, app, d),
+        "find" | "replace" => super::find_replace_dlg::show(ctx, app, d),
         // Find / Select in a received message: handled by the message view (reading pane or read window).
         "messageFind" => {
             if let Some(id) = d.u64("id") {
@@ -620,24 +555,8 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             Form::new("Text Box", vec![f("text", "Text:", Kind::Multi)]).ok("Insert"),
             |app, v| cmd(app, "insert.textBox", with(json!({"text": v.s("text")}))).map(|_| None),
         ),
-        "insertLink" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Insert Hyperlink",
-                vec![f("text", "Text to display:", Kind::Text), f("url", "Address:", Kind::Text)],
-            )
-            .init("text", json!(d.str("text")))
-            .init("url", json!(d.str("url")))
-            .width(480.0),
-            |app, v| {
-                if v.s("url").is_empty() {
-                    return Err("Enter an address.".into());
-                }
-                cmd(app, "insert.link", with(json!({"url": v.s("url"), "text": v.s("text")}))).map(|_| None)
-            },
-        ),
+        "insertLink" => super::link_dlg::show(ctx, app, d),
+        "sortText" => sort_text(ctx, app, d),
         "bookmark" => {
             let marks: Vec<String> =
                 d.arr("bookmarks").iter().filter_map(Value::as_str).map(str::to_owned).collect();
@@ -906,18 +825,6 @@ const NUMBER_STYLES: [(&str, &str, &str); 6] = [
     ("upper-roman", "I, II, III, …", "I"),
 ];
 
-/// Multilevel list definitions: (key, label).
-const MULTILEVEL: [(&str, &str); 8] = [
-    ("numbered", "1. a. i."),
-    ("numberedParen", "1) a) i)"),
-    ("outline", "1. 1.1. 1.1.1."),
-    ("outlineRoman", "I. A. 1. a)"),
-    ("article", "Article I. / Section 1.01"),
-    ("chapter", "Chapter 1 / 1.1"),
-    ("bullets", "Bullets by level"),
-    ("diamonds", "Four small diamonds"),
-];
-
 /// Fonts offered by Customize Fonts: the theme font names (shown with bundled substitutes) and the bundled
 /// families.
 const THEME_FONT_CHOICES: [&str; 22] = [
@@ -1023,76 +930,77 @@ fn customize_colors(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 
 // ---------------------------------------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
-struct FindState {
-    find: String,
-    replace: String,
-    case: bool,
-    msg: String,
-    replace_mode: bool,
-}
-
-fn find_replace(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let uid = d.uid;
-    let compose = d.u64("compose");
-    with_state(
+/// Sort Text: sort by paragraphs or a field / column, as text, numbers or dates, either way, with a header
+/// row kept in place.
+fn sort_text(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let table = d.str("target") == "table";
+    let fields = d.u64("fields").unwrap_or(1).clamp(1, 63);
+    let mut by: Vec<String> = Vec::new();
+    if !table {
+        by.push("Paragraphs".into());
+    }
+    for n in 1..=fields {
+        by.push(if table { format!("Column {n}") } else { format!("Field {n}") });
+    }
+    let mut fields_list = vec![
+        f("by", "Sort by:", Kind::Combo(by.clone())),
+        f("type", "Type:", combo(&["Text", "Number", "Date"])),
+        f("order", "Order:", combo(&["Ascending", "Descending"])),
+        f("header", "Keep the first row on top (it is a heading)", Kind::Check),
+        f("case", "Case sensitive", Kind::Check),
+    ];
+    if !table {
+        fields_list.push(f("separator", "Separate fields at:", combo(&["Tabs", "Commas", "Other"])));
+        fields_list.push(f("other", "Other character:", Kind::Text));
+    }
+    let sep = if d.str("separator") == "comma" { "Commas" } else { "Tabs" };
+    let c = json!(d.u64("compose"));
+    run_form(
         ctx,
         app,
-        uid,
-        |_: &App| FindState { replace_mode: d.name == "replace", ..Default::default() },
-        |st, app| {
-            window(ctx, app, d, "Find and Replace", 460.0, |ui, app| {
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(!st.replace_mode, "Find").clicked() {
-                        st.replace_mode = false;
+        d,
+        Form::new("Sort Text", fields_list)
+            .init("by", json!(by.first().cloned().unwrap_or_default()))
+            .init("type", json!("Text"))
+            .init("order", json!("Ascending"))
+            .init("separator", json!(sep))
+            .width(440.0),
+        move |app, v| {
+            let mut p = json!({
+                "compose": c,
+                "type": v.s("type").to_lowercase(),
+                "order": v.s("order").to_lowercase(),
+                "header": v.b("header"),
+                "matchCase": v.b("case"),
+            });
+            let chosen = v.s("by");
+            if let Some(o) = p.as_object_mut() {
+                let n = chosen.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok());
+                match n {
+                    Some(n) => {
+                        o.insert("by".into(), json!(if table { "column" } else { "field" }));
+                        o.insert("field".into(), json!(n));
                     }
-                    if ui.selectable_label(st.replace_mode, "Replace").clicked() {
-                        st.replace_mode = true;
+                    None => {
+                        o.insert("by".into(), json!("paragraphs"));
                     }
-                });
-                ui.separator();
-                common::field(ui, "Find what:", &mut st.find, 300.0);
-                if st.replace_mode {
-                    common::field(ui, "Replace with:", &mut st.replace, 290.0);
                 }
-                ui.checkbox(&mut st.case, "Match case");
-                if !st.msg.is_empty() {
-                    muted(ui, app, &st.msg);
-                }
-                let c = json!(compose);
-                footer(ui, |ui| {
-                    if btn(ui, "Cancel") {
-                        return Out::Close;
-                    }
-                    let has = !st.find.is_empty();
-                    if btn_en(ui, has, "Find Next") {
-                        st.msg = match app
-                            .run("format.find", json!({"compose": c, "text": st.find, "matchCase": st.case}))
-                        {
-                            Some(v) if v.get("found").and_then(Value::as_bool) == Some(false) => {
-                                "No more matches.".into()
+                if !table {
+                    let separator = match v.s("separator").as_str() {
+                        "Commas" => "comma".to_owned(),
+                        "Other" => {
+                            let other = v.s("other");
+                            if other.chars().count() != 1 {
+                                return Err("Type one character to separate the fields at.".into());
                             }
-                            Some(_) => String::new(),
-                            None => last_error(app),
-                        };
-                    }
-                    if st.replace_mode {
-                        if btn_en(ui, has, "Replace All") {
-                            st.msg = match app.run("format.replace", json!({"compose": c, "find": st.find, "replace": st.replace, "all": true, "matchCase": st.case})) {
-                            Some(v) => format!("Replaced {} occurrence(s).", v.get("replaced").and_then(Value::as_u64).unwrap_or(0)),
-                            None => last_error(app),
-                        };
+                            other
                         }
-                        if btn_en(ui, has, "Replace") {
-                            st.msg = match app.run("format.replace", json!({"compose": c, "find": st.find, "replace": st.replace, "matchCase": st.case})) {
-                            Some(_) => String::new(),
-                            None => last_error(app),
-                        };
-                        }
-                    }
-                    Out::Keep
-                })
-            })
+                        _ => "tab".to_owned(),
+                    };
+                    o.insert("separator".into(), json!(separator));
+                }
+            }
+            cmd(app, "format.sort", p).map(|_| None)
         },
     )
 }

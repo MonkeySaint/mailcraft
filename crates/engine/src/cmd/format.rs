@@ -9,11 +9,22 @@ use super::compose::{
 };
 use crate::cmd::util::{dialog, opt_bool, opt_i64, opt_str, opt_u64, req_str};
 use crate::compose::{
-    BodySelection, CaseKind, ClipEntry, ComposeState, DocPos, ListFormat, NamedStyle, NumberStyle,
-    PainterState, PasteMode, align_of, multilevel_formats,
+    BodySelection, CaseKind, ClipEntry, ComposeState, DocPos, FindDirection, FindFormat, FindOptions,
+    ListFormat, NamedStyle, NumberStyle, PainterState, PasteMode, SortKind, SortSpec, align_of,
+    multilevel_formats,
 };
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_geom::Color;
+
+mod borders;
+#[cfg(test)]
+mod find_sort_tests;
+#[cfg(test)]
+mod list_tests;
+#[cfg(test)]
+mod style_set_tests;
+
+pub use borders::{BORDER_KINDS, SHADING_PATTERNS, edge_json, para_borders_json, shade, table_borders_json};
 use mailcraft_model::rich::ListKind;
 use mailcraft_model::{Doc, LineRule, ParaStyle, TextStyle, UnderlineKind};
 
@@ -662,81 +673,6 @@ fn paragraph_spacing(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"before": before, "after": after}))
 }
 
-fn shading(s: &mut Session, p: &Value) -> CmdResult {
-    if opt_bool(p, "custom") == Some(true) {
-        return dialog(s, "colors", json!({"compose": compose_id(s, p)?, "target": "shading"}));
-    }
-    let themed = requested_theme_color(s, p)?;
-    let last = s.composes.get(&compose_id(s, p)?).and_then(|c| c.last_shading);
-    let col = match p.get("color") {
-        _ if themed.is_some() => themed,
-        // The button face shades with the colour chosen last; before one is chosen it opens the form.
-        None if last.is_some() => last,
-        None => {
-            return dialog(s, "bordersAndShading", json!({"compose": compose_id(s, p)?, "tab": "shading"}));
-        }
-        Some(Value::Null) => None,
-        Some(v) => {
-            let t = v
-                .as_str()
-                .ok_or_else(|| CmdError::Params("`color` must be a colour string or null".into()))?;
-            if t.eq_ignore_ascii_case("none") { None } else { Some(parse_color(t)?) }
-        }
-    };
-    let c = compose_mut(s, p)?;
-    if col.is_some() {
-        c.last_shading = col;
-    }
-    c.checkpoint();
-    let target = if let Some(cell) = c.cell_at_caret_mut() {
-        cell.background = col;
-        "cell"
-    } else {
-        c.set_para_style(|ps| ps.background = col);
-        "paragraph"
-    };
-    c.dirty = true;
-    Ok(json!({"shading": col.map(|x| x.to_hex()), "target": target}))
-}
-
-fn borders(s: &mut Session, p: &Value) -> CmdResult {
-    let kind = opt_str(p, "kind");
-    if opt_bool(p, "dialog") == Some(true) || kind.is_none() {
-        return dialog(s, "bordersAndShading", json!({"compose": compose_id(s, p)?, "tab": "borders"}));
-    }
-    let kind = kind.unwrap_or("none");
-    if !matches!(
-        kind,
-        "bottom" | "top" | "left" | "right" | "none" | "all" | "outside" | "inside" | "insideH" | "insideV"
-    ) {
-        return Err(CmdError::Params(format!("unknown border `{kind}`")));
-    }
-    let c = compose_mut(s, p)?;
-    c.checkpoint();
-    if let Some(table) = c.table_at_caret() {
-        let _ = table;
-        let on = kind != "none";
-        let changed = c.set_table_border(on);
-        return Ok(json!({"target": "table", "border": on, "changed": changed}));
-    }
-    let changed = match kind {
-        "bottom" => c.set_para_rule(false, true),
-        "top" => c.set_para_rule(true, true),
-        "none" => {
-            let a = c.set_para_rule(true, false);
-            let b = c.set_para_rule(false, false);
-            a || b
-        }
-        "outside" | "all" => {
-            let a = c.set_para_rule(true, true);
-            let b = c.set_para_rule(false, true);
-            a || b
-        }
-        _ => return Err(CmdError::Failed(format!("`{kind}` borders apply to tables only"))),
-    };
-    Ok(json!({"target": "paragraph", "border": kind, "changed": changed}))
-}
-
 /// The list format a Bullets / Numbering call asks for: `glyph` (Define New Bullet), `pattern` +
 /// `numberStyle` (Define New Number Format) or a gallery `style` key. `Ok(None)` for a plain toggle.
 fn requested_format(p: &Value, numbered: bool) -> Result<Option<ListFormat>, CmdError> {
@@ -823,6 +759,15 @@ fn bullets(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn numbering(s: &mut Session, p: &Value) -> CmdResult {
+    // Set Numbering Value › carry on from the list above.
+    if opt_bool(p, "continue") == Some(true) {
+        let c = compose_mut(s, p)?;
+        c.checkpoint();
+        let start = c.continue_previous_list().ok_or_else(|| {
+            CmdError::Failed("There is no numbered list before this one to continue.".into())
+        })?;
+        return Ok(json!({"list": "numbered", "start": start, "continued": true}));
+    }
     if let Some(v) = p.get("start") {
         let n = v
             .as_u64()
@@ -840,8 +785,17 @@ fn numbering(s: &mut Session, p: &Value) -> CmdResult {
 /// Multilevel gallery key for a key or an observed gallery name ("Outline numbered: L1: Numbered, I, II,
 /// III, …, Number Format: Article I., …").
 fn multilevel_key(name: &str) -> Option<&'static str> {
-    const KEYS: [&str; 8] =
-        ["numbered", "numberedParen", "outline", "article", "chapter", "outlineRoman", "bullets", "diamonds"];
+    const KEYS: [&str; 9] = [
+        "numbered",
+        "numberedParen",
+        "outline",
+        "outlinePlain",
+        "article",
+        "chapter",
+        "outlineRoman",
+        "bullets",
+        "diamonds",
+    ];
     if let Some(k) = KEYS.iter().find(|k| k.eq_ignore_ascii_case(name)) {
         return Some(k);
     }
@@ -858,6 +812,9 @@ fn multilevel_key(name: &str) -> Option<&'static str> {
         "outlineRoman"
     } else if n.contains("format: 1)") {
         "numberedParen"
+    } else if n.contains("format: 1,") || n.ends_with("format: 1") || n.contains("1 / 1.1 / 1.1.1") {
+        // "Number Format: 1, Aligned at …": the number alone, no period (1 / 1.1 / 1.1.1).
+        "outlinePlain"
     } else if n.contains("1.1") || n.contains("legal") {
         "outline"
     } else if n.contains("format: 1") || n.contains("numbered") {
@@ -865,6 +822,19 @@ fn multilevel_key(name: &str) -> Option<&'static str> {
     } else {
         return None;
     })
+}
+
+/// One level as Define New Multilevel List shows it: `{"glyph"}` or `{"pattern","numberStyle","chain"}`
+/// (the pattern with the first number standing for the level's number: "Article I.").
+pub fn level_json(f: &ListFormat) -> Value {
+    match f {
+        ListFormat::Bullet { glyph } => json!({"glyph": glyph}),
+        ListFormat::Number { style, prefix, suffix, chain } => json!({
+            "pattern": format!("{prefix}{}{suffix}", style.format(1)),
+            "numberStyle": style.css(),
+            "chain": chain,
+        }),
+    }
 }
 
 /// One level of a Define New Multilevel List definition: `{"glyph"}` or `{"pattern","numberStyle","chain"}`.
@@ -889,10 +859,11 @@ fn level_param(v: &Value) -> Result<ListFormat, CmdError> {
 }
 
 /// The List Library of the Multilevel List gallery: (key, label).
-pub const MULTILEVEL_LIBRARY: [(&str, &str); 8] = [
+pub const MULTILEVEL_LIBRARY: [(&str, &str); 9] = [
     ("numbered", "1. a. i."),
     ("numberedParen", "1) a) i)"),
     ("outline", "1. 1.1. 1.1.1."),
+    ("outlinePlain", "1 / 1.1 / 1.1.1"),
     ("outlineRoman", "I. A. 1. a)"),
     ("article", "Article I. / Section 1.01"),
     ("chapter", "Chapter 1 / 1.1"),
@@ -983,11 +954,17 @@ fn multilevel(s: &mut Session, p: &Value) -> CmdResult {
         (None, Some("none" | "None")) => {
             return list_cmd(s, &json!({"style": "none", "compose": p.get("compose")}), ListKind::Bullet, "");
         }
-        (None, Some("define")) => {
-            return dialog(s, "defineNewMultilevelList", json!({"compose": compose_id(s, p)?}));
-        }
-        (None, Some("defineStyle")) => {
-            return dialog(s, "defineNewListStyle", json!({"compose": compose_id(s, p)?}));
+        (None, Some(which @ ("define" | "defineStyle"))) => {
+            let cid = compose_id(s, p)?;
+            let levels = s
+                .composes
+                .get(&cid)
+                .and_then(ComposeState::list_levels_at_caret)
+                .or_else(|| multilevel_formats("numbered"))
+                .unwrap_or_default();
+            let levels: Vec<Value> = levels.iter().map(level_json).collect();
+            let name = if which == "define" { "defineNewMultilevelList" } else { "defineNewListStyle" };
+            return dialog(s, name, json!({"compose": cid, "levels": levels}));
         }
         (None, Some(name)) => {
             let key = multilevel_key(name)
@@ -1049,10 +1026,82 @@ fn outdent(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"indent": c.para_at_caret().indent_px}))
 }
 
+/// The Sort Text dialog's parameters (any of them sorts right away; none opens the dialog).
+const SORT_KEYS: [&str; 8] =
+    ["descending", "order", "type", "by", "field", "separator", "header", "matchCase"];
+
+/// What the Sort Text dialog opens with: what is sorted (table rows, list items or paragraphs), the fields
+/// it can sort by and a separator guessed from the text.
+fn sort_dialog_state(c: &ComposeState) -> Value {
+    if let Some(cols) = c.table_columns_at_caret() {
+        return json!({"compose": c.id, "target": "table", "fields": cols, "separator": "tab"});
+    }
+    let text = if c.has_selection() { c.selected_text() } else { c.body.to_plain_text() };
+    let separator = if text.contains('\t') {
+        "tab"
+    } else if text.contains(',') {
+        "comma"
+    } else {
+        "tab"
+    };
+    let sep = if separator == "comma" { ',' } else { '\t' };
+    let fields = text.lines().map(|l| l.split(sep).count()).max().unwrap_or(1).clamp(1, 63);
+    let target = if c.list_at_caret().is_some() { "list" } else { "paragraphs" };
+    json!({"compose": c.id, "target": target, "fields": fields, "separator": separator})
+}
+
 fn sort(s: &mut Session, p: &Value) -> CmdResult {
-    let desc = opt_bool(p, "descending").unwrap_or(false);
-    edit(s, p, |c| c.sort_selection(desc))?;
-    Ok(json!({"sorted": true, "descending": desc}))
+    if !SORT_KEYS.iter().any(|k| p.get(*k).is_some()) {
+        let cid = compose_id(s, p)?;
+        let state = s.composes.get(&cid).map(sort_dialog_state).unwrap_or(Value::Null);
+        return dialog(s, "sortText", state);
+    }
+    let descending = match (opt_bool(p, "descending"), opt_str(p, "order")) {
+        (Some(d), _) => d,
+        (None, Some("descending")) => true,
+        (None, Some("ascending") | None) => false,
+        (None, Some(o)) => return Err(CmdError::Params(format!("unknown sort order `{o}`"))),
+    };
+    let kind = match opt_str(p, "type") {
+        Some(t) => {
+            SortKind::from_name(t).ok_or_else(|| CmdError::Params(format!("unknown sort type `{t}`")))?
+        }
+        None => SortKind::Text,
+    };
+    let field = match (opt_str(p, "by"), p.get("field")) {
+        (Some("paragraphs") | None, None) => None,
+        (Some("paragraphs"), Some(_)) => None,
+        (Some("field" | "column") | None, Some(v)) => Some(
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .and_then(|n| n.checked_sub(1))
+                .filter(|n| *n < crate::compose::MAX_TEXT_TABLE_COLS)
+                .ok_or_else(|| CmdError::Params("`field` is the field's number, from 1".into()))?,
+        ),
+        (Some("field" | "column"), None) => Some(0),
+        (Some(b), _) => return Err(CmdError::Params(format!("unknown sort key `{b}`"))),
+    };
+    let separator = match opt_str(p, "separator") {
+        None | Some("tab") => '\t',
+        Some("comma") => ',',
+        Some(other) => {
+            let mut chars = other.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) if !ch.is_control() => ch,
+                _ => return Err(CmdError::Params("`separator` is tab, comma or one character".into())),
+            }
+        }
+    };
+    let spec = SortSpec {
+        descending,
+        kind,
+        field,
+        separator,
+        header: opt_bool(p, "header").unwrap_or(false),
+        match_case: opt_bool(p, "matchCase").unwrap_or(false),
+    };
+    edit(s, p, |c| c.sort_selection_with(&spec))?;
+    Ok(json!({"sorted": true, "descending": descending}))
 }
 
 /// Paragraph dialog: opens it with the caret paragraph's formatting (`tab`: `indents` or `breaks`);
@@ -2353,32 +2402,132 @@ fn find(s: &mut Session, p: &Value) -> CmdResult {
         ));
         return Ok(json!({"dialog": "messageFind", "id": id, "matches": n}));
     }
+    // Reading Highlight › Clear Highlighting.
+    if opt_bool(p, "highlightAll") == Some(false) || opt_bool(p, "clearHighlight") == Some(true) {
+        let c = compose_mut(s, p)?;
+        c.find_marks.clear();
+        return Ok(json!({"highlighted": 0}));
+    }
     let Some(text) = opt_str(p, "text").map(str::to_owned) else {
-        return dialog(s, "find", json!({"compose": compose_id(s, p)?}));
+        let cid = compose_id(s, p)?;
+        let last = s.composes.get(&cid).map(|c| c.find_text.clone()).unwrap_or_default();
+        return dialog(s, "find", json!({"compose": cid, "text": last}));
     };
-    let case = opt_bool(p, "matchCase").unwrap_or(false);
+    let opts = find_options(p)?;
     let c = compose_mut(s, p)?;
     c.find_text = text.clone();
-    let found = c.find_next(&text, case);
+    if text.is_empty() {
+        return Ok(json!({"found": false}));
+    }
+    if opt_bool(p, "highlightAll") == Some(true) {
+        let marks = c.find_all_with(&text, &opts).map_err(CmdError::Params)?;
+        let n = marks.len();
+        c.find_marks = marks;
+        return Ok(json!({"highlighted": n, "found": n > 0}));
+    }
+    // Find In: every match selected at once (in the whole message or the current selection).
+    if let Some(scope) = opt_str(p, "findIn") {
+        let opts = match scope {
+            "main" => FindOptions { in_selection: false, ..opts },
+            "selection" => FindOptions { in_selection: true, ..opts },
+            other => return Err(CmdError::Params(format!("unknown Find In `{other}`"))),
+        };
+        let n = c.select_all_matches(&text, &opts).map_err(CmdError::Params)?;
+        return Ok(json!({"found": n > 0, "count": n}));
+    }
+    let found = c.find_with(&text, &opts).map_err(CmdError::Params)?;
     Ok(
         json!({"found": found, "anchor": pos_json(&c.selection.anchor), "focus": pos_json(&c.selection.focus)}),
     )
 }
 
+/// The Format of Find / Replace: `{"bold"?, "italic"?, "underline"?, "strike"?: bool, "highlight"?: bool or
+/// colour, "font"?: string, "size"?: points, "color"?: colour}`.
+fn find_format(v: Option<&Value>) -> Result<FindFormat, CmdError> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(FindFormat::default());
+    };
+    let o = v.as_object().ok_or_else(|| CmdError::Params("a find format is an object".into()))?;
+    let flag = |k: &str| -> Result<Option<bool>, CmdError> {
+        match o.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(_) => Err(CmdError::Params(format!("`{k}` must be true or false"))),
+        }
+    };
+    let (highlight, highlight_color) = match o.get("highlight") {
+        None | Some(Value::Null) => (None, None),
+        Some(Value::Bool(b)) => (Some(*b), None),
+        Some(Value::String(c)) => (Some(true), Some(parse_color(c)?)),
+        Some(_) => return Err(CmdError::Params("`highlight` is true, false or a colour".into())),
+    };
+    let size_pt = match o.get("size") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let n = v.as_f64().filter(|n| n.is_finite() && (1.0..=f64::from(MAX_FONT_PT)).contains(n));
+            #[allow(clippy::cast_possible_truncation)]
+            Some(n.ok_or_else(|| CmdError::Params("`size` must be a font size in points".into()))? as f32)
+        }
+    };
+    Ok(FindFormat {
+        bold: flag("bold")?,
+        italic: flag("italic")?,
+        underline: flag("underline")?,
+        strike: flag("strike")?,
+        highlight,
+        highlight_color,
+        font: o
+            .get("font")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(str::to_owned),
+        size_pt,
+        color: o.get("color").and_then(Value::as_str).map(parse_color).transpose()?,
+    })
+}
+
+/// The More options of Find and Replace.
+fn find_options(p: &Value) -> Result<FindOptions, CmdError> {
+    let direction = match opt_str(p, "direction") {
+        Some(d) => FindDirection::from_name(d)
+            .ok_or_else(|| CmdError::Params(format!("unknown search direction `{d}`")))?,
+        None => FindDirection::Down,
+    };
+    Ok(FindOptions {
+        match_case: opt_bool(p, "matchCase").unwrap_or(false),
+        whole_word: opt_bool(p, "wholeWord").unwrap_or(false),
+        wildcards: opt_bool(p, "wildcards").unwrap_or(false),
+        prefix: opt_bool(p, "prefix").unwrap_or(false),
+        suffix: opt_bool(p, "suffix").unwrap_or(false),
+        direction,
+        in_selection: opt_bool(p, "inSelection").unwrap_or(false),
+        format: find_format(p.get("format"))?,
+        replace_format: find_format(p.get("replaceFormat"))?,
+    })
+}
+
 fn replace(s: &mut Session, p: &Value) -> CmdResult {
     let Some(needle) = opt_str(p, "find").map(str::to_owned) else {
-        return dialog(s, "replace", json!({"compose": compose_id(s, p)?}));
+        let cid = compose_id(s, p)?;
+        let last = s.composes.get(&cid).map(|c| c.find_text.clone()).unwrap_or_default();
+        return dialog(s, "replace", json!({"compose": cid, "text": last}));
     };
     let with = opt_str(p, "replace").unwrap_or("").to_owned();
-    let case = opt_bool(p, "matchCase").unwrap_or(false);
+    let opts = find_options(p)?;
     let c = compose_mut(s, p)?;
     c.find_text = needle.clone();
+    if needle.is_empty() {
+        return Ok(json!({"replaced": 0, "found": false}));
+    }
+    // A pattern or replacement that cannot be used changes nothing (no empty undo step either).
+    crate::compose::check_find(&needle, Some(&with), &opts).map_err(CmdError::Params)?;
     c.checkpoint();
     if opt_bool(p, "all") == Some(true) {
-        let n = c.replace_all(&needle, &with, case);
+        let n = c.replace_all_with(&needle, &with, &opts).map_err(CmdError::Params)?;
         return Ok(json!({"replaced": n}));
     }
-    let (replaced, found) = c.replace_next(&needle, &with, case);
+    let (replaced, found) = c.replace_next_with(&needle, &with, &opts).map_err(CmdError::Params)?;
     Ok(json!({"replaced": usize::from(replaced), "found": found}))
 }
 
@@ -2489,6 +2638,7 @@ fn inline_pictures(
         match i {
             Inline::Text { text, .. } => *at = at.saturating_add(text.chars().count()),
             Inline::LineBreak => *at = at.saturating_add(1),
+            Inline::Anchor { .. } => {}
             Inline::Image { src, alt, .. } => {
                 out.push((*at, src.clone(), alt.clone()));
                 *at = at.saturating_add(1);
@@ -2606,10 +2756,10 @@ pub fn specs() -> Vec<CommandSpec> {
             "Borders",
             "Format Text › Paragraph",
             "",
-            r#"{"kind"?:"bottom"|"top"|"left"|"right"|"none"|"all"|"outside"|"inside"|"insideH"|"insideV","dialog"?:bool}"#,
+            r#"{"kind"?:"bottom"|"top"|"left"|"right"|"none"|"all"|"outside"|"inside"|"insideH"|"insideV","style"?:"single"|"dotted"|"dashed"|"double"|"groove"|"ridge"|"inset"|"outset","color"?:string|"auto","width"?:pt,"dialog"?:bool,"tab"?:"borders"|"shading"} | {"apply":{"setting"?:"none"|"box"|"shadow"|"all"|"grid"|"custom","pen"?:edge,"top"?:edge|null,"bottom"?,"left"?,"right"?,"insideH"?,"insideV"?,"shadow"?:bool,"target"?:"paragraph"|"table"}}  (edge: {"style","color","width"}; a menu kind toggles its edges; in a table the table's edges)"#,
             false,
             rich_compose,
-            borders,
+            borders::borders,
         ),
         spec(
             "format.bullets",
@@ -2686,7 +2836,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Find",
             "Format Text › Editing",
             "",
-            r#"{"text"?:string,"matchCase"?:bool,"ids"?:[number]}  (ids: find in that received message)"#,
+            r#"{"text"?:string,"matchCase"?:bool,"wholeWord"?:bool,"wildcards"?:bool,"prefix"?:bool,"suffix"?:bool,"direction"?:"down"|"up"|"all","inSelection"?:bool,"format"?:{"bold"?,"italic"?,"underline"?,"strike"?,"highlight"?,"font"?,"size"?,"color"?},"highlightAll"?:bool,"findIn"?:"main"|"selection","ids"?:[number]}  (Special codes ^t ^l ^? ^# ^$ ^w ^^; ids: find in that received message)"#,
             false,
             compose_or_message,
             find,
@@ -2806,7 +2956,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Numbering",
             "Message › Basic Text; Format Text › Paragraph",
             "",
-            r#"{"style"?:string,"start"?:number}"#,
+            r#"{"style"?:string,"start"?:number,"continue"?:bool}  (start: Set Numbering Value; continue: carry on numbering from the list above)"#,
             false,
             rich_compose,
             numbering,
@@ -2876,7 +3026,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Replace",
             "Format Text › Editing",
             "Mod+H",
-            r#"{"find"?:string,"replace"?:string,"all"?:bool,"matchCase"?:bool}"#,
+            r#"{"find"?:string,"replace"?:string,"all"?:bool,"matchCase"?:bool,"wholeWord"?:bool,"wildcards"?:bool,"prefix"?:bool,"suffix"?:bool,"direction"?:"down"|"up"|"all","inSelection"?:bool,"format"?:object,"replaceFormat"?:object}  (Replace with: ^& the found text, ^t, ^l, ^^)"#,
             false,
             has_compose,
             replace,
@@ -2926,10 +3076,10 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shading",
             "Format Text › Paragraph",
             "",
-            r#"{"color"?:string|null,"theme"?:string,"tint"?:number,"custom"?:bool}"#,
+            r#"{"color"?:string|null,"theme"?:string,"tint"?:number,"custom"?:bool,"pattern"?:"clear"|"5%".."80%"|"solid","patternColor"?:string}"#,
             false,
             rich_compose,
-            shading,
+            borders::shading,
         ),
         spec(
             "format.showGridlines",
@@ -2966,7 +3116,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Sort",
             "Format Text › Paragraph",
             "",
-            r#"{"descending"?:bool}"#,
+            r#"{"order"?:"ascending"|"descending","descending"?:bool,"by"?:"paragraphs"|"field"|"column","field"?:number,"type"?:"text"|"number"|"date","separator"?:"tab"|"comma"|string,"header"?:bool,"matchCase"?:bool}  (none: the Sort Text dialog)"#,
             false,
             has_compose,
             sort,
@@ -3178,11 +3328,16 @@ mod tests {
         s.run("format.outdent", &json!({})).unwrap();
         s.run("format.outdent", &json!({})).unwrap();
         assert_eq!(s.composes[&id].para_at_caret().indent_px, 0.0);
+        // Bottom Border is a real border on the paragraph (no rule paragraph after it).
         s.run("format.borders", &json!({"kind": "bottom"})).unwrap();
-        assert!(matches!(s.composes[&id].body.blocks[1], Block::Rule));
+        assert_eq!(s.composes[&id].body.blocks.len(), 1);
+        assert!(s.composes[&id].para_borders_at_caret().bottom.is_some());
         s.run("format.borders", &json!({"kind": "none"})).unwrap();
-        assert!(!s.composes[&id].body.blocks.iter().any(|b| matches!(b, Block::Rule)));
-        assert!(s.run("format.borders", &json!({"kind": "left"})).is_err());
+        assert!(s.composes[&id].para_at_caret().borders.is_none());
+        // Left and right borders work on paragraphs too; Inside Vertical needs a table.
+        s.run("format.borders", &json!({"kind": "left"})).unwrap();
+        assert!(s.composes[&id].para_borders_at_caret().left.is_some());
+        assert!(s.run("format.borders", &json!({"kind": "insideV"})).is_err());
         assert_eq!(s.run("format.borders", &json!({"dialog": true})).unwrap()["dialog"], "bordersAndShading");
         s.run("insert.table", &json!({"rows": 2, "cols": 2})).unwrap();
         s.run("format.borders", &json!({"kind": "none"})).unwrap();
@@ -3839,7 +3994,7 @@ mod range_tests {
         let c = &s.composes[&id];
         assert!(
             matches!(&c.body.blocks[0], Block::Paragraph { inlines, .. }
-                if inlines.iter().any(|i| matches!(i, Inline::Link { href, children }
+                if inlines.iter().any(|i| matches!(i, Inline::Link { title: _, href, children }
                     if href.ends_with("://example.com")
                         && matches!(&children[0], Inline::Text { text, .. } if text == "the site")))),
             "{:?}",

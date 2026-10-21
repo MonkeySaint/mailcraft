@@ -17,6 +17,7 @@
 //! - A `div`/`p` with a top border (the desktop-client reply header box) is preceded by a `Block::Rule`.
 //! - `display:none` / `mso-hide:all` content (newsletter preheaders) is dropped.
 
+mod borders;
 mod convert;
 mod css;
 mod dom;

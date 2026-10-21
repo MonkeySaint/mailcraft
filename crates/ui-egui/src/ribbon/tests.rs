@@ -1037,6 +1037,39 @@ fn compose_app() -> (App, u64) {
     (app, cid)
 }
 
+#[test]
+fn add_space_items_flip_to_remove() {
+    let (mut app, cid) = compose_app();
+    let s = Surface::Compose(cid);
+    app.run("compose.insertText", serde_json::json!({"compose": cid, "text": "para"})).unwrap();
+    app.run("format.paragraphSpacing", serde_json::json!({"compose": cid, "before": 0, "after": 0})).unwrap();
+    let labels = |app: &App| -> Vec<String> {
+        menu_entries(app, s, "lineSpacing")
+            .into_iter()
+            .filter(|(_, a, _)| a.cmd == "format.paragraphSpacing")
+            .map(|(l, ..)| l)
+            .collect()
+    };
+    assert_eq!(labels(&app), ["Add Space Before Paragraph", "Add Space After Paragraph"]);
+    run_entry(&mut app, s, "lineSpacing", "Add Space Before Paragraph");
+    assert_eq!(app.s.composes.get(&cid).unwrap().para_at_caret().space_before_px, 16.0);
+    assert_eq!(labels(&app), ["Remove Space Before Paragraph", "Add Space After Paragraph"]);
+    run_entry(&mut app, s, "lineSpacing", "Remove Space Before Paragraph");
+    let p = app.s.composes.get(&cid).unwrap().para_at_caret();
+    assert_eq!((p.space_before_px, p.space_after_px), (0.0, 0.0), "the other side is left alone");
+}
+
+#[test]
+fn multilevel_menu_has_the_all_header_and_the_plain_outline() {
+    let (app, cid) = compose_app();
+    let s = Surface::Compose(cid);
+    let entries = menu_entries(&app, s, "multilevel");
+    assert!(entries.iter().any(|(l, a, _)| l == "1 / 1.1 / 1.1.1" && a.params["style"] == "outlinePlain"));
+    let items = defs().menu("multilevel").unwrap();
+    let first = state::expand_items(&app, s, &state::Mem::default(), items).into_iter().next();
+    assert!(matches!(first, Some(state::Resolved::Sub { ref label, .. }) if label == "All"), "{first:?}");
+}
+
 fn entry_disabled(app: &App, surface: Surface, menu: &str, label: &str) -> Option<&'static str> {
     let items = defs().menu(menu).unwrap();
     state::expand_items(app, surface, &state::Mem::default(), items)

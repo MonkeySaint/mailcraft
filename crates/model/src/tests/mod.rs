@@ -5,6 +5,7 @@ mod dates;
 mod item;
 mod mailbox;
 mod rich;
+mod rich_borders;
 mod rule;
 mod subject;
 mod text;

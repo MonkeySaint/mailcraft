@@ -906,6 +906,7 @@ fn leaf_runs(doc: &Doc, path: &[usize]) -> Vec<(usize, usize, mailcraft_model::T
                     *at = at.saturating_add(n);
                 }
                 Inline::LineBreak | Inline::Image { .. } => *at = at.saturating_add(1),
+                Inline::Anchor { .. } => {}
                 Inline::Link { children, .. } => walk(children, true, at, out, depth + 1),
             }
         }
@@ -1052,7 +1053,7 @@ fn flatten_inlines(inlines: &[Inline], out: &mut String, depth: usize) {
             Inline::LineBreak => out.push('\n'),
             Inline::Image { .. } => out.push('\u{FFFC}'),
             Inline::Link { children, .. } if depth < 256 => flatten_inlines(children, out, depth + 1),
-            Inline::Link { .. } => {}
+            Inline::Link { .. } | Inline::Anchor { .. } => {}
         }
     }
 }

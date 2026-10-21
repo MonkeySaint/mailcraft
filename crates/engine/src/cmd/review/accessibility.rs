@@ -263,7 +263,8 @@ impl Walk<'_> {
         for i in inlines {
             match i {
                 Inline::Text { text, style } => self.text(text, style, path, bg, heading),
-                Inline::Link { href, children } => {
+                Inline::Anchor { .. } => {}
+                Inline::Link { title: _, href, children } => {
                     let shown = inline_text(children);
                     let plain = shown.trim().trim_matches(|c: char| c.is_ascii_punctuation()).to_lowercase();
                     let bare = shown.trim() == href.trim() && shown.trim().chars().count() > BARE_URL_CHARS;
@@ -357,7 +358,7 @@ fn inline_text(inlines: &[Inline]) -> String {
             Inline::Text { text, .. } => out.push_str(text),
             Inline::Link { children, .. } => out.push_str(&inline_text(children)),
             Inline::LineBreak => out.push(' '),
-            Inline::Image { .. } => {}
+            Inline::Image { .. } | Inline::Anchor { .. } => {}
         }
     }
     out

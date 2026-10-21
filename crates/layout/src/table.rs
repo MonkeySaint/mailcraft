@@ -2,11 +2,12 @@
 //! row heights, cell backgrounds and borders.
 
 use mailcraft_geom::{Color, Rect};
-use mailcraft_model::TextStyle;
 use mailcraft_model::rich::TableCell;
+use mailcraft_model::{TableBorders, TextStyle};
 
 use crate::DisplayItem;
 use crate::block::{Ctx, Frame, Out, blocks_min_max, layout_blocks};
+use crate::border::draw_table_grid;
 
 /// Columns beyond this are dropped.
 pub(crate) const MAX_COLS: usize = 128;
@@ -166,7 +167,6 @@ pub(crate) fn distribute(mins: &[f32], maxs: &[f32], target: f32, fill: bool) ->
 pub(crate) fn table_min_max(
     ctx: &Ctx<'_>,
     rows: &[Vec<TableCell>],
-    _border: bool,
     width_px: Option<f32>,
     ts: &TextStyle,
     depth: usize,
@@ -185,6 +185,7 @@ pub(crate) fn layout_table(
     ctx: &Ctx<'_>,
     rows: &[Vec<TableCell>],
     border: bool,
+    grid: Option<&TableBorders>,
     width_px: Option<f32>,
     ts: &TextStyle,
     path: &mut Vec<usize>,
@@ -258,8 +259,9 @@ pub(crate) fn layout_table(
 
     let stroke = ctx.px(1.0);
     // Borders go on top of every cell: a stroke straddles the cell edge, so a neighbour's background drawn
-    // later would cover half of it.
-    let mut borders: Vec<DisplayItem> = Vec::new();
+    // later would cover half of it. Per-edge borders (Borders and Shading) replace the plain grid.
+    let plain = border && grid.is_none();
+    let mut strokes: Vec<DisplayItem> = Vec::new();
     for (p, (content, h)) in placed.iter().zip(laid) {
         let cx = frame.x + col_x.get(p.col).copied().unwrap_or(0.0);
         let cy = frame.y + row_y.get(p.row).copied().unwrap_or(0.0);
@@ -277,19 +279,24 @@ pub(crate) fn layout_table(
         let over = (dx + content_right(&content) - (frame.x + table_w)).max(0.0);
         let dx = if over.is_finite() { (dx - over).max(frame.x) } else { dx };
         out.append(content, dx, cy + pad + free / 2.0);
-        if border {
-            borders.push(DisplayItem::StrokeRect { rect, color: BORDER_COLOR, width: stroke });
+        if plain {
+            strokes.push(DisplayItem::StrokeRect { rect, color: BORDER_COLOR, width: stroke });
         }
     }
-    for b in borders {
-        out.push(b);
+    for s in strokes {
+        out.push(s);
     }
-    if border {
+    if plain {
         out.push(DisplayItem::StrokeRect {
             rect: Rect::new(frame.x, frame.y, table_w, table_h),
             color: BORDER_COLOR,
             width: stroke,
         });
+    }
+    if let Some(b) = grid {
+        let cells: Vec<(usize, usize, usize, usize)> =
+            placed.iter().map(|p| (p.row, p.col, p.rowspan, p.colspan)).collect();
+        draw_table_grid(ctx, out, b, (frame.x, frame.y), (&col_x, &row_y), (table_w, table_h), &cells);
     }
     table_h
 }

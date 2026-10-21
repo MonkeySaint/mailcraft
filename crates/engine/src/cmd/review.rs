@@ -940,6 +940,7 @@ mod tests {
     fn table(rows: Vec<Vec<(&str, bool)>>) -> mailcraft_model::Block {
         use mailcraft_model::rich::TableCell;
         mailcraft_model::Block::Table {
+            borders: None,
             rows: rows
                 .into_iter()
                 .map(|r| {
@@ -981,6 +982,7 @@ mod tests {
         let link = |text: &str, href: &str| Block::Paragraph {
             style: Default::default(),
             inlines: vec![Inline::Link {
+                title: None,
                 href: href.into(),
                 children: vec![Inline::Text { text: text.into(), style: Default::default() }],
             }],

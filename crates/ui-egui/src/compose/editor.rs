@@ -466,6 +466,7 @@ fn flatten(inlines: &[Inline], out: &mut String, depth: usize) {
             Inline::Link { children, .. } => flatten(children, out, depth + 1),
             Inline::LineBreak => out.push('\n'),
             Inline::Image { .. } => out.push('\u{FFFC}'),
+            Inline::Anchor { .. } => {}
         }
     }
 }
@@ -1149,9 +1150,7 @@ fn apply(
 pub(crate) fn follow_link(ctx: &egui::Context, host: &mut dyn EditorHost, cid: u64, href: &str) -> bool {
     let h = href.trim();
     if let Some(name) = h.strip_prefix('#') {
-        let pos = host.compose(cid).and_then(|c| {
-            c.bookmarks.iter().find(|b| b.name.eq_ignore_ascii_case(name)).map(|b| b.pos.clone())
-        });
+        let pos = host.compose(cid).and_then(|c| c.bookmark_pos(name));
         return match pos {
             Some(p) => {
                 select(host, cid, &p, &p);
@@ -1684,6 +1683,9 @@ pub(crate) fn body_editor_in(
     // Select Text With Similar Formatting: the other selected ranges.
     mem.view.extra =
         c.extra_ranges.iter().take(10_000).map(|r| (to_text(r.start()), to_text(r.end()))).collect();
+    // Find › Reading Highlight › Highlight All.
+    mem.view.marks =
+        c.find_marks.iter().take(10_000).map(|r| (to_text(r.start()), to_text(r.end()))).collect();
     // Formatted list markers: a new set of markers needs a fresh layout to patch.
     let markers = if c.list_formats.is_empty() { Vec::new() } else { c.list_markers() };
     if markers != mem.markers {

@@ -15,54 +15,57 @@ const MAX_RULES_PER_KEY: usize = 64;
 /// Properties the converter understands; everything else is discarded at parse time, which also bounds the
 /// work hostile stylesheets can cause.
 fn is_known_property(p: &str) -> bool {
-    matches!(
-        p,
-        "color"
-            | "background"
-            | "background-color"
-            | "font"
-            | "font-family"
-            | "font-size"
-            | "font-weight"
-            | "font-style"
-            | "text-decoration"
-            | "text-decoration-line"
-            | "text-decoration-style"
-            | "text-decoration-color"
-            | "font-variant"
-            | "text-transform"
-            | "letter-spacing"
-            | "text-indent"
-            | "margin-right"
-            | "padding-right"
-            | "page-break-before"
-            | "page-break-after"
-            | "page-break-inside"
-            | "break-before"
-            | "break-after"
-            | "break-inside"
-            | "widows"
-            | "orphans"
-            | "mso-line-height-rule"
-            | "text-align"
-            | "vertical-align"
-            | "margin"
-            | "margin-top"
-            | "margin-bottom"
-            | "margin-left"
-            | "padding"
-            | "padding-left"
-            | "line-height"
-            | "width"
-            | "height"
-            | "display"
-            | "mso-hide"
-            | "border"
-            | "border-style"
-            | "border-top"
-            | "border-top-style"
-            | "white-space"
-    )
+    crate::borders::is_border_property(p)
+        || matches!(
+            p,
+            "color"
+                | "background"
+                | "background-color"
+                | "font"
+                | "font-family"
+                | "font-size"
+                | "font-weight"
+                | "font-style"
+                | "text-decoration"
+                | "text-decoration-line"
+                | "text-decoration-style"
+                | "text-decoration-color"
+                | "font-variant"
+                | "text-transform"
+                | "letter-spacing"
+                | "text-indent"
+                | "margin-right"
+                | "padding-right"
+                | "page-break-before"
+                | "page-break-after"
+                | "page-break-inside"
+                | "break-before"
+                | "break-after"
+                | "break-inside"
+                | "widows"
+                | "orphans"
+                | "mso-line-height-rule"
+                | "text-align"
+                | "vertical-align"
+                | "margin"
+                | "margin-top"
+                | "margin-bottom"
+                | "margin-left"
+                | "padding"
+                | "padding-left"
+                | "padding-top"
+                | "padding-bottom"
+                | "line-height"
+                | "width"
+                | "height"
+                | "display"
+                | "mso-hide"
+                | "border"
+                | "border-style"
+                | "border-top"
+                | "border-top-style"
+                | "white-space"
+        )
 }
 
 /// Default font size (CSS `medium`) in points.
@@ -92,7 +95,7 @@ pub(crate) fn strip_comments(s: &str) -> String {
 }
 
 /// Splits on `sep` outside quotes and parentheses.
-fn split_top(s: &str, sep: char) -> Vec<&str> {
+pub(crate) fn split_top(s: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut quote: Option<char> = None;
     let mut depth = 0u32;

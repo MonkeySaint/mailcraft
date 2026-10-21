@@ -28,6 +28,7 @@
 //! per document (later lines are dropped).
 
 mod block;
+mod border;
 mod inline;
 mod style;
 mod table;
