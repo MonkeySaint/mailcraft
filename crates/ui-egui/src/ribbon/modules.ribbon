@@ -13,12 +13,14 @@ drop L | New Items | new-items | | | I | menu=calendarNewItems
 group Go To | ZG | launch=calendar.goToDate
 button L | Today | today | calendar.today | | OD
 button L | Next 7 Days | week | calendar.next7Days | | X
+button S | Go to Date... | calendar | calendar.goToDate | | L
 group Arrange | ZR | c1024=collapse launch=options.open{"page":"calendar"}
 toggle L | Day | day | calendar.arrange | {"mode":"day"} | R | on=cal:day
 toggle L | Work Week | work-week | calendar.arrange | {"mode":"workWeek"} | K | on=cal:workWeek
 toggle L | Week | week | calendar.arrange | {"mode":"week"} | W | on=cal:week
 toggle L | Month | month | calendar.arrange | {"mode":"month"} | T | on=cal:month
 toggle L | Schedule View | schedule | calendar.arrange | {"mode":"schedule"} | SV | on=cal:schedule
+button S | Calendar Options... | settings | options.open | {"page":"calendar"} | CO
 group Work Location | Z1 | c1180=collapse
 button L | Work Hours and Location Settings | work-week | options.open | {"page":"calendar"} | CS
 group Manage Calendars | ZC | c900=collapse
@@ -54,15 +56,16 @@ toggle L | Week | week | calendar.arrange | {"mode":"week"} | W1 | on=cal:week
 toggle L | Month | month | calendar.arrange | {"mode":"month"} | T | on=cal:month
 toggle L | Schedule View | schedule | calendar.arrange | {"mode":"schedule"} | SV | on=cal:schedule
 drop S | Time Scale | schedule | | | SC | menu=timeScale
-toggle S | Overlay | calendar | calendar.overlay | {"on":"$!on"} | OL | on=mem:calOverlay
-toggle S | Working Hours | work-week | calendar.workingHours | {"on":"$!on"} | WH | on=mem:calWorkingHours
+toggle S | Overlay | calendar | calendar.overlay | {"on":"$!on"} | OL | on=calview:overlay
+toggle S | Working Hours | work-week | calendar.workingHours | {"on":"$!on"} | WH | on=calview:workingHours
+button S | Calendar Options... | settings | options.open | {"page":"calendar"} | CO
 group Color | ZC
 drop L | Color | font-color | | | CR | menu=calendarColor
 group Layout | ZS
-toggle S | Use Tighter Spacing | view | view.tighterSpacing | | U | on=mem:calTighter
+toggle S | Use Tighter Spacing | view | view.tighterSpacing | {"on":"$!on"} | U | on=calview:tighter
 drop L | Daily Task List | tasks | | | D | menu=dailyTaskList
 drop L | Folder Pane | folder-pane | | | F | menu=folderPane
-drop L | Reading Pane | reading-pane | | | PN | menu=readingPane
+drop L | Reading Pane | reading-pane | | | PN | menu=calendarReadingPane
 drop L | To-Do Bar | tasks | | | B | menu=todoBar
 group Window | ZW
 button L | Reminders Window | bell | view.reminderWindow | | M
@@ -204,9 +207,9 @@ drop L | Change View | view | | | CV | menu=notesChangeView
 button S | View Settings... | settings | view.viewSettings | | V
 button S | Reset View | undo | view.resetView | | X
 group Arrangement | ZM
-toggle L | Large Icons | note | notes.iconView | {"mode":"large"} | L1 | on=mem:notesView.large=1
-toggle L | Small Icons | note | notes.iconView | {"mode":"small"} | S | on=mem:notesView.small
-toggle L | List | bullets | notes.iconView | {"mode":"list"} | T | on=mem:notesView.list
+toggle L | Large Icons | note | notes.iconView | {"mode":"large"} | L1 | on=notesIcon:large
+toggle L | Small Icons | note | notes.iconView | {"mode":"small"} | S | on=notesIcon:small
+toggle L | List | bullets | notes.iconView | {"mode":"list"} | T | on=notesIcon:list
 button L | Line Up Icons | align-left | notes.lineUpIcons | | I
 group Layout | ZS
 toggle L | Use Tighter Spacing | view | view.tighterSpacing | | U | on=tighter
@@ -263,12 +266,12 @@ item | Save Current View As a New View... | save | view.saveViewAs | | S
 item | Apply Current View to Other Calendar Folders... | | view.applyViewTo | | A
 
 menu timeScale
-item | 60 Minutes | | calendar.timeScale | {"minutes":60} | 6 | on=mem:timeScale.60
-item | 30 Minutes | | calendar.timeScale | {"minutes":30} | 3 | on=mem:timeScale.30=1
-item | 15 Minutes | | calendar.timeScale | {"minutes":15} | 1 | on=mem:timeScale.15
-item | 10 Minutes | | calendar.timeScale | {"minutes":10} | 0 | on=mem:timeScale.10
-item | 6 Minutes | | calendar.timeScale | {"minutes":6} | M | on=mem:timeScale.6
-item | 5 Minutes | | calendar.timeScale | {"minutes":5} | 5 | on=mem:timeScale.5
+item | 60 Minutes - Least Space for Details | | calendar.timeScale | {"minutes":60} | 0 | on=calview:timeScale.60
+item | 30 Minutes | | calendar.timeScale | {"minutes":30} | 3 | on=calview:timeScale.30
+item | 15 Minutes | | calendar.timeScale | {"minutes":15} | 1 | on=calview:timeScale.15
+item | 10 Minutes | | calendar.timeScale | {"minutes":10} | M | on=calview:timeScale.10
+item | 6 Minutes | | calendar.timeScale | {"minutes":6} | 6 | on=calview:timeScale.6
+item | 5 Minutes - Most Space for Details | | calendar.timeScale | {"minutes":5} | 5 | on=calview:timeScale.5
 sep
 item | Change Time Zone... | location | calendar.changeTimeZone | | Z
 
@@ -285,9 +288,16 @@ item | Brown | | calendar.color | {"color":"Brown"} | | swatch=#8a5a3a
 item | Dark Red | | calendar.color | {"color":"Dark Red"} | | swatch=#9a2a2a
 
 menu dailyTaskList
-item | Normal | | calendar.dailyTaskList | {"mode":"normal"} | N
-item | Minimized | | calendar.dailyTaskList | {"mode":"minimized"} | M
-item | Off | | calendar.dailyTaskList | {"mode":"off"} | O
+item | Normal | | calendar.dailyTaskList | {"mode":"normal"} | N | on=calview:dailyTaskList.normal
+item | Minimized | | calendar.dailyTaskList | {"mode":"minimized"} | M | on=calview:dailyTaskList.minimized
+item | Off | | calendar.dailyTaskList | {"mode":"off"} | O | on=calview:dailyTaskList.off
+
+menu calendarReadingPane
+item | Right | | view.readingPane | {"position":"right"} | R | on=calview:rp.right
+item | Bottom | | view.readingPane | {"position":"bottom"} | B | on=calview:rp.bottom
+item | Off | | view.readingPane | {"position":"off"} | O | on=calview:rp.off
+sep
+item | Options... | settings | view.readingPaneOptions | | N
 
 menu peopleNewItems
 item | E-mail Message | mail | mail.newEmail | | M

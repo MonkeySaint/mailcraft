@@ -197,36 +197,35 @@ struct NewFolderState {
     focused: bool,
 }
 
-const CONTAINS: [&str; 6] =
-    ["Mail and Post Items", "Calendar Items", "Contact Items", "Journal Items", "Note Items", "Task Items"];
-
-/// Engine names of [`CONTAINS`] ("Journal Items" is kept for completeness).
-const CONTAINS_KEYS: [&str; 6] = ["mail", "calendar", "contacts", "journal", "notes", "tasks"];
-
-/// The "Folder contains" choice that matches a folder's kind.
+/// The "Folder contains" choice (an index into `FOLDER_CONTENTS`) that matches a folder's kind.
 fn contains_index(app: &App, folder: Option<u64>) -> usize {
-    use mailcraft_model::FolderKind;
-    match folder.and_then(|f| app.s.mailbox.folder(FolderId(f))).map(|f| f.kind) {
-        Some(FolderKind::Calendar) => 1,
-        Some(FolderKind::Contacts) => 2,
-        Some(FolderKind::Journal) => 3,
-        Some(FolderKind::Notes) => 4,
-        Some(FolderKind::Tasks) => 5,
-        _ => 0,
-    }
+    use mailcraft_engine::cmd::folder::{FOLDER_CONTENTS, contents_key};
+    let kind = folder.and_then(|f| app.s.mailbox.folder(FolderId(f))).map(|f| f.kind);
+    let key = kind.map_or("mail", contents_key);
+    FOLDER_CONTENTS.iter().position(|(k, _, _)| *k == key).unwrap_or(0)
 }
 
-/// Create New Folder: name, what the folder holds, and where it goes (a folder, or the top of an account
-/// when the dialog was opened from the account's root with `account`).
+/// Create New Folder (`plan/reference/dialogs.md` › new-folder): a name, what the folder contains (mail,
+/// calendar, contact, journal, note or task items; the module's items by default) and where it goes (a
+/// folder, or the top of an account when the dialog was opened from the account's root with `account`).
 fn create_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    use mailcraft_engine::cmd::folder::FOLDER_CONTENTS;
     let uid = d.uid;
     let account = d.u64("account").filter(|_| d.u64("parent").is_none());
     let parent = if account.is_some() { None } else { d.u64("parent").or(Some(app.s.selection.folder.0)) };
+    // The engine's default (the module's items, else what the parent holds).
+    let wanted = if d.str("kind").is_empty() { d.str("contains") } else { d.str("kind") };
+    let start = FOLDER_CONTENTS.iter().position(|(k, _, _)| *k == wanted);
+    let labels: Vec<&str> = FOLDER_CONTENTS.iter().map(|(_, l, _)| *l).collect();
     with_state(
         ctx,
         app,
         uid,
-        |a: &App| NewFolderState { sel: parent, contains: contains_index(a, parent), ..Default::default() },
+        |a: &App| NewFolderState {
+            sel: parent,
+            contains: start.unwrap_or_else(|| contains_index(a, parent)),
+            ..Default::default()
+        },
         |st, app| {
             window(ctx, app, d, "Create New Folder", 340.0, |ui, app| {
                 ui.label("Name:");
@@ -244,7 +243,7 @@ fn create_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     )
                 });
                 ui.add_enabled_ui(!fixed, |ui| {
-                    common::combo_idx(ui, ("contains", uid), &mut st.contains, &CONTAINS, 300.0);
+                    common::combo_idx(ui, ("contains", uid), &mut st.contains, &labels, 300.0);
                 })
                 .response
                 .on_disabled_hover_text("Folders under Search Folders hold saved searches.");
@@ -275,8 +274,8 @@ fn create_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                             None => json!({"name": st.name.trim(), "account": account}),
                         };
                         if !fixed && let Some(o) = p.as_object_mut() {
-                            let contains = CONTAINS_KEYS.get(st.contains).copied().unwrap_or("mail");
-                            o.insert("contains".into(), json!(contains));
+                            let kind = FOLDER_CONTENTS.get(st.contains).map_or("mail", |(k, _, _)| *k);
+                            o.insert("contains".into(), json!(kind));
                         }
                         match app.run("folder.new", p) {
                             Some(v) => {

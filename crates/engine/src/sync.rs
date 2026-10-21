@@ -405,6 +405,11 @@ pub struct SyncState {
     discoveries: BTreeMap<String, Discovering>,
     /// The slow-connection threshold in bytes per second (`None` = [`SLOW_LINK_BYTES_PER_SEC`]).
     pub slow_link_threshold: Option<u64>,
+    /// A UI fetches internet calendars on its own worker threads: Send/Receive and Update Folder queue
+    /// their calendar refreshes in [`SyncState::calendar_requests`] instead of fetching while the command runs.
+    pub background_calendars: bool,
+    /// Internet calendars Send/Receive asked to refresh, waiting for the UI's fetcher.
+    pub calendar_requests: Vec<crate::cmd::calendar::subscribe::Due>,
     /// Newly arrived mail not looked at yet (the new-mail envelope, see `new_mail.rs`).
     pub(crate) new_mail: BTreeSet<ItemId>,
     #[cfg(not(target_arch = "wasm32"))]

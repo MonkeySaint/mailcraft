@@ -733,6 +733,50 @@ fn task_ribbon_actions_and_recurrence() {
 }
 
 #[test]
+fn notes_list_is_a_table_sorted_by_its_headers() {
+    let mut a = app();
+    let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Notes);
+    let mut h = harness(super::notes, a, (1500.0, 900.0));
+    assert!(!has(&h, "Sort by Subject"), "the Icon view has no column headers");
+    run_cmd(&mut h, "view.changeView", json!({"name": "Notes List"}));
+    for col in ["Subject", "Created", "Categories"] {
+        assert!(has(&h, &format!("Sort by {col}")), "{col}");
+    }
+    assert!(!has(&h, "Sort by Modified"), "not a default column");
+    let order = |h: &Harness<'_, App>| -> Vec<u64> {
+        mailcraft_engine::cmd::notes::view_rows(&h.state().s, folder).into_iter().map(|r| r.id.0).collect()
+    };
+    let newest_first = order(&h);
+    click(&h, "Sort by Subject");
+    h.run_ok();
+    let st = mailcraft_engine::cmd::view::modules::state(
+        &h.state().s,
+        folder,
+        mailcraft_engine::cmd::view::modules::ModuleKind::Notes,
+    );
+    assert_eq!(st.sort, "subject");
+    let by_subject = order(&h);
+    let titles: Vec<String> = by_subject
+        .iter()
+        .map(|id| {
+            mailcraft_engine::cmd::notes::title(&h.state().s.mailbox.notes[&ItemId(*id)]).to_lowercase()
+        })
+        .collect();
+    let mut sorted = titles.clone();
+    sorted.sort();
+    assert_eq!(titles, sorted, "A to Z");
+    click(&h, "Sort by Subject");
+    h.run_ok();
+    let reversed: Vec<u64> = by_subject.iter().rev().copied().collect();
+    assert_eq!(order(&h), reversed, "again: Z to A");
+    assert_eq!(newest_first.len(), by_subject.len());
+    // Columns and AutoPreview come from View Settings.
+    run_cmd(&mut h, "view.viewSettings", json!({"columns": ["subject", "modified"], "autoPreview": false}));
+    assert!(has(&h, "Sort by Modified"));
+    assert!(!has(&h, "Sort by Categories"));
+}
+
+#[test]
 fn notes_views_icons_and_line_up() {
     let mut a = app();
     let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Notes);
@@ -1112,4 +1156,34 @@ fn module_view_settings_opens_the_table_parts() {
     click(&h, "Sort...");
     h.run_ok();
     assert!(h.state().ui.dialogs.iter().any(|(d, _)| d == "viewSort"));
+}
+
+#[test]
+fn update_folder_fetches_an_internet_calendar_in_the_background_from_any_module() {
+    use mailcraft_engine::cmd::calendar::props;
+    let mut a = app();
+    let r = a
+        .run(
+            "calendar.addCalendar",
+            json!({"source": "internet", "url": "http://127.0.0.1:1/feed.ics", "name": "Feed", "fetch": false}),
+        )
+        .unwrap();
+    let f = mailcraft_model::FolderId(r["folder"].as_u64().unwrap());
+    a.s.view.module = mailcraft_engine::Module::Mail;
+    a.s.selection.folder = f;
+    let r = a.run("sendReceive.folder", json!({})).unwrap();
+    assert_eq!(r["status"], "updating", "queued for the UI's fetcher, not fetched on the UI thread");
+    let ctx = egui::Context::default();
+    super::calendar_background(&ctx, &mut a);
+    assert!(a.s.sync.calendar_requests.is_empty(), "handed to a worker");
+    // The worker's result is applied on a later frame, wherever the user is.
+    for _ in 0..200 {
+        super::calendar_background(&ctx, &mut a);
+        if props::read(&a.s.mailbox, f).subscription.and_then(|s| s.last_error).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(props::read(&a.s.mailbox, f).subscription.unwrap().last_error.is_some());
+    assert!(a.ui.toast.as_ref().is_some_and(|t| t.0.contains("Feed")), "{:?}", a.ui.toast);
 }

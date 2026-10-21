@@ -379,26 +379,68 @@ fn found_row(app: &App, id: ItemId) -> Option<FoundRow> {
 struct BookState {
     search: String,
     selected: Option<String>,
+    /// The selected entry: (name, address, contact id when it is a contact).
+    entry: Option<(String, String, Option<u64>)>,
+    /// Address book shown: "" (every contacts folder), a contacts folder id, or "recent".
+    book: String,
     to: String,
     cc: String,
     bcc: String,
     loaded: bool,
+    info: String,
 }
 
-/// "Name <address>" entries of every contact address, sorted by name.
-fn entries(app: &App) -> Vec<(String, String, String)> {
-    let mut v: Vec<(String, String, String)> = app
+/// One address book entry: name, address, company, contact id (`None` for a recent recipient).
+type Entry = (String, String, String, Option<u64>);
+
+/// Address books: every contacts folder together, each contacts folder, the recent recipients.
+fn books(app: &App) -> Vec<(String, String)> {
+    let mut v = vec![(String::new(), "Contacts (all folders)".to_owned())];
+    let mut folders: Vec<(String, String)> = app
         .s
         .mailbox
-        .contacts
+        .folders
         .values()
-        .flat_map(|c| {
-            let name = c.full_name();
-            let name = if name.trim().is_empty() { c.file_as.clone() } else { name };
-            let company = c.company.clone();
-            c.emails.iter().map(move |e| (name.clone(), e.clone(), company.clone())).collect::<Vec<_>>()
-        })
+        .filter(|f| f.kind == mailcraft_model::FolderKind::Contacts)
+        .map(|f| (f.id.0.to_string(), app.s.mailbox.folder_path(f.id)))
         .collect();
+    folders.sort_by_key(|(_, p)| p.to_lowercase());
+    if folders.len() > 1 {
+        v.extend(folders);
+    }
+    v.push(("recent".to_owned(), "Recent Recipients".to_owned()));
+    v
+}
+
+/// Entries of address book `book` (see [`books`]), sorted by name.
+fn entries(app: &App, book: &str) -> Vec<Entry> {
+    let mut v: Vec<Entry> = if book == "recent" {
+        app.s
+            .mailbox
+            .recent_recipients
+            .iter()
+            .take(2_000)
+            .map(|r| (r.name.clone(), r.address.clone(), String::new(), None))
+            .collect()
+    } else {
+        let folder = book.parse::<u64>().ok();
+        app.s
+            .mailbox
+            .contacts
+            .values()
+            .filter(|c| folder.is_none_or(|f| c.folder.0 == f))
+            .flat_map(|c| {
+                let name = c.full_name();
+                let name = if name.trim().is_empty() { c.file_as.clone() } else { name };
+                let company = c.company.clone();
+                let id = c.id.0;
+                c.emails
+                    .iter()
+                    .map(move |e| (name.clone(), e.clone(), company.clone(), Some(id)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
     v.sort_by_key(|e| e.0.to_lowercase());
     v
 }
@@ -435,17 +477,34 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 }
                 st.loaded = true;
             }
-            window(ctx, app, d, "Address Book: Contacts", 660.0, |ui, app| {
+            let all_books = books(app);
+            let book_name = all_books
+                .iter()
+                .find(|(k, _)| *k == st.book)
+                .map_or("Contacts".to_owned(), |(_, l)| l.clone());
+            window(ctx, app, d, &format!("Address Book: {book_name}"), 660.0, |ui, app| {
                 let mut out = Out::Keep;
                 ui.horizontal(|ui| {
                     ui.label("Search:");
-                    ui.add(egui::TextEdit::singleline(&mut st.search).desired_width(260.0));
-                    ui.label("Address Book: Contacts");
+                    ui.add(egui::TextEdit::singleline(&mut st.search).desired_width(220.0));
+                    ui.label("Address Book:");
+                    egui::ComboBox::from_id_salt(("ab-book", uid)).selected_text(book_name.clone()).show_ui(
+                        ui,
+                        |ui| {
+                            for (k, l) in &all_books {
+                                if ui.selectable_label(st.book == *k, l).clicked() {
+                                    st.book.clone_from(k);
+                                    st.selected = None;
+                                    st.entry = None;
+                                }
+                            }
+                        },
+                    );
                     if btn(ui, "Advanced Find") {
                         out = Out::open("advancedFind", json!({}));
                     }
                 });
-                let list = entries(app);
+                let list = entries(app, &st.book);
                 let q = st.search.to_lowercase();
                 egui::Frame::new()
                     .stroke(egui::Stroke::new(1.0, app.theme.separator))
@@ -467,10 +526,15 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                         }
                                         ui.end_row();
                                         if list.is_empty() {
-                                            muted(ui, app, "No contacts with email addresses.");
+                                            let empty = if st.book == "recent" {
+                                                "No recent recipients yet."
+                                            } else {
+                                                "No contacts with email addresses."
+                                            };
+                                            muted(ui, app, empty);
                                             ui.end_row();
                                         }
-                                        for (name, addr, company) in &list {
+                                        for (name, addr, company, id) in &list {
                                             if !q.is_empty()
                                                 && !name.to_lowercase().contains(&q)
                                                 && !addr.to_lowercase().contains(&q)
@@ -487,6 +551,8 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                             ui.end_row();
                                             if r.clicked() {
                                                 st.selected = Some(text.clone());
+                                                st.entry = Some((name.clone(), addr.clone(), *id));
+                                                st.info.clear();
                                             }
                                             if r.double_clicked() && compose.is_some() {
                                                 append(&mut st.to, &text);
@@ -495,6 +561,37 @@ fn address_book(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                     });
                             });
                     });
+                ui.horizontal(|ui| {
+                    let contact = st.entry.as_ref().and_then(|e| e.2);
+                    if btn_en(ui, contact.is_some(), "Properties")
+                        && let Some(id) = contact
+                    {
+                        // The contact's own window.
+                        out = Out::open("contact", json!({"id": id}));
+                    }
+                    let new_entry = st.entry.as_ref().filter(|e| e.2.is_none()).cloned();
+                    if btn_en(ui, new_entry.is_some(), "Add to Contacts")
+                        && let Some((name, addr, _)) = new_entry
+                    {
+                        let mut p = json!({"email": addr});
+                        if !name.trim().is_empty()
+                            && let Some(o) = p.as_object_mut()
+                        {
+                            o.insert("fullName".into(), json!(name));
+                        }
+                        st.info = if app.run("people.new", p).is_some() {
+                            format!(
+                                "{} was added to Contacts.",
+                                if name.trim().is_empty() { &addr } else { &name }
+                            )
+                        } else {
+                            super::folders::last_error(app)
+                        };
+                    }
+                    if !st.info.is_empty() {
+                        muted(ui, app, &st.info);
+                    }
+                });
                 if compose.is_some() {
                     ui.label("Message Recipients");
                     for (label, field) in

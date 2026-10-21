@@ -1,8 +1,8 @@
 //! Notes module: My Notes (folder pane) and the folder's current view: Icon (large icons, small icons or a
 //! list; icons can be dragged anywhere — where they are dropped is saved with `notes.setPosition` and
 //! kept with the profile — and View › Line Up Icons snaps them back to the grid), Notes List and
-//! Last 7 Days (lists, newest first). Notes are edited in place; the text is saved with `notes.update` when
-//! the edit box loses focus. The reading pane (off by default) shows the selected note. The order and the
+//! Last 7 Days (tables with column headers that sort, newest first by default). Notes are edited in place;
+//! the text is saved with `notes.update` when the edit box loses focus. The reading pane (off by default) shows the selected note. The order and the
 //! filter come from the engine (`mailcraft_engine::cmd::notes::view_rows`), the view and the icon
 //! arrangement from the folder's module view.
 
@@ -211,15 +211,20 @@ fn content(ui: &mut Ui, app: &mut App, st: &mut ModState, view: &ModuleView, ord
         select_item(app, None);
     }
     let icons = view.view == "Icon" && view.icon_mode != IconMode::List;
-    child(ui, list_rect.shrink(10.0), "mc-notes-body", |ui| {
-        ScrollArea::vertical().id_salt("mc-notes-scroll").auto_shrink([false, false]).show(ui, |ui| {
-            if icons {
-                grid(ui, app, st, order, view);
-            } else {
-                list(ui, app, st, order);
-            }
+    if view.view != "Icon" {
+        // Notes List and Last 7 Days: a table with column headers.
+        table(ui, app, st, order, view, list_rect.shrink2(vec2(10.0, 6.0)));
+    } else {
+        child(ui, list_rect.shrink(10.0), "mc-notes-body", |ui| {
+            ScrollArea::vertical().id_salt("mc-notes-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                if icons {
+                    grid(ui, app, st, order, view);
+                } else {
+                    list(ui, app, st, order);
+                }
+            });
         });
-    });
+    }
     if let Some(p) = pane {
         pane_separator(ui, app, list_rect, p);
         reading(ui, app, st, p);
@@ -266,6 +271,10 @@ fn reading(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect) {
 }
 
 fn note_menu(ui: &mut Ui, app: &mut App, st: &mut ModState, id: ItemId) {
+    // Right-clicking a note selects it (the commands below act on the selection).
+    if app.ui.module_selection != Some(id.0) {
+        select_item(app, Some(id.0));
+    }
     if ui.button("Open").clicked() {
         commit_edit(app, st);
         super::editors::open_note(app, st, id);
@@ -466,6 +475,218 @@ fn grid(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &
         note_click(app, st, &resp, id);
         resp.context_menu(|ui| note_menu(ui, app, st, id));
     }
+}
+
+/// Fixed widths of the Notes table columns (0 = shares the free space).
+fn column_width(key: &str) -> f32 {
+    match key {
+        "icon" => 30.0,
+        "created" | "modified" => 150.0,
+        "categories" => 140.0,
+        _ => 0.0,
+    }
+}
+
+/// Column x ranges (start, width) for a table `width` wide.
+fn column_layout(cols: &[&'static str], width: f32) -> Vec<(&'static str, f32, f32)> {
+    let fixed: f32 = cols.iter().map(|c| column_width(c)).sum();
+    let flexible = cols.iter().filter(|c| column_width(c) == 0.0).count().max(1) as f32;
+    let share = ((width - fixed) / flexible).max(80.0);
+    let mut x = 0.0;
+    cols.iter()
+        .map(|c| {
+            let w = if column_width(c) == 0.0 { share } else { column_width(c) };
+            let out = (*c, x, w);
+            x += w;
+            out
+        })
+        .collect()
+}
+
+/// "#rrggbb" as a colour.
+fn hex_color(c: &str) -> Option<Color32> {
+    let h = c.strip_prefix('#')?;
+    if h.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(h, 16).ok()?;
+    let [_, r, g, b] = v.to_be_bytes();
+    Some(Color32::from_rgb(r, g, b))
+}
+
+/// Text of a Notes table cell.
+fn cell_text(n: &Note, key: &str, tz: i32) -> String {
+    match key {
+        "subject" => {
+            let t = title(n);
+            if t.is_empty() { "(Empty note)".to_owned() } else { t }
+        }
+        "created" => ListTime::short_date_time(n.created, tz),
+        "modified" => ListTime::short_date_time(n.modified, tz),
+        "categories" => n.categories.join(", "),
+        _ => String::new(),
+    }
+}
+
+/// The note text after its title, on one line (AutoPreview).
+fn preview_line(n: &Note) -> String {
+    n.text
+        .lines()
+        .map(str::trim)
+        .skip_while(|l| l.is_empty())
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// Notes List and Last 7 Days: column headers (click to sort, again to reverse) over one row per note, with
+/// AutoPreview, grid lines and Conditional Formatting from the folder's View Settings.
+fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &ModuleView, rect: Rect) {
+    use mailcraft_engine::cmd::view::modules::{self, note_column_label, note_columns, note_sort_descending};
+    let folder = current_folder(app, Kind::Note);
+    let cols = column_layout(&note_columns(view), rect.width() - 14.0);
+    let sort = if view.sort.is_empty() { "created" } else { view.sort.as_str() };
+    let reversed = folder.is_some_and(|f| modules::reversed(&app.s, f));
+    let descending = note_sort_descending(&view.sort) != reversed;
+    let head = Rect::from_min_size(rect.min, vec2(rect.width(), 26.0));
+    let line = Stroke::new(1.0, app.theme.separator);
+    ui.painter().rect_filled(head, CornerRadius::ZERO, blend(app.theme.reading, app.theme.backdrop, 0.3));
+    for (key, x, w) in &cols {
+        let r = Rect::from_min_size(pos2(head.min.x + x, head.min.y), vec2(*w, head.height()));
+        let resp = ui.interact(r, Id::new(("mc-notes-head", *key)), Sense::click());
+        let label = note_column_label(key);
+        a11y(&resp, WidgetType::Button, &format!("Sort by {label}"));
+        if resp.hovered() {
+            ui.painter().rect_filled(r, CornerRadius::ZERO, app.theme.hover);
+        }
+        let mut text = if *key == "icon" { String::new() } else { label.to_owned() };
+        if *key == sort {
+            text.push_str(if descending { " ▼" } else { " ▲" });
+        }
+        paint_text_clipped(
+            ui,
+            pos2(r.min.x + 6.0, r.min.y + 5.0),
+            &text,
+            FontId::proportional(12.5),
+            app.theme.text,
+            w - 10.0,
+        );
+        ui.painter().vline(r.max.x, r.y_range(), line);
+        if resp.clicked() {
+            commit_edit(app, st);
+            app.run("view.arrangeBy", json!({ "key": key }));
+        }
+    }
+    ui.painter().hline(rect.x_range(), head.max.y, line);
+    let body = Rect::from_min_max(pos2(rect.min.x, head.max.y + 1.0), rect.max);
+    let tz = app.s.tz_offset_min;
+    let preview = !view.no_preview;
+    child(ui, body, "mc-notes-table", |ui| {
+        ScrollArea::vertical().id_salt("mc-notes-table-scroll").auto_shrink([false, false]).show(ui, |ui| {
+            for &id in order {
+                let Some(n) = app.s.mailbox.notes.get(&id).cloned() else { continue };
+                let editing = st.note_edit.as_ref().is_some_and(|(e, _)| *e == id.0);
+                let extra = preview && !preview_line(&n).is_empty();
+                let base = row_height(app, 24.0);
+                let h = if editing {
+                    120.0
+                } else if extra {
+                    base + 17.0
+                } else {
+                    base
+                };
+                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+                a11y(&resp, WidgetType::Button, &cell_text(&n, "subject", tz));
+                let sel = app.ui.module_selection == Some(id.0);
+                if sel {
+                    ui.painter().rect_filled(row, CornerRadius::ZERO, app.theme.selected);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(row, CornerRadius::ZERO, app.theme.hover);
+                }
+                let style = mailcraft_engine::cmd::notes::row_style(&app.s, view, &n);
+                let color = style.color.as_deref().and_then(hex_color).unwrap_or(app.theme.text);
+                let font = FontId::proportional(13.0);
+                for (key, x, w) in &cols {
+                    let cx = row.min.x + x;
+                    if *key == "icon" {
+                        let sw = Rect::from_min_size(pos2(cx + 7.0, row.min.y + 4.0), Vec2::splat(15.0));
+                        ui.painter().rect_filled(
+                            sw,
+                            CornerRadius::same(3),
+                            note_fill(n.color, app.theme.dark),
+                        );
+                        ui.painter().rect_stroke(sw, CornerRadius::same(3), line, egui::StrokeKind::Inside);
+                        continue;
+                    }
+                    if editing && *key == "subject" {
+                        continue;
+                    }
+                    let text = cell_text(&n, key, tz);
+                    let c =
+                        if *key == "subject" || style.color.is_some() { color } else { app.theme.text_muted };
+                    let mut job = egui::text::LayoutJob::single_section(
+                        text,
+                        egui::TextFormat {
+                            font_id: font.clone(),
+                            color: c,
+                            italics: style.italic,
+                            strikethrough: if style.strike { Stroke::new(1.0, c) } else { Stroke::NONE },
+                            ..Default::default()
+                        },
+                    );
+                    job.wrap = egui::text::TextWrapping {
+                        max_width: (w - 10.0).max(1.0),
+                        max_rows: 1,
+                        break_anywhere: true,
+                        overflow_character: Some('…'),
+                    };
+                    let galley = ui.painter().layout_job(job);
+                    let at = pos2(cx + 6.0, row.min.y + 4.0);
+                    ui.painter().galley(at, galley.clone(), c);
+                    if style.bold {
+                        // Faux bold: the same text one pixel to the right.
+                        ui.painter().galley(at + vec2(0.6, 0.0), galley, c);
+                    }
+                }
+                if editing {
+                    let sub = cols
+                        .iter()
+                        .find(|(k, ..)| *k == "subject")
+                        .map_or((0.0, row.width()), |c| (c.1, c.2));
+                    edit_box(
+                        ui,
+                        app,
+                        st,
+                        Rect::from_min_size(
+                            pos2(row.min.x + sub.0 + 4.0, row.min.y + 4.0),
+                            vec2(sub.1 - 8.0, h - 8.0),
+                        ),
+                        id,
+                    );
+                } else if extra {
+                    let x0 = cols.iter().find(|(k, ..)| *k == "subject").map_or(0.0, |c| c.1);
+                    paint_text_clipped(
+                        ui,
+                        pos2(row.min.x + x0 + 6.0, row.min.y + base - 2.0),
+                        &preview_line(&n),
+                        FontId::proportional(12.0),
+                        app.theme.accent,
+                        row.width() - x0 - 12.0,
+                    );
+                }
+                if !view.no_grid {
+                    ui.painter().hline(
+                        row.x_range(),
+                        row.max.y,
+                        Stroke::new(1.0, blend(app.theme.separator, app.theme.reading, 0.5)),
+                    );
+                }
+                note_click(app, st, &resp, id);
+                resp.context_menu(|ui| note_menu(ui, app, st, id));
+            }
+        });
+    });
 }
 
 fn list(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId]) {

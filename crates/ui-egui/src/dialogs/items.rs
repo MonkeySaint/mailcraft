@@ -98,37 +98,40 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 cmd(app, "calendar.addCalendar", params).map(|_| None)
             },
         ),
+        "newDataFile" => {
+            let location = d.str("location");
+            let note = if location.is_empty() {
+                "The data file gets its own folders (Inbox, Calendar, Contacts and the rest) in this profile."
+                    .to_owned()
+            } else {
+                format!(
+                    "The data file gets its own folders (Inbox, Calendar, Contacts and the rest), kept with \
+                     this profile in {location}."
+                )
+            };
+            run_form(
+                ctx,
+                app,
+                d,
+                Form::new(
+                    "Create Data File",
+                    vec![f("name", "Data file name:", Kind::Text), f("n", "", Kind::Note(note))],
+                )
+                .init("name", json!(d.str("name")))
+                .width(420.0),
+                |app, v| {
+                    let name = v.s("name");
+                    if name.trim().is_empty() {
+                        return Err("Type a name for the data file.".into());
+                    }
+                    cmd(app, "file.newDataFile", json!({"name": name.trim()})).map(|_| None)
+                },
+            )
+        }
         "contactCard" => contact_card(ctx, app, d),
         "chooseContact" => choose_contact(ctx, app, d),
         "forwardContact" => forward_contact(ctx, app, d),
-        "chooseForm" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Choose Form",
-                vec![f(
-                    "kind",
-                    "Standard forms:",
-                    combo(&[
-                        "appointment",
-                        "meeting",
-                        "allDayEvent",
-                        "recurringAppointment",
-                        "recurringMeeting",
-                        "recurringEvent",
-                        "post",
-                        "contact",
-                        "task",
-                        "contactGroup",
-                        "taskRequest",
-                        "email",
-                    ]),
-                )],
-            )
-            .ok("Open"),
-            |app, v| cmd(app, "mail.newItem", json!({"kind": v.s("kind")})).map(|_| None),
-        ),
+        "chooseForm" => choose_form(ctx, app, d),
         _ => return None,
     })
 }
@@ -380,6 +383,188 @@ fn forward_contact(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
+/// Standard forms of Choose Form (engine kind, label).
+const STANDARD_FORMS: [(&str, &str); 12] = [
+    ("appointment", "Appointment"),
+    ("meeting", "Meeting"),
+    ("allDayEvent", "All Day Event"),
+    ("recurringAppointment", "Recurring Appointment"),
+    ("recurringMeeting", "Recurring Meeting"),
+    ("recurringEvent", "Recurring Event"),
+    ("post", "Post"),
+    ("contact", "Contact"),
+    ("task", "Task"),
+    ("contactGroup", "Contact Group"),
+    ("taskRequest", "Task Request"),
+    ("email", "Message"),
+];
+
+#[derive(Clone, Default)]
+struct FormsState {
+    /// Look In: false = Standard Forms Library, true = User Templates in File System.
+    user: bool,
+    /// The selected standard form (index) or template (path).
+    standard: usize,
+    template: Option<String>,
+    dir: String,
+    templates: Vec<(String, String)>,
+    error: String,
+    /// List the folder's templates on the next frame (on opening and after Browse picks a folder).
+    pending: bool,
+}
+
+/// Lists the templates of `st.dir` (Show): the list, and a message when the folder cannot be read or has
+/// none. A message from an earlier folder never stays under a new list.
+fn list_templates(app: &mut App, st: &mut FormsState) {
+    st.pending = false;
+    st.error.clear();
+    match app.run("mail.newItem", json!({"kind": "fromForm", "dir": st.dir.trim(), "list": true})) {
+        Some(v) => {
+            st.templates = templates_of(&v);
+            if st.templates.is_empty() {
+                st.error = "This folder has no .oft, .msg or .eml templates.".into();
+            }
+        }
+        None => {
+            st.templates.clear();
+            st.error = super::folders::last_error(app);
+        }
+    }
+    if st.template.as_ref().is_some_and(|t| !st.templates.iter().any(|(_, p)| p == t)) {
+        st.template = None;
+    }
+}
+
+fn templates_of(v: &Value) -> Vec<(String, String)> {
+    v.get("templates")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| {
+                    Some((t.get("name")?.as_str()?.to_owned(), t.get("path")?.as_str()?.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Choose Form: the standard forms, or the message templates (.oft, .msg, .eml) of a folder (User Templates
+/// in File System; `mail.newItem {"kind": "fromForm"}` lists and opens them).
+fn choose_form(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let start_dir = d.str("dir");
+    let start_templates = d.get("templates").map(|_| templates_of(d.params)).unwrap_or_default();
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| FormsState {
+            pending: start_templates.is_empty() && !start_dir.trim().is_empty(),
+            dir: start_dir.clone(),
+            templates: start_templates.clone(),
+            ..Default::default()
+        },
+        |st, app| {
+            window(ctx, app, d, "Choose Form", 460.0, |ui, app| {
+                ui.horizontal(|ui| {
+                    ui.label("Look In:");
+                    let cur =
+                        if st.user { "User Templates in File System" } else { "Standard Forms Library" };
+                    egui::ComboBox::from_id_salt(("forms-look", uid)).selected_text(cur).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut st.user, false, "Standard Forms Library");
+                        ui.selectable_value(&mut st.user, true, "User Templates in File System");
+                    });
+                });
+                let mut open = false;
+                if st.user {
+                    ui.horizontal(|ui| {
+                        let typed = ui.add(
+                            egui::TextEdit::singleline(&mut st.dir).desired_width(260.0).hint_text("Folder"),
+                        );
+                        if typed.changed() {
+                            // The message was about the folder named before.
+                            st.error.clear();
+                        }
+                        if btn(ui, "Browse...")
+                            && let Some(dir) = common::browse_folder(app, "Templates folder", &st.dir)
+                        {
+                            st.dir = dir;
+                            st.templates.clear();
+                            st.pending = true;
+                        }
+                        if btn(ui, "Show") || st.pending && !st.dir.trim().is_empty() {
+                            list_templates(app, st);
+                        }
+                    });
+                    egui::ScrollArea::vertical().id_salt(("forms-list", uid)).max_height(220.0).show(
+                        ui,
+                        |ui| {
+                            for (name, path) in &st.templates {
+                                let r =
+                                    ui.selectable_label(st.template.as_deref() == Some(path.as_str()), name);
+                                if r.clicked() {
+                                    st.template = Some(path.clone());
+                                }
+                                if r.double_clicked() {
+                                    st.template = Some(path.clone());
+                                    open = true;
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    egui::ScrollArea::vertical().id_salt(("forms-std", uid)).max_height(220.0).show(
+                        ui,
+                        |ui| {
+                            for (i, (_, label)) in STANDARD_FORMS.iter().enumerate() {
+                                let r = ui.selectable_label(st.standard == i, *label);
+                                if r.clicked() {
+                                    st.standard = i;
+                                }
+                                if r.double_clicked() {
+                                    st.standard = i;
+                                    open = true;
+                                }
+                            }
+                        },
+                    );
+                }
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                let can = !st.user || st.template.is_some();
+                let pressed = footer(ui, |ui| {
+                    if btn(ui, "Cancel") {
+                        return Some(false);
+                    }
+                    if common::primary(ui, app, can, "Open") {
+                        return Some(true);
+                    }
+                    None
+                });
+                match (pressed, open) {
+                    (Some(false), _) => Out::Close,
+                    (Some(true), _) | (None, true) if can => {
+                        let p = if st.user {
+                            json!({"kind": "fromForm", "path": st.template})
+                        } else {
+                            let kind = STANDARD_FORMS.get(st.standard).map_or("email", |(k, _)| *k);
+                            json!({"kind": kind})
+                        };
+                        if app.run("mail.newItem", p).is_some() {
+                            Out::Close
+                        } else {
+                            st.error = super::folders::last_error(app);
+                            Out::Keep
+                        }
+                    }
+                    _ => Out::Keep,
+                }
+            })
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::App;
@@ -483,5 +668,46 @@ mod tests {
         for other in ["", "internet", "addressBook", "roomList", "shared"] {
             assert_eq!(super::add_calendar_source(other), "internet");
         }
+    }
+}
+
+#[cfg(test)]
+mod choose_form_tests {
+    use super::{FormsState, list_templates};
+    use crate::App;
+    use mailcraft_engine::sample::sample_session;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.ancestors().nth(3).map(|t| t.join("tmp")))
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
+        let dir = base.join(format!("mc-forms-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Regression: "no templates" stayed under a later, populated list.
+    #[test]
+    fn a_listed_folder_clears_the_earlier_message() {
+        let empty = scratch("empty");
+        let full = scratch("full");
+        let eml = "From: a@example.com\r\nTo: b@example.org\r\nSubject: Weekly\r\n\r\nBody\r\n";
+        std::fs::write(full.join("Weekly.eml"), eml).unwrap();
+        let mut app = App::new(sample_session());
+        let mut st = FormsState { dir: empty.display().to_string(), pending: true, ..Default::default() };
+        list_templates(&mut app, &mut st);
+        assert!(st.templates.is_empty() && !st.error.is_empty() && !st.pending);
+        st.dir = full.display().to_string();
+        list_templates(&mut app, &mut st);
+        assert_eq!(st.templates.len(), 1);
+        assert!(st.error.is_empty(), "{}", st.error);
+        st.template = st.templates.first().map(|(_, p)| p.clone());
+        st.dir = empty.join("missing").display().to_string();
+        list_templates(&mut app, &mut st);
+        assert!(st.templates.is_empty() && st.template.is_none() && !st.error.is_empty());
+        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_dir_all(&full);
     }
 }

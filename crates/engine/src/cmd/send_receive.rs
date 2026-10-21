@@ -6,6 +6,7 @@
 
 use serde_json::{Value, json};
 
+use crate::cmd::calendar::subscribe;
 use crate::cmd::rules::{dialog, need_selection};
 use crate::cmd::util::{opt_bool, req_str};
 use crate::sync::{Plan, cmds};
@@ -197,7 +198,57 @@ fn all(s: &mut Session, p: &Value) -> CmdResult {
     let ids = all_account_ids(s);
     let off = offline(s, p);
     let report = outbox_report(s, &ids, off);
-    start(s, &ids, Plan::all(), off, report)
+    let mut out = start(s, &ids, Plan::all(), off, report)?;
+    // Send/Receive All Folders also updates the internet calendars.
+    let calendars = subscribe::subscriptions(s, true);
+    let refreshed = refresh_calendars(s, calendars, off);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("calendars".into(), refreshed);
+    }
+    Ok(out)
+}
+
+/// Most internet calendars one command refreshes.
+const MAX_CALENDARS: usize = 200;
+
+/// Refreshes internet calendars: with a UI (`SyncState::background_calendars`) they are queued for its
+/// worker threads, else fetched now (CLI, MCP). Offline nothing is fetched. Returns `{"queued", "refreshed",
+/// "errors"}` counts.
+fn refresh_calendars(s: &mut Session, targets: Vec<subscribe::Due>, offline: bool) -> Value {
+    if offline || targets.is_empty() {
+        return json!({ "queued": 0, "refreshed": 0, "errors": 0 });
+    }
+    let targets: Vec<subscribe::Due> = targets.into_iter().take(MAX_CALENDARS).collect();
+    if s.sync.background_calendars {
+        let mut queued = 0usize;
+        for d in targets {
+            if !s.sync.calendar_requests.iter().any(|q| q.folder == d.folder)
+                && s.sync.calendar_requests.len() < MAX_CALENDARS
+            {
+                s.sync.calendar_requests.push(d);
+                queued = queued.saturating_add(1);
+            }
+        }
+        return json!({ "queued": queued, "refreshed": 0, "errors": 0 });
+    }
+    let (mut refreshed, mut errors) = (0usize, 0usize);
+    for d in targets {
+        let outcome = subscribe::fetch(&d);
+        let r = subscribe::apply_background(s, d.folder, outcome);
+        if let Some(e) = r.get("error").and_then(Value::as_str) {
+            errors = errors.saturating_add(1);
+            let name = s.mailbox.folder(d.folder).map(|f| f.name.clone()).unwrap_or_default();
+            s.notify(Notice::Error(format!("Couldn't update the calendar \"{name}\": {e}")));
+        } else {
+            refreshed = refreshed.saturating_add(1);
+        }
+    }
+    json!({ "queued": 0, "refreshed": refreshed, "errors": errors })
+}
+
+/// Takes the internet calendar refreshes waiting for the UI's fetcher.
+pub fn take_calendar_requests(s: &mut Session) -> Vec<subscribe::Due> {
+    std::mem::take(&mut s.sync.calendar_requests)
 }
 
 fn send_all(s: &mut Session, p: &Value) -> CmdResult {
@@ -216,6 +267,28 @@ fn folder(s: &mut Session, p: &Value) -> CmdResult {
     let account = folder.account;
     let mapped = folder.remote_name.is_some();
     let off = offline(s, p);
+    // Update Folder on an internet calendar downloads it again.
+    if let Some(d) = subscribe::subscription(s, f) {
+        let r = refresh_calendars(s, vec![d], off);
+        let count = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let status = if off {
+            "offline"
+        } else if count("queued") > 0 {
+            "updating"
+        } else if count("errors") > 0 {
+            "failed"
+        } else {
+            "updated"
+        };
+        return Ok(json!({
+            "folder": f.0,
+            "name": name,
+            "started": 0,
+            "offline": off,
+            "calendar": r,
+            "status": status,
+        }));
+    }
     let remote = crate::sync::server_accounts(s).contains(&account);
     let mut started = 0;
     if remote && !off {

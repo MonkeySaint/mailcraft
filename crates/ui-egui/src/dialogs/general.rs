@@ -95,12 +95,17 @@ fn about(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
-/// Built-in help topics (our own text).
-const TOPICS: [(&str, &str, &str); 10] = [
+/// Built-in help topics (our own text): (key, title, text).
+const TOPICS: [(&str, &str, &str); 13] = [
     (
         "getting-started",
         "Getting started",
-        "MailCraft keeps your mail, calendar, people, tasks and notes in one window. Pick a module on the left rail, a folder in the folder pane, and a message in the list; it opens in the reading pane. Everything on the ribbon is also available from the keyboard.",
+        "MailCraft keeps your mail, calendar, people, tasks and notes in one window. Pick a module on the left rail, a folder in the folder pane, and a message in the list; it opens in the reading pane. Everything on the ribbon is also available from the keyboard: press Alt to see the key tips.",
+    ),
+    (
+        "training",
+        "Training: a first tour",
+        "1. Mail: pick Inbox in the folder pane and select a message to read it in the reading pane.\n2. Write: choose New Email (Ctrl+Shift+M), type an address, a subject and some text, then Send.\n3. Organize: right-click a message to flag it, give it a category or move it; Rules › Create Rule files similar mail for you.\n4. Calendar: switch to the Calendar on the rail, double-click a time to make an appointment, and try Day, Week and Month on the Home tab.\n5. People: add a contact with New Contact; its card shows in the reading pane.\n6. Tasks and Notes: add a task with New Task, jot a note with New Note.\n7. Make it yours: File › Options holds the settings, the View tab changes how each folder looks.",
     ),
     (
         "reading",
@@ -113,6 +118,31 @@ const TOPICS: [(&str, &str, &str); 10] = [
         "Choose New Email (Ctrl+Shift+M) to write a message. Reply, Reply All and Forward start a response in the reading pane; Pop Out moves it to its own window. Drafts are saved automatically.",
     ),
     (
+        "calendar",
+        "Calendar",
+        "The Calendar shows your appointments by day, work week, week or month (Home › Arrange) or as a schedule. Go to Date (Ctrl+G) jumps to any day. Double-click a time to make an appointment; New Meeting invites people. Add Calendar subscribes to an internet calendar, opens an .ics file or makes a blank calendar; Update Folder on the Send / Receive tab downloads an internet calendar again. View › Change View › List and Active show the items as a table whose columns, groups, filter and formatting come from View Settings.",
+    ),
+    (
+        "people",
+        "People and contacts",
+        "People keeps your contacts. New Contact adds one, New Contact Group makes a list to mail at once, and Search People finds anyone by name, company or address. Change View switches between the contact list with its card, business cards, address cards and the Phone and List tables. In a table, Add Columns picks the fields shown, a click on a column heading sorts by it, and the flag and category cells take one click (the Quick Click flag and category, set under Follow Up and Categorize). Mark a contact Private from the Tags group or the contact window; Forward Contact sends it as a business card or a vCard file.",
+    ),
+    (
+        "tasks",
+        "Tasks and the To-Do List",
+        "Tasks lists your to-dos and the messages you flagged. New Task adds one with a start date, a due date and a reminder; Mark Complete ticks it off, and Assign Task sends a task request to someone else. The To-Do List gathers your open tasks with the messages and contacts you flagged: type in the box at the top to add a task, tick its box or click its flag to complete it. Every task view is a table: Add Columns chooses the fields (status, % complete, dates, folder, categories, priority and more), View Settings sorts, filters and colours rows, and Change View shows only the active, completed, overdue or today's tasks.",
+    ),
+    (
+        "notes",
+        "Notes",
+        "Notes are quick reminders, like paper sticky notes. New Note starts one and its first line becomes the title. The Icon view lets you drag notes anywhere (View › Line Up Icons puts them back); Notes List and Last 7 Days show a table you can sort by clicking a column header. Forward sends a note as an attachment.",
+    ),
+    (
+        "views",
+        "Views and View Settings",
+        "Every folder remembers its view. View › Change View picks a view. View Settings sets the columns, the sort order, a filter and conditional formatting (rules that change the font of matching rows). Save Current View As a New View keeps it under a name for this folder or every folder of its kind. Manage All Views creates, copies, renames, modifies and deletes saved views; Reset View brings back the standard settings.",
+    ),
+    (
         "rules",
         "Organizing with rules",
         "Rules act on messages as they arrive: move them to folders, flag them, assign categories and more. Create one from a message (Rules › Create Rule) or manage them all in Rules and Alerts.",
@@ -122,34 +152,32 @@ const TOPICS: [(&str, &str, &str); 10] = [
         "Searching",
         "Type in the search box at the top to search the current folder. Use the Search tab to widen the scope or refine by sender, subject, attachments and more. Advanced Find (Ctrl+Shift+F) searches with several criteria at once.",
     ),
-    (
-        "people",
-        "People and contacts",
-        "People keeps your contacts. Change View switches between the contact list with its card, business cards, address cards and the Phone and List tables. In a table, Add Columns picks the fields shown, a click on a column heading sorts by it, and the flag and category cells take one click (the Quick Click flag and category, set under Follow Up and Categorize). Mark a contact Private from the Tags group or the contact window; Forward Contact sends it as a business card or a vCard file.",
-    ),
-    (
-        "tasks",
-        "Tasks and the To-Do List",
-        "The To-Do List gathers your open tasks with the messages and contacts you flagged. Type in the box at the top to add a task; tick its box or click its flag to complete it. Every task view is a table: Add Columns chooses the fields (status, % complete, dates, folder, categories, priority and more), View Settings sorts, filters and colours rows, and Save Current View As a New View keeps your arrangement for one folder or for all task folders.",
-    ),
-    (
-        "views",
-        "Views and View Settings",
-        "Each folder remembers its view. View Settings sets the columns, the sort order, a filter and conditional formatting (rules that change the font of matching rows). Manage All Views creates, copies, renames and deletes saved views; Reset View goes back to the folder's defaults.",
-    ),
     ("shortcuts", "Keyboard shortcuts", ""),
     (
         "data",
         "Your data",
-        "MailCraft stores your mailbox in a local data file. Use File › Open & Export to import EML or MBOX files and to export a folder to MBOX.",
+        "MailCraft stores your mailbox in a local data file. New Data File adds another one, for example for an archive. Use File › Open & Export to import EML, MBOX, iCalendar and vCard files and to export a folder.",
     ),
 ];
+
+/// Topics whose title or text holds every word of `query` (all topics for an empty query).
+fn matching_topics(query: &str) -> Vec<usize> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    TOPICS
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, title, text))| {
+            let hay = format!("{title}\n{text}").to_lowercase();
+            words.iter().all(|w| hay.contains(w.as_str()))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
 
 #[derive(Clone, Default)]
 struct HelpState {
     topic: usize,
     filter: String,
-    /// Help search text (filters the topic list).
     search: String,
 }
 
@@ -162,22 +190,21 @@ fn help(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         search: String::new(),
     };
     with_state(ctx, app, uid, init, |st, app| {
-        window(ctx, app, d, "MailCraft Help", 640.0, |ui, app| {
+        window(ctx, app, d, "MailCraft Help", 680.0, |ui, app| {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(170.0);
-                    // Search the topics: titles and text containing every word typed.
+                    ui.set_width(190.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut st.search)
                             .hint_text("Search help")
-                            .desired_width(160.0),
+                            .desired_width(180.0),
                     );
-                    let words: Vec<String> = st.search.split_whitespace().map(str::to_lowercase).collect();
-                    for (i, (_, title, text)) in TOPICS.iter().enumerate() {
-                        let hay = format!("{title} {text}").to_lowercase();
-                        if !words.iter().all(|w| hay.contains(w.as_str())) {
-                            continue;
-                        }
+                    let found = matching_topics(&st.search);
+                    if found.is_empty() {
+                        muted(ui, app, "No topic matches.");
+                    }
+                    for i in found {
+                        let Some((_, title, _)) = TOPICS.get(i) else { continue };
                         if ui.selectable_label(st.topic == i, *title).clicked() {
                             st.topic = i;
                         }
@@ -214,26 +241,47 @@ fn help(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                             },
                         );
                     } else {
-                        ui.label(*text);
+                        egui::ScrollArea::vertical().id_salt(("helptext", uid)).max_height(320.0).show(
+                            ui,
+                            |ui| {
+                                ui.label(*text);
+                            },
+                        );
                     }
                 });
             });
-            footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
+            footer(ui, |ui| {
+                if btn(ui, "Close") {
+                    return Out::Close;
+                }
+                if btn(ui, "Issue Tracker") {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(mailcraft_engine::cmd::help::ISSUES_URL));
+                }
+                Out::Keep
+            })
         })
     })
 }
 
 fn whats_new(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    window(ctx, app, d, "What's New", 440.0, |ui, app| {
+    window(ctx, app, d, "What's New", 520.0, |ui, app| {
         ui.label(RichText::new(format!("MailCraft {}", d.str("version"))).strong());
-        for line in [
-            "Classic desktop mail layout: ribbon, folder pane, message list and reading pane.",
-            "Rules: Create Rule, Rules and Alerts and the four-step Rules Wizard.",
-            "Import and export EML and MBOX from File › Open & Export.",
-            "Light and dark themes (File › Account).",
-        ] {
-            ui.label(format!("•  {line}"));
+        let notes = d.arr("notes");
+        if notes.is_empty() {
+            muted(ui, app, "No release notes are bundled with this build.");
         }
+        egui::ScrollArea::vertical().id_salt(("whatsnew", d.uid)).max_height(360.0).show(ui, |ui| {
+            for section in &notes {
+                let version = section.get("version").and_then(Value::as_str).unwrap_or_default();
+                ui.add_space(4.0);
+                ui.label(RichText::new(version).size(14.0).strong());
+                for item in section.get("items").and_then(Value::as_array).into_iter().flatten() {
+                    if let Some(t) = item.as_str() {
+                        ui.label(format!("•  {t}"));
+                    }
+                }
+            }
+        });
         ok_only(ui, app)
     })
 }
@@ -243,6 +291,8 @@ struct FeedbackState {
     text: String,
     info: bool,
     copied: bool,
+    /// The last Open a New Issue cut the note to fit the link and copied all of it.
+    too_long: bool,
 }
 
 fn feedback(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -265,7 +315,7 @@ fn feedback(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 muted(
                     ui,
                     app,
-                    "Write your note here, then open it as a new issue on the project's public issue tracker (in your browser), or copy it.",
+                    "Feedback goes to the project's public issue tracker. Write your note here, then open a new issue with it filled in (you sign in there), or copy it.",
                 );
                 ui.add(egui::TextEdit::multiline(&mut st.text).desired_rows(6).desired_width(f32::INFINITY));
                 ui.checkbox(&mut st.info, "Include version and system information");
@@ -273,27 +323,43 @@ fn feedback(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 if st.info {
                     muted(ui, app, &about_line(&about));
                 }
-                if st.copied {
+                if st.too_long {
+                    muted(
+                        ui,
+                        app,
+                        "Your note is too long for the link, so the issue starts with its first part. The whole note is on the clipboard: paste it into the issue.",
+                    );
+                } else if st.copied {
                     muted(ui, app, "Copied to the clipboard.");
-                }
-                let mut note = st.text.clone();
-                if st.info {
-                    note.push_str("\n\n");
-                    note.push_str(&about_line(&about));
                 }
                 footer(ui, |ui| {
                     if btn(ui, "Close") {
                         return Out::Close;
                     }
-                    if primary(ui, app, !st.text.trim().is_empty(), "Open Issue Tracker") {
-                        let first = st.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(title);
-                        let url = mailcraft_engine::cmd::help::issue_url(first, &note);
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                        return Out::Close;
+                    let mut t = st.text.clone();
+                    if st.info {
+                        t.push_str("\n\n");
+                        t.push_str(&about_line(&about));
                     }
                     if btn(ui, "Copy") {
-                        ui.ctx().copy_text(note);
+                        ui.ctx().copy_text(t.clone());
                         st.copied = true;
+                    }
+                    if btn(ui, "Open a New Issue") {
+                        let title = if support {
+                            "Support request"
+                        } else if d.str("kind") == "suggestion" {
+                            "Suggestion"
+                        } else {
+                            "Feedback"
+                        };
+                        let link = mailcraft_engine::cmd::help::new_issue_link(title, &t);
+                        if !link.whole {
+                            // The link carries only the start: the whole text goes to the clipboard.
+                            ui.ctx().copy_text(t.clone());
+                            st.too_long = true;
+                        }
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(link.url));
                     }
                     Out::Keep
                 })

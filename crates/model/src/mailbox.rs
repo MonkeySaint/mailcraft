@@ -365,13 +365,32 @@ impl Mailbox {
     /// The new folder holds the same kind of items as its parent (a folder under Calendar is a calendar);
     /// under Search Folders it is a search folder. Search folders cannot have subfolders.
     pub fn create_folder(&mut self, parent: FolderId, name: &str) -> Result<FolderId> {
+        self.create_folder_of_kind(parent, name, None)
+    }
+
+    /// Like [`Mailbox::create_folder`], with what the folder contains (Create New Folder › Folder contains):
+    /// `None` inherits the parent's kind. Mail, calendar, contacts, tasks, notes and journal folders can sit
+    /// under any of those; Search Folders only hold saved searches.
+    pub fn create_folder_of_kind(
+        &mut self,
+        parent: FolderId,
+        name: &str,
+        kind: Option<FolderKind>,
+    ) -> Result<FolderId> {
         let p = self.folders.get(&parent).ok_or(ModelError::NoFolder(parent))?;
-        let kind = match p.kind {
-            FolderKind::Search => {
+        let kind = match (p.kind, kind) {
+            (FolderKind::Search, _) => {
                 return Err(ModelError::NotAllowed("search folders cannot contain folders".into()));
             }
-            FolderKind::SearchRoot => FolderKind::Search,
-            k => k,
+            (FolderKind::SearchRoot, None | Some(FolderKind::Search)) => FolderKind::Search,
+            (FolderKind::SearchRoot, Some(_)) => {
+                return Err(ModelError::NotAllowed("Search Folders only hold saved searches".into()));
+            }
+            (_, Some(FolderKind::Search | FolderKind::SearchRoot)) => {
+                return Err(ModelError::NotAllowed("make search folders with New Search Folder".into()));
+            }
+            (k, None) => k,
+            (_, Some(k)) => k,
         };
         let account = p.account;
         let name = Self::valid_name(name)?;

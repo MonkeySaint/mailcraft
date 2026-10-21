@@ -796,6 +796,91 @@ fn module_view_galleries_and_calendar_view_commands() {
     assert_eq!(app.ui.calendar_view, "day");
 }
 
+#[test]
+fn notes_change_view_lists_saved_views_and_checks_the_current_one() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let notes =
+        app.s.mailbox.folders.values().find(|f| f.kind == mailcraft_model::FolderKind::Notes).unwrap().id;
+    app.run("nav.selectFolder", serde_json::json!({"folder": notes.0})).unwrap();
+    let items = state::dyn_items(&app, Surface::Main, "views:notes");
+    assert_eq!(
+        items.iter().map(|d| (d.label.as_str(), d.on)).collect::<Vec<_>>(),
+        [("Icon", true), ("Notes List", false), ("Last 7 Days", false)]
+    );
+    app.run("view.changeView", serde_json::json!({"name": "Notes List"})).unwrap();
+    app.run("view.saveViewAs", serde_json::json!({"name": "Mine", "confirm": true})).unwrap();
+    let items = state::dyn_items(&app, Surface::Main, "views:notes");
+    assert_eq!(items.last().map(|d| (d.label.as_str(), d.on)), Some(("Mine", true)));
+    assert_eq!(items.iter().filter(|d| d.on).count(), 1);
+    // The menu's entries run Change View with the saved view's name.
+    run_entry(&mut app, Surface::Main, "notesChangeView", "Icon");
+    run_entry(&mut app, Surface::Main, "notesChangeView", "Mine");
+    let st = mailcraft_engine::cmd::view::modules::state(
+        &app.s,
+        notes,
+        mailcraft_engine::cmd::view::modules::ModuleKind::Notes,
+    );
+    assert_eq!((st.view.as_str(), st.name.as_str()), ("Notes List", "Mine"));
+    // Icon arrangement toggles follow the engine, not UI memory.
+    let mem = state::Mem::default();
+    assert!(!state::is_on(&app, Surface::Main, &mem, "notesIcon:large"), "not in the Icon view");
+    app.run("notes.iconView", serde_json::json!({"mode": "small"})).unwrap();
+    assert!(state::is_on(&app, Surface::Main, &mem, "notesIcon:small"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "notesIcon:large"));
+    // Delete, Move and Categorize wait for a selected note.
+    app.s.selection.items.clear();
+    app.s.selection.focus = None;
+    for cmd in ["notes.delete", "notes.move", "notes.categorize", "notes.forward"] {
+        assert!(state::disabled(&app, Surface::Main, cmd).is_some(), "{cmd}");
+    }
+}
+
+#[test]
+fn calendar_toggles_follow_the_calendar_view() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let mem = state::Mem::default();
+    app.s.view.module = mailcraft_engine::Module::Calendar;
+    // Month view (the default): Time Scale, Working Hours and the Daily Task List are greyed out.
+    assert!(state::is_on(&app, Surface::Main, &mem, "calview:timeScale.30"));
+    for cmd in ["calendar.timeScale", "calendar.workingHours", "calendar.dailyTaskList"] {
+        assert_eq!(state::disabled(&app, Surface::Main, cmd), Some("not available in Month view"), "{cmd}");
+    }
+    let ctx = egui::Context::default();
+    let mut m = state::Mem::default();
+    let go = |app: &mut App, m: &mut state::Mem, cmd: &str, p: serde_json::Value| {
+        state::run(&ctx, app, Surface::Main, m, &state::Action { cmd: cmd.into(), params: p, flip: None });
+    };
+    go(&mut app, &mut m, "calendar.arrange", serde_json::json!({"mode": "week"}));
+    assert!(state::disabled(&app, Surface::Main, "calendar.timeScale").is_none());
+    go(&mut app, &mut m, "calendar.timeScale", serde_json::json!({"minutes": 15}));
+    assert!(state::is_on(&app, Surface::Main, &mem, "calview:timeScale.15"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "calview:timeScale.30"));
+    // `$!on` toggles flip in one click, from the saved view.
+    let (_, act, _) = menu_entries(&app, Surface::Main, "timeScale").into_iter().next().unwrap();
+    assert_eq!(act.params, serde_json::json!({"minutes": 60}));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "calview:workingHours"));
+    go(&mut app, &mut m, "calendar.workingHours", serde_json::json!({"on": true}));
+    assert!(state::is_on(&app, Surface::Main, &mem, "calview:workingHours"));
+    go(&mut app, &mut m, "view.tighterSpacing", serde_json::json!({"on": true}));
+    assert!(state::is_on(&app, Surface::Main, &mem, "calview:tighter"));
+    go(&mut app, &mut m, "view.readingPane", serde_json::json!({"position": "right"}));
+    assert!(state::is_on(&app, Surface::Main, &mem, "calview:rp.right"));
+    // Regression: the calendar's Reading Pane menu keeps Options... ("Alt, V, P N, N").
+    let pane = menu_entries(&app, Surface::Main, "calendarReadingPane");
+    let options = pane.iter().find(|(label, _, _)| label == "Options...").map(|(_, act, _)| act.cmd.clone());
+    assert_eq!(options.as_deref(), Some("view.readingPaneOptions"));
+    assert!(state::is_on(&app, Surface::Main, &mem, "calview:dailyTaskList.normal"));
+    // Download Preferences show their state.
+    assert!(state::is_on(&app, Surface::Main, &mem, "dl:full"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "dl:headers"));
+    assert_eq!(
+        state::is_on(&app, Surface::Main, &mem, "slowHeaders"),
+        mailcraft_engine::sync::cmds::slow_headers_only(&app.s)
+    );
+    let entries = menu_entries(&app, Surface::Main, "downloadPreferences");
+    assert_eq!(entries.len(), 4);
+}
+
 /// Labels and actions of a menu as it would be drawn.
 fn menu_entries(app: &App, surface: Surface, menu: &str) -> Vec<(String, state::Action, Option<[u8; 3]>)> {
     let items = defs().menu(menu).unwrap();

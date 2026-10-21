@@ -15,7 +15,7 @@
 //! back to the grid), and so does Reset View. Positions MailCraft 0.1 kept in the folder's view state move
 //! onto the notes when the profile is loaded ([`migrate_view_positions`]).
 //!
-//! `notes.forward` sends the note's text in a new message. [`view_rows`] is the list of the Notes views
+//! `notes.forward` sends the notes attached as text files in a new message. [`view_rows`] is the list of the Notes views
 //! (Icon, Notes List, Last 7 Days).
 
 use std::collections::BTreeMap;
@@ -294,51 +294,152 @@ fn run_all_categories(s: &mut Session, p: &Value) -> CmdResult {
     crate::cmd::tasks::categories_dialog(s, p, Kind::Note)
 }
 
-/// Forward: a new message with the note's title as the subject and its text as the body (one message for
-/// all the selected notes).
+/// Longest attachment file name made from a note title (characters, before ".txt").
+const MAX_FILE_STEM: usize = 60;
+
+/// "Groceries.txt" for a note titled "Groceries": characters file systems refuse become spaces; an empty
+/// title gives "Note.txt"; `taken` names (lower case) get " (2)", " (3)"… added.
+fn attachment_name(n: &Note, taken: &mut std::collections::BTreeSet<String>) -> String {
+    let cleaned: String = title(n)
+        .chars()
+        .map(|c| if c.is_control() || "\\/:*?\"<>|".contains(c) { ' ' } else { c })
+        .take(MAX_FILE_STEM)
+        .collect();
+    let stem = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stem = stem.trim_matches('.').trim();
+    let stem = if stem.is_empty() { "Note" } else { stem };
+    let mut name = format!("{stem}.txt");
+    let mut k = 2u32;
+    while !taken.insert(name.to_lowercase()) && k < 10_000 {
+        name = format!("{stem} ({k}).txt");
+        k = k.saturating_add(1);
+    }
+    name
+}
+
+/// Forward: a new message with the note's title as the subject and each selected note attached as a text
+/// file (like forwarding the note item); `{"as": "text"}` pastes the notes' text into the body instead.
 fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
     let ids = pim::require_targets(s, p, Kind::Note)?;
+    let inline = match opt_str(p, "as") {
+        None | Some("attachment") => false,
+        Some("text") => true,
+        Some(o) => {
+            let o: String = o.chars().take(32).collect();
+            return Err(CmdError::Params(format!("`as` must be attachment or text, not `{o}`")));
+        }
+    };
     let notes: Vec<Note> = ids.iter().filter_map(|i| s.mailbox.notes.get(i)).cloned().collect();
     let subject = match notes.as_slice() {
         [one] => title(one),
         [first, rest @ ..] => format!("{} and {} more", title(first), rest.len()),
         [] => String::new(),
     };
-    let body = notes.iter().map(|n| n.text.trim_end().to_owned()).collect::<Vec<_>>().join("\n\n");
+    let body = if inline {
+        notes.iter().map(|n| n.text.trim_end().to_owned()).collect::<Vec<_>>().join("\n\n")
+    } else {
+        String::new()
+    };
+    let mut taken = std::collections::BTreeSet::new();
+    let attachments = if inline {
+        Vec::new()
+    } else {
+        notes
+            .iter()
+            .map(|n| crate::compose::ComposeAttachment {
+                filename: attachment_name(n, &mut taken),
+                mime_type: "text/plain; charset=utf-8".into(),
+                data: n.text.replace("\r\n", "\n").replace('\n', "\r\n").into_bytes(),
+            })
+            .collect()
+    };
+    let names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
     let mut compose = crate::compose::ComposeState {
         subject: mailcraft_model::subject::forward_subject(&subject),
         body: mailcraft_model::Doc::from_plain_text(&body),
+        attachments,
         dirty: true,
         ..Default::default()
     };
     crate::compose::insert_default_signature(&s.mailbox, &mut compose);
     let cid = s.open_compose(compose);
-    Ok(json!({ "compose": cid, "notes": notes.len() }))
+    Ok(json!({ "compose": cid, "notes": notes.len(), "attachments": names }))
 }
 
+/// Enabled when a note is selected, or when the params name the notes (`id` / `ids`, from a script).
 fn note_selected(s: &Session) -> Option<&'static str> {
-    if pim::selected(s, Kind::Note).is_empty() { Some("select a note first") } else { None }
+    if s.params_name_items() || !pim::selected(s, Kind::Note).is_empty() {
+        None
+    } else {
+        Some("select a note first")
+    }
 }
 
-/// Rows of the selected Notes view of `folder`: Icon in grid order (oldest first), Notes List newest
-/// first, Last 7 Days the notes changed in the last seven days, newest first. Reverse Sort reverses.
+/// Whether note `n` meets a View Settings filter (subject = the note's title, text = the rest).
+pub fn filter_matches(f: &mailcraft_model::view::ItemFilter, n: &Note, now: i64) -> bool {
+    f.matches_text(&filter_text(n, f.needs_body()), &n.categories, n.modified.unix, now)
+}
+
+/// Note `n`'s title and text prepared once for filters (`with_body`: the text too).
+fn filter_text(n: &Note, with_body: bool) -> mailcraft_model::view::FilterText {
+    let title = n.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    mailcraft_model::view::FilterText::new(title, &n.text, with_body)
+}
+
+/// Conditional Formatting of note `n` in the folder's view (the note's text is prepared once for every rule).
+pub fn row_style(s: &Session, st: &modules::ModuleView, n: &Note) -> mailcraft_model::view::ItemStyle {
+    use mailcraft_model::view::{ItemStyle, rule_style, rules_active, rules_need_body};
+    if !rules_active(&st.rules) {
+        return ItemStyle::default();
+    }
+    let now = s.now().unix;
+    let text = filter_text(n, rules_need_body(&st.rules));
+    rule_style(&st.rules, |f| f.matches_text(&text, &n.categories, n.modified.unix, now))
+}
+
+/// Sort key of a note for a Notes table column.
+fn sort_key(n: &Note, col: &str) -> (i64, String) {
+    match col {
+        "subject" => (0, title(n).to_lowercase()),
+        "categories" => (0, n.categories.join(", ").to_lowercase()),
+        "icon" => (i64::from(n.color as u8), String::new()),
+        "modified" => (n.modified.unix, String::new()),
+        _ => (n.created.unix, String::new()),
+    }
+}
+
+/// Rows of the selected Notes view of `folder`: Icon in grid order (oldest first); Notes List and Last 7 Days
+/// (the notes changed in the last seven days) sorted by the view's sort column, newest first until a column
+/// header picks another. Reverse Sort reverses. The View Settings filter applies to every view.
 pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
     let st = modules::state(s, folder, ModuleKind::Notes);
-    let since = s.now().unix.saturating_sub(7 * pim::DAY_SECS);
-    let mut v: Vec<(i64, ItemId)> = s
+    let now = s.now().unix;
+    let since = now.saturating_sub(7 * pim::DAY_SECS);
+    let filter = (!st.filter.is_empty()).then_some(&st.filter);
+    let mut v: Vec<&Note> = s
         .mailbox
         .notes
         .values()
         .filter(|n| n.folder == folder)
         .filter(|n| st.view != "Last 7 Days" || n.modified.unix >= since)
-        .map(|n| (n.created.unix, n.id))
+        .filter(|n| filter.is_none_or(|f| filter_matches(f, n, now)))
         .collect();
-    v.sort();
-    if st.view != "Icon" {
-        v.reverse();
+    if st.view == "Icon" {
+        v.sort_by_key(|n| (n.created.unix, n.id));
+    } else {
+        let col = if st.sort.is_empty() { "created" } else { st.sort.as_str() };
+        v.sort_by(|a, b| {
+            sort_key(a, col)
+                .cmp(&sort_key(b, col))
+                .then(a.created.unix.cmp(&b.created.unix))
+                .then(a.id.cmp(&b.id))
+        });
+        if modules::note_sort_descending(&st.sort) {
+            v.reverse();
+        }
     }
     let mut out: Vec<ViewRow> =
-        v.into_iter().map(|(_, id)| ViewRow { id, kind: RowKind::Note, group: None }).collect();
+        v.into_iter().map(|n| ViewRow { id: n.id, kind: RowKind::Note, group: None }).collect();
     if modules::reversed(s, folder) {
         out.reverse();
     }
@@ -372,8 +473,20 @@ pub fn grid_order(s: &Session) -> Vec<ItemId> {
     v.into_iter().map(|(_, id)| id).collect()
 }
 
-fn notes_present(s: &Session) -> Option<&'static str> {
-    if grid_order(s).is_empty() { Some("no notes to line up") } else { None }
+/// Line Up Icons: the Icon view shows large or small icons that are not lined up yet.
+fn line_up_needed(s: &Session) -> Option<&'static str> {
+    if grid_order(s).is_empty() {
+        return Some("no notes to line up");
+    }
+    let Some(f) = pim::current_folder(s, Kind::Note) else { return Some("no notes folder") };
+    let st = modules::state(s, f, ModuleKind::Notes);
+    if st.icon_mode == IconMode::List {
+        Some("not available in the list arrangement")
+    } else if st.lined_up && positions(s, f).is_empty() {
+        Some("the icons are lined up")
+    } else {
+        None
+    }
 }
 
 fn run_line_up(s: &mut Session, p: &Value) -> CmdResult {
@@ -416,7 +529,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Notes › View › Arrangement",
             r#"{"view"?: NotesViewState}"#,
             true,
-            notes_present,
+            line_up_needed,
             run_line_up,
         ),
         spec(
@@ -452,7 +565,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Notes › Home › Delete",
             r#"{"id"?: number, "ids"?: [number]}"#,
             true,
-            always,
+            note_selected,
             run_delete,
         ),
         spec(
@@ -470,7 +583,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Notes › Home › Actions › Move",
             r#"{"folder": number, "id"?: number, "ids"?: [number]}"#,
             true,
-            always,
+            note_selected,
             run_move,
         ),
         spec(
@@ -479,7 +592,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Notes › Home › Tags",
             r#"{"name": string, "on"?: bool, "clear"?: bool, "id"?: number, "ids"?: [number]}"#,
             true,
-            always,
+            note_selected,
             run_categorize,
         ),
         spec(
@@ -495,7 +608,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "notes.forward",
             "Forward",
             "Notes › Home › Actions",
-            r#"{"ids"?: [number]}"#,
+            r#"{"ids"?: [number], "as"?: "attachment" (default) | "text"}"#,
             false,
             note_selected,
             run_forward,
@@ -548,13 +661,21 @@ mod tests {
         s.selection = Selection { folder: role(&s, FolderRole::Notes), items: vec![], focus: None };
         assert!(matches!(s.run("notes.lineUpIcons", &json!({})), Err(CmdError::Disabled(_))));
         let a = s.run("notes.new", &json!({"text": "a"})).unwrap()["id"].as_u64().unwrap();
+        // Observed: Line Up Icons is unavailable while the icons are lined up.
+        assert_eq!(s.enabled("notes.lineUpIcons"), Some("the icons are lined up"));
+        s.run("notes.setPosition", &json!({"id": a, "x": 300, "y": 10})).unwrap();
+        assert!(s.enabled("notes.lineUpIcons").is_none(), "a dragged icon can be lined up");
         let r = s.run("notes.lineUpIcons", &json!({"view": {"iconMode": "large"}})).unwrap();
         assert_eq!(r["order"], json!([a]));
         assert_eq!(r["view"]["linedUp"], true);
+        assert!(s.enabled("notes.lineUpIcons").is_some(), "lined up again");
+        s.run("notes.setPosition", &json!({"id": a, "x": 300, "y": 10})).unwrap();
         assert!(matches!(
             s.run("notes.lineUpIcons", &json!({"view": {"iconMode": "list"}})),
             Err(CmdError::Disabled(_))
         ));
+        s.run("notes.iconView", &json!({"mode": "list"})).unwrap();
+        assert_eq!(s.enabled("notes.lineUpIcons"), Some("not available in the list arrangement"));
     }
 
     #[test]
@@ -570,7 +691,18 @@ mod tests {
         let r = s.run("notes.forward", &json!({})).unwrap();
         let c = &s.composes[&r["compose"].as_u64().unwrap()];
         assert_eq!(c.subject, "FW: Groceries");
+        // The note goes as an attached text file, not pasted into the body.
+        assert!(!c.body.to_plain_text().contains("eggs"));
+        assert_eq!(c.attachments.len(), 1);
+        assert_eq!(c.attachments[0].filename, "Groceries.txt");
+        assert_eq!(c.attachments[0].data, b"Groceries\r\nmilk\r\neggs".to_vec());
+        assert!(c.attachments[0].mime_type.starts_with("text/plain"));
+        // As text: the old behaviour.
+        let r = s.run("notes.forward", &json!({"as": "text"})).unwrap();
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
         assert!(c.body.to_plain_text().contains("eggs"));
+        assert!(c.attachments.is_empty());
+        assert!(matches!(s.run("notes.forward", &json!({"as": "fax"})), Err(CmdError::Params(_))));
         assert_eq!(s.run("notes.move", &json!({})).unwrap()["dialog"], "pimMove");
         assert_eq!(s.run("notes.allCategories", &json!({})).unwrap()["dialog"], "colorCategories");
         s.selection.items.clear();
@@ -584,6 +716,28 @@ mod tests {
         let id = s.run("notes.new", &json!({"text": "a"})).unwrap()["id"].as_u64().unwrap();
         let root = role(&s, FolderRole::Notes);
         let sub = s.mailbox.create_folder(root, "Ideas").unwrap();
+        // Delete, Move and Categorize are greyed out without a selected note (observed)...
+        s.selection = Selection { folder: root, items: vec![], focus: None };
+        for cmd in ["notes.delete", "notes.move", "notes.categorize"] {
+            assert_eq!(s.enabled(cmd), Some("select a note first"), "{cmd}");
+            assert!(matches!(s.run(cmd, &json!({"name": "x"})), Err(CmdError::Disabled(_))), "{cmd}");
+            assert!(
+                matches!(s.run(cmd, &json!({"id": null, "ids": []})), Err(CmdError::Disabled(_))),
+                "{cmd}"
+            );
+        }
+        // ...but a script naming the notes runs them (regression: explicit ids were refused).
+        let other = s.run("notes.new", &json!({"text": "b"})).unwrap()["id"].as_u64().unwrap();
+        s.selection = Selection { folder: root, items: vec![], focus: None };
+        s.run("notes.categorize", &json!({"ids": [other], "name": "Blue category"})).unwrap();
+        assert_eq!(s.mailbox.notes[&ItemId(other)].categories, vec!["Blue category".to_owned()]);
+        s.run("notes.move", &json!({"id": other, "folder": sub.0})).unwrap();
+        assert_eq!(s.mailbox.notes[&ItemId(other)].folder, sub);
+        s.run("notes.delete", &json!({"ids": [other]})).unwrap();
+        assert_eq!(s.mailbox.notes[&ItemId(other)].folder, role(&s, FolderRole::DeletedItems));
+        assert!(!s.params_name_items(), "only set while an enabled check runs");
+        assert_eq!(s.enabled("notes.delete"), Some("select a note first"));
+        s.selection = Selection { folder: root, items: vec![ItemId(id)], focus: Some(ItemId(id)) };
         s.run("notes.copy", &json!({"id": id, "folder": sub.0})).unwrap();
         s.run("notes.move", &json!({"id": id, "folder": sub.0})).unwrap();
         assert_eq!(s.mailbox.notes[&ItemId(id)].folder, sub);
@@ -592,7 +746,7 @@ mod tests {
         assert!(s.mailbox.notes[&ItemId(id)].categories.is_empty());
         s.run("notes.delete", &json!({"id": id})).unwrap();
         assert_eq!(s.mailbox.notes[&ItemId(id)].folder, role(&s, FolderRole::DeletedItems));
-        assert!(matches!(s.run("notes.delete", &json!({"id": 424_242})), Err(CmdError::Params(_))));
+        assert!(s.run("notes.delete", &json!({"id": 424_242})).is_err());
     }
 
     #[test]
@@ -602,7 +756,6 @@ mod tests {
         s.selection = Selection { folder, items: vec![], focus: None };
         let a = s.run("notes.new", &json!({"text": "A"})).unwrap()["id"].as_u64().unwrap();
         let b = s.run("notes.new", &json!({"text": "B"})).unwrap()["id"].as_u64().unwrap();
-        s.run("notes.lineUpIcons", &json!({})).unwrap();
         assert!(stored_view(&s).lined_up);
         s.run("notes.setPosition", &json!({"id": a, "x": 420.5, "y": 30})).unwrap();
         s.run("notes.setPosition", &json!({"id": b, "x": 0, "y": 900})).unwrap();
@@ -638,6 +791,7 @@ mod tests {
         }
         // A deleted note leaves the folder's positions.
         s.run("notes.setPosition", &json!({"id": a, "x": 5, "y": 5})).unwrap();
+        s.selection.items = vec![ItemId(a)];
         s.run("notes.delete", &json!({"id": a})).unwrap();
         assert!(positions(&s, folder).is_empty());
         // Damaged values on a note read as "on the grid".

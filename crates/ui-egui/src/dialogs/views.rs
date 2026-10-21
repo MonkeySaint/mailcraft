@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::common::{self, Dlg, Out, btn, btn_en, footer, muted, ok_cancel, primary, window, with_state};
 use crate::App;
 use mailcraft_engine::cmd::view::mail::{self as mailview, CustomFilter, FormatRule, RuleFont};
-use mailcraft_engine::cmd::view::modules::{self, ModuleKind};
+use mailcraft_engine::cmd::view::modules::ModuleKind;
 use mailcraft_engine::cmd::view::table;
 use mailcraft_engine::queries::view_settings;
 use mailcraft_model::FolderId;
@@ -1133,6 +1133,7 @@ fn manage_mail_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 /// with where they can be used; New, Copy, Modify, Rename, Reset, Delete and Apply View
 /// (`view.manageViews` with `op`).
 fn manage_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    use mailcraft_engine::cmd::view::modules;
     let uid = d.uid;
     let folder = folder_of(app, d);
     let Some(kind) = modules::module_kind(&app.s, folder) else {
@@ -1539,6 +1540,45 @@ mod tests {
         h.get_by_label("Delete").click();
         h.run_steps(2);
         assert!(mailview::saved_views(&h.state().s).is_empty());
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(h.query_by_label("Manage All Views").is_none());
+    }
+
+    #[test]
+    fn module_manage_views_copy_rename_and_delete() {
+        use mailcraft_engine::cmd::view::modules;
+        let mut h = harness();
+        let notes = h
+            .state()
+            .s
+            .mailbox
+            .folders
+            .values()
+            .find(|f| f.kind == mailcraft_model::FolderKind::Notes)
+            .unwrap()
+            .id;
+        h.state_mut().run("nav.selectFolder", json!({"folder": notes.0})).unwrap();
+        open(&mut h, "view.manageViews", json!({}));
+        assert!(h.query_by_label("Manage All Views").is_some());
+        assert!(h.query_by_label("New...").is_some(), "New is offered");
+        h.get_by_label("Copy...").click();
+        h.run();
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        let names = |h: &Harness<'static, App>| -> Vec<String> {
+            modules::saved_views(&h.state().s, notes).into_iter().map(|v| v.name).collect()
+        };
+        assert_eq!(names(&h), ["Copy of Icon"]);
+        h.run_steps(6);
+        h.get_by_label("Rename...").click();
+        h.run();
+        assert!(h.query_by_label("Rename View").is_some());
+        h.get_by_label("Cancel").click();
+        h.run_steps(6);
+        h.get_by_label("Delete").click();
+        h.run_steps(2);
+        assert!(names(&h).is_empty());
         h.get_by_label("Close").click();
         h.run();
         assert!(h.query_by_label("Manage All Views").is_none());

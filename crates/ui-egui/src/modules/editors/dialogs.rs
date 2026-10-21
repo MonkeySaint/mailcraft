@@ -13,6 +13,7 @@ use egui::{ComboBox, Id, RichText, ScrollArea, TextEdit, Ui, vec2};
 use serde_json::{Value, json};
 
 use mailcraft_model::FolderKind;
+use mailcraft_model::view::{ItemFilter, ItemRule};
 
 use super::super::common::{ModState, day_string, day_time_string, parse_day, run_checked, today};
 use super::{STATUSES, date_field, error_line, recurrence_choices, time_combo};
@@ -55,7 +56,7 @@ pub(crate) enum Kind {
         folder: Option<u64>,
     },
     Flag(FlagForm),
-    ViewSettings(ViewForm),
+    ViewSettings(Box<ViewForm>),
     ApplyView {
         noun: String,
         folders: Vec<(u64, String)>,
@@ -64,8 +65,9 @@ pub(crate) enum Kind {
     },
     SaveView {
         name: String,
+        noun: String,
+        all_text: String,
         all: bool,
-        all_label: String,
     },
     MailMerge(MergeForm),
     TaskRequest(RequestForm),
@@ -111,6 +113,17 @@ pub(crate) struct ViewForm {
     pub table: Option<TableSummary>,
     /// Opened from Manage All Views › Modify on this saved view: OK stores the view into it.
     pub saved_view: String,
+    /// The view Change View checks (a saved view's name, else the built-in view).
+    pub current: String,
+    /// Notes tables: sort column ("" = the view's own order), columns shown and every column (key, label).
+    pub sort: String,
+    pub columns: Vec<String>,
+    pub all_columns: Vec<(String, String)>,
+    /// Filter, Other Settings and Conditional Formatting.
+    pub filter: ItemFilter,
+    pub auto_preview: bool,
+    pub grid_lines: bool,
+    pub rules: Vec<ItemRule>,
     /// Values when the dialog opened (only changes are applied).
     pub initial: Box<Option<ViewForm>>,
 }
@@ -123,6 +136,18 @@ pub(crate) struct TableSummary {
     pub filter: String,
     pub rules: String,
     pub formats: String,
+}
+
+impl ViewForm {
+    /// True when the advanced settings (columns, sort, filter, other settings, rules) differ from `o`.
+    fn advanced_changed(&self, o: &ViewForm) -> bool {
+        self.sort != o.sort
+            || self.columns != o.columns
+            || self.filter != o.filter
+            || self.auto_preview != o.auto_preview
+            || self.grid_lines != o.grid_lines
+            || self.rules != o.rules
+    }
 }
 
 #[derive(Clone, Default)]
@@ -231,10 +256,37 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
                     },
                 ),
                 saved_view: str_of(p, "savedView"),
+                current: str_of(p, "current"),
+                sort: str_of(p, "sort"),
+                columns: strings_of(p, "columns"),
+                all_columns: p
+                    .get("allColumns")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| {
+                                Some((
+                                    x.get("key")?.as_str()?.to_owned(),
+                                    x.get("label")?.as_str()?.to_owned(),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                filter: p
+                    .get("filter")
+                    .and_then(|v| serde_json::from_value::<ItemFilter>(v.clone()).ok())
+                    .unwrap_or_default(),
+                auto_preview: p.get("autoPreview").and_then(Value::as_bool).unwrap_or(true),
+                grid_lines: p.get("gridLines").and_then(Value::as_bool).unwrap_or(true),
+                rules: p
+                    .get("rules")
+                    .and_then(|v| serde_json::from_value::<Vec<ItemRule>>(v.clone()).ok())
+                    .unwrap_or_default(),
                 initial: Box::new(None),
             };
             f.initial = Box::new(Some(f.clone()));
-            Kind::ViewSettings(f)
+            Kind::ViewSettings(Box::new(f))
         }
         "applyModuleView" => Kind::ApplyView {
             noun: str_of(p, "noun"),
@@ -250,9 +302,12 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
             picked: BTreeSet::new(),
             subfolders: false,
         },
-        "saveModuleView" => {
-            Kind::SaveView { name: str_of(p, "name"), all: false, all_label: str_of(p, "allFolders") }
-        }
+        "saveModuleView" => Kind::SaveView {
+            name: str_of(p, "name"),
+            noun: str_of(p, "noun"),
+            all_text: str_of(p, "allFolders"),
+            all: false,
+        },
         "mailMerge" => Kind::MailMerge(MergeForm {
             contacts: if str_of(p, "contacts") == "selected" { "selected".into() } else { "all".into() },
             // E-mail is the output MailCraft can produce.
@@ -389,7 +444,7 @@ fn draw(ctx: &egui::Context, app: &mut App, d: &mut Dialog) -> bool {
             Kind::ApplyView { noun, folders, picked, subfolders, .. } => {
                 apply_ui(ui, noun, folders, picked, subfolders)
             }
-            Kind::SaveView { name, all, all_label, .. } => save_ui(ui, name, all, all_label),
+            Kind::SaveView { name, noun, all_text, all } => save_ui(ui, name, noun, all_text, all),
             Kind::MailMerge(f) => merge_ui(ui, app, f, nonce),
             Kind::TaskRequest(f) => request_ui(ui, app, f, nonce),
             Kind::DeleteRequest { subject, choice, .. } => {
@@ -464,7 +519,7 @@ fn move_ui(
         // New Folder: a folder of this kind under the one picked (or the current one).
         if ui.button("New...").clicked() {
             let parent = folder.or(Some(app.s.selection.folder.0));
-            let contains = mailcraft_engine::cmd::folder::contents_name(kind);
+            let contains = mailcraft_engine::cmd::folder::contents_key(kind);
             crate::dialogs::open(app, "createFolder", json!({ "parent": parent, "contains": contains }));
         }
         let b = ok_cancel(ui, "OK", folder.is_some());
@@ -650,6 +705,9 @@ fn view_ui(ui: &mut Ui, app: &mut App, f: &mut ViewForm, nonce: u64) -> Btn {
         ui.checkbox(&mut f.spacing, "Use tighter spacing");
         ui.end_row();
     });
+    if f.module == "notes" {
+        advanced_ui(ui, f, nonce);
+    }
     ui.separator();
     ui.horizontal(|ui| {
         if ui.button("Reset Current View").clicked() {
@@ -661,6 +719,140 @@ fn view_ui(ui: &mut Ui, app: &mut App, f: &mut ViewForm, nonce: u64) -> Btn {
         }
     });
     out
+}
+
+/// Colours offered by Conditional Formatting (label, "#rrggbb"; "" = the list's own).
+const RULE_COLORS: [(&str, &str); 7] = [
+    ("Automatic", ""),
+    ("Red", "#c42b1c"),
+    ("Orange", "#ca5010"),
+    ("Green", "#107c10"),
+    ("Blue", "#0f6cbd"),
+    ("Purple", "#8764b8"),
+    ("Gray", "#8a8886"),
+];
+
+/// Columns, Sort, Filter, Other Settings and Conditional Formatting of a Notes table view.
+fn advanced_ui(ui: &mut Ui, f: &mut ViewForm, nonce: u64) {
+    let table = f.view != "Icon";
+    egui::CollapsingHeader::new("Columns").id_salt(("mc-viewset-cols", nonce)).show(ui, |ui| {
+        if !table {
+            ui.label(RichText::new("Columns apply to the Notes List and Last 7 Days views.").weak());
+        }
+        ui.add_enabled_ui(table, |ui| {
+            for (key, label) in f.all_columns.clone() {
+                let mut on = f.columns.contains(&key);
+                let fixed = key == "subject";
+                if ui.add_enabled(!fixed, egui::Checkbox::new(&mut on, &label)).changed() {
+                    if on {
+                        // Keep the dialog's column order.
+                        let order: Vec<String> = f.all_columns.iter().map(|(k, _)| k.clone()).collect();
+                        f.columns.push(key.clone());
+                        f.columns.sort_by_key(|c| order.iter().position(|k| k == c).unwrap_or(usize::MAX));
+                    } else {
+                        f.columns.retain(|c| *c != key);
+                    }
+                }
+            }
+        });
+    });
+    egui::CollapsingHeader::new("Sort").id_salt(("mc-viewset-sort", nonce)).show(ui, |ui| {
+        ui.add_enabled_ui(table, |ui| {
+            let cur = f
+                .all_columns
+                .iter()
+                .find(|(k, _)| *k == f.sort)
+                .map_or("Created (newest first)".to_owned(), |(_, l)| l.clone());
+            ui.horizontal(|ui| {
+                ui.label("Sort items by");
+                ComboBox::from_id_salt(("mc-viewset-sortby", nonce)).selected_text(cur).width(200.0).show_ui(
+                    ui,
+                    |ui| {
+                        ui.selectable_value(&mut f.sort, String::new(), "Created (newest first)");
+                        for (k, l) in f.all_columns.clone() {
+                            ui.selectable_value(&mut f.sort, k, l);
+                        }
+                    },
+                );
+            });
+        });
+    });
+    let filter_title = format!("Filter: {}", f.filter.describe());
+    egui::CollapsingHeader::new(filter_title).id_salt(("mc-viewset-filter", nonce)).show(ui, |ui| {
+        filter_ui(ui, &mut f.filter, ("mc-viewset-filter-grid", nonce));
+        if ui.button("Clear All").clicked() {
+            f.filter = ItemFilter::default();
+        }
+    });
+    egui::CollapsingHeader::new("Other Settings").id_salt(("mc-viewset-other", nonce)).show(ui, |ui| {
+        ui.add_enabled_ui(table, |ui| {
+            ui.checkbox(&mut f.auto_preview, "AutoPreview (the note text under each row)");
+            ui.checkbox(&mut f.grid_lines, "Grid lines between rows");
+        });
+    });
+    egui::CollapsingHeader::new("Conditional Formatting").id_salt(("mc-viewset-rules", nonce)).show(
+        ui,
+        |ui| {
+            let mut remove = None;
+            for (i, r) in f.rules.iter_mut().enumerate() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut r.on, "");
+                        ui.add(TextEdit::singleline(&mut r.name).desired_width(160.0).hint_text("Rule name"));
+                        if ui.small_button("Delete").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    filter_ui(ui, &mut r.filter, ("mc-viewset-rule", nonce, i));
+                    ui.horizontal(|ui| {
+                        ui.label("Font");
+                        ui.checkbox(&mut r.bold, "Bold");
+                        ui.checkbox(&mut r.italic, "Italic");
+                        ui.checkbox(&mut r.strike, "Strikethrough");
+                        let cur =
+                            RULE_COLORS.iter().find(|(_, h)| *h == r.color).map_or("Automatic", |(l, _)| *l);
+                        ComboBox::from_id_salt(("mc-viewset-rule-color", nonce, i))
+                            .selected_text(cur)
+                            .show_ui(ui, |ui| {
+                                for (l, h) in RULE_COLORS {
+                                    ui.selectable_value(&mut r.color, h.to_owned(), l);
+                                }
+                            });
+                    });
+                });
+            }
+            if let Some(i) = remove
+                && i < f.rules.len()
+            {
+                f.rules.remove(i);
+            }
+            if ui.add_enabled(f.rules.len() < 32, egui::Button::new("Add")).clicked() {
+                let n = f.rules.len().saturating_add(1);
+                f.rules.push(ItemRule { name: format!("Untitled {n}"), on: true, ..Default::default() });
+            }
+        },
+    );
+}
+
+/// The conditions of an [`ItemFilter`]: words (subject, or subject and text), category, days.
+fn filter_ui(ui: &mut Ui, f: &mut ItemFilter, id: impl std::hash::Hash + std::fmt::Debug) {
+    egui::Grid::new(id).num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+        let l = ui.label("Search for the word(s)");
+        ui.add(TextEdit::singleline(&mut f.words).desired_width(220.0)).labelled_by(l.id);
+        ui.end_row();
+        ui.label("");
+        ui.checkbox(&mut f.in_body, "Also in the note text");
+        ui.end_row();
+        let l = ui.label("Category");
+        ui.add(TextEdit::singleline(&mut f.category).desired_width(220.0)).labelled_by(l.id);
+        ui.end_row();
+        ui.label("Changed within");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut f.days).range(0..=36_500));
+            ui.label(if f.days == 0 { "days (any time)" } else { "days" });
+        });
+        ui.end_row();
+    });
 }
 
 fn apply_ui(
@@ -693,17 +885,16 @@ fn apply_ui(
     ok_cancel(ui, "OK", !picked.is_empty())
 }
 
-fn save_ui(ui: &mut Ui, name: &mut String, all: &mut bool, all_label: &str) -> Btn {
+fn save_ui(ui: &mut Ui, name: &mut String, noun: &str, all_text: &str, all: &mut bool) -> Btn {
     let l = ui.label("Name of new view:");
     let r = ui.add(TextEdit::singleline(name).desired_width(260.0)).labelled_by(l.id);
     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !name.trim().is_empty() {
         return Btn::Ok;
     }
     ui.label("Can be used on:");
-    ui.radio_value(all, false, "This folder");
-    if !all_label.is_empty() {
-        ui.radio_value(all, true, all_label);
-    }
+    ui.radio_value(all, false, format!("This {} folder", noun.to_lowercase()));
+    let every = if all_text.is_empty() { format!("All {noun} folders") } else { all_text.to_owned() };
+    ui.radio_value(all, true, every);
     ok_cancel(ui, "OK", !name.trim().is_empty())
 }
 
@@ -967,8 +1158,30 @@ fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
             if f.spacing != init.spacing {
                 run_checked(app, "view.tighterSpacing", json!({}))?;
             }
+            if f.module == "notes" && f.advanced_changed(&init) {
+                let rules: Vec<ItemRule> =
+                    f.rules.iter().filter(|r| !r.name.trim().is_empty()).cloned().collect();
+                run_checked(
+                    app,
+                    "view.viewSettings",
+                    json!({
+                        "sort": f.sort,
+                        "columns": f.columns,
+                        "filter": f.filter,
+                        "rules": rules,
+                        "autoPreview": f.auto_preview,
+                        "gridLines": f.grid_lines,
+                    }),
+                )?;
+            }
+            // Opened from Manage All Views › Modify: OK stores the view into that saved view. Otherwise a saved
+            // view that shows keeps what was changed while it shows.
+            let saved_shown =
+                !f.current.is_empty() && !f.views.iter().any(|v| v.eq_ignore_ascii_case(&f.current));
             if !f.saved_view.is_empty() {
                 run_checked(app, "view.manageViews", json!({ "op": "update", "name": f.saved_view }))?;
+            } else if saved_shown && f.view == init.view {
+                run_checked(app, "view.manageViews", json!({ "op": "update", "name": f.current }))?;
             }
             Ok(true)
         }
@@ -1162,6 +1375,39 @@ mod tests {
     }
 
     #[test]
+    fn notes_view_settings_apply_advanced_parts_and_keep_them_in_a_saved_view() {
+        use mailcraft_engine::cmd::view::modules::{self, ModuleKind};
+        let mut app = app();
+        let notes =
+            app.s.mailbox.folders.values().find(|f| f.kind == FolderKind::Notes).map(|f| f.id).unwrap();
+        app.run("nav.selectFolder", json!({"folder": notes.0}));
+        app.run("view.changeView", json!({"name": "Notes List"}));
+        app.run("view.saveViewAs", json!({"name": "Mine", "confirm": true}));
+        app.run("view.viewSettings", json!({}));
+        let mut st = ModState::default();
+        let Some(mailcraft_engine::Notice::OpenDialog(name, p)) = app.s.notices.last().cloned() else {
+            panic!("no dialog")
+        };
+        open(&app, &mut st, &name, &p);
+        let Some(Dialog { kind: Kind::ViewSettings(mut f), .. }) = st.dialogs.open.pop() else {
+            panic!("no view settings form")
+        };
+        assert_eq!(f.current, "Mine");
+        assert_eq!(f.columns, vec!["icon", "subject", "created", "categories"]);
+        f.columns.retain(|c| c != "categories");
+        f.filter.words = "wifi".into();
+        f.grid_lines = false;
+        f.rules.push(ItemRule { name: "Guests".into(), on: true, bold: true, ..Default::default() });
+        assert_eq!(apply(&mut app, &mut Kind::ViewSettings(f)), Ok(true));
+        let st = modules::state(&app.s, notes, ModuleKind::Notes);
+        assert_eq!(st.columns, vec!["icon", "subject", "created"]);
+        assert_eq!(st.filter.words, "wifi");
+        assert!(st.no_grid);
+        let saved = modules::saved_views(&app.s, notes).into_iter().find(|v| v.name == "Mine").unwrap();
+        assert_eq!(saved.state.filter.words, "wifi", "the saved view shown keeps the changes");
+    }
+
+    #[test]
     fn task_request_and_view_settings_apply() {
         let mut app = app();
         let mut k = Kind::TaskRequest(RequestForm {
@@ -1199,7 +1445,7 @@ mod tests {
         f.arrange = Some("importance".into());
         f.reverse = true;
         f.initial = Box::new(Some(init));
-        assert_eq!(apply(&mut app, &mut Kind::ViewSettings(f)), Ok(true));
+        assert_eq!(apply(&mut app, &mut Kind::ViewSettings(Box::new(f))), Ok(true));
         let st = mailcraft_engine::cmd::view::modules::state(
             &app.s,
             tasks,

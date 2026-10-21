@@ -211,6 +211,15 @@ impl CalendarColumn {
         CalendarColumn::Categories,
         CalendarColumn::Calendar,
     ];
+    /// Columns of a table nobody changed (Calendar shows when several calendars are listed).
+    pub const DEFAULT: [CalendarColumn; 6] = [
+        CalendarColumn::Subject,
+        CalendarColumn::Location,
+        CalendarColumn::Start,
+        CalendarColumn::End,
+        CalendarColumn::Recurrence,
+        CalendarColumn::Categories,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             CalendarColumn::Subject => "Subject",
@@ -266,6 +275,57 @@ pub struct CalendarViewState {
     pub reading_pane: crate::ReadingPanePos,
     /// View › Layout › Use Tighter Spacing.
     pub tighter_spacing: bool,
+    /// View Settings › Columns of the List / Active tables, in order (empty = [`CalendarColumn::DEFAULT`]).
+    pub columns: Vec<CalendarColumn>,
+    /// View Settings › Group By of the List / Active tables (`None` = no groups).
+    pub group_by: Option<CalendarColumn>,
+    /// View Settings › Filter (List / Active tables).
+    pub filter: crate::view::ItemFilter,
+    /// View Settings › Conditional Formatting (List / Active tables).
+    pub rules: Vec<crate::view::ItemRule>,
+    /// View Settings › Other Settings: no grid lines between table rows.
+    pub no_grid: bool,
+    /// View Settings › Format Columns: header labels set by hand (column name → label).
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// Longest Format Columns label (characters).
+pub const MAX_COLUMN_LABEL: usize = 64;
+
+impl CalendarViewState {
+    /// The table settings cleaned up (duplicate columns, overlong labels, unnamed rules).
+    pub fn sanitize_table(&mut self) {
+        let mut seen = Vec::new();
+        self.columns.retain(|c| {
+            let fresh = !seen.contains(c);
+            seen.push(*c);
+            fresh
+        });
+        if self.columns == CalendarColumn::DEFAULT {
+            self.columns.clear();
+        }
+        self.filter = std::mem::take(&mut self.filter).sanitized();
+        self.rules = crate::view::sanitize_rules(std::mem::take(&mut self.rules));
+        self.labels = std::mem::take(&mut self.labels)
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let col = CalendarColumn::parse(&k)?;
+                let label: String =
+                    v.trim().chars().filter(|c| !c.is_control()).take(MAX_COLUMN_LABEL).collect();
+                (!label.is_empty() && label != col.label()).then(|| (col.name().to_owned(), label))
+            })
+            .collect();
+    }
+
+    /// Columns of the List / Active tables (its own, else the defaults).
+    pub fn table_columns(&self) -> Vec<CalendarColumn> {
+        if self.columns.is_empty() { CalendarColumn::DEFAULT.to_vec() } else { self.columns.clone() }
+    }
+
+    /// Header label of column `c` (Format Columns, else the column's name).
+    pub fn column_label(&self, c: CalendarColumn) -> String {
+        self.labels.get(c.name()).cloned().unwrap_or_else(|| c.label().to_owned())
+    }
 }
 
 impl Default for CalendarViewState {
@@ -283,6 +343,12 @@ impl Default for CalendarViewState {
             ascending: true,
             reading_pane: crate::ReadingPanePos::Off,
             tighter_spacing: false,
+            columns: Vec::new(),
+            group_by: None,
+            filter: crate::view::ItemFilter::default(),
+            rules: Vec::new(),
+            no_grid: false,
+            labels: std::collections::BTreeMap::new(),
         }
     }
 }

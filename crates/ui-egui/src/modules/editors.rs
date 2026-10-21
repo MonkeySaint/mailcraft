@@ -2691,11 +2691,17 @@ fn note_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             }
         }
         Act::Delete => {
-            app.run("notes.delete", json!({ "id": ed.id }));
-            if app.ui.module_selection == Some(ed.id) {
-                select_item(app, None);
+            // Delete acts on the selection: the window's note becomes the selected one.
+            select_item(app, Some(ed.id));
+            match run_checked(app, "notes.delete", json!({ "id": ed.id })) {
+                Ok(_) => {
+                    if app.ui.module_selection == Some(ed.id) {
+                        select_item(app, None);
+                    }
+                    return;
+                }
+                Err(e) => ed.error = Some(e),
             }
-            return;
         }
         Act::Close => return,
         _ => {}

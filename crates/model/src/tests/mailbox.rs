@@ -185,6 +185,21 @@ fn favorites_default_order_and_editing() {
 }
 
 #[test]
+fn create_folder_of_kind_picks_what_it_contains() {
+    let (mut m, a) = mb();
+    let inbox = role(&m, a, FolderRole::Inbox);
+    let cal = m.create_folder_of_kind(inbox, "Rota", Some(FolderKind::Calendar)).unwrap();
+    assert_eq!(m.folder(cal).unwrap().kind, FolderKind::Calendar);
+    let sub = m.create_folder_of_kind(cal, "Sub", None).unwrap();
+    assert_eq!(m.folder(sub).unwrap().kind, FolderKind::Calendar, "inherits without a kind");
+    let notes = m.create_folder_of_kind(cal, "Jots", Some(FolderKind::Notes)).unwrap();
+    assert_eq!(m.folder(notes).unwrap().kind, FolderKind::Notes);
+    // Search folders keep their own rules.
+    assert!(m.create_folder_of_kind(inbox, "S", Some(FolderKind::Search)).is_err());
+    assert!(m.create_folder_of_kind(inbox, "R", Some(FolderKind::SearchRoot)).is_err());
+}
+
+#[test]
 fn create_folder_validation() {
     let (mut m, a) = mb();
     let inbox = role(&m, a, FolderRole::Inbox);

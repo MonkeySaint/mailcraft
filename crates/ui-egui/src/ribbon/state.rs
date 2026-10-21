@@ -224,6 +224,8 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
             app.ui.calendar_view.eq_ignore_ascii_case(arg)
                 || (app.ui.calendar_view.is_empty() && arg == "month")
         }
+        "calview" => calview_on(app, arg),
+        "notesIcon" => notes_icon_on(app, arg),
         _ => compose(app, surface).is_some_and(|c| compose_on(c, name, arg)),
     }
 }
@@ -763,6 +765,51 @@ fn module_view_items(app: &App, kind: mailcraft_engine::cmd::view::modules::Modu
         .collect()
 }
 
+/// The Calendar's view as the engine keeps it for the current calendar (the default view before any change).
+fn calendar_view_state(app: &App) -> mailcraft_model::calendar::CalendarViewState {
+    mailcraft_engine::cmd::calendar::views::saved_view(&app.s).map(|(v, _)| v).unwrap_or_default()
+}
+
+/// `calview:<part>`: the Calendar view's toggles and choices (`overlay`, `workingHours`, `tighter`,
+/// `timeScale.<minutes>`, `rp.<right|bottom|off>`, `dailyTaskList.<normal|minimized|off>`).
+fn calview_on(app: &App, arg: &str) -> bool {
+    use mailcraft_model::calendar::DailyTaskList;
+    let v = calendar_view_state(app);
+    let (part, value) = arg.split_once('.').unwrap_or((arg, ""));
+    match part {
+        "overlay" => v.overlay,
+        "workingHours" => v.working_hours,
+        "tighter" => v.tighter_spacing,
+        "timeScale" => value.parse::<u8>().is_ok_and(|m| m == v.time_scale),
+        "rp" => matches!(
+            (value, v.reading_pane),
+            ("right", ReadingPanePos::Right)
+                | ("bottom", ReadingPanePos::Bottom)
+                | ("off", ReadingPanePos::Off)
+        ),
+        "dailyTaskList" => matches!(
+            (value, v.daily_task_list),
+            ("normal", DailyTaskList::Normal)
+                | ("minimized", DailyTaskList::Minimized)
+                | ("off", DailyTaskList::Off)
+        ),
+        _ => false,
+    }
+}
+
+/// `notesIcon:<large|small|list>`: the Notes folder shows its Icon view with that arrangement.
+fn notes_icon_on(app: &App, arg: &str) -> bool {
+    use mailcraft_engine::cmd::notes::IconMode;
+    use mailcraft_engine::cmd::view::modules;
+    let folder = app.s.selection.folder;
+    let Some((modules::ModuleKind::Notes, st)) = modules::current(&app.s, folder) else { return false };
+    st.view == "Icon"
+        && matches!(
+            (arg, st.icon_mode),
+            ("large", IconMode::Large) | ("small", IconMode::Small) | ("list", IconMode::List)
+        )
+}
+
 /// Items of a dynamic source.
 pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
     let plain = |label: &str, icon: &'static str| DynItem {
@@ -1106,6 +1153,13 @@ pub fn disabled(app: &App, surface: Surface, cmd: &str) -> Option<&'static str> 
         } else {
             Some("the message is no longer available")
         };
+    }
+    // Calendar view commands that do not apply to the arrangement shown (Time Scale in Month view).
+    if surface == Surface::Main
+        && app.s.view.module == Module::Calendar
+        && let Some(why) = mailcraft_engine::cmd::calendar::view_enabled(&calendar_view_state(app), cmd)
+    {
+        return Some(why);
     }
     app.s.enabled(cmd)
 }

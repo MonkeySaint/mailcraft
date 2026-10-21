@@ -675,6 +675,7 @@ fn view_param(s: &mut Session, p: &Value) -> Result<CalendarViewState, CmdError>
     if !TIME_SCALES.contains(&v.time_scale) {
         v.time_scale = 30;
     }
+    v.sanitize_table();
     Ok(v)
 }
 
@@ -960,7 +961,7 @@ fn create_calendar(s: &mut Session, parent: FolderId, name: &str) -> Result<Fold
     let mut last = None;
     for n in 1..=50u32 {
         let candidate = if n == 1 { base.clone() } else { format!("{base} ({n})") };
-        match s.mailbox.create_folder(parent, &candidate) {
+        match s.mailbox.create_folder_of_kind(parent, &candidate, Some(FolderKind::Calendar)) {
             Ok(id) => return Ok(id),
             Err(e) => last = Some(e),
         }
@@ -968,13 +969,16 @@ fn create_calendar(s: &mut Session, parent: FolderId, name: &str) -> Result<Fold
     Err(last.map_or_else(|| CmdError::Failed("could not create the calendar".into()), CmdError::from))
 }
 
-/// Where Add Calendar puts new calendars: `params.parent` when it is a calendar, else the default calendar.
+/// Where Add Calendar puts new calendars: `params.parent` (any folder that can hold folders, like Create New
+/// Folder's "Select where to place the folder"), else the default calendar.
 fn calendar_parent(s: &Session, p: &Value) -> Result<FolderId, CmdError> {
     if let Some(f) = opt_u64(p, "parent").map(FolderId) {
-        return if pim::is_kind_folder(s, f, Kind::Appointment) {
-            Ok(f)
-        } else {
-            Err(CmdError::Params(format!("folder {} is not a calendar", f.0)))
+        return match s.mailbox.folder(f).map(|x| x.kind) {
+            None => Err(CmdError::Params(format!("no such folder {}", f.0))),
+            Some(FolderKind::Search | FolderKind::SearchRoot) => {
+                Err(CmdError::Params("a calendar cannot go under Search Folders".into()))
+            }
+            Some(_) => Ok(f),
         };
     }
     pim::default_folder(s, Kind::Appointment)

@@ -67,14 +67,19 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
                 s.notify(crate::Notice::OpenDialog(SAVE_VIEW_DIALOG.into(), json!({})));
                 extra.insert("dialog".into(), json!(SAVE_VIEW_DIALOG));
             } else {
-                store_named(s, &name, &v, None)?;
+                let holder = scope_folder(s, p)?;
+                store_named(s, &name, &v, None, Some(holder))?;
                 extra.insert("saved".into(), json!(name));
             }
         }
         "view.manageViews" => match opt_str(p, "action") {
             None => {
                 let names = view_names(s);
-                s.notify(crate::Notice::OpenDialog(MANAGE_VIEWS_DIALOG.into(), json!({ "views": names })));
+                let rows = view_rows(s);
+                s.notify(crate::Notice::OpenDialog(
+                    MANAGE_VIEWS_DIALOG.into(),
+                    json!({ "views": names, "rows": rows }),
+                ));
                 extra.insert("dialog".into(), json!(MANAGE_VIEWS_DIALOG));
                 extra.insert("views".into(), json!(names));
             }
@@ -83,9 +88,23 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
                 let new_name = opt_str(p, "newName").unwrap_or("").trim().to_owned();
                 match action {
                     "apply" => v = apply_named(s, &v, &name)?,
+                    "new" => {
+                        // A view of the chosen kind with the standard settings.
+                        let base = match opt_str(p, "base") {
+                            Some(b) => CalendarCurrentView::parse(b).ok_or_else(|| {
+                                CmdError::Params("`base` must be Calendar, Preview, List or Active".into())
+                            })?,
+                            None => CalendarCurrentView::Calendar,
+                        };
+                        let fresh = CalendarViewState { current: base, ..CalendarViewState::default() };
+                        let holder = scope_folder(s, p)?;
+                        let target = if new_name.is_empty() { name.clone() } else { new_name.clone() };
+                        store_named(s, &target, &fresh, None, Some(holder))?;
+                    }
                     "copy" => {
                         let source = apply_named(s, &v, &name)?;
-                        store_named(s, &new_name, &source, None)?;
+                        let holder = scope_folder(s, p)?;
+                        store_named(s, &new_name, &source, None, Some(holder))?;
                     }
                     "rename" => {
                         let source = apply_named(s, &v, &name)?;
@@ -94,7 +113,29 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
                                 "the standard view `{name}` cannot be renamed"
                             )));
                         }
-                        store_named(s, &new_name, &source, Some(&name))?;
+                        store_named(s, &new_name, &source, Some(&name), None)?;
+                    }
+                    "update" => {
+                        // Modify: the named view takes the calendar's current settings.
+                        if CalendarCurrentView::parse(&name).is_some() {
+                            return Err(CmdError::Params(format!(
+                                "the standard view `{name}` is changed with View Settings"
+                            )));
+                        }
+                        let (holder, found) = find_named(s, &name)
+                            .ok_or_else(|| CmdError::Params(format!("no view named `{name}`")))?;
+                        let on_default = views_folder(s).ok() == Some(holder);
+                        let mut list = props::named_views(&s.mailbox, holder);
+                        let mut saved = v.clone();
+                        saved.date.clear();
+                        saved.days = 1;
+                        for x in list.iter_mut().filter(|x| same_view(x, &found.name, found.own, on_default))
+                        {
+                            x.view = saved.clone();
+                        }
+                        if props::set_named_views(&mut s.mailbox, holder, &list) {
+                            journal_folder(s, holder);
+                        }
                     }
                     "delete" => {
                         if CalendarCurrentView::parse(&name).is_some() {
@@ -102,13 +143,11 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
                                 "the standard view `{name}` cannot be deleted"
                             )));
                         }
-                        let folder = views_folder(s)?;
+                        let (folder, found) = find_named(s, &name)
+                            .ok_or_else(|| CmdError::Params(format!("no view named `{name}`")))?;
+                        let on_default = views_folder(s).ok() == Some(folder);
                         let mut list = props::named_views(&s.mailbox, folder);
-                        let before = list.len();
-                        list.retain(|x| !x.name.eq_ignore_ascii_case(&name));
-                        if list.len() == before {
-                            return Err(CmdError::Params(format!("no view named `{name}`")));
-                        }
+                        list.retain(|x| !same_view(x, &found.name, found.own, on_default));
                         if props::set_named_views(&mut s.mailbox, folder, &list) {
                             journal_folder(s, folder);
                         }
@@ -122,12 +161,14 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
                         (v.date, v.days) = keep;
                     }
                     a => {
+                        let a: String = a.chars().take(32).collect();
                         return Err(CmdError::Params(format!(
-                            "`action` must be apply, copy, rename, delete or reset, not `{a}`"
+                            "`action` must be apply, new, copy, rename, update, delete or reset, not `{a}`"
                         )));
                     }
                 }
                 extra.insert("views".into(), json!(view_names(s)));
+                extra.insert("rows".into(), json!(view_rows(s)));
             }
         },
         "view.applyViewTo" => match p.get("folders") {
@@ -218,8 +259,7 @@ fn run_module_view(s: &mut Session, id: &str, p: &Value) -> CmdResult {
             (v.date, v.days) = keep;
         }
         "view.viewSettings" => {
-            let keys = ["sort", "ascending", "timeScale", "readingPane", "tighterSpacing", "dailyTaskList"];
-            if !pim::has_any(p, &keys) {
+            if !pim::has_any(p, &SETTINGS_KEYS) {
                 // The calendar's View Settings window (drawn by the calendar view).
                 s.notify(crate::Notice::OpenDialog(VIEW_SETTINGS_DIALOG.into(), json!({})));
                 extra.insert("dialog".into(), json!(VIEW_SETTINGS_DIALOG));
@@ -241,13 +281,112 @@ fn views_folder(s: &Session) -> Result<FolderId, CmdError> {
     pim::default_folder(s, Kind::Appointment).ok_or_else(|| CmdError::Failed("there is no calendar".into()))
 }
 
+/// Views saved by name usable in the current calendar: those for every calendar (kept on the default
+/// calendar), then those made for the current calendar alone (kept on it; on the default calendar, the ones
+/// marked [`props::NamedView::own`]), with the calendar keeping each. `own` is set on the current
+/// calendar's own views. A name used by both shows the current calendar's own.
+pub fn named_all(s: &Session) -> Vec<(FolderId, props::NamedView)> {
+    let default = views_folder(s).ok();
+    let current = pim::current_folder(s, Kind::Appointment);
+    let own = current.into_iter().flat_map(|c| {
+        props::named_views(&s.mailbox, c).into_iter().filter(move |v| Some(c) != default || v.own).map(
+            move |mut v| {
+                v.own = true;
+                (c, v)
+            },
+        )
+    });
+    let shared = default
+        .into_iter()
+        .flat_map(|d| props::named_views(&s.mailbox, d).into_iter().filter(|v| !v.own).map(move |v| (d, v)));
+    let mut out: Vec<(FolderId, props::NamedView)> = Vec::new();
+    for (f, v) in own.chain(shared) {
+        if !out.iter().any(|(_, x)| x.name.eq_ignore_ascii_case(&v.name)) {
+            out.push((f, v));
+        }
+    }
+    // The current calendar's own come after the shared ones in the lists.
+    out.sort_by_key(|(_, v)| v.own);
+    out
+}
+
+/// Entry `x` of a calendar's named views is the view `name` with scope `own` (`on_default`: the list is the
+/// default calendar's, which keeps both kinds; any other calendar's list keeps only its own).
+fn same_view(x: &props::NamedView, name: &str, own: bool, on_default: bool) -> bool {
+    x.name.eq_ignore_ascii_case(name) && (!on_default || x.own == own)
+}
+
+fn find_named(s: &Session, name: &str) -> Option<(FolderId, props::NamedView)> {
+    named_all(s).into_iter().find(|(_, v)| v.name.eq_ignore_ascii_case(name.trim()))
+}
+
+/// `scope` param of Save View As / New / Copy: "all" (default) keeps the view for every calendar, "folder"
+/// for the current calendar alone. Returns the calendar that keeps it and whether it is that calendar's own.
+fn scope_folder(s: &Session, p: &Value) -> Result<(FolderId, bool), CmdError> {
+    match opt_str(p, "scope") {
+        None | Some("all") => Ok((views_folder(s)?, false)),
+        Some("folder") => match pim::current_folder(s, Kind::Appointment) {
+            Some(c) => Ok((c, true)),
+            None => Ok((views_folder(s)?, true)),
+        },
+        Some(o) => {
+            let o: String = o.chars().take(32).collect();
+            Err(CmdError::Params(format!("`scope` must be all or folder, not `{o}`")))
+        }
+    }
+}
+
 /// The views Change View offers: the standard ones, then those saved by name.
 pub fn view_names(s: &Session) -> Vec<String> {
     let mut out: Vec<String> = CalendarCurrentView::ALL.iter().map(|v| v.label().to_owned()).collect();
-    if let Ok(f) = views_folder(s) {
-        out.extend(props::named_views(&s.mailbox, f).into_iter().map(|v| v.name));
-    }
+    out.extend(named_all(s).into_iter().map(|(_, v)| v.name));
     out
+}
+
+/// One-line description of a calendar view (Manage Views › Description).
+pub fn describe(v: &CalendarViewState) -> String {
+    let mut parts = vec![format!("{} view", v.current.label())];
+    if v.current.is_table() {
+        let dir = if v.ascending { "ascending" } else { "descending" };
+        parts.push(format!("sorted by {} ({dir})", v.column_label(v.sort)));
+        if let Some(g) = v.group_by {
+            parts.push(format!("grouped by {}", v.column_label(g)));
+        }
+    } else {
+        parts.push(format!("{} arrangement", v.mode.label()));
+        parts.push(format!("time scale {} minutes", v.time_scale));
+    }
+    if !v.filter.is_empty() {
+        parts.push(format!("filter: {}", v.filter.describe()));
+    }
+    let rules = v.rules.iter().filter(|r| r.on).count();
+    if rules > 0 {
+        parts.push(format!("{rules} formatting rule(s)"));
+    }
+    parts.join(", ")
+}
+
+/// Rows of the Manage Views list: name, standard or saved, where it can be used, description.
+pub fn view_rows(s: &Session) -> Vec<Value> {
+    let standard = CalendarCurrentView::ALL.iter().map(|c| {
+        let v = CalendarViewState { current: *c, ..CalendarViewState::default() };
+        json!({ "name": c.label(), "standard": true, "usedOn": "All Calendar folders", "description": describe(&v) })
+    });
+    let named = named_all(s).into_iter().map(|(f, v)| {
+        let used_on = if v.own {
+            s.mailbox.folder(f).map_or_else(|| "This calendar".to_owned(), |x| x.name.clone())
+        } else {
+            "All Calendar folders".to_owned()
+        };
+        json!({
+            "name": v.name,
+            "standard": false,
+            "usedOn": used_on,
+            "scope": if v.own { "folder" } else { "all" },
+            "description": describe(&v.view),
+        })
+    });
+    standard.chain(named).collect()
 }
 
 /// `v` switched to the view named `name`: a standard view (Calendar, Preview, List, Active) or one saved by
@@ -257,27 +396,27 @@ fn apply_named(s: &Session, v: &CalendarViewState, name: &str) -> Result<Calenda
     if let Some(current) = CalendarCurrentView::parse(name) {
         return Ok(CalendarViewState { current, ..v.clone() });
     }
-    let saved = views_folder(s)
-        .ok()
-        .and_then(|f| {
-            props::named_views(&s.mailbox, f).into_iter().find(|x| x.name.eq_ignore_ascii_case(name))
-        })
-        .ok_or_else(|| {
-            CmdError::Params(format!(
-                "`name` must be Calendar, Preview, List, Active or a saved view, not `{name}`"
-            ))
-        })?;
+    let saved = find_named(s, name).map(|(_, v)| v).ok_or_else(|| {
+        CmdError::Params(format!(
+            "`name` must be Calendar, Preview, List, Active or a saved view, not `{name}`"
+        ))
+    })?;
     let mut out = saved.view;
     (out.date, out.days) = (v.date.clone(), v.days);
     Ok(out)
 }
 
-/// Saves `v` as the view `name` (replacing a view of that name, or `replacing` when renaming).
+/// Saves `v` as the view `name` on calendar `target.0`, for that calendar alone when `target.1` (replacing a
+/// view of that name and scope there; `None` = the default calendar, for every calendar). When renaming,
+/// the view `replacing` keeps its calendar, scope and settings and only takes the new name. A view saved for
+/// every calendar also replaces the current calendar's own view of that name, which would otherwise hide it
+/// there; a view saved for one calendar leaves the shared view of that name alone (other calendars keep it).
 fn store_named(
     s: &mut Session,
     name: &str,
     v: &CalendarViewState,
     replacing: Option<&str>,
+    target: Option<(FolderId, bool)>,
 ) -> Result<(), CmdError> {
     let name = name.trim();
     if name.is_empty() {
@@ -292,29 +431,63 @@ fn store_named(
     if CalendarCurrentView::parse(name).is_some() {
         return Err(CmdError::Params(format!("`{name}` is the name of a standard view")));
     }
-    let folder = views_folder(s)?;
-    let mut list = props::named_views(&s.mailbox, folder);
+    let default = views_folder(s).ok();
     if let Some(old) = replacing {
-        let pos = list
-            .iter()
-            .position(|x| x.name.eq_ignore_ascii_case(old))
-            .ok_or_else(|| CmdError::Params(format!("no view named `{old}`")))?;
-        if !old.eq_ignore_ascii_case(name) && list.iter().any(|x| x.name.eq_ignore_ascii_case(name)) {
+        let (folder, found) = find_named(s, old).ok_or_else(|| {
+            let old: String = old.chars().take(props::MAX_VIEW_NAME).collect();
+            CmdError::Params(format!("no view named `{old}`"))
+        })?;
+        if !found.name.eq_ignore_ascii_case(name)
+            && named_all(s).iter().any(|(_, x)| x.name.eq_ignore_ascii_case(name))
+        {
             return Err(CmdError::Params(format!("there is already a view named `{name}`")));
         }
-        if let Some(x) = list.get_mut(pos) {
-            x.name = name.to_owned();
+        let on_default = default == Some(folder);
+        let mut list = props::named_views(&s.mailbox, folder);
+        let x = list
+            .iter_mut()
+            .find(|x| same_view(x, &found.name, found.own, on_default))
+            .ok_or_else(|| CmdError::Params(format!("no view named `{}`", found.name)))?;
+        x.name = name.to_owned();
+        if props::set_named_views(&mut s.mailbox, folder, &list) {
+            journal_folder(s, folder);
         }
-    } else {
-        let mut view = v.clone();
-        view.date.clear();
-        view.days = 1;
-        list.retain(|x| !x.name.eq_ignore_ascii_case(name));
-        if list.len() >= props::MAX_NAMED_VIEWS {
-            return Err(CmdError::Params(format!("at most {} views can be saved", props::MAX_NAMED_VIEWS)));
-        }
-        list.push(props::NamedView { name: name.to_owned(), view });
+        return Ok(());
     }
+    let (folder, own) = match target {
+        Some(t) => t,
+        None => (views_folder(s)?, false),
+    };
+    let on_default = default == Some(folder);
+    let mut list = props::named_views(&s.mailbox, folder);
+    list.retain(|x| !same_view(x, name, own, on_default));
+    // The current calendar's own view of that name, which a view for every calendar replaces.
+    let hidden = if own {
+        None
+    } else {
+        named_all(s).into_iter().find(|(_, x)| x.own && x.name.eq_ignore_ascii_case(name))
+    };
+    if let Some((holder, h)) = &hidden
+        && *holder == folder
+    {
+        list.retain(|x| !same_view(x, &h.name, true, on_default));
+    }
+    if list.len() >= props::MAX_NAMED_VIEWS {
+        return Err(CmdError::Params(format!("at most {} views can be saved", props::MAX_NAMED_VIEWS)));
+    }
+    if let Some((holder, h)) = hidden
+        && holder != folder
+    {
+        let mut own_list = props::named_views(&s.mailbox, holder);
+        own_list.retain(|x| !same_view(x, &h.name, true, default == Some(holder)));
+        if props::set_named_views(&mut s.mailbox, holder, &own_list) {
+            journal_folder(s, holder);
+        }
+    }
+    let mut view = v.clone();
+    view.date.clear();
+    view.days = 1;
+    list.push(props::NamedView { name: name.to_owned(), view, own });
     if props::set_named_views(&mut s.mailbox, folder, &list) {
         journal_folder(s, folder);
     }
@@ -351,8 +524,88 @@ fn calendar_targets(s: &Session, list: &Value) -> Result<Vec<FolderId>, CmdError
     Ok(out)
 }
 
-/// View Settings fields: sort column and order, time scale, reading pane, spacing, daily task list.
+/// Keys of `view.viewSettings` in the Calendar (without any, the View Settings window opens).
+pub const SETTINGS_KEYS: [&str; 12] = [
+    "sort",
+    "ascending",
+    "timeScale",
+    "readingPane",
+    "tighterSpacing",
+    "dailyTaskList",
+    "columns",
+    "groupBy",
+    "filter",
+    "rules",
+    "gridLines",
+    "labels",
+];
+
+fn column_param(v: &Value, key: &str) -> Result<CalendarColumn, CmdError> {
+    v.as_str().and_then(CalendarColumn::parse).ok_or_else(|| {
+        CmdError::Params(format!(
+            "`{key}`: columns are {}",
+            CalendarColumn::ALL.map(CalendarColumn::name).join(", ")
+        ))
+    })
+}
+
+/// View Settings fields: sort column and order, time scale, reading pane, spacing, daily task list, and the
+/// List / Active table's columns (`columns`, names in order; [] = the defaults), `groupBy` (a column or
+/// null), `filter` (an `ItemFilter` or null), `rules` (Conditional Formatting), `gridLines` and `labels`
+/// (Format Columns: column name → header label, "" = the column's own).
 fn apply_settings(v: &mut CalendarViewState, p: &Value) -> Result<(), CmdError> {
+    if let Some(c) = p.get("columns").filter(|x| !x.is_null()) {
+        let list = c.as_array().ok_or_else(|| CmdError::Params("`columns` must be a list".into()))?;
+        let mut cols = Vec::new();
+        for x in list.iter().take(CalendarColumn::ALL.len().saturating_mul(4)) {
+            let col = column_param(x, "columns")?;
+            if !cols.contains(&col) {
+                cols.push(col);
+            }
+        }
+        if !cols.is_empty() && !cols.contains(&CalendarColumn::Subject) {
+            return Err(CmdError::Params("the Subject column cannot be hidden".into()));
+        }
+        v.columns = cols;
+    }
+    if let Some(g) = p.get("groupBy") {
+        v.group_by = match g {
+            Value::Null => None,
+            Value::String(t) if t.trim().is_empty() || t.eq_ignore_ascii_case("none") => None,
+            other => Some(column_param(other, "groupBy")?),
+        };
+    }
+    if let Some(f) = p.get("filter") {
+        v.filter = if f.is_null() {
+            Default::default()
+        } else {
+            serde_json::from_value(f.clone()).map_err(|e| CmdError::Params(format!("`filter`: {e}")))?
+        };
+    }
+    if let Some(r) = p.get("rules") {
+        v.rules = if r.is_null() {
+            Vec::new()
+        } else {
+            serde_json::from_value(r.clone()).map_err(|e| CmdError::Params(format!("`rules`: {e}")))?
+        };
+    }
+    if let Some(g) = pim::flag(p, "gridLines")? {
+        v.no_grid = !g;
+    }
+    if let Some(l) = p.get("labels").filter(|x| !x.is_null()) {
+        let map = l.as_object().ok_or_else(|| CmdError::Params("`labels` must be an object".into()))?;
+        for (k, label) in map.iter().take(32) {
+            let col = column_param(&json!(k), "labels")?;
+            let text =
+                label.as_str().ok_or_else(|| CmdError::Params("`labels` values must be text".into()))?;
+            if text.trim().is_empty() {
+                v.labels.remove(col.name());
+            } else {
+                v.labels.insert(col.name().to_owned(), text.to_owned());
+            }
+        }
+    }
+    v.sanitize_table();
     if let Some(c) = opt_str(p, "sort") {
         v.sort = CalendarColumn::parse(c).ok_or_else(|| CmdError::Params(format!("unknown column `{c}`")))?;
     }

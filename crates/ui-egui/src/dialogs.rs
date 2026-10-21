@@ -42,7 +42,7 @@ use serde_json::{Value, json};
 
 use crate::{App, Surface};
 use common::{Dlg, Out};
-pub(crate) use common::{browse_folder, browse_open, browse_save};
+pub(crate) use common::{Pick, browse_folder, browse_open, browse_save, folder_tree};
 
 pub fn dialogs(ctx: &egui::Context, app: &mut App) {
     take_notices(app);
@@ -337,6 +337,7 @@ pub const KNOWN: &[&str] = &[
     "addCalendar",
     "contactCard",
     "chooseContact",
+    "newDataFile",
 ];
 
 fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {

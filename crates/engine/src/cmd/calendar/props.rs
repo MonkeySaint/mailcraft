@@ -28,6 +28,10 @@ pub const MAX_VIEW_NAME: usize = 64;
 pub struct NamedView {
     pub name: String,
     pub view: CalendarViewState,
+    /// Saved for the calendar keeping it alone. Only read on the default calendar, which also keeps the
+    /// views for every calendar; a view kept on any other calendar is always that calendar's own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own: bool,
 }
 
 /// Marks a `remote_name` holding calendar properties.
@@ -223,7 +227,7 @@ mod tests {
         let acc = mb.default_account().unwrap().id;
         let cal = mb.role_folder(acc, mailcraft_model::FolderRole::Calendar).unwrap();
         assert!(named_views(&mb, cal).is_empty());
-        let v = NamedView { name: "Weekly".into(), view: CalendarViewState::default() };
+        let v = NamedView { name: "Weekly".into(), view: CalendarViewState::default(), own: false };
         assert!(set_named_views(&mut mb, cal, std::slice::from_ref(&v)));
         assert!(update(&mut mb, cal, |p| p.color = Some("Teal".into())));
         assert_eq!(named_views(&mb, cal), vec![v]);

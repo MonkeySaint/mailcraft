@@ -673,10 +673,11 @@ fn from_file_and_blank_calendars() {
     assert_eq!(r["name"], "Kids (2)");
     let kids = FolderId(r["folder"].as_u64().unwrap());
     assert_eq!(s.mailbox.folder(kids).unwrap().kind, FolderKind::Calendar);
+    // Like Create New Folder, a blank calendar may go under a mail folder (it still holds calendar items).
     let inbox = role(&s, FolderRole::Inbox);
-    assert!(
-        s.run("calendar.addCalendar", &json!({"source": "blank", "name": "X", "parent": inbox.0})).is_err()
-    );
+    let r = run(&mut s, "calendar.addCalendar", json!({"source": "blank", "name": "X", "parent": inbox.0}));
+    let x = FolderId(r["folder"].as_u64().unwrap());
+    assert_eq!(s.mailbox.folder(x).unwrap().kind, FolderKind::Calendar);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -752,4 +753,240 @@ fn work_week_and_hours() {
     assert_eq!(views::parse_work_week(&json!([])), None);
     assert_eq!(views::parse_work_week(&json!(["x", "m"])), None);
     assert_eq!(views::parse_work_week(&json!(5)), None);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Update Folder and Send/Receive on internet calendars, Create New Folder kinds, View Settings of the
+// List / Active tables, Manage Views
+
+fn subscribed(s: &mut Session, url: &str) -> FolderId {
+    let r = run(
+        s,
+        "calendar.addCalendar",
+        json!({"source": "internet", "url": url, "name": "Feed", "fetch": false}),
+    );
+    FolderId(r["folder"].as_u64().unwrap())
+}
+
+#[test]
+fn update_folder_refreshes_an_internet_calendar() {
+    let body = ics(&[("u1@example.org", "20261012T090000Z", "Standup")], "");
+    let (base, seen, t) = serve(1, move |_| http("200 OK", "Content-Type: text/calendar\r\n", &body));
+    let mut s = session();
+    let f = subscribed(&mut s, &format!("{base}/team.ics"));
+    s.selection.folder = f;
+    let undo_before = s.undo.undo_label().map(str::to_owned);
+    // Without a UI the command fetches straight away.
+    let r = run(&mut s, "sendReceive.folder", json!({}));
+    assert_eq!(r["status"], "updated", "{r}");
+    assert_eq!(r["calendar"]["refreshed"], 1);
+    assert!(seen.recv().unwrap().starts_with("GET /team.ics"));
+    assert_eq!(s.mailbox.appointments.values().filter(|a| a.folder == f).count(), 1);
+    // A refresh is synchronisation, not an editing step.
+    assert_eq!(s.undo.undo_label().map(str::to_owned), undo_before);
+    t.join().unwrap();
+    // Offline: nothing is fetched.
+    let r = run(&mut s, "sendReceive.folder", json!({"offline": true}));
+    assert_eq!(r["status"], "offline");
+    // A calendar that cannot be fetched is reported.
+    props::update(&mut s.mailbox, f, |p| {
+        if let Some(sub) = p.subscription.as_mut() {
+            sub.url = "http://127.0.0.1:1/x.ics".into();
+        }
+    });
+    let r = run(&mut s, "sendReceive.folder", json!({"folder": f.0}));
+    assert_eq!(r["status"], "failed", "{r}");
+    assert!(props::read(&s.mailbox, f).subscription.unwrap().last_error.is_some());
+}
+
+#[test]
+fn send_receive_queues_calendar_refreshes_for_the_ui() {
+    let mut s = session();
+    s.sync.background_calendars = true;
+    let a = subscribed(&mut s, "https://cal.example.com/a.ics");
+    let b = subscribed(&mut s, "https://cal.example.com/b.ics");
+    s.selection.folder = a;
+    let r = run(&mut s, "sendReceive.folder", json!({}));
+    assert_eq!(r["status"], "updating");
+    assert_eq!(r["calendar"]["queued"], 1);
+    // Send/Receive All Folders queues every internet calendar, each once.
+    let r = run(&mut s, "sendReceive.all", json!({}));
+    assert_eq!(r["calendars"]["queued"], 1, "{r}");
+    let mut queued: Vec<FolderId> =
+        crate::cmd::send_receive::take_calendar_requests(&mut s).into_iter().map(|d| d.folder).collect();
+    queued.sort();
+    assert_eq!(queued, vec![a, b]);
+    assert!(crate::cmd::send_receive::take_calendar_requests(&mut s).is_empty());
+    // A local calendar is not an internet calendar: the mail rules apply.
+    s.selection.folder = cal(&s);
+    let r = run(&mut s, "sendReceive.folder", json!({}));
+    assert_eq!(r["status"], "local folder");
+}
+
+#[test]
+fn new_folders_choose_what_they_contain() {
+    let mut s = session();
+    let inbox = role(&s, FolderRole::Inbox);
+    s.selection.folder = inbox;
+    // In the Calendar the dialog offers Calendar Items first.
+    s.view.module = Module::Calendar;
+    run(&mut s, "folder.new", json!({}));
+    let Some(crate::Notice::OpenDialog(name, p)) = s.notices.last() else { panic!("no dialog") };
+    assert_eq!((name.as_str(), p["kind"].as_str()), ("createFolder", Some("calendar")));
+    assert_eq!(p["kinds"].as_array().unwrap().len(), 6);
+    // A calendar under a mail folder, a task list under the calendar.
+    let r = run(&mut s, "folder.new", json!({"name": "Rota", "parent": inbox.0, "kind": "calendar"}));
+    let rota = FolderId(r["folder"].as_u64().unwrap());
+    assert_eq!(s.mailbox.folder(rota).unwrap().kind, FolderKind::Calendar);
+    let r = run(&mut s, "folder.new", json!({"name": "Chores", "parent": rota.0, "kind": "Task Items"}));
+    assert_eq!(s.mailbox.folder(FolderId(r["folder"].as_u64().unwrap())).unwrap().kind, FolderKind::Tasks);
+    // Without a kind the parent's is kept.
+    let r = run(&mut s, "folder.new", json!({"name": "Sub", "parent": rota.0}));
+    assert_eq!(s.mailbox.folder(FolderId(r["folder"].as_u64().unwrap())).unwrap().kind, FolderKind::Calendar);
+    assert!(matches!(
+        s.run("folder.new", &json!({"name": "X", "parent": inbox.0, "kind": "fax"})),
+        Err(CmdError::Params(_))
+    ));
+    // Create New Blank Calendar can go under any folder.
+    let r =
+        run(&mut s, "calendar.addCalendar", json!({"source": "blank", "name": "Club", "parent": inbox.0}));
+    let club = FolderId(r["folder"].as_u64().unwrap());
+    assert_eq!(s.mailbox.folder(club).unwrap().parent, Some(inbox));
+    assert_eq!(s.mailbox.folder(club).unwrap().kind, FolderKind::Calendar);
+    assert!(
+        s.run("calendar.addCalendar", &json!({"source": "blank", "name": "Y", "parent": 999_999})).is_err()
+    );
+}
+
+#[test]
+fn table_view_settings_round_trip() {
+    let mut s = session();
+    s.view.module = Module::Calendar;
+    let r = run(
+        &mut s,
+        "view.viewSettings",
+        json!({
+            "columns": ["subject", "start", "location", "start"],
+            "groupBy": "Location",
+            "filter": {"words": "standup"},
+            "rules": [{"name": "Team", "on": true, "filter": {"category": "Red category"}, "color": "#107C10"}],
+            "gridLines": false,
+            "labels": {"start": "Begins", "end": ""},
+        }),
+    );
+    let v: CalendarViewState = serde_json::from_value(r["view"].clone()).unwrap();
+    assert_eq!(v.columns, vec![CalendarColumn::Subject, CalendarColumn::Start, CalendarColumn::Location]);
+    assert_eq!(v.group_by, Some(CalendarColumn::Location));
+    assert_eq!(v.filter.words, "standup");
+    assert_eq!(v.rules[0].color, "#107c10");
+    assert!(v.no_grid);
+    assert_eq!(v.column_label(CalendarColumn::Start), "Begins");
+    assert_eq!(v.column_label(CalendarColumn::End), "End");
+    // Saved on the calendar: the next command without a view starts from it.
+    let r = run(&mut s, "view.viewSettings", json!({"groupBy": null, "gridLines": true}));
+    let v: CalendarViewState = serde_json::from_value(r["view"].clone()).unwrap();
+    assert_eq!((v.group_by, v.no_grid, v.filter.words.as_str()), (None, false, "standup"));
+    for bad in [
+        json!({"columns": ["start"]}),
+        json!({"columns": "subject"}),
+        json!({"groupBy": "size"}),
+        json!({"filter": 3}),
+        json!({"labels": {"nope": "x"}}),
+        json!({"labels": {"start": 5}}),
+    ] {
+        assert!(matches!(s.run("view.viewSettings", &bad), Err(CmdError::Params(_))), "{bad}");
+    }
+    // Stored state is not trusted.
+    let mut hostile = CalendarViewState {
+        columns: vec![CalendarColumn::Start; 50],
+        rules: vec![mailcraft_model::view::ItemRule::default(); 100],
+        ..CalendarViewState::default()
+    };
+    hostile.labels.insert("bogus".into(), "x".into());
+    hostile.sanitize_table();
+    assert_eq!(hostile.columns, vec![CalendarColumn::Start]);
+    assert!(hostile.labels.is_empty() && hostile.rules.is_empty());
+}
+
+#[test]
+fn calendar_manage_views_new_modify_and_scope() {
+    let mut s = session();
+    s.view.module = Module::Calendar;
+    let main = cal(&s);
+    let team = s.mailbox.create_folder(main, "Team").unwrap();
+    // New: a List view with the standard settings, for every calendar.
+    run(&mut s, "view.manageViews", json!({"action": "new", "name": "Agenda", "base": "List"}));
+    let r = run(&mut s, "view.changeView", json!({"name": "agenda"}));
+    assert_eq!(r["view"]["current"], "list");
+    // Modify: View Settings, then the saved view takes them.
+    run(&mut s, "view.viewSettings", json!({"groupBy": "categories"}));
+    run(&mut s, "view.manageViews", json!({"action": "update", "name": "Agenda"}));
+    let (_, saved) = views::named_all(&s).into_iter().find(|(_, v)| v.name == "Agenda").unwrap();
+    assert_eq!(saved.view.group_by, Some(CalendarColumn::Categories));
+    assert!(
+        views::describe(&saved.view).contains("grouped by Categories"),
+        "{}",
+        views::describe(&saved.view)
+    );
+    // A view for one calendar only.
+    s.selection.folder = team;
+    run(&mut s, "view.saveViewAs", json!({"name": "Team only", "scope": "folder"}));
+    let rows = views::view_rows(&s);
+    let team_row = rows.iter().find(|r| r["name"] == "Team only").unwrap();
+    assert_eq!((team_row["scope"].as_str(), team_row["usedOn"].as_str()), (Some("folder"), Some("Team")));
+    assert_eq!(rows.iter().find(|r| r["name"] == "Agenda").unwrap()["usedOn"], "All Calendar folders");
+    s.selection.folder = main;
+    assert!(!views::view_names(&s).iter().any(|n| n == "Team only"), "only on its own calendar");
+    s.selection.folder = team;
+    run(&mut s, "view.manageViews", json!({"action": "rename", "name": "Team only", "newName": "Crew"}));
+    run(&mut s, "view.manageViews", json!({"action": "delete", "name": "Crew"}));
+    assert!(!views::view_names(&s).iter().any(|n| n == "Crew"));
+    assert!(s.run("view.manageViews", &json!({"action": "update", "name": "List"})).is_err());
+    assert!(s.run("view.manageViews", &json!({"action": "new", "name": "X", "base": "Grid"})).is_err());
+    assert!(s.run("view.saveViewAs", &json!({"name": "Y", "scope": "galaxy"})).is_err());
+}
+
+/// Regression: "This calendar" on the default calendar used to save the view for every calendar.
+#[test]
+fn calendar_view_for_the_default_calendar_alone() {
+    let mut s = session();
+    s.view.module = Module::Calendar;
+    let main = cal(&s);
+    let team = s.mailbox.create_folder(main, "Team").unwrap();
+    s.selection.folder = main;
+    run(&mut s, "view.saveViewAs", json!({"name": "Mine", "scope": "folder"}));
+    let rows = views::view_rows(&s);
+    let row = rows.iter().find(|r| r["name"] == "Mine").unwrap();
+    assert_eq!(row["scope"], "folder");
+    assert_ne!(row["usedOn"], "All Calendar folders");
+    s.selection.folder = team;
+    assert!(!views::view_names(&s).iter().any(|n| n == "Mine"), "not offered on other calendars");
+    // A shared view and the default calendar's own view of the same name both survive.
+    run(&mut s, "view.viewSettings", json!({"groupBy": "categories"}));
+    run(&mut s, "view.manageViews", json!({"action": "new", "name": "Both", "base": "List"}));
+    s.selection.folder = main;
+    run(&mut s, "view.saveViewAs", json!({"name": "Both", "scope": "folder"}));
+    let both: Vec<_> = views::view_rows(&s).into_iter().filter(|r| r["name"] == "Both").collect();
+    assert_eq!(both.len(), 1);
+    assert_eq!(both[0]["scope"], "folder", "the calendar's own wins here");
+    s.selection.folder = team;
+    let rows = views::view_rows(&s);
+    assert_eq!(
+        rows.iter().find(|r| r["name"] == "Both").unwrap()["scope"],
+        "all",
+        "others keep the shared one"
+    );
+    // Deleting the own view on the default calendar leaves the shared one.
+    s.selection.folder = main;
+    run(&mut s, "view.manageViews", json!({"action": "delete", "name": "Both"}));
+    let rows = views::view_rows(&s);
+    assert_eq!(rows.iter().find(|r| r["name"] == "Both").unwrap()["scope"], "all");
+    // Renaming the own view keeps its scope.
+    run(&mut s, "view.manageViews", json!({"action": "rename", "name": "Mine", "newName": "Still mine"}));
+    let rows = views::view_rows(&s);
+    assert_eq!(rows.iter().find(|r| r["name"] == "Still mine").unwrap()["scope"], "folder");
+    assert!(
+        s.run("view.manageViews", &json!({"action": "rename", "name": "Still mine", "newName": "Both"}))
+            .is_err()
+    );
 }

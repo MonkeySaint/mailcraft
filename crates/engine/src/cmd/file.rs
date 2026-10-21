@@ -88,7 +88,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.newDataFile",
             "New Data File",
             "Home › New Items › More Items",
-            r#"{"path"?: string, "name"?: string} (neither = open the New Data File dialog)"#,
+            r#"{"path"?: string, "name"?: string, "confirm"?: bool} (without a name or path the Create Data File prompt opens; confirm: true creates one with the default name)"#,
             true,
             always,
             new_data_file,
@@ -635,18 +635,6 @@ fn new_data_file(s: &mut Session, p: &Value) -> CmdResult {
     if s.mailbox.accounts.len() >= MAX_ACCOUNTS {
         return Err(CmdError::Failed(format!("at most {MAX_ACCOUNTS} data files")));
     }
-    // Without a name or path the New Data File dialog asks for one (and shows where it is kept).
-    if p.get("name").is_none_or(Value::is_null) && p.get("path").is_none_or(Value::is_null) {
-        let taken = |n: &str| s.mailbox.accounts.iter().any(|a| a.display_name.eq_ignore_ascii_case(n));
-        let mut name = LOCAL_ACCOUNT_FALLBACK_NAME.to_owned();
-        let mut k = 2u32;
-        while taken(&name) && k < 10_000 {
-            name = format!("{LOCAL_ACCOUNT_FALLBACK_NAME} ({k})");
-            k = k.saturating_add(1);
-        }
-        let location = s.store.as_ref().map(|st| st.dir.display().to_string());
-        return dialog(s, "newDataFile", json!({ "name": name, "location": location }));
-    }
     let from_path = opt_str(p, "path").and_then(|path| Path::new(path).file_stem()).and_then(|n| n.to_str());
     let clean = |n: &str| -> String { n.chars().filter(|c| !c.is_control()).take(255).collect() };
     let base = opt_str(p, "name")
@@ -660,6 +648,12 @@ fn new_data_file(s: &mut Session, p: &Value) -> CmdResult {
     while taken(&name) && k < 10_000 {
         name = format!("{base} ({k})");
         k = k.saturating_add(1);
+    }
+    // Without a name or a file, ask for one first (Create or Open Data File); `confirm` skips the prompt.
+    let named = opt_str(p, "name").is_some() || opt_str(p, "path").is_some();
+    if !named && p.get("confirm").and_then(Value::as_bool) != Some(true) {
+        let location = s.store.as_ref().map(|st| st.dir.display().to_string()).unwrap_or_default();
+        return dialog(s, "newDataFile", json!({ "name": name, "location": location }));
     }
     let id = s.mailbox.add_account(Account {
         kind: AccountKind::Local,
@@ -1478,6 +1472,64 @@ mod tests {
         assert!(p["name"].as_str().is_some_and(|n| !n.is_empty()));
         s.run("file.newDataFile", &json!({"name": "Archive"})).unwrap();
         assert_eq!(s.mailbox.accounts.len(), before + 1);
+    }
+
+    #[test]
+    fn new_data_file_asks_for_a_name_first() {
+        let (mut s, _, _) = session();
+        let before = s.mailbox.accounts.len();
+        // From the ribbon (no name): the Create Data File prompt, with a free name suggested.
+        let r = s.run("file.newDataFile", &json!({})).unwrap();
+        assert_eq!(r["dialog"], "newDataFile");
+        let Some(crate::Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
+        let suggested = p["name"].as_str().unwrap().to_owned();
+        assert!(!suggested.is_empty());
+        assert_eq!(s.mailbox.accounts.len(), before, "nothing made yet");
+        let r = s.run("file.newDataFile", &json!({"name": suggested})).unwrap();
+        assert_eq!(r["name"], suggested.as_str());
+        assert_eq!(s.mailbox.accounts.len(), before + 1);
+        // Scripts can skip the prompt.
+        assert!(s.run("file.newDataFile", &json!({"confirm": true})).unwrap()["account"].is_u64());
+    }
+
+    #[test]
+    fn choose_form_lists_and_opens_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let eml = "From: Ann <ann@example.com>\r\nTo: Team <team@example.org>\r\nSubject: Weekly report\r\n\r\nWins:\r\nRisks:\r\n";
+        std::fs::write(dir.path().join("Weekly report.eml"), eml).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "not a template").unwrap();
+        std::fs::write(dir.path().join("Broken.oft"), "not a compound file").unwrap();
+        let (mut s, _, _) = session();
+        let d = dir.path().display().to_string();
+        let r = s.run("mail.newItem", &json!({"kind": "fromForm", "dir": d, "list": true})).unwrap();
+        let names: Vec<&str> =
+            r["templates"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, vec!["Broken", "Weekly report"]);
+        // Without `list` the Choose Form dialog opens with them.
+        let r = s.run("mail.newItem", &json!({"kind": "fromForm", "dir": d})).unwrap();
+        assert_eq!(r["dialog"], "chooseForm");
+        // Opening a template starts a new message from it.
+        let path = dir.path().join("Weekly report.eml").display().to_string();
+        let r = s.run("mail.newItem", &json!({"kind": "fromForm", "path": path})).unwrap();
+        let c = &s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.subject, "Weekly report");
+        assert!(c.to.contains("team@example.org"));
+        assert!(c.body.to_plain_text().contains("Risks:"));
+        // Not a template, unreadable or missing files are refused.
+        let txt = dir.path().join("notes.txt").display().to_string();
+        assert!(matches!(
+            s.run("mail.newItem", &json!({"kind": "fromForm", "path": txt})),
+            Err(CmdError::Params(_))
+        ));
+        let broken = dir.path().join("Broken.oft").display().to_string();
+        assert!(s.run("mail.newItem", &json!({"kind": "fromForm", "path": broken})).is_err());
+        let gone = dir.path().join("Gone.msg").display().to_string();
+        assert!(s.run("mail.newItem", &json!({"kind": "fromForm", "path": gone})).is_err());
+        // A folder that cannot be read lists nothing.
+        let r = s
+            .run("mail.newItem", &json!({"kind": "fromForm", "dir": "/nonexistent-mc", "list": true}))
+            .unwrap();
+        assert!(r["templates"].as_array().unwrap().is_empty());
     }
 
     #[cfg(unix)]

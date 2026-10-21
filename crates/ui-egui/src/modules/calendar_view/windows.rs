@@ -19,6 +19,7 @@ use mailcraft_engine::cmd::calendar::subscribe::{self, Due, Fetched};
 use mailcraft_engine::cmd::calendar::{
     CalendarColumn, CalendarCurrentView, DailyTaskList, Subscription, TIME_SCALES, props, tz, views,
 };
+use mailcraft_model::view::{ItemFilter, ItemRule};
 use mailcraft_model::{FolderId, ReadingPanePos};
 
 use mailcraft_engine::cmd::calendar::pim::{self, Kind};
@@ -46,6 +47,8 @@ pub(super) struct Windows {
     settings: Option<SettingsForm>,
     /// View Settings was asked for (the form is filled from the view when drawn).
     settings_requested: bool,
+    /// Manage Views › Modify asked for View Settings of this saved view.
+    modify: Option<String>,
     share: Option<ShareForm>,
     manage: Option<ManageForm>,
     save_view: Option<NameForm>,
@@ -83,12 +86,16 @@ const SHARE_DETAILS: [(&str, &str, &str); 3] = [
     ("full", "Full details", "Times, subjects, locations, notes and attendees."),
 ];
 
-/// Manage Views: the selected view and the name typed for Copy / Rename.
+/// Manage Views: the selected view, the name typed for New / Copy / Rename, the kind of a new view, where
+/// a new or copied view can be used and the "only this calendar's views" filter.
 #[derive(Clone, Default)]
 struct ManageForm {
     selected: String,
     new_name: String,
     error: String,
+    base: usize,
+    this_folder_scope: bool,
+    only_this_folder: bool,
 }
 
 /// Apply Current View to Other Calendar Folders: the calendars ticked.
@@ -119,6 +126,10 @@ struct InternetForm {
 struct NameForm {
     name: String,
     error: String,
+    /// Save View As: the view is for the current calendar only.
+    this_folder: bool,
+    /// Create New Blank Calendar: the folder the calendar goes in (`None` = the default calendar).
+    parent: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -136,6 +147,143 @@ struct SettingsForm {
     reading_pane: ReadingPanePos,
     daily: DailyTaskList,
     tighter: bool,
+    /// List / Active tables: columns shown, Group By, Filter, Other Settings, Conditional Formatting and
+    /// Format Columns (header labels).
+    columns: Vec<CalendarColumn>,
+    group_by: Option<CalendarColumn>,
+    filter: ItemFilter,
+    grid_lines: bool,
+    rules: Vec<ItemRule>,
+    labels: std::collections::BTreeMap<String, String>,
+    /// Manage Views › Modify: the saved view that takes the settings on OK.
+    modify: Option<String>,
+}
+
+/// Colours offered by Conditional Formatting (label, "#rrggbb"; "" = the table's own).
+const RULE_COLORS: [(&str, &str); 7] = [
+    ("Automatic", ""),
+    ("Red", "#c42b1c"),
+    ("Orange", "#ca5010"),
+    ("Green", "#107c10"),
+    ("Blue", "#0f6cbd"),
+    ("Purple", "#8764b8"),
+    ("Gray", "#8a8886"),
+];
+
+/// The conditions of an [`ItemFilter`] for calendar items.
+fn filter_fields(ui: &mut Ui, f: &mut ItemFilter, id: impl std::hash::Hash + std::fmt::Debug) {
+    egui::Grid::new(id).num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+        let l = ui.label("Search for the word(s):");
+        ui.add(TextEdit::singleline(&mut f.words).desired_width(220.0)).labelled_by(l.id);
+        ui.end_row();
+        ui.label("");
+        ui.checkbox(&mut f.in_body, "Also in the notes");
+        ui.end_row();
+        let l = ui.label("Category:");
+        ui.add(TextEdit::singleline(&mut f.category).desired_width(220.0)).labelled_by(l.id);
+        ui.end_row();
+        ui.label("Starting within:");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut f.days).range(0..=36_500));
+            ui.label(if f.days == 0 { "days (any time)" } else { "days of today" });
+        });
+        ui.end_row();
+    });
+}
+
+/// Columns, Group By, Filter, Other Settings, Conditional Formatting and Format Columns of the List and
+/// Active tables (the parts of the observed Advanced View Settings that apply to them).
+fn table_settings(ui: &mut Ui, f: &mut SettingsForm) {
+    egui::CollapsingHeader::new("Columns...").id_salt("mc-cal-settings-cols").show(ui, |ui| {
+        for c in CalendarColumn::ALL {
+            let mut on = f.columns.contains(&c);
+            let fixed = c == CalendarColumn::Subject;
+            if ui.add_enabled(!fixed, egui::Checkbox::new(&mut on, c.label())).changed() {
+                if on {
+                    f.columns.push(c);
+                    f.columns.sort_by_key(|x| CalendarColumn::ALL.iter().position(|y| y == x));
+                } else {
+                    f.columns.retain(|x| *x != c);
+                }
+            }
+        }
+    });
+    egui::CollapsingHeader::new("Group By...").id_salt("mc-cal-settings-group").show(ui, |ui| {
+        let cur = f.group_by.map_or("(none)", CalendarColumn::label);
+        ComboBox::from_id_salt("mc-cal-settings-groupby").selected_text(cur).show_ui(ui, |ui| {
+            ui.selectable_value(&mut f.group_by, None, "(none)");
+            for c in CalendarColumn::ALL {
+                ui.selectable_value(&mut f.group_by, Some(c), c.label());
+            }
+        });
+    });
+    egui::CollapsingHeader::new(format!("Filter... ({})", f.filter.describe()))
+        .id_salt("mc-cal-settings-filter")
+        .show(ui, |ui| {
+            filter_fields(ui, &mut f.filter, "mc-cal-settings-filter-grid");
+            if ui.button("Clear All").clicked() {
+                f.filter = ItemFilter::default();
+            }
+        });
+    egui::CollapsingHeader::new("Other Settings...").id_salt("mc-cal-settings-other").show(ui, |ui| {
+        ui.checkbox(&mut f.grid_lines, "Grid lines between rows");
+    });
+    egui::CollapsingHeader::new("Conditional Formatting...").id_salt("mc-cal-settings-rules").show(
+        ui,
+        |ui| {
+            let mut remove = None;
+            for (i, r) in f.rules.iter_mut().enumerate() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut r.on, "");
+                        ui.add(TextEdit::singleline(&mut r.name).desired_width(160.0).hint_text("Rule name"));
+                        if ui.small_button("Delete").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    filter_fields(ui, &mut r.filter, ("mc-cal-rule", i));
+                    ui.horizontal(|ui| {
+                        ui.label("Font:");
+                        ui.checkbox(&mut r.bold, "Bold");
+                        ui.checkbox(&mut r.italic, "Italic");
+                        ui.checkbox(&mut r.strike, "Strikethrough");
+                        let cur =
+                            RULE_COLORS.iter().find(|(_, h)| *h == r.color).map_or("Automatic", |(l, _)| *l);
+                        ComboBox::from_id_salt(("mc-cal-rule-color", i)).selected_text(cur).show_ui(
+                            ui,
+                            |ui| {
+                                for (l, h) in RULE_COLORS {
+                                    ui.selectable_value(&mut r.color, h.to_owned(), l);
+                                }
+                            },
+                        );
+                    });
+                });
+            }
+            if let Some(i) = remove
+                && i < f.rules.len()
+            {
+                f.rules.remove(i);
+            }
+            if ui.add_enabled(f.rules.len() < 32, egui::Button::new("Add")).clicked() {
+                let n = f.rules.len().saturating_add(1);
+                f.rules.push(ItemRule { name: format!("Untitled {n}"), on: true, ..Default::default() });
+            }
+        },
+    );
+    egui::CollapsingHeader::new("Format Columns...").id_salt("mc-cal-settings-format").show(ui, |ui| {
+        egui::Grid::new("mc-cal-settings-labels").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+            for c in CalendarColumn::ALL {
+                ui.label(c.label());
+                let mut text = f.labels.get(c.name()).cloned().unwrap_or_default();
+                if ui.add(TextEdit::singleline(&mut text).hint_text(c.label()).desired_width(180.0)).changed()
+                {
+                    f.labels.insert(c.name().to_owned(), text);
+                }
+                ui.end_row();
+            }
+        });
+    });
 }
 
 /// True for a window request the calendar draws itself (while the Calendar module shows).
@@ -422,6 +570,19 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                 if !r.has_focus() && f.name.is_empty() {
                     r.request_focus();
                 }
+                ui.label("Folder contains: Calendar Items");
+                ui.label("Select where to place the folder:");
+                if f.parent.is_none() {
+                    f.parent = pim::default_folder(&app.s, Kind::Appointment).map(|x| x.0);
+                }
+                crate::dialogs::folder_tree(
+                    ui,
+                    app,
+                    &mut f.parent,
+                    crate::dialogs::Pick::Parent,
+                    "mc-cal-blank-parent",
+                    180.0,
+                );
                 error_line(ui, app, &f.error);
                 let (ok, cancel) = ok_cancel(ui, "OK");
                 if cancel {
@@ -431,9 +592,11 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                     if f.name.trim().is_empty() {
                         f.error = "Enter a name for the calendar.".into();
                     } else {
-                        match app
-                            .run("calendar.addCalendar", json!({ "source": "blank", "name": f.name.trim() }))
-                        {
+                        let mut p = json!({ "source": "blank", "name": f.name.trim() });
+                        if let (Some(parent), Some(o)) = (f.parent, p.as_object_mut()) {
+                            o.insert("parent".into(), json!(parent));
+                        }
+                        match app.run("calendar.addCalendar", p) {
                             Some(out) => {
                                 if let Some(folder) = out.get("folder").and_then(Value::as_u64) {
                                     st.cal_shown.insert(folder);
@@ -495,6 +658,13 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
             reading_pane: st.cal.reading_pane,
             daily: st.cal.daily_task_list,
             tighter: st.cal.tighter_spacing,
+            columns: st.cal.table_columns(),
+            group_by: st.cal.group_by,
+            filter: st.cal.filter.clone(),
+            grid_lines: !st.cal.no_grid,
+            rules: st.cal.rules.clone(),
+            labels: st.cal.labels.clone(),
+            modify: cu.windows.modify.take(),
         });
     }
     if let Some(mut f) = cu.windows.settings.take() {
@@ -558,6 +728,9 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                     ui.checkbox(&mut f.tighter, "Use tighter spacing");
                     ui.end_row();
                 });
+                ui.add_space(4.0);
+                ui.label(RichText::new("List and Active views").strong());
+                table_settings(ui, &mut f);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("OK").clicked() {
@@ -571,6 +744,18 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                             DailyTaskList::Minimized => "minimized",
                             DailyTaskList::Off => "off",
                         };
+                        let columns: Vec<&str> = f.columns.iter().map(|c| c.name()).collect();
+                        let rules: Vec<ItemRule> =
+                            f.rules.iter().filter(|r| !r.name.trim().is_empty()).cloned().collect();
+                        let labels: serde_json::Map<String, Value> = CalendarColumn::ALL
+                            .iter()
+                            .map(|c| {
+                                (
+                                    c.name().to_owned(),
+                                    json!(f.labels.get(c.name()).cloned().unwrap_or_default()),
+                                )
+                            })
+                            .collect();
                         let p = json!({
                             "sort": f.sort.name(),
                             "ascending": f.ascending,
@@ -578,9 +763,23 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &m
                             "readingPane": rp,
                             "dailyTaskList": daily,
                             "tighterSpacing": f.tighter,
+                            "columns": columns,
+                            "groupBy": f.group_by.map(CalendarColumn::name),
+                            "filter": f.filter,
+                            "gridLines": f.grid_lines,
+                            "rules": rules,
+                            "labels": labels,
                         });
                         if run_view_cmd(app, st, "view.viewSettings", p).is_some() {
                             keep = false;
+                            if let Some(name) = f.modify.clone() {
+                                run_view_cmd(
+                                    app,
+                                    st,
+                                    "view.manageViews",
+                                    json!({ "action": "update", "name": name }),
+                                );
+                            }
                         }
                     }
                     if ui.button("Cancel").clicked() {
@@ -718,40 +917,77 @@ fn manage_window(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &mut
     let center = ctx.content_rect().center();
     let mut open = true;
     let mut keep = true;
-    let names = views::view_names(&app.s);
+    let rows = views::view_rows(&app.s);
+    let names: Vec<String> =
+        rows.iter().filter_map(|r| r.get("name").and_then(Value::as_str)).map(str::to_owned).collect();
     if !names.iter().any(|n| n == &f.selected) {
         f.selected = st.cal.current.label().to_owned();
     }
     let standard = CalendarCurrentView::parse(&f.selected).is_some();
-    window("Manage Views", "mc-cal-manage-window").default_pos(center).open(&mut open).show(ctx, |ui| {
+    window("Manage All Views", "mc-cal-manage-window").default_pos(center).open(&mut open).show(ctx, |ui| {
         crate::dialogs::form_visuals(ui, &app.theme);
-        ui.label("Calendar views:");
         egui::ScrollArea::vertical().id_salt("mc-cal-manage-list").max_height(180.0).show(ui, |ui| {
-            for n in &names {
-                let label = if CalendarCurrentView::parse(n).is_some() {
-                    format!("{n}  (standard)")
-                } else {
-                    n.clone()
-                };
-                if ui.selectable_label(&f.selected == n, label).clicked() {
-                    f.selected = n.clone();
-                    f.error.clear();
+            egui::Grid::new("mc-cal-manage-grid").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                ui.label(RichText::new("View Name").strong());
+                ui.label(RichText::new("Can Be Used On").strong());
+                ui.end_row();
+                for r in &rows {
+                    let name = r.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let used_on = r.get("usedOn").and_then(Value::as_str).unwrap_or_default();
+                    let folder_only = r.get("scope").and_then(Value::as_str) == Some("folder");
+                    if f.only_this_folder && !folder_only {
+                        continue;
+                    }
+                    if ui.selectable_label(f.selected == name, name).clicked() {
+                        f.selected = name.to_owned();
+                        f.error.clear();
+                    }
+                    ui.label(used_on);
+                    ui.end_row();
                 }
-            }
+            });
+        });
+        ui.checkbox(&mut f.only_this_folder, "Only show views created for this calendar");
+        let description = rows
+            .iter()
+            .find(|r| r.get("name").and_then(Value::as_str) == Some(f.selected.as_str()))
+            .and_then(|r| r.get("description").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_owned();
+        ui.label(RichText::new("Description").strong());
+        ui.label(RichText::new(description).color(app.theme.text_muted));
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Name (New, Copy, Rename):");
+            ui.add(TextEdit::singleline(&mut f.new_name).desired_width(180.0));
         });
         ui.horizontal(|ui| {
-            ui.label("New name (Copy, Rename):");
-            ui.add(TextEdit::singleline(&mut f.new_name).desired_width(180.0));
+            ui.label("Type of view (New):");
+            let kinds: Vec<&str> = CalendarCurrentView::ALL.iter().map(|c| c.label()).collect();
+            let cur = kinds.get(f.base).copied().unwrap_or("Calendar");
+            ComboBox::from_id_salt("mc-cal-manage-base").selected_text(cur).show_ui(ui, |ui| {
+                for (i, k) in kinds.iter().enumerate() {
+                    ui.selectable_value(&mut f.base, i, *k);
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Can be used on (New, Copy):");
+            ui.radio_value(&mut f.this_folder_scope, false, "All Calendar folders");
+            ui.radio_value(&mut f.this_folder_scope, true, "This calendar");
         });
         error_line(ui, app, &f.error);
         ui.add_space(4.0);
         let mut action: Option<&str> = None;
         ui.horizontal(|ui| {
-            if ui.button("Apply View").clicked() {
-                action = Some("apply");
+            if ui.button("New...").clicked() {
+                action = Some("new");
             }
             if ui.button("Copy...").clicked() {
                 action = Some("copy");
+            }
+            if ui.button("Modify...").clicked() {
+                action = Some("modify");
             }
             if ui.add_enabled(!standard, egui::Button::new("Rename...")).clicked() {
                 action = Some("rename");
@@ -762,28 +998,47 @@ fn manage_window(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &mut
             if ui.add_enabled(standard, egui::Button::new("Reset")).clicked() {
                 action = Some("reset");
             }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Apply View").clicked() {
+                action = Some("apply");
+            }
             if ui.button("Close").clicked() {
                 keep = false;
             }
         });
-        if let Some(a) = action {
-            if matches!(a, "copy" | "rename") && f.new_name.trim().is_empty() {
-                f.error = "Type a name for the view.".into();
-                return;
+        let Some(a) = action else { return };
+        if matches!(a, "new" | "copy" | "rename") && f.new_name.trim().is_empty() {
+            f.error = "Type a name for the view.".into();
+            return;
+        }
+        let scope = if f.this_folder_scope { "folder" } else { "all" };
+        let p = match a {
+            "modify" => json!({ "action": "apply", "name": f.selected }),
+            "new" => json!({
+                "action": "new",
+                "name": f.new_name.trim(),
+                "base": CalendarCurrentView::ALL.get(f.base).map_or("Calendar", |c| c.label()),
+                "scope": scope,
+            }),
+            _ => json!({ "action": a, "name": f.selected, "newName": f.new_name.trim(), "scope": scope }),
+        };
+        if run_view_cmd(app, st, "view.manageViews", p).is_some() {
+            f.error.clear();
+            if matches!(a, "new" | "copy" | "rename") {
+                f.selected = f.new_name.trim().to_owned();
+                f.new_name.clear();
             }
-            let p = json!({ "action": a, "name": f.selected, "newName": f.new_name.trim() });
-            if run_view_cmd(app, st, "view.manageViews", p).is_some() {
-                f.error.clear();
-                if matches!(a, "copy" | "rename") {
-                    f.selected = f.new_name.trim().to_owned();
-                    f.new_name.clear();
-                }
-                if a == "apply" {
-                    keep = false;
-                }
-            } else {
-                f.error = take_error(app);
+            if a == "modify" {
+                // View Settings of the view shown; OK stores them in the saved view.
+                cu.windows.modify = (!standard).then(|| f.selected.clone());
+                cu.windows.settings_requested = true;
             }
+            if a == "apply" {
+                keep = false;
+            }
+        } else {
+            f.error = take_error(app);
         }
     });
     if open && keep {
@@ -804,7 +1059,9 @@ fn save_view_window(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &
         if !r.has_focus() && f.name.is_empty() {
             r.request_focus();
         }
-        ui.label(RichText::new("Saved views can be used on every calendar.").color(app.theme.text_muted));
+        ui.label("Can be used on:");
+        ui.radio_value(&mut f.this_folder, false, "All Calendar folders");
+        ui.radio_value(&mut f.this_folder, true, "This calendar");
         error_line(ui, app, &f.error);
         let (ok, cancel) = ok_cancel(ui, "OK");
         if cancel {
@@ -813,7 +1070,14 @@ fn save_view_window(ctx: &egui::Context, app: &mut App, st: &mut ModState, cu: &
         if ok {
             if f.name.trim().is_empty() {
                 f.error = "Type a name for the view.".into();
-            } else if run_view_cmd(app, st, "view.saveViewAs", json!({ "name": f.name.trim() })).is_some() {
+            } else if run_view_cmd(
+                app,
+                st,
+                "view.saveViewAs",
+                json!({ "name": f.name.trim(), "scope": if f.this_folder { "folder" } else { "all" } }),
+            )
+            .is_some()
+            {
                 keep = false;
             } else {
                 f.error = take_error(app);
@@ -940,6 +1204,11 @@ impl Fetches {
     /// True while calendar `folder` is being fetched.
     pub(super) fn busy(&self, folder: u64) -> bool {
         self.0.lock().is_ok_and(|b| b.pending.contains(&folder))
+    }
+
+    /// True while any fetch runs or a finished one waits to be applied.
+    pub(super) fn active(&self) -> bool {
+        self.0.lock().is_ok_and(|b| !b.pending.is_empty() || !b.done.is_empty())
     }
 }
 

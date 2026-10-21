@@ -103,6 +103,12 @@ pub fn calendar_command(ctx: &egui::Context, app: &mut App, id: &str, params: Va
     out
 }
 
+/// Internet calendar refreshes queued by Send/Receive or Update Folder, in any module (see
+/// `calendar_view::background`).
+pub fn calendar_background(ctx: &egui::Context, app: &mut App) {
+    calendar_view::background(ctx, app);
+}
+
 /// Sets the People view ("people" = list with contact card, "card" = business-card grid).
 pub fn set_people_view(ctx: &egui::Context, view: &str) {
     let mut st = common::load(ctx);

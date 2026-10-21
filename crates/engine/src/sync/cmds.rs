@@ -48,6 +48,15 @@ pub fn download_mode(s: &Session) -> DownloadMode {
     }
 }
 
+/// "On Slow Connections Download Only Headers" for the current account (the menu's check box state; the
+/// value `sendReceive.preferences {"slowHeadersOnly": "toggle"}` flips).
+pub fn slow_headers_only(s: &Session) -> bool {
+    match s.current_account() {
+        Some(a) => account_options(s, a).slow_headers_only,
+        None => s.sync.prefs.data.defaults.slow_headers_only,
+    }
+}
+
 fn server_account(s: &Session, id: AccountId) -> bool {
     s.mailbox
         .account(id)

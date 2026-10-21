@@ -157,7 +157,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Folder",
             "Folder › New",
             "Mod+Shift+E",
-            r#"{"name"?:string,"parent"?:string|number,"account"?:number (with no parent: at the top of this account's folders),"contains"?:"mail"|"calendar"|"contacts"|"journal"|"notes"|"tasks" (what the folder holds; default: what the parent holds)}"#,
+            r#"{"name"?:string,"parent"?:string|number,"account"?:number (with no parent: at the top of this account's folders),"contains"?:"mail"|"calendar"|"contacts"|"journal"|"notes"|"tasks" (also "kind"; what the folder holds; default: the module's items in Calendar, People, Tasks and Notes, else what the parent holds)}"#,
             true,
             always,
             new_folder,
@@ -451,32 +451,53 @@ fn deleted_has_content(s: &Session) -> Option<&'static str> {
 // ---------------------------------------------------------------------------------------------------------
 // Create / rename / copy / move / delete
 
-/// "Folder contains" choice of New Folder.
+/// "Folder contains" choice of New Folder: a key, a few other spellings, or a label of [`FOLDER_CONTENTS`].
 fn folder_kind(v: &str) -> Option<FolderKind> {
-    Some(match v.trim().to_ascii_lowercase().as_str() {
+    let v = v.trim();
+    Some(match v.to_ascii_lowercase().as_str() {
         "mail" | "post" => FolderKind::Mail,
         "calendar" => FolderKind::Calendar,
         "contacts" | "contact" => FolderKind::Contacts,
         "tasks" | "task" => FolderKind::Tasks,
         "notes" | "note" => FolderKind::Notes,
         "journal" => FolderKind::Journal,
-        _ => return None,
+        _ => {
+            return FOLDER_CONTENTS
+                .iter()
+                .find(|(_, label, _)| label.eq_ignore_ascii_case(v))
+                .map(|(_, _, k)| *k);
+        }
     })
 }
 
-/// Create New Folder › Folder contains: (param value, folder kind), in the dialog's order.
-pub const FOLDER_CONTENTS: [(&str, FolderKind); 6] = [
-    ("mail", FolderKind::Mail),
-    ("calendar", FolderKind::Calendar),
-    ("contacts", FolderKind::Contacts),
-    ("journal", FolderKind::Journal),
-    ("notes", FolderKind::Notes),
-    ("tasks", FolderKind::Tasks),
+/// Create New Folder › Folder contains: (key, label, kind), in the dialog's order.
+pub const FOLDER_CONTENTS: [(&str, &str, FolderKind); 6] = [
+    ("mail", "Mail and Post Items", FolderKind::Mail),
+    ("calendar", "Calendar Items", FolderKind::Calendar),
+    ("contacts", "Contact Items", FolderKind::Contacts),
+    ("journal", "Journal Items", FolderKind::Journal),
+    ("notes", "Note Items", FolderKind::Notes),
+    ("tasks", "Task Items", FolderKind::Tasks),
 ];
 
-/// The "Folder contains" value of a folder kind (a new folder takes its parent's kind by default).
-pub fn contents_name(kind: FolderKind) -> &'static str {
-    FOLDER_CONTENTS.iter().find(|(_, k)| *k == kind).map_or("mail", |(n, _)| *n)
+/// The Folder contains key of a folder kind ("mail" for mail and search folders).
+pub fn contents_key(kind: FolderKind) -> &'static str {
+    FOLDER_CONTENTS.iter().find(|(_, _, k)| *k == kind).map_or("mail", |(key, _, _)| *key)
+}
+
+/// What a new folder contains by default: in the Calendar, People, Tasks and Notes modules their items,
+/// else what the parent holds (mail at the top of an account and under Search Folders).
+fn default_contents(s: &Session, parent: Option<FolderId>) -> FolderKind {
+    match s.view.module {
+        crate::Module::Calendar => FolderKind::Calendar,
+        crate::Module::People => FolderKind::Contacts,
+        crate::Module::Tasks => FolderKind::Tasks,
+        crate::Module::Notes => FolderKind::Notes,
+        _ => match parent.and_then(|f| s.mailbox.folder(f)).map(|f| f.kind) {
+            Some(FolderKind::Search | FolderKind::SearchRoot) | None => FolderKind::Mail,
+            Some(k) => k,
+        },
+    }
 }
 
 fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
@@ -498,7 +519,7 @@ fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
         None if account.is_some() => None,
         None => Some(current_folder(s, &Value::Null)?),
     };
-    let contains = match opt_str(p, "contains") {
+    let contains = match opt_str(p, "contains").or_else(|| opt_str(p, "kind")) {
         Some(v) => {
             Some(folder_kind(v).ok_or_else(|| CmdError::Params(format!("unknown folder contents `{v}`")))?)
         }
@@ -509,12 +530,17 @@ fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
     let fixed = matches!(parent_kind, FolderKind::Search | FolderKind::SearchRoot);
     let Some(name) = opt_str(p, "name") else {
         let path = parent.map(|f| s.mailbox.folder_path(f)).unwrap_or_default();
+        let default = contents_key(default_contents(s, parent));
+        let kinds: Vec<Value> =
+            FOLDER_CONTENTS.iter().map(|(k, l, _)| json!({ "key": k, "label": l })).collect();
         let mut params = match parent {
             Some(f) => json!({ "parent": f.0, "path": path }),
             None => json!({ "account": account.map(|a| a.0), "path": path }),
         };
         if let Some(o) = params.as_object_mut() {
-            o.insert("contains".into(), json!(contents_name(parent_kind)));
+            o.insert("contains".into(), json!(default));
+            o.insert("kind".into(), json!(default));
+            o.insert("kinds".into(), json!(kinds));
             o.insert("fixed".into(), json!(fixed));
         }
         return Ok(dialog(s, "createFolder", params));
@@ -522,20 +548,13 @@ fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
     if fixed && contains.is_some() {
         return Err(CmdError::Params("folders under Search Folders are search folders".into()));
     }
+    // No choice given: the module's items (Calendar, People, Tasks, Notes), else what the parent holds.
+    let contains = if fixed { None } else { Some(contains.unwrap_or_else(|| default_contents(s, parent))) };
     let id = match (parent, contains) {
-        (Some(parent), None) => s.mailbox.create_folder(parent, name)?,
-        (parent, kind) => {
-            let acct = match parent {
-                Some(f) => s.mailbox.folder_account(f),
-                None => account,
-            }
-            .ok_or_else(|| CmdError::Params("no account for the new folder".into()))?;
-            let kind = match (kind, parent.and_then(|f| s.mailbox.folder(f))) {
-                (Some(k), _) => k,
-                (None, Some(f)) => f.kind,
-                (None, None) => FolderKind::Mail,
-            };
-            s.mailbox.create_folder_in(acct, parent, name, kind)?
+        (Some(parent), kind) => s.mailbox.create_folder_of_kind(parent, name, kind)?,
+        (None, kind) => {
+            let acct = account.ok_or_else(|| CmdError::Params("no account for the new folder".into()))?;
+            s.mailbox.create_folder_in(acct, None, name, kind.unwrap_or(FolderKind::Mail))?
         }
     };
     if let Some(parent) = parent
@@ -544,7 +563,7 @@ fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
         f.expanded = true;
     }
     let kind = s.mailbox.folder(id).map(|f| f.kind).unwrap_or_default();
-    Ok(json!({ "folder": id.0, "path": s.mailbox.folder_path(id), "contains": contents_name(kind) }))
+    Ok(json!({ "folder": id.0, "path": s.mailbox.folder_path(id), "contains": contents_key(kind) }))
 }
 
 fn rename(s: &mut Session, p: &Value) -> CmdResult {

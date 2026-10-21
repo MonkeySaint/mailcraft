@@ -254,7 +254,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Items",
             "Home › New › New Items",
             "",
-            r#"{"kind":"appointment"|"meeting"|"allDayEvent"|"recurringAppointment"|"recurringMeeting"|"recurringEvent"|"meetingWithAll"|"contact"|"task"|"post"|"contactGroup"|"taskRequest"|"fromForm", "subject"?:string, "text"?:string, "html"?:string, "folder"?:number|string (post: subject/text save the post in the mail folder)}"#,
+            r#"{"kind":"appointment"|"meeting"|"allDayEvent"|"recurringAppointment"|"recurringMeeting"|"recurringEvent"|"meetingWithAll"|"contact"|"task"|"post"|"contactGroup"|"taskRequest"|"fromForm", "subject"?:string, "text"?:string, "html"?:string, "folder"?:number|string (post: subject/text save the post in the mail folder), "path"?:string, "dir"?:string, "list"?:bool (fromForm: open a .oft/.msg/.eml template, or list the templates of a folder)}"#,
             true,
             always,
             new_item,
@@ -827,7 +827,7 @@ fn new_item(s: &mut Session, p: &Value) -> CmdResult {
         "task" => return s.run("tasks.new", &json!({})),
         "contactGroup" => return s.run("people.newGroup", &json!({})),
         "taskRequest" => return open_dialog(s, "newTaskRequest", json!({"kind": kind})),
-        "fromForm" => return open_dialog(s, "chooseForm", json!({"kind": kind})),
+        "fromForm" => return choose_form(s, p),
         "email" | "message" => return new_email(s, p),
         other => return Err(CmdError::Params(format!("unknown item kind `{other}`"))),
     };
@@ -846,6 +846,104 @@ fn new_item(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     s.run(command, &params)
+}
+
+/// Largest template file Choose Form reads (bytes).
+pub const MAX_TEMPLATE_FILE: u64 = 25 * 1024 * 1024;
+/// Most templates listed from one folder.
+pub const MAX_TEMPLATES: usize = 500;
+
+/// File extensions of message templates: `.oft` (a template saved by another mail program, the same compound
+/// file format as `.msg` per [MS-OXMSG]), `.msg` and `.eml`.
+fn is_template(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| ["oft", "msg", "eml"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// The User Templates folder Choose Form looks in first: `templates` in the profile folder.
+pub fn templates_dir(s: &Session) -> Option<std::path::PathBuf> {
+    s.store.as_ref().map(|st| st.dir.join("templates"))
+}
+
+/// Templates in folder `dir` (name, path), sorted by name; empty when the folder cannot be read.
+pub fn template_files(dir: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<(String, String)> = rd
+        .filter_map(Result::ok)
+        .take(10_000)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_template(p))
+        .filter_map(|p| {
+            let name = p.file_stem()?.to_str()?.chars().filter(|c| !c.is_control()).take(200).collect();
+            Some((name, p.to_str()?.to_owned()))
+        })
+        .collect();
+    out.sort_by_key(|(n, _)| n.to_lowercase());
+    out.truncate(MAX_TEMPLATES);
+    out
+}
+
+/// Choose Form (`mail.newItem {"kind": "fromForm"}`): without `path` the Choose Form dialog opens with the
+/// standard forms and the templates of the User Templates folder (`dir`, default [`templates_dir`]);
+/// `list: true` only returns those templates. With `path` the template file (.oft, .msg or .eml) opens as a
+/// new message with its recipients, subject, body and attachments.
+fn choose_form(s: &mut Session, p: &Value) -> CmdResult {
+    let dir = opt_str(p, "dir").map(std::path::PathBuf::from).or_else(|| templates_dir(s));
+    let Some(path) = opt_str(p, "path").map(std::path::PathBuf::from) else {
+        let templates: Vec<Value> = dir
+            .as_deref()
+            .map(template_files)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, path)| json!({"name": name, "path": path}))
+            .collect();
+        let dir_text = dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+        if opt_bool(p, "list") == Some(true) {
+            return Ok(json!({"templates": templates, "dir": dir_text}));
+        }
+        return open_dialog(
+            s,
+            "chooseForm",
+            json!({"kind": "fromForm", "templates": templates, "dir": dir_text}),
+        );
+    };
+    if !is_template(&path) {
+        return Err(CmdError::Params("a template is an .oft, .msg or .eml file".into()));
+    }
+    let data = crate::cmd::rules::read_file_capped(&path, MAX_TEMPLATE_FILE)?;
+    let folder = s.selection.folder;
+    let is_eml = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("eml"));
+    let mut m = if is_eml {
+        mailcraft_formats::eml::read(&data, folder, s.now())
+    } else {
+        mailcraft_formats::msg::read_item(&data, folder, s.now())
+    }
+    .map_err(|e| CmdError::Failed(format!("the template could not be read: {e}")))?;
+    if m.raw.is_none() && is_eml {
+        m.raw = Some(data);
+    }
+    let join = |l: &[mailcraft_model::Address]| {
+        l.iter().map(crate::cmd::compose::field_mailbox).collect::<Vec<_>>().join("; ")
+    };
+    let c = ComposeState {
+        kind: ComposeKind::New,
+        inline: false,
+        to: join(&m.to),
+        cc: join(&m.cc),
+        bcc: join(&m.bcc),
+        show_bcc: !m.bcc.is_empty(),
+        subject: m.subject.clone(),
+        body: body_doc(&m),
+        format: m.body.format,
+        importance: m.importance,
+        attachments: source_attachments(&m),
+        dirty: true,
+        ..Default::default()
+    };
+    let id = s.open_compose(c);
+    let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
+    Ok(json!({"compose": id, "template": name}))
 }
 
 /// Lower-case address of `m` is one of the user's own.

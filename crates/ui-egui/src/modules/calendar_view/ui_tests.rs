@@ -355,7 +355,7 @@ fn share_and_view_windows_are_the_calendars_own() {
     let mut h = harness(app());
     for (id, title) in [
         ("calendar.share", "Share Calendar"),
-        ("view.manageViews", "Manage Views"),
+        ("view.manageViews", "Manage All Views"),
         ("view.saveViewAs", "Save View As"),
         ("view.applyViewTo", "Apply View"),
     ] {
@@ -368,7 +368,8 @@ fn share_and_view_windows_are_the_calendars_own() {
         assert!(h.state().ui.dialogs.is_empty(), "{id}: no generic window");
     }
     assert!(has_part(&h, "Free and busy times only"), "the share window's detail note");
-    assert!(has_part(&h, "Calendar  (standard)"));
+    assert!(has_part(&h, "All Calendar folders"), "where each view can be used");
+    assert!(has(&h, "New..."), "Manage Views can make a view");
 }
 
 #[test]

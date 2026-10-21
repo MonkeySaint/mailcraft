@@ -745,6 +745,35 @@ fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool, prev
 // Module
 // ---------------------------------------------------------------------------------------------------------
 
+fn background_id() -> Id {
+    Id::new("mailcraft.modules.calendar.background")
+}
+
+/// Every frame, in any module: internet calendar refreshes that Send/Receive or Update Folder queued
+/// (`SyncState::calendar_requests`) go to the fetch workers, and finished fetches are applied. Idle frames
+/// only read one flag.
+pub(super) fn background(ctx: &egui::Context, app: &mut App) {
+    let requests = mailcraft_engine::cmd::send_receive::take_calendar_requests(&mut app.s);
+    let active = ctx.data(|d| d.get_temp::<bool>(background_id())).unwrap_or(false);
+    if requests.is_empty() && !active {
+        return;
+    }
+    let mut cu = load_ui(ctx);
+    for d in requests {
+        cu.fetches.start(ctx, d);
+    }
+    if app.s.view.module != mailcraft_engine::Module::Calendar {
+        // The calendar view polls for itself while it shows.
+        windows::poll_fetches(ctx, app, &mut cu);
+    }
+    let still = cu.fetches.active();
+    store_ui(ctx, cu);
+    ctx.data_mut(|d| d.insert_temp(background_id(), still));
+    if still {
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+}
+
 pub(super) fn show(ui: &mut Ui, app: &mut App) {
     let ctx = ui.ctx().clone();
     let mut st = load(&ctx);

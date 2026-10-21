@@ -345,7 +345,9 @@ pub fn ui_semibold() -> egui::FontFamily {
 }
 
 impl App {
-    pub fn new(s: Session) -> App {
+    pub fn new(mut s: Session) -> App {
+        // Internet calendars are fetched on the UI's worker threads (`modules::calendar_background`).
+        s.sync.background_calendars = true;
         let theme = theme::Theme::for_dark(s.view.dark);
         App { s, ui: UiState::default(), theme, icons: icons::Icons::default(), files: None }
     }
@@ -441,6 +443,7 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         control::frame(&ctx, self);
         self.poll_sync(&ctx);
+        modules::calendar_background(&ctx, self);
         dialogs::auto_archive_tick(&ctx, self);
         keys::handle(&ctx, self, Surface::Main);
         self.drain_notices(&ctx);

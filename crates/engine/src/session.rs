@@ -201,6 +201,9 @@ pub struct Session {
     settings_dir: Option<std::path::PathBuf>,
     /// Bytes last read from or written to `settings.json` (identical states are not rewritten).
     settings_saved: Option<Vec<u8>>,
+    /// The command whose enabled check is running names its items in its params (`id` / `ids`), see
+    /// [`Session::params_name_items`].
+    params_name_items: bool,
 }
 
 /// Longest wait for "Perform an automatic send/receive when exiting" (seconds).
@@ -250,6 +253,7 @@ impl Session {
             direct_print: false,
             settings_dir: None,
             settings_saved: None,
+            params_name_items: false,
         };
         s.refresh_me();
         s.select_default_folder();
@@ -684,7 +688,10 @@ impl Session {
         let Some(spec) = self.registry.get(id).cloned() else {
             return Err(CmdError::Unknown(id.to_owned()));
         };
-        match catch_unwind(AssertUnwindSafe(|| (spec.enabled)(self))) {
+        let named = std::mem::replace(&mut self.params_name_items, names_items(params));
+        let enabled = catch_unwind(AssertUnwindSafe(|| (spec.enabled)(self)));
+        self.params_name_items = named;
+        match enabled {
             Ok(None) => {}
             Ok(Some(why)) => return Err(CmdError::Disabled(why.to_owned())),
             Err(payload) => {
@@ -929,6 +936,13 @@ impl Session {
     }
 
     /// Whether a command is currently enabled (`None` = enabled).
+    /// True while the enabled check of a command whose params name its items (a non-null `id`, or a
+    /// non-empty `ids`) runs: a check that only asks "is something selected?" passes then, so scripts (CLI,
+    /// MCP) can act on items by id with nothing selected, while the ribbon still greys the command out.
+    pub fn params_name_items(&self) -> bool {
+        self.params_name_items
+    }
+
     pub fn enabled(&self, id: &str) -> Option<&'static str> {
         match self.registry.get(id) {
             Some(spec) => (spec.enabled)(self),
@@ -1030,6 +1044,12 @@ pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
         }
     }
     ops
+}
+
+/// Whether command params name the items to act on ([`Session::params_name_items`]).
+fn names_items(params: &Value) -> bool {
+    params.get("id").is_some_and(|v| !v.is_null())
+        || params.get("ids").and_then(Value::as_array).is_some_and(|a| !a.is_empty())
 }
 
 #[cfg(test)]
