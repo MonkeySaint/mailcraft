@@ -18,6 +18,22 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
 - AutoText starts with your name and initials; F3 in a message inserts the entry you started typing.
 - Font Color has High-contrast only; Insert › Symbol has the smiling face; F1 in a message opens Writing
   mail help.
+- Compose drawing: shapes, text boxes, WordArt and drawing canvases are floating objects you can move,
+  resize and type into, with a Shape Format tab; icons, charts, SmartArt and 3D models are sent as PNG and
+  can be edited after insert.
+- Compose paragraph tools: Borders and Shading, Find and Replace options (wildcards, special characters,
+  Highlight All), Insert Hyperlink to places and bookmarks in the message, Sort Text, nine-level lists,
+  Draw Table.
+- Tasks: the Tasks ribbon and menus act on flagged messages and contacts in the To-Do List.
+- Read windows: Edit Message edits the received message in place; commands act on the window's own
+  message.
+- Recover Deleted Items keeps permanently deleted items across restarts; the status bar shows the mailbox
+  quota; Send/Receive groups with their own schedules.
+- Stationery, form-field search conditions and the conversation: search term.
+- Mail Merge to form letters, mailing labels and envelopes; Calendar Properties and the contact folder's
+  Address Book tab; each main window keeps its own calendar.
+- Contacts and tasks sync with CardDAV and CalDAV servers; calendars can be published to a WebDAV
+  location; other users' and shared IMAP mailboxes can be opened.
 
 ## 0.2.0
 
