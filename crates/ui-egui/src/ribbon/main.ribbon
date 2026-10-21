@@ -274,7 +274,7 @@ item | Clean Up Folder & Subfolders | | mail.cleanUpSubfolders | | E
 menu block
 item | Block Sender | block | mail.block | {"kind":"sender"} | B
 item | Never Block Sender | | mail.block | {"kind":"neverSender"} | S
-item | Never Block Sender's Domain | | mail.block | {"kind":"neverDomain"} | D
+dyn | senderDomain | mail.block | {"kind":"neverDomain"}
 item | Never Block this Group or Mailing List | | mail.block | {"kind":"neverList"} | M
 sep
 item | Junk E-mail Options... | junk | mail.junk | {"action":"options"} | O
@@ -362,7 +362,11 @@ item | Forward as Attachment | forward | mail.forwardAsAttachment | | F
 
 menu sendReceiveGroups
 item | All Accounts | sync | sendReceive.all | | 0
+dyn | srGroups | sendReceive.group | {"name":"$name"}
 dyn | accounts | sendReceive.group | {"name":"$name"}
+item | Inbox | inbox | sendReceive.group | {"name":"Inbox"} | I
+sep
+item | Define Send/Receive Groups... | settings | sendReceive.defineGroups | | D
 
 menu markToDownload
 item | Mark to Download | check | sendReceive.markToDownload | | T

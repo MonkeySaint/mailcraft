@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use mailcraft_engine::{Module, Notice, Session};
 use mailcraft_model::{ItemId, ReadingPanePos};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Which window a ribbon / keyboard handler belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -94,6 +94,23 @@ pub struct UiState {
     pub todo_bar_parts: (bool, bool, bool),
     /// The To-Do Bar parts an older profile kept in the dialog settings were taken over (and removed there).
     pub todo_bar_migrated: bool,
+    /// Rename Folder in place in the folder pane (the row being renamed and the text typed).
+    pub inline_rename: Option<InlineRename>,
+    /// Text for the system clipboard after Copy (copied messages as From / Received / To / Subject lines), put
+    /// there at the next frame boundary.
+    pub clipboard_out: Option<String>,
+}
+
+/// A folder being renamed in the folder pane.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InlineRename {
+    pub folder: u64,
+    pub text: String,
+    /// The text box got the keyboard focus.
+    pub focused: bool,
+    /// The row was drawn this frame (a folder whose row is not visible gets the Rename Folder dialog).
+    pub drawn: bool,
+    pub missed: u8,
 }
 
 impl Surface {
@@ -397,6 +414,12 @@ impl App {
                 if id == "view.todoBar" {
                     self.ui.todo_bar_parts = modules::todo_bar_parts(self);
                 }
+                // Copied messages also reach other programs as text.
+                if id == "app.copy"
+                    && let Some(text) = v.get("text").and_then(Value::as_str).filter(|t| !t.is_empty())
+                {
+                    self.ui.clipboard_out = Some(text.to_owned());
+                }
                 Some(v)
             }
             Err(e) => {
@@ -489,10 +512,31 @@ impl App {
         // Item windows (appointment, contact, task, Go to Date) take their requests out of `ui.dialogs`
         // before the dialogs area draws the rest; a no-op when a module view already drew them this pass.
         modules::pim_windows(&ctx, self);
+        self.inline_rename_fallback();
         dialogs::dialogs(&ctx, self);
 
         self.drain_notices(&ctx);
+        if let Some(text) = self.ui.clipboard_out.take() {
+            ctx.copy_text(text);
+        }
         self.draw_toasts(&ctx);
+    }
+
+    /// A folder renamed in place whose row did not show (collapsed parent, pane hidden) gets the Rename
+    /// Folder dialog instead.
+    fn inline_rename_fallback(&mut self) {
+        let Some(r) = self.ui.inline_rename.as_mut() else { return };
+        if r.drawn {
+            r.drawn = false;
+            r.missed = 0;
+            return;
+        }
+        r.missed = r.missed.saturating_add(1);
+        if r.missed > 2
+            && let Some(r) = self.ui.inline_rename.take()
+        {
+            dialogs::open(self, "renameFolder", json!({"folder": r.folder, "name": r.text, "inline": false}));
+        }
     }
 
     /// Mirrors the To-Do Bar parts the session keeps into [`UiState::todo_bar_parts`]; parts an older profile

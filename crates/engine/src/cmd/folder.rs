@@ -11,10 +11,7 @@ use serde_json::{Value, json};
 
 use super::util::{opt_bool, opt_str};
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Selection, Session, always};
-use mailcraft_model::{
-    AccountId, Appointment, Contact, Folder, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox,
-    Note, Rule, Task,
-};
+use mailcraft_model::{AccountId, Folder, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox, Rule};
 
 #[allow(clippy::too_many_arguments)]
 fn spec(
@@ -197,7 +194,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Recover Deleted Items",
             "Folder › Clean Up",
             "",
-            r#"{"ids"?:[number]}"#,
+            r#"{"ids"?:[number] (recover these), "purge"?:[number] (remove these from the list for good)}"#,
             true,
             always,
             recover_deleted,
@@ -794,164 +791,40 @@ fn empty_deleted(s: &mut Session, _p: &Value) -> CmdResult {
     Ok(json!({ "items": items, "folders": subs.len() }))
 }
 
-/// An item of any kind that is gone from the mailbox but still held by an undo snapshot.
-#[derive(Clone)]
-enum Lost {
-    Mail(Box<MailItem>),
-    Appointment(Box<Appointment>),
-    Contact(Box<Contact>),
-    Task(Box<Task>),
-    Note(Box<Note>),
-}
-
-impl Lost {
-    fn id(&self) -> ItemId {
-        match self {
-            Lost::Mail(m) => m.id,
-            Lost::Appointment(a) => a.id,
-            Lost::Contact(c) => c.id,
-            Lost::Task(t) => t.id,
-            Lost::Note(n) => n.id,
-        }
-    }
-
-    fn folder(&self) -> FolderId {
-        match self {
-            Lost::Mail(m) => m.folder,
-            Lost::Appointment(a) => a.folder,
-            Lost::Contact(c) => c.folder,
-            Lost::Task(t) => t.folder,
-            Lost::Note(n) => n.folder,
-        }
-    }
-
-    /// (kind, subject, from, date) for the Recover Deleted Items list.
-    fn summary(&self) -> (&'static str, String, String, i64) {
-        match self {
-            Lost::Mail(m) => (
-                "mail",
-                m.subject.clone(),
-                m.from.as_ref().map(|f| f.addr.clone()).unwrap_or_default(),
-                m.received.unix,
-            ),
-            Lost::Appointment(a) => ("appointment", a.subject.clone(), String::new(), a.start.unix),
-            Lost::Contact(c) => ("contact", c.full_name(), String::new(), 0),
-            Lost::Task(t) => ("task", t.subject.clone(), String::new(), t.due.map_or(0, |d| d.unix)),
-            Lost::Note(n) => {
-                ("note", n.text.lines().next().unwrap_or("").to_owned(), String::new(), n.modified.unix)
-            }
-        }
-    }
-
-    /// Puts the item back into `mb` with `id` in `folder`.
-    fn restore(self, mb: &mut Mailbox, id: ItemId, folder: FolderId) {
-        match self {
-            Lost::Mail(mut m) => {
-                m.id = id;
-                m.folder = folder;
-                // The server copy is gone: the item comes back as a new local message (a synchronised folder
-                // uploads it).
-                m.remote_id = None;
-                mb.mail.insert(id, *m);
-            }
-            Lost::Appointment(mut a) => {
-                a.id = id;
-                a.folder = folder;
-                mb.appointments.insert(id, *a);
-            }
-            Lost::Contact(mut c) => {
-                c.id = id;
-                c.folder = folder;
-                mb.contacts.insert(id, *c);
-            }
-            Lost::Task(mut t) => {
-                t.id = id;
-                t.folder = folder;
-                mb.tasks.insert(id, *t);
-            }
-            Lost::Note(mut n) => {
-                n.id = id;
-                n.folder = folder;
-                mb.notes.insert(id, *n);
-            }
-        }
-    }
-}
-
-/// Most items Recover Deleted Items lists.
-const MAX_RECOVERABLE: usize = 5000;
-
-/// Items of every kind that are gone from the mailbox but still held by an undo snapshot (newest snapshot
-/// first; at most [`MAX_RECOVERABLE`]). Nothing can be fetched back from a server: IMAP and JMAP keep no
-/// copy of an expunged / destroyed message.
-fn recoverable(s: &Session) -> Vec<Lost> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    let mb = &s.mailbox;
-    for entry in s.undo.undo.iter().rev() {
-        let b = &entry.before;
-        let lost = b
-            .mail
-            .values()
-            .filter(|m| !mb.mail.contains_key(&m.id))
-            .map(|m| Lost::Mail(Box::new(m.clone())))
-            .chain(
-                b.appointments
-                    .values()
-                    .filter(|a| !mb.appointments.contains_key(&a.id))
-                    .map(|a| Lost::Appointment(Box::new(a.clone()))),
-            )
-            .chain(
-                b.contacts
-                    .values()
-                    .filter(|c| !mb.contacts.contains_key(&c.id))
-                    .map(|c| Lost::Contact(Box::new(c.clone()))),
-            )
-            .chain(
-                b.tasks
-                    .values()
-                    .filter(|t| !mb.tasks.contains_key(&t.id))
-                    .map(|t| Lost::Task(Box::new(t.clone()))),
-            )
-            .chain(
-                b.notes
-                    .values()
-                    .filter(|n| !mb.notes.contains_key(&n.id))
-                    .map(|n| Lost::Note(Box::new(n.clone()))),
-            );
-        for item in lost {
-            if out.len() >= MAX_RECOVERABLE {
-                return out;
-            }
-            if seen.insert(item.id()) {
-                out.push(item);
-            }
-        }
-    }
-    out
-}
-
-/// Recover Deleted Items: no `ids` lists what can be recovered (dialog); `ids` puts those items back into
-/// the Deleted Items folder of their account.
+/// Recover Deleted Items: no `ids` lists what can be recovered from the recoverable-items bin (dialog,
+/// newest first, see `crate::recover`); `ids` puts those items back into the Deleted Items folder of their
+/// account; `purge` removes those entries from the bin for good.
 fn recover_deleted(s: &mut Session, p: &Value) -> CmdResult {
-    let items = recoverable(s);
-    let Some(ids) = super::util::opt_ids(p) else {
-        let list: Vec<Value> = items
+    if let Some(purge) = p.get("purge") {
+        let ids: Vec<ItemId> = purge
+            .as_array()
+            .ok_or_else(|| CmdError::Params("`purge` takes a list of item ids".into()))?
             .iter()
-            .map(|it| {
-                let (kind, subject, from, when) = it.summary();
+            .filter_map(Value::as_u64)
+            .map(ItemId)
+            .collect();
+        let purged = crate::recover::purge(s, &ids);
+        return Ok(json!({ "purged": purged }));
+    }
+    let Some(ids) = super::util::opt_ids(p) else {
+        let list: Vec<Value> = crate::recover::listed(s)
+            .into_iter()
+            .map(|e| {
+                let (subject, from, when) = e.item.summary();
                 json!({
-                    "id": it.id().0,
-                    "kind": kind,
+                    "id": e.item.id().0,
+                    "kind": e.item.kind(),
                     "subject": subject,
                     "from": from,
                     "received": when,
-                    "folder": s.mailbox.folder_path(it.folder()),
+                    "deleted": e.deleted,
+                    "folder": e.folder_path,
                 })
             })
             .collect();
         let count = list.len();
-        let mut v = dialog(s, "recoverDeletedItems", json!({ "items": list }));
+        let days = crate::recover::keep_days(s);
+        let mut v = dialog(s, "recoverDeletedItems", json!({ "items": list, "days": days }));
         if let Some(o) = v.as_object_mut() {
             o.insert("count".into(), json!(count));
         }
@@ -959,9 +832,15 @@ fn recover_deleted(s: &mut Session, p: &Value) -> CmdResult {
     };
     let fallback = deleted_items_folder(s);
     let wanted: BTreeSet<ItemId> = ids.into_iter().collect();
+    let items: Vec<mailcraft_model::DeletedItem> = crate::recover::listed(s)
+        .into_iter()
+        .filter(|e| wanted.contains(&e.item.id()))
+        .map(|e| e.item.clone())
+        .collect();
     let mut restored = Vec::new();
     let mut recovered = Vec::new();
-    for item in items.into_iter().filter(|it| wanted.contains(&it.id())) {
+    let mut pairs = Vec::new();
+    for item in items {
         let old_id = item.id();
         let account = s.mailbox.folder_account(item.folder());
         let target = account
@@ -974,7 +853,9 @@ fn recover_deleted(s: &mut Session, p: &Value) -> CmdResult {
         item.restore(&mut s.mailbox, id, target);
         restored.push(id.0);
         recovered.push(old_id.0);
+        pairs.push((old_id, id));
     }
+    crate::recover::mark_recovered(s, &pairs);
     Ok(json!({ "restored": restored.len(), "ids": restored, "recovered": recovered }))
 }
 
@@ -1235,6 +1116,7 @@ fn properties(s: &mut Session, p: &Value) -> CmdResult {
         "unread": mb.unread_count(id),
         "total": mb.total_count(id).saturating_add(pim),
         "sizeKb": size.div_ceil(1024),
+        "sizes": folder_sizes(mb, id),
     });
     if let Some(o) = params.as_object_mut() {
         match kind {
@@ -1265,6 +1147,41 @@ fn properties(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     Ok(dialog(s, "folderProperties", params))
+}
+
+/// Most rows the Folder Size list shows.
+const MAX_SIZE_ROWS: usize = 500;
+
+/// Folder Size: the folder and each subfolder with its own size and its size with its subfolders (KB), the
+/// folder itself first, then the subfolders by path.
+fn folder_sizes(mb: &Mailbox, id: FolderId) -> Vec<Value> {
+    let tree: BTreeSet<FolderId> = mb.subtree(id).into_iter().collect();
+    let mut own: BTreeMap<FolderId, u64> = BTreeMap::new();
+    for m in mb.mail.values().filter(|m| tree.contains(&m.folder)) {
+        let e = own.entry(m.folder).or_default();
+        *e = e.saturating_add(m.size);
+    }
+    let base = mb.folder_path(id);
+    let mut rows: Vec<(String, u64, u64)> = tree
+        .iter()
+        .take(MAX_SIZE_ROWS)
+        .map(|f| {
+            let total = mb
+                .subtree(*f)
+                .iter()
+                .fold(0u64, |acc, x| acc.saturating_add(own.get(x).copied().unwrap_or(0)));
+            let path = mb.folder_path(*f);
+            let rel =
+                path.strip_prefix(&base).map(|r| r.trim_start_matches('\\')).unwrap_or(&path).to_owned();
+            (rel, own.get(f).copied().unwrap_or(0), total)
+        })
+        .collect();
+    rows.sort_by(|a, b| (!a.0.is_empty(), &a.0).cmp(&(!b.0.is_empty(), &b.0)));
+    rows.into_iter()
+        .map(|(path, size, total)| {
+            json!({"path": path, "sizeKb": size.div_ceil(1024), "totalKb": total.div_ceil(1024)})
+        })
+        .collect()
 }
 
 /// The folder's AutoArchive properties: opens the dialog, or saves them (see `crate::archive`).
@@ -1752,6 +1669,19 @@ mod tests {
         assert_eq!(p(&s)["kind"], "mail");
         assert_eq!(p(&s)["type"], folder_type_label(FolderKind::Mail));
         assert!(p(&s).get("calendar").is_none());
+        // Folder Size: the folder, then each subfolder with and without its own subfolders.
+        let inbox = s.selection.folder;
+        let sub = s.mailbox.create_folder(inbox, "Big").unwrap();
+        let deeper = s.mailbox.create_folder(sub, "Bigger").unwrap();
+        s.mailbox.add_mail(MailItem { folder: sub, size: 4096, ..Default::default() });
+        s.mailbox.add_mail(MailItem { folder: deeper, size: 2048, ..Default::default() });
+        run(&mut s, "folder.properties", json!({"folder": inbox.0}));
+        let sizes = p(&s)["sizes"].as_array().unwrap().clone();
+        assert_eq!(sizes[0]["path"], "");
+        assert_eq!(sizes[0]["totalKb"].as_u64().unwrap(), p(&s)["sizeKb"].as_u64().unwrap() + 6);
+        let big = sizes.iter().find(|r| r["path"] == "Big").unwrap();
+        assert_eq!((big["sizeKb"].as_u64(), big["totalKb"].as_u64()), (Some(4), Some(6)));
+        assert!(sizes.iter().any(|r| r["path"] == "Big\\Bigger" && r["sizeKb"] == 2));
         let cal = role(&s, FolderRole::Calendar);
         run(&mut s, "calendar.newAppointment", json!({"subject": "Dentist", "start": "2026-10-12T09:00"}));
         let mut props = crate::cmd::calendar::props::read(&s.mailbox, cal);

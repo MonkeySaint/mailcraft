@@ -24,6 +24,21 @@ pub enum QuickStepAction {
     Reply,
     ReplyAll,
     NewMeeting,
+    /// Forward the messages as attachments (to these people; empty = ask on first use).
+    ForwardAsAttachment(Vec<String>),
+    /// Reply with a meeting request.
+    ReplyWithMeeting,
+    /// A task with the message's subject and text.
+    CreateTask,
+    /// An appointment with the message's subject and text (opened for its time).
+    CreateAppointment,
+    /// Ignore the conversation.
+    Ignore,
+    /// Always move the conversation to this folder (`None` = ask on first use).
+    AlwaysMoveConversation(Option<FolderId>),
+    /// Focused Inbox: move to Focused / to Other.
+    MoveToFocused,
+    MoveToOther,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,8 +106,12 @@ impl QuickStep {
     pub fn needs_setup(&self) -> bool {
         self.actions.is_empty()
             || self.actions.iter().any(|a| {
-                matches!(a, QuickStepAction::MoveTo(None) | QuickStepAction::CopyTo(None))
-                    || matches!(a, QuickStepAction::Forward(to) | QuickStepAction::NewMessageTo(to) if to.is_empty())
+                matches!(
+                    a,
+                    QuickStepAction::MoveTo(None)
+                        | QuickStepAction::CopyTo(None)
+                        | QuickStepAction::AlwaysMoveConversation(None)
+                ) || matches!(a, QuickStepAction::Forward(to) | QuickStepAction::NewMessageTo(to) if to.is_empty())
             })
     }
 }

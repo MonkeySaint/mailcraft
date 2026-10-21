@@ -320,8 +320,16 @@ fn folder_row(ui: &mut Ui, app: &mut App, row: &FolderRow, highlight: bool) -> b
         name_right = t.paint_right(&painter, rect, rect.right() - 10.0) - 6.0;
     }
     let name_x = icon_c.x + 14.0;
-    let t = Text::new(ui, &row.name, 13.5, false, th.text, (name_right - name_x).max(1.0), 1);
-    t.paint_left(&painter, rect, name_x);
+    let renaming = row.kind != FolderRowKind::Favorite
+        && app.ui.inline_rename.as_ref().is_some_and(|r| r.folder == fid.0);
+    if renaming {
+        let edit =
+            Rect::from_min_max(pos2(name_x - 2.0, rect.top() + 2.0), pos2(name_right, rect.bottom() - 2.0));
+        inline_rename(ui, app, fid, edit);
+    } else {
+        let t = Text::new(ui, &row.name, 13.5, false, th.text, (name_right - name_x).max(1.0), 1);
+        t.paint_left(&painter, rect, name_x);
+    }
 
     let mut navigated = false;
     resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, highlight, &row.accessible));
@@ -358,6 +366,38 @@ fn folder_row(ui: &mut Ui, app: &mut App, row: &FolderRow, highlight: bool) -> b
         run(ui, app, cmd, json!({ "folder": fid.0 }));
     }
     navigated
+}
+
+/// The name box of a folder renamed in place: Enter (or leaving the box) renames, Escape keeps the name.
+fn inline_rename(ui: &mut Ui, app: &mut App, fid: FolderId, rect: Rect) {
+    let Some(mut r) = app.ui.inline_rename.take() else { return };
+    let id = Id::new(("mailcraft.folders.rename", fid.0));
+    let resp = ui.put(rect, egui::TextEdit::singleline(&mut r.text).id(id).desired_width(rect.width()));
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Folder name"));
+    if !r.focused {
+        resp.request_focus();
+        r.focused = true;
+    }
+    r.drawn = true;
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return;
+    }
+    if resp.lost_focus() {
+        let name = r.text.trim().to_owned();
+        let current = app.s.mailbox.folder(fid).map(|f| f.name.clone()).unwrap_or_default();
+        if name.is_empty() || name == current {
+            return;
+        }
+        if crate::menus::run_folder(app, fid, "folder.rename", json!({"folder": fid.0, "name": name}))
+            .is_none()
+        {
+            // Refused (a duplicate name…): keep editing; the toast says why.
+            r.focused = false;
+            app.ui.inline_rename = Some(r);
+        }
+        return;
+    }
+    app.ui.inline_rename = Some(r);
 }
 
 /// Minimised pane: › button and the Favorites (or the current folder) written top to bottom.
@@ -492,6 +532,24 @@ mod tests {
         assert!(inbox.accessible.contains("unread"));
         assert_eq!(h.query_all_by_label(&inbox.accessible).count(), 2, "favourite + tree row");
         assert!(h.query_by_label("Minimize the Folder Pane").is_some());
+    }
+
+    #[test]
+    fn rename_folder_in_place() {
+        let mut app = App::new(sample_session());
+        let projects = app.s.mailbox.folders.values().find(|f| f.name == "Projects").map(|f| f.id.0).unwrap();
+        crate::dialogs::open(&mut app, "renameFolder", json!({"folder": projects, "name": ""}));
+        assert!(app.ui.dialogs.is_empty(), "renamed in the folder pane, not a dialog");
+        let mut h = harness(app, vec2(230.0, 900.0));
+        h.run();
+        h.get_by_label("Folder name").type_text("Ventures");
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        h.run();
+        let name = h.state().s.mailbox.folder(FolderId(projects)).unwrap().name.clone();
+        assert_eq!(name, "Ventures");
+        assert!(h.state().ui.inline_rename.is_none());
     }
 
     #[test]

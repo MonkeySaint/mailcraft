@@ -89,7 +89,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "More Filters",
             "Home › Find › Filter Email",
             "",
-            r#"{"kind"?:"from|to|cc|subject|body|attachments|hasAttachments|categorized|sentTo|unread|read|flagged|important|importance|thisWeek|received|sent|size|folder|expiringSoon|formField","value"?:string} (no kind = enter Search mode; from/to/cc/subject/body/attachments/folder without a value and sentTo "other" put key:"" in the box with the caret between the quotes)"#,
+            r#"{"kind"?:"from|to|cc|subject|body|attachments|hasAttachments|categorized|sentTo|unread|read|flagged|important|importance|thisWeek|received|sent|size|folder|expiringSoon|formField|refiners|field|removeField","value"?:string, "field"?:string, "condition"?:string, "replace"?:string, "term"?:string} (no kind = enter Search mode; from/to/cc/subject/body/attachments/folder without a value and sentTo "other" put key:"" in the box with the caret between the quotes; formField = the Add Form Field chooser; field adds a form-field condition (field, condition, value; replace = the term it replaces); removeField removes `term`)"#,
             false,
             always,
             refine,
@@ -429,6 +429,28 @@ fn refine(s: &mut Session, p: &Value) -> CmdResult {
     };
     if kind == "formField" {
         let folder = current_folder(s, &Value::Null).map(|f| f.0).unwrap_or_default();
+        return Ok(dialog(
+            s,
+            "addFormField",
+            json!({ "folder": folder, "forms": form_fields_json(), "conditions": field_conditions(&s.view.search), "query": s.view.search }),
+        ));
+    }
+    if kind == "field" {
+        return add_field_condition(s, p);
+    }
+    if kind == "removeField" {
+        let term = opt_str(p, "term").map(str::trim).unwrap_or_default();
+        let mut list = terms(&s.view.search);
+        let before = list.len();
+        list.retain(|t| !t.eq_ignore_ascii_case(term));
+        if list.len() == before {
+            return Err(CmdError::Params("that condition is not in the search".into()));
+        }
+        s.view.search = list.join(" ");
+        return Ok(summary(s));
+    }
+    if kind == "refiners" {
+        let folder = current_folder(s, &Value::Null).map(|f| f.0).unwrap_or_default();
         let kinds = [
             "from",
             "to",
@@ -516,6 +538,236 @@ fn refine(s: &mut Session, p: &Value) -> CmdResult {
         o.insert("on".into(), json!(on));
     }
     Ok(out)
+}
+
+/// Field types of Add Form Field: what conditions and values they take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldType {
+    Text,
+    Date,
+    Number,
+    /// One of the listed values.
+    Choice(&'static [&'static str]),
+}
+
+const YES_NO: &[&str] = &["Yes", "No"];
+const SENSITIVITIES: &[&str] = &["Normal", "Personal", "Private", "Confidential"];
+const LEVELS: &[&str] = &["Low", "Normal", "High"];
+const TASK_STATUSES: &[&str] =
+    &["Not Started", "In Progress", "Completed", "Waiting on someone else", "Deferred"];
+const FLAG_STATUSES: &[&str] = &["Flagged", "Completed"];
+const CLASSES: &[&str] = &[
+    "IPM.Note",
+    "IPM.Schedule.Meeting.Request",
+    "IPM.Appointment",
+    "IPM.Contact",
+    "IPM.Task",
+    "IPM.StickyNote",
+];
+
+/// Add Form Field: the item properties a condition can test, grouped by form (group, field label, type).
+/// The labels name the properties of `mailcraft_search::Doc::props` (compared without spaces).
+pub const FORM_FIELDS: &[(&str, &str, FieldType)] = &[
+    ("Frequently-used fields", "Subject", FieldType::Text),
+    ("Frequently-used fields", "From", FieldType::Text),
+    ("Frequently-used fields", "To", FieldType::Text),
+    ("Frequently-used fields", "Categories", FieldType::Text),
+    ("Frequently-used fields", "Importance", FieldType::Choice(LEVELS)),
+    ("Frequently-used fields", "Sensitivity", FieldType::Choice(SENSITIVITIES)),
+    ("Frequently-used fields", "Received", FieldType::Date),
+    ("Frequently-used fields", "Due Date", FieldType::Date),
+    ("Frequently-used fields", "Message Class", FieldType::Choice(CLASSES)),
+    ("Frequently-used fields", "Size", FieldType::Number),
+    ("All Mail fields", "Cc", FieldType::Text),
+    ("All Mail fields", "Sent", FieldType::Date),
+    ("All Mail fields", "Flag Status", FieldType::Choice(FLAG_STATUSES)),
+    ("All Mail fields", "Start Date", FieldType::Date),
+    ("All Mail fields", "Read", FieldType::Choice(YES_NO)),
+    ("All Mail fields", "Has Attachments", FieldType::Choice(YES_NO)),
+    ("All Mail fields", "Conversation", FieldType::Text),
+    ("All Contact fields", "Full Name", FieldType::Text),
+    ("All Contact fields", "First Name", FieldType::Text),
+    ("All Contact fields", "Last Name", FieldType::Text),
+    ("All Contact fields", "File As", FieldType::Text),
+    ("All Contact fields", "Company", FieldType::Text),
+    ("All Contact fields", "Job Title", FieldType::Text),
+    ("All Contact fields", "Department", FieldType::Text),
+    ("All Contact fields", "Office", FieldType::Text),
+    ("All Contact fields", "Email", FieldType::Text),
+    ("All Contact fields", "Business Phone", FieldType::Text),
+    ("All Contact fields", "Mobile Phone", FieldType::Text),
+    ("All Contact fields", "Home Phone", FieldType::Text),
+    ("All Contact fields", "Birthday", FieldType::Text),
+    ("All Contact fields", "Web Page", FieldType::Text),
+    ("All Task fields", "Status", FieldType::Choice(TASK_STATUSES)),
+    ("All Task fields", "Priority", FieldType::Choice(LEVELS)),
+    ("All Task fields", "Percent Complete", FieldType::Number),
+    ("All Task fields", "Complete", FieldType::Choice(YES_NO)),
+    ("All Task fields", "Date Completed", FieldType::Date),
+    ("All Task fields", "Owner", FieldType::Text),
+    ("All Appointment fields", "Location", FieldType::Text),
+    ("All Appointment fields", "Start", FieldType::Date),
+    ("All Appointment fields", "End", FieldType::Date),
+    ("All Appointment fields", "All Day Event", FieldType::Choice(YES_NO)),
+    ("All Appointment fields", "Recurring", FieldType::Choice(YES_NO)),
+    ("All Appointment fields", "Organizer", FieldType::Text),
+    ("All Note fields", "Modified", FieldType::Date),
+];
+
+/// Conditions of a field type: (id, label, query operator); "is empty" / "is not empty" take no value.
+pub fn conditions_of(t: FieldType) -> &'static [(&'static str, &'static str, &'static str)] {
+    match t {
+        FieldType::Text => &[
+            ("contains", "contains", "~"),
+            ("doesNotContain", "doesn't contain", "!~"),
+            ("is", "is (exactly)", "="),
+            ("isNot", "is not", "!="),
+            ("isEmpty", "is empty", "="),
+            ("isNotEmpty", "is not empty", "!="),
+        ],
+        FieldType::Date => &[
+            ("on", "on", "="),
+            ("before", "before", "<"),
+            ("after", "after", ">"),
+            ("isEmpty", "does not exist", "="),
+            ("isNotEmpty", "exists", "!="),
+        ],
+        FieldType::Number => &[
+            ("equals", "equals", "="),
+            ("notEquals", "not equal to", "!="),
+            ("lessThan", "less than", "<"),
+            ("moreThan", "more than", ">"),
+        ],
+        FieldType::Choice(_) => &[("is", "equals", "="), ("isNot", "not equal to", "!=")],
+    }
+}
+
+fn field_type_name(t: FieldType) -> &'static str {
+    match t {
+        FieldType::Text => "text",
+        FieldType::Date => "date",
+        FieldType::Number => "number",
+        FieldType::Choice(_) => "choice",
+    }
+}
+
+/// The Add Form Field chooser: forms with their fields, each with its conditions and choices.
+pub fn form_fields_json() -> Value {
+    let mut groups: Vec<(&str, Vec<Value>)> = Vec::new();
+    for (group, label, t) in FORM_FIELDS {
+        let conds: Vec<Value> =
+            conditions_of(*t).iter().map(|(id, l, _)| json!({"id": id, "label": l})).collect();
+        let choices: &[&str] = if let FieldType::Choice(c) = t { c } else { &[] };
+        let field =
+            json!({"label": label, "type": field_type_name(*t), "conditions": conds, "choices": choices});
+        match groups.iter_mut().find(|(g, _)| g == group) {
+            Some((_, list)) => list.push(field),
+            None => groups.push((group, vec![field])),
+        }
+    }
+    Value::Array(groups.into_iter().map(|(g, fields)| json!({"form": g, "fields": fields})).collect())
+}
+
+/// The form-field conditions (`prop:` terms) in a query, for the editable rows under the search box:
+/// `{term, field, condition, value}`.
+pub fn field_conditions(query: &str) -> Vec<Value> {
+    terms(query)
+        .into_iter()
+        .filter_map(|t| {
+            let mailcraft_search::Query::Term(mailcraft_search::Term::Prop(p)) = mailcraft_search::parse(&t)
+            else {
+                return None;
+            };
+            let field = FORM_FIELDS
+                .iter()
+                .find(|(_, l, _)| mailcraft_search::doc::prop_id(l) == p.name)
+                .map_or(p.label.clone(), |(_, l, _)| (*l).to_owned());
+            let ftype = FORM_FIELDS
+                .iter()
+                .find(|(_, l, _)| mailcraft_search::doc::prop_id(l) == p.name)
+                .map_or(FieldType::Text, |(_, _, t)| *t);
+            let sym = p.op.symbol();
+            let cond = conditions_of(ftype)
+                .iter()
+                .find(|(id, _, op)| {
+                    *op == sym && (p.value.is_empty() == matches!(*id, "isEmpty" | "isNotEmpty"))
+                })
+                .map_or("is", |(id, _, _)| id);
+            Some(json!({"term": t, "field": field, "condition": cond, "value": p.value}))
+        })
+        .collect()
+}
+
+/// `search.refine {"kind": "field", "field", "condition", "value"}`: adds (or with `replace`, swaps in) a
+/// form-field condition.
+fn add_field_condition(s: &mut Session, p: &Value) -> CmdResult {
+    let name = opt_str(p, "field").map(str::trim).unwrap_or_default();
+    let Some((_, label, ftype)) = FORM_FIELDS.iter().find(|(_, l, _)| {
+        l.eq_ignore_ascii_case(name)
+            || mailcraft_search::doc::prop_id(l) == mailcraft_search::doc::prop_id(name)
+    }) else {
+        return Err(CmdError::Params(format!(
+            "unknown field `{}`",
+            name.chars().take(60).collect::<String>()
+        )));
+    };
+    let cond = opt_str(p, "condition").unwrap_or(match ftype {
+        FieldType::Text => "contains",
+        FieldType::Date => "on",
+        FieldType::Number => "equals",
+        FieldType::Choice(_) => "is",
+    });
+    let Some((cid, _, op)) = conditions_of(*ftype).iter().find(|(id, _, _)| *id == cond) else {
+        return Err(CmdError::Params(format!("`{label}` has no condition `{cond}`")));
+    };
+    let no_value = matches!(*cid, "isEmpty" | "isNotEmpty");
+    let raw = opt_str(p, "value").map(str::trim).unwrap_or_default().replace('"', "");
+    let value = if no_value { String::new() } else { raw };
+    if !no_value && value.is_empty() {
+        return Err(CmdError::Params(format!("`{label}` {cond} needs a value")));
+    }
+    let value = match ftype {
+        FieldType::Date if !no_value => normal_date(&value)
+            .ok_or_else(|| CmdError::Params(format!("`{value}` is not a date (YYYY-MM-DD)")))?,
+        FieldType::Number if value.parse::<f64>().is_err() => {
+            return Err(CmdError::Params(format!("`{value}` is not a number")));
+        }
+        FieldType::Choice(list) => match list.iter().find(|c| c.eq_ignore_ascii_case(&value)) {
+            Some(c) => (*c).to_owned(),
+            None => return Err(CmdError::Params(format!("`{value}` is not a choice of `{label}`"))),
+        },
+        _ => value,
+    };
+    let term = format!("prop:\"{label}{op}{value}\"");
+    let mut list = terms(&s.view.search);
+    if let Some(old) = opt_str(p, "replace").map(str::trim).filter(|r| !r.is_empty()) {
+        list.retain(|t| !t.eq_ignore_ascii_case(old));
+    }
+    if !list.iter().any(|t| t.eq_ignore_ascii_case(&term)) {
+        list.push(term.clone());
+    }
+    s.view.search = list.join(" ");
+    let mut out = summary(s);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("term".into(), json!(term));
+        o.insert("on".into(), json!(true));
+    }
+    Ok(out)
+}
+
+/// A date as `YYYY-MM-DD` (accepts `YYYY-M-D` and `YYYY/MM/DD`).
+fn normal_date(v: &str) -> Option<String> {
+    let parts: Vec<&str> = v.split(['-', '/']).collect();
+    let [y, m, d] = parts.as_slice() else { return None };
+    let (y, m, d): (i32, u8, u8) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    if !(1..=9999).contains(&y)
+        || !(1..=12).contains(&m)
+        || d == 0
+        || i64::from(d) > i64::from(mailcraft_mime::date::days_in_month(i64::from(y), m))
+    {
+        return None;
+    }
+    Some(format!("{y:04}-{m:02}-{d:02}"))
 }
 
 /// Builds the query an Advanced Find form describes.
@@ -964,7 +1216,113 @@ mod tests {
         assert!(s.run("search.refine", &json!({"kind": "zzz"})).is_err());
         // More Filters… enters Search mode; Add Form Field… opens the refiner form.
         assert_eq!(run(&mut s, "search.refine", json!({}))["dialog"], "searchBox");
-        assert_eq!(run(&mut s, "search.refine", json!({"kind": "formField"}))["dialog"], "searchRefine");
+        assert_eq!(run(&mut s, "search.refine", json!({"kind": "formField"}))["dialog"], "addFormField");
+        assert_eq!(run(&mut s, "search.refine", json!({"kind": "refiners"}))["dialog"], "searchRefine");
+    }
+
+    #[test]
+    fn scope_current_mailbox_from_the_inbox() {
+        let mut s = session();
+        let inbox = s.selection.folder;
+        let acct = s.mailbox.accounts[0].id;
+        let sent = s.mailbox.role_folder(acct, FolderRole::SentItems).unwrap();
+        assert_eq!(
+            crate::settings::def("search.scope").map(|d| d.default_value()),
+            Some(json!("currentMailbox"))
+        );
+        run(&mut s, "options.set", json!({"key": "search.scope", "value": "folderInboxMailbox"}));
+        assert_eq!(s.view.search_scope, SearchScope::CurrentMailbox, "the Inbox is selected");
+        run(&mut s, "nav.selectFolder", json!({"folder": sent.0}));
+        assert_eq!(s.view.search_scope, SearchScope::CurrentFolder);
+        run(&mut s, "nav.selectFolder", json!({"folder": inbox.0}));
+        assert_eq!(s.view.search_scope, SearchScope::CurrentMailbox);
+        assert_eq!(s.settings.text("search.scope"), "folderInboxMailbox", "the rule stays the option");
+        // Choosing another scope by hand replaces the rule.
+        run(&mut s, "options.set", json!({"key": "search.scope", "value": "allMailboxes"}));
+        run(&mut s, "nav.selectFolder", json!({"folder": sent.0}));
+        assert_eq!(s.view.search_scope, SearchScope::AllMailboxes);
+    }
+
+    #[test]
+    fn form_field_conditions() {
+        let mut s = session();
+        let private = add(
+            &mut s,
+            MailItem {
+                subject: "Salary".into(),
+                sensitivity: mailcraft_model::Sensitivity::Private,
+                ..Default::default()
+            },
+        );
+        add(&mut s, MailItem { subject: "Menu".into(), ..Default::default() });
+        // The chooser lists the forms and their fields.
+        run(&mut s, "search.refine", json!({"kind": "formField"}));
+        let p = s
+            .notices
+            .iter()
+            .rev()
+            .find_map(|n| match n {
+                crate::Notice::OpenDialog(d, p) if d == "addFormField" => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let forms = p["forms"].as_array().unwrap();
+        assert_eq!(forms[0]["form"], "Frequently-used fields");
+        let all: Vec<&str> = forms
+            .iter()
+            .flat_map(|f| f["fields"].as_array().unwrap().iter().filter_map(|x| x["label"].as_str()))
+            .collect();
+        for want in ["Sensitivity", "Due Date", "Message Class", "Company", "Status"] {
+            assert!(all.contains(&want), "{want} offered");
+        }
+        let r = run(
+            &mut s,
+            "search.refine",
+            json!({"kind": "field", "field": "sensitivity", "condition": "is", "value": "private"}),
+        );
+        assert_eq!(r["term"], "prop:\"Sensitivity=Private\"");
+        assert_eq!(crate::search_index::results(&s), vec![private]);
+        let rows = field_conditions(&s.view.search);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["field"], "Sensitivity");
+        assert_eq!(rows[0]["condition"], "is");
+        assert_eq!(rows[0]["value"], "Private");
+        // Edit the row: is not.
+        let term = rows[0]["term"].as_str().unwrap().to_owned();
+        run(
+            &mut s,
+            "search.refine",
+            json!({"kind": "field", "field": "Sensitivity", "condition": "isNot", "value": "Private", "replace": term}),
+        );
+        assert_eq!(s.view.search, "prop:\"Sensitivity!=Private\"");
+        assert_eq!(crate::search_index::results(&s).len(), 1);
+        assert!(!crate::search_index::results(&s).contains(&private));
+        // Message class and dates; bad values are refused.
+        run(&mut s, "search.refine", json!({"kind": "removeField", "term": "prop:\"Sensitivity!=Private\""}));
+        assert!(s.view.search.is_empty());
+        run(&mut s, "search.refine", json!({"kind": "field", "field": "Message Class", "value": "ipm.note"}));
+        assert_eq!(crate::search_index::results(&s).len(), 2);
+        run(
+            &mut s,
+            "search.refine",
+            json!({"kind": "field", "field": "Received", "condition": "after", "value": "2000-1-2"}),
+        );
+        assert!(s.view.search.ends_with("prop:\"Received>2000-01-02\""));
+        assert_eq!(crate::search_index::results(&s).len(), 2);
+        for bad in [
+            json!({"kind": "field", "field": "Shoe Size", "value": "9"}),
+            json!({"kind": "field", "field": "Received", "condition": "after", "value": "soon"}),
+            json!({"kind": "field", "field": "Size", "condition": "lessThan", "value": "big"}),
+            json!({"kind": "field", "field": "Sensitivity", "value": "Secret"}),
+            json!({"kind": "field", "field": "Subject", "condition": "contains"}),
+            json!({"kind": "field", "field": "Subject", "condition": "before", "value": "x"}),
+            json!({"kind": "removeField", "term": "nope"}),
+        ] {
+            assert!(s.run("search.refine", &bad).is_err(), "{bad}");
+        }
+        run(&mut s, "search.refine", json!({"kind": "field", "field": "Company", "condition": "isNotEmpty"}));
+        assert!(s.view.search.ends_with("prop:\"Company!=\""));
+        assert_eq!(field_conditions(&s.view.search).last().unwrap()["condition"], "isNotEmpty");
     }
 
     fn search_box(s: &Session) -> Value {

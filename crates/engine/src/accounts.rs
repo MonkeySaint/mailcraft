@@ -584,6 +584,8 @@ pub struct AccountPrefs {
     pub marked: BTreeMap<u64, bool>,
     pub pop3: BTreeMap<u32, Pop3State>,
     pub jmap: BTreeMap<u32, JmapState>,
+    /// User-defined Send/Receive groups (`sync/groups.rs`).
+    pub groups: Vec<crate::sync::groups::SendReceiveGroup>,
 }
 
 const OPTIONS_NOTE: &str = "MailCraft account options and send/receive bookkeeping. No secrets.";
@@ -633,6 +635,10 @@ pub(crate) fn load_prefs(s: &mut Session) {
     d.accounts.retain(|k, _| ids.contains(k));
     d.pop3.retain(|k, _| ids.contains(k));
     d.jmap.retain(|k, _| ids.contains(k));
+    d.groups.truncate(crate::sync::groups::MAX_GROUPS);
+    for g in &mut d.groups {
+        g.members.retain(|m| ids.contains(&m.account));
+    }
 }
 
 /// Writes the options file (when the session has a data folder). Failures are logged and shown once.
@@ -686,8 +692,13 @@ pub fn kind_label(s: &Session, a: &Account) -> &'static str {
 /// Drops the options and bookkeeping of a removed account.
 pub(crate) fn forget_options(s: &mut Session, id: AccountId) {
     let p = prefs(s);
-    let had =
+    let mut had =
         p.accounts.remove(&id.0).is_some() | p.pop3.remove(&id.0).is_some() | p.jmap.remove(&id.0).is_some();
+    for g in &mut p.groups {
+        let n = g.members.len();
+        g.members.retain(|m| m.account != id.0);
+        had |= g.members.len() != n;
+    }
     if had {
         save_prefs(s);
     }
@@ -1351,7 +1362,9 @@ pub(crate) fn remove_account_data(s: &mut Session, id: AccountId) -> usize {
     }
     for step in &mut mb.quick_steps {
         for action in &mut step.actions {
-            if let QuickStepAction::MoveTo(target) | QuickStepAction::CopyTo(target) = action
+            if let QuickStepAction::MoveTo(target)
+            | QuickStepAction::CopyTo(target)
+            | QuickStepAction::AlwaysMoveConversation(target) = action
                 && target.as_ref().is_some_and(gone)
             {
                 *target = None;

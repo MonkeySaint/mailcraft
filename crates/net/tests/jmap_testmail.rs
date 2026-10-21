@@ -79,3 +79,39 @@ fn mailboxes_query_changes_set_import_and_submit() {
     let r = c.set_emails(Map::new(), Map::new(), &["nope".to_owned()]).unwrap();
     assert!(r.not_destroyed.contains_key("nope"));
 }
+
+#[test]
+fn quota_get_reports_mail_storage() {
+    let s = TestServers::start(Config {
+        users: vec![(USER.into(), PASS.into())],
+        add_trace_headers: false,
+        ..Config::default()
+    })
+    .unwrap();
+    let c = client(&s, PASS).unwrap();
+    assert_eq!(c.quota().unwrap(), None, "no limit set");
+    s.set_quota(USER, Some(1_000_000)).unwrap();
+    let raw = b"Subject: q\r\n\r\nbody\r\n";
+    s.seed_message(USER, "INBOX", raw, &[]).unwrap();
+    let q = c.quota().unwrap().expect("quota");
+    assert_eq!(q.limit, 1_000_000);
+    assert_eq!(q.used, raw.len() as u64);
+    assert_eq!(q.messages, Some((1, 100_000)));
+}
+
+#[test]
+fn quota_list_parsing_is_defensive() {
+    use mailcraft_net::jmap::quota_from_list;
+    assert_eq!(quota_from_list(&[]), None);
+    let list = vec![
+        json!({"resourceType": "octets", "used": 5, "hardLimit": 10, "types": ["Calendar"]}),
+        json!({"resourceType": "octets", "used": "x", "hardLimit": 10}),
+        json!({"resourceType": "octets", "used": 1, "hardLimit": 0}),
+        json!({"resourceType": "octets", "used": 90, "hardLimit": 100, "types": ["Mail"]}),
+        json!({"resourceType": "octets", "used": 10, "hardLimit": 1000, "types": []}),
+        json!("garbage"),
+    ];
+    let q = quota_from_list(&list).unwrap();
+    assert_eq!((q.used, q.limit), (90, 100), "the tightest mail quota wins");
+    assert_eq!(q.messages, None);
+}

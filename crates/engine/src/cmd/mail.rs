@@ -234,7 +234,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Email",
             "Home › New",
             "Mod+Shift+M",
-            r#"{"format"?:"html"|"rich"|"plain","pickStationery"?:bool}"#,
+            r#"{"format"?:"html"|"rich"|"plain","pickStationery"?:bool (the stationery picker),"stationery"?:string (id or name)}"#,
             false,
             always,
             new_email,
@@ -762,21 +762,52 @@ fn parse_format(v: Option<&str>) -> Result<BodyFormat, CmdError> {
     }
 }
 
+/// The stationery list for the More Stationery… picker.
+pub fn stationery_list() -> Vec<Value> {
+    crate::compose::STATIONERY
+        .iter()
+        .map(|(id, name, page, theme)| {
+            json!({"id": id, "name": name, "page": mailcraft_geom::Color::hex(*page).to_hex(), "theme": theme})
+        })
+        .collect()
+}
+
 fn new_email(s: &mut Session, p: &Value) -> CmdResult {
     let format = parse_format(opt_str(p, "format"))?;
     if opt_bool(p, "pickStationery") == Some(true) {
-        return open_dialog(s, "stationery", json!({}));
+        let current = s.settings.text("mail.compose.stationery");
+        return open_dialog(
+            s,
+            "pickStationery",
+            json!({"stationery": stationery_list(), "default": current}),
+        );
     }
-    let c = ComposeState {
+    let stationery = match opt_str(p, "stationery").map(str::trim).filter(|t| !t.is_empty()) {
+        None => None,
+        Some(name) => Some(
+            crate::compose::stationery(name)
+                .ok_or_else(|| CmdError::Params(format!("unknown stationery `{}`", clip_name(name))))?,
+        ),
+    };
+    let mut c = ComposeState {
         kind: ComposeKind::New,
         from: account_from(s, new_mail_account(s)),
         format,
+        // E-mail Message Using › Plain Text / Rich Text / HTML (or a stationery) is this message's format.
+        format_explicit: opt_str(p, "format").is_some() || stationery.is_some(),
         inline: false,
         ..Default::default()
     };
+    if let Some(st) = stationery {
+        c.apply_stationery(st);
+    }
     let c = crate::compose::with_default_signature(&s.mailbox, c);
     let id = s.open_compose(c);
-    Ok(json!({"compose": id}))
+    Ok(json!({"compose": id, "stationery": stationery.map(|st| st.1)}))
+}
+
+fn clip_name(t: &str) -> String {
+    t.chars().take(60).collect()
 }
 
 /// A new message from a `mailto:` link (RFC 6068): its recipients, subject and body. Options › Advanced ›
@@ -948,6 +979,8 @@ fn choose_form(s: &mut Session, p: &Value) -> CmdResult {
         subject: m.subject.clone(),
         body: body_doc(&m),
         format: m.body.format,
+        // The template's format is the message's format, whatever Options say for new messages.
+        format_explicit: true,
         importance: m.importance,
         attachments: source_attachments(&m),
         dirty: true,
@@ -2633,7 +2666,9 @@ fn find_related(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Failed("message not found".into()));
     };
     let query = match opt_str(p, "kind").unwrap_or("conversation") {
-        "conversation" => format!("subject:\"{}\"", quote_term(strip_prefixes(&item.subject))),
+        // The conversation's topic (subject without RE:/FW: prefixes), matched whole: "Lunch" does not
+        // bring in "Lunch plans".
+        "conversation" => format!("conversation:\"{}\"", quote_term(strip_prefixes(&item.subject))),
         "sender" => match &item.from {
             Some(a) => format!("from:\"{}\"", quote_term(&a.addr)),
             None => return Err(CmdError::Failed("the message has no sender".into())),
@@ -4141,12 +4176,90 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
     #[test]
     fn find_related_sets_search() {
         let mut f = fx();
+        let other =
+            f.s.mailbox.add_mail(msg(f.inbox, "Lunch plans", "dan@example.com", "Friday?", at(20735, 9)));
         f.s.selection.focus = Some(f.b);
         find_related(&mut f.s, &json!({"kind": "conversation"})).unwrap();
-        assert_eq!(f.s.view.search, "subject:\"Lunch\"");
+        assert_eq!(f.s.view.search, "conversation:\"Lunch\"");
+        let hits = crate::search_index::results(&f.s);
+        assert!(hits.contains(&f.b) && hits.contains(&f.c), "{hits:?}");
+        assert!(!hits.contains(&other), "another topic that only starts the same is not in the conversation");
         find_related(&mut f.s, &json!({"kind": "sender"})).unwrap();
         assert_eq!(f.s.view.search, "from:\"bob@example.org\"");
         assert_eq!(f.s.view.search_scope, SearchScope::CurrentMailbox);
+    }
+
+    #[test]
+    fn explicit_html_is_kept_over_the_default_format() {
+        let mut f = fx();
+        f.s.run("options.set", &json!({"key": "mail.compose.defaultFormat", "value": "plain"})).unwrap();
+        let plain = f.s.run("mail.newEmail", &json!({})).unwrap()["compose"].as_u64().unwrap();
+        assert_eq!(f.s.composes[&plain].format, BodyFormat::PlainText, "the default applies");
+        let html = f.s.run("mail.newEmail", &json!({"format": "html"})).unwrap()["compose"].as_u64().unwrap();
+        assert_eq!(f.s.composes[&html].format, BodyFormat::Html, "E-mail Message Using › HTML stays HTML");
+        assert!(f.s.composes[&html].format_explicit);
+        // A template opened with Choose Form keeps its own format too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.eml");
+        std::fs::write(
+            &path,
+            "Subject: Template\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hi</p>\r\n",
+        )
+        .unwrap();
+        let r = f.s.run("mail.newItem", &json!({"kind": "fromForm", "path": path})).unwrap();
+        let cid = r["compose"].as_u64().unwrap();
+        assert_eq!(f.s.composes[&cid].format, BodyFormat::Html);
+    }
+
+    #[test]
+    fn stationery_picker_and_default_stationery() {
+        let mut f = fx();
+        let r = f.s.run("mail.newEmail", &json!({"pickStationery": true})).unwrap();
+        assert_eq!(r["dialog"], "pickStationery");
+        let list =
+            f.s.notices
+                .iter()
+                .rev()
+                .find_map(|n| match n {
+                    Notice::OpenDialog(d, p) if d == "pickStationery" => Some(p["stationery"].clone()),
+                    _ => None,
+                })
+                .unwrap();
+        assert!(list.as_array().unwrap().len() >= 5);
+        f.s.run("options.set", &json!({"key": "mail.compose.defaultFormat", "value": "rich"})).unwrap();
+        let r = f.s.run("mail.newEmail", &json!({"stationery": "Linen"})).unwrap();
+        assert_eq!(r["stationery"], "Linen");
+        let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
+        assert_eq!(c.format, BodyFormat::Html, "stationery is HTML whatever the default");
+        assert_eq!(c.theme.name.as_deref(), Some("Organic"));
+        assert!(c.body.background.is_some());
+        assert!(f.s.run("mail.newEmail", &json!({"stationery": "Wallpaper"})).is_err());
+        // Personal Stationery: new HTML messages get the default stationery; plain ones do not.
+        f.s.run("options.set", &json!({"key": "mail.compose.defaultFormat", "value": "html"})).unwrap();
+        f.s.run("options.set", &json!({"key": "mail.compose.stationery", "value": "slate"})).unwrap();
+        let id = f.s.run("mail.newEmail", &json!({})).unwrap()["compose"].as_u64().unwrap();
+        assert_eq!(f.s.composes[&id].theme.name.as_deref(), Some("Integral"));
+        let id = f.s.run("mail.newEmail", &json!({"format": "plain"})).unwrap()["compose"].as_u64().unwrap();
+        assert!(f.s.composes[&id].body.background.is_none());
+        assert!(f.s.run("options.set", &json!({"key": "mail.compose.stationery", "value": "x"})).is_err());
+    }
+
+    #[test]
+    fn unseen_items_since_the_last_visit() {
+        let mut f = fx();
+        let inbox = f.s.selection.folder;
+        let account = f.s.current_account().unwrap();
+        let sent = f.s.mailbox.role_folder(account, FolderRole::SentItems).unwrap();
+        f.s.run("nav.selectFolder", &json!({"folder": inbox.0})).unwrap();
+        assert_eq!(crate::queries::unseen_in_view(&f.s), 0, "first visit: nothing unseen");
+        f.s.run("nav.selectFolder", &json!({"folder": sent.0})).unwrap();
+        f.s.mailbox.add_mail(msg(inbox, "New one", "carol@example.com", "Hi", at(20740, 9)));
+        f.s.mailbox.add_mail(msg(inbox, "New two", "carol@example.com", "Hi", at(20740, 10)));
+        f.s.run("nav.selectFolder", &json!({"folder": inbox.0})).unwrap();
+        assert_eq!(crate::queries::unseen_in_view(&f.s), 2, "arrived since the last visit");
+        f.s.run("nav.selectFolder", &json!({"folder": sent.0})).unwrap();
+        f.s.run("nav.selectFolder", &json!({"folder": inbox.0})).unwrap();
+        assert_eq!(crate::queries::unseen_in_view(&f.s), 0, "seen on the previous visit");
     }
 
     #[test]
@@ -4159,7 +4272,10 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         assert_eq!(c.format, BodyFormat::PlainText);
         assert_eq!(c.from, "Test User <test.user@example.net>");
         assert!(!c.inline);
-        assert_eq!(new_email(&mut f.s, &json!({"pickStationery": true})).unwrap()["dialog"], "stationery");
+        assert_eq!(
+            new_email(&mut f.s, &json!({"pickStationery": true})).unwrap()["dialog"],
+            "pickStationery"
+        );
         assert!(new_email(&mut f.s, &json!({"format": "pdf"})).is_err());
         assert_eq!(new_item(&mut f.s, &json!({"kind": "meeting"})).unwrap()["dialog"], "newMeeting");
         assert!(new_item(&mut f.s, &json!({"kind": "spaceship"})).is_err());

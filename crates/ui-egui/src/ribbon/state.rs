@@ -475,7 +475,7 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 61] = [
+pub const SOURCES: [&str; 64] = [
     "shapes:Lines",
     "shapes:Rectangles",
     "shapes:Basic Shapes",
@@ -507,6 +507,9 @@ pub const SOURCES: [&str; 61] = [
     "quicksteps",
     "categories",
     "accounts",
+    "srGroups",
+    "senderDomain",
+    "recentNoteFolders",
     "arrange",
     "styles",
     "views:mail",
@@ -1025,6 +1028,48 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                     vars: vec![("$name", json!(name))],
                     on: false,
                 }
+            })
+            .collect(),
+        // Block › Never Block Sender's Domain, naming the selected message's domain: "(@example.com)".
+        "senderDomain" => {
+            let domain = app
+                .s
+                .selection
+                .focus
+                .or_else(|| app.s.selection.items.first().copied())
+                .and_then(|id| app.s.mailbox.mail.get(&id))
+                .and_then(|m| m.from.as_ref())
+                .and_then(|f| f.addr.rsplit_once('@').map(|(_, d)| d.trim().to_owned()))
+                .filter(|d| !d.is_empty());
+            let label = match domain {
+                Some(d) => format!("Never Block Sender's Domain (@{d})"),
+                None => "Never Block Sender's Domain".to_owned(),
+            };
+            vec![DynItem { label, icon: "", swatch: None, vars: Vec::new(), on: false }]
+        }
+        // Notes › Move: the notes folders notes were last moved to.
+        "recentNoteFolders" => {
+            mailcraft_engine::recent_move_folders(&app.s, mailcraft_model::FolderKind::Notes)
+                .into_iter()
+                .filter_map(|f| app.s.mailbox.folder(f).map(|x| (f, x.name.clone())))
+                .map(|(f, name)| DynItem {
+                    label: name,
+                    icon: "folder",
+                    swatch: None,
+                    vars: vec![("$id", json!(f.0))],
+                    on: false,
+                })
+                .collect()
+        }
+        // Send/Receive Groups menu: the user-defined groups (All Accounts is a fixed item).
+        "srGroups" => mailcraft_engine::sync::groups::groups(&app.s)
+            .iter()
+            .map(|g| DynItem {
+                label: g.name.clone(),
+                icon: "sync",
+                swatch: None,
+                vars: vec![("$name", json!(g.name))],
+                on: false,
             })
             .collect(),
         // Arrangement gallery / Arrange By menu of a contacts or tasks folder: the module's arrangements.

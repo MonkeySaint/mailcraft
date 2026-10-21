@@ -98,8 +98,60 @@ fn about(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
+/// Training lessons (Help › Show Training): (title, text, "Show me" label, command run by it). Our own text.
+pub(crate) const LESSONS: [(&str, &str, &str, &str); 8] = [
+    (
+        "1. The window",
+        "On the left is the module rail: Mail, Calendar, People, To Do and more. Next to it the folder pane lists your folders; the middle shows the items of the selected folder and the reading pane on the right shows the selected item. The ribbon at the top holds the commands of each tab; press Alt to see their key tips.",
+        "Go to the Inbox",
+        "nav.inbox",
+    ),
+    (
+        "2. Reading",
+        "Click a message to read it in the reading pane, or double-click it to open its own window. Unread messages are bold; Ctrl+Q marks the selected ones read, Ctrl+U unread. The View tab moves the reading pane and turns on conversations.",
+        "Select the first message",
+        "nav.firstItem",
+    ),
+    (
+        "3. Writing",
+        "New Email (Ctrl+Shift+M) opens a message. Type the addresses (MailCraft completes names it has seen), a subject and the text, then Send. Reply, Reply All and Forward answer the selected message. Drafts are kept in the Drafts folder until you send them.",
+        "Write a new message",
+        "mail.newEmail",
+    ),
+    (
+        "4. Organizing",
+        "Right-click a message to flag it for follow-up, give it a color category or move it. Quick Steps do several of these in one click, and rules (Rules › Create Rule) file new mail for you as it arrives. Deleted items go to Deleted Items; Recover Deleted Items brings back what was emptied from there.",
+        "Open Rules and Alerts",
+        "rules.manage",
+    ),
+    (
+        "5. Calendar",
+        "The Calendar shows appointments by day, work week, week or month. Double-click a time to add an appointment; New Meeting invites people. Go to Date (Ctrl+G) jumps to any day.",
+        "Open the Calendar",
+        "nav.calendar",
+    ),
+    (
+        "6. People",
+        "People keeps your contacts. New Contact adds one; Search People finds anyone by name, company or address; a contact group lets you mail several people at once.",
+        "Open People",
+        "nav.people",
+    ),
+    (
+        "7. Tasks and notes",
+        "To Do lists your tasks and the messages you flagged. Type in \"Type a new task\" to add one. Notes are quick reminders like paper sticky notes.",
+        "Open To Do",
+        "nav.tasks",
+    ),
+    (
+        "8. Send and receive",
+        "MailCraft checks your accounts on a schedule and when you press F9 (Send/Receive All Folders). Send/Receive Groups choose which accounts and folders run together and when. File › Options holds every setting.",
+        "Define Send/Receive Groups",
+        "sendReceive.defineGroups",
+    ),
+];
+
 /// Built-in help topics (our own text): (key, title, text).
-const TOPICS: [(&str, &str, &str); 14] = [
+const TOPICS: [(&str, &str, &str); 19] = [
     (
         "getting-started",
         "Getting started",
@@ -153,12 +205,37 @@ const TOPICS: [(&str, &str, &str); 14] = [
     (
         "rules",
         "Organizing with rules",
-        "Rules act on messages as they arrive: move them to folders, flag them, assign categories and more. Create one from a message (Rules › Create Rule) or manage them all in Rules and Alerts.",
+        "Rules act on messages as they arrive: move them to folders, flag them, assign categories and more. Create one from a message (Rules › Create Rule) or manage them all in Rules and Alerts.\n\nA rule has conditions (who sent it, words in the subject or body, who it was sent to, importance, sensitivity, attachments, size, dates, account), actions (move or copy to a folder, delete, forward, reply with a template, flag, categorize, play a sound, show an alert, stop processing more rules) and exceptions, which use the same tests as the conditions. Rules run in the order of the list; Run Rules Now applies them to mail already in a folder.",
+    ),
+    (
+        "quick-steps",
+        "Quick Steps",
+        "A Quick Step does several things to the selected messages in one click: move, copy, categorize, flag, mark read, reply, forward, start a meeting and more. Home › Quick Steps lists them; Create New and New Quick Step make your own, and Manage Quick Steps orders, edits and removes them. A Quick Step can have a keyboard shortcut (Ctrl+Shift+1 to 9).",
+    ),
+    (
+        "accounts",
+        "Accounts",
+        "File › Add Account sets up a mail account: type the address and MailCraft looks up its servers (IMAP or POP3 and SMTP, or JMAP), or enter them yourself. Account Settings lists the accounts and data files: change an account's servers and password, make it the default, or remove it. Test Account Settings signs in to both servers and reports what worked. Your passwords stay on this computer, next to the mail data, never in the mail file itself.",
+    ),
+    (
+        "send-receive",
+        "Send/Receive and its groups",
+        "Send/Receive All Folders (F9) sends what waits in the Outbox and downloads new mail for every account in the All Accounts group; Options › Advanced sets how often that happens on its own.\n\nSend / Receive › Send/Receive Groups › Define Send/Receive Groups makes your own groups. A group lists accounts and, for each, whether it sends, receives, downloads only headers, and which folders it updates. Each group decides whether F9 includes it, how often it runs by itself (online and while working offline) and whether it runs when MailCraft closes. Pick a group in the Send/Receive Groups menu to run it now.\n\nWork Offline stops every connection until you turn it off again. The status bar can show how full your mailbox is on the server (right-click it and choose Quota Information) when the server reports a quota.",
+    ),
+    (
+        "recover",
+        "Recovering deleted items",
+        "Deleting a message moves it to Deleted Items. Items deleted from there (or with Shift+Delete, by emptying the folder, a rule or AutoArchive) are kept for a while: Folder › Recover Deleted Items lists them, newest first, and puts the ones you pick back into Deleted Items. They are kept 14 days by default; Options › Advanced sets how long, and Purge Selected Items removes some for good at once.",
+    ),
+    (
+        "stationery",
+        "Signatures and stationery",
+        "File › Options › Mail › Signatures writes the signatures added to new messages and replies. Stationery gives new HTML messages a page color and a theme: New Items › E-mail Message Using › More Stationery picks one for a single message, and the Personal Stationery tab sets the one every new HTML message starts with, along with its font.",
     ),
     (
         "search",
         "Searching",
-        "Type in the search box at the top to search the current folder. Use the Search tab to widen the scope or refine by sender, subject, attachments and more. Advanced Find (Ctrl+Shift+F) searches with several criteria at once.",
+        "Type in the search box at the top to search. The scope menu next to it (or File › Options › Search) chooses where: the current folder, the current mailbox, every mailbox, or the folder you are in except from the Inbox, which searches the whole mailbox. Use the Search tab to refine by sender, subject, attachments and more. Advanced Find (Ctrl+Shift+F) searches with several criteria at once.\n\nRefine › More › Add Form Field tests any item property: pick a form (mail, contact, task, appointment), a field such as Sensitivity, Due Date or Message Class, a condition and a value. The conditions show under Add Form Field as rows you can change or remove; in the search box they read like prop:\"Sensitivity=Private\".",
     ),
     ("shortcuts", "Keyboard shortcuts", ""),
     (
@@ -187,6 +264,8 @@ struct HelpState {
     topic: usize,
     filter: String,
     search: String,
+    /// Training: the lesson shown.
+    lesson: usize,
 }
 
 fn help(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -196,6 +275,7 @@ fn help(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         topic: TOPICS.iter().position(|(k, _, _)| *k == want).unwrap_or(0),
         filter: String::new(),
         search: String::new(),
+        lesson: 0,
     };
     with_state(ctx, app, uid, init, |st, app| {
         window(ctx, app, d, "MailCraft Help", 680.0, |ui, app| {
@@ -248,6 +328,8 @@ fn help(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                 });
                             },
                         );
+                    } else if *key == "training" {
+                        lesson(ui, app, st);
                     } else {
                         egui::ScrollArea::vertical().id_salt(("helptext", uid)).max_height(320.0).show(
                             ui,
@@ -269,6 +351,30 @@ fn help(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             })
         })
     })
+}
+
+/// One training lesson with Back / Next and a "Show me" button that does what the lesson describes.
+fn lesson(ui: &mut egui::Ui, app: &mut App, st: &mut HelpState) {
+    st.lesson = st.lesson.min(LESSONS.len().saturating_sub(1));
+    let Some((title, text, show, cmd)) = LESSONS.get(st.lesson).copied() else { return };
+    muted(ui, app, &format!("Lesson {} of {}", st.lesson.saturating_add(1), LESSONS.len()));
+    ui.label(RichText::new(title).size(14.0).strong());
+    ui.add_space(4.0);
+    ui.label(text);
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(st.lesson > 0, egui::Button::new("Back")).clicked() {
+            st.lesson = st.lesson.saturating_sub(1);
+        }
+        let last = st.lesson.saturating_add(1) >= LESSONS.len();
+        if ui.add_enabled(!last, egui::Button::new("Next")).clicked() {
+            st.lesson = st.lesson.saturating_add(1);
+        }
+        let enabled = app.s.enabled(cmd).is_none();
+        if ui.add_enabled(enabled, egui::Button::new(show)).clicked() {
+            app.run(cmd, json!({}));
+        }
+    });
 }
 
 fn whats_new(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {

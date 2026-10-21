@@ -1666,9 +1666,19 @@ pub fn find_contacts(s: &Session, text: &str) -> Vec<ItemId> {
 fn run_search(s: &mut Session, p: &Value) -> CmdResult {
     let text = match pim::text(p, "text")? {
         Some(t) if !t.trim().is_empty() => t,
-        _ => return Ok(json!({ "focus": "searchPeople" })),
+        _ => return Ok(json!({ "focus": "searchPeople", "recent": s.view.recent_people_searches })),
     };
+    // Recent searches, newest first (the search box offers them).
+    let kept: String = text.trim().chars().take(MAX_PEOPLE_SEARCH_CHARS).collect();
+    let recent = &mut s.view.recent_people_searches;
+    recent.retain(|r| !r.eq_ignore_ascii_case(&kept));
+    recent.insert(0, kept);
+    recent.truncate(crate::session::MAX_RECENT_PEOPLE_SEARCHES);
     let ids = find_contacts(s, &text);
+    if ids.is_empty() {
+        let shown: String = text.trim().chars().take(60).collect();
+        s.notify(crate::Notice::Info(format!("No contacts match \"{shown}\".")));
+    }
     let matches: Vec<Value> =
         ids.iter().filter_map(|id| s.mailbox.contacts.get(id)).map(contact_json).collect();
     let dialog = match ids.as_slice() {
@@ -1685,6 +1695,9 @@ fn run_search(s: &mut Session, p: &Value) -> CmdResult {
     }
     Ok(out)
 }
+
+/// Longest Search People text kept with the recent searches.
+const MAX_PEOPLE_SEARCH_CHARS: usize = 256;
 
 fn contact_selected(s: &Session) -> Option<&'static str> {
     if pim::selected(s, Kind::Contact).is_empty() { Some("no contact selected") } else { None }
@@ -2394,6 +2407,14 @@ mod tests {
         assert_eq!(r["dialog"], "chooseContact");
         let r = s.run("people.search", &json!({"text": "zzz"})).unwrap();
         assert!(r["matches"].as_array().unwrap().is_empty());
+        assert!(
+            matches!(s.notices.last(), Some(Notice::Info(t)) if t.contains("No contacts match")),
+            "an empty result says so"
+        );
+        let r = s.run("people.search", &json!({})).unwrap();
+        assert_eq!(r["recent"], json!(["zzz", "ann", "lee"]), "recent searches, newest first");
+        s.run("people.search", &json!({"text": "LEE"})).unwrap();
+        assert_eq!(s.view.recent_people_searches, ["LEE", "zzz", "ann"]);
     }
 
     #[test]

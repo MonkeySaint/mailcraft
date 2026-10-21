@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use mailcraft_model::Security;
 
-use super::parse::{Code, Fetch, ListEntry, Response, Status, Untagged, parse_response, trailing_literal};
+use super::parse::{
+    Code, Fetch, ListEntry, QuotaResource, Response, Status, Untagged, parse_response, trailing_literal,
+};
 use super::seqset::SeqSet;
 use super::utf7;
 use crate::error::{NetError, Result};
@@ -838,6 +840,26 @@ impl ImapClient {
                 _ => None,
             })
             .flatten()
+            .collect())
+    }
+
+    /// GETQUOTAROOT `mailbox` (RFC 9208 / RFC 2087): the resources of every quota root the mailbox is under.
+    /// `Ok(empty)` when the server does not announce QUOTA.
+    pub fn get_quota_root(&mut self, mailbox: &str) -> Result<Vec<(String, Vec<QuotaResource>)>> {
+        if !self.has_capability("QUOTA")
+            && !self.caps.iter().any(|c| c.to_ascii_uppercase().starts_with("QUOTA="))
+        {
+            return Ok(Vec::new());
+        }
+        let cmd = self.mailbox_arg(Command::new("GETQUOTAROOT"), mailbox);
+        let done = self.run(cmd)?;
+        Ok(done
+            .untagged
+            .into_iter()
+            .filter_map(|u| match u {
+                Untagged::Quota { root, resources } => Some((root, resources)),
+                _ => None,
+            })
             .collect())
     }
 

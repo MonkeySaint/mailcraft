@@ -423,6 +423,7 @@ item | Save Current View As a New View... | save | view.saveViewAs | | S
 item | Apply Current View to Other Note Folders... | | view.applyViewTo | | A
 
 menu notesMove
+dyn | recentNoteFolders | notes.move | {"folder":"$id"}
 item | Other Folder... | folder | notes.move | | O
 item | Copy to Folder... | copy | notes.copy | | C
 
@@ -431,3 +432,4 @@ dyn | categories | notes.categorize | {"name":"$name"}
 sep
 item | Clear All Categories | | notes.categorize | {"name":"","clear":true} | C
 item | All Categories... | category-tag | notes.allCategories | | A
+item | Set Quick Click... | | categories.setQuickClick | | Q

@@ -122,6 +122,10 @@ struct Posting {
     tf: u16,
 }
 
+/// Most properties kept per item, and the longest value kept.
+const MAX_PROPS: usize = 64;
+const MAX_PROP_VALUE: usize = 512;
+
 #[derive(Clone, Debug, Default)]
 struct Slot {
     id: u64,
@@ -140,6 +144,8 @@ struct Slot {
     people: Box<[(u8, Box<str>)]>,
     /// Folded word tokens of each category name.
     categories: Box<[Box<[Box<str>]>]>,
+    /// Item properties for form-field conditions (`Doc::props`).
+    props: Box<[(Box<str>, Box<str>)]>,
     /// Term ids of every field in `field::ALL` order, `GAP` between segments.
     tokens: Box<[u32]>,
     /// End offset in `tokens` of each field.
@@ -337,6 +343,12 @@ impl Index {
             expires: doc.expires,
             people: people.into_boxed_slice(),
             categories: categories.into_boxed_slice(),
+            props: doc
+                .props
+                .iter()
+                .take(MAX_PROPS)
+                .map(|(k, v)| (k.as_str().into(), v.chars().take(MAX_PROP_VALUE).collect::<String>().into()))
+                .collect(),
             tokens: tokens.into_boxed_slice(),
             ends,
         });
@@ -508,6 +520,7 @@ impl Index {
             }
             Term::Size(spec) => self.scan(|s| spec.contains(s.size)),
             Term::Kind(k) => self.scan(|s| s.kind == *k),
+            Term::Prop(p) => self.scan(|s| p.matches(&s.props)),
             Term::Expires(v) => match Expiry::parse(v) {
                 Some(e) => self.scan(|s| ctx.expiry_matches(&e, s.expires)),
                 None => self.empty_bits(),
@@ -703,6 +716,45 @@ mod tests {
         let mut v = ix.matching(&parse(q), &ctx(), &Filter::default());
         v.sort_unstable();
         v
+    }
+
+    #[test]
+    fn property_conditions_agree_with_direct_evaluation() {
+        let mut ix = index();
+        let mut docs = docs();
+        let props = [
+            vec![("sensitivity", "Private"), ("duedate", "2026-11-02"), ("percentcomplete", "50")],
+            vec![("sensitivity", "Normal"), ("conversation", "lunch")],
+            vec![("sensitivity", "Private"), ("company", "Example Café")],
+            vec![("conversation", "lunch plans")],
+        ];
+        for (d, p) in docs.iter_mut().zip(props) {
+            d.props = p.into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+            ix.upsert(d);
+        }
+        for (q, want) in [
+            ("prop:\"Sensitivity=private\"", vec![1, 3]),
+            ("prop:\"Sensitivity!=Private\"", vec![2, 4]),
+            ("prop:\"Due Date<2026-12-01\"", vec![1]),
+            ("prop:\"Due Date>2026-12-01\"", vec![]),
+            ("prop:\"Percent Complete>9\"", vec![1]),
+            ("prop:\"Company~cafe\"", vec![3]),
+            ("prop:\"Company!~cafe\"", vec![1, 2, 4]),
+            ("prop:\"Company=\"", vec![1, 2, 4]),
+            ("prop:\"Company!=\"", vec![3]),
+            ("conversation:\"RE: Lunch\"", vec![2]),
+            ("prop:\"no operator\"", vec![]),
+            ("budget prop:\"sensitivity=private\"", vec![1, 3]),
+        ] {
+            assert_eq!(ids(&ix, q), want, "{q}");
+            let direct: Vec<u64> =
+                docs.iter().filter(|d| crate::eval::matches(&parse(q), d, &ctx())).map(|d| d.id).collect();
+            assert_eq!(direct, want, "{q} (direct)");
+        }
+        // Canonical text round-trips.
+        for q in ["prop:\"Due Date<2026-12-01\"", "conversation:\"lunch\"", "prop:\"Company!=\""] {
+            assert_eq!(parse(&parse(q).to_string()), parse(q), "{q}");
+        }
     }
 
     #[test]

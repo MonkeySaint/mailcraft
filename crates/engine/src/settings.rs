@@ -247,6 +247,7 @@ const QUICK_CLICK_FLAG: &[(&str, &str)] = &[
 ];
 const SEARCH_SCOPES: &[(&str, &str)] = &[
     ("currentFolder", "Current folder"),
+    ("folderInboxMailbox", "Current folder, current mailbox when searching from the Inbox"),
     ("subfolders", "Current folder and its subfolders"),
     ("currentMailbox", "Current mailbox"),
     ("allMailboxes", "All mailboxes"),
@@ -273,6 +274,16 @@ const ACCESS_WARNINGS: &[(&str, &str)] = &[
 ];
 const ALT_CALENDARS: &[(&str, &str)] = &[("hijri", "Hijri (tabular)"), ("hebrew", "Hebrew lunar")];
 const SOUND_SCHEMES: &[(&str, &str)] = &[("modern", "Modern"), ("classic", "Classic")];
+/// Personal Stationery: "none" plus the ids of `compose::STATIONERY`.
+const STATIONERY_CHOICES: &[(&str, &str)] = &[
+    ("none", "(none)"),
+    ("clearDay", "Clear Day"),
+    ("linen", "Linen"),
+    ("meadow", "Meadow"),
+    ("slate", "Slate"),
+    ("blush", "Blush"),
+    ("sunrise", "Sunrise"),
+];
 const OPEN_FILES: &[(&str, &str)] = &[("browser", "Browser"), ("desktop", "Desktop app")];
 const OPEN_LINKS: &[(&str, &str)] = &[("default", "Default browser")];
 const ENCODINGS: &[(&str, &str)] = &[
@@ -976,6 +987,14 @@ pub const DEFS: &[Def] = &[
         Int(0, 0, 72),
         A,
     ),
+    d(
+        "stationery",
+        "New mail messages",
+        "mail.compose.stationery",
+        "Stationery for new HTML messages:",
+        Choice("none", STATIONERY_CHOICES),
+        A,
+    ),
     // ---------------------------------------------------------------- Calendar
     d("calendar", "Work time", "calendar.workHours", "Work hours (start-end):", TimeRange("08:00-17:00"), A),
     d(
@@ -1350,7 +1369,7 @@ pub const DEFS: &[Def] = &[
         "Results",
         "search.scope",
         "Include results only from:",
-        Choice("currentFolder", SEARCH_SCOPES),
+        Choice("currentMailbox", SEARCH_SCOPES),
         A,
     ),
     d(
@@ -1526,6 +1545,14 @@ pub const DEFS: &[Def] = &[
         "advanced.emptyDeletedOnExit",
         "Empty Deleted Items folders when exiting MailCraft",
         Bool(false),
+        A,
+    ),
+    d(
+        "advanced",
+        "Start and exit",
+        "advanced.recoverDays",
+        "Keep permanently deleted items recoverable for (days, 0 = not at all):",
+        Int(14, 0, 365),
         A,
     ),
     d(

@@ -230,6 +230,7 @@ fn term_matches(t: &Term, doc: &Doc, ctx: &Context) -> bool {
         Term::Size(s) => s.contains(doc.size),
         Term::Kind(k) => doc.kind == *k,
         Term::Expires(v) => Expiry::parse(v).is_some_and(|e| ctx.expiry_matches(&e, doc.expires)),
+        Term::Prop(p) => p.matches(&doc.props),
         Term::Invalid(..) => false,
     }
 }

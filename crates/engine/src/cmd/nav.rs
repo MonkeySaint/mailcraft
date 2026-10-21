@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::cmd::util::{dialog, opt_bool, opt_ids};
 use crate::cmd::view::modules;
 use crate::queries;
-use crate::{CmdError, CmdResult, CommandSpec, Module, Selection, Session, always};
+use crate::{CmdError, CmdResult, CommandSpec, Module, SearchScope, Selection, Session, always};
 use mailcraft_model::{FolderId, FolderKind, FolderRole, ItemId, TaskStatus};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -207,8 +207,31 @@ fn show_folder(s: &mut Session, folder: FolderId) {
     if s.selection.folder != folder {
         s.view.search.clear();
     }
+    if s.selection.folder != folder || !s.view.folder_visits.contains_key(&folder) {
+        note_visit(s, folder);
+    }
     s.selection = Selection { folder, items: Vec::new(), focus: None };
     crate::new_mail::seen_folder(s, folder);
+    if s.settings.text("search.scope") == crate::session::INBOX_MAILBOX_SCOPE
+        && matches!(s.view.search_scope, SearchScope::CurrentFolder | SearchScope::CurrentMailbox)
+    {
+        s.view.search_scope = s.inbox_rule_scope(folder);
+    }
+}
+
+/// Opening a folder: what arrived since the previous visit counts as unseen (status bar) until the next one.
+pub(crate) fn note_visit(s: &mut Session, folder: FolderId) {
+    let mark = s.mailbox.next_id;
+    let visits = &mut s.view.folder_visits;
+    let prev = visits.get(&folder).map_or(mark, |(_, cur)| *cur);
+    visits.insert(folder, (prev, mark));
+    if visits.len() > crate::session::MAX_FOLDER_VISITS {
+        let oldest =
+            visits.iter().filter(|(f, _)| **f != folder).min_by_key(|(_, (_, cur))| *cur).map(|(f, _)| *f);
+        if let Some(f) = oldest {
+            visits.remove(&f);
+        }
+    }
 }
 
 fn switch_module(s: &mut Session, module: Module) -> FolderId {

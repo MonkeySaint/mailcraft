@@ -60,6 +60,10 @@ fn doc() -> impl Strategy<Value = Doc> {
                 has_attachments: has_att,
                 // Some expire (a few days back up to a few weeks ahead), the rest never.
                 expires: flagged.then(|| NOW + (days - 10) * 86_400 + 1_800),
+                props: vec![
+                    ("sensitivity".to_owned(), if read { "Private" } else { "Normal" }.to_owned()),
+                    ("duedate".to_owned(), format!("2026-10-{:02}", days % 28 + 1)),
+                ],
             },
         )
 }
@@ -104,6 +108,9 @@ fn query() -> impl Strategy<Value = String> {
         Just("expires:expired".to_owned()),
         Just("expires:no".to_owned()),
         Just("expires:<=tomorrow".to_owned()),
+        Just("prop:\"Sensitivity=private\"".to_owned()),
+        Just("prop:\"Due Date<2026-10-15\"".to_owned()),
+        Just("prop:\"company!=\"".to_owned()),
     ];
     prop::collection::vec(
         (atom, prop::sample::select(vec![" ", " OR ", " -", " AND NOT ", " (", ") "])),

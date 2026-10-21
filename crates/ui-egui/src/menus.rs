@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 
 use mailcraft_engine::cmd::quicksteps;
 use mailcraft_engine::queries;
-use mailcraft_model::{AccountId, ArrangeBy, FlagState, FolderId, FolderRole, ItemId, ListFilter, SortOrder};
+use mailcraft_model::{
+    AccountId, ArrangeBy, FlagState, FolderId, FolderKind, FolderRole, ItemId, ListFilter, SortOrder,
+};
 
 use crate::App;
 
@@ -271,9 +273,9 @@ fn quick_steps_menu(ui: &mut Ui, app: &mut App, t: &Targets, group: bool) {
         let params = if group { t.with(json!({"id": id, "group": true})) } else { t.with(json!({"id": id})) };
         cmd_if(ui, app, "quick-steps", &name, ok, "quicksteps.run", params);
     }
-    if !app.s.mailbox.quick_steps.is_empty() {
-        ui.separator();
-    }
+    // The fixed Create New entry (as the ribbon gallery has it): the Edit Quick Step editor.
+    cmd(ui, app, "plus", "Create New", "quicksteps.run", json!({"id": "new"}));
+    ui.separator();
     sub(ui, app, "plus", "New Quick Step", true, |ui, app| {
         for (label, template) in [
             ("Move to Folder...", "moveToFolder"),
@@ -582,7 +584,7 @@ pub fn group_header_menu(ui: &mut Ui, app: &mut App, label: &str) {
 
 /// Runs a folder command for `folder`; when the command is disabled only because another folder is
 /// selected, selects `folder` first.
-fn run_folder(app: &mut App, folder: FolderId, id: &str, params: Value) -> Option<Value> {
+pub(crate) fn run_folder(app: &mut App, folder: FolderId, id: &str, params: Value) -> Option<Value> {
     if app.s.selection.folder != folder && app.s.enabled(id).is_some() {
         app.run("nav.selectFolder", json!({"folder": folder.0}));
     }
@@ -653,6 +655,10 @@ fn folder_menu_in(ui: &mut Ui, app: &mut App, folder: FolderId, in_favorites: bo
     folder_row(ui, app, folder, "copy", "Copy Folder", true, "folder.copy", p.clone());
     folder_row(ui, app, folder, "move", "Move Folder", user, "folder.move", p.clone());
     folder_row(ui, app, folder, "delete", "Delete Folder", user, "folder.delete", p.clone());
+    // Paste the messages copied with Copy (Ctrl+C) into this folder.
+    let can_paste = !app.s.clipboard.is_empty()
+        && app.s.mailbox.folder(folder).is_some_and(|f| f.kind == FolderKind::Mail);
+    folder_row(ui, app, folder, "paste", "Paste", can_paste, "app.paste", p.clone());
     ui.separator();
     folder_row(ui, app, folder, "read", "Mark All as Read", unread, "folder.markAllRead", p.clone());
     folder_row(ui, app, folder, "clean-up", "Clean Up Folder", true, "mail.cleanUpFolder", p.clone());
@@ -828,7 +834,14 @@ pub fn status_bar_menu(ui: &mut Ui, app: &mut App) {
     let filtered = filter_applied(app);
     for (key, label) in STATUS_BAR_ITEMS {
         let value = match key {
-            "quota" => "Off".to_owned(),
+            "quota" => match mailcraft_engine::sync::status_quota(&app.s).and_then(|(_, q)| q.percent()) {
+                Some(p) => format!("{p}% full"),
+                None => "Off".to_owned(),
+            },
+            "unseenItems" => {
+                let n = queries::unseen_in_view(&app.s);
+                if n > 0 { thousands(n) } else { String::new() }
+            }
             "headerItems" => {
                 let n = queries::header_items_in_view(&app.s);
                 if n > 0 { thousands(n) } else { String::new() }

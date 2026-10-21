@@ -19,6 +19,7 @@ pub mod intl;
 pub mod junk;
 pub mod new_mail;
 pub mod queries;
+pub mod recover;
 pub mod reminders;
 pub mod rules_exec;
 pub mod sample;
@@ -37,8 +38,9 @@ pub use accounts::{FileSecretStore, MemorySecretStore, SecretStore};
 pub use mailcraft_model as model;
 pub use session::{
     DEFAULT_QUICK_ACCESS, Module, Notice, SearchScope, Selection, Session, TodoBar, ViewState,
+    recent_move_folders,
 };
-pub use sync::{Connection, Plan, SyncStatus, TestReport};
+pub use sync::{Connection, MailboxQuota, Plan, SyncStatus, TestReport};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CmdError {

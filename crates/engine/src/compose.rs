@@ -380,6 +380,9 @@ pub struct ComposeState {
     pub style_set: Option<String>,
     pub paragraph_spacing_preset: Option<String>,
     pub custom_styles: Vec<NamedStyle>,
+    /// The format was chosen for this message (E-mail Message Using › HTML, a template opened with Choose
+    /// Form, a stationery): Options › Mail › "Compose messages in this format" does not replace it.
+    pub format_explicit: bool,
     /// Switch Background: show the body on a light canvas while dark mode is on.
     pub light_canvas: bool,
     /// Body zoom percent; `None` = 100.
@@ -4614,6 +4617,32 @@ pub const THEME_EFFECTS: &[&str] = &[
     "Extreme Shadow",
     "Glossy",
 ];
+
+/// Stationery for new HTML messages (More Stationery…, Personal Stationery): id, name, page colour, document
+/// theme. MailCraft's own set.
+pub const STATIONERY: &[(&str, &str, u32, &str)] = &[
+    ("clearDay", "Clear Day", 0xEEF6FC, "Facet"),
+    ("linen", "Linen", 0xFAF6EE, "Organic"),
+    ("meadow", "Meadow", 0xEFF7EF, "Wisp"),
+    ("slate", "Slate", 0xEEF0F3, "Integral"),
+    ("blush", "Blush", 0xFBF0F2, "Gallery"),
+    ("sunrise", "Sunrise", 0xFFF6E5, "Retrospect"),
+];
+
+/// A stationery by id or name (case-insensitive).
+pub fn stationery(key: &str) -> Option<&'static (&'static str, &'static str, u32, &'static str)> {
+    let k = key.trim();
+    STATIONERY.iter().find(|s| s.0.eq_ignore_ascii_case(k) || s.1.eq_ignore_ascii_case(k))
+}
+
+impl ComposeState {
+    /// Puts a stationery on the message: HTML, the stationery's page colour and theme.
+    pub fn apply_stationery(&mut self, st: &(&str, &str, u32, &str)) {
+        self.format = BodyFormat::Html;
+        self.body.background = Some(Color::hex(st.2));
+        self.theme = ThemeState { name: Some(st.3.to_owned()), ..ThemeState::default() };
+    }
+}
 
 /// Named themes (Options › Themes): name, colour set, font set, effect set.
 pub const THEMES: &[(&str, &str, &str, &str)] = &[

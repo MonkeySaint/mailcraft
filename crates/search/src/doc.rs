@@ -127,6 +127,42 @@ pub struct Doc {
     pub has_attachments: bool,
     /// Unix seconds the item expires (mail: the `Expiry-Date` or `Expires` header, RFC 4021).
     pub expires: Option<i64>,
+    /// Item properties for form-field conditions (`prop:` / `conversation:` terms): (property id, value as
+    /// text). Ids are [`prop_id`]s; dates are `YYYY-MM-DD` (UTC), numbers plain digits.
+    pub props: Vec<(String, String)>,
+}
+
+/// A property id as conditions name it: lower case, without spaces, dashes or underscores ("Message
+/// Class" and "messageClass" both give "messageclass").
+pub fn prop_id(name: &str) -> String {
+    name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// `YYYY-MM-DD` of a time (UTC).
+fn day_text(d: DateTime) -> String {
+    let c = d.civil(0);
+    format!("{:04}-{:02}-{:02}", c.year, c.month, c.day)
+}
+
+fn prop(name: &str, value: impl Into<String>) -> (String, String) {
+    (prop_id(name), value.into())
+}
+
+fn sensitivity_name(s: mailcraft_model::Sensitivity) -> &'static str {
+    match s {
+        mailcraft_model::Sensitivity::Normal => "Normal",
+        mailcraft_model::Sensitivity::Personal => "Personal",
+        mailcraft_model::Sensitivity::Private => "Private",
+        mailcraft_model::Sensitivity::Confidential => "Confidential",
+    }
+}
+
+fn importance_name(i: Importance) -> &'static str {
+    match i {
+        Importance::Low => "Low",
+        Importance::Normal => "Normal",
+        Importance::High => "High",
+    }
 }
 
 /// Most header bytes looked at for the expiry date.
@@ -213,6 +249,7 @@ impl Doc {
             importance: m.importance.into(),
             has_attachments: m.has_attachments(),
             expires: m.raw.as_deref().and_then(expiry_of),
+            props: mail_props(m),
         }
     }
 
@@ -234,6 +271,18 @@ impl Doc {
             categories: a.categories.clone(),
             received: a.start.unix,
             read: true,
+            props: vec![
+                prop("messageClass", "IPM.Appointment"),
+                prop("subject", a.subject.clone()),
+                prop("location", a.location.clone()),
+                prop("start", day_text(a.start)),
+                prop("end", day_text(a.end)),
+                prop("allDayEvent", if a.all_day { "Yes" } else { "No" }),
+                prop("recurring", if a.recurrence.is_some() { "Yes" } else { "No" }),
+                prop("sensitivity", if a.private { "Private" } else { "Normal" }),
+                prop("organizer", a.organizer.as_ref().map(|o| o.addr.clone()).unwrap_or_default()),
+                prop("categories", a.categories.join(", ")),
+            ],
             ..Doc::default()
         }
     }
@@ -267,6 +316,7 @@ impl Doc {
             body: cap(body),
             categories: c.categories.clone(),
             read: true,
+            props: contact_props(c),
             ..Doc::default()
         }
     }
@@ -281,6 +331,7 @@ impl Doc {
             categories: t.categories.clone(),
             received: t.due.or(t.start).map_or(0, |d| d.unix),
             read: true,
+            props: task_props(t),
             ..Doc::default()
         }
     }
@@ -296,7 +347,119 @@ impl Doc {
             categories: n.categories.clone(),
             received: n.modified.unix,
             read: true,
+            props: vec![
+                prop("messageClass", "IPM.StickyNote"),
+                prop("subject", n.text.lines().next().unwrap_or_default()),
+                prop("modified", day_text(n.modified)),
+                prop("categories", n.categories.join(", ")),
+            ],
             ..Doc::default()
         }
     }
+}
+
+/// Mail properties: message class, sensitivity, importance, flag dates and status, dates, size, the
+/// conversation topic.
+fn mail_props(m: &MailItem) -> Vec<(String, String)> {
+    let class = if m.attachments.iter().any(|a| a.mime_type.eq_ignore_ascii_case("text/calendar")) {
+        "IPM.Schedule.Meeting.Request"
+    } else {
+        "IPM.Note"
+    };
+    let (flag_status, flag_due, flag_start) = match &m.flag {
+        FlagState::None => ("", None, None),
+        FlagState::Flagged { due, start, .. } => ("Flagged", *due, *start),
+        FlagState::Complete { .. } => ("Completed", None, None),
+    };
+    let names = |l: &[mailcraft_model::Address]| {
+        l.iter().map(|a| a.name.clone().unwrap_or_else(|| a.addr.clone())).collect::<Vec<_>>().join("; ")
+    };
+    let mut out = vec![
+        prop("messageClass", class),
+        prop("subject", m.subject.clone()),
+        prop("conversation", mailcraft_model::subject::conversation_topic(&m.subject)),
+        prop("from", m.from.as_ref().map(|f| f.addr.clone()).unwrap_or_default()),
+        prop("to", names(&m.to)),
+        prop("cc", names(&m.cc)),
+        prop("sensitivity", sensitivity_name(m.sensitivity)),
+        prop("importance", importance_name(m.importance)),
+        prop("flagStatus", flag_status),
+        prop("received", day_text(m.received)),
+        prop("size", m.size.to_string()),
+        prop("read", if m.read { "Yes" } else { "No" }),
+        prop("hasAttachments", if m.has_attachments() { "Yes" } else { "No" }),
+        prop("categories", m.categories.join(", ")),
+    ];
+    if let Some(d) = m.sent {
+        out.push(prop("sent", day_text(d)));
+    }
+    if let Some(d) = flag_due {
+        out.push(prop("dueDate", day_text(d)));
+    }
+    if let Some(d) = flag_start {
+        out.push(prop("startDate", day_text(d)));
+    }
+    out
+}
+
+fn contact_props(c: &Contact) -> Vec<(String, String)> {
+    let mut out = vec![
+        prop("messageClass", "IPM.Contact"),
+        prop("fullName", c.full_name()),
+        prop("firstName", c.first_name.clone()),
+        prop("lastName", c.last_name.clone()),
+        prop("fileAs", c.file_as.clone()),
+        prop("company", c.company.clone()),
+        prop("jobTitle", c.job_title.clone()),
+        prop("department", c.department.clone()),
+        prop("office", c.office.clone()),
+        prop("email", c.emails.first().cloned().unwrap_or_default()),
+        prop("webPage", c.web_page.clone()),
+        prop("sensitivity", if c.private { "Private" } else { "Normal" }),
+        prop("categories", c.categories.join(", ")),
+    ];
+    if let Some(b) = &c.birthday {
+        out.push(prop("birthday", b.clone()));
+    }
+    for (kind, number) in c.phones.iter().take(32) {
+        out.push(prop(&format!("{kind}Phone"), number.clone()));
+    }
+    out
+}
+
+fn task_props(t: &Task) -> Vec<(String, String)> {
+    use mailcraft_model::{TaskPriority, TaskStatus};
+    let status = match t.status {
+        TaskStatus::NotStarted => "Not Started",
+        TaskStatus::InProgress => "In Progress",
+        TaskStatus::Completed => "Completed",
+        TaskStatus::WaitingOnSomeoneElse => "Waiting on someone else",
+        TaskStatus::Deferred => "Deferred",
+    };
+    let priority = match t.priority {
+        TaskPriority::Low => "Low",
+        TaskPriority::Normal => "Normal",
+        TaskPriority::High => "High",
+    };
+    let mut out = vec![
+        prop("messageClass", "IPM.Task"),
+        prop("subject", t.subject.clone()),
+        prop("status", status),
+        prop("priority", priority),
+        prop("percentComplete", t.percent_complete.to_string()),
+        prop("complete", if t.is_complete() { "Yes" } else { "No" }),
+        prop("sensitivity", if t.private { "Private" } else { "Normal" }),
+        prop("owner", t.assigned_to.join("; ")),
+        prop("categories", t.categories.join(", ")),
+    ];
+    if let Some(d) = t.due {
+        out.push(prop("dueDate", day_text(d)));
+    }
+    if let Some(d) = t.start {
+        out.push(prop("startDate", day_text(d)));
+    }
+    if let Some(d) = t.completed {
+        out.push(prop("dateCompleted", day_text(d)));
+    }
+    out
 }

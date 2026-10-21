@@ -137,9 +137,21 @@ pub struct User {
     pub address: String,
     pub password: String,
     pub mailboxes: Vec<Mailbox>,
+    /// Storage limit in octets (IMAP QUOTA, JMAP Quota); `None` = unlimited.
+    pub quota: Option<u64>,
 }
 
 impl User {
+    /// Octets used by every mailbox of the user.
+    pub fn used(&self) -> u64 {
+        self.mailboxes.iter().map(Mailbox::size).fold(0, u64::saturating_add)
+    }
+
+    /// Messages in every mailbox of the user.
+    pub fn message_count(&self) -> u64 {
+        self.mailboxes.iter().map(|m| m.messages.len() as u64).fold(0, u64::saturating_add)
+    }
+
     pub fn mailbox(&self, name: &str) -> Option<&Mailbox> {
         let name = canonical_name(name);
         self.mailboxes.iter().find(|m| m.name == name)
@@ -324,7 +336,7 @@ impl Store {
         }
         self.users.insert(
             Self::key(addr),
-            User { address: addr.to_owned(), password: password.to_owned(), mailboxes },
+            User { address: addr.to_owned(), password: password.to_owned(), mailboxes, quota: None },
         );
         Ok(())
     }

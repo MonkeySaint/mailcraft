@@ -41,7 +41,7 @@ pub(super) const TEMPLATES: [(&str, &str); 7] = [
 ];
 
 /// Action kinds offered in the editor, in [`QuickStepAction`] order.
-const KINDS: [&str; 17] = [
+const KINDS: [&str; 25] = [
     "Move to folder",
     "Copy to folder",
     "Delete message",
@@ -59,6 +59,14 @@ const KINDS: [&str; 17] = [
     "Reply",
     "Reply All",
     "New meeting",
+    "Forward as attachment",
+    "Reply with meeting",
+    "Create a task with the message text",
+    "Create an appointment with the message text",
+    "Ignore conversation",
+    "Always move conversation",
+    "Move to Focused",
+    "Move to Other",
 ];
 
 /// Flag choices: the Follow Up keys the engine turns into dates, with their labels.
@@ -115,6 +123,14 @@ pub(super) fn action_text(app: &App, a: &QuickStepAction) -> String {
         QuickStepAction::Reply => "Reply".into(),
         QuickStepAction::ReplyAll => "Reply All".into(),
         QuickStepAction::NewMeeting => "New meeting".into(),
+        QuickStepAction::ForwardAsAttachment(to) => format!("Forward as attachment to: {}", people(to)),
+        QuickStepAction::ReplyWithMeeting => "Reply with meeting".into(),
+        QuickStepAction::CreateTask => "Create a task with the message text".into(),
+        QuickStepAction::CreateAppointment => "Create an appointment with the message text".into(),
+        QuickStepAction::Ignore => "Ignore conversation".into(),
+        QuickStepAction::AlwaysMoveConversation(f) => format!("Always move conversation to: {}", folder(f)),
+        QuickStepAction::MoveToFocused => "Move to Focused".into(),
+        QuickStepAction::MoveToOther => "Move to Other".into(),
     }
 }
 
@@ -298,6 +314,18 @@ impl Act {
             QuickStepAction::Reply => k(14),
             QuickStepAction::ReplyAll => k(15),
             QuickStepAction::NewMeeting => k(16),
+            QuickStepAction::ForwardAsAttachment(to) => {
+                Act { kind: 17, text: to.join("; "), ..Default::default() }
+            }
+            QuickStepAction::ReplyWithMeeting => k(18),
+            QuickStepAction::CreateTask => k(19),
+            QuickStepAction::CreateAppointment => k(20),
+            QuickStepAction::Ignore => k(21),
+            QuickStepAction::AlwaysMoveConversation(f) => {
+                Act { kind: 22, folder: f.map(|f| f.0), ..Default::default() }
+            }
+            QuickStepAction::MoveToFocused => k(23),
+            QuickStepAction::MoveToOther => k(24),
         }
     }
 
@@ -323,6 +351,14 @@ impl Act {
             13 => QuickStepAction::Forward(common::split_list(&self.text)),
             14 => QuickStepAction::Reply,
             15 => QuickStepAction::ReplyAll,
+            17 => QuickStepAction::ForwardAsAttachment(common::split_list(&self.text)),
+            18 => QuickStepAction::ReplyWithMeeting,
+            19 => QuickStepAction::CreateTask,
+            20 => QuickStepAction::CreateAppointment,
+            21 => QuickStepAction::Ignore,
+            22 => QuickStepAction::AlwaysMoveConversation(self.folder.map(FolderId)),
+            23 => QuickStepAction::MoveToFocused,
+            24 => QuickStepAction::MoveToOther,
             _ => QuickStepAction::NewMeeting,
         }
     }
@@ -429,7 +465,7 @@ fn action_rows(ui: &mut Ui, app: &mut App, uid: u64, st: &mut EditState) -> Out 
         ui.horizontal(|ui| {
             common::combo_idx(ui, ("qs-kind", uid, i), &mut a.kind, &KINDS, 180.0);
             match a.kind {
-                0 | 1 => {
+                0 | 1 | 22 => {
                     let p = folder_path(app, a.folder);
                     ui.label(if p.is_empty() { "Choose folder on first use".to_owned() } else { p });
                     if ui.button("Folder...").clicked() {
@@ -450,7 +486,7 @@ fn action_rows(ui: &mut Ui, app: &mut App, uid: u64, st: &mut EditState) -> Out 
                     let labels: Vec<&str> = FLAGS.iter().map(|(_, l)| *l).collect();
                     common::combo_idx(ui, ("qs-flag", uid, i), &mut a.choice, &labels, 120.0);
                 }
-                12 | 13 => {
+                12 | 13 | 17 => {
                     ui.add(
                         egui::TextEdit::singleline(&mut a.text)
                             .hint_text("To (empty: ask on first use)")

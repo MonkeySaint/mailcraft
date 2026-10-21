@@ -1519,6 +1519,14 @@ pub fn status_counts(s: &Session) -> (usize, usize) {
     (items.len(), unread)
 }
 
+/// Status bar › Unseen Items in View: items in the current view that arrived after the previous time the
+/// folder was opened (0 on a first visit).
+pub fn unseen_in_view(s: &Session) -> usize {
+    let Some((prev, _)) = s.view.folder_visits.get(&s.selection.folder).copied() else { return 0 };
+    let (_, items) = view_items(s);
+    items.iter().filter(|m| m.id.0 > prev).count()
+}
+
 /// Reading pane header model for an item.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReadingHeader {

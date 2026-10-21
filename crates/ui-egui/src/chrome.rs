@@ -1154,6 +1154,18 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
         if items.shown("filter") && crate::menus::filter_applied(app) {
             ui.label("Filter applied");
         }
+        if items.shown("unseenItems") {
+            let unseen = mailcraft_engine::queries::unseen_in_view(&app.s);
+            if unseen > 0 {
+                ui.label(format!("Unseen: {}", crate::menus::thousands(unseen)))
+                    .on_hover_text("Items that arrived since you last opened this folder");
+            }
+        }
+    }
+    if items.shown("quota")
+        && let Some((name, q)) = mailcraft_engine::sync::status_quota(&app.s)
+    {
+        quota_meter(ui, app, &name, &q);
     }
     // Mail › Message arrival › "Show an envelope icon in the taskbar": the in-app envelope (the window icon
     // carries it too, `App::sync_envelope`); clicking it opens the folder of the newest new message.
@@ -1234,6 +1246,22 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
     {
         paint_focus(ui, app, r.rect.intersect(bar));
     }
+}
+
+/// Quota Information: "Mailbox 42%" and a small meter (red from 90 %); the hover tells the sizes.
+fn quota_meter(ui: &mut Ui, app: &App, account: &str, q: &mailcraft_engine::MailboxQuota) {
+    let Some(pct) = q.percent() else { return };
+    let theme = &app.theme;
+    let full = pct >= 90;
+    let color = if full { theme.danger } else { theme.text_muted };
+    let hover = format!("{account}: {}", q.text());
+    ui.label(egui::RichText::new(format!("Mailbox {pct}% full")).color(color)).on_hover_text(hover.as_str());
+    let (r, resp) = ui.allocate_exact_size(vec2(48.0, 6.0), Sense::hover());
+    ui.painter().rect_filled(r, CornerRadius::same(3), theme.separator);
+    let mut fill = r;
+    fill.set_width(r.width() * f32::from(pct) / 100.0);
+    ui.painter().rect_filled(fill, CornerRadius::same(3), if full { theme.danger } else { theme.accent });
+    resp.on_hover_text(hover);
 }
 
 /// Total messages waiting in the Outboxes of server accounts, and the first account with any.

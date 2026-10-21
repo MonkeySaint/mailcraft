@@ -375,6 +375,13 @@ pub(crate) fn run(
             let (list, state) = c.mailboxes_with_state()?;
             send(events, cancel, account, JmapEvent::Mailboxes { list, state });
         }
+        // The mailbox quota (RFC 9425), when the server offers it.
+        match c.quota() {
+            Ok(quota) => {
+                events.send(Event::Quota { account, quota });
+            }
+            Err(e) => log::info!("jmap: quota not available: {e}"),
+        }
         progress("Updating messages…");
         let mut since = j.email_state.clone();
         if !since.is_empty() {

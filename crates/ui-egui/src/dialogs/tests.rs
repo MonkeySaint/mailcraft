@@ -928,3 +928,139 @@ fn new_data_file_asks_for_a_name() {
     assert_eq!(h.state().s.mailbox.accounts.len(), before + 1);
     assert!(h.state().s.mailbox.accounts.iter().any(|a| a.display_name == "Receipts archive"));
 }
+
+#[test]
+fn stationery_picker_opens_a_message_on_the_chosen_stationery() {
+    let mut app = sample_app();
+    let before = app.s.composes.len();
+    let list = mailcraft_engine::cmd::mail::stationery_list();
+    crate::dialogs::open(&mut app, "pickStationery", json!({"stationery": list, "default": "none"}));
+    let mut h = harness(app);
+    h.get_by_label("Linen").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    let s = &h.state().s;
+    assert_eq!(s.composes.len(), before + 1);
+    let c = s.composes.values().max_by_key(|c| c.id).unwrap();
+    assert_eq!(c.theme.name.as_deref(), Some("Organic"));
+    assert!(c.body.background.is_some());
+    assert!(!names(&h).iter().any(|n| n == "pickStationery"));
+}
+
+#[test]
+fn send_receive_groups_dialog_lists_and_adds_groups() {
+    let mut app = sample_app();
+    let listing = app.s.run("sendReceive.defineGroups", &json!({"action": "list"})).unwrap();
+    crate::dialogs::open(&mut app, "sendReceiveGroups", listing);
+    let mut h = harness(app);
+    assert!(h.query_by_label("All Accounts").is_some());
+    assert!(h.query_by_label_contains("Settings for group").is_some());
+    h.get_by_label("New...").click();
+    step(&mut h);
+    assert!(h.query_by_label("Group name:").is_some());
+    // A group made through the command shows after the next listing; the editor opens on Edit.
+    h.state_mut()
+        .s
+        .run("sendReceive.defineGroups", &json!({"action": "save", "group": {"name": "Evening"}}))
+        .unwrap();
+    assert_eq!(mailcraft_engine::sync::groups::groups(&h.state().s).len(), 1);
+}
+
+#[test]
+fn add_form_field_adds_and_edits_conditions() {
+    let mut app = sample_app();
+    crate::dialogs::open(&mut app, "addFormField", json!({}));
+    let mut h = harness(app);
+    assert!(h.query_by_label("Fields from:").is_some());
+    step(&mut h);
+    // The fields are listed one per line.
+    let top = |h: &Harness<'_, App>, l: &str| {
+        h.get_all_by_label(l).map(|n| n.rect().min.y).fold(f32::MAX, f32::min)
+    };
+    assert!(top(&h, "Sensitivity") > top(&h, "Subject"));
+    h.get_by_label("Sensitivity").click();
+    step(&mut h);
+    assert_eq!(h.get_all_by_label("Sensitivity").count(), 2, "the chosen field heads the condition");
+    step(&mut h);
+    h.get_by_label("Add to Search").click();
+    step(&mut h);
+    assert_eq!(h.state().s.view.search, "prop:\"Sensitivity=Normal\"");
+    assert!(h.query_by_label("Remove").is_some(), "the condition shows as a row");
+    h.get_by_label("Remove").click();
+    step(&mut h);
+    assert!(h.state().s.view.search.is_empty());
+}
+
+#[test]
+fn training_lessons_page_with_next_and_back() {
+    let mut app = sample_app();
+    crate::dialogs::open(&mut app, "help", json!({"topic": "training"}));
+    let mut h = harness(app);
+    assert!(h.query_by_label("Lesson 1 of 8").is_some());
+    h.get_by_label("Next").click();
+    step(&mut h);
+    assert!(h.query_by_label("Lesson 2 of 8").is_some());
+    h.get_by_label("Back").click();
+    step(&mut h);
+    assert!(h.query_by_label("Lesson 1 of 8").is_some());
+    for (_, _, _, cmd) in super::general::LESSONS {
+        assert!(h.state().s.registry.get(cmd).is_some(), "{cmd}");
+    }
+}
+
+#[test]
+fn recover_deleted_items_purges_selected() {
+    let mut app = sample_app();
+    let account = app.s.current_account().unwrap();
+    let deleted = app.s.mailbox.role_folder(account, mailcraft_model::FolderRole::DeletedItems).unwrap();
+    app.s.mailbox.add_mail(mailcraft_model::MailItem {
+        folder: deleted,
+        subject: "Old memo".into(),
+        ..Default::default()
+    });
+    app.s.run("folder.emptyDeleted", &json!({"folder": deleted.0})).unwrap();
+    app.s.run("folder.recoverDeleted", &json!({})).unwrap();
+    // The command asks for the dialog with a notice (the shell opens it); open it the same way here.
+    let params = app
+        .s
+        .notices
+        .iter()
+        .rev()
+        .find_map(|n| match n {
+            mailcraft_engine::Notice::OpenDialog(d, p) if d == "recoverDeletedItems" => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    crate::dialogs::open(&mut app, "recoverDeletedItems", params);
+    let mut h = harness(app);
+    assert!(h.query_by_label("Old memo").is_some());
+    assert!(h.query_by_label("Purge Selected Items").is_some());
+    h.get_by_label("Select All").click();
+    step(&mut h);
+    h.get_by_label("Purge Selected Items").click();
+    step(&mut h);
+    assert!(mailcraft_engine::recover::listed(&h.state().s).is_empty());
+}
+
+#[test]
+fn custom_flag_due_date_from_the_month_picker() {
+    let mut app = sample_app();
+    let item = select_first(&mut app);
+    app.run("mail.flagCustom", json!({})).unwrap();
+    let mut h = harness(app);
+    // The second ▾ is the due date's calendar.
+    h.get_all_by_label("▾").nth(1).unwrap().click();
+    step(&mut h);
+    h.get_by_label("15").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    match &h.state().s.mailbox.mail.get(&ItemId(item)).unwrap().flag {
+        FlagState::Flagged { due: Some(d), .. } => {
+            let tz = h.state().s.tz_offset_min;
+            assert_eq!(mailcraft_model::dates::LocalTime::of(*d, tz).day, 15);
+        }
+        other => panic!("no due date: {other:?}"),
+    }
+}

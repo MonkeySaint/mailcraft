@@ -17,8 +17,113 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "readingPaneOptions" => reading_pane(ctx, app, d),
         "messageOptions" => message_options(ctx, app, d),
         "stationery" | "signatures" => signatures::show(ctx, app, d),
+        "pickStationery" => pick_stationery(ctx, app, d),
         _ => return None,
     })
+}
+
+#[derive(Clone, Default)]
+struct PickStationery {
+    picked: Option<String>,
+    make_default: bool,
+}
+
+/// More Stationery…: the stationery list with a preview; OK opens a new HTML message on it ("Set as my
+/// default" also keeps it for new messages, Personal Stationery).
+fn pick_stationery(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let list = d.arr("stationery");
+    let default = d.str("default");
+    let first = list.first().and_then(|v| v.get("id")).and_then(Value::as_str).map(str::to_owned);
+    let initial = list
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .find(|id| *id == default)
+        .map(str::to_owned)
+        .or(first);
+    with_state(
+        ctx,
+        app,
+        d.uid,
+        |_: &App| PickStationery { picked: initial, make_default: false },
+        |st, app| {
+            window(ctx, app, d, "Choose Stationery", 520.0, |ui, app| {
+                muted(ui, app, "Pick the stationery for the new message:");
+                let mut chosen = None;
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(180.0);
+                        egui::ScrollArea::vertical().id_salt(("stl", d.uid)).max_height(220.0).show(
+                            ui,
+                            |ui| {
+                                for v in &list {
+                                    let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
+                                    let name = v.get("name").and_then(Value::as_str).unwrap_or(id);
+                                    let r = ui.selectable_label(st.picked.as_deref() == Some(id), name);
+                                    if r.clicked() {
+                                        st.picked = Some(id.to_owned());
+                                    }
+                                    if r.double_clicked() {
+                                        chosen = Some(id.to_owned());
+                                    }
+                                }
+                            },
+                        );
+                    });
+                    let sel =
+                        list.iter().find(|v| v.get("id").and_then(Value::as_str) == st.picked.as_deref());
+                    preview(ui, app, sel);
+                });
+                ui.checkbox(&mut st.make_default, "Use this stationery for all new HTML messages");
+                let ok = ok_cancel(ui, app, st.picked.is_some());
+                let pick = match ok {
+                    Some(true) => st.picked.clone(),
+                    Some(false) => return Out::Close,
+                    None => chosen,
+                };
+                let Some(id) = pick else { return Out::Keep };
+                if st.make_default {
+                    let _ = save(app, &[("mail.compose.stationery", json!(id))]);
+                }
+                app.run("mail.newEmail", json!({"stationery": id}));
+                Out::Close
+            })
+        },
+    )
+}
+
+/// A sample of a stationery: its page colour behind a few lines of text.
+fn preview(ui: &mut egui::Ui, app: &App, st: Option<&Value>) {
+    let size = egui::vec2(ui.available_width().max(200.0), 220.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let page = st
+        .and_then(|v| v.get("page"))
+        .and_then(Value::as_str)
+        .and_then(|h| egui::Color32::from_hex(h).ok())
+        .unwrap_or(egui::Color32::WHITE);
+    let p = ui.painter();
+    p.rect_filled(rect, 4.0, page);
+    p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, app.theme.separator), egui::StrokeKind::Inside);
+    let ink = egui::Color32::from_rgb(0x20, 0x24, 0x2c);
+    let mut y = rect.top() + 16.0;
+    let name = st.and_then(|v| v.get("name")).and_then(Value::as_str).unwrap_or("");
+    p.text(
+        egui::pos2(rect.left() + 14.0, y),
+        egui::Align2::LEFT_TOP,
+        name,
+        egui::FontId::proportional(18.0),
+        ink,
+    );
+    y += 34.0;
+    for line in ["Hello,", "This is how your message will look.", "", "Best regards"] {
+        p.text(
+            egui::pos2(rect.left() + 14.0, y),
+            egui::Align2::LEFT_TOP,
+            line,
+            egui::FontId::proportional(13.0),
+            ink,
+        );
+        y += 20.0;
+    }
 }
 
 fn sbool(app: &App, key: &str) -> bool {

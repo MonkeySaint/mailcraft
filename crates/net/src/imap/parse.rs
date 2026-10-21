@@ -256,9 +256,31 @@ pub enum Untagged {
         earlier: bool,
         uids: SeqSet,
     },
-    /// Anything not modelled (ID, NAMESPACE, QUOTA, ESEARCH…), as text.
+    /// RFC 9208 QUOTAROOT: the quota roots of a mailbox.
+    QuotaRoot {
+        mailbox: String,
+        roots: Vec<String>,
+    },
+    /// RFC 9208 QUOTA: a root's resources (usage and limit; STORAGE is in units of 1024 octets).
+    Quota {
+        root: String,
+        resources: Vec<QuotaResource>,
+    },
+    /// Anything not modelled (ID, NAMESPACE, ESEARCH…), as text.
     Other(String),
 }
+
+/// One resource of a QUOTA response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaResource {
+    /// Upper-case resource name: STORAGE, MESSAGE, MAILBOX, ANNOTATION-STORAGE…
+    pub name: String,
+    pub usage: u64,
+    pub limit: u64,
+}
+
+/// Most quota roots or resources kept from one response.
+const MAX_QUOTA_ENTRIES: usize = 64;
 
 /// One complete server response.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,6 +482,13 @@ impl<'a> P<'a> {
             }
         }
     }
+    /// An astring that may be empty (`""`, the usual name of a server's only quota root).
+    fn astring_or_empty(&mut self) -> Result<String> {
+        match self.peek() {
+            Some(b'"' | b'{' | b'~') => self.value(0)?.as_string().ok_or_else(|| err("bad string")),
+            _ => self.astring(),
+        }
+    }
     /// The rest of the line as text.
     fn text(&mut self) -> String {
         let r = self.rest();
@@ -638,6 +667,39 @@ fn untagged(p: &mut P<'_>, whole: &[u8]) -> Result<Untagged> {
                 }
             }
             Ok(Untagged::MailboxStatus { mailbox, items })
+        }
+        "QUOTAROOT" => {
+            p.skip_sp();
+            let mailbox = p.astring()?;
+            let mut roots = Vec::new();
+            loop {
+                p.skip_sp();
+                if p.eof() || roots.len() >= MAX_QUOTA_ENTRIES {
+                    break;
+                }
+                roots.push(p.astring_or_empty()?);
+            }
+            Ok(Untagged::QuotaRoot { mailbox, roots })
+        }
+        "QUOTA" => {
+            p.skip_sp();
+            let root = p.astring_or_empty()?;
+            p.skip_sp();
+            let v = p.value(0)?;
+            let list = v.as_list().ok_or_else(|| err("QUOTA resources are not a list"))?;
+            let resources = list
+                .chunks(3)
+                .filter_map(|c| match c {
+                    [n, u, l] => Some(QuotaResource {
+                        name: n.as_string()?.to_ascii_uppercase(),
+                        usage: u.as_u64()?,
+                        limit: l.as_u64()?,
+                    }),
+                    _ => None,
+                })
+                .take(MAX_QUOTA_ENTRIES)
+                .collect();
+            Ok(Untagged::Quota { root, resources })
         }
         "VANISHED" => {
             p.skip_sp();
@@ -823,6 +885,33 @@ mod tests {
             Response::Untagged(u) => u,
             other => panic!("not untagged: {other:?}"),
         }
+    }
+
+    #[test]
+    fn quota_responses() {
+        assert_eq!(
+            untagged_of(b"* QUOTAROOT INBOX \"\" user"),
+            Untagged::QuotaRoot { mailbox: "INBOX".into(), roots: vec![String::new(), "user".into()] }
+        );
+        assert_eq!(
+            untagged_of(b"* QUOTA \"\" (STORAGE 10 512 message 3 1000)"),
+            Untagged::Quota {
+                root: String::new(),
+                resources: vec![
+                    QuotaResource { name: "STORAGE".into(), usage: 10, limit: 512 },
+                    QuotaResource { name: "MESSAGE".into(), usage: 3, limit: 1000 },
+                ],
+            }
+        );
+        // Garbled triples are skipped; a missing list is an error, never a panic.
+        assert!(matches!(
+            untagged_of(b"* QUOTA \"\" (STORAGE x 5 MESSAGE 1)"),
+            Untagged::Quota { resources, .. } if resources.is_empty()
+        ));
+        assert!(parse_response(b"* QUOTA \"\" STORAGE").is_err());
+        assert!(
+            matches!(untagged_of(b"* QUOTAROOT INBOX"), Untagged::QuotaRoot { roots, .. } if roots.is_empty())
+        );
     }
 
     #[test]

@@ -81,6 +81,14 @@ pub struct ViewState {
     pub send_immediately: bool,
     /// View › Layout › To-Do Bar: the parts shown (`view.todoBar`).
     pub todo_bar: TodoBar,
+    /// Folders appointments, contacts, tasks and notes were last moved to, newest first (the Move menus
+    /// offer them for a one-click move).
+    pub recent_move_folders: Vec<FolderId>,
+    /// People › Search People: recent searches, newest first.
+    pub recent_people_searches: Vec<String>,
+    /// Status bar › Unseen Items in View: per folder, the item-id high-water mark of the visit before the
+    /// current one and of the current one (items above the first arrived since the folder was last opened).
+    pub folder_visits: BTreeMap<FolderId, (u64, u64)>,
 }
 
 /// The parts of the To-Do Bar shown at the right of the main window (none = the bar is off).
@@ -98,6 +106,33 @@ impl TodoBar {
         self.calendar || self.people || self.tasks
     }
 }
+
+/// Most recent Search People texts kept.
+pub const MAX_RECENT_PEOPLE_SEARCHES: usize = 10;
+
+/// Most folders [`ViewState::recent_move_folders`] keeps.
+pub const MAX_RECENT_MOVES: usize = 10;
+
+/// Records `folder` as the newest Move target of a calendar, contact, task or note item.
+pub(crate) fn note_recent_move(s: &mut Session, folder: FolderId) {
+    let list = &mut s.view.recent_move_folders;
+    list.retain(|f| *f != folder);
+    list.insert(0, folder);
+    list.truncate(MAX_RECENT_MOVES);
+}
+
+/// Recent Move targets of `kind` other than the current folder, newest first.
+pub fn recent_move_folders(s: &Session, kind: FolderKind) -> Vec<FolderId> {
+    s.view
+        .recent_move_folders
+        .iter()
+        .copied()
+        .filter(|f| *f != s.selection.folder && s.mailbox.folder(*f).is_some_and(|x| x.kind == kind))
+        .collect()
+}
+
+/// Most folders whose visits [`ViewState::folder_visits`] remembers.
+pub const MAX_FOLDER_VISITS: usize = 2_000;
 
 /// Default Quick Access Toolbar: Send/Receive All Folders, Undo (`plan/reference/layout.md`).
 pub const DEFAULT_QUICK_ACCESS: [&str; 2] = ["sendReceive.all", "app.undo"];
@@ -138,6 +173,9 @@ impl Default for ViewState {
             auto_send_receive_minutes: crate::sync::DEFAULT_AUTO_MINUTES,
             send_immediately: true,
             todo_bar: TodoBar::default(),
+            recent_move_folders: Vec::new(),
+            recent_people_searches: Vec::new(),
+            folder_visits: BTreeMap::new(),
         }
     }
 }
@@ -210,6 +248,8 @@ pub struct Session {
     /// S/MIME: digital IDs, other people's certificates, trusted certificates and opened messages (see
     /// `smime.rs`).
     pub smime: crate::smime::SmimeSlot,
+    /// Items deleted for good, kept for Recover Deleted Items (`recover.rs`).
+    pub recover: crate::recover::RecoverState,
     /// Data files closed in a session without a store, ready to be opened again (`datafile.rs`).
     pub closed_data_files: Vec<crate::datafile::ClosedDataFile>,
     /// Set by a command whose effect reaches outside the mailbox where an undo snapshot cannot put it back
@@ -289,6 +329,7 @@ impl Session {
             search: crate::search_index::SearchState::default(),
             smime: crate::smime::SmimeSlot::default(),
             settings: Settings::default(),
+            recover: crate::recover::RecoverState::default(),
             closed_data_files: Vec::new(),
             undo_barrier: false,
             direct_print: false,
@@ -336,6 +377,7 @@ impl Session {
             }
         }
         s.load_settings(dir);
+        crate::recover::load(&mut s);
         crate::smime::load(&mut s);
         // A named calendar time zone (Calendar › Time Zones) sets the display offset for today's DST rules.
         crate::cmd::calendar::views::refresh_time_zone(&mut s);
@@ -379,6 +421,7 @@ impl Session {
         }
         self.apply_settings();
         self.select_start_folder();
+        crate::cmd::nav::note_visit(self, self.selection.folder);
         self.settings_saved = self.settings_bytes();
         if self.migrate_view_state() {
             // The moved entries leave settings.json right away, so an older copy never brings them back.
@@ -424,6 +467,14 @@ impl Session {
         v.quick_access.truncate(64);
         v.quick_access.dedup();
         v.collapsed_groups.retain(|f, labels| self.mailbox.folders.contains_key(f) && labels.len() <= 64);
+        v.folder_visits.retain(|f, _| self.mailbox.folders.contains_key(f));
+        v.recent_move_folders.retain(|f| self.mailbox.folders.contains_key(f));
+        v.recent_move_folders.truncate(MAX_RECENT_MOVES);
+        v.recent_people_searches.retain(|q| !q.trim().is_empty() && q.chars().count() <= 256);
+        v.recent_people_searches.truncate(MAX_RECENT_PEOPLE_SEARCHES);
+        while v.folder_visits.len() > MAX_FOLDER_VISITS {
+            v.folder_visits.pop_first();
+        }
         v.search.clear();
         v.minimized = false;
         v.work_offline = false;
@@ -459,10 +510,13 @@ impl Session {
                 let name = st.text(key);
                 if let Some((sc, _)) = SCOPE_NAMES.iter().find(|(_, n)| *n == name) {
                     self.view.search_scope = *sc;
+                } else if name == INBOX_MAILBOX_SCOPE {
+                    self.view.search_scope = self.inbox_rule_scope(self.selection.folder);
                 }
             }
             "search.includeDeleted" => self.search.include_deleted = st.bool(key),
             "calendar.timeZone" => self.tz_offset_min = st.time_zone_offset_min(),
+            crate::recover::DAYS_KEY => crate::recover::days_changed(self),
             _ => {}
         }
     }
@@ -470,10 +524,17 @@ impl Session {
     /// Copies session state that mirrors a setting back into the settings (commands such as Work Offline,
     /// Change Time Zone or the dark-mode toggle change the session directly).
     fn sync_settings_from_session(&mut self) {
-        let scope = SCOPE_NAMES
+        let mut scope = SCOPE_NAMES
             .iter()
             .find(|(sc, _)| *sc == self.view.search_scope)
             .map_or("currentFolder", |(_, n)| *n);
+        // "Current folder, current mailbox when searching from the Inbox" picks one of the two by folder: the
+        // pick is not a new choice.
+        if self.settings.text("search.scope") == INBOX_MAILBOX_SCOPE
+            && matches!(self.view.search_scope, SearchScope::CurrentFolder | SearchScope::CurrentMailbox)
+        {
+            scope = INBOX_MAILBOX_SCOPE;
+        }
         let pairs = [
             ("advanced.sendImmediately", json!(self.view.send_immediately)),
             ("advanced.sendReceiveMinutes", json!(self.view.auto_send_receive_minutes)),
@@ -568,8 +629,18 @@ impl Session {
                 }
             }
             ComposeKind::New if c.source.is_none() && c.draft.is_none() => {
-                if c.format == mailcraft_model::BodyFormat::Html {
+                if c.format == mailcraft_model::BodyFormat::Html && !c.format_explicit {
                     c.format = st.compose_format();
+                }
+                // Personal Stationery: a new HTML message without a template or stationery of its own.
+                let unstyled =
+                    c.theme == crate::compose::ThemeState::default() && c.body.background.is_none();
+                if c.format == mailcraft_model::BodyFormat::Html
+                    && unstyled
+                    && !c.dirty
+                    && let Some(stationery) = crate::compose::stationery(&st.text("mail.compose.stationery"))
+                {
+                    c.apply_stationery(stationery);
                 }
                 if c.importance == mailcraft_model::Importance::Normal {
                     c.importance = st.default_importance();
@@ -641,24 +712,35 @@ impl Session {
     /// at most [`EXIT_SYNC_SECS`] (then the workers are asked to stop). Nothing happens offline or without
     /// server accounts, and it runs once per session however often `file.exit` runs.
     fn send_receive_on_exit(&mut self) {
-        if self.exit_sync_done || !self.settings.bool("advanced.sendReceiveOnExit") || self.view.work_offline
-        {
+        if self.exit_sync_done || self.view.work_offline {
             return;
         }
-        let accounts = crate::sync::group_accounts(self);
-        if accounts.is_empty() {
+        crate::accounts::load_prefs(self);
+        let all = self.settings.bool("advanced.sendReceiveOnExit");
+        let accounts = if all { crate::sync::group_accounts(self) } else { Vec::new() };
+        // User-defined groups set to "Perform an automatic send/receive when exiting".
+        let groups = crate::sync::groups::exit_groups(self);
+        if accounts.is_empty() && groups.is_empty() {
             return;
         }
         self.exit_sync_done = true;
-        let plan = crate::sync::Plan { user: false, ..crate::sync::Plan::all() };
-        match self.send_receive(&accounts, plan) {
-            Ok(_) => {
-                if !self.wait_for_sync(std::time::Duration::from_secs(EXIT_SYNC_SECS)) {
-                    log::warn!("send/receive on exit did not finish in {EXIT_SYNC_SECS} s");
-                    self.cancel_sync();
-                }
+        let mut started = false;
+        if !accounts.is_empty() {
+            let plan = crate::sync::Plan { user: false, ..crate::sync::Plan::all() };
+            match self.send_receive(&accounts, plan) {
+                Ok(_) => started = true,
+                Err(e) => log::warn!("send/receive on exit: {e}"),
             }
-            Err(e) => log::warn!("send/receive on exit: {e}"),
+        }
+        for g in groups {
+            match crate::sync::groups::run(self, &g, false, false) {
+                Ok(_) => started = true,
+                Err(e) => log::warn!("send/receive of group {} on exit: {e}", g.name),
+            }
+        }
+        if started && !self.wait_for_sync(std::time::Duration::from_secs(EXIT_SYNC_SECS)) {
+            log::warn!("send/receive on exit did not finish in {EXIT_SYNC_SECS} s");
+            self.cancel_sync();
         }
     }
 
@@ -691,6 +773,7 @@ impl Session {
         }
         let ops = diff_ops(&before, &self.mailbox);
         if !ops.is_empty() {
+            crate::recover::capture(self, &before);
             self.undo.push(UndoEntry { label: "Empty Deleted Items".into(), before: Box::new(before) });
             self.journal(ops);
             self.tidy_selection();
@@ -812,6 +895,15 @@ impl Session {
                     crate::sync::queue_local_changes(self, &before);
                 }
                 let ops = diff_ops(&before, &self.mailbox);
+                // Items this command deleted for good stay recoverable (not a draft replaced by its sent copy,
+                // nor the items of a data file being closed).
+                if !ops.is_empty()
+                    && self.run_depth == 0
+                    && !self.undo_barrier
+                    && !spec.id.starts_with("compose.")
+                {
+                    crate::recover::capture(self, &before);
+                }
                 if self.undo_barrier {
                     self.undo.clear();
                 }
@@ -1053,6 +1145,20 @@ const MIRRORED: [&str; 6] = [
 ];
 
 /// Search scopes by their option names (Options › Search › "Include results only from").
+/// Options › Search › "Current folder, current mailbox when searching from the Inbox".
+pub(crate) const INBOX_MAILBOX_SCOPE: &str = "folderInboxMailbox";
+
+impl Session {
+    /// The search scope [`INBOX_MAILBOX_SCOPE`] gives in `folder`: the mailbox from an Inbox, else the folder.
+    pub(crate) fn inbox_rule_scope(&self, folder: FolderId) -> SearchScope {
+        if self.mailbox.folder(folder).is_some_and(|f| f.role == Some(FolderRole::Inbox)) {
+            SearchScope::CurrentMailbox
+        } else {
+            SearchScope::CurrentFolder
+        }
+    }
+}
+
 pub(crate) const SCOPE_NAMES: [(SearchScope, &str); 5] = [
     (SearchScope::CurrentFolder, "currentFolder"),
     (SearchScope::Subfolders, "subfolders"),

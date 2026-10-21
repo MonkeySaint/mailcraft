@@ -239,8 +239,36 @@ fn copy(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Disabled("nothing selected to copy".into()));
     }
     s.clipboard = ids;
+    let text = clipboard_text(s, &s.clipboard);
     let ids: Vec<u64> = s.clipboard.iter().map(|i| i.0).collect();
-    Ok(json!({"copied": ids.len(), "ids": ids}))
+    Ok(json!({"copied": ids.len(), "ids": ids, "text": text}))
+}
+
+/// Most items a copy renders as text for the system clipboard.
+const MAX_CLIPBOARD_ITEMS: usize = 500;
+
+/// Copied messages as text for other programs: a From / Sent / To / Subject block per message.
+pub fn clipboard_text(s: &Session, ids: &[ItemId]) -> String {
+    let tz = s.tz_offset_min;
+    let mut out = String::new();
+    for m in ids.iter().take(MAX_CLIPBOARD_ITEMS).filter_map(|id| s.mailbox.mail.get(id)) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let who = |a: &mailcraft_model::Address| match &a.name {
+            Some(n) if !n.trim().is_empty() => format!("{n} <{}>", a.addr),
+            _ => a.addr.clone(),
+        };
+        if let Some(f) = &m.from {
+            out.push_str(&format!("From: {}\n", who(f)));
+        }
+        out.push_str(&format!("Received: {}\n", mailcraft_model::ListTime::long_date(m.received, tz)));
+        if !m.to.is_empty() {
+            out.push_str(&format!("To: {}\n", m.to.iter().map(who).collect::<Vec<_>>().join("; ")));
+        }
+        out.push_str(&format!("Subject: {}\n", m.subject));
+    }
+    out
 }
 
 fn paste(s: &mut Session, p: &Value) -> CmdResult {
@@ -349,6 +377,11 @@ mod tests {
         s.selection.items = vec![first];
         let r = s.run("app.copy", &json!({})).unwrap();
         assert_eq!(r["copied"], 1);
+        // A text rendering for other programs (the system clipboard).
+        let subject = s.mailbox.mail[&first].subject.clone();
+        let text = r["text"].as_str().unwrap();
+        assert!(text.contains(&format!("Subject: {subject}")), "{text}");
+        assert!(text.contains("Received: "), "{text}");
         let before = s.mailbox.mail.len();
         let archive = s.mailbox.folders.values().find(|f| f.name == "Archive").map(|f| f.id.0).unwrap();
         s.run("app.paste", &json!({"folder": archive})).unwrap();

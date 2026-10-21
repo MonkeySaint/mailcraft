@@ -621,7 +621,7 @@ mod tests {
     use super::*;
     use crate::cmd::calendar::tests::{role, session};
     use crate::{Notice, Selection};
-    use mailcraft_model::FolderRole;
+    use mailcraft_model::{FolderKind, FolderRole};
 
     #[test]
     fn new_note_creates_and_opens() {
@@ -733,6 +733,11 @@ mod tests {
         assert_eq!(s.mailbox.notes[&ItemId(other)].categories, vec!["Blue category".to_owned()]);
         s.run("notes.move", &json!({"id": other, "folder": sub.0})).unwrap();
         assert_eq!(s.mailbox.notes[&ItemId(other)].folder, sub);
+        // The Move menu offers the folder notes were last moved to (not the folder shown).
+        assert_eq!(crate::recent_move_folders(&s, FolderKind::Notes), vec![sub]);
+        s.selection.folder = sub;
+        assert!(crate::recent_move_folders(&s, FolderKind::Notes).is_empty());
+        s.selection.folder = root;
         s.run("notes.delete", &json!({"ids": [other]})).unwrap();
         assert_eq!(s.mailbox.notes[&ItemId(other)].folder, role(&s, FolderRole::DeletedItems));
         assert!(!s.params_name_items(), "only set while an enabled check runs");

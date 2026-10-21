@@ -346,6 +346,8 @@ pub enum Term {
     /// `expires:` (see [`Expiry`]; a value it does not understand matches nothing). Holds the value as
     /// written.
     Expires(String),
+    /// A form-field condition on an item property (`prop:"Sensitivity=Private"`, `conversation:"Lunch"`).
+    Prop(PropTest),
     /// A value the key does not understand (matches nothing). Holds the value as written.
     Invalid(Key, String),
 }
@@ -372,9 +374,11 @@ pub enum Key {
     Size,
     Kind,
     Expires,
+    Prop,
+    Conversation,
 }
 
-const KEY_NAMES: [(&str, Key); 23] = [
+const KEY_NAMES: [(&str, Key); 26] = [
     ("from", Key::From),
     ("to", Key::To),
     ("cc", Key::Cc),
@@ -398,7 +402,102 @@ const KEY_NAMES: [(&str, Key); 23] = [
     ("messagesize", Key::Size),
     ("kind", Key::Kind),
     ("expires", Key::Expires),
+    ("prop", Key::Prop),
+    ("conversation", Key::Conversation),
+    ("conversationtopic", Key::Conversation),
 ];
+
+/// How a form-field condition compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropOp {
+    /// `=`: equal (case-insensitive); with an empty value, "is empty".
+    Is,
+    /// `!=`: not equal; with an empty value, "is not empty".
+    IsNot,
+    /// `~`: contains.
+    Contains,
+    /// `!~`: does not contain.
+    NotContains,
+    /// `<`: less than (numbers, else text order, which fits `YYYY-MM-DD` dates).
+    Less,
+    /// `>`: more than.
+    More,
+}
+
+impl PropOp {
+    /// Operators in the order they are tried when parsing (longest first).
+    const ALL: [(&'static str, PropOp); 6] = [
+        ("!=", PropOp::IsNot),
+        ("!~", PropOp::NotContains),
+        ("=", PropOp::Is),
+        ("~", PropOp::Contains),
+        ("<", PropOp::Less),
+        (">", PropOp::More),
+    ];
+
+    pub fn symbol(self) -> &'static str {
+        PropOp::ALL.iter().find(|(_, o)| *o == self).map_or("=", |(s, _)| s)
+    }
+}
+
+/// `name op value` on an item property (see `Doc::props`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropTest {
+    /// Property id as written by [`crate::doc::prop_id`] ("messageclass").
+    pub name: String,
+    /// The name as written (kept for display).
+    pub label: String,
+    pub op: PropOp,
+    pub value: String,
+}
+
+/// Longest property name or value in a condition.
+const MAX_PROP_CHARS: usize = 256;
+
+impl PropTest {
+    /// Parses `Name<op>Value` (`Sensitivity=Private`, `Due Date<2026-11-01`, `Company!=`).
+    pub fn parse(v: &str) -> Option<PropTest> {
+        let (at, op, sym) = PropOp::ALL
+            .iter()
+            .filter_map(|(s, o)| v.find(s).map(|i| (i, *o, *s)))
+            .min_by_key(|(i, _, s)| (*i, std::cmp::Reverse(s.len())))?;
+        let label = v.get(..at)?.trim();
+        let value = v.get(at.checked_add(sym.len())?..)?.trim();
+        let name = crate::doc::prop_id(label);
+        if name.is_empty() || label.chars().count() > MAX_PROP_CHARS || value.chars().count() > MAX_PROP_CHARS
+        {
+            return None;
+        }
+        Some(PropTest { name, label: label.to_owned(), op, value: value.to_owned() })
+    }
+
+    /// True when the property in `props` satisfies the condition (a missing property is empty).
+    pub fn matches<K: AsRef<str>, V: AsRef<str>>(&self, props: &[(K, V)]) -> bool {
+        let actual = props.iter().find(|(k, _)| k.as_ref() == self.name).map_or("", |(_, v)| v.as_ref());
+        let a = crate::fold::fold(actual.trim());
+        let want = crate::fold::fold(&self.value);
+        match self.op {
+            PropOp::Is => a == want,
+            PropOp::IsNot => a != want,
+            PropOp::Contains => !want.is_empty() && a.contains(&want),
+            PropOp::NotContains => want.is_empty() || !a.contains(&want),
+            PropOp::Less | PropOp::More => {
+                if a.is_empty() || want.is_empty() {
+                    return false;
+                }
+                let ord = match (a.parse::<f64>(), want.parse::<f64>()) {
+                    (Ok(x), Ok(y)) => x.partial_cmp(&y),
+                    _ => Some(a.as_str().cmp(want.as_str())),
+                };
+                match ord {
+                    Some(std::cmp::Ordering::Less) => self.op == PropOp::Less,
+                    Some(std::cmp::Ordering::Greater) => self.op == PropOp::More,
+                    _ => false,
+                }
+            }
+        }
+    }
+}
 
 impl Key {
     /// Canonical name (first in the alias table).
@@ -696,6 +795,16 @@ pub fn make_term(key: Key, value: &str, quoted: bool) -> Query {
             None => return invalid(),
         },
         Key::Expires => Term::Expires(value.to_owned()),
+        Key::Prop => match PropTest::parse(value) {
+            Some(p) => Term::Prop(p),
+            None => return invalid(),
+        },
+        Key::Conversation => Term::Prop(PropTest {
+            name: "conversation".into(),
+            label: "conversation".into(),
+            op: PropOp::Is,
+            value: mailcraft_model::subject::conversation_topic(value),
+        }),
         // Text keys returned above.
         _ => return invalid(),
     };
@@ -1081,6 +1190,14 @@ impl fmt::Display for Term {
             Term::Expires(v) => {
                 f.write_str("expires:")?;
                 write_value(f, v, true)
+            }
+            Term::Prop(p) if p.name == "conversation" && p.op == PropOp::Is => {
+                f.write_str("conversation:")?;
+                write_value(f, &p.value, true)
+            }
+            Term::Prop(p) => {
+                f.write_str("prop:")?;
+                write_value(f, &format!("{}{}{}", p.label, p.op.symbol(), p.value), true)
             }
             Term::Invalid(k, v) => {
                 write!(f, "{}:", k.name())?;

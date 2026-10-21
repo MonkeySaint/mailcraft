@@ -116,6 +116,8 @@ struct SigState {
     prompt: Option<(Option<String>, String)>,
     error: Option<String>,
     font: String,
+    /// Default stationery name (Personal Stationery).
+    stationery: String,
 }
 
 fn names(app: &App) -> Vec<String> {
@@ -167,6 +169,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             prompt: None,
             error: None,
             font: font_choice(app),
+            stationery: stationery_choice(app),
         }
     };
     with_state(ctx, app, uid, init, |st, app| {
@@ -200,11 +203,14 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         save_body(app, &mut ed);
                     }
                     let (family, size) = parse_font_choice(&st.font);
+                    let stationery =
+                        mailcraft_engine::compose::stationery(&st.stationery).map_or("none", |s| s.0);
                     let err = common::set_options(
                         app,
                         &[
                             ("mail.compose.fontFamily", json!(family)),
                             ("mail.compose.fontSizePt", json!(size)),
+                            ("mail.compose.stationery", json!(stationery)),
                         ],
                     );
                     if let Some(e) = err {
@@ -453,11 +459,26 @@ fn font_choice(app: &App) -> String {
     }
 }
 
+/// "(none)" or the name of the default stationery.
+const NO_STATIONERY: &str = "(none)";
+
+fn stationery_choice(app: &App) -> String {
+    mailcraft_engine::compose::stationery(&app.s.settings.text("mail.compose.stationery"))
+        .map_or_else(|| NO_STATIONERY.to_owned(), |s| s.1.to_owned())
+}
+
 fn stationery_tab(ui: &mut egui::Ui, app: &mut App, st: &mut SigState, uid: u64) {
+    common::heading(ui, app, "Stationery");
+    ui.horizontal(|ui| {
+        ui.label("Stationery for new HTML messages:");
+        let mut names = vec![NO_STATIONERY];
+        names.extend(mailcraft_engine::compose::STATIONERY.iter().map(|s| s.1));
+        common::combo(ui, ("sstat", uid), &mut st.stationery, &names, 200.0);
+    });
     common::heading(ui, app, "New mail messages");
     ui.horizontal(|ui| {
         ui.label("Font:");
         common::combo(ui, ("sfont", uid), &mut st.font, &FONT_CHOICES, 200.0);
     });
-    muted(ui, app, "The font applies to new messages you write.");
+    muted(ui, app, "The stationery and font apply to new messages you write.");
 }

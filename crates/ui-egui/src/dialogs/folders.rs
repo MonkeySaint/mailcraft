@@ -598,6 +598,41 @@ struct PropState {
     error: String,
 }
 
+/// Folder Size: the folder's own size, then each subfolder with its size and its size with subfolders.
+fn folder_size_list(ui: &mut egui::Ui, app: &App, d: &Dlg<'_>, uid: u64) {
+    let rows = d.arr("sizes");
+    let total = rows.first().and_then(|r| r.get("totalKb")).and_then(Value::as_u64);
+    muted(
+        ui,
+        app,
+        &format!(
+            "Size (without subfolders): {} KB; total size (with subfolders): {} KB",
+            d.u64("sizeKb").unwrap_or(0),
+            total.unwrap_or_else(|| d.u64("sizeKb").unwrap_or(0))
+        ),
+    );
+    let subs: Vec<&Value> =
+        rows.iter().filter(|r| r.get("path").and_then(Value::as_str) != Some("")).collect();
+    if subs.is_empty() {
+        return;
+    }
+    egui::ScrollArea::vertical().id_salt(("fsize", uid)).max_height(160.0).show(ui, |ui| {
+        egui::Grid::new(("fsizeg", uid)).num_columns(3).striped(true).show(ui, |ui| {
+            ui.label(RichText::new("Subfolder").strong());
+            ui.label(RichText::new("Size").strong());
+            ui.label(RichText::new("Total Size").strong());
+            ui.end_row();
+            for r in subs {
+                let kb = |k: &str| format!("{} KB", r.get(k).and_then(Value::as_u64).unwrap_or(0));
+                ui.label(r.get("path").and_then(Value::as_str).unwrap_or_default());
+                ui.label(kb("sizeKb"));
+                ui.label(kb("totalKb"));
+                ui.end_row();
+            }
+        });
+    });
+}
+
 fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = d.u64("folder");
@@ -681,7 +716,7 @@ fn properties(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     st.show_size = !st.show_size;
                 }
                 if st.show_size {
-                    muted(ui, app, &format!("Size: {} KB", d.u64("sizeKb").unwrap_or(0)));
+                    folder_size_list(ui, app, d, uid);
                 }
             } else if let Some(f) = folder {
                 let out = super::archive::folder_form(ui, app, &mut st.archive, f, uid, "archiveTarget");
@@ -888,10 +923,22 @@ fn recover(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 if left.is_empty() {
                     muted(ui, app, "There are no items to recover.");
                 }
+                let days = d.u64("days").unwrap_or(0);
+                if days > 0 {
+                    muted(
+                        ui,
+                        app,
+                        &format!(
+                            "Items deleted for good stay here for {days} day(s) (File › Options › Advanced)."
+                        ),
+                    );
+                }
+                let tz = app.s.tz_offset_min;
                 egui::ScrollArea::vertical().id_salt(("rec", uid)).max_height(260.0).show(ui, |ui| {
-                    egui::Grid::new(("recg", uid)).num_columns(5).striped(true).show(ui, |ui| {
+                    egui::Grid::new(("recg", uid)).num_columns(6).striped(true).show(ui, |ui| {
                         ui.label("");
                         ui.label(RichText::new("Subject").strong());
+                        ui.label(RichText::new("Deleted").strong());
                         ui.label(RichText::new("Type").strong());
                         ui.label(RichText::new("From").strong());
                         ui.label(RichText::new("Folder").strong());
@@ -908,6 +955,15 @@ fn recover(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                 }
                             }
                             ui.label(if subject.is_empty() { "(no subject)" } else { subject });
+                            let deleted = it.get("deleted").and_then(Value::as_i64).unwrap_or(0);
+                            ui.label(if deleted > 0 {
+                                mailcraft_model::ListTime::long_date(
+                                    mailcraft_model::DateTime::from_unix(deleted, 0),
+                                    tz,
+                                )
+                            } else {
+                                String::new()
+                            });
                             ui.label(kind_label(it.get("kind").and_then(Value::as_str).unwrap_or("mail")));
                             ui.label(it.get("from").and_then(Value::as_str).unwrap_or_default());
                             ui.label(it.get("folder").and_then(Value::as_str).unwrap_or_default());
@@ -937,6 +993,16 @@ fn recover(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                     .filter_map(Value::as_u64),
                             );
                             st.picked.clear();
+                        }
+                    }
+                    if btn_en(ui, !st.picked.is_empty(), "Purge Selected Items") {
+                        let res = app.run("folder.recoverDeleted", json!({"purge": st.picked}));
+                        if let Some(v) = res {
+                            st.done = format!(
+                                "Removed {} item(s) for good.",
+                                v.get("purged").and_then(Value::as_u64).unwrap_or(0)
+                            );
+                            st.recovered.append(&mut st.picked);
                         }
                     }
                     if btn_en(ui, !left.is_empty(), "Select All") {

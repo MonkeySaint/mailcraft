@@ -242,6 +242,11 @@ pub(super) enum Event {
     PushChanged {
         account: AccountId,
     },
+    /// The mailbox quota the server reported (`None` = no limits).
+    Quota {
+        account: AccountId,
+        quota: Option<mailcraft_net::sync::Quota>,
+    },
     /// The transfer rate a run measured (bytes per second).
     LinkSpeed {
         account: AccountId,
@@ -307,6 +312,7 @@ impl Event {
             | Event::Push { account, .. }
             | Event::PushChanged { account }
             | Event::LinkSpeed { account, .. }
+            | Event::Quota { account, .. }
             | Event::Pop3New { account, .. }
             | Event::Pop3Full { account, .. }
             | Event::Pop3Server { account, .. }
@@ -1306,6 +1312,14 @@ fn run_imap(
             }
             Err(e) => error = Some(e.to_string()),
         }
+        // The mailbox quota (RFC 9208), when the server has the extension.
+        if error.is_none() {
+            match imap.quota() {
+                Ok(quota) => send(Event::Quota { account, quota }),
+                Err(e) if e.is_connection_lost() => error = Some(e.to_string()),
+                Err(e) => log::info!("imap: quota not available: {e}"),
+            }
+        }
     }
     // 3. The Outbox (SMTP works even when the IMAP server does not).
     if !job.outgoing.is_empty() {
@@ -1936,6 +1950,16 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
                     }
                 }
                 run.push_error = error;
+            }
+            Event::Quota { account, quota } => {
+                let checked = s.now().unix;
+                let q = quota.map(|q| super::MailboxQuota {
+                    used: q.used,
+                    limit: q.limit,
+                    messages: q.messages,
+                    checked,
+                });
+                super::set_quota(s, account, q);
             }
             Event::LinkSpeed { account, bytes_per_sec } => {
                 let now = s.now().unix;

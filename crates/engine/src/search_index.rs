@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, MutexGuard};
 
 use mailcraft_model::{
-    Appointment, Contact, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox, Note, Task,
+    Appointment, Contact, FlagState, FolderId, FolderKind, FolderRole, ItemId, MailItem, Mailbox, Note, Task,
 };
 /// Fields of a mail item that search highlights apply to (for [`highlights`]).
 pub use mailcraft_search::Field;
@@ -97,6 +97,21 @@ fn stamp_mail(m: &MailItem) -> u64 {
     }
     // The whole body: an edit past the preview that keeps the length must still re-index the item.
     h(&mut st, &(body_hash(m.body.text.as_deref()), body_hash(m.body.html.as_deref())));
+    // Form-field properties (`Doc::props`): sensitivity and the flag's state and dates.
+    let flag = match &m.flag {
+        FlagState::None => (0u8, None, None),
+        FlagState::Flagged { due, start, .. } => (1, due.map(|d| d.unix), start.map(|d| d.unix)),
+        FlagState::Complete { .. } => (2, None, None),
+    };
+    h(&mut st, &(m.sensitivity as u8, flag));
+    st.finish()
+}
+
+/// Mixes more properties into a stamp.
+fn mix(stamp: u64, v: &impl Hash) -> u64 {
+    let mut st = DefaultHasher::new();
+    h(&mut st, &stamp);
+    h(&mut st, v);
     st.finish()
 }
 
@@ -136,7 +151,8 @@ fn stamp_appointment(a: &Appointment) -> u64 {
         .collect();
     let mut parts = vec![a.subject.as_str(), a.location.as_str(), a.body.as_str()];
     parts.extend(people);
-    stamp_text(1, a.folder, &parts, &a.categories, a.start.unix)
+    let s = stamp_text(1, a.folder, &parts, &a.categories, a.start.unix);
+    mix(s, &(a.end.unix, a.all_day, a.recurrence.is_some(), a.private))
 }
 
 fn stamp_contact(c: &Contact) -> u64 {
@@ -146,12 +162,21 @@ fn stamp_contact(c: &Contact) -> u64 {
         .map(String::as_str)
         .collect();
     parts.extend(c.emails.iter().map(String::as_str));
-    parts.extend(c.phones.iter().map(|(_, n)| n.as_str()));
-    stamp_text(2, c.folder, &parts, &c.categories, 0)
+    parts.extend(c.phones.iter().flat_map(|(k, n)| [k.as_str(), n.as_str()]));
+    let s = stamp_text(2, c.folder, &parts, &c.categories, 0);
+    mix(s, &(c.office.as_str(), c.private, c.birthday.as_deref()))
 }
 
 fn stamp_task(t: &Task) -> u64 {
-    stamp_text(3, t.folder, &[&t.subject, &t.body], &t.categories, t.due.or(t.start).map_or(0, |d| d.unix))
+    let s = stamp_text(
+        3,
+        t.folder,
+        &[&t.subject, &t.body],
+        &t.categories,
+        t.due.or(t.start).map_or(0, |d| d.unix),
+    );
+    let dates = (t.start.map(|d| d.unix), t.completed.map(|d| d.unix));
+    mix(s, &(t.status as u8, t.priority as u8, t.percent_complete, t.private, dates, &t.assigned_to))
 }
 
 fn stamp_note(n: &Note) -> u64 {

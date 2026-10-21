@@ -8,6 +8,8 @@
 //!   skipped with a warning. Compacted into a new snapshot by [`Store::checkpoint`].
 //! - `blobs/<aa>/<hash>-<len>.eml`: raw RFC 5322 sources, content-addressed (FNV-1a 64 hex + length,
 //!   collision-checked byte for byte; a true collision gets a `-<n>` suffix).
+//! - `recoverable.json`: items deleted for good, kept for Recover Deleted Items
+//!   ([`mailcraft_model::RecoverBin`], raw sources in blobs), written atomically by [`Store::save_recoverable`].
 //! - `lock`: single-writer lock file holding the owner's pid and a timestamp. A lock whose process is gone
 //!   (checked via `/proc/<pid>` on Linux) or, where liveness cannot be checked, whose timestamp is more than an
 //!   hour old, is taken over.
@@ -36,7 +38,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use mailcraft_model::{DateTime, FolderId, Importance, ItemId, MailItem, Mailbox};
+use mailcraft_model::{DateTime, DeletedItem, FolderId, Importance, ItemId, MailItem, Mailbox, RecoverBin};
 use serde::{Deserialize, Serialize};
 
 pub use autosave::Autosave;
@@ -55,6 +57,12 @@ pub enum StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// The recoverable-items bin in the profile directory.
+pub const RECOVERABLE_FILE: &str = "recoverable.json";
+
+/// Largest recoverable-items file read or written.
+pub const MAX_RECOVERABLE_BYTES: u64 = 256 << 20;
 
 /// Largest single blob (raw message) accepted.
 pub const MAX_BLOB_BYTES: usize = mailcraft_mime::MAX_MESSAGE_BYTES;
@@ -476,10 +484,47 @@ impl Store {
         })
     }
 
-    /// Deletes blobs not referenced by `mb` (which must be the complete current state) and leftover temp
-    /// files. Returns the number of blobs removed.
+    /// Reads the recoverable-items bin (`Ok(default)` when there is none yet).
+    pub fn load_recoverable(&self) -> Result<RecoverBin> {
+        let path = self.dir.join(RECOVERABLE_FILE);
+        match journal::read_capped(&path, MAX_RECOVERABLE_BYTES)? {
+            None => Ok(RecoverBin::default()),
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| StoreError::Corrupt(format!("{}: {e}", path.display()))),
+        }
+    }
+
+    /// Writes the recoverable-items bin atomically. Raw message sources go to the blob store (the file keeps
+    /// blob keys only); `bin` itself is left as it is.
+    pub fn save_recoverable(&mut self, bin: &RecoverBin) -> Result<()> {
+        let mut copy = bin.clone();
+        for e in &mut copy.items {
+            if let DeletedItem::Mail(m) = &mut e.item
+                && let Some(raw) = m.raw.take()
+            {
+                m.blob = Some(self.blob_for(&raw, m.blob.as_deref())?);
+            }
+        }
+        let bytes = serde_json::to_vec(&copy).map_err(std::io::Error::other)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECOVERABLE_BYTES {
+            return Err(StoreError::Io(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("the recoverable items would take {} bytes, past the cap", bytes.len()),
+            )));
+        }
+        journal::write_atomic(&self.dir.join(RECOVERABLE_FILE), |w| w.write_all(&bytes))
+    }
+
+    /// Deletes blobs not referenced by `mb` (which must be the complete current state) or by the
+    /// recoverable-items bin, and leftover temp files. Returns the number of blobs removed.
     pub fn gc_blobs(&mut self, mb: &Mailbox) -> Result<usize> {
-        let live: BTreeSet<&str> = mb.mail.values().filter_map(|m| m.blob.as_deref()).collect();
+        // A bin that cannot be read keeps every blob (nothing it may still need is removed).
+        let bin = self.load_recoverable()?;
+        let mut live: BTreeSet<&str> = mb.mail.values().filter_map(|m| m.blob.as_deref()).collect();
+        live.extend(bin.items.iter().filter_map(|e| match &e.item {
+            DeletedItem::Mail(m) => m.blob.as_deref(),
+            _ => None,
+        }));
         // Items still holding their source may have been journaled or snapshotted with a blob key the caller
         // never saw (`append` / `checkpoint` set it on their own copy): every probe of that content is live.
         let live_content: BTreeSet<(u64, u64)> = mb
@@ -537,6 +582,7 @@ fn remove_temp_files(dir: &Path) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let ours = name.starts_with(&format!(".{}.tmp-", journal::SNAPSHOT_FILE))
             || name.starts_with(&format!(".{}.tmp-", journal::JOURNAL_FILE))
+            || name.starts_with(&format!(".{RECOVERABLE_FILE}.tmp-"))
             || name.starts_with(&format!("{}.stale-", lock::LOCK_FILE));
         if ours {
             let _ = fs::remove_file(entry.path());

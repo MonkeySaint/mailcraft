@@ -373,6 +373,15 @@ impl TestServers {
         Ok(())
     }
 
+    /// Sets `user`'s storage limit in octets (`None` = unlimited), reported by IMAP GETQUOTAROOT (RFC 9208)
+    /// and JMAP Quota/get (RFC 9425). Usage is the size of every stored message.
+    pub fn set_quota(&self, user: &str, limit: Option<u64>) -> Result<()> {
+        let mut st = self.shared.lock();
+        let u = st.user_mut(user).ok_or_else(|| Error::UnknownUser(user.to_owned()))?;
+        u.quota = limit;
+        Ok(())
+    }
+
     /// Creates a mailbox (and missing parents, `/` separated) for `user`.
     pub fn create_mailbox(&self, user: &str, name: &str, special: Option<SpecialUse>) -> Result<()> {
         self.shared.lock().create_mailbox(user, name, special)?;

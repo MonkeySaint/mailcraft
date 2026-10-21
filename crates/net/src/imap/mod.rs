@@ -7,8 +7,8 @@ pub mod utf7;
 
 pub use client::{CopyUid, Done, IdleEvent, ImapClient, Limits, MailboxInfo, StoreMode};
 pub use parse::{
-    Address, BodyStructure, Code, Disposition, Envelope, Fetch, ListEntry, Response, SinglePart, Status,
-    Untagged, Value, parse_response,
+    Address, BodyStructure, Code, Disposition, Envelope, Fetch, ListEntry, QuotaResource, Response,
+    SinglePart, Status, Untagged, Value, parse_response,
 };
 pub use seqset::SeqSet;
 

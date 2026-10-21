@@ -96,6 +96,48 @@ impl Connection {
     }
 }
 
+/// A server mailbox's storage quota (IMAP QUOTA, RFC 9208; JMAP Quota, RFC 9425), as last reported.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxQuota {
+    /// Bytes in use.
+    pub used: u64,
+    /// Bytes allowed (0 = only a message-count limit).
+    pub limit: u64,
+    /// Messages in use and allowed, when the server limits those.
+    pub messages: Option<(u64, u64)>,
+    /// When the server reported it (Unix seconds).
+    pub checked: i64,
+}
+
+impl MailboxQuota {
+    /// Share of the limit in use, 0–100 (storage, else messages); `None` without a limit.
+    pub fn percent(&self) -> Option<u8> {
+        let (used, limit) = if self.limit > 0 { (self.used, self.limit) } else { self.messages? };
+        if limit == 0 {
+            return None;
+        }
+        let pct = u128::from(used).saturating_mul(100) / u128::from(limit);
+        Some(u8::try_from(pct.min(100)).unwrap_or(100))
+    }
+
+    /// "1.4 MB of 100.0 MB used (2%)" / "120 of 1,000 messages (12%)".
+    pub fn text(&self) -> String {
+        let pct = self.percent().map(|p| format!(" ({p}%)")).unwrap_or_default();
+        if self.limit > 0 {
+            format!(
+                "{} of {} used{pct}",
+                crate::queries::size_text(self.used),
+                crate::queries::size_text(self.limit)
+            )
+        } else if let Some((u, l)) = self.messages {
+            format!("{} of {} messages{pct}", grouped(u), grouped(l))
+        } else {
+            String::new()
+        }
+    }
+}
+
 /// One account's send/receive state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +158,8 @@ pub struct AccountStatus {
     pub push: PushMode,
     /// The last measured transfer rate was below the slow-connection threshold.
     pub slow_connection: bool,
+    /// The mailbox quota the server reported on the last send/receive (`None` = no limit or not known).
+    pub quota: Option<MailboxQuota>,
 }
 
 /// How far a send/receive run has got: the folder it updates (its place among the folders of the run) and
@@ -362,6 +406,8 @@ struct AccountRun {
     /// Transfer rate measured by the last run that downloaded enough to tell (bytes per second), and when
     /// (Unix time).
     link_speed: Option<(u64, i64)>,
+    /// Mailbox quota reported by the server.
+    quota: Option<MailboxQuota>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -389,6 +435,8 @@ pub struct SyncState {
     pub(crate) fetch: BTreeMap<AccountId, Vec<ItemId>>,
     /// Accounts whose next run downloads new messages as headers only (Download Headers).
     pub(crate) force_headers: BTreeSet<AccountId>,
+    /// Last run of each user-defined Send/Receive group (lower-case name → Unix time; see `groups.rs`).
+    pub(crate) group_runs: BTreeMap<String, i64>,
     /// JMAP accounts with local changes not sent yet (they have no change queue; see `sync/jmap.rs`).
     pub(crate) jmap_dirty: BTreeSet<AccountId>,
     /// OAuth sign-ins started in this session.
@@ -506,6 +554,8 @@ impl Session {
         let status_before = self.sync.status.clone();
         let mailbox_changed = poll_events(self);
         tick(self);
+        groups::tick(self);
+        crate::recover::tick(self);
         if self.undo.undo.is_empty() && self.undo.redo.is_empty() && !self.sync.track.is_empty() {
             self.sync.track = Track::default();
         }
@@ -614,6 +664,31 @@ fn group_members(s: &Session, accounts: &[AccountId], plan: &Plan) -> Vec<Accoun
         .collect()
 }
 
+/// The quota a server reported for an account's mailbox (stored with the run state; shown in the status bar).
+pub(crate) fn set_quota(s: &mut Session, account: AccountId, quota: Option<MailboxQuota>) {
+    let run = s.sync.runs.entry(account).or_default();
+    if run.quota != quota {
+        run.quota = quota;
+        s.sync.dirty = true;
+    }
+}
+
+/// The last reported quota of an account's mailbox.
+pub fn account_quota(s: &Session, account: AccountId) -> Option<MailboxQuota> {
+    s.sync.runs.get(&account).and_then(|r| r.quota)
+}
+
+/// The quota for the status bar: the current folder's account, else the first server account that has one.
+pub fn status_quota(s: &Session) -> Option<(String, MailboxQuota)> {
+    let name = |id: AccountId| s.mailbox.account(id).map(|a| a.display_name.clone()).unwrap_or_default();
+    if let Some(a) = s.current_account()
+        && let Some(q) = account_quota(s, a)
+    {
+        return Some((name(a), q));
+    }
+    s.mailbox.accounts.iter().find_map(|a| account_quota(s, a.id).map(|q| (name(a.id), q)))
+}
+
 /// The accounts in the "All Accounts" Send/Receive group.
 pub fn group_accounts(s: &Session) -> Vec<AccountId> {
     server_accounts(s)
@@ -708,6 +783,7 @@ fn refresh_status(s: &mut Session) {
             outbox,
             push: run.map(|r| r.push).unwrap_or_default(),
             slow_connection: slow_connection(s, a.id),
+            quota: run.and_then(|r| r.quota),
         };
         if busy && busy_text.is_none() {
             busy_text = Some(row.progress.clone());
@@ -1552,6 +1628,7 @@ fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
 pub mod arrival;
 pub mod cmds;
 pub mod focus;
+pub mod groups;
 #[cfg(not(target_arch = "wasm32"))]
 mod jmap;
 #[cfg(not(target_arch = "wasm32"))]

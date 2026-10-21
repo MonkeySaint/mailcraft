@@ -172,6 +172,9 @@ impl Session<'_> {
             "LIST-STATUS",
             "CONDSTORE",
             "ESEARCH",
+            "QUOTA",
+            "QUOTA=RES-STORAGE",
+            "QUOTA=RES-MESSAGE",
         ];
         if !self.ctx.config.imap_idle {
             // IMAP4rev2 includes IDLE: a server without push offers neither.
@@ -326,6 +329,8 @@ impl Session<'_> {
                 out.extend_from_slice(b"* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
                 Ok("NAMESPACE completed".to_owned())
             }
+            (false, "GETQUOTAROOT") => self.quota_root(p, out),
+            (false, "GETQUOTA") => self.quota(p, out),
             (false, "SELECT") => self.select(p, out, false),
             (false, "EXAMINE") => self.select(p, out, true),
             (false, "CREATE") => self.create(p),
@@ -677,6 +682,53 @@ impl Session<'_> {
         self.shared().lock().rename_mailbox(&user, &from, &to).map_err(store_fail)?;
         self.shared().notify();
         Ok("RENAME completed".to_owned())
+    }
+
+    /// The user's quota resources: one root, `""`, over all mailboxes (STORAGE in units of 1024 octets).
+    fn quota_line(&self, user: &str) -> Option<Vec<u8>> {
+        let st = self.shared().lock();
+        let u = st.user(user)?;
+        let limit = u.quota?;
+        let kb = |n: u64| n.div_ceil(1024);
+        Some(format!("* QUOTA \"\" (STORAGE {} {})\r\n", kb(u.used()), kb(limit)).into_bytes())
+    }
+
+    /// RFC 9208 GETQUOTAROOT.
+    fn quota_root(&mut self, p: &mut Parser<'_>, out: &mut Vec<u8>) -> Res {
+        let user = self.need_auth()?.to_owned();
+        p.sp()?;
+        let name = self.mailbox_arg(p)?;
+        p.end()?;
+        let exists = self.shared().lock().user(&user).is_some_and(|u| u.mailbox(&name).is_some());
+        if !exists {
+            return Err(no("[NONEXISTENT] No such mailbox"));
+        }
+        let line = self.quota_line(&user);
+        out.extend_from_slice(b"* QUOTAROOT ");
+        self.write_mbox(out, &name);
+        if line.is_some() {
+            out.extend_from_slice(b" \"\"");
+        }
+        out.extend_from_slice(b"\r\n");
+        if let Some(l) = line {
+            out.extend_from_slice(&l);
+        }
+        Ok("GETQUOTAROOT completed".to_owned())
+    }
+
+    /// RFC 9208 GETQUOTA (the only root is `""`).
+    fn quota(&mut self, p: &mut Parser<'_>, out: &mut Vec<u8>) -> Res {
+        let user = self.need_auth()?.to_owned();
+        p.sp()?;
+        let root = p.astring_utf8()?;
+        p.end()?;
+        match self.quota_line(&user) {
+            Some(l) if root.is_empty() => {
+                out.extend_from_slice(&l);
+                Ok("GETQUOTA completed".to_owned())
+            }
+            _ => Err(no("No such quota root")),
+        }
     }
 
     fn subscribe(&mut self, p: &mut Parser<'_>, on: bool) -> Res {

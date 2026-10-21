@@ -133,7 +133,10 @@ fn set_shortcut(s: &mut Session, idx: usize, shortcut: String) {
 
 fn check_actions(s: &Session, actions: &[QuickStepAction]) -> Result<(), CmdError> {
     for a in actions {
-        if let QuickStepAction::MoveTo(Some(f)) | QuickStepAction::CopyTo(Some(f)) = a {
+        if let QuickStepAction::MoveTo(Some(f))
+        | QuickStepAction::CopyTo(Some(f))
+        | QuickStepAction::AlwaysMoveConversation(Some(f)) = a
+        {
             match s.mailbox.folder(*f) {
                 Some(folder) if folder.kind == FolderKind::Mail => {}
                 Some(folder) => {
@@ -183,13 +186,19 @@ fn complete_setup(step: &mut QuickStep, p: &Value) -> bool {
     let mut changed = false;
     for a in &mut step.actions {
         match a {
-            QuickStepAction::MoveTo(f @ None) | QuickStepAction::CopyTo(f @ None) => {
+            QuickStepAction::MoveTo(f @ None)
+            | QuickStepAction::CopyTo(f @ None)
+            | QuickStepAction::AlwaysMoveConversation(f @ None) => {
                 if let Some(folder) = folder {
                     *f = Some(folder);
                     changed = true;
                 }
             }
-            QuickStepAction::Forward(list) | QuickStepAction::NewMessageTo(list) if list.is_empty() => {
+            QuickStepAction::Forward(list)
+            | QuickStepAction::NewMessageTo(list)
+            | QuickStepAction::ForwardAsAttachment(list)
+                if list.is_empty() =>
+            {
                 if let Some(to) = &to {
                     *list = to.clone();
                     changed = true;
@@ -206,9 +215,13 @@ fn complete_setup(step: &mut QuickStep, p: &Value) -> bool {
 /// forwards is unavailable on a list group's header; a plain multi-selection is forwarded as one message
 /// with the messages attached. The gallery and the context menus grey such steps out.
 pub fn blocked_for(step: &QuickStep, count: usize, group: bool) -> Option<&'static str> {
-    let replies =
-        step.actions.iter().any(|a| matches!(a, QuickStepAction::Reply | QuickStepAction::ReplyAll));
-    let forwards = step.actions.iter().any(|a| matches!(a, QuickStepAction::Forward(_)));
+    let replies = step.actions.iter().any(|a| {
+        matches!(a, QuickStepAction::Reply | QuickStepAction::ReplyAll | QuickStepAction::ReplyWithMeeting)
+    });
+    let forwards = step
+        .actions
+        .iter()
+        .any(|a| matches!(a, QuickStepAction::Forward(_) | QuickStepAction::ForwardAsAttachment(_)));
     if replies && (count > 1 || group) {
         return Some("this quick step replies, so it works on one message at a time");
     }
@@ -451,6 +464,73 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                     composes.push(cid);
                 }
             }
+            QuickStepAction::ForwardAsAttachment(to) => {
+                if !live.is_empty() {
+                    let r = invoke(s, "mail.forwardAsAttachment", &json!({"ids": ids_json(&live)}))?;
+                    if let Some(cid) = r.get("compose").and_then(Value::as_u64) {
+                        if !to.is_empty()
+                            && let Some(c) = s.composes.get_mut(&cid)
+                        {
+                            c.to = to.join("; ");
+                        }
+                        composes.push(cid);
+                    }
+                }
+            }
+            QuickStepAction::ReplyWithMeeting => {
+                if let Some(first) = live.first() {
+                    invoke(s, "mail.replyWithMeeting", &json!({"ids": [first.0]}))?;
+                }
+            }
+            QuickStepAction::CreateTask | QuickStepAction::CreateAppointment => {
+                for id in &live {
+                    let Some(m) = s.mailbox.mail.get(id) else { continue };
+                    let (subject, body) = (m.subject.clone(), m.body_text());
+                    let r = if matches!(action, QuickStepAction::CreateTask) {
+                        invoke(s, "tasks.new", &json!({"subject": subject, "body": body}))
+                    } else {
+                        invoke(
+                            s,
+                            "calendar.newAppointment",
+                            &json!({"subject": subject, "body": body, "form": true}),
+                        )
+                    };
+                    if let Err(e) = r {
+                        errors.push(e.to_string());
+                    }
+                }
+            }
+            QuickStepAction::Ignore => {
+                if !live.is_empty() {
+                    match invoke(s, "mail.ignore", &json!({"ids": ids_json(&live), "confirm": true})) {
+                        Ok(_) => touched.extend(live.iter().copied()),
+                        Err(e) => errors.push(e.to_string()),
+                    }
+                }
+            }
+            QuickStepAction::AlwaysMoveConversation(Some(f)) => {
+                if !live.is_empty() {
+                    let p = json!({"ids": ids_json(&live), "folder": f.0});
+                    match invoke(s, "mail.alwaysMoveConversation", &p) {
+                        Ok(_) => touched.extend(live.iter().copied()),
+                        Err(e) => errors.push(e.to_string()),
+                    }
+                }
+            }
+            QuickStepAction::AlwaysMoveConversation(None) => {}
+            QuickStepAction::MoveToFocused | QuickStepAction::MoveToOther => {
+                let cmd = if matches!(action, QuickStepAction::MoveToFocused) {
+                    "mail.moveToFocused"
+                } else {
+                    "mail.moveToOther"
+                };
+                if !live.is_empty() {
+                    match invoke(s, cmd, &json!({"ids": ids_json(&live)})) {
+                        Ok(_) => touched.extend(live.iter().copied()),
+                        Err(e) => errors.push(e.to_string()),
+                    }
+                }
+            }
             QuickStepAction::NewMeeting => match invoke(s, "calendar.newMeeting", &json!({})) {
                 Ok(_) => {}
                 Err(CmdError::Unknown(_)) => {
@@ -463,6 +543,10 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
     touched.sort();
     touched.dedup();
     Ok(json!({"step": step.id, "items": touched.len(), "composes": composes, "errors": errors}))
+}
+
+fn ids_json(ids: &[ItemId]) -> Value {
+    Value::Array(ids.iter().map(|i| json!(i.0)).collect())
 }
 
 /// Follow Up keys a `Flag` action may hold, with their menu labels.
@@ -687,6 +771,46 @@ mod tests {
             assert!(m.read);
         }
         assert_eq!(s.mailbox.quick_steps.last().unwrap().shortcut, "Ctrl+Shift+3");
+    }
+
+    #[test]
+    fn more_actions_tasks_focus_ignore_and_forward_as_attachment() {
+        let (mut s, inbox, proj) = session();
+        let first = s.mailbox.items_in(inbox)[0].id;
+        let subject = s.mailbox.mail[&first].subject.clone();
+        let tasks_before = s.mailbox.tasks.len();
+        s.run("quicksteps.new", &json!({"name": "To task", "actions": ["CreateTask", "MoveToOther"]}))
+            .unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "to task", "ids": [first.0]})).unwrap();
+        assert!(r["errors"].as_array().unwrap().is_empty(), "{r}");
+        assert_eq!(s.mailbox.tasks.len(), tasks_before + 1);
+        assert!(s.mailbox.tasks.values().any(|t| t.subject == subject));
+        assert_eq!(s.mailbox.mail[&first].focus, mailcraft_model::FocusClass::Other);
+        // Forward as attachment to a set address.
+        s.run(
+            "quicksteps.new",
+            &json!({"name": "Fwd att", "actions": [{"ForwardAsAttachment": ["pat@example.net"]}]}),
+        )
+        .unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "fwd att", "ids": [first.0]})).unwrap();
+        let cid = r["composes"][0].as_u64().unwrap();
+        assert_eq!(s.composes[&cid].to, "pat@example.net");
+        assert_eq!(s.composes[&cid].attachments.len(), 1);
+        // Always move conversation asks for the folder on first use, then remembers it.
+        s.run("quicksteps.new", &json!({"name": "Always", "actions": [{"AlwaysMoveConversation": null}]}))
+            .unwrap();
+        let r = s.run("quicksteps.run", &json!({"id": "always", "ids": [first.0]})).unwrap();
+        assert_eq!(r["dialog"], "quickStepFirstUse");
+        s.run("quicksteps.run", &json!({"id": "always", "ids": [first.0], "folder": proj.0})).unwrap();
+        assert_eq!(s.mailbox.mail[&first].always_move_to, Some(proj));
+        // Ignore.
+        let second = s.mailbox.items_in(inbox)[0].id;
+        s.run("quicksteps.new", &json!({"name": "Mute", "actions": ["Ignore"]})).unwrap();
+        s.run("quicksteps.run", &json!({"id": "mute", "ids": [second.0]})).unwrap();
+        assert!(s.mailbox.mail[&second].ignored);
+        // Reply with meeting answers one message at a time.
+        let step = QuickStep { actions: vec![QuickStepAction::ReplyWithMeeting], ..Default::default() };
+        assert!(blocked_for(&step, 2, false).is_some());
     }
 
     #[test]

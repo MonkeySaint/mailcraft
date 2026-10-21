@@ -242,10 +242,13 @@ fn handle(conn: &mut Conn, ctx: &Ctx, jmap: &SharedJmap, req: &Request) -> io::R
                     },
                     "urn:ietf:params:jmap:mail": {},
                     "urn:ietf:params:jmap:submission": {},
+                    "urn:ietf:params:jmap:quota": {},
                 },
                 "accounts": { ACCOUNT: { "name": user, "isPersonal": true, "isReadOnly": false,
-                    "accountCapabilities": { "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {} } } },
-                "primaryAccounts": { "urn:ietf:params:jmap:mail": ACCOUNT, "urn:ietf:params:jmap:submission": ACCOUNT },
+                    "accountCapabilities": { "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {},
+                        "urn:ietf:params:jmap:quota": {} } } },
+                "primaryAccounts": { "urn:ietf:params:jmap:mail": ACCOUNT, "urn:ietf:params:jmap:submission": ACCOUNT,
+                    "urn:ietf:params:jmap:quota": ACCOUNT },
                 "username": user,
                 "apiUrl": "/jmap/api",
                 "downloadUrl": "/jmap/download/{accountId}/{blobId}/{name}?type={type}",
@@ -399,6 +402,7 @@ fn api(ctx: &Ctx, jmap: &SharedJmap, user: &str, body: &Value) -> Value {
             "Email/get" => (name.clone(), email_get(ctx, jmap, user, &args)),
             "Email/set" => (name.clone(), email_set(ctx, jmap, user, &args)),
             "Email/import" => (name.clone(), email_import(ctx, jmap, user, &args)),
+            "Quota/get" => (name.clone(), quota_get(ctx, user)),
             "Identity/get" => (
                 name.clone(),
                 json!({"accountId": ACCOUNT, "state": "i0", "notFound": [],
@@ -423,6 +427,28 @@ fn api(ctx: &Ctx, jmap: &SharedJmap, user: &str, body: &Value) -> Value {
         responses.push(json!([rname, rargs, id]));
     }
     json!({"methodResponses": responses, "sessionState": "s0"})
+}
+
+/// RFC 9425 Quota/get: one account-scoped octets quota for mail when the user has a limit.
+fn quota_get(ctx: &Ctx, user: &str) -> Value {
+    let store = ctx.shared.lock();
+    let list: Vec<Value> = store
+        .user(user)
+        .and_then(|u| {
+            let limit = u.quota?;
+            Some(vec![
+                json!({
+                    "id": "Q1", "resourceType": "octets", "used": u.used(), "hardLimit": limit,
+                    "scope": "account", "name": "Mail storage", "types": ["Mail"],
+                }),
+                json!({
+                    "id": "Q2", "resourceType": "count", "used": u.message_count(), "hardLimit": 100_000,
+                    "scope": "account", "name": "Messages", "types": ["Mail"],
+                }),
+            ])
+        })
+        .unwrap_or_default();
+    json!({"accountId": ACCOUNT, "state": "q0", "list": list, "notFound": []})
 }
 
 fn mailbox_get(ctx: &Ctx, jmap: &SharedJmap, user: &str) -> Value {

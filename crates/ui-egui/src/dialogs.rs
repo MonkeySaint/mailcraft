@@ -24,6 +24,7 @@ pub(crate) mod files;
 mod find;
 mod find_replace_dlg;
 mod folders;
+mod form_field;
 pub(crate) mod format_dlg;
 mod general;
 mod insert_dlg;
@@ -37,6 +38,7 @@ mod print;
 mod quicksteps;
 mod rules;
 mod security;
+mod sr_groups;
 mod views;
 
 #[cfg(test)]
@@ -107,6 +109,16 @@ pub fn open(app: &mut App, name: &str, params: Value) {
             {
                 app.run("nav.selectFolder", json!({"folder": f}));
             }
+        }
+        // Rename Folder edits the name in the folder pane when the pane shows it (the dialog otherwise).
+        "renameFolder"
+            if params.get("inline").and_then(Value::as_bool) != Some(false)
+                && app.s.view.folder_pane == mailcraft_model::FolderPaneState::Normal
+                && params.get("folder").and_then(Value::as_u64).is_some() =>
+        {
+            let folder = params.get("folder").and_then(Value::as_u64).unwrap_or(0);
+            let text = params.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            app.ui.inline_rename = Some(crate::InlineRename { folder, text, ..Default::default() });
         }
         "readWindow" => {
             if let Some(id) = params.get("id").and_then(Value::as_u64) {
@@ -267,6 +279,9 @@ pub const KNOWN: &[&str] = &[
     "indexingStatus",
     "reminders",
     "stationery",
+    "pickStationery",
+    "sendReceiveGroups",
+    "addFormField",
     "signatures",
     "notAvailable",
     "message",
@@ -387,6 +402,12 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     }
     if d.name == "options" {
         return options::show(ctx, app, d);
+    }
+    if d.name == "addFormField" {
+        return form_field::show(ctx, app, d);
+    }
+    if d.name == "sendReceiveGroups" {
+        return sr_groups::show(ctx, app, d);
     }
     if let Some(out) = accounts::show(ctx, app, d) {
         return out;

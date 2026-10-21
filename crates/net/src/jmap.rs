@@ -14,6 +14,8 @@ use crate::smtp::{DsnRequest, take_submit_options, xtext};
 pub const CORE: &str = "urn:ietf:params:jmap:core";
 pub const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
+/// RFC 9425 quotas.
+pub const QUOTA: &str = "urn:ietf:params:jmap:quota";
 
 /// How to authenticate HTTP requests.
 #[derive(Clone, PartialEq, Eq)]
@@ -121,6 +123,42 @@ impl Invocation {
     pub fn into_result(self) -> Result<Invocation> {
         if self.name == "error" { Err(method_error(&self.args)) } else { Ok(self) }
     }
+}
+
+/// The tightest mail quotas of a Quota/get list: octets give the storage, counts the messages.
+pub fn quota_from_list(list: &[Value]) -> Option<crate::sync::Quota> {
+    let mut storage: Option<(u64, u64)> = None;
+    let mut count: Option<(u64, u64)> = None;
+    for q in list.iter().take(256) {
+        let mail = q.get("types").and_then(Value::as_array).is_none_or(|t| {
+            t.is_empty() || t.iter().any(|x| x.as_str().is_some_and(|s| s.eq_ignore_ascii_case("Mail")))
+        });
+        let (Some(used), Some(limit)) =
+            (q.get("used").and_then(Value::as_u64), q.get("hardLimit").and_then(Value::as_u64))
+        else {
+            continue;
+        };
+        if !mail || limit == 0 {
+            continue;
+        }
+        let slot = match q.get("resourceType").and_then(Value::as_str) {
+            Some("octets") => &mut storage,
+            Some("count") => &mut count,
+            _ => continue,
+        };
+        let tighter = match *slot {
+            Some((u, l)) => u128::from(used) * u128::from(l) > u128::from(u) * u128::from(limit),
+            None => true,
+        };
+        if tighter {
+            *slot = Some((used, limit));
+        }
+    }
+    if storage.is_none() && count.is_none() {
+        return None;
+    }
+    let (used, limit) = storage.unwrap_or((0, 0));
+    Some(crate::sync::Quota { used, limit, messages: count })
 }
 
 fn method_error(v: &Value) -> NetError {
@@ -331,6 +369,9 @@ impl JmapClient {
         if calls.iter().any(|c| c.name.starts_with("EmailSubmission/") || c.name.starts_with("Identity/")) {
             using.push(SUBMISSION);
         }
+        if calls.iter().any(|c| c.name.starts_with("Quota/")) {
+            using.push(QUOTA);
+        }
         let body = json!({
             "using": using,
             "methodCalls": calls.iter().map(Invocation::to_json).collect::<Vec<_>>(),
@@ -377,6 +418,25 @@ impl JmapClient {
             m.insert("accountId".into(), Value::String(self.session.account_id.clone()));
         }
         args
+    }
+
+    /// Quota/get (RFC 9425) for the mail account: `Ok(None)` when the server has no quota capability or
+    /// reports no mail limits.
+    pub fn quota(&self) -> Result<Option<crate::sync::Quota>> {
+        if !self.session.has_capability(QUOTA) {
+            return Ok(None);
+        }
+        let account = self
+            .session
+            .raw
+            .get("primaryAccounts")
+            .and_then(|p| p.get(QUOTA))
+            .and_then(Value::as_str)
+            .unwrap_or(&self.session.account_id)
+            .to_owned();
+        let r = self.call_one("Quota/get", json!({ "accountId": account, "ids": null }))?;
+        let list = r.get("list").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(quota_from_list(&list))
     }
 
     /// Mailbox/get for all mailboxes.

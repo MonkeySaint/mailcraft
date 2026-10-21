@@ -122,6 +122,55 @@ pub struct SyncDelta {
     pub state: FolderState,
 }
 
+/// A mailbox's storage quota as the server reports it (IMAP QUOTA, RFC 9208; JMAP Quota, RFC 9425).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quota {
+    /// Bytes in use.
+    pub used: u64,
+    /// Bytes allowed (0 = no storage limit reported).
+    pub limit: u64,
+    /// Messages in use and allowed, when the server limits those too.
+    pub messages: Option<(u64, u64)>,
+}
+
+impl Quota {
+    /// From IMAP quota roots: the tightest STORAGE limit (in units of 1024 octets) and MESSAGE limit.
+    /// `None` when no root limits storage or messages.
+    pub fn from_imap(roots: &[(String, Vec<crate::imap::QuotaResource>)]) -> Option<Quota> {
+        let mut storage: Option<(u64, u64)> = None;
+        let mut messages: Option<(u64, u64)> = None;
+        for r in roots.iter().flat_map(|(_, r)| r) {
+            let pair = (r.usage, r.limit);
+            // The tightest limit is the one the user runs into first (largest share used).
+            let tighter = |cur: Option<(u64, u64)>| match cur {
+                Some((u, l)) if l > 0 && pair.1 > 0 => {
+                    u128::from(pair.0) * u128::from(l) > u128::from(u) * u128::from(pair.1)
+                }
+                _ => true,
+            };
+            match r.name.as_str() {
+                "STORAGE" if tighter(storage) => storage = Some(pair),
+                "MESSAGE" if tighter(messages) => messages = Some(pair),
+                _ => {}
+            }
+        }
+        if storage.is_none() && messages.is_none() {
+            return None;
+        }
+        let (used, limit) = storage.unwrap_or((0, 0));
+        Some(Quota { used: used.saturating_mul(1024), limit: limit.saturating_mul(1024), messages })
+    }
+
+    /// Share of the storage limit in use (0.0–1.0; `None` without a storage limit).
+    pub fn fraction(&self) -> Option<f32> {
+        if self.limit == 0 {
+            return None;
+        }
+        let f = self.used as f64 / self.limit as f64;
+        Some(f.clamp(0.0, 1.0) as f32)
+    }
+}
+
 /// How far a folder sync has got: reported once the new messages are counted and after every batch of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FetchProgress {
@@ -212,6 +261,12 @@ impl ImapAccount {
                 other => return other,
             }
         }
+    }
+
+    /// The quota of the Inbox's quota roots (`Ok(None)` when the server has no QUOTA extension or sets no
+    /// limits).
+    pub fn quota(&mut self) -> Result<Option<Quota>> {
+        self.with_client(true, |c| c.get_quota_root("INBOX")).map(|roots| Quota::from_imap(&roots))
     }
 
     /// Lists every folder with its role and subscription state.

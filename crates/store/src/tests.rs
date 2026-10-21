@@ -886,3 +886,39 @@ fn autosave_falls_back_to_checkpoint_when_append_is_refused() {
     drop(store);
     assert_eq!(Store::open(d.path()).unwrap().load().unwrap(), mb);
 }
+
+#[test]
+fn recoverable_bin_round_trips_with_raw_in_blobs() {
+    let d = tmp();
+    let mut store = Store::open(d.path()).unwrap();
+    assert!(store.load_recoverable().unwrap().items.is_empty(), "no file yet");
+    let mut bin = mailcraft_model::RecoverBin::default();
+    bin.add(mailcraft_model::DeletedItem::Mail(Box::new(mail(7, "Gone", Some(RAW1)))), "Inbox", 100);
+    store.save_recoverable(&bin).unwrap();
+    let text = fs::read_to_string(d.path().join(crate::RECOVERABLE_FILE)).unwrap();
+    assert!(!text.contains("First body"), "raw sources live in blobs");
+    drop(store);
+    let mut store = Store::open(d.path()).unwrap();
+    let back = store.load_recoverable().unwrap();
+    let m = match back.items.first().map(|e| &e.item) {
+        Some(mailcraft_model::DeletedItem::Mail(m)) => m.clone(),
+        other => panic!("mail entry expected, got {other:?}"),
+    };
+    assert_eq!(m.subject, "Gone");
+    let key = m.blob.clone().unwrap();
+    assert_eq!(store.get_blob(&key).unwrap(), RAW1);
+    // The bin keeps its blob alive through a collection that only sees the (empty) mailbox.
+    assert_eq!(store.gc_blobs(&base_mailbox()).unwrap(), 0);
+    assert!(store.has_blob(&key));
+}
+
+#[test]
+fn garbled_recoverable_file_is_an_error_and_keeps_blobs() {
+    let d = tmp();
+    let mut store = Store::open(d.path()).unwrap();
+    let key = store.put_blob(RAW2).unwrap();
+    fs::write(d.path().join(crate::RECOVERABLE_FILE), b"{not json").unwrap();
+    assert!(matches!(store.load_recoverable(), Err(StoreError::Corrupt(_))));
+    assert!(store.gc_blobs(&base_mailbox()).is_err());
+    assert!(store.has_blob(&key));
+}

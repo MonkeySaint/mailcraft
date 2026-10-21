@@ -58,6 +58,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_accounts,
             group,
         ),
+        spec(
+            "sendReceive.defineGroups",
+            "Define Send/Receive Groups",
+            "Send / Receive › Send/Receive Groups",
+            "",
+            r#"{"action"?: "list"|"save"|"copy"|"rename"|"remove" (none: the dialog), "group"?: {"name": string, "members": [{"account": number, "send"?: bool, "receive"?: bool, "headersOnly"?: bool, "folders"?: [number]|null}], "include"?: bool, "everyMinutes"?: number, "onExit"?: bool, "offlineInclude"?: bool, "offlineEveryMinutes"?: number}, "oldName"?: string, "name"?: string, "newName"?: string}"#,
+            always,
+            crate::sync::groups::define,
+        ),
         spec("sendReceive.sendAll", "Send All", SR, "", r#"{"offline"?: bool}"#, has_accounts, send_all),
         spec("sendReceive.cancelAll", "Cancel All", DL, "", "", always, cancel_all),
         spec("sendReceive.status", "Send/Receive Status", "Status bar", "", "", always, status),
@@ -199,6 +208,23 @@ fn all(s: &mut Session, p: &Value) -> CmdResult {
     let off = offline(s, p);
     let report = outbox_report(s, &ids, off);
     let mut out = start(s, &ids, Plan::all(), off, report)?;
+    // User-defined groups included in F9 (online, or set to run while working offline).
+    let mut groups_started = 0usize;
+    let mut group_names = Vec::new();
+    for g in crate::sync::groups::f9_groups(s) {
+        match crate::sync::groups::run(s, &g, true, s.view.work_offline) {
+            Ok(n) => groups_started = groups_started.saturating_add(n),
+            Err(e) => log::info!("send/receive group {}: {e}", g.name),
+        }
+        group_names.push(g.name);
+    }
+    if let Some(o) = out.as_object_mut() {
+        o.insert("groups".into(), json!(group_names));
+        if groups_started > 0 {
+            let before = o.get("started").and_then(Value::as_u64).unwrap_or(0);
+            o.insert("started".into(), json!(before.saturating_add(groups_started as u64)));
+        }
+    }
     // Send/Receive All Folders also updates the internet calendars.
     let calendars = subscribe::subscriptions(s, true);
     let refreshed = refresh_calendars(s, calendars, off);
@@ -309,8 +335,21 @@ fn folder(s: &mut Session, p: &Value) -> CmdResult {
 fn group(s: &mut Session, p: &Value) -> CmdResult {
     let name = req_str(p, "name")?.trim().to_owned();
     let off = offline(s, p);
-    if name.eq_ignore_ascii_case("All Accounts") {
+    if name.eq_ignore_ascii_case(crate::sync::groups::ALL_ACCOUNTS) {
         return all(s, p);
+    }
+    crate::accounts::load_prefs(s);
+    if let Some(g) = crate::sync::groups::group(s, &name) {
+        let ids: Vec<AccountId> = g.members.iter().map(|m| AccountId(m.account)).collect();
+        let report = outbox_report(s, &ids, off);
+        let started = if off { 0 } else { crate::sync::groups::run(s, &g, true, false).unwrap_or(0) };
+        let mut out = report;
+        if let Some(o) = out.as_object_mut() {
+            o.insert("group".into(), json!(g.name));
+            o.insert("started".into(), json!(started));
+            o.insert("status".into(), serde_json::to_value(s.sync_status()).unwrap_or(Value::Null));
+        }
+        return Ok(out);
     }
     if let Some(a) = s
         .mailbox
@@ -322,7 +361,18 @@ fn group(s: &mut Session, p: &Value) -> CmdResult {
         let report = outbox_report(s, &[id], off);
         return start(s, &[id], Plan::all(), off, report);
     }
-    if let Some(f) = s.mailbox.folders.values().find(|f| f.name.eq_ignore_ascii_case(&name)).map(|f| f.id) {
+    // A folder name ("Inbox"): the current account's folder first.
+    let current = s.current_account();
+    let named = |f: &&mailcraft_model::Folder| f.name.eq_ignore_ascii_case(&name);
+    let found = s
+        .mailbox
+        .folders
+        .values()
+        .filter(named)
+        .find(|f| Some(f.account) == current)
+        .or_else(|| s.mailbox.folders.values().find(named))
+        .map(|f| f.id);
+    if let Some(f) = found {
         return folder(s, &json!({"folder": f.0, "offline": off}));
     }
     Err(CmdError::Params(format!("no account, group or folder named \"{name}\"")))

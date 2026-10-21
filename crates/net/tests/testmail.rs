@@ -449,3 +449,27 @@ fn sync_reports_download_progress_per_batch() {
     assert_eq!(seen, [FetchProgress::default()]);
     assert_eq!(d3.waiting, 0);
 }
+
+#[test]
+fn imap_quota_root_reports_storage() {
+    let s = servers(Config::default());
+    let mut acc = account(&s, Security::Tls);
+    assert_eq!(acc.quota().unwrap(), None, "no limit set: nothing to report");
+    s.set_quota(USER, Some(10 * 1024 * 1024)).unwrap();
+    let raw = msg("quota", &"x".repeat(5000));
+    s.seed_message(USER, "INBOX", &raw, &[]).unwrap();
+    let q = acc.quota().unwrap().expect("quota");
+    assert_eq!(q.limit, 10 * 1024 * 1024);
+    assert_eq!(q.used, (raw.len() as u64).div_ceil(1024) * 1024);
+    assert!(q.fraction().unwrap() > 0.0);
+    // GETQUOTA on the root and on an unknown root.
+    let mut c = ImapClient::connect("127.0.0.1", s.imaps_port, Security::Tls, &opts(&s)).unwrap();
+    c.login_with(&Credentials::password(USER, PASS), "").unwrap();
+    assert!(c.has_capability("QUOTA"));
+    let roots = c.get_quota_root("INBOX").unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].1[0].name, "STORAGE");
+    assert!(c.get_quota_root("No such folder").is_err());
+    c.logout().unwrap();
+    acc.disconnect();
+}

@@ -383,6 +383,7 @@ pub mod pim {
         let folder = opt_folder(p).ok_or_else(|| CmdError::Params("`folder` (number) required".into()))?;
         let ids = require_targets(s, p, kind)?;
         let out = move_to(s, &ids, folder, kind)?;
+        crate::session::note_recent_move(s, folder);
         Ok(json!({ "moved": ids_json(&out) }))
     }
 

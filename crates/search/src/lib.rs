@@ -27,4 +27,4 @@ pub use eval::{Context, matches};
 pub use fold::fold;
 pub use highlight::{Field, highlights};
 pub use index::{Counts, Filter, Hit, Index, Stats};
-pub use query::{Query, Term, TextField, parse};
+pub use query::{PropOp, PropTest, Query, Term, TextField, parse};
