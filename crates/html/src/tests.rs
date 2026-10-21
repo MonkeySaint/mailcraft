@@ -602,6 +602,7 @@ fn doc_to_html_shape() {
         ],
         base: TextStyle { font_family: Some("Aptos".into()), size_pt: Some(12.0), ..TextStyle::default() },
         background: None,
+        drawings: Vec::new(),
     };
     let out = doc_to_html(&d);
     assert!(out.starts_with("<!DOCTYPE html>"));
@@ -1074,6 +1075,7 @@ fn font_family_cannot_inject_css_into_output() {
         }],
         base: TextStyle { font_family: Some("Aptos;background:url(x)".into()), ..TextStyle::default() },
         background: None,
+        drawings: Vec::new(),
     };
     let out = doc_to_html(&d);
     assert!(!out.contains(";color:red") && !out.contains(";background:url"), "{out}");

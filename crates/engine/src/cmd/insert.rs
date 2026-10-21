@@ -1,17 +1,28 @@
 //! `insert.*`: tables, pictures and generated graphics, links, bookmarks, symbols, building blocks, cards and
-//! calendars in the compose body. Graphics the body model cannot hold natively are inserted as inline images
-//! (`cid:` parts when sent): shapes, WordArt and SmartArt are drawn to PNG with `mailcraft-render` in the
-//! theme's colours and effects; icons, charts and 3D models are SVG. Commands that need an OS facility (screen
-//! capture) or a picker without params open a dialog instead.
+//! calendars in the compose body.
+//!
+//! Shapes, text boxes, WordArt and drawing canvases are floating drawing objects of the body
+//! ([`mailcraft_model::Drawing`], edited by `cmd::drawing`); [`drawing`] draws them and turns them into
+//! pictures when the message is sent. Icons, charts, SmartArt, 3D models and object icons are inline PNG
+//! pictures drawn with `mailcraft-render` (every mail program shows PNG; many do not show SVG); charts,
+//! SmartArt and 3D models keep their recipe, so they can be edited again and follow theme changes. Commands
+//! that need an OS facility (screen capture) or a picker without params open a dialog instead.
 //!
 //! Quick Parts / AutoText and the other building-block galleries are kept in `building-blocks.json` in the
 //! profile directory (next to the data file), so they outlive the compose windows.
 
 use std::fmt::Write as _;
 
+pub mod chart;
+pub mod drawing;
+mod gltf;
+pub mod icons;
 #[cfg(test)]
 mod link_tests;
 mod math;
+pub mod shapes;
+pub mod smartart;
+mod table_draw;
 pub use math::{MAX_EQUATION, equation_png};
 
 use serde_json::{Value, json};
@@ -46,7 +57,6 @@ pub const GALLERIES: [&str; 5] = ["quickParts", "autoText", "textBoxes", "quickT
 pub const LIST_STYLES_GALLERY: &str = "listStyles";
 /// Most named list styles kept.
 const MAX_LIST_STYLES: usize = 100;
-const PALETTE: [&str; 6] = ["#156082", "#e97132", "#196b24", "#0f9ed5", "#a02b93", "#4ea72e"];
 
 fn edit(s: &mut Session, p: &Value, f: impl FnOnce(&mut ComposeState)) -> Result<(), CmdError> {
     let c = compose_mut(s, p)?;
@@ -205,30 +215,6 @@ pub(crate) fn paste_picture(c: &mut ComposeState, data: Vec<u8>) -> Result<Strin
     Ok(put_image(c, &filename, mime, data, "Picture", size))
 }
 
-/// Embeds generated SVG at the caret.
-fn put_svg(c: &mut ComposeState, name: &str, svg: String, alt: &str, w: f32, h: f32) -> String {
-    put_image(c, &format!("{name}.svg"), "image/svg+xml", svg.into_bytes(), alt, (Some(w), Some(h)))
-}
-
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn svg_open(w: f32, h: f32) -> String {
-    format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">"#)
-}
-
 fn picture(s: &mut Session, p: &Value) -> CmdResult {
     let Some((name, data)) = file_param(p, MAX_PICTURE_BYTES)? else {
         return dialog(s, "insertPicture", json!({"compose": compose_id(s, p)?}));
@@ -252,30 +238,92 @@ fn picture(s: &mut Session, p: &Value) -> CmdResult {
 // Shapes, icons, charts, SmartArt, 3D models
 // ---------------------------------------------------------------------------------------------------------
 
-const SHAPES: &str = "rectangle, roundedRectangle, oval, circle, triangle, rightTriangle, diamond, pentagon, hexagon, octagon, star, star6, line, arrow, leftArrow, upArrow, downArrow, parallelogram, trapezoid, plus, chevron, heart, callout, canvas";
+/// A number param (`None` when absent or null).
+fn num_param(p: &Value, k: &str) -> Result<Option<f32>, CmdError> {
+    match p.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .map(|n| Some(n as f32))
+            .ok_or_else(|| CmdError::Params(format!("`{k}` must be a number"))),
+    }
+}
 
+/// `x`, `y` (where a drawing goes, px) when given.
+fn point_param(p: &Value) -> Result<Option<(f32, f32)>, CmdError> {
+    match (num_param(p, "x")?, num_param(p, "y")?) {
+        (Some(x), Some(y)) => Ok(Some((x, y))),
+        (None, None) => Ok(None),
+        _ => Err(CmdError::Params("give both `x` and `y`".into())),
+    }
+}
+
+/// `points`: [[x, y], …] as fractions of the box (hand-drawn freeforms and scribbles, line ends).
+fn points_param(p: &Value) -> Result<Vec<(f32, f32)>, CmdError> {
+    let Some(v) = p.get("points") else { return Ok(Vec::new()) };
+    let arr = v.as_array().ok_or_else(|| CmdError::Params("`points` must be a list of [x, y]".into()))?;
+    Ok(arr
+        .iter()
+        .take(drawing::MAX_POINTS)
+        .filter_map(|pt| {
+            let a = pt.as_array()?;
+            let (x, y) = (a.first()?.as_f64()?, a.get(1)?.as_f64()?);
+            (x.is_finite() && y.is_finite())
+                .then_some(((x as f32).clamp(0.0, 1.0), (y as f32).clamp(0.0, 1.0)))
+        })
+        .collect())
+}
+
+/// Insert › Shapes: a floating shape object. With `draw` the shape becomes the drawing tool (the next drag
+/// in the body draws it); with `x`, `y` (and `w`, `h`, `points`) it goes there; otherwise at the caret.
 fn shape(s: &mut Session, p: &Value) -> CmdResult {
-    let kind = req_str(p, "kind")?.to_owned();
+    let raw = req_str(p, "kind")?;
+    let Some(kind) = shapes::canonical(raw) else {
+        return Err(CmdError::Params(format!(
+            "unknown shape `{raw}` (a gallery name such as `rectangle`, `oval`, `rightArrow`, or its label)"
+        )));
+    };
+    if opt_bool(p, "draw") == Some(true) {
+        let tool = if kind == "canvas" { "canvas".to_owned() } else { format!("shape:{kind}") };
+        let c = compose_mut(s, p)?;
+        c.draw_tool = Some(tool.clone());
+        c.selected_drawing = None;
+        return Ok(json!({"armed": tool}));
+    }
+    let at = point_param(p)?;
+    let (w, h) = (num_param(p, "w")?, num_param(p, "h")?);
+    let points = points_param(p)?;
     let cid = compose_id(s, p)?;
     let theme = s
         .composes
         .get(&cid)
         .map(ComposeState::theme_resolved)
         .ok_or_else(|| CmdError::Disabled("no compose".into()))?;
-    let color = match opt_str(p, "color") {
-        Some(c) => mailcraft_html::parse_css_color(c)
-            .ok_or_else(|| CmdError::Params(format!("`{c}` is not a colour")))?,
-        None => theme.color(crate::compose::ACCENT1),
-    };
-    let Some((png, w, h)) = shape_png(&kind, color, theme.effects) else {
-        return Err(CmdError::Params(format!("unknown shape `{kind}` (known: {SHAPES})")));
-    };
+    let mut d = drawing::new_shape(&theme, kind);
+    if let Some(col) = opt_str(p, "color") {
+        let col = mailcraft_html::parse_css_color(col)
+            .ok_or_else(|| CmdError::Params(format!("`{col}` is not a colour")))?;
+        if shapes::is_line_shape(kind) {
+            d.outline = Some(col);
+        } else {
+            d.fill = Some(col);
+            d.outline = Some(darken(col, 0.35));
+        }
+    }
+    if let Some(w) = w {
+        d.w = w;
+    }
+    if let Some(h) = h {
+        d.h = h;
+    }
+    d.points = points;
     let c = compose_mut(s, p)?;
-    let cid = put_png(c, &kind, png, &kind, w, h)?;
-    // A shape in the theme's accent follows later colour changes; an explicit colour stays.
-    let fixed = opt_str(p, "color").map(|_| color.to_hex());
-    remember_generated(c, &cid, "shape", json!({"shape": kind, "color": fixed}));
-    Ok(json!({"shape": kind, "cid": cid, "format": "png", "effects": theme.effects}))
+    let id = drawing::add(c, d, at, true).map_err(CmdError::Failed)?;
+    let d = c.body.drawings.iter().find(|d| d.id == id).cloned().unwrap_or_default();
+    Ok(
+        json!({"shape": kind, "drawing": id, "x": d.x, "y": d.y, "w": d.w, "h": d.h, "effects": theme.effects}),
+    )
 }
 
 /// Records how picture `cid` was drawn, so a theme change can draw it again.
@@ -332,11 +380,15 @@ fn redraw(g: &crate::compose::GeneratedPicture, theme: &crate::compose::Resolved
                 .spec
                 .get("items")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).take(30).collect())
+                .map(|a| {
+                    a.iter().filter_map(Value::as_str).map(str::to_owned).take(smartart::MAX_ITEMS).collect()
+                })
                 .unwrap_or_default();
-            smart_art_png(&text("layout"), &items, theme)?.0
+            smartart::png(&text("layout"), &items, theme)?.0
         }
         "wordArt" => wordart_png(&text("text"), &text("style"), theme)?.0,
+        "chart" => chart::png(&serde_json::from_value::<chart::ChartSpec>(g.spec.clone()).ok()?, theme)?,
+        "model3d" => model_recipe_png(&g.spec, theme)?,
         _ => return None,
     };
     (!png.is_empty()).then_some(png)
@@ -822,6 +874,8 @@ struct Effect {
     texture: u8,
     /// Fill opacity.
     opacity: f32,
+    /// Soft edges: the fill fades out over this many logical px at its edge.
+    soft: f32,
 }
 
 fn effect_style(name: &str) -> Effect {
@@ -858,6 +912,13 @@ fn darken(c: Color, t: f32) -> Color {
 fn composite(img: &mut Img, at: (usize, usize), mask: &Mask, color: Color, fx: &Effect) {
     let s = RASTER_SCALE;
     let d = |v: f32| (v * s).round() as i64;
+    let softened;
+    let mask = if fx.soft > 0.0 {
+        softened = mask.eroded(d(fx.soft / 2.0).max(1)).blurred(d(fx.soft / 2.0).max(1));
+        &softened
+    } else {
+        mask
+    };
     if let Some((off, blur, op)) = fx.shadow {
         let sh = mask.shifted(d(off), d(off)).blurred(d(blur / 2.0).max(1));
         img.paint_at(&sh, at, op, &|_, _| Color::BLACK);
@@ -908,13 +969,18 @@ fn text_list(
     style: &TextStyle,
     fonts: &mailcraft_fonts::FontDb,
 ) -> (mailcraft_layout::DisplayList, f32, f32, f32, f32) {
-    let doc = Doc {
-        blocks: vec![Block::Paragraph {
-            style: ParaStyle::default(),
-            inlines: vec![Inline::Text { text: text.to_owned(), style: style.clone() }],
-        }],
-        ..Default::default()
-    };
+    // One line per `\n`.
+    let mut inlines = Vec::new();
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            inlines.push(Inline::LineBreak);
+        }
+        if !line.is_empty() {
+            inlines.push(Inline::Text { text: line.to_owned(), style: style.clone() });
+        }
+    }
+    let doc =
+        Doc { blocks: vec![Block::Paragraph { style: ParaStyle::default(), inlines }], ..Default::default() };
     let lo = mailcraft_layout::LayoutOptions { width: MAX_RASTER_SIDE * 4.0, ..Default::default() };
     let layout = mailcraft_layout::layout_doc(&doc, fonts, &lo);
     let mut list = mailcraft_layout::DisplayList::default();
@@ -1011,7 +1077,8 @@ struct WordArtStyle {
     hard_shadow: Option<Color>,
     inner_shadow: bool,
     glow: Option<Color>,
-    bevel: bool,
+    /// Bevel: `Some(true)` sharp, `Some(false)` soft.
+    bevel: Option<bool>,
     reflection: bool,
 }
 
@@ -1053,7 +1120,7 @@ fn parse_wordart(style: &str, theme: &crate::compose::ResolvedTheme) -> WordArtS
         hard_shadow: None,
         inner_shadow: false,
         glow: None,
-        bevel: false,
+        bevel: None,
         reflection: false,
     };
     for part in style.split(';').map(str::trim).filter(|p| !p.is_empty()) {
@@ -1082,7 +1149,7 @@ fn parse_wordart(style: &str, theme: &crate::compose::ResolvedTheme) -> WordArtS
         } else if h.starts_with("glow") {
             w.glow = col.or(Some(accent));
         } else if h.contains("bevel") {
-            w.bevel = true;
+            w.bevel = Some(h.contains("sharp"));
         } else if h.starts_with("reflection") {
             w.reflection = true;
         }
@@ -1090,30 +1157,72 @@ fn parse_wordart(style: &str, theme: &crate::compose::ResolvedTheme) -> WordArtS
     w
 }
 
-/// PNG of `text` as WordArt in `style`, set in `font` (the theme's heading font); (png, width, height).
+/// PNG of `text` as WordArt in `style`, set in the theme's heading font at 36 pt; (png, width, height).
 fn wordart_png(
     text: &str,
     style: &str,
     theme: &crate::compose::ResolvedTheme,
 ) -> Option<(Vec<u8>, f32, f32)> {
+    let (img, w, h) = wordart_img(text, style, theme, &TextStyle::default(), &WordArtOverrides::default())?;
+    Some((img.to_png(), w, h))
+}
+
+/// `text` (lines split at `\n`) drawn as WordArt in `style` with [`EFFECT_MARGIN`] around the ink: the
+/// picture and its size (logical px). `ts` overrides the font (default: the theme's heading font, bold,
+/// 36 pt) and, with a colour, the style's fill.
+/// What a WordArt drawing changes of its style: Text Outline and Text Effects.
+#[derive(Clone, Debug, Default)]
+struct WordArtOverrides {
+    /// Outline colour of the letters (instead of the style's).
+    outline: Option<Color>,
+    /// `""` (the style's effects), `none`, `shadow`, `glow`, `reflection`, `bevel`.
+    effect: String,
+}
+
+fn wordart_img(
+    text: &str,
+    style: &str,
+    theme: &crate::compose::ResolvedTheme,
+    ts_in: &TextStyle,
+    over: &WordArtOverrides,
+) -> Option<(Img, f32, f32)> {
     let fonts = mailcraft_fonts::FontDb::bundled();
+    let size = ts_in.size_pt.filter(|s| s.is_finite() && *s > 0.0).unwrap_or(36.0).clamp(4.0, 400.0);
     let mut ts = TextStyle {
-        bold: Some(true),
-        size_pt: Some(36.0),
-        font_family: Some(theme.heading_font.clone()),
+        bold: Some(ts_in.bold.unwrap_or(true)),
+        italic: ts_in.italic,
+        underline: ts_in.underline,
+        size_pt: Some(size),
+        font_family: Some(ts_in.font_family.clone().unwrap_or_else(|| theme.heading_font.clone())),
         ..Default::default()
     };
     let (mut list, mut x0, mut y0, mut tw, mut th) = text_list(text, &ts, &fonts);
     let room = MAX_RASTER_SIDE - 2.0 * EFFECT_MARGIN;
-    if tw > room {
+    if tw > room || th > room {
         // Long text gets a smaller size rather than being cut off.
-        ts.size_pt = Some((36.0 * room / tw).max(8.0));
+        ts.size_pt = Some((size * room / tw.max(th)).max(4.0));
         (list, x0, y0, tw, th) = text_list(text, &ts, &fonts);
     }
     if tw <= 0.0 || th <= 0.0 {
         return None;
     }
-    let ws = parse_wordart(style, theme);
+    let mut ws = parse_wordart(style, theme);
+    if let Some(c) = ts_in.color {
+        ws.fill = c;
+        ws.gradient = ws.gradient.map(|_| lighten(c, 0.6));
+    }
+    if over.outline.is_some() {
+        ws.outline = over.outline;
+    }
+    if !over.effect.is_empty() {
+        // Text Effects replaces the style's effects with one.
+        ws.shadow = over.effect == "shadow";
+        ws.hard_shadow = None;
+        ws.inner_shadow = false;
+        ws.glow = (over.effect == "glow").then(|| theme.color(crate::compose::ACCENT1));
+        ws.bevel = (over.effect == "bevel").then_some(false);
+        ws.reflection = over.effect == "reflection";
+    }
     let m = EFFECT_MARGIN;
     let extra = if ws.reflection { th * 0.6 } else { 0.0 };
     let (w, h) = ((tw + 2.0 * m).min(MAX_RASTER_SIDE), (th + 2.0 * m + extra).min(MAX_RASTER_SIDE));
@@ -1147,400 +1256,267 @@ fn wordart_png(
     if ws.inner_shadow {
         img.paint(&mask.minus(&mask.shifted(d(1.5), d(1.5))), 0.5, &|_, _| darken(fill, 0.6));
     }
-    if ws.bevel {
-        img.paint(&mask.minus(&mask.shifted(d(1.0), d(1.0))), 0.6, &|_, _| Color::WHITE);
-        img.paint(&mask.minus(&mask.shifted(-d(1.0), -d(1.0))), 0.4, &|_, _| darken(fill, 0.5));
+    if let Some(sharp) = ws.bevel {
+        // A soft bevel shades a wide, faint edge; a sharp one a narrow, strong one.
+        let (r, hi, lo) = if sharp { (0.6, 0.85, 0.6) } else { (1.4, 0.5, 0.35) };
+        img.paint(&mask.minus(&mask.shifted(d(r), d(r))), hi, &|_, _| Color::WHITE);
+        img.paint(&mask.minus(&mask.shifted(-d(r), -d(r))), lo, &|_, _| darken(fill, 0.5));
     }
     if ws.reflection {
         let r = mask.reflected(i64::try_from(y_bot).unwrap_or(0) + d(1.0), d(th * 0.6));
         img.paint(&r, 1.0, &|_, _| fill);
     }
-    Some((img.to_png(), w, h))
+    Some((img, w, h))
 }
 
-/// PNG of a SmartArt `layout` over `items` with theme colours and effects; (png, width, height).
-fn smart_art_png(
-    layout: &str,
-    items: &[String],
-    theme: &crate::compose::ResolvedTheme,
-) -> Option<(Vec<u8>, f32, f32)> {
-    let fonts = mailcraft_fonts::FontDb::bundled();
-    // At most as many items as fit the largest picture.
-    let cap = match layout {
-        "list" => 19,
-        "process" => 6,
-        "hierarchy" => 8,
-        _ => 30,
-    };
-    let items = items.get(..items.len().min(cap)).unwrap_or(items);
-    let n = items.len();
-    if n == 0 {
-        return None;
-    }
-    // Boxes (x, y, w, h) and connector polygons in logical px.
-    let mut boxes: Vec<(f32, f32, f32, f32)> = Vec::new();
-    let mut connectors: Vec<Vec<(f32, f32)>> = Vec::new();
-    let (w, h) = match layout {
-        "list" => {
-            for i in 0..n {
-                boxes.push((10.0, 10.0 + 50.0 * i as f32, 340.0, 40.0));
-            }
-            (360.0, 20.0 + 50.0 * n as f32)
-        }
-        "process" => {
-            for i in 0..n {
-                let x = 10.0 + 150.0 * i as f32;
-                boxes.push((x, 15.0, 115.0, 50.0));
-                if i + 1 < n {
-                    connectors.push(vec![(x + 120.0, 30.0), (x + 142.0, 40.0), (x + 120.0, 50.0)]);
-                }
-            }
-            (20.0 + 150.0 * n as f32, 80.0)
-        }
-        "cycle" => {
-            let ring_outer = ellipse_pts(210.0, 210.0, 142.0, 142.0);
-            let mut ring_inner = ellipse_pts(210.0, 210.0, 138.0, 138.0);
-            ring_inner.reverse();
-            // A ring as one polygon: outer circle, bridge, inner circle reversed.
-            let mut ring = ring_outer;
-            ring.extend(ring_inner);
-            connectors.push(ring);
-            for i in 0..n {
-                let a = std::f32::consts::TAU * i as f32 / n as f32 - std::f32::consts::FRAC_PI_2;
-                boxes.push((210.0 + 140.0 * a.cos() - 55.0, 210.0 + 140.0 * a.sin() - 22.0, 110.0, 44.0));
-            }
-            (420.0, 420.0)
-        }
-        "hierarchy" => {
-            let kids = n.saturating_sub(1).max(1);
-            let w = (20.0 + 140.0 * kids as f32).max(200.0);
-            boxes.push((w / 2.0 - 60.0, 10.0, 120.0, 44.0));
-            for i in 1..n {
-                let x = 10.0 + 140.0 * (i - 1) as f32;
-                let cx = x + 60.0;
-                connectors.push(vec![
-                    (w / 2.0 - 1.0, 54.0),
-                    (w / 2.0 + 1.0, 54.0),
-                    (w / 2.0 + 1.0, 80.0),
-                    (w / 2.0 - 1.0, 80.0),
-                ]);
-                let (l, r) = (cx.min(w / 2.0) - 1.0, cx.max(w / 2.0) + 1.0);
-                connectors.push(vec![(l, 79.0), (r, 79.0), (r, 81.0), (l, 81.0)]);
-                connectors.push(vec![
-                    (cx - 1.0, 80.0),
-                    (cx + 1.0, 80.0),
-                    (cx + 1.0, 110.0),
-                    (cx - 1.0, 110.0),
-                ]);
-                boxes.push((x, 110.0, 120.0, 44.0));
-            }
-            (w, 170.0)
-        }
-        _ => return None,
-    };
-    let (w, h) = (w.min(MAX_RASTER_SIDE), h.min(MAX_RASTER_SIDE));
-    let fx = effect_style(theme.effects);
-    let mut img = Img::new(dev(w), dev(h));
-    let grey = Color::rgb(0x9e, 0x9e, 0x9e);
-    if !connectors.is_empty() {
-        let mut list = mailcraft_layout::DisplayList::default();
-        for c in &connectors {
-            polygon_list(c, &mut list);
-        }
-        img.paint(&Mask::from_list(&list, dev(w), dev(h), &fonts), 1.0, &|_, _| grey);
-    }
-    // Each box is drawn on its own small canvas (box plus room for effects) and placed on the picture.
-    let m = EFFECT_MARGIN / 2.0;
-    for (i, (bx, by, bw, bh)) in boxes.iter().enumerate() {
-        let color = theme.color(crate::compose::ACCENT1 + i % 6);
-        let (lw, lh) = (bw + 2.0 * m, bh + 2.0 * m);
-        let mut list = mailcraft_layout::DisplayList::default();
-        polygon_list(&rounded_rect_pts(m, m, *bw, *bh, 6.0), &mut list);
-        let mask = Mask::from_list(&list, dev(lw), dev(lh), &fonts);
-        let at = (((bx - m).max(0.0) * RASTER_SCALE) as usize, ((by - m).max(0.0) * RASTER_SCALE) as usize);
-        composite(&mut img, at, &mask, color, &Effect { reflection: false, glow: None, ..fx });
-        let label = items.get(i).map(String::as_str).unwrap_or("");
-        let ts = TextStyle {
-            size_pt: Some(10.0),
-            font_family: Some(theme.body_font.clone()),
-            ..Default::default()
-        };
-        let (mut tl, x0, y0, tw, th) = text_list(label, &ts, &fonts);
-        if tw > 0.0 {
-            translate(&mut tl, m + (bw - tw.min(*bw - 6.0)) / 2.0 - x0, m + (bh - th) / 2.0 - y0);
-            let tm = Mask::from_list(&tl, dev(lw), dev(lh), &fonts);
-            let clip = mask.eroded(2);
-            let text_mask = tm.map(|x, y| tm.get(x, y).min(clip.get(x, y)));
-            img.paint_at(&text_mask, at, 1.0, &|_, _| Color::WHITE);
-        }
-    }
-    Some((img.to_png(), w, h))
-}
-
-/// Bundled icons: 48×48 SVG bodies drawn for MailCraft.
-fn icon_svg(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "check" => {
-            r##"<path d="M8 26 L20 38 L40 12" fill="none" stroke="#196b24" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>"##
-        }
-        "cross" => {
-            r##"<path d="M12 12 L36 36 M36 12 L12 36" stroke="#c00000" stroke-width="6" stroke-linecap="round"/>"##
-        }
-        "star" => {
-            r##"<polygon points="24,3 30,18 46,18 33,28 38,44 24,34 10,44 15,28 2,18 18,18" fill="#e9a800"/>"##
-        }
-        "heart" => {
-            r##"<path d="M24 42 C8 30 2 20 8 12 C14 4 22 8 24 14 C26 8 34 4 40 12 C46 20 40 30 24 42 Z" fill="#d13438"/>"##
-        }
-        "warning" => {
-            r##"<path d="M24 4 L46 44 H2 Z" fill="#f2c811"/><path d="M24 18 V30 M24 36 V38" stroke="#222" stroke-width="4" stroke-linecap="round"/>"##
-        }
-        "info" => {
-            r##"<circle cx="24" cy="24" r="21" fill="#0f6cbd"/><path d="M24 21 V35 M24 13 V15" stroke="#fff" stroke-width="5" stroke-linecap="round"/>"##
-        }
-        "mail" => {
-            r##"<rect x="3" y="10" width="42" height="28" rx="3" fill="#0f6cbd"/><path d="M5 13 L24 27 L43 13" fill="none" stroke="#fff" stroke-width="3"/>"##
-        }
-        "phone" => {
-            r##"<rect x="14" y="3" width="20" height="42" rx="4" fill="#424242"/><rect x="17" y="8" width="14" height="28" fill="#9fd3ff"/><circle cx="24" cy="40" r="2" fill="#fff"/>"##
-        }
-        "calendar" => {
-            r##"<rect x="4" y="8" width="40" height="36" rx="3" fill="#fff" stroke="#0f6cbd" stroke-width="3"/><rect x="4" y="8" width="40" height="10" fill="#0f6cbd"/><path d="M14 4 V12 M34 4 V12" stroke="#0f6cbd" stroke-width="3"/>"##
-        }
-        "clock" => {
-            r##"<circle cx="24" cy="24" r="20" fill="#fff" stroke="#424242" stroke-width="3"/><path d="M24 12 V24 L32 30" fill="none" stroke="#424242" stroke-width="3" stroke-linecap="round"/>"##
-        }
-        "person" => {
-            r##"<circle cx="24" cy="15" r="9" fill="#5b5fc7"/><path d="M6 44 C6 32 14 27 24 27 C34 27 42 32 42 44 Z" fill="#5b5fc7"/>"##
-        }
-        "home" => {
-            r##"<path d="M4 24 L24 6 L44 24 H38 V42 H10 V24 Z" fill="#196b24"/><rect x="20" y="30" width="8" height="12" fill="#fff"/>"##
-        }
-        "lightbulb" => {
-            r##"<path d="M24 4 C14 4 9 12 9 18 C9 26 16 29 17 35 H31 C32 29 39 26 39 18 C39 12 34 4 24 4 Z" fill="#f2c811"/><rect x="17" y="37" width="14" height="7" rx="2" fill="#616161"/>"##
-        }
-        "flag" => {
-            r##"<path d="M10 4 V44" stroke="#424242" stroke-width="3"/><path d="M11 6 H40 L33 15 L40 24 H11 Z" fill="#c00000"/>"##
-        }
-        "arrowRight" => {
-            r##"<path d="M4 24 H40 M28 12 L40 24 L28 36" fill="none" stroke="#0f6cbd" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>"##
-        }
-        "document" => {
-            r##"<path d="M10 3 H30 L40 13 V45 H10 Z" fill="#fff" stroke="#616161" stroke-width="2.5"/><path d="M30 3 V13 H40" fill="none" stroke="#616161" stroke-width="2.5"/><path d="M16 22 H34 M16 29 H34 M16 36 H28" stroke="#9e9e9e" stroke-width="2.5"/>"##
-        }
-        _ => return None,
-    })
-}
-
-const ICONS: &str = "check, cross, star, heart, warning, info, mail, phone, calendar, clock, person, home, lightbulb, flag, arrowRight, document";
-
+/// Insert › Icons: without `name` the Insert Icons dialog (every icon with its category); with it the icon
+/// as a PNG `size` px square (default 48) at the caret.
 fn icon(s: &mut Session, p: &Value) -> CmdResult {
     let Some(name) = opt_str(p, "name").map(str::to_owned) else {
-        return dialog(s, "icons", json!({"compose": compose_id(s, p)?, "available": ICONS}));
+        let all: Vec<Value> = icons::ICONS
+            .iter()
+            .map(|(id, label, cat, _)| json!({"id": id, "label": label, "category": cat}))
+            .collect();
+        return dialog(
+            s,
+            "icons",
+            json!({"compose": compose_id(s, p)?, "icons": all, "categories": icons::CATEGORIES}),
+        );
     };
-    let Some(body) = icon_svg(&name) else {
-        return Err(CmdError::Params(format!("unknown icon `{name}` (bundled: {ICONS})")));
+    let Some((id, label, ..)) = icons::find(&name) else {
+        return Err(CmdError::Params(format!(
+            "unknown icon `{name}` (bundled: {})",
+            icons::ICONS.iter().map(|i| i.0).collect::<Vec<_>>().join(", ")
+        )));
     };
-    let svg = format!("{}{body}</svg>", svg_open(48.0, 48.0));
+    let size = num_param(p, "size")?.unwrap_or(48.0).clamp(16.0, 512.0);
+    let png = icons::png(id, size * RASTER_SCALE)
+        .ok_or_else(|| CmdError::Failed("the icon could not be drawn".into()))?;
     let c = compose_mut(s, p)?;
-    let cid = put_svg(c, &name, svg, &name, 48.0, 48.0);
-    Ok(json!({"icon": name, "cid": cid}))
+    let cid = put_png(c, id, png, label, size, size)?;
+    Ok(json!({"icon": id, "cid": cid, "format": "png", "size": size}))
 }
 
-/// `[[label, value], …]` or `{"labels": [...], "values": [...]}`.
-fn chart_data(v: &Value) -> Option<Vec<(String, f64)>> {
-    let label = |x: &Value| x.as_str().map(str::to_owned).unwrap_or_else(|| x.to_string());
-    let out: Vec<(String, f64)> = if let Some(rows) = v.as_array() {
-        rows.iter()
-            .filter_map(|r| {
-                let r = r.as_array()?;
-                Some((label(r.first()?), r.get(1)?.as_f64()?))
-            })
-            .collect()
-    } else {
-        let labels = v.get("labels")?.as_array()?;
-        let values = v.get("values")?.as_array()?;
-        labels.iter().zip(values).filter_map(|(l, x)| Some((label(l), x.as_f64()?))).collect()
-    };
-    let out: Vec<(String, f64)> = out.into_iter().filter(|(_, x)| x.is_finite()).take(100).collect();
-    (!out.is_empty()).then_some(out)
+/// The recipe of generated picture `cid` of `kind` in compose `c`, if any.
+fn recipe(c: &ComposeState, cid: &str, kind: &str) -> Option<Value> {
+    c.generated
+        .iter()
+        .rev()
+        .find(|g| g.content_id.eq_ignore_ascii_case(cid) && g.kind == kind)
+        .map(|g| g.spec.clone())
 }
 
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn chart_svg(kind: &str, title: &str, data: &[(String, f64)]) -> Option<String> {
-    let (w, h) = (480.0f32, 300.0f32);
-    let mut svg = svg_open(w, h);
-    svg.push_str(r##"<rect width="480" height="300" fill="#ffffff"/>"##);
-    let _ = write!(
-        svg,
-        r##"<text x="240" y="22" font-family="sans-serif" font-size="15" text-anchor="middle" fill="#222">{}</text>"##,
-        esc(title)
-    );
-    let n = data.len().max(1) as f32;
-    let max = data.iter().map(|(_, v)| *v).fold(0.0f64, f64::max).max(f64::MIN_POSITIVE) as f32;
-    let (left, top, right, bottom) = (50.0f32, 36.0f32, 460.0f32, 260.0f32);
-    let color = |i: usize| PALETTE.get(i % PALETTE.len()).copied().unwrap_or("#156082");
-    match kind {
-        "column" | "bar" => {
-            let _ =
-                write!(svg, r##"<path d="M{left} {top} V{bottom} H{right}" stroke="#888" fill="none"/>"##);
-            if kind == "column" {
-                let slot = (right - left) / n;
-                for (i, (l, v)) in data.iter().enumerate() {
-                    let bh = ((*v as f32).max(0.0) / max) * (bottom - top);
-                    let x = left + slot * i as f32 + slot * 0.15;
-                    let _ = write!(
-                        svg,
-                        r#"<rect x="{x:.1}" y="{:.1}" width="{:.1}" height="{bh:.1}" fill="{}"/>"#,
-                        bottom - bh,
-                        slot * 0.7,
-                        color(0)
-                    );
-                    let _ = write!(
-                        svg,
-                        r##"<text x="{:.1}" y="{:.1}" font-family="sans-serif" font-size="11" text-anchor="middle" fill="#444">{}</text>"##,
-                        x + slot * 0.35,
-                        bottom + 16.0,
-                        esc(l)
-                    );
+/// Replaces generated picture `old` in the body with a new one (`png`, `w`×`h` px, `alt`) drawn from
+/// `spec`, as one undo step; the old picture and recipe stay for Undo. Returns the new content id.
+fn replace_picture(
+    c: &mut ComposeState,
+    old: &str,
+    name: &str,
+    png: Vec<u8>,
+    alt: &str,
+    (w, h): (f32, f32),
+    kind: &str,
+    spec: Value,
+) -> String {
+    c.checkpoint();
+    let cid = c.next_content_id();
+    c.inline_images.push(InlineImage {
+        content_id: cid.clone(),
+        filename: format!("{name}.png"),
+        mime_type: "image/png".into(),
+        data: png,
+    });
+    retarget_images(&mut c.body.blocks, old, &cid, alt, w, h);
+    c.dirty = true;
+    remember_generated(c, &cid, kind, spec);
+    cid
+}
+
+/// Points every `cid:old` picture in `blocks` at `cid:new` with a new alt text and size.
+fn retarget_images(blocks: &mut [Block], old: &str, new: &str, alt_text: &str, w: f32, h: f32) {
+    fn inlines(list: &mut [Inline], old: &str, new: &str, alt_text: &str, w: f32, h: f32) {
+        for i in list {
+            match i {
+                Inline::Image { src, alt, width, height }
+                    if src.strip_prefix("cid:").is_some_and(|c| c.eq_ignore_ascii_case(old)) =>
+                {
+                    *src = format!("cid:{new}");
+                    *alt = alt_text.to_owned();
+                    *width = Some(w);
+                    *height = Some(h);
                 }
-            } else {
-                let slot = (bottom - top) / n;
-                for (i, (l, v)) in data.iter().enumerate() {
-                    let bw = ((*v as f32).max(0.0) / max) * (right - left);
-                    let y = top + slot * i as f32 + slot * 0.15;
-                    let _ = write!(
-                        svg,
-                        r#"<rect x="{left}" y="{y:.1}" width="{bw:.1}" height="{:.1}" fill="{}"/>"#,
-                        slot * 0.7,
-                        color(0)
-                    );
-                    let _ = write!(
-                        svg,
-                        r##"<text x="{:.1}" y="{:.1}" font-family="sans-serif" font-size="11" text-anchor="end" fill="#444">{}</text>"##,
-                        left - 4.0,
-                        y + slot * 0.45,
-                        esc(l)
-                    );
-                }
+                Inline::Link { children, .. } => inlines(children, old, new, alt_text, w, h),
+                _ => {}
             }
         }
-        "line" => {
-            let _ =
-                write!(svg, r##"<path d="M{left} {top} V{bottom} H{right}" stroke="#888" fill="none"/>"##);
-            let step = if data.len() > 1 { (right - left) / (n - 1.0) } else { 0.0 };
-            let mut d = String::new();
-            for (i, (l, v)) in data.iter().enumerate() {
-                let x = left + step * i as f32;
-                let y = bottom - ((*v as f32).max(0.0) / max) * (bottom - top);
-                let _ = write!(d, "{}{x:.1} {y:.1} ", if i == 0 { "M" } else { "L" });
-                let _ = write!(svg, r#"<circle cx="{x:.1}" cy="{y:.1}" r="3" fill="{}"/>"#, color(0));
-                let _ = write!(
-                    svg,
-                    r##"<text x="{x:.1}" y="{:.1}" font-family="sans-serif" font-size="11" text-anchor="middle" fill="#444">{}</text>"##,
-                    bottom + 16.0,
-                    esc(l)
-                );
-            }
-            let _ = write!(svg, r#"<path d="{d}" stroke="{}" stroke-width="2.5" fill="none"/>"#, color(0));
-        }
-        "pie" => {
-            let total: f64 = data.iter().map(|(_, v)| v.max(0.0)).sum();
-            if total <= 0.0 {
-                return None;
-            }
-            let (cx, cy, r) = (170.0f32, 155.0f32, 105.0f32);
-            let mut a0 = -std::f32::consts::FRAC_PI_2;
-            for (i, (l, v)) in data.iter().enumerate() {
-                let frac = (v.max(0.0) / total) as f32;
-                let a1 = a0 + frac * std::f32::consts::TAU;
-                let large = i32::from(frac > 0.5);
-                if frac >= 0.9999 {
-                    let _ = write!(svg, r#"<circle cx="{cx}" cy="{cy}" r="{r}" fill="{}"/>"#, color(i));
-                } else if frac > 0.0 {
-                    let _ = write!(
-                        svg,
-                        r#"<path d="M{cx} {cy} L{:.1} {:.1} A{r} {r} 0 {large} 1 {:.1} {:.1} Z" fill="{}"/>"#,
-                        cx + r * a0.cos(),
-                        cy + r * a0.sin(),
-                        cx + r * a1.cos(),
-                        cy + r * a1.sin(),
-                        color(i)
-                    );
-                }
-                let ly = 60.0 + 20.0 * i as f32;
-                let _ = write!(
-                    svg,
-                    r#"<rect x="310" y="{:.1}" width="12" height="12" fill="{}"/>"#,
-                    ly - 10.0,
-                    color(i)
-                );
-                let _ = write!(
-                    svg,
-                    r##"<text x="328" y="{ly:.1}" font-family="sans-serif" font-size="12" fill="#333">{}</text>"##,
-                    esc(l)
-                );
-                a0 = a1;
-            }
-        }
-        _ => return None,
     }
-    svg.push_str("</svg>");
-    Some(svg)
+    for b in blocks {
+        match b {
+            Block::Paragraph { inlines: l, .. } | Block::Heading { inlines: l, .. } => {
+                inlines(l, old, new, alt_text, w, h)
+            }
+            Block::List { items, .. } => {
+                items.iter_mut().for_each(|it| retarget_images(it, old, new, alt_text, w, h))
+            }
+            Block::Quote { blocks } | Block::Container { blocks, .. } => {
+                retarget_images(blocks, old, new, alt_text, w, h)
+            }
+            Block::Table { rows, .. } => rows
+                .iter_mut()
+                .flatten()
+                .for_each(|cell| retarget_images(&mut cell.blocks, old, new, alt_text, w, h)),
+            Block::Pre { .. } | Block::Rule => {}
+        }
+    }
 }
 
+/// Whether picture `cid` is still in the body.
+fn in_body(c: &ComposeState, cid: &str) -> bool {
+    c.images().iter().any(|(src, _)| src.strip_prefix("cid:").is_some_and(|x| x.eq_ignore_ascii_case(cid)))
+}
+
+/// Insert › Chart. Without data the chart dialog (data sheet) opens; with `sheet`, `series` or `data` the
+/// chart is drawn to PNG and inserted, keeping its recipe. `edit` names a chart picture already in the body:
+/// without data its data opens in the dialog, with data the chart is redrawn in place.
 fn chart(s: &mut Session, p: &Value) -> CmdResult {
-    let kind = opt_str(p, "kind").unwrap_or("column").to_owned();
-    if !matches!(kind.as_str(), "column" | "bar" | "line" | "pie") {
-        return Err(CmdError::Params(format!("unknown chart kind `{kind}` (column, bar, line, pie)")));
+    let cid = compose_id(s, p)?;
+    let edit = opt_str(p, "edit").map(str::to_owned);
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let theme = c.theme_resolved();
+    if let Some(e) = &edit
+        && (recipe(c, e, "chart").is_none() || !in_body(c, e))
+    {
+        return Err(CmdError::Params(format!("`{e}` is not a chart in this message")));
     }
-    let Some(data) = p.get("data").and_then(chart_data) else {
-        return dialog(s, "insertChart", json!({"compose": compose_id(s, p)?, "kind": kind}));
+    let spec = chart::ChartSpec::from_params(p).map_err(CmdError::Params)?;
+    let Some(spec) = spec else {
+        let current = edit.as_deref().and_then(|e| recipe(c, e, "chart"));
+        let kind = opt_str(p, "kind").and_then(chart::ChartSpec::kind_id).unwrap_or("column");
+        let kinds: Vec<Value> =
+            chart::KINDS.iter().map(|(id, label)| json!({"id": id, "label": label})).collect();
+        return dialog(
+            s,
+            "insertChart",
+            json!({"compose": cid, "kind": kind, "edit": edit, "chart": current, "kinds": kinds}),
+        );
     };
-    let title = opt_str(p, "title").unwrap_or("").to_owned();
-    let svg = chart_svg(&kind, &title, &data)
-        .ok_or_else(|| CmdError::Params("the chart has nothing to show".into()))?;
-    let alt = if title.is_empty() { format!("{kind} chart") } else { title };
+    let png =
+        chart::png(&spec, &theme).ok_or_else(|| CmdError::Params("the chart has nothing to show".into()))?;
+    let alt = if spec.title.is_empty() { format!("{} chart", spec.label()) } else { spec.title.clone() };
+    let recipe_value = serde_json::to_value(&spec).unwrap_or(Value::Null);
     let c = compose_mut(s, p)?;
-    let cid = put_svg(c, "chart", svg, &alt, 480.0, 300.0);
-    Ok(json!({"chart": kind, "points": data.len(), "cid": cid}))
+    let size = (spec.width, spec.height);
+    let pic = match &edit {
+        Some(old) => replace_picture(c, old, "chart", png, &alt, size, "chart", recipe_value),
+        None => {
+            let pic = put_png(c, "chart", png, &alt, size.0, size.1)?;
+            remember_generated(c, &pic, "chart", recipe_value);
+            pic
+        }
+    };
+    Ok(
+        json!({"chart": spec.kind, "points": spec.categories.len(), "series": spec.series.len(), "cid": pic, "format": "png", "edited": edit.is_some()}),
+    )
 }
 
-fn smart_art(s: &mut Session, p: &Value) -> CmdResult {
-    let layout = opt_str(p, "layout").map(str::to_owned);
-    let items: Vec<String> = p
-        .get("items")
+/// SmartArt items from `items` (strings; leading tabs or pairs of spaces give the level).
+fn smart_items(p: &Value) -> Vec<String> {
+    p.get("items")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(|t| t.chars().take(80).collect()).take(30).collect())
-        .unwrap_or_default();
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| {
+                    let level = smartart::level_of(t);
+                    format!("{}{}", "\t".repeat(level), t.trim().chars().take(80).collect::<String>())
+                })
+                .take(smartart::MAX_ITEMS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Insert › SmartArt: without a layout and items the SmartArt dialog (layout gallery and text pane); with
+/// them the graphic as PNG. `edit` names a SmartArt picture of the body: its layout and text open in the
+/// dialog, or with new ones it is redrawn in place.
+fn smart_art(s: &mut Session, p: &Value) -> CmdResult {
+    let cid = compose_id(s, p)?;
+    let edit = opt_str(p, "edit").map(str::to_owned);
+    let layout = opt_str(p, "layout").map(str::to_owned);
+    let items = smart_items(p);
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    if let Some(e) = &edit
+        && (recipe(c, e, "smartArt").is_none() || !in_body(c, e))
+    {
+        return Err(CmdError::Params(format!("`{e}` is not a SmartArt graphic in this message")));
+    }
     let (Some(layout), false) = (layout, items.is_empty()) else {
+        let current = edit.as_deref().and_then(|e| recipe(c, e, "smartArt"));
+        let layouts: Vec<Value> = smartart::LAYOUTS
+            .iter()
+            .map(|(id, label, cat)| json!({"id": id, "label": label, "category": cat}))
+            .collect();
         return dialog(
             s,
             "smartArt",
-            json!({"compose": compose_id(s, p)?, "layouts": ["list", "process", "cycle", "hierarchy"]}),
+            json!({"compose": cid, "layouts": layouts, "edit": edit, "current": current}),
         );
     };
-    if !matches!(layout.as_str(), "list" | "process" | "cycle" | "hierarchy") {
-        return Err(CmdError::Params(format!("unknown layout `{layout}` (list, process, cycle, hierarchy)")));
-    }
-    let cid = compose_id(s, p)?;
-    let theme = s
-        .composes
-        .get(&cid)
-        .map(ComposeState::theme_resolved)
-        .ok_or_else(|| CmdError::Disabled("no compose".into()))?;
-    let Some((png, w, h)) = smart_art_png(&layout, &items, &theme) else {
+    let Some(layout) = smartart::layout_id(&layout) else {
+        return Err(CmdError::Params(format!(
+            "unknown layout `{layout}` ({})",
+            smartart::LAYOUTS.iter().map(|l| l.0).collect::<Vec<_>>().join(", ")
+        )));
+    };
+    let theme = c.theme_resolved();
+    let Some((png, w, h)) = smartart::png(layout, &items, &theme) else {
         return Err(CmdError::Failed("the SmartArt graphic could not be drawn".into()));
     };
-    let alt = items.join(", ");
+    let alt = items.iter().map(|i| i.trim()).collect::<Vec<_>>().join(", ");
+    let spec = json!({"layout": layout, "items": items});
     let c = compose_mut(s, p)?;
-    let cid = put_png(c, "smartart", png, &alt, w, h)?;
-    remember_generated(c, &cid, "smartArt", json!({"layout": layout, "items": items}));
-    Ok(json!({"layout": layout, "items": items.len(), "cid": cid, "format": "png"}))
+    let pic = match &edit {
+        Some(old) => replace_picture(c, old, "smartart", png, &alt, (w, h), "smartArt", spec),
+        None => {
+            let pic = put_png(c, "smartart", png, &alt, w, h)?;
+            remember_generated(c, &pic, "smartArt", spec);
+            pic
+        }
+    };
+    Ok(json!({"layout": layout, "items": items.len(), "cid": pic, "format": "png", "edited": edit.is_some()}))
 }
 
-/// Parses OBJ / ASCII STL / binary STL into (vertices, edges).
+/// Opens the editor of a generated picture (a double-click on it in the body): the chart's data sheet,
+/// the SmartArt text pane or the 3D model's view. An error for other pictures.
+fn edit_picture(s: &mut Session, p: &Value) -> CmdResult {
+    let pic = req_str(p, "cid")?.trim_start_matches("cid:").to_owned();
+    let cid = compose_id(s, p)?;
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let kind = c
+        .generated
+        .iter()
+        .rev()
+        .find(|g| g.content_id.eq_ignore_ascii_case(&pic))
+        .map(|g| g.kind.clone())
+        .filter(|_| in_body(c, &pic))
+        .ok_or_else(|| CmdError::Params("this picture cannot be edited".into()))?;
+    let q = json!({"compose": cid, "edit": pic});
+    match kind.as_str() {
+        "chart" => chart(s, &q),
+        "smartArt" => smart_art(s, &q),
+        "model3d" => model3d(s, &q),
+        _ => Err(CmdError::Params("this picture cannot be edited".into())),
+    }
+}
+
+/// Parses OBJ, STL (text or binary), PLY (text) or glTF / GLB into (vertices, edges).
 pub fn parse_model(data: &[u8]) -> Option<(Vec<[f64; 3]>, Vec<(usize, usize)>)> {
+    if data.starts_with(b"glTF")
+        || (data.trim_ascii_start().starts_with(b"{") && data.windows(7).any(|w| w == b"\"asset\""))
+    {
+        return gltf::parse(data);
+    }
     const MAX_VERTS: usize = 300_000;
     const MAX_EDGES: usize = 600_000;
     let mut verts: Vec<[f64; 3]> = Vec::new();
@@ -1568,6 +1544,45 @@ pub fn parse_model(data: &[u8]) -> Option<(Vec<[f64; 3]>, Vec<(usize, usize)>)> 
                 if k.is_multiple_of(3) && edges.len() < MAX_EDGES {
                     let (a, b, c) = (k - 3, k - 2, k - 1);
                     edges.extend([(a, b), (b, c), (c, a)]);
+                }
+            }
+        }
+    } else if let Some(t) = text
+        && t.starts_with("ply")
+    {
+        // PLY (text form): a header naming the vertex and face counts, then one vertex per line (x y z
+        // first) and one face per line (count, then vertex indexes).
+        let mut lines = t.lines();
+        let (mut nv, mut nf) = (0usize, 0usize);
+        for line in lines.by_ref() {
+            let mut it = line.split_whitespace();
+            match (it.next(), it.next(), it.next()) {
+                (Some("format"), Some(f), _) if f != "ascii" => return None,
+                (Some("element"), Some("vertex"), Some(n)) => nv = n.parse().ok()?,
+                (Some("element"), Some("face"), Some(n)) => nf = n.parse().ok()?,
+                (Some("end_header"), ..) => break,
+                _ => {}
+            }
+        }
+        for line in lines.by_ref().take(nv.min(MAX_VERTS)) {
+            if let Some(v) = nums(&mut line.split_whitespace()) {
+                verts.push(v);
+            }
+        }
+        for line in lines.take(nf) {
+            let idx: Vec<usize> = line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|tok| tok.parse::<usize>().ok().filter(|k| *k < verts.len()))
+                .collect();
+            // Each side of the face (a two-index face is one edge, not two).
+            let sides = if idx.len() > 2 { idx.len() } else { idx.len().saturating_sub(1) };
+            for k in 0..sides {
+                if let (Some(a), Some(b)) = (idx.get(k), idx.get((k + 1) % idx.len()))
+                    && edges.len() < MAX_EDGES
+                    && a != b
+                {
+                    edges.push((*a, *b));
                 }
             }
         }
@@ -1630,10 +1645,59 @@ pub fn parse_model(data: &[u8]) -> Option<(Vec<[f64; 3]>, Vec<(usize, usize)>)> 
     (!verts.is_empty() && !edges.is_empty()).then_some((verts, edges))
 }
 
-/// Wireframe of a model, projected isometrically into a `size`×`size` SVG.
-#[allow(clippy::cast_possible_truncation)]
-pub fn model_svg(verts: &[[f64; 3]], edges: &[(usize, usize)], size: f32) -> String {
-    let (ay, ax) = (35f64.to_radians(), 25f64.to_radians());
+/// Most model edges kept with a 3D model picture (so it can be turned later); more are sampled.
+const MAX_MODEL_EDGES: usize = 3_000;
+
+/// The model fitted into a unit cube around the origin, with at most [`MAX_MODEL_EDGES`] edges (sampled
+/// evenly) and only the vertices they use.
+fn model_recipe(verts: &[[f64; 3]], edges: &[(usize, usize)]) -> (Vec<[f64; 3]>, Vec<(usize, usize)>) {
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for v in verts {
+        for ((l, h), x) in lo.iter_mut().zip(hi.iter_mut()).zip(v) {
+            *l = l.min(*x);
+            *h = h.max(*x);
+        }
+    }
+    let span = lo.iter().zip(&hi).map(|(l, h)| h - l).fold(0.0f64, f64::max).max(f64::MIN_POSITIVE);
+    let mid = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+    let stride = edges.len().div_ceil(MAX_MODEL_EDGES).max(1);
+    let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut out_v: Vec<[f64; 3]> = Vec::new();
+    let mut out_e = Vec::new();
+    let mut keep = |i: usize, out_v: &mut Vec<[f64; 3]>| -> Option<usize> {
+        if let Some(k) = map.get(&i) {
+            return Some(*k);
+        }
+        let v = verts.get(i)?;
+        let round = |x: f64| (x * 1000.0).round() / 1000.0;
+        out_v.push([
+            round((v[0] - mid[0]) / span),
+            round((v[1] - mid[1]) / span),
+            round((v[2] - mid[2]) / span),
+        ]);
+        map.insert(i, out_v.len() - 1);
+        Some(out_v.len() - 1)
+    };
+    for (a, b) in edges.iter().step_by(stride) {
+        if let (Some(a), Some(b)) = (keep(*a, &mut out_v), keep(*b, &mut out_v)) {
+            out_e.push((a, b));
+        }
+    }
+    (out_v, out_e)
+}
+
+/// Wireframe of a model turned `yaw` degrees about the vertical axis and tilted `pitch` degrees towards the
+/// viewer, drawn in `color` on white as a `size`-px square PNG.
+pub fn model_png(
+    verts: &[[f64; 3]],
+    edges: &[(usize, usize)],
+    size: f32,
+    yaw: f32,
+    pitch: f32,
+    color: Color,
+) -> Option<Vec<u8>> {
+    let size = if size.is_finite() { size.clamp(64.0, 800.0) } else { 320.0 };
+    let (ay, ax) = (f64::from(yaw).to_radians(), f64::from(pitch).to_radians());
     let proj: Vec<(f64, f64)> = verts
         .iter()
         .map(|[x, y, z]| {
@@ -1651,41 +1715,104 @@ pub fn model_svg(verts: &[[f64; 3]], edges: &[(usize, usize)], size: f32) -> Str
         maxy = maxy.max(*y);
     }
     let span = (maxx - minx).max(maxy - miny).max(f64::MIN_POSITIVE);
-    let margin = 8.0;
+    let margin = 8.0f64;
     let scale = (f64::from(size) - 2.0 * margin) / span;
-    let mut d = String::new();
-    // Keep the SVG reasonably small: sample edges beyond 20k.
+    let (ox, oy) = (
+        margin + (f64::from(size) - 2.0 * margin - (maxx - minx) * scale) / 2.0,
+        margin + (f64::from(size) - 2.0 * margin - (maxy - miny) * scale) / 2.0,
+    );
+    let mut list = mailcraft_layout::DisplayList::default();
     let stride = (edges.len() / 20_000).max(1);
     for (a, b) in edges.iter().step_by(stride) {
         let (Some(pa), Some(pb)) = (proj.get(*a), proj.get(*b)) else {
             continue;
         };
-        let _ = write!(
-            d,
-            "M{:.1} {:.1}L{:.1} {:.1}",
-            margin + (pa.0 - minx) * scale,
-            margin + (pa.1 - miny) * scale,
-            margin + (pb.0 - minx) * scale,
-            margin + (pb.1 - miny) * scale
-        );
+        let pt = |p: &(f64, f64)| {
+            mailcraft_geom::Point::new((ox + (p.0 - minx) * scale) as f32, (oy + (p.1 - miny) * scale) as f32)
+        };
+        list.items.push(mailcraft_layout::DisplayItem::Line { from: pt(pa), to: pt(pb), color, width: 0.8 });
     }
-    format!(
-        r##"{}<rect width="{size}" height="{size}" fill="#ffffff"/><path d="{d}" stroke="#156082" stroke-width="0.8" fill="none"/></svg>"##,
-        svg_open(size, size)
+    let fonts = mailcraft_fonts::FontDb::bundled();
+    let d = u32::try_from(dev(size)).ok()?;
+    let png = mailcraft_render::render(&list, &fonts, d, d, RASTER_SCALE, Color::WHITE, &|_| None).to_png();
+    (!png.is_empty()).then_some(png)
+}
+
+/// Draws a 3D model recipe (`verts`, `edges`, `yaw`, `pitch`, `size`) in the theme's first accent.
+fn model_recipe_png(spec: &Value, theme: &crate::compose::ResolvedTheme) -> Option<Vec<u8>> {
+    let verts: Vec<[f64; 3]> = serde_json::from_value(spec.get("verts")?.clone()).ok()?;
+    let edges: Vec<(usize, usize)> = serde_json::from_value(spec.get("edges")?.clone()).ok()?;
+    let f = |k: &str, d: f32| spec.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32);
+    model_png(
+        &verts,
+        &edges,
+        f("size", 320.0),
+        f("yaw", 35.0),
+        f("pitch", 25.0),
+        theme.color(crate::compose::ACCENT1),
     )
 }
 
+/// Insert › 3D Models: an OBJ, STL, PLY or glTF model as a wireframe picture (PNG) that can be turned later:
+/// `edit` names a model picture of the body; without `yaw` / `pitch` its view opens in the 3D Model Views
+/// dialog, with them it is drawn again turned that way.
 fn model3d(s: &mut Session, p: &Value) -> CmdResult {
+    let cid = compose_id(s, p)?;
+    if let Some(old) = opt_str(p, "edit").map(str::to_owned) {
+        let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+        let mut spec = recipe(c, &old, "model3d")
+            .filter(|_| in_body(c, &old))
+            .ok_or_else(|| CmdError::Params(format!("`{old}` is not a 3D model in this message")))?;
+        let (yaw, pitch) = (num_param(p, "yaw")?, num_param(p, "pitch")?);
+        if yaw.is_none() && pitch.is_none() {
+            let f = |k: &str, d: f64| spec.get(k).and_then(Value::as_f64).unwrap_or(d);
+            return dialog(
+                s,
+                "model3dView",
+                json!({"compose": cid, "edit": old, "yaw": f("yaw", 35.0), "pitch": f("pitch", 25.0)}),
+            );
+        }
+        if let Some(o) = spec.as_object_mut() {
+            if let Some(y) = yaw {
+                o.insert("yaw".into(), json!(y.rem_euclid(360.0)));
+            }
+            if let Some(pt) = pitch {
+                o.insert("pitch".into(), json!(pt.clamp(-90.0, 90.0)));
+            }
+        }
+        let theme = c.theme_resolved();
+        let alt = c
+            .images()
+            .into_iter()
+            .find(|(src, _)| src.strip_prefix("cid:").is_some_and(|x| x.eq_ignore_ascii_case(&old)))
+            .map(|(_, alt)| alt)
+            .unwrap_or_default();
+        let png = model_recipe_png(&spec, &theme)
+            .ok_or_else(|| CmdError::Failed("the model could not be drawn".into()))?;
+        let size = spec.get("size").and_then(Value::as_f64).unwrap_or(320.0) as f32;
+        let c = compose_mut(s, p)?;
+        let pic = replace_picture(c, &old, "model", png, &alt, (size, size), "model3d", spec);
+        return Ok(json!({"cid": pic, "edited": true}));
+    }
     let Some((name, data)) = file_param(p, MAX_MODEL_BYTES)? else {
-        return dialog(s, "insert3dModel", json!({"compose": compose_id(s, p)?}));
+        return dialog(s, "insert3dModel", json!({"compose": cid}));
     };
     let Some((verts, edges)) = parse_model(&data) else {
-        return Err(CmdError::Failed(format!("{name}: only OBJ and STL models can be shown")));
+        return Err(CmdError::Failed(format!("{name}: only OBJ, STL, PLY and glTF models can be shown")));
     };
-    let svg = model_svg(&verts, &edges, 320.0);
+    let (rv, re) = model_recipe(&verts, &edges);
+    let spec = json!({"verts": rv, "edges": re, "yaw": 35.0, "pitch": 25.0, "size": 320.0});
+    let theme = s
+        .composes
+        .get(&cid)
+        .map(ComposeState::theme_resolved)
+        .ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let png = model_recipe_png(&spec, &theme)
+        .ok_or_else(|| CmdError::Failed("the model could not be drawn".into()))?;
     let c = compose_mut(s, p)?;
-    let cid = put_svg(c, &name, svg, &name, 320.0, 320.0);
-    Ok(json!({"inserted": name, "vertices": verts.len(), "edges": edges.len(), "cid": cid}))
+    let pic = put_png(c, "model", png, &name, 320.0, 320.0)?;
+    remember_generated(c, &pic, "model3d", spec);
+    Ok(json!({"inserted": name, "vertices": verts.len(), "edges": edges.len(), "cid": pic, "format": "png"}))
 }
 
 /// What Screenshot offers when nothing can capture the screen (the engine cannot; the desktop app captures
@@ -1778,8 +1905,44 @@ fn table(s: &mut Session, p: &Value) -> CmdResult {
 /// Draw Table: the drawing pad (dialog) sends the column widths it drew (`widths`, px) and the number of
 /// rows; this makes that table, each column as wide as drawn.
 fn draw_table(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(action) = opt_str(p, "action") {
+        // The table pencil and eraser in the body (see `table_draw`).
+        let erase = match action {
+            "stroke" => false,
+            "erase" => true,
+            other => {
+                return Err(CmdError::Params(format!("unknown Draw Table action `{other}` (stroke, erase)")));
+            }
+        };
+        let path: Vec<usize> = p
+            .get("path")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter().filter_map(Value::as_u64).filter_map(|n| usize::try_from(n).ok()).take(64).collect()
+            })
+            .ok_or_else(|| CmdError::Params("`path` (where the stroke started) required".into()))?;
+        let offset =
+            p.get("offset").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
+        let (dx, dy) = (num_param(p, "dx")?.unwrap_or(0.0), num_param(p, "dy")?.unwrap_or(0.0));
+        let c = compose_mut(s, p)?;
+        let done = table_draw::stroke(c, DocPos::new(path, offset), dx, dy, erase);
+        let what = match done {
+            table_draw::Drawn::NewTable => "newTable",
+            table_draw::Drawn::Split => "split",
+            table_draw::Drawn::Merged => "merged",
+            table_draw::Drawn::Nothing => "nothing",
+        };
+        return Ok(json!({"drawn": what, "caret": caret(c)}));
+    }
     let Some(widths) = p.get("widths") else {
-        return dialog(s, "drawTable", json!({"compose": compose_id(s, p)?}));
+        if opt_bool(p, "pad") == Some(true) {
+            return dialog(s, "drawTable", json!({"compose": compose_id(s, p)?}));
+        }
+        // The pencil: strokes in the body draw tables and split cells (Esc puts it away).
+        let c = compose_mut(s, p)?;
+        c.draw_tool = Some("tablePencil".into());
+        c.selected_drawing = None;
+        return Ok(json!({"armed": "tablePencil"}));
     };
     let widths: Vec<f32> = widths
         .as_array()
@@ -1868,45 +2031,61 @@ fn horizontal_line(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"inserted": "rule"}))
 }
 
+/// Insert › Text Box: a floating text box. `simple` and `sidebar` are the built-in boxes; `draw` arms the
+/// text box tool (the next drag in the body draws one) unless `x`, `y` (and `w`, `h`) say where it goes;
+/// `saved:<name>` inserts a box saved to the Text Box gallery.
 fn text_box(s: &mut Session, p: &Value) -> CmdResult {
     let preset = opt_str(p, "preset").unwrap_or("simple");
-    if preset == "draw" {
-        return dialog(s, "drawTextBox", json!({"compose": compose_id(s, p)?}));
-    }
     if let Some(name) = preset.strip_prefix("saved:") {
         return insert_building_block(s, p, "textBoxes", name);
     }
-    if !matches!(preset, "simple" | "sidebar") {
+    if !matches!(preset, "simple" | "sidebar" | "draw") {
         return Err(CmdError::Params(format!(
             "unknown text box `{preset}` (simple, sidebar, draw, saved:<name>)"
         )));
     }
-    let text = opt_str(p, "text").unwrap_or("").to_owned();
-    let c = compose_mut(s, p)?;
-    c.checkpoint();
-    let block = if preset == "sidebar" {
+    let at = point_param(p)?;
+    let (w, h) = (num_param(p, "w")?, num_param(p, "h")?);
+    let vertical = opt_bool(p, "vertical") == Some(true);
+    if preset == "draw" && at.is_none() {
+        let tool = if vertical { "verticalTextBox" } else { "textBox" };
+        let c = compose_mut(s, p)?;
+        c.draw_tool = Some(tool.into());
+        c.selected_drawing = None;
+        return Ok(json!({"armed": tool}));
+    }
+    let text = opt_str(p, "text").unwrap_or("").replace("\r\n", "\n");
+    let cid = compose_id(s, p)?;
+    let theme = s
+        .composes
+        .get(&cid)
+        .map(ComposeState::theme_resolved)
+        .ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let mut d = drawing::new_text_box(&theme, &text);
+    d.vertical = vertical;
+    if preset == "sidebar" {
         // A shaded, borderless side panel in a light tint of the accent colour, its text in the accent.
-        let accent = c.theme_resolved().color(crate::compose::ACCENT1);
-        let para = Block::Paragraph {
-            style: ParaStyle::default(),
-            inlines: vec![Inline::Text {
-                text: if text.is_empty() { "Sidebar".into() } else { text.clone() },
-                style: TextStyle { italic: Some(true), color: Some(accent), ..Default::default() },
-            }],
-        };
-        let cell = TableCell {
-            blocks: vec![para],
-            width_px: Some(200.0),
-            background: Some(lighten(accent, 0.85)),
-            ..table_cell("")
-        };
-        Block::Table { borders: None, rows: vec![vec![cell]], border: false, width_px: Some(200.0) }
-    } else {
-        let cell = TableCell { width_px: Some(240.0), ..table_cell(&text) };
-        Block::Table { borders: None, rows: vec![vec![cell]], border: true, width_px: Some(240.0) }
-    };
-    c.insert_blocks(vec![block]);
-    Ok(json!({"textBox": preset, "caret": caret(c)}))
+        let accent = theme.color(crate::compose::ACCENT1);
+        d.fill = Some(lighten(accent, 0.85));
+        d.outline = None;
+        d.text_style = TextStyle { italic: Some(true), color: Some(accent), ..Default::default() };
+        d.w = 200.0;
+        d.h = 240.0;
+        if d.text.is_empty() {
+            d.text = "Sidebar".into();
+        }
+    }
+    if let Some(w) = w {
+        d.w = w;
+    }
+    if let Some(h) = h {
+        d.h = h;
+    }
+    let c = compose_mut(s, p)?;
+    let id = drawing::add(c, d, at, true).map_err(CmdError::Failed)?;
+    let d = c.body.drawings.iter().find(|d| d.id == id).cloned().unwrap_or_default();
+    // The editor puts the caret in a new box.
+    Ok(json!({"textBox": preset, "drawing": id, "editText": true, "x": d.x, "y": d.y, "w": d.w, "h": d.h}))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -2837,30 +3016,43 @@ fn edit_block(s: &mut Session, p: &Value, cid: u64, gallery: Option<&str>, name:
 
 /// WordArt: the selected text (or `text`, or "Your text here") drawn in the chosen style with the theme's
 /// heading font and colours, inserted as a picture in place of the selection.
+/// Insert › WordArt: the selected text (or "Your text here", ready to type over) as a floating WordArt
+/// object in `style`. Its text stays editable; the selection leaves the body in the same undo step.
 fn word_art(s: &mut Session, p: &Value) -> CmdResult {
-    let style = req_str(p, "style")?.to_owned();
+    let style: String = req_str(p, "style")?.trim().chars().take(300).collect();
+    let at = point_param(p)?;
     let cid = compose_id(s, p)?;
     let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
     let theme = c.theme_resolved();
     let selected = (!c.selection.is_collapsed()).then(|| c.selected_text());
-    let text: String = opt_str(p, "text")
-        .map(str::to_owned)
-        .or(selected)
-        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|t| !t.is_empty())
+    let given = opt_str(p, "text").map(str::to_owned).or(selected);
+    let placeholder = given.as_deref().is_none_or(|t| t.trim().is_empty());
+    let text: String = given
+        .map(|t| {
+            t.lines()
+                .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "Your text here".to_owned())
         .chars()
-        .take(200)
+        .take(drawing::MAX_DRAWING_TEXT)
         .collect();
-    let Some((png, w, h)) = wordart_png(&text, &style, &theme) else {
-        return Err(CmdError::Failed("the WordArt could not be drawn".into()));
-    };
+    let d = drawing::new_word_art(&theme, &text, &style);
     let c = compose_mut(s, p)?;
+    // Refused before anything changes: the selected text is only replaced when the WordArt fits.
+    if c.body.drawings.len() >= drawing::MAX_DRAWINGS {
+        return Err(CmdError::Failed(format!("a message holds at most {} drawings", drawing::MAX_DRAWINGS)));
+    }
     c.checkpoint();
+    let at = match at {
+        Some(at) => Some(at),
+        None => Some(drawing::caret_point(c)),
+    };
     c.delete_selection();
-    let cid = put_png(c, "wordart", png, &text, w, h)?;
-    remember_generated(c, &cid, "wordArt", json!({"text": text, "style": style}));
-    Ok(json!({"wordArt": style, "text": text, "cid": cid, "format": "png"}))
+    let id = drawing::add(c, d, at, false).map_err(CmdError::Failed)?;
+    Ok(json!({"wordArt": style, "text": text, "drawing": id, "editText": placeholder}))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -3026,7 +3218,98 @@ fn calendar(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"appointments": n, "detail": detail}))
 }
 
+/// A file shown as an icon with its name under it (PNG, logical width × height).
+fn object_icon_png(name: &str) -> Option<(Vec<u8>, f32, f32)> {
+    let fonts = mailcraft_fonts::FontDb::bundled();
+    let icon = icons::png("document", 48.0 * RASTER_SCALE)?;
+    let canvas = mailcraft_render::svg::decode_png(&icon)?;
+    let rgba = canvas.to_rgba_unpremultiplied();
+    let caption: String = {
+        let n: Vec<char> = name.chars().collect();
+        if n.len() > 28 {
+            let head: String = n.iter().take(12).collect();
+            let tail: String = n.iter().skip(n.len().saturating_sub(12)).collect();
+            format!("{head}…{tail}")
+        } else {
+            name.to_owned()
+        }
+    };
+    let ts = TextStyle { size_pt: Some(8.0), ..Default::default() };
+    let (mut list, x0, y0, tw, th) = text_list(&caption, &ts, &fonts);
+    let w = tw.clamp(56.0, MAX_RASTER_SIDE) + 8.0;
+    let h = 48.0 + 6.0 + th + 4.0;
+    translate(&mut list, (w - tw) / 2.0 - x0, 54.0 - y0);
+    list.items.push(mailcraft_layout::DisplayItem::Image {
+        rect: mailcraft_geom::Rect::new((w - 48.0) / 2.0, 0.0, 48.0, 48.0),
+        src: "icon".into(),
+        alt: String::new(),
+    });
+    let (cw, ch) = (canvas.width, canvas.height);
+    let images = move |src: &str| (src == "icon").then(|| (cw, ch, rgba.clone()));
+    let (dw, dh) = (u32::try_from(dev(w)).ok()?, u32::try_from(dev(h)).ok()?);
+    let png = mailcraft_render::render(&list, &fonts, dw, dh, RASTER_SCALE, Color::rgba(0, 0, 0, 0), &images)
+        .to_png();
+    (!png.is_empty()).then_some((png, w, h))
+}
+
+/// Insert › Object: a file put into the message. As text its text is inserted; otherwise it is shown as an
+/// icon with its name and attached (`link`: the icon links to the file instead and nothing is attached).
+/// Without a file the Object dialog opens (`path` pre-filled when given alone with `ask`).
 fn object(s: &mut Session, p: &Value) -> CmdResult {
+    if opt_bool(p, "ask") == Some(true) {
+        let path = opt_str(p, "path").unwrap_or("").to_owned();
+        let text_like = mime_for(&path).starts_with("text/");
+        return dialog(
+            s,
+            "insertObject",
+            json!({"compose": compose_id(s, p)?, "path": path, "asText": text_like}),
+        );
+    }
+    let link = opt_bool(p, "link").unwrap_or(false);
+    if link {
+        let path = opt_str(p, "path")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| CmdError::Params("`path` (the file to link to) required".into()))?
+            .to_owned();
+        if !std::path::Path::new(&path).is_file() {
+            return Err(CmdError::Failed(format!("{path} was not found")));
+        }
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let (png, w, h) =
+            object_icon_png(&name).ok_or_else(|| CmdError::Failed("the icon could not be drawn".into()))?;
+        let href = file_url(&path);
+        let c = compose_mut(s, p)?;
+        let cid = c.next_content_id();
+        c.checkpoint();
+        c.inline_images.push(InlineImage {
+            content_id: cid.clone(),
+            filename: "object.png".into(),
+            mime_type: "image/png".into(),
+            data: png,
+        });
+        let frag = Doc {
+            blocks: vec![Block::Paragraph {
+                style: ParaStyle::default(),
+                inlines: vec![Inline::Link {
+                    href: href.clone(),
+                    title: None,
+                    children: vec![Inline::Image {
+                        src: format!("cid:{cid}"),
+                        alt: name.clone(),
+                        width: Some(w),
+                        height: Some(h),
+                    }],
+                }],
+            }],
+            ..Default::default()
+        };
+        c.insert_fragment(&frag, crate::compose::PasteMode::KeepSource);
+        return Ok(json!({"inserted": name, "asText": false, "attached": false, "linked": href, "cid": cid}));
+    }
     let Some((name, data)) = file_param(p, super::compose::MAX_ATTACHMENT_BYTES)? else {
         return dialog(s, "insertObject", json!({"compose": compose_id(s, p)?}));
     };
@@ -3040,12 +3323,13 @@ fn object(s: &mut Session, p: &Value) -> CmdResult {
         edit(s, p, |c| c.insert_text(&text))?;
         return Ok(json!({"inserted": name, "asText": true}));
     }
-    let svg = format!("{}{}</svg>", svg_open(48.0, 48.0), icon_svg("document").unwrap_or(""));
+    let (png, w, h) =
+        object_icon_png(&name).ok_or_else(|| CmdError::Failed("the icon could not be drawn".into()))?;
     let mime = mime_for(&name).to_owned();
     let c = compose_mut(s, p)?;
     c.attachments.push(ComposeAttachment { filename: name.clone(), mime_type: mime, data });
-    put_svg(c, "object", svg, &name, 48.0, 48.0);
-    Ok(json!({"inserted": name, "asText": false, "attached": true}))
+    let cid = put_png(c, "object", png, &name, w, h)?;
+    Ok(json!({"inserted": name, "asText": false, "attached": true, "cid": cid}))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -3085,7 +3369,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Chart",
             "Insert › Illustrations",
             "",
-            r#"{"kind"?:"column"|"bar"|"line"|"pie","data"?:[[string,number]]|{"labels":[..],"values":[..]},"title"?:string}"#,
+            r#"{"kind"?:"column"|"stackedColumn"|"bar"|"stackedBar"|"line"|"area"|"pie"|"doughnut"|"scatter"|"radar","sheet"?:[[..]],"categories"?:[string],"series"?:[{"name","values"}],"data"?:[[string,number]],"title"?:string,"legend"?:bool,"width"?:number,"height"?:number,"edit"?:string}  (no data: the data sheet dialog; edit: a chart picture's content id)"#,
             false,
             rich_compose,
             chart,
@@ -3121,6 +3405,16 @@ pub fn specs() -> Vec<CommandSpec> {
             equation,
         ),
         spec(
+            "insert.editPicture",
+            "Edit Picture",
+            "Compose body (double-click a chart, SmartArt graphic or 3D model)",
+            "",
+            r#"{"cid":string}"#,
+            false,
+            rich_compose,
+            edit_picture,
+        ),
+        spec(
             "insert.horizontalLine",
             "Horizontal Line",
             "Insert › Symbols; Format Text › Paragraph › Borders",
@@ -3135,7 +3429,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Icons",
             "Insert › Illustrations",
             "",
-            r#"{"name"?:string}"#,
+            r#"{"name"?:string,"size"?:number}  (no name: the Insert Icons dialog)"#,
             false,
             rich_compose,
             icon,
@@ -3155,7 +3449,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "3D Models",
             "Insert › Illustrations",
             "",
-            r#"{"path"?:string} | {"name":string,"data_base64":string}"#,
+            r#"{"path"?:string} | {"name":string,"data_base64":string} | {"edit":string,"yaw"?:number,"pitch"?:number}  (OBJ, STL, PLY, glTF, GLB)"#,
             false,
             rich_compose,
             model3d,
@@ -3165,7 +3459,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Object",
             "Insert › Text",
             "",
-            r#"{"path"?:string,"asText"?:bool}"#,
+            r#"{"path"?:string,"asText"?:bool,"link"?:bool,"ask"?:bool}  (link: an icon linking to the file; ask: the dialog for that path)"#,
             false,
             rich_compose,
             object,
@@ -3215,7 +3509,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shapes",
             "Insert › Illustrations",
             "",
-            r#"{"kind":string,"color"?:string}"#,
+            r#"{"kind":string,"draw"?:bool,"x"?:number,"y"?:number,"w"?:number,"h"?:number,"points"?:[[number,number]],"color"?:string}  (draw: arm the drawing tool)"#,
             false,
             rich_compose,
             shape,
@@ -3225,7 +3519,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "SmartArt",
             "Insert › Illustrations",
             "",
-            r#"{"layout"?:"list"|"process"|"cycle"|"hierarchy","items"?:[string]}"#,
+            r#"{"layout"?:"list"|"blocks"|"process"|"chevron"|"cycle"|"radial"|"hierarchy"|"venn"|"matrix"|"pyramid","items"?:[string],"edit"?:string}  (tabs before an item lower its level)"#,
             false,
             rich_compose,
             smart_art,
@@ -3245,7 +3539,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Table",
             "Insert › Tables",
             "",
-            r#"{"rows"?:number,"cols"?:number,"mode"?:"grid"|"dialog"|"draw"|"fromText"|"quick","name"?:string,"widths"?:[number],"separator"?:"tabs"|"commas"|"semicolons"|"paragraphs"|"auto"|string}  (widths with "draw", px per column; separator with "fromText")"#,
+            r#"{"rows"?:number,"cols"?:number,"mode"?:"grid"|"dialog"|"draw"|"fromText"|"quick","name"?:string,"widths"?:[number],"pad"?:bool,"action"?:"stroke"|"erase","path"?:[number],"offset"?:number,"dx"?:number,"dy"?:number,"separator"?:"tabs"|"commas"|"semicolons"|"paragraphs"|"auto"|string}  ("draw": the table pencil, or the drawing pad with pad; action: a pencil stroke or eraser click at path; widths: the pad's columns)"#,
             false,
             rich_compose,
             table,
@@ -3255,7 +3549,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Box",
             "Insert › Text",
             "",
-            r#"{"preset"?:string,"text"?:string}  ("draw" opens the drawing tool)"#,
+            r#"{"preset"?:"simple"|"sidebar"|"draw"|"saved:<name>","text"?:string,"x"?:number,"y"?:number,"w"?:number,"h"?:number,"vertical"?:bool}  ("draw" without x/y arms the text box tool; vertical: the text runs top to bottom)"#,
             false,
             rich_compose,
             text_box,
@@ -3265,7 +3559,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "WordArt",
             "Insert › Text",
             "",
-            r#"{"style":string,"text"?:string}"#,
+            r#"{"style":string,"text"?:string,"x"?:number,"y"?:number}"#,
             false,
             rich_compose,
             word_art,
@@ -3338,6 +3632,7 @@ pub(crate) mod tests {
         assert!(s.run("insert.shape", &json!({"kind": "blob"})).is_err());
         s.run("insert.icon", &json!({"name": "check"})).unwrap();
         assert_eq!(s.run("insert.icon", &json!({})).unwrap()["dialog"], "icons");
+        assert!(s.run("insert.icon", &json!({"name": "unicorn"})).is_err());
         s.run("insert.chart", &json!({"kind": "pie", "data": [["a", 1], ["b", 3]], "title": "Share <1>"}))
             .unwrap();
         s.run("insert.chart", &json!({"kind": "line", "data": {"labels": ["x", "y"], "values": [1, 2]}}))
@@ -3349,26 +3644,19 @@ pub(crate) mod tests {
         }
         assert_eq!(s.run("insert.smartArt", &json!({})).unwrap()["dialog"], "smartArt");
         let c = &s.composes[&id];
-        assert_eq!(c.inline_images.len(), 9);
-        let chart = String::from_utf8(c.inline_images[2].data.clone()).unwrap();
-        assert!(chart.contains("Share &lt;1&gt;"));
-        // Shapes and SmartArt are PNG; icons and charts stay SVG.
-        let mimes: Vec<&str> = c.inline_images.iter().map(|i| i.mime_type.as_str()).collect();
-        assert_eq!(mimes[0], "image/png");
-        assert!(mimes[5..].iter().all(|m| *m == "image/png"), "{mimes:?}");
-        assert!(
-            c.inline_images
-                .iter()
-                .filter(|i| i.mime_type == "image/png")
-                .all(|i| i.data.starts_with(b"\x89PNG"))
-        );
+        // The star is a floating drawing; the rest are pictures in the text.
+        assert_eq!(c.body.drawings.len(), 1);
+        assert_eq!(c.inline_images.len(), 8);
+        assert!(c.generated.iter().any(|g| g.kind == "chart" && g.spec["title"] == "Share <1>"));
+        // Every generated picture is PNG (many mail programs show no SVG).
+        assert!(c.inline_images.iter().all(|i| i.mime_type == "image/png" && i.data.starts_with(b"\x89PNG")));
         let r = s.run("insert.screenshot", &json!({"clip": true})).unwrap();
         assert_eq!(r["dialog"], "screenshot");
         assert_eq!(last_dialog(&s)["capture"], false);
     }
 
-    /// Decoded RGBA of a generated PNG via the renderer's own decoder path is not available here, so check
-    /// pixels through the mask helpers instead: a shape covers its middle and leaves its corner empty.
+    /// Pictures drawn before shapes became drawing objects are still redrawn from their recipes: a shape covers
+    /// its middle and leaves its corner empty, in the theme's colour and effects.
     #[test]
     fn shapes_are_drawn_in_theme_colours_with_effects() {
         let theme = crate::compose::ThemeState::default().resolve();
@@ -3387,7 +3675,7 @@ pub(crate) mod tests {
         let png = |fx: &str| shape_png("oval", accent, fx).unwrap().0;
         assert_ne!(png("Subtle Solids"), png("Top Shadow"));
         assert_ne!(png("Glow Edge"), png("Glossy"));
-        for kind in SHAPES.split(", ") {
+        for kind in ["rectangle", "oval", "star", "line", "arrow", "heart", "callout", "canvas"] {
             let (data, w, h) = shape_png(kind, accent, "Office").unwrap();
             assert!(data.starts_with(b"\x89PNG") && w > 100.0 && h > 50.0, "{kind}");
         }
@@ -3398,11 +3686,35 @@ pub(crate) mod tests {
         let (mut s, id) = setup();
         s.run("compose.theme", &json!({"part": "colors", "name": "Red"})).unwrap();
         s.run("insert.shape", &json!({"kind": "rectangle"})).unwrap();
+        let red = s.composes[&id].body.drawings[0].fill;
         s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
-        s.run("insert.shape", &json!({"kind": "rectangle"})).unwrap();
+        // The shape drawn in the old theme's accent takes the new accent.
         let c = &s.composes[&id];
-        assert_ne!(c.inline_images[0].data, c.inline_images[1].data);
+        assert_ne!(c.body.drawings[0].fill, red);
+        assert_eq!(c.body.drawings[0].fill, Some(c.theme_resolved().color(crate::compose::ACCENT1)));
         assert!(s.run("insert.shape", &json!({"kind": "rectangle", "color": "nope"})).is_err());
+        s.run("insert.shape", &json!({"kind": "rectangle", "color": "#123456"})).unwrap();
+        assert_eq!(s.composes[&id].body.drawings[1].fill, Some(Color::rgb(0x12, 0x34, 0x56)));
+    }
+
+    /// Regression: with the drawing limit reached, WordArt from selected text deleted the text and then
+    /// failed, leaving the edit half done.
+    #[test]
+    fn word_art_over_the_drawing_limit_leaves_the_selected_text() {
+        let (mut s, id) = setup();
+        s.run("compose.insertText", &json!({"text": "Keep me"})).unwrap();
+        let c = s.composes.get_mut(&id).unwrap();
+        for n in 0..drawing::MAX_DRAWINGS {
+            let d = mailcraft_model::rich::Drawing { id: n as u32 + 1, ..Default::default() };
+            c.body.drawings.push(d);
+        }
+        c.select_all();
+        let (undo, text) = (c.edit_undo.len(), c.body.to_plain_text());
+        assert!(text.contains("Keep me"));
+        assert!(s.run("insert.wordArt", &json!({"style": "Fill: Black, Text color 1"})).is_err());
+        let c = &s.composes[&id];
+        assert_eq!(c.body.to_plain_text(), text);
+        assert_eq!(c.edit_undo.len(), undo, "no undo step for a refused insert");
     }
 
     #[test]
@@ -3423,7 +3735,8 @@ pub(crate) mod tests {
         assert_eq!(w.hard_shadow, Some(theme.color(crate::compose::ACCENT1 + 4)));
         let w = parse_wordart("Gradient Fill: Plum, Accent color 5; Reflection", &theme);
         assert!(w.gradient.is_some() && w.reflection);
-        assert!(parse_wordart("Fill: Dark Teal, Accent color 1; Soft Bevel", &theme).bevel);
+        assert!(parse_wordart("Fill: Dark Teal, Accent color 1; Soft Bevel", &theme).bevel == Some(false));
+        assert!(parse_wordart("Fill: Dark Green, Accent color 3; Sharp Bevel", &theme).bevel == Some(true));
         assert!(parse_wordart("Fill: Light Gray, Background color 2; Inner Shadow", &theme).inner_shadow);
         let w = parse_wordart(
             "Fill: White; Outline: Dark Teal, Accent color 1; Glow: Dark Teal, Accent color 1",
@@ -3439,7 +3752,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn models_obj_and_stl() {
+    fn models_obj_stl_and_ply_turn() {
         let obj = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3\nf 1/1/1 2 4\nf -1 -2 -3\n";
         let (v, e) = parse_model(obj).unwrap();
         assert_eq!(v.len(), 4);
@@ -3457,14 +3770,38 @@ pub(crate) mod tests {
         bin.extend([0u8; 2]);
         assert_eq!(parse_model(&bin).unwrap().0.len(), 3);
         assert!(parse_model(b"\x00\x01garbage").is_none());
-        let svg = model_svg(&v, &e, 100.0);
-        assert!(svg.starts_with("<svg") && svg.contains("<path"));
+        let ply = b"ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\nproperty float y\nproperty float z\nelement face 2\nproperty list uchar int vertex_indices\nend_header\n0 0 0\n1 0 0\n1 1 0\n0 1 1\n3 0 1 2\n3 0 2 99\n";
+        let (pv, pe) = parse_model(ply).unwrap();
+        assert_eq!(pv.len(), 4);
+        assert_eq!(pe.len(), 4, "edges to a vertex that does not exist are dropped");
+        assert!(parse_model(b"ply\nformat binary_little_endian 1.0\nend_header\n").is_none());
+        let png = model_png(&v, &e, 100.0, 35.0, 25.0, Color::BLACK).unwrap();
+        assert!(png.starts_with(b"\x89PNG"));
+        assert_ne!(
+            png,
+            model_png(&v, &e, 100.0, 120.0, 25.0, Color::BLACK).unwrap(),
+            "turning changes the view"
+        );
         let (mut s, id) = setup();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.obj");
         std::fs::write(&path, obj).unwrap();
-        s.run("insert.model3d", &json!({"path": path.to_string_lossy()})).unwrap();
-        assert_eq!(s.composes[&id].inline_images.len(), 1);
+        let r = s.run("insert.model3d", &json!({"path": path.to_string_lossy()})).unwrap();
+        let cid = r["cid"].as_str().unwrap().to_owned();
+        assert_eq!(s.composes[&id].inline_images[0].mime_type, "image/png");
+        // Double-click opens the 3D Model Views dialog; turning draws it again in place, undoably.
+        assert_eq!(s.run("insert.editPicture", &json!({"cid": cid})).unwrap()["dialog"], "model3dView");
+        assert_eq!(last_dialog(&s)["yaw"], 35.0);
+        let r = s.run("insert.model3d", &json!({"edit": cid, "yaw": 400, "pitch": 10})).unwrap();
+        let new = r["cid"].as_str().unwrap().to_owned();
+        assert_ne!(new, cid);
+        let c = &s.composes[&id];
+        assert_eq!(image_srcs(c), vec![format!("cid:{new}")]);
+        let spec = &c.generated.iter().find(|g| g.content_id == new).unwrap().spec;
+        assert_eq!((spec["yaw"].as_f64(), spec["pitch"].as_f64()), (Some(40.0), Some(10.0)));
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(image_srcs(&s.composes[&id]), vec![format!("cid:{cid}")]);
+        assert!(s.run("insert.model3d", &json!({"edit": "nope@x", "yaw": 1})).is_err());
     }
 
     #[test]
@@ -3480,7 +3817,10 @@ pub(crate) mod tests {
                 .any(|b| matches!(b, Block::Table { rows, .. } if rows.len() == 2 && rows[0].len() == 3))
         );
         assert!(s.run("insert.table", &json!({"rows": 2, "cols": 64})).is_err());
-        assert_eq!(s.run("insert.table", &json!({"mode": "draw"})).unwrap()["dialog"], "drawTable");
+        assert_eq!(
+            s.run("insert.table", &json!({"mode": "draw", "pad": true})).unwrap()["dialog"],
+            "drawTable"
+        );
         s.run("compose.select", &json!({"all": true})).unwrap();
         s.run("compose.insertText", &json!({"text": "a\tb\nc\td"})).unwrap();
         s.run("compose.select", &json!({"all": true})).unwrap();
@@ -3500,9 +3840,18 @@ pub(crate) mod tests {
         );
         s.run("insert.horizontalLine", &json!({})).unwrap();
         assert!(s.composes[&id].body.to_plain_text().contains("------"), "rule inside the cell");
-        s.run("insert.textBox", &json!({"text": "boxed"})).unwrap();
-        assert!(s.composes[&id].body.to_plain_text().contains("boxed"));
-        assert_eq!(s.run("insert.textBox", &json!({"preset": "draw"})).unwrap()["dialog"], "drawTextBox");
+        // A text box floats over the text; Draw Text Box arms the tool, or draws where it is told.
+        let r = s.run("insert.textBox", &json!({"text": "boxed"})).unwrap();
+        assert_eq!(r["editText"], true);
+        let c = &s.composes[&id];
+        assert_eq!(c.body.drawings[0].kind, mailcraft_model::DrawingKind::TextBox);
+        assert_eq!(c.body.drawings[0].text, "boxed");
+        assert!(!c.body.to_plain_text().contains("boxed"), "not in the text flow");
+        assert_eq!(s.run("insert.textBox", &json!({"preset": "draw"})).unwrap()["armed"], "textBox");
+        s.run("insert.textBox", &json!({"preset": "draw", "x": 10, "y": 20, "w": 90, "h": 40})).unwrap();
+        let d = &s.composes[&id].body.drawings[1];
+        assert_eq!((d.x, d.y, d.w, d.h), (10.0, 20.0, 90.0, 40.0));
+        assert!(s.run("insert.textBox", &json!({"preset": "draw", "x": 10})).is_err());
         assert!(s.run("insert.textBox", &json!({"preset": "nope"})).is_err());
     }
 
@@ -3559,7 +3908,10 @@ pub(crate) mod tests {
     #[test]
     fn draw_table_uses_the_drawn_widths() {
         let (mut s, id) = setup();
-        assert_eq!(s.run("insert.table", &json!({"mode": "draw"})).unwrap()["dialog"], "drawTable");
+        assert_eq!(
+            s.run("insert.table", &json!({"mode": "draw", "pad": true})).unwrap()["dialog"],
+            "drawTable"
+        );
         let r = s.run("insert.table", &json!({"mode": "draw", "widths": [100.0, 50.5], "rows": 3})).unwrap();
         assert_eq!((r["rows"].as_u64(), r["cols"].as_u64()), (Some(3), Some(2)));
         let t = tables(&s, id);
@@ -3578,15 +3930,270 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn table_pencil_draws_splits_and_erases_in_the_body() {
+        let (mut s, id) = setup();
+        assert_eq!(s.run("insert.table", &json!({"mode": "draw"})).unwrap()["armed"], "tablePencil");
+        assert_eq!(s.composes[&id].draw_tool.as_deref(), Some("tablePencil"));
+        let stroke = |s: &mut Session, path: Vec<usize>, dx: f32, dy: f32| {
+            s.run(
+                "insert.table",
+                &json!({"mode": "draw", "action": "stroke", "path": path, "offset": 0, "dx": dx, "dy": dy}),
+            )
+            .unwrap()["drawn"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        // Outside a table: a sideways stroke draws a one-cell table that wide.
+        assert_eq!(stroke(&mut s, vec![0], 300.0, 40.0), "newTable");
+        let t = tables(&s, id);
+        assert_eq!((t.len(), t[0].len(), t[0][0].len()), (1, 1, 1));
+        assert_eq!(t[0][0][0].width_px, Some(300.0));
+        let at = s.composes[&id].table_starts()[0].path.clone();
+        // Down the cell: two columns; across a cell: two rows.
+        assert_eq!(stroke(&mut s, at.clone(), 2.0, 60.0), "split");
+        assert_eq!(tables(&s, id)[0][0].len(), 2);
+        assert_eq!(stroke(&mut s, at.clone(), 80.0, 1.0), "split");
+        let t = tables(&s, id);
+        assert_eq!(t[0].len(), 2);
+        assert_eq!(t[0][0][1].rowspan, 2, "the cell beside it now spans both rows");
+        // A tiny stroke changes nothing; the eraser merges the split cells back.
+        assert_eq!(stroke(&mut s, at.clone(), 1.0, 1.0), "nothing");
+        let r = s
+            .run("insert.table", &json!({"mode": "draw", "action": "erase", "path": at, "offset": 0}))
+            .unwrap();
+        assert_eq!(r["drawn"], "merged");
+        assert_eq!(
+            tables(&s, id)[0][0][0].rowspan,
+            2,
+            "with the cell below it (the one beside spans two rows)"
+        );
+        // Each change is one undo step.
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(tables(&s, id)[0][0][0].rowspan, 1);
+        // Junk paths and actions are refused or do nothing.
+        assert_eq!(stroke(&mut s, vec![99, 3], 300.0, 0.0), "nothing");
+        assert!(s.run("insert.table", &json!({"mode": "draw", "action": "zap", "path": [0]})).is_err());
+        assert!(s.run("insert.table", &json!({"mode": "draw", "action": "stroke"})).is_err());
+        assert_eq!(
+            s.run("insert.table", &json!({"mode": "draw", "pad": true})).unwrap()["dialog"],
+            "drawTable"
+        );
+    }
+
+    #[test]
     fn sidebar_text_box_differs_from_simple() {
         let (mut s, id) = setup();
         s.run("insert.textBox", &json!({"preset": "simple", "text": "a"})).unwrap();
         s.run("insert.textBox", &json!({"preset": "sidebar", "text": "b"})).unwrap();
-        let t = tables(&s, id);
-        let shaded: Vec<bool> = t.iter().map(|rows| rows[0][0].background.is_some()).collect();
-        assert!(shaded.contains(&true) && shaded.contains(&false), "{shaded:?}");
+        let d = &s.composes[&id].body.drawings;
+        let accent = s.composes[&id].theme_resolved().color(crate::compose::ACCENT1);
+        assert_eq!((d[0].fill, d[0].outline.is_some()), (Some(Color::WHITE), true));
+        assert_eq!((d[1].fill, d[1].outline), (Some(lighten(accent, 0.85)), None));
+        assert_eq!((d[1].text_style.italic, d[1].text_style.color), (Some(true), Some(accent)));
     }
 
+    #[test]
+    fn theme_changes_redraw_charts_smart_art_and_recolour_drawings() {
+        let (mut s, id) = setup();
+        s.run("insert.smartArt", &json!({"layout": "process", "items": ["a", "b"]})).unwrap();
+        s.run("insert.chart", &json!({"kind": "column", "data": [["a", 1], ["b", 2]]})).unwrap();
+        s.run("insert.shape", &json!({"kind": "oval"})).unwrap();
+        s.run("insert.shape", &json!({"kind": "rectangle", "color": "#ff0000"})).unwrap();
+        s.run("insert.wordArt", &json!({"style": "Fill: Dark Teal, Accent color 1; Shadow", "text": "Hi"}))
+            .unwrap();
+        assert_eq!(s.composes[&id].generated.len(), 2, "drawings are objects, not pictures with recipes");
+        let before = image_srcs(&s.composes[&id]);
+        let data = |s: &Session, src: &str| {
+            let cid = src.trim_start_matches("cid:");
+            s.composes[&id]
+                .inline_images
+                .iter()
+                .find(|i| i.content_id == cid)
+                .map(|i| i.data.clone())
+                .unwrap()
+        };
+        let old_smart = data(&s, &before[0]);
+        let r = s.run("compose.theme", &json!({"part": "effects", "name": "Glossy"})).unwrap();
+        assert_eq!(r["redrawn"], 1, "SmartArt takes the new effects (a chart has none)");
+        let after = image_srcs(&s.composes[&id]);
+        assert_eq!(after.len(), 2);
+        assert_ne!(after[0], before[0], "a new picture replaces the old one");
+        assert_eq!(after[1], before[1]);
+        assert_ne!(data(&s, &after[0]), old_smart);
+        // Colours: both pictures and the accent-coloured drawing change; the red shape keeps its fill.
+        let accent_before = s.composes[&id].theme_resolved().color(crate::compose::ACCENT1);
+        assert_eq!(s.composes[&id].body.drawings[0].fill, Some(accent_before));
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
+        assert_eq!(r["redrawn"], 2, "{r}");
+        let c = &s.composes[&id];
+        let accent = c.theme_resolved().color(crate::compose::ACCENT1);
+        assert_ne!(accent, accent_before);
+        assert_eq!(c.body.drawings[0].fill, Some(accent));
+        assert_eq!(c.body.drawings[1].fill, Some(Color::rgb(255, 0, 0)));
+        // Undo of the body still finds the old pictures.
+        assert!(
+            before.iter().all(|src| c.inline_images.iter().any(|i| format!("cid:{}", i.content_id) == *src))
+        );
+        // A deleted picture is no longer redrawn.
+        s.run("compose.select", &json!({"all": true})).unwrap();
+        s.run("compose.insertText", &json!({"text": "plain"})).unwrap();
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Red"})).unwrap();
+        assert_eq!(r["redrawn"], 0, "pictures no longer in the body are not redrawn");
+        assert_eq!(s.composes[&id].generated.len(), 5, "every recipe stays for Undo (2 + 1 + 2 redrawn)");
+    }
+
+    #[test]
+    fn theme_change_then_undo_still_redraws_on_the_next_change() {
+        // Regression: the redraw moved each recipe to the new picture, so after Undo (old pictures back in
+        // the body) no recipe matched the body and later theme changes redrew nothing.
+        let (mut s, id) = setup();
+        s.run("insert.chart", &json!({"kind": "pie", "data": [["a", 1], ["b", 2]]})).unwrap();
+        s.run("insert.smartArt", &json!({"layout": "list", "items": ["a"]})).unwrap();
+        let before = image_srcs(&s.composes[&id]);
+        let theme_before = s.composes[&id].theme.clone();
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
+        assert_eq!(r["redrawn"], 2);
+        assert_ne!(image_srcs(&s.composes[&id]), before);
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(image_srcs(&s.composes[&id]), before, "Undo brings back the old pictures");
+        assert_eq!(s.composes[&id].theme, theme_before, "and the theme they were drawn in");
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Red"})).unwrap();
+        assert_eq!(r["redrawn"], 2, "the old pictures are redrawn again: {r}");
+        // Redo of the first change after a new change is gone; Undo twice returns to the start.
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(image_srcs(&s.composes[&id]), before);
+    }
+
+    #[test]
+    fn many_redraws_keep_the_recipes_of_pictures_in_the_body() {
+        let (mut s, id) = setup();
+        s.run("insert.smartArt", &json!({"layout": "list", "items": ["a"]})).unwrap();
+        // The SmartArt is the oldest recipe; many newer ones are of pictures no longer in the body.
+        let c = s.composes.get_mut(&id).unwrap();
+        for i in 0..MAX_GENERATED + 20 {
+            c.generated.push(crate::compose::GeneratedPicture {
+                content_id: format!("gone{i}@example.com"),
+                kind: "shape".into(),
+                spec: json!({"shape": "oval"}),
+            });
+        }
+        trim_generated(c);
+        assert_eq!(c.generated.len(), MAX_GENERATED);
+        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
+        assert_eq!(r["redrawn"], 1, "the SmartArt in the body kept its recipe");
+        assert!(s.composes[&id].generated.len() <= MAX_GENERATED);
+    }
+
+    #[test]
+    fn charts_and_smart_art_are_edited_in_place() {
+        let (mut s, id) = setup();
+        let r = s
+            .run(
+                "insert.chart",
+                &json!({"kind": "column", "sheet": [["", "A", "B"], ["x", 1, 2]], "title": "T"}),
+            )
+            .unwrap();
+        let cid = r["cid"].as_str().unwrap().to_owned();
+        // Double-click: the data sheet opens with the chart's data.
+        assert_eq!(
+            s.run("insert.editPicture", &json!({"cid": format!("cid:{cid}")})).unwrap()["dialog"],
+            "insertChart"
+        );
+        let d = last_dialog(&s);
+        assert_eq!(d["edit"], cid.as_str());
+        assert_eq!(d["chart"]["series"][1]["name"], "B");
+        // New data redraws it in place (one undo step).
+        let r = s.run("insert.chart", &json!({"edit": cid, "kind": "line", "sheet": [["", "A"], ["x", 3], ["y", 4]], "title": "New"})).unwrap();
+        let new = r["cid"].as_str().unwrap().to_owned();
+        let c = &s.composes[&id];
+        assert_eq!(image_srcs(c), vec![format!("cid:{new}")]);
+        assert!(c.body.to_plain_text().contains("New"), "the alt text follows the title");
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert_eq!(image_srcs(&s.composes[&id]), vec![format!("cid:{cid}")]);
+        assert!(s.run("insert.chart", &json!({"edit": "missing@x", "data": [["a", 1]]})).is_err());
+        // SmartArt: layout and text pane, edited the same way.
+        let r = s
+            .run("insert.smartArt", &json!({"layout": "hierarchy", "items": ["Lead", "\tA", "\tB"]}))
+            .unwrap();
+        let sa = r["cid"].as_str().unwrap().to_owned();
+        assert_eq!(s.run("insert.editPicture", &json!({"cid": sa})).unwrap()["dialog"], "smartArt");
+        assert_eq!(last_dialog(&s)["current"]["items"][1], "\tA");
+        s.run("insert.smartArt", &json!({"edit": sa, "layout": "Basic Pyramid", "items": ["1", "2", "3"]}))
+            .unwrap();
+        assert!(
+            s.composes[&id].generated.iter().any(|g| g.kind == "smartArt" && g.spec["layout"] == "pyramid")
+        );
+        assert!(s.run("insert.smartArt", &json!({"layout": "spiral", "items": ["a"]})).is_err());
+        // Plain pictures cannot be edited this way.
+        let r = s.run("insert.icon", &json!({"name": "star"})).unwrap();
+        assert!(s.run("insert.editPicture", &json!({"cid": r["cid"]})).is_err());
+    }
+
+    #[test]
+    fn sent_messages_carry_drawings_as_pictures_and_no_svg() {
+        let (mut s, id) = setup();
+        s.run("compose.insertText", &json!({"text": "First\nSecond\nThird"})).unwrap();
+        // A canvas with a shape inside it, a lone text box lower down, and an SVG picture.
+        s.run("insert.shape", &json!({"kind": "canvas", "x": 0, "y": 0, "w": 200, "h": 120})).unwrap();
+        s.run("insert.shape", &json!({"kind": "oval", "x": 20, "y": 20, "w": 60, "h": 40})).unwrap();
+        s.run("insert.textBox", &json!({"text": "Note", "x": 300, "y": 40, "w": 80, "h": 30})).unwrap();
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>"#;
+        {
+            let c = s.composes.get_mut(&id).unwrap();
+            c.insert_image(
+                InlineImage {
+                    content_id: "pic@example.com".into(),
+                    filename: "pic.svg".into(),
+                    mime_type: "image/svg+xml".into(),
+                    data: svg.to_vec(),
+                },
+                "pic",
+                Some(8.0),
+                Some(8.0),
+            );
+        }
+        let c = s.composes[&id].clone();
+        let flat = drawing::flattened(&c).unwrap();
+        assert!(flat.body.drawings.is_empty());
+        assert!(
+            flat.inline_images.iter().all(|i| i.mime_type == "image/png" && i.data.starts_with(b"\x89PNG"))
+        );
+        assert!(
+            flat.inline_images.iter().any(|i| i.content_id == "pic@example.com" && i.filename == "pic.png")
+        );
+        // Two groups (the canvas with its oval; the text box), each a picture paragraph indented to its left
+        // edge before the text it was drawn over.
+        let pics: Vec<(usize, f32, String)> = flat
+            .body
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b {
+                Block::Paragraph { style, inlines } => match inlines.as_slice() {
+                    [Inline::Image { alt, src, .. }] if src.contains("@mailcraft.invalid") => {
+                        Some((i, style.indent_px, alt.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pics.len(), 2, "{:?}", flat.body.blocks);
+        assert_eq!(pics[0].0, 0, "the canvas starts at the top");
+        assert!(pics.iter().any(|(_, indent, alt)| *indent > 250.0 && alt == "Note"));
+        assert!(flat.body.to_plain_text().contains("Note"), "the plain text gets the drawing's text");
+        // Nothing to flatten: no copy.
+        let (s2, id2) = setup();
+        assert!(drawing::flattened(&s2.composes[&id2]).is_none());
+        // Sent: the message has PNG parts only and the drawings' text in its plain-text part.
+        s.run("compose.setTo", &json!({"value": "a@example.com"})).unwrap();
+        assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
+        let sent = s.mailbox.mail.values().find(|m| !m.is_draft && m.subject.is_empty()).unwrap();
+        let raw = String::from_utf8_lossy(sent.raw.as_ref().unwrap()).into_owned();
+        assert!(!raw.contains("image/svg+xml"), "no SVG is sent");
+        assert!(raw.matches("image/png").count() >= 3, "{raw}");
+    }
     #[test]
     fn links_to_recent_files() {
         let (mut s, id) = setup();
@@ -3614,94 +4221,6 @@ pub(crate) mod tests {
     /// The `cid:` sources of the body's pictures.
     fn image_srcs(c: &ComposeState) -> Vec<String> {
         c.images().into_iter().map(|(src, ..)| src).collect()
-    }
-
-    #[test]
-    fn theme_changes_redraw_shapes_smart_art_and_word_art() {
-        let (mut s, id) = setup();
-        s.run("insert.shape", &json!({"kind": "oval"})).unwrap();
-        s.run("insert.shape", &json!({"kind": "rectangle", "color": "#ff0000"})).unwrap();
-        s.run("insert.smartArt", &json!({"layout": "process", "items": ["a", "b"]})).unwrap();
-        s.run("insert.wordArt", &json!({"style": "Fill: Dark Teal, Accent color 1; Shadow", "text": "Hi"}))
-            .unwrap();
-        assert_eq!(s.composes[&id].generated.len(), 4);
-        let before = image_srcs(&s.composes[&id]);
-        let data = |s: &Session, src: &str| {
-            let cid = src.trim_start_matches("cid:");
-            s.composes[&id]
-                .inline_images
-                .iter()
-                .find(|i| i.content_id == cid)
-                .map(|i| i.data.clone())
-                .unwrap()
-        };
-        let old_oval = data(&s, &before[0]);
-        let r = s.run("compose.theme", &json!({"part": "effects", "name": "Glossy"})).unwrap();
-        assert_eq!(r["redrawn"], 3, "shapes and SmartArt take the new effects (WordArt has its own)");
-        let after = image_srcs(&s.composes[&id]);
-        assert_eq!(after.len(), 4);
-        assert!(after.iter().zip(&before).take(3).all(|(a, b)| a != b), "new pictures replace the old ones");
-        assert_eq!(after.get(3), before.get(3));
-        assert_ne!(data(&s, &after[0]), old_oval);
-        // Colours: the accent-coloured shape changes, the explicit red one keeps its fill.
-        let red = data(&s, &after[1]);
-        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
-        assert_eq!(r["redrawn"], 3, "the fixed-colour shape is unchanged: {r}");
-        let now = image_srcs(&s.composes[&id]);
-        assert_eq!(data(&s, &now[1]), red);
-        // Undo of the body still finds the old pictures.
-        let c = &s.composes[&id];
-        assert!(
-            before.iter().all(|src| c.inline_images.iter().any(|i| format!("cid:{}", i.content_id) == *src))
-        );
-        // A deleted picture is no longer redrawn.
-        s.run("compose.select", &json!({"all": true})).unwrap();
-        s.run("compose.insertText", &json!({"text": "plain"})).unwrap();
-        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Red"})).unwrap();
-        assert_eq!(r["redrawn"], 0, "pictures no longer in the body are not redrawn");
-        assert_eq!(s.composes[&id].generated.len(), 10, "every recipe stays for Undo (4 + 3 + 3 redrawn)");
-    }
-
-    #[test]
-    fn theme_change_then_undo_still_redraws_on_the_next_change() {
-        // Regression: the redraw moved each recipe to the new picture, so after Undo (old pictures back in
-        // the body) no recipe matched the body and later theme changes redrew nothing.
-        let (mut s, id) = setup();
-        s.run("insert.shape", &json!({"kind": "oval"})).unwrap();
-        s.run("insert.smartArt", &json!({"layout": "list", "items": ["a"]})).unwrap();
-        let before = image_srcs(&s.composes[&id]);
-        let theme_before = s.composes[&id].theme.clone();
-        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
-        assert_eq!(r["redrawn"], 2);
-        assert_ne!(image_srcs(&s.composes[&id]), before);
-        s.run("compose.editUndo", &json!({})).unwrap();
-        assert_eq!(image_srcs(&s.composes[&id]), before, "Undo brings back the old pictures");
-        assert_eq!(s.composes[&id].theme, theme_before, "and the theme they were drawn in");
-        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Red"})).unwrap();
-        assert_eq!(r["redrawn"], 2, "the old pictures are redrawn again: {r}");
-        // Redo of the first change after a new change is gone; Undo twice returns to the start.
-        s.run("compose.editUndo", &json!({})).unwrap();
-        assert_eq!(image_srcs(&s.composes[&id]), before);
-    }
-
-    #[test]
-    fn many_redraws_keep_the_recipes_of_pictures_in_the_body() {
-        let (mut s, id) = setup();
-        s.run("insert.shape", &json!({"kind": "oval"})).unwrap();
-        // The shape is the oldest recipe; many newer ones are of pictures no longer in the body.
-        let c = s.composes.get_mut(&id).unwrap();
-        for i in 0..MAX_GENERATED + 20 {
-            c.generated.push(crate::compose::GeneratedPicture {
-                content_id: format!("gone{i}@example.com"),
-                kind: "shape".into(),
-                spec: json!({"shape": "oval"}),
-            });
-        }
-        trim_generated(c);
-        assert_eq!(c.generated.len(), MAX_GENERATED);
-        let r = s.run("compose.theme", &json!({"part": "colors", "name": "Green"})).unwrap();
-        assert_eq!(r["redrawn"], 1, "the shape in the body kept its recipe");
-        assert!(s.composes[&id].generated.len() <= MAX_GENERATED);
     }
 
     #[test]
@@ -3825,16 +4344,25 @@ pub(crate) mod tests {
                 &json!({"style": "Fill: Orange, Accent color 2; Outline: Orange, Accent color 2", "text": "Big"}),
             )
             .unwrap();
-        assert_eq!(r["format"], "png");
+        assert_eq!(r["editText"], false, "given text is not a placeholder");
         let c = &s.composes[&id];
-        let img = c.inline_images.last().unwrap();
-        assert_eq!(img.mime_type, "image/png");
-        assert!(img.data.starts_with(b"\x89PNG"));
-        assert_eq!(c.images().last().unwrap().1, "Big", "alt text is the WordArt text");
-        // The selected text becomes the WordArt.
+        let d = c.body.drawings.last().unwrap();
+        assert_eq!(
+            (d.kind, d.text.as_str(), d.alt.as_str()),
+            (mailcraft_model::DrawingKind::WordArt, "Big", "Big")
+        );
+        // The selected text becomes the WordArt, and leaves the text in the same undo step.
         s.run("compose.select", &json!({"all": true})).unwrap();
         let r = s.run("insert.wordArt", &json!({"style": "Fill: Black, Text color 1; Shadow"})).unwrap();
         assert!(r["text"].as_str().unwrap().contains("tart"));
+        assert!(!s.composes[&id].body.to_plain_text().contains("tart"));
+        s.run("compose.editUndo", &json!({})).unwrap();
+        assert!(s.composes[&id].body.to_plain_text().contains("tart"));
+        assert_eq!(s.composes[&id].body.drawings.len(), 1);
+        // Without a selection: a placeholder the editor selects for typing over.
+        s.run("compose.select", &json!({"anchor": {"path": [0], "offset": 0}})).ok();
+        let r = s.run("insert.wordArt", &json!({"style": "Fill: Black, Text color 1; Shadow"})).unwrap();
+        assert_eq!((r["text"].as_str(), r["editText"].as_bool()), (Some("Your text here"), Some(true)));
     }
 
     #[test]
@@ -3980,5 +4508,25 @@ pub(crate) mod tests {
         assert!(s.composes[&id].body.to_plain_text().contains("hello object"));
         s.run("insert.object", &json!({"name": "a.bin", "data_base64": "AAEC"})).unwrap();
         assert!(s.composes[&id].attachments.iter().any(|a| a.filename == "a.bin"));
+        // The icon is a PNG with the file name under it.
+        let icon = s.composes[&id].inline_images.last().unwrap();
+        assert_eq!(icon.mime_type, "image/png");
+        assert_eq!(s.composes[&id].images().last().unwrap().1, "a.bin");
+        // Linked: an icon that links to the file, nothing attached.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.pdf");
+        std::fs::write(&path, b"%PDF").unwrap();
+        let attached = s.composes[&id].attachments.len();
+        let r = s.run("insert.object", &json!({"path": path.to_string_lossy(), "link": true})).unwrap();
+        assert!(r["linked"].as_str().unwrap().starts_with("file://"));
+        assert_eq!(s.composes[&id].attachments.len(), attached);
+        assert!(s.run("insert.object", &json!({"path": "/no/such/file.pdf", "link": true})).is_err());
+        // From the native picker: the dialog asks how, with the path filled in.
+        let r = s.run("insert.object", &json!({"path": "/x/notes.txt", "ask": true})).unwrap();
+        assert_eq!(r["dialog"], "insertObject");
+        assert_eq!(
+            (last_dialog(&s)["path"].as_str(), last_dialog(&s)["asText"].as_bool()),
+            (Some("/x/notes.txt"), Some(true))
+        );
     }
 }

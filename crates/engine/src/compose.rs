@@ -450,6 +450,17 @@ pub struct ComposeState {
     /// What `preview` previews: the command and its parameters as JSON.
     #[serde(skip)]
     pub preview_key: Option<String>,
+
+    // --- floating drawing objects (`cmd::drawing`) ---
+    /// The selected drawing object of the body (its [`mailcraft_model::Drawing::id`]).
+    pub selected_drawing: Option<u32>,
+    /// The armed drawing tool: the next drag in the body draws it (`shape:<name>`, `textBox`, `canvas`,
+    /// `scribble`, `tablePencil`, `tableEraser`).
+    #[serde(skip)]
+    pub draw_tool: Option<String>,
+    /// Width of the body's text area as last shown (px at 100 %), for placing and aligning drawings.
+    #[serde(skip)]
+    pub view_width: Option<f32>,
 }
 
 /// Edits that share one undo step while they follow each other at the caret (typing a word, holding
@@ -1604,7 +1615,7 @@ impl ComposeState {
                 _ => Block::Rule,
             });
         }
-        Doc { blocks, base: self.body.base.clone(), background: None }
+        Doc { blocks, base: self.body.base.clone(), background: None, drawings: Vec::new() }
     }
 
     /// Pastes a document fragment at the caret.
@@ -5082,6 +5093,13 @@ impl ComposeState {
             }
             _ => {}
         });
+        // Drawing objects in theme colours and fonts follow the theme too.
+        for d in &mut self.body.drawings {
+            map_color(&mut d.fill);
+            map_color(&mut d.outline);
+            map_color(&mut d.text_style.color);
+            map_font(&mut d.text_style.font_family, false);
+        }
         self.body.base.font_family = Some(after.body_font.clone());
         self.dirty = true;
     }

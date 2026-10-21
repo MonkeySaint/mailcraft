@@ -144,6 +144,8 @@ pub(crate) trait EditorHost {
     /// Live Preview: shows `choice` (a gallery command and its parameters) in compose `cid`'s body, or stops
     /// previewing (`None`).
     fn live_preview(&mut self, _cid: u64, _choice: Option<(String, Value)>) {}
+    /// Tells the compose how wide its text area is shown (px at 100 %), for placing and aligning drawings.
+    fn set_view_width(&mut self, _cid: u64, _width: f32) {}
 }
 
 impl EditorHost for App {
@@ -216,6 +218,14 @@ impl EditorHost for App {
                 let _ = self.s.run("compose.livePreview", &json!({"compose": cid, "clear": true}));
             }
             _ => {}
+        }
+    }
+    fn set_view_width(&mut self, cid: u64, width: f32) {
+        if let Some(c) = self.s.composes.get_mut(&cid)
+            && width.is_finite()
+            && c.view_width != Some(width)
+        {
+            c.view_width = Some(width);
         }
     }
 }
@@ -1406,6 +1416,25 @@ fn object_at(layout: &Layout, c: &ComposeState, p: mailcraft_geom::Point) -> Opt
     None
 }
 
+/// The content id of the chart, SmartArt graphic or 3D model picture under `p`, if any (pictures MailCraft
+/// drew and kept the recipe of).
+fn editable_picture(layout: &Layout, c: &ComposeState, p: mailcraft_geom::Point) -> Option<String> {
+    layout.display.items.iter().rev().find_map(|item| {
+        let DisplayItem::Image { rect, src, .. } = item else { return None };
+        if !(p.x >= rect.x && p.x <= rect.x + rect.w && p.y >= rect.y && p.y <= rect.y + rect.h) {
+            return None;
+        }
+        let cid = src.strip_prefix("cid:")?;
+        c.generated
+            .iter()
+            .any(|g| {
+                g.content_id.eq_ignore_ascii_case(cid)
+                    && matches!(g.kind.as_str(), "chart" | "smartArt" | "model3d")
+            })
+            .then(|| cid.to_owned())
+    })
+}
+
 /// Spelling squiggle colour.
 const SPELLING_INK: Color32 = Color32::from_rgb(0xd8, 0x2c, 0x2c);
 /// Grammar underline colour.
@@ -1647,6 +1676,13 @@ pub(crate) fn body_editor_in(
     let id = editor_id(cid);
     let choice = take_preview_request(&ctx, cid);
     host.live_preview(cid, choice);
+    {
+        // Drawings are placed and aligned in the width the text is shown in (px at 100 %).
+        let zoom = f32::from(host.compose(cid)?.zoom_pct().clamp(10, 500)) / 100.0;
+        let avail = ui.available_width();
+        let width = if avail.is_finite() { avail.max(MIN_TEXT_W + 2.0 * PAD) } else { 800.0 };
+        host.set_view_width(cid, ((width - 2.0 * PAD).max(MIN_TEXT_W) / zoom).round());
+    }
     let c = host.compose(cid)?;
     // Live Preview: the body as the gallery choice under the pointer would leave it.
     let shown = c.preview.as_ref().unwrap_or(&c.body);
@@ -1677,6 +1713,8 @@ pub(crate) fn body_editor_in(
     // Background and body (the body painter draws the selection handed to it).
     let bg = crate::body::map_color(c.body.background.unwrap_or(mailcraft_geom::Color::WHITE), dark);
     ui.painter().rect_filled(rect, 0.0, bg);
+    // Drawings behind the text.
+    super::drawing::paint(ui, &*host, cid, origin, zoom, true);
     let sel = c.selection.clone();
     mem.view.doc_key = mem.doc_key;
     mem.view.selection = Some((to_text(&sel.anchor), to_text(&sel.focus)));
@@ -1736,6 +1774,8 @@ pub(crate) fn body_editor_in(
     {
         paint_marks(ui, layout, &c.body, origin, zoom);
     }
+    // Drawings in front of the text, the selected one's handles and the object being drawn.
+    super::drawing::paint(ui, &*host, cid, origin, zoom, false);
     let select_objects = c.editor.select_objects;
 
     // The editor's interaction, on top of the painted body.
@@ -1749,10 +1789,12 @@ pub(crate) fn body_editor_in(
         layout.and_then(|l| l.hit_pos(local(p))).map(to_doc).unwrap_or_else(|| body_start.clone())
     };
     let link_under = |p: Pos2| -> Option<String> { layout.and_then(|l| l.hit(local(p))).map(str::to_owned) };
+    // Drawings take the pointer (and their keys) first: drawing tools, selecting, moving, sizing, typing.
+    let on_drawing = super::drawing::interact(ui, host, cid, &resp, origin, zoom, select_objects, &hit);
     let (pressed, down, mods) =
         ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers));
     let hover_link = resp.hover_pos().and_then(link_under);
-    if resp.hovered() {
+    if resp.hovered() && !on_drawing {
         let icon = if select_objects {
             CursorIcon::Default
         } else if hover_link.is_some() && mods.command {
@@ -1764,7 +1806,18 @@ pub(crate) fn body_editor_in(
     }
     super::claim_initial_focus(ui, cid, &resp);
     let mut changed = false;
-    if select_objects {
+    // A double-click on a chart, SmartArt graphic or 3D model opens its editor.
+    let edit_pic = (resp.double_clicked() && !on_drawing)
+        .then(|| resp.interact_pointer_pos())
+        .flatten()
+        .and_then(|p| layout.zip(host.compose(cid)).and_then(|(l, c)| editable_picture(l, c, local(p))));
+    if on_drawing {
+        *drag_anchor = None;
+    } else if let Some(pic) = edit_pic {
+        *drag_anchor = None;
+        host.run("insert.editPicture", with_compose(cid, json!({"cid": pic})));
+        changed = true;
+    } else if select_objects {
         // Select Objects: a click picks the picture under the pointer; text is not selected.
         if pressed && let Some(p) = resp.interact_pointer_pos() {
             resp.request_focus();
@@ -1905,10 +1958,12 @@ pub(crate) fn body_editor_in(
     let focused = resp.has_focus();
     let mut acted = false;
     if focused {
+        // Esc puts away an armed drawing tool or deselects a drawing, so the body keeps it then.
+        let escape = host.compose(cid).is_some_and(|c| c.draw_tool.is_some() || c.selected_drawing.is_some());
         ctx.memory_mut(|m| {
             m.set_focus_lock_filter(
                 id,
-                EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false },
+                EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape },
             );
         });
         // The @mention list takes its keys first (Up / Down / Enter / Tab / Esc while it is open).

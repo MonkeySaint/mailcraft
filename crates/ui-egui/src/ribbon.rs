@@ -53,8 +53,11 @@ pub fn tabs(app: &App, surface: Surface) -> Vec<&'static str> {
             }
             v
         }
-        Surface::Compose(_) => {
+        Surface::Compose(id) => {
             let mut v = d.tab_names("compose", simplified);
+            if drawing_selected(app, id) {
+                v.extend(d.tab_names("shapeformat", simplified));
+            }
             v.push("Help");
             v
         }
@@ -66,6 +69,14 @@ pub fn tabs(app: &App, surface: Surface) -> Vec<&'static str> {
     }
 }
 
+/// Whether compose `cid` has a drawing object selected (the Shape Format tab shows).
+fn drawing_selected(app: &App, cid: u64) -> bool {
+    app.s
+        .composes
+        .get(&cid)
+        .is_some_and(|c| c.selected_drawing.is_some_and(|id| c.body.drawings.iter().any(|d| d.id == id)))
+}
+
 /// The definition drawn for a tab name on a surface (module and window fallbacks applied).
 fn resolve_tab(app: &App, surface: Surface, name: &str) -> Option<&'static Tab> {
     let d = defs();
@@ -73,6 +84,7 @@ fn resolve_tab(app: &App, surface: Surface, name: &str) -> Option<&'static Tab> 
     let chain: Vec<&str> = match surface {
         Surface::Main if name == "Search" => vec!["search"],
         Surface::Main => module_surface(app).into_iter().chain(["main"]).collect(),
+        Surface::Compose(_) if name == "Shape Format" => vec!["shapeformat"],
         Surface::Compose(_) => vec!["compose", "main"],
         Surface::Read(_) => vec!["read", "main"],
     };
@@ -157,6 +169,19 @@ pub fn ribbon(ui: &mut egui::Ui, app: &mut App, surface: Surface, frame: &Frame)
             select_tab(app, surface, "Search");
         }
         mem.flags.insert("__searchActive".to_owned(), app.ui.search_active);
+    }
+    // The Shape Format tab comes forward when a new drawing is put in and selected.
+    if let Surface::Compose(cid) = surface
+        && let Some(c) = app.s.composes.get(&cid)
+    {
+        let key = egui::Id::new(("mailcraft-ribbon-drawing-max", cid));
+        let newest = c.body.drawings.iter().map(|d| d.id).max().unwrap_or(0);
+        let seen = ui.ctx().data(|d| d.get_temp::<u32>(key));
+        let fresh = seen.is_some_and(|s| newest > s) && c.selected_drawing == Some(newest);
+        ui.ctx().data_mut(|d| d.insert_temp(key, newest.max(seen.unwrap_or(0))));
+        if fresh {
+            select_tab(app, surface, "Shape Format");
+        }
     }
     let simplified = app.s.view.simplified_ribbon;
     let height =

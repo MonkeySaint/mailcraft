@@ -208,7 +208,7 @@ fn draw_table_pad_makes_a_table_with_the_drawn_columns() {
     let (app, cid) = app_with_body("x");
     let mut h = harness(app);
     h.run();
-    h.state_mut().run("insert.table", json!({"compose": cid, "mode": "draw"}));
+    h.state_mut().run("insert.table", json!({"compose": cid, "mode": "draw", "pad": true}));
     h.run();
     h.run();
     let pad = h.get_by_label("Table drawing area").rect();

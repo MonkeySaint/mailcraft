@@ -1146,7 +1146,9 @@ fn insert_3d_model_and_gallery_filter_open_their_windows() {
     let mut h = full_harness(app);
     h.run();
     h.get_by_label("Insert 3D Model");
-    h.get_by_label("OBJ and STL models are inserted as a picture of the model.");
+    h.get_by_label(
+        "OBJ, STL, PLY and glTF models are inserted as a picture of the model, which can be turned later.",
+    );
     h.get_by_label("Cancel").click();
     h.run();
     assert!(h.state().ui.dialogs.is_empty());

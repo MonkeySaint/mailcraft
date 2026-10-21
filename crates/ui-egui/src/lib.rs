@@ -66,6 +66,9 @@ pub struct UiState {
     /// Window then shows the folder in the main window instead (an embedded second main window would clash
     /// with the first). Mirrored from the context every frame.
     pub embedded_viewports: bool,
+    /// The egui context of the last frame: commands run outside a frame's drawing code (shortcuts, the save
+    /// prompt, AutoSave) first hand any half-typed drawing text to the engine (`compose::flush_drawing_text`).
+    pub egui_ctx: Option<egui::Context>,
     /// Search box has focus (shows the Search contextual tab).
     pub search_active: bool,
     pub search_text: String,
@@ -373,6 +376,19 @@ impl App {
 
     /// Runs a command; errors become a toast (never panics).
     pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
+        // Text typed into a text box, shape or WordArt lives in the editor until the edit ends: every other
+        // command (Send, Save, AutoSave, Close…) sees it first.
+        if !id.starts_with("drawing.")
+            && let Some(ctx) = self.ui.egui_ctx.clone()
+        {
+            let cids: Vec<u64> = match params.get("compose").and_then(Value::as_u64) {
+                Some(cid) => vec![cid],
+                None => self.s.composes.keys().copied().collect(),
+            };
+            for cid in cids {
+                compose::flush_drawing_text(&ctx, self, cid);
+            }
+        }
         match self.s.run(id, &params) {
             Ok(v) => {
                 // The session keeps no To-Do Bar state: the UI applies the part (see `apply_todo_bar`).
@@ -436,6 +452,7 @@ impl App {
     /// builds it from the context). The main window always covers the whole viewport.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.ui.egui_ctx = Some(ctx.clone());
         self.ui.embedded_viewports = ctx.embed_viewports();
         egui_extras::install_image_loaders(&ctx);
         self.sync_theme(&ctx);

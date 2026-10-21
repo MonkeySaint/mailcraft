@@ -108,7 +108,7 @@ zeroize = "1.8"
 # file formats: Compound File Binary container ([MS-CFB]) for .msg (MIT)
 cfb = "0.14"
 
-# tooling (xtask ico): SVG rasterising
+# SVG rasterising: xtask ico, the UI (app icon, SVG pictures) and mailcraft-render (generated pictures to PNG)
 resvg = { version = "0.45.1", default-features = false }
 
 # text / rendering

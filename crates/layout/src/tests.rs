@@ -1197,6 +1197,7 @@ fn arb_doc() -> impl Strategy<Value = Doc> {
         blocks,
         base: TextStyle::default(),
         background: bg.then_some(Color::WHITE),
+        drawings: Vec::new(),
     })
 }
 

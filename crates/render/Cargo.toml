@@ -12,6 +12,8 @@ mailcraft-fonts.workspace = true
 mailcraft-layout.workspace = true
 mailcraft-model.workspace = true
 tiny-skia.workspace = true
+# Rasterising generated SVG pictures to PNG before they are sent (Apache-2.0 OR MIT).
+resvg.workspace = true
 krilla.workspace = true
 
 [lints]

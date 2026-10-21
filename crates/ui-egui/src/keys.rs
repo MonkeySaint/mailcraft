@@ -219,6 +219,9 @@ pub struct KeyContext {
     /// A non-text widget that a click activates (button, tab, check box, folder row) has keyboard focus:
     /// Space / Enter press it and the arrow keys move focus, so they are not bound here.
     pub widget_focus: bool,
+    /// The text of a drawing (text box, shape, WordArt) in a compose body has keyboard focus: Send and Save
+    /// still work, the body formatting shortcuts do not (they would format the hidden body selection).
+    pub drawing_text: bool,
 }
 
 impl KeyContext {
@@ -235,6 +238,7 @@ impl KeyContext {
             ctrl_enter_sends: true,
             space_reading: true,
             widget_focus: false,
+            drawing_text: false,
         }
     }
 
@@ -261,6 +265,7 @@ impl KeyContext {
             ctrl_enter_sends: app.s.settings.bool("mail.send.ctrlEnterSends"),
             space_reading: app.s.settings.bool("mail.readingPane.spaceBarReading"),
             widget_focus: widget_focused(ctx),
+            drawing_text: crate::compose::drawing_text_focused(ctx),
         }
     }
 }
@@ -364,6 +369,21 @@ fn allowed_with_text_focus(c: Chord, surface: Surface) -> bool {
     false
 }
 
+/// Keys allowed in the context: the text-focus rule, and in a drawing's text only Send and Save of the
+/// compose formatting shortcuts.
+fn allowed_in(c: Chord, cx: &KeyContext) -> bool {
+    if !cx.text_focus {
+        return true;
+    }
+    if !allowed_with_text_focus(c, cx.surface) {
+        return false;
+    }
+    !(cx.drawing_text
+        && matches!(cx.surface, Surface::Compose(_))
+        && is_compose_formatting(c)
+        && !(c.cmd && !c.shift && !c.alt && matches!(c.key, Key::S | Key::Enter)))
+}
+
 /// Compose formatting shortcuts that apply even while a header field has focus.
 fn is_compose_formatting(c: Chord) -> bool {
     if !c.cmd {
@@ -432,7 +452,7 @@ fn function_key_number(k: Key) -> Option<u8> {
 
 /// Resolves a chord with the built-in bindings (no registry fallback). Honours the text-focus rule.
 pub fn resolve(c: Chord, cx: &KeyContext) -> Option<Action> {
-    if cx.text_focus && !allowed_with_text_focus(c, cx.surface) {
+    if !allowed_in(c, cx) {
         return None;
     }
     if cx.widget_focus && goes_to_focused_widget(c) {
@@ -467,7 +487,7 @@ pub fn resolve_with(c: Chord, cx: &KeyContext, registry: &Registry) -> Option<Ac
     if matches!(cx.surface, Surface::Compose(_)) && !cx.ctrl_enter_sends && c == Chord::cmd(Key::Enter) {
         return None;
     }
-    if cx.text_focus && !allowed_with_text_focus(c, cx.surface) {
+    if !allowed_in(c, cx) {
         return None;
     }
     if cx.widget_focus && goes_to_focused_widget(c) {

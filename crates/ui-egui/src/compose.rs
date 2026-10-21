@@ -31,6 +31,9 @@ mod a11y;
 mod attach;
 pub(crate) mod capture;
 mod clipboard;
+mod drawing;
+#[cfg(test)]
+mod drawing_tests;
 mod editor;
 mod fonts;
 #[cfg(test)]
@@ -40,6 +43,16 @@ mod minibar;
 mod panes;
 mod recipients;
 mod spelling;
+
+/// Hands half-typed drawing text of compose `cid` to the engine before another command runs (`App::run`).
+pub(crate) fn flush_drawing_text(ctx: &egui::Context, app: &mut App, cid: u64) {
+    drawing::flush(ctx, app, cid);
+}
+
+/// Whether the keyboard focus is in the text of a text box, shape or WordArt in a compose body.
+pub(crate) fn drawing_text_focused(ctx: &egui::Context) -> bool {
+    drawing::text_focused(ctx)
+}
 #[cfg(test)]
 mod tests;
 mod voting;
@@ -203,6 +216,9 @@ fn field_id(cid: u64, f: Field) -> Id {
 /// The compose whose header field or body has keyboard focus, if any (for the keyboard handler: compose
 /// shortcuts such as Ctrl+Enter apply to it, and list shortcuts must not fire while typing).
 pub fn focused_compose(ctx: &egui::Context, app: &App) -> Option<u64> {
+    if let Some(cid) = drawing::text_focus_compose(ctx).filter(|cid| app.s.composes.contains_key(cid)) {
+        return Some(cid);
+    }
     let focus = ctx.memory(|m| m.focused())?;
     app.s.composes.keys().copied().find(|&cid| {
         focus == editor_id(cid)
@@ -259,6 +275,7 @@ fn request_close(ctx: &egui::Context, app: &mut App, cid: u64) {
 
 /// All open compose windows (non-inline composes in `app.s.composes`).
 pub fn compose_windows(ctx: &egui::Context, app: &mut App) {
+    app.ui.egui_ctx = Some(ctx.clone());
     capture::poll(ctx, app);
     let now = ctx.input(|i| i.time);
     auto_save_timer(ctx, app, now);
@@ -835,16 +852,27 @@ fn insert_command(
             Some(path) => run_with_path(app, cmd, path),
             None => false,
         },
-        "insert.model3d" if no_file => {
-            match picked(app, "Insert 3D Model", &[FileFilter::new("3D models", &["obj", "stl"])]) {
+        "insert.model3d" if no_file && params.get("edit").is_none() => {
+            match picked(
+                app,
+                "Insert 3D Model",
+                &[FileFilter::new("3D models", &["obj", "stl", "ply", "gltf", "glb"])],
+            ) {
                 Some(path) => run_with_path(app, cmd, path),
                 None => false,
             }
         }
-        "insert.object" if no_file => match picked(app, "Insert Object", &[]) {
-            Some(path) => run_with_path(app, cmd, path),
-            None => false,
-        },
+        // The picked file then goes to the Object dialog, which asks how to put it in (icon, link or text).
+        "insert.object" if no_file && params.get("ask").is_none() => {
+            match picked(app, "Insert Object", &[]) {
+                Some(Some(path)) => {
+                    app.run(cmd, json!({"compose": cid, "path": path, "ask": true}));
+                    true
+                }
+                Some(None) => true,
+                None => false,
+            }
+        }
         "compose.theme"
             if params.get("action").and_then(serde_json::Value::as_str) == Some("browse")
                 && params.get("path").is_none() =>

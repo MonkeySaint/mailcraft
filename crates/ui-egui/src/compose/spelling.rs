@@ -18,6 +18,9 @@ use crate::App;
 pub const TITLE: &str = "Spelling and Grammar";
 /// Shown when no issue is left.
 pub const COMPLETE: &str = "The spelling and grammar check is complete.";
+/// Shown when the message text is done but text boxes or shapes have issues.
+pub const DRAWINGS_LEFT: &str =
+    "The message text is checked. These words in text boxes and shapes may be misspelled:";
 /// Context chars shown on each side of the flagged word.
 const CONTEXT_CHARS: usize = 80;
 
@@ -41,6 +44,9 @@ struct SpellDlg {
     current: Option<Current>,
     /// Selected suggestion.
     pick: usize,
+    /// Issues in the text of text boxes, shapes and WordArt: (drawing id, word). The steps go through the
+    /// message text; these are listed when it is done, each with a button that selects its drawing.
+    drawings: Vec<(u64, String)>,
 }
 
 fn state_id(cid: u64) -> Id {
@@ -96,6 +102,18 @@ fn step(app: &mut App, cid: u64, st: &mut SpellDlg) {
         return;
     };
     st.language = r.get("language").and_then(Value::as_str).unwrap_or("en-US").to_owned();
+    st.drawings = r
+        .get("drawings")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|i| {
+                    Some((i.get("drawing")?.as_u64()?, i.get("word")?.as_str()?.chars().take(60).collect()))
+                })
+                .take(50)
+                .collect()
+        })
+        .unwrap_or_default();
     st.current = r.get("current").filter(|v| !v.is_null()).and_then(|cur| {
         let start = parse_pos(cur.get("start")?)?;
         let end = cur.get("end").and_then(parse_pos).unwrap_or_else(|| start.clone());
@@ -151,6 +169,8 @@ enum Choice {
     Add,
     Change(bool),
     Close,
+    /// Close and select a drawing whose text has an issue (to fix it in place).
+    SelectDrawing(u64),
 }
 
 /// Draws the dialog of compose `cid` when open (call once per frame from the compose's viewport).
@@ -171,7 +191,22 @@ pub(crate) fn dialog(ctx: &egui::Context, app: &mut App, cid: u64) {
         ui.label(RichText::new(format!("{TITLE}: {}", language_name(&st.language))).strong().size(14.0));
         ui.add_space(8.0);
         let Some(cur) = st.current.clone() else {
-            ui.label(COMPLETE);
+            if st.drawings.is_empty() {
+                ui.label(COMPLETE);
+            } else {
+                ui.label(DRAWINGS_LEFT);
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                    for (n, (id, word)) in st.drawings.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(word).color(Color32::from_rgb(0xc4, 0x26, 0x26)));
+                            if ui.push_id(n, |ui| ui.link("Select")).inner.clicked() {
+                                choice = Some(Choice::SelectDrawing(*id));
+                            }
+                        });
+                    }
+                });
+            }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new("OK").min_size(vec2(80.0, 26.0))).clicked() {
@@ -274,6 +309,11 @@ pub(crate) fn dialog(ctx: &egui::Context, app: &mut App, cid: u64) {
         Some(Choice::Close) => {
             st.open = false;
             st.current = None;
+        }
+        Some(Choice::SelectDrawing(id)) => {
+            st.open = false;
+            st.current = None;
+            app.run("drawing.select", json!({"compose": cid, "id": id}));
         }
         Some(Choice::IgnoreOnce) => {
             app.run("review.ignore", json!({"compose": cid, "at": at}));

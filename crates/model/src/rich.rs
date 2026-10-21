@@ -459,6 +459,147 @@ pub enum Block {
     },
 }
 
+/// What a floating drawing object is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DrawingKind {
+    /// A shape from the Shapes gallery (its geometry is [`Drawing::shape`]); it can hold text.
+    #[default]
+    Shape,
+    /// A text box: a rectangle meant for text.
+    TextBox,
+    /// Decorative text drawn in a WordArt style ([`Drawing::word_art`]).
+    WordArt,
+    /// A drawing canvas: a frame that keeps the drawings placed inside it together.
+    Canvas,
+}
+
+/// Vertical placement of the text inside a drawing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VAlign {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// A floating drawing object of the compose body (text box, shape, WordArt, drawing canvas). It sits over the
+/// text ("in front of text", or behind it) at its own position instead of flowing with the paragraphs.
+/// Positions and sizes are px at 100 % zoom, from the top-left corner of the body's text area.
+///
+/// Mail has no portable way to send floating objects, so the compose window turns each group of drawings into
+/// a picture placed in the text when the message is sent; while composing they stay editable.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Drawing {
+    /// Unique within the document (selection, commands).
+    pub id: u32,
+    pub kind: DrawingKind,
+    /// Geometry name (`rectangle`, `oval`, `rightArrow`, `scribble`, …); text boxes use `rectangle`.
+    pub shape: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Clockwise rotation in degrees.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rotation: f32,
+    /// Fill colour (`None` = no fill).
+    pub fill: Option<Color>,
+    /// Outline colour (`None` = no outline).
+    pub outline: Option<Color>,
+    /// Outline weight in px.
+    pub outline_px: f32,
+    /// Shape effect: `""` (the theme's effect style), `none`, `shadow`, `glow`, `reflection`, `bevel`,
+    /// `softEdges`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub effect: String,
+    /// The text inside (lines separated by `\n`).
+    pub text: String,
+    /// Formatting of the text (colour, font, size, bold, italic, underline).
+    pub text_style: TextStyle,
+    pub align: Align,
+    pub valign: VAlign,
+    /// WordArt style ("Fill: Orange, Accent color 2; Outline: …"; WordArt drawings only).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub word_art: String,
+    /// Alternative text for people who use screen readers (and the sent picture's alt text).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub alt: String,
+    /// Freeform / scribble outline, as fractions (0..=1) of the box.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<(f32, f32)>,
+    /// Drawn behind the body text instead of in front of it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub behind_text: bool,
+    /// The drawing canvas this drawing was drawn in (or moved into): it moves and is deleted with that
+    /// canvas. A canvas drawn over drawings that already exist does not take them in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<u32>,
+    /// Gradient fill: `""` (solid), `down`, `up`, `right`, `left` (from a light tint of the fill to the fill,
+    /// in that direction) or `center` (light in the middle).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub gradient: String,
+    /// The text runs top to bottom (turned 90° clockwise) instead of left to right.
+    #[serde(skip_serializing_if = "is_false")]
+    pub vertical: bool,
+    /// Outline drawn around the letters of the text (WordArt: instead of its style's outline).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_outline: Option<Color>,
+    /// Effect on the letters of the text: `""` (WordArt: its style's), `none`, `shadow`, `glow`,
+    /// `reflection` (WordArt only), `bevel`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub text_effect: String,
+}
+
+impl Default for Drawing {
+    fn default() -> Self {
+        Drawing {
+            id: 0,
+            kind: DrawingKind::Shape,
+            shape: "rectangle".into(),
+            x: 0.0,
+            y: 0.0,
+            w: 160.0,
+            h: 100.0,
+            rotation: 0.0,
+            fill: None,
+            outline: None,
+            outline_px: 1.0,
+            effect: String::new(),
+            text: String::new(),
+            text_style: TextStyle::default(),
+            align: Align::Start,
+            valign: VAlign::Top,
+            word_art: String::new(),
+            alt: String::new(),
+            points: Vec::new(),
+            behind_text: false,
+            canvas: None,
+            gradient: String::new(),
+            vertical: false,
+            text_outline: None,
+            text_effect: String::new(),
+        }
+    }
+}
+
+impl Drawing {
+    /// Whether the point (`px`, `py`) lies in the drawing's box (rotation ignored).
+    pub fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px <= self.x + self.w && py >= self.y && py <= self.y + self.h
+    }
+
+    /// Whether this drawing's box lies wholly inside `other`'s box.
+    pub fn inside(&self, other: &Drawing) -> bool {
+        self.x >= other.x
+            && self.y >= other.y
+            && self.x + self.w <= other.x + other.w
+            && self.y + self.h <= other.y + other.h
+    }
+}
+
 /// A rich-text document.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Doc {
@@ -466,6 +607,9 @@ pub struct Doc {
     /// Document default text style (compose default: Aptos-like body font, 12 pt).
     pub base: TextStyle,
     pub background: Option<Color>,
+    /// Floating drawing objects (compose bodies), back to front.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drawings: Vec<Drawing>,
 }
 
 impl Doc {
@@ -501,7 +645,7 @@ impl Doc {
         lines.join("\n")
     }
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.blocks.is_empty() && self.drawings.is_empty()
     }
     /// Plain text of all inline content, paragraphs joined by spaces (search snippets, previews).
     pub fn text_content(&self) -> String {

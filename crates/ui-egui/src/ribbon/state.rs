@@ -305,9 +305,13 @@ pub fn combo_value(app: &App, surface: Surface, spec: Option<&str>) -> String {
         let pt = s.size_pt.or(c.body.base.size_pt).unwrap_or(mailcraft_fonts::BODY_SIZE_PT);
         if (pt.fract()).abs() < 0.01 { format!("{pt:.0}") } else { format!("{pt:.1}") }
     };
+    // Shape Format › Size: the selected drawing's height and width.
+    let drawing = || c.selected_drawing.and_then(|id| c.body.drawings.iter().find(|d| d.id == id));
     match spec {
         Some("value:font") => selection_value(c, font),
         Some("value:size") => selection_value(c, size),
+        Some("value:drawH") => drawing().map(|d| format!("{:.0} px", d.h)).unwrap_or_default(),
+        Some("value:drawW") => drawing().map(|d| format!("{:.0} px", d.w)).unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -452,7 +456,15 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 41] = [
+pub const SOURCES: [&str; 49] = [
+    "shapes:Lines",
+    "shapes:Rectangles",
+    "shapes:Basic Shapes",
+    "shapes:Block Arrows",
+    "shapes:Equation Shapes",
+    "shapes:Flowchart",
+    "shapes:Stars and Banners",
+    "shapes:Callouts",
     "paragraphSpacing",
     "themeFontNames",
     "fontNames",
@@ -979,6 +991,25 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                     swatch: None,
                     vars: vec![("$key", json!(arrange_key(*a)))],
                     on: *a == cur,
+                })
+                .collect()
+        }
+        // Insert › Shapes and Shape Format › Change Shape: the gallery's shapes of one category.
+        _ if source.starts_with("shapes:") => {
+            use mailcraft_engine::cmd::insert::shapes::{CATEGORIES, SHAPES};
+            let cat = source.strip_prefix("shapes:").unwrap_or("");
+            let current = compose(app, surface)
+                .and_then(|c| c.selected_drawing.and_then(|id| c.body.drawings.iter().find(|d| d.id == id)))
+                .map(|d| d.shape.clone());
+            SHAPES
+                .iter()
+                .filter(|(_, _, ci)| CATEGORIES.get(*ci).is_some_and(|c| *c == cat))
+                .map(|(id, label, _)| DynItem {
+                    label: (*label).to_owned(),
+                    icon: "",
+                    swatch: None,
+                    vars: vec![("$name", json!(id))],
+                    on: current.as_deref() == Some(*id),
                 })
                 .collect()
         }

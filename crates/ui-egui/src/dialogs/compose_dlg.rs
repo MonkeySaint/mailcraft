@@ -430,7 +430,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                     f(
                         "n",
                         "",
-                        Kind::Note("OBJ and STL models are inserted as a picture of the model.".into()),
+                        Kind::Note("OBJ, STL, PLY and glTF models are inserted as a picture of the model, which can be turned later.".into()),
                     ),
                 ],
             )
@@ -477,55 +477,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                     .map(|_| None)
             },
         ),
-        "icons" => {
-            let names: Vec<String> = d
-                .str("available")
-                .split(',')
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .collect();
-            run_form(
-                ctx,
-                app,
-                d,
-                Form::new("Insert Icons", vec![f("name", "Icon:", Kind::Combo(names))]).ok("Insert"),
-                |app, v| cmd(app, "insert.icon", with(json!({"name": v.s("name")}))).map(|_| None),
-            )
-        }
-        "insertChart" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Insert Chart",
-                vec![
-                    f("kind", "Chart type:", combo(&["column", "bar", "line", "pie"])),
-                    f("title", "Title:", Kind::Text),
-                    f("data", "Data (label, value per line):", Kind::Multi),
-                ],
-            )
-            .init("kind", json!(if d.str("kind").is_empty() { "column".to_owned() } else { d.str("kind") }))
-            .init("data", json!("Q1, 10\nQ2, 14\nQ3, 9")),
-            |app, v| {
-                let data: Vec<Value> = v
-                    .s("data")
-                    .lines()
-                    .filter_map(|l| {
-                        let (a, b) = l.split_once(',')?;
-                        Some(json!([a.trim(), b.trim().parse::<f64>().ok()?]))
-                    })
-                    .collect();
-                if data.is_empty() {
-                    return Err("Enter at least one \"label, value\" line.".into());
-                }
-                cmd(
-                    app,
-                    "insert.chart",
-                    with(json!({"kind": v.s("kind"), "title": v.s("title"), "data": data})),
-                )
-                .map(|_| None)
-            },
-        ),
         "insertTable" => run_form(
             ctx,
             app,
@@ -547,13 +498,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 )
                 .map(|_| None)
             },
-        ),
-        "drawTextBox" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new("Text Box", vec![f("text", "Text:", Kind::Multi)]).ok("Insert"),
-            |app, v| cmd(app, "insert.textBox", with(json!({"text": v.s("text")}))).map(|_| None),
         ),
         "insertLink" => super::link_dlg::show(ctx, app, d),
         "sortText" => sort_text(ctx, app, d),
@@ -640,20 +584,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "insertObject" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Object",
-                vec![f("path", "File name:", Kind::Text), f("asText", "Insert the file's text", Kind::Check)],
-            )
-            .ok("Insert"),
-            |app, v| {
-                cmd(app, "insert.object", with(json!({"path": v.s("path"), "asText": v.b("asText")})))
-                    .map(|_| None)
-            },
-        ),
         "attachFile" => run_form(
             ctx,
             app,
@@ -733,30 +663,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 },
             )
         }
-        "smartArt" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Choose a SmartArt Graphic",
-                vec![
-                    f("layout", "Layout:", combo(&["list", "process", "cycle", "hierarchy"])),
-                    f("items", "Items (one per line):", Kind::Multi),
-                ],
-            )
-            .ok("Insert"),
-            |app, v| {
-                let items: Vec<String> = v
-                    .s("items")
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-                cmd(app, "insert.smartArt", with(json!({"layout": v.s("layout"), "items": items})))
-                    .map(|_| None)
-            },
-        ),
         "translate" => translate(ctx, app, d),
         "wordCount" => word_count(ctx, app, d),
         "accessibility" => accessibility(ctx, app, d),
@@ -1102,7 +1008,13 @@ fn multilevel_gallery(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 fn word_count(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    window(ctx, app, d, "Word Count", 320.0, |ui, app| {
+    // "Include text boxes and shapes" (on by default; remembered while the dialog is open).
+    let include_id = egui::Id::new(("mailcraft-wordcount-drawings", d.uid));
+    let mut include = ctx.data(|m| m.get_temp::<bool>(include_id)).unwrap_or(true);
+    let drawings = d.get("drawings").cloned().unwrap_or(Value::Null);
+    let has_drawings = drawings.get("words").and_then(Value::as_u64).unwrap_or(0) > 0
+        || drawings.get("charactersWithSpaces").and_then(Value::as_u64).unwrap_or(0) > 0;
+    let out = window(ctx, app, d, "Word Count", 320.0, |ui, app| {
         egui::Grid::new(("wc", d.uid)).num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
             for (label, key) in [
                 ("Words", "words"),
@@ -1111,13 +1023,23 @@ fn word_count(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 ("Paragraphs", "paragraphs"),
                 ("Lines", "lines"),
             ] {
+                let extra = if include { drawings.get(key).and_then(Value::as_u64).unwrap_or(0) } else { 0 };
                 ui.label(label);
-                ui.label(d.u64(key).unwrap_or(0).to_string());
+                ui.label(d.u64(key).unwrap_or(0).saturating_add(extra).to_string());
                 ui.end_row();
             }
         });
+        if has_drawings {
+            ui.checkbox(&mut include, "Include text boxes and shapes");
+        }
         footer(ui, |ui| if primary(ui, app, true, "Close") { Out::Close } else { Out::Keep })
-    })
+    });
+    if out.keeps() {
+        ctx.data_mut(|m| m.insert_temp(include_id, include));
+    } else {
+        ctx.data_mut(|m| m.remove::<bool>(include_id));
+    }
+    out
 }
 
 fn accessibility(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -1136,11 +1058,16 @@ fn accessibility(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             for (n, i) in list.into_iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(format!("•  {}", i.get("message").and_then(Value::as_str).unwrap_or_default()));
-                    // Go to: selects the start of the paragraph or table the issue is in.
+                    // Go to: selects the start of the paragraph or table the issue is in, or the drawing.
                     if let (Some(at), Some(cid)) = (i.get("at"), d.u64("compose"))
                         && ui.push_id((sev, n), |ui| ui.link("Go to")).inner.clicked()
                     {
                         app.run("compose.select", json!({"compose": cid, "anchor": at, "focus": at}));
+                    } else if let (Some(id), Some(cid)) =
+                        (i.get("drawing").and_then(Value::as_u64), d.u64("compose"))
+                        && ui.push_id((sev, n), |ui| ui.link("Select")).inner.clicked()
+                    {
+                        app.run("drawing.select", json!({"compose": cid, "id": id}));
                     }
                 });
             }

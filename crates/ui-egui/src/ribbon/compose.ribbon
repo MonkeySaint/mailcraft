@@ -537,6 +537,7 @@ dyn | tableGrid | insert.table | {"rows":"$rows","cols":"$cols"}
 sep
 item | Insert Table... | table | insert.table | {"mode":"dialog"} | I
 item | Draw Table | format-painter | insert.table | {"mode":"draw"} | D
+item | Eraser | clean-up | drawing.tool | {"tool":"tableEraser"} | E
 item | Convert Text to Table... | | insert.table | {"mode":"fromText"} | V
 sub | Quick Tables | table | quickTables | | T
 
@@ -550,30 +551,16 @@ menu pictures
 item | This Device... | picture | insert.picture | | D
 
 menu shapes
-item | Line | minus | insert.shape | {"kind":"line"} |
-item | Arrow: Right | chevron-right | insert.shape | {"kind":"rightArrow"} |
-item | Arrow: Left | chevron-left | insert.shape | {"kind":"leftArrow"} |
-item | Arrow: Up | chevron-up | insert.shape | {"kind":"upArrow"} |
-item | Arrow: Down | chevron-down | insert.shape | {"kind":"downArrow"} |
-item | Rectangle | table | insert.shape | {"kind":"rectangle"} |
-item | Rectangle: Rounded Corners | | insert.shape | {"kind":"roundedRectangle"} |
-item | Oval | | insert.shape | {"kind":"oval"} |
-item | Isosceles Triangle | | insert.shape | {"kind":"triangle"} |
-item | Right Triangle | | insert.shape | {"kind":"rightTriangle"} |
-item | Parallelogram | | insert.shape | {"kind":"parallelogram"} |
-item | Trapezoid | | insert.shape | {"kind":"trapezoid"} |
-item | Diamond | | insert.shape | {"kind":"diamond"} |
-item | Pentagon | | insert.shape | {"kind":"pentagon"} |
-item | Hexagon | | insert.shape | {"kind":"hexagon"} |
-item | Octagon | | insert.shape | {"kind":"octagon"} |
-item | Cross | plus | insert.shape | {"kind":"plus"} |
-item | Arrow: Chevron | chevron-right | insert.shape | {"kind":"chevron"} |
-item | Star: 5 Points | | insert.shape | {"kind":"star"} |
-item | Star: 6 Points | | insert.shape | {"kind":"star6"} |
-item | Heart | | insert.shape | {"kind":"heart"} |
-item | Speech Bubble: Rectangle | conversation | insert.shape | {"kind":"callout"} |
+sub | Lines | minus | shapesLines | | L
+sub | Rectangles | table | shapesRectangles | | R
+sub | Basic Shapes | new-items | shapesBasic | | B
+sub | Block Arrows | chevron-right | shapesArrows | | A
+sub | Equation Shapes | plus | shapesEquation | | E
+sub | Flowchart | sort | shapesFlowchart | | F
+sub | Stars and Banners | favorites | shapesStars | | S
+sub | Callouts | conversation | shapesCallouts | | C
 sep
-item | New Drawing Canvas | picture | insert.shape | {"kind":"canvas"} | N
+item | New Drawing Canvas | picture | insert.shape | {"kind":"canvas","draw":true} | N
 
 menu models3d
 item | This Device... | picture | insert.model3d | | D
@@ -847,3 +834,301 @@ item | Spelling and Grammar | spelling | review.spelling | {"grammar":true} | G
 menu language
 item | Set Proofing Language... | email | review.language | | L
 item | Language Preferences... | settings | options.open | {"page":"language"} | P
+
+# ------------------------------------------------------------------------------------------------------------
+# Shape Format contextual tab (compose window, while a drawing object is selected). One definition for both
+# ribbon modes.
+
+surface shapeformat
+mode both
+
+tab Shape Format | JD
+group Insert Shapes | ZI
+drop L | Shapes | new-items | | | SH | menu=shapes
+split S | Text Box | note | insert.textBox | {"preset":"draw"} | TX | menu=drawTextBox
+drop S | Edit Shape | new-items | | | E | menu=changeShape
+group Shape Styles | ZS | launch=drawing.format
+drop L | Shape Styles | favorites | | | SS | menu=shapeQuickStyles
+drop S | Shape Fill | highlight | | | SF | menu=shapeFill
+drop S | Shape Outline | font-color | | | SO | menu=shapeOutline
+drop S | Shape Effects | favorites | | | SE | menu=shapeEffects
+group WordArt Styles | ZW
+drop L | Quick Styles | font-color | | | Q | menu=wordArtStyles
+drop S | Text Fill | font-color | | | TI | menu=textFill
+drop S | Text Outline | font-color | | | TO | menu=textOutline
+drop S | Text Effects | favorites | | | TE | menu=textEffects
+group Text | ZT
+drop S | Text Direction | sort | | | TD | menu=textDirection
+drop S | Align Text | align-left | | | AT | menu=alignText
+drop S | Font | bold | | | FN | menu=drawingFont
+group Accessibility | ZA
+button L | Alt Text | info | drawing.altText | | AA
+group Arrange | ZR
+split S | Bring Forward | chevron-up | drawing.arrange | {"action":"bringForward"} | AF | menu=bringForward
+split S | Send Backward | chevron-down | drawing.arrange | {"action":"sendBackward"} | AE | menu=sendBackward
+button S | Selection Pane | sort | format.selectionPane | | AP
+drop S | Align | align-center | | | AL | menu=alignObjects
+drop S | Rotate | redo | | | AY | menu=rotate
+button S | Delete | delete | drawing.delete | | D
+group Size | ZZ | launch=drawing.format
+combo S | Height | | | | H | menu=drawHeights w=70 on=value:drawH
+combo S | Width | | | | W | menu=drawWidths w=70 on=value:drawW
+
+menu shapesLines
+dyn | shapes:Lines | insert.shape | {"kind":"$name","draw":true}
+
+menu shapesRectangles
+dyn | shapes:Rectangles | insert.shape | {"kind":"$name","draw":true}
+
+menu shapesBasic
+dyn | shapes:Basic Shapes | insert.shape | {"kind":"$name","draw":true}
+
+menu shapesArrows
+dyn | shapes:Block Arrows | insert.shape | {"kind":"$name","draw":true}
+
+menu shapesEquation
+dyn | shapes:Equation Shapes | insert.shape | {"kind":"$name","draw":true}
+
+menu shapesFlowchart
+dyn | shapes:Flowchart | insert.shape | {"kind":"$name","draw":true}
+
+menu shapesStars
+dyn | shapes:Stars and Banners | insert.shape | {"kind":"$name","draw":true}
+
+menu shapesCallouts
+dyn | shapes:Callouts | insert.shape | {"kind":"$name","draw":true}
+
+menu changeShape
+sub | Rectangles | table | changeRectangles | | R
+sub | Basic Shapes | new-items | changeBasic | | B
+sub | Block Arrows | chevron-right | changeArrows | | A
+sub | Equation Shapes | plus | changeEquation | | E
+sub | Flowchart | sort | changeFlowchart | | F
+sub | Stars and Banners | favorites | changeStars | | S
+sub | Callouts | conversation | changeCallouts | | C
+
+menu changeRectangles
+dyn | shapes:Rectangles | drawing.changeShape | {"shape":"$name"}
+
+menu changeBasic
+dyn | shapes:Basic Shapes | drawing.changeShape | {"shape":"$name"}
+
+menu changeArrows
+dyn | shapes:Block Arrows | drawing.changeShape | {"shape":"$name"}
+
+menu changeEquation
+dyn | shapes:Equation Shapes | drawing.changeShape | {"shape":"$name"}
+
+menu changeFlowchart
+dyn | shapes:Flowchart | drawing.changeShape | {"shape":"$name"}
+
+menu changeStars
+dyn | shapes:Stars and Banners | drawing.changeShape | {"shape":"$name"}
+
+menu changeCallouts
+dyn | shapes:Callouts | drawing.changeShape | {"shape":"$name"}
+
+menu drawTextBox
+item | Draw Text Box | note | insert.textBox | {"preset":"draw"} | H
+item | Draw Vertical Text Box | note | insert.textBox | {"preset":"draw","vertical":true} | V
+
+menu shapeQuickStyles
+sub | Outlined | favorites | shapeStylesOutline | | O
+sub | Filled | favorites | shapeStylesFill | | F
+sub | Light | favorites | shapeStylesLight | | L
+sub | Strong | favorites | shapeStylesStrong | | S
+
+menu shapeStylesOutline
+item | Outlined, Text Color | favorites | drawing.shapeStyle | {"style":"outline","accent":0} |
+item | Outlined, Accent 1 | favorites | drawing.shapeStyle | {"style":"outline","accent":1} |
+item | Outlined, Accent 2 | favorites | drawing.shapeStyle | {"style":"outline","accent":2} |
+item | Outlined, Accent 3 | favorites | drawing.shapeStyle | {"style":"outline","accent":3} |
+item | Outlined, Accent 4 | favorites | drawing.shapeStyle | {"style":"outline","accent":4} |
+item | Outlined, Accent 5 | favorites | drawing.shapeStyle | {"style":"outline","accent":5} |
+item | Outlined, Accent 6 | favorites | drawing.shapeStyle | {"style":"outline","accent":6} |
+
+menu shapeStylesFill
+item | Filled, Text Color | favorites | drawing.shapeStyle | {"style":"fill","accent":0} |
+item | Filled, Accent 1 | favorites | drawing.shapeStyle | {"style":"fill","accent":1} |
+item | Filled, Accent 2 | favorites | drawing.shapeStyle | {"style":"fill","accent":2} |
+item | Filled, Accent 3 | favorites | drawing.shapeStyle | {"style":"fill","accent":3} |
+item | Filled, Accent 4 | favorites | drawing.shapeStyle | {"style":"fill","accent":4} |
+item | Filled, Accent 5 | favorites | drawing.shapeStyle | {"style":"fill","accent":5} |
+item | Filled, Accent 6 | favorites | drawing.shapeStyle | {"style":"fill","accent":6} |
+
+menu shapeStylesLight
+item | Light, Text Color | favorites | drawing.shapeStyle | {"style":"light","accent":0} |
+item | Light, Accent 1 | favorites | drawing.shapeStyle | {"style":"light","accent":1} |
+item | Light, Accent 2 | favorites | drawing.shapeStyle | {"style":"light","accent":2} |
+item | Light, Accent 3 | favorites | drawing.shapeStyle | {"style":"light","accent":3} |
+item | Light, Accent 4 | favorites | drawing.shapeStyle | {"style":"light","accent":4} |
+item | Light, Accent 5 | favorites | drawing.shapeStyle | {"style":"light","accent":5} |
+item | Light, Accent 6 | favorites | drawing.shapeStyle | {"style":"light","accent":6} |
+
+menu shapeStylesStrong
+item | Strong, Text Color | favorites | drawing.shapeStyle | {"style":"strong","accent":0} |
+item | Strong, Accent 1 | favorites | drawing.shapeStyle | {"style":"strong","accent":1} |
+item | Strong, Accent 2 | favorites | drawing.shapeStyle | {"style":"strong","accent":2} |
+item | Strong, Accent 3 | favorites | drawing.shapeStyle | {"style":"strong","accent":3} |
+item | Strong, Accent 4 | favorites | drawing.shapeStyle | {"style":"strong","accent":4} |
+item | Strong, Accent 5 | favorites | drawing.shapeStyle | {"style":"strong","accent":5} |
+item | Strong, Accent 6 | favorites | drawing.shapeStyle | {"style":"strong","accent":6} |
+
+menu shapeFill
+dyn | themeColors | drawing.fill | {"theme":"$theme","tint":"$tint"}
+sep
+item | No Fill | close | drawing.fill | {"color":null} | N
+item | More Fill Colors... | highlight | drawing.fill | {"custom":true} | M
+sub | Gradient | highlight | shapeGradients | | G
+
+menu shapeGradients
+item | No Gradient | close | drawing.fill | {"gradient":""} | N
+sep
+item | Light at the Top | chevron-down | drawing.fill | {"gradient":"down"} | T
+item | Light at the Bottom | chevron-up | drawing.fill | {"gradient":"up"} | B
+item | Light at the Left | chevron-right | drawing.fill | {"gradient":"right"} | L
+item | Light at the Right | chevron-left | drawing.fill | {"gradient":"left"} | R
+item | Light in the Middle | favorites | drawing.fill | {"gradient":"center"} | M
+
+menu shapeOutline
+dyn | themeColors | drawing.outline | {"theme":"$theme","tint":"$tint"}
+sep
+item | No Outline | close | drawing.outline | {"color":null} | N
+item | More Outline Colors... | font-color | drawing.outline | {"custom":true} | M
+sub | Weight | minus | outlineWeights | | W
+
+menu outlineWeights
+item | 1/2 px | minus | drawing.outline | {"weight":0.5} |
+item | 1 px | minus | drawing.outline | {"weight":1} |
+item | 2 px | minus | drawing.outline | {"weight":2} |
+item | 3 px | minus | drawing.outline | {"weight":3} |
+item | 4 px | minus | drawing.outline | {"weight":4} |
+item | 6 px | minus | drawing.outline | {"weight":6} |
+item | 8 px | minus | drawing.outline | {"weight":8} |
+
+menu shapeEffects
+item | Theme Effect | favorites | drawing.effect | {"effect":""} | T
+item | No Effect | close | drawing.effect | {"effect":"none"} | N
+sep
+item | Shadow | favorites | drawing.effect | {"effect":"shadow"} | S
+item | Reflection | favorites | drawing.effect | {"effect":"reflection"} | R
+item | Glow | favorites | drawing.effect | {"effect":"glow"} | G
+item | Soft Edges | favorites | drawing.effect | {"effect":"softEdges"} | E
+item | Bevel | favorites | drawing.effect | {"effect":"bevel"} | B
+
+menu wordArtStyles
+item | Fill: Black, Text color 1; Shadow | font-color | drawing.wordArt | {"style":"Fill: Black, Text color 1; Shadow"} |
+item | Fill: Dark Teal, Accent color 1; Shadow | font-color | drawing.wordArt | {"style":"Fill: Dark Teal, Accent color 1; Shadow"} |
+item | Fill: Orange, Accent color 2; Outline: Orange, Accent color 2 | font-color | drawing.wordArt | {"style":"Fill: Orange, Accent color 2; Outline: Orange, Accent color 2"} |
+item | Fill: White; Outline: Plum, Accent color 5; Shadow | font-color | drawing.wordArt | {"style":"Fill: White; Outline: Plum, Accent color 5; Shadow"} |
+item | Fill: Turquoise, Accent color 4; Soft Bevel | font-color | drawing.wordArt | {"style":"Fill: Turquoise, Accent color 4; Soft Bevel"} |
+item | Gradient Fill, Gray | font-color | drawing.wordArt | {"style":"Gradient Fill, Gray"} |
+item | Gradient Fill: Plum, Accent color 5; Reflection | font-color | drawing.wordArt | {"style":"Gradient Fill: Plum, Accent color 5; Reflection"} |
+item | Gradient Fill: Turquoise, Accent color 4; Outline: Turquoise, Accent color 4 | font-color | drawing.wordArt | {"style":"Gradient Fill: Turquoise, Accent color 4; Outline: Turquoise, Accent color 4"} |
+item | Fill: White; Outline: Dark Teal, Accent color 1; Glow: Dark Teal, Accent color 1 | font-color | drawing.wordArt | {"style":"Fill: White; Outline: Dark Teal, Accent color 1; Glow: Dark Teal, Accent color 1"} |
+item | Fill: Dark Green, Accent color 3; Sharp Bevel | font-color | drawing.wordArt | {"style":"Fill: Dark Green, Accent color 3; Sharp Bevel"} |
+item | Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: White, Background color 1 | font-color | drawing.wordArt | {"style":"Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: White, Background color 1"} |
+item | Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5 | font-color | drawing.wordArt | {"style":"Fill: Black, Text color 1; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5"} |
+item | Fill: Plum, Accent color 5; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5 | font-color | drawing.wordArt | {"style":"Fill: Plum, Accent color 5; Outline: White, Background color 1; Hard Shadow: Plum, Accent color 5"} |
+item | Fill: White; Outline: Orange, Accent color 2; Hard Shadow: Orange, Accent color 2 | font-color | drawing.wordArt | {"style":"Fill: White; Outline: Orange, Accent color 2; Hard Shadow: Orange, Accent color 2"} |
+item | Fill: Light Gray, Background color 2; Inner Shadow | font-color | drawing.wordArt | {"style":"Fill: Light Gray, Background color 2; Inner Shadow"} |
+sep
+item | Clear WordArt | close | drawing.wordArt | {"style":""} | C
+
+menu textFill
+item | Automatic | font-color | drawing.textColor | {"color":null} | A
+sep
+dyn | themeColors | drawing.textColor | {"theme":"$theme","tint":"$tint"}
+sep
+item | More Fill Colors... | font-color | drawing.textColor | {"custom":true} | M
+
+menu textOutline
+dyn | themeColors | drawing.textOutline | {"theme":"$theme","tint":"$tint"}
+sep
+item | No Outline | close | drawing.textOutline | {"color":null} | N
+item | More Outline Colors... | font-color | drawing.textOutline | {"custom":true} | M
+
+menu textEffects
+item | No Effect | close | drawing.textEffect | {"effect":"none"} | N
+item | WordArt Style's Effects | font-color | drawing.textEffect | {"effect":""} | W
+sep
+item | Shadow | favorites | drawing.textEffect | {"effect":"shadow"} | S
+item | Reflection (WordArt) | favorites | drawing.textEffect | {"effect":"reflection"} | R
+item | Glow | favorites | drawing.textEffect | {"effect":"glow"} | G
+item | Bevel | favorites | drawing.textEffect | {"effect":"bevel"} | B
+
+menu textDirection
+item | Horizontal | align-left | drawing.textDirection | {"vertical":false} | H
+item | Top to Bottom | sort | drawing.textDirection | {"vertical":true} | V
+
+menu alignText
+item | Top | chevron-up | drawing.alignText | {"v":"top"} | T
+item | Middle | align-center | drawing.alignText | {"v":"middle"} | M
+item | Bottom | chevron-down | drawing.alignText | {"v":"bottom"} | B
+sep
+item | Align Left | align-left | drawing.alignText | {"h":"left"} | L
+item | Center | align-center | drawing.alignText | {"h":"center"} | C
+item | Align Right | align-right | drawing.alignText | {"h":"right"} | R
+
+menu drawingFont
+item | Bold | bold | drawing.font | {"bold":true} | B
+item | Not Bold | bold | drawing.font | {"bold":false} |
+item | Italic | italic | drawing.font | {"italic":true} | I
+item | Not Italic | italic | drawing.font | {"italic":false} |
+item | Underline | underline | drawing.font | {"underline":true} | U
+item | No Underline | underline | drawing.font | {"underline":false} |
+sep
+item | 9 pt | | drawing.font | {"size":9} |
+item | 11 pt | | drawing.font | {"size":11} |
+item | 14 pt | | drawing.font | {"size":14} |
+item | 18 pt | | drawing.font | {"size":18} |
+item | 24 pt | | drawing.font | {"size":24} |
+item | 36 pt | | drawing.font | {"size":36} |
+
+menu bringForward
+item | Bring Forward | chevron-up | drawing.arrange | {"action":"bringForward"} | F
+item | Bring to Front | chevron-up | drawing.arrange | {"action":"bringToFront"} | R
+item | Bring in Front of Text | chevron-up | drawing.arrange | {"action":"inFrontOfText"} | T
+
+menu sendBackward
+item | Send Backward | chevron-down | drawing.arrange | {"action":"sendBackward"} | B
+item | Send to Back | chevron-down | drawing.arrange | {"action":"sendToBack"} | K
+item | Send Behind Text | chevron-down | drawing.arrange | {"action":"behindText"} | H
+
+menu alignObjects
+item | Align Left | align-left | drawing.align | {"kind":"left"} | L
+item | Align Center | align-center | drawing.align | {"kind":"center"} | C
+item | Align Right | align-right | drawing.align | {"kind":"right"} | R
+item | Align Top | chevron-up | drawing.align | {"kind":"top"} | T
+item | Align Middle | align-center | drawing.align | {"kind":"middle"} | M
+item | Align Bottom | chevron-down | drawing.align | {"kind":"bottom"} | B
+
+menu rotate
+item | Rotate Right 90° | redo | drawing.rotate | {"by":90} | R
+item | Rotate Left 90° | undo | drawing.rotate | {"by":-90} | L
+item | No Rotation | close | drawing.rotate | {"degrees":0} | N
+sep
+item | More Rotation Options... | settings | drawing.format | | M
+
+menu drawHeights
+item | 24 px | | drawing.size | {"h":24} |
+item | 48 px | | drawing.size | {"h":48} |
+item | 72 px | | drawing.size | {"h":72} |
+item | 96 px | | drawing.size | {"h":96} |
+item | 120 px | | drawing.size | {"h":120} |
+item | 160 px | | drawing.size | {"h":160} |
+item | 240 px | | drawing.size | {"h":240} |
+item | 320 px | | drawing.size | {"h":320} |
+sep
+item | Size and Position... | settings | drawing.format | | S
+
+menu drawWidths
+item | 48 px | | drawing.size | {"w":48} |
+item | 96 px | | drawing.size | {"w":96} |
+item | 160 px | | drawing.size | {"w":160} |
+item | 240 px | | drawing.size | {"w":240} |
+item | 320 px | | drawing.size | {"w":320} |
+item | 480 px | | drawing.size | {"w":480} |
+item | 640 px | | drawing.size | {"w":640} |
+sep
+item | Size and Position... | settings | drawing.format | | S

@@ -205,8 +205,15 @@ fn every_command_has_a_mapped_catalog_counterpart_or_is_known() {
         mailcraft_engine::catalog::catalog_rows().iter().filter_map(|r| r.id).collect();
     // Module commands act on the selected module item (the catalog maps some of these to mail.* ids).
     // Sign sits next to Encrypt once S/MIME is set up; the observed window had no digital ID to show it.
-    let ours =
-        ["help.about", "app.toggleRibbonMode", "rules.alwaysMoveFrom", "mail.addReminder", "compose.sign"];
+    // Delete on the Shape Format tab removes the selected drawing (the observed tab relied on the Delete key).
+    let ours = [
+        "help.about",
+        "app.toggleRibbonMode",
+        "rules.alwaysMoveFrom",
+        "mail.addReminder",
+        "compose.sign",
+        "drawing.delete",
+    ];
     let module = |id: &str| ["people.", "tasks.", "notes.", "calendar."].iter().any(|p| id.starts_with(p));
     let mut odd = Vec::new();
     for (at, c) in all_cmds() {

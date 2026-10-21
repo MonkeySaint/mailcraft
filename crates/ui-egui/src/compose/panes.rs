@@ -17,7 +17,7 @@
 use egui::{Align, Id, Layout, Rect, RichText, Stroke, Ui, UiBuilder, pos2, vec2};
 use serde_json::json;
 
-use mailcraft_engine::cmd::format::{body_objects, styles_list};
+use mailcraft_engine::cmd::format::styles_list;
 use mailcraft_engine::compose::ComposeState;
 
 use crate::App;
@@ -412,8 +412,9 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
     let Some(c) = app.s.composes.get(&cid) else {
         return;
     };
-    let objects = body_objects(c);
+    let objects = mailcraft_engine::cmd::format::pane_objects(c);
     let sel = c.selection.clone();
+    let sel_drawing = c.selected_drawing;
     let ctx = ui.ctx().clone();
     let mut hidden = hidden_objects(&ctx, cid);
     let before = hidden.clone();
@@ -434,9 +435,15 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
         ui,
         |ui| {
             for (i, o) in objects.iter().enumerate() {
-                let selected = sel.start() == &o.at
-                    && sel.end().path == o.at.path
-                    && sel.end().offset == o.at.offset.saturating_add(1);
+                let selected = match o.drawing {
+                    Some(id) => sel_drawing == Some(id),
+                    None => {
+                        sel_drawing.is_none()
+                            && sel.start() == &o.at
+                            && sel.end().path == o.at.path
+                            && sel.end().offset == o.at.offset.saturating_add(1)
+                    }
+                };
                 let is_hidden = hidden.contains(&o.src);
                 ui.horizontal(|ui| {
                     let toggle = if is_hidden { "Show" } else { "Hide" };

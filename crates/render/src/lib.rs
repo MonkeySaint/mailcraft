@@ -22,6 +22,7 @@
 mod paint;
 pub mod pdf;
 pub mod print;
+pub mod svg;
 #[cfg(test)]
 mod tests;
 

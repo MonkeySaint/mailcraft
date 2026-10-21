@@ -48,8 +48,8 @@ pub use mailbox::Mailbox;
 pub use note::{Note, NoteColor};
 pub use quickstep::{QuickStep, QuickStepAction};
 pub use rich::{
-    Block, BorderEdge, BorderJoin, BorderLine, Doc, Inline, LineRule, ParaBorders, ParaStyle, TableBorders,
-    TextStyle, UnderlineKind,
+    Block, BorderEdge, BorderJoin, BorderLine, Doc, Drawing, DrawingKind, Inline, LineRule, ParaBorders,
+    ParaStyle, TableBorders, TextStyle, UnderlineKind, VAlign,
 };
 pub use rule::{Rule, RuleAction, RuleCondition};
 pub use signature::{AccountSignatures, RecentRecipient, Signature};

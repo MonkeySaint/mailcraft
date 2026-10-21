@@ -2656,8 +2656,10 @@ pub struct BodyObject {
     pub name: String,
     /// Where it sits: the picture is the char at `at`.
     pub at: DocPos,
-    /// The picture's source (`cid:…`), which identifies it across edits.
+    /// The picture's source (`cid:…`), which identifies it across edits; `drawing:<id>` for a drawing.
     pub src: String,
+    /// The floating drawing (text box, shape, WordArt, canvas) this is, when it is not a picture.
+    pub drawing: Option<u32>,
 }
 
 /// The objects of a compose body, in document order.
@@ -2678,9 +2680,44 @@ pub fn body_objects(c: &ComposeState) -> Vec<BodyObject> {
             let n = out.len().saturating_add(1);
             let alt = alt.trim();
             let name = if alt.is_empty() { format!("Picture {n}") } else { alt.chars().take(80).collect() };
-            out.push(BodyObject { name, at: DocPos::new(path.clone(), off), src });
+            out.push(BodyObject { name, at: DocPos::new(path.clone(), off), src, drawing: None });
         }
     }
+    out
+}
+
+/// The floating drawings of a compose body, front-most first (as the Selection pane lists them): named by
+/// their alternative text, else their text, else their kind and number.
+pub fn drawing_objects(c: &ComposeState) -> Vec<BodyObject> {
+    use mailcraft_model::rich::DrawingKind;
+    c.body
+        .drawings
+        .iter()
+        .rev()
+        .take(MAX_OBJECTS)
+        .map(|d| {
+            let first_line = |t: &str| t.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_owned);
+            let kind = match d.kind {
+                DrawingKind::TextBox => "Text Box".to_owned(),
+                DrawingKind::WordArt => "WordArt".to_owned(),
+                DrawingKind::Canvas => "Drawing Canvas".to_owned(),
+                DrawingKind::Shape => crate::cmd::insert::shapes::label(&d.shape).to_owned(),
+            };
+            let name = first_line(&d.alt)
+                .or_else(|| first_line(&d.text))
+                .unwrap_or_else(|| format!("{kind} {}", d.id))
+                .chars()
+                .take(80)
+                .collect();
+            BodyObject { name, at: c.body_start(), src: format!("drawing:{}", d.id), drawing: Some(d.id) }
+        })
+        .collect()
+}
+
+/// Everything the Selection pane lists: the pictures in the text, then the floating drawings.
+pub fn pane_objects(c: &ComposeState) -> Vec<BodyObject> {
+    let mut out = body_objects(c);
+    out.extend(drawing_objects(c));
     out
 }
 
@@ -2688,18 +2725,29 @@ pub fn body_objects(c: &ComposeState) -> Vec<BodyObject> {
 /// object n (its picture, for copy, cut, delete or formatting).
 fn selection_pane(s: &mut Session, p: &Value) -> CmdResult {
     let c = compose_mut(s, p)?;
-    let objects = body_objects(c);
+    let objects = pane_objects(c);
     if let Some(n) = opt_u64(p, "select") {
         let obj = usize::try_from(n)
             .ok()
             .and_then(|i| objects.get(i))
             .ok_or_else(|| CmdError::Params(format!("no object {n}")))?;
-        let end = DocPos::new(obj.at.path.clone(), obj.at.offset.saturating_add(1));
-        c.set_selection(obj.at.clone(), end);
+        if let Some(id) = obj.drawing {
+            c.selected_drawing = Some(id);
+        } else {
+            let end = DocPos::new(obj.at.path.clone(), obj.at.offset.saturating_add(1));
+            c.selected_drawing = None;
+            c.set_selection(obj.at.clone(), end);
+        }
     } else if opt_bool(p, "list") != Some(true) {
         c.editor.selection_pane = opt_bool(p, "show").unwrap_or(!c.editor.selection_pane);
     }
-    let list: Vec<Value> = objects.iter().map(|o| json!({"name": o.name, "at": pos_json(&o.at)})).collect();
+    let list: Vec<Value> = objects
+        .iter()
+        .map(|o| match o.drawing {
+            Some(id) => json!({"name": o.name, "drawing": id}),
+            None => json!({"name": o.name, "at": pos_json(&o.at)}),
+        })
+        .collect();
     Ok(json!({"selectionPane": c.editor.selection_pane, "objects": list}))
 }
 
@@ -4348,6 +4396,22 @@ mod pane_tests {
         assert_eq!(s.run("format.selectionPane", &json!({})).unwrap()["selectionPane"], true);
         assert_eq!(s.run("format.selectObjects", &json!({"on": true})).unwrap()["selectObjects"], true);
         assert_eq!(s.run("format.selectObjects", &json!({"on": true})).unwrap()["selectObjects"], true);
+    }
+
+    /// Regression: shapes became floating drawings and dropped out of the Selection pane.
+    #[test]
+    fn selection_pane_lists_and_selects_drawings() {
+        let (mut s, id) = with_text("ab");
+        s.run("insert.shape", &json!({"kind": "oval", "x": 0, "y": 0})).unwrap();
+        s.run("insert.textBox", &json!({"text": "Note\nmore", "x": 200, "y": 0})).unwrap();
+        s.run("drawing.select", &json!({"id": null})).unwrap();
+        let r = s.run("format.selectionPane", &json!({"list": true})).unwrap();
+        let names: Vec<&str> =
+            r["objects"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Note", "Oval"], "front-most first");
+        let oval = s.composes[&id].body.drawings[0].id;
+        s.run("format.selectionPane", &json!({"select": 1})).unwrap();
+        assert_eq!(s.composes[&id].selected_drawing, Some(oval));
     }
 
     #[test]

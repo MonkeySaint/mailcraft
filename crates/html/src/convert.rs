@@ -1248,5 +1248,5 @@ pub(crate) fn dom_to_doc(dom: &Dom) -> Doc {
         ..Ctx::default()
     };
     let blocks = conv.flow_with(Dom::ROOT, &ctx, ctx.para(), 0);
-    Doc { blocks, base, background: bx.background }
+    Doc { blocks, base, background: bx.background, drawings: Vec::new() }
 }

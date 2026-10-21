@@ -167,6 +167,63 @@ Compose|Insert > WordArt|Fill: White; Outline: Orange, Accent color 2; Hard Shad
 Compose|Insert > WordArt|Fill: Light Gray, Background color 2; Inner Shadow|insert.wordArt
 Compose|Insert > More Options|Insert New Equation|insert.equation
 Compose|Insert > More Options|Save Selection to Equation Gallery...|insert.saveToGallery
+Compose|Shape Format › Insert Shapes|Shapes|insert.shape
+Compose|Shape Format › Insert Shapes|Change Shape|drawing.changeShape
+Compose|Shape Format › Insert Shapes|Edit Points|drawing.editPoints
+Compose|Shape Format › Insert Shapes|Draw Horizontal Text Box|insert.textBox
+Compose|Shape Format › Insert Shapes|Vertical Text Box|insert.textBox
+Compose|Shape Format › Shape Styles|Quick Styles|drawing.shapeStyle
+Compose|Shape Format › Shape Styles|Shape Fill|drawing.fill
+Compose|Shape Format › Shape Styles|More Fill Colors...|drawing.fill
+Compose|Shape Format › Shape Styles|Gradient|drawing.fill
+Compose|Shape Format › Shape Styles|Change Outline Color|drawing.outline
+Compose|Shape Format › Shape Styles|More Outline Colors...|drawing.outline
+Compose|Shape Format › Shape Styles|Weight|drawing.outline
+Compose|Shape Format › Shape Styles|Shape Effects|drawing.effect
+Compose|Shape Format › Shape Styles|Shadow|drawing.effect
+Compose|Shape Format › Shape Styles|Reflection|drawing.effect
+Compose|Shape Format › Shape Styles|Glow|drawing.effect
+Compose|Shape Format › Shape Styles|Soft Edges|drawing.effect
+Compose|Shape Format › Shape Styles|Bevel Shape Effect|drawing.effect
+Compose|Shape Format › Shape Styles|Format Shape|drawing.format
+Compose|Shape Format › WordArt Styles|Quick Styles|drawing.wordArt
+Compose|Shape Format › WordArt Styles|Clear WordArt|drawing.wordArt
+Compose|Shape Format › WordArt Styles|Text Fill|drawing.textColor
+Compose|Shape Format › WordArt Styles|More Fill Colors...|drawing.textColor
+Compose|Shape Format › WordArt Styles|Text Outline|drawing.textOutline
+Compose|Shape Format › WordArt Styles|More Outline Colors...|drawing.textOutline
+Compose|Shape Format › WordArt Styles|Text Effects|drawing.textEffect
+Compose|Shape Format › Text|Align Text|drawing.alignText
+Compose|Shape Format › Text|Font|drawing.font
+Compose|Shape Format › Text|Text Direction|drawing.textDirection
+Compose|Shape Format › Text|Create Text Box Link|drawing.linkTextBox
+Compose|Shape Format › Accessibility|Alt Text|drawing.altText
+Compose|Shape Format › Arrange|Bring Forward|drawing.arrange
+Compose|Shape Format › Arrange|Bring to Front|drawing.arrange
+Compose|Shape Format › Arrange|Bring in Front of Text|drawing.arrange
+Compose|Shape Format › Arrange|Send Backward|drawing.arrange
+Compose|Shape Format › Arrange|Send to Back|drawing.arrange
+Compose|Shape Format › Arrange|Send Behind Text|drawing.arrange
+Compose|Shape Format › Arrange|Text Wrap Gallery|drawing.wrapText
+Compose|Shape Format › Arrange|Selection Pane...|format.selectionPane
+Compose|Shape Format › Arrange|Align Left|drawing.align
+Compose|Shape Format › Arrange|Align Center|drawing.align
+Compose|Shape Format › Arrange|Align Right|drawing.align
+Compose|Shape Format › Arrange|Align Top|drawing.align
+Compose|Shape Format › Arrange|Align Middle|drawing.align
+Compose|Shape Format › Arrange|Align Bottom|drawing.align
+Compose|Shape Format › Arrange|Rotate|drawing.rotate
+Compose|Shape Format › Arrange|More Rotation Options...|drawing.format
+Compose|Shape Format › Arrange|Group Objects|drawing.group
+Compose|Shape Format › Arrange|Distribute Horizontally|drawing.distribute
+Compose|Shape Format › Arrange|Distribute Vertically|drawing.distribute
+Compose|Shape Format › Size|Height|drawing.size
+Compose|Shape Format › Size|Width|drawing.size
+Compose|Shape Format › Size|Size and Position|drawing.format
+# Observed on the Table Layout tab; MailCraft has no Table Layout tab: the eraser is on Insert › Table.
+Compose|Table Layout › Draw|Eraser|drawing.tool
+# Observed on the Chart Design tab; MailCraft has no Chart Design tab: double-click a chart to edit its data.
+Compose|Chart Design › Data|Edit Chart Data|insert.editPicture
 Compose|Insert > Symbol|Euro Sign|insert.symbol
 Compose|Insert > Symbol|Pound Sign|insert.symbol
 Compose|Insert > Symbol|Yen Sign|insert.symbol

@@ -761,6 +761,10 @@ fn color_target(target: &str) -> (&'static str, &'static str) {
         "highlight" => ("format.highlight", "Highlight Colors"),
         "shading" => ("format.shading", "Shading Colors"),
         "page" => ("compose.pageColor", "Page Color"),
+        "shapeFill" => ("drawing.fill", "Shape Fill Colors"),
+        "shapeOutline" => ("drawing.outline", "Outline Colors"),
+        "textFill" => ("drawing.textColor", "Text Fill Colors"),
+        "textOutline" => ("drawing.textOutline", "Text Outline Colors"),
         _ => ("format.color", "Colors"),
     }
 }

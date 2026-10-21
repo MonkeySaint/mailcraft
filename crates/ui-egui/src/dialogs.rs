@@ -19,6 +19,7 @@ mod borders_dlg;
 mod categories;
 mod common;
 mod compose_dlg;
+mod drawing_dlg;
 pub(crate) mod files;
 mod find;
 mod find_replace_dlg;
@@ -302,7 +303,9 @@ pub const KNOWN: &[&str] = &[
     "createBuildingBlock",
     "quickTables",
     "insertTable",
-    "drawTextBox",
+    "model3dView",
+    "drawingAltText",
+    "formatShape",
     "insertLink",
     "bookmark",
     "symbol",
@@ -401,6 +404,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return out;
     }
     if let Some(out) = insert_dlg::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = drawing_dlg::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = compose_dlg::show(ctx, app, d) {

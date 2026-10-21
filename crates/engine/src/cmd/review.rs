@@ -236,16 +236,51 @@ fn spelling(s: &mut Session, p: &Value) -> CmdResult {
     } else {
         None
     };
+    let drawings = drawing_spelling(&sp, c, grammar);
     Ok(json!({
         "compose": c.id,
         "issues": issues,
         "count": count,
+        "drawings": drawings,
         "current": current,
         "grammar": grammar,
         "wordsChecked": words,
         "language": c.language.clone().unwrap_or_else(|| "en-US".into()),
         "notChecked": proofing_off(c),
     }))
+}
+
+/// Most issues reported in the text of drawings.
+const MAX_DRAWING_ISSUES: usize = 200;
+
+/// Spelling (and with `grammar`, grammar) issues in the text of the compose's text boxes, shapes and WordArt:
+/// `[{drawing, word, kind, suggestions}]`, in drawing order.
+fn drawing_spelling(sp: &Speller, c: &ComposeState, grammar: bool) -> Vec<Value> {
+    if proofing_off(c).is_some() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for d in c.body.drawings.iter().filter(|d| !d.text.trim().is_empty()) {
+        let chars: Vec<char> = d.text.chars().collect();
+        for i in text_issues(sp, &d.text) {
+            if out.len() >= MAX_DRAWING_ISSUES {
+                return out;
+            }
+            if !grammar && i.kind != "spelling" && i.kind != "repeated" {
+                continue;
+            }
+            let word: String =
+                chars.get(i.start..i.end.min(chars.len())).unwrap_or_default().iter().collect();
+            let suggestions = if i.suggestions.is_empty() && i.kind == "spelling" && out.len() < SUGGEST_FIRST
+            {
+                sp.suggest(&word, SUGGESTIONS)
+            } else {
+                i.suggestions
+            };
+            out.push(json!({"drawing": d.id, "word": word, "kind": i.kind, "suggestions": suggestions}));
+        }
+    }
+    out
 }
 
 /// `{"at": {path, offset}}` when given.
@@ -327,6 +362,20 @@ fn word_count(s: &mut Session, p: &Value) -> CmdResult {
     };
     let wc = c.word_count();
     let scope = if c.selection.is_collapsed() { "body" } else { "selection" };
+    // The text of text boxes, shapes and WordArt, counted on its own (the dialog adds it when asked).
+    let mut dw = crate::compose::WordCount::default();
+    if c.selection.is_collapsed() {
+        for d in c.body.drawings.iter().filter(|d| !d.text.trim().is_empty()) {
+            let lines: Vec<&str> = d.text.split('\n').filter(|l| !l.trim().is_empty()).collect();
+            dw.paragraphs = dw.paragraphs.saturating_add(lines.len());
+            dw.lines = dw.lines.saturating_add(lines.len());
+            dw.words = dw.words.saturating_add(d.text.split_whitespace().count());
+            dw.characters_no_spaces =
+                dw.characters_no_spaces.saturating_add(d.text.chars().filter(|c| !c.is_whitespace()).count());
+            dw.characters_with_spaces =
+                dw.characters_with_spaces.saturating_add(d.text.chars().filter(|c| *c != '\n').count());
+        }
+    }
     let counts = json!({
         "compose": cid,
         "scope": scope,
@@ -335,6 +384,13 @@ fn word_count(s: &mut Session, p: &Value) -> CmdResult {
         "charactersWithSpaces": wc.characters_with_spaces,
         "paragraphs": wc.paragraphs,
         "lines": wc.lines,
+        "drawings": {
+            "words": dw.words,
+            "charactersNoSpaces": dw.characters_no_spaces,
+            "charactersWithSpaces": dw.characters_with_spaces,
+            "paragraphs": dw.paragraphs,
+            "lines": dw.lines,
+        },
     });
     let _ = dialog(s, "wordCount", counts.clone())?;
     Ok(counts)
@@ -857,14 +913,64 @@ mod tests {
         s.run("format.color", &json!({"color": "#eeeeee"})).unwrap();
         s.run("compose.select", &json!({"anchor": {"path": [0], "offset": 5}})).unwrap();
         s.run("insert.shape", &json!({"kind": "oval"})).unwrap();
-        // Shapes carry alt text; an image without alt is flagged.
+        // Shapes carry alt text (their gallery name); an image without alt is flagged.
         s.run("insert.picture", &json!({"name": "p.gif", "data_base64": "R0lGODlhAQABAAAAACw="})).unwrap();
         let r = s.run("review.accessibility", &json!({})).unwrap();
         let kinds: Vec<&str> =
             r["issues"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap()).collect();
         assert!(kinds.contains(&"missingAltText"), "{kinds:?}");
         assert!(kinds.contains(&"lowContrast"));
-        assert_eq!(s.composes[&id].images().len(), 2);
+        assert_eq!(s.composes[&id].images().len(), 1, "the shape is a drawing object, not a picture");
+        assert_eq!(s.composes[&id].body.drawings.len(), 1);
+    }
+
+    /// Regression: shapes stopped being pictures and the checks skipped them: no alt text warning, and the
+    /// text of text boxes was neither spell checked nor counted.
+    #[test]
+    fn drawings_are_checked_and_counted() {
+        let mut s = session();
+        let cid = open(&mut s);
+        s.run("compose.insertText", &json!({"text": "Hello there"})).unwrap();
+        s.run("insert.shape", &json!({"kind": "oval", "x": 0, "y": 0})).unwrap();
+        s.run("insert.textBox", &json!({"text": "Thre wrold words", "x": 200, "y": 0})).unwrap();
+        let ids: Vec<u32> = s.composes[&cid].body.drawings.iter().map(|d| d.id).collect();
+        let r = s.run("review.accessibility", &json!({})).unwrap();
+        let about = |kind: &str| -> Vec<u64> {
+            r["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["kind"] == kind)
+                .filter_map(|i| i["drawing"].as_u64())
+                .collect()
+        };
+        assert_eq!(about("altTextIsShapeName"), [u64::from(ids[0])], "{r}");
+        s.run("drawing.altText", &json!({"id": ids[0], "alt": ""})).unwrap();
+        let r = s.run("review.accessibility", &json!({})).unwrap();
+        assert!(r["issues"].as_array().unwrap().iter().any(|i| i["kind"] == "missingAltText"
+            && i["drawing"] == json!(ids[0])
+            && i["severity"] == "error"));
+        // Text that is too faint on the box.
+        s.run("drawing.textColor", &json!({"id": ids[1], "color": "#f4f4f4"})).unwrap();
+        let r = s.run("review.accessibility", &json!({})).unwrap();
+        assert!(
+            r["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["kind"] == "lowContrast" && i["drawing"] == json!(ids[1])),
+            "{r}"
+        );
+        // Spelling of the box's text.
+        let r = s.run("review.spelling", &json!({"grammar": false})).unwrap();
+        let words: Vec<&str> =
+            r["drawings"].as_array().unwrap().iter().map(|i| i["word"].as_str().unwrap()).collect();
+        assert_eq!(words, ["Thre", "wrold"], "{r}");
+        assert_eq!(r["drawings"][0]["drawing"], json!(ids[1]));
+        // Word Count counts the box's text on its own.
+        s.run("compose.select", &json!({"anchor": {"path": [0], "offset": 0}})).unwrap();
+        let r = s.run("review.wordCount", &json!({})).unwrap();
+        assert_eq!((r["words"].as_u64(), r["drawings"]["words"].as_u64()), (Some(2), Some(3)), "{r}");
     }
 
     fn set(s: &mut Session, key: &str, v: Value) {

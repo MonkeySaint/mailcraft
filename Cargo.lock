@@ -2792,6 +2792,7 @@ dependencies = [
  "mailcraft-layout",
  "mailcraft-model",
  "proptest",
+ "resvg",
  "tiny-skia 0.12.0",
 ]
 

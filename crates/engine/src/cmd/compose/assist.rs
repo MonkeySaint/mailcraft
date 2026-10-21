@@ -717,6 +717,7 @@ mod tests {
             ],
             base,
             background: None,
+            drawings: Vec::new(),
         };
         let small = reduce_formatting(&doc);
         assert_eq!(small.to_plain_text(), doc.to_plain_text());
@@ -754,6 +755,7 @@ mod tests {
             }],
             base: TextStyle { font_family: Some("Aptos".into()), ..Default::default() },
             background: None,
+            drawings: Vec::new(),
         };
         let html = |s: &Session| {
             super::super::build_message(s, &s.composes[&id], None, false).html.unwrap_or_default()

@@ -705,6 +705,16 @@ pub(crate) fn build_message(
     account: Option<&Account>,
     for_draft: bool,
 ) -> MessageBuilder {
+    // Floating drawings become pictures in the text and SVG pictures become PNG: mail programs show
+    // neither reliably.
+    let flat;
+    let c = match crate::cmd::insert::drawing::flattened(c) {
+        Some(f) => {
+            flat = f;
+            &flat
+        }
+        None => c,
+    };
     let lenient = parse_recipients_lenient;
     let mut b = MessageBuilder::new();
     let from = account.filter(|a| !a.address.trim().is_empty()).map(|a| {

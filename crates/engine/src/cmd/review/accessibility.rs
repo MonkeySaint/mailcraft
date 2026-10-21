@@ -2,11 +2,12 @@
 //! Accessibility › Accessibility checker options).
 //!
 //! [`check`] walks the compose body and reports, most serious first:
-//! - errors: pictures without alternative text;
+//! - errors: pictures without alternative text, and drawings (shapes, text boxes) with neither alternative
+//!   text nor text of their own;
 //! - warnings: text that is hard to read against what is behind it (WCAG 2.x contrast: 4.5:1, 3:1 for large
 //!   text), tables without a header row (the first row in bold or as headings), merged table cells, link text
 //!   that does not say where the link goes ("click here", a bare long address), alternative text that is
-//!   just a file name;
+//!   just a file name or a drawing's shape name, a drawing's text hard to read against its fill;
 //! - tips: long messages without headings, skipped heading levels, empty table rows used for spacing,
 //!   repeated blank characters (runs of spaces, several empty paragraphs).
 //!
@@ -27,9 +28,10 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use crate::Session;
+use crate::cmd::insert::{drawing, shapes};
 use crate::compose::{ComposeState, DocPos};
 use mailcraft_geom::Color;
-use mailcraft_model::rich::TableCell;
+use mailcraft_model::rich::{Drawing, DrawingKind, TableCell};
 use mailcraft_model::{Block, Doc, Importance, Inline, ParaStyle, TextStyle};
 
 /// Minimum contrast ratio for body text (WCAG 2.x AA, normal text).
@@ -92,7 +94,7 @@ impl Severity {
 /// One accessibility issue.
 #[derive(Clone, Debug, PartialEq)]
 pub struct A11yIssue {
-    /// `missingAltText`, `altTextIsFileName`, `lowContrast`, `tableHeader`, `mergedCells`,
+    /// `missingAltText`, `altTextIsFileName`, `altTextIsShapeName`, `lowContrast`, `tableHeader`, `mergedCells`,
     /// `unclearLinkText`, `noHeadings`, `headingOrder`, `blankTableRows`, `emptyParagraphs`, `repeatedSpaces`.
     pub kind: &'static str,
     pub severity: Severity,
@@ -101,6 +103,8 @@ pub struct A11yIssue {
     pub at: Option<DocPos>,
     /// What it is about (picture source, colour, link address).
     pub target: Option<String>,
+    /// The drawing (text box, shape, WordArt) it is about.
+    pub drawing: Option<u32>,
 }
 
 impl A11yIssue {
@@ -112,6 +116,9 @@ impl A11yIssue {
             }
             if let Some(t) = &self.target {
                 o.insert("target".into(), json!(t));
+            }
+            if let Some(d) = self.drawing {
+                o.insert("drawing".into(), json!(d));
             }
         }
         v
@@ -148,6 +155,7 @@ impl Walk<'_> {
                 message: message.to_owned(),
                 at: Some(DocPos::new(at.to_vec(), 0)),
                 target,
+                drawing: None,
             });
         }
     }
@@ -421,6 +429,7 @@ fn looks_like_file_name(alt: &str) -> bool {
 /// order).
 pub fn check(c: &ComposeState) -> Vec<A11yIssue> {
     let mut out = walk(&c.body).out;
+    drawing_issues(c, &mut out);
     out.sort_by_key(|i| i.severity);
     out
 }
@@ -446,9 +455,68 @@ fn walk(doc: &Doc) -> Walk<'_> {
             message: "Long messages are easier to navigate with headings.".into(),
             at: None,
             target: None,
+            drawing: None,
         });
     }
     w
+}
+
+/// Issues of the drawings floating over the body: a drawing that says nothing to a screen reader (no
+/// alternative text and no text of its own, or only its shape's name), and text hard to read against the
+/// drawing's fill (or the page behind a drawing without one).
+fn drawing_issues(c: &ComposeState, out: &mut Vec<A11yIssue>) {
+    if c.body.drawings.is_empty() {
+        return;
+    }
+    let theme = c.theme_resolved();
+    let page = c.body.background.unwrap_or(Color::WHITE);
+    let mut push = |kind, severity, message: &str, d: &Drawing, target: Option<String>| {
+        if out.len() < MAX_ISSUES {
+            out.push(A11yIssue {
+                kind,
+                severity,
+                message: message.to_owned(),
+                at: None,
+                target,
+                drawing: Some(d.id),
+            });
+        }
+    };
+    for d in &c.body.drawings {
+        let alt = d.alt.trim();
+        let has_text = !d.text.trim().is_empty();
+        // A canvas is a frame: what is drawn in it is checked on its own.
+        if d.kind != DrawingKind::Canvas && !has_text {
+            if alt.is_empty() {
+                push("missingAltText", Severity::Error, "A drawing has no alternative text.", d, None);
+            } else if alt.eq_ignore_ascii_case(shapes::label(&d.shape)) || alt.eq_ignore_ascii_case(&d.shape)
+            {
+                push(
+                    "altTextIsShapeName",
+                    Severity::Warning,
+                    "A drawing's alternative text is just its shape's name: say what it shows.",
+                    d,
+                    Some(alt.to_owned()),
+                );
+            }
+        }
+        if has_text && d.kind != DrawingKind::WordArt {
+            let fg = d.text_style.color.unwrap_or_else(|| drawing::default_text_color(d, &theme));
+            let bg = d.fill.unwrap_or(page);
+            let pt = d.text_style.size_pt.unwrap_or(11.0);
+            let large = pt >= 18.0 || (d.text_style.bold == Some(true) && pt >= 14.0);
+            let min = if large { MIN_CONTRAST_LARGE } else { MIN_CONTRAST };
+            if fg.contrast(&bg) < min {
+                push(
+                    "lowContrast",
+                    Severity::Warning,
+                    "The text of a drawing is hard to read against its fill.",
+                    d,
+                    Some(fg.to_hex()),
+                );
+            }
+        }
+    }
 }
 
 /// Accessibility checker options › "Accessibility warnings:" (`whileWorking`, `when`, `checkerOnly`).
