@@ -79,6 +79,49 @@ fn current_view(app: &App) -> mailcraft_model::ViewSettings {
     mailcraft_engine::queries::view_settings(&app.s, app.s.selection.folder)
 }
 
+/// The selected folder's module view (contacts, tasks and notes folders).
+fn module_here(
+    app: &App,
+) -> Option<(
+    mailcraft_engine::cmd::view::modules::ModuleKind,
+    mailcraft_engine::cmd::view::modules::ModuleView,
+)> {
+    mailcraft_engine::cmd::view::modules::current(&app.s, app.s.selection.folder)
+}
+
+/// The module item the main window has selected (People, Tasks, Notes).
+fn module_item(app: &App, surface: Surface) -> Option<mailcraft_model::ItemId> {
+    if surface != Surface::Main
+        || !matches!(app.s.view.module, Module::People | Module::Tasks | Module::Notes)
+    {
+        return None;
+    }
+    app.ui.module_selection.map(mailcraft_model::ItemId)
+}
+
+/// Tags state of the selected contact or task (`pim:private`, `pim:high`, `pim:low`, `pim:flagged`).
+fn pim_on(app: &App, surface: Surface, arg: &str) -> bool {
+    let Some(id) = module_item(app, surface) else { return false };
+    let mb = &app.s.mailbox;
+    if let Some(t) = mb.tasks.get(&id) {
+        return match arg {
+            "private" => t.private,
+            "high" => t.priority == mailcraft_model::TaskPriority::High,
+            "low" => t.priority == mailcraft_model::TaskPriority::Low,
+            "flagged" => !t.is_complete() && (t.due.is_some() || t.start.is_some()),
+            _ => false,
+        };
+    }
+    if let Some(c) = mb.contacts.get(&id) {
+        return match arg {
+            "private" => c.private,
+            "flagged" => matches!(c.flag, mailcraft_model::FlagState::Flagged { .. }),
+            _ => false,
+        };
+    }
+    false
+}
+
 fn focused_mail(app: &App, surface: Surface) -> Option<&mailcraft_model::MailItem> {
     let id = match surface {
         Surface::Read(id) => mailcraft_model::ItemId(id),
@@ -120,6 +163,8 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
         "followup" => focused_mail(app, surface)
             .and_then(|m| mailcraft_engine::cmd::mail::follow_up_kind(&app.s, &m.flag))
             .is_some_and(|k| k == arg),
+        // Send / Receive › Work Offline, as the engine keeps it.
+        "offline" => v.work_offline,
         // Folder › Show All Folders A to Z, as the engine keeps it.
         "allaz" => mailcraft_engine::cmd::folder::show_all_az_on(&app.s),
         "favorite" => {
@@ -134,7 +179,14 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
         "reverse" => current_view(app).order == mailcraft_model::SortOrder::Ascending,
         "tighter" => current_view(app).tighter_spacing,
         "groups" => current_view(app).show_in_groups,
-        "preview" => arg.parse::<u8>().is_ok_and(|n| current_view(app).preview_lines == n),
+        // A tasks folder keeps its own message preview (the task notes); mail folders their view settings.
+        "preview" => arg.parse::<u8>().is_ok_and(|n| match module_here(app) {
+            Some((_, st)) => st.preview_lines == n,
+            None => current_view(app).preview_lines == n,
+        }),
+        "pim" => pim_on(app, surface, arg),
+        // The arrangement of a contacts or tasks folder (the module's Arrange By menu).
+        "marr" => module_here(app).is_some_and(|(k, st)| st.arrangement(k) == Some(arg)),
         "layout" => matches!(
             (arg, current_view(app).layout),
             ("compact", ViewLayout::Compact)
@@ -161,10 +213,10 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
                 _ => false,
             }
         }
-        // Send / Receive › Download Preferences: the mode every server account uses (`dl:<mode>`) and On Slow
-        // Connections Download Only Headers.
-        "dl" => download_options(app).iter().all(|o| o.download.name() == arg),
-        "slowHeaders" => download_options(app).iter().all(|o| o.slow_headers_only),
+        // Send / Receive › Download Preferences as the engine shows them (the current account's, else the
+        // defaults for new accounts): the mode (`dl:<mode>`) and On Slow Connections Download Only Headers.
+        "dl" => mailcraft_engine::sync::cmds::shown_preferences(&app.s).0 == arg,
+        "slowHeaders" => mailcraft_engine::sync::cmds::shown_preferences(&app.s).1,
         "ignored" => focused_mail(app, surface).is_some_and(|m| m.ignored),
         "cat" => focused_mail(app, surface)
             .is_some_and(|m| m.categories.iter().any(|c| c.eq_ignore_ascii_case(arg))),
@@ -174,19 +226,6 @@ pub fn is_on(app: &App, surface: Surface, mem: &Mem, spec: &str) -> bool {
         }
         _ => compose(app, surface).is_some_and(|c| compose_on(c, name, arg)),
     }
-}
-
-/// Download options of the server accounts (the default options when there are none).
-fn download_options(app: &App) -> Vec<mailcraft_engine::accounts::AccountOptions> {
-    let v: Vec<_> = app
-        .s
-        .mailbox
-        .accounts
-        .iter()
-        .filter(|a| a.kind != mailcraft_model::AccountKind::Local)
-        .map(|a| mailcraft_engine::accounts::account_options(&app.s, a.id))
-        .collect();
-    if v.is_empty() { vec![mailcraft_engine::accounts::AccountOptions::default()] } else { v }
 }
 
 fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str) -> bool {
@@ -696,6 +735,34 @@ fn saved_theme_items(app: &App, part: &str) -> Vec<DynItem> {
     }
 }
 
+/// Change View / Current View gallery of a module: its built-in views, then the views saved for the selected
+/// folder (or for every folder of the module); checked: the view the folder shows.
+fn module_view_items(app: &App, kind: mailcraft_engine::cmd::view::modules::ModuleKind) -> Vec<DynItem> {
+    use mailcraft_engine::cmd::view::modules;
+    let folder = app.s.selection.folder;
+    let icon = match kind {
+        modules::ModuleKind::People => "people",
+        modules::ModuleKind::Tasks => "tasks",
+        modules::ModuleKind::Notes => "notes",
+    };
+    let choices = if modules::module_kind(&app.s, folder) == Some(kind) {
+        modules::view_choices(&app.s, folder)
+    } else {
+        // Not in a folder of this module: its built-in views, the default one checked.
+        kind.views().iter().map(|v| ((*v).to_owned(), false, *v == kind.default_view())).collect()
+    };
+    choices
+        .into_iter()
+        .map(|(name, saved, on)| DynItem {
+            label: name.clone(),
+            icon: if saved { "view" } else { icon },
+            swatch: None,
+            vars: vec![("$name", json!(name))],
+            on,
+        })
+        .collect()
+}
+
 /// Items of a dynamic source.
 pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
     let plain = |label: &str, icon: &'static str| DynItem {
@@ -754,6 +821,8 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
             .collect(),
         "categories" => {
             let item = focused_mail(app, surface);
+            let pim: Option<&Vec<String>> = module_item(app, surface)
+                .and_then(|id| mailcraft_engine::cmd::calendar::pim::categories(&app.s.mailbox, id));
             sorted_categories(app)
                 .into_iter()
                 .map(|c| {
@@ -763,8 +832,12 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                         icon: "category-tag",
                         swatch: Some([rgb.r, rgb.g, rgb.b]),
                         vars: vec![("$name", json!(c.name))],
-                        on: item
-                            .is_some_and(|m| m.categories.iter().any(|x| x.eq_ignore_ascii_case(&c.name))),
+                        on: match pim {
+                            Some(cats) => cats.iter().any(|x| x.eq_ignore_ascii_case(&c.name)),
+                            None => item.is_some_and(|m| {
+                                m.categories.iter().any(|x| x.eq_ignore_ascii_case(&c.name))
+                            }),
+                        },
                     }
                 })
                 .collect()
@@ -814,6 +887,21 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 }
             })
             .collect(),
+        // Arrangement gallery / Arrange By menu of a contacts or tasks folder: the module's arrangements.
+        "arrange" if module_here(app).is_some_and(|(k, _)| !k.arrangements().is_empty()) => {
+            let Some((kind, st)) = module_here(app) else { return Vec::new() };
+            let cur = st.arrangement(kind).map(str::to_owned);
+            kind.arrangements()
+                .iter()
+                .map(|(key, label)| DynItem {
+                    label: (*label).to_owned(),
+                    icon: "sort",
+                    swatch: None,
+                    vars: vec![("$key", json!(key))],
+                    on: cur.as_deref() == Some(*key),
+                })
+                .collect()
+        }
         "arrange" => {
             let cur = current_view(app).arrange_by;
             ArrangeBy::ALL
@@ -883,26 +971,9 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 on: false,
             })
             .collect(),
-        "views:people" => {
-            ["People", "Business Card", "Card", "Phone", "List"].iter().map(|s| plain(s, "people")).collect()
-        }
-        "views:tasks" => [
-            "Detailed",
-            "Simple List",
-            "To-Do List",
-            "Prioritized",
-            "Active",
-            "Completed",
-            "Today",
-            "Next 7 Days",
-            "Overdue",
-            "Assigned",
-            "Server Tasks",
-        ]
-        .iter()
-        .map(|s| plain(s, "tasks"))
-        .collect(),
-        "views:notes" => ["Icon", "Notes List", "Last 7 Days"].iter().map(|s| plain(s, "notes")).collect(),
+        "views:people" => module_view_items(app, mailcraft_engine::cmd::view::modules::ModuleKind::People),
+        "views:tasks" => module_view_items(app, mailcraft_engine::cmd::view::modules::ModuleKind::Tasks),
+        "views:notes" => module_view_items(app, mailcraft_engine::cmd::view::modules::ModuleKind::Notes),
         _ => Vec::new(),
     }
 }

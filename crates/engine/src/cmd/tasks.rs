@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 use crate::cmd::calendar::{pim, pim::Kind};
 use crate::cmd::util::{opt_bool, opt_str};
 use crate::cmd::view::modules::{self, ModuleKind, ViewRow};
+use crate::cmd::view::table;
 use crate::compose::{ComposeAttachment, ComposeState};
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
 use mailcraft_model::task::{TaskRecurrence, TaskRequestState};
@@ -100,6 +101,7 @@ fn priority_name(p: TaskPriority) -> &'static str {
 
 /// Marks a task complete (or not) keeping status / percent / completed date consistent.
 pub fn set_complete(t: &mut Task, done: bool, now: DateTime) {
+    t.modified = Some(now);
     if done {
         t.status = TaskStatus::Completed;
         t.percent_complete = 100;
@@ -193,6 +195,7 @@ pub fn apply_task_fields(s: &Session, t: &mut Task, p: &Value) -> Result<(), Cmd
     if let Some(r) = p.get("recurrence") {
         t.recurrence = parse_recurrence(r, t, p)?;
     }
+    t.modified = Some(s.now());
     Ok(())
 }
 
@@ -431,8 +434,65 @@ fn run_update_now(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "updated": out, "completedCopies": pim::ids_json(&copies) }))
 }
 
+/// Delete. Deleting a task I accepted from someone else's task request first asks what to tell them
+/// (`request`): `decline` answers DECLINED, `complete` marks it complete and sends the completion report,
+/// `delete` just deletes. The answers are sent at once; one that cannot be sent stays open in a message
+/// window.
 fn run_delete(s: &mut Session, p: &Value) -> CmdResult {
-    pim::run_delete(s, p, Kind::Task)
+    let ids = pim::require_targets(s, p, Kind::Task)?;
+    let requested: Vec<ItemId> = ids
+        .iter()
+        .filter(|i| {
+            s.mailbox.tasks.get(i).is_some_and(|t| {
+                t.is_requested() && !t.is_complete() && t.request_state == TaskRequestState::Accepted
+            })
+        })
+        .copied()
+        .collect();
+    let mut notified = 0usize;
+    match opt_str(p, "request") {
+        None if !requested.is_empty() => {
+            let subject = requested
+                .first()
+                .and_then(|i| s.mailbox.tasks.get(i))
+                .map(|t| t.subject.clone())
+                .unwrap_or_default();
+            return pim::dialog(
+                s,
+                "deleteTaskRequest",
+                json!({ "ids": pim::ids_json(&ids), "subject": subject, "requested": requested.len() }),
+            );
+        }
+        None | Some("delete") => {}
+        Some("decline") => {
+            for id in &requested {
+                let Some(t) = s.mailbox.tasks.get(id).cloned() else { continue };
+                let to = reply_targets(s, &t, false);
+                let subject = format!("Task Declined: {}", t.subject.trim());
+                let intro = "I have declined this task.";
+                if send_task_reply(s, &t, &to, subject, intro, "DECLINED", SendMode::Now).is_ok_and(|r| r.1) {
+                    notified = notified.saturating_add(1);
+                }
+            }
+        }
+        Some("complete") => {
+            let now = s.now();
+            for id in &requested {
+                if let Some(t) = s.mailbox.tasks.get_mut(id) {
+                    set_complete(t, true, now);
+                }
+                if send_status_report(s, *id, SendMode::Now).is_ok_and(|r| r.1) {
+                    notified = notified.saturating_add(1);
+                }
+            }
+        }
+        Some(_) => return Err(CmdError::Params("`request` must be decline, complete or delete".into())),
+    }
+    let mut out = pim::run_delete(s, p, Kind::Task)?;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("notified".into(), json!(notified));
+    }
+    Ok(out)
 }
 fn run_copy(s: &mut Session, p: &Value) -> CmdResult {
     if p.get("folder").is_none_or(Value::is_null) {
@@ -460,8 +520,8 @@ pub(crate) fn move_dialog(s: &mut Session, p: &Value, kind: Kind, copy: bool) ->
     )
 }
 
-/// Categorize › All Categories for module items: the module's categories dialog (`pimCategories`), which
-/// runs `<area>.categorize`.
+/// Categorize › All Categories for module items: the Color Categories dialog (the one Mail uses: New, Rename,
+/// Delete, Color, Shortcut Key), which assigns with `<area>.categorize`.
 pub(crate) fn categories_dialog(s: &mut Session, p: &Value, kind: Kind) -> CmdResult {
     let ids = pim::require_targets(s, p, kind)?;
     let mut on: Vec<String> = Vec::new();
@@ -472,7 +532,7 @@ pub(crate) fn categories_dialog(s: &mut Session, p: &Value, kind: Kind) -> CmdRe
             }
         }
     }
-    pim::dialog(s, "pimCategories", json!({ "ids": pim::ids_json(&ids), "area": area_of(kind), "on": on }))
+    pim::dialog(s, "colorCategories", json!({ "ids": pim::ids_json(&ids), "area": area_of(kind), "on": on }))
 }
 
 /// Command area of a PIM kind ("people", "tasks", "notes", "calendar").
@@ -489,7 +549,14 @@ fn run_all_categories(s: &mut Session, p: &Value) -> CmdResult {
     categories_dialog(s, p, Kind::Task)
 }
 fn run_categorize(s: &mut Session, p: &Value) -> CmdResult {
-    pim::run_categorize(s, p, Kind::Task)
+    let out = pim::run_categorize(s, p, Kind::Task)?;
+    let now = s.now();
+    for id in out.get("ids").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_u64) {
+        if let Some(t) = s.mailbox.tasks.get_mut(&ItemId(id)) {
+            t.modified = Some(now);
+        }
+    }
+    Ok(out)
 }
 
 /// To-do targets: (tasks, flagged messages) among the ids a command acts on.
@@ -811,6 +878,14 @@ pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
             .map(task_entry)
             .collect()
     };
+    let custom = table::custom(&st);
+    let entries: Vec<Entry> = match &custom.filter {
+        Some(f) => entries
+            .into_iter()
+            .filter(|e| table::item(s, e.kind, e.id).is_some_and(|it| table::matches(s, it, f)))
+            .collect(),
+        None => entries,
+    };
     let arrange =
         if modules::show_groups(s, folder) { st.arrangement(kind).map(str::to_owned) } else { None };
     let mut keyed: Vec<((u8, String), (i64, String, ItemId), ViewRow)> = entries
@@ -846,7 +921,15 @@ pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
             (group.unwrap_or((0, String::new())), order, row)
         })
         .collect();
-    keyed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let by = |a: &ViewRow, b: &ViewRow| match (
+        &custom.sort,
+        table::item(s, a.kind, a.id),
+        table::item(s, b.kind, b.id),
+    ) {
+        (Some(f), Some(x), Some(y)) => table::compare(s, kind, f, x, y),
+        _ => std::cmp::Ordering::Equal,
+    };
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| by(&a.2, &b.2)).then_with(|| a.1.cmp(&b.1)));
     let mut out: Vec<ViewRow> = keyed.into_iter().map(|(_, _, r)| r).collect();
     if modules::reversed(s, folder) {
         out.reverse();
@@ -919,10 +1002,12 @@ fn run_flag_now(s: &mut Session, p: &Value) -> CmdResult {
         CmdError::Params("`kind` must be today|tomorrow|thisWeek|nextWeek|noDate|custom".into())
     })?;
     let (start, due) = crate::cmd::mail::flag_dates(s, fk);
+    let now = s.now();
     for id in &ids {
         if let Some(t) = s.mailbox.tasks.get_mut(id) {
             t.start = start;
             t.due = due;
+            t.modified = Some(now);
         }
     }
     let tz = s.tz_offset_min;
@@ -939,9 +1024,11 @@ fn run_private(s: &mut Session, p: &Value) -> CmdResult {
     let ids = pim::require_targets(s, p, Kind::Task)?;
     let all = ids.iter().all(|i| s.mailbox.tasks.get(i).is_some_and(|t| t.private));
     let on = opt_bool(p, "on").unwrap_or(!all);
+    let now = s.now();
     for id in &ids {
         if let Some(t) = s.mailbox.tasks.get_mut(id) {
             t.private = on;
+            t.modified = Some(now);
         }
     }
     Ok(json!({ "ids": pim::ids_json(&ids), "private": on }))
@@ -958,9 +1045,11 @@ fn run_importance(s: &mut Session, p: &Value) -> CmdResult {
     };
     let all = ids.iter().all(|i| s.mailbox.tasks.get(i).is_some_and(|t| t.priority == level));
     let set = if all && p.get("on").is_none() { TaskPriority::Normal } else { level };
+    let now = s.now();
     for id in &ids {
         if let Some(t) = s.mailbox.tasks.get_mut(id) {
             t.priority = set;
+            t.modified = Some(now);
         }
     }
     Ok(json!({ "ids": pim::ids_json(&ids), "priority": priority_name(set) }))
@@ -2017,7 +2106,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Delete",
             "Tasks Home › Delete",
             "",
-            r#"{"id"?: number, "ids"?: [number]}"#,
+            r#"{"id"?: number, "ids"?: [number], "request"?: "decline"|"complete"|"delete"} (a task accepted from a task request: what to tell the person who assigned it; without it the Delete dialog asks)"#,
             true,
             always,
             run_delete,
@@ -2436,7 +2525,7 @@ mod tests {
         assert_eq!(s.run("tasks.importance", &json!({"level": "high"})).unwrap()["priority"], "normal");
         assert_eq!(s.run("tasks.importance", &json!({"level": "low"})).unwrap()["priority"], "low");
         assert!(s.run("tasks.importance", &json!({"level": "urgent"})).is_err());
-        assert_eq!(s.run("tasks.allCategories", &json!({})).unwrap()["dialog"], "pimCategories");
+        assert_eq!(s.run("tasks.allCategories", &json!({})).unwrap()["dialog"], "colorCategories");
         assert_eq!(s.run("tasks.move", &json!({})).unwrap()["dialog"], "pimMove");
         s.selection.items.clear();
         s.selection.focus = None;
@@ -2683,6 +2772,59 @@ mod tests {
             )
             .unwrap();
         (ItemId(r["task"].as_u64().unwrap()), r["compose"].as_u64().unwrap())
+    }
+
+    #[test]
+    fn deleting_an_accepted_task_request_asks_and_answers_the_assigner() {
+        let mut org = person("me@example.com", "Me Myself");
+        let (_, cid) = assign_to_ann(&mut org, "Budget");
+        let mut ann = person("ann@example.com", "Ann Lee");
+        let req = deliver(&org, cid, &mut ann);
+        let accept = |ann: &mut Session| {
+            let r = ann.run("tasks.acceptRequest", &json!({"id": req.0, "send": "none"})).unwrap();
+            ItemId(r["task"].as_u64().unwrap())
+        };
+        let t = accept(&mut ann);
+        // Delete asks first.
+        assert_eq!(ann.run("tasks.delete", &json!({"ids": [t.0]})).unwrap()["dialog"], "deleteTaskRequest");
+        assert_eq!(ann.mailbox.tasks[&t].folder, role(&ann, FolderRole::Tasks), "nothing deleted yet");
+        assert!(ann.run("tasks.delete", &json!({"ids": [t.0], "request": "maybe"})).is_err());
+        // The assigner was told: the answer went out (Sent or Outbox, counted in `notified`) or waits in an
+        // open message window.
+        let told = |ann: &Session, r: &Value, subject: &str| {
+            let mailed = ann.mailbox.mail.values().any(|m| m.subject == subject);
+            let open = ann.composes.values().any(|c| c.subject == subject);
+            if r["notified"] == 1 {
+                assert!(mailed, "{subject}: counted as sent but no message");
+            } else {
+                assert_eq!(r["notified"], 0);
+                assert!(open, "{subject}: not sent and no message window");
+            }
+        };
+        // Decline: the DECLINED answer goes to the assigner, then the task is deleted.
+        let r = ann.run("tasks.delete", &json!({"ids": [t.0], "request": "decline"})).unwrap();
+        assert_eq!(ann.mailbox.tasks[&t].folder, role(&ann, FolderRole::DeletedItems));
+        told(&ann, &r, "Task Declined: Budget");
+        if let Some(c) = ann.composes.values().find(|c| c.subject == "Task Declined: Budget") {
+            let ics = String::from_utf8(c.attachments[0].data.clone()).unwrap().replace("\r\n ", "");
+            assert!(ics.contains("PARTSTAT=DECLINED"), "{ics}");
+        }
+        // Mark complete and notify: the task completes before it goes, and the completion report is sent.
+        let t = accept(&mut ann);
+        let r = ann.run("tasks.delete", &json!({"ids": [t.0], "request": "complete"})).unwrap();
+        let done = ann.mailbox.tasks.get(&t).is_none_or(|x| x.is_complete());
+        assert!(done);
+        told(&ann, &r, "Task Completed: Budget");
+        // Delete without telling anyone: no answer at all.
+        let t = accept(&mut ann);
+        let (mails, windows) = (ann.mailbox.mail.len(), ann.composes.len());
+        let r = ann.run("tasks.delete", &json!({"ids": [t.0], "request": "delete"})).unwrap();
+        assert_eq!(r["notified"], 0);
+        assert_eq!((ann.mailbox.mail.len(), ann.composes.len()), (mails, windows));
+        // Plain tasks delete straight away.
+        let tasks_folder = role(&ann, FolderRole::Tasks);
+        let plain = create_task(&mut ann, tasks_folder, &json!({"subject": "Mine"})).unwrap();
+        assert!(ann.run("tasks.delete", &json!({"ids": [plain.0]})).unwrap().get("dialog").is_none());
     }
 
     #[test]

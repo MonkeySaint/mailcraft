@@ -272,3 +272,23 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn private_contacts_write_and_read_class() {
+    let c =
+        Contact { first_name: "Ann".into(), last_name: "Lee".into(), private: true, ..Default::default() };
+    for v in [Version::V3, Version::V4] {
+        let text = vcf::write(std::slice::from_ref(&c), v);
+        assert!(text.contains("\r\nCLASS:PRIVATE\r\n"), "{text}");
+        let back = vcf::read(text.as_bytes()).unwrap();
+        assert!(back[0].private);
+    }
+    let public = Contact { first_name: "Bo".into(), ..Default::default() };
+    assert!(!vcf::write(&[public], Version::V3).contains("CLASS"));
+    let read = |class: &str| {
+        let text = format!("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Cy\r\nCLASS:{class}\r\nEND:VCARD\r\n");
+        vcf::read(text.as_bytes()).unwrap()[0].private
+    };
+    assert!(read("CONFIDENTIAL") && read("private"));
+    assert!(!read("PUBLIC"));
+}

@@ -239,7 +239,7 @@ impl CustomFilter {
     }
 
     /// Lengths capped, choices checked (stored or given text is not trusted).
-    fn sanitized(mut self) -> CustomFilter {
+    pub(crate) fn sanitized(mut self) -> CustomFilter {
         for t in [&mut self.words, &mut self.from, &mut self.sent_to, &mut self.category] {
             *t = clip(t.trim(), MAX_TEXT);
         }
@@ -398,7 +398,7 @@ pub fn default_rules() -> Vec<FormatRule> {
     ]
 }
 
-fn sanitize_rule(mut r: FormatRule) -> Option<FormatRule> {
+pub(crate) fn sanitize_rule(mut r: FormatRule) -> Option<FormatRule> {
     r.name = clip(r.name.trim(), MAX_NAME);
     if !matches!(r.kind.as_str(), "unread" | "overdue" | "expired" | "custom") {
         return None;
@@ -825,11 +825,11 @@ fn ui_prefs(s: &Session) -> Map<String, Value> {
     }
 }
 
-fn ui_pref(s: &Session, key: &str) -> Option<Value> {
+pub(super) fn ui_pref(s: &Session, key: &str) -> Option<Value> {
     ui_prefs(s).remove(key)
 }
 
-fn set_ui_pref(s: &mut Session, key: &str, v: Option<Value>) -> Result<(), CmdError> {
+pub(super) fn set_ui_pref(s: &mut Session, key: &str, v: Option<Value>) -> Result<(), CmdError> {
     let mut m = ui_prefs(s);
     match v {
         Some(v) => m.insert(key.to_owned(), v),
@@ -988,7 +988,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "View › Current View › View Settings › Columns",
             r#"{"columns"?:[string],"add"?:string,"remove"?:string,"widths"?:{string:number|null},"reset"?:bool}"#,
             false,
-            mail_list,
+            mail_or_table,
             set_columns,
         ),
         spec(
@@ -997,25 +997,25 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "View › Current View › View Settings › Format Columns",
             r#"{"column"?:string,"label"?:string,"format"?:string,"align"?:"left"|"center"|"right"}"#,
             false,
-            mail_list,
+            mail_or_table,
             format_columns,
         ),
         spec(
             "view.conditionalFormatting",
             "Conditional Formatting",
             "View › Current View › View Settings › Conditional Formatting",
-            r#"{"rules"?:[{"name":string,"on":bool,"kind":"unread"|"overdue"|"expired"|"custom","condition"?:object,"font"?:{"bold"?:bool,"italic"?:bool,"underline"?:bool,"strike"?:bool,"color"?:string}}],"reset"?:bool}"#,
+            r#"{"rules"?:[{"name":string,"on":bool,"kind":"unread"|"overdue"|"expired"|"completed"|"custom","condition"?:object,"font"?:{"bold"?:bool,"italic"?:bool,"underline"?:bool,"strike"?:bool,"color"?:string}}],"reset"?:bool} (module tables: overdue, completed and custom rules)"#,
             false,
-            mail_list,
+            mail_or_table,
             conditional_formatting,
         ),
         spec(
             "view.customFilter",
             "Filter",
             "View › Current View › View Settings › Filter",
-            r#"{"filter"?:{"words"?:string,"inBody"?:bool,"from"?:string,"sentTo"?:string,"read"?:"unread"|"read","importance"?:"high"|"normal"|"low","hasAttachments"?:bool,"flagged"?:bool,"category"?:string,"days"?:number}|null}"#,
+            r#"{"filter"?:{"words"?:string,"inBody"?:bool,"from"?:string,"sentTo"?:string,"read"?:"unread"|"read","importance"?:"high"|"normal"|"low","hasAttachments"?:bool,"flagged"?:bool,"category"?:string,"days"?:number}|null} (module tables: words, inBody, importance, flagged, category, days = modified)"#,
             false,
-            mail_list,
+            mail_or_table,
             custom_filter_cmd,
         ),
     ]
@@ -1028,6 +1028,11 @@ pub(super) fn mail_list(s: &Session) -> Option<&'static str> {
         Some(FolderKind::Mail | FolderKind::Search) => None,
         Some(_) => Some("not available in this view"),
     }
+}
+
+/// Mail and search folders, and the module tables (People Phone and List, the Tasks views).
+pub(super) fn mail_or_table(s: &Session) -> Option<&'static str> {
+    if super::table::table_here(s).is_some() { None } else { mail_list(s) }
 }
 
 /// `folder` is a mail or search folder (it has a mail view).
@@ -1059,6 +1064,9 @@ fn columns_json(s: &Session, folder: FolderId) -> Value {
 /// `view.columns`: sets the folder's columns (`columns`: the shown ids in order; `add` / `remove` one;
 /// `widths`: px per column, null back to automatic; `reset`: the default columns and widths).
 fn set_columns(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some((folder, kind, _)) = super::table::table_here(s) {
+        return super::table::set_columns(s, folder, kind, p);
+    }
     let folder = mail_folder(s)?;
     let mut v = mail_view(s, folder);
     if opt_bool(p, "reset") == Some(true) {
@@ -1152,6 +1160,9 @@ fn formats_json(s: &Session, folder: FolderId) -> Value {
 /// `view.formatColumns`: without `column` the Format Columns dialog opens; with it the column's label,
 /// format and alignment change (empty strings back to the defaults).
 fn format_columns(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some((folder, kind, _)) = super::table::table_here(s) {
+        return super::table::format_columns(s, folder, kind, p);
+    }
     let folder = mail_folder(s)?;
     let Some(id) = opt_str(p, "column") else {
         let params = formats_json(s, folder);
@@ -1211,6 +1222,9 @@ fn format_columns(s: &mut Session, p: &Value) -> CmdResult {
 /// `view.conditionalFormatting`: without `rules` (or `reset`) the Conditional Formatting dialog opens;
 /// `rules` replaces the folder's rules, `reset` restores the defaults.
 fn conditional_formatting(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some((folder, kind, _)) = super::table::table_here(s) {
+        return super::table::set_rules(s, folder, kind, p);
+    }
     let folder = mail_folder(s)?;
     let mut v = mail_view(s, folder);
     if opt_bool(p, "reset") == Some(true) {
@@ -1242,6 +1256,9 @@ fn conditional_formatting(s: &mut Session, p: &Value) -> CmdResult {
 /// `view.customFilter`: without `filter` the Filter dialog opens; `filter` sets the View Settings filter
 /// (null or an empty filter turns it off).
 fn custom_filter_cmd(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some((folder, kind, _)) = super::table::table_here(s) {
+        return super::table::set_filter(s, folder, kind, p);
+    }
     let folder = mail_folder(s)?;
     let Some(f) = p.get("filter") else {
         let current = custom_filter(s, folder).unwrap_or_default();

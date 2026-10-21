@@ -7,13 +7,24 @@
 //! Location in the Phone and List views; Tasks: Categories / Start Date / Due Date / Folder / Type /
 //! Importance), the Tasks message preview, the reading pane position and the Notes icon arrangement.
 //! Reverse Sort, Show in Groups and Use Tighter Spacing are the folder's [`ViewSettings`] fields as in Mail.
+//! The table views (People › Phone and List, every Tasks view) also keep their columns, sort field, filter
+//! and Conditional Formatting ([`super::table`]).
+//!
+//! **Saved views.** Save Current View As a New View and Manage All Views › New / Copy keep a view for this
+//! folder or for every folder of the module ("Can Be Used On"); Change View lists them after the built-in
+//! views. While a saved view shows, the folder's state names it (`ModuleView::name`) and its table settings
+//! sit under their own key, so they never overwrite the built-in view's.
 //!
 //! **Storage.** Like the conversation state, the module view state lives in `ViewState::collapsed_groups`
 //! (persisted with the profile) as reserved entries starting with a control character: one JSON
 //! [`ModuleView`] and the folder's saved custom views. Group code skips them ([`super::is_group_label`]).
+//! Views kept for every folder of a module live in the profile's `state.uiPrefs`
+//! (`view.moduleViews.<module>`).
 //!
 //! **Rows.** [`rows`] is the list a module view shows (filtered, sorted and grouped); the UI draws it and the
 //! Expand/Collapse commands read group labels from it.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -147,6 +158,13 @@ pub struct ModuleView {
     pub icon_mode: IconMode,
     /// Notes Icon view: icons snapped to the grid (Line Up Icons); cleared when the user drags an icon.
     pub lined_up: bool,
+    /// What View Settings changed per built-in table view (columns, sort, filter, Conditional Formatting;
+    /// see [`super::table`]).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom: BTreeMap<String, super::table::ViewCustom>,
+    /// The saved view in effect (empty: the built-in view `view`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 impl Default for ModuleView {
@@ -166,6 +184,8 @@ impl ModuleView {
             reading_pane: if kind == ModuleKind::Notes { ReadingPanePos::Off } else { ReadingPanePos::Right },
             icon_mode: IconMode::Large,
             lined_up: true,
+            custom: BTreeMap::new(),
+            name: String::new(),
         }
     }
 
@@ -184,7 +204,7 @@ impl ModuleView {
     }
 }
 
-/// A custom view saved with Save Current View As a New View.
+/// A custom view saved with Save Current View As a New View (or New / Copy in Manage All Views).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct SavedView {
@@ -193,11 +213,20 @@ pub struct SavedView {
     /// Reverse Sort and Show in Groups at the time it was saved.
     pub reverse: bool,
     pub groups: bool,
+    /// Kept for every folder of the module ("Can be used on: All … folders") rather than this folder only.
+    #[serde(skip)]
+    pub everywhere: bool,
 }
 
 impl Default for SavedView {
     fn default() -> Self {
-        SavedView { name: String::new(), state: ModuleView::default(), reverse: false, groups: true }
+        SavedView {
+            name: String::new(),
+            state: ModuleView::default(),
+            reverse: false,
+            groups: true,
+            everywhere: false,
+        }
     }
 }
 
@@ -249,10 +278,33 @@ pub fn state(s: &Session, folder: FolderId, kind: ModuleKind) -> ModuleView {
             v.view = canonical_view(kind, &v.view).unwrap_or(kind.default_view()).to_owned();
             v.arrange = v.arrange.as_deref().and_then(|a| canonical_arrange(kind, a)).map(str::to_owned);
             v.preview_lines = v.preview_lines.min(3);
+            v.custom = super::table::sanitize_custom(kind, std::mem::take(&mut v.custom));
+            v.name = v.name.chars().filter(|c| !c.is_control()).take(MAX_VIEW_NAME).collect();
+            // A saved view deleted or renamed from another folder leaves no trace here: the folder goes
+            // back to its built-in view and loses that view's table settings.
+            let names: Vec<String> =
+                saved_views(s, folder).into_iter().map(|sv| sv.name.to_lowercase()).collect();
+            if !v.name.is_empty() && !names.contains(&v.name.to_lowercase()) {
+                v.name.clear();
+            }
+            v.custom.retain(|k, _| k.strip_prefix('@').is_none_or(|n| names.contains(&n.to_lowercase())));
             v
         }
         None => ModuleView::defaults(kind),
     }
+}
+
+/// While a saved view is shown, a change made to the view (columns, sort, filter, rules, formats,
+/// arrangement, preview, Reverse Sort, Show in Groups) is kept in that saved view too, so showing it
+/// again later does not undo the change.
+pub(crate) fn sync_saved(s: &mut Session, folder: FolderId) -> Result<(), CmdError> {
+    let Some((kind, st)) = current(s, folder) else { return Ok(()) };
+    if st.name.is_empty() {
+        return Ok(());
+    }
+    let Some(old) = find_saved(s, folder, &st.name) else { return Ok(()) };
+    let v = snapshot(s, folder, kind, &old.name, old.everywhere);
+    if v != old { put_saved(s, folder, kind, v) } else { Ok(()) }
 }
 
 /// Stores the view state of a module folder (the entry is dropped when it equals the defaults, so Reset
@@ -270,17 +322,63 @@ pub(crate) fn store(s: &mut Session, folder: FolderId, kind: ModuleKind, st: &Mo
     }
 }
 
-/// Custom views saved for `folder`.
-pub fn saved_views(s: &Session, folder: FolderId) -> Vec<SavedView> {
-    s.view
+/// Key of a module's views kept for all its folders (in the profile's `state.uiPrefs`).
+fn module_key(kind: ModuleKind) -> String {
+    format!("view.moduleViews.{}", kind.name())
+}
+
+fn clean_saved(kind: ModuleKind, list: Vec<SavedView>, everywhere: bool) -> Vec<SavedView> {
+    let mut seen: Vec<String> = Vec::new();
+    list.into_iter()
+        .filter_map(|mut v| {
+            v.name = v.name.trim().chars().filter(|c| !c.is_control()).take(MAX_VIEW_NAME).collect();
+            v.state.view = canonical_view(kind, &v.state.view).unwrap_or(kind.default_view()).to_owned();
+            v.state.arrange =
+                v.state.arrange.as_deref().and_then(|a| canonical_arrange(kind, a)).map(str::to_owned);
+            v.state.preview_lines = v.state.preview_lines.min(3);
+            v.state.custom = super::table::sanitize_custom(kind, std::mem::take(&mut v.state.custom));
+            v.state.name.clear();
+            v.everywhere = everywhere;
+            let key = v.name.to_lowercase();
+            let ok = !v.name.is_empty() && canonical_view(kind, &v.name).is_none() && !seen.contains(&key);
+            seen.push(key);
+            ok.then_some(v)
+        })
+        .take(MAX_SAVED_VIEWS)
+        .collect()
+}
+
+/// Custom views saved for `folder` only.
+fn folder_saved(s: &Session, folder: FolderId, kind: ModuleKind) -> Vec<SavedView> {
+    let list = s
+        .view
         .collapsed_groups
         .get(&folder)
         .and_then(|list| list.iter().find_map(|e| e.strip_prefix(MOD_SAVED)))
         .and_then(|json| serde_json::from_str::<Vec<SavedView>>(json).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .take(MAX_SAVED_VIEWS)
-        .collect()
+        .unwrap_or_default();
+    clean_saved(kind, list, false)
+}
+
+/// Custom views kept for every folder of the module.
+fn module_saved(s: &Session, kind: ModuleKind) -> Vec<SavedView> {
+    let list = super::mail::ui_pref(s, &module_key(kind))
+        .and_then(|v| serde_json::from_value::<Vec<SavedView>>(v).ok())
+        .unwrap_or_default();
+    clean_saved(kind, list, true)
+}
+
+/// Custom views usable in `folder`: the folder's own, then the module's views for all folders (a folder
+/// view hides a module view of the same name).
+pub fn saved_views(s: &Session, folder: FolderId) -> Vec<SavedView> {
+    let Some(kind) = module_kind(s, folder) else { return Vec::new() };
+    let mut out = folder_saved(s, folder, kind);
+    for v in module_saved(s, kind) {
+        if !out.iter().any(|x| x.name.eq_ignore_ascii_case(&v.name)) {
+            out.push(v);
+        }
+    }
+    out
 }
 
 fn store_saved(s: &mut Session, folder: FolderId, views: &[SavedView]) {
@@ -294,6 +392,141 @@ fn store_saved(s: &mut Session, folder: FolderId, views: &[SavedView]) {
     if list.is_empty() {
         s.view.collapsed_groups.remove(&folder);
     }
+}
+
+fn store_module_saved(s: &mut Session, kind: ModuleKind, views: &[SavedView]) -> Result<(), CmdError> {
+    let v = if views.is_empty() { None } else { serde_json::to_value(views).ok() };
+    super::mail::set_ui_pref(s, &module_key(kind), v)
+}
+
+/// Stores `view` as a saved view (replacing one of the same name in the same scope).
+fn put_saved(s: &mut Session, folder: FolderId, kind: ModuleKind, view: SavedView) -> Result<(), CmdError> {
+    let mut list = if view.everywhere { module_saved(s, kind) } else { folder_saved(s, folder, kind) };
+    list.retain(|x| !x.name.eq_ignore_ascii_case(&view.name));
+    if list.len() >= MAX_SAVED_VIEWS {
+        return Err(CmdError::Failed(format!("at most {MAX_SAVED_VIEWS} saved views are kept")));
+    }
+    let everywhere = view.everywhere;
+    list.push(view);
+    if everywhere {
+        store_module_saved(s, kind, &list)
+    } else {
+        store_saved(s, folder, &list);
+        Ok(())
+    }
+}
+
+/// Removes the saved view `name` usable in `folder` (the folder's own first). False when there is none.
+fn remove_saved(s: &mut Session, folder: FolderId, kind: ModuleKind, name: &str) -> Result<bool, CmdError> {
+    let mut list = folder_saved(s, folder, kind);
+    if list.iter().any(|v| v.name.eq_ignore_ascii_case(name)) {
+        list.retain(|v| !v.name.eq_ignore_ascii_case(name));
+        store_saved(s, folder, &list);
+        return Ok(true);
+    }
+    let mut list = module_saved(s, kind);
+    if list.iter().any(|v| v.name.eq_ignore_ascii_case(name)) {
+        list.retain(|v| !v.name.eq_ignore_ascii_case(name));
+        store_module_saved(s, kind, &list)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The saved view `name` usable in `folder`.
+fn find_saved(s: &Session, folder: FolderId, name: &str) -> Option<SavedView> {
+    let want = name.trim();
+    saved_views(s, folder).into_iter().find(|v| v.name.eq_ignore_ascii_case(want))
+}
+
+/// The name of the view the folder shows: its saved view while one is in effect, else the built-in view.
+pub fn current_view_name(s: &Session, folder: FolderId) -> String {
+    let Some((_, st)) = current(s, folder) else { return String::new() };
+    if !st.name.is_empty() && find_saved(s, folder, &st.name).is_some() {
+        return st.name;
+    }
+    st.view
+}
+
+/// Change View choices of the folder: (name, saved, shown now), the built-in views first.
+pub fn view_choices(s: &Session, folder: FolderId) -> Vec<(String, bool, bool)> {
+    let Some(kind) = module_kind(s, folder) else { return Vec::new() };
+    let current = current_view_name(s, folder);
+    kind.views()
+        .iter()
+        .map(|v| ((*v).to_owned(), false))
+        .chain(saved_views(s, folder).into_iter().map(|v| (v.name, true)))
+        .map(|(name, saved)| {
+            let on = name.eq_ignore_ascii_case(&current);
+            (name, saved, on)
+        })
+        .collect()
+}
+
+/// Manage All Views' Description of the view `name` usable in `folder` (a built-in view with this folder's
+/// changes to it, or a saved view): (label, text) rows. `None` when there is no such view.
+pub fn view_description(s: &Session, folder: FolderId, name: &str) -> Option<Vec<(&'static str, String)>> {
+    let kind = module_kind(s, folder)?;
+    let (st, reverse, groups, used_on) = if let Some(v) = canonical_view(kind, name) {
+        let here = state(s, folder, kind);
+        let mut st = ModuleView::defaults(kind);
+        st.view = v.to_owned();
+        if let Some(c) = here.custom.get(v) {
+            st.custom.insert(v.to_owned(), c.clone());
+        }
+        if here.name.is_empty() && here.view == v {
+            st.arrange = here.arrange;
+        }
+        let set = settings(s, folder);
+        (st, set.order == SortOrder::Ascending, set.show_in_groups, scope_label(kind, true))
+    } else {
+        let v = find_saved(s, folder, name)?;
+        let mut st = v.state;
+        st.name.clear();
+        (st, v.reverse, v.groups, scope_label(kind, v.everywhere))
+    };
+    let sum = super::table::summary(folder, kind, &st);
+    let text = |k: &str| sum.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut rows = vec![("Type of view", st.view.clone())];
+    if sum.get("table").and_then(Value::as_bool) == Some(true) {
+        rows.push(("Columns", text("columns")));
+    }
+    let arranged = if arrange_allowed(kind, &st.view) || grouped_view(kind, &st.view) {
+        st.arrangement(kind).map(|a| arrange_label(kind, a)).filter(|l| !l.is_empty())
+    } else {
+        None
+    };
+    let group = match arranged {
+        Some(l) if groups => format!("{l}{}", if reverse { " (reversed)" } else { "" }),
+        Some(l) => format!("Off (arranged by {l})"),
+        None => "None".to_owned(),
+    };
+    rows.push(("Group By", group));
+    if sum.get("table").and_then(Value::as_bool) == Some(true) {
+        rows.push(("Sort", text("sort")));
+        rows.push(("Filter", text("filter")));
+        if kind != ModuleKind::Notes {
+            rows.push(("Conditional Formatting", text("rules")));
+        }
+        rows.push(("Format Columns", text("formats")));
+    }
+    rows.push(("Can be used on", used_on));
+    Some(rows)
+}
+
+/// A new view name: printable, not too long, not a built-in view's name.
+fn check_name(kind: ModuleKind, name: &str) -> Result<String, CmdError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CmdError::Params("the view needs a name".into()));
+    }
+    if name.chars().count() > MAX_VIEW_NAME || name.chars().any(char::is_control) {
+        return Err(CmdError::Params(format!("view names are at most {MAX_VIEW_NAME} printable characters")));
+    }
+    if canonical_view(kind, name).is_some() {
+        return Err(CmdError::Params(format!("a view named \"{name}\" already exists")));
+    }
+    Ok(name.to_owned())
 }
 
 /// True when the folder's module view differs from its defaults (Reset View is enabled).
@@ -409,6 +642,7 @@ pub fn view_json(s: &Session, folder: FolderId, kind: ModuleKind, st: &ModuleVie
         "view": st.view,
         "views": kind.views(),
         "saved": saved_views(s, folder).iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
+        "name": current_view_name(s, folder),
         "arrange": st.arrangement(kind),
         "arrangements": kind.arrangements().iter().map(|(k, l)| json!({"key": k, "label": l})).collect::<Vec<_>>(),
         "arrangeAllowed": arrange_allowed(kind, &st.view),
@@ -442,23 +676,48 @@ pub(crate) fn change_view(s: &mut Session, folder: FolderId, kind: ModuleKind, n
             st.arrange = None;
         }
         st.view = v.to_owned();
+        st.name.clear();
         store(s, folder, kind, &st);
         clear_groups(s, folder);
         return Ok(json!({ "view": v, "module": kind.name() }));
     }
     let wanted = name.trim();
-    let Some(saved) = saved_views(s, folder).into_iter().find(|v| v.name.eq_ignore_ascii_case(wanted)) else {
-        return Err(CmdError::Params(format!("no {} view named \"{wanted}\"", kind.name())));
+    let Some(saved) = find_saved(s, folder, wanted) else {
+        let clipped: String = wanted.chars().take(MAX_VIEW_NAME).collect();
+        return Err(CmdError::Params(format!("no {} view named \"{clipped}\"", kind.name())));
     };
-    let mut st = saved.state.clone();
-    st.view = canonical_view(kind, &st.view).unwrap_or(kind.default_view()).to_owned();
+    apply_saved(s, folder, kind, &saved);
+    let view = state(s, folder, kind).view;
+    Ok(json!({ "view": view, "saved": saved.name, "module": kind.name() }))
+}
+
+fn apply_saved(s: &mut Session, folder: FolderId, kind: ModuleKind, saved: &SavedView) {
+    // The folder keeps its changes to the built-in views; the saved view's table settings go under its own
+    // key ("@name").
+    let sv = &saved.state;
+    let mut st = state(s, folder, kind);
+    st.view = canonical_view(kind, &sv.view).unwrap_or(kind.default_view()).to_owned();
+    st.arrange = sv.arrange.clone();
+    st.preview_lines = sv.preview_lines;
+    st.reading_pane = sv.reading_pane;
+    st.icon_mode = sv.icon_mode;
+    st.lined_up = sv.lined_up;
+    st.name = saved.name.clone();
+    let key = format!("@{}", saved.name);
+    match sv.custom.get(&super::table::active_key(sv)).or_else(|| sv.custom.get(&sv.view)) {
+        Some(c) if !c.is_empty() => {
+            st.custom.insert(key, c.clone());
+        }
+        _ => {
+            st.custom.remove(&key);
+        }
+    }
     store(s, folder, kind, &st);
     set_settings(s, folder, |v| {
         v.order = if saved.reverse { SortOrder::Ascending } else { SortOrder::Descending };
         v.show_in_groups = saved.groups;
     });
     clear_groups(s, folder);
-    Ok(json!({ "view": st.view, "saved": saved.name, "module": kind.name() }))
 }
 
 /// `view.arrangeBy` in a module folder.
@@ -471,6 +730,7 @@ pub(crate) fn arrange_by(s: &mut Session, folder: FolderId, kind: ModuleKind, ke
         .ok_or_else(|| CmdError::Params(format!("unknown {} arrangement `{key}`", kind.name())))?;
     st.arrange = Some(a.to_owned());
     store(s, folder, kind, &st);
+    sync_saved(s, folder)?;
     clear_groups(s, folder);
     Ok(json!({ "arrangeBy": a, "label": arrange_label(kind, a), "module": kind.name() }))
 }
@@ -483,6 +743,7 @@ pub(crate) fn message_preview(s: &mut Session, folder: FolderId, kind: ModuleKin
     let mut st = state(s, folder, kind);
     st.preview_lines = lines.min(3);
     store(s, folder, kind, &st);
+    sync_saved(s, folder)?;
     Ok(json!({ "lines": st.preview_lines, "module": kind.name() }))
 }
 
@@ -498,6 +759,7 @@ pub(crate) fn reading_pane(
     st.reading_pane = pos;
     store(s, folder, kind, &st);
     set_settings(s, folder, |v| v.reading_pane = pos);
+    sync_saved(s, folder)?;
     Ok(json!({ "position": pane_name(pos), "module": kind.name() }))
 }
 
@@ -552,60 +814,249 @@ pub(crate) fn apply_view_to(
     Ok(json!({ "applied": applied, "module": kind.name() }))
 }
 
-/// `view.manageViews` in a module folder: the module's views plus the folder's saved ones.
-pub(crate) fn manage_views(s: &mut Session, folder: FolderId, kind: ModuleKind) -> CmdResult {
-    let st = state(s, folder, kind);
-    let mut views: Vec<String> = kind.views().iter().map(|v| (*v).to_owned()).collect();
-    views.extend(saved_views(s, folder).into_iter().map(|v| v.name));
-    Ok(dialog(
-        s,
-        "manageViews",
-        json!({ "views": views, "current": st.view, "module": kind.name(), "folder": folder.0 }),
-    ))
+fn scope_everywhere(p: &Value) -> Result<bool, CmdError> {
+    match p.get("scope").and_then(Value::as_str) {
+        None | Some("folder") => Ok(false),
+        Some("all") => Ok(true),
+        Some(_) => Err(CmdError::Params("`scope` must be folder or all".into())),
+    }
+}
+
+fn name_param<'a>(p: &'a Value, key: &str) -> Result<&'a str, CmdError> {
+    p.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| CmdError::Params(format!("`{key}` (a view name) required")))
+}
+
+/// The current view of the folder as a saved view named `name`.
+fn snapshot(s: &Session, folder: FolderId, kind: ModuleKind, name: &str, everywhere: bool) -> SavedView {
+    let v = settings(s, folder);
+    let mut st = state(s, folder, kind);
+    // Only the shown view's table settings go with it.
+    let c = super::table::custom(&st);
+    st.custom.clear();
+    if !c.is_empty() {
+        st.custom.insert(st.view.clone(), c);
+    }
+    st.name.clear();
+    SavedView {
+        name: name.to_owned(),
+        state: st,
+        reverse: v.order == SortOrder::Ascending,
+        groups: v.show_in_groups,
+        everywhere,
+    }
+}
+
+/// "Can Be Used On" text of a module view.
+pub fn scope_label(kind: ModuleKind, everywhere: bool) -> String {
+    if everywhere { format!("All {} folders", kind.item_noun()) } else { "This folder".to_owned() }
+}
+
+fn exists_error(name: &str) -> CmdError {
+    CmdError::Params(format!("a view named \"{name}\" already exists"))
+}
+
+/// `view.manageViews` in a module folder. Without `op` the Manage All Views dialog opens; `op` is one of
+/// `apply` (`name`), `new` (`name`, `base`: a built-in view, `scope`), `copy` (`name`, `newName`,
+/// `scope`), `rename` (`name`, `newName`), `delete` (`name`), `update` (`name`: the saved view takes the
+/// current view) and `reset` (`name`: a built-in view loses its View Settings changes).
+pub(crate) fn manage_views(s: &mut Session, folder: FolderId, kind: ModuleKind, p: &Value) -> CmdResult {
+    let Some(op) = p.get("op").and_then(Value::as_str) else {
+        let current = current_view_name(s, folder);
+        let saved = saved_views(s, folder);
+        let mut views: Vec<String> = kind.views().iter().map(|v| (*v).to_owned()).collect();
+        views.extend(saved.iter().map(|v| v.name.clone()));
+        let saved: Vec<Value> = saved
+            .iter()
+            .map(|v| {
+                json!({
+                    "name": v.name,
+                    "base": v.state.view,
+                    "scope": if v.everywhere { "all" } else { "folder" },
+                    "usedOn": scope_label(kind, v.everywhere),
+                })
+            })
+            .collect();
+        return Ok(dialog(
+            s,
+            "manageViews",
+            json!({
+                "views": views,
+                "builtIn": kind.views(),
+                "saved": saved,
+                "current": current,
+                "allFolders": scope_label(kind, true),
+                "module": kind.name(),
+                "noun": kind.item_noun(),
+                "folder": folder.0,
+            }),
+        ));
+    };
+    match op {
+        "apply" => change_view(s, folder, kind, name_param(p, "name")?),
+        "new" => {
+            let name = check_name(kind, name_param(p, "name")?)?;
+            if find_saved(s, folder, &name).is_some() {
+                return Err(exists_error(&name));
+            }
+            let base = match p.get("base").and_then(Value::as_str) {
+                None => kind.default_view(),
+                Some(b) => canonical_view(kind, b)
+                    .ok_or_else(|| CmdError::Params(format!("`base` must be a {} view", kind.name())))?,
+            };
+            let everywhere = scope_everywhere(p)?;
+            let mut st = ModuleView::defaults(kind);
+            st.view = base.to_owned();
+            let v = SavedView { name: name.clone(), state: st, reverse: false, groups: true, everywhere };
+            put_saved(s, folder, kind, v)?;
+            Ok(json!({ "created": name, "base": base, "module": kind.name() }))
+        }
+        "copy" => {
+            let from = name_param(p, "name")?;
+            let name = check_name(kind, name_param(p, "newName")?)?;
+            if find_saved(s, folder, &name).is_some() {
+                return Err(exists_error(&name));
+            }
+            let everywhere = scope_everywhere(p)?;
+            let copy = if let Some(b) = canonical_view(kind, from) {
+                // A built-in view with this folder's View Settings changes for it.
+                let mut st = ModuleView::defaults(kind);
+                st.view = b.to_owned();
+                if let Some(c) = state(s, folder, kind).custom.get(b) {
+                    st.custom.insert(b.to_owned(), c.clone());
+                }
+                SavedView { name: name.clone(), state: st, reverse: false, groups: true, everywhere }
+            } else {
+                let mut v = find_saved(s, folder, from)
+                    .ok_or_else(|| CmdError::Params(format!("no {} view named \"{from}\"", kind.name())))?;
+                v.name = name.clone();
+                v.everywhere = everywhere;
+                v
+            };
+            put_saved(s, folder, kind, copy)?;
+            Ok(json!({ "copied": name, "module": kind.name() }))
+        }
+        "rename" => {
+            let from = name_param(p, "name")?;
+            let name = check_name(kind, name_param(p, "newName")?)?;
+            let mut v = find_saved(s, folder, from)
+                .ok_or_else(|| CmdError::Params("only saved views can be renamed".into()))?;
+            if !v.name.eq_ignore_ascii_case(&name) && find_saved(s, folder, &name).is_some() {
+                return Err(exists_error(&name));
+            }
+            // Read before the old name goes, or the state would already have dropped its settings.
+            let mut st = state(s, folder, kind);
+            remove_saved(s, folder, kind, &v.name)?;
+            let old = std::mem::replace(&mut v.name, name.clone());
+            put_saved(s, folder, kind, v)?;
+            if let Some(c) = st.custom.remove(&format!("@{old}")) {
+                st.custom.insert(format!("@{name}"), c);
+            }
+            if st.name.eq_ignore_ascii_case(&old) {
+                st.name = name.clone();
+            }
+            store(s, folder, kind, &st);
+            Ok(json!({ "renamed": old, "name": name, "module": kind.name() }))
+        }
+        "delete" => {
+            let name = name_param(p, "name")?;
+            if !remove_saved(s, folder, kind, name)? {
+                return Err(CmdError::Params("only saved views can be deleted".into()));
+            }
+            let mut st = state(s, folder, kind);
+            st.custom.retain(|k, _| !k.strip_prefix('@').is_some_and(|n| n.eq_ignore_ascii_case(name)));
+            if st.name.eq_ignore_ascii_case(name) {
+                st.name.clear();
+            }
+            store(s, folder, kind, &st);
+            Ok(json!({ "deleted": name, "module": kind.name() }))
+        }
+        "update" => {
+            let name = name_param(p, "name")?;
+            let old = find_saved(s, folder, name)
+                .ok_or_else(|| CmdError::Params(format!("no saved view named \"{name}\"")))?;
+            let v = snapshot(s, folder, kind, &old.name, old.everywhere);
+            put_saved(s, folder, kind, v)?;
+            let mut st = state(s, folder, kind);
+            st.name = old.name.clone();
+            store(s, folder, kind, &st);
+            Ok(json!({ "updated": old.name, "module": kind.name() }))
+        }
+        "reset" => {
+            let name = name_param(p, "name")?;
+            let v = canonical_view(kind, name)
+                .ok_or_else(|| CmdError::Params("only built-in views can be reset".into()))?;
+            let mut st = state(s, folder, kind);
+            st.custom.remove(v);
+            if st.view == v && st.name.is_empty() {
+                st.arrange = None;
+            }
+            store(s, folder, kind, &st);
+            clear_groups(s, folder);
+            Ok(json!({ "reset": v, "module": kind.name() }))
+        }
+        other => {
+            let clipped: String = other.chars().take(20).collect();
+            Err(CmdError::Params(format!(
+                "`op` must be apply, new, copy, rename, delete, update or reset, not `{clipped}`"
+            )))
+        }
+    }
 }
 
 /// `view.saveViewAs` in a module folder: without `confirm` the Save View dialog opens; with
 /// `{"name", "confirm": true}` the current view is saved under that name (replacing a saved view of the
-/// same name).
+/// same name) for this folder, or with `"scope": "all"` for every folder of the module.
 pub(crate) fn save_view_as(s: &mut Session, folder: FolderId, kind: ModuleKind, p: &Value) -> CmdResult {
     let name = p.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_owned();
     if canonical_view(kind, &name).is_some() {
-        return Err(CmdError::Params(format!("a view named \"{name}\" already exists")));
+        return Err(exists_error(&name));
     }
     if p.get("confirm").and_then(Value::as_bool) != Some(true) {
         return Ok(dialog(
             s,
             "saveModuleView",
-            json!({ "folder": folder.0, "module": kind.name(), "name": name, "noun": kind.item_noun() }),
+            json!({
+                "folder": folder.0,
+                "module": kind.name(),
+                "name": name,
+                "noun": kind.item_noun(),
+                "allFolders": scope_label(kind, true),
+            }),
         ));
     }
-    if name.is_empty() {
-        return Err(CmdError::Params("the view needs a name".into()));
+    let name = check_name(kind, &name)?;
+    let everywhere = scope_everywhere(p)?;
+    // Same name, same scope: the saved view is replaced. Same name in the other scope: one of the two
+    // would hide the other in this folder, so the name is refused.
+    if let Some(other) = find_saved(s, folder, &name)
+        && other.everywhere != everywhere
+    {
+        let place =
+            if other.everywhere { scope_label(kind, true).to_lowercase() } else { "this folder".to_owned() };
+        return Err(CmdError::Params(format!("a view named \"{}\" is already kept for {place}", other.name)));
     }
-    if name.chars().count() > MAX_VIEW_NAME || name.chars().any(char::is_control) {
-        return Err(CmdError::Params(format!("view names are at most {MAX_VIEW_NAME} printable characters")));
-    }
-    let v = settings(s, folder);
-    let entry = SavedView {
-        name: name.clone(),
-        state: state(s, folder, kind),
-        reverse: v.order == SortOrder::Ascending,
-        groups: v.show_in_groups,
-    };
-    let mut list = saved_views(s, folder);
-    list.retain(|x| !x.name.eq_ignore_ascii_case(&name));
-    if list.len() >= MAX_SAVED_VIEWS {
-        return Err(CmdError::Failed(format!("a folder keeps at most {MAX_SAVED_VIEWS} saved views")));
-    }
-    list.push(entry);
-    store_saved(s, folder, &list);
-    Ok(json!({ "saved": name, "module": kind.name() }))
+    let v = snapshot(s, folder, kind, &name, everywhere);
+    put_saved(s, folder, kind, v)?;
+    let mut st = state(s, folder, kind);
+    st.name = name.clone();
+    store(s, folder, kind, &st);
+    Ok(json!({ "saved": name, "module": kind.name(), "scope": if everywhere { "all" } else { "folder" } }))
 }
 
 /// `view.viewSettings` in a module folder: the module's View Settings dialog.
-pub(crate) fn view_settings(s: &mut Session, folder: FolderId, kind: ModuleKind) -> CmdResult {
+pub(crate) fn view_settings(s: &mut Session, folder: FolderId, kind: ModuleKind, p: &Value) -> CmdResult {
     let st = state(s, folder, kind);
-    let params = view_json(s, folder, kind, &st);
+    let mut params = view_json(s, folder, kind, &st);
+    if let Some(o) = params.as_object_mut() {
+        o.insert("table".into(), super::table::summary(folder, kind, &st));
+        if let Some(name) = p.get("savedView").and_then(Value::as_str) {
+            o.insert("savedView".into(), json!(name));
+        }
+    }
     Ok(dialog(s, "moduleViewSettings", params))
 }
 
@@ -877,14 +1328,15 @@ mod tests {
         let r = run(&mut s, "view.applyViewTo", json!({"folders": [other.0, inbox.0]}));
         assert_eq!(r["applied"], 1, "only folders of the same kind take the view");
         assert_eq!(state(&s, other, ModuleKind::Tasks).view, "Overdue");
-        // Save Current View As a New View, then apply it.
-        assert_eq!(run(&mut s, "view.saveViewAs", json!({"name": "Mine"}))["dialog"], "saveModuleView");
+        // Save Current View As a New View (Tasks wait for a change first), then apply it.
         run(&mut s, "view.reverseSort", json!({}));
+        assert_eq!(run(&mut s, "view.saveViewAs", json!({"name": "Mine"}))["dialog"], "saveModuleView");
         assert_eq!(run(&mut s, "view.saveViewAs", json!({"name": "Mine", "confirm": true}))["saved"], "Mine");
         assert!(s.run("view.saveViewAs", &json!({"name": "Detailed", "confirm": true})).is_err());
         assert!(s.run("view.saveViewAs", &json!({"name": " ", "confirm": true})).is_err());
         run(&mut s, "view.resetView", json!({}));
         assert_eq!(saved_views(&s, tasks).len(), 1, "Reset View keeps the folder's saved views");
+        run(&mut s, "view.reverseSort", json!({}));
         run(&mut s, "view.saveViewAs", json!({"name": "Mine", "confirm": true}));
         run(&mut s, "view.changeView", json!({"name": "Detailed"}));
         assert_eq!(run(&mut s, "view.changeView", json!({"name": "mine"}))["view"], "To-Do List");
@@ -892,6 +1344,255 @@ mod tests {
         let Some(Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
         assert_eq!(p["views"].as_array().unwrap().last().unwrap(), "Mine");
         assert_eq!(run(&mut s, "view.viewSettings", json!({}))["dialog"], "moduleViewSettings");
+    }
+
+    #[test]
+    fn manage_views_new_copy_rename_delete_and_scopes() {
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        let other = s.mailbox.create_folder(tasks, "Home").unwrap();
+        let mv = |s: &mut Session, p: Value| s.run("view.manageViews", &p);
+        // New: a view of a built-in type, for this folder or every task folder.
+        mv(&mut s, json!({"op": "new", "name": "Errands", "base": "detailed"})).unwrap();
+        mv(&mut s, json!({"op": "new", "name": "Shared", "base": "Overdue", "scope": "all"})).unwrap();
+        assert!(mv(&mut s, json!({"op": "new", "name": "errands"})).is_err(), "names are unique");
+        assert!(mv(&mut s, json!({"op": "new", "name": "Completed"})).is_err(), "built-in names are taken");
+        assert!(mv(&mut s, json!({"op": "new", "name": "X", "base": "Phone"})).is_err());
+        assert!(mv(&mut s, json!({"op": "new", "name": "X", "scope": "everywhere"})).is_err());
+        let names =
+            |s: &Session, f: FolderId| saved_views(s, f).into_iter().map(|v| v.name).collect::<Vec<_>>();
+        assert_eq!(names(&s, tasks), ["Errands", "Shared"]);
+        assert_eq!(names(&s, other), ["Shared"], "only the all-folders view is usable elsewhere");
+        // The dialog shows where each view can be used.
+        mv(&mut s, json!({})).unwrap();
+        let Some(Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
+        assert_eq!(p["saved"][0]["usedOn"], "This folder");
+        assert_eq!(p["saved"][1]["usedOn"], "All Task folders");
+        // Apply, then the Change View choices check it.
+        mv(&mut s, json!({"op": "apply", "name": "Errands"})).unwrap();
+        assert_eq!(state(&s, tasks, ModuleKind::Tasks).view, "Detailed");
+        assert_eq!(current_view_name(&s, tasks), "Errands");
+        let on: Vec<String> = view_choices(&s, tasks).into_iter().filter(|c| c.2).map(|c| c.0).collect();
+        assert_eq!(on, ["Errands"]);
+        // Copy (of a built-in view with this folder's column changes, or of a saved view), Rename, Delete.
+        s.run("view.changeView", &json!({"name": "Simple List"})).unwrap();
+        s.run("view.columns", &json!({"columns": ["subject", "priority"]})).unwrap();
+        mv(&mut s, json!({"op": "copy", "name": "Simple List", "newName": "Lean"})).unwrap();
+        mv(&mut s, json!({"op": "copy", "name": "Shared", "newName": "Mine too", "scope": "folder"}))
+            .unwrap();
+        mv(&mut s, json!({"op": "apply", "name": "Lean"})).unwrap();
+        assert_eq!(crate::cmd::view::table::columns(&s, tasks).len(), 2);
+        mv(&mut s, json!({"op": "rename", "name": "Lean", "newName": "Lean list"})).unwrap();
+        assert_eq!(current_view_name(&s, tasks), "Lean list", "the shown view follows its new name");
+        assert!(mv(&mut s, json!({"op": "rename", "name": "Detailed", "newName": "Z"})).is_err());
+        assert!(mv(&mut s, json!({"op": "rename", "name": "Lean list", "newName": "Errands"})).is_err());
+        mv(&mut s, json!({"op": "delete", "name": "Lean list"})).unwrap();
+        assert_eq!(current_view_name(&s, tasks), "Simple List");
+        assert!(mv(&mut s, json!({"op": "delete", "name": "Overdue"})).is_err(), "built-in views stay");
+        mv(&mut s, json!({"op": "delete", "name": "Shared"})).unwrap();
+        assert!(names(&s, other).is_empty());
+        // Update stores the current view into a saved one; Reset clears a built-in view's changes.
+        s.run("view.arrangeBy", &json!({"key": "folder"})).unwrap();
+        mv(&mut s, json!({"op": "update", "name": "Errands"})).unwrap();
+        let errands = saved_views(&s, tasks).into_iter().find(|v| v.name == "Errands").unwrap();
+        assert_eq!(errands.state.arrange.as_deref(), Some("folder"));
+        mv(&mut s, json!({"op": "reset", "name": "Simple List"})).unwrap();
+        assert_eq!(crate::cmd::view::table::columns(&s, tasks).len(), 5);
+        assert!(mv(&mut s, json!({"op": "reset", "name": "Errands"})).is_err());
+        assert!(mv(&mut s, json!({"op": "fly"})).is_err());
+        assert!(mv(&mut s, json!({"op": "apply"})).is_err());
+        // Save As with "all": usable in every task folder.
+        s.run("view.saveViewAs", &json!({"name": "Everywhere", "scope": "all", "confirm": true})).unwrap();
+        assert_eq!(names(&s, other), ["Everywhere"]);
+        assert_eq!(current_view_name(&s, tasks), "Everywhere");
+    }
+
+    #[test]
+    fn a_saved_view_keeps_its_own_columns_apart_from_the_built_in_view() {
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        let cols =
+            |s: &Session| crate::cmd::view::table::columns(s, tasks).iter().map(|c| c.id).collect::<Vec<_>>();
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        run(&mut s, "view.columns", json!({"columns": ["subject", "status"]}));
+        run(&mut s, "view.saveViewAs", json!({"name": "Two", "confirm": true}));
+        // Changing the saved view's columns while it shows leaves the built-in Detailed view alone.
+        run(&mut s, "view.columns", json!({"columns": ["subject"]}));
+        assert_eq!(cols(&s), ["subject"]);
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        assert_eq!(cols(&s), ["subject", "status"]);
+        // Showing the saved view again keeps the change made while it was shown.
+        run(&mut s, "view.changeView", json!({"name": "Two"}));
+        assert_eq!(cols(&s), ["subject"]);
+        assert_eq!(state(&s, tasks, ModuleKind::Tasks).view, "Detailed");
+    }
+
+    #[test]
+    fn changes_made_while_a_saved_view_shows_are_kept_in_it() {
+        // Regression: sort, filter, arrangement, Reverse Sort and Show in Groups changed while a saved view
+        // was shown went back to the stored definition the next time the view was picked.
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        let other = s.mailbox.create_folder(tasks, "Home").unwrap();
+        run(&mut s, "view.changeView", json!({"name": "Simple List"}));
+        run(&mut s, "view.saveViewAs", json!({"name": "Shared", "scope": "all", "confirm": true}));
+        run(&mut s, "view.sortBy", json!({"field": "subject"}));
+        run(&mut s, "view.customFilter", json!({"filter": {"words": "budget"}}));
+        run(&mut s, "view.arrangeBy", json!({"key": "folder"}));
+        run(&mut s, "view.reverseSort", json!({}));
+        run(&mut s, "view.showInGroups", json!({}));
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        assert!(crate::cmd::view::table::filter(&s, tasks).is_none(), "the built-in view has no filter");
+        run(&mut s, "view.changeView", json!({"name": "Shared"}));
+        let sort = crate::cmd::view::table::sort(&s, tasks);
+        assert_eq!(sort.map(|f| f.column), Some("subject".to_owned()));
+        assert!(crate::cmd::view::table::filter(&s, tasks).is_some_and(|f| f.words == "budget"));
+        let st = state(&s, tasks, ModuleKind::Tasks);
+        assert_eq!(st.arrange.as_deref(), Some("folder"));
+        assert_eq!(settings(&s, tasks).order, SortOrder::Ascending);
+        assert!(!settings(&s, tasks).show_in_groups);
+        // A view kept for all folders brings the change to the other folders too.
+        s.selection.folder = other;
+        run(&mut s, "view.changeView", json!({"name": "Shared"}));
+        assert!(crate::cmd::view::table::filter(&s, other).is_some_and(|f| f.words == "budget"));
+        assert_eq!(state(&s, other, ModuleKind::Tasks).arrange.as_deref(), Some("folder"));
+    }
+
+    #[test]
+    fn a_view_deleted_in_another_folder_leaves_no_orphan_settings() {
+        // Regression: deleting or renaming an all-folders view from folder A left folder B reading and
+        // writing the gone view's "@name" settings while its ribbon showed the built-in view.
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        let other = s.mailbox.create_folder(tasks, "Home").unwrap();
+        run(
+            &mut s,
+            "view.manageViews",
+            json!({"op": "new", "name": "Shared", "base": "Simple List", "scope": "all"}),
+        );
+        s.selection.folder = other;
+        run(&mut s, "view.changeView", json!({"name": "Shared"}));
+        run(&mut s, "view.columns", json!({"columns": ["subject"]}));
+        assert!(state(&s, other, ModuleKind::Tasks).custom.contains_key("@Shared"));
+        s.selection.folder = tasks;
+        run(&mut s, "view.manageViews", json!({"op": "delete", "name": "Shared"}));
+        s.selection.folder = other;
+        let st = state(&s, other, ModuleKind::Tasks);
+        assert!(st.name.is_empty());
+        assert!(!st.custom.keys().any(|k| k.starts_with('@')));
+        assert_eq!(current_view_name(&s, other), "Simple List");
+        // The built-in view's own changes show and Reset on it works.
+        run(&mut s, "view.columns", json!({"columns": ["subject", "status"]}));
+        assert_eq!(crate::cmd::view::table::columns(&s, other).len(), 2);
+        run(&mut s, "view.manageViews", json!({"op": "reset", "name": "Simple List"}));
+        assert_eq!(crate::cmd::view::table::columns(&s, other).len(), 5);
+        // Renaming from another folder: the folder showing it falls back the same way.
+        run(
+            &mut s,
+            "view.manageViews",
+            json!({"op": "new", "name": "Wide", "base": "Detailed", "scope": "all"}),
+        );
+        run(&mut s, "view.changeView", json!({"name": "Wide"}));
+        s.selection.folder = tasks;
+        run(&mut s, "view.manageViews", json!({"op": "rename", "name": "Wide", "newName": "Wider"}));
+        assert_eq!(current_view_name(&s, other), "Detailed");
+        // Renaming in the folder that shows it keeps its settings under the new name.
+        run(&mut s, "view.changeView", json!({"name": "Wider"}));
+        run(&mut s, "view.columns", json!({"columns": ["subject"]}));
+        run(&mut s, "view.manageViews", json!({"op": "rename", "name": "Wider", "newName": "Widest"}));
+        assert_eq!(current_view_name(&s, tasks), "Widest");
+        assert_eq!(crate::cmd::view::table::columns(&s, tasks).len(), 1);
+    }
+
+    #[test]
+    fn manage_views_describes_built_in_and_saved_views() {
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        let get = |rows: &[(&str, String)], k: &str| rows.iter().find(|r| r.0 == k).map(|r| r.1.clone());
+        run(&mut s, "view.changeView", json!({"name": "Simple List"}));
+        run(&mut s, "view.columns", json!({"columns": ["subject", "priority"]}));
+        run(&mut s, "view.customFilter", json!({"filter": {"words": "report"}}));
+        let rows = view_description(&s, tasks, "simple list").unwrap();
+        assert_eq!(get(&rows, "Type of view").as_deref(), Some("Simple List"));
+        assert_eq!(get(&rows, "Columns").as_deref(), Some("Subject, Priority"));
+        assert!(get(&rows, "Filter").is_some_and(|f| f.contains("report")), "{rows:?}");
+        assert_eq!(get(&rows, "Can be used on").as_deref(), Some("All Task folders"));
+        // A built-in view this folder did not change has its own columns.
+        let rows = view_description(&s, tasks, "Detailed").unwrap();
+        assert_ne!(get(&rows, "Columns").as_deref(), Some("Subject, Priority"));
+        assert_eq!(get(&rows, "Filter").as_deref(), Some("Off"));
+        // A saved view: its base view, its own settings and where it can be used.
+        run(&mut s, "view.saveViewAs", json!({"name": "Lean", "confirm": true}));
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        let rows = view_description(&s, tasks, "Lean").unwrap();
+        assert_eq!(get(&rows, "Type of view").as_deref(), Some("Simple List"));
+        assert_eq!(get(&rows, "Columns").as_deref(), Some("Subject, Priority"));
+        assert_eq!(get(&rows, "Can be used on").as_deref(), Some("This folder"));
+        assert!(view_description(&s, tasks, "Nope").is_none());
+        // Views that are not tables: no column rows.
+        let notes = select_folder(&mut s, FolderRole::Notes);
+        let rows = view_description(&s, notes, "Icon").unwrap();
+        assert!(get(&rows, "Columns").is_none());
+        assert!(view_description(&s, role(&s, FolderRole::Inbox), "Compact").is_none());
+    }
+
+    #[test]
+    fn save_view_as_refuses_a_name_kept_in_the_other_scope() {
+        // Regression: saving for all folders under the name of a folder-only view hid the new view here.
+        let mut s = session();
+        let tasks = select_folder(&mut s, FolderRole::Tasks);
+        run(&mut s, "view.reverseSort", json!({}));
+        run(&mut s, "view.saveViewAs", json!({"name": "Mine", "confirm": true}));
+        let e = s.run("view.saveViewAs", &json!({"name": "mine", "scope": "all", "confirm": true}));
+        assert!(e.is_err());
+        run(&mut s, "view.manageViews", json!({"op": "new", "name": "Shared", "scope": "all"}));
+        assert!(s.run("view.saveViewAs", &json!({"name": "Shared", "confirm": true})).is_err());
+        // The same scope replaces the saved view.
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        run(&mut s, "view.saveViewAs", json!({"name": "Mine", "confirm": true}));
+        let mine = saved_views(&s, tasks).into_iter().find(|v| v.name == "Mine").unwrap();
+        assert_eq!(mine.state.view, "Detailed");
+        assert_eq!(saved_views(&s, tasks).len(), 2);
+    }
+
+    #[test]
+    fn arrange_by_is_greyed_where_a_view_has_no_arrangement() {
+        let mut s = session();
+        select_folder(&mut s, FolderRole::Contacts);
+        assert!(s.enabled("view.arrangeBy").is_some(), "the People view has no arrangement");
+        run(&mut s, "view.changeView", json!({"name": "Card"}));
+        assert!(s.enabled("view.arrangeBy").is_some());
+        run(&mut s, "view.changeView", json!({"name": "Phone"}));
+        assert!(s.enabled("view.arrangeBy").is_none());
+        select_folder(&mut s, FolderRole::Notes);
+        assert!(s.enabled("view.arrangeBy").is_some());
+        select_folder(&mut s, FolderRole::Tasks);
+        assert!(s.enabled("view.arrangeBy").is_none());
+        select_folder(&mut s, FolderRole::Inbox);
+        assert!(s.enabled("view.arrangeBy").is_none());
+    }
+
+    #[test]
+    fn save_view_as_waits_for_a_change_in_tasks() {
+        let mut s = session();
+        select_folder(&mut s, FolderRole::Tasks);
+        assert!(s.enabled("view.saveViewAs").is_some(), "an unchanged Tasks view has nothing to save");
+        run(&mut s, "view.changeView", json!({"name": "Detailed"}));
+        assert!(s.enabled("view.saveViewAs").is_none());
+        // People and Notes offer it at once, as observed.
+        select_folder(&mut s, FolderRole::Contacts);
+        assert!(s.enabled("view.saveViewAs").is_none());
+    }
+
+    #[test]
+    fn sort_by_in_a_mail_folder_sets_the_arrangement() {
+        let mut s = session();
+        let inbox = select_folder(&mut s, FolderRole::Inbox);
+        let r = run(&mut s, "view.sortBy", json!({"field": "subject", "dir": "asc"}));
+        assert_eq!(r["arrangeBy"], "subject");
+        assert_eq!(settings(&s, inbox).order, SortOrder::Ascending);
+        assert!(s.run("view.sortBy", &json!({"field": "mention"})).is_err(), "Mention does not sort");
+        assert!(s.run("view.sortBy", &json!({})).is_err());
     }
 
     #[test]

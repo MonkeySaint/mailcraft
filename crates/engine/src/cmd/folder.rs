@@ -157,7 +157,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Folder",
             "Folder › New",
             "Mod+Shift+E",
-            r#"{"name"?:string,"parent"?:string|number,"account"?:number (with no parent: at the top of this account's folders),"contains"?:"mail"|"calendar"|"contacts"|"tasks"|"notes"|"journal" (default: what the parent holds)}"#,
+            r#"{"name"?:string,"parent"?:string|number,"account"?:number (with no parent: at the top of this account's folders),"contains"?:"mail"|"calendar"|"contacts"|"journal"|"notes"|"tasks" (what the folder holds; default: what the parent holds)}"#,
             true,
             always,
             new_folder,
@@ -464,6 +464,21 @@ fn folder_kind(v: &str) -> Option<FolderKind> {
     })
 }
 
+/// Create New Folder › Folder contains: (param value, folder kind), in the dialog's order.
+pub const FOLDER_CONTENTS: [(&str, FolderKind); 6] = [
+    ("mail", FolderKind::Mail),
+    ("calendar", FolderKind::Calendar),
+    ("contacts", FolderKind::Contacts),
+    ("journal", FolderKind::Journal),
+    ("notes", FolderKind::Notes),
+    ("tasks", FolderKind::Tasks),
+];
+
+/// The "Folder contains" value of a folder kind (a new folder takes its parent's kind by default).
+pub fn contents_name(kind: FolderKind) -> &'static str {
+    FOLDER_CONTENTS.iter().find(|(_, k)| *k == kind).map_or("mail", |(n, _)| *n)
+}
+
 fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
     let account = match p.get("account").filter(|v| !v.is_null()) {
         Some(v) => {
@@ -489,14 +504,24 @@ fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
         }
         None => None,
     };
+    let parent_kind = parent.and_then(|f| s.mailbox.folder(f)).map(|f| f.kind).unwrap_or_default();
+    // Search folders take saved searches only: what they contain is not a choice.
+    let fixed = matches!(parent_kind, FolderKind::Search | FolderKind::SearchRoot);
     let Some(name) = opt_str(p, "name") else {
         let path = parent.map(|f| s.mailbox.folder_path(f)).unwrap_or_default();
-        let params = match parent {
+        let mut params = match parent {
             Some(f) => json!({ "parent": f.0, "path": path }),
             None => json!({ "account": account.map(|a| a.0), "path": path }),
         };
+        if let Some(o) = params.as_object_mut() {
+            o.insert("contains".into(), json!(contents_name(parent_kind)));
+            o.insert("fixed".into(), json!(fixed));
+        }
         return Ok(dialog(s, "createFolder", params));
     };
+    if fixed && contains.is_some() {
+        return Err(CmdError::Params("folders under Search Folders are search folders".into()));
+    }
     let id = match (parent, contains) {
         (Some(parent), None) => s.mailbox.create_folder(parent, name)?,
         (parent, kind) => {
@@ -518,7 +543,8 @@ fn new_folder(s: &mut Session, p: &Value) -> CmdResult {
     {
         f.expanded = true;
     }
-    Ok(json!({ "folder": id.0, "path": s.mailbox.folder_path(id) }))
+    let kind = s.mailbox.folder(id).map(|f| f.kind).unwrap_or_default();
+    Ok(json!({ "folder": id.0, "path": s.mailbox.folder_path(id), "contains": contents_name(kind) }))
 }
 
 fn rename(s: &mut Session, p: &Value) -> CmdResult {
@@ -1390,6 +1416,26 @@ mod tests {
         assert!(s.run("folder.new", &json!({"name": "X", "account": 999})).is_err());
         assert!(s.run("folder.new", &json!({"name": "X", "account": acct.0, "contains": "search"})).is_err());
         assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+    }
+
+    #[test]
+    fn new_folder_contains_a_chosen_kind() {
+        let mut s = session();
+        let inbox = s.selection.folder;
+        let r = run(&mut s, "folder.new", json!({"name": "Clients", "contains": "contacts"}));
+        let id = FolderId(r["folder"].as_u64().unwrap());
+        assert_eq!(s.mailbox.folder(id).unwrap().kind, FolderKind::Contacts);
+        assert_eq!(r["contains"], "contacts");
+        assert_eq!(s.mailbox.folder(id).unwrap().parent, Some(inbox));
+        // Without `contains` a folder takes its parent's kind; the dialog offers it as the default.
+        let r = run(&mut s, "folder.new", json!({"name": "Family", "parent": id.0}));
+        assert_eq!(r["contains"], "contacts");
+        s.selection.folder = id;
+        run(&mut s, "folder.new", json!({}));
+        let Some(crate::Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
+        assert_eq!(p["contains"], "contacts");
+        assert_eq!(p["fixed"], false);
+        assert!(s.run("folder.new", &json!({"name": "Odd", "contains": "spreadsheets"})).is_err());
     }
 
     #[test]

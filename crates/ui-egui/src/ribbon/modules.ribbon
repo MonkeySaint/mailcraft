@@ -92,7 +92,7 @@ drop L | Forward Contact | forward | | | FW | menu=forwardContact
 group Tags | ZT | c1024=collapse
 drop S | Categorize | categorize | | | G | menu=peopleCategorize
 drop S | Follow Up | flag | | | U | menu=peopleFollowUp
-button S | Private | private | people.private | | V
+toggle S | Private | private | people.private | {"on":"$!on"} | V | on=pim:private
 group Find | ZN | c800=collapse
 edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=140
 button S | Address Book... | address-book | compose.addressBook | | AB
@@ -104,7 +104,7 @@ button S | View Settings... | settings | view.viewSettings | | V
 button S | Reset View | undo | view.resetView | | X
 group Arrangement | ZM
 drop L | Message Preview | view | | | PL | menu=messagePreview
-drop L | Arrange By | sort | | | AB | menu=peopleArrangeBy
+gallery L | Arrange By | sort | | | AB | dyn=arrange menu=peopleArrangeBy w=260
 toggle S | Reverse Sort | sort-up | view.reverseSort | | RS | on=reverse
 button S | Add Columns | table | view.addColumns | | AC
 drop S | Expand/Collapse | collapse-ribbon | | | E | menu=expandCollapse
@@ -150,9 +150,9 @@ group Actions | ZA | c1024=collapse
 drop L | Move | move | | | MV | menu=tasksMove
 group Tags | ZT | c1024=collapse
 drop S | Categorize | categorize | | | G | menu=tasksCategorize
-button S | Private | private | tasks.private | | V
-button S | High Importance | importance-high | tasks.importance | {"level":"high"} | H
-button S | Low Importance | importance-low | tasks.importance | {"level":"low"} | L
+toggle S | Private | private | tasks.private | {"on":"$!on"} | V | on=pim:private
+toggle S | High Importance | importance-high | tasks.importance | {"level":"high"} | H | on=pim:high
+toggle S | Low Importance | importance-low | tasks.importance | {"level":"low"} | L | on=pim:low
 group Find | ZN | c800=collapse
 edit S | Search People | address-book | people.search | {"text":"$value"} | FC | w=140
 button S | Address Book... | address-book | compose.addressBook | | AB
@@ -164,7 +164,7 @@ button S | View Settings... | settings | view.viewSettings | | V
 button S | Reset View | undo | view.resetView | | X
 group Arrangement | ZM
 drop L | Message Preview | view | | | PL | menu=messagePreview
-drop L | Arrange By | sort | | | AB | menu=tasksArrangeBy
+gallery L | Arrange By | sort | | | AB | dyn=arrange menu=tasksArrangeBy w=400
 toggle S | Reverse Sort | sort-up | view.reverseSort | | RS | on=reverse
 button S | Add Columns | table | view.addColumns | | AC
 drop S | Expand/Collapse | collapse-ribbon | | | E | menu=expandCollapse
@@ -334,9 +334,7 @@ sep
 item | Set Quick Click... | | mail.setQuickClickFlag | | Q
 
 menu peopleArrangeBy
-item | Categories | | view.arrangeBy | {"key":"categories"} | E
-item | Company | | view.arrangeBy | {"key":"company"} | C
-item | Location | | view.arrangeBy | {"key":"location"} | L
+dyn | arrange | view.arrangeBy | {"key":"$key"}
 sep
 item | View Settings... | settings | view.viewSettings | | V
 
@@ -381,12 +379,7 @@ menu tasksRespondMore
 item | Forward as Attachment | forward | tasks.forward | {"as":"attachment"} | F
 
 menu tasksArrangeBy
-item | Categories | | view.arrangeBy | {"key":"categories"} | E
-item | Start Date | | view.arrangeBy | {"key":"startDate"} | R
-item | Due Date | | view.arrangeBy | {"key":"dueDate"} | U
-item | Folder | | view.arrangeBy | {"key":"folder"} | L
-item | Type | | view.arrangeBy | {"key":"type"} | Y
-item | Importance | | view.arrangeBy | {"key":"importance"} | I
+dyn | arrange | view.arrangeBy | {"key":"$key"}
 sep
 item | Show in Groups | | view.showInGroups | | W | on=groups
 item | View Settings... | settings | view.viewSettings | | V
@@ -396,6 +389,7 @@ dyn | categories | tasks.categorize | {"name":"$name"}
 sep
 item | Clear All Categories | | tasks.categorize | {"name":"","clear":true} | C
 item | All Categories... | category-tag | tasks.allCategories | | A
+item | Set Quick Click... | | categories.setQuickClick | | Q
 
 menu notesNewItems
 item | E-mail Message | mail | mail.newEmail | | M

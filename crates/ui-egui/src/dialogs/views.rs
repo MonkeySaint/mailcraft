@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use super::common::{self, Dlg, Out, btn, btn_en, footer, muted, ok_cancel, primary, window, with_state};
 use crate::App;
 use mailcraft_engine::cmd::view::mail::{self as mailview, CustomFilter, FormatRule, RuleFont};
+use mailcraft_engine::cmd::view::modules::{self, ModuleKind};
+use mailcraft_engine::cmd::view::table;
 use mailcraft_engine::queries::view_settings;
 use mailcraft_model::FolderId;
 use mailcraft_model::view::{ArrangeBy, ReadingPanePos, SortOrder, ViewLayout};
@@ -165,6 +167,9 @@ struct SortState {
 }
 
 fn sort(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    if let Some((_, kind, _)) = table::table_here(&app.s) {
+        return module_sort(ctx, app, d, kind);
+    }
     let uid = d.uid;
     let folder = folder_of(app, d);
     let init = |a: &App| {
@@ -250,6 +255,9 @@ const IMPORTANCE_CHOICES: [(&str, &str); 4] =
 
 /// View Settings › Filter: the conditions an item must meet to show in this view (`view.customFilter`).
 fn filter(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    if let Some((_, kind, _)) = table::table_here(&app.s) {
+        return module_filter(ctx, app, d, kind);
+    }
     let uid = d.uid;
     let folder = app.s.selection.folder;
     let init = |a: &App| {
@@ -444,6 +452,9 @@ fn rule_condition_text(r: &FormatRule) -> String {
 /// Conditional Formatting: rules that change the font of matching rows, applied top to bottom
 /// (`view.conditionalFormatting`). The built-in rules can be turned off but not removed.
 fn rules(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    if let Some((_, kind, _)) = table::table_here(&app.s) {
+        return module_rules(ctx, app, d, kind);
+    }
     let uid = d.uid;
     let folder = app.s.selection.folder;
     let init = |a: &App| RulesState { rules: mailview::rules(&a.s, folder), pick: Some(0) };
@@ -601,28 +612,48 @@ struct FormatState {
 fn format_columns(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = app.s.selection.folder;
-    let init = |a: &App| FormatState {
-        cols: mailview::columns(&a.s, folder)
-            .into_iter()
-            .map(|c| {
-                let def = mailview::column(c.id);
-                ColFormat {
-                    id: c.id.to_owned(),
-                    default_label: def.map_or_else(String::new, |x| x.label.to_owned()),
-                    formats: c
-                        .kind
-                        .formats()
-                        .iter()
-                        .map(|(i, l)| ((*i).to_owned(), (*l).to_owned()))
-                        .collect(),
-                    start: (c.label.clone(), c.format.to_owned(), c.align.to_owned()),
-                    label: c.label,
-                    format: c.format.to_owned(),
-                    align: c.align.to_owned(),
-                }
-            })
-            .collect(),
-        pick: 0,
+    let init = |a: &App| {
+        if table::table_here(&a.s).is_some() {
+            // Module tables: label and alignment only (one display format).
+            return FormatState {
+                cols: table::shown(&a.s, folder)
+                    .into_iter()
+                    .map(|c| ColFormat {
+                        id: c.col.id.to_owned(),
+                        default_label: c.col.label.to_owned(),
+                        formats: vec![("text".to_owned(), "Text".to_owned())],
+                        start: (c.label.clone(), "text".to_owned(), c.align.to_owned()),
+                        label: c.label,
+                        format: "text".to_owned(),
+                        align: c.align.to_owned(),
+                    })
+                    .collect(),
+                pick: 0,
+            };
+        }
+        FormatState {
+            cols: mailview::columns(&a.s, folder)
+                .into_iter()
+                .map(|c| {
+                    let def = mailview::column(c.id);
+                    ColFormat {
+                        id: c.id.to_owned(),
+                        default_label: def.map_or_else(String::new, |x| x.label.to_owned()),
+                        formats: c
+                            .kind
+                            .formats()
+                            .iter()
+                            .map(|(i, l)| ((*i).to_owned(), (*l).to_owned()))
+                            .collect(),
+                        start: (c.label.clone(), c.format.to_owned(), c.align.to_owned()),
+                        label: c.label,
+                        format: c.format.to_owned(),
+                        align: c.align.to_owned(),
+                    }
+                })
+                .collect(),
+            pick: 0,
+        }
     };
     with_state(ctx, app, uid, init, |st, app| {
         window(ctx, app, d, "Format Columns", 460.0, |ui, app| {
@@ -699,13 +730,16 @@ fn col_label(id: &str) -> &'static str {
 }
 
 /// Show Columns (Add Columns, View Settings › Columns): which columns the column layout shows, in what order
-/// and how wide (`view.columns`). Module tables keep their own columns.
+/// and how wide (`view.columns`). Module tables have their own columns ([`module_columns`]).
 fn columns(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let folder = app.s.selection.folder;
+    if let Some((_, kind, _)) = table::table_here(&app.s) {
+        return module_columns(ctx, app, d, kind);
+    }
     if !mailview::mail_list_folder(&app.s, folder) {
         return window(ctx, app, d, "Show Columns", 360.0, |ui, app| {
-            muted(ui, app, "The columns of this view are fixed.");
+            muted(ui, app, "This view has no columns.");
             ok_cancel(ui, app, true).map_or(Out::Keep, |_| Out::Close)
         });
     }
@@ -1095,77 +1129,172 @@ fn manage_mail_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     )
 }
 
-#[derive(Clone, Default)]
-struct ViewsState {
-    selected: String,
-    this_folder: bool,
-}
-
+/// Manage All Views in a contacts, tasks or notes folder: the module's built-in views and the saved ones
+/// with where they can be used; New, Copy, Modify, Rename, Reset, Delete and Apply View
+/// (`view.manageViews` with `op`).
 fn manage_views(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
-    let mut views: Vec<String> = d.arr("views").iter().filter_map(Value::as_str).map(str::to_owned).collect();
-    if views.is_empty() {
-        views = vec!["Compact".into(), "Single".into(), "Preview".into()];
-    }
-    // Saved module views come in `views` after the built-in ones.
-    let saved: Vec<String> = Vec::new();
-    let current = d.str("current");
+    let folder = folder_of(app, d);
+    let Some(kind) = modules::module_kind(&app.s, folder) else {
+        return window(ctx, app, d, "Manage All Views", 360.0, |ui, app| {
+            muted(ui, app, "This folder has no views to manage.");
+            ok_cancel(ui, app, true).map_or(Out::Keep, |_| Out::Close)
+        });
+    };
+    let built_in: &'static [&'static str] = kind.views();
+    let current = modules::current_view_name(&app.s, folder);
+    let all_label = modules::scope_label(kind, true);
     with_state(
         ctx,
         app,
         uid,
-        |_: &App| ViewsState { selected: current.clone(), this_folder: false },
+        |_: &App| MailViewsState { selected: current.clone(), scope: "folder".into(), ..Default::default() },
         |st, app| {
-            window(ctx, app, d, "Manage All Views", 500.0, |ui, app| {
-                let mut out = Out::Keep;
+            window(ctx, app, d, "Manage All Views", 520.0, |ui, app| {
+                let saved = modules::saved_views(&app.s, folder);
+                let is_built = built_in.iter().any(|b| b.eq_ignore_ascii_case(&st.selected));
+                let is_saved = saved.iter().any(|v| v.name.eq_ignore_ascii_case(&st.selected));
                 ui.horizontal_top(|ui| {
                     egui::Frame::new()
                         .stroke(egui::Stroke::new(1.0, app.theme.separator))
                         .inner_margin(4.0)
                         .show(ui, |ui| {
-                            ui.set_width(300.0);
+                            ui.set_width(320.0);
                             ui.set_min_height(200.0);
-                            egui::Grid::new(("mv", uid)).num_columns(2).show(ui, |ui| {
-                                ui.label(RichText::new("View Name").strong());
-                                ui.label(RichText::new("Can Be Used On").strong());
-                                ui.end_row();
-                                for v in views.iter().chain(saved.iter()) {
-                                    if ui.selectable_label(st.selected.eq_ignore_ascii_case(v), v).clicked() {
-                                        st.selected = v.clone();
-                                    }
-                                    ui.label("This folder");
-                                    ui.end_row();
-                                }
-                            });
+                            egui::ScrollArea::vertical().id_salt(("mmv-scroll", uid)).max_height(260.0).show(
+                                ui,
+                                |ui| {
+                                    egui::Grid::new(("mmv", uid)).num_columns(2).show(ui, |ui| {
+                                        ui.label(RichText::new("View Name").strong());
+                                        ui.label(RichText::new("Can Be Used On").strong());
+                                        ui.end_row();
+                                        if !st.this_folder {
+                                            for v in built_in {
+                                                let sel = st.selected.eq_ignore_ascii_case(v);
+                                                if ui.selectable_label(sel, *v).clicked() {
+                                                    st.selected = (*v).to_owned();
+                                                }
+                                                ui.label(all_label.as_str());
+                                                ui.end_row();
+                                            }
+                                        }
+                                        for v in &saved {
+                                            if st.this_folder && v.everywhere {
+                                                continue;
+                                            }
+                                            let sel = st.selected.eq_ignore_ascii_case(&v.name);
+                                            if ui.selectable_label(sel, &v.name).clicked() {
+                                                st.selected = v.name.clone();
+                                            }
+                                            ui.label(modules::scope_label(kind, v.everywhere));
+                                            ui.end_row();
+                                        }
+                                    });
+                                },
+                            );
                         });
                     ui.vertical(|ui| {
-                        ui.add_enabled(false, egui::Button::new("New...").min_size(egui::vec2(90.0, 24.0)));
-                        if btn_en(ui, !st.selected.is_empty(), "Copy...") {
-                            // The module's Save View dialog saves the current view: show the chosen one first.
-                            app.run("view.changeView", json!({"name": st.selected}));
-                            app.run("view.saveViewAs", json!({"name": format!("Copy of {}", st.selected)}));
-                            out = Out::Close;
+                        if btn(ui, "New...") {
+                            st.prompt = ViewPrompt::New;
+                            st.name = String::new();
+                            st.scope = "folder".into();
                         }
-                        if btn(ui, "Modify...") {
-                            app.run("view.viewSettings", json!({}));
+                        if btn_en(ui, is_built || is_saved, "Copy...") {
+                            st.prompt = ViewPrompt::Copy;
+                            st.name = format!("Copy of {}", st.selected);
+                            st.scope = "folder".into();
                         }
-                        if btn(ui, "Reset") {
-                            app.run("view.resetView", json!({}));
+                        if btn_en(ui, is_built || is_saved, "Modify...") {
+                            // Show the view, then edit it; OK in View Settings stores a saved view.
+                            app.run("view.manageViews", json!({"op": "apply", "name": st.selected}));
+                            let p = if is_saved { json!({"savedView": st.selected}) } else { json!({}) };
+                            app.run("view.viewSettings", p);
+                        }
+                        if btn_en(ui, is_saved, "Rename...") {
+                            st.prompt = ViewPrompt::Rename;
+                            st.name = st.selected.clone();
+                        }
+                        if btn_en(ui, is_built, "Reset") {
+                            app.run("view.manageViews", json!({"op": "reset", "name": st.selected}));
+                        }
+                        if btn_en(ui, is_saved, "Delete")
+                            && app
+                                .run("view.manageViews", json!({"op": "delete", "name": st.selected}))
+                                .is_some()
+                        {
+                            st.selected = modules::current_view_name(&app.s, folder);
                         }
                     });
                 });
+                if let Some(rows) = modules::view_description(&app.s, folder, &st.selected) {
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, app.theme.separator))
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new("Description").strong());
+                            for (label, text) in rows {
+                                let line =
+                                    RichText::new(format!("{label}: {text}")).color(app.theme.text_muted);
+                                ui.add(egui::Label::new(line).truncate());
+                            }
+                        });
+                }
                 ui.checkbox(&mut st.this_folder, "Only show views created for this folder");
-                if !matches!(out, Out::Keep) {
-                    return out;
+                if st.prompt != ViewPrompt::None {
+                    let title = match st.prompt {
+                        ViewPrompt::New => "Create a New View",
+                        ViewPrompt::Copy => "Copy View",
+                        _ => "Rename View",
+                    };
+                    common::heading(ui, app, title);
+                    common::field(ui, "Name of new view:", &mut st.name, 220.0);
+                    if st.prompt == ViewPrompt::New {
+                        ui.horizontal(|ui| {
+                            ui.label("Type of view:");
+                            common::combo_idx(ui, ("mmv-base", uid), &mut st.base, built_in, 140.0);
+                        });
+                    }
+                    if st.prompt != ViewPrompt::Rename {
+                        ui.label("Can be used on:");
+                        ui.radio_value(&mut st.scope, "folder".to_owned(), "This folder");
+                        ui.radio_value(&mut st.scope, "all".to_owned(), all_label.as_str());
+                    }
+                    ui.horizontal(|ui| {
+                        if btn_en(ui, !st.name.trim().is_empty(), "OK") {
+                            let p = match st.prompt {
+                                ViewPrompt::New => json!({
+                                    "op": "new",
+                                    "name": st.name.trim(),
+                                    "base": built_in.get(st.base).copied().unwrap_or(kind.default_view()),
+                                    "scope": st.scope,
+                                }),
+                                ViewPrompt::Copy => json!({
+                                    "op": "copy", "name": st.selected, "newName": st.name.trim(), "scope": st.scope,
+                                }),
+                                _ => json!({"op": "rename", "name": st.selected, "newName": st.name.trim()}),
+                            };
+                            if app.run("view.manageViews", p).is_some() {
+                                st.selected = st.name.trim().to_owned();
+                                st.prompt = ViewPrompt::None;
+                            }
+                        }
+                        if btn(ui, "Cancel") {
+                            st.prompt = ViewPrompt::None;
+                        }
+                    });
                 }
                 footer(ui, |ui| {
                     if btn(ui, "Close") {
                         return Out::Close;
                     }
-                    if primary(ui, app, !st.selected.is_empty(), "Apply View") {
-                        if views.iter().any(|v| v.eq_ignore_ascii_case(&st.selected)) {
-                            app.run("view.changeView", json!({"name": st.selected}));
-                        }
+                    if primary(ui, app, is_built || is_saved, "Apply View") {
+                        app.run("view.manageViews", json!({"op": "apply", "name": st.selected}));
+                        return Out::Close;
+                    }
+                    // New, Copy, Rename, Reset and Delete take effect at once: OK closes and keeps them
+                    // (hidden while a name is asked, whose own OK confirms it).
+                    if st.prompt == ViewPrompt::None && btn(ui, "OK") {
                         return Out::Close;
                     }
                     Out::Keep
@@ -1445,4 +1574,393 @@ mod tests {
         h.run_steps(2);
         assert_eq!(mailview::quick_actions(&h.state().s), mailview::DEFAULT_QUICK_ACTIONS);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Module tables (People › Phone and List, the Tasks views): Show Columns, Sort, Filter and Conditional
+// Formatting act on the engine's per-view table state (`mailcraft_engine::cmd::view::table`).
+
+/// Show Columns for a module table: the module's columns, shown ones in order (`view.columns`).
+fn module_columns(ctx: &Context, app: &mut App, d: &Dlg<'_>, kind: ModuleKind) -> Out {
+    let uid = d.uid;
+    let folder = app.s.selection.folder;
+    let init = |a: &App| ColState {
+        shown: table::columns(&a.s, folder).iter().map(|c| c.id.to_owned()).collect(),
+        ..Default::default()
+    };
+    let label = move |id: &str| table::column(kind, id).map_or("", |c| c.label);
+    with_state(ctx, app, uid, init, |st, app| {
+        window(ctx, app, d, "Show Columns", 560.0, |ui, app| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(170.0);
+                    ui.label("Available columns:");
+                    egui::ScrollArea::vertical().id_salt(("mcols-avail", uid)).max_height(300.0).show(
+                        ui,
+                        |ui| {
+                            for c in
+                                table::available(kind).iter().filter(|c| !st.shown.iter().any(|s| s == c.id))
+                            {
+                                if ui
+                                    .selectable_label(st.pick_avail.as_deref() == Some(c.id), c.label)
+                                    .clicked()
+                                {
+                                    st.pick_avail = Some(c.id.to_owned());
+                                }
+                            }
+                        },
+                    );
+                });
+                ui.vertical(|ui| {
+                    if btn_en(ui, st.pick_avail.is_some() && st.shown.len() < table::MAX_COLUMNS, "Add ->")
+                        && let Some(c) = st.pick_avail.take()
+                    {
+                        st.shown.push(c);
+                        st.pick_shown = Some(st.shown.len().saturating_sub(1));
+                    }
+                    if btn_en(ui, st.pick_shown.is_some() && st.shown.len() > 1, "<- Remove")
+                        && let Some(i) = st.pick_shown.take()
+                        && i < st.shown.len()
+                    {
+                        st.shown.remove(i);
+                    }
+                    if btn(ui, "Reset") {
+                        let view = mailcraft_engine::cmd::view::modules::state(&app.s, folder, kind).view;
+                        st.shown =
+                            table::default_columns(kind, &view).iter().map(|c| (*c).to_owned()).collect();
+                        st.pick_shown = None;
+                    }
+                });
+                ui.vertical(|ui| {
+                    ui.label("Show these columns in this order:");
+                    for (i, c) in st.shown.iter().enumerate() {
+                        if ui.selectable_label(st.pick_shown == Some(i), label(c)).clicked() {
+                            st.pick_shown = Some(i);
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if btn_en(ui, st.pick_shown.is_some_and(|i| i > 0), "Move Up")
+                            && let Some(i) = st.pick_shown
+                            && i > 0
+                            && i < st.shown.len()
+                        {
+                            st.shown.swap(i, i - 1);
+                            st.pick_shown = Some(i - 1);
+                        }
+                        if btn_en(ui, st.pick_shown.is_some_and(|i| i + 1 < st.shown.len()), "Move Down")
+                            && let Some(i) = st.pick_shown
+                            && i + 1 < st.shown.len()
+                        {
+                            st.shown.swap(i, i + 1);
+                            st.pick_shown = Some(i + 1);
+                        }
+                    });
+                });
+            });
+            match ok_cancel(ui, app, !st.shown.is_empty()) {
+                Some(true) => {
+                    let ok = app.run("view.columns", json!({"columns": st.shown})).is_some();
+                    if ok { Out::Close } else { Out::Keep }
+                }
+                Some(false) => Out::Close,
+                None => Out::Keep,
+            }
+        })
+    })
+}
+
+#[derive(Clone, Default)]
+struct ModuleSortState {
+    /// Index into the choices (0 = the view's own order).
+    key: usize,
+    desc: bool,
+}
+
+/// Sort for a module table: a column (or the view's own order) and the direction (`view.sortBy`).
+fn module_sort(ctx: &Context, app: &mut App, d: &Dlg<'_>, kind: ModuleKind) -> Out {
+    let uid = d.uid;
+    let folder = app.s.selection.folder;
+    let cols = table::available(kind);
+    let init = |a: &App| match table::sort(&a.s, folder) {
+        Some(f) => ModuleSortState {
+            key: cols.iter().position(|c| c.id == f.column).map_or(0, |i| i + 1),
+            desc: f.descending,
+        },
+        None => ModuleSortState::default(),
+    };
+    with_state(ctx, app, uid, init, |st, app| {
+        window(ctx, app, d, "Sort", 380.0, |ui, app| {
+            ui.label("Sort items by");
+            let mut labels: Vec<&str> = vec!["(the view's own order)"];
+            labels.extend(cols.iter().map(|c| c.label));
+            ui.horizontal(|ui| {
+                common::combo_idx(ui, ("msortk", uid), &mut st.key, &labels, 200.0);
+                ui.add_enabled_ui(st.key > 0, |ui| {
+                    ui.vertical(|ui| {
+                        ui.radio_value(&mut st.desc, false, "Ascending");
+                        ui.radio_value(&mut st.desc, true, "Descending");
+                    });
+                });
+            });
+            muted(ui, app, "Items sort inside their groups; Reverse Sort turns the whole list around.");
+            match ok_cancel(ui, app, true) {
+                Some(true) => {
+                    let field = st.key.checked_sub(1).and_then(|i| cols.get(i)).map(|c| c.id);
+                    let dir = if st.desc { "desc" } else { "asc" };
+                    app.run("view.sortBy", json!({"field": field, "dir": dir}));
+                    Out::Close
+                }
+                Some(false) => Out::Close,
+                None => Out::Keep,
+            }
+        })
+    })
+}
+
+/// Filter for a module table: words (in the subject or name, optionally the notes), priority (tasks),
+/// flagged, a category and, for tasks, Modified in the last N days (`view.customFilter`).
+fn module_filter(ctx: &Context, app: &mut App, d: &Dlg<'_>, kind: ModuleKind) -> Out {
+    let uid = d.uid;
+    let folder = app.s.selection.folder;
+    let tasks = kind == ModuleKind::Tasks;
+    let init = |a: &App| {
+        let f = table::filter(&a.s, folder).unwrap_or_default();
+        let days = if f.days == 0 { String::new() } else { f.days.to_string() };
+        FilterState { f, days }
+    };
+    with_state(ctx, app, uid, init, |st, app| {
+        window(ctx, app, d, "Filter", 460.0, |ui, app| {
+            common::heading(ui, app, if tasks { "Tasks" } else { "Contacts" });
+            common::field(ui, "Search for the word(s):", &mut st.f.words, 240.0);
+            ui.horizontal(|ui| {
+                ui.label("In:");
+                let (a, b) = if tasks {
+                    ("subject field only", "subject field and notes")
+                } else {
+                    ("name fields only", "name fields and notes")
+                };
+                ui.radio_value(&mut st.f.in_body, false, a);
+                ui.radio_value(&mut st.f.in_body, true, b);
+            });
+            common::heading(ui, app, "More Choices");
+            if tasks {
+                ui.horizontal(|ui| {
+                    ui.label("Whose priority is:");
+                    let mut idx =
+                        IMPORTANCE_CHOICES.iter().position(|(k, _)| *k == st.f.importance).unwrap_or(0);
+                    let labels: Vec<&str> = IMPORTANCE_CHOICES.iter().map(|x| x.1).collect();
+                    if common::combo_idx(ui, ("mf-imp", uid), &mut idx, &labels, 120.0) {
+                        st.f.importance = IMPORTANCE_CHOICES.get(idx).map_or("", |x| x.0).to_owned();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Modified in the last");
+                    ui.add(egui::TextEdit::singleline(&mut st.days).desired_width(50.0));
+                    ui.label("days (empty: any time)");
+                });
+            }
+            let flagged = if tasks { "Only tasks with a start or due date" } else { "Only flagged contacts" };
+            ui.checkbox(&mut st.f.flagged, flagged);
+            common::field(ui, "Category:", &mut st.f.category, 200.0);
+            let days_ok = !tasks || st.days.trim().is_empty() || st.days.trim().parse::<u32>().is_ok();
+            if !days_ok {
+                ui.colored_label(app.theme.danger, "Enter a number of days.");
+            }
+            let mut clear = false;
+            let r = footer(ui, |ui| {
+                if btn(ui, "Cancel") {
+                    return Some(false);
+                }
+                if primary(ui, app, days_ok, "OK") {
+                    return Some(true);
+                }
+                if btn(ui, "Clear All") {
+                    clear = true;
+                }
+                None
+            });
+            if clear {
+                *st = FilterState::default();
+            }
+            match r {
+                Some(true) => {
+                    let mut f = CustomFilter {
+                        words: st.f.words.clone(),
+                        in_body: st.f.in_body,
+                        importance: if tasks { st.f.importance.clone() } else { String::new() },
+                        flagged: st.f.flagged,
+                        category: st.f.category.clone(),
+                        ..Default::default()
+                    };
+                    f.days = if tasks { st.days.trim().parse().unwrap_or(0) } else { 0 };
+                    let v = if f.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::to_value(&f).unwrap_or(Value::Null)
+                    };
+                    app.run("view.customFilter", json!({"filter": v}));
+                    Out::Close
+                }
+                Some(false) => Out::Close,
+                None => Out::Keep,
+            }
+        })
+    })
+}
+
+fn module_rule_text(kind: ModuleKind, r: &FormatRule) -> String {
+    match (kind, r.kind.as_str()) {
+        (ModuleKind::People, "overdue") => "The follow-up due date has passed".into(),
+        (_, "overdue") => "The due date has passed and the task is not complete".into(),
+        (ModuleKind::People, "completed") => "The follow-up flag is complete".into(),
+        (_, "completed") => "The task is complete".into(),
+        _ => table::describe_filter(kind, &r.condition),
+    }
+}
+
+/// Conditional Formatting for a module table: the built-in Overdue and Completed rules (on or off, their
+/// font) and custom rules with a condition (`view.conditionalFormatting`).
+fn module_rules(ctx: &Context, app: &mut App, d: &Dlg<'_>, kind: ModuleKind) -> Out {
+    let uid = d.uid;
+    let folder = app.s.selection.folder;
+    let tasks = kind == ModuleKind::Tasks;
+    let init = |a: &App| RulesState { rules: table::rules(&a.s, folder), pick: Some(0) };
+    with_state(ctx, app, uid, init, |st, app| {
+        window(ctx, app, d, "Conditional Formatting", 520.0, |ui, app| {
+            ui.label("Rules for this view:");
+            egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).inner_margin(4.0).show(
+                ui,
+                |ui| {
+                    ui.set_min_height(100.0);
+                    ui.set_width(ui.available_width());
+                    for (i, r) in st.rules.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut r.on, "");
+                            if ui.selectable_label(st.pick == Some(i), r.name.as_str()).clicked() {
+                                st.pick = Some(i);
+                            }
+                        });
+                    }
+                },
+            );
+            let n = st.rules.len();
+            let custom = st.pick.and_then(|i| st.rules.get(i)).is_some_and(|r| r.kind == "custom");
+            ui.horizontal(|ui| {
+                if btn_en(ui, n < mailview::MAX_RULES, "Add") {
+                    st.rules.push(FormatRule {
+                        name: "Untitled".into(),
+                        on: true,
+                        kind: "custom".into(),
+                        condition: CustomFilter::default(),
+                        font: RuleFont { bold: true, ..Default::default() },
+                    });
+                    st.pick = Some(st.rules.len().saturating_sub(1));
+                }
+                if btn_en(ui, custom, "Delete")
+                    && let Some(i) = st.pick
+                    && i < st.rules.len()
+                {
+                    st.rules.remove(i);
+                    st.pick = None;
+                }
+                if btn_en(ui, st.pick.is_some_and(|i| i > 0), "Move Up")
+                    && let Some(i) = st.pick
+                    && i > 0
+                    && i < n
+                {
+                    st.rules.swap(i, i - 1);
+                    st.pick = Some(i - 1);
+                }
+                if btn_en(ui, st.pick.is_some_and(|i| i + 1 < n), "Move Down")
+                    && let Some(i) = st.pick
+                    && i + 1 < n
+                {
+                    st.rules.swap(i, i + 1);
+                    st.pick = Some(i + 1);
+                }
+            });
+            if let Some(r) = st.pick.and_then(|i| st.rules.get_mut(i)) {
+                common::heading(ui, app, "Properties of selected rule");
+                ui.add_enabled_ui(r.kind == "custom", |ui| {
+                    common::field(ui, "Name:", &mut r.name, 260.0);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Font:");
+                    ui.checkbox(&mut r.font.bold, "Bold");
+                    ui.checkbox(&mut r.font.italic, "Italic");
+                    ui.checkbox(&mut r.font.underline, "Underline");
+                    ui.checkbox(&mut r.font.strike, "Strikethrough");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Color:");
+                    let mut idx = RULE_COLORS
+                        .iter()
+                        .position(|(_, h)| h.eq_ignore_ascii_case(&r.font.color))
+                        .unwrap_or(0);
+                    let labels: Vec<&str> = RULE_COLORS.iter().map(|x| x.0).collect();
+                    if common::combo_idx(ui, ("mcf-color", uid), &mut idx, &labels, 140.0) {
+                        r.font.color = RULE_COLORS.get(idx).map_or("", |x| x.1).to_owned();
+                    }
+                });
+                if r.kind == "custom" {
+                    ui.label("Condition (the row matches every part that is filled in):");
+                    let words = if tasks { "Words in the subject:" } else { "Words in the name:" };
+                    common::field(ui, words, &mut r.condition.words, 220.0);
+                    if tasks {
+                        ui.horizontal(|ui| {
+                            ui.label("Priority:");
+                            let mut idx = IMPORTANCE_CHOICES
+                                .iter()
+                                .position(|(k, _)| *k == r.condition.importance)
+                                .unwrap_or(0);
+                            let labels: Vec<&str> = IMPORTANCE_CHOICES.iter().map(|x| x.1).collect();
+                            if common::combo_idx(ui, ("mcf-imp", uid), &mut idx, &labels, 120.0) {
+                                r.condition.importance =
+                                    IMPORTANCE_CHOICES.get(idx).map_or("", |x| x.0).to_owned();
+                            }
+                        });
+                    }
+                    common::field(ui, "Category:", &mut r.condition.category, 200.0);
+                    ui.checkbox(
+                        &mut r.condition.flagged,
+                        if tasks { "With a start or due date" } else { "Flagged" },
+                    );
+                } else {
+                    muted(ui, app, &format!("Condition: {}", module_rule_text(kind, r)));
+                    if r.font.color.is_empty() && tasks {
+                        muted(ui, app, "Automatic colour: the one set in Options › Tasks.");
+                    }
+                }
+            }
+            let mut reset = false;
+            let res = footer(ui, |ui| {
+                if btn(ui, "Cancel") {
+                    return Some(false);
+                }
+                if primary(ui, app, true, "OK") {
+                    return Some(true);
+                }
+                if btn(ui, "Reset") {
+                    reset = true;
+                }
+                None
+            });
+            if reset {
+                st.rules = table::default_rules(kind);
+                st.pick = Some(0);
+            }
+            match res {
+                Some(true) => {
+                    let rules = serde_json::to_value(&st.rules).unwrap_or(Value::Null);
+                    if app.run("view.conditionalFormatting", json!({"rules": rules})).is_some() {
+                        Out::Close
+                    } else {
+                        Out::Keep
+                    }
+                }
+                Some(false) => Out::Close,
+                None => Out::Keep,
+            }
+        })
+    })
 }

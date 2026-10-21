@@ -236,7 +236,18 @@ fn create_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     st.focused = true;
                 }
                 ui.label("Folder contains:");
-                common::combo_idx(ui, ("contains", uid), &mut st.contains, &CONTAINS, 300.0);
+                // Folders under Search Folders hold saved searches: what they contain is not a choice.
+                let fixed = st.sel.and_then(|f| app.s.mailbox.folder(FolderId(f))).is_some_and(|f| {
+                    matches!(
+                        f.kind,
+                        mailcraft_model::FolderKind::Search | mailcraft_model::FolderKind::SearchRoot
+                    )
+                });
+                ui.add_enabled_ui(!fixed, |ui| {
+                    common::combo_idx(ui, ("contains", uid), &mut st.contains, &CONTAINS, 300.0);
+                })
+                .response
+                .on_disabled_hover_text("Folders under Search Folders hold saved searches.");
                 ui.label("Select where to place the folder:");
                 let account_name = account
                     .and_then(|a| app.s.mailbox.accounts.iter().find(|x| u64::from(x.id.0) == a))
@@ -259,11 +270,14 @@ fn create_folder(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 let can = !st.name.trim().is_empty() && (st.sel.is_some() || account_name.is_some());
                 match ok_cancel(ui, app, can) {
                     Some(true) => {
-                        let contains = CONTAINS_KEYS.get(st.contains).copied().unwrap_or("mail");
-                        let p = match st.sel {
-                            Some(f) => json!({"name": st.name.trim(), "contains": contains, "parent": f}),
-                            None => json!({"name": st.name.trim(), "contains": contains, "account": account}),
+                        let mut p = match st.sel {
+                            Some(f) => json!({"name": st.name.trim(), "parent": f}),
+                            None => json!({"name": st.name.trim(), "account": account}),
                         };
+                        if !fixed && let Some(o) = p.as_object_mut() {
+                            let contains = CONTAINS_KEYS.get(st.contains).copied().unwrap_or("mail");
+                            o.insert("contains".into(), json!(contains));
+                        }
                         match app.run("folder.new", p) {
                             Some(v) => {
                                 if let (Some((to, key)), Some(id)) =

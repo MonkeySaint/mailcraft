@@ -24,6 +24,7 @@ mod people_view;
 mod recurrence;
 mod reminders;
 mod scheduling;
+mod table;
 mod tasks_view;
 mod todo_bar;
 

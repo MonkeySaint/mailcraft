@@ -351,8 +351,9 @@ pub(crate) fn muted(ui: &mut Ui, app: &App, text: &str) {
 /// A labelled single-line text field on one row.
 pub(crate) fn field(ui: &mut Ui, label: &str, value: &mut String, width: f32) -> egui::Response {
     ui.horizontal(|ui| {
-        ui.label(label);
-        ui.add(egui::TextEdit::singleline(value).desired_width(width))
+        // The label names the text box for screen readers (and tests).
+        let l = ui.label(label);
+        ui.add(egui::TextEdit::singleline(value).desired_width(width)).labelled_by(l.id)
     })
     .inner
 }

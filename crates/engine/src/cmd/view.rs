@@ -16,6 +16,7 @@
 
 pub mod mail;
 pub mod modules;
+pub mod table;
 
 use serde_json::{Value, json};
 
@@ -70,7 +71,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"key":"date"|"from"|"to"|"categories"|"flagStatus"|"flagStart"|"flagDue"|"size"|"subject"|"type"|"attachments"|"account"|"importance"}"#,
             true,
-            has_folder,
+            arrange_view,
             arrange_by,
         ),
         spec(
@@ -283,7 +284,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "",
             r#"{"name"?:string,"scope"?:"all"|"folder","confirm"?:bool}"#,
             true,
-            has_folder,
+            save_view_enabled,
             save_view_as,
         ),
         spec(
@@ -305,6 +306,16 @@ pub fn specs() -> Vec<CommandSpec> {
             true,
             has_folder,
             sort_order,
+        ),
+        spec(
+            "view.sortBy",
+            "Sort",
+            "View › Current View › View Settings › Sort; a click on a column header",
+            "",
+            r#"{"field":string|null,"dir"?:"asc"|"desc"}"#,
+            true,
+            has_folder,
+            sort_by,
         ),
         spec(
             "view.statusBar",
@@ -369,6 +380,8 @@ fn update(s: &mut Session, f: impl FnOnce(&mut ViewSettings) -> Value) -> CmdRes
     if s.mailbox.views.get(&folder).is_some_and(|v| *v == ViewSettings::default()) {
         s.mailbox.views.remove(&folder);
     }
+    // In a module folder showing a saved view, the change is kept in that view too.
+    modules::sync_saved(s, folder)?;
     Ok(out)
 }
 
@@ -516,6 +529,39 @@ fn calendar_first(s: &mut Session, id: &str, p: &Value) -> Option<CmdResult> {
 
 fn has_folder(s: &Session) -> Option<&'static str> {
     if s.mailbox.folders.contains_key(&s.selection.folder) { None } else { Some("no folder is selected") }
+}
+
+/// Save Current View As a New View: in a tasks folder only once the view differs from the folder's defaults
+/// (observed greyed out on an unchanged Tasks view); elsewhere whenever a folder is selected.
+fn save_view_enabled(s: &Session) -> Option<&'static str> {
+    if let Some(why) = has_folder(s) {
+        return Some(why);
+    }
+    let f = s.selection.folder;
+    match modules::module_kind(s, f) {
+        Some(ModuleKind::Tasks)
+            if !modules::customized(s, f)
+                && s.mailbox.views.get(&f).is_none_or(|v| *v == ViewSettings::default()) =>
+        {
+            Some("the view has no changes to save yet")
+        }
+        _ => None,
+    }
+}
+
+/// Arrange By: any folder, except the module views without arrangements (People, Business Card and Card;
+/// Notes), which grey it out as observed.
+fn arrange_view(s: &Session) -> Option<&'static str> {
+    if let Some(why) = has_folder(s) {
+        return Some(why);
+    }
+    if s.view.module == Module::Calendar {
+        return None;
+    }
+    match modules::current(s, s.selection.folder) {
+        Some((kind, st)) if !modules::arrange_allowed(kind, &st.view) => Some("not available in this view"),
+        _ => None,
+    }
 }
 
 /// Message Preview, Add Columns and Expand/Collapse belong to list views (mail, tasks); the People
@@ -679,7 +725,7 @@ fn manage_views(s: &mut Session, p: &Value) -> CmdResult {
         return r;
     }
     if let Some((folder, kind)) = module_here(s) {
-        return modules::manage_views(s, folder, kind);
+        return modules::manage_views(s, folder, kind, p);
     }
     mail::manage_views(s, p)
 }
@@ -689,7 +735,7 @@ fn view_settings(s: &mut Session, p: &Value) -> CmdResult {
         return r;
     }
     if let Some((folder, kind)) = module_here(s) {
-        return modules::view_settings(s, folder, kind);
+        return modules::view_settings(s, folder, kind, p);
     }
     let folder = current_folder(s, &Value::Null)?;
     let current = serde_json::to_value(settings(s, folder)).unwrap_or(Value::Null);
@@ -711,8 +757,15 @@ fn add_columns(s: &mut Session, p: &Value) -> CmdResult {
     }
     let folder = current_folder(s, &Value::Null)?;
     if mail::mail_list(s).is_some() {
-        // Module tables (Tasks, People › Phone and List) keep their own fixed columns.
-        return Ok(dialog(s, "showColumns", json!({ "folder": folder.0, "mail": false })));
+        // Module tables (Tasks, People › Phone and List) have their own columns.
+        let Some((folder, kind, _)) = table::table_here(s) else {
+            return Err(CmdError::Disabled("not available in this view".into()));
+        };
+        let mut params = table::columns_json(s, folder, kind);
+        if let Some(o) = params.as_object_mut() {
+            o.insert("mail".into(), json!(false));
+        }
+        return Ok(dialog(s, "showColumns", params));
     }
     let shown: Vec<&str> = mail::columns(s, folder).iter().map(|c| c.id).collect();
     let available: Vec<Value> = mail::COLUMNS.iter().map(|c| json!({"id": c.id, "label": c.label})).collect();
@@ -817,6 +870,38 @@ fn sort_order(s: &mut Session, p: &Value) -> CmdResult {
         v.order = order;
         json!({ "order": order_name(order) })
     })
+}
+
+/// `view.sortBy`: sorts the list by a column. In a module table the column (`null`: the view's own order)
+/// orders the rows inside their groups; in a mail folder the column's arrangement is used.
+fn sort_by(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some((folder, kind, _)) = table::table_here(s) {
+        return table::sort_by(s, folder, kind, p);
+    }
+    if module_here(s).is_some() || s.view.module == Module::Calendar {
+        return Err(CmdError::Disabled("not available in this view".into()));
+    }
+    let field = req_str(p, "field")?;
+    let clipped: String = field.chars().take(40).collect();
+    let arrange = mail::column(field)
+        .and_then(|c| c.arrange)
+        .ok_or_else(|| CmdError::Params(format!("the list cannot be sorted by `{clipped}`")))?;
+    let order = match p.get("dir").and_then(Value::as_str) {
+        None => None,
+        Some("desc") => Some(SortOrder::Descending),
+        Some("asc") => Some(SortOrder::Ascending),
+        Some(_) => return Err(CmdError::Params("`dir` must be asc or desc".into())),
+    };
+    let folder = s.selection.folder;
+    let r = update(s, |v| {
+        v.arrange_by = arrange;
+        if let Some(o) = order {
+            v.order = o;
+        }
+        json!({ "arrangeBy": arrange_name(arrange), "order": order_name(v.order) })
+    })?;
+    modules::clear_groups(s, folder);
+    Ok(r)
 }
 
 fn show_in_groups(s: &mut Session, p: &Value) -> CmdResult {

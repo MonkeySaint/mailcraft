@@ -96,7 +96,7 @@ fn about(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 /// Built-in help topics (our own text).
-const TOPICS: [(&str, &str, &str); 7] = [
+const TOPICS: [(&str, &str, &str); 10] = [
     (
         "getting-started",
         "Getting started",
@@ -122,6 +122,21 @@ const TOPICS: [(&str, &str, &str); 7] = [
         "Searching",
         "Type in the search box at the top to search the current folder. Use the Search tab to widen the scope or refine by sender, subject, attachments and more. Advanced Find (Ctrl+Shift+F) searches with several criteria at once.",
     ),
+    (
+        "people",
+        "People and contacts",
+        "People keeps your contacts. Change View switches between the contact list with its card, business cards, address cards and the Phone and List tables. In a table, Add Columns picks the fields shown, a click on a column heading sorts by it, and the flag and category cells take one click (the Quick Click flag and category, set under Follow Up and Categorize). Mark a contact Private from the Tags group or the contact window; Forward Contact sends it as a business card or a vCard file.",
+    ),
+    (
+        "tasks",
+        "Tasks and the To-Do List",
+        "The To-Do List gathers your open tasks with the messages and contacts you flagged. Type in the box at the top to add a task; tick its box or click its flag to complete it. Every task view is a table: Add Columns chooses the fields (status, % complete, dates, folder, categories, priority and more), View Settings sorts, filters and colours rows, and Save Current View As a New View keeps your arrangement for one folder or for all task folders.",
+    ),
+    (
+        "views",
+        "Views and View Settings",
+        "Each folder remembers its view. View Settings sets the columns, the sort order, a filter and conditional formatting (rules that change the font of matching rows). Manage All Views creates, copies, renames and deletes saved views; Reset View goes back to the folder's defaults.",
+    ),
     ("shortcuts", "Keyboard shortcuts", ""),
     (
         "data",
@@ -134,6 +149,8 @@ const TOPICS: [(&str, &str, &str); 7] = [
 struct HelpState {
     topic: usize,
     filter: String,
+    /// Help search text (filters the topic list).
+    search: String,
 }
 
 fn help(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -142,13 +159,25 @@ fn help(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let init = |_: &App| HelpState {
         topic: TOPICS.iter().position(|(k, _, _)| *k == want).unwrap_or(0),
         filter: String::new(),
+        search: String::new(),
     };
     with_state(ctx, app, uid, init, |st, app| {
         window(ctx, app, d, "MailCraft Help", 640.0, |ui, app| {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(170.0);
-                    for (i, (_, title, _)) in TOPICS.iter().enumerate() {
+                    // Search the topics: titles and text containing every word typed.
+                    ui.add(
+                        egui::TextEdit::singleline(&mut st.search)
+                            .hint_text("Search help")
+                            .desired_width(160.0),
+                    );
+                    let words: Vec<String> = st.search.split_whitespace().map(str::to_lowercase).collect();
+                    for (i, (_, title, text)) in TOPICS.iter().enumerate() {
+                        let hay = format!("{title} {text}").to_lowercase();
+                        if !words.iter().all(|w| hay.contains(w.as_str())) {
+                            continue;
+                        }
                         if ui.selectable_label(st.topic == i, *title).clicked() {
                             st.topic = i;
                         }

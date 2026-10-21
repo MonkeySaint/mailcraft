@@ -165,6 +165,8 @@ pub(crate) struct ContactEditor {
     /// Add Members picker (group).
     pub picker: Option<MemberPicker>,
     pub categories: Vec<String>,
+    /// Private (Tags › Private): kept from people who see the folder shared.
+    pub private: bool,
     /// Page shown: General, Details or All Fields.
     pub page: ContactPage,
     /// Details page: office, profession, manager's name, assistant's name, nickname, spouse/partner.
@@ -490,6 +492,7 @@ pub(crate) fn open_contact(app: &App, st: &mut ModState, id: ItemId) {
         notes,
         members: if group { c.emails.join("; ") } else { String::new() },
         categories: c.categories.clone(),
+        private: c.private,
         details: [
             c.office.clone(),
             c.profession.clone(),
@@ -1754,6 +1757,9 @@ fn contact_page(ui: &mut Ui, app: &App, ed: &mut ContactEditor) {
                     ui.label("Categories");
                     categories_menu(ui, app, &mut ed.categories);
                     ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut ed.private, "Private");
+                    ui.end_row();
                 });
                 egui::CollapsingHeader::new("Business address")
                     .id_salt("mc-contact-baddr")
@@ -1899,6 +1905,7 @@ fn edited_contact(ed: &ContactEditor) -> Contact {
     c.im_address = ed.im.clone();
     c.notes = ed.notes.clone();
     c.categories = ed.categories.clone();
+    c.private = ed.private;
     let [a, b, cc, d, e] = &ed.home;
     if [a, b, cc, d, e].iter().any(|x| !x.trim().is_empty()) {
         c.addresses.push(PostalAddress {
@@ -2224,6 +2231,7 @@ pub(crate) fn save_contact_checked(app: &mut App, ed: &ContactEditor) -> Result<
         p.insert("addresses".into(), Value::Array(addresses));
         p.insert("birthday".into(), json!(ed.birthday.trim()));
         p.insert("categories".into(), json!(ed.categories));
+        p.insert("private".into(), json!(ed.private));
         if !ed.anniversary.trim().is_empty() && parse_day(&ed.anniversary).is_none() {
             return Err("Enter the anniversary as YYYY-MM-DD.".into());
         }
@@ -2517,11 +2525,7 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
             Err(e) => ed.error = Some(e),
         },
         Act::Delete => {
-            if let Some(id) = ed.id {
-                app.run("tasks.delete", json!({ "id": id }));
-                if app.ui.module_selection == Some(id) {
-                    select_item(app, None);
-                }
+            if delete_from_window(app, &ed) {
                 return;
             }
         }
@@ -2530,6 +2534,24 @@ fn task_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
     }
     if open {
         st.editors.task = Some(ed);
+    }
+}
+
+/// Delete in the task window; true when the task was deleted and the window closes. A task accepted from a
+/// request first asks what to tell the person who assigned it: the window (with its unsaved edits) stays
+/// open until that question really deletes the task, so Cancel loses nothing.
+fn delete_from_window(app: &mut App, ed: &TaskEditor) -> bool {
+    let Some(id) = ed.id else { return false };
+    match app.run("tasks.delete", json!({ "id": id })) {
+        Some(r) if r.get("dialog").is_some() => false,
+        Some(_) => {
+            if app.ui.module_selection == Some(id) {
+                select_item(app, None);
+            }
+            true
+        }
+        // The error shows as a toast; the window stays.
+        None => false,
     }
 }
 

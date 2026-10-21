@@ -655,3 +655,175 @@ fn new_folder_from_the_account_root_goes_to_the_top_level() {
     assert_eq!(f.parent, None);
     assert_eq!(f.account, acct);
 }
+
+fn module_folder(app: &mut App, kind: mailcraft_model::FolderKind) -> FolderId {
+    let f = app.s.mailbox.folders.values().find(|f| f.kind == kind).map(|f| f.id).unwrap();
+    app.run("nav.selectFolder", json!({"folder": f.0})).unwrap();
+    f
+}
+
+#[test]
+fn module_show_columns_adds_and_orders_columns() {
+    let mut app = sample_app();
+    let folder = module_folder(&mut app, mailcraft_model::FolderKind::Contacts);
+    app.run("view.changeView", json!({"name": "Phone"})).unwrap();
+    app.run("view.addColumns", json!({})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["showColumns"]);
+    h.get_by_label("Department").click();
+    step(&mut h);
+    h.get_by_label("Add ->").click();
+    step(&mut h);
+    h.get_by_label("Move Up").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    let cols: Vec<&str> =
+        mailcraft_engine::cmd::view::table::columns(&h.state().s, folder).iter().map(|c| c.id).collect();
+    let n = cols.len();
+    assert_eq!(cols.get(n - 2), Some(&"department"), "{cols:?}");
+    assert_eq!(cols.last(), Some(&"flagStatus"));
+}
+
+#[test]
+fn module_format_columns_aligns_a_task_column() {
+    use mailcraft_engine::cmd::view::table;
+    let mut app = sample_app();
+    let folder = module_folder(&mut app, mailcraft_model::FolderKind::Tasks);
+    app.run("view.changeView", json!({"name": "Detailed"})).unwrap();
+    app.run("view.formatColumns", json!({})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["viewFormat"]);
+    let first = table::shown(&h.state().s, folder).first().map(|c| c.col.id).unwrap();
+    h.get_by_label("Right").click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    let col = table::shown(&h.state().s, folder).into_iter().find(|c| c.col.id == first).unwrap();
+    assert_eq!(col.align, "right");
+}
+
+#[test]
+fn module_manage_views_creates_renames_and_deletes() {
+    use mailcraft_engine::cmd::view::modules;
+    let mut app = sample_app();
+    let folder = module_folder(&mut app, mailcraft_model::FolderKind::Tasks);
+    app.run("view.manageViews", json!({})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["manageViews"]);
+    h.get_by_label("New...").click();
+    step(&mut h);
+    h.get_by_label("Name of new view:").focus();
+    step(&mut h);
+    h.get_by_label("Name of new view:").type_text("Errands");
+    step(&mut h);
+    h.query_all_by_label("All Task folders").last().unwrap().click();
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    let saved = modules::saved_views(&h.state().s, folder);
+    assert_eq!(
+        saved.iter().map(|v| (v.name.as_str(), v.everywhere)).collect::<Vec<_>>(),
+        [("Errands", true)]
+    );
+    // "Only show views created for this folder" hides the built-in and module-wide views.
+    assert!(h.query_by_label("Detailed").is_some());
+    h.get_by_label("Only show views created for this folder").click();
+    step(&mut h);
+    assert!(h.query_by_label("Detailed").is_none());
+    assert!(h.query_by_label("Errands").is_none());
+    h.get_by_label("Only show views created for this folder").click();
+    step(&mut h);
+    h.get_by_label("Rename...").click();
+    step(&mut h);
+    let field = h.get_by_label("Name of new view:");
+    field.focus();
+    step(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+    h.get_by_label("Name of new view:").type_text("Chores");
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    let saved = modules::saved_views(&h.state().s, folder);
+    assert_eq!(saved.first().map(|v| v.name.as_str()), Some("Chores"));
+    h.get_by_label("Apply View").click();
+    step(&mut h);
+    assert_eq!(modules::current_view_name(&h.state().s, folder), "Chores");
+    h.state_mut().run("view.manageViews", json!({}));
+    step(&mut h);
+    h.get_by_label("Delete").click();
+    step(&mut h);
+    assert!(modules::saved_views(&h.state().s, folder).is_empty());
+}
+
+#[test]
+fn module_manage_views_describes_the_selected_view_and_has_ok() {
+    let mut app = sample_app();
+    module_folder(&mut app, mailcraft_model::FolderKind::Tasks);
+    app.run("view.changeView", json!({"name": "Simple List"})).unwrap();
+    app.run("view.columns", json!({"columns": ["subject", "priority"]})).unwrap();
+    app.run("view.manageViews", json!({})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["manageViews"]);
+    // The Description shows the selected view's settings, and follows the selection.
+    assert!(h.query_by_label("Type of view: Simple List").is_some());
+    assert!(h.query_all_by_label_contains("Columns: Subject, Priority").next().is_some());
+    assert!(h.query_all_by_label_contains("Filter: Off").next().is_some());
+    h.get_by_label("Detailed").click();
+    step(&mut h);
+    assert!(h.query_by_label("Type of view: Detailed").is_some());
+    assert!(h.query_all_by_label_contains("Columns: Subject, Priority").next().is_none());
+    // OK, Apply View and Close.
+    assert!(h.query_by_label("Apply View").is_some() && h.query_by_label("Close").is_some());
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+}
+
+#[test]
+fn contact_color_categories_assign_through_people_categorize() {
+    let mut app = sample_app();
+    let folder = module_folder(&mut app, mailcraft_model::FolderKind::Contacts);
+    let id = app.s.mailbox.contacts.values().find(|c| c.folder == folder).map(|c| c.id).unwrap();
+    app.s.selection.items = vec![id];
+    app.s.selection.focus = Some(id);
+    app.run("people.allCategories", json!({})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["colorCategories"]);
+    // The full dialog: New, Rename, Delete, Color and Shortcut Key.
+    for label in ["New...", "Rename", "Delete", "Color:", "Shortcut Key:"] {
+        assert!(h.query_by_label(label).is_some(), "{label}");
+    }
+    h.get_by_label("New...").click();
+    step(&mut h);
+    h.get_by_role(egui::accesskit::Role::TextInput).type_text("Neighbours");
+    step(&mut h);
+    h.key_press(Key::Enter);
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert!(h.state().s.mailbox.contacts[&id].categories.iter().any(|c| c == "Neighbours"));
+}
+
+#[test]
+fn new_data_file_asks_for_a_name() {
+    let mut app = sample_app();
+    let before = app.s.mailbox.accounts.len();
+    app.run("file.newDataFile", json!({})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["newDataFile"]);
+    let field = h.get_by_label("File name:");
+    field.focus();
+    step(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+    h.get_by_label("File name:").type_text("Receipts archive");
+    step(&mut h);
+    h.get_by_label("OK").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert_eq!(h.state().s.mailbox.accounts.len(), before + 1);
+    assert!(h.state().s.mailbox.accounts.iter().any(|a| a.display_name == "Receipts archive"));
+}

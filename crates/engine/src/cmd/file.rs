@@ -88,7 +88,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.newDataFile",
             "New Data File",
             "Home › New Items › More Items",
-            r#"{"path"?: string, "name"?: string}"#,
+            r#"{"path"?: string, "name"?: string} (neither = open the New Data File dialog)"#,
             true,
             always,
             new_data_file,
@@ -634,6 +634,18 @@ fn cleanup_tools(s: &mut Session, _: &Value) -> CmdResult {
 fn new_data_file(s: &mut Session, p: &Value) -> CmdResult {
     if s.mailbox.accounts.len() >= MAX_ACCOUNTS {
         return Err(CmdError::Failed(format!("at most {MAX_ACCOUNTS} data files")));
+    }
+    // Without a name or path the New Data File dialog asks for one (and shows where it is kept).
+    if p.get("name").is_none_or(Value::is_null) && p.get("path").is_none_or(Value::is_null) {
+        let taken = |n: &str| s.mailbox.accounts.iter().any(|a| a.display_name.eq_ignore_ascii_case(n));
+        let mut name = LOCAL_ACCOUNT_FALLBACK_NAME.to_owned();
+        let mut k = 2u32;
+        while taken(&name) && k < 10_000 {
+            name = format!("{LOCAL_ACCOUNT_FALLBACK_NAME} ({k})");
+            k = k.saturating_add(1);
+        }
+        let location = s.store.as_ref().map(|st| st.dir.display().to_string());
+        return dialog(s, "newDataFile", json!({ "name": name, "location": location }));
     }
     let from_path = opt_str(p, "path").and_then(|path| Path::new(path).file_stem()).and_then(|n| n.to_str());
     let clean = |n: &str| -> String { n.chars().filter(|c| !c.is_control()).take(255).collect() };
@@ -1453,6 +1465,19 @@ mod tests {
         let (mut s, _, _) = session();
         let r = s.run("file.newDataFile", &json!({"name": "\u{7}\u{7}"})).unwrap();
         assert_eq!(r["name"], LOCAL_ACCOUNT_FALLBACK_NAME);
+    }
+
+    #[test]
+    fn new_data_file_without_a_name_asks_for_one() {
+        let (mut s, _, _) = session();
+        let before = s.mailbox.accounts.len();
+        let r = s.run("file.newDataFile", &json!({})).unwrap();
+        assert_eq!(r["dialog"], "newDataFile");
+        assert_eq!(s.mailbox.accounts.len(), before, "nothing is created until the dialog's OK");
+        let Some(crate::Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
+        assert!(p["name"].as_str().is_some_and(|n| !n.is_empty()));
+        s.run("file.newDataFile", &json!({"name": "Archive"})).unwrap();
+        assert_eq!(s.mailbox.accounts.len(), before + 1);
     }
 
     #[cfg(unix)]

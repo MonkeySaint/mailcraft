@@ -416,6 +416,9 @@ fn address_from(v: &Value, default_kind: &str) -> Result<PostalAddress, CmdError
 /// Applies contact field params (shared by new and update). A `fullName` is split in the profile's Default
 /// "Full Name" order and an automatic File As follows the Default "File As" order (Options › People).
 pub fn apply_contact_fields(s: &Session, c: &mut Contact, p: &Value) -> Result<(), CmdError> {
+    if let Some(v) = pim::flag(p, "private")? {
+        c.private = v;
+    }
     let file_as_order = s.settings.file_as();
     let was_auto =
         c.file_as.trim().is_empty() || FILE_AS_ORDERS.iter().any(|o| c.file_as == file_as_in(c, o));
@@ -965,6 +968,62 @@ pub fn business_card_lines(c: &Contact) -> Vec<String> {
 }
 
 /// File name for a contact's vCard ("Ann Lee.vcf").
+/// Forward › As a Business Card: the message body shows each card as a bordered box (the contact's picture,
+/// or a coloured band, beside the name in bold and the card lines); the .vcf files go with it.
+pub fn business_card_doc(cards: &[Contact]) -> mailcraft_model::Doc {
+    use base64::Engine as _;
+    use mailcraft_geom::Color;
+    use mailcraft_model::rich::{Block, Inline, ParaStyle, TableCell, TextStyle};
+    let accent = Color::hex(0x000f_6cbd);
+    let muted = Color::hex(0x0060_5e5c);
+    let para = |inlines: Vec<Inline>| Block::Paragraph {
+        style: ParaStyle { space_after_px: 2.0, ..ParaStyle::default() },
+        inlines,
+    };
+    let cell = |blocks: Vec<Block>, background: Option<Color>, width_px: Option<f32>| TableCell {
+        blocks,
+        colspan: 1,
+        rowspan: 1,
+        background,
+        width_px,
+    };
+    let mut blocks = Vec::new();
+    for c in cards {
+        let lines = business_card_lines(c);
+        let text: Vec<Block> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let style = if i == 0 {
+                    TextStyle { bold: Some(true), size_pt: Some(14.0), ..TextStyle::default() }
+                } else {
+                    TextStyle { size_pt: Some(10.0), color: Some(muted), ..TextStyle::default() }
+                };
+                para(vec![Inline::Text { text: l.clone(), style }])
+            })
+            .collect();
+        let side = match &c.picture {
+            Some(pic) => {
+                let src = format!(
+                    "data:{};base64,{}",
+                    pic.mime,
+                    base64::engine::general_purpose::STANDARD.encode(&pic.data)
+                );
+                let img = Inline::Image { src, alt: display_name(c), width: Some(72.0), height: None };
+                cell(vec![para(vec![img])], None, Some(84.0))
+            }
+            None => cell(vec![para(Vec::new())], Some(accent), Some(10.0)),
+        };
+        blocks.push(Block::Table {
+            rows: vec![vec![side, cell(text, Some(Color::WHITE), None)]],
+            border: true,
+            width_px: Some(360.0),
+        });
+        blocks.push(para(Vec::new()));
+    }
+    mailcraft_model::Doc { blocks, ..mailcraft_model::Doc::default() }
+}
+
 fn vcard_name(c: &Contact) -> String {
     crate::compose::clean_attachment_name(&format!("{}.vcf", display_name(c)), "contact.vcf")
 }
@@ -991,9 +1050,9 @@ fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
         [] => String::new(),
     };
     let body = if as_kind == "businessCard" {
-        contacts.iter().map(|c| business_card_lines(c).join("\n")).collect::<Vec<_>>().join("\n\n")
+        business_card_doc(&contacts)
     } else {
-        String::new()
+        mailcraft_model::Doc::default()
     };
     let attachments = contacts
         .iter()
@@ -1004,13 +1063,8 @@ fn run_forward(s: &mut Session, p: &Value) -> CmdResult {
                 .into_bytes(),
         })
         .collect();
-    let mut compose = crate::compose::ComposeState {
-        subject,
-        body: mailcraft_model::Doc::from_plain_text(&body),
-        attachments,
-        dirty: true,
-        ..Default::default()
-    };
+    let mut compose =
+        crate::compose::ComposeState { subject, body, attachments, dirty: true, ..Default::default() };
     crate::compose::insert_default_signature(&s.mailbox, &mut compose);
     let cid = s.open_compose(compose);
     Ok(json!({ "compose": cid, "as": as_kind, "contacts": contacts.len() }))
@@ -1471,6 +1525,7 @@ fn row_matches(c: &Contact, q: &str) -> bool {
 /// Rows of the selected People view of `folder` matching `query`: by File As (Reverse Sort reverses),
 /// grouped by the arrangement (Phone and List views; List groups by company) when Show in Groups is on.
 pub fn view_rows(s: &Session, folder: FolderId, query: &str) -> Vec<ViewRow> {
+    use crate::cmd::view::table::Item;
     let kind = ModuleKind::People;
     let st = modules::state(s, folder, kind);
     let q = query.trim();
@@ -1479,17 +1534,22 @@ pub fn view_rows(s: &Session, folder: FolderId, query: &str) -> Vec<ViewRow> {
     } else {
         None
     };
-    let mut keyed: Vec<((u8, String), (String, ItemId), ViewRow)> =
-        s.mailbox
-            .contacts
-            .values()
-            .filter(|c| c.folder == folder && row_matches(c, q))
-            .map(|c| {
-                let text = |v: &str| {
-                    let v = v.trim();
-                    if v.is_empty() { (1, "(none)".to_owned()) } else { (0, v.to_owned()) }
-                };
-                let group = arrange.as_deref().map(|a| match a {
+    let custom = crate::cmd::view::table::custom(&st);
+    let mut keyed: Vec<((u8, String), (String, ItemId), ViewRow)> = s
+        .mailbox
+        .contacts
+        .values()
+        .filter(|c| c.folder == folder && row_matches(c, q))
+        .filter(|c| {
+            custom.filter.as_ref().is_none_or(|f| crate::cmd::view::table::matches(s, Item::Contact(c), f))
+        })
+        .map(|c| {
+            let text = |v: &str| {
+                let v = v.trim();
+                if v.is_empty() { (1, "(none)".to_owned()) } else { (0, v.to_owned()) }
+            };
+            let group =
+                arrange.as_deref().map(|a| match a {
                     "categories" => text(c.categories.first().map(String::as_str).unwrap_or("")),
                     "location" => {
                         let a = c
@@ -1506,12 +1566,19 @@ pub fn view_rows(s: &Session, folder: FolderId, query: &str) -> Vec<ViewRow> {
                     }
                     _ => text(&c.company),
                 });
-                let row =
-                    ViewRow { id: c.id, kind: RowKind::Contact, group: group.as_ref().map(|g| g.1.clone()) };
-                (group.unwrap_or((0, String::new())), (display_name(c).to_lowercase(), c.id), row)
-            })
-            .collect();
-    keyed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            let row =
+                ViewRow { id: c.id, kind: RowKind::Contact, group: group.as_ref().map(|g| g.1.clone()) };
+            (group.unwrap_or((0, String::new())), (display_name(c).to_lowercase(), c.id), row)
+        })
+        .collect();
+    let by =
+        |a: &ItemId, b: &ItemId| match (&custom.sort, s.mailbox.contacts.get(a), s.mailbox.contacts.get(b)) {
+            (Some(f), Some(x), Some(y)) => {
+                crate::cmd::view::table::compare(s, kind, f, Item::Contact(x), Item::Contact(y))
+            }
+            _ => std::cmp::Ordering::Equal,
+        };
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| by(&a.2.id, &b.2.id)).then_with(|| a.1.cmp(&b.1)));
     let mut out: Vec<ViewRow> = keyed.into_iter().map(|(_, _, r)| r).collect();
     if modules::reversed(s, folder) {
         out.reverse();
@@ -1652,7 +1719,7 @@ pub fn specs() -> Vec<CommandSpec> {
         enabled,
         run,
     };
-    const FIELDS: &str = r#"{"fullName"?, "firstName"?, "middleName"?, "lastName"?, "title"?, "suffix"?, "fileAs"?, "company"?, "jobTitle"?, "department"?, "email"?, "email2"?, "email3"?, "emails"?: [string], "phones"?: {"Business": string, "Mobile": string, ...}, "addresses"?: [{"kind","street","city","region","postalCode","country"}], "businessAddress"?: {...}, "webPage"?, "im"?, "birthday"?: "YYYY-MM-DD", "notes"?, "categories"?: [string], "folder"?: number, "duplicate"?: "add"|"update" (new contacts: what to do when Options › People › Check for duplicates finds one; without it a duplicate is reported and nothing is saved)} (no fields = open a blank contact window)"#;
+    const FIELDS: &str = r#"{"fullName"?, "firstName"?, "middleName"?, "lastName"?, "title"?, "suffix"?, "fileAs"?, "company"?, "jobTitle"?, "department"?, "email"?, "email2"?, "email3"?, "emails"?: [string], "phones"?: {"Business": string, "Mobile": string, ...}, "addresses"?: [{"kind","street","city","region","postalCode","country"}], "businessAddress"?: {...}, "webPage"?, "im"?, "birthday"?: "YYYY-MM-DD", "notes"?, "categories"?: [string], "private"?: bool, "folder"?: number, "duplicate"?: "add"|"update" (new contacts: what to do when Options › People › Check for duplicates finds one; without it a duplicate is reported and nothing is saved)} (no fields = open a blank contact window)"#;
     vec![
         spec(
             "people.assignTask",
@@ -1768,7 +1835,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "people.move",
             "Move to Folder",
             "People › Home › Actions › Move",
-            "",
+            "Mod+Shift+V",
             r#"{"folder": number, "id"?: number, "ids"?: [number]}"#,
             true,
             always,
@@ -2117,6 +2184,14 @@ mod tests {
             text.contains("Ann Lee") && text.contains("Editor") && text.contains("+1 555 0100 Mobile"),
             "{text}"
         );
+        // The body shows the card as a box: a bordered table with the name in bold.
+        let table = c.body.blocks.iter().find(|b| matches!(b, mailcraft_model::Block::Table { .. }));
+        let Some(mailcraft_model::Block::Table { rows, border: true, .. }) = table else {
+            panic!("no card box: {:?}", c.body.blocks)
+        };
+        assert_eq!(rows[0].len(), 2);
+        let html = mailcraft_html::doc_to_html(&c.body);
+        assert!(html.contains("<table") && html.contains("Ann Lee"), "{html}");
         // As a contact: the vCard alone.
         let r = s.run("people.forward", &json!({"as": "contact", "ids": [a]})).unwrap();
         let c = &s.composes[&r["compose"].as_u64().unwrap()];
@@ -2196,7 +2271,7 @@ mod tests {
         assert!(s.mailbox.contacts[&ItemId(a)].private);
         assert_eq!(s.run("people.move", &json!({})).unwrap()["dialog"], "pimMove");
         assert_eq!(s.run("people.copy", &json!({})).unwrap()["dialog"], "pimMove");
-        assert_eq!(s.run("people.allCategories", &json!({})).unwrap()["dialog"], "pimCategories");
+        assert_eq!(s.run("people.allCategories", &json!({})).unwrap()["dialog"], "colorCategories");
     }
 
     #[test]

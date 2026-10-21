@@ -1,8 +1,10 @@
 //! People module: My Contacts (folder pane) and the folder's current view: People (letter index, contact
 //! list with search and the contact card), Business Card (business cards), Card (address cards), Phone and
-//! List (tables grouped by the arrangement, collapsible). The reading pane (contact card) follows View ›
-//! Reading Pane in the People, Phone and List views. The rows, their order and groups come from the engine
-//! (`mailcraft_engine::cmd::people::view_rows`).
+//! List (tables with the view's columns, grouped by the arrangement, collapsible; a header click sorts, the
+//! Flag Status and Categories cells take the Quick Click flag and category). The reading pane (contact card)
+//! follows View › Reading Pane in the People, Phone and List views. The rows, their order and groups come
+//! from the engine (`mailcraft_engine::cmd::people::view_rows`); the columns from
+//! `mailcraft_engine::cmd::view::table`.
 
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Modifiers, Rect, RichText, ScrollArea,
@@ -23,7 +25,9 @@ use super::common::{
     sync_selection, todo_bar_strip, toggle_group, view_switch,
 };
 use super::editors;
+use super::table as mt;
 use crate::App;
+use mailcraft_engine::cmd::view::table;
 
 const INDEX_W: f32 = 30.0;
 const ROW_H: f32 = 56.0;
@@ -217,7 +221,7 @@ fn content(
     let list_w = if table { (rest.width() * 0.62).max(420.0) } else { 300.0 };
     let (list, pane) = reading_split(rest, view.reading_pane, list_w, 0.55);
     if table {
-        child(ui, list, "mc-people-table", |ui| table_view(ui, app, st, folder, &view.view, rows));
+        child(ui, list, "mc-people-table", |ui| table_view(ui, app, st, folder, rows));
     } else {
         child(ui, list, "mc-people-list", |ui| contact_list(ui, app, st, &ids));
     }
@@ -238,64 +242,19 @@ fn content(
     }
 }
 
-/// Columns of the Phone and List views: (header, value of a contact).
-type Column = (&'static str, fn(&Contact) -> String);
-
-fn phone(c: &Contact, kind: &str) -> String {
-    c.phones.iter().find(|(k, _)| k.eq_ignore_ascii_case(kind)).map(|(_, n)| n.clone()).unwrap_or_default()
-}
-
-const PHONE_COLUMNS: [Column; 7] = [
-    ("Full Name", |c| if is_group(c) { display_name(c) } else { c.full_name() }),
-    ("Company", |c| c.company.clone()),
-    ("File As", display_name),
-    ("Business Phone", |c| phone(c, "Business")),
-    ("Business Fax", |c| phone(c, "Business Fax")),
-    ("Home Phone", |c| phone(c, "Home")),
-    ("Mobile Phone", |c| phone(c, "Mobile")),
-];
-
-const LIST_COLUMNS: [Column; 7] = [
-    ("Full Name", |c| if is_group(c) { display_name(c) } else { c.full_name() }),
-    ("Job Title", |c| c.job_title.clone()),
-    ("Company", |c| c.company.clone()),
-    ("File As", display_name),
-    ("Department", |c| c.department.clone()),
-    ("Business Phone", |c| phone(c, "Business")),
-    ("Email", |c| c.emails.first().cloned().unwrap_or_default()),
-];
-
-/// The Phone and List views: a table of the contacts, grouped by the arrangement (collapsible).
-fn table_view(
-    ui: &mut Ui,
-    app: &mut App,
-    st: &mut ModState,
-    folder: Option<FolderId>,
-    view: &str,
-    rows: &[ViewRow],
-) {
-    let columns: &[Column] = if view == "Phone" { &PHONE_COLUMNS } else { &LIST_COLUMNS };
+/// The Phone and List views: a table of the contacts with the view's columns (Show Columns), grouped by the
+/// arrangement (collapsible). A header click sorts by the column; the Flag Status and Categories cells take
+/// a click (the Quick Click flag and category).
+fn table_view(ui: &mut Ui, app: &mut App, st: &mut ModState, folder: Option<FolderId>, rows: &[ViewRow]) {
+    let cols = folder.map(|f| table::shown(&app.s, f)).unwrap_or_default();
+    let sort = folder.and_then(|f| table::sort(&app.s, f));
+    let rules = folder.map(|f| table::rules(&app.s, f)).unwrap_or_default();
     let width = ui.available_width();
-    // The first column gets a double share.
-    let unit = (width - 32.0).max(80.0) / (columns.len() as f32 + 1.0);
-    let col_x = |i: usize| 28.0 + unit * (i as f32 + if i > 0 { 1.0 } else { 0.0 });
-    let col_w = |i: usize| if i == 0 { unit * 2.0 } else { unit } - 6.0;
-    let (head, _) = ui.allocate_exact_size(vec2(width, 24.0), Sense::hover());
-    for (i, (name, _)) in columns.iter().enumerate() {
-        let cell =
-            Rect::from_min_size(pos2(head.min.x + col_x(i), head.min.y), vec2(col_w(i).max(1.0), 22.0));
-        let resp = ui.interact(cell, Id::new(("mc-people-col", i)), Sense::hover());
-        a11y(&resp, WidgetType::Label, name);
-        paint_text_clipped(
-            ui,
-            pos2(head.min.x + col_x(i), head.min.y + 5.0),
-            name,
-            FontId::proportional(11.5),
-            app.theme.text_muted,
-            col_w(i),
-        );
+    let laid = mt::layout(width, &cols);
+    let (head, _) = ui.allocate_exact_size(vec2(width, mt::HEAD_H), Sense::hover());
+    if let Some(c) = mt::header(ui, app, head, &laid, sort.as_ref(), "mc-people") {
+        mt::sort_by_column(app, sort.as_ref(), c);
     }
-    ui.painter().hline(head.x_range(), head.max.y - 1.0, Stroke::new(1.0, app.theme.separator));
     if rows.is_empty() {
         let hint = if st.people_search.trim().is_empty() {
             "Add someone with New Contact."
@@ -325,38 +284,74 @@ fn table_view(
             }
             let Some(c) = app.s.mailbox.contacts.get(&r.id).cloned() else { continue };
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
-            a11y(&resp, WidgetType::Button, &display_name(&c));
+            let name = display_name(&c);
+            a11y(&resp, WidgetType::Button, &name);
             if app.ui.module_selection == Some(r.id.0) {
                 ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.selected);
             } else if resp.hovered() {
                 ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.hover);
             }
-            let icon = if is_group(&c) { "contact-group" } else { "person" };
-            app.icons.paint(
-                ui,
-                Rect::from_center_size(pos2(rect.min.x + 12.0, rect.center().y), Vec2::splat(14.0)),
-                icon,
-                app.theme.text_muted,
-            );
-            if matches!(c.flag, FlagState::Flagged { .. }) {
-                app.icons.paint(
-                    ui,
-                    Rect::from_center_size(pos2(rect.max.x - 10.0, rect.center().y), Vec2::splat(14.0)),
-                    "flag",
-                    app.theme.flag,
-                );
-            }
-            for (i, (_, value)) in columns.iter().enumerate() {
-                paint_text_clipped(
-                    ui,
-                    pos2(rect.min.x + col_x(i), rect.center().y - 8.0),
-                    &value(&c),
-                    FontId::proportional(12.5),
-                    app.theme.text,
-                    col_w(i),
-                );
+            let style = table::row_style(&app.s, &rules, table::Item::Contact(&c));
+            let (color, look) = mt::row_look(&style, app.theme.text, app.theme.danger, app.theme.text_muted);
+            let hovered = resp.hovered();
+            let mut flag_click = false;
+            let mut cat_click = false;
+            for l in &laid {
+                let cell = Rect::from_min_size(pos2(rect.min.x + l.x, rect.min.y), vec2(l.w.max(1.0), row_h));
+                match l.col.id {
+                    "icon" => {
+                        let icon = if is_group(&c) {
+                            "contact-group"
+                        } else if c.private {
+                            "private"
+                        } else {
+                            "person"
+                        };
+                        mt::paint_icon(ui, app, cell, icon);
+                    }
+                    "flagStatus" => {
+                        let look = match c.flag {
+                            FlagState::Flagged { .. } => mt::FlagLook::Flagged,
+                            FlagState::Complete { .. } => mt::FlagLook::Complete,
+                            FlagState::None => mt::FlagLook::None,
+                        };
+                        let label = format!("Flag {name}");
+                        flag_click |= mt::flag_cell(ui, app, cell, look, hovered, ("people", r.id.0), &label);
+                    }
+                    "categories" => {
+                        cat_click |=
+                            mt::categories_cell(ui, app, cell, &c.categories, hovered, ("people", r.id.0));
+                    }
+                    id => {
+                        let text = table::contact_cell(&c, id);
+                        let size = if id == "fullName" { 12.5 } else { 12.0 };
+                        let tint =
+                            if id == "fullName" || color != app.theme.text { color } else { app.theme.text };
+                        mt::styled_cell(ui, cell, &text, size, look, tint, l.align);
+                    }
+                }
             }
             ui.painter().hline(rect.x_range(), rect.max.y, Stroke::new(0.5, app.theme.separator));
+            if flag_click {
+                // Unflagged: the Quick Click flag; flagged: complete; complete: clear (like the mail list).
+                let kind = match c.flag {
+                    FlagState::None => None,
+                    FlagState::Flagged { .. } => Some("complete"),
+                    FlagState::Complete { .. } => Some("clear"),
+                };
+                select_item(app, Some(r.id.0));
+                let p = match kind {
+                    Some(k) => json!({ "ids": [r.id.0], "kind": k }),
+                    None => json!({ "ids": [r.id.0] }),
+                };
+                app.run("people.flag", p);
+                continue;
+            }
+            if cat_click {
+                select_item(app, Some(r.id.0));
+                app.run("people.categorize", json!({ "ids": [r.id.0] }));
+                continue;
+            }
             if resp.clicked() {
                 select_item(app, Some(r.id.0));
             }
@@ -589,6 +584,13 @@ fn contact_list(ui: &mut Ui, app: &mut App, st: &mut ModState, ids: &[ItemId]) {
                     Rect::from_min_size(pos2(rect.max.x - 26.0, rect.center().y - 8.0), Vec2::splat(16.0));
                 app.icons.paint(ui, r, "flag", app.theme.flag);
             }
+            if c.private {
+                let r =
+                    Rect::from_min_size(pos2(rect.max.x - 46.0, rect.center().y - 7.0), Vec2::splat(14.0));
+                let lock = ui.interact(r, Id::new(("mc-people-private", id.0)), Sense::hover());
+                a11y(&lock, WidgetType::Label, &format!("Private {name}"));
+                app.icons.paint(ui, r, "private", app.theme.text_muted);
+            }
             paint_text_clipped(
                 ui,
                 pos2(x, rect.min.y + 10.0),
@@ -745,6 +747,9 @@ fn contact_card(ui: &mut Ui, app: &mut App, st: &mut ModState, id: ItemId) {
             }
             if !c.categories.is_empty() {
                 info_row(ui, app, "category-tag", "Categories", &c.categories.join(", "));
+            }
+            if c.private {
+                info_row(ui, app, "private", "Sensitivity", "Private");
             }
             // Details page.
             let details = [

@@ -1,6 +1,7 @@
-//! Module dialogs: Move / Copy to Folder, All Categories and Custom follow-up for contacts, tasks and notes;
-//! the module View Settings, Apply View and Save View dialogs; Mail Merge Contacts; and the Task Request
-//! window (People › Assign Task, New Items › Task Request).
+//! Module dialogs: Move / Copy to Folder and Custom follow-up for contacts, tasks and notes;
+//! the module View Settings, Apply View and Save View dialogs; Mail Merge Contacts; the Task Request
+//! window (People › Assign Task, New Items › Task Request); and the question asked before a task accepted
+//! from a task request is deleted.
 //!
 //! The engine asks for them with `Notice::OpenDialog` (ids in [`HANDLED`]); [`super::show`] takes them out
 //! of `app.ui.dialogs` before the dialogs area draws, so these replace any generic renderer. Every button
@@ -20,7 +21,7 @@ use crate::App;
 /// Dialog ids drawn here.
 pub(crate) const HANDLED: [&str; 9] = [
     "pimMove",
-    "pimCategories",
+    "deleteTaskRequest",
     "pimFlag",
     "moduleViewSettings",
     "applyModuleView",
@@ -47,14 +48,35 @@ pub(crate) struct Dialog {
 
 #[derive(Clone)]
 pub(crate) enum Kind {
-    Move { ids: Vec<u64>, area: String, copy: bool, folder: Option<u64> },
-    Categories { ids: Vec<u64>, area: String, initial: Vec<String>, on: Vec<String> },
+    Move {
+        ids: Vec<u64>,
+        area: String,
+        copy: bool,
+        folder: Option<u64>,
+    },
     Flag(FlagForm),
     ViewSettings(ViewForm),
-    ApplyView { noun: String, folders: Vec<(u64, String)>, picked: BTreeSet<u64>, subfolders: bool },
-    SaveView { name: String, noun: String },
+    ApplyView {
+        noun: String,
+        folders: Vec<(u64, String)>,
+        picked: BTreeSet<u64>,
+        subfolders: bool,
+    },
+    SaveView {
+        name: String,
+        all: bool,
+        all_label: String,
+    },
     MailMerge(MergeForm),
     TaskRequest(RequestForm),
+    /// Deleting a task accepted from a task request: decline, mark complete and notify, or just delete.
+    DeleteRequest {
+        ids: Vec<u64>,
+        subject: String,
+        choice: String,
+        /// Set once the tasks were really deleted (the task window showing one of them then closes).
+        done: bool,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -83,8 +105,24 @@ pub(crate) struct ViewForm {
     pub preview: u8,
     pub pane: String,
     pub spacing: bool,
+    /// The table parts of View Settings (Columns, Sort, Filter, Conditional Formatting, Format Columns): their
+    /// descriptions,
+    /// `None` when the view is not a table.
+    pub table: Option<TableSummary>,
+    /// Opened from Manage All Views › Modify on this saved view: OK stores the view into it.
+    pub saved_view: String,
     /// Values when the dialog opened (only changes are applied).
     pub initial: Box<Option<ViewForm>>,
+}
+
+/// What the table parts of a module view are set to.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct TableSummary {
+    pub columns: String,
+    pub sort: String,
+    pub filter: String,
+    pub rules: String,
+    pub formats: String,
 }
 
 #[derive(Clone, Default)]
@@ -144,10 +182,6 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
             copy: p.get("copy").and_then(Value::as_bool).unwrap_or(false),
             folder: None,
         },
-        "pimCategories" => {
-            let on = strings_of(p, "on");
-            Kind::Categories { ids: ids_of(p), area: str_of(p, "area"), initial: on.clone(), on }
-        }
         "pimFlag" => Kind::Flag(FlagForm {
             ids: ids_of(p),
             area: str_of(p, "area"),
@@ -187,6 +221,16 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
                     .unwrap_or(0),
                 pane: str_of(p, "readingPane"),
                 spacing: p.get("tighterSpacing").and_then(Value::as_bool).unwrap_or(false),
+                table: p.get("table").filter(|t| t.get("table").and_then(Value::as_bool) == Some(true)).map(
+                    |t| TableSummary {
+                        columns: str_of(t, "columns"),
+                        sort: str_of(t, "sort"),
+                        filter: str_of(t, "filter"),
+                        rules: str_of(t, "rules"),
+                        formats: str_of(t, "formats"),
+                    },
+                ),
+                saved_view: str_of(p, "savedView"),
                 initial: Box::new(None),
             };
             f.initial = Box::new(Some(f.clone()));
@@ -206,7 +250,9 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
             picked: BTreeSet::new(),
             subfolders: false,
         },
-        "saveModuleView" => Kind::SaveView { name: str_of(p, "name"), noun: str_of(p, "noun") },
+        "saveModuleView" => {
+            Kind::SaveView { name: str_of(p, "name"), all: false, all_label: str_of(p, "allFolders") }
+        }
         "mailMerge" => Kind::MailMerge(MergeForm {
             contacts: if str_of(p, "contacts") == "selected" { "selected".into() } else { "all".into() },
             // E-mail is the output MailCraft can produce.
@@ -224,6 +270,12 @@ pub(crate) fn open(app: &App, st: &mut ModState, name: &str, p: &Value) {
             body: "Dear {{First Name}},\n\n".into(),
             ..Default::default()
         }),
+        "deleteTaskRequest" => Kind::DeleteRequest {
+            ids: ids_of(p),
+            subject: str_of(p, "subject"),
+            choice: "decline".into(),
+            done: false,
+        },
         "taskRequest" | "newTaskRequest" => Kind::TaskRequest(RequestForm {
             to: str_of(p, "to"),
             status: "notStarted".into(),
@@ -248,11 +300,20 @@ pub(crate) fn show(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
     for mut d in open {
         if draw(ctx, app, &mut d) {
             keep.push(d);
+        } else if let Kind::DeleteRequest { ids, done: true, .. } = &d.kind {
+            close_deleted_task(st, ids);
         }
     }
     // Dialogs opened while drawing (none today) come after the ones kept.
     keep.append(&mut st.dialogs.open);
     st.dialogs.open = keep;
+}
+
+/// The task window stays open while the delete question is asked; it closes once its task is deleted.
+fn close_deleted_task(st: &mut ModState, ids: &[u64]) {
+    if st.editors.task.as_ref().and_then(|e| e.id).is_some_and(|id| ids.contains(&id)) {
+        st.editors.task = None;
+    }
 }
 
 fn window<'a>(title: &str, nonce: u64) -> egui::Window<'a> {
@@ -304,13 +365,13 @@ fn draw(ctx: &egui::Context, app: &mut App, d: &mut Dialog) -> bool {
     let title = match &d.kind {
         Kind::Move { copy: true, .. } => "Copy Items".to_owned(),
         Kind::Move { .. } => "Move Items".to_owned(),
-        Kind::Categories { .. } => "Color Categories".to_owned(),
         Kind::Flag(f) if f.reminder_only => "Add Reminder".to_owned(),
         Kind::Flag(_) => "Custom".to_owned(),
         Kind::ViewSettings(f) => format!("Advanced View Settings: {}", f.view),
         Kind::ApplyView { .. } => "Apply View".to_owned(),
         Kind::SaveView { .. } => "Save Current View As a New View".to_owned(),
         Kind::MailMerge(_) => "Mail Merge Contacts".to_owned(),
+        Kind::DeleteRequest { .. } => "Delete Task".to_owned(),
         Kind::TaskRequest(f) => {
             format!(
                 "{} - Task Request",
@@ -323,15 +384,26 @@ fn draw(ctx: &egui::Context, app: &mut App, d: &mut Dialog) -> bool {
         crate::dialogs::form_visuals(ui, &app.theme);
         btn = match &mut d.kind {
             Kind::Move { ids, area, copy, folder } => move_ui(ui, app, ids.len(), area, *copy, folder),
-            Kind::Categories { on, .. } => categories_ui(ui, app, on),
             Kind::Flag(f) => flag_ui(ui, app, f, nonce),
-            Kind::ViewSettings(f) => view_ui(ui, f, nonce),
+            Kind::ViewSettings(f) => view_ui(ui, app, f, nonce),
             Kind::ApplyView { noun, folders, picked, subfolders, .. } => {
                 apply_ui(ui, noun, folders, picked, subfolders)
             }
-            Kind::SaveView { name, noun } => save_ui(ui, name, noun),
+            Kind::SaveView { name, all, all_label, .. } => save_ui(ui, name, all, all_label),
             Kind::MailMerge(f) => merge_ui(ui, app, f, nonce),
             Kind::TaskRequest(f) => request_ui(ui, app, f, nonce),
+            Kind::DeleteRequest { subject, choice, .. } => {
+                let s = if subject.trim().is_empty() { "this task" } else { subject.trim() };
+                ui.label(format!("\"{s}\" was assigned to you. Before it is deleted:"));
+                for (k, l) in [
+                    ("decline", "Decline it and delete"),
+                    ("complete", "Mark it complete, tell the person who assigned it, and delete"),
+                    ("delete", "Delete it without telling anyone"),
+                ] {
+                    ui.radio_value(choice, k.to_owned(), l);
+                }
+                ok_cancel(ui, "OK", true)
+            }
         };
         error_line(ui, app, &error);
     });
@@ -355,7 +427,14 @@ fn draw(ctx: &egui::Context, app: &mut App, d: &mut Dialog) -> bool {
     }
 }
 
-fn move_ui(ui: &mut Ui, app: &App, count: usize, area: &str, copy: bool, folder: &mut Option<u64>) -> Btn {
+fn move_ui(
+    ui: &mut Ui,
+    app: &mut App,
+    count: usize,
+    area: &str,
+    copy: bool,
+    folder: &mut Option<u64>,
+) -> Btn {
     let verb = if copy { "Copy" } else { "Move" };
     ui.label(format!("{verb} the {count} selected item{} to the folder:", if count == 1 { "" } else { "s" }));
     let kind = folder_kind(area);
@@ -380,22 +459,20 @@ fn move_ui(ui: &mut Ui, app: &App, count: usize, area: &str, copy: bool, folder:
             },
         );
     });
-    ok_cancel(ui, "OK", folder.is_some())
-}
-
-fn categories_ui(ui: &mut Ui, app: &App, on: &mut Vec<String>) -> Btn {
-    ui.label("To assign Color Categories to the selected items, use the check boxes next to each category.");
-    for c in &app.s.mailbox.categories {
-        let mut checked = on.iter().any(|x| x.eq_ignore_ascii_case(&c.name));
-        if ui.checkbox(&mut checked, &c.name).changed() {
-            if checked {
-                on.push(c.name.clone());
-            } else {
-                on.retain(|x| !x.eq_ignore_ascii_case(&c.name));
-            }
+    let mut out = Btn::None;
+    ui.horizontal(|ui| {
+        // New Folder: a folder of this kind under the one picked (or the current one).
+        if ui.button("New...").clicked() {
+            let parent = folder.or(Some(app.s.selection.folder.0));
+            let contains = mailcraft_engine::cmd::folder::contents_name(kind);
+            crate::dialogs::open(app, "createFolder", json!({ "parent": parent, "contains": contains }));
         }
-    }
-    ok_cancel(ui, "OK", true)
+        let b = ok_cancel(ui, "OK", folder.is_some());
+        if b != Btn::None {
+            out = b;
+        }
+    });
+    out
 }
 
 fn flag_ui(ui: &mut Ui, app: &App, f: &mut FlagForm, nonce: u64) -> Btn {
@@ -448,8 +525,54 @@ fn flag_ui(ui: &mut Ui, app: &App, f: &mut FlagForm, nonce: u64) -> Btn {
 
 const PANES: [(&str, &str); 3] = [("right", "Right"), ("bottom", "Bottom"), ("off", "Off")];
 
-fn view_ui(ui: &mut Ui, f: &mut ViewForm, nonce: u64) -> Btn {
+/// The table parts of View Settings: a button per part (it opens that dialog) with what it is set to.
+fn table_parts(ui: &mut Ui, app: &mut App, t: &TableSummary, nonce: u64) {
+    let parts: [(&str, &str, Value, &str); 5] = [
+        ("Columns...", "view.addColumns", json!({}), &t.columns),
+        ("Sort...", "", json!({}), &t.sort),
+        ("Filter...", "view.customFilter", json!({}), &t.filter),
+        ("Conditional Formatting...", "view.conditionalFormatting", json!({}), &t.rules),
+        ("Format Columns...", "view.formatColumns", json!({}), &t.formats),
+    ];
+    egui::Frame::new().stroke(egui::Stroke::new(1.0, app.theme.separator)).inner_margin(6.0).show(ui, |ui| {
+        ui.label(RichText::new("Description").strong());
+        egui::Grid::new(("mc-viewset-parts", nonce)).num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+            for (label, cmd, params, desc) in parts {
+                if ui.add(egui::Button::new(label).min_size(vec2(180.0, 22.0))).clicked() {
+                    if cmd.is_empty() {
+                        let folder = app.s.selection.folder.0;
+                        crate::dialogs::open(app, "viewSort", json!({ "folder": folder }));
+                    } else {
+                        app.run(cmd, params);
+                    }
+                }
+                ui.add(egui::Label::new(RichText::new(desc).color(app.theme.text_muted)).truncate());
+                ui.end_row();
+            }
+        });
+    });
+    ui.add_space(6.0);
+}
+
+fn view_ui(ui: &mut Ui, app: &mut App, f: &mut ViewForm, nonce: u64) -> Btn {
     let mut out = Btn::None;
+    // The table parts describe the view as it is now (they apply at once in their own dialogs).
+    if let Some(t) = &f.table {
+        let folder = app.s.selection.folder;
+        let live = mailcraft_engine::cmd::view::modules::current(&app.s, folder)
+            .map(|(kind, st)| mailcraft_engine::cmd::view::table::summary(folder, kind, &st));
+        let t = match live {
+            Some(v) if v.get("table").and_then(Value::as_bool) == Some(true) => TableSummary {
+                columns: str_of(&v, "columns"),
+                sort: str_of(&v, "sort"),
+                filter: str_of(&v, "filter"),
+                rules: str_of(&v, "rules"),
+                formats: str_of(&v, "formats"),
+            },
+            _ => t.clone(),
+        };
+        table_parts(ui, app, &t, nonce);
+    }
     egui::Grid::new(("mc-viewset-grid", nonce)).num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
         ui.label("Current view");
         ComboBox::from_id_salt(("mc-viewset-view", nonce))
@@ -570,13 +693,17 @@ fn apply_ui(
     ok_cancel(ui, "OK", !picked.is_empty())
 }
 
-fn save_ui(ui: &mut Ui, name: &mut String, noun: &str) -> Btn {
+fn save_ui(ui: &mut Ui, name: &mut String, all: &mut bool, all_label: &str) -> Btn {
     let l = ui.label("Name of new view:");
     let r = ui.add(TextEdit::singleline(name).desired_width(260.0)).labelled_by(l.id);
     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !name.trim().is_empty() {
         return Btn::Ok;
     }
-    ui.label(RichText::new(format!("Can be used on: this {} folder", noun.to_lowercase())).weak());
+    ui.label("Can be used on:");
+    ui.radio_value(all, false, "This folder");
+    if !all_label.is_empty() {
+        ui.radio_value(all, true, all_label);
+    }
     ok_cancel(ui, "OK", !name.trim().is_empty())
 }
 
@@ -775,17 +902,6 @@ fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
             run_checked(app, &id, json!({ "folder": folder, "ids": ids }))?;
             Ok(true)
         }
-        Kind::Categories { ids, area, initial, on } => {
-            let id = format!("{area}.categorize");
-            for c in &app.s.mailbox.categories.clone() {
-                let was = initial.iter().any(|x| x.eq_ignore_ascii_case(&c.name));
-                let now = on.iter().any(|x| x.eq_ignore_ascii_case(&c.name));
-                if was != now {
-                    run_checked(app, &id, json!({ "name": c.name, "on": now, "ids": ids }))?;
-                }
-            }
-            Ok(true)
-        }
         Kind::Flag(f) => {
             let day = |s: &str, what: &str| -> Result<Value, String> {
                 if s.trim().is_empty() {
@@ -851,6 +967,9 @@ fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
             if f.spacing != init.spacing {
                 run_checked(app, "view.tighterSpacing", json!({}))?;
             }
+            if !f.saved_view.is_empty() {
+                run_checked(app, "view.manageViews", json!({ "op": "update", "name": f.saved_view }))?;
+            }
             Ok(true)
         }
         Kind::ApplyView { picked, subfolders, .. } => {
@@ -858,8 +977,13 @@ fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
             run_checked(app, "view.applyViewTo", json!({ "folders": folders, "subfolders": *subfolders }))?;
             Ok(true)
         }
-        Kind::SaveView { name, .. } => {
-            run_checked(app, "view.saveViewAs", json!({ "name": name.trim(), "confirm": true }))?;
+        Kind::SaveView { name, all, .. } => {
+            let scope = if *all { "all" } else { "folder" };
+            run_checked(
+                app,
+                "view.saveViewAs",
+                json!({ "name": name.trim(), "scope": scope, "confirm": true }),
+            )?;
             Ok(true)
         }
         Kind::MailMerge(f) => {
@@ -867,6 +991,12 @@ fn apply(app: &mut App, kind: &mut Kind) -> Result<bool, String> {
             let r = run_checked(app, "people.mailMerge", p)?;
             let sent = r.get("sent").and_then(Value::as_u64).unwrap_or(0);
             app.ui.toast = Some((format!("Mail Merge: {sent} message(s) sent to the Outbox."), 0.0));
+            Ok(true)
+        }
+        Kind::DeleteRequest { ids, choice, done, .. } => {
+            run_checked(app, "tasks.delete", json!({ "ids": ids, "request": choice }))?;
+            *done = true;
+            super::super::common::select_item(app, None);
             Ok(true)
         }
         Kind::TaskRequest(f) => {
@@ -936,16 +1066,14 @@ mod tests {
         let mut st = ModState::default();
         open(&app, &mut st, "pimMove", &json!({"ids": [1, 2], "area": "people", "copy": true}));
         open(&app, &mut st, "nope", &json!({}));
-        open(&app, &mut st, "pimCategories", &json!({"ids": "junk", "on": [1, "Red category"]}));
+        open(&app, &mut st, "pimFlag", &json!({"ids": "junk", "area": "people"}));
         assert_eq!(st.dialogs.open.len(), 2);
         assert!(matches!(&st.dialogs.open[0].kind, Kind::Move { ids, copy: true, .. } if ids == &vec![1, 2]));
-        assert!(
-            matches!(&st.dialogs.open[1].kind, Kind::Categories { ids, on, .. } if ids.is_empty() && on.len() == 1)
-        );
+        assert!(matches!(&st.dialogs.open[1].kind, Kind::Flag(f) if f.ids.is_empty() && f.area == "people"));
     }
 
     #[test]
-    fn move_and_categories_apply_through_commands() {
+    fn move_applies_through_commands() {
         let mut app = app();
         let tasks =
             app.s.mailbox.folders.values().find(|f| f.kind == FolderKind::Tasks).map(|f| f.id).unwrap();
@@ -955,14 +1083,82 @@ mod tests {
         let mut k = Kind::Move { ids: vec![id.0], area: "tasks".into(), copy: false, folder: Some(sub.0) };
         assert_eq!(apply(&mut app, &mut k), Ok(true));
         assert_eq!(app.s.mailbox.tasks[&id].folder, sub);
-        let mut k = Kind::Categories {
-            ids: vec![id.0],
-            area: "tasks".into(),
-            initial: vec![],
-            on: vec!["Blue category".into()],
-        };
-        assert_eq!(apply(&mut app, &mut k), Ok(true));
-        assert!(app.s.mailbox.tasks[&id].categories.iter().any(|c| c == "Blue category"));
+    }
+
+    #[test]
+    fn delete_request_dialog_defaults_to_decline_and_deletes() {
+        let mut app = app();
+        let mut st = ModState::default();
+        let id = app.s.mailbox.tasks.keys().next().copied().unwrap();
+        let folder = app.s.mailbox.tasks[&id].folder;
+        open(&app, &mut st, "deleteTaskRequest", &json!({"ids": [id.0], "subject": "Budget"}));
+        let d = st.dialogs.open.first_mut().unwrap();
+        let Kind::DeleteRequest { choice, ids, .. } = &mut d.kind else { panic!("not the delete question") };
+        assert_eq!((choice.as_str(), ids.as_slice()), ("decline", &[id.0][..]));
+        *choice = "delete".into();
+        assert_eq!(apply(&mut app, &mut d.kind), Ok(true));
+        assert!(app.s.mailbox.tasks.get(&id).is_none_or(|t| t.folder != folder), "the task was deleted");
+    }
+
+    #[test]
+    fn deleting_a_requested_task_from_its_window_keeps_the_edits_until_the_question_is_answered() {
+        // Regression: Delete in the window of an accepted task request closed the window at once, so
+        // Cancel in the question that followed lost every unsaved edit.
+        let mut app = app();
+        let mut st = ModState::default();
+        let id = app.s.mailbox.tasks.values().find(|t| !t.is_complete()).map(|t| t.id).unwrap();
+        if let Some(t) = app.s.mailbox.tasks.get_mut(&id) {
+            t.requested_by = Some("Boss <boss@example.com>".into());
+            t.request_state = mailcraft_model::task::TaskRequestState::Accepted;
+        }
+        let folder = app.s.mailbox.tasks[&id].folder;
+        super::super::open_task(&app, &mut st, id);
+        let mut ed = st.editors.task.take().unwrap();
+        ed.body = "Unsaved notes".into();
+        app.s.notices.clear();
+        assert!(
+            !super::super::delete_from_window(&mut app, &ed),
+            "the window stays while the question is asked"
+        );
+        assert_eq!(app.s.mailbox.tasks[&id].folder, folder, "nothing deleted yet");
+        let params = app
+            .s
+            .notices
+            .iter()
+            .find_map(|n| match n {
+                mailcraft_engine::Notice::OpenDialog(name, p) if name == "deleteTaskRequest" => {
+                    Some(p.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        st.editors.task = Some(ed);
+        // Cancel: the question closes without deleting; the window and its edits are still there.
+        open(&app, &mut st, "deleteTaskRequest", &params);
+        let d = st.dialogs.open.pop().unwrap();
+        let Kind::DeleteRequest { ids, done, .. } = &d.kind else { panic!("not the delete question") };
+        assert!(!done);
+        if *done {
+            close_deleted_task(&mut st, ids);
+        }
+        assert_eq!(st.editors.task.as_ref().map(|e| e.body.as_str()), Some("Unsaved notes"));
+        assert_eq!(app.s.mailbox.tasks[&id].folder, folder);
+        // OK: the task is deleted, then its window closes.
+        open(&app, &mut st, "deleteTaskRequest", &params);
+        let mut d = st.dialogs.open.pop().unwrap();
+        if let Kind::DeleteRequest { choice, .. } = &mut d.kind {
+            *choice = "delete".into();
+        }
+        assert_eq!(apply(&mut app, &mut d.kind), Ok(true));
+        let Kind::DeleteRequest { ids, done: true, .. } = &d.kind else { panic!("not marked deleted") };
+        close_deleted_task(&mut st, ids);
+        assert!(st.editors.task.is_none());
+        assert!(app.s.mailbox.tasks.get(&id).is_none_or(|t| t.folder != folder));
+        // A plain task deletes straight from its window.
+        let plain = app.s.mailbox.tasks.values().find(|t| t.folder == folder).map(|t| t.id).unwrap();
+        super::super::open_task(&app, &mut st, plain);
+        let ed = st.editors.task.take().unwrap();
+        assert!(super::super::delete_from_window(&mut app, &ed));
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //!
 //! Mapping to [`Contact`]: N → name parts, FN when N is missing, ORG → company;department, TITLE → job title,
 //! EMAIL (first three), TEL (TYPE work/home/cell/fax/pager/car → phone kind), ADR (TYPE work/home → Business,
-//! Home, else Other), URL, IMPP (and the common X-…IM properties), BDAY, NOTE, CATEGORIES. MailCraft-only
+//! Home, else Other), URL, IMPP (and the common X-…IM properties), BDAY, NOTE, CATEGORIES, CLASS (Private,
+//! RFC 2426; written in 4.0 cards too). MailCraft-only
 //! detail that has no standard property is kept in `X-MAILCRAFT-*` extension properties/parameters.
 //!
 //! Details page and picture:
@@ -468,6 +469,11 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
                 }
             }
             "X-MAILCRAFT-FILE-AS" => file_as = Some(text_value(cl)),
+            // RFC 2426 CLASS: PRIVATE and CONFIDENTIAL cards are private contacts.
+            "CLASS" => {
+                let v = text_value(cl);
+                c.private = v.eq_ignore_ascii_case("private") || v.eq_ignore_ascii_case("confidential");
+            }
             "KIND" => is_org = text_value(cl).eq_ignore_ascii_case("org"),
             "X-ABSHOWAS" => is_org = text_value(cl).eq_ignore_ascii_case("company"),
             _ => {}
@@ -670,6 +676,10 @@ pub fn write_one(c: &Contact, version: Version, out: &mut String) {
     }
     if !c.file_as.is_empty() && c.file_as != crate::csv::default_file_as(c) {
         lines.push(line("X-MAILCRAFT-FILE-AS", vec![], escape(&c.file_as)));
+    }
+    if c.private {
+        // RFC 2426 CLASS (vCard 4.0 dropped it; readers that know it still take it there).
+        lines.push(line("CLASS", vec![], "PRIVATE".to_owned()));
     }
     out.push_str("BEGIN:VCARD\r\n");
     for l in &lines {

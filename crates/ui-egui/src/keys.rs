@@ -625,6 +625,7 @@ fn resolve_calendar(c: Chord) -> Option<Action> {
 fn resolve_people(c: Chord) -> Option<Action> {
     match (c.cmd, c.alt, c.shift, c.key) {
         (true, false, false, Key::F) => run_p("people.forward", json!({"as": "contact"})),
+        (true, false, true, Key::V) => run("people.move"),
         _ => resolve_delete(c, "people.delete"),
     }
 }

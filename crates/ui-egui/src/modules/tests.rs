@@ -991,3 +991,125 @@ fn reply_with_meeting_opens_the_meeting_window_prefilled() {
     let ed = st.editors.appt.as_ref().expect("meeting window");
     assert!(ed.meeting && !ed.attendees.trim().is_empty(), "{}", ed.attendees);
 }
+
+#[test]
+fn people_tables_quick_click_flag_and_category_cells() {
+    use mailcraft_model::FlagState;
+    let mut a = app();
+    let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+    let mut h = harness(super::people, a, (1500.0, 900.0));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Phone"}));
+    assert!(has(&h, "Flag Status") && has(&h, "Categories") && has(&h, "Mobile Phone"));
+    let alice = h.state().s.mailbox.contacts.values().find(|c| c.last_name == "Rivera").unwrap().id;
+    // Unflagged → the Quick Click flag; flagged → complete; complete → cleared.
+    click(&h, "Flag Rivera, Alice");
+    h.run_ok();
+    assert!(matches!(h.state().s.mailbox.contacts[&alice].flag, FlagState::Flagged { .. }));
+    click(&h, "Flag Rivera, Alice");
+    h.run_ok();
+    assert!(matches!(h.state().s.mailbox.contacts[&alice].flag, FlagState::Complete { .. }));
+    click(&h, "Flag Rivera, Alice");
+    h.run_ok();
+    assert!(matches!(h.state().s.mailbox.contacts[&alice].flag, FlagState::None));
+    // The category cell applies the Quick Click category to its contact.
+    let quick = mailcraft_engine::cmd::categories::quick_click_category(&h.state().s).unwrap();
+    let tagged = |h: &Harness<'_, App>| {
+        h.state().s.mailbox.contacts.values().filter(|c| c.categories.contains(&quick)).count()
+    };
+    let before = tagged(&h);
+    click(&h, "No Categories");
+    h.run_ok();
+    assert_eq!(tagged(&h), before + 1);
+    // A header click sorts by the column; a second click reverses it.
+    click(&h, "Company");
+    h.run_ok();
+    let sort = mailcraft_engine::cmd::view::table::sort(&h.state().s, folder).unwrap();
+    assert_eq!((sort.column.as_str(), sort.descending), ("company", false));
+    click(&h, "Company, sorted ascending");
+    h.run_ok();
+    assert!(mailcraft_engine::cmd::view::table::sort(&h.state().s, folder).unwrap().descending);
+    // Show Columns: the chosen columns are drawn.
+    run_cmd(&mut h, "view.columns", json!({"columns": ["fullName", "nickname", "flagStatus"]}));
+    assert!(has(&h, "Nickname"));
+    assert!(!has(&h, "Mobile Phone"));
+    // Private contacts carry the private glyph's label in the People view.
+    run_cmd(&mut h, "people.private", json!({"ids": [alice.0], "on": true}));
+    run_cmd(&mut h, "view.changeView", json!({"name": "People"}));
+    assert!(has(&h, "Private Rivera, Alice"));
+}
+
+#[test]
+fn task_tables_draw_their_columns_and_take_clicks() {
+    let mut a = app();
+    let folder = select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
+    let mut h = harness(super::tasks, a, (1500.0, 900.0));
+    run_cmd(&mut h, "view.changeView", json!({"name": "Simple List"}));
+    assert!(has(&h, "Subject") && has(&h, "Due Date") && has(&h, "Flag Status"));
+    assert!(!has(&h, "% Complete"));
+    run_cmd(
+        &mut h,
+        "view.columns",
+        json!({"columns": ["complete", "subject", "status", "percentComplete", "dateCompleted", "inFolder", "categories", "flagStatus", "priority", "modified"]}),
+    );
+    for label in ["Status", "% Complete", "Date Completed", "In Folder", "Categories", "Priority", "Modified"]
+    {
+        assert!(has(&h, label), "{label}");
+    }
+    let id = h.state().s.mailbox.tasks.values().find(|t| t.subject == "Submit benefits forms").unwrap().id;
+    // The flag cell completes the task (and brings it back).
+    click(&h, "Mark complete Submit benefits forms");
+    h.run_ok();
+    assert_eq!(h.state().s.mailbox.tasks[&id].status, TaskStatus::Completed);
+    click(&h, "Complete Submit benefits forms");
+    h.run_ok();
+    assert_ne!(h.state().s.mailbox.tasks[&id].status, TaskStatus::Completed);
+    // The category cell applies the Quick Click category.
+    let quick = mailcraft_engine::cmd::categories::quick_click_category(&h.state().s).unwrap();
+    let before = h.state().s.mailbox.tasks.values().filter(|t| t.categories.contains(&quick)).count();
+    click(&h, "No Categories");
+    h.run_ok();
+    let after = h.state().s.mailbox.tasks.values().filter(|t| t.categories.contains(&quick)).count();
+    assert_eq!(after, before + 1);
+    // Sorting by a header.
+    click(&h, "Subject");
+    h.run_ok();
+    assert_eq!(
+        mailcraft_engine::cmd::view::table::sort(&h.state().s, folder).map(|f| f.column),
+        Some("subject".to_owned())
+    );
+    // A filter hides rows.
+    run_cmd(&mut h, "view.customFilter", json!({"filter": {"words": "benefits"}}));
+    assert!(has(&h, "Submit benefits forms"));
+    assert!(!has(&h, "Review quarterly report"));
+}
+
+#[test]
+fn module_view_settings_opens_the_table_parts() {
+    let mut a = app();
+    select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
+    let mut h = harness(super::tasks, a, (1500.0, 1000.0));
+    run_cmd(&mut h, "view.viewSettings", json!({}));
+    assert!(has(&h, "Columns...") && has(&h, "Sort...") && has(&h, "Filter..."));
+    assert!(has(&h, "Conditional Formatting...") && has(&h, "Format Columns..."));
+    click(&h, "Format Columns...");
+    h.run_ok();
+    assert!(
+        h.state()
+            .s
+            .notices
+            .iter()
+            .any(|n| matches!(n, mailcraft_engine::Notice::OpenDialog(d, _) if d == "viewFormat"))
+    );
+    click(&h, "Columns...");
+    h.run_ok();
+    assert!(
+        h.state()
+            .s
+            .notices
+            .iter()
+            .any(|n| matches!(n, mailcraft_engine::Notice::OpenDialog(d, _) if d == "showColumns"))
+    );
+    click(&h, "Sort...");
+    h.run_ok();
+    assert!(h.state().ui.dialogs.iter().any(|(d, _)| d == "viewSort"));
+}

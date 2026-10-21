@@ -67,7 +67,13 @@ fn about_json() -> Value {
 }
 
 fn help(s: &mut Session, p: &Value) -> CmdResult {
-    let topic = opt_str(p, "topic").map(str::trim).filter(|t| !t.is_empty());
+    // Without a topic, Help opens at the topic of the module in view (People, Tasks).
+    let module_topic = match s.view.module {
+        crate::Module::People => Some("people"),
+        crate::Module::Tasks => Some("tasks"),
+        _ => None,
+    };
+    let topic = opt_str(p, "topic").map(str::trim).filter(|t| !t.is_empty()).or(module_topic);
     dialog(s, "help", json!({"topic": topic}))
 }
 
@@ -123,6 +129,12 @@ mod tests {
         let (mut s, _, _) = session();
         assert_eq!(s.registry.by_shortcut("F1").map(|c| c.id), Some("help.help"));
         assert_eq!(s.run("help.help", &json!({})).unwrap()["dialog"], "help");
+        // Help opens at the People or Tasks topic in those modules.
+        s.view.module = crate::Module::People;
+        s.run("help.help", &json!({})).unwrap();
+        let Some(crate::Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
+        assert_eq!(p["topic"], "people");
+        s.view.module = crate::Module::Mail;
         assert_eq!(s.run("help.showTraining", &json!({})).unwrap()["params"]["topic"], "getting-started");
         assert_eq!(s.run("help.whatsNew", &json!({})).unwrap()["params"]["version"], VERSION);
         assert_eq!(

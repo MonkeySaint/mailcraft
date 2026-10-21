@@ -75,15 +75,26 @@ struct CatState {
     selected: Option<String>,
 }
 
-fn initial_marks(app: &App, ids: &[u64]) -> Vec<(String, Option<bool>)> {
-    let items: Vec<_> = ids.iter().filter_map(|i| app.s.mailbox.mail.get(&ItemId(*i))).collect();
+/// Categories of the target items: messages, or (with `area` people / tasks / notes / calendar) the
+/// module's items.
+fn item_categories<'a>(app: &'a App, area: &str, ids: &[u64]) -> Vec<&'a Vec<String>> {
+    use mailcraft_engine::cmd::calendar::pim;
+    ids.iter()
+        .filter_map(|i| match area {
+            "" | "mail" => app.s.mailbox.mail.get(&ItemId(*i)).map(|m| &m.categories),
+            _ => pim::categories(&app.s.mailbox, ItemId(*i)),
+        })
+        .collect()
+}
+
+fn initial_marks(app: &App, area: &str, ids: &[u64]) -> Vec<(String, Option<bool>)> {
+    let items = item_categories(app, area, ids);
     app.s
         .mailbox
         .categories
         .iter()
         .map(|c| {
-            let n =
-                items.iter().filter(|m| m.categories.iter().any(|x| x.eq_ignore_ascii_case(&c.name))).count();
+            let n = items.iter().filter(|m| m.iter().any(|x| x.eq_ignore_ascii_case(&c.name))).count();
             let mark = if items.is_empty() || n == 0 {
                 Some(false)
             } else if n == items.len() {
@@ -106,8 +117,9 @@ fn sorted_categories(app: &App) -> Vec<mailcraft_model::Category> {
 fn color_categories(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let ids = d.ids();
+    let area = d.str("area");
     let init = |app: &App| {
-        let initial = initial_marks(app, &ids);
+        let initial = initial_marks(app, &area, &ids);
         let checks = initial.iter().map(|(n, m)| (n.clone(), m.unwrap_or(false) || m.is_none())).collect();
         CatState { checks, initial, selected: sorted_categories(app).first().map(|c| c.name.clone()) }
     };
@@ -208,7 +220,7 @@ fn color_categories(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             }
             match ok_cancel(ui, app, true) {
                 Some(true) => {
-                    apply_checks(app, &ids, st);
+                    apply_checks(app, &area, &ids, st);
                     Out::Close
                 }
                 Some(false) => Out::Close,
@@ -218,13 +230,29 @@ fn color_categories(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
-/// Runs `mail.categorize` (a toggle) so each category ends up on or off on every target.
-fn apply_checks(app: &mut App, ids: &[u64], st: &CatState) {
+/// Runs `mail.categorize` (a toggle) so each category ends up on or off on every target; module items
+/// (`area`) take `<area>.categorize` with `on`.
+fn apply_checks(app: &mut App, area: &str, ids: &[u64], st: &CatState) {
     if ids.is_empty() {
         return;
     }
     let cats: Vec<String> = app.s.mailbox.categories.iter().map(|c| c.name.clone()).collect();
-    let now = initial_marks(app, ids);
+    if !matches!(area, "" | "mail") {
+        let cmd = format!("{area}.categorize");
+        for name in cats {
+            let key = name.to_lowercase();
+            let want = st.checks.iter().find(|(n, _)| *n == key).is_some_and(|(_, v)| *v);
+            // A category made in this dialog was on no target (`None` below means mixed).
+            let was = st.initial.iter().find(|(n, _)| *n == key).map_or(Some(false), |(_, m)| *m);
+            // Untouched mixed rows stay mixed; rows already as wanted are left alone.
+            if (was.is_none() && want) || was == Some(want) {
+                continue;
+            }
+            app.run(&cmd, json!({"name": name, "on": want, "ids": ids}));
+        }
+        return;
+    }
+    let now = initial_marks(app, area, ids);
     for name in cats {
         let key = name.to_lowercase();
         let want = st.checks.iter().find(|(n, _)| *n == key).is_some_and(|(_, v)| *v);

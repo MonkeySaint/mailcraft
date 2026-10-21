@@ -1037,3 +1037,119 @@ fn page_color_menu_has_theme_and_standard_colours() {
     run_entry(&mut app, s, "pageColor", &first_theme);
     assert!(app.s.composes.get(&cid).unwrap().body.background.is_some());
 }
+
+#[test]
+fn module_ribbon_state_follows_the_folder_and_selection() {
+    use mailcraft_engine::cmd::view::modules;
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let tasks =
+        app.s.mailbox.folders.values().find(|f| f.kind == mailcraft_model::FolderKind::Tasks).unwrap().id;
+    app.run("nav.selectFolder", serde_json::json!({"folder": tasks.0})).unwrap();
+    app.s.view.module = mailcraft_engine::Module::Tasks;
+    let mem = state::Mem::default();
+    // Change View: the built-in views, then the saved ones; the shown view is checked.
+    let on = |app: &App| -> Vec<String> {
+        state::dyn_items(app, Surface::Main, "views:tasks")
+            .into_iter()
+            .filter(|d| d.on)
+            .map(|d| d.label)
+            .collect()
+    };
+    assert_eq!(on(&app), ["To-Do List"]);
+    app.run("view.changeView", serde_json::json!({"name": "Detailed"})).unwrap();
+    app.run("view.saveViewAs", serde_json::json!({"name": "Mine", "confirm": true})).unwrap();
+    let items = state::dyn_items(&app, Surface::Main, "views:tasks");
+    assert_eq!(items.last().map(|d| d.label.as_str()), Some("Mine"));
+    assert_eq!(on(&app), ["Mine"]);
+    app.run("view.changeView", serde_json::json!({"name": "Simple List"})).unwrap();
+    assert_eq!(on(&app), ["Simple List"]);
+    run_entry(&mut app, Surface::Main, "tasksChangeView", "Mine");
+    assert_eq!(modules::current_view_name(&app.s, tasks), "Mine");
+    // Message Preview reads the tasks folder's own setting (Off by default), not the mail view's.
+    assert!(state::is_on(&app, Surface::Main, &mem, "preview:0"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "preview:1"));
+    app.run("view.messagePreview", serde_json::json!({"lines": 2})).unwrap();
+    assert!(state::is_on(&app, Surface::Main, &mem, "preview:2"));
+    // Arrangement: the gallery lists the module's arrangements with the current one checked.
+    app.run("view.arrangeBy", serde_json::json!({"key": "importance"})).unwrap();
+    let arr = state::dyn_items(&app, Surface::Main, "arrange");
+    assert_eq!(arr.len(), 6);
+    assert!(arr.iter().any(|d| d.label == "Importance" && d.on));
+    assert!(state::is_on(&app, Surface::Main, &mem, "marr:importance"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "marr:dueDate"));
+    // Tags toggles show the selected task's state.
+    let id = app.s.mailbox.tasks.values().find(|t| t.folder == tasks).unwrap().id;
+    app.ui.module_selection = Some(id.0);
+    app.s.selection.items = vec![id];
+    app.s.selection.focus = Some(id);
+    assert!(!state::is_on(&app, Surface::Main, &mem, "pim:private"));
+    run_entry_toggle(&mut app, "Private");
+    assert!(app.s.mailbox.tasks[&id].private);
+    assert!(state::is_on(&app, Surface::Main, &mem, "pim:private"));
+    run_entry_toggle(&mut app, "Private");
+    assert!(!app.s.mailbox.tasks[&id].private, "the toggle turns it off again");
+    app.run("tasks.importance", serde_json::json!({"level": "high", "on": true})).unwrap();
+    assert!(state::is_on(&app, Surface::Main, &mem, "pim:high"));
+    assert!(!state::is_on(&app, Surface::Main, &mem, "pim:low"));
+    // Categorize › the categories of the selected task are checked.
+    app.run("tasks.categorize", serde_json::json!({"name": "Red category", "on": true})).unwrap();
+    assert!(
+        state::dyn_items(&app, Surface::Main, "categories").iter().any(|d| d.label == "Red category" && d.on)
+    );
+    // The People Arrange By is greyed out in the People view (no arrangement there).
+    let contacts =
+        app.s.mailbox.folders.values().find(|f| f.kind == mailcraft_model::FolderKind::Contacts).unwrap().id;
+    app.run("nav.selectFolder", serde_json::json!({"folder": contacts.0})).unwrap();
+    assert!(app.s.enabled("view.arrangeBy").is_some());
+    app.run("view.changeView", serde_json::json!({"name": "List"})).unwrap();
+    assert!(app.s.enabled("view.arrangeBy").is_none());
+    assert!(state::is_on(&app, Surface::Main, &mem, "marr:company"), "List arranges by company");
+}
+
+/// Runs the Tasks Home tab toggle labelled `label` as the ribbon would (its `$!on` filled from its state).
+fn run_entry_toggle(app: &mut App, label: &str) {
+    let tab = defs().tabs.iter().find(|t| t.surface == "tasks" && t.name == "Home").unwrap();
+    let item = tab.groups.iter().flat_map(|g| g.ctls.iter()).find(|i| i.label == label).unwrap();
+    let mem = state::Mem::default();
+    let on = item.on.as_deref().is_some_and(|s| state::is_on(app, Surface::Main, &mem, s));
+    let act = state::action(app, &item.cmd, on, None, &[]);
+    let ctx = egui::Context::default();
+    state::run(&ctx, app, Surface::Main, &mut state::Mem::default(), &act);
+}
+
+#[test]
+fn work_offline_and_download_preferences_show_the_engine_state() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    let mem = state::Mem::default();
+    assert!(!state::is_on(&app, Surface::Main, &mem, "offline"));
+    app.run("sendReceive.workOffline", serde_json::json!({})).unwrap();
+    assert!(state::is_on(&app, Surface::Main, &mem, "offline"));
+    assert!(
+        state::is_on(&app, Surface::Main, &mem, "dl:full")
+            || state::is_on(&app, Surface::Main, &mem, "dl:headersThenFull")
+            || state::is_on(&app, Surface::Main, &mem, "dl:headers")
+    );
+    let (mode, slow) = mailcraft_engine::sync::cmds::shown_preferences(&app.s);
+    assert!(state::is_on(&app, Surface::Main, &mem, &format!("dl:{mode}")));
+    assert_eq!(state::is_on(&app, Surface::Main, &mem, "slowHeaders"), slow);
+    // Exactly one download mode is checked, and it follows a change.
+    let modes = ["full", "headersThenFull", "headers"];
+    for want in ["headers", "full", "headersThenFull"] {
+        app.run("sendReceive.preferences", serde_json::json!({"mode": want})).unwrap();
+        assert_eq!(mailcraft_engine::sync::cmds::shown_preferences(&app.s).0, want);
+        for m in modes {
+            assert_eq!(
+                state::is_on(&app, Surface::Main, &mem, &format!("dl:{m}")),
+                m == want,
+                "{want}: dl:{m}"
+            );
+        }
+    }
+    // On Slow Connections Download Only Headers follows its toggle both ways.
+    for _ in 0..2 {
+        let before = state::is_on(&app, Surface::Main, &mem, "slowHeaders");
+        app.run("sendReceive.preferences", serde_json::json!({"slowHeadersOnly": "toggle"})).unwrap();
+        assert_eq!(state::is_on(&app, Surface::Main, &mem, "slowHeaders"), !before);
+        assert_eq!(mailcraft_engine::sync::cmds::shown_preferences(&app.s).1, !before);
+    }
+}

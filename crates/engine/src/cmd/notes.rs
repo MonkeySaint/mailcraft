@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(c.subject, "FW: Groceries");
         assert!(c.body.to_plain_text().contains("eggs"));
         assert_eq!(s.run("notes.move", &json!({})).unwrap()["dialog"], "pimMove");
-        assert_eq!(s.run("notes.allCategories", &json!({})).unwrap()["dialog"], "pimCategories");
+        assert_eq!(s.run("notes.allCategories", &json!({})).unwrap()["dialog"], "colorCategories");
         s.selection.items.clear();
         s.selection.focus = None;
         assert!(matches!(s.run("notes.forward", &json!({})), Err(CmdError::Disabled(_))));

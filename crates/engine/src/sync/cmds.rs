@@ -169,6 +169,17 @@ pub fn process_marked(s: &mut Session, p: &Value) -> CmdResult {
     )
 }
 
+/// What the Download Preferences menu shows: the selected account's download mode name ("full",
+/// "headersThenFull", "headers") and its "On Slow Connections Download Only Headers" option (the
+/// defaults when no account is selected), as `sendReceive.preferences` without an account reports them.
+pub fn shown_preferences(s: &Session) -> (&'static str, bool) {
+    let o = s
+        .current_account()
+        .map(|a| crate::accounts::account_options(s, a))
+        .unwrap_or_else(|| s.sync.prefs.data.defaults.clone());
+    (o.download.name(), o.slow_headers_only)
+}
+
 /// Download Preferences and the Send/Receive group basics, for one account or (no `account`) for all of them
 /// and new ones. Without changes it reports the current state.
 pub fn preferences(s: &mut Session, p: &Value) -> CmdResult {

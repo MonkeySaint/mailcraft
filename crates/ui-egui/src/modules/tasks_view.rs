@@ -1,9 +1,11 @@
 //! Tasks module (classic Tasks / To-Do List): My Tasks (folder pane), the task list of the folder's current
 //! view (Detailed, Simple List, To-Do List, Prioritized, Active, Completed, Today, Next 7 Days, Overdue,
-//! Assigned, Server Tasks) with complete checkboxes, due dates and flags, grouped by the view's arrangement
-//! (collapsible), a quick "new task" box, the task notes as message preview and a reading pane (right,
-//! bottom or off). The rows, their filter, order and groups come from the engine
-//! (`mailcraft_engine::cmd::tasks::view_rows`); View commands change them.
+//! Assigned, Server Tasks) as a table with the view's columns (Show Columns: complete box, subject, status,
+//! dates, % complete, folder, categories, priority, modified, flag…), grouped by the view's arrangement
+//! (collapsible), with Conditional Formatting, a header click to sort, a quick "new task" box, the task
+//! notes as message preview and a reading pane (right, bottom or off). The rows, their filter, order and
+//! groups come from the engine (`mailcraft_engine::cmd::tasks::view_rows`), the columns from
+//! `mailcraft_engine::cmd::view::table`; View commands change them.
 
 use egui::{
     Align, Align2, CornerRadius, FontId, Id, Key, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke,
@@ -19,11 +21,13 @@ use mailcraft_model::{FlagState, FolderId, FolderKind, ItemId, TaskPriority, Tas
 use super::common::{
     DAY, ModState, a11y, change_view, child, collapsed_labels, current_folder, day_string, draw_check,
     empty_message, folder_rows, group_header, group_row, load, local_secs, long_date, module_folder_pane,
-    module_view, paint_text_clipped, pane_bg, pane_separator, reading_split, row_height, select_folder,
-    select_item, short_date, store, sync_selection, today, todo_bar_strip, toggle_group, tz, weekday_short,
+    module_view, pane_bg, pane_separator, reading_split, row_height, select_folder, select_item, store,
+    sync_selection, today, todo_bar_strip, toggle_group, tz,
 };
 use super::editors;
+use super::table as mt;
 use crate::App;
+use mailcraft_engine::cmd::view::table;
 
 const ROW_H: f32 = 30.0;
 
@@ -150,6 +154,15 @@ fn folder_pane(ui: &mut Ui, app: &mut App, view: &ModuleView) {
     }
 }
 
+/// Deletes a task row. A task accepted from a request first asks what to tell the assigner: the row stays
+/// selected until that question really deletes it (the question clears the selection then).
+fn delete_row(app: &mut App, id: ItemId) {
+    let asked = app.run("tasks.delete", json!({ "ids": [id.0] })).is_some_and(|r| r.get("dialog").is_some());
+    if !asked {
+        select_item(app, None);
+    }
+}
+
 fn selected<'a>(app: &App, list: &'a [Row]) -> Option<&'a Row> {
     let sel = app.ui.module_selection?;
     list.iter().find(|r| r.id.0 == sel)
@@ -163,10 +176,10 @@ fn keyboard(ctx: &egui::Context, app: &mut App, st: &mut ModState, list: &[Row])
     if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)) {
         if row.flagged_item() {
             app.run("tasks.removeFromList", json!({ "ids": [row.id.0] }));
+            select_item(app, None);
         } else {
-            app.run("tasks.delete", json!({ "ids": [row.id.0] }));
+            delete_row(app, row.id);
         }
-        select_item(app, None);
     } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
         open_row(app, st, &row);
     } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Insert)) {
@@ -224,10 +237,15 @@ fn content(
     list: &[Row],
 ) {
     let rect = ui.max_rect();
+    // The list is as wide as its columns want (within limits), Detailed takes most of the room.
+    let cols = folder.map(|f| table::shown(&app.s, f)).unwrap_or_default();
+    let wanted: f32 =
+        cols.iter().map(|c| if c.col.width == 0 { 240.0 } else { f32::from(c.col.width) }).sum::<f32>()
+            + 24.0;
     let list_w = if view.view == "Detailed" {
         (rect.width() * 0.65).max(420.0)
     } else {
-        380.0_f32.max(rect.width() * 0.4).min(560.0)
+        wanted.clamp(380.0, (rect.width() * 0.7).max(380.0))
     };
     let (left, pane) = reading_split(rect, view.reading_pane, list_w, 0.5);
     child(ui, left.shrink2(vec2(8.0, 8.0)), "mc-tasks-list", |ui| task_list(ui, app, st, folder, view, list));
@@ -241,10 +259,6 @@ fn content(
         }
     }
 }
-
-/// Columns of the Detailed view (besides the subject).
-const DETAILED: [&str; 4] = ["Status", "% Complete", "In Folder", "Categories"];
-const DETAILED_W: f32 = 92.0;
 
 fn task_list(
     ui: &mut Ui,
@@ -288,9 +302,15 @@ fn task_list(
         resp.request_focus();
     }
     ui.add_space(4.0);
-    let detailed = view.view == "Detailed" && ui.available_width() > 600.0;
-    if detailed {
-        column_header(ui, app);
+    let cols = folder.map(|f| table::shown(&app.s, f)).unwrap_or_default();
+    let sort = folder.and_then(|f| table::sort(&app.s, f));
+    let rules = folder.map(|f| table::rules(&app.s, f)).unwrap_or_default();
+    let laid = mt::layout(ui.available_width(), &cols);
+    if !laid.is_empty() {
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), mt::HEAD_H), Sense::hover());
+        if let Some(c) = mt::header(ui, app, head, &laid, sort.as_ref(), "mc-tasks") {
+            mt::sort_by_column(app, sort.as_ref(), c);
+        }
     }
     if list.is_empty() {
         let r = ui.available_rect_before_wrap();
@@ -298,7 +318,6 @@ fn task_list(
         empty_message(ui, r, app, "No tasks here", "Type one in the box above.");
         return;
     }
-    let now = today(app);
     let collapsed = folder.map(|f| collapsed_labels(app, f)).unwrap_or_default();
     ScrollArea::vertical().id_salt("mc-tasks-scroll").auto_shrink([false, false]).show(ui, |ui| {
         let mut last_group: Option<&str> = None;
@@ -316,50 +335,9 @@ fn task_list(
             if row.group.as_ref().is_some_and(|g| collapsed.contains(g)) {
                 continue;
             }
-            row_ui(ui, app, st, row, now, view.preview_lines, detailed);
+            row_ui(ui, app, st, row, &laid, &rules, view.preview_lines);
         }
     });
-}
-
-fn column_header(ui: &mut Ui, app: &App) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
-    // Column headers are announced (and found by tests) like labels.
-    for (i, name) in ["Subject", "Due Date"].iter().chain(DETAILED.iter()).enumerate() {
-        let r = Rect::from_min_size(pos2(rect.min.x + i as f32, rect.min.y), vec2(1.0, 1.0));
-        let resp = ui.interact(r, Id::new(("mc-task-col", i)), Sense::hover());
-        a11y(&resp, WidgetType::Label, name);
-    }
-    let font = FontId::proportional(11.5);
-    let p = ui.painter();
-    p.text(
-        pos2(rect.min.x + 52.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        "Subject",
-        font.clone(),
-        app.theme.text_muted,
-    );
-    let mut x = rect.max.x - 120.0;
-    p.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, "Due Date", font.clone(), app.theme.text_muted);
-    for c in DETAILED.iter().rev() {
-        x -= DETAILED_W;
-        p.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, *c, font.clone(), app.theme.text_muted);
-    }
-    p.hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, app.theme.separator));
-}
-
-/// Text of the Detailed view's extra columns for a row.
-fn detailed_cells(app: &App, row: &Row) -> [String; 4] {
-    let Some(t) = app.s.mailbox.tasks.get(&row.id).filter(|_| row.kind == RowKind::Task) else {
-        let kind = if row.kind == RowKind::Mail { "Flagged message" } else { "Flagged contact" };
-        return [kind.to_owned(), String::new(), String::new(), String::new()];
-    };
-    let folder = app.s.mailbox.folder(t.folder).map(|f| f.name.clone()).unwrap_or_default();
-    [
-        editors::status_label(editors::status_key(t.status)).to_owned(),
-        format!("{}%", t.percent_complete),
-        folder,
-        t.categories.join(", "),
-    ]
 }
 
 fn preview_text(app: &App, row: &Row, lines: u8) -> String {
@@ -375,7 +353,41 @@ fn preview_text(app: &App, row: &Row, lines: u8) -> String {
         .join("\n")
 }
 
-fn row_ui(ui: &mut Ui, app: &mut App, st: &mut ModState, row: &Row, now: i64, preview: u8, detailed: bool) {
+/// The Quick Click category on a row (a task, a flagged message or a flagged contact).
+fn quick_category(app: &mut App, row: &Row) {
+    let cmd = match row.kind {
+        RowKind::Mail => "mail.categorize",
+        RowKind::Contact => "people.categorize",
+        _ => "tasks.categorize",
+    };
+    app.run(cmd, json!({ "ids": [row.id.0] }));
+}
+
+/// Look of a row's flag: a task's flag is complete with the task; messages and contacts show their flag.
+fn flag_look(app: &App, row: &Row) -> mt::FlagLook {
+    let flag = match row.kind {
+        RowKind::Mail => app.s.mailbox.mail.get(&row.id).map(|m| m.flag.clone()),
+        RowKind::Contact => app.s.mailbox.contacts.get(&row.id).map(|c| c.flag.clone()),
+        _ => None,
+    };
+    match flag {
+        Some(FlagState::Complete { .. }) => mt::FlagLook::Complete,
+        Some(FlagState::None) => mt::FlagLook::None,
+        Some(FlagState::Flagged { .. }) => mt::FlagLook::Flagged,
+        None if row.done => mt::FlagLook::Complete,
+        None => mt::FlagLook::Flagged,
+    }
+}
+
+fn row_ui(
+    ui: &mut Ui,
+    app: &mut App,
+    st: &mut ModState,
+    row: &Row,
+    laid: &[mt::Laid],
+    rules: &[mailcraft_engine::cmd::view::mail::FormatRule],
+    preview: u8,
+) {
     let body = preview_text(app, row, preview);
     let extra = if body.is_empty() { 0.0 } else { 15.0 * body.lines().count() as f32 + 2.0 };
     let base = row_height(app, ROW_H);
@@ -388,117 +400,99 @@ fn row_ui(ui: &mut Ui, app: &mut App, st: &mut ModState, row: &Row, now: i64, pr
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.hover);
     }
-    // Complete checkbox.
-    let cb = Rect::from_center_size(pos2(line.min.x + 14.0, line.center().y), Vec2::splat(14.0));
-    let cb_resp = ui.interact(cb.expand(4.0), Id::new(("mc-task-check", row.id.0)), Sense::click());
-    a11y(&cb_resp, WidgetType::Checkbox, &format!("Complete {}", row.subject));
-    draw_check(ui, cb, row.done, app.theme.complete, app.theme.text_muted);
-    // Kind icon.
-    let icon = match row.kind {
-        RowKind::Mail => "mail",
-        RowKind::Contact => "person",
-        _ => "task",
-    };
-    app.icons.paint(
-        ui,
-        Rect::from_min_size(pos2(line.min.x + 30.0, line.center().y - 8.0), Vec2::splat(16.0)),
-        icon,
-        app.theme.text_muted,
-    );
-    let mut x = line.min.x + 52.0;
-    let recurring = app.s.mailbox.tasks.get(&row.id).is_some_and(|t| t.recurrence.is_some());
-    if row.priority == TaskPriority::High {
-        app.icons.paint(
-            ui,
-            Rect::from_min_size(pos2(x, line.center().y - 7.0), Vec2::splat(14.0)),
-            "importance-high",
-            app.theme.importance_high,
-        );
-        x += 16.0;
-    }
-    if recurring {
-        app.icons.paint(
-            ui,
-            Rect::from_min_size(pos2(x, line.center().y - 7.0), Vec2::splat(14.0)),
-            "recurrence",
-            app.theme.text_muted,
-        );
-        x += 16.0;
-    }
-    // Flag at the right, due date left of it.
-    let flag = Rect::from_center_size(pos2(line.max.x - 14.0, line.center().y), Vec2::splat(16.0));
-    let flag_resp = ui.interact(flag.expand(3.0), Id::new(("mc-task-flag", row.id.0)), Sense::click());
-    a11y(&flag_resp, WidgetType::Button, &format!("Mark complete {}", row.subject));
-    if row.done {
-        app.icons.paint(ui, flag, "flag-complete", app.theme.complete);
-    } else {
-        app.icons.paint(ui, flag, "flag", app.theme.flag);
-    }
-    let due_text = row.due.map(|d| {
-        format!(
-            "{} {}",
-            weekday_short(d),
-            short_date(d).rsplit_once('/').map(|(md, _)| md.to_owned()).unwrap_or_default()
-        )
-    });
-    let mut right = flag.min.x - 6.0;
-    if detailed {
-        right = line.max.x - 120.0 - 6.0;
-    }
-    let overdue = row.due.is_some_and(|d| d < now) && !row.done;
+    let style = table::item(&app.s, row.kind, row.id)
+        .map(|it| table::row_style(&app.s, rules, it))
+        .unwrap_or_default();
     let overdue_color = option_color(app, "tasks.overdueColor", app.theme.danger);
     let done_color = option_color(app, "tasks.completedColor", app.theme.text_muted);
-    if let Some(t) = &due_text {
-        let pos =
-            if detailed { pos2(line.max.x - 120.0, line.center().y) } else { pos2(right, line.center().y) };
-        let align = if detailed { Align2::LEFT_CENTER } else { Align2::RIGHT_CENTER };
-        let r = ui.painter().text(
-            pos,
-            align,
-            t,
-            FontId::proportional(12.0),
-            if overdue { overdue_color } else { app.theme.text_muted },
-        );
-        if !detailed {
-            right = r.min.x - 8.0;
+    let (color, look) = mt::row_look(&style, app.theme.text, overdue_color, done_color);
+    let muted = if color == app.theme.text { app.theme.text_muted } else { color };
+    let hovered = resp.hovered();
+    let mut toggle = false;
+    let mut categorize = false;
+    let priority_shown = laid.iter().any(|l| l.col.id == "priority");
+    let mut subject_x = None;
+    for l in laid {
+        let cell = Rect::from_min_size(pos2(line.min.x + l.x, line.min.y), vec2(l.w.max(1.0), base));
+        match l.col.id {
+            "complete" => {
+                let cb = Rect::from_center_size(cell.center(), Vec2::splat(14.0));
+                let cb_resp =
+                    ui.interact(cb.expand(4.0), Id::new(("mc-task-check", row.id.0)), Sense::click());
+                a11y(&cb_resp, WidgetType::Checkbox, &format!("Complete {}", row.subject));
+                draw_check(ui, cb, row.done, app.theme.complete, app.theme.text_muted);
+                toggle |= cb_resp.clicked();
+            }
+            "icon" => {
+                let icon = match row.kind {
+                    RowKind::Mail => "mail",
+                    RowKind::Contact => "person",
+                    _ if app.s.mailbox.tasks.get(&row.id).is_some_and(|t| t.private) => "private",
+                    _ => "task",
+                };
+                mt::paint_icon(ui, app, cell, icon);
+            }
+            "flagStatus" => {
+                let look = flag_look(app, row);
+                let label = format!("Mark complete {}", row.subject);
+                toggle |= mt::flag_cell(ui, app, cell, look, hovered, ("tasks", row.id.0), &label);
+            }
+            "categories" => {
+                let cats = table::item(&app.s, row.kind, row.id)
+                    .map(|it| match it {
+                        table::Item::Task(t) => t.categories.clone(),
+                        table::Item::Mail(m) => m.categories.clone(),
+                        table::Item::Contact(c) => c.categories.clone(),
+                    })
+                    .unwrap_or_default();
+                categorize |= mt::categories_cell(ui, app, cell, &cats, hovered, ("tasks", row.id.0));
+            }
+            "subject" => {
+                let mut x = cell.min.x + 4.0;
+                subject_x = Some(x);
+                if row.priority == TaskPriority::High && !priority_shown {
+                    let tint = app.theme.importance_high;
+                    let r = Rect::from_min_size(pos2(x, line.center().y - 7.0), Vec2::splat(14.0));
+                    app.icons.paint(ui, r, "importance-high", tint);
+                    x += 16.0;
+                }
+                if app.s.mailbox.tasks.get(&row.id).is_some_and(|t| t.recurrence.is_some()) {
+                    let tint = app.theme.text_muted;
+                    let r = Rect::from_min_size(pos2(x, line.center().y - 7.0), Vec2::splat(14.0));
+                    app.icons.paint(ui, r, "recurrence", tint);
+                    x += 16.0;
+                }
+                let text = if row.subject.trim().is_empty() { "(No subject)" } else { row.subject.as_str() };
+                let text_cell = Rect::from_min_max(pos2(x - 4.0, cell.min.y), cell.max);
+                mt::styled_cell(ui, text_cell, text, 13.5, look, color, l.align);
+            }
+            "priority" => {
+                if row.priority != TaskPriority::Normal {
+                    let (icon, tint) = if row.priority == TaskPriority::High {
+                        ("importance-high", app.theme.importance_high)
+                    } else {
+                        ("importance-low", app.theme.importance_low)
+                    };
+                    let r =
+                        Rect::from_center_size(pos2(cell.min.x + 12.0, cell.center().y), Vec2::splat(13.0));
+                    app.icons.paint(ui, r, icon, tint);
+                }
+                let text = table::item(&app.s, row.kind, row.id)
+                    .map(|it| table::task_cell(&app.s, it, "priority"))
+                    .unwrap_or_default();
+                let text_cell = Rect::from_min_max(pos2(cell.min.x + 18.0, cell.min.y), cell.max);
+                mt::styled_cell(ui, text_cell, &text, 12.0, look, muted, l.align);
+            }
+            id => {
+                let text = table::item(&app.s, row.kind, row.id)
+                    .map(|it| table::task_cell(&app.s, it, id))
+                    .unwrap_or_default();
+                mt::styled_cell(ui, cell, &text, 12.0, look, muted, l.align);
+            }
         }
-    }
-    if detailed {
-        let cells = detailed_cells(app, row);
-        let mut cx = line.max.x - 120.0;
-        for c in cells.iter().rev() {
-            cx -= DETAILED_W;
-            paint_text_clipped(
-                ui,
-                pos2(cx, line.center().y - 7.0),
-                c,
-                FontId::proportional(11.5),
-                app.theme.text_muted,
-                DETAILED_W - 6.0,
-            );
-        }
-        right = cx - 6.0;
-    }
-    // Options › Tasks › Overdue / Completed task color.
-    let color = if row.done {
-        done_color
-    } else if overdue {
-        overdue_color
-    } else {
-        app.theme.text
-    };
-    let text_rect = paint_text_clipped(
-        ui,
-        pos2(x, line.center().y - 8.0),
-        if row.subject.trim().is_empty() { "(No subject)" } else { &row.subject },
-        FontId::proportional(13.5),
-        color,
-        right - x,
-    );
-    if row.done {
-        ui.painter().hline(text_rect.x_range(), text_rect.center().y, Stroke::new(1.0, done_color));
     }
     if !body.is_empty() {
+        let x = subject_x.unwrap_or(line.min.x + 52.0);
         let area = Rect::from_min_max(pos2(x, line.max.y - 2.0), rect.max);
         let pr = ui.interact(area, Id::new(("mc-task-preview", row.id.0)), Sense::hover());
         a11y(&pr, WidgetType::Label, &body);
@@ -508,11 +502,16 @@ fn row_ui(ui: &mut Ui, app: &mut App, st: &mut ModState, row: &Row, now: i64, pr
             app.theme.text_muted,
             (rect.max.x - x - 8.0).max(10.0),
         );
-        let clip = Rect::from_min_max(pos2(x, line.max.y - 2.0), rect.max);
-        ui.painter().with_clip_rect(clip).galley(pos2(x, line.max.y - 2.0), galley, app.theme.text_muted);
+        ui.painter().with_clip_rect(area).galley(pos2(x, line.max.y - 2.0), galley, app.theme.text_muted);
     }
-    if cb_resp.clicked() || flag_resp.clicked() {
+    ui.painter().hline(rect.x_range(), rect.max.y, Stroke::new(0.5, app.theme.separator));
+    if toggle {
         toggle_complete(app, row);
+        return;
+    }
+    if categorize {
+        select_item(app, Some(row.id.0));
+        quick_category(app, row);
         return;
     }
     if resp.clicked() {
@@ -574,8 +573,7 @@ fn row_menu(ui: &mut Ui, app: &mut App, st: &mut ModState, r: &Row) {
         ui.close();
     }
     if !r.flagged_item() && ui.button("Delete").clicked() {
-        app.run("tasks.delete", json!({ "ids": [r.id.0] }));
-        select_item(app, None);
+        delete_row(app, r.id);
         ui.close();
     }
 }
@@ -619,8 +617,7 @@ fn details(ui: &mut Ui, app: &mut App, st: &mut ModState, row: &Row) {
             }
             if !row.flagged_item() && crate::widgets::icon_button(ui, app, "delete", "Delete", true).clicked()
             {
-                app.run("tasks.delete", json!({ "ids": [row.id.0] }));
-                select_item(app, None);
+                delete_row(app, row.id);
             }
         });
         ui.separator();

@@ -21,7 +21,9 @@
 use egui::{Context, RichText, Ui};
 use serde_json::{Value, json};
 
-use super::common::{self, Dlg, Out, btn, btn_en, footer, heading, muted, primary, window, with_state};
+use super::common::{
+    self, Dlg, Out, btn, btn_en, footer, heading, muted, ok_cancel, primary, window, with_state,
+};
 use crate::App;
 use mailcraft_engine::accounts::{AccountOptions, DownloadMode};
 use mailcraft_engine::sync::{PushMode, TestReport};
@@ -34,8 +36,67 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "testAccount" => test_account(ctx, app, d),
         "confirmRemoveAccount" => confirm_remove(ctx, app, d),
         "sendReceiveProgress" => progress(ctx, app, d),
+        "newDataFile" => new_data_file(ctx, app, d),
         _ => return None,
     })
+}
+
+#[derive(Clone, Default)]
+struct DataFileState {
+    name: String,
+    error: String,
+    focused: bool,
+}
+
+/// New Data File (New Items › More Items › Data File..., File › Account Settings › Data Files): the data
+/// file's name; it is kept with this profile's data, whose folder the dialog shows (`file.newDataFile`).
+fn new_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let uid = d.uid;
+    let start = d.str("name");
+    let location = d.str("location");
+    with_state(
+        ctx,
+        app,
+        uid,
+        |_: &App| DataFileState { name: start.clone(), ..Default::default() },
+        |st, app| {
+            window(ctx, app, d, "New Data File", 420.0, |ui, app| {
+                let l = ui.label("File name:");
+                let r = ui
+                    .add(egui::TextEdit::singleline(&mut st.name).desired_width(f32::INFINITY))
+                    .labelled_by(l.id);
+                if !st.focused {
+                    r.request_focus();
+                    st.focused = true;
+                }
+                if location.is_empty() {
+                    muted(ui, app, "Saved with this profile's data (this session keeps it in memory only).");
+                } else {
+                    muted(ui, app, &format!("Saved with this profile's data in {location}"));
+                }
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                match ok_cancel(ui, app, !st.name.trim().is_empty()) {
+                    Some(true) => create_data_file(app, st),
+                    _ if enter && !st.name.trim().is_empty() => create_data_file(app, st),
+                    Some(false) => Out::Close,
+                    None => Out::Keep,
+                }
+            })
+        },
+    )
+}
+
+fn create_data_file(app: &mut App, st: &mut DataFileState) -> Out {
+    match try_run(app, "file.newDataFile", json!({ "name": st.name.trim() })) {
+        Ok(_) => Out::Close,
+        Err(e) => {
+            st.error = e;
+            Out::Keep
+        }
+    }
 }
 
 /// Runs a command, returning its error text instead of raising a toast (dialogs show errors inline).
