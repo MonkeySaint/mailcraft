@@ -1288,6 +1288,75 @@ fn font_list_has_theme_fonts_and_known_and_installed_fonts() {
 }
 
 #[test]
+fn multilevel_gallery_filters_in_place() {
+    let (mut app, cid) = compose_app();
+    let s = Surface::Compose(cid);
+    app.run("compose.insertText", serde_json::json!({"compose": cid, "text": "one"})).unwrap();
+    let labels = |app: &App| -> Vec<String> {
+        menu_entries(app, s, "multilevel").into_iter().map(|(l, ..)| l).collect()
+    };
+    // All: the library (with its heading); not in a list yet, so no Current List.
+    let all = labels(&app);
+    assert!(
+        all.contains(&"List Library".to_owned()) && all.contains(&"1. 1.1. 1.1.1.".to_owned()),
+        "{all:?}"
+    );
+    assert!(!all.contains(&"Current List".to_owned()));
+    run_entry(&mut app, s, "multilevel", "1. 1.1. 1.1.1.");
+    assert!(app.s.composes[&cid].list_at_caret().is_some());
+    // Current List: the list at the cursor as a full outline, which applies it again; the library is gone.
+    let filter = menu_entries(&app, s, "multilevelFilter");
+    let current = filter.iter().find(|(l, ..)| l == "Current List").unwrap().1.clone();
+    assert!(super::draw::keeps_menu_open(&current), "the menu stays open on a filter");
+    run_entry(&mut app, s, "multilevelFilter", "Current List");
+    let only = labels(&app);
+    assert!(
+        only.contains(&"1.  1.1.  1.1.1.".to_owned()) && !only.contains(&"List Library".to_owned()),
+        "{only:?}"
+    );
+    run_entry(&mut app, s, "multilevel", "1.  1.1.  1.1.1.");
+    // The filter is checked in its menu and named on the gallery's top entry.
+    let items = defs().menu("multilevelFilter").unwrap();
+    let resolved = state::expand_items(&app, s, &state::Mem::default(), items);
+    let checked: Vec<&str> = resolved
+        .iter()
+        .filter_map(|r| match r {
+            state::Resolved::Cmd { label, on: Some(true), .. } => Some(label.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(checked, ["Current List"]);
+    let top = state::expand_items(&app, s, &state::Mem::default(), defs().menu("multilevel").unwrap());
+    assert!(matches!(&top[0], state::Resolved::Sub { label, .. } if label == "Current List"));
+    // Saved list styles join the gallery under All.
+    app.run(
+        "format.multilevel",
+        serde_json::json!({"compose": cid, "name": "Steps", "levels": [{"pattern": "Step 1:"}]}),
+    )
+    .unwrap();
+    run_entry(&mut app, s, "multilevelFilter", "All");
+    let all = labels(&app);
+    assert!(all.iter().any(|l| l.ends_with("Steps")) && all.contains(&"List Styles".to_owned()), "{all:?}");
+}
+
+#[test]
+fn apply_styles_menu_item_shows_the_pane_state() {
+    let (mut app, cid) = compose_app();
+    let s = Surface::Compose(cid);
+    let on = |app: &App| {
+        state::expand_items(app, s, &state::Mem::default(), defs().menu("styles").unwrap()).iter().any(
+            |r| matches!(r, state::Resolved::Cmd { label, on: Some(true), .. } if label == "Apply Styles..."),
+        )
+    };
+    assert!(!on(&app));
+    run_entry(&mut app, s, "styles", "Apply Styles...");
+    assert!(app.s.composes[&cid].editor.apply_styles);
+    assert!(on(&app), "checked while the pane is open");
+    run_entry(&mut app, s, "styles", "Apply Styles...");
+    assert!(!app.s.composes[&cid].editor.apply_styles, "the item toggles the pane");
+}
+
+#[test]
 fn change_styles_offers_colors_fonts_and_saved_style_sets() {
     let (mut app, cid) = compose_app();
     let s = Surface::Compose(cid);

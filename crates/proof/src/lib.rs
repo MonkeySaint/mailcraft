@@ -19,6 +19,8 @@
 //!   commonly confused words) and the writing refinements switched on in [`SpellOptions::refinements`]
 //!   (passive voice, wordy phrases, clichés, informal words, inclusive language).
 //!
+//! - [`hunspell`]: other languages from the Hunspell-format dictionaries installed on the computer
+//!   ([`hunspell::find_dictionaries`], [`Speller::from_hunspell`]); none is bundled.
 //! - [`thesaurus::lookup`]: related words from the bundled Moby Thesaurus II (Review › Thesaurus).
 //!
 //! Nothing here panics on any input: all offsets are byte offsets on char boundaries of the given text, word
@@ -27,6 +29,7 @@
 mod dict;
 mod distance;
 mod grammar;
+pub mod hunspell;
 mod refine;
 mod rules;
 mod speller;

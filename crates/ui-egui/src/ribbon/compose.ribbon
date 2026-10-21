@@ -226,21 +226,12 @@ item | i, ii, iii, …, Number Format: i. | numbering | format.numbering | {"sty
 sep
 sub | Change List Level | indent | listLevels | | L
 item | Define New Number Format... | | format.numbering | {"style":"define"} | D
-item | Set Numbering Value... | | format.numbering | {"style":"setValue"} | V
+item | Set Numbering Value... | | format.numbering | {"style":"setValue"} | V | en=numlist
 
 menu multilevel
 sub | All | filter | multilevelFilter | |
 sep
-item | None | | format.multilevel | {"style":"none"} |
-item | 1. a. i. | numbering | format.multilevel | {"style":"numbered"} |
-item | 1) a) i) | numbering | format.multilevel | {"style":"numberedParen"} |
-item | 1. 1.1. 1.1.1. | numbering | format.multilevel | {"style":"outline"} |
-item | 1 / 1.1 / 1.1.1 | numbering | format.multilevel | {"style":"outlinePlain"} |
-item | I. A. 1. a) | numbering | format.multilevel | {"style":"outlineRoman"} |
-item | Article I. / Section 1.01 | numbering | format.multilevel | {"style":"article"} |
-item | Chapter 1 / 1.1 | numbering | format.multilevel | {"style":"chapter"} |
-item | Bullets by level | bullets | format.multilevel | {"style":"bullets"} |
-item | Four Small Diamonds | bullets | format.multilevel | {"style":"diamonds"} |
+dyn | multilevelGallery | format.multilevel | {"style":"$style"}
 sep
 sub | Gallery Filter | filter | multilevelFilter | | F
 sub | Change List Level | indent | listLevels | | L
@@ -248,20 +239,20 @@ item | Define New Multilevel List... | | format.multilevel | {"style":"define"} 
 item | Define New List Style... | | format.multilevel | {"style":"defineStyle"} | S
 
 menu multilevelFilter
-item | All | | format.multilevel | {"filter":"all"} | A
-item | Current List | | format.multilevel | {"filter":"current"} | C
-item | List Library | | format.multilevel | {"filter":"library"} | L
+item | All | | format.multilevel | {"filter":"all"} | A | on=listfilter:all
+item | Current List | | format.multilevel | {"filter":"current"} | C | on=listfilter:current
+item | List Library | | format.multilevel | {"filter":"library"} | L | on=listfilter:library
 
 menu listLevels
-item | Level 1 | | format.indent | {"level":1} | 1
-item | Level 2 | | format.indent | {"level":2} | 2
-item | Level 3 | | format.indent | {"level":3} | 3
-item | Level 4 | | format.indent | {"level":4} | 4
-item | Level 5 | | format.indent | {"level":5} | 5
-item | Level 6 | | format.indent | {"level":6} | 6
-item | Level 7 | | format.indent | {"level":7} | 7
-item | Level 8 | | format.indent | {"level":8} | 8
-item | Level 9 | | format.indent | {"level":9} | 9
+item | Level 1 | | format.indent | {"level":1} | 1 | en=inlist
+item | Level 2 | | format.indent | {"level":2} | 2 | en=inlist
+item | Level 3 | | format.indent | {"level":3} | 3 | en=inlist
+item | Level 4 | | format.indent | {"level":4} | 4 | en=inlist
+item | Level 5 | | format.indent | {"level":5} | 5 | en=inlist
+item | Level 6 | | format.indent | {"level":6} | 6 | en=inlist
+item | Level 7 | | format.indent | {"level":7} | 7 | en=inlist
+item | Level 8 | | format.indent | {"level":8} | 8 | en=inlist
+item | Level 9 | | format.indent | {"level":9} | 9 | en=inlist
 
 menu highlight
 item | High-contrast only | | format.highlight | {"highContrastOnly":"$!on"} | H | on=hc
@@ -325,21 +316,14 @@ menu fontColorShades10
 dyn | fontThemeShades:accent6 | format.color | {"theme":"$theme","tint":"$tint"}
 
 menu shading
+item | High-contrast only | | format.shading | {"highContrastOnly":"$!on"} | H | on=shc
+sep
 item | No Color | | format.shading | {"color":null} | N
 sep
-dyn | themeColors | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeColors | format.shading | {"theme":"$theme","tint":"$tint"}
 sub | Theme Color Shades | font-color | shadingShades | | T
 sep
-item | Dark Red | | format.shading | {"color":"#a01c1c"} | | swatch=#a01c1c
-item | Red | | format.shading | {"color":"#e02424"} | | swatch=#e02424
-item | Orange | | format.shading | {"color":"#ef8a17"} | | swatch=#ef8a17
-item | Yellow | | format.shading | {"color":"#f2c94c"} | | swatch=#f2c94c
-item | Light Green | | format.shading | {"color":"#7ac74f"} | | swatch=#7ac74f
-item | Green | | format.shading | {"color":"#2e8b46"} | | swatch=#2e8b46
-item | Light Blue | | format.shading | {"color":"#3fa7d6"} | | swatch=#3fa7d6
-item | Blue | | format.shading | {"color":"#1f5fbf"} | | swatch=#1f5fbf
-item | Dark Blue | | format.shading | {"color":"#14286b"} | | swatch=#14286b
-item | Purple | | format.shading | {"color":"#6b3fa0"} | | swatch=#6b3fa0
+dyn | shadingColors | format.shading | {"color":"$color"}
 sep
 item | More Colors... | highlight | format.shading | {"custom":true} | M
 
@@ -356,34 +340,34 @@ sub | Plum, Accent 5 | | shadingShades9 |
 sub | Green, Accent 6 | | shadingShades10 |
 
 menu shadingShades1
-dyn | themeShades:bg1 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:bg1 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades2
-dyn | themeShades:tx1 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:tx1 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades3
-dyn | themeShades:bg2 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:bg2 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades4
-dyn | themeShades:tx2 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:tx2 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades5
-dyn | themeShades:accent1 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:accent1 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades6
-dyn | themeShades:accent2 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:accent2 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades7
-dyn | themeShades:accent3 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:accent3 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades8
-dyn | themeShades:accent4 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:accent4 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades9
-dyn | themeShades:accent5 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:accent5 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu shadingShades10
-dyn | themeShades:accent6 | format.shading | {"theme":"$theme","tint":"$tint"}
+dyn | shadingThemeShades:accent6 | format.shading | {"theme":"$theme","tint":"$tint"}
 
 menu borders
 item | Bottom Border | | format.borders | {"kind":"bottom"} | B
@@ -425,7 +409,7 @@ dyn | styles | format.style | {"name":"$name"}
 sep
 item | Create a Style | plus | format.style | {"action":"create"} | S
 item | Clear Formatting | format-painter | format.clearFormatting | | C
-item | Apply Styles... | settings | format.stylesPane | {"apply":true} | A
+item | Apply Styles... | settings | format.stylesPane | {"apply":true} | A | on=applystyles
 
 menu changeStyles
 sub | Style Set | view | styleSet | | Y
@@ -501,7 +485,7 @@ menu businessCard
 item | Other Business Cards... | contact-group | insert.businessCard | | B
 
 menu link
-dyn | recentFiles | insert.link | {"path":"$path"}
+dyn | recentFilesLink | insert.link | {"path":"$path"}
 sep
 item | Insert Link... | link | insert.link | | I
 item | Remove Link | | insert.link | {"url":""} | R
@@ -635,7 +619,7 @@ item | Greek Small Letter Beta | | insert.symbol | {"char":"β"} |
 item | Greek Small Letter Pi | | insert.symbol | {"char":"π"} |
 item | Ohm Sign | | insert.symbol | {"char":"Ω"} |
 item | N-Ary Summation | | insert.symbol | {"char":"∑"} |
-item | White Smiling Face | | insert.symbol | {"char":"☺"} |
+item | Wingdings: 74 | | insert.symbol | {"font":"Wingdings","code":74} |
 sep
 item | More Symbols... | info | insert.symbol | | M
 

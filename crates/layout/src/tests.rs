@@ -348,6 +348,33 @@ fn paragraph_background_behind_text() {
     }
 }
 
+/// Text in the automatic colour stays readable on dark shading (the Shading button's face is black).
+#[test]
+fn automatic_text_colour_turns_white_on_dark_shading() {
+    let colors = |bg: Color, inlines: Vec<Inline>| -> Vec<Color> {
+        let style = ParaStyle { background: Some(bg), ..Default::default() };
+        let l = lay(&doc(vec![Block::Paragraph { style, inlines }, para_s("after")]), 300.0);
+        l.display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Text { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect()
+    };
+    let red = TextStyle { color: Some(Color::rgb(0xee, 0, 0)), ..Default::default() };
+    let c = colors(Color::BLACK, vec![text("auto "), styled("red", red)]);
+    assert_eq!(
+        c,
+        [Color::WHITE, Color::rgb(0xee, 0, 0), Color::BLACK],
+        "own colours and later paragraphs keep theirs"
+    );
+    assert_eq!(colors(Color::rgb(0xd9, 0xd9, 0xd9), vec![text("x")]), [Color::BLACK, Color::BLACK]);
+    assert_eq!(crate::block::auto_text_color(Some(Color::WHITE), Color::WHITE), Color::BLACK);
+    assert_eq!(crate::block::auto_text_color(None, Color::WHITE), Color::WHITE);
+}
+
 #[test]
 fn highlight_drawn_before_text() {
     let hl = TextStyle { highlight: Some(Color::rgb(255, 255, 0)), ..Default::default() };

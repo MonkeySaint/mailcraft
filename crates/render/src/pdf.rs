@@ -173,7 +173,7 @@ impl Painter<'_, '_, '_> {
             .entry(id)
             .or_insert_with(|| {
                 let data = fonts.data(id);
-                if data.is_empty() { None } else { Font::new(data.into(), 0) }
+                if data.is_empty() { None } else { Font::new(data.into(), fonts.face_index(id)) }
             })
             .clone()
     }
@@ -212,7 +212,9 @@ impl Painter<'_, '_, '_> {
             if count > MAX_RUN_GLYPHS {
                 break;
             }
-            let face = self.fonts.fallback_for(font, c);
+            // A face whose licence forbids embedding is replaced by its bundled stand-in (OS/2 fsType).
+            let base = self.fonts.embeddable_face(font);
+            let face = self.fonts.embeddable_face(self.fonts.fallback_for(base, c));
             let gid = self.fonts.glyph_id(face, c);
             let adv = self.fonts.glyph_advance(face, gid, size) / size;
             let adv = if adv.is_finite() { adv } else { 0.0 };

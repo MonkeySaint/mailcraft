@@ -37,6 +37,20 @@ pub const MAX_FONT_PT: f32 = 1638.0;
 const DEFAULT_FONT_COLOR: Color = Color::rgb(0xee, 0x00, 0x00);
 /// Default highlight colour (the yellow on the button).
 const DEFAULT_HIGHLIGHT: Color = Color::rgb(0xff, 0xff, 0x00);
+/// Shading's face colour before one is chosen (black, as observed; text in the automatic colour turns white
+/// on it, see the layout's automatic text colour).
+pub const DEFAULT_SHADING: Color = Color::rgb(0, 0, 0);
+
+/// The colour the face of a colour button applies in `c`: Font Color, Text Highlight Color or Shading (the
+/// colour picked last, else its default). `None` for other commands.
+pub fn face_color(c: &ComposeState, cmd: &str) -> Option<Color> {
+    match cmd {
+        "format.color" => Some(c.last_font_color.unwrap_or(DEFAULT_FONT_COLOR)),
+        "format.highlight" => Some(c.last_highlight.unwrap_or(DEFAULT_HIGHLIGHT)),
+        "format.shading" => Some(c.last_shading.unwrap_or(DEFAULT_SHADING)),
+        _ => None,
+    }
+}
 /// Accent used by the built-in emphasis / reference styles.
 const ACCENT: Color = Color::rgb(0x0f, 0x47, 0x61);
 const SUBTLE: Color = Color::rgb(0x40, 0x40, 0x40);
@@ -446,9 +460,11 @@ fn highlight_palette(high_contrast_only: bool) -> Vec<Value> {
         .collect()
 }
 
+/// Clear All Formatting: the selection goes back to Normal; text highlight stays (it marks text, it is not
+/// a look).
 fn clear_formatting(s: &mut Session, p: &Value) -> CmdResult {
     edit(s, p, |c| {
-        c.apply_text_style(|st| *st = TextStyle::default());
+        c.apply_text_style(|st| *st = TextStyle { highlight: st.highlight, ..TextStyle::default() });
         c.set_heading(None);
         c.set_para_style(|ps| *ps = ParaStyle::default());
     })?;
@@ -856,13 +872,21 @@ fn multilevel_key(name: &str) -> Option<&'static str> {
     } else if n.contains("format: 1,") || n.ends_with("format: 1") || n.contains("1 / 1.1 / 1.1.1") {
         // "Number Format: 1, Aligned at …": the number alone, no period (1 / 1.1 / 1.1.1).
         "outlinePlain"
-    } else if n.contains("1.1") || n.contains("legal") {
+    } else if n.contains("1.1") || n.contains("legal") || (n.contains("format: 1.") && aligned_at_zero(&n)) {
+        // "Number Format: 1., Aligned at: 0" is the legal outline (1. 1.1. 1.1.1.); at 0.25 it is 1. a. i.
         "outline"
     } else if n.contains("format: 1") || n.contains("numbered") {
         "numbered"
     } else {
         return None;
     })
+}
+
+/// Whether a gallery name's "Aligned at:" value is zero ("Aligned at:  0", not "0.25").
+fn aligned_at_zero(name: &str) -> bool {
+    let Some((_, rest)) = name.split_once("aligned at:") else { return false };
+    let num: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    num.parse::<f32>().is_ok_and(|v| v == 0.0)
 }
 
 /// One level as Define New Multilevel List shows it: `{"glyph"}` or `{"pattern","numberStyle","chain"}`
@@ -912,12 +936,48 @@ pub const MULTILEVEL_LIBRARY: [(&str, &str); 9] = [
     ("diamonds", "Four Small Diamonds"),
 ];
 
-/// Gallery Filter (All / Current List / List Library): the sections the Multilevel List gallery shows, as
-/// a picker window. "Current List" is the list at the caret, "List Library" the built-in definitions, "All"
-/// both plus the named list styles.
+/// The marker each of the nine list levels gets in the list at the caret (its own formats, else the default
+/// bullets or numbers); empty outside a list.
+pub fn level_markers(c: &ComposeState) -> Vec<String> {
+    let Some((_, kind)) = c.list_at_caret() else { return Vec::new() };
+    let numbered = matches!(kind, ListKind::Numbered { .. });
+    let levels = c.list_levels_at_caret().unwrap_or_default();
+    (0..crate::compose::MAX_LIST_LEVEL)
+        .map(|k| match levels.get(k) {
+            Some(f) => f.marker(1, &vec![1u64; k]).trim().to_owned(),
+            None => ListFormat::default_marker(numbered, 1, k),
+        })
+        .collect()
+}
+
+/// The levels of a list as a one-line outline ("1.  a.  i."): the first three levels' markers for item 1.
+pub fn outline_label(levels: &[ListFormat]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (k, f) in levels.iter().take(3).enumerate() {
+        let parents = vec![1u64; k];
+        parts.push(f.marker(1, &parents).trim().to_owned());
+    }
+    parts.join("  ")
+}
+
+/// Gallery Filter (All / Current List / List Library): remembers which sections the Multilevel List gallery
+/// shows (the menu filters in place) and returns them. "Current List" is the list at the caret, "List
+/// Library" the built-in definitions, "All" both plus the named list styles.
 fn multilevel_gallery(s: &mut Session, p: &Value, filter: &str) -> CmdResult {
     let cid = compose_id(s, p)?;
-    let current = s.composes.get(&cid).and_then(ComposeState::list_format_at_caret);
+    let c = compose_mut(s, p)?;
+    c.editor.list_gallery_filter = if filter == "all" { String::new() } else { filter.to_owned() };
+    Ok(multilevel_gallery_data(s, cid))
+}
+
+/// The Multilevel List gallery of compose `cid` under its Gallery Filter: `{"filter", "shown", "current":
+/// {"label", "levels"} | null, "library": [{"style", "label"}], "styles": [{"style", "label", "sample"}]}`.
+pub fn multilevel_gallery_data(s: &Session, cid: u64) -> Value {
+    let c = s.composes.get(&cid);
+    let filter = c.map(|c| c.editor.list_gallery_filter.clone()).filter(|f| !f.is_empty());
+    let filter = filter.unwrap_or_else(|| "all".to_owned());
+    let current = c.and_then(ComposeState::list_format_at_caret);
+    let current_levels = c.and_then(ComposeState::list_levels_at_caret);
     let library: Vec<Value> =
         MULTILEVEL_LIBRARY.iter().map(|(k, l)| json!({"style": k, "label": l})).collect();
     let styles: Vec<Value> = super::insert::list_styles(s, cid)
@@ -927,7 +987,7 @@ fn multilevel_gallery(s: &mut Session, p: &Value, filter: &str) -> CmdResult {
             json!({"style": name, "label": name, "sample": sample})
         })
         .collect();
-    let shown: Vec<&str> = match filter {
+    let shown: Vec<&str> = match filter.as_str() {
         "current" if current.is_none() => Vec::new(),
         "current" => vec!["current"],
         "library" => vec!["library"],
@@ -943,16 +1003,23 @@ fn multilevel_gallery(s: &mut Session, p: &Value, filter: &str) -> CmdResult {
             v
         }
     };
-    let out = json!({
+    let current_json = match (&current, &current_levels) {
+        (Some(f), Some(levels)) => {
+            json!({"label": outline_label(levels), "format": format_json(Some(f)), "levels": levels.len()})
+        }
+        (Some(f), None) => {
+            json!({"label": outline_label(std::slice::from_ref(f)), "format": format_json(Some(f))})
+        }
+        _ => Value::Null,
+    };
+    json!({
         "compose": cid,
         "filter": filter,
         "shown": shown,
-        "current": format_json(current.as_ref()),
+        "current": current_json,
         "library": if shown.contains(&"library") { library } else { Vec::new() },
         "styles": if shown.contains(&"styles") { styles } else { Vec::new() },
-    });
-    s.notify(crate::Notice::OpenDialog("multilevelGallery".into(), out.clone()));
-    Ok(out)
+    })
 }
 
 fn multilevel(s: &mut Session, p: &Value) -> CmdResult {
@@ -964,6 +1031,16 @@ fn multilevel(s: &mut Session, p: &Value) -> CmdResult {
         if style.is_none() && p.get("levels").is_none() {
             return multilevel_gallery(s, p, f);
         }
+    }
+    // The gallery's Current List entry: the list at the caret, its definition applied to the selection.
+    if style == Some("current") && p.get("levels").is_none() {
+        let cid = compose_id(s, p)?;
+        let levels = s
+            .composes
+            .get(&cid)
+            .and_then(ComposeState::list_levels_at_caret)
+            .ok_or_else(|| CmdError::Disabled("the cursor is not in a list".into()))?;
+        return apply_multilevel(s, p, levels);
     }
     // A named list style (Define New List Style) is applied by its name.
     if let Some(name) = style.filter(|n| !matches!(*n, "none" | "None" | "define" | "defineStyle"))
@@ -1068,8 +1145,42 @@ fn outdent(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// The Sort Text dialog's parameters (any of them sorts right away; none opens the dialog).
-const SORT_KEYS: [&str; 8] =
-    ["descending", "order", "type", "by", "field", "separator", "header", "matchCase"];
+const SORT_KEYS: [&str; 9] =
+    ["descending", "order", "type", "by", "field", "separator", "header", "matchCase", "thenBy"];
+
+/// The "Then by" keys of a Sort Text request: `[{"field"?: n (from 1), "type"?, "order"?}]`.
+fn then_by_param(p: &Value) -> Result<Vec<crate::compose::SortKey>, CmdError> {
+    let Some(v) = p.get("thenBy").filter(|v| !v.is_null()) else { return Ok(Vec::new()) };
+    let arr = v.as_array().ok_or_else(|| CmdError::Params("`thenBy` must be a list".into()))?;
+    if arr.len() > crate::compose::MAX_THEN_BY {
+        return Err(CmdError::Params(format!("at most {} \"then by\" keys", crate::compose::MAX_THEN_BY)));
+    }
+    arr.iter()
+        .map(|k| {
+            let field = match k.get("field").filter(|v| !v.is_null()) {
+                None => None,
+                Some(f) => Some(
+                    f.as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .and_then(|n| n.checked_sub(1))
+                        .filter(|n| *n < crate::compose::MAX_TEXT_TABLE_COLS)
+                        .ok_or_else(|| CmdError::Params("`field` is the field's number, from 1".into()))?,
+                ),
+            };
+            let kind = match k.get("type").and_then(Value::as_str) {
+                Some(t) => SortKind::from_name(t)
+                    .ok_or_else(|| CmdError::Params(format!("unknown sort type `{t}`")))?,
+                None => SortKind::Text,
+            };
+            let descending = match k.get("order").and_then(Value::as_str) {
+                None | Some("ascending") => false,
+                Some("descending") => true,
+                Some(o) => return Err(CmdError::Params(format!("unknown sort order `{o}`"))),
+            };
+            Ok(crate::compose::SortKey { field, kind, descending })
+        })
+        .collect()
+}
 
 /// What the Sort Text dialog opens with: what is sorted (table rows, list items or paragraphs), the fields
 /// it can sort by and a separator guessed from the text.
@@ -1140,6 +1251,7 @@ fn sort(s: &mut Session, p: &Value) -> CmdResult {
         separator,
         header: opt_bool(p, "header").unwrap_or(false),
         match_case: opt_bool(p, "matchCase").unwrap_or(false),
+        then: then_by_param(p)?,
     };
     edit(s, p, |c| c.sort_selection_with(&spec))?;
     Ok(json!({"sorted": true, "descending": descending}))
@@ -1536,18 +1648,59 @@ const MAX_STYLE_NAME: usize = 100;
 /// Most styles created in one message.
 const MAX_CUSTOM_STYLES: usize = 200;
 
-/// The style the caret's paragraph looks like: a created style with exactly its formatting, else its
-/// heading level, else Normal.
+/// The style the caret's text looks like: a created style with exactly its formatting; else a built-in
+/// character style with a look of its own (Subtle / Intense Emphasis and Reference, Book Title); else the
+/// paragraph's: Title (a 28 pt first-level heading), the heading level, Code, Quote, Intense Quote,
+/// Subtitle, List Paragraph, No Spacing; else Normal. Plain italic and bold read as Normal (they are
+/// direct formatting as often as Emphasis and Strong).
 pub fn current_style(c: &ComposeState) -> String {
+    use mailcraft_model::rich::Align;
     let (st, para) = (c.style_at_caret(), c.para_at_caret());
     if let Some(x) = c.custom_styles.iter().rev().find(|x| x.style == st && x.para == para) {
         return x.name.clone();
     }
-    let path = &c.selection.focus.path;
-    match block_at(&c.body.blocks, path) {
-        Some(mailcraft_model::Block::Heading { level, .. }) => format!("Heading {level}"),
-        _ => "Normal".to_owned(),
+    let accent = accent(c);
+    let yes = |v: Option<bool>| v == Some(true);
+    let centered = para.align == Align::Center;
+    let character = if yes(st.small_caps) && yes(st.bold) && st.color == Some(accent) {
+        Some("Intense Reference")
+    } else if yes(st.small_caps) && st.color == Some(SUBTLE_REF) {
+        Some("Subtle Reference")
+    } else if yes(st.bold) && yes(st.italic) && st.spacing_pt == Some(0.5) {
+        Some("Book Title")
+    } else if yes(st.italic) && st.color == Some(SUBTLE) && !centered {
+        Some("Subtle Emphasis")
+    } else if yes(st.italic) && st.color == Some(accent) && !centered {
+        Some("Intense Emphasis")
+    } else {
+        None
+    };
+    if let Some(name) = character {
+        return name.to_owned();
     }
+    let path = &c.selection.focus.path;
+    if let Some(mailcraft_model::Block::Heading { level, .. }) = block_at(&c.body.blocks, path) {
+        if *level == 1 && st.size_pt == Some(28.0) {
+            return "Title".to_owned();
+        }
+        return format!("Heading {level}");
+    }
+    let name = if st.font_family.as_deref() == Some(CODE_FONT) && para.background == Some(CODE_BACKGROUND) {
+        "Code"
+    } else if centered && yes(st.italic) && st.color == Some(accent) && para.indent_px == 48.0 {
+        "Intense Quote"
+    } else if centered && yes(st.italic) && st.color == Some(SUBTLE) {
+        "Quote"
+    } else if st.size_pt == Some(14.0) && st.color == Some(SUBTITLE) {
+        "Subtitle"
+    } else if para.indent_px == 48.0 && c.list_at_caret().is_none() {
+        "List Paragraph"
+    } else if para.space_before_px == 0.0 && para.space_after_px == 0.0 && para.line_height == Some(1.0) {
+        "No Spacing"
+    } else {
+        "Normal"
+    };
+    name.to_owned()
 }
 
 /// The Styles pane list: built-in styles (a created style of the same name replaces one), then the
@@ -1589,6 +1742,10 @@ fn style(s: &mut Session, p: &Value) -> CmdResult {
     let new_name: Option<String> = opt_str(p, "newName")
         .map(|n| n.trim_start_matches('¶').trim().chars().take(MAX_STYLE_NAME).collect::<String>())
         .filter(|n| !n.is_empty());
+    if action == "define" && new_name.is_none() && !STYLE_PROPS.iter().any(|k| p.get(*k).is_some()) {
+        let cid = compose_id(s, p)?;
+        return modify_style_dialog(s, cid, &name);
+    }
     let c = compose_mut(s, p)?;
     let is_builtin = |n: &str| BUILTIN_STYLES.iter().any(|b| b.eq_ignore_ascii_case(n));
     match action {
@@ -1627,6 +1784,9 @@ fn style(s: &mut Session, p: &Value) -> CmdResult {
             c.custom_styles.push(st);
             Ok(json!({"modified": target}))
         }
+        // Modify Style: without properties opens the dialog with the style's definition; with them sets
+        // its font, size, emphasis, colour, alignment and spacing (a built-in keeps its name).
+        "define" => define_style(c, &name, new_name.as_deref(), p),
         "rename" => {
             let Some(to) = new_name else {
                 return Err(CmdError::Params("`newName` required".into()));
@@ -1659,8 +1819,7 @@ fn style(s: &mut Session, p: &Value) -> CmdResult {
             c.checkpoint();
             if let Some(custom) = c.custom_styles.iter().find(|x| x.name.eq_ignore_ascii_case(&name)).cloned()
             {
-                c.set_para_style(|ps| *ps = custom.para.clone());
-                c.with_whole_paragraphs(|c| c.apply_text_style(|st| *st = custom.style.clone()));
+                apply_named_style(c, &custom);
             } else if !apply_builtin_style(c, &name.to_lowercase()) {
                 c.undo_edit();
                 c.edit_redo.clear();
@@ -1671,6 +1830,187 @@ fn style(s: &mut Session, p: &Value) -> CmdResult {
         }
         other => Err(CmdError::Params(format!("unknown style action `{other}`"))),
     }
+}
+
+/// The kind of block a built-in paragraph style makes: `Some(Some(level))` for Title and the headings,
+/// `Some(None)` (a plain paragraph) for the other built-in paragraph styles, `None` for character styles and
+/// created ones (they leave the block as it is).
+fn style_block(name: &str) -> Option<Option<u8>> {
+    let n = name.trim().to_lowercase();
+    if n == "title" {
+        return Some(Some(1));
+    }
+    if let Some(level) = n.strip_prefix("heading ").and_then(|l| l.trim().parse::<u8>().ok()) {
+        return (1..=9).contains(&level).then_some(Some(level.min(6)));
+    }
+    ["normal", "code", "no spacing", "subtitle", "quote", "intense quote", "list paragraph"]
+        .contains(&n.as_str())
+        .then_some(None)
+}
+
+/// Applies a created or modified style to the selection's paragraphs: its formatting, and for a modified
+/// built-in paragraph style the block it makes (a modified Heading 2 is still a second-level heading, in the
+/// Navigation pane, the table of contents and the HTML sent).
+fn apply_named_style(c: &mut ComposeState, x: &NamedStyle) {
+    if let Some(level) = style_block(&x.name) {
+        c.set_heading(level);
+    }
+    c.set_para_style(|ps| *ps = x.para.clone());
+    c.with_whole_paragraphs(|c| c.apply_text_style(|st| *st = x.style.clone()));
+}
+
+/// The formatting style `name` gives a paragraph in `c`: a created (or modified) style's own, else the
+/// built-in look applied to a sample paragraph under the message's theme and style set.
+pub fn style_definition(c: &ComposeState, name: &str) -> Option<(TextStyle, ParaStyle)> {
+    if let Some(x) = c.custom_styles.iter().find(|x| x.name.eq_ignore_ascii_case(name)) {
+        return Some((x.style.clone(), x.para.clone()));
+    }
+    let mut t = ComposeState {
+        theme: c.theme.clone(),
+        style_set: c.style_set.clone(),
+        format: c.format,
+        ..ComposeState::default()
+    };
+    t.ensure_body();
+    t.insert_text("Sample");
+    t.select_all();
+    if !apply_builtin_style(&mut t, &name.to_lowercase()) {
+        return None;
+    }
+    Some((t.style_at_caret(), t.para_at_caret()))
+}
+
+/// Modify Style's fields for a definition.
+fn style_definition_json(name: &str, st: &TextStyle, para: &ParaStyle) -> Value {
+    let align = match para.align {
+        mailcraft_model::rich::Align::Center => "center",
+        mailcraft_model::rich::Align::End => "right",
+        mailcraft_model::rich::Align::Justify => "justify",
+        _ => "left",
+    };
+    json!({
+        "name": name,
+        "font": st.font_family,
+        "size": st.size_pt,
+        "bold": st.bold == Some(true),
+        "italic": st.italic == Some(true),
+        "underline": st.underline == Some(true),
+        "color": st.color.map(|c| c.to_hex()),
+        "align": align,
+        "before": px_to_pt(para.space_before_px),
+        "after": px_to_pt(para.space_after_px),
+        "line": para.line_height,
+    })
+}
+
+/// Properties Modify Style sets.
+const STYLE_PROPS: [&str; 10] =
+    ["font", "size", "bold", "italic", "underline", "color", "align", "before", "after", "line"];
+
+/// The Modify Style dialog for style `name` of compose `cid`, filled with its definition.
+fn modify_style_dialog(s: &mut Session, cid: u64, name: &str) -> CmdResult {
+    let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
+    let (st, para) =
+        style_definition(c, name).ok_or_else(|| CmdError::Params(format!("unknown style `{name}`")))?;
+    let mut v = style_definition_json(name, &st, &para);
+    // What a property the style leaves unset looks like now: the theme's heading or body font.
+    let theme = c.theme_resolved();
+    let heading = matches!(style_block(name), Some(Some(_)));
+    let shown_font =
+        st.font_family.clone().unwrap_or(if heading { theme.heading_font } else { theme.body_font });
+    if let Some(o) = v.as_object_mut() {
+        o.insert("shownFont".into(), json!(shown_font));
+        o.insert("compose".into(), json!(cid));
+        o.insert("builtin".into(), json!(BUILTIN_STYLES.iter().any(|b| b.eq_ignore_ascii_case(name))));
+        o.insert("fonts".into(), json!([c.theme_resolved().heading_font, c.theme_resolved().body_font]));
+    }
+    dialog(s, "modifyStyle", v)
+}
+
+/// Modify Style (see `format.style` `define`).
+fn define_style(c: &mut ComposeState, name: &str, new_name: Option<&str>, p: &Value) -> CmdResult {
+    let (mut st, mut para) =
+        style_definition(c, name).ok_or_else(|| CmdError::Params(format!("unknown style `{name}`")))?;
+    let is_builtin = BUILTIN_STYLES.iter().any(|b| b.eq_ignore_ascii_case(name));
+    if let Some(f) = opt_str(p, "font") {
+        let f: String = f.chars().filter(|ch| !ch.is_control()).take(64).collect();
+        st.font_family = Some(f.trim().to_owned()).filter(|f| !f.is_empty());
+    }
+    if let Some(v) = p.get("size").filter(|v| !v.is_null()) {
+        let pt = v
+            .as_f64()
+            .or_else(|| v.as_str().and_then(|t| t.trim().parse().ok()))
+            .filter(|n| n.is_finite() && (1.0..=1638.0).contains(n))
+            .ok_or_else(|| CmdError::Params("`size` must be 1..1638 points".into()))?;
+        #[allow(clippy::cast_possible_truncation)]
+        let pt = pt as f32;
+        st.size_pt = Some(pt);
+    }
+    for (k, slot) in [("bold", &mut st.bold), ("italic", &mut st.italic), ("underline", &mut st.underline)] {
+        if let Some(b) = opt_bool(p, k) {
+            *slot = Some(b);
+        }
+    }
+    if let Some(col) = opt_str(p, "color") {
+        st.color = if col.trim().is_empty() || col == "auto" { None } else { Some(parse_color(col)?) };
+    }
+    if let Some(a) = opt_str(p, "align") {
+        para.align = match a {
+            "left" => mailcraft_model::rich::Align::Start,
+            "center" => mailcraft_model::rich::Align::Center,
+            "right" => mailcraft_model::rich::Align::End,
+            "justify" => mailcraft_model::rich::Align::Justify,
+            other => return Err(CmdError::Params(format!("unknown alignment `{other}`"))),
+        };
+    }
+    let spacing = |k: &str, hi: f64| -> Result<Option<f32>, CmdError> {
+        match p.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                let n = v.as_f64().filter(|n| n.is_finite() && (0.0..=hi).contains(n));
+                #[allow(clippy::cast_possible_truncation)]
+                n.map(|n| Some(n as f32)).ok_or_else(|| CmdError::Params(format!("`{k}` must be 0..{hi}")))
+            }
+        }
+    };
+    if let Some(v) = spacing("before", 1584.0)? {
+        para.space_before_px = pt_to_px(v);
+    }
+    if let Some(v) = spacing("after", 1584.0)? {
+        para.space_after_px = pt_to_px(v);
+    }
+    if let Some(v) = spacing("line", 10.0)? {
+        para.line_height = Some(v.max(0.25));
+    }
+    let target = match new_name {
+        Some(n) if !is_builtin => n.to_owned(),
+        _ => name.to_owned(),
+    };
+    // A new name never takes over another style (as with `rename`).
+    if !target.eq_ignore_ascii_case(name) {
+        if BUILTIN_STYLES.iter().any(|b| b.eq_ignore_ascii_case(&target)) {
+            return Err(CmdError::Failed("built-in styles cannot be renamed".into()));
+        }
+        if c.custom_styles.iter().any(|x| x.name.eq_ignore_ascii_case(&target)) {
+            return Err(CmdError::Failed(format!("a style named `{target}` already exists")));
+        }
+    }
+    if c.custom_styles.len() >= MAX_CUSTOM_STYLES
+        && !c.custom_styles.iter().any(|x| x.name.eq_ignore_ascii_case(name))
+    {
+        return Err(CmdError::Failed("this message has too many styles".into()));
+    }
+    c.custom_styles.retain(|x| !x.name.eq_ignore_ascii_case(name) && !x.name.eq_ignore_ascii_case(&target));
+    c.custom_styles.push(NamedStyle { name: target.clone(), style: st, para });
+    // Paragraphs already in this style take the new look (Word updates them too).
+    if opt_bool(p, "reapply") == Some(true) {
+        c.checkpoint();
+        if let Some(x) = c.custom_styles.last().cloned() {
+            apply_named_style(c, &x);
+        }
+    }
+    c.dirty = true;
+    Ok(json!({"modified": target}))
 }
 
 /// Paragraph spacing presets for Change Styles: (space after in pt, line height multiple).
@@ -1742,6 +2082,7 @@ fn apply_custom_spacing(c: &mut ComposeState, (before, after, line): CustomSpaci
 }
 
 /// Settings keys of the style set defaults and the saved style sets.
+pub const DEFAULT_THEME_KEY: &str = "state.compose.defaultTheme";
 pub const DEFAULT_STYLE_SET_KEY: &str = "state.compose.defaultStyleSet";
 pub const DEFAULT_SPACING_KEY: &str = "state.compose.defaultParagraphSpacing";
 pub const SAVED_STYLE_SETS_KEY: &str = "state.compose.styleSets";
@@ -1784,7 +2125,10 @@ fn apply_set_and_spacing(c: &mut ComposeState, set: Option<&str>, spacing: Optio
         c.apply_style_set();
     }
     if let Some(sp) = spacing {
-        if let Some((after, line)) = spacing_preset(sp) {
+        // Paragraph Spacing › Default is the active style set's own spacing.
+        let own =
+            (sp == "default").then(|| c.style_set_def().map(|x| (x.space_after_pt, x.line_height))).flatten();
+        if let Some((after, line)) = own.or_else(|| spacing_preset(sp)) {
             c.with_whole_body(|c| {
                 c.set_para_style(|ps| {
                     ps.space_after_px = pt_to_px(after);
@@ -1798,9 +2142,21 @@ fn apply_set_and_spacing(c: &mut ComposeState, set: Option<&str>, spacing: Optio
     }
 }
 
-/// New messages: the style set and paragraph spacing chosen with Set as Default. Leaves the message
+/// The theme saved with Set as Default (`None` when none was, or the setting is garbled).
+pub fn default_theme(s: &Session) -> Option<crate::compose::ThemeState> {
+    let v = s.settings.get(DEFAULT_THEME_KEY)?;
+    let t: crate::compose::ThemeState = serde_json::from_value(v).ok()?;
+    (t != crate::compose::ThemeState::default()).then_some(t)
+}
+
+/// New messages: the theme, style set and paragraph spacing chosen with Set as Default. Leaves the message
 /// unchanged (not dirty).
 pub fn apply_default_style_set(s: &Session, c: &mut ComposeState) {
+    if let Some(t) = default_theme(s)
+        && c.theme == crate::compose::ThemeState::default()
+    {
+        c.theme = t;
+    }
     let name = s.settings.text(DEFAULT_STYLE_SET_KEY);
     let spacing = s.settings.text(DEFAULT_SPACING_KEY);
     let (mut set, mut sp) = (None, Some(spacing).filter(|sp| spacing_known(sp)));
@@ -1816,6 +2172,20 @@ pub fn apply_default_style_set(s: &Session, c: &mut ComposeState) {
     let dirty = c.dirty;
     apply_set_and_spacing(c, set.as_deref(), sp.as_deref());
     c.dirty = dirty;
+}
+
+/// The style set and spacing saved with Set as Default (a saved set stands for its base and spacing).
+fn default_style_set(s: &Session) -> (Option<String>, Option<String>) {
+    let name = s.settings.text(DEFAULT_STYLE_SET_KEY);
+    let mut sp = Some(s.settings.text(DEFAULT_SPACING_KEY)).filter(|sp| spacing_known(sp));
+    let mut set = None;
+    if crate::compose::style_set(&name).is_some() {
+        set = Some(name);
+    } else if let Some(saved) = saved_style_sets(s).into_iter().find(|x| x.name.eq_ignore_ascii_case(&name)) {
+        set = saved.base;
+        sp = sp.or(saved.spacing);
+    }
+    (set, sp)
 }
 
 /// Custom Paragraph Spacing: `after` (and `before`, points) and `line` (multiple) for every paragraph.
@@ -1860,9 +2230,34 @@ fn style_set(s: &mut Session, p: &Value) -> CmdResult {
             let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
             let (set, spacing) = (c.style_set.clone(), c.paragraph_spacing_preset.clone());
             let spacing = spacing.filter(|sp| spacing_known(sp));
+            let theme = c.theme.clone();
+            // Asks first: every new message starts this way from now on.
+            if opt_bool(p, "confirm") != Some(true) {
+                let theme_name = theme.name.clone().unwrap_or_else(|| "Office".into());
+                let set_name = set.clone().unwrap_or_else(|| "Default".into());
+                s.notify(crate::Notice::OpenDialog(
+                    "confirm".into(),
+                    json!({
+                        "title": "Set as Default",
+                        "text": format!(
+                            "New messages will start with the {set_name} style set, its paragraph spacing and the \
+                             {theme_name} theme. Use these as the default?"
+                        ),
+                        "command": "format.styleSet",
+                        "params": {"compose": cid, "action": "setDefault", "confirm": true},
+                    }),
+                ));
+                return Ok(json!({"dialog": "confirm", "confirm": true}));
+            }
             s.settings.set(DEFAULT_STYLE_SET_KEY, &json!(set.clone().unwrap_or_default()))?;
             s.settings.set(DEFAULT_SPACING_KEY, &json!(spacing.clone().unwrap_or_default()))?;
-            return Ok(json!({"default": set, "paragraphSpacing": spacing}));
+            let theme_json = if theme == crate::compose::ThemeState::default() {
+                json!({})
+            } else {
+                serde_json::to_value(&theme).map_err(|e| CmdError::Failed(e.to_string()))?
+            };
+            s.settings.set(DEFAULT_THEME_KEY, &theme_json)?;
+            return Ok(json!({"default": set, "paragraphSpacing": spacing, "theme": theme.name}));
         }
         "apply" | "reset" => {}
         other => return Err(CmdError::Params(format!("unknown action `{other}`"))),
@@ -1889,13 +2284,26 @@ fn style_set(s: &mut Session, p: &Value) -> CmdResult {
         spacing = spacing.or(saved.spacing);
         saved_name = Some(saved.name);
     }
+    // Reset to the Default Style Set: the one chosen with Set as Default, else the built-in Default.
+    let user_default = if action == "reset" { default_style_set(s) } else { (None, None) };
     let c = compose_mut(s, p)?;
     if action == "reset" {
         c.checkpoint();
-        c.style_set = Some("Default".to_owned());
-        c.apply_style_set();
-        c.style_set = None;
-        c.paragraph_spacing_preset = None;
+        match user_default {
+            (None, None) => {
+                c.style_set = Some("Default".to_owned());
+                c.apply_style_set();
+                c.style_set = None;
+                c.paragraph_spacing_preset = None;
+            }
+            (set, sp) => {
+                c.style_set = Some("Default".to_owned());
+                c.apply_style_set();
+                c.style_set = None;
+                c.paragraph_spacing_preset = None;
+                apply_set_and_spacing(c, set.as_deref(), sp.as_deref());
+            }
+        }
     } else {
         if name.is_none() && spacing.is_none() && saved_name.is_none() {
             return Err(CmdError::Params("`name` or `paragraphSpacing` required".into()));
@@ -1936,19 +2344,16 @@ fn save_style_set(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"saved": name, "base": base, "paragraphSpacing": spacing}))
 }
 
-/// Styles pane: toggles (or `show`s) the pane; `list` only reports the styles; `apply` opens Apply Styles.
+/// Styles pane: toggles (or `show`s) the pane; `list` only reports the styles; `apply` toggles (or, with
+/// `show`, shows or hides) the Apply Styles pane, a small window that stays open while you work.
 fn styles_pane(s: &mut Session, p: &Value) -> CmdResult {
     if opt_bool(p, "apply") == Some(true) {
-        let cid = compose_id(s, p)?;
-        let names: Vec<Value> = s
-            .composes
-            .get(&cid)
-            .map(styles_list)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.get("name").cloned())
-            .collect();
-        return dialog(s, "applyStyles", json!({"compose": cid, "styles": names}));
+        let c = compose_mut(s, p)?;
+        c.editor.apply_styles = opt_bool(p, "show").unwrap_or(!c.editor.apply_styles);
+        let names: Vec<Value> = styles_list(c).into_iter().filter_map(|v| v.get("name").cloned()).collect();
+        return Ok(
+            json!({"applyStyles": c.editor.apply_styles, "styles": names, "current": current_style(c)}),
+        );
     }
     let c = compose_mut(s, p)?;
     if opt_bool(p, "list") != Some(true) {
@@ -2701,13 +3106,52 @@ fn go_to(s: &mut Session, p: &Value) -> CmdResult {
     let c = compose_mut(s, p)?;
     let (kind, arg) = target.split_once(':').map_or((target.as_str(), ""), |(k, a)| (k, a.trim()));
     let nth = |a: &str| a.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+    // The places of a kind, in document order.
+    let places = |c: &ComposeState, what: &str| -> Option<Vec<DocPos>> {
+        Some(match what {
+            "paragraph" => c.leaf_paths().into_iter().map(|p| DocPos::new(p, 0)).collect(),
+            "line" => c.line_starts(),
+            "table" => c.table_starts(),
+            "bookmark" => {
+                let order = c.pos_orders();
+                let mut v: Vec<DocPos> = c.bookmarks.iter().map(|b| b.pos.clone()).collect();
+                v.sort_by_key(|p| order.of(p));
+                v
+            }
+            _ => return None,
+        })
+    };
+    // Next / Previous: the first place after (or the last before) the caret. The leaf order is built once
+    // per move, so a long body costs one pass, not one per place.
+    let relative = |c: &ComposeState, what: &str, forward: bool| -> Option<DocPos> {
+        let order = c.pos_orders();
+        let here = order.of(&c.selection.focus);
+        let list = places(c, what)?;
+        if forward {
+            list.into_iter().find(|p| order.of(p) > here)
+        } else {
+            list.into_iter().rev().find(|p| order.of(p) < here)
+        }
+    };
+    // "+2" / "-1": that many places on from the one holding the caret.
+    let offset = |c: &ComposeState, what: &str, delta: i64| -> Option<DocPos> {
+        let order = c.pos_orders();
+        let here = order.of(&c.selection.focus);
+        let list = places(c, what)?;
+        let cur = list.iter().rposition(|p| order.of(p) <= here).unwrap_or(0);
+        let i = i64::try_from(cur).ok()?.checked_add(delta)?;
+        list.get(usize::try_from(i).ok()?).cloned()
+    };
+    let signed = |a: &str| -> Option<i64> {
+        if a.starts_with('+') || a.starts_with('-') { a.parse::<i64>().ok() } else { None }
+    };
     let pos: Option<DocPos> = match kind {
         "start" | "page" if kind == "start" || nth(arg) == Some(0) => Some(c.body_start()),
         "end" => Some(c.body_end()),
-        "paragraph" | "line" => {
-            nth(arg).and_then(|n| c.leaf_paths().get(n).cloned()).map(|path| DocPos::new(path, 0))
-        }
-        "table" => nth(arg).and_then(|n| c.table_starts().get(n).cloned()),
+        "next" => relative(c, arg, true),
+        "previous" | "prev" => relative(c, arg, false),
+        "paragraph" | "line" | "table" if signed(arg).is_some() => offset(c, kind, signed(arg).unwrap_or(0)),
+        "paragraph" | "line" | "table" => nth(arg).and_then(|n| places(c, kind)?.get(n).cloned()),
         "bookmark" => c.bookmarks.iter().find(|b| b.name == arg).map(|b| b.pos.clone()),
         name => c.bookmarks.iter().find(|b| b.name == name).map(|b| b.pos.clone()),
     };
@@ -2881,8 +3325,18 @@ pub fn drawing_objects(c: &ComposeState) -> Vec<BodyObject> {
 pub fn pane_objects(c: &ComposeState) -> Vec<BodyObject> {
     let mut out = body_objects(c);
     out.extend(drawing_objects(c));
+    // Names given in the pane win over the generated ones.
+    for o in &mut out {
+        if let Some((_, n)) = c.object_names.iter().find(|(src, _)| *src == o.src) {
+            o.name.clone_from(n);
+        }
+    }
     out
 }
+
+/// Most names kept for one message's objects, and the longest name.
+const MAX_OBJECT_NAMES: usize = 500;
+const MAX_OBJECT_NAME: usize = 80;
 
 /// The objects (pictures) of a document, as the selection pane lists them.
 pub fn doc_objects(doc: &Doc) -> Vec<BodyObject> {
@@ -2921,7 +3375,56 @@ fn selection_pane(s: &mut Session, p: &Value) -> CmdResult {
         }
         return Ok(json!({"item": id, "objects": names}));
     }
+    // Bring Forward / Send Backward a drawing from the pane (pictures sit in the text and do not move).
+    if let (Some(n), Some(dir)) = (opt_u64(p, "move"), opt_str(p, "dir")) {
+        let cid = compose_id(s, p)?;
+        let objects = s.composes.get(&cid).map(pane_objects).unwrap_or_default();
+        let obj = usize::try_from(n)
+            .ok()
+            .and_then(|i| objects.get(i))
+            .ok_or_else(|| CmdError::Params(format!("no object {n}")))?;
+        let id = obj.drawing.ok_or_else(|| {
+            CmdError::Disabled("a picture in the text cannot be moved in front of or behind others".into())
+        })?;
+        let action = match dir {
+            "forward" | "up" => "bringForward",
+            "backward" | "down" => "sendBackward",
+            other => {
+                return Err(CmdError::Params(format!("unknown direction `{other}` (forward, backward)")));
+            }
+        };
+        s.run("drawing.arrange", &json!({"compose": cid, "id": id, "action": action}))?;
+        let objects = s.composes.get(&cid).map(pane_objects).unwrap_or_default();
+        let at = objects.iter().position(|o| o.drawing == Some(id));
+        return Ok(json!({"moved": id, "index": at}));
+    }
     let c = compose_mut(s, p)?;
+    // Rename an object (an empty name gives back the generated one).
+    if let Some(n) = opt_u64(p, "rename") {
+        let objects = pane_objects(c);
+        let obj = usize::try_from(n)
+            .ok()
+            .and_then(|i| objects.get(i))
+            .ok_or_else(|| CmdError::Params(format!("no object {n}")))?;
+        let name: String = opt_str(p, "name")
+            .unwrap_or("")
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(MAX_OBJECT_NAME)
+            .collect();
+        let name = name.trim().to_owned();
+        c.object_names.retain(|(src, _)| *src != obj.src);
+        if !name.is_empty() {
+            if c.object_names.len() >= MAX_OBJECT_NAMES {
+                return Err(CmdError::Failed("too many named objects".into()));
+            }
+            c.object_names.push((obj.src.clone(), name.clone()));
+        }
+        c.dirty = true;
+        return Ok(
+            json!({"renamed": n, "name": pane_objects(c).get(usize::try_from(n).unwrap_or(usize::MAX)).map(|o| o.name.clone())}),
+        );
+    }
     let objects = pane_objects(c);
     if let Some(n) = opt_u64(p, "select") {
         let obj = usize::try_from(n)
@@ -2960,7 +3463,37 @@ fn show_marks(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"showMarks": c.editor.show_marks}))
 }
 
+/// Width of a printed page (8.5 in at 96 px per inch) and of its text between 1 in margins, for Zoom's Page
+/// width and Text width.
+pub const PAGE_WIDTH_PX: f64 = 816.0;
+pub const TEXT_WIDTH_PX: f64 = 624.0;
+
+/// Zoom that fits `fit` ("page" or "text" width) into a view `view_px` wide, in percent (10–500).
+pub fn fit_zoom(fit: &str, view_px: f64) -> Option<u16> {
+    let width = match fit {
+        "page" => PAGE_WIDTH_PX,
+        "text" => TEXT_WIDTH_PX,
+        _ => return None,
+    };
+    if !view_px.is_finite() || view_px <= 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pct = (view_px / width * 100.0).floor().clamp(10.0, 500.0) as u16;
+    Some(pct)
+}
+
 fn zoom(s: &mut Session, p: &Value) -> CmdResult {
+    // Page width / Text width: the zoom that fits that width into the view (`viewWidth`, px).
+    if let Some(fit) = opt_str(p, "fit") {
+        let view = p.get("viewWidth").and_then(Value::as_f64).unwrap_or(0.0);
+        let pct = fit_zoom(fit, view).ok_or_else(|| {
+            CmdError::Params("`fit` is page or text, with the view's `viewWidth` in px".into())
+        })?;
+        let c = compose_mut(s, p)?;
+        c.zoom = (pct != 100).then_some(pct);
+        return Ok(json!({"zoom": pct, "fit": fit}));
+    }
     let Some(v) = p.get("pct") else {
         return dialog(s, "zoom", json!({"compose": compose_id(s, p)?}));
     };
@@ -3151,7 +3684,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Go To",
             "Format Text › Editing › Find",
             "Mod+G",
-            r#"{"target"?:string}  ("start", "end", "page:1", "paragraph:n", "table:n", "bookmark:name")"#,
+            r#"{"target"?:string}  ("start", "end", "page:1", "paragraph:n", "line:n", "table:n", "bookmark:name"; "paragraph:+2" / "line:-1" move from the cursor; "next:paragraph" / "previous:table" and so on)"#,
             false,
             has_compose,
             go_to,
@@ -3211,7 +3744,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Multilevel List",
             "Format Text › Paragraph",
             "",
-            r#"{"style"?:string,"filter"?:"all"|"current"|"library","levels"?:[{"glyph"|"pattern","numberStyle"?,"chain"?}],"name"?:string}  (name + levels: Define New List Style)"#,
+            r#"{"style"?:string|"current","filter"?:"all"|"current"|"library","levels"?:[{"glyph"|"pattern","numberStyle"?,"chain"?}],"name"?:string}  (name + levels: Define New List Style; filter: the gallery shows only those sections)"#,
             false,
             rich_compose,
             multilevel,
@@ -3331,7 +3864,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Selection Pane",
             "Format Text › Editing › Select",
             "",
-            r#"{"show"?:bool,"list"?:bool,"select"?:number,"ids"?:[number]}  (ids: the received message's body)"#,
+            r#"{"show"?:bool,"list"?:bool,"select"?:number,"ids"?:[number]}  (ids: the received message's body) | {"rename":n,"name":string} | {"move":n,"dir":"forward"|"backward"}"#,
             false,
             compose_or_message,
             selection_pane,
@@ -3341,7 +3874,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shading",
             "Format Text › Paragraph",
             "",
-            r#"{"color"?:string|null,"theme"?:string,"tint"?:number,"custom"?:bool,"pattern"?:"clear"|"5%".."80%"|"solid","patternColor"?:string}"#,
+            r#"{"color"?:string|null,"theme"?:string,"tint"?:number,"custom"?:bool,"pattern"?:"clear"|"5%".."80%"|"solid","patternColor"?:string,"highContrastOnly"?:bool,"dialog"?:bool}  (no colour: the face colour, the last one picked)"#,
             false,
             rich_compose,
             borders::shading,
@@ -3381,7 +3914,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Sort",
             "Format Text › Paragraph",
             "",
-            r#"{"order"?:"ascending"|"descending","descending"?:bool,"by"?:"paragraphs"|"field"|"column","field"?:number,"type"?:"text"|"number"|"date","separator"?:"tab"|"comma"|string,"header"?:bool,"matchCase"?:bool}  (none: the Sort Text dialog)"#,
+            r#"{"order"?:"ascending"|"descending","descending"?:bool,"by"?:"paragraphs"|"field"|"column","field"?:number,"type"?:"text"|"number"|"date","separator"?:"tab"|"comma"|string,"header"?:bool,"matchCase"?:bool,"thenBy"?:[{"field"?:number,"type"?,"order"?}]}  (none: the Sort Text dialog; thenBy: up to two keys that break ties)"#,
             false,
             has_compose,
             sort,
@@ -3392,7 +3925,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Styles",
             "Format Text › Styles",
             "",
-            r#"{"name":string,"action"?:"apply"|"create"|"modify"|"rename"|"delete","newName"?:string} | {"action":"create"}  (no name: the naming dialog)"#,
+            r#"{"name":string,"action"?:"apply"|"create"|"modify"|"define"|"rename"|"delete","newName"?:string,"font"?,"size"?,"bold"?,"italic"?,"underline"?,"color"?,"align"?,"before"?,"after"?,"line"?,"reapply"?:bool} | {"action":"create"}  (no name: the naming dialog; define without properties: Modify Style)"#,
             false,
             rich_compose,
             style,
@@ -3402,7 +3935,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Change Styles",
             "Format Text › Styles",
             "",
-            r#"{"name"?:string,"paragraphSpacing"?:"default"|"noParagraphSpace"|"compact"|"tight"|"open"|"relaxed"|"double"|"custom","before"?:pt,"after"?:pt,"line"?:number,"action"?:"apply"|"reset"|"save"|"setDefault"}"#,
+            r#"{"name"?:string,"paragraphSpacing"?:"default"|"noParagraphSpace"|"compact"|"tight"|"open"|"relaxed"|"double"|"custom","before"?:pt,"after"?:pt,"line"?:number,"action"?:"apply"|"reset"|"save"|"setDefault","confirm"?:bool}  (setDefault asks first unless confirm)"#,
             false,
             rich_compose,
             style_set,
@@ -3412,7 +3945,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Styles Pane",
             "Format Text › Styles",
             "Mod+Alt+Shift+S",
-            r#"{"apply"?:bool,"show"?:bool,"list"?:bool}"#,
+            r#"{"apply"?:bool,"show"?:bool,"list"?:bool}  (apply: the Apply Styles pane)"#,
             false,
             rich_compose,
             styles_pane,
@@ -3636,7 +4169,7 @@ mod tests {
         s.run("format.styleSet", &json!({"action": "reset"})).unwrap();
         assert!(s.composes[&id].style_set.is_none());
         assert_eq!(s.run("format.stylesPane", &json!({})).unwrap()["stylesPane"], true);
-        assert_eq!(s.run("format.stylesPane", &json!({"apply": true})).unwrap()["dialog"], "applyStyles");
+        assert_eq!(s.run("format.stylesPane", &json!({"apply": true})).unwrap()["applyStyles"], true);
     }
 
     fn send_html(s: &mut Session) -> String {
@@ -3998,6 +4531,50 @@ mod tests {
         s.run("format.changeCase", &json!({"kind": "upper"})).unwrap();
     }
 
+    /// Regression: Go To Next / ±n on a long body is one pass over it, not one per place (a reply quoting
+    /// 20 000 paragraphs froze the window).
+    #[test]
+    fn go_to_on_a_long_body_is_linear() {
+        let text: String = (0..20_000).map(|i| format!("p{i}\n")).collect();
+        let (mut s, id) = with_text(&text);
+        sel(&mut s, (&[10_000], 0), (&[10_000], 0));
+        let started = std::time::Instant::now();
+        s.run("format.goTo", &json!({"target": "next:paragraph"})).unwrap();
+        assert_eq!(s.composes[&id].selection.focus, DocPos::new(vec![10_001], 0));
+        s.run("format.goTo", &json!({"target": "next:line"})).unwrap();
+        s.run("format.goTo", &json!({"target": "paragraph:-2"})).unwrap();
+        assert_eq!(s.composes[&id].selection.focus, DocPos::new(vec![10_000], 0));
+        s.run("format.goTo", &json!({"target": "previous:paragraph"})).unwrap();
+        assert_eq!(s.composes[&id].selection.focus, DocPos::new(vec![9_999], 0));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    }
+
+    /// Regression: Modify Style with a new name never replaces another style or a built-in one.
+    #[test]
+    fn modify_style_new_name_never_takes_another_style() {
+        let (mut s, id) = with_text("x");
+        s.run("format.style", &json!({"name": "Mine", "action": "create"})).unwrap();
+        s.run("format.style", &json!({"name": "Other", "action": "create"})).unwrap();
+        let taken = s.run(
+            "format.style",
+            &json!({"name": "Mine", "action": "define", "newName": "other", "bold": true}),
+        );
+        assert!(matches!(taken, Err(CmdError::Failed(m)) if m.contains("already exists")));
+        for builtin in ["Heading 1", "normal"] {
+            let r = s.run(
+                "format.style",
+                &json!({"name": "Mine", "action": "define", "newName": builtin, "bold": true}),
+            );
+            assert!(matches!(r, Err(CmdError::Failed(_))), "{builtin}: {r:?}");
+        }
+        let names: Vec<&str> = s.composes[&id].custom_styles.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["Mine", "Other"]);
+        // Its own name in another case is fine.
+        s.run("format.style", &json!({"name": "Mine", "action": "define", "newName": "MINE", "bold": true}))
+            .unwrap();
+        assert!(s.composes[&id].custom_styles.iter().any(|x| x.name == "MINE"));
+    }
+
     #[test]
     fn painter_toggles_and_view_flags() {
         let (mut s, id) = with_text("abc def");
@@ -4357,7 +4934,12 @@ mod pane_tests {
     }
 
     fn first_style(s: &Session, id: u64) -> TextStyle {
-        match &s.composes[&id].body.blocks[0] {
+        first_style_at(s, id, 0)
+    }
+
+    /// Style of the first text run of block `i`.
+    fn first_style_at(s: &Session, id: u64, i: usize) -> TextStyle {
+        match &s.composes[&id].body.blocks[i] {
             Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => match &inlines[0] {
                 Inline::Text { style, .. } => style.clone(),
                 other => panic!("{other:?}"),
@@ -4562,8 +5144,186 @@ mod pane_tests {
         s.run("format.style", &json!({"name": "Heading 2", "action": "delete"})).unwrap();
         s.run("format.style", &json!({"name": "Heading 2"})).unwrap();
         assert!(matches!(s.composes[&id].body.blocks[0], Block::Heading { level: 2, .. }));
+        // Apply Styles is a pane that stays open (a toggle), listing the styles.
         let r = s.run("format.stylesPane", &json!({"apply": true})).unwrap();
-        assert_eq!(r["dialog"], "applyStyles");
+        assert_eq!(r["applyStyles"], true);
+        assert!(r["styles"].as_array().unwrap().iter().any(|v| v == "Heading 2"), "{r}");
+        assert!(s.composes[&id].editor.apply_styles);
+        let r = s.run("format.stylesPane", &json!({"apply": true})).unwrap();
+        assert_eq!(r["applyStyles"], false);
+        assert_eq!(
+            s.run("format.stylesPane", &json!({"apply": true, "show": true})).unwrap()["applyStyles"],
+            true
+        );
+    }
+
+    #[test]
+    fn applied_styles_are_recognised_at_the_caret() {
+        let (mut s, id) = with_text("Big title\nsome words here\nquoted");
+        sel(&mut s, (&[0], 1), (&[0], 1));
+        s.run("format.style", &json!({"name": "Title"})).unwrap();
+        assert_eq!(current_style(&s.composes[&id]), "Title");
+        sel(&mut s, (&[1], 0), (&[1], 4));
+        for name in
+            ["Subtle Emphasis", "Intense Emphasis", "Subtle Reference", "Intense Reference", "Book Title"]
+        {
+            s.run("format.clearFormatting", &json!({})).unwrap();
+            s.run("format.style", &json!({"name": name})).unwrap();
+            sel(&mut s, (&[1], 2), (&[1], 2));
+            assert_eq!(current_style(&s.composes[&id]), name);
+            sel(&mut s, (&[1], 0), (&[1], 4));
+        }
+        sel(&mut s, (&[2], 1), (&[2], 1));
+        for name in ["Quote", "Intense Quote", "Subtitle", "Code", "No Spacing", "List Paragraph"] {
+            s.run("format.style", &json!({"name": "Normal"})).unwrap();
+            s.run("format.style", &json!({"name": name})).unwrap();
+            assert_eq!(current_style(&s.composes[&id]), name);
+        }
+        // The Styles pane marks it as current.
+        let r = s.run("format.stylesPane", &json!({"list": true})).unwrap();
+        let current: Vec<&str> = r["styles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["current"] == true)
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(current, ["List Paragraph"]);
+    }
+
+    #[test]
+    fn modify_style_sets_a_definition_and_reapplies_it() {
+        let (mut s, id) = with_text("Heading text\nbody text");
+        // Without properties: the dialog, filled with the style's definition (a built-in's look included).
+        s.notices.clear();
+        s.run("format.style", &json!({"name": "Title", "action": "define"})).unwrap();
+        let d = crate::cmd::insert::tests::last_dialog(&s);
+        assert_eq!(d["name"], "Title");
+        assert_eq!(d["size"], 28.0);
+        assert_eq!(d["builtin"], true);
+        assert!(s.run("format.style", &json!({"name": "Nope", "action": "define"})).is_err());
+        // With properties: the style changes; applying it gives the new look.
+        let r = s
+            .run(
+                "format.style",
+                &json!({"name": "Heading 2", "action": "define", "font": "Georgia", "size": 18, "italic": true,
+                        "color": "#336699", "align": "center", "after": 12, "line": 1.5}),
+            )
+            .unwrap();
+        assert_eq!(r["modified"], "Heading 2");
+        sel(&mut s, (&[1], 0), (&[1], 4));
+        s.run("format.style", &json!({"name": "Heading 2"})).unwrap();
+        let st = first_style_at(&s, id, 1);
+        assert_eq!(
+            (st.font_family.as_deref(), st.size_pt, st.italic),
+            (Some("Georgia"), Some(18.0), Some(true))
+        );
+        let para = s.composes[&id].para_at_caret();
+        assert_eq!(para.align, mailcraft_model::rich::Align::Center);
+        assert_eq!(para.line_height, Some(1.5));
+        assert!((para.space_after_px - 16.0).abs() < 0.01);
+        // Regression: a modified heading style still makes a heading (Navigation pane, contents, <h2>).
+        assert!(matches!(
+            block_at(&s.composes[&id].body.blocks, &[1]),
+            Some(mailcraft_model::Block::Heading { level: 2, .. })
+        ));
+        assert_eq!(current_style(&s.composes[&id]), "Heading 2");
+        // A modified Normal makes it a plain paragraph again.
+        s.run("format.style", &json!({"name": "Normal", "action": "define", "bold": true})).unwrap();
+        s.run("format.style", &json!({"name": "Normal"})).unwrap();
+        assert!(matches!(
+            block_at(&s.composes[&id].body.blocks, &[1]),
+            Some(mailcraft_model::Block::Paragraph { .. })
+        ));
+        // The dialog now shows the changed definition.
+        s.run("format.style", &json!({"name": "Heading 2", "action": "define"})).unwrap();
+        let d = crate::cmd::insert::tests::last_dialog(&s);
+        assert_eq!((d["font"].as_str(), d["after"].as_f64()), (Some("Georgia"), Some(12.0)));
+        // Bad values are refused and change nothing.
+        assert!(s.run("format.style", &json!({"name": "Heading 2", "action": "define", "size": 0})).is_err());
+        assert!(
+            s.run("format.style", &json!({"name": "Heading 2", "action": "define", "align": "up"})).is_err()
+        );
+        // A created style can be renamed while modifying; reapply updates the selection.
+        s.run("format.style", &json!({"name": "Mine", "action": "create"})).unwrap();
+        s.run(
+            "format.style",
+            &json!({"name": "Mine", "action": "define", "newName": "Yours", "bold": true, "reapply": true}),
+        )
+        .unwrap();
+        assert_eq!(first_style_at(&s, id, 1).bold, Some(true));
+        assert!(s.composes[&id].custom_styles.iter().any(|x| x.name == "Yours"));
+    }
+
+    #[test]
+    fn zoom_fits_the_page_or_text_width() {
+        let (mut s, id) = with_text("x");
+        let r = s.run("format.zoom", &json!({"fit": "page", "viewWidth": 1224})).unwrap();
+        assert_eq!(r["zoom"], 150);
+        assert_eq!(s.composes[&id].zoom, Some(150));
+        let r = s.run("format.zoom", &json!({"fit": "text", "viewWidth": 624})).unwrap();
+        assert_eq!(r["zoom"], 100);
+        assert_eq!(s.composes[&id].zoom, None);
+        assert_eq!(fit_zoom("text", 1.0), Some(10));
+        assert_eq!(fit_zoom("page", 1e9), Some(500));
+        assert!(s.run("format.zoom", &json!({"fit": "page"})).is_err());
+        assert!(s.run("format.zoom", &json!({"fit": "wide", "viewWidth": 500})).is_err());
+    }
+
+    #[test]
+    fn clear_formatting_keeps_the_highlight() {
+        let (mut s, id) = with_text("marked text");
+        sel(&mut s, (&[0], 0), (&[0], 6));
+        s.run("format.bold", &json!({})).unwrap();
+        s.run("format.highlight", &json!({"color": "yellow"})).unwrap();
+        s.run("format.clearFormatting", &json!({})).unwrap();
+        let st = first_style(&s, id);
+        assert_eq!(st.bold, None);
+        assert!(st.highlight.is_some(), "highlight survives Clear All Formatting");
+    }
+
+    #[test]
+    fn multilevel_gallery_filters_in_place() {
+        let (mut s, id) = with_text("one\ntwo");
+        s.run("format.selectAll", &json!({})).unwrap();
+        s.notices.clear();
+        let r = s.run("format.multilevel", &json!({"filter": "library"})).unwrap();
+        assert_eq!(r["filter"], "library");
+        assert!(s.notices.iter().all(|n| !matches!(n, Notice::OpenDialog(..))), "no picker window");
+        assert_eq!(s.composes[&id].editor.list_gallery_filter, "library");
+        assert_eq!(multilevel_gallery_data(&s, id)["shown"], json!(["library"]));
+        // The current list shows its whole outline and can be applied again.
+        s.run("format.multilevel", &json!({"style": "outline"})).unwrap();
+        s.run("format.multilevel", &json!({"filter": "current"})).unwrap();
+        let g = multilevel_gallery_data(&s, id);
+        assert_eq!(g["shown"], json!(["current"]));
+        assert_eq!(g["current"]["label"], "1.  1.1.  1.1.1.");
+        s.run("format.multilevel", &json!({"style": "current"})).unwrap();
+        assert_eq!(s.composes[&id].list_markers()[1].2, "2.");
+        s.run("format.multilevel", &json!({"filter": "all"})).unwrap();
+        assert_eq!(s.composes[&id].editor.list_gallery_filter, "");
+        s.run("format.multilevel", &json!({"style": "none"})).unwrap();
+        assert!(s.run("format.multilevel", &json!({"style": "current"})).is_err(), "not in a list");
+    }
+
+    #[test]
+    fn multilevel_names_from_the_gallery_map_to_their_lists() {
+        // Regression: "Number Format: 1., Aligned at: 0" (the legal outline) mapped to 1. a. i.
+        let name = |f: &str, at: &str| {
+            format!(
+                "Outline numbered: L1: Numbered, 1, 2, 3, …, ALIGNMENT Left, Number Format: {f}, Aligned at:  {at}"
+            )
+        };
+        assert_eq!(multilevel_key(&name("1.", "0")), Some("outline"));
+        assert_eq!(multilevel_key(&name("1.", "0.25")), Some("numbered"));
+        assert_eq!(multilevel_key(&name("1)", "0")), Some("numberedParen"));
+        assert_eq!(multilevel_key(&name("1", "0")), Some("outlinePlain"));
+        assert_eq!(multilevel_key(&name("I.", "0")), Some("outlineRoman"));
+        assert!(
+            !aligned_at_zero("aligned at: 0.25")
+                && aligned_at_zero("aligned at:  0")
+                && !aligned_at_zero("x")
+        );
     }
 
     #[test]
@@ -4657,7 +5417,6 @@ mod pane_tests {
         s.notices.clear();
         let r = s.run("format.multilevel", &json!({"filter": "current"})).unwrap();
         assert!(r["shown"].as_array().unwrap().is_empty(), "not in a list yet");
-        assert!(s.notices.iter().any(|n| matches!(n, Notice::OpenDialog(d, _) if d == "multilevelGallery")));
         let r = s.run("format.multilevel", &json!({"filter": "library"})).unwrap();
         assert_eq!(r["library"].as_array().unwrap().len(), MULTILEVEL_LIBRARY.len());
         // Define New List Style: saved under its name, applied, then listed and reusable by name.
@@ -4695,6 +5454,39 @@ mod pane_tests {
         // (Only the AutoText entries every profile starts with: the user's name and initials.)
         let entries = listed.unwrap()["entries"].as_array().unwrap().clone();
         assert!(entries.iter().all(|e| e["gallery"] == "autoText"), "{entries:?}");
+    }
+
+    #[test]
+    fn selection_pane_renames_and_reorders_objects() {
+        let (mut s, id) = with_text("ab");
+        sel(&mut s, (&[0], 1), (&[0], 1));
+        s.run("format.paste", &json!({"image": b64(PNG)})).unwrap();
+        s.run("insert.shape", &json!({"kind": "oval", "x": 0, "y": 0})).unwrap();
+        s.run("insert.textBox", &json!({"text": "Note", "x": 200, "y": 0})).unwrap();
+        let names = |s: &Session| -> Vec<String> {
+            pane_objects(&s.composes[&id]).into_iter().map(|o| o.name).collect()
+        };
+        let before = names(&s);
+        assert_eq!(before.len(), 3, "{before:?}");
+        // Rename: the pane shows the new name; an empty name gives the old one back.
+        let r = s.run("format.selectionPane", &json!({"rename": 0, "name": "Logo"})).unwrap();
+        assert_eq!(r["name"], "Logo");
+        assert_eq!(names(&s)[0], "Logo");
+        s.run("format.selectionPane", &json!({"rename": 0, "name": ""})).unwrap();
+        assert_eq!(names(&s)[0], before[0]);
+        assert!(s.run("format.selectionPane", &json!({"rename": 9, "name": "x"})).is_err());
+        // Reorder: the front drawing goes back one step.
+        let front = pane_objects(&s.composes[&id])[1].drawing;
+        let r = s.run("format.selectionPane", &json!({"move": 1, "dir": "backward"})).unwrap();
+        assert_eq!(r["index"], 2);
+        assert_eq!(pane_objects(&s.composes[&id])[2].drawing, front);
+        s.run("format.selectionPane", &json!({"move": 2, "dir": "forward"})).unwrap();
+        assert_eq!(pane_objects(&s.composes[&id])[1].drawing, front);
+        assert!(
+            s.run("format.selectionPane", &json!({"move": 0, "dir": "forward"})).is_err(),
+            "a picture in the text"
+        );
+        assert!(s.run("format.selectionPane", &json!({"move": 1, "dir": "sideways"})).is_err());
     }
 
     #[test]
@@ -5083,17 +5875,40 @@ mod dialog_tests {
     fn style_sets_can_be_the_default_and_saved_under_a_name() {
         let (mut s, id) = with_text("Body");
         s.run("format.styleSet", &json!({"name": "Shaded", "paragraphSpacing": "open"})).unwrap();
+        s.run("compose.theme", &json!({"name": "Slice"})).unwrap();
+        // Set as Default asks first; nothing changes until it is confirmed.
+        s.notices.clear();
         let r = s.run("format.styleSet", &json!({"action": "setDefault"})).unwrap();
+        assert_eq!(r["dialog"], "confirm");
+        let (name, d) = last_dialog(&s).unwrap();
+        assert_eq!((name.as_str(), d["command"].as_str()), ("confirm", Some("format.styleSet")));
+        assert!(
+            d["text"].as_str().unwrap().contains("Shaded") && d["text"].as_str().unwrap().contains("Slice")
+        );
+        assert_eq!(s.settings.text(DEFAULT_STYLE_SET_KEY), "");
+        let r = s.run("format.styleSet", &d["params"]).unwrap();
         assert_eq!((r["default"].as_str(), r["paragraphSpacing"].as_str()), (Some("Shaded"), Some("open")));
+        assert_eq!(r["theme"], "Slice");
         assert_eq!(s.settings.text(DEFAULT_STYLE_SET_KEY), "Shaded");
-        // A new message starts with it, unchanged (no save prompt).
+        // A new message starts with it and the theme, unchanged (no save prompt).
         let other = open(&mut s);
         let c = &s.composes[&other];
         assert_eq!(
             (c.style_set.as_deref(), c.paragraph_spacing_preset.as_deref()),
             (Some("Shaded"), Some("open"))
         );
+        assert_eq!(c.theme.name.as_deref(), Some("Slice"));
         assert!(!c.dirty);
+        assert_eq!(c.para_at_caret().line_height, Some(1.15));
+        // Reset to the Default Style Set goes back to the default chosen here, not the built-in one.
+        s.run(
+            "format.styleSet",
+            &json!({"compose": other, "name": "Basic (Simple)", "paragraphSpacing": "double"}),
+        )
+        .unwrap();
+        s.run("format.styleSet", &json!({"compose": other, "action": "reset"})).unwrap();
+        let c = &s.composes[&other];
+        assert_eq!(c.style_set.as_deref(), Some("Shaded"));
         assert_eq!(c.para_at_caret().line_height, Some(1.15));
         // Save as a New Style Set: the dialog first, then the name.
         s.run("format.styleSet", &json!({"compose": id, "action": "save"})).unwrap();
@@ -5163,7 +5978,9 @@ mod dialog_tests {
         let ps = s.composes[&other].para_at_caret();
         assert_eq!((ps.space_before_px, ps.space_after_px, ps.line_height), (4.0, 12.0, Some(1.5)));
         // Set as Default: new messages start with them.
-        let r = s.run("format.styleSet", &json!({"compose": id, "action": "setDefault"})).unwrap();
+        let r = s
+            .run("format.styleSet", &json!({"compose": id, "action": "setDefault", "confirm": true}))
+            .unwrap();
         assert_eq!(r["paragraphSpacing"], "custom:3,9,1.5");
         let third = open(&mut s);
         let ps = s.composes[&third].para_at_caret();
@@ -5190,7 +6007,8 @@ mod dialog_tests {
     #[test]
     fn shading_button_reuses_the_last_colour_and_references_use_small_caps() {
         let (mut s, id) = with_text("shade me");
-        assert_eq!(s.run("format.shading", &json!({})).unwrap()["dialog"], "bordersAndShading");
+        assert_eq!(s.run("format.shading", &json!({})).unwrap()["shading"], "#000000");
+        assert_eq!(s.run("format.shading", &json!({"dialog": true})).unwrap()["dialog"], "bordersAndShading");
         s.run("format.shading", &json!({"color": "#ccddee"})).unwrap();
         s.run("format.shading", &json!({"color": null})).unwrap();
         assert_eq!(s.composes[&id].para_at_caret().background, None);

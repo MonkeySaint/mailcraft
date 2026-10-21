@@ -631,7 +631,7 @@ fn browse_and_save_as_use_the_platform_hooks() {
     let c = compose(&h, cid);
     assert_eq!(c.attachments.first().map(|a| a.data.clone()), Some(b"picked bytes".to_vec()));
     let picked = dir.join("picked.txt").to_string_lossy().into_owned();
-    assert!(recent_files().contains(&picked));
+    assert!(recent_files(h.state()).contains(&picked));
     // A recent file attaches by path.
     assert!(ribbon_command(&ctx, h.state_mut(), cid, "compose.attachFile", &json!({"path": picked})));
     assert_eq!(compose(&h, cid).attachments.len(), 2);
@@ -674,7 +674,7 @@ fn files_dropped_on_the_window_become_attachments() {
     let c = compose(&h, cid);
     assert_eq!(c.attachments.len(), 1);
     assert_eq!(c.attachments[0].filename, "dropped notes.txt");
-    assert!(recent_files().contains(&path.to_string_lossy().into_owned()));
+    assert!(recent_files(h.state()).contains(&path.to_string_lossy().into_owned()));
 
     // A drop without a full path (a name only) attaches the bytes the drop carries.
     h.input_mut().dropped_files.push(std::sync::Arc::new(TestDrop(
@@ -1329,17 +1329,102 @@ fn insert_3d_model_and_gallery_filter_open_their_windows() {
     h.get_by_label("Cancel").click();
     h.run();
     assert!(h.state().ui.dialogs.is_empty());
-    // Multilevel List › Gallery Filter › List Library: the library as a picker; a pick applies it.
+    // Multilevel List › Gallery Filter › List Library: the gallery filters in place, no picker window.
     let app = h.state_mut();
     app.run("compose.insertText", json!({"compose": cid, "text": "item"})).unwrap();
     app.run("format.multilevel", json!({"compose": cid, "filter": "library"})).unwrap();
     crate::dialogs::take_notices(app);
     h.run();
-    h.get_by_label("Multilevel List: List Library");
-    h.get_by_label("1. 1.1. 1.1.1.").click();
-    h.run();
-    assert!(compose(&h, cid).list_at_caret().is_some());
     assert!(h.state().ui.dialogs.is_empty());
+    assert_eq!(compose(&h, cid).editor.list_gallery_filter, "library");
+}
+
+#[test]
+fn apply_styles_is_a_pane_that_stays_open() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "alpha beta"})).unwrap();
+    app.run("format.stylesPane", json!({"compose": cid, "apply": true})).unwrap();
+    select_range(&mut app, cid, 0, 0);
+    let mut h = full_harness(app);
+    h.run();
+    h.run();
+    h.get_by_label(super::panes::APPLY_STYLES_TITLE);
+    // The box follows the style at the cursor; Reapply applies it again and the pane stays.
+    h.get_by_label("Reapply").click();
+    h.run();
+    h.get_by_label(super::panes::APPLY_STYLES_TITLE);
+    // Modify... opens Modify Style for the style.
+    h.get_by_label("Modify...").click();
+    h.run();
+    crate::dialogs::take_notices(h.state_mut());
+    h.run();
+    h.run();
+    h.get_by_label("Modify Style: Normal");
+    h.get_by_label("Cancel").click();
+    h.run();
+    // The Styles button shows the Styles pane next to it.
+    h.get_by_label("Styles pane").click();
+    h.run();
+    assert!(compose(&h, cid).editor.styles_pane);
+    assert!(compose(&h, cid).editor.apply_styles, "still open");
+}
+
+#[test]
+fn modify_style_dialog_changes_the_style() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "alpha"})).unwrap();
+    select_range(&mut app, cid, 0, 5);
+    app.run("format.style", json!({"compose": cid, "name": "Heading 2", "action": "define"})).unwrap();
+    crate::dialogs::take_notices(&mut app);
+    let mut h = full_harness(app);
+    h.run();
+    h.run();
+    h.get_by_label("Modify Style: Heading 2");
+    h.get_by_role_and_label(Role::CheckBox, "Italic").click();
+    h.get_by_label("Apply the changed style to the selection").click();
+    h.run();
+    h.get_by_label("OK").click();
+    h.run();
+    h.run();
+    let c = compose(&h, cid);
+    assert!(c.custom_styles.iter().any(|x| x.name == "Heading 2" && x.style.italic == Some(true)));
+    assert_eq!(c.style_at_caret().italic, Some(true));
+    // Regression: only what was changed is stored; the font, size and spacing the style left to the theme
+    // stay unset (OK used to write the dialog's defaults into the style).
+    let x = c.custom_styles.iter().find(|x| x.name == "Heading 2").unwrap();
+    assert_eq!((x.style.font_family.as_deref(), x.style.size_pt, x.para.line_height), (None, None, None));
+    assert_eq!((x.style.bold, x.style.underline), (None, None));
+    assert!(matches!(c.body.blocks.first(), Some(mailcraft_model::Block::Heading { level: 2, .. })));
+}
+
+/// OK without a change leaves the style as it was (no created definition).
+#[test]
+fn modify_style_dialog_ok_without_changes_keeps_the_style() {
+    let (mut app, cid) = app_with_compose(false);
+    app.run("compose.insertText", json!({"compose": cid, "text": "alpha"})).unwrap();
+    app.run("format.style", json!({"compose": cid, "name": "Normal", "action": "define"})).unwrap();
+    crate::dialogs::take_notices(&mut app);
+    let mut h = full_harness(app);
+    h.run();
+    h.run();
+    h.get_by_label("Modify Style: Normal");
+    h.get_by_label("OK").click();
+    h.run();
+    h.run();
+    assert!(compose(&h, cid).custom_styles.is_empty());
+}
+
+#[test]
+fn apply_styles_suggests_names_while_typing() {
+    let names: Vec<String> = ["Normal", "No Spacing", "Heading 1", "Subtle Emphasis", "Emphasis"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert_eq!(super::panes::style_suggestions(&names, "no"), ["Normal", "No Spacing"]);
+    assert_eq!(super::panes::style_suggestions(&names, "n"), ["Normal", "No Spacing", "Heading 1"]);
+    assert_eq!(super::panes::style_suggestions(&names, "emph"), ["Emphasis", "Subtle Emphasis"]);
+    assert!(super::panes::style_suggestions(&names, "").is_empty());
+    assert!(super::panes::style_suggestions(&names, "normal").is_empty(), "an exact name needs no list");
 }
 
 #[test]

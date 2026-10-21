@@ -7,7 +7,8 @@
 
 use serde_json::{Value, json};
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::compose::{
     commit_extras, compose_id, compose_mut, has_compose, pos_json, pos_param, rich_compose, spec,
@@ -17,6 +18,7 @@ use crate::compose::{ComposeState, DocPos, SpellIssue, TextIssue};
 use crate::settings::Settings;
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_model::{Doc, ItemId};
+use mailcraft_proof::hunspell::{DictionaryFile, Hunspell};
 use mailcraft_proof::{IssueKind, Refinements, SpellOptions, Speller};
 
 mod accessibility;
@@ -63,13 +65,157 @@ const SUGGEST_FIRST: usize = 50;
 
 static BASE_SPELLER: OnceLock<Speller> = OnceLock::new();
 
-/// The session's speller: bundled US English plus the custom dictionary (File › Options › Mail › Editor
-/// Options › Custom Dictionaries), checking with the Editor Options proofing settings ([`spell_options`]).
+/// The session's English speller: bundled US English plus the custom dictionary (File › Options › Mail ›
+/// Editor Options › Custom Dictionaries), checking with the Editor Options proofing settings
+/// ([`spell_options`]).
 pub fn speller(s: &Session) -> Speller {
-    let mut sp = BASE_SPELLER.get_or_init(Speller::bundled_en_us).clone();
+    speller_for(s, None)
+}
+
+/// The speller for proofing language `lang`: English (any variety, or no language) uses the bundled lists;
+/// another language uses the matching dictionary installed on the computer ([`installed_dictionaries`]),
+/// falling back to English when there is none (such a message is not checked, see [`proofing_off`]).
+pub fn speller_for(s: &Session, lang: Option<&str>) -> Speller {
+    speller_with(s, lang, true)
+}
+
+/// [`speller_for`], reading an installed dictionary now (`wait`) or in the background: until it is read the
+/// speller is the English one and a message in that language is not checked ([`proofing_off`]).
+fn speller_with(s: &Session, lang: Option<&str>, wait: bool) -> Speller {
+    let mut sp = match lang.filter(|l| !is_english(l)).and_then(|l| hunspell_for(s, l, wait)) {
+        Some(h) => Speller::from_hunspell(h),
+        None => BASE_SPELLER.get_or_init(Speller::bundled_en_us).clone(),
+    };
     sp.set_user_words(s.mailbox.custom_dictionary.iter());
     sp.set_options(spell_options(&s.settings));
     sp
+}
+
+/// The speller for compose `cid`'s proofing language (an installed dictionary is read first if need be:
+/// for F7, the check before sending and other checks asked for).
+pub fn compose_speller(s: &Session, cid: u64) -> Speller {
+    let lang = s.composes.get(&cid).and_then(|c| c.language.clone());
+    speller_for(s, lang.as_deref())
+}
+
+/// The speller for checking compose `cid` as you type: never waits for an installed dictionary to be read
+/// (a large one takes a while); it is read in the background and the body is checked again once it is.
+pub fn compose_speller_live(s: &Session, cid: u64) -> Speller {
+    let lang = s.composes.get(&cid).and_then(|c| c.language.clone());
+    speller_with(s, lang.as_deref(), false)
+}
+
+/// Settings key: a folder searched for Hunspell-format dictionaries (`.dic` + `.aff`) before the system's.
+pub const DICTIONARY_FOLDER: &str = "mail.editor.dictionaryFolder";
+
+/// Folders searched for dictionaries: the one set in Editor Options, then the platform's.
+fn dictionary_dirs(s: &Session) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let own = s.settings.text(DICTIONARY_FOLDER);
+    if !own.trim().is_empty() {
+        dirs.push(std::path::PathBuf::from(own.trim()));
+    }
+    dirs.extend(mailcraft_proof::hunspell::dictionary_dirs());
+    dirs
+}
+
+type Listings = HashMap<Vec<std::path::PathBuf>, Arc<Vec<DictionaryFile>>>;
+/// An installed dictionary: being read in the background (with its language tag), or read (`None` when it
+/// could not be).
+#[derive(Clone)]
+enum Slot {
+    Loading(String),
+    Ready(Option<Arc<Hunspell>>),
+}
+type Loaded = HashMap<std::path::PathBuf, Slot>;
+static LISTINGS: Mutex<Option<Listings>> = Mutex::new(None);
+static LOADED: Mutex<Option<Loaded>> = Mutex::new(None);
+/// Counts dictionaries read in the background: checks made while one was being read are redone after.
+static DICTIONARY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The Hunspell-format dictionaries installed on this computer (and in the Editor Options folder), listed
+/// once per process for each set of folders.
+pub fn installed_dictionaries(s: &Session) -> Arc<Vec<DictionaryFile>> {
+    let dirs = dictionary_dirs(s);
+    let Ok(mut guard) = LISTINGS.lock() else {
+        return Arc::new(mailcraft_proof::hunspell::find_dictionaries(&dirs));
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(found) = map.get(&dirs) {
+        return Arc::clone(found);
+    }
+    let found = Arc::new(mailcraft_proof::hunspell::find_dictionaries(&dirs));
+    map.insert(dirs, Arc::clone(&found));
+    found
+}
+
+/// Reads an installed dictionary (`None` when it cannot be read).
+fn read_dictionary(file: &DictionaryFile) -> Option<Arc<Hunspell>> {
+    match Hunspell::load(&file.aff, &file.dic) {
+        Ok(mut h) => {
+            h.language = file.tag.clone();
+            Some(Arc::new(h))
+        }
+        Err(e) => {
+            log::warn!("dictionary {} not loaded: {e}", file.dic.display());
+            None
+        }
+    }
+}
+
+/// Keeps a dictionary read and tells checks made without it to run again.
+fn store_dictionary(dic: &std::path::Path, h: Option<Arc<Hunspell>>) {
+    if let Ok(mut guard) = LOADED.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(dic.to_owned(), Slot::Ready(h));
+    }
+    DICTIONARY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The installed dictionary for `lang`, read on first use (once per process); `None` when there is none or
+/// it cannot be read. Without `wait`, a dictionary not read yet is read on a background thread and `None`
+/// is returned until it is (where threads cannot be started it is read here).
+fn hunspell_for(s: &Session, lang: &str, wait: bool) -> Option<Arc<Hunspell>> {
+    let found = installed_dictionaries(s);
+    let file = mailcraft_proof::hunspell::dictionary_for(&found, lang)?.clone();
+    {
+        let mut guard = LOADED.lock().ok()?;
+        let map = guard.get_or_insert_with(HashMap::new);
+        match map.get(&file.dic) {
+            Some(Slot::Ready(h)) => return h.clone(),
+            Some(Slot::Loading(_)) if !wait => return None,
+            None if !wait => {
+                map.insert(file.dic.clone(), Slot::Loading(file.tag.clone()));
+                let bg = file.clone();
+                let started =
+                    std::thread::Builder::new().name("mailcraft-dictionary".into()).spawn(move || {
+                        let h = read_dictionary(&bg);
+                        store_dictionary(&bg.dic, h);
+                    });
+                if started.is_ok() {
+                    return None;
+                }
+            }
+            // Asked to wait (or no thread could start): read it here, outside the lock.
+            _ => {}
+        }
+    }
+    let h = read_dictionary(&file);
+    store_dictionary(&file.dic, h.clone());
+    h
+}
+
+/// Whether the installed dictionary for `lang` is being read in the background.
+fn dictionary_loading(lang: &str) -> bool {
+    let primary = |t: &str| t.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    let want = primary(lang);
+    LOADED.lock().is_ok_and(|g| {
+        g.as_ref().is_some_and(|m| m.values().any(|v| matches!(v, Slot::Loading(t) if primary(t) == want)))
+    })
+}
+
+fn is_english(lang: &str) -> bool {
+    let l = lang.trim().to_ascii_lowercase();
+    l == "en" || l.starts_with("en-")
 }
 
 /// Whether Writing Style is "Grammar & Refinements" (else "Grammar": no refinements are checked).
@@ -176,6 +322,8 @@ fn options_key(o: &SpellOptions) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     o.hash(&mut h);
+    // A dictionary read in the background since makes the last check out of date too.
+    DICTIONARY_GENERATION.load(std::sync::atomic::Ordering::SeqCst).hash(&mut h);
     h.finish() | 1
 }
 
@@ -210,7 +358,7 @@ pub fn text_issues(sp: &Speller, text: &str) -> Vec<TextIssue> {
 /// it re-checked.
 /// A check under other proofing options (Options changed since) is always redone.
 pub fn spell_check(sp: &Speller, c: &mut ComposeState, force: bool, min_edits: u64) -> bool {
-    if proofing_off(c).is_some() {
+    if proofing_off(sp, c).is_some() {
         // Not checked: no squiggles, nothing for F7.
         let had = !c.spell_issues.is_empty();
         c.spell_issues.clear();
@@ -260,7 +408,7 @@ pub fn grammar_mode(s: &Session) -> bool {
 
 /// Checks the target compose (when stale) and returns it.
 fn checked<'a>(s: &'a mut Session, p: &Value) -> Result<(&'a mut ComposeState, Speller), CmdError> {
-    let sp = speller(s);
+    let sp = compose_speller(s, compose_id(s, p)?);
     let force = opt_bool(p, "force") == Some(true);
     let c = compose_mut(s, p)?;
     spell_check(&sp, c, force, 1);
@@ -321,7 +469,7 @@ fn spelling(s: &mut Session, p: &Value) -> CmdResult {
         "grammar": grammar,
         "wordsChecked": words,
         "language": c.language.clone().unwrap_or_else(|| "en-US".into()),
-        "notChecked": proofing_off(c),
+        "notChecked": proofing_off(&sp, c),
     }))
 }
 
@@ -331,7 +479,7 @@ const MAX_DRAWING_ISSUES: usize = 200;
 /// Spelling (and with `grammar`, grammar) issues in the text of the compose's text boxes, shapes and WordArt:
 /// `[{drawing, word, kind, suggestions}]`, in drawing order.
 fn drawing_spelling(sp: &Speller, c: &ComposeState, grammar: bool) -> Vec<Value> {
-    if proofing_off(c).is_some() {
+    if proofing_off(sp, c).is_some() {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -436,7 +584,7 @@ fn editor(s: &mut Session, p: &Value) -> CmdResult {
         "selected": selected,
         "words": words,
         "language": c.language.clone().unwrap_or_else(|| "en-US".into()),
-        "notChecked": proofing_off(c),
+        "notChecked": proofing_off(&sp, c),
     }))
 }
 
@@ -588,28 +736,43 @@ pub(crate) fn valid_lang(tag: &str) -> bool {
         })
 }
 
-/// Languages the bundled dictionary checks (US English word lists; other English variants use them too).
-pub fn has_dictionary(lang: &str) -> bool {
-    let l = lang.trim().to_ascii_lowercase();
-    l == "en" || l.starts_with("en-")
+/// Whether spelling in `lang` is checked: English (the bundled US English lists; other English varieties
+/// use them too) or a language with a dictionary installed on the computer.
+pub fn has_dictionary(s: &Session, lang: &str) -> bool {
+    is_english(lang) || mailcraft_proof::hunspell::dictionary_for(&installed_dictionaries(s), lang).is_some()
+}
+
+/// Where a language's dictionary comes from, for the Language dialog: "MailCraft" (bundled English), the
+/// installed dictionary's tag ("fr-FR"), or `None` when there is none.
+pub fn dictionary_source(s: &Session, lang: &str) -> Option<String> {
+    if is_english(lang) {
+        return Some("MailCraft".into());
+    }
+    mailcraft_proof::hunspell::dictionary_for(&installed_dictionaries(s), lang).map(|d| d.tag.clone())
 }
 
 /// Why the message's spelling is not checked: "Do not check spelling or grammar", or a proofing language
-/// without a bundled dictionary.
-pub fn proofing_off(c: &ComposeState) -> Option<String> {
+/// with no dictionary on this computer (`sp` is the compose's speller, [`compose_speller`]: English when
+/// no dictionary for the language was found).
+pub fn proofing_off(sp: &Speller, c: &ComposeState) -> Option<String> {
     if c.no_proof {
         return Some("Spelling and grammar are not checked in this message.".into());
     }
     match c.language.as_deref() {
-        Some(l) if !has_dictionary(l) => {
-            Some(format!("There is no dictionary for {l}; spelling is not checked."))
-        }
+        Some(l) if !is_english(l) && sp.language().is_none() && dictionary_loading(l) => Some(format!(
+            "The {l} dictionary is still being read; spelling is checked as soon as it is ready."
+        )),
+        Some(l) if !is_english(l) && sp.language().is_none() => Some(format!(
+            "There is no dictionary for {l} on this computer; spelling is not checked. Install a Hunspell \
+             dictionary for it, or add a dictionary folder in Editor Options."
+        )),
         _ => None,
     }
 }
 
 /// Set Proofing Language: the message's language (sent as Content-Language, RFC 3282) and whether spelling
-/// is checked. Languages without a bundled dictionary are not spell-checked.
+/// is checked. English uses the bundled dictionary, other languages a dictionary installed on the computer;
+/// a language with neither is not spell-checked (the result and a notice say so).
 fn language(s: &mut Session, p: &Value) -> CmdResult {
     let no_proof = opt_bool(p, "noProof");
     let Some(lang) = opt_str(p, "lang").map(str::to_owned) else {
@@ -622,15 +785,18 @@ fn language(s: &mut Session, p: &Value) -> CmdResult {
         let cid = compose_id(s, p)?;
         let (current, off) =
             s.composes.get(&cid).map(|c| (c.language.clone(), c.no_proof)).unwrap_or_default();
+        let installed: Vec<String> = installed_dictionaries(s).iter().map(|d| d.tag.clone()).collect();
         return dialog(
             s,
             "language",
-            json!({"compose": cid, "lang": current.unwrap_or_else(|| "en-US".into()), "noProof": off}),
+            json!({"compose": cid, "lang": current.unwrap_or_else(|| "en-US".into()), "noProof": off,
+                   "dictionaries": installed}),
         );
     };
     if !valid_lang(&lang) {
         return Err(CmdError::Params(format!("`{lang}` is not a language tag (e.g. en-US)")));
     }
+    let dictionary = has_dictionary(s, &lang);
     let c = compose_mut(s, p)?;
     c.language = Some(lang.clone());
     if let Some(off) = no_proof {
@@ -639,8 +805,18 @@ fn language(s: &mut Session, p: &Value) -> CmdResult {
     // Check again under the new language.
     c.spell_rev = None;
     c.dirty = true;
+    let no_proof_now = c.no_proof;
+    let cid = compose_id(s, p)?;
+    let sp = compose_speller(s, cid);
+    let why = s.composes.get(&cid).and_then(|c| proofing_off(&sp, c));
+    let checked = why.is_none();
+    if !dictionary && !no_proof_now {
+        s.notify(crate::Notice::Info(format!(
+            "No {lang} dictionary on this computer: spelling is not checked."
+        )));
+    }
     Ok(
-        json!({"language": lang, "noProof": c.no_proof, "dictionary": has_dictionary(&lang), "checked": proofing_off(c).is_none()}),
+        json!({"language": lang, "noProof": no_proof_now, "dictionary": dictionary, "checked": checked, "notChecked": why}),
     )
 }
 
@@ -1008,11 +1184,11 @@ mod tests {
         assert!(issue["suggestions"].as_array().unwrap().iter().any(|v| v == "the"), "{issue}");
         assert_eq!(r["language"], "en-US");
         // A language without a dictionary is not checked; Do not check spelling turns it off too.
-        let r = s.run("review.language", &json!({"lang": "fr-CA"})).unwrap();
+        let r = s.run("review.language", &json!({"lang": "qaa-QM"})).unwrap();
         assert_eq!((r["dictionary"].as_bool(), r["checked"].as_bool()), (Some(false), Some(false)));
         let r = s.run("review.spelling", &json!({})).unwrap();
         assert_eq!(r["count"], 0);
-        assert!(r["notChecked"].as_str().unwrap().contains("fr-CA"));
+        assert!(r["notChecked"].as_str().unwrap().contains("qaa-QM"));
         s.run("review.language", &json!({"lang": "en-GB"})).unwrap();
         assert_eq!(
             s.run("review.spelling", &json!({})).unwrap()["count"],
@@ -1272,6 +1448,76 @@ mod tests {
 
     fn set(s: &mut Session, key: &str, v: Value) {
         s.run("options.set", &json!({"key": key, "value": v})).unwrap();
+    }
+
+    #[test]
+    fn other_languages_use_installed_dictionaries() {
+        // A synthetic Hunspell-format dictionary in the Editor Options folder stands in for an installed one.
+        let dir = std::env::temp_dir().join(format!("mailcraft-review-dict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("qab_QB.aff"), "SET UTF-8\nSFX S Y 1\nSFX S 0 s .\n").unwrap();
+        std::fs::write(dir.join("qab_QB.dic"), "4\nbonjour/S\nmonde/S\nchat/S\nle\n").unwrap();
+        let mut s = session();
+        let id = open(&mut s);
+        set(&mut s, DICTIONARY_FOLDER, json!(dir.to_string_lossy()));
+        s.run("compose.insertText", &json!({"text": "Bonjour le mondes, le chta. Their is."})).unwrap();
+        let r = s.run("review.language", &json!({"lang": "qab-QB"})).unwrap();
+        assert_eq!((r["dictionary"].as_bool(), r["checked"].as_bool()), (Some(true), Some(true)), "{r}");
+        assert!(has_dictionary(&s, "qab") && dictionary_source(&s, "qab-XX").as_deref() == Some("qab-QB"));
+        let r = s.run("review.spelling", &json!({"grammar": true})).unwrap();
+        let spelled = words(&r, "spelling");
+        assert_eq!(spelled, ["chta", "Their", "is"], "{r}");
+        let chta = r["issues"].as_array().unwrap().iter().find(|i| i["word"] == "chta").unwrap();
+        assert!(chta["suggestions"].as_array().unwrap().iter().any(|v| v == "chat"), "{chta}");
+        // English grammar rules do not run on another language.
+        assert!(words(&r, "agreement").is_empty() && words(&r, "confused").is_empty(), "{r}");
+        assert_eq!(compose_speller(&s, id).language(), Some("qab-QB"));
+        // The language dialog lists the installed dictionary's language.
+        s.run("review.language", &json!({})).unwrap();
+        let d = crate::cmd::insert::tests::last_dialog(&s);
+        assert!(d["dictionaries"].as_array().unwrap().iter().any(|t| t == "qab-QB"), "{d}");
+        // A language with no dictionary says so, in the result and as a notice.
+        s.notices.clear();
+        let r = s.run("review.language", &json!({"lang": "qaa"})).unwrap();
+        assert_eq!(r["checked"], false);
+        assert!(r["notChecked"].as_str().unwrap().contains("no dictionary for qaa"), "{r}");
+        assert!(s.notices.iter().any(|n| matches!(n, Notice::Info(t) if t.contains("qaa"))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: checking as you type never waits for an installed dictionary to be read (a large one
+    /// froze the editor on first use); it is read in the background and the body is checked once it is.
+    #[test]
+    fn live_checking_reads_installed_dictionaries_in_the_background() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let tmp = tempfile::tempdir_in(base).unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("qac_QC.aff"), "SET UTF-8\nSFX S Y 1\nSFX S 0 s .\n").unwrap();
+        std::fs::write(dir.join("qac_QC.dic"), "3\nbonjour/S\nmonde/S\nchat/S\n").unwrap();
+        let mut s = session();
+        let id = open(&mut s);
+        set(&mut s, DICTIONARY_FOLDER, json!(dir.to_string_lossy()));
+        s.run("compose.insertText", &json!({"text": "Bonjour chta"})).unwrap();
+        s.composes.get_mut(&id).unwrap().language = Some("qac-QC".into());
+        // The first live speller is the English stand-in: the message is not checked meanwhile.
+        let sp = compose_speller_live(&s, id);
+        assert_eq!(sp.language(), None);
+        let c = s.composes.get_mut(&id).unwrap();
+        spell_check(&sp, c, true, 1);
+        assert!(c.spell_issues.is_empty(), "nothing is flagged in the wrong language");
+        let started = std::time::Instant::now();
+        while compose_speller_live(&s, id).language().is_none() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(30), "the dictionary was never read");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Once read, the body is out of date and the next live check uses the dictionary.
+        assert!(spelling_stale(&s, &s.composes[&id]));
+        let sp = compose_speller_live(&s, id);
+        let c = s.composes.get_mut(&id).unwrap();
+        spell_check(&sp, c, false, 1);
+        let flagged: Vec<&str> = c.spell_issues.iter().map(|i| i.word.as_str()).collect();
+        assert_eq!(flagged, ["chta"]);
     }
 
     fn words(r: &Value, kind: &str) -> Vec<String> {

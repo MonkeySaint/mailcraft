@@ -220,12 +220,34 @@ fn paint_check(ui: &Ui, app: &mut App, rect: Rect, on: bool, color: Color32) {
 }
 
 /// Paints a button's content (background drawn separately).
+/// Where a control's icon is drawn.
+fn icon_rect(rect: Rect, look: &Look<'_>) -> Rect {
+    if look.large {
+        return Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 21.0), Vec2::splat(32.0));
+    }
+    let has_label = look.label.is_some_and(|l| !l.is_empty());
+    let icon_x = if has_label || look.arrow { rect.left() + 14.0 } else { rect.center().x };
+    Rect::from_center_size(Pos2::new(icon_x, rect.center().y), Vec2::splat(16.0))
+}
+
+/// The colour bar under the icon of Text Highlight Color, Font Color and Shading: the colour the button
+/// face applies.
+fn paint_face_bar(ui: &Ui, rect: Rect, look: &Look<'_>, color: [u8; 3], enabled: bool) {
+    let icon = icon_rect(rect, look);
+    let h = if look.large { 4.0 } else { 3.0 };
+    let bar =
+        Rect::from_min_size(Pos2::new(icon.left(), icon.bottom() - h + 1.0), Vec2::new(icon.width(), h));
+    let [r, g, b] = color;
+    let c = Color32::from_rgb(r, g, b);
+    ui.painter().rect_filled(bar, CornerRadius::ZERO, if enabled { c } else { c.gamma_multiply(0.4) });
+}
+
 fn paint_look(ui: &Ui, app: &mut App, rect: Rect, look: Look<'_>) {
     let base = app.theme.text;
     let color = if look.enabled { base } else { muted(base) };
     let painter = ui.painter().clone();
     if look.large {
-        let icon_r = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 21.0), Vec2::splat(32.0));
+        let icon_r = icon_rect(rect, &look);
         if look.check {
             paint_check(ui, app, icon_r, look.on, color);
         } else {
@@ -259,15 +281,7 @@ fn paint_look(ui: &Ui, app: &mut App, rect: Rect, look: Look<'_>) {
             }
         }
     } else {
-        let has_label = look.label.is_some_and(|l| !l.is_empty());
-        let icon_x = if has_label {
-            rect.left() + 6.0 + 8.0
-        } else if look.arrow {
-            rect.left() + 14.0
-        } else {
-            rect.center().x
-        };
-        let icon_r = Rect::from_center_size(Pos2::new(icon_x, rect.center().y), Vec2::splat(16.0));
+        let icon_r = icon_rect(rect, &look);
         if look.check {
             paint_check(ui, app, icon_r, look.on, color);
         } else {
@@ -387,7 +401,57 @@ fn menu_row(
     enabled: bool,
     sub: bool,
 ) -> Response {
-    let tw = text_w(ui, label, TEXT);
+    menu_row_in(ui, app, icon, swatch, label, on, enabled, sub, egui::FontFamily::Proportional)
+}
+
+/// Whether running `action` from a menu leaves the menu open (Multilevel List › Gallery Filter).
+pub fn keeps_menu_open(action: &Action) -> bool {
+    action.cmd == "format.multilevel" && action.params.get("filter").is_some()
+}
+
+/// A section heading inside a menu (a gallery's "List Library").
+fn menu_heading(ui: &mut Ui, app: &App, label: &str) {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width().max(120.0), 22.0), Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, app.theme.hover.gamma_multiply(0.5));
+    ui.painter().text(
+        Pos2::new(rect.left() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::new(TEXT, crate::ui_semibold()),
+        app.theme.text,
+    );
+}
+
+/// The font a menu entry previews: a Font list entry (`format.font` with a `name`) shows in its own face
+/// once its row is on screen.
+fn entry_face(ui: &Ui, action: &Action) -> Option<egui::FontFamily> {
+    if action.cmd != "format.font" {
+        return None;
+    }
+    let name = action.params.get("family").and_then(serde_json::Value::as_str)?;
+    let row = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width().max(40.0), 24.0));
+    if !ui.is_rect_visible(row) {
+        return None;
+    }
+    crate::body::preview_family(ui.ctx(), name)
+}
+
+/// [`menu_row`] with its label drawn in `family`.
+fn menu_row_in(
+    ui: &mut Ui,
+    app: &mut App,
+    icon: &str,
+    swatch: Option<[u8; 3]>,
+    label: &str,
+    on: Option<bool>,
+    enabled: bool,
+    sub: bool,
+    family: egui::FontFamily,
+) -> Response {
+    let font = FontId::new(TEXT, family);
+    let tw = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE).size().x;
     let want = 34.0 + tw + 34.0;
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width().max(want), 24.0),
@@ -432,7 +496,7 @@ fn menu_row(
         Pos2::new(rect.left() + 30.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(TEXT),
+        font,
         color,
     );
     if sub {
@@ -556,7 +620,12 @@ fn menu_entries(ui: &mut Ui, app: &mut App, cx: &mut Cx, entries: &[Resolved], d
                 menu_grid(ui, app, cx, (*cols, *rows), *disabled, cmd)
             }
             Resolved::Cmd { label, icon, swatch, on, disabled, action, key } => {
-                let resp = menu_row(ui, app, icon, *swatch, label, *on, disabled.is_none(), false);
+                let family = entry_face(ui, action).unwrap_or(egui::FontFamily::Proportional);
+                if *disabled == Some("heading") {
+                    menu_heading(ui, app, label);
+                    continue;
+                }
+                let resp = menu_row_in(ui, app, icon, *swatch, label, *on, disabled.is_none(), false, family);
                 menu_key_badge(ui, app, resp.rect, key, false);
                 let resp = match disabled {
                     Some(why) => resp.on_hover_text(*why),
@@ -567,7 +636,10 @@ fn menu_entries(ui: &mut Ui, app: &mut App, cx: &mut Cx, entries: &[Resolved], d
                 }
                 if resp.clicked() {
                     run(app, cx, action);
-                    ui.close();
+                    // A gallery filter changes the gallery in place: the menu stays open.
+                    if !keeps_menu_open(action) {
+                        ui.close();
+                    }
                 }
             }
             Resolved::Sub { label, icon, menu, key } => {
@@ -748,7 +820,12 @@ fn draw_ctl(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, rect: Rect, st: St
             }
         }
         Kind::Split => {
+            let face = state::face_color(app, cx.surface, &c.cmd.id);
+            let enabled = look.enabled;
             let (main, arrow) = split_button(ui, app, id, rect, look, &c.label, why);
+            if let Some(col) = face {
+                paint_face_bar(ui, rect, &look, col, enabled);
+            }
             if main.clicked() {
                 let act = ctl_action(app, cx, c, None);
                 run(app, cx, &act);

@@ -217,7 +217,7 @@ fn normalized_chars(raw: &str, strip_quotes: bool) -> impl Iterator<Item = char>
         .take(MAX_NAME_LEN)
 }
 
-fn collapse(raw: &str, strip_quotes: bool) -> String {
+pub(crate) fn collapse(raw: &str, strip_quotes: bool) -> String {
     normalized_chars(raw, strip_quotes).collect()
 }
 
@@ -239,18 +239,35 @@ fn strip_parenthetical(name: &str) -> &str {
     }
 }
 
-/// Looks a normalised name up directly in the alias table or among the db's own family names.
-fn lookup(name: &str, extra: &[&'static str]) -> Option<&'static str> {
+/// Looks a normalised name up among `extra` (the db's own family names), then, when `aliases` is set, in the
+/// alias table.
+fn lookup(name: &str, extra: &[&'static str], aliases: bool) -> Option<&'static str> {
     if let Some(f) = extra.iter().find(|f| normalized_chars(f, false).eq(name.chars())) {
         return Some(f);
+    }
+    if !aliases {
+        return None;
     }
     ALIASES.iter().find(|(alias, _)| *alias == name).map(|(_, fam)| *fam)
 }
 
 /// Maps one normalised family name to a bundled family, peeling style words off the end when needed.
 pub(crate) fn match_family(name: &str, extra: &[&'static str]) -> Option<FamilyMatch> {
+    match_family_with(name, |n| lookup(n, extra, true))
+}
+
+/// [`match_family`] against the db's own families only (no aliases).
+pub(crate) fn match_own_family(name: &str, extra: &[&'static str]) -> Option<FamilyMatch> {
+    match_family_with(name, |n| lookup(n, extra, false))
+}
+
+/// [`match_family`] with any lookup of a normalised name (style words peeled off the end in turn).
+pub(crate) fn match_family_with(
+    name: &str,
+    lookup: impl Fn(&str) -> Option<&'static str>,
+) -> Option<FamilyMatch> {
     let name = strip_parenthetical(name);
-    if let Some(family) = lookup(name, extra) {
+    if let Some(family) = lookup(name) {
         return Some(FamilyMatch { family, weight_hint: None, italic_hint: false });
     }
     let mut words: Vec<&str> = name.split(' ').collect();
@@ -276,7 +293,7 @@ pub(crate) fn match_family(name: &str, extra: &[&'static str]) -> Option<FamilyM
         }
         italic_hint |= it;
         let base = words.join(" ");
-        if let Some(family) = lookup(&base, extra) {
+        if let Some(family) = lookup(&base) {
             return Some(FamilyMatch { family, weight_hint, italic_hint });
         }
     }

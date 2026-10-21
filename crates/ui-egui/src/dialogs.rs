@@ -320,7 +320,7 @@ pub const KNOWN: &[&str] = &[
     "defineNewListStyle",
     "paragraph",
     "saveStyleSet",
-    "applyStyles",
+    "modifyStyle",
     "pasteSpecial",
     "find",
     "messageSelectionPane",

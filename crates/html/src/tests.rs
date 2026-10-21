@@ -334,6 +334,25 @@ fn container_for_backgrounds() {
     assert!(matches!(&d.blocks[1], Block::Paragraph { .. }));
 }
 
+/// Text in the automatic colour is sent white on dark paragraph shading (black-shaded text stays readable).
+#[test]
+fn dark_shading_sends_white_automatic_text() {
+    let shaded = |bg: Color| {
+        let style = ParaStyle { background: Some(bg), ..Default::default() };
+        let d = Doc {
+            blocks: vec![Block::Paragraph {
+                style,
+                inlines: vec![Inline::Text { text: "x".into(), style: TextStyle::default() }],
+            }],
+            ..Default::default()
+        };
+        doc_to_html(&d)
+    };
+    let dark = shaded(Color::BLACK);
+    assert!(dark.contains("background-color:#000000;color:#ffffff"), "{dark}");
+    assert!(!shaded(Color::hex(0xd9d9d9)).contains("color:#ffffff"));
+}
+
 #[test]
 fn white_space_pre_wrap() {
     let d = doc("<div style='white-space:pre-wrap'>a  b\n  c</div><div>d  e</div>");

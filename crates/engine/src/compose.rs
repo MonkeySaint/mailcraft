@@ -19,7 +19,7 @@ mod sort;
 pub use find::{
     FindDirection, FindFormat, FindOptions, MAX_FIND_ALL, MAX_FIND_CHARS, check_find, expand_replacement,
 };
-pub use sort::{SortKind, SortSpec};
+pub use sort::{MAX_THEN_BY, SortKey, SortKind, SortSpec};
 
 use mailcraft_geom::Color;
 use mailcraft_layout::TextPos;
@@ -253,6 +253,17 @@ pub struct NamedStyle {
     pub para: ParaStyle,
 }
 
+/// The document order of a body's leaves (see [`ComposeState::pos_orders`]).
+#[derive(Clone, Debug, Default)]
+pub struct PosOrders(std::collections::HashMap<Vec<usize>, usize>);
+
+impl PosOrders {
+    /// Document order of `pos`: (leaf ordinal, offset); positions in no leaf sort last.
+    pub fn of(&self, pos: &DocPos) -> (usize, usize) {
+        (self.0.get(&pos.path).copied().unwrap_or(usize::MAX), pos.offset)
+    }
+}
+
 /// Editor-only view toggles.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -267,8 +278,15 @@ pub struct EditorFlags {
     pub high_contrast_only: bool,
     /// Font Color palette shows only high-contrast colours.
     pub font_high_contrast_only: bool,
+    /// Shading palette shows only high-contrast colours.
+    pub shading_high_contrast_only: bool,
     /// The Editor pane (Review › Editor): issue counts, score, corrections and refinements.
     pub editor_pane: bool,
+    /// The Apply Styles pane (a small window that stays open: style name, Reapply, Modify).
+    pub apply_styles: bool,
+    /// Multilevel List › Gallery Filter: which sections the gallery shows ("current", "library"; empty =
+    /// all).
+    pub list_gallery_filter: String,
 }
 
 /// One editor undo step.
@@ -490,6 +508,8 @@ pub struct ComposeState {
     // --- floating drawing objects (`cmd::drawing`) ---
     /// The selected drawing object of the body (its [`mailcraft_model::Drawing::id`]).
     pub selected_drawing: Option<u32>,
+    /// Names given in the Selection pane: (object source, name), see `format.selectionPane` `rename`.
+    pub object_names: Vec<(String, String)>,
     /// The armed drawing tool: the next drag in the body draws it (`shape:<name>`, `textBox`, `canvas`,
     /// `scribble`, `tablePencil`, `tableEraser`).
     #[serde(skip)]
@@ -1512,12 +1532,12 @@ impl ComposeState {
                 if t1 == t2 =>
             {
                 if let Some(Block::Table { rows, .. }) = block_at_mut(&mut self.body.blocks, &t1) {
-                    let col = spec.field.unwrap_or(0);
-                    let key =
-                        |r: &Vec<TableCell>| r.get(col).map(|c| blocks_text(&c.blocks)).unwrap_or_default();
+                    let key = |r: &Vec<TableCell>, f: Option<usize>| {
+                        r.get(f.unwrap_or(0)).map(|c| blocks_text(&c.blocks)).unwrap_or_default()
+                    };
                     let from = usize::from(spec.header).min(rows.len());
                     if let Some(part) = rows.get_mut(from..) {
-                        part.sort_by(|a, b| spec.cmp(&key(a), &key(b)));
+                        part.sort_by(|a, b| spec.compare(a, b, &key));
                     }
                 }
             }
@@ -1529,7 +1549,7 @@ impl ComposeState {
                     if let Some(part) = items.get_mut(from..) {
                         part.sort_by(|a, b| {
                             let (ta, tb) = (blocks_text(a), blocks_text(b));
-                            spec.cmp(spec.key(&ta), spec.key(&tb))
+                            spec.compare(ta.as_str(), tb.as_str(), &|t: &str, f| spec.field_text(t, f))
                         });
                     }
                 }
@@ -1550,7 +1570,7 @@ impl ComposeState {
                     part.sort_by(|a, b| {
                         let ta = blocks_text(std::slice::from_ref(a));
                         let tb = blocks_text(std::slice::from_ref(b));
-                        spec.cmp(spec.key(&ta), spec.key(&tb))
+                        spec.compare(ta.as_str(), tb.as_str(), &|t: &str, f| spec.field_text(t, f))
                     });
                 }
             }
@@ -2126,15 +2146,42 @@ impl ComposeState {
         self.ensure_body();
     }
 
+    /// Start of each line, in document order (Go To › Line): each paragraph starts one, and so does every
+    /// line break inside a paragraph or preformatted block.
+    pub fn line_starts(&self) -> Vec<DocPos> {
+        let mut out = Vec::new();
+        for path in leaves(&self.body.blocks) {
+            out.push(DocPos::new(path.clone(), 0));
+            if let Some((_, flat)) = leaf(&self.body.blocks, &path) {
+                for (i, a) in flat.atoms.iter().enumerate() {
+                    if matches!(a.kind, AtomKind::Break | AtomKind::Char('\n')) {
+                        out.push(DocPos::new(path.clone(), i.saturating_add(1)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Document order of `pos`: (leaf ordinal, offset). To compare many positions, build a
+    /// [`ComposeState::pos_orders`] once instead (this walks the body every call).
+    pub fn pos_order(&self, pos: &DocPos) -> (usize, usize) {
+        self.pos_orders().of(pos)
+    }
+
+    /// The document order of every leaf, for ordering many positions in one pass.
+    pub fn pos_orders(&self) -> PosOrders {
+        PosOrders(leaves(&self.body.blocks).into_iter().enumerate().map(|(i, p)| (p, i)).collect())
+    }
+
     /// Start of each table's first cell, in document order (Go To › Table).
     pub fn table_starts(&self) -> Vec<DocPos> {
-        let mut seen: Vec<Vec<usize>> = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<usize>> = std::collections::HashSet::new();
         let mut out = Vec::new();
         for path in leaves(&self.body.blocks) {
             if let Some((Owner::Cell { table, .. }, _)) = parent_of(&self.body.blocks, &path)
-                && !seen.contains(&table)
+                && seen.insert(table)
             {
-                seen.push(table);
                 out.push(DocPos::new(path, 0));
             }
         }

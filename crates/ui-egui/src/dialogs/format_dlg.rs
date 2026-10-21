@@ -941,6 +941,7 @@ fn create_style(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             vec![
                 f("name", "Name:", Kind::Text),
                 f("n", "", Kind::Note("The style takes the formatting at the caret.".into())),
+                f("modify", "Modify its formatting next (font, size, colour, paragraph)", Kind::Check),
             ],
         )
         .init("name", json!(d.str("name"))),
@@ -948,8 +949,17 @@ fn create_style(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             if v.s("name").is_empty() {
                 return Err("Type a name for the style.".into());
             }
-            cmd(app, "format.style", json!({"compose": compose, "name": v.s("name"), "action": "create"}))
-                .map(|_| None)
+            let r = cmd(
+                app,
+                "format.style",
+                json!({"compose": compose, "name": v.s("name"), "action": "create"}),
+            )?;
+            // Modify…: the full style definition dialog for the new style.
+            if v.b("modify") {
+                let created = r.get("created").and_then(Value::as_str).unwrap_or_default().to_owned();
+                cmd(app, "format.style", json!({"compose": compose, "name": created, "action": "define"}))?;
+            }
+            Ok(None)
         },
     )
 }

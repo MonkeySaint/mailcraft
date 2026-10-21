@@ -114,8 +114,8 @@ pub(crate) trait EditorHost {
     }
     /// Re-checks the spelling of compose `cid` when its body changed since the last check.
     fn refresh_spelling(&mut self, _cid: u64) {}
-    /// Spelling suggestions for `word`.
-    fn suggest(&self, _word: &str) -> Vec<String> {
+    /// Spelling suggestions for `word` in compose `cid` (its proofing language).
+    fn suggest(&self, _cid: u64, _word: &str) -> Vec<String> {
         Vec::new()
     }
     /// F7 in the body.
@@ -175,14 +175,15 @@ impl EditorHost for App {
         {
             return;
         }
-        let sp = mailcraft_engine::cmd::review::speller(&self.s);
+        // Never waits for an installed dictionary: it is read in the background and the body re-checked.
+        let sp = mailcraft_engine::cmd::review::compose_speller_live(&self.s, cid);
         if let Some(c) = self.s.composes.get_mut(&cid) {
             // Stale after an edit, or checked under proofing options that changed since.
             mailcraft_engine::cmd::review::spell_check(&sp, c, false, 1);
         }
     }
-    fn suggest(&self, word: &str) -> Vec<String> {
-        mailcraft_engine::cmd::review::speller(&self.s).suggest(word, MENU_SUGGESTIONS)
+    fn suggest(&self, cid: u64, word: &str) -> Vec<String> {
+        mailcraft_engine::cmd::review::compose_speller_live(&self.s, cid).suggest(word, MENU_SUGGESTIONS)
     }
     fn open_spelling(&mut self, ctx: &egui::Context, cid: u64) {
         super::spelling::open(ctx, self, cid);
@@ -1571,7 +1572,7 @@ fn menu_target(host: &dyn EditorHost, cid: u64, pos: &DocPos, link: Option<Strin
         && suggestions.is_empty()
         && i.kind == "spelling"
     {
-        suggestions = host.suggest(&i.word);
+        suggestions = host.suggest(cid, &i.word);
     }
     suggestions.truncate(MENU_SUGGESTIONS);
     MenuAt { issue, suggestions, link, in_table: c.cell_at_caret().is_some() }

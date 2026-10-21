@@ -44,7 +44,9 @@ pub(crate) struct Ctx<'a> {
     pub fonts: &'a FontDb,
     pub zoom: f32,
     pub width: f32,
-    pub default_color: Color,
+    /// Colour of text in the automatic colour (no colour of its own): the options' default, or white / black
+    /// on a paragraph shading it would not show on (see [`auto_text_color`]).
+    pub default_color: Cell<Color>,
     pub link_color: Color,
     /// Lines that may still be laid out (see [`MAX_LINES`]).
     pub lines_left: Cell<usize>,
@@ -58,13 +60,13 @@ impl<'a> Ctx<'a> {
             fonts,
             zoom,
             width,
-            default_color: opts.default_color,
+            default_color: Cell::new(opts.default_color),
             link_color: opts.link_color,
             lines_left: Cell::new(MAX_LINES),
         }
     }
     pub(crate) fn resolve(&self, ts: &TextStyle) -> RStyle {
-        resolve(self.fonts, ts, self.zoom, self.default_color)
+        resolve(self.fonts, ts, self.zoom, self.default_color.get())
     }
     /// Model px value → layout px (sanitised, zoomed).
     pub(crate) fn px(&self, v: f32) -> f32 {
@@ -261,7 +263,10 @@ fn layout_block(
             let sa = ctx.px(style.space_after_px);
             let bg = style.background.map(|_| out.placeholder());
             let inner = frame.inset(ctx.px(style.indent_px)).at_y(frame.y + sb).deeper();
+            let saved = ctx.default_color.get();
+            ctx.default_color.set(auto_text_color(style.background, saved));
             let h = layout_blocks(ctx, blocks, ts, path, inner, out);
+            ctx.default_color.set(saved);
             if let (Some(i), Some(color)) = (bg, style.background) {
                 out.set(
                     i,
@@ -270,6 +275,21 @@ fn layout_block(
             }
             sb + h + sa
         }
+    }
+}
+
+/// The automatic text colour on paragraph shading `background`: `default` when it shows well enough on it,
+/// else white on a dark shading and black on a light one (black shading keeps unstyled text readable).
+pub(crate) fn auto_text_color(background: Option<Color>, default: Color) -> Color {
+    let Some(bg) = background.filter(|b| b.a >= 128) else { return default };
+    let lum = |c: Color| (0.299 * f32::from(c.r) + 0.587 * f32::from(c.g) + 0.114 * f32::from(c.b)) / 255.0;
+    let (b, d) = (lum(bg), lum(default));
+    if (b - d).abs() >= 0.4 {
+        default
+    } else if b < 0.5 {
+        Color::WHITE
+    } else {
+        Color::BLACK
     }
 }
 
@@ -294,8 +314,11 @@ fn layout_para(
         sa = m;
     }
     let bg = style.background.map(|_| out.placeholder());
+    let saved = ctx.default_color.get();
+    ctx.default_color.set(auto_text_color(style.background, saved));
     let mut flat = Flat::new(ctx, ts);
     flatten(ctx, inlines, ts, None, &mut flat, 0);
+    ctx.default_color.set(saved);
     let left = ctx.px(style.indent_px);
     let inner = frame.inset(left).inset_right(ctx.px(style.right_indent_px)).at_y(frame.y + sb);
     // A hanging indent may reach back to the paragraph's own left edge, no further: by at most the indent

@@ -313,7 +313,15 @@ fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str
         "selpane" => c.editor.selection_pane,
         "hc" => c.editor.high_contrast_only,
         "fhc" => c.editor.font_high_contrast_only,
+        "shc" => c.editor.shading_high_contrast_only,
         "editorpane" => c.editor.editor_pane,
+        "applystyles" => c.editor.apply_styles,
+        "inlist" => c.list_at_caret().is_some(),
+        "numlist" => matches!(c.list_at_caret(), Some((_, mailcraft_model::rich::ListKind::Numbered { .. }))),
+        "listfilter" => {
+            let f = c.editor.list_gallery_filter.as_str();
+            if f.is_empty() { arg == "all" } else { f == arg }
+        }
         "flagged" => c.flag != mailcraft_model::FlagState::None || c.recipient_flag.is_some(),
         "lightcanvas" => c.light_canvas,
         "vote" => c.voting.eq_ignore_ascii_case(arg),
@@ -491,7 +499,21 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 65] = [
+pub const SOURCES: [&str; 79] = [
+    "multilevelGallery",
+    "shadingThemeColors",
+    "shadingColors",
+    "shadingThemeShades:bg1",
+    "shadingThemeShades:tx1",
+    "shadingThemeShades:bg2",
+    "shadingThemeShades:tx2",
+    "shadingThemeShades:accent1",
+    "shadingThemeShades:accent2",
+    "shadingThemeShades:accent3",
+    "shadingThemeShades:accent4",
+    "shadingThemeShades:accent5",
+    "shadingThemeShades:accent6",
+    "recentFilesLink",
     "shapes:Lines",
     "shapes:Rectangles",
     "shapes:Basic Shapes",
@@ -650,6 +672,48 @@ fn readable_only(app: &App, surface: Surface, items: Vec<DynItem>) -> Vec<DynIte
         .collect()
 }
 
+/// Shading's standard colours: (name, hex).
+pub const SHADING_COLORS: [(&str, &str); 10] = [
+    ("Dark Red", "#a01c1c"),
+    ("Red", "#e02424"),
+    ("Orange", "#ef8a17"),
+    ("Yellow", "#f2c94c"),
+    ("Light Green", "#7ac74f"),
+    ("Green", "#2e8b46"),
+    ("Light Blue", "#3fa7d6"),
+    ("Blue", "#1f5fbf"),
+    ("Dark Blue", "#14286b"),
+    ("Purple", "#6b3fa0"),
+];
+
+fn shading_colors() -> Vec<DynItem> {
+    SHADING_COLORS
+        .iter()
+        .filter_map(|(name, hex)| {
+            let col = mailcraft_geom::Color::parse_hex(hex)?;
+            Some(DynItem {
+                label: (*name).to_owned(),
+                icon: "",
+                swatch: swatch(col),
+                vars: vec![("$color", json!(hex))],
+                on: false,
+            })
+        })
+        .collect()
+}
+
+/// Shading colours; with its High-contrast only on, the colours text is hard to read on are hidden.
+fn shading_only(app: &App, surface: Surface, items: Vec<DynItem>) -> Vec<DynItem> {
+    use mailcraft_engine::cmd::format::is_high_contrast;
+    if !compose(app, surface).is_some_and(|c| c.editor.shading_high_contrast_only) {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|i| i.swatch.is_none_or(|[r, g, b]| is_high_contrast(mailcraft_geom::Color::rgb(r, g, b))))
+        .collect()
+}
+
 /// Text Highlight Color pens; with High-contrast only on, the pens that leave text hard to read are hidden.
 fn highlight_pens(app: &App, surface: Surface) -> Vec<DynItem> {
     use mailcraft_engine::cmd::format::{HIGHLIGHT_COLORS, is_high_contrast};
@@ -741,6 +805,74 @@ fn font_name_items(app: &App, surface: Surface) -> Vec<DynItem> {
             swatch: None,
         })
         .collect()
+}
+
+/// A section heading inside a dynamic list (drawn greyed, does nothing).
+fn heading_item(label: &str) -> DynItem {
+    DynItem {
+        label: label.to_owned(),
+        icon: "",
+        swatch: None,
+        vars: vec![(HEADING_VAR, json!(true))],
+        on: false,
+    }
+}
+
+/// Template variable marking a [`heading_item`].
+pub const HEADING_VAR: &str = "$heading";
+
+/// Multilevel List gallery, filtered in place by Gallery Filter: the list at the cursor (its whole outline;
+/// picking it applies it again), the List Library and the saved list styles (`$style`).
+fn multilevel_gallery_items(app: &App, surface: Surface) -> Vec<DynItem> {
+    let Some(c) = compose(app, surface) else { return Vec::new() };
+    let g = mailcraft_engine::cmd::format::multilevel_gallery_data(&app.s, c.id);
+    let shown: Vec<&str> = g
+        .get("shown")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let item = |label: String, style: &str, icon: &'static str| DynItem {
+        label,
+        icon,
+        swatch: None,
+        vars: vec![("$style", json!(style))],
+        on: false,
+    };
+    let mut out = Vec::new();
+    if g.get("filter").and_then(Value::as_str) == Some("current") && shown.is_empty() {
+        out.push(heading_item("Current List"));
+        out.push(heading_item("The cursor is not in a list."));
+        return out;
+    }
+    if shown.contains(&"current") {
+        out.push(heading_item("Current List"));
+        let label = g
+            .get("current")
+            .and_then(|v| v.get("label"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        out.push(DynItem { on: true, ..item(label, "current", "numbering") });
+    }
+    if shown.contains(&"library") {
+        out.push(heading_item("List Library"));
+        out.push(item("None".to_owned(), "none", ""));
+        for v in g.get("library").and_then(Value::as_array).into_iter().flatten() {
+            let key = v.get("style").and_then(Value::as_str).unwrap_or_default();
+            let icon = if matches!(key, "bullets" | "diamonds") { "bullets" } else { "numbering" };
+            out.push(item(v.get("label").and_then(Value::as_str).unwrap_or_default().to_owned(), key, icon));
+        }
+    }
+    if shown.contains(&"styles") {
+        out.push(heading_item("List Styles"));
+        for v in g.get("styles").and_then(Value::as_array).into_iter().flatten() {
+            let name = v.get("style").and_then(Value::as_str).unwrap_or_default();
+            let sample = v.get("sample").and_then(Value::as_str).unwrap_or_default();
+            let label = if sample.is_empty() { name.to_owned() } else { format!("{sample}  {name}") };
+            out.push(item(label, name, "numbering"));
+        }
+    }
+    out
 }
 
 /// Change Styles › Style Set: the sets saved with Save as a New Style Set.
@@ -1161,6 +1293,7 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
         "styles" => style_items(app, surface),
         "themeFontNames" => theme_font_items(app, surface),
         "fontNames" => font_name_items(app, surface),
+        "multilevelGallery" => multilevel_gallery_items(app, surface),
         "styleSets" => saved_style_set_items(app),
         _ if source.starts_with("blocks:") => {
             block_items(app, surface, source.strip_prefix("blocks:").unwrap_or(""))
@@ -1189,6 +1322,12 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
         "fontThemeColors" => readable_only(app, surface, theme_items(app, surface, None)),
         "fontColors" => readable_only(app, surface, font_colors()),
         "highlightPens" => highlight_pens(app, surface),
+        "shadingThemeColors" => shading_only(app, surface, theme_items(app, surface, None)),
+        "shadingColors" => shading_only(app, surface, shading_colors()),
+        // Shading › Theme Color Shades: High-contrast only applies to the shades too.
+        _ if source.starts_with("shadingThemeShades:") => {
+            shading_only(app, surface, theme_items(app, surface, source.strip_prefix("shadingThemeShades:")))
+        }
         "paragraphSpacing" => paragraph_spacing_items(app, surface),
         _ if source.starts_with("themeShades:") => {
             theme_items(app, surface, source.strip_prefix("themeShades:"))
@@ -1210,8 +1349,8 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 })
                 .collect()
         }
-        // Attach File ▾: files attached recently, newest first.
-        "recentFiles" => crate::compose::recent_files()
+        // Attach File ▾: files attached recently, newest first (kept across restarts).
+        "recentFiles" => crate::compose::recent_files(app)
             .into_iter()
             .map(|p| DynItem {
                 label: crate::compose::recent_label(&p),
@@ -1221,6 +1360,34 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 on: false,
             })
             .collect(),
+        // Link ▾: web documents linked recently (picking one links it), then the recent files (picking one
+        // attaches it: a link to a file on this computer would not open for the recipients).
+        "recentFilesLink" => {
+            let links = mailcraft_engine::cmd::compose::recent_links(&app.s);
+            let files = crate::compose::recent_files(app);
+            let mut out = Vec::new();
+            if !links.is_empty() {
+                out.push(heading_item("Recent web links"));
+            }
+            out.extend(links.into_iter().map(|p| DynItem {
+                label: crate::compose::recent_label(&p),
+                icon: "link",
+                swatch: None,
+                vars: vec![("$path", json!(p))],
+                on: false,
+            }));
+            if !files.is_empty() {
+                out.push(heading_item("Recent files (attached when picked)"));
+            }
+            out.extend(files.into_iter().map(|p| DynItem {
+                label: crate::compose::recent_label(&p),
+                icon: "attach",
+                swatch: None,
+                vars: vec![("$path", json!(p))],
+                on: false,
+            }));
+            out
+        }
         "views:people" => module_view_items(app, mailcraft_engine::cmd::view::modules::ModuleKind::People),
         "views:tasks" => module_view_items(app, mailcraft_engine::cmd::view::modules::ModuleKind::Tasks),
         "views:notes" => module_view_items(app, mailcraft_engine::cmd::view::modules::ModuleKind::Notes),
@@ -1451,13 +1618,47 @@ pub fn run(ctx: &egui::Context, app: &mut App, surface: Surface, mem: &mut Mem, 
 }
 
 /// Expands a menu's entries, resolving dynamic sources into concrete command items.
+/// The colour a colour button's face applies (Text Highlight Color, Font Color, Shading), for the bar under
+/// its icon; `None` for other controls or outside a compose window.
+pub fn face_color(app: &App, surface: Surface, cmd: &str) -> Option<[u8; 3]> {
+    let c = compose(app, surface)?;
+    let col = mailcraft_engine::cmd::format::face_color(c, cmd)?;
+    Some([col.r, col.g, col.b])
+}
+
+/// A menu item's label; Change List Level's levels show the marker each level gets in the list at the caret
+/// ("Level 2   a.").
+fn item_label(app: &App, surface: Surface, it: &Item) -> String {
+    if it.cmd.id == "format.indent"
+        && let Some(level) = it.label.strip_prefix("Level ").and_then(|n| n.trim().parse::<usize>().ok())
+        && let Some(c) = compose(app, surface)
+        && let Some(marker) = mailcraft_engine::cmd::format::level_markers(c).get(level.saturating_sub(1))
+    {
+        return format!("{}    {marker}", it.label);
+    }
+    it.label.clone()
+}
+
+/// A submenu's label; the Multilevel List gallery's filter entry names the filter in effect.
+fn sub_label(app: &App, surface: Surface, it: &Item) -> String {
+    if it.target == "multilevelFilter" && it.key.is_empty() {
+        let filter = compose(app, surface).map(|c| c.editor.list_gallery_filter.as_str()).unwrap_or("");
+        return match filter {
+            "current" => "Current List".to_owned(),
+            "library" => "List Library".to_owned(),
+            _ => "All".to_owned(),
+        };
+    }
+    it.label.clone()
+}
+
 pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> Vec<Resolved> {
     let mut out = Vec::new();
     for it in items {
         match it.kind {
             ItemKind::Sep => out.push(Resolved::Sep),
             ItemKind::Sub => out.push(Resolved::Sub {
-                label: it.label.clone(),
+                label: sub_label(app, surface, it),
                 icon: it.icon.clone(),
                 menu: it.target.clone(),
                 key: it.key.clone(),
@@ -1475,6 +1676,18 @@ pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> V
                 // Recent Searches with nothing in it shows its placeholder greyed out.
                 let empty = it.target == "recentSearches" && app.s.search.recent.is_empty();
                 for d in dyn_items(app, surface, &it.target) {
+                    if d.vars.iter().any(|(k, _)| *k == HEADING_VAR) {
+                        out.push(Resolved::Cmd {
+                            label: d.label,
+                            icon: String::new(),
+                            swatch: None,
+                            key: String::new(),
+                            on: None,
+                            disabled: Some("heading"),
+                            action: Action { cmd: String::new(), params: Value::Null, flip: None },
+                        });
+                        continue;
+                    }
                     let action = action(app, &it.cmd, d.on, None, &d.vars);
                     let disabled = disabled(app, surface, &it.cmd.id).or_else(|| {
                         if it.target == "quicksteps" {
@@ -1499,7 +1712,7 @@ pub fn expand_items(app: &App, surface: Surface, mem: &Mem, items: &[Item]) -> V
                 let mut action = action(app, &it.cmd, on.unwrap_or(false), None, &[]);
                 action.flip = it.on.as_deref().and_then(|s| s.strip_prefix("mem:")).map(str::to_owned);
                 out.push(Resolved::Cmd {
-                    label: it.label.clone(),
+                    label: item_label(app, surface, it),
                     icon: it.icon.clone(),
                     swatch: it.swatch,
                     key: it.key.clone(),
@@ -1657,6 +1870,88 @@ mod compose_state_tests {
     }
 
     #[test]
+    fn shading_face_colour_bar_and_high_contrast_only() {
+        let (mut app, cid) = app_with(mailcraft_model::Doc::from_plain_text("x"));
+        let s = Surface::Compose(cid);
+        // The faces show the colour they apply: the defaults first, then the last colour picked.
+        assert_eq!(face_color(&app, s, "format.shading"), Some([0, 0, 0]));
+        assert_eq!(face_color(&app, s, "format.highlight"), Some([0xff, 0xff, 0x00]));
+        assert_eq!(face_color(&app, s, "format.bold"), None);
+        assert_eq!(face_color(&app, Surface::Main, "format.color"), None);
+        app.run("format.shading", json!({"compose": cid, "color": "#14286b"}));
+        assert_eq!(face_color(&app, s, "format.shading"), Some([0x14, 0x28, 0x6b]));
+        // High-contrast only hides the shading colours text is hard to read on.
+        let all = dyn_items(&app, s, "shadingColors").len();
+        app.run("format.shading", json!({"compose": cid, "highContrastOnly": true}));
+        assert!(is_on(&app, s, &Mem::default(), "shc"));
+        let few = dyn_items(&app, s, "shadingColors");
+        assert!(few.len() < all && !few.is_empty(), "{} of {all}", few.len());
+        assert!(dyn_items(&app, s, "shadingThemeShades:accent1").len() <= 6);
+    }
+
+    #[test]
+    fn list_level_items_need_a_list_and_show_their_markers() {
+        let (mut app, cid) = app_with(mailcraft_model::Doc::from_plain_text("x"));
+        let s = Surface::Compose(cid);
+        let levels = |app: &App| {
+            expand_items(app, s, &Mem::default(), crate::ribbon::defs::defs().menu("listLevels").unwrap())
+        };
+        assert!(
+            levels(&app).iter().all(|r| matches!(r, Resolved::Cmd { disabled: Some(_), .. })),
+            "not in a list"
+        );
+        let numbering =
+            expand_items(&app, s, &Mem::default(), crate::ribbon::defs::defs().menu("numbering").unwrap());
+        assert!(numbering.iter().any(
+            |r| matches!(r, Resolved::Cmd { label, disabled: Some(_), .. } if label == "Set Numbering Value...")
+        ));
+        app.run("format.multilevel", json!({"compose": cid, "style": "numbered"}));
+        let labels: Vec<String> = levels(&app)
+            .into_iter()
+            .filter_map(|r| match r {
+                Resolved::Cmd { label, disabled: None, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 9);
+        assert_eq!(labels[0], "Level 1    1.");
+        assert_eq!(labels[1], "Level 2    a.");
+        assert_eq!(labels[2], "Level 3    i.");
+    }
+
+    /// Regression: Link ▾ lists the web documents linked recently and picking one inserts a link (the
+    /// web-link path was reachable only from the CLI).
+    #[test]
+    fn link_menu_picks_a_recent_web_document() {
+        let (mut app, cid) = app_with(mailcraft_model::Doc::from_plain_text("x"));
+        let s = Surface::Compose(cid);
+        let url = "https://www.example.com/team/Q3 plan.docx";
+        app.run("insert.link", json!({"compose": cid, "url": url, "text": "plan"}));
+        let menu = expand_items(&app, s, &Mem::default(), crate::ribbon::defs::defs().menu("link").unwrap());
+        assert!(menu.iter().any(
+            |r| matches!(r, Resolved::Cmd { label, disabled: Some(_), .. } if label == "Recent web links")
+        ));
+        let action = menu
+            .iter()
+            .find_map(|r| match r {
+                Resolved::Cmd { label, action, disabled: None, .. } if label == "Q3 plan.docx" => {
+                    Some(action.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        // Attach File ▾ does not offer it (it is not a file here).
+        assert!(dyn_items(&app, s, "recentFiles").iter().all(|d| d.label != "Q3 plan.docx"));
+        let ctx = egui::Context::default();
+        run(&ctx, &mut app, s, &mut Mem::default(), &action);
+        let c = &app.s.composes[&cid];
+        assert!(c.attachments.is_empty(), "a web document is linked, not attached");
+        assert!(c.body.to_plain_text().contains("Q3 plan.docx"), "{}", c.body.to_plain_text());
+        let links = mailcraft_engine::cmd::compose::recent_links(&app.s);
+        assert_eq!(links, [url], "picked again: still one entry");
+    }
+
+    #[test]
     fn signature_and_recent_file_sources() {
         let (mut app, cid) = app_with(mailcraft_model::Doc::from_plain_text("x"));
         let s = Surface::Compose(cid);
@@ -1666,10 +1961,17 @@ mod compose_state_tests {
         app.run("compose.signature", json!({"compose": cid, "name": "Formal"}));
         assert!(dyn_items(&app, s, "signatures")[0].on);
         assert!(is_on(&app, s, &Mem::default(), "signature:Formal"));
-        let path = format!("/home/user/Documents/mailcraft-state-test-{}/notes.txt", std::process::id());
-        crate::compose::remember_file(&path);
+        let dir = std::env::temp_dir().join(format!("mailcraft-state-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt").to_string_lossy().into_owned();
+        std::fs::write(&path, b"x").unwrap();
+        crate::compose::remember_file(&mut app, &path);
         let recent = dyn_items(&app, s, "recentFiles");
         let item = recent.iter().find(|d| d.label == "notes.txt").unwrap();
         assert_eq!(item.vars, vec![("$path", json!(path))]);
+        let link = dyn_items(&app, s, "recentFilesLink");
+        assert!(link[0].vars.iter().any(|(k, _)| *k == HEADING_VAR), "a heading says what picking does");
+        assert!(link.iter().any(|d| d.label == "notes.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

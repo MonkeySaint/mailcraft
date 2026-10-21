@@ -1147,6 +1147,42 @@ struct SymbolState {
     pick: Option<char>,
     code: String,
     error: String,
+    /// 0 = (normal text), else a symbol font of `SYMBOL_FONTS` (index + 1).
+    font: usize,
+    /// The Special Characters tab is shown.
+    special: bool,
+}
+
+/// Special Characters: (name, character). Names are MailCraft's own.
+pub(crate) const SPECIAL_CHARACTERS: [(&str, char); 20] = [
+    ("Em dash", '\u{2014}'),
+    ("En dash", '\u{2013}'),
+    ("Nonbreaking hyphen", '\u{2011}'),
+    ("Optional hyphen", '\u{00AD}'),
+    ("Em space", '\u{2003}'),
+    ("En space", '\u{2002}'),
+    ("Quarter em space", '\u{2005}'),
+    ("Nonbreaking space", '\u{00A0}'),
+    ("Copyright", '\u{00A9}'),
+    ("Registered", '\u{00AE}'),
+    ("Trademark", '\u{2122}'),
+    ("Section", '\u{00A7}'),
+    ("Paragraph", '\u{00B6}'),
+    ("Ellipsis", '\u{2026}'),
+    ("Single opening quote", '\u{2018}'),
+    ("Single closing quote", '\u{2019}'),
+    ("Double opening quote", '\u{201C}'),
+    ("Double closing quote", '\u{201D}'),
+    ("Zero-width space (optional break)", '\u{200B}'),
+    ("Word joiner (no break)", '\u{2060}'),
+];
+
+/// The characters a symbol font offers in the dialog: (label for the tooltip, character).
+fn symbol_font_chars(font: &str) -> Vec<(String, char)> {
+    mailcraft_engine::cmd::insert::symbol_fonts::characters(font)
+        .into_iter()
+        .map(|(code, ch)| (format!("{font}: {code}"), ch))
+        .collect()
 }
 
 /// More Symbols…: recently used symbols, a subset picker over a character grid, the selected character's
@@ -1160,23 +1196,87 @@ fn symbol(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         |_: &App| SymbolState::default(),
         |st, app| {
             window(ctx, app, d, "Symbol", 520.0, |ui, app| {
-                let names: Vec<&str> = SYMBOL_SUBSETS.iter().map(|(n, ..)| *n).collect();
                 ui.horizontal(|ui| {
-                    ui.label("Font: (normal text)");
-                    ui.add_space(12.0);
-                    ui.label("Subset:");
-                    super::common::combo_idx(ui, ("sym-subset", d.uid), &mut st.subset, &names, 200.0);
+                    if ui.selectable_label(!st.special, "Symbols").clicked() {
+                        st.special = false;
+                    }
+                    if ui.selectable_label(st.special, "Special Characters").clicked() {
+                        st.special = true;
+                    }
                 });
-                let chars = subset_chars(st.subset);
+                ui.separator();
                 let mut insert: Option<String> = None;
+                if st.special {
+                    egui::ScrollArea::vertical().id_salt(("sym-special", d.uid)).max_height(300.0).show(
+                        ui,
+                        |ui| {
+                            egui::Grid::new(("sym-special-grid", d.uid)).num_columns(2).striped(true).show(
+                                ui,
+                                |ui| {
+                                    for (name, ch) in SPECIAL_CHARACTERS {
+                                        let shown = if ch.is_whitespace()
+                                            || u32::from(ch) == 0xAD
+                                            || (0x200B..=0x2060).contains(&u32::from(ch))
+                                        {
+                                            format!("U+{:04X}", u32::from(ch))
+                                        } else {
+                                            ch.to_string()
+                                        };
+                                        ui.label(shown);
+                                        if ui.selectable_label(st.pick == Some(ch), name).clicked() {
+                                            st.pick = Some(ch);
+                                        }
+                                        ui.end_row();
+                                    }
+                                },
+                            );
+                        },
+                    );
+                    let mut out = Out::Keep;
+                    footer(ui, |ui| {
+                        if btn(ui, "Close") {
+                            out = Out::Close;
+                        }
+                        if primary(ui, app, st.pick.is_some(), "Insert") {
+                            insert = st.pick.map(String::from);
+                        }
+                    });
+                    if let Some(ch) = insert
+                        && !crate::compose::insert_symbol(app, cid, &ch)
+                    {
+                        st.error = super::folders::last_error(app);
+                    }
+                    return out;
+                }
+                let names: Vec<&str> = SYMBOL_SUBSETS.iter().map(|(n, ..)| *n).collect();
+                let mut fonts: Vec<&str> = vec!["(normal text)"];
+                fonts.extend(mailcraft_engine::cmd::insert::symbol_fonts::SYMBOL_FONTS);
+                ui.horizontal(|ui| {
+                    ui.label("Font:");
+                    super::common::combo_idx(ui, ("sym-font", d.uid), &mut st.font, &fonts, 140.0);
+                    if st.font == 0 {
+                        ui.add_space(12.0);
+                        ui.label("Subset:");
+                        super::common::combo_idx(ui, ("sym-subset", d.uid), &mut st.subset, &names, 200.0);
+                    }
+                });
+                let font_name = fonts.get(st.font).copied().unwrap_or("(normal text)");
+                let chars: Vec<(String, char)> = if st.font == 0 {
+                    subset_chars(st.subset)
+                        .into_iter()
+                        .map(|c| (format!("U+{:04X}", u32::from(c)), c))
+                        .collect()
+                } else {
+                    symbol_font_chars(font_name)
+                };
                 egui::ScrollArea::vertical().id_salt(("sym", d.uid)).max_height(230.0).show(ui, |ui| {
                     egui::Grid::new(("sym-grid", d.uid)).spacing([2.0, 2.0]).show(ui, |ui| {
-                        for (i, ch) in chars.iter().enumerate() {
+                        for (i, (tip, ch)) in chars.iter().enumerate() {
                             let on = st.pick == Some(*ch);
                             let b = egui::Button::new(RichText::new(ch.to_string()).size(17.0))
                                 .selected(on)
                                 .min_size(Vec2::splat(30.0));
-                            let r = ui.add(b).on_hover_text(format!("U+{:04X}", u32::from(*ch)));
+                            let r = ui.add(b).on_hover_text(format!("{tip} (U+{:04X})", u32::from(*ch)));
                             if r.clicked() {
                                 st.pick = Some(*ch);
                             }
@@ -1244,6 +1344,10 @@ fn symbol(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 // Options: themes (Page Color › More Colors… is the Colors dialog of `format_dlg`)
 
 const THEME_FILTER: [&str; 1] = ["json"];
+/// Office theme files (a theme package or its theme part).
+const OFFICE_THEME_FILTER: [&str; 2] = ["thmx", "xml"];
+/// Every theme file Browse for Themes opens.
+const ALL_THEME_FILTER: [&str; 3] = ["thmx", "xml", "json"];
 
 /// Browse for Themes: a theme file (MailCraft theme, .json) to apply; it joins the Themes gallery.
 fn browse_themes(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -1262,7 +1366,11 @@ fn browse_themes(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         && let Some(p) = super::common::browse_open(
                             app,
                             "Browse for Themes",
-                            &[crate::FileFilter::new("MailCraft themes", &THEME_FILTER)],
+                            &[
+                                crate::FileFilter::new("All themes", &ALL_THEME_FILTER),
+                                crate::FileFilter::new("Office themes", &OFFICE_THEME_FILTER),
+                                crate::FileFilter::new("MailCraft themes", &THEME_FILTER),
+                            ],
                             &st.path,
                         )
                     {
@@ -1272,7 +1380,8 @@ fn browse_themes(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 muted(
                     ui,
                     app,
-                    "A theme saved with Save Current Theme. Opened themes are added to the Themes gallery.",
+                    "An Office theme (.thmx, or its theme .xml) or a theme saved with Save Current Theme. Opened \
+                     themes are added to the Themes gallery.",
                 );
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
@@ -1325,14 +1434,17 @@ fn save_theme(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         );
                         if super::common::browse_button(ui, app) {
                             let suggested = if st.path.trim().is_empty() {
-                                format!("{}.json", st.name.trim())
+                                format!("{}.thmx", st.name.trim())
                             } else {
                                 st.path.clone()
                             };
                             if let Some(p) = super::common::browse_save(
                                 app,
                                 "Save Current Theme",
-                                &[crate::FileFilter::new("MailCraft themes", &THEME_FILTER)],
+                                &[
+                                    crate::FileFilter::new("Office themes", &["thmx"]),
+                                    crate::FileFilter::new("MailCraft themes", &THEME_FILTER),
+                                ],
                                 &suggested,
                             ) {
                                 st.path = p;
@@ -1396,6 +1508,8 @@ struct LangState {
     /// (tag, name) rows: [`LANGUAGES`], plus the message's own language when it is not one of them (set by
     /// a command, the CLI or MCP), so OK never swaps it for another.
     choices: Vec<(String, String)>,
+    /// Whether each row's spelling is checked (bundled English or an installed dictionary).
+    checked: Vec<bool>,
     pick: usize,
     /// The row of the message's language (its tag is only sent when another row is picked).
     was: usize,
@@ -1403,10 +1517,26 @@ struct LangState {
     error: String,
 }
 
-/// The Language dialog's rows for a message in language `current`, and the row to select.
-fn language_choices(current: &str) -> (Vec<(String, String)>, usize) {
+/// What the Language dialog says when the picked language has no dictionary.
+pub const NO_DICTIONARY_NOTICE: &str = "There is no dictionary for this language on this computer, so spelling \
+     will not be checked. Install a Hunspell dictionary for it (or add its folder in Editor Options).";
+
+/// The Language dialog's rows for a message in language `current`, and the row to select: [`LANGUAGES`],
+/// the languages of the dictionaries installed on the computer (`installed` tags), and `current` itself.
+fn language_choices(current: &str, installed: &[String]) -> (Vec<(String, String)>, usize) {
     let mut choices: Vec<(String, String)> =
         LANGUAGES.iter().map(|(t, n)| ((*t).to_owned(), (*n).to_owned())).collect();
+    for tag in installed.iter().take(200) {
+        let tag: String = tag.trim().chars().take(35).collect();
+        if tag.is_empty() || choices.iter().any(|(t, _)| t.eq_ignore_ascii_case(&tag)) {
+            continue;
+        }
+        let name = match mailcraft_engine::translate::language_name(&tag) {
+            Some(n) => format!("{n} ({tag})"),
+            None => tag.clone(),
+        };
+        choices.push((tag, name));
+    }
     let current = current.trim();
     let pick = match choices.iter().position(|(t, _)| t.eq_ignore_ascii_case(current)) {
         Some(i) => i,
@@ -1420,13 +1550,18 @@ fn language_choices(current: &str) -> (Vec<(String, String)>, usize) {
     (choices, pick)
 }
 
-/// Set Proofing Language: the message's language, with which ones the bundled dictionary checks, and "Do
-/// not check spelling or grammar".
+/// Set Proofing Language: the message's language, which ones are spell-checked (English with the bundled
+/// dictionary, others with a dictionary installed on the computer), and "Do not check spelling or grammar".
 fn language(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let cid = compose_of(d);
     let current = d.str("lang");
-    let (choices, pick) = language_choices(&current);
-    let init = LangState { choices, pick, was: pick, no_proof: d.bool("noProof"), error: String::new() };
+    let installed: Vec<String> =
+        d.arr("dictionaries").iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+    let (choices, pick) = language_choices(&current, &installed);
+    let checked =
+        choices.iter().map(|(tag, _)| mailcraft_engine::cmd::review::has_dictionary(&app.s, tag)).collect();
+    let init =
+        LangState { choices, checked, pick, was: pick, no_proof: d.bool("noProof"), error: String::new() };
     with_state(
         ctx,
         app,
@@ -1436,8 +1571,8 @@ fn language(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             window(ctx, app, d, "Language", 420.0, |ui, app| {
                 ui.label("Mark this message as:");
                 egui::ScrollArea::vertical().id_salt(("lang", d.uid)).max_height(220.0).show(ui, |ui| {
-                    for (i, (tag, name)) in st.choices.iter().enumerate() {
-                        let dict = mailcraft_engine::cmd::review::has_dictionary(tag);
+                    for (i, (_, name)) in st.choices.iter().enumerate() {
+                        let dict = st.checked.get(i).copied().unwrap_or(false);
                         let label = if dict { format!("\u{2713} {name}") } else { format!("    {name}") };
                         if ui.selectable_label(st.pick == i, label).clicked() {
                             st.pick = i;
@@ -1447,8 +1582,12 @@ fn language(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 muted(
                     ui,
                     app,
-                    "\u{2713} Spelling is checked with the bundled dictionary. Other languages are not checked.",
+                    "\u{2713} Spelling is checked: English with MailCraft's dictionary, other languages with the \
+                     dictionaries installed on this computer.",
                 );
+                if !st.checked.get(st.pick).copied().unwrap_or(true) && !st.no_proof {
+                    ui.colored_label(app.theme.danger, NO_DICTIONARY_NOTICE);
+                }
                 ui.checkbox(&mut st.no_proof, "Do not check spelling or grammar");
                 if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);

@@ -12,7 +12,7 @@
 //! [`tab_keytip`] (badge text for the tab row) and [`keytip`] (resolves an Alt keytip sequence).
 
 pub mod defs;
-mod draw;
+pub(crate) mod draw;
 pub(crate) mod state;
 
 use crate::responsive::Frame;

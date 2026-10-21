@@ -849,6 +849,14 @@ pub const DEFS: &[Def] = &[
     d(
         "mail",
         EDITOR_PROOFING,
+        "mail.editor.dictionaryFolder",
+        "Also look for dictionaries (Hunspell .dic and .aff files) in this folder:",
+        Text("", 1024),
+        A,
+    ),
+    d(
+        "mail",
+        EDITOR_PROOFING,
         "mail.editor.mainDictionaryOnly",
         "Suggest from main dictionary only",
         Bool(false),
@@ -1997,6 +2005,22 @@ pub const DEFS: &[Def] = &[
         "state.compose.defaultParagraphSpacing",
         "Paragraph spacing of new messages (empty = none)",
         Text("", 32),
+        A,
+    ),
+    d(
+        "state",
+        "Files",
+        "state.compose.recentFiles",
+        "Files attached recently, newest first (Attach File and Link menus)",
+        List(25),
+        A,
+    ),
+    d(
+        "state",
+        "Styles",
+        "state.compose.defaultTheme",
+        "Theme of new messages (colours, fonts, effects; empty = Office)",
+        Object(16 * 1024),
         A,
     ),
     d(

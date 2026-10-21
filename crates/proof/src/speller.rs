@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::dict::{Dictionary, hash_chars, lower_chars};
 use crate::distance::{self, MAX_LEN};
+use crate::hunspell::Hunspell;
 use crate::tokenize::looks_like_address;
 
 /// Which words the checker skips, mirroring the proofing options of the classic client.
@@ -65,6 +66,8 @@ pub const MAX_USER_WORDS: usize = 100_000;
 #[derive(Clone, Debug)]
 pub struct Speller {
     dict: Arc<Dictionary>,
+    /// A Hunspell-format dictionary checked instead of (empty) word lists ([`Speller::from_hunspell`]).
+    hun: Option<Arc<Hunspell>>,
     user: BTreeSet<String>,
     ignored: HashSet<String>,
     options: SpellOptions,
@@ -197,12 +200,42 @@ impl Speller {
     }
 
     fn with_dictionary(dict: Arc<Dictionary>) -> Self {
-        Speller { dict, user: BTreeSet::new(), ignored: HashSet::new(), options: SpellOptions::default() }
+        Speller {
+            dict,
+            hun: None,
+            user: BTreeSet::new(),
+            ignored: HashSet::new(),
+            options: SpellOptions::default(),
+        }
     }
 
-    /// Number of words in the main list plus proper nouns.
+    /// A speller over a Hunspell-format dictionary (another language's, installed on the computer). Words are
+    /// accepted as the dictionary spells them (with the same capitalisation rules), the English contraction
+    /// and possessive rules do not apply, and [`Speller::check_text`] runs only the language-neutral checks.
+    pub fn from_hunspell(dict: Arc<Hunspell>) -> Self {
+        static EMPTY: OnceLock<Arc<Dictionary>> = OnceLock::new();
+        let empty = EMPTY.get_or_init(|| Arc::new(Dictionary::new(Cow::Borrowed(""), Cow::Borrowed(""), "")));
+        Speller { hun: Some(dict), ..Speller::with_dictionary(Arc::clone(empty)) }
+    }
+
+    /// The language of a Hunspell-format dictionary ("fr-FR"); `None` for the bundled English lists.
+    pub fn language(&self) -> Option<&str> {
+        self.hun.as_deref().map(|h| h.language.as_str())
+    }
+
+    /// Whether this speller checks English (the bundled lists or an English Hunspell dictionary), so the
+    /// English grammar rules and writing refinements apply.
+    pub fn is_english(&self) -> bool {
+        self.language().is_none_or(|l| {
+            let l = l.to_ascii_lowercase();
+            l == "en" || l.starts_with("en-") || l.starts_with("en_")
+        })
+    }
+
+    /// Number of words in the main list plus proper nouns (stems for a Hunspell-format dictionary).
     pub fn dictionary_len(&self) -> usize {
-        self.dict.common.len().saturating_add(self.dict.proper.len())
+        let hun = self.hun.as_deref().map_or(0, Hunspell::len);
+        self.dict.common.len().saturating_add(self.dict.proper.len()).saturating_add(hun)
     }
 
     pub fn options(&self) -> &SpellOptions {
@@ -327,6 +360,15 @@ impl Speller {
 
     /// Dictionary lookup with the case rules.
     fn known(&self, word: &str, case: Case) -> bool {
+        if let Some(h) = &self.hun {
+            return match case {
+                Case::Lower | Case::Mixed => h.check_exact(word),
+                Case::Title | Case::Upper => {
+                    let lower = word.to_lowercase();
+                    h.check_exact(word) || h.check_exact(&lower) || h.check_exact(&title_case(&lower))
+                }
+            };
+        }
         match case {
             Case::Lower => self.dict.common.contains(word),
             Case::Title | Case::Upper => {
@@ -338,6 +380,10 @@ impl Speller {
     }
 
     fn check_apostrophe(&self, word: &str, case: Case) -> bool {
+        if self.hun.is_some() {
+            // Other languages' elisions ("l'homme") are in their dictionaries; the English rules do not apply.
+            return false;
+        }
         let lower = word.to_lowercase();
         if CONTRACTIONS.contains(&lower.as_str()) {
             // "I'm", never "i'm"; other contractions follow the normal case rules.
@@ -429,13 +475,20 @@ impl Speller {
             let (display, proper) = self.dict.entry(id);
             consider(display, proper, &mut scored);
         }
+        if let Some(h) = &self.hun {
+            for cand in h.candidates(word) {
+                let proper = cand.chars().next().is_some_and(char::is_uppercase);
+                consider(&cand, proper, &mut scored);
+            }
+        }
         if !self.options.main_dictionary_only {
             for u in &self.user {
                 consider(u, u.chars().any(char::is_uppercase), &mut scored);
             }
         }
         // Two words run together ("alot" → "a lot", "thankyou" → "thank you").
-        for (score, rank, split) in self.splits(&query) {
+        let splits = if self.hun.is_some() { Vec::new() } else { self.splits(&query) };
+        for (score, rank, split) in splits {
             let out = apply_case(&split, false, case);
             if seen.insert(out.clone()) {
                 scored.push((score, rank.unwrap_or(u32::MAX), out));

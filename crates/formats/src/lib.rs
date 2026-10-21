@@ -18,6 +18,7 @@ pub mod eml;
 pub mod ics;
 pub mod mbox;
 pub mod msg;
+pub mod theme;
 pub mod vcf;
 
 mod text;

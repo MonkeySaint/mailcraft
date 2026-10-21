@@ -928,6 +928,19 @@ fn zoom(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 ui.label("Percent:");
                 ui.add(egui::DragValue::new(&mut st.pct).range(10..=500).suffix("%"));
             });
+            // Page width / Text width fit that width into the message's view.
+            if compose.is_some() {
+                let view = f64::from((ctx.content_rect().width() - 48.0).max(100.0));
+                ui.horizontal(|ui| {
+                    for (label, fit) in [("Page width", "page"), ("Text width", "text")] {
+                        if ui.button(label).clicked()
+                            && let Some(pct) = mailcraft_engine::cmd::format::fit_zoom(fit, view)
+                        {
+                            st.pct = u32::from(pct);
+                        }
+                    }
+                });
+            }
             match ok_cancel(ui, app, true) {
                 Some(true) => {
                     match compose {

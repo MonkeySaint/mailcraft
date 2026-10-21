@@ -23,6 +23,7 @@ mod math;
 mod send_calendar;
 pub mod shapes;
 pub mod smartart;
+pub mod symbol_fonts;
 mod table_draw;
 
 pub use math::{MAX_EQUATION, equation_png};
@@ -2292,18 +2293,42 @@ fn link_dialog_state(c: &ComposeState, text: Option<String>) -> Value {
     })
 }
 
+/// A recent "file" that is a web address (a document on a web site or in cloud storage), which the people
+/// the message goes to can open: returned as the link address. Files on this computer or a network share
+/// are not links (`file:` links are dropped from sent HTML: they would not open for the recipients).
+pub fn web_location(path: &str) -> Option<String> {
+    let t = path.trim();
+    let lower = t.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")).then(|| t.replace(' ', "%20"))
+}
+
 fn link(s: &mut Session, p: &Value) -> CmdResult {
-    // Link ▾ › a recent file: the file is attached to the message. A link to a file on this computer
-    // would not open for the people the message goes to.
+    // Link ▾ › a recent file: a document on the web is linked (its name as the text); a file on this
+    // computer or a share is attached instead (a link to it would not open for the people the message goes
+    // to).
     if let Some(path) = opt_str(p, "path").map(str::trim).filter(|t| !t.is_empty()) {
-        let (name, data) = super::compose::read_file(path, super::compose::MAX_ATTACHMENT_BYTES)?;
+        if let Some(href) = web_location(path) {
+            let href = normalize_url(&href)
+                .ok_or_else(|| CmdError::Params(format!("`{path}` is not a usable link address")))?;
+            let text = path.rsplit(['/', '\\']).find(|x| !x.is_empty()).unwrap_or(path).to_owned();
+            let c = compose_mut(s, p)?;
+            c.checkpoint();
+            let text = if c.selection.is_collapsed() { Some(text) } else { None };
+            c.set_link(Some(&href), text.as_deref());
+            let caret = caret(c);
+            super::compose::remember_file(s, path);
+            return Ok(json!({"url": href, "linked": true, "caret": caret}));
+        }
+        let (name, data) = super::compose::read_recent_file(path, super::compose::MAX_ATTACHMENT_BYTES)?;
         let c = compose_mut(s, p)?;
         if c.attachments.len() >= super::compose::MAX_ATTACHMENTS {
             return Err(CmdError::Failed("too many attachments".into()));
         }
         let i = c.attach_bytes(&name, None, data).map_err(CmdError::Failed)?;
         let name = c.attachments.get(i).map(|a| a.filename.clone()).unwrap_or(name);
-        return Ok(json!({"attached": name, "index": i, "count": c.attachments.len()}));
+        let count = c.attachments.len();
+        super::compose::remember_file(s, path);
+        return Ok(json!({"attached": name, "index": i, "count": count}));
     }
     let text = opt_str(p, "text").map(str::to_owned);
     let tip = opt_str(p, "screenTip").map(str::to_owned);
@@ -2332,7 +2357,12 @@ fn link(s: &mut Session, p: &Value) -> CmdResult {
     } else {
         c.set_link(href.as_deref(), text.as_deref());
     }
-    Ok(json!({"url": href, "screenTip": c.link_tip_at_caret(), "caret": caret(c)}))
+    let out = json!({"url": href, "screenTip": c.link_tip_at_caret(), "caret": caret(c)});
+    // A web address linked joins Link ▾'s recent items.
+    if let Some(h) = href.as_deref().filter(|h| web_location(h).is_some()) {
+        super::compose::remember_file(s, h);
+    }
+    Ok(out)
 }
 
 /// Longest ScreenTip accepted (characters).
@@ -2403,8 +2433,26 @@ fn symbol_text(v: &str) -> Option<String> {
 }
 
 fn symbol(s: &mut Session, p: &Value) -> CmdResult {
+    // A symbol font's character by its code ("Wingdings: 74"), as the Unicode character it stands for.
+    if let Some(font) = opt_str(p, "font").filter(|f| !f.trim().is_empty() && *f != "(normal text)") {
+        let code = p
+            .get("code")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|t| t.trim().parse().ok())))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| CmdError::Params("`code` is the character code (0-255)".into()))?;
+        let ch = symbol_fonts::map(font, code).ok_or_else(|| {
+            CmdError::Params(format!("{font} has no character at {code} that MailCraft can insert"))
+        })?;
+        let text = ch.to_string();
+        edit(s, p, |c| c.insert_text(&text))?;
+        return Ok(json!({"inserted": text, "font": font, "code": code}));
+    }
     let Some(ch) = opt_str(p, "char") else {
-        return dialog(s, "symbol", json!({"compose": compose_id(s, p)?}));
+        return dialog(
+            s,
+            "symbol",
+            json!({"compose": compose_id(s, p)?, "fonts": symbol_fonts::SYMBOL_FONTS}),
+        );
     };
     let text = symbol_text(ch).ok_or_else(|| CmdError::Params(format!("`{ch}` is not a symbol")))?;
     edit(s, p, |c| c.insert_text(&text))?;
@@ -3534,7 +3582,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Link",
             "Message › Include; Insert › Links",
             "Mod+K",
-            r#"{"url"?:string,"text"?:string,"screenTip"?:string,"bookmark"?:string,"heading"?:number,"top"?:bool,"email"?:string,"subject"?:string,"path"?:string}  ("" url removes the link; bookmark / heading / top: a place in this message; email + subject: a mailto link; path: attaches that file)"#,
+            r#"{"url"?:string,"text"?:string,"screenTip"?:string,"bookmark"?:string,"heading"?:number,"top"?:bool,"email"?:string,"subject"?:string,"path"?:string}  ("" url removes the link; bookmark / heading / top: a place in this message; email + subject: a mailto link; path: a recent file, linked when it is a web address, else attached)"#,
             false,
             rich_compose,
             link,
@@ -3624,7 +3672,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Symbol",
             "Insert › Symbols",
             "",
-            r#"{"char"?:string}  ("©" or "U+00A9")"#,
+            r#"{"char"?:string} | {"font":"Symbol"|"Wingdings","code":number}  ("©" or "U+00A9"; a symbol font's character is inserted as the Unicode character it stands for)"#,
             false,
             has_compose,
             symbol,
@@ -4314,6 +4362,56 @@ pub(crate) mod tests {
         assert_eq!(c.attachments.last().map(|a| a.data.clone()), Some(b"plan".to_vec()));
         assert!(!mailcraft_html::doc_to_html(&c.body).contains("file:"), "no link to a local file");
         assert!(s.run("insert.link", &json!({"path": dir.join("missing.txt").to_string_lossy()})).is_err());
+        // The file joins the recent files (kept in the settings); files that are gone drop out of the list
+        // (checked in the background, or at once when one fails to open).
+        let recent = crate::cmd::compose::recent_files(&s);
+        assert_eq!(recent.first().map(String::as_str), path.to_str());
+        std::fs::remove_file(&path).unwrap();
+        crate::cmd::compose::recheck_recent_files(&s);
+        assert!(crate::cmd::compose::recent_files(&s).is_empty());
+        // Picking a file that has gone since takes it off the list as well.
+        let gone = dir.join("Gone.txt");
+        std::fs::write(&gone, b"x").unwrap();
+        s.run("compose.attachFile", &json!({"path": gone.to_string_lossy()})).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        assert_eq!(crate::cmd::compose::recent_files(&s).len(), 1, "not checked again yet");
+        assert!(s.run("insert.link", &json!({"path": gone.to_string_lossy()})).is_err());
+        assert!(crate::cmd::compose::recent_files(&s).is_empty());
+        // A document on the web is linked, named after the file.
+        let r = s.run("insert.link", &json!({"path": "https://www.example.com/team/Q3 plan.docx"})).unwrap();
+        assert_eq!(
+            (r["url"].as_str(), r["linked"].as_bool()),
+            (Some("https://www.example.com/team/Q3%20plan.docx"), Some(true))
+        );
+        let html = mailcraft_html::doc_to_html(&s.composes[&id].body);
+        assert!(
+            html.contains("Q3 plan.docx</a>") && html.contains("https://www.example.com/team/Q3%20plan.docx"),
+            "{html}"
+        );
+        assert_eq!(web_location("C:\\Docs\\c.txt"), None);
+        assert_eq!(web_location("\\\\files.example.com\\team\\a.txt"), None);
+        assert_eq!(web_location("file:///home/u/x"), None);
+        drop(tmp);
+    }
+
+    #[test]
+    fn recent_files_are_kept_across_sessions_in_the_settings() {
+        let (mut s, _) = setup();
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let tmp = tempfile::tempdir_in(base).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..30 {
+            let p = tmp.path().join(format!("f{i}.txt"));
+            std::fs::write(&p, b"x").unwrap();
+            s.run("compose.attachFile", &json!({"path": p.to_string_lossy()})).unwrap();
+            paths.push(p.to_string_lossy().into_owned());
+        }
+        let recent = crate::cmd::compose::recent_files(&s);
+        assert_eq!(recent.len(), crate::cmd::compose::MAX_RECENT_FILES);
+        assert_eq!(recent[0], paths[29]);
+        // The list lives in the settings file, so a restart keeps it.
+        assert_eq!(s.settings.list(crate::cmd::compose::RECENT_FILES_KEY).first(), Some(&paths[29]));
         drop(tmp);
     }
 
@@ -4404,6 +4502,15 @@ pub(crate) mod tests {
         s.run("insert.symbol", &json!({"char": "€"})).unwrap();
         assert!(s.composes[&id].body.to_plain_text().contains("©€"));
         assert_eq!(s.run("insert.symbol", &json!({})).unwrap()["dialog"], "symbol");
+        // Symbol fonts: "Wingdings: 74" is the smiling face.
+        let r = s.run("insert.symbol", &json!({"font": "Wingdings", "code": 74})).unwrap();
+        assert_eq!(r["inserted"], "\u{263A}");
+        assert!(s.run("insert.symbol", &json!({"font": "Wingdings", "code": 48})).is_err());
+        assert!(s.run("insert.symbol", &json!({"font": "Wingdings"})).is_err());
+        assert_eq!(
+            s.run("insert.symbol", &json!({"font": "Symbol", "code": "97"})).unwrap()["inserted"],
+            "α"
+        );
         s.run("insert.equation", &json!({"preset": "pythagoreanTheorem"})).unwrap();
         assert!(s.composes[&id].images().iter().any(|(_, alt)| alt == "a^2+b^2=c^2"));
         assert_eq!(s.run("insert.equation", &json!({})).unwrap()["dialog"], "equation");

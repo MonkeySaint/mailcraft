@@ -41,7 +41,21 @@ pub struct SortSpec {
     /// The first paragraph or row is a header and keeps its place.
     pub header: bool,
     pub match_case: bool,
+    /// "Then by": keys compared in turn when the sort key is equal (at most [`MAX_THEN_BY`]).
+    pub then: Vec<SortKey>,
 }
+
+/// A "Then by" key of Sort Text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SortKey {
+    /// Field (0-based); `None` = the whole paragraph (a table's first column).
+    pub field: Option<usize>,
+    pub kind: SortKind,
+    pub descending: bool,
+}
+
+/// Most "Then by" keys (the dialog offers two).
+pub const MAX_THEN_BY: usize = 2;
 
 impl Default for SortSpec {
     fn default() -> Self {
@@ -52,6 +66,7 @@ impl Default for SortSpec {
             separator: '\t',
             header: false,
             match_case: false,
+            then: Vec::new(),
         }
     }
 }
@@ -62,17 +77,49 @@ impl SortSpec {
         SortSpec { descending, ..SortSpec::default() }
     }
 
-    /// The part of a paragraph's text this sort compares.
-    pub(crate) fn key<'a>(&self, text: &'a str) -> &'a str {
-        match self.field {
-            Some(n) => text.split(self.separator).nth(n).unwrap_or(""),
-            None => text,
+    /// Compares two records: by the sort key, then by each "Then by" key while they are equal.
+    /// `field_of(record, field)` is a record's text for a field (`None` = the whole record, or a table's
+    /// first column).
+    pub(crate) fn compare<R: ?Sized>(
+        &self,
+        a: &R,
+        b: &R,
+        field_of: &dyn Fn(&R, Option<usize>) -> String,
+    ) -> Ordering {
+        let mut ord = self.cmp(&field_of(a, self.field), &field_of(b, self.field));
+        for k in self.then.iter().take(MAX_THEN_BY) {
+            if ord != Ordering::Equal {
+                break;
+            }
+            ord = compare_keys(
+                k.kind,
+                k.descending,
+                self.match_case,
+                &field_of(a, k.field),
+                &field_of(b, k.field),
+            );
+        }
+        ord
+    }
+
+    /// A paragraph's text for `field` (split at the separator).
+    pub(crate) fn field_text(&self, text: &str, field: Option<usize>) -> String {
+        match field {
+            Some(n) => text.split(self.separator).nth(n).unwrap_or("").to_owned(),
+            None => text.to_owned(),
         }
     }
 
     /// Compares two keys.
     pub(crate) fn cmp(&self, a: &str, b: &str) -> Ordering {
-        let ord = match self.kind {
+        compare_keys(self.kind, self.descending, self.match_case, a, b)
+    }
+}
+
+/// Compares two keys read as `kind`.
+fn compare_keys(kind: SortKind, descending: bool, match_case: bool, a: &str, b: &str) -> Ordering {
+    {
+        let ord = match kind {
             // Keys that are a whole (finite) number come first, in numeric order, then the other keys as
             // text. Ranking by class first keeps this a total order (mixing number and text comparisons
             // between the same keys made cycles, which `sort_by` may panic on).
@@ -80,7 +127,7 @@ impl SortSpec {
                 (Some(x), Some(y)) => x.total_cmp(&y),
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
-                (None, None) if self.match_case => a.cmp(b),
+                (None, None) if match_case => a.cmp(b),
                 (None, None) => a.to_lowercase().cmp(&b.to_lowercase()),
             },
             SortKind::Number => cmp_opt(number_key(a), number_key(b)),
@@ -91,7 +138,7 @@ impl SortSpec {
                 (None, None) => Ordering::Equal,
             },
         };
-        if self.descending { ord.reverse() } else { ord }
+        if descending { ord.reverse() } else { ord }
     }
 }
 
@@ -232,6 +279,23 @@ mod tests {
     }
 
     #[test]
+    fn then_by_keys_break_ties() {
+        let spec = SortSpec {
+            field: Some(0),
+            separator: ',',
+            then: vec![
+                SortKey { field: Some(1), kind: SortKind::Number, descending: true },
+                SortKey { field: Some(2), kind: SortKind::Text, descending: false },
+            ],
+            ..SortSpec::default()
+        };
+        let field = |t: &str, f: Option<usize>| spec.field_text(t, f);
+        let mut rows = vec!["b,1,x", "a,2,z", "a,9,y", "a,2,a"];
+        rows.sort_by(|x, y| spec.compare(*x, *y, &|r: &str, f| field(r, f)));
+        assert_eq!(rows, ["a,9,y", "a,2,a", "a,2,z", "b,1,x"]);
+    }
+
+    #[test]
     fn specs_compare_keys() {
         let by_num = SortSpec { kind: SortKind::Number, ..SortSpec::default() };
         assert_eq!(by_num.cmp("item 9", "item 10"), Ordering::Less);
@@ -242,8 +306,8 @@ mod tests {
         assert_eq!(cased.cmp("b", "B"), Ordering::Greater);
         assert_eq!(SortSpec::default().cmp("b", "B"), Ordering::Equal);
         let field = SortSpec { field: Some(1), separator: ',', ..SortSpec::default() };
-        assert_eq!(field.key("Smith,Anna,12"), "Anna");
-        assert_eq!(field.key("alone"), "");
+        assert_eq!(field.field_text("Smith,Anna,12", field.field), "Anna");
+        assert_eq!(field.field_text("alone", field.field), "");
         assert_eq!(SortKind::from_name("Date"), Some(SortKind::Date));
         assert_eq!(SortKind::from_name("color"), None);
     }

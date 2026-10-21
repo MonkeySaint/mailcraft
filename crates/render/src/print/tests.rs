@@ -554,3 +554,50 @@ fn merge_documents_report_the_records_they_hold() {
     let (_, placed) = paginate_merge(&doc(MergeStyle::Letters, 2, &long), &blank(), &ctx(), &f);
     assert_eq!(placed, 2);
 }
+
+/// A copy of a bundled font file with its OS/2 `fsType` set to `fs_type`.
+fn with_fs_type(file: &str, fs_type: u16) -> &'static [u8] {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts").join(file);
+    let mut data = std::fs::read(path).unwrap();
+    let tables = usize::from(u16::from_be_bytes([data[4], data[5]]));
+    let rec = (0..tables).map(|i| 12 + 16 * i).find(|&r| &data[r..r + 4] == b"OS/2").unwrap();
+    let off = u32::from_be_bytes(data[rec + 8..rec + 12].try_into().unwrap()) as usize;
+    data[off + 8..off + 10].copy_from_slice(&fs_type.to_be_bytes());
+    Box::leak(data.into_boxed_slice())
+}
+
+/// Regression: a face marked Restricted License embedding is not put in a PDF; its text is drawn with the
+/// bundled stand-in.
+#[test]
+fn pdf_never_embeds_a_restricted_font() {
+    let pdf_with = |fs_type: u16| {
+        let mut f = fonts();
+        let id = f
+            .add_face(mailcraft_fonts::Face {
+                family: "Zed Restricted",
+                weight: 400,
+                italic: false,
+                data: with_fs_type("LiberationMono-Regular.ttf", fs_type),
+                index: 0,
+            })
+            .unwrap();
+        assert_eq!(f.embeddable(id), fs_type & 0x000e != 2 && fs_type & 0x0200 == 0);
+        let page = Page {
+            width: 400.0,
+            height: 200.0,
+            display: DisplayList {
+                items: vec![Style { font: id, ..Style::new(&f, 12.0, false) }.text(10.0, 20.0, "Secret")],
+            },
+        };
+        write_pdf(&[page], &f, &PdfInfo::default()).unwrap()
+    };
+    let has = |pdf: &[u8], name: &[u8]| pdf.windows(name.len()).any(|w| w == name);
+    let open = pdf_with(0);
+    assert!(has(&open, b"LiberationMono"), "an installable face is embedded");
+    let restricted = pdf_with(0x0002);
+    assert!(!has(&restricted, b"LiberationMono"), "a restricted face is not embedded");
+    assert!(has(&restricted, b"/FontFile"), "the text is still there, in the stand-in");
+    // Restricted plus a less restrictive bit: the least restrictive wins (OpenType OS/2 fsType).
+    assert!(has(&pdf_with(0x0006), b"LiberationMono"));
+    assert!(!has(&pdf_with(0x0200), b"LiberationMono"), "bitmap embedding only");
+}

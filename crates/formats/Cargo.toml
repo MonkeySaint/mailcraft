@@ -15,6 +15,10 @@ log.workspace = true
 encoding_rs.workspace = true
 # MIT: Compound File Binary container ([MS-CFB]) for .msg.
 cfb.workspace = true
+# MIT/Apache: XML reading for Office theme files.
+roxmltree.workspace = true
+# MIT/Zlib/Apache: DEFLATE for theme packages (.thmx).
+miniz_oxide.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

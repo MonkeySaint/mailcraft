@@ -23,6 +23,7 @@ pub(crate) struct FaceInfo {
     /// Address and length of the data this info was built from (detects a replaced `Face`).
     data_addr: usize,
     data_len: usize,
+    index: u32,
     pub font: Option<FontRef<'static>>,
     pub charmap: Option<Charmap<'static>>,
     /// Outline source, built once (it parses the glyph/CFF table headers).
@@ -40,6 +41,8 @@ pub(crate) struct FaceInfo {
     pub advances: Vec<f32>,
     /// Glyph ids for U+0000..U+00FF.
     pub fast_glyphs: Vec<u32>,
+    /// The OS/2 table's embedding permissions (`fsType`; 0 when the face has no OS/2 table).
+    pub fs_type: u16,
 }
 
 impl std::fmt::Debug for FaceInfo {
@@ -61,10 +64,11 @@ fn finite_or(v: f32, default: f32) -> f32 {
 
 impl FaceInfo {
     /// Info for data that is not a usable font: synthetic proportions, no glyphs.
-    fn placeholder(data: &'static [u8]) -> FaceInfo {
+    fn placeholder(data: &'static [u8], index: u32) -> FaceInfo {
         FaceInfo {
             data_addr: data.as_ptr() as usize,
             data_len: data.len(),
+            index,
             font: None,
             charmap: None,
             outlines: None,
@@ -76,12 +80,14 @@ impl FaceInfo {
             underline_thickness: 50.0,
             advances: Vec::new(),
             fast_glyphs: Vec::new(),
+            fs_type: 0,
         }
     }
 
-    pub fn parse(data: &'static [u8]) -> FaceInfo {
-        let Ok(font) = FontRef::from_index(data, 0) else {
-            return FaceInfo::placeholder(data);
+    /// Parses face `index` of `data` (0 for a single font; collections hold several).
+    pub fn parse(data: &'static [u8], index: u32) -> FaceInfo {
+        let Ok(font) = FontRef::from_index(data, index) else {
+            return FaceInfo::placeholder(data, index);
         };
         let m = font.metrics(Size::unscaled(), LocationRef::default());
         let upem = match m.units_per_em {
@@ -122,9 +128,14 @@ impl FaceInfo {
             })
             .collect();
         let outlines = Some(font.outline_glyphs());
+        let fs_type = {
+            use skrifa::raw::TableProvider;
+            font.os2().map(|t| t.fs_type()).unwrap_or(0)
+        };
         FaceInfo {
             data_addr: data.as_ptr() as usize,
             data_len: data.len(),
+            index,
             font: Some(font),
             charmap: Some(charmap),
             outlines,
@@ -136,12 +147,20 @@ impl FaceInfo {
             underline_thickness,
             advances,
             fast_glyphs,
+            fs_type,
         }
     }
 
-    /// True if this info was built from exactly `data`.
-    pub fn matches(&self, data: &'static [u8]) -> bool {
-        self.data_addr == data.as_ptr() as usize && self.data_len == data.len()
+    /// Whether the face's licence lets a document carry its outlines (OpenType OS/2 `fsType`): not when it is
+    /// marked Restricted License embedding only (usage bits 1–3 = 2; when several are set the least
+    /// restrictive wins) or bitmap embedding only (bit 9).
+    pub fn embeddable(&self) -> bool {
+        self.fs_type & 0x000e != 0x0002 && self.fs_type & 0x0200 == 0
+    }
+
+    /// True if this info was built from exactly face `index` of `data`.
+    pub fn matches(&self, data: &'static [u8], index: u32) -> bool {
+        self.data_addr == data.as_ptr() as usize && self.data_len == data.len() && self.index == index
     }
 
     /// Glyph id mapped for `c`, 0 when unmapped.

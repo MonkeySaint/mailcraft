@@ -1519,7 +1519,7 @@ fn merge_document(s: &mut Session, p: &Value, job: MergeJob<'_>) -> CmdResult {
         texts.push(t);
     }
     let doc = MergeDoc { style, records: texts, return_address: tidy_address(&return_address) };
-    let fonts = mailcraft_fonts::FontDb::bundled();
+    let fonts = mailcraft_fonts::FontDb::with_installed();
     let ctx = PrintContext { title: title.to_owned(), ..Default::default() };
     let (pages, placed) = paginate_merge(&doc, &setup, &ctx, &fonts);
     // Long letters can fill the pages before every contact has one: nothing is written then.
@@ -1534,7 +1534,7 @@ fn merge_document(s: &mut Session, p: &Value, job: MergeJob<'_>) -> CmdResult {
         Some(path) => Some(write_data_file(s, path, job.records)?),
         None => None,
     };
-    let mut out = crate::cmd::print::output_pages(s, &pages, title, printer, path)?;
+    let mut out = crate::cmd::print::output_pages(s, &pages, &fonts, title, printer, path)?;
     if let Some(o) = out.as_object_mut() {
         o.insert("merged".into(), json!(job.records.len()));
         o.insert("skipped".into(), json!(job.skipped));

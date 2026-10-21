@@ -306,36 +306,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             )
         }
         "defineNewMultilevelList" | "defineNewListStyle" => super::multilevel_dlg::show(ctx, app, d),
-        "applyStyles" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Apply Styles",
-                vec![
-                    f("name", "Style Name:", {
-                        let listed: Vec<String> =
-                            d.arr("styles").iter().filter_map(Value::as_str).map(str::to_owned).collect();
-                        if listed.is_empty() {
-                            Kind::Combo(
-                                mailcraft_engine::cmd::format::BUILTIN_STYLES
-                                    .iter()
-                                    .map(|s| (*s).to_owned())
-                                    .collect(),
-                            )
-                        } else {
-                            Kind::Combo(listed)
-                        }
-                    }),
-                    f("create", "Create a new style from the selection with this name", Kind::Check),
-                ],
-            )
-            .ok("Apply"),
-            |app, v| {
-                let action = if v.b("create") { "create" } else { "apply" };
-                cmd(app, "format.style", with(json!({"name": v.s("name"), "action": action}))).map(|_| None)
-            },
-        ),
+        "modifyStyle" => modify_style(ctx, app, d),
         "pasteSpecial" => {
             let html = crate::compose::clipboard_html();
             let text = crate::compose::clipboard_text();
@@ -426,7 +397,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             Out::Close
         }
         "messageSelectionPane" => message_selection_pane(ctx, app, d),
-        "multilevelGallery" => multilevel_gallery(ctx, app, d),
         "insert3dModel" => run_form(
             ctx,
             app,
@@ -457,17 +427,30 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                     f(
                         "what",
                         "Go to what:",
-                        combo(&["start", "end", "page", "paragraph", "table", "bookmark"]),
+                        combo(&["start", "end", "page", "paragraph", "line", "table", "bookmark"]),
                     ),
                     f("value", "Enter number or name:", Kind::Text),
+                    f("move", "Go:", combo(&GO_TO_MOVES)),
+                    f(
+                        "n",
+                        "",
+                        Kind::Note("A number goes to that one; +2 or -1 moves on or back from the cursor.".into()),
+                    ),
                 ],
             )
+            .init("move", json!(GO_TO_MOVES[0]))
             .ok("Go To"),
             |app, v| {
                 let what = v.s("what");
-                let target =
-                    if what == "start" || what == "end" { what } else { format!("{what}:{}", v.s("value")) };
-                cmd(app, "format.goTo", with(json!({"target": target}))).map(|_| None)
+                let target = match v.s("move").as_str() {
+                    m if m == GO_TO_MOVES[1] && what != "start" && what != "end" => format!("next:{what}"),
+                    m if m == GO_TO_MOVES[2] && what != "start" && what != "end" => format!("previous:{what}"),
+                    _ if what == "start" || what == "end" => what,
+                    _ => format!("{what}:{}", v.s("value")),
+                };
+                // Next / Previous leave the dialog open, as the original's buttons do.
+                cmd(app, "format.goTo", with(json!({"target": target})))
+                    .map(|_| if v.s("move") == GO_TO_MOVES[0] { None } else { Some(Out::Keep) })
             },
         ),
         "insertPicture" => run_form(
@@ -621,34 +604,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             )
         }
         "customizeColors" => customize_colors(ctx, app, d),
-        "customizeFonts" => {
-            let fonts: Vec<String> = THEME_FONT_CHOICES.iter().map(|s| (*s).to_owned()).collect();
-            run_form(
-                ctx,
-                app,
-                d,
-                Form::new(
-                    "Create New Theme Fonts",
-                    vec![
-                        f("heading", "Heading font:", Kind::Combo(fonts.clone())),
-                        f("body", "Body font:", Kind::Combo(fonts)),
-                        f("name", "Name:", Kind::Text),
-                    ],
-                )
-                .init("heading", json!(d.str("headingFont")))
-                .init("body", json!(d.str("bodyFont")))
-                .init("name", json!("Custom 1"))
-                .ok("Save"),
-                |app, v| {
-                    cmd(
-                        app,
-                        "compose.theme",
-                        with(json!({"action": "customize", "part": "fonts", "heading": v.s("heading"), "body": v.s("body"), "name": v.s("name")})),
-                    )
-                    .map(|_| None)
-                },
-            )
-        }
+        "customizeFonts" => customize_fonts(ctx, app, d),
         "translate" => translate(ctx, app, d),
         "wordCount" => word_count(ctx, app, d),
         "accessibility" => accessibility(ctx, app, d),
@@ -824,6 +780,9 @@ fn customize_colors(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 
 /// Sort Text: sort by paragraphs or a field / column, as text, numbers or dates, either way, with a header
 /// row kept in place.
+/// The "Then by" choice that adds no key.
+pub const SORT_THEN_NONE: &str = "(none)";
+
 fn sort_text(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let table = d.str("target") == "table";
     let fields = d.u64("fields").unwrap_or(1).clamp(1, 63);
@@ -834,6 +793,8 @@ fn sort_text(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     for n in 1..=fields {
         by.push(if table { format!("Column {n}") } else { format!("Field {n}") });
     }
+    let mut then: Vec<String> = vec![SORT_THEN_NONE.to_owned()];
+    then.extend(by.iter().cloned());
     let mut fields_list = vec![
         f("by", "Sort by:", Kind::Combo(by.clone())),
         f("type", "Type:", combo(&["Text", "Number", "Date"])),
@@ -845,6 +806,14 @@ fn sort_text(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         fields_list.push(f("separator", "Separate fields at:", combo(&["Tabs", "Commas", "Other"])));
         fields_list.push(f("other", "Other character:", Kind::Text));
     }
+    fields_list.extend([
+        f("then1", "Then by:", Kind::Combo(then.clone())),
+        f("then1type", "Then by type:", combo(&["Text", "Number", "Date"])),
+        f("then1order", "Then by order:", combo(&["Ascending", "Descending"])),
+        f("then2", "And then by:", Kind::Combo(then)),
+        f("then2type", "And then by type:", combo(&["Text", "Number", "Date"])),
+        f("then2order", "And then by order:", combo(&["Ascending", "Descending"])),
+    ]);
     let sep = if d.str("separator") == "comma" { "Commas" } else { "Tabs" };
     let c = json!(d.u64("compose"));
     run_form(
@@ -855,6 +824,8 @@ fn sort_text(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             .init("by", json!(by.first().cloned().unwrap_or_default()))
             .init("type", json!("Text"))
             .init("order", json!("Ascending"))
+            .init("then1", json!(SORT_THEN_NONE))
+            .init("then2", json!(SORT_THEN_NONE))
             .init("separator", json!(sep))
             .width(440.0),
         move |app, v| {
@@ -876,6 +847,27 @@ fn sort_text(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     None => {
                         o.insert("by".into(), json!("paragraphs"));
                     }
+                }
+                // "Then by" keys: a field number (or the whole paragraph), its type and order.
+                let mut keys = Vec::new();
+                for k in ["then1", "then2"] {
+                    let pick = v.s(k);
+                    if pick.is_empty() || pick == SORT_THEN_NONE {
+                        continue;
+                    }
+                    let mut key = json!({
+                        "type": v.s(&format!("{k}type")).to_lowercase(),
+                        "order": v.s(&format!("{k}order")).to_lowercase(),
+                    });
+                    if let (Some(n), Some(ko)) =
+                        (pick.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()), key.as_object_mut())
+                    {
+                        ko.insert("field".into(), json!(n));
+                    }
+                    keys.push(key);
+                }
+                if !keys.is_empty() {
+                    o.insert("thenBy".into(), json!(keys));
                 }
                 if !table {
                     let separator = match v.s("separator").as_str() {
@@ -965,58 +957,190 @@ fn translate(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     )
 }
 
-/// Multilevel List › Gallery Filter: the gallery's sections the filter shows (Current List, List Library,
-/// List Styles); clicking one applies it.
-fn multilevel_gallery(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let filter = d.str("filter");
-    let title = match filter.as_str() {
-        "current" => "Multilevel List: Current List",
-        "library" => "Multilevel List: List Library",
-        _ => "Multilevel List: All",
+#[derive(Clone, Default)]
+struct ThemeFontsState {
+    heading: String,
+    body: String,
+    name: String,
+    error: String,
+}
+
+/// Title of Customize Fonts.
+pub const CUSTOMIZE_FONTS_TITLE: &str = "Create New Theme Fonts";
+
+/// Customize Fonts: the heading and body fonts with a live sample of each, and the name to save them under.
+fn customize_fonts(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let cid = d.u64("compose");
+    let mut fonts: Vec<String> = THEME_FONT_CHOICES.iter().map(|s| (*s).to_owned()).collect();
+    for f in crate::compose::font_names() {
+        if !fonts.iter().any(|x| x.eq_ignore_ascii_case(&f)) {
+            fonts.push(f);
+        }
+    }
+    let init = ThemeFontsState {
+        heading: d.str("headingFont"),
+        body: d.str("bodyFont"),
+        name: "Custom 1".into(),
+        error: String::new(),
     };
-    let shown: Vec<String> = d.arr("shown").iter().filter_map(Value::as_str).map(str::to_owned).collect();
-    let current = d.get("current").cloned();
-    let library = d.arr("library");
-    let styles = d.arr("styles");
-    let compose = d.u64("compose");
-    window(ctx, app, d, title, 360.0, |ui, app| {
-        let mut pick: Option<Value> = None;
-        if shown.is_empty() {
-            muted(ui, app, "The text at the cursor is not in a list.");
-        }
-        if shown.iter().any(|s| s == "current") {
-            common::heading(ui, app, "Current List");
-            let sample = current
-                .as_ref()
-                .and_then(|c| c.get("sample").or_else(|| c.get("glyph")))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            ui.label(format!("{sample}  (the list at the cursor)"));
-        }
-        for (key, heading, list) in
-            [("library", "List Library", &library), ("styles", "List Styles", &styles)]
-        {
-            if !shown.iter().any(|s| s == key) {
+    with_state(
+        ctx,
+        app,
+        d.uid,
+        |_: &App| init,
+        |st, app| {
+            window(ctx, app, d, CUSTOMIZE_FONTS_TITLE, 460.0, |ui, app| {
+                let list: Vec<&str> = fonts.iter().map(String::as_str).collect();
+                egui::Grid::new(("theme-fonts", d.uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Heading font:");
+                    common::combo(ui, ("tf-heading", d.uid), &mut st.heading, &list, 220.0);
+                    ui.end_row();
+                    ui.label("Body font:");
+                    common::combo(ui, ("tf-body", d.uid), &mut st.body, &list, 220.0);
+                    ui.end_row();
+                });
+                // Sample: the heading and body text drawn in the chosen fonts.
+                ui.label("Sample");
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, app.theme.separator))
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let heading = crate::body::sample_family(ctx, &st.heading, 400);
+                        let body = crate::body::sample_family(ctx, &st.body, 400);
+                        ui.label(RichText::new("Heading").family(heading).size(20.0).color(app.theme.accent));
+                        ui.label(
+                            RichText::new("Body text: the quick brown fox jumps over the lazy dog.")
+                                .family(body)
+                                .size(13.0),
+                        );
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.add(egui::TextEdit::singleline(&mut st.name).desired_width(240.0));
+                });
+                if !st.error.is_empty() {
+                    ui.colored_label(app.theme.danger, &st.error);
+                }
+                let mut out = Out::Keep;
+                let mut go = false;
+                footer(ui, |ui| {
+                    if btn(ui, "Cancel") {
+                        out = Out::Close;
+                    }
+                    go =
+                        primary(ui, app, !st.heading.trim().is_empty() && !st.body.trim().is_empty(), "Save");
+                });
+                if go {
+                    let p = json!({"compose": cid, "action": "customize", "part": "fonts", "heading": st.heading,
+                                   "body": st.body, "name": st.name.trim()});
+                    match cmd(app, "compose.theme", p) {
+                        Ok(_) => out = Out::Close,
+                        Err(e) => st.error = e,
+                    }
+                }
+                out
+            })
+        },
+    )
+}
+
+/// Go To's moves: to the number or name typed, or to the next / previous one from the cursor.
+const GO_TO_MOVES: [&str; 3] = ["To the number or name", "Next", "Previous"];
+
+/// Alignments the Modify Style dialog offers: (label, `format.style` value).
+const STYLE_ALIGNS: [(&str, &str); 4] =
+    [("Left", "left"), ("Center", "center"), ("Right", "right"), ("Justify", "justify")];
+
+/// Modify Style: the style's font, size, emphasis, colour, alignment and spacing (and its name, for a
+/// created style), from `format.style` `define`. Only what was changed is sent: a property the style leaves
+/// to the theme or style set (shown with the value it has now) stays that way.
+fn modify_style(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let cid = d.u64("compose");
+    let name = d.str("name");
+    let builtin = d.bool("builtin");
+    let mut fonts: Vec<String> = d.arr("fonts").iter().filter_map(Value::as_str).map(str::to_owned).collect();
+    fonts.extend(crate::compose::font_names());
+    // A style without a font of its own shows the theme font it is drawn in.
+    let current_font = Some(d.str("font"))
+        .filter(|f| !f.is_empty())
+        .or_else(|| Some(d.str("shownFont")).filter(|f| !f.is_empty()))
+        .unwrap_or_else(|| mailcraft_fonts::BODY_FAMILY.to_owned());
+    if !fonts.iter().any(|f| f.eq_ignore_ascii_case(&current_font)) {
+        fonts.insert(0, current_font.clone());
+    }
+    let align = STYLE_ALIGNS.iter().find(|(_, v)| *v == d.str("align")).map_or("Left", |(l, _)| *l);
+    let mut fields = Vec::new();
+    if !builtin {
+        fields.push(f("newName", "Name:", Kind::Text));
+    }
+    fields.extend([
+        f("font", "Font:", Kind::Combo(fonts)),
+        f("size", "Size (pt):", Kind::Num { min: 1.0, max: 1638.0 }),
+        f("bold", "Bold", Kind::Check),
+        f("italic", "Italic", Kind::Check),
+        f("underline", "Underline", Kind::Check),
+        f("color", "Font color (#rrggbb, or auto):", Kind::Text),
+        f("align", "Alignment:", combo(&STYLE_ALIGNS.map(|(l, _)| l))),
+        f("before", "Space before (pt):", Kind::Num { min: 0.0, max: 1584.0 }),
+        f("after", "Space after (pt):", Kind::Num { min: 0.0, max: 1584.0 }),
+        f("line", "Line spacing (multiple):", Kind::Num { min: 0.25, max: 10.0 }),
+        f("reapply", "Apply the changed style to the selection", Kind::Check),
+    ]);
+    let size = d
+        .get("size")
+        .and_then(Value::as_f64)
+        .or_else(|| d.get("shownSize").and_then(Value::as_f64))
+        .unwrap_or(f64::from(mailcraft_fonts::BODY_SIZE_PT));
+    let form = Form::new(format!("Modify Style: {name}"), fields)
+        .width(460.0)
+        .init("newName", json!(name))
+        .init("font", json!(current_font))
+        .init("size", json!(size))
+        .init("bold", json!(d.bool("bold")))
+        .init("italic", json!(d.bool("italic")))
+        .init("underline", json!(d.bool("underline")))
+        .init("color", json!(if d.str("color").is_empty() { "auto".to_owned() } else { d.str("color") }))
+        .init("align", json!(align))
+        .init("before", json!(d.get("before").and_then(Value::as_f64).unwrap_or(0.0)))
+        .init("after", json!(d.get("after").and_then(Value::as_f64).unwrap_or(0.0)))
+        .init("line", json!(d.get("line").and_then(Value::as_f64).unwrap_or(1.0)));
+    let shown = form.init.clone();
+    run_form(ctx, app, d, form, move |app, v| {
+        let mut p = serde_json::Map::new();
+        p.insert("compose".into(), json!(cid));
+        p.insert("name".into(), json!(name));
+        p.insert("action".into(), json!("define"));
+        p.insert("reapply".into(), json!(v.b("reapply")));
+        for key in MODIFY_STYLE_PROPS {
+            if v.0.get(key) == shown.get(key) {
                 continue;
             }
-            common::heading(ui, app, heading);
-            for item in list {
-                let label = item.get("label").and_then(Value::as_str).unwrap_or_default();
-                let sample = item.get("sample").and_then(Value::as_str).unwrap_or_default();
-                let text = if sample.is_empty() { label.to_owned() } else { format!("{sample}  {label}") };
-                if ui.button(text).clicked() {
-                    pick = item.get("style").cloned();
+            let value = match key {
+                "font" | "color" => json!(v.s(key)),
+                "bold" | "italic" | "underline" => json!(v.b(key)),
+                "align" => {
+                    json!(STYLE_ALIGNS.iter().find(|(l, _)| *l == v.s("align")).map_or("left", |(_, a)| *a))
                 }
-            }
+                _ => json!(v.n(key)),
+            };
+            p.insert(key.into(), value);
         }
-        if let Some(style) = pick {
-            let _ = app.run("format.multilevel", json!({"compose": compose, "style": style}));
-            return Out::Close;
+        let new_name = v.s("newName");
+        if !builtin && !new_name.is_empty() && new_name != name {
+            p.insert("newName".into(), json!(new_name));
         }
-        footer(ui, |ui| if btn(ui, "Close") { Out::Close } else { Out::Keep })
+        // Nothing changed (and no reapply): the definition stays as it is.
+        if p.len() == 4 && !p.contains_key("newName") && !v.b("reapply") {
+            return Ok(None);
+        }
+        cmd(app, "format.style", Value::Object(p)).map(|_| None)
     })
 }
+
+/// Modify Style's properties, each sent only when changed.
+const MODIFY_STYLE_PROPS: [&str; 10] =
+    ["font", "size", "bold", "italic", "underline", "color", "align", "before", "after", "line"];
 
 fn word_count(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     // "Include text boxes and shapes" (on by default; remembered while the dialog is open).

@@ -194,6 +194,30 @@ fn sort_text_dialog_fields_types_and_header() {
 }
 
 #[test]
+fn sort_text_then_by_breaks_ties() {
+    let (mut s, id) = with_text("Smith,Anna,40\nJones,Bob,25\nSmith,Carl,31\nSmith,Anna,22");
+    s.run("compose.select", &json!({"all": true})).unwrap();
+    s.run(
+        "format.sort",
+        &json!({"separator": "comma", "field": 1, "thenBy": [{"field": 2}, {"field": 3, "type": "number", "order": "descending"}]}),
+    )
+    .unwrap();
+    assert_eq!(text(&s, id), "Jones,Bob,25\nSmith,Anna,40\nSmith,Anna,22\nSmith,Carl,31");
+    // Table rows too: by column 1, then column 2 as numbers.
+    let (mut s, _) = with_text("x");
+    s.run("insert.table", &json!({"rows": 3, "cols": 2})).unwrap();
+    for bad in [
+        json!({"thenBy": "field"}),
+        json!({"thenBy": [{"field": 0}]}),
+        json!({"thenBy": [{"type": "colour"}]}),
+        json!({"thenBy": [{"order": "up"}]}),
+        json!({"thenBy": [{}, {}, {}]}),
+    ] {
+        assert!(s.run("format.sort", &bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn sort_a_table_by_a_column() {
     let (mut s, id) = with_text("");
     s.run("insert.table", &json!({"rows": 3, "cols": 2})).unwrap();
@@ -263,4 +287,39 @@ fn junk_find_and_sort_params_never_panic() {
     for p in [json!({"field": 999}), json!({"field": "x"}), json!({"header": 1, "descending": "no"})] {
         let _ = s.run("format.sort", &p);
     }
+}
+
+#[test]
+fn go_to_lines_next_previous_and_relative() {
+    let (mut s, id) = with_text("one\ntwo\nthree");
+    // A line break inside a paragraph starts a line too.
+    if let Some(mailcraft_model::Block::Paragraph { inlines, .. }) =
+        s.composes.get_mut(&id).unwrap().body.blocks.get_mut(0)
+    {
+        inlines.push(mailcraft_model::Inline::LineBreak);
+        inlines.push(mailcraft_model::Inline::Text { text: "more".into(), style: Default::default() });
+    }
+    let lines = s.composes[&id].line_starts();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    let r = s.run("format.goTo", &json!({"target": "line:2"})).unwrap();
+    assert_eq!(r["caret"], json!({"path": [0], "offset": 4}));
+    let r = s.run("format.goTo", &json!({"target": "line:3"})).unwrap();
+    assert_eq!(r["caret"], json!({"path": [1], "offset": 0}));
+    // Next / Previous paragraph from the cursor.
+    let r = s.run("format.goTo", &json!({"target": "next:paragraph"})).unwrap();
+    assert_eq!(r["caret"]["path"], json!([2]));
+    let r = s.run("format.goTo", &json!({"target": "previous:paragraph"})).unwrap();
+    assert_eq!(r["caret"]["path"], json!([1]));
+    // +n / -n.
+    let r = s.run("format.goTo", &json!({"target": "paragraph:+1"})).unwrap();
+    assert_eq!(r["caret"]["path"], json!([2]));
+    let r = s.run("format.goTo", &json!({"target": "paragraph:-2"})).unwrap();
+    assert_eq!(r["caret"]["path"], json!([0]));
+    assert!(
+        s.run("format.goTo", &json!({"target": "previous:paragraph"})).is_err(),
+        "nothing before the first"
+    );
+    assert!(s.run("format.goTo", &json!({"target": "paragraph:-5"})).is_err());
+    assert!(s.run("format.goTo", &json!({"target": "next:table"})).is_err());
+    assert!(s.run("format.goTo", &json!({"target": "next:widget"})).is_err());
 }

@@ -95,6 +95,13 @@ pub fn body_with_panes(ui: &mut Ui, app: &mut App, cid: u64, min_h: f32, scroll:
     let Some(c) = app.s.composes.get(&cid) else {
         return;
     };
+    if c.editor.apply_styles {
+        let near = ui.available_rect_before_wrap().right_top();
+        apply_styles_window(ui.ctx(), app, cid, near);
+    }
+    let Some(c) = app.s.composes.get(&cid) else {
+        return;
+    };
     let avail = ui.available_rect_before_wrap();
     let (lw, rw) = widths(c, avail.width());
     let h = if scroll { ui.available_height().max(40.0) } else { min_h.max(40.0) };
@@ -396,6 +403,10 @@ fn styles_pane(ui: &mut Ui, app: &mut App, cid: u64) {
                     run = Some(("format.style", json!({"name": name})));
                 }
                 r.context_menu(|ui| {
+                    if ui.button("Modify...").clicked() {
+                        run = Some(("format.style", json!({"name": name, "action": "define"})));
+                        ui.close();
+                    }
                     if ui.button(format!("Update {name} to Match Selection")).clicked() {
                         run = Some(("format.style", json!({"name": name, "action": "modify"})));
                         ui.close();
@@ -456,6 +467,138 @@ fn styles_pane(ui: &mut Ui, app: &mut App, cid: u64) {
 }
 
 // -----------------------------------------------------------------------------------------------------------
+// Apply Styles
+
+/// Title of the Apply Styles pane.
+pub const APPLY_STYLES_TITLE: &str = "Apply Styles";
+/// Label of its style name box.
+pub const STYLE_NAME_LABEL: &str = "Style Name:";
+/// Most style names suggested under the box while typing.
+const MAX_STYLE_SUGGESTIONS: usize = 8;
+
+#[derive(Clone, Debug, Default)]
+struct ApplyStylesState {
+    name: String,
+    /// The box is being edited (it stops following the caret's style).
+    editing: bool,
+    autocomplete: bool,
+    /// Set once `autocomplete` was initialised.
+    ready: bool,
+}
+
+/// Style names starting with (then containing) `typed`, without regard to case.
+pub fn style_suggestions(names: &[String], typed: &str) -> Vec<String> {
+    let t = typed.trim().to_lowercase();
+    if t.is_empty() {
+        return Vec::new();
+    }
+    let mut starts: Vec<String> =
+        names.iter().filter(|n| n.to_lowercase().starts_with(&t)).cloned().collect();
+    let more =
+        names.iter().filter(|n| !n.to_lowercase().starts_with(&t) && n.to_lowercase().contains(&t)).cloned();
+    starts.extend(more);
+    starts.retain(|n| !n.eq_ignore_ascii_case(typed.trim()));
+    starts.truncate(MAX_STYLE_SUGGESTIONS);
+    starts
+}
+
+/// Apply Styles: a small window that stays open while you write, with the style at the cursor, a style
+/// name box (with suggestions), Reapply, Modify and the Styles pane button.
+fn apply_styles_window(ctx: &egui::Context, app: &mut App, cid: u64, near: egui::Pos2) {
+    let Some(c) = app.s.composes.get(&cid) else { return };
+    let names: Vec<String> = styles_list(c)
+        .iter()
+        .filter_map(|v| v.get("name").and_then(serde_json::Value::as_str).map(str::to_owned))
+        .collect();
+    let current = mailcraft_engine::cmd::format::current_style(c);
+    let styles_open = c.editor.styles_pane;
+    let state_id = Id::new(("mc-apply-styles", cid));
+    let mut st: ApplyStylesState = ctx.data(|d| d.get_temp(state_id)).unwrap_or_default();
+    if !st.ready {
+        st.autocomplete = true;
+        st.ready = true;
+    }
+    if !st.editing {
+        st.name = current.clone();
+    }
+    let mut open = true;
+    let mut run: Option<(&'static str, serde_json::Value)> = None;
+    egui::Window::new(APPLY_STYLES_TITLE)
+        .id(state_id.with("window"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(near + vec2(-PANE_W - 20.0, 8.0))
+        .default_width(240.0)
+        .show(ctx, |ui| {
+            ui.label(STYLE_NAME_LABEL);
+            let r = ui
+                .add(egui::TextEdit::singleline(&mut st.name).desired_width(220.0).id(state_id.with("name")));
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, STYLE_NAME_LABEL));
+            if r.changed() || r.has_focus() {
+                st.editing = true;
+            }
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if r.lost_focus() && !enter && !ui.input(|i| i.pointer.any_down()) {
+                st.editing = false;
+            }
+            if st.autocomplete && st.editing {
+                for n in style_suggestions(&names, &st.name) {
+                    if ui
+                        .add(egui::Button::selectable(false, n.as_str()).min_size(vec2(220.0, 20.0)))
+                        .clicked()
+                    {
+                        st.name = n;
+                        run = Some(("format.style", json!({"name": st.name.trim()})));
+                        st.editing = false;
+                    }
+                }
+            }
+            let known = names.iter().any(|n| n.eq_ignore_ascii_case(st.name.trim()));
+            if enter && !st.name.trim().is_empty() {
+                // A name that is not a style yet makes one from the selection, as the original does.
+                let action = if known { "apply" } else { "create" };
+                run = Some(("format.style", json!({"name": st.name.trim(), "action": action})));
+                st.editing = false;
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let label =
+                    if known && st.name.trim().eq_ignore_ascii_case(&current) { "Reapply" } else { "Apply" };
+                if ui
+                    .add_enabled(known, egui::Button::new(label))
+                    .on_hover_text("Apply this style to the selection again")
+                    .clicked()
+                {
+                    run = Some(("format.style", json!({"name": st.name.trim()})));
+                    st.editing = false;
+                }
+                if ui.add_enabled(known, egui::Button::new("Modify...")).clicked() {
+                    run = Some(("format.style", json!({"name": st.name.trim(), "action": "define"})));
+                }
+                let styles = ui.add(egui::Button::selectable(styles_open, "Styles"));
+                styles.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, styles_open, "Styles pane")
+                });
+                if styles.on_hover_text("Show the Styles pane").clicked() {
+                    run = Some(("format.stylesPane", json!({"show": !styles_open})));
+                }
+            });
+            ui.checkbox(&mut st.autocomplete, "AutoComplete style names");
+        });
+    ctx.data_mut(|d| d.insert_temp(state_id, st));
+    if !open {
+        run = Some(("format.stylesPane", json!({"apply": true, "show": false})));
+    }
+    if let Some((id, mut p)) = run {
+        if let Some(o) = p.as_object_mut() {
+            o.insert("compose".into(), json!(cid));
+        }
+        app.run(id, p);
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------
 // Selection
 
 fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
@@ -473,6 +616,10 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
     let mut hidden = hidden_objects(&ctx, cid);
     let before = hidden.clone();
     let mut select: Option<usize> = None;
+    let rename_id = Id::new(("mc-selection-rename", cid));
+    let mut renaming: Option<(usize, String)> = ctx.data(|d| d.get_temp(rename_id));
+    let mut run: Option<serde_json::Value> = None;
+    let count = objects.len();
     ui.horizontal(|ui| {
         if ui.add_enabled(!objects.is_empty(), egui::Button::new("Show All")).clicked() {
             hidden.clear();
@@ -513,15 +660,74 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
                             hidden.push(o.src.clone());
                         }
                     }
+                    if let Some((at, name)) = renaming.as_mut()
+                        && *at == i
+                    {
+                        let r = ui.add(egui::TextEdit::singleline(name).desired_width(120.0));
+                        r.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Object name")
+                        });
+                        if r.lost_focus() {
+                            if !ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                                run = Some(json!({"compose": cid, "rename": i, "name": name.trim()}));
+                            }
+                            renaming = None;
+                        } else {
+                            r.request_focus();
+                        }
+                        return;
+                    }
                     let text =
                         if is_hidden { RichText::new(&o.name).italics() } else { RichText::new(&o.name) };
-                    if ui.add(egui::Button::selectable(selected, text)).clicked() {
+                    let r = ui.add(egui::Button::selectable(selected, text));
+                    if r.clicked() {
                         select = Some(i);
+                    }
+                    if r.double_clicked() {
+                        renaming = Some((i, o.name.clone()));
+                    }
+                    r.context_menu(|ui| {
+                        if ui.button("Rename").clicked() {
+                            renaming = Some((i, o.name.clone()));
+                            ui.close();
+                        }
+                    });
+                    // Bring Forward / Send Backward (drawings; pictures sit in the text).
+                    if o.drawing.is_some() {
+                        let up = ui.add_enabled(i > 0, egui::Button::new("\u{25B2}").small());
+                        let up_label = format!("Bring {} forward", o.name);
+                        up.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, i > 0, up_label.clone())
+                        });
+                        if up.on_hover_text("Bring Forward").clicked() {
+                            run = Some(json!({"compose": cid, "move": i, "dir": "forward"}));
+                        }
+                        let down = ui.add_enabled(i + 1 < count, egui::Button::new("\u{25BC}").small());
+                        let down_label = format!("Send {} backward", o.name);
+                        down.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                i + 1 < count,
+                                down_label.clone(),
+                            )
+                        });
+                        if down.on_hover_text("Send Backward").clicked() {
+                            run = Some(json!({"compose": cid, "move": i, "dir": "backward"}));
+                        }
                     }
                 });
             }
         },
     );
+    match renaming {
+        Some(r) => ctx.data_mut(|d| {
+            d.insert_temp(rename_id, r);
+        }),
+        None => ctx.data_mut(|d| d.remove::<(usize, String)>(rename_id)),
+    }
+    if let Some(p) = run {
+        app.run("format.selectionPane", p);
+    }
     if hidden != before {
         set_hidden(&ctx, cid, hidden);
         ctx.request_repaint();

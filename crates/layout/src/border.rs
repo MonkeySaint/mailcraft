@@ -57,7 +57,7 @@ pub(crate) fn draw_edge(
     if !(at.is_finite() && a.is_finite() && b.is_finite() && t.is_finite()) || b <= a || t <= 0.0 {
         return;
     }
-    let color = edge.color.unwrap_or(ctx.default_color);
+    let color = edge.color.unwrap_or(ctx.default_color.get());
     let dark = color.lerp(Color::BLACK, 0.45);
     let light = color.lerp(Color::WHITE, 0.55);
     // A stroke of thickness `w` whose centre is `off` px in from the outer face.

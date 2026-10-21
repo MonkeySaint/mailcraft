@@ -1050,7 +1050,7 @@ fn spelling_before_send(s: &mut Session, cid: u64, p: &Value) -> Option<Value> {
     if !s.settings.bool("mail.compose.spellBeforeSend") || opt_bool(p, "spellCheck") == Some(false) {
         return None;
     }
-    let sp = crate::cmd::review::speller(s);
+    let sp = crate::cmd::review::compose_speller(s, cid);
     let c = s.composes.get_mut(&cid)?;
     crate::cmd::review::spell_check(&sp, c, false, 1);
     let count = c.spell_issues.iter().filter(|i| i.kind == "spelling" || i.kind == "repeated").count();
@@ -1483,8 +1483,161 @@ fn lookup_contacts(s: &Session, query: &str) -> Vec<String> {
 // Attachments and include
 // =======================================================================================================
 
+/// Settings key of the files attached recently and the web documents linked recently (newest first), listed
+/// by Attach File ▾ (files) and Link ▾ (both).
+pub const RECENT_FILES_KEY: &str = "state.compose.recentFiles";
+/// Most recent files kept.
+pub const MAX_RECENT_FILES: usize = 25;
+
+/// Whether the recent files still exist, as last checked. Menus ask for the list every frame they are open,
+/// and a file on a network share that is gone can make one check take seconds, so checks run on a
+/// background thread and the list shows what is known (a file not checked yet is listed).
+#[derive(Default)]
+struct FileChecks {
+    known: std::collections::HashMap<String, bool>,
+    running: bool,
+    /// Lists asked for since the last full re-check.
+    calls: u32,
+    /// Bumped by every answer given here (remembered, unreadable, checked now): a background check started
+    /// before it is out of date and dropped.
+    epoch: u64,
+}
+
+static FILE_CHECKS: std::sync::Mutex<Option<FileChecks>> = std::sync::Mutex::new(None);
+/// Lists asked for between two background re-checks of every recent file.
+const RECHECK_EVERY: u32 = 600;
+/// Most answers kept.
+const MAX_KNOWN_FILES: usize = 1_000;
+
+fn with_checks<T>(f: impl FnOnce(&mut FileChecks) -> T) -> Option<T> {
+    let mut g = FILE_CHECKS.lock().ok()?;
+    let st = g.get_or_insert_with(FileChecks::default);
+    if st.known.len() > MAX_KNOWN_FILES {
+        st.known.clear();
+    }
+    Some(f(st))
+}
+
+/// Records whether `path` exists (it was just read, or could not be).
+fn note_file(path: &str, exists: bool) {
+    let _ = with_checks(|st| {
+        st.known.insert(path.to_owned(), exists);
+        st.epoch = st.epoch.wrapping_add(1);
+    });
+}
+
+/// `paths` without the ones known to be gone; the others are checked in the background.
+fn still_there(paths: Vec<String>) -> Vec<String> {
+    let Some(keep) = with_checks(|st| {
+        st.calls = st.calls.wrapping_add(1);
+        if st.calls % RECHECK_EVERY == 0 && !st.running {
+            // Now and then every file is checked again (one may have been deleted since).
+            for p in &paths {
+                st.known.remove(p);
+            }
+        }
+        let unknown: Vec<String> = paths.iter().filter(|p| !st.known.contains_key(*p)).cloned().collect();
+        if !unknown.is_empty() && !st.running {
+            st.running = true;
+            let epoch = st.epoch;
+            let todo = unknown.clone();
+            let started =
+                std::thread::Builder::new().name("mailcraft-recent-files".into()).spawn(move || {
+                    let found: Vec<(String, bool)> =
+                        todo.into_iter().map(|p| (p.clone(), std::path::Path::new(&p).is_file())).collect();
+                    let _ = with_checks(|st| {
+                        st.running = false;
+                        if st.epoch == epoch {
+                            st.known.extend(found);
+                        }
+                    });
+                });
+            if started.is_err() {
+                // No threads here (the web build, where nothing is on a share): check now.
+                st.running = false;
+                for p in unknown {
+                    let exists = std::path::Path::new(&p).is_file();
+                    st.known.insert(p, exists);
+                }
+            }
+        }
+        paths.iter().map(|p| st.known.get(p) != Some(&false)).collect::<Vec<bool>>()
+    }) else {
+        return paths;
+    };
+    paths.into_iter().zip(keep).filter_map(|(p, k)| k.then_some(p)).collect()
+}
+
+/// Checks every recent file now (on this thread): what the lists show next is up to date.
+pub fn recheck_recent_files(s: &Session) {
+    for p in s.settings.list(RECENT_FILES_KEY) {
+        if crate::cmd::insert::web_location(&p).is_none() {
+            note_file(&p, std::path::Path::new(&p).is_file());
+        }
+    }
+}
+
+/// Files attached recently, newest first: those on this computer or a share that still exist (as checked
+/// in the background, see [`FileChecks`]); web documents are left out ([`recent_links`]).
+pub fn recent_files(s: &Session) -> Vec<String> {
+    let local: Vec<String> = s
+        .settings
+        .list(RECENT_FILES_KEY)
+        .into_iter()
+        .filter(|p| crate::cmd::insert::web_location(p).is_none())
+        .take(MAX_RECENT_FILES)
+        .collect();
+    still_there(local)
+}
+
+/// Web documents linked recently (http and https addresses), newest first: Link ▾ inserts them as links.
+pub fn recent_links(s: &Session) -> Vec<String> {
+    s.settings
+        .list(RECENT_FILES_KEY)
+        .into_iter()
+        .filter(|p| crate::cmd::insert::web_location(p).is_some())
+        .take(MAX_RECENT_FILES)
+        .collect()
+}
+
+/// Puts `path` (a file, or a web document's address) at the top of the recent files (kept in the settings,
+/// so the list survives a restart).
+pub fn remember_file(s: &mut Session, path: &str) {
+    let p = path.trim();
+    if p.is_empty() || p.chars().count() > 4096 || p.chars().any(char::is_control) {
+        return;
+    }
+    let mut list = s.settings.list(RECENT_FILES_KEY);
+    list.retain(|x| x != p);
+    list.insert(0, p.to_owned());
+    list.truncate(MAX_RECENT_FILES);
+    if let Err(e) = s.settings.set(RECENT_FILES_KEY, &json!(list)) {
+        log::debug!("recent files not kept: {e}");
+    }
+    if crate::cmd::insert::web_location(p).is_none() {
+        note_file(p, true);
+    }
+}
+
+/// Reads a recent file picked from a menu; one that cannot be read leaves the lists.
+pub(crate) fn read_recent_file(path: &str, cap: u64) -> Result<(String, Vec<u8>), CmdError> {
+    let r = read_file(path, cap);
+    if r.is_err() && !std::path::Path::new(path).is_file() {
+        note_file(path.trim(), false);
+    }
+    r
+}
+
 fn attach_file(s: &mut Session, p: &Value) -> CmdResult {
-    let Some((name, data)) = file_param(p, MAX_ATTACHMENT_BYTES)? else {
+    let picked = file_param(p, MAX_ATTACHMENT_BYTES);
+    // A recent file that is gone leaves Attach File ▾.
+    if picked.is_err()
+        && let Some(path) = opt_str(p, "path")
+        && !std::path::Path::new(path).is_file()
+    {
+        note_file(path.trim(), false);
+    }
+    let Some((name, data)) = picked? else {
         return dialog(s, "attachFile", json!({"compose": compose_id(s, p)?}));
     };
     let mime = opt_str(p, "mime_type").map(str::to_owned);
@@ -1496,7 +1649,11 @@ fn attach_file(s: &mut Session, p: &Value) -> CmdResult {
     let i = c.attach_bytes(&name, mime.as_deref(), data).map_err(CmdError::Failed)?;
     let (name, mime) =
         c.attachments.get(i).map(|a| (a.filename.clone(), a.mime_type.clone())).unwrap_or_default();
-    Ok(json!({"attached": name, "mimeType": mime, "index": i, "size": size, "count": c.attachments.len()}))
+    let count = c.attachments.len();
+    if let Some(path) = opt_str(p, "path") {
+        remember_file(s, path);
+    }
+    Ok(json!({"attached": name, "mimeType": mime, "index": i, "size": size, "count": count}))
 }
 
 /// Parses `itemId` (number or numeric string).
@@ -2132,8 +2289,10 @@ fn format_cmd(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"format": kind, "converted": converted, "title": c.title()}))
 }
 
-/// Largest theme file Browse for Themes reads.
+/// Largest MailCraft theme file (and saved-themes file / 16) read.
 const MAX_THEME_FILE: u64 = 64 * 1024;
+/// Largest Office theme file (.thmx package or theme .xml) Browse for Themes reads.
+const MAX_OFFICE_THEME_FILE: u64 = 8 * 1024 * 1024;
 
 /// Galleries for the Themes / Colors / Fonts / Effects menus and dialogs.
 pub fn theme_galleries() -> Value {
@@ -2162,6 +2321,49 @@ fn theme_state_json(c: &ComposeState) -> Value {
         "bodyFont": r.body_font,
         "effectSet": r.effects,
     })
+}
+
+/// A theme file read by Browse for Themes: MailCraft's own JSON format, or an Office theme (a `.thmx`
+/// package or a DrawingML theme `.xml` part, see `mailcraft_formats::theme`).
+fn read_theme_file(data: &[u8]) -> Result<ThemeFile, CmdError> {
+    if let Ok(file) = serde_json::from_slice::<ThemeFile>(data) {
+        return Ok(file);
+    }
+    let office = mailcraft_formats::theme::read_theme(data)
+        .map_err(|e| CmdError::Failed(format!("this is not a theme file: {e}")))?;
+    let effects =
+        crate::compose::effect_set(&office.effects).map_or_else(|| "Office".to_owned(), str::to_owned);
+    Ok(ThemeFile {
+        version: 1,
+        name: office.name,
+        colors: office.colors,
+        heading_font: office.heading_font,
+        body_font: office.body_font,
+        effects,
+    })
+}
+
+/// Writes `file` to `path`: an Office theme package for `.thmx`, a theme part for `.xml`, else MailCraft's
+/// JSON.
+fn write_theme_file(path: &str, file: &ThemeFile) -> Result<(), CmdError> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let office = || mailcraft_formats::theme::OfficeTheme {
+        name: file.name.clone(),
+        colors: file.colors.clone(),
+        heading_font: file.heading_font.clone(),
+        body_font: file.body_font.clone(),
+        effects: file.effects.clone(),
+    };
+    let bytes = match ext.as_str() {
+        "thmx" => mailcraft_formats::theme::write_thmx(&office()),
+        "xml" => mailcraft_formats::theme::theme_xml(&office()).into_bytes(),
+        _ => serde_json::to_vec_pretty(file).map_err(|e| CmdError::Failed(e.to_string()))?,
+    };
+    std::fs::write(path, bytes).map_err(|e| CmdError::Failed(format!("the theme could not be saved: {e}")))
 }
 
 /// A theme file (Save Current Theme / Browse for Themes): MailCraft's own JSON format.
@@ -2345,10 +2547,7 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
                 effects: r.effects.to_owned(),
             };
             if let Some(path) = &path {
-                let text =
-                    serde_json::to_string_pretty(&file).map_err(|e| CmdError::Failed(e.to_string()))?;
-                std::fs::write(path, text)
-                    .map_err(|e| CmdError::Failed(format!("the theme could not be saved: {e}")))?;
+                write_theme_file(path, &file)?;
             }
             let name = file.name.clone();
             let mut saved = saved_themes(s);
@@ -2379,9 +2578,8 @@ fn theme(s: &mut Session, p: &Value) -> CmdResult {
         "reset" => next = Default::default(),
         "browse" => {
             let path = opt_str(p, "path").unwrap_or_default();
-            let (_, data) = read_file(path, MAX_THEME_FILE)?;
-            let file: ThemeFile = serde_json::from_slice(&data)
-                .map_err(|e| CmdError::Failed(format!("this is not a MailCraft theme file: {e}")))?;
+            let (_, data) = read_file(path, MAX_OFFICE_THEME_FILE)?;
+            let file = read_theme_file(&data)?;
             apply_theme_file(&mut next, &file)?;
             // An opened theme joins the Themes gallery.
             let mut kept = saved.clone();
@@ -4640,6 +4838,49 @@ Original-Message-ID: <{mid}>\nDisposition: manual-action/MDN-sent-manually; disp
         );
         assert_eq!(s.run("compose.theme", &json!({"action": "browse"})).unwrap()["dialog"], "browseThemes");
         assert_eq!(s.run("compose.theme", &json!({"action": "save"})).unwrap()["dialog"], "saveTheme");
+    }
+
+    #[test]
+    fn office_theme_files_open_and_save() {
+        let mut s = session();
+        let id = open(&mut s);
+        s.run(
+            "compose.theme",
+            &json!({"action": "customize", "part": "fonts", "heading": "Georgia", "body": "Verdana", "name": "Pair"}),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Save Current Theme as an Office theme package and as a theme part.
+        let thmx = dir.path().join("Team.thmx");
+        let xml = dir.path().join("Team.xml");
+        for p in [&thmx, &xml] {
+            s.run("compose.theme", &json!({"action": "save", "path": p.to_str().unwrap(), "name": "Team"}))
+                .unwrap();
+        }
+        let package = std::fs::read(&thmx).unwrap();
+        assert!(package.starts_with(b"PK"), "a .thmx is a ZIP package");
+        let read = mailcraft_formats::theme::read_theme(&package).unwrap();
+        assert_eq!((read.name.as_str(), read.heading_font.as_str()), ("Team", "Georgia"));
+        assert!(std::fs::read_to_string(&xml).unwrap().contains("<a:theme"));
+        // Browse for Themes opens both kinds.
+        for p in [&thmx, &xml] {
+            let other = open(&mut s);
+            s.run(
+                "compose.theme",
+                &json!({"compose": other, "action": "browse", "path": p.to_str().unwrap()}),
+            )
+            .unwrap();
+            let r = s.composes[&other].theme_resolved();
+            assert_eq!((r.heading_font.as_str(), r.body_font.as_str()), ("Georgia", "Verdana"));
+            assert_eq!(r.colors, s.composes[&id].theme_resolved().colors);
+            assert_eq!(s.composes[&other].theme.name.as_deref(), Some("Team"));
+        }
+        // Anything else is refused with a reason.
+        let junk = dir.path().join("junk.thmx");
+        std::fs::write(&junk, b"PK\x03\x04 not really a package").unwrap();
+        let e =
+            s.run("compose.theme", &json!({"action": "browse", "path": junk.to_str().unwrap()})).unwrap_err();
+        assert!(e.to_string().contains("not a theme file"), "{e}");
     }
 
     #[test]

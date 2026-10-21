@@ -193,6 +193,12 @@ fn para_css(s: &ParaStyle, inherited: Align, join: BorderJoin) -> String {
     }
     if let Some(bg) = s.background {
         let _ = write!(css, ";background-color:{}", bg.to_hex());
+        // Text in the automatic colour turns white on dark shading (as the editor draws it), so it stays
+        // readable where the recipient's default text colour is black.
+        let lum = (0.299 * f32::from(bg.r) + 0.587 * f32::from(bg.g) + 0.114 * f32::from(bg.b)) / 255.0;
+        if bg.a >= 128 && lum < 0.4 {
+            css.push_str(";color:#ffffff");
+        }
     }
     css
 }

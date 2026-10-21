@@ -1537,18 +1537,80 @@ fn paint_texture(painter: &egui::Painter, r: Rect, tex: &egui::TextureHandle) {
 // ---------------------------------------------------------------------------------------------------------
 // Fonts and colours
 
-/// The bundled font database, shared through egui's temp data (built once per context).
+/// The font database for message bodies (bundled faces plus the installed fonts once the platform shell has
+/// indexed them, see [`FontDb::with_installed`]), shared through egui's temp data (built once per context).
 pub fn font_db(ctx: &egui::Context) -> Arc<FontDb> {
     let id = Id::new("mailcraft.body.fontdb");
     if let Some(db) = ctx.data(|d| d.get_temp::<Arc<FontDb>>(id)) {
         return db;
     }
-    let db = Arc::new(FontDb::bundled());
+    let db = Arc::new(FontDb::with_installed());
     ctx.data_mut(|d| d.insert_temp(id, Arc::clone(&db)));
     db
 }
 
-/// egui family name used for one bundled face.
+/// Most font families the Font list previews in their own face (each one registers a font with egui).
+pub const MAX_PREVIEW_FAMILIES: usize = 400;
+/// Most families first previewed in one frame (the rest show in the UI font until the next frames).
+pub const PREVIEWS_PER_FRAME: usize = 6;
+
+/// Families already previewed in the Font list, and how many were added this frame.
+#[derive(Clone, Default)]
+struct Previews {
+    names: std::collections::HashSet<String>,
+    frame: u64,
+    added: usize,
+}
+
+/// Whether `face` can draw `label`: every letter and digit has a glyph (symbol fonts cannot, so their names
+/// stay in the UI font).
+pub fn face_draws_label(db: &FontDb, id: McFontId, label: &str) -> bool {
+    label.chars().filter(|c| c.is_alphanumeric()).all(|c| db.has_glyph(id, c))
+}
+
+/// The egui family to draw the Font list entry `name` in: the face text in that font is drawn with (the
+/// installed font, else its bundled stand-in), registered on first use. `None` draws the entry in the UI
+/// font: symbol fonts, once [`MAX_PREVIEW_FAMILIES`] are previewed, and beyond [`PREVIEWS_PER_FRAME`] new
+/// ones in one frame (those follow on the next frames).
+pub fn preview_family(ctx: &egui::Context, name: &str) -> Option<FontFamily> {
+    let key = name.trim().to_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    let id = Id::new("mailcraft.body.font-previews");
+    let frame = ctx.cumulative_pass_nr();
+    let mut st = ctx.data(|d| d.get_temp::<Arc<Previews>>(id)).map(|a| (*a).clone()).unwrap_or_default();
+    if !st.names.contains(&key) {
+        if st.frame != frame {
+            st.frame = frame;
+            st.added = 0;
+        }
+        if st.names.len() >= MAX_PREVIEW_FAMILIES {
+            return None;
+        }
+        if st.added >= PREVIEWS_PER_FRAME {
+            ctx.request_repaint();
+            return None;
+        }
+        st.added += 1;
+        st.names.insert(key);
+        ctx.data_mut(|d| d.insert_temp(id, Arc::new(st)));
+    }
+    // Only the family's regular face is loaded for its entry (the rest when text uses the font).
+    let db = font_db(ctx);
+    let face = db.resolve_regular(name);
+    face_draws_label(&db, face, name).then(|| egui_family(ctx, &db, face))
+}
+
+/// The egui family text in font `name` is drawn with (the installed font, else its bundled stand-in), for
+/// samples in dialogs; registered on first use (the UI font until then).
+pub fn sample_family(ctx: &egui::Context, name: &str, weight: u16) -> FontFamily {
+    let db = font_db(ctx);
+    let id = db.resolve(name, weight, false);
+    egui_family(ctx, &db, id)
+}
+
+/// egui family name used for one face.
 pub fn face_family_name(family: &str, weight: u16, italic: bool) -> String {
     format!("mailcraft-body:{family}:{weight}:{}", if italic { "i" } else { "n" })
 }
@@ -1610,7 +1672,7 @@ fn egui_family(ctx: &egui::Context, db: &FontDb, id: McFontId) -> FontFamily {
         ctx.data_mut(|d| d.insert_temp(flag, true));
         ctx.add_font(egui::epaint::text::FontInsert::new(
             &name,
-            egui::FontData::from_static(face.data),
+            egui::FontData { index: face.index, ..egui::FontData::from_static(face.data) },
             vec![egui::epaint::text::InsertFontFamily {
                 family: family.clone(),
                 priority: egui::epaint::text::FontPriority::Highest,
@@ -1685,6 +1747,41 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_list_previews_are_budgeted_and_skip_symbol_faces() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        // The first frame previews a few names; the rest follow on later frames.
+        let names: Vec<String> = (0..PREVIEWS_PER_FRAME + 3).map(|i| format!("Font {i}")).collect();
+        let mut previewed = 0;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for n in &names {
+                if preview_family(ui.ctx(), n).is_some() {
+                    previewed += 1;
+                }
+            }
+        });
+        out.textures_delta.clear();
+        assert_eq!(previewed, PREVIEWS_PER_FRAME);
+        let mut later = 0;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for n in &names {
+                if preview_family(ui.ctx(), n).is_some() {
+                    later += 1;
+                }
+            }
+        });
+        out.textures_delta.clear();
+        assert_eq!(later, names.len(), "names seen before stay previewed");
+        assert!(preview_family(&ctx, "  ").is_none());
+        // A face without the letters of its name (a symbol font) shows the name in the UI font.
+        let db = FontDb::bundled();
+        let inter = db.resolve("Inter", 400, false);
+        assert!(face_draws_label(&db, inter, "Inter 123"));
+        assert!(!face_draws_label(&db, inter, "\u{4e2d}\u{6587}"));
+    }
 
     #[test]
     fn dark_mapping_inverts_lightness() {

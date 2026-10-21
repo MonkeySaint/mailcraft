@@ -683,7 +683,7 @@ pub struct Preview {
 
 /// Renders page `page` (clamped) of the job at `scale` device px per logical px.
 pub fn preview(s: &Session, p: &Value, page: usize, scale: f32) -> Result<Preview, CmdError> {
-    let fonts = FontDb::bundled();
+    let fonts = FontDb::with_installed();
     let job = build(s, p, &fonts)?;
     let n = job.pages.len();
     let page = page.min(n.saturating_sub(1));
@@ -726,7 +726,7 @@ fn page_range(spec: Option<&str>, n: usize) -> Vec<usize> {
 
 /// The PDF for the job described by `p` (honouring `pages`); returns (bytes, pages written, title).
 pub fn pdf_bytes(s: &Session, p: &Value) -> Result<(Vec<u8>, usize, String), CmdError> {
-    let fonts = FontDb::bundled();
+    let fonts = FontDb::with_installed();
     let job = build(s, p, &fonts)?;
     let keep = page_range(opt_str(p, "pages"), job.pages.len());
     let pages: Vec<Page> = keep.iter().filter_map(|i| job.pages.get(*i).cloned()).collect();
@@ -749,18 +749,19 @@ pub(crate) fn output_path(path: &str) -> Result<std::path::PathBuf, CmdError> {
 }
 
 /// Sends laid-out `pages` to `printer`: [`SAVE_AS_PDF`] writes them as a PDF at `path`; any other name (or
-/// [`DEFAULT_PRINTER`]) goes to the system print service. Returns `{"printer", "pages", "path"?}`.
+/// [`DEFAULT_PRINTER`]) goes to the system print service. `fonts` is the db the pages were laid out with.
+/// Returns `{"printer", "pages", "path"?}`.
 pub(crate) fn output_pages(
     s: &mut Session,
     pages: &[Page],
+    fonts: &FontDb,
     title: &str,
     printer: &str,
     path: Option<&str>,
 ) -> CmdResult {
-    let fonts = FontDb::bundled();
     let info = mailcraft_render::pdf::PdfInfo { title: title.to_owned(), author: String::new() };
     let pdf = |pages: &[Page]| {
-        mailcraft_render::pdf::write_pdf(pages, &fonts, &info).map_err(|e| CmdError::Failed(e.to_string()))
+        mailcraft_render::pdf::write_pdf(pages, fonts, &info).map_err(|e| CmdError::Failed(e.to_string()))
     };
     if printer.eq_ignore_ascii_case(SAVE_AS_PDF) {
         let path = path

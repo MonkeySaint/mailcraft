@@ -2688,7 +2688,9 @@ dependencies = [
  "mailcraft-mime",
  "mailcraft-model",
  "mailcraft-store",
+ "miniz_oxide 0.8.9",
  "proptest",
+ "roxmltree",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -2778,6 +2780,7 @@ dependencies = [
 name = "mailcraft-proof"
 version = "0.2.0"
 dependencies = [
+ "encoding_rs",
  "proptest",
  "unicode-segmentation",
 ]

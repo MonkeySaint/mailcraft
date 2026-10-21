@@ -174,12 +174,18 @@ impl Speller {
         if self.options().flag_repeated_words {
             repeated_words(text, &tokens, &mut issues);
         }
+        // The grammar rules and refinements are English; other languages get the language-neutral checks.
+        let english = self.is_english();
         if self.options().check_grammar {
             sentence_capitals(text, &tokens, &mut issues);
             double_spaces(text, &mut issues);
-            crate::rules::check(text, &tokens, self.options().confused_words, &mut issues);
+            if english {
+                crate::rules::check(text, &tokens, self.options().confused_words, &mut issues);
+            }
         }
-        crate::refine::check(text, &tokens, self.options().refinements, &mut issues);
+        if english {
+            crate::refine::check(text, &tokens, self.options().refinements, &mut issues);
+        }
         issues.truncate(MAX_ISSUES);
         dedupe(issues)
     }

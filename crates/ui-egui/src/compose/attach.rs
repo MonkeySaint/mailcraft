@@ -7,12 +7,13 @@
 //! - **Attach File ▾ › Browse This PC…** runs the platform's open-file dialog when the app installed one
 //!   ([`set_file_hooks`]; the desktop app uses the native dialog, the web build has none) and attaches every
 //!   file picked; without a picker it falls back to the engine's Insert File dialog (a path box).
-//! - **Recent files**: paths attached in this run, newest first, listed at the top of Attach File ▾.
+//! - **Recent files**: paths attached recently (kept by the engine across restarts, files that still exist),
+//!   newest first, listed at the top of Attach File ▾ and Link ▾.
 //! - **Drag and drop**: files dropped onto a compose window are attached; while files hover over it the
 //!   window shows a drop hint.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 use egui::{Align2, CornerRadius, Id, Rect, Sense, Stroke, Ui, vec2};
 use serde_json::{Value, json};
@@ -20,7 +21,7 @@ use serde_json::{Value, json};
 use crate::App;
 
 /// Most entries kept in the recent-files list.
-pub const MAX_RECENT: usize = 10;
+pub const MAX_RECENT: usize = mailcraft_engine::cmd::compose::MAX_RECENT_FILES;
 /// Drop hint text.
 pub const DROP_HINT: &str = "Drop files here to attach them";
 
@@ -38,7 +39,6 @@ pub struct FileHooks {
 
 static HOOKS: RwLock<FileHooks> =
     RwLock::new(FileHooks { pick_files: None, pick_save: None, open_path: None });
-static RECENT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Installs the platform's file services (call once at start-up from the app).
 pub fn set_file_hooks(hooks: FileHooks) {
@@ -56,27 +56,14 @@ pub fn file_hooks() -> FileHooks {
     }
 }
 
-/// Recently attached file paths, newest first.
-pub fn recent_files() -> Vec<String> {
-    match RECENT.lock() {
-        Ok(r) => r.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+/// Recently attached file paths that still exist, newest first.
+pub fn recent_files(app: &App) -> Vec<String> {
+    mailcraft_engine::cmd::compose::recent_files(&app.s)
 }
 
 /// Puts `path` at the top of the recent-files list.
-pub fn remember_file(path: &str) {
-    let p = path.trim();
-    if p.is_empty() || p.len() > 4096 {
-        return;
-    }
-    let mut list = match RECENT.lock() {
-        Ok(r) => r,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    list.retain(|x| x != p);
-    list.insert(0, p.to_owned());
-    list.truncate(MAX_RECENT);
+pub fn remember_file(app: &mut App, path: &str) {
+    mailcraft_engine::cmd::compose::remember_file(&mut app.s, path);
 }
 
 /// The file name part of a path (for menus and chips).
@@ -86,11 +73,7 @@ pub fn file_name(path: &str) -> String {
 
 /// Attaches the file at `path` to compose `cid` and remembers it. Returns whether it worked.
 pub fn attach_path(app: &mut App, cid: u64, path: &str) -> bool {
-    let ok = app.run("compose.attachFile", json!({"compose": cid, "path": path})).is_some();
-    if ok {
-        remember_file(path);
-    }
-    ok
+    app.run("compose.attachFile", json!({"compose": cid, "path": path})).is_some()
 }
 
 /// Browse This PC…: the platform's picker when installed (returns true: handled), else false (the caller
@@ -433,22 +416,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recent_files_keep_the_newest_first() {
-        // Paths are only remembered, never opened. Other tests share the list, so compare positions.
-        let tag = format!("/home/user/Documents/mailcraft-recent-test-{}", std::process::id());
-        for i in 0..12 {
-            remember_file(&format!("{tag}-{i}.txt"));
+    fn recent_files_keep_the_newest_first_and_survive_in_the_settings() {
+        let dir = std::env::temp_dir().join(format!("mailcraft-recent-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app =
+            App::new(mailcraft_engine::Session::new(mailcraft_engine::model::Mailbox::new_local("L")));
+        let path = |i: usize| dir.join(format!("f{i}.txt")).to_string_lossy().into_owned();
+        for i in 0..30 {
+            std::fs::write(path(i), b"x").unwrap();
+            remember_file(&mut app, &path(i));
         }
-        remember_file(&format!("{tag}-3.txt"));
-        let list = recent_files();
-        assert!(list.len() <= MAX_RECENT);
-        let at = |name: String| list.iter().position(|p| *p == name);
-        let three = at(format!("{tag}-3.txt"));
-        assert!(three.is_some());
-        assert!(at(format!("{tag}-11.txt")).is_none_or(|eleven| three < Some(eleven)), "{list:?}");
-        assert_eq!(list.iter().filter(|p| **p == format!("{tag}-3.txt")).count(), 1);
-        remember_file("   ");
+        remember_file(&mut app, &path(3));
+        let list = recent_files(&app);
+        assert_eq!(list.len(), MAX_RECENT);
+        assert_eq!(list[0], path(3));
+        assert_eq!(list.iter().filter(|p| **p == path(3)).count(), 1);
+        // A file that is gone is left out.
+        std::fs::remove_file(path(29)).unwrap();
+        mailcraft_engine::cmd::compose::recheck_recent_files(&app.s);
+        assert!(!recent_files(&app).contains(&path(29)));
+        remember_file(&mut app, "   ");
         assert_eq!(file_name("/a/b/report.pdf"), "report.pdf");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

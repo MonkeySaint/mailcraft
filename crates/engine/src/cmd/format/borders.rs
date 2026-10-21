@@ -360,19 +360,26 @@ pub(super) fn shading(s: &mut Session, p: &Value) -> CmdResult {
     if opt_bool(p, "custom") == Some(true) {
         return dialog(s, "colors", json!({"compose": compose_id(s, p)?, "target": "shading"}));
     }
+    // High-contrast only: the Shading palette offers only colours text stays readable on.
+    if let Some(v) = opt_bool(p, "highContrastOnly") {
+        let c = compose_mut(s, p)?;
+        c.editor.shading_high_contrast_only = v;
+        if p.get("color").is_none() && p.get("theme").is_none() {
+            return Ok(json!({"highContrastOnly": v}));
+        }
+    }
+    if opt_bool(p, "dialog") == Some(true) {
+        let cid = compose_id(s, p)?;
+        let state = s.composes.get(&cid).map(|c| dialog_state(c, "shading")).unwrap_or(Value::Null);
+        return dialog(s, "bordersAndShading", state);
+    }
     let themed = requested_theme_color(s, p)?;
-    let last = s.composes.get(&compose_id(s, p)?).and_then(|c| c.last_shading);
+    let last = s.composes.get(&compose_id(s, p)?).map(|c| c.last_shading.unwrap_or(super::DEFAULT_SHADING));
     let pattern = opt_str(p, "pattern");
     let mut col = match p.get("color") {
         _ if themed.is_some() => themed,
-        // The button face shades with the colour chosen last; before one is chosen it opens Borders and
-        // Shading on its Shading tab.
-        None if last.is_some() || pattern.is_some() => last.filter(|_| pattern.is_none()),
-        None => {
-            let cid = compose_id(s, p)?;
-            let state = s.composes.get(&cid).map(|c| dialog_state(c, "shading")).unwrap_or(Value::Null);
-            return dialog(s, "bordersAndShading", state);
-        }
+        // The button face shades with the colour chosen last (light grey before one is chosen).
+        None => last.filter(|_| pattern.is_none()),
         Some(Value::Null) => None,
         Some(v) => {
             let t = v
@@ -554,10 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn shading_patterns_blend_and_the_button_opens_the_dialog_first() {
+    fn shading_patterns_blend_and_the_button_applies_its_face_colour() {
         let (mut s, id) = with_text("shaded");
-        let r = opened(&mut s, "format.shading", json!({}));
+        // The face applies black before any colour was picked, as observed (it used to open the dialog).
+        let r = s.run("format.shading", &json!({})).unwrap();
+        assert_eq!(r["shading"], "#000000");
+        let r = opened(&mut s, "format.shading", json!({"dialog": true}));
         assert_eq!(r["tab"], "shading");
+        s.run("format.shading", &json!({"color": null})).unwrap();
+        s.composes.get_mut(&id).unwrap().last_shading = None;
+        // High-contrast only is a switch of the Shading menu.
+        assert_eq!(
+            s.run("format.shading", &json!({"highContrastOnly": true})).unwrap()["highContrastOnly"],
+            true
+        );
+        assert!(s.composes[&id].editor.shading_high_contrast_only);
         let r = s
             .run("format.shading", &json!({"color": "#ffffff", "pattern": "25%", "patternColor": "#000000"}))
             .unwrap();
