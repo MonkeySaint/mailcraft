@@ -1,6 +1,8 @@
-//! IMAP: response parser, client, sequence sets, modified UTF-7, and folder-role mapping.
+//! IMAP: response parser, client, sequence sets, modified UTF-7, namespaces (RFC 2342), and folder-role
+//! mapping.
 
 pub mod client;
+pub mod namespace;
 pub mod parse;
 pub mod seqset;
 pub mod utf7;

@@ -6,6 +6,8 @@
 //! - the OAuth 2.0 authorization server of [`crate::oauth`]: `POST /oauth/device` (device authorization),
 //!   `POST /oauth/token`, `GET /oauth/authorize` (answers with a redirect at once) and `GET /oauth/verify`.
 //!
+//! - the WebDAV / CardDAV / CalDAV server of [`crate::dav`] under `/dav/` and the `.well-known` DAV locations.
+//!
 //! Every request path is logged ([`crate::TestServers::web_requests`]). One request per connection.
 
 use std::collections::BTreeMap;
@@ -32,8 +34,13 @@ pub type SharedWeb = Arc<Mutex<WebState>>;
 const MAX_LOG: usize = 1000;
 
 pub fn serve(mut conn: Conn, ctx: &Ctx) {
-    if let Ok(Some(req)) = read_request(&mut conn, 64 * 1024) {
-        let _ = handle(&mut conn, ctx, &req);
+    if let Ok(Some(req)) = read_request(&mut conn, crate::dav::MAX_RESOURCE + 64 * 1024) {
+        let path = req.path.split('?').next().unwrap_or_default();
+        let _ = if crate::dav::handles(path) {
+            crate::dav::handle(&mut conn, ctx, &req)
+        } else {
+            handle(&mut conn, ctx, &req)
+        };
     }
     conn.close();
 }

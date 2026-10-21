@@ -250,7 +250,7 @@ pub fn search(s: &mut Session<'_>, tag: &str, p: &mut Parser<'_>, out: &mut Vec<
     let known = sel.known.clone();
     let views: Vec<View> = {
         let st = s.shared().lock();
-        let mb = st.user(&user).and_then(|u| u.mailbox(&name)).ok_or_else(|| no("Mailbox is gone"))?;
+        let mb = st.mbox(&user, &name).ok_or_else(|| no("Mailbox is gone"))?;
         known
             .iter()
             .enumerate()

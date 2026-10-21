@@ -1129,6 +1129,7 @@ mod tests {
                 last_error: None,
             }],
             next_op: 1,
+            ..Default::default()
         };
         s.mailbox.accounts.iter_mut().find(|a| a.id == acct).unwrap().sync = sync;
         let _ = item;

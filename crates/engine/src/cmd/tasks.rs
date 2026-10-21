@@ -44,8 +44,8 @@ use crate::compose::{ComposeAttachment, ComposeState};
 use crate::{CmdError, CmdResult, CommandSpec, Session, always};
 use mailcraft_model::task::{TaskRecurrence, TaskRequestState};
 use mailcraft_model::{
-    AccountKind, Appointment, DateTime, Doc, FlagState, FolderId, FolderRole, ItemId, Recurrence, Task,
-    TaskPriority, TaskStatus,
+    Appointment, DateTime, Doc, FlagState, FolderId, FolderRole, ItemId, Recurrence, Task, TaskPriority,
+    TaskStatus,
 };
 
 const TASK_FIELDS: [&str; 12] = [
@@ -299,6 +299,11 @@ fn advance_recurring(s: &mut Session, id: ItemId) -> Option<ItemId> {
     copy.recurrence = None;
     copy.from_mail = None;
     copy.reminder = None;
+    // The completed occurrence is an item of its own: the series keeps the UID and the server copy.
+    copy.remote = None;
+    if !copy.uid.trim().is_empty() {
+        copy.uid = crate::cmd::calendar::new_uid(s, copy_id, s.now().unix);
+    }
     s.mailbox.tasks.insert(copy_id, copy);
     let shift = next.unix.saturating_sub(t.due.or(t.start).map_or(next.unix, |d| d.unix));
     let mut t = t;
@@ -1030,11 +1035,6 @@ pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
     let tz = s.tz_offset_min;
     let today = s.now().day_number(tz);
     let day = |t: Option<DateTime>| t.map(|d| d.day_number(tz));
-    let server = s
-        .mailbox
-        .folder_account(folder)
-        .and_then(|a| s.mailbox.account(a))
-        .is_some_and(|a| a.kind != AccountKind::Local);
     let entries: Vec<Entry> = if st.view == "To-Do List" {
         todo_entries(s)
     } else {
@@ -1052,7 +1052,8 @@ pub fn view_rows(s: &Session, folder: FolderId) -> Vec<ViewRow> {
                     "Next 7 Days" => open && due.is_some_and(|d| d >= today && d < today.saturating_add(7)),
                     "Overdue" => open && due.is_some_and(|d| d < today),
                     "Assigned" => t.is_assigned_by_me(),
-                    "Server Tasks" => server,
+                    // Tasks that live on a task server (CalDAV), kept in step by send/receive.
+                    "Server Tasks" => t.on_server(),
                     _ => true,
                 }
             })

@@ -95,6 +95,9 @@ pub struct Task {
     /// When the task was last created or changed in MailCraft (the Modified column).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified: Option<DateTime>,
+    /// The server copy (CalDAV), when the task is synchronised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::account::RemoteRef>,
 }
 
 impl Task {
@@ -106,6 +109,11 @@ impl Task {
     /// True for a task I accepted from someone else's task request.
     pub fn is_requested(&self) -> bool {
         self.requested_by.is_some()
+    }
+
+    /// True for a task that lives on a server (CalDAV), not only here.
+    pub fn on_server(&self) -> bool {
+        self.remote.as_ref().is_some_and(|r| !r.url.is_empty())
     }
 
     /// True for my copy of a task I assigned to other people.

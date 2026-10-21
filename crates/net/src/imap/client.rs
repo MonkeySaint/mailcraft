@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use mailcraft_model::Security;
 
+use super::namespace::{self, Namespaces};
 use super::parse::{
     Code, Fetch, ListEntry, QuotaResource, Response, Status, Untagged, parse_response, trailing_literal,
 };
@@ -800,6 +801,35 @@ impl ImapClient {
             }
         }
         Ok(out)
+    }
+
+    /// NAMESPACE (RFC 2342; part of IMAP4rev2), prefixes decoded. A server without it has one personal
+    /// namespace with an empty prefix.
+    pub fn namespace(&mut self) -> Result<Namespaces> {
+        if !self.has_capability("NAMESPACE") && !self.has_capability("IMAP4rev2") {
+            return Ok(Namespaces::personal_only(None));
+        }
+        // A server (or proxy) that advertises NAMESPACE but refuses it has only the personal namespace as
+        // far as the client can tell; only a lost connection is an error.
+        let done = match self.run(Command::new("NAMESPACE")) {
+            Ok(done) => done,
+            Err(e) if e.is_connection_lost() => return Err(e),
+            Err(e) => {
+                log::info!("imap: NAMESPACE refused ({e}); using the personal namespace only");
+                return Ok(Namespaces::personal_only(None));
+            }
+        };
+        for u in &done.untagged {
+            if let Untagged::Other(line) = u
+                && let Some(mut n) = namespace::parse(line)
+            {
+                for ns in n.personal.iter_mut().chain(n.other_users.iter_mut()).chain(n.shared.iter_mut()) {
+                    ns.prefix = self.decode_mailbox(&ns.prefix);
+                }
+                return Ok(n);
+            }
+        }
+        Ok(Namespaces::personal_only(None))
     }
 
     pub fn create(&mut self, mailbox: &str) -> Result<()> {

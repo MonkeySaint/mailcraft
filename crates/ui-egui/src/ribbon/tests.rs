@@ -1430,3 +1430,16 @@ fn work_offline_and_download_preferences_show_the_engine_state() {
         assert_eq!(mailcraft_engine::sync::cmds::shown_preferences(&app.s).1, !before);
     }
 }
+
+#[test]
+fn share_calendar_menu_lists_each_calendar() {
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    app.run("calendar.addCalendar", serde_json::json!({"source": "blank", "name": "Team"}));
+    let items = state::dyn_items(&app, Surface::Main, "shareCalendars");
+    let names: Vec<&str> = items.iter().map(|d| d.label.as_str()).collect();
+    assert_eq!(names.first(), Some(&"Calendar"), "the default calendar comes first: {names:?}");
+    let team = items.iter().find(|d| d.label == "Team").expect("a new calendar gets its own entry");
+    let id = team.vars.iter().find(|(k, _)| *k == "$id").map(|(_, v)| v.clone()).unwrap();
+    let folder = mailcraft_model::FolderId(id.as_u64().unwrap());
+    assert_eq!(app.s.mailbox.folder(folder).map(|f| f.name.as_str()), Some("Team"));
+}

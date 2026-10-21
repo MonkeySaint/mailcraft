@@ -29,6 +29,7 @@
 //! time across daylight-saving changes.
 
 pub mod props;
+pub mod publish;
 pub mod subscribe;
 pub mod tz;
 pub mod views;
@@ -321,6 +322,8 @@ pub mod pim {
                     if let Some(mut c) = mb.contacts.get(&id).cloned() {
                         c.id = new;
                         c.folder = folder;
+                        // A copy is a new item: it goes to the server as one.
+                        c.remote = None;
                         mb.contacts.insert(new, c);
                     }
                 }
@@ -329,6 +332,8 @@ pub mod pim {
                         t.id = new;
                         t.folder = folder;
                         t.from_mail = None;
+                        t.uid = uid.clone();
+                        t.remote = None;
                         mb.tasks.insert(new, t);
                     }
                 }
@@ -803,7 +808,7 @@ fn overlay_enabled(s: &Session) -> Option<&'static str> {
 
 /// Calendar a command targets: `params.calendar` (name), `params.folder`, the selected calendar, else the
 /// default calendar.
-fn target_calendar(s: &Session, p: &Value) -> Result<FolderId, CmdError> {
+pub(crate) fn target_calendar(s: &Session, p: &Value) -> Result<FolderId, CmdError> {
     if let Some(name) = opt_str(p, "calendar") {
         let name = name.trim();
         return s
@@ -1268,21 +1273,19 @@ fn run_refresh_calendar(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "refreshed": out }))
 }
 
-/// Share Calendar › E-mail Calendar: a message with the calendar as an iCalendar attachment. `range`: `all`
-/// (default), `today`, `tomorrow`, `next7`, `next30` or `custom` (`from` to `to`, whole days, "YYYY-MM-DD");
-/// `detail`: `full` (default), `limited` (subject and time) or `availability` (busy/free blocks only).
-/// Private items are shared as their free/busy time only unless `includePrivate` is true (then like any
-/// other item). Reminders are left out.
-fn run_share(s: &mut Session, p: &Value) -> CmdResult {
-    let folder = target_calendar(s, p)?;
-    let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
+/// The date window of a shared range: `all` (none), `today`, `tomorrow`, `next7`, `next30` or `custom`
+/// (`from` to `to` in `p`, whole days, "YYYY-MM-DD").
+pub(crate) fn share_window(
+    s: &Session,
+    range: &str,
+    p: &Value,
+) -> Result<Option<(DateTime, DateTime)>, CmdError> {
     let clock = tz::Clock::of(s);
     let today = clock.midnight(s.now());
     let day_after = |t: DateTime, days: i64| {
         clock.from_local(clock.day(t).saturating_add(days).saturating_mul(pim::DAY_SECS))
     };
-    let range = opt_str(p, "range").unwrap_or("all");
-    let window = match range {
+    Ok(match range {
         "all" => None,
         "today" => Some((today, day_after(today, 1))),
         "tomorrow" => Some((day_after(today, 1), day_after(today, 2))),
@@ -1308,12 +1311,27 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
                 "`range` must be all|today|tomorrow|next7|next30|custom, not `{r}`"
             )));
         }
-    };
-    let detail = opt_str(p, "detail").unwrap_or("full");
-    if !["full", "limited", "availability"].contains(&detail) {
-        return Err(CmdError::Params(format!("`detail` must be full|limited|availability, not `{detail}`")));
+    })
+}
+
+/// Checks a share `detail` level.
+pub(crate) fn share_detail(detail: &str) -> Result<(), CmdError> {
+    if ["full", "limited", "availability"].contains(&detail) {
+        Ok(())
+    } else {
+        Err(CmdError::Params(format!("`detail` must be full|limited|availability, not `{detail}`")))
     }
-    let include_private = pim::flag(p, "includePrivate")?.unwrap_or(false);
+}
+
+/// Copies of the items of calendar `folder` to share: those in `window`, with details cut down to
+/// `detail`; private items show as free/busy time only unless `include_private`; no reminders.
+pub(crate) fn share_items(
+    s: &Session,
+    folder: FolderId,
+    window: Option<(DateTime, DateTime)>,
+    detail: &str,
+    include_private: bool,
+) -> Vec<Appointment> {
     let mut appts: Vec<Appointment> = s
         .mailbox
         .appointments
@@ -1341,6 +1359,29 @@ fn run_share(s: &mut Session, p: &Value) -> CmdResult {
         // The copy is not the user's item: no alarms go out with it.
         a.reminder_min = None;
     }
+    appts
+}
+
+/// Share Calendar › E-mail Calendar: a message with the calendar as an iCalendar attachment. `range`: `all`
+/// (default), `today`, `tomorrow`, `next7`, `next30` or `custom` (`from` to `to`, whole days, "YYYY-MM-DD");
+/// `detail`: `full` (default), `limited` (subject and time) or `availability` (busy/free blocks only).
+/// Private items are shared as their free/busy time only unless `includePrivate` is true (then like any
+/// other item). Reminders are left out. With `publish: true` the calendar is published instead
+/// (`calendar.publish`) and the message is a sharing invitation with its address, so recipients subscribe
+/// and see later changes.
+fn run_share(s: &mut Session, p: &Value) -> CmdResult {
+    if pim::flag(p, "publish")? == Some(true) {
+        return publish::share_invitation(s, p);
+    }
+    let folder = target_calendar(s, p)?;
+    let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
+    let clock = tz::Clock::of(s);
+    let range = opt_str(p, "range").unwrap_or("all");
+    let window = share_window(s, range, p)?;
+    let detail = opt_str(p, "detail").unwrap_or("full");
+    share_detail(detail)?;
+    let include_private = pim::flag(p, "includePrivate")?.unwrap_or(false);
+    let appts = share_items(s, folder, window, detail, include_private);
     let refs: Vec<&Appointment> = appts.iter().collect();
     let ics = ics_calendar(Some("PUBLISH"), &refs, s.now());
     let events = appts.len();
@@ -1387,7 +1428,7 @@ fn show_as_label(b: BusyStatus) -> &'static str {
     }
 }
 
-fn file_safe(name: &str) -> String {
+pub(crate) fn file_safe(name: &str) -> String {
     let n: String =
         name.chars().map(|c| if c.is_control() || "\\/:*?\"<>|".contains(c) { '_' } else { c }).collect();
     if n.trim().is_empty() { "calendar".into() } else { n.trim().to_owned() }
@@ -3880,9 +3921,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Share Calendar",
             "Home › Manage Calendars; Folder › Share",
             "",
-            r#"{"calendar"?: "<calendar name>", "folder"?: number, "range"?: "all|today|tomorrow|next7|next30|custom", "from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD" (custom), "detail"?: "full|limited|availability", "includePrivate"?: bool}"#,
-            false,
+            r#"{"calendar"?: "<calendar name>", "folder"?: number, "range"?: "all|today|tomorrow|next7|next30|custom", "from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD" (custom), "detail"?: "full|limited|availability", "includePrivate"?: bool, "publish"?: bool (publish online and send a sharing invitation with the address instead of a copy; see calendar.publish), "recipients"?: string (invitation recipients)}"#,
+            true,
             run_share,
+        ),
+        spec(
+            "calendar.publish",
+            "Publish Calendar Online",
+            "Home › Share Calendar; Folder › Share Calendar",
+            "",
+            r#"{"calendar"?: "<calendar name>", "folder"?: number, "account"?: number|string (whose WebDAV publishing location; default the calendar's account, else the first with one), "url"?: "https://… (publish exactly here)", "range"?: "all|today|tomorrow|next7|next30", "detail"?: "full|limited|availability", "includePrivate"?: bool, "stop"?: bool (stop publishing and remove the file)} → {"url", "webcal", "started"}"#,
+            true,
+            publish::run_publish,
         ),
         spec(
             "calendar.refreshCalendar",

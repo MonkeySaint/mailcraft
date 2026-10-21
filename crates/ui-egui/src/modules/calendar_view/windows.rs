@@ -66,6 +66,8 @@ struct ShareForm {
     /// `availability`, `limited` or `full`.
     detail: String,
     include_private: bool,
+    /// Publish online (WebDAV) and send a sharing invitation with the address instead of a copy.
+    publish: bool,
     error: String,
 }
 
@@ -849,8 +851,14 @@ fn calendars(app: &App) -> Vec<(u64, String)> {
     v.into_iter().map(|(_, n, id)| (id, n)).collect()
 }
 
+/// True when some account has a WebDAV location to publish calendars to.
+fn can_publish(app: &App) -> bool {
+    app.s.mailbox.accounts.iter().any(|a| a.dav.as_ref().is_some_and(|d| !d.publish_url.trim().is_empty()))
+}
+
 /// Share Calendar: the calendar, a date range and a detail level; OK writes the message with the calendar
-/// as an iCalendar attachment (`calendar.share`).
+/// as an iCalendar attachment (`calendar.share`), or publishes the calendar online and writes a sharing
+/// invitation with its address (`publish`). A published calendar shows where it is and can be withdrawn.
 fn share_window(ctx: &egui::Context, app: &mut App, cu: &mut CalUi) {
     let Some(mut f) = cu.windows.share.take() else { return };
     let center = ctx.content_rect().center();
@@ -909,6 +917,41 @@ fn share_window(ctx: &egui::Context, app: &mut App, cu: &mut CalUi) {
                 egui::Checkbox::new(&mut f.include_private, "Share private items in detail too"),
             );
             ui.end_row();
+            ui.label("");
+            let publishing = can_publish(app);
+            ui.add_enabled(
+                publishing,
+                egui::Checkbox::new(&mut f.publish, "Publish online and send a link that stays up to date"),
+            );
+            ui.end_row();
+            if !publishing {
+                ui.label("");
+                ui.label(
+                    RichText::new("Set a publishing location in Account Settings to publish calendars.")
+                        .color(app.theme.text_muted),
+                );
+                ui.end_row();
+            }
+            let published = mailcraft_engine::cmd::calendar::props::read(&app.s.mailbox, FolderId(f.folder))
+                .publication
+                .filter(|x| !x.withdraw);
+            if let Some(pubn) = published {
+                ui.label("Published:");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&pubn.url).color(app.theme.text_muted));
+                    if ui.button("Stop Publishing").clicked()
+                        && app.run("calendar.publish", json!({"folder": f.folder, "stop": true})).is_none()
+                    {
+                        f.error = take_error(app);
+                    }
+                });
+                ui.end_row();
+                if let Some(e) = &pubn.last_error {
+                    ui.label("");
+                    ui.label(RichText::new(format!("Last upload failed: {e}")).color(app.theme.text_muted));
+                    ui.end_row();
+                }
+            }
         });
         error_line(ui, app, &f.error);
         ui.add_space(6.0);
@@ -923,6 +966,15 @@ fn share_window(ctx: &egui::Context, app: &mut App, cu: &mut CalUi) {
                 "detail": f.detail,
                 "includePrivate": f.include_private && f.detail != "availability",
             });
+            if f.publish {
+                if f.range == "custom" {
+                    f.error =
+                        "A published calendar keeps a moving range: choose one other than Custom dates."
+                            .into();
+                    return;
+                }
+                put(&mut p, "publish", json!(true));
+            }
             if f.range == "custom" {
                 if parse_day(&f.from).is_none() || parse_day(&f.to).is_none() {
                     f.error = "Enter the start and end dates as YYYY-MM-DD.".into();

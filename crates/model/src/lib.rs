@@ -33,7 +33,7 @@ pub mod view;
 #[cfg(test)]
 mod tests;
 
-pub use account::{Account, AccountKind, Security, ServerSettings};
+pub use account::{Account, AccountKind, DavSettings, RemoteRef, Security, ServerSettings, SharedStore};
 pub use calendar::{Appointment, Attendee, BusyStatus, Recurrence};
 pub use category::{Category, CategoryColor};
 pub use contact::Contact;

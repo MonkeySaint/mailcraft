@@ -27,7 +27,8 @@ use mailcraft_net::oauth::{OAuthProvider, TokenSet};
 use mailcraft_net::pop3::{Pop3Client, Pop3Settings};
 use mailcraft_net::smtp::{SmtpClient, SmtpSettings};
 use mailcraft_net::sync::{
-    FetchProgress, FolderState, ImapAccount, ImapSettings, NewMessage, RemoteFolder, SyncDelta,
+    FetchProgress, FolderState, ImapAccount, ImapSettings, ListScope, NewMessage, RemoteFolder, SharedRoot,
+    SyncDelta,
 };
 use mailcraft_net::{ConnectOptions, Credentials, NetError};
 
@@ -136,6 +137,10 @@ pub(super) struct Outgoing {
 struct Receive {
     only: Option<Vec<String>>,
     states: BTreeMap<String, FolderState>,
+    /// The folders listed: the personal namespace, or a shared store's root.
+    scope: ListScope,
+    /// Also list the other users' and shared mailboxes the login can open (full runs of a personal account).
+    shared_roots: bool,
 }
 
 /// One POP3 run: what is already here, what to delete and what to download in full.
@@ -161,6 +166,8 @@ struct Job {
     fetch: Vec<(String, Vec<u32>)>,
     pop3: Option<Pop3Job>,
     jmap: Option<super::jmap::JmapJob>,
+    /// Contacts and tasks (CardDAV / CalDAV) and calendar publishing.
+    dav: Option<super::dav::DavJob>,
 }
 
 /// What a worker listens to between jobs.
@@ -274,6 +281,16 @@ pub(super) enum Event {
         account: AccountId,
         ev: super::jmap::JmapEvent,
     },
+    /// Contacts, tasks and published calendars (see `pim.rs`).
+    Dav {
+        account: AccountId,
+        ev: Box<super::pim::PimEvent>,
+    },
+    /// Other users' and shared mailboxes the account's login can open (RFC 2342).
+    SharedRoots {
+        account: AccountId,
+        roots: Vec<SharedRoot>,
+    },
     /// A refreshed OAuth token (store it).
     Tokens {
         account: AccountId,
@@ -317,6 +334,8 @@ impl Event {
             | Event::Pop3Full { account, .. }
             | Event::Pop3Server { account, .. }
             | Event::Jmap { account, .. }
+            | Event::Dav { account, .. }
+            | Event::SharedRoots { account, .. }
             | Event::Tokens { account, .. }
             | Event::OAuthPrompt { account, .. }
             | Event::OAuthDone { account, .. } => *account,
@@ -507,6 +526,21 @@ pub(super) fn oauth_http_options(s: &Session) -> ConnectOptions {
 }
 
 pub(super) fn conn_settings(s: &Session, a: &Account) -> Result<Conn, String> {
+    if let Some(sh) = &a.shared {
+        // Another user's or a shared mailbox: the owner's login, IMAP only, nothing to send or refresh.
+        let owner = s
+            .mailbox
+            .account(sh.owner)
+            .filter(|o| o.shared.is_none() && o.kind == AccountKind::Imap)
+            .ok_or("The account this shared mailbox belongs to is gone.")?;
+        let mut c = conn_settings(s, owner)?;
+        if !matches!(c.incoming, Incoming::Imap(_)) {
+            return Err("Shared mailboxes need an IMAP account.".into());
+        }
+        c.smtp = None;
+        c.oauth = None;
+        return Ok(c);
+    }
     let inc = a.incoming.as_ref().ok_or("The account has no incoming mail server.")?;
     if inc.host.trim().is_empty() {
         return Err("The account has no incoming mail server.".into());
@@ -663,7 +697,12 @@ fn imap_receive(s: &Session, a: &Account, plan: &Plan, sending: bool) -> Option<
                 fs.iter().filter_map(|f| s.mailbox.folder(*f).and_then(|f| f.remote_name.clone())).collect()
             })
         };
-        Receive { only, states }
+        let scope = match &a.shared {
+            Some(sh) => ListScope::Store { root: sh.root.clone(), delimiter: sh.delimiter },
+            None => ListScope::Personal,
+        };
+        let shared_roots = a.shared.is_none() && plan.receive && plan.folders.is_none() && !list_only;
+        Receive { only, states, scope, shared_roots }
     })
 }
 
@@ -778,6 +817,10 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
     // On Slow Connections Download Only Headers: like Download Headers, without the bodies following.
     let slow = super::slow_headers_only(s, id);
     let window = opts.download_months.map(|m| mailcraft_net::sync::months_before(now, m));
+    // Contacts, tasks and calendars go to the DAV server; the mail part only sees mail folders.
+    let dav = super::dav::build_job(s, &a, &plan).filter(|j| !j.is_empty());
+    let full_plan = plan;
+    let plan = super::dav::mail_only(s, id, &full_plan);
     let outgoing = outgoing_items(s, &a, &plan, now);
     let mut job = Job {
         conn,
@@ -789,6 +832,7 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         fetch: Vec::new(),
         pop3: None,
         jmap: None,
+        dav,
     };
     match &mut job.conn.incoming {
         Incoming::Imap(settings) => {
@@ -812,6 +856,7 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         && job.fetch.is_empty()
         && job.pop3.is_none()
         && job.jmap.is_none()
+        && job.dav.is_none()
     {
         s.sync.fetch.remove(&id);
         s.sync.force_headers.remove(&id);
@@ -821,7 +866,11 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         ops: job.ops.iter().map(|(i, _, _)| *i).collect(),
         sending: job.outgoing.iter().map(|o| o.item).collect(),
     };
-    let receiving = job.receive.is_some() || !job.ops.is_empty() || job.pop3.is_some() || job.jmap.is_some();
+    let receiving = job.receive.is_some()
+        || !job.ops.is_empty()
+        || job.pop3.is_some()
+        || job.jmap.is_some()
+        || job.dav.is_some();
     let progress = if receiving || !job.fetch.is_empty() { "Connecting…" } else { "Sending…" };
     s.sync.rt.submit(id, job)?;
     s.sync.fetch.remove(&id);
@@ -1212,23 +1261,39 @@ fn run_job(
         return Some(e);
     }
     let mut meter = RateMeter::default();
-    let res = match job.conn.incoming.clone() {
-        Incoming::Imap(settings) => run_imap(account, slot, settings, job, events, cancel, &mut meter),
-        Incoming::Pop3(settings) => {
-            if let Some(mut old) = slot.take() {
-                old.disconnect();
+    let mail_part = job.receive.is_some()
+        || !job.ops.is_empty()
+        || !job.outgoing.is_empty()
+        || !job.fetch.is_empty()
+        || job.pop3.is_some()
+        || job.jmap.is_some();
+    let res = if !mail_part {
+        None
+    } else {
+        match job.conn.incoming.clone() {
+            Incoming::Imap(settings) => run_imap(account, slot, settings, job, events, cancel, &mut meter),
+            Incoming::Pop3(settings) => {
+                if let Some(mut old) = slot.take() {
+                    old.disconnect();
+                }
+                run_pop3(account, &settings, job, events, cancel, &mut meter)
             }
-            run_pop3(account, &settings, job, events, cancel, &mut meter)
-        }
-        Incoming::Jmap(conn) => {
-            if let Some(mut old) = slot.take() {
-                old.disconnect();
+            Incoming::Jmap(conn) => {
+                if let Some(mut old) = slot.take() {
+                    old.disconnect();
+                }
+                super::jmap::run(account, &conn, job.jmap.as_ref(), &job.outgoing, events, cancel)
             }
-            super::jmap::run(account, &conn, job.jmap.as_ref(), &job.outgoing, events, cancel)
         }
     };
     meter.report(account, events);
-    res
+    // Contacts, tasks and published calendars: after the mail, also when the mail part failed (another
+    // server may well be reachable).
+    let dav = match job.dav.as_ref() {
+        Some(d) if !cancel.load(Ordering::SeqCst) => super::dav::run(account, d, events, cancel),
+        _ => None,
+    };
+    res.or(dav)
 }
 
 fn run_imap(
@@ -1298,7 +1363,14 @@ fn run_imap(
             return Some("Send/Receive was cancelled.".into());
         }
         progress("Updating the folder list…");
-        match imap.sync_folder_list() {
+        if rcv.shared_roots {
+            match imap.shared_roots() {
+                Ok(roots) => send(Event::SharedRoots { account, roots }),
+                Err(e) if e.is_connection_lost() => error = Some(e.to_string()),
+                Err(e) => log::info!("imap: no shared mailboxes listed: {e}"),
+            }
+        }
+        match imap.sync_folder_list_in(&rcv.scope) {
             Ok(list) => {
                 todo = list
                     .iter()
@@ -1883,6 +1955,8 @@ pub(super) fn poll_events(s: &mut Session) -> bool {
                 | Event::Pop3New { .. }
                 | Event::Pop3Full { .. }
                 | Event::Jmap { .. }
+                | Event::Dav { .. }
+                | Event::SharedRoots { .. }
                 | Event::OAuthDone { .. }
         )
     });
@@ -1983,6 +2057,8 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
                 apply_pop3_server(s, account, &present, &deleted)
             }
             Event::Jmap { account, ev } => super::jmap::apply(s, account, ev, &mut new_inbox),
+            Event::Dav { account, ev } => super::pim::apply(s, account, *ev),
+            Event::SharedRoots { account, roots } => super::shared::apply_roots(s, account, roots),
             Event::Tokens { account, tokens } => store_tokens(s, account, &tokens),
             Event::OAuthPrompt { account, prompt } => {
                 if let Some(f) = s.sync.oauth.get_mut(&account) {

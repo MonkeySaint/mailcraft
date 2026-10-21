@@ -84,6 +84,42 @@ Every account belongs to **All Accounts** unless excluded; F9 and scheduled runs
 Each account can have its own send/receive interval. These options and the sync bookkeeping are kept in
 `account-options.json` next to the data file (it holds no secrets).
 
+## Contacts, tasks and published calendars
+
+An IMAP or JMAP account can also keep its **Contacts** and **Tasks** folders on a server: in Account
+Settings › Change › **Contacts, Tasks and Calendar Server**, enter the server's address (a CardDAV / CalDAV
+server, principal or collection URL; the account's password signs in, or a separate user name). Send/Receive
+All Folders and **Update Folder** on Contacts or Tasks then synchronise both ways (CardDAV, RFC 6352;
+CalDAV tasks, RFC 4791):
+
+- the Contacts folder takes the server's first address book and the Tasks folder its first task list; more
+  address books and task lists get folders of their own below them;
+- an item changed here is uploaded with `If-Match`, a new one with `If-None-Match: *`, one deleted here is
+  deleted there; changes and deletions made on the server arrive here; when both sides changed an item the
+  copy changed here wins (a change made on the server during the run is never overwritten unseen);
+- details only MailCraft keeps (a contact's follow-up flag, a task's link to its mail) stay local;
+- **View › Change View › Server Tasks** lists the tasks that live on the server;
+- the links between items and their server copies survive settings changes that keep the same contacts
+  server and login (a new mail server, the address written with or without its trailing `/`); when they are
+  lost, the next run recognises items already on the server (same UID, or the same card) instead of
+  uploading them again;
+- the account's password or token is only sent to the contacts server and the publishing location; an
+  address a server answers with that points elsewhere is not followed.
+
+The same section takes a **publishing location**, a WebDAV collection. **Share Calendar** (one entry per
+calendar) can then publish a calendar there and write a sharing invitation with its `webcal://` address;
+every send/receive uploads it again when it changed, and subscribers refresh it (`REFRESH-INTERVAL`). The
+commands are `calendar.publish` and `calendar.share {"publish": true}`. A calendar is only published on the
+account's publishing server; publishing it again at another address removes the earlier file with the next
+send/receive.
+
+## Shared and other users' mailboxes
+
+A full send/receive of an IMAP account lists the mailboxes its login may open besides its own (the RFC 2342
+"other users" and "shared" namespaces). Account Settings › Change › **Shared Mailboxes** opens one as a
+mailbox of its own (`accounts.openSharedMailbox`): it signs in with the account's login, lists only that
+mailbox's folders, cannot send, and appears in the folder pane and in Search › Locations to Search.
+
 ## Passwords and tokens
 
 - The desktop app keeps account passwords and OAuth tokens in the operating system's credential store: the

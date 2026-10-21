@@ -21,6 +21,11 @@
 //!   Identity/get, EmailSubmission/set, blob upload and download, push over an event source) on the same
 //!   mail, for JMAP accounts.
 //!
+//! - a WebDAV server with CardDAV (RFC 6352) and CalDAV (RFC 4791) collections per user (contacts, calendar,
+//!   tasks and a public collection for published calendars) on the web server's ports (`dav.rs`);
+//!   and the RFC 2342 other-users and shared IMAP namespaces ([`TestServers::grant_access`],
+//!   [`TestServers::share_mailbox`]).
+//!
 //! - an OAuth 2.0 authorization server (device grant, authorization code with PKCE, refresh tokens) whose
 //!   access tokens sign in to IMAP and SMTP (XOAUTH2, OAUTHBEARER) and JMAP (Bearer), plus autoconfig
 //!   documents, both on a small web server (HTTP and HTTPS); and a fake DNS responder (UDP) answering SRV
@@ -33,6 +38,7 @@
 
 mod conn;
 mod date;
+mod dav;
 mod dns;
 mod imap;
 mod jmap;
@@ -112,6 +118,8 @@ pub struct Config {
     /// IMAP advertises IDLE (and IMAP4rev2, which includes it). Off to test clients facing a server without
     /// push.
     pub imap_idle: bool,
+    /// IMAP commands answered NO although advertised (upper case, e.g. `NAMESPACE`), as some proxies do.
+    pub imap_refuse: Vec<String>,
     /// Users created at start: (address, password).
     pub users: Vec<(String, String)>,
     /// The web server (autoconfig, OAuth) over plain HTTP.
@@ -147,6 +155,7 @@ impl Default for Config {
             add_trace_headers: true,
             idle_timeout: Duration::from_secs(30 * 60),
             imap_idle: true,
+            imap_refuse: Vec::new(),
             users: Vec::new(),
             web_port: 0,
             webs_port: 0,
@@ -423,6 +432,69 @@ impl TestServers {
     /// Every message the SMTP server accepted, oldest first.
     pub fn submissions(&self) -> Vec<Submission> {
         self.shared.lock().submissions.clone()
+    }
+
+    /// Lets `grantee` open `owner`'s mailboxes over IMAP as `Other Users/<owner>/…` (RFC 2342).
+    pub fn grant_access(&self, owner: &str, grantee: &str) -> Result<()> {
+        self.shared.lock().grant(owner, grantee)?;
+        self.shared.notify();
+        Ok(())
+    }
+
+    /// Makes `owner`'s mailboxes a shared mailbox every user can open as `Shared/<label>/…` (RFC 2342).
+    pub fn share_mailbox(&self, label: &str, owner: &str) -> Result<()> {
+        self.shared.lock().share(label, owner)?;
+        self.shared.notify();
+        Ok(())
+    }
+
+    /// The WebDAV root over HTTPS (`https://127.0.0.1:<webs_port>/dav/`): CardDAV and CalDAV discovery
+    /// start here.
+    pub fn dav_url(&self) -> String {
+        format!("{}/dav/", self.web_url())
+    }
+
+    /// The HTTPS URL of `user`'s DAV collection `collection` (`contacts`, `calendar`, `tasks`, `public`).
+    pub fn dav_collection_url(&self, user: &str, collection: &str) -> String {
+        format!("{}/dav/{user}/{collection}/", self.web_url())
+    }
+
+    /// The resources of `user`'s DAV collection: (name, data), by name. Empty for an unknown collection.
+    pub fn dav_items(&self, user: &str, collection: &str) -> Vec<(String, String)> {
+        let mut d = self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner());
+        d.ensure(user);
+        d.collection(user, collection)
+            .map(|c| {
+                c.items
+                    .iter()
+                    .map(|(n, i)| (n.clone(), String::from_utf8_lossy(&i.data).into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Stores a resource in `user`'s DAV collection (as if another client wrote it). Returns its ETag.
+    pub fn put_dav_item(&self, user: &str, collection: &str, name: &str, data: &str) -> Result<String> {
+        let ctype = match collection {
+            "contacts" => "text/vcard; charset=utf-8",
+            "public" => "application/octet-stream",
+            _ => "text/calendar; charset=utf-8",
+        };
+        let mut d = self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner());
+        d.put(user, collection, name, data.as_bytes().to_vec(), ctype)
+            .ok_or_else(|| Error::Invalid(format!("no DAV collection `{collection}`")))
+    }
+
+    /// Removes a resource from `user`'s DAV collection. True when it was there.
+    pub fn delete_dav_item(&self, user: &str, collection: &str, name: &str) -> bool {
+        let mut d = self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner());
+        d.ensure(user);
+        d.collection_mut(user, collection).is_some_and(|c| c.items.remove(name).is_some())
+    }
+
+    /// DAV requests received ("METHOD /path"), oldest first.
+    pub fn dav_requests(&self) -> Vec<String> {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).requests.clone()
     }
 
     /// Stops all threads now (also done on drop).

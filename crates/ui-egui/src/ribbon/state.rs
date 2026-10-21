@@ -491,7 +491,7 @@ pub struct DynItem {
 
 /// Names of the dynamic sources (for tests).
 #[cfg(test)]
-pub const SOURCES: [&str; 64] = [
+pub const SOURCES: [&str; 65] = [
     "shapes:Lines",
     "shapes:Rectangles",
     "shapes:Basic Shapes",
@@ -501,6 +501,7 @@ pub const SOURCES: [&str; 64] = [
     "shapes:Stars and Banners",
     "shapes:Callouts",
     "paragraphSpacing",
+    "shareCalendars",
     "themeFontNames",
     "fontNames",
     "styleSets",
@@ -954,6 +955,28 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                     swatch: None,
                     vars: vec![("$id", json!(i))],
                     on: q == &app.s.view.search,
+                })
+                .collect()
+        }
+        // Share Calendar: one entry per calendar (the default calendar first), each opening the share window
+        // for that calendar.
+        "shareCalendars" => {
+            let mut cals: Vec<(bool, String, u64)> = app
+                .s
+                .mailbox
+                .folders
+                .values()
+                .filter(|f| f.kind == mailcraft_model::FolderKind::Calendar)
+                .map(|f| (f.role.is_none(), f.name.clone(), f.id.0))
+                .collect();
+            cals.sort();
+            cals.into_iter()
+                .map(|(_, name, id)| DynItem {
+                    label: name.clone(),
+                    icon: "calendar",
+                    swatch: None,
+                    vars: vec![("$id", json!(id)), ("$name", json!(name))],
+                    on: false,
                 })
                 .collect()
         }

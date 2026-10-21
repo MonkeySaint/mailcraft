@@ -10,7 +10,7 @@ use rustls::ServerConfig;
 
 use crate::conn::Conn;
 use crate::store::Shared;
-use crate::{Config, Result, dns, imap, jmap, pop3, smtp, web};
+use crate::{Config, Result, dav, dns, imap, jmap, pop3, smtp, web};
 
 /// Maximum simultaneous connections per listener.
 const MAX_CONNECTIONS: usize = 256;
@@ -35,6 +35,8 @@ pub struct Ctx {
     pub web: web::SharedWeb,
     /// SRV records of the fake DNS responder.
     pub dns: dns::Zone,
+    /// WebDAV collections (contacts, calendars, tasks, published files).
+    pub dav: dav::SharedDav,
 }
 
 pub struct Running {
@@ -88,6 +90,7 @@ impl Running {
             jmap: Default::default(),
             web: Default::default(),
             dns: Default::default(),
+            dav: Default::default(),
         });
         let conn_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let mut accept_threads = Vec::new();

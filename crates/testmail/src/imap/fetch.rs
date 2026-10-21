@@ -142,8 +142,7 @@ pub fn fetch(s: &mut Session<'_>, p: &mut Parser<'_>, out: &mut Vec<u8>, uid_mod
     let mut any_changed = false;
     {
         let mut st = s.shared().lock();
-        let mb =
-            st.user_mut(&user).and_then(|u| u.mailbox_mut(&name)).ok_or_else(|| no("Mailbox is gone"))?;
+        let mb = st.mbox_mut(&user, &name).ok_or_else(|| no("Mailbox is gone"))?;
         for (seq, uid) in &targets {
             let need_seen = set_seen && mb.find(*uid).is_some_and(|m| !m.has_flag("\\Seen"));
             let new_modseq = if need_seen { Some(mb.next_modseq()) } else { None };
@@ -318,8 +317,7 @@ pub fn store(s: &mut Session<'_>, p: &mut Parser<'_>, out: &mut Vec<u8>, uid_mod
     let mut modified = Vec::new();
     {
         let mut st = s.shared().lock();
-        let mb =
-            st.user_mut(&user).and_then(|u| u.mailbox_mut(&name)).ok_or_else(|| no("Mailbox is gone"))?;
+        let mb = st.mbox_mut(&user, &name).ok_or_else(|| no("Mailbox is gone"))?;
         for (seq, uid) in &targets {
             let Some(m) = mb.find(*uid) else { continue };
             if unchanged_since.is_some_and(|u| m.modseq > u) {

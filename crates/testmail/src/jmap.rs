@@ -198,7 +198,7 @@ fn respond_json(conn: &mut Conn, status: &str, v: &Value) -> io::Result<()> {
 }
 
 /// The user the request authenticates as.
-fn authenticate(ctx: &Ctx, req: &Request) -> Option<String> {
+pub(crate) fn authenticate(ctx: &Ctx, req: &Request) -> Option<String> {
     let h = req.header("authorization")?;
     if let Some(b64) = h.strip_prefix("Basic ") {
         let raw = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;

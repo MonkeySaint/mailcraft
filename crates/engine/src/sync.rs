@@ -369,11 +369,16 @@ pub(crate) struct Track {
     flags: BTreeSet<ItemId>,
     folders_created: BTreeSet<FolderId>,
     folders_removed: BTreeSet<FolderId>,
+    /// Contacts and tasks the contacts/tasks server added or removed.
+    pim_created: BTreeSet<ItemId>,
+    pim_removed: BTreeSet<ItemId>,
 }
 
 impl Track {
     fn is_empty(&self) -> bool {
-        self.created.is_empty()
+        self.pim_created.is_empty()
+            && self.pim_removed.is_empty()
+            && self.created.is_empty()
             && self.removed.is_empty()
             && self.flags.is_empty()
             && self.folders_created.is_empty()
@@ -973,7 +978,14 @@ fn manage_push(s: &mut Session) {
                 && run.last_sync.is_some()
                 && run.error.is_none();
             if want != run.push_on {
-                let target = want.then(|| native::PushTarget::Imap("INBOX".to_owned()));
+                // A shared mailbox's Inbox has its own server name.
+                let inbox = s
+                    .mailbox
+                    .role_folder(id, mailcraft_model::FolderRole::Inbox)
+                    .and_then(|f| s.mailbox.folder(f))
+                    .and_then(|f| f.remote_name.clone())
+                    .unwrap_or_else(|| "INBOX".to_owned());
+                let target = want.then_some(native::PushTarget::Imap(inbox));
                 let sent = s.sync.rt.push(id, target);
                 if let Some(r) = s.sync.runs.get_mut(&id) {
                     r.push_on = want && sent;
@@ -1108,8 +1120,13 @@ fn delimiter(mb: &Mailbox, account: AccountId) -> char {
 fn remote_path(mb: &Mailbox, f: &Folder) -> Option<String> {
     let d = delimiter(mb, f.account);
     let leaf: String = f.name.chars().map(|c| if c == d { '-' } else { c }).collect();
+    let root = mb.account(f.account).and_then(|a| a.shared.as_ref()).map(|sh| sh.root.clone());
     match f.parent {
-        None => Some(leaf),
+        // A shared mailbox's top-level folders live below its root.
+        None => Some(match root {
+            Some(r) => format!("{r}{d}{leaf}"),
+            None => leaf,
+        }),
         Some(p) => {
             let pf = mb.folders.get(&p)?;
             let pn = pf.remote_name.as_deref()?;
@@ -1469,6 +1486,8 @@ fn item_changes(
 pub(crate) fn after_restore(s: &mut Session, live: &Mailbox) {
     // Internet calendars keep their last refresh (refreshes are not undo steps).
     crate::cmd::calendar::subscribe::carry_over(live, &mut s.mailbox);
+    // Contacts and tasks keep what their server sent and their links to it.
+    pim::carry_over(live, &mut s.mailbox, &s.sync.track.pim_created, &s.sync.track.pim_removed);
     if !live.accounts.iter().any(|a| a.kind == AccountKind::Imap) {
         return;
     }
@@ -1627,12 +1646,16 @@ fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
 
 pub mod arrival;
 pub mod cmds;
+#[cfg(not(target_arch = "wasm32"))]
+mod dav;
 pub mod focus;
 pub mod groups;
 #[cfg(not(target_arch = "wasm32"))]
 mod jmap;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
+pub mod pim;
+pub mod shared;
 
 // =======================================================================================================
 // OAuth sign-in

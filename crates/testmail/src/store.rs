@@ -1,6 +1,6 @@
 //! Shared in-memory mail state: users, mailboxes, messages, UIDs, flags, mod-sequences and SMTP log.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -9,6 +9,10 @@ use crate::{Error, Result};
 
 /// Mailbox hierarchy delimiter.
 pub const DELIM: char = '/';
+/// RFC 2342 other users' namespace: `Other Users/<owner address>/<mailbox>`.
+pub const OTHER_USERS_PREFIX: &str = "Other Users/";
+/// RFC 2342 shared namespace: `Shared/<label>/<mailbox>`.
+pub const SHARED_PREFIX: &str = "Shared/";
 /// Caps against runaway tests or hostile clients.
 const MAX_MAILBOXES: usize = 1000;
 const MAX_MESSAGES: usize = 200_000;
@@ -224,6 +228,11 @@ pub fn remove_flags(flags: &mut Vec<String>, rem: &[String]) -> bool {
 
 pub struct Store {
     users: BTreeMap<String, User>,
+    /// Shared mailboxes (RFC 2342 shared namespace): label → the account holding the mail.
+    shared_mailboxes: BTreeMap<String, String>,
+    /// (owner, grantee) pairs, lower-cased: the grantee sees the owner's mailboxes under
+    /// [`OTHER_USERS_PREFIX`].
+    grants: BTreeSet<(String, String)>,
     next_uidvalidity: u32,
     pub submissions: Vec<Submission>,
     /// Grants and tokens of the OAuth test server (see `oauth.rs`).
@@ -261,6 +270,8 @@ impl Store {
     pub fn new(uidvalidity_seed: u32) -> Store {
         Store {
             users: BTreeMap::new(),
+            shared_mailboxes: BTreeMap::new(),
+            grants: BTreeSet::new(),
             next_uidvalidity: uidvalidity_seed.max(1),
             submissions: Vec::new(),
             oauth: Default::default(),
@@ -281,6 +292,105 @@ impl Store {
 
     fn user_or_err(&mut self, address: &str) -> Result<&mut User> {
         self.users.get_mut(&Self::key(address)).ok_or_else(|| Error::UnknownUser(address.to_owned()))
+    }
+
+    /// Where mailbox `name` of `user`'s session lives: (owner, the owner's mailbox name). Names below
+    /// [`OTHER_USERS_PREFIX`] of an owner who granted `user` access, and below [`SHARED_PREFIX`] of a shared
+    /// mailbox, are that owner's; everything else is `user`'s own.
+    pub fn locate(&self, user: &str, name: &str) -> (String, String) {
+        if let Some(rest) = name.strip_prefix(OTHER_USERS_PREFIX)
+            && let Some((owner, inner)) = rest.split_once(DELIM)
+            && !inner.is_empty()
+            && self.grants.contains(&(Self::key(owner), Self::key(user)))
+        {
+            return (owner.to_owned(), canonical_name(inner));
+        }
+        if let Some(rest) = name.strip_prefix(SHARED_PREFIX)
+            && let Some((label, inner)) = rest.split_once(DELIM)
+            && !inner.is_empty()
+            && let Some(owner) = self.shared_mailboxes.get(label)
+        {
+            return (owner.clone(), canonical_name(inner));
+        }
+        (user.to_owned(), name.to_owned())
+    }
+
+    /// Mailbox `name` as `user`'s session sees it (see [`Store::locate`]).
+    pub fn mbox(&self, user: &str, name: &str) -> Option<&Mailbox> {
+        let (owner, inner) = self.locate(user, name);
+        self.user(&owner)?.mailbox(&inner)
+    }
+
+    /// Mutable [`Store::mbox`].
+    pub fn mbox_mut(&mut self, user: &str, name: &str) -> Option<&mut Mailbox> {
+        let (owner, inner) = self.locate(user, name);
+        self.user_mut(&owner)?.mailbox_mut(&inner)
+    }
+
+    /// True when `a` and `b` (names of `user`'s session) belong to the same account.
+    pub fn same_owner(&self, user: &str, a: &str, b: &str) -> bool {
+        Self::key(&self.locate(user, a).0) == Self::key(&self.locate(user, b).0)
+    }
+
+    /// Every name `user`'s session can list, with whether it is a real mailbox (`false`: a `\Noselect`
+    /// namespace container) and whether it has children. Own mailboxes first, then other users' and shared
+    /// mailboxes under their namespace prefixes.
+    pub fn visible(&self, user: &str) -> Vec<(String, bool, bool)> {
+        let mut out = Vec::new();
+        let Some(me) = self.user(user) else { return out };
+        for mb in &me.mailboxes {
+            out.push((mb.name.clone(), true, me.has_children(&mb.name)));
+        }
+        let mut foreign: Vec<(String, &User)> = Vec::new();
+        for (owner, grantee) in &self.grants {
+            if *grantee == Self::key(user)
+                && let Some(u) = self.users.get(owner)
+            {
+                foreign.push((format!("{OTHER_USERS_PREFIX}{}", u.address), u));
+            }
+        }
+        let others = foreign.len();
+        for (label, owner) in &self.shared_mailboxes {
+            if let Some(u) = self.user(owner) {
+                foreign.push((format!("{SHARED_PREFIX}{label}"), u));
+            }
+        }
+        if others > 0 {
+            out.push((OTHER_USERS_PREFIX.trim_end_matches(DELIM).to_owned(), false, true));
+        }
+        if foreign.len() > others {
+            out.push((SHARED_PREFIX.trim_end_matches(DELIM).to_owned(), false, true));
+        }
+        for (root, u) in foreign {
+            out.push((root.clone(), false, !u.mailboxes.is_empty()));
+            for mb in &u.mailboxes {
+                out.push((format!("{root}{DELIM}{}", mb.name), true, u.has_children(&mb.name)));
+            }
+        }
+        out
+    }
+
+    /// Lets `grantee` open `owner`'s mailboxes (under [`OTHER_USERS_PREFIX`]).
+    pub fn grant(&mut self, owner: &str, grantee: &str) -> Result<()> {
+        for u in [owner, grantee] {
+            if self.user(u).is_none() {
+                return Err(Error::UnknownUser(u.to_owned()));
+            }
+        }
+        self.grants.insert((Self::key(owner), Self::key(grantee)));
+        Ok(())
+    }
+
+    /// Publishes `owner`'s mailboxes to every user as the shared mailbox `label` (under [`SHARED_PREFIX`]).
+    pub fn share(&mut self, label: &str, owner: &str) -> Result<()> {
+        if self.user(owner).is_none() {
+            return Err(Error::UnknownUser(owner.to_owned()));
+        }
+        if label.is_empty() || label.contains(DELIM) || label.bytes().any(|b| b < b' ' || b == b'"') {
+            return Err(Error::Invalid(format!("shared mailbox label `{label}`")));
+        }
+        self.shared_mailboxes.insert(label.to_owned(), owner.trim().to_owned());
+        Ok(())
     }
 
     pub fn check_password(&self, address: &str, password: &str) -> Option<String> {
@@ -466,8 +576,9 @@ impl Store {
                 None => return Err(Error::Invalid(format!("flag `{f}`"))),
             }
         }
-        let u = self.user_or_err(user)?;
-        let mb = u.mailbox_mut(mailbox).ok_or_else(|| Error::UnknownMailbox(mailbox.to_owned()))?;
+        let (owner, inner) = self.locate(user, mailbox);
+        let u = self.user_or_err(&owner)?;
+        let mb = u.mailbox_mut(&inner).ok_or_else(|| Error::UnknownMailbox(mailbox.to_owned()))?;
         Ok(append_msg(mb, Arc::from(raw), clean, date))
     }
 

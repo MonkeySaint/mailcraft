@@ -106,6 +106,9 @@ fn try_run(app: &mut App, id: &str, params: Value) -> Result<Value, String> {
 
 /// The account type shown in Account Settings (POP3 accounts are IMAP-kind accounts with the POP3 option).
 fn account_type(app: &App, a: &Account) -> &'static str {
+    if a.shared.is_some() {
+        return "Shared mailbox (IMAP)";
+    }
     if mailcraft_engine::accounts::kind_label(&app.s, a) == "pop3" { "POP/SMTP" } else { kind_label(a.kind) }
 }
 
@@ -440,6 +443,12 @@ struct Extra {
     client_secret: String,
     device: bool,
     oauth_error: String,
+    /// Contacts and tasks server (CardDAV / CalDAV) and calendar publishing location.
+    dav_url: String,
+    dav_contacts: bool,
+    dav_tasks: bool,
+    dav_publish: String,
+    dav_user: String,
 }
 
 impl Default for Extra {
@@ -470,7 +479,39 @@ impl Extra {
             client_secret: String::new(),
             device: true,
             oauth_error: String::new(),
+            dav_url: String::new(),
+            dav_contacts: true,
+            dav_tasks: true,
+            dav_publish: String::new(),
+            dav_user: String::new(),
         }
+    }
+
+    fn fill_dav(&mut self, d: Option<&mailcraft_model::DavSettings>) {
+        let d = d.cloned().unwrap_or(mailcraft_model::DavSettings {
+            contacts: true,
+            tasks: true,
+            ..Default::default()
+        });
+        self.dav_url = d.url;
+        self.dav_contacts = d.contacts;
+        self.dav_tasks = d.tasks;
+        self.dav_publish = d.publish_url;
+        self.dav_user = d.username;
+    }
+
+    /// `accounts.add` / `accounts.edit` DAV settings (`null`: none).
+    fn dav_param(&self) -> Value {
+        if self.dav_url.trim().is_empty() && self.dav_publish.trim().is_empty() {
+            return Value::Null;
+        }
+        json!({
+            "url": self.dav_url.trim(),
+            "contacts": self.dav_contacts,
+            "tasks": self.dav_tasks,
+            "publishUrl": self.dav_publish.trim(),
+            "username": self.dav_user.trim(),
+        })
     }
 }
 
@@ -669,6 +710,7 @@ impl Wizard {
         self.jmap = a.kind == AccountKind::Jmap;
         self.pop3 = mailcraft_engine::accounts::kind_label(&app.s, a) == "pop3";
         self.extra = Extra::from_options(&mailcraft_engine::accounts::account_options(&app.s, a.id));
+        self.extra.fill_dav(a.dav.as_ref());
         self.address.clone_from(&a.address);
         self.name.clone_from(&a.sender_name);
         self.account_name.clone_from(&a.display_name);
@@ -784,6 +826,7 @@ impl Wizard {
             o.insert("outgoingPassword".into(), json!(self.out_password));
         }
         self.option_params(o);
+        o.insert("dav".into(), self.extra.dav_param());
         if let Some(id) = account {
             o.remove("kind");
             o.insert("account".into(), json!(id));
@@ -1077,6 +1120,7 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
             }
         }
         more_settings(ui, app, st, uid);
+        pim_server_settings(ui, app, st, uid);
         if let Some(o) = oauth_section(ui, app, st, uid) {
             ui.ctx().open_url(egui::OpenUrl::new_tab(o));
         }
@@ -1172,6 +1216,69 @@ fn more_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
             ui.checkbox(&mut e.push, "Show new mail as soon as it arrives (push)");
         }
         let _ = app;
+    });
+}
+
+/// Contacts, tasks and calendar server: the CardDAV / CalDAV address Send/Receive keeps the Contacts and
+/// Tasks folders in step with, the WebDAV location calendars are published to, and (IMAP) the other users'
+/// and shared mailboxes the login can open as mailboxes of their own.
+fn pim_server_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
+    egui::CollapsingHeader::new("Contacts, Tasks and Calendar Server").id_salt(("mc-wiz-dav", uid)).show(ui, |ui| {
+        let e = &mut st.extra;
+        egui::Grid::new(("mc-wiz-dav-grid", uid)).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            grid_edit(ui, "Server address:", &mut e.dav_url, "https://dav.example.com/", false);
+            ui.end_row();
+            ui.label("");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut e.dav_contacts, "Keep Contacts on the server");
+                ui.checkbox(&mut e.dav_tasks, "Keep Tasks on the server");
+            });
+            ui.end_row();
+            grid_edit(ui, "Publish calendars to:", &mut e.dav_publish, "https://dav.example.com/public/", false);
+            ui.end_row();
+            grid_edit(ui, "User name (if different):", &mut e.dav_user, "", false);
+            ui.end_row();
+        });
+        ui.label(
+            RichText::new("The server's password is the account's. Send/Receive updates contacts, tasks and published calendars.")
+                .color(app.theme.text_muted),
+        );
+    });
+    let Some(id) = st.change.or(st.created) else { return };
+    let Some(a) = account_of(app, id) else { return };
+    if a.kind != AccountKind::Imap || a.shared.is_some() || st.pop3 {
+        return;
+    }
+    egui::CollapsingHeader::new("Shared Mailboxes").id_salt(("mc-wiz-shared", uid)).show(ui, |ui| {
+        if a.sync.shared_roots.is_empty() {
+            ui.label(
+                RichText::new(
+                    "The server offered no other mailboxes the last time this account was updated.",
+                )
+                .color(app.theme.text_muted),
+            );
+            return;
+        }
+        let open: Vec<String> = app
+            .s
+            .mailbox
+            .accounts
+            .iter()
+            .filter_map(|x| x.shared.as_ref().filter(|sh| sh.owner == a.id).map(|sh| sh.root.clone()))
+            .collect();
+        for r in &a.sync.shared_roots {
+            let mut on = open.contains(&r.root);
+            let kind = match r.kind {
+                mailcraft_model::account::SharedKind::OtherUser => "another person's mailbox",
+                mailcraft_model::account::SharedKind::Shared => "shared mailbox",
+            };
+            if ui.checkbox(&mut on, format!("{} ({kind})", r.name)).changed() {
+                let p = json!({"account": a.id.0, "mailbox": r.root, "open": on});
+                if let Err(e) = try_run(app, "accounts.openSharedMailbox", p) {
+                    st.error = e;
+                }
+            }
+        }
     });
 }
 

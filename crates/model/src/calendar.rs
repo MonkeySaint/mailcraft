@@ -433,6 +433,46 @@ pub struct CalendarProps {
     /// The calendar's time zones (kept on the default calendar).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_zones: Option<CalendarTimeZones>,
+    /// The calendar is published on a WebDAV server (Share Calendar › Publish), kept up to date by
+    /// send/receive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication: Option<Publication>,
+    /// Published files still to be removed from their server (the calendar was published again at another
+    /// address or with another account); send/receive deletes them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub withdrawals: Vec<Withdrawal>,
+}
+
+/// A published calendar file waiting to be removed from its server.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Withdrawal {
+    pub url: String,
+    /// Account whose DAV login removes it.
+    pub account: crate::AccountId,
+}
+
+/// A calendar published to a WebDAV server: subscribers fetch `url` and refresh it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Publication {
+    /// URL of the published iCalendar file (subscribers use it, or its `webcal://` form).
+    pub url: String,
+    /// Account whose DAV login uploads it.
+    pub account: crate::AccountId,
+    /// Date range shared: `all`, `today`, `tomorrow`, `next7`, `next30`.
+    pub range: String,
+    /// `full`, `limited` or `availability`.
+    pub detail: String,
+    pub include_private: bool,
+    /// Fingerprint of the calendar as last uploaded (0 = never).
+    pub fingerprint: u64,
+    /// Unix seconds of the last upload.
+    pub last_published: Option<i64>,
+    /// Error of the last upload, if it failed.
+    pub last_error: Option<String>,
+    /// Publishing was stopped: the next send/receive removes the published file, then the publication.
+    pub withdraw: bool,
 }
 
 fn is_zero(n: &u64) -> bool {

@@ -201,6 +201,9 @@ pub struct Contact {
     /// them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub certificates: Vec<String>,
+    /// The server copy (CardDAV), when the contact is synchronised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::account::RemoteRef>,
 }
 
 impl Contact {

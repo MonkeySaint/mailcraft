@@ -108,7 +108,13 @@ fn unescape(s: &str) -> String {
 
 /// Parses a document and returns its root element.
 pub fn parse_xml(input: &str) -> Result<Element> {
-    if input.len() > MAX_DOCUMENT {
+    parse_xml_with(input, MAX_DOCUMENT, MAX_ELEMENTS)
+}
+
+/// [`parse_xml`] with other caps on the document size and the element count (WebDAV listings are larger
+/// than autoconfig documents).
+pub fn parse_xml_with(input: &str, max_bytes: usize, max_elements: usize) -> Result<Element> {
+    if input.len() > max_bytes {
         return Err(NetError::TooLarge("XML document".into()));
     }
     let s = input.strip_prefix('\u{feff}').unwrap_or(input);
@@ -226,7 +232,7 @@ pub fn parse_xml(input: &str) -> Result<Element> {
         }
         pos += i;
         count += 1;
-        if count > MAX_ELEMENTS {
+        if count > max_elements {
             return Err(NetError::TooLarge("too many XML elements".into()));
         }
         if self_closing {

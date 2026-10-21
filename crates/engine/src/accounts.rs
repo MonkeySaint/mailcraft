@@ -28,8 +28,8 @@ use crate::cmd::util::opt_bool;
 use crate::{CmdError, CmdResult, CommandSpec, Notice, Session, always};
 use mailcraft_model::account::CredentialKind;
 use mailcraft_model::{
-    Account, AccountId, AccountKind, FolderId, FolderRole, QuickStepAction, RuleAction, Security,
-    ServerSettings,
+    Account, AccountId, AccountKind, DavSettings, FolderId, FolderRole, QuickStepAction, RuleAction,
+    Security, ServerSettings,
 };
 
 /// Name of the secrets file in the profile (data) folder.
@@ -827,7 +827,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.add",
             "Add Account",
-            r#"{"kind": "imap"|"jmap", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL)"#,
+            r#"{"kind": "imap"|"jmap", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL)"#,
             true,
             always,
             add,
@@ -835,7 +835,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.edit",
             "Change Account",
-            r#"{"account": number|string, "displayName"?, "senderName"?, "address"?, "incoming"?: server, "outgoing"?: server|null, "password"?, "outgoingPassword"?, "oauthToken"?, "serverSavesSent"?: bool}"#,
+            r#"{"account": number|string, "displayName"?, "senderName"?, "address"?, "incoming"?: server, "outgoing"?: server|null, "password"?, "outgoingPassword"?, "oauthToken"?, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string}|null}"#,
             true,
             has_server_account,
             edit,
@@ -887,6 +887,22 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             always,
             discover,
+        ),
+        spec(
+            "accounts.sharedMailboxes",
+            "Shared mailboxes",
+            r#"{"account"?: number|string} → {"mailboxes": [{"name", "root", "kind": "otherUser"|"shared", "open", "store"?}]} (other users' and shared IMAP mailboxes the login can open, as listed by the last full send/receive)"#,
+            false,
+            has_server_account,
+            shared_mailboxes,
+        ),
+        spec(
+            "accounts.openSharedMailbox",
+            "Open shared mailbox",
+            r#"{"account"?: number|string (the IMAP account), "mailbox": string (name or server root), "open"?: bool (false closes it; default true)} → {"store", "open"}"#,
+            true,
+            has_server_account,
+            open_shared_mailbox,
         ),
         spec("accounts.oauthProviders", "Sign in with OAuth (providers)", "", false, always, oauth_providers),
         spec(
@@ -996,7 +1012,143 @@ pub(crate) fn account_settings_json(s: &Session, a: &Account) -> Value {
         "hasSecret": s.secrets.get(&secret_key(a.id, false)).is_some(),
         "serverSavesSent": a.server_saves_sent,
         "pendingChanges": a.sync.pending.len(),
+        "dav": a.dav.as_ref().map(dav_json),
+        "sharedMailbox": a.shared.as_ref().map(|sh| json!({
+            "owner": sh.owner.0,
+            "root": sh.root,
+            "kind": shared_kind_name(sh.kind),
+        })),
+        "sharedMailboxesOffered": a.sync.shared_roots.len(),
     })
+}
+
+fn shared_kind_name(k: mailcraft_model::account::SharedKind) -> &'static str {
+    match k {
+        mailcraft_model::account::SharedKind::OtherUser => "otherUser",
+        mailcraft_model::account::SharedKind::Shared => "shared",
+    }
+}
+
+fn dav_json(d: &DavSettings) -> Value {
+    json!({
+        "url": d.url,
+        "contacts": d.contacts,
+        "tasks": d.tasks,
+        "publishUrl": d.publish_url,
+        "username": d.username,
+    })
+}
+
+/// A web address for DAV settings: empty, or http(s) without spaces.
+fn dav_url(what: &str, v: &str) -> Result<String, CmdError> {
+    let v = clean_line(what, v)?;
+    if v.is_empty() {
+        return Ok(v);
+    }
+    let lower = v.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) || v.contains(char::is_whitespace) {
+        return Err(CmdError::Params(format!("{what} must be an http(s) address, not `{v}`")));
+    }
+    Ok(v)
+}
+
+/// DAV settings from `p.dav` (`old` supplies values not given). `Some(None)`: turned off; `None`: not given.
+fn parse_dav(p: &Value, old: Option<&DavSettings>) -> Result<Option<Option<DavSettings>>, CmdError> {
+    let Some(v) = p.get("dav") else { return Ok(None) };
+    if v.is_null() {
+        return Ok(Some(None));
+    }
+    if !v.is_object() {
+        return Err(CmdError::Params("`dav` must be an object or null".into()));
+    }
+    let mut d = old.cloned().unwrap_or(DavSettings { contacts: true, tasks: true, ..Default::default() });
+    if let Some(u) = str_field(v, &["url"])? {
+        d.url = dav_url("the contacts and tasks server", u)?;
+    }
+    if let Some(u) = str_field(v, &["publishUrl", "publish_url"])? {
+        d.publish_url = dav_url("the publishing location", u)?;
+    }
+    if let Some(u) = str_field(v, &["username", "user"])? {
+        d.username = clean_line("the user name", u)?;
+    }
+    if let Some(b) = opt_bool(v, "contacts") {
+        d.contacts = b;
+    }
+    if let Some(b) = opt_bool(v, "tasks") {
+        d.tasks = b;
+    }
+    if d.url.is_empty() && d.publish_url.is_empty() {
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(d)))
+}
+
+/// Forgets what was synchronised with an account's contacts and tasks server (its address changed or it was
+/// turned off): the items stay, as local items.
+fn forget_dav(s: &mut Session, id: AccountId) {
+    let folders: Vec<FolderId> = match s.mailbox.account(id) {
+        Some(a) => a.sync.dav.keys().copied().collect(),
+        None => return,
+    };
+    let own: Vec<FolderId> = s.mailbox.folders.values().filter(|f| f.account == id).map(|f| f.id).collect();
+    for c in s.mailbox.contacts.values_mut().filter(|c| own.contains(&c.folder)) {
+        c.remote = None;
+    }
+    for t in s.mailbox.tasks.values_mut().filter(|t| own.contains(&t.folder)) {
+        t.remote = None;
+    }
+    if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == id) {
+        a.sync.dav.clear();
+    }
+    let _ = folders;
+}
+
+fn shared_mailboxes(s: &mut Session, p: &Value) -> CmdResult {
+    let id = find_account(s, p, "account")?;
+    let Some(a) = s.mailbox.account(id) else { return Err(CmdError::Params("no such account".into())) };
+    let stores = crate::sync::shared::stores_of(s, id);
+    let list: Vec<Value> = a
+        .sync
+        .shared_roots
+        .iter()
+        .map(|r| {
+            let store = stores.iter().find(|x| x.shared.as_ref().is_some_and(|sh| sh.root == r.root));
+            json!({
+                "name": r.name,
+                "root": r.root,
+                "kind": shared_kind_name(r.kind),
+                "open": store.is_some(),
+                "store": store.map(|x| x.id.0),
+            })
+        })
+        .collect();
+    Ok(json!({ "account": id.0, "mailboxes": list }))
+}
+
+fn open_shared_mailbox(s: &mut Session, p: &Value) -> CmdResult {
+    let id = find_account(s, p, "account")?;
+    let name = str_field(p, &["mailbox", "name"])?
+        .map(str::to_owned)
+        .ok_or_else(|| CmdError::Params("`mailbox` (name) required".into()))?;
+    if opt_bool(p, "open") == Some(false) {
+        let store = crate::sync::shared::stores_of(s, id)
+            .into_iter()
+            .find(|a| {
+                a.display_name.eq_ignore_ascii_case(name.trim())
+                    || a.shared.as_ref().is_some_and(|sh| sh.root == name.trim())
+            })
+            .map(|a| a.id)
+            .ok_or_else(|| CmdError::Params(format!("\"{}\" is not open", name.trim())))?;
+        crate::sync::shared::close(s, store)?;
+        s.refresh_me();
+        return Ok(json!({ "store": store.0, "open": false }));
+    }
+    let store = crate::sync::shared::open(s, id, &name)?;
+    // Download it now (it opens empty).
+    let started =
+        if s.view.work_offline { 0 } else { s.send_receive(&[store], crate::sync::Plan::all()).unwrap_or(0) };
+    s.refresh_me();
+    Ok(json!({ "store": store.0, "open": true, "started": started }))
 }
 
 fn list(s: &mut Session, _: &Value) -> CmdResult {
@@ -1219,6 +1371,7 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         is_default: make_default,
         credential: cred.unwrap_or_default(),
         server_saves_sent: opt_bool(p, "serverSavesSent").unwrap_or(false),
+        dav: parse_dav(p, None)?.flatten(),
         ..Default::default()
     });
     s.mailbox.create_default_folders(id);
@@ -1278,6 +1431,9 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(b) = opt_bool(p, "serverSavesSent") {
         a.server_saves_sent = b;
     }
+    if let Some(d) = parse_dav(p, old.dav.as_ref())? {
+        a.dav = d;
+    }
     let (secret_in, secret_out, cred) = parse_secrets(p)?;
     if let Some(c) = cred {
         a.credential = c;
@@ -1290,8 +1446,14 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     };
     let reset = server_changed(&old.incoming, &a.incoming);
     if reset {
+        // The contacts and tasks server is a separate one: its links stay unless it changed too (below).
+        let dav = std::mem::take(&mut a.sync.dav);
         a.sync = Default::default();
+        a.sync.dav = dav;
     }
+    // Only another contacts and tasks server (or login) makes the links stale: a trailing `/`, a different
+    // spelling of the same address or a new mail server keep them.
+    let dav_reset = crate::sync::pim::dav_identity(&old) != crate::sync::pim::dav_identity(&a);
     let changed = a != old;
     if let Some(slot) = s.mailbox.accounts.iter_mut().find(|x| x.id == id) {
         *slot = a;
@@ -1313,6 +1475,9 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     if reset {
         prefs(s).pop3.remove(&id.0);
         prefs(s).jmap.remove(&id.0);
+    }
+    if dav_reset {
+        forget_dav(s, id);
     }
     if opts_changed || reset {
         update_options(s, id, |o| *o = opts);
@@ -1409,6 +1574,11 @@ fn remove(s: &mut Session, p: &Value) -> CmdResult {
             json!({"account": id.0, "message": message}),
         ));
         return Ok(json!({"removed": false, "needsConfirm": true, "message": message}));
+    }
+    // Shared mailboxes opened through this account's login go with it.
+    let stores: Vec<AccountId> = crate::sync::shared::stores_of(s, id).iter().map(|a| a.id).collect();
+    for store in stores {
+        let _ = crate::sync::shared::close(s, store);
     }
     crate::sync::forget_account(s, id);
     let folders = remove_account_data(s, id);

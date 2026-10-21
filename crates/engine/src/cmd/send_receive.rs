@@ -315,6 +315,40 @@ fn folder(s: &mut Session, p: &Value) -> CmdResult {
             "status": status,
         }));
     }
+    // Contacts and Tasks folders synchronise with the account's contacts and tasks server (CardDAV /
+    // CalDAV), not with the mail server.
+    let pim_kind = folder_kind(s, f).and_then(crate::sync::pim::PimKind::of);
+    if let Some(kind) = pim_kind {
+        let synced = crate::sync::pim::is_synced_folder(&s.mailbox, f)
+            && crate::sync::server_accounts(s).contains(&account);
+        let mut started = 0;
+        if synced && !off {
+            let plan = Plan { send: false, receive: true, folders: Some(vec![f]), user: true };
+            started = s.send_receive(&[account], plan).unwrap_or(0);
+        }
+        let status = if !synced {
+            "local folder"
+        } else if off {
+            "offline"
+        } else {
+            "updating"
+        };
+        if !synced {
+            s.notify(Notice::Info(format!(
+                "\"{name}\" is kept on this computer only. To keep {} on a server, set up a contacts and tasks \
+                 server (CardDAV / CalDAV) in Account Settings.",
+                kind.label()
+            )));
+        }
+        return Ok(json!({
+            "folder": f.0,
+            "name": name,
+            "started": started,
+            "offline": off,
+            "status": status,
+            "server": if synced { "dav" } else { "none" },
+        }));
+    }
     let remote = crate::sync::server_accounts(s).contains(&account);
     let mut started = 0;
     if remote && !off {
@@ -330,6 +364,10 @@ fn folder(s: &mut Session, p: &Value) -> CmdResult {
         "offline": off,
         "status": if !remote { "local folder" } else if off { "offline" } else { "updating" },
     }))
+}
+
+fn folder_kind(s: &Session, f: mailcraft_model::FolderId) -> Option<mailcraft_model::FolderKind> {
+    s.mailbox.folder(f).map(|x| x.kind)
 }
 
 fn group(s: &mut Session, p: &Value) -> CmdResult {

@@ -78,6 +78,109 @@ pub struct RemoteFolder {
     pub attributes: Vec<String>,
 }
 
+/// Which folders a folder list covers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ListScope {
+    /// The user's own mailboxes (the personal namespace).
+    #[default]
+    Personal,
+    /// One other user's or shared mailbox: `root` and everything below it. The root itself (or its
+    /// `INBOX` child) is the store's Inbox; its children are top-level folders of the store.
+    Store { root: String, delimiter: Option<char> },
+}
+
+/// What kind of namespace a shared mailbox is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SharedKind {
+    /// Another user's mailbox the user may open (RFC 2342 "Other Users" namespace).
+    OtherUser,
+    /// A mailbox shared by several users (RFC 2342 "Shared" namespace).
+    Shared,
+}
+
+/// A mailbox in another user's or the shared namespace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedRoot {
+    /// Full server name of the mailbox ("Shared/support").
+    pub root: String,
+    /// The name below the namespace prefix ("support").
+    pub name: String,
+    pub delimiter: Option<char>,
+    pub kind: SharedKind,
+}
+
+/// Most folders listed for one shared mailbox.
+const MAX_STORE_FOLDERS: usize = 5_000;
+/// Most shared mailboxes reported.
+const MAX_SHARED_ROOTS: usize = 500;
+
+/// Folder list entries with their roles. `root` (store root and delimiter) maps a shared mailbox: its root or
+/// `INBOX` child is the Inbox and the root's children are top-level folders.
+fn remote_folders(
+    entries: Vec<crate::imap::ListEntry>,
+    subscribed: &HashSet<String>,
+    special_use: bool,
+    root: Option<&(String, char)>,
+) -> Vec<RemoteFolder> {
+    let mut out: Vec<RemoteFolder> = Vec::with_capacity(entries.len());
+    let mut taken: BTreeSet<FolderRole> = BTreeSet::new();
+    let store_inbox = root.map(|(r, d)| {
+        let child = format!("{r}{d}INBOX");
+        if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&child)) { child } else { r.clone() }
+    });
+    // Within a store the name `INBOX` means nothing special: only the store's own Inbox is one.
+    let attr_role =
+        |name: &str, attrs: &[String]| role_from_attributes(if root.is_some() { "" } else { name }, attrs);
+    for e in &entries {
+        if let Some(r) = attr_role(&e.name, &e.attributes) {
+            taken.insert(r);
+        }
+    }
+    for e in entries {
+        let is_inbox = match &store_inbox {
+            Some(i) => e.name.eq_ignore_ascii_case(i),
+            None => e.name.eq_ignore_ascii_case("INBOX"),
+        };
+        let (mut parent, leaf) = match e.delimiter.and_then(|d| e.name.rsplit_once(d)) {
+            Some((p, l)) if !p.is_empty() => (Some(p.to_owned()), l.to_owned()),
+            _ => (None, e.name.clone()),
+        };
+        if let Some((r, _)) = root {
+            if e.name == *r && !is_inbox {
+                // The root is only a container: its children are the store's top-level folders.
+                continue;
+            }
+            if parent.as_deref() == Some(r.as_str()) || is_inbox {
+                parent = None;
+            }
+        }
+        let mut role = if is_inbox { Some(FolderRole::Inbox) } else { attr_role(&e.name, &e.attributes) };
+        let top_or_inbox_child = parent.as_deref().is_none_or(|p| {
+            p.eq_ignore_ascii_case("INBOX")
+                || store_inbox.as_deref().is_some_and(|i| i.eq_ignore_ascii_case(p))
+        });
+        if role.is_none() && !special_use && top_or_inbox_child {
+            role = role_from_name(&leaf)
+                .filter(|r| !taken.contains(r) && (root.is_none() || *r != FolderRole::Inbox));
+            if let Some(r) = role {
+                taken.insert(r);
+            }
+        }
+        let selectable = !e.has_attribute("\\Noselect") && !e.has_attribute("\\NonExistent");
+        out.push(RemoteFolder {
+            subscribed: is_inbox || root.is_some() || subscribed.contains(&e.name),
+            display_name: if is_inbox { "Inbox".into() } else { leaf },
+            name: e.name,
+            parent,
+            delimiter: e.delimiter,
+            role,
+            selectable,
+            attributes: e.attributes,
+        });
+    }
+    out
+}
+
 /// What the client remembers about a folder between syncs. Persist it with the local copy.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderState {
@@ -269,48 +372,79 @@ impl ImapAccount {
         self.with_client(true, |c| c.get_quota_root("INBOX")).map(|roots| Quota::from_imap(&roots))
     }
 
-    /// Lists every folder with its role and subscription state.
+    /// Lists every folder of the personal namespace with its role and subscription state (other users' and
+    /// shared mailboxes, RFC 2342, are left out: they are opened as stores of their own).
     pub fn sync_folder_list(&mut self) -> Result<Vec<RemoteFolder>> {
+        self.sync_folder_list_in(&ListScope::Personal)
+    }
+
+    /// Lists the folders of `scope`: the personal namespace, or one shared mailbox (see [`SharedRoot`]).
+    pub fn sync_folder_list_in(&mut self, scope: &ListScope) -> Result<Vec<RemoteFolder>> {
         self.with_client(true, |c| {
-            let entries = c.list("", "*")?;
-            let subscribed: HashSet<String> = match c.lsub("", "*") {
-                Ok(l) => l.into_iter().map(|e| e.name).collect(),
-                Err(e) if e.is_connection_lost() => return Err(e),
-                Err(_) => HashSet::new(),
+            let (entries, root) = match scope {
+                ListScope::Personal => {
+                    let mut entries = c.list("", "*")?;
+                    let ns = c.namespace()?;
+                    let foreign: Vec<String> =
+                        ns.foreign_prefixes().iter().map(|n| n.prefix.clone()).collect();
+                    entries.retain(|e| {
+                        !foreign.iter().any(|p| {
+                            e.name.starts_with(p.as_str())
+                                || e.delimiter.is_some_and(|d| p.strip_suffix(d) == Some(e.name.as_str()))
+                        })
+                    });
+                    (entries, None)
+                }
+                ListScope::Store { root, delimiter } => {
+                    let mut entries = c.list("", root)?;
+                    let d = delimiter.or_else(|| entries.first().and_then(|e| e.delimiter)).unwrap_or('/');
+                    let mut below = c.list("", &format!("{root}{d}*"))?;
+                    below.retain(|e| e.name.len() > root.len());
+                    entries.extend(below);
+                    entries.truncate(MAX_STORE_FOLDERS);
+                    (entries, Some((root.clone(), d)))
+                }
+            };
+            let subscribed: HashSet<String> = match (&root, c.lsub("", "*")) {
+                (Some(_), _) => HashSet::new(),
+                (None, Ok(l)) => l.into_iter().map(|e| e.name).collect(),
+                (None, Err(e)) if e.is_connection_lost() => return Err(e),
+                (None, Err(_)) => HashSet::new(),
             };
             let special_use = c.has_capability("SPECIAL-USE") || c.has_capability("XLIST");
-            let mut out: Vec<RemoteFolder> = Vec::with_capacity(entries.len());
-            let mut taken: BTreeSet<FolderRole> = BTreeSet::new();
-            for e in &entries {
-                if let Some(r) = role_from_attributes(&e.name, &e.attributes) {
-                    taken.insert(r);
-                }
-            }
-            for e in entries {
-                let (parent, leaf) = match e.delimiter.and_then(|d| e.name.rsplit_once(d)) {
-                    Some((p, l)) if !p.is_empty() => (Some(p.to_owned()), l.to_owned()),
-                    _ => (None, e.name.clone()),
-                };
-                let mut role = role_from_attributes(&e.name, &e.attributes);
-                let top_or_inbox_child = parent.as_deref().is_none_or(|p| p.eq_ignore_ascii_case("INBOX"));
-                if role.is_none() && !special_use && top_or_inbox_child {
-                    role = role_from_name(&leaf).filter(|r| !taken.contains(r));
-                    if let Some(r) = role {
-                        taken.insert(r);
+            Ok(remote_folders(entries, &subscribed, special_use, root.as_ref()))
+        })
+    }
+
+    /// Other users' mailboxes and shared mailboxes this login can open (RFC 2342 namespaces): the names one
+    /// level below each other-users and shared namespace prefix. Empty when the server has no such
+    /// namespaces.
+    pub fn shared_roots(&mut self) -> Result<Vec<SharedRoot>> {
+        self.with_client(true, |c| {
+            let ns = c.namespace()?;
+            let mut out: Vec<SharedRoot> = Vec::new();
+            let groups = [(SharedKind::OtherUser, &ns.other_users), (SharedKind::Shared, &ns.shared)];
+            for (kind, list) in groups {
+                for n in list.iter().filter(|n| !n.prefix.is_empty()) {
+                    let mut entries = c.list("", &format!("{}%", n.prefix))?;
+                    entries.sort_by(|a, b| a.name.cmp(&b.name));
+                    for e in entries {
+                        let Some(rest) = e.name.strip_prefix(n.prefix.as_str()) else { continue };
+                        let name = rest.trim_matches(|ch| Some(ch) == n.delimiter).to_owned();
+                        if name.is_empty() || out.iter().any(|r| r.root == e.name) {
+                            continue;
+                        }
+                        if out.len() >= MAX_SHARED_ROOTS {
+                            return Ok(out);
+                        }
+                        out.push(SharedRoot {
+                            root: e.name.clone(),
+                            name,
+                            delimiter: e.delimiter.or(n.delimiter),
+                            kind,
+                        });
                     }
                 }
-                let selectable = !e.has_attribute("\\Noselect") && !e.has_attribute("\\NonExistent");
-                let is_inbox = e.name.eq_ignore_ascii_case("INBOX");
-                out.push(RemoteFolder {
-                    subscribed: is_inbox || subscribed.contains(&e.name),
-                    display_name: if is_inbox { "Inbox".into() } else { leaf },
-                    name: e.name,
-                    parent,
-                    delimiter: e.delimiter,
-                    role,
-                    selectable,
-                    attributes: e.attributes,
-                });
             }
             Ok(out)
         })

@@ -253,7 +253,7 @@ item | Create New Blank Calendar... | plus | calendar.addCalendar | {"source":"b
 item | Open Shared Calendar... | calendar | calendar.addCalendar | {"source":"shared"} | O
 
 menu shareCalendar
-item | Calendar | calendar | calendar.share | | C
+dyn | shareCalendars | calendar.share | {"folder":"$id"}
 
 menu calendarChangeView
 item | Calendar | calendar | view.changeView | {"name":"Calendar"} | C

@@ -299,6 +299,9 @@ impl Session<'_> {
             self.sync(out, allow_expunge);
         }
         let res = match (uid, name.as_str()) {
+            (_, n) if self.ctx.config.imap_refuse.iter().any(|c| c.eq_ignore_ascii_case(n)) => {
+                Err(Fail::No(format!("{n} is turned off on this server")))
+            }
             (false, "CAPABILITY") => {
                 p.end()?;
                 out.extend_from_slice(format!("* CAPABILITY {}\r\n", self.capabilities()).as_bytes());
@@ -326,7 +329,10 @@ impl Session<'_> {
             (false, "ENABLE") => self.enable(p, out),
             (false, "NAMESPACE") => {
                 self.need_auth()?;
-                out.extend_from_slice(b"* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
+                // RFC 2342: personal, other users' and shared namespaces (see `store::locate`).
+                out.extend_from_slice(
+                    b"* NAMESPACE ((\"\" \"/\")) ((\"Other Users/\" \"/\")) ((\"Shared/\" \"/\"))\r\n",
+                );
                 Ok("NAMESPACE completed".to_owned())
             }
             (false, "GETQUOTAROOT") => self.quota_root(p, out),
@@ -385,8 +391,7 @@ impl Session<'_> {
             return;
         };
         let st = self.ctx.shared.lock();
-        let mb =
-            st.user(user).and_then(|u| u.mailbox(&sel.name)).filter(|m| m.uidvalidity == sel.uidvalidity);
+        let mb = st.mbox(user, &sel.name).filter(|m| m.uidvalidity == sel.uidvalidity);
         let Some(mb) = mb else {
             drop(st);
             self.sel = None;
@@ -581,10 +586,10 @@ impl Session<'_> {
             out.extend_from_slice(b"* OK [CLOSED] Previous mailbox closed\r\n");
         }
         let st = self.shared().lock();
-        let mb = st
-            .user(&user)
-            .and_then(|u| u.mailbox(&name))
-            .ok_or_else(|| no("[NONEXISTENT] No such mailbox"))?;
+        let own = st.locate(&user, &name) == (user.clone(), name.clone());
+        let mb = st.mbox(&user, &name).ok_or_else(|| no("[NONEXISTENT] No such mailbox"))?;
+        // Another user's or a shared mailbox keeps the name the session used for it.
+        let sel_name = if own { mb.name.clone() } else { name.clone() };
         let mut keywords: Vec<String> = Vec::new();
         for m in &mb.messages {
             for f in m.flags.iter().filter(|f| !f.starts_with('\\')) {
@@ -613,11 +618,11 @@ impl Session<'_> {
         out.extend_from_slice(format!("* OK [HIGHESTMODSEQ {}] Highest\r\n", mb.highest_modseq).as_bytes());
         if self.rev2 {
             out.extend_from_slice(b"* LIST () \"/\" ");
-            write_string(out, mb.name.as_bytes());
+            write_string(out, sel_name.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
         let sel = Selected {
-            name: mb.name.clone(),
+            name: sel_name,
             read_only,
             uidvalidity: mb.uidvalidity,
             known: mb.messages.iter().map(|m| (m.uid, m.modseq)).collect(),
@@ -654,6 +659,7 @@ impl Session<'_> {
         if name == "INBOX" {
             return Err(no("[ALREADYEXISTS] INBOX always exists"));
         }
+        foreign_namespace(&name)?;
         self.shared().lock().create_mailbox(&user, &name, special).map_err(store_fail)?;
         self.shared().notify();
         Ok("CREATE completed".to_owned())
@@ -664,6 +670,7 @@ impl Session<'_> {
         p.sp()?;
         let name = self.mailbox_arg(p)?;
         p.end()?;
+        foreign_namespace(&name)?;
         self.shared().lock().delete_mailbox(&user, &name).map_err(store_fail)?;
         self.shared().notify();
         if self.sel.as_ref().is_some_and(|s| s.name == canonical_name(&name)) {
@@ -679,6 +686,8 @@ impl Session<'_> {
         p.sp()?;
         let to = self.mailbox_arg(p)?;
         p.end()?;
+        foreign_namespace(&from)?;
+        foreign_namespace(&to)?;
         self.shared().lock().rename_mailbox(&user, &from, &to).map_err(store_fail)?;
         self.shared().notify();
         Ok("RENAME completed".to_owned())
@@ -737,10 +746,7 @@ impl Session<'_> {
         let name = self.mailbox_arg(p)?;
         p.end()?;
         let mut st = self.shared().lock();
-        let mb = st
-            .user_mut(&user)
-            .and_then(|u| u.mailbox_mut(&name))
-            .ok_or_else(|| no("[NONEXISTENT] No such mailbox"))?;
+        let mb = st.mbox_mut(&user, &name).ok_or_else(|| no("[NONEXISTENT] No such mailbox"))?;
         mb.subscribed = on;
         Ok(format!("{} completed", if on { "SUBSCRIBE" } else { "UNSUBSCRIBE" }))
     }
@@ -799,28 +805,38 @@ impl Session<'_> {
             return Ok(format!("{verb} completed"));
         }
         let st = self.shared().lock();
-        let u = st.user(&user).ok_or_else(|| no("[UNAVAILABLE] User is gone"))?;
-        for mb in &u.mailboxes {
+        if st.user(&user).is_none() {
+            return Err(no("[UNAVAILABLE] User is gone"));
+        }
+        for (name, real, children) in st.visible(&user) {
             let hit = patterns.iter().any(|pat| {
                 let full = canonical_pattern(&format!("{reference}{pat}"));
-                wildcard_match(&full, &mb.name)
+                wildcard_match(&full, &name)
             });
-            if !hit || (sel_subscribed && !mb.subscribed) || (sel_special && mb.special.is_none()) {
+            let mb = if real { st.mbox(&user, &name) } else { None };
+            if !hit || (real && mb.is_none()) {
                 continue;
             }
-            let mut attrs =
-                vec![if u.has_children(&mb.name) { "\\HasChildren" } else { "\\HasNoChildren" }.to_owned()];
-            if let Some(s) = mb.special {
+            let subscribed = mb.is_some_and(|m| m.subscribed);
+            let special = mb.and_then(|m| m.special);
+            if (sel_subscribed && !subscribed) || (sel_special && special.is_none()) {
+                continue;
+            }
+            let mut attrs = vec![if children { "\\HasChildren" } else { "\\HasNoChildren" }.to_owned()];
+            if !real {
+                attrs.insert(0, "\\Noselect".to_owned());
+            }
+            if let Some(s) = special {
                 attrs.push(s.attribute().to_owned());
             }
-            if ret_subscribed && mb.subscribed {
+            if ret_subscribed && subscribed {
                 attrs.push("\\Subscribed".to_owned());
             }
             out.extend_from_slice(format!("* {verb} ({}) \"{DELIM}\" ", attrs.join(" ")).as_bytes());
-            self.write_mbox(out, &mb.name);
+            self.write_mbox(out, &name);
             out.extend_from_slice(b"\r\n");
-            if let Some(items) = &status_items {
-                write_status(out, mb, items, self.rev2);
+            if let (Some(items), Some(mb)) = (&status_items, mb) {
+                write_status(out, mb, &name, items, self.rev2);
             }
         }
         Ok(format!("{verb} completed"))
@@ -834,11 +850,8 @@ impl Session<'_> {
         let items = status_item_list(p)?;
         p.end()?;
         let st = self.shared().lock();
-        let mb = st
-            .user(&user)
-            .and_then(|u| u.mailbox(&name))
-            .ok_or_else(|| no("[NONEXISTENT] No such mailbox"))?;
-        write_status(out, mb, &items, self.rev2);
+        let mb = st.mbox(&user, &name).ok_or_else(|| no("[NONEXISTENT] No such mailbox"))?;
+        write_status(out, mb, &name, &items, self.rev2);
         Ok("STATUS completed".to_owned())
     }
 
@@ -925,8 +938,7 @@ impl Session<'_> {
         let name = sel.name.clone();
         let removed: Vec<u32> = {
             let mut st = self.shared().lock();
-            let mb =
-                st.user_mut(&user).and_then(|u| u.mailbox_mut(&name)).ok_or_else(|| no("Mailbox is gone"))?;
+            let mb = st.mbox_mut(&user, &name).ok_or_else(|| no("Mailbox is gone"))?;
             let max = mb.messages.last().map(|m| m.uid).unwrap_or(0);
             let removed: Vec<u32> = mb
                 .messages
@@ -975,11 +987,16 @@ impl Session<'_> {
         let targets = sel.targets(&set, uid_mode);
         let (src_uids, dst_uids, v) = {
             let mut st = self.shared().lock();
-            let u = st.user_mut(&user).ok_or_else(|| no("[UNAVAILABLE] User is gone"))?;
-            let src = u.mailbox(&src_name).ok_or_else(|| no("Mailbox is gone"))?;
+            if st.user(&user).is_none() {
+                return Err(no("[UNAVAILABLE] User is gone"));
+            }
+            if !st.same_owner(&user, &src_name, &dest) {
+                return Err(no("[CANNOT] Copy between different users' mailboxes is not supported"));
+            }
+            let src = st.mbox(&user, &src_name).ok_or_else(|| no("Mailbox is gone"))?;
             let msgs: Vec<store::Msg> =
                 targets.iter().filter_map(|(_, uid)| src.find(*uid).cloned()).collect();
-            let dst = u.mailbox_mut(&dest).ok_or_else(|| no("[TRYCREATE] No such mailbox"))?;
+            let dst = st.mbox_mut(&user, &dest).ok_or_else(|| no("[TRYCREATE] No such mailbox"))?;
             let mut src_uids = Vec::new();
             let mut dst_uids = Vec::new();
             for m in &msgs {
@@ -990,7 +1007,7 @@ impl Session<'_> {
             let v = dst.uidvalidity;
             if mv
                 && !src_uids.is_empty()
-                && let Some(src) = u.mailbox_mut(&src_name)
+                && let Some(src) = st.mbox_mut(&user, &src_name)
             {
                 src.messages.retain(|m| src_uids.binary_search(&m.uid).is_err());
                 src.next_modseq();
@@ -1030,7 +1047,15 @@ fn status_item_list(p: &mut Parser<'_>) -> Result<Vec<String>, Fail> {
     Ok(items)
 }
 
-fn write_status(out: &mut Vec<u8>, mb: &store::Mailbox, items: &[String], utf8_names: bool) {
+/// Other users' and shared mailboxes cannot be created, deleted or renamed here.
+fn foreign_namespace(name: &str) -> Result<(), Fail> {
+    if name.starts_with(store::OTHER_USERS_PREFIX) || name.starts_with(store::SHARED_PREFIX) {
+        return Err(no("[NOPERM] Mailboxes of other users cannot be changed"));
+    }
+    Ok(())
+}
+
+fn write_status(out: &mut Vec<u8>, mb: &store::Mailbox, name: &str, items: &[String], utf8_names: bool) {
     let vals: Vec<String> = items
         .iter()
         .map(|it| {
@@ -1049,9 +1074,9 @@ fn write_status(out: &mut Vec<u8>, mb: &store::Mailbox, items: &[String], utf8_n
         .collect();
     out.extend_from_slice(b"* STATUS ");
     if utf8_names {
-        write_string(out, mb.name.as_bytes());
+        write_string(out, name.as_bytes());
     } else {
-        write_string(out, utf7::encode(&mb.name).as_bytes());
+        write_string(out, utf7::encode(name).as_bytes());
     }
     out.extend_from_slice(format!(" ({})\r\n", vals.join(" ")).as_bytes());
 }
