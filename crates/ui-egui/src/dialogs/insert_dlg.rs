@@ -5,7 +5,7 @@
 //! Thesaurus and Read Aloud. Every action goes through `app.run`.
 
 use egui::{Color32, Context, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::common::{Dlg, Out, btn, btn_en, footer, muted, primary, window, with_state};
 use super::compose_dlg::cmd;
@@ -22,7 +22,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         "screenshot" => saved_screenshot(ctx, app, d),
         "screenClip" => screen_clip(ctx, app, d),
         "symbol" => symbol(ctx, app, d),
-        "pageColor" => page_color(ctx, app, d),
         "browseThemes" => browse_themes(ctx, app, d),
         "saveTheme" => save_theme(ctx, app, d),
         "readAloud" => read_aloud(ctx, app, d),
@@ -1242,75 +1241,7 @@ fn symbol(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Options: Page Color, themes
-
-#[derive(Clone)]
-struct ColorState {
-    color: Color32,
-    hex: String,
-    error: String,
-}
-
-fn hex_of(c: Color32) -> String {
-    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
-}
-
-/// Page Color › More Colors…: a colour picker (hue, saturation, value) with the colour as #rrggbb.
-fn page_color(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
-    let cid = compose_of(d);
-    let start = mailcraft_geom::Color::parse_hex(&d.str("color"))
-        .map_or(Color32::WHITE, |c| Color32::from_rgb(c.r, c.g, c.b));
-    with_state(
-        ctx,
-        app,
-        d.uid,
-        |_: &App| ColorState { color: start, hex: hex_of(start), error: String::new() },
-        |st, app| {
-            window(ctx, app, d, "Colors", 360.0, |ui, app| {
-                if egui::color_picker::color_picker_color32(
-                    ui,
-                    &mut st.color,
-                    egui::color_picker::Alpha::Opaque,
-                ) {
-                    st.hex = hex_of(st.color);
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Hex:");
-                    if ui.add(egui::TextEdit::singleline(&mut st.hex).desired_width(90.0)).changed()
-                        && let Some(c) = mailcraft_geom::Color::parse_hex(st.hex.trim())
-                    {
-                        st.color = Color32::from_rgb(c.r, c.g, c.b);
-                    }
-                    let (r, _) = ui.allocate_exact_size(Vec2::new(40.0, 20.0), Sense::hover());
-                    ui.painter().rect_filled(r, CornerRadius::same(2), st.color);
-                });
-                if !st.error.is_empty() {
-                    ui.colored_label(app.theme.danger, &st.error);
-                }
-                let mut out = Out::Keep;
-                let mut action: Option<Value> = None;
-                footer(ui, |ui| {
-                    if btn(ui, "Cancel") {
-                        out = Out::Close;
-                    }
-                    if primary(ui, app, true, "OK") {
-                        action = Some(json!(hex_of(st.color)));
-                    }
-                    if btn(ui, "No Color") {
-                        action = Some(Value::Null);
-                    }
-                });
-                if let Some(color) = action {
-                    match cmd(app, "compose.pageColor", json!({"compose": cid, "color": color})) {
-                        Ok(_) => out = Out::Close,
-                        Err(e) => st.error = e,
-                    }
-                }
-                out
-            })
-        },
-    )
-}
+// Options: themes (Page Color › More Colors… is the Colors dialog of `format_dlg`)
 
 const THEME_FILTER: [&str; 1] = ["json"];
 

@@ -11,7 +11,6 @@
 //!
 //! The text reaches a program as an argument after `--` or on standard input, never through a shell.
 
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, PoisonError};
@@ -101,8 +100,10 @@ fn command(engine: &Engine, text: &str, rate: i8) -> Option<Command> {
         }
         Engine::PowerShell(p) => {
             let mut c = Command::new(p);
+            // The text arrives as UTF-8 on standard input (the console's own code page would garble it).
             let script = format!(
-                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; \
+Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
 $s.Rate = {}; $s.Speak([Console]::In.ReadToEnd())",
                 i32::from(rate) * 2
             );
@@ -134,12 +135,27 @@ impl SystemSpeech {
             Stdio::null()
         });
         let mut child = cmd.spawn().map_err(|e| format!("The speech program could not start ({e})."))?;
-        if windows && let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+        if windows
+            && let Some(stdin) = child.stdin.take()
+            && let Err(e) = write_in_background(stdin, text.to_owned())
+        {
+            stop_child(&mut Some(child));
+            return Err(format!("The speech program did not take the text ({e})."));
         }
         *slot = Some(child);
         Ok(())
     }
+}
+
+/// Writes `text` to a speech program's standard input from a short-lived thread. The text can be larger
+/// than the pipe buffer and the program reads it while it speaks, so writing it on the caller's (UI) thread
+/// could hold the frame up until speech catches up. The pipe closes when the thread drops it, which tells
+/// the program the text is complete; once the program is stopped the write fails and the thread ends.
+fn write_in_background(mut stdin: impl std::io::Write + Send + 'static, text: String) -> std::io::Result<()> {
+    std::thread::Builder::new().name("mailcraft-speech-input".into()).spawn(move || {
+        let _ = stdin.write_all(text.as_bytes());
+    })?;
+    Ok(())
 }
 
 impl Speech for SystemSpeech {
@@ -491,7 +507,30 @@ mod tests {
             c.get_args().all(|a| !a.to_string_lossy().contains("rm x")),
             "Windows gets the text on stdin"
         );
+        assert!(
+            c.get_args().any(|a| a
+                .to_string_lossy()
+                .starts_with("[Console]::InputEncoding = [System.Text.Encoding]::UTF8;")),
+            "Windows reads its input as UTF-8"
+        );
         assert!(command(&Engine::Speechd { espeak: None }, "Hi", 0).is_none(), "no program to run");
+    }
+
+    /// Regression: the text was written to the speech program on the UI thread; more than the pipe buffer
+    /// holds (long non-ASCII text) blocked the frame until the program had read it, forever for one that
+    /// reads slowly or not at all.
+    #[cfg(unix)]
+    #[test]
+    fn writing_long_text_never_blocks_the_caller() {
+        let Ok(mut child) = Command::new("sleep").arg("30").stdin(Stdio::piped()).spawn() else {
+            return; // No `sleep` here.
+        };
+        let stdin = child.stdin.take().unwrap();
+        let text = "\u{1d11e}".repeat(20_000); // 80 KB of UTF-8, more than a pipe buffer.
+        let started = std::time::Instant::now();
+        write_in_background(stdin, text).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "returned at once");
+        stop_child(&mut Some(child));
     }
 
     #[test]
@@ -506,7 +545,7 @@ mod tests {
     mod speechd {
         use super::super::ssip::{body, parse_line};
         use super::*;
-        use std::io::{BufRead, BufReader};
+        use std::io::{BufRead, BufReader, Write as _};
         use std::os::unix::net::UnixListener;
         use std::sync::Arc;
 

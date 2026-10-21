@@ -303,9 +303,8 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params("no such quick step".into()));
     };
     if step.actions.is_empty() {
-        // An empty step ("Create New") stays in the gallery: it opens the editor on a new step.
-        let (name, actions) = template(s, "custom")?;
-        return dialog(s, "editQuickStep", json!({"template": "custom", "name": name, "actions": actions}));
+        // A step with no actions left opens its own editor (the gallery's Create New is handled above).
+        return dialog(s, "editQuickStep", json!({"step": step_json(&step), "template": "custom"}));
     }
     if step.needs_setup() && complete_setup(&mut step, p) {
         check_actions(s, &step.actions)?;
@@ -941,6 +940,22 @@ mod tests {
         s.run("quicksteps.run", &json!({"id": 1, "folder": proj.0, "ids": [items[2].0]})).unwrap();
         assert_eq!(s.mailbox.mail[&items[2]].folder, proj);
         assert_eq!(s.mailbox.mail[&items[0]].folder, inbox);
+    }
+
+    /// Integration: a stored step whose actions were all removed opens its own editor, not a new step's.
+    #[test]
+    fn a_step_without_actions_opens_its_own_editor() {
+        let (mut s, _, _) = session();
+        let r = s.run("quicksteps.new", &json!({"name": "Empty", "actions": ["MarkRead"]})).unwrap();
+        let id = r["id"].as_u64().unwrap();
+        if let Some(q) = s.mailbox.quick_steps.iter_mut().find(|q| q.id == id) {
+            q.actions.clear();
+        }
+        let before = s.mailbox.quick_steps.len();
+        assert_eq!(s.run("quicksteps.run", &json!({"id": id})).unwrap()["dialog"], "editQuickStep");
+        let Some(crate::Notice::OpenDialog(_, p)) = s.notices.last() else { panic!("no dialog") };
+        assert_eq!(p["step"]["id"], id, "{p}");
+        assert_eq!(s.mailbox.quick_steps.len(), before);
     }
 
     #[test]

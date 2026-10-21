@@ -98,36 +98,6 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 cmd(app, "calendar.addCalendar", params).map(|_| None)
             },
         ),
-        "newDataFile" => {
-            let location = d.str("location");
-            let note = if location.is_empty() {
-                "The data file gets its own folders (Inbox, Calendar, Contacts and the rest) in this profile."
-                    .to_owned()
-            } else {
-                format!(
-                    "The data file gets its own folders (Inbox, Calendar, Contacts and the rest), kept with \
-                     this profile in {location}."
-                )
-            };
-            run_form(
-                ctx,
-                app,
-                d,
-                Form::new(
-                    "Create Data File",
-                    vec![f("name", "Data file name:", Kind::Text), f("n", "", Kind::Note(note))],
-                )
-                .init("name", json!(d.str("name")))
-                .width(420.0),
-                |app, v| {
-                    let name = v.s("name");
-                    if name.trim().is_empty() {
-                        return Err("Type a name for the data file.".into());
-                    }
-                    cmd(app, "file.newDataFile", json!({"name": name.trim()})).map(|_| None)
-                },
-            )
-        }
         "contactCard" => contact_card(ctx, app, d),
         "chooseContact" => choose_contact(ctx, app, d),
         "forwardContact" => forward_contact(ctx, app, d),

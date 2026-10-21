@@ -337,7 +337,6 @@ pub const KNOWN: &[&str] = &[
     "addCalendar",
     "contactCard",
     "chooseContact",
-    "newDataFile",
 ];
 
 fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
