@@ -18,6 +18,7 @@ pub mod charset;
 pub mod date;
 pub mod encoded;
 pub mod header;
+pub mod idn;
 pub mod message;
 pub mod params;
 pub mod transfer;

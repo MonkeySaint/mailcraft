@@ -13,7 +13,9 @@ pub mod accounts;
 pub mod catalog;
 pub mod cmd;
 pub mod compose;
+pub mod intl;
 pub mod junk;
+pub mod new_mail;
 pub mod queries;
 pub mod reminders;
 pub mod rules_exec;
@@ -22,6 +24,7 @@ pub mod search_index;
 mod session;
 pub mod settings;
 pub mod sync;
+pub mod troubleshoot;
 pub mod undo;
 
 use serde_json::Value;

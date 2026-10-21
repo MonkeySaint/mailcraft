@@ -240,6 +240,16 @@ pub fn specs() -> Vec<CommandSpec> {
             new_email,
         ),
         spec(
+            "mail.newFromMailto",
+            "New Email from a mailto: Link",
+            "Reading pane › links; command line",
+            "",
+            r#"{"url":string}  (RFC 6068 mailto: URL; to, cc, bcc, subject and body are used)"#,
+            false,
+            always,
+            new_from_mailto,
+        ),
+        spec(
             "mail.newItem",
             "New Items",
             "Home › New › New Items",
@@ -723,6 +733,31 @@ fn new_email(s: &mut Session, p: &Value) -> CmdResult {
         inline: false,
         ..Default::default()
     };
+    let c = crate::compose::with_default_signature(&s.mailbox, c);
+    let id = s.open_compose(c);
+    Ok(json!({"compose": id}))
+}
+
+/// A new message from a `mailto:` link (RFC 6068): its recipients, subject and body. Options › Advanced ›
+/// "Allow UTF-8 support for the mailto: protocol" says how its percent-encoded text decodes.
+fn new_from_mailto(s: &mut Session, p: &Value) -> CmdResult {
+    let url = req_str(p, "url")?;
+    let m =
+        crate::intl::parse_mailto(url, s.settings.bool("advanced.mailtoUtf8")).map_err(CmdError::Params)?;
+    let mut c = ComposeState {
+        kind: ComposeKind::New,
+        from: account_from(s, new_mail_account(s)),
+        format: s.settings.compose_format(),
+        to: m.to.join("; "),
+        cc: m.cc.join("; "),
+        bcc: m.bcc.join("; "),
+        subject: m.subject,
+        inline: false,
+        ..Default::default()
+    };
+    if !m.body.is_empty() {
+        c.body = mailcraft_model::Doc::from_plain_text(&m.body);
+    }
     let c = crate::compose::with_default_signature(&s.mailbox, c);
     let id = s.open_compose(c);
     Ok(json!({"compose": id}))
@@ -1611,28 +1646,64 @@ fn is_signed(m: &MailItem) -> bool {
     })
 }
 
+/// Body lines normalised like [`normalised_text`] (quote markers removed, whitespace collapsed), empty lines
+/// left out.
+fn normalised_lines(m: &MailItem) -> Vec<String> {
+    m.body_text()
+        .lines()
+        .map(|l| {
+            l.trim_start_matches(|c: char| c == '>' || c.is_whitespace())
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        })
+        .filter(|w| !w.is_empty())
+        .map(|w| w.join(" "))
+        .collect()
+}
+
+/// True when every line of `original` appears in `later`, in order, with other lines between them: a reply
+/// that answered inside the quoted original (inline comments) and so modified it.
+fn quoted_with_changes(original: &[String], later: &[String]) -> bool {
+    if original.is_empty() || later.len() <= original.len() {
+        return false;
+    }
+    let mut want = original.iter().peekable();
+    for line in later {
+        if want.peek().is_some_and(|w| *w == line) {
+            want.next();
+        }
+    }
+    want.peek().is_none()
+}
+
 /// Members of `conv` passing `candidate` whose text is fully contained in a later member. Options › Mail ›
 /// Conversation Clean Up says which are kept whatever their text (unread, categorized, flagged, digitally
-/// signed); drafts are never moved. A message whose text a later reply changed is never contained in it, so
-/// "When a reply modifies a message, don't move the original" always holds.
+/// signed); drafts are never moved. "When a reply modifies a message, don't move the original": with it off,
+/// a message a later reply quotes with comments added inside the quote (every line still there, in order)
+/// counts as redundant too; with it on (the default) only an unchanged quote does.
 fn redundant_members(
     s: &Session,
     conv: &Conversation,
     candidate: &dyn Fn(&MailItem) -> bool,
     opts: &crate::settings::CleanUpOptions,
 ) -> Vec<ItemId> {
-    let members: Vec<(&MailItem, String)> =
-        conv.items.iter().filter_map(|id| s.mailbox.mail.get(id)).map(|m| (m, normalised_text(m))).collect();
+    let members: Vec<(&MailItem, String, Vec<String>)> = conv
+        .items
+        .iter()
+        .filter_map(|id| s.mailbox.mail.get(id))
+        .map(|m| (m, normalised_text(m), if opts.keep_original { Vec::new() } else { normalised_lines(m) }))
+        .collect();
     let mut out = Vec::new();
-    for (m, text) in &members {
+    for (m, text, lines) in &members {
         if text.is_empty() || m.is_draft || !candidate(m) || opts.keeps(m, is_signed(m)) {
             continue;
         }
-        let quoted_later = members.iter().any(|(n, ntext)| {
+        let quoted_later = members.iter().any(|(n, ntext, nlines)| {
             n.id != m.id
                 && (n.received.unix > m.received.unix || (n.received.unix == m.received.unix && n.id > m.id))
                 && ntext.len() > text.len()
-                && ntext.contains(text.as_str())
+                && (ntext.contains(text.as_str())
+                    || (!opts.keep_original && quoted_with_changes(lines, nlines)))
         });
         if quoted_later {
             out.push(m.id);
@@ -2971,6 +3042,31 @@ mod tests {
         // Undo puts it back (one step).
         f.s.run("app.undo", &json!({})).unwrap();
         assert_eq!(folder_of(&f.s, f.c), f.inbox);
+    }
+
+    #[test]
+    fn clean_up_moves_an_original_a_reply_modified_only_when_that_option_is_off() {
+        let mut f = fx();
+        // b answers inside the quote: every line of c is still there, with a comment between them.
+        let c = f.s.mailbox.mail.get_mut(&f.c).unwrap();
+        c.body.text = Some("Shall we meet at noon?\nThe usual place.".into());
+        let b = f.s.mailbox.mail.get_mut(&f.b).unwrap();
+        b.body.text =
+            Some("See below.\n\n> Shall we meet at noon?\nYes, noon.\n> The usual place.\nFine.".into());
+        f.s.selection.items = vec![f.b];
+        f.s.selection.focus = Some(f.b);
+        // On (default): the modified original stays.
+        assert_eq!(f.s.run("mail.cleanUpConversation", &json!({})).unwrap()["moved"], 0);
+        assert_eq!(folder_of(&f.s, f.c), f.inbox);
+        // Off: it goes to Deleted Items.
+        f.s.settings.set("mail.cleanup.keepOriginal", &json!(false)).unwrap();
+        assert_eq!(f.s.run("mail.cleanUpConversation", &json!({})).unwrap()["moved"], 1);
+        assert_eq!(folder_of(&f.s, f.c), role(&f.s, FolderRole::DeletedItems));
+        // A reply that dropped part of the original does not count.
+        let lines = |t: &[&str]| t.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>();
+        assert!(!quoted_with_changes(&lines(&["a", "b"]), &lines(&["a", "x", "c"])));
+        assert!(quoted_with_changes(&lines(&["a", "b"]), &lines(&["a", "x", "b"])));
+        assert!(!quoted_with_changes(&[], &lines(&["a"])));
     }
 
     #[test]

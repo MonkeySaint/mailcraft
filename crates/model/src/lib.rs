@@ -8,6 +8,7 @@
 //! `#[serde(default)]` and keep `Default` derivable so other crates can build values with `..Default::default()`.
 
 pub mod account;
+pub mod altcal;
 pub mod calendar;
 pub mod category;
 pub mod contact;

@@ -1,8 +1,12 @@
 //! MailCraft desktop app: an eframe window around [`mailcraft_ui_egui::App`].
 //!
 //! ```text
-//! mailcraft [--profile <dir>] [--sample] [--control-port <N>] [--version] [--help]
+//! mailcraft [--profile <dir>] [--sample] [--control-port <N>] [--version] [--help] [mailto:…]
 //! ```
+//!
+//! A `mailto:` URL (RFC 6068) opens a new message to it (`mail.newFromMailto`). With File › Options ›
+//! Advanced › "Enable troubleshooting logging" on, the profile's `logs/mailcraft.log` records what the app
+//! does (`mailcraft_engine::troubleshoot`; size-capped, no secrets).
 //!
 //! The profile (mail store) defaults to the platform data folder: `$XDG_DATA_HOME/MailCraft` or
 //! `~/.local/share/MailCraft` on Linux and other Unix systems, `~/Library/Application Support/MailCraft` on
@@ -28,6 +32,9 @@ Options:
   --control-port <N>    Accept control commands on 127.0.0.1:<N> (for tests and automation)
   --version             Print the version and exit
   -h, --help            Print this help and exit
+
+Arguments:
+  mailto:<address>      Open a new message (RFC 6068 mailto: link)
 ";
 
 /// `git <hash>, <date>` from `build.rs` (`unknown` when the build had neither git nor the variables).
@@ -46,6 +53,8 @@ struct Args {
     control_port: Option<u16>,
     version: bool,
     help: bool,
+    /// A `mailto:` link to open as a new message.
+    mailto: Option<String>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -72,6 +81,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--version" | "-V" => out.version = true,
             "--help" | "-h" => out.help = true,
+            m if m.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) => {
+                out.mailto = Some(a.clone())
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
     }
@@ -116,6 +128,12 @@ fn open_session(args: &Args) -> Session {
     }
     match Session::open(&dir) {
         Ok(mut s) => {
+            // File › Options › Advanced › "Enable troubleshooting logging" (read at start-up).
+            match mailcraft_engine::troubleshoot::start(&s.settings, &dir) {
+                Ok(Some(path)) => log::info!("troubleshooting log: {}", path.display()),
+                Ok(None) => {}
+                Err(e) => eprintln!("mailcraft: {e}"),
+            }
             // Account secrets live in the OS credential store where there is one; otherwise the profile's
             // unencrypted secrets file stays in use (Account Settings says so).
             match s.use_os_keyring() {
@@ -178,6 +196,9 @@ fn main() -> ExitCode {
 
     let session = open_session(&args);
     let mut app = App::new(session);
+    if let Some(url) = &args.mailto {
+        app.run("mail.newFromMailto", serde_json::json!({"url": url}));
+    }
     file_dialogs::install(&mut app);
     clipboard::install();
     app.ui.control_port = args.control_port.or_else(|| {
@@ -235,6 +256,9 @@ mod tests {
         assert!(parse(&["--control-port", "x"]).is_err());
         assert!(parse(&["--profile"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+        let m = parse(&["--sample", "mailto:ann@example.org?subject=Hi"]).unwrap();
+        assert_eq!(m.mailto.as_deref(), Some("mailto:ann@example.org?subject=Hi"));
+        assert!(parse(&["ann@example.org"]).is_err(), "only mailto: links are arguments");
     }
 
     #[test]

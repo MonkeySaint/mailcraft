@@ -443,6 +443,14 @@ fn title(st: &ModState, sel: i64, work: &[u8], first: u8) -> String {
     }
 }
 
+/// `label` with the alternate calendar's date after it ("Friday, October 9, 2026, 26 Tishri 5787").
+fn with_alternate(label: String, alt: Option<&mailcraft_model::altcal::AltDate>) -> String {
+    match alt {
+        Some(a) => format!("{label}, {}", a.long()),
+        None => label,
+    }
+}
+
 /// The date the previous/next arrows go to.
 fn step(st: &ModState, sel: i64, dir: i64) -> i64 {
     match st.cal.mode {
@@ -1353,7 +1361,8 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
             vec2(cell_w, cell_h),
         );
         let resp = ui.interact(cell, Id::new(("mc-cal-cell", k, d)), Sense::click());
-        a11y(&resp, WidgetType::Button, &long_date(d));
+        let alt = mailcraft_engine::queries::alternate_date(&app.s, d);
+        a11y(&resp, WidgetType::Button, &with_alternate(long_date(d), alt.as_ref()));
         let (_, m, dd) = ymd(d);
         let fill = if d == sel {
             app.theme.selected
@@ -1376,7 +1385,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
                 app.theme.accent,
             );
         }
-        p.text(
+        let first = p.text(
             pos2(cell.min.x + 8.0, cell.min.y + 6.0),
             Align2::LEFT_TOP,
             label,
@@ -1389,6 +1398,18 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
                 app.theme.text_muted
             },
         );
+        // Calendar › "Enable an alternate calendar": that calendar's date at the top right.
+        if let Some(a) = &alt {
+            let text = if a.day == 1 || i == 0 { a.short() } else { a.day.to_string() };
+            paint_text_clipped(
+                ui,
+                pos2((cell.max.x - 6.0 - 90.0).max(first.max.x + 6.0), cell.min.y + 7.0),
+                &text,
+                FontId::proportional(11.0),
+                app.theme.text_muted,
+                (cell.max.x - 6.0 - first.max.x - 6.0).clamp(0.0, 90.0),
+            );
+        }
         if resp.clicked() {
             app.ui.module_selection = None;
             if d != sel {
@@ -1694,7 +1715,8 @@ fn time_grid_view(
             vec2(col_w, head_h),
         );
         let resp = ui.interact(r, Id::new(("mc-cal-dayhead", k, d)), Sense::click());
-        a11y(&resp, WidgetType::Button, &long_date(d));
+        let alt = mailcraft_engine::queries::alternate_date(&app.s, d);
+        a11y(&resp, WidgetType::Button, &with_alternate(long_date(d), alt.as_ref()));
         let color = if d == now { app.theme.accent } else { app.theme.text };
         let (_, _, dd) = ymd(d);
         let num = p.text(
@@ -1705,13 +1727,24 @@ fn time_grid_view(
             color,
         );
         let name = if col_w > 110.0 { weekday_name(d) } else { super::common::weekday_short(d) };
-        p.text(
+        let day_name = p.text(
             pos2(num.max.x + 6.0, r.center().y + 1.0),
             Align2::LEFT_CENTER,
             name,
             FontId::proportional(12.5),
             color,
         );
+        // Calendar › "Enable an alternate calendar": that calendar's date after the weekday.
+        if let Some(a) = &alt {
+            paint_text_clipped(
+                ui,
+                pos2(day_name.max.x + 8.0, r.center().y - 6.0),
+                &a.short(),
+                FontId::proportional(10.5),
+                app.theme.text_muted,
+                (r.max.x - day_name.max.x - 12.0).max(0.0),
+            );
+        }
         if d == now {
             p.rect_filled(
                 Rect::from_min_size(pos2(r.min.x, r.max.y - 3.0), vec2(col_w, 3.0)),

@@ -321,6 +321,15 @@ fn view_items(s: &Session) -> (ViewSettings, Vec<&MailItem>) {
         items.retain(|m| f.matches(s, m));
     }
     sort_items(s, &vs, &mut items);
+    // Options › Search › "Show most relevant search results on top": the best hits lead a search.
+    let top = top_results(s);
+    if !top.is_empty() {
+        let (mut first, rest): (Vec<&MailItem>, Vec<&MailItem>) =
+            items.into_iter().partition(|m| top.contains(&m.id));
+        first.sort_by_key(|m| top.iter().position(|t| *t == m.id));
+        first.extend(rest);
+        items = first;
+    }
     // Pinned messages lead the list (conversations keep their own order).
     if !vs.conversations {
         let pins = crate::cmd::view::mail::pinned(s);
@@ -337,6 +346,53 @@ fn view_items(s: &Session) -> (ViewSettings, Vec<&MailItem>) {
 /// Pinned messages of the list (empty in conversation view, which keeps its own order).
 fn list_pins(s: &Session, vs: &ViewSettings) -> BTreeSet<ItemId> {
     if vs.conversations { BTreeSet::new() } else { crate::cmd::view::mail::pinned(s) }
+}
+
+/// Group header of the most relevant search results.
+pub const TOP_RESULTS_LABEL: &str = "Top Results";
+/// How many search results [`top_results`] puts on top.
+pub const TOP_RESULTS: usize = 3;
+
+/// Options › Search › "Show most relevant search results on top": the [`TOP_RESULTS`] best hits of the
+/// active search (relevance: term frequency, rarity, recency), shown in their own group above the results
+/// in the view's order. Empty while the option is off, without a search, when the search found no more than
+/// that many messages, or in conversation view (which keeps its own order).
+pub fn top_results(s: &Session) -> Vec<ItemId> {
+    if s.view.search.trim().is_empty() || !s.settings.bool("search.relevance") {
+        return Vec::new();
+    }
+    if view_settings(s, s.selection.folder).conversations {
+        return Vec::new();
+    }
+    let hits = crate::search_index::results(s);
+    if hits.len() <= TOP_RESULTS {
+        return Vec::new();
+    }
+    hits.into_iter().take(TOP_RESULTS).collect()
+}
+
+/// Options › Search › "Notify me when results might be limited because search indexing is not complete":
+/// while a search covers messages downloaded as headers only (their text is not on this computer, so it
+/// cannot be indexed), the notice shown above the results. `None` without such messages, without a search
+/// or when the option is off.
+pub fn search_notice(s: &Session) -> Option<String> {
+    if s.view.search.trim().is_empty() || !s.settings.bool("search.notifyIncomplete") {
+        return None;
+    }
+    let folders: BTreeSet<FolderId> = crate::search_index::scope_folders(s).into_iter().collect();
+    let n = s.mailbox.mail.values().filter(|m| folders.contains(&m.folder) && header_only(s, m)).count();
+    match n {
+        0 => None,
+        1 => Some(
+            "Results might be incomplete: 1 message here was downloaded as headers only, so its text isn't \
+             searched."
+                .to_owned(),
+        ),
+        n => Some(format!(
+            "Results might be incomplete: {n} messages here were downloaded as headers only, so their text \
+             isn't searched."
+        )),
+    }
 }
 
 /// Primary sort / group key.
@@ -491,7 +547,17 @@ fn grouped<'a>(
     pins: &BTreeSet<ItemId>,
 ) -> Vec<(String, Vec<&'a MailItem>)> {
     let mut out: Vec<(Key, String, Vec<&'a MailItem>)> = Vec::new();
+    // Top search results (first in `items` after the pins) form a group of their own too.
+    let top = top_results(s);
     for m in items {
+        if top.contains(&m.id) && !pins.contains(&m.id) {
+            let id = Key::Text("\u{1}top".to_owned());
+            match out.last_mut() {
+                Some((last, _, list)) if *last == id => list.push(m),
+                _ => out.push((id, TOP_RESULTS_LABEL.to_owned(), vec![m])),
+            }
+            continue;
+        }
         if pins.contains(&m.id) {
             let id = Key::Text("\u{1}pinned".to_owned());
             match out.last_mut() {
@@ -767,8 +833,9 @@ fn group_collapsed(
 ) -> bool {
     !collapsed.is_empty()
         && (collapsed.iter().any(|c| c == label)
-            // The pinned group goes by its own label only (its items belong to other groups too).
-            || label != crate::cmd::view::mail::PINNED_LABEL && list.iter().any(|m| {
+            // The pinned and top-results groups go by their own label only (their items belong to other
+            // groups too).
+            || label != crate::cmd::view::mail::PINNED_LABEL && label != TOP_RESULTS_LABEL && list.iter().any(|m| {
                 let other = crate::cmd::view::group_label(s, m, vs.arrange_by);
                 collapsed.contains(&other)
             }))
@@ -1112,6 +1179,38 @@ pub struct ReadingHeader {
     pub info: Vec<String>,
     pub attachments: Vec<(String, String)>,
     pub categories: Vec<String>,
+    /// The contact whose picture stands in for the persona circle: a contact with a picture and the
+    /// sender's address, while People › "Show user photographs when available" is on.
+    #[serde(default)]
+    pub photo: Option<ItemId>,
+}
+
+/// People › "Show user photographs when available": the contact with a picture for `addr` (any of its
+/// e-mail addresses, case-insensitive), `None` when the option is off or no such contact exists.
+pub fn photo_contact(s: &Session, addr: &str) -> Option<ItemId> {
+    let addr = addr.trim();
+    if addr.is_empty() || !s.settings.bool("people.photos") {
+        return None;
+    }
+    s.mailbox
+        .contacts
+        .values()
+        .filter(|c| c.picture.is_some())
+        .find(|c| c.emails.iter().any(|e| e.trim().eq_ignore_ascii_case(addr)))
+        .map(|c| c.id)
+}
+
+/// Calendar › "Enable an alternate calendar": the date `day` (days since 1970-01-01) falls on in the chosen
+/// alternate calendar (`calendar.alternateCalendarType`), `None` while the option is off.
+pub fn alternate_date(s: &Session, day: i64) -> Option<mailcraft_model::altcal::AltDate> {
+    if !s.settings.bool("calendar.alternateCalendar") {
+        return None;
+    }
+    let cal = match s.settings.text("calendar.alternateCalendarType").as_str() {
+        "hebrew" => mailcraft_model::altcal::AltCalendar::Hebrew,
+        _ => mailcraft_model::altcal::AltCalendar::Hijri,
+    };
+    Some(mailcraft_model::altcal::to_alt(cal, day))
 }
 
 /// Initials for the persona circle: first letters of the first and last words of the name, else the first
@@ -1235,6 +1334,7 @@ pub fn reading_header(s: &Session, id: ItemId) -> Option<ReadingHeader> {
             .map(|a| (a.filename.clone(), size_text(a.size)))
             .collect(),
         categories: m.categories.clone(),
+        photo: from_box.and_then(|f| photo_contact(s, &f.addr)),
     })
 }
 
@@ -1483,6 +1583,116 @@ mod tests {
         let mut vs = view_settings(s, folder);
         f(&mut vs);
         s.mailbox.views.insert(folder, vs);
+    }
+
+    /// The sample Inbox plus five "budget" messages; the oldest is by far the most relevant.
+    fn budget_search() -> (Session, ItemId) {
+        let mut s = sample_session();
+        let inbox = s.selection.folder;
+        let now = s.now();
+        let mut best = ItemId(0);
+        for n in 0..5i64 {
+            let text = if n == 0 { "budget budget budget: the budget review" } else { "see the budget" };
+            let m = MailItem {
+                folder: inbox,
+                subject: if n == 0 { "Budget budget".into() } else { format!("Note {n}") },
+                body: mailcraft_model::Body {
+                    format: mailcraft_model::BodyFormat::PlainText,
+                    text: Some(text.into()),
+                    html: None,
+                },
+                received: DateTime::from_unix(now.unix - 86_400 * (10 - n), 0),
+                read: true,
+                ..Default::default()
+            };
+            let id = s.mailbox.add_mail(m);
+            if n == 0 {
+                best = id;
+            }
+        }
+        s.search.invalidate();
+        s.run("search.query", &serde_json::json!({"text": "budget"})).unwrap();
+        (s, best)
+    }
+
+    #[test]
+    fn most_relevant_results_lead_a_search_when_the_option_is_on() {
+        let (mut s, best) = budget_search();
+        // On (default): the best hits in their own group first.
+        let rows = list_rows(&s);
+        assert_eq!(groups(&rows).first().map(String::as_str), Some(TOP_RESULTS_LABEL));
+        assert_eq!(items(&rows).first().map(|r| r.id), Some(best));
+        assert_eq!(top_results(&s).len(), TOP_RESULTS);
+        assert_eq!(group_items(&s, TOP_RESULTS_LABEL).len(), TOP_RESULTS);
+        // Off: date order only (the oldest, best match comes last).
+        s.run("options.set", &serde_json::json!({"key": "search.relevance", "value": false})).unwrap();
+        let rows = list_rows(&s);
+        assert!(!groups(&rows).iter().any(|g| g == TOP_RESULTS_LABEL));
+        assert_eq!(items(&rows).last().map(|r| r.id), Some(best));
+        assert!(top_results(&s).is_empty());
+    }
+
+    #[test]
+    fn incomplete_search_notice_follows_the_option() {
+        let (mut s, best) = budget_search();
+        assert_eq!(search_notice(&s), None, "every message has its text");
+        // A server account's message downloaded as headers only.
+        if let Some(a) = s.mailbox.accounts.first_mut() {
+            a.kind = mailcraft_model::AccountKind::Imap;
+        }
+        if let Some(m) = s.mailbox.mail.get_mut(&best) {
+            m.body = mailcraft_model::Body::default();
+            m.raw = None;
+        }
+        let notice = search_notice(&s).unwrap();
+        assert!(notice.contains("1 message here was downloaded as headers only"), "{notice}");
+        s.run("options.set", &serde_json::json!({"key": "search.notifyIncomplete", "value": false})).unwrap();
+        assert_eq!(search_notice(&s), None);
+        s.run("options.set", &serde_json::json!({"key": "search.notifyIncomplete", "value": true})).unwrap();
+        s.run("search.close", &serde_json::json!({})).unwrap();
+        assert_eq!(search_notice(&s), None, "no search, no notice");
+    }
+
+    #[test]
+    fn alternate_dates_follow_the_calendar_options() {
+        let mut s = sample_session();
+        let day = mailcraft_mime::date::days_from_civil(2026, 10, 8);
+        assert_eq!(alternate_date(&s, day), None);
+        s.run("options.set", &serde_json::json!({"key": "calendar.alternateCalendar", "value": true}))
+            .unwrap();
+        assert_eq!(alternate_date(&s, day).map(|d| d.long()).as_deref(), Some("25 Rabi\u{2bf} II 1448"));
+        s.run(
+            "options.set",
+            &serde_json::json!({"key": "calendar.alternateCalendarType", "value": "hebrew"}),
+        )
+        .unwrap();
+        assert_eq!(alternate_date(&s, day).map(|d| d.long()).as_deref(), Some("27 Tishri 5787"));
+    }
+
+    #[test]
+    fn sender_photos_show_only_while_the_option_is_on() {
+        let mut s = sample_session();
+        let id = s.selection.focus.or_else(|| visible_item_ids(&s).first().copied()).unwrap();
+        let addr = s.mailbox.mail[&id].from.as_ref().unwrap().addr.clone();
+        assert_eq!(reading_header(&s, id).unwrap().photo, None, "no contact picture yet");
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0".to_vec();
+        let cid = ItemId(s.mailbox.alloc_id());
+        let contacts =
+            s.mailbox.folders.values().find(|f| f.kind == FolderKind::Contacts).map(|f| f.id).unwrap();
+        let c = mailcraft_model::Contact {
+            id: cid,
+            folder: contacts,
+            emails: vec![addr.to_uppercase()],
+            ..Default::default()
+        };
+        s.mailbox.contacts.insert(cid, c);
+        assert_eq!(reading_header(&s, id).unwrap().photo, None, "a contact without a picture");
+        s.mailbox.contacts.get_mut(&cid).unwrap().picture =
+            mailcraft_model::contact::ContactPicture::sniff(&png);
+        assert_eq!(reading_header(&s, id).unwrap().photo, Some(cid));
+        s.run("options.set", &serde_json::json!({"key": "people.photos", "value": false})).unwrap();
+        assert_eq!(reading_header(&s, id).unwrap().photo, None);
+        assert_eq!(photo_contact(&s, ""), None);
     }
 
     #[test]

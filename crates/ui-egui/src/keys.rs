@@ -326,6 +326,8 @@ pub enum Action {
     ComposeStep(bool),
     /// Mod+F1: collapse or expand the ribbon.
     ToggleRibbon,
+    /// F4: Find in the received message (reading pane or read window).
+    FindInMessage,
 }
 
 fn run(id: &str) -> Option<Action> {
@@ -648,6 +650,7 @@ fn resolve_mail(c: Chord) -> Option<Action> {
         (false, false, shift, Key::ArrowUp) => run_p("nav.prevItem", json!({"extend": shift})),
         (false, false, false, Key::Home) => run("nav.firstItem"),
         (false, false, false, Key::End) => run("nav.lastItem"),
+        (false, false, false, Key::F4) => Some(Action::FindInMessage),
         _ => None,
     }
 }
@@ -717,6 +720,7 @@ fn resolve_read(c: Chord, item: u64, _cx: &KeyContext) -> Option<Action> {
         (true, false, true, Key::V) => run_p("mail.move", ids()),
         (true, false, _, Key::Period) => Some(Action::ReadStep(true)),
         (true, false, _, Key::Comma) => Some(Action::ReadStep(false)),
+        (false, false, false, Key::F4) => Some(Action::FindInMessage),
         (true, false, true, Key::M) => run("mail.newEmail"),
         (true, false, true, Key::B) => run("compose.addressBook"),
         (false, false, false, Key::F9) => run("sendReceive.all"),
@@ -1229,24 +1233,23 @@ pub fn apply(ctx: &egui::Context, app: &mut App, surface: Surface, action: Actio
             let Surface::Read(item) = surface else {
                 return json!({"action": "readStep", "ok": false});
             };
-            let order = mailcraft_engine::queries::visible_item_ids(&app.s);
-            let pos = order.iter().position(|i| i.0 == item);
-            let target = pos.and_then(|p| {
-                if next {
-                    order.get(p.saturating_add(1))
-                } else {
-                    p.checked_sub(1).and_then(|q| order.get(q))
-                }
-            });
-            match target {
-                Some(t) => {
-                    let t = t.0;
-                    if let Some(slot) = app.ui.read_windows.iter_mut().find(|w| **w == item) {
-                        *slot = t;
-                    }
-                    json!({"action": "readStep", "ok": true, "item": t})
-                }
+            match crate::reading::read_step(app, item, next) {
+                Some(t) => json!({"action": "readStep", "ok": true, "item": t}),
                 None => json!({"action": "readStep", "ok": false}),
+            }
+        }
+        Action::FindInMessage => {
+            // F4: the find bar of the message in this read window, else of the reading pane's message.
+            let item = match surface {
+                Surface::Read(item) => Some(item),
+                _ => app.s.selection.focus.filter(|f| app.s.mailbox.mail.contains_key(f)).map(|f| f.0),
+            };
+            match item {
+                Some(id) => {
+                    let r = app.run("format.find", json!({"ids": [id]}));
+                    json!({"action": "findInMessage", "ok": r.is_some(), "item": id})
+                }
+                None => json!({"action": "findInMessage", "ok": false}),
             }
         }
     }

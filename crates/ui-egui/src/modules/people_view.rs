@@ -73,10 +73,11 @@ fn first_address(c: &Contact) -> String {
     c.emails.iter().find(|e| !e.trim().is_empty()).cloned().unwrap_or_default()
 }
 
-/// The contact's picture, else a persona circle with initials.
-fn avatar(ui: &Ui, center: egui::Pos2, radius: f32, c: &Contact) {
+/// The contact's picture (while People › "Show user photographs when available" is on, `photos`), else a
+/// persona circle with initials.
+fn avatar(ui: &Ui, photos: bool, center: egui::Pos2, radius: f32, c: &Contact) {
     let rect = egui::Rect::from_center_size(center, egui::Vec2::splat(radius * 2.0));
-    if super::common::paint_contact_picture(ui, rect, c) {
+    if photos && super::common::paint_contact_picture(ui, rect, c) {
         return;
     }
     let name = display_name(c);
@@ -367,13 +368,40 @@ fn table_view(
     });
 }
 
+/// egui memory: the additional index is the one shown (People › "Show an additional index").
+fn alt_index_id() -> Id {
+    Id::new("mc-people-index-alt")
+}
+
+/// Accessible names of the index switch.
+pub const SHOW_ADDITIONAL_INDEX: &str = "Show the additional index";
+pub const SHOW_LATIN_INDEX: &str = "Show the a to z index";
+
 fn letter_index(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: &[ItemId]) {
+    // People › Contacts index › "Show an additional index": a switch at the bottom flips the bar between a–z
+    // and the chosen alphabet (Arabic, Cyrillic, Greek, Hebrew, Thai or Vietnamese).
+    let extra = mailcraft_engine::cmd::people::additional_index(&app.s);
+    let showing_alt =
+        extra.is_some() && ui.ctx().data(|d| d.get_temp::<bool>(alt_index_id())).unwrap_or(false);
+    if let Some(letters) = extra.filter(|_| showing_alt) {
+        alt_letter_index(ui, app, st, rect, ids, letters);
+        return;
+    }
+    let slots = INDEX.len() + usize::from(extra.is_some());
     let present: std::collections::BTreeSet<char> = ids
         .iter()
         .filter_map(|id| app.s.mailbox.contacts.get(id))
         .map(|c| bucket(&display_name(c)))
         .collect();
-    let h = ((rect.height() - 8.0) / INDEX.len() as f32).clamp(10.0, 23.0);
+    let h = ((rect.height() - 8.0) / slots as f32).clamp(10.0, 23.0);
+    if let Some(letters) = extra {
+        let r = Rect::from_min_size(
+            pos2(rect.min.x, rect.min.y + 4.0 + h * INDEX.len() as f32),
+            vec2(INDEX_W, h),
+        );
+        let label: String = letters.iter().take(2).collect();
+        index_switch(ui, app, r, &label, SHOW_ADDITIONAL_INDEX, true);
+    }
     for (k, &c) in INDEX.iter().enumerate() {
         let r = Rect::from_min_size(pos2(rect.min.x, rect.min.y + 4.0 + h * k as f32), vec2(INDEX_W, h));
         let label = if c == '#' { "123".to_owned() } else { c.to_string() };
@@ -391,9 +419,70 @@ fn letter_index(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: 
     }
 }
 
-/// Resolves a pending letter jump to the first contact at or after that letter.
+/// The switch button below the index letters.
+fn index_switch(ui: &mut Ui, app: &App, r: Rect, label: &str, name: &str, to_alt: bool) {
+    let resp = ui.interact(r, Id::new(("mc-people-index-switch", to_alt)), Sense::click());
+    a11y(&resp, WidgetType::Button, name);
+    let fill = if resp.hovered() { app.theme.hover } else { app.theme.group_header };
+    ui.painter().rect_filled(r.shrink(2.0), CornerRadius::same(3), fill);
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(10.5), app.theme.accent);
+    if resp.clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(alt_index_id(), to_alt));
+    }
+}
+
+/// The additional index: its letters (dimmed where no contact starts with one), then the a–z switch. A
+/// letter jumps to the first contact (list order) whose name starts with it.
+fn alt_letter_index(
+    ui: &mut Ui,
+    app: &mut App,
+    st: &mut ModState,
+    rect: Rect,
+    ids: &[ItemId],
+    letters: &[char],
+) {
+    use mailcraft_engine::cmd::people::index_bucket;
+    let names: Vec<(ItemId, Option<usize>)> = ids
+        .iter()
+        .filter_map(|id| {
+            app.s.mailbox.contacts.get(id).map(|c| (*id, index_bucket(&display_name(c), letters)))
+        })
+        .collect();
+    let h = ((rect.height() - 8.0) / (letters.len() + 1) as f32).clamp(8.0, 23.0);
+    for (k, &c) in letters.iter().enumerate() {
+        let r = Rect::from_min_size(pos2(rect.min.x, rect.min.y + 4.0 + h * k as f32), vec2(INDEX_W, h));
+        let resp = ui.interact(r, Id::new(("mc-people-index-alt", k)), Sense::click());
+        a11y(&resp, WidgetType::Button, &format!("Jump to {c}"));
+        if resp.hovered() {
+            ui.painter().rect_filled(r, CornerRadius::same(3), app.theme.hover);
+        }
+        let first = names.iter().find(|(_, b)| *b == Some(k)).map(|(id, _)| *id);
+        let color = if first.is_some() { app.theme.text } else { app.theme.text_muted.gamma_multiply(0.6) };
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, c, FontId::proportional(11.5), color);
+        if resp.clicked() {
+            st.people_jump = Some(c);
+        }
+    }
+    let r =
+        Rect::from_min_size(pos2(rect.min.x, rect.min.y + 4.0 + h * letters.len() as f32), vec2(INDEX_W, h));
+    index_switch(ui, app, r, "az", SHOW_LATIN_INDEX, false);
+}
+
+/// Resolves a pending letter jump to the first contact at or after that letter (of the a–z index, or of the
+/// additional index for its letters).
 fn jump_target(app: &App, st: &ModState, ids: &[ItemId]) -> Option<ItemId> {
     let want = st.people_jump?;
+    if !INDEX.contains(&want)
+        && let Some(letters) = mailcraft_engine::cmd::people::additional_index(&app.s)
+        && let Some(k) = letters.iter().position(|l| *l == want)
+    {
+        let at_or_after = |id: &ItemId| {
+            app.s.mailbox.contacts.get(id).is_some_and(|c| {
+                mailcraft_engine::cmd::people::index_bucket(&display_name(c), letters).is_some_and(|b| b >= k)
+            })
+        };
+        return ids.iter().copied().find(at_or_after).or_else(|| ids.last().copied());
+    }
     ids.iter()
         .copied()
         .find(|id| app.s.mailbox.contacts.get(id).is_some_and(|c| bucket(&display_name(c)) >= want))
@@ -482,7 +571,13 @@ fn contact_list(ui: &mut Ui, app: &mut App, st: &mut ModState, ids: &[ItemId]) {
                     app.theme.hover,
                 );
             }
-            avatar(ui, pos2(rect.min.x + 30.0, rect.center().y), 17.0, &c);
+            avatar(
+                ui,
+                app.s.settings.bool("people.photos"),
+                pos2(rect.min.x + 30.0, rect.center().y),
+                17.0,
+                &c,
+            );
             let x = rect.min.x + 56.0;
             let w = rect.max.x - x - 8.0;
             if is_group(&c) {
@@ -573,7 +668,7 @@ fn contact_card(ui: &mut Ui, app: &mut App, st: &mut ModState, id: ItemId) {
     let Some(c) = app.s.mailbox.contacts.get(&id).cloned() else { return };
     ScrollArea::vertical().id_salt("mc-people-card-scroll").auto_shrink([false, false]).show(ui, |ui| {
         let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 88.0), Sense::hover());
-        avatar(ui, pos2(head.min.x + 40.0, head.center().y), 38.0, &c);
+        avatar(ui, app.s.settings.bool("people.photos"), pos2(head.min.x + 40.0, head.center().y), 38.0, &c);
         let name = display_name(&c);
         let shown = if c.full_name().is_empty() || is_group(&c) { name.clone() } else { c.full_name() };
         paint_text_clipped(
@@ -841,7 +936,13 @@ fn business_cards(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids
                         CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 },
                         app.theme.accent,
                     );
-                    avatar(ui, pos2(card.min.x + 46.0, card.min.y + 46.0), 28.0, &c);
+                    avatar(
+                        ui,
+                        app.s.settings.bool("people.photos"),
+                        pos2(card.min.x + 46.0, card.min.y + 46.0),
+                        28.0,
+                        &c,
+                    );
                     let lines = if is_group(&c) {
                         vec![name.clone(), format!("Contact group · {} members", c.emails.len())]
                     } else {

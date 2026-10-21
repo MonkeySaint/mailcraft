@@ -271,6 +271,7 @@ const ACCESS_WARNINGS: &[(&str, &str)] = &[
     ("when", "Show me accessibility warnings when"),
     ("checkerOnly", "Show me accessibility warnings only when I open the accessibility checker"),
 ];
+const ALT_CALENDARS: &[(&str, &str)] = &[("hijri", "Hijri (tabular)"), ("hebrew", "Hebrew lunar")];
 const SOUND_SCHEMES: &[(&str, &str)] = &[("modern", "Modern"), ("classic", "Classic")];
 const OPEN_FILES: &[(&str, &str)] = &[("browser", "Browser"), ("desktop", "Desktop app")];
 const OPEN_LINKS: &[(&str, &str)] = &[("default", "Default browser")];
@@ -303,13 +304,16 @@ pub const DEFS: &[Def] = &[
         Bool(false),
         N,
     ),
+    // N: MailCraft always lays itself out again at each display's scale, keeping its physical size (egui and
+    // winit are per-monitor scale aware). "Optimize for compatibility" asks the system to stretch a bitmap
+    // drawn at one scale instead; MailCraft has no such mode, and shrinking or growing the UI is not one.
     d(
         "general",
         "User Interface options",
         "general.multipleDisplays",
         "When using multiple displays:",
         Choice("appearance", DISPLAYS),
-        S,
+        N,
     ),
     d(
         "general",
@@ -344,7 +348,7 @@ pub const DEFS: &[Def] = &[
         "general.background",
         "Background:",
         Choice("none", BACKGROUNDS),
-        S,
+        A,
     ),
     d("general", "Personalize your copy of MailCraft", "general.theme", "Theme:", Choice("light", THEMES), A),
     d(
@@ -407,7 +411,7 @@ pub const DEFS: &[Def] = &[
         "mail.arrival.envelope",
         "Show an envelope icon in the taskbar",
         Bool(true),
-        S,
+        A,
     ),
     d("mail", "Message arrival", "mail.arrival.desktopAlert", "Display a Desktop Alert", Bool(true), E),
     d(
@@ -472,7 +476,7 @@ pub const DEFS: &[Def] = &[
         "mail.cleanup.keepOriginal",
         "When a reply modifies a message, don't move the original",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -760,7 +764,7 @@ pub const DEFS: &[Def] = &[
         "mail.other.nextPreviousLinks",
         "Show Next and Previous links in the message headers when reading messages",
         Bool(true),
-        S,
+        A,
     ),
     d(
         "mail",
@@ -768,7 +772,7 @@ pub const DEFS: &[Def] = &[
         "mail.other.noAutoExpandConversations",
         "Don't automatically expand conversations when using the keyboard to change messages",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "mail",
@@ -886,7 +890,7 @@ pub const DEFS: &[Def] = &[
         "mail.readingPane.portraitFullScreen",
         "Turn on automatic full-screen reading in portrait orientation",
         Bool(false),
-        S,
+        A,
     ),
     d(
         "readingPane",
@@ -894,7 +898,7 @@ pub const DEFS: &[Def] = &[
         "mail.readingPane.alwaysPreview",
         "Always preview messages",
         Bool(true),
-        S,
+        A,
     ),
     // Mail › Stationery and Fonts... (dialog)
     d(
@@ -1010,15 +1014,25 @@ pub const DEFS: &[Def] = &[
         "calendar.alternateCalendar",
         "Enable an alternate calendar",
         Bool(false),
-        S,
+        A,
     ),
+    d(
+        "calendar",
+        "Calendar options",
+        "calendar.alternateCalendarType",
+        "Alternate calendar:",
+        Choice("hijri", ALT_CALENDARS),
+        A,
+    ),
+    // N: MailCraft always sends meeting requests as iCalendar (RFC 5545/5546); the other choice is a
+    // proprietary rich-text encoding it does not write.
     d(
         "calendar",
         "Calendar options",
         "calendar.iCalendarOutside",
         "When sending meeting requests outside of your organization, use the iCalendar format",
         Bool(true),
-        S,
+        N,
     ),
     d(
         "calendar",
@@ -1114,7 +1128,7 @@ pub const DEFS: &[Def] = &[
         "calendar.gridDetails",
         "Show calendar details in the scheduling grid",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "calendar",
@@ -1192,14 +1206,14 @@ pub const DEFS: &[Def] = &[
         Bool(true),
         A,
     ),
-    d("people", "Contacts index", "people.additionalIndex", "Show an additional index", Bool(false), E),
+    d("people", "Contacts index", "people.additionalIndex", "Show an additional index", Bool(false), A),
     d(
         "people",
         "Contacts index",
         "people.additionalIndexLanguage",
         "Additional contact index:",
         Choice("arabic", INDEX_LANGUAGES),
-        E,
+        A,
     ),
     d(
         "people",
@@ -1215,7 +1229,7 @@ pub const DEFS: &[Def] = &[
         "people.photos",
         "Show user photographs when available",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "people",
@@ -1223,7 +1237,7 @@ pub const DEFS: &[Def] = &[
         "people.namesOnlyInPeek",
         "Show only names in the People peek",
         Bool(false),
-        E,
+        A,
     ),
     // ---------------------------------------------------------------- Tasks
     d("tasks", "Task options", "tasks.openInToDo", "Open tasks in the To Do app", Bool(false), N),
@@ -1303,9 +1317,9 @@ pub const DEFS: &[Def] = &[
         "search.notifyIncomplete",
         "Notify me when results might be limited because search indexing is not complete",
         Bool(true),
-        S,
+        A,
     ),
-    d("search", "Results", "search.relevance", "Show most relevant search results on top", Bool(true), E),
+    d("search", "Results", "search.relevance", "Show most relevant search results on top", Bool(true), A),
     // ---------------------------------------------------------------- Language
     d(
         "language",
@@ -1396,21 +1410,23 @@ pub const DEFS: &[Def] = &[
         Bool(true),
         E,
     ),
+    // N: MailCraft has no audio output (no sound library in its dependencies), so feedback sounds cannot play.
     d(
         "accessibility",
         "Feedback options",
         "accessibility.sound",
         "Provide feedback with sound",
         Bool(false),
-        S,
+        N,
     ),
+    // N: see accessibility.sound.
     d(
         "accessibility",
         "Feedback options",
         "accessibility.soundScheme",
         "Sound Scheme:",
         Choice("modern", SOUND_SCHEMES),
-        S,
+        N,
     ),
     d(
         "accessibility",
@@ -1418,7 +1434,7 @@ pub const DEFS: &[Def] = &[
         "accessibility.readAloud",
         "Show Read Aloud",
         Bool(true),
-        S,
+        A,
     ),
     d(
         "accessibility",
@@ -1512,13 +1528,15 @@ pub const DEFS: &[Def] = &[
         Choice("desktop", OPEN_FILES),
         N,
     ),
+    // N: links always open in the system's default browser, the only choice MailCraft has (the other
+    // observed choice names one vendor's browser).
     d(
         "advanced",
         "File and browser preferences",
         "advanced.openLinksIn",
         "Open hyperlinks from MailCraft in:",
         Choice("default", OPEN_LINKS),
-        S,
+        N,
     ),
     d("advanced", "Reminders", "advanced.showReminders", "Show reminders", Bool(true), E),
     d("advanced", "Reminders", "advanced.reminderSound", "Play reminder sound", Bool(true), E),
@@ -1546,13 +1564,14 @@ pub const DEFS: &[Def] = &[
         Bool(false),
         E,
     ),
+    // N: MailCraft has no RSS feeds.
     d(
         "advanced",
         "RSS Feeds",
         "advanced.rssUpdatedAsNew",
         "Any RSS Feed item that is updated appears as new",
         Bool(false),
-        S,
+        N,
     ),
     d(
         "advanced",
@@ -1584,7 +1603,7 @@ pub const DEFS: &[Def] = &[
         "advanced.sendReceiveOnExit",
         "Perform an automatic send/receive when exiting",
         Bool(false),
-        E,
+        A,
     ),
     d("advanced", "Developers", "advanced.addInErrors", "Show add-in user interface errors", Bool(false), N),
     d(
@@ -1601,7 +1620,7 @@ pub const DEFS: &[Def] = &[
         "advanced.englishHeaders",
         "Use English for message headers on replies and forwards and for forward notifications",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "advanced",
@@ -1609,7 +1628,7 @@ pub const DEFS: &[Def] = &[
         "advanced.autoEncoding",
         "Automatically select encoding for outgoing messages",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "advanced",
@@ -1617,7 +1636,7 @@ pub const DEFS: &[Def] = &[
         "advanced.encoding",
         "Preferred encoding for outgoing messages:",
         Choice("utf-8", ENCODINGS),
-        E,
+        A,
     ),
     d(
         "advanced",
@@ -1625,7 +1644,7 @@ pub const DEFS: &[Def] = &[
         "advanced.autoVcardEncoding",
         "Automatically select encoding for outgoing vCards",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "advanced",
@@ -1633,7 +1652,7 @@ pub const DEFS: &[Def] = &[
         "advanced.vcardEncoding",
         "Preferred encoding for outgoing vCards:",
         Choice("utf-8", ENCODINGS),
-        E,
+        A,
     ),
     d(
         "advanced",
@@ -1641,7 +1660,7 @@ pub const DEFS: &[Def] = &[
         "advanced.idn",
         "Allow international domain names in email addresses",
         Bool(true),
-        E,
+        A,
     ),
     d(
         "advanced",
@@ -1649,7 +1668,7 @@ pub const DEFS: &[Def] = &[
         "advanced.mailtoUtf8",
         "Allow UTF-8 support for the mailto: protocol",
         Bool(true),
-        S,
+        A,
     ),
     d(
         "advanced",
@@ -1681,7 +1700,7 @@ pub const DEFS: &[Def] = &[
         "advanced.logging",
         "Enable troubleshooting logging (requires restarting MailCraft)",
         Bool(false),
-        E,
+        A,
     ),
     d(
         "advanced",
@@ -2315,7 +2334,8 @@ pub fn new_text_of_reply(body: &str) -> &str {
     let mut offset = 0usize;
     for line in body.split_inclusive('\n') {
         let t = line.trim_start();
-        if t.starts_with("From:")
+        if crate::intl::is_header_start(t)
+            || crate::intl::is_original_separator(t)
             || t.starts_with("-----Original Message")
             || t.starts_with('>')
             || (t.starts_with("On ") && t.trim_end().ends_with("wrote:"))

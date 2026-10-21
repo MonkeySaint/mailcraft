@@ -2309,6 +2309,7 @@ version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "encoding_rs",
+ "idna",
  "proptest",
  "serde",
  "thiserror 2.0.21",

@@ -45,6 +45,9 @@ pub struct MessageBuilder {
     pub extra_headers: Vec<(String, String)>,
     /// When false, Bcc is omitted from the output (sending); true keeps it (drafts / Sent Items copy).
     pub keep_bcc: bool,
+    /// Charset of the text parts (a label such as `iso-8859-1` or `windows-1252`); `None` = UTF-8. A text the
+    /// charset cannot represent goes out in UTF-8 instead (see [`MessageBuilder::text_charset`]).
+    pub charset: Option<String>,
 }
 
 /// 64-bit FNV-1a: small, deterministic across runs and platforms (unlike `DefaultHasher`).
@@ -188,19 +191,86 @@ fn fits_7bit(text: &str) -> bool {
     true
 }
 
-fn text_entity(text: &str, subtype: &str) -> Entity {
-    let (data, cte, raw) = if fits_7bit(text) {
-        (to_crlf(text).into_bytes(), "7bit", true)
+/// A text part in `charset` (a label [`crate::charset::encode`] accepts; UTF-8 when it cannot represent
+/// `text`). An HTML part in another charset than UTF-8 has its own charset declaration rewritten to match
+/// ([`retarget_meta_charset`]).
+fn text_entity(text: &str, subtype: &str, charset: Option<&str>) -> Entity {
+    let encoded = charset.and_then(|c| {
+        let label = charset_label(c);
+        let text = if subtype == "html" && label != "utf-8" {
+            std::borrow::Cow::Owned(retarget_meta_charset(text, &label))
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        crate::charset::encode(&text, c).map(|b| (label, text, b))
+    });
+    let (label, text, bytes) = encoded
+        .unwrap_or_else(|| ("utf-8".to_owned(), std::borrow::Cow::Borrowed(text), text.as_bytes().to_vec()));
+    let (data, cte, raw) = if fits_7bit(&text) {
+        (to_crlf(&text).into_bytes(), "7bit", true)
     } else {
-        (crate::transfer::encode_qp(text.as_bytes()).into_bytes(), "quoted-printable", false)
+        (crate::transfer::encode_qp(&bytes).into_bytes(), "quoted-printable", false)
     };
     Entity {
         headers: vec![
-            ("Content-Type".into(), format!("text/{subtype}; charset=\"utf-8\"")),
+            ("Content-Type".into(), format!("text/{subtype}; charset=\"{label}\"")),
             ("Content-Transfer-Encoding".into(), cte.into()),
         ],
         body: Body::Encoded { data, raw },
     }
+}
+
+/// `html` with the charset it declares for itself set to `label`: the value after `charset=` in every
+/// `<meta>` tag before `<body` (`<meta charset="utf-8">` and the `content` of
+/// `<meta http-equiv="Content-Type" content="text/html; charset=utf-8">`), so a saved copy or a reader that
+/// honours the markup decodes the bytes in the charset the Content-Type names. `label` is a token
+/// ([`charset_label`]).
+fn retarget_meta_charset(html: &str, label: &str) -> String {
+    // ASCII lower-casing keeps every byte offset, so offsets found in `lower` are char boundaries in `html`
+    // (they all sit on ASCII bytes).
+    let lower = html.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let head_end = lower.find("<body").unwrap_or(lower.len());
+    let mut out = String::with_capacity(html.len().saturating_add(16));
+    let (mut copied, mut at) = (0, 0);
+    while let Some(rel) = lower.get(at..head_end).and_then(|h| h.find("<meta")) {
+        let tag = at.saturating_add(rel);
+        let tag_end =
+            lower.get(tag..).and_then(|t| t.find('>')).map_or(lower.len(), |e| tag.saturating_add(e));
+        if let Some(c) = lower.get(tag..tag_end).and_then(|t| t.find("charset=")) {
+            let mut start = tag.saturating_add(c).saturating_add("charset=".len());
+            if bytes.get(start).is_some_and(|b| matches!(b, b'"' | b'\'')) {
+                start = start.saturating_add(1);
+            }
+            let mut end = start;
+            while end < tag_end
+                && bytes.get(end).is_some_and(|b| {
+                    !matches!(b, b'"' | b'\'' | b';' | b'/' | b'>') && !b.is_ascii_whitespace()
+                })
+            {
+                end = end.saturating_add(1);
+            }
+            out.push_str(html.get(copied..start).unwrap_or_default());
+            out.push_str(label);
+            copied = end;
+        }
+        at = tag_end.max(tag.saturating_add(1));
+        if at >= head_end {
+            break;
+        }
+    }
+    out.push_str(html.get(copied..).unwrap_or_default());
+    out
+}
+
+/// The charset parameter written for `label`: lower-cased, only token characters.
+fn charset_label(label: &str) -> String {
+    let l: String = crate::charset::normalize_label(label)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        .take(40)
+        .collect();
+    if l.is_empty() { "utf-8".to_owned() } else { l }
 }
 
 fn clean_line(s: &str) -> String {
@@ -317,6 +387,22 @@ impl MessageBuilder {
         format!("{:x}.{:016x}.{seq}@{domain}", date.unix.max(0), h.0)
     }
 
+    /// The charset the text parts go out in: [`MessageBuilder::charset`] when it can represent both the text
+    /// and the HTML body, else UTF-8.
+    pub fn text_charset(&self) -> String {
+        match self.charset.as_deref() {
+            Some(c)
+                if [&self.text, &self.html]
+                    .into_iter()
+                    .flatten()
+                    .all(|t| crate::charset::encode(t, c).is_some()) =>
+            {
+                charset_label(c)
+            }
+            _ => "utf-8".to_owned(),
+        }
+    }
+
     /// Serialises to RFC 5322 bytes.
     pub fn build(&self) -> Vec<u8> {
         let date = self.date.unwrap_or_else(DateTime::now_utc);
@@ -393,8 +479,9 @@ impl MessageBuilder {
             .attachments
             .iter()
             .partition(|a| has_html && a.content_id.as_deref().is_some_and(|c| !c.trim().is_empty()));
+        let cs = self.charset.as_deref();
         let html_entity = |h: &str| {
-            let e = text_entity(h, "html");
+            let e = text_entity(h, "html", cs);
             if inline.is_empty() {
                 e
             } else {
@@ -411,14 +498,14 @@ impl MessageBuilder {
             }
         };
         let body = match (&self.text, &self.html) {
-            (text, None) => text_entity(text.as_deref().unwrap_or_default(), "plain"),
+            (text, None) => text_entity(text.as_deref().unwrap_or_default(), "plain", cs),
             (None, Some(h)) => html_entity(h),
             (Some(t), Some(h)) => Entity {
                 headers: Vec::new(),
                 body: Body::Multipart {
                     subtype: "alternative",
                     extra: Vec::new(),
-                    children: vec![text_entity(t, "plain"), html_entity(h)],
+                    children: vec![text_entity(t, "plain", cs), html_entity(h)],
                 },
             },
         };

@@ -3,6 +3,10 @@
 //! free/busy information: MailCraft has no server to ask). The meeting time is a band over the grid;
 //! clicking a slot moves the meeting there (keeping its length) and "Next free time" finds the next slot of
 //! that length that is free on the user's calendar.
+//!
+//! Options › Calendar › Scheduling assistant › "Show calendar details in the scheduling grid": on (default),
+//! each busy block shows its subject (and reads "subject, time, show-as" to assistive technology); off, the
+//! blocks show only the busy time, and conflicts are counted instead of named.
 
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 
@@ -86,8 +90,42 @@ pub(crate) fn next_free(app: &App, ed: &ApptEditor) -> Option<(i64, i64)> {
     None
 }
 
+/// What a busy block says: "Subject, 9:00 AM - 9:15 AM, Busy" with calendar details on (private items say
+/// "Private appointment"), else only "Busy, 9:00 AM - 9:15 AM".
+pub(crate) fn block_label(b: &BusySlot, start_min: i64, end_min: i64, details: bool) -> String {
+    let show_as = match b.show_as.as_str() {
+        "tentative" => "Tentative",
+        "outOfOffice" => "Out of office",
+        "workingElsewhere" => "Working elsewhere",
+        _ => "Busy",
+    };
+    let clock = |m: i64| {
+        let (h, mm) = (m.div_euclid(60).rem_euclid(24), m.rem_euclid(60));
+        let (h12, ap) = match h {
+            0 => (12, "AM"),
+            1..=11 => (h, "AM"),
+            12 => (12, "PM"),
+            _ => (h - 12, "PM"),
+        };
+        format!("{h12}:{mm:02} {ap}")
+    };
+    let when = format!("{} - {}", clock(start_min), clock(end_min));
+    if !details {
+        return format!("{show_as}, {when}");
+    }
+    let subject = if b.private {
+        "Private appointment"
+    } else if b.subject.trim().is_empty() {
+        "(No subject)"
+    } else {
+        b.subject.trim()
+    };
+    format!("{subject}, {when}, {show_as}")
+}
+
 /// The Scheduling Assistant tab.
 pub(crate) fn show(ui: &mut Ui, app: &App, ed: &mut ApptEditor) {
+    let details = app.s.settings.bool("calendar.gridDetails");
     let Some(start_day) = parse_day(&ed.start_date) else {
         ui.colored_label(app.theme.danger, "Enter the start date as YYYY-MM-DD.");
         return;
@@ -164,6 +202,21 @@ pub(crate) fn show(ui: &mut Ui, app: &App, ed: &mut ApptEditor) {
                         _ => theme.accent,
                     };
                     p.rect_filled(r, CornerRadius::same(2), fill);
+                    let label = block_label(b, s, e, details);
+                    let block = ui.interact(r, ui.id().with(("mc-sched-busy", b.id, s)), Sense::hover());
+                    a11y(&block, egui::WidgetType::Other, &label);
+                    if details {
+                        let text = if b.private { "Private appointment" } else { b.subject.trim() };
+                        let clip = p.with_clip_rect(r.shrink(1.0));
+                        clip.text(
+                            pos2(r.min.x + 3.0, r.center().y),
+                            Align2::LEFT_CENTER,
+                            text,
+                            FontId::proportional(10.5),
+                            Color32::WHITE,
+                        );
+                        block.on_hover_text(label);
+                    }
                 }
             } else {
                 // No free/busy information for other people: hatched.
@@ -211,8 +264,12 @@ pub(crate) fn show(ui: &mut Ui, app: &App, ed: &mut ApptEditor) {
             .collect();
         if clash.is_empty() {
             ui.label(egui::RichText::new("You're free at this time.").color(app.theme.text_muted));
-        } else {
+        } else if details {
             ui.colored_label(app.theme.danger, format!("Conflicts with: {}", clash.join("; ")));
+        } else {
+            let n = clash.len();
+            let what = if n == 1 { "1 item".to_owned() } else { format!("{n} items") };
+            ui.colored_label(app.theme.danger, format!("Conflicts with {what} on your calendar."));
         }
     }
     ui.label(
@@ -235,6 +292,47 @@ mod tests {
             end_min: end,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn grid_details_follow_the_option() {
+        let b = BusySlot {
+            id: 1,
+            start: 0,
+            end: 0,
+            show_as: "busy".into(),
+            subject: "Team stand-up".into(),
+            private: false,
+        };
+        assert_eq!(block_label(&b, 9 * 60, 9 * 60 + 15, true), "Team stand-up, 9:00 AM - 9:15 AM, Busy");
+        assert_eq!(block_label(&b, 9 * 60, 9 * 60 + 15, false), "Busy, 9:00 AM - 9:15 AM");
+        let private = BusySlot { private: true, show_as: "tentative".into(), ..b };
+        assert_eq!(
+            block_label(&private, 12 * 60, 13 * 60, true),
+            "Private appointment, 12:00 PM - 1:00 PM, Tentative"
+        );
+
+        // In the grid: the stand-up on Friday 9 Oct is named only with details on.
+        let grid = |details: bool| {
+            let mut app = App::new(sample_session());
+            app.run("options.set", serde_json::json!({"key": "calendar.gridDetails", "value": details}));
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 400.0)).build_ui_state(
+                |ui, app: &mut App| {
+                    let mut ed = editor("2026-10-09", 8 * 60 + 30, 9 * 60 + 30);
+                    show(ui, app, &mut ed);
+                },
+                app,
+            );
+            h.run();
+            use egui_kittest::kittest::Queryable;
+            (
+                h.query_by_label("Team stand-up, 9:00 AM - 9:15 AM, Busy").is_some(),
+                h.query_by_label("Busy, 9:00 AM - 9:15 AM").is_some(),
+                h.query_all_by_label_contains("Conflicts with 1 item").next().is_some(),
+            )
+        };
+        assert_eq!(grid(true), (true, false, false));
+        assert_eq!(grid(false), (false, true, true));
     }
 
     #[test]

@@ -395,6 +395,9 @@ pub fn title_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
     ui.painter().rect_filled(bar, CornerRadius::ZERO, app.theme.chrome);
     let theme = app.theme.clone();
     chrome_visuals(ui, &theme);
+    // General › Personalize › Background: a faint pattern across the title bar.
+    let ink = theme.chrome_text.gamma_multiply(0.12);
+    ui.painter().extend(title_background(&app.s.settings.text("general.background"), bar, ink));
 
     // App icon.
     let icon_rect = Rect::from_center_size(pos2(bar.left() + 22.0, bar.center().y), vec2(20.0, 20.0));
@@ -431,6 +434,48 @@ pub fn title_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
     }
 
     search_box(ui, app, frame, bar, qat_end, right_edge);
+}
+
+/// General › Personalize › "Background": the title bar pattern (our own designs: "circles" = rings and
+/// diagonal stripes, "geometry" = a band of triangles), drawn from the bar's right third leftwards in `ink`.
+/// Nothing for "none".
+pub(crate) fn title_background(kind: &str, bar: Rect, ink: Color32) -> Vec<egui::Shape> {
+    let mut out = Vec::new();
+    let h = bar.height();
+    if h <= 1.0 || bar.width() <= 1.0 {
+        return out;
+    }
+    let stroke = Stroke::new(1.2, ink);
+    match kind {
+        "circles" => {
+            let center = pos2(bar.right() - h * 2.2, bar.center().y);
+            for k in 1..=5 {
+                out.push(egui::Shape::circle_stroke(center, h * 0.32 * k as f32, stroke));
+            }
+            let mut x = bar.right() - h * 6.0;
+            while x < bar.right() {
+                out.push(egui::Shape::line_segment([pos2(x, bar.bottom()), pos2(x + h, bar.top())], stroke));
+                x += h * 0.45;
+            }
+        }
+        "geometry" => {
+            let side = h * 0.9;
+            let mut x = bar.right() - side * 10.0;
+            let mut up = true;
+            while x + side < bar.right() + side {
+                let (a, b, c) = if up {
+                    (pos2(x, bar.bottom()), pos2(x + side, bar.bottom()), pos2(x + side / 2.0, bar.top()))
+                } else {
+                    (pos2(x, bar.top()), pos2(x + side, bar.top()), pos2(x + side / 2.0, bar.bottom()))
+                };
+                out.push(egui::Shape::closed_line(vec![a, b, c], stroke));
+                x += side / 2.0;
+                up = !up;
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Options › Quick Access Toolbar › Toolbar Position: Below Ribbon (and the toolbar shown).
@@ -942,6 +987,8 @@ pub fn module_rail(ui: &mut Ui, app: &mut App) {
     for (module, cmd, icon, name) in entries {
         let on = current == module;
         let r = widgets::icon_toggle(ui, app, icon, name, on, size::RAIL_ITEM);
+        // The People peek: hovering People shows the people mailed most.
+        let r = if module == Module::People { r.on_hover_ui(|ui| people_peek(ui, app)) } else { r };
         if on {
             let bar = Rect::from_min_size(
                 pos2(r.rect.left(), r.rect.top() + 12.0),
@@ -969,6 +1016,28 @@ pub fn module_rail(ui: &mut Ui, app: &mut App) {
             ui.close();
         }
     });
+}
+
+/// Title of the People peek.
+pub const PEOPLE_PEEK: &str = "People you mail most";
+
+/// The People peek's contents ([`mailcraft_engine::cmd::people::peek_people`]): a name per person, plus
+/// their job title and company or address unless People › "Show only names in the People peek" is on.
+pub(crate) fn people_peek(ui: &mut Ui, app: &mut App) {
+    let people = mailcraft_engine::cmd::people::peek_people(&app.s);
+    ui.set_min_width(200.0);
+    ui.label(egui::RichText::new(PEOPLE_PEEK).strong());
+    if people.is_empty() {
+        ui.label(egui::RichText::new("People you send mail to show up here.").color(app.theme.text_muted));
+        return;
+    }
+    for p in people {
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(&p.name).color(app.theme.text));
+        if let Some(d) = &p.detail {
+            ui.label(egui::RichText::new(d).size(11.5).color(app.theme.text_muted));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1050,6 +1119,17 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
         }
         if items.shown("filter") && crate::menus::filter_applied(app) {
             ui.label("Filter applied");
+        }
+    }
+    // Mail › Message arrival › "Show an envelope icon in the taskbar": the in-app envelope (the window icon
+    // carries it too, `App::sync_envelope`); clicking it opens the folder of the newest new message.
+    let new = mailcraft_engine::new_mail::envelope(&app.s);
+    if new > 0 {
+        let label = if new == 1 { "1 new message".to_owned() } else { format!("{new} new messages") };
+        if widgets::icon_button(ui, app, "new-mail", &label, true).clicked()
+            && let Some(f) = mailcraft_engine::new_mail::envelope_folder(&app.s)
+        {
+            app.run("nav.selectFolder", json!({ "folder": f.0 }));
         }
     }
     // The Reminders window's last scan (also counts flagged mail); before its first scan, a direct count.

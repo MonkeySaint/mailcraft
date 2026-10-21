@@ -30,8 +30,8 @@ use crate::settings::OriginalText;
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_model::subject::{forward_subject, reply_subject};
 use mailcraft_model::{
-    Address, Block, BodyFormat, FolderKind, FolderRole, Importance, Inline, ItemId, ListTime, MailItem,
-    ParaStyle, TextStyle,
+    Address, Block, BodyFormat, FolderKind, FolderRole, Importance, Inline, ItemId, MailItem, ParaStyle,
+    TextStyle,
 };
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -191,26 +191,28 @@ fn source_inline_images(m: &MailItem) -> Vec<InlineImage> {
         .collect()
 }
 
-fn importance_label(i: Importance) -> Option<&'static str> {
+fn importance_label(i: Importance, l: &crate::intl::HeaderLabels) -> Option<&'static str> {
     match i {
-        Importance::High => Some("High"),
-        Importance::Low => Some("Low"),
+        Importance::High => Some(l.high),
+        Importance::Low => Some(l.low),
         Importance::Normal => None,
     }
 }
 
 /// Header lines of the quoted block as (label, value): From, Sent, To, Cc (when present), Subject and
-/// Importance (when not normal).
+/// Importance (when not normal). The words are English unless Options › Advanced › "Use English for message
+/// headers on replies and forwards" is off ([`crate::intl::header_labels`]).
 fn header_lines(s: &Session, m: &MailItem) -> Vec<(&'static str, String)> {
+    let l = crate::intl::header_labels(&s.settings);
     let from = m.from.as_ref().or(m.sender.as_ref()).map(Address::to_display_string).unwrap_or_default();
-    let sent = ListTime::long(m.sent.unwrap_or(m.received), s.tz_offset_min);
-    let mut lines = vec![("From:", from), ("Sent:", sent), ("To:", join_addresses(&m.to))];
+    let sent = crate::intl::sent_date(m.sent.unwrap_or(m.received), s.tz_offset_min, l);
+    let mut lines = vec![(l.from, from), (l.sent, sent), (l.to, join_addresses(&m.to))];
     if !m.cc.is_empty() {
-        lines.push(("Cc:", join_addresses(&m.cc)));
+        lines.push((l.cc, join_addresses(&m.cc)));
     }
-    lines.push(("Subject:", m.subject.clone()));
-    if let Some(imp) = importance_label(m.importance) {
-        lines.push(("Importance:", imp.to_string()));
+    lines.push((l.subject, m.subject.clone()));
+    if let Some(imp) = importance_label(m.importance, l) {
+        lines.push((l.importance, imp.to_string()));
     }
     lines
 }
@@ -235,7 +237,7 @@ pub fn quoted_body_as(s: &Session, m: &MailItem, mode: OriginalText, prefix: &st
     }
     let lines = header_lines(s, m);
     if m.body.format == BodyFormat::PlainText {
-        blocks.push(Block::text_paragraph("-----Original Message-----"));
+        blocks.push(Block::text_paragraph(crate::intl::header_labels(&s.settings).original));
         for (label, value) in lines {
             blocks.push(Block::text_paragraph(&format!("{label} {value}")));
         }
@@ -583,6 +585,27 @@ Importance: High\n\
 \n\
 The badge reader is down. Please use the side door today.";
         assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn header_block_language_follows_the_english_headers_option() {
+        let mut f = fx();
+        f.s.settings.set("language.authoring", &json!("fr-FR")).unwrap();
+        let text = |s: &mut Session| {
+            let r = reply(s, &Value::Null).unwrap();
+            s.composes[&r["compose"].as_u64().unwrap()].body.to_plain_text()
+        };
+        // On (default): English whatever the authoring language.
+        assert!(text(&mut f.s).contains("\nFrom: Alice Rivera"));
+        f.s.settings.set("advanced.englishHeaders", &json!(false)).unwrap();
+        let fr = text(&mut f.s);
+        assert!(fr.contains("-----Message original-----\nDe : Alice Rivera <alice@example.com>\n"), "{fr}");
+        assert!(fr.contains("Envoyé : jeudi 8 octobre 2026 04:30\n"), "{fr}");
+        assert!(fr.contains("Objet : URGENT: server room access\nImportance : Haute"), "{fr}");
+        // The quoted original is still recognised (proofing skips it; new-text checks stop at it).
+        let id = f.s.run("mail.reply", &json!({})).unwrap()["compose"].as_u64().unwrap();
+        assert_eq!(f.s.composes[&id].quoted_start(), Some(2));
+        assert_eq!(crate::settings::new_text_of_reply("Merci\nDe : Ann\nattached"), "Merci\n");
     }
 
     #[test]

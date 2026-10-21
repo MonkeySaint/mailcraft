@@ -28,6 +28,30 @@ pub fn decode(bytes: &[u8], charset: &str) -> String {
     }
 }
 
+/// Encodes `text` in the charset `label` for an outgoing part: `us-ascii`, `iso-8859-1` (exactly Latin-1:
+/// U+0000–U+00FF), `utf-8` or any other label `encoding_rs` can encode (`windows-1252`, `iso-8859-15`,
+/// `koi8-r`…). `None` when the label is unknown, cannot be encoded to (UTF-16, UTF-7) or a character of
+/// `text` has no code in it, so the caller can fall back to UTF-8.
+pub fn encode(text: &str, label: &str) -> Option<Vec<u8>> {
+    let label = normalize_label(label);
+    if is_ascii_label(&label) {
+        return text.is_ascii().then(|| text.as_bytes().to_vec());
+    }
+    if matches!(label.as_str(), "iso-8859-1" | "iso_8859-1" | "latin1" | "l1" | "iso8859-1" | "cp819") {
+        return text.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect();
+    }
+    let enc = lookup(&label)?;
+    if enc == encoding_rs::UTF_8 {
+        return Some(text.as_bytes().to_vec());
+    }
+    if enc.output_encoding() != enc {
+        // UTF-16 and the replacement encoding have no encoder of their own.
+        return None;
+    }
+    let (bytes, _, unmappable) = enc.encode(text);
+    (!unmappable).then(|| bytes.into_owned())
+}
+
 /// Decodes bytes of unknown charset: UTF-8 when valid, windows-1252 otherwise (the usual meaning of raw 8-bit
 /// header bytes and unlabelled bodies).
 pub fn decode_unlabelled(bytes: &[u8]) -> String {

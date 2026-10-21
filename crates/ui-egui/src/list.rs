@@ -301,6 +301,8 @@ struct Cached {
     focused_tabs: bool,
     /// "Other: New messages (N)" banner: count and sender names.
     other_new: Option<(usize, String)>,
+    /// Search › "Notify me when results might be limited…": the notice above incomplete search results.
+    search_notice: Option<String>,
     searching: bool,
     /// Effective reading pane position for the folder.
     pane: ReadingPanePos,
@@ -420,6 +422,7 @@ fn build(s: &Session, key: u64) -> Cached {
         role,
         focused_tabs,
         other_new,
+        search_notice: queries::search_notice(s),
         searching,
         pane,
         columns: mailview::columns(s, folder),
@@ -716,7 +719,7 @@ const COLUMN_HEADER: f32 = 26.0;
 /// headers in the column layout. Nothing else sits above the rows (no folder title).
 fn header_height(c: &Cached, mode: Mode) -> f32 {
     let mut h = HEADER_ROW;
-    if c.other_new.is_some() {
+    if c.other_new.is_some() || c.search_notice.is_some() {
         h += BANNER_ROW;
     }
     if let Mode::Columns { .. } = mode {
@@ -827,6 +830,14 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
         if resp.clicked() {
             run(ui, app, "view.focusedTab", json!({ "tab": "other" }));
         }
+    }
+
+    if let Some(notice) = &c.search_notice {
+        let t = Text::new(ui, notice, 12.0, false, th.text_muted, row_b.width() - 24.0, 2);
+        t.paint_left(&painter, row_b, row_b.left() + 12.0);
+        let resp = ui.interact(row_b, Id::new("mailcraft.list.searchnotice"), Sense::hover());
+        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, notice));
+        resp.on_hover_text(notice);
     }
 
     // Row C: column headers in the column layout.

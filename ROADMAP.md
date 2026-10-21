@@ -62,7 +62,7 @@ Two numbers, kept separate on purpose:
 | Area | Honest | Evidence |
 |---|---|---|
 | Message list and folders | ~80 % | grouping, Focused/Other, arrange/sort/filter, folder CRUD, favourites, Bottom-pane columns, hover actions; saved views, Add Columns, conditional formatting, Quick Actions settings, AutoArchive missing |
-| Reading pane | ~85 % | header, info bars, inline reply, mark-as-read timing, Space-bar reading; no find in a received message |
+| Reading pane | ~90 % | header, info bars, inline reply, mark-as-read timing, Space-bar reading, find in a received message (Find…, F4), preview and portrait reading options, read-window Next / Previous links |
 | Compose | ~80 % | editing, styles, themes, list formats, rich paste, voting, receipts, Save Sent Item To; Clipboard/Styles/Selection panes, ¶ marks, S/MIME, bitmap paste missing |
 | Ribbon, menus, shortcuts | ~88 % | data-driven ribbons with width rules and keytips; a few Calendar buttons route through Mail commands |
 | Rules and quick steps | ~80 % | 31 conditions, 25 actions, wizard and manage dialogs, Quick Steps |

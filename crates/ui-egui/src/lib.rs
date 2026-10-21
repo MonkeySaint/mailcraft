@@ -185,6 +185,8 @@ pub(crate) struct ShellState {
     pub layout: ShellLayout,
     /// Content pane rectangles of the frame before (hit tests made before this frame's panes exist).
     pub prev_pane_rects: Vec<egui::Rect>,
+    /// Whether the window icon last pushed carries the new-mail envelope (None = never pushed).
+    pub applied_envelope: Option<bool>,
 }
 
 /// What the shell laid out in the last frame (for tests, the control channel and other areas).
@@ -234,6 +236,47 @@ pub fn app_icon_rgba(size: u32) -> Option<(Vec<u8>, u32, u32)> {
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     let mut rgba = Vec::with_capacity(pixmap.pixels().len() * 4);
     for p in pixmap.pixels() {
+        let c = p.demultiply();
+        rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    Some((rgba, size, size))
+}
+
+/// [`app_icon_rgba`] with the new-mail badge in the lower right corner: a filled circle (our own red) holding
+/// a white envelope outline. Straight RGBA.
+pub fn app_icon_with_envelope_rgba(size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    use resvg::tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
+    let size = size.clamp(16, 1024);
+    let (base, _, _) = app_icon_rgba(size)?;
+    let mut pm = Pixmap::new(size, size)?;
+    for (px, &[r, g, b, a]) in pm.pixels_mut().iter_mut().zip(base.as_chunks::<4>().0) {
+        *px = resvg::tiny_skia::ColorU8::from_rgba(r, g, b, a).premultiply();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let s = size as f32;
+    let (cx, cy, r) = (s * 0.74, s * 0.74, s * 0.25);
+    let mut paint = Paint { anti_alias: true, ..Paint::default() };
+    paint.set_color(Color::from_rgba8(0xc4, 0x2b, 0x1c, 0xff));
+    let circle = PathBuilder::from_circle(cx, cy, r)?;
+    pm.fill_path(&circle, &paint, FillRule::Winding, Transform::identity(), None);
+    // Envelope: a rectangle with the flap's V.
+    let (w, h) = (r * 1.15, r * 0.8);
+    let (x0, y0) = (cx - w / 2.0, cy - h / 2.0);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x0, y0);
+    pb.line_to(x0 + w, y0);
+    pb.line_to(x0 + w, y0 + h);
+    pb.line_to(x0, y0 + h);
+    pb.close();
+    pb.move_to(x0, y0);
+    pb.line_to(cx, cy + h * 0.1);
+    pb.line_to(x0 + w, y0);
+    let env = pb.finish()?;
+    paint.set_color(Color::WHITE);
+    let stroke = Stroke { width: (s * 0.035).max(1.0), ..Stroke::default() };
+    pm.stroke_path(&env, &paint, &stroke, Transform::identity(), None);
+    let mut rgba = Vec::with_capacity(pm.pixels().len() * 4);
+    for p in pm.pixels() {
         let c = p.demultiply();
         rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
     }
@@ -333,10 +376,22 @@ impl App {
         matches!(self.s.view.module, Module::Mail | Module::Folders | Module::Shortcuts)
     }
 
-    /// The responsive frame for a main window of `width`×`height`.
+    /// The responsive frame for a main window of `width`×`height`. Reading Pane options › "Turn on automatic
+    /// full-screen reading in portrait orientation": a window taller than it is wide shows the list, and a
+    /// message opened from it full-screen (single-pane reading with a back button), wherever the reading pane
+    /// sits (not when it is off).
     pub fn frame_for(&self, width: f32, height: f32) -> responsive::Frame {
-        let right = self.mail_like_module() && self.reading_pane_pos() == ReadingPanePos::Right;
-        responsive::Frame::compute_for(width, height, right)
+        let pos = self.reading_pane_pos();
+        let right = self.mail_like_module() && pos == ReadingPanePos::Right;
+        let mut f = responsive::Frame::compute_for(width, height, right);
+        if self.mail_like_module()
+            && pos != ReadingPanePos::Off
+            && f.height > f.width
+            && self.s.settings.bool("mail.readingPane.portraitFullScreen")
+        {
+            f.single_pane = true;
+        }
+        f
     }
 
     /// One frame of the whole UI (main window + secondary viewports + dialogs).
@@ -362,6 +417,7 @@ impl App {
         keys::handle(&ctx, self, Surface::Main);
         self.drain_notices(&ctx);
         self.sync_window(&ctx);
+        self.sync_envelope(&ctx);
         self.apply_todo_bar(&ctx);
 
         // The whole viewport, whatever margins the host ui carries (test harnesses wrap it in a panel frame).
@@ -448,6 +504,29 @@ impl App {
             st.applied_maximized = Some(max);
             st.applied_minimized = min;
         });
+    }
+
+    /// Options › Mail › Message arrival › "Show an envelope icon in the taskbar": while new mail waits
+    /// ([`mailcraft_engine::new_mail::envelope`]) the window icon carries an envelope badge (the taskbar, dock
+    /// or window list shows it where the platform uses the window icon; the browser build has none) and the
+    /// status bar shows an envelope ([`chrome::status_bar`]).
+    fn sync_envelope(&mut self, ctx: &egui::Context) {
+        let on = mailcraft_engine::new_mail::envelope(&self.s) > 0;
+        let applied = with_shell(ctx, |st| st.applied_envelope);
+        if applied == Some(on) || (applied.is_none() && !on) {
+            // The app opens with the plain icon already set.
+            with_shell(ctx, |st| st.applied_envelope = Some(on));
+            return;
+        }
+        let icon = if on { app_icon_with_envelope_rgba(256) } else { app_icon_rgba(256) };
+        if let Some((rgba, width, height)) = icon {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(egui::IconData {
+                rgba,
+                width,
+                height,
+            }))));
+        }
+        with_shell(ctx, |st| st.applied_envelope = Some(on));
     }
 
     /// Single-pane mode: a newly focused message replaces the list with the reading pane.

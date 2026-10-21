@@ -11,6 +11,7 @@ thiserror.workspace = true
 serde.workspace = true
 base64.workspace = true
 encoding_rs.workspace = true
+idna.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

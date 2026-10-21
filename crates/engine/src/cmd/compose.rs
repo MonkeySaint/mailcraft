@@ -826,6 +826,9 @@ pub(crate) fn build_message(
     }
     if for_draft {
         b.extra_headers.push(("X-Unsent".into(), "1".into()));
+    } else {
+        // Options › Advanced › International options: charsets, vCard encoding, ASCII domains.
+        crate::intl::apply_outgoing(s, &mut b);
     }
     b.keep_bcc = for_draft;
     b
@@ -1030,6 +1033,10 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Err(b) = parse_recipients(&c.reply_to) {
         return fail(s, format!("The reply address is not valid: {}", b.join("; ")));
+    }
+    // Options › Advanced › "Allow international domain names in email addresses".
+    if let Some(msg) = crate::intl::idn_problem(s, &[&c.to, &c.cc, &c.bcc, &c.reply_to]) {
+        return fail(s, msg);
     }
     let Some(account) = sending_account(s, &c, true) else {
         return fail(s, NO_ACCOUNT.into());

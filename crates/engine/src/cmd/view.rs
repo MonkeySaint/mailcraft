@@ -1054,6 +1054,18 @@ pub fn conversation_state(s: &Session, folder: FolderId) -> ConversationState {
     st
 }
 
+/// Mail › "Don't automatically expand conversations when using the keyboard to change messages": the
+/// keyboard moved the focus onto the header message `item` of the collapsed conversation `key`, which stays
+/// collapsed while that message keeps the focus (as a collapse by hand would).
+pub(crate) fn keep_collapsed(s: &mut Session, folder: FolderId, key: u64, item: ItemId) {
+    let mut st = conversation_state(s, folder);
+    if st.expanded.contains(&key) {
+        return;
+    }
+    st.collapsed = Some((key, item));
+    store_conversation_state(s, folder, &st);
+}
+
 fn store_conversation_state(s: &mut Session, folder: FolderId, st: &ConversationState) {
     let defaults = ConversationSettings::default();
     let list = s.view.collapsed_groups.entry(folder).or_default();

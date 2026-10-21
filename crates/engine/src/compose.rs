@@ -2228,10 +2228,10 @@ impl ComposeState {
                 // The HTML header: a rule, then "From: …" (a rule the user drew above it is their text).
                 Block::Rule => blocks.get(i.saturating_add(1)).is_some_and(|n| {
                     matches!(n, Block::Paragraph { .. })
-                        && blocks_text(std::slice::from_ref(n)).trim_start().starts_with("From:")
+                        && crate::intl::is_header_start(&blocks_text(std::slice::from_ref(n)))
                 }),
                 Block::Paragraph { .. } => {
-                    blocks_text(std::slice::from_ref(b)).trim() == "-----Original Message-----"
+                    crate::intl::is_original_separator(&blocks_text(std::slice::from_ref(b)))
                 }
                 _ => false,
             };

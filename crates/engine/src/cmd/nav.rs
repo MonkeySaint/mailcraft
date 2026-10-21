@@ -180,9 +180,12 @@ pub(crate) fn module_for_kind(kind: FolderKind) -> Module {
 }
 
 /// Marks the focused message read when the selection leaves it for `next` (Reading Pane options › "Mark
-/// item as read when selection changes").
+/// item as read when selection changes"). Not while "Always preview messages" is off: the reading pane did not
+/// show the message, so the user has not read it.
 fn leave_focus(s: &mut Session, next: Option<ItemId>) {
-    if !s.settings.bool("mail.readingPane.markReadOnSelectionChange") {
+    if !s.settings.bool("mail.readingPane.markReadOnSelectionChange")
+        || !s.settings.bool("mail.readingPane.alwaysPreview")
+    {
         return;
     }
     if let Some(cur) = s.selection.focus
@@ -205,6 +208,7 @@ fn show_folder(s: &mut Session, folder: FolderId) {
         s.view.search.clear();
     }
     s.selection = Selection { folder, items: Vec::new(), focus: None };
+    crate::new_mail::seen_folder(s, folder);
 }
 
 fn switch_module(s: &mut Session, module: Module) -> FolderId {
@@ -488,7 +492,19 @@ fn step(s: &mut Session, p: &Value, dir: Step) -> CmdResult {
         return Ok(selection_result(s));
     };
     let extend = opt_bool(p, "extend").unwrap_or(false);
+    // Options › Mail › "Don't automatically expand conversations when using the keyboard to change
+    // messages": stepping onto a collapsed conversation keeps it collapsed (its header message gets the
+    // focus; the next step goes on to the next conversation).
+    let keep_shut = s
+        .settings
+        .bool("mail.other.noAutoExpandConversations")
+        .then(|| queries::conversation_of(s, target))
+        .flatten()
+        .filter(|c| c.is_thread() && c.header == target && !c.expanded);
     leave_focus(s, Some(target));
+    if let Some(c) = keep_shut {
+        crate::cmd::view::keep_collapsed(s, s.selection.folder, c.key, target);
+    }
     if extend {
         if !s.selection.items.contains(&target) {
             s.selection.items.push(target);
@@ -565,6 +581,60 @@ mod tests {
             .unwrap();
         s.run("nav.prevItem", &json!({})).unwrap();
         assert!(s.mailbox.mail[&b].read);
+    }
+
+    #[test]
+    fn selection_change_marks_nothing_read_while_previews_are_off() {
+        let mut s = sample_session();
+        let order = crate::queries::visible_item_ids(&s);
+        let (a, b) = (order[0], order[1]);
+        s.mailbox.set_read(&[a, b], false);
+        s.run("options.set", &json!({"key": "mail.readingPane.markReadOnSelectionChange", "value": true}))
+            .unwrap();
+        s.run("options.set", &json!({"key": "mail.readingPane.alwaysPreview", "value": false})).unwrap();
+        // Arrowing through the list: the reading pane shows neither message, so neither is read.
+        s.run("nav.selectItem", &json!({"id": a.0})).unwrap();
+        s.run("nav.nextItem", &json!({})).unwrap();
+        s.run("nav.prevItem", &json!({})).unwrap();
+        assert!(!s.mailbox.mail[&a].read && !s.mailbox.mail[&b].read);
+        // Previews back on: leaving the previewed message marks it read again.
+        s.run("options.set", &json!({"key": "mail.readingPane.alwaysPreview", "value": true})).unwrap();
+        s.run("nav.nextItem", &json!({})).unwrap();
+        assert!(s.mailbox.mail[&a].read && !s.mailbox.mail[&b].read);
+    }
+
+    #[test]
+    fn keyboard_steps_expand_conversations_unless_the_option_says_not_to() {
+        let steps = |no_expand: bool| {
+            let mut s = sample_session();
+            s.run("options.set", &json!({"key": "mail.other.noAutoExpandConversations", "value": no_expand}))
+                .unwrap();
+            s.run("view.conversations", &json!({"on": true})).unwrap();
+            let convs = crate::queries::list_conversations(&s);
+            let pos = (0..convs.len().saturating_sub(1))
+                .find(|i| convs[*i].is_thread())
+                .expect("the sample has a thread that is not last");
+            let thread = convs[pos].clone();
+            let before = pos.checked_sub(1).map(|i| convs[i].header);
+            match before {
+                Some(b) => {
+                    s.run("nav.selectItem", &json!({"id": b.0})).unwrap();
+                    s.run("nav.nextItem", &json!({})).unwrap();
+                }
+                None => {
+                    s.run("nav.firstItem", &json!({})).unwrap();
+                }
+            }
+            assert_eq!(s.selection.focus, Some(thread.header));
+            let expanded = crate::queries::conversation_of(&s, thread.header).unwrap().expanded;
+            s.run("nav.nextItem", &json!({})).unwrap();
+            let next_in_thread = thread.contains(s.selection.focus.unwrap());
+            (expanded, next_in_thread)
+        };
+        // Default: the conversation opens and Down goes into it.
+        assert_eq!(steps(false), (true, true));
+        // Option on: it stays shut and Down goes on to the next conversation.
+        assert_eq!(steps(true), (false, false));
     }
 
     #[test]

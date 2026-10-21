@@ -16,6 +16,7 @@
 
 mod calendar_view;
 mod common;
+pub(crate) use common::paint_contact_picture;
 mod editors;
 mod meeting_bar;
 mod notes_view;

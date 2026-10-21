@@ -67,6 +67,159 @@ pub fn display_name(c: &Contact) -> String {
     c.emails.first().cloned().unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// People peek
+
+/// Most people the People peek lists.
+pub const PEEK_PEOPLE: usize = 8;
+
+/// One person in the People peek.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PeekPerson {
+    pub name: String,
+    pub address: String,
+    /// Their contact, when one has the address.
+    pub contact: Option<ItemId>,
+    /// Second line (job title and company, else the address); `None` with People › "Show only names in the
+    /// People peek" on.
+    pub detail: Option<String>,
+}
+
+/// The People peek (hovering People on the module rail): the people mailed most often (the Auto-Complete
+/// list, most used first, then most recent), with their contact's job title and company or their address
+/// unless "Show only names in the People peek" is on.
+pub fn peek_people(s: &Session) -> Vec<PeekPerson> {
+    let names_only = s.settings.bool("people.namesOnlyInPeek");
+    let mut recent: Vec<&mailcraft_model::RecentRecipient> =
+        s.mailbox.recent_recipients.iter().filter(|r| !r.address.trim().is_empty()).collect();
+    recent.sort_by(|a, b| {
+        b.uses.cmp(&a.uses).then(b.last_used.map(|t| t.unix).cmp(&a.last_used.map(|t| t.unix)))
+    });
+    recent
+        .into_iter()
+        .take(PEEK_PEOPLE)
+        .map(|r| {
+            let addr = r.address.trim();
+            let contact = s
+                .mailbox
+                .contacts
+                .values()
+                .find(|c| !is_group(c) && c.emails.iter().any(|e| e.trim().eq_ignore_ascii_case(addr)));
+            let name = contact
+                .map(display_name)
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| Some(r.name.trim().to_owned()).filter(|n| !n.is_empty()))
+                .unwrap_or_else(|| addr.to_owned());
+            let work = contact
+                .map(|c| {
+                    [c.job_title.trim(), c.company.trim()]
+                        .into_iter()
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|w| !w.is_empty());
+            PeekPerson {
+                name,
+                address: addr.to_owned(),
+                contact: contact.map(|c| c.id),
+                detail: (!names_only).then(|| work.unwrap_or_else(|| addr.to_owned())),
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Contacts index
+
+/// Letters of the additional contacts indexes (Options › People › Contacts index), in alphabet order.
+const INDEX_ARABIC: &[char] = &[
+    'ا', 'ب', 'ت', 'ث', 'ج', 'ح', 'خ', 'د', 'ذ', 'ر', 'ز', 'س', 'ش', 'ص', 'ض', 'ط', 'ظ', 'ع', 'غ', 'ف', 'ق',
+    'ك', 'ل', 'م', 'ن', 'ه', 'و', 'ي',
+];
+const INDEX_CYRILLIC: &[char] = &[
+    'а', 'б', 'в', 'г', 'д', 'е', 'ж', 'з', 'и', 'й', 'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т', 'у', 'ф',
+    'х', 'ц', 'ч', 'ш', 'щ', 'ъ', 'ы', 'ь', 'э', 'ю', 'я',
+];
+const INDEX_GREEK: &[char] = &[
+    'α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'τ', 'υ', 'φ',
+    'χ', 'ψ', 'ω',
+];
+const INDEX_HEBREW: &[char] = &[
+    'א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ז', 'ח', 'ט', 'י', 'כ', 'ל', 'מ', 'נ', 'ס', 'ע', 'פ', 'צ', 'ק', 'ר', 'ש',
+    'ת',
+];
+/// Thai consonants (names are indexed by their first consonant; leading vowels are skipped).
+const INDEX_THAI: &[char] = &[
+    'ก', 'ข', 'ฃ', 'ค', 'ฅ', 'ฆ', 'ง', 'จ', 'ฉ', 'ช', 'ซ', 'ฌ', 'ญ', 'ฎ', 'ฏ', 'ฐ', 'ฑ', 'ฒ', 'ณ', 'ด', 'ต',
+    'ถ', 'ท', 'ธ', 'น', 'บ', 'ป', 'ผ', 'ฝ', 'พ', 'ฟ', 'ภ', 'ม', 'ย', 'ร', 'ล', 'ว', 'ศ', 'ษ', 'ส', 'ห', 'ฬ',
+    'อ', 'ฮ',
+];
+const INDEX_VIETNAMESE: &[char] = &[
+    'a', 'ă', 'â', 'b', 'c', 'd', 'đ', 'e', 'ê', 'g', 'h', 'i', 'k', 'l', 'm', 'n', 'o', 'ô', 'ơ', 'p', 'q',
+    'r', 's', 't', 'u', 'ư', 'v', 'x', 'y',
+];
+
+/// People › Contacts index › "Show an additional index": the letters of the "Additional contact index"
+/// language (Arabic, Cyrillic, Greek, Hebrew, Thai, Vietnamese), shown next to the a–z index. `None` while
+/// the option is off.
+pub fn additional_index(s: &Session) -> Option<&'static [char]> {
+    if !s.settings.bool("people.additionalIndex") {
+        return None;
+    }
+    Some(match s.settings.text("people.additionalIndexLanguage").as_str() {
+        "cyrillic" => INDEX_CYRILLIC,
+        "greek" => INDEX_GREEK,
+        "hebrew" => INDEX_HEBREW,
+        "thai" => INDEX_THAI,
+        "vietnamese" => INDEX_VIETNAMESE,
+        _ => INDEX_ARABIC,
+    })
+}
+
+/// The letter a vowel with a tone mark or accent is indexed under (Greek accents, Arabic hamza forms,
+/// Cyrillic ё, Vietnamese tones); other letters as they are, lower-cased.
+fn index_base(c: char) -> char {
+    const FOLD: &[(&str, char)] = &[
+        ("άἀἁ", 'α'),
+        ("έ", 'ε'),
+        ("ή", 'η'),
+        ("ίϊΐ", 'ι'),
+        ("ό", 'ο'),
+        ("ύϋΰ", 'υ'),
+        ("ώ", 'ω'),
+        ("ς", 'σ'),
+        ("أإآٱ", 'ا'),
+        ("ة", 'ه'),
+        ("ىئ", 'ي'),
+        ("ؤ", 'و'),
+        ("ё", 'е'),
+        ("àáảãạ", 'a'),
+        ("ằắẳẵặ", 'ă'),
+        ("ầấẩẫậ", 'â'),
+        ("èéẻẽẹ", 'e'),
+        ("ềếểễệ", 'ê'),
+        ("ìíỉĩị", 'i'),
+        ("òóỏõọ", 'o'),
+        ("ồốổỗộ", 'ô'),
+        ("ờớởỡợ", 'ơ'),
+        ("ùúủũụ", 'u'),
+        ("ừứửữự", 'ư'),
+        ("ỳýỷỹỵ", 'y'),
+    ];
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    FOLD.iter().find(|(from, _)| from.contains(lower)).map_or(lower, |(_, to)| *to)
+}
+
+/// Position of `name`'s first letter in an index's `letters` (Thai leading vowels skipped), `None` when it
+/// starts with none of them.
+pub fn index_bucket(name: &str, letters: &[char]) -> Option<usize> {
+    const THAI_LEADING: [char; 5] = ['เ', 'แ', 'โ', 'ใ', 'ไ'];
+    let first = name.trim_start().chars().find(|c| !THAI_LEADING.contains(c))?;
+    let base = index_base(first);
+    letters.iter().position(|l| *l == base)
+}
+
 /// The orders of Options › People › Default "File As" (`people.fileAs`).
 pub const FILE_AS_ORDERS: [&str; 5] =
     ["lastFirst", "firstLast", "company", "lastFirstCompany", "companyLastFirst"];
@@ -1682,6 +1835,56 @@ mod tests {
 
     fn add(s: &mut Session, p: Value) -> u64 {
         s.run("people.new", &p).unwrap()["id"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn the_people_peek_shows_details_unless_names_only() {
+        let mut s = session();
+        assert!(peek_people(&s).is_empty());
+        add(
+            &mut s,
+            json!({"fullName": "Ann Lee", "email": "ann@example.com", "jobTitle": "Editor", "company": "Example Co"}),
+        );
+        let now = s.now();
+        let r = |n: &str, a: &str| (n.to_owned(), a.to_owned());
+        s.mailbox.record_recipients(&[r("Ann", "ann@example.com"), r("", "bob@example.org")], now);
+        s.mailbox.record_recipients(&[r("", "ann@example.com")], now);
+        let peek = peek_people(&s);
+        assert_eq!(peek.len(), 2);
+        assert_eq!(
+            (peek[0].name.as_str(), peek[0].detail.as_deref()),
+            ("Lee, Ann", Some("Editor, Example Co"))
+        );
+        assert!(peek[0].contact.is_some());
+        assert_eq!(peek[1].detail.as_deref(), Some("bob@example.org"));
+        s.run("options.set", &json!({"key": "people.namesOnlyInPeek", "value": true})).unwrap();
+        assert!(peek_people(&s).iter().all(|p| p.detail.is_none()));
+        assert_eq!(peek_people(&s)[0].name, "Lee, Ann");
+    }
+
+    #[test]
+    fn the_additional_index_follows_its_options() {
+        let mut s = session();
+        assert_eq!(additional_index(&s), None, "off by default");
+        s.run("options.set", &json!({"key": "people.additionalIndex", "value": true})).unwrap();
+        let arabic = additional_index(&s).unwrap();
+        assert_eq!(arabic.first(), Some(&'ا'));
+        assert_eq!(index_bucket("أحمد", arabic), Some(0), "hamza forms index under alef");
+        s.run("options.set", &json!({"key": "people.additionalIndexLanguage", "value": "greek"})).unwrap();
+        let greek = additional_index(&s).unwrap();
+        assert_eq!(index_bucket("Ώλος", greek), greek.iter().position(|c| *c == 'ω'));
+        assert_eq!(index_bucket("Ann", greek), None);
+        s.run("options.set", &json!({"key": "people.additionalIndexLanguage", "value": "thai"})).unwrap();
+        let thai = additional_index(&s).unwrap();
+        assert_eq!(index_bucket("เกศ", thai), Some(0), "leading vowels skipped");
+        s.run("options.set", &json!({"key": "people.additionalIndexLanguage", "value": "vietnamese"}))
+            .unwrap();
+        let vi = additional_index(&s).unwrap();
+        assert_eq!(index_bucket("Ánh", vi), Some(0));
+        assert_eq!(index_bucket("Đức", vi), vi.iter().position(|c| *c == 'đ'));
+        assert_eq!(index_bucket("", vi), None);
+        s.run("options.set", &json!({"key": "people.additionalIndex", "value": false})).unwrap();
+        assert_eq!(additional_index(&s), None);
     }
 
     #[test]

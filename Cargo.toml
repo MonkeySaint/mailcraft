@@ -38,6 +38,9 @@ proptest = "1"
 tempfile = "3"
 base64 = "0.23"
 encoding_rs = "0.8"
+# Internationalised domain names (UTS #46 / IDNA2008 processing, Punycode RFC 3492; MIT OR Apache-2.0, data
+# Unicode-3.0). Already in the tree through `url`.
+idna = "1.1"
 unicode-segmentation = "1"
 unicode-linebreak = "0.1"
 unicode-width = "0.2"

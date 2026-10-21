@@ -16,9 +16,13 @@
 //! asks for these with `messageFind` / `messageSelect` notices, which land in [`request`].
 //!
 //! Options that act here (engine settings): Reading Pane options (mark as read after N seconds, Space-bar
-//! reading through [`space_read`]), General › "Never change the message background color", Search ›
-//! highlight, Trust Center › pictures / plain text / link warning, Mail › "Close original message window when
-//! replying or forwarding" and "After moving or deleting an open item" (read windows).
+//! reading through [`space_read`], "Always preview messages": off, the pane shows the selected message only
+//! once it is opened, with a link to turn previews back on), General › "Never change the message background
+//! color", Search › highlight, Trust Center › pictures / plain text / link warning, Mail › "Close original
+//! message window when replying or forwarding", "After moving or deleting an open item" and "Show Next and
+//! Previous links in the message headers when reading messages" (read windows), People › "Show user
+//! photographs when available" (the sender's contact picture instead of the initials), Advanced › "Allow
+//! UTF-8 support for the mailto: protocol" (`mailto:` links go to `mail.newFromMailto`).
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -78,10 +82,60 @@ fn pane_contents(ui: &mut Ui, app: &mut App, focus: Option<u64>, frame: &Frame) 
         crate::compose::inline_compose(ui, app, cid);
         return;
     }
+    if !app.s.settings.bool("mail.readingPane.alwaysPreview") {
+        preview_off(ui, app);
+        return;
+    }
     let narrow = frame.width <= NARROW_W && frame.width > 0.0 || ui.available_width() < NARROW_PANE_W;
     mark_read_timer(ui.ctx(), app, id);
     message_view(ui, app, id, Surface::Main, narrow);
 }
+
+/// Shown instead of the selected message while Reading Pane options › "Always preview messages" is off.
+pub const PREVIEW_OFF: &str = "Open the message to read it (double-click it or press Enter).";
+/// The link that turns previews back on.
+pub const ALWAYS_PREVIEW_LINK: &str = "Click here to always preview messages";
+
+/// The reading pane while previews are off: nothing of the message is shown (and nothing marks it read);
+/// the link turns "Always preview messages" back on.
+fn preview_off(ui: &mut Ui, app: &mut App) {
+    let avail = ui.available_rect_before_wrap();
+    let center = Pos2::new(avail.center().x, avail.top() + (avail.height() * 0.4).max(60.0));
+    let icon = Rect::from_center_size(center, Vec2::splat(56.0));
+    app.icons.paint(ui, icon, "mail", app.theme.text_muted);
+    let label_rect =
+        Rect::from_center_size(Pos2::new(center.x, center.y + 64.0), Vec2::new(avail.width() - 24.0, 56.0));
+    let mut turn_on = false;
+    ui.scope_builder(UiBuilder::new().max_rect(label_rect).layout(Layout::top_down(Align::Center)), |ui| {
+        ui.add(egui::Label::new(RichText::new(PREVIEW_OFF).size(13.5).color(app.theme.text_muted)).wrap());
+        if ui.link(RichText::new(ALWAYS_PREVIEW_LINK).size(12.5).color(app.theme.link)).clicked() {
+            turn_on = true;
+        }
+    });
+    if turn_on {
+        app.run("options.set", json!({"key": "mail.readingPane.alwaysPreview", "value": true}));
+    }
+}
+
+/// Read window Previous / Next Item (Ctrl+< / Ctrl+>, and the header's Previous / Next links): shows the
+/// message before / after `item` in the main window's list in the same window. Returns the new item.
+pub(crate) fn read_step(app: &mut App, item: u64, next: bool) -> Option<u64> {
+    let order = queries::visible_item_ids(&app.s);
+    let pos = order.iter().position(|i| i.0 == item)?;
+    let target =
+        if next { order.get(pos.saturating_add(1)) } else { pos.checked_sub(1).and_then(|q| order.get(q)) };
+    let t = target?.0;
+    if app.ui.read_windows.contains(&t) {
+        return None;
+    }
+    let slot = app.ui.read_windows.iter_mut().find(|w| **w == item)?;
+    *slot = t;
+    Some(t)
+}
+
+/// Accessible names of the read window header's Previous / Next links.
+pub const PREVIOUS_LINK: &str = "Previous message";
+pub const NEXT_LINK: &str = "Next message";
 
 /// Reading Pane options › "Mark items as read when viewed in the Reading Pane" after the wait in seconds.
 fn mark_read_timer(ctx: &egui::Context, app: &mut App, id: u64) {
@@ -748,6 +802,31 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
         right.add_space(4.0);
         right.label(RichText::new(date).size(12.0).color(theme.text_muted));
     }
+    // Mail › Other › "Show Next and Previous links in the message headers when reading messages".
+    if in_window && app.s.settings.bool("mail.other.nextPreviousLinks") {
+        right.add_space(2.0);
+        let mut step = None;
+        right.allocate_ui_with_layout(Vec2::new(right_w, 20.0), Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let order = queries::visible_item_ids(&app.s);
+            let pos = order.iter().position(|i| i.0 == id);
+            let has_next = pos.is_some_and(|p| p.saturating_add(1) < order.len());
+            let has_prev = pos.is_some_and(|p| p > 0);
+            for (next, label, name, on) in
+                [(true, "Next", NEXT_LINK, has_next), (false, "Previous", PREVIOUS_LINK, has_prev)]
+            {
+                let r =
+                    ui.add_enabled(on, egui::Link::new(RichText::new(label).size(12.0).color(theme.link)));
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, on, name));
+                if r.clicked() {
+                    step = Some(next);
+                }
+            }
+        });
+        if let Some(next) = step {
+            read_step(app, id, next);
+        }
+    }
     let right_used = right.min_rect();
 
     let left_w = (full.width() - right_w - 8.0).max(60.0);
@@ -755,14 +834,21 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
         let d = if in_window { 48.0 } else { 40.0 };
         let (r, _) = ui.allocate_exact_size(Vec2::splat(d), Sense::hover());
         let c = r.center();
-        ui.painter().circle_filled(c, d / 2.0, persona_color(h.persona_color));
-        ui.painter().text(
-            c,
-            egui::Align2::CENTER_CENTER,
-            &h.from_initials,
-            FontId::proportional(d * 0.36),
-            Color32::WHITE,
-        );
+        // People › "Show user photographs when available": the sender's contact picture.
+        let photo = h
+            .photo
+            .and_then(|cid| app.s.mailbox.contacts.get(&cid))
+            .is_some_and(|contact| crate::modules::paint_contact_picture(ui, r, contact));
+        if !photo {
+            ui.painter().circle_filled(c, d / 2.0, persona_color(h.persona_color));
+            ui.painter().text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                &h.from_initials,
+                FontId::proportional(d * 0.36),
+                Color32::WHITE,
+            );
+        }
         ui.add_space(10.0);
         ui.vertical(|ui| {
             ui.set_max_width((left_w - d - 12.0).max(40.0));
@@ -1098,14 +1184,9 @@ fn sun_button(ui: &mut Ui, app: &mut App, on: bool, tooltip: &str) -> egui::Resp
 fn open_link(ctx: &egui::Context, app: &mut App, href: &str) {
     let h = href.trim();
     let lower = h.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("mailto:").map(|_| h.get(7..).unwrap_or("")) {
-        let addr = rest.split('?').next().unwrap_or("").to_owned();
-        if let Some(v) = app.run("mail.newEmail", json!({}))
-            && let Some(cid) = v.get("compose").and_then(serde_json::Value::as_u64)
-            && !addr.is_empty()
-        {
-            app.run("compose.setTo", json!({"compose": cid, "value": addr}));
-        }
+    if lower.starts_with("mailto:") {
+        // RFC 6068: recipients, subject and body (Options › Advanced › mailto: UTF-8 support).
+        app.run("mail.newFromMailto", json!({"url": h}));
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
         if app.s.settings.bool("trust.warnLinks") {
             // Trust Center › "Ask before opening web links in messages": confirm first.

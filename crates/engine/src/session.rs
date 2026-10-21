@@ -173,6 +173,9 @@ pub struct Session {
     run_depth: u32,
     /// Automatic actions running ([`Session::run_automatic`]): their changes record no undo step.
     automatic_depth: u32,
+    /// The exit send/receive has run: the window close that follows File › Exit runs `file.exit` again (the
+    /// final save), which must not start a second send/receive and a second wait.
+    exit_sync_done: bool,
     /// Account passwords and tokens (never in the mailbox or its journal; see `accounts.rs`).
     pub secrets: Box<dyn crate::accounts::SecretStore>,
     /// Send/receive workers, queued results and the status bar state (see `sync.rs`).
@@ -187,6 +190,9 @@ pub struct Session {
     /// Bytes last read from or written to `settings.json` (identical states are not rewritten).
     settings_saved: Option<Vec<u8>>,
 }
+
+/// Longest wait for "Perform an automatic send/receive when exiting" (seconds).
+pub const EXIT_SYNC_SECS: u64 = 30;
 
 /// Most ops kept in `pending_ops` while no store is attached; beyond that they collapse into one `Replace`.
 const MAX_PENDING_OPS: usize = 2_000;
@@ -221,6 +227,7 @@ impl Session {
             journal_calls: 0,
             run_depth: 0,
             automatic_depth: 0,
+            exit_sync_done: false,
             secrets: Box::new(crate::accounts::MemorySecretStore::default()),
             sync: crate::sync::SyncState::default(),
             search: crate::search_index::SearchState::default(),
@@ -557,6 +564,32 @@ impl Session {
         Some(Ok(json!({"sent": false, "compose": cid, "dialog": "confirm", "reason": "attachmentReminder"})))
     }
 
+    /// Options › Advanced › Send and receive › "Perform an automatic send/receive when exiting": one
+    /// send/receive of the All Accounts group (Outboxes sent, folders updated) before the exit save, waited for
+    /// at most [`EXIT_SYNC_SECS`] (then the workers are asked to stop). Nothing happens offline or without
+    /// server accounts, and it runs once per session however often `file.exit` runs.
+    fn send_receive_on_exit(&mut self) {
+        if self.exit_sync_done || !self.settings.bool("advanced.sendReceiveOnExit") || self.view.work_offline
+        {
+            return;
+        }
+        let accounts = crate::sync::group_accounts(self);
+        if accounts.is_empty() {
+            return;
+        }
+        self.exit_sync_done = true;
+        let plan = crate::sync::Plan { user: false, ..crate::sync::Plan::all() };
+        match self.send_receive(&accounts, plan) {
+            Ok(_) => {
+                if !self.wait_for_sync(std::time::Duration::from_secs(EXIT_SYNC_SECS)) {
+                    log::warn!("send/receive on exit did not finish in {EXIT_SYNC_SECS} s");
+                    self.cancel_sync();
+                }
+            }
+            Err(e) => log::warn!("send/receive on exit: {e}"),
+        }
+    }
+
     /// Options › Advanced › "Empty Deleted Items folders when exiting": empties every Deleted Items folder
     /// (items and subfolders) and journals the change before the exit save.
     fn empty_deleted_on_exit(&mut self) {
@@ -643,6 +676,7 @@ impl Session {
             return r;
         }
         if id == "file.exit" {
+            self.send_receive_on_exit();
             self.empty_deleted_on_exit();
         }
         let read_on_delete = (id == "mail.delete" && self.settings.bool("mail.other.markReadOnDelete"))

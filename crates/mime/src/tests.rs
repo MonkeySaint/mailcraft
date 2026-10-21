@@ -435,6 +435,34 @@ fn text_of(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn html_in_another_charset_declares_that_charset() {
+    let html = "<!DOCTYPE html>\n<html>\n<head>\n<META Charset=\"UTF-8\">\n\
+                <meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">\n</head>\n\
+                <body><p>Café crème</p><p>charset=utf-8 in the text stays</p></body>\n</html>\n";
+    let mut b = MessageBuilder { html: Some(html.into()), charset: Some("ISO-8859-1".into()), ..builder() };
+    let parsed = must(&b.build());
+    let body = parsed.html_body().unwrap();
+    assert!(body.contains("<META Charset=\"iso-8859-1\">"), "{body}");
+    assert!(body.contains("content=\"text/html; charset=iso-8859-1\""), "{body}");
+    assert!(body.contains("Café crème"), "{body}");
+    assert!(body.contains("charset=utf-8 in the text stays"), "{body}");
+    assert!(text_of(&b.build()).contains("text/html; charset=\"iso-8859-1\""));
+    // UTF-8 (no preferred charset, or one that cannot hold the text) keeps the markup as it is.
+    for cs in [None, Some("us-ascii")] {
+        b.charset = cs.map(str::to_owned);
+        let raw = b.build();
+        assert!(text_of(&raw).contains("text/html; charset=\"utf-8\""));
+        assert!(must(&raw).html_body().unwrap().contains("<META Charset=\"UTF-8\">"));
+    }
+    // Hostile markup: unterminated tags, empty values, non-ASCII next to the declaration.
+    for junk in ["<meta charset=", "<meta charset=\"é", "<head><meta charset=''><meta", "<meta>é<body>"] {
+        b.html = Some(junk.into());
+        b.charset = Some("iso-8859-1".into());
+        let _ = must(&b.build());
+    }
+}
+
+#[test]
 fn build_text_only() {
     let mut b = builder();
     b.text = Some("Hello\nworld".into());

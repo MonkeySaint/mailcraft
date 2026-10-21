@@ -183,6 +183,7 @@ pub fn ribbon(ui: &mut egui::Ui, app: &mut App, surface: Surface, frame: &Frame)
         mem,
         id: egui::Id::new(("mailcraft-ribbon", surface_key(surface))),
         badges: Vec::new(),
+        hidden: hidden_commands(app),
     };
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
@@ -196,6 +197,15 @@ pub fn ribbon(ui: &mut egui::Ui, app: &mut App, surface: Surface, frame: &Frame)
     // pop up later.
     cx.mem.open_request = None;
     state::store_mem(ui.ctx(), surface, cx.mem);
+}
+
+/// Commands an option takes off the ribbon: Accessibility › "Show Read Aloud" off hides Read Aloud.
+pub fn hidden_commands(app: &App) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if !app.s.settings.bool("accessibility.readAloud") {
+        out.push("review.readAloud");
+    }
+    out
 }
 
 /// Result of [`keytip`].
@@ -287,7 +297,13 @@ pub fn keytip(ctx: &egui::Context, app: &mut App, surface: Surface, seq: &str) -
         }
         let mut mem = state::load_mem(ctx, surface);
         let simplified = app.s.view.simplified_ribbon;
-        let exact = tab.groups.iter().flat_map(|g| g.ctls.iter()).find(|c| c.key == rest);
+        let hidden = hidden_commands(app);
+        let exact = tab
+            .groups
+            .iter()
+            .flat_map(|g| g.ctls.iter())
+            .filter(|c| !hidden.iter().any(|h| *h == c.cmd.id))
+            .find(|c| c.key == rest);
         if let Some(c) = exact {
             select_tab(app, surface, name);
             // Split buttons open their dropdown (plan/reference/ribbon-*.md: "Alt, H, R 1" opens Report's menu,

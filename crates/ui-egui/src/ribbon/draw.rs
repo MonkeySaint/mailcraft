@@ -41,6 +41,15 @@ pub struct Cx {
     pub id: Id,
     /// Keytip badges collected while drawing.
     pub badges: Vec<(Rect, String)>,
+    /// Commands whose controls are left out ([`super::hidden_commands`]).
+    pub hidden: Vec<&'static str>,
+}
+
+impl Cx {
+    /// True when `c` is left out of the ribbon (an option hides its command).
+    fn hides(&self, c: &Ctl) -> bool {
+        self.hidden.iter().any(|h| *h == c.cmd.id)
+    }
 }
 
 fn active(rules: &[Rule], classic: bool, width: f32) -> Vec<Act> {
@@ -809,7 +818,7 @@ pub fn simplified(ui: &mut Ui, app: &mut App, cx: &mut Cx, rect: Rect) {
     let mut order = 0usize;
     for (gi, g) in tab.groups.iter().enumerate() {
         let gacts = active(&g.rules, false, cx.width);
-        for (ci, c) in g.ctls.iter().enumerate() {
+        for (ci, c) in g.ctls.iter().filter(|c| !cx.hides(c)).enumerate() {
             order = order.saturating_add(1);
             let cacts = active(&c.rules, false, cx.width);
             if gacts.contains(&Act::Overflow) || cacts.contains(&Act::Overflow) {
@@ -1019,7 +1028,7 @@ fn layout_group(ui: &Ui, cx: &Cx, g: &'static Group, collapsed: bool) -> GroupLa
     };
     if g.rows {
         let mut rows: Vec<Vec<(&'static Ctl, Style, f32)>> = vec![Vec::new()];
-        for c in &g.ctls {
+        for c in g.ctls.iter().filter(|c| !cx.hides(c)) {
             if c.row_break && rows.last().is_some_and(|r| !r.is_empty()) {
                 rows.push(Vec::new());
             }
@@ -1032,7 +1041,7 @@ fn layout_group(ui: &Ui, cx: &Cx, g: &'static Group, collapsed: bool) -> GroupLa
         }
         cells.push(Cell::Rows(rows));
     } else {
-        for c in &g.ctls {
+        for c in g.ctls.iter().filter(|c| !cx.hides(c)) {
             let st = style(c);
             let w = ctl_width(ui, c, st, false);
             if st.large || c.kind == Kind::Gallery {
@@ -1157,10 +1166,13 @@ fn draw_group(ui: &mut Ui, app: &mut App, cx: &mut Cx, gl: &GroupLayout, rect: R
 pub fn classic(ui: &mut Ui, app: &mut App, cx: &mut Cx, rect: Rect) {
     let tab = cx.tab;
     let avail = rect.width() - 8.0 - DISPLAY_W - 4.0;
+    // Groups whose every control is hidden by an option are left out.
+    let groups: Vec<&'static Group> =
+        tab.groups.iter().filter(|g| g.ctls.is_empty() || !g.ctls.iter().all(|c| cx.hides(c))).collect();
     let mut collapsed: Vec<bool> =
-        tab.groups.iter().map(|g| active(&g.rules, true, cx.width).contains(&Act::Collapse)).collect();
+        groups.iter().map(|g| active(&g.rules, true, cx.width).contains(&Act::Collapse)).collect();
     let lay = |ui: &Ui, cx: &Cx, collapsed: &[bool]| -> Vec<GroupLayout> {
-        tab.groups.iter().zip(collapsed.iter()).map(|(g, c)| layout_group(ui, cx, g, *c)).collect()
+        groups.iter().zip(collapsed.iter()).map(|(g, c)| layout_group(ui, cx, g, *c)).collect()
     };
     let total = |ls: &[GroupLayout]| ls.iter().map(|l| l.width + 9.0).sum::<f32>();
     let mut layouts = lay(ui, cx, &collapsed);

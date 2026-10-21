@@ -405,6 +405,8 @@ pub struct SyncState {
     discoveries: BTreeMap<String, Discovering>,
     /// The slow-connection threshold in bytes per second (`None` = [`SLOW_LINK_BYTES_PER_SEC`]).
     pub slow_link_threshold: Option<u64>,
+    /// Newly arrived mail not looked at yet (the new-mail envelope, see `new_mail.rs`).
+    pub(crate) new_mail: BTreeSet<ItemId>,
     #[cfg(not(target_arch = "wasm32"))]
     rt: native::Runtime,
 }

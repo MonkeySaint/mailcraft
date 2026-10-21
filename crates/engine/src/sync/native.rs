@@ -575,18 +575,29 @@ fn outgoing_items(s: &Session, a: &Account, plan: &Plan, now: i64) -> Vec<Outgoi
         .filter(|m| !m.is_draft && m.sent.is_none_or(|t| t.unix <= now))
         .collect();
     items.sort_by_key(|m| (m.received.unix, m.id));
+    // Options › Advanced › "Allow international domain names": the envelope carries the ASCII form too, like
+    // the headers (`intl::apply_outgoing`), so a server without SMTPUTF8 accepts it.
+    let idn = s.settings.bool("advanced.idn");
+    let envelope = |addr: &str| {
+        let addr = addr.trim();
+        if idn {
+            mailcraft_mime::idn::addr_to_ascii(addr).unwrap_or_else(|_| addr.to_owned())
+        } else {
+            addr.to_owned()
+        }
+    };
     for m in items {
         let mut rcpts: Vec<String> = Vec::new();
         for addr in m.to.iter().chain(&m.cc).chain(&m.bcc) {
-            let x = addr.addr.trim().to_owned();
+            let x = envelope(&addr.addr);
             if !x.is_empty() && !rcpts.iter().any(|r| r.eq_ignore_ascii_case(&x)) {
                 rcpts.push(x);
             }
         }
         let from = if a.address.trim().is_empty() {
-            m.from.as_ref().map(|f| f.addr.clone()).unwrap_or_default()
+            m.from.as_ref().map(|f| envelope(&f.addr)).unwrap_or_default()
         } else {
-            a.address.trim().to_owned()
+            envelope(&a.address)
         };
         outgoing.push(Outgoing { item: m.id, from, rcpts, raw: item_source(s, m) });
     }
@@ -2967,6 +2978,36 @@ mod tests {
         let safe = s.run("mail.junk", &json!({"action": "get"})).unwrap();
         let safe = safe.to_string();
         assert!(safe.contains("bo@example.org") && safe.contains("cy@example.org"), "{safe}");
+    }
+
+    #[test]
+    fn envelope_addresses_follow_the_international_domain_names_option() {
+        let (mut s, _, _) = session();
+        let acct = imap_account(&mut s);
+        if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == acct) {
+            a.address = "me@bücher.example".into();
+        }
+        let outbox = s.mailbox.role_folder(acct, FolderRole::Outbox).unwrap();
+        let raw = "From: me@bücher.example\r\nTo: ann@例え.example, Ann@例え.example\r\n\
+                   Cc: bo@example.org\r\nSubject: Hello\r\n\r\nBody\r\n";
+        let mut item = mailcraft_store::import::item_from_raw(raw.as_bytes(), outbox, s.now());
+        item.raw = Some(raw.as_bytes().to_vec());
+        s.mailbox.add_mail(item);
+        let envelope = |s: &Session| {
+            let a = s.mailbox.account(acct).unwrap();
+            let out = outgoing_items(s, a, &Plan::all(), s.now().unix);
+            assert_eq!(out.len(), 1);
+            (out[0].from.clone(), out[0].rcpts.clone())
+        };
+        // On (default): ASCII domains, so a server without SMTPUTF8 takes the message.
+        let (from, rcpts) = envelope(&s);
+        assert_eq!(from, "me@xn--bcher-kva.example");
+        assert_eq!(rcpts, vec!["ann@xn--r8jz45g.example".to_owned(), "bo@example.org".to_owned()]);
+        // Off: left as written (sending refuses such addresses before they reach the Outbox).
+        s.run("options.set", &json!({"key": "advanced.idn", "value": false})).unwrap();
+        let (from, rcpts) = envelope(&s);
+        assert_eq!(from, "me@bücher.example");
+        assert_eq!(rcpts.first().map(String::as_str), Some("ann@例え.example"));
     }
 
     // -----------------------------------------------------------------------------------------------
