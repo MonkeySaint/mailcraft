@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::distance::{self, MAX_LEN};
 
@@ -31,8 +32,13 @@ pub const MAX_STEMS: usize = 3_000_000;
 pub const MAX_RULES: usize = 500_000;
 /// Most flags read for one word or rule.
 const MAX_FLAGS: usize = 512;
-/// Most `REP` pairs kept.
+/// Most `REP` pairs kept (each side at most [`MAX_LEN`] characters).
 const MAX_REP: usize = 2_000;
+/// Most flags stored for one dictionary over all its alias sets, rule continuation sets, two-level suffix
+/// index entries and word flag sets. `AF` aliases let a short rule line name hundreds of flags, so without a
+/// total a few megabytes of `.aff` could take gigabytes; past this, further aliases are empty, rules and
+/// words that would store more flags are skipped.
+pub const MAX_STORED_FLAGS: usize = 4_000_000;
 /// Longest condition (in character positions).
 const MAX_COND: usize = 64;
 /// Most affix rules and stems one check of a word visits (past it the word counts as not found).
@@ -158,8 +164,8 @@ struct Affix {
     strip: Vec<char>,
     add: Vec<char>,
     cond: Cond,
-    /// Continuation flags (sorted).
-    cont: Vec<Flag>,
+    /// Continuation flags (sorted); shared with the `AF` alias it names, when it names one.
+    cont: Arc<[Flag]>,
 }
 
 impl Affix {
@@ -175,7 +181,7 @@ pub struct Hunspell {
     pub language: String,
     /// Stem → indices into `flag_sets` (one per homonym).
     words: HashMap<Box<str>, Box<[u32]>>,
-    flag_sets: Vec<Box<[Flag]>>,
+    flag_sets: Vec<Arc<[Flag]>>,
     prefixes: Vec<Affix>,
     suffixes: Vec<Affix>,
     /// Added text → rule indices.
@@ -192,6 +198,8 @@ pub struct Hunspell {
     /// Letters tried for suggestions, most frequent first.
     try_chars: Vec<char>,
     rep: Vec<(String, String)>,
+    /// Flags stored so far (at most [`MAX_STORED_FLAGS`]).
+    stored_flags: usize,
 }
 
 /// Why a dictionary could not be read.
@@ -241,7 +249,7 @@ fn decode(bytes: &[u8], enc: &'static encoding_rs::Encoding) -> String {
 /// Parser state for flags.
 struct Flags {
     mode: FlagMode,
-    aliases: Vec<Vec<Flag>>,
+    aliases: Vec<Arc<[Flag]>>,
 }
 
 impl Flags {
@@ -268,14 +276,16 @@ impl Flags {
         out
     }
 
-    /// Flags of a word or rule: an alias number when the `.aff` has `AF` lines, else flags.
-    fn parse_or_alias(&self, s: &str) -> Vec<Flag> {
+    /// Flags of a word or rule: an alias number when the `.aff` has `AF` lines, else flags. The flag is true
+    /// when the set is an alias (shared, already counted in [`MAX_STORED_FLAGS`]).
+    fn parse_or_alias(&self, s: &str) -> (Arc<[Flag]>, bool) {
         if !self.aliases.is_empty()
             && let Ok(n) = s.parse::<usize>()
         {
-            return n.checked_sub(1).and_then(|i| self.aliases.get(i)).cloned().unwrap_or_default();
+            let set = n.checked_sub(1).and_then(|i| self.aliases.get(i)).cloned();
+            return (set.unwrap_or_else(|| Arc::from(Vec::new())), true);
         }
-        self.parse(s)
+        (Arc::from(self.parse(s)), false)
     }
 
     fn one(&self, s: &str) -> Option<Flag> {
@@ -319,6 +329,8 @@ impl Hunspell {
         // Affix headers announce how many rule lines follow; the rule lines carry the details.
         let mut cross: HashMap<(bool, Flag), bool> = HashMap::new();
         let mut af_header = false;
+        // One shared empty set for every rule and word without flags.
+        let no_flags: Arc<[Flag]> = Arc::from(Vec::new());
         for line in aff.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -338,8 +350,12 @@ impl Hunspell {
                     if !af_header {
                         af_header = true;
                     } else if flags.aliases.len() < 65_536 {
-                        let set = flags.parse(a);
-                        flags.aliases.push(set);
+                        // Past the total, aliases stay numbered but are empty.
+                        let mut set = flags.parse(a);
+                        if !h.store_flags(set.len()) {
+                            set.clear();
+                        }
+                        flags.aliases.push(Arc::from(set));
                     }
                 }
                 ["NEEDAFFIX" | "PSEUDOROOT", x, ..] => h.need_affix = flags.one(x),
@@ -349,7 +365,10 @@ impl Hunspell {
                 ["TRY", x, ..] => h.try_chars = x.chars().take(128).collect(),
                 ["LANG", x, ..] => h.language = x.replace('_', "-").chars().take(35).collect(),
                 ["REP", from, to, ..] if h.rep.len() < MAX_REP => {
-                    h.rep.push((from.replace('_', " "), to.replace('_', " ")));
+                    // A pair longer than any checked word only costs time and memory per suggestion.
+                    if from.chars().count() <= MAX_LEN && to.chars().count() <= MAX_LEN {
+                        h.rep.push((from.replace('_', " "), to.replace('_', " ")));
+                    }
                 }
                 [kind @ ("PFX" | "SFX"), flag, c, n] if *c == "Y" || *c == "N" => {
                     // Header: PFX <flag> <cross product> <count>.
@@ -366,7 +385,8 @@ impl Hunspell {
                         continue;
                     }
                     let (add, cont) = split_flags(add);
-                    let cont = cont.map(|c| flags.parse_or_alias(c)).unwrap_or_default();
+                    let (cont, shared) =
+                        cont.map_or((Arc::clone(&no_flags), true), |c| flags.parse_or_alias(c));
                     let cond = Cond::parse(rest.first().copied().unwrap_or("."));
                     let rule = Affix {
                         flag: fl,
@@ -377,6 +397,9 @@ impl Hunspell {
                         cont,
                     };
                     if rule.add.len() > MAX_LEN || rule.strip.len() > MAX_LEN {
+                        continue;
+                    }
+                    if !shared && !h.store_flags(rule.cont.len()) {
                         continue;
                     }
                     if is_pfx {
@@ -393,15 +416,26 @@ impl Hunspell {
             h.max_pfx = h.max_pfx.max(r.add.len());
             h.pfx_by_add.entry(r.add.clone().into_boxed_slice()).or_default().push(i);
         }
+        // Only a suffix's own flag is ever looked up as the outer suffix of a two-level suffix.
+        let suffix_flags: HashSet<Flag> = h.suffixes.iter().map(|r| r.flag).collect();
+        let mut by_cont: HashMap<Flag, Vec<u32>> = HashMap::new();
+        let mut stored = h.stored_flags;
         for (i, r) in h.suffixes.iter().enumerate() {
             let Ok(i) = u32::try_from(i) else { break };
             h.max_sfx = h.max_sfx.max(r.add.len());
             h.sfx_by_add.entry(r.add.clone().into_boxed_slice()).or_default().push(i);
-            for f in &r.cont {
-                h.sfx_by_cont.entry(*f).or_default().push(i);
+            // Past the total, further rules allow no second suffix.
+            for f in r.cont.iter().filter(|f| suffix_flags.contains(f)) {
+                if stored >= MAX_STORED_FLAGS {
+                    break;
+                }
+                stored += 1;
+                by_cont.entry(*f).or_default().push(i);
             }
         }
-        let mut interned: HashMap<Vec<Flag>, u32> = HashMap::new();
+        h.stored_flags = stored;
+        h.sfx_by_cont = by_cont;
+        let mut interned: HashMap<Arc<[Flag]>, u32> = HashMap::new();
         let mut letters: HashMap<char, usize> = HashMap::new();
         for (n, line) in dic.lines().enumerate() {
             if h.words.len() >= MAX_STEMS {
@@ -419,12 +453,19 @@ impl Hunspell {
             if word.is_empty() || word.chars().count() > MAX_LEN {
                 continue;
             }
-            let set = fl.map(|f| flags.parse_or_alias(f)).unwrap_or_default();
-            let next = u32::try_from(h.flag_sets.len()).unwrap_or(u32::MAX);
-            let id = *interned.entry(set.clone()).or_insert_with(|| {
-                h.flag_sets.push(set.into_boxed_slice());
-                next
-            });
+            let (set, shared) = fl.map_or((Arc::clone(&no_flags), true), |f| flags.parse_or_alias(f));
+            let id = match interned.get(&set) {
+                Some(id) => *id,
+                None => {
+                    if !shared && !h.store_flags(set.len()) {
+                        continue;
+                    }
+                    let Ok(id) = u32::try_from(h.flag_sets.len()) else { continue };
+                    h.flag_sets.push(Arc::clone(&set));
+                    interned.insert(set, id);
+                    id
+                }
+            };
             if h.try_chars.is_empty() {
                 for c in word.chars().flat_map(char::to_lowercase).filter(|c| c.is_alphabetic()) {
                     *letters.entry(c).or_default() += 1;
@@ -466,6 +507,17 @@ impl Hunspell {
         Ok(h)
     }
 
+    /// Counts `n` more stored flags; false (nothing counted) when that would pass [`MAX_STORED_FLAGS`].
+    fn store_flags(&mut self, n: usize) -> bool {
+        match self.stored_flags.checked_add(n) {
+            Some(total) if total <= MAX_STORED_FLAGS => {
+                self.stored_flags = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Number of stems in the word list.
     pub fn len(&self) -> usize {
         self.words.len()
@@ -501,6 +553,10 @@ impl Hunspell {
 
     /// [`Hunspell::check_exact`] within `budget` (false once it runs out).
     fn check_within(&self, word: &str, budget: &Budget) -> bool {
+        // Longer than any word (a char is at most 4 bytes): rejected before anything is copied.
+        if word.len() > MAX_LEN.saturating_mul(4) || word.chars().nth(MAX_LEN).is_some() {
+            return false;
+        }
         let chars: Vec<char> = word.chars().collect();
         if chars.is_empty() || chars.len() > MAX_LEN {
             return false;
@@ -643,6 +699,10 @@ impl Hunspell {
         };
         for (from, to) in &self.rep {
             if from.is_empty() {
+                continue;
+            }
+            // A candidate longer than any word is never built (REP sides are capped when read).
+            if word.len().saturating_sub(from.len()).saturating_add(to.len()) > MAX_LEN.saturating_mul(4) {
                 continue;
             }
             for (i, _) in word.match_indices(from.as_str()).take(8) {
@@ -851,6 +911,50 @@ mod tests {
 
     fn dict() -> Hunspell {
         Hunspell::parse(AFF.as_bytes(), DIC.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn alias_flags_are_shared_and_bounded() {
+        // Regression: every rule naming an alias cloned its 512 flags, and each flag added an index entry, so
+        // a few megabytes of .aff took gigabytes.
+        let many: String = (0..512u32).filter_map(|i| char::from_u32(0x100 + i)).collect();
+        let rules = 200_000;
+        let mut aff = format!("AF 1\nAF A{many}\nSFX A Y {rules}\n");
+        for _ in 0..rules {
+            aff.push_str("SFX A 0 s/1 .\n");
+        }
+        let h = Hunspell::parse(aff.as_bytes(), b"1\nchat/A\n").unwrap();
+        assert_eq!(h.suffixes.len(), rules);
+        let first = h.suffixes.first().unwrap();
+        assert!(h.suffixes.iter().all(|r| Arc::ptr_eq(&r.cont, &first.cont)), "one shared alias set");
+        // Only suffix flags are indexed for two-level suffixes: here just A.
+        assert_eq!(h.sfx_by_cont.len(), 1);
+        let entries: usize = h.sfx_by_cont.values().map(Vec::len).sum();
+        assert!(entries <= rules && h.stored_flags <= MAX_STORED_FLAGS);
+        assert!(h.check_exact("chats") && h.check_exact("chatss"), "two-level suffixes still work");
+
+        // Aliases past the total are empty: 9,000 aliases of 500 flags would store 4.5 million.
+        let wide: String = many.chars().take(500).collect();
+        let mut aff = String::from("AF 9000\n");
+        for _ in 0..9_000 {
+            aff.push_str(&format!("AF {wide}\n"));
+        }
+        let h = Hunspell::parse(aff.as_bytes(), b"1\nchat/1\nchien/9000\n").unwrap();
+        assert!(h.stored_flags <= MAX_STORED_FLAGS, "{}", h.stored_flags);
+        let sets: usize = h.flag_sets.iter().map(|s| s.len()).sum();
+        assert_eq!(sets, 500, "the first alias is kept, the last one is empty");
+        assert!(h.flag_sets.iter().any(|s| s.is_empty()));
+    }
+
+    #[test]
+    fn long_rep_pairs_are_dropped() {
+        // Regression: `REP a <huge>` built a huge candidate per match and copied it twice per check.
+        let huge = "b".repeat(100_000);
+        let aff = format!("TRY ab\nREP 2\nREP a {huge}\nREP f ph\n");
+        let h = Hunspell::parse(aff.as_bytes(), b"1\nphone\n").unwrap();
+        assert_eq!(h.rep, vec![("f".to_owned(), "ph".to_owned())]);
+        assert!(h.candidates("fone").contains(&"phone".to_owned()));
+        assert!(!h.check_exact(&"a".repeat(1_000_000)), "over-long words are refused before copying");
     }
 
     #[test]

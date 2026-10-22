@@ -193,6 +193,11 @@ pub struct RemoteRef {
     pub uid: String,
     /// Fingerprint of the item as last synchronised: a different one means it changed here since.
     pub synced: u64,
+    /// The server's copy as last synchronised, without what the item itself holds (an event's inline
+    /// files): an upload starts from it, so what MailCraft does not model goes back unchanged. Empty when
+    /// none is kept.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub raw: String,
 }
 
 /// A server collection mapped to a local Contacts or Tasks folder.

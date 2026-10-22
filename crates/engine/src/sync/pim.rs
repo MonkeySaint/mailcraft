@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mailcraft_formats::ics::{self, ImportOptions};
-use mailcraft_formats::vcf;
+use mailcraft_formats::{keep, vcf};
 use mailcraft_model::account::{DavFolderState, normalize_url_path};
 use mailcraft_model::task::TaskRecurrence;
 use mailcraft_model::{
@@ -126,10 +126,34 @@ fn clean_uid(uid: &str) -> String {
 
 /// The contact as the vCard 4.0 MailCraft uploads (with `uid`, when given).
 pub fn contact_card(c: &Contact, uid: &str) -> String {
+    contact_card_as(c, uid, vcf::Version::V4)
+}
+
+/// The task as the iCalendar object (one VTODO) MailCraft uploads.
+pub fn task_calendar(t: &Task, uid: &str, now: DateTime) -> String {
+    let mut plain = t.clone();
+    plain.remote = None;
+    plain.uid = clean_uid(uid);
+    crate::cmd::tasks::task_ics(&plain, None, None, &[], now)
+}
+
+/// The server copy of a resource as items keep it ([`RemoteRef::raw`]).
+pub fn kept(kind: PimKind, data: &str) -> String {
+    match kind {
+        PimKind::Contacts => keep::kept_card(data),
+        // A tasks folder holds no event, so no event's files: they stay in the kept copy.
+        PimKind::Tasks => keep::kept_calendar(data, 0),
+        // The files of the events `read_events` takes are the item's.
+        PimKind::Calendar => keep::kept_calendar(data, MAX_GROUP),
+    }
+}
+
+/// The contact's vCard written in `version` (with `uid`, when given).
+fn contact_card_as(c: &Contact, uid: &str, version: vcf::Version) -> String {
     let mut plain = c.clone();
     plain.remote = None;
     let mut out = String::new();
-    vcf::write_one(&plain, vcf::Version::V4, &mut out);
+    vcf::write_one(&plain, version, &mut out);
     let uid = clean_uid(uid);
     if !uid.is_empty()
         && let Some(end) = out.rfind("END:VCARD")
@@ -139,12 +163,61 @@ pub fn contact_card(c: &Contact, uid: &str) -> String {
     out
 }
 
-/// The task as the iCalendar object (one VTODO) MailCraft uploads.
-pub fn task_calendar(t: &Task, uid: &str, now: DateTime) -> String {
-    let mut plain = t.clone();
-    plain.remote = None;
-    plain.uid = clean_uid(uid);
-    crate::cmd::tasks::task_ics(&plain, None, None, &[], now)
+/// The vCard uploaded for a changed contact: [`contact_card`], rebuilt on the server's copy (`server`, as
+/// kept) so what MailCraft does not model goes back unchanged ([`mailcraft_formats::keep`]). The rebuilt
+/// card is used only when it reads back exactly as MailCraft's own card does.
+pub fn upload_contact(c: &Contact, uid: &str, server: Option<&str>) -> String {
+    let mine = contact_card(c, uid);
+    let Some(raw) = server else { return mine };
+    let Some((card, _)) = read_contact(raw) else { return mine };
+    let version = keep::card_version(raw);
+    let base = contact_card_as(&merged_contact(card, Some(c)), uid, version);
+    let Some(patched) = keep::patch_card(raw, &base, &contact_card_as(c, uid, version)) else { return mine };
+    let reads =
+        |text: &str| read_contact(text).map(|(x, _)| contact_fingerprint(&merged_contact(x, Some(c))));
+    match (reads(&patched), reads(&mine)) {
+        (Some(a), Some(b)) if a == b => patched,
+        _ => mine,
+    }
+}
+
+/// The iCalendar object uploaded for a changed task: [`task_calendar`] rebuilt on the server's copy (see
+/// [`upload_contact`]).
+pub fn upload_task(t: &Task, uid: &str, now: DateTime, server: Option<&str>, tz_offset_min: i32) -> String {
+    let mine = task_calendar(t, uid, now);
+    let Some(raw) = server else { return mine };
+    let Some((task, _)) = read_task(raw, tz_offset_min) else { return mine };
+    let base = task_calendar(&merged_task(task, Some(t)), uid, now);
+    let Some(patched) = keep::patch_calendar(raw, &base, &mine, tz_offset_min) else { return mine };
+    let reads =
+        |text: &str| read_task(text, tz_offset_min).map(|(x, _)| task_fingerprint(&merged_task(x, Some(t))));
+    match (reads(&patched), reads(&mine)) {
+        (Some(a), Some(b)) if a == b => patched,
+        _ => mine,
+    }
+}
+
+/// The iCalendar object uploaded for a changed group of appointments: [`event_calendar`] rebuilt on the
+/// server's copy (see [`upload_contact`]).
+pub fn upload_events(
+    items: &[&Appointment],
+    uid: &str,
+    now: DateTime,
+    server: Option<&str>,
+    tz_offset_min: i32,
+) -> String {
+    let mine = event_calendar(items, uid, now);
+    let Some(raw) = server else { return mine };
+    let Some((events, _)) = read_events(raw, tz_offset_min) else { return mine };
+    let base = event_calendar(&events.iter().collect::<Vec<_>>(), uid, now);
+    let Some(patched) = keep::patch_calendar(raw, &base, &mine, tz_offset_min) else { return mine };
+    let reads = |text: &str| {
+        read_events(text, tz_offset_min).map(|(x, _)| event_fingerprint(&x.iter().collect::<Vec<_>>()))
+    };
+    match (reads(&patched), reads(&mine)) {
+        (Some(a), Some(b)) if a == b => patched,
+        _ => mine,
+    }
 }
 
 pub fn contact_fingerprint(c: &Contact) -> u64 {
@@ -583,14 +656,47 @@ pub struct LocalItem {
     /// Its server copy (`None`: new here).
     pub remote: Option<RemoteRef>,
     pub uid: String,
-    /// What to upload when it is new or changed (empty otherwise).
-    pub body: String,
+    /// What to upload when it is new or changed (`None` otherwise); the text is built by the run
+    /// ([`LocalItem::body`]), off the session thread.
+    pub upload: Option<Box<Upload>>,
     pub fingerprint: u64,
 }
 
 impl LocalItem {
     pub fn changed(&self) -> bool {
         self.remote.as_ref().is_none_or(|r| r.synced != self.fingerprint)
+    }
+
+    /// The text to upload (empty when there is nothing to upload). Rebuilding it on the server's kept copy
+    /// reads and writes the whole object, so the run does it in the background, not the session.
+    pub fn body(&self) -> String {
+        self.upload.as_ref().map(|u| u.body(&self.uid)).unwrap_or_default()
+    }
+}
+
+/// A new or changed item as it goes up: the item, and the server's copy as kept ([`RemoteRef::raw`]) when
+/// its link counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Upload {
+    Contact { contact: Box<Contact>, server: Option<String> },
+    Task { task: Box<Task>, now: DateTime, server: Option<String>, tz_offset_min: i32 },
+    Events { items: Vec<Appointment>, now: DateTime, server: Option<String>, tz_offset_min: i32 },
+}
+
+impl Upload {
+    /// The vCard or iCalendar text uploaded under `uid` ([`upload_contact`], [`upload_task`],
+    /// [`upload_events`]).
+    pub fn body(&self, uid: &str) -> String {
+        match self {
+            Upload::Contact { contact, server } => upload_contact(contact, uid, server.as_deref()),
+            Upload::Task { task, now, server, tz_offset_min } => {
+                upload_task(task, uid, *now, server.as_deref(), *tz_offset_min)
+            }
+            Upload::Events { items, now, server, tz_offset_min } => {
+                let refs: Vec<&Appointment> = items.iter().collect();
+                upload_events(&refs, uid, *now, server.as_deref(), *tz_offset_min)
+            }
+        }
     }
 }
 
@@ -737,10 +843,21 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
     let mut seen: BTreeSet<String> = BTreeSet::new();
     // The remote copy only counts when it is in this folder's collection and no other item claimed it (a
     // copied or moved item is new here).
+    // The run gets the kept server copy only inside what goes up ([`Upload`]), not on the link.
     let mut keep = |r: &Option<RemoteRef>| -> Option<RemoteRef> {
         let r = r.as_ref()?;
         let inside = collection.as_deref().is_some_and(|c| stored_inside(&r.url, c));
-        (inside && seen.insert(r.url.clone())).then(|| r.clone())
+        (inside && seen.insert(r.url.clone())).then(|| RemoteRef {
+            url: r.url.clone(),
+            etag: r.etag.clone(),
+            uid: r.uid.clone(),
+            synced: r.synced,
+            raw: String::new(),
+        })
+    };
+    // The kept server copy of an item whose link counts.
+    let server = |linked: bool, r: &Option<RemoteRef>| -> Option<String> {
+        r.as_ref().map(|r| r.raw.clone()).filter(|raw| linked && !raw.is_empty())
     };
     match kind {
         PimKind::Contacts => {
@@ -749,9 +866,10 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
                 let uid = remote.as_ref().map(|r| r.uid.clone()).filter(|u| !u.is_empty());
                 let uid = uid.unwrap_or_else(|| new_uid(account, c.id, now.unix));
                 let fingerprint = contact_fingerprint(c);
-                let mut item = LocalItem { id: c.id, remote, uid, body: String::new(), fingerprint };
+                let mut item = LocalItem { id: c.id, remote, uid, upload: None, fingerprint };
                 if item.changed() {
-                    item.body = contact_card(c, &item.uid);
+                    let server = server(item.remote.is_some(), &c.remote);
+                    item.upload = Some(Box::new(Upload::Contact { contact: Box::new(c.clone()), server }));
                 }
                 job.items.push(item);
             }
@@ -784,9 +902,12 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
                     }
                 };
                 let fingerprint = task_fingerprint(t);
-                let mut item = LocalItem { id: t.id, remote, uid, body: String::new(), fingerprint };
+                let mut item = LocalItem { id: t.id, remote, uid, upload: None, fingerprint };
                 if item.changed() {
-                    item.body = task_calendar(t, &item.uid, now);
+                    let server = server(item.remote.is_some(), &t.remote);
+                    let task = Box::new(t.clone());
+                    item.upload =
+                        Some(Box::new(Upload::Task { task, now, server, tz_offset_min: s.tz_offset_min }));
                 }
                 job.items.push(item);
             }
@@ -803,9 +924,12 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
                     None => new_uid(account, lead.id, now.unix),
                 };
                 let fingerprint = event_fingerprint(&items);
-                let mut item = LocalItem { id: lead.id, remote, uid, body: String::new(), fingerprint };
+                let mut item = LocalItem { id: lead.id, remote, uid, upload: None, fingerprint };
                 if item.changed() {
-                    item.body = event_calendar(&items, &item.uid, now);
+                    let server = server(item.remote.is_some(), &lead.remote);
+                    let items: Vec<Appointment> = items.iter().map(|a| (*a).clone()).collect();
+                    let tz_offset_min = s.tz_offset_min;
+                    item.upload = Some(Box::new(Upload::Events { items, now, server, tz_offset_min }));
                 }
                 job.items.push(item);
             }
@@ -1102,11 +1226,14 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
         PimKind::Contacts | PimKind::Tasks => BTreeMap::new(),
     };
     for inc in out.incoming {
+        // What MailCraft does not model of the server copy goes back with the next upload of the item.
+        let raw = kept(kind, &inc.data);
         let remote = |uid: String, synced: u64| RemoteRef {
             url: inc.url.clone(),
             etag: inc.etag.clone(),
             uid,
             synced,
+            raw: raw.clone(),
         };
         match kind {
             PimKind::Contacts => {
@@ -1671,6 +1798,7 @@ mod tests {
             etag: "\"1\"".into(),
             uid: "u1".into(),
             synced: 1,
+            ..Default::default()
         };
         for (n, remote) in [(1, Some(remote.clone())), (2, Some(remote)), (3, None), (4, None)] {
             let id = ItemId(1000 + n);
@@ -1869,5 +1997,74 @@ mod tests {
             assert!(alt.starts_with(c) && alt.ends_with(".vcf") && alt.contains('!'), "{alt}");
             assert_eq!(alt, alternate_resource_url(c, uid, PimKind::Contacts), "stable");
         }
+    }
+
+    #[test]
+    fn task_uploads_keep_what_the_server_copy_holds() {
+        // Regression: a task went up as MailCraft rebuilt it, deleting other clients' properties and alarms.
+        let server = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\nBEGIN:VTODO\r\nUID:t-1\r\n\
+            DTSTAMP:20261001T000000Z\r\nSUMMARY:Report\r\nX-OTHER-CLIENT:keep me\r\nCATEGORIES:Work\r\n\
+            BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT1H\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let now = DateTime::from_unix(1_790_000_000, 0);
+        let (task, uid) = read_task(server, 0).unwrap();
+        let kept = kept(PimKind::Tasks, server);
+        let edited = Task { percent_complete: 50, ..task.clone() };
+        let body = upload_task(&edited, &uid, now, Some(&kept), 0);
+        assert!(body.contains("X-OTHER-CLIENT:keep me") && body.contains("TRIGGER:-PT1H"), "{body}");
+        assert!(body.contains("PERCENT-COMPLETE:50"), "{body}");
+        let (back, _) = read_task(&body, 0).unwrap();
+        assert_eq!(task_fingerprint(&merged_task(back, Some(&edited))), task_fingerprint(&edited));
+        // Without a kept copy, or when the kept copy is junk: MailCraft's own.
+        assert_eq!(upload_task(&edited, &uid, now, None, 0), task_calendar(&edited, &uid, now));
+        assert_eq!(upload_task(&edited, &uid, now, Some("junk"), 0), task_calendar(&edited, &uid, now));
+        // Contacts: a property the mapping drops survives an edit.
+        let card = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c-1\r\nFN:Pat Example\r\nN:Example;Pat;;;\r\n\
+            X-OTHER:1\r\nEND:VCARD\r\n";
+        let (c, uid) = read_contact(card).unwrap();
+        let edited = Contact { job_title: "Engineer".into(), ..c };
+        let body = upload_contact(&edited, &uid, Some(&kept_card_of(card)));
+        assert!(body.contains("X-OTHER:1") && body.contains("TITLE:Engineer"), "{body}");
+    }
+
+    fn kept_card_of(card: &str) -> String {
+        kept(PimKind::Contacts, card)
+    }
+
+    #[test]
+    fn changed_items_are_merged_with_the_server_copy_by_the_run_not_the_session() {
+        // Regression: the merge with the kept server copy (several parses of an object of up to 32 MiB) ran
+        // on the session thread while planning a run; it now runs with the upload, in the background.
+        let (mut s, account) = local_session();
+        let folder = s.mailbox.role_folder(account, FolderRole::Contacts).unwrap();
+        let collection = "https://dav.example.com/card/";
+        if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
+            a.sync
+                .dav
+                .insert(folder, DavFolderState { collection: collection.into(), known: BTreeMap::new() });
+        }
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c-2\r\nFN:Pat Example\r\nN:Example;Pat;;;\r\n\
+            X-EVOLUTION-SPOUSE:Alex\r\nX-OTHER:1\r\nEND:VCARD\r\n";
+        let (c, uid) = read_contact(card).unwrap();
+        let id = ItemId(4000);
+        let remote = RemoteRef {
+            url: format!("{collection}c-2.vcf"),
+            etag: "\"1\"".into(),
+            uid: uid.clone(),
+            synced: 1,
+            raw: kept_card_of(card),
+        };
+        let edited = Contact { id, folder, spouse: "Sam".into(), remote: Some(remote), ..c };
+        s.mailbox.contacts.insert(id, edited.clone());
+        let job = folder_job(&s, account, folder, PimKind::Contacts);
+        let item = job.items.iter().find(|i| i.id == id).unwrap();
+        assert!(item.remote.as_ref().is_some_and(|r| r.raw.is_empty()), "the link carries no copy");
+        assert!(matches!(item.upload.as_deref(), Some(Upload::Contact { server: Some(_), .. })));
+        let body = item.body();
+        assert_eq!(body, upload_contact(&edited, &uid, Some(&kept_card_of(card))));
+        // The spouse read from another client's name is replaced there too, so it shows the new one.
+        assert!(body.contains("Sam") && !body.contains("Alex") && body.contains("X-OTHER:1"), "{body}");
+        // An unchanged item has nothing to upload.
+        let unchanged = LocalItem { upload: None, ..item.clone() };
+        assert!(unchanged.body().is_empty());
     }
 }

@@ -3,6 +3,7 @@
 mod csv;
 mod eml_mbox;
 mod ics;
+mod keep;
 mod msg;
 mod sniff;
 mod spec;

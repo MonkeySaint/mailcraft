@@ -515,6 +515,8 @@ struct PathState {
     path: String,
     kind: usize,
     error: String,
+    /// The file at `path` exists: the next Save replaces it.
+    replace: bool,
 }
 
 fn save_as(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
@@ -581,7 +583,13 @@ fn save_item_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let name = d.str("name");
     let size = d.u64("size").unwrap_or(0);
     let (id, index) = (d.u64("id"), d.u64("index"));
-    let suggested = if name.trim().is_empty() { "attachment".to_owned() } else { name.clone() };
+    // The engine sends the name made safe; never a folder part or a hidden name from the item itself.
+    let suggested = Some(d.str("suggested"))
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::path::Path::new(&name).file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .map(|n| n.trim_start_matches('.').to_owned())
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "attachment".to_owned());
     with_state(
         ctx,
         app,
@@ -598,13 +606,20 @@ fn save_item_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 let l = ui.label("Save to:");
                 ui.horizontal(|ui| {
                     let browse = common::browse_button(ui, app);
-                    ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(ui.available_width()))
+                    let edit = ui
+                        .add(egui::TextEdit::singleline(&mut st.path).desired_width(ui.available_width()))
                         .labelled_by(l.id);
+                    if edit.changed() {
+                        st.replace = false;
+                    }
                     if browse && let Some(p) = common::browse_save(app, "Save Attachment", &[], &st.path) {
                         st.path = p;
+                        st.replace = false;
                     }
                 });
-                if !st.error.is_empty() {
+                if st.replace {
+                    ui.colored_label(app.theme.danger, "A file with this name is already there. Replace it?");
+                } else if !st.error.is_empty() {
                     ui.colored_label(app.theme.danger, &st.error);
                 }
                 footer(ui, |ui| {
@@ -612,12 +627,17 @@ fn save_item_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         return Out::Close;
                     }
                     let ready = id.is_some() && !st.path.trim().is_empty();
-                    if primary(ui, app, ready, "Save") {
-                        let p = json!({"id": id, "index": index, "name": name, "path": st.path.trim()});
+                    let label = if st.replace { "Replace" } else { "Save" };
+                    if primary(ui, app, ready, label) {
+                        let p = json!({
+                            "id": id, "index": index, "name": name, "path": st.path.trim(), "overwrite": st.replace
+                        });
                         if app.run("calendar.saveAttachment", p).is_some() {
                             return Out::Close;
                         }
                         st.error = last_error(app);
+                        // The engine refuses to replace a file unasked: ask, then replace on the next click.
+                        st.replace = !st.replace && std::path::Path::new(st.path.trim()).exists();
                     }
                     Out::Keep
                 })

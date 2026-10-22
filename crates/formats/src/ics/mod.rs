@@ -12,7 +12,7 @@
 //! local time with a fixed-offset VTIMEZONE (`TZID=UTC-04:00`) so the written offset round-trips.
 
 pub mod itip;
-mod map;
+pub(crate) mod map;
 pub mod parse;
 pub mod rrule;
 pub mod tz;

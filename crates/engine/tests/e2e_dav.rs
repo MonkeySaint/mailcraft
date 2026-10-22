@@ -1159,6 +1159,8 @@ fn an_item_whose_address_another_item_took_goes_up_under_another_name() {
     assert!(srv.dav_items(ALICE, "tasks").iter().any(|(n, d)| n == "dup-1.ics" && d.contains("other-9")));
     let mine = s.mailbox.tasks[&ids[1]].remote.clone().expect("the task here went up under another name");
     assert!(!mine.url.ends_with("/dup-1.ics"), "{}", mine.url);
+    // What went up under the other name is kept as the server copy, so the next edit starts from it.
+    assert!(mine.raw.contains("SUMMARY:Mine") && mine.raw.contains("UID:dup-1"), "{}", mine.raw);
     assert!(
         s.mailbox.tasks.values().any(|t| t.folder == tasks && t.subject == "From the phone"),
         "the phone's task arrived"
@@ -1283,4 +1285,93 @@ fn the_mail_token_goes_only_to_the_providers_dav_server_and_is_renewed_for_it() 
     assert_eq!(acct["hasDavPassword"], true, "{acct}");
     update_folder(&mut s, contacts);
     assert!(contact_named(&s, contacts, "Lee").is_some());
+}
+
+/// A card from another client, with more than MailCraft models.
+const KIM: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:urn:uuid:kim-1\r\nFN:Kim Example\r\nN:Example;Kim;;;\r\n\
+EMAIL;TYPE=work:kim@example.com\r\nEMAIL;TYPE=home:kim@example.net\r\nEMAIL:kim.two@example.org\r\n\
+EMAIL:kim.three@example.org\r\nitem1.URL:https://example.com/kim\r\nitem1.X-ABLABEL:Blog\r\n\
+X-OTHER-CLIENT-ID:42\r\nGEO:43.6;-79.4\r\nEND:VCARD\r\n";
+
+/// Folds a content line at 75 octets (ASCII only).
+fn folded(line: &str) -> String {
+    let mut out = String::new();
+    for (i, chunk) in line.as_bytes().chunks(74).enumerate() {
+        if i > 0 {
+            out.push_str("\r\n ");
+        }
+        out.push_str(std::str::from_utf8(chunk).unwrap());
+    }
+    out.push_str("\r\n");
+    out
+}
+
+#[test]
+fn edits_keep_what_the_server_copy_holds_beyond_the_mapping() {
+    // Regression: contacts and events went up as MailCraft rebuilt them, so a fourth e-mail address, other
+    // clients' properties, a second alarm and attachments by URI were deleted on the server at the first edit
+    // here; and an inline file over 768 KiB was cut while reading, then uploaded cut.
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "tasks": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    let cal = role(&s, alice, FolderRole::Calendar);
+    srv.put_dav_item(ALICE, "contacts", "kim-1.vcf", KIM).unwrap();
+    let file: Vec<u8> =
+        (0..2 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    let b64 = mailcraft_mime::transfer::encode_base64_flat(&file);
+    let event = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\nBEGIN:VEVENT\r\nUID:trip-1\r\n\
+         DTSTAMP:20261001T000000Z\r\nDTSTART:20261102T090000Z\r\nDTEND:20261102T100000Z\r\nSUMMARY:Trip\r\n\
+         X-OTHER-CLIENT:keep me\r\nATTACH;FMTTYPE=application/pdf:https://files.example.com/agenda.pdf\r\n{}\
+         BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Trip\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n\
+         BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Trip\r\nTRIGGER:-PT1H\r\nEND:VALARM\r\n\
+         END:VEVENT\r\nEND:VCALENDAR\r\n",
+        folded(&format!("ATTACH;ENCODING=BASE64;VALUE=BINARY;X-FILENAME=big.bin:{b64}"))
+    );
+    srv.put_dav_item(ALICE, "calendar", "trip-1.ics", &event).unwrap();
+    update_folder(&mut s, contacts);
+    update_folder(&mut s, cal);
+    let kim = contact_named(&s, contacts, "Kim").expect("the card arrived").id;
+    let trip =
+        calendar_items(&s, cal).into_iter().find(|a| a.subject == "Trip").expect("the event arrived").id;
+    let got = &s.mailbox.appointments[&trip].attachments;
+    assert_eq!(got.len(), 1);
+    assert!(got[0].data[..] == file[..], "the inline file arrived whole");
+
+    s.mailbox.contacts.get_mut(&kim).unwrap().job_title = "Engineer".into();
+    run(&mut s, "calendar.update", json!({"id": trip.0, "location": "Room 2"}));
+    update_folder(&mut s, contacts);
+    update_folder(&mut s, cal);
+
+    let (_, card) = srv.dav_items(ALICE, "contacts").into_iter().find(|(n, _)| n == "kim-1.vcf").unwrap();
+    let unfolded = card.replace("\r\n ", "");
+    for kept in [
+        "TITLE:Engineer",
+        "VERSION:3.0",
+        "UID:urn:uuid:kim-1",
+        "kim.three@example.org",
+        "item1.X-ABLABEL:Blog",
+        "X-OTHER-CLIENT-ID:42",
+        "GEO:43.6;-79.4",
+    ] {
+        assert!(unfolded.contains(kept), "{kept} in {card}");
+    }
+    let (_, data) = srv.dav_items(ALICE, "calendar").into_iter().find(|(n, _)| n == "trip-1.ics").unwrap();
+    let unfolded = data.replace("\r\n ", "");
+    for kept in ["LOCATION:Room 2", "X-OTHER-CLIENT:keep me", "https://files.example.com/agenda.pdf", "-PT1H"]
+    {
+        assert!(unfolded.contains(kept), "{kept} in the uploaded event");
+    }
+    assert_eq!(unfolded.matches("BEGIN:VALARM").count(), 2, "both alarms are kept");
+    let back = mailcraft_formats::ics::read_str(&data, Default::default()).unwrap();
+    let files = &back.events[0].appointment.attachments;
+    assert_eq!(files.len(), 1);
+    assert!(files[0].data[..] == file[..], "the server's file is still whole");
+    // Nothing more to upload: what went up reads back as the items here.
+    let puts = || srv.dav_requests().iter().filter(|r| r.starts_with("PUT")).count();
+    let before = puts();
+    update_folder(&mut s, contacts);
+    update_folder(&mut s, cal);
+    assert_eq!(puts(), before);
 }

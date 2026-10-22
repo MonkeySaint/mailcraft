@@ -1585,6 +1585,28 @@ pub(crate) fn attach_to_window(ed: &mut ApptEditor, path: &str) {
     }
 }
 
+/// Save As… for file `index` (named `filename`) of the saved appointment `id`. With a native save dialog,
+/// it offers the name made safe (a name from another calendar never names another folder or a hidden
+/// file) and replaces a file that exists, as the dialog has asked about that already; without one, the
+/// Save Attachment window asks for the path.
+pub(crate) fn save_item_file(app: &mut App, id: u64, index: usize, filename: &str) {
+    let p = json!({"id": id, "index": index, "name": filename});
+    let Some(files) = app.files.clone() else {
+        app.run("calendar.saveAttachment", p);
+        return;
+    };
+    let suggested = mailcraft_mime::message::safe_file_name(filename);
+    let suggested = if suggested.is_empty() { "attachment".to_owned() } else { suggested };
+    if let Some(path) = files.save_file("Save Attachment", &suggested, &[], None) {
+        let mut p = p;
+        if let Some(o) = p.as_object_mut() {
+            o.insert("path".into(), json!(path.to_string_lossy()));
+            o.insert("overwrite".into(), json!(true));
+        }
+        app.run("calendar.saveAttachment", p);
+    }
+}
+
 /// The attached files (name, size, Save As… for a saved item, remove) and Attach File.
 fn attachments_row(ui: &mut Ui, app: &mut App, ed: &mut ApptEditor) {
     ui.vertical(|ui| {
@@ -1606,25 +1628,7 @@ fn attachments_row(ui: &mut Ui, app: &mut App, ed: &mut ApptEditor) {
                         if let Some((id, index)) = stored
                             && ui.button("Save As…").clicked()
                         {
-                            let path = app
-                                .files
-                                .as_ref()
-                                .and_then(|d| d.save_file("Save Attachment", &f.filename, &[], None));
-                            let p = json!({"id": id, "index": index, "name": f.filename});
-                            match path {
-                                Some(path) => {
-                                    let mut p = p;
-                                    if let Some(o) = p.as_object_mut() {
-                                        o.insert("path".into(), json!(path.to_string_lossy()));
-                                    }
-                                    app.run("calendar.saveAttachment", p);
-                                }
-                                // No file picker here: the Save Attachment window asks for the path.
-                                None if app.files.is_none() => {
-                                    app.run("calendar.saveAttachment", p);
-                                }
-                                None => {}
-                            }
+                            save_item_file(app, id, index, &f.filename);
                             ui.close();
                         }
                         if ui.button("Remove").clicked() {
@@ -3823,5 +3827,69 @@ mod tests {
         assert_eq!(ed.requested_by, "Boss <boss@example.com>");
         assert!(request_line(&ed).unwrap().starts_with("You accepted"));
         let _ = &mut app;
+    }
+
+    /// A save dialog that answers with a fixed path and records the name it offered.
+    struct SaveTo {
+        path: std::path::PathBuf,
+        offered: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::FileDialogs for SaveTo {
+        fn open_files(
+            &self,
+            _: &str,
+            _: &[crate::FileFilter],
+            _: bool,
+            _: Option<&std::path::Path>,
+        ) -> Option<Vec<std::path::PathBuf>> {
+            None
+        }
+        fn save_file(
+            &self,
+            _: &str,
+            suggested: &str,
+            _: &[crate::FileFilter],
+            _: Option<&std::path::Path>,
+        ) -> Option<std::path::PathBuf> {
+            self.offered.lock().unwrap().push(suggested.to_owned());
+            Some(self.path.clone())
+        }
+        fn pick_folder(&self, _: &str, _: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    #[test]
+    fn save_as_through_the_file_picker_replaces_the_file_and_offers_a_safe_name() {
+        // Regression: the native dialog had asked to replace the file, but the save was refused because it
+        // did not say `overwrite`; and the dialog offered the item's raw name (`../.bashrc`).
+        let base = option_env!("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_exe().ok()?.ancestors().nth(3).map(|t| t.join("tmp")))
+            .unwrap();
+        let dir = base.join(format!("mc-item-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("notes.txt");
+        std::fs::write(&out, b"old").unwrap();
+        let mut app = app();
+        let id = app
+            .run(
+                "calendar.newAppointment",
+                json!({"subject": "Review", "start": "2026-11-02T09:00", "end": "2026-11-02T10:00",
+                       "attachments": [{"name": "../.bashrc", "data_base64": "aXRlbSAx"}]}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let picker = std::sync::Arc::new(SaveTo { path: out.clone(), offered: Default::default() });
+        app.set_file_dialogs(picker.clone());
+        save_item_file(&mut app, id, 0, "../.bashrc");
+        assert_eq!(*picker.offered.lock().unwrap(), ["bashrc"]);
+        assert_eq!(std::fs::read(&out).unwrap(), b"item 1", "{:?}", app.ui.toast);
+        // A name with nothing usable left is offered as "attachment".
+        save_item_file(&mut app, id, 0, "...");
+        assert_eq!(picker.offered.lock().unwrap().last().map(String::as_str), Some("attachment"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

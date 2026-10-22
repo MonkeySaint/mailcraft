@@ -452,6 +452,68 @@ pub fn sanitize_filename(name: &str) -> String {
     if t == "." || t == ".." { String::new() } else { t.to_owned() }
 }
 
+/// Longest file name [`safe_file_name`] keeps (characters).
+pub const MAX_FILE_NAME_CHARS: usize = 200;
+
+/// A file name from hostile input made safe to offer as the name of a file saved in a folder:
+/// [`sanitize_filename`] (last path component, no control characters, no `.`/`..`), then no leading dots
+/// (no hidden or dot-segment names), the characters Windows refuses (`: * ? " < > |`) replaced, Windows
+/// device names (`CON`, `NUL`, `COM1`… with or without an extension) prefixed with `_`, and at most
+/// [`MAX_FILE_NAME_CHARS`] characters. Invisible format characters are removed too, among them the
+/// bidirectional controls that would show `invoice\u{202E}fdp.exe` as `invoiceexe.pdf`. Empty when nothing
+/// usable is left.
+pub fn safe_file_name(name: &str) -> String {
+    let base = sanitize_filename(name);
+    let base: String = base.chars().filter(|c| !is_format_char(*c)).collect();
+    let base = base.trim().trim_start_matches(['.', ' ']);
+    let mut out: String = base
+        .chars()
+        .map(|c| if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .take(MAX_FILE_NAME_CHARS)
+        .collect();
+    let trimmed = out.trim_end_matches(['.', ' ']).len();
+    out.truncate(trimmed);
+    let stem = out.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.chars().nth(3).is_some_and(|c| c.is_ascii_digit()));
+    if device {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// Unicode format characters (general category Cf) that change how a name is shown without showing
+/// themselves: bidirectional marks, embeddings, overrides and isolates, zero-width characters, the byte
+/// order mark, interlinear annotation and tag characters.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
 impl Part {
     pub fn mime_type(&self) -> &str {
         &self.content_type.mime_type
@@ -892,6 +954,33 @@ mod tests {
         assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
         assert_eq!(sanitize_filename(".."), "");
         assert_eq!(sanitize_filename("a\u{0}b.txt "), "ab.txt");
+    }
+
+    #[test]
+    fn safe_file_names() {
+        for (hostile, safe) in [
+            ("../../x", "x"),
+            ("../.bashrc", "bashrc"),
+            (".config/autostart/x.desktop", "x.desktop"),
+            ("..\\..\\Startup\\run.bat", "run.bat"),
+            ("...", ""),
+            (". .hidden", "hidden"),
+            ("con", "_con"),
+            ("NUL.txt", "_NUL.txt"),
+            ("com1.log", "_com1.log"),
+            ("lpt9", "_lpt9"),
+            ("console.txt", "console.txt"),
+            ("a:b*c?.txt", "a_b_c_.txt"),
+            ("report.pdf. . ", "report.pdf"),
+            // Regression: bidi overrides showed an executable as a PDF (`invoiceexe.pdf`).
+            ("invoice\u{202E}fdp.exe", "invoicefdp.exe"),
+            ("\u{2067}a\u{200F}b\u{2069}.txt", "ab.txt"),
+            ("\u{200B}.hidden", "hidden"),
+            ("\u{FEFF}con", "_con"),
+        ] {
+            assert_eq!(safe_file_name(hostile), safe, "{hostile:?}");
+        }
+        assert_eq!(safe_file_name(&"é".repeat(500)).chars().count(), MAX_FILE_NAME_CHARS);
     }
 
     #[test]

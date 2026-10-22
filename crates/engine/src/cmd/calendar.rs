@@ -42,7 +42,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use self::pim::Kind;
-use crate::cmd::util::{opt_str, opt_u64};
+use crate::cmd::util::{opt_bool, opt_str, opt_u64};
 use crate::compose::{ComposeAttachment, ComposeState};
 use crate::{CmdError, CmdResult, CommandSpec, Module, Session, always};
 pub use mailcraft_formats::ics::itip::ItipMessage;
@@ -1585,9 +1585,12 @@ pub fn attachment_from_path(path: &str) -> Result<ItemAttachment, CmdError> {
     Ok(ItemAttachment { filename, mime_type, data: data.into() })
 }
 
-/// `calendar.saveAttachment {id, index | name, path}`: writes a file attached to an appointment to `path`
-/// (atomically). `index` picks the file (two files may share a name); `name` alone picks the first file so
-/// named, and with `index` it must match. Without `path` the Save Attachment window asks for one.
+/// `calendar.saveAttachment {id, index | name, path, overwrite}`: writes a file attached to an appointment to
+/// `path` (atomically). `index` picks the file (two files may share a name); `name` alone picks the first
+/// file so named, and with `index` it must match. Without `path` the Save Attachment window asks for one,
+/// suggesting the file's name made safe ([`mailcraft_mime::message::safe_file_name`]: a name from another
+/// calendar never names another folder or a hidden file). An existing file is replaced only with
+/// `overwrite: true` (the window asks first).
 fn run_save_attachment(s: &mut Session, p: &Value) -> CmdResult {
     let id = pim::require_targets(s, p, Kind::Appointment)?
         .into_iter()
@@ -1608,11 +1611,21 @@ fn run_save_attachment(s: &mut Session, p: &Value) -> CmdResult {
     };
     let (index, file) = found.ok_or_else(|| CmdError::Params("the appointment has no such file".into()))?;
     let Some(path) = opt_str(p, "path").map(str::trim).filter(|x| !x.is_empty()) else {
-        let params = json!({"id": id.0, "index": index, "name": file.filename, "size": file.data.len()});
+        let suggested = mailcraft_mime::message::safe_file_name(&file.filename);
+        let suggested = if suggested.is_empty() { "attachment".to_owned() } else { suggested };
+        let params = json!({
+            "id": id.0, "index": index, "name": file.filename, "suggested": suggested, "size": file.data.len()
+        });
         return pim::dialog(s, SAVE_ITEM_FILE, params);
     };
     let (name, size, data) = (file.filename.clone(), file.data.len(), file.data.clone());
-    crate::cmd::rules::write_file(std::path::Path::new(path), &data)?;
+    let target = std::path::Path::new(path);
+    if target.exists() && opt_bool(p, "overwrite") != Some(true) {
+        return Err(CmdError::Params(format!(
+            "{path} already exists (pass `overwrite: true` to replace it)"
+        )));
+    }
+    crate::cmd::rules::write_file(target, &data)?;
     Ok(json!({"saved": path, "name": name, "index": index, "size": size}))
 }
 
@@ -4511,7 +4524,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save Attachment",
             "Appointment › Attachments",
             "",
-            r#"{"id": number, "name"?: string, "index"?: number, "path"?: string (without: the save dialog)}"#,
+            r#"{"id": number, "name"?: string, "index"?: number, "path"?: string (without: the save dialog), "overwrite"?: bool (replace an existing file; default false)}"#,
             false,
             run_save_attachment,
         ),

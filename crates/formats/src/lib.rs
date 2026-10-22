@@ -9,6 +9,8 @@
 //! - [`ics`]: iCalendar (RFC 5545) with recurrence expansion, time zones and iTIP methods (RFC 5546).
 //! - [`vcf`]: vCard 4.0 (RFC 6350) and 3.0 (RFC 2426), lenient with 2.1.
 //! - [`csv`]: RFC 4180 CSV and the contacts import/export column mapping.
+//! - [`keep`]: server copies of vCards and iCalendar objects kept across an edit (what MailCraft does not
+//!   model goes back unchanged).
 //!
 //! Every reader is total: hostile input produces an error or a best-effort value, never a panic. Each format
 //! has an input size cap and bounded counts (components, properties, recursion, occurrences).
@@ -16,6 +18,7 @@
 pub mod csv;
 pub mod eml;
 pub mod ics;
+pub mod keep;
 pub mod mbox;
 pub mod msg;
 pub mod theme;

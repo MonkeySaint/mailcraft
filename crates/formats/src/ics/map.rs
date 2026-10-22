@@ -139,7 +139,7 @@ impl<'a> Ctx<'a> {
         value::parse_time_value(&p.value, p.param("VALUE"), p.param("TZID"))
     }
 
-    fn time(&self, c: &Component, name: &str) -> Option<(TimeValue, DateTime)> {
+    pub(crate) fn time(&self, c: &Component, name: &str) -> Option<(TimeValue, DateTime)> {
         let tv = Self::time_value(c.prop(name)?)?;
         let dt = self.resolve(&tv);
         Some((tv, dt))
@@ -374,9 +374,16 @@ fn html_description(c: &Component) -> Option<String> {
 /// Files carried inline by an event (`ATTACH;VALUE=BINARY;ENCODING=BASE64`, RFC 5545 section 3.8.1.1), up to
 /// the per-item limits. Attachments by URI are not fetched.
 fn attachments_of(c: &Component) -> Vec<ItemAttachment> {
-    let mut out: Vec<ItemAttachment> = Vec::new();
+    held_attachments(c).into_iter().map(|(_, f)| f).collect()
+}
+
+/// The inline files of `c` the model keeps, with the index of the property each comes from. A file name
+/// from the file is made safe to save under ([`mailcraft_mime::message::safe_file_name`]: no folders, no
+/// dot segments or hidden names, no device names).
+pub(crate) fn held_attachments(c: &Component) -> Vec<(usize, ItemAttachment)> {
+    let mut out: Vec<(usize, ItemAttachment)> = Vec::new();
     let mut total = 0usize;
-    for p in c.props_named("ATTACH") {
+    for (i, p) in c.props.iter().enumerate().filter(|(_, p)| p.name.eq_ignore_ascii_case("ATTACH")) {
         if out.len() >= MAX_ITEM_ATTACHMENTS {
             break;
         }
@@ -392,11 +399,11 @@ fn attachments_of(c: &Component) -> Vec<ItemAttachment> {
         let name = ["X-FILENAME", "FILENAME", "X-APPLE-FILENAME"]
             .iter()
             .find_map(|n| p.param(n))
-            .map(|n| n.trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>())
+            .map(mailcraft_mime::message::safe_file_name)
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| format!("attachment{}", out.len().saturating_add(1)));
         let mime_type = p.param("FMTTYPE").map(|m| m.trim().to_ascii_lowercase()).unwrap_or_default();
-        out.push(ItemAttachment { filename: name, mime_type, data: data.into() });
+        out.push((i, ItemAttachment { filename: name, mime_type, data: data.into() }));
     }
     out
 }

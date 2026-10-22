@@ -2,8 +2,10 @@
 
 /// Most content lines read from one iCalendar / vCard input.
 pub const MAX_CONTENT_LINES: usize = 1_000_000;
-/// Longest unfolded content line kept (longer lines are truncated at a char boundary).
-pub const MAX_LINE_CHARS: usize = 1 << 20;
+/// Longest unfolded content line kept, in bytes. It is above the largest iCalendar and vCard input
+/// accepted, so a line of a valid file (a large inline attachment) is never cut; a longer line is dropped
+/// whole, never kept truncated (a cut base64 value would decode to a corrupted file).
+pub const MAX_LINE_BYTES: usize = 40 * 1024 * 1024;
 /// Most parameters kept on one content line.
 pub const MAX_PARAMS: usize = 64;
 /// Most values kept for one parameter.
@@ -67,18 +69,34 @@ pub fn clip(s: &str, max: usize) -> String {
 }
 
 /// Splits into logical lines and unfolds continuation lines (a line break followed by a space or tab).
-/// Accepts CRLF, LF and bare CR line breaks. Blank lines are dropped.
+/// Accepts CRLF, LF and bare CR line breaks. Blank lines are dropped, and so are lines longer than
+/// [`MAX_LINE_BYTES`] once unfolded.
 pub fn unfold(input: &str) -> Vec<String> {
+    unfold_capped(input, MAX_LINE_BYTES)
+}
+
+/// [`unfold`] with `max` bytes per unfolded line.
+pub(crate) fn unfold_capped(input: &str, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    // The last line grew past `max`: its continuations are skipped and it is dropped.
+    let mut too_long = false;
     let normal = input.replace("\r\n", "\n").replace('\r', "\n");
     for raw in normal.split('\n') {
         if let Some(cont) = raw.strip_prefix([' ', '\t'])
             && let Some(last) = out.last_mut()
         {
-            if last.len() < MAX_LINE_CHARS {
-                last.push_str(cont);
+            if !too_long {
+                if last.len().saturating_add(cont.len()) > max {
+                    too_long = true;
+                } else {
+                    last.push_str(cont);
+                }
             }
             continue;
+        }
+        if too_long {
+            out.pop();
+            too_long = false;
         }
         if raw.trim().is_empty() {
             continue;
@@ -86,12 +104,13 @@ pub fn unfold(input: &str) -> Vec<String> {
         if out.len() >= MAX_CONTENT_LINES {
             break;
         }
+        if raw.len() > max {
+            too_long = true;
+        }
         out.push(raw.to_owned());
     }
-    for line in &mut out {
-        if line.len() > MAX_LINE_CHARS {
-            *line = clip(line, MAX_LINE_CHARS);
-        }
+    if too_long {
+        out.pop();
     }
     out
 }

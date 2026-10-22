@@ -409,8 +409,15 @@ fn save_attachment_picks_the_file_by_index_and_asks_for_a_path_in_its_own_window
     );
     assert_eq!(r["index"], 1);
     assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    // An existing file is replaced only when asked to.
+    assert!(s.run("calendar.saveAttachment", &json!({"id": id, "name": "notes.txt", "path": at})).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"second");
     // By name alone: the first so named.
-    run(&mut s, "calendar.saveAttachment", json!({"id": id, "name": "notes.txt", "path": at}));
+    run(
+        &mut s,
+        "calendar.saveAttachment",
+        json!({"id": id, "name": "notes.txt", "path": at, "overwrite": true}),
+    );
     assert_eq!(std::fs::read(&path).unwrap(), b"first");
     for bad in [
         json!({"id": id}),
@@ -422,4 +429,41 @@ fn save_attachment_picks_the_file_by_index_and_asks_for_a_path_in_its_own_window
         assert!(s.run("calendar.saveAttachment", &bad).is_err(), "{bad}");
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn save_attachment_suggests_a_safe_name_for_hostile_file_names() {
+    // Regression: a file name from a server or an invitation (`../.bashrc`) went into the suggested path
+    // unchanged, and a click on Save replaced a file outside the folder.
+    let mut s = session();
+    let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:a@example.com\r\n\
+        DTSTART:20261102T090000Z\r\nDTEND:20261102T100000Z\r\nSUMMARY:Trip\r\n\
+        ATTACH;ENCODING=BASE64;VALUE=BINARY;X-FILENAME=../../x:Zmlyc3Q=\r\n\
+        ATTACH;ENCODING=BASE64;VALUE=BINARY;FILENAME=.config/autostart/run.desktop:Zmlyc3Q=\r\n\
+        ATTACH;ENCODING=BASE64;VALUE=BINARY;X-FILENAME=..:Zmlyc3Q=\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+    let cal = mailcraft_formats::ics::read_str(ics, Default::default()).unwrap();
+    let names: Vec<String> =
+        cal.events[0].appointment.attachments.iter().map(|f| f.filename.clone()).collect();
+    assert_eq!(names, ["x", "run.desktop", "attachment3"]);
+    // A name that reached an item another way is made safe when it is offered for saving.
+    let r = run(
+        &mut s,
+        "calendar.newAppointment",
+        json!({"subject": "Trip", "start": "2026-11-02T09:00", "end": "2026-11-02T10:00",
+               "attachments": [{"name": "../.bashrc", "data_base64": "Zmlyc3Q="}]}),
+    );
+    let id = r["id"].as_u64().unwrap();
+    s.notices.clear();
+    run(&mut s, "calendar.saveAttachment", json!({"id": id, "index": 0}));
+    let params = s
+        .notices
+        .iter()
+        .find_map(|n| match n {
+            crate::Notice::OpenDialog(name, p) if name == SAVE_ITEM_FILE => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(params["suggested"], "bashrc");
+    assert_eq!(params["name"], "../.bashrc", "the item's own name still picks the file");
 }

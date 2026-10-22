@@ -640,11 +640,13 @@ fn sync_folder(client: &DavClient, job: &FolderJob, collection: &str) -> Result<
             }
         }
     };
-    let uploaded = |item: &pim::LocalItem, url: &str, etag: String| RemoteRef {
+    let uploaded = |item: &pim::LocalItem, url: &str, etag: String, body: &str| RemoteRef {
         url: url.to_owned(),
         etag,
         uid: item.uid.clone(),
         synced: item.fingerprint,
+        // The server now holds what went up.
+        raw: pim::kept(kind, body),
     };
     // Items new here go up after the server's unknown copies are read: one of those may be the same item
     // (its link was lost with a settings change, or another device uploaded it), and is then taken instead
@@ -666,11 +668,13 @@ fn sync_folder(client: &DavClient, job: &FolderJob, collection: &str) -> Result<
                     Some(_) => Precondition::Any,
                     None => Precondition::Create,
                 };
-                match put(&url, &item.body, pre, &mut out)? {
+                // Built here, off the session thread: the merge with the server's copy reads the whole object.
+                let body = item.body();
+                match put(&url, &body, pre, &mut out)? {
                     Put::Done(etag) => {
                         relist |= etag.is_empty();
                         known.insert(url.clone(), etag.clone());
-                        out.uploaded.push((item.id, uploaded(item, &url, etag)));
+                        out.uploaded.push((item.id, uploaded(item, &url, etag, &body)));
                     }
                     Put::Conflict => out.errors.push(format!("{url}: changed on the server meanwhile")),
                     Put::Failed => {}
@@ -744,11 +748,12 @@ fn sync_folder(client: &DavClient, job: &FolderJob, collection: &str) -> Result<
             continue;
         }
         here.insert(url.clone());
-        match put(&url, &item.body, Precondition::Create, &mut out)? {
+        let body = item.body();
+        match put(&url, &body, Precondition::Create, &mut out)? {
             Put::Done(etag) => {
                 relist |= etag.is_empty();
                 known.insert(url.clone(), etag.clone());
-                out.uploaded.push((item.id, uploaded(item, &url, etag)));
+                out.uploaded.push((item.id, uploaded(item, &url, etag, &body)));
             }
             // Something already lives at that name (the same item from another device): take it.
             Put::Conflict => conflicts.push((item, url.clone())),
@@ -787,11 +792,12 @@ fn sync_folder(client: &DavClient, job: &FolderJob, collection: &str) -> Result<
             out.errors.push(format!("{taken}: another item already has this address on the server"));
             continue;
         }
-        match put(&url, &item.body, Precondition::Create, &mut out)? {
+        let body = item.body();
+        match put(&url, &body, Precondition::Create, &mut out)? {
             Put::Done(etag) => {
                 relist |= etag.is_empty();
                 known.insert(url.clone(), etag.clone());
-                out.uploaded.push((item.id, uploaded(item, &url, etag)));
+                out.uploaded.push((item.id, uploaded(item, &url, etag, &body)));
             }
             Put::Conflict => {
                 out.errors.push(format!("{taken}: another item already has this address on the server"))
@@ -1077,9 +1083,10 @@ mod tests {
                     etag: "\"1\"".into(),
                     uid: "pat".into(),
                     synced: 5,
+                    ..Default::default()
                 }),
                 uid: "pat".into(),
-                body: String::new(),
+                upload: None,
                 fingerprint: 5,
             }],
             too_many: false,

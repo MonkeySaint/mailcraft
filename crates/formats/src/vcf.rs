@@ -103,7 +103,7 @@ fn join_qp_soft_breaks(lines: Vec<String>) -> Vec<String> {
         if continuing && let Some(last) = out.last_mut() {
             let _ = last.pop(); // the soft-break '='
             last.push_str(&line);
-            continuing = last.ends_with('=') && last.len() < crate::text::MAX_LINE_CHARS;
+            continuing = last.ends_with('=') && last.len() < crate::text::MAX_LINE_BYTES;
             continue;
         }
         let is_qp = line
@@ -309,7 +309,41 @@ fn set_once(field: &mut String, v: String) {
 }
 
 fn contact_from_lines(lines: &[ContentLine]) -> Contact {
+    contact_and_fields(lines).0
+}
+
+/// The Contact field each line of a card feeds, as [`contact_from_lines`] reads it (`None`: a line the
+/// reader leaves alone, such as an unknown property, a fourth e-mail address or a second web page). A field
+/// read from several names (spouse from `X-EVOLUTION-SPOUSE`, `RELATED;TYPE=spouse`, `X-ABRELATEDNAMES`…)
+/// names every line it may come from, so replacing the field replaces all of them; in lists (e-mail
+/// addresses, phones, addresses, certificates) and in the web page and IM address, only the lines read
+/// (and, for the IM address, other forms of the same account) belong to the field. Used to merge an edit
+/// into a server's card ([`crate::keep`]).
+pub(crate) fn line_fields(lines: &[ContentLine]) -> Vec<Option<&'static str>> {
+    contact_and_fields(lines).1
+}
+
+/// Same account in two forms (`skype:pat` and `pat`): the value without a URI scheme, compared without case.
+fn same_account(a: &str, b: &str) -> bool {
+    let bare = |v: &str| -> String {
+        let v = v.trim();
+        let v = match v.split_once(':') {
+            Some((scheme, rest))
+                if !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric()) =>
+            {
+                rest
+            }
+            _ => v,
+        };
+        v.trim().to_lowercase()
+    };
+    let (a, b) = (bare(a), bare(b));
+    !a.is_empty() && a == b
+}
+
+fn contact_and_fields(lines: &[ContentLine]) -> (Contact, Vec<Option<&'static str>>) {
     let mut c = Contact::default();
+    let mut fields: Vec<Option<&'static str>> = Vec::with_capacity(lines.len());
     // Apple-style grouped labels: group → label.
     let labels: Vec<(&str, String)> = lines
         .iter()
@@ -328,7 +362,7 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
     let mut is_org = false;
     let mut categories = CategoryList::default();
     for cl in lines {
-        match cl.name.as_str() {
+        let field: Option<&'static str> = match cl.name.as_str() {
             "N" => {
                 let p = components(cl, 5);
                 let get = |i: usize| p.get(i).cloned().unwrap_or_default();
@@ -338,74 +372,118 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
                 c.title = get(3);
                 c.suffix = get(4);
                 have_n = p.iter().any(|s| !s.is_empty());
+                Some("N")
             }
-            "FN" => fn_value = text_value(cl),
+            "FN" => {
+                fn_value = text_value(cl);
+                Some("FN")
+            }
             "ORG" => {
                 let p = components(cl, 2);
                 c.company = p.first().cloned().unwrap_or_default();
                 c.department =
                     p.iter().skip(1).filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(", ");
+                Some("ORG")
             }
-            "TITLE" => c.job_title = text_value(cl),
+            "TITLE" => {
+                c.job_title = text_value(cl);
+                Some("TITLE")
+            }
             "ROLE" | "X-PROFESSION" | "X-KADDRESSBOOK-X-PROFESSION" => {
-                set_once(&mut c.profession, text_value(cl))
+                set_once(&mut c.profession, text_value(cl));
+                Some("profession")
             }
-            "NICKNAME" => set_once(&mut c.nickname, text_value(cl)),
+            "NICKNAME" => {
+                set_once(&mut c.nickname, text_value(cl));
+                Some("nickname")
+            }
             "X-MAILCRAFT-OFFICE"
             | "X-OFFICE"
             | "X-MS-OFFICE"
             | "X-EVOLUTION-OFFICE"
             | "X-KADDRESSBOOK-X-OFFICE" => {
                 set_once(&mut c.office, text_value(cl));
+                Some("office")
             }
             "X-MAILCRAFT-MANAGER"
             | "X-MANAGER"
             | "X-MS-MANAGER"
             | "X-EVOLUTION-MANAGER"
-            | "X-KADDRESSBOOK-X-MANAGERSNAME" => set_once(&mut c.manager, text_value(cl)),
+            | "X-KADDRESSBOOK-X-MANAGERSNAME" => {
+                set_once(&mut c.manager, text_value(cl));
+                Some("manager")
+            }
             "X-MAILCRAFT-ASSISTANT"
             | "X-ASSISTANT"
             | "X-MS-ASSISTANT"
             | "X-EVOLUTION-ASSISTANT"
-            | "X-KADDRESSBOOK-X-ASSISTANTSNAME" => set_once(&mut c.assistant, text_value(cl)),
+            | "X-KADDRESSBOOK-X-ASSISTANTSNAME" => {
+                set_once(&mut c.assistant, text_value(cl));
+                Some("assistant")
+            }
             "X-MAILCRAFT-SPOUSE"
             | "X-SPOUSE"
             | "X-MS-SPOUSE"
             | "X-EVOLUTION-SPOUSE"
-            | "X-KADDRESSBOOK-X-SPOUSESNAME" => set_once(&mut c.spouse, text_value(cl)),
+            | "X-KADDRESSBOOK-X-SPOUSESNAME" => {
+                set_once(&mut c.spouse, text_value(cl));
+                Some("spouse")
+            }
+            // A spouse by reference (a URI) is not shown, but it is still the spouse: a new one replaces it.
             "RELATED" if cl.has_type("spouse") => {
                 let v = text_value(cl);
                 let text = cl.param("VALUE").is_some_and(|t| t.eq_ignore_ascii_case("text")) || !is_uri(&v);
                 if text {
                     set_once(&mut c.spouse, v);
                 }
+                Some("spouse")
             }
             "X-ABRELATEDNAMES" => match label_of(cl) {
-                Some("spouse") => set_once(&mut c.spouse, text_value(cl)),
-                Some("manager") => set_once(&mut c.manager, text_value(cl)),
-                Some("assistant") => set_once(&mut c.assistant, text_value(cl)),
-                _ => {}
+                Some("spouse") => {
+                    set_once(&mut c.spouse, text_value(cl));
+                    Some("spouse")
+                }
+                Some("manager") => {
+                    set_once(&mut c.manager, text_value(cl));
+                    Some("manager")
+                }
+                Some("assistant") => {
+                    set_once(&mut c.assistant, text_value(cl));
+                    Some("assistant")
+                }
+                _ => None,
             },
             "ANNIVERSARY"
             | "X-ANNIVERSARY"
             | "X-MS-ANNIVERSARY"
             | "X-EVOLUTION-ANNIVERSARY"
-            | "X-KADDRESSBOOK-X-ANNIVERSARY"
-                if c.anniversary.is_none() =>
-            {
-                c.anniversary = birthday(&text_value(cl));
-            }
-            "X-ABDATE" if c.anniversary.is_none() && label_of(cl) == Some("anniversary") => {
-                c.anniversary = birthday(&text_value(cl));
-            }
-            "PHOTO" if c.picture.is_none() => c.picture = photo(cl),
-            "KEY" if c.certificates.len() < MAX_KEYS => {
-                if let Some(cert) = certificate(cl)
-                    && !c.certificates.contains(&cert)
-                {
-                    c.certificates.push(cert);
+            | "X-KADDRESSBOOK-X-ANNIVERSARY" => {
+                if c.anniversary.is_none() {
+                    c.anniversary = birthday(&text_value(cl));
                 }
+                Some("anniversary")
             }
+            "X-ABDATE" if label_of(cl) == Some("anniversary") => {
+                if c.anniversary.is_none() {
+                    c.anniversary = birthday(&text_value(cl));
+                }
+                Some("anniversary")
+            }
+            "PHOTO" => {
+                if c.picture.is_none() {
+                    c.picture = photo(cl);
+                }
+                Some("PHOTO")
+            }
+            "KEY" if c.certificates.len() < MAX_KEYS => match certificate(cl) {
+                Some(cert) => {
+                    if !c.certificates.contains(&cert) {
+                        c.certificates.push(cert);
+                    }
+                    Some("KEY")
+                }
+                None => None,
+            },
             "EMAIL" => {
                 let v = text_value(cl);
                 let v = strip_scheme(&v, "mailto:").trim().to_owned();
@@ -415,6 +493,9 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
                     } else {
                         c.emails.push(v);
                     }
+                    Some("EMAIL")
+                } else {
+                    None
                 }
             }
             "TEL" => {
@@ -422,6 +503,9 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
                 let v = strip_scheme(&v, "tel:").trim().to_owned();
                 if !v.is_empty() && c.phones.len() < crate::csv::MAX_PHONES {
                     c.phones.push((phone_kind(cl), v));
+                    Some("TEL")
+                } else {
+                    None
                 }
             }
             "ADR" => {
@@ -444,16 +528,31 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
                     && a.country.is_empty();
                 if !empty && c.addresses.len() < 16 {
                     c.addresses.push(a);
+                    Some("ADR")
+                } else {
+                    None
                 }
             }
-            "URL" if c.web_page.is_empty() => c.web_page = text_value(cl),
-            "IMPP" | "X-AIM" | "X-ICQ" | "X-JABBER" | "X-MSN" | "X-YAHOO" | "X-SKYPE" | "X-GOOGLE-TALK"
-            | "X-GADUGADU" | "X-QQ"
-                if c.im_address.is_empty() =>
-            {
-                c.im_address = text_value(cl);
+            "URL" if c.web_page.is_empty() => {
+                c.web_page = text_value(cl);
+                Some("URL")
             }
-            "BDAY" => c.birthday = birthday(&text_value(cl)),
+            "IMPP" | "X-AIM" | "X-ICQ" | "X-JABBER" | "X-MSN" | "X-YAHOO" | "X-SKYPE" | "X-GOOGLE-TALK"
+            | "X-GADUGADU" | "X-QQ" => {
+                let v = text_value(cl);
+                if c.im_address.is_empty() {
+                    c.im_address = v;
+                    Some("IM")
+                } else if same_account(&c.im_address, &v) {
+                    Some("IM")
+                } else {
+                    None
+                }
+            }
+            "BDAY" => {
+                c.birthday = birthday(&text_value(cl));
+                Some("BDAY")
+            }
             "NOTE" => {
                 let v = unescape(&raw_value(cl));
                 if c.notes.is_empty() {
@@ -462,22 +561,37 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
                     c.notes.push('\n');
                     c.notes.push_str(&v);
                 }
+                Some("NOTE")
             }
-            "CATEGORIES" if !categories.is_full() => {
-                for cat in split_unescaped(&raw_value(cl), ',', MAX_CATEGORIES) {
-                    categories.add(&cat);
+            "CATEGORIES" => {
+                if !categories.is_full() {
+                    for cat in split_unescaped(&raw_value(cl), ',', MAX_CATEGORIES) {
+                        categories.add(&cat);
+                    }
                 }
+                Some("CATEGORIES")
             }
-            "X-MAILCRAFT-FILE-AS" => file_as = Some(text_value(cl)),
+            "X-MAILCRAFT-FILE-AS" => {
+                file_as = Some(text_value(cl));
+                Some("file-as")
+            }
             // RFC 2426 CLASS: PRIVATE and CONFIDENTIAL cards are private contacts.
             "CLASS" => {
                 let v = text_value(cl);
                 c.private = v.eq_ignore_ascii_case("private") || v.eq_ignore_ascii_case("confidential");
+                Some("CLASS")
             }
-            "KIND" => is_org = text_value(cl).eq_ignore_ascii_case("org"),
-            "X-ABSHOWAS" => is_org = text_value(cl).eq_ignore_ascii_case("company"),
-            _ => {}
-        }
+            "KIND" => {
+                is_org = text_value(cl).eq_ignore_ascii_case("org");
+                Some("kind")
+            }
+            "X-ABSHOWAS" => {
+                is_org = text_value(cl).eq_ignore_ascii_case("company");
+                Some("kind")
+            }
+            _ => None,
+        };
+        fields.push(field);
     }
     c.categories = categories.into_vec();
     // FN stands for the organisation when it repeats ORG, and for nobody when it repeats an address (the
@@ -503,7 +617,7 @@ fn contact_from_lines(lines: &[ContentLine]) -> Contact {
         }
     }
     c.file_as = file_as.filter(|f| !f.is_empty()).unwrap_or_else(|| crate::csv::default_file_as(&c));
-    c
+    (c, fields)
 }
 
 fn line(name: &str, params: Vec<(&str, String)>, value: String) -> ContentLine {
