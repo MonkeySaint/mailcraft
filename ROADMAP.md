@@ -5,7 +5,7 @@ workflow. This file tracks what is done, what is next, and an honest estimate of
 Outlook. It is updated with every commit.
 
 Status: **pre-alpha** (2026-10-21). Repository: https://github.com/MonkeySaint/mailcraft. Tags: v0.1.0 (commit 23,
-unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release), v0.2.0 (after round 5).
+unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release), v0.2.0 (after round 5), v0.3.0 (after round 7).
 
 ## Milestones
 
@@ -94,8 +94,8 @@ Two numbers, kept separate on purpose:
 5. Mail: Post in This Folder is plain text; Quick Print opens the Print page on Windows; voting buttons only
    work between MailCraft users.
 
-The full audit (per-row classification) is regenerated before each release; the commits after 14 and the
-milestones after v0.3.0 work down this list until every area is ≥ 95 %.
+The full audit (per-row classification) is regenerated before each release. Every area is now at 95 % or more;
+the rounds after v0.3.0 work down this list and check the audit with a second, skeptical pass before v1.0.0.
 
 ## Needs the owner
 
