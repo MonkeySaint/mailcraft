@@ -486,6 +486,39 @@ pub fn inline_drawing_id(src: &str) -> Option<u32> {
     src.strip_prefix(INLINE_DRAWING_PREFIX)?.parse().ok()
 }
 
+/// Edit Points: how a point of a freeform joins the two segments that meet there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PointKind {
+    /// The two handles move on their own (a sharp turn is allowed).
+    #[default]
+    Corner,
+    /// The handles stay on one line and equally long: the outline runs through without a kink.
+    Smooth,
+    /// The handles stay on one line but keep their own lengths.
+    Straight,
+}
+
+/// The curve handles of one point of a freeform ([`Drawing::handles`]): the control points of the cubic
+/// Bezier segments arriving at (`before`) and leaving (`after`) the point, as fractions of the box (they may
+/// lie outside it). A segment is curved when either of its ends has a handle, straight otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PointHandles {
+    pub kind: PointKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<(f32, f32)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<(f32, f32)>,
+}
+
+impl PointHandles {
+    /// A corner point with straight segments on both sides.
+    pub fn is_plain(&self) -> bool {
+        self.kind == PointKind::Corner && self.before.is_none() && self.after.is_none()
+    }
+}
+
 /// How the body text flows around a floating drawing (Wrap Text). Behind Text is
 /// [`Drawing::behind_text`] with the default [`WrapStyle::Front`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,6 +741,10 @@ pub struct Drawing {
     /// Freeform / scribble outline, as fractions (0..=1) of the box.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub points: Vec<(f32, f32)>,
+    /// Edit Points: point types and curve handles, one per entry of [`Drawing::points`] (empty: every point
+    /// is a corner with straight segments).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub handles: Vec<PointHandles>,
     /// Drawn behind the body text instead of in front of it.
     #[serde(skip_serializing_if = "is_false")]
     pub behind_text: bool,
@@ -820,6 +857,7 @@ impl Default for Drawing {
             word_art: String::new(),
             alt: String::new(),
             points: Vec::new(),
+            handles: Vec::new(),
             behind_text: false,
             canvas: None,
             gradient: String::new(),

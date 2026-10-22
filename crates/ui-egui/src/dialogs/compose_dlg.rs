@@ -492,21 +492,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
         ),
         "insertLink" => super::link_dlg::show(ctx, app, d),
         "sortText" => sort_text(ctx, app, d),
-        "bookmark" => {
-            let marks: Vec<String> =
-                d.arr("bookmarks").iter().filter_map(Value::as_str).map(str::to_owned).collect();
-            let mut fields = vec![
-                f("name", "Bookmark name:", Kind::Text),
-                f("action", "Action:", combo(&["add", "goTo", "delete"])),
-            ];
-            if !marks.is_empty() {
-                fields.push(f("n", "", Kind::Note(format!("Existing: {}", marks.join(", ")))));
-            }
-            run_form(ctx, app, d, Form::new("Bookmark", fields), |app, v| {
-                cmd(app, "insert.bookmark", with(json!({"name": v.s("name"), "action": v.s("action")})))
-                    .map(|_| None)
-            })
-        }
+        "bookmark" => super::bookmark_dlg::show(ctx, app, d),
         "dateTime" => run_form(
             ctx,
             app,

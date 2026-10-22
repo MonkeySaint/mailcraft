@@ -370,6 +370,8 @@ struct MenuAt {
     suggestions: Vec<String>,
     link: Option<String>,
     in_table: bool,
+    /// A point or segment of the drawing whose points are being edited.
+    points: Option<super::drawing::PointMenu>,
 }
 
 /// A layout of `doc` with the options the body painter uses (for moves right after an edit in the same frame).
@@ -1556,6 +1558,8 @@ enum Pick {
     CopyLink(String),
     RemoveLink,
     Table(&'static str),
+    /// An Edit Points change (`drawing.editPoints` params).
+    Points(Value),
 }
 
 /// Context-menu target at `pos`: the spelling issue (with suggestions), the link and whether it is in a table.
@@ -1575,12 +1579,19 @@ fn menu_target(host: &dyn EditorHost, cid: u64, pos: &DocPos, link: Option<Strin
         suggestions = host.suggest(cid, &i.word);
     }
     suggestions.truncate(MENU_SUGGESTIONS);
-    MenuAt { issue, suggestions, link, in_table: c.cell_at_caret().is_some() }
+    MenuAt { issue, suggestions, link, in_table: c.cell_at_caret().is_some(), points: None }
 }
 
 fn menu_ui(ui: &mut Ui, at: &MenuAt, has_selection: bool) -> Option<Pick> {
     let mut pick = None;
     ui.set_min_width(200.0);
+    if let Some(points) = &at.points {
+        pick = super::drawing::point_menu_ui(ui, points).map(Pick::Points);
+        if pick.is_some() {
+            ui.close();
+        }
+        return pick;
+    }
     if let Some(issue) = &at.issue {
         // What the checker says (grammar and refinements; a misspelling needs no words).
         if !issue.message.is_empty() {
@@ -1687,6 +1698,17 @@ fn apply_pick(ctx: &egui::Context, host: &mut dyn EditorHost, cid: u64, pick: Pi
         }
         Pick::Table(action) => {
             host.run("compose.tableEdit", json!({"compose": cid, "action": action}));
+        }
+        Pick::Points(mut p) => {
+            // Adding, deleting or opening renumbers the points: the picked one is forgotten.
+            let renumbers = ["insert", "delete", "path"].iter().any(|k| p.get(k).is_some());
+            if let Some(o) = p.as_object_mut() {
+                o.insert("compose".into(), json!(cid));
+            }
+            host.run("drawing.editPoints", p);
+            if renumbers {
+                super::drawing::forget_point(ctx, cid);
+            }
         }
     }
     ctx.memory_mut(|m| m.request_focus(editor_id(cid)));
@@ -1968,6 +1990,14 @@ pub(crate) fn body_editor_in(
     // Right-click: the caret moves to the click unless it falls inside the selection; the menu works on that
     // spot (spelling issue, link, table).
     if resp.secondary_clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+        && let Some(points) =
+            super::drawing::point_menu_at(&ctx, &*host, cid, p, origin, zoom, &shown_drawings)
+    {
+        // Edit Points: the menu works on the point or segment under the pointer; the caret stays.
+        resp.request_focus();
+        *menu = Some(MenuAt { points: Some(points), ..MenuAt::default() });
+    } else if resp.secondary_clicked()
         && let Some(p) = resp.interact_pointer_pos()
     {
         let at = hit(p);

@@ -473,3 +473,46 @@ fn imap_quota_root_reports_storage() {
     c.logout().unwrap();
     acc.disconnect();
 }
+
+/// Issue #16: mail that reached the Inbox after its last sync but before IDLE began (while the run synced
+/// other folders, or between reporting push and sending IDLE) was taken in by the SELECT before IDLE, so
+/// IDLE had nothing to report and the message waited for the next scheduled check.
+#[test]
+fn idle_once_reports_mail_that_arrived_between_sync_and_idle() {
+    let s = servers(Config::default());
+    s.create_mailbox(USER, "Projects", None).unwrap();
+    s.seed_message(USER, "INBOX", &msg("old", "already here"), &[]).unwrap();
+    let mut acc = account(&s, Security::Tls);
+    let d = acc.sync_folder("INBOX", &FolderState::default()).unwrap();
+    assert_eq!(d.new.len(), 1);
+    // The run goes on with another folder; meanwhile new mail arrives in the Inbox.
+    acc.sync_folder("Projects", &FolderState::default()).unwrap();
+    s.seed_message(USER, "INBOX", &msg("in-the-gap", "arrived before IDLE"), &[]).unwrap();
+    let t = std::time::Instant::now();
+    assert!(acc.idle_once("INBOX", Duration::from_secs(3), None).unwrap(), "mail in the gap was missed");
+    assert!(t.elapsed() < Duration::from_secs(2), "reported at once, not after the wait");
+    // Reported once: the next IDLE waits for real news instead of repeating it in a busy loop.
+    assert!(!acc.idle_once("INBOX", Duration::from_millis(800), None).unwrap());
+    // The sync that follows picks the message up, and push is back to plain IDLE.
+    let d2 = acc.sync_folder("INBOX", &d.state).unwrap();
+    assert_eq!(d2.new.len(), 1);
+    assert!(!acc.idle_once("INBOX", Duration::from_millis(800), None).unwrap());
+    // Mail during that IDLE is still reported the usual way.
+    s.seed_message(USER, "INBOX", &msg("later", "pushed"), &[]).unwrap();
+    assert!(acc.idle_once("INBOX", Duration::from_secs(10), None).unwrap());
+}
+
+/// Issue #16, second window: the Inbox stays selected after its sync and a later command of the same run
+/// takes in the server's EXISTS for new mail; IDLE must still report it.
+#[test]
+fn idle_once_reports_mail_announced_during_the_run() {
+    let s = servers(Config::default());
+    s.seed_message(USER, "INBOX", &msg("first", "one"), &[]).unwrap();
+    let mut acc = account(&s, Security::Tls);
+    let d = acc.sync_folder("INBOX", &FolderState::default()).unwrap();
+    let uid = d.new.first().unwrap().uid;
+    s.seed_message(USER, "INBOX", &msg("second", "two"), &[]).unwrap();
+    // Still on the Inbox: this fetch hears about the new message as an untagged EXISTS.
+    assert_eq!(acc.fetch_messages("INBOX", &[uid]).unwrap().len(), 1);
+    assert!(acc.idle_once("INBOX", Duration::from_secs(3), None).unwrap(), "announced mail was missed");
+}

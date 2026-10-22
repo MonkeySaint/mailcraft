@@ -405,6 +405,8 @@ fn include_older_results_leaves_new_mail_to_the_sync() {
 
     let mut s = session();
     let a = add_imap(&mut s, &srv, json!({"downloadMonths": 3}));
+    // Push would sync the new mail below at once (issue #16): this test is about the search alone.
+    run(&mut s, "accounts.options", json!({"account": a.0, "push": false}));
     sync(&mut s);
     let ib = inbox(&s, a);
     assert!(find(&s, ib, "Fresh notes").is_some() && find(&s, ib, "Old budget").is_none());

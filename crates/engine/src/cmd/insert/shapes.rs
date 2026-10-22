@@ -465,6 +465,29 @@ fn curved_band(cx: f32, cy: f32, rx: f32, ry: f32, t: f32, a0: f32, a1: f32) -> 
     out
 }
 
+/// Geometry of drawing `d` drawn as shape `id`: a freeform, scribble or curve whose points have curve
+/// handles (Edit Points) follows its curved segments; anything else is [`geometry`].
+pub fn drawing_geometry(id: &str, d: &mailcraft_model::rich::Drawing) -> Option<Geometry> {
+    let freeform = matches!(id, "freeform" | "scribble" | "curve");
+    if freeform && d.points.len() >= 2 && d.handles.iter().any(|h| !h.is_plain()) {
+        let w = if d.w.is_finite() { d.w.max(1.0) } else { 1.0 };
+        let h = if d.h.is_finite() { d.h.max(1.0) } else { 1.0 };
+        let closed = id == "freeform";
+        let nodes = super::freeform::nodes_from(&d.points, &d.handles, 0.0, 0.0, w, h);
+        let outline = super::freeform::flatten(&nodes, closed);
+        if outline.len() >= 2 {
+            let mut g = Geometry::default();
+            if closed {
+                g.fill.push(outline);
+            } else {
+                g.lines.push(outline);
+            }
+            return Some(g);
+        }
+    }
+    geometry(id, d.w, d.h, &d.points)
+}
+
 /// Geometry of shape `id` in a `w`×`h` box; `points` are the freeform / line points (fractions of the
 /// box) when the shape was drawn by hand. `None` for an unknown id.
 pub fn geometry(id: &str, w: f32, h: f32, points: &[P]) -> Option<Geometry> {

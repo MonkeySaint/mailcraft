@@ -87,8 +87,30 @@ fn finite(v: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
     if v.is_finite() { v.clamp(lo, hi) } else { fallback }
 }
 
+/// Curve handles: one per point at most, finite and not far outside the box; none when all are plain.
+fn sanitize_handles(d: &mut Drawing) {
+    use super::freeform::HANDLE_REACH;
+    use mailcraft_model::rich::PointHandles;
+    d.handles.truncate(d.points.len());
+    let fix = |p: Option<(f32, f32)>| {
+        p.filter(|(x, y)| x.is_finite() && y.is_finite()).map(|(x, y)| {
+            (x.clamp(-HANDLE_REACH, 1.0 + HANDLE_REACH), y.clamp(-HANDLE_REACH, 1.0 + HANDLE_REACH))
+        })
+    };
+    for h in &mut d.handles {
+        h.before = fix(h.before);
+        h.after = fix(h.after);
+    }
+    if !d.handles.is_empty() && d.handles.len() < d.points.len() {
+        d.handles.resize(d.points.len(), PointHandles::default());
+    }
+    if d.handles.iter().all(PointHandles::is_plain) {
+        d.handles.clear();
+    }
+}
+
 /// Keeps a drawing's numbers in range (hostile params, old saves): size, position, rotation, outline,
-/// text length and points.
+/// text length, points and their curve handles.
 pub fn sanitize(d: &mut Drawing) {
     d.w = finite(d.w, MIN_DRAWING_SIDE, MAX_DRAWING_SIDE, 160.0);
     d.h = finite(d.h, MIN_DRAWING_SIDE, MAX_DRAWING_SIDE, 100.0);
@@ -100,10 +122,15 @@ pub fn sanitize(d: &mut Drawing) {
         d.text = d.text.chars().take(MAX_DRAWING_TEXT).collect();
     }
     d.points.truncate(MAX_POINTS);
+    if d.points.iter().any(|(x, y)| !(x.is_finite() && y.is_finite())) {
+        // Handles belong to their points: once a point is dropped they no longer line up.
+        d.handles.clear();
+    }
     d.points.retain(|(x, y)| x.is_finite() && y.is_finite());
     for p in &mut d.points {
         *p = (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0));
     }
+    sanitize_handles(d);
     if let Some(s) = d.text_style.size_pt.as_mut() {
         *s = finite(*s, 1.0, 400.0, 11.0);
     }
@@ -644,7 +671,7 @@ fn dash_stripes(dash: &str, x: i64, y: i64) -> bool {
 /// A shape, text box or canvas drawn: the picture and its corner relative to the drawing's (px).
 fn shape_img(d: &Drawing, theme: &ResolvedTheme, with_text: bool) -> Option<(Img, f32, f32)> {
     let shape = if d.kind == DrawingKind::TextBox { "textBox" } else { d.shape.as_str() };
-    let mut g: Geometry = shapes::geometry(shape, d.w, d.h, &d.points)?;
+    let mut g: Geometry = shapes::drawing_geometry(shape, d)?;
     if d.flip_h || d.flip_v {
         flip_geometry(&mut g, d.w, d.h, d.flip_h, d.flip_v);
     }

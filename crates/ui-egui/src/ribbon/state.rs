@@ -431,6 +431,8 @@ fn compose_on(c: &mailcraft_engine::compose::ComposeState, name: &str, arg: &str
         "gridlines" => c.editor.show_gridlines,
         "selobj" => c.editor.select_objects,
         "selpane" => c.editor.selection_pane,
+        // Some text selected: Save Selection to Quick Tables / Equation Gallery save no drawing.
+        "textsel" => c.has_selection(),
         "hc" => c.editor.high_contrast_only,
         "fhc" => c.editor.font_high_contrast_only,
         "shc" => c.editor.shading_high_contrast_only,
@@ -2046,6 +2048,36 @@ mod compose_state_tests {
         let few = dyn_items(&app, s, "shadingColors");
         assert!(few.len() < all && !few.is_empty(), "{} of {all}", few.len());
         assert!(dyn_items(&app, s, "shadingThemeShades:accent1").len() <= 6);
+    }
+
+    /// Release check: with only a drawing selected, Save Selection to Quick Tables / Equation Gallery showed
+    /// enabled and then refused; they save text only, so they need selected text.
+    #[test]
+    fn save_selection_to_text_only_galleries_needs_selected_text() {
+        let (mut app, cid) = app_with(mailcraft_model::Doc::from_plain_text("Some words"));
+        let s = Surface::Compose(cid);
+        let save_item = |app: &App, menu: &str| -> Option<Option<&'static str>> {
+            expand_items(app, s, &Mem::default(), crate::ribbon::defs::defs().menu(menu).unwrap())
+                .into_iter()
+                .find_map(|r| match r {
+                    Resolved::Cmd { label, disabled, .. } if label.starts_with("Save Selection") => {
+                        Some(disabled)
+                    }
+                    _ => None,
+                })
+        };
+        app.run("insert.textBox", json!({"compose": cid, "text": "Box"}));
+        assert!(app.s.composes[&cid].selection.is_collapsed());
+        for menu in ["textBox", "quickParts", "autoText"] {
+            assert_eq!(save_item(&app, menu), Some(None), "{menu}: a drawing can be saved there");
+        }
+        for menu in ["quickTables", "equation"] {
+            assert!(matches!(save_item(&app, menu), Some(Some(_))), "{menu}: greyed out with only a drawing");
+        }
+        app.run("compose.select", json!({"compose": cid, "all": true}));
+        for menu in ["quickTables", "equation"] {
+            assert_eq!(save_item(&app, menu), Some(None), "{menu}: enabled with text selected");
+        }
     }
 
     #[test]

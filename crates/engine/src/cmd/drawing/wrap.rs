@@ -103,7 +103,7 @@ pub(crate) fn outline_points(d: &Drawing) -> Vec<(f32, f32)> {
     if d.kind != DrawingKind::Shape {
         return boxed;
     }
-    let Some(g) = shapes::geometry(&d.shape, d.w, d.h, &d.points) else { return boxed };
+    let Some(g) = shapes::drawing_geometry(&d.shape, d) else { return boxed };
     let path = g
         .fill
         .iter()

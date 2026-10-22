@@ -256,3 +256,44 @@ fn replies_leave_quoted_anchors_in_the_body() {
     let last = crate::compose::MAX_BOOKMARKS + 4;
     assert!(sent.contains(&format!("name=\"b{last}\"")), "an anchor past the cap was dropped");
 }
+
+/// Release check: the Bookmark dialog had no list to pick from, no sort and no hidden bookmarks; the
+/// command now gives it every bookmark with its place, and lists them sorted on request.
+#[test]
+fn bookmarks_list_by_name_or_location_with_hidden_ones_on_request() {
+    let (mut s, _id) = setup("First line\nSecond line\nThird line");
+    select(&mut s, (&[2], 0), (&[2], 0));
+    s.run("insert.bookmark", &json!({"name": "apple"})).unwrap();
+    select(&mut s, (&[0], 3), (&[0], 3));
+    s.run("insert.bookmark", &json!({"name": "Zebra"})).unwrap();
+    select(&mut s, (&[1], 0), (&[1], 0));
+    s.run("insert.bookmark", &json!({"name": "mango"})).unwrap();
+    s.run("insert.link", &json!({"top": true, "text": "up"})).unwrap();
+    let names = |v: &serde_json::Value| -> Vec<String> {
+        v["bookmarks"].as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap().to_owned()).collect()
+    };
+    // By name (ignoring case), hidden ones left out.
+    let r = s.run("insert.bookmark", &json!({"action": "list"})).unwrap();
+    assert_eq!(names(&r), ["apple", "mango", "Zebra"]);
+    // By place in the message, top first.
+    let r = s.run("insert.bookmark", &json!({"action": "list", "sort": "location"})).unwrap();
+    assert_eq!(names(&r), ["Zebra", "mango", "apple"]);
+    // Hidden bookmarks too: the one the top link made, at the very start.
+    let r = s.run("insert.bookmark", &json!({"action": "list", "sort": "location", "hidden": true})).unwrap();
+    assert_eq!(names(&r), ["_top", "Zebra", "mango", "apple"]);
+    assert_eq!(r["bookmarks"][0]["hidden"], true);
+    assert_eq!(r["bookmarks"][1]["location"], 2);
+    assert!(s.run("insert.bookmark", &json!({"action": "list", "sort": "size"})).is_err());
+    // The dialog gets them all with their places, plus the visible names.
+    assert_eq!(s.run("insert.bookmark", &json!({})).unwrap()["dialog"], "bookmark");
+    let d = last_dialog(&s);
+    assert_eq!(d["entries"].as_array().unwrap().len(), 4);
+    assert_eq!(d["bookmarks"].as_array().unwrap().len(), 3);
+    // A hidden bookmark can be gone to and deleted by name, but not added.
+    s.run("insert.bookmark", &json!({"name": "_top", "action": "goTo"})).unwrap();
+    assert!(s.run("insert.bookmark", &json!({"name": "_mine"})).is_err());
+    assert_eq!(
+        s.run("insert.bookmark", &json!({"name": "_top", "action": "delete"})).unwrap()["deleted"],
+        true
+    );
+}

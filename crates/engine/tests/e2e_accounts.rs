@@ -137,6 +137,23 @@ fn idle_push_delivers_new_mail_without_send_receive() {
     poll_until(&mut s, "push off", |s| s.push_state(a).0 == PushMode::Off);
 }
 
+/// Issue #16: mail that reaches the Inbox after the run synced it but before push starts IDLE (here: right
+/// after the run, before the worker even switches to push) arrives by push, not at the next scheduled check.
+#[test]
+fn push_delivers_mail_that_arrived_before_idle_started() {
+    let srv = servers();
+    let mut s = session();
+    let a = add_imap(&mut s, &srv, json!({}));
+    sync(&mut s);
+    srv.seed_message(ALICE, "INBOX", &message("In the gap", "gap", "between sync and IDLE"), &[]).unwrap();
+    let ib = inbox(&s, a);
+    poll_until(&mut s, "mail from the gap", |s| find(s, ib, "In the gap").is_some());
+    assert_eq!(s.push_state(a).0, PushMode::Idle);
+    // And push keeps working afterwards.
+    srv.seed_message(ALICE, "INBOX", &message("After the gap", "gap2", "pushed"), &[]).unwrap();
+    poll_until(&mut s, "the next pushed message", |s| find(s, ib, "After the gap").is_some());
+}
+
 #[test]
 fn pop3_receive_keeps_server_copies_then_removes_them() {
     let srv = servers();

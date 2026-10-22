@@ -521,7 +521,7 @@ menu quickTables
 dyn | blocks:quickTables | insert.table | {"mode":"quick","name":"$name"}
 sep
 item | Quick Tables... | table | insert.table | {"mode":"quick"} | Q
-item | Save Selection to Quick Tables Gallery... | save | insert.saveToGallery | {"gallery":"quickTables"} | S
+item | Save Selection to Quick Tables Gallery... | save | insert.saveToGallery | {"gallery":"quickTables"} | S | en=textsel
 
 menu pictures
 item | This Device... | picture | insert.picture | | D
@@ -595,7 +595,7 @@ menu equation
 dyn | blocks:equations | insert.quickPart | {"gallery":"equations","name":"$name"}
 sep
 item | Insert New Equation | plus | insert.equation | | I
-item | Save Selection to Equation Gallery... | save | insert.saveToGallery | {"gallery":"equations"} | S
+item | Save Selection to Equation Gallery... | save | insert.saveToGallery | {"gallery":"equations"} | S | en=textsel
 
 menu symbol
 dyn | recentSymbols | insert.symbol | {"char":"$name"}

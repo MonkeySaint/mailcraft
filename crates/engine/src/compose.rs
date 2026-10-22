@@ -202,7 +202,14 @@ pub struct BuildingBlock {
     pub category: String,
     #[serde(default)]
     pub description: String,
+    /// Floating drawings saved with the entry (Save Selection to Text Box Gallery with a text box selected),
+    /// placed relative to the top left corner of the box around them; inserted back as drawings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drawings: Vec<mailcraft_model::rich::Drawing>,
 }
+
+/// Most drawings one saved building block keeps.
+pub const MAX_BLOCK_DRAWINGS: usize = 64;
 
 /// Most columns Convert Text to Table makes.
 pub const MAX_TEXT_TABLE_COLS: usize = 63;

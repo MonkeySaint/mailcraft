@@ -29,10 +29,11 @@ use serde_json::json;
 
 use mailcraft_engine::cmd::drawing as engine_cmd;
 use mailcraft_engine::cmd::insert::drawing::{self as engine_drawing, Raster};
+use mailcraft_engine::cmd::insert::freeform::{self, Node};
 use mailcraft_engine::cmd::insert::shapes;
 use mailcraft_engine::compose::{ComposeState, DocPos};
 use mailcraft_layout::{DisplayItem, Layout};
-use mailcraft_model::rich::{Align, Drawing, DrawingKind, WrapStyle};
+use mailcraft_model::rich::{Align, Drawing, DrawingKind, PointKind, WrapStyle};
 
 use super::editor::EditorHost;
 
@@ -57,6 +58,8 @@ enum DragKind {
     Resize(usize),
     /// An Edit Points point.
     Point(usize),
+    /// The curve handle of an Edit Points point: (point, true for the one after it).
+    Handle(usize, bool),
 }
 
 #[derive(Clone, Debug)]
@@ -228,9 +231,189 @@ fn selection(c: &ComposeState, shown: &[Drawing]) -> Vec<u32> {
     c.selected_drawings().into_iter().filter(|id| shown.iter().any(|d| d.id == *id)).collect()
 }
 
-/// The points of a drawing being point-edited, on screen.
-fn point_handles(d: &Drawing, b: [f32; 4], origin: Pos2, zoom: f32) -> Vec<Pos2> {
-    d.points.iter().map(|(fx, fy)| origin + vec2(b[0] + fx * b[2], b[1] + fy * b[3]) * zoom).collect()
+/// Lines one curved segment is drawn with on screen.
+const CURVE_STEPS: usize = 24;
+
+/// A drawing being point-edited, on screen: its points with their curve handles, and each segment as a
+/// polyline (segment `i` runs from point `i` to the next).
+#[derive(Clone, Debug, Default)]
+struct PointView {
+    id: u32,
+    nodes: Vec<Node>,
+    segs: Vec<Vec<Pos2>>,
+    closed: bool,
+}
+
+impl PointView {
+    fn points(&self) -> Vec<Pos2> {
+        self.nodes.iter().map(|n| pos2(n.at.0, n.at.1)).collect()
+    }
+
+    /// The curve handle of point `point` under `p`: (point, true for the one after it).
+    fn handle_at(&self, point: usize, p: Pos2) -> Option<(usize, bool)> {
+        let n = self.nodes.get(point)?;
+        let near = |h: Option<(f32, f32)>| h.is_some_and(|h| pos2(h.0, h.1).distance(p) <= POINT);
+        if near(n.after) {
+            Some((point, true))
+        } else if near(n.before) {
+            Some((point, false))
+        } else {
+            None
+        }
+    }
+
+    /// The segment nearest `p` (within a few px): the point it starts from.
+    fn segment_at(&self, p: Pos2) -> Option<usize> {
+        self.segs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let d = line
+                    .windows(2)
+                    .filter_map(|w| Some(to_segment(p, *w.first()?, *w.get(1)?)))
+                    .fold(f32::MAX, f32::min);
+                (d <= 5.0).then_some((i, d))
+            })
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .map(|(i, _)| i)
+    }
+}
+
+/// Distance from `p` to the line from `a` to `b`.
+fn to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+    (a + ab * t).distance(p)
+}
+
+/// The points, handles and segments of drawing `d` (shown in box `b`) on screen; a point or handle being
+/// dragged (`drag`) shows where it is going.
+fn point_view(d: &Drawing, b: [f32; 4], origin: Pos2, zoom: f32, drag: Option<&Drag>) -> PointView {
+    let (x, y) = (origin.x + b[0] * zoom, origin.y + b[1] * zoom);
+    let mut nodes = freeform::nodes_from(&d.points, &d.handles, x, y, b[2] * zoom, b[3] * zoom);
+    if let Some(drag) = drag.filter(|g| g.id == d.id && g.moved) {
+        let (dx, dy) = ((drag.cur[0] - drag.orig[0]) * zoom, (drag.cur[1] - drag.orig[1]) * zoom);
+        match drag.kind {
+            DragKind::Point(i) => {
+                if let Some(n) = nodes.get_mut(i) {
+                    n.translate(dx, dy);
+                }
+            }
+            DragKind::Handle(i, after) => {
+                if let Some(n) = nodes.get_mut(i) {
+                    let h = if after { &mut n.after } else { &mut n.before };
+                    *h = h.map(|h| (h.0 + dx, h.1 + dy));
+                    freeform::constrain(n, after);
+                }
+            }
+            DragKind::Move | DragKind::Resize(_) => {}
+        }
+    }
+    let closed = d.shape == "freeform";
+    let segs = (0..freeform::segment_count(nodes.len(), closed))
+        .filter_map(|i| freeform::segment(&nodes, i, closed))
+        .map(|(p0, c1, c2, p3, curved)| {
+            if curved {
+                (0..=CURVE_STEPS)
+                    .map(|k| freeform::cubic_at(p0, c1, c2, p3, k as f32 / CURVE_STEPS as f32))
+                    .map(|q| pos2(q.0, q.1))
+                    .collect()
+            } else {
+                vec![pos2(p0.0, p0.1), pos2(p3.0, p3.1)]
+            }
+        })
+        .collect();
+    PointView { id: d.id, nodes, segs, closed }
+}
+
+/// What a right-click in Edit Points is on: a point (with how it joins its segments) or a segment.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PointMenu {
+    pub id: u32,
+    pub point: Option<(usize, PointKind)>,
+    /// The segment and whether it is curved.
+    pub segment: Option<(usize, bool)>,
+    pub closed: bool,
+}
+
+/// Right-click at `p` in compose `cid`: the point or segment of the point-edited drawing under it (the point
+/// becomes the picked one, its handles showing).
+pub(crate) fn point_menu_at(
+    ctx: &egui::Context,
+    host: &dyn EditorHost,
+    cid: u64,
+    p: Pos2,
+    origin: Pos2,
+    zoom: f32,
+    shown: &[Drawing],
+) -> Option<PointMenu> {
+    let c = host.compose(cid)?;
+    let id = c.edit_points?;
+    let d = shown.iter().find(|d| d.id == id)?;
+    let view = point_view(d, bounds(d), origin, zoom, None);
+    let point = point_at(&view.points(), p);
+    let segment = if point.is_none() { view.segment_at(p) } else { None };
+    if point.is_none() && segment.is_none() {
+        return None;
+    }
+    let mut m: Mem = ctx.data(|x| x.get_temp::<Mem>(mem_id(cid))).unwrap_or_default();
+    if let Some(i) = point {
+        m.point = Some((id, i));
+        store(ctx, cid, m);
+    }
+    let curved = |i: usize| freeform::segment(&view.nodes, i, view.closed).is_some_and(|s| s.4);
+    Some(PointMenu {
+        id,
+        point: point.and_then(|i| view.nodes.get(i).map(|n| (i, n.kind))),
+        segment: segment.map(|i| (i, curved(i))),
+        closed: view.closed,
+    })
+}
+
+/// The Edit Points part of the context menu: the `drawing.editPoints` params picked.
+pub(crate) fn point_menu_ui(ui: &mut Ui, at: &PointMenu) -> Option<serde_json::Value> {
+    let mut pick = None;
+    let id = at.id;
+    let mut item = |ui: &mut Ui, enabled: bool, label: &str, p: serde_json::Value| {
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            pick = Some(p);
+        }
+    };
+    if let Some((i, _)) = at.segment {
+        item(ui, true, "Add Point", json!({"id": id, "insert": i}));
+    }
+    if let Some((i, _)) = at.point {
+        item(ui, true, "Delete Point", json!({"id": id, "delete": i}));
+    }
+    match (at.closed, at.segment) {
+        (true, Some((i, _))) => item(ui, true, "Open Path", json!({"id": id, "path": "open", "segment": i})),
+        (true, None) => item(ui, true, "Open Path", json!({"id": id, "path": "open"})),
+        (false, _) => item(ui, true, "Close Path", json!({"id": id, "path": "close"})),
+    }
+    ui.separator();
+    if let Some((i, kind)) = at.point {
+        for (label, k, name) in [
+            ("Smooth Point", PointKind::Smooth, "smooth"),
+            ("Straight Point", PointKind::Straight, "straight"),
+            ("Corner Point", PointKind::Corner, "corner"),
+        ] {
+            item(ui, kind != k, label, json!({"id": id, "point": i, "pointType": name}));
+        }
+    }
+    if let Some((i, curved)) = at.segment {
+        item(ui, curved, "Straight Segment", json!({"id": id, "segment": i, "segmentType": "straight"}));
+        item(ui, !curved, "Curved Segment", json!({"id": id, "segment": i, "segmentType": "curved"}));
+    }
+    ui.separator();
+    item(ui, true, "Exit Edit Points", json!({"id": id, "on": false}));
+    pick
+}
+
+/// Forgets the Edit Points point picked last in compose `cid` (after a menu changed the points).
+pub(crate) fn forget_point(ctx: &egui::Context, cid: u64) {
+    let mut m: Mem = ctx.data(|x| x.get_temp::<Mem>(mem_id(cid))).unwrap_or_default();
+    m.point = None;
+    store(ctx, cid, m);
 }
 
 /// Paints the drawings of compose `cid` (as [`displayed`] gives them) behind the text (`behind`) or in front
@@ -302,17 +485,26 @@ pub(crate) fn paint(
         };
         ui.painter().rect_stroke(r, 0.0, stroke, StrokeKind::Outside);
         if c.edit_points == Some(*id) {
-            // Edit Points: the outline and its points.
-            let pts = point_handles(sel, b, origin, zoom);
-            let closed = sel.shape == "freeform";
-            let mut line = pts.clone();
-            if closed && let Some(first) = pts.first() {
-                line.push(*first);
+            // Edit Points: the outline (curved segments followed), its points, and the curve handles of
+            // the point picked last.
+            let view = point_view(sel, b, origin, zoom, m.drag.as_ref());
+            for line in &view.segs {
+                ui.painter().add(egui::Shape::dashed_line(line, Stroke::new(1.0, accent), 4.0, 3.0));
             }
-            ui.painter().add(egui::Shape::dashed_line(&line, Stroke::new(1.0, accent), 4.0, 3.0));
-            for p in pts {
+            let picked = m.point.filter(|(pid, _)| *pid == view.id).map(|(_, i)| i);
+            if let Some(n) = picked.and_then(|i| view.nodes.get(i)) {
+                let at = pos2(n.at.0, n.at.1);
+                for h in [n.before, n.after].into_iter().flatten() {
+                    let hp = pos2(h.0, h.1);
+                    ui.painter().line_segment([at, hp], Stroke::new(1.0, accent));
+                    ui.painter().circle_filled(hp, POINT / 2.0, Color32::WHITE);
+                    ui.painter().circle_stroke(hp, POINT / 2.0, Stroke::new(1.0, accent));
+                }
+            }
+            for (i, p) in view.points().into_iter().enumerate() {
                 let hr = Rect::from_center_size(p, vec2(POINT, POINT));
-                ui.painter().rect_filled(hr, 0.0, Color32::BLACK);
+                let fill = if picked == Some(i) { accent } else { Color32::BLACK };
+                ui.painter().rect_filled(hr, 0.0, fill);
                 ui.painter().rect_stroke(hr, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
             }
             continue;
@@ -416,22 +608,6 @@ fn handle_at(b: [f32; 4], p: Pos2, origin: Pos2, zoom: f32) -> Option<usize> {
 /// The point of a point-edited drawing under `p`.
 fn point_at(pts: &[Pos2], p: Pos2) -> Option<usize> {
     pts.iter().position(|q| Rect::from_center_size(*q, vec2(POINT + 4.0, POINT + 4.0)).contains(p))
-}
-
-/// The edge of a point-edited drawing nearest `p` (within a few px): the point it starts from.
-fn edge_at(pts: &[Pos2], closed: bool, p: Pos2) -> Option<usize> {
-    let n = pts.len();
-    let last = if closed { n } else { n.saturating_sub(1) };
-    (0..last)
-        .filter_map(|i| {
-            let (a, b) = (*pts.get(i)?, *pts.get((i + 1) % n)?);
-            let ab = b - a;
-            let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
-            let d = (a + ab * t).distance(p);
-            (d <= 5.0).then_some((i, d))
-        })
-        .min_by(|x, y| x.1.total_cmp(&y.1))
-        .map(|(i, _)| i)
 }
 
 /// The box after dragging handle `h` by (`dx`, `dy`) px at 100 %.
@@ -760,24 +936,44 @@ pub(crate) fn interact(
         let point_edit = edit_points
             .filter(|e| primary == Some(*e))
             .and_then(|e| drawings.iter().find(|d| d.id == e))
-            .map(|d| (d.id, point_handles(d, bounds(d), origin, zoom), d.shape == "freeform"));
-        // Press: an Edit Points point, a handle of the selection, else a drawing, else the text (deselects).
+            .map(|d| point_view(d, bounds(d), origin, zoom, None));
+        // Press: a curve handle of the picked point, an Edit Points point, a handle of the selection, else a
+        // drawing, else the text (deselects).
         if pressed
             && resp.hovered()
             && let Some(p) = pointer
         {
             let add = mods.shift;
             let toggle = mods.command || mods.ctrl;
-            let on_point = point_edit.as_ref().and_then(|(id, pts, _)| point_at(pts, p).map(|i| (*id, i)));
+            let picked = m.point.filter(|(pid, _)| point_edit.as_ref().is_some_and(|v| v.id == *pid));
+            let on_curve_handle =
+                point_edit.as_ref().zip(picked).and_then(|(v, (_, i))| v.handle_at(i, p).map(|h| (v.id, h)));
+            let on_point = point_edit
+                .as_ref()
+                .filter(|_| on_curve_handle.is_none())
+                .and_then(|v| point_at(&v.points(), p).map(|i| (v.id, i)));
             let on_edge = point_edit
                 .as_ref()
-                .filter(|_| toggle && on_point.is_none())
-                .and_then(|(id, pts, closed)| edge_at(pts, *closed, p).map(|i| (*id, i)));
+                .filter(|_| toggle && on_point.is_none() && on_curve_handle.is_none())
+                .and_then(|v| v.segment_at(p).map(|i| (v.id, i)));
             let handle = (selected.len() == 1 && point_edit.is_none())
                 .then(|| sel_box(primary).and_then(|b| handle_at(b, p, origin, zoom)))
                 .flatten();
             let local = ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom);
-            if let Some((id, i)) = on_point {
+            if let Some((id, (i, after))) = on_curve_handle {
+                let b = sel_box(Some(id)).unwrap_or_default();
+                m.drag = Some(Drag {
+                    id,
+                    kind: DragKind::Handle(i, after),
+                    start: p,
+                    orig: b,
+                    cur: b,
+                    moved: false,
+                    moving: Vec::new(),
+                    targets: Vec::new(),
+                });
+                consumed = true;
+            } else if let Some((id, i)) = on_point {
                 if toggle {
                     m.point = None;
                     host.run("drawing.editPoints", with_compose(cid, json!({"id": id, "delete": i})));
@@ -894,7 +1090,7 @@ pub(crate) fn interact(
                 }
                 if drag.moved {
                     drag.cur = match drag.kind {
-                        DragKind::Move | DragKind::Point(_) => {
+                        DragKind::Move | DragKind::Point(_) | DragKind::Handle(..) => {
                             [drag.orig[0] + dx, drag.orig[1] + dy, drag.orig[2], drag.orig[3]]
                         }
                         DragKind::Resize(h) => {
@@ -940,6 +1136,24 @@ pub(crate) fn interact(
                                 )
                             })
                         }
+                        DragKind::Handle(i, after) => {
+                            // Where the handle was (body px), moved as far as the pointer went.
+                            let was = drawings.iter().find(|x| x.id == d.id).and_then(|x| {
+                                let nodes = freeform::nodes_from(&x.points, &x.handles, x.x, x.y, x.w, x.h);
+                                nodes.get(i).and_then(|n| if after { n.after } else { n.before })
+                            });
+                            was.and_then(|(hx, hy)| {
+                                let (px, py) = (hx + x - d.orig[0], hy + y - d.orig[1]);
+                                let side = if after { "after" } else { "before" };
+                                host.run(
+                                    "drawing.editPoints",
+                                    with_compose(
+                                        cid,
+                                        json!({"id": d.id, "handle": i, "side": side, "x": px, "y": py}),
+                                    ),
+                                )
+                            })
+                        }
                     };
                 }
             }
@@ -950,7 +1164,7 @@ pub(crate) fn interact(
             // Edit Points: a double-click on an edge adds a point there; one on a point keeps it picked.
             let on_points = point_edit
                 .as_ref()
-                .map(|(id, pts, closed)| (*id, point_at(pts, p), edge_at(pts, *closed, p)))
+                .map(|v| (v.id, point_at(&v.points(), p), v.segment_at(p)))
                 .filter(|(_, pt, edge)| pt.is_some() || edge.is_some());
             if let Some((id, pt, edge)) = on_points {
                 m.drag = None;
@@ -972,7 +1186,10 @@ pub(crate) fn interact(
         if resp.hovered()
             && let Some(p) = resp.hover_pos()
         {
-            let on_point = point_edit.as_ref().is_some_and(|(_, pts, _)| point_at(pts, p).is_some());
+            let on_point = point_edit.as_ref().is_some_and(|v| {
+                point_at(&v.points(), p).is_some()
+                    || m.point.is_some_and(|(pid, i)| pid == v.id && v.handle_at(i, p).is_some())
+            });
             let handle = (selected.len() == 1 && point_edit.is_none())
                 .then(|| sel_box(primary).and_then(|b| handle_at(b, p, origin, zoom)))
                 .flatten();
@@ -1214,12 +1431,123 @@ mod tests {
 
     #[test]
     fn edit_points_find_points_and_edges() {
-        let pts = [pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0)];
-        assert_eq!(point_at(&pts, pos2(99.0, 2.0)), Some(1));
-        assert_eq!(point_at(&pts, pos2(50.0, 50.0)), None);
-        assert_eq!(edge_at(&pts, false, pos2(50.0, 2.0)), Some(0));
-        assert_eq!(edge_at(&pts, true, pos2(50.0, 49.0)), Some(2), "the closing edge");
-        assert_eq!(edge_at(&pts, false, pos2(50.0, 49.0)), None);
+        let tri = |shape: &str| Drawing {
+            id: 1,
+            shape: shape.into(),
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+            points: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            ..Drawing::default()
+        };
+        let o = pos2(0.0, 0.0);
+        let closed = point_view(&tri("freeform"), [0.0, 0.0, 100.0, 100.0], o, 1.0, None);
+        let open = point_view(&tri("scribble"), [0.0, 0.0, 100.0, 100.0], o, 1.0, None);
+        assert_eq!(point_at(&closed.points(), pos2(99.0, 2.0)), Some(1));
+        assert_eq!(point_at(&closed.points(), pos2(50.0, 50.0)), None);
+        assert_eq!(closed.segment_at(pos2(50.0, 2.0)), Some(0));
+        assert_eq!(closed.segment_at(pos2(50.0, 49.0)), Some(2), "the closing edge");
+        assert_eq!(open.segment_at(pos2(50.0, 49.0)), None);
+    }
+
+    /// Release check: Edit Points drew and hit-tested straight lines between the points; a curved segment is
+    /// now drawn and picked where it runs, and the picked point's curve handles can be caught.
+    #[test]
+    fn curved_segments_are_hit_where_they_run_and_handles_are_caught() {
+        use mailcraft_model::rich::PointHandles;
+        // The top side bent upward by its two handles (drawn at 100 % in a 100 × 100 box at 0, 0).
+        let d = Drawing {
+            id: 1,
+            shape: "freeform".into(),
+            w: 100.0,
+            h: 100.0,
+            points: vec![(0.0, 0.5), (1.0, 0.5), (1.0, 1.0), (0.0, 1.0)],
+            handles: vec![
+                PointHandles { kind: PointKind::Corner, before: None, after: Some((0.25, 0.0)) },
+                PointHandles { kind: PointKind::Corner, before: Some((0.75, 0.0)), after: None },
+                PointHandles::default(),
+                PointHandles::default(),
+            ],
+            ..Drawing::default()
+        };
+        let v = point_view(&d, [0.0, 0.0, 100.0, 100.0], pos2(0.0, 0.0), 1.0, None);
+        assert_eq!(v.segs.len(), 4);
+        assert!(v.segs[0].len() > 2, "the curve is drawn in steps");
+        // The bulge peaks at y = 50 - 0.75 * 50 = 12.5: hit there, not on the straight chord at y = 50.
+        assert_eq!(v.segment_at(pos2(50.0, 13.0)), Some(0));
+        assert_eq!(v.segment_at(pos2(50.0, 50.0)), None);
+        assert_eq!(v.handle_at(0, pos2(25.0, 1.0)), Some((0, true)));
+        assert_eq!(v.handle_at(1, pos2(75.0, 0.0)), Some((1, false)));
+        assert_eq!(v.handle_at(2, pos2(75.0, 0.0)), None, "only the picked point's handles");
+        // A handle being dragged shows its curve where it is going.
+        let drag = Drag {
+            id: 1,
+            kind: DragKind::Handle(0, true),
+            start: pos2(25.0, 0.0),
+            orig: [0.0, 0.0, 100.0, 100.0],
+            cur: [0.0, 40.0, 100.0, 100.0],
+            moved: true,
+            moving: Vec::new(),
+            targets: Vec::new(),
+        };
+        let moved = point_view(&d, [0.0, 0.0, 100.0, 100.0], pos2(0.0, 0.0), 1.0, Some(&drag));
+        assert_eq!(moved.nodes[0].after, Some((25.0, 40.0)));
+        assert!(moved.segment_at(pos2(50.0, 13.0)).is_none());
+    }
+
+    /// The Edit Points context menu: a point offers its point types (not the one it has), a segment its
+    /// segment types, and each item asks `drawing.editPoints` for the change.
+    #[test]
+    fn the_edit_points_menu_offers_what_the_spot_can_change() {
+        let mut app = crate::App::new(mailcraft_engine::sample::sample_session());
+        let cid = app
+            .run("mail.newEmail", json!({}))
+            .and_then(|v| v.get("compose").and_then(serde_json::Value::as_u64))
+            .unwrap();
+        let r = app
+            .run("insert.shape", json!({"compose": cid, "kind": "oval", "x": 0, "y": 0, "w": 200, "h": 100}));
+        let id = r.and_then(|r| r["drawing"].as_u64()).unwrap() as u32;
+        app.run("drawing.editPoints", json!({"compose": cid, "id": id, "on": true}));
+        let ctx = egui::Context::default();
+        let shown = app.s.composes[&cid].body.drawings.clone();
+        // The oval's right-hand point, at (200, 50).
+        let at = point_menu_at(&ctx, &app, cid, pos2(200.0, 50.0), pos2(0.0, 0.0), 1.0, &shown).unwrap();
+        assert_eq!(at.point.map(|(i, _)| i), Some(0));
+        assert!(at.point.is_some_and(|(_, k)| k != PointKind::Corner));
+        assert!(at.closed && at.segment.is_none());
+        let m: Mem = ctx.data(|x| x.get_temp::<Mem>(mem_id(cid))).unwrap_or_default();
+        assert_eq!(m.point, Some((id, 0)), "a right-click picks the point");
+        // Halfway along the curved bottom right segment.
+        let seg = point_menu_at(&ctx, &app, cid, pos2(170.71, 85.36), pos2(0.0, 0.0), 1.0, &shown).unwrap();
+        assert_eq!(seg.segment, Some((0, true)));
+        assert!(point_menu_at(&ctx, &app, cid, pos2(100.0, 50.0), pos2(0.0, 0.0), 1.0, &shown).is_none());
+
+        // Corner Point from the menu, then Straight Segment, then Open Path.
+        let click = |at: &PointMenu, label: &str| {
+            let mut pick = None;
+            let mut h = egui_kittest::Harness::new_ui(|ui| {
+                if let Some(p) = point_menu_ui(ui, at) {
+                    pick = Some(p);
+                }
+            });
+            h.run();
+            egui_kittest::kittest::Queryable::get_by_label(&h, label).click();
+            h.run();
+            drop(h);
+            pick
+        };
+        let p = click(&at, "Corner Point").unwrap();
+        assert_eq!(p, json!({"id": id, "point": 0, "pointType": "corner"}));
+        app.run("drawing.editPoints", with_compose(cid, p)).unwrap();
+        let p = click(&seg, "Straight Segment").unwrap();
+        app.run("drawing.editPoints", with_compose(cid, p)).unwrap();
+        let d = app.s.composes[&cid].body.drawings.iter().find(|d| d.id == id).cloned().unwrap();
+        assert!(d.handles.first().is_some_and(|h| h.kind == PointKind::Corner && h.after.is_none()));
+        let p = click(&seg, "Open Path").unwrap();
+        assert_eq!(p, json!({"id": id, "path": "open", "segment": 0}));
+        app.run("drawing.editPoints", with_compose(cid, p)).unwrap();
+        assert_eq!(app.s.composes[&cid].body.drawings.iter().find(|d| d.id == id).unwrap().shape, "scribble");
     }
 
     /// Presses Delete with drawing `id` selected (`editing_points`: Edit Points is on).

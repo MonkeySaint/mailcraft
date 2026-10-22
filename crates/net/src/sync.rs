@@ -3,7 +3,7 @@
 //! otherwise, plus the write-back operations (flags, move, copy, append, expunge, folder management) and
 //! change notification through IDLE.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -290,14 +290,21 @@ pub struct FetchProgress {
 pub struct ImapAccount {
     settings: ImapSettings,
     client: Option<ImapClient>,
+    /// UIDVALIDITY and UIDNEXT of each folder when it was last synced (as the sync's SELECT saw them), until
+    /// [`Self::idle_once`] reports a change in it. Mail that arrives after the sync but before IDLE starts
+    /// is taken in by the SELECT (or an untagged EXISTS) on the way, so IDLE alone would never report it.
+    synced: HashMap<String, (u32, u32)>,
 }
+
+/// Most folders whose sync state [`ImapAccount`] remembers for IDLE (a guard against hostile folder lists).
+const MAX_SYNCED_FOLDERS: usize = 4096;
 
 const BODY_ITEMS: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])";
 const HEADER_ITEMS: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])";
 
 impl ImapAccount {
     pub fn new(settings: ImapSettings) -> Self {
-        ImapAccount { settings, client: None }
+        ImapAccount { settings, client: None, synced: HashMap::new() }
     }
 
     pub fn settings(&self) -> &ImapSettings {
@@ -487,9 +494,14 @@ impl ImapAccount {
         let batch = self.settings.fetch_batch.max(1);
         let cap = self.settings.max_new_per_sync.max(1);
         let window = self.settings.first_sync_since;
-        self.with_client(true, |c| {
+        let delta = self.with_client(true, |c| {
             sync_once(c, name, since, Limits { batch, cap, headers_only, window }, &mut *progress)
-        })
+        })?;
+        if self.synced.len() >= MAX_SYNCED_FOLDERS && !self.synced.contains_key(name) {
+            self.synced.clear();
+        }
+        self.synced.insert(name.to_owned(), (delta.state.uidvalidity, delta.state.uidnext));
+        Ok(delta)
     }
 
     /// Downloads whole messages by UID (for messages first downloaded as headers). UIDs no longer on the
@@ -683,14 +695,29 @@ impl ImapAccount {
     /// server reported a change. Unlike [`Self::wait_for_changes`] there is no NOOP fallback: a server
     /// without IDLE gives [`NetError::Unsupported`], so the caller can poll on its own schedule. Connects
     /// (and reconnects once after a lost connection) as needed.
+    ///
+    /// When `folder` was synced through this account, mail that arrived since that sync counts as a change
+    /// too, reported at once without waiting: the folder is selected afresh and its UIDNEXT compared with
+    /// the one the sync saw. A change is reported once; after that only IDLE news counts until the folder's
+    /// next sync.
     pub fn idle_once(&mut self, folder: &str, max_wait: Duration, stop: Option<&AtomicBool>) -> Result<bool> {
-        self.with_client(true, |c| {
+        let known = self.synced.get(folder).copied();
+        let changed = self.with_client(true, |c| {
             if !c.has_capability("IDLE") && !c.has_capability("IMAP4rev2") {
                 return Err(NetError::Unsupported("IDLE".into()));
             }
-            Self::select(c, folder, false)?;
+            let info = Self::select(c, folder, known.is_some())?;
+            if let Some((uidvalidity, uidnext)) = known
+                && (info.uidvalidity != uidvalidity || info.uidnext > uidnext)
+            {
+                return Ok(true);
+            }
             Ok(matches!(c.idle(max_wait, stop)?, IdleEvent::Changed(_)))
-        })
+        })?;
+        if changed {
+            self.synced.remove(folder);
+        }
+        Ok(changed)
     }
 
     /// Waits up to `max_wait` for changes in `folder` (IDLE, or NOOP polling every few seconds when the

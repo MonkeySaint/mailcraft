@@ -15,6 +15,9 @@ use std::fmt::Write as _;
 
 pub mod chart;
 pub mod drawing;
+pub mod freeform;
+#[cfg(test)]
+mod gallery_tests;
 mod gltf;
 pub mod icons;
 #[cfg(test)]
@@ -44,7 +47,7 @@ use crate::compose::{
 };
 use crate::{CmdError, CmdResult, CommandSpec, Session};
 use mailcraft_geom::Color;
-use mailcraft_model::rich::{Align, TableCell};
+use mailcraft_model::rich::{Align, Drawing, TableCell};
 use mailcraft_model::{Block, BusyStatus, DateTime, Doc, Inline, ItemId, ParaStyle, TextStyle};
 
 /// Largest picture / object file accepted.
@@ -59,6 +62,8 @@ pub const MAX_TABLE_ROWS: usize = 1000;
 const MAX_TABLE_CELLS: usize = 20_000;
 /// Galleries building blocks can be saved to.
 pub const GALLERIES: [&str; 5] = ["quickParts", "autoText", "textBoxes", "quickTables", "equations"];
+/// Galleries that can keep a selected drawing (text box, shape, WordArt, group) instead of text.
+const DRAWING_GALLERIES: [&str; 3] = ["textBoxes", "quickParts", "autoText"];
 /// Gallery that keeps named list styles (Define New List Style), stored with the building blocks.
 pub const LIST_STYLES_GALLERY: &str = "listStyles";
 /// Most named list styles kept.
@@ -2588,25 +2593,61 @@ fn link(s: &mut Session, p: &Value) -> CmdResult {
 /// Longest ScreenTip accepted (characters).
 const MAX_SCREEN_TIP: usize = 255;
 
-fn valid_bookmark(name: &str) -> bool {
+/// Whether `name` can be added as a bookmark: starts with a letter, at most 40 letters, digits and `_`
+/// (names starting with `_` are hidden bookmarks, made for links to headings and the top).
+pub fn valid_bookmark(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(char::is_alphabetic)
         && name.chars().count() <= 40
         && name.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
+/// The bookmarks of `c` for the Bookmark dialog and `action: "list"`: `{name, hidden, location, at}`, where
+/// `location` is the place in the message counted from the top (1 = first). Sorted by `sort` ("name", the
+/// default, ignoring case; or "location"); hidden bookmarks (`_…`) only with `hidden`.
+pub fn bookmark_entries(c: &ComposeState, sort: &str, hidden: bool) -> Vec<Value> {
+    let mut marks: Vec<&crate::compose::Bookmark> = c.bookmarks.iter().collect();
+    marks.sort_by(|a, b| a.pos.cmp(&b.pos).then_with(|| a.name.cmp(&b.name)));
+    let mut rows: Vec<(usize, &crate::compose::Bookmark)> =
+        marks.into_iter().enumerate().filter(|(_, b)| hidden || !b.name.starts_with('_')).collect();
+    if sort != "location" {
+        rows.sort_by(|(_, a), (_, b)| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.name.cmp(&b.name))
+        });
+    }
+    rows.into_iter()
+        .map(|(i, b)| {
+            json!({"name": b.name, "hidden": b.name.starts_with('_'), "location": i.saturating_add(1),
+                   "at": crate::cmd::compose::pos_json(&b.pos)})
+        })
+        .collect()
+}
+
 fn bookmark(s: &mut Session, p: &Value) -> CmdResult {
-    let Some(name) = opt_str(p, "name").map(str::to_owned) else {
-        let cid = compose_id(s, p)?;
-        // Hidden bookmarks (`_…`, made for links to headings and the top) are not listed.
-        let names: Vec<String> = s
-            .composes
-            .get(&cid)
-            .map(|c| c.bookmarks.iter().map(|b| b.name.clone()).filter(|n| !n.starts_with('_')).collect())
-            .unwrap_or_default();
-        return dialog(s, "bookmark", json!({"compose": cid, "bookmarks": names}));
-    };
     let action = opt_str(p, "action").unwrap_or("add");
+    let listing = action == "list";
+    let name = opt_str(p, "name").map(str::to_owned);
+    if listing || name.is_none() {
+        let sort = opt_str(p, "sort").unwrap_or("name");
+        if !matches!(sort, "name" | "location") {
+            return Err(CmdError::Params(format!("unknown bookmark sort `{sort}` (name, location)")));
+        }
+        let hidden = opt_bool(p, "hidden") == Some(true);
+        let cid = compose_id(s, p)?;
+        let c = compose_mut(s, p)?;
+        // Places are worked out against the body as it is now.
+        c.sync_bookmarks();
+        let entries = bookmark_entries(c, sort, hidden);
+        if listing {
+            return Ok(json!({"bookmarks": entries}));
+        }
+        // The dialog gets every bookmark (hidden ones too, for its Hidden bookmarks box) and sorts them itself.
+        let all = bookmark_entries(c, "location", true);
+        let names: Vec<String> =
+            c.bookmarks.iter().map(|b| b.name.clone()).filter(|n| !n.starts_with('_')).collect();
+        return dialog(s, "bookmark", json!({"compose": cid, "bookmarks": names, "entries": all}));
+    }
+    let name = name.unwrap_or_default();
     let c = compose_mut(s, p)?;
     match action {
         "add" => {
@@ -3142,6 +3183,7 @@ fn builtin_auto_text(s: &Session) -> Vec<BuildingBlock> {
             blocks: vec![Block::text_paragraph(&text)],
             category: DEFAULT_CATEGORY.into(),
             description: String::new(),
+            drawings: Vec::new(),
         });
     }
     out
@@ -3203,10 +3245,18 @@ fn auto_text(s: &mut Session, p: &Value) -> CmdResult {
         return Ok(json!({"word": word, "name": block.name}));
     }
     let c = compose_mut(s, p)?;
+    if !block.drawings.is_empty() {
+        block_drawings_fit(c, &block)?;
+    }
     c.checkpoint();
     let focus = c.selection.focus.clone();
     c.selection = crate::compose::BodySelection { anchor: DocPos::new(focus.path.clone(), start), focus };
     c.delete_selection();
+    if !block.drawings.is_empty() {
+        // A saved text box (or other drawing) comes back as a drawing where the word was; one undo step.
+        let ids = insert_block_drawings(c, &block, None, false)?;
+        return Ok(json!({"word": word, "inserted": block.name, "drawings": ids, "caret": caret(c)}));
+    }
     let single = matches!(block.blocks.as_slice(), [Block::Paragraph { .. }]);
     if single {
         c.insert_fragment(
@@ -3299,8 +3349,142 @@ fn insert_building_block(s: &mut Session, p: &Value, gallery: &str, name: &str) 
     let Some(block) = find_block(s, cid, Some(gallery), name) else {
         return Err(CmdError::Params(format!("no saved entry `{name}` in {gallery}")));
     };
+    if !block.drawings.is_empty() {
+        let at = point_param(p)?;
+        let c = compose_mut(s, p)?;
+        let ids = insert_block_drawings(c, &block, at, true)?;
+        return Ok(json!({"inserted": block.name, "gallery": gallery, "drawings": ids}));
+    }
     edit(s, p, |c| c.insert_blocks(block.blocks.clone()))?;
     Ok(json!({"inserted": block.name, "gallery": gallery}))
+}
+
+/// Places the drawings of a saved entry at `at` (else at the caret) as new drawings, keeping their layout,
+/// groups, canvases and text box links among themselves; the entry's text (if any) goes in at the caret.
+/// Checkpoints first when `checkpoint` (else the caller has). Returns the new drawing ids; the first
+/// top-level one ends up selected.
+fn insert_block_drawings(
+    c: &mut ComposeState,
+    block: &BuildingBlock,
+    at: Option<(f32, f32)>,
+    checkpoint: bool,
+) -> Result<Vec<u32>, CmdError> {
+    use mailcraft_model::rich::{DrawingKind, WrapStyle};
+    let saved: Vec<&Drawing> = block.drawings.iter().take(crate::compose::MAX_BLOCK_DRAWINGS).collect();
+    block_drawings_fit(c, block)?;
+    let (ox, oy) = at.unwrap_or_else(|| drawing::caret_point(c));
+    if checkpoint {
+        c.checkpoint();
+    }
+    if !block.blocks.is_empty() {
+        c.insert_blocks(block.blocks.clone());
+    }
+    let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
+    // (saved id, new id, saved canvas)
+    let mut map: Vec<(u32, u32, Option<u32>)> = Vec::new();
+    for d in saved {
+        let at = Some((ox + finite(d.x), oy + finite(d.y)));
+        let mut d = d.clone();
+        // An In Line with Text drawing has no place in the text here: it floats (entries saved before such
+        // drawings were made floating on saving).
+        if d.wrap == WrapStyle::Inline {
+            d.wrap = WrapStyle::Square;
+        }
+        let (old, old_canvas) = (d.id, d.canvas);
+        let id = drawing::add(c, d, at, false).map_err(CmdError::Failed)?;
+        map.push((old, id, old_canvas));
+    }
+    let new_id = |old: u32| map.iter().find(|(o, ..)| *o == old).map(|(_, n, _)| *n);
+    let new_ids: Vec<u32> = map.iter().map(|(_, n, _)| *n).collect();
+    let of_kind = |c: &ComposeState, kind: DrawingKind| -> Vec<u32> {
+        c.body.drawings.iter().filter(|d| new_ids.contains(&d.id) && d.kind == kind).map(|d| d.id).collect()
+    };
+    let groups = of_kind(c, DrawingKind::Group);
+    let canvases = of_kind(c, DrawingKind::Canvas);
+    for d in c.body.drawings.iter_mut().filter(|d| new_ids.contains(&d.id)) {
+        let id = d.id;
+        d.group = d.group.and_then(new_id).filter(|g| *g != id && groups.contains(g));
+        d.link_next = d.link_next.and_then(new_id).filter(|n| *n != id);
+        // A drawing saved inside a saved canvas goes back into its copy; the others keep the canvas they
+        // landed in, if any.
+        let saved_canvas = map.iter().find(|(_, n, _)| *n == id).and_then(|(.., k)| *k).and_then(new_id);
+        if let Some(k) = saved_canvas.filter(|k| *k != id && canvases.contains(k)) {
+            d.canvas = Some(k);
+        }
+    }
+    // Groups take the box of their members; one left with too few members dissolves.
+    crate::cmd::drawing::tidy(&mut c.body.drawings);
+    let new_ids: Vec<u32> =
+        new_ids.into_iter().filter(|id| c.body.drawings.iter().any(|d| d.id == *id)).collect();
+    let first = c
+        .body
+        .drawings
+        .iter()
+        .find(|d| {
+            new_ids.contains(&d.id) && d.group.is_none() && d.canvas.is_none_or(|k| !new_ids.contains(&k))
+        })
+        .map(|d| d.id)
+        .or_else(|| new_ids.first().copied());
+    c.select_drawing(first);
+    c.dirty = true;
+    Ok(new_ids)
+}
+
+/// Fails when the drawings of `block` would take the message over its drawing limit.
+fn block_drawings_fit(c: &ComposeState, block: &BuildingBlock) -> Result<(), CmdError> {
+    let n = block.drawings.len().min(crate::compose::MAX_BLOCK_DRAWINGS);
+    if c.body.drawings.len().saturating_add(n) > drawing::MAX_DRAWINGS {
+        return Err(CmdError::Failed(format!("a message holds at most {} drawings", drawing::MAX_DRAWINGS)));
+    }
+    Ok(())
+}
+
+/// The selected drawings of `c` (with everything in selected groups, in groups inside them and in selected
+/// canvases) as a saved entry keeps them: in body order, placed relative to the top left corner of the box
+/// around them, with canvases, groups and links to drawings left behind dropped. An In Line with Text drawing
+/// is kept where it is shown, floating (it has no place in the text it goes back into). Empty when no
+/// drawing is selected.
+fn selected_drawings_for_block(c: &ComposeState) -> Vec<Drawing> {
+    use mailcraft_model::rich::WrapStyle;
+    let ds = &c.body.drawings;
+    let mut keep: Vec<u32> = Vec::new();
+    for id in c.selected_drawings() {
+        if !ds.iter().any(|d| d.id == id) {
+            continue;
+        }
+        for m in std::iter::once(id).chain(crate::cmd::drawing::descendants(ds, id)) {
+            if !keep.contains(&m) {
+                keep.push(m);
+            }
+        }
+    }
+    let mut out: Vec<Drawing> = ds
+        .iter()
+        .filter(|d| keep.contains(&d.id))
+        .take(crate::compose::MAX_BLOCK_DRAWINGS)
+        .cloned()
+        .collect();
+    if out.iter().any(|d| d.wrap == WrapStyle::Inline) {
+        let shown = crate::cmd::drawing::inline_boxes(c);
+        for d in out.iter_mut().filter(|d| d.wrap == WrapStyle::Inline) {
+            if let Some((_, (x, y, ..))) = shown.iter().find(|(i, _)| *i == d.id) {
+                (d.x, d.y) = (*x, *y);
+            }
+            d.wrap = WrapStyle::Square;
+        }
+    }
+    let ids: Vec<u32> = out.iter().map(|d| d.id).collect();
+    let left = out.iter().map(|d| d.x).fold(f32::INFINITY, f32::min);
+    let top = out.iter().map(|d| d.y).fold(f32::INFINITY, f32::min);
+    let (left, top) = (if left.is_finite() { left } else { 0.0 }, if top.is_finite() { top } else { 0.0 });
+    for d in &mut out {
+        d.x -= left;
+        d.y -= top;
+        d.canvas = d.canvas.filter(|k| ids.contains(k));
+        d.group = d.group.filter(|g| ids.contains(g));
+        d.link_next = d.link_next.filter(|n| ids.contains(n));
+    }
+    out
 }
 
 fn quick_part(s: &mut Session, p: &Value) -> CmdResult {
@@ -3316,14 +3500,15 @@ fn quick_part(s: &mut Session, p: &Value) -> CmdResult {
             .iter()
             .filter(|b| gallery.is_none_or(|g| b.gallery == g))
             .map(|b| {
-                let preview: String = Doc { blocks: b.blocks.clone(), ..Default::default() }
-                    .text_content()
-                    .chars()
-                    .take(120)
-                    .collect();
+                let text = if b.blocks.is_empty() && !b.drawings.is_empty() {
+                    b.drawings.iter().map(|d| d.text.as_str()).collect::<Vec<_>>().join(" ")
+                } else {
+                    Doc { blocks: b.blocks.clone(), ..Default::default() }.text_content()
+                };
+                let preview: String = text.chars().take(120).collect();
                 let category = if b.category.is_empty() { DEFAULT_CATEGORY } else { b.category.as_str() };
                 json!({"gallery": b.gallery, "name": b.name, "preview": preview, "category": category,
-                       "description": b.description})
+                       "description": b.description, "drawings": b.drawings.len()})
             })
             .collect();
         return dialog(s, "quickParts", json!({"compose": cid, "gallery": gallery, "entries": entries}));
@@ -3361,6 +3546,13 @@ fn quick_part(s: &mut Session, p: &Value) -> CmdResult {
     let found = find_block(s, cid, gallery, &name)
         .or_else(|| if gallery.is_none() { None } else { find_block(s, cid, None, &name) })
         .ok_or_else(|| CmdError::Params(format!("no saved entry `{name}`")))?;
+    if !found.drawings.is_empty() {
+        // A saved text box (or other drawing) comes back as a drawing, not as text.
+        let at = point_param(p)?;
+        let c = compose_mut(s, p)?;
+        let ids = insert_block_drawings(c, &found, at, true)?;
+        return Ok(json!({"inserted": found.name, "gallery": found.gallery, "drawings": ids}));
+    }
     edit(s, p, |c| {
         let single = matches!(found.blocks.as_slice(), [Block::Paragraph { .. }]);
         if single {
@@ -3427,8 +3619,16 @@ fn store_block(s: &mut Session, entry: BuildingBlock) -> Result<(bool, bool), Cm
     Ok((replaced, persisted))
 }
 
+/// Enabled: a compose has selected text or a selected drawing (Save Selection to … Gallery).
+fn has_selection_or_drawing(s: &Session) -> Option<&'static str> {
+    has_body_selection(s)
+        .filter(|_| s.composes.values().all(|c| c.selected_drawings().is_empty()))
+        .map(|why| if why == "select some text first" { "select some text or a text box first" } else { why })
+}
+
 /// Save Selection to … Gallery: without a `name`, the Create New Building Block dialog (name proposed from
-/// the selection's first words, gallery, category, description); with one, saves the selection.
+/// the selection's first words, gallery, category, description); with one, saves the selection: a selected
+/// text box or other drawing for the Text Box, Quick Part and AutoText galleries, else the selected text.
 fn save_to_gallery(s: &mut Session, p: &Value) -> CmdResult {
     let gallery = req_str(p, "gallery")?.to_owned();
     if !GALLERIES.contains(&gallery.as_str()) {
@@ -3436,12 +3636,24 @@ fn save_to_gallery(s: &mut Session, p: &Value) -> CmdResult {
     }
     let cid = compose_id(s, p)?;
     let c = s.composes.get(&cid).ok_or_else(|| CmdError::Disabled("no compose".into()))?;
-    if c.selection.is_collapsed() {
+    // A selected text box (or shape, WordArt, group) is saved as a drawing: clicking a drawing leaves the
+    // text selection as it was, so the drawing is what was picked last.
+    let drawings = if DRAWING_GALLERIES.contains(&gallery.as_str()) {
+        selected_drawings_for_block(c)
+    } else {
+        Vec::new()
+    };
+    if c.selection.is_collapsed() && drawings.is_empty() {
         return Err(CmdError::Disabled("select what to save first".into()));
     }
     let Some(name) = trimmed(p, "name", MAX_BLOCK_NAME) else {
-        let suggested: String = c
-            .selected_text()
+        let words = if drawings.is_empty() {
+            c.selected_text()
+        } else {
+            drawings.iter().map(|d| d.text.as_str()).collect::<Vec<_>>().join(" ")
+        };
+        let words = if words.trim().is_empty() { "Text Box".to_owned() } else { words };
+        let suggested: String = words
             .split_whitespace()
             .take(4)
             .collect::<Vec<_>>()
@@ -3460,16 +3672,19 @@ fn save_to_gallery(s: &mut Session, p: &Value) -> CmdResult {
     };
     let category = trimmed(p, "category", MAX_BLOCK_NAME).unwrap_or_else(|| DEFAULT_CATEGORY.to_owned());
     let description = trimmed(p, "description", MAX_BLOCK_DESCRIPTION).unwrap_or_default();
-    let frag = c.fragment();
+    let blocks = if drawings.is_empty() { c.fragment().blocks } else { Vec::new() };
+    let count = drawings.len();
     let entry = BuildingBlock {
         gallery: gallery.clone(),
         name: name.clone(),
-        blocks: frag.blocks,
+        blocks,
         category,
         description,
+        drawings,
     };
     let (replaced, persisted) = store_block(s, entry)?;
-    Ok(json!({"saved": name, "gallery": gallery, "persisted": persisted, "replaced": replaced}))
+    Ok(json!({"saved": name, "gallery": gallery, "persisted": persisted, "replaced": replaced,
+              "drawings": count}))
 }
 
 /// Building Blocks Organizer › Edit Properties: renames an entry, moves it to another gallery or changes its
@@ -3511,6 +3726,7 @@ fn edit_block(s: &mut Session, p: &Value, cid: u64, gallery: Option<&str>, name:
         blocks: found.blocks,
         category,
         description,
+        drawings: found.drawings,
     };
     store_block(s, entry)?;
     Ok(json!({"edited": new_name, "gallery": new_gallery}))
@@ -3751,7 +3967,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Bookmark",
             "Insert › Links",
             "",
-            r#"{"name"?:string,"action"?:"add"|"goTo"|"delete"}"#,
+            r#"{"name"?:string,"action"?:"add"|"goTo"|"delete"|"list","sort"?:"name"|"location","hidden"?:bool}  (no name: the Bookmark dialog; list: the bookmarks sorted by name or by place in the message, hidden ones with hidden)"#,
             false,
             has_compose,
             bookmark,
@@ -3911,9 +4127,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save Selection to Gallery",
             "Insert › Text › Quick Parts / Text Box; Insert › Tables › Quick Tables; Insert › Symbols › Equation",
             "",
-            r#"{"gallery":"quickParts"|"autoText"|"textBoxes"|"quickTables"|"equations","name"?:string,"category"?:string,"description"?:string}  (no name: the Create New Building Block dialog)"#,
+            r#"{"gallery":"quickParts"|"autoText"|"textBoxes"|"quickTables"|"equations","name"?:string,"category"?:string,"description"?:string}  (no name: the Create New Building Block dialog; a selected text box or other drawing is saved as a drawing, else the selected text)"#,
             false,
-            has_body_selection,
+            has_selection_or_drawing,
             save_to_gallery,
         ),
         spec(

@@ -2790,6 +2790,10 @@ fn select(s: &mut Session, p: &Value) -> CmdResult {
             c.set_selection(anchor, focus);
         }
     }
+    // Selecting text picks it instead of a selected drawing (what Save Selection to … Gallery saves).
+    if c.has_selection() {
+        c.select_drawing(None);
+    }
     Ok(
         json!({"anchor": pos_json(&c.selection.anchor), "focus": pos_json(&c.selection.focus), "text": c.selected_text()}),
     )

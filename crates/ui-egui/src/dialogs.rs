@@ -15,6 +15,7 @@ mod account_tests;
 mod accounts;
 mod alerts;
 mod archive;
+mod bookmark_dlg;
 mod borders_dlg;
 mod categories;
 mod common;

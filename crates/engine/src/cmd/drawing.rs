@@ -16,7 +16,7 @@
 mod fx;
 mod group;
 mod link;
-mod points;
+pub mod points;
 mod props;
 #[cfg(test)]
 mod tests;
@@ -1101,6 +1101,7 @@ fn change_shape(s: &mut Session, p: &Value) -> CmdResult {
         }
         if !matches!(shape, "freeform" | "scribble") {
             d.points.clear();
+            d.handles.clear();
         }
         if matches!(d.wrap, WrapStyle::Tight | WrapStyle::Through) {
             d.wrap_points = wrap::outline_points(d);
@@ -1464,7 +1465,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Points",
             "Shape Format › Insert Shapes › Edit Shape",
             "",
-            r#"{"id"?:number,"on"?:bool,"point"?:number,"x"?:number,"y"?:number,"insert"?:number,"delete"?:number,"points"?:[[number,number]]}  (on: drag the corner points; x, y in the body)"#,
+            r#"{"id"?:number,"on"?:bool,"point"?:number,"pointType"?:"smooth"|"straight"|"corner","handle"?:number,"side"?:"before"|"after","segment"?:number,"segmentType"?:"straight"|"curved","path"?:"open"|"close","x"?:number,"y"?:number,"insert"?:number,"delete"?:number,"points"?:[[number,number]]}  (on: edit the points, a shape's curves kept as curved segments; point + x, y moves a point, + pointType changes it; handle + side + x, y drags a curve handle; segment + segmentType; insert splits the segment after a point; path open (at segment) / close; x, y in the body)"#,
             true,
             has_drawings,
             points::edit_points,
