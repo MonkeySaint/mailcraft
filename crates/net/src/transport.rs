@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -67,9 +67,47 @@ impl ConnectOptions {
     }
 }
 
+/// The TCP socket under a connection. With a deadline, every read and write waits at most the time left and
+/// fails once it has passed, so a peer sending one byte at a time cannot stretch a request (a TLS record, a
+/// header line, a body) past it.
+struct Sock {
+    tcp: TcpStream,
+    deadline: Option<Instant>,
+    io_timeout: Duration,
+}
+
+impl Sock {
+    fn arm(&mut self, write: bool) -> std::io::Result<()> {
+        let Some(d) = self.deadline else { return Ok(()) };
+        let left = d.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the request took too long"));
+        }
+        let t = Some(left.min(self.io_timeout).max(Duration::from_millis(1)));
+        if write { self.tcp.set_write_timeout(t) } else { self.tcp.set_read_timeout(t) }
+    }
+}
+
+impl Read for Sock {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.arm(false)?;
+        self.tcp.read(out)
+    }
+}
+
+impl Write for Sock {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.arm(true)?;
+        self.tcp.write(data)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
 enum Stream {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<ClientConnection, TcpStream>>),
+    Plain(Sock),
+    Tls(Box<rustls::StreamOwned<ClientConnection, Sock>>),
     /// Transitional state during a STARTTLS upgrade that failed.
     Gone,
 }
@@ -183,7 +221,7 @@ fn server_name(host: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(h.to_owned()).map_err(|e| NetError::Invalid(format!("server name `{host}`: {e}")))
 }
 
-fn tls_wrap(sock: TcpStream, host: &str, opts: &TlsOptions) -> Result<Stream> {
+fn tls_wrap(sock: Sock, host: &str, opts: &TlsOptions) -> Result<Stream> {
     let config = client_config(opts)?;
     let mut conn = ClientConnection::new(config, server_name(host)?)?;
     let mut sock = sock;
@@ -199,6 +237,18 @@ fn tls_wrap(sock: TcpStream, host: &str, opts: &TlsOptions) -> Result<Stream> {
 impl Conn {
     /// Connects to `host:port`; `implicit_tls` starts TLS immediately (IMAPS 993, SMTPS 465, HTTPS).
     pub fn connect(host: &str, port: u16, implicit_tls: bool, opts: &ConnectOptions) -> Result<Conn> {
+        Conn::connect_until(host, port, implicit_tls, opts, None)
+    }
+
+    /// [`Conn::connect`] with a deadline for everything the connection does (the TLS handshake included):
+    /// see [`Conn::set_deadline`].
+    pub fn connect_until(
+        host: &str,
+        port: u16,
+        implicit_tls: bool,
+        opts: &ConnectOptions,
+        deadline: Option<Instant>,
+    ) -> Result<Conn> {
         if host.is_empty() {
             return Err(NetError::Invalid("empty host name".into()));
         }
@@ -227,6 +277,7 @@ impl Conn {
         sock.set_read_timeout(Some(opts.io_timeout))?;
         sock.set_write_timeout(Some(opts.io_timeout))?;
         let _ = sock.set_nodelay(true);
+        let sock = Sock { tcp: sock, deadline, io_timeout: opts.io_timeout };
         let stream = if implicit_tls { tls_wrap(sock, host, &opts.tls)? } else { Stream::Plain(sock) };
         Ok(Conn { stream, buf: Vec::new(), start: 0, host: host.to_owned(), opts: opts.clone() })
     }
@@ -274,9 +325,19 @@ impl Conn {
 
     fn tcp(&self) -> Option<&TcpStream> {
         match &self.stream {
-            Stream::Plain(s) => Some(s),
-            Stream::Tls(t) => Some(t.get_ref()),
+            Stream::Plain(s) => Some(&s.tcp),
+            Stream::Tls(t) => Some(&t.get_ref().tcp),
             Stream::Gone => None,
+        }
+    }
+
+    /// Sets (or with `None` clears) a deadline: from now on every read and write waits at most the time left,
+    /// and fails with [`NetError::Timeout`] once it has passed.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        match &mut self.stream {
+            Stream::Plain(s) => s.deadline = deadline,
+            Stream::Tls(t) => t.get_mut().deadline = deadline,
+            Stream::Gone => {}
         }
     }
 
@@ -402,12 +463,12 @@ impl Conn {
     pub fn shutdown(&mut self) {
         match &mut self.stream {
             Stream::Plain(s) => {
-                let _ = s.shutdown(std::net::Shutdown::Both);
+                let _ = s.tcp.shutdown(std::net::Shutdown::Both);
             }
             Stream::Tls(t) => {
                 t.conn.send_close_notify();
                 let _ = t.flush();
-                let _ = t.get_ref().shutdown(std::net::Shutdown::Both);
+                let _ = t.get_ref().tcp.shutdown(std::net::Shutdown::Both);
             }
             Stream::Gone => {}
         }

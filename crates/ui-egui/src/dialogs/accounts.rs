@@ -615,6 +615,14 @@ struct Extra {
     dav_calendar: bool,
     dav_publish: String,
     dav_user: String,
+    /// A DAV password of its own (empty: keep the stored one, or use the account's).
+    dav_password: String,
+    /// A DAV password of its own is saved (it is never read back).
+    dav_has_password: bool,
+    /// Remove the saved DAV password: the server gets the account's password again.
+    dav_forget_password: bool,
+    /// Allow the DAV login over plain http (its own consent, not the mail server's).
+    dav_plain: bool,
 }
 
 impl Default for Extra {
@@ -651,6 +659,10 @@ impl Extra {
             dav_calendar: true,
             dav_publish: String::new(),
             dav_user: String::new(),
+            dav_password: String::new(),
+            dav_has_password: false,
+            dav_forget_password: false,
+            dav_plain: false,
         }
     }
 
@@ -667,6 +679,20 @@ impl Extra {
         self.dav_calendar = d.calendar;
         self.dav_publish = d.publish_url;
         self.dav_user = d.username;
+        self.dav_password.clear();
+        self.dav_forget_password = false;
+        self.dav_plain = d.allow_plaintext_auth;
+    }
+
+    /// The DAV password was saved: a typed one is now stored, a removed one is gone.
+    fn dav_password_saved(&mut self) {
+        if !self.dav_password.is_empty() {
+            self.dav_has_password = true;
+        } else if self.dav_forget_password {
+            self.dav_has_password = false;
+        }
+        self.dav_password.clear();
+        self.dav_forget_password = false;
     }
 
     /// `accounts.add` / `accounts.edit` DAV settings (`null`: none).
@@ -674,14 +700,27 @@ impl Extra {
         if self.dav_url.trim().is_empty() && self.dav_publish.trim().is_empty() {
             return Value::Null;
         }
-        json!({
+        let mut v = json!({
             "url": self.dav_url.trim(),
             "contacts": self.dav_contacts,
             "tasks": self.dav_tasks,
             "calendar": self.dav_calendar,
             "publishUrl": self.dav_publish.trim(),
             "username": self.dav_user.trim(),
-        })
+            "allowPlaintextAuth": self.dav_plain,
+        });
+        // A typed password replaces the saved one; an empty one removes it (only when asked to).
+        let password = if !self.dav_password.is_empty() {
+            Some(self.dav_password.as_str())
+        } else if self.dav_forget_password {
+            Some("")
+        } else {
+            None
+        };
+        if let (Some(pw), Some(o)) = (password, v.as_object_mut()) {
+            o.insert("password".into(), json!(pw));
+        }
+        v
     }
 }
 
@@ -881,6 +920,8 @@ impl Wizard {
         self.pop3 = mailcraft_engine::accounts::kind_label(&app.s, a) == "pop3";
         self.extra = Extra::from_options(&mailcraft_engine::accounts::account_options(&app.s, a.id));
         self.extra.fill_dav(a.dav.as_ref());
+        self.extra.dav_has_password =
+            app.s.secrets.get(&mailcraft_engine::accounts::dav_secret_key(a.id)).is_some();
         self.address.clone_from(&a.address);
         self.name.clone_from(&a.sender_name);
         self.account_name.clone_from(&a.display_name);
@@ -1009,6 +1050,7 @@ impl Wizard {
         match self.change.or(self.created) {
             Some(id) => {
                 try_run(app, "accounts.edit", self.params(Some(id)))?;
+                self.extra.dav_password_saved();
                 Ok(id)
             }
             None => {
@@ -1019,6 +1061,7 @@ impl Wizard {
                     .and_then(|n| u32::try_from(n).ok())
                     .ok_or_else(|| "the account was not added".to_owned())?;
                 self.created = Some(id);
+                self.extra.dav_password_saved();
                 Ok(id)
             }
         }
@@ -1409,10 +1452,32 @@ fn pim_server_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
             ui.end_row();
             grid_edit(ui, "User name (if different):", &mut e.dav_user, "", false);
             ui.end_row();
+            grid_edit(ui, "Password (if different):", &mut e.dav_password, "", true);
+            ui.end_row();
+            if e.dav_has_password {
+                ui.label("");
+                ui.vertical(|ui| {
+                    let saved = if e.dav_forget_password {
+                        "The saved password for this server is removed when you save."
+                    } else {
+                        "This server has a saved password of its own (leave the field empty to keep it)."
+                    };
+                    ui.label(RichText::new(saved).color(app.theme.text_muted));
+                    ui.checkbox(&mut e.dav_forget_password, "Use the account's password instead");
+                });
+                ui.end_row();
+            }
+            ui.label("");
+            ui.checkbox(&mut e.dav_plain, "Allow signing in over http:// (a server on this computer or network)");
+            ui.end_row();
         });
         ui.label(
-            RichText::new("The server's password is the account's. Send/Receive updates contacts, tasks, calendars and published calendars.")
-                .color(app.theme.text_muted),
+            RichText::new(
+                "Without a password of its own the server gets the account's password. A sign-in through the \
+                 mail provider's page only works for the provider's own server. Send/Receive updates contacts, \
+                 tasks, calendars and published calendars.",
+            )
+            .color(app.theme.text_muted),
         );
     });
     let Some(id) = st.change.or(st.created) else { return };
@@ -1971,4 +2036,43 @@ fn progress(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             })
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    #[test]
+    fn dav_settings_carry_their_own_password_and_plain_http_consent() {
+        let mut e = Extra { dav_url: "http://127.0.0.1:5232/".into(), ..Extra::default() };
+        let v = e.dav_param();
+        assert!(v.get("password").is_none(), "an empty field keeps the stored password");
+        assert_eq!(v["allowPlaintextAuth"], false);
+        e.dav_password = "dav-pw".into();
+        e.dav_plain = true;
+        let v = e.dav_param();
+        assert_eq!((v["password"].as_str(), v["allowPlaintextAuth"].as_bool()), (Some("dav-pw"), Some(true)));
+        e.fill_dav(Some(&mailcraft_model::DavSettings { allow_plaintext_auth: false, ..Default::default() }));
+        assert!(e.dav_password.is_empty() && !e.dav_plain);
+    }
+
+    #[test]
+    fn a_saved_dav_password_can_be_removed() {
+        // Regression: once saved, a DAV password could not be removed from the dialog (an empty field keeps
+        // it), so the server never got the account's password again.
+        let mut e =
+            Extra { dav_url: "https://dav.example.com/".into(), dav_has_password: true, ..Extra::default() };
+        assert!(e.dav_param().get("password").is_none(), "kept unless asked");
+        e.dav_forget_password = true;
+        assert_eq!(e.dav_param()["password"], "", "an empty password removes the saved one");
+        e.dav_password_saved();
+        assert!(!e.dav_has_password && !e.dav_forget_password);
+        // A typed password wins over removing, and is then the saved one.
+        e.dav_forget_password = true;
+        e.dav_password = "new-pw".into();
+        assert_eq!(e.dav_param()["password"], "new-pw");
+        e.dav_password_saved();
+        assert!(e.dav_has_password && e.dav_password.is_empty());
+    }
 }

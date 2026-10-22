@@ -59,6 +59,19 @@ pub struct DavState {
     next_etag: u64,
     /// "METHOD path" of every DAV request, oldest first (capped).
     pub requests: Vec<String>,
+    /// Answer PUT without an ETag (allowed by RFC 4791 / 6352: the client lists again to learn it).
+    pub put_without_etag: bool,
+    /// Stored right after the next successful PUT, as if another client wrote it meanwhile: (user,
+    /// collection, name, data).
+    pub after_next_put: Option<(String, String, String, String)>,
+    /// Collections moved elsewhere: (user key, old name) → new name. Requests for the old one are redirected
+    /// (301) to the new one.
+    pub moved: BTreeMap<(String, String), String>,
+    /// The next signed-in request whose path starts with this is refused (401), as if the server had revoked
+    /// the sign-in on its side only.
+    pub refuse_once: Option<String>,
+    /// An href added to every collection listing (a response naming something that is not a member).
+    pub stray_href: Option<String>,
 }
 
 pub type SharedDav = Arc<Mutex<DavState>>;
@@ -93,6 +106,24 @@ impl DavState {
 
     pub fn collection_mut(&mut self, user: &str, name: &str) -> Option<&mut Collection> {
         self.collections.get_mut(&(Self::key(user), name.to_owned()))
+    }
+
+    /// Adds (or replaces) a collection of `user`.
+    pub fn add_collection(&mut self, user: &str, name: &str, kind: Kind, display: &str) {
+        self.ensure(user);
+        self.collections.insert(
+            (Self::key(user), name.to_owned()),
+            Collection { kind, display: display.to_owned(), items: BTreeMap::new() },
+        );
+    }
+
+    /// Moves a collection of `user` to another name; the old name then redirects to the new one.
+    pub fn move_collection(&mut self, user: &str, from: &str, to: &str) -> bool {
+        self.ensure(user);
+        let Some(c) = self.collections.remove(&(Self::key(user), from.to_owned())) else { return false };
+        self.collections.insert((Self::key(user), to.to_owned()), c);
+        self.moved.insert((Self::key(user), from.to_owned()), to.to_owned());
+        true
     }
 
     pub fn new_etag(&mut self) -> String {
@@ -155,6 +186,19 @@ const MS_OPEN: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 fn multistatus(conn: &mut Conn, responses: &[String]) -> io::Result<()> {
     let body = format!("{MS_OPEN}{}</d:multistatus>", responses.concat());
     respond(conn, "207 Multi-Status", &[("Content-Type", "application/xml; charset=utf-8")], body.as_bytes())
+}
+
+/// A resource name as it appears in an href: percent-encoded except for unreserved characters and `@`.
+fn href_name(name: &str) -> String {
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'@') {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 fn response(href: &str, props: &str) -> String {
@@ -257,7 +301,16 @@ pub fn handle(conn: &mut Conn, ctx: &Ctx, req: &Request) -> io::Result<()> {
             }
         };
     }
-    let Some(me) = authenticate(ctx, req) else {
+    let signed_in = authenticate(ctx, req);
+    let refused = signed_in.is_some() && {
+        let mut d = ctx.dav.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = d.refuse_once.as_deref().is_some_and(|prefix| path.starts_with(prefix));
+        if hit {
+            d.refuse_once = None;
+        }
+        hit
+    };
+    let Some(me) = signed_in.filter(|_| !refused) else {
         return respond(
             conn,
             "401 Unauthorized",
@@ -302,14 +355,20 @@ pub fn handle(conn: &mut Conn, ctx: &Ctx, req: &Request) -> io::Result<()> {
         if depth == "1" {
             for ((u, name), c) in &d.collections {
                 if *u == DavState::key(&me) {
-                    out.push(response(&format!("{principal}{name}/"), &collection_props(c)));
+                    out.push(response(&format!("{principal}{}/", href_name(name)), &collection_props(c)));
                 }
             }
         }
         drop(d);
         return multistatus(conn, &out);
     };
-    let base = format!("{principal}{coll}/");
+    if let Some(to) = d.moved.get(&(DavState::key(&me), coll.clone())).cloned() {
+        drop(d);
+        let rest = item_seg.as_deref().map(href_name).unwrap_or_default();
+        let to = format!("{principal}{}/{rest}", href_name(&to));
+        return respond(conn, "301 Moved Permanently", &[("Location", &to)], b"");
+    }
+    let base = format!("{principal}{}/", href_name(&coll));
     let Some(c) = d.collection(&me, &coll).cloned() else {
         drop(d);
         return plain(conn, "404 Not Found", "no such collection");
@@ -317,11 +376,15 @@ pub fn handle(conn: &mut Conn, ctx: &Ctx, req: &Request) -> io::Result<()> {
     let Some(item) = item_seg else {
         return match req.method.as_str() {
             "PROPFIND" => {
+                let stray = d.stray_href.clone();
                 drop(d);
                 let mut out = vec![response(&base, &collection_props(&c))];
                 if depth == "1" {
                     for (name, i) in &c.items {
-                        out.push(response(&format!("{base}{name}"), &item_props(i)));
+                        out.push(response(&format!("{base}{}", href_name(name)), &item_props(i)));
+                    }
+                    if let Some(h) = stray {
+                        out.push(response(&h, "<d:resourcetype/><d:getetag>\"stray\"</d:getetag>"));
                     }
                 }
                 multistatus(conn, &out)
@@ -402,9 +465,15 @@ pub fn handle(conn: &mut Conn, ctx: &Ctx, req: &Request) -> io::Result<()> {
             }
             let ctype = req.header("content-type").unwrap_or("application/octet-stream").to_owned();
             let etag = d.put(&me, &coll, &item, req.body.clone(), &ctype).unwrap_or_default();
+            if let Some((u, c, n, data)) = d.after_next_put.take() {
+                let ctype = if c == "contacts" { "text/vcard" } else { "text/calendar" };
+                d.put(&u, &c, &n, data.into_bytes(), ctype);
+            }
+            let etag = if d.put_without_etag { String::new() } else { etag };
             drop(d);
             let status = if current.is_some() { "204 No Content" } else { "201 Created" };
-            respond(conn, status, &[("ETag", &etag)], b"")
+            let headers: &[(&str, &str)] = if etag.is_empty() { &[] } else { &[("ETag", &etag)] };
+            respond(conn, status, headers, b"")
         }
         "DELETE" => {
             let if_match = req.header("if-match").map(str::trim);
@@ -425,7 +494,9 @@ pub fn handle(conn: &mut Conn, ctx: &Ctx, req: &Request) -> io::Result<()> {
         "PROPFIND" => {
             drop(d);
             match current {
-                Some(i) => multistatus(conn, &[response(&format!("{base}{item}"), &item_props(&i))]),
+                Some(i) => {
+                    multistatus(conn, &[response(&format!("{base}{}", href_name(&item)), &item_props(&i))])
+                }
                 None => plain(conn, "404 Not Found", "not found"),
             }
         }

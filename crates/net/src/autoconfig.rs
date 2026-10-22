@@ -71,7 +71,9 @@ fn unescape(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(rest.get(..i).unwrap_or_default());
         let after = rest.get(i..).unwrap_or_default();
-        let semi = after.find(';').filter(|j| *j <= 12);
+        // Only a short window is searched: the longest reference kept is 12 bytes (`&#x10FFFF;` and the
+        // like), and scanning the whole rest for every `&` would make a long run of them quadratic.
+        let semi = after.as_bytes().iter().take(13).position(|&b| b == b';');
         let replaced = semi.and_then(|j| {
             let ent = after.get(1..j)?;
             let c = match ent {
@@ -156,12 +158,17 @@ pub fn parse_xml_with(input: &str, max_bytes: usize, max_elements: usize) -> Res
             continue;
         }
         if let Some(r) = rest.strip_prefix("<!") {
-            // DOCTYPE (with an optional internal subset): skipped, entities are not expanded.
-            let end = match r.find('[') {
-                Some(b) if r.find('>').is_none_or(|g| b < g) => {
+            // DOCTYPE (with an optional internal subset): skipped, entities are not expanded. The `[` of a
+            // subset is only looked for before the declaration's first `>` (searching the rest of the document
+            // for every declaration would make many of them quadratic).
+            let gt = r.find('>');
+            let subset = gt.and_then(|g| r.get(..g)).is_some_and(|head| head.contains('['));
+            let end = match gt {
+                Some(_) if subset => {
                     r.find("]>").map(|e| e + 2).ok_or_else(|| xml_err("unterminated DOCTYPE"))?
                 }
-                _ => r.find('>').map(|e| e + 1).ok_or_else(|| xml_err("unterminated declaration"))?,
+                Some(g) => g + 1,
+                None => return Err(xml_err("unterminated declaration")),
             };
             pos += 2 + end;
             continue;
@@ -532,5 +539,32 @@ mod tests {
                 let _ = parse_autoconfig(p.as_bytes(), "a@example.com");
             }
         }
+    }
+
+    #[test]
+    fn long_runs_of_references_and_declarations_parse_in_linear_time() {
+        // Regression: every `&` searched the whole rest of the text for a `;`, and every `<!…>` the rest of
+        // the document for a `[`, so a 32 MiB WebDAV answer of either took hours.
+        const MIB32: usize = 32 * 1024 * 1024;
+        let budget = std::time::Duration::from_secs(60);
+        let amps = format!("<a>{}</a>", "&".repeat(MIB32 - 7));
+        let t = std::time::Instant::now();
+        let el = parse_xml_with(&amps, MIB32, 10).unwrap();
+        assert_eq!(el.text.len(), MIB32 - 7);
+        assert!(t.elapsed() < budget, "{:?}", t.elapsed());
+        let decls = format!("<a>{}</a>", "<!a>".repeat((MIB32 - 7) / 4));
+        let t = std::time::Instant::now();
+        let el = parse_xml_with(&decls, MIB32, 10).unwrap();
+        assert!(el.text.is_empty() && el.children.is_empty());
+        assert!(t.elapsed() < budget, "{:?}", t.elapsed());
+        // References and declarations still read as before.
+        assert_eq!(
+            unescape("a &amp; b &#x10FFFF; &#1114111; &unknownentityname; &"),
+            "a & b \u{10FFFF} \u{10FFFF} &unknownentityname; &"
+        );
+        let el = parse_xml("<!DOCTYPE r [ <!ENTITY x \"y\"> ]><!x><r>t</r>").unwrap();
+        assert_eq!(el.text, "t");
+        assert!(parse_xml("<!DOCTYPE r [ <!ENTITY x \"y\">").is_err());
+        assert!(parse_xml("<r><!x").is_err());
     }
 }

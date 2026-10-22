@@ -45,7 +45,11 @@ fn session() -> Session {
     s
 }
 
-fn add_alice(s: &mut Session, srv: &TestServers, dav: Value) -> AccountId {
+fn add_alice(s: &mut Session, srv: &TestServers, mut dav: Value) -> AccountId {
+    // The DAV server's certificate is trusted by the DAV settings themselves (never by the mail server's).
+    if let Some(o) = dav.as_object_mut() {
+        o.entry("extraRootPem").or_insert_with(|| json!(srv.cert_pem));
+    }
     let r = run(
         s,
         "accounts.add",
@@ -671,4 +675,612 @@ fn a_collection_with_events_and_tasks_is_shared_by_calendar_and_tasks() {
     assert_eq!(calendar_items(&s, cal).len(), 2);
     update_folder(&mut s, cal);
     assert_eq!(srv.dav_items(ALICE, "calendar").len(), 2, "the task stays on the server");
+}
+
+fn puts(srv: &TestServers) -> usize {
+    srv.dav_requests().iter().filter(|r| r.starts_with("PUT")).count()
+}
+
+fn account_error(s: &Session) -> String {
+    s.sync_status().accounts.iter().find_map(|a| a.error.clone()).unwrap_or_default()
+}
+
+const PHONE: &str =
+    "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:phone-1\r\nFN:Sam Phone\r\nN:Phone;Sam;;;\r\nEND:VCARD\r\n";
+
+#[test]
+fn a_put_without_an_etag_never_deletes_what_another_device_added() {
+    // Regression: after a PUT answered without an ETag, the run listed the collection again and took every
+    // resource in it as known, also one another device created meanwhile; the next run read its absence here
+    // as a deletion and removed it from the server.
+    let srv = servers();
+    srv.set_dav_put_etags(false);
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "tasks": false, "calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    let id = ItemId(s.mailbox.alloc_id());
+    s.mailbox.contacts.insert(
+        id,
+        Contact {
+            id,
+            folder: contacts,
+            first_name: "Robin".into(),
+            last_name: "Sample".into(),
+            ..Default::default()
+        },
+    );
+    srv.put_dav_item_after_next_put(ALICE, "contacts", "phone-1.vcf", PHONE);
+    update_folder(&mut s, contacts);
+    assert_eq!(
+        srv.dav_items(ALICE, "contacts").len(),
+        2,
+        "uploaded, and the phone's contact arrived meanwhile"
+    );
+    let robin = s.mailbox.contacts[&id].remote.clone().expect("linked");
+    assert!(!robin.etag.is_empty(), "the ETag came from the second listing");
+    for _ in 0..2 {
+        update_folder(&mut s, contacts);
+        let names: Vec<String> = srv.dav_items(ALICE, "contacts").into_iter().map(|(n, _)| n).collect();
+        assert!(names.iter().any(|n| n == "phone-1.vcf"), "the other device's contact stays: {names:?}");
+    }
+    assert!(contact_named(&s, contacts, "Sam").is_some(), "and arrives here");
+    assert!(!srv.dav_requests().iter().any(|r| r.starts_with("DELETE")), "{:?}", srv.dav_requests());
+    assert_eq!(contacts_here(&s, contacts), 2);
+}
+
+#[test]
+fn publishing_never_replaces_or_removes_a_file_it_did_not_write() {
+    // Regression: a publication could name any resource on the publishing server, and was written with an
+    // unconditional PUT and removed with an unconditional DELETE.
+    let srv = servers();
+    let mut s = session();
+    let public = srv.dav_collection_url(ALICE, "public");
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "publishUrl": public}));
+    let cal = role(&s, alice, FolderRole::Calendar);
+    srv.put_dav_item(ALICE, "contacts", "pat-1.vcf", PAT).unwrap();
+    // Only a file inside the publishing location: not a contact, not the address book, not the location.
+    for bad in [
+        srv.dav_collection_url(ALICE, "contacts") + "pat-1.vcf",
+        srv.dav_collection_url(ALICE, "contacts"),
+        format!("{public}../contacts/pat-1.vcf"),
+        format!("{public}%2E%2E%2Fcontacts%2Fpat-1.vcf"),
+        public.clone(),
+    ] {
+        let e = s.run("calendar.publish", &json!({"folder": cal.0, "url": bad}));
+        assert!(e.is_err(), "{bad}: {e:?}");
+    }
+    // Someone else's file already at the address: left as it is.
+    srv.put_dav_item(ALICE, "public", "taken.ics", "someone else's file").unwrap();
+    run(&mut s, "calendar.publish", json!({"folder": cal.0, "url": format!("{public}taken.ics")}));
+    settle(&mut s);
+    let file = |n: &str| srv.dav_items(ALICE, "public").into_iter().find(|(x, _)| x == n).map(|(_, d)| d);
+    assert_eq!(file("taken.ics").as_deref(), Some("someone else's file"));
+    assert!(account_error(&s).contains("did not publish"), "{}", account_error(&s));
+    // Stopped: nothing of MailCraft's to remove, so the file stays.
+    run(&mut s, "calendar.publish", json!({"folder": cal.0, "stop": true}));
+    settle(&mut s);
+    assert_eq!(file("taken.ics").as_deref(), Some("someone else's file"));
+    assert!(srv.dav_requests().iter().all(|r| !r.starts_with("DELETE")), "{:?}", srv.dav_requests());
+
+    // A file of its own: replaced only while it is still the one MailCraft wrote.
+    run(&mut s, "calendar.publish", json!({"folder": cal.0, "url": format!("{public}mine.ics")}));
+    settle(&mut s);
+    assert!(file("mine.ics").is_some_and(|d| d.contains("BEGIN:VCALENDAR")));
+    srv.put_dav_item(ALICE, "public", "mine.ics", "replaced by hand").unwrap();
+    let id = ItemId(s.mailbox.alloc_id());
+    s.mailbox.appointments.insert(
+        id,
+        Appointment {
+            id,
+            folder: cal,
+            uid: "review@example.com".into(),
+            subject: "Review".into(),
+            start: DateTime::from_unix(1_790_000_000, 0),
+            end: DateTime::from_unix(1_790_003_600, 0),
+            ..Default::default()
+        },
+    );
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(file("mine.ics").as_deref(), Some("replaced by hand"), "not overwritten");
+    // And not removed when publishing stops, but not quietly either: the address is still public.
+    run(&mut s, "calendar.publish", json!({"folder": cal.0, "stop": true}));
+    settle(&mut s);
+    assert_eq!(file("mine.ics").as_deref(), Some("replaced by hand"), "not removed");
+    let e = account_error(&s);
+    assert!(e.contains("still published") && e.contains("mine.ics"), "{e}");
+    let p = mailcraft_engine::cmd::calendar::props::read(&s.mailbox, cal).publication.expect("kept");
+    assert!(p.withdraw && p.last_error.is_some(), "{p:?}");
+    assert_eq!(srv.dav_items(ALICE, "contacts").len(), 1, "the address book was never touched");
+    // Removed by hand: the next run sees it gone and the publication ends.
+    srv.delete_dav_item(ALICE, "public", "mine.ics");
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert!(mailcraft_engine::cmd::calendar::props::read(&s.mailbox, cal).publication.is_none());
+}
+
+#[test]
+fn uids_with_reserved_characters_get_resources_of_their_own() {
+    // Regression: every character outside `[A-Za-z0-9._-]` became `-`, so these three tasks shared one
+    // resource and two of them lost their content to the third.
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "contacts": false, "calendar": false}));
+    let tasks = role(&s, alice, FolderRole::Tasks);
+    for (uid, subject) in [("a@b.com", "At"), ("a#b.com", "Hash"), ("a/b.com", "Slash")] {
+        let id = ItemId(s.mailbox.alloc_id());
+        s.mailbox.tasks.insert(
+            id,
+            Task { id, folder: tasks, uid: uid.into(), subject: subject.into(), ..Default::default() },
+        );
+    }
+    update_folder(&mut s, tasks);
+    let mut names: Vec<String> = srv.dav_items(ALICE, "tasks").into_iter().map(|(n, _)| n).collect();
+    names.sort();
+    assert_eq!(names, ["a#b.com.ics", "a/b.com.ics", "a@b.com.ics"]);
+    let before = puts(&srv);
+    update_folder(&mut s, tasks);
+    assert_eq!(puts(&srv), before, "nothing uploaded again");
+    let mut subjects: Vec<String> =
+        s.mailbox.tasks.values().filter(|t| t.folder == tasks).map(|t| t.subject.clone()).collect();
+    subjects.sort();
+    assert_eq!(subjects, ["At", "Hash", "Slash"]);
+    assert!(s.mailbox.tasks.values().filter(|t| t.folder == tasks).all(|t| t.remote.is_some()));
+}
+
+#[test]
+fn discovery_starts_from_an_address_with_escapes() {
+    // Regression: `alice%40example.com` was encoded again (`alice%2540example.com`), a path that does not
+    // exist, so no address book was found.
+    let srv = servers();
+    let mut s = session();
+    let url = format!("{}/dav/alice%40example.com/", srv.web_url());
+    let alice = add_alice(&mut s, &srv, json!({"url": url, "tasks": false, "calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    srv.put_dav_item(ALICE, "contacts", "pat-1.vcf", PAT).unwrap();
+    update_folder(&mut s, contacts);
+    assert!(contact_named(&s, contacts, "Pat").is_some());
+    assert!(srv.dav_requests().iter().all(|r| !r.contains("%25")), "{:?}", srv.dav_requests());
+}
+
+#[test]
+fn dav_does_not_borrow_the_mail_servers_connection_settings() {
+    // Regression: the DAV connection took the incoming server's trusted certificate (and plain-text consent).
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(
+        &mut s,
+        &srv,
+        json!({"url": srv.dav_url(), "tasks": false, "calendar": false, "extraRootPem": null}),
+    );
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    run(&mut s, "sendReceive.folder", json!({"folder": contacts.0}));
+    settle(&mut s);
+    let error = account_error(&s);
+    assert!(
+        error.to_ascii_lowercase().contains("tls"),
+        "the mail server's certificate is not trusted here: {error}"
+    );
+    assert!(srv.dav_requests().is_empty(), "{:?}", srv.dav_requests());
+    // Trusted in the DAV settings: works.
+    run(&mut s, "accounts.edit", json!({"account": alice.0, "dav": {"extraRootPem": srv.cert_pem}}));
+    update_folder(&mut s, contacts);
+}
+
+fn poll_until(s: &mut Session, what: &str, mut done: impl FnMut(&mut Session) -> bool) {
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        s.poll_sync();
+        if done(s) {
+            return;
+        }
+        assert!(std::time::Instant::now() < end, "timed out waiting for {what}: {:?}", s.sync_status());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+const LEE: &str =
+    "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:lee-1\r\nFN:Lee Example\r\nN:Example;Lee;;;\r\nEND:VCARD\r\n";
+
+/// Alice's account signed in with OAuth (device flow against the test authorization server), its DAV server
+/// set up with `dav`.
+fn oauth_alice(srv: &TestServers, s: &mut Session, mut dav: Value) -> AccountId {
+    s.sync.oauth_http = Some(mailcraft_engine::sync::ConnectOptions::trusting(srv.cert_der.clone()));
+    if let Some(o) = dav.as_object_mut() {
+        o.insert("url".into(), json!(srv.dav_url()));
+        o.insert("extraRootPem".into(), json!(srv.cert_pem));
+    }
+    let r = run(
+        s,
+        "accounts.add",
+        json!({
+            "kind": "imap",
+            "address": ALICE,
+            "incoming": {"host": "127.0.0.1", "port": srv.imaps_port, "security": "tls", "extraRootPem": srv.cert_pem},
+            "dav": dav,
+        }),
+    );
+    let alice = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+    let (_, token, device) = srv.oauth_endpoints();
+    run(
+        s,
+        "accounts.oauthSignIn",
+        json!({"account": alice.0, "provider": "custom", "clientId": mailcraft_testmail::OAUTH_TEST_CLIENT,
+               "flow": "device", "tokenEndpoint": token, "deviceAuthorizationEndpoint": device, "scopes": ["mail"]}),
+    );
+    let mut code = String::new();
+    poll_until(s, "the device code", |s| {
+        code = s.run("accounts.oauthStatus", &json!({"account": alice.0})).unwrap()["userCode"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        !code.is_empty()
+    });
+    srv.oauth_approve(&code, ALICE).unwrap();
+    poll_until(s, "sign-in", |s| {
+        s.run("accounts.oauthStatus", &json!({"account": alice.0})).unwrap()["status"] == "done"
+    });
+    alice
+}
+
+fn refreshes(srv: &TestServers) -> usize {
+    srv.oauth_grants().iter().filter(|g| *g == "refresh_token").count()
+}
+
+#[test]
+fn a_token_only_the_dav_server_refuses_is_renewed_once_and_dav_tried_again() {
+    // The mail server still takes the token, the DAV server refuses it (revoked on its side): the run renews
+    // the token once and the DAV part goes through with the new one.
+    let srv = servers();
+    let mut s = session();
+    let alice = oauth_alice(&srv, &mut s, json!({"tasks": false, "calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    srv.put_dav_item(ALICE, "contacts", "pat-1.vcf", PAT).unwrap();
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert!(contact_named(&s, contacts, "Pat").is_some(), "{:?}", s.sync_status());
+    let before = refreshes(&srv);
+    srv.refuse_dav_sign_in_once("/dav/");
+    srv.put_dav_item(ALICE, "contacts", "lee-1.vcf", LEE).unwrap();
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(account_error(&s), "", "{:?}", s.sync_status());
+    assert_eq!(refreshes(&srv), before + 1, "renewed exactly once");
+    assert!(contact_named(&s, contacts, "Lee").is_some(), "the second DAV pass went through");
+    assert_eq!(contacts_here(&s, contacts), 2);
+}
+
+#[test]
+fn a_refusal_after_folders_were_updated_is_not_retried_from_the_start() {
+    // A retry runs the whole DAV job again from the state it was built with; once a folder's result went out,
+    // that state is stale, so the refusal is reported instead (the next run starts afresh).
+    let srv = servers();
+    let mut s = session();
+    let alice = oauth_alice(&srv, &mut s, json!({"calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(account_error(&s), "", "{:?}", s.sync_status());
+    let before = refreshes(&srv);
+    srv.put_dav_item(ALICE, "contacts", "pat-1.vcf", PAT).unwrap();
+    srv.refuse_dav_sign_in_once(&format!("/dav/{ALICE}/tasks/"));
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert!(!account_error(&s).is_empty(), "the refusal is reported");
+    assert_eq!(refreshes(&srv), before, "not retried");
+    assert!(contact_named(&s, contacts, "Pat").is_some(), "the contacts folder was updated before");
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(account_error(&s), "", "{:?}", s.sync_status());
+    assert_eq!(contacts_here(&s, contacts), 1);
+}
+
+/// `url` with every `%XX` escape decoded, as an earlier version stored links.
+fn decoded(url: &str) -> String {
+    let b = url.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) =
+                b.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// Rewrites what the account stored for `folder` (collection, known resources, the items' links) the way an
+/// earlier version stored it: every path fully decoded.
+fn store_like_an_earlier_version(s: &mut Session, account: AccountId, folder: FolderId) {
+    let a = s.mailbox.accounts.iter_mut().find(|a| a.id == account).unwrap();
+    let st = a.sync.dav.get_mut(&folder).unwrap();
+    st.collection = decoded(&st.collection);
+    st.known = st.known.iter().map(|(u, e)| (decoded(u), e.clone())).collect();
+    for c in s.mailbox.contacts.values_mut().filter(|c| c.folder == folder) {
+        if let Some(r) = c.remote.as_mut() {
+            r.url = decoded(&r.url);
+        }
+    }
+}
+
+const SAM: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:sam-2\r\nFN:Sam Plus\r\nN:Plus;Sam;;;\r\nEND:VCARD\r\n";
+
+#[test]
+fn links_stored_by_an_earlier_version_still_match_after_the_upgrade() {
+    // Regression: an earlier version stored links with their paths decoded. Read back, a name with a space
+    // or `+` (`%2B` on the server) and an address book with `#` in its name matched nothing on the server:
+    // every unchanged contact looked deleted there and was removed here (local-only details lost), then
+    // imported again as a new contact.
+    let srv = servers();
+    let mut s = session();
+    // Sorted first, so the Contacts folder takes it.
+    srv.add_dav_collection(ALICE, "My Book #1", false, "My Book");
+    srv.put_dav_item(ALICE, "My Book #1", "John Smith.vcf", PAT).unwrap();
+    srv.put_dav_item(ALICE, "My Book #1", "a+b.vcf", SAM).unwrap();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "tasks": false, "calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    update_folder(&mut s, contacts);
+    let collection = s.mailbox.account(alice).unwrap().sync.dav[&contacts].collection.clone();
+    assert!(collection.ends_with("/My%20Book%20%231/"), "{collection}");
+    let ids: Vec<ItemId> =
+        s.mailbox.contacts.values().filter(|c| c.folder == contacts).map(|c| c.id).collect();
+    assert_eq!(ids.len(), 2);
+    let pat = contact_named(&s, contacts, "Pat").unwrap().id;
+    s.mailbox.contacts.get_mut(&pat).unwrap().flag = mailcraft_engine::model::FlagState::Flagged {
+        label: "Follow up".into(),
+        start: None,
+        due: None,
+        reminder: None,
+    };
+    let canonical: Vec<String> =
+        ids.iter().map(|id| s.mailbox.contacts[id].remote.as_ref().unwrap().url.clone()).collect();
+
+    for full in [false, true] {
+        store_like_an_earlier_version(&mut s, alice, contacts);
+        assert!(s.mailbox.contacts[&pat].remote.as_ref().unwrap().url.contains("#1/"));
+        let before = srv.dav_requests().len();
+        if full {
+            run(&mut s, "sendReceive.all", json!({}));
+            settle(&mut s);
+            assert_eq!(account_error(&s), "", "{:?}", s.sync_status());
+        } else {
+            update_folder(&mut s, contacts);
+        }
+        let now: Vec<ItemId> =
+            s.mailbox.contacts.values().filter(|c| c.folder == contacts).map(|c| c.id).collect();
+        assert_eq!(now, ids, "the same contacts, none removed or imported again (full run: {full})");
+        assert!(matches!(s.mailbox.contacts[&pat].flag, mailcraft_engine::model::FlagState::Flagged { .. }));
+        let sent: Vec<String> = srv.dav_requests()[before..].to_vec();
+        assert!(sent.iter().all(|r| !r.starts_with("PUT") && !r.starts_with("DELETE")), "{sent:?}");
+        // The links take the server's form again.
+        let links: Vec<String> =
+            ids.iter().map(|id| s.mailbox.contacts[id].remote.as_ref().unwrap().url.clone()).collect();
+        assert_eq!(links, canonical);
+        assert_eq!(s.mailbox.account(alice).unwrap().sync.dav[&contacts].collection, collection);
+    }
+    assert_eq!(srv.dav_items(ALICE, "My Book #1").len(), 2);
+}
+
+#[test]
+fn a_collection_the_server_moved_keeps_its_items() {
+    // Regression: a collection whose listing was redirected listed nothing (its members are under the new
+    // path), so every item looked deleted on the server and was removed here.
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "tasks": false, "calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    srv.put_dav_item(ALICE, "contacts", "pat-1.vcf", PAT).unwrap();
+    srv.put_dav_item(ALICE, "contacts", "lee-1.vcf", LEE).unwrap();
+    update_folder(&mut s, contacts);
+    let ids: Vec<ItemId> =
+        s.mailbox.contacts.values().filter(|c| c.folder == contacts).map(|c| c.id).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(srv.move_dav_collection(ALICE, "contacts", "address-book"));
+    let before = srv.dav_requests().len();
+    update_folder(&mut s, contacts);
+    let now: Vec<ItemId> =
+        s.mailbox.contacts.values().filter(|c| c.folder == contacts).map(|c| c.id).collect();
+    assert_eq!(now, ids);
+    let sent: Vec<String> = srv.dav_requests()[before..].to_vec();
+    assert!(sent.iter().all(|r| !r.starts_with("PUT") && !r.starts_with("DELETE")), "{sent:?}");
+    assert!(s.mailbox.account(alice).unwrap().sync.dav[&contacts].collection.ends_with("/address-book/"));
+    for id in &ids {
+        let url = &s.mailbox.contacts[id].remote.as_ref().unwrap().url;
+        assert!(url.contains("/address-book/"), "{url}");
+    }
+    // A full run finds it at its new address too.
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(account_error(&s), "", "{:?}", s.sync_status());
+    let now: Vec<ItemId> =
+        s.mailbox.contacts.values().filter(|c| c.folder == contacts).map(|c| c.id).collect();
+    assert_eq!(now, ids);
+    assert_eq!(srv.dav_items(ALICE, "address-book").len(), 2);
+}
+
+#[test]
+fn an_incomplete_listing_removes_nothing_here() {
+    // A listing with responses that are not members of the collection may be missing members: an item it
+    // does not show is not taken as deleted on the server that time.
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "tasks": false, "calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    srv.put_dav_item(ALICE, "contacts", "pat-1.vcf", PAT).unwrap();
+    srv.put_dav_item(ALICE, "contacts", "lee-1.vcf", LEE).unwrap();
+    update_folder(&mut s, contacts);
+    assert_eq!(contacts_here(&s, contacts), 2);
+    srv.delete_dav_item(ALICE, "contacts", "lee-1.vcf");
+    srv.set_stray_dav_href(Some("/elsewhere/x.vcf"));
+    update_folder(&mut s, contacts);
+    assert_eq!(contacts_here(&s, contacts), 2, "kept while the listing is incomplete");
+    srv.set_stray_dav_href(None);
+    update_folder(&mut s, contacts);
+    assert_eq!(contacts_here(&s, contacts), 1, "gone once the listing is complete");
+    assert!(contact_named(&s, contacts, "Lee").is_none());
+}
+
+const OTHER_TODO: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\nBEGIN:VTODO\r\nUID:other-9\r\nSUMMARY:From the phone\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+
+#[test]
+fn an_item_whose_address_another_item_took_goes_up_under_another_name() {
+    // Regression: when another device's item appeared at a new item's address during the run, that copy was
+    // remembered as known without being imported (deleting the item here later removed the other device's
+    // item from the server), and the item here retried the same address on every run.
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "contacts": false, "calendar": false}));
+    let tasks = role(&s, alice, FolderRole::Tasks);
+    let mut ids = Vec::new();
+    for (uid, subject) in [("first-1", "First"), ("dup-1", "Mine")] {
+        let id = ItemId(s.mailbox.alloc_id());
+        s.mailbox.tasks.insert(
+            id,
+            Task { id, folder: tasks, uid: uid.into(), subject: subject.into(), ..Default::default() },
+        );
+        ids.push(id);
+    }
+    // The first upload lets the phone's task in at the second one's address.
+    srv.put_dav_item_after_next_put(ALICE, "tasks", "dup-1.ics", OTHER_TODO);
+    update_folder(&mut s, tasks);
+    let names = |srv: &TestServers| {
+        let mut n: Vec<String> = srv.dav_items(ALICE, "tasks").into_iter().map(|(n, _)| n).collect();
+        n.sort();
+        n
+    };
+    let on_server = names(&srv);
+    assert_eq!(on_server.len(), 3, "{on_server:?}");
+    assert!(srv.dav_items(ALICE, "tasks").iter().any(|(n, d)| n == "dup-1.ics" && d.contains("other-9")));
+    let mine = s.mailbox.tasks[&ids[1]].remote.clone().expect("the task here went up under another name");
+    assert!(!mine.url.ends_with("/dup-1.ics"), "{}", mine.url);
+    assert!(
+        s.mailbox.tasks.values().any(|t| t.folder == tasks && t.subject == "From the phone"),
+        "the phone's task arrived"
+    );
+    let before = puts(&srv);
+    update_folder(&mut s, tasks);
+    assert_eq!(puts(&srv), before, "nothing retried");
+    // Deleting the task here removes its own copy only.
+    s.mailbox.tasks.remove(&ids[1]);
+    update_folder(&mut s, tasks);
+    let left = names(&srv);
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(left.iter().any(|n| n == "dup-1.ics"), "the phone's task stays: {left:?}");
+}
+
+#[test]
+fn a_withdrawal_saved_by_an_earlier_version_removes_its_file() {
+    // Regression: a pending removal saved by an earlier version (no ETag) was dropped without removing the
+    // file, and one outside the publishing location was dropped silently while the file stayed public.
+    use mailcraft_engine::cmd::calendar::props;
+    use mailcraft_engine::model::calendar::Withdrawal;
+    let srv = servers();
+    let mut s = session();
+    let public = srv.dav_collection_url(ALICE, "public");
+    let alice = add_alice(
+        &mut s,
+        &srv,
+        json!({"url": srv.dav_url(), "publishUrl": public, "contacts": false, "tasks": false, "calendar": false}),
+    );
+    let cal = role(&s, alice, FolderRole::Calendar);
+    srv.put_dav_item(ALICE, "public", "old.ics", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").unwrap();
+    srv.put_dav_item(ALICE, "calendar", "elsewhere.ics", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").unwrap();
+    let mut p = props::read(&s.mailbox, cal);
+    // As an earlier version's entries read back (see the model: no ETag field reads as `*`).
+    for url in [format!("{public}old.ics"), srv.dav_collection_url(ALICE, "calendar") + "elsewhere.ics"] {
+        p.withdrawals.push(Withdrawal { url, account: alice, etag: "*".into() });
+    }
+    props::write(&mut s.mailbox, cal, &p);
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert!(srv.dav_items(ALICE, "public").is_empty(), "the file inside the publishing location is removed");
+    // Outside it: left in place, but reported, and kept to look at again.
+    assert!(account_error(&s).contains("elsewhere.ics"), "{}", account_error(&s));
+    assert_eq!(srv.dav_items(ALICE, "calendar").len(), 1);
+    let left = props::read(&s.mailbox, cal).withdrawals;
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].url.ends_with("elsewhere.ics"));
+    // Removed by hand: the next run sees it gone and forgets it.
+    srv.delete_dav_item(ALICE, "calendar", "elsewhere.ics");
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(account_error(&s), "", "{:?}", s.sync_status());
+    assert!(props::read(&s.mailbox, cal).withdrawals.is_empty());
+}
+
+#[test]
+fn the_mail_token_goes_only_to_the_providers_dav_server_and_is_renewed_for_it() {
+    // Regressions: the DAV part kept the access token the job was built with after the run renewed it (every
+    // DAV request then failed to sign in), and the token went to any DAV server, the provider's or not.
+    let srv = servers();
+    let mut s = session();
+    s.sync.oauth_http = Some(mailcraft_engine::sync::ConnectOptions::trusting(srv.cert_der.clone()));
+    let r = run(
+        &mut s,
+        "accounts.add",
+        json!({
+            "kind": "imap",
+            "address": ALICE,
+            "incoming": {"host": "127.0.0.1", "port": srv.imaps_port, "security": "tls", "extraRootPem": srv.cert_pem},
+            "dav": {"url": srv.dav_url(), "tasks": false, "calendar": false, "extraRootPem": srv.cert_pem},
+        }),
+    );
+    let alice = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+    let (_, token, device) = srv.oauth_endpoints();
+    run(
+        &mut s,
+        "accounts.oauthSignIn",
+        json!({"account": alice.0, "provider": "custom", "clientId": mailcraft_testmail::OAUTH_TEST_CLIENT,
+               "flow": "device", "tokenEndpoint": token, "deviceAuthorizationEndpoint": device, "scopes": ["mail"]}),
+    );
+    let mut code = String::new();
+    poll_until(&mut s, "the device code", |s| {
+        code = s.run("accounts.oauthStatus", &json!({"account": alice.0})).unwrap()["userCode"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        !code.is_empty()
+    });
+    srv.oauth_approve(&code, ALICE).unwrap();
+    poll_until(&mut s, "sign-in", |s| {
+        s.run("accounts.oauthStatus", &json!({"account": alice.0})).unwrap()["status"] == "done"
+    });
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    srv.put_dav_item(ALICE, "contacts", "pat-1.vcf", PAT).unwrap();
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert!(contact_named(&s, contacts, "Pat").is_some(), "{:?}", s.sync_status());
+    // Every access token expires: the run renews it at the mail sign-in, and the DAV part uses the new one.
+    srv.oauth_expire_access_tokens();
+    srv.put_dav_item(ALICE, "contacts", "lee-1.vcf", LEE).unwrap();
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(account_error(&s), "", "{:?}", s.sync_status());
+    assert!(contact_named(&s, contacts, "Lee").is_some());
+
+    // A DAV server that is not the provider's: no token for it, it needs a password of its own.
+    let other = srv.dav_url().replace("127.0.0.1", "localhost");
+    run(&mut s, "accounts.edit", json!({"account": alice.0, "dav": {"url": other}}));
+    let before = srv.dav_requests().len();
+    run(&mut s, "sendReceive.folder", json!({"folder": contacts.0}));
+    settle(&mut s);
+    assert!(account_error(&s).contains("password of its own"), "{}", account_error(&s));
+    assert!(srv.dav_requests().len() > before, "the server was asked, without the token");
+    run(&mut s, "accounts.edit", json!({"account": alice.0, "dav": {"password": ALICE_PW}}));
+    let acct = run(&mut s, "accounts.list", json!({}))["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == alice.0)
+        .cloned()
+        .unwrap();
+    assert_eq!(acct["hasDavPassword"], true, "{acct}");
+    update_folder(&mut s, contacts);
+    assert!(contact_named(&s, contacts, "Lee").is_some());
 }

@@ -512,6 +512,16 @@ pub struct Withdrawal {
     pub url: String,
     /// Account whose DAV login removes it.
     pub account: crate::AccountId,
+    /// ETag of the file as MailCraft last wrote it (the removal is conditional on it, so a file someone else
+    /// put there meanwhile stays). Empty: never written, nothing is removed. `*`: written by a server that gave
+    /// no ETag, or by an earlier version, which kept none (a stored entry without the field reads as `*`, so
+    /// its file is still removed).
+    #[serde(default = "any_etag")]
+    pub etag: String,
+}
+
+fn any_etag() -> String {
+    "*".to_owned()
 }
 
 /// A calendar published to a WebDAV server: subscribers fetch `url` and refresh it.
@@ -535,6 +545,10 @@ pub struct Publication {
     pub last_error: Option<String>,
     /// Publishing was stopped: the next send/receive removes the published file, then the publication.
     pub withdraw: bool,
+    /// ETag of the file as MailCraft last wrote it: the next upload replaces only that file (`If-Match`), the
+    /// first one only creates a new file (`If-None-Match: *`). `*`: written by a server that gave no ETag.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub etag: String,
 }
 
 fn is_zero(n: &u64) -> bool {

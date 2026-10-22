@@ -106,6 +106,8 @@ pub(super) struct Conn {
     pub(super) incoming: Incoming,
     pub(super) smtp: Option<SmtpSettings>,
     pub(super) oauth: Option<OAuthRefresh>,
+    /// The OAuth access token renewed during this run (the DAV part signs in with it too).
+    pub(super) renewed: Option<mailcraft_net::dav::DavAuth>,
 }
 
 impl Conn {
@@ -124,6 +126,7 @@ impl Conn {
         if let Some(c) = self.smtp.as_mut().and_then(|s| s.credentials.as_mut()) {
             swap(c);
         }
+        self.renewed = Some(mailcraft_net::dav::DavAuth::Bearer(token.to_owned()));
     }
 }
 
@@ -404,6 +407,12 @@ impl Events {
     pub(super) fn send(&self, e: Event) -> bool {
         self.tx.send((self.serial, e)).is_ok()
     }
+
+    /// Events sent to `tx` (unit tests of a worker part).
+    #[cfg(test)]
+    pub(super) fn to(tx: mpsc::Sender<(u64, Event)>) -> Events {
+        Events { tx, serial: NO_WORKER }
+    }
 }
 
 pub(super) struct Runtime {
@@ -620,7 +629,7 @@ pub(super) fn conn_settings(s: &Session, a: &Account) -> Result<Conn, String> {
     } else {
         None
     };
-    Ok(Conn { incoming, smtp, oauth })
+    Ok(Conn { incoming, smtp, oauth, renewed: None })
 }
 
 /// What a JMAP account's worker listens to for push (`None` when the account cannot connect: no password).
@@ -1307,7 +1316,7 @@ fn run_job(
     slot: &mut Option<ImapAccount>,
     job: &mut Job,
     events: &Events,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> Option<String> {
     if let Err(e) = refresh_token(account, &mut job.conn, events, false) {
         return Some(e);
@@ -1350,9 +1359,29 @@ fn run_job(
     };
     meter.report(account, events);
     // Contacts, tasks and published calendars: after the mail, also when the mail part failed (another
-    // server may well be reachable).
-    let dav = match job.dav.as_ref() {
-        Some(d) if !cancel.load(Ordering::SeqCst) => super::dav::run(account, d, events, cancel),
+    // server may well be reachable). A token renewed above (or by the mail part) replaces the one the job was
+    // built with.
+    let dav = match job.dav.as_mut() {
+        Some(d) if !cancel.load(Ordering::SeqCst) => {
+            if let Some(mailcraft_net::dav::DavAuth::Bearer(t)) = &job.conn.renewed {
+                d.renew_token(t);
+            }
+            let mut end = super::dav::run(account, d, events, cancel);
+            // The token was refused (revoked, or expired early while the mail connection stayed signed in):
+            // renew it once and try again.
+            if end.refused && d.uses_token() && job.conn.oauth.is_some() {
+                end = match refresh_token(account, &mut job.conn, events, true) {
+                    Ok(_) => {
+                        if let Some(mailcraft_net::dav::DavAuth::Bearer(t)) = &job.conn.renewed {
+                            d.renew_token(t);
+                        }
+                        super::dav::run(account, d, events, cancel)
+                    }
+                    Err(e) => super::dav::DavEnd { error: Some(e), refused: true },
+                };
+            }
+            end.error
+        }
         _ => None,
     };
     res.or(dav)

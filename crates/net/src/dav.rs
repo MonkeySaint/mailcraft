@@ -20,12 +20,16 @@
 //! naming resources on another origin has those responses dropped, and an address learned from the server
 //! that points elsewhere is never followed with credentials.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use base64::Engine;
 
 use crate::autoconfig::{Element, parse_xml_with};
 use crate::error::{NetError, Result};
-use crate::http::{HttpClient, HttpResponse, Url, percent_decode};
-use crate::transport::ConnectOptions;
+use crate::http::{HttpClient, HttpResponse, Url, normalize_path, percent_decode};
+use crate::transport::{ConnectOptions, deadline_after};
 
 /// Largest WebDAV response read.
 pub const MAX_RESPONSE: usize = 32 * 1024 * 1024;
@@ -41,6 +45,8 @@ const MULTIGET_BATCH: usize = 25;
 pub const MAX_ITEM_DATA: usize = 8 * 1024 * 1024;
 /// Most data one [`DavClient::multiget`] call downloads in all.
 pub const MAX_FETCH_TOTAL: usize = 256 * 1024 * 1024;
+/// Longest one request may take, redirects included (each read also has the connection's own timeout).
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 /// How requests sign in.
 #[derive(Clone, PartialEq, Eq)]
@@ -128,6 +134,17 @@ pub struct Resource {
     /// Entity tag as the server wrote it (quotes included); empty when the server gave none.
     pub etag: String,
     pub content_type: String,
+}
+
+/// A collection's listing ([`DavClient::listing`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// The collection's address the answer came from (after redirects), path without its query.
+    pub collection: String,
+    pub resources: Vec<Resource>,
+    /// Responses left out because they did not name a direct member of the collection. When some were, the
+    /// listing may be incomplete: a resource missing from it is not known to be gone.
+    pub dropped: usize,
 }
 
 /// A downloaded resource.
@@ -220,13 +237,38 @@ pub struct DavClient {
     pub max_item: usize,
     /// Most data one [`DavClient::multiget`] downloads.
     pub max_total: usize,
+    /// Longest one request may take ([`REQUEST_DEADLINE`]).
+    pub request_deadline: Duration,
+    /// Set from elsewhere to stop: the next request fails at once (a cancelled send/receive).
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl DavClient {
     /// A client that signs in with `auth` only on the origins added with [`DavClient::trust`].
     pub fn new(options: ConnectOptions, auth: DavAuth) -> Self {
         let http = HttpClient { max_body: MAX_RESPONSE, ..HttpClient::new(options) };
-        DavClient { http, auth, trusted: Vec::new(), max_item: MAX_ITEM_DATA, max_total: MAX_FETCH_TOTAL }
+        DavClient {
+            http,
+            auth,
+            trusted: Vec::new(),
+            max_item: MAX_ITEM_DATA,
+            max_total: MAX_FETCH_TOTAL,
+            request_deadline: REQUEST_DEADLINE,
+            cancel: None,
+        }
+    }
+
+    /// Stops sending requests once `flag` is set: each request (every multiget batch and single GET
+    /// included) checks it first and fails with [`NetError::Timeout`].
+    #[must_use]
+    pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    /// True once the cancel flag given to [`DavClient::with_cancel`] is set.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
     }
 
     /// Sends the credentials to `url`'s origin too (ignored when `url` is not an http(s) address).
@@ -245,8 +287,8 @@ impl DavClient {
         origin_of(url).is_some_and(|o| self.trusted.contains(&o))
     }
 
-    /// Sends one request (with the account's credentials when `url` is on a trusted origin). 401 is
-    /// [`NetError::Auth`].
+    /// Sends one request (with the account's credentials when `url` is on a trusted origin), finished within
+    /// [`DavClient::request_deadline`]. 401 is [`NetError::Auth`].
     pub fn request(
         &self,
         method: &str,
@@ -254,12 +296,16 @@ impl DavClient {
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<HttpResponse> {
+        if self.is_cancelled() {
+            return Err(NetError::Timeout("Send/Receive was cancelled".into()));
+        }
         let auth = if self.is_trusted(url) { self.auth.header() } else { None };
         let mut h: Vec<(&str, &str)> = headers.to_vec();
         if let Some(a) = auth.as_deref() {
             h.push(("Authorization", a));
         }
-        let resp = self.http.request(method, url, &h, body)?;
+        let deadline = deadline_after(self.request_deadline);
+        let resp = self.http.request_with_deadline(method, url, &h, body, Some(deadline))?;
         // 403 is also how CalDAV and CardDAV refuse data a collection does not take (RFC 4791 section 5.3.2.1):
         // only 401 means the sign-in failed.
         if resp.status == 401 {
@@ -270,6 +316,17 @@ impl DavClient {
 
     /// `PROPFIND` (or `REPORT`) with an XML body; the multistatus answer's responses.
     fn multistatus(&self, method: &str, url: &str, depth: &str, body: &str) -> Result<Vec<MsResponse>> {
+        self.multistatus_at(method, url, depth, body).map(|(rs, _)| rs)
+    }
+
+    /// [`DavClient::multistatus`], also returning the address the answer came from (after redirects).
+    fn multistatus_at(
+        &self,
+        method: &str,
+        url: &str,
+        depth: &str,
+        body: &str,
+    ) -> Result<(Vec<MsResponse>, Url)> {
         let resp = self.request(
             method,
             url,
@@ -280,7 +337,8 @@ impl DavClient {
             return Err(NetError::Http { status: resp.status, body: resp.text_snippet() });
         }
         let base = Url::parse(&resp.url).or_else(|_| Url::parse(url))?;
-        parse_multistatus(&String::from_utf8_lossy(&resp.body), &base)
+        let rs = parse_multistatus(&String::from_utf8_lossy(&resp.body), &base)?;
+        Ok((rs, base))
     }
 
     /// Address books (or calendars) reachable from `start`: the collection itself when it is one, else the
@@ -390,13 +448,32 @@ impl DavClient {
             .collect())
     }
 
-    /// Every resource in `collection` with its ETag (sub-collections left out).
+    /// Every resource in `collection` with its ETag (sub-collections left out). Only direct members are
+    /// taken: an href outside the collection, deeper inside it, or with a `.` or `..` segment is dropped (a
+    /// request for it would land on another resource than the one listed).
     pub fn list(&self, collection: &str) -> Result<Vec<Resource>> {
+        self.listing(collection).map(|l| l.resources)
+    }
+
+    /// [`DavClient::list`], with the address the listing came from and how many responses were left out.
+    /// Membership is checked against the address that answered: a collection whose `PROPFIND` was redirected
+    /// (a server that moved its DAV root) lists its members under the new path.
+    pub fn listing(&self, collection: &str) -> Result<Listing> {
         let body = propfind_body("<d:resourcetype/><d:getetag/><d:getcontenttype/>");
-        let rs = self.multistatus("PROPFIND", collection, "1", &body)?;
+        let (rs, base) = self.multistatus_at("PROPFIND", collection, "1", &body)?;
+        let answered = format!("{}{}", base.origin(), base.path.split('?').next().unwrap_or("/"));
         let mut out = Vec::new();
+        let mut dropped = 0usize;
         for r in rs {
-            if same_path(&r.url, collection) || r.status.is_some_and(|s| !(200..300).contains(&s)) {
+            if same_path(&r.url, collection) || same_path(&r.url, &answered) {
+                continue;
+            }
+            if r.status.is_some_and(|s| !(200..300).contains(&s)) {
+                continue;
+            }
+            if !is_member(&answered, &r.url) {
+                log::warn!("dav: {} is not a resource of {answered}; left out", r.url);
+                dropped = dropped.saturating_add(1);
                 continue;
             }
             if r.resource_types().iter().any(|t| t == "collection") {
@@ -411,7 +488,7 @@ impl DavClient {
                 url: r.url,
             });
         }
-        Ok(out)
+        Ok(Listing { collection: answered, resources: out, dropped })
     }
 
     /// Downloads resources of `collection` (multiget reports, or single GETs when the server refuses
@@ -522,6 +599,16 @@ impl DavClient {
         Ok(resp.header("etag").map(str::to_owned).filter(|e| !e.is_empty() && e.len() <= 1024))
     }
 
+    /// The ETag of one resource (`PROPFIND` depth 0); `None` when the server gives none.
+    pub fn etag(&self, url: &str) -> Result<Option<String>> {
+        let rs = self.multistatus("PROPFIND", url, "0", &propfind_body("<d:getetag/>"))?;
+        Ok(rs
+            .iter()
+            .find(|r| same_path(&r.url, url))
+            .and_then(|r| r.text("getetag"))
+            .filter(|e| !e.is_empty() && e.len() <= 1024 && !e.contains(['\r', '\n'])))
+    }
+
     /// Removes a resource (only while it still has `etag`, when given). A resource already gone is fine.
     pub fn delete(&self, url: &str, etag: Option<&str>) -> Result<()> {
         let mut h: Vec<(&str, &str)> = Vec::new();
@@ -534,6 +621,19 @@ impl DavClient {
             st => Err(NetError::Http { status: st, body: resp.text_snippet() }),
         }
     }
+}
+
+/// True when `resource` is a direct member of `collection`: its path (normalised) is the collection's plus one
+/// non-empty segment that is not `.` or `..`.
+pub fn is_member(collection: &str, resource: &str) -> bool {
+    let path = |u: &str| -> Option<String> {
+        let p = Url::parse(u).ok()?.path;
+        Some(normalize_path(p.split('?').next().unwrap_or("/")))
+    };
+    let (Some(c), Some(r)) = (path(collection), path(resource)) else { return false };
+    let c = if c.ends_with('/') { c } else { format!("{c}/") };
+    let Some(name) = r.strip_prefix(&c) else { return false };
+    !name.is_empty() && !name.contains('/') && name != "." && name != ".."
 }
 
 /// A collection from a PROPFIND response (`url` empty when the response is not a collection).
@@ -779,5 +879,89 @@ mod tests {
         let e = c.multiget(&format!("{base}/c/"), &urls, Service::Contacts).unwrap_err();
         t.join().unwrap();
         assert!(matches!(e, NetError::TooLarge(_)), "{e:?}");
+    }
+
+    #[test]
+    fn listings_keep_direct_members_only() {
+        // Regression: an href such as `/c/%2E%2E%2Fother%2Fx.vcf` was decoded and requested as
+        // `/c/../other/x.vcf`, a resource outside the collection.
+        let body = r#"<d:multistatus xmlns:d="DAV:">
+          <d:response><d:href>/c/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
+          <d:response><d:href>/c/a.vcf</d:href><d:propstat><d:prop><d:getetag>"1"</d:getetag></d:prop></d:propstat></d:response>
+          <d:response><d:href>/c/a%2Fb.vcf</d:href><d:propstat><d:prop><d:getetag>"2"</d:getetag></d:prop></d:propstat></d:response>
+          <d:response><d:href>/c/../other/x.vcf</d:href><d:propstat><d:prop><d:getetag>"3"</d:getetag></d:prop></d:propstat></d:response>
+          <d:response><d:href>/c/%2E%2E</d:href><d:propstat><d:prop><d:getetag>"4"</d:getetag></d:prop></d:propstat></d:response>
+          <d:response><d:href>/c/sub/x.vcf</d:href><d:propstat><d:prop><d:getetag>"5"</d:getetag></d:prop></d:propstat></d:response>
+          <d:response><d:href>/other/y.vcf</d:href><d:propstat><d:prop><d:getetag>"6"</d:getetag></d:prop></d:propstat></d:response>
+        </d:multistatus>"#
+            .to_owned();
+        let (base, t, _rx) = serve(1, move |_| ms(207, &body));
+        let got = client(&base).list(&format!("{base}/c/")).unwrap();
+        t.join().unwrap();
+        let etags: Vec<&str> = got.iter().map(|r| r.etag.as_str()).collect();
+        assert_eq!(etags, ["\"1\"", "\"2\""], "{got:?}");
+        assert!(got[1].url.ends_with("/c/a%2Fb.vcf"), "the escape is kept: {}", got[1].url);
+        assert!(is_member("https://h.example.com/c", "https://h.example.com/c/x%40y.vcf"));
+        assert!(!is_member("https://h.example.com/c/", "https://h.example.com/c/."));
+        assert!(!is_member("https://h.example.com/c/", "https://h.example.com/c/"));
+        assert!(!is_member("https://h.example.com/c/", "https://h.example.com/cx/a.vcf"));
+    }
+
+    #[test]
+    fn a_redirected_listing_keeps_the_members_at_the_new_address() {
+        // Regression: membership was checked against the requested path, so a collection whose PROPFIND was
+        // redirected (a server that moved its DAV root) listed nothing, and every item looked deleted.
+        let body = r#"<d:multistatus xmlns:d="DAV:">
+          <d:response><d:href>/new/c/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
+          <d:response><d:href>/new/c/a.vcf</d:href><d:propstat><d:prop><d:getetag>"1"</d:getetag></d:prop></d:propstat></d:response>
+          <d:response><d:href>/other/x.vcf</d:href><d:propstat><d:prop><d:getetag>"2"</d:getetag></d:prop></d:propstat></d:response>
+        </d:multistatus>"#
+            .to_owned();
+        let (base, t, rx) = serve(2, move |seen| {
+            if seen.path.starts_with("/old/") {
+                b"HTTP/1.1 301 Moved\r\nLocation: /new/c/\r\nContent-Length: 0\r\n\r\n".to_vec()
+            } else {
+                ms(207, &body)
+            }
+        });
+        let l = client(&base).listing(&format!("{base}/old/c/")).unwrap();
+        t.join().unwrap();
+        assert_eq!(l.collection, format!("{base}/new/c/"));
+        let urls: Vec<&str> = l.resources.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, [format!("{base}/new/c/a.vcf")], "{l:?}");
+        assert_eq!(l.dropped, 1, "the href outside the collection is counted");
+        let seen: Vec<String> = rx.try_iter().map(|s| s.path).collect();
+        assert_eq!(seen, ["/old/c/", "/new/c/"]);
+    }
+
+    #[test]
+    fn a_cancelled_client_sends_nothing() {
+        let flag = Arc::new(AtomicBool::new(true));
+        // Nothing listens on port 1: a request that got through would fail differently.
+        let c = client("http://127.0.0.1:1/").with_cancel(Arc::clone(&flag));
+        assert!(c.is_cancelled());
+        let e = c.list("http://127.0.0.1:1/c/").unwrap_err();
+        assert!(matches!(e, NetError::Timeout(ref m) if m.contains("cancelled")), "{e:?}");
+        let e =
+            c.multiget("http://127.0.0.1:1/c/", &["http://127.0.0.1:1/c/a.vcf".into()], Service::Contacts);
+        assert!(matches!(e, Err(NetError::Timeout(_))), "{e:?}");
+        assert_eq!(
+            DavClient::new(ConnectOptions::default(), DavAuth::None).request_deadline,
+            REQUEST_DEADLINE
+        );
+    }
+
+    #[test]
+    fn a_resource_etag_comes_from_a_depth_0_propfind() {
+        let (base, t, rx) = serve(1, |_| {
+            ms(
+                207,
+                r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/p/cal.ics</d:href><d:propstat><d:prop><d:getetag>"e5"</d:getetag></d:prop></d:propstat></d:response></d:multistatus>"#,
+            )
+        });
+        assert_eq!(client(&base).etag(&format!("{base}/p/cal.ics")).unwrap().as_deref(), Some("\"e5\""));
+        t.join().unwrap();
+        let seen: Vec<_> = rx.try_iter().collect();
+        assert_eq!((seen[0].method.as_str(), seen[0].header("depth")), ("PROPFIND", Some("0")));
     }
 }

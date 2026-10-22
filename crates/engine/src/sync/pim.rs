@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mailcraft_formats::ics::{self, ImportOptions};
 use mailcraft_formats::vcf;
-use mailcraft_model::account::DavFolderState;
+use mailcraft_model::account::{DavFolderState, normalize_url_path};
 use mailcraft_model::task::TaskRecurrence;
 use mailcraft_model::{
     AccountId, Appointment, Contact, DateTime, Folder, FolderId, FolderKind, FolderRole, ItemId, Mailbox,
@@ -317,14 +317,109 @@ fn new_uid(account: AccountId, id: ItemId, now: i64) -> String {
     format!("mailcraft-{h:016x}-{}", id.0)
 }
 
-/// The resource URL for a new item: `<collection><uid>.<ext>`.
+/// Longest resource name made from a UID (before the extension).
+const MAX_RESOURCE_NAME: usize = 200;
+/// How much of a too-long UID's name is kept before its hash.
+const RESOURCE_NAME_PREFIX: usize = 150;
+
+/// The resource URL for a new item: `<collection><name>.<ext>`, the name being the UID with every byte other
+/// than a letter, digit, `-`, `_` or `.` percent-encoded, so different UIDs never share a name. A name longer
+/// than [`MAX_RESOURCE_NAME`] is cut and ends in `!` and a hash of the whole UID instead (`!` is never part of
+/// an encoded name).
 pub fn resource_url(collection: &str, uid: &str, kind: PimKind) -> String {
     let base = if collection.ends_with('/') { collection.to_owned() } else { format!("{collection}/") };
-    let name: String = uid
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+    let pieces: Vec<String> = uid
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
         .collect();
+    let total = pieces.iter().map(String::len).fold(0usize, usize::saturating_add);
+    let name = if total <= MAX_RESOURCE_NAME {
+        pieces.concat()
+    } else {
+        let mut name = String::with_capacity(RESOURCE_NAME_PREFIX + 17);
+        for p in &pieces {
+            if name.len() + p.len() > RESOURCE_NAME_PREFIX {
+                break;
+            }
+            name.push_str(p);
+        }
+        format!("{name}!{:016x}", fnv(uid.as_bytes()))
+    };
     format!("{base}{name}.{}", kind.extension())
+}
+
+/// Another resource URL for a new item whose [`resource_url`] another item already holds on the server: the
+/// name ends in `!` and a hash of the UID (a short name never holds a `!`, and a long one already ends in its
+/// hash, so this one ends in a second, different hash).
+pub fn alternate_resource_url(collection: &str, uid: &str, kind: PimKind) -> String {
+    let first = resource_url(collection, uid, kind);
+    let ext = format!(".{}", kind.extension());
+    let stem = first.strip_suffix(&ext).unwrap_or(&first);
+    let mut salted = Vec::with_capacity(uid.len().saturating_add(1));
+    salted.extend_from_slice(uid.as_bytes());
+    salted.push(0);
+    format!("{stem}!{:016x}{ext}", fnv(&salted))
+}
+
+/// True when a server copy's UID (as read from its data) is the UID of local item `local` (as uploaded: the
+/// characters a UID cannot carry are dropped, see `clean_uid`).
+pub fn same_uid(local: &str, server: &str) -> bool {
+    !local.is_empty() && !server.is_empty() && (local == server || clean_uid(local) == server)
+}
+
+/// The path of an http(s) address (from the first `/` after the host up to any `?` or `#`; `/` when none).
+fn web_path(url: &str) -> &str {
+    let rest = url.trim().split_once("://").map_or("", |(_, r)| r);
+    let path = rest.find(['/', '?', '#']).and_then(|i| rest.get(i..)).unwrap_or("/");
+    match path.split(['?', '#']).next() {
+        Some(p) if p.starts_with('/') => p,
+        _ => "/",
+    }
+}
+
+/// Where a calendar published at `url` goes when the account's publishing location is `base`: the address
+/// in its canonical form (origin and normalised path). The account's login goes with the upload, and the
+/// publishing server is often the contacts and calendar server too, so the address must name a file strictly
+/// inside the publishing location: the same origin, below its path, not a folder (no trailing `/`), and
+/// without `.` or `..` segments, an escaped `/` or `\`, a query or a fragment.
+pub fn publication_target(base: &str, url: &str) -> Result<String, String> {
+    let url = url.trim();
+    let base = base.trim();
+    let Some(home) = web_origin(base) else {
+        return Err("the account has no publishing location".into());
+    };
+    if web_origin(url).as_deref() != Some(home.as_str()) {
+        return Err(format!(
+            "`{url}` is not on the account's publishing server ({home}): a calendar is published there only"
+        ));
+    }
+    if url.contains(['?', '#']) || url.contains(char::is_whitespace) {
+        return Err(format!("`{url}` must be a plain file address (no spaces, `?` or `#`)"));
+    }
+    let mut inside = normalize_url_path(web_path(base));
+    if !inside.ends_with('/') {
+        inside.push('/');
+    }
+    let path = normalize_url_path(web_path(url));
+    let Some(name) = path.strip_prefix(&inside) else {
+        return Err(format!("`{url}` is not inside the publishing location {base}"));
+    };
+    if name.is_empty() || name.ends_with('/') {
+        return Err(format!("`{url}` names a folder: a calendar is published as a file (…/calendar.ics)"));
+    }
+    for seg in name.split('/') {
+        let lower = seg.to_ascii_lowercase();
+        if seg.is_empty() || seg == "." || seg == ".." || lower.contains("%2f") || lower.contains("%5c") {
+            return Err(format!("`{url}` must name a file inside the publishing location {base}"));
+        }
+    }
+    Ok(format!("{home}{path}"))
 }
 
 /// `scheme://host[:port]` of an http(s) address, lower case and without the default port; `None` for
@@ -363,6 +458,77 @@ pub fn web_origin(url: &str) -> Option<String> {
     } else {
         Some(format!("{scheme}://{host}:{port}"))
     }
+}
+
+/// Origin and path of an address MailCraft stored (a link, a known resource, a collection). Stored addresses
+/// have no query, so a `?` or `#` there is part of the path.
+fn split_stored(url: &str) -> Option<(String, &str)> {
+    let url = url.trim();
+    let origin = web_origin(url)?;
+    let rest = url.split_once("://").map_or("", |(_, r)| r);
+    let path = rest.find(['/', '?', '#']).and_then(|i| rest.get(i..)).unwrap_or("/");
+    Some((origin, path))
+}
+
+/// Canonical form of a stored address (origin and normalised path). What this version stores is canonical
+/// already and stays as it is. An earlier version stored the path fully decoded (`/c/John Smith.vcf`, a
+/// calendar named `a#b`), which a request cannot carry and which never equals the server's form: it is
+/// escaped again here.
+pub fn stored_canon(url: &str) -> String {
+    match split_stored(url) {
+        Some((origin, path)) if path.starts_with('/') => format!("{origin}{}", normalize_url_path(path)),
+        Some((origin, path)) => format!("{origin}/{}", normalize_url_path(path)),
+        None => url.trim().to_owned(),
+    }
+}
+
+/// The form an earlier version stored addresses in (origin plus the fully decoded path), for a stored address
+/// and a server's alike. Only for recognising such a link: two different resources (`a%2Bb`, `a+b`) may
+/// share it.
+pub fn legacy_key(url: &str) -> String {
+    let Some((origin, path)) = split_stored(url) else { return url.trim().to_owned() };
+    let b = path.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while let Some(&c) = b.get(i) {
+        let hex = b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
+        match hex.filter(|h| c == b'%' && h.bytes().all(|x| x.is_ascii_hexdigit())) {
+            Some(h) => {
+                out.push(u8::from_str_radix(h, 16).unwrap_or(b'%'));
+                i += 3;
+            }
+            None => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    format!("{origin}{}", String::from_utf8_lossy(&out))
+}
+
+/// The discovered address (of `found`: URL, name) of the collection stored as `stored`, in this version's
+/// form or decoded as an earlier version stored it. `None` when discovery did not find it (or, decoded, more
+/// than one collection would match).
+pub fn discovered_form(found: &[(String, String)], stored: &str) -> Option<String> {
+    let exact = stored_canon(stored);
+    let urls = || found.iter().map(|(u, _)| u);
+    if let Some(u) = urls().find(|u| **u == exact) {
+        return Some(u.clone());
+    }
+    let key = legacy_key(stored);
+    let mut same = urls().filter(|u| legacy_key(u) == key);
+    match (same.next(), same.next()) {
+        (Some(u), None) => Some(u.clone()),
+        _ => None,
+    }
+}
+
+/// True when the stored link `url` is inside the stored collection `collection` (either written in this
+/// version's form, or decoded as an earlier version wrote it).
+pub fn stored_inside(url: &str, collection: &str) -> bool {
+    url.starts_with(collection)
+        || stored_canon(url).starts_with(&stored_canon(collection))
+        || legacy_key(url).starts_with(&legacy_key(collection))
 }
 
 /// Which contacts and tasks server (and login) an account's DAV links belong to: the server address in a
@@ -451,6 +617,9 @@ pub struct PublishJob {
     pub fingerprint: u64,
     /// Remove the published file instead.
     pub withdraw: bool,
+    /// ETag of the file as MailCraft last wrote it (empty: never written). Writes and removals are
+    /// conditional on it, so a file someone else put at the address is never replaced or removed.
+    pub etag: String,
 }
 
 /// Why a folder is not synchronised when it holds too many items.
@@ -481,6 +650,9 @@ pub struct FolderOutcome {
     pub removed: Vec<(ItemId, u64)>,
     /// Server copies this run deleted (items removed here).
     pub deleted: Vec<String>,
+    /// Unchanged items whose link was stored in another form (by an earlier version, or before the
+    /// collection moved): the server's address of their copy.
+    pub relinked: Vec<(ItemId, String)>,
     /// Resource URL → ETag on the server after the run.
     pub known: BTreeMap<String, String>,
     /// Items that could not be synchronised (the rest went through).
@@ -507,7 +679,8 @@ pub enum PimEvent {
         url: String,
         fingerprint: u64,
         withdrawn: bool,
-        result: Result<(), String>,
+        /// Done: the published file's new ETag (`*`: the server gave none; empty for a removal).
+        result: Result<String, String>,
     },
 }
 
@@ -566,7 +739,7 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
     // copied or moved item is new here).
     let mut keep = |r: &Option<RemoteRef>| -> Option<RemoteRef> {
         let r = r.as_ref()?;
-        let inside = collection.as_deref().is_some_and(|c| r.url.starts_with(c));
+        let inside = collection.as_deref().is_some_and(|c| stored_inside(&r.url, c));
         (inside && seen.insert(r.url.clone())).then(|| r.clone())
     };
     match kind {
@@ -715,7 +888,7 @@ fn map_collections(
     if !on || list.is_empty() {
         return Vec::new();
     }
-    let mapped: BTreeMap<FolderId, String> = s
+    let mut mapped: BTreeMap<FolderId, String> = s
         .mailbox
         .account(account)
         .map(|a| {
@@ -727,6 +900,20 @@ fn map_collections(
                 .collect()
         })
         .unwrap_or_default();
+    // A collection an earlier version stored (its path decoded) is the discovered one with the same address:
+    // it takes the discovered form instead of looking gone.
+    for (f, c) in mapped.iter_mut() {
+        if list.iter().any(|(u, _)| u == c) {
+            continue;
+        }
+        let Some(u) = discovered_form(list, c) else { continue };
+        if let Some(st) =
+            s.mailbox.accounts.iter_mut().find(|a| a.id == account).and_then(|a| a.sync.dav.get_mut(f))
+        {
+            st.collection.clone_from(&u);
+        }
+        *c = u;
+    }
     // Gone from the server.
     let gone: Vec<FolderId> =
         mapped.iter().filter(|(_, c)| !list.iter().any(|(u, _)| u == *c)).map(|(f, _)| *f).collect();
@@ -871,6 +1058,16 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
                     a.remote = Some(r);
                 }
             }
+        }
+    }
+    for (id, url) in out.relinked {
+        let remote = match kind {
+            PimKind::Contacts => s.mailbox.contacts.get_mut(&id).and_then(|c| c.remote.as_mut()),
+            PimKind::Tasks => s.mailbox.tasks.get_mut(&id).and_then(|t| t.remote.as_mut()),
+            PimKind::Calendar => s.mailbox.appointments.get_mut(&id).and_then(|a| a.remote.as_mut()),
+        };
+        if let Some(r) = remote {
+            r.url = url;
         }
     }
     let mut problems = out.errors;
@@ -1162,7 +1359,7 @@ fn published(
     url: &str,
     fingerprint: u64,
     withdrawn: bool,
-    result: Result<(), String>,
+    result: Result<String, String>,
 ) {
     use crate::cmd::calendar::props;
     let mut p = props::read(&s.mailbox, folder);
@@ -1171,7 +1368,7 @@ fn published(
     if withdrawn {
         let stopped = p.publication.as_ref().is_some_and(|x| x.withdraw && this(x));
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 p.withdrawals.retain(|w| !(w.url == url && w.account == account));
                 if stopped {
                     p.publication = None;
@@ -1191,10 +1388,25 @@ fn published(
         props::write(&mut s.mailbox, folder, &p);
         return;
     }
+    // Uploaded, but published elsewhere (or stopped) meanwhile: the file waiting to be removed is the one just
+    // written, with this ETag.
+    if let Ok(etag) = &result
+        && let Some(w) = p.withdrawals.iter_mut().find(|w| w.url == url && w.account == account)
+    {
+        w.etag.clone_from(etag);
+        props::write(&mut s.mailbox, folder, &p);
+        return;
+    }
+    if let (Ok(etag), Some(x)) = (&result, p.publication.as_mut().filter(|x| x.withdraw && this(x))) {
+        x.etag.clone_from(etag);
+        props::write(&mut s.mailbox, folder, &p);
+        return;
+    }
     let Some(publication) = p.publication.as_mut().filter(|x| !x.withdraw && this(x)) else { return };
     match result {
-        Ok(()) => {
+        Ok(etag) => {
             let first = publication.last_published.is_none();
+            publication.etag = etag;
             publication.fingerprint = fingerprint;
             publication.last_published = Some(s.now().unix);
             publication.last_error = None;
@@ -1378,7 +1590,7 @@ mod tests {
         assert_eq!(back.subject, "Plan");
         assert_eq!(back.recurrence.map(|r| r.rrule), Some("FREQ=WEEKLY".into()));
         assert!(read_task("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", 0).is_none());
-        assert_eq!(resource_url("https://h/c", "a b/c", PimKind::Contacts), "https://h/c/a-b-c.vcf");
+        assert_eq!(resource_url("https://h/c", "a b/c", PimKind::Contacts), "https://h/c/a%20b%2Fc.vcf");
     }
 
     fn local_session() -> (Session, AccountId) {
@@ -1495,14 +1707,14 @@ mod tests {
         let new = "https://dav.example.com/p/new.ics";
         let mut p = crate::cmd::calendar::props::read(&s.mailbox, cal);
         p.publication = Some(Publication { url: new.into(), account, ..Default::default() });
-        p.withdrawals = vec![Withdrawal { url: old.into(), account }];
+        p.withdrawals = vec![Withdrawal { url: old.into(), account, etag: "\"w\"".into() }];
         crate::cmd::calendar::props::write(&mut s.mailbox, cal, &p);
         let ev = |url: &str, withdrawn: bool| PimEvent::Published {
             folder: cal,
             url: url.into(),
             fingerprint: 7,
             withdrawn,
-            result: Ok(()),
+            result: Ok(if withdrawn { String::new() } else { "\"e7\"".into() }),
         };
         // An upload to the old address that finished late does not mark the new one published.
         apply(&mut s, account, ev(old, false));
@@ -1516,6 +1728,7 @@ mod tests {
         apply(&mut s, account, ev(new, false));
         let p = crate::cmd::calendar::props::read(&s.mailbox, cal);
         assert_eq!(p.publication.as_ref().unwrap().fingerprint, 7);
+        assert_eq!(p.publication.as_ref().unwrap().etag, "\"e7\"", "the next upload replaces only this file");
         // Stopped, then published again before the removal came back: the new publication stays.
         let mut p = crate::cmd::calendar::props::read(&s.mailbox, cal);
         p.publication = Some(Publication { url: old.into(), account, ..Default::default() });
@@ -1523,5 +1736,138 @@ mod tests {
         apply(&mut s, account, ev(new, true));
         let p = crate::cmd::calendar::props::read(&s.mailbox, cal);
         assert_eq!(p.publication.map(|x| x.url).as_deref(), Some(old));
+    }
+
+    #[test]
+    fn resource_names_are_distinct_and_bounded() {
+        // Regression: every character outside `[A-Za-z0-9._-]` became `-`, so `a@b.com`, `a#b.com` and
+        // `a/b.com` shared one resource, and the name had no length limit.
+        let c = "https://dav.example.com/c/";
+        let urls: Vec<String> = ["a@b.com", "a#b.com", "a/b.com", "a-b.com", "a%40b.com"]
+            .iter()
+            .map(|u| resource_url(c, u, PimKind::Tasks))
+            .collect();
+        let distinct: BTreeSet<&String> = urls.iter().collect();
+        assert_eq!(distinct.len(), urls.len(), "{urls:?}");
+        assert_eq!(urls[0], "https://dav.example.com/c/a%40b.com.ics");
+        assert_eq!(urls[2], "https://dav.example.com/c/a%2Fb.com.ics", "a `/` never makes a sub-path");
+        assert_eq!(
+            resource_url("https://dav.example.com/c", "x", PimKind::Contacts),
+            "https://dav.example.com/c/x.vcf"
+        );
+        // Long UIDs: bounded, and still different from each other.
+        let long_a = format!("{}a", "\u{e9}".repeat(400));
+        let long_b = format!("{}b", "\u{e9}".repeat(400));
+        let (a, b) =
+            (resource_url(c, &long_a, PimKind::Calendar), resource_url(c, &long_b, PimKind::Calendar));
+        assert_ne!(a, b);
+        for u in [&a, &b] {
+            let name = u.strip_prefix(c).unwrap();
+            assert!(name.len() <= MAX_RESOURCE_NAME, "{name}");
+            let kept = name.split('!').next().unwrap();
+            assert!(name.contains('!') && kept.len() % 6 == 0, "cut between escapes: {name}");
+        }
+        assert!(same_uid("urn:uuid:1", "urnuuid1") && same_uid("x", "x"));
+        assert!(!same_uid("x", "y") && !same_uid("", "") && !same_uid("x", ""));
+    }
+
+    #[test]
+    fn publications_stay_strictly_inside_the_publishing_location() {
+        // Regression: only the origin was checked, so a publication could overwrite (or, stopped, delete) any
+        // resource of the same server, an address book included.
+        let base = "https://cloud.example.com/dav/me/public/";
+        assert_eq!(
+            publication_target(base, "https://Cloud.example.com:443/dav/me/public/team%2Dcal.ics").as_deref(),
+            Ok("https://cloud.example.com/dav/me/public/team-cal.ics")
+        );
+        assert!(
+            publication_target(
+                "https://cloud.example.com/dav/me/public",
+                "https://cloud.example.com/dav/me/public/a.ics"
+            )
+            .is_ok()
+        );
+        for bad in [
+            "https://cloud.example.com/dav/me/contacts/x.vcf",
+            "https://cloud.example.com/dav/me/contacts/",
+            "https://cloud.example.com/dav/me/public/",
+            "https://cloud.example.com/dav/me/public/sub/",
+            "https://cloud.example.com/dav/me/public/../contacts/x.vcf",
+            "https://cloud.example.com/dav/me/public/%2E%2E/contacts/x.vcf",
+            "https://cloud.example.com/dav/me/public/..%2Fcontacts%2Fx.vcf",
+            "https://cloud.example.com/dav/me/public/a%5C..%5Cb.ics",
+            "https://cloud.example.com/dav/me/publicx/a.ics",
+            "https://cloud.example.com/dav/me/public/a.ics?x=1",
+            "https://elsewhere.example.net/dav/me/public/a.ics",
+            "http://cloud.example.com/dav/me/public/a.ics",
+        ] {
+            assert!(publication_target(base, bad).is_err(), "{bad}");
+        }
+        assert!(publication_target("", "https://cloud.example.com/a.ics").is_err());
+    }
+
+    #[test]
+    fn links_stored_by_an_earlier_version_are_recognised() {
+        // Regression: an earlier version stored every path fully decoded. Read back as it was, a link with a
+        // space or `#` named no resource, and one from `%2B` named another, so unchanged items looked deleted
+        // on the server and were removed here.
+        let h = "https://dav.example.com/c";
+        assert_eq!(stored_canon(&format!("{h}/John Smith.vcf")), format!("{h}/John%20Smith.vcf"));
+        assert_eq!(
+            stored_canon("https://dav.example.com/cal/en.usa#holiday@group.example.com/events/"),
+            "https://dav.example.com/cal/en.usa%23holiday@group.example.com/events/"
+        );
+        assert_eq!(stored_canon(&format!("{h}/what?.vcf")), format!("{h}/what%3F.vcf"), "no query in a link");
+        assert_eq!(stored_canon("HTTPS://Dav.Example.com:443/c/x.vcf"), format!("{h}/x.vcf"));
+        // This version's form stays as it is.
+        for c in [format!("{h}/John%20Smith.vcf"), format!("{h}/a%2Bb.vcf"), format!("{h}/a%2Fb.vcf")] {
+            assert_eq!(stored_canon(&c), c);
+        }
+        // Reserved escapes: the decoded form is only a key to find the server's resource by.
+        assert_eq!(legacy_key(&format!("{h}/a+b.vcf")), legacy_key(&format!("{h}/a%2Bb.vcf")));
+        assert_eq!(legacy_key(&format!("{h}/a,b=c.vcf")), legacy_key(&format!("{h}/a%2Cb%3Dc.vcf")));
+        assert_eq!(legacy_key(&format!("{h}/John Smith.vcf")), legacy_key(&format!("{h}/John%20Smith.vcf")));
+        assert_ne!(legacy_key(&format!("{h}/a.vcf")), legacy_key(&format!("{h}/b.vcf")));
+        assert_eq!(legacy_key("not a url"), "not a url");
+        // A legacy link is still inside its (legacy or migrated) collection.
+        let coll = "https://dav.example.com/dav/me/My Book/";
+        assert!(stored_inside("https://dav.example.com/dav/me/My Book/a+b.vcf", coll));
+        assert!(stored_inside("https://dav.example.com/dav/me/My Book/a+b.vcf", &stored_canon(coll)));
+        assert!(stored_inside("https://dav.example.com/dav/me/My%20Book/a%2Bb.vcf", coll));
+        assert!(!stored_inside("https://dav.example.com/dav/me/Other/a.vcf", coll));
+        let found = vec![
+            ("https://dav.example.com/dav/me/My%20Book/".to_owned(), "My Book".to_owned()),
+            ("https://dav.example.com/dav/me/contacts/".to_owned(), "Contacts".to_owned()),
+        ];
+        assert_eq!(
+            discovered_form(&found, coll).as_deref(),
+            Some("https://dav.example.com/dav/me/My%20Book/")
+        );
+        assert_eq!(discovered_form(&found, "https://dav.example.com/dav/me/gone/"), None);
+    }
+
+    #[test]
+    fn a_withdrawal_saved_by_an_earlier_version_is_still_removed() {
+        // Regression: an earlier version kept no ETag for a pending removal; read back with none, it counted
+        // as a file never written, so the published calendar stayed public.
+        use mailcraft_model::calendar::Withdrawal;
+        let old: Withdrawal =
+            serde_json::from_str(r#"{"url": "https://dav.example.com/p/a.ics", "account": 1}"#).unwrap();
+        assert_eq!(old.etag, "*");
+        // Never written (this version's form): stays so through a save.
+        let never = Withdrawal { url: "https://dav.example.com/p/b.ics".into(), ..Default::default() };
+        let back: Withdrawal = serde_json::from_str(&serde_json::to_string(&never).unwrap()).unwrap();
+        assert_eq!(back.etag, "");
+    }
+
+    #[test]
+    fn an_alternate_resource_name_differs_from_every_first_choice() {
+        let c = "https://dav.example.com/c/";
+        for uid in ["pat-1", "a@b.com", &"x".repeat(400)] {
+            let alt = alternate_resource_url(c, uid, PimKind::Contacts);
+            assert_ne!(alt, resource_url(c, uid, PimKind::Contacts), "{uid}");
+            assert!(alt.starts_with(c) && alt.ends_with(".vcf") && alt.contains('!'), "{alt}");
+            assert_eq!(alt, alternate_resource_url(c, uid, PimKind::Contacts), "stable");
+        }
     }
 }

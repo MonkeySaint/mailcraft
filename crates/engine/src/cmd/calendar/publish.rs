@@ -163,20 +163,20 @@ pub fn run_publish(s: &mut Session, p: &Value) -> CmdResult {
         .and_then(|a| a.dav.as_ref())
         .map(|d| d.publish_url.trim().to_owned())
         .unwrap_or_default();
-    // The account's login goes with the upload, so the file can only go to its own publishing server.
-    let Some(home) = crate::sync::pim::web_origin(&base) else {
+    // The account's login goes with the upload, so the file can only go inside its own publishing location.
+    if crate::sync::pim::web_origin(&base).is_none() {
         return Err(CmdError::Disabled(
             "That account has no publishing location: add the WebDAV address for published calendars in \
              Account Settings (contacts, tasks and calendar server)."
                 .into(),
         ));
-    };
+    }
     let url = match opt_str(p, "url").map(str::trim).filter(|u| !u.is_empty()) {
         Some(u) => u.to_owned(),
         None => match props.publication.as_ref().filter(|x| x.account == account && !x.withdraw) {
             Some(x) => x.url.clone(),
             None => {
-                let base = if base.ends_with('/') { base } else { format!("{base}/") };
+                let base = if base.ends_with('/') { base.clone() } else { format!("{base}/") };
                 format!("{base}{}-{}.ics", slug(&name), folder.0)
             }
         },
@@ -184,29 +184,39 @@ pub fn run_publish(s: &mut Session, p: &Value) -> CmdResult {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(char::is_whitespace) {
         return Err(CmdError::Params(format!("`{url}` is not a web address to publish to")));
     }
-    if crate::sync::pim::web_origin(&url).as_deref() != Some(home.as_str()) {
-        return Err(CmdError::Params(format!(
-            "`{url}` is not on the account's publishing server ({home}): a calendar is published there only"
-        )));
-    }
+    crate::sync::pim::publication_target(&base, &url).map_err(CmdError::Params)?;
+    // The file as MailCraft last wrote it (an earlier version kept no ETag: `*`, the file is there).
+    let written = |x: &Publication| {
+        if x.etag.is_empty() && x.last_published.is_some() { "*".to_owned() } else { x.etag.clone() }
+    };
+    // Published here before: the next upload replaces that file (and only that file).
+    let mut etag = String::new();
     // Published before at another address (or by another account): that file is removed by the next run.
-    if let Some(old) = props.publication.take()
-        && (old.url != url || old.account != account)
-        && !props.withdrawals.iter().any(|w| w.url == old.url && w.account == old.account)
-    {
-        props.withdrawals.push(Withdrawal { url: old.url, account: old.account });
-        // Bounded: the calendar's properties have a size limit.
-        if props.withdrawals.len() > MAX_WITHDRAWALS {
-            props.withdrawals.remove(0);
+    if let Some(old) = props.publication.take() {
+        if old.url == url && old.account == account {
+            etag = written(&old);
+        } else if !props.withdrawals.iter().any(|w| w.url == old.url && w.account == old.account) {
+            props.withdrawals.push(Withdrawal { etag: written(&old), url: old.url, account: old.account });
+            // Bounded: the calendar's properties have a size limit.
+            if props.withdrawals.len() > MAX_WITHDRAWALS {
+                props.withdrawals.remove(0);
+            }
         }
     }
-    props.withdrawals.retain(|w| !(w.url == url && w.account == account));
+    // Published here again before an earlier copy was removed: that copy is the file to replace.
+    if let Some(i) = props.withdrawals.iter().position(|w| w.url == url && w.account == account) {
+        let w = props.withdrawals.remove(i);
+        if etag.is_empty() {
+            etag = w.etag;
+        }
+    }
     props.publication = Some(Publication {
         url: url.clone(),
         account,
         range: range.clone(),
         detail: detail.clone(),
         include_private,
+        etag,
         ..Default::default()
     });
     props::write(&mut s.mailbox, folder, &props);

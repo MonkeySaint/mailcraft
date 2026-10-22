@@ -492,6 +492,49 @@ impl TestServers {
         d.collection_mut(user, collection).is_some_and(|c| c.items.remove(name).is_some())
     }
 
+    /// Makes the DAV server answer PUT with (`true`, the default) or without an ETag.
+    pub fn set_dav_put_etags(&self, on: bool) {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).put_without_etag = !on;
+    }
+
+    /// Stores a resource in `user`'s DAV collection right after the next PUT any client makes, as if another
+    /// device created it while that client was synchronising.
+    pub fn put_dav_item_after_next_put(&self, user: &str, collection: &str, name: &str, data: &str) {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).after_next_put =
+            Some((user.to_owned(), collection.to_owned(), name.to_owned(), data.to_owned()));
+    }
+
+    /// Adds an address book (`events: false`) or a calendar of events to `user`'s DAV home, under `name` (any
+    /// characters: hrefs escape them).
+    pub fn add_dav_collection(&self, user: &str, name: &str, events: bool, display: &str) {
+        let kind = if events { dav::Kind::Calendar(&["VEVENT"]) } else { dav::Kind::AddressBook };
+        self.inner
+            .ctx
+            .dav
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add_collection(user, name, kind, display);
+    }
+
+    /// Moves `user`'s DAV collection `from` to `to`, with its items; requests for `from` are then redirected
+    /// (301) to `to`, as by a server that moved its DAV tree. False when there is no such collection.
+    pub fn move_dav_collection(&self, user: &str, from: &str, to: &str) -> bool {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).move_collection(user, from, to)
+    }
+
+    /// Refuses (401) the next signed-in DAV request whose path starts with `path_prefix`, as a server that
+    /// revoked the sign-in on its side only (the mail servers keep accepting it).
+    pub fn refuse_dav_sign_in_once(&self, path_prefix: &str) {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).refuse_once =
+            Some(path_prefix.to_owned());
+    }
+
+    /// Adds `href` (`None`: nothing) to every DAV collection listing, as a server listing something that is
+    /// not one of the collection's own resources.
+    pub fn set_stray_dav_href(&self, href: Option<&str>) {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).stray_href = href.map(str::to_owned);
+    }
+
     /// DAV requests received ("METHOD /path"), oldest first.
     pub fn dav_requests(&self) -> Vec<String> {
         self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).requests.clone()

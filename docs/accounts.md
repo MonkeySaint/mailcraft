@@ -109,16 +109,33 @@ synchronise both ways (CardDAV, RFC 6352; CalDAV tasks and events, RFC 4791):
   lost, the next run recognises items already on the server (same UID, or the same card) instead of
   uploading them again;
 - the account's password or token is only sent to the contacts server and the publishing location; an
-  address a server answers with that points elsewhere is not followed.
+  address a server answers with that points elsewhere is not followed, and a listed item outside its
+  collection is left out (that run then removes nothing here: the listing may be incomplete);
+- a collection the server moved (its listing is redirected) is followed to its new address, links included;
+  links saved by an earlier MailCraft version are recognised as they are and take the server's form;
+- the server has connection settings of its own: a **Password (if different)**, the consent to sign in over
+  plain `http://`, and (`accounts.edit {"dav": {"extraRootPem": …}}`) a trusted certificate for a self-signed
+  server. Nothing is taken over from the mail server's settings. A saved password of its own can be removed
+  again (**Use the account's password instead**, or `"password": ""`). An account signed in through its mail
+  provider's page (OAuth) sends that token only to the provider's own servers; any other contacts server
+  needs its own password. A token the contacts server refuses is renewed once and the server asked again,
+  as long as nothing of that run was applied yet;
+- every request has a time limit (five minutes) and stops when Send/Receive is cancelled.
 
 Update Folder on a calendar kept on this computer only says so, and how to keep it on a server.
 
 The same section takes a **publishing location**, a WebDAV collection. **Share Calendar** (one entry per
 calendar) can then publish a calendar there and write a sharing invitation with its `webcal://` address;
 every send/receive uploads it again when it changed, and subscribers refresh it (`REFRESH-INTERVAL`). The
-commands are `calendar.publish` and `calendar.share {"publish": true}`. A calendar is only published on the
-account's publishing server; publishing it again at another address removes the earlier file with the next
-send/receive.
+commands are `calendar.publish` and `calendar.share {"publish": true}`. A calendar is only published as a
+file inside the account's publishing location (not a folder, not anywhere else on that server). MailCraft
+only ever replaces or removes the file it wrote itself: the first upload creates the file and fails when
+something is already at that address, later uploads and the removal need the file to be unchanged since
+the last upload (`If-Match`), and a file changed or replaced by someone else is left as it is. Publishing
+again at another address removes the earlier file with the next send/receive. When a file that stops being
+published cannot be removed that way (it changed since, or an earlier version published it outside the
+current publishing location), Send/Receive reports the address that is still public and keeps asking until
+the file is gone (remove it on the server).
 
 ## Shared and other users' mailboxes
 

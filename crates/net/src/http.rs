@@ -172,6 +172,8 @@ pub fn percent_encode(s: &str) -> String {
     out
 }
 
+pub use mailcraft_model::account::normalize_url_path as normalize_path;
+
 /// Decodes `%XX` escapes (and `+` as space when `plus` is set); invalid escapes are kept.
 pub fn percent_decode(s: &str, plus: bool) -> String {
     let b = s.as_bytes();
@@ -319,6 +321,20 @@ impl HttpClient {
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<HttpResponse> {
+        self.request_with_deadline(method, url, headers, body, None)
+    }
+
+    /// [`HttpClient::request`] finished by `deadline` (redirects included): connecting, the TLS handshake,
+    /// sending and every read wait at most the time left, and a request still running when it passes fails
+    /// with [`NetError::Timeout`], however slowly the server trickles its answer.
+    pub fn request_with_deadline(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        deadline: Option<Instant>,
+    ) -> Result<HttpResponse> {
         let mut url = Url::parse(url)?;
         let first = url.clone();
         let mut method = method.to_owned();
@@ -331,7 +347,7 @@ impl HttpClient {
                 .copied()
                 .filter(|(k, _)| same_origin || !k.eq_ignore_ascii_case("authorization"))
                 .collect();
-            let resp = self.once(&method, &url, &hdrs, body.as_deref(), None)?;
+            let resp = self.once(&method, &url, &hdrs, body.as_deref(), deadline)?;
             let is_redirect = matches!(resp.status, 301 | 302 | 303 | 307 | 308);
             let Some(loc) = resp.header("location").filter(|_| is_redirect).map(str::to_owned) else {
                 return Ok(resp);
@@ -413,7 +429,7 @@ impl HttpClient {
             }
             None => Cow::Borrowed(&self.options),
         };
-        let mut conn = Conn::connect(&url.host, url.port, url.https, &options)?;
+        let mut conn = Conn::connect_until(&url.host, url.port, url.https, &options, deadline)?;
         conn.write_all(&data)?;
         Ok(conn)
     }
@@ -786,6 +802,58 @@ pub(crate) mod testserver {
 mod tests {
     use super::testserver::*;
     use super::*;
+
+    #[test]
+    fn paths_normalise_without_changing_the_resource() {
+        assert_eq!(normalize_path("/dav/a%40b.com/c/x.vcf"), "/dav/a@b.com/c/x.vcf");
+        assert_eq!(normalize_path("/dav/a@b.com/c/x.vcf"), "/dav/a@b.com/c/x.vcf");
+        // Escaped separators, dots, `%` and reserved characters keep their meaning.
+        assert_eq!(normalize_path("/c/a%2fb.vcf"), "/c/a%2Fb.vcf");
+        assert_eq!(normalize_path("/c/%2E%2E%2F%2E%2E%2Fother%2Fx.vcf"), "/c/..%2F..%2Fother%2Fx.vcf");
+        assert_eq!(normalize_path("/c/100%25.vcf"), "/c/100%25.vcf");
+        assert_eq!(normalize_path("/c/a%3Bb;c"), "/c/a%3Bb;c");
+        // What cannot stand raw is escaped; invalid UTF-8 stays as its bytes.
+        assert_eq!(normalize_path("/c/a b/\u{fc}%FF%"), "/c/a%20b/%C3%BC%FF%25");
+        assert_eq!(normalize_path("/c/%zz%+1"), "/c/%25zz%25+1");
+        for p in ["/c/a%2fb", "/x y/%C3%BC", "/%%41%"] {
+            assert_eq!(normalize_path(&normalize_path(p)), normalize_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_deadline_stops_a_trickling_answer() {
+        // Regression: only each read had a timeout, so a server sending a byte now and then kept a request
+        // open indefinitely.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n");
+            for _ in 0..60 {
+                if s.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let c = HttpClient::new(ConnectOptions::default());
+        let start = Instant::now();
+        let e = c
+            .request_with_deadline(
+                "GET",
+                &format!("http://127.0.0.1:{port}/"),
+                &[],
+                None,
+                Some(start + Duration::from_secs(1)),
+            )
+            .unwrap_err();
+        assert!(matches!(e, NetError::Timeout(_)), "{e:?}");
+        assert!(start.elapsed() < Duration::from_secs(4), "{:?}", start.elapsed());
+        t.join().unwrap();
+    }
 
     #[test]
     fn url_parsing() {

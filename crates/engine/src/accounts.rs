@@ -228,6 +228,12 @@ pub fn client_secret_key(account: AccountId) -> String {
     format!("account/{}/oauth-client-secret", account.0)
 }
 
+/// Secret-store key of the password for an account's contacts, tasks and calendar (DAV) server, when it has one
+/// of its own (an OAuth account's mail sign-in only goes to the mail provider's servers).
+pub fn dav_secret_key(account: AccountId) -> String {
+    format!("account/{}/dav", account.0)
+}
+
 /// The secret for an account's server: the outgoing one falls back to the incoming one.
 pub fn account_secret(s: &Session, account: AccountId, outgoing: bool) -> Option<String> {
     let own = s.secrets.get(&secret_key(account, outgoing));
@@ -369,8 +375,8 @@ impl SecretStore for KeyringSecretStore {
 }
 
 /// Every secret key an account can have.
-fn account_secret_keys(id: AccountId) -> [String; 4] {
-    [secret_key(id, false), secret_key(id, true), refresh_key(id), client_secret_key(id)]
+fn account_secret_keys(id: AccountId) -> [String; 5] {
+    [secret_key(id, false), secret_key(id, true), refresh_key(id), client_secret_key(id), dav_secret_key(id)]
 }
 
 impl Session {
@@ -829,7 +835,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.add",
             "Add Account",
-            r#"{"kind": "imap"|"jmap", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL)"#,
+            r#"{"kind": "imap"|"jmap", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string, "password"?: string (a DAV password of its own; empty removes it), "extraRootPem"?: string, "allowPlaintextAuth"?: bool}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL)"#,
             true,
             always,
             add,
@@ -837,7 +843,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.edit",
             "Change Account",
-            r#"{"account": number|string, "displayName"?, "senderName"?, "address"?, "incoming"?: server, "outgoing"?: server|null, "password"?, "outgoingPassword"?, "oauthToken"?, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string}|null}"#,
+            r#"{"account": number|string, "displayName"?, "senderName"?, "address"?, "incoming"?: server, "outgoing"?: server|null, "password"?, "outgoingPassword"?, "oauthToken"?, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string, "password"?: string (a DAV password of its own; empty removes it), "extraRootPem"?: string, "allowPlaintextAuth"?: bool}|null}"#,
             true,
             has_server_account,
             edit,
@@ -1015,6 +1021,7 @@ pub(crate) fn account_settings_json(s: &Session, a: &Account) -> Value {
         "serverSavesSent": a.server_saves_sent,
         "pendingChanges": a.sync.pending.len(),
         "dav": a.dav.as_ref().map(dav_json),
+        "hasDavPassword": s.secrets.get(&dav_secret_key(a.id)).is_some(),
         "sharedMailbox": a.shared.as_ref().map(|sh| json!({
             "owner": sh.owner.0,
             "root": sh.root,
@@ -1039,6 +1046,8 @@ fn dav_json(d: &DavSettings) -> Value {
         "calendar": d.calendar,
         "publishUrl": d.publish_url,
         "username": d.username,
+        "extraRootCertificate": d.extra_root_pem.is_some(),
+        "allowPlaintextAuth": d.allow_plaintext_auth,
     })
 }
 
@@ -1088,10 +1097,48 @@ fn parse_dav(p: &Value, old: Option<&DavSettings>) -> Result<Option<Option<DavSe
     if let Some(b) = opt_bool(v, "calendar") {
         d.calendar = b;
     }
+    // The DAV servers' own connection settings (the incoming mail server's are not used for them).
+    match field(v, &["extraRootPem", "extra_root_pem"]) {
+        Some(Value::String(pem)) if pem.trim().is_empty() => d.extra_root_pem = None,
+        Some(Value::String(pem)) => {
+            pem_certificates(pem).map_err(CmdError::Params)?;
+            d.extra_root_pem = Some(pem.clone());
+        }
+        Some(Value::Null) => d.extra_root_pem = None,
+        Some(_) => return Err(CmdError::Params("`dav.extraRootPem` must be a string".into())),
+        None => {}
+    }
+    if let Some(b) = opt_bool(v, "allowPlaintextAuth").or_else(|| opt_bool(v, "allow_plaintext_auth")) {
+        d.allow_plaintext_auth = b;
+    }
     if d.url.is_empty() && d.publish_url.is_empty() {
         return Ok(Some(None));
     }
     Ok(Some(Some(d)))
+}
+
+/// The DAV password from `p.dav.password`: `Some("")` removes a stored one, `None` leaves it as it is.
+fn parse_dav_password(p: &Value) -> Result<Option<String>, CmdError> {
+    let Some(v) = p.get("dav").filter(|v| v.is_object()) else { return Ok(None) };
+    let Some(pw) = str_field(v, &["password"])? else { return Ok(None) };
+    if pw.chars().count() > MAX_SECRET_CHARS || pw.contains(['\r', '\n', '\0']) {
+        return Err(CmdError::Params("the DAV password is not valid".into()));
+    }
+    Ok(Some(pw.to_owned()))
+}
+
+/// Stores (or with an empty one, removes) an account's DAV password.
+fn store_dav_password(s: &mut Session, id: AccountId, pw: Option<String>) -> Result<(), CmdError> {
+    match pw {
+        Some(pw) if pw.is_empty() => {
+            if s.secrets.get(&dav_secret_key(id)).is_some() {
+                s.secrets.remove(&dav_secret_key(id)).map_err(CmdError::Failed)?;
+            }
+        }
+        Some(pw) => s.secrets.set(&dav_secret_key(id), &pw).map_err(CmdError::Failed)?,
+        None => {}
+    }
+    Ok(())
 }
 
 /// Forgets what was synchronised with an account's contacts and tasks server (its address changed or it was
@@ -1375,6 +1422,8 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     // default sender once a real account exists).
     let default_is_local = s.mailbox.default_account().is_none_or(|a| a.kind == AccountKind::Local);
     let make_default = opt_bool(p, "default").unwrap_or(default_is_local);
+    let dav = parse_dav(p, None)?.flatten();
+    let dav_password = parse_dav_password(p)?;
     let id = s.mailbox.add_account(Account {
         kind,
         display_name: display_name.clone(),
@@ -1385,7 +1434,7 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         is_default: make_default,
         credential: cred.unwrap_or_default(),
         server_saves_sent: opt_bool(p, "serverSavesSent").unwrap_or(false),
-        dav: parse_dav(p, None)?.flatten(),
+        dav,
         ..Default::default()
     });
     s.mailbox.create_default_folders(id);
@@ -1399,6 +1448,7 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     prefs(s).jmap.remove(&id.0);
     update_options(s, id, |o| *o = opts);
     store_secrets(s, id, secret_in, secret_out)?;
+    store_dav_password(s, id, dav_password)?;
     s.refresh_me();
     Ok(
         json!({"account": id.0, "name": display_name, "address": address, "default": make_default, "kind": if pop3 { "pop3" } else { kind_name(kind) }}),
@@ -1448,6 +1498,7 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(d) = parse_dav(p, old.dav.as_ref())? {
         a.dav = d;
     }
+    let dav_password = parse_dav_password(p)?;
     let (secret_in, secret_out, cred) = parse_secrets(p)?;
     if let Some(c) = cred {
         a.credential = c;
@@ -1496,8 +1547,9 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     if opts_changed || reset {
         update_options(s, id, |o| *o = opts);
     }
-    let secrets_changed = secret_in.is_some() || secret_out.is_some();
+    let secrets_changed = secret_in.is_some() || secret_out.is_some() || dav_password.is_some();
     store_secrets(s, id, secret_in, secret_out)?;
+    store_dav_password(s, id, dav_password)?;
     s.refresh_me();
     Ok(json!({"account": id.0, "changed": changed || secrets_changed || opts_changed, "resetSync": reset}))
 }

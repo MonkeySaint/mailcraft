@@ -281,7 +281,8 @@ fn copying_a_published_calendar_does_not_publish_the_copy() {
     let mut p = props::read(&s.mailbox, c);
     p.publication =
         Some(Publication { url: "https://dav.example.com/p/team.ics".into(), account, ..Default::default() });
-    p.withdrawals = vec![Withdrawal { url: "https://dav.example.com/p/old.ics".into(), account }];
+    p.withdrawals =
+        vec![Withdrawal { url: "https://dav.example.com/p/old.ics".into(), account, ..Default::default() }];
     props::write(&mut s.mailbox, c, &p);
     let id = create_appointment(&mut s, c, &json!({"subject": "Review", "start": "2026-10-12T10:00"}), false)
         .unwrap();

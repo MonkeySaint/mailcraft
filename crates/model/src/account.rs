@@ -99,6 +99,52 @@ pub struct DavSettings {
     pub publish_url: String,
     /// User name for the DAV server (empty: the incoming server's).
     pub username: String,
+    /// Extra trusted root certificate(s) for the DAV and publishing servers, PEM (a self-signed server). The
+    /// incoming mail server's certificate is not trusted here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_root_pem: Option<String>,
+    /// Allow the DAV login over plain `http://` (a server on this computer or a trusted LAN). Separate from the
+    /// incoming mail server's setting.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_plaintext_auth: bool,
+}
+
+/// A URL path (without its query) in one normal form, for comparing addresses and for sending them
+/// (RFC 3986 section 6.2.2): escapes of unreserved characters and of `:` and `@` are decoded, any other escape is
+/// kept (in upper-case hex), and a byte a path cannot hold as it is (a space, a non-ASCII byte, a lone `%`) is
+/// escaped. `/` separators stay as written. An escaped `/`, `%` or `;` therefore keeps its escape, so the
+/// normal form names exactly the resource the original did, and normalising twice changes nothing.
+pub fn normalize_url_path(path: &str) -> String {
+    let decoded_ok =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b':' | b'@');
+    let raw_ok = |b: u8| decoded_ok(b) || b == b'/' || b"!$&'()*+,;=".contains(&b);
+    let hex = |h: Option<&[u8]>| -> Option<u8> {
+        let h = std::str::from_utf8(h?).ok()?;
+        if h.bytes().all(|c| c.is_ascii_hexdigit()) { u8::from_str_radix(h, 16).ok() } else { None }
+    };
+    let b = path.as_bytes();
+    let mut out = String::with_capacity(b.len());
+    let mut i = 0usize;
+    while let Some(&c) = b.get(i) {
+        if c == b'%'
+            && let Some(v) = hex(b.get(i + 1..i + 3))
+        {
+            if decoded_ok(v) {
+                out.push(char::from(v));
+            } else {
+                out.push_str(&format!("%{v:02X}"));
+            }
+            i += 3;
+            continue;
+        }
+        if raw_ok(c) {
+            out.push(char::from(c));
+        } else {
+            out.push_str(&format!("%{c:02X}"));
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Which namespace a shared store comes from.
