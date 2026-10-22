@@ -117,7 +117,7 @@ fn new_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         "The file can be closed, moved and opened again (File › Open & Export › Open Data \
                          File). With a password the file is encrypted and cannot be opened without it. \
                          While it is open, its items are kept unencrypted with this profile and its \
-                         password is remembered there.",
+                         password is remembered there; closing it removes both from the profile.",
                     );
                 }
                 let mismatch = st.own_file && st.password != st.verify;

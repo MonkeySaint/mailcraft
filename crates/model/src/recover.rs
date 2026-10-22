@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Appointment, Contact, FolderId, ItemId, MailItem, Mailbox, Note, Task};
+use crate::{AccountId, Appointment, Contact, FolderId, ItemId, MailItem, Mailbox, Note, Task};
 
 /// Most items the bin holds (the oldest go first).
 pub const MAX_RECOVERABLE: usize = 5_000;
@@ -138,6 +138,10 @@ pub struct Recoverable {
     /// Recovered as this item id (the entry is kept so undoing the recovery leaves it recoverable).
     #[serde(default)]
     pub restored_as: Option<ItemId>,
+    /// The account (data file) the item was deleted from, kept after its folder is gone (`None` for
+    /// entries written before it was recorded, or when it was not known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountId>,
 }
 
 impl Recoverable {
@@ -169,19 +173,24 @@ impl RecoverBin {
     /// same items are replaced, and past [`MAX_RECOVERABLE`] the oldest entries go (of `items` only the
     /// last [`MAX_RECOVERABLE`] are kept).
     pub fn add_all(&mut self, items: Vec<(DeletedItem, String)>, now: i64) {
+        self.add_all_from(items.into_iter().map(|(item, path)| (item, path, None)).collect(), now);
+    }
+
+    /// [`RecoverBin::add_all`] with the account each item was deleted from.
+    pub fn add_all_from(&mut self, items: Vec<(DeletedItem, String, Option<AccountId>)>, now: i64) {
         if items.is_empty() {
             return;
         }
         let skip = items.len().saturating_sub(MAX_RECOVERABLE);
-        let items: Vec<(DeletedItem, String)> = items.into_iter().skip(skip).collect();
-        let new: HashSet<(&'static str, ItemId)> = items.iter().map(|(i, _)| (i.kind(), i.id())).collect();
+        let items: Vec<(DeletedItem, String, Option<AccountId>)> = items.into_iter().skip(skip).collect();
+        let new: HashSet<(&'static str, ItemId)> = items.iter().map(|(i, _, _)| (i.kind(), i.id())).collect();
         self.items.retain(|e| {
             let kind = e.item.kind();
             !new.contains(&(kind, e.item.id())) && e.restored_as.is_none_or(|r| !new.contains(&(kind, r)))
         });
-        for (item, folder_path) in items {
+        for (item, folder_path, account) in items {
             let folder_path: String = folder_path.chars().take(MAX_PATH_CHARS).collect();
-            self.items.push(Recoverable { item, deleted: now, folder_path, restored_as: None });
+            self.items.push(Recoverable { item, deleted: now, folder_path, restored_as: None, account });
         }
         if self.items.len() > MAX_RECOVERABLE {
             let excess = self.items.len().saturating_sub(MAX_RECOVERABLE);
@@ -310,6 +319,24 @@ mod tests {
         assert_eq!(bin.items.first().map(|e| e.item.id().0), Some(1_005));
         bin.add_all(Vec::new(), 40);
         assert_eq!(bin.items.len(), MAX_RECOVERABLE);
+    }
+
+    #[test]
+    fn entries_keep_their_account_and_older_entries_still_read() {
+        let mut bin = RecoverBin::default();
+        bin.add_all_from(vec![(note(1, "a"), "Notes".into(), Some(AccountId(7)))], 10);
+        bin.add(note(2, "b"), "Notes", 10);
+        assert_eq!(bin.items[0].account, Some(AccountId(7)));
+        assert_eq!(bin.items[1].account, None);
+        let text = serde_json::to_string(&bin).unwrap();
+        let back: RecoverBin = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, bin);
+        // An entry written before the account was recorded.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(v["items"][1].get("account").is_none(), "not written when unknown");
+        v["items"][0].as_object_mut().unwrap().remove("account");
+        let old: RecoverBin = serde_json::from_value(v).unwrap();
+        assert_eq!(old.items[0].account, None);
     }
 
     #[test]

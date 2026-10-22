@@ -97,6 +97,7 @@ rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", 
 sha1 = "0.10.6"
 sha2 = "0.10.9"
 hmac = "0.12.1"
+pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
 aes = "0.8.4"
 cbc = { version = "0.1.2", features = ["alloc", "block-padding"] }
 des = "0.8.1"

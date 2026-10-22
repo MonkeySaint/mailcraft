@@ -93,11 +93,26 @@ pub(crate) fn capture(s: &mut Session, before: &Mailbox) {
         .map(|item| {
             let path =
                 paths.entry(item.folder()).or_insert_with(|| before.folder_path(item.folder())).clone();
-            (item, path)
+            let account = before.folder(item.folder()).map(|f| f.account);
+            (item, path, account)
         })
         .collect();
-    s.recover.bin.add_all(items, now);
+    s.recover.bin.add_all_from(items, now);
     save(s);
+}
+
+/// Drops the entries of items deleted from data file `account`, or from `folders` (its folders now, for
+/// entries that do not record their account) (a protected data file being closed: its deleted items must
+/// not stay readable in the profile once its file is encrypted again, also those deleted together with a
+/// folder of it that is gone). Returns how many went.
+pub(crate) fn forget_account(s: &mut Session, account: AccountId, folders: &BTreeSet<FolderId>) -> usize {
+    let before = s.recover.bin.items.len();
+    s.recover.bin.items.retain(|e| e.account != Some(account) && !folders.contains(&e.item.folder()));
+    let gone = before.saturating_sub(s.recover.bin.items.len());
+    if gone > 0 {
+        save(s);
+    }
+    gone
 }
 
 /// Drops entries past the retention period; runs at most hourly from the sync tick (and at open).

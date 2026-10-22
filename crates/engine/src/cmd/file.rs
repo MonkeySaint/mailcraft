@@ -644,13 +644,23 @@ fn free_name(s: &Session, base: &str) -> String {
 }
 
 /// Opens the data file read from `path` as a standalone data file (see `datafile::open_linked`).
-fn open_linked_cmd(s: &mut Session, path: &Path, bytes: &[u8], password: Option<&str>) -> CmdResult {
-    let id = crate::datafile::open_linked(s, path, bytes, password)?;
+fn open_linked_cmd(s: &mut Session, path: &Path, bytes: Vec<u8>, password: Option<&str>) -> CmdResult {
+    let opened = crate::datafile::open_linked(s, path, bytes, password)?;
+    let id = opened.account;
     // The data file is now open from its file: an undo step would drop it while the file waits elsewhere.
     s.undo_barrier = true;
     let name = s.mailbox.account(id).map(|a| a.display_name.clone()).unwrap_or_default();
     let (_, items, folders) = crate::datafile::usage(s, id);
     let protected = s.mailbox.account(id).and_then(|a| a.data_file.as_ref()).is_some_and(|l| l.protected);
+    let backup = opened.backup.as_ref().map(|b| b.display().to_string());
+    if opened.repairs.any() {
+        let kept =
+            backup.as_deref().map(|b| format!(" The file as it was is kept in {b}.")).unwrap_or_default();
+        s.notify(Notice::Info(format!(
+            "The data file \"{name}\" needed repairs when it opened: {}.{kept}",
+            opened.repairs.describe()
+        )));
+    }
     Ok(json!({
         "account": id.0,
         "name": name,
@@ -658,6 +668,8 @@ fn open_linked_cmd(s: &mut Session, path: &Path, bytes: &[u8], password: Option<
         "folders": folders,
         "path": path.display().to_string(),
         "protected": protected,
+        "repaired": opened.repairs.any().then_some(opened.repairs),
+        "backup": backup,
     }))
 }
 
@@ -702,7 +714,7 @@ fn new_data_file(s: &mut Session, p: &Value) -> CmdResult {
                     json!({"path": path.display().to_string(), "command": "file.openDataFile"}),
                 );
             }
-            return open_linked_cmd(s, &path, &bytes, password.as_deref());
+            return open_linked_cmd(s, &path, bytes, password.as_deref());
         }
         let clean = |n: &str| -> String { n.chars().filter(|c| !c.is_control()).take(255).collect() };
         let stem = path.file_stem().and_then(|n| n.to_str()).map(clean).unwrap_or_default();
@@ -792,9 +804,8 @@ fn close_data_file(s: &mut Session, p: &Value) -> CmdResult {
             match password_param(p)? {
                 Some(pw) => {
                     match &sealed {
-                        Some(bytes) => {
-                            crate::datafile::unseal(bytes, &pw)?;
-                        }
+                        // Checked without decrypting the whole file.
+                        Some(bytes) => crate::datafile::check_sealed_password(bytes, &pw)?,
                         // Nothing to check it against (the file is gone or not protected): it is typed twice.
                         None if opt_str(p, "verify") != Some(pw.as_str()) => {
                             return Err(CmdError::Params(
@@ -820,10 +831,18 @@ fn close_data_file(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
         }
+        let own_folders: std::collections::BTreeSet<FolderId> =
+            s.mailbox.folders.values().filter(|f| f.account == id).map(|f| f.id).collect();
         let (path, folders) = crate::datafile::close_linked(s, id)?;
         s.undo_barrier = true;
-        // A protected data file's contents leave the profile's journal and snapshot with it.
-        s.checkpoint_after = link.protected;
+        if link.protected {
+            // A protected data file's contents leave the profile with it: its deleted items leave the
+            // recoverable-items bin, its items leave the journal and snapshot (folded into a fresh one), and
+            // then the message sources only it used leave the profile's blobs.
+            crate::recover::forget_account(s, id, &own_folders);
+            s.checkpoint_after = true;
+            s.purge_blobs_after = true;
+        }
         return Ok(
             json!({"removed": id.0, "folders": folders, "name": name, "path": path.display().to_string()}),
         );
@@ -872,7 +891,7 @@ fn open_data_file(s: &mut Session, p: &Value) -> CmdResult {
                     json!({"path": path.display().to_string(), "command": "file.openDataFile"}),
                 );
             }
-            return open_linked_cmd(s, &path, &bytes, password.as_deref());
+            return open_linked_cmd(s, &path, bytes, password.as_deref());
         }
         (bytes, Some(path), None)
     } else if let Some(name) = opt_str(p, "name") {
@@ -898,7 +917,8 @@ fn open_data_file(s: &mut Session, p: &Value) -> CmdResult {
         return dialog(s, "openDataFile", json!({"files": files, "dir": dir}));
     };
     let image = crate::datafile::parse(&bytes)?;
-    let id = crate::datafile::attach(s, image)?;
+    drop(bytes);
+    let (id, repairs) = crate::datafile::attach_report(s, image)?;
     // The closed data file is consumed below (set aside or dropped): an undo step would take the data file
     // out of the mailbox with nothing left to open it from.
     s.undo_barrier = true;
@@ -907,9 +927,9 @@ fn open_data_file(s: &mut Session, p: &Value) -> CmdResult {
     {
         s.closed_data_files.remove(i);
     }
-    if let Some(path) = from_dir {
+    if let Some(path) = &from_dir {
         let done = path.with_extension(format!("{}.opened", crate::datafile::EXTENSION));
-        if let Err(e) = std::fs::rename(&path, &done) {
+        if let Err(e) = std::fs::rename(path, &done) {
             s.notify(Notice::Info(format!(
                 "The data file is open again, but {} could not be renamed: {e}",
                 path.display()
@@ -918,7 +938,24 @@ fn open_data_file(s: &mut Session, p: &Value) -> CmdResult {
     }
     let name = s.mailbox.account(id).map(|a| a.display_name.clone()).unwrap_or_default();
     let (_, items, folders) = crate::datafile::usage(s, id);
-    Ok(json!({"account": id.0, "name": name, "items": items, "folders": folders}))
+    if repairs.any() {
+        let kept = if from_dir.is_some() {
+            " The file as it was stays in the closed data files folder (renamed to end in .opened)."
+        } else {
+            ""
+        };
+        s.notify(Notice::Info(format!(
+            "The data file \"{name}\" needed repairs when it opened: {}.{kept}",
+            repairs.describe()
+        )));
+    }
+    Ok(json!({
+        "account": id.0,
+        "name": name,
+        "items": items,
+        "folders": folders,
+        "repaired": repairs.any().then_some(repairs),
+    }))
 }
 
 /// Data File Properties: the data file's name (renamed with `name`), where it is kept, its size and counts;
@@ -983,14 +1020,14 @@ fn data_file_properties(s: &mut Session, p: &Value) -> CmdResult {
     )
 }
 
-/// Writes every data file kept in a file of its own back to its file (on exit). Returns the files that
-/// could not be written, with why.
-fn save_linked_files(s: &Session) -> Vec<String> {
+/// Writes every data file kept in a file of its own back to its file (on exit) when it changed since it was
+/// last read or written. Returns the files that could not be written, with why.
+fn save_linked_files(s: &mut Session) -> Vec<String> {
     let linked: Vec<AccountId> =
         s.mailbox.accounts.iter().filter(|a| a.data_file.is_some()).map(|a| a.id).collect();
     linked
         .into_iter()
-        .filter_map(|id| crate::datafile::save_linked(s, id).err().map(|e| e.to_string()))
+        .filter_map(|id| crate::datafile::save_linked_as(s, id, true).err().map(|e| e.to_string()))
         .collect()
 }
 
@@ -1005,8 +1042,16 @@ fn open_file_location(s: &mut Session, p: &Value) -> CmdResult {
     dialog(s, "revealPath", json!({"path": path}))
 }
 
-/// Flushes pending ops and checkpoints the store, then asks the UI to close the window.
+/// Writes data files of their own back to their files, flushes pending ops and checkpoints the store, then
+/// asks the UI to close the window.
 fn exit(s: &mut Session, _: &Value) -> CmdResult {
+    // Data files of their own are written back to their files first: one written to a copy (its file was
+    // changed elsewhere) is linked to that copy from now on, and the checkpoint below must save that link,
+    // or the next start-up would follow the old file again and overwrite it.
+    let failed = save_linked_files(s);
+    for why in &failed {
+        s.notify(Notice::Error(format!("Could not save a data file: {why}")));
+    }
     if let Some(st) = s.store.as_mut() {
         // Queued ops leave the queue only once written, so a failed save loses nothing.
         let res = st.append(&s.pending_ops).and_then(|()| {
@@ -1021,10 +1066,6 @@ fn exit(s: &mut Session, _: &Value) -> CmdResult {
     } else {
         // Nothing to write to (in-memory session): the queue only mirrors the mailbox.
         s.pending_ops.clear();
-    }
-    // Data files of their own are written back to their files.
-    for why in save_linked_files(s) {
-        s.notify(Notice::Error(format!("Could not save a data file: {why}")));
     }
     s.notify(Notice::OpenDialog("exit".into(), json!({})));
     Ok(json!({"exit": true}))
@@ -1344,6 +1385,423 @@ mod tests {
         s.run("file.closeDataFile", &ok).unwrap();
         assert!(s.mailbox.account(id).is_none());
         assert!(crate::datafile::unseal(&std::fs::read(&file).unwrap(), "right-1").is_ok());
+    }
+
+    /// Every file under `dir` read as text, for checking that something is nowhere in a profile.
+    fn all_text_under(dir: &Path) -> String {
+        let mut out = String::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    todo.push(p);
+                } else {
+                    out.push_str(&String::from_utf8_lossy(&std::fs::read(&p).unwrap_or_default()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Regression: closing a protected data file left the raw source of every message in it unencrypted in
+    /// the profile's `blobs` folder for good (and its deleted items in the recoverable-items bin).
+    #[test]
+    fn closing_a_protected_data_file_removes_its_message_sources_from_the_profile() {
+        let profile = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::open(profile.path()).unwrap();
+        let file = dir.path().join("Private.mcdata");
+        let r =
+            s.run("file.newDataFile", &json!({"path": file.to_str().unwrap(), "password": "pw-1"})).unwrap();
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+        let other = s.mailbox.accounts.iter().find(|a| a.id != id).map(|a| a.id).unwrap();
+        let other_inbox = s.mailbox.role_folder(other, FolderRole::Inbox).unwrap();
+        let secret = b"From: a@example.com\r\nSubject: Q\r\n\r\nTopsecret-body-7f3a\r\n".to_vec();
+        let shared = b"From: b@example.org\r\nSubject: S\r\n\r\nShared-body-91c2\r\n".to_vec();
+        s.mailbox.add_mail(MailItem { folder: inbox, raw: Some(secret), ..Default::default() });
+        s.mailbox.add_mail(MailItem { folder: inbox, raw: Some(shared.clone()), ..Default::default() });
+        s.mailbox.add_mail(MailItem { folder: other_inbox, raw: Some(shared), ..Default::default() });
+        // A message deleted for good from the protected data file while it was open.
+        let deleted = MailItem {
+            id: ItemId(900_001),
+            folder: inbox,
+            subject: "Deleted-plan-55e1".into(),
+            raw: Some(b"Subject: D\r\n\r\nDeleted-src-55e1\r\n".to_vec()),
+            ..Default::default()
+        };
+        let now = s.now().unix;
+        s.recover.bin.add(mailcraft_model::DeletedItem::Mail(Box::new(deleted)), "Inbox", now);
+        s.store.as_mut().unwrap().save_recoverable(&mut s.recover.bin).unwrap();
+        s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
+        let open = all_text_under(profile.path());
+        for needle in ["Topsecret-body-7f3a", "Deleted-src-55e1", "Deleted-plan-55e1", "Shared-body-91c2"] {
+            assert!(open.contains(needle), "open, {needle} lives in the profile");
+        }
+        s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true})).unwrap();
+        let closed = all_text_under(profile.path());
+        for needle in ["Topsecret-body-7f3a", "Deleted-src-55e1", "Deleted-plan-55e1"] {
+            assert!(!closed.contains(needle), "closed, {needle} is gone from the profile");
+        }
+        assert!(closed.contains("Shared-body-91c2"), "a source another data file shares stays");
+        assert!(s.recover.bin.items.is_empty());
+        // The file keeps everything; the other data file's message still has its source.
+        let image =
+            crate::datafile::parse(&crate::datafile::unseal(&std::fs::read(&file).unwrap(), "pw-1").unwrap())
+                .unwrap();
+        assert_eq!(image.mail.len(), 2);
+        let kept = s.mailbox.mail.values().find(|m| m.folder == other_inbox && m.subject.is_empty()).unwrap();
+        let raw = s.store.as_ref().unwrap().raw_of(kept).unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&raw).contains("Shared-body-91c2"));
+        drop(s);
+        let s = Session::open(profile.path()).unwrap();
+        assert!(s.mailbox.account(id).is_none());
+        let kept = s.mailbox.mail.values().find(|m| m.folder == other_inbox && m.subject.is_empty()).unwrap();
+        assert!(s.store.as_ref().unwrap().raw_of(kept).unwrap().is_some(), "and after a restart");
+    }
+
+    /// Regression: closing a protected data file dropped only the recoverable items whose folder it still
+    /// had. Items deleted for good together with a folder of it stayed in the bin, and their text and
+    /// sources stayed readable in the profile.
+    #[test]
+    fn closing_a_protected_data_file_removes_items_deleted_with_its_folders() {
+        let profile = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::open(profile.path()).unwrap();
+        let file = dir.path().join("Private.mcdata");
+        let r =
+            s.run("file.newDataFile", &json!({"path": file.to_str().unwrap(), "password": "pw-1"})).unwrap();
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+        let sub = s.mailbox.create_folder(inbox, "Plans").unwrap();
+        s.mailbox.add_mail(MailItem {
+            folder: sub,
+            subject: "Gone-plan-6b2d".into(),
+            raw: Some(b"Subject: G\r\n\r\nGone-src-6b2d\r\n".to_vec()),
+            ..Default::default()
+        });
+        s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
+        // The folder goes to Deleted Items, then is deleted for good from there, message and all.
+        s.selection.folder = sub;
+        let r = s.run("folder.delete", &json!({"folder": sub.0, "confirm": true})).unwrap();
+        assert_eq!(r["permanent"], false);
+        s.selection.folder = sub;
+        let r = s.run("folder.delete", &json!({"folder": sub.0, "confirm": true})).unwrap();
+        assert_eq!(r["permanent"], true);
+        assert!(s.mailbox.folder(sub).is_none());
+        assert_eq!(s.recover.bin.items.len(), 1, "recoverable");
+        assert_eq!(s.recover.bin.items[0].account, Some(id), "with the data file it came from");
+        let open = all_text_under(profile.path());
+        for needle in ["Gone-src-6b2d", "Gone-plan-6b2d"] {
+            assert!(open.contains(needle), "open, {needle} lives in the profile");
+        }
+        s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true})).unwrap();
+        assert!(s.recover.bin.items.is_empty());
+        let closed = all_text_under(profile.path());
+        for needle in ["Gone-src-6b2d", "Gone-plan-6b2d"] {
+            assert!(!closed.contains(needle), "closed, {needle} is gone from the profile");
+        }
+    }
+
+    /// Regression: New Data File with a password on a file that exists unprotected opened it unprotected
+    /// and dropped the password silently, so it kept being written in clear.
+    #[test]
+    fn a_password_for_an_existing_unprotected_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _, _) = session();
+        let file = dir.path().join("Plain.mcdata");
+        let p = file.to_str().unwrap();
+        let r = s.run("file.newDataFile", &json!({"path": p})).unwrap();
+        s.run("file.closeDataFile", &json!({"store": r["account"], "confirm": true})).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        let accounts = s.mailbox.accounts.len();
+        for cmd in ["file.newDataFile", "file.openDataFile"] {
+            let e = s.run(cmd, &json!({"path": p, "password": "pw-1"})).unwrap_err();
+            assert!(matches!(&e, CmdError::Params(m) if m.contains("not protected")), "{cmd}: {e}");
+            assert_eq!(s.mailbox.accounts.len(), accounts, "{cmd}: nothing opens");
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), before, "the file is untouched");
+        assert!(!crate::datafile::is_sealed(&before));
+        // Without a password it opens as it is.
+        let r = s.run("file.newDataFile", &json!({"path": p})).unwrap();
+        assert_eq!(r["protected"], false);
+    }
+
+    /// Regression: a data file whose name contains the protected format's name was taken for a protected
+    /// file and could never be opened again.
+    #[test]
+    fn a_data_file_named_like_the_protected_format_opens_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _, _) = session();
+        let file = dir.path().join("odd.mcdata");
+        let p = file.to_str().unwrap();
+        let name = "mailcraft-data-file-sealed notes";
+        let r = s.run("file.newDataFile", &json!({"path": p, "name": name})).unwrap();
+        s.run("file.closeDataFile", &json!({"store": r["account"], "confirm": true})).unwrap();
+        let r = s.run("file.openDataFile", &json!({"path": p})).unwrap();
+        assert_eq!(r["name"], name);
+        assert_eq!(r["protected"], false);
+    }
+
+    /// A data file with items in missing folders, a message listed twice and a broken folder parent.
+    fn damaged_image() -> Vec<u8> {
+        use mailcraft_model::{Folder, Task};
+        let a = AccountId(1);
+        let image = crate::datafile::DataFileImage {
+            format: crate::datafile::FORMAT.to_owned(),
+            version: crate::datafile::VERSION,
+            account: Account { id: a, display_name: "Rescued".into(), ..Default::default() },
+            folders: vec![
+                Folder {
+                    id: FolderId(1),
+                    account: a,
+                    name: "Inbox".into(),
+                    role: Some(FolderRole::Inbox),
+                    ..Default::default()
+                },
+                Folder {
+                    id: FolderId(2),
+                    account: a,
+                    parent: Some(FolderId(77)),
+                    name: "Lost".into(),
+                    ..Default::default()
+                },
+            ],
+            mail: vec![
+                MailItem {
+                    id: ItemId(10),
+                    folder: FolderId(1),
+                    subject: "Kept".into(),
+                    ..Default::default()
+                },
+                MailItem {
+                    id: ItemId(10),
+                    folder: FolderId(1),
+                    subject: "Twin".into(),
+                    ..Default::default()
+                },
+                MailItem {
+                    id: ItemId(11),
+                    folder: FolderId(99),
+                    subject: "Orphan".into(),
+                    ..Default::default()
+                },
+            ],
+            tasks: vec![Task { folder: FolderId(98), subject: "Orphan task".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        serde_json::to_vec(&image).unwrap()
+    }
+
+    /// Regression: opening a data file repaired it silently, and the first write-back on Close or Exit lost
+    /// what was left out for good. Now the repairs are reported and the file as it was is kept first.
+    #[test]
+    fn opening_a_damaged_data_file_reports_its_repairs_and_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _, _) = session();
+        let file = dir.path().join("Rescued.mcdata");
+        let original = damaged_image();
+        std::fs::write(&file, &original).unwrap();
+        let r = s.run("file.openDataFile", &json!({"path": file.to_str().unwrap()})).unwrap();
+        assert_eq!(r["items"], 1);
+        assert_eq!(r["repaired"]["itemsWithoutFolder"], 2);
+        assert_eq!(r["repaired"]["duplicateItems"], 1);
+        assert_eq!(r["repaired"]["foldersMovedToTop"], 1);
+        let bak = dir.path().join("Rescued.mcdata.bak");
+        assert_eq!(r["backup"], bak.to_str().unwrap());
+        assert_eq!(std::fs::read(&bak).unwrap(), original, "the file as it was");
+        assert!(s.notices.iter().any(|n| matches!(n,
+            Notice::Info(t) if t.contains("needed repairs") && t.contains("2 items whose folder is not in the file")
+                && t.contains("Rescued.mcdata.bak"))));
+        // Close writes the repaired data file back; the backup stays as it was.
+        s.run("file.closeDataFile", &json!({"store": r["account"], "confirm": true})).unwrap();
+        assert_eq!(crate::datafile::parse(&std::fs::read(&file).unwrap()).unwrap().mail.len(), 1);
+        assert_eq!(std::fs::read(&bak).unwrap(), original);
+        // Nothing is left to repair the next time, so no further backup.
+        let r = s.run("file.openDataFile", &json!({"path": file.to_str().unwrap()})).unwrap();
+        assert!(r["repaired"].is_null() && r["backup"].is_null(), "{r}");
+        assert!(!dir.path().join("Rescued.mcdata.2.bak").exists());
+        // A closed data file of the profile reports its repairs too.
+        s.closed_data_files
+            .push(crate::datafile::ClosedDataFile { name: "Old".into(), bytes: damaged_image() });
+        let r = s.run("file.openDataFile", &json!({"name": "Old"})).unwrap();
+        assert_eq!(r["repaired"]["itemsWithoutFolder"], 2);
+        assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+    }
+
+    /// Regression: every Exit rewrote every linked data file, even unchanged, and two profiles with the same
+    /// file open overwrote each other (last writer won). Now an unchanged data file is left alone, and a file
+    /// something else wrote since it was read is never overwritten: this side goes to a copy next to it.
+    #[test]
+    fn exit_leaves_unchanged_files_alone_and_never_overwrites_a_file_changed_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Shared.mcdata");
+        let p = file.to_str().unwrap();
+        let (mut a, _, _) = session();
+        let r = a.run("file.newDataFile", &json!({"path": p, "password": "pw-1"})).unwrap();
+        let a_id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        // Unchanged: Exit does not write it again (a protected file would come out different: new salt).
+        let written = std::fs::read(&file).unwrap();
+        a.run("file.exit", &json!({})).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), written, "unchanged, not rewritten");
+        // A second profile opens the same file.
+        let (mut b, _, _) = session();
+        let r = b.run("file.openDataFile", &json!({"path": p, "password": "pw-1"})).unwrap();
+        let b_id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        // The first one changes it and exits: written.
+        let inbox = a.mailbox.role_folder(a_id, FolderRole::Inbox).unwrap();
+        a.mailbox.add_mail(MailItem { folder: inbox, subject: "From A".into(), ..Default::default() });
+        a.run("file.exit", &json!({})).unwrap();
+        let from_a = std::fs::read(&file).unwrap();
+        assert_ne!(from_a, written);
+        // The second one changes it too: its exit does not overwrite what the first wrote.
+        let inbox = b.mailbox.role_folder(b_id, FolderRole::Inbox).unwrap();
+        b.mailbox.add_mail(MailItem { folder: inbox, subject: "From B".into(), ..Default::default() });
+        b.run("file.exit", &json!({})).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), from_a, "the other profile's save is kept");
+        let copy = dir.path().join("Shared (copy).mcdata");
+        let subjects = |path: &Path| -> Vec<String> {
+            let plain = crate::datafile::unseal(&std::fs::read(path).unwrap(), "pw-1").unwrap();
+            crate::datafile::parse(&plain).unwrap().mail.into_iter().map(|m| m.subject).collect()
+        };
+        assert_eq!(subjects(&file), ["From A"]);
+        assert_eq!(subjects(&copy), ["From B"], "this side went to a copy, protected all the same");
+        assert!(b.notices.iter().any(|n| matches!(n,
+            Notice::Info(t) if t.contains("changed by another program") && t.contains("Shared (copy).mcdata"))));
+        // It stays linked to the copy: closing it writes there, and the shared file is still left alone.
+        let link = b.mailbox.account(b_id).and_then(|x| x.data_file.clone()).unwrap();
+        assert_eq!(link.path, copy.to_str().unwrap());
+        let r = b.run("file.closeDataFile", &json!({"store": b_id.0, "confirm": true})).unwrap();
+        assert_eq!(r["path"], copy.to_str().unwrap());
+        assert_eq!(std::fs::read(&file).unwrap(), from_a);
+        assert!(b.linked_seen.is_empty(), "nothing is remembered for a closed data file");
+    }
+
+    /// Regression: Exit checkpointed the profile before it wrote the data files, so a data file it sent to
+    /// a copy was linked to that copy in memory only. The next start-up followed the original file again,
+    /// and the next Exit wrote over what the other program had written there.
+    #[test]
+    fn a_copy_made_on_exit_stays_linked_after_a_restart() {
+        let profile = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Shared.mcdata");
+        let copy = dir.path().join("Shared (copy).mcdata");
+        let subjects = |path: &Path| -> Vec<String> {
+            let image = crate::datafile::parse(&std::fs::read(path).unwrap()).unwrap();
+            let mut v: Vec<String> = image.mail.into_iter().map(|m| m.subject).collect();
+            v.sort();
+            v
+        };
+        let mut s = Session::open(profile.path()).unwrap();
+        let r = s.run("file.newDataFile", &json!({"path": file.to_str().unwrap()})).unwrap();
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        // Something else writes the file while this side changes the data file too.
+        let other = crate::datafile::tests::plain_file("Written elsewhere");
+        std::fs::write(&file, &other).unwrap();
+        let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+        s.mailbox.add_mail(MailItem { folder: inbox, subject: "Mine".into(), ..Default::default() });
+        s.run("file.exit", &json!({})).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), other);
+        assert_eq!(subjects(&copy), ["Mine"]);
+        drop(s);
+        // After a restart the data file still follows the copy.
+        let mut s = Session::open(profile.path()).unwrap();
+        let link = s.mailbox.account(id).and_then(|a| a.data_file.clone()).unwrap();
+        assert_eq!(link.path, copy.to_str().unwrap());
+        // So the next Exit writes there and leaves the other program's file as it wrote it.
+        let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
+        s.mailbox.add_mail(MailItem { folder: inbox, subject: "Mine too".into(), ..Default::default() });
+        s.run("file.exit", &json!({})).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), other);
+        assert_eq!(subjects(&copy), ["Mine", "Mine too"]);
+        assert!(!dir.path().join("Shared (copy 2).mcdata").exists());
+        drop(s);
+        let s = Session::open(profile.path()).unwrap();
+        let link = s.mailbox.account(id).and_then(|a| a.data_file.clone()).unwrap();
+        assert_eq!(link.path, copy.to_str().unwrap());
+    }
+
+    /// Regression: a profile that only had a shared file open wrote a stale copy of it on Exit once another
+    /// profile had saved the file, and followed that stale copy from then on. With no changes of its own,
+    /// nothing is written and the link stays.
+    #[test]
+    fn exit_without_changes_leaves_a_file_changed_elsewhere_and_makes_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Shared.mcdata");
+        let p = file.to_str().unwrap();
+        let (mut a, _, _) = session();
+        let r = a.run("file.newDataFile", &json!({"path": p})).unwrap();
+        let a_id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let (mut b, _, _) = session();
+        let r = b.run("file.openDataFile", &json!({"path": p})).unwrap();
+        let b_id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        let inbox = a.mailbox.role_folder(a_id, FolderRole::Inbox).unwrap();
+        a.mailbox.add_mail(MailItem { folder: inbox, subject: "From A".into(), ..Default::default() });
+        a.run("file.exit", &json!({})).unwrap();
+        let from_a = std::fs::read(&file).unwrap();
+        b.run("file.exit", &json!({})).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), from_a);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no copy");
+        let link = b.mailbox.account(b_id).and_then(|x| x.data_file.clone()).unwrap();
+        assert_eq!(link.path, p);
+        assert!(!b.notices.iter().any(|n| matches!(n, Notice::Info(t) if t.contains("changed by another"))));
+        // Closing it without changes leaves the newer file too, and says why nothing was written.
+        let r = b.run("file.closeDataFile", &json!({"store": b_id.0, "confirm": true})).unwrap();
+        assert_eq!(r["path"], p);
+        assert_eq!(std::fs::read(&file).unwrap(), from_a);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no copy");
+        assert!(b.notices.iter().any(|n| matches!(n,
+            Notice::Info(t) if t.contains("changed by another program") && t.contains("no changes of its own"))));
+    }
+
+    /// Changes made on disk while a profile was not running are noticed from the next start-up on.
+    #[test]
+    fn a_file_changed_after_start_up_is_not_overwritten() {
+        let profile = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Notes.mcdata");
+        let mut s = Session::open(profile.path()).unwrap();
+        let r = s.run("file.newDataFile", &json!({"path": file.to_str().unwrap()})).unwrap();
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        drop(s);
+        let mut s = Session::open(profile.path()).unwrap();
+        assert!(s.linked_seen.contains_key(&id), "noted at start-up");
+        // Something else rewrites the file (a different size).
+        let other = crate::datafile::tests::plain_file("Written elsewhere");
+        std::fs::write(&file, &other).unwrap();
+        let r = s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true})).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), other);
+        let copy = dir.path().join("Notes (copy).mcdata");
+        assert_eq!(r["path"], copy.to_str().unwrap());
+        assert!(crate::datafile::parse(&std::fs::read(&copy).unwrap()).is_ok());
+    }
+
+    /// A data file protected in the earlier format (no MAC) opens, and is written in the current one.
+    #[test]
+    fn a_version_1_protected_file_opens_and_is_saved_in_the_current_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _, _) = session();
+        let file = dir.path().join("Old.mcdata");
+        let p = file.to_str().unwrap();
+        let plain = crate::datafile::tests::plain_file("Old archive");
+        std::fs::write(&file, crate::datafile::tests::v1_file(&plain, "old-pw")).unwrap();
+        assert_eq!(s.run("file.openDataFile", &json!({"path": p})).unwrap()["dialog"], "dataFilePassword");
+        let r = s.run("file.openDataFile", &json!({"path": p, "password": "old-pw"})).unwrap();
+        assert_eq!((r["name"].as_str(), r["protected"].as_bool()), (Some("Old archive"), Some(true)));
+        let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        // Closing without the kept password checks the typed one against the old file first.
+        s.secrets.remove(&crate::datafile::secret_key(id)).unwrap();
+        assert!(
+            s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true, "password": "nope"}))
+                .is_err()
+        );
+        s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true, "password": "old-pw"})).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["version"], crate::datafile::SEALED_VERSION);
+        assert_eq!(v["auth"], "hmac-sha256");
+        assert!(crate::datafile::unseal(&bytes, "old-pw").is_ok());
     }
 
     #[test]

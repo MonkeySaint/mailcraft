@@ -268,6 +268,12 @@ pub struct Session {
     /// password-protected data file): once the command's changes are written, the journal is folded into a
     /// fresh snapshot.
     pub(crate) checkpoint_after: bool,
+    /// Set with `checkpoint_after` by closing a protected data file: once the snapshot is written, the
+    /// message sources nothing refers to any more are deleted from the store's blobs.
+    pub(crate) purge_blobs_after: bool,
+    /// What was last read from or written to each standalone data file's file (`datafile::Seen`), so a file
+    /// something else wrote meanwhile is not overwritten and an unchanged one is not rewritten on exit.
+    pub(crate) linked_seen: BTreeMap<mailcraft_model::AccountId, crate::datafile::Seen>,
     /// Quick Print may go straight to the system's default printer. The desktop app turns it on; tests and
     /// tools leave it off, so nothing reaches a real printer by accident.
     pub direct_print: bool,
@@ -360,6 +366,8 @@ impl Session {
             closed_data_files: Vec::new(),
             undo_barrier: false,
             checkpoint_after: false,
+            purge_blobs_after: false,
+            linked_seen: BTreeMap::new(),
             direct_print: false,
             translator: None,
             translations: BTreeMap::new(),
@@ -420,6 +428,7 @@ impl Session {
         s.load_settings(dir);
         crate::recover::load(&mut s);
         crate::smime::load(&mut s);
+        crate::datafile::note_linked_files(&mut s);
         // A named calendar time zone (Calendar › Time Zones) sets the display offset for today's DST rules.
         crate::cmd::calendar::views::refresh_time_zone(&mut s);
         Ok(s)
@@ -973,8 +982,11 @@ impl Session {
             }
             self.flush_pending();
         }
-        if self.run_depth == 0 && std::mem::take(&mut self.checkpoint_after) {
-            self.checkpoint_now();
+        if self.run_depth == 0 {
+            let purge = std::mem::take(&mut self.purge_blobs_after);
+            if std::mem::take(&mut self.checkpoint_after) && self.checkpoint_now() && purge {
+                self.purge_unused_blobs();
+            }
         }
         self.tidy_selection();
         self.sync_settings_from_session();
@@ -1040,15 +1052,39 @@ impl Session {
     /// Folds the journal into a fresh snapshot of the mailbox now (when a store is attached and every queued
     /// change is written), so items that left the mailbox leave the journal and snapshot too. Message sources
     /// (content-addressed files next to the snapshot) are not touched.
-    pub(crate) fn checkpoint_now(&mut self) {
+    /// Returns whether the snapshot was written (`false` without a store too).
+    pub(crate) fn checkpoint_now(&mut self) -> bool {
         if !self.pending_ops.is_empty() {
             self.flush_pending();
         }
-        if let Some(store) = self.store.as_mut()
-            && self.pending_ops.is_empty()
-            && let Err(e) = store.checkpoint(&self.mailbox)
-        {
-            log::error!("could not fold the journal into a snapshot: {e}");
+        let Some(store) = self.store.as_mut() else { return false };
+        if !self.pending_ops.is_empty() {
+            return false;
+        }
+        match store.checkpoint(&self.mailbox) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("could not fold the journal into a snapshot: {e}");
+                false
+            }
+        }
+    }
+
+    /// Deletes the message sources in the store's blobs that nothing refers to any more (the mailbox, which
+    /// was just checkpointed, and the recoverable-items bin), e.g. those of a protected data file that was
+    /// closed. A source another item shares by content stays.
+    pub(crate) fn purge_unused_blobs(&mut self) {
+        if let Some(store) = self.store.as_mut() {
+            match store.gc_blobs(&self.mailbox) {
+                Ok(n) => log::info!("removed {n} message sources nothing refers to any more"),
+                Err(e) => {
+                    log::error!("could not remove unused message sources: {e}");
+                    self.notify(Notice::Error(format!(
+                        "The message sources of the closed data file could not all be removed from this \
+                         profile ({e})."
+                    )));
+                }
+            }
         }
     }
 

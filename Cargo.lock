@@ -2667,6 +2667,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -2821,6 +2822,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac 0.12.1",
  "mailcraft-mime",
+ "pbkdf2",
  "pkcs12",
  "pkcs5",
  "pkcs8",

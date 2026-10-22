@@ -233,6 +233,23 @@ fn module_rail_and_selection_flow() {
     assert_eq!(s.registry.by_shortcut("mod+z").map(|c| c.id), Some("app.undo"));
 }
 
+/// Regression (release check, #19): a protected data file was written with 200,000 PBKDF2 rounds. The
+/// release build (this test sees the engine as the app does, not its unit-test setting) writes 600,000.
+#[test]
+fn protected_data_files_are_written_with_600000_rounds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("Private.mcdata");
+    let mut s = sample_session();
+    s.run("file.newDataFile", &json!({"path": file.to_str().expect("path"), "password": "pw-strong-1"}))
+        .expect("new data file");
+    let bytes = std::fs::read(&file).expect("written");
+    let v: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(v["rounds"], mailcraft_engine::datafile::PASSWORD_ROUNDS);
+    assert!(v["rounds"].as_u64().is_some_and(|r| r >= 600_000));
+    assert_eq!(v["version"], 2);
+    assert!(mailcraft_engine::datafile::unseal(&bytes, "pw-strong-1").is_ok());
+}
+
 /// Regression (honest-parity audit, commit 10): New Appointment/Contact/Task from the Mail module used to pass the
 /// selected mail folder, which the item dialogs reject; only a post belongs in the mail folder.
 #[test]
