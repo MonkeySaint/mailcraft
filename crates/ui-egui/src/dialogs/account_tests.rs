@@ -407,16 +407,26 @@ fn change_account_keeps_unencrypted_sign_in() {
 // ---------------------------------------------------------------------------------------------------------
 // Test Account Settings
 
-fn wait_for_report(h: &mut Harness<'_, App>, id: u32) {
-    for _ in 0..200 {
+/// How long a test waits for background work (lookups, test connections, sync runs). Generous, so a busy
+/// machine (the full CI run builds and tests in parallel) does not fail the test.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Steps the UI until `done` holds, failing with `what` after [`WAIT`].
+fn step_until(h: &mut Harness<'_, App>, what: &str, mut done: impl FnMut(&Harness<'_, App>) -> bool) {
+    let end = std::time::Instant::now() + WAIT;
+    loop {
         step(h);
-        if h.state().s.sync.tests.contains_key(&AccountId(id)) {
-            step(h);
+        if done(h) {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(std::time::Instant::now() < end, "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    panic!("no test report");
+}
+
+fn wait_for_report(h: &mut Harness<'_, App>, id: u32) {
+    step_until(h, "the test report", |h| h.state().s.sync.tests.contains_key(&AccountId(id)));
+    step(h);
 }
 
 #[test]
@@ -771,17 +781,10 @@ fn the_shell_polls_send_receive_every_frame() {
     h.run_steps(2);
     h.state_mut().run("sendReceive.group", json!({"name": "pat@example.net"}));
     // No explicit poll: `App::ui_root` applies the worker's results.
-    let mut failed = false;
-    for _ in 0..400 {
-        h.run_steps(1);
+    step_until(&mut h, "the run against a closed port to finish with an error", |h| {
         let st = h.state().s.sync_status();
-        if !st.busy && st.accounts.iter().any(|a| a.account == id && a.error.is_some()) {
-            failed = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    assert!(failed, "the run against a closed port finishes with an error");
+        !st.busy && st.accounts.iter().any(|a| a.account == id && a.error.is_some())
+    });
     h.run_steps(2);
     assert!(h.query_by_label("Retry").is_some());
 }
@@ -893,14 +896,7 @@ fn local_lookup(app: &mut App, servers: &mailcraft_testmail::TestServers) {
 
 /// Steps until the settings page shows (the lookup runs in the background).
 fn wait_for_settings(h: &mut Harness<'_, App>, title: &str) {
-    for _ in 0..400 {
-        step(h);
-        if h.query_by_label(title).is_some() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    panic!("the settings page did not appear");
+    step_until(h, "the settings page", |h| h.query_by_label(title).is_some());
 }
 
 #[test]
@@ -995,13 +991,7 @@ fn add_account_points_out_servers_outside_the_domain_found_in_dns() {
     h.get_by_label("Let me set up my account manually").click();
     step(&mut h);
     h.get_by_label("Connect").click();
-    for _ in 0..400 {
-        step(&mut h);
-        if h.query_by_label("Advanced setup").is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    step_until(&mut h, "Advanced setup", |h| h.query_by_label("Advanced setup").is_some());
     h.get_by_label("POP").click();
     step(&mut h);
     assert_eq!(field_value(&h, "Server:"), "pop.example.org");
