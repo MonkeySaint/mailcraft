@@ -16,6 +16,12 @@ pub struct Theme {
     pub text: Color32,
     pub text_muted: Color32,
     pub accent: Color32,
+    /// Text and marks drawn on an `accent` fill (primary buttons, today in the date navigators): at least
+    /// 4.5:1 against it.
+    pub on_accent: Color32,
+    /// Fill of text boxes outside dialogs (the search boxes in the People and Tasks bars): set apart from the
+    /// pane they sit on.
+    pub field: Color32,
     /// Unread bar, unread subject/time.
     pub unread: Color32,
     pub selected: Color32,
@@ -99,6 +105,8 @@ impl Theme {
         v.panel_fill = self.pane;
         v.window_fill = self.pane;
         v.extreme_bg_color = if self.dark { self.backdrop } else { Color32::WHITE };
+        // Text boxes on a pane (the People and Tasks bars) need a fill of their own: idle widgets are frameless.
+        v.text_edit_bg_color = Some(self.field);
         v.faint_bg_color = self.group_header;
         v.code_bg_color = self.info_bar;
         v.window_stroke = Stroke::new(1.0, self.separator);
@@ -172,7 +180,9 @@ impl Theme {
             text: Color32::from_rgb(0x1d, 0x1f, 0x23),
             text_muted: Color32::from_rgb(0x5f, 0x66, 0x70),
             accent: Color32::from_rgb(0x0e, 0x7c, 0x86),
-            unread: Color32::from_rgb(0x0b, 0x6a, 0xb8),
+            on_accent: Color32::WHITE,
+            field: Color32::from_rgb(0xee, 0xf0, 0xf3),
+            unread: Color32::from_rgb(0x0a, 0x64, 0xae),
             selected: Color32::from_rgb(0xd5, 0xe6, 0xf2),
             selected_folder: Color32::from_rgb(0xdf, 0xe6, 0xec),
             hover: Color32::from_rgb(0xee, 0xf2, 0xf5),
@@ -202,13 +212,15 @@ impl Theme {
             text: Color32::from_rgb(0xe8, 0xea, 0xed),
             text_muted: Color32::from_rgb(0x9a, 0xa1, 0xab),
             accent: Color32::from_rgb(0x3f, 0xb8, 0xc2),
+            on_accent: Color32::from_rgb(0x0c, 0x0e, 0x10),
+            field: Color32::from_rgb(0x15, 0x17, 0x1a),
             unread: Color32::from_rgb(0x6c, 0xb8, 0xf6),
             selected: Color32::from_rgb(0x34, 0x45, 0x52),
             selected_folder: Color32::from_rgb(0x33, 0x38, 0x3e),
             hover: Color32::from_rgb(0x2a, 0x2e, 0x33),
             group_header: Color32::from_rgb(0x26, 0x29, 0x2d),
             separator: Color32::from_rgb(0x33, 0x37, 0x3c),
-            flagged_row: Color32::from_rgb(0x3a, 0x22, 0x24),
+            flagged_row: Color32::from_rgb(0x33, 0x24, 0x26),
             flag: Color32::from_rgb(0xe5, 0x5b, 0x58),
             complete: Color32::from_rgb(0x5c, 0xc0, 0x76),
             importance_high: Color32::from_rgb(0xe5, 0x5b, 0x58),
@@ -219,5 +231,92 @@ impl Theme {
             info_bar: Color32::from_rgb(0x2a, 0x2e, 0x33),
             search_hit: Color32::from_rgb(0x6b, 0x5a, 0x12),
         }
+    }
+}
+
+/// Relative luminance of an opaque colour (WCAG 2.x).
+pub fn luminance(c: Color32) -> f32 {
+    let lin = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.039_28 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// WCAG contrast ratio of two opaque colours (1 to 21).
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `fg`, moved toward white on a dark `bg` (toward black on a light one) just far enough to reach `min`
+/// contrast against `bg`: keeps a calendar or category colour recognisable while it stays visible.
+pub fn legible(fg: Color32, bg: Color32, min: f32) -> Color32 {
+    let to = if luminance(bg) < 0.18 { Color32::WHITE } else { Color32::BLACK };
+    let mix = |t: f32| {
+        let m =
+            |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round().clamp(0.0, 255.0) as u8;
+        Color32::from_rgb(m(fg.r(), to.r()), m(fg.g(), to.g()), m(fg.b(), to.b()))
+    };
+    (0..=20).map(|i| mix(i as f32 / 20.0)).find(|c| contrast(*c, bg) >= min).unwrap_or(to)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Release check: dark-theme primary buttons drew white text on the light teal accent (about 2.4:1).
+    #[test]
+    fn text_on_the_accent_reaches_aa_in_both_themes() {
+        for t in [Theme::light(), Theme::dark()] {
+            let c = contrast(t.on_accent, t.accent);
+            assert!(c >= 4.5, "dark={}: on_accent {c:.2}:1", t.dark);
+        }
+    }
+
+    /// Release check (dark theme): the blue unread subject on a highlighted (flagged) row sat on a strong dark
+    /// red. The ratio passed (6.8:1), but the two hues clashed. The tint is now a muted rose that keeps the
+    /// ratio and keeps flagged rows apart from the pane. The selected row is checked too.
+    #[test]
+    fn unread_text_on_tinted_rows_reaches_aa() {
+        for t in [Theme::light(), Theme::dark()] {
+            for (name, bg) in [("flagged", t.flagged_row), ("selected", t.selected), ("pane", t.pane)] {
+                let c = contrast(t.unread, bg);
+                assert!(c >= 4.5, "dark={}: unread on {name} {c:.2}:1", t.dark);
+            }
+        }
+        let d = Theme::dark();
+        assert!(contrast(d.unread, d.flagged_row) >= 6.0);
+        let f = d.flagged_row;
+        let chroma = f.r().max(f.g()).max(f.b()) - f.r().min(f.g()).min(f.b());
+        assert!(chroma <= 0x12, "dark flagged tint too saturated: {f:?}");
+        assert_ne!(f, d.pane, "flagged rows still stand out");
+        assert!(f.r() > f.g(), "still a warm tint");
+    }
+
+    /// Release check: in the light theme the People and Tasks search boxes had the pane's own white fill and
+    /// no border, so they read as plain labels.
+    #[test]
+    fn text_boxes_stand_apart_from_the_pane() {
+        for t in [Theme::light(), Theme::dark()] {
+            let fill = t.visuals().text_edit_bg_color();
+            assert_ne!(fill, t.pane, "dark={}", t.dark);
+            assert!(contrast(fill, t.pane) >= 1.08, "dark={}: field {:.2}:1", t.dark, contrast(fill, t.pane));
+            assert!(contrast(t.text, fill) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn legible_lifts_dark_colours_on_dark_fills() {
+        let navy = Color32::from_rgb(0x1f, 0x3a, 0x68);
+        let cell = Theme::dark().selected;
+        assert!(contrast(navy, cell) < 3.0);
+        let lifted = legible(navy, cell, 3.0);
+        assert!(contrast(lifted, cell) >= 3.0);
+        assert!(lifted.b() >= lifted.r(), "still bluish: {lifted:?}");
+        // Already legible colours are kept as they are.
+        let light = Theme::light();
+        assert_eq!(legible(light.accent, light.pane, 3.0), light.accent);
+        assert_eq!(contrast(Color32::BLACK, Color32::WHITE).round(), 21.0);
     }
 }

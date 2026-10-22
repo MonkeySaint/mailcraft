@@ -8,9 +8,7 @@
 //! [`todo_bar_shown`]. Older profiles kept the parts in the dialog settings (`todoBar.parts`); the shell takes
 //! them over once ([`saved_todo_bar`]).
 
-use egui::{
-    Align2, Color32, CornerRadius, FontId, Id, Rect, RichText, ScrollArea, Sense, TextEdit, Ui, pos2, vec2,
-};
+use egui::{Align2, CornerRadius, FontId, Id, Rect, RichText, ScrollArea, Sense, TextEdit, Ui, pos2, vec2};
 use serde_json::{Value, json};
 
 use mailcraft_engine::cmd::people::{display_name, find_contacts, is_group};
@@ -158,7 +156,7 @@ fn calendar_part(ui: &mut Ui, app: &mut App, st: &mut TodoBarState) {
         let mut color = if in_month { app.theme.text } else { app.theme.text_muted };
         if d == now {
             ui.painter().rect_filled(cr.shrink(1.0), CornerRadius::same(3), app.theme.accent);
-            color = Color32::WHITE;
+            color = app.theme.on_accent;
         } else if st.day == Some(d) {
             ui.painter().rect_filled(cr.shrink(1.0), CornerRadius::same(3), app.theme.selected);
         } else if resp.hovered() {

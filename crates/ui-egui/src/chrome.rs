@@ -559,7 +559,9 @@ fn account_button(ui: &mut Ui, app: &mut App, rect: Rect) {
     ui.painter().circle_filled(c, 14.0, theme.accent);
     ui.painter().circle_stroke(c, 14.0, Stroke::new(1.0, theme.chrome_text.gamma_multiply(0.6)));
     let text = if initials.is_empty() { "?".to_owned() } else { initials };
-    ui.painter().text(c, Align2::CENTER_CENTER, text, egui::FontId::proportional(12.0), Color32::WHITE);
+    // The initials sit on the accent: `on_accent` keeps them readable in both themes (white on the dark
+    // theme's light accent was about 2.4:1).
+    ui.painter().text(c, Align2::CENTER_CENTER, text, egui::FontId::proportional(12.0), theme.on_accent);
     let resp = resp.on_hover_text(label);
     egui::Popup::menu(&resp).show(|ui| {
         ui.set_min_width(220.0);
@@ -1689,6 +1691,47 @@ mod tests {
         let b = bands(&h.ctx);
         assert_eq!(b.status_bar, None, "{b:?}");
         assert_eq!(b.ribbon, None, "{b:?}");
+    }
+
+    /// Release check: the title bar's account avatar drew white initials on the dark theme's light accent
+    /// (about 2.4:1). They now use the theme's `on_accent` colour, as primary buttons do.
+    #[test]
+    fn account_avatar_initials_reach_aa_in_both_themes() {
+        fn texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                egui::Shape::Text(t) => {
+                    let color = t.galley.job.sections.first().map_or(t.fallback_color, |s| s.format.color);
+                    out.push((t.galley.text().to_owned(), color));
+                }
+                _ => {}
+            }
+        }
+        for theme in [Theme::light(), Theme::dark()] {
+            let mut app = App::new(mailcraft_engine::sample::sample_session());
+            app.theme = theme.clone();
+            let (name, addr) = app
+                .s
+                .mailbox
+                .default_account()
+                .map(|a| (a.display_name.clone(), a.address.clone()))
+                .unwrap_or_default();
+            let initials = mailcraft_engine::queries::initials(Some(name.as_str()), &addr);
+            assert!(!initials.is_empty());
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(200.0, 60.0)).build_ui_state(
+                |ui, app: &mut App| {
+                    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(size::ACCOUNT_BUTTON_W, 40.0));
+                    account_button(ui, app, rect);
+                },
+                app,
+            );
+            h.run();
+            let mut out = Vec::new();
+            h.output().shapes.iter().for_each(|c| texts(&c.shape, &mut out));
+            let color = out.iter().find(|(t, _)| *t == initials).map(|(_, c)| *c);
+            assert_eq!(color, Some(theme.on_accent), "dark={}: {out:?}", theme.dark);
+            assert!(crate::theme::contrast(theme.on_accent, theme.accent) >= 4.5);
+        }
     }
 
     #[test]

@@ -166,6 +166,9 @@ pub fn show_in(ui: &mut Ui, app: &mut App, surface: Surface, page: &str, rect: R
     );
 }
 
+/// Room the backstage nav keeps below its last entry (Exit).
+const NAV_BOTTOM_PAD: f32 = 20.0;
+
 fn nav_column(ui: &mut Ui, app: &mut App, surface: Surface, page: &str, rect: Rect) -> Option<&'static str> {
     let text = app.theme.chrome_text;
     let w = rect.width();
@@ -190,8 +193,11 @@ fn nav_column(ui: &mut Ui, app: &mut App, surface: Surface, page: &str, rect: Re
         }
     }
     let used = ui.min_rect().height();
-    let bottom_h = 56.0 + 40.0 * (bottom.len().saturating_sub(1)) as f32;
-    let gap = (rect.height() - used - bottom_h - 8.0).max(8.0);
+    // The entries plus the spacing before each (left out, it pushed Exit onto the window's edge).
+    let bottom_h = 56.0
+        + 40.0 * (bottom.len().saturating_sub(1)) as f32
+        + ui.spacing().item_spacing.y * bottom.len() as f32;
+    let gap = (rect.height() - used - bottom_h - NAV_BOTTOM_PAD).max(8.0);
     ui.add_space(gap);
     for (i, (id, label)) in bottom.into_iter().enumerate() {
         let h = if i == 0 { 56.0 } else { 40.0 };
@@ -471,6 +477,7 @@ fn info(ui: &mut Ui, app: &mut App, st: &mut PageState) {
         |_, _| {},
     );
     let (used, items, deleted) = mailbox_size(app, current);
+    let quota = acct.as_ref().and_then(|a| mailcraft_engine::sync::account_quota(&app.s, a.id));
     let mut tools: Option<&str> = None;
     if tile_with(
         ui,
@@ -481,7 +488,7 @@ fn info(ui: &mut Ui, app: &mut App, st: &mut PageState) {
         true,
         |ui, app| {
             ui.label(format!("{} in {} items", files_size(used), items));
-            size_bar(ui, app, used, deleted);
+            size_bar(ui, app, quota);
             muted(ui, app, &format!("Deleted Items: {}", files_size(deleted)));
             ui.horizontal(|ui| {
                 if ui.link("Mailbox Cleanup...").clicked() {
@@ -619,15 +626,40 @@ fn mailbox_size(app: &App, account: Option<u32>) -> (u64, usize, u64) {
     (used, items, del)
 }
 
-fn size_bar(ui: &mut Ui, app: &App, used: u64, deleted: u64) {
-    let w = 300.0;
-    let (r, _) = ui.allocate_exact_size(Vec2::new(w, 8.0), Sense::hover());
-    ui.painter().rect_filled(r, 3.0, app.theme.hover);
-    if used > 0 {
-        let frac = (deleted as f32 / used as f32).clamp(0.0, 1.0);
-        let keep = Rect::from_min_size(r.min, Vec2::new(w * (1.0 - frac), 8.0));
-        ui.painter().rect_filled(keep, 3.0, app.theme.accent);
+/// Width of the Tools tile's storage bar.
+const SIZE_BAR_W: f32 = 300.0;
+
+/// Share of the storage limit in use (0 to 1), or `None` when the server reported no size limit: the bar is then
+/// left out rather than drawn full (a full bar read as "mailbox full" for a mailbox of a few hundred KB).
+pub(crate) fn storage_fill(quota: Option<&mailcraft_engine::MailboxQuota>) -> Option<f32> {
+    let q = quota?;
+    if q.limit == 0 {
+        return None;
     }
+    Some((q.used as f64 / q.limit as f64).clamp(0.0, 1.0) as f32)
+}
+
+/// The storage bar: a visible track, filled in proportion to the server's limit, and the free space; nothing
+/// when no limit is known.
+fn size_bar(ui: &mut Ui, app: &App, quota: Option<mailcraft_engine::MailboxQuota>) {
+    let Some(frac) = storage_fill(quota.as_ref()) else { return };
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(SIZE_BAR_W, 8.0), Sense::hover());
+    let limit = quota.map_or(0, |q| q.limit);
+    let used = quota.map_or(0, |q| q.used);
+    resp.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::ProgressIndicator,
+            true,
+            format!("{:.0}% of the mailbox limit used", frac * 100.0),
+        )
+    });
+    ui.painter().rect_filled(r, 3.0, app.theme.hover);
+    ui.painter().rect_stroke(r, 3.0, egui::Stroke::new(1.0, app.theme.separator), egui::StrokeKind::Inside);
+    if frac > 0.0 {
+        let fill = Rect::from_min_size(r.min, Vec2::new((SIZE_BAR_W * frac).max(3.0), 8.0));
+        ui.painter().rect_filled(fill, 3.0, app.theme.accent);
+    }
+    muted(ui, app, &format!("{} free of {}", files_size(limit.saturating_sub(used)), files_size(limit)));
 }
 
 fn compose_info(ui: &mut Ui, app: &mut App, cid: u64) {

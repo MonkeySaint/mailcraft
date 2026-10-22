@@ -1407,3 +1407,163 @@ fn view_in_browser_opens_the_written_page() {
     h.run_steps(1);
     assert!(h.state().ui.open_urls.is_empty(), "opened at the next frame");
 }
+
+fn sized(app: App, w: f32, ht: f32) -> Harness<'static, App> {
+    let mut h = Harness::builder().with_size(egui::vec2(w, ht)).build_ui_state(
+        |ui, app: &mut App| {
+            let ctx = ui.ctx().clone();
+            crate::dialogs::dialogs(&ctx, app);
+        },
+        app,
+    );
+    h.run_steps(3);
+    h
+}
+
+/// Release check: the Options page's scroll area was capped at 560 points while the dialog ran the screen's
+/// full height, so the page was cut through a row with an empty band below it, and the title bar touched the
+/// top of the screen.
+#[test]
+fn options_page_fills_its_dialog_and_the_dialog_fits_the_screen() {
+    for (w, ht) in [(1920.0, 1080.0), (1024.0, 768.0), (800.0, 600.0)] {
+        let mut app = sample_app();
+        app.run("options.open", json!({"page": "general"})).unwrap();
+        let h = sized(app, w, ht);
+        let top = h.get_by_label("Close dialog").rect();
+        let ok = h.get_by_label("OK").rect();
+        assert!(top.top() >= 8.0, "{w}x{ht}: title bar at the screen's edge: {top:?}");
+        assert!(ok.bottom() <= ht - 8.0, "{w}x{ht}: OK off screen: {ok:?}");
+        let height = ok.bottom() - top.top();
+        assert!(height <= 600.0 + 200.0, "{w}x{ht}: dialog {height} tall, an empty band below the page");
+    }
+    // The page height follows the room: the cap on a tall screen, the rest on a short one.
+    assert_eq!(super::options::page_height(2000.0), 600.0);
+    assert!(super::options::page_height(500.0) < 420.0);
+    assert!(super::options::page_height(f32::INFINITY) <= 600.0);
+    assert!(super::options::page_height(f32::NAN).is_finite());
+}
+
+/// Rectangles painted with a `color` outline.
+fn stroked_rects(h: &Harness<'_, App>, color: egui::Color32) -> Vec<egui::Rect> {
+    fn walk(shape: &egui::Shape, color: egui::Color32, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, color, out)),
+            egui::Shape::Rect(r) if r.stroke.color == color && r.stroke.width > 0.0 => out.push(r.rect),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    h.output().shapes.iter().for_each(|c| walk(&c.shape, color, &mut out));
+    out
+}
+
+/// The outlined box that starts right below the label `label`.
+fn box_below(h: &Harness<'_, App>, label: &str) -> egui::Rect {
+    let l = h.get_by_label(label).rect();
+    let sep = h.state().theme.separator;
+    stroked_rects(h, sep)
+        .into_iter()
+        .filter(|r| r.top() >= l.bottom() - 1.0 && r.top() <= l.bottom() + 16.0 && r.height() > 40.0)
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
+        .unwrap_or_else(|| panic!("no box below {label}"))
+}
+
+/// Release check: the Rules Wizard's Step 1 template list was sized to its content and ended short of the
+/// Step 2 description box below it.
+#[test]
+fn rules_wizard_step_boxes_line_up() {
+    for (w, ht) in [(1920.0, 1080.0), (1024.0, 768.0)] {
+        let mut app = sample_app();
+        app.run("rules.new", json!({})).unwrap();
+        let h = sized(app, w, ht);
+        let step1 = box_below(&h, "Step 1: Select a template");
+        let step2 = box_below(&h, "Step 2: Edit the rule description (click an underlined value)");
+        assert!((step1.right() - step2.right()).abs() <= 1.0, "{w}x{ht}: {step1:?} vs {step2:?}");
+        assert!((step1.left() - step2.left()).abs() <= 1.0, "{w}x{ht}: {step1:?} vs {step2:?}");
+    }
+}
+
+/// Release check: Advanced View Settings cut the Columns summary to one line ("…, Attachment, Fro…").
+#[test]
+fn advanced_view_settings_shows_the_whole_columns_summary() {
+    for (w, ht) in [(1920.0, 1080.0), (1024.0, 768.0)] {
+        let mut app = sample_app();
+        crate::dialogs::open(&mut app, "advancedViewSettings", json!({}));
+        let folder = app.s.selection.folder;
+        let cols: Vec<String> =
+            mailcraft_engine::cmd::view::mail::columns(&app.s, folder).into_iter().map(|c| c.label).collect();
+        assert!(cols.len() > 4, "a long column list");
+        let h = sized(app, w, ht);
+        let summary = h.get_by_label(cols.join(", ").as_str()).rect();
+        let button = h.get_by_label("Columns...").rect();
+        let edge = h.get_by_label("Close dialog").rect().right();
+        assert!(summary.height() > button.height(), "{w}x{ht}: wrapped onto more lines: {summary:?}");
+        assert!(summary.right() <= edge, "{w}x{ht}: inside the dialog: {summary:?} {edge}");
+        assert!(
+            summary.bottom() < h.get_by_label("Group By...").rect().top(),
+            "no overlap with the next row"
+        );
+    }
+}
+
+/// Release check: Advanced Find's Find Now, New Search and Show in List were three widths, and Find Now lined
+/// up with the tab strip instead of the form's first row.
+#[test]
+fn advanced_find_buttons_share_a_width_and_line_up_with_the_form() {
+    for (w, ht) in [(1920.0, 1080.0), (1024.0, 768.0)] {
+        let mut app = sample_app();
+        app.run("search.advancedFind", json!({})).unwrap();
+        let h = sized(app, w, ht);
+        let find = h.get_by_label("Find Now").rect();
+        let new = h.get_by_label("New Search").rect();
+        let show = h.get_by_label("Show in List").rect();
+        assert!((find.width() - new.width()).abs() < 0.5 && (new.width() - show.width()).abs() < 0.5);
+        assert!((find.left() - show.left()).abs() < 0.5);
+        let tabs = h.get_by_label("More Choices").rect();
+        let first = h.get_by_label("Search for the word(s):").rect();
+        assert!(find.top() > tabs.bottom(), "below the tab strip: {find:?} {tabs:?}");
+        assert!((find.center().y - first.center().y).abs() <= 6.0, "{find:?} vs {first:?}");
+    }
+}
+
+fn backstage_at(w: f32, ht: f32) -> Harness<'static, App> {
+    let mut app = sample_app();
+    app.ui.backstage = Some((Surface::Main, "info".into()));
+    let mut h = Harness::builder().with_size(egui::vec2(w, ht)).build_ui_state(
+        |ui, app: &mut App| {
+            let ctx = ui.ctx().clone();
+            crate::backstage::backstage(&ctx, app);
+        },
+        app,
+    );
+    h.run_steps(3);
+    h
+}
+
+/// Release check: the backstage's Exit sat on the window's bottom edge, and the Tools storage bar was drawn
+/// full for a mailbox of a few hundred KB with no limit known.
+#[test]
+fn backstage_exit_has_room_and_the_storage_bar_needs_a_limit() {
+    for (w, ht) in [(1920.0, 1080.0), (1024.0, 768.0)] {
+        let h = backstage_at(w, ht);
+        let exit = h.get_by_label("Exit").rect();
+        assert!(exit.bottom() <= ht - 16.0, "{w}x{ht}: Exit at {exit:?}");
+        let options = h.get_by_label("Options").rect();
+        assert!(options.bottom() <= exit.top() + 0.5, "{options:?} {exit:?}");
+        assert!(
+            h.query_by_role(egui::accesskit::Role::ProgressIndicator).is_none(),
+            "no bar without a reported limit"
+        );
+    }
+    use crate::backstage::storage_fill;
+    use mailcraft_engine::MailboxQuota;
+    assert_eq!(storage_fill(None), None);
+    assert_eq!(storage_fill(Some(&MailboxQuota { used: 300_000, limit: 0, ..Default::default() })), None);
+    let half = storage_fill(Some(&MailboxQuota { used: 50, limit: 100, ..Default::default() }));
+    assert_eq!(half, Some(0.5));
+    let over = storage_fill(Some(&MailboxQuota { used: u64::MAX, limit: 1, ..Default::default() }));
+    assert_eq!(over, Some(1.0));
+    let tiny =
+        storage_fill(Some(&MailboxQuota { used: 301_000, limit: 2_000_000_000, ..Default::default() }));
+    assert!(tiny.is_some_and(|f| f < 0.01), "{tiny:?}");
+}

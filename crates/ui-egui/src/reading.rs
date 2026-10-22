@@ -44,6 +44,10 @@ const NARROW_W: f32 = 700.0;
 /// Reading-pane width below which the header goes narrow regardless of the window.
 const NARROW_PANE_W: f32 = 520.0;
 const PAD: f32 = 16.0;
+/// Gap between the sender line and the header's button cluster.
+const HEADER_GAP: f32 = 12.0;
+/// Default size of a read window.
+const READ_WINDOW_SIZE: [f32; 2] = [960.0, 760.0];
 
 pub fn reading_pane(ui: &mut egui::Ui, app: &mut App, frame: &Frame) {
     let rect = ui.max_rect();
@@ -242,7 +246,7 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
     let ids = app.ui.read_windows.clone();
     let mut closed: Vec<u64> = Vec::new();
     let after = app.s.settings.text("mail.other.afterMoveOrDelete");
-    for id in ids {
+    for (index, id) in ids.into_iter().enumerate() {
         // The folder the item was in when the window first showed it: deleting, archiving or moving the item
         // takes it out of that folder, which counts as the item leaving the window.
         let folder_key = folder_id(id);
@@ -312,10 +316,24 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
         let title = window_title(&m.subject, m.body.format);
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size([960.0, 760.0])
+            .with_inner_size(READ_WINDOW_SIZE)
             .with_min_inner_size([300.0, 200.0]);
         let vid = read_viewport_id(id);
-        let close = ctx.show_viewport_immediate(vid, builder, |ui, class| read_window_ui(ui, app, id, class));
+        let theme = app.theme.clone();
+        // Read windows stack after the compose windows.
+        let slot = crate::widgets::ItemSlot {
+            index: crate::widgets::compose_windows_open(app).saturating_add(index),
+            open: crate::widgets::item_windows_open(app),
+        };
+        let close = crate::widgets::item_window(
+            ctx,
+            vid,
+            builder,
+            READ_WINDOW_SIZE.into(),
+            &theme,
+            slot,
+            |ui, class| read_window_ui(ui, app, id, class),
+        );
         if close {
             closed.push(id);
         }
@@ -872,13 +890,21 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             info_top
         });
         ui.add_space(10.0);
+        // The page colour fills the pane from here down, edge to edge (not a box behind the text only); a
+        // message without a background of its own shown dark takes the pane's colour.
+        if let Some(fill) = body::page_fill(&cache.doc, dark) {
+            let top = ui.cursor().top();
+            let bottom = ui.clip_rect().bottom().max(top);
+            let page = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=bottom);
+            ui.painter().rect_filled(page, 0.0, fill);
+        }
         let body_frame =
             egui::Frame::new().inner_margin(egui::Margin::symmetric(PAD as i8, 0)).show(ui, |ui| {
                 let opts = BodyOptions {
                     dark,
                     zoom,
                     allow_remote,
-                    paint_background: true,
+                    paint_background: false,
                     doc_key: Some(cache.doc_key),
                 };
                 let doc = Arc::clone(&cache.doc);
@@ -994,7 +1020,10 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
     }
     let right_used = right.min_rect();
 
-    let left_w = (full.width() - right_w - 8.0).max(60.0);
+    // The sender line ends a clear gap before the button cluster, which can be wider than its share (the dark
+    // theme's background toggle adds a button).
+    let right_left = right_used.left().min(right_rect.left());
+    let left_w = (right_left - full.left() - HEADER_GAP).max(60.0);
     ui.allocate_ui_with_layout(Vec2::new(left_w, 0.0), Layout::left_to_right(Align::Min), |ui| {
         let d = if in_window { 48.0 } else { 40.0 };
         let (r, _) = ui.allocate_exact_size(Vec2::splat(d), Sense::hover());
@@ -1464,6 +1493,59 @@ fn link_prompt(ctx: &egui::Context, app: &mut App) {
 // ---------------------------------------------------------------------------------------------------------
 // Read windows
 
+/// The read window's Quick Access row (read-window.md): Save, Undo, Redo, Previous Item, Next Item, plus Close
+/// at the right when the window is embedded (its egui frame has no close button). `tiny` keeps only Close;
+/// `unsaved` (Edit Message changes waiting) enables Save, which saves them, and disables the item steps.
+/// Returns whether Close was clicked.
+fn read_quick_access(ui: &mut Ui, app: &mut App, id: u64, embedded: bool, tiny: bool, unsaved: bool) -> bool {
+    let mut close = false;
+    let can_undo = crate::keys::enabled(&app.s, "app.undo");
+    let can_redo = crate::keys::enabled(&app.s, "app.redo");
+    let order = queries::visible_item_ids(&app.s);
+    let pos = order.iter().position(|i| i.0 == id);
+    let neighbour = |step: Option<usize>| {
+        step.and_then(|p| order.get(p)).is_some_and(|n| !app.ui.read_windows.contains(&n.0))
+    };
+    let has_prev = !unsaved && neighbour(pos.and_then(|p| p.checked_sub(1)));
+    let has_next = !unsaved && neighbour(pos.map(|p| p.saturating_add(1)));
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), crate::compose::QAT_H),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.add_space(8.0);
+            if !tiny {
+                // Save keeps Edit Message changes (Save As, to a file, is in File); with nothing being
+                // edited there is nothing to save.
+                if crate::widgets::icon_only(ui, app, "save", "Save", unsaved).clicked() {
+                    let ctx = ui.ctx().clone();
+                    crate::edit_message::save(&ctx, app, id);
+                }
+                if crate::widgets::icon_only(ui, app, "undo", "Undo", can_undo).clicked() {
+                    app.run("app.undo", json!({}));
+                }
+                if crate::widgets::icon_only(ui, app, "redo", "Redo", can_redo).clicked() {
+                    app.run("app.redo", json!({}));
+                }
+                if crate::widgets::icon_only(ui, app, "chevron-up", "Previous Item", has_prev).clicked() {
+                    read_step(app, id, false);
+                }
+                if crate::widgets::icon_only(ui, app, "chevron-down", "Next Item", has_next).clicked() {
+                    read_step(app, id, true);
+                }
+            }
+            if embedded {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    if crate::widgets::icon_only(ui, app, "close", "Close", true).clicked() {
+                        close = true;
+                    }
+                });
+            }
+        },
+    );
+    close
+}
+
 /// One read window's contents; returns true when it should close.
 fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClass) -> bool {
     let ctx = ui.ctx().clone();
@@ -1484,24 +1566,28 @@ fn read_window_ui(ui: &mut Ui, app: &mut App, id: u64, class: egui::ViewportClas
     let size = if embedded { ui.available_size() } else { ctx.content_rect().size() };
     let frame = Frame::compute(size.x, size.y);
     let narrow = size.x <= NARROW_W;
+    let backstage_here = matches!(&app.ui.backstage, Some((Surface::Read(s), _)) if *s == id);
     egui::Frame::new().fill(app.theme.reading).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
-        if embedded {
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if plain_icon_button(ui, app, "close", None, "Close").clicked() {
-                        close = true;
-                    }
-                });
-            });
+        // File: the window's own backstage, over the whole window (Escape goes back to the message).
+        if backstage_here {
+            crate::backstage::window_backstage(ui, app, Surface::Read(id));
+            return;
         }
-        // A tiny window (responsive.md: 300×200) keeps the message and drops the ribbon, as compose does.
+        // Unsaved Edit Message changes: the window's commands wait until they are saved or discarded
+        // (Reply, Move or Delete would act on the stored message, not on what is being edited).
+        let unsaved =
+            crate::edit_message::is_editing(app, id) && crate::edit_message::has_unsaved_edits(&ctx, id);
+        // A tiny window (responsive.md: 300×200) keeps the message and drops the Quick Access buttons, the
+        // tabs and the ribbon, as compose does (an embedded one keeps its Close button).
+        if (!frame.inspector_tiny || embedded)
+            && read_quick_access(ui, app, id, embedded, frame.inspector_tiny, unsaved)
+        {
+            close = true;
+        }
         let ribbon_top = ui.cursor().top();
         if !frame.inspector_tiny {
-            // Unsaved Edit Message changes: the window's commands wait until they are saved or discarded
-            // (Reply, Move or Delete would act on the stored message, not on what is being edited).
-            let unsaved =
-                crate::edit_message::is_editing(app, id) && crate::edit_message::has_unsaved_edits(&ctx, id);
+            crate::compose::tab_row(ui, app, Surface::Read(id));
             ui.add_enabled_ui(!unsaved, |ui| crate::ribbon::ribbon(ui, app, Surface::Read(id), &frame))
                 .response
                 .on_disabled_hover_text(crate::edit_message::RIBBON_WAITS_NOTE);
@@ -2016,6 +2102,214 @@ mod tests {
         assert!(h.state().ui.read_windows.is_empty());
     }
 
+    /// Release check: the read window drew no tab row (no File, Message, Help) and no Quick Access Toolbar, so
+    /// Help and its backstage could not be reached; at 1024×768 it also left slivers of the main window showing.
+    #[test]
+    fn read_window_has_quick_access_tabs_and_its_own_backstage() {
+        let s = sample_session();
+        let id =
+            s.mailbox.mail.values().find(|m| m.subject == "Slides for Thursday").map(|m| m.id.0).unwrap();
+        let mut app = App::new(s);
+        app.ui.read_windows.push(id);
+        let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                let ctx = ui.ctx().clone();
+                read_windows(&ctx, app);
+            },
+            app,
+        );
+        h.run_steps(2);
+        for label in
+            ["Save", "Undo", "Redo", "Previous Item", "Next Item", "Close", "File", "Message", "Help"]
+        {
+            assert!(h.query_by_label(label).is_some(), "{label} missing");
+        }
+        // The window fills the 1024×768 screen: its title strip at the top, Close at the right edge.
+        let title = h.get_by_label_contains("Slides for Thursday - Message").rect();
+        assert!(title.top() < 8.0, "{title:?}");
+        assert!(h.get_by_label("Close").rect().right() > 1024.0 - 24.0);
+        assert!(h.get_by_label("Save").rect().left() < 40.0);
+        // QAT, tab row and ribbon do not overlap.
+        let qat = h.get_by_label("Save").rect();
+        let tab = h.get_by_label("Message").rect();
+        assert!(qat.bottom() <= tab.top() + 0.5, "{qat:?} {tab:?}");
+        // Help is a tab of the window.
+        h.get_by_label("Help").click();
+        h.run_steps(2);
+        assert_eq!(h.state().ui.tab(Surface::Read(id)), Some("Help"));
+        // File opens the window's own backstage, drawn in the window; Escape goes back to the message.
+        h.get_by_label("File").click();
+        h.run_steps(2);
+        assert!(matches!(&h.state().ui.backstage, Some((Surface::Read(r), _)) if *r == id));
+        assert!(h.query_by_label("Save Attachments").is_some(), "the backstage shows in the window");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().ui.backstage.is_none());
+        assert_eq!(h.state().ui.read_windows, vec![id], "Escape left the backstage, not the window");
+        // Next Item shows the following message in the same window.
+        h.get_by_label("Next Item").click();
+        h.run_steps(2);
+        assert_ne!(h.state().ui.read_windows, vec![id]);
+        assert_eq!(h.state().ui.read_windows.len(), 1);
+    }
+
+    /// A read window that fits with room to spare stays a floating window over the main one.
+    #[test]
+    fn read_window_floats_on_a_large_screen() {
+        assert!(crate::widgets::embedded_fills(READ_WINDOW_SIZE.into(), Vec2::new(1024.0, 768.0)));
+        assert!(crate::widgets::embedded_fills(
+            crate::compose::DEFAULT_SIZE.into(),
+            Vec2::new(1440.0, 900.0)
+        ));
+        assert!(!crate::widgets::embedded_fills(READ_WINDOW_SIZE.into(), Vec2::new(1920.0, 1080.0)));
+        let s = sample_session();
+        let id = s.mailbox.mail.keys().next().copied().unwrap();
+        let mut app = App::new(s);
+        app.ui.read_windows.push(id.0);
+        let mut h = Harness::builder().with_size(Vec2::new(1920.0, 1080.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                let ctx = ui.ctx().clone();
+                read_windows(&ctx, app);
+            },
+            app,
+        );
+        h.run_steps(2);
+        let close = h.get_by_label("Close").rect();
+        assert!(close.right() < 1920.0 - 100.0, "floating, not filling: {close:?}");
+    }
+
+    fn click_at(h: &mut Harness<'_, App>, pos: egui::Pos2) {
+        h.hover_at(pos);
+        h.drag_at(pos);
+        h.drop_at(pos);
+        h.run_steps(2);
+    }
+
+    fn layer_shown(h: &Harness<'_, App>, layer: egui::LayerId) -> bool {
+        h.ctx.memory(|m| m.areas().visible_last_frame(&layer))
+    }
+
+    fn top_window(h: &Harness<'_, App>) -> Option<egui::LayerId> {
+        h.ctx.memory(|m| m.areas().top_layer_id(egui::Order::Middle))
+    }
+
+    /// Release check: at 1024×768 an embedded read window covered the screen and Reply's compose covered it
+    /// in turn, with nothing to bring the message being answered forward again. With two item windows open
+    /// both now float, staggered: the new one in front, the other one forward with a click on the part that
+    /// shows, and either can be dragged aside. Alone again, the read window covers the screen and works.
+    #[test]
+    fn a_reply_over_a_full_screen_read_window_leaves_both_reachable() {
+        use crate::widgets::{item_cover_layer, item_float_layer};
+        let s = sample_session();
+        let id = s.mailbox.items_in(s.selection.folder).first().map(|m| m.id.0).unwrap();
+        let mut app = App::new(s);
+        app.ui.read_windows.push(id);
+        let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                let ctx = ui.ctx().clone();
+                read_windows(&ctx, app);
+                crate::compose::compose_windows(&ctx, app);
+            },
+            app,
+        );
+        h.run_steps(2);
+        let read = read_viewport_id(id);
+        assert!(layer_shown(&h, item_cover_layer(read)), "alone, the read window covers the screen");
+        h.state_mut().run("mail.reply", json!({"ids": [id], "window": true})).unwrap();
+        h.run_steps(3);
+        let cid = h.state().s.composes.values().find(|c| !c.inline).map(|c| c.id).unwrap();
+        let compose = crate::compose::viewport_id(cid);
+        assert!(!layer_shown(&h, item_cover_layer(read)), "two windows: no cover");
+        assert!(layer_shown(&h, item_float_layer(read)) && layer_shown(&h, item_float_layer(compose)));
+        assert_eq!(top_window(&h), Some(item_float_layer(compose)), "the reply comes to the front");
+        let rect = |h: &Harness<'_, App>, v: egui::ViewportId| {
+            h.ctx.memory(|m| m.area_rect(item_float_layer(v).id)).unwrap()
+        };
+        let (r, c) = (rect(&h, read), rect(&h, compose));
+        assert!(r.right() > c.right() + 8.0 && r.bottom() > c.bottom() + 8.0, "staggered: {r:?} {c:?}");
+        assert!(r.max.x <= 1024.0 && r.max.y <= 768.0, "on the screen: {r:?}");
+        // A click on the part of the read window that shows brings it forward.
+        click_at(&mut h, egui::pos2(r.right() - 6.0, r.center().y));
+        assert_eq!(top_window(&h), Some(item_float_layer(read)));
+        h.state_mut().run("compose.close", json!({"compose": cid, "save": false}));
+        h.run_steps(3);
+        assert!(h.state().s.composes.is_empty());
+        assert!(layer_shown(&h, item_cover_layer(read)), "alone again: the read window covers the screen");
+        assert_eq!(h.ctx.layer_id_at(egui::pos2(512.0, 400.0)), Some(item_cover_layer(read)));
+        h.get_by_label("Help").click();
+        h.run_steps(2);
+        assert_eq!(h.state().ui.tab(Surface::Read(id)), Some("Help"));
+    }
+
+    /// A read window opened over a compose that covers the screen comes to the front (the compose, drawn after
+    /// it, would otherwise land on top as it starts floating).
+    #[test]
+    fn a_window_opened_over_a_full_screen_compose_comes_to_the_front() {
+        use crate::widgets::item_float_layer;
+        let s = sample_session();
+        let id = s.mailbox.items_in(s.selection.folder).first().map(|m| m.id.0).unwrap();
+        let mut app = App::new(s);
+        app.run("mail.reply", json!({"ids": [id], "window": true})).unwrap();
+        let cid = app.s.composes.values().find(|c| !c.inline).map(|c| c.id).unwrap();
+        let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                let ctx = ui.ctx().clone();
+                read_windows(&ctx, app);
+                crate::compose::compose_windows(&ctx, app);
+            },
+            app,
+        );
+        h.run_steps(2);
+        let compose = crate::compose::viewport_id(cid);
+        assert!(layer_shown(&h, crate::widgets::item_cover_layer(compose)));
+        h.state_mut().ui.read_windows.push(id);
+        h.run_steps(2);
+        assert!(layer_shown(&h, item_float_layer(compose)));
+        assert_eq!(top_window(&h), Some(item_float_layer(read_viewport_id(id))));
+        // It stays there: the next frames leave the order alone.
+        h.run_steps(3);
+        assert_eq!(top_window(&h), Some(item_float_layer(read_viewport_id(id))));
+    }
+
+    /// A floating item window moves when its title bar is dragged, past the screen's edge (part of it stays).
+    #[test]
+    fn a_floating_item_window_can_be_dragged_aside() {
+        use crate::widgets::item_float_layer;
+        let s = sample_session();
+        let ids: Vec<u64> = s.mailbox.items_in(s.selection.folder).iter().take(2).map(|m| m.id.0).collect();
+        let mut app = App::new(s);
+        app.ui.read_windows.extend(ids.iter().copied());
+        let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                let ctx = ui.ctx().clone();
+                read_windows(&ctx, app);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let second = read_viewport_id(ids[1]);
+        let before = h.ctx.memory(|m| m.area_rect(item_float_layer(second).id)).unwrap();
+        let grip = egui::pos2(before.center().x, before.top() + 10.0);
+        h.hover_at(grip);
+        h.drag_at(grip);
+        h.run_steps(2);
+        for step in 1..=10 {
+            h.hover_at(grip + egui::vec2(70.0 * step as f32, 0.0));
+            h.run();
+        }
+        h.drop_at(grip + egui::vec2(700.0, 0.0));
+        h.run_steps(2);
+        let after = h.ctx.memory(|m| m.area_rect(item_float_layer(second).id)).unwrap();
+        assert!(after.left() > before.left() + 300.0, "moved aside: {before:?} -> {after:?}");
+        assert!(after.right() > 1024.0, "past the screen's edge: {after:?}");
+        assert!(after.left() < 1024.0 - 100.0, "part of it stays on the screen: {after:?}");
+    }
+
     fn embedded_read_windows(app: App) -> Harness<'static, App> {
         Harness::builder().with_size(Vec2::new(1000.0, 800.0)).build_ui_state(
             |ui, app: &mut App| {
@@ -2059,6 +2353,15 @@ mod tests {
         }
     }
 
+    /// Clicks Save in the save-changes question (the window's Quick Access row has a Save button too).
+    fn prompt_save(h: &Harness<'_, App>) {
+        // The question is centred; the Quick Access rows sit at the top.
+        match h.query_all_by_label("Save").max_by(|a, b| a.rect().top().total_cmp(&b.rect().top())) {
+            Some(n) => n.click(),
+            None => panic!("no Save in the save question"),
+        }
+    }
+
     /// A read window editing the first Inbox message, with a subject edit not saved yet.
     fn editing_with_unsaved_edits(s: mailcraft_engine::Session) -> (Harness<'static, App>, ItemId) {
         let inbox = s.selection.folder;
@@ -2096,7 +2399,7 @@ mod tests {
         assert_eq!(h.state().ui.read_windows, [id.0], "the window stays on the edited message");
         assert!(crate::edit_message::is_editing(h.state(), id.0));
         h.get_by_label(crate::edit_message::SAVE_PROMPT);
-        h.get_by_label("Save").click();
+        prompt_save(&h);
         h.run_steps(3);
         let m = &h.state().s.mailbox.mail[&id];
         assert_eq!(m.folder, target);
@@ -2145,6 +2448,46 @@ mod tests {
         assert!(crate::edit_message::may_exit(&ctx, h.state_mut()));
     }
 
+    /// Release check: Exit brought a window waiting on the save question forward with a viewport Focus, which
+    /// does nothing to a window embedded in the main one, so it could stay behind another item window.
+    #[test]
+    fn exit_brings_the_embedded_window_with_unsaved_edits_forward() {
+        let (mut h, id) = editing_with_unsaved_edits(sample_session());
+        // Another read window opens over it.
+        let other = h.state().s.mailbox.mail.keys().copied().find(|k| *k != id).unwrap();
+        h.state_mut().ui.read_windows.push(other.0);
+        h.run_steps(3);
+        let layer = |v: u64| crate::widgets::item_float_layer(read_viewport_id(v));
+        assert_eq!(top_window(&h), Some(layer(other.0)));
+        let ctx = h.ctx.clone();
+        assert!(!crate::edit_message::may_exit(&ctx, h.state_mut()));
+        h.run_steps(2);
+        assert_eq!(top_window(&h), Some(layer(id.0)), "the window with the question comes forward");
+    }
+
+    /// Release check: the Quick Access Save was disabled exactly while Edit Message had unsaved changes and
+    /// otherwise opened the save-to-file dialog, so it could not save message edits. It now saves them.
+    #[test]
+    fn quick_access_save_saves_message_edits() {
+        use egui_kittest::kittest::NodeT;
+        let (mut h, id) = editing_with_unsaved_edits(sample_session());
+        let before = h.state().s.mailbox.mail[&id].subject.clone();
+        // The Quick Access row is the top one (the editor's own bar has a Save button too).
+        let qat_save = h.get_all_by_label("Save").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()));
+        let qat_save = qat_save.expect("the Quick Access Save");
+        assert!(!qat_save.accesskit_node().is_disabled(), "Save is enabled while edits wait");
+        qat_save.click();
+        h.run_steps(3);
+        let m = &h.state().s.mailbox.mail[&id];
+        assert_eq!(m.subject, format!("{before} (edited)"));
+        assert!(!crate::edit_message::is_editing(h.state(), id.0), "saved: the editor stops");
+        assert_eq!(h.state().ui.read_windows, [id.0], "the window stays open on the saved message");
+        assert!(h.state().ui.dialogs.is_empty(), "no save-to-file dialog: {:?}", h.state().ui.dialogs);
+        // Nothing being edited: nothing to save.
+        let save = h.get_all_by_label("Save").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()));
+        assert!(save.expect("the Quick Access Save").accesskit_node().is_disabled());
+    }
+
     #[test]
     fn closing_the_main_window_with_unsaved_edits_is_cancelled() {
         let s = sample_session();
@@ -2173,7 +2516,7 @@ mod tests {
         assert!(close(&mut h), "the close is cancelled while edits are unsaved");
         h.run_steps(2);
         h.get_by_label(crate::edit_message::SAVE_PROMPT);
-        h.get_by_label("Save").click();
+        prompt_save(&h);
         h.run_steps(3);
         assert!(h.state().s.mailbox.mail[&id].subject.ends_with('!'));
         assert!(!close(&mut h), "nothing unsaved: MailCraft closes");
@@ -2267,5 +2610,75 @@ mod tests {
         let mut h = harness(app);
         h.run_steps(2);
         assert!(h.query_by_label_contains("seems to be in French").is_none());
+    }
+
+    fn sized(app: App, w: f32) -> Harness<'static, App> {
+        Harness::builder().with_size(Vec2::new(w, 600.0)).build_ui_state(
+            |ui, app: &mut App| {
+                let frame = Frame { width: 1400.0, height: 900.0, ..Frame::default() };
+                reading_pane(ui, app, &frame);
+            },
+            app,
+        )
+    }
+
+    fn painted_rects(h: &Harness<'_, App>, color: Color32) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::Shape, color: Color32, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, color, out)),
+                egui::Shape::Rect(r) if r.fill == color => out.push(r.rect),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        h.output().shapes.iter().for_each(|c| walk(&c.shape, color, &mut out));
+        out
+    }
+
+    /// Release check: in the dark theme the body was painted on its own grey box behind the text only.
+    /// A message without a background takes the pane's colour; a light page (the sun toggle) fills the pane
+    /// from edge to edge.
+    #[test]
+    fn dark_message_body_has_no_box_of_its_own() {
+        let mut app = app_with("Slides for Thursday");
+        app.theme = crate::theme::Theme::dark();
+        let mut h = sized(app, 900.0);
+        h.run_steps(2);
+        let mapped_white = body::map_color(mailcraft_geom::Color::WHITE, true);
+        assert!(painted_rects(&h, mapped_white).is_empty(), "no grey page box behind the text");
+        h.get_by_label("Switch background to light").click();
+        h.run_steps(2);
+        let page = painted_rects(&h, Color32::WHITE);
+        assert!(
+            page.iter().any(|r| r.width() >= 880.0 && r.bottom() >= 585.0),
+            "the light page spans the pane to its bottom: {page:?}"
+        );
+    }
+
+    /// Release check: in a narrow dark reading pane the background toggle butted against the truncated
+    /// sender line.
+    #[test]
+    fn sender_line_keeps_a_gap_before_the_header_buttons() {
+        for (w, dark) in [(420.0, true), (520.0, true), (420.0, false), (900.0, true)] {
+            let mut app = app_with("Slides for Thursday");
+            if dark {
+                app.theme = crate::theme::Theme::dark();
+            }
+            let mut h = sized(app, w);
+            h.run_steps(2);
+            let from = h.get_by_label_contains("Grace Kim").rect();
+            let mut buttons = vec![h.get_by_label("Reply").rect()];
+            if dark {
+                buttons.push(h.get_by_label("Switch background to light").rect());
+            }
+            for b in buttons {
+                if b.top() < from.bottom() && b.bottom() > from.top() {
+                    assert!(
+                        from.right() + 8.0 <= b.left(),
+                        "{w} dark={dark}: sender {from:?} runs into {b:?}"
+                    );
+                }
+            }
+        }
     }
 }

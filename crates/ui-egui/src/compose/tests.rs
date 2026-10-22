@@ -2188,3 +2188,57 @@ fn more_colors_picks_from_the_standard_grid() {
     h.run();
     assert!(compose(&h, cid).body.background.is_none());
 }
+
+/// Release check: at 1024x768 an embedded compose window (1440x780 by default) was a floating window a little
+/// smaller than the screen, so half of the main window's status bar showed below it. Near the screen's size it
+/// now covers the screen exactly, under its title strip; with room to spare it stays a floating window.
+#[test]
+fn compose_window_covers_a_small_screen() {
+    let (app, cid) = app_with_compose(false);
+    let title = app.s.composes.get(&cid).map(ComposeState::title).unwrap_or_default();
+    let mut h = Harness::builder()
+        .with_size([1024.0, 768.0])
+        .build_ui_state(|ui, app: &mut App| compose_windows(ui.ctx(), app), app);
+    h.run();
+    let strip = h.get_by_label(title.as_str()).rect();
+    assert!(strip.top() < crate::widgets::EMBED_TITLE_H, "title strip at the top: {strip:?}");
+    assert!(strip.left() < 24.0, "{strip:?}");
+    // The window's own controls reach the screen's edges: Send at the left, Close at the right.
+    assert!(h.get_by_label("Send").rect().left() < 40.0);
+    assert!(h.get_by_label("Close").rect().right() > 1024.0 - 24.0);
+    assert!(crate::widgets::embedded_fills(DEFAULT_SIZE.into(), egui::vec2(1024.0, 768.0)));
+    assert!(!crate::widgets::embedded_fills(DEFAULT_SIZE.into(), egui::vec2(1920.0, 1080.0)));
+}
+
+/// Release check: a compose window covering a small screen was raised over every other window by any click in
+/// it, so a window it had opened (Reminders, Propose New Time, Apply Styles, an appointment) went behind it
+/// for good. The cover now stays under floating windows.
+#[test]
+fn reminders_stay_reachable_over_a_full_screen_compose() {
+    let (app, cid) = app_with_compose(false);
+    let mut h = Harness::builder().with_size([1024.0, 768.0]).build_ui_state(
+        |ui, app: &mut App| {
+            let ctx = ui.ctx().clone();
+            compose_windows(&ctx, app);
+            crate::modules::pim_windows(&ctx, app);
+        },
+        app,
+    );
+    h.run();
+    let cover = crate::widgets::item_cover_layer(viewport_id(cid));
+    assert_eq!(h.ctx.layer_id_at(egui::pos2(60.0, 700.0)), Some(cover), "the compose covers the screen");
+    let ctx = h.ctx.clone();
+    crate::modules::open_reminders(&ctx, h.state());
+    h.run_steps(2);
+    let reminders = egui::LayerId::new(egui::Order::Middle, egui::Id::new("mc-reminders-window"));
+    let title = h.get_by_label_contains("Reminders").rect().center();
+    assert_eq!(h.ctx.layer_id_at(title), Some(reminders));
+    // A click in the compose, outside the Reminders window.
+    let spot = egui::pos2(60.0, 700.0);
+    h.hover_at(spot);
+    h.drag_at(spot);
+    h.drop_at(spot);
+    h.run_steps(2);
+    assert_eq!(h.ctx.layer_id_at(spot), Some(cover));
+    assert_eq!(h.ctx.layer_id_at(title), Some(reminders), "Reminders stays in front");
+}

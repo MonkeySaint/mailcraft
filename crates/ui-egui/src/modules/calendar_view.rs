@@ -748,6 +748,12 @@ fn paint_occ_text(
     rect
 }
 
+/// The Month view's dot before an appointment: the calendar's colour, lifted until it keeps 3:1 (the WCAG
+/// figure for graphics) against `under`, the fill it sits on.
+fn month_dot(bar: Color32, under: Color32) -> Color32 {
+    crate::theme::legible(bar, under, 3.0)
+}
+
 /// Fill and bar colours of an occurrence block.
 fn occ_colors(app: &App, o: &Occ) -> (Color32, Color32) {
     let bg = app.theme.reading;
@@ -829,6 +835,9 @@ fn occ_interact(app: &mut App, st: &mut ModState, resp: &egui::Response, o: &Occ
     });
 }
 
+/// Narrowest text area of an occurrence block that gets its subject; narrower blocks are plain markers.
+const BLOCK_TEXT_MIN_W: f32 = 24.0;
+
 /// Paints an occurrence block (time grid / schedule). `preview` adds the body's first lines.
 fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool, preview: bool) {
     let (fill, bar) = occ_colors(app, o);
@@ -843,7 +852,9 @@ fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool, prev
         pos2(rect.min.x + 7.0, rect.min.y + 2.0),
         pos2(rect.max.x - 3.0, rect.max.y - 1.0),
     );
-    if inner.width() < 6.0 || inner.height() < 6.0 {
+    // Too narrow for a word (a 15-minute item in Schedule view): a plain marker, its details in the tooltip,
+    // rather than a block of "…".
+    if inner.width() < BLOCK_TEXT_MIN_W || inner.height() < 6.0 {
         return;
     }
     let mut x = inner.min.x;
@@ -1182,7 +1193,7 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64
         let mut color = if in_month { app.theme.text } else { app.theme.text_muted };
         if d == now {
             ui.painter().rect_filled(rect.shrink(1.0), CornerRadius::same(3), app.theme.accent);
-            color = Color32::WHITE;
+            color = app.theme.on_accent;
         } else if visible.contains(&d) {
             ui.painter().rect_filled(rect.shrink(1.0), CornerRadius::same(3), app.theme.selected);
         } else if resp.hovered() {
@@ -1198,7 +1209,11 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64
         );
         if st.cal.nav_marks && busy.contains(&d) && in_month {
             let dot = pos2(rect.center().x, rect.max.y - 3.0);
-            ui.painter().circle_filled(dot, 1.6, if d == now { Color32::WHITE } else { app.theme.accent });
+            ui.painter().circle_filled(
+                dot,
+                1.6,
+                if d == now { app.theme.on_accent } else { app.theme.accent },
+            );
         }
         if resp.clicked() {
             let keep = st.nav_month;
@@ -1609,6 +1624,7 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
             forms::new_at(app, st, folder, d, 0, true);
         }
         // Items
+        let cell_fill = fill;
         let line_h = 19.0;
         let top = cell.min.y + 24.0;
         let avail = ((cell.max.y - top - 2.0) / line_h).floor().max(0.0) as usize;
@@ -1645,7 +1661,10 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
                 if resp.hovered() || selected {
                     p.rect_filled(chip, CornerRadius::same(3), fill);
                 }
-                p.circle_filled(pos2(chip.min.x + 6.0, chip.center().y), 3.5, bar);
+                // The dot keeps 3:1 against what it sits on (a dark calendar colour on the dark theme's
+                // selected day was nearly invisible).
+                let under = if resp.hovered() || selected { fill } else { cell_fill };
+                p.circle_filled(pos2(chip.min.x + 6.0, chip.center().y), 3.5, month_dot(bar, under));
                 let text = month_chip_text(o, st.cal.month_end_time);
                 paint_occ_text(
                     ui,
@@ -2474,6 +2493,22 @@ fn schedule_rows(app: &App, shown: &BTreeSet<FolderId>, overlay: bool) -> Vec<(S
     rows.into_iter().map(|(n, f)| (n, vec![f])).collect()
 }
 
+/// Whether a ruler label at `x`, `w` wide, shows whole inside `visible`.
+fn ruler_label_fits(x: f32, w: f32, visible: egui::Rangef) -> bool {
+    x >= visible.min && x + w <= visible.max
+}
+
+/// The minute Schedule view first scrolls to: the working day's start, unless the current time (`now`, when
+/// the day shown is today) would then sit in the last quarter of the `view_w`-point pane or beyond it; the
+/// view then opens with the current time a third of the way in.
+fn schedule_start(axis: &ScheduleAxis, work: i64, now: Option<i64>, view_w: f32) -> i64 {
+    let shown = if axis.px_per_min > 0.0 { (view_w / axis.px_per_min).max(0.0) as i64 } else { 0 };
+    match now {
+        Some(n) if shown > 0 && (n >= work + shown * 3 / 4 || n < work) => (n - shown / 3).max(axis.from),
+        _ => work,
+    }
+}
+
 fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rect: Rect) {
     let sel = selected_day(app, st);
     let label_w = 190.0_f32.min(rect.width() / 3.0);
@@ -2522,15 +2557,23 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
     }
     let timeline = Rect::from_min_max(pos2(rect.min.x + label_w + 1.0, rect.min.y), rect.max);
     let key = format!("schedule|{}|{}|{}|{}", st.cal.date, axis.slot, axis.from, axis.to);
-    let mut area = ScrollArea::horizontal().id_salt("mc-cal-schedule").auto_shrink([false, false]);
+    // The scroll bar always shows: the timeline is wider than the pane, and a bar that appears only on hover
+    // left no hint that the rest of the day is there.
+    let mut area = ScrollArea::horizontal()
+        .id_salt("mc-cal-schedule")
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+    let now = today(app);
+    let now_min = now_minute(app);
     if st.cal_scroll_key != key {
-        // Opens on the working day (all day: from 8 AM).
-        let start = if axis.from > 0 { axis.from } else { look.work.0.clamp(0, 23 * 60).min(8 * 60) };
+        // Opens on the working day (all day: from 8 AM), or on the current time today when that would sit at
+        // or past the pane's edge.
+        let work = if axis.from > 0 { axis.from } else { look.work.0.clamp(0, 23 * 60).min(8 * 60) };
+        let today_now = (sel == now).then_some(now_min);
+        let start = schedule_start(&axis, work, today_now, timeline.width());
         area = area.horizontal_scroll_offset(axis.x(start as f32));
         st.cal_scroll_key = key;
     }
-    let now = today(app);
-    let now_min = now_minute(app);
     child(ui, timeline, "mc-cal-schedule-area", |ui| {
         area.show(ui, |ui| {
             let total_w = axis.width();
@@ -2573,13 +2616,13 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
                 } else {
                     continue;
                 };
-                p.text(
-                    pos2(x + 6.0, area_rect.min.y + head_h / 2.0),
-                    Align2::LEFT_CENTER,
-                    text,
-                    FontId::proportional(if hour { 11.5 } else { 10.0 }),
-                    app.theme.text_muted,
-                );
+                // A label the pane's edge would cut ("M :30" for a scrolled-off "6 AM") is left out.
+                let font = FontId::proportional(if hour { 11.5 } else { 10.0 });
+                let galley = p.layout_no_wrap(text, font, app.theme.text_muted);
+                let at = pos2(x + 6.0, area_rect.min.y + head_h / 2.0 - galley.size().y / 2.0);
+                if ruler_label_fits(at.x, galley.size().x, ui.clip_rect().x_range()) {
+                    p.galley(at, galley, app.theme.text_muted);
+                }
             }
             for k in 0..=rows.len() {
                 p.hline(area_rect.x_range(), area_rect.min.y + head_h + row_h * k as f32, line);
@@ -2638,8 +2681,12 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
                         pos2(x0 + 1.0, top),
                         pos2((x1 - 1.0).max(x0 + 3.0), top + lane_h - 1.0),
                     );
-                    let resp = ui.interact(r, Id::new(("mc-cal-sched", o.id.0, o.start, k)), Sense::click());
+                    let mut resp =
+                        ui.interact(r, Id::new(("mc-cal-sched", o.id.0, o.start, k)), Sense::click());
                     a11y(&resp, WidgetType::Button, &occ_a11y(o));
+                    if r.width() < BLOCK_TEXT_MIN_W + 10.0 {
+                        resp = resp.on_hover_text(occ_a11y(o));
+                    }
                     let selected = app.ui.module_selection == Some(o.id.0);
                     paint_block(ui, app, r, o, selected, false);
                     occ_interact(app, st, &resp, o);
@@ -2683,6 +2730,53 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
 mod tests {
     use super::*;
     use mailcraft_model::Recurrence;
+
+    /// Release check (Schedule view): at 1024×768 the view opened on 8 AM with the current time (2:30 PM)
+    /// right on the pane's edge; and a scrolled-off hour label showed cut ("M :30").
+    #[test]
+    fn schedule_opens_with_now_in_view_and_skips_cut_labels() {
+        let axis = ScheduleAxis::of(&CalendarViewState::default(), (8 * 60, 17 * 60));
+        let px = axis.px_per_min;
+        let narrow = 500.0; // about 6 hours at the default scale
+        let shown = (narrow / px) as i64;
+        // Not today, or now early in the view: the working day's start.
+        assert_eq!(schedule_start(&axis, 8 * 60, None, narrow), 8 * 60);
+        assert_eq!(schedule_start(&axis, 8 * 60, Some(9 * 60), narrow), 8 * 60);
+        // 2:30 PM in a 6-hour-wide pane: now a third of the way in, well away from the edge.
+        let start = schedule_start(&axis, 8 * 60, Some(14 * 60 + 30), narrow);
+        let now_x = axis.x((14 * 60 + 30) as f32) - axis.x(start as f32);
+        assert!(now_x > narrow * 0.2 && now_x < narrow * 0.75, "now at {now_x} of {narrow}");
+        assert!(start >= axis.from && start + shown > 14 * 60 + 30);
+        // Before the working day starts: still in view.
+        let early = schedule_start(&axis, 8 * 60, Some(6 * 60), narrow);
+        assert!(early <= 6 * 60);
+        // A zero-width pane does not divide by anything odd.
+        assert_eq!(schedule_start(&axis, 8 * 60, Some(14 * 60), 0.0), 8 * 60);
+        // Ruler labels: whole or not at all.
+        let visible = egui::Rangef::new(490.0, 1900.0);
+        assert!(!ruler_label_fits(470.0, 30.0, visible), "cut at the left edge");
+        assert!(!ruler_label_fits(1880.0, 30.0, visible), "cut at the right edge");
+        assert!(ruler_label_fits(552.0, 30.0, visible));
+    }
+
+    /// Release check: in the dark theme the Month view dot of an appointment on the selected day (a dark
+    /// calendar colour on the selected-cell fill) was nearly invisible.
+    #[test]
+    fn month_dots_stay_visible_on_every_cell_fill() {
+        let app = App::new(mailcraft_engine::sample::sample_session());
+        let cals: Vec<FolderId> =
+            app.s.mailbox.folders.values().filter(|f| f.kind == FolderKind::Calendar).map(|f| f.id).collect();
+        assert!(!cals.is_empty());
+        let navy = Color32::from_rgb(0x1f, 0x3a, 0x68);
+        for t in [crate::theme::Theme::light(), crate::theme::Theme::dark()] {
+            for base in cals.iter().map(|f| calendar_color32(&app, *f)).chain([navy]) {
+                for under in [t.selected, t.reading, t.hover] {
+                    let c = crate::theme::contrast(month_dot(base, under), under);
+                    assert!(c >= 3.0, "dark={} {base:?} on {under:?}: {c:.2}:1", t.dark);
+                }
+            }
+        }
+    }
 
     #[test]
     fn schedule_axis_follows_working_hours_and_time_scale() {

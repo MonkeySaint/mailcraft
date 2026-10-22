@@ -221,7 +221,7 @@ pub fn may_exit(ctx: &egui::Context, app: &mut App) -> bool {
             continue;
         }
         waiting = true;
-        ctx.send_viewport_cmd_to(crate::reading::read_viewport_id(item), egui::ViewportCommand::Focus);
+        crate::widgets::focus_item_window(ctx, crate::reading::read_viewport_id(item));
     }
     if waiting {
         app.ui.toast = Some((EXIT_WAITS_NOTE.to_owned(), 0.0));

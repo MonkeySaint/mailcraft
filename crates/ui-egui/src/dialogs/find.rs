@@ -4,8 +4,8 @@ use egui::{Context, RichText};
 use serde_json::{Value, json};
 
 use super::common::{
-    self, Dlg, Out, btn, btn_en, child, folder_path, footer, muted, ok_cancel, primary, take_replies, window,
-    with_state,
+    self, Dlg, Out, btn, btn_en, btn_w, child, folder_path, footer, muted, ok_cancel, primary, primary_w,
+    take_replies, window, with_state,
 };
 use crate::App;
 use mailcraft_engine::cmd::search::{item_matches, token};
@@ -74,6 +74,9 @@ struct FindState {
     crit_error: String,
 }
 
+/// Width of Advanced Find's Find Now / New Search / Show in List column.
+const SIDE_BTN_W: f32 = 110.0;
+
 fn advanced_find(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let init = |a: &App| {
@@ -115,96 +118,107 @@ fn advanced_find(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 ui.checkbox(&mut st.subfolders, "Include subfolders");
             });
             ui.horizontal_top(|ui| {
+                let form_top = ui
+                    .vertical(|ui| {
+                        ui.set_width(500.0);
+                        ui.horizontal(|ui| {
+                            for (i, t) in ["Messages", "More Choices", "Advanced"].iter().enumerate() {
+                                if ui.selectable_label(st.tab == i, *t).clicked() {
+                                    st.tab = i;
+                                }
+                            }
+                        });
+                        ui.separator();
+                        let form_top = ui.cursor().top();
+                        egui::Grid::new(("af", uid, st.tab)).num_columns(2).spacing([10.0, 6.0]).show(
+                            ui,
+                            |ui| match st.tab {
+                                0 => {
+                                    ui.label("Search for the word(s):");
+                                    ui.add(egui::TextEdit::singleline(&mut st.words).desired_width(300.0));
+                                    ui.end_row();
+                                    ui.label("In:");
+                                    common::combo_idx(ui, ("afin", uid), &mut st.in_field, &IN_FIELDS, 300.0);
+                                    ui.end_row();
+                                    ui.label("From...");
+                                    ui.add(egui::TextEdit::singleline(&mut st.from).desired_width(300.0));
+                                    ui.end_row();
+                                    ui.label("Sent To...");
+                                    ui.add(egui::TextEdit::singleline(&mut st.sent_to).desired_width(300.0));
+                                    ui.end_row();
+                                    ui.label("Time: received");
+                                    let names: Vec<&str> = TIMES.iter().map(|t| t.0).collect();
+                                    ui.horizontal(|ui| {
+                                        common::combo_idx(ui, ("aftime", uid), &mut st.time, &names, 160.0);
+                                        if st.time == 8 {
+                                            ui.add(
+                                                egui::DragValue::new(&mut st.older_days)
+                                                    .range(1..=3650)
+                                                    .suffix(" days"),
+                                            );
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                                1 => {
+                                    ui.label("Categories:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut st.categories)
+                                            .hint_text("any category name")
+                                            .desired_width(260.0),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Only items that are:");
+                                    common::combo_idx(
+                                        ui,
+                                        ("afread", uid),
+                                        &mut st.read,
+                                        &["read or unread", "unread", "read"],
+                                        160.0,
+                                    );
+                                    ui.end_row();
+                                    ui.label("");
+                                    ui.checkbox(
+                                        &mut st.attachments,
+                                        "Only items with one or more attachments",
+                                    );
+                                    ui.end_row();
+                                    ui.label("Whose importance is:");
+                                    common::combo_idx(
+                                        ui,
+                                        ("afimp", uid),
+                                        &mut st.importance,
+                                        &["any", "high", "normal", "low"],
+                                        160.0,
+                                    );
+                                    ui.end_row();
+                                    ui.label("Size (kilobytes): larger than");
+                                    ui.add(egui::DragValue::new(&mut st.larger_kb).range(0..=1_000_000));
+                                    ui.end_row();
+                                }
+                                _ => {
+                                    criteria_ui(ui, app, uid, st);
+                                    ui.label("Search text:");
+                                    ui.label(RichText::new(build_query(st)).monospace());
+                                    ui.end_row();
+                                }
+                            },
+                        );
+                        form_top
+                    })
+                    .inner;
+                // One width for the three buttons, the first lined up with the form's first row (not the
+                // tab strip).
                 ui.vertical(|ui| {
-                    ui.set_width(500.0);
-                    ui.horizontal(|ui| {
-                        for (i, t) in ["Messages", "More Choices", "Advanced"].iter().enumerate() {
-                            if ui.selectable_label(st.tab == i, *t).clicked() {
-                                st.tab = i;
-                            }
-                        }
-                    });
-                    ui.separator();
-                    egui::Grid::new(("af", uid, st.tab)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                        match st.tab {
-                            0 => {
-                                ui.label("Search for the word(s):");
-                                ui.add(egui::TextEdit::singleline(&mut st.words).desired_width(300.0));
-                                ui.end_row();
-                                ui.label("In:");
-                                common::combo_idx(ui, ("afin", uid), &mut st.in_field, &IN_FIELDS, 300.0);
-                                ui.end_row();
-                                ui.label("From...");
-                                ui.add(egui::TextEdit::singleline(&mut st.from).desired_width(300.0));
-                                ui.end_row();
-                                ui.label("Sent To...");
-                                ui.add(egui::TextEdit::singleline(&mut st.sent_to).desired_width(300.0));
-                                ui.end_row();
-                                ui.label("Time: received");
-                                let names: Vec<&str> = TIMES.iter().map(|t| t.0).collect();
-                                ui.horizontal(|ui| {
-                                    common::combo_idx(ui, ("aftime", uid), &mut st.time, &names, 160.0);
-                                    if st.time == 8 {
-                                        ui.add(
-                                            egui::DragValue::new(&mut st.older_days)
-                                                .range(1..=3650)
-                                                .suffix(" days"),
-                                        );
-                                    }
-                                });
-                                ui.end_row();
-                            }
-                            1 => {
-                                ui.label("Categories:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut st.categories)
-                                        .hint_text("any category name")
-                                        .desired_width(260.0),
-                                );
-                                ui.end_row();
-                                ui.label("Only items that are:");
-                                common::combo_idx(
-                                    ui,
-                                    ("afread", uid),
-                                    &mut st.read,
-                                    &["read or unread", "unread", "read"],
-                                    160.0,
-                                );
-                                ui.end_row();
-                                ui.label("");
-                                ui.checkbox(&mut st.attachments, "Only items with one or more attachments");
-                                ui.end_row();
-                                ui.label("Whose importance is:");
-                                common::combo_idx(
-                                    ui,
-                                    ("afimp", uid),
-                                    &mut st.importance,
-                                    &["any", "high", "normal", "low"],
-                                    160.0,
-                                );
-                                ui.end_row();
-                                ui.label("Size (kilobytes): larger than");
-                                ui.add(egui::DragValue::new(&mut st.larger_kb).range(0..=1_000_000));
-                                ui.end_row();
-                            }
-                            _ => {
-                                criteria_ui(ui, app, uid, st);
-                                ui.label("Search text:");
-                                ui.label(RichText::new(build_query(st)).monospace());
-                                ui.end_row();
-                            }
-                        }
-                    });
-                });
-                ui.vertical(|ui| {
-                    if primary(ui, app, true, "Find Now") {
+                    ui.add_space((form_top - ui.cursor().top()).max(0.0));
+                    if primary_w(ui, app, true, "Find Now", SIDE_BTN_W) {
                         run_find(app, st);
                     }
-                    if btn(ui, "New Search") {
+                    if btn_w(ui, true, "New Search", SIDE_BTN_W) {
                         let folder = st.folder;
                         *st = FindState { folder, ..Default::default() };
                     }
-                    if btn_en(ui, st.searched, "Show in List") {
+                    if btn_w(ui, st.searched, "Show in List", SIDE_BTN_W) {
                         if let Some(f) = st.folder {
                             app.run("nav.selectFolder", json!({"folder": f}));
                         }

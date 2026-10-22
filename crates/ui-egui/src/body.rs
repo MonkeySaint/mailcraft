@@ -1697,6 +1697,16 @@ fn egui_family(ctx: &egui::Context, db: &FontDb, id: McFontId) -> FontFamily {
     fallback
 }
 
+/// The page colour a host should paint behind `doc` across its whole area: `None` when the message has no
+/// background of its own and is shown dark (it then takes the reading pane's own colour, rather than a mapped
+/// grey box behind the text only).
+pub fn page_fill(doc: &Doc, dark: bool) -> Option<Color32> {
+    if dark && doc.background.is_none() {
+        return None;
+    }
+    Some(map_color(doc.background.unwrap_or(Color::WHITE), dark))
+}
+
 /// Geometry colour → egui colour, re-mapped for dark rendering.
 pub fn map_color(c: Color, dark: bool) -> Color32 {
     if !dark {

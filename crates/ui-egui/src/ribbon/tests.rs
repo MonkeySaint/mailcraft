@@ -161,6 +161,16 @@ const ICONS: &[&str] = &[
     "phone",
     "email",
     "ellipsis",
+    "subscript",
+    "superscript",
+    "shape-styles",
+    "shape-fill",
+    "shape-outline",
+    "shape-effects",
+    "quick-styles",
+    "text-fill",
+    "text-outline",
+    "text-effects",
 ];
 
 /// Icons the drawing code uses directly.
@@ -1579,4 +1589,67 @@ fn people_tabs_and_the_module_folder_pane_menu() {
     let menu = defs().menus.get("moduleFolderPane").unwrap();
     assert!(menu.iter().all(|i| i.label != "Favorites"));
     assert_eq!(menu.len(), 3);
+}
+
+/// Release check: Subscript and Superscript used the expand/collapse chevrons, and six of the Shape Format
+/// buttons shared the star or the font-colour A. Each formatting button now has an icon of its own.
+#[test]
+fn formatting_buttons_have_icons_of_their_own() {
+    let d = defs();
+    let icon = |surface: &str, tab: &str, label: &str| -> String {
+        d.tabs
+            .iter()
+            .filter(|t| t.surface == surface && t.name == tab)
+            .flat_map(|t| t.groups.iter().flat_map(|g| g.ctls.iter()))
+            .find(|c| c.label == label)
+            .map(|c| c.icon.clone())
+            .unwrap_or_else(|| panic!("{surface}/{tab}: no {label}"))
+    };
+    assert_eq!(icon("compose", "Format Text", "Subscript"), "subscript");
+    assert_eq!(icon("compose", "Format Text", "Superscript"), "superscript");
+    for chevron in ["chevron-up", "chevron-down"] {
+        assert_ne!(icon("compose", "Format Text", "Subscript"), chevron);
+        assert_ne!(icon("compose", "Format Text", "Superscript"), chevron);
+    }
+    let shape = [
+        "Shape Styles",
+        "Shape Fill",
+        "Shape Outline",
+        "Shape Effects",
+        "Quick Styles",
+        "Text Fill",
+        "Text Outline",
+        "Text Effects",
+    ];
+    let icons: Vec<String> = shape.iter().map(|l| icon("shapeformat", "Shape Format", l)).collect();
+    let distinct: BTreeSet<&String> = icons.iter().collect();
+    assert_eq!(distinct.len(), shape.len(), "shared icons on Shape Format: {icons:?}");
+    for i in &icons {
+        assert!(crate::icons::Icons::has(i), "{i} is not a bundled icon");
+    }
+}
+
+/// Release check: on the Simplified Notes Home ribbon the Current View gallery's ▾ sat about 40 points past
+/// "Notes List", cut off from its gallery. The gallery is now as wide as the chips it shows.
+#[test]
+fn simplified_gallery_arrow_follows_its_last_chip() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = App::new(mailcraft_engine::sample::sample_session());
+    app.s.view.simplified_ribbon = true;
+    app.s.view.module = mailcraft_engine::Module::Notes;
+    let mut h = harness(app, Surface::Main, 1920.0);
+    h.run();
+    let chips: Vec<egui::Rect> = ["Icon", "Notes List", "Last 7 Days"]
+        .iter()
+        .flat_map(|l| h.query_all_by_label(l).map(|n| n.rect()).collect::<Vec<_>>())
+        .filter(|r| r.width() > 0.0)
+        .collect();
+    assert!(!chips.is_empty(), "the gallery shows its views");
+    let last = chips.iter().map(|r| r.right()).fold(f32::MIN, f32::max);
+    let arrow = h
+        .query_all_by_label("Current View")
+        .map(|n| n.rect())
+        .find(|r| r.left() >= last - 1.0)
+        .expect("the gallery's more arrow");
+    assert!(arrow.left() - last <= 8.0, "▾ at {} but the last chip ends at {last}", arrow.left());
 }

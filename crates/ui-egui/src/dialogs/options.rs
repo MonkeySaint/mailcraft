@@ -240,6 +240,21 @@ fn enabled(app: &App, st: &OptState, key: &str) -> bool {
     true
 }
 
+/// Height of a page's title line above its scroll area.
+const PAGE_TITLE_H: f32 = 26.0;
+/// Room below the page: notes, errors and the OK / Cancel row.
+const BELOW_PAGE_H: f32 = 64.0;
+/// Tallest page area: the dialog stays a dialog on a large screen.
+const PAGE_MAX_H: f32 = 600.0;
+
+/// Height of the Options page's scroll area for `room` points of dialog body: all the room left once the page
+/// title and the OK / Cancel row are counted, at most [`PAGE_MAX_H`], so the dialog ends right below the page
+/// and the page is never cut through by the dialog's edge.
+pub(super) fn page_height(room: f32) -> f32 {
+    let room = if room.is_finite() { room } else { PAGE_MAX_H + PAGE_TITLE_H + BELOW_PAGE_H };
+    (room - PAGE_TITLE_H - BELOW_PAGE_H).clamp(160.0, PAGE_MAX_H)
+}
+
 pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let want = d.str("page");
@@ -260,7 +275,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         }
         window(ctx, app, d, "MailCraft Options", 820.0, |ui, app| {
             let mut out = Out::Keep;
-            let h = (ctx.content_rect().height() - 170.0).clamp(240.0, 560.0);
+            let h = page_height(ui.available_height());
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(170.0);
@@ -277,7 +292,15 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                         }
                     }
                 });
-                ui.separator();
+                // A separator as tall as the page (a plain one would stretch the dialog to the screen's height
+                // and leave an empty band below the page).
+                let (line, _) =
+                    ui.allocate_exact_size(egui::vec2(9.0, h + PAGE_TITLE_H), egui::Sense::hover());
+                ui.painter().vline(
+                    line.center().x,
+                    line.y_range(),
+                    egui::Stroke::new(1.0, app.theme.separator),
+                );
                 ui.vertical(|ui| {
                     let Some((pid, _)) = settings::PAGES.get(st.page).copied() else { return };
                     let desc = DESCRIPTIONS.iter().find(|(p, _)| *p == pid).map_or("", |(_, t)| *t);

@@ -279,6 +279,8 @@ pub(crate) fn dialog_visuals(ui: &mut Ui, t: &crate::theme::Theme) {
     v.widgets.inactive.weak_bg_fill = t.pane;
     v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, t.accent);
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, t.separator);
+    // Dialog fields are bordered: they keep the plain field colour.
+    v.text_edit_bg_color = Some(v.extreme_bg_color);
 }
 
 fn title_close(ui: &mut Ui, app: &mut App) -> bool {
@@ -298,18 +300,29 @@ pub(crate) fn btn(ui: &mut Ui, label: &str) -> bool {
 }
 
 pub(crate) fn btn_en(ui: &mut Ui, enabled: bool, label: &str) -> bool {
-    ui.add_enabled(enabled, egui::Button::new(label).min_size(Vec2::new(80.0, 26.0))).clicked()
+    btn_w(ui, enabled, label, 80.0)
 }
 
-/// Accent (default) button.
+/// A dialog button at least `w` wide (a column of buttons of one width).
+pub(crate) fn btn_w(ui: &mut Ui, enabled: bool, label: &str, w: f32) -> bool {
+    ui.add_enabled(enabled, egui::Button::new(label).min_size(Vec2::new(w, 26.0))).clicked()
+}
+
+/// Accent (default) button. Its text is the theme's `on_accent` colour (white on the light theme's dark teal,
+/// near-black on the dark theme's light teal), so it keeps 4.5:1 in both.
 pub(crate) fn primary(ui: &mut Ui, app: &App, enabled: bool, label: &str) -> bool {
+    primary_w(ui, app, enabled, label, 80.0)
+}
+
+/// [`primary`] at least `w` wide.
+pub(crate) fn primary_w(ui: &mut Ui, app: &App, enabled: bool, label: &str, w: f32) -> bool {
     let b = egui::Button::new(RichText::new(label).color(if enabled {
-        Color32::WHITE
+        app.theme.on_accent
     } else {
         app.theme.text_muted
     }))
     .fill(if enabled { app.theme.accent } else { app.theme.hover })
-    .min_size(Vec2::new(80.0, 26.0));
+    .min_size(Vec2::new(w, 26.0));
     ui.add_enabled(enabled, b).clicked()
 }
 

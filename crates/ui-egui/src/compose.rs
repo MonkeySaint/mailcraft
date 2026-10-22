@@ -116,13 +116,15 @@ const NAME_BTN: Vec2 = Vec2::new(80.0, 32.0);
 const ROW_H: f32 = 38.0;
 const MARGIN: f32 = 16.0;
 const GAP: f32 = 12.0;
-const QAT_H: f32 = 30.0;
+pub(crate) const QAT_H: f32 = 30.0;
 const TAB_H: f32 = 30.0;
 /// Left inset of the attachments well (lines the chips up with the address buttons).
 const WELL_INDENT: f32 = MARGIN + SEND_SIZE.x + MARGIN;
 
 /// Compose tabs used when the ribbon area does not list any (compose.md).
 const FALLBACK_TABS: [&str; 6] = ["Message", "Insert", "Options", "Format Text", "Review", "Help"];
+/// Read window tabs used when the ribbon area does not list any (read-window.md).
+const READ_FALLBACK_TABS: [&str; 2] = ["Message", "Help"];
 
 /// Save-changes prompt text (our wording).
 pub const SAVE_PROMPT: &str = "Do you want to save changes?";
@@ -281,7 +283,7 @@ pub fn compose_windows(ctx: &egui::Context, app: &mut App) {
     let now = ctx.input(|i| i.time);
     auto_save_timer(ctx, app, now);
     let ids: Vec<u64> = app.s.composes.values().filter(|c| !c.inline).map(|c| c.id).collect();
-    for cid in ids {
+    for (index, cid) in ids.into_iter().enumerate() {
         let Some(c) = app.s.composes.get(&cid) else {
             continue;
         };
@@ -289,9 +291,17 @@ pub fn compose_windows(ctx: &egui::Context, app: &mut App) {
             .with_title(c.title())
             .with_inner_size(DEFAULT_SIZE)
             .with_min_inner_size(MIN_SIZE);
-        ctx.show_viewport_immediate(viewport_id(cid), builder, |ui, class| {
-            compose_viewport(ui, app, cid, class)
-        });
+        let theme = app.theme.clone();
+        let slot = crate::widgets::ItemSlot { index, open: crate::widgets::item_windows_open(app) };
+        crate::widgets::item_window(
+            ctx,
+            viewport_id(cid),
+            builder,
+            DEFAULT_SIZE.into(),
+            &theme,
+            slot,
+            |ui, class| compose_viewport(ui, app, cid, class),
+        );
     }
 }
 
@@ -415,7 +425,7 @@ fn compose_viewport(ui: &mut Ui, app: &mut App, cid: u64, class: ViewportClass) 
         };
         let ribbon_top = ui.cursor().top();
         if !tiny {
-            tab_row(ui, app, cid);
+            tab_row(ui, app, Surface::Compose(cid));
             crate::ribbon::ribbon(ui, app, Surface::Compose(cid), &frame);
         }
         let ribbon = band(ui, ribbon_top);
@@ -541,12 +551,15 @@ fn quick_access(ui: &mut Ui, app: &mut App, cid: u64, embedded: bool, tiny: bool
     );
 }
 
-/// File + the compose tabs; the selected tab is `app.ui.tab(Surface::Compose(cid))`.
-fn tab_row(ui: &mut Ui, app: &mut App, cid: u64) {
-    let surface = Surface::Compose(cid);
+/// File + the window's tabs (compose: Message … Help; read window: Message, Help); the selected tab is
+/// `app.ui.tab(surface)`. File opens the window's own backstage.
+pub(crate) fn tab_row(ui: &mut Ui, app: &mut App, surface: Surface) {
     let mut tabs: Vec<&str> = crate::ribbon::tabs(app, surface);
     if tabs.is_empty() {
-        tabs = FALLBACK_TABS.to_vec();
+        tabs = match surface {
+            Surface::Read(_) => READ_FALLBACK_TABS.to_vec(),
+            _ => FALLBACK_TABS.to_vec(),
+        };
     }
     let selected = app
         .ui

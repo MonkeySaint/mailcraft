@@ -1878,6 +1878,8 @@ fn wizard_body(ctx: &Context, ui: &mut Ui, app: &mut App, uid: u64, w: &mut Wiza
                 ui,
                 |ui| {
                     ui.set_min_height(200.0);
+                    // As wide as the Step 2 box below it (sized to its content, it ended short of it).
+                    ui.set_min_width(ui.available_width());
                     let mut group = "";
                     for (i, (g, label, _, _, _)) in TEMPLATES.iter().enumerate() {
                         if *g != group {

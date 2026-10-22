@@ -950,21 +950,78 @@ pub(crate) fn todo_bar_strip(ui: &mut Ui, app: &mut App, rect: Rect) -> Rect {
 }
 
 /// Small toggle buttons for a module's views (the ribbon's Current View gallery, also in the view's
-/// toolbar). Returns the view picked.
+/// toolbar), drawn right to left. Returns the view picked.
+///
+/// The switch fits the room left in its row ([`view_switch_mode`]): labelled buttons, else icon-only ones (the
+/// view's name in the tooltip and the accessible label), else one "View" button with a menu of the views.
 pub(crate) fn view_switch(
     ui: &mut Ui,
     app: &mut App,
     views: &[(&str, &str)],
     current: &str,
+    mode: SwitchMode,
 ) -> Option<String> {
     let mut picked = None;
-    for (name, icon) in views.iter().rev() {
-        if crate::widgets::toggle_button(ui, app, icon, name, current == *name).clicked() && current != *name
-        {
-            picked = Some((*name).to_owned());
+    match mode {
+        SwitchMode::Labels | SwitchMode::Icons => {
+            let side = crate::widgets::icon_side(ui);
+            for (name, icon) in views.iter().rev() {
+                let on = current == *name;
+                let r = if mode == SwitchMode::Labels {
+                    crate::widgets::toggle_button(ui, app, icon, name, on)
+                } else {
+                    crate::widgets::icon_toggle(ui, app, icon, name, on, side)
+                };
+                if r.clicked() && !on {
+                    picked = Some((*name).to_owned());
+                }
+            }
+        }
+        SwitchMode::Menu => {
+            let icon = views.iter().find(|(n, _)| *n == current).map_or("view", |(_, i)| *i);
+            let r = crate::widgets::dropdown_button(ui, app, icon, VIEW_MENU, true);
+            egui::Popup::menu(&r).show(|ui| {
+                for (name, _) in views {
+                    if ui.selectable_label(current == *name, *name).clicked() && current != *name {
+                        picked = Some((*name).to_owned());
+                    }
+                }
+            });
         }
     }
     picked
+}
+
+/// Label of the view switch's menu button when even icon-only buttons do not fit.
+pub(crate) const VIEW_MENU: &str = "View";
+
+/// How [`view_switch`] draws itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SwitchMode {
+    Labels,
+    Icons,
+    Menu,
+}
+
+/// The widest form of the view switch that fits in `room` points.
+pub(crate) fn view_switch_mode(ui: &Ui, views: &[(&str, &str)], room: f32) -> SwitchMode {
+    [SwitchMode::Labels, SwitchMode::Icons]
+        .into_iter()
+        .find(|m| view_switch_width(ui, views, *m) <= room)
+        .unwrap_or(SwitchMode::Menu)
+}
+
+/// The width the view switch takes drawn as `mode`.
+pub(crate) fn view_switch_width(ui: &Ui, views: &[(&str, &str)], mode: SwitchMode) -> f32 {
+    let gaps = ui.spacing().item_spacing.x * views.len().saturating_sub(1) as f32;
+    match mode {
+        SwitchMode::Labels => {
+            views.iter().map(|(name, icon)| crate::widgets::button_width(ui, icon, name, false)).sum::<f32>()
+                + gaps
+        }
+        SwitchMode::Icons => crate::widgets::icon_side(ui) * views.len() as f32 + gaps,
+        SwitchMode::Menu => crate::widgets::button_width(ui, "view", VIEW_MENU, true),
+    }
 }
 
 #[cfg(test)]

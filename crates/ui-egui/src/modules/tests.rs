@@ -1493,3 +1493,46 @@ fn mail_merge_window_offers_fields_catalog_and_an_existing_document() {
     h.run_ok();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Whether two widget rects overlap by more than half a point.
+fn overlaps(a: egui::Rect, b: egui::Rect) -> bool {
+    let i = a.intersect(b);
+    i.width() > 0.5 && i.height() > 0.5
+}
+
+/// Release check: at 1024×768 the People view switch (People / Business Card / Card / Phone / List) was drawn
+/// over New Contact and New Contact Group. The bar's buttons must never overlap, however narrow the view.
+#[test]
+fn people_bar_buttons_never_overlap() {
+    let labels = [
+        "New Contact",
+        "New Contact Group",
+        "People",
+        "Business Card",
+        "Card",
+        "Phone",
+        "List",
+        super::common::VIEW_MENU,
+    ];
+    for (w, view) in [(976.0, "Card"), (976.0, "List"), (760.0, "People"), (560.0, "Phone"), (420.0, "Card")]
+    {
+        let mut a = app();
+        select_module_folder(&mut a, mailcraft_model::FolderKind::Contacts);
+        let mut h = harness(super::people, a, (w, 700.0));
+        run_cmd(&mut h, "view.changeView", json!({"name": view}));
+        let rects: Vec<(&str, egui::Rect)> = labels
+            .iter()
+            .flat_map(|l| h.query_all_by_label(l).map(move |n| (*l, n.rect())))
+            .filter(|(_, r)| r.max.y < 60.0 && r.width() > 0.0)
+            .collect();
+        assert!(rects.iter().any(|(l, _)| *l == "New Contact"), "{w}: New Contact shows");
+        for (i, (la, ra)) in rects.iter().enumerate() {
+            for (lb, rb) in rects.iter().skip(i + 1) {
+                assert!(!overlaps(*ra, *rb), "{w} {view}: {la} {ra:?} overlaps {lb} {rb:?}");
+            }
+        }
+        // Every view stays reachable: as a button, or through the View menu.
+        let switch = labels[2..7].iter().all(|l| h.query_all_by_label(l).any(|n| n.rect().max.y < 60.0));
+        assert!(switch || has(&h, super::common::VIEW_MENU), "{w}: the view switch is gone");
+    }
+}

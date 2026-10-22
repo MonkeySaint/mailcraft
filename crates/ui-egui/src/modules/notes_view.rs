@@ -180,7 +180,10 @@ fn content(
                 new_note(app, st);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(v) = view_switch(ui, app, &VIEWS, &view.view) {
+                // The Icon view's three arrangement buttons sit left of the switch: keep room for them.
+                let icon_modes = if view.view == "Icon" { 330.0 } else { 0.0 };
+                let mode = super::common::view_switch_mode(ui, &VIEWS, ui.available_width() - icon_modes);
+                if let Some(v) = view_switch(ui, app, &VIEWS, &view.view, mode) {
                     commit_edit(app, st);
                     change_view(app, &v);
                 }

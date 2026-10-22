@@ -138,7 +138,8 @@ fn advanced(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                             }
                             out = Out::open(dlg, params);
                         }
-                        ui.add(egui::Label::new(RichText::new(desc).color(app.theme.text_muted)).truncate());
+                        // Wrapped, not cut: the Columns list is usually longer than one line.
+                        ui.add(egui::Label::new(RichText::new(desc).color(app.theme.text_muted)).wrap());
                         ui.end_row();
                     }
                 });

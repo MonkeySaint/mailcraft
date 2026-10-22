@@ -893,11 +893,31 @@ fn edit(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, id: Id, rect: Rect, wh
     }
 }
 
+/// Width of a gallery's ▾ (its full menu).
+const GALLERY_ARROW_W: f32 = 16.0;
+/// Widest chip of a Simplified gallery.
+const S_CHIP_MAX_W: f32 = 140.0;
+
+/// Width of a Simplified gallery: just the chips that fit in `max` (its set width) and the ▾ after them, so
+/// the ▾ sits right after the last chip shown rather than at the end of an empty stretch.
+fn simplified_gallery_w(ui: &Ui, app: &App, surface: Surface, c: &Ctl, max: f32) -> f32 {
+    let items = c.source.as_deref().map(|s| state::dyn_items(app, surface, s)).unwrap_or_default();
+    let mut used = 3.0_f32;
+    for it in &items {
+        let w = small_w(ui, Some(&it.label), false, TEXT).min(S_CHIP_MAX_W);
+        if used + w + GALLERY_ARROW_W > max {
+            break;
+        }
+        used += w + 2.0;
+    }
+    if used <= 3.0 { max } else { (used + GALLERY_ARROW_W).min(max) }
+}
+
 fn gallery(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, id: Id, rect: Rect, st: Style) {
     let t = app.theme.clone();
     let template = gallery_template(c);
     let items = c.source.as_deref().map(|s| state::dyn_items(app, cx.surface, s)).unwrap_or_default();
-    let arrow_w = 16.0;
+    let arrow_w = GALLERY_ARROW_W;
     let body = Rect::from_min_max(rect.min, Pos2::new(rect.right() - arrow_w, rect.bottom()));
     let arrow_r = Rect::from_min_max(Pos2::new(rect.right() - arrow_w, rect.top()), rect.max);
     if !cx.simplified {
@@ -921,7 +941,7 @@ fn gallery(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, id: Id, rect: Rect,
     let mut placed = 0usize;
     for (i, item) in items.iter().enumerate() {
         let (cell, ok) = if cx.simplified {
-            let w = small_w(ui, Some(&item.label), false, TEXT).min(140.0);
+            let w = small_w(ui, Some(&item.label), false, TEXT).min(S_CHIP_MAX_W);
             let r = Rect::from_min_size(Pos2::new(x, body.center().y - chip_h / 2.0), Vec2::new(w, chip_h));
             x += w + 2.0;
             (r, r.right() <= body.right())
@@ -1029,7 +1049,11 @@ pub fn simplified(ui: &mut Ui, app: &mut App, cx: &mut Cx, rect: Rect) {
             }
             let narrow = gacts.contains(&Act::Narrow) || cacts.contains(&Act::Narrow);
             let st = Style { large: false, label, narrow };
-            items.push(SItem { group: gi, order, ctl: c, st, w: ctl_width(ui, c, st, true) });
+            let mut w = ctl_width(ui, c, st, true);
+            if c.kind == Kind::Gallery && !st.narrow {
+                w = simplified_gallery_w(ui, app, cx.surface, c, w);
+            }
+            items.push(SItem { group: gi, order, ctl: c, st, w });
         }
     }
     let avail = rect.width() - 8.0 - MORE_W - DISPLAY_W - 12.0;

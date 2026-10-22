@@ -85,15 +85,9 @@ fn flat(
 ) -> Response {
     let color = fg(ui, enabled);
     let galley = label_galley(ui, label, color, None);
-    let text_w = galley.as_ref().map_or(0.0, |g| g.size().x);
+    let text_w = galley.as_ref().map(|g| g.size().x);
     let h = ui.spacing().interact_size.y.max(24.0);
-    let mut w = PAD + if icon.is_empty() { 0.0 } else { ICON } + PAD;
-    if galley.is_some() {
-        w += if icon.is_empty() { text_w } else { GAP + text_w };
-    }
-    if chevron {
-        w += 12.0;
-    }
+    let w = flat_width(icon, text_w, chevron);
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), sense(enabled));
     let info_label = label.to_owned();
     resp.widget_info(|| {
@@ -126,6 +120,30 @@ fn flat(
         }
     }
     resp
+}
+
+/// Width of a flat button whose label is `text_w` wide (`None` = no label).
+fn flat_width(icon: &str, text_w: Option<f32>, chevron: bool) -> f32 {
+    let mut w = PAD + if icon.is_empty() { 0.0 } else { ICON } + PAD;
+    if let Some(t) = text_w {
+        w += if icon.is_empty() { t } else { GAP + t };
+    }
+    if chevron {
+        w += 12.0;
+    }
+    w
+}
+
+/// The width [`icon_button`] / [`toggle_button`] (or [`dropdown_button`] with `chevron`) takes for `label`,
+/// so a row can be fitted before it is drawn.
+pub fn button_width(ui: &Ui, icon: &str, label: &str, chevron: bool) -> f32 {
+    let text_w = label_galley(ui, label, Color32::WHITE, None).map(|g| g.size().x);
+    flat_width(icon, text_w, chevron)
+}
+
+/// Side of a square icon-only toggle in a toolbar row ([`icon_toggle`]).
+pub fn icon_side(ui: &Ui) -> f32 {
+    ui.spacing().interact_size.y.max(24.0)
 }
 
 /// Flat icon+label button as used in the ribbon and toolbars. `icon` is an `assets/icons` name.
@@ -197,6 +215,162 @@ pub fn icon_toggle(ui: &mut Ui, app: &mut App, icon: &str, tooltip: &str, on: bo
         paint_icon(ui, app, rect.center(), icon_size, icon, color);
     }
     resp.on_hover_text(tooltip)
+}
+
+/// Room an embedded item window keeps around itself; a window whose default size does not leave it fills the
+/// screen instead.
+pub const EMBED_FILL_MARGIN: f32 = 64.0;
+/// Height of the title strip of an embedded item window that fills the screen.
+pub const EMBED_TITLE_H: f32 = 32.0;
+
+/// Whether an embedded item window of `default` size fills a `screen` of this size ([`item_window`]).
+pub fn embedded_fills(default: egui::Vec2, screen: egui::Vec2) -> bool {
+    default.x + EMBED_FILL_MARGIN > screen.x || default.y + EMBED_FILL_MARGIN > screen.y
+}
+
+/// Number of open compose windows (inline replies are not windows).
+pub fn compose_windows_open(app: &App) -> usize {
+    app.s.composes.values().filter(|c| !c.inline).count()
+}
+
+/// Number of open compose and read windows (the item windows [`item_window`] draws).
+pub fn item_windows_open(app: &App) -> usize {
+    compose_windows_open(app).saturating_add(app.ui.read_windows.len())
+}
+
+/// The layer of an embedded item window that covers the screen ([`item_window`]).
+pub fn item_cover_layer(id: egui::ViewportId) -> egui::LayerId {
+    egui::LayerId::new(egui::Order::Background, egui::Id::new(("mc-item-cover", id)))
+}
+
+/// The layer of an embedded item window drawn as a floating window ([`item_window`]).
+pub fn item_float_layer(id: egui::ViewportId) -> egui::LayerId {
+    egui::LayerId::new(egui::Order::Middle, egui::Id::new(id))
+}
+
+/// Brings item window `id` to the front: its OS window where it has one, else its embedded layer (an
+/// embedded window has no OS window for [`egui::ViewportCommand::Focus`] to act on).
+pub fn focus_item_window(ctx: &egui::Context, id: egui::ViewportId) {
+    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+    if ctx.embed_viewports() {
+        for layer in [item_cover_layer(id), item_float_layer(id)] {
+            if ctx.memory(|m| m.areas().visible_last_frame(&layer)) {
+                ctx.move_to_top(layer);
+            }
+        }
+        ctx.request_repaint();
+    }
+}
+
+/// Where an item window sits among the open compose and read windows ([`item_window`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ItemSlot {
+    /// Its place among them (staggers the floating windows so each one's title bar shows).
+    pub index: usize,
+    /// How many are open ([`item_windows_open`]).
+    pub open: usize,
+}
+
+/// Step between the top-left corners of successive floating item windows.
+const ITEM_CASCADE: f32 = 28.0;
+/// Part of a floating item window that stays on screen however far it is dragged aside.
+const ITEM_KEEP: egui::Vec2 = egui::vec2(120.0, 40.0);
+
+/// Shows an item window (compose, read message): a real OS window where the platform has them, else embedded
+/// in the main window. An embedded window that would nearly cover the screen covers it exactly, under a title
+/// strip, while it is the only item window open: a slightly smaller floating window left slivers of the main
+/// window's text showing at its edges. With other item windows open each one floats, staggered, sized to
+/// leave room, and can be dragged mostly off the screen or brought forward with a click, so none hides
+/// another for good. The cover sits under every floating window (the dialogs and windows it opens, such as
+/// Reminders, stay in front of it); it covers the main window only.
+pub fn item_window<T: Default>(
+    ctx: &egui::Context,
+    id: egui::ViewportId,
+    builder: egui::ViewportBuilder,
+    default: egui::Vec2,
+    theme: &crate::theme::Theme,
+    slot: ItemSlot,
+    mut ui_cb: impl FnMut(&mut Ui, egui::ViewportClass) -> T,
+) -> T {
+    let screen = ctx.content_rect();
+    if !ctx.embed_viewports() {
+        return ctx.show_viewport_immediate(id, builder, ui_cb);
+    }
+    let fills = embedded_fills(default, screen.size());
+    let float = item_float_layer(id);
+    let shown = |layer: egui::LayerId| ctx.memory(|m| m.areas().visible_last_frame(&layer));
+    let was_float = shown(float);
+    let was_cover = shown(item_cover_layer(id));
+    let newest_key = egui::Id::new("mc-item-window-newest");
+    let raise_key = egui::Id::new("mc-item-window-raise-newest");
+    if !was_float && !was_cover {
+        // Just opened: it comes to the front, above a window that starts floating in the same frame.
+        ctx.data_mut(|d| d.insert_temp(newest_key, id));
+    }
+    if slot.open > 1 || !fills {
+        // A floating window (what `show_viewport_immediate` embeds, without its panics should the window
+        // not show). One that would fill the screen leaves room for the others.
+        let size = if fills {
+            (screen.size() - vec2(2.0, 2.0) * EMBED_FILL_MARGIN).max(vec2(200.0, 150.0)).min(default)
+        } else {
+            default
+        };
+        let step = (slot.index % 6) as f32 * ITEM_CASCADE;
+        let outer = ctx.memory(|m| m.area_rect(item_float_layer(id).id)).map_or(size, |r| r.size());
+        let spare = (outer - ITEM_KEEP).max(egui::Vec2::ZERO);
+        let bounds = Rect::from_min_max(
+            egui::pos2(screen.min.x - spare.x, screen.min.y),
+            egui::pos2(screen.max.x + spare.x, screen.max.y + spare.y),
+        );
+        let out = egui::Window::from_viewport(id, builder.with_inner_size(size))
+            .collapsible(false)
+            .default_pos(screen.min + vec2(16.0 + step, 16.0 + step))
+            .constrain_to(bounds)
+            .show(ctx, |ui| ui_cb(ui, egui::ViewportClass::EmbeddedWindow))
+            .and_then(|r| r.inner)
+            .unwrap_or_default();
+        // A window that appears in egui is raised over the others, all in the order they were drawn, so a
+        // window that had covered the screen and now floats (another one just opened) could land on top of
+        // the new one. Then the new one is raised once more in a second pass, before anything shows.
+        let pass = ctx.cumulative_pass_nr();
+        if was_cover {
+            ctx.data_mut(|d| d.insert_temp(raise_key, pass));
+            ctx.request_discard("a new item window comes to the front");
+        }
+        let flagged = ctx.data(|d| d.get_temp::<u64>(raise_key));
+        if was_float
+            && flagged.is_some_and(|p| p.saturating_add(1) == pass)
+            && ctx.data(|d| d.get_temp::<egui::ViewportId>(newest_key)) == Some(id)
+        {
+            ctx.move_to_top(float);
+        }
+        return out;
+    }
+    let title = builder.title.unwrap_or_default();
+    let layer = item_cover_layer(id);
+    egui::Area::new(layer.id)
+        .order(layer.order)
+        .fixed_pos(screen.min)
+        .constrain(false)
+        .show(ctx, |ui| {
+            ui.set_min_size(screen.size());
+            ui.set_max_size(screen.size());
+            // Swallow clicks on the strip and any gaps so nothing below reacts.
+            let _ = ui.interact(screen, egui::Id::new(("mc-item-window-blocker", id)), Sense::click());
+            ui.painter().rect_filled(screen, 0.0, theme.pane);
+            let strip = Rect::from_min_size(screen.min, vec2(screen.width(), EMBED_TITLE_H));
+            ui.painter().rect_filled(strip, 0.0, theme.ribbon);
+            ui.painter().hline(strip.x_range(), strip.bottom(), egui::Stroke::new(1.0, theme.separator));
+            ui.put(
+                strip.shrink2(vec2(12.0, 0.0)),
+                egui::Label::new(egui::RichText::new(title).size(14.0).color(theme.text)).truncate(),
+            );
+            let body = Rect::from_min_max(egui::pos2(screen.min.x, strip.bottom() + 1.0), screen.max);
+            let mut child =
+                ui.new_child(egui::UiBuilder::new().id_salt(("mc-item-window", id)).max_rect(body));
+            ui_cb(&mut child, egui::ViewportClass::EmbeddedWindow)
+        })
+        .inner
 }
 
 /// A rounded content pane frame (folder pane, message list, reading pane, module views).

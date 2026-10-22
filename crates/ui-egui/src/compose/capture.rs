@@ -300,7 +300,7 @@ pub(crate) fn poll_at(ctx: &egui::Context, app: &mut App, now: Instant) {
             ctx.send_viewport_cmd_to(vp, ViewportCommand::Minimized(false));
         }
         // A window capture may have brought the captured window to the front: the compose comes back.
-        ctx.send_viewport_cmd_to(vp, ViewportCommand::Focus);
+        crate::widgets::focus_item_window(ctx, vp);
         if !app.s.composes.contains_key(&job.cid) {
             continue;
         }

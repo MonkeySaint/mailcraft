@@ -22,7 +22,7 @@ use super::common::{
     ModState, a11y, change_view, child, collapsed_labels, current_folder, empty_message, folder_rows,
     group_header, load, module_folder_pane, module_view, nested_headers, paint_text_clipped, pane_bg,
     pane_separator, persona_fill, reading_split, row_font, row_height, select_folder, select_item, store,
-    sync_selection, todo_bar_strip, view_switch,
+    sync_selection, todo_bar_strip, view_switch, view_switch_mode, view_switch_width,
 };
 use super::editors;
 use super::table as mt;
@@ -30,6 +30,10 @@ use crate::App;
 use mailcraft_engine::cmd::view::table;
 
 const INDEX_W: f32 = 30.0;
+/// The narrowest search box the People bar keeps before the view switch gives up its labels.
+const SEARCH_MIN_W: f32 = 140.0;
+/// The narrowest search box beside a labelled New Contact button.
+const SEARCH_NARROW_W: f32 = 90.0;
 const ROW_H: f32 = 56.0;
 const INDEX: [char; 27] = [
     '#', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
@@ -174,12 +178,30 @@ fn content(
     let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 44.0));
     child(ui, bar.shrink2(vec2(10.0, 7.0)), "mc-people-bar", |ui| {
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            // Fit the row before drawing it: the view switch takes the room the left-hand controls leave
+            // (labels, else icons, else a menu); then New Contact drops its label and the search box narrows.
+            let bar_w = ui.available_width();
+            let gap = ui.spacing().item_spacing.x;
+            let side = crate::widgets::icon_side(ui);
+            let new_w = crate::widgets::button_width(ui, "person", "New Contact", false);
+            let group_w = side + 4.0;
+            let min_left = SEARCH_MIN_W + new_w + group_w + 3.0 * gap;
+            let mode = view_switch_mode(ui, &VIEWS, bar_w - min_left);
+            let rest = bar_w - view_switch_width(ui, &VIEWS, mode) - 3.0 * gap - group_w;
+            let new_label = rest >= SEARCH_NARROW_W + new_w;
+            let new_space = if new_label { new_w } else { side + 4.0 };
+            let search_w = (rest - new_space - ui.spacing().button_padding.x * 2.0).clamp(40.0, 220.0);
             ui.add(
                 TextEdit::singleline(&mut st.people_search)
                     .hint_text("Search contacts")
-                    .desired_width(220.0_f32.min(ui.available_width() * 0.4)),
+                    .desired_width(search_w),
             );
-            if crate::widgets::icon_button(ui, app, "person", "New Contact", true).clicked() {
+            let new = if new_label {
+                crate::widgets::icon_button(ui, app, "person", "New Contact", true)
+            } else {
+                crate::widgets::icon_only(ui, app, "person", "New Contact", true)
+            };
+            if new.clicked() {
                 let f = current_folder(app, Kind::Contact);
                 editors::new_contact(app, st, f, false);
             }
@@ -190,7 +212,7 @@ fn content(
                 editors::new_contact(app, st, f, true);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(v) = view_switch(ui, app, &VIEWS, &view.view) {
+                if let Some(v) = view_switch(ui, app, &VIEWS, &view.view, mode) {
                     change_view(app, &v);
                 }
             });
@@ -825,6 +847,22 @@ fn contact_card(ui: &mut Ui, app: &mut App, st: &mut ModState, id: ItemId) {
     });
 }
 
+/// Width of a card in the Card view.
+const CARD_W: f32 = 250.0;
+/// Text size of the field labels on a card.
+const CARD_LABEL_SIZE: f32 = 11.5;
+
+/// Width of a card's label column: the widest field label (so "Business Phone" shows whole), at least 60
+/// points and at most 45 % of the card (a very long custom label is cut, not the values).
+fn card_label_width(ui: &Ui, labels: &[&str]) -> f32 {
+    let font = FontId::proportional(CARD_LABEL_SIZE);
+    let widest = labels
+        .iter()
+        .map(|l| ui.painter().layout_no_wrap((*l).to_owned(), font.clone(), Color32::WHITE).size().x)
+        .fold(0.0_f32, f32::max);
+    (widest.ceil() + 2.0).clamp(60.0, CARD_W * 0.45)
+}
+
 fn cards(
     ui: &mut Ui,
     app: &mut App,
@@ -844,8 +882,11 @@ fn cards(
     let rules = folder.map(|f| table::rules(&app.s, f)).unwrap_or_default();
     child(ui, rect.shrink(8.0), "mc-people-cards", |ui| {
         ScrollArea::vertical().id_salt("mc-people-cards-scroll").auto_shrink([false, false]).show(ui, |ui| {
-            let card_w = 236.0;
+            let card_w = CARD_W;
             let card_h = 150.0;
+            let labels: Vec<&str> =
+                fields.iter().filter(|f| f.col.id != "icon").map(|f| f.label.as_str()).collect();
+            let label_w = card_label_width(ui, &labels);
             let cols = ((ui.available_width() + 10.0) / (card_w + 10.0)).floor().max(1.0) as usize;
             let rows = ids.len().div_ceil(cols);
             let (area, _) = ui.allocate_exact_size(
@@ -901,17 +942,18 @@ fn cards(
                         ui,
                         pos2(card.min.x + 8.0, y),
                         label,
-                        FontId::proportional(11.5),
+                        FontId::proportional(CARD_LABEL_SIZE),
                         app.theme.text_muted,
-                        70.0,
+                        label_w,
                     );
+                    let value_x = 8.0 + label_w + 8.0;
                     paint_text_clipped(
                         ui,
-                        pos2(card.min.x + 80.0, y),
+                        pos2(card.min.x + value_x, y),
                         value,
                         FontId::proportional(12.0),
                         app.theme.text,
-                        card_w - 88.0,
+                        card_w - value_x - 8.0,
                     );
                     y += 18.0;
                 };
@@ -1070,5 +1112,24 @@ mod tests {
         assert_eq!(contact_ids(&app, &st).len(), 3);
         st.people_search = "0104".into();
         assert_eq!(contact_ids(&app, &st).len(), 1);
+    }
+
+    /// Release check: "Business Phone" was cut to "Business P..." on every card (fixed 70-point labels).
+    #[test]
+    fn card_labels_fit_the_longest_field_name() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let labels = ["Full Name", "Company", "Business Phone", "E-mail"];
+            let w = card_label_width(ui, &labels);
+            let font = FontId::proportional(CARD_LABEL_SIZE);
+            let need = ui.painter().layout_no_wrap("Business Phone".into(), font, Color32::WHITE).size().x;
+            assert!(w >= need, "label column {w} narrower than \"Business Phone\" ({need})");
+            assert!(w <= CARD_W * 0.45);
+            // A very long label is cut, the value column keeps room.
+            let long = card_label_width(ui, &["A field label far too long to show whole on a card"]);
+            assert!((long - CARD_W * 0.45).abs() < 0.01);
+            assert!(card_label_width(ui, &[]) >= 60.0);
+        });
+        out.textures_delta.clear();
     }
 }
