@@ -120,6 +120,8 @@ pub struct Config {
     pub imap_idle: bool,
     /// IMAP commands answered NO although advertised (upper case, e.g. `NAMESPACE`), as some proxies do.
     pub imap_refuse: Vec<String>,
+    /// IMAP SEARCH with a `TEXT` or `BODY` key is answered NO (a server without full-text search).
+    pub imap_refuse_text_search: bool,
     /// Users created at start: (address, password).
     pub users: Vec<(String, String)>,
     /// The web server (autoconfig, OAuth) over plain HTTP.
@@ -134,6 +136,9 @@ pub struct Config {
     pub oauth_token_lifetime: Duration,
     /// JMAP offers push (an `eventSourceUrl`). Off to test clients falling back to polling.
     pub jmap_push: bool,
+    /// JMAP filter conditions (`text`, `subject`, …) that Email/query refuses with `unsupportedFilter`
+    /// (RFC 8621 section 4.4), wherever they appear in the filter.
+    pub jmap_unsupported_filters: Vec<String>,
 }
 
 impl Default for Config {
@@ -156,6 +161,7 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(30 * 60),
             imap_idle: true,
             imap_refuse: Vec::new(),
+            imap_refuse_text_search: false,
             users: Vec::new(),
             web_port: 0,
             webs_port: 0,
@@ -163,6 +169,7 @@ impl Default for Config {
             oauth_clients: vec![OAUTH_TEST_CLIENT.to_owned()],
             oauth_token_lifetime: Duration::from_secs(3600),
             jmap_push: true,
+            jmap_unsupported_filters: Vec::new(),
         }
     }
 }

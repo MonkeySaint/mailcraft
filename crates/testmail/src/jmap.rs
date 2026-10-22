@@ -508,6 +508,17 @@ fn diff<T: PartialEq>(
     (created, updated, destroyed)
 }
 
+/// True when filter `f` (or a FilterOperator below it) has one of the conditions `names`.
+fn uses_condition(f: &Value, names: &[String], depth: usize) -> bool {
+    if names.is_empty() || depth > 16 {
+        return false;
+    }
+    if let Some(list) = f.get("conditions").and_then(Value::as_array) {
+        return list.iter().any(|c| uses_condition(c, names, depth + 1));
+    }
+    f.as_object().is_some_and(|o| o.keys().any(|k| names.iter().any(|n| n == k)))
+}
+
 fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value {
     let _ = current_state(ctx, jmap, user);
     let in_mailbox =
@@ -520,6 +531,11 @@ fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value 
         return json!({"__error": "invalidArguments"});
     }
     let (after, before) = (after.flatten(), before.flatten());
+    if let Some(f) = args.get("filter")
+        && uses_condition(f, &ctx.config.jmap_unsupported_filters, 0)
+    {
+        return json!({"__error": "unsupportedFilter"});
+    }
     let store = ctx.shared.lock();
     let mut all: Vec<(i64, String)> = Vec::new();
     let mut seen = BTreeSet::new();

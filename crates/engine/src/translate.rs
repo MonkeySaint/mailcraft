@@ -28,8 +28,49 @@ use crate::Session;
 
 /// Setting holding the translation server's address (empty = none).
 pub const URL_SETTING: &str = "language.translatorUrl";
-/// Secret-store key of the translation server's API key.
+/// Secret-store key of the translation server's API key. The value is bound to the server it was entered
+/// for (`{"server": <address>, "key": <key>}`, see [`store_key`]): it is only ever sent to that server, so
+/// a path that changes or clears the address without removing the key (Reset All, an unreadable
+/// settings.json) cannot hand it to the next server entered.
 pub const KEY_SECRET: &str = "translator/api-key";
+
+/// A translation server address as the key is bound to it (surrounding spaces and trailing slashes do not
+/// count).
+pub(crate) fn server_id(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
+}
+
+/// The stored API key with the server it belongs to, if one is stored in the bound form.
+fn bound_key(s: &Session) -> Option<(String, String)> {
+    let v: Value = serde_json::from_str(&s.secrets.get(KEY_SECRET)?).ok()?;
+    let server = v.get("server")?.as_str()?.to_owned();
+    let key = v.get("key")?.as_str()?.to_owned();
+    (!key.is_empty()).then_some((server, key))
+}
+
+/// The stored API key, when it was entered for the server at `url` (else `None`: it is never sent to
+/// another one).
+pub(crate) fn key_for(s: &Session, url: &str) -> Option<String> {
+    let url = server_id(url);
+    bound_key(s).filter(|(server, _)| !url.is_empty() && server == url).map(|(_, k)| k)
+}
+
+/// True when an API key is stored for the translation server in Options › Language.
+pub fn has_key(s: &Session) -> bool {
+    key_for(s, &s.settings.text(URL_SETTING)).is_some()
+}
+
+/// True when a key is stored that does not belong to the server at `url` (an older server's, or one in an
+/// older unbound form).
+pub(crate) fn has_foreign_key(s: &Session, url: &str) -> bool {
+    s.secrets.get(KEY_SECRET).is_some() && key_for(s, url).is_none()
+}
+
+/// Stores `key` as the API key of the server at `url`.
+pub(crate) fn store_key(s: &mut Session, url: &str, key: &str) -> Result<(), String> {
+    let v = serde_json::json!({"server": server_id(url), "key": key});
+    s.secrets.set(KEY_SECRET, &v.to_string())
+}
 
 /// Longest text handed to a translator at once (characters).
 pub const MAX_CHARS: usize = 100_000;
@@ -110,7 +151,7 @@ fn configured(s: &Session) -> Option<Arc<dyn Translator>> {
     if url.is_empty() {
         return None;
     }
-    let key = s.secrets.get(KEY_SECRET);
+    let key = key_for(s, url);
     let options = s
         .translator_options
         .clone()
@@ -665,7 +706,7 @@ mod tests {
         let r = s.run("options.translator", &json!({"url": url, "apiKey": "k-1"})).unwrap();
         assert_eq!(r["apiKey"], true);
         assert!(!r.to_string().contains("k-1"), "the key is never returned");
-        assert_eq!(s.secrets.get(KEY_SECRET).as_deref(), Some("k-1"));
+        assert_eq!(stored(&s).as_deref(), Some("k-1"));
         assert!(s.option(URL_SETTING).unwrap().as_str().unwrap().starts_with("http://127.0.0.1"));
         // Test: a sample through the server, nothing stored.
         let t = s.run("options.translator", &json!({"test": true, "apiKey": "k-2"})).unwrap();
@@ -674,7 +715,7 @@ mod tests {
         let (path, body) = seen.recv().unwrap();
         assert_eq!(path, "/translate");
         assert_eq!(body["api_key"], "k-2");
-        assert_eq!(s.secrets.get(KEY_SECRET).as_deref(), Some("k-1"));
+        assert_eq!(stored(&s).as_deref(), Some("k-1"));
         // Translate Message goes to the server with the stored key, into "Translate messages into".
         let r = s.run("review.translate", &json!({"id": id.0})).unwrap();
         assert_eq!(r["text"], FRENCH.to_uppercase());
@@ -702,7 +743,7 @@ mod tests {
         s.run("options.translator", &json!({"test": true, "url": new})).unwrap();
         let (_, body) = seen.recv().unwrap();
         assert!(body.get("api_key").is_none(), "{body}");
-        assert_eq!(s.secrets.get(KEY_SECRET).as_deref(), Some("k-old"), "a test stores nothing");
+        assert_eq!(stored(&s).as_deref(), Some("k-old"), "a test stores nothing");
         // Saving the new address removes the old server's key, and says so.
         s.notices.clear();
         s.run("options.set", &json!({"key": URL_SETTING, "value": new})).unwrap();
@@ -713,9 +754,89 @@ mod tests {
         assert!(body.get("api_key").is_none(), "{body}");
         // A key typed with the new address is kept; setting the same address again keeps it.
         s.run("options.translator", &json!({"url": format!("{new}/"), "apiKey": "k-new"})).unwrap();
-        assert_eq!(s.secrets.get(KEY_SECRET).as_deref(), Some("k-new"));
+        assert_eq!(stored(&s).as_deref(), Some("k-new"));
         s.run("options.set", &json!({"key": URL_SETTING, "value": new})).unwrap();
-        assert_eq!(s.secrets.get(KEY_SECRET).as_deref(), Some("k-new"));
+        assert_eq!(stored(&s).as_deref(), Some("k-new"));
+    }
+
+    fn stored(s: &Session) -> Option<String> {
+        bound_key(s).map(|(_, k)| k)
+    }
+
+    /// Regression: Reset All (and an unreadable settings.json) cleared the server address but kept its API
+    /// key, and the next server entered was sent that key. The key is bound to its server now, and both
+    /// paths remove it too.
+    #[test]
+    fn a_key_left_behind_never_goes_to_the_next_server() {
+        let (a, _a_seen) = fake_server(0);
+        let (b, seen) = fake_server(3);
+        let (mut s, id) = session_with("Projet", FRENCH);
+        s.run("options.translator", &json!({"url": a, "apiKey": "k-a"})).unwrap();
+        assert_eq!(key_for(&s, &a).as_deref(), Some("k-a"));
+        s.run("options.reset", &json!({})).unwrap();
+        assert_eq!(s.settings.text(URL_SETTING), "");
+        assert!(s.secrets.get(KEY_SECRET).is_none(), "Reset All removes the key");
+        s.run("options.set", &json!({"key": URL_SETTING, "value": b})).unwrap();
+        s.run("review.translate", &json!({"id": id.0})).unwrap();
+        let (_, body) = seen.recv().unwrap();
+        assert!(body.get("api_key").is_none(), "{body}");
+        // A key that is still stored for server A (whatever path left it) is not sent to server B …
+        store_key(&mut s, &a, "k-a").unwrap();
+        assert!(!has_key(&s) && key_for(&s, &b).is_none());
+        s.translations.clear();
+        s.run("review.translate", &json!({"id": id.0})).unwrap();
+        let (_, body) = seen.recv().unwrap();
+        assert!(body.get("api_key").is_none(), "{body}");
+        let r = s.run("options.translator", &json!({})).unwrap();
+        assert_eq!(r["apiKey"], false, "B has no key");
+        // … nor is one in the older form that names no server.
+        s.secrets.set(KEY_SECRET, "k-legacy").unwrap();
+        s.translations.clear();
+        s.run("review.translate", &json!({"id": id.0})).unwrap();
+        let (_, body) = seen.recv().unwrap();
+        assert!(body.get("api_key").is_none(), "{body}");
+        // A key needs a server to belong to.
+        s.run("options.set", &json!({"key": URL_SETTING, "value": ""})).unwrap();
+        assert!(s.secrets.get(KEY_SECRET).is_none(), "clearing the address removes a stray key");
+        assert!(matches!(
+            s.run("options.translator", &json!({"apiKey": "k"})),
+            Err(crate::CmdError::Params(_))
+        ));
+    }
+
+    /// Regression: a key sent with an address is stored only when the address is accepted; nothing changes
+    /// when either is refused, so a key never ends up bound to the server that was there before.
+    #[test]
+    fn a_refused_address_stores_neither_it_nor_its_key() {
+        let (mut s, _) = session_with("Projet", FRENCH);
+        s.run("options.translator", &json!({"url": "https://a.example.org", "apiKey": "k-a"})).unwrap();
+        let far = json!({"url": "http://b.example.org", "apiKey": "k-b"});
+        assert!(matches!(s.run("options.translator", &far), Err(crate::CmdError::Params(_))));
+        assert_eq!(s.settings.text(URL_SETTING), "https://a.example.org");
+        assert_eq!(key_for(&s, "https://a.example.org").as_deref(), Some("k-a"));
+        // An empty address with a key is refused before the address is cleared.
+        let none = json!({"url": "", "apiKey": "k-b"});
+        assert!(matches!(s.run("options.translator", &none), Err(crate::CmdError::Params(_))));
+        assert_eq!(s.settings.text(URL_SETTING), "https://a.example.org");
+        assert_eq!(key_for(&s, "https://a.example.org").as_deref(), Some("k-a"));
+    }
+
+    /// Regression: settings.json that cannot be read starts the app with no translation server, but the
+    /// key stayed in the secret store.
+    #[test]
+    fn unreadable_settings_drop_the_translation_key() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        {
+            let mut s = Session::open(dir.path()).unwrap();
+            s.run("options.translator", &json!({"url": "http://127.0.0.1:9", "apiKey": "k-a"})).unwrap();
+            assert_eq!(stored(&s).as_deref(), Some("k-a"));
+        }
+        std::fs::write(dir.path().join(crate::settings::FILE_NAME), b"{ not json").unwrap();
+        let s = Session::open(dir.path()).unwrap();
+        assert_eq!(s.settings.text(URL_SETTING), "");
+        assert!(s.secrets.get(KEY_SECRET).is_none());
     }
 
     /// Regression: the desktop app's Test button waited for the server on the UI thread.

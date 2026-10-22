@@ -322,8 +322,12 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 /// Applies the edits; returns the settings that were refused.
 fn apply(ctx: &Context, app: &mut App, st: &OptState) -> Vec<String> {
     let mut errors = Vec::new();
+    // A typed key goes with the address it was typed for, in one call that is refused as a whole: a refused
+    // address must not leave the key stored for the server that was there before.
+    let url_setting = mailcraft_engine::translate::URL_SETTING;
+    let new_key = st.api_key.as_ref().filter(|k| !k.trim().is_empty());
     for (k, v) in &st.edits {
-        if app.s.option(k).as_ref() == Some(v) {
+        if app.s.option(k).as_ref() == Some(v) || (new_key.is_some() && k == url_setting) {
             continue;
         }
         if let Err(e) = app.s.run("options.set", &json!({"key": k, "value": v})) {
@@ -331,10 +335,18 @@ fn apply(ctx: &Context, app: &mut App, st: &OptState) -> Vec<String> {
             errors.push(format!("{label}: {e}"));
         }
     }
-    if let Some(k) = &st.api_key
-        && let Err(e) = app.s.run("options.translator", &json!({"apiKey": k}))
+    let translator = match (&st.api_key, new_key) {
+        (_, Some(k)) => {
+            let url = current_key(app, st, url_setting);
+            Some(json!({"url": url.as_str().unwrap_or_default(), "apiKey": k}))
+        }
+        (Some(k), None) => Some(json!({"apiKey": k})),
+        (None, None) => None,
+    };
+    if let Some(p) = translator
+        && let Err(e) = app.s.run("options.translator", &p)
     {
-        errors.push(format!("Translation server API key: {e}"));
+        errors.push(format!("Translation server: {e}"));
     }
     common::sync_mirror(ctx, app);
     errors
@@ -343,7 +355,7 @@ fn apply(ctx: &Context, app: &mut App, st: &OptState) -> Vec<String> {
 /// Options › Language › Translation: the server's API key (kept in the secret store, never shown) and a
 /// Test button that translates a sample through the address and key as typed.
 fn translator_ui(ui: &mut egui::Ui, app: &mut App, st: &mut OptState) {
-    let stored = app.s.secrets.get(mailcraft_engine::translate::KEY_SECRET).is_some();
+    let stored = mailcraft_engine::translate::has_key(&app.s);
     let mut key = st.api_key.clone().unwrap_or_default();
     ui.horizontal(|ui| {
         let l = ui.label("API key (if the server asks for one):");
@@ -650,5 +662,45 @@ mod tests {
         assert!(h.query_by_label("API key (if the server asks for one):").is_some());
         assert!(h.query_by_label_contains("sends its text to the translation server").is_some());
         assert!(h.query_by_label("Ask me before translating").is_some());
+    }
+
+    /// Regression: OK sent a newly typed API key on its own after the address edit was refused, so the key
+    /// typed for the new server was stored as the old server's key and later sent there.
+    #[test]
+    fn a_key_typed_with_a_refused_address_is_not_stored_for_the_old_server() {
+        use mailcraft_engine::translate::{KEY_SECRET, URL_SETTING, has_key};
+        let ctx = Context::default();
+        let mut app = App::new(sample_session());
+        app.run("options.translator", json!({"url": "https://a.example.org", "apiKey": "k-a"})).unwrap();
+        let stored = |app: &App| {
+            let v: Value = serde_json::from_str(&app.s.secrets.get(KEY_SECRET).unwrap()).unwrap();
+            (v["server"].as_str().unwrap().to_owned(), v["key"].as_str().unwrap().to_owned())
+        };
+        assert_eq!(stored(&app).1, "k-a");
+        // Plain http to another computer is refused; the key typed for it must not land on server A.
+        let mut st = OptState::default();
+        st.edits.insert(URL_SETTING.into(), json!("http://b.example.org"));
+        st.api_key = Some("k-b".into());
+        let errors = apply(&ctx, &mut app, &st);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(app.s.settings.text(URL_SETTING), "https://a.example.org");
+        let (server, key) = stored(&app);
+        assert_eq!(key, "k-a", "server A keeps its own key");
+        assert!(server.contains("a.example.org"), "{server}");
+        // An accepted address takes the key typed with it, bound to that address.
+        st.edits.insert(URL_SETTING.into(), json!("https://b.example.org"));
+        assert!(apply(&ctx, &mut app, &st).is_empty());
+        assert_eq!(app.s.settings.text(URL_SETTING), "https://b.example.org");
+        let (server, key) = stored(&app);
+        assert_eq!(key, "k-b");
+        assert!(server.contains("b.example.org"), "{server}");
+        // A key typed with the address unchanged goes to the current server; Remove Key still removes it.
+        st.edits.clear();
+        st.api_key = Some("k-b2".into());
+        assert!(apply(&ctx, &mut app, &st).is_empty());
+        assert_eq!(stored(&app).1, "k-b2");
+        st.api_key = Some(String::new());
+        assert!(apply(&ctx, &mut app, &st).is_empty());
+        assert!(!has_key(&app.s) && app.s.secrets.get(KEY_SECRET).is_none());
     }
 }

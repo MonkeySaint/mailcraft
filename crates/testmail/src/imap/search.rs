@@ -205,6 +205,17 @@ fn uses_modseq(k: &Key) -> bool {
     }
 }
 
+/// True when the key searches text (`TEXT` or `BODY`).
+fn uses_text(k: &Key) -> bool {
+    match k {
+        Key::Text(_) | Key::Body(_) => true,
+        Key::Not(k) => uses_text(k),
+        Key::Or(a, b) => uses_text(a) || uses_text(b),
+        Key::And(ks) => ks.iter().any(uses_text),
+        _ => false,
+    }
+}
+
 pub fn search(s: &mut Session<'_>, tag: &str, p: &mut Parser<'_>, out: &mut Vec<u8>, uid_mode: bool) -> Res {
     let user = s.need_auth()?.to_owned();
     p.sp()?;
@@ -241,6 +252,9 @@ pub fn search(s: &mut Session<'_>, tag: &str, p: &mut Parser<'_>, out: &mut Vec<
     }
     p.end()?;
     let key = Key::And(keys);
+    if s.ctx.config.imap_refuse_text_search && uses_text(&key) {
+        return Err(no("[CANNOT] Text search is turned off on this server"));
+    }
     let with_modseq = uses_modseq(&key);
     if with_modseq {
         s.condstore = true;

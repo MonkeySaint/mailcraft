@@ -3468,6 +3468,82 @@ mod tests {
         assert_eq!(s.mailbox.mail.values().filter(|m| m.subject.starts_with("Note INBOX")).count(), 150);
     }
 
+    /// Queues an Include Older Results search for "budget" on `id`, the way a search started while the
+    /// account was busy waits for its next run, then runs a full Send/Receive.
+    fn search_with_receive(s: &mut Session, id: AccountId) {
+        let folders = s.mailbox.folders.values().filter(|f| f.account == id).map(|f| f.id).collect();
+        let criterion = super::super::older::criterion(s, "budget").unwrap();
+        s.sync.older.on = true;
+        s.sync.older.query = "budget".into();
+        s.sync.older.generation = s.sync.older.generation.wrapping_add(1);
+        s.sync.older.pending.insert(id);
+        let generation = s.sync.older.generation;
+        s.sync.older_requests.insert(id, super::super::older::Request { generation, criterion, folders });
+        assert_eq!(s.send_receive(&[id], Plan::all()).unwrap(), 1);
+        assert!(s.wait_for_sync(Duration::from_secs(30)), "{:?}", s.sync_status());
+    }
+
+    /// Regression: a JMAP server that refused the Include Older Results search (`unsupportedFilter`) failed
+    /// the whole run it rode along with, so the account's new mail was not received.
+    #[test]
+    fn a_refused_jmap_search_does_not_stop_receiving() {
+        let srv = mailcraft_testmail::TestServers::start(mailcraft_testmail::Config {
+            users: vec![(PROGRESS_USER.into(), PROGRESS_PW.into())],
+            add_trace_headers: false,
+            jmap_unsupported_filters: vec!["text".into()],
+            ..mailcraft_testmail::Config::default()
+        })
+        .unwrap();
+        seed(&srv, "INBOX", 1);
+        let (mut s, id) =
+            progress_session(&srv, json!({"host": srv.jmap_url(), "extraRootPem": srv.cert_pem}), "jmap");
+        assert_eq!(s.send_receive(&[id], Plan::all()).unwrap(), 1);
+        assert!(s.wait_for_sync(Duration::from_secs(30)), "{:?}", s.sync_status());
+        let raw = format!(
+            "From: bob@example.org\r\nTo: {PROGRESS_USER}\r\nSubject: Arrived meanwhile\r\n\
+             Date: Mon, 5 Oct 2026 11:00:00 +0000\r\nMessage-ID: <later@example.org>\r\n\r\nHi\r\n"
+        );
+        srv.seed_message(PROGRESS_USER, "INBOX", raw.as_bytes(), &[]).unwrap();
+        search_with_receive(&mut s, id);
+        assert!(
+            s.mailbox.mail.values().any(|m| m.subject == "Arrived meanwhile"),
+            "the receive ran although the search was refused"
+        );
+        let error = s.sync.older.error.clone().unwrap_or_default();
+        assert!(error.contains("unsupportedFilter"), "the search reports why: {error:?}");
+        assert!(s.sync.older.pending.is_empty());
+        let st = s.sync_status();
+        assert!(st.accounts.iter().all(|a| a.error.is_none()), "no account error: {st:?}");
+    }
+
+    /// The same for IMAP: a server that refuses a text SEARCH fails the search, not the receive.
+    #[test]
+    fn a_refused_imap_search_does_not_stop_receiving() {
+        let srv = mailcraft_testmail::TestServers::start(mailcraft_testmail::Config {
+            users: vec![(PROGRESS_USER.into(), PROGRESS_PW.into())],
+            add_trace_headers: false,
+            imap_refuse_text_search: true,
+            ..mailcraft_testmail::Config::default()
+        })
+        .unwrap();
+        seed(&srv, "INBOX", 1);
+        let incoming = json!({"host": "127.0.0.1", "port": srv.imaps_port, "security": "tls",
+            "extraRootPem": srv.cert_pem});
+        let (mut s, id) = progress_session(&srv, incoming, "imap");
+        assert_eq!(s.send_receive(&[id], Plan::all()).unwrap(), 1);
+        assert!(s.wait_for_sync(Duration::from_secs(30)), "{:?}", s.sync_status());
+        let raw = format!(
+            "From: bob@example.org\r\nTo: {PROGRESS_USER}\r\nSubject: Arrived meanwhile\r\n\
+             Date: Mon, 5 Oct 2026 11:00:00 +0000\r\nMessage-ID: <later@example.org>\r\n\r\nHi\r\n"
+        );
+        srv.seed_message(PROGRESS_USER, "INBOX", raw.as_bytes(), &[]).unwrap();
+        search_with_receive(&mut s, id);
+        assert!(s.mailbox.mail.values().any(|m| m.subject == "Arrived meanwhile"), "{:?}", s.sync_status());
+        assert!(s.sync.older.error.is_some(), "the search reports that it failed");
+        let st = s.sync_status();
+        assert!(st.accounts.iter().all(|a| a.error.is_none()), "no account error: {st:?}");
+    }
+
     #[test]
     fn progress_text_and_throttle() {
         let mut d = SyncProgress {

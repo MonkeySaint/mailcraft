@@ -117,31 +117,37 @@ fn translator(s: &mut Session, p: &Value) -> CmdResult {
     if opt_bool(p, "test") == Some(true) {
         return test_translator(s, url.as_deref(), key);
     }
+    // A key needs a server to belong to: refused before anything changes, so the call is all or nothing.
+    let server = url.clone().unwrap_or_else(|| s.settings.text(crate::translate::URL_SETTING));
+    if matches!(key, Some(Some(_))) && server.trim().is_empty() {
+        return Err(CmdError::Params("enter the address of the translation server first".into()));
+    }
     if let Some(u) = &url {
         set_option(s, crate::translate::URL_SETTING, &json!(u))?;
     }
     if let Some(k) = key {
+        // The key belongs to the server now entered, and is only ever sent there.
+        let server = s.settings.text(crate::translate::URL_SETTING);
         let r = match k {
-            Some(k) => s.secrets.set(crate::translate::KEY_SECRET, &k),
+            Some(k) => crate::translate::store_key(s, &server, &k),
             None => s.secrets.remove(crate::translate::KEY_SECRET),
         };
         r.map_err(|e| CmdError::Failed(format!("the API key could not be stored: {e}")))?;
     }
     Ok(json!({
         "url": s.settings.text(crate::translate::URL_SETTING),
-        "apiKey": s.secrets.get(crate::translate::KEY_SECRET).is_some(),
+        "apiKey": crate::translate::has_key(s),
         "keyStore": s.secrets.location(),
     }))
 }
 
-/// The translation server address changed from `old`: the stored API key was for that server, so it is
-/// removed rather than sent to the new one (the user enters the new server's key if it needs one).
-fn forget_key_of_old_server(s: &mut Session, old: &str) {
+/// The translation server address changed: a stored API key that was not entered for the new server is
+/// removed (it would never be sent there anyway, see [`crate::translate::key_for`]); the user enters the new
+/// server's key if it needs one. This also catches a key left behind by a path that cleared the address
+/// without removing it.
+fn forget_key_of_old_server(s: &mut Session) {
     let now = s.settings.text(crate::translate::URL_SETTING);
-    if old.trim().is_empty()
-        || same_translator(old, &now)
-        || s.secrets.get(crate::translate::KEY_SECRET).is_none()
-    {
+    if !crate::translate::has_foreign_key(s, &now) {
         return;
     }
     match s.secrets.remove(crate::translate::KEY_SECRET) {
@@ -174,12 +180,6 @@ fn check_translator_url(_s: &Session, _url: &str) -> Result<(), CmdError> {
 #[cfg(not(target_arch = "wasm32"))]
 const TEST_TEXT: &str = "Thank you for your message. I will reply tomorrow.";
 
-/// True when two translation server addresses name the same server (ignoring surrounding spaces and a
-/// trailing slash).
-pub(crate) fn same_translator(a: &str, b: &str) -> bool {
-    a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/')
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn test_translator(s: &mut Session, url: Option<&str>, key: Option<Option<String>>) -> CmdResult {
     let stored = s.settings.text(crate::translate::URL_SETTING);
@@ -187,12 +187,11 @@ fn test_translator(s: &mut Session, url: Option<&str>, key: Option<Option<String
     if url.trim().is_empty() {
         return Err(CmdError::Params("enter the address of a translation server first".into()));
     }
-    // The stored key belongs to the stored server: a different address is tested with the key typed for it
-    // (or none), never with that one.
+    // The stored key belongs to the server it was entered for: a different address is tested with the key
+    // typed for it (or none), never with that one.
     let key = match key {
         Some(k) => k,
-        None if same_translator(&url, &stored) => s.secrets.get(crate::translate::KEY_SECRET),
-        None => None,
+        None => crate::translate::key_for(s, &url),
     };
     let options = s
         .translator_options
@@ -349,7 +348,7 @@ pub fn set_option(s: &mut Session, key: &str, v: &Value) -> Result<Value, CmdErr
             if settings::def(key).is_none() {
                 return Err(CmdError::Disabled(format!("option `{}` is not supported", clip(key))));
             }
-            let translator_was = (key == crate::translate::URL_SETTING).then(|| s.settings.text(key));
+            let translator_changed = key == crate::translate::URL_SETTING;
             if key == crate::translate::URL_SETTING
                 && let Some(u) = v.as_str().map(str::trim).filter(|u| !u.is_empty())
             {
@@ -357,8 +356,8 @@ pub fn set_option(s: &mut Session, key: &str, v: &Value) -> Result<Value, CmdErr
             }
             s.settings.set(key, v)?;
             s.apply_setting(key);
-            if let Some(old) = translator_was {
-                forget_key_of_old_server(s, &old);
+            if translator_changed {
+                forget_key_of_old_server(s);
             }
         }
     }
@@ -451,6 +450,10 @@ fn reset(s: &mut Session, p: &Value) -> CmdResult {
         }
         None => {
             s.settings.reset_all();
+            // The translation server address is gone, and with it the key kept for that server.
+            if let Err(e) = s.secrets.remove(crate::translate::KEY_SECRET) {
+                log::error!("the translation server's API key could not be removed: {e}");
+            }
             for d in settings::DEFS.iter().filter(|d| d.view) {
                 set_option(s, d.key, &d.default_value())?;
             }

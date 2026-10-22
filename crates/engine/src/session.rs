@@ -401,6 +401,12 @@ impl Session {
         }
         let mut s = Session::new(mailbox);
         s.store = Some(store);
+        // View in Browser pages a crashed session left behind (the profile's lock is held now, so no other
+        // session is using them).
+        let swept = crate::browser::sweep_leftovers(&crate::browser::profile_base(dir));
+        if swept > 0 {
+            log::info!("View in Browser: removed {swept} page folder(s) left by an earlier session");
+        }
         // Secrets live next to the data file, outside the mailbox snapshot and journal.
         match crate::accounts::FileSecretStore::open(dir) {
             Ok(st) => s.secrets = Box::new(st),
@@ -449,6 +455,10 @@ impl Session {
                 log::error!("settings.json unreadable: {e}");
                 let bad = dir.join(format!("{}.bad", settings::FILE_NAME));
                 let _ = std::fs::rename(dir.join(settings::FILE_NAME), bad);
+                // The translation server address is lost with the settings: so is the key kept for it.
+                if let Err(e) = self.secrets.remove(crate::translate::KEY_SECRET) {
+                    log::error!("the translation server's API key could not be removed: {e}");
+                }
                 self.notify(Notice::Error(format!(
                     "Your settings could not be read ({e}); MailCraft started with the default settings."
                 )));

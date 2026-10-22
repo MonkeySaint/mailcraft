@@ -422,13 +422,30 @@ pub(crate) fn run(
                 ]});
             }
             let sort = json!([{ "property": "receivedAt", "isAscending": false }]);
-            let q = c.query_emails(filter, sort, 0, SEARCH_LIMIT)?;
-            let fresh: Vec<String> = q.ids.into_iter().filter(|id| !sr.known.contains(id)).collect();
-            let total = fresh.len();
-            let take: Vec<String> = fresh.into_iter().take(super::older::MAX_PER_ACCOUNT).collect();
-            let all: BTreeSet<String> = take.iter().cloned().collect();
-            let (list, _) = get_emails(&c, &take, &all, cancel)?;
-            send(events, cancel, account, JmapEvent::Found { generation: sr.generation, list, total });
+            // A search the server refuses (RFC 8621 lets it reject a filter it cannot handle, e.g.
+            // `unsupportedFilter`) or gives up on is reported to the search and does not stop the run: every
+            // JMAP request is an HTTP exchange of its own, so the receive below still runs (and reports a
+            // server that is really gone by itself).
+            let found = c.query_emails(filter, sort, 0, SEARCH_LIMIT).and_then(|q| {
+                let fresh: Vec<String> = q.ids.into_iter().filter(|id| !sr.known.contains(id)).collect();
+                let total = fresh.len();
+                let take: Vec<String> = fresh.into_iter().take(super::older::MAX_PER_ACCOUNT).collect();
+                let all: BTreeSet<String> = take.iter().cloned().collect();
+                get_emails(&c, &take, &all, cancel).map(|(list, _)| (list, total))
+            });
+            match found {
+                Ok((list, total)) => {
+                    send(
+                        events,
+                        cancel,
+                        account,
+                        JmapEvent::Found { generation: sr.generation, list, total },
+                    );
+                }
+                Err(e) => {
+                    events.send(Event::SearchFailed { account, error: e.to_string() });
+                }
+            }
         }
         // 3. Receive.
         let Some(j) = job.filter(|j| j.receive) else { return Ok(()) };

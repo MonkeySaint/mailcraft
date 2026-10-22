@@ -3,7 +3,9 @@
 //!
 //! Nothing here runs unless the user entered a server: the app never picks one. Plain `http://` is only
 //! accepted for a server on this computer (`localhost`, `127.0.0.1`, `::1`); anything else must be
-//! `https://`, so message text and the API key are not sent across a network in the clear.
+//! `https://`, so message text and the API key are not sent across a network in the clear. A plain `http://`
+//! name is checked again on connecting: every address it resolves to must be a loopback address
+//! ([`ConnectOptions::loopback_only`]), so no DNS answer can send the request to another computer.
 
 use std::time::Duration;
 
@@ -62,6 +64,9 @@ impl LibreTranslate {
         {
             return Err(NetError::Invalid("the API key is not valid".into()));
         }
+        let mut options = options;
+        // Plain http: the name must still be this computer once resolved (checked on every connection).
+        options.loopback_only |= !base.https;
         let mut http = HttpClient::new(options);
         http.max_body = MAX_RESPONSE;
         http.max_redirects = 0;
@@ -209,6 +214,26 @@ mod tests {
         assert!(lt.translate(&"x".repeat(MAX_TEXT_BYTES + 1), "en").is_err());
     }
 
+    /// Regression: a plain-http name under `.localhost` was trusted on its name alone, but it goes through
+    /// the system resolver, and where that asks DNS the answer can be another computer. The resolved
+    /// addresses are checked now: anything but loopback is refused before a byte is sent.
+    #[test]
+    fn plain_http_connects_only_to_loopback_addresses() {
+        let mut o = LibreTranslate::default_options();
+        o.loopback_only = true;
+        let far = crate::transport::Conn::connect("192.0.2.1", 9, false, &o);
+        assert!(matches!(far, Err(NetError::Insecure(_))), "{:?}", far.err());
+        let mut http = HttpClient::new(o.clone());
+        http.max_redirects = 0;
+        let r = http.post_json("http://192.0.2.1:9/translate", &[], &json!({"api_key": "k"}));
+        assert!(matches!(r, Err(NetError::Insecure(_))), "{:?}", r.err());
+        // A loopback server is reached as before.
+        let (url, t, _) = serve(1, |_| reply(200, r#"{"translatedText":"Hi"}"#));
+        let lt = LibreTranslate::new(&url, Some("k"), o).unwrap();
+        assert_eq!(lt.translate("Salut", "en").unwrap().0, "Hi");
+        t.join().unwrap();
+    }
+
     #[test]
     fn only_https_leaves_this_computer() {
         let o = LibreTranslate::default_options;
@@ -234,6 +259,13 @@ mod tests {
         assert!(lt.api_key.is_none());
         assert_eq!(lt.server(), "https://translate.example.org/api/");
         assert_eq!(check_lang("pt-BR").unwrap(), "pt-BR");
+        // Plain http is held to loopback addresses when connecting; https is not.
+        assert!(
+            LibreTranslate::new("http://lt.localhost:5000", None, o()).unwrap().http.options.loopback_only
+        );
+        assert!(
+            !LibreTranslate::new("https://lt.example.org", None, o()).unwrap().http.options.loopback_only
+        );
         assert!(check_lang("e").is_err() && check_lang("en-").is_err());
     }
 }

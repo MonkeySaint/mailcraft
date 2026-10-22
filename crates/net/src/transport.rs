@@ -40,6 +40,11 @@ pub struct ConnectOptions {
     /// Allow passwords, tokens and other credentials over an unencrypted connection (IMAP/SMTP without
     /// TLS, `http://`). Off by default: only for a server the user explicitly chose to trust that way.
     pub allow_plaintext_auth: bool,
+    /// Connect only to this computer: the host name is resolved and refused unless every address it
+    /// resolves to is a loopback address, and the connection goes to one of those addresses. For a plain
+    /// `http://` server that must not be another computer whatever a DNS answer says (names under
+    /// `.localhost` do not resolve to loopback everywhere).
+    pub loopback_only: bool,
 }
 
 impl Default for ConnectOptions {
@@ -49,6 +54,7 @@ impl Default for ConnectOptions {
             io_timeout: Duration::from_secs(120),
             tls: TlsOptions::default(),
             allow_plaintext_auth: false,
+            loopback_only: false,
         }
     }
 }
@@ -255,6 +261,12 @@ impl Conn {
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         let addrs: Vec<_> =
             (bare, port).to_socket_addrs().map_err(|e| NetError::Connect(format!("{host}: {e}")))?.collect();
+        // The addresses checked are the ones connected to, so a later lookup cannot change the answer.
+        if opts.loopback_only && addrs.iter().any(|a| !a.ip().is_loopback()) {
+            return Err(NetError::Insecure(format!(
+                "{host} is not on this computer (it resolves to another address)"
+            )));
+        }
         let mut last = NetError::Connect(format!("{host}: no addresses"));
         let mut sock = None;
         for addr in addrs {

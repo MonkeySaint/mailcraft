@@ -702,7 +702,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "View in Browser",
             "Message › More Commands › Actions › Other Actions",
             "",
-            r#"{"ids"?:[number], "dir"?: string (folder for the page; default the profile's)} (writes the message as a cleaned-up web page and returns its path and file URL for the browser)"#,
+            r#"{"ids"?:[number]} (writes the message as a cleaned-up web page in the session's private folder and returns its path and file URL for the browser)"#,
             false,
             need_one,
             view_in_browser,
@@ -3088,10 +3088,27 @@ fn view_in_browser(s: &mut Session, p: &Value) -> CmdResult {
     };
     let esc =
         |t: &str| t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
-    let body = match (&m.body.html, &m.body.text) {
-        (Some(h), _) => mailcraft_html::doc_to_html(&mailcraft_html::html_to_doc(h)),
-        (None, Some(t)) => mailcraft_html::text_to_html(t),
+    // The same protection as the reading pane: a message in Junk Email with "Disable links and other
+    // functionality" on is plain text without links or pictures, and Trust Center › "Read all standard mail
+    // in plain text" shows the text body.
+    let links_off = crate::junk::links_disabled(s, focus);
+    let plain = links_off || s.settings.bool("trust.plainText");
+    let text_body = || match (&m.body.text, &m.body.html) {
+        (Some(t), _) => t.clone(),
+        (None, Some(h)) => mailcraft_html::html_to_text(h),
         (None, None) => String::new(),
+    };
+    let body = if links_off {
+        // Escaped text only: nothing a browser could follow or load.
+        format!("<pre style=\"white-space:pre-wrap;font-family:sans-serif\">{}</pre>", esc(&text_body()))
+    } else if plain {
+        mailcraft_html::text_to_html(&text_body())
+    } else {
+        match (&m.body.html, &m.body.text) {
+            (Some(h), _) => mailcraft_html::doc_to_html(&mailcraft_html::html_to_doc(h)),
+            (None, Some(t)) => mailcraft_html::text_to_html(t),
+            (None, None) => String::new(),
+        }
     };
     let people = |list: &[mailcraft_model::Address]| {
         list.iter().map(|a| esc(&a.to_display_string())).collect::<Vec<_>>().join("; ")
@@ -3115,7 +3132,11 @@ fn view_in_browser(s: &mut Session, p: &Value) -> CmdResult {
         head.push_str(&format!("<div><b>Cc:</b> {}</div>", people(&m.cc)));
     }
     head.push_str(&format!("<div><b>Subject:</b> {}</div>", esc(&m.subject)));
-    let images = if s.settings.bool("trust.blockImages") { "data: cid:" } else { "data: cid: https: http:" };
+    let images = if links_off || s.settings.bool("trust.blockImages") {
+        "data: cid:"
+    } else {
+        "data: cid: https: http:"
+    };
     let page = format!(
         "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n\
          <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src {images}; style-src 'unsafe-inline'\">\n\
@@ -3128,27 +3149,17 @@ fn view_in_browser(s: &mut Session, p: &Value) -> CmdResult {
     if cfg!(target_arch = "wasm32") {
         return Err(CmdError::Disabled("View in Browser is not available in the web version".into()));
     }
-    // A folder the caller names (tools, tests) is used as is; otherwise the session's own private folder,
-    // whose pages go when their message does and when the session ends (`browser.rs`).
-    let given = opt_str(p, "dir").map(str::trim).filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
-    let dir = match &given {
-        Some(d) => {
-            std::fs::create_dir_all(d).map_err(|e| CmdError::Failed(format!("{}: {e}", d.display())))?;
-            d.clone()
-        }
-        None => {
-            let base = match s.store.as_ref() {
-                Some(st) => st.dir.join("browser"),
-                None => std::env::temp_dir(),
-            };
-            s.browser_pages.dir(&base).map_err(CmdError::Failed)?
-        }
+    // Always the session's own private folder (no caller picks where pages go), whose pages go when their
+    // message does and when the session ends, and leftovers of a session that crashed at the next start
+    // (`browser.rs`).
+    let base = match s.store.as_ref() {
+        Some(st) => crate::browser::profile_base(&st.dir),
+        None => std::env::temp_dir(),
     };
+    let dir = s.browser_pages.dir(&base).map_err(CmdError::Failed)?;
     let path = dir.join(format!("message-{}.html", focus.0));
     crate::cmd::rules::write_file(&path, page.as_bytes())?;
-    if given.is_none() {
-        s.browser_pages.written(focus, path.clone());
-    }
+    s.browser_pages.written(focus, path.clone());
     let shown = path.display().to_string();
     let url = crate::browser::file_url(&path);
     // The front end opens it in the system browser.
@@ -3362,10 +3373,11 @@ mod tests {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
         std::fs::create_dir_all(&base).unwrap();
         let dir = tempfile::tempdir_in(base).unwrap();
+        f.s.browser_pages.dir(dir.path()).unwrap();
         if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
             m.body.html = Some("<p onclick=\"x()\">Hi<script>alert(1)</script><img src=\"https://img.example.com/t.png\"></p>".into());
         }
-        let r = f.s.run("mail.viewInBrowser", &json!({"dir": dir.path().display().to_string()})).unwrap();
+        let r = f.s.run("mail.viewInBrowser", &json!({})).unwrap();
         let path = r["path"].as_str().unwrap();
         assert!(r["url"].as_str().unwrap().starts_with("file:///"));
         let page = std::fs::read_to_string(path).unwrap();
@@ -3374,12 +3386,12 @@ mod tests {
         assert!(!page.contains("<script") && !page.contains("onclick"), "{page}");
         assert!(page.contains("<b>From:</b> Alice Rivera &lt;"), "{page}");
         f.s.run("options.set", &json!({"key": "trust.blockImages", "value": false})).unwrap();
-        f.s.run("mail.viewInBrowser", &json!({"dir": dir.path().display().to_string()})).unwrap();
+        f.s.run("mail.viewInBrowser", &json!({})).unwrap();
         assert!(std::fs::read_to_string(path).unwrap().contains("img-src data: cid: https: http:;"));
         // The subject of the other message is escaped.
         f.s.selection.items = vec![id];
         f.s.selection.focus = Some(id);
-        let r = f.s.run("mail.viewInBrowser", &json!({"dir": dir.path().display().to_string()})).unwrap();
+        let r = f.s.run("mail.viewInBrowser", &json!({})).unwrap();
         let page = std::fs::read_to_string(r["path"].as_str().unwrap()).unwrap();
         assert!(page.contains("<title>Gr&lt;u&gt;sse</title>"), "{page}");
     }
@@ -3422,6 +3434,103 @@ mod tests {
             crate::browser::file_url(std::path::Path::new(r"C:\Users\me\x.html")),
             "file:///C:/Users/me/x.html"
         );
+    }
+
+    fn scratch_dir() -> tempfile::TempDir {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(base).unwrap()
+    }
+
+    /// Regression: View in Browser ignored the Junk Email protection the reading pane applies, so a phishing
+    /// message from Junk Email opened in the browser with live links and remote pictures (and "Read all
+    /// standard mail in plain text" was ignored too).
+    #[test]
+    fn view_in_browser_keeps_junk_links_and_pictures_off() {
+        let mut f = fx();
+        let base = scratch_dir();
+        f.s.browser_pages.dir(base.path()).unwrap();
+        f.s.run("options.set", &json!({"key": "trust.blockImages", "value": false})).unwrap();
+        let junk = role(&f.s, FolderRole::JunkEmail);
+        if let Some(m) = f.s.mailbox.mail.get_mut(&f.a) {
+            m.folder = junk;
+            m.body.text = None;
+            m.body.html = Some(
+                "<p>Your account is locked. <a href=\"https://phish.example.net/login\">Sign in now</a></p>\
+                 <img src=\"https://img.example.com/pixel.png\">"
+                    .into(),
+            );
+        }
+        assert!(crate::junk::links_disabled(&f.s, f.a));
+        let view = |s: &mut Session| {
+            let r = s.run("mail.viewInBrowser", &json!({"ids": [f.a.0]})).unwrap();
+            std::fs::read_to_string(r["path"].as_str().unwrap()).unwrap()
+        };
+        let page = view(&mut f.s);
+        assert!(page.contains("Sign in now"), "{page}");
+        assert!(!page.contains("href") && !page.contains("<img") && !page.contains("<a "), "{page}");
+        assert!(page.contains("img-src data: cid:;"), "{page}");
+        // Links on in Junk Email: the page is the cleaned-up HTML again, pictures as Trust Center says.
+        f.s.mailbox.junk.disable_links = false;
+        let page = view(&mut f.s);
+        assert!(page.contains("href=\"https://phish.example.net/login\""), "{page}");
+        assert!(page.contains("img-src data: cid: https: http:;"), "{page}");
+        // Trust Center › Read all standard mail in plain text: the text body, no pictures.
+        f.s.run("options.set", &json!({"key": "trust.plainText", "value": true})).unwrap();
+        let page = view(&mut f.s);
+        assert!(page.contains("Sign in now") && !page.contains("<img"), "{page}");
+    }
+
+    /// Regression: `mail.viewInBrowser` took a folder from the caller (MCP, control channel, CLI) and
+    /// created it, overwrote a file in it and kept the page there forever. Pages only go to the session's
+    /// own folder now.
+    #[test]
+    fn view_in_browser_never_writes_where_the_caller_says() {
+        let mut f = fx();
+        let base = scratch_dir();
+        let own = f.s.browser_pages.dir(base.path()).unwrap();
+        let other = scratch_dir();
+        let target = other.path().join("made-by-caller");
+        let r = f.s.run("mail.viewInBrowser", &json!({"dir": target.display().to_string()})).unwrap();
+        let page = std::path::PathBuf::from(r["path"].as_str().unwrap());
+        assert!(page.starts_with(&own), "{}", page.display());
+        assert!(!target.exists(), "no folder is created where the caller says");
+        assert_eq!(f.s.browser_pages.page(f.a), Some(page.as_path()), "the page is tracked for clean-up");
+        let spec = specs().into_iter().find(|c| c.id == "mail.viewInBrowser").unwrap();
+        assert!(!spec.params.contains("dir"), "{}", spec.params);
+    }
+
+    /// Regression: page folders were removed only when the session ended cleanly; after a crash they kept
+    /// rendered mail on disk for good. Opening the profile removes them now, and nothing else.
+    #[test]
+    fn opening_the_profile_removes_pages_a_crash_left() {
+        let profile = scratch_dir();
+        let base = crate::browser::profile_base(profile.path());
+        let left = base.join("mailcraft-pages-AbC123");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("message-7.html"), b"<p>private</p>").unwrap();
+        let keep = base.join("not-ours");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::write(base.join("mailcraft-pages-file"), b"x").unwrap();
+        let outside = scratch_dir();
+        std::fs::write(outside.path().join("keep.txt"), b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), base.join("mailcraft-pages-link")).unwrap();
+        let mut s = Session::open(profile.path()).unwrap();
+        assert!(!left.exists(), "a leftover page folder is removed");
+        assert!(keep.is_dir() && base.join("mailcraft-pages-file").is_file(), "other entries stay");
+        assert!(outside.path().join("keep.txt").is_file(), "a link is never followed");
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(base.join("mailcraft-pages-link")).is_ok());
+        // The session's own pages still work, in the profile's folder.
+        let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
+        let id = s.mailbox.add_mail(msg(inbox, "Hi", "ann@example.com", "Hello.", at(20735, 9)));
+        s.selection.items = vec![id];
+        s.selection.focus = Some(id);
+        let r = s.run("mail.viewInBrowser", &json!({})).unwrap();
+        let page = std::path::PathBuf::from(r["path"].as_str().unwrap());
+        assert!(page.starts_with(&base) && page.is_file());
+        assert_eq!(crate::browser::sweep_leftovers(outside.path()), 0);
     }
 
     fn folder_of(s: &Session, id: ItemId) -> FolderId {
