@@ -34,6 +34,22 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
   Address Book tab; each main window keeps its own calendar.
 - Contacts and tasks sync with CardDAV and CalDAV servers; calendars can be published to a WebDAV
   location; other users' and shared IMAP mailboxes can be opened.
+- Compose fonts and proofing: installed fonts are drawn in the editor, print preview and PDF, and the Font
+  list shows each font in its own face; Set Proofing Language uses Hunspell dictionaries found on the system.
+- Apply Styles pane and Modify Style; Browse for Themes and Save Current Theme read and write Office theme
+  files.
+- Drawings: select several, Group, Align and Distribute; text wraps around drawings; Edit Points, linked text
+  boxes and a Format Shape dialog with fill, line, effects and layout.
+- Equations reopen for editing; 3D models are shaded.
+- Appointments and meetings: time zones, formatted notes, attachments, Importance and Resources; a new
+  meeting is sent from its own window. Account calendars sync with CalDAV; Add Holidays.
+- View Settings: group by up to four fields, sort by up to four keys, fonts and grid lines, for every
+  module; People card views can be sorted and filtered.
+- New Data File can write a standalone data file, optionally protected with a password.
+- Quick steps carry message options and can send automatically; context menus have access keys.
+- Search: Include Older Results searches mail that is only on the server.
+- Translate Message with a translation server you set up yourself (nothing is sent until you do);
+  Encoding menu; read windows zoom on their own.
 
 ## 0.2.0
 

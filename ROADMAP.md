@@ -29,8 +29,9 @@ unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release), 
 | — | Round 4: AutoArchive, S/MIME, compose and reading options take effect, note positions | ✅ done |
 | — | Round 5: data safety (data files kept on Remove, Close All Items prompts), second main window, Focused Inbox on arrival, Ignore, Font and Paragraph dialogs, building blocks, screenshots, equations, thesaurus, People/Tasks/Notes/Calendar table views, Help | ✅ done, re-audited at 95.7 % |
 | — | Round 6: compose drawing objects, paragraph borders, Find and Replace options, proofing and the Editor pane, To-Do List actions, in-place Edit Message, recoverable items, quota, Send/Receive groups, Mail Merge documents, CardDAV/CalDAV contact and task sync, calendar publishing, shared mailboxes | ✅ done, re-audited at 97.1 % |
-| — | Round 7: multi-object drawing (group, align, distribute, text wrap), appointment window depth, CalDAV calendar sync, standalone data files, View Settings depth | next |
-| v0.1.0 / v0.2.0 / v0.3.0 | Local release tags | commits 23 / 27 / 30 |
+| — | Round 7: installed fonts and system dictionaries, Apply Styles pane, Office themes, multi-object drawing (group, align, distribute, text wrap, Edit Points, linked text boxes), Format Shape, appointment window depth, CalDAV event sync, View Settings depth in every module, standalone data files, quick step options, menu access keys, server search, opt-in translation | ✅ done, re-audited at 99.1 % |
+| — | Round 8: release check (second-opinion audit, app walk-through, security review of the network code), accessibility pane, building blocks with pictures, list and paragraph dialog depth, linked styles | next |
+| v0.1.0 / v0.2.0 / v0.3.0 | Local release tags | commit 23 / after round 5 / after round 7 |
 | v1.0.0 | Definition of done: full catalog coverage, ≥ 95 % honest parity in every area, end-to-end against a local IMAP/SMTP server | goal |
 
 ## Parity
@@ -38,29 +39,27 @@ unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release), 
 Two numbers, kept separate on purpose:
 
 - **Catalog coverage** (mechanical, `cargo xtask parity` → [docs/parity.md](docs/parity.md)): every observed
-  Outlook command row maps to a MailCraft command id that exists in the registry. Today 1,559 of 1,565 applicable
-  rows (99.6 %); 133 rows are not applicable (cloud-only Microsoft services). The 6 missing rows are drawing
-  features not built yet (Edit Points, Create Text Box Link, Group Objects, Distribute, Text Wrap). This only
-  proves an id exists.
-- **Honest parity** (re-audited 2026-10-21 after round 6): each of the 1,565 audited rows classified by what its
+  Outlook command row maps to a MailCraft command id that exists in the registry. Today 1,565 of 1,565 applicable
+  rows (100 %); 133 rows are not applicable (cloud-only Microsoft services). This only proves an id exists.
+- **Honest parity** (re-audited 2026-10-21 after round 7): each of the 1,565 audited rows classified by what its
   command really does: REAL (works and is reachable), DIALOG-OK (opens a dialog that works), DIALOG-STUB (opens a
   dialog that doesn't do the thing), PARTIAL (works, but clearly less than observed), STUB (no-op, echo or
-  error). Honest % = (REAL + DIALOG-OK + ½ PARTIAL) / rows. **Overall: 97.1 %** (94.8 % counting only REAL +
-  DIALOG-OK), up from 95.7 % (92.0 %) after round 5 with the same method. Every area is now at 95 % or more;
-  Compose is exactly at 95 %, and the strict number is still under 95 % for Compose, Read, Calendar and People.
+  error). Honest % = (REAL + DIALOG-OK + ½ PARTIAL) / rows. **Overall: 99.1 %** (98.3 % counting only REAL +
+  DIALOG-OK), up from 97.1 % (94.8 %) after round 6 with the same method. Every area is above 95 % on both
+  numbers; the 27 PARTIAL rows left are listed under Biggest gaps.
 
 | Catalog area | Rows | REAL | DIALOG-OK | DIALOG-STUB | PARTIAL | STUB | Honest |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Mail (main window) | 262 | 199 | 56 | 0 | 7 | 0 | 98.7 % |
-| Context menus | 204 | 162 | 39 | 0 | 3 | 0 | 99.3 % |
-| Read window | 84 | 56 | 23 | 2 | 3 | 0 | 95.8 % |
-| Search | 40 | 34 | 4 | 0 | 1 | 1 | 96.2 % |
-| Compose | 503 | 370 | 89 | 0 | 38 | 6 | 95.0 % |
-| Calendar | 122 | 86 | 29 | 0 | 7 | 0 | 97.1 % |
-| People | 142 | 102 | 31 | 0 | 9 | 0 | 96.8 % |
-| Notes | 64 | 51 | 11 | 0 | 2 | 0 | 98.4 % |
-| Tasks | 144 | 123 | 19 | 0 | 2 | 0 | 99.3 % |
-| **Total** | **1,565** | **1,183** | **301** | **2** | **72** | **7** | **97.1 %** |
+| Mail (main window) | 262 | 200 | 60 | 0 | 2 | 0 | 99.6 % |
+| Context menus | 204 | 162 | 40 | 0 | 2 | 0 | 99.5 % |
+| Read window | 84 | 59 | 23 | 0 | 2 | 0 | 98.8 % |
+| Search | 40 | 36 | 4 | 0 | 0 | 0 | 100 % |
+| Compose | 503 | 403 | 80 | 0 | 20 | 0 | 98.0 % |
+| Calendar | 122 | 91 | 30 | 0 | 1 | 0 | 99.6 % |
+| People | 142 | 104 | 38 | 0 | 0 | 0 | 100 % |
+| Notes | 64 | 50 | 14 | 0 | 0 | 0 | 100 % |
+| Tasks | 144 | 119 | 25 | 0 | 0 | 0 | 100 % |
+| **Total** | **1,565** | **1,224** | **314** | **0** | **27** | **0** | **99.1 %** |
 
 ### By functional area (judgement, with evidence)
 
@@ -68,32 +67,32 @@ Two numbers, kept separate on purpose:
 |---|---|---|
 | Message list and folders | ~80 % | grouping, Focused/Other, arrange/sort/filter, folder CRUD, favourites, Bottom-pane columns, hover actions; saved views, Add Columns, conditional formatting, Quick Actions settings missing; AutoArchive (scheduled and manual, per-folder settings) |
 | Reading pane | ~90 % | header, info bars, inline reply, mark-as-read timing, Space-bar reading, find in a received message (Find…, F4), preview and portrait reading options, read-window Next / Previous links |
-| Compose | ~95 % | editing, styles, themes, list formats, rich paste, voting, receipts, S/MIME, accessibility checker, @mentions, system clipboard, Format Painter, Font and Paragraph dialogs, building blocks, screenshots, equations, thesaurus, Read Aloud, floating drawing objects with Shape Format, Borders and Shading, Find and Replace options, bookmarks, Editor pane; no multi-object selection, text wrapping or installed-font rendering |
+| Compose | ~97 % | editing, styles, themes and Office theme files, list formats, rich paste, voting, receipts, S/MIME, accessibility checker, @mentions, system clipboard, Format Painter, Font and Paragraph dialogs, building blocks, screenshots, equations, thesaurus, Read Aloud, drawing objects (multi-select, groups, wrapping, Format Shape), Borders and Shading, Find and Replace options, bookmarks, Editor pane, installed fonts, system dictionaries; styles are direct formatting, drop caps inline |
 | Ribbon, menus, shortcuts | ~88 % | data-driven ribbons with width rules and keytips; a few Calendar buttons route through Mail commands |
 | Rules and quick steps | ~80 % | 31 conditions, 25 actions, wizard and manage dialogs, Quick Steps |
-| Search | ~82 % | indexed query language, refiners, Advanced Find, search folders; scopes and Expiring Soon partial |
-| Accounts and sync | ~80 % | IMAP (IDLE, CONDSTORE/QRESYNC, QUOTA, NAMESPACE and shared mailboxes), POP3, JMAP, SMTP, CardDAV/CalDAV for contacts and tasks, Send/Receive groups, OAuth sign-in, OS keyring; no CalDAV event sync, no OAuth end-to-end test |
-| Calendar | ~90 % | views, colours, overlay, drag/resize, named time zones, subscriptions, iTIP, Calendar Properties, WebDAV publishing, per-window calendars; appointment window lacks time zones, rich notes and Resources, New Meeting sends through a second compose |
-| People | ~96 % | editor, groups, table views with column sets and saved views, vCard/CSV, Mail Merge (e-mail, letters, labels, envelopes), CardDAV sync; card views lack sort/filter settings |
-| Tasks | ~97 % | editor, recurrence, task requests, table views with column sets and saved views, Tasks ribbon on flagged messages and contacts, CalDAV task sync; flagged mail has no preview in the To-Do List |
+| Search | ~92 % | indexed query language, refiners, Advanced Find with more criteria, search folders, Include Older Results on the server (IMAP, JMAP), Deleted Items scope |
+| Accounts and sync | ~85 % | IMAP (IDLE, CONDSTORE/QRESYNC, QUOTA, NAMESPACE and shared mailboxes), POP3, JMAP, SMTP, CardDAV/CalDAV for contacts and tasks, Send/Receive groups, OAuth sign-in, OS keyring; no OAuth end-to-end test |
+| Calendar | ~96 % | views, colours, overlay, drag/resize, named time zones, subscriptions, iTIP, Calendar Properties, WebDAV publishing, CalDAV event sync, per-window calendars, appointment window with time zones, formatted notes, attachments and Resources; saved views missing from Change View |
+| People | ~97 % | editor, groups, table and card views with sort, filter and conditional formatting, saved views, vCard/CSV, Mail Merge (e-mail, letters, labels, envelopes), CardDAV sync |
+| Tasks | ~98 % | editor, recurrence, task requests, table views with column sets and saved views, Tasks ribbon on flagged messages and contacts, CalDAV task sync, flagged mail previews in the To-Do List |
 | Notes | ~100 % | create/edit/colour, icon and table views, saved views, positions kept on the note |
 | Import/export and print | ~65 % | EML/MSG/MBOX/Maildir/ICS/VCF/CSV, PDF everywhere, CUPS; no PST, no Windows printing |
 | Options dialog | ~90 % | every setting persists in the profile; 178 of 228 take effect, 29 are not applicable, 21 are shown or stored only (`settings::effect_counts`) |
 | Responsive behaviour | ~97 % | 29 of 30 observed behaviours (Classic Respond group at 1024 px) |
 | Keyboard | ~99 % | Space on a focused button; F6 cycles compose and read windows |
 
-### Biggest gaps (ranked by user impact, from the 2026-10-21 audit after round 6)
+### Biggest gaps (ranked by user impact, from the 2026-10-21 audit after round 7)
 
-1. Compose drawing: one drawing is selected at a time, so Group, Align Selected Objects and Distribute are
-   missing; text never wraps around drawings; Edit Points and linked text boxes are not built.
-2. Calendar: the appointment window has no time-zone picker, rich notes, attachments, Importance or Resources,
-   and a new meeting is sent through a second compose window; event calendars are not synced with CalDAV.
-3. Data files: New Data File adds a store inside the profile instead of writing a standalone file the user picks.
-4. Views: View Settings grouping is on/off with one sort level; card views and calendar grids ignore filters and
-   conditional formatting; Reset View in a tasks folder resets the whole module.
-5. Compose fonts and proofing: installed fonts are drawn with the closest bundled face; English is the only
-   bundled dictionary.
-6. Search: no search of older mail that is only on the server; Translate needs a translator the user installs.
+1. Compose: Check Accessibility is a one-shot list, not a pane that keeps checking with fix actions; building
+   blocks lose their pictures in other messages and after a restart.
+2. Compose structure: built-in styles are direct formatting rather than linked styles; Paragraph has no Tabs
+   dialog; list definitions have no position settings; drop caps stay inline.
+3. Compose drawing and pictures: 10 SmartArt layouts, 67 icons, single-colour 3D models, no arrowheads or
+   picture/gradient text fills.
+4. Proofing and reading aids: one proofing language per message; Read Aloud and the Thesaurus are dialogs, not
+   panes; Translate needs a server the user sets up.
+5. Mail: Post in This Folder is plain text; Quick Print opens the Print page on Windows; voting buttons only
+   work between MailCraft users.
 
 The full audit (per-row classification) is regenerated before each release; the commits after 14 and the
 milestones after v0.3.0 work down this list until every area is ≥ 95 %.
