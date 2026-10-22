@@ -5,8 +5,9 @@
 # Run by hand (workflow_dispatch) it builds the same packages as run artifacts and publishes nothing.
 #
 # Jobs: version check, Linux x86_64 (ubuntu-latest) and aarch64 (ubuntu-24.04-arm) with tar.gz, deb, rpm and
-# AppImage, Flatpak (x86_64), web, Windows MSI + zip (windows-latest), macOS universal DMG (macos-latest) and
-# FreeBSD tar.gz + pkg (a FreeBSD VM on ubuntu-latest). A repository variable RELEASE_WINDOWS,
+# AppImage, an offline start test of each AppImage (Ubuntu 22.04 container), Flatpak (x86_64), web,
+# Windows MSI + zip (windows-latest), macOS universal DMG (macos-latest) and FreeBSD tar.gz + pkg (a
+# FreeBSD VM on ubuntu-latest). A repository variable RELEASE_WINDOWS,
 # RELEASE_MACOS or RELEASE_FREEBSD set to `false` skips that platform; skipped platforms do not hold the
 # release back, failed ones do.
 name: release
@@ -93,6 +94,35 @@ jobs:
           name: linux-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
+
+  appimage-smoke:
+    # The AppImage must open its window on a plain Ubuntu 22.04 with no network (GitHub issue #23), which
+    # lacks most of the windowing libraries the app opens (libXcursor, libXi, libxkbcommon-x11...; Mesa and
+    # xdotool bring libXext, libXfixes and libxkbcommon). packaging/linux/appimage-test.sh runs it under Xvfb
+    # in such a container (`--network none`), waits for the window with xdotool, checks that the app is
+    # still running 10 s later and that every library it must bundle was loaded from the AppImage, not the
+    # system. --self-test also proves the test fails on an app that exits after its window appears and on
+    # one that loads libXext from the system.
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/linux
+      - name: AppImage opens its window offline (Ubuntu 22.04, Xvfb)
+        env:
+          CONTAINER: docker
+        run: packaging/linux/appimage-test.sh --self-test "dist/linux/MailCraft-${{ matrix.arch }}.AppImage"
 
   flatpak:
     needs: linux
@@ -243,11 +273,12 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [version-check, linux, flatpak, web, windows, macos, freebsd]
+    needs: [version-check, linux, appimage-smoke, flatpak, web, windows, macos, freebsd]
     # Tag pushes only; skipped platforms are fine, a failed one stops the release.
     if: >-
       ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v')
       && needs.version-check.result == 'success' && needs.linux.result == 'success'
+      && needs.appimage-smoke.result == 'success'
       && needs.flatpak.result == 'success' && needs.web.result == 'success'
       && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest

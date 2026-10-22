@@ -48,6 +48,7 @@ tags.
 |---|---|---|
 | `version-check` | `ubuntu-latest` (`rust:1.99-bookworm` container) | (fails when the tag and `Cargo.toml` disagree) |
 | `linux` (x86_64, aarch64) | `ubuntu-latest`, `ubuntu-24.04-arm` (`rust:1.99-bookworm` container) | `mailcraft-VERSION-linux-ARCH.tar.gz`, `mailcraft_VERSION-1_ARCH.deb`, `mailcraft-VERSION-1.ARCH.rpm`, `MailCraft-ARCH.AppImage` + `.zsync` |
+| `appimage-smoke` (x86_64, aarch64) | `ubuntu-latest`, `ubuntu-24.04-arm` (offline `ubuntu:22.04` container) | (fails when the AppImage does not open its window, see [AppImage libraries](#appimage-libraries-and-minimum-system)) |
 | `flatpak` | `ubuntu-latest` (privileged `debian:trixie` container) | `mailcraft-VERSION-x86_64.flatpak` |
 | `web` | `ubuntu-latest` (`rust:1.99-bookworm` container) | `mailcraft-VERSION-web.zip` |
 | `windows` | `windows-latest` | `mailcraft-VERSION-windows-x86_64.msi`, `mailcraft-VERSION-windows-x86_64.zip` |
@@ -82,6 +83,7 @@ id `saint.dev.MailCraft`.
   `gh-releases-zsync|MonkeySaint|mailcraft|latest|MailCraft-*ARCH.AppImage.zsync`, so AppImageUpdate
   fetches the matching `.zsync` from the newest GitHub release; this is why the AppImage file name has no
   version in it.
+  It carries the windowing libraries the app opens at run time, see below.
 - **Flatpak**: a single-file bundle on the Freedesktop 25.08 runtime from Flathub, with network, Wayland
   (X11 fallback), GPU and portal file dialogs: `flatpak install --user mailcraft-….flatpak`.
 - **MSI**: per-machine install to `Program Files\MailCraft`, Start menu shortcut, `mailcraft-cli` on the
@@ -89,6 +91,62 @@ id `saint.dev.MailCraft`.
 - **DMG**: `MailCraft.app`, a universal binary (Apple silicon and Intel), macOS 11 or later.
 - **web zip**: static files to serve from any web server, with a `_headers` file (content security policy,
   `application/wasm`) for hosts that read one.
+
+### AppImage libraries and minimum system
+
+The app links only glibc and `libgcc_s`; winit, xkbcommon-dl, wayland-sys and glutin open the windowing
+libraries with `dlopen` when the window is created. A desktop without one of them cannot open the window (base Ubuntu
+22.04 has neither `libXcursor.so.1` nor `libxkbcommon-x11.so.0`, GitHub issue #23), so
+`packaging/linux/appimage-libs.sh` (called by `appimage.sh`) copies them from the build system into
+`usr/lib` of the AppDir and gives `usr/bin/mailcraft` the `DT_RPATH` `$ORIGIN/../lib` (with `patchelf`):
+
+| Bundled | Why |
+|---|---|
+| `libXcursor.so.1`, `libXi.so.6` | opened by winit on X11 |
+| `libXrender.so.1`, `libXfixes.so.3`, `libXext.so.6` | needed by libXcursor and libXi |
+| `libxkbcommon.so.0`, `libxkbcommon-x11.so.0` | keyboard handling (X11 and Wayland) |
+| `libxcb-xkb.so.1` | needed by libxkbcommon-x11 |
+| `libwayland-cursor.so.0`, `libwayland-egl.so.1` | opened on Wayland |
+
+Libraries on the [AppImage excludelist](https://github.com/AppImage/pkg2appimage/blob/master/excludelist)
+are never bundled, because they have to match the system's drivers and display server: glibc, `libGL`,
+`libEGL`, `libX11`, `libX11-xcb`, `libxcb`, `libwayland-client` and the rest of that list. The script
+follows the `NEEDED` entries of everything it copies, fails when a library is missing on the build system
+(`packaging/linux/ci-deps.sh` installs them in the release job) and copies the Debian copyright file of
+each library's package to `usr/share/doc/mailcraft/third-party/` (all of them are MIT/X11-style licences).
+`packaging/linux/appimage-libs.sh --check <AppDir>` reruns the checks on a filled AppDir.
+
+The executable's `DT_RPATH` covers `dlopen` and the dependencies of every library loaded into the app,
+and, unlike `LD_LIBRARY_PATH`, it does not reach the programs the app starts: the browser that opens a
+link or the viewer that opens an attachment keeps the system's own (possibly newer) libraries. `AppRun`
+therefore leaves the environment alone; the library checks and the smoke test below both fail when it
+sets `LD_LIBRARY_PATH`.
+
+The AppImage needs **glibc 2.35 or newer** (Ubuntu 22.04, Debian 12, Fedora 36 and later). It is built in
+the `rust:1.99-bookworm` container (glibc 2.36), but nothing in it references a glibc symbol newer than
+2.35; `appimage-libs.sh` fails the build when something does (`MC_APPIMAGE_MAX_GLIBC`, default `2.35`).
+If that check ever fails, build the Linux packages on an older base instead of raising the limit.
+
+The `appimage-smoke` job proves it on every release: `packaging/linux/appimage-test.sh` builds a plain
+Ubuntu 22.04 image with only Xvfb, Mesa and xdotool (`packaging/linux/appimage-test/Containerfile`), runs
+the AppImage in it with `--network none`, a new empty home and no arguments (as the AppImage catalog
+does). It fails unless the MailCraft window appears within 30 s (`--timeout`), the app is still running
+10 s after that (`--settle`), its environment has no `LD_LIBRARY_PATH`, and every library it must bundle
+was loaded from the AppImage's `usr/lib`. The last check reads the running app's `/proc/PID/maps`: the
+image lacks libXcursor, libXi, libXrender, libxkbcommon-x11 and libxcb-xkb, so a missing copy of one of
+those stops the app anyway, but Mesa and xdotool install libXext, libXfixes and libxkbcommon, and a system
+copy of those would otherwise hide a broken bundle or RPATH. `--self-test` (used by the release job) also
+runs two broken variants of the AppImage, one that exits a second after its window appears and one that
+loads libXext from the system, and fails unless the smoke test rejects both. The same works locally with
+podman or docker:
+
+```sh
+packaging/linux/appimage-test.sh --self-test dist/MailCraft-x86_64.AppImage
+```
+
+Build that AppImage in the release job's container (`rust:1.99-bookworm`), not on a newer distribution:
+an AppImage built on the developer machine takes that machine's glibc and libraries along, and the glibc
+check stops it.
 
 ## Actions and downloaded tools
 
@@ -101,7 +159,8 @@ JavaScript actions in container jobs use the Node.js that the runner mounts into
 Some build tools are downloaded from their upstream release pages during the jobs (none of them ends up in
 a package): nfpm (checked against its release checksums), appimagetool and the AppImage type2 runtime
 (`continuous` releases), Trunk, ShellCheck and actionlint (checked against pinned SHA-256 sums). They are
-cached with `actions/cache` under `~/.cache/mailcraft-packaging` and `~/.cache/mailcraft-lint`.
+cached with `actions/cache` under `~/.cache/mailcraft-packaging` and `~/.cache/mailcraft-lint`. The
+`appimage-smoke` job builds its test image from `ubuntu:22.04` (Docker Hub) and the Ubuntu archive.
 
 ## Secrets and variables
 
@@ -134,6 +193,8 @@ packaging/linux/package.sh --build
 cargo build -p mailcraft -p mailcraft-cli && packaging/linux/package.sh --profile debug
 # AppImage from the built binaries (appimagetool on PATH, or MC_DOWNLOAD_TOOLS=1 to fetch it)
 packaging/linux/appimage.sh
+# start the AppImage offline in a plain Ubuntu 22.04 container (podman or docker)
+packaging/linux/appimage-test.sh dist/MailCraft-x86_64.AppImage
 # Flatpak bundle (flatpak-builder installed)
 packaging/linux/flatpak/flatpak-bundle.sh --bin-dir target/release
 # web zip (Trunk if installed, else cargo + wasm-bindgen-cli)

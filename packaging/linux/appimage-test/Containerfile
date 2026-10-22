@@ -1,0 +1,13 @@
+# A plain Ubuntu 22.04 with only an X server (Xvfb), Mesa and the tools packaging/linux/appimage-smoke.sh
+# uses: the oldest system the AppImage supports, close to what the AppImage catalog tests on.
+# Of the libraries the AppImage bundles, Mesa and xdotool pull in libXext.so.6, libXfixes.so.3 and
+# libxkbcommon.so.0; libXcursor, libXi, libXrender, libxkbcommon-x11, libxcb-xkb, libwayland-cursor and
+# libwayland-egl are not installed. A library of the second group that the AppImage forgets to bundle stops
+# the app here; for the first group a system copy would hide the mistake, so the smoke test reads the
+# running app's memory map and fails when a library the AppImage must bring was loaded from the system.
+# Built and run (offline) by packaging/linux/appimage-test.sh.
+FROM docker.io/library/ubuntu:22.04
+RUN apt-get update \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+		xvfb xdotool libgl1 libegl1 libgl1-mesa-dri ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*

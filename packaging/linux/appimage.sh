@@ -9,6 +9,12 @@
 #     gh-releases-zsync|MonkeySaint|mailcraft|latest|MailCraft-*ARCH.AppImage.zsync
 # and AppImageUpdate fetches the matching file from the newest GitHub release.
 #
+# The windowing libraries the app opens at run time come from the build system:
+# packaging/linux/appimage-libs.sh copies them into usr/lib (all but the AppImage excludelist), gives
+# usr/bin/mailcraft the RPATH $ORIGIN/../lib and checks the AppDir (nothing missing, glibc 2.35 at most).
+# Build the AppImage on Debian 12 / Ubuntu 22.04 or older (the release job uses rust:1.99-bookworm).
+# packaging/linux/appimage-test.sh starts the result offline in a plain Ubuntu 22.04 container.
+#
 # Tools:
 #   appimagetool  $APPIMAGETOOL, else PATH, else (MC_DOWNLOAD_TOOLS=1) downloaded once from
 #                 https://github.com/AppImage/appimagetool/releases (continuous) into $MC_TOOL_CACHE
@@ -18,6 +24,7 @@
 #                 runtime-ARCH from https://github.com/AppImage/type2-runtime/releases (continuous), cached
 #                 the same way, or $APPIMAGE_RUNTIME.
 #   zsyncmake     (package `zsync`) writes the .zsync file; without it only the AppImage is produced.
+#   readelf, patchelf  (packages `binutils`, `patchelf`) for appimage-libs.sh.
 set -euo pipefail
 # shellcheck source=packaging/env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -32,7 +39,7 @@ while [ $# -gt 0 ]; do
 	--profile) profile="${2:?--profile needs a value}"; shift ;;
 	--out) out="${2:?--out needs a value}"; shift ;;
 	--no-update-info) update_info=0 ;;
-	-h | --help) sed -n '2,22p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,27p' "$0"; exit 0 ;;
 	*) mc_die "unknown option $1" ;;
 	esac
 	shift
@@ -91,11 +98,15 @@ cp "$appdir/$APP_ID.png" "$appdir/.DirIcon"
 cp "$appdir/usr/share/metainfo/$APP_ID.metainfo.xml" "$appdir/usr/share/metainfo/$APP_ID.appdata.xml"
 cat >"$appdir/AppRun" <<'EOF'
 #!/bin/sh
-# AppImage entry point: start the desktop app from inside the mounted image.
+# AppImage entry point: start the desktop app from inside the mounted image. The executable's RPATH
+# ($ORIGIN/../lib) finds the bundled windowing libraries in usr/lib (see packaging/linux/appimage-libs.sh);
+# the environment stays as it is, so programs the app opens use the system's libraries.
 HERE="$(dirname "$(readlink -f "$0")")"
 exec "$HERE/usr/bin/mailcraft" "$@"
 EOF
 chmod 0755 "$appdir/AppRun"
+
+"$MC_ROOT/packaging/linux/appimage-libs.sh" --arch "$arch" "$appdir"
 
 image="$out/MailCraft-$arch.AppImage"
 rm -f "$image" "$image.zsync"
