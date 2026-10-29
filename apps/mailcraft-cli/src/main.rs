@@ -63,8 +63,9 @@ fn print_json(v: &Value) -> Result<(), String> {
 fn open(source: &Source) -> Result<Session, String> {
     match source {
         Source::Sample => Ok(mailcraft_engine::sample::sample_session()),
-        Source::Profile(dir) => {
-            let mut s = Session::open(dir).map_err(|e| e.to_string())?;
+        Source::Profile(dir, store) => {
+            let kind = store.unwrap_or_else(mailcraft_engine::StoreKind::from_env);
+            let mut s = Session::open_with(dir, kind).map_err(|e| e.to_string())?;
             // Secrets the desktop app moved into the OS credential store are read from there. Profiles without
             // mail accounts have no secrets, so the keyring is not touched for them. Without a keyring the
             // profile's secrets file stays in use.
@@ -287,7 +288,10 @@ fn mcp(target: McpTarget) -> Result<(), String> {
         McpTarget::Headless(source) => {
             let backend = match &source {
                 Source::Sample => HeadlessBackend::sample(),
-                Source::Profile(dir) => HeadlessBackend::open(dir)?,
+                Source::Profile(dir, store) => HeadlessBackend::open_with(
+                    dir,
+                    store.unwrap_or_else(mailcraft_engine::StoreKind::from_env),
+                )?,
             };
             eprintln!("mailcraft-cli mcp: serving {} on stdio", mailcraft_mcp::Backend::describe(&backend));
             mailcraft_mcp::serve_stdio(&mut Server::new(backend)).map_err(|e| e.to_string())

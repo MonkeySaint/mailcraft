@@ -1,6 +1,7 @@
 //! `cargo xtask layers`: each crate depends only on strictly lower layers, and nothing below the UI layer
 //! (L6) pulls in a GUI toolkit, directly or transitively. Test-support crates (local test servers) may be
-//! used only as dev-dependencies, or by apps and tooling.
+//! used only as dev-dependencies, or by apps and tooling. The native storage crates (SQLite and zstd, C code)
+//! are declared by `mailcraft-store` alone, so every database and pack access goes through its API.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -48,6 +49,11 @@ pub const SAME_LAYER_EXCEPTIONS: &[(&str, &str)] = &[];
 /// The UI layer: crates below it must not reach these packages.
 pub const UI_LAYER: u8 = 6;
 pub const GUI_CRATES: &[&str] = &["egui", "eframe", "winit", "wgpu", "glow", "rfd"];
+
+/// Native storage crates (bundled SQLite and zstd, both C): only [`STORAGE_OWNER`] declares them (storage
+/// ADR §3.1; it keeps them out of the browser build with a target cfg, which the wasm build step checks).
+pub const STORAGE_CRATES: &[&str] = &["rusqlite", "libsqlite3-sys", "zstd", "zstd-safe", "zstd-sys"];
+pub const STORAGE_OWNER: &str = "mailcraft-store";
 
 pub fn layer_of(name: &str) -> Option<u8> {
     LAYERS.iter().find(|(n, _)| *n == name).map(|(_, l)| *l)
@@ -107,7 +113,27 @@ pub fn check(meta: &Metadata) -> Vec<String> {
     }
     problems.extend(gui_leaks(meta));
     problems.extend(desktop_links(meta));
+    problems.extend(storage_owner(meta));
     problems
+}
+
+/// Workspace crates other than [`STORAGE_OWNER`] that declare a [`STORAGE_CRATES`] dependency (tests may).
+fn storage_owner(meta: &Metadata) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in meta.members() {
+        if p.name == STORAGE_OWNER {
+            continue;
+        }
+        for (dep, kind) in &p.dependencies {
+            if STORAGE_CRATES.contains(&dep.as_str()) && kind.as_deref() != Some("dev") {
+                out.push(format!(
+                    "`{}` depends on `{dep}`: SQLite and zstd are reached through `{STORAGE_OWNER}` only",
+                    p.name
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The desktop app must be able to open links: egui-winit only does that with its `links` feature, which
@@ -269,6 +295,21 @@ mod tests {
             &[("mailcraft", "webbrowser", Some("dev"))],
         );
         assert!(!desktop_links(&dev_only).is_empty());
+    }
+
+    #[test]
+    fn storage_crates_only_in_the_store() {
+        let store = pkg("mailcraft-store", &["rusqlite", "zstd"]);
+        let engine = pkg("mailcraft-engine", &["mailcraft-store"]);
+        let ok = meta(vec![store.clone(), engine], &["mailcraft-store", "mailcraft-engine"], &[]);
+        assert!(storage_owner(&ok).is_empty());
+        let bad = pkg("mailcraft-engine", &["mailcraft-store", "rusqlite"]);
+        let m = meta(vec![store.clone(), bad], &["mailcraft-store", "mailcraft-engine"], &[]);
+        assert!(storage_owner(&m).iter().any(|p| p.contains("rusqlite")));
+        let mut dev = pkg("mailcraft-engine", &[]);
+        dev.dependencies.push(("zstd".into(), Some("dev".into())));
+        let m = meta(vec![store, dev], &["mailcraft-store", "mailcraft-engine"], &[]);
+        assert!(storage_owner(&m).is_empty(), "tests may use them");
     }
 
     #[test]

@@ -17,11 +17,13 @@ Commands:
 
 Options:
   --size N            messages: 2000, 10k, 40k, 100k, 1m… (default 10k)
-  --backend B         legacy (default) or sqlite (not built yet)
+  --backend B         legacy (default) or sqlite
   --small-bodies      bodies of a few KB (same structure; lets 1M-message runs fit on disk)
   --seed N            generator seed
   --sync N            messages applied as synchronised mail (default 10000)
   --bulk-move N       messages in the bulk move / undo / redo (default 10000)
+  --generate-batch N  sources stored per fsync and commit while generating (default 1000; 1 = one per
+                      source, as the app's import and sync store them)
   --work DIR          run: where the profile is built (default target/scratch/bench/work)
   --out PATH          run: report file (default target/scratch/bench/<date>-<backend>-<size>.json);
                       maildir / mbox: where to write
@@ -38,6 +40,7 @@ struct Args {
     seed: Option<u64>,
     sync: Option<usize>,
     bulk: Option<usize>,
+    generate_batch: Option<usize>,
     work: Option<PathBuf>,
     out: Option<PathBuf>,
     profile: Option<PathBuf>,
@@ -58,6 +61,11 @@ fn parse(args: &[String]) -> Result<Args> {
             "--sync" => a.sync = Some(value("--sync")?.parse().map_err(|_| "`--sync` needs a number")?),
             "--bulk-move" => {
                 a.bulk = Some(value("--bulk-move")?.parse().map_err(|_| "`--bulk-move` needs a number")?)
+            }
+            "--generate-batch" => {
+                a.generate_batch = Some(
+                    value("--generate-batch")?.parse().map_err(|_| "`--generate-batch` needs a number")?,
+                )
             }
             "--work" => a.work = Some(PathBuf::from(value("--work")?)),
             "--out" => a.out = Some(PathBuf::from(value("--out")?)),
@@ -83,6 +91,9 @@ fn options(a: &Args) -> Options {
     }
     if let Some(n) = a.bulk {
         o.bulk_move = n;
+    }
+    if let Some(n) = a.generate_batch {
+        o.generate_batch = n;
     }
     o
 }
@@ -259,6 +270,11 @@ mod tests {
         let mut child = vec!["measure".to_owned()];
         child.extend(child_args(&o));
         assert_eq!(options(&parse(&child).unwrap()), o);
+        assert_eq!(o.generate_batch, mailcraft_bench::GENERATE_BATCH);
+        let one: Vec<String> =
+            ["generate", "--generate-batch", "1"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(options(&parse(&one).unwrap()).generate_batch, 1);
+        assert!(parse(&["run".to_owned(), "--generate-batch".to_owned(), "x".to_owned()]).is_err());
         assert!(parse(&["run".to_owned(), "--size".to_owned()]).is_err());
         assert!(parse(&["run".to_owned(), "--backend".to_owned(), "pst".to_owned()]).is_err());
         assert_eq!(size_label(40_000), "40k");

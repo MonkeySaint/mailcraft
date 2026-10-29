@@ -308,7 +308,8 @@ fn content_the_undo_history_refers_to_stays_until_the_step_goes() {
 fn content_stays_until_the_store_holds_the_change() {
     let dir = tempfile::tempdir().unwrap();
     let mut f = fx();
-    let mut s = Session::open(dir.path()).unwrap();
+    // The journal's size cap makes the write fail (a legacy profile).
+    let mut s = Session::open_with(dir.path(), mailcraft_store::StoreKind::Legacy).unwrap();
     s.mailbox = std::mem::take(&mut f.s.mailbox);
     s.fixed_now = f.s.fixed_now;
     s.view.work_offline = true;

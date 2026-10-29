@@ -35,7 +35,7 @@ fn ops_after(dir: &std::path::Path, from: u64) -> Vec<String> {
 /// A profile with an IMAP account whose INBOX holds `n` synchronised messages (UIDs 1..=n), saved as a
 /// snapshot so the journal starts empty. No server is contacted: the changes only queue.
 fn imap_profile(dir: &std::path::Path, n: u32) -> (Session, AccountId, Vec<ItemId>) {
-    let mut s = Session::open(dir).unwrap();
+    let mut s = open_legacy(dir).unwrap();
     s.view.auto_send_receive_minutes = 0;
     s.view.work_offline = true;
     // Never fold the journal into a snapshot while measuring.
@@ -114,7 +114,7 @@ fn a_flag_change_on_synchronised_mail_journals_bytes_independent_of_the_mailbox(
             ids.iter().take(CHANGES).map(|id| s.mailbox.mail.get(*id).unwrap().clone()).collect();
         let accounts = s.mailbox.accounts.clone();
         drop(s);
-        let s = Session::open(dir.path()).unwrap();
+        let s = open_legacy(dir.path()).unwrap();
         assert_eq!(s.mailbox.account(account).unwrap().sync.pending, queued);
         assert_eq!(s.mailbox.accounts, accounts);
         for m in &mail {
@@ -164,7 +164,7 @@ fn configuration_changes_journal_only_the_part_that_changed() {
     assert_eq!(ops.iter().filter(|o| *o == "PutMail").count(), 1_000, "the UIDs are forgotten");
     let memory = s.mailbox.clone();
     drop(s);
-    let mut s = Session::open(dir.path()).unwrap();
+    let mut s = open_legacy(dir.path()).unwrap();
     assert_eq!(s.mailbox.categories, memory.categories);
     assert_eq!(s.mailbox.views, memory.views);
     assert_eq!(s.mailbox.accounts, memory.accounts);
@@ -178,9 +178,15 @@ fn configuration_changes_journal_only_the_part_that_changed() {
     assert_eq!(ops.iter().filter(|o| *o == "RemoveMail").count(), 1_000);
     let memory = s.mailbox.clone();
     drop(s);
-    let s = Session::open(dir.path()).unwrap();
+    let s = open_legacy(dir.path()).unwrap();
     assert!(s.mailbox.account(account).is_none());
     assert_eq!(s.mailbox.accounts, memory.accounts);
     assert_eq!(s.mailbox.folders, memory.folders);
     assert_eq!(s.mailbox.mail.len(), memory.mail.len());
+}
+
+/// These tests measure the legacy journal and snapshot: their profiles use legacy storage whatever
+/// `MAILCRAFT_STORE` says.
+fn open_legacy(dir: &std::path::Path) -> Result<Session, mailcraft_engine::CmdError> {
+    Session::open_with(dir, mailcraft_store::StoreKind::Legacy)
 }

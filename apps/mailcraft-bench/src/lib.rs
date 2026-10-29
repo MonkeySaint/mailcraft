@@ -5,9 +5,12 @@
 //! switches, list windows, search, applying synchronised mail and the common commands. The result is one JSON
 //! document ([`run`], `cargo xtask bench`).
 //!
-//! Only the `legacy` backend exists so far (the JSON snapshot, journal and blobs of `mailcraft-store`); the
-//! `sqlite` backend arrives with the new store (stage S6). Nothing here contacts a server: synchronised mail
-//! goes through [`mailcraft_engine::Session::queue_imap_results`].
+//! Backends: `legacy` (the JSON snapshot, journal and blobs of `mailcraft-store`) and `sqlite` (`store.db` and
+//! the zstd pack files, storage stage S6; the session still holds the mailbox in memory until S7). Nothing
+//! here contacts a server: synchronised mail goes through [`mailcraft_engine::Session::queue_imap_results`].
+//!
+//! The `*_journal_bytes` rows are the bytes a command adds to the legacy journal; on SQLite, the bytes it adds
+//! to the write-ahead log (emptied just before), i.e. the database pages it wrote.
 //!
 //! Timings are wall-clock milliseconds; memory figures are kilobytes from `/proc/self/status` (Linux only,
 //! `null` elsewhere). Measuring in a fresh process ([`measure`], which `mailcraft-bench run` starts for
@@ -32,6 +35,8 @@ pub type Result<T> = std::result::Result<T, String>;
 pub const SCHEMA: u64 = 1;
 /// Rows in one message-list window (the visible part of a tall list).
 pub const WINDOW_ROWS: usize = 50;
+/// Sources stored per batch while a profile is generated (by default; [`Options::generate_batch`]).
+pub const GENERATE_BATCH: usize = 1_000;
 /// Messages per synchronised batch (the IMAP worker's `max_new_per_sync`).
 pub const SYNC_BATCH: usize = 500;
 /// Display name of the IMAP account the sync measurements fill (it has no server).
@@ -70,7 +75,7 @@ pub const QUERIES: [&str; 20] = [
 pub enum Backend {
     /// `mailbox.json` + `journal.jsonl` + `blobs/` (mailcraft-store today).
     Legacy,
-    /// The SQLite store of the storage ADR (stage S6; not built yet).
+    /// `store.db` + `packs/` (storage stage S6).
     Sqlite,
 }
 
@@ -90,10 +95,11 @@ impl Backend {
         }
     }
 
-    fn check(self) -> Result<()> {
+    /// The storage a new profile of this backend gets.
+    pub fn kind(self) -> mailcraft_store::StoreKind {
         match self {
-            Backend::Legacy => Ok(()),
-            Backend::Sqlite => Err("the sqlite backend does not exist yet (storage stage S6)".into()),
+            Backend::Legacy => mailcraft_store::StoreKind::Legacy,
+            Backend::Sqlite => mailcraft_store::StoreKind::Sqlite,
         }
     }
 }
@@ -113,6 +119,10 @@ pub struct Options {
     pub bulk_move: usize,
     /// List windows fetched at random offsets.
     pub windows: usize,
+    /// Sources stored per batch while the profile is generated: on SQLite one pack fsync and one transaction
+    /// per batch. Only the benchmark batches: the app's import, sync and compose store each source with its
+    /// own fsync and commit, which `1` reproduces (the legacy store writes every file durably either way).
+    pub generate_batch: usize,
 }
 
 impl Options {
@@ -125,6 +135,7 @@ impl Options {
             sync_messages: 10_000,
             bulk_move: 10_000,
             windows: 50,
+            generate_batch: GENERATE_BATCH,
         }
     }
 
@@ -283,13 +294,25 @@ fn item_of(m: &synth::SynthMessage, folder: FolderId, now: DateTime) -> MailItem
 
 /// Writes a fresh profile of `opts` into `dir` (emptied first) and describes what it holds.
 pub fn generate(dir: &Path, opts: &Options) -> Result<Value> {
-    opts.backend.check()?;
     if dir.exists() {
         std::fs::remove_dir_all(dir).map_err(|e| format!("cannot empty {}: {e}", dir.display()))?;
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let started = Instant::now();
-    let mut store = mailcraft_store::Store::open(dir).map_err(|e| format!("cannot open the profile: {e}"))?;
+    let mut store = mailcraft_store::Store::open_with(dir, opts.backend.kind())
+        .map_err(|e| format!("cannot open the profile: {e}"))?;
+    if store.kind() != opts.backend.kind() {
+        return Err(format!("{} is not a new {} profile", dir.display(), opts.backend.name()));
+    }
+    let mut bodies = store.body_store();
+    // Sources go in batches of `generate_batch` (on SQLite one fsync and one transaction per batch). The app
+    // does not batch yet (import and sync store one source per fsync and commit): `generate_batch = 1` writes
+    // the profile that way, for a like-for-like comparison with legacy, which writes each file durably.
+    let batched = opts.generate_batch > 1;
+    if batched {
+        bodies.begin_batch();
+    }
+    let mut in_batch = 0usize;
     let (mut mb, ids) = skeleton()?;
     let now = opts.now();
     let mut counts = vec![0usize; FOLDERS.len()];
@@ -302,7 +325,13 @@ pub fn generate(dir: &Path, opts: &Options) -> Result<Value> {
         let Some(m) = messages.next() else { break };
         gen_time += t.elapsed();
         let folder = *ids.get(m.folder).ok_or("message in an unknown folder")?;
-        let key = store.put_blob(&m.raw).map_err(|e| format!("cannot store a message: {e}"))?;
+        let key = bodies.put_source(&m.raw).map_err(|e| format!("cannot store a message: {e}"))?;
+        in_batch += 1;
+        if batched && in_batch >= opts.generate_batch {
+            bodies.finish_batch().map_err(|e| format!("cannot store messages: {e}"))?;
+            bodies.begin_batch();
+            in_batch = 0;
+        }
         let mut item = item_of(&m, folder, now);
         item.blob = Some(key);
         mb.add_mail(item);
@@ -317,6 +346,8 @@ pub fn generate(dir: &Path, opts: &Options) -> Result<Value> {
             BodyKind::Attachment => attach += 1,
         }
     }
+    bodies.finish_batch().map_err(|e| format!("cannot store messages: {e}"))?;
+    drop(bodies);
     let approx = mb.approx_bytes();
     let t = Instant::now();
     store.checkpoint(&mb).map_err(|e| format!("cannot write the profile: {e}"))?;
@@ -328,6 +359,7 @@ pub fn generate(dir: &Path, opts: &Options) -> Result<Value> {
         "generator_ms": ms(gen_time),
         "snapshot_ms": ms(snapshot),
         "messages": opts.messages,
+        "batch": opts.generate_batch.max(1),
         "source_bytes": source_bytes,
         "avg_source_bytes": source_bytes / n as u64,
         "unread": unread,
@@ -400,10 +432,13 @@ fn local_folder(s: &Session, name: &str) -> Option<FolderId> {
 
 /// Opens the profile in `dir` and runs every measurement; the profile is changed (commands, synced mail).
 pub fn measure(dir: &Path, opts: &Options) -> Result<Value> {
-    opts.backend.check()?;
     let before_open = memory_json();
     let t = Instant::now();
-    let mut s = Session::open(dir).map_err(|e| format!("cannot open the profile: {e}"))?;
+    let mut s =
+        Session::open_with(dir, opts.backend.kind()).map_err(|e| format!("cannot open the profile: {e}"))?;
+    if s.store.as_ref().map(mailcraft_store::Store::kind) != Some(opts.backend.kind()) {
+        return Err(format!("{} is not a {} profile", dir.display(), opts.backend.name()));
+    }
     let open = t.elapsed();
     s.fixed_now = Some(opts.now());
     s.view.work_offline = true;
@@ -733,7 +768,7 @@ fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
 /// journal bytes each one wrote.
 fn config_commands(s: &mut Session, out: &mut serde_json::Map<String, Value>) -> Result<()> {
     let mut timed = |s: &mut Session, key: &str, id: &str, params: Value| -> Result<()> {
-        let before = journal_now(s);
+        let before = journal_mark(s);
         let (d, _) = run_cmd(s, id, params)?;
         out.insert(format!("{key}_ms"), json!(ms(d)));
         out.insert(format!("{key}_journal_bytes"), json!(journal_now(s).saturating_sub(before)));
@@ -744,9 +779,20 @@ fn config_commands(s: &mut Session, out: &mut serde_json::Map<String, Value>) ->
     Ok(())
 }
 
-/// The journal's size now (0 without a store).
+/// The journal's size now (0 without a store); on SQLite, of the write-ahead log.
 fn journal_now(s: &Session) -> u64 {
     s.store.as_ref().map_or(0, mailcraft_store::Store::journal_bytes)
+}
+
+/// Where to measure a command's journal bytes from: the journal's size now, or on SQLite an emptied
+/// write-ahead log (its size afterwards is what the command wrote).
+fn journal_mark(s: &Session) -> u64 {
+    if let Some(db) = s.store.as_ref().and_then(mailcraft_store::Store::db)
+        && db.checkpoint_wal().is_ok()
+    {
+        return db.wal_bytes();
+    }
+    journal_now(s)
 }
 
 /// Commands on synchronised mail (the sync account's INBOX that [`sync_apply`] filled): each one also queues
@@ -769,7 +815,7 @@ fn imap_commands(s: &mut Session, out: &mut serde_json::Map<String, Value>) -> R
     };
     run_cmd(s, "nav.selectFolder", json!({"folder": inbox.0}))?;
     let mut timed = |s: &mut Session, key: &str, id: &str, params: Value| -> Result<()> {
-        let before = journal_now(s);
+        let before = journal_mark(s);
         let (d, _) = run_cmd(s, id, params)?;
         out.insert(format!("{key}_ms"), json!(ms(d)));
         out.insert(format!("{key}_journal_bytes"), json!(journal_now(s).saturating_sub(before)));

@@ -74,9 +74,15 @@ impl HeadlessBackend {
         Self::new(mailcraft_engine::sample::sample_session(), "sample mailbox (in memory)")
     }
 
-    /// A profile folder (created when missing); changes are journaled to it.
+    /// A profile folder (created when missing); changes are journaled to it. A new profile gets the storage
+    /// `MAILCRAFT_STORE` names.
     pub fn open(dir: &Path) -> Result<Self, String> {
-        let session = Session::open(dir).map_err(|e| e.to_string())?;
+        Self::open_with(dir, mailcraft_engine::StoreKind::from_env())
+    }
+
+    /// [`HeadlessBackend::open`], a new profile getting `kind` storage.
+    pub fn open_with(dir: &Path, kind: mailcraft_engine::StoreKind) -> Result<Self, String> {
+        let session = Session::open_with(dir, kind).map_err(|e| e.to_string())?;
         Ok(Self::new(session, format!("profile {}", dir.display())))
     }
 

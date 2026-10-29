@@ -106,6 +106,14 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 getrandom = "0.2.17"
 zeroize = "1.8"
 
+# Native profile storage (storage ADR, stage S6; owner-approved C dependencies): SQLite through rusqlite with the
+# bundled amalgamation (rusqlite and libsqlite3-sys MIT, SQLite public domain), and zstd for the pack files (zstd,
+# zstd-safe and zstd-sys BSD-3-Clause, libzstd BSD-3-Clause chosen of its BSD/GPLv2 dual licence). Native
+# builds only: the browser build keeps its in-memory store.
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "cache"] }
+zstd = { version = "0.14.3", default-features = false }
+crc32fast = "1.5.2"
+
 # file formats: Compound File Binary container ([MS-CFB]) for .msg (MIT)
 cfb = "0.14"
 roxmltree = "0.20"

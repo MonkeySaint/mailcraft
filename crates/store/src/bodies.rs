@@ -6,9 +6,10 @@
 //!   local draft, a message made here) or one whose body differs from its source (changed here). A body
 //!   record wins over the source.
 //!
-//! Backends: **on disk** (a profile: the same content-addressed `blobs/<aa>/<key>.eml` files the store has
-//! always written, plus `blobs/<aa>/<key>.body` for body records) and **in memory** (sessions without a
-//! profile: the sample mailbox, tests and the browser build). Keys use the [`BlobKey`] grammar over the bytes
+//! Backends: **on disk** (a legacy profile: the same content-addressed `blobs/<aa>/<key>.eml` files the store
+//! has always written, plus `blobs/<aa>/<key>.body` for body records), **packs** (a SQLite profile, storage
+//! stage S6: zstd records in `packs/NNNNNN.pack`, indexed in `store.db`, [`crate::packs`]) and **in memory**
+//! (sessions without a profile: the sample mailbox, tests and the browser build). Keys use the [`BlobKey`] grammar over the bytes
 //! stored (the source, or the body record's JSON), so equal content shares one entry and a changed body gets
 //! a new key: nothing is ever rewritten in place, and undo can put an old key back.
 //!
@@ -80,6 +81,9 @@ struct Memory {
 enum Backend {
     Memory(Memory),
     Disk(PathBuf),
+    /// The zstd pack files of a SQLite profile (storage stage S6).
+    #[cfg(not(target_arch = "wasm32"))]
+    Packs(crate::packs::Packs),
 }
 
 /// Least-recently-used cache of decoded bodies, capped in bytes.
@@ -342,11 +346,60 @@ impl BodyStore {
         }
     }
 
+    /// A store over the pack files of the SQLite profile `db` belongs to.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn packs(db: crate::sql::Db) -> BodyStore {
+        BodyStore {
+            backend: Backend::Packs(crate::packs::Packs::new(db)),
+            cache: Mutex::new(Cache::new(DEFAULT_CACHE_BYTES)),
+        }
+    }
+
     /// The profile folder of an on-disk store.
     pub fn dir(&self) -> Option<&Path> {
         match &self.backend {
             Backend::Disk(d) => Some(d),
             Backend::Memory(_) => None,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => Some(p.db().dir()),
+        }
+    }
+
+    /// Whether this store keeps its content in pack files.
+    pub fn is_packs(&self) -> bool {
+        match &self.backend {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Starts a write batch on a pack store: content written from now on (by any handle on the same
+    /// profile) is made durable and indexed together by [`BodyStore::finish_batch`], one fsync for all of
+    /// it, instead of one per entry. Nothing to do for the other backends.
+    pub fn begin_batch(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Backend::Packs(p) = &self.backend {
+            p.begin_batch();
+        }
+    }
+
+    /// Makes the content of an open batch durable (see [`BodyStore::begin_batch`]); returns how many
+    /// entries it held. Content must not be referred to by stored items before this returns.
+    pub fn finish_batch(&self) -> Result<usize> {
+        match &self.backend {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => p.finish_batch(),
+            _ => Ok(0),
+        }
+    }
+
+    /// Counters of a pack store (`None` for the other backends).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn pack_stats(&self) -> Option<Result<crate::packs::PackStats>> {
+        match &self.backend {
+            Backend::Packs(p) => Some(p.stats()),
+            _ => None,
         }
     }
 
@@ -380,6 +433,8 @@ impl BodyStore {
         match &mut self.backend {
             Backend::Disk(dir) => disk_put(dir, raw, SOURCE_EXT, MAX_BLOB_BYTES),
             Backend::Memory(m) => mem_put(&mut m.sources, raw, |e: &[u8]| e == raw, || Arc::from(raw)),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => p.put(crate::packs::Kind::Source, raw),
         }
     }
 
@@ -391,6 +446,8 @@ impl BodyStore {
             Backend::Memory(m) => {
                 mem_put(&mut m.bodies, &bytes, |e: &Body| e == body, || Arc::new(body.clone()))?
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => p.put(crate::packs::Kind::Body, &bytes)?,
         };
         self.cache().put(&body_cache_key(&key), &Arc::new(body.clone()));
         Ok(key)
@@ -438,6 +495,8 @@ impl BodyStore {
             Backend::Memory(m) => {
                 m.sources.get(key).map(|s| s.to_vec()).ok_or_else(|| not_found("source", key))
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => p.get(crate::packs::Kind::Source, key),
         }
     }
 
@@ -448,6 +507,8 @@ impl BodyStore {
             Backend::Memory(m) => {
                 Ok(m.sources.get(key).map(|s| s.get(..s.len().min(cap)).unwrap_or_default().to_vec()))
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => p.head(crate::packs::Kind::Source, key, cap),
         }
     }
 
@@ -465,6 +526,13 @@ impl BodyStore {
                     .map_err(|e| StoreError::Corrupt(format!("message body {}: {e}", short(key))))?;
                 Arc::new(body)
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => {
+                let bytes = p.get(crate::packs::Kind::Body, key)?;
+                let body: Body = serde_json::from_slice(&bytes)
+                    .map_err(|e| StoreError::Corrupt(format!("message body {}: {e}", short(key))))?;
+                Arc::new(body)
+            }
         };
         self.cache().put(&ck, &body);
         Ok(body)
@@ -477,6 +545,8 @@ impl BodyStore {
                 BlobKey::parse(key).is_some_and(|k| content_path(dir, &k, SOURCE_EXT).is_file())
             }
             Backend::Memory(m) => m.sources.contains_key(key),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => p.has(crate::packs::Kind::Source, key),
         }
     }
 
@@ -487,6 +557,8 @@ impl BodyStore {
                 BlobKey::parse(key).is_some_and(|k| content_path(dir, &k, BODY_EXT).is_file())
             }
             Backend::Memory(m) => m.bodies.contains_key(key),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => p.has(crate::packs::Kind::Body, key),
         }
     }
 
@@ -542,6 +614,8 @@ impl BodyStore {
                 before.saturating_sub(m.sources.len().saturating_add(m.bodies.len()))
             }
             Backend::Disk(dir) => disk_collect(dir, live)?,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Packs(p) => p.collect(live, None)?,
         };
         if removed > 0 {
             self.clear_cache();
@@ -552,6 +626,16 @@ impl BodyStore {
     /// Deletes the content under `keys` that is not in `live` (content another item shares stays). Returns
     /// how many entries went.
     pub fn remove_unreferenced(&mut self, keys: &BTreeSet<String>, live: &BTreeSet<String>) -> Result<usize> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Backend::Packs(p) = &self.backend {
+            let removed = p.collect(live, Some(keys))?;
+            let mut c = self.cache();
+            for key in keys.iter().filter(|k| !live.contains(*k)) {
+                c.remove(&source_cache_key(key));
+                c.remove(&body_cache_key(key));
+            }
+            return Ok(removed);
+        }
         let mut removed = 0usize;
         for key in keys.iter().filter(|k| !live.contains(*k)) {
             match &mut self.backend {
@@ -560,6 +644,8 @@ impl BodyStore {
                         .saturating_add(usize::from(m.sources.remove(key).is_some()))
                         .saturating_add(usize::from(m.bodies.remove(key).is_some()));
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                Backend::Packs(_) => {}
                 Backend::Disk(dir) => {
                     let Some(parsed) = BlobKey::parse(key) else { continue };
                     for ext in [SOURCE_EXT, BODY_EXT] {
@@ -582,7 +668,7 @@ impl BodyStore {
     pub fn memory_entries(&self) -> usize {
         match &self.backend {
             Backend::Memory(m) => m.sources.len().saturating_add(m.bodies.len()),
-            Backend::Disk(_) => 0,
+            _ => 0,
         }
     }
 
@@ -613,7 +699,7 @@ impl BodyStore {
                     Backend::Memory(m) => {
                         m.sources.insert(key, Arc::from(raw));
                     }
-                    Backend::Disk(_) => {
+                    _ => {
                         self.put_source(&raw)?;
                     }
                 }
@@ -627,7 +713,7 @@ impl BodyStore {
                     Backend::Memory(m) => {
                         m.bodies.insert(key, Arc::new(body));
                     }
-                    Backend::Disk(_) => {
+                    _ => {
                         self.put_body(&body)?;
                     }
                 }

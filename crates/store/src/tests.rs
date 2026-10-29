@@ -430,7 +430,7 @@ fn snapshot_format_two_is_written_and_one_still_read() {
     assert!(snap.starts_with(b"{\"mailcraft_snapshot\":2,"));
     assert_eq!(crate::journal::parse_generation_prefix(&snap), Some(1));
     let mb_text = serde_json::to_string(&base_mailbox()).unwrap();
-    for (format, ok) in [(1, true), (2, true), (3, false), (0, false)] {
+    for (format, ok) in [(1, true), (2, true), (4, false), (0, false)] {
         fs::write(
             d.path().join(SNAPSHOT_FILE),
             format!("{{\"mailcraft_snapshot\":{format},\"generation\":6,\"mailbox\":{mb_text}}}"),
@@ -443,6 +443,15 @@ fn snapshot_format_two_is_written_and_one_still_read() {
         }
         assert_eq!(store.load().is_ok(), ok, "format {format}");
     }
+    // Format 3 marks a SQLite profile: without its store.db the profile does not open at all (it is never
+    // taken for an empty legacy profile).
+    fs::write(
+        d.path().join(SNAPSHOT_FILE),
+        format!("{{\"mailcraft_snapshot\":3,\"generation\":0,\"store\":\"sqlite\",\"mailbox\":{mb_text}}}"),
+    )
+    .unwrap();
+    let err = Store::open(d.path()).unwrap_err();
+    assert!(err.to_string().contains("store.db"), "{err}");
 }
 
 #[test]

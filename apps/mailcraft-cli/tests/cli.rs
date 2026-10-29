@@ -117,6 +117,32 @@ fn import_show_export_on_a_profile() {
     assert_eq!(bad.status.code(), Some(1));
 }
 
+/// Storage stage S6: `--store sqlite` makes a new profile a SQLite one, and later runs keep it.
+#[test]
+fn import_show_export_on_a_sqlite_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("profile");
+    let eml = dir.path().join("one.eml");
+    std::fs::write(&eml, EML).unwrap();
+    let profile_s = profile.to_str().unwrap();
+    let msg = ok(&["import-eml", "--profile", profile_s, "--store", "sqlite", eml.to_str().unwrap()]);
+    assert!(msg.starts_with("Imported 1 message(s) into "), "{msg}");
+    assert!(profile.join("store.db").is_file());
+    assert!(!profile.join("journal.jsonl").exists());
+    let text = ok(&["show", "--profile", profile_s]);
+    assert!(text.contains("Imported from the CLI test"), "{text}");
+    let mbox = dir.path().join("out.mbox");
+    let inbox = text.split(':').next().unwrap().to_owned();
+    let msg = ok(&["export-mbox", "--profile", profile_s, "--folder", &inbox, mbox.to_str().unwrap()]);
+    assert!(msg.starts_with("Exported 1 message(s)"), "{msg}");
+    let data = std::fs::read(&mbox).unwrap();
+    let source = EML.replace("\r\n", "\n");
+    let body_line = source.lines().last().unwrap();
+    assert!(String::from_utf8_lossy(&data).contains(body_line), "the source comes back from the pack");
+    let bad = cli(&["show", "--profile", profile_s, "--store", "nosuch"]);
+    assert_eq!(bad.status.code(), Some(2));
+}
+
 #[test]
 fn mcp_over_stdio() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_mailcraft-cli"))

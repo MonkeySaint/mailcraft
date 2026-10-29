@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use mailcraft_engine::StoreKind;
 use serde_json::{Value, json};
 
 pub const USAGE: &str = "\
@@ -29,6 +30,8 @@ Commands:
 Options:
   --sample         Use the built-in sample mailbox (in memory; nothing is saved). Default for run/show/mcp.
   --profile DIR    Use (or create) the MailCraft data folder DIR; changes are saved there.
+  --store KIND     Storage of a new --profile folder: legacy (default) or sqlite. An existing profile keeps
+                   its own. MAILCRAFT_STORE=sqlite does the same.
   -h, --help       Show this help.
   -V, --version    Show the version.
 ";
@@ -37,7 +40,8 @@ Options:
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
     Sample,
-    Profile(PathBuf),
+    /// A profile folder, and the storage a new one gets (`--store`; `None`: `MAILCRAFT_STORE`).
+    Profile(PathBuf, Option<StoreKind>),
 }
 
 /// What `--query` reads after `run`.
@@ -165,6 +169,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut json_out = false;
     let mut filter = None;
     let mut source: Option<Source> = None;
+    let mut store: Option<StoreKind> = None;
     let mut connect: Option<String> = None;
     let mut cmds = Vec::new();
     let mut queries = Vec::new();
@@ -176,10 +181,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         let allowed: &[&str] = match sub {
             "commands" => &["--json", "--filter"],
             "parity" => &["--json"],
-            "run" => &["--sample", "--profile", "--cmd", "--query"],
-            "show" => &["--sample", "--profile", "--folder", "--limit"],
-            "import-eml" | "import-mbox" | "export-mbox" => &["--sample", "--profile", "--folder"],
-            "mcp" => &["--sample", "--profile", "--connect"],
+            "run" => &["--sample", "--profile", "--store", "--cmd", "--query"],
+            "show" => &["--sample", "--profile", "--store", "--folder", "--limit"],
+            "import-eml" | "import-mbox" | "export-mbox" => &["--sample", "--profile", "--store", "--folder"],
+            "mcp" => &["--sample", "--profile", "--store", "--connect"],
             other => return Err(format!("unknown command `{other}` (try --help)")),
         };
         if matches!(flag, "-h" | "--help") {
@@ -198,7 +203,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 if dir.trim().is_empty() {
                     return Err("`--profile` needs a folder".into());
                 }
-                set_source(Source::Profile(PathBuf::from(dir)), &mut source)?;
+                set_source(Source::Profile(PathBuf::from(dir), None), &mut source)?;
+            }
+            "--store" => {
+                let v = a.value(flag, inline)?;
+                store = Some(
+                    StoreKind::parse(&v)
+                        .ok_or_else(|| format!("`--store` is legacy or sqlite, not `{v}`"))?,
+                );
             }
             "--connect" => connect = Some(a.value(flag, inline)?),
             "--cmd" => cmds.push(parse_cmd(&a.value(flag, inline)?)?),
@@ -209,6 +221,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 limit = v.parse().map_err(|_| format!("`--limit` must be a number, not `{v}`"))?;
             }
             _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    if let Some(kind) = store {
+        match source.as_mut() {
+            Some(Source::Profile(_, k)) => *k = Some(kind),
+            _ => return Err("`--store` needs --profile DIR".into()),
         }
     }
     let no_positional = |positional: &[PathBuf]| match positional.first() {
@@ -309,7 +327,7 @@ mod tests {
         assert_eq!(
             cli,
             Ok(Cli::Run {
-                source: Source::Profile("/tmp/x".into()),
+                source: Source::Profile("/tmp/x".into(), None),
                 cmds: vec![("nav.selectAll".into(), json!({})), ("mail.flag".into(), json!({"ids": [1]}))],
                 queries: vec![Query::Status],
             })
@@ -349,5 +367,27 @@ mod tests {
         assert!(p(&["frobnicate"]).unwrap_err().contains("unknown command"));
         assert!(p(&["show", "--limit", "many"]).is_err());
         assert!(p(&["show", "extra"]).unwrap_err().contains("unexpected"));
+    }
+
+    #[test]
+    fn store_kind_for_a_new_profile() {
+        assert_eq!(
+            p(&["show", "--store", "sqlite", "--profile", "d"]),
+            Ok(Cli::Show {
+                source: Source::Profile("d".into(), Some(StoreKind::Sqlite)),
+                folder: None,
+                limit: 200
+            })
+        );
+        assert_eq!(
+            p(&["mcp", "--profile=d", "--store=legacy"]),
+            Ok(Cli::Mcp {
+                target: McpTarget::Headless(Source::Profile("d".into(), Some(StoreKind::Legacy)))
+            })
+        );
+        assert!(p(&["show", "--store", "sqlite"]).unwrap_err().contains("--profile"));
+        assert!(p(&["show", "--sample", "--store", "sqlite"]).unwrap_err().contains("--profile"));
+        assert!(p(&["show", "--profile", "d", "--store", "lmdb"]).unwrap_err().contains("legacy or sqlite"));
+        assert!(p(&["commands", "--store", "sqlite"]).unwrap_err().contains("does not take"));
     }
 }

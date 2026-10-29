@@ -1,6 +1,16 @@
 //! Local mailbox storage (layer L2).
 //!
-//! On-disk layout under the profile directory:
+//! A profile uses one of two storages ([`StoreKind`]); an existing profile always opens in the one it has, a
+//! new one gets the legacy storage unless asked for SQLite (`--store sqlite` or `MAILCRAFT_STORE=sqlite`; the
+//! default until storage stage S9 migrates profiles).
+//!
+//! **SQLite** (storage stage S6, native builds, [`sql`]): `store.db` (WAL, `synchronous=FULL`) holds the
+//! mailbox as rows, each [`Store::append`] one transaction; message sources and body records are zstd
+//! records in the append-only `packs/NNNNNN.pack` files ([`packs`]), de-duplicated by SHA-256 and indexed in
+//! the database. `mailbox.json` is a marker older versions refuse to open. `recoverable.json` and `lock` are
+//! as below. [`SqlRepo`] is the [`MailRepo`] over the mail table; [`MemRepo`] the in-memory one.
+//!
+//! **Legacy** on-disk layout under the profile directory:
 //! - `mailbox.json`: full [`mailcraft_model::Mailbox`] snapshot without message bodies or sources (written
 //!   atomically: temp file + fsync + rename). Wrapped as
 //!   `{"mailcraft_snapshot":2,"generation":N,"bodies":2,"mailbox":{...}}` (format 1, written before storage
@@ -27,7 +37,8 @@
 //! [`Store::checkpoint_mut`], [`Store::load_report`], [`Store::raw_of`], [`Store::gc_blobs`], [`Op::apply`],
 //! [`Store::journal_bytes`], [`Store::keep_alive`], [`Store::append_keyed`], [`MailRepo`] (storage stage S2),
 //! [`Op::PutSync`], [`Op::PutConfig`] and [`SmallState`] (storage stage S4), [`BodyStore`] and [`Content`]
-//! (storage stage S5: bodies and sources out of memory).
+//! (storage stage S5: bodies and sources out of memory), [`StoreKind`], [`Store::open_with`],
+//! [`Store::body_store`], [`SqlRepo`], [`SqlStore`], [`MemRepo`] and the pack files (storage stage S6).
 //!
 //! Size caps (issue #25): every file is written under the same cap its reader applies, so a profile can never
 //! hold a snapshot, journal or recoverable-items file it would refuse to open. A write past the cap fails with
@@ -42,7 +53,12 @@ pub mod journal;
 pub mod legacy;
 pub mod lock;
 pub mod mbox;
+pub mod mem;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod packs;
 pub mod repo;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sql;
 mod time;
 
 #[cfg(test)]
@@ -65,7 +81,10 @@ pub use config::SmallState;
 pub use import::MaildirFlags;
 pub use journal::Repair;
 pub use mailcraft_model::{ChangeToken, MailChanges};
+pub use mem::MemRepo;
 pub use repo::{MailRepo, Shared};
+#[cfg(not(target_arch = "wasm32"))]
+pub use sql::{Db, SqlRepo, SqlStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -83,6 +102,9 @@ pub enum StoreError {
     /// replaced as a whole).
     #[error("the change record is not open")]
     NoChangeRecord,
+    /// The SQLite database refused an operation (storage stage S6).
+    #[error("database: {0}")]
+    Db(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -173,40 +195,209 @@ pub struct LoadReport {
     pub migrated_bodies: usize,
 }
 
+/// Which storage a profile uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum StoreKind {
+    /// `mailbox.json` + `journal.jsonl` + `blobs/` (the default until storage stage S9).
+    #[default]
+    Legacy,
+    /// `store.db` + `packs/` (storage stage S6; native builds only).
+    Sqlite,
+}
+
+impl StoreKind {
+    /// Environment variable choosing the storage of new profiles (`legacy` or `sqlite`).
+    pub const ENV: &'static str = "MAILCRAFT_STORE";
+
+    /// `legacy` or `sqlite` (ASCII case ignored).
+    pub fn parse(s: &str) -> Option<StoreKind> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Some(StoreKind::Legacy),
+            "sqlite" => Some(StoreKind::Sqlite),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            StoreKind::Legacy => "legacy",
+            StoreKind::Sqlite => "sqlite",
+        }
+    }
+
+    /// The kind [`StoreKind::ENV`] asks for: legacy when it is unset, empty or not understood (with a
+    /// warning).
+    pub fn from_env() -> StoreKind {
+        let Some(v) = std::env::var_os(StoreKind::ENV) else { return StoreKind::Legacy };
+        let v = v.to_string_lossy();
+        if v.trim().is_empty() {
+            return StoreKind::Legacy;
+        }
+        StoreKind::parse(&v).unwrap_or_else(|| {
+            log::warn!("{}={v:?} is not `legacy` or `sqlite`; using legacy storage", StoreKind::ENV);
+            StoreKind::Legacy
+        })
+    }
+
+    /// The storage of the existing profile in `dir`: `Ok(None)` for a folder holding no profile yet. A
+    /// SQLite profile whose `store.db` is missing is an error (its `mailbox.json` is only a marker).
+    pub fn of_profile(dir: &Path) -> Result<Option<StoreKind>> {
+        let marker = journal::is_sqlite_marker(dir)?;
+        if dir.join(SQL_DB_FILE).is_file() {
+            if !marker && let Some(legacy) = legacy_part(dir) {
+                // Legacy mail next to a database: opening either one would hide the other's mail (and a new
+                // SQLite marker would make that permanent).
+                return Err(StoreError::Corrupt(format!(
+                    "{} holds both a legacy {legacy} and a {SQL_DB_FILE}; move one of them away",
+                    dir.display()
+                )));
+            }
+            return Ok(Some(StoreKind::Sqlite));
+        }
+        if marker {
+            return Err(StoreError::Corrupt(format!(
+                "{} keeps its mail in {SQL_DB_FILE}, which is missing",
+                dir.display()
+            )));
+        }
+        let legacy = [journal::SNAPSHOT_FILE, journal::JOURNAL_FILE].iter().any(|f| dir.join(f).exists());
+        Ok(legacy.then_some(StoreKind::Legacy))
+    }
+}
+
+/// The first part of a legacy profile in `dir`, if any: its snapshot, its journal, or a `blobs/` folder that
+/// holds something (a SQLite profile has none of them, apart from its marker snapshot).
+fn legacy_part(dir: &Path) -> Option<&'static str> {
+    if dir.join(journal::SNAPSHOT_FILE).exists() {
+        return Some(journal::SNAPSHOT_FILE);
+    }
+    if dir.join(journal::JOURNAL_FILE).exists() {
+        return Some(journal::JOURNAL_FILE);
+    }
+    let blobs = dir.join(blob::BLOBS_DIR);
+    match fs::read_dir(&blobs) {
+        Ok(mut rd) => rd.next().map(|_| "blobs folder"),
+        // There, but unreadable: count it as mail rather than guess.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some("blobs folder"),
+        Err(_) => None,
+    }
+}
+
+/// The database file of a SQLite profile.
+pub const SQL_DB_FILE: &str = "store.db";
+
+/// The snapshot and journal of a legacy profile.
 #[derive(Debug)]
-pub struct Store {
-    pub dir: PathBuf,
-    lock: lock::LockGuard,
+struct LegacyFiles {
     journal: File,
     generation: u64,
     /// The snapshot for `generation` was written but the journal still belongs to an older one.
     journal_stale: bool,
+}
+
+#[derive(Debug)]
+enum Backend {
+    Legacy(LegacyFiles),
+    #[cfg(not(target_arch = "wasm32"))]
+    Sql(Box<sql::SqlStore>),
+}
+
+#[derive(Debug)]
+pub struct Store {
+    pub dir: PathBuf,
+    lock: lock::LockGuard,
+    backend: Backend,
     repair: Repair,
-    /// Largest journal [`Store::append`] will produce (what `open` / `load` read back).
+    /// Largest journal [`Store::append`] will produce (what `open` / `load` read back); for a SQLite
+    /// profile, the most one append writes (no limit unless lowered).
     journal_cap: u64,
-    /// Largest snapshot [`Store::checkpoint`] will write (what `open` / `load` read back).
+    /// Largest snapshot [`Store::checkpoint`] will write (what `open` / `load` read back); for a SQLite
+    /// profile, the most one checkpoint writes (no limit unless lowered).
     snapshot_cap: u64,
 }
 
 impl Store {
-    /// Opens (creating if missing) a store at `dir`, taking the lock.
+    /// Opens (creating if missing) a store at `dir`, taking the lock. An existing profile opens in the
+    /// storage it has; a new one gets legacy storage.
     pub fn open(dir: &Path) -> Result<Store> {
+        Store::open_with(dir, StoreKind::Legacy)
+    }
+
+    /// Opens (creating if missing) a store at `dir`, taking the lock. An existing profile opens in the
+    /// storage it has ([`Store::kind`] tells which); a new one gets `new_kind`. A new SQLite profile also
+    /// gets a marker `mailbox.json` that older MailCraft versions refuse to open, instead of starting an
+    /// empty profile next to the database.
+    pub fn open_with(dir: &Path, new_kind: StoreKind) -> Result<Store> {
         fs::create_dir_all(dir)?;
         let lock = lock::LockGuard::acquire(dir)?;
-        fs::create_dir_all(dir.join(blob::BLOBS_DIR))?;
         remove_temp_files(dir);
-        let snapshot_gen = journal::peek_snapshot_generation(dir)?;
-        let (journal, generation, repair) = journal::prepare_journal(dir, snapshot_gen)?;
-        Ok(Store {
-            dir: dir.to_path_buf(),
-            lock,
-            journal,
-            generation: generation.max(snapshot_gen),
-            journal_stale: false,
-            repair,
-            journal_cap: journal::MAX_STATE_BYTES,
-            snapshot_cap: journal::MAX_STATE_BYTES,
-        })
+        let kind = StoreKind::of_profile(dir)?.unwrap_or(new_kind);
+        match kind {
+            StoreKind::Legacy => {
+                fs::create_dir_all(dir.join(blob::BLOBS_DIR))?;
+                let snapshot_gen = journal::peek_snapshot_generation(dir)?;
+                let (journal, generation, repair) = journal::prepare_journal(dir, snapshot_gen)?;
+                Ok(Store {
+                    dir: dir.to_path_buf(),
+                    lock,
+                    backend: Backend::Legacy(LegacyFiles {
+                        journal,
+                        generation: generation.max(snapshot_gen),
+                        journal_stale: false,
+                    }),
+                    repair,
+                    journal_cap: journal::MAX_STATE_BYTES,
+                    snapshot_cap: journal::MAX_STATE_BYTES,
+                })
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            StoreKind::Sqlite => {
+                let db = sql::Db::open(dir)?;
+                if !dir.join(journal::SNAPSHOT_FILE).exists() {
+                    journal::write_sqlite_marker(dir)?;
+                }
+                Ok(Store {
+                    dir: dir.to_path_buf(),
+                    lock,
+                    backend: Backend::Sql(Box::new(sql::SqlStore::new(db))),
+                    repair: Repair::default(),
+                    journal_cap: u64::MAX,
+                    snapshot_cap: u64::MAX,
+                })
+            }
+            #[cfg(target_arch = "wasm32")]
+            StoreKind::Sqlite => {
+                Err(StoreError::Db("SQLite storage is not available in the browser build".into()))
+            }
+        }
+    }
+
+    /// The storage this profile uses.
+    pub fn kind(&self) -> StoreKind {
+        match &self.backend {
+            Backend::Legacy(_) => StoreKind::Legacy,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(_) => StoreKind::Sqlite,
+        }
+    }
+
+    /// The database of a SQLite profile (shared: a [`sql::SqlRepo`] or [`BodyStore::packs`] over it uses the
+    /// store's own connection).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn db(&self) -> Option<sql::Db> {
+        match &self.backend {
+            Backend::Sql(s) => Some(s.db().clone()),
+            Backend::Legacy(_) => None,
+        }
+    }
+
+    /// The body store of this profile: the `blobs/` files of a legacy profile, the pack files of a SQLite one.
+    pub fn body_store(&self) -> BodyStore {
+        match &self.backend {
+            Backend::Legacy(_) => BodyStore::on_disk(&self.dir),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(s) => BodyStore::packs(s.db().clone()),
+        }
     }
 
     /// Loads snapshot + replays the journal.
@@ -216,8 +407,19 @@ impl Store {
 
     /// [`Store::load`] plus what recovery did. Message content that a snapshot or journal written before
     /// storage stage S5 carries inline is moved to the profile's body store on the way (idempotent: the
-    /// content is keyed by its bytes), so the mailbox returned refers to it by key.
+    /// content is keyed by its bytes), so the mailbox returned refers to it by key. A SQLite profile reads its
+    /// database.
     pub fn load_report(&self) -> Result<(Mailbox, LoadReport)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Backend::Sql(s) = &self.backend {
+            let mb = s.load()?;
+            let report = LoadReport {
+                snapshot_generation: s.generation(),
+                open_repair: self.repair.clone(),
+                ..Default::default()
+            };
+            return Ok((mb, report));
+        }
         let snap = journal::read_snapshot_full(&self.dir)?;
         let snap_gen = snap.generation;
         let mut mb = snap.mailbox;
@@ -271,7 +473,7 @@ impl Store {
             }
         }
         if report.legacy_content {
-            let mut bodies = BodyStore::on_disk(&self.dir);
+            let mut bodies = self.body_store();
             report.migrated_bodies = legacy::apply(&mut mb, pending, &mut bodies)?;
             let dated = legacy::fill_expiry(&mut mb, &bodies);
             log::info!(
@@ -284,20 +486,32 @@ impl Store {
     }
 
     /// Appends ops to the journal (fsync'd). Items in the ops refer to their content by key: whoever made it
-    /// stored it in the body store first, so the journal never names content that is not on disk.
+    /// stored it in the body store first, so the journal never names content that is not on disk. A SQLite
+    /// profile writes them in one transaction.
     pub fn append(&mut self, ops: &[Op]) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
-        if self.journal_stale {
+        let cap = self.journal_cap;
+        let lf = match &mut self.backend {
+            Backend::Legacy(lf) => lf,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(s) => {
+                s.append(ops, cap)?;
+                self.lock.refresh_if_due();
+                return Ok(());
+            }
+        };
+        if lf.journal_stale {
             // A previous checkpoint wrote its snapshot but could not reset the journal.
-            self.reset_journal()?;
+            lf.journal = journal::reset_journal(&self.dir, lf.generation)?;
+            lf.journal_stale = false;
         }
-        let before = self.journal.metadata()?.len();
+        let before = lf.journal.metadata()?.len();
         // Open and load refuse a journal past the cap; writing it would make the whole store unopenable. The
         // batch is serialised through a writer capped at the room left, so a refused batch (a whole-mailbox
         // `Replace` can be as large as the cap) is never built in memory first.
-        let mut w = journal::CapWriter::new(Vec::new(), self.journal_cap.saturating_sub(before));
+        let mut w = journal::CapWriter::new(Vec::new(), cap.saturating_sub(before));
         for op in ops {
             let res = serde_json::to_writer(&mut w, op)
                 .map_err(std::io::Error::from)
@@ -306,18 +520,17 @@ impl Store {
                 Ok(()) => {}
                 Err(e) if journal::is_cap_error(&e) => {
                     return Err(StoreError::TooLarge(format!(
-                        "the journal would grow past the {} byte cap; checkpoint first",
-                        self.journal_cap
+                        "the journal would grow past the {cap} byte cap; checkpoint first"
                     )));
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         let buf = w.into_inner();
-        let written = self.journal.write_all(&buf).and_then(|()| self.journal.sync_data());
+        let written = lf.journal.write_all(&buf).and_then(|()| lf.journal.sync_data());
         if let Err(e) = written {
             // Cut off a partial batch so the next append does not glue its first op onto a torn line.
-            if let Err(e2) = self.journal.set_len(before) {
+            if let Err(e2) = lf.journal.set_len(before) {
                 log::warn!("could not roll back a failed journal append: {e2}");
             }
             return Err(e.into());
@@ -327,40 +540,56 @@ impl Store {
     }
 
     /// Writes a fresh snapshot of `mb` and truncates the journal. Items hold no content, so the mailbox is
-    /// written as it is (no copy).
+    /// written as it is (no copy). A SQLite profile writes the rows of `mb` that differ from the database and
+    /// folds its write-ahead log into the database file.
     pub fn checkpoint(&mut self, mb: &Mailbox) -> Result<()> {
-        let generation = self.generation.saturating_add(1);
+        let cap = self.snapshot_cap;
+        let lf = match &mut self.backend {
+            Backend::Legacy(lf) => lf,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(s) => {
+                s.write_all(mb, cap)?;
+                if let Err(e) = s.db().checkpoint_wal() {
+                    log::warn!("store.db: write-ahead log not folded in: {e}");
+                }
+                self.lock.refresh_if_due();
+                return Ok(());
+            }
+        };
+        let generation = lf.generation.saturating_add(1);
         // Past the cap the snapshot is refused (the old snapshot and the journal stay as they are): `load`
         // could not read it back.
-        journal::write_snapshot_capped(&self.dir, generation, mb, self.snapshot_cap)?;
+        journal::write_snapshot_capped(&self.dir, generation, mb, cap)?;
         // The snapshot now holds everything; from here on the old journal is stale (open/load ignore it), so
         // nothing may be appended to it even if the reset below fails.
-        self.generation = generation;
-        self.journal_stale = true;
-        self.reset_journal()?;
+        lf.generation = generation;
+        lf.journal_stale = true;
+        lf.journal = journal::reset_journal(&self.dir, lf.generation)?;
+        lf.journal_stale = false;
         self.lock.refresh_if_due();
-        Ok(())
-    }
-
-    /// Replaces the journal with an empty one for the current generation.
-    fn reset_journal(&mut self) -> Result<()> {
-        self.journal = journal::reset_journal(&self.dir, self.generation)?;
-        self.journal_stale = false;
         Ok(())
     }
 
     /// Stores a raw message; returns its blob key.
     pub fn put_blob(&mut self, raw: &[u8]) -> Result<String> {
-        BodyStore::on_disk(&self.dir).put_source(raw)
+        self.body_store().put_source(raw)
     }
 
     pub fn get_blob(&self, key: &str) -> Result<Vec<u8>> {
-        bodies::disk_get(&self.dir, key, bodies::SOURCE_EXT, MAX_BLOB_BYTES)
+        match &self.backend {
+            Backend::Legacy(_) => bodies::disk_get(&self.dir, key, bodies::SOURCE_EXT, MAX_BLOB_BYTES),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(_) => self.body_store().source(key),
+        }
     }
 
     /// True when the blob exists on disk (not verified).
     pub fn has_blob(&self, key: &str) -> bool {
-        BlobKey::parse(key).is_some_and(|k| k.path(&self.dir).is_file())
+        match &self.backend {
+            Backend::Legacy(_) => BlobKey::parse(key).is_some_and(|k| k.path(&self.dir).is_file()),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(_) => self.body_store().has_source(key),
+        }
     }
 
     /// The raw source of `item` from its blob. `Ok(None)` when it has none.
@@ -376,12 +605,21 @@ impl Store {
     /// blob shorter than its key says is reported as corrupt. `Ok(None)` when the item has no source.
     pub fn head_of(&self, item: &MailItem, cap: usize) -> Result<Option<Vec<u8>>> {
         let Some(key) = &item.blob else { return Ok(None) };
-        bodies::disk_head(&self.dir, key, bodies::SOURCE_EXT, cap)
+        match &self.backend {
+            Backend::Legacy(_) => bodies::disk_head(&self.dir, key, bodies::SOURCE_EXT, cap),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(_) => self.body_store().source_head(key, cap),
+        }
     }
 
-    /// Current size of the journal file in bytes (0 when it cannot be read).
+    /// Current size of the journal file in bytes (0 when it cannot be read); for a SQLite profile, of its
+    /// write-ahead log.
     pub fn journal_bytes(&self) -> u64 {
-        self.journal.metadata().map_or(0, |m| m.len())
+        match &self.backend {
+            Backend::Legacy(lf) => lf.journal.metadata().map_or(0, |m| m.len()),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(s) => s.db().wal_bytes(),
+        }
     }
 
     /// Keeps the store lock fresh while the store is idle; call on an idle tick (done by
@@ -409,9 +647,13 @@ impl Store {
         self.lock.backdate_refresh();
     }
 
-    /// Generation of the last snapshot written or found.
+    /// Generation of the last snapshot written or found (for a SQLite profile, of the last checkpoint).
     pub fn generation(&self) -> u64 {
-        self.generation
+        match &self.backend {
+            Backend::Legacy(lf) => lf.generation,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sql(s) => s.generation(),
+        }
     }
 
     /// Repairs made to the journal by [`Store::open`].
@@ -422,13 +664,13 @@ impl Store {
     /// Imports one `.eml` file into `folder`: the raw source goes to the profile's body store (`item.blob`
     /// set). Not journaled: the caller appends `Op::PutMail` (or checkpoints) as for any other change.
     pub fn import_eml(&mut self, mb: &mut Mailbox, path: &Path, folder: FolderId) -> Result<ItemId> {
-        let mut bodies = BodyStore::on_disk(&self.dir);
+        let mut bodies = self.body_store();
         import::import_eml(mb, &mut bodies, path, folder)
     }
 
     /// [`export_mbox`] reading the content from the profile's body store.
     pub fn export_mbox(&self, items: &[&MailItem], file: &Path) -> Result<()> {
-        export_mbox(items, &BodyStore::on_disk(&self.dir), file)
+        export_mbox(items, &self.body_store(), file)
     }
 
     /// Reads the recoverable-items bin (`Ok(default)` when there is none yet). Content a bin written before
@@ -444,7 +686,7 @@ impl Store {
         if legacy::has_inline(&bytes) {
             let inline = legacy::recoverable_inline(&bytes)?;
             drop(bytes);
-            let mut bodies = BodyStore::on_disk(&self.dir);
+            let mut bodies = self.body_store();
             for (i, id, content) in inline {
                 if let Some(e) = bin.items.get_mut(i)
                     && let DeletedItem::Mail(m) = &mut e.item
@@ -473,7 +715,7 @@ impl Store {
 
     /// Deletes stored content (sources and body records) referred to neither by `mb` (which must be the
     /// complete current state), nor by the recoverable-items bin, nor by a key in `also` (the undo history),
-    /// and leftover temp files. Returns the number of files removed.
+    /// and leftover temp files. Returns the number of entries removed.
     pub fn gc_blobs(&mut self, mb: &Mailbox, also: &BTreeSet<String>) -> Result<usize> {
         // A bin that cannot be read keeps every blob (nothing it may still need is removed).
         let bin = self.load_recoverable()?;
@@ -483,7 +725,7 @@ impl Store {
             _ => None,
         })));
         live.extend(also.iter().cloned());
-        BodyStore::on_disk(&self.dir).collect(&live)
+        self.body_store().collect(&live)
     }
 }
 

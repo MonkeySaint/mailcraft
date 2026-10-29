@@ -1324,9 +1324,20 @@ mod tests {
 
     #[test]
     fn closing_a_protected_data_file_takes_its_items_out_of_the_profile_journal() {
+        closing_a_protected_data_file_takes_its_items_out_of_the_profile_journal_in(
+            mailcraft_store::StoreKind::Legacy,
+        );
+        closing_a_protected_data_file_takes_its_items_out_of_the_profile_journal_in(
+            mailcraft_store::StoreKind::Sqlite,
+        );
+    }
+
+    fn closing_a_protected_data_file_takes_its_items_out_of_the_profile_journal_in(
+        kind: mailcraft_store::StoreKind,
+    ) {
         let profile = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::open(profile.path()).unwrap();
+        let mut s = Session::open_with(profile.path(), kind).unwrap();
         let file = dir.path().join("Private.mcdata");
         let r =
             s.run("file.newDataFile", &json!({"path": file.to_str().unwrap(), "password": "pw-1"})).unwrap();
@@ -1338,17 +1349,13 @@ mod tests {
             ..Default::default()
         });
         s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
-        let on_disk = |p: &Path| -> String {
-            ["journal.jsonl", "mailbox.json"]
-                .iter()
-                .map(|f| String::from_utf8_lossy(&std::fs::read(p.join(f)).unwrap_or_default()).into_owned())
-                .collect()
-        };
+        // Everything in the profile: the snapshot and journal, or the database and its log.
+        let on_disk = |p: &Path| -> String { all_text_under(p) };
         assert!(on_disk(profile.path()).contains("Confidential"), "open, its items live in the profile");
         s.run("file.closeDataFile", &json!({"store": id.0, "confirm": true})).unwrap();
         assert!(!on_disk(profile.path()).contains("Confidential"), "closed, they leave the journal");
         drop(s);
-        let s = Session::open(profile.path()).unwrap();
+        let s = Session::open_with(profile.path(), kind).unwrap();
         assert!(s.mailbox.account(id).is_none(), "and stay closed after a restart");
     }
 
@@ -1402,9 +1409,20 @@ mod tests {
     /// the profile's `blobs` folder for good (and its deleted items in the recoverable-items bin).
     #[test]
     fn closing_a_protected_data_file_removes_its_message_sources_from_the_profile() {
+        closing_a_protected_data_file_removes_its_message_sources_from_the_profile_in(
+            mailcraft_store::StoreKind::Legacy,
+        );
+        closing_a_protected_data_file_removes_its_message_sources_from_the_profile_in(
+            mailcraft_store::StoreKind::Sqlite,
+        );
+    }
+
+    fn closing_a_protected_data_file_removes_its_message_sources_from_the_profile_in(
+        kind: mailcraft_store::StoreKind,
+    ) {
         let profile = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::open(profile.path()).unwrap();
+        let mut s = Session::open_with(profile.path(), kind).unwrap();
         let file = dir.path().join("Private.mcdata");
         let r =
             s.run("file.newDataFile", &json!({"path": file.to_str().unwrap(), "password": "pw-1"})).unwrap();
@@ -1461,7 +1479,7 @@ mod tests {
         let raw = s.store.as_ref().unwrap().raw_of(kept).unwrap().unwrap();
         assert!(String::from_utf8_lossy(&raw).contains("Shared-body-91c2"));
         drop(s);
-        let s = Session::open(profile.path()).unwrap();
+        let s = Session::open_with(profile.path(), kind).unwrap();
         assert!(s.mailbox.account(id).is_none());
         let kept = s.mailbox.mail.items().find(|m| m.folder == other_inbox && m.subject.is_empty()).unwrap();
         assert!(s.store.as_ref().unwrap().raw_of(kept).unwrap().is_some(), "and after a restart");
@@ -1472,9 +1490,20 @@ mod tests {
     /// sources stayed readable in the profile.
     #[test]
     fn closing_a_protected_data_file_removes_items_deleted_with_its_folders() {
+        closing_a_protected_data_file_removes_items_deleted_with_its_folders_in(
+            mailcraft_store::StoreKind::Legacy,
+        );
+        closing_a_protected_data_file_removes_items_deleted_with_its_folders_in(
+            mailcraft_store::StoreKind::Sqlite,
+        );
+    }
+
+    fn closing_a_protected_data_file_removes_items_deleted_with_its_folders_in(
+        kind: mailcraft_store::StoreKind,
+    ) {
         let profile = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::open(profile.path()).unwrap();
+        let mut s = Session::open_with(profile.path(), kind).unwrap();
         let file = dir.path().join("Private.mcdata");
         let r =
             s.run("file.newDataFile", &json!({"path": file.to_str().unwrap(), "password": "pw-1"})).unwrap();

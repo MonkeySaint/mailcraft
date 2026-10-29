@@ -64,6 +64,14 @@ pub struct ChangeToken(u64);
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+impl ChangeToken {
+    /// A token no other record of this process has (for repositories other than [`MailTable`] that keep
+    /// change records of their own, like the SQLite one).
+    pub fn fresh() -> ChangeToken {
+        ChangeToken(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Most records open at once. A deeper `begin` first folds the innermost record into the one below it, so the
 /// stack stays bounded even if something keeps opening records and never closes them.
 const MAX_OPEN_RECORDS: usize = 64;
@@ -543,7 +551,7 @@ impl MailTable {
 
     /// Opens a change record: from now on the first write to each item keeps its before-image.
     pub fn begin(&mut self) -> ChangeToken {
-        let token = ChangeToken(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed));
+        let token = ChangeToken::fresh();
         if self.log.frames.len() >= MAX_OPEN_RECORDS {
             self.fold_above(self.log.frames.len().saturating_sub(2));
         }

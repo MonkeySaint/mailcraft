@@ -186,8 +186,67 @@ pub fn offence(p: &Package) -> Option<String> {
     }
 }
 
+/// Dependencies compiled into the binaries whose licences require their text to ship with them, and lines
+/// of that text `NOTICE` (which every package ships) must hold: the copyright line and the binary
+/// redistribution or permission condition. Compared with runs of whitespace collapsed.
+pub const NOTICE_TEXTS: &[(&str, &[&str])] = &[
+    (
+        "zstd-sys",
+        &[
+            "Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.",
+            "Redistributions in binary form must reproduce the above copyright notice, this list of \
+             conditions and the following disclaimer in the documentation and/or other materials provided \
+             with the distribution.",
+            "THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"",
+        ],
+    ),
+    ("zstd", &["Copyright (c) 2026, Alexandre Bury", "Redistributions in binary form must reproduce"]),
+    (
+        "rusqlite",
+        &[
+            "Copyright (c) 2014 The rusqlite developers",
+            "The above copyright notice and this permission notice shall be included in all copies or \
+             substantial portions of the Software.",
+        ],
+    ),
+    ("libsqlite3-sys", &["Copyright (c) 2014 The rusqlite developers"]),
+];
+
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The licence lines `notice` lacks for the packages in `names` (empty when it holds them all).
+pub fn notice_missing(notice: &str, names: impl Fn(&str) -> bool) -> Vec<String> {
+    let text = squash(notice);
+    let mut missing = Vec::new();
+    for (krate, lines) in NOTICE_TEXTS {
+        if !names(krate) {
+            continue;
+        }
+        for line in *lines {
+            if !text.contains(&squash(line)) {
+                missing.push(format!("{krate}: NOTICE lacks \"{line}\""));
+            }
+        }
+    }
+    missing
+}
+
 pub fn run(root: &Path) -> TaskResult {
     let meta = metadata::load(root, true)?;
+    let notice =
+        std::fs::read_to_string(root.join("NOTICE")).map_err(|e| format!("licences: NOTICE: {e}"))?;
+    let missing = notice_missing(&notice, |name| meta.packages.iter().any(|p| p.name == name));
+    if !missing.is_empty() {
+        for m in &missing {
+            println!("  ✗ {m}");
+        }
+        return Err(format!(
+            "licences: NOTICE must reproduce the licence text of {} bundled dependencies",
+            missing.len()
+        ));
+    }
     let mut offenders = Vec::new();
     let mut checked = 0usize;
     for p in &meta.packages {
@@ -266,5 +325,19 @@ mod tests {
         assert!(offence(&p(Some("MPL-2.0"), "a")).unwrap().contains("not satisfiable"));
         assert_eq!(offence(&p(Some("OFL-1.1"), "some-font")), None);
         assert!(offence(&p(Some("OFL-1.1"), "not-a-typeface")).is_some());
+    }
+
+    #[test]
+    fn notice_reproduces_bundled_licences() {
+        let notice =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("NOTICE")).unwrap();
+        assert_eq!(notice_missing(&notice, |_| true), Vec::<String>::new());
+        // Line breaks and indentation do not matter; a missing text does, for a dependency in the build only.
+        let reflowed = notice.replace('\n', "  \n   ");
+        assert!(notice_missing(&reflowed, |_| true).is_empty());
+        let cut = notice.replace("Redistributions in binary form", "Redistributions");
+        assert!(notice_missing(&cut, |n| n == "zstd-sys").iter().any(|m| m.starts_with("zstd-sys")));
+        assert!(notice_missing(&cut, |n| n == "rusqlite").is_empty());
+        assert!(notice_missing("", |_| false).is_empty());
     }
 }

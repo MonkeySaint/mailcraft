@@ -1,6 +1,8 @@
 //! The benchmark harness on a 2,000-message profile: every measurement runs and reports sane numbers. No
 //! thresholds (timings depend on the machine); this only keeps the harness from rotting.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
 use mailcraft_bench::{Backend, Options, QUERIES};
 use serde_json::Value;
 
@@ -18,14 +20,24 @@ fn num(r: &Value, p: &str) -> f64 {
 
 #[test]
 fn two_thousand_messages_smoke() {
-    let work = work_dir("smoke");
+    smoke(Backend::Legacy);
+}
+
+#[test]
+fn two_thousand_messages_smoke_on_sqlite() {
+    smoke(Backend::Sqlite);
+}
+
+fn smoke(backend: Backend) {
+    let work = work_dir(&format!("smoke-{}", backend.name()));
     let mut opts = Options::new(2_000);
+    opts.backend = backend;
     opts.small_bodies = true;
     opts.sync_messages = 600;
     opts.bulk_move = 300;
     opts.windows = 10;
     let r = mailcraft_bench::run(&work, &opts).unwrap();
-    assert_eq!(r["backend"], "legacy");
+    assert_eq!(r["backend"], backend.name());
     assert_eq!(num(&r, "/generate/messages"), 2_000.0);
     let kinds = &r["generate"]["kinds"];
     let sum: u64 = ["text", "html", "attachments"].iter().map(|k| kinds[k].as_u64().unwrap()).sum();
@@ -34,7 +46,14 @@ fn two_thousand_messages_smoke() {
         r["generate"]["folders"].as_object().unwrap().values().map(|n| n.as_u64().unwrap()).sum();
     assert_eq!(per_folder, 2_000);
     assert!(num(&r, "/generate/disk/parts/mailbox.json") > 0.0);
-    assert!(num(&r, "/generate/disk/parts/blobs") > 0.0);
+    match backend {
+        Backend::Legacy => assert!(num(&r, "/generate/disk/parts/blobs") > 0.0),
+        Backend::Sqlite => {
+            assert!(num(&r, "/generate/disk/parts/store.db") > 0.0);
+            assert!(num(&r, "/generate/disk/parts/packs") > 0.0);
+            assert!(r["generate"]["disk"]["parts"].get("blobs").is_none());
+        }
+    }
     // The opened profile holds every message, and the first window is full.
     assert_eq!(num(&r, "/measure/open/mail_items"), 2_000.0);
     assert_eq!(num(&r, "/measure/open/window_rows"), 50.0);
@@ -94,12 +113,33 @@ fn two_thousand_messages_smoke() {
 }
 
 #[test]
-fn the_sqlite_backend_is_not_there_yet() {
-    let mut opts = Options::new(10);
+fn measuring_a_profile_of_the_other_backend_is_refused() {
+    let work = work_dir("mismatch");
+    let mut opts = Options::new(50);
+    opts.small_bodies = true;
+    mailcraft_bench::generate(&work, &opts).unwrap();
     opts.backend = Backend::Sqlite;
-    let work = work_dir("sqlite");
-    assert!(mailcraft_bench::run(&work, &opts).unwrap_err().contains("S6"));
-    assert!(!work.exists());
+    assert!(mailcraft_bench::measure(&work, &opts).unwrap_err().contains("not a sqlite profile"));
+    std::fs::remove_dir_all(&work).unwrap();
+}
+
+/// `generate_batch = 1` writes a SQLite profile the way the app stores sources today (one fsync and commit
+/// each), for a like-for-like comparison with legacy; the report says which was used.
+#[test]
+fn a_sqlite_profile_can_be_generated_without_batching() {
+    let work = work_dir("unbatched");
+    let mut opts = Options::new(120);
+    opts.small_bodies = true;
+    opts.backend = Backend::Sqlite;
+    opts.generate_batch = 1;
+    let g = mailcraft_bench::generate(&work, &opts).unwrap();
+    assert_eq!(g["batch"], 1);
+    assert_eq!(g["messages"], 120);
+    assert!(num(&g, "/disk/parts/packs") > 0.0);
+    let store = mailcraft_store::Store::open(&work).unwrap();
+    assert_eq!(store.load().unwrap().mail.len(), 120);
+    drop(store);
+    std::fs::remove_dir_all(&work).unwrap();
 }
 
 #[test]

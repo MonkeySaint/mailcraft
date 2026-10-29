@@ -80,6 +80,9 @@ cargo run --release -p mailcraft -- --sample
 # Your own local profile (data in ~/.local/share/MailCraft by default)
 cargo run --release -p mailcraft
 
+# A new profile on the SQLite storage (opt-in preview; an existing profile keeps its storage)
+cargo run --release -p mailcraft -- --profile /path/to/new-profile --store sqlite
+
 # Local test mail servers for trying accounts without a real mailbox
 cargo run -p mailcraft-testmail-app -- --help
 

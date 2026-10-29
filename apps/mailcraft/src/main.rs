@@ -1,7 +1,8 @@
 //! MailCraft desktop app: an eframe window around [`mailcraft_ui_egui::App`].
 //!
 //! ```text
-//! mailcraft [--profile <dir>] [--sample] [--control-port <N>] [--version] [--help] [mailto:…]
+//! mailcraft [--profile <dir>] [--store legacy|sqlite] [--sample] [--control-port <N>] [--version] [--help]
+//!           [mailto:…]
 //! ```
 //!
 //! A `mailto:` URL (RFC 6068) opens a new message to it (`mail.newFromMailto`). With File › Options ›
@@ -31,6 +32,8 @@ Usage: mailcraft [OPTIONS]
 
 Options:
   --profile <DIR>       Data folder to open (created when missing)
+  --store <KIND>        Storage of a new data folder: legacy (default) or sqlite; an existing folder
+                        keeps its own (also MAILCRAFT_STORE=sqlite)
   --sample              Open an in-memory sample mailbox instead of a profile
   --control-port <N>    Accept control commands on 127.0.0.1:<N> (for tests and automation)
   --version             Print the version and exit
@@ -52,6 +55,8 @@ fn version_line() -> String {
 #[derive(Debug, Default, PartialEq)]
 struct Args {
     profile: Option<PathBuf>,
+    /// `--store`: the storage a new profile gets (`None`: `MAILCRAFT_STORE`, else legacy).
+    store: Option<mailcraft_engine::StoreKind>,
     sample: bool,
     control_port: Option<u16>,
     version: bool,
@@ -72,6 +77,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             |name: &str| inline.clone().or_else(|| it.next()).ok_or_else(|| format!("{name} needs a value"));
         match flag.as_str() {
             "--profile" => out.profile = Some(PathBuf::from(value("--profile")?)),
+            "--store" => {
+                let v = value("--store")?;
+                out.store = Some(
+                    mailcraft_engine::StoreKind::parse(&v)
+                        .ok_or_else(|| format!("--store: `{v}` is not legacy or sqlite"))?,
+                );
+            }
             "--sample" => out.sample = true,
             "--control-port" => {
                 let v = value("--control-port")?;
@@ -129,7 +141,7 @@ fn open_session(args: &Args) -> Session {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("cannot create {}: {e}", dir.display());
     }
-    match Session::open(&dir) {
+    match Session::open_with(&dir, args.store.unwrap_or_else(mailcraft_engine::StoreKind::from_env)) {
         Ok(mut s) => {
             // File › Options › Advanced › "Enable troubleshooting logging" (read at start-up).
             match mailcraft_engine::troubleshoot::start(&s.settings, &dir) {
@@ -270,6 +282,10 @@ mod tests {
         assert!(parse(&["--control-port", "0"]).is_err());
         assert!(parse(&["--control-port", "x"]).is_err());
         assert!(parse(&["--profile"]).is_err());
+        assert_eq!(parse(&["--store", "sqlite"]).unwrap().store, Some(mailcraft_engine::StoreKind::Sqlite));
+        assert_eq!(parse(&["--store=legacy"]).unwrap().store, Some(mailcraft_engine::StoreKind::Legacy));
+        assert!(parse(&["--store", "lmdb"]).is_err());
+        assert!(parse(&["--store"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
         let m = parse(&["--sample", "mailto:ann@example.org?subject=Hi"]).unwrap();
         assert_eq!(m.mailto.as_deref(), Some("mailto:ann@example.org?subject=Hi"));

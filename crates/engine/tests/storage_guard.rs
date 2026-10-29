@@ -63,7 +63,7 @@ fn tempdir() -> tempfile::TempDir {
 fn a_mailbox_past_the_snapshot_cap_keeps_its_journal_and_still_opens() {
     let dir = tempdir();
     let (inbox, ids) = {
-        let mut s = Session::open(dir.path()).unwrap();
+        let mut s = open_legacy(dir.path()).unwrap();
         let inbox = s.selection.folder;
         let snapshot = std::fs::metadata(dir.path().join("mailbox.json")).unwrap().len();
         // Fold the journal on every write, and allow a snapshot only a little larger than the empty one.
@@ -101,7 +101,7 @@ fn a_mailbox_past_the_snapshot_cap_keeps_its_journal_and_still_opens() {
         assert!(std::fs::metadata(dir.path().join("mailbox.json")).unwrap().len() <= snapshot + 2_000);
         (inbox, ids)
     };
-    let s = Session::open(dir.path()).unwrap();
+    let s = open_legacy(dir.path()).unwrap();
     assert_eq!(s.mailbox.items_in(inbox).len(), 20);
     for (n, id) in ids.iter().enumerate() {
         assert_eq!(s.mailbox.mail.get(*id).unwrap().read, n < 3, "item {n}");
@@ -201,7 +201,7 @@ fn sync(s: &mut Session) {
 fn synced_mail_leaves_its_source_in_the_store_and_counts_follow_sync() {
     let srv = servers();
     let dir = tempdir();
-    let mut s = Session::open(dir.path()).unwrap();
+    let mut s = open_legacy(dir.path()).unwrap();
     s.view.auto_send_receive_minutes = 0;
     let acct = add_alice(&mut s, &srv);
     let list = "List-Post: <mailto:team@lists.example.org>\r\n";
@@ -258,7 +258,7 @@ fn imported_mail_leaves_its_source_in_the_store() {
     }
     std::fs::write(&mbox, &data).unwrap();
     let profile = dir.path().join("profile");
-    let mut s = Session::open(&profile).unwrap();
+    let mut s = open_legacy(&profile).unwrap();
     let inbox = s.selection.folder;
     let r = run(
         &mut s,
@@ -336,7 +336,7 @@ fn notices_of(s: &Session, text: &str) -> usize {
 #[test]
 fn source_readers_see_the_stored_source_after_it_left_memory() {
     let dir = tempdir();
-    let mut s = Session::open(&dir.path().join("profile")).unwrap();
+    let mut s = open_legacy(&dir.path().join("profile")).unwrap();
     // 2026-10-15: after the offer below expired.
     s.fixed_now = Some(mailcraft_engine::model::DateTime { unix: 1_792_000_000, offset_min: 0 });
     let inbox = s.selection.folder;
@@ -420,7 +420,7 @@ fn source_readers_see_the_stored_source_after_it_left_memory() {
 fn a_batch_the_journal_refuses_is_saved_as_a_snapshot() {
     let dir = tempdir();
     let (id, generation) = {
-        let mut s = Session::open(dir.path()).unwrap();
+        let mut s = open_legacy(dir.path()).unwrap();
         let inbox = s.selection.folder;
         let id = import_eml(&mut s, dir.path(), "one", &message("One", "j1", ""), inbox);
         let store = s.store.as_mut().unwrap();
@@ -434,7 +434,7 @@ fn a_batch_the_journal_refuses_is_saved_as_a_snapshot() {
         assert_eq!(notices_of(&s, mailcraft_engine::UNSAVED_TOO_LARGE), 0);
         (id, generation)
     };
-    let s = Session::open(dir.path()).unwrap();
+    let s = open_legacy(dir.path()).unwrap();
     assert!(s.mailbox.mail.get(id).unwrap().read, "the change was saved");
     assert!(s.store.as_ref().unwrap().generation() > generation);
 }
@@ -445,7 +445,7 @@ fn a_batch_the_journal_refuses_is_saved_as_a_snapshot() {
 fn changes_neither_journal_nor_snapshot_can_take_stay_queued_until_there_is_room() {
     let dir = tempdir();
     let ids = {
-        let mut s = Session::open(dir.path()).unwrap();
+        let mut s = open_legacy(dir.path()).unwrap();
         let inbox = s.selection.folder;
         let mut ids = Vec::new();
         for i in 0..3 {
@@ -471,7 +471,7 @@ fn changes_neither_journal_nor_snapshot_can_take_stay_queued_until_there_is_room
         assert_eq!(notices_of(&s, mailcraft_engine::UNSAVED_TOO_LARGE), 1);
         ids
     };
-    let s = Session::open(dir.path()).unwrap();
+    let s = open_legacy(dir.path()).unwrap();
     assert!(ids.iter().all(|id| s.mailbox.mail.get(*id).unwrap().read), "every queued change was saved");
 }
 
@@ -481,7 +481,7 @@ fn changes_neither_journal_nor_snapshot_can_take_stay_queued_until_there_is_room
 fn a_refused_mailbox_is_saved_once_it_shrinks() {
     let dir = tempdir();
     let (keep, gone) = {
-        let mut s = Session::open(dir.path()).unwrap();
+        let mut s = open_legacy(dir.path()).unwrap();
         let inbox = s.selection.folder;
         let mut ids = Vec::new();
         for i in 0..8 {
@@ -508,7 +508,7 @@ fn a_refused_mailbox_is_saved_once_it_shrinks() {
         assert_eq!(notices_of(&s, mailcraft_engine::UNSAVED_TOO_LARGE), 1);
         (ids[..4].to_vec(), ids[4..].to_vec())
     };
-    let s = Session::open(dir.path()).unwrap();
+    let s = open_legacy(dir.path()).unwrap();
     assert!(s.mailbox.mail.get(keep[0]).unwrap().read);
     assert!(keep.iter().all(|id| s.mailbox.mail.contains(*id)));
     assert!(gone.iter().all(|id| !s.mailbox.mail.contains(*id)));
@@ -588,7 +588,7 @@ fn bench_folder_pane_and_undo_estimate() {
         data.extend_from_slice(b"\n\n");
     }
     std::fs::write(&mbox, &data).unwrap();
-    let mut p = Session::open(&dir.path().join("profile")).unwrap();
+    let mut p = open_legacy(&dir.path().join("profile")).unwrap();
     let inbox = p.selection.folder;
     let t = Instant::now();
     run(
@@ -602,4 +602,10 @@ fn bench_folder_pane_and_undo_estimate() {
         "import of {count} messages ({} MiB of mbox) took {took:?}; content cached in memory afterwards: {held} bytes",
         data.len() >> 20
     );
+}
+
+/// These tests measure the legacy journal and snapshot: their profiles use legacy storage whatever
+/// `MAILCRAFT_STORE` says.
+fn open_legacy(dir: &std::path::Path) -> Result<Session, mailcraft_engine::CmdError> {
+    Session::open_with(dir, mailcraft_store::StoreKind::Legacy)
 }

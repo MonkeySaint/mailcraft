@@ -456,9 +456,20 @@ impl Session {
     }
 
     /// Opens (or creates) a persistent session in `dir`. A new data folder gets a local mailbox ("Local
-    /// Folders") written as its first snapshot.
+    /// Folders") written as its first snapshot, in the storage `MAILCRAFT_STORE` names (legacy unless it says
+    /// `sqlite`; see [`Session::open_with`]).
     pub fn open(dir: &std::path::Path) -> Result<Session, CmdError> {
-        let mut store = mailcraft_store::Store::open(dir)
+        Session::open_with(dir, mailcraft_store::StoreKind::from_env())
+    }
+
+    /// [`Session::open`] with the storage a new profile gets. An existing profile keeps the storage it has;
+    /// asking for SQLite on a legacy profile says so in a notice (moving a profile over comes with storage
+    /// stage S9).
+    pub fn open_with(
+        dir: &std::path::Path,
+        new_kind: mailcraft_store::StoreKind,
+    ) -> Result<Session, CmdError> {
+        let mut store = mailcraft_store::Store::open_with(dir, new_kind)
             .map_err(|e| CmdError::Failed(format!("cannot open the data folder {}: {e}", dir.display())))?;
         let (mut mailbox, report) = store
             .load_report()
@@ -481,9 +492,17 @@ impl Session {
                 CmdError::Failed(format!("cannot write the data folder {}: {e}", dir.display()))
             })?;
         }
+        let kind = store.kind();
         let mut s = Session::new(mailbox);
+        s.bodies = store.body_store();
         s.store = Some(store);
-        s.bodies = mailcraft_store::BodyStore::on_disk(dir);
+        log::info!("profile {}: {} storage", dir.display(), kind.name());
+        if kind == mailcraft_store::StoreKind::Legacy && new_kind == mailcraft_store::StoreKind::Sqlite {
+            s.notify(Notice::Info(
+                "This profile keeps its current storage: SQLite storage is only used for new profiles so far."
+                    .into(),
+            ));
+        }
         // View in Browser pages a crashed session left behind (the profile's lock is held now, so no other
         // session is using them).
         let swept = crate::browser::sweep_leftovers(&crate::browser::profile_base(dir));

@@ -143,6 +143,15 @@ fn data_files_carry_sources_and_edited_bodies() {
     assert_eq!(s.body(c).unwrap().unwrap().text.as_deref(), Some("Only here"));
 }
 
+/// The body records in a session's profile: `.body` files of a legacy profile, pack entries (all of them
+/// body records in the test below) of a SQLite one.
+fn body_records_of(s: &Session, dir: &std::path::Path) -> usize {
+    match s.bodies.pack_stats() {
+        Some(stats) => stats.unwrap().entries,
+        None => body_records(dir),
+    }
+}
+
 /// The `.body` records in a profile's body store.
 fn body_records(dir: &std::path::Path) -> usize {
     fn walk(p: &std::path::Path, n: &mut usize) {
@@ -164,9 +173,14 @@ fn body_records(dir: &std::path::Path) -> usize {
 /// left its old record forever). Opening the profile now removes it.
 #[test]
 fn opening_a_profile_collects_content_nothing_refers_to() {
+    opening_a_profile_collects_content_nothing_refers_to_in(mailcraft_store::StoreKind::Legacy);
+    opening_a_profile_collects_content_nothing_refers_to_in(mailcraft_store::StoreKind::Sqlite);
+}
+
+fn opening_a_profile_collects_content_nothing_refers_to_in(kind: mailcraft_store::StoreKind) {
     let dir = tempfile::tempdir().unwrap();
     let id = {
-        let mut s = Session::open(dir.path()).unwrap();
+        let mut s = Session::open_with(dir.path(), kind).unwrap();
         let folder = inbox(&s);
         let id = s
             .add_message(
@@ -178,11 +192,15 @@ fn opening_a_profile_collects_content_nothing_refers_to() {
         for i in 1..=5 {
             s.run("mail.editMessage", &json!({"ids": [id.0], "text": format!("version {i}")})).unwrap();
         }
-        assert_eq!(body_records(dir.path()), 6, "every version is stored while the undo history needs it");
+        assert_eq!(
+            body_records_of(&s, dir.path()),
+            6,
+            "every version is stored while the undo history needs it"
+        );
         id
     };
-    let s = Session::open(dir.path()).unwrap();
-    assert_eq!(body_records(dir.path()), 1, "only the latest version is left");
+    let s = Session::open_with(dir.path(), kind).unwrap();
+    assert_eq!(body_records_of(&s, dir.path()), 1, "only the latest version is left");
     assert_eq!(s.body(id).unwrap().unwrap().text.as_deref(), Some("version 5"));
 }
 

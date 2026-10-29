@@ -41,7 +41,7 @@ use serde_json::Value;
 
 pub use accounts::{FileSecretStore, MemorySecretStore, SecretStore};
 pub use mailcraft_model as model;
-pub use mailcraft_store::{BodyStore, Content};
+pub use mailcraft_store::{BodyStore, Content, StoreKind};
 pub use session::{
     DEFAULT_QUICK_ACCESS, Module, Notice, SNAPSHOT_TOO_LARGE, SearchScope, Selection, Session, TodoBar,
     UNSAVED_TOO_LARGE, ViewState, recent_move_folders,

@@ -1,6 +1,6 @@
 [package]
 name = "mailcraft-store"
-description = "Local mailbox storage for MailCraft: snapshot + journal, blob store, Maildir/MBOX import, crash recovery"
+description = "Local mailbox storage for MailCraft: SQLite store with zstd pack files, legacy snapshot + journal, blob store, Maildir/MBOX import, crash recovery"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,13 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
+
+# The SQLite store and its zstd pack files (storage stage S6): native only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite.workspace = true
+zstd.workspace = true
+sha2.workspace = true
+crc32fast.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

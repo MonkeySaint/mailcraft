@@ -188,6 +188,43 @@ pub fn read_snapshot_full(dir: &Path) -> Result<SnapshotRead> {
     Ok(SnapshotRead { generation, mailbox, legacy })
 }
 
+/// Snapshot format of the marker `mailbox.json` of a SQLite profile (storage stage S6). No version reads it
+/// as a snapshot: older ones refuse it ("unknown snapshot format 3") instead of starting an empty profile
+/// beside the database, and this one opens `store.db`.
+pub const SQLITE_MARKER_FORMAT: u32 = 3;
+const SQLITE_MARKER_PREFIX: &str = "{\"mailcraft_snapshot\":3,";
+
+/// Writes the marker `mailbox.json` of a SQLite profile.
+pub fn write_sqlite_marker(dir: &Path) -> Result<()> {
+    let body = serde_json::to_string(&Mailbox::default()).map_err(std::io::Error::other)?;
+    write_atomic(&dir.join(SNAPSHOT_FILE), |w| {
+        write!(
+            w,
+            "{SQLITE_MARKER_PREFIX}\"generation\":0,\"store\":\"sqlite\",\"note\":\"This profile keeps its mail \
+             in store.db. Open it with a MailCraft version that has SQLite storage.\",\"mailbox\":{body}}}"
+        )
+    })
+}
+
+/// Whether `mailbox.json` in `dir` is the marker of a SQLite profile.
+pub fn is_sqlite_marker(dir: &Path) -> Result<bool> {
+    let mut f = match File::open(dir.join(SNAPSHOT_FILE)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let mut head = [0u8; 32];
+    let mut filled = 0usize;
+    while filled < head.len() {
+        let n = f.read(head.get_mut(filled..).unwrap_or(&mut []))?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(head.get(..filled).unwrap_or(&[]).starts_with(SQLITE_MARKER_PREFIX.as_bytes()))
+}
+
 /// Writes a snapshot atomically.
 ///
 /// Refused with [`StoreError::TooLarge`] when the snapshot would be larger than [`MAX_STATE_BYTES`], the most
