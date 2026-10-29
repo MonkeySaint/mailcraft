@@ -297,8 +297,8 @@ fn shared_mailboxes_open_as_stores_and_join_locations_to_search() {
     let store = AccountId(u32::try_from(r["store"].as_u64().unwrap()).unwrap());
     settle(&mut s);
     let inbox = role(&s, store, FolderRole::Inbox);
-    let msg = s.mailbox.mail.values().find(|m| m.folder == inbox).expect("the shared inbox downloaded").id;
-    assert_eq!(s.mailbox.mail[&msg].subject, "Printer jams");
+    let msg = s.mailbox.mail.items().find(|m| m.folder == inbox).expect("the shared inbox downloaded").id;
+    assert_eq!(s.mailbox.mail.get(msg).unwrap().subject, "Printer jams");
     // Locations to Search lists the store beside the user's own mailbox.
     let locations = mailcraft_engine::cmd::search::locations(&s);
     assert!(locations.iter().any(|(_, label, on)| label == "Support" && *on), "{locations:?}");

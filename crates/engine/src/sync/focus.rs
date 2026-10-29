@@ -79,7 +79,7 @@ pub fn known(s: &Session) -> Known {
     for m in s
         .mailbox
         .mail
-        .values()
+        .items()
         .filter(|m| m.from.as_ref().is_some_and(|f| me.contains(&f.addr.trim().to_lowercase())))
         .take(MAX_SENT_SCANNED)
     {
@@ -105,8 +105,9 @@ pub fn known(s: &Session) -> Known {
     }
 }
 
+/// The Message-ID key the mail table matches by (no brackets, lower-case).
 fn bare_id(v: &str) -> String {
-    v.trim().trim_start_matches('<').trim_end_matches('>').trim().to_ascii_lowercase()
+    mailcraft_model::message_id_key(v)
 }
 
 /// True for an address whose local part says it takes no replies ("noreply@", "no-reply@",
@@ -185,7 +186,7 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
     let k = known(s);
     let mut decided: Vec<(ItemId, FocusClass)> = Vec::new();
     for id in ids.iter().take(super::arrival::MAX_PROCESSED) {
-        let Some(m) = s.mailbox.mail.get(id) else { continue };
+        let Some(m) = s.mailbox.mail.get(*id) else { continue };
         let head = crate::cmd::compose::stored_raw(s, m).map(|raw| crate::cmd::compose::raw_headers(&raw));
         let (class, _) = classify(m, head.as_ref(), &k);
         decided.push((*id, class));
@@ -193,7 +194,7 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
     let mut other = Vec::new();
     let mut changed = Vec::new();
     for (id, class) in decided {
-        if let Some(m) = s.mailbox.mail.get_mut(&id) {
+        if let Some(m) = s.mailbox.mail.get_mut(id) {
             if m.focus != class {
                 m.focus = class;
                 changed.push(id);
@@ -225,7 +226,7 @@ mod tests {
     fn class(s: &mut Session, raw: &str) -> (FocusClass, Reason) {
         let id = arrive(s, raw);
         let k = known(s);
-        let m = &s.mailbox.mail[&id];
+        let m = s.mailbox.mail.get(id).unwrap();
         let raw = m.raw.clone().unwrap_or_default();
         let head = crate::cmd::compose::raw_headers(&raw);
         classify(m, Some(&head), &k)
@@ -312,7 +313,7 @@ mod tests {
         );
         // A draft's recipients are not people I wrote to.
         let draft = arrive(&mut s, "From: me@example.com\nTo: fay@example.com\nSubject: e\n\nx\n");
-        s.mailbox.mail.get_mut(&draft).unwrap().is_draft = true;
+        s.mailbox.mail.get_mut(draft).unwrap().is_draft = true;
         assert!(!known(&s).people.contains("fay@example.com"));
         // An invitation is Focused even from a no-reply address.
         let invite = "From: noreply@example.net\nSubject: Invitation\nMIME-Version: 1.0\n\
@@ -343,8 +344,8 @@ mod tests {
         let a = arrive(&mut s, "From: news@example.org\nList-Id: <n.example.org>\nSubject: a\n\nx\n");
         let b = arrive(&mut s, "From: ann@example.com\nSubject: b\n\nx\n");
         assert_eq!(on_new_mail(&mut s, &[a, b, ItemId(u64::MAX)]), vec![a]);
-        assert_eq!(s.mailbox.mail[&a].focus, FocusClass::Other);
-        assert_eq!(s.mailbox.mail[&b].focus, FocusClass::Focused);
+        assert_eq!(s.mailbox.mail.get(a).unwrap().focus, FocusClass::Other);
+        assert_eq!(s.mailbox.mail.get(b).unwrap().focus, FocusClass::Focused);
         assert!(on_new_mail(&mut s, &[]).is_empty());
         // Junk and odd input never panics.
         let mut m = MailItem::default();

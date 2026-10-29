@@ -361,7 +361,7 @@ fn respond(s: &mut Session, cmd: &str, kind: ComposeKind, ids: &[ItemId]) -> Res
     match invoke(s, cmd, &json!({"ids": list})) {
         Ok(_) => {}
         Err(CmdError::Unknown(_)) => {
-            let Some(m) = s.mailbox.mail.get(&id) else {
+            let Some(m) = s.mailbox.mail.get(id) else {
                 return Ok(None);
             };
             let sender =
@@ -428,7 +428,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
         }
         return dialog(s, "quickStepFirstUse", params);
     }
-    let ids: Vec<ItemId> = s.target_ids(p).into_iter().filter(|id| s.mailbox.mail.contains_key(id)).collect();
+    let ids: Vec<ItemId> = s.target_ids(p).into_iter().filter(|id| s.mailbox.mail.contains(*id)).collect();
     if ids.is_empty() && step.actions.iter().any(needs_items) {
         return Err(CmdError::Disabled("no message selected".into()));
     }
@@ -440,7 +440,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
     let mut out = RunOut::default();
     let now = s.now();
     for action in &step.actions {
-        let live: Vec<ItemId> = ids.iter().copied().filter(|id| s.mailbox.mail.contains_key(id)).collect();
+        let live: Vec<ItemId> = ids.iter().copied().filter(|id| s.mailbox.mail.contains(*id)).collect();
         match action {
             QuickStepAction::MoveTo(Some(f)) => match s.mailbox.move_items(&live, *f) {
                 Ok(moved) => touched.extend(moved),
@@ -449,7 +449,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             QuickStepAction::CopyTo(Some(f)) => {
                 if s.mailbox.folder(*f).is_some_and(|x| x.kind == FolderKind::Mail) {
                     for id in &live {
-                        if let Some(mut copy) = s.mailbox.mail.get(id).cloned() {
+                        if let Some(mut copy) = s.mailbox.mail.get(*id).cloned() {
                             copy.folder = *f;
                             copy.remote_id = None;
                             touched.push(s.mailbox.add_mail(copy));
@@ -466,7 +466,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             },
             QuickStepAction::PermanentlyDelete => {
                 for id in &live {
-                    s.mailbox.mail.remove(id);
+                    s.mailbox.mail.remove(*id);
                     touched.push(*id);
                 }
             }
@@ -474,7 +474,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             QuickStepAction::MarkUnread => touched.extend(s.mailbox.set_read(&live, false)),
             QuickStepAction::SetImportance(i) => {
                 for id in &live {
-                    if let Some(m) = s.mailbox.mail.get_mut(id) {
+                    if let Some(m) = s.mailbox.mail.get_mut(*id) {
                         m.importance = *i;
                         touched.push(*id);
                     }
@@ -484,7 +484,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                 let name = name.trim();
                 if !name.is_empty() {
                     for id in &live {
-                        if let Some(m) = s.mailbox.mail.get_mut(id)
+                        if let Some(m) = s.mailbox.mail.get_mut(*id)
                             && !m.categories.iter().any(|c| c.trim().eq_ignore_ascii_case(name))
                         {
                             m.categories.push(name.to_owned());
@@ -495,7 +495,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             }
             QuickStepAction::ClearCategories => {
                 for id in &live {
-                    if let Some(m) = s.mailbox.mail.get_mut(id)
+                    if let Some(m) = s.mailbox.mail.get_mut(*id)
                         && !m.categories.is_empty()
                     {
                         m.categories.clear();
@@ -506,7 +506,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             QuickStepAction::Flag(label) => {
                 let (label, start, due) = flag_of(s, label);
                 for id in &live {
-                    if let Some(m) = s.mailbox.mail.get_mut(id) {
+                    if let Some(m) = s.mailbox.mail.get_mut(*id) {
                         m.flag = FlagState::Flagged { label: label.clone(), start, due, reminder: None };
                         touched.push(*id);
                     }
@@ -514,7 +514,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             }
             QuickStepAction::ClearFlag => {
                 for id in &live {
-                    if let Some(m) = s.mailbox.mail.get_mut(id) {
+                    if let Some(m) = s.mailbox.mail.get_mut(*id) {
                         m.flag = FlagState::None;
                         touched.push(*id);
                     }
@@ -522,7 +522,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             }
             QuickStepAction::MarkComplete => {
                 for id in &live {
-                    if let Some(m) = s.mailbox.mail.get_mut(id) {
+                    if let Some(m) = s.mailbox.mail.get_mut(*id) {
                         m.flag = FlagState::Complete { completed: Some(now) };
                         touched.push(*id);
                     }
@@ -568,7 +568,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             }
             QuickStepAction::CreateTask | QuickStepAction::CreateAppointment => {
                 for id in &live {
-                    let Some(m) = s.mailbox.mail.get(id) else { continue };
+                    let Some(m) = s.mailbox.mail.get(*id) else { continue };
                     let (subject, body) = (m.subject.clone(), m.body_text());
                     let r = if matches!(action, QuickStepAction::CreateTask) {
                         invoke(s, "tasks.new", &json!({"subject": subject, "body": body}))
@@ -916,7 +916,7 @@ mod tests {
     fn more_actions_tasks_focus_ignore_and_forward_as_attachment() {
         let (mut s, inbox, proj) = session();
         let first = s.mailbox.items_in(inbox)[0].id;
-        let subject = s.mailbox.mail[&first].subject.clone();
+        let subject = s.mailbox.mail.get(first).unwrap().subject.clone();
         let tasks_before = s.mailbox.tasks.len();
         s.run("quicksteps.new", &json!({"name": "To task", "actions": ["CreateTask", "MoveToOther"]}))
             .unwrap();
@@ -924,7 +924,7 @@ mod tests {
         assert!(r["errors"].as_array().unwrap().is_empty(), "{r}");
         assert_eq!(s.mailbox.tasks.len(), tasks_before + 1);
         assert!(s.mailbox.tasks.values().any(|t| t.subject == subject));
-        assert_eq!(s.mailbox.mail[&first].focus, mailcraft_model::FocusClass::Other);
+        assert_eq!(s.mailbox.mail.get(first).unwrap().focus, mailcraft_model::FocusClass::Other);
         // Forward as attachment to a set address.
         s.run(
             "quicksteps.new",
@@ -941,12 +941,12 @@ mod tests {
         let r = s.run("quicksteps.run", &json!({"id": "always", "ids": [first.0]})).unwrap();
         assert_eq!(r["dialog"], "quickStepFirstUse");
         s.run("quicksteps.run", &json!({"id": "always", "ids": [first.0], "folder": proj.0})).unwrap();
-        assert_eq!(s.mailbox.mail[&first].always_move_to, Some(proj));
+        assert_eq!(s.mailbox.mail.get(first).unwrap().always_move_to, Some(proj));
         // Ignore.
         let second = s.mailbox.items_in(inbox)[0].id;
         s.run("quicksteps.new", &json!({"name": "Mute", "actions": ["Ignore"]})).unwrap();
         s.run("quicksteps.run", &json!({"id": "mute", "ids": [second.0]})).unwrap();
-        assert!(s.mailbox.mail[&second].ignored);
+        assert!(s.mailbox.mail.get(second).unwrap().ignored);
         // Reply with meeting answers one message at a time.
         let step = QuickStep { actions: vec![QuickStepAction::ReplyWithMeeting], ..Default::default() };
         assert!(blocked_for(&step, 2, false).is_some());
@@ -1089,7 +1089,7 @@ mod tests {
     fn forward_options_add_to_the_forward_and_can_send_it() {
         let (mut s, inbox, _) = session();
         let first = s.mailbox.items_in(inbox)[0].id;
-        let subject = s.mailbox.mail[&first].subject.clone();
+        let subject = s.mailbox.mail.get(first).unwrap().subject.clone();
         let m = MessageAction {
             to: vec!["boss@example.com".into()],
             cc: vec!["me2@example.org".into()],
@@ -1355,8 +1355,8 @@ mod tests {
         });
         let r = s.run("quicksteps.run", &json!({"id": step, "ids": [big.0, many[0]]}));
         assert!(r.is_err(), "{r:?}");
-        assert!(s.mailbox.mail.contains_key(&big));
-        assert_eq!(s.mailbox.mail[&big].folder, inbox);
+        assert!(s.mailbox.mail.contains(big));
+        assert_eq!(s.mailbox.mail.get(big).unwrap().folder, inbox);
         assert_eq!(s.composes.len(), composes);
         // The cap and the message in `blocked_for` agree.
         assert!(
@@ -1376,8 +1376,8 @@ mod tests {
         s.selection.items = vec![items[0]];
         s.selection.focus = Some(items[0]);
         s.run("quicksteps.run", &json!({"id": 1, "folder": proj.0, "ids": [items[2].0]})).unwrap();
-        assert_eq!(s.mailbox.mail[&items[2]].folder, proj);
-        assert_eq!(s.mailbox.mail[&items[0]].folder, inbox);
+        assert_eq!(s.mailbox.mail.get(items[2]).unwrap().folder, proj);
+        assert_eq!(s.mailbox.mail.get(items[0]).unwrap().folder, inbox);
     }
 
     /// Integration: a stored step whose actions were all removed opens its own editor, not a new step's.
@@ -1432,7 +1432,7 @@ mod tests {
         s.selection.items = s.mailbox.items_in(inbox).iter().map(|m| m.id).take(1).collect();
         let id = s.selection.items[0];
         s.run("quicksteps.run", &json!({"id": "Tomorrow"})).unwrap();
-        match &s.mailbox.mail[&id].flag {
+        match &s.mailbox.mail.get(id).unwrap().flag {
             FlagState::Flagged { label, due: Some(due), .. } => {
                 assert_eq!(label, "Follow up");
                 assert_eq!(mailcraft_model::ListTime::date(*due, 0), "10/8/2026");
@@ -1440,7 +1440,10 @@ mod tests {
             other => panic!("{other:?}"),
         }
         s.run("quicksteps.run", &json!({"id": "Undated"})).unwrap();
-        assert!(matches!(&s.mailbox.mail[&id].flag, FlagState::Flagged { due: None, start: None, .. }));
+        assert!(matches!(
+            &s.mailbox.mail.get(id).unwrap().flag,
+            FlagState::Flagged { due: None, start: None, .. }
+        ));
         assert_eq!(s.run("quicksteps.list", &json!({})).unwrap()["steps"].as_array().unwrap().len(), 7);
     }
 }

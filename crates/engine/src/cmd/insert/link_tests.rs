@@ -49,7 +49,7 @@ fn links(c: &ComposeState) -> Vec<(String, Option<String>, String)> {
 
 fn draft_html(s: &mut Session, id: u64) -> String {
     let draft = crate::cmd::compose::save_draft(s, id).unwrap();
-    s.mailbox.mail[&draft].body.html.clone().unwrap()
+    s.mailbox.mail.get(draft).unwrap().body.html.clone().unwrap()
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn replies_leave_quoted_anchors_in_the_body() {
     assert!(c.bookmarks.is_empty());
     assert!(format!("{:?}", c.body).contains("Anchor"));
     let out = crate::cmd::compose::save_draft(&mut s, cid).unwrap();
-    let sent = s.mailbox.mail[&out].body.html.clone().unwrap();
+    let sent = s.mailbox.mail.get(out).unwrap().body.html.clone().unwrap();
     assert!(sent.contains(r#"name="sec2""#) || sent.contains(r#"id="sec2""#), "{sent}");
     // A draft of the user's own adopts them, but those past the cap stay in the body.
     let mut many = String::new();
@@ -252,7 +252,7 @@ fn replies_leave_quoted_anchors_in_the_body() {
     assert_eq!(c.bookmarks.len(), crate::compose::MAX_BOOKMARKS);
     assert_eq!(format!("{:?}", c.body).matches("Anchor").count(), 5);
     let out = crate::cmd::compose::save_draft(&mut s, cid).unwrap();
-    let sent = s.mailbox.mail[&out].body.html.clone().unwrap();
+    let sent = s.mailbox.mail.get(out).unwrap().body.html.clone().unwrap();
     let last = crate::compose::MAX_BOOKMARKS + 4;
     assert!(sent.contains(&format!("name=\"b{last}\"")), "an anchor past the cap was dropped");
 }

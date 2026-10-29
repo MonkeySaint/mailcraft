@@ -152,7 +152,7 @@ fn has_attachments(s: &Session) -> Option<&'static str> {
     let any = s
         .target_ids(&Value::Null)
         .iter()
-        .any(|id| s.mailbox.mail.get(id).is_some_and(MailItem::has_attachments));
+        .any(|id| s.mailbox.mail.get(*id).is_some_and(MailItem::has_attachments));
     if any { None } else { Some("no attachments in the selection") }
 }
 
@@ -193,7 +193,7 @@ fn kind_name(k: AccountKind) -> &'static str {
 fn account_json(s: &Session, a: &Account) -> Value {
     let folders: Vec<FolderId> =
         s.mailbox.folders.values().filter(|f| f.account == a.id).map(|f| f.id).collect();
-    let items = s.mailbox.mail.values().filter(|m| folders.contains(&m.folder));
+    let items = s.mailbox.mail.items().filter(|m| folders.contains(&m.folder));
     let (total, unread, bytes) = items.fold((0usize, 0usize, 0u64), |(t, u, b), m| {
         (t.saturating_add(1), u.saturating_add(usize::from(!m.read)), b.saturating_add(m.size))
     });
@@ -510,7 +510,7 @@ fn save_bytes(s: &Session, m: &MailItem, kind: &str) -> Result<Vec<u8>, CmdError
 
 fn save_as(s: &mut Session, p: &Value) -> CmdResult {
     let id = focused_item(s, p).ok_or_else(|| CmdError::Disabled("no message selected".into()))?;
-    let Some(m) = s.mailbox.mail.get(&id) else {
+    let Some(m) = s.mailbox.mail.get(id) else {
         return Err(CmdError::Disabled("no message selected".into()));
     };
     let wanted = opt_str(p, "type").map(|t| t.trim().trim_start_matches('.').to_ascii_lowercase());
@@ -548,7 +548,7 @@ fn save_attachments(s: &mut Session, p: &Value) -> CmdResult {
     let ids: Vec<ItemId> = s
         .target_ids(p)
         .into_iter()
-        .filter(|id| s.mailbox.mail.get(id).is_some_and(MailItem::has_attachments))
+        .filter(|id| s.mailbox.mail.get(*id).is_some_and(MailItem::has_attachments))
         .collect();
     if ids.is_empty() {
         return Err(CmdError::Disabled("no attachments in the selection".into()));
@@ -575,7 +575,7 @@ fn save_attachments(s: &mut Session, p: &Value) -> CmdResult {
     let mut saved = Vec::new();
     let mut missing = 0usize;
     for id in &ids {
-        let Some(m) = s.mailbox.mail.get(id) else { continue };
+        let Some(m) = s.mailbox.mail.get(*id) else { continue };
         if m.raw.is_none() && m.blob.is_none() {
             missing = missing.saturating_add(1);
             continue;
@@ -1101,7 +1101,7 @@ mod tests {
             )
             .unwrap();
         let id = ItemId(r["ids"][0].as_u64().unwrap());
-        assert_eq!(s.mailbox.mail[&id].subject, "Report: Q3/Q4");
+        assert_eq!(s.mailbox.mail.get(id).unwrap().subject, "Report: Q3/Q4");
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         // Save As into a directory picks a safe name from the subject.
@@ -1451,13 +1451,13 @@ mod tests {
             crate::datafile::parse(&crate::datafile::unseal(&std::fs::read(&file).unwrap(), "pw-1").unwrap())
                 .unwrap();
         assert_eq!(image.mail.len(), 2);
-        let kept = s.mailbox.mail.values().find(|m| m.folder == other_inbox && m.subject.is_empty()).unwrap();
+        let kept = s.mailbox.mail.items().find(|m| m.folder == other_inbox && m.subject.is_empty()).unwrap();
         let raw = s.store.as_ref().unwrap().raw_of(kept).unwrap().unwrap();
         assert!(String::from_utf8_lossy(&raw).contains("Shared-body-91c2"));
         drop(s);
         let s = Session::open(profile.path()).unwrap();
         assert!(s.mailbox.account(id).is_none());
-        let kept = s.mailbox.mail.values().find(|m| m.folder == other_inbox && m.subject.is_empty()).unwrap();
+        let kept = s.mailbox.mail.items().find(|m| m.folder == other_inbox && m.subject.is_empty()).unwrap();
         assert!(s.store.as_ref().unwrap().raw_of(kept).unwrap().is_some(), "and after a restart");
     }
 
@@ -1852,7 +1852,7 @@ mod tests {
         });
         // The source moves to the blob store, as it does for downloaded mail.
         s.store.as_mut().unwrap().checkpoint_mut(&mut s.mailbox, true).unwrap();
-        assert!(s.mailbox.mail[&item].raw.is_none());
+        assert!(s.mailbox.mail.get(item).unwrap().raw.is_none());
         let r = s.run("file.closeDataFile", &json!({"store": acct.0, "confirm": true})).unwrap();
         let path = std::path::PathBuf::from(r["path"].as_str().unwrap());
         assert!(path.starts_with(dir.path().join(crate::datafile::CLOSED_DIR)));
@@ -1920,8 +1920,8 @@ mod tests {
         let a = s.mailbox.account(id).unwrap();
         assert_eq!(a.display_name, "Test (2)");
         assert!(!a.is_default, "an opened data file never takes over as the default");
-        assert!(s.mailbox.mail.values().any(|m| m.subject == "kept"));
-        assert!(!s.mailbox.mail.values().any(|m| m.subject == "orphan"));
+        assert!(s.mailbox.mail.items().any(|m| m.subject == "kept"));
+        assert!(!s.mailbox.mail.items().any(|m| m.subject == "orphan"));
         let inboxes =
             s.mailbox.folders.values().filter(|f| f.account == id && f.role == Some(FolderRole::Inbox));
         assert_eq!(inboxes.count(), 1);
@@ -2021,9 +2021,9 @@ mod tests {
         let _ = s.run("app.undo", &json!({}));
         let copies = s.mailbox.accounts.iter().filter(|a| a.display_name == "Old").count();
         assert_eq!(copies, 1);
-        assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "keep me").count(), 1);
+        assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "keep me").count(), 1);
         // Later commands record undo steps again.
-        let id = s.mailbox.mail.values().find(|m| m.subject == "keep me").unwrap().id;
+        let id = s.mailbox.mail.items().find(|m| m.subject == "keep me").unwrap().id;
         s.run("mail.markUnread", &json!({"ids": [id.0]})).ok();
         s.run("mail.markRead", &json!({"ids": [id.0]})).unwrap();
         assert!(s.undo.can_undo());
@@ -2162,7 +2162,7 @@ mod tests {
         let (f1, f2) = (by_name("F1"), by_name("F2"));
         assert_eq!(f1.auto_archive.unwrap().target, Some(f2.id));
         assert_eq!(f2.auto_archive.unwrap().target, None, "a folder outside the file is not a target");
-        let mail = |n: &str| s.mailbox.mail.values().find(|m| m.subject == n).unwrap();
+        let mail = |n: &str| s.mailbox.mail.items().find(|m| m.subject == n).unwrap();
         let (voted, response) = (mail("Vote"), mail("Response"));
         assert_eq!(voted.votes[0].response, Some(response.id));
         assert_eq!(voted.votes[1].response, None);
@@ -2298,7 +2298,7 @@ mod tests {
             )
             .unwrap();
         let back = ItemId(r["ids"][0].as_u64().unwrap());
-        assert_eq!(s.mailbox.mail[&back].subject, "Report: Q3/Q4");
+        assert_eq!(s.mailbox.mail.get(back).unwrap().subject, "Report: Q3/Q4");
         assert!(matches!(
             s.run("file.saveAs", &json!({"path": out.to_str().unwrap(), "type": "pdf"})),
             Err(CmdError::Params(_))

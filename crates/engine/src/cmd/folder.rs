@@ -338,7 +338,7 @@ pub fn current_folder(s: &Session, p: &Value) -> Result<FolderId, CmdError> {
 pub fn prune_selection(s: &mut Session) {
     let folder = s.selection.folder;
     let mb = &s.mailbox;
-    let keep = |id: &ItemId| mb.mail.get(id).is_some_and(|m| m.folder == folder);
+    let keep = |id: &ItemId| mb.mail.get(*id).is_some_and(|m| m.folder == folder);
     s.selection.items.retain(keep);
     if s.selection.focus.is_some_and(|f| !keep(&f)) {
         s.selection.focus = s.selection.items.first().copied();
@@ -356,7 +356,7 @@ fn select_folder_or_default(s: &mut Session, folder: Option<FolderId>) {
 /// True when any folder or item uses `id`.
 fn id_taken(mb: &Mailbox, id: u64) -> bool {
     mb.folders.contains_key(&FolderId(id))
-        || mb.mail.contains_key(&ItemId(id))
+        || mb.mail.contains(ItemId(id))
         || mb.appointments.contains_key(&ItemId(id))
         || mb.contacts.contains_key(&ItemId(id))
         || mb.tasks.contains_key(&ItemId(id))
@@ -661,7 +661,7 @@ pub fn copy_folder_tree(
         map.insert(*old, id);
     }
     let mut items = 0usize;
-    let mail: Vec<MailItem> = mb.mail.values().filter(|m| map.contains_key(&m.folder)).cloned().collect();
+    let mail: Vec<MailItem> = mb.mail.items().filter(|m| map.contains_key(&m.folder)).cloned().collect();
     for mut m in mail {
         let Some(to) = map.get(&m.folder).copied() else { continue };
         m.id = ItemId(mb.alloc_id());
@@ -1245,7 +1245,7 @@ const MAX_SIZE_ROWS: usize = 500;
 fn folder_sizes(mb: &Mailbox, id: FolderId) -> Vec<Value> {
     let tree: BTreeSet<FolderId> = mb.subtree(id).into_iter().collect();
     let mut own: BTreeMap<FolderId, u64> = BTreeMap::new();
-    for m in mb.mail.values().filter(|m| tree.contains(&m.folder)) {
+    for m in mb.mail.items().filter(|m| tree.contains(&m.folder)) {
         let e = own.entry(m.folder).or_default();
         *e = e.saturating_add(m.size);
     }
@@ -1367,7 +1367,7 @@ mod tests {
         let inbox = s.selection.folder;
         mail(&mut s, inbox, "One", "a@example.com");
         let read = mail(&mut s, inbox, "Two", "b@example.com");
-        if let Some(m) = s.mailbox.mail.get_mut(&read) {
+        if let Some(m) = s.mailbox.mail.get_mut(read) {
             m.read = true;
         }
         assert_eq!(s.mailbox.badge(inbox).as_deref(), Some("1"));
@@ -1655,12 +1655,12 @@ mod tests {
         let r = run(&mut s, "folder.emptyDeleted", json!({}));
         assert_eq!(r["items"], 1);
         assert_eq!(r["folders"], 1);
-        assert!(!s.mailbox.mail.contains_key(&id));
+        assert!(!s.mailbox.mail.contains(id));
         let r = run(&mut s, "folder.recoverDeleted", json!({}));
         assert_eq!(r["count"], 1);
         let r = run(&mut s, "folder.recoverDeleted", json!({"ids": [id.0]}));
         assert_eq!(r["restored"], 1);
-        assert_eq!(s.mailbox.mail.get(&id).unwrap().folder, deleted);
+        assert_eq!(s.mailbox.mail.get(id).unwrap().folder, deleted);
         assert!(s.mailbox.validate().is_empty());
     }
 
@@ -1980,17 +1980,17 @@ mod tests {
         ];
         let r = run(&mut s, "folder.runRulesNow", json!({"all": true}));
         assert_eq!(r["matched"], 2);
-        let ma = s.mailbox.mail.get(&a).unwrap();
+        let ma = s.mailbox.mail.get(a).unwrap();
         assert_eq!(ma.folder, archive);
         assert!(ma.read && ma.is_flagged() && ma.importance == Importance::High);
         assert_eq!(ma.categories, vec!["Red category".to_string()]);
         assert_eq!(s.mailbox.total_count(archive), 2);
-        assert_eq!(s.mailbox.mail.get(&b).unwrap().folder, role(&s, FolderRole::DeletedItems));
+        assert_eq!(s.mailbox.mail.get(b).unwrap().folder, role(&s, FolderRole::DeletedItems));
         // Explicitly chosen rules run even when disabled.
         s.selection.folder = archive;
         let r = run(&mut s, "folder.runRulesNow", json!({"rules": ["Off"]}));
         assert_eq!(r["matched"], 2);
-        assert!(!s.mailbox.mail.get(&a).unwrap().is_flagged());
+        assert!(!s.mailbox.mail.get(a).unwrap().is_flagged());
         assert!(s.run("folder.runRulesNow", &json!({"rules": [99]})).is_err());
         // The shared executor counts matching items.
         let c = mail(&mut s, inbox, "budget again", "x@example.com");

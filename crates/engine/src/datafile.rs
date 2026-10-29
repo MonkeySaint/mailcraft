@@ -238,7 +238,7 @@ pub fn image_of(s: &Session, account: AccountId) -> Result<DataFileImage, CmdErr
     let folders: Vec<Folder> = s.mailbox.folders.values().filter(|f| f.account == account).cloned().collect();
     let ids: BTreeSet<FolderId> = folders.iter().map(|f| f.id).collect();
     let mut mail = Vec::new();
-    for m in s.mailbox.mail.values().filter(|m| ids.contains(&m.folder)) {
+    for m in s.mailbox.mail.items().filter(|m| ids.contains(&m.folder)) {
         let mut m = m.clone();
         if m.raw.is_none()
             && m.blob.is_some()
@@ -1139,7 +1139,7 @@ fn content_digest(s: &Session, account: AccountId) -> Result<u64, CmdError> {
     for f in s.mailbox.folders.values().filter(|f| f.account == account) {
         h.put(f)?;
     }
-    for m in s.mailbox.mail.values().filter(|m| ids.contains(&m.folder)) {
+    for m in s.mailbox.mail.items().filter(|m| ids.contains(&m.folder)) {
         // The item without its source (a copy of one message at most), then the source itself.
         let mut item = m.clone();
         let raw = item.raw.take();
@@ -1423,7 +1423,7 @@ pub fn usage(s: &Session, account: AccountId) -> (u64, usize, usize) {
         s.mailbox.folders.values().filter(|f| f.account == account).map(|f| f.id).collect();
     let mut bytes = 0u64;
     let mut items = 0usize;
-    for m in s.mailbox.mail.values().filter(|m| ids.contains(&m.folder)) {
+    for m in s.mailbox.mail.items().filter(|m| ids.contains(&m.folder)) {
         bytes = bytes.saturating_add(m.size);
         items = items.saturating_add(1);
     }
@@ -1718,7 +1718,9 @@ pub(crate) mod tests {
         assert_eq!(content_digest(&s, id).unwrap(), inline, "the same every time");
         // The source moves into the store's blobs: same contents, same digest.
         s.store.as_mut().unwrap().checkpoint_mut(&mut s.mailbox, true).unwrap();
-        assert!(s.mailbox.mail[&m].raw.is_none() && s.mailbox.mail[&m].blob.is_some());
+        assert!(
+            s.mailbox.mail.get(m).unwrap().raw.is_none() && s.mailbox.mail.get(m).unwrap().blob.is_some()
+        );
         assert_eq!(content_digest(&s, id).unwrap(), inline);
         // What Exit compares is that digest: written once with this message, then left alone.
         save_linked(&mut s, id).unwrap();
@@ -1726,12 +1728,12 @@ pub(crate) mod tests {
         assert!(!save_linked_as(&mut s, id, true).unwrap().1, "unchanged, not written again");
         assert_eq!(std::fs::read(&file).unwrap(), written);
         // Another source, another digest; the item itself counts as well.
-        let item = s.mailbox.mail.get_mut(&m).unwrap();
+        let item = s.mailbox.mail.get_mut(m).unwrap();
         item.raw = Some(b"Subject: A\r\n\r\nbody two\r\n".to_vec());
         item.blob = None;
         let other = content_digest(&s, id).unwrap();
         assert_ne!(other, inline);
-        s.mailbox.mail.get_mut(&m).unwrap().subject = "B".into();
+        s.mailbox.mail.get_mut(m).unwrap().subject = "B".into();
         assert_ne!(content_digest(&s, id).unwrap(), other);
         assert!(content_digest(&s, AccountId(9_999)).is_err());
     }

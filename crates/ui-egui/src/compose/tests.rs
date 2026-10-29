@@ -190,7 +190,7 @@ fn tiny_windows_hide_the_ribbon() {
 #[test]
 fn caret_moves_through_a_quoted_reply() {
     let ids: Vec<u64> =
-        mailcraft_engine::sample::sample_session().mailbox.mail.keys().map(|i| i.0).take(4).collect();
+        mailcraft_engine::sample::sample_session().mailbox.mail.ids().map(|i| i.0).take(4).collect();
     assert!(!ids.is_empty());
     for id in ids {
         let mut s = mailcraft_engine::sample::sample_session();

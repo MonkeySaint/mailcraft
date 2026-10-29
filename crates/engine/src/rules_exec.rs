@@ -161,7 +161,7 @@ fn contact_addresses(s: &Session) -> Vec<String> {
 }
 
 fn role_of(s: &Session, item: ItemId) -> Option<FolderRole> {
-    s.mailbox.mail.get(&item).and_then(|m| s.mailbox.folder(m.folder)).and_then(|f| f.role)
+    s.mailbox.mail.get(item).and_then(|m| s.mailbox.folder(m.folder)).and_then(|f| f.role)
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -182,7 +182,7 @@ pub fn run_rules(s: &mut Session, ids: &[ItemId], rules: &[Rule]) -> RunReport {
         // The stored source, read once per item and only for rules whose conditions scan it.
         let mut head: Option<Option<Vec<u8>>> = None;
         for rule in rules {
-            let Some(item) = s.mailbox.mail.get(&id) else { break };
+            let Some(item) = s.mailbox.mail.get(id) else { break };
             let ctx = rule_context(s, item);
             let mut env = rule_env(s, item, &run.contacts);
             if rule.needs_source() {
@@ -251,7 +251,7 @@ pub fn run_now(
     let ids: Vec<ItemId> = s
         .mailbox
         .mail
-        .values()
+        .items()
         .filter(|m| folders.contains(&m.folder) && which.wants(m))
         .map(|m| m.id)
         .collect();
@@ -269,7 +269,7 @@ fn finish(s: &mut Session, mut run: Run) -> RunReport {
         s.notify(Notice::OpenDialog("ruleSound".into(), json!({"paths": run.report.sounds})));
     }
     // A later rule may have permanently deleted an item queued for printing.
-    run.report.printed.retain(|id| s.mailbox.mail.contains_key(id));
+    run.report.printed.retain(|id| s.mailbox.mail.contains(*id));
     if !run.report.printed.is_empty() {
         let ids: Vec<u64> = run.report.printed.iter().map(|i| i.0).collect();
         match invoke(s, "file.print", &json!({"ids": ids, "quick": true, "rule": true})) {
@@ -300,7 +300,7 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
     let outgoing_rule = rule.is_outgoing();
     let mut stop = false;
     for action in &rule.actions {
-        if !s.mailbox.mail.contains_key(&id) {
+        if !s.mailbox.mail.contains(id) {
             return true;
         }
         if !action.applies_to(outgoing_rule) {
@@ -316,7 +316,7 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
             }
             RuleAction::CopyTo(f) => {
                 if s.mailbox.folder(*f).is_some_and(|t| t.kind == FolderKind::Mail)
-                    && let Some(mut copy) = s.mailbox.mail.get(&id).cloned()
+                    && let Some(mut copy) = s.mailbox.mail.get(id).cloned()
                 {
                     copy.folder = *f;
                     copy.remote_id = None;
@@ -325,7 +325,7 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
             }
             RuleAction::AssignCategory(c) => {
                 let c = c.trim();
-                if let Some(m) = s.mailbox.mail.get_mut(&id)
+                if let Some(m) = s.mailbox.mail.get_mut(id)
                     && !c.is_empty()
                     && !m.categories.iter().any(|x| x.eq_ignore_ascii_case(c))
                 {
@@ -337,7 +337,7 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
                 stop = true;
             }
             RuleAction::PermanentlyDelete => {
-                s.mailbox.mail.remove(&id);
+                s.mailbox.mail.remove(id);
                 return true;
             }
             RuleAction::MarkAsRead => {
@@ -351,22 +351,22 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
                     .map(|unix| DateTime { unix, offset_min: now.offset_min });
                 let label =
                     if label.trim().is_empty() { "Follow up".to_owned() } else { label.trim().to_owned() };
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
+                if let Some(m) = s.mailbox.mail.get_mut(id) {
                     m.flag = FlagState::Flagged { label, start: Some(now), due, reminder: None };
                 }
             }
             RuleAction::ClearFlag => {
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
+                if let Some(m) = s.mailbox.mail.get_mut(id) {
                     m.flag = FlagState::None;
                 }
             }
             RuleAction::ClearCategories => {
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
+                if let Some(m) = s.mailbox.mail.get_mut(id) {
                     m.categories.clear();
                 }
             }
             RuleAction::MarkImportance(i) => {
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
+                if let Some(m) = s.mailbox.mail.get_mut(id) {
                     m.importance = *i;
                 }
             }
@@ -379,7 +379,7 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
                 }
             }
             RuleAction::DesktopAlert => {
-                if let Some(m) = s.mailbox.mail.get(&id) {
+                if let Some(m) = s.mailbox.mail.get(id) {
                     let from = m.from.as_ref().map(|f| f.display().to_owned()).unwrap_or_default();
                     let text =
                         if from.is_empty() { m.subject.clone() } else { format!("{from}: {}", m.subject) };
@@ -413,7 +413,7 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
 
 /// One line of the New Item Alert window.
 fn alert_json(s: &Session, id: ItemId, msg: &str, rule: &str) -> Value {
-    let Some(m) = s.mailbox.mail.get(&id) else { return Value::Null };
+    let Some(m) = s.mailbox.mail.get(id) else { return Value::Null };
     let from = m.from.as_ref().or(m.sender.as_ref());
     json!({
         "item": id.0,
@@ -455,9 +455,9 @@ fn source_of(s: &Session, m: &MailItem) -> Vec<u8> {
 
 /// Rewrites the source of Outbox item `id` with `edit` (which gets and returns the raw bytes).
 fn edit_source(s: &mut Session, id: ItemId, edit: impl FnOnce(Vec<u8>) -> Vec<u8>) {
-    let Some(m) = s.mailbox.mail.get(&id) else { return };
+    let Some(m) = s.mailbox.mail.get(id) else { return };
     let raw = edit(source_of(s, m));
-    if let Some(m) = s.mailbox.mail.get_mut(&id) {
+    if let Some(m) = s.mailbox.mail.get_mut(id) {
         m.size = u64::try_from(raw.len()).unwrap_or(u64::MAX);
         m.raw = Some(raw);
         m.blob = None;
@@ -465,7 +465,7 @@ fn edit_source(s: &mut Session, id: ItemId, edit: impl FnOnce(Vec<u8>) -> Vec<u8
 }
 
 fn mark_sensitivity(s: &mut Session, id: ItemId, x: Sensitivity) {
-    if let Some(m) = s.mailbox.mail.get_mut(&id) {
+    if let Some(m) = s.mailbox.mail.get_mut(id) {
         m.sensitivity = x;
     }
     if in_outbox(s, id) {
@@ -488,7 +488,7 @@ fn defer(s: &mut Session, id: ItemId, minutes: u32) {
     let now = s.now();
     let secs = i64::from(minutes.min(MAX_DEFER_MINUTES)).saturating_mul(60);
     let until = now.unix.saturating_add(secs);
-    if let Some(m) = s.mailbox.mail.get_mut(&id) {
+    if let Some(m) = s.mailbox.mail.get_mut(id) {
         let current = m.sent.map_or(now.unix, |t| t.unix);
         m.sent = Some(DateTime { unix: until.max(current), offset_min: now.offset_min });
     }
@@ -519,7 +519,7 @@ fn cc_to(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId, list: &[String
         return;
     }
     let mut added = Vec::new();
-    if let Some(m) = s.mailbox.mail.get_mut(&id) {
+    if let Some(m) = s.mailbox.mail.get_mut(id) {
         for a in extra {
             let known = m.to.iter().chain(&m.cc).chain(&m.bcc).any(|x| x.addr.eq_ignore_ascii_case(&a.addr));
             if !known {
@@ -547,7 +547,7 @@ fn notify_header(s: &mut Session, id: ItemId, header: &str) {
     if !in_outbox(s, id) {
         return;
     }
-    let Some(from) = s.mailbox.mail.get(&id).and_then(|m| m.from.clone()) else { return };
+    let Some(from) = s.mailbox.mail.get(id).and_then(|m| m.from.clone()) else { return };
     let value = mailcraft_mime::addr::format_mailbox(&from, true);
     edit_source(s, id, |raw| set_header(&raw, header, Some(value)));
 }
@@ -568,7 +568,7 @@ fn sending_account(s: &Session, id: ItemId) -> Option<Account> {
     let own = s
         .mailbox
         .mail
-        .get(&id)
+        .get(id)
         .and_then(|m| s.mailbox.folder_account(m.folder))
         .and_then(|a| s.mailbox.account(a))
         .filter(|a| a.can_send());
@@ -629,7 +629,7 @@ fn open_response(s: &mut Session, cmd: &str, id: ItemId) -> Result<u64, String> 
 
 fn filed(s: &mut Session, run: &mut Run, item: ItemId) {
     run.report.sent.push(item);
-    if let Some(a) = s.mailbox.mail.get(&item).and_then(|m| s.mailbox.folder_account(m.folder)) {
+    if let Some(a) = s.mailbox.mail.get(item).and_then(|m| s.mailbox.folder_account(m.folder)) {
         run.outboxes.insert(a);
     }
 }
@@ -641,7 +641,7 @@ fn forward(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId, to: &[String
         run.report.errors.push(format!("{}: no valid address to forward to", rule.name));
         return;
     }
-    if s.mailbox.mail.get(&id).is_none_or(|m| from_me(s, m)) || !budget(run, rule) {
+    if s.mailbox.mail.get(id).is_none_or(|m| from_me(s, m)) || !budget(run, rule) {
         return;
     }
     if sending_account(s, id).is_none() {
@@ -671,7 +671,7 @@ fn redirect(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId, to: &[Strin
         run.report.errors.push(format!("{}: no valid address to redirect to", rule.name));
         return;
     }
-    let Some(m) = s.mailbox.mail.get(&id).cloned() else { return };
+    let Some(m) = s.mailbox.mail.get(id).cloned() else { return };
     if from_me(s, &m) || !budget(run, rule) {
         return;
     }
@@ -790,7 +790,7 @@ fn load_template(path: &str, now: DateTime) -> Result<Template, String> {
 /// with the template's (or the given) text instead of the quoted original; once per sender per run, never
 /// to the user, to automatic replies or to lists.
 fn auto_reply(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId, reply: Reply<'_>) {
-    let Some(m) = s.mailbox.mail.get(&id) else { return };
+    let Some(m) = s.mailbox.mail.get(id) else { return };
     let Some(sender) = m.reply_to.first().or(m.from.as_ref()).or(m.sender.as_ref()) else { return };
     let key = sender.addr.trim().to_lowercase();
     if key.is_empty() || from_me(s, m) || no_auto_reply(s, m) || run.replied.contains(&key) {
@@ -1017,7 +1017,7 @@ mod tests {
             .insert(cid, Contact { id: cid, emails: vec!["PAT@example.org".into()], ..Default::default() });
         let contacts = contact_addresses(&s);
         let check = |s: &Session, id: ItemId, cond: C| {
-            let item = &s.mailbox.mail[&id];
+            let item = s.mailbox.mail.get(id).unwrap();
             rule(vec![cond], vec![]).matches_in(item, &rule_context(s, item), &rule_env(s, item, &contacts))
         };
         assert!(check(&s, a, C::SuspectedJunk));
@@ -1067,7 +1067,7 @@ mod tests {
         let toasts =
             s.notices.iter().filter(|n| matches!(n, Notice::NewItemAlert(t, _) if t == "Bob: One")).count();
         assert_eq!(toasts, 1);
-        assert_eq!(s.mailbox.mail[&a].sensitivity, Sensitivity::Private);
+        assert_eq!(s.mailbox.mail.get(a).unwrap().sensitivity, Sensitivity::Private);
         // Without a print command the run says so instead.
         s.registry.specs.retain(|c| c.id != "file.print");
         s.notices.clear();
@@ -1119,7 +1119,7 @@ mod tests {
         assert!(s.composes.is_empty(), "no compose window left open");
         assert!(!s.notices.iter().any(|n| matches!(n, Notice::Compose(_))));
         // The original is still in the Inbox.
-        assert_eq!(s.mailbox.mail[&a].folder, inbox);
+        assert_eq!(s.mailbox.mail.get(a).unwrap().folder, inbox);
         let att = rule(vec![], vec![RuleAction::ForwardAsAttachment(vec!["carol@example.net".into()])]);
         run_rules(&mut s, &[a], &[att]);
         let out = outbox_items(&s, acc);
@@ -1287,7 +1287,7 @@ mod tests {
         assert_eq!(on_new_mail(&mut s, &[id]).matched, 0);
         let report = on_send(&mut s, &[id]);
         assert_eq!(report.matched, 1);
-        let m = &s.mailbox.mail[&id];
+        let m = s.mailbox.mail.get(id).unwrap();
         assert_eq!(m.sent.unwrap().unix, s.now().unix + 600, "held 10 minutes");
         assert!(m.cc.iter().any(|a| a.addr == "boss@example.net"));
         assert_eq!(m.categories, vec!["Red category".to_string()]);
@@ -1312,7 +1312,7 @@ mod tests {
         let inbox = folder(&s, acc, FolderRole::Inbox);
         let x = deliver(&mut s, inbox, &raw_message("bob@example.org", "budget", ""));
         assert_eq!(on_send(&mut s, &[x]).matched, 0);
-        assert!(s.mailbox.mail[&x].categories.is_empty());
+        assert!(s.mailbox.mail.get(x).unwrap().categories.is_empty());
     }
 
     #[test]
@@ -1320,7 +1320,7 @@ mod tests {
         let (mut s, acc) = session();
         let inbox = folder(&s, acc, FolderRole::Inbox);
         let a = deliver(&mut s, inbox, &raw_message("bob@example.org", "x", ""));
-        let before = s.mailbox.mail[&a].clone();
+        let before = s.mailbox.mail.get(a).unwrap().clone();
         run_rules(
             &mut s,
             &[a],
@@ -1329,7 +1329,7 @@ mod tests {
                 vec![RuleAction::DeferDelivery(5), RuleAction::CcTo(vec!["c@example.net".into()])],
             )],
         );
-        assert_eq!(s.mailbox.mail[&a], before);
+        assert_eq!(s.mailbox.mail.get(a).unwrap(), &before);
     }
 
     #[test]
@@ -1345,7 +1345,7 @@ mod tests {
         assert_eq!((n, rep.matched), (0, 0));
         let (n, rep) = run_now(&mut s, std::slice::from_ref(&r), inbox, true, Which::Unread);
         assert_eq!((n, rep.matched), (1, 1));
-        assert_eq!(s.mailbox.mail[&b].categories.len(), 1);
+        assert_eq!(s.mailbox.mail.get(b).unwrap().categories.len(), 1);
         let (n, _) = run_now(&mut s, &[r], inbox, true, Which::All);
         assert_eq!(n, 2);
         assert_eq!(Which::parse("READ"), Some(Which::Read));
@@ -1360,10 +1360,10 @@ mod tests {
         let r1 = rule(vec![], vec![RuleAction::MarkAsRead, RuleAction::StopProcessingMoreRules]);
         let r2 = rule(vec![], vec![RuleAction::AssignCategory("Red category".into())]);
         run_rules(&mut s, &[a], &[r1, r2.clone()]);
-        assert!(s.mailbox.mail[&a].read && s.mailbox.mail[&a].categories.is_empty());
+        assert!(s.mailbox.mail.get(a).unwrap().read && s.mailbox.mail.get(a).unwrap().categories.is_empty());
         let r0 = rule(vec![], vec![RuleAction::PermanentlyDelete]);
         assert_eq!(run_rules(&mut s, &[a, ItemId(u64::MAX)], &[r0, r2]).matched, 1);
-        assert!(!s.mailbox.mail.contains_key(&a));
+        assert!(!s.mailbox.mail.contains(a));
     }
 
     /// Rules on arriving mail run outside `Session::run`: what they delete for good must still reach the
@@ -1379,7 +1379,7 @@ mod tests {
             vec![RuleAction::PermanentlyDelete],
         )];
         crate::sync::arrival::on_new_mail(&mut s, &[a, kept]);
-        assert!(!s.mailbox.mail.contains_key(&a));
+        assert!(!s.mailbox.mail.contains(a));
         let listed: Vec<ItemId> = crate::recover::listed(&s).iter().map(|e| e.item.id()).collect();
         assert_eq!(listed, vec![a]);
         assert_eq!(crate::recover::listed(&s)[0].folder_path, "Inbox");

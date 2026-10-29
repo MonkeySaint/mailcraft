@@ -45,7 +45,7 @@ fn old_mail(app: &mut App, days: i64) -> ItemId {
 }
 
 fn path_of(app: &App, id: ItemId) -> String {
-    app.s.mailbox.mail.get(&id).map(|m| app.s.mailbox.folder_path(m.folder)).unwrap_or_default()
+    app.s.mailbox.mail.get(id).map(|m| app.s.mailbox.folder_path(m.folder)).unwrap_or_default()
 }
 
 #[test]
@@ -280,7 +280,7 @@ fn message_options_sets_do_not_autoarchive() {
     step(&mut h);
     h.get_by_label("OK").click();
     step(&mut h);
-    assert!(h.state().s.mailbox.mail[&old].no_auto_archive);
+    assert!(h.state().s.mailbox.mail.get(old).unwrap().no_auto_archive);
     let mut app = h.into_state();
     app.run("file.archive", json!({"all": true})).unwrap();
     assert_eq!(path_of(&app, old), "Inbox");

@@ -104,7 +104,7 @@ pub fn extra_results(s: &Session) -> Vec<ItemId> {
     if !o.on || o.query.trim() != s.view.search.trim() || s.view.search.trim().is_empty() {
         return Vec::new();
     }
-    o.hits.iter().copied().filter(|i| s.mailbox.mail.contains_key(i)).collect()
+    o.hits.iter().copied().filter(|i| s.mailbox.mail.contains(*i)).collect()
 }
 
 /// State for the command result and the UI.

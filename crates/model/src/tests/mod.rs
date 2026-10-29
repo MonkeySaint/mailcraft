@@ -4,6 +4,7 @@ mod category;
 mod dates;
 mod item;
 mod mailbox;
+mod mailtable;
 mod rich;
 mod rich_borders;
 mod rule;

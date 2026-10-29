@@ -278,7 +278,7 @@ fn selected_items(app: &App, surface: Surface) -> Vec<&MailItem> {
     {
         ids.push(f);
     }
-    ids.iter().filter_map(|i| app.s.mailbox.mail.get(i)).collect()
+    ids.iter().filter_map(|i| app.s.mailbox.mail.get(*i)).collect()
 }
 
 fn selected_ids(app: &App, surface: Surface) -> Vec<u64> {
@@ -614,7 +614,7 @@ fn mailbox_size(app: &App, account: Option<u32>) -> (u64, usize, u64) {
     let mut used = 0u64;
     let mut items = 0usize;
     let mut del = 0u64;
-    for m in mb.mail.values() {
+    for m in mb.mail.items() {
         if mb.folder(m.folder).is_some_and(|f| f.account == acct) {
             used = used.saturating_add(m.size);
             items = items.saturating_add(1);
@@ -674,7 +674,7 @@ fn compose_info(ui: &mut Ui, app: &mut App, cid: u64) {
     if tile(ui, app, "private", "Encrypt", encrypt_desc) {
         app.run("compose.encrypt", json!({"compose": cid}));
     }
-    let draft = c.draft.and_then(|d| app.s.mailbox.mail.get(&d)).map(|m| (m.id.0, m.folder, m.size));
+    let draft = c.draft.and_then(|d| app.s.mailbox.mail.get(d)).map(|m| (m.id.0, m.folder, m.size));
     let folder = draft.map_or_else(|| "Not yet saved".to_owned(), |(_, f, _)| app.s.mailbox.folder_path(f));
     let moved = tile_with(
         ui,
@@ -842,7 +842,7 @@ fn save_as(ui: &mut Ui, app: &mut App, surface: Surface, st: &mut PageState) {
         if app.files.is_some() && ui.button("Browse...").clicked() {
             let subject = ids
                 .first()
-                .and_then(|id| app.s.mailbox.mail.get(&ItemId(*id)))
+                .and_then(|id| app.s.mailbox.mail.get(ItemId(*id)))
                 .map(|m| m.subject.clone())
                 .unwrap_or_default();
             let ext = files::SAVE_TYPES.get(st.kind).and_then(|t| t.2.first()).copied().unwrap_or("eml");
@@ -1147,7 +1147,7 @@ pub fn print_styles(app: &mut App, ids: &[u64]) -> (Vec<(String, String)>, Strin
 fn pdf_name(app: &App, ids: &[u64]) -> String {
     let subject = ids
         .first()
-        .and_then(|i| app.s.mailbox.mail.get(&ItemId(*i)).map(|m| m.subject.clone()))
+        .and_then(|i| app.s.mailbox.mail.get(ItemId(*i)).map(|m| m.subject.clone()))
         .unwrap_or_default();
     let clean: String = subject
         .chars()

@@ -251,7 +251,7 @@ const MAX_CLIPBOARD_ITEMS: usize = 500;
 pub fn clipboard_text(s: &Session, ids: &[ItemId]) -> String {
     let tz = s.tz_offset_min;
     let mut out = String::new();
-    for m in ids.iter().take(MAX_CLIPBOARD_ITEMS).filter_map(|id| s.mailbox.mail.get(id)) {
+    for m in ids.iter().take(MAX_CLIPBOARD_ITEMS).filter_map(|id| s.mailbox.mail.get(*id)) {
         if !out.is_empty() {
             out.push('\n');
         }
@@ -281,7 +281,7 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Failed(format!("messages cannot be pasted into \"{}\"", target.name)));
     }
     let sources: Vec<MailItem> =
-        s.clipboard.iter().filter_map(|id| s.mailbox.mail.get(id).cloned()).collect();
+        s.clipboard.iter().filter_map(|id| s.mailbox.mail.get(*id).cloned()).collect();
     if sources.is_empty() {
         return Err(CmdError::Disabled("nothing to paste".into()));
     }
@@ -378,7 +378,7 @@ mod tests {
         let r = s.run("app.copy", &json!({})).unwrap();
         assert_eq!(r["copied"], 1);
         // A text rendering for other programs (the system clipboard).
-        let subject = s.mailbox.mail[&first].subject.clone();
+        let subject = s.mailbox.mail.get(first).unwrap().subject.clone();
         let text = r["text"].as_str().unwrap();
         assert!(text.contains(&format!("Subject: {subject}")), "{text}");
         assert!(text.contains("Received: "), "{text}");
@@ -415,10 +415,10 @@ mod tests {
         );
         assert!(!s.composes.contains_key(&clean));
         assert!(s.composes.contains_key(&dirty));
-        let drafts_before = s.mailbox.mail.values().filter(|m| m.is_draft).count();
+        let drafts_before = s.mailbox.mail.items().filter(|m| m.is_draft).count();
         s.run("app.closeAllItems", &json!({"save": true})).unwrap();
         assert!(s.composes.is_empty());
-        let drafts: Vec<_> = s.mailbox.mail.values().filter(|m| m.is_draft).collect();
+        let drafts: Vec<_> = s.mailbox.mail.items().filter(|m| m.is_draft).collect();
         assert_eq!(drafts.len(), drafts_before + 1);
         assert!(
             drafts.iter().any(

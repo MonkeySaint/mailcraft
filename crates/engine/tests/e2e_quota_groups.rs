@@ -67,7 +67,7 @@ fn add_imap(s: &mut Session, srv: &TestServers, user: &str, pw: &str) -> Account
 fn has(s: &Session, account: AccountId, subject: &str) -> bool {
     s.mailbox
         .mail
-        .values()
+        .items()
         .any(|m| m.subject == subject && s.mailbox.folder(m.folder).is_some_and(|f| f.account == account))
 }
 

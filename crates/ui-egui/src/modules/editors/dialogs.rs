@@ -1888,8 +1888,8 @@ mod tests {
             app.s.mailbox.folders.values().find(|f| f.kind == FolderKind::Tasks).map(|f| f.id).unwrap();
         let sub = app.s.mailbox.create_folder(tasks, "Errands").unwrap();
         let t = app.s.mailbox.tasks.keys().next().copied().unwrap();
-        let m = app.s.mailbox.mail.keys().next().copied().unwrap();
-        if let Some(mail) = app.s.mailbox.mail.get_mut(&m) {
+        let m = app.s.mailbox.mail.ids().next().unwrap();
+        if let Some(mail) = app.s.mailbox.mail.get_mut(m) {
             mail.flag = mailcraft_model::FlagState::Flagged {
                 label: "Follow up".into(),
                 start: None,
@@ -1897,12 +1897,12 @@ mod tests {
                 reminder: None,
             };
         }
-        let folder_before = app.s.mailbox.mail[&m].folder;
+        let folder_before = app.s.mailbox.mail.get(m).unwrap().folder;
         let mut k =
             Kind::Move { ids: vec![t.0, m.0], area: "tasks".into(), copy: false, folder: Some(sub.0) };
         assert_eq!(apply(&mut app, &mut k), Ok(true));
         assert_eq!(app.s.mailbox.tasks[&t].folder, sub);
-        assert_eq!(app.s.mailbox.mail[&m].folder, folder_before);
+        assert_eq!(app.s.mailbox.mail.get(m).unwrap().folder, folder_before);
         let toast = app.ui.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
         assert!(toast.starts_with("1 item could not be moved"), "{toast}");
     }

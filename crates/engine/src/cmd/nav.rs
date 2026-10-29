@@ -290,7 +290,7 @@ fn nav_people(s: &mut Session, _: &Value) -> CmdResult {
 /// To Do: flagged mail and open tasks.
 fn nav_tasks(s: &mut Session, _: &Value) -> CmdResult {
     switch_module(s, Module::Tasks);
-    let flagged: Vec<u64> = s.mailbox.mail.values().filter(|m| m.is_flagged()).map(|m| m.id.0).collect();
+    let flagged: Vec<u64> = s.mailbox.mail.items().filter(|m| m.is_flagged()).map(|m| m.id.0).collect();
     let tasks: Vec<u64> =
         s.mailbox.tasks.values().filter(|t| t.status != TaskStatus::Completed).map(|t| t.id.0).collect();
     Ok(json!({
@@ -410,7 +410,7 @@ fn selection_result(s: &Session) -> Value {
 fn item_folder(s: &Session, id: ItemId) -> Option<FolderId> {
     let mb = &s.mailbox;
     mb.mail
-        .get(&id)
+        .get(id)
         .map(|m| m.folder)
         .or_else(|| mb.contacts.get(&id).map(|c| c.folder))
         .or_else(|| mb.tasks.get(&id).map(|t| t.folder))
@@ -454,7 +454,7 @@ fn select_item(s: &mut Session, p: &Value) -> CmdResult {
         && let Some(folder) = item_folder(s, f)
         && folder != s.selection.folder
     {
-        let is_mail = s.mailbox.mail.contains_key(&f);
+        let is_mail = s.mailbox.mail.contains(f);
         // A message found by a search stays in the results; an item the current module view lists (the
         // To-Do List's flagged messages and contacts) stays in that view.
         let searching = is_mail && !s.view.search.trim().is_empty();
@@ -582,10 +582,10 @@ mod tests {
         let (a, b) = (order[0], order[1]);
         s.mailbox.set_read(&[a, b], false);
         s.run("nav.selectItem", &json!({"id": a.0})).unwrap();
-        assert!(!s.mailbox.mail[&a].read, "still unread while selected");
+        assert!(!s.mailbox.mail.get(a).unwrap().read, "still unread while selected");
         s.run("nav.nextItem", &json!({})).unwrap();
         assert_eq!(s.selection.focus, Some(b));
-        assert!(s.mailbox.mail[&a].read, "marked read when the selection moved");
+        assert!(s.mailbox.mail.get(a).unwrap().read, "marked read when the selection moved");
         s.run("nav.selectItem", &json!({"id": a.0, "extend": true})).unwrap();
         assert_eq!(s.selection.items.len(), 2);
         s.run("nav.selectAll", &json!({})).unwrap();
@@ -604,11 +604,11 @@ mod tests {
             .unwrap();
         s.run("nav.selectItem", &json!({"id": a.0})).unwrap();
         s.run("nav.nextItem", &json!({})).unwrap();
-        assert!(!s.mailbox.mail[&a].read, "option off: leaving the message keeps it unread");
+        assert!(!s.mailbox.mail.get(a).unwrap().read, "option off: leaving the message keeps it unread");
         s.run("options.set", &json!({"key": "mail.readingPane.markReadOnSelectionChange", "value": true}))
             .unwrap();
         s.run("nav.prevItem", &json!({})).unwrap();
-        assert!(s.mailbox.mail[&b].read);
+        assert!(s.mailbox.mail.get(b).unwrap().read);
     }
 
     #[test]
@@ -624,11 +624,11 @@ mod tests {
         s.run("nav.selectItem", &json!({"id": a.0})).unwrap();
         s.run("nav.nextItem", &json!({})).unwrap();
         s.run("nav.prevItem", &json!({})).unwrap();
-        assert!(!s.mailbox.mail[&a].read && !s.mailbox.mail[&b].read);
+        assert!(!s.mailbox.mail.get(a).unwrap().read && !s.mailbox.mail.get(b).unwrap().read);
         // Previews back on: leaving the previewed message marks it read again.
         s.run("options.set", &json!({"key": "mail.readingPane.alwaysPreview", "value": true})).unwrap();
         s.run("nav.nextItem", &json!({})).unwrap();
-        assert!(s.mailbox.mail[&a].read && !s.mailbox.mail[&b].read);
+        assert!(s.mailbox.mail.get(a).unwrap().read && !s.mailbox.mail.get(b).unwrap().read);
     }
 
     #[test]
@@ -706,7 +706,7 @@ mod tests {
         // The To-Do List shows flagged messages: selecting one keeps the Tasks module.
         s.run("nav.inbox", &json!({})).unwrap();
         let mail = crate::queries::visible_item_ids(&s)[0];
-        if let Some(m) = s.mailbox.mail.get_mut(&mail) {
+        if let Some(m) = s.mailbox.mail.get_mut(mail) {
             m.flag = mailcraft_model::FlagState::Flagged {
                 label: "Follow up".into(),
                 start: None,

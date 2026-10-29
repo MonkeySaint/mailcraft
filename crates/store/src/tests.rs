@@ -83,7 +83,7 @@ fn journal_round_trip_moves_raw_to_blobs() {
     let store = Store::open(d.path()).unwrap();
     let loaded = store.load().unwrap();
     assert_eq!(loaded.mail.len(), 1);
-    let got = loaded.mail.get(&ItemId(10)).cloned().unwrap();
+    let got = loaded.mail.get(ItemId(10)).cloned().unwrap();
     assert_eq!(got, stored(a));
     assert_eq!(store.get_blob(got.blob.as_deref().unwrap()).unwrap(), RAW1);
     assert_eq!(store.raw_of(&got).unwrap().as_deref(), Some(RAW1));
@@ -125,7 +125,7 @@ fn checkpoint_snapshot_excludes_raw_and_resets_journal() {
     assert!(!snap.contains("\"raw\":["), "raw sources stay out of the snapshot");
     let journal = fs::read_to_string(d.path().join(JOURNAL_FILE)).unwrap();
     assert_eq!(journal.lines().count(), 1);
-    assert!(mb.mail.get(&ItemId(5)).and_then(|m| m.raw.as_ref()).is_some(), "caller's mailbox untouched");
+    assert!(mb.mail.get(ItemId(5)).and_then(|m| m.raw.as_ref()).is_some(), "caller's mailbox untouched");
     drop(store);
 
     let store = Store::open(d.path()).unwrap();
@@ -133,7 +133,7 @@ fn checkpoint_snapshot_excludes_raw_and_resets_journal() {
     assert_eq!(report.snapshot_generation, 1);
     assert_eq!(report.replayed, 0);
     let mut expect = mb.clone();
-    for item in expect.mail.values_mut() {
+    for item in expect.mail.items_mut() {
         *item = stored(item.clone());
     }
     assert_eq!(loaded, expect);
@@ -146,12 +146,12 @@ fn checkpoint_mut_records_blob_keys() {
     mb.mail.insert(ItemId(5), mail(5, "One", Some(RAW1)));
     let mut store = Store::open(d.path()).unwrap();
     store.checkpoint_mut(&mut mb, false).unwrap();
-    let item = mb.mail.get(&ItemId(5)).cloned().unwrap();
+    let item = mb.mail.get(ItemId(5)).cloned().unwrap();
     assert_eq!(item.raw.as_deref(), Some(RAW1));
     assert_eq!(item.blob, Some(BlobKey::for_data(RAW1).to_string()));
     store.checkpoint_mut(&mut mb, true).unwrap();
     assert_eq!(store.generation(), 2);
-    assert!(mb.mail.get(&ItemId(5)).and_then(|m| m.raw.as_ref()).is_none());
+    assert!(mb.mail.get(ItemId(5)).and_then(|m| m.raw.as_ref()).is_none());
     let loaded = store.load().unwrap();
     assert_eq!(loaded, mb);
 }
@@ -174,7 +174,7 @@ fn crash_recovery_truncated_last_line() {
     let mut store = Store::open(d.path()).unwrap();
     assert!(store.open_repair().torn_bytes_removed > 0);
     let loaded = store.load().unwrap();
-    assert_eq!(loaded.mail.keys().copied().collect::<Vec<_>>(), vec![ItemId(1), ItemId(2)]);
+    assert_eq!(loaded.mail.ids().collect::<Vec<_>>(), vec![ItemId(1), ItemId(2)]);
     // Appending after the repair produces a clean journal.
     store.append(&[Op::PutMail(Box::new(mail(4, "m4", None)))]).unwrap();
     let (loaded, report) = store.load_report().unwrap();
@@ -357,7 +357,7 @@ fn replace_op_strips_raws() {
     let journal = fs::read_to_string(d.path().join(JOURNAL_FILE)).unwrap();
     assert!(!journal.contains("\"raw\":["));
     let loaded = store.load().unwrap();
-    assert_eq!(loaded.mail.get(&ItemId(4)).cloned(), Some(stored(mail(4, "x", Some(RAW2)))));
+    assert_eq!(loaded.mail.get(ItemId(4)).cloned(), Some(stored(mail(4, "x", Some(RAW2)))));
 }
 
 fn write_file(path: &Path, data: &[u8]) {
@@ -383,7 +383,7 @@ fn maildir_import_with_flags() {
     let mut mb = base_mailbox();
     let ids = import_maildir(&mut mb, &md, FolderId(1)).unwrap();
     assert_eq!(ids.len(), 4);
-    let items: Vec<&MailItem> = ids.iter().filter_map(|id| mb.mail.get(id)).collect();
+    let items: Vec<&MailItem> = ids.iter().filter_map(|id| mb.mail.get(*id)).collect();
     assert_eq!(items.len(), 4);
     let first = items.first().copied().unwrap();
     assert!(!first.read);
@@ -421,11 +421,11 @@ body two\n";
     let mut mb = base_mailbox();
     let ids = import_mbox(&mut mb, &file, FolderId(1)).unwrap();
     assert_eq!(ids.len(), 2);
-    let a = mb.mail.get(ids.first().unwrap()).unwrap();
+    let a = mb.mail.get(*ids.first().unwrap()).unwrap();
     assert_eq!(a.raw.as_deref(), Some(&b"Subject: First\nStatus: RO\n\nFrom the archive\n"[..]));
     assert!(a.read);
     assert_eq!(a.received.unix, 1_791_433_800);
-    let b = mb.mail.get(ids.get(1).unwrap()).unwrap();
+    let b = mb.mail.get(*ids.get(1).unwrap()).unwrap();
     assert!(!b.read && b.is_flagged());
     assert!(import_mbox(&mut mb, &d.path().join("nope.mbox"), FolderId(1)).is_err());
 }
@@ -454,9 +454,9 @@ fn mbox_export_import_round_trip() {
     let mut mb = base_mailbox();
     let ids = import_mbox(&mut mb, &file, FolderId(1)).unwrap();
     let back: Vec<Vec<u8>> =
-        ids.iter().filter_map(|id| mb.mail.get(id).and_then(|m| m.raw.clone())).collect();
+        ids.iter().filter_map(|id| mb.mail.get(*id).and_then(|m| m.raw.clone())).collect();
     assert_eq!(back, raws.iter().map(|r| r.to_vec()).collect::<Vec<_>>());
-    let received: Vec<i64> = ids.iter().filter_map(|id| mb.mail.get(id)).map(|m| m.received.unix).collect();
+    let received: Vec<i64> = ids.iter().filter_map(|id| mb.mail.get(*id)).map(|m| m.received.unix).collect();
     assert_eq!(received, vec![1_791_433_800, 1_791_433_801, 1_791_433_802]);
 }
 
@@ -498,7 +498,7 @@ fn import_eml_stores_blob() {
     let mut store = Store::open(&d.path().join("s")).unwrap();
     let mut mb = base_mailbox();
     let id = store.import_eml(&mut mb, &eml, FolderId(1)).unwrap();
-    let item = mb.mail.get(&id).cloned().unwrap();
+    let item = mb.mail.get(id).cloned().unwrap();
     assert_eq!(item.folder, FolderId(1));
     assert_eq!(item.raw.as_deref(), Some(RAW1));
     assert_eq!(store.get_blob(item.blob.as_deref().unwrap()).unwrap(), RAW1);
@@ -529,7 +529,7 @@ fn autosave_batches_and_checkpoints() {
     assert_eq!(auto.since_checkpoint(), 0);
     assert_eq!(auto.checkpoints(), 1);
 
-    mb.mail.remove(&ItemId(1));
+    mb.mail.remove(ItemId(1));
     auto.push(Op::RemoveMail(ItemId(1)));
     auto.finish(&mut store, &mb).unwrap();
     assert_eq!(store.generation(), 2);
@@ -538,7 +538,7 @@ fn autosave_batches_and_checkpoints() {
     let store = Store::open(d.path()).unwrap();
     let loaded = store.load().unwrap();
     let mut expect = mb.clone();
-    for item in expect.mail.values_mut() {
+    for item in expect.mail.items_mut() {
         *item = stored(item.clone());
     }
     assert_eq!(loaded, expect);
@@ -551,7 +551,7 @@ fn op_apply_semantics() {
     Op::PutMail(Box::new(mail(40, "a", None))).apply(&mut mb);
     assert_eq!(mb.next_id, 40);
     Op::PutMail(Box::new(mail(40, "b", None))).apply(&mut mb);
-    assert_eq!(mb.mail.get(&ItemId(40)).map(|m| m.subject.as_str()), Some("b"));
+    assert_eq!(mb.mail.get(ItemId(40)).map(|m| m.subject.as_str()), Some("b"));
     Op::RemoveMail(ItemId(40)).apply(&mut mb);
     Op::RemoveMail(ItemId(40)).apply(&mut mb);
     assert!(mb.mail.is_empty());
@@ -641,7 +641,7 @@ proptest::proptest! {
         let store = Store::open(d.path()).unwrap();
         let loaded = store.load().unwrap();
         let mut expect = mb;
-        for item in expect.mail.values_mut() {
+        for item in expect.mail.items_mut() {
             *item = stored(item.clone());
         }
         proptest::prop_assert_eq!(loaded, expect);
@@ -667,7 +667,7 @@ fn gc_keeps_blobs_of_items_still_holding_raw() {
     }
     let store = Store::open(d.path()).unwrap();
     let loaded = store.load().unwrap();
-    let got = loaded.mail.get(&ItemId(9)).cloned().unwrap();
+    let got = loaded.mail.get(ItemId(9)).cloned().unwrap();
     assert_eq!(store.raw_of(&got).unwrap().as_deref(), Some(RAW1));
 }
 
@@ -691,7 +691,7 @@ fn appends_survive_failed_journal_reset() {
     drop(store);
     let store = Store::open(d.path()).unwrap();
     let loaded = store.load().unwrap();
-    assert_eq!(loaded.mail.keys().copied().collect::<Vec<_>>(), vec![ItemId(1), ItemId(2)]);
+    assert_eq!(loaded.mail.ids().collect::<Vec<_>>(), vec![ItemId(1), ItemId(2)]);
 }
 
 /// A damaged blob that an item still points at is rewritten from the in-memory source before the source is
@@ -703,7 +703,7 @@ fn checkpoint_rewrites_damaged_blob_before_dropping_raw() {
     mb.mail.insert(ItemId(5), mail(5, "One", Some(RAW1)));
     let mut store = Store::open(d.path()).unwrap();
     store.checkpoint_mut(&mut mb, false).unwrap();
-    let key = mb.mail.get(&ItemId(5)).and_then(|m| m.blob.clone()).unwrap();
+    let key = mb.mail.get(ItemId(5)).and_then(|m| m.blob.clone()).unwrap();
     let path = BlobKey::parse(&key).unwrap().path(d.path());
     fs::write(&path, &RAW1[..10]).unwrap();
     store.checkpoint_mut(&mut mb, true).unwrap();
@@ -796,11 +796,11 @@ fn import_eml_without_date_uses_mtime() {
     let mut store = Store::open(&d.path().join("s")).unwrap();
     let mut mb = base_mailbox();
     let id = store.import_eml(&mut mb, &eml, FolderId(1)).unwrap();
-    assert_eq!(mb.mail.get(&id).map(|m| m.received.unix), Some(1_700_000_000));
+    assert_eq!(mb.mail.get(id).map(|m| m.received.unix), Some(1_700_000_000));
     // A dated message keeps its own date.
     write_file(&eml, b"Subject: dated\r\nDate: Thu, 08 Oct 2026 04:30:00 +0000\r\n\r\nbody\r\n");
     let id = store.import_eml(&mut mb, &eml, FolderId(1)).unwrap();
-    assert_eq!(mb.mail.get(&id).map(|m| m.received.unix), Some(1_791_433_800));
+    assert_eq!(mb.mail.get(id).map(|m| m.received.unix), Some(1_791_433_800));
 }
 
 /// The journal never grows past what `open` / `load` will read back.
@@ -857,7 +857,7 @@ fn mbox_import_stops_at_byte_cap() {
     let mut mb = base_mailbox();
     let ids = crate::import::import_mbox_capped(&mut mb, &file, FolderId(1), 300).unwrap();
     assert!(!ids.is_empty() && ids.len() < 10, "{}", ids.len());
-    let held: usize = mb.mail.values().filter_map(|m| m.raw.as_ref()).map(Vec::len).sum();
+    let held: usize = mb.mail.items().filter_map(|m| m.raw.as_ref()).map(Vec::len).sum();
     assert!(held <= 300);
     let ids = import_mbox(&mut mb, &file, FolderId(1)).unwrap();
     assert_eq!(ids.len(), 10);

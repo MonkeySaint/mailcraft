@@ -612,7 +612,7 @@ mod tests {
         let s = &h.state().s;
         assert_eq!(s.mailbox.notes.len(), notes);
         assert_eq!(s.mailbox.mail.len(), mail + 1);
-        let m = s.mailbox.mail.values().find(|m| m.subject == "Team lunch").expect("post saved");
+        let m = s.mailbox.mail.items().find(|m| m.subject == "Team lunch").expect("post saved");
         assert_eq!(m.folder, inbox);
         assert!(m.to.is_empty() && !m.is_draft);
         assert_eq!(m.body.text.as_deref(), Some("Friday at noon."));

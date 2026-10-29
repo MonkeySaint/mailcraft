@@ -907,7 +907,7 @@ fn every_item(s: &Session, filter: &mailcraft_search::Filter) -> Vec<ItemId> {
     };
     let mut mail: Vec<(i64, ItemId)> = mb
         .mail
-        .values()
+        .items()
         .filter(|m| wanted(DocKind::Mail, m.folder))
         .map(|m| (m.received.unix, m.id))
         .collect();
@@ -923,7 +923,7 @@ fn every_item(s: &Session, filter: &mailcraft_search::Filter) -> Vec<ItemId> {
 /// One result row: id, subject, from, received, folder.
 fn row(s: &Session, id: ItemId) -> Option<Value> {
     let mb = &s.mailbox;
-    if let Some(m) = mb.mail.get(&id) {
+    if let Some(m) = mb.mail.get(id) {
         let from =
             m.from.as_ref().map(|a| a.name.clone().unwrap_or_else(|| a.addr.clone())).unwrap_or_default();
         return Some(json!({
@@ -984,7 +984,7 @@ fn highlights(s: &mut Session, p: &Value) -> CmdResult {
             let m = s
                 .mailbox
                 .mail
-                .get(&ItemId(id))
+                .get(ItemId(id))
                 .ok_or_else(|| CmdError::Params(format!("no message with id {id}")))?;
             let people = |list: &[mailcraft_model::Address]| {
                 list.iter()
@@ -1104,7 +1104,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let m = s.mailbox.mail.get(&a).unwrap().clone();
+        let m = s.mailbox.mail.get(a).unwrap().clone();
         for q in [
             "",
             "budget",

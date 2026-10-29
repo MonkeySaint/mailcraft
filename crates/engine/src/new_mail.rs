@@ -41,7 +41,7 @@ pub(crate) fn seen_folder(s: &mut Session, folder: FolderId) {
         return;
     }
     let mb = &s.mailbox;
-    s.sync.new_mail.retain(|id| mb.mail.get(id).is_some_and(|m| m.folder != folder));
+    s.sync.new_mail.retain(|id| mb.mail.get(*id).is_some_and(|m| m.folder != folder));
 }
 
 /// Folders whose mail never counts as new: every Deleted Items and Junk Email folder with its subfolders,
@@ -56,7 +56,7 @@ fn excluded_folders(mb: &Mailbox) -> BTreeSet<FolderId> {
 
 /// True while `id` is unread mail outside the folders in `skip` ([`excluded_folders`]).
 fn counts(mb: &Mailbox, skip: &BTreeSet<FolderId>, id: ItemId) -> bool {
-    let Some(m) = mb.mail.get(&id) else { return false };
+    let Some(m) = mb.mail.get(id) else { return false };
     if m.read || m.is_draft || skip.contains(&m.folder) {
         return false;
     }
@@ -82,7 +82,7 @@ pub fn envelope_folder(s: &Session) -> Option<FolderId> {
         .new_mail
         .iter()
         .filter(|id| counts(&s.mailbox, &skip, **id))
-        .filter_map(|id| s.mailbox.mail.get(id))
+        .filter_map(|id| s.mailbox.mail.get(*id))
         .max_by_key(|m| (m.received.unix, m.id))
         .map(|m| m.folder)
 }
@@ -156,7 +156,7 @@ mod tests {
         let mut s = sample_session();
         let (m, _) = unread_inbox_mail(&mut s);
         // Entries for mail that is gone (or read, or moved to folders nobody opens) fill the set.
-        let first_free = s.mailbox.mail.keys().max().map_or(0, |i| i.0).saturating_add(1);
+        let first_free = s.mailbox.mail.ids().max().map_or(0, |i| i.0).saturating_add(1);
         let stale = u64::try_from(MAX_NEW).unwrap();
         s.sync.new_mail.extend((first_free..first_free.saturating_add(stale)).map(ItemId));
         assert_eq!(s.sync.new_mail.len(), MAX_NEW);

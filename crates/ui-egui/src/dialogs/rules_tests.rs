@@ -385,7 +385,7 @@ fn run_rules_now_on_unread_messages() {
     let ids = inbox_items(&app);
     let first = *ids.first().unwrap();
     app.s.mailbox.set_read(&[ItemId(first)], true);
-    let unread = ids.iter().filter(|i| !app.s.mailbox.mail[&ItemId(**i)].read).count();
+    let unread = ids.iter().filter(|i| !app.s.mailbox.mail.get(ItemId(**i)).unwrap().read).count();
     let everything = app.s.mailbox.rules.len() - 1;
     app.run("folder.runRulesNow", json!({})).unwrap();
     let mut h = harness(app);
@@ -401,8 +401,11 @@ fn run_rules_now_on_unread_messages() {
     step(&mut h);
     assert!(h.query_by_label(&format!("Done. The rules acted on {unread} message(s).")).is_some());
     let mb = &h.state().s.mailbox;
-    assert!(mb.mail[&ItemId(first)].categories.iter().all(|c| c != "Rules test"), "read message skipped");
-    let blue = mb.mail.values().filter(|m| m.categories.iter().any(|c| c == "Rules test")).count();
+    assert!(
+        mb.mail.get(ItemId(first)).unwrap().categories.iter().all(|c| c != "Rules test"),
+        "read message skipped"
+    );
+    let blue = mb.mail.items().filter(|m| m.categories.iter().any(|c| c == "Rules test")).count();
     assert_eq!(blue, unread);
 }
 
@@ -427,7 +430,8 @@ fn new_item_alert_window_collects_runs_and_opens_items() {
     // Two runs, one window; the sound "dialog" played (once for the frame) and closed at once.
     assert_eq!(names(&h), ["newItemAlerts"]);
     assert_eq!(crate::dialogs::alerts::played_sounds(&h.ctx), vec!["/s/ding.wav".to_owned()]);
-    let subject = |id: u64, h: &Harness<'_, App>| h.state().s.mailbox.mail[&ItemId(id)].subject.clone();
+    let subject =
+        |id: u64, h: &Harness<'_, App>| h.state().s.mailbox.mail.get(ItemId(id)).unwrap().subject.clone();
     let (s1, s2) = (subject(first, &h), subject(second, &h));
     assert!(h.query_by_label("From").is_some() && h.query_by_label("Received").is_some());
     assert!(h.query_all_by_label(&s1).next().is_some());
@@ -484,7 +488,7 @@ fn first_use_setup_names_the_step_after_the_folder() {
     let q = &st.s.mailbox.quick_steps[0];
     assert_eq!(q.name, "Projects");
     assert_eq!(q.actions[0], QuickStepAction::MoveTo(Some(FolderId(target))));
-    assert_eq!(st.s.mailbox.mail[&ItemId(item)].folder, FolderId(target));
+    assert_eq!(st.s.mailbox.mail.get(ItemId(item)).unwrap().folder, FolderId(target));
 }
 
 #[test]

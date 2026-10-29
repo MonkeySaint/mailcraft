@@ -382,7 +382,7 @@ pub fn offer(s: &Session, id: ItemId) -> Option<(&'static str, String)> {
     {
         return None;
     }
-    let m = s.mailbox.mail.get(&id)?;
+    let m = s.mailbox.mail.get(id)?;
     let from = detect(&detect_sample(m))?;
     let to = s.settings.text("language.translateTo");
     (primary(from) != primary(&to)).then_some((from, to))
@@ -579,7 +579,7 @@ fn apply(s: &mut Session, job: Job, r: Result<String, String>) {
         .target
         .get("item")
         .and_then(Value::as_u64)
-        .is_some_and(|i| s.mailbox.mail.contains_key(&ItemId(i)))
+        .is_some_and(|i| s.mailbox.mail.contains(ItemId(i)))
     {
         return;
     }
@@ -883,7 +883,7 @@ mod tests {
     fn ask_offers_and_always_translates_once() {
         let (url, seen) = fake_server(2);
         let (mut s, fr) = session_with("Projet", FRENCH);
-        let inbox = s.mailbox.mail[&fr].folder;
+        let inbox = s.mailbox.mail.get(fr).unwrap().folder;
         let mut m = MailItem { folder: inbox, subject: "Report".into(), ..Default::default() };
         m.body.text = Some(ENGLISH.into());
         let en = s.mailbox.add_mail(m);

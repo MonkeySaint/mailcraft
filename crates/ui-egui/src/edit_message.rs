@@ -54,7 +54,7 @@ pub(crate) struct MsgEditor {
 
 impl MsgEditor {
     fn new(app: &App, item: u64) -> Option<MsgEditor> {
-        let m = app.s.mailbox.mail.get(&ItemId(item))?;
+        let m = app.s.mailbox.mail.get(ItemId(item))?;
         let plain = m.body.format == BodyFormat::PlainText || m.body.html.is_none();
         let body: Doc = mailcraft_engine::cmd::mail::body_doc(m);
         let mut session = Session::new(Mailbox::new_local("Edit Message"));
@@ -148,7 +148,7 @@ pub fn is_editing(app: &App, item: u64) -> bool {
 
 /// Starts editing `item` in its read window (opening the window when needed).
 pub fn start(app: &mut App, item: u64) {
-    if !app.s.mailbox.mail.contains_key(&ItemId(item)) {
+    if !app.s.mailbox.mail.contains(ItemId(item)) {
         return;
     }
     if !app.ui.read_windows.contains(&item) {
@@ -404,9 +404,9 @@ mod tests {
         app.s
             .mailbox
             .mail
-            .values()
+            .items()
             .find(|m| m.body.html.as_deref().is_some_and(|h| h.contains("<b>") || h.contains("<strong>")))
-            .or_else(|| app.s.mailbox.mail.values().find(|m| m.body.html.is_some()))
+            .or_else(|| app.s.mailbox.mail.items().find(|m| m.body.html.is_some()))
             .map(|m| m.id.0)
             .unwrap()
     }
@@ -442,7 +442,7 @@ mod tests {
         let html = p["html"].as_str().unwrap().to_owned();
         assert!(html.contains("EDITED"), "{html}");
         app.run("mail.editMessage", p).unwrap();
-        let m = &app.s.mailbox.mail[&ItemId(id)];
+        let m = app.s.mailbox.mail.get(ItemId(id)).unwrap();
         assert!(m.subject.ends_with("(annotated)"));
         let stored = m.body.html.as_deref().unwrap();
         assert!(stored.contains("EDITED"), "{stored}");
@@ -457,8 +457,8 @@ mod tests {
     #[test]
     fn plain_text_messages_save_as_text() {
         let mut s = sample_session();
-        let id = s.mailbox.mail.values().next().map(|m| m.id).unwrap();
-        if let Some(m) = s.mailbox.mail.get_mut(&id) {
+        let id = s.mailbox.mail.items().next().map(|m| m.id).unwrap();
+        if let Some(m) = s.mailbox.mail.get_mut(id) {
             m.body.format = BodyFormat::PlainText;
             m.body.html = None;
             m.body.text = Some("line one".into());
@@ -504,6 +504,6 @@ mod tests {
         h.run_steps(2);
         assert!(!is_editing(h.state(), id));
         assert!(h.state().ui.read_windows.is_empty());
-        assert!(!h.state().s.mailbox.mail[&ItemId(id)].subject.ends_with('!'));
+        assert!(!h.state().s.mailbox.mail.get(ItemId(id)).unwrap().subject.ends_with('!'));
     }
 }

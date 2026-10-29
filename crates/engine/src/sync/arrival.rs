@@ -78,7 +78,7 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
     let mut report = ArrivalReport::default();
     let mut seen = BTreeSet::new();
     let ids: Vec<ItemId> =
-        ids.iter().copied().filter(|i| s.mailbox.mail.contains_key(i) && seen.insert(*i)).collect();
+        ids.iter().copied().filter(|i| s.mailbox.mail.contains(*i) && seen.insert(*i)).collect();
     if ids.is_empty() {
         return report;
     }
@@ -107,7 +107,7 @@ fn process(s: &mut Session, ids: Vec<ItemId>, report: &mut ArrivalReport) {
     // What the rules left outside Deleted Items and Junk Email, newest last.
     let mut ids: Vec<ItemId> = ids.into_iter().filter(|i| still_in_mail(s, *i)).collect();
     if ids.len() > MAX_PROCESSED {
-        ids.sort_by_key(|i| (s.mailbox.mail.get(i).map_or(0, |m| m.received.unix), *i));
+        ids.sort_by_key(|i| (s.mailbox.mail.get(*i).map_or(0, |m| m.received.unix), *i));
         let excess = ids.len().saturating_sub(MAX_PROCESSED);
         ids.drain(..excess);
     }
@@ -125,7 +125,7 @@ fn record_votes(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
     let replies: Vec<ItemId> = ids
         .iter()
         .copied()
-        .filter(|i| s.mailbox.mail.get(i).is_some_and(|m| !m.in_reply_to.is_empty()))
+        .filter(|i| s.mailbox.mail.get(*i).is_some_and(|m| !m.in_reply_to.is_empty()))
         .take(MAX_PROCESSED)
         .collect();
     if replies.is_empty() {
@@ -138,7 +138,7 @@ fn record_votes(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
     let mut out = Vec::new();
     for id in replies {
         let to_mine =
-            s.mailbox.mail.get(&id).is_some_and(|m| m.in_reply_to.iter().any(|r| mine.contains(&bare_id(r))));
+            s.mailbox.mail.get(id).is_some_and(|m| m.in_reply_to.iter().any(|r| mine.contains(&bare_id(r))));
         if to_mine && crate::cmd::compose::record_vote(s, id).is_some() {
             out.push(id);
         }
@@ -148,7 +148,7 @@ fn record_votes(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
 
 /// True when `id` still exists in a mail folder outside Deleted Items and Junk Email.
 fn still_in_mail(s: &Session, id: ItemId) -> bool {
-    let Some(m) = s.mailbox.mail.get(&id) else { return false };
+    let Some(m) = s.mailbox.mail.get(id) else { return false };
     let Some(f) = s.mailbox.folder(m.folder) else { return false };
     if f.kind != FolderKind::Mail {
         return false;
@@ -168,7 +168,7 @@ fn scheduling(s: &mut Session, ids: &[ItemId], report: &mut ArrivalReport) {
     let mut task_replies = Vec::new();
     for id in ids {
         // Cheap test first: only messages carrying calendar data are parsed.
-        let carries_calendar = s.mailbox.mail.get(id).is_some_and(|m| {
+        let carries_calendar = s.mailbox.mail.get(*id).is_some_and(|m| {
             m.attachments.iter().any(|a| {
                 a.mime_type.to_ascii_lowercase().starts_with("text/calendar")
                     || a.filename.trim().to_ascii_lowercase().ends_with(".ics")
@@ -241,8 +241,10 @@ fn scheduling(s: &mut Session, ids: &[ItemId], report: &mut ArrivalReport) {
         }
     }
     if delete_plain {
-        let gone: Vec<ItemId> =
-            plain.into_iter().filter(|id| s.mailbox.mail.get(id).is_some_and(|m| !has_comments(m))).collect();
+        let gone: Vec<ItemId> = plain
+            .into_iter()
+            .filter(|id| s.mailbox.mail.get(*id).is_some_and(|m| !has_comments(m)))
+            .collect();
         delete(s, &gone, report);
     }
 }
@@ -263,7 +265,7 @@ fn tracking(s: &mut Session, ids: &[ItemId], report: &mut ArrivalReport) {
     let mut votes = Vec::new();
     let mut receipts = Vec::new();
     for id in ids {
-        let Some(m) = s.mailbox.mail.get(id) else { continue };
+        let Some(m) = s.mailbox.mail.get(*id) else { continue };
         let Some(raw) = crate::cmd::compose::stored_raw(s, m) else { continue };
         if delete_plain
             && refers_to_mine(m)
@@ -286,7 +288,7 @@ fn tracking(s: &mut Session, ids: &[ItemId], report: &mut ArrivalReport) {
     }
     let target = s.settings.text("mail.tracking.moveReceiptsTo");
     for id in receipts {
-        let account = s.mailbox.mail.get(&id).and_then(|m| s.mailbox.folder_account(m.folder));
+        let account = s.mailbox.mail.get(id).and_then(|m| s.mailbox.folder_account(m.folder));
         let Some(dest) = receipts_folder(s, account, &target) else {
             log::warn!("the receipts folder \"{target}\" was not found; receipt {} stays", id.0);
             continue;
@@ -314,8 +316,9 @@ fn has_comments(m: &MailItem) -> bool {
     !crate::settings::new_text_of_reply(&m.body_text()).trim().is_empty()
 }
 
+/// The Message-ID key the mail table matches by (no brackets, lower-case).
 fn bare_id(v: &str) -> String {
-    v.trim().trim_start_matches('<').trim_end_matches('>').trim().to_ascii_lowercase()
+    mailcraft_model::message_id_key(v)
 }
 
 /// Message-IDs (bare, lower-case) of the messages I sent that are still in the mailbox.
@@ -323,7 +326,7 @@ fn my_message_ids(s: &Session) -> BTreeSet<String> {
     let me = crate::cmd::mail::my_addresses(s);
     s.mailbox
         .mail
-        .values()
+        .items()
         .filter(|m| m.from.as_ref().is_some_and(|f| me.contains(&f.addr.trim().to_lowercase())))
         .filter_map(|m| m.message_id.as_deref().map(bare_id))
         .filter(|i| !i.is_empty())
@@ -445,7 +448,7 @@ mod tests {
         s.selection.focus = Some(first);
         s.run("mail.ignore", &json!({"ids": [first.0], "confirm": true})).unwrap();
         let deleted = role(&s, FolderRole::DeletedItems);
-        assert_eq!(s.mailbox.mail[&first].folder, deleted);
+        assert_eq!(s.mailbox.mail.get(first).unwrap().folder, deleted);
         // A reply that only links through References (its subject changed) and an unrelated message.
         let reply = arrive(
             &mut s,
@@ -455,11 +458,11 @@ mod tests {
         let fresh = arrive(&mut s, "From: cy@example.com\nSubject: Agenda\n\nz\n");
         let r = on_new_mail(&mut s, &[reply, fresh]);
         assert_eq!(r.ignored, vec![reply]);
-        assert_eq!(s.mailbox.mail[&reply].folder, deleted);
-        assert!(s.mailbox.mail[&reply].ignored);
+        assert_eq!(s.mailbox.mail.get(reply).unwrap().folder, deleted);
+        assert!(s.mailbox.mail.get(reply).unwrap().ignored);
         let inbox = role(&s, FolderRole::Inbox);
-        assert_eq!(s.mailbox.mail[&fresh].folder, inbox);
-        assert_eq!(s.mailbox.mail[&other].folder, inbox);
+        assert_eq!(s.mailbox.mail.get(fresh).unwrap().folder, inbox);
+        assert_eq!(s.mailbox.mail.get(other).unwrap().folder, inbox);
         // Regression: the same subject from someone else, linked by no Message-ID, is not part of the
         // ignored conversation (it used to be threaded in by subject and deleted on arrival).
         let same_subject = arrive(
@@ -471,9 +474,9 @@ mod tests {
             "From: zed@example.org\nSubject: RE: Parking rota\nMessage-ID: <z-2@example.org>\n\nagain\n",
         );
         assert!(on_new_mail(&mut s, &[same_subject, reply_subject]).ignored.is_empty());
-        assert_eq!(s.mailbox.mail[&same_subject].folder, inbox);
-        assert!(!s.mailbox.mail[&same_subject].ignored);
-        assert_eq!(s.mailbox.mail[&reply_subject].folder, inbox);
+        assert_eq!(s.mailbox.mail.get(same_subject).unwrap().folder, inbox);
+        assert!(!s.mailbox.mail.get(same_subject).unwrap().ignored);
+        assert_eq!(s.mailbox.mail.get(reply_subject).unwrap().folder, inbox);
         // A reply and its own reply arriving together both follow the ignored conversation.
         let r1 = arrive(
             &mut s,
@@ -487,16 +490,16 @@ mod tests {
         );
         let got = on_new_mail(&mut s, &[r2, r1]).ignored;
         assert_eq!(got.len(), 2, "{got:?}");
-        assert_eq!(s.mailbox.mail[&r2].folder, deleted);
+        assert_eq!(s.mailbox.mail.get(r2).unwrap().folder, deleted);
         // Nothing ignored: nothing moves.
         s.run("mail.ignore", &json!({"ids": [first.0]})).unwrap();
-        assert!(!s.mailbox.mail.values().any(|m| m.ignored));
+        assert!(!s.mailbox.mail.items().any(|m| m.ignored));
         let again = arrive(
             &mut s,
             "From: bob@example.com\nSubject: Re: Parking rota\nReferences: <rota-1@example.com>\n\nw\n",
         );
         assert!(on_new_mail(&mut s, &[again]).ignored.is_empty());
-        assert_eq!(s.mailbox.mail[&again].folder, inbox);
+        assert_eq!(s.mailbox.mail.get(again).unwrap().folder, inbox);
     }
 
     #[test]
@@ -518,10 +521,10 @@ mod tests {
         assert_eq!(r.junk, vec![spam]);
         assert_eq!(r.focused_other, vec![news]);
         assert_eq!(r.rules_matched, 1);
-        assert_eq!(s.mailbox.mail[&news].focus, FocusClass::Other);
-        assert_eq!(s.mailbox.mail[&news].categories, vec!["Red category".to_string()]);
-        assert_eq!(s.mailbox.mail[&ann].focus, FocusClass::Focused);
-        assert!(s.mailbox.mail[&spam].categories.is_empty(), "rules skip junk");
+        assert_eq!(s.mailbox.mail.get(news).unwrap().focus, FocusClass::Other);
+        assert_eq!(s.mailbox.mail.get(news).unwrap().categories, vec!["Red category".to_string()]);
+        assert_eq!(s.mailbox.mail.get(ann).unwrap().focus, FocusClass::Focused);
+        assert!(s.mailbox.mail.get(spam).unwrap().categories.is_empty(), "rules skip junk");
         assert_eq!(on_new_mail(&mut s, &[]), ArrivalReport::default());
     }
 
@@ -544,7 +547,7 @@ mod tests {
         assert_eq!(r["ignored"], true);
         assert!(s.settings.bool(crate::cmd::mail::IGNORE_DONT_ASK));
         let deleted = role(&s, FolderRole::DeletedItems);
-        assert_eq!(s.mailbox.mail[&first].folder, deleted);
+        assert_eq!(s.mailbox.mail.get(first).unwrap().folder, deleted);
         // A reply (by References) follows it, and so does a reply to that reply. Mail that only shares the
         // subject (no header link to the ignored messages) stays in the Inbox, as does unrelated mail.
         let reply = arrive(
@@ -556,12 +559,12 @@ mod tests {
         let unrelated = arrive(&mut s, "From: ann@example.com\nSubject: Lunch\n\nx\n");
         let r = on_new_mail(&mut s, &[reply, same_topic, unrelated]);
         assert_eq!(r.ignored, vec![reply]);
-        assert_eq!(s.mailbox.mail[&reply].folder, deleted);
-        assert!(s.mailbox.mail[&reply].ignored);
+        assert_eq!(s.mailbox.mail.get(reply).unwrap().folder, deleted);
+        assert!(s.mailbox.mail.get(reply).unwrap().ignored);
         let inbox = role(&s, FolderRole::Inbox);
         for id in [same_topic, unrelated] {
-            assert_eq!(s.mailbox.mail[&id].folder, inbox);
-            assert!(!s.mailbox.mail[&id].ignored);
+            assert_eq!(s.mailbox.mail.get(id).unwrap().folder, inbox);
+            assert!(!s.mailbox.mail.get(id).unwrap().ignored);
         }
         assert_eq!(r.rules_matched, 0);
         let second = arrive(
@@ -604,9 +607,9 @@ mod tests {
         );
         let r = on_new_mail(&mut s, &[reply]);
         assert!(r.ignored.is_empty(), "not reported as ignored: it is still in the Inbox");
-        assert_eq!(s.mailbox.mail[&reply].folder, role(&s, FolderRole::Inbox));
+        assert_eq!(s.mailbox.mail.get(reply).unwrap().folder, role(&s, FolderRole::Inbox));
         assert_eq!(r.rules_matched, 1, "the rules still see it");
-        assert_eq!(s.mailbox.mail[&reply].categories, vec!["Red category".to_string()]);
+        assert_eq!(s.mailbox.mail.get(reply).unwrap().categories, vec!["Red category".to_string()]);
     }
 
     #[test]
@@ -619,8 +622,8 @@ mod tests {
         let ann = arrive(&mut s, "From: ann@example.com\nSubject: Hi\n\nx\n");
         let r = on_new_mail(&mut s, &[news, ann]);
         assert_eq!(r.focused_other, vec![news]);
-        assert_eq!(s.mailbox.mail[&news].focus, FocusClass::Other);
-        assert_eq!(s.mailbox.mail[&ann].focus, FocusClass::Focused);
+        assert_eq!(s.mailbox.mail.get(news).unwrap().focus, FocusClass::Other);
+        assert_eq!(s.mailbox.mail.get(ann).unwrap().focus, FocusClass::Focused);
     }
 
     #[test]
@@ -679,8 +682,8 @@ mod tests {
         assert_eq!(r.meeting_responses, vec![reply, noted]);
         assert!(tracked(&mut org));
         assert_eq!(r.responses_deleted, vec![reply]);
-        assert_eq!(org.mailbox.mail[&reply].folder, role(&org, FolderRole::DeletedItems));
-        assert_eq!(org.mailbox.mail[&noted].folder, role(&org, FolderRole::Inbox));
+        assert_eq!(org.mailbox.mail.get(reply).unwrap().folder, role(&org, FolderRole::DeletedItems));
+        assert_eq!(org.mailbox.mail.get(noted).unwrap().folder, role(&org, FolderRole::Inbox));
     }
 
     #[test]
@@ -728,9 +731,9 @@ mod tests {
         );
         let r = on_new_mail(&mut s, &[b, c, d]);
         assert_eq!(r.responses_deleted, vec![b]);
-        assert_eq!(s.mailbox.mail[&b].folder, role(&s, FolderRole::DeletedItems));
-        assert_eq!(s.mailbox.mail[&c].folder, role(&s, FolderRole::Inbox));
-        assert_eq!(s.mailbox.mail[&d].folder, role(&s, FolderRole::Inbox));
+        assert_eq!(s.mailbox.mail.get(b).unwrap().folder, role(&s, FolderRole::DeletedItems));
+        assert_eq!(s.mailbox.mail.get(c).unwrap().folder, role(&s, FolderRole::Inbox));
+        assert_eq!(s.mailbox.mail.get(d).unwrap().folder, role(&s, FolderRole::Inbox));
     }
 
     fn mdn(about: &str) -> String {
@@ -766,8 +769,8 @@ mod tests {
         let other = arrive(&mut s, &mdn("not-mine@example.net"));
         let r = on_new_mail(&mut s, &[read, other]);
         assert_eq!(r.receipts_moved, vec![read]);
-        assert_eq!(s.mailbox.mail[&read].folder, role(&s, FolderRole::DeletedItems));
-        assert_eq!(s.mailbox.mail[&other].folder, role(&s, FolderRole::Inbox));
+        assert_eq!(s.mailbox.mail.get(read).unwrap().folder, role(&s, FolderRole::DeletedItems));
+        assert_eq!(s.mailbox.mail.get(other).unwrap().folder, role(&s, FolderRole::Inbox));
         // A folder of my own; a delivery receipt goes there, a failure report stays in the Inbox.
         let inbox = role(&s, FolderRole::Inbox);
         let receipts = s.mailbox.create_folder(inbox, "Receipts").unwrap();
@@ -776,13 +779,13 @@ mod tests {
         let failed = arrive(&mut s, &dsn("r-1@example.com", "failed"));
         let r = on_new_mail(&mut s, &[delivered, failed]);
         assert_eq!(r.receipts_moved, vec![delivered]);
-        assert_eq!(s.mailbox.mail[&delivered].folder, receipts);
-        assert_eq!(s.mailbox.mail[&failed].folder, inbox);
+        assert_eq!(s.mailbox.mail.get(delivered).unwrap().folder, receipts);
+        assert_eq!(s.mailbox.mail.get(failed).unwrap().folder, inbox);
         // A folder that does not exist: the receipt stays.
         set(&mut s, "mail.tracking.moveReceiptsTo", json!("Nowhere\\At all"));
         let lost = arrive(&mut s, &mdn("r-1@example.com"));
         assert!(on_new_mail(&mut s, &[lost]).receipts_moved.is_empty());
-        assert_eq!(s.mailbox.mail[&lost].folder, inbox);
+        assert_eq!(s.mailbox.mail.get(lost).unwrap().folder, inbox);
     }
 
     #[test]
@@ -823,7 +826,7 @@ mod tests {
         assert_eq!(a.show_as, BusyStatus::Tentative);
         assert_eq!(a.reminder_min, Some(30));
         assert_eq!(a.folder, role(&ann, FolderRole::Calendar));
-        assert!(!ann.mailbox.mail[&req].read);
+        assert!(!ann.mailbox.mail.get(req).unwrap().read);
         let info = ann.run("calendar.meetingInfo", &json!({"id": req.0})).unwrap();
         assert_eq!((info["myResponse"].as_str(), info["appointment"].as_u64()), (Some("none"), Some(id.0)));
         // The same meeting again is not placed twice.
@@ -879,9 +882,9 @@ mod tests {
         assert_eq!(tally(&s), vec![("Approve".to_owned(), 1), ("Reject".to_owned(), 1)]);
         // Deleted Items emptied: the responses are gone, the tally is not.
         s.run("folder.emptyDeleted", &json!({"confirm": true})).unwrap();
-        assert!(!s.mailbox.mail.contains_key(&a) && !s.mailbox.mail.contains_key(&b));
+        assert!(!s.mailbox.mail.contains(a) && !s.mailbox.mail.contains(b));
         assert_eq!(tally(&s), vec![("Approve".to_owned(), 1), ("Reject".to_owned(), 1)]);
-        assert_eq!(s.mailbox.mail[&original].votes.len(), 2);
+        assert_eq!(s.mailbox.mail.get(original).unwrap().votes.len(), 2);
         // A later vote from the same person replaces theirs; a vote from someone else's thread is not mine.
         let c = arrive(&mut s, &plain("ann@example.com", "Reject"));
         let d = arrive(

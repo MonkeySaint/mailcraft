@@ -116,7 +116,7 @@ impl DeletedItem {
 
 fn present(mb: &Mailbox, kind: &str, id: ItemId) -> bool {
     match kind {
-        "mail" => mb.mail.contains_key(&id),
+        "mail" => mb.mail.contains(id),
         "appointment" => mb.appointments.contains_key(&id),
         "contact" => mb.contacts.contains_key(&id),
         "task" => mb.tasks.contains_key(&id),
@@ -234,8 +234,8 @@ impl RecoverBin {
     ) -> Vec<DeletedItem> {
         let mut out: Vec<DeletedItem> = before
             .mail
-            .values()
-            .filter(|m| !after.mail.contains_key(&m.id) && keep(m.folder))
+            .items()
+            .filter(|m| !after.mail.contains(m.id) && keep(m.folder))
             .take(limit)
             .map(|m| DeletedItem::Mail(Box::new(m.clone())))
             .collect();

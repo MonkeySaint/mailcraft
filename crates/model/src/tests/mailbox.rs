@@ -297,7 +297,7 @@ fn delete_folder_moves_then_purges() {
     m.delete_folder(p).unwrap();
     assert_eq!(m.folder(p).unwrap().parent, Some(deleted));
     assert_eq!(m.folder_path(c), "Deleted Items\\Projects\\Child");
-    assert!(m.mail.contains_key(&item));
+    assert!(m.mail.contains(item));
     assert!(m.folder(c).unwrap().favorite_pos.is_none());
     assert_eq!(m.favorites().len(), 4);
 
@@ -310,7 +310,7 @@ fn delete_folder_moves_then_purges() {
     m.delete_folder(p).unwrap();
     assert!(m.folder(p).is_none());
     assert!(m.folder(c).is_none());
-    assert!(!m.mail.contains_key(&item));
+    assert!(!m.mail.contains(item));
     assert!(m.validate().is_empty());
     assert_eq!(m.delete_folder(p), Err(ModelError::NoFolder(p)));
 }
@@ -372,7 +372,7 @@ fn move_and_delete_items() {
     let z = add(&mut m, archive, true);
     let moved = m.move_items(&[x, z, ItemId(999_999), x], archive).unwrap();
     assert_eq!(moved, vec![x]);
-    assert_eq!(m.mail[&x].folder, archive);
+    assert_eq!(m.mail.get(x).unwrap().folder, archive);
     assert_eq!(m.move_items(&[y], FolderId(888_888)), Err(ModelError::NoFolder(FolderId(888_888))));
     assert!(matches!(m.move_items(&[y], role(&m, a, FolderRole::Calendar)), Err(ModelError::NotAllowed(_))));
 
@@ -380,20 +380,20 @@ fn move_and_delete_items() {
     assert_eq!(snaps.len(), 2);
     assert_eq!(snaps[0].folder, archive);
     assert_eq!(snaps[1].folder, inbox);
-    assert_eq!(m.mail[&x].folder, deleted);
-    assert_eq!(m.mail[&y].folder, deleted);
+    assert_eq!(m.mail.get(x).unwrap().folder, deleted);
+    assert_eq!(m.mail.get(y).unwrap().folder, deleted);
 
     let snaps = m.delete_items(&[x, ItemId(777_777)]).unwrap();
     assert_eq!(snaps.len(), 1);
     assert_eq!(snaps[0].folder, deleted);
-    assert!(!m.mail.contains_key(&x));
-    assert!(m.mail.contains_key(&y));
+    assert!(!m.mail.contains(x));
+    assert!(m.mail.contains(y));
 
     // Items in a subfolder of Deleted Items are purged too.
     let sub = m.create_folder(deleted, "Old").unwrap();
     m.move_items(&[y], sub).unwrap();
     m.delete_items(&[y]).unwrap();
-    assert!(!m.mail.contains_key(&y));
+    assert!(!m.mail.contains(y));
 }
 
 #[test]
@@ -495,7 +495,7 @@ proptest! {
             ids[i % ids.len()]
         };
         let pick_item = |m: &Mailbox, i: usize| -> Option<ItemId> {
-            let ids: Vec<ItemId> = m.mail.keys().copied().collect();
+            let ids: Vec<ItemId> = m.mail.ids().collect();
             (!ids.is_empty()).then(|| ids[i % ids.len()])
         };
         let names = ["a", "B", "c", "A", "b", "deep"];
@@ -523,7 +523,7 @@ proptest! {
         let folder_ids: BTreeSet<u64> = m.folders.keys().map(|f| f.0).collect();
         for (k, f) in &m.folders { prop_assert_eq!(*k, f.id); }
         for (k, item) in &m.mail {
-            prop_assert_eq!(*k, item.id);
+            prop_assert_eq!(k, item.id);
             prop_assert!(!folder_ids.contains(&k.0));
         }
         // Sibling names stay unique (case-insensitive).
@@ -549,7 +549,7 @@ fn exhausted_id_counter_never_reuses_ids() {
     let f = m.create_folder(inbox, "After exhaustion").unwrap();
     assert_ne!(x, y);
     assert_eq!(m.mail.len(), 2, "second insert must not overwrite the first");
-    assert!(!m.mail.contains_key(&ItemId(f.0)));
+    assert!(!m.mail.contains(ItemId(f.0)));
     assert!(m.validate().is_empty());
 }
 

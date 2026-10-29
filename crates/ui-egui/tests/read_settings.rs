@@ -66,7 +66,7 @@ fn select_first(h: &mut Harness<'_, App>) -> u64 {
 fn always_preview_off_keeps_the_message_out_of_the_reading_pane() {
     let mut h = build(app_with(&[("mail.readingPane.alwaysPreview", json!(false))]), 1600.0, 1000.0);
     let id = select_first(&mut h);
-    let subject = h.state().s.mailbox.mail[&mailcraft_engine::model::ItemId(id)].subject.clone();
+    let subject = h.state().s.mailbox.mail.get(mailcraft_engine::model::ItemId(id)).unwrap().subject.clone();
     assert!(has(&h, mailcraft_ui_egui::reading::PREVIEW_OFF));
     assert!(!has(&h, "More actions"), "no message header in the pane");
     // The link turns previews on again.
@@ -234,7 +234,7 @@ fn incomplete_search_notice_sits_above_the_results() {
     }
     let inbox = app.s.selection.folder;
     let m = app.s.mailbox.items_in(inbox)[0].id;
-    if let Some(item) = app.s.mailbox.mail.get_mut(&m) {
+    if let Some(item) = app.s.mailbox.mail.get_mut(m) {
         item.body = mailcraft_engine::model::Body::default();
         item.raw = None;
     }

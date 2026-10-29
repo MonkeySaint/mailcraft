@@ -54,7 +54,7 @@ fn cleanup(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     "Keep your mailbox small: find old or large items, archive, and empty Deleted Items.",
                 );
                 ui.horizontal(|ui| {
-                    let total: u64 = app.s.mailbox.mail.values().map(|m| m.size).sum();
+                    let total: u64 = app.s.mailbox.mail.items().map(|m| m.size).sum();
                     ui.label(format!("Mailbox size: {}", common::size_text(total)));
                     if btn(ui, "View Mailbox Size...") {
                         st.show_sizes = !st.show_sizes;
@@ -112,7 +112,7 @@ fn deleted_folder(app: &App) -> Option<FolderId> {
 fn deleted_size(app: &App) -> u64 {
     let Some(d) = deleted_folder(app) else { return 0 };
     let tree = app.s.mailbox.subtree(d);
-    app.s.mailbox.mail.values().filter(|m| tree.contains(&m.folder) || m.folder == d).map(|m| m.size).sum()
+    app.s.mailbox.mail.items().filter(|m| tree.contains(&m.folder) || m.folder == d).map(|m| m.size).sum()
 }
 
 fn has_deleted_subfolders(app: &App) -> bool {

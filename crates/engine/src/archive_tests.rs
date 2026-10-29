@@ -36,7 +36,7 @@ fn mail(s: &mut Session, folder: FolderId, days_ago: i64) -> ItemId {
 }
 
 fn folder_of(s: &Session, id: ItemId) -> Option<String> {
-    s.mailbox.mail.get(&id).map(|m| s.mailbox.folder_path(m.folder))
+    s.mailbox.mail.get(id).map(|m| s.mailbox.folder_path(m.folder))
 }
 
 fn run(s: &mut Session, id: &str, p: Value) -> Value {
@@ -58,8 +58,8 @@ fn scheduled_delete_keeps_items_recoverable() {
     run(&mut s, "options.autoArchive", json!({"run": true, "action": "delete", "olderThanMonths": 3}));
     let r = run_scheduled(&mut s).unwrap();
     assert_eq!(r["deleted"], 1, "{r}");
-    assert!(!s.mailbox.mail.contains_key(&old));
-    assert!(s.mailbox.mail.contains_key(&new));
+    assert!(!s.mailbox.mail.contains(old));
+    assert!(s.mailbox.mail.contains(new));
     let listed: Vec<ItemId> = crate::recover::listed(&s).iter().map(|e| e.item.id()).collect();
     assert_eq!(listed, vec![old]);
 }
@@ -206,8 +206,8 @@ fn the_age_setting_and_action_change_what_happens() {
     set(&mut s, "advanced.autoArchive.action", json!("delete"));
     let r = run(&mut s, "file.archive", json!({"all": true}));
     assert_eq!((r["deleted"].as_u64(), r["moved"].as_u64()), (Some(1), Some(0)));
-    assert!(!s.mailbox.mail.contains_key(&b));
-    assert!(s.mailbox.mail.contains_key(&a), "what was archived stays archived");
+    assert!(!s.mailbox.mail.contains(b));
+    assert!(s.mailbox.mail.contains(a), "what was archived stays archived");
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn folder_properties_override_the_defaults() {
     assert_eq!((r["moved"].as_u64(), r["deleted"].as_u64()), (Some(2), Some(1)), "{r}");
     assert_eq!(folder_of(&s, in_never).as_deref(), Some("Sent Items"), "Do not archive");
     assert_eq!(folder_of(&s, three_weeks).as_deref(), Some("Archives\\Inbox"), "own age");
-    assert!(!s.mailbox.mail.contains_key(&in_delete), "own action: delete");
+    assert!(!s.mailbox.mail.contains(in_delete), "own action: delete");
     assert_eq!(folder_of(&s, in_target).as_deref(), Some("Inbox\\Kept"), "own folder, no mirroring");
     // The target folder is not archived itself (it sits under Inbox, whose age would catch it).
     assert_eq!(folder_of(&s, in_target).as_deref(), Some("Inbox\\Kept"));
@@ -336,9 +336,9 @@ fn expired_mail_is_deleted_when_asked() {
     set(&mut s, "advanced.autoArchive.deleteExpired", json!(true));
     let r = run(&mut s, "file.archive", json!({"all": true}));
     assert_eq!(r["expired"], 1);
-    assert!(!s.mailbox.mail.contains_key(&expired));
-    assert!(s.mailbox.mail.contains_key(&later));
-    assert!(s.mailbox.mail.contains_key(&in_never), "folders that are not archived keep expired mail");
+    assert!(!s.mailbox.mail.contains(expired));
+    assert!(s.mailbox.mail.contains(later));
+    assert!(s.mailbox.mail.contains(in_never), "folders that are not archived keep expired mail");
 }
 
 #[test]
@@ -350,7 +350,7 @@ fn do_not_autoarchive_items_stay_unless_included() {
     s.selection.focus = Some(keep);
     let r = run(&mut s, "mail.doNotAutoArchive", json!({"on": true}));
     assert_eq!(r["changed"], 1);
-    assert!(s.mailbox.mail[&keep].no_auto_archive);
+    assert!(s.mailbox.mail.get(keep).unwrap().no_auto_archive);
     run(&mut s, "file.archive", json!({"all": true}));
     assert_eq!(folder_of(&s, keep).as_deref(), Some("Inbox"));
     // The Archive dialog can include them.
@@ -550,7 +550,7 @@ fn header_only_server_mail_is_not_moved_out_of_the_server() {
         .unwrap();
     assert!(text.contains("2 messages with only their headers"), "{text}");
     // Downloaded later, it goes on the next run.
-    s.mailbox.mail.get_mut(&head).unwrap().body.text = Some("Now in full".into());
+    s.mailbox.mail.get_mut(head).unwrap().body.text = Some("Now in full".into());
     s.sync.prefs.data.headers_only.remove(&head.0);
     run(&mut s, "file.archive", json!({"all": true}));
     assert_eq!(folder_of(&s, head).as_deref(), Some("Archives\\Inbox"));
@@ -569,12 +569,12 @@ fn header_only_server_mail_is_not_moved_out_of_the_server() {
     );
     run(&mut s, "folder.autoArchiveSettings", json!({"folder": inbox.0, "mode": "custom", "target": keep.0}));
     run(&mut s, "file.archive", json!({"all": true}));
-    assert_eq!(s.mailbox.mail[&bare].folder, keep);
+    assert_eq!(s.mailbox.mail.get(bare).unwrap().folder, keep);
     // Permanent delete was asked for: headers only or not, it goes.
     let gone = server_mail(&mut s, inbox, 10, false);
     run(&mut s, "folder.autoArchiveSettings", json!({"folder": inbox.0, "action": "delete", "target": null}));
     run(&mut s, "file.archive", json!({"all": true}));
-    assert!(!s.mailbox.mail.contains_key(&gone));
+    assert!(!s.mailbox.mail.contains(gone));
 }
 
 #[test]
@@ -635,12 +635,12 @@ fn expired_mail_is_found_in_the_store_after_a_restart() {
     };
     let mut s = Session::open(dir.path()).unwrap();
     s.fixed_now = Some(DateTime::from_unix(now_unix(), 0));
-    let m = &s.mailbox.mail[&id];
+    let m = s.mailbox.mail.get(id).unwrap();
     assert!(m.raw.is_none() && m.blob.is_some(), "the source is in a blob");
     set(&mut s, "advanced.autoArchive.deleteExpired", json!(true));
     let r = run(&mut s, "file.archive", json!({"all": true}));
     assert_eq!(r["expired"], 1, "{r}");
-    assert!(!s.mailbox.mail.contains_key(&id));
+    assert!(!s.mailbox.mail.contains(id));
 }
 
 #[test]
@@ -669,7 +669,7 @@ fn flagged_mail_is_archived_like_any_other() {
     let mut s = session();
     let inbox = role(&s, FolderRole::Inbox);
     let id = mail(&mut s, inbox, 400);
-    s.mailbox.mail.get_mut(&id).unwrap().flag =
+    s.mailbox.mail.get_mut(id).unwrap().flag =
         FlagState::Flagged { label: "Follow up".into(), start: None, due: None, reminder: None };
     run(&mut s, "file.archive", json!({"all": true}));
     assert_eq!(folder_of(&s, id).as_deref(), Some("Archives\\Inbox"));

@@ -30,7 +30,7 @@ pub(crate) fn dialog(s: &mut Session, name: &str, params: Value) -> CmdResult {
 
 /// Enabled predicate: something is selected in the list.
 pub(crate) fn need_selection(s: &Session) -> Option<&'static str> {
-    if s.target_ids(&Value::Null).iter().any(|id| s.mailbox.mail.contains_key(id)) {
+    if s.target_ids(&Value::Null).iter().any(|id| s.mailbox.mail.contains(*id)) {
         None
     } else {
         Some("no message selected")
@@ -43,11 +43,11 @@ pub(crate) fn focused_item(s: &Session, p: &Value) -> Option<ItemId> {
     if crate::cmd::util::opt_ids(p).is_none()
         && let Some(f) = s.selection.focus
         && ids.contains(&f)
-        && s.mailbox.mail.contains_key(&f)
+        && s.mailbox.mail.contains(f)
     {
         return Some(f);
     }
-    ids.into_iter().find(|id| s.mailbox.mail.contains_key(id))
+    ids.into_iter().find(|id| s.mailbox.mail.contains(*id))
 }
 
 /// Parses `p[key]` as JSON of type `T` (model enums use serde's external tagging, e.g. `{"MoveTo": 5}`).
@@ -372,7 +372,7 @@ fn items_in_scope(s: &Session, folder: FolderId, subfolders: bool) -> Vec<ItemId
     let folders: Vec<FolderId> = if subfolders { s.mailbox.subtree(folder) } else { vec![folder] };
     s.mailbox
         .mail
-        .values()
+        .items()
         .filter(|m| folders.contains(&m.folder) || m.folder == folder)
         .map(|m| m.id)
         .collect()
@@ -475,7 +475,7 @@ fn new_rule(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Prefill for the Create Rule dialog from an item: sender, first recipient, subject.
 fn prefill(s: &Session, id: ItemId) -> Option<Value> {
-    let m = s.mailbox.mail.get(&id)?;
+    let m = s.mailbox.mail.get(id)?;
     let from = m.from.as_ref().or(m.sender.as_ref());
     Some(json!({
         "item": id.0,
@@ -492,7 +492,7 @@ fn create_from_message(s: &mut Session, p: &Value) -> CmdResult {
     if p.get("actions").is_none() {
         return dialog(s, "createRule", pre);
     }
-    let Some(m) = s.mailbox.mail.get(&id) else {
+    let Some(m) = s.mailbox.mail.get(id) else {
         return Err(CmdError::Disabled("no message selected".into()));
     };
     let from = m.from.as_ref().or(m.sender.as_ref()).map(|f| f.addr.clone());
@@ -534,7 +534,7 @@ fn create_from_message(s: &mut Session, p: &Value) -> CmdResult {
 
 fn always_move_from(s: &mut Session, p: &Value) -> CmdResult {
     let id = focused_item(s, p).ok_or_else(|| CmdError::Disabled("no message selected".into()))?;
-    let Some(m) = s.mailbox.mail.get(&id) else {
+    let Some(m) = s.mailbox.mail.get(id) else {
         return Err(CmdError::Disabled("no message selected".into()));
     };
     let Some(sender) = m.from.clone().or_else(|| m.sender.clone()) else {
@@ -1033,7 +1033,7 @@ fn ids_param(s: &Session, p: &Value) -> Vec<ItemId> {
     crate::cmd::util::opt_ids(p)
         .unwrap_or_default()
         .into_iter()
-        .filter(|id| s.mailbox.mail.contains_key(id))
+        .filter(|id| s.mailbox.mail.contains(*id))
         .collect()
 }
 

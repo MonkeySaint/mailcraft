@@ -1280,7 +1280,7 @@ pub fn apply(ctx: &egui::Context, app: &mut App, surface: Surface, action: Actio
             // F4: the find bar of the message in this read window, else of the reading pane's message.
             let item = match surface {
                 Surface::Read(item) => Some(item),
-                _ => app.s.selection.focus.filter(|f| app.s.mailbox.mail.contains_key(f)).map(|f| f.0),
+                _ => app.s.selection.focus.filter(|f| app.s.mailbox.mail.contains(*f)).map(|f| f.0),
             };
             match item {
                 Some(id) => {
@@ -1337,7 +1337,7 @@ fn run_cmd(ctx: &egui::Context, app: &mut App, surface: Surface, id: &str, param
     if let Surface::Read(item) = surface
         && id.starts_with("mail.")
         && app.s.enabled(id).is_some()
-        && app.s.mailbox.mail.contains_key(&mailcraft_model::ItemId(item))
+        && app.s.mailbox.mail.contains(mailcraft_model::ItemId(item))
         && !app.s.selection.items.iter().any(|i| i.0 == item)
     {
         let _ = app.run("nav.selectItem", json!({"id": item}));
@@ -1965,7 +1965,7 @@ mod tests {
             Action::Run { id: "mail.permanentDelete".into(), params: json!({}) },
         );
         assert_eq!(r["action"], "confirm");
-        assert!(app.s.mailbox.mail.contains_key(&item));
+        assert!(app.s.mailbox.mail.contains(item));
         assert!(app.ui.dialogs.iter().any(|(n, p)| n == "confirm" && p["params"]["ids"][0] == item.0));
         app.ui.dialogs.clear();
         app.run("options.set", json!({"key": "advanced.confirmPermanentDelete", "value": false}));
@@ -1975,7 +1975,7 @@ mod tests {
             Surface::Main,
             Action::Run { id: "mail.permanentDelete".into(), params: json!({"ids": [item.0]}) },
         );
-        assert!(!app.s.mailbox.mail.contains_key(&item));
+        assert!(!app.s.mailbox.mail.contains(item));
     }
 
     #[test]

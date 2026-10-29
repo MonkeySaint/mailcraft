@@ -22,7 +22,7 @@ fn run(s: &mut Session, id: &str, p: Value) -> Value {
 
 fn select(s: &mut Session, ids: &[ItemId]) {
     if let Some(first) = ids.first() {
-        s.selection.folder = s.mailbox.mail[first].folder;
+        s.selection.folder = s.mailbox.mail.get(*first).unwrap().folder;
     }
     s.selection.items = ids.to_vec();
     s.selection.focus = ids.first().copied();
@@ -104,7 +104,7 @@ fn a_mailbox_past_the_snapshot_cap_keeps_its_journal_and_still_opens() {
     let s = Session::open(dir.path()).unwrap();
     assert_eq!(s.mailbox.items_in(inbox).len(), 20);
     for (n, id) in ids.iter().enumerate() {
-        assert_eq!(s.mailbox.mail[id].read, n < 3, "item {n}");
+        assert_eq!(s.mailbox.mail.get(*id).unwrap().read, n < 3, "item {n}");
     }
 }
 
@@ -161,7 +161,7 @@ fn folder_counts_are_memoised_and_stay_right_across_commands_undo_and_redo() {
     assert!(s.folder_counts(inbox).unread > 0 || unread_before == 0);
 
     // A change made directly to the mailbox (tests, tools) is seen once it is announced.
-    if let Some(m) = s.mailbox.mail.get_mut(&items[0]) {
+    if let Some(m) = s.mailbox.mail.get_mut(items[0]) {
         m.read = !m.read;
     }
     s.mailbox_changed();
@@ -223,7 +223,7 @@ fn synced_mail_leaves_its_source_in_the_store_and_counts_follow_sync() {
     // Features that read the source still find it in the store.
     let second = s.mailbox.items_in(inbox).iter().find(|m| m.subject == "Second").map(|m| m.id).unwrap();
     assert_eq!(
-        mailcraft_engine::junk::list_address(&s, &s.mailbox.mail[&second]).as_deref(),
+        mailcraft_engine::junk::list_address(&s, s.mailbox.mail.get(second).unwrap()).as_deref(),
         Some("team@lists.example.org")
     );
     select(&mut s, &[second]);
@@ -276,13 +276,19 @@ fn imported_mail_leaves_its_source_in_the_store() {
     for m in s.mailbox.items_in(inbox) {
         assert!(m.raw.is_none() && m.blob.is_some(), "{}", m.subject);
     }
-    assert_eq!(s.store.as_ref().unwrap().raw_of(&s.mailbox.mail[&id]).unwrap().as_deref(), Some(&raw[..]));
+    assert_eq!(
+        s.store.as_ref().unwrap().raw_of(s.mailbox.mail.get(id).unwrap()).unwrap().as_deref(),
+        Some(&raw[..])
+    );
     assert_counts_right(&s, "import");
     // Undo the import, redo it: the sources come back from the store.
     run(&mut s, "app.undo", json!({}));
     assert_counts_right(&s, "undo import");
     run(&mut s, "app.redo", json!({}));
-    assert_eq!(s.store.as_ref().unwrap().raw_of(&s.mailbox.mail[&id]).unwrap().as_deref(), Some(&raw[..]));
+    assert_eq!(
+        s.store.as_ref().unwrap().raw_of(s.mailbox.mail.get(id).unwrap()).unwrap().as_deref(),
+        Some(&raw[..])
+    );
 
     let mut mem = Session::new(Mailbox::new_local("Local Folders"));
     let inbox = mem.selection.folder;
@@ -292,7 +298,11 @@ fn imported_mail_leaves_its_source_in_the_store() {
         json!({"action": "importEml", "path": eml.to_str().unwrap(), "folder": inbox.0}),
     );
     let id = ItemId(r["ids"][0].as_u64().unwrap());
-    assert_eq!(mem.mailbox.mail[&id].raw.as_deref(), Some(&raw[..]), "no store: the source stays");
+    assert_eq!(
+        mem.mailbox.mail.get(id).unwrap().raw.as_deref(),
+        Some(&raw[..]),
+        "no store: the source stays"
+    );
 }
 
 /// Imports `raw` as an .eml file into `folder`; returns the new item.
@@ -351,7 +361,7 @@ fn source_readers_see_the_stored_source_after_it_left_memory() {
     let signed = import_eml(&mut s, dir.path(), "signed", &p7m("signed-data", "o1"), inbox);
     let sealed = import_eml(&mut s, dir.path(), "sealed", &p7m("enveloped-data", "o2"), inbox);
     for id in [list, away, plain, offer, signed, sealed] {
-        let m = &s.mailbox.mail[&id];
+        let m = s.mailbox.mail.get(id).unwrap();
         assert!(m.raw.is_none() && m.blob.is_some(), "{} left memory", m.subject);
     }
     // Another command in between: nothing brings the sources back.
@@ -373,13 +383,14 @@ fn source_readers_see_the_stored_source_after_it_left_memory() {
     );
     let r = run(&mut s, "rules.runNow", json!({"folder": inbox.0}));
     assert_eq!(r["applied"], 2, "{r}");
-    assert_eq!(s.mailbox.mail[&list].folder, lists, "the List-Id header matched");
-    assert!(s.mailbox.mail[&away].read, "the Auto-Submitted header matched");
-    assert_eq!(s.mailbox.mail[&plain].folder, inbox);
-    assert!(!s.mailbox.mail[&plain].read);
+    assert_eq!(s.mailbox.mail.get(list).unwrap().folder, lists, "the List-Id header matched");
+    assert!(s.mailbox.mail.get(away).unwrap().read, "the Auto-Submitted header matched");
+    assert_eq!(s.mailbox.mail.get(plain).unwrap().folder, inbox);
+    assert!(!s.mailbox.mail.get(plain).unwrap().read);
 
     // Expiry: the list strikes the message through, and search finds it, also after it changed.
-    let expired = |s: &Session, id| mailcraft_engine::cmd::view::mail::is_expired(s, &s.mailbox.mail[&id]);
+    let expired =
+        |s: &Session, id| mailcraft_engine::cmd::view::mail::is_expired(s, s.mailbox.mail.get(id).unwrap());
     assert!(expired(&s, offer));
     assert!(!expired(&s, plain));
     s.selection.folder = inbox;
@@ -393,11 +404,15 @@ fn source_readers_see_the_stored_source_after_it_left_memory() {
     run(&mut s, "mail.markRead", json!({}));
     assert_eq!(found(&s), vec![offer], "re-indexed with its expiry date");
     assert!(expired(&s, offer));
-    assert!(mailcraft_engine::search_index::item_matches(&s, &s.mailbox.mail[&offer], "expires:any"));
+    assert!(mailcraft_engine::search_index::item_matches(
+        &s,
+        s.mailbox.mail.get(offer).unwrap(),
+        "expires:any"
+    ));
 
     // S/MIME: opaque-signed mail is readable, so a reply need not be encrypted; enveloped data is encrypted.
-    assert!(!mailcraft_engine::smime::is_encrypted(&s, &s.mailbox.mail[&signed]), "opaque-signed");
-    assert!(mailcraft_engine::smime::is_encrypted(&s, &s.mailbox.mail[&sealed]), "enveloped");
+    assert!(!mailcraft_engine::smime::is_encrypted(&s, s.mailbox.mail.get(signed).unwrap()), "opaque-signed");
+    assert!(mailcraft_engine::smime::is_encrypted(&s, s.mailbox.mail.get(sealed).unwrap()), "enveloped");
 }
 
 /// Regression test (issue #25 review): when the journal refuses a batch for its size, the same state is
@@ -421,7 +436,7 @@ fn a_batch_the_journal_refuses_is_saved_as_a_snapshot() {
         (id, generation)
     };
     let s = Session::open(dir.path()).unwrap();
-    assert!(s.mailbox.mail[&id].read, "the change was saved");
+    assert!(s.mailbox.mail.get(id).unwrap().read, "the change was saved");
     assert!(s.store.as_ref().unwrap().generation() > generation);
 }
 
@@ -458,7 +473,7 @@ fn changes_neither_journal_nor_snapshot_can_take_stay_queued_until_there_is_room
         ids
     };
     let s = Session::open(dir.path()).unwrap();
-    assert!(ids.iter().all(|id| s.mailbox.mail[id].read), "every queued change was saved");
+    assert!(ids.iter().all(|id| s.mailbox.mail.get(*id).unwrap().read), "every queued change was saved");
 }
 
 /// Regression test (issue #25 review): while both refuse, the snapshot is not retried on every command, but
@@ -495,9 +510,9 @@ fn a_refused_mailbox_is_saved_once_it_shrinks() {
         (ids[..4].to_vec(), ids[4..].to_vec())
     };
     let s = Session::open(dir.path()).unwrap();
-    assert!(s.mailbox.mail[&keep[0]].read);
-    assert!(keep.iter().all(|id| s.mailbox.mail.contains_key(id)));
-    assert!(gone.iter().all(|id| !s.mailbox.mail.contains_key(id)));
+    assert!(s.mailbox.mail.get(keep[0]).unwrap().read);
+    assert!(keep.iter().all(|id| s.mailbox.mail.contains(*id)));
+    assert!(gone.iter().all(|id| !s.mailbox.mail.contains(*id)));
 }
 
 /// Timings for the folder pane and the undo estimate on a large synthetic mailbox (run by hand:
@@ -584,7 +599,7 @@ fn bench_folder_pane_and_undo_estimate() {
         json!({"action": "importMbox", "path": mbox.to_str().unwrap(), "folder": inbox.0}),
     );
     let took = t.elapsed();
-    let held: usize = p.mailbox.mail.values().filter_map(|m| m.raw.as_ref()).map(Vec::len).sum();
+    let held: usize = p.mailbox.mail.items().filter_map(|m| m.raw.as_ref()).map(Vec::len).sum();
     println!(
         "import of {count} messages ({} MiB of mbox) took {took:?}; sources held in memory afterwards: {held} bytes",
         data.len() >> 20

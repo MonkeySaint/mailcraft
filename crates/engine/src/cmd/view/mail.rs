@@ -1090,12 +1090,12 @@ pub fn cell_text(s: &Session, m: &MailItem, id: &str, format: &str) -> String {
 
 /// Every pinned message (of every folder).
 pub fn pinned(s: &Session) -> BTreeSet<ItemId> {
-    s.mailbox.mail.values().filter(|m| m.pinned).map(|m| m.id).collect()
+    s.mailbox.mail.items().filter(|m| m.pinned).map(|m| m.id).collect()
 }
 
 /// Pinned messages in `folder`.
 pub fn pinned_in(s: &Session, folder: FolderId) -> usize {
-    s.mailbox.mail.values().filter(|m| m.pinned && m.folder == folder).count()
+    s.mailbox.mail.items().filter(|m| m.pinned && m.folder == folder).count()
 }
 
 /// Moves the pins MailCraft 0.1 kept in the folders' view state (`PINNED` entries) onto the messages, and
@@ -1116,13 +1116,13 @@ pub(crate) fn migrate_view_pins(s: &mut Session) -> usize {
             reserved_json(s, folder, PINNED).and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
         store_reserved(s, folder, PINNED, None);
         for id in ids.into_iter().take(MAX_PINNED) {
-            let Some(now_in) = s.mailbox.mail.get(&ItemId(id)).filter(|m| !m.pinned).map(|m| m.folder) else {
+            let Some(now_in) = s.mailbox.mail.get(ItemId(id)).filter(|m| !m.pinned).map(|m| m.folder) else {
                 continue;
             };
             if pinned_in(s, now_in) >= MAX_PINNED {
                 continue;
             }
-            if let Some(m) = s.mailbox.mail.get_mut(&ItemId(id)) {
+            if let Some(m) = s.mailbox.mail.get_mut(ItemId(id)) {
                 m.pinned = true;
                 pinned = pinned.saturating_add(1);
             }
@@ -2085,7 +2085,7 @@ mod tests {
             },
         );
         let style = |s: &Session, id: ItemId| {
-            let m = s.mailbox.mail.get(&id).unwrap();
+            let m = s.mailbox.mail.get(id).unwrap();
             row_style(s, &rules(s, f), m, !m.read)
         };
         assert!(style(&s, unread).bold);
@@ -2209,9 +2209,9 @@ mod tests {
         assert!(matches!(s.run("mail.pin", &json!({"ids": [old.0], "on": "yes"})), Err(CmdError::Params(_))));
         // The pin is on the message: saved with the mailbox, undoable, and it stays on top after a move.
         run(&mut s, "mail.pin", json!({"ids": [old.0], "on": true}));
-        assert!(s.mailbox.mail[&old].pinned);
+        assert!(s.mailbox.mail.get(old).unwrap().pinned);
         run(&mut s, "app.undo", json!({}));
-        assert!(!s.mailbox.mail[&old].pinned);
+        assert!(!s.mailbox.mail.get(old).unwrap().pinned);
         run(&mut s, "mail.pin", json!({"ids": [old.0, new.0]}));
         run(&mut s, "mail.pin", json!({"ids": [old.0, new.0]}));
         assert!(pinned(&s).is_empty(), "all pinned: the toggle unpins them");
@@ -2235,10 +2235,10 @@ mod tests {
         // MailCraft 0.1 kept the pins as a reserved entry of the folder's view state.
         s.view.collapsed_groups.insert(f, vec!["Today".into(), format!("{PINNED}[{},{},424242]", a.0, b.0)]);
         assert_eq!(migrate_view_pins(&mut s), 2);
-        assert!(s.mailbox.mail[&a].pinned);
+        assert!(s.mailbox.mail.get(a).unwrap().pinned);
         // 0.1 showed a moved message pinned at the top of its new folder; it stays that way.
-        assert!(s.mailbox.mail[&b].pinned, "a message that left the folder keeps its pin");
-        assert_eq!(s.mailbox.mail[&b].folder, elsewhere);
+        assert!(s.mailbox.mail.get(b).unwrap().pinned, "a message that left the folder keeps its pin");
+        assert_eq!(s.mailbox.mail.get(b).unwrap().folder, elsewhere);
         s.selection.folder = elsewhere;
         let later = DateTime { unix: now.unix + 60, ..now };
         let c = add(&mut s, MailItem { subject: "c".into(), received: later, ..Default::default() });

@@ -515,7 +515,7 @@ fn selected_group(s: &Session) -> Option<String> {
     if modules::module_kind(s, s.selection.folder).is_some() {
         return modules::group_of(s, s.selection.folder, id);
     }
-    let m = s.mailbox.mail.get(&id)?;
+    let m = s.mailbox.mail.get(id)?;
     // The list's own header label (pinned messages, conversations grouped by their sort item).
     Some(crate::queries::group_label(s, m))
 }
@@ -1510,7 +1510,7 @@ fn zoom(s: &mut Session, p: &Value) -> CmdResult {
         .and_then(Value::as_u64)
         .or_else(|| crate::cmd::util::opt_ids(p).and_then(|v| v.first().map(|i| i.0)))
         .map(mailcraft_model::ItemId)
-        .filter(|i| s.mailbox.mail.contains_key(i));
+        .filter(|i| s.mailbox.mail.contains(*i));
     let Some(pct) = p.get("pct").filter(|v| !v.is_null()) else {
         let current = window.map_or(s.view.zoom, |i| read_zoom(s, i));
         let mut params = json!({ "pct": current });

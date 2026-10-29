@@ -385,7 +385,7 @@ fn run_find(app: &mut App, st: &mut FindState) {
         .s
         .mailbox
         .mail
-        .values()
+        .items()
         .filter(|m| folders.contains(&m.folder))
         .filter(|m| item_matches(&app.s, m, &query))
         .filter(|m| match TIMES.get(st.time).map(|t| t.1) {
@@ -447,7 +447,7 @@ fn found_row(app: &App, id: ItemId) -> Option<FoundRow> {
     let folder = |f: FolderId| mb.folder(f).map(|f| f.name.clone()).unwrap_or_default();
     let untitled =
         |t: &str| if t.trim().is_empty() { "(no subject)".to_owned() } else { t.trim().to_owned() };
-    if let Some(m) = mb.mail.get(&id) {
+    if let Some(m) = mb.mail.get(id) {
         return Some(FoundRow {
             from: m.from.as_ref().map(|f| f.display().to_owned()).unwrap_or_default(),
             subject: untitled(&m.subject),

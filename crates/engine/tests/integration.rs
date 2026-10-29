@@ -16,7 +16,7 @@ fn role(s: &Session, r: FolderRole) -> FolderId {
 }
 
 fn find(s: &Session, subject: &str) -> ItemId {
-    s.mailbox.mail.values().find(|m| m.subject == subject).map(|m| m.id).expect("sample message")
+    s.mailbox.mail.items().find(|m| m.subject == subject).map(|m| m.id).expect("sample message")
 }
 
 fn select(s: &mut Session, id: ItemId) {
@@ -56,12 +56,12 @@ fn delete_then_undo_restores_the_message() {
     let id = find(&s, "Lunch on Friday?");
     select(&mut s, id);
     s.run("mail.delete", &json!({})).expect("delete");
-    assert_eq!(s.mailbox.mail[&id].folder, role(&s, FolderRole::DeletedItems));
+    assert_eq!(s.mailbox.mail.get(id).unwrap().folder, role(&s, FolderRole::DeletedItems));
     assert_eq!(s.undo.undo_label(), Some("Delete"));
     s.run("app.undo", &json!({})).expect("undo");
-    assert_eq!(s.mailbox.mail[&id].folder, inbox);
+    assert_eq!(s.mailbox.mail.get(id).unwrap().folder, inbox);
     s.run("app.redo", &json!({})).expect("redo");
-    assert_eq!(s.mailbox.mail[&id].folder, role(&s, FolderRole::DeletedItems));
+    assert_eq!(s.mailbox.mail.get(id).unwrap().folder, role(&s, FolderRole::DeletedItems));
 }
 
 #[test]
@@ -72,17 +72,17 @@ fn move_flag_categorize_and_undo_each() {
     select(&mut s, id);
 
     s.run("mail.flag", &json!({})).expect("flag");
-    assert!(matches!(s.mailbox.mail[&id].flag, FlagState::Flagged { .. }));
+    assert!(matches!(s.mailbox.mail.get(id).unwrap().flag, FlagState::Flagged { .. }));
     s.run("mail.markComplete", &json!({})).expect("complete");
-    assert!(matches!(s.mailbox.mail[&id].flag, FlagState::Complete { .. }));
+    assert!(matches!(s.mailbox.mail.get(id).unwrap().flag, FlagState::Complete { .. }));
     s.run("mail.clearFlag", &json!({})).expect("clear flag");
-    assert_eq!(s.mailbox.mail[&id].flag, FlagState::None);
+    assert_eq!(s.mailbox.mail.get(id).unwrap().flag, FlagState::None);
 
     // Clear All Categories is grey until the message has a category (as observed).
-    s.mailbox.mail.get_mut(&id).expect("item").categories.clear();
+    s.mailbox.mail.get_mut(id).expect("item").categories.clear();
     assert!(s.enabled("mail.clearCategories").is_some());
     s.run("mail.categorize", &json!({"name": "Red category"})).expect("categorize");
-    assert!(s.mailbox.mail[&id].categories.iter().any(|c| c == "Red category"));
+    assert!(s.mailbox.mail.get(id).unwrap().categories.iter().any(|c| c == "Red category"));
     assert!(s.enabled("mail.clearCategories").is_none());
     let row = list_rows(&s)
         .into_iter()
@@ -94,14 +94,14 @@ fn move_flag_categorize_and_undo_each() {
     assert!(!row.categories.is_empty());
 
     s.run("mail.move", &json!({"folder": projects.0})).expect("move");
-    assert_eq!(s.mailbox.mail[&id].folder, projects);
+    assert_eq!(s.mailbox.mail.get(id).unwrap().folder, projects);
     assert!(!visible_item_ids(&s).contains(&id), "moved out of the Inbox view");
 
     // Undo walks back move, categorize, clear flag, complete, flag.
     s.run("app.undo", &json!({})).expect("undo move");
-    assert_ne!(s.mailbox.mail[&id].folder, projects);
+    assert_ne!(s.mailbox.mail.get(id).unwrap().folder, projects);
     s.run("app.undo", &json!({})).expect("undo categorize");
-    assert!(!s.mailbox.mail[&id].categories.iter().any(|c| c == "Red category"));
+    assert!(!s.mailbox.mail.get(id).unwrap().categories.iter().any(|c| c == "Red category"));
 }
 
 #[test]
@@ -212,9 +212,9 @@ fn store_journal_survives_reopen() {
     }
     let s = Session::open(dir.path()).expect("reopen");
     assert_eq!(s.mailbox.mail.len(), count);
-    let copies = s.mailbox.mail.values().filter(|m| m.subject == "Analytics summary").count();
+    let copies = s.mailbox.mail.items().filter(|m| m.subject == "Analytics summary").count();
     assert_eq!(copies, 2);
-    assert!(s.mailbox.mail.values().filter(|m| m.subject == "Analytics summary").all(|m| !m.is_flagged()));
+    assert!(s.mailbox.mail.items().filter(|m| m.subject == "Analytics summary").all(|m| !m.is_flagged()));
     assert_eq!(s.me, vec!["jordan.lee@example.net".to_owned()]);
 }
 
@@ -222,11 +222,11 @@ fn store_journal_survives_reopen() {
 fn module_rail_and_selection_flow() {
     let mut s = sample_session();
     let unread: Vec<ItemId> =
-        visible_item_ids(&s).into_iter().filter(|id| !s.mailbox.mail[id].read).collect();
+        visible_item_ids(&s).into_iter().filter(|id| !s.mailbox.mail.get(*id).unwrap().read).collect();
     let first = unread[0];
     select(&mut s, first);
     s.run("nav.calendar", &json!({})).expect("calendar");
-    assert!(s.mailbox.mail[&first].read, "leaving the message marks it read");
+    assert!(s.mailbox.mail.get(first).unwrap().read, "leaving the message marks it read");
     s.run("nav.mail", &json!({})).expect("mail");
     assert_eq!(s.mailbox.folder(s.selection.folder).and_then(|f| f.role), Some(FolderRole::Inbox));
     assert_eq!(s.registry.by_shortcut("Mod+2").map(|c| c.id), Some("nav.calendar"));

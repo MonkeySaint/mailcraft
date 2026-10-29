@@ -60,7 +60,7 @@ fn propose_id() -> Id {
 
 /// The meeting summary for `mail`, or `None` when it carries no calendar part.
 pub(crate) fn summary(ctx: &egui::Context, app: &App, mail: u64) -> Option<MeetingMessage> {
-    let m = app.s.mailbox.mail.get(&ItemId(mail))?;
+    let m = app.s.mailbox.mail.get(ItemId(mail))?;
     let stamp = (m.size, m.received.unix);
     let mut cache: Cache = ctx.data_mut(|d| d.get_temp(cache_id())).unwrap_or_default();
     if cache.mail != mail || cache.stamp != stamp {
@@ -73,7 +73,7 @@ pub(crate) fn summary(ctx: &egui::Context, app: &App, mail: u64) -> Option<Meeti
 
 /// The task summary for `mail` (its info bar against my task list), or `None` when it carries no task.
 pub(crate) fn task_summary(ctx: &egui::Context, app: &App, mail: u64) -> Option<TaskRequestInfo> {
-    let m = app.s.mailbox.mail.get(&ItemId(mail))?;
+    let m = app.s.mailbox.mail.get(ItemId(mail))?;
     let stamp = (m.size, m.received.unix);
     let mut cache: TaskCache = ctx.data_mut(|d| d.get_temp(task_cache_id())).unwrap_or_default();
     if cache.mail != mail || cache.stamp != stamp {

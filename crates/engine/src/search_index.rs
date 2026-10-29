@@ -213,7 +213,7 @@ fn for_each_item(
     released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
     mut f: impl FnMut(u64, u64, &dyn Fn() -> Doc),
 ) {
-    for m in mb.mail.values() {
+    for m in mb.mail.items() {
         f(m.id.0, stamp_mail(m), &|| mail_doc(m, released));
     }
     for a in mb.appointments.values() {
@@ -237,7 +237,7 @@ fn doc_of(
     id: u64,
 ) -> Option<(u64, Doc)> {
     let id = ItemId(id);
-    if let Some(m) = mb.mail.get(&id) {
+    if let Some(m) = mb.mail.get(id) {
         Some((stamp_mail(m), mail_doc(m, released)))
     } else if let Some(a) = mb.appointments.get(&id) {
         Some((stamp_appointment(a), Doc::from_appointment(a)))
@@ -623,7 +623,7 @@ pub fn results(s: &Session) -> Vec<ItemId> {
             extra
                 .into_iter()
                 .filter(|i| !have.contains(i))
-                .filter(|i| s.mailbox.mail.get(i).is_some_and(|m| scope.contains(&m.folder))),
+                .filter(|i| s.mailbox.mail.get(*i).is_some_and(|m| scope.contains(&m.folder))),
         );
     }
     out
@@ -798,10 +798,10 @@ mod tests {
         s.selection.items = vec![a];
         s.selection.focus = Some(a);
         s.run("mail.markRead", &json!({"ids": [a.0]})).unwrap();
-        assert!(s.mailbox.mail.get(&a).unwrap().read);
+        assert!(s.mailbox.mail.get(a).unwrap().read);
         assert_eq!(count(&s, "isread:yes", &scope_filter(&s)).total, 1);
         // Direct edit + invalidate.
-        s.mailbox.mail.get_mut(&a).unwrap().subject = "Dinner".into();
+        s.mailbox.mail.get_mut(a).unwrap().subject = "Dinner".into();
         s.search.invalidate();
         assert!(results(&s).is_empty());
         // Direct add: picked up by the shape check.
@@ -828,8 +828,8 @@ mod tests {
         let a = add(&mut s, "Notes");
         let filler = "word ".repeat(80);
         let body = |tail: &str| format!("{filler}{tail}");
-        s.mailbox.mail.get_mut(&a).unwrap().body.text = Some(body("alpha"));
-        s.mailbox.mail.get_mut(&a).unwrap().refresh_preview();
+        s.mailbox.mail.get_mut(a).unwrap().body.text = Some(body("alpha"));
+        s.mailbox.mail.get_mut(a).unwrap().refresh_preview();
         s.search.invalidate();
         s.view.search_scope = SearchScope::CurrentFolder;
         s.view.search = "alpha".into();
@@ -842,7 +842,7 @@ mod tests {
         s.view.search = "gamma".into();
         assert_eq!(results(&s), [a]);
         // And a direct edit followed by `invalidate` (the full reconcile).
-        s.mailbox.mail.get_mut(&a).unwrap().body.text = Some(body("delta"));
+        s.mailbox.mail.get_mut(a).unwrap().body.text = Some(body("delta"));
         s.search.invalidate();
         assert!(results(&s).is_empty());
         s.view.search = "delta".into();

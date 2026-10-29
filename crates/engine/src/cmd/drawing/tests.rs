@@ -292,7 +292,7 @@ fn saving_a_draft_keeps_the_drawings_editable_in_the_open_message() {
     let r = s.run("compose.saveDraft", &json!({"compose": cid})).unwrap();
     let draft = crate::model::ItemId(r["draft"].as_u64().unwrap());
     assert_eq!(drawings(&s, cid), before, "still floating, with their text");
-    let html = s.mailbox.mail[&draft].body.html.clone().unwrap_or_default();
+    let html = s.mailbox.mail.get(draft).unwrap().body.html.clone().unwrap_or_default();
     assert!(html.contains("<img"), "the draft holds the drawing as a picture: {html}");
     s.run("drawing.text", &json!({"compose": cid, "text": "Changed"})).unwrap();
     assert_eq!(drawings(&s, cid)[0].text, "Changed");

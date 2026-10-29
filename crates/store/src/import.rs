@@ -93,14 +93,14 @@ pub fn insert_item(mb: &mut Mailbox, mut item: MailItem) -> Result<ItemId> {
             return Err(StoreError::Corrupt("mailbox id space exhausted".into()));
         }
         let id = ItemId(mb.alloc_id());
-        if let std::collections::btree_map::Entry::Vacant(slot) = mb.mail.entry(id) {
+        if !mb.mail.contains(id) {
             item.id = id;
-            slot.insert(item);
+            mb.mail.insert(id, item);
             return Ok(id);
         }
     }
     // next_id lags far behind existing ids (a damaged snapshot): jump past them.
-    let max = mb.mail.keys().next_back().map_or(0, |k| k.0);
+    let max = mb.mail.ids().next_back().map_or(0, |k| k.0);
     mb.next_id = max;
     if mb.next_id == u64::MAX {
         return Err(StoreError::Corrupt("mailbox id space exhausted".into()));
@@ -121,7 +121,7 @@ pub fn insert_all(mb: &mut Mailbox, items: Vec<MailItem>) -> Result<Vec<ItemId>>
             Ok(id) => ids.push(id),
             Err(e) => {
                 for id in &ids {
-                    mb.mail.remove(id);
+                    mb.mail.remove(*id);
                 }
                 mb.next_id = saved_next;
                 return Err(e);
@@ -414,7 +414,7 @@ mod tests {
         mb.mail.insert(ItemId(5000), MailItem { subject: "keep2".into(), ..Default::default() });
         let id = insert_item(&mut mb, MailItem::default()).unwrap_or_default();
         assert_ne!(id, ItemId(1));
-        assert_eq!(mb.mail.get(&ItemId(1)).map(|m| m.subject.as_str()), Some("keep"));
+        assert_eq!(mb.mail.get(ItemId(1)).map(|m| m.subject.as_str()), Some("keep"));
         mb.next_id = u64::MAX;
         assert!(insert_item(&mut mb, MailItem::default()).is_err());
     }

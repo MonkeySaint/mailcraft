@@ -443,7 +443,7 @@ fn forward_as_attachment(s: &mut Session, p: &Value) -> CmdResult {
         ))
     };
     let listed: u64 =
-        ids.iter().filter_map(|id| s.mailbox.mail.get(id)).map(|m| m.size).fold(0, u64::saturating_add);
+        ids.iter().filter_map(|id| s.mailbox.mail.get(*id)).map(|m| m.size).fold(0, u64::saturating_add);
     if usize::try_from(listed).map_or(true, |n| n > MAX_FORWARD_BYTES) {
         return Err(too_big());
     }
@@ -451,7 +451,7 @@ fn forward_as_attachment(s: &mut Session, p: &Value) -> CmdResult {
     let mut subject = String::new();
     let mut total = 0usize;
     for id in &ids {
-        if let Some(m) = s.mailbox.mail.get(id) {
+        if let Some(m) = s.mailbox.mail.get(*id) {
             if subject.is_empty() {
                 subject = forward_subject(&m.subject);
             }
@@ -490,7 +490,7 @@ fn reply_with_meeting(s: &mut Session, p: &Value) -> CmdResult {
     let Some(id) = primary_item(s, p) else {
         return Err(CmdError::Disabled("No message is selected.".into()));
     };
-    let Some(m) = s.mailbox.mail.get(&id) else {
+    let Some(m) = s.mailbox.mail.get(id) else {
         return Err(CmdError::Failed("message not found".into()));
     };
     let (to, cc) = response_lists(s, m, ComposeKind::ReplyAll);
@@ -804,7 +804,7 @@ The badge reader is down. Please use the side door today.";
     #[test]
     fn forward_attaches_a_capped_number_and_size_of_messages() {
         let mut f = fx();
-        let folder = f.s.mailbox.mail[&f.plain].folder;
+        let folder = f.s.mailbox.mail.get(f.plain).unwrap().folder;
         let mut ids = Vec::new();
         for i in 0..=MAX_FORWARD_ITEMS {
             ids.push(
@@ -897,13 +897,16 @@ The badge reader is down. Please use the side door today.";
         assert_eq!(s.composes[&cid].to, "Rivera, Alice <alice@example.com>");
         let r = s.run("compose.send", &json!({"compose": cid})).unwrap();
         assert_eq!(r["sent"], true, "{r}");
-        let sent = &s.mailbox.mail[&ItemId(r["item"].as_u64().unwrap())];
+        let sent = &s.mailbox.mail.get(ItemId(r["item"].as_u64().unwrap())).unwrap();
         let to: Vec<(&str, Option<&str>)> =
             sent.to.iter().map(|a| (a.addr.as_str(), a.name.as_deref())).collect();
         assert_eq!(to, [("alice@example.com", Some("Rivera, Alice"))]);
         let cc: Vec<&str> = sent.cc.iter().map(|a| a.addr.as_str()).collect();
         assert_eq!(cc, ["bob@example.org", "carol@example.com"]);
-        assert!(matches!(s.mailbox.mail[&src].response, mailcraft_model::ResponseState::RepliedAll(_)));
+        assert!(matches!(
+            s.mailbox.mail.get(src).unwrap().response,
+            mailcraft_model::ResponseState::RepliedAll(_)
+        ));
     }
 
     #[test]
@@ -1111,9 +1114,9 @@ The badge reader is down. Please use the side door today.";
         // A reply to a message outside the Inbox is saved next to it when asked to.
         set(&mut f.s, "mail.save.replyInSameFolder", json!(true));
         assert_eq!(respond_to(&mut f, plain, ComposeKind::Reply).save_sent, SaveSentTo::Default, "Inbox");
-        let inbox = f.s.mailbox.mail[&plain].folder;
+        let inbox = f.s.mailbox.mail.get(plain).unwrap().folder;
         let projects = f.s.mailbox.create_folder(inbox, "Projects").unwrap();
-        f.s.mailbox.mail.get_mut(&plain).unwrap().folder = projects;
+        f.s.mailbox.mail.get_mut(plain).unwrap().folder = projects;
         assert_eq!(respond_to(&mut f, plain, ComposeKind::ReplyAll).save_sent, SaveSentTo::Folder(projects));
         // ...unless sent copies are not saved at all.
         set(&mut f.s, "mail.save.sentCopies", json!(false));

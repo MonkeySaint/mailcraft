@@ -328,7 +328,7 @@ fn press_applies_keys_and_keytips() {
 fn keytips_continue_into_dropdown_entries() {
     let ctx = egui::Context::default();
     let mut app = app();
-    let first = app.s.mailbox.mail.keys().next().copied().unwrap();
+    let first = app.s.mailbox.mail.ids().next().unwrap();
     app.run("nav.selectItem", json!({"id": first.0}));
     app.run("mail.flag", json!({"kind": "clear"}));
     // Alt, H, U opens Follow Up and keeps keytips on; T then picks Today (ribbon-mail.md "Alt, H, U, T").
@@ -337,7 +337,7 @@ fn keytips_continue_into_dropdown_entries() {
     keys::press(&ctx, &mut app, Surface::Main, "T");
     assert_eq!(app.ui.keytips, None);
     assert!(matches!(
-        app.s.mailbox.mail.get(&first).map(|m| &m.flag),
+        app.s.mailbox.mail.get(first).map(|m| &m.flag),
         Some(mailcraft_model::FlagState::Flagged { .. })
     ));
     // Escape inside an opened dropdown steps back to the tab's keytips.
@@ -354,12 +354,12 @@ fn read_window_keys_work_with_nothing_selected_in_the_main_window() {
     let ctx = egui::Context::default();
     let mut app = app();
     let folder = app.s.selection.folder;
-    let item = app.s.mailbox.mail.values().find(|m| m.read && m.folder == folder).map(|m| m.id).unwrap();
+    let item = app.s.mailbox.mail.items().find(|m| m.read && m.folder == folder).map(|m| m.id).unwrap();
     app.s.selection.items.clear();
     app.s.selection.focus = None;
     let r = keys::press(&ctx, &mut app, Surface::Read(item.0), "Mod+U");
     assert_eq!(r["ok"], true, "{r}");
-    assert_eq!(app.s.mailbox.mail.get(&item).map(|m| m.read), Some(false));
+    assert_eq!(app.s.mailbox.mail.get(item).map(|m| m.read), Some(false));
 }
 
 #[test]
@@ -408,13 +408,13 @@ fn handle_consumes_bound_events() {
     let ctx = egui::Context::default();
     let mut app = app();
     let first =
-        app.s.mailbox.mail.values().find(|m| m.folder == app.s.selection.folder && m.read).map(|m| m.id);
+        app.s.mailbox.mail.items().find(|m| m.folder == app.s.selection.folder && m.read).map(|m| m.id);
     let Some(first) = first else { return };
     app.run("nav.selectItem", json!({"id": first.0}));
     frame(&ctx, &mut app, vec![key(Key::U, Modifiers::COMMAND)]);
-    assert!(!app.s.mailbox.mail[&first].read, "Ctrl+U marks unread");
+    assert!(!app.s.mailbox.mail.get(first).unwrap().read, "Ctrl+U marks unread");
     frame(&ctx, &mut app, vec![key(Key::Q, Modifiers::COMMAND)]);
-    assert!(app.s.mailbox.mail[&first].read, "Ctrl+Q marks read");
+    assert!(app.s.mailbox.mail.get(first).unwrap().read, "Ctrl+Q marks read");
 
     // Bare Alt down + up toggles keytips; a letter then selects a tab.
     frame(&ctx, &mut app, vec![key(Key::AltLeft, Modifiers::ALT)]);

@@ -18,6 +18,7 @@ pub mod ids;
 pub mod item;
 pub mod junk;
 pub mod mailbox;
+pub mod mailtable;
 pub mod note;
 pub mod quickstep;
 pub mod recover;
@@ -46,6 +47,7 @@ pub use item::{
 };
 pub use junk::{JunkLevel, JunkList, JunkSettings};
 pub use mailbox::{FolderCounts, Mailbox};
+pub use mailtable::{MailTable, ScanFilter, message_id_key};
 pub use note::{Note, NoteColor};
 pub use quickstep::{MessageAction, QuickStep, QuickStepAction};
 pub use recover::{DeletedItem, MAX_RECOVERABLE, RecoverBin, Recoverable};

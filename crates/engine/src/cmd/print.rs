@@ -139,7 +139,7 @@ enum Kind {
 
 fn kind_of(s: &Session, id: ItemId) -> Option<Kind> {
     let mb = &s.mailbox;
-    if mb.mail.contains_key(&id) {
+    if mb.mail.contains(id) {
         Some(Kind::Mail)
     } else if mb.appointments.contains_key(&id) {
         Some(Kind::Appointment)
@@ -349,7 +349,7 @@ fn push(fields: &mut Vec<(String, String)>, label: &str, value: String) {
 fn memo_item(s: &Session, id: ItemId) -> Option<MemoItem> {
     let mb = &s.mailbox;
     let tz = s.tz_offset_min;
-    if let Some(m) = mb.mail.get(&id) {
+    if let Some(m) = mb.mail.get(id) {
         return Some(mail_memo(m, tz));
     }
     if let Some(a) = mb.appointments.get(&id) {
@@ -538,7 +538,7 @@ fn table(s: &Session, p: &Value) -> TableData {
                 .collect(),
         };
     }
-    let mails: Vec<&MailItem> = ids.iter().filter_map(|i| s.mailbox.mail.get(i)).collect();
+    let mails: Vec<&MailItem> = ids.iter().filter_map(|i| s.mailbox.mail.get(*i)).collect();
     TableData {
         title,
         columns: vec![
@@ -984,7 +984,7 @@ mod tests {
     use crate::sample::sample_session;
 
     fn first_mail(s: &Session) -> u64 {
-        s.mailbox.mail.keys().next().unwrap().0
+        s.mailbox.mail.ids().next().unwrap().0
     }
 
     fn parse_pdf_pages(b: &[u8]) -> usize {

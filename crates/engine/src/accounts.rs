@@ -1531,7 +1531,7 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
                 f.remote_name = None;
             }
         }
-        for m in s.mailbox.mail.values_mut().filter(|m| folders.contains(&m.folder)) {
+        for m in s.mailbox.mail.items_mut().filter(|m| folders.contains(&m.folder)) {
             m.remote_id = None;
         }
         // A run against the old server may still be going: its results must not land in the new mapping.

@@ -7,15 +7,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Account, AccountId, AccountKind, Appointment, Category, Contact, Folder, FolderId, FolderKind,
-    FolderRole, ItemId, MailItem, ModelError, Note, QuickStep, QuickStepAction, Result, Rule, RuleAction,
-    Task, ViewSettings,
+    FolderRole, ItemId, MailItem, MailTable, ModelError, Note, QuickStep, QuickStepAction, Result, Rule,
+    RuleAction, Task, ViewSettings,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Mailbox {
     pub accounts: Vec<Account>,
     pub folders: BTreeMap<FolderId, Folder>,
-    pub mail: BTreeMap<ItemId, MailItem>,
+    /// Mail items, behind the [`MailTable`] read/write API.
+    pub mail: MailTable,
     pub appointments: BTreeMap<ItemId, Appointment>,
     pub contacts: BTreeMap<ItemId, Contact>,
     pub tasks: BTreeMap<ItemId, Task>,
@@ -53,7 +54,7 @@ pub struct FolderCounts {
 }
 
 impl FolderCounts {
-    fn add(&mut self, read: bool) {
+    pub(crate) fn add(&mut self, read: bool) {
         self.total = self.total.saturating_add(1);
         if !read {
             self.unread = self.unread.saturating_add(1);
@@ -152,7 +153,7 @@ impl Mailbox {
             .folders
             .keys()
             .map(|f| f.0)
-            .chain(self.mail.keys().map(|i| i.0))
+            .chain(self.mail.ids().map(|i| i.0))
             .chain(self.appointments.keys().map(|i| i.0))
             .chain(self.contacts.keys().map(|i| i.0))
             .chain(self.tasks.keys().map(|i| i.0))
@@ -169,7 +170,7 @@ impl Mailbox {
     }
     fn id_in_use(&self, id: u64) -> bool {
         self.folders.contains_key(&FolderId(id))
-            || self.mail.contains_key(&ItemId(id))
+            || self.mail.contains(ItemId(id))
             || self.appointments.contains_key(&ItemId(id))
             || self.contacts.contains_key(&ItemId(id))
             || self.tasks.contains_key(&ItemId(id))
@@ -599,31 +600,23 @@ impl Mailbox {
     }
     /// Mail items in `folder` (unsorted).
     pub fn items_in(&self, folder: FolderId) -> Vec<&MailItem> {
-        self.mail.values().filter(|m| m.folder == folder).collect()
+        self.mail.in_folder(folder).collect()
     }
     pub fn unread_count(&self, folder: FolderId) -> usize {
-        self.mail.values().filter(|m| m.folder == folder && !m.read).count()
+        self.mail.counts(folder).unread
     }
     pub fn total_count(&self, folder: FolderId) -> usize {
-        self.mail.values().filter(|m| m.folder == folder).count()
+        self.mail.counts(folder).total
     }
     /// The mail counts of `folder` (one scan of all mail; [`Mailbox::folder_counts`] counts every folder in
     /// one scan).
     pub fn counts_of(&self, folder: FolderId) -> FolderCounts {
-        let mut c = FolderCounts::default();
-        for m in self.mail.values().filter(|m| m.folder == folder) {
-            c.add(m.read);
-        }
-        c
+        self.mail.counts(folder)
     }
     /// The mail counts of every folder holding mail, in one scan of all mail. Folders without mail are
     /// missing (their counts are zero).
     pub fn folder_counts(&self) -> BTreeMap<FolderId, FolderCounts> {
-        let mut out: BTreeMap<FolderId, FolderCounts> = BTreeMap::new();
-        for m in self.mail.values() {
-            out.entry(m.folder).or_default().add(m.read);
-        }
-        out
+        self.mail.all_counts()
     }
     /// Folder-pane badge text: "[8]" for a folder that counts every item (total-count roles, or Properties ›
     /// "Show total number of items") when non-zero, "778" unread for others, `None` when nothing to show.
@@ -674,7 +667,7 @@ impl Mailbox {
         let list = |v: &[String]| v.iter().map(String::len).fold(0usize, usize::saturating_add);
         let mut total = std::mem::size_of::<Mailbox>();
         let mut add = |n: usize| total = total.saturating_add(n);
-        for m in self.mail.values() {
+        for m in self.mail.items() {
             add(m.approx_bytes());
         }
         for a in self.appointments.values() {
@@ -715,7 +708,7 @@ impl Mailbox {
         }
         let mut moved = Vec::new();
         for id in ids {
-            if let Some(m) = self.mail.get_mut(id)
+            if let Some(m) = self.mail.get_mut(*id)
                 && m.folder != to
             {
                 m.folder = to;
@@ -733,20 +726,20 @@ impl Mailbox {
     pub fn delete_items(&mut self, ids: &[ItemId]) -> Result<Vec<MailItem>> {
         let mut out = Vec::new();
         for id in ids {
-            let Some(item) = self.mail.get(id) else {
+            let Some(item) = self.mail.get(*id) else {
                 continue;
             };
             let account = self.folders.get(&item.folder).map(|f| f.account);
             let deleted = account.and_then(|a| self.role_folder(a, FolderRole::DeletedItems));
             match deleted {
                 Some(d) if !self.is_in_subtree(item.folder, d) => {
-                    if let Some(m) = self.mail.get_mut(id) {
+                    if let Some(m) = self.mail.get_mut(*id) {
                         out.push(m.clone());
                         m.folder = d;
                     }
                 }
                 _ => {
-                    if let Some(m) = self.mail.remove(id) {
+                    if let Some(m) = self.mail.remove(*id) {
                         out.push(m);
                     }
                 }
@@ -775,7 +768,7 @@ impl Mailbox {
     pub fn set_read(&mut self, ids: &[ItemId], read: bool) -> Vec<ItemId> {
         let mut changed = Vec::new();
         for id in ids {
-            if let Some(m) = self.mail.get_mut(id)
+            if let Some(m) = self.mail.get_mut(*id)
                 && m.read != read
             {
                 m.read = read;
@@ -843,7 +836,7 @@ impl Mailbox {
                 problems.push(format!("role {role:?} appears {n} times in account {account:?}"));
             }
         }
-        for m in self.mail.values() {
+        for m in self.mail.items() {
             if !self.folders.contains_key(&m.folder) {
                 problems.push(format!("item {:?} is in missing folder {:?}", m.id, m.folder));
             }

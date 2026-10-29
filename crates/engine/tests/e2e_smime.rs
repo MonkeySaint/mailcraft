@@ -33,7 +33,7 @@ fn role(s: &Session, account: AccountId, role: FolderRole) -> FolderId {
 }
 
 fn find(s: &Session, folder: FolderId, subject: &str) -> Option<ItemId> {
-    s.mailbox.mail.values().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
+    s.mailbox.mail.items().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
 }
 
 /// A session for `address` on the test servers, holding the digital ID `id` (its CA trusted).
@@ -129,5 +129,5 @@ fn signed_and_encrypted_mail_through_smtp_and_imap() {
     let shown = mailcraft_engine::smime::display_item(&bob, got).unwrap();
     assert!(shown.body_text().contains("Secret answer: blue."));
     // The stored item keeps the encrypted form: the text is not in the mailbox.
-    assert!(!bob.mailbox.mail[&got].body_text().contains("blue"));
+    assert!(!bob.mailbox.mail.get(got).unwrap().body_text().contains("blue"));
 }

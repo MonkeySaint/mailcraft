@@ -676,10 +676,10 @@ mod tests {
         s.run("nav.selectItem", &json!({"id": a.0})).unwrap();
         s.mailbox.set_read(&[a], false);
         s.run("mail.delete", &json!({"ids": [a.0]})).unwrap();
-        assert!(s.mailbox.mail.get(&a).is_none_or(|m| m.read));
+        assert!(s.mailbox.mail.get(a).is_none_or(|m| m.read));
         let deleted =
             s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::DeletedItems)).unwrap().id;
-        assert!(s.mailbox.mail.get(&a).is_none_or(|m| m.folder == deleted));
+        assert!(s.mailbox.mail.get(a).is_none_or(|m| m.folder == deleted));
     }
 
     #[test]

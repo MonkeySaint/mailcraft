@@ -701,7 +701,7 @@ fn imap_receive(s: &Session, a: &Account, plan: &Plan, sending: bool) -> Option<
     let list_only = !plan.receive && sending && sent_unmapped && !a.server_saves_sent;
     (plan.receive || list_only).then(|| {
         let mut uids: BTreeMap<FolderId, Vec<u32>> = BTreeMap::new();
-        for m in s.mailbox.mail.values() {
+        for m in s.mailbox.mail.items() {
             if let Some(u) = uid_of(m) {
                 uids.entry(m.folder).or_default().push(u);
             }
@@ -755,7 +755,7 @@ fn imap_receive(s: &Session, a: &Account, plan: &Plan, sending: bool) -> Option<
 fn imap_fetch_list(s: &Session, id: AccountId, items: &[ItemId]) -> Vec<(String, Vec<u32>)> {
     let mut by_folder: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for i in items {
-        let Some(m) = s.mailbox.mail.get(i) else { continue };
+        let Some(m) = s.mailbox.mail.get(*i) else { continue };
         let Some(uid) = uid_of(m) else { continue };
         let Some(f) = s.mailbox.folder(m.folder).filter(|f| f.account == id) else { continue };
         let Some(name) = &f.remote_name else { continue };
@@ -787,14 +787,14 @@ fn pop3_job(
         |m: &MailItem| prefs.headers_only.contains(&m.id.0) && m.raw.is_none() && m.blob.is_none();
     // Unique id → (item, downloaded in full).
     let mut local: BTreeMap<String, (ItemId, bool)> = BTreeMap::new();
-    for m in s.mailbox.mail.values().filter(|m| folders.contains(&m.folder)) {
+    for m in s.mailbox.mail.items().filter(|m| folders.contains(&m.folder)) {
         if let Some(u) = pop3_uidl(m) {
             local.insert(u.to_owned(), (m.id, !header_only(m)));
         }
     }
     // Unique ids still held anywhere (an item moved into another data file keeps its id): such mail was
     // archived, not deleted, so "Remove from server when deleted" leaves its server copy alone.
-    let anywhere: BTreeSet<&str> = s.mailbox.mail.values().filter_map(pop3_uidl).collect();
+    let anywhere: BTreeSet<&str> = s.mailbox.mail.items().filter_map(pop3_uidl).collect();
     let st = prefs.pop3.get(&a.id.0).cloned().unwrap_or_default();
     let mut known: BTreeSet<String> = st.seen.keys().cloned().collect();
     known.extend(local.keys().cloned());
@@ -819,7 +819,7 @@ fn pop3_job(
     }
     let full: BTreeSet<String> = fetch
         .iter()
-        .filter_map(|i| s.mailbox.mail.get(i))
+        .filter_map(|i| s.mailbox.mail.get(*i))
         .filter(|m| folders.contains(&m.folder))
         .filter_map(|m| pop3_uidl(m).map(str::to_owned))
         .collect();
@@ -2224,7 +2224,7 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
             }
         }
         if !new_inbox.is_empty() {
-            let ids: Vec<ItemId> = new_inbox.into_iter().filter(|i| s.mailbox.mail.contains_key(i)).collect();
+            let ids: Vec<ItemId> = new_inbox.into_iter().filter(|i| s.mailbox.mail.contains(*i)).collect();
             // Junk Email filter first, then Focused Inbox overrides, the rules for received messages
             // (client-side, like every rule here), automatic meeting responses, tracking and receipts.
             super::arrival::on_new_mail(s, &ids);
@@ -2300,7 +2300,7 @@ fn oauth_done(s: &mut Session, account: AccountId, result: Result<TokenSet, Stri
 /// Replaces a header-only item's content with the whole message, keeping its id, folder and state.
 fn fill_item(s: &mut Session, id: ItemId, raw: &[u8]) -> bool {
     let now = s.now();
-    let Some(old) = s.mailbox.mail.get(&id).cloned() else { return false };
+    let Some(old) = s.mailbox.mail.get(id).cloned() else { return false };
     let mut full = mailcraft_store::import::item_from_raw(raw, old.folder, now);
     full.keep_local_state(&old);
     s.mailbox.mail.insert(id, full);
@@ -2330,7 +2330,7 @@ fn strip_to_header(s: &mut Session, item: &mut MailItem, size: Option<u64>) {
 /// such bound and is left out.
 fn imap_search(s: &Session, a: &Account, req: &super::older::Request) -> Option<ImapSearch> {
     let mut uids: BTreeMap<FolderId, Vec<u32>> = BTreeMap::new();
-    for m in s.mailbox.mail.values() {
+    for m in s.mailbox.mail.items() {
         if req.folders.contains(&m.folder)
             && let Some(u) = uid_of(m)
         {
@@ -2386,13 +2386,8 @@ fn apply_found(
 ) {
     let Some(fid) = find_by_remote(&s.mailbox, account, name) else { return };
     let now = s.now();
-    let mut by_uid: BTreeMap<u32, ItemId> = s
-        .mailbox
-        .mail
-        .values()
-        .filter(|m| m.folder == fid)
-        .filter_map(|m| Some((uid_of(m)?, m.id)))
-        .collect();
+    let mut by_uid: BTreeMap<u32, ItemId> =
+        s.mailbox.mail.in_folder(fid).filter_map(|m| Some((uid_of(m)?, m.id))).collect();
     let mut ids = Vec::new();
     for nm in msgs {
         if let Some(id) = by_uid.get(&nm.uid) {
@@ -2414,13 +2409,8 @@ fn apply_found(
 
 fn apply_bodies(s: &mut Session, account: AccountId, name: &str, msgs: Vec<NewMessage>) {
     let Some(fid) = find_by_remote(&s.mailbox, account, name) else { return };
-    let by_uid: BTreeMap<u32, ItemId> = s
-        .mailbox
-        .mail
-        .values()
-        .filter(|m| m.folder == fid)
-        .filter_map(|m| Some((uid_of(m)?, m.id)))
-        .collect();
+    let by_uid: BTreeMap<u32, ItemId> =
+        s.mailbox.mail.in_folder(fid).filter_map(|m| Some((uid_of(m)?, m.id))).collect();
     for m in msgs {
         if let Some(id) = by_uid.get(&m.uid) {
             fill_item(s, *id, &m.raw);
@@ -2429,13 +2419,7 @@ fn apply_bodies(s: &mut Session, account: AccountId, name: &str, msgs: Vec<NewMe
 }
 
 fn find_pop3(s: &Session, account: AccountId, uidl: &str) -> Option<ItemId> {
-    s.mailbox
-        .mail
-        .values()
-        .find(|m| {
-            pop3_uidl(m) == Some(uidl) && s.mailbox.folder(m.folder).is_some_and(|f| f.account == account)
-        })
-        .map(|m| m.id)
+    first_item(&s.mailbox, &account_scope(&s.mailbox, account), |m| pop3_uidl(m) == Some(uidl))
 }
 
 fn apply_pop3_new(
@@ -2501,7 +2485,7 @@ pub(super) fn prune_stale_ops(mb: &mut Mailbox, inflight: &Inflight) {
         let account = a.id;
         a.sync.pending.retain(|p| {
             inflight.contains(&(account, p.id))
-                || !matches!(&p.op, RemoteOp::Append { item, .. } if !mail.contains_key(item))
+                || !matches!(&p.op, RemoteOp::Append { item, .. } if !mail.contains(*item))
         });
     }
 }
@@ -2545,7 +2529,7 @@ pub(super) fn op_done(s: &mut Session, account: AccountId, op: u64, result: Resu
 /// yet), the server copy follows it now: a queued upload of the item becomes a move, and a copy whose item
 /// left the account or was deleted is removed, so it is not downloaded again.
 fn landed(s: &mut Session, account: AccountId, item: ItemId, folder: String, uid: u32) {
-    let here = s.mailbox.mail.get(&item).and_then(|m| synced_folder(&s.mailbox, m.folder));
+    let here = s.mailbox.mail.get(item).and_then(|m| synced_folder(&s.mailbox, m.folder));
     match here {
         Some((a, name)) if a == account && name == folder => {
             set_remote_id(&mut s.mailbox, item, Some(uid));
@@ -2577,7 +2561,7 @@ fn message_sent(s: &mut Session, account: AccountId, item: ItemId, result: Resul
         b.sending.remove(&item);
     }
     let outbox = s.mailbox.role_folder(account, FolderRole::Outbox);
-    let Some(m) = s.mailbox.mail.get(&item) else { return };
+    let Some(m) = s.mailbox.mail.get(item) else { return };
     if Some(m.folder) != outbox {
         return;
     }
@@ -2603,13 +2587,13 @@ fn message_sent(s: &mut Session, account: AccountId, item: ItemId, result: Resul
                     let stripped = s
                         .mailbox
                         .mail
-                        .get(&item)
+                        .get(item)
                         .and_then(|m| crate::cmd::compose::stored_raw(s, m))
                         .and_then(|r| {
                             let out = crate::cmd::compose::strip_submit_headers(&r);
                             (out.len() != r.len()).then_some(out)
                         });
-                    if let Some(m) = s.mailbox.mail.get_mut(&item) {
+                    if let Some(m) = s.mailbox.mail.get_mut(item) {
                         m.folder = sent;
                         m.read = true;
                         m.remote_id = None;
@@ -2621,7 +2605,7 @@ fn message_sent(s: &mut Session, account: AccountId, item: ItemId, result: Resul
                 }
                 // The server files its own copy (downloaded by the next update of Sent Items).
                 _ => {
-                    s.mailbox.mail.remove(&item);
+                    s.mailbox.mail.remove(item);
                 }
             }
         }
@@ -2674,7 +2658,7 @@ fn forget_old_uids(s: &mut Session, account: AccountId, name: &str) {
         }
         match &p.op {
             RemoteOp::Flags { folder, .. } | RemoteOp::Expunge { folder, .. } => folder != name,
-            RemoteOp::Move { folder, dest, item, .. } if folder == name => match mail.get(item) {
+            RemoteOp::Move { folder, dest, item, .. } if folder == name => match mail.get(*item) {
                 Some(m) => {
                     let (dest, item) = (dest.clone(), *item);
                     p.op = RemoteOp::Append { folder: dest, item, flags: upload_flags(m) };
@@ -2801,7 +2785,7 @@ fn apply_folders(s: &mut Session, account: AccountId, mut list: Vec<RemoteFolder
             if let Some(f) = s.mailbox.folders.get_mut(&fid) {
                 f.remote_name = None;
             }
-            for m in s.mailbox.mail.values_mut().filter(|m| m.folder == fid) {
+            for m in s.mailbox.mail.items_mut().filter(|m| m.folder == fid) {
                 m.remote_id = None;
             }
             if let Some(a) = account_mut(s, account) {
@@ -2833,21 +2817,21 @@ pub(super) fn apply_delta(
     let now = s.now();
     let is_inbox = s.mailbox.folder(fid).is_some_and(|f| f.role == Some(FolderRole::Inbox));
     let mut by_uid: BTreeMap<u32, ItemId> = BTreeMap::new();
-    for m in s.mailbox.mail.values().filter(|m| m.folder == fid) {
+    for m in s.mailbox.mail.in_folder(fid) {
         if let Some(u) = uid_of(m) {
             by_uid.insert(u, m.id);
         }
     }
     if delta.reset {
         for (_, id) in std::mem::take(&mut by_uid) {
-            s.mailbox.mail.remove(&id);
+            s.mailbox.mail.remove(id);
             s.sync.track.removed.insert(id);
         }
         forget_old_uids(s, account, name);
     }
     for uid in &delta.vanished {
         if let Some(id) = by_uid.remove(uid) {
-            s.mailbox.mail.remove(&id);
+            s.mailbox.mail.remove(id);
             s.sync.track.removed.insert(id);
         }
     }
@@ -2877,7 +2861,7 @@ pub(super) fn apply_delta(
             continue;
         }
         if let Some(id) = by_uid.get(uid)
-            && let Some(m) = s.mailbox.mail.get_mut(id)
+            && let Some(m) = s.mailbox.mail.get_mut(*id)
             && apply_server_flags(m, flags, now)
         {
             s.sync.track.flags.insert(*id);
@@ -2890,13 +2874,7 @@ pub(super) fn apply_delta(
         let mut item = mailcraft_store::import::item_from_raw(&nm.raw, fid, now);
         // A local copy waiting for this message (uploaded without a reported UID, or the server filed a
         // sent message itself): adopt it instead of showing the message twice.
-        let adopt = item.message_id.as_ref().and_then(|mid| {
-            s.mailbox
-                .mail
-                .values()
-                .find(|m| m.folder == fid && m.remote_id.is_none() && m.message_id.as_ref() == Some(mid))
-                .map(|m| m.id)
-        });
+        let adopt = item.message_id.as_deref().and_then(|mid| local_copy(&s.mailbox, fid, mid));
         if let Some(local) = adopt {
             set_remote_id(&mut s.mailbox, local, Some(nm.uid));
             if let Some(a) = account_mut(s, account) {
@@ -3170,20 +3148,20 @@ mod tests {
             }],
         );
         let id = find_pop3(&s, acct, "h1").unwrap();
-        assert!(s.mailbox.mail[&id].body.text.is_none(), "header only");
+        assert!(s.mailbox.mail.get(id).unwrap().body.text.is_none(), "header only");
         s.run("mail.pin", &json!({"ids": [id.0], "on": true})).unwrap();
         let vote = mailcraft_model::VoteRecord {
             from: "bo@example.org".into(),
             choice: "Yes".into(),
             ..Default::default()
         };
-        if let Some(m) = s.mailbox.mail.get_mut(&id) {
+        if let Some(m) = s.mailbox.mail.get_mut(id) {
             m.votes.push(vote.clone());
             m.categories = vec!["Blue".into()];
         }
         // Mark to Download: the whole message arrives for the same item.
         apply_all(&mut s, vec![Event::Pop3Full { account: acct, uidl: "h1".into(), raw }]);
-        let m = &s.mailbox.mail[&id];
+        let m = s.mailbox.mail.get(id).unwrap();
         assert!(m.body.text.as_deref().is_some_and(|t| t.contains("Hi.")), "the body is filled in");
         assert!(m.pinned, "still pinned");
         assert_eq!(m.votes, [vote]);
@@ -3227,7 +3205,7 @@ mod tests {
         let moved = find_pop3(&s, acct, "u1").unwrap();
         let deleted = find_pop3(&s, acct, "u2").unwrap();
         s.mailbox.move_items(&[moved], archive).unwrap();
-        s.mailbox.mail.remove(&deleted);
+        s.mailbox.mail.remove(deleted);
         let a = s.mailbox.account(acct).cloned().unwrap();
         let job = pop3_job(&s, &a, true, false, &[], s.now().unix).unwrap();
         assert!(job.delete.contains("u2"), "deleted here: the server copy goes");
@@ -3259,7 +3237,7 @@ mod tests {
         );
         let junk = s.mailbox.role_folder(acct, FolderRole::JunkEmail).unwrap();
         let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
-        let by_subject = |subj: &str| s.mailbox.mail.values().find(|m| m.subject == subj).unwrap();
+        let by_subject = |subj: &str| s.mailbox.mail.items().find(|m| m.subject == subj).unwrap();
         let spam = by_subject("hello there");
         assert_eq!(spam.folder, junk, "blocked sender filed in Junk Email");
         assert!(spam.categories.is_empty(), "rules do not run on junk");
@@ -3271,7 +3249,7 @@ mod tests {
         s.run("options.set", &json!({"key": "mail.focused.otherSenders", "value": ["ann@example.org"]}))
             .unwrap();
         apply_all(&mut s, vec![pop3_new(acct, "u3", "Ann <ann@example.org>", "later")]);
-        let later = s.mailbox.mail.values().find(|m| m.subject == "later").unwrap();
+        let later = s.mailbox.mail.items().find(|m| m.subject == "later").unwrap();
         assert_eq!(later.focus, mailcraft_model::FocusClass::Other);
     }
 
@@ -3301,8 +3279,8 @@ mod tests {
                 Event::Sent { account: acct, item: filed, result: Ok(()) },
             ],
         );
-        assert!(!s.mailbox.mail.contains_key(&dropped), "Do Not Save");
-        let m = &s.mailbox.mail[&filed];
+        assert!(!s.mailbox.mail.contains(dropped), "Do Not Save");
+        let m = s.mailbox.mail.get(filed).unwrap();
         assert_eq!(m.folder, sent_folder);
         let raw = String::from_utf8(m.raw.clone().unwrap()).unwrap();
         assert!(!raw.contains("X-MailCraft-Submit"), "{raw}");
@@ -3450,7 +3428,7 @@ mod tests {
         assert!(projects.iter().all(|d| d.folder_index > 1 && d.folder_index <= folders));
 
         let inbox_id = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
-        assert_eq!(s.mailbox.mail.values().filter(|m| m.folder == inbox_id).count(), 130);
+        assert_eq!(s.mailbox.mail.in_folder(inbox_id).count(), 130);
         assert_eq!(s.sync_status().text, "All folders are up to date.");
 
         // The next run finds nothing new: no message counts, only the folder steps.
@@ -3479,7 +3457,7 @@ mod tests {
         let reports: Vec<&SyncProgress> = counted.iter().map(|(_, d)| d).collect();
         assert_counts_climb(&reports, 150);
         assert!(counted.iter().any(|(t, _)| t == "Downloading 150 of 150 messages"), "{counted:?}");
-        assert_eq!(s.mailbox.mail.values().filter(|m| m.subject.starts_with("Note INBOX")).count(), 150);
+        assert_eq!(s.mailbox.mail.items().filter(|m| m.subject.starts_with("Note INBOX")).count(), 150);
     }
 
     /// Queues an Include Older Results search for "budget" on `id`, the way a search started while the
@@ -3520,7 +3498,7 @@ mod tests {
         srv.seed_message(PROGRESS_USER, "INBOX", raw.as_bytes(), &[]).unwrap();
         search_with_receive(&mut s, id);
         assert!(
-            s.mailbox.mail.values().any(|m| m.subject == "Arrived meanwhile"),
+            s.mailbox.mail.items().any(|m| m.subject == "Arrived meanwhile"),
             "the receive ran although the search was refused"
         );
         let error = s.sync.older.error.clone().unwrap_or_default();
@@ -3552,7 +3530,7 @@ mod tests {
         );
         srv.seed_message(PROGRESS_USER, "INBOX", raw.as_bytes(), &[]).unwrap();
         search_with_receive(&mut s, id);
-        assert!(s.mailbox.mail.values().any(|m| m.subject == "Arrived meanwhile"), "{:?}", s.sync_status());
+        assert!(s.mailbox.mail.items().any(|m| m.subject == "Arrived meanwhile"), "{:?}", s.sync_status());
         assert!(s.sync.older.error.is_some(), "the search reports that it failed");
         let st = s.sync_status();
         assert!(st.accounts.iter().all(|a| a.error.is_none()), "no account error: {st:?}");
@@ -3609,7 +3587,7 @@ mod tests {
         crate::accounts::prefs(&mut s).headers_only.insert(id.0);
         let raw = b"From: a@example.com\r\nSubject: Headers only\r\n\r\nThe whole body\r\n";
         assert!(fill_item(&mut s, id, raw));
-        let m = &s.mailbox.mail[&id];
+        let m = s.mailbox.mail.get(id).unwrap();
         assert_eq!(m.body.text.as_deref().map(str::trim), Some("The whole body"));
         assert!(m.no_auto_archive && m.ignored && m.read);
         assert_eq!(m.remote_id.as_deref(), Some("5"));

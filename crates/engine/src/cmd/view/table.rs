@@ -527,7 +527,7 @@ pub enum Item<'a> {
 pub fn item(s: &Session, kind: RowKind, id: ItemId) -> Option<Item<'_>> {
     match kind {
         RowKind::Task => s.mailbox.tasks.get(&id).map(Item::Task),
-        RowKind::Mail => s.mailbox.mail.get(&id).map(Item::Mail),
+        RowKind::Mail => s.mailbox.mail.get(id).map(Item::Mail),
         RowKind::Contact => s.mailbox.contacts.get(&id).map(Item::Contact),
         RowKind::Note => None,
     }

@@ -2906,8 +2906,7 @@ mod tests {
         let r = s.run("people.mailMerge", &send).unwrap();
         assert_eq!((r["sent"].as_u64(), r["skipped"].as_u64()), (Some(2), Some(1)));
         let outbox = role(&s, FolderRole::Outbox);
-        let subjects: Vec<&str> =
-            s.mailbox.mail.values().filter(|m| m.folder == outbox).map(|m| m.subject.as_str()).collect();
+        let subjects: Vec<&str> = s.mailbox.mail.in_folder(outbox).map(|m| m.subject.as_str()).collect();
         assert!(subjects.contains(&"Hi Ann") && subjects.contains(&"Hi Bo"), "{subjects:?}");
         let mut bad = send.clone();
         bad["subject"] = json!("{{Nope}}");

@@ -90,7 +90,7 @@ pub fn req_folder(s: &crate::Session, p: &Value) -> Result<FolderId, CmdError> {
 /// `{"id": n}` → an existing mail item, else a `Params` error.
 pub fn req_mail(s: &crate::Session, p: &Value) -> Result<ItemId, CmdError> {
     let id = ItemId(req_u64(p, "id")?);
-    if s.mailbox.mail.contains_key(&id) {
+    if s.mailbox.mail.contains(id) {
         Ok(id)
     } else {
         Err(CmdError::Params(format!("no message with id {}", id.0)))
@@ -99,15 +99,14 @@ pub fn req_mail(s: &crate::Session, p: &Value) -> Result<ItemId, CmdError> {
 
 /// Enabled predicate: something is selected in the message list (or focused).
 pub fn needs_selection(s: &crate::Session) -> Option<&'static str> {
-    let any =
-        s.selection.items.iter().chain(s.selection.focus.iter()).any(|id| s.mailbox.mail.contains_key(id));
+    let any = s.selection.items.iter().chain(s.selection.focus.iter()).any(|id| s.mailbox.mail.contains(*id));
     if any { None } else { Some("select a message first") }
 }
 
 /// Existing mail ids among [`crate::Session::target_ids`] (unknown ids dropped, order kept, no duplicates).
 pub fn mail_targets(s: &crate::Session, p: &Value) -> Vec<ItemId> {
     let mut seen = std::collections::BTreeSet::new();
-    s.target_ids(p).into_iter().filter(|id| s.mailbox.mail.contains_key(id) && seen.insert(*id)).collect()
+    s.target_ids(p).into_iter().filter(|id| s.mailbox.mail.contains(*id) && seen.insert(*id)).collect()
 }
 
 /// A parsed profile file kept between reads (building blocks, saved themes): menus and dialogs list their

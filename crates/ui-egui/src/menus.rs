@@ -196,7 +196,7 @@ struct Targets {
 
 impl Targets {
     fn of(app: &App, ids: Vec<ItemId>) -> Targets {
-        let items: Vec<_> = ids.iter().filter_map(|i| app.s.mailbox.mail.get(i)).collect();
+        let items: Vec<_> = ids.iter().filter_map(|i| app.s.mailbox.mail.get(*i)).collect();
         let mut common: Option<BTreeSet<String>> = None;
         for m in &items {
             let set: BTreeSet<String> = m.categories.iter().map(|c| c.to_lowercase()).collect();
@@ -425,7 +425,7 @@ fn ensure_selected(app: &mut App, ids: &[ItemId]) {
 /// the row (which becomes selected).
 pub fn message_row_menu(ui: &mut Ui, app: &mut App, item: u64) {
     let id = ItemId(item);
-    let Some(m) = app.s.mailbox.mail.get(&id) else {
+    let Some(m) = app.s.mailbox.mail.get(id) else {
         ui.label("This item no longer exists.");
         return;
     };
@@ -514,12 +514,12 @@ pub fn conversation_menu(ui: &mut Ui, app: &mut App, header: u64) {
         message_row_menu(ui, app, header);
         return;
     };
-    let ignored = app.s.mailbox.mail.get(&id).is_some_and(|m| m.ignored);
+    let ignored = app.s.mailbox.mail.get(id).is_some_and(|m| m.ignored);
     ensure_selected(app, &[id]);
     let t = Targets::of(app, conv.view_members());
     let one = json!({"ids": [header]});
-    let any_unread = t.ids.iter().any(|i| app.s.mailbox.mail.get(i).is_some_and(|m| !m.read));
-    let any_read = t.ids.iter().any(|i| app.s.mailbox.mail.get(i).is_some_and(|m| m.read));
+    let any_unread = t.ids.iter().any(|i| app.s.mailbox.mail.get(*i).is_some_and(|m| !m.read));
+    let any_read = t.ids.iter().any(|i| app.s.mailbox.mail.get(*i).is_some_and(|m| m.read));
 
     let toggle = json!({"conversation": true, "id": header});
     // The engine state after selecting (the selected conversation shows expanded).
@@ -604,8 +604,8 @@ pub fn group_header_menu(ui: &mut Ui, app: &mut App, label: &str) {
     };
     ensure_selected(app, &ids);
     let t = Targets::of(app, ids);
-    let any_unread = t.ids.iter().any(|i| app.s.mailbox.mail.get(i).is_some_and(|m| !m.read));
-    let any_read = t.ids.iter().any(|i| app.s.mailbox.mail.get(i).is_some_and(|m| m.read));
+    let any_unread = t.ids.iter().any(|i| app.s.mailbox.mail.get(*i).is_some_and(|m| !m.read));
+    let any_read = t.ids.iter().any(|i| app.s.mailbox.mail.get(*i).is_some_and(|m| m.read));
 
     cmd(ui, app, "collapse-ribbon", "Collapse All &Groups", "view.collapseAll", json!({}));
     cmd(ui, app, "chevron-down", "E&xpand All Groups", "view.expandAll", json!({}));
@@ -1101,7 +1101,7 @@ mod tests {
         let inbox = app.s.selection.folder;
         let id = app.s.mailbox.items_in(inbox).first().map(|m| m.id).unwrap();
         app.run("nav.selectItem", json!({"id": id.0})).unwrap();
-        if let Some(m) = app.s.mailbox.mail.get_mut(&id) {
+        if let Some(m) = app.s.mailbox.mail.get_mut(id) {
             m.read = true;
             m.flag = FlagState::None;
         }
@@ -1119,14 +1119,14 @@ mod tests {
         press(&mut h, egui::Key::U);
         assert!(shown(&h, "Mark Complete"), "Follow Up opened by its key");
         press(&mut h, egui::Key::T);
-        assert!(matches!(h.state().s.mailbox.mail[&id].flag, FlagState::Flagged { .. }));
+        assert!(matches!(h.state().s.mailbox.mail.get(id).unwrap().flag, FlagState::Flagged { .. }));
         assert!(!shown(&h, "Quick Print"), "the menu closed");
 
         // N: Mark as Unread (the message is read).
         h.get_by_label("Menu target").click_secondary();
         h.run();
         press(&mut h, egui::Key::N);
-        assert!(!h.state().s.mailbox.mail[&id].read);
+        assert!(!h.state().s.mailbox.mail.get(id).unwrap().read);
     }
 
     #[test]
@@ -1234,19 +1234,19 @@ mod tests {
         let id = one_message(&mut app);
         app.run("mail.delete", json!({"ids": [id.0]})).unwrap();
         assert!(app.ui.dialogs.is_empty(), "moving to Deleted Items asks nothing");
-        let deleted = app.s.mailbox.mail[&id].folder;
+        let deleted = app.s.mailbox.mail.get(id).unwrap().folder;
         app.run("nav.selectFolder", json!({"folder": deleted.0})).unwrap();
         app.run("nav.selectItem", json!({"id": id.0})).unwrap();
         let mut h = menu_harness(app, move |ui, app| message_row_menu(ui, app, id.0));
         press(&mut h, egui::Key::D);
-        assert!(h.state().s.mailbox.mail.contains_key(&id), "not removed yet");
+        assert!(h.state().s.mailbox.mail.contains(id), "not removed yet");
         let (name, p) = h.state().ui.dialogs.last().cloned().unwrap();
         assert_eq!(name, "confirm");
         assert!(p["text"].as_str().unwrap().contains("permanently deleted"), "{p}");
         // Yes runs Delete with the answer.
         let (cmd, params) = (p["command"].as_str().unwrap().to_owned(), p["params"].clone());
         h.state_mut().run(&cmd, params);
-        assert!(!h.state().s.mailbox.mail.contains_key(&id));
+        assert!(!h.state().s.mailbox.mail.contains(id));
     }
 
     #[test]

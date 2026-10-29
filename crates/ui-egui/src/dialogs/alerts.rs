@@ -131,7 +131,7 @@ fn new_item_alerts(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             muted(ui, app, &detail);
         }
         let sel_item = list.selected.and_then(|i| list.lines.get(i)).map(|a| a.item);
-        let exists = sel_item.is_some_and(|id| app.s.mailbox.mail.contains_key(&mailcraft_model::ItemId(id)));
+        let exists = sel_item.is_some_and(|id| app.s.mailbox.mail.contains(mailcraft_model::ItemId(id)));
         let mut close = false;
         footer(ui, |ui| {
             if btn(ui, "Close") {

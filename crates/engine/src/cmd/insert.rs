@@ -4250,7 +4250,7 @@ pub(crate) mod tests {
         // Sending embeds it as a related part.
         s.run("compose.setTo", &json!({"value": "a@example.com"})).unwrap();
         assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
-        let sent = s.mailbox.mail.values().find(|m| m.subject.is_empty() && !m.is_draft).unwrap();
+        let sent = s.mailbox.mail.items().find(|m| m.subject.is_empty() && !m.is_draft).unwrap();
         assert!(String::from_utf8_lossy(sent.raw.as_ref().unwrap()).contains("Content-ID"));
     }
 
@@ -4859,7 +4859,7 @@ f 1 2 3 4\nf 5 6 7 8\nf 1 2 6 5\nf 2 3 7 6\nf 3 4 8 7\nf 4 1 5 8\n";
         // Sent: the message has PNG parts only and the drawings' text in its plain-text part.
         s.run("compose.setTo", &json!({"value": "a@example.com"})).unwrap();
         assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
-        let sent = s.mailbox.mail.values().find(|m| !m.is_draft && m.subject.is_empty()).unwrap();
+        let sent = s.mailbox.mail.items().find(|m| !m.is_draft && m.subject.is_empty()).unwrap();
         let raw = String::from_utf8_lossy(sent.raw.as_ref().unwrap()).into_owned();
         assert!(!raw.contains("image/svg+xml"), "no SVG is sent");
         assert!(raw.matches("image/png").count() >= 3, "{raw}");

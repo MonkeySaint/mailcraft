@@ -61,7 +61,7 @@ fn row_of(app: &App, r: &ViewRow) -> Option<Row> {
             (t.subject.clone(), day(t.due), t.status == TaskStatus::Completed, t.priority)
         }
         RowKind::Mail => {
-            let m = app.s.mailbox.mail.get(&r.id)?;
+            let m = app.s.mailbox.mail.get(r.id)?;
             let due = match &m.flag {
                 FlagState::Flagged { due, .. } => day(*due),
                 _ => None,
@@ -359,7 +359,7 @@ pub(super) fn preview_text(app: &App, row: &Row, lines: u8) -> String {
     }
     let text = match row.kind {
         RowKind::Task => app.s.mailbox.tasks.get(&row.id).map(|t| t.body.clone()),
-        RowKind::Mail => app.s.mailbox.mail.get(&row.id).map(|m| {
+        RowKind::Mail => app.s.mailbox.mail.get(row.id).map(|m| {
             // Only the start of the body is read: this runs for every row on every frame.
             let body = m.body_text_prefix(PREVIEW_BODY_BYTES);
             if body.trim().is_empty() { m.preview.clone() } else { body }
@@ -390,7 +390,7 @@ fn quick_category(app: &mut App, row: &Row) {
 /// Look of a row's flag: a task's flag is complete with the task; messages and contacts show their flag.
 fn flag_look(app: &App, row: &Row) -> mt::FlagLook {
     let flag = match row.kind {
-        RowKind::Mail => app.s.mailbox.mail.get(&row.id).map(|m| m.flag.clone()),
+        RowKind::Mail => app.s.mailbox.mail.get(row.id).map(|m| m.flag.clone()),
         RowKind::Contact => app.s.mailbox.contacts.get(&row.id).map(|c| c.flag.clone()),
         _ => None,
     };
@@ -756,7 +756,7 @@ fn flagged_body(ui: &mut Ui, app: &App, row: &Row) {
     let tz = tz(app);
     match row.kind {
         RowKind::Mail => {
-            let Some(m) = app.s.mailbox.mail.get(&row.id) else { return };
+            let Some(m) = app.s.mailbox.mail.get(row.id) else { return };
             let from =
                 m.from.as_ref().or(m.sender.as_ref()).map(|a| a.to_display_string()).unwrap_or_default();
             info(ui, app, "From", &from);

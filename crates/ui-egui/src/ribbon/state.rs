@@ -126,7 +126,7 @@ fn pim_on(app: &App, surface: Surface, arg: &str) -> bool {
         };
     }
     // A flagged message row of the To-Do List.
-    if let Some(m) = mb.mail.get(&id) {
+    if let Some(m) = mb.mail.get(id) {
         return match arg {
             "private" => m.sensitivity == mailcraft_model::Sensitivity::Private,
             "high" => m.importance == Importance::High,
@@ -152,7 +152,7 @@ fn focused_mail(app: &App, surface: Surface) -> Option<&mailcraft_model::MailIte
         Surface::Read(id) => mailcraft_model::ItemId(id),
         _ => app.s.selection.focus.or_else(|| app.s.selection.items.first().copied())?,
     };
-    app.s.mailbox.mail.get(&id)
+    app.s.mailbox.mail.get(id)
 }
 
 fn compose(app: &App, surface: Surface) -> Option<&mailcraft_engine::compose::ComposeState> {
@@ -1358,7 +1358,7 @@ pub fn dyn_items(app: &App, surface: Surface, source: &str) -> Vec<DynItem> {
                 .selection
                 .focus
                 .or_else(|| app.s.selection.items.first().copied())
-                .and_then(|id| app.s.mailbox.mail.get(&id))
+                .and_then(|id| app.s.mailbox.mail.get(id))
                 .and_then(|m| m.from.as_ref())
                 .and_then(|f| f.addr.rsplit_once('@').map(|(_, d)| d.trim().to_owned()))
                 .filter(|d| !d.is_empty());
@@ -1689,7 +1689,7 @@ pub fn disabled(app: &App, surface: Surface, cmd: &str) -> Option<&'static str> 
             || (spec.params.contains("\"id\"") && cmd.split('.').next() == Some("review")))
     {
         let item = mailcraft_model::ItemId(item);
-        return if app.s.mailbox.mail.contains_key(&item) {
+        return if app.s.mailbox.mail.contains(item) {
             app.s.enabled_for(cmd, &[item])
         } else {
             Some("the message is no longer available")
@@ -1721,7 +1721,7 @@ pub fn run(ctx: &egui::Context, app: &mut App, surface: Surface, mem: &mut Mem, 
             .get(&act.cmd)
             .is_some_and(|s| s.params.contains("\"ids\"") || (review && s.params.contains("\"id\"")));
         let selected = app.s.selection.items.iter().any(|i| i.0 == item);
-        let exists = app.s.mailbox.mail.contains_key(&mailcraft_model::ItemId(item));
+        let exists = app.s.mailbox.mail.contains(mailcraft_model::ItemId(item));
         if !takes_ids && !selected && exists && act.cmd.starts_with("mail.") {
             let _ = app.run("nav.selectItem", json!({"id": item}));
         }

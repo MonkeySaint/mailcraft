@@ -190,7 +190,7 @@ impl Backend for HeadlessBackend {
     }
 
     fn body_text(&mut self, item: u64) -> Result<Option<String>, String> {
-        match self.session.mailbox.mail.get(&ItemId(item)) {
+        match self.session.mailbox.mail.get(ItemId(item)) {
             Some(m) => Ok(Some(m.body_text())),
             None => Err(format!("no message with id {item}")),
         }

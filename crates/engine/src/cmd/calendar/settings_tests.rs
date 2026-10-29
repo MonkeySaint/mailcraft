@@ -317,7 +317,7 @@ fn automatic_accept_and_decline() {
     assert_eq!(r["handled"][0]["action"], "decline", "{r}");
     let uid = org.mailbox.appointments[&meeting].uid.clone();
     assert!(find_by_uid(&bob, &uid).is_none());
-    assert!(bob.mailbox.mail[&mail].read);
+    assert!(bob.mailbox.mail.get(mail).unwrap().read);
 
     // Declining recurring requests (only that option on).
     let r = org
@@ -339,7 +339,7 @@ fn automatic_accept_and_decline() {
     let r = ann.run("calendar.autoRespond", &json!({})).unwrap();
     assert_eq!(r["handled"][0]["action"], "remove", "{r}");
     assert!(find_by_uid(&ann, &uid).is_none());
-    assert!(ann.mailbox.mail[&cancel].read);
+    assert!(ann.mailbox.mail.get(cancel).unwrap().read);
     // Junk ids are skipped.
     let r = ann.run("calendar.autoRespond", &json!({"ids": [u64::MAX, 0]})).unwrap();
     assert_eq!(r["handled"], json!([]));

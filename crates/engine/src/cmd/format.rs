@@ -2926,7 +2926,7 @@ fn message_target(s: &Session, p: &Value) -> Result<Option<u64>, CmdError> {
         }
         _ => return Ok(None),
     };
-    if !s.mailbox.mail.contains_key(&mailcraft_model::ItemId(id)) {
+    if !s.mailbox.mail.contains(mailcraft_model::ItemId(id)) {
         return Err(CmdError::Params(format!("no message with id {id}")));
     }
     Ok(Some(id))
@@ -2935,7 +2935,7 @@ fn message_target(s: &Session, p: &Value) -> Result<Option<u64>, CmdError> {
 /// How often `needle` occurs in message `id`'s text.
 fn message_matches(s: &Session, id: u64, needle: &str, match_case: bool) -> usize {
     const MAX_TEXT: usize = 4 * 1024 * 1024;
-    let Some(m) = s.mailbox.mail.get(&mailcraft_model::ItemId(id)) else {
+    let Some(m) = s.mailbox.mail.get(mailcraft_model::ItemId(id)) else {
         return 0;
     };
     if needle.is_empty() {
@@ -3361,7 +3361,7 @@ fn selection_pane(s: &mut Session, p: &Value) -> CmdResult {
         let objects = s
             .mailbox
             .mail
-            .get(&mailcraft_model::ItemId(id))
+            .get(mailcraft_model::ItemId(id))
             .map(|m| doc_objects(&crate::cmd::mail::body_doc(m)))
             .unwrap_or_default();
         let names: Vec<&str> = objects.iter().map(|o| o.name.as_str()).collect();
@@ -4228,7 +4228,7 @@ mod tests {
     fn send_html(s: &mut Session) -> String {
         s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
         assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
-        let m = s.mailbox.mail.values().filter(|m| !m.is_draft).max_by_key(|m| m.id).unwrap();
+        let m = s.mailbox.mail.items().filter(|m| !m.is_draft).max_by_key(|m| m.id).unwrap();
         m.body.html.clone().unwrap()
     }
 
@@ -4506,7 +4506,7 @@ mod tests {
         let out = s
             .mailbox
             .mail
-            .values()
+            .items()
             .filter_map(|m| m.raw.as_ref())
             .map(|r| String::from_utf8_lossy(r).into_owned())
             .find(|r| r.contains("Content-ID"))
@@ -5605,7 +5605,7 @@ mod pane_tests {
         let (id, needle) = s
             .mailbox
             .mail
-            .values()
+            .items()
             .find_map(|m| {
                 let t = m.body.text.clone()?;
                 let w = t

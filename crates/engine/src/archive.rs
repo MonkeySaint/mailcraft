@@ -395,7 +395,7 @@ impl Report {
 
 fn set_folder(mb: &mut Mailbox, kind: Kind, id: ItemId, to: FolderId) -> bool {
     let slot = match kind {
-        Kind::Mail => mb.mail.get_mut(&id).map(|x| &mut x.folder),
+        Kind::Mail => mb.mail.get_mut(id).map(|x| &mut x.folder),
         Kind::Appointment => mb.appointments.get_mut(&id).map(|x| &mut x.folder),
         Kind::Task => mb.tasks.get_mut(&id).map(|x| &mut x.folder),
         Kind::Note => mb.notes.get_mut(&id).map(|x| &mut x.folder),
@@ -411,7 +411,7 @@ fn set_folder(mb: &mut Mailbox, kind: Kind, id: ItemId, to: FolderId) -> bool {
 
 fn remove(mb: &mut Mailbox, kind: Kind, id: ItemId) -> bool {
     match kind {
-        Kind::Mail => mb.mail.remove(&id).is_some(),
+        Kind::Mail => mb.mail.remove(id).is_some(),
         Kind::Appointment => mb.appointments.remove(&id).is_some(),
         Kind::Task => mb.tasks.remove(&id).is_some(),
         Kind::Note => mb.notes.remove(&id).is_some(),
@@ -456,7 +456,7 @@ pub fn archive(s: &mut Session, plan: &Plan) -> Result<Report, CmdError> {
     let is_mail_folder = |f: FolderId| mb.folder(f).is_some_and(|f| f.kind == FolderKind::Mail);
     // Each job with the account whose server change queue it feeds.
     let mut jobs: Vec<(Job, Option<AccountId>)> = Vec::new();
-    for m in mb.mail.values() {
+    for m in mb.mail.items() {
         let Some(r) = rules.get(&m.folder) else { continue };
         let queue = crate::sync::queue_account(mb, m);
         if delete_expired
@@ -887,7 +887,7 @@ fn run_exclude(s: &mut Session, p: &Value) -> CmdResult {
     let on = opt_bool(p, "on").unwrap_or(true);
     let mut n = 0usize;
     for id in &ids {
-        if let Some(m) = s.mailbox.mail.get_mut(id)
+        if let Some(m) = s.mailbox.mail.get_mut(*id)
             && m.no_auto_archive != on
         {
             m.no_auto_archive = on;

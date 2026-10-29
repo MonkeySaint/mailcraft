@@ -39,11 +39,11 @@ fn settle(s: &mut Session) {
 }
 
 fn find(s: &Session, folder: FolderId, subject: &str) -> Option<ItemId> {
-    s.mailbox.mail.values().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
+    s.mailbox.mail.items().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
 }
 
 fn select(s: &mut Session, id: ItemId) {
-    s.selection.folder = s.mailbox.mail[&id].folder;
+    s.selection.folder = s.mailbox.mail.get(id).unwrap().folder;
     s.selection.items = vec![id];
     s.selection.focus = Some(id);
 }
@@ -96,14 +96,14 @@ fn jmap_account_receives_writes_back_and_sends() {
     assert!(s.mailbox.folder(inbox).unwrap().remote_name.is_some(), "Inbox mapped to its mailbox id");
     assert!(s.mailbox.folders.values().any(|f| f.account == a && f.name == "Projects"));
     let hello = find(&s, inbox, "Hello JMAP").expect("first run downloads the mail");
-    assert!(!s.mailbox.mail[&hello].read);
+    assert!(!s.mailbox.mail.get(hello).unwrap().read);
 
     // Later mail comes from Email/changes; flags set elsewhere arrive too.
     srv.seed_message(ALICE, "INBOX", &message("Second", "second"), &["\\Seen"]).unwrap();
     sync(&mut s);
     let second = find(&s, inbox, "Second").expect("Email/changes delivers new mail");
-    assert!(s.mailbox.mail[&second].read);
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Hello JMAP").count(), 1, "no duplicates");
+    assert!(s.mailbox.mail.get(second).unwrap().read);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Hello JMAP").count(), 1, "no duplicates");
 
     // Local changes reach the server (Email/set keywords and mailboxIds).
     select(&mut s, hello);
@@ -120,8 +120,8 @@ fn jmap_account_receives_writes_back_and_sends() {
     assert!(subjects(&srv, ALICE, "Archive").contains(&"Hello JMAP".to_owned()));
     assert!(!subjects(&srv, ALICE, "INBOX").contains(&"Hello JMAP".to_owned()));
     sync(&mut s);
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Hello JMAP").count(), 1);
-    assert_eq!(s.mailbox.mail[&hello].folder, archive, "the moved item keeps its identity");
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Hello JMAP").count(), 1);
+    assert_eq!(s.mailbox.mail.get(hello).unwrap().folder, archive, "the moved item keeps its identity");
 
     // Permanent delete destroys the server copy.
     select(&mut s, second);

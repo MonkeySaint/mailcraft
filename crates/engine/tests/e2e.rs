@@ -50,7 +50,7 @@ fn settle(s: &mut Session) {
 
 /// Selects one message (mail commands act on the selection; `ids` must also be selected to be enabled).
 fn select(s: &mut Session, id: ItemId) {
-    let folder = s.mailbox.mail[&id].folder;
+    let folder = s.mailbox.mail.get(id).unwrap().folder;
     s.selection.folder = folder;
     s.selection.items = vec![id];
     s.selection.focus = Some(id);
@@ -61,7 +61,7 @@ fn role(s: &Session, account: AccountId, role: FolderRole) -> FolderId {
 }
 
 fn find(s: &Session, folder: FolderId, subject: &str) -> Option<ItemId> {
-    s.mailbox.mail.values().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
+    s.mailbox.mail.items().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
 }
 
 fn server_subjects(srv: &TestServers, user: &str, mailbox: &str) -> Vec<String> {
@@ -123,7 +123,7 @@ fn imap_account_receive_rules_reply_send_and_server_changes() {
     sync(&mut s);
     let inbox = role(&s, acct, FolderRole::Inbox);
     let lunch = find(&s, inbox, "Lunch?").expect("seeded message received");
-    assert!(!s.mailbox.mail[&lunch].read);
+    assert!(!s.mailbox.mail.get(lunch).unwrap().read);
     assert_eq!(s.sync_status().text, "All folders are up to date.");
     assert_eq!(s.sync_status().connection_text, "Connected");
     for (r, name) in [
@@ -155,7 +155,7 @@ fn imap_account_receive_rules_reply_send_and_server_changes() {
     let px = find(&s, projects, "Project X status").expect("rule moved the new message");
     assert!(server_subjects(&srv, ALICE, "INBOX/Projects").contains(&"Project X status".to_owned()));
     assert!(!server_subjects(&srv, ALICE, "INBOX").contains(&"Project X status".to_owned()));
-    assert!(s.mailbox.mail[&px].remote_id.is_some(), "the moved message knows its new UID");
+    assert!(s.mailbox.mail.get(px).unwrap().remote_id.is_some(), "the moved message knows its new UID");
 
     // Reply and send.
     s.selection.items = vec![lunch];
@@ -170,14 +170,14 @@ fn imap_account_receive_rules_reply_send_and_server_changes() {
     assert_eq!(s.mailbox.total_count(outbox), 0, "Outbox emptied");
     let sent = role(&s, acct, FolderRole::SentItems);
     let reply = find(&s, sent, "RE: Lunch?").expect("reply filed in Sent Items");
-    assert!(s.mailbox.mail[&reply].remote_id.is_some());
+    assert!(s.mailbox.mail.get(reply).unwrap().remote_id.is_some());
     assert!(server_subjects(&srv, BOB, "INBOX").contains(&"RE: Lunch?".to_owned()), "Bob received the reply");
     assert!(server_subjects(&srv, ALICE, "Sent").contains(&"RE: Lunch?".to_owned()), "uploaded to Sent");
     let sub = srv.submissions();
     let last = sub.last().unwrap();
     assert_eq!(last.mail_from, ALICE);
     assert_eq!(last.rcpt_to, vec![BOB.to_owned()]);
-    assert!(matches!(s.mailbox.mail[&lunch].response, ResponseState::Replied(_)));
+    assert!(matches!(s.mailbox.mail.get(lunch).unwrap().response, ResponseState::Replied(_)));
     assert!(server_flags(&srv, ALICE, "INBOX", "Lunch?").contains(&"\\Answered".to_owned()));
 
     // Flag, unread, move, delete, permanent delete.
@@ -233,7 +233,7 @@ fn imap_account_receive_rules_reply_send_and_server_changes() {
     srv.seed_message(ALICE, "INBOX", &message(BOB, ALICE, "Second", "second"), &["\\Seen"]).unwrap();
     sync(&mut s);
     let second = find(&s, inbox, "Second").unwrap();
-    assert!(s.mailbox.mail[&second].read, "server flags on new mail");
+    assert!(s.mailbox.mail.get(second).unwrap().read, "server flags on new mail");
     assert!(s.mailbox.account(acct).unwrap().sync.pending.is_empty(), "queue drained");
     assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
 }
@@ -322,11 +322,11 @@ fn offline_and_queue_persist_in_the_data_file() {
     settle(&mut s);
     assert!(server_flags(&srv, ALICE, "INBOX", "Lunch?").contains(&"\\Flagged".to_owned()));
     assert_eq!(
-        s.mailbox.mail.values().filter(|m| m.subject == "Lunch?").count(),
+        s.mailbox.mail.items().filter(|m| m.subject == "Lunch?").count(),
         1,
         "no duplicate after reopening"
     );
-    assert!(s.mailbox.mail.contains_key(&lunch));
+    assert!(s.mailbox.mail.contains(lunch));
 }
 
 fn add_account(s: &mut Session, srv: &TestServers, address: &str, password: &str) -> AccountId {
@@ -345,7 +345,7 @@ fn add_account(s: &mut Session, srv: &TestServers, address: &str, password: &str
 }
 
 fn count(s: &Session, folder: FolderId, subject: &str) -> usize {
-    s.mailbox.mail.values().filter(|m| m.folder == folder && m.subject == subject).count()
+    s.mailbox.mail.items().filter(|m| m.folder == folder && m.subject == subject).count()
 }
 
 /// Holds every queued server change of `acct` back (as if waiting out a retry delay), or releases them.
@@ -390,8 +390,8 @@ fn queued_delete_and_move_are_not_downloaded_again() {
     settle(&mut s);
     assert_eq!(server_subjects(&srv, ALICE, "INBOX"), vec!["Oldest".to_owned()]);
     assert_eq!(server_subjects(&srv, ALICE, "Archive"), vec!["Middle".to_owned()]);
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Middle").count(), 1);
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Newest").count(), 0);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Middle").count(), 1);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Newest").count(), 0);
     assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
 }
 
@@ -410,7 +410,7 @@ fn results_of_a_removed_account_never_reach_a_new_one() {
     assert_eq!(bob, alice, "the test needs the id to be reused");
     assert!(s.wait_for_sync(WAIT));
     assert!(
-        !s.mailbox.mail.values().any(|m| m.subject == "For Alice only"),
+        !s.mailbox.mail.items().any(|m| m.subject == "For Alice only"),
         "Alice's mail was filed in Bob's account"
     );
     assert!(s.mailbox.folders.values().filter(|f| f.account == bob).all(|f| f.remote_name.is_none()));
@@ -418,7 +418,7 @@ fn results_of_a_removed_account_never_reach_a_new_one() {
     srv.seed_message(BOB, "INBOX", &message(ALICE, BOB, "For Bob", "bob-mail"), &[]).unwrap();
     sync(&mut s);
     assert!(find(&s, role(&s, bob, FolderRole::Inbox), "For Bob").is_some());
-    assert!(!s.mailbox.mail.values().any(|m| m.subject == "For Alice only"));
+    assert!(!s.mailbox.mail.items().any(|m| m.subject == "For Alice only"));
 }
 
 #[test]
@@ -452,7 +452,7 @@ fn first_sync_status_counts_the_messages() {
     assert!(seen.windows(2).all(|w| w[0].folder_index <= w[1].folder_index), "folders in order: {seen:?}");
     let inbox = role(&s, acct, FolderRole::Inbox);
     assert_eq!(
-        s.mailbox.mail.values().filter(|m| m.folder == inbox && m.subject.starts_with("Bulk ")).count(),
+        s.mailbox.mail.items().filter(|m| m.folder == inbox && m.subject.starts_with("Bulk ")).count(),
         180
     );
     let st = s.sync_status();

@@ -410,7 +410,7 @@ fn mail_group_by_fields_nest_and_sort_then_by() {
     assert_eq!(crate::queries::group_title(&format!("From: Ann{sep}Importance: High")), "Importance: High");
     // Collapse This Group closes the innermost group of the selected message; an outer group hides all.
     s.selection = Selection { folder: inbox, items: vec![a2], focus: Some(a2) };
-    let m = s.mailbox.mail[&a2].clone();
+    let m = s.mailbox.mail.get(a2).unwrap().clone();
     assert_eq!(crate::queries::group_label(&s, &m), format!("From: Ann{sep}Importance: Normal"));
     run(&mut s, "view.collapseGroup", json!({"label": "From: Ann"}));
     assert_eq!(item_ids(&s), vec![b1]);

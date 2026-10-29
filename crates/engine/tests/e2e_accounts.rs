@@ -89,11 +89,11 @@ fn inbox(s: &Session, a: AccountId) -> FolderId {
 }
 
 fn find(s: &Session, folder: FolderId, subject: &str) -> Option<ItemId> {
-    s.mailbox.mail.values().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
+    s.mailbox.mail.items().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
 }
 
 fn body(s: &Session, id: ItemId) -> String {
-    s.mailbox.mail[&id].body.text.clone().unwrap_or_default()
+    s.mailbox.mail.get(id).unwrap().body.text.clone().unwrap_or_default()
 }
 
 /// Polls the session until `done` holds (or panics after `WAIT`).
@@ -184,7 +184,7 @@ fn pop3_receive_keeps_server_copies_then_removes_them() {
     s.selection.items = vec![first];
     run(&mut s, "mail.permanentDelete", json!({"ids": [first.0]}));
     sync(&mut s);
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Second").count(), 1);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Second").count(), 1);
     assert!(find(&s, ib, "First").is_none(), "a deleted POP3 message came back");
     // Without "leave a copy on the server" the next run deletes what is already here.
     run(&mut s, "accounts.options", json!({"account": a.0, "leaveOnServer": false}));
@@ -237,9 +237,9 @@ fn imap_headers_first_then_full_download() {
     let ib = inbox(&s, a);
     let report = find(&s, ib, "Report").expect("header downloaded");
     assert!(cmds::is_header_only(&s, report));
-    assert!(s.mailbox.mail[&report].read, "flags come with the header");
+    assert!(s.mailbox.mail.get(report).unwrap().read, "flags come with the header");
     assert!(!body(&s, report).contains("quarterly"));
-    assert!(s.mailbox.mail[&report].size > 0);
+    assert!(s.mailbox.mail.get(report).unwrap().size > 0);
     // Mark (copy) and process: the whole message replaces the header in place.
     let r = cmds::mark(&mut s, &json!({"ids": [report.0], "copy": true})).unwrap();
     assert_eq!(r["copy"], true);
@@ -247,8 +247,8 @@ fn imap_headers_first_then_full_download() {
     assert!(s.wait_for_sync(WAIT));
     assert!(body(&s, report).contains("quarterly numbers"));
     assert!(!cmds::is_header_only(&s, report));
-    assert!(s.mailbox.mail[&report].read);
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Report").count(), 1);
+    assert!(s.mailbox.mail.get(report).unwrap().read);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Report").count(), 1);
     // Download Headers with the full preference: one header-only run.
     cmds::preferences(&mut s, &json!({"account": a.0, "mode": "full"})).unwrap();
     srv.seed_message(ALICE, "INBOX", &message("Second", "second", "second body"), &[]).unwrap();
@@ -318,7 +318,7 @@ fn account_options_survive_reopening_and_hold_no_secrets() {
     assert_eq!(o["intervalMinutes"], 7);
     // The unique ids seen before are remembered: no second copy.
     sync(&mut s);
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Kept").count(), 1);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Kept").count(), 1);
 }
 
 #[test]

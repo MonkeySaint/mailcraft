@@ -93,18 +93,18 @@ fn excluded(id: &str) -> bool {
 fn item_ids(s: &Session) -> Vec<u64> {
     let mb = &s.mailbox;
     mb.mail
-        .keys()
-        .chain(mb.appointments.keys())
-        .chain(mb.contacts.keys())
-        .chain(mb.tasks.keys())
-        .chain(mb.notes.keys())
+        .ids()
+        .chain(mb.appointments.keys().copied())
+        .chain(mb.contacts.keys().copied())
+        .chain(mb.tasks.keys().copied())
+        .chain(mb.notes.keys().copied())
         .map(|i| i.0)
         .collect()
 }
 
 fn all_docs(s: &Session) -> Vec<Doc> {
     let mb = &s.mailbox;
-    let mut out: Vec<Doc> = mb.mail.values().map(Doc::from_mail).collect();
+    let mut out: Vec<Doc> = mb.mail.items().map(Doc::from_mail).collect();
     out.extend(mb.appointments.values().map(Doc::from_appointment));
     out.extend(mb.contacts.values().map(Doc::from_contact));
     out.extend(mb.tasks.values().map(Doc::from_task));
@@ -179,7 +179,7 @@ fn randomize_selection(r: &mut Rng, s: &mut Session) {
         s.selection.folder = f;
     }
     // Mostly mail (most commands act on selected mail), sometimes any item.
-    let ids: Vec<u64> = if r.chance(70) { s.mailbox.mail.keys().map(|i| i.0).collect() } else { item_ids(s) };
+    let ids: Vec<u64> = if r.chance(70) { s.mailbox.mail.ids().map(|i| i.0).collect() } else { item_ids(s) };
     let n = r.below(3);
     s.selection.items = (0..n).filter_map(|_| r.pick(&ids).copied()).map(ItemId).collect();
     s.selection.focus = s.selection.items.first().copied();
@@ -187,10 +187,10 @@ fn randomize_selection(r: &mut Rng, s: &mut Session) {
 
 /// A direct mailbox edit (bypassing the journal), as importers and tests do, followed by `invalidate`.
 fn direct_edit(r: &mut Rng, s: &mut Session) {
-    let ids: Vec<ItemId> = s.mailbox.mail.keys().copied().collect();
+    let ids: Vec<ItemId> = s.mailbox.mail.ids().collect();
     let Some(id) = r.pick(&ids).copied() else { return };
     let w = *r.pick(&VOCAB).unwrap_or(&"zeta");
-    if let Some(m) = s.mailbox.mail.get_mut(&id) {
+    if let Some(m) = s.mailbox.mail.get_mut(id) {
         match r.below(4) {
             0 => m.subject = format!("{} {w}", m.subject),
             1 => m.read = !m.read,
@@ -238,7 +238,7 @@ fn check(s: &Session, extra: &[String], step: &str) {
         let want: BTreeSet<u64> = s
             .mailbox
             .mail
-            .values()
+            .items()
             .filter(|m| folders.contains(&m.folder.0))
             .map(Doc::from_mail)
             .filter(|d| matches(&q, d, &ctx))
@@ -253,7 +253,7 @@ fn check(s: &Session, extra: &[String], step: &str) {
 
 /// Words of the current items' subjects, so queries also hit text that commands just wrote.
 fn live_words(r: &mut Rng, s: &Session) -> Vec<String> {
-    let subjects: Vec<String> = s.mailbox.mail.values().map(|m| m.subject.clone()).collect();
+    let subjects: Vec<String> = s.mailbox.mail.items().map(|m| m.subject.clone()).collect();
     let mut out = Vec::new();
     for _ in 0..3 {
         if let Some(sub) = r.pick(&subjects) {
@@ -343,7 +343,7 @@ fn every_command_keeps_the_index_in_step() {
         s.run("folder.newSearchFolder", &json!({ "template": "unread" })).unwrap();
         // Warm the index so a missed change shows up as a stale answer.
         check(&s, &[], "setup");
-        let mail: Vec<u64> = s.mailbox.mail.keys().map(|i| i.0).collect();
+        let mail: Vec<u64> = s.mailbox.mail.ids().map(|i| i.0).collect();
         let first = mail.first().copied().unwrap_or(0);
         let all_params = [
             json!({}),

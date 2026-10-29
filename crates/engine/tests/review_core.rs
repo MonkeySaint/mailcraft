@@ -10,7 +10,7 @@ use mailcraft_model::{Address, ArrangeBy, FolderRole, ItemId, ListFilter, SortOr
 use serde_json::json;
 
 fn find(s: &Session, subject: &str) -> ItemId {
-    s.mailbox.mail.values().find(|m| m.subject == subject).map(|m| m.id).expect("sample message")
+    s.mailbox.mail.items().find(|m| m.subject == subject).map(|m| m.id).expect("sample message")
 }
 
 fn groups(rows: &[ListRow]) -> Vec<String> {
@@ -55,15 +55,14 @@ fn from_groups_are_not_split_by_name_case() {
     let mut alice: Vec<ItemId> = s
         .mailbox
         .mail
-        .values()
-        .filter(|m| m.folder == s.selection.folder)
+        .in_folder(s.selection.folder)
         .filter(|m| m.from.as_ref().is_some_and(|f| f.addr == "alice@example.com"))
         .map(|m| m.id)
         .collect();
-    alice.sort_by_key(|id| s.mailbox.mail[id].received.unix);
+    alice.sort_by_key(|id| s.mailbox.mail.get(*id).unwrap().received.unix);
     assert!(alice.len() >= 2, "sample has several mails from Alice");
     let mid = alice[alice.len() / 2];
-    if let Some(m) = s.mailbox.mail.get_mut(&mid) {
+    if let Some(m) = s.mailbox.mail.get_mut(mid) {
         m.from = Some(Address { name: Some("alice rivera".into()), addr: "alice@example.com".into() });
     }
     arrange(&mut s, ArrangeBy::From, SortOrder::Ascending);
@@ -84,12 +83,12 @@ fn subject_groups_are_not_split_by_case_or_spacing() {
     let b = s
         .mailbox
         .mail
-        .values()
+        .items()
         .find(|m| m.folder == inbox && m.subject == "RE: Project kickoff")
         .map(|m| m.id)
         .expect("Bob's reply in the Inbox");
     // Same conversation topic as "Project kickoff", different case/spacing.
-    if let Some(m) = s.mailbox.mail.get_mut(&b) {
+    if let Some(m) = s.mailbox.mail.get_mut(b) {
         m.subject = "RE: project  KICKOFF".into();
     }
     arrange(&mut s, ArrangeBy::Subject, SortOrder::Ascending);
@@ -192,7 +191,7 @@ fn folder_pane_default_order_and_badges() {
         let Some(id) = r.id else { continue };
         let f = mb.folder(id).expect("folder");
         let total = mb.total_count(id);
-        let unread = mb.mail.values().filter(|m| m.folder == id && !m.read).count();
+        let unread = mb.mail.items().filter(|m| m.folder == id && !m.read).count();
         match f.role {
             Some(FolderRole::Drafts | FolderRole::JunkEmail) => {
                 let want = if total == 0 { String::new() } else { format!("[{total}]") };
@@ -293,9 +292,9 @@ fn every_mailbox_change_is_journaled() {
 }
 
 fn journal_then_fail(s: &mut Session, _: &serde_json::Value) -> mailcraft_engine::CmdResult {
-    let ids: Vec<ItemId> = s.mailbox.mail.keys().copied().collect();
+    let ids: Vec<ItemId> = s.mailbox.mail.ids().collect();
     for id in &ids {
-        s.mailbox.mail.remove(id);
+        s.mailbox.mail.remove(*id);
     }
     s.journal(ids.into_iter().map(mailcraft_store::Op::RemoveMail).collect());
     Err(mailcraft_engine::CmdError::Failed("nope".into()))
@@ -340,7 +339,7 @@ fn a_failed_command_that_journaled_without_a_store_queues_the_rollback() {
     let mut s = sample_session();
     for _ in 0..3 {
         s.journal(vec![mailcraft_store::Op::PutMail(Box::new(
-            s.mailbox.mail.values().next().cloned().expect("mail"),
+            s.mailbox.mail.items().next().cloned().expect("mail"),
         ))]);
     }
     s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
@@ -383,10 +382,10 @@ fn a_growing_journal_is_folded_into_a_snapshot() {
         let bytes = s.store.as_ref().map_or(u64::MAX, |st| st.journal_bytes());
         assert!(bytes < 1_000, "the journal was folded into a snapshot ({bytes} bytes left)");
         assert!(s.pending_ops.is_empty());
-        flagged = s.mailbox.mail[&id].is_flagged();
+        flagged = s.mailbox.mail.get(id).unwrap().is_flagged();
     }
     let s = Session::open(dir.path()).expect("reopen");
     let id = find(&s, "Analytics summary");
-    assert_eq!(s.mailbox.mail[&id].is_flagged(), flagged);
+    assert_eq!(s.mailbox.mail.get(id).unwrap().is_flagged(), flagged);
     assert!(flagged);
 }

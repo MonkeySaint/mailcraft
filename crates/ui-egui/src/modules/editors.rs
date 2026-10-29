@@ -3249,7 +3249,7 @@ mod tests {
         assert_eq!(a.attendees.iter().filter(|x| x.role == AttendeeRole::Resource).count(), 1);
         assert!(app.s.composes.is_empty(), "no compose opens");
         let outbox = app.s.mailbox.role_folder(a_account(&app), mailcraft_model::FolderRole::Outbox).unwrap();
-        assert!(app.s.mailbox.mail.values().any(|m| m.folder == outbox && m.subject == "Review"));
+        assert!(app.s.mailbox.mail.items().any(|m| m.folder == outbox && m.subject == "Review"));
         open_appointment(&app, &mut st, ItemId(id));
         let ed = st.editors.appt.clone().unwrap();
         assert_eq!(ed.optional, "bob@example.org");

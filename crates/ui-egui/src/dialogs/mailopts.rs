@@ -348,7 +348,7 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 no_archive: c.no_auto_archive,
                 error: None,
             }
-        } else if let Some(m) = item.and_then(|i| a.s.mailbox.mail.get(&ItemId(i))) {
+        } else if let Some(m) = item.and_then(|i| a.s.mailbox.mail.get(ItemId(i))) {
             MsgOpts {
                 importance: imp_idx(m.importance),
                 sensitivity: sens_idx(m.sensitivity),
@@ -457,7 +457,7 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     ui.label("Categories");
                     categories_menu(ui, app, &mut st.categories);
                 });
-            } else if let Some(m) = item.and_then(|i| app.s.mailbox.mail.get(&ItemId(i))) {
+            } else if let Some(m) = item.and_then(|i| app.s.mailbox.mail.get(ItemId(i))) {
                 ui.checkbox(&mut st.no_archive, "Do not AutoArchive this item");
                 common::heading(ui, app, "Internet headers");
                 // The message's own header block as received (the engine reads it from the source).
@@ -504,7 +504,7 @@ fn message_options(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                 json!({"ids": ids, "importance": imp, "sensitivity": sens}),
                             );
                             let was = item
-                                .and_then(|i| app.s.mailbox.mail.get(&ItemId(i)))
+                                .and_then(|i| app.s.mailbox.mail.get(ItemId(i)))
                                 .is_some_and(|m| m.no_auto_archive);
                             if !ids.is_empty() && was != st.no_archive {
                                 app.run("mail.doNotAutoArchive", json!({"ids": ids, "on": st.no_archive}));

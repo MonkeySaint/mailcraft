@@ -664,7 +664,7 @@ fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
     let (d, _) = run_cmd(s, "app.redo", json!({}))?;
     out.insert("redo_bulk_move_ms".into(), json!(ms(d)));
     if let Some(&last) = rest.last()
-        && s.mailbox.mail.get(&last).is_some_and(|m| m.folder == big)
+        && s.mailbox.mail.get(last).is_some_and(|m| m.folder == big)
     {
         let (d, _) = run_cmd(s, "mail.delete", json!({"ids": [last.0]}))?;
         out.insert("delete_1_ms".into(), json!(ms(d)));

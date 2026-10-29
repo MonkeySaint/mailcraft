@@ -513,8 +513,8 @@ fn read_window_quick_steps_act_on_the_window_message() {
     };
     let mut mem = state::Mem::default();
     state::run(&ctx, &mut app, Surface::Read(open.0), &mut mem, &act);
-    assert_eq!(app.s.mailbox.mail[&open].folder, archive);
-    assert_eq!(app.s.mailbox.mail[&selected].folder, inbox);
+    assert_eq!(app.s.mailbox.mail.get(open).unwrap().folder, archive);
+    assert_eq!(app.s.mailbox.mail.get(selected).unwrap().folder, inbox);
     // Reply & Delete is greyed out for a multi-selection in the main window, not in a read window.
     app.s.selection.items = items.iter().take(2).copied().collect();
     let reply = app.s.mailbox.quick_steps.iter().find(|q| q.name == "Reply & Delete").map(|q| q.id).unwrap();
@@ -534,7 +534,7 @@ fn read_window_commands_act_on_the_window_message_without_touching_the_list_sele
     let inbox = app.s.selection.folder;
     let open = app.s.mailbox.items_in(inbox).first().map(|m| m.id).unwrap();
     // Clear All Categories needs a category to clear.
-    if let Some(m) = app.s.mailbox.mail.get_mut(&open) {
+    if let Some(m) = app.s.mailbox.mail.get_mut(open) {
         m.categories = vec!["Red Category".into()];
     }
     // The main window shows another module with nothing selected.
@@ -577,7 +577,7 @@ fn read_window_commands_act_on_the_window_message_without_touching_the_list_sele
         state::Action { cmd: "mail.flag".into(), params: serde_json::json!({"kind": "today"}), flip: None };
     let mut mem = state::Mem::default();
     state::run(&ctx, &mut app, surface, &mut mem, &act);
-    assert!(matches!(app.s.mailbox.mail[&ItemId(open.0)].flag, FlagState::Flagged { .. }));
+    assert!(matches!(app.s.mailbox.mail.get(ItemId(open.0)).unwrap().flag, FlagState::Flagged { .. }));
     assert!(app.s.selection.items.is_empty() && app.s.selection.focus.is_none());
     assert!(state::is_on(&app, surface, &mem, "followup:today"));
 }
@@ -610,7 +610,7 @@ fn tasks_follow_up_buttons_show_the_selected_rows_flag() {
     assert!(state::is_on(&app, Surface::Main, &mem, "taskflag:tomorrow"));
     assert!(!state::is_on(&app, Surface::Main, &mem, "taskflag:today"));
     // A flagged message row of the To-Do List: the buttons are enabled and show its flag.
-    let m = app.s.mailbox.mail.keys().next().copied().map(|i: ItemId| i.0).unwrap();
+    let m = app.s.mailbox.mail.ids().next().map(|i: ItemId| i.0).unwrap();
     app.run("mail.flag", serde_json::json!({"ids": [m], "kind": "nextWeek"}));
     pick(&mut app, m);
     assert_eq!(state::disabled(&app, Surface::Main, "tasks.flag"), None);
@@ -648,7 +648,7 @@ fn keytips_select_tabs_and_run_commands() {
 fn keytips_reach_dropdown_entries_and_split_menus() {
     let ctx = egui::Context::default();
     let mut app = App::new(mailcraft_engine::sample::sample_session());
-    let first = *app.s.mailbox.mail.keys().next().unwrap();
+    let first = app.s.mailbox.mail.ids().next().unwrap();
     app.run("nav.selectItem", serde_json::json!({"id": first.0}));
     app.run("mail.flag", serde_json::json!({"kind": "clear"}));
     // Simplified: "R" is the Report group's key but only prefixes Reply (R P) etc.
@@ -657,13 +657,13 @@ fn keytips_reach_dropdown_entries_and_split_menus() {
     // Split buttons open their menu ("Alt, H, D" → Delete's More Options) instead of running.
     let count = app.s.mailbox.mail.len();
     assert_eq!(keytip(&ctx, &mut app, Surface::Main, "HD"), KeytipHit::Menu);
-    assert_eq!(app.s.mailbox.mail.get(&first).map(|m| m.folder), Some(app.s.selection.folder));
+    assert_eq!(app.s.mailbox.mail.get(first).map(|m| m.folder), Some(app.s.selection.folder));
     assert_eq!(app.s.mailbox.mail.len(), count);
     // "Alt, H, U, T": Follow Up › Today.
     assert_eq!(keytip(&ctx, &mut app, Surface::Main, "HU"), KeytipHit::Menu);
     assert_eq!(keytip(&ctx, &mut app, Surface::Main, "HUT"), KeytipHit::Done);
     assert!(matches!(
-        app.s.mailbox.mail.get(&first).map(|m| &m.flag),
+        app.s.mailbox.mail.get(first).map(|m| &m.flag),
         Some(mailcraft_model::FlagState::Flagged { .. })
     ));
     // Submenus: "Alt, H, N, U, P" = New Email › E-mail Message Using › Plain Text.
@@ -688,14 +688,14 @@ fn read_window_keytips_follow_the_observed_ribbon() {
     let mut app = App::new(mailcraft_engine::sample::sample_session());
     app.s.view.simplified_ribbon = true;
     let folder = app.s.selection.folder;
-    let item = app.s.mailbox.mail.values().find(|m| m.folder == folder).map(|m| m.id.0).unwrap();
+    let item = app.s.mailbox.mail.items().find(|m| m.folder == folder).map(|m| m.id.0).unwrap();
     let surface = Surface::Read(item);
     // uia/read-window-ribbon.txt: Mark Unread "U", Follow Up "W", Archive "O 1", Zoom "Q 1".
     assert_eq!(keytip(&ctx, &mut app, surface, "HW"), KeytipHit::Menu);
     assert_eq!(state::load_mem(&ctx, surface).open_request.as_deref(), Some("W"));
-    let read = app.s.mailbox.mail.get(&mailcraft_model::ItemId(item)).map(|m| m.read);
+    let read = app.s.mailbox.mail.get(mailcraft_model::ItemId(item)).map(|m| m.read);
     assert_eq!(keytip(&ctx, &mut app, surface, "HU"), KeytipHit::Done);
-    assert_ne!(app.s.mailbox.mail.get(&mailcraft_model::ItemId(item)).map(|m| m.read), read);
+    assert_ne!(app.s.mailbox.mail.get(mailcraft_model::ItemId(item)).map(|m| m.read), read);
     let d = defs();
     let tab = d.tab("read", true, "Message").unwrap();
     let keys: Vec<&str> = tab.groups.iter().flat_map(|g| g.ctls.iter()).map(|c| c.key.as_str()).collect();
@@ -769,7 +769,7 @@ fn compose_read_search_and_module_ribbons_render() {
         app.s.view.simplified_ribbon = simplified;
         let cid =
             app.run("mail.newEmail", serde_json::Value::Null).and_then(|v| v["compose"].as_u64()).unwrap();
-        let item = app.s.mailbox.mail.keys().next().unwrap().0;
+        let item = app.s.mailbox.mail.ids().next().unwrap().0;
         let mut h = harness(app, Surface::Compose(cid), 1400.0);
         h.run();
         assert!(h.query_by_label("Paste").is_some());

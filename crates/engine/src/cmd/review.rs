@@ -32,7 +32,7 @@ fn compose_or_message(s: &Session) -> Option<&'static str> {
         .target_ids(&Value::Null)
         .iter()
         .chain(s.selection.focus.iter())
-        .any(|id| s.mailbox.mail.contains_key(id));
+        .any(|id| s.mailbox.mail.contains(*id));
     if msg || !s.composes.is_empty() { None } else { Some("select a message first") }
 }
 
@@ -45,7 +45,7 @@ fn target_text(s: &Session, p: &Value) -> Result<(Value, String), CmdError> {
         .map(ItemId)
         .or(s.selection.focus)
         .or_else(|| s.selection.items.first().copied())
-        .filter(|id| s.mailbox.mail.contains_key(id));
+        .filter(|id| s.mailbox.mail.contains(*id));
     if p.get("compose").is_some() || item.is_none() {
         let cid = compose_id(s, p)?;
         let c =
@@ -54,7 +54,7 @@ fn target_text(s: &Session, p: &Value) -> Result<(Value, String), CmdError> {
         return Ok((json!({"compose": cid}), text));
     }
     let id = item.ok_or_else(|| CmdError::Disabled("select a message first".into()))?;
-    let m = s.mailbox.mail.get(&id).ok_or_else(|| CmdError::Disabled("select a message first".into()))?;
+    let m = s.mailbox.mail.get(id).ok_or_else(|| CmdError::Disabled("select a message first".into()))?;
     Ok((json!({"item": id.0}), m.body_text()))
 }
 
@@ -1044,7 +1044,7 @@ fn show_original(s: &mut Session, p: &Value) -> CmdResult {
         t.show_original = on && !t.show_original;
         return Ok(json!({"item": id.0, "showOriginal": t.show_original}));
     }
-    if p.get("compose").is_none() && item.is_some_and(|i| s.mailbox.mail.contains_key(&i)) {
+    if p.get("compose").is_none() && item.is_some_and(|i| s.mailbox.mail.contains(i)) {
         return Err(CmdError::Failed("this message has not been translated".into()));
     }
     let c = compose_mut(s, p)?;
@@ -1910,7 +1910,7 @@ mod tests {
         let shown = crate::translate::shown(&s, mid).unwrap();
         assert_eq!((shown.to.as_str(), shown.by.as_str()), ("fr", "Test translator"));
         // The message itself is not changed.
-        assert_eq!(s.mailbox.mail[&mid].body.text.as_deref(), Some("hola mundo"));
+        assert_eq!(s.mailbox.mail.get(mid).unwrap().body.text.as_deref(), Some("hola mundo"));
         // Show Original switches to the message's own body and back.
         let r = s.run("review.translate", &json!({"id": mid.0, "showOriginal": true})).unwrap();
         assert_eq!(r["showOriginal"], true);
@@ -2005,7 +2005,7 @@ mod tests {
 
         // A message deleted while it was translated: the result is dropped.
         s.run("review.translate", &json!({"id": mid.0, "to": "de"})).unwrap();
-        s.mailbox.mail.remove(&mid);
+        s.mailbox.mail.remove(mid);
         s.tidy_selection();
         go.send(()).unwrap();
         settle(&mut s);
@@ -2031,7 +2031,7 @@ mod tests {
         s.run("mail.editMessage", &json!({"ids": [a.0], "text": "hola de nuevo"})).unwrap();
         assert!(crate::translate::shown(&s, a).is_none(), "the edited message shows itself");
         // A message gone from the mailbox (deleted for good, or replaced by a sync) loses its translation.
-        s.mailbox.mail.remove(&b);
+        s.mailbox.mail.remove(b);
         s.tidy_selection();
         assert!(!s.translations.contains_key(&b));
     }

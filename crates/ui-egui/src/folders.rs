@@ -103,7 +103,7 @@ fn drop_items(ui: &Ui, app: &mut App, ids: &[u64], folder: FolderId) {
         .iter()
         .copied()
         .filter(|id| {
-            copy || app.s.mailbox.mail.get(&mailcraft_model::ItemId(*id)).is_some_and(|m| m.folder != folder)
+            copy || app.s.mailbox.mail.get(mailcraft_model::ItemId(*id)).is_some_and(|m| m.folder != folder)
         })
         .collect();
     if ids.is_empty() {
@@ -704,7 +704,7 @@ mod tests {
         );
         h.step();
         let app = h.state();
-        assert_eq!(app.s.mailbox.mail.get(&mailcraft_model::ItemId(id)).unwrap().folder, deleted);
+        assert_eq!(app.s.mailbox.mail.get(mailcraft_model::ItemId(id)).unwrap().folder, deleted);
         assert!(app.ui.toast.is_none(), "{:?}", app.ui.toast);
     }
 

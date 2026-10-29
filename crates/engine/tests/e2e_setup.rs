@@ -64,7 +64,7 @@ fn inbox(s: &Session, a: AccountId) -> FolderId {
 }
 
 fn find(s: &Session, folder: FolderId, subject: &str) -> Option<ItemId> {
-    s.mailbox.mail.values().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
+    s.mailbox.mail.items().find(|m| m.folder == folder && m.subject == subject).map(|m| m.id)
 }
 
 fn poll_until(s: &mut Session, what: &str, mut done: impl FnMut(&mut Session) -> bool) {
@@ -350,7 +350,7 @@ fn include_older_results_searches_the_server() {
     // Searching again does not download the same match twice.
     run(&mut s, "search.includeOlderResults", json!({"on": true, "refresh": true}));
     assert!(s.wait_for_sync(WAIT));
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "Old budget").count(), 1);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Old budget").count(), 1);
 
     // Opening it downloads the whole message.
     s.selection.items = vec![old_id];
@@ -359,7 +359,17 @@ fn include_older_results_searches_the_server() {
     assert_eq!(r["downloading"], true);
     assert!(s.wait_for_sync(WAIT));
     assert!(!cmds::is_header_only(&s, old_id));
-    assert!(s.mailbox.mail[&old_id].body.text.as_deref().unwrap_or_default().contains("archived figures"));
+    assert!(
+        s.mailbox
+            .mail
+            .get(old_id)
+            .unwrap()
+            .body
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("archived figures")
+    );
 
     // Off again; the downloaded message now matches locally on its body text.
     assert_eq!(run(&mut s, "search.includeOlderResults", json!({"on": false}))["on"], false);
@@ -427,7 +437,7 @@ fn include_older_results_leaves_new_mail_to_the_sync() {
     assert!(find(&s, ib, "New lunch").is_some(), "the unmatched new message still downloads");
     let new_budget = find(&s, ib, "New budget").expect("the new match downloads with the sync");
     assert!(!cmds::is_header_only(&s, new_budget));
-    assert_eq!(s.mailbox.mail.values().filter(|m| m.subject == "New budget").count(), 1);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "New budget").count(), 1);
 }
 
 #[test]

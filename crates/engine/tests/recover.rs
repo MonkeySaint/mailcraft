@@ -24,7 +24,7 @@ fn delete_for_good(s: &mut Session, subject: &str) -> ItemId {
     let deleted = s.mailbox.role_folder(account, FolderRole::DeletedItems).unwrap();
     let id = s.mailbox.add_mail(MailItem { folder: deleted, subject: subject.into(), ..Default::default() });
     run(s, "folder.emptyDeleted", json!({}));
-    assert!(!s.mailbox.mail.contains_key(&id));
+    assert!(!s.mailbox.mail.contains(id));
     id
 }
 
@@ -55,7 +55,7 @@ fn survives_restart_and_the_undo_limit_then_purges() {
         for i in 0..110 {
             run(&mut s, "folder.new", json!({"name": format!("F{i}")}));
         }
-        assert!(s.undo.undo.iter().all(|e| !e.before.mail.contains_key(&id)), "gone from the undo history");
+        assert!(s.undo.undo.iter().all(|e| !e.before.mail.contains(id)), "gone from the undo history");
         let l = listed(&mut s);
         assert_eq!(l.len(), 1);
         assert_eq!(l[0]["subject"], "Quarterly figures");
@@ -71,7 +71,7 @@ fn survives_restart_and_the_undo_limit_then_purges() {
     let r = run(&mut s, "folder.recoverDeleted", json!({"ids": [id.0]}));
     assert_eq!(r["restored"], 1);
     let back = r["ids"][0].as_u64().unwrap();
-    assert_eq!(s.mailbox.mail[&ItemId(back)].subject, "Quarterly figures");
+    assert_eq!(s.mailbox.mail.get(ItemId(back)).unwrap().subject, "Quarterly figures");
     assert!(listed(&mut s).is_empty(), "a recovered item leaves the list");
     // Undoing the recovery makes it recoverable again.
     run(&mut s, "app.undo", json!({}));

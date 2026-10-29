@@ -31,6 +31,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -38,7 +39,8 @@ use serde_json::{Value, json};
 use crate::{CmdError, Notice, Session};
 use mailcraft_model::account::{PendingOp, RemoteOp};
 use mailcraft_model::{
-    AccountId, AccountKind, FlagState, Folder, FolderId, FolderKind, ItemId, MailItem, Mailbox, ResponseState,
+    AccountId, AccountKind, FlagState, Folder, FolderId, FolderKind, ItemId, MailItem, Mailbox,
+    ResponseState, ScanFilter,
 };
 /// Settings for `accounts.discover` and the server connections (for front ends and tests that configure them).
 #[cfg(not(target_arch = "wasm32"))]
@@ -1014,7 +1016,7 @@ fn manage_push(s: &mut Session) {
 
 /// True when an upload's item no longer exists (the op is skipped and later pruned).
 fn stale(mb: &Mailbox, op: &RemoteOp) -> bool {
-    matches!(op, RemoteOp::Append { item, .. } if !mb.mail.contains_key(item))
+    matches!(op, RemoteOp::Append { item, .. } if !mb.mail.contains(*item))
 }
 
 /// True when the next queued server change of `a` is due at `now`. Changes run in queue order, so one waiting
@@ -1040,7 +1042,7 @@ fn job_ops(
             break;
         }
         let raw = match &p.op {
-            RemoteOp::Append { item, .. } => s.mailbox.mail.get(item).map(|m| item_source(s, m)),
+            RemoteOp::Append { item, .. } => s.mailbox.mail.get(*item).map(|m| item_source(s, m)),
             _ => None,
         };
         ops.push((p.id, p.op.clone(), raw));
@@ -1171,7 +1173,7 @@ fn push_op(mb: &mut Mailbox, account: AccountId, op: RemoteOp) {
 }
 
 fn set_remote_id(mb: &mut Mailbox, id: ItemId, uid: Option<u32>) {
-    if let Some(m) = mb.mail.get_mut(&id) {
+    if let Some(m) = mb.mail.get_mut(id) {
         m.remote_id = uid.map(|u| u.to_string());
     }
 }
@@ -1297,7 +1299,7 @@ fn folder_changes(
                                 g.remote_name = None;
                             }
                         }
-                        for m in after.mail.values_mut().filter(|m| sub.contains(&m.folder)) {
+                        for m in after.mail.items_mut().filter(|m| sub.contains(&m.folder)) {
                             m.remote_id = None;
                         }
                     }
@@ -1408,14 +1410,14 @@ fn item_changes(
     let mut ids: BTreeSet<ItemId> = before
         .mail
         .iter()
-        .filter(|(id, b)| after.mail.get(id).is_none_or(|a| !same(a, b)))
-        .map(|(id, _)| *id)
+        .filter(|(id, b)| after.mail.get(*id).is_none_or(|a| !same(a, b)))
+        .map(|(id, _)| id)
         .collect();
-    ids.extend(after.mail.keys().filter(|id| !before.mail.contains_key(id)));
+    ids.extend(after.mail.ids().filter(|id| !before.mail.contains(*id)));
     for id in ids {
-        let b = before.mail.get(&id);
+        let b = before.mail.get(id);
         // What is needed of the item after the change (taken before `after` is adjusted).
-        let Some((a_folder, a_uid, upload, words, draft_changed)) = after.mail.get(&id).map(|a| {
+        let Some((a_folder, a_uid, upload, words, draft_changed)) = after.mail.get(id).map(|a| {
             let draft_changed =
                 b.is_some_and(|b| a.is_draft && b.is_draft && a.raw.is_some() && a.raw != b.raw);
             (a.folder, uid_of(a), upload_flags(a), flag_words(a), draft_changed)
@@ -1548,16 +1550,16 @@ fn carry_over(live: &Mailbox, restored: &mut Mailbox, track: &Track) {
     }
     // Mail that arrived or vanished meanwhile, and server flag changes.
     for id in &track.created {
-        if let Some(m) = live.mail.get(id)
-            && !restored.mail.contains_key(id)
+        if let Some(m) = live.mail.get(*id)
+            && !restored.mail.contains(*id)
             && restored.folders.contains_key(&m.folder)
         {
             restored.mail.insert(*id, m.clone());
         }
     }
     for id in &track.removed {
-        if !live.mail.contains_key(id) {
-            restored.mail.remove(id);
+        if !live.mail.contains(*id) {
+            restored.mail.remove(*id);
         }
     }
     for (id, m) in restored.mail.iter_mut() {
@@ -1565,7 +1567,7 @@ fn carry_over(live: &Mailbox, restored: &mut Mailbox, track: &Track) {
         if l.folder == m.folder {
             m.remote_id = l.remote_id.clone();
         }
-        if track.flags.contains(id) {
+        if track.flags.contains(&id) {
             m.read = l.read;
             m.flag = l.flag.clone();
         }
@@ -1619,7 +1621,7 @@ fn remove_folders(mb: &mut Mailbox, ids: &[FolderId]) -> Vec<ItemId> {
     for id in ids {
         all.extend(mb.subtree(*id));
     }
-    let removed: Vec<ItemId> = mb.mail.values().filter(|m| all.contains(&m.folder)).map(|m| m.id).collect();
+    let removed: Vec<ItemId> = mb.mail.items().filter(|m| all.contains(&m.folder)).map(|m| m.id).collect();
     mb.mail.retain(|_, m| !all.contains(&m.folder));
     mb.folders.retain(|id, _| !all.contains(id));
     mb.views.retain(|id, _| !all.contains(id));
@@ -1634,6 +1636,36 @@ fn remove_folders(mb: &mut Mailbox, ids: &[FolderId]) -> Vec<ItemId> {
         }
     }
     removed
+}
+
+/// Every folder of `account` (server ids such as JMAP email ids and POP3 unique ids are per account).
+fn account_scope(mb: &Mailbox, account: AccountId) -> ScanFilter {
+    ScanFilter::Folders(mb.folders.values().filter(|f| f.account == account).map(|f| f.id).collect())
+}
+
+/// The first item (lowest id) that `scope` admits and `hit` accepts.
+fn first_item(mb: &Mailbox, scope: &ScanFilter, mut hit: impl FnMut(&MailItem) -> bool) -> Option<ItemId> {
+    let mut found = None;
+    mb.mail.scan(scope, &mut |m| {
+        if hit(m) {
+            found = Some(m.id);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    found
+}
+
+/// A local copy in `folder` waiting for the server message whose Message-ID is `mid` (sent or uploaded here,
+/// no server id yet): the lowest such item. Its stored Message-ID must equal `mid` exactly; the server hands
+/// back the bytes this client wrote.
+fn local_copy(mb: &Mailbox, folder: FolderId, mid: &str) -> Option<ItemId> {
+    mb.mail.by_message_id(mid).into_iter().find(|id| {
+        mb.mail.get(*id).is_some_and(|m| {
+            m.folder == folder && m.remote_id.is_none() && m.message_id.as_deref() == Some(mid)
+        })
+    })
 }
 
 /// Raw source of an item: kept bytes, else the blob store, else rebuilt from its fields.
@@ -1885,6 +1917,49 @@ mod tests {
         mb.account(a).unwrap().sync.pending.iter().map(|p| p.op.clone()).collect()
     }
 
+    /// The sync lookups that moved onto the table's targeted reads (`scan`, `by_message_id`) find exactly
+    /// what the full walks they replaced found.
+    #[test]
+    fn server_id_and_local_copy_lookups() {
+        let (mut mb, a, inbox, trash) = imap_mailbox();
+        let b = mb.add_account(Account {
+            kind: AccountKind::Imap,
+            address: "other@example.org".into(),
+            incoming: Some(Default::default()),
+            ..Default::default()
+        });
+        mb.create_default_folders(b);
+        let b_inbox = mb.role_folder(b, FolderRole::Inbox).unwrap();
+        let other =
+            mb.add_mail(MailItem { folder: b_inbox, remote_id: Some("9".into()), ..Default::default() });
+        let first =
+            mb.add_mail(MailItem { folder: trash, remote_id: Some("9".into()), ..Default::default() });
+        let second =
+            mb.add_mail(MailItem { folder: inbox, remote_id: Some("9".into()), ..Default::default() });
+        let is_9 = |m: &MailItem| m.remote_id.as_deref() == Some("9");
+        // Server ids are per account: any folder of the account, lowest id first, never another account's.
+        assert_eq!(first_item(&mb, &account_scope(&mb, a), is_9), Some(first));
+        assert_eq!(first_item(&mb, &account_scope(&mb, b), is_9), Some(other));
+        assert_eq!(first_item(&mb, &account_scope(&mb, AccountId(999)), is_9), None);
+        assert!(first < second, "Trash's copy has the lower id, the Inbox one is found later in id order");
+
+        let mid = "sent.1@example.com";
+        let msg = |folder, remote: Option<&str>, id: &str| MailItem {
+            folder,
+            remote_id: remote.map(str::to_owned),
+            message_id: Some(id.to_owned()),
+            ..Default::default()
+        };
+        mb.add_mail(msg(inbox, Some("3"), mid)); // already on the server
+        mb.add_mail(msg(trash, None, mid)); // another folder
+        mb.add_mail(msg(inbox, None, "Sent.1@Example.com")); // same key, different stored form
+        assert_eq!(local_copy(&mb, inbox, mid), None, "the adoption match stays exact");
+        let waiting = mb.add_mail(msg(inbox, None, mid));
+        mb.add_mail(msg(inbox, None, mid));
+        assert_eq!(local_copy(&mb, inbox, mid), Some(waiting), "the lowest waiting copy");
+        assert_eq!(local_copy(&mb, inbox, ""), None);
+    }
+
     #[test]
     fn flags_moves_deletes_and_folders_queue_server_changes() {
         let (mut mb, a, inbox, trash) = imap_mailbox();
@@ -1892,8 +1967,8 @@ mod tests {
         let none = BTreeSet::new();
         // Read + flag.
         let before = mb.clone();
-        mb.mail.get_mut(&id).unwrap().read = true;
-        mb.mail.get_mut(&id).unwrap().flag =
+        mb.mail.get_mut(id).unwrap().read = true;
+        mb.mail.get_mut(id).unwrap().flag =
             FlagState::Flagged { label: "x".into(), start: None, due: None, reminder: None };
         assert_eq!(queue_changes(&before, &mut mb, &none), 1);
         assert_eq!(
@@ -1907,22 +1982,25 @@ mod tests {
         );
         // Move to Deleted Items.
         let before = mb.clone();
-        mb.mail.get_mut(&id).unwrap().folder = trash;
+        mb.mail.get_mut(id).unwrap().folder = trash;
         queue_changes(&before, &mut mb, &none);
         assert_eq!(
             pending(&mb, a)[1],
             RemoteOp::Move { folder: "INBOX".into(), uid: 5, dest: "Trash".into(), item: id }
         );
-        assert!(mb.mail[&id].remote_id.is_none(), "UID cleared until the server reports the new one");
+        assert!(
+            mb.mail.get(id).unwrap().remote_id.is_none(),
+            "UID cleared until the server reports the new one"
+        );
         // Moving back before the move ran cancels it and restores the UID.
         let before = mb.clone();
-        mb.mail.get_mut(&id).unwrap().folder = inbox;
+        mb.mail.get_mut(id).unwrap().folder = inbox;
         queue_changes(&before, &mut mb, &none);
         assert_eq!(pending(&mb, a).len(), 1);
-        assert_eq!(mb.mail[&id].remote_id.as_deref(), Some("5"));
+        assert_eq!(mb.mail.get(id).unwrap().remote_id.as_deref(), Some("5"));
         // Permanent delete.
         let before = mb.clone();
-        mb.mail.remove(&id);
+        mb.mail.remove(id);
         queue_changes(&before, &mut mb, &none);
         assert_eq!(pending(&mb, a).last(), Some(&RemoteOp::Expunge { folder: "INBOX".into(), uid: 5 }));
         // New folder, rename, delete.
@@ -1948,7 +2026,7 @@ mod tests {
         let n = mb.add_mail(MailItem { folder: outbox, ..Default::default() });
         assert_eq!(queue_changes(&before, &mut mb, &none), 0);
         let before = mb.clone();
-        mb.mail.get_mut(&n).unwrap().folder = inbox;
+        mb.mail.get_mut(n).unwrap().folder = inbox;
         queue_changes(&before, &mut mb, &none);
         assert!(
             matches!(pending(&mb, a).last(), Some(RemoteOp::Append { folder, item, .. }) if folder == "INBOX" && *item == n)
@@ -1972,18 +2050,18 @@ mod tests {
             s.mailbox.add_mail(MailItem { folder: inbox, remote_id: Some("1".into()), ..Default::default() });
         s.selection.items = vec![x];
         s.run("mail.delete", &json!({"ids": [x.0]})).unwrap();
-        assert_eq!(s.mailbox.mail[&x].folder, trash);
+        assert_eq!(s.mailbox.mail.get(x).unwrap().folder, trash);
         assert_eq!(s.mailbox.account(a).unwrap().sync.pending.len(), 1);
         // Mail arrives from the server after the command.
         let y =
             s.mailbox.add_mail(MailItem { folder: inbox, remote_id: Some("2".into()), ..Default::default() });
         s.sync.track.created.insert(y);
         s.run("app.undo", &json!({})).unwrap();
-        assert_eq!(s.mailbox.mail[&x].folder, inbox);
-        assert!(s.mailbox.mail.contains_key(&y), "mail that arrived meanwhile survives the undo");
+        assert_eq!(s.mailbox.mail.get(x).unwrap().folder, inbox);
+        assert!(s.mailbox.mail.contains(y), "mail that arrived meanwhile survives the undo");
         // The undone move was not sent yet: it is cancelled and the UID restored.
         assert!(s.mailbox.account(a).unwrap().sync.pending.is_empty());
-        assert_eq!(s.mailbox.mail[&x].remote_id.as_deref(), Some("1"));
+        assert_eq!(s.mailbox.mail.get(x).unwrap().remote_id.as_deref(), Some("1"));
     }
 
     #[test]
@@ -2033,7 +2111,7 @@ mod tests {
         // All three are moved to Archive and the moves are handed to the worker.
         change(&mut s, |mb| {
             for id in [x, y, z] {
-                mb.mail.get_mut(&id).unwrap().folder = archive;
+                mb.mail.get_mut(id).unwrap().folder = archive;
             }
         });
         let moves = op_ids(&s, a);
@@ -2041,9 +2119,9 @@ mod tests {
         mark_inflight(&mut s, a);
         // Meanwhile: x goes on to Deleted Items, y is deleted permanently, z goes to a local folder.
         change(&mut s, |mb| {
-            mb.mail.get_mut(&x).unwrap().folder = trash;
-            mb.mail.remove(&y);
-            mb.mail.get_mut(&z).unwrap().folder = local;
+            mb.mail.get_mut(x).unwrap().folder = trash;
+            mb.mail.remove(y);
+            mb.mail.get_mut(z).unwrap().folder = local;
         });
         // The moves finish with new UIDs in Archive.
         for (op, uid) in moves.iter().zip([15, 16, 17]) {
@@ -2059,7 +2137,10 @@ mod tests {
                 RemoteOp::Move { folder: "Archive".into(), uid: 15, dest: "Trash".into(), item: x },
             ]
         );
-        assert!(s.mailbox.mail[&x].remote_id.is_none() && s.mailbox.mail[&z].remote_id.is_none());
+        assert!(
+            s.mailbox.mail.get(x).unwrap().remote_id.is_none()
+                && s.mailbox.mail.get(z).unwrap().remote_id.is_none()
+        );
     }
 
     #[test]
@@ -2096,11 +2177,13 @@ mod tests {
         let items: Vec<&MailItem> = s.mailbox.items_in(inbox);
         assert_eq!(items.len(), 2);
         let header = items.iter().find(|m| m.remote_id.as_deref() == Some("2")).map(|m| m.id).unwrap();
-        assert!(s.mailbox.mail[&header].body.text.is_none(), "header only");
+        assert!(s.mailbox.mail.get(header).unwrap().body.text.is_none(), "header only");
         let bodies = SyntheticImap::Bodies { folder: "INBOX".into(), msgs: vec![msg(2, false)] };
         assert!(s.queue_imap_results(a, bodies));
         assert!(s.poll_sync());
-        assert!(s.mailbox.mail[&header].body.text.as_deref().is_some_and(|t| t.contains("Body 2")));
+        assert!(
+            s.mailbox.mail.get(header).unwrap().body.text.as_deref().is_some_and(|t| t.contains("Body 2"))
+        );
     }
 
     #[test]
@@ -2114,9 +2197,9 @@ mod tests {
         let t =
             s.mailbox.add_mail(MailItem { folder: trash, remote_id: Some("3".into()), ..Default::default() });
         change(&mut s, |mb| {
-            mb.mail.get_mut(&x).unwrap().read = true;
-            mb.mail.get_mut(&t).unwrap().read = true;
-            mb.mail.get_mut(&z).unwrap().folder = trash;
+            mb.mail.get_mut(x).unwrap().read = true;
+            mb.mail.get_mut(t).unwrap().read = true;
+            mb.mail.get_mut(z).unwrap().folder = trash;
         });
         assert_eq!(pending(&s.mailbox, a).len(), 3);
         let raw = b"From: a@example.com\r\nSubject: Fresh\r\nMessage-ID: <fresh@example.com>\r\n\r\nHi\r\n"
@@ -2136,9 +2219,9 @@ mod tests {
         };
         let mut new_inbox = Vec::new();
         native::apply_delta(&mut s, a, "INBOX", delta, &mut new_inbox);
-        assert!(!s.mailbox.mail.contains_key(&x), "old copies are discarded");
+        assert!(!s.mailbox.mail.contains(x), "old copies are discarded");
         assert_eq!(new_inbox.len(), 1);
-        assert_eq!(s.mailbox.mail[&new_inbox[0]].remote_id.as_deref(), Some("1"));
+        assert_eq!(s.mailbox.mail.get(new_inbox[0]).unwrap().remote_id.as_deref(), Some("1"));
         // The flag change on an old INBOX UID is dropped; the moved message is uploaded to its folder
         // instead of moving whatever now has its old UID; Deleted Items is untouched.
         let ops = pending(&s.mailbox, a);
@@ -2185,14 +2268,14 @@ mod tests {
             remote_id: Some("8".into()),
             ..Default::default()
         });
-        change(&mut s, |mb| mb.mail.get_mut(&x).unwrap().folder = b_trash);
+        change(&mut s, |mb| mb.mail.get_mut(x).unwrap().folder = b_trash);
         push_op(&mut s.mailbox, a, RemoteOp::CreateFolder { name: "Z".into() });
         mark_inflight(&mut s, a);
         assert!(op_ids(&s, a).contains(&op_ids(&s, b)[1]), "the test needs colliding ids");
         // Moving it back before the move ran cancels the move and restores the UID.
-        change(&mut s, |mb| mb.mail.get_mut(&x).unwrap().folder = b_inbox);
+        change(&mut s, |mb| mb.mail.get_mut(x).unwrap().folder = b_inbox);
         assert_eq!(pending(&s.mailbox, b).len(), 1, "{:?}", pending(&s.mailbox, b));
-        assert_eq!(s.mailbox.mail[&x].remote_id.as_deref(), Some("8"));
+        assert_eq!(s.mailbox.mail.get(x).unwrap().remote_id.as_deref(), Some("8"));
     }
 
     #[test]
@@ -2201,8 +2284,8 @@ mod tests {
         let mut s = Session::new(mb);
         let x =
             s.mailbox.add_mail(MailItem { folder: inbox, remote_id: Some("5".into()), ..Default::default() });
-        change(&mut s, |mb| mb.mail.get_mut(&x).unwrap().read = true);
-        change(&mut s, |mb| mb.mail.get_mut(&x).unwrap().read = false);
+        change(&mut s, |mb| mb.mail.get_mut(x).unwrap().read = true);
+        change(&mut s, |mb| mb.mail.get_mut(x).unwrap().read = false);
         let now = 1_000;
         if let Some(p) = s.mailbox.accounts.iter_mut().find(|x| x.id == a).unwrap().sync.pending.first_mut() {
             p.attempts = 3;

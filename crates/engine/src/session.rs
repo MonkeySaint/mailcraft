@@ -1169,7 +1169,7 @@ impl Session {
             return;
         }
         for (id, key) in std::mem::take(&mut self.store_guard.stored) {
-            let Some(item) = self.mailbox.mail.get_mut(&id) else { continue };
+            let Some(item) = self.mailbox.mail.get_mut(id) else { continue };
             let same = item
                 .raw
                 .as_deref()
@@ -1266,7 +1266,7 @@ impl Session {
         let mb = &self.mailbox;
         // Selections hold mail in Mail and contacts/appointments/tasks/notes in the other modules.
         let exists = |id: &ItemId| {
-            mb.mail.contains_key(id)
+            mb.mail.contains(*id)
                 || mb.contacts.contains_key(id)
                 || mb.appointments.contains_key(id)
                 || mb.tasks.contains_key(id)
@@ -1277,11 +1277,11 @@ impl Session {
             self.selection.focus = self.selection.items.first().copied();
         }
         let mail = &self.mailbox.mail;
-        self.clipboard.retain(|id| mail.contains_key(id));
+        self.clipboard.retain(|id| mail.contains(*id));
         // Translations of messages that are gone (deleted, or replaced by a sync) are dropped.
-        self.translations.retain(|id, _| mail.contains_key(id));
+        self.translations.retain(|id, _| mail.contains(*id));
         // So are their View in Browser pages.
-        self.browser_pages.prune(|id| mail.contains_key(&id));
+        self.browser_pages.prune(|id| mail.contains(id));
     }
 
     /// Item ids a command should act on: `params.ids` when present, else the selection (else the focus).
@@ -1369,7 +1369,7 @@ impl Session {
         };
         let mb = &self.mailbox;
         let exists = |id: &ItemId| {
-            mb.mail.contains_key(id)
+            mb.mail.contains(*id)
                 || mb.contacts.contains_key(id)
                 || mb.appointments.contains_key(id)
                 || mb.tasks.contains_key(id)
@@ -1475,9 +1475,9 @@ pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
             ops.push(Op::PutMail(Box::new(m.clone())));
         }
     }
-    for id in before.mail.keys() {
-        if !after.mail.contains_key(id) {
-            ops.push(Op::RemoveMail(*id));
+    for id in before.mail.ids() {
+        if !after.mail.contains(id) {
+            ops.push(Op::RemoveMail(id));
         }
     }
     for id in before.folders.keys() {
@@ -1516,14 +1516,14 @@ mod tests {
     #[test]
     fn automatic_runs_record_no_undo_step() {
         let mut s = crate::sample::sample_session();
-        let id = s.mailbox.mail.values().find(|m| !m.read).map(|m| m.id).unwrap();
-        s.selection.folder = s.mailbox.mail[&id].folder;
+        let id = s.mailbox.mail.items().find(|m| !m.read).map(|m| m.id).unwrap();
+        s.selection.folder = s.mailbox.mail.get(id).unwrap().folder;
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         let undo_before = s.undo.undo.len();
         let ops_before = s.journal_calls;
         s.run_automatic("mail.markRead", &serde_json::json!({"ids": [id.0]})).unwrap();
-        assert!(s.mailbox.mail[&id].read);
+        assert!(s.mailbox.mail.get(id).unwrap().read);
         assert_eq!(s.undo.undo.len(), undo_before, "not undoable");
         assert!(s.journal_calls > ops_before, "still journaled");
         assert_eq!((s.automatic_depth, s.run_depth), (0, 0));
@@ -1559,18 +1559,18 @@ mod tests {
         };
         {
             let s = Session::open(dir.path()).unwrap();
-            assert!(s.mailbox.mail[&msg].pinned);
+            assert!(s.mailbox.mail.get(msg).unwrap().pinned);
             assert_eq!(s.mailbox.notes[&note].position(), Some((12.0, 34.0)));
             assert!(s.view.collapsed_groups.values().flatten().all(|e| !e.starts_with('\u{1}')));
         }
         // Saved with the mailbox, and gone from settings.json: unpinning sticks.
         let mut s = Session::open(dir.path()).unwrap();
-        assert!(s.mailbox.mail[&msg].pinned);
+        assert!(s.mailbox.mail.get(msg).unwrap().pinned);
         s.run("mail.pin", &serde_json::json!({"ids": [msg.0]})).unwrap();
         s.run("notes.setPosition", &serde_json::json!({"id": note.0, "position": null})).unwrap();
         drop(s);
         let s = Session::open(dir.path()).unwrap();
-        assert!(!s.mailbox.mail[&msg].pinned);
+        assert!(!s.mailbox.mail.get(msg).unwrap().pinned);
         assert_eq!(s.mailbox.notes[&note].position(), None);
     }
 
@@ -1591,7 +1591,7 @@ mod tests {
             s.store.as_mut().unwrap().set_journal_cap(1);
             s.store.as_mut().unwrap().set_snapshot_cap(1);
             s.load_settings(dir.path());
-            assert!(s.mailbox.mail[&msg].pinned, "pinned in memory");
+            assert!(s.mailbox.mail.get(msg).unwrap().pinned, "pinned in memory");
             assert!(!s.pending_ops.is_empty());
             assert!(s.view.collapsed_groups[&inbox].iter().any(|e| e.starts_with("\u{1}mail.pinned=")));
             assert!(settings().contains("mail.pinned="), "{}", settings());
@@ -1599,7 +1599,7 @@ mod tests {
         };
         // Next start (the store writes again): moved for good.
         let s = Session::open(dir.path()).unwrap();
-        assert!(s.mailbox.mail[&msg].pinned);
+        assert!(s.mailbox.mail.get(msg).unwrap().pinned);
         assert!(!settings().contains("mail.pinned="));
     }
 }

@@ -145,7 +145,7 @@ pub const NEXT_LINK: &str = "Next message";
 fn mark_read_timer(ctx: &egui::Context, app: &mut App, id: u64) {
     let key = per_viewport(ctx, Id::new("mailcraft.reading.read-timer"));
     let st = &app.s.settings;
-    let unread = app.s.mailbox.mail.get(&ItemId(id)).is_some_and(|m| !m.read);
+    let unread = app.s.mailbox.mail.get(ItemId(id)).is_some_and(|m| !m.read);
     if !st.bool("mail.readingPane.markReadWhenViewed") || !unread {
         ctx.data_mut(|d| d.remove::<(u64, f64)>(key));
         return;
@@ -250,7 +250,7 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
         // The folder the item was in when the window first showed it: deleting, archiving or moving the item
         // takes it out of that folder, which counts as the item leaving the window.
         let folder_key = folder_id(id);
-        let current = app.s.mailbox.mail.get(&ItemId(id)).map(|m| m.folder.0);
+        let current = app.s.mailbox.mail.get(ItemId(id)).map(|m| m.folder.0);
         let opened_in = ctx.data_mut(|d| d.get_temp::<u64>(folder_key));
         if opened_in.is_none()
             && let Some(f) = current
@@ -274,7 +274,7 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
             crate::edit_message::may_close(ctx, app, id);
             left = false;
         }
-        let m = app.s.mailbox.mail.get(&ItemId(id)).filter(|_| !left);
+        let m = app.s.mailbox.mail.get(ItemId(id)).filter(|_| !left);
         let Some(m) = m else {
             ctx.data_mut(|d| d.remove::<u64>(folder_key));
             // The window shows another message now (or closes): an editor of this one goes with it. Edits can
@@ -291,7 +291,7 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
                 ("openPrevious", Some((p, _))) => p,
                 _ => None,
             }
-            .filter(|n| app.s.mailbox.mail.contains_key(&ItemId(*n)) && !app.ui.read_windows.contains(n));
+            .filter(|n| app.s.mailbox.mail.contains(ItemId(*n)) && !app.ui.read_windows.contains(n));
             let next = next.filter(|n| *n != id);
             match next {
                 Some(n) => {
@@ -734,7 +734,7 @@ fn focused_mail(app: &App) -> Option<u64> {
     sel.focus
         .into_iter()
         .chain(sel.items.iter().copied())
-        .find(|id| app.s.mailbox.mail.contains_key(id))
+        .find(|id| app.s.mailbox.mail.contains(*id))
         .map(|id| id.0)
 }
 
@@ -1637,7 +1637,7 @@ mod tests {
 
     fn app_with(subject: &str) -> App {
         let mut s = sample_session();
-        let id = s.mailbox.mail.values().find(|m| m.subject == subject).map(|m| m.id).unwrap();
+        let id = s.mailbox.mail.items().find(|m| m.subject == subject).map(|m| m.id).unwrap();
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         App::new(s)
@@ -1656,7 +1656,7 @@ mod tests {
     #[test]
     fn mark_as_read_after_the_wait_and_space_bar_reading() {
         let s = sample_session();
-        let subject = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let subject = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap().subject.clone();
         let mut app = app_with(&subject);
         let id = app.s.selection.focus.unwrap();
         app.s.mailbox.set_read(&[id], false);
@@ -1664,14 +1664,14 @@ mod tests {
         app.run("options.set", json!({"key": "mail.readingPane.markReadAfterSeconds", "value": 0}));
         let mut h = harness(app);
         h.run_steps(2);
-        assert!(h.state().s.mailbox.mail[&id].read, "marked read after 0 s");
+        assert!(h.state().s.mailbox.mail.get(id).unwrap().read, "marked read after 0 s");
         // Option off: viewing leaves it unread.
         let mut app = h.into_state();
         app.s.mailbox.set_read(&[id], false);
         app.run("options.set", json!({"key": "mail.readingPane.markReadWhenViewed", "value": false}));
         let mut h = harness(app);
         h.run_steps(2);
-        assert!(!h.state().s.mailbox.mail[&id].read);
+        assert!(!h.state().s.mailbox.mail.get(id).unwrap().read);
         // Space pages the message, then moves on.
         let ctx = h.ctx.clone();
         let mut moved = false;
@@ -1690,7 +1690,7 @@ mod tests {
     #[test]
     fn inline_cid_pictures_reach_the_body() {
         let s = sample_session();
-        let subject = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let subject = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap().subject.clone();
         let mut app = app_with(&subject);
         let id = app.s.selection.focus.unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
@@ -1713,7 +1713,7 @@ mod tests {
         let raw = b.build();
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut built = mailcraft_model::MailItem::from_message(&msg, &raw, app.s.now());
-        if let Some(m) = app.s.mailbox.mail.get_mut(&id) {
+        if let Some(m) = app.s.mailbox.mail.get_mut(id) {
             m.body = built.body.clone();
             m.attachments = std::mem::take(&mut built.attachments);
             m.raw = Some(raw);
@@ -1726,7 +1726,7 @@ mod tests {
     #[test]
     fn trust_center_and_background_options_render() {
         let s = sample_session();
-        let subject = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let subject = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap().subject.clone();
         let mut app = app_with(&subject);
         for (k, v) in
             [("trust.plainText", true), ("trust.blockImages", false), ("general.keepMessageBackground", true)]
@@ -1823,13 +1823,13 @@ mod tests {
     #[test]
     fn junk_info_bar_and_read_receipt_request() {
         let s = sample_session();
-        let subject = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let subject = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap().subject.clone();
         let mut app = app_with(&subject);
         let id = app.s.selection.focus.unwrap();
         // A read-receipt request: the bar asks (Options › Mail › Tracking default), "never" hides it.
         let raw = b"From: Ann <ann@example.org>\r\nTo: me@example.com\r\nSubject: Hi\r\n\
                     Disposition-Notification-To: ann@example.org\r\n\r\nBody\r\n";
-        if let Some(m) = app.s.mailbox.mail.get_mut(&id) {
+        if let Some(m) = app.s.mailbox.mail.get_mut(id) {
             m.raw = Some(raw.to_vec());
         }
         let mut h = harness(app);
@@ -1842,7 +1842,7 @@ mod tests {
         assert!(h.query_by_label(crate::compose::READ_RECEIPT_REQUEST).is_none());
         // In Junk Email: the info bar, and the body is shown as plain text without working links.
         let mut app = h.into_state();
-        let acct = app.s.mailbox.folder_account(app.s.mailbox.mail[&id].folder).unwrap();
+        let acct = app.s.mailbox.folder_account(app.s.mailbox.mail.get(id).unwrap().folder).unwrap();
         let junk = app.s.mailbox.role_folder(acct, mailcraft_model::FolderRole::JunkEmail).unwrap();
         app.s.mailbox.move_items(&[id], junk).unwrap();
         assert!(mailcraft_engine::junk::links_disabled(&app.s, id));
@@ -1853,8 +1853,8 @@ mod tests {
 
     fn app_with_text(text: &str) -> (App, u64) {
         let mut s = sample_session();
-        let id = s.mailbox.mail.values().find(|m| m.body.html.is_some()).map(|m| m.id).unwrap();
-        if let Some(m) = s.mailbox.mail.get_mut(&id) {
+        let id = s.mailbox.mail.items().find(|m| m.body.html.is_some()).map(|m| m.id).unwrap();
+        if let Some(m) = s.mailbox.mail.get_mut(id) {
             m.body.html = None;
             m.body.format = BodyFormat::PlainText;
             m.body.text = Some(text.to_owned());
@@ -1869,7 +1869,7 @@ mod tests {
     #[test]
     fn main_and_explorer_reading_panes_keep_their_own_caches() {
         let s = sample_session();
-        let mut bodies = s.mailbox.mail.values().filter(|m| m.body.html.is_some() || m.body.text.is_some());
+        let mut bodies = s.mailbox.mail.items().filter(|m| m.body.html.is_some() || m.body.text.is_some());
         let (a, b) = (bodies.next().unwrap().id, bodies.next().unwrap().id);
         let mut app = App::new(s);
         let ctx = egui::Context::default();
@@ -2021,7 +2021,7 @@ mod tests {
     #[test]
     fn renders_html_message() {
         let s = sample_session();
-        let m = s.mailbox.mail.values().find(|m| m.body.html.is_some()).unwrap();
+        let m = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap();
         let subject = m.subject.clone();
         let mut h = harness(app_with(&subject));
         h.run();
@@ -2036,7 +2036,7 @@ mod tests {
     #[test]
     fn renders_plain_message_and_attachment_and_reply() {
         let mut s = sample_session();
-        let m = s.mailbox.mail.values_mut().find(|m| m.subject == "Quarterly report draft").unwrap();
+        let m = s.mailbox.mail.items_mut().find(|m| m.subject == "Quarterly report draft").unwrap();
         m.body.html = None;
         m.body.format = BodyFormat::PlainText;
         m.body.text = Some("Hi team,\nplease see the attached draft.\n".into());
@@ -2052,7 +2052,7 @@ mod tests {
     }
 
     fn app_with_session(mut s: mailcraft_engine::Session, subject: &str) -> App {
-        let id = s.mailbox.mail.values().find(|m| m.subject == subject).map(|m| m.id).unwrap();
+        let id = s.mailbox.mail.items().find(|m| m.subject == subject).map(|m| m.id).unwrap();
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         App::new(s)
@@ -2061,7 +2061,7 @@ mod tests {
     #[test]
     fn tiny_read_windows_drop_the_ribbon_like_compose() {
         let s = sample_session();
-        let id = s.mailbox.mail.keys().next().copied().unwrap();
+        let id = s.mailbox.mail.ids().next().unwrap();
         let ribbon_shown = |w: f32, h: f32| {
             let mut app = App::new(sample_session());
             app.ui.read_windows.push(id.0);
@@ -2084,7 +2084,7 @@ mod tests {
     #[test]
     fn read_window_closes_on_escape_when_embedded() {
         let s = sample_session();
-        let id = s.mailbox.mail.keys().next().copied().unwrap();
+        let id = s.mailbox.mail.ids().next().unwrap();
         let mut app = App::new(s);
         app.ui.read_windows.push(id.0);
         let mut h = Harness::builder().with_size(Vec2::new(1000.0, 800.0)).build_ui_state(
@@ -2107,8 +2107,7 @@ mod tests {
     #[test]
     fn read_window_has_quick_access_tabs_and_its_own_backstage() {
         let s = sample_session();
-        let id =
-            s.mailbox.mail.values().find(|m| m.subject == "Slides for Thursday").map(|m| m.id.0).unwrap();
+        let id = s.mailbox.mail.items().find(|m| m.subject == "Slides for Thursday").map(|m| m.id.0).unwrap();
         let mut app = App::new(s);
         app.ui.read_windows.push(id);
         let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
@@ -2164,7 +2163,7 @@ mod tests {
         ));
         assert!(!crate::widgets::embedded_fills(READ_WINDOW_SIZE.into(), Vec2::new(1920.0, 1080.0)));
         let s = sample_session();
-        let id = s.mailbox.mail.keys().next().copied().unwrap();
+        let id = s.mailbox.mail.ids().next().unwrap();
         let mut app = App::new(s);
         app.ui.read_windows.push(id.0);
         let mut h = Harness::builder().with_size(Vec2::new(1920.0, 1080.0)).build_ui_state(
@@ -2346,7 +2345,7 @@ mod tests {
             h.state_mut().s.selection.items = vec![id];
             h.state_mut().s.selection.focus = Some(id);
             h.state_mut().s.run(cmd, &params).unwrap();
-            assert!(h.state().s.mailbox.mail.contains_key(&id), "{cmd}: the item still exists elsewhere");
+            assert!(h.state().s.mailbox.mail.contains(id), "{cmd}: the item still exists elsewhere");
             h.run();
             // Default "After moving or deleting an open item": return to the current folder.
             assert!(h.state().ui.read_windows.is_empty(), "{cmd} left the window open");
@@ -2401,7 +2400,7 @@ mod tests {
         h.get_by_label(crate::edit_message::SAVE_PROMPT);
         prompt_save(&h);
         h.run_steps(3);
-        let m = &h.state().s.mailbox.mail[&id];
+        let m = &h.state().s.mailbox.mail.get(id).unwrap();
         assert_eq!(m.folder, target);
         assert!(m.subject.ends_with(" (edited)"), "{}", m.subject);
         assert!(h.state().ui.read_windows.is_empty());
@@ -2454,7 +2453,7 @@ mod tests {
     fn exit_brings_the_embedded_window_with_unsaved_edits_forward() {
         let (mut h, id) = editing_with_unsaved_edits(sample_session());
         // Another read window opens over it.
-        let other = h.state().s.mailbox.mail.keys().copied().find(|k| *k != id).unwrap();
+        let other = h.state().s.mailbox.mail.ids().find(|k| *k != id).unwrap();
         h.state_mut().ui.read_windows.push(other.0);
         h.run_steps(3);
         let layer = |v: u64| crate::widgets::item_float_layer(read_viewport_id(v));
@@ -2471,14 +2470,14 @@ mod tests {
     fn quick_access_save_saves_message_edits() {
         use egui_kittest::kittest::NodeT;
         let (mut h, id) = editing_with_unsaved_edits(sample_session());
-        let before = h.state().s.mailbox.mail[&id].subject.clone();
+        let before = h.state().s.mailbox.mail.get(id).unwrap().subject.clone();
         // The Quick Access row is the top one (the editor's own bar has a Save button too).
         let qat_save = h.get_all_by_label("Save").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()));
         let qat_save = qat_save.expect("the Quick Access Save");
         assert!(!qat_save.accesskit_node().is_disabled(), "Save is enabled while edits wait");
         qat_save.click();
         h.run_steps(3);
-        let m = &h.state().s.mailbox.mail[&id];
+        let m = &h.state().s.mailbox.mail.get(id).unwrap();
         assert_eq!(m.subject, format!("{before} (edited)"));
         assert!(!crate::edit_message::is_editing(h.state(), id.0), "saved: the editor stops");
         assert_eq!(h.state().ui.read_windows, [id.0], "the window stays open on the saved message");
@@ -2518,7 +2517,7 @@ mod tests {
         h.get_by_label(crate::edit_message::SAVE_PROMPT);
         prompt_save(&h);
         h.run_steps(3);
-        assert!(h.state().s.mailbox.mail[&id].subject.ends_with('!'));
+        assert!(h.state().s.mailbox.mail.get(id).unwrap().subject.ends_with('!'));
         assert!(!close(&mut h), "nothing unsaved: MailCraft closes");
     }
 
@@ -2547,7 +2546,7 @@ mod tests {
     fn f6_cycles_header_body_info_bar_and_ribbon_in_a_read_window() {
         let mut s = sample_session();
         // A message with an info bar (a follow-up flag).
-        let id = s.mailbox.mail.values().find(|m| m.body.html.is_some()).map(|m| m.id).unwrap();
+        let id = s.mailbox.mail.items().find(|m| m.body.html.is_some()).map(|m| m.id).unwrap();
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         s.run("mail.flag", &json!({"ids": [id.0]})).unwrap();

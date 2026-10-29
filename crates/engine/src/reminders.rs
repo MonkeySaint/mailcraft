@@ -276,7 +276,7 @@ pub fn due(s: &Session, st: &ReminderState) -> Vec<Reminder> {
             recurring: false,
         });
     }
-    for m in mb.mail.values() {
+    for m in mb.mail.items() {
         let FlagState::Flagged { reminder: Some(r), due: flag_due, .. } = &m.flag else { continue };
         // Junk Email never pops a window: a sender-set reminder there is a way to grab attention.
         if r.unix > now.unix || in_deleted(mb, m.folder) || in_role(mb, m.folder, FolderRole::JunkEmail) {
@@ -346,7 +346,7 @@ pub fn next_due_after(s: &Session, st: &ReminderState, horizon_secs: i64) -> Opt
             consider(r.unix);
         }
     }
-    for m in mb.mail.values() {
+    for m in mb.mail.items() {
         if let FlagState::Flagged { reminder: Some(r), .. } = &m.flag {
             consider(r.unix);
         }
@@ -424,7 +424,7 @@ pub fn dismiss(s: &mut Session, st: &mut ReminderState, keys: &[String]) -> usiz
                 }
                 None => false,
             },
-            Key::Mail(id) => match s.mailbox.mail.get_mut(&id) {
+            Key::Mail(id) => match s.mailbox.mail.get_mut(id) {
                 Some(m) => match &mut m.flag {
                     FlagState::Flagged { reminder, .. } => {
                         *reminder = None;
@@ -468,7 +468,7 @@ pub fn snooze(s: &mut Session, st: &mut ReminderState, keys: &[String], minutes:
                 }
                 None => false,
             },
-            Key::Mail(id) => match s.mailbox.mail.get_mut(&id) {
+            Key::Mail(id) => match s.mailbox.mail.get_mut(id) {
                 Some(m) => match &mut m.flag {
                     FlagState::Flagged { reminder, .. } => {
                         *reminder = Some(until);
@@ -591,9 +591,7 @@ pub fn run_open(s: &mut Session, p: &Value) -> CmdResult {
             pim::dialog(s, "appointment", json!({ "id": id.0 }))
         }
         Key::Task(id) if s.mailbox.tasks.contains_key(&id) => pim::dialog(s, "task", json!({ "id": id.0 })),
-        Key::Mail(id) if s.mailbox.mail.contains_key(&id) => {
-            pim::dialog(s, "readWindow", json!({ "id": id.0 }))
-        }
+        Key::Mail(id) if s.mailbox.mail.contains(id) => pim::dialog(s, "readWindow", json!({ "id": id.0 })),
         Key::Contact(id) if s.mailbox.contacts.contains_key(&id) => {
             pim::dialog(s, "contact", json!({ "id": id.0 }))
         }
@@ -796,7 +794,7 @@ mod tests {
         assert!(due(&s, &ReminderState::default()).is_empty());
         // Moved back to the Inbox (not junk after all), its reminder comes due.
         let inbox = role(&s, FolderRole::Inbox);
-        s.mailbox.mail.get_mut(&id).unwrap().folder = inbox;
+        s.mailbox.mail.get_mut(id).unwrap().folder = inbox;
         assert_eq!(due(&s, &ReminderState::default()).len(), 1);
     }
 
@@ -834,7 +832,7 @@ mod tests {
         assert_eq!(s.mailbox.tasks[&ItemId(t)].reminder.unwrap().unix, at(&s, 10).unix);
         // Dismiss the message's reminder; the flag stays.
         s.run("calendar.dismissReminder", &json!({ "keys": [format!("mail:{}", mail.0)] })).unwrap();
-        assert!(matches!(s.mailbox.mail[&mail].flag, FlagState::Flagged { reminder: None, .. }));
+        assert!(matches!(s.mailbox.mail.get(mail).unwrap().flag, FlagState::Flagged { reminder: None, .. }));
         assert!(due(&s, &st).is_empty());
         // Completed tasks never remind.
         s.run("tasks.update", &json!({ "id": t, "reminder": reminder, "complete": true })).unwrap();

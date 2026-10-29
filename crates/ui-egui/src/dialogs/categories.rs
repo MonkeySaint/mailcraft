@@ -82,7 +82,7 @@ fn item_categories<'a>(app: &'a App, area: &str, ids: &[u64]) -> Vec<&'a Vec<Str
     use mailcraft_engine::cmd::calendar::pim;
     ids.iter()
         .filter_map(|i| match area {
-            "" | "mail" => app.s.mailbox.mail.get(&ItemId(*i)).map(|m| &m.categories),
+            "" | "mail" => app.s.mailbox.mail.get(ItemId(*i)).map(|m| &m.categories),
             _ => pim::categories(&app.s.mailbox, ItemId(*i)),
         })
         .collect()
@@ -481,7 +481,7 @@ fn custom_flag(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         };
         let flag = match compose {
             Some(c) => app.s.composes.get(&c).map(|c| c.flag.clone()),
-            None => ids.first().and_then(|i| app.s.mailbox.mail.get(&ItemId(*i))).map(|m| m.flag.clone()),
+            None => ids.first().and_then(|i| app.s.mailbox.mail.get(ItemId(*i))).map(|m| m.flag.clone()),
         };
         if let Some(FlagState::Flagged { label, start, due, reminder }) = flag {
             st.label = label;
@@ -524,7 +524,7 @@ fn custom_flag(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             app.s.composes.get(&c).is_some_and(|c| c.flag != FlagState::None || c.recipient_flag.is_some())
         }
         None => {
-            ids.iter().any(|i| app.s.mailbox.mail.get(&ItemId(*i)).is_some_and(|m| m.flag != FlagState::None))
+            ids.iter().any(|i| app.s.mailbox.mail.get(ItemId(*i)).is_some_and(|m| m.flag != FlagState::None))
         }
     };
     with_state(ctx, app, uid, init, |st, app| {

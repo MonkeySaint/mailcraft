@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn sample_covers_the_interesting_states() {
         let mb = sample_mailbox(sample_now());
-        let mail: Vec<&MailItem> = mb.mail.values().collect();
+        let mail: Vec<&MailItem> = mb.mail.items().collect();
         assert!(mail.iter().any(|m| !m.read));
         assert!(mail.iter().any(|m| m.is_flagged()));
         assert!(mail.iter().any(|m| matches!(m.flag, FlagState::Complete { .. })));

@@ -30,7 +30,7 @@ fn bodyless(m: &MailItem) -> bool {
 
 /// True when the item was downloaded as headers only and not yet in full.
 pub fn is_header_only(s: &Session, id: ItemId) -> bool {
-    s.mailbox.mail.get(&id).is_some_and(|m| {
+    s.mailbox.mail.get(id).is_some_and(|m| {
         (s.sync.prefs.data.headers_only.contains(&id.0) && m.raw.is_none() && m.blob.is_none()) || bodyless(m)
     })
 }
@@ -98,7 +98,7 @@ pub fn download_now(s: &mut Session, ids: &[ItemId]) -> Result<usize, CmdError> 
         if !is_header_only(s, *id) {
             continue;
         }
-        let Some(acct) = s.mailbox.mail.get(id).and_then(|m| s.mailbox.folder(m.folder)).map(|f| f.account)
+        let Some(acct) = s.mailbox.mail.get(*id).and_then(|m| s.mailbox.folder(m.folder)).map(|f| f.account)
         else {
             continue;
         };
@@ -147,7 +147,7 @@ pub fn unmark(s: &mut Session, p: &Value) -> CmdResult {
     let ids: Vec<u64> = if all {
         let mut v: Vec<u64> = s.sync.prefs.data.marked.keys().copied().collect();
         // Header-only items that were never marked are reported too (nothing to undo for them).
-        v.extend(s.mailbox.mail.values().filter(|m| bodyless(m)).map(|m| m.id.0));
+        v.extend(s.mailbox.mail.items().filter(|m| bodyless(m)).map(|m| m.id.0));
         v.sort_unstable();
         v.dedup();
         v
@@ -179,7 +179,7 @@ pub fn process_marked(s: &mut Session, p: &Value) -> CmdResult {
     let mut by_account: std::collections::BTreeMap<AccountId, Vec<ItemId>> = Default::default();
     let mut stale = Vec::new();
     for id in marked_ids {
-        let Some(m) = s.mailbox.mail.get(&id) else {
+        let Some(m) = s.mailbox.mail.get(id) else {
             stale.push(id.0);
             continue;
         };

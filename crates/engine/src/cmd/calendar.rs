@@ -173,7 +173,7 @@ pub mod pim {
 
     /// Categories of a PIM item, or of a message (the To-Do List shows flagged messages beside tasks).
     pub fn categories(mb: &Mailbox, id: ItemId) -> Option<&Vec<String>> {
-        let Some(kind) = kind_of(mb, id) else { return mb.mail.get(&id).map(|m| &m.categories) };
+        let Some(kind) = kind_of(mb, id) else { return mb.mail.get(id).map(|m| &m.categories) };
         match kind {
             Kind::Appointment => mb.appointments.get(&id).map(|a| &a.categories),
             Kind::Contact => mb.contacts.get(&id).map(|c| &c.categories),
@@ -183,7 +183,7 @@ pub mod pim {
     }
 
     pub fn categories_mut(mb: &mut Mailbox, id: ItemId) -> Option<&mut Vec<String>> {
-        let Some(kind) = kind_of(mb, id) else { return mb.mail.get_mut(&id).map(|m| &mut m.categories) };
+        let Some(kind) = kind_of(mb, id) else { return mb.mail.get_mut(id).map(|m| &mut m.categories) };
         match kind {
             Kind::Appointment => mb.appointments.get_mut(&id).map(|a| &mut a.categories),
             Kind::Contact => mb.contacts.get_mut(&id).map(|c| &mut c.categories),
@@ -3291,7 +3291,7 @@ pub fn calendar_data(s: &Session, m: &MailItem) -> Option<Vec<u8>> {
 
 /// The scheduling message carried by mail item `mail` (METHOD and first VEVENT).
 pub fn read_itip(s: &Session, mail: ItemId) -> Option<ItipMessage> {
-    let m = s.mailbox.mail.get(&mail)?;
+    let m = s.mailbox.mail.get(mail)?;
     let data = calendar_data(s, m)?;
     itip::read(&data, ImportOptions { local_offset_min: s.tz_offset_min }).ok()
 }
@@ -3319,7 +3319,7 @@ fn my_address(s: &Session, mail: Option<ItemId>, event: &Appointment) -> Option<
         return Some(a.mailbox.clone());
     }
     let account = mail
-        .and_then(|m| s.mailbox.mail.get(&m))
+        .and_then(|m| s.mailbox.mail.get(m))
         .and_then(|m| s.mailbox.folder_account(m.folder))
         .and_then(|a| s.mailbox.account(a))
         .or_else(|| s.mailbox.default_account())?;
@@ -3492,7 +3492,7 @@ fn req_meeting_mail(s: &Session, p: &Value) -> Result<(ItemId, ItipMessage), Cmd
         .map(ItemId)
         .or(s.selection.focus)
         .ok_or_else(|| CmdError::Params("`id` (the meeting message) is required".into()))?;
-    if !s.mailbox.mail.contains_key(&id) {
+    if !s.mailbox.mail.contains(id) {
         return Err(CmdError::Params(format!("no message {}", id.0)));
     }
     let msg =
@@ -3596,7 +3596,7 @@ fn keep_local(a: &mut Appointment, old: &Appointment) {
 
 /// The calendar a new meeting from `mail` goes to: its account's Calendar, else the default one.
 fn meeting_folder(s: &Session, mail: ItemId) -> Result<FolderId, CmdError> {
-    let account = s.mailbox.mail.get(&mail).and_then(|m| s.mailbox.folder_account(m.folder));
+    let account = s.mailbox.mail.get(mail).and_then(|m| s.mailbox.folder_account(m.folder));
     account
         .and_then(|acc| s.mailbox.role_folder(acc, FolderRole::Calendar))
         .or_else(|| pim::default_folder(s, Kind::Appointment))
@@ -3678,7 +3678,7 @@ fn apply_response(
     let me = my_address(s, Some(mail), &a)
         .ok_or_else(|| CmdError::Failed("there is no account address to answer from".into()))?;
     set_my_response(&mut a, &me, response);
-    let sender = s.mailbox.mail.get(&mail).and_then(|m| m.from.clone());
+    let sender = s.mailbox.mail.get(mail).and_then(|m| m.from.clone());
     if a.organizer.is_none() {
         a.organizer = sender.clone();
     }
@@ -3769,9 +3769,9 @@ pub fn place_tentative(s: &mut Session, mail: ItemId, msg: &ItipMessage) -> Resu
     {
         return Ok(None);
     }
-    let was_read = s.mailbox.mail.get(&mail).is_some_and(|m| m.read);
+    let was_read = s.mailbox.mail.get(mail).is_some_and(|m| m.read);
     let (item, ..) = apply_response(s, mail, msg, ResponseStatus::None)?;
-    if let Some(m) = s.mailbox.mail.get_mut(&mail) {
+    if let Some(m) = s.mailbox.mail.get_mut(mail) {
         m.read = was_read;
     }
     if let Some(id) = item {
@@ -3789,7 +3789,7 @@ pub fn place_tentative(s: &mut Session, mail: ItemId, msg: &ItipMessage) -> Resu
 }
 
 fn mark_read(s: &mut Session, mail: ItemId) {
-    if let Some(m) = s.mailbox.mail.get_mut(&mail) {
+    if let Some(m) = s.mailbox.mail.get_mut(mail) {
         m.read = true;
     }
 }
@@ -3982,7 +3982,7 @@ pub fn auto_respond_candidates(s: &Session) -> Vec<ItemId> {
     let mut hits: Vec<(i64, ItemId)> = s
         .mailbox
         .mail
-        .values()
+        .items()
         .filter(|m| !m.read)
         .filter(|m| m.attachments.iter().any(|a| is_calendar_type(&a.mime_type) || is_ics_name(&a.filename)))
         .filter(|m| {
@@ -4048,7 +4048,7 @@ fn run_auto_respond(s: &mut Session, p: &Value) -> CmdResult {
         return Ok(json!({ "handled": handled }));
     }
     for mail in ids {
-        if !s.mailbox.mail.contains_key(&mail) {
+        if !s.mailbox.mail.contains(mail) {
             continue;
         }
         let Some(msg) = read_itip(s, mail) else { continue };

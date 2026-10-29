@@ -1794,7 +1794,7 @@ fn paint_columns(
     let painter = ui.painter().clone();
     let line_h = if c.vs.tighter_spacing { COL_ROW - 4.0 } else { COL_ROW };
     let line = Rect::from_min_size(r.min, vec2(r.width(), line_h));
-    let mail = app.s.mailbox.mail.get(&row.id);
+    let mail = app.s.mailbox.mail.get(row.id);
     let conv = row.conversation.as_ref();
     let header = conv.is_some_and(|cv| cv.header);
     let other = conv.is_some_and(|cv| cv.other_folder.is_some());
@@ -2138,14 +2138,14 @@ mod tests {
         let ids: Vec<mailcraft_model::ItemId> = s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
         let newest = s.mailbox.items_in(inbox).iter().map(|m| m.received.unix).max().unwrap();
         for id in &ids {
-            s.mailbox.mail.get_mut(id).unwrap().categories.clear();
+            s.mailbox.mail.get_mut(*id).unwrap().categories.clear();
         }
         // The newest message is in Red and Blue, so it is the first item under the Red header too.
         let both = ids[0];
-        let m = s.mailbox.mail.get_mut(&both).unwrap();
+        let m = s.mailbox.mail.get_mut(both).unwrap();
         m.categories = vec!["Red category".into(), "Blue category".into()];
         m.received.unix = newest + 60;
-        s.mailbox.mail.get_mut(&ids[1]).unwrap().categories = vec!["Red category".into()];
+        s.mailbox.mail.get_mut(ids[1]).unwrap().categories = vec!["Red category".into()];
         s.run("view.arrangeBy", &json!({"key": "categories"})).unwrap();
         let _ = s.run("view.sort", &json!({"order": "ascending"}));
         assert_eq!(queries::group_items(&s, "Red category").first(), Some(&both));
@@ -2186,7 +2186,7 @@ mod tests {
         let mut h = harness(App::new(s), vec2(420.0, 1400.0));
         h.run();
         h.state_mut().run("nav.selectItem", json!({"id": first.0}));
-        let subject = h.state().s.mailbox.mail[&first].subject.clone();
+        let subject = h.state().s.mailbox.mail.get(first).unwrap().subject.clone();
         h.query_all_by_label_contains(&format!("Subject {subject}")).next().unwrap().click();
         h.run();
         for (mods, key) in [
@@ -2199,7 +2199,7 @@ mod tests {
             let st = &h.state().s;
             assert_eq!(st.selection.folder, folder, "{key:?} keeps the search results");
             let focus = st.selection.focus.unwrap();
-            assert!(st.mailbox.mail.contains_key(&focus), "{key:?} stays on mail");
+            assert!(st.mailbox.mail.contains(focus), "{key:?} stays on mail");
             assert_eq!(Some(&focus), mail.last());
         }
     }
@@ -2264,7 +2264,7 @@ mod tests {
             .map(|m| (*m).clone())
             .unwrap();
         let now = s.now().unix;
-        let base = s.mailbox.mail.keys().map(|k| k.0).max().unwrap_or(0) + 1;
+        let base = s.mailbox.mail.ids().map(|k| k.0).max().unwrap_or(0) + 1;
         for i in 0..3000u64 {
             let mut m = template.clone();
             m.id = mailcraft_model::ItemId(base + i);
@@ -2380,7 +2380,7 @@ mod tests {
             .into_iter()
             .map(|(id, _)| id)
             .find(|id| {
-                app.s.mailbox.mail.get(&mailcraft_model::ItemId(*id)).is_some_and(|m| m.categories.is_empty())
+                app.s.mailbox.mail.get(mailcraft_model::ItemId(*id)).is_some_and(|m| m.categories.is_empty())
             })
             .unwrap();
         let category = mailcraft_engine::cmd::categories::quick_click_category(&app.s).unwrap();
@@ -2397,14 +2397,14 @@ mod tests {
                     .s
                     .mailbox
                     .mail
-                    .get(&mailcraft_model::ItemId(**id))
+                    .get(mailcraft_model::ItemId(**id))
                     .is_some_and(|m| m.categories.is_empty())
             })
             .position(|id| *id == target)
             .unwrap();
         h.query_all_by_label("No Categories").nth(nth).unwrap().click();
         h.run();
-        let m = h.state().s.mailbox.mail.get(&mailcraft_model::ItemId(target)).unwrap();
+        let m = h.state().s.mailbox.mail.get(mailcraft_model::ItemId(target)).unwrap();
         assert!(m.categories.iter().any(|c| c.eq_ignore_ascii_case(&category)));
     }
 
@@ -2553,7 +2553,7 @@ mod tests {
         h.key_press(Key::ArrowDown);
         h.run();
         assert_eq!(h.state().s.selection.focus.map(|f| f.0), Some(s1), "the Sent Items child");
-        assert_eq!(h.state().s.mailbox.mail.get(&mailcraft_model::ItemId(s1)).map(|m| m.folder), {
+        assert_eq!(h.state().s.mailbox.mail.get(mailcraft_model::ItemId(s1)).map(|m| m.folder), {
             let st = &h.state().s;
             st.mailbox.role_folder(st.current_account().unwrap(), FolderRole::SentItems)
         });

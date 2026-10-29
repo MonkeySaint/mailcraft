@@ -505,8 +505,8 @@ fn status_bar_shows_outbox_offline_and_retry() {
     let id = add_local_imap(&mut app, "pat@example.net");
     // One message waiting in the new account's Outbox.
     let outbox = app.s.mailbox.role_folder(AccountId(id), FolderRole::Outbox).unwrap();
-    let item = *app.s.mailbox.mail.keys().next().unwrap();
-    app.s.mailbox.mail.get_mut(&item).unwrap().folder = outbox;
+    let item = app.s.mailbox.mail.ids().next().unwrap();
+    app.s.mailbox.mail.get_mut(item).unwrap().folder = outbox;
     app.s.view.work_offline = true;
     app.s.poll_sync();
     let mut h = status_harness(app);
@@ -530,7 +530,7 @@ fn status_bar_shows_outbox_offline_and_retry() {
             |n| matches!(n, mailcraft_engine::Notice::OpenDialog(name, _) if name == "sendReceiveProgress"),
         );
     assert!(progress, "clicking the error opens Send/Receive Progress");
-    assert_eq!(h.state().s.mailbox.mail.get(&ItemId(item.0)).map(|m| m.folder), Some(outbox));
+    assert_eq!(h.state().s.mailbox.mail.get(ItemId(item.0)).map(|m| m.folder), Some(outbox));
 }
 
 /// Puts the status of account `id` in the middle of a first download (as the worker reports it).

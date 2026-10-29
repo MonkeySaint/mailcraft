@@ -20,7 +20,7 @@
 //! Interface (frozen for commit 2): [`Store`], [`Op`], [`StoreError`], [`import_maildir`], [`import_mbox`],
 //! [`export_mbox`]. Additions: [`Autosave`], [`Store::import_eml`], [`Store::export_mbox`],
 //! [`Store::checkpoint_mut`], [`Store::load_report`], [`Store::raw_of`], [`Store::gc_blobs`], [`Op::apply`],
-//! [`Store::journal_bytes`], [`Store::keep_alive`], [`Store::append_keyed`].
+//! [`Store::journal_bytes`], [`Store::keep_alive`], [`Store::append_keyed`], [`MailRepo`] (storage stage S2).
 //!
 //! Size caps (issue #25): every file is written under the same cap its reader applies, so a profile can never
 //! hold a snapshot, journal or recoverable-items file it would refuse to open. A write past the cap fails with
@@ -32,6 +32,7 @@ pub mod import;
 pub mod journal;
 pub mod lock;
 pub mod mbox;
+pub mod repo;
 mod time;
 
 #[cfg(test)]
@@ -49,6 +50,7 @@ pub use autosave::Autosave;
 pub use blob::BlobKey;
 pub use import::MaildirFlags;
 pub use journal::Repair;
+pub use repo::{MailRepo, Shared};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -98,7 +100,7 @@ impl Op {
                 mb.mail.insert(item.id, *item);
             }
             Op::RemoveMail(id) => {
-                mb.mail.remove(&id);
+                mb.mail.remove(id);
             }
             Op::PutFolder(folder) => {
                 mb.next_id = mb.next_id.max(folder.id.0);
@@ -269,7 +271,7 @@ impl Store {
         let res = self.write_checkpoint(mb);
         if !drop_raw {
             for (id, raw) in raws {
-                if let Some(item) = mb.mail.get_mut(&id) {
+                if let Some(item) = mb.mail.get_mut(id) {
                     item.raw = Some(raw);
                 }
             }
@@ -312,13 +314,13 @@ impl Store {
                         break;
                     }
                 }
-                raws.push((*id, raw));
+                raws.push((id, raw));
             }
         }
         if let Some(e) = failure {
             // Leave the caller's mailbox as it was.
             for (id, raw) in raws {
-                if let Some(item) = mb.mail.get_mut(&id) {
+                if let Some(item) = mb.mail.get_mut(id) {
                     item.raw = Some(raw);
                 }
             }
@@ -340,11 +342,11 @@ impl Store {
                 }
                 Ok(Some(Op::PutMail(Box::new(copy))))
             }
-            Op::Replace(mb) if mb.mail.values().any(|m| m.raw.is_some()) => {
+            Op::Replace(mb) if mb.mail.items().any(|m| m.raw.is_some()) => {
                 let mut copy = (**mb).clone();
                 let moved = self.strip_raws(&mut copy)?;
                 for (id, _) in moved {
-                    if let Some(key) = copy.mail.get(&id).and_then(|m| m.blob.clone()) {
+                    if let Some(key) = copy.mail.get(id).and_then(|m| m.blob.clone()) {
                         keys.push((id, key));
                     }
                 }
@@ -573,7 +575,7 @@ impl Store {
     pub fn gc_blobs(&mut self, mb: &Mailbox) -> Result<usize> {
         // A bin that cannot be read keeps every blob (nothing it may still need is removed).
         let bin = self.load_recoverable()?;
-        let mut live: BTreeSet<&str> = mb.mail.values().filter_map(|m| m.blob.as_deref()).collect();
+        let mut live: BTreeSet<&str> = mb.mail.items().filter_map(|m| m.blob.as_deref()).collect();
         live.extend(bin.items.iter().filter_map(|e| match &e.item {
             DeletedItem::Mail(m) => m.blob.as_deref(),
             _ => None,
@@ -582,7 +584,7 @@ impl Store {
         // never saw (`append` / `checkpoint` set it on their own copy): every probe of that content is live.
         let live_content: BTreeSet<(u64, u64)> = mb
             .mail
-            .values()
+            .items()
             .filter_map(|m| m.raw.as_deref())
             .map(|raw| {
                 let k = BlobKey::for_data(raw);

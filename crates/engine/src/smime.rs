@@ -757,7 +757,7 @@ pub(crate) fn protect_for_send(
 /// True when a draft of `c` must be stored encrypted: Encrypt is on, or it answers or forwards an encrypted
 /// message (its quoted text came from the opened message).
 pub(crate) fn draft_must_be_encrypted(s: &Session, c: &ComposeState) -> bool {
-    c.encrypt || c.source.and_then(|id| s.mailbox.mail.get(&id)).is_some_and(|m| is_encrypted(s, m))
+    c.encrypt || c.source.and_then(|id| s.mailbox.mail.get(id)).is_some_and(|m| is_encrypted(s, m))
 }
 
 /// The draft `raw` encrypted to the user's own digital ID for `from` (only the user can open it; nothing is
@@ -784,7 +784,7 @@ pub(crate) fn protect_draft(s: &mut Session, from: &str, raw: Vec<u8>) -> Result
 pub(crate) fn compose_defaults(s: &Session, c: &mut ComposeState) {
     c.sign |= s.settings.bool("trust.smime.sign");
     c.encrypt |= s.settings.bool("trust.smime.encrypt");
-    if let Some(src) = c.source.and_then(|id| s.mailbox.mail.get(&id))
+    if let Some(src) = c.source.and_then(|id| s.mailbox.mail.get(id))
         && is_encrypted(s, src)
     {
         c.encrypt = true;
@@ -835,7 +835,7 @@ fn source_key(m: &MailItem) -> u64 {
 
 /// The opened form of S/MIME item `id` (None for other mail), cached in memory.
 pub fn view(s: &Session, id: ItemId) -> Option<Arc<View>> {
-    let m = s.mailbox.mail.get(&id)?;
+    let m = s.mailbox.mail.get(id)?;
     if !is_smime(m) {
         return None;
     }
@@ -917,7 +917,7 @@ fn build_view(s: &Session, m: &MailItem, opened: Opened) -> View {
 pub fn display_item(s: &Session, id: ItemId) -> Option<std::borrow::Cow<'_, MailItem>> {
     match view(s, id) {
         Some(v) => Some(std::borrow::Cow::Owned(v.item.clone())),
-        None => s.mailbox.mail.get(&id).map(std::borrow::Cow::Borrowed),
+        None => s.mailbox.mail.get(id).map(std::borrow::Cow::Borrowed),
     }
 }
 
@@ -991,7 +991,7 @@ pub fn on_view(s: &mut Session, id: ItemId) {
 /// New mail: signed messages teach the senders' certificates (for encrypted replies later).
 pub(crate) fn on_new_mail(s: &mut Session, ids: &[ItemId]) {
     let signed: Vec<ItemId> =
-        ids.iter().copied().filter(|i| s.mailbox.mail.get(i).is_some_and(is_smime)).take(500).collect();
+        ids.iter().copied().filter(|i| s.mailbox.mail.get(*i).is_some_and(is_smime)).take(500).collect();
     if signed.is_empty() {
         return;
     }
@@ -1260,7 +1260,7 @@ fn trust_certificate(s: &mut Session, p: &Value) -> CmdResult {
 
 /// The signer's chain of message `id` (signer first), from its signature.
 fn signer_chain(s: &Session, id: ItemId) -> Vec<Cert> {
-    let Some(m) = s.mailbox.mail.get(&id) else { return Vec::new() };
+    let Some(m) = s.mailbox.mail.get(id) else { return Vec::new() };
     let raw = crate::cmd::file::raw_source(s, m);
     let ids = identities(s);
     let anchors = anchors(s);
@@ -1360,7 +1360,7 @@ mod tests {
     }
 
     fn raw_of(s: &Session, id: ItemId) -> Vec<u8> {
-        s.mailbox.mail[&id].raw.clone().unwrap()
+        s.mailbox.mail.get(id).unwrap().raw.clone().unwrap()
     }
 
     #[test]
@@ -1668,7 +1668,7 @@ mod tests {
         bob.fixed_now = Some(DateTime { unix: now.unix + 120, offset_min: now.offset_min });
         let r = bob.run("compose.autoSaveTick", &json!({})).unwrap();
         let draft = ItemId(r["saved"][0]["draft"].as_u64().unwrap());
-        let stored = &bob.mailbox.mail[&draft];
+        let stored = bob.mailbox.mail.get(draft).unwrap();
         assert!(stored.is_draft);
         assert!(String::from_utf8_lossy(&raw_of(&bob, draft)).contains("smime-type=enveloped-data"));
         for secret in ["old mill", "Noon works"] {
@@ -1676,7 +1676,7 @@ mod tests {
             for op in &bob.pending_ops {
                 let leaked = match op {
                     mailcraft_store::Op::PutMail(m) => holds(m, secret),
-                    mailcraft_store::Op::Replace(mb) => mb.mail.values().any(|m| holds(m, secret)),
+                    mailcraft_store::Op::Replace(mb) => mb.mail.items().any(|m| holds(m, secret)),
                     _ => false,
                 };
                 assert!(!leaked, "the journal holds `{secret}`");
@@ -1687,10 +1687,10 @@ mod tests {
         // Saving explicitly, and Close All Items, keep it encrypted too.
         bob.run("compose.insertText", &json!({"compose": cid, "text": "See you."})).unwrap();
         bob.run("compose.saveDraft", &json!({"compose": cid})).unwrap();
-        assert!(!holds(&bob.mailbox.mail[&draft], "See you."));
+        assert!(!holds(bob.mailbox.mail.get(draft).unwrap(), "See you."));
         bob.run("compose.insertText", &json!({"compose": cid, "text": " Bye."})).unwrap();
         bob.run("app.closeAllItems", &json!({"save": true})).unwrap();
-        assert!(!holds(&bob.mailbox.mail[&draft], "Bye."));
+        assert!(!holds(bob.mailbox.mail.get(draft).unwrap(), "Bye."));
         assert!(display_item(&bob, draft).unwrap().body_text().contains("Bye."));
 
         // Without a digital ID to keep it encrypted with, the draft is not saved at all (the window stays
@@ -1701,7 +1701,7 @@ mod tests {
         s.run("compose.encrypt", &json!({"compose": c, "on": true})).unwrap();
         let e = s.run("compose.saveDraft", &json!({"compose": c})).unwrap_err();
         assert!(e.to_string().contains("not saved"), "{e}");
-        assert!(s.mailbox.mail.values().all(|m| !holds(m, "Merger terms")));
+        assert!(s.mailbox.mail.items().all(|m| !holds(m, "Merger terms")));
         assert!(s.composes[&c].dirty);
     }
 

@@ -83,7 +83,7 @@ fn create_rule_end_to_end() {
         .s
         .mailbox
         .mail
-        .get(&ItemId(item))
+        .get(ItemId(item))
         .and_then(|m| m.from.clone())
         .map(|f| f.display().to_owned())
         .unwrap();
@@ -117,7 +117,7 @@ fn create_rule_end_to_end() {
     assert!(matches!(&rule.conditions[..], [RuleCondition::From(_)]));
     assert_eq!(rule.actions, vec![RuleAction::MoveTo(FolderId(target))]);
     // Run now moved the selected message.
-    assert_eq!(app.s.mailbox.mail.get(&ItemId(item)).map(|m| m.folder.0), Some(target));
+    assert_eq!(app.s.mailbox.mail.get(ItemId(item)).map(|m| m.folder.0), Some(target));
 }
 
 #[test]
@@ -227,7 +227,7 @@ fn move_to_folder_picker_moves_the_selection() {
     h.get_by_label("OK").click();
     step(&mut h);
     assert!(names(&h).is_empty());
-    assert_eq!(h.state().s.mailbox.mail.get(&ItemId(item)).map(|m| m.folder.0), Some(target));
+    assert_eq!(h.state().s.mailbox.mail.get(ItemId(item)).map(|m| m.folder.0), Some(target));
 }
 
 #[test]
@@ -245,7 +245,7 @@ fn always_move_conversation_can_be_stopped_from_its_dialog() {
     step(&mut h);
     assert!(names(&h).is_empty());
     let marked =
-        |h: &Harness<'_, App>| h.state().s.mailbox.mail.get(&ItemId(item)).and_then(|m| m.always_move_to);
+        |h: &Harness<'_, App>| h.state().s.mailbox.mail.get(ItemId(item)).and_then(|m| m.always_move_to);
     assert_eq!(marked(&h), Some(FolderId(target)));
     // Opened again: it says where the conversation goes and unticking the box stops it.
     h.state_mut().run("mail.alwaysMoveConversation", json!({"ids": [item]})).unwrap();
@@ -260,7 +260,7 @@ fn always_move_conversation_can_be_stopped_from_its_dialog() {
     assert!(names(&h).is_empty());
     assert_eq!(marked(&h), None);
     // The message already moved stays where it went.
-    assert_eq!(h.state().s.mailbox.mail.get(&ItemId(item)).map(|m| m.folder.0), Some(target));
+    assert_eq!(h.state().s.mailbox.mail.get(ItemId(item)).map(|m| m.folder.0), Some(target));
 }
 
 #[test]
@@ -296,7 +296,7 @@ fn color_categories_new_category_is_assigned() {
     step(&mut h);
     let app = h.state();
     assert!(app.s.mailbox.categories.iter().any(|c| c.name == "Urgent"));
-    assert!(app.s.mailbox.mail.get(&ItemId(item)).unwrap().categories.iter().any(|c| c == "Urgent"));
+    assert!(app.s.mailbox.mail.get(ItemId(item)).unwrap().categories.iter().any(|c| c == "Urgent"));
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn custom_flag_sets_label_and_due() {
     h.get_by_label("OK").click();
     step(&mut h);
     assert!(names(&h).is_empty(), "{:?}", names(&h));
-    match &h.state().s.mailbox.mail.get(&ItemId(item)).unwrap().flag {
+    match &h.state().s.mailbox.mail.get(ItemId(item)).unwrap().flag {
         FlagState::Flagged { label, due, .. } => {
             assert_eq!(label, "Follow up");
             assert!(due.is_some());
@@ -667,10 +667,10 @@ fn read_window_backstage_acts_on_its_own_message() {
         .s
         .mailbox
         .mail
-        .values()
+        .items()
         .find_map(|m| m.attachments.first().map(|a| (m.id, a.filename.clone())))
         .expect("sample has an attachment");
-    let other = app.s.mailbox.mail.values().find(|m| !m.has_attachments()).map(|m| m.id).unwrap();
+    let other = app.s.mailbox.mail.items().find(|m| !m.has_attachments()).map(|m| m.id).unwrap();
     app.s.selection.items = vec![other];
     app.s.selection.focus = Some(other);
     // Alt, F in a read window opens its backstage; the window does not host it, so the main window shows it.
@@ -725,7 +725,7 @@ fn ignore_prompt_offers_dont_ask_again() {
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Ignore Conversation").click();
     step(&mut h);
     let app = h.state();
-    assert!(app.s.mailbox.mail[&ItemId(item)].ignored);
+    assert!(app.s.mailbox.mail.get(ItemId(item)).unwrap().ignored);
     assert!(app.s.settings.bool(mailcraft_engine::cmd::mail::IGNORE_DONT_ASK));
 }
 
@@ -1175,7 +1175,7 @@ fn custom_flag_due_date_from_the_month_picker() {
     step(&mut h);
     h.get_by_label("OK").click();
     step(&mut h);
-    match &h.state().s.mailbox.mail.get(&ItemId(item)).unwrap().flag {
+    match &h.state().s.mailbox.mail.get(ItemId(item)).unwrap().flag {
         FlagState::Flagged { due: Some(d), .. } => {
             let tz = h.state().s.tz_offset_min;
             assert_eq!(mailcraft_model::dates::LocalTime::of(*d, tz).day, 15);

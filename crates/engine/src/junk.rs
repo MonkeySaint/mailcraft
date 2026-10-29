@@ -139,7 +139,7 @@ fn context_for(s: &Session, item: &MailItem, contacts: &[String]) -> JunkContext
 
 /// The verdict for one item under the current settings.
 pub fn classify(s: &Session, id: ItemId) -> Option<Verdict> {
-    let item = s.mailbox.mail.get(&id)?;
+    let item = s.mailbox.mail.get(id)?;
     let contacts = contact_addresses(s);
     Some(junk::classify(&s.mailbox.junk, item, &context_for(s, item, &contacts)))
 }
@@ -160,7 +160,7 @@ pub fn verdict_json(id: ItemId, v: &Verdict) -> Value {
 // Filtering
 
 fn role_of(s: &Session, id: ItemId) -> Option<FolderRole> {
-    s.mailbox.mail.get(&id).and_then(|m| s.mailbox.folder(m.folder)).and_then(|f| f.role)
+    s.mailbox.mail.get(id).and_then(|m| s.mailbox.folder(m.folder)).and_then(|f| f.role)
 }
 
 /// Folders the filter never touches (the user's own mail and the junk/trash bins).
@@ -187,14 +187,14 @@ pub fn filter_items(s: &mut Session, ids: &[ItemId]) -> FilterReport {
         if exempt(role_of(s, id)) {
             continue;
         }
-        let Some(item) = s.mailbox.mail.get(&id) else { continue };
+        let Some(item) = s.mailbox.mail.get(id) else { continue };
         report.checked = report.checked.saturating_add(1);
         let verdict = junk::classify(&s.mailbox.junk, item, &context_for(s, item, &contacts));
         if !verdict.junk {
             continue;
         }
         if s.mailbox.junk.delete_suspected {
-            if s.mailbox.mail.remove(&id).is_some() {
+            if s.mailbox.mail.remove(id).is_some() {
                 report.deleted.push(id);
             }
             continue;
@@ -202,7 +202,7 @@ pub fn filter_items(s: &mut Session, ids: &[ItemId]) -> FilterReport {
         let dest = s
             .mailbox
             .mail
-            .get(&id)
+            .get(id)
             .and_then(|m| s.mailbox.folder_account(m.folder))
             .and_then(|a| s.mailbox.role_folder(a, FolderRole::JunkEmail));
         if let Some(dest) = dest
@@ -231,7 +231,7 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> FilterReport {
 
 /// Run Junk Filter over every message in `folder`.
 pub fn run_filter(s: &mut Session, folder: FolderId) -> FilterReport {
-    let ids: Vec<ItemId> = s.mailbox.mail.values().filter(|m| m.folder == folder).map(|m| m.id).collect();
+    let ids: Vec<ItemId> = s.mailbox.mail.in_folder(folder).map(|m| m.id).collect();
     filter_items(s, &ids)
 }
 
@@ -243,7 +243,7 @@ pub fn on_sent(s: &mut Session, ids: &[ItemId]) -> usize {
     }
     let addrs: Vec<String> = ids
         .iter()
-        .filter_map(|id| s.mailbox.mail.get(id))
+        .filter_map(|id| s.mailbox.mail.get(*id))
         .flat_map(|m| m.to.iter().chain(m.cc.iter()).chain(m.bcc.iter()))
         .map(|a| a.addr.clone())
         .collect();
@@ -270,7 +270,7 @@ pub fn sender_warning(s: &Session, id: ItemId) -> Option<&'static str> {
     if !s.mailbox.junk.warn_suspicious_domains {
         return None;
     }
-    let item = s.mailbox.mail.get(&id)?;
+    let item = s.mailbox.mail.get(id)?;
     junk::suspicious_domain(&item.from.as_ref()?.addr)
 }
 
@@ -349,7 +349,7 @@ mod tests {
         assert!(!ids.is_empty());
         let prize = ids
             .iter()
-            .find(|i| s.mailbox.mail.get(i).is_some_and(|m| m.subject.contains("WON")))
+            .find(|i| s.mailbox.mail.get(**i).is_some_and(|m| m.subject.contains("WON")))
             .copied()
             .unwrap();
         let v = classify(&s, prize).unwrap();
@@ -377,10 +377,10 @@ mod tests {
         assert_eq!(r.checked, 4);
         let j = junkf(&s);
         let i = inbox(&s);
-        assert_eq!(s.mailbox.mail[&blocked].folder, j);
-        assert_eq!(s.mailbox.mail[&spam].folder, j);
-        assert_eq!(s.mailbox.mail[&safe].folder, i);
-        assert_eq!(s.mailbox.mail[&normal].folder, i);
+        assert_eq!(s.mailbox.mail.get(blocked).unwrap().folder, j);
+        assert_eq!(s.mailbox.mail.get(spam).unwrap().folder, j);
+        assert_eq!(s.mailbox.mail.get(safe).unwrap().folder, i);
+        assert_eq!(s.mailbox.mail.get(normal).unwrap().folder, i);
         assert_eq!(r.moved.len(), 2);
         assert!(links_disabled(&s, spam));
         assert!(!links_disabled(&s, normal));
@@ -396,10 +396,10 @@ mod tests {
         let id = deliver(&mut s, "a@example.org", "Hi", "x", None);
         let a = s.current_account().unwrap();
         let sent = s.mailbox.role_folder(a, FolderRole::SentItems).unwrap();
-        s.mailbox.mail.get_mut(&id).unwrap().folder = sent;
+        s.mailbox.mail.get_mut(id).unwrap().folder = sent;
         assert_eq!(on_new_mail(&mut s, &[id]).checked, 0);
         assert_eq!(filter_items(&mut s, &[id]).checked, 0);
-        assert_eq!(s.mailbox.mail[&id].folder, sent);
+        assert_eq!(s.mailbox.mail.get(id).unwrap().folder, sent);
     }
 
     #[test]
@@ -412,7 +412,7 @@ mod tests {
         s.selection.focus = Some(id);
         let r = on_new_mail(&mut s, &[id]);
         assert_eq!(r.deleted, vec![id]);
-        assert!(!s.mailbox.mail.contains_key(&id));
+        assert!(!s.mailbox.mail.contains(id));
         assert!(s.selection.focus.is_none());
     }
 
@@ -429,7 +429,10 @@ mod tests {
         let raw = "From: b@example.org\r\nList-Post: <mailto:Team@Lists.Example.org?subject=x>\r\n\r\nhi\r\n";
         s.mailbox.junk.level = JunkLevel::SafeListsOnly;
         let id = deliver(&mut s, "b@example.org", "x", "hi", Some(raw));
-        assert_eq!(list_address(&s, &s.mailbox.mail[&id]).as_deref(), Some("team@lists.example.org"));
+        assert_eq!(
+            list_address(&s, s.mailbox.mail.get(id).unwrap()).as_deref(),
+            Some("team@lists.example.org")
+        );
         assert!(classify(&s, id).unwrap().junk);
         s.mailbox.junk.add(JunkList::SafeRecipients, "team@lists.example.org").unwrap();
         assert!(!classify(&s, id).unwrap().junk);
@@ -475,7 +478,7 @@ mod tests {
         let before = s.mailbox.mail.len();
         let a = deliver(&mut s, "x@spam.example.net", "x", "y", None);
         let b = deliver(&mut s, "promo@example.org", "YOU HAVE WON!!!", "act now, claim your prize", None);
-        let all: Vec<ItemId> = s.mailbox.mail.keys().copied().collect();
+        let all: Vec<ItemId> = s.mailbox.mail.ids().collect();
         for level in JunkLevel::ALL {
             s.mailbox.junk.level = level;
             assert!(on_new_mail(&mut s, &[a, b]).deleted.is_empty());
@@ -490,7 +493,7 @@ mod tests {
         let c = deliver(&mut s, "y@spam.example.net", "x", "y", None);
         let r = on_new_mail(&mut s, &[c]);
         assert!(r.moved.is_empty() && r.deleted.is_empty());
-        assert_eq!(s.mailbox.mail[&c].folder, inbox(&s));
+        assert_eq!(s.mailbox.mail.get(c).unwrap().folder, inbox(&s));
     }
 
     #[test]

@@ -116,7 +116,7 @@ pub(crate) fn build_search(s: &Session, a: &Account, req: &super::older::Request
     let known: BTreeSet<String> = s
         .mailbox
         .mail
-        .values()
+        .items()
         .filter(|m| s.mailbox.folder(m.folder).is_some_and(|f| f.account == a.id))
         .filter_map(|m| m.remote_id.clone())
         .collect();
@@ -220,7 +220,7 @@ pub(crate) fn build_job(
         ..Default::default()
     };
     let mut here: BTreeSet<&str> = BTreeSet::new();
-    for m in s.mailbox.mail.values() {
+    for m in s.mailbox.mail.items() {
         let Some(f) = s.mailbox.folder(m.folder).filter(|f| f.account == a.id && f.kind == FolderKind::Mail)
         else {
             continue;
@@ -581,15 +581,9 @@ fn folder_of(s: &Session, account: AccountId, mailbox: &str) -> Option<FolderId>
         .map(|f| f.id)
 }
 
+/// The item of `account` whose JMAP email id is `id` (email ids are per account, not per mailbox).
 fn item_of(s: &Session, account: AccountId, id: &str) -> Option<ItemId> {
-    s.mailbox
-        .mail
-        .values()
-        .find(|m| {
-            m.remote_id.as_deref() == Some(id)
-                && s.mailbox.folder(m.folder).is_some_and(|f| f.account == account)
-        })
-        .map(|m| m.id)
+    first_item(&s.mailbox, &account_scope(&s.mailbox, account), |m| m.remote_id.as_deref() == Some(id))
 }
 
 fn apply_keywords(m: &mut MailItem, k: &[String], now: mailcraft_model::DateTime) {
@@ -705,7 +699,7 @@ fn apply_emails(s: &mut Session, account: AccountId, list: Vec<JEmail>, new_inbo
         let shadow = JmapShadow { mailbox, keywords: e.keywords.clone() };
         match item_of(s, account, &e.id) {
             Some(id) => {
-                if let Some(m) = s.mailbox.mail.get_mut(&id) {
+                if let Some(m) = s.mailbox.mail.get_mut(id) {
                     if m.folder != folder {
                         m.folder = folder;
                     }
@@ -717,17 +711,9 @@ fn apply_emails(s: &mut Session, account: AccountId, list: Vec<JEmail>, new_inbo
                 let Some(raw) = &e.raw else { continue };
                 let mut item = mailcraft_store::import::item_from_raw(raw, folder, now);
                 // A local copy waiting for this message (sent here, filed by the server): adopt it.
-                let adopt = item.message_id.as_ref().and_then(|mid| {
-                    s.mailbox
-                        .mail
-                        .values()
-                        .find(|m| {
-                            m.folder == folder && m.remote_id.is_none() && m.message_id.as_ref() == Some(mid)
-                        })
-                        .map(|m| m.id)
-                });
+                let adopt = item.message_id.as_deref().and_then(|mid| local_copy(&s.mailbox, folder, mid));
                 if let Some(local) = adopt {
-                    if let Some(m) = s.mailbox.mail.get_mut(&local) {
+                    if let Some(m) = s.mailbox.mail.get_mut(local) {
                         m.remote_id = Some(e.id.clone());
                     }
                 } else {
@@ -755,7 +741,7 @@ pub(crate) fn apply(s: &mut Session, account: AccountId, ev: JmapEvent, new_inbo
         JmapEvent::Gone { ids } => {
             for id in &ids {
                 if let Some(item) = item_of(s, account, id) {
-                    s.mailbox.mail.remove(&item);
+                    s.mailbox.mail.remove(item);
                     s.sync.track.removed.insert(item);
                 }
             }
@@ -775,7 +761,7 @@ pub(crate) fn apply(s: &mut Session, account: AccountId, ev: JmapEvent, new_inbo
             }
         }
         JmapEvent::Imported { item, id, shadow } => {
-            if let Some(m) = s.mailbox.mail.get_mut(&item) {
+            if let Some(m) = s.mailbox.mail.get_mut(item) {
                 m.remote_id = Some(id.clone());
                 prefs(s).jmap.entry(account.0).or_default().shadow.insert(id, shadow);
             }
@@ -807,7 +793,7 @@ pub(crate) fn changed(before: &Mailbox, after: &Mailbox, account: AccountId) -> 
             && a.is_draft == b.is_draft
     };
     before.mail.iter().any(|(id, b)| in_acct(before, b) && after.mail.get(id).is_none_or(|a| !same(a, b)))
-        || after.mail.iter().any(|(id, a)| in_acct(after, a) && !before.mail.contains_key(id))
+        || after.mail.iter().any(|(id, a)| in_acct(after, a) && !before.mail.contains(id))
 }
 
 #[cfg(test)]

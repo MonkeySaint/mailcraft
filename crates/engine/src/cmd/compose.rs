@@ -729,7 +729,7 @@ pub(crate) fn build_message(
     b.subject = c.subject.clone();
     b.date = Some(c.delay_until.unwrap_or_else(|| s.now()));
     if matches!(c.kind, ComposeKind::Reply | ComposeKind::ReplyAll)
-        && let Some(src) = c.source.and_then(|id| s.mailbox.mail.get(&id))
+        && let Some(src) = c.source.and_then(|id| s.mailbox.mail.get(id))
         && let Some(mid) = &src.message_id
     {
         b.in_reply_to = vec![mid.clone()];
@@ -964,7 +964,7 @@ fn item_from_raw(b: &MessageBuilder, raw: Vec<u8>, now: DateTime) -> (MailItem, 
 pub fn save_draft(s: &mut Session, cid: u64) -> Result<ItemId, CmdError> {
     let c = s.composes.get(&cid).cloned().ok_or_else(|| CmdError::Disabled(NO_COMPOSE.into()))?;
     let account = sending_account(s, &c, false);
-    let existing = c.draft.and_then(|d| s.mailbox.mail.get(&d)).map(|m| (m.id, m.folder));
+    let existing = c.draft.and_then(|d| s.mailbox.mail.get(d)).map(|m| (m.id, m.folder));
     let drafts = match existing {
         Some((_, f)) => Some(f),
         None => {
@@ -1147,9 +1147,9 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     // Auto-Complete list (most recently used first).
     s.mailbox.record_recipients(&c.recipients(), now);
     if let Some(d) = c.draft {
-        s.mailbox.mail.remove(&d);
+        s.mailbox.mail.remove(d);
     }
-    if let Some(src) = c.source.and_then(|sid| s.mailbox.mail.get_mut(&sid)) {
+    if let Some(src) = c.source.and_then(|sid| s.mailbox.mail.get_mut(sid)) {
         match c.kind {
             ComposeKind::Reply => src.response = ResponseState::Replied(now),
             ComposeKind::ReplyAll => src.response = ResponseState::RepliedAll(now),
@@ -1167,7 +1167,7 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     // Rules for sent messages (Cc, defer delivery, sensitivity…) edit the Outbox copy before it goes out.
     crate::rules_exec::on_send(s, &[id]);
     // Delay Delivery or a deferring rule: the message waits in the Outbox until its send time.
-    let deferred = s.mailbox.mail.get(&id).and_then(|m| m.sent).filter(|t| t.unix > now.unix);
+    let deferred = s.mailbox.mail.get(id).and_then(|m| m.sent).filter(|t| t.unix > now.unix);
     // "Send immediately when connected": the account's worker submits the Outbox now (deferred messages
     // wait); otherwise the next send/receive does.
     if deferred.is_none() {
@@ -1244,7 +1244,7 @@ fn discard(s: &mut Session, p: &Value) -> CmdResult {
     let meeting = c.as_ref().and_then(|c| c.pending_meeting);
     let draft = c.and_then(|c| c.draft);
     if let Some(d) = draft {
-        s.mailbox.mail.remove(&d);
+        s.mailbox.mail.remove(d);
     }
     let removed = drop_pending_meeting(s, meeting);
     Ok(json!({"discarded": cid, "draftRemoved": draft.map(|d| d.0), "meetingRemoved": removed.map(|m| m.0)}))
@@ -1701,7 +1701,7 @@ fn item_as_text(s: &Session, id: ItemId) -> Option<String> {
             out.push_str(&format!("{label}: {}\n", value.trim()));
         }
     };
-    if let Some(m) = s.mailbox.mail.get(&id) {
+    if let Some(m) = s.mailbox.mail.get(id) {
         line("From", &m.from.as_ref().map(|f| f.to_display_string()).unwrap_or_default());
         line("Sent", &when(m.received));
         line("To", &m.to.iter().map(|a| a.to_display_string()).collect::<Vec<_>>().join("; "));
@@ -1747,7 +1747,7 @@ fn attach_item(s: &mut Session, p: &Value) -> CmdResult {
         return Ok(json!({"inserted": "text", "chars": text.chars().count()}));
     }
     let now = s.now();
-    let att = if let Some(m) = s.mailbox.mail.get(&id) {
+    let att = if let Some(m) = s.mailbox.mail.get(id) {
         ComposeAttachment {
             filename: safe_name(&m.subject, "message", "eml"),
             mime_type: "message/rfc822".into(),
@@ -3182,13 +3182,13 @@ pub fn strip_submit_headers(raw: &[u8]) -> Vec<u8> {
 ///
 /// Called by the send worker's completion (`sync::message_sent`) before it files the copy itself.
 pub fn file_sent_copy(s: &mut Session, item: ItemId) -> bool {
-    let Some(raw) = s.mailbox.mail.get(&item).and_then(|m| stored_raw(s, m)) else {
+    let Some(raw) = s.mailbox.mail.get(item).and_then(|m| stored_raw(s, m)) else {
         return false;
     };
     let choice = raw_headers(&raw).get(SAVE_SENT_HEADER).map(|v| v.trim().to_ascii_lowercase());
     match choice.as_deref() {
         Some("none") => {
-            s.mailbox.mail.remove(&item);
+            s.mailbox.mail.remove(item);
             true
         }
         Some(v) => {
@@ -3200,7 +3200,7 @@ pub fn file_sent_copy(s: &mut Session, item: ItemId) -> bool {
             let Some(folder) = folder else {
                 return false;
             };
-            let Some(m) = s.mailbox.mail.get_mut(&item) else {
+            let Some(m) = s.mailbox.mail.get_mut(item) else {
                 return false;
             };
             m.folder = folder;
@@ -3431,7 +3431,7 @@ fn vote_of(s: &Session, m: &MailItem, choices: &[String]) -> Option<String> {
 /// so the tally keeps the vote after the response is deleted and Deleted Items is emptied: one record per
 /// responder, the latest kept. Returns the original's id when the response was recorded.
 pub(crate) fn record_vote(s: &mut Session, response: ItemId) -> Option<ItemId> {
-    let x = s.mailbox.mail.get(&response)?;
+    let x = s.mailbox.mail.get(response)?;
     if item_sent_by_me(s, x) {
         return None;
     }
@@ -3439,11 +3439,13 @@ pub(crate) fn record_vote(s: &mut Session, response: ItemId) -> Option<ItemId> {
     if parents.is_empty() {
         return None;
     }
-    let original = s
-        .mailbox
-        .mail
-        .values()
-        .filter(|m| m.id != response)
+    // The Message-ID lookup ignores case; the match on the parent's id stays exact, as it always was.
+    let candidates: std::collections::BTreeSet<ItemId> =
+        parents.iter().flat_map(|p| s.mailbox.mail.by_message_id(p)).collect();
+    let original = candidates
+        .into_iter()
+        .filter(|id| *id != response)
+        .filter_map(|id| s.mailbox.mail.get(id))
         .find(|m| m.message_id.as_deref().map(bare_id).is_some_and(|mid| parents.contains(&mid)))
         .filter(|m| item_sent_by_me(s, m))?;
     let choices = stored_raw(s, original)
@@ -3458,7 +3460,7 @@ pub(crate) fn record_vote(s: &mut Session, response: ItemId) -> Option<ItemId> {
     let when = x.sent.unwrap_or(x.received);
     let id = original.id;
     let record = mailcraft_model::VoteRecord { from, choice, when, response: Some(response) };
-    let o = s.mailbox.mail.get_mut(&id)?;
+    let o = s.mailbox.mail.get_mut(id)?;
     let same = |v: &mailcraft_model::VoteRecord| {
         v.response == Some(response) || (!record.from.is_empty() && v.from.eq_ignore_ascii_case(&record.from))
     };
@@ -3480,7 +3482,7 @@ pub(crate) fn record_vote(s: &mut Session, response: ItemId) -> Option<ItemId> {
 
 /// Tracking state of message `id` (voting buttons and responses, receipts, a pending read-receipt request).
 pub fn tracking(s: &Session, id: ItemId) -> Option<Tracking> {
-    let m = s.mailbox.mail.get(&id)?;
+    let m = s.mailbox.mail.get(id)?;
     let headers = stored_raw(s, m).map(|r| raw_headers(&r)).unwrap_or_default();
     let mut t = Tracking {
         choices: headers.text(VOTING_HEADER).map(|v| voting_choices(&v)).unwrap_or_default(),
@@ -3508,7 +3510,7 @@ pub fn tracking(s: &Session, id: ItemId) -> Option<Tracking> {
     let mut candidates: Vec<&MailItem> = s
         .mailbox
         .mail
-        .values()
+        .items()
         .filter(|x| x.id != id && x.received.unix >= since)
         .filter(|x| {
             let replies = x.in_reply_to.iter().chain(x.references.iter()).any(|r| bare_id(r) == mid);
@@ -3674,7 +3676,7 @@ fn vote(s: &mut Session, p: &Value) -> CmdResult {
     let Some(mut c) = crate::cmd::respond::build_response(s, id, ComposeKind::Reply, false) else {
         return Err(CmdError::Params(format!("no message with id {}", id.0)));
     };
-    let original = s.mailbox.mail.get(&id).map(|m| m.subject.clone()).unwrap_or_default();
+    let original = s.mailbox.mail.get(id).map(|m| m.subject.clone()).unwrap_or_default();
     c.subject = format!("{choice}: {}", mailcraft_model::subject::strip_prefixes(&original));
     c.vote_response = Some(choice.clone());
     if opt_bool(p, "edit") == Some(true) {
@@ -3811,7 +3813,7 @@ fn send_read_receipt(s: &mut Session, p: &Value) -> CmdResult {
     let Some(outbox) = s.mailbox.role_folder(account.id, FolderRole::Outbox) else {
         return Err(CmdError::Failed(format!("The account {} has no Outbox folder.", account.address)));
     };
-    let Some(m) = s.mailbox.mail.get(&id).cloned() else {
+    let Some(m) = s.mailbox.mail.get(id).cloned() else {
         return Err(CmdError::Params(format!("no message with id {}", id.0)));
     };
     let name = if account.sender_name.trim().is_empty() {
@@ -4360,7 +4362,7 @@ pub(crate) mod tests {
     fn folder_items(s: &Session, role: FolderRole) -> Vec<&MailItem> {
         s.mailbox
             .mail
-            .values()
+            .items()
             .filter(|m| s.mailbox.folder(m.folder).is_some_and(|f| f.role == Some(role)))
             .collect()
     }
@@ -4443,7 +4445,7 @@ pub(crate) mod tests {
         let m = folder_items(&s, FolderRole::Outbox)[0];
         assert!(m.body.html.is_none());
         assert_eq!(m.in_reply_to, vec!["q@x".to_string()]);
-        assert!(matches!(s.mailbox.mail[&src].response, ResponseState::Replied(_)));
+        assert!(matches!(s.mailbox.mail.get(src).unwrap().response, ResponseState::Replied(_)));
     }
 
     #[test]
@@ -4455,12 +4457,12 @@ pub(crate) mod tests {
         s.run("compose.setSubject", &json!({"value": "Draft 2"})).unwrap();
         let d2 = s.run("compose.saveDraft", &json!({})).unwrap()["draft"].as_u64().unwrap();
         assert_eq!(d1, d2);
-        assert_eq!(s.mailbox.mail[&ItemId(d1)].subject, "Draft 2");
-        assert!(s.mailbox.mail[&ItemId(d1)].is_draft);
+        assert_eq!(s.mailbox.mail.get(ItemId(d1)).unwrap().subject, "Draft 2");
+        assert!(s.mailbox.mail.get(ItemId(d1)).unwrap().is_draft);
         assert!(s.composes.contains_key(&id), "save keeps compose open");
         s.run("compose.discard", &json!({})).unwrap();
         assert!(s.composes.is_empty());
-        assert!(!s.mailbox.mail.contains_key(&ItemId(d1)));
+        assert!(!s.mailbox.mail.contains(ItemId(d1)));
     }
 
     #[test]
@@ -4546,7 +4548,7 @@ pub(crate) mod tests {
         // After sending, Do Not Save drops the copy.
         let id = folder_items(&s, FolderRole::Outbox)[0].id;
         assert!(file_sent_copy(&mut s, id));
-        assert!(!s.mailbox.mail.contains_key(&id));
+        assert!(!s.mailbox.mail.contains(id));
 
         // Other Folder: the copy moves there without the submission-only headers.
         let inbox = folder_of(&s, FolderRole::Inbox);
@@ -4558,7 +4560,7 @@ pub(crate) mod tests {
         assert!(outbox_raw(&s).contains(&format!("X-MailCraft-Submit-Save-Sent: folder={}", archive.0)));
         let id = folder_items(&s, FolderRole::Outbox)[0].id;
         assert!(file_sent_copy(&mut s, id));
-        let m = &s.mailbox.mail[&id];
+        let m = s.mailbox.mail.get(id).unwrap();
         assert_eq!(m.folder, archive);
         assert!(!String::from_utf8_lossy(m.raw.as_ref().unwrap()).contains("X-MailCraft-Submit"));
 
@@ -4604,7 +4606,7 @@ pub(crate) mod tests {
         s.run("compose.send", &json!({})).unwrap();
         assert!(outbox_raw(&s).contains("X-MailCraft-Voting: Approve;Reject"));
         let sent = folder_items(&s, FolderRole::Outbox)[0].id;
-        let mid = s.mailbox.mail[&sent].message_id.clone().unwrap();
+        let mid = s.mailbox.mail.get(sent).unwrap().message_id.clone().unwrap();
 
         // The recipient votes.
         let mut r = session();
@@ -4746,7 +4748,7 @@ pub(crate) mod tests {
         s.run("compose.readReceipt", &json!({"on": true})).unwrap();
         s.run("compose.send", &json!({})).unwrap();
         let sent = folder_items(&s, FolderRole::Outbox)[0].id;
-        let mid = s.mailbox.mail[&sent].message_id.clone().unwrap();
+        let mid = s.mailbox.mail.get(sent).unwrap().message_id.clone().unwrap();
         receive(
             &mut s,
             &format!(
@@ -5255,7 +5257,7 @@ Original-Message-ID: <{mid}>\nDisposition: manual-action/MDN-sent-manually; disp
         let addrs = |list: &[mailcraft_model::Address]| -> Vec<String> {
             list.iter().map(|m| m.addr.clone()).collect()
         };
-        let draft = &s.mailbox.mail[&ItemId(d)];
+        let draft = s.mailbox.mail.get(ItemId(d)).unwrap();
         assert_eq!(addrs(&draft.to), ["a@example.com", "b@example.com", "alice@example.com"]);
         assert_eq!(draft.to.get(2).and_then(|m| m.name.as_deref()), Some("Rivera, Alice"));
         assert_eq!(addrs(&draft.cc), ["c@example.org", "d@example.org"]);
@@ -5263,7 +5265,7 @@ Original-Message-ID: <{mid}>\nDisposition: manual-action/MDN-sent-manually; disp
         s.run("compose.setSubject", &json!({"value": "changed"})).unwrap();
         let r = s.run("app.closeAllItems", &json!({"save": true})).unwrap();
         let d = r["saved"][0].as_u64().unwrap();
-        let draft = &s.mailbox.mail[&ItemId(d)];
+        let draft = s.mailbox.mail.get(ItemId(d)).unwrap();
         assert_eq!(draft.subject, "changed");
         assert_eq!(addrs(&draft.to), ["a@example.com", "b@example.com", "alice@example.com"]);
         assert_eq!(addrs(&draft.cc), ["c@example.org", "d@example.org"]);
@@ -5644,7 +5646,7 @@ mod options_tests {
     fn in_role(s: &Session, role: FolderRole) -> Vec<ItemId> {
         s.mailbox
             .mail
-            .values()
+            .items()
             .filter(|m| s.mailbox.folder(m.folder).is_some_and(|f| f.role == Some(role)))
             .map(|m| m.id)
             .collect()
@@ -5657,7 +5659,7 @@ mod options_tests {
 
     fn outbox_raw(s: &Session) -> String {
         let id = in_role(s, FolderRole::Outbox).into_iter().max().unwrap();
-        String::from_utf8_lossy(s.mailbox.mail[&id].raw.as_ref().unwrap()).into_owned()
+        String::from_utf8_lossy(s.mailbox.mail.get(id).unwrap().raw.as_ref().unwrap()).into_owned()
     }
 
     #[test]
@@ -5682,7 +5684,7 @@ mod options_tests {
         advance(&mut s, 3 * 60);
         s.run("compose.insertText", &json!({"text": "!"})).unwrap();
         assert!(!s.composes[&id].dirty, "saved while typing");
-        assert!(s.mailbox.mail[&ItemId(draft)].body_text().contains("Draft text more!"));
+        assert!(s.mailbox.mail.get(ItemId(draft)).unwrap().body_text().contains("Draft text more!"));
         // Every minute when set to 1; never when off.
         set(&mut s, "mail.save.autoSaveMinutes", json!(1));
         s.run("compose.insertText", &json!({"text": "x"})).unwrap();
@@ -5704,7 +5706,7 @@ mod options_tests {
         s.run("compose.insertText", &json!({"text": "Note to self"})).unwrap();
         let d = s.run("compose.saveDraft", &json!({})).unwrap()["draft"].as_u64().unwrap();
         assert_eq!(in_role(&s, FolderRole::Inbox), [ItemId(d)]);
-        assert!(s.mailbox.mail[&ItemId(d)].is_draft);
+        assert!(s.mailbox.mail.get(ItemId(d)).unwrap().is_draft);
     }
 
     #[test]
@@ -5929,7 +5931,7 @@ mod options_tests {
         s.run("compose.readReceipt", &json!({"on": true})).unwrap();
         s.run("compose.send", &json!({})).unwrap();
         let sent = in_role(&s, FolderRole::Outbox)[0];
-        let mid = s.mailbox.mail[&sent].message_id.clone().unwrap();
+        let mid = s.mailbox.mail.get(sent).unwrap().message_id.clone().unwrap();
         let raw = format!(
             "From: Ann <ann@example.org>\r\nSubject: Read: Plan\r\nMessage-ID: <m1@example.org>\r\nIn-Reply-To: <{mid}>\r\n\
 Content-Type: multipart/report; report-type=disposition-notification; boundary=\"c\"\r\n\r\n--c\r\nContent-Type: text/plain\r\n\r\nRead.\r\n\
@@ -5988,7 +5990,7 @@ Original-Message-ID: <{mid}>\r\nDisposition: manual-action/MDN-sent-manually; di
         assert!(raw.contains("X-Message-Flag: Reply\r\n"), "{raw}");
         assert!(raw.contains("Reply-By: Thu, 15 Oct 2026"), "{raw}");
         assert!(raw.contains("X-MailCraft-Flag-Reminder: Thu, 15 Oct 2026 08:00"), "{raw}");
-        let sent = &s.mailbox.mail[in_role(&s, FolderRole::Outbox).iter().max().unwrap()];
+        let sent = s.mailbox.mail.get(*in_role(&s, FolderRole::Outbox).iter().max().unwrap()).unwrap();
         assert!(matches!(&sent.flag, FlagState::Flagged { label, .. } if label == "Review"));
         // Received, the message is flagged for follow-up with the due date and reminder.
         let msg = mailcraft_mime::parse(raw.as_bytes()).unwrap();
@@ -6028,7 +6030,8 @@ Original-Message-ID: <{mid}>\r\nDisposition: manual-action/MDN-sent-manually; di
         // A drafted message carries no recipient flag headers.
         s.run("compose.followUp", &json!({"kind": "custom", "recipients": {"label": "Read"}})).unwrap();
         let draft = save_draft(&mut s, id).unwrap();
-        let raw = String::from_utf8_lossy(s.mailbox.mail[&draft].raw.as_ref().unwrap()).into_owned();
+        let raw =
+            String::from_utf8_lossy(s.mailbox.mail.get(draft).unwrap().raw.as_ref().unwrap()).into_owned();
         assert!(!raw.contains("X-Message-Flag"), "{raw}");
     }
 
@@ -6061,7 +6064,7 @@ Original-Message-ID: <{mid}>\r\nDisposition: manual-action/MDN-sent-manually; di
             "{}",
             outbox_raw(&s)
         );
-        let sent = &s.mailbox.mail[in_role(&s, FolderRole::Outbox).iter().max().unwrap()];
+        let sent = s.mailbox.mail.get(*in_role(&s, FolderRole::Outbox).iter().max().unwrap()).unwrap();
         assert_eq!(sent.categories, ["Red", "Blue"]);
         assert_eq!(sent.contacts, ["Ann Lee", "Bo Ek"]);
         assert!(sent.no_auto_archive);

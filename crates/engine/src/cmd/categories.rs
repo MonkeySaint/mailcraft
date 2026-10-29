@@ -198,7 +198,7 @@ fn for_each_item_categories(
 ) -> usize {
     let lists = mb
         .mail
-        .values_mut()
+        .items_mut()
         .map(|m| &mut m.categories)
         .chain(mb.appointments.values_mut().map(|a| &mut a.categories))
         .chain(mb.contacts.values_mut().map(|c| &mut c.categories))
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!((c.color, c.shortcut.as_str()), (CategoryColor::DarkBlue, "Ctrl+F3"));
         let ids: Vec<_> = s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
         for id in &ids {
-            s.mailbox.mail.get_mut(id).unwrap().categories = vec!["Work".into(), "Red category".into()];
+            s.mailbox.mail.get_mut(*id).unwrap().categories = vec!["Work".into(), "Red category".into()];
         }
         let r = s.run("categories.rename", &json!({"name": "work", "newName": "Job"})).unwrap();
         assert_eq!(r["items"], 3);
@@ -363,9 +363,9 @@ mod tests {
         let (mut s, inbox, _) = session();
         let id = s.mailbox.items_in(inbox).first().map(|m| m.id).unwrap();
         // "Job" is on the item but not in the master list (e.g. imported mail).
-        s.mailbox.mail.get_mut(&id).unwrap().categories = vec!["Red category".into(), "Job".into()];
+        s.mailbox.mail.get_mut(id).unwrap().categories = vec!["Red category".into(), "Job".into()];
         s.run("categories.rename", &json!({"name": "Red category", "newName": "Job"})).unwrap();
-        assert_eq!(s.mailbox.mail[&id].categories, vec!["Job".to_string()]);
+        assert_eq!(s.mailbox.mail.get(id).unwrap().categories, vec!["Job".to_string()]);
     }
 
     #[test]
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(s.run("categories.setQuickClick", &json!({})).unwrap()["dialog"], "setQuickClick");
         let id = s.mailbox.items_in(inbox).first().unwrap().id;
         s.run("mail.categorize", &json!({"ids": [id.0]})).unwrap();
-        assert!(s.mailbox.mail[&id].categories.iter().any(|c| c == "Green category"));
+        assert!(s.mailbox.mail.get(id).unwrap().categories.iter().any(|c| c == "Green category"));
         // A Quick Click category that was deleted falls back to the first one.
         s.run("categories.delete", &json!({"name": "Green category"})).unwrap();
         assert_eq!(
@@ -427,7 +427,7 @@ mod tests {
         s.run("mail.setQuickClickFlag", &json!({"kind": "noDate"})).unwrap();
         s.run("mail.flag", &json!({"ids": [id.0]})).unwrap();
         assert!(matches!(
-            &s.mailbox.mail[&id].flag,
+            &s.mailbox.mail.get(id).unwrap().flag,
             mailcraft_model::FlagState::Flagged { due: None, start: None, .. }
         ));
     }

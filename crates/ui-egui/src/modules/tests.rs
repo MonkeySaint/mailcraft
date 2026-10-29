@@ -351,7 +351,7 @@ fn meeting_bar_accepts_a_request() {
 #[test]
 fn meeting_bar_ignores_plain_mail() {
     let a = app();
-    let mail = *a.s.mailbox.mail.keys().next().unwrap();
+    let mail = a.s.mailbox.mail.ids().next().unwrap();
     let mut drew = true;
     let ctx = egui::Context::default();
     let mut a = a;
@@ -624,7 +624,7 @@ fn mail_merge_window_previews_and_sends() {
         .s
         .mailbox
         .mail
-        .values()
+        .items()
         .filter(|m| {
             h.state()
                 .s
@@ -763,7 +763,7 @@ fn assign_task_window_sends_a_request() {
         h.state().s.mailbox.tasks.values().find(|t| t.subject == "Order supplies").expect("assigned copy");
     assert_eq!(t.assigned_to.len(), 1);
     assert!(t.assigned_to[0].contains("alice@example.com"));
-    let sent = h.state().s.mailbox.mail.values().any(|m| m.subject == "Task Request: Order supplies");
+    let sent = h.state().s.mailbox.mail.items().any(|m| m.subject == "Task Request: Order supplies");
     assert!(sent, "the request went to the Outbox");
 }
 
@@ -1066,7 +1066,7 @@ ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{me}\r\nEND:VTODO\r\nEND:VCALEND
     h.run_ok();
     assert!(has(&h, "You declined this task."));
     // Plain mail gets no task bar.
-    let plain = *h.state().s.mailbox.mail.keys().next().unwrap();
+    let plain = h.state().s.mailbox.mail.ids().next().unwrap();
     let ctx = egui::Context::default();
     let mut drew = true;
     let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -1149,7 +1149,7 @@ fn reply_with_meeting_opens_the_meeting_window_prefilled() {
     let mut a = app();
     let folder = a.s.selection.folder;
     let id = a.s.mailbox.items_in(folder).iter().find(|m| m.from.is_some()).map(|m| m.id).unwrap();
-    let subject = a.s.mailbox.mail[&id].subject.clone();
+    let subject = a.s.mailbox.mail.get(id).unwrap().subject.clone();
     a.run("nav.selectItem", json!({"id": id.0})).unwrap();
     a.run("mail.replyWithMeeting", json!({})).unwrap();
     let mut h = harness(mail_window, a, (1400.0, 1000.0));
@@ -1321,7 +1321,7 @@ fn todo_list_flagged_mail_rows_preview_and_show_their_text() {
     let m =
         a.s.mailbox
             .mail
-            .values()
+            .items()
             .find(|m| m.is_flagged() && !linked.contains(&m.id) && !m.body_text().trim().is_empty())
             .cloned()
             .expect("the sample has a flagged message");
@@ -1345,9 +1345,9 @@ fn todo_list_flagged_mail_with_a_huge_body_previews_its_start() {
     select_module_folder(&mut a, mailcraft_model::FolderKind::Tasks);
     let linked: Vec<ItemId> = a.s.mailbox.tasks.values().filter_map(|t| t.from_mail).collect();
     let id =
-        a.s.mailbox.mail.values().find(|m| m.is_flagged() && !linked.contains(&m.id)).map(|m| m.id).unwrap();
+        a.s.mailbox.mail.items().find(|m| m.is_flagged() && !linked.contains(&m.id)).map(|m| m.id).unwrap();
     let subject = {
-        let m = a.s.mailbox.mail.get_mut(&id).unwrap();
+        let m = a.s.mailbox.mail.get_mut(id).unwrap();
         m.body.text = None;
         m.body.html = Some(format!("<p>Opening words here</p>{}", "<div>filler text</div>".repeat(400_000)));
         m.subject.clone()

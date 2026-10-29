@@ -536,9 +536,9 @@ fn view_items(s: &Session) -> (ViewSettings, Vec<&MailItem>) {
     };
     // Searches and search folders go through the search index (`search_index`); results are mail only here.
     let mut items: Vec<&MailItem> = if !s.view.search.trim().is_empty() {
-        crate::search_index::results(s).iter().filter_map(|id| mb.mail.get(id)).collect()
+        crate::search_index::results(s).iter().filter_map(|id| mb.mail.get(*id)).collect()
     } else if f.kind == FolderKind::Search {
-        crate::search_index::search_folder_items(s, folder).iter().filter_map(|id| mb.mail.get(id)).collect()
+        crate::search_index::search_folder_items(s, folder).iter().filter_map(|id| mb.mail.get(*id)).collect()
     } else {
         let mut v = mb.items_in(folder);
         if f.role == Some(FolderRole::Inbox) && vs.focused_inbox {
@@ -627,7 +627,7 @@ pub fn search_notice(s: &Session) -> Option<String> {
         return None;
     }
     let folders: BTreeSet<FolderId> = crate::search_index::scope_folders(s).into_iter().collect();
-    let n = s.mailbox.mail.values().filter(|m| folders.contains(&m.folder) && header_only(s, m)).count();
+    let n = s.mailbox.mail.items().filter(|m| folders.contains(&m.folder) && header_only(s, m)).count();
     match n {
         0 => None,
         1 => Some(
@@ -1103,7 +1103,7 @@ fn group_ids(s: &Session) -> Vec<(String, Vec<ItemId>)> {
     if vs.conversations {
         let convs = build_conversations(s, &vs, items);
         let by_sort: HashMap<ItemId, &ListConversation> = convs.iter().map(|c| (c.sort_item, c)).collect();
-        let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
+        let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(c.sort_item)).collect();
         if !fields.is_empty() {
             let groups = nested(s, &fields, reps, &BTreeSet::new());
             return nested_ids(&groups, |m| by_sort.get(&m.id).map(|c| c.view_members()).unwrap_or_default());
@@ -1146,7 +1146,7 @@ pub fn header_items_in_view(s: &Session) -> usize {
 
 /// Only the header of message `id` was downloaded and its account has a mail server to get the rest from.
 pub fn is_server_header_only(s: &Session, id: ItemId) -> bool {
-    s.mailbox.mail.get(&id).is_some_and(|m| header_only(s, m))
+    s.mailbox.mail.get(id).is_some_and(|m| header_only(s, m))
 }
 
 /// Only the header of `m` was downloaded (an item of a server account; local items never are).
@@ -1331,7 +1331,7 @@ fn other_item_rows(s: &Session, rows: &mut Vec<ListRow>) {
     let others: Vec<ItemRow> = hits
         .iter()
         .map(|h| ItemId(h.id))
-        .filter(|id| !s.mailbox.mail.contains_key(id))
+        .filter(|id| !s.mailbox.mail.contains(*id))
         .filter_map(|id| pim_row(s, id))
         .take(MAX_OTHER_ITEMS)
         .collect();
@@ -1412,7 +1412,7 @@ fn decorate(s: &Session, rows: &mut [ListRow]) {
     let pins = crate::cmd::view::mail::pinned(s);
     for r in rows.iter_mut() {
         let ListRow::Item(row) = r else { continue };
-        let Some(m) = s.mailbox.mail.get(&row.id) else { continue };
+        let Some(m) = s.mailbox.mail.get(row.id) else { continue };
         row.style = crate::cmd::view::mail::row_style(s, &rules, m, row.unread);
         row.pinned = pins.contains(&m.id);
         row.header_only = header_only(s, m);
@@ -1612,7 +1612,7 @@ fn other_folder_items<'a>(s: &'a Session, items: &[&MailItem]) -> Vec<&'a MailIt
         .map(|f| f.id)
         .collect();
     mb.mail
-        .values()
+        .items()
         .filter(|m| allowed.contains(&m.folder))
         .filter(|m| {
             m.message_id
@@ -1646,7 +1646,7 @@ fn build_conversations(s: &Session, vs: &ViewSettings, items: Vec<&MailItem>) ->
             header
         };
         let items: Vec<(ItemId, usize)> = if state.settings.classic_indent {
-            let members: Vec<&MailItem> = t.items.iter().filter_map(|i| s.mailbox.mail.get(i)).collect();
+            let members: Vec<&MailItem> = t.items.iter().filter_map(|i| s.mailbox.mail.get(*i)).collect();
             reply_tree(&members).into_iter().map(|(i, d)| (i, d.saturating_add(1))).collect()
         } else {
             t.items.iter().map(|i| (*i, 1)).collect()
@@ -1677,7 +1677,7 @@ fn build_conversations(s: &Session, vs: &ViewSettings, items: Vec<&MailItem>) ->
             selected,
         });
     }
-    let mut reps: Vec<&MailItem> = out.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
+    let mut reps: Vec<&MailItem> = out.iter().filter_map(|c| s.mailbox.mail.get(c.sort_item)).collect();
     sort_items(s, vs, &mut reps);
     let pos: HashMap<ItemId, usize> = reps.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
     out.sort_by_key(|c| pos.get(&c.sort_item).copied().unwrap_or(usize::MAX));
@@ -1697,7 +1697,7 @@ fn conversation_rows(s: &Session, vs: &ViewSettings, items: Vec<&MailItem>) -> V
         return rows;
     }
     let by_sort: HashMap<ItemId, &ListConversation> = convs.iter().map(|c| (c.sort_item, c)).collect();
-    let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(&c.sort_item)).collect();
+    let reps: Vec<&MailItem> = convs.iter().filter_map(|c| s.mailbox.mail.get(c.sort_item)).collect();
     let collapsed = collapsed_labels(s);
     let fields = manual_fields(s);
     if !fields.is_empty() {
@@ -1741,7 +1741,7 @@ fn push_conversation(
     c: &ListConversation,
     settings: &ConversationSettings,
 ) {
-    let Some(head) = s.mailbox.mail.get(&c.header) else { return };
+    let Some(head) = s.mailbox.mail.get(c.header) else { return };
     if !c.is_thread() {
         rows.push(ListRow::Item(item_row(s, head)));
         return;
@@ -1751,7 +1751,7 @@ fn push_conversation(
         return;
     }
     for (id, depth) in &c.items {
-        let Some(m) = s.mailbox.mail.get(id) else { continue };
+        let Some(m) = s.mailbox.mail.get(*id) else { continue };
         let mut row = item_row(s, m);
         // Child rows name the sender, also for your own replies from Sent Items.
         let sender = sender_name(m);
@@ -1789,7 +1789,7 @@ fn conversation_header_row(
     head: &MailItem,
     settings: &ConversationSettings,
 ) -> ItemRow {
-    let mut members: Vec<&MailItem> = c.items.iter().filter_map(|(i, _)| s.mailbox.mail.get(i)).collect();
+    let mut members: Vec<&MailItem> = c.items.iter().filter_map(|(i, _)| s.mailbox.mail.get(*i)).collect();
     members.sort_by(|a, b| b.received.unix.cmp(&a.received.unix).then(b.id.cmp(&a.id)));
     let mut senders: Vec<String> = Vec::new();
     for m in &members {
@@ -2346,7 +2346,7 @@ mod tests {
         if let Some(a) = s.mailbox.accounts.first_mut() {
             a.kind = mailcraft_model::AccountKind::Imap;
         }
-        if let Some(m) = s.mailbox.mail.get_mut(&best) {
+        if let Some(m) = s.mailbox.mail.get_mut(best) {
             m.body = mailcraft_model::Body::default();
             m.raw = None;
         }
@@ -2379,7 +2379,7 @@ mod tests {
     fn sender_photos_show_only_while_the_option_is_on() {
         let mut s = sample_session();
         let id = s.selection.focus.or_else(|| visible_item_ids(&s).first().copied()).unwrap();
-        let addr = s.mailbox.mail[&id].from.as_ref().unwrap().addr.clone();
+        let addr = s.mailbox.mail.get(id).unwrap().from.as_ref().unwrap().addr.clone();
         assert_eq!(reading_header(&s, id).unwrap().photo, None, "no contact picture yet");
         let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0".to_vec();
         let cid = ItemId(s.mailbox.alloc_id());
@@ -2434,7 +2434,7 @@ mod tests {
         let id = s.mailbox.add_mail(item);
         assert_eq!(inline_pictures(&s, id), vec![("cid:logo@example.com".to_owned(), png)]);
         // Messages without Content-IDs, and unknown ids, have none.
-        let plain = *s.mailbox.mail.keys().find(|k| **k != id).unwrap();
+        let plain = s.mailbox.mail.ids().find(|k| *k != id).unwrap();
         assert!(inline_pictures(&s, plain).is_empty());
         assert!(inline_pictures(&s, ItemId(u64::MAX)).is_empty());
     }
@@ -2493,9 +2493,9 @@ mod tests {
         // Focused tab: no "Other" newsletters.
         let mb = &s.mailbox;
         for i in items(&rows) {
-            assert_eq!(mb.mail[&i.id].focus, FocusClass::Focused);
+            assert_eq!(mb.mail.get(i.id).unwrap().focus, FocusClass::Focused);
         }
-        let times: Vec<i64> = items(&rows).iter().map(|i| mb.mail[&i.id].received.unix).collect();
+        let times: Vec<i64> = items(&rows).iter().map(|i| mb.mail.get(i.id).unwrap().received.unix).collect();
         assert!(times.windows(2).all(|w| w[0] >= w[1]), "newest on top");
         let (n, unread) = status_counts(&s);
         assert_eq!(n, items(&rows).len());
@@ -2781,7 +2781,7 @@ mod tests {
     #[test]
     fn reading_header_info_bars() {
         let s = sample_session();
-        let find = |subj: &str| s.mailbox.mail.values().find(|m| m.subject == subj).unwrap().id;
+        let find = |subj: &str| s.mailbox.mail.items().find(|m| m.subject == subj).unwrap().id;
         let h = reading_header(&s, find("URGENT: server room access")).unwrap();
         assert_eq!(h.from, "Carol Okafor <carol@example.com>");
         assert_eq!(h.from_initials, "CO");
@@ -2870,7 +2870,7 @@ mod tests {
             let b1 = add(&mut s, inbox, "RE: Budget plan", "Bob", "b1@x", &["a1@x", "s1@x"], 3_600, false);
             let lone = add(&mut s, inbox, "Lunch", "Dave", "l1@x", &[], 1_800, true);
             let old = add(&mut s, inbox, "Old thing", "Eve", "o1@x", &[], 10 * 86_400, true);
-            if let Some(m) = s.mailbox.mail.get_mut(&a1) {
+            if let Some(m) = s.mailbox.mail.get_mut(a1) {
                 m.flag =
                     FlagState::Flagged { label: "Follow up".into(), start: None, due: None, reminder: None };
                 m.categories = vec!["Red category".into()];
@@ -3011,7 +3011,7 @@ mod tests {
             let mut fx = fixture();
             let today = group_items(&fx.s, "Today");
             assert_eq!(today, vec![fx.lone, fx.b1, fx.f1, fx.a1], "view members only, header first");
-            let a1 = fx.s.mailbox.mail.get(&fx.a1).cloned().unwrap();
+            let a1 = fx.s.mailbox.mail.get(fx.a1).cloned().unwrap();
             assert_eq!(group_label(&fx.s, &a1), "Today", "an old member sits in its conversation's group");
             select(&mut fx.s, fx.a1);
             fx.s.run("view.collapseGroup", &json!({})).unwrap();
@@ -3078,13 +3078,13 @@ mod tests {
         let inbox = s.selection.folder;
         let ids: Vec<ItemId> = s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
         for id in &ids {
-            s.mailbox.mail.get_mut(id).unwrap().categories.clear();
+            s.mailbox.mail.get_mut(*id).unwrap().categories.clear();
         }
         let both = ids[0];
         let red = ids[1];
-        s.mailbox.mail.get_mut(&both).unwrap().categories =
+        s.mailbox.mail.get_mut(both).unwrap().categories =
             vec!["Red category".into(), "Blue category".into()];
-        s.mailbox.mail.get_mut(&red).unwrap().categories = vec!["red category".into()];
+        s.mailbox.mail.get_mut(red).unwrap().categories = vec!["red category".into()];
         s.run("view.arrangeBy", &serde_json::json!({"key": "categories"})).unwrap();
         s.run("view.sort", &serde_json::json!({"order": "ascending"})).ok();
         let groups = |s: &Session| -> Vec<(String, Vec<ItemId>, bool)> {
@@ -3157,7 +3157,7 @@ mod tests {
             })
             .collect();
         assert!(other.iter().any(|i| i.kind.as_deref() == Some("appointment") && i.subject == subject));
-        assert!(other.iter().all(|i| !s.mailbox.mail.contains_key(&i.id)));
+        assert!(other.iter().all(|i| !s.mailbox.mail.contains(i.id)));
         let visible = visible_item_ids(&s);
         assert!(other.iter().all(|i| !visible.contains(&i.id)));
         // Every kind gets a row.

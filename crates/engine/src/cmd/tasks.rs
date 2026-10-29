@@ -395,7 +395,7 @@ fn sync_mail_flag(s: &mut Session, task: ItemId) {
     let (Some(mail), done, completed) = (t.from_mail, t.status == TaskStatus::Completed, t.completed) else {
         return;
     };
-    if let Some(m) = s.mailbox.mail.get_mut(&mail) {
+    if let Some(m) = s.mailbox.mail.get_mut(mail) {
         if done {
             m.flag = FlagState::Complete { completed };
         } else if matches!(m.flag, FlagState::Complete { .. }) {
@@ -665,7 +665,7 @@ fn todo_targets(s: &Session, p: &Value) -> (Vec<ItemId>, Vec<ItemId>) {
         .iter()
         .copied()
         .filter(|i| {
-            s.mailbox.mail.get(i).is_some_and(|m| !matches!(m.flag, FlagState::None))
+            s.mailbox.mail.get(*i).is_some_and(|m| !matches!(m.flag, FlagState::None))
                 || s.mailbox.contacts.get(i).is_some_and(|c| !matches!(c.flag, FlagState::None))
         })
         .collect();
@@ -715,7 +715,7 @@ impl Rows {
 fn row_of(s: &Session, id: ItemId) -> Option<RowOf> {
     if s.mailbox.tasks.contains_key(&id) {
         Some(RowOf::Task)
-    } else if s.mailbox.mail.get(&id).is_some_and(|m| !matches!(m.flag, FlagState::None)) {
+    } else if s.mailbox.mail.get(id).is_some_and(|m| !matches!(m.flag, FlagState::None)) {
         Some(RowOf::Mail)
     } else if s.mailbox.contacts.get(&id).is_some_and(|c| !matches!(c.flag, FlagState::None)) {
         Some(RowOf::Contact)
@@ -787,7 +787,7 @@ fn run_mark_complete_now(s: &mut Session, p: &Value) -> CmdResult {
     let now = s.now();
     let mut all_tasks = tasks.clone();
     for m in &mail {
-        if let Some(item) = s.mailbox.mail.get_mut(m) {
+        if let Some(item) = s.mailbox.mail.get_mut(*m) {
             item.flag = FlagState::Complete { completed: Some(now) };
         }
         all_tasks.extend(linked_tasks(s, *m));
@@ -846,7 +846,7 @@ fn run_remove_from_list(s: &mut Session, p: &Value) -> CmdResult {
     drop_links.sort();
     drop_links.dedup();
     for m in &cleared {
-        if let Some(item) = s.mailbox.mail.get_mut(m) {
+        if let Some(item) = s.mailbox.mail.get_mut(*m) {
             item.flag = FlagState::None;
         }
         if let Some(c) = s.mailbox.contacts.get_mut(m) {
@@ -872,18 +872,18 @@ fn run_remove_from_list(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Creates (or refreshes) tasks linked to flagged messages; unflagged messages get a "Follow up" flag.
 fn run_from_mail(s: &mut Session, p: &Value) -> CmdResult {
-    let ids: Vec<ItemId> = s.target_ids(p).into_iter().filter(|i| s.mailbox.mail.contains_key(i)).collect();
+    let ids: Vec<ItemId> = s.target_ids(p).into_iter().filter(|i| s.mailbox.mail.contains(*i)).collect();
     if ids.is_empty() {
         return Err(CmdError::Params("no message selected".into()));
     }
     let mut out = Vec::new();
     for m in ids {
-        let Some(item) = s.mailbox.mail.get(&m).cloned() else { continue };
+        let Some(item) = s.mailbox.mail.get(m).cloned() else { continue };
         let (start, due, reminder, done) = match &item.flag {
             FlagState::Flagged { start, due, reminder, .. } => (*start, *due, *reminder, false),
             FlagState::Complete { .. } => (None, None, None, true),
             FlagState::None => {
-                if let Some(mi) = s.mailbox.mail.get_mut(&m) {
+                if let Some(mi) = s.mailbox.mail.get_mut(m) {
                     mi.flag = FlagState::Flagged {
                         label: "Follow up".into(),
                         start: None,
@@ -960,7 +960,7 @@ fn todo_entries(s: &Session) -> Vec<Entry> {
     }
     let linked: std::collections::BTreeSet<ItemId> =
         s.mailbox.tasks.values().filter_map(|t| t.from_mail).collect();
-    for m in s.mailbox.mail.values() {
+    for m in s.mailbox.mail.items() {
         let FlagState::Flagged { start, due, .. } = &m.flag else { continue };
         if in_deleted(m.folder) || linked.contains(&m.id) {
             continue;
@@ -1152,11 +1152,11 @@ fn run_flag(s: &mut Session, p: &Value) -> CmdResult {
 
 /// The flag of a flagged message or contact row.
 fn row_flag(s: &Session, id: ItemId) -> Option<&FlagState> {
-    s.mailbox.mail.get(&id).map(|m| &m.flag).or_else(|| s.mailbox.contacts.get(&id).map(|c| &c.flag))
+    s.mailbox.mail.get(id).map(|m| &m.flag).or_else(|| s.mailbox.contacts.get(&id).map(|c| &c.flag))
 }
 
 fn set_row_flag(s: &mut Session, id: ItemId, flag: FlagState) {
-    if let Some(m) = s.mailbox.mail.get_mut(&id) {
+    if let Some(m) = s.mailbox.mail.get_mut(id) {
         m.flag = flag;
     } else if let Some(c) = s.mailbox.contacts.get_mut(&id) {
         c.flag = flag;
@@ -1300,7 +1300,7 @@ fn row_private(s: &Session, id: ItemId) -> bool {
     s.mailbox.tasks.get(&id).map(|t| t.private).unwrap_or_else(|| {
         s.mailbox
             .mail
-            .get(&id)
+            .get(id)
             .map(|m| m.sensitivity == mailcraft_model::Sensitivity::Private)
             .or_else(|| s.mailbox.contacts.get(&id).map(|c| c.private))
             .unwrap_or(false)
@@ -1316,7 +1316,7 @@ fn run_private(s: &mut Session, p: &Value) -> CmdResult {
         if let Some(t) = s.mailbox.tasks.get_mut(id) {
             t.private = on;
             t.modified = Some(now);
-        } else if let Some(m) = s.mailbox.mail.get_mut(id) {
+        } else if let Some(m) = s.mailbox.mail.get_mut(*id) {
             m.sensitivity =
                 if on { mailcraft_model::Sensitivity::Private } else { mailcraft_model::Sensitivity::Normal };
         } else if let Some(c) = s.mailbox.contacts.get_mut(id) {
@@ -1331,7 +1331,7 @@ fn row_priority(s: &Session, id: ItemId) -> TaskPriority {
     if let Some(t) = s.mailbox.tasks.get(&id) {
         return t.priority;
     }
-    match s.mailbox.mail.get(&id).map(|m| m.importance) {
+    match s.mailbox.mail.get(id).map(|m| m.importance) {
         Some(mailcraft_model::Importance::High) => TaskPriority::High,
         Some(mailcraft_model::Importance::Low) => TaskPriority::Low,
         _ => TaskPriority::Normal,
@@ -1359,7 +1359,7 @@ fn run_importance(s: &mut Session, p: &Value) -> CmdResult {
         if let Some(t) = s.mailbox.tasks.get_mut(id) {
             t.priority = set;
             t.modified = Some(now);
-        } else if let Some(m) = s.mailbox.mail.get_mut(id) {
+        } else if let Some(m) = s.mailbox.mail.get_mut(*id) {
             m.importance = match set {
                 TaskPriority::High => mailcraft_model::Importance::High,
                 TaskPriority::Low => mailcraft_model::Importance::Low,
@@ -1855,7 +1855,7 @@ pub fn parse_task_message(data: &[u8], tz: i32) -> Option<TaskMessage> {
 
 /// The task message carried by mail item `mail` (its `text/calendar` part, else an attached `.ics`).
 pub fn read_task_message(s: &Session, mail: ItemId) -> Option<TaskMessage> {
-    let m = s.mailbox.mail.get(&mail)?;
+    let m = s.mailbox.mail.get(mail)?;
     let data = crate::cmd::calendar::calendar_data(s, m)?;
     parse_task_message(&data, s.tz_offset_min)
 }
@@ -2046,7 +2046,7 @@ fn req_task_mail(s: &Session, p: &Value) -> Result<(ItemId, TaskMessage), CmdErr
         .map(ItemId)
         .or(s.selection.focus)
         .ok_or_else(|| CmdError::Params("`id` (the task request message) is required".into()))?;
-    if !s.mailbox.mail.contains_key(&id) {
+    if !s.mailbox.mail.contains(id) {
         return Err(CmdError::Params(format!("no message {}", id.0)));
     }
     let msg = read_task_message(s, id)
@@ -2159,7 +2159,7 @@ fn accept_folder(s: &Session, p: &Value, mail: ItemId) -> Result<FolderId, CmdEr
     }
     s.mailbox
         .mail
-        .get(&mail)
+        .get(mail)
         .and_then(|m| s.mailbox.folder_account(m.folder))
         .and_then(|a| s.mailbox.role_folder(a, FolderRole::Tasks))
         .or_else(|| pim::default_folder(s, Kind::Task))
@@ -2178,7 +2178,7 @@ fn respond_request(s: &mut Session, p: &Value, accept: bool) -> CmdResult {
     let requester = msg
         .organizer
         .clone()
-        .or_else(|| s.mailbox.mail.get(&mail).and_then(|m| m.from.as_ref()).map(|a| a.to_display_string()))
+        .or_else(|| s.mailbox.mail.get(mail).and_then(|m| m.from.as_ref()).map(|a| a.to_display_string()))
         .ok_or_else(|| CmdError::Params("the task request does not say who sent it".into()))?;
     if is_my_address(s, &requester) {
         return Err(CmdError::Disabled("you sent this task request".into()));
@@ -2719,11 +2719,11 @@ mod tests {
         assert_eq!(r["tasks"][0], t.0);
         assert_eq!(s.mailbox.tasks.len(), 1);
         s.run("tasks.markComplete", &json!({"ids": [t.0]})).unwrap();
-        assert!(matches!(s.mailbox.mail[&m].flag, FlagState::Complete { .. }));
+        assert!(matches!(s.mailbox.mail.get(m).unwrap().flag, FlagState::Complete { .. }));
         assert_eq!(s.mailbox.tasks[&t].status, TaskStatus::Completed);
         // Reopening the task re-flags the message.
         s.run("tasks.update", &json!({"id": t.0, "complete": false})).unwrap();
-        assert!(matches!(s.mailbox.mail[&m].flag, FlagState::Flagged { .. }));
+        assert!(matches!(s.mailbox.mail.get(m).unwrap().flag, FlagState::Flagged { .. }));
     }
 
     #[test]
@@ -2737,7 +2737,7 @@ mod tests {
         let r = s.run("tasks.removeFromList", &json!({})).unwrap();
         assert_eq!(r["unflagged"], json!([m.0]));
         assert_eq!(r["deleted"], json!([plain]));
-        assert_eq!(s.mailbox.mail[&m].flag, FlagState::None);
+        assert_eq!(s.mailbox.mail.get(m).unwrap().flag, FlagState::None);
         assert_eq!(s.mailbox.tasks[&ItemId(plain)].folder, role(&s, FolderRole::DeletedItems));
         assert!(s.selection.items.is_empty());
     }
@@ -2752,7 +2752,7 @@ mod tests {
         let r = s.run("tasks.removeFromList", &json!({})).unwrap();
         assert_eq!(r["unlinked"], json!([t]));
         assert!(!s.mailbox.tasks.contains_key(&ItemId(t)));
-        assert_eq!(s.mailbox.mail[&m].flag, FlagState::None);
+        assert_eq!(s.mailbox.mail.get(m).unwrap().flag, FlagState::None);
     }
 
     #[test]
@@ -2985,7 +2985,7 @@ mod tests {
             .unwrap();
         assert_eq!(r["sent"], true, "{r}");
         assert_eq!(r["task"], Value::Null);
-        assert!(s.mailbox.mail.values().any(|m| m.folder == outbox && m.subject == "Task Request: Send it"));
+        assert!(s.mailbox.mail.items().any(|m| m.folder == outbox && m.subject == "Task Request: Send it"));
     }
 
     #[test]
@@ -3154,7 +3154,7 @@ mod tests {
         // The assigner was told: the answer went out (Sent or Outbox, counted in `notified`) or waits in an
         // open message window.
         let told = |ann: &Session, r: &Value, subject: &str| {
-            let mailed = ann.mailbox.mail.values().any(|m| m.subject == subject);
+            let mailed = ann.mailbox.mail.items().any(|m| m.subject == subject);
             let open = ann.composes.values().any(|c| c.subject == subject);
             if r["notified"] == 1 {
                 assert!(mailed, "{subject}: counted as sent but no message");
@@ -3376,7 +3376,7 @@ ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.com\r\nEND:VTODO\r\n
     }
 
     fn flag_of(s: &Session, id: ItemId) -> FlagState {
-        s.mailbox.mail.get(&id).map(|m| m.flag.clone()).unwrap_or(FlagState::None)
+        s.mailbox.mail.get(id).map(|m| m.flag.clone()).unwrap_or(FlagState::None)
     }
 
     #[test]
@@ -3411,19 +3411,19 @@ ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.com\r\nEND:VTODO\r\n
         // Categorize (and All Categories) on a message and a contact together.
         let cat = s.mailbox.categories.first().map(|x| x.name.clone()).unwrap();
         s.run("tasks.categorize", &json!({"ids": [m.0, c.0], "name": cat})).unwrap();
-        assert!(s.mailbox.mail[&m].categories.contains(&cat));
+        assert!(s.mailbox.mail.get(m).unwrap().categories.contains(&cat));
         assert!(s.mailbox.contacts[&c].categories.contains(&cat));
         assert_eq!(
             s.run("tasks.allCategories", &json!({"ids": [m.0]})).unwrap()["dialog"],
             "colorCategories"
         );
         s.run("tasks.categorize", &json!({"ids": [m.0], "name": "", "clear": true})).unwrap();
-        assert!(s.mailbox.mail[&m].categories.is_empty());
+        assert!(s.mailbox.mail.get(m).unwrap().categories.is_empty());
         // Private and High Importance.
         s.run("tasks.private", &json!({"ids": [m.0]})).unwrap();
-        assert_eq!(s.mailbox.mail[&m].sensitivity, mailcraft_model::Sensitivity::Private);
+        assert_eq!(s.mailbox.mail.get(m).unwrap().sensitivity, mailcraft_model::Sensitivity::Private);
         s.run("tasks.importance", &json!({"ids": [m.0], "level": "high"})).unwrap();
-        assert_eq!(s.mailbox.mail[&m].importance, mailcraft_model::Importance::High);
+        assert_eq!(s.mailbox.mail.get(m).unwrap().importance, mailcraft_model::Importance::High);
         // Follow Up › Complete (the Quick Click when set to it) completes the message's flag.
         s.run("tasks.flag", &json!({"ids": [m.0], "kind": "complete"})).unwrap();
         assert!(matches!(flag_of(&s, m), FlagState::Complete { .. }));
@@ -3437,7 +3437,7 @@ ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.com\r\nEND:VTODO\r\n
     fn tasks_home_respond_move_and_delete_act_on_flagged_messages() {
         let mut s = session();
         let m = add_mail(&mut s, "Budget", flagged());
-        if let Some(x) = s.mailbox.mail.get_mut(&m) {
+        if let Some(x) = s.mailbox.mail.get_mut(m) {
             x.from = Some(mailcraft_model::Address::new(Some("Ann Lee"), "ann@example.com"));
         }
         select(&mut s, m);
@@ -3459,21 +3459,21 @@ ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.com\r\nEND:VTODO\r\n
         let archive = s.mailbox.create_folder(inbox, "Projects").unwrap();
         let r = s.run("tasks.move", &json!({"ids": [m.0], "folder": archive.0})).unwrap();
         assert_eq!(r["moved"], json!([m.0]));
-        assert_eq!(s.mailbox.mail[&m].folder, archive);
+        assert_eq!(s.mailbox.mail.get(m).unwrap().folder, archive);
         // A tasks folder cannot hold the message.
         let tasks = role(&s, FolderRole::Tasks);
         assert!(s.run("tasks.move", &json!({"ids": [m.0], "folder": tasks.0})).is_err());
         // Delete: the message goes to Deleted Items (and leaves the To-Do List), in one undo step.
         let r = s.run("tasks.delete", &json!({"ids": [m.0]})).unwrap();
         assert_eq!(r["mail"], json!([m.0]));
-        assert_eq!(s.mailbox.mail[&m].folder, role(&s, FolderRole::DeletedItems));
+        assert_eq!(s.mailbox.mail.get(m).unwrap().folder, role(&s, FolderRole::DeletedItems));
         assert!(todo_list(&s).is_empty());
         s.run("app.undo", &json!({})).unwrap();
-        assert_eq!(s.mailbox.mail[&m].folder, archive);
+        assert_eq!(s.mailbox.mail.get(m).unwrap().folder, archive);
         // Nothing that is a To-Do List row: refused, nothing changes.
         let plain = add_mail(&mut s, "Plain", FlagState::None);
         assert!(s.run("tasks.delete", &json!({"ids": [plain.0]})).is_err());
-        assert_eq!(s.mailbox.mail[&plain].folder, inbox);
+        assert_eq!(s.mailbox.mail.get(plain).unwrap().folder, inbox);
     }
 
     #[test]
@@ -3508,7 +3508,7 @@ ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.com\r\nEND:VTODO\r\n
         // Delete on a task, a message and a contact together.
         let r = s.run("tasks.delete", &json!({"ids": [t.0, m.0, c.0]})).unwrap();
         assert_eq!(r["deleted"].as_array().map(Vec::len), Some(3));
-        assert_eq!(s.mailbox.mail[&m].folder, role(&s, FolderRole::DeletedItems));
+        assert_eq!(s.mailbox.mail.get(m).unwrap().folder, role(&s, FolderRole::DeletedItems));
         assert_eq!(s.mailbox.contacts.get(&c).map(|x| x.folder), Some(role(&s, FolderRole::DeletedItems)));
     }
 

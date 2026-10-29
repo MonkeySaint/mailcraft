@@ -260,10 +260,10 @@ fn bulk_folder_actions_and_ignore_ask_first() {
     h.run_steps(3);
     assert!(has_label(&h, "Ignore Conversation"), "the confirmation is up");
     assert!(has_label(&h, "Don't ask me again"));
-    assert!(!h.state().s.mailbox.mail[&first].ignored, "nothing ignored before the answer");
+    assert!(!h.state().s.mailbox.mail.get(first).unwrap().ignored, "nothing ignored before the answer");
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Ignore Conversation").click();
     h.run_steps(3);
-    assert!(h.state().s.mailbox.mail[&first].ignored);
+    assert!(h.state().s.mailbox.mail.get(first).unwrap().ignored);
     assert!(h.state().s.mailbox.total_count(inbox) <= count);
     // A message whose whole text is quoted in a later reply: Clean Up would move it.
     let redundant = {

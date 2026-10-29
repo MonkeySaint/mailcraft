@@ -163,7 +163,7 @@ fn a_new_meeting_sends_its_invitation_from_the_window() {
     // The invitation waits in the Outbox: the room is invited as a resource, the file and the formatted
     // notes go with it, and it is marked important.
     let out = outbox(&s);
-    let m = s.mailbox.mail.values().find(|m| m.folder == out).expect("the invitation is in the Outbox");
+    let m = s.mailbox.mail.items().find(|m| m.folder == out).expect("the invitation is in the Outbox");
     assert_eq!(m.subject, "Planning");
     assert_eq!(m.importance, Importance::High);
     assert!(m.to.iter().any(|x| x.addr == "room4@example.com"));
@@ -186,7 +186,7 @@ fn a_meeting_that_cannot_be_sent_leaves_nothing_behind() {
     assert!(e.contains("not sent"), "{e}");
     assert!(s.mailbox.appointments.is_empty());
     assert!(s.composes.is_empty());
-    assert!(s.mailbox.mail.values().all(|m| m.folder != outbox(&s)));
+    assert!(s.mailbox.mail.items().all(|m| m.folder != outbox(&s)));
     assert!(s.run("calendar.newMeeting", &json!({"start": "2026-10-12T10:00", "send": "none"})).is_err());
 }
 
@@ -234,7 +234,7 @@ fn a_saved_invitation_keeps_its_meeting_when_closed() {
     let c = run(&mut s, "compose.close", json!({"compose": cid}));
     assert_eq!(c["meetingRemoved"], Value::Null, "{c}");
     assert!(s.mailbox.appointments.contains_key(&id));
-    assert!(s.mailbox.mail.contains_key(&draft));
+    assert!(s.mailbox.mail.contains(draft));
     // Saved, then closed with Don't Save or Save: the draft and the meeting stay too.
     for save in [false, true] {
         let r = run(&mut s, "calendar.newMeeting", meeting(false));
