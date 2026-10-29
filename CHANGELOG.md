@@ -2,6 +2,26 @@
 
 What changed in each MailCraft release. Help › What's New shows the newest entries from this file.
 
+## 0.4.0
+
+- Large mailboxes: message bodies and sources are read from disk when shown instead of being kept in memory,
+  folder counts are kept up to date instead of being recounted every frame, and commands and undo record only
+  what they change. A profile can no longer grow past the size it can be opened at again.
+- Offline mail: server accounts keep message bodies on this computer for a chosen period (1 year by default,
+  from 3 days to All) set with a slider in the account settings; headers, flags and previews always stay.
+- New profiles can keep their mail in SQLite with compressed pack files (`--store sqlite`, opt-in for now).
+- Account setup recognises Microsoft 365 and Google Workspace domains from their mail servers, and the big
+  consumer domains, and fills in the servers and OAuth sign-in.
+- JMAP: folder changes are written back to the server, and Contacts and Calendar sync over JMAP when the server
+  offers them. Archiving on a server without an Archive folder creates one.
+- CardDAV and CalDAV: a calendar holding both events and tasks fills Calendar and Tasks; uploads never replace
+  or delete what another device changed; calendar publishing only writes its own files.
+- IMAP IDLE picks up mail that arrived just before it started listening.
+- Bookmark dialog; text boxes and shapes saved to the Text Box gallery; Edit Points keeps curves.
+- Release-check fixes: layout at 1024x768 and in the dark theme, View in Browser follows Junk Email
+  protection, the translation key is only sent to its own server, safer data files and calendar attachments.
+- The Linux AppImage starts on a base Ubuntu 22.04.
+
 ## 0.3.0
 
 - Compose drawing: shapes, text boxes, WordArt and canvases are objects you can select together, group, align,
