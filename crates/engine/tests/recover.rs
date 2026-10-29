@@ -55,7 +55,7 @@ fn survives_restart_and_the_undo_limit_then_purges() {
         for i in 0..110 {
             run(&mut s, "folder.new", json!({"name": format!("F{i}")}));
         }
-        assert!(s.undo.undo.iter().all(|e| !e.before.mail.contains(id)), "gone from the undo history");
+        assert!(s.undo.undo.iter().all(|e| !e.mail.contains(id)), "gone from the undo history");
         let l = listed(&mut s);
         assert_eq!(l.len(), 1);
         assert_eq!(l[0]["subject"], "Quarterly figures");

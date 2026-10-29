@@ -695,6 +695,130 @@ impl Mailbox {
         add(self.views.len().saturating_mul(std::mem::size_of::<ViewSettings>()));
         total
     }
+    /// A copy of everything but the mail (undo's small-state snapshot, the "before" of a change record):
+    /// folders, accounts, calendar, contacts, tasks, notes and the configuration. Its mail table is empty.
+    pub fn without_mail(&self) -> Mailbox {
+        // Exhaustive on purpose: a new field fails to compile here until it is copied.
+        let Mailbox {
+            accounts,
+            folders,
+            mail: _,
+            appointments,
+            contacts,
+            tasks,
+            notes,
+            categories,
+            rules,
+            quick_steps,
+            views,
+            next_id,
+            signatures,
+            signature_defaults,
+            recent_recipients,
+            custom_dictionary,
+            junk,
+        } = self;
+        Mailbox {
+            accounts: accounts.clone(),
+            folders: folders.clone(),
+            mail: MailTable::new(),
+            appointments: appointments.clone(),
+            contacts: contacts.clone(),
+            tasks: tasks.clone(),
+            notes: notes.clone(),
+            categories: categories.clone(),
+            rules: rules.clone(),
+            quick_steps: quick_steps.clone(),
+            views: views.clone(),
+            next_id: *next_id,
+            signatures: signatures.clone(),
+            signature_defaults: signature_defaults.clone(),
+            recent_recipients: recent_recipients.clone(),
+            custom_dictionary: custom_dictionary.clone(),
+            junk: junk.clone(),
+        }
+    }
+    /// Puts everything but the mail of `small` in place of this mailbox's (undo, a failed command); the mail
+    /// stays. Returns what was there, as a mailbox without mail.
+    pub fn replace_all_but_mail(&mut self, small: Mailbox) -> Mailbox {
+        use std::mem::replace;
+        let Mailbox {
+            accounts,
+            folders,
+            mail: _,
+            appointments,
+            contacts,
+            tasks,
+            notes,
+            categories,
+            rules,
+            quick_steps,
+            views,
+            next_id,
+            signatures,
+            signature_defaults,
+            recent_recipients,
+            custom_dictionary,
+            junk,
+        } = small;
+        Mailbox {
+            accounts: replace(&mut self.accounts, accounts),
+            folders: replace(&mut self.folders, folders),
+            mail: MailTable::new(),
+            appointments: replace(&mut self.appointments, appointments),
+            contacts: replace(&mut self.contacts, contacts),
+            tasks: replace(&mut self.tasks, tasks),
+            notes: replace(&mut self.notes, notes),
+            categories: replace(&mut self.categories, categories),
+            rules: replace(&mut self.rules, rules),
+            quick_steps: replace(&mut self.quick_steps, quick_steps),
+            views: replace(&mut self.views, views),
+            next_id: replace(&mut self.next_id, next_id),
+            signatures: replace(&mut self.signatures, signatures),
+            signature_defaults: replace(&mut self.signature_defaults, signature_defaults),
+            recent_recipients: replace(&mut self.recent_recipients, recent_recipients),
+            custom_dictionary: replace(&mut self.custom_dictionary, custom_dictionary),
+            junk: replace(&mut self.junk, junk),
+        }
+    }
+    /// Whether everything but the mail is equal (`next_id` included).
+    pub fn eq_except_mail(&self, other: &Mailbox) -> bool {
+        let Mailbox {
+            accounts,
+            folders,
+            mail: _,
+            appointments,
+            contacts,
+            tasks,
+            notes,
+            categories,
+            rules,
+            quick_steps,
+            views,
+            next_id,
+            signatures,
+            signature_defaults,
+            recent_recipients,
+            custom_dictionary,
+            junk,
+        } = self;
+        *accounts == other.accounts
+            && *folders == other.folders
+            && *appointments == other.appointments
+            && *contacts == other.contacts
+            && *tasks == other.tasks
+            && *notes == other.notes
+            && *categories == other.categories
+            && *rules == other.rules
+            && *quick_steps == other.quick_steps
+            && *views == other.views
+            && *next_id == other.next_id
+            && *signatures == other.signatures
+            && *signature_defaults == other.signature_defaults
+            && *recent_recipients == other.recent_recipients
+            && *custom_dictionary == other.custom_dictionary
+            && *junk == other.junk
+    }
     /// Moves items; returns the ids actually moved.
     ///
     /// Unknown ids and items already in `to` are skipped. Only mail folders accept mail items.

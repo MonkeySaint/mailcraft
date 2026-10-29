@@ -73,16 +73,24 @@ fn save(s: &mut Session) {
     }
 }
 
-/// Puts the items that are in `before` and gone from the session's mailbox into the bin. Items of an
-/// account that is gone too (a removed account, a closed data file) left with it and are not captured; at
-/// most [`MAX_RECOVERABLE`] items are taken from one change.
-pub(crate) fn capture(s: &mut Session, before: &Mailbox) {
+/// Puts the items a change set removed from the session's mailbox into the bin: the mail it recorded as gone,
+/// and the calendar, contact, task and note items missing since. Items of an account that is gone too (a
+/// removed account, a closed data file) left with it and are not captured; at most [`MAX_RECOVERABLE`]
+/// items are taken from one change.
+pub(crate) fn capture(s: &mut Session, changes: &crate::changes::ChangeSet) {
     if keep_days(s) == 0 {
         return;
     }
+    let before: &Mailbox = &changes.small;
+    let Some(mail) = changes.mail.as_ref() else {
+        log::error!("deleted items not kept for recovery: the record of what changed was lost");
+        return;
+    };
     let live: BTreeSet<AccountId> = s.mailbox.accounts.iter().map(|a| a.id).collect();
     let kept = |f: FolderId| before.folder(f).is_none_or(|folder| live.contains(&folder.account));
-    let gone = RecoverBin::vanished_where(before, &s.mailbox, kept, MAX_RECOVERABLE);
+    let after = &s.mailbox;
+    let gone_mail = mail.iter().filter_map(|(id, b)| b.filter(|_| !after.mail.contains(id)));
+    let gone = RecoverBin::vanished_from(before, gone_mail, after, kept, MAX_RECOVERABLE);
     if gone.is_empty() {
         return;
     }

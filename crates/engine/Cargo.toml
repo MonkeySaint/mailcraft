@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Tests only: a change record that disagrees with the whole-mailbox comparison fails the test instead of
+# being logged (`changes.rs`). The engine's own dev-dependency on itself turns it on for its integration tests.
+strict-change-check = []
+
 [dependencies]
 mailcraft-geom.workspace = true
 mailcraft-mime.workspace = true
@@ -32,6 +37,7 @@ mailcraft-net.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+mailcraft-engine = { workspace = true, features = ["strict-change-check"] }
 proptest.workspace = true
 tempfile.workspace = true
 mailcraft-testmail.workspace = true

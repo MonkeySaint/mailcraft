@@ -83,10 +83,11 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> ArrivalReport {
         return report;
     }
     // What the filters and rules delete for good stays recoverable (this runs outside `Session::run`).
-    let before = (crate::recover::keep_days(s) > 0).then(|| s.mailbox.clone());
+    let recording = (crate::recover::keep_days(s) > 0).then(|| s.begin_changes());
     process(s, ids, &mut report);
-    if let Some(before) = before {
-        crate::recover::capture(s, &before);
+    if let Some(recording) = recording {
+        let changes = s.end_changes(recording);
+        crate::recover::capture(s, &changes);
     }
     report
 }

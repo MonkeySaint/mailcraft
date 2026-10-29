@@ -1651,7 +1651,7 @@ mod tests {
         let id = mail(&mut s, deleted, "gone", "a@example.com");
         s.mailbox.create_folder(deleted, "Old").unwrap();
         // Simulate the undo snapshot the session records before a mutating command.
-        s.undo.undo.push(crate::undo::UndoEntry::new("x", Box::new(s.mailbox.clone())));
+        s.undo.undo.push(crate::undo::UndoEntry::between("x", &s.mailbox, &s.mailbox));
         let r = run(&mut s, "folder.emptyDeleted", json!({}));
         assert_eq!(r["items"], 1);
         assert_eq!(r["folders"], 1);

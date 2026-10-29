@@ -333,7 +333,8 @@ fn state_id() -> Id {
 }
 
 /// Cheap fingerprint of everything `list_rows` depends on. A mutating command that changes the mailbox
-/// always pushes a new undo entry (a fresh boxed snapshot), so the top entry's address changes with it.
+/// always pushes a new undo entry (each holds a freshly boxed small-state snapshot), so the top entry's
+/// address changes with it.
 fn fingerprint(s: &Session) -> u64 {
     let mut h = DefaultHasher::new();
     let folder = s.selection.folder;
@@ -351,8 +352,8 @@ fn fingerprint(s: &Session) -> u64 {
     s.mailbox.folders.len().hash(&mut h);
     s.undo.undo.len().hash(&mut h);
     s.undo.redo.len().hash(&mut h);
-    s.undo.undo.last().map(|e| std::ptr::from_ref(e.before.as_ref()) as usize).hash(&mut h);
-    s.undo.redo.last().map(|e| std::ptr::from_ref(e.before.as_ref()) as usize).hash(&mut h);
+    s.undo.undo.last().map(|e| std::ptr::from_ref(e.small.as_ref()) as usize).hash(&mut h);
+    s.undo.redo.last().map(|e| std::ptr::from_ref(e.small.as_ref()) as usize).hash(&mut h);
     for (k, c) in &s.composes {
         k.hash(&mut h);
         c.source.hash(&mut h);

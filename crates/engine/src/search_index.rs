@@ -280,8 +280,9 @@ impl SearchState {
                 Op::RemoveMail(id) => {
                     inner.dirty.insert(id.0);
                 }
-                // Folder names feed `folder:` and scopes: results may change without index changes.
-                Op::PutFolder(_) | Op::RemoveFolder(_) => {}
+                // Folder names feed `folder:` and scopes: results may change without index changes. An
+                // account's queue and sync state hold no searchable text.
+                Op::PutFolder(_) | Op::RemoveFolder(_) | Op::PutAccount(_) => {}
                 Op::Replace(_) => inner.full = true,
             }
         }

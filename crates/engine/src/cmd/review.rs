@@ -623,7 +623,7 @@ fn add_to_dictionary(s: &mut Session, p: &Value) -> CmdResult {
             )?
         }
     };
-    let before = s.mailbox.clone();
+    let before = s.mailbox.without_mail();
     let added = s.mailbox.add_to_dictionary(&word);
     if !added && !s.mailbox.in_dictionary(&word) {
         return Err(CmdError::Params(format!("`{word}` cannot be added to the dictionary")));

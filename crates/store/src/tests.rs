@@ -92,6 +92,34 @@ fn journal_round_trip_moves_raw_to_blobs() {
     assert_eq!(loaded.folders, mb.folders);
 }
 
+/// `PutAccount` replaces the account with its id in place (the others and their order stay) and is replayed
+/// from the journal; an account the mailbox lacks is appended.
+#[test]
+fn put_account_replaces_one_account_in_place() {
+    use mailcraft_model::{Account, AccountId};
+    let d = tmp();
+    let mut mb = base_mailbox();
+    for (id, name) in [(1, "First"), (2, "Second")] {
+        mb.accounts.push(Account { id: AccountId(id), display_name: name.into(), ..Default::default() });
+    }
+    let mut second = mb.accounts.get(1).cloned().unwrap();
+    second.display_name = "Second, renamed".into();
+    second.sync.next_op = 7;
+    let third = Account { id: AccountId(3), display_name: "Third".into(), ..Default::default() };
+    {
+        let mut store = Store::open(d.path()).unwrap();
+        store.append(&[Op::Replace(Box::new(mb.clone()))]).unwrap();
+        store
+            .append(&[Op::PutAccount(Box::new(second.clone())), Op::PutAccount(Box::new(third.clone()))])
+            .unwrap();
+    }
+    let loaded = Store::open(d.path()).unwrap().load().unwrap();
+    let names: Vec<&str> = loaded.accounts.iter().map(|a| a.display_name.as_str()).collect();
+    assert_eq!(names, ["First", "Second, renamed", "Third"]);
+    assert_eq!(loaded.accounts.get(1), Some(&second));
+    assert_eq!(loaded.folders, mb.folders);
+}
+
 #[test]
 fn head_of_reads_the_start_of_the_source() {
     let d = tmp();

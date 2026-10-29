@@ -50,6 +50,7 @@ pub use autosave::Autosave;
 pub use blob::BlobKey;
 pub use import::MaildirFlags;
 pub use journal::Repair;
+pub use mailcraft_model::{ChangeToken, MailChanges};
 pub use repo::{MailRepo, Shared};
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +65,10 @@ pub enum StoreError {
     /// left as it was).
     #[error("{0}")]
     TooLarge(String),
+    /// A change record was closed that is not open (it was closed already, or the mail it recorded was
+    /// replaced as a whole).
+    #[error("the change record is not open")]
+    NoChangeRecord,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -86,7 +91,11 @@ pub enum Op {
     /// Upsert the whole folder table entry.
     PutFolder(Box<mailcraft_model::Folder>),
     RemoveFolder(FolderId),
-    /// Replace the whole mailbox (used for big changes: rules, categories, views, accounts).
+    /// Replace one account, matched by id (appended when it is missing). Only for an account whose place in
+    /// the list stays: accounts added, removed or reordered go through `Replace`. Changing an account's sync
+    /// state or its queue of server changes (every command on synchronised mail) journals just this.
+    PutAccount(Box<mailcraft_model::Account>),
+    /// Replace the whole mailbox (used for big changes: rules, categories, views, accounts added or removed).
     Replace(Box<Mailbox>),
 }
 
@@ -110,6 +119,10 @@ impl Op {
                 mb.folders.remove(&id);
                 mb.views.remove(&id);
             }
+            Op::PutAccount(account) => match mb.accounts.iter_mut().find(|a| a.id == account.id) {
+                Some(a) => *a = *account,
+                None => mb.accounts.push(*account),
+            },
             Op::Replace(new) => *mb = *new,
         }
     }

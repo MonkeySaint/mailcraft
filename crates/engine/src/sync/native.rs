@@ -2093,12 +2093,12 @@ pub(super) fn poll_events(s: &mut Session) -> bool {
         )
     });
     let prefs_before = s.sync.prefs.data.clone();
-    let before = touches.then(|| s.mailbox.clone());
+    let recording = touches.then(|| s.begin_changes());
     let res = catch_unwind(AssertUnwindSafe(|| apply_all(s, events)));
     if s.sync.prefs.data != prefs_before {
         crate::accounts::save_prefs(s);
     }
-    let Some(before) = before else {
+    let Some(recording) = recording else {
         if res.is_err() {
             log::error!("applying send/receive status panicked");
         }
@@ -2106,11 +2106,11 @@ pub(super) fn poll_events(s: &mut Session) -> bool {
     };
     if res.is_err() {
         log::error!("applying send/receive results panicked; the mailbox was restored");
-        s.mailbox = before;
+        s.rollback_changes(recording);
         s.mailbox_changed();
         return false;
     }
-    let ops = crate::session::diff_ops(&before, &s.mailbox);
+    let ops = s.end_changes(recording).ops(&s.mailbox);
     let changed = !ops.is_empty();
     s.journal(ops);
     s.tidy_selection();
@@ -2217,7 +2217,7 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
     // Changes below are local actions (sending files the message, rules move it): they reach the server
     // through the queue like a command's changes.
     if !sent.is_empty() || !new_inbox.is_empty() {
-        let mid = s.mailbox.clone();
+        let mid = s.begin_changes();
         for ev in sent {
             if let Event::Sent { account, item, result } = ev {
                 message_sent(s, account, item, result);
@@ -2229,7 +2229,8 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
             // (client-side, like every rule here), automatic meeting responses, tracking and receipts.
             super::arrival::on_new_mail(s, &ids);
         }
-        queue_local_changes(s, &mid);
+        let mut local = s.end_changes(mid);
+        queue_local_changes(s, &mut local);
     }
     let inflight = s.sync.inflight_ops();
     prune_stale_ops(&mut s.mailbox, &inflight);
@@ -2785,9 +2786,7 @@ fn apply_folders(s: &mut Session, account: AccountId, mut list: Vec<RemoteFolder
             if let Some(f) = s.mailbox.folders.get_mut(&fid) {
                 f.remote_name = None;
             }
-            for m in s.mailbox.mail.items_mut().filter(|m| m.folder == fid) {
-                m.remote_id = None;
-            }
+            s.mailbox.mail.update_where(|m| m.folder == fid, |m| m.remote_id = None);
             if let Some(a) = account_mut(s, account) {
                 a.sync.folders.remove(&fid);
             }

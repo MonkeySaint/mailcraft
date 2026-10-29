@@ -669,11 +669,63 @@ fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
         let (d, _) = run_cmd(s, "mail.delete", json!({"ids": [last.0]}))?;
         out.insert("delete_1_ms".into(), json!(ms(d)));
     }
+    // Undo of a one-item step: mark one message read, then undo that.
+    if let Some(id) = s.mailbox.items_in(big).iter().find(|m| !m.read).map(|m| m.id) {
+        run_cmd(s, "mail.markRead", json!({"ids": [id.0]}))?;
+        let (d, _) = run_cmd(s, "app.undo", json!({}))?;
+        out.insert("undo_1_ms".into(), json!(ms(d)));
+    }
+    imap_commands(s, &mut out)?;
     let journal = s.store.as_ref().map(mailcraft_store::Store::journal_bytes);
     out.insert("journal_bytes".into(), json!(journal));
     out.insert("undo_steps".into(), json!(s.undo.undo.len()));
+    out.insert("undo_bytes".into(), json!(s.undo.bytes()));
+    // What every undo step copies until storage stage S12 (everything but the mail).
+    out.insert("small_state_bytes".into(), json!(s.mailbox.without_mail().approx_bytes()));
     out.insert("memory_after".into(), memory_json());
     Ok(Value::Object(out))
+}
+
+/// The journal's size now (0 without a store).
+fn journal_now(s: &Session) -> u64 {
+    s.store.as_ref().map_or(0, mailcraft_store::Store::journal_bytes)
+}
+
+/// Commands on synchronised mail (the sync account's INBOX that [`sync_apply`] filled): each one also queues
+/// a server change on the account, so the account changes with the mail. Rows `imap_*`, with the journal
+/// bytes each one wrote.
+fn imap_commands(s: &mut Session, out: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let Some(account) = s.mailbox.accounts.iter().find(|a| a.display_name == SYNC_ACCOUNT).map(|a| a.id)
+    else {
+        return Ok(());
+    };
+    let remote = |s: &Session, name: &str| {
+        s.mailbox
+            .folders
+            .values()
+            .find(|f| f.account == account && f.remote_name.as_deref() == Some(name))
+            .map(|f| f.id)
+    };
+    let (Some(inbox), Some(target)) = (remote(s, "INBOX"), remote(s, HEADERS_FOLDER)) else {
+        return Ok(());
+    };
+    run_cmd(s, "nav.selectFolder", json!({"folder": inbox.0}))?;
+    let mut timed = |s: &mut Session, key: &str, id: &str, params: Value| -> Result<()> {
+        let before = journal_now(s);
+        let (d, _) = run_cmd(s, id, params)?;
+        out.insert(format!("{key}_ms"), json!(ms(d)));
+        out.insert(format!("{key}_journal_bytes"), json!(journal_now(s).saturating_sub(before)));
+        Ok(())
+    };
+    if let Some(id) = s.mailbox.items_in(inbox).iter().find(|m| !m.read).map(|m| m.id) {
+        timed(s, "imap_mark_read_1", "mail.markRead", json!({"ids": [id.0]}))?;
+        timed(s, "imap_undo_1", "app.undo", json!({}))?;
+    }
+    if let Some(id) = s.mailbox.items_in(inbox).first().map(|m| m.id) {
+        timed(s, "imap_move_1", "mail.move", json!({"ids": [id.0], "folder": target.0}))?;
+        timed(s, "imap_undo_move_1", "app.undo", json!({}))?;
+    }
+    Ok(())
 }
 
 /// The JSON document of a run: options, host, generation and the measurements.

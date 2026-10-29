@@ -1,6 +1,7 @@
 //! Unit tests for the model crate.
 
 mod category;
+mod changes;
 mod dates;
 mod item;
 mod mailbox;

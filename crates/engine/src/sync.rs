@@ -23,9 +23,9 @@
 //! ordinary queue (unless the account says the server files sent mail itself). A failure leaves the message
 //! in the Outbox with an error notice; the next send/receive tries again.
 //!
-//! **Undo.** Undo restores whole-mailbox snapshots; [`after_restore`] carries the synchronised state (queue,
-//! folder states, mail that arrived or vanished meanwhile) into the restored mailbox and queues the server
-//! changes that revert the undone command.
+//! **Undo.** Undo puts back what its step changed (everything but the mail, and the mail items the step
+//! wrote); [`after_restore`] carries the synchronised state (queue, folder states, mail that arrived or vanished
+//! meanwhile) into the items put back and queues the server changes that revert the undone command.
 
 // The browser build has no worker threads: the code that applies their results is unused there.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 use crate::{CmdError, Notice, Session};
 use mailcraft_model::account::{PendingOp, RemoteOp};
 use mailcraft_model::{
-    AccountId, AccountKind, FlagState, Folder, FolderId, FolderKind, ItemId, MailItem, Mailbox,
+    AccountId, AccountKind, FlagState, Folder, FolderId, FolderKind, ItemId, MailChanges, MailItem, Mailbox,
     ResponseState, ScanFilter,
 };
 /// Settings for `accounts.discover` and the server connections (for front ends and tests that configure them).
@@ -564,6 +564,7 @@ impl Session {
     /// the status changed. Never panics: a panic while applying results restores the mailbox. Translations
     /// that finished in the background are applied here too (`translate::poll`).
     pub fn poll_sync(&mut self) -> bool {
+        self.drop_stray_records();
         let status_before = self.sync.status.clone();
         let translated = crate::translate::poll(self);
         let mailbox_changed = poll_events(self) || translated;
@@ -1178,15 +1179,20 @@ fn set_remote_id(mb: &mut Mailbox, id: ItemId, uid: Option<u32>) {
     }
 }
 
-/// Queues the server changes that turn `before` into the current mailbox (after a command or an undo).
-pub(crate) fn queue_local_changes(s: &mut Session, before: &Mailbox) -> usize {
+/// Queues the server changes a change set describes (after a command, an undo or a sync batch). The
+/// adjustments this makes to the mailbox (server names, cleared UIDs, the accounts' queues) join `changes`.
+pub(crate) fn queue_local_changes(s: &mut Session, changes: &mut crate::changes::ChangeSet) -> usize {
     crate::accounts::load_prefs(s);
+    let Some(mail) = changes.mail.as_ref() else {
+        log::error!("server changes not queued: the record of what changed was lost");
+        return 0;
+    };
     #[cfg(not(target_arch = "wasm32"))]
     {
         let jmap: Vec<AccountId> =
             s.mailbox.accounts.iter().filter(|a| a.kind == AccountKind::Jmap).map(|a| a.id).collect();
         for a in jmap {
-            if jmap::changed(before, &s.mailbox, a) {
+            if jmap::changed(&changes.small, mail, &s.mailbox, a) {
                 s.sync.jmap_dirty.insert(a);
             }
         }
@@ -1194,7 +1200,11 @@ pub(crate) fn queue_local_changes(s: &mut Session, before: &Mailbox) -> usize {
     let inflight = s.sync.inflight_ops();
     let pop3: BTreeSet<AccountId> =
         s.mailbox.accounts.iter().filter(|a| crate::accounts::is_pop3(s, a.id)).map(|a| a.id).collect();
-    queue_changes_except(before, &mut s.mailbox, &inflight, &pop3)
+    let token = s.mailbox.mail.begin();
+    let n = queue_changes_except(&changes.small, mail, &mut s.mailbox, &inflight, &pop3);
+    let more = s.mailbox.mail.commit(token);
+    changes.absorb(more);
+    n
 }
 
 /// Compares `before` and `after` for IMAP accounts and appends [`RemoteOp`]s to the accounts' queues.
@@ -1203,12 +1213,16 @@ pub(crate) fn queue_local_changes(s: &mut Session, before: &Mailbox) -> usize {
 /// operations were queued.
 #[cfg(test)]
 pub(crate) fn queue_changes(before: &Mailbox, after: &mut Mailbox, inflight: &Inflight) -> usize {
-    queue_changes_except(before, after, inflight, &BTreeSet::new())
+    let mail = MailChanges::between(&before.mail, &after.mail);
+    queue_changes_except(before, &mail, after, inflight, &BTreeSet::new())
 }
 
-/// [`queue_changes`] leaving out `skip` (POP3 accounts: their folders are local).
+/// [`queue_changes`] from a change record: `before` holds everything but the mail as it was (its mail is not
+/// read), `mail` the before-images of the items written since, and `after` the mailbox now. Leaves out
+/// `skip` (POP3 accounts: their folders are local).
 pub(crate) fn queue_changes_except(
     before: &Mailbox,
+    mail: &MailChanges,
     after: &mut Mailbox,
     inflight: &Inflight,
     skip: &BTreeSet<AccountId>,
@@ -1218,7 +1232,7 @@ pub(crate) fn queue_changes_except(
     }
     let mut q: Vec<(AccountId, RemoteOp)> = Vec::new();
     folder_changes(before, after, skip, &mut q);
-    item_changes(before, after, inflight, &mut q);
+    item_changes(mail, before, after, inflight, &mut q);
     let n = q.len();
     for (account, op) in q {
         push_op(after, account, op);
@@ -1299,9 +1313,7 @@ fn folder_changes(
                                 g.remote_name = None;
                             }
                         }
-                        for m in after.mail.items_mut().filter(|m| sub.contains(&m.folder)) {
-                            m.remote_id = None;
-                        }
+                        after.mail.update_where(|m| sub.contains(&m.folder), |m| m.remote_id = None);
                     }
                 }
             }
@@ -1392,12 +1404,14 @@ fn cancel_op(after: &mut Mailbox, inflight: &Inflight, pred: impl Fn(&RemoteOp) 
 }
 
 fn item_changes(
+    mail: &MailChanges,
     before: &Mailbox,
     after: &mut Mailbox,
     inflight: &Inflight,
     q: &mut Vec<(AccountId, RemoteOp)>,
 ) {
-    // Only items whose server-relevant state changed (most commands touch a handful of items).
+    // Only items whose server-relevant state changed (most commands touch a handful of items), among those
+    // the change record holds (the others are as they were).
     let same = |a: &MailItem, b: &MailItem| {
         a.folder == b.folder
             && a.read == b.read
@@ -1407,15 +1421,17 @@ fn item_changes(
             && a.is_draft == b.is_draft
             && (!a.is_draft || a.raw == b.raw)
     };
-    let mut ids: BTreeSet<ItemId> = before
-        .mail
+    let ids: Vec<ItemId> = mail
         .iter()
-        .filter(|(id, b)| after.mail.get(*id).is_none_or(|a| !same(a, b)))
+        .filter(|(id, b)| match (b, after.mail.get(*id)) {
+            (Some(b), Some(a)) => !same(a, b),
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        })
         .map(|(id, _)| id)
         .collect();
-    ids.extend(after.mail.ids().filter(|id| !before.mail.contains(*id)));
     for id in ids {
-        let b = before.mail.get(id);
+        let b = mail.before(id).flatten();
         // What is needed of the item after the change (taken before `after` is adjusted).
         let Some((a_folder, a_uid, upload, words, draft_changed)) = after.mail.get(id).map(|a| {
             let draft_changed =
@@ -1492,9 +1508,12 @@ fn item_changes(
     }
 }
 
-/// Undo/redo replaced `live` with a snapshot (now `s.mailbox`): keep what synchronisation did meanwhile and
-/// queue the server changes that revert the undone command.
-pub(crate) fn after_restore(s: &mut Session, live: &Mailbox) {
+/// Undo/redo put a step back (`s.mailbox` now): `changes` holds what was there instead (`changes.small`,
+/// everything but the mail, and the live versions of the mail items the step put back). Keep what
+/// synchronisation did meanwhile and queue the server changes that revert the undone command; the
+/// adjustments join `changes`.
+pub(crate) fn after_restore(s: &mut Session, changes: &mut crate::changes::ChangeSet) {
+    let live = &changes.small;
     // Internet calendars keep their last refresh (refreshes are not undo steps).
     crate::cmd::calendar::subscribe::carry_over(live, &mut s.mailbox);
     // Contacts and tasks keep what their server sent and their links to it.
@@ -1502,11 +1521,26 @@ pub(crate) fn after_restore(s: &mut Session, live: &Mailbox) {
     if !live.accounts.iter().any(|a| a.kind == AccountKind::Imap) {
         return;
     }
-    carry_over(live, &mut s.mailbox, &s.sync.track);
-    queue_local_changes(s, live);
+    let Some(live_mail) = changes.mail.as_ref() else { return };
+    let token = s.mailbox.mail.begin();
+    carry_over(live, live_mail, &mut s.mailbox, &s.sync.track);
+    let more = s.mailbox.mail.commit(token);
+    changes.absorb(more);
+    queue_local_changes(s, changes);
 }
 
-fn carry_over(live: &Mailbox, restored: &mut Mailbox, track: &Track) {
+/// The live version of mail item `id`: its image in `live_mail` when the restore replaced it, else the item
+/// in `restored` (left as it was).
+fn live_item<'a>(live_mail: &'a MailChanges, restored: &'a Mailbox, id: ItemId) -> Option<&'a MailItem> {
+    match live_mail.before(id) {
+        Some(image) => image,
+        None => restored.mail.get(id),
+    }
+}
+
+/// `live` is everything but the mail as it was before the restore, `live_mail` the live versions of the items
+/// the restore put back; the other items of `restored` are live already.
+fn carry_over(live: &Mailbox, live_mail: &MailChanges, restored: &mut Mailbox, track: &Track) {
     restored.next_id = restored.next_id.max(live.next_id);
     for a in restored.accounts.iter_mut() {
         if let Some(l) = live.account(a.id) {
@@ -1548,29 +1582,46 @@ fn carry_over(live: &Mailbox, restored: &mut Mailbox, track: &Track) {
             f.remote_name = name;
         }
     }
-    // Mail that arrived or vanished meanwhile, and server flag changes.
+    // Mail that arrived or vanished meanwhile, and server flag changes. Only the items the restore put back
+    // can differ from their live versions.
     for id in &track.created {
-        if let Some(m) = live.mail.get(*id)
+        if live_mail.contains(*id)
             && !restored.mail.contains(*id)
+            && let Some(m) = live_item(live_mail, restored, *id)
             && restored.folders.contains_key(&m.folder)
         {
-            restored.mail.insert(*id, m.clone());
+            let m = m.clone();
+            restored.mail.insert(*id, m);
         }
     }
     for id in &track.removed {
-        if !live.mail.contains(*id) {
+        if live_mail.contains(*id) && live_item(live_mail, restored, *id).is_none() {
             restored.mail.remove(*id);
         }
     }
-    for (id, m) in restored.mail.iter_mut() {
-        let Some(l) = live.mail.get(id) else { continue };
-        if l.folder == m.folder {
-            m.remote_id = l.remote_id.clone();
+    let put_back: Vec<(ItemId, FolderId, Option<String>, bool, FlagState)> = live_mail
+        .iter()
+        .filter_map(|(id, l)| {
+            let l = l?;
+            Some((id, l.folder, l.remote_id.clone(), l.read, l.flag.clone()))
+        })
+        .collect();
+    for (id, folder, remote_id, read, flag) in put_back {
+        let Some(m) = restored.mail.get(id) else { continue };
+        let same_folder = m.folder == folder;
+        let flags = track.flags.contains(&id);
+        if (!same_folder || m.remote_id == remote_id) && (!flags || (m.read == read && m.flag == flag)) {
+            continue;
         }
-        if track.flags.contains(&id) {
-            m.read = l.read;
-            m.flag = l.flag.clone();
-        }
+        restored.mail.update(id, |m| {
+            if same_folder {
+                m.remote_id = remote_id;
+            }
+            if flags {
+                m.read = read;
+                m.flag = flag;
+            }
+        });
     }
 }
 
@@ -2087,9 +2138,10 @@ mod tests {
     }
 
     fn change(s: &mut Session, f: impl FnOnce(&mut Mailbox)) {
-        let before = s.mailbox.clone();
+        let recording = s.begin_changes();
         f(&mut s.mailbox);
-        queue_local_changes(s, &before);
+        let mut changes = s.end_changes(recording);
+        queue_local_changes(s, &mut changes);
     }
 
     #[test]

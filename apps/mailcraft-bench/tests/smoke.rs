@@ -66,8 +66,20 @@ fn two_thousand_messages_smoke() {
         "undo_bulk_move_ms",
         "redo_bulk_move_ms",
         "delete_1_ms",
+        "imap_mark_read_1_ms",
+        "imap_undo_1_ms",
+        "imap_move_1_ms",
+        "imap_undo_move_1_ms",
+        "undo_bytes",
+        "small_state_bytes",
     ] {
         assert!(r["measure"]["commands"][k].is_number(), "{k}");
+    }
+    // A command on synchronised mail journals the item and its account, not the whole mailbox.
+    let whole = num(&r, "/measure/open/mailbox_approx_bytes");
+    for k in ["imap_mark_read_1_journal_bytes", "imap_move_1_journal_bytes"] {
+        let wrote = num(&r, &format!("/measure/commands/{k}"));
+        assert!(wrote > 0.0 && wrote < whole / 10.0, "{k}: {wrote} of {whole}");
     }
     assert!(num(&r, "/measure/commands/journal_bytes") > 0.0);
     std::fs::remove_dir_all(&work).unwrap();

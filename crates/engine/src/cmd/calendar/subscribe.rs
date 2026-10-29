@@ -160,18 +160,18 @@ pub fn apply_background(
     if subscription(s, folder).is_none() {
         return serde_json::json!({ "folder": folder.0, "error": "not an internet calendar" });
     }
-    let before = s.mailbox.clone();
+    let recording = s.begin_changes();
     let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply(s, folder, outcome)));
     match applied {
         Ok(v) => {
-            let ops = crate::session::diff_ops(&before, &s.mailbox);
+            let ops = s.end_changes(recording).ops(&s.mailbox);
             s.journal(ops);
             s.tidy_selection();
             v
         }
         Err(_) => {
             log::error!("applying an internet calendar refresh panicked; the mailbox was restored");
-            s.mailbox = before;
+            s.rollback_changes(recording);
             s.mailbox_changed();
             serde_json::json!({ "folder": folder.0, "error": "the calendar could not be updated" })
         }

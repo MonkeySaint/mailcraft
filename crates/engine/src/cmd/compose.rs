@@ -1211,7 +1211,7 @@ pub fn auto_save(s: &mut Session) -> Vec<(u64, ItemId)> {
     if due.is_empty() {
         return Vec::new();
     }
-    let before = s.mailbox.clone();
+    let recording = s.begin_changes();
     let mut saved = Vec::new();
     for cid in due {
         let result = save_draft(s, cid);
@@ -1224,9 +1224,10 @@ pub fn auto_save(s: &mut Session) -> Vec<(u64, ItemId)> {
             Err(e) => log::warn!("auto-save of compose {cid} failed: {e}"),
         }
     }
+    let mut changes = s.end_changes(recording);
     if !saved.is_empty() {
-        crate::sync::queue_local_changes(s, &before);
-        let ops = crate::session::diff_ops(&before, &s.mailbox);
+        crate::sync::queue_local_changes(s, &mut changes);
+        let ops = changes.ops(&s.mailbox);
         s.journal(ops);
     }
     saved
@@ -2867,11 +2868,15 @@ const MAX_SIGNATURE_SOURCE: usize = 1024 * 1024;
 
 /// Records mailbox changes the session's store diff does not cover (signatures, Auto-Complete list,
 /// dictionary) as one undo step plus a journal write; does nothing when the diff already sees them.
+/// `before` is everything but the mail as it was ([`mailcraft_model::Mailbox::without_mail`]); these
+/// commands do not change mail.
 pub(crate) fn commit_extras(s: &mut Session, before: mailcraft_model::Mailbox, label: &str) {
-    if before == s.mailbox || !crate::session::diff_ops(&before, &s.mailbox).is_empty() {
+    if before.eq_except_mail(&s.mailbox)
+        || !crate::changes::ops_for(&before, &mailcraft_model::MailChanges::new(), &s.mailbox).is_empty()
+    {
         return;
     }
-    s.undo.push(crate::undo::UndoEntry::new(label, Box::new(before)));
+    s.undo.push(crate::undo::UndoEntry::new(label, Box::new(before), mailcraft_model::MailChanges::new()));
     s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
 }
 
@@ -2936,7 +2941,7 @@ fn signature_list(s: &mut Session, _p: &Value) -> CmdResult {
 fn signature_create(s: &mut Session, p: &Value) -> CmdResult {
     let name = req_str(p, "name")?.to_owned();
     let body = doc_param(p)?.unwrap_or_default();
-    let before = s.mailbox.clone();
+    let before = s.mailbox.without_mail();
     let name = s.mailbox.add_signature(&name, body)?;
     let new_default = opt_bool(p, "defaultNew") == Some(true);
     let reply_default = opt_bool(p, "defaultReply") == Some(true);
@@ -2955,7 +2960,7 @@ fn signature_edit(s: &mut Session, p: &Value) -> CmdResult {
     let name = req_str(p, "name")?.to_owned();
     let new_name = opt_str(p, "newName").map(str::to_owned);
     let body = doc_param(p)?;
-    let before = s.mailbox.clone();
+    let before = s.mailbox.without_mail();
     let final_name = s.mailbox.edit_signature(&name, new_name.as_deref(), body)?;
     commit_extras(s, before, "Edit Signature");
     Ok(json!({"name": final_name}))
@@ -2963,7 +2968,7 @@ fn signature_edit(s: &mut Session, p: &Value) -> CmdResult {
 
 fn signature_delete(s: &mut Session, p: &Value) -> CmdResult {
     let name = req_str(p, "name")?.to_owned();
-    let before = s.mailbox.clone();
+    let before = s.mailbox.without_mail();
     let removed = s.mailbox.delete_signature(&name)?;
     commit_extras(s, before, "Delete Signature");
     Ok(json!({"deleted": removed.name, "count": s.mailbox.signatures.len()}))
@@ -2986,7 +2991,7 @@ fn signature_defaults(s: &mut Session, p: &Value) -> CmdResult {
     if new_messages.is_none() && replies.is_none() {
         return Err(CmdError::Params("`newMessages` and/or `replies` (name or null) required".into()));
     }
-    let before = s.mailbox.clone();
+    let before = s.mailbox.without_mail();
     s.mailbox.set_signature_defaults(account, new_messages, replies)?;
     commit_extras(s, before, "Default Signature");
     Ok(json!({
@@ -3009,14 +3014,14 @@ fn suggest_recipients(s: &mut Session, p: &Value) -> CmdResult {
 
 fn forget_recipient(s: &mut Session, p: &Value) -> CmdResult {
     let addr = req_str(p, "address")?.to_owned();
-    let before = s.mailbox.clone();
+    let before = s.mailbox.without_mail();
     let removed = s.mailbox.forget_recipient(&addr);
     commit_extras(s, before, "Remove From Auto-Complete List");
     Ok(json!({"removed": removed}))
 }
 
 fn empty_auto_complete(s: &mut Session, _p: &Value) -> CmdResult {
-    let before = s.mailbox.clone();
+    let before = s.mailbox.without_mail();
     let n = s.mailbox.recent_recipients.len();
     s.mailbox.recent_recipients.clear();
     commit_extras(s, before, "Empty Auto-Complete List");

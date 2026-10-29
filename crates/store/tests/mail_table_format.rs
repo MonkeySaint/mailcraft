@@ -200,3 +200,47 @@ fn repo_trait_object_reads_what_the_table_reads() {
     let repo: &dyn MailRepo = &empty;
     assert!(repo.is_empty() && repo.all_counts().is_empty() && repo.ids_in(inbox).is_empty());
 }
+
+/// Storage stage S3: the trait's writes land in change records, which commit to the before-images of what
+/// they wrote and roll back to the state at `begin`; the stored form never carries a record.
+#[test]
+fn repo_trait_object_writes_into_change_records() {
+    let mut mb = fixture();
+    let account = mb.accounts[0].id;
+    let inbox = mb.role_folder(account, FolderRole::Inbox).unwrap();
+    let sent = mb.role_folder(account, FolderRole::SentItems).unwrap();
+    let start = mb.mail.clone();
+    let ids = mb.mail.ids_in(inbox);
+    let repo: &mut dyn MailRepo = &mut mb.mail;
+    let token = repo.begin();
+    assert_eq!(repo.set_read(&ids, true).unwrap().len(), 1, "one of the two was unread");
+    assert_eq!(repo.move_to(&ids, sent).unwrap(), ids);
+    assert!(repo.move_to(&ids, sent).unwrap().is_empty(), "already there");
+    let new = MailItem { id: ItemId(900), folder: inbox, subject: "new".into(), ..Default::default() };
+    assert!(repo.insert(new).unwrap().is_none());
+    assert!(repo.update(ItemId(900), &mut |m| m.read = true).unwrap());
+    assert!(!repo.update(ItemId(901), &mut |m| m.read = true).unwrap());
+    let gone = repo.remove(&[ids[0], ItemId(902)]).unwrap();
+    assert_eq!(gone.len(), 1);
+    assert_eq!(repo.get(ids[1]).unwrap().folder, sent);
+    let changes = repo.commit(token).unwrap();
+    assert_eq!(changes.ids().collect::<Vec<_>>(), vec![ids[0], ids[1], ItemId(900)]);
+    assert_eq!(changes.before(ItemId(900)), Some(None));
+    assert_eq!(changes.before(ids[0]).flatten(), start.get(ids[0]));
+    assert!(matches!(repo.commit(token), Err(mailcraft_store::StoreError::NoChangeRecord)));
+    // A rollback puts back what was written since its begin.
+    let after = mb.mail.clone();
+    let repo: &mut dyn MailRepo = &mut mb.mail;
+    let token = repo.begin();
+    repo.remove(&ids).unwrap();
+    repo.set_read(&[ItemId(900)], false).unwrap();
+    let undone = repo.rollback(token).unwrap();
+    assert_eq!(undone.len(), 2, "ids[1] and 900 (ids[0] went in the first record)");
+    assert_eq!(mb.mail, after);
+    assert!(mb.mail.rollback(token).is_none());
+    // An open record changes nothing in the stored forms.
+    let open = mb.mail.begin();
+    let journal = serde_json::to_string(&Op::Replace(Box::new(mb.clone()))).unwrap();
+    assert_eq!(journal, format!("{{\"Replace\":{}}}", serde_json::to_string(&legacy(&mb)).unwrap()));
+    assert!(mb.mail.commit(open).is_some_and(|c| c.is_empty()));
+}

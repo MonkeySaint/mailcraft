@@ -781,9 +781,10 @@ pub(crate) fn apply(s: &mut Session, account: AccountId, ev: JmapEvent, new_inbo
     }
 }
 
-/// After a command: true when `before` → `after` changed mail of the JMAP account `account` in a way the
-/// server should learn (folder, read, flag, response, new or removed items).
-pub(crate) fn changed(before: &Mailbox, after: &Mailbox, account: AccountId) -> bool {
+/// After a command: true when the change record (`before`: everything but the mail as it was; `mail`: the
+/// before-images of the items written) changed mail of the JMAP account `account` in a way the server should
+/// learn (folder, read, flag, response, new or removed items). Only the items in the record are looked at.
+pub(crate) fn changed(before: &Mailbox, mail: &MailChanges, after: &Mailbox, account: AccountId) -> bool {
     let in_acct = |mb: &Mailbox, m: &MailItem| mb.folder(m.folder).is_some_and(|f| f.account == account);
     let same = |a: &MailItem, b: &MailItem| {
         a.folder == b.folder
@@ -792,8 +793,11 @@ pub(crate) fn changed(before: &Mailbox, after: &Mailbox, account: AccountId) -> 
             && a.response == b.response
             && a.is_draft == b.is_draft
     };
-    before.mail.iter().any(|(id, b)| in_acct(before, b) && after.mail.get(id).is_none_or(|a| !same(a, b)))
-        || after.mail.iter().any(|(id, a)| in_acct(after, a) && !before.mail.contains(id))
+    mail.iter().any(|(id, b)| match (b, after.mail.get(id)) {
+        (Some(b), a) => in_acct(before, b) && a.is_none_or(|a| !same(a, b)),
+        (None, Some(a)) => in_acct(after, a),
+        (None, None) => false,
+    })
 }
 
 #[cfg(test)]

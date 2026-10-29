@@ -107,17 +107,13 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 fn undo(s: &mut Session, _: &Value) -> CmdResult {
-    match s.undo_last() {
-        Some(label) => Ok(json!({"undone": label})),
-        None => Err(CmdError::Disabled("nothing to undo".into())),
-    }
+    let label = s.undo_last()?;
+    Ok(json!({"undone": label}))
 }
 
 fn redo(s: &mut Session, _: &Value) -> CmdResult {
-    match s.redo_last() {
-        Some(label) => Ok(json!({"redone": label})),
-        None => Err(CmdError::Disabled("nothing to redo".into())),
-    }
+    let label = s.redo_last()?;
+    Ok(json!({"redone": label}))
 }
 
 fn minimize(s: &mut Session, _: &Value) -> CmdResult {
@@ -438,7 +434,11 @@ mod tests {
         let after = s.mailbox.clone();
         assert_ne!(before, after);
         s.run("app.undo", &json!({})).unwrap();
-        assert_eq!(s.mailbox, before);
+        // Everything comes back but the id counter: the pasted copy's id is not handed out again.
+        assert_eq!(s.mailbox.next_id, after.next_id);
+        let mut undone = s.mailbox.clone();
+        undone.next_id = before.next_id;
+        assert_eq!(undone, before);
         s.run("app.redo", &json!({})).unwrap();
         assert_eq!(s.mailbox, after);
         assert!(s.run("app.redo", &json!({})).is_err());

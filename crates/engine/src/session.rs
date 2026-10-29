@@ -231,9 +231,9 @@ pub struct Session {
     pub clip_history: Vec<crate::compose::ClipEntry>,
     /// Last folder shown in each module (restored when switching back).
     pub module_folders: Vec<(Module, FolderId)>,
-    /// Journal size in bytes past which a write folds the journal into a fresh snapshot (0 = never). Undo,
-    /// redo and view changes journal whole-mailbox `Replace` ops, so without this the journal would grow
-    /// until the store refuses it.
+    /// Journal size in bytes past which a write folds the journal into a fresh snapshot (0 = never).
+    /// Changes to accounts, rules, categories and views still journal whole-mailbox `Replace` ops, so
+    /// without this the journal would grow until the store refuses it.
     pub checkpoint_bytes: u64,
     /// Number of [`Session::journal`] calls so far (lets `run` tell whether a failed command journaled).
     journal_calls: u64,
@@ -864,7 +864,7 @@ impl Session {
         if !self.settings.bool("advanced.emptyDeletedOnExit") {
             return;
         }
-        let before = self.mailbox.clone();
+        let recording = self.begin_changes();
         let deleted: Vec<FolderId> = self
             .mailbox
             .folders
@@ -885,12 +885,35 @@ impl Session {
                 }
             }
         }
-        let ops = diff_ops(&before, &self.mailbox);
+        let mut changes = self.end_changes(recording);
+        let ops = changes.ops(&self.mailbox);
         if !ops.is_empty() {
-            crate::recover::capture(self, &before);
-            self.undo.push(UndoEntry::new("Empty Deleted Items", Box::new(before)));
+            crate::recover::capture(self, &changes);
+            self.record_undo("Empty Deleted Items", changes);
             self.journal(ops);
             self.tidy_selection();
+        }
+    }
+
+    /// Drops change records left open on the mail table when nothing that could close them is running (no
+    /// command, no undo; called as the outermost command starts and as send/receive results are applied). A
+    /// record is only left open by a panic between opening and closing it with no enclosing record to fold it
+    /// into (inside undo's adjustments, or queueing server changes); kept, it would copy every item written
+    /// for the rest of the session.
+    pub(crate) fn drop_stray_records(&mut self) {
+        if self.run_depth > 0 || !self.mailbox.mail.is_recording() {
+            return;
+        }
+        let n = self.mailbox.mail.abandon_all();
+        log::error!("dropped {n} change record(s) left open by an earlier failure");
+    }
+
+    /// Records a fresh undo step from a command's changes. A change set whose mail record was lost cannot be
+    /// undone: the history is cleared instead (an older step would not fit the mailbox any more).
+    pub(crate) fn record_undo(&mut self, label: &str, changes: crate::changes::ChangeSet) {
+        match UndoEntry::from_changes(label, changes) {
+            Some(entry) => self.undo.push(entry),
+            None => self.undo.clear(),
         }
     }
 
@@ -923,12 +946,13 @@ impl Session {
     }
 
     /// Runs a command by id. Checks `enabled`, records undo for mutating commands, guards against panics
-    /// (a panicking command returns `CmdError::Failed` and the mailbox is restored from the undo snapshot),
+    /// (a panicking command returns `CmdError::Failed` and the mailbox is put back from its change record),
     /// flushes pending ops to the store.
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
         let Some(spec) = self.registry.get(id).cloned() else {
             return Err(CmdError::Unknown(id.to_owned()));
         };
+        self.drop_stray_records();
         let named = std::mem::replace(&mut self.params_name_items, names_items(params));
         let scope = self.named_items(params);
         let enabled = catch_unwind(AssertUnwindSafe(|| match scope {
@@ -957,12 +981,13 @@ impl Session {
         }
         let read_on_delete = (id == "mail.delete" && self.settings.bool("mail.other.markReadOnDelete"))
             .then(|| self.target_ids(params));
-        // Undo/redo restore snapshots themselves (and journal a Replace); they must not record undo entries.
+        // Undo/redo restore their steps and journal them themselves; they must not record undo entries.
         let self_journaling = matches!(spec.id, "app.undo" | "app.redo");
-        let snapshot = (spec.mutates && !self_journaling).then(|| self.mailbox.clone());
+        // What the command changes is recorded (`changes.rs`): no copy of the whole mailbox.
+        let recording = (spec.mutates && !self_journaling).then(|| self.begin_changes());
         let pending_before = self.pending_ops.len();
         let journal_calls_before = self.journal_calls;
-        let counted = u32::from(snapshot.is_some());
+        let counted = u32::from(recording.is_some());
         self.run_depth = self.run_depth.saturating_add(counted);
         let result = catch_unwind(AssertUnwindSafe(|| (spec.run)(self, params)));
         self.run_depth = self.run_depth.saturating_sub(counted);
@@ -991,26 +1016,31 @@ impl Session {
                 }
             }
         }
-        if let Some(before) = snapshot {
+        if let Some(recording) = recording {
             // The command may have changed the mailbox (or it is put back below): memoised views are stale.
             self.mailbox_changed();
             if result.is_err() {
-                self.mailbox = before;
+                let back = self.rollback_changes(recording);
                 // Ops a failed command queued describe changes that were just rolled back.
-                if self.journal_calls != journal_calls_before {
+                if back.mail.is_none() {
+                    // Nothing could be rolled back; the whole mailbox was journaled as it is.
+                } else if self.journal_calls != journal_calls_before {
                     // It journaled: those ops may already be in the store (or a queued Replace may have
-                    // superseded older ops), so record the rolled-back mailbox on top of them.
+                    // superseded older ops), and it may have changed an item again after journaling it, so
+                    // record the whole rolled-back mailbox on top of them (rare: a command that journals and
+                    // then fails).
                     self.journal(vec![Op::Replace(Box::new(self.mailbox.clone()))]);
                 } else if self.pending_ops.len() > pending_before {
                     self.pending_ops.truncate(pending_before);
                 }
             } else {
+                let mut changes = self.end_changes(recording);
                 // Local changes to synchronised folders become queued server changes (adjusting the
-                // mailbox, so this comes before the diff that journals it).
+                // mailbox, so this comes before the ops that journal it).
                 if self.run_depth == 0 {
-                    crate::sync::queue_local_changes(self, &before);
+                    crate::sync::queue_local_changes(self, &mut changes);
                 }
-                let ops = diff_ops(&before, &self.mailbox);
+                let ops = changes.ops(&self.mailbox);
                 // Items this command deleted for good stay recoverable (not a draft replaced by its sent copy,
                 // nor the items of a data file being closed or of a removed account: `capture` skips those).
                 if !ops.is_empty()
@@ -1018,14 +1048,14 @@ impl Session {
                     && !self.undo_barrier
                     && !spec.id.starts_with("compose.")
                 {
-                    crate::recover::capture(self, &before);
+                    crate::recover::capture(self, &changes);
                 }
                 if self.undo_barrier {
                     self.undo.clear();
                 }
                 if !ops.is_empty() {
                     if self.automatic_depth == 0 && !self.undo_barrier {
-                        self.undo.push(UndoEntry::new(spec.label, Box::new(before)));
+                        self.record_undo(spec.label, changes);
                     }
                     self.journal(ops);
                 }
@@ -1163,7 +1193,7 @@ impl Session {
 
     /// Drops from memory the message sources the store now holds (the live item keeps the blob key), once
     /// the outermost command or sync batch is done: nothing in it reads the in-memory copy any more, and
-    /// undo snapshots taken before it keep their own. Sources that changed since they were stored stay.
+    /// undo steps taken before it keep their own copies. Sources that changed since they were stored stay.
     pub(crate) fn release_sources(&mut self) {
         if self.run_depth > 0 || self.store_guard.stored.is_empty() {
             return;
@@ -1231,30 +1261,142 @@ impl Session {
         }
     }
 
-    /// Undoes the last recorded command (restores its snapshot); returns its label.
-    pub fn undo_last(&mut self) -> Option<String> {
-        let entry = self.undo.undo.pop()?;
-        let after = std::mem::replace(&mut self.mailbox, *entry.before);
-        crate::sync::after_restore(self, &after);
-        self.undo.push_redo(UndoEntry::new(entry.label.clone(), Box::new(after)));
-        self.after_restore();
-        Some(entry.label)
+    /// Undoes the last recorded command (puts back what it changed); returns its label. `Disabled` when there
+    /// is nothing to undo; `Failed` when putting the step back went wrong (the mailbox and the history are
+    /// left as they were).
+    pub fn undo_last(&mut self) -> Result<String, CmdError> {
+        let entry = self.undo.undo.pop().ok_or_else(|| CmdError::Disabled("nothing to undo".into()))?;
+        let label = entry.label.clone();
+        match self.restore_step(entry) {
+            Ok(live) => match UndoEntry::from_changes(&label, live) {
+                Some(redo) => self.undo.push_redo(redo),
+                None => self.undo.redo.clear(),
+            },
+            Err(entry) => {
+                self.undo.undo.push(*entry);
+                return Err(CmdError::Failed(format!("\"{label}\" could not be undone")));
+            }
+        }
+        Ok(label)
     }
 
-    /// Redoes the last undone command; returns its label.
-    pub fn redo_last(&mut self) -> Option<String> {
-        let entry = self.undo.redo.pop()?;
-        let before = std::mem::replace(&mut self.mailbox, *entry.before);
-        crate::sync::after_restore(self, &before);
-        self.undo.push_keep_redo(UndoEntry::new(entry.label.clone(), Box::new(before)));
-        self.after_restore();
-        Some(entry.label)
+    /// Redoes the last undone command; returns its label (errors as [`Session::undo_last`]).
+    pub fn redo_last(&mut self) -> Result<String, CmdError> {
+        let entry = self.undo.redo.pop().ok_or_else(|| CmdError::Disabled("nothing to redo".into()))?;
+        let label = entry.label.clone();
+        match self.restore_step(entry) {
+            Ok(live) => match UndoEntry::from_changes(&label, live) {
+                Some(undo) => self.undo.push_keep_redo(undo),
+                None => self.undo.undo.clear(),
+            },
+            Err(entry) => {
+                self.undo.redo.push(*entry);
+                return Err(CmdError::Failed(format!("\"{label}\" could not be redone")));
+            }
+        }
+        Ok(label)
     }
 
-    fn after_restore(&mut self) {
-        self.journal(vec![Op::Replace(Box::new(self.mailbox.clone()))]);
+    /// Puts an undo or redo step back: everything but the mail as the step kept it, and the mail items it
+    /// kept, then what happened meanwhile (folders holding later mail, `sync::after_restore`). Journals the
+    /// change and returns what was there before, as the step that reverts this one.
+    ///
+    /// A panic while adjusting for what happened meanwhile puts the mailbox back as it was before the
+    /// restore and hands the step back (`Err`) for the history to keep; nothing is journaled.
+    fn restore_step(&mut self, entry: UndoEntry) -> Result<crate::changes::ChangeSet, Box<UndoEntry>> {
+        #[cfg(any(test, debug_assertions))]
+        let full = self.mailbox.clone();
+        let UndoEntry { label, small, mail, .. } = entry;
+        let step_ids: std::collections::BTreeSet<ItemId> = mail.ids().collect();
+        let live_small = Box::new(self.mailbox.replace_all_but_mail(*small));
+        // Ids never go back: items and folders made after the step (a draft saved, mail that arrived) keep
+        // theirs, and an id the step frees is not handed out again before a redo brings its item back.
+        self.mailbox.next_id = self.mailbox.next_id.max(live_small.next_id);
+        let live_mail = self.mailbox.mail.restore(mail);
+        // What the step put back, in case it has to be taken out again.
+        let step_small = self.mailbox.without_mail();
+        let mut changes = crate::changes::ChangeSet::new(live_small, Some(live_mail));
+        #[cfg(any(test, debug_assertions))]
+        changes.set_full(full);
+        let token = self.mailbox.mail.begin();
+        let adjusted = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            test_hooks::maybe_panic_in_restore(&mut self.mailbox.mail);
+            self.keep_filled_folders(&changes.small);
+            crate::sync::after_restore(self, &mut changes);
+        }));
+        if let Err(payload) = adjusted {
+            log::error!(
+                "undo/redo of \"{label}\" panicked: {}; the step is kept",
+                panic_text(payload.as_ref())
+            );
+            // The adjustments go first (records they left open are folded in), then the restore itself.
+            let _ = self.mailbox.mail.rollback(token);
+            let crate::changes::ChangeSet { small: live_small, mail: live_mail, .. } = changes;
+            let next_id = self.mailbox.next_id;
+            let _ = self.mailbox.replace_all_but_mail(*live_small);
+            self.mailbox.next_id = self.mailbox.next_id.max(next_id);
+            let put_back = live_mail.map(|m| self.mailbox.mail.restore(m)).unwrap_or_default();
+            let mail = put_back.into_iter().filter(|(id, _)| step_ids.contains(id)).collect();
+            self.mailbox_changed();
+            self.tidy_selection();
+            return Err(Box::new(UndoEntry::new(label, Box::new(step_small), mail)));
+        }
+        let more = self.mailbox.mail.commit(token);
+        changes.absorb(more);
+        let ops = changes.ops(&self.mailbox);
+        self.journal(ops);
         self.refresh_me();
         self.tidy_selection();
+        Ok(changes)
+    }
+
+    /// After an undo or redo put everything but the mail back: a folder the step takes away (it created the
+    /// folder) that still holds mail the step did not put there (filed by AutoArchive, a rule or
+    /// synchronisation afterwards) stays, with its parents, so that mail is never dropped. `live` is
+    /// everything but the mail as it was before the restore.
+    ///
+    /// Not when the folder's account is gone too (undo of Add Account, redo of Remove Account): that mail goes
+    /// with the account, as the step took it, instead of staying in folders no account owns. Runs inside the
+    /// restore's change record, which keeps what it removes.
+    fn keep_filled_folders(&mut self, live: &Mailbox) {
+        let gone: std::collections::BTreeSet<FolderId> =
+            live.folders.keys().filter(|f| !self.mailbox.folders.contains_key(f)).copied().collect();
+        if gone.is_empty() {
+            return;
+        }
+        let mut holding: std::collections::BTreeSet<FolderId> = std::collections::BTreeSet::new();
+        for m in self.mailbox.mail.items() {
+            if gone.contains(&m.folder) {
+                holding.insert(m.folder);
+            }
+        }
+        let mut orphaned: std::collections::BTreeSet<FolderId> = std::collections::BTreeSet::new();
+        for fid in holding {
+            if !live.folders.get(&fid).is_some_and(|f| self.mailbox.account(f.account).is_some()) {
+                orphaned.insert(fid);
+                continue;
+            }
+            let mut cur = Some(fid);
+            let mut hops = 0usize;
+            while let Some(f) = cur {
+                hops = hops.saturating_add(1);
+                if self.mailbox.folders.contains_key(&f) || hops > live.folders.len() {
+                    break;
+                }
+                let Some(folder) = live.folders.get(&f) else { break };
+                if self.mailbox.account(folder.account).is_none() {
+                    break;
+                }
+                log::info!("undo keeps folder {} ({}): it holds mail filed after the step", f.0, folder.name);
+                cur = folder.parent;
+                self.mailbox.folders.insert(f, folder.clone());
+            }
+        }
+        if !orphaned.is_empty() {
+            log::info!("undo removes the mail of {} folders of an account it takes away", orphaned.len());
+            self.mailbox.mail.retain(|_, m| !orphaned.contains(&m.folder));
+        }
     }
 
     /// Drops selected items that no longer exist; reselects the default folder when the selected one is gone.
@@ -1412,6 +1554,32 @@ pub(crate) const SCOPE_NAMES: [(SearchScope, &str); 5] = [
     (SearchScope::AllItems, "allItems"),
 ];
 
+/// Tests: makes the next undo or redo panic while it adjusts for what happened after its step.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PANIC_IN_RESTORE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn panic_in_next_restore() {
+        PANIC_IN_RESTORE.with(|c| c.set(true));
+    }
+
+    /// Panics when asked to, after opening a change record it never closes and changing an item under it
+    /// (as code that panics half-way would).
+    pub(crate) fn maybe_panic_in_restore(mail: &mut mailcraft_model::MailTable) {
+        if PANIC_IN_RESTORE.with(|c| c.replace(false)) {
+            let _ = mail.begin();
+            if let Some(id) = mail.ids().next() {
+                mail.update(id, |m| m.subject.push_str(" (half done)"));
+            }
+            panic!("injected panic while undo adjusts the mailbox");
+        }
+    }
+}
+
 /// Text of a panic payload.
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -1426,45 +1594,16 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 /// Store ops turning `before` into `after`: per-item and per-folder upserts/removals, or one `Replace` when
 /// anything else changed (accounts and their sync queues, rules, categories, views, quick steps,
 /// calendar/contacts/tasks/notes, signatures, Auto-Complete, the dictionary).
+///
+/// Compares every item, so it is O(mailbox). Commands, undo and sync use change records instead
+/// (`changes.rs`, which derives the same ops); this remains for the debug-build check that they agree and for
+/// tests (release builds leave it out).
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
-    // Exhaustive on purpose: a new Mailbox field fails to compile here until it is journaled.
-    let Mailbox {
-        accounts,
-        folders: _,
-        mail: _,
-        appointments,
-        contacts,
-        tasks,
-        notes,
-        categories,
-        rules,
-        quick_steps,
-        views,
-        next_id: _,
-        signatures,
-        signature_defaults,
-        recent_recipients,
-        custom_dictionary,
-        junk,
-    } = after;
-    let other_changed = before.accounts != *accounts
-        || before.categories != *categories
-        || before.rules != *rules
-        || before.quick_steps != *quick_steps
-        || before.views != *views
-        || before.appointments != *appointments
-        || before.contacts != *contacts
-        || before.tasks != *tasks
-        || before.notes != *notes
-        || before.signatures != *signatures
-        || before.signature_defaults != *signature_defaults
-        || before.recent_recipients != *recent_recipients
-        || before.custom_dictionary != *custom_dictionary
-        || before.junk != *junk;
-    if other_changed {
+    if other_changed(before, after) {
         return vec![Op::Replace(Box::new(after.clone()))];
     }
-    let mut ops = Vec::new();
+    let mut ops = account_ops(before, after);
     for (id, f) in &after.folders {
         if before.folders.get(id) != Some(f) {
             ops.push(Op::PutFolder(Box::new(f.clone())));
@@ -1486,6 +1625,63 @@ pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
         }
     }
     ops
+}
+
+/// One `PutAccount` per account that changed in place ([`other_changed`] is false, so the accounts are the
+/// same ids in the same order), in list order.
+pub(crate) fn account_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
+    before
+        .accounts
+        .iter()
+        .zip(&after.accounts)
+        .filter(|(b, a)| b != a)
+        .map(|(_, a)| Op::PutAccount(Box::new(a.clone())))
+        .collect()
+}
+
+/// Whether the account list kept its accounts in their places (only their contents may differ).
+fn same_accounts(before: &[mailcraft_model::Account], after: &[mailcraft_model::Account]) -> bool {
+    before.len() == after.len() && before.iter().zip(after).all(|(b, a)| b.id == a.id)
+}
+
+/// Whether anything but the folders, the mail, the contents of accounts that kept their place
+/// ([`account_ops`]) and `next_id` differs (the store journals that as a whole mailbox `Replace` until
+/// storage stage S4).
+pub(crate) fn other_changed(before: &Mailbox, after: &Mailbox) -> bool {
+    // Exhaustive on purpose: a new Mailbox field fails to compile here until it is journaled.
+    let Mailbox {
+        accounts,
+        folders: _,
+        mail: _,
+        appointments,
+        contacts,
+        tasks,
+        notes,
+        categories,
+        rules,
+        quick_steps,
+        views,
+        next_id: _,
+        signatures,
+        signature_defaults,
+        recent_recipients,
+        custom_dictionary,
+        junk,
+    } = after;
+    !same_accounts(&before.accounts, accounts)
+        || before.categories != *categories
+        || before.rules != *rules
+        || before.quick_steps != *quick_steps
+        || before.views != *views
+        || before.appointments != *appointments
+        || before.contacts != *contacts
+        || before.tasks != *tasks
+        || before.notes != *notes
+        || before.signatures != *signatures
+        || before.signature_defaults != *signature_defaults
+        || before.recent_recipients != *recent_recipients
+        || before.custom_dictionary != *custom_dictionary
+        || before.junk != *junk
 }
 
 /// Whether command params name the items to act on ([`Session::params_name_items`]).

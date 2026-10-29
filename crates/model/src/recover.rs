@@ -232,10 +232,22 @@ impl RecoverBin {
         keep: impl Fn(FolderId) -> bool,
         limit: usize,
     ) -> Vec<DeletedItem> {
-        let mut out: Vec<DeletedItem> = before
-            .mail
-            .items()
-            .filter(|m| !after.mail.contains(m.id) && keep(m.folder))
+        let gone = before.mail.items().filter(|m| !after.mail.contains(m.id));
+        RecoverBin::vanished_from(before, gone, after, keep, limit)
+    }
+
+    /// Like [`RecoverBin::vanished_where`] when the mail that went is known already (a change record):
+    /// `gone_mail` lists it, and only the calendar, contact, task and note items are compared. `before` needs
+    /// no mail (a mailbox without mail, [`Mailbox::without_mail`], will do).
+    pub fn vanished_from<'a>(
+        before: &Mailbox,
+        gone_mail: impl Iterator<Item = &'a crate::MailItem>,
+        after: &Mailbox,
+        keep: impl Fn(FolderId) -> bool,
+        limit: usize,
+    ) -> Vec<DeletedItem> {
+        let mut out: Vec<DeletedItem> = gone_mail
+            .filter(|m| keep(m.folder))
             .take(limit)
             .map(|m| DeletedItem::Mail(Box::new(m.clone())))
             .collect();

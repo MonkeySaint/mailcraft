@@ -1,11 +1,13 @@
 //! The mail repository abstraction (`plan/storage-adr.md` §4.2).
 //!
-//! [`MailRepo`] is how the engine will reach mail once it no longer holds every item in memory. Stage S2
-//! defines the read half and implements it on the in-memory [`MailTable`] (the future `MemRepo` of the
-//! browser build, the sample mailbox and tests) with exactly today's behaviour. The write half (`insert`,
-//! `update`, `move_to`, `begin`/`commit` with a `ChangeSet`) arrives with S3; list windows (`view`, `page`)
-//! and persisted threads (`thread_members`) with S7; message sources (`raw`) with S5. A SQLite-backed
-//! implementation follows in S6.
+//! [`MailRepo`] is how the engine will reach mail once it no longer holds every item in memory. It is
+//! implemented on the in-memory [`MailTable`] (the future `MemRepo` of the browser build, the sample mailbox
+//! and tests) with exactly today's behaviour. Stage S2 defined the reads; S3 adds the writes and the change
+//! records they land in ([`MailRepo::begin`], [`MailRepo::commit`], [`MailRepo::rollback`]): a commit hands
+//! back the before-image of every item written since the matching begin ([`MailChanges`]), which is what the
+//! engine journals, queues for the server and keeps as an undo step. List windows (`view`, `page`) and
+//! persisted threads (`thread_members`) come with S7, message sources (`raw`) with S5, and a SQLite-backed
+//! implementation with S6.
 //!
 //! The trait has no borrowing iterator over every item. The engine and UI still walk the whole table through
 //! `MailTable::items`/`iter`/`ids`/`in_folder` in well over a hundred places; those move to [`MailRepo::scan`]
@@ -19,9 +21,11 @@ use std::collections::BTreeMap;
 use std::ops::{ControlFlow, Deref};
 use std::sync::Arc;
 
-use mailcraft_model::{Body, FolderCounts, FolderId, ItemId, MailItem, MailTable, ScanFilter};
+use mailcraft_model::{
+    Body, ChangeToken, FolderCounts, FolderId, ItemId, MailChanges, MailItem, MailTable, ScanFilter,
+};
 
-use crate::Result;
+use crate::{Result, StoreError};
 
 /// A value read from a repository: borrowed from the repository itself, or shared from its cache.
 #[derive(Debug)]
@@ -91,6 +95,28 @@ pub trait MailRepo {
     fn scan(&self, filter: &ScanFilter, visit: &mut dyn FnMut(&MailItem) -> ControlFlow<()>) -> Result<()>;
     /// The decoded body of item `id` (`None` for an unknown id).
     fn body(&self, id: ItemId) -> Result<Option<Shared<'_, Body>>>;
+
+    // ---- writes (each recorded in the innermost open change record) ----
+
+    /// Opens a change record. Records nest; see [`MailTable::begin`].
+    fn begin(&mut self) -> ChangeToken;
+    /// Closes record `token`: the before-image of every item written since it opened. An enclosing record
+    /// keeps what it did not have. [`StoreError::NoChangeRecord`] when `token` is not open.
+    fn commit(&mut self, token: ChangeToken) -> Result<MailChanges>;
+    /// Closes record `token` and puts back every item written since it opened. Returns the items as they
+    /// were just before. [`StoreError::NoChangeRecord`] when `token` is not open.
+    fn rollback(&mut self, token: ChangeToken) -> Result<MailChanges>;
+    /// Stores `item` under its id, returning the item it replaced.
+    fn insert(&mut self, item: MailItem) -> Result<Option<MailItem>>;
+    /// Changes item `id` in place; false when there is no such item.
+    fn update(&mut self, id: ItemId, f: &mut dyn FnMut(&mut MailItem)) -> Result<bool>;
+    /// Removes these items; returns those that existed, in the order given.
+    fn remove(&mut self, ids: &[ItemId]) -> Result<Vec<MailItem>>;
+    /// Files these items in `to` (the caller checks the folder accepts mail); returns the ids that moved
+    /// (unknown ids and items already there are skipped).
+    fn move_to(&mut self, ids: &[ItemId], to: FolderId) -> Result<Vec<ItemId>>;
+    /// Marks these items read or unread; returns the ids that changed.
+    fn set_read(&mut self, ids: &[ItemId], read: bool) -> Result<Vec<ItemId>>;
 }
 
 impl MailRepo for MailTable {
@@ -130,5 +156,45 @@ impl MailRepo for MailTable {
     }
     fn body(&self, id: ItemId) -> Result<Option<Shared<'_, Body>>> {
         Ok(MailTable::body(self, id).map(Shared::Borrowed))
+    }
+    fn begin(&mut self) -> ChangeToken {
+        MailTable::begin(self)
+    }
+    fn commit(&mut self, token: ChangeToken) -> Result<MailChanges> {
+        MailTable::commit(self, token).ok_or(StoreError::NoChangeRecord)
+    }
+    fn rollback(&mut self, token: ChangeToken) -> Result<MailChanges> {
+        MailTable::rollback(self, token).ok_or(StoreError::NoChangeRecord)
+    }
+    fn insert(&mut self, item: MailItem) -> Result<Option<MailItem>> {
+        Ok(MailTable::insert(self, item.id, item))
+    }
+    fn update(&mut self, id: ItemId, f: &mut dyn FnMut(&mut MailItem)) -> Result<bool> {
+        Ok(MailTable::update(self, id, f))
+    }
+    fn remove(&mut self, ids: &[ItemId]) -> Result<Vec<MailItem>> {
+        Ok(ids.iter().filter_map(|id| MailTable::remove(self, *id)).collect())
+    }
+    fn move_to(&mut self, ids: &[ItemId], to: FolderId) -> Result<Vec<ItemId>> {
+        let mut moved = Vec::new();
+        for id in ids {
+            if MailTable::get(self, *id).is_some_and(|m| m.folder != to)
+                && MailTable::update(self, *id, |m| m.folder = to)
+            {
+                moved.push(*id);
+            }
+        }
+        Ok(moved)
+    }
+    fn set_read(&mut self, ids: &[ItemId], read: bool) -> Result<Vec<ItemId>> {
+        let mut changed = Vec::new();
+        for id in ids {
+            if MailTable::get(self, *id).is_some_and(|m| m.read != read)
+                && MailTable::update(self, *id, |m| m.read = read)
+            {
+                changed.push(*id);
+            }
+        }
+        Ok(changed)
     }
 }
