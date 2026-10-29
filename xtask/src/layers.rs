@@ -1,7 +1,8 @@
 //! `cargo xtask layers`: each crate depends only on strictly lower layers, and nothing below the UI layer
 //! (L6) pulls in a GUI toolkit, directly or transitively. Test-support crates (local test servers) may be
 //! used only as dev-dependencies, or by apps and tooling. The native storage crates (SQLite and zstd, C code)
-//! are declared by `mailcraft-store` alone, so every database and pack access goes through its API.
+//! are declared by `mailcraft-store` alone, so every database and pack access goes through its API. Hooks
+//! that fake server results (`mailcraft-engine/synthetic-sync`) are turned on only by the benchmark tool.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -54,6 +55,11 @@ pub const GUI_CRATES: &[&str] = &["egui", "eframe", "winit", "wgpu", "glow", "rf
 /// ADR §3.1; it keeps them out of the browser build with a target cfg, which the wasm build step checks).
 pub const STORAGE_CRATES: &[&str] = &["rusqlite", "libsqlite3-sys", "zstd", "zstd-safe", "zstd-sys"];
 pub const STORAGE_OWNER: &str = "mailcraft-store";
+
+/// Features that inject state no real source produced (test and benchmark hooks): (package, feature, the
+/// only crates that may turn it on outside dev-dependencies). Shipped apps must never be built with them.
+pub const RESTRICTED_FEATURES: &[(&str, &str, &[&str])] =
+    &[("mailcraft-engine", "synthetic-sync", &["mailcraft-bench"])];
 
 pub fn layer_of(name: &str) -> Option<u8> {
     LAYERS.iter().find(|(n, _)| *n == name).map(|(_, l)| *l)
@@ -114,7 +120,28 @@ pub fn check(meta: &Metadata) -> Vec<String> {
     problems.extend(gui_leaks(meta));
     problems.extend(desktop_links(meta));
     problems.extend(storage_owner(meta));
+    problems.extend(restricted_features(meta));
     problems
+}
+
+/// Workspace crates that turn on a [`RESTRICTED_FEATURES`] feature they are not allowed (tests may).
+fn restricted_features(meta: &Metadata) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in meta.members() {
+        for (dep, features) in &p.dependency_features {
+            for &(pkg, feature, allowed) in RESTRICTED_FEATURES {
+                if dep == pkg && features.iter().any(|f| f == feature) && !allowed.contains(&p.name.as_str())
+                {
+                    out.push(format!(
+                        "`{}` turns on `{pkg}/{feature}`: only {} may (it fakes server results)",
+                        p.name,
+                        allowed.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Workspace crates other than [`STORAGE_OWNER`] that declare a [`STORAGE_CRATES`] dependency (tests may).
@@ -310,6 +337,25 @@ mod tests {
         dev.dependencies.push(("zstd".into(), Some("dev".into())));
         let m = meta(vec![store, dev], &["mailcraft-store", "mailcraft-engine"], &[]);
         assert!(storage_owner(&m).is_empty(), "tests may use them");
+    }
+
+    #[test]
+    fn synthetic_sync_only_in_the_bench() {
+        let engine = pkg("mailcraft-engine", &[]);
+        let mut bench = pkg("mailcraft-bench", &["mailcraft-engine"]);
+        bench.dependency_features.push(("mailcraft-engine".into(), vec!["synthetic-sync".into()]));
+        let mut app = pkg("mailcraft", &["mailcraft-engine"]);
+        app.dependency_features.push(("mailcraft-engine".into(), vec!["other".into()]));
+        let members = ["mailcraft-engine", "mailcraft-bench", "mailcraft"];
+        let ok = meta(vec![engine.clone(), bench.clone(), app.clone()], &members, &[]);
+        assert!(restricted_features(&ok).is_empty(), "{:?}", restricted_features(&ok));
+        app.dependency_features.push(("mailcraft-engine".into(), vec!["synthetic-sync".into()]));
+        let bad = meta(vec![engine, bench, app], &members, &[]);
+        let problems = restricted_features(&bad);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems.iter().all(|p| p.contains("`mailcraft` turns on `mailcraft-engine/synthetic-sync`"))
+        );
     }
 
     #[test]

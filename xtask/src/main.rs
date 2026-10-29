@@ -27,10 +27,11 @@ Tasks:
   licences                   every dependency's licence is on the allowlist
   parity [--out FILE] [--check]
                              write docs/parity.md (--check: fail when stale or below xtask/parity-floor.txt)
-  bench --size 10k|100k|1m [--backend legacy|sqlite] [--small-bodies] [--out FILE]
-        [--seed N] [--sync N] [--bulk-move N] [--keep]
+  bench [--size 10k|50k | --size 100k|1m|2m --small-bodies] [--backend legacy|sqlite]
+        [--out FILE] [--seed N] [--sync N] [--bulk-move N] [--keep] [--force-large]
                              storage benchmarks on a synthetic profile (apps/mailcraft-bench, release
-                             build); JSON report in target/scratch/bench/ unless --out
+                             build); JSON report in target/scratch/bench/ unless --out. Full bodies stop
+                             at 50k messages, small bodies at 2m (--force-large lifts that)
   stats                      lines of Rust, tests and commands per crate
   version show | bump X.Y.Z | check
                              show or bump the workspace version; check it against the CI tag

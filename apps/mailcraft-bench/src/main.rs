@@ -10,21 +10,24 @@ Usage: mailcraft-bench <command> [options]
 
 Commands:
   run        generate a profile, measure it in a fresh process, write the JSON report
-  generate   only write the profile (--profile DIR)
-  measure    only measure an existing profile (--profile DIR); prints the measurements as JSON
+  generate   only write the profile (--profile DIR: missing, empty or an earlier benchmark profile)
+  measure    only measure a profile `generate` wrote (--profile DIR); prints the measurements as JSON
   maildir    write the synthetic mailbox as a Maildir tree (--out DIR), for importer tests
   mbox       write the synthetic mailbox as one MBOX file (--out FILE), for importer tests
 
 Options:
-  --size N            messages: 2000, 10k, 40k, 100k, 1m… (default 10k)
+  --size N            messages (default 10k): up to 50k with full bodies (about 70 KB each); 100k, 1m… up
+                      to 2m only with --small-bodies
   --backend B         legacy (default) or sqlite
   --small-bodies      bodies of a few KB (same structure; lets 1M-message runs fit on disk)
+  --force-large       allow sizes above those limits or above this machine's memory (never above the free
+                      disk space)
   --seed N            generator seed
   --sync N            messages applied as synchronised mail (default 10000)
   --bulk-move N       messages in the bulk move / undo / redo (default 10000)
   --generate-batch N  sources stored per fsync and commit while generating (default 1000; 1 = one per
                       source, as the app's import and sync store them)
-  --work DIR          run: where the profile is built (default target/scratch/bench/work)
+  --work DIR          run: where the profile is built, in DIR/profile (default target/scratch/bench/work)
   --out PATH          run: report file (default target/scratch/bench/<date>-<backend>-<size>.json);
                       maildir / mbox: where to write
   --profile DIR       generate / measure: the profile folder
@@ -45,6 +48,7 @@ struct Args {
     out: Option<PathBuf>,
     profile: Option<PathBuf>,
     keep: bool,
+    force_large: bool,
 }
 
 fn parse(args: &[String]) -> Result<Args> {
@@ -71,6 +75,7 @@ fn parse(args: &[String]) -> Result<Args> {
             "--out" => a.out = Some(PathBuf::from(value("--out")?)),
             "--profile" => a.profile = Some(PathBuf::from(value("--profile")?)),
             "--keep" => a.keep = true,
+            "--force-large" => a.force_large = true,
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }
@@ -80,6 +85,7 @@ fn parse(args: &[String]) -> Result<Args> {
 fn options(a: &Args) -> Options {
     let mut o = Options::new(a.size.unwrap_or(10_000));
     o.small_bodies = a.small;
+    o.force_large = a.force_large;
     if let Some(b) = a.backend {
         o.backend = b;
     }
@@ -114,6 +120,9 @@ fn child_args(o: &Options) -> Vec<String> {
     ];
     if o.small_bodies {
         v.push("--small-bodies".to_owned());
+    }
+    if o.force_large {
+        v.push("--force-large".to_owned());
     }
     v
 }
@@ -169,8 +178,10 @@ fn run_all(a: &Args) -> Result<()> {
         .map_err(|e| format!("the measuring process wrote bad JSON: {e}"))?;
     let report = mailcraft_bench::report(&o, generated, measured);
     write_json(&out, &report)?;
-    if !a.keep {
-        let _ = std::fs::remove_dir_all(&profile);
+    if !a.keep
+        && let Err(e) = mailcraft_bench::remove_profile(&profile)
+    {
+        eprintln!("mailcraft-bench: {e}");
     }
     println!("{}", summary(&report));
     println!("report: {}", out.display());
@@ -264,9 +275,16 @@ mod tests {
         let a = parse(&args).unwrap();
         let o = options(&a);
         assert_eq!(
-            (o.messages, o.small_bodies, o.seed, o.sync_messages, o.bulk_move),
-            (40_000, true, 9, 100, 50)
+            (o.messages, o.small_bodies, o.seed, o.sync_messages, o.bulk_move, o.force_large),
+            (40_000, true, 9, 100, 50, false)
         );
+        let mut forced = args.clone();
+        forced.push("--force-large".to_owned());
+        let f = options(&parse(&forced).unwrap());
+        assert!(f.force_large);
+        let mut child = vec!["measure".to_owned()];
+        child.extend(child_args(&f));
+        assert_eq!(options(&parse(&child).unwrap()), f);
         let mut child = vec!["measure".to_owned()];
         child.extend(child_args(&o));
         assert_eq!(options(&parse(&child).unwrap()), o);

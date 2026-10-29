@@ -18,6 +18,8 @@ pub struct Package {
     pub categories: Vec<String>,
     /// Declared dependencies: (package name, kind: None = normal, "dev", "build").
     pub dependencies: Vec<(String, Option<String>)>,
+    /// Features turned on by normal and build dependencies: (package name, features).
+    pub dependency_features: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -83,6 +85,17 @@ pub fn parse(json: &Value) -> Result<Metadata, String> {
                 .map(|deps| {
                     deps.iter()
                         .filter_map(|d| Some((opt_string(d.get("name"))?, opt_string(d.get("kind")))))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            dependency_features: p
+                .get("dependencies")
+                .and_then(Value::as_array)
+                .map(|deps| {
+                    deps.iter()
+                        .filter(|d| opt_string(d.get("kind")).as_deref() != Some("dev"))
+                        .filter_map(|d| Some((opt_string(d.get("name"))?, strings(d.get("features")))))
+                        .filter(|(_, f)| !f.is_empty())
                         .collect()
                 })
                 .unwrap_or_default(),

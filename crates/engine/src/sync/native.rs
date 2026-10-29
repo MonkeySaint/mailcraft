@@ -2043,6 +2043,7 @@ pub(super) fn cancel_oauth(s: &mut Session, id: AccountId) -> bool {
 
 /// Queues synthetic results for IMAP account `account` (see [`super::SyntheticImap`]) on the channel its
 /// worker would use; `poll_events` applies them. False when the account is not an IMAP account.
+#[cfg(any(test, feature = "synthetic-sync"))]
 pub(super) fn queue_synthetic(s: &Session, account: AccountId, results: super::SyntheticImap) -> bool {
     if !s.mailbox.account(account).is_some_and(|a| a.kind == AccountKind::Imap) {
         return false;

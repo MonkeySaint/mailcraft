@@ -15,6 +15,11 @@
 //! Timings are wall-clock milliseconds; memory figures are kilobytes from `/proc/self/status` (Linux only,
 //! `null` elsewhere). Measuring in a fresh process ([`measure`], which `mailcraft-bench run` starts for
 //! itself) keeps the generator's memory out of the figures.
+//!
+//! A profile folder holds a [`MARKER`] file. [`generate`] only empties a folder that is missing, empty or
+//! has the marker, and [`measure`] only opens a folder with it, so a real MailCraft profile or any other
+//! folder handed over by mistake is never deleted or changed. [`generate`] also refuses sizes whose
+//! estimated memory or disk use ([`estimate`]) would not fit, before writing anything.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -45,6 +50,23 @@ pub const SYNC_ACCOUNT: &str = "Bench IMAP (no server)";
 pub const HEADERS_FOLDER: &str = "Headers";
 /// Seed offset of the synchronised messages (other Message-IDs than the profile's).
 const SYNC_SEED: u64 = 0x5359_4e43;
+/// The file that marks a folder as a benchmark profile (written first by [`generate`]).
+pub const MARKER: &str = "bench-profile.json";
+/// Largest profile with realistic bodies (about 70 KB each) without `--force-large`.
+pub const MAX_FULL_BODIES: usize = 50_000;
+/// Largest profile with small bodies (about 2.5 KB each) without `--force-large`.
+pub const MAX_SMALL_BODIES: usize = 2_000_000;
+/// Average message source with realistic bodies (measured on the generator).
+pub const AVG_FULL_SOURCE_BYTES: u64 = 72_500;
+/// Average message source with small bodies.
+pub const AVG_SMALL_SOURCE_BYTES: u64 = 2_500;
+/// Peak memory per mail item while measuring (bodies stay on disk; the search index dominates), about 1.5
+/// times what the 5k-full (30-32 KB per item, both backends) and 40k-small (10 KB) runs peaked at.
+const ITEM_MEMORY_FULL_BYTES: u64 = 48_000;
+const ITEM_MEMORY_SMALL_BYTES: u64 = 16_000;
+/// Disk per item on top of its source (snapshot, journal, file overhead); SQLite packs compress, so the
+/// estimate is an upper bound there.
+const ITEM_DISK_BYTES: u64 = 2_000;
 
 /// The fixed search queries (ADR 6.1): rare and common terms, prefixes, people, phrases, dates, attachments.
 pub const QUERIES: [&str; 20] = [
@@ -123,6 +145,9 @@ pub struct Options {
     /// per batch. Only the benchmark batches: the app's import, sync and compose store each source with its
     /// own fsync and commit, which `1` reproduces (the legacy store writes every file durably either way).
     pub generate_batch: usize,
+    /// Allow sizes above [`MAX_FULL_BODIES`] / [`MAX_SMALL_BODIES`] and memory estimates above the
+    /// machine's (never a disk estimate above the free space).
+    pub force_large: bool,
 }
 
 impl Options {
@@ -136,6 +161,7 @@ impl Options {
             bulk_move: 10_000,
             windows: 50,
             generate_batch: GENERATE_BATCH,
+            force_large: false,
         }
     }
 
@@ -292,12 +318,191 @@ fn item_of(m: &synth::SynthMessage, folder: FolderId, now: DateTime) -> MailItem
     item
 }
 
-/// Writes a fresh profile of `opts` into `dir` (emptied first) and describes what it holds.
-pub fn generate(dir: &Path, opts: &Options) -> Result<Value> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir).map_err(|e| format!("cannot empty {}: {e}", dir.display()))?;
+// -------------------------------------------------------------------------------------------------------
+// Profile folders and size budget
+// -------------------------------------------------------------------------------------------------------
+
+/// Whether `dir` holds the [`MARKER`] of a benchmark profile.
+pub fn is_bench_profile(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(MARKER)).is_ok_and(|m| m.is_file())
+}
+
+/// Makes `dir` ready for a new profile: missing is fine, an empty folder or an old benchmark profile is
+/// emptied, anything else is refused untouched.
+fn prepare_dir(dir: &Path) -> Result<()> {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else { return Ok(()) };
+    if !meta.is_dir() {
+        return Err(format!("{} is not a folder, refusing to replace it", dir.display()));
     }
+    let empty =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?.next().is_none();
+    if !empty && !is_bench_profile(dir) {
+        return Err(format!(
+            "{} is not a benchmark profile (no {MARKER}) and is not empty, refusing to delete it",
+            dir.display()
+        ));
+    }
+    std::fs::remove_dir_all(dir).map_err(|e| format!("cannot empty {}: {e}", dir.display()))
+}
+
+/// Deletes the benchmark profile `dir`; refuses a folder without the [`MARKER`]. A missing folder is fine.
+pub fn remove_profile(dir: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(dir).is_err() {
+        return Ok(());
+    }
+    if !is_bench_profile(dir) {
+        return Err(format!("{} is not a benchmark profile (no {MARKER}), leaving it", dir.display()));
+    }
+    std::fs::remove_dir_all(dir).map_err(|e| format!("cannot delete {}: {e}", dir.display()))
+}
+
+/// What a run is expected to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Estimate {
+    /// Mail items at the end of the measurements (profile plus the two synchronised sets).
+    pub items: u64,
+    pub source_bytes: u64,
+    /// Profile size on disk at the end.
+    pub disk_bytes: u64,
+    /// Peak resident memory of the measuring process.
+    pub memory_bytes: u64,
+}
+
+/// The memory and disk a run of `opts` needs (from the average source size and per-item costs).
+pub fn estimate(opts: &Options) -> Estimate {
+    let (avg, per_item) = if opts.small_bodies {
+        (AVG_SMALL_SOURCE_BYTES, ITEM_MEMORY_SMALL_BYTES)
+    } else {
+        (AVG_FULL_SOURCE_BYTES, ITEM_MEMORY_FULL_BYTES)
+    };
+    let items = (opts.messages as u64).saturating_add((opts.sync_messages as u64).saturating_mul(2));
+    Estimate {
+        items,
+        source_bytes: items.saturating_mul(avg),
+        disk_bytes: items.saturating_mul(avg.saturating_add(ITEM_DISK_BYTES)),
+        memory_bytes: items.saturating_mul(per_item),
+    }
+}
+
+fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+/// Whether a run of `opts` with estimate `est` fits: the size caps and the machine's memory (both lifted
+/// by `force_large`) and the free disk space (never lifted). `free_disk` / `mem_total` are `None` when
+/// unknown, which skips that check.
+pub fn check_budget(
+    opts: &Options,
+    est: &Estimate,
+    free_disk: Option<u64>,
+    mem_total: Option<u64>,
+) -> Result<()> {
+    if !opts.force_large {
+        if !opts.small_bodies && opts.messages > MAX_FULL_BODIES {
+            return Err(format!(
+                "{} messages with full bodies would need about {} of memory and {} of disk; use \
+                 --small-bodies above {MAX_FULL_BODIES} messages (or --force-large)",
+                opts.messages,
+                gb(est.memory_bytes),
+                gb(est.disk_bytes)
+            ));
+        }
+        if opts.small_bodies && opts.messages > MAX_SMALL_BODIES {
+            return Err(format!(
+                "{} messages are above the {MAX_SMALL_BODIES}-message limit even with small bodies (about {} \
+                 of memory, {} of disk; --force-large to try anyway)",
+                opts.messages,
+                gb(est.memory_bytes),
+                gb(est.disk_bytes)
+            ));
+        }
+        if let Some(total) = mem_total
+            && est.memory_bytes > total / 4 * 3
+        {
+            return Err(format!(
+                "the run would need about {} of memory, more than three quarters of this machine's {} \
+                 (smaller --size, --small-bodies, or --force-large)",
+                gb(est.memory_bytes),
+                gb(total)
+            ));
+        }
+    }
+    if let Some(free) = free_disk
+        && est.disk_bytes > free
+    {
+        return Err(format!(
+            "the profile would need about {} of disk, only {} is free there",
+            gb(est.disk_bytes),
+            gb(free)
+        ));
+    }
+    Ok(())
+}
+
+/// Free bytes on the file system holding `dir` (or its nearest existing parent): `df -Pk` on Unix-likes,
+/// `None` when unknown (Windows, no `df`, odd output).
+pub fn free_disk_bytes(dir: &Path) -> Option<u64> {
+    if cfg!(windows) {
+        return None;
+    }
+    let mut at = dir;
+    while std::fs::symlink_metadata(at).is_err() {
+        at = at.parent()?;
+    }
+    let at = if at.as_os_str().is_empty() { Path::new(".") } else { at };
+    let out = std::process::Command::new("df").arg("-Pk").arg(at).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kb: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
+    kb.checked_mul(1024)
+}
+
+/// Total memory of the machine in bytes (Linux; `None` elsewhere).
+fn mem_total_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = text
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())?;
+    kb.checked_mul(1024)
+}
+
+/// Checks that a run of `opts` with its profile in `dir` fits this machine ([`check_budget`]); the space an
+/// old benchmark profile in `dir` takes counts as free.
+fn budget(dir: &Path, opts: &Options) -> Result<Value> {
+    let est = estimate(opts);
+    let reclaim =
+        if is_bench_profile(dir) { disk(dir).get("total").and_then(Value::as_u64).unwrap_or(0) } else { 0 };
+    let free = free_disk_bytes(dir).map(|f| f.saturating_add(reclaim));
+    let mem = mem_total_bytes();
+    check_budget(opts, &est, free, mem)?;
+    Ok(json!({
+        "items": est.items,
+        "source_bytes": est.source_bytes,
+        "disk_bytes": est.disk_bytes,
+        "memory_bytes": est.memory_bytes,
+        "free_disk_bytes": free,
+        "mem_total_bytes": mem,
+    }))
+}
+
+/// Writes a fresh profile of `opts` into `dir` and describes what it holds. `dir` must be missing, empty or
+/// an earlier benchmark profile (which is replaced), and the run must fit the machine ([`check_budget`]).
+pub fn generate(dir: &Path, opts: &Options) -> Result<Value> {
+    let estimate = budget(dir, opts)?;
+    prepare_dir(dir)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let marker = json!({
+        "schema": SCHEMA,
+        "backend": opts.backend.name(),
+        "messages": opts.messages,
+        "small_bodies": opts.small_bodies,
+        "seed": opts.seed,
+    });
+    std::fs::write(dir.join(MARKER), marker.to_string() + "\n")
+        .map_err(|e| format!("cannot mark {} as a benchmark profile: {e}", dir.display()))?;
     let started = Instant::now();
     let mut store = mailcraft_store::Store::open_with(dir, opts.backend.kind())
         .map_err(|e| format!("cannot open the profile: {e}"))?;
@@ -371,6 +576,7 @@ pub fn generate(dir: &Path, opts: &Options) -> Result<Value> {
             .collect::<serde_json::Map<String, Value>>(),
         "mailbox_approx_bytes": approx,
         "mail_item_size": std::mem::size_of::<MailItem>(),
+        "estimate": estimate,
         "disk": disk(dir),
     }))
 }
@@ -430,8 +636,16 @@ fn local_folder(s: &Session, name: &str) -> Option<FolderId> {
     s.mailbox.folders.values().find(|f| f.account == local && f.name == name).map(|f| f.id)
 }
 
-/// Opens the profile in `dir` and runs every measurement; the profile is changed (commands, synced mail).
+/// Opens the benchmark profile in `dir` (refused without the [`MARKER`]) and runs every measurement; the
+/// profile is changed (commands, synced mail). The commands run on the profile as generated, before the
+/// synchronised mail grows the mailbox; every section records the mail items it started with.
 pub fn measure(dir: &Path, opts: &Options) -> Result<Value> {
+    if !is_bench_profile(dir) {
+        return Err(format!(
+            "{} is not a benchmark profile (no {MARKER}); `generate` one first, refusing to open it",
+            dir.display()
+        ));
+    }
     let before_open = memory_json();
     let t = Instant::now();
     let mut s =
@@ -466,8 +680,14 @@ pub fn measure(dir: &Path, opts: &Options) -> Result<Value> {
     let scroll = scroll(&mut s, opts)?;
     let bodies = bodies(&s);
     let search = search(&mut s)?;
+    let mut commands = commands(&mut s, opts)?;
+    // The peak so far belongs to the profile as generated; the synchronised mail comes on top.
+    let memory_before_sync = memory_json();
     let sync = sync_apply(&mut s, opts)?;
-    let commands = commands(&mut s, opts)?;
+    // Commands on synchronised mail need the synced messages, so they run last (on the grown mailbox, which
+    // `imap_mail_items` records).
+    commands.insert("imap_mail_items".into(), json!(s.mailbox.mail.len()));
+    imap_commands(&mut s, &mut commands)?;
     drop(s);
     Ok(json!({
         "open": open_json,
@@ -476,8 +696,9 @@ pub fn measure(dir: &Path, opts: &Options) -> Result<Value> {
         "scroll": scroll,
         "bodies": bodies,
         "search": search,
-        "sync": sync,
         "commands": commands,
+        "memory_before_sync": memory_before_sync,
+        "sync": sync,
         "memory_end": memory_json(),
         "disk_end": disk(dir),
     }))
@@ -493,6 +714,7 @@ fn list_ms(s: &Session) -> (f64, usize) {
 }
 
 fn folder_switch(s: &mut Session) -> Result<Value> {
+    let mail_items = s.mailbox.mail.len();
     let (big, items) = largest_folder(s).ok_or("the profile has no mail folder")?;
     let name = s.mailbox.folder(big).map(|f| f.name.clone()).unwrap_or_default();
     // Start elsewhere, so the switch really changes folder.
@@ -512,6 +734,7 @@ fn folder_switch(s: &mut Session) -> Result<Value> {
     run_cmd(s, "view.conversations", json!({"on": false}))?;
     list_ms(s);
     Ok(json!({
+        "mail_items": mail_items,
         "folder": name,
         "items": items,
         "select_cmd_ms": ms(cmd),
@@ -535,6 +758,7 @@ fn median(v: &mut [f64]) -> f64 {
 /// Windows of the largest folder's list at random offsets. The legacy UI builds every row once per change
 /// (`rebuild_ms`) and slices the cached rows per frame (`window_*`).
 fn scroll(s: &mut Session, opts: &Options) -> Result<Value> {
+    let mail_items = s.mailbox.mail.len();
     let (big, _) = largest_folder(s).ok_or("the profile has no mail folder")?;
     run_cmd(s, "nav.selectFolder", json!({"folder": big.0}))?;
     let t = Instant::now();
@@ -551,6 +775,7 @@ fn scroll(s: &mut Session, opts: &Options) -> Result<Value> {
     }
     let max = times.iter().copied().fold(0.0, f64::max);
     Ok(json!({
+        "mail_items": mail_items,
         "rows": rows.len(),
         "rebuild_ms": ms(rebuild),
         "windows": times.len(),
@@ -601,6 +826,7 @@ fn bodies(s: &Session) -> Value {
 }
 
 fn search(s: &mut Session) -> Result<Value> {
+    let mail_items = s.mailbox.mail.len();
     let before = memory_json();
     let t = Instant::now();
     s.search.ensure(&s.mailbox, &s.bodies);
@@ -621,6 +847,7 @@ fn search(s: &mut Session) -> Result<Value> {
     let count = t.elapsed();
     let stats = s.search.stats(&s.mailbox, &s.bodies);
     Ok(json!({
+        "mail_items": mail_items,
         "memory_before": before,
         "index_build_ms": ms(build),
         "memory_after_build": after_build,
@@ -652,7 +879,9 @@ fn sync_messages(opts: &Options, uid_base: u32, headers_only: bool) -> impl Iter
 }
 
 /// Applies `opts.sync_messages` synthetic messages as IMAP results in batches of [`SYNC_BATCH`]: whole
-/// messages into INBOX, then headers into [`HEADERS_FOLDER`] followed by their bodies.
+/// messages into INBOX, then headers into [`HEADERS_FOLDER`] followed by their bodies. Each phase starts on
+/// a larger mailbox than the one before (`mail_items_before_*`), which matters while the legacy store's
+/// cost grows with the whole mailbox.
 fn sync_apply(s: &mut Session, opts: &Options) -> Result<Value> {
     let account = s
         .mailbox
@@ -662,6 +891,7 @@ fn sync_apply(s: &mut Session, opts: &Options) -> Result<Value> {
         .map(|a| a.id)
         .ok_or("the profile has no sync account")?;
     let n = opts.sync_messages;
+    let before_full = s.mailbox.mail.len();
     let apply = |s: &mut Session, folder: &str, headers_only: bool, bodies: bool| -> Result<Duration> {
         let mut spent = Duration::ZERO;
         let mut it = sync_messages(opts, 1, headers_only && !bodies).peekable();
@@ -688,8 +918,9 @@ fn sync_apply(s: &mut Session, opts: &Options) -> Result<Value> {
         Ok(spent)
     };
     let full = apply(s, "INBOX", false, false)?;
-    let after_full = s.mailbox.mail.len();
+    let before_headers = s.mailbox.mail.len();
     let headers = apply(s, HEADERS_FOLDER, true, false)?;
+    let before_bodies = s.mailbox.mail.len();
     let bodies = apply(s, HEADERS_FOLDER, false, true)?;
     let count = |name: &str| {
         s.mailbox
@@ -709,12 +940,17 @@ fn sync_apply(s: &mut Session, opts: &Options) -> Result<Value> {
         "bodies_per_sec": per_sec(n, bodies),
         "inbox_items": count("INBOX"),
         "headers_items": count(HEADERS_FOLDER),
-        "mail_items_after_full": after_full,
+        "mail_items_before_full": before_full,
+        "mail_items_before_headers": before_headers,
+        "mail_items_before_bodies": before_bodies,
+        "mail_items_after": s.mailbox.mail.len(),
         "memory_after": memory_json(),
     }))
 }
 
-fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
+/// Commands on local mail and configuration changes, on the profile as generated (`mail_items`).
+fn commands(s: &mut Session, opts: &Options) -> Result<serde_json::Map<String, Value>> {
+    let mail_items = s.mailbox.mail.len();
     let (big, items) = largest_folder(s).ok_or("the profile has no mail folder")?;
     let target = local_folder(s, "Old stuff").ok_or("no target folder")?;
     let archive = local_folder(s, "Archive").ok_or("no Archive folder")?;
@@ -723,12 +959,13 @@ fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
     ids.sort_unstable();
     let unread = s.mailbox.items_in(big).iter().find(|m| !m.read).map(|m| m.id);
     let mut out = serde_json::Map::new();
+    out.insert("mail_items".into(), json!(mail_items));
     if let Some(id) = unread {
         let (d, _) = run_cmd(s, "mail.markRead", json!({"ids": [id.0]}))?;
         out.insert("mark_read_1_ms".into(), json!(ms(d)));
     }
     let Some((&one, rest)) = ids.split_first() else {
-        return Ok(Value::Object(out));
+        return Ok(out);
     };
     let (d, _) = run_cmd(s, "mail.move", json!({"ids": [one.0], "folder": archive.0}))?;
     out.insert("move_1_ms".into(), json!(ms(d)));
@@ -752,7 +989,6 @@ fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
         let (d, _) = run_cmd(s, "app.undo", json!({}))?;
         out.insert("undo_1_ms".into(), json!(ms(d)));
     }
-    imap_commands(s, &mut out)?;
     config_commands(s, &mut out)?;
     let journal = s.store.as_ref().map(mailcraft_store::Store::journal_bytes);
     out.insert("journal_bytes".into(), json!(journal));
@@ -761,7 +997,7 @@ fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
     // What every undo step copies until storage stage S12 (everything but the mail).
     out.insert("small_state_bytes".into(), json!(s.mailbox.without_mail().approx_bytes()));
     out.insert("memory_after".into(), memory_json());
-    Ok(Value::Object(out))
+    Ok(out)
 }
 
 /// Configuration changes (storage stage S4 journals just the part that changed): rows `config_*`, with the
@@ -843,6 +1079,7 @@ pub fn report(opts: &Options, generated: Value, measured: Value) -> Value {
         "seed": opts.seed,
         "sync_messages": opts.sync_messages,
         "bulk_move": opts.bulk_move,
+        "force_large": opts.force_large,
         "host": host(),
         "generate": generated,
         "measure": measured,

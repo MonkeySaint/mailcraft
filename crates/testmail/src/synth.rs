@@ -1040,8 +1040,30 @@ fn fmt_list(people: &[Person]) -> String {
     people.iter().map(fmt_person).collect::<Vec<_>>().join(", ")
 }
 
+/// The separator before a Maildir file name's info (`2,FS`): `:` as the Maildir convention has it, `!` on
+/// Windows, where `:` cannot be in a file name (the separator other Windows Maildir tools use).
+pub const MAILDIR_INFO_SEP: char = if cfg!(windows) { '!' } else { ':' };
+
+/// The `cur/` or `new/` subfolder and file name of message `m` in a Maildir. Unread, unflagged messages
+/// go to `new/` without an info suffix (Maildir keeps the suffix for `cur/`); the others go to `cur/` with
+/// `F` / `S` flags after [`MAILDIR_INFO_SEP`]`2,`.
+pub fn maildir_name(m: &SynthMessage) -> (&'static str, String) {
+    let unique = format!("{}.M{}.synth", m.received, m.index);
+    if !m.read && !m.flagged {
+        return ("new", unique);
+    }
+    let mut flags = String::new();
+    if m.flagged {
+        flags.push('F');
+    }
+    if m.read {
+        flags.push('S');
+    }
+    ("cur", format!("{unique}{MAILDIR_INFO_SEP}2,{flags}"))
+}
+
 /// Writes the mailbox as a Maildir tree under `dir`: one Maildir per folder at its path (`Inbox`,
-/// `Lists/rust-users`…), with `S` / `F` flags in the file names. Returns the number of messages written.
+/// `Lists/rust-users`…), named by [`maildir_name`]. Returns the number of messages written.
 pub fn write_maildir(dir: &Path, cfg: &Config) -> io::Result<usize> {
     for i in 0..FOLDERS.len() {
         let base = dir.join(folder_path(i));
@@ -1051,15 +1073,7 @@ pub fn write_maildir(dir: &Path, cfg: &Config) -> io::Result<usize> {
     }
     let mut n = 0usize;
     for m in cfg.generate() {
-        let mut flags = String::new();
-        if m.flagged {
-            flags.push('F');
-        }
-        if m.read {
-            flags.push('S');
-        }
-        let name = format!("{}.M{}.synth:2,{flags}", m.received, m.index);
-        let sub = if m.read { "cur" } else { "new" };
+        let (sub, name) = maildir_name(&m);
         fs::write(dir.join(folder_path(m.folder)).join(sub).join(name), &m.raw)?;
         n += 1;
     }
@@ -1177,6 +1191,26 @@ mod tests {
     }
 
     #[test]
+    fn maildir_names_follow_the_flags() {
+        let msgs: Vec<SynthMessage> = Config::small(400).generate().collect();
+        let pick = |read: bool, flagged: bool| msgs.iter().find(|m| m.read == read && m.flagged == flagged);
+        let sep = MAILDIR_INFO_SEP;
+        if let Some(m) = pick(false, false) {
+            let (sub, name) = maildir_name(m);
+            assert_eq!(sub, "new");
+            assert!(name.ends_with(".synth"), "{name}");
+        }
+        if let Some(m) = pick(true, false) {
+            assert_eq!(maildir_name(m), ("cur", format!("{}.M{}.synth{sep}2,S", m.received, m.index)));
+        }
+        if let Some(m) = pick(false, true) {
+            assert_eq!(maildir_name(m), ("cur", format!("{}.M{}.synth{sep}2,F", m.received, m.index)));
+        }
+        let m = pick(true, true).unwrap();
+        assert_eq!(maildir_name(m).1, format!("{}.M{}.synth{sep}2,FS", m.received, m.index));
+    }
+
+    #[test]
     fn maildir_and_mbox_hold_every_message() {
         let dir = tempdir();
         let cfg = Config::small(120);
@@ -1188,6 +1222,19 @@ mod tests {
             }
         }
         assert_eq!(files, 120);
+        // No `:` in names on Windows; nothing in `new/` carries the info suffix; `cur/` names do.
+        for i in 0..FOLDERS.len() {
+            let base = dir.join("maildir").join(folder_path(i));
+            for e in fs::read_dir(base.join("new")).unwrap() {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                assert!(!name.contains(":2,") && !name.contains("!2,"), "{name}");
+            }
+            for e in fs::read_dir(base.join("cur")).unwrap() {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                assert!(name.contains(&format!("{MAILDIR_INFO_SEP}2,")), "{name}");
+                assert!(!cfg!(windows) || !name.contains(':'), "{name}");
+            }
+        }
         let mbox = dir.join("all.mbox");
         assert_eq!(write_mbox(&mbox, &cfg).unwrap(), 120);
         let text = fs::read_to_string(&mbox).unwrap();

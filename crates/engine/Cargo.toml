@@ -10,6 +10,9 @@ rust-version.workspace = true
 # Tests only: a change record that disagrees with the whole-mailbox comparison fails the test instead of
 # being logged (`changes.rs`). The engine's own dev-dependency on itself turns it on for its integration tests.
 strict-change-check = []
+# `Session::queue_imap_results`: IMAP results made up without a server, for `apps/mailcraft-bench` only. Never
+# enabled by the app, CLI or MCP builds (it injects deltas, `reset` and vanished UIDs as if a server sent them).
+synthetic-sync = []
 
 [dependencies]
 mailcraft-geom.workspace = true

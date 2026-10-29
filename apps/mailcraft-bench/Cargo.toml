@@ -12,7 +12,7 @@ name = "mailcraft-bench"
 path = "src/main.rs"
 
 [dependencies]
-mailcraft-engine.workspace = true
+mailcraft-engine = { workspace = true, features = ["synthetic-sync"] }
 mailcraft-store.workspace = true
 mailcraft-search.workspace = true
 mailcraft-net.workspace = true

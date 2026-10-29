@@ -13,12 +13,13 @@ pub struct Bench {
     pub backend: String,
     pub small_bodies: bool,
     pub out: Option<PathBuf>,
-    /// Options passed through unchanged (`--seed`, `--sync`, `--bulk-move`, `--keep`).
+    /// Options passed through unchanged (`--seed`, `--sync`, `--bulk-move`, `--keep`, `--force-large`).
     pub extra: Vec<String>,
 }
 
-/// Parses `--size 10k|100k|1m [--backend legacy|sqlite] [--small-bodies] [--out FILE] [--seed N] [--sync N]
-/// [--bulk-move N] [--keep]`.
+/// Parses `[--size 10k|50k | --size 100k|1m|2m --small-bodies] [--backend legacy|sqlite] [--out FILE]
+/// [--seed N] [--sync N] [--bulk-move N] [--keep] [--force-large]`. `mailcraft-bench` checks the size
+/// against the body kind and the machine before it writes anything.
 pub fn parse(args: &[String]) -> Result<Bench, String> {
     let mut b = Bench { size: "10k".into(), backend: "legacy".into(), ..Default::default() };
     let mut it = args.iter();
@@ -34,7 +35,7 @@ pub fn parse(args: &[String]) -> Result<Bench, String> {
             }
             "--small-bodies" => b.small_bodies = true,
             "--out" => b.out = Some(PathBuf::from(value("--out")?)),
-            "--keep" => b.extra.push(a.clone()),
+            "--keep" | "--force-large" => b.extra.push(a.clone()),
             "--seed" | "--sync" | "--bulk-move" => {
                 let v = value(a)?;
                 b.extra.extend([a.clone(), v]);
@@ -107,14 +108,15 @@ mod tests {
 
     #[test]
     fn arguments_reach_the_runner() {
-        let b = parse(&s(&["--size", "40k", "--small-bodies", "--seed", "3", "--keep"])).unwrap();
+        let b = parse(&s(&["--size", "40k", "--small-bodies", "--seed", "3", "--keep", "--force-large"]))
+            .unwrap();
         assert_eq!(b.size, "40k");
         assert_eq!(b.backend, "legacy");
         let args = bench_args(Path::new("/repo"), &b, "2026-10-28");
         let joined = args.join(" ");
         assert!(joined.starts_with("run --size 40k --backend legacy --work "), "{joined}");
         assert!(joined.contains("2026-10-28-legacy-40k-small.json"), "{joined}");
-        assert!(joined.ends_with("--small-bodies --seed 3 --keep"), "{joined}");
+        assert!(joined.ends_with("--small-bodies --seed 3 --keep --force-large"), "{joined}");
         assert!(parse(&s(&["--backend", "pst"])).is_err());
         assert!(parse(&s(&["--size"])).is_err());
         assert!(parse(&s(&["--fast"])).is_err());

@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use mailcraft_bench::{Backend, Options, QUERIES};
+use mailcraft_bench::{Backend, MARKER, Options, QUERIES};
 use serde_json::Value;
 
 fn work_dir(name: &str) -> std::path::PathBuf {
@@ -109,7 +109,133 @@ fn smoke(backend: Backend) {
         assert!(wrote > 0.0 && wrote < whole / 10.0, "{k}: {wrote} of {whole}");
     }
     assert!(num(&r, "/measure/commands/journal_bytes") > 0.0);
+    assert_sizes_are_explicit(&r, 2_000, 600);
     std::fs::remove_dir_all(&work).unwrap();
+}
+
+/// The commands ran on the profile as generated, before the synchronised mail grew it, and every phase
+/// says how many mail items it started with.
+fn assert_sizes_are_explicit(r: &Value, messages: usize, sync: usize) {
+    let (messages, sync) = (messages as f64, sync as f64);
+    for section in ["folder_switch", "scroll", "search", "commands"] {
+        assert_eq!(num(r, &format!("/measure/{section}/mail_items")), messages, "{section}");
+    }
+    assert_eq!(num(r, "/measure/sync/mail_items_before_full"), messages);
+    assert_eq!(num(r, "/measure/sync/mail_items_before_headers"), messages + sync);
+    assert_eq!(num(r, "/measure/sync/mail_items_before_bodies"), messages + 2.0 * sync);
+    assert_eq!(num(r, "/measure/sync/mail_items_after"), messages + 2.0 * sync);
+    // Only the commands on synchronised mail run after the sync (they need its messages).
+    assert_eq!(num(r, "/measure/commands/imap_mail_items"), messages + 2.0 * sync);
+    assert!(r.pointer("/measure/memory_before_sync").is_some_and(Value::is_object));
+    assert!(num(r, "/generate/estimate/memory_bytes") > 0.0);
+}
+
+/// The default `cargo xtask bench` path: realistic bodies (HTML newsletters, base64 attachments of up to
+/// 5 MB, header-only downloads of large sources, then their bodies).
+#[test]
+fn full_bodies_smoke() {
+    let work = work_dir("full");
+    let mut opts = Options::new(200);
+    opts.sync_messages = 100;
+    opts.bulk_move = 50;
+    opts.windows = 5;
+    let r = mailcraft_bench::run(&work, &opts).unwrap();
+    assert_eq!(r["small_bodies"], false);
+    assert!(num(&r, "/generate/avg_source_bytes") > 10_000.0, "realistic bodies");
+    assert!(num(&r, "/generate/kinds/attachments") > 0.0);
+    assert!(num(&r, "/generate/kinds/html") > 0.0);
+    assert_eq!(num(&r, "/measure/open/mail_items"), 200.0);
+    assert_eq!(num(&r, "/measure/sync/inbox_items"), 100.0);
+    assert_eq!(num(&r, "/measure/sync/headers_items"), 100.0);
+    assert_eq!(num(&r, "/measure/commands/bulk_move_items"), 50.0);
+    assert!(r["measure"]["search"]["queries"].as_array().is_some_and(|q| q.len() == QUERIES.len()));
+    assert_sizes_are_explicit(&r, 200, 100);
+    std::fs::remove_dir_all(&work).unwrap();
+}
+
+/// A folder without the marker (a real profile, a home folder handed over by mistake) is never deleted
+/// or opened; an empty folder or an earlier benchmark profile is replaced.
+#[test]
+fn only_benchmark_profiles_are_replaced_or_measured() {
+    let work = work_dir("marker");
+    let dir = work.join("not-a-bench-profile");
+    std::fs::create_dir_all(dir.join("blobs")).unwrap();
+    std::fs::write(dir.join("mailbox.json"), "{}").unwrap();
+    std::fs::write(dir.join("blobs").join("keep"), "mail").unwrap();
+    let opts = Options { sync_messages: 5, bulk_move: 3, windows: 1, ..Options::new(20) };
+    let err = mailcraft_bench::generate(&dir, &opts).unwrap_err();
+    assert!(err.contains("not a benchmark profile"), "{err}");
+    assert_eq!(std::fs::read_to_string(dir.join("mailbox.json")).unwrap(), "{}");
+    assert_eq!(std::fs::read_to_string(dir.join("blobs").join("keep")).unwrap(), "mail");
+    assert!(!dir.join(MARKER).exists());
+    // `measure` refuses it too and leaves it as it was.
+    let err = mailcraft_bench::measure(&dir, &opts).unwrap_err();
+    assert!(err.contains("not a benchmark profile"), "{err}");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    assert!(mailcraft_bench::remove_profile(&dir).is_err());
+    assert!(dir.join("blobs").join("keep").exists());
+    // `run --work` with such a folder at work/profile refuses as well.
+    let run_work = work.join("run");
+    std::fs::create_dir_all(mailcraft_bench::profile_dir(&run_work)).unwrap();
+    std::fs::write(mailcraft_bench::profile_dir(&run_work).join("notes.txt"), "mine").unwrap();
+    assert!(mailcraft_bench::run(&run_work, &opts).unwrap_err().contains("not a benchmark profile"));
+    assert!(mailcraft_bench::profile_dir(&run_work).join("notes.txt").exists());
+    // A file is not replaced either.
+    let file = work.join("file");
+    std::fs::write(&file, "x").unwrap();
+    assert!(mailcraft_bench::generate(&file, &opts).is_err());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "x");
+    // An empty folder is fine, and a benchmark profile is replaced by the next run.
+    let bench = work.join("bench");
+    std::fs::create_dir_all(&bench).unwrap();
+    mailcraft_bench::generate(&bench, &opts).unwrap();
+    assert!(mailcraft_bench::is_bench_profile(&bench));
+    std::fs::write(bench.join("stale"), "old run").unwrap();
+    mailcraft_bench::generate(&bench, &opts).unwrap();
+    assert!(!bench.join("stale").exists());
+    mailcraft_bench::remove_profile(&bench).unwrap();
+    assert!(!bench.exists());
+    std::fs::remove_dir_all(&work).unwrap();
+}
+
+/// Sizes that would not fit (full bodies above 50k, small above 2m, more memory or disk than the machine
+/// has) are refused before anything is written.
+#[test]
+fn oversized_runs_are_refused() {
+    use mailcraft_bench::{check_budget, estimate};
+    let full = Options::new(100_000);
+    let err = check_budget(&full, &estimate(&full), None, None).unwrap_err();
+    assert!(err.contains("--small-bodies"), "{err}");
+    let small = Options { small_bodies: true, ..Options::new(1_000_000) };
+    check_budget(&small, &estimate(&small), None, None).unwrap();
+    let huge = Options { small_bodies: true, ..Options::new(5_000_000) };
+    assert!(check_budget(&huge, &estimate(&huge), None, None).is_err());
+    let forced = Options { force_large: true, ..huge.clone() };
+    check_budget(&forced, &estimate(&forced), None, None).unwrap();
+    // Memory: a 10k full run (30k items with the synchronised mail) needs over a GB, more than three
+    // quarters of a 1.5 GB machine (unless forced).
+    let ten = Options::new(10_000);
+    let est = estimate(&ten);
+    assert_eq!(est.items, 30_000);
+    assert!((1_000_000_000..3_000_000_000).contains(&est.memory_bytes), "{est:?}");
+    assert!((1_000_000_000..3_000_000_000).contains(&est.disk_bytes), "{est:?}");
+    assert!(check_budget(&ten, &est, None, Some(1_500_000_000)).is_err());
+    check_budget(&ten, &est, None, Some(64_000_000_000)).unwrap();
+    let ten_forced = Options { force_large: true, ..ten.clone() };
+    check_budget(&ten_forced, &est, None, Some(1_500_000_000)).unwrap();
+    // The largest allowed runs fit a 64 GB machine.
+    let most = Options { small_bodies: true, ..Options::new(2_000_000) };
+    check_budget(&most, &estimate(&most), None, Some(64_000_000_000)).unwrap();
+    let most_full = Options::new(50_000);
+    check_budget(&most_full, &estimate(&most_full), None, Some(64_000_000_000)).unwrap();
+    // Disk: never above the free space, forced or not.
+    assert!(check_budget(&ten_forced, &est, Some(est.disk_bytes - 1), None).is_err());
+    check_budget(&ten, &est, Some(est.disk_bytes), None).unwrap();
+    // `generate` refuses before touching the folder.
+    let work = work_dir("budget");
+    let err = mailcraft_bench::generate(&work.join("p"), &full).unwrap_err();
+    assert!(err.contains("--small-bodies"), "{err}");
+    assert!(!work.exists());
 }
 
 #[test]
@@ -150,4 +276,32 @@ fn sizes_parse() {
     for bad in ["", "k", "0", "ten", "99999999999999999999m", "20m"] {
         assert!(mailcraft_bench::parse_size(bad).is_err(), "{bad}");
     }
+}
+
+/// The synthetic Maildir imports with the generator's read and flagged state: flagged unread mail sits in
+/// `cur/` with its flags (an importer reads no flags from `new/`).
+#[test]
+fn synthetic_maildir_imports_with_its_flags() {
+    use mailcraft_engine::model::{FlagState, FolderRole, Mailbox};
+    use mailcraft_testmail::synth::{self, Config};
+    let work = work_dir("maildir");
+    let cfg = Config::small(300);
+    let msgs: Vec<_> = cfg.generate().collect();
+    assert!(msgs.iter().any(|m| m.flagged && !m.read), "the case that needs cur/");
+    assert_eq!(synth::write_maildir(&work, &cfg).unwrap(), 300);
+    let mut mb = Mailbox::new_local("Bench");
+    let account = mb.default_account().unwrap().id;
+    let inbox = mb.role_folder(account, FolderRole::Inbox).unwrap();
+    let mut bodies = mailcraft_store::BodyStore::in_memory();
+    for i in 0..synth::FOLDERS.len() {
+        let dir = work.join(synth::folder_path(i));
+        mailcraft_store::import_maildir(&mut mb, &mut bodies, &dir, inbox).unwrap();
+    }
+    let items = mb.items_in(inbox);
+    assert_eq!(items.len(), 300);
+    let read = items.iter().filter(|m| m.read).count();
+    let flagged = items.iter().filter(|m| matches!(m.flag, FlagState::Flagged { .. })).count();
+    assert_eq!(read, msgs.iter().filter(|m| m.read).count());
+    assert_eq!(flagged, msgs.iter().filter(|m| m.flagged).count());
+    std::fs::remove_dir_all(&work).unwrap();
 }

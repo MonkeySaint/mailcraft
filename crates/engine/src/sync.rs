@@ -1908,8 +1908,9 @@ fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
 
 /// IMAP folder results made up without a server, for benchmarks (`apps/mailcraft-bench`) and tests: queued
 /// with [`Session::queue_imap_results`], they are applied by the next [`Session::poll_sync`] exactly like
-/// results a send/receive worker downloaded (rules, the Junk Email filter, journaling, undo tracking).
-#[cfg(not(target_arch = "wasm32"))]
+/// results a send/receive worker downloaded (rules, the Junk Email filter, journaling, undo tracking). Only
+/// in tests and with the `synthetic-sync` feature, which only the benchmark tool turns on.
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "synthetic-sync")))]
 #[derive(Clone, Debug)]
 pub enum SyntheticImap {
     /// One sync round of the folder whose server name is `folder` (new messages, flag changes, vanished
@@ -1919,7 +1920,7 @@ pub enum SyntheticImap {
     Bodies { folder: String, msgs: Vec<mailcraft_net::sync::NewMessage> },
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "synthetic-sync")))]
 impl Session {
     /// Queues `results` for IMAP account `account` as if its send/receive worker had sent them (see
     /// [`SyntheticImap`]); nothing connects to a server. False when `account` is not an IMAP account.
