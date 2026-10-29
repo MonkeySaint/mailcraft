@@ -162,6 +162,21 @@ fn store_round_trips_a_mailbox_and_its_ops() {
     assert_eq!(loaded, mb);
     assert_eq!(loaded.next_id, 150);
     assert_counts_consistent(&db);
+    // A batch (journal format 2) applies its ops in order, nested ones too, as `Op::apply` does.
+    let batch = Op::Batch(vec![
+        Op::PutMail(Box::new(item(10, 1, false, "batched"))),
+        Op::Batch(vec![
+            Op::RemoveMail(ItemId(6)),
+            Op::PutSync(AccountId(1), Box::new(AccountSync { next_op: 13, ..Default::default() })),
+        ]),
+        Op::RemoveMail(ItemId(10)),
+        Op::PutMail(Box::new(item(11, 2, true, "kept"))),
+    ]);
+    batch.clone().apply(&mut mb);
+    st.append(&[batch], u64::MAX).unwrap();
+    assert_eq!(SqlStore::new(db.clone()).load().unwrap(), mb);
+    assert!(mb.mail.get(ItemId(11)).is_some() && mb.mail.get(ItemId(6)).is_none());
+    assert_counts_consistent(&db);
     // A cap refuses the batch and writes nothing.
     let err = st.append(&[Op::PutMail(Box::new(item(9, 1, false, "too big")))], 10).unwrap_err();
     assert!(matches!(err, StoreError::TooLarge(_)), "{err}");

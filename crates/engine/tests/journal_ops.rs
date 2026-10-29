@@ -8,6 +8,7 @@ use mailcraft_engine::Session;
 use mailcraft_engine::model::{
     Account, AccountId, AccountKind, FolderRole, ItemId, MailItem, ServerSettings,
 };
+use mailcraft_store::StoreKind;
 use serde_json::{Value, json};
 
 fn run(s: &mut Session, id: &str, p: Value) -> Value {
@@ -18,18 +19,36 @@ fn journal_bytes(s: &Session) -> u64 {
     s.store.as_ref().unwrap().journal_bytes()
 }
 
-/// The op names on the journal's lines after byte `from`.
-fn ops_after(dir: &std::path::Path, from: u64) -> Vec<String> {
+/// The ops on the journal's lines after byte `from`, a batch line unrolled into its ops.
+fn op_values_after(dir: &std::path::Path, from: u64) -> Vec<Value> {
     let bytes = std::fs::read(dir.join("journal.jsonl")).unwrap();
     let tail = bytes.get(usize::try_from(from).unwrap()..).unwrap();
     String::from_utf8_lossy(tail)
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| {
+        .flat_map(|l| {
             let v: Value = serde_json::from_str(l).unwrap();
-            v.as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_else(|| v.to_string())
+            match v.get("Batch").and_then(Value::as_array) {
+                Some(ops) => ops.clone(),
+                None => vec![v],
+            }
         })
         .collect()
+}
+
+/// The op names on the journal's lines after byte `from` (a batch unrolled).
+fn ops_after(dir: &std::path::Path, from: u64) -> Vec<String> {
+    op_values_after(dir, from)
+        .into_iter()
+        .map(|v| v.as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_else(|| v.to_string()))
+        .collect()
+}
+
+/// Journal lines after byte `from`.
+fn lines_after(dir: &std::path::Path, from: u64) -> usize {
+    let bytes = std::fs::read(dir.join("journal.jsonl")).unwrap();
+    let tail = bytes.get(usize::try_from(from).unwrap()..).unwrap();
+    tail.iter().filter(|&&b| b == b'\n').count()
 }
 
 /// A profile with an IMAP account whose INBOX holds `n` synchronised messages (UIDs 1..=n), saved as a
@@ -188,5 +207,136 @@ fn configuration_changes_journal_only_the_part_that_changed() {
 /// These tests measure the legacy journal and snapshot: their profiles use legacy storage whatever
 /// `MAILCRAFT_STORE` says.
 fn open_legacy(dir: &std::path::Path) -> Result<Session, mailcraft_engine::CmdError> {
-    Session::open_with(dir, mailcraft_store::StoreKind::Legacy)
+    Session::open_with(dir, StoreKind::Legacy)
+}
+
+/// The parts of a mailbox an account's removal journals, for comparing a reopened profile with memory.
+fn account_state(s: &Session) -> (Vec<Account>, Vec<(u64, String)>, Vec<ItemId>) {
+    let folders = s.mailbox.folders.values().map(|f| (f.id.0, f.name.clone())).collect();
+    (s.mailbox.accounts.clone(), folders, s.mailbox.mail.ids().collect())
+}
+
+/// Regression (storage S4 review): removing an account journaled the account list, then each of its
+/// messages and folders, on lines of their own. A crash partway through the write could keep the account
+/// list without the account and some of its folders and mail, owned by nobody. The command's ops are one
+/// journal line now: cut anywhere, the profile reopens as it was before the removal or after it.
+#[test]
+fn an_account_removal_cut_short_by_a_crash_reopens_before_or_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut s, account, _) = imap_profile(dir.path(), 200);
+    let before = account_state(&s);
+    let from = journal_bytes(&s);
+    run(&mut s, "accounts.remove", json!({"account": account.0, "confirm": true}));
+    assert_eq!(lines_after(dir.path(), from), 1, "one line for the whole removal");
+    let ops = ops_after(dir.path(), from);
+    assert_eq!(ops.first().map(String::as_str), Some("PutConfig"));
+    assert_eq!(ops.iter().filter(|o| *o == "RemoveMail").count(), 200);
+    let after = account_state(&s);
+    assert_ne!(before, after);
+    drop(s);
+    let path = dir.path().join("journal.jsonl");
+    let full = std::fs::read(&path).unwrap();
+    let from = usize::try_from(from).unwrap();
+    let line = full.len() - from;
+    let mut cuts: Vec<usize> = (0..=16).map(|i| from + line * i / 16).collect();
+    cuts.extend([from + 1, full.len() - 2, full.len() - 1]);
+    for cut in cuts {
+        std::fs::write(&path, full.get(..cut).unwrap()).unwrap();
+        let s = open_legacy(dir.path()).unwrap();
+        let got = account_state(&s);
+        let want = if cut + 1 >= full.len() { &after } else { &before };
+        assert!(
+            got == *want,
+            "cut at byte {cut} of {}: not the state {}",
+            full.len(),
+            if cut + 1 >= full.len() { "after" } else { "before" }
+        );
+    }
+}
+
+/// Regression (storage S4 review): Categorize with a new category name, Archive remembering the folder
+/// picked, and Private on an appointment lost their own whole-mailbox journal call in S4 and rely on the
+/// change record. Their changes reach the store (the new category list and the folder's Archive role as
+/// configuration and folder ops, the appointment in a whole-mailbox Replace until stage S12) and are there
+/// after a restart, in either kind of storage.
+#[test]
+fn categorize_archive_and_private_survive_a_restart() {
+    categorize_archive_and_private(StoreKind::Legacy);
+    categorize_archive_and_private(StoreKind::Sqlite);
+}
+
+fn categorize_archive_and_private(kind: StoreKind) {
+    use mailcraft_engine::sample::{sample_mailbox, sample_now};
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::open_with(dir.path(), kind).unwrap();
+    assert_eq!(s.store.as_ref().unwrap().kind(), kind);
+    // The journal's ops are checked on a legacy profile (a SQLite one writes rows).
+    let legacy = kind == StoreKind::Legacy;
+    s.fixed_now = Some(sample_now());
+    s.checkpoint_bytes = 0;
+    s.mailbox = sample_mailbox(sample_now(), &mut s.bodies);
+    let account = s.mailbox.accounts.first().map(|a| a.id).unwrap();
+    let inbox = s.mailbox.role_folder(account, FolderRole::Inbox).unwrap();
+    // An account without an Archive folder, and a plain folder to pick for it.
+    if let Some(archive) = s.mailbox.role_folder(account, FolderRole::Archive) {
+        s.mailbox.folders.get_mut(&archive).unwrap().role = None;
+    }
+    let kept = s.mailbox.create_folder(inbox, "Kept").unwrap();
+    let appt = s.mailbox.appointments.keys().next().copied().unwrap();
+    assert!(!s.mailbox.appointments[&appt].private);
+    let mb = s.mailbox.clone();
+    s.store.as_mut().unwrap().checkpoint(&mb).unwrap();
+    s.select_default_folder();
+    let ids: Vec<ItemId> =
+        s.mailbox.mail.items().filter(|m| m.folder == inbox).map(|m| m.id).take(2).collect();
+    let [a, b] = ids[..] else { panic!("two messages in the Inbox: {ids:?}") };
+
+    let from = journal_bytes(&s);
+    let r = run(&mut s, "mail.categorize", json!({"ids": [a.0], "name": "Brand New"}));
+    assert_eq!(r["category"], "Brand New");
+    if legacy {
+        let ops = op_values_after(dir.path(), from);
+        let names = ops_after(dir.path(), from);
+        assert_eq!(names, ["PutConfig", "PutMail"], "{names:?}");
+        assert!(
+            ops[0]["PutConfig"]["categories"].as_array().unwrap().iter().any(|c| c["name"] == "Brand New")
+        );
+    }
+
+    let from = journal_bytes(&s);
+    let r = run(&mut s, "mail.archive", json!({"ids": [b.0], "folder": kept.0, "remember": true}));
+    assert_eq!(r["remembered"], true);
+    if legacy {
+        let ops = op_values_after(dir.path(), from);
+        let names = ops_after(dir.path(), from);
+        assert!(!names.iter().any(|o| o == "Replace"), "{names:?}");
+        assert!(
+            ops.iter().any(|o| o["PutFolder"]["id"] == kept.0 && o["PutFolder"]["role"] == "Archive"),
+            "{names:?}"
+        );
+        assert!(ops.iter().any(|o| o["PutMail"]["id"] == b.0), "{names:?}");
+    }
+
+    let from = journal_bytes(&s);
+    let r = run(&mut s, "mail.private", json!({"ids": [appt.0]}));
+    assert_eq!(r["private"], true);
+    if legacy {
+        assert_eq!(ops_after(dir.path(), from), ["Replace"], "calendar changes are saved whole until S12");
+    }
+
+    let memory = s.mailbox.clone();
+    drop(s);
+    let s = Session::open_with(dir.path(), kind).unwrap();
+    assert_eq!(s.store.as_ref().unwrap().kind(), kind);
+    assert_eq!(s.mailbox.categories, memory.categories);
+    assert!(s.mailbox.categories.iter().any(|c| c.name == "Brand New"));
+    assert_eq!(s.mailbox.folder(kept).unwrap().role, Some(FolderRole::Archive));
+    assert_eq!(s.mailbox.role_folder(account, FolderRole::Archive), Some(kept));
+    assert!(s.mailbox.appointments[&appt].private);
+    assert_eq!(s.mailbox.appointments, memory.appointments);
+    assert_eq!(s.mailbox.folders, memory.folders);
+    for id in [a, b] {
+        assert_eq!(s.mailbox.mail.get(id), memory.mail.get(id));
+    }
+    assert_eq!(s.mailbox.mail.get(b).unwrap().folder, kept);
 }

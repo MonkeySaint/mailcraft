@@ -386,6 +386,14 @@ impl Known {
                 }
             }
             Op::PutConfig(state) => self.put_config(c, state, p)?,
+            // The ops of a batch in order (one transaction makes every append atomic here anyway).
+            Op::Batch(_) => {
+                let mut leaves = Vec::new();
+                op.for_each_leaf(|o| leaves.push(o));
+                for o in leaves {
+                    self.apply(c, o, p)?;
+                }
+            }
         }
         Ok(())
     }

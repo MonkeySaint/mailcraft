@@ -284,7 +284,8 @@ impl SearchState {
                 | Op::PutAccount(_)
                 | Op::PutSync(..)
                 | Op::PutConfig(_) => {}
-                Op::Replace(_) => inner.full = true,
+                // The engine never queues a batch (the store writes one per append); be safe if it does.
+                Op::Replace(_) | Op::Batch(_) => inner.full = true,
             }
         }
         inner.generation = inner.generation.wrapping_add(1);

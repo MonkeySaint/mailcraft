@@ -10,6 +10,9 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
 - Offline mail: server accounts keep message bodies on this computer for a chosen period (1 year by default,
   from 3 days to All) set with a slider in the account settings; headers, flags and previews always stay.
 - New profiles can keep their mail in SQLite with compressed pack files (`--store sqlite`, opt-in for now).
+- A profile opened in 0.4.0 no longer opens in older versions, and a version that finds a profile saved by a
+  newer one refuses it instead of opening it with changes missing. A crash can no longer save half of a
+  change such as removing an account.
 - Account setup recognises Microsoft 365 and Google Workspace domains from their mail servers, and the big
   consumer domains, and fills in the servers and OAuth sign-in.
 - JMAP: folder changes are written back to the server, and Contacts and Calendar sync over JMAP when the server

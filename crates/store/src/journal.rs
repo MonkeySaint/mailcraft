@@ -8,9 +8,18 @@
 //! instead of opening the profile with every message empty and dropping the body keys on their next save. A
 //! bare [`Mailbox`] JSON object is also accepted (generation 0).
 //!
-//! Journal (`journal.jsonl`): first line `{"mailcraft_journal":1,"generation":N}`, then one [`Op`] per line.
+//! Journal (`journal.jsonl`): first line `{"mailcraft_journal":2,"generation":N}`, then one [`Op`] per line.
 //! A journal whose generation is older than the snapshot's was already folded into that snapshot (a crash
 //! between the snapshot rename and the journal reset) and is ignored.
+//!
+//! Journal format versions ([`JOURNAL_VERSION`]): 1 held mail, folder, account and whole-mailbox ops; 2 adds
+//! `PutSync`, `PutConfig` (storage stage S4) and `Batch` (several ops on one line). A journal of a version
+//! newer than this build knows is refused ([`StoreError::TooNew`]) instead of being replayed with the lines it
+//! cannot read skipped: the next snapshot would make that loss permanent. An older journal is replayed, and
+//! its header is rewritten to the current version before anything is appended. Builds from before version 2
+//! ignore the version and skip what they cannot read; Exit folds the journal into the snapshot, so they only
+//! meet version 2 lines in a profile last closed by a crash, and those from before storage stage S5 refuse
+//! the format 2 snapshot next to it anyway.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Read, Write};
@@ -57,6 +66,9 @@ pub struct SnapshotRead {
     pub legacy: Option<Vec<u8>>,
 }
 
+/// The journal format this build writes, and the newest it reads (see the module docs).
+pub const JOURNAL_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JournalHeader {
@@ -66,16 +78,35 @@ pub struct JournalHeader {
 
 impl JournalHeader {
     pub fn new(generation: u64) -> Self {
-        JournalHeader { mailcraft_journal: 1, generation }
+        JournalHeader { mailcraft_journal: JOURNAL_VERSION, generation }
     }
     pub fn parse(line: &[u8]) -> Option<JournalHeader> {
         serde_json::from_slice(line).ok()
     }
     fn line(&self) -> Vec<u8> {
-        let mut v = format!("{{\"mailcraft_journal\":1,\"generation\":{}}}", self.generation).into_bytes();
+        let mut v = format!(
+            "{{\"mailcraft_journal\":{},\"generation\":{}}}",
+            self.mailcraft_journal, self.generation
+        )
+        .into_bytes();
         v.push(b'\n');
         v
     }
+    /// [`StoreError::TooNew`] when this build cannot read the journal's format.
+    fn check_version(&self) -> Result<()> {
+        if self.mailcraft_journal > JOURNAL_VERSION {
+            return Err(too_new_error(self.mailcraft_journal));
+        }
+        Ok(())
+    }
+}
+
+/// The error for a journal in format `version`, newer than [`JOURNAL_VERSION`].
+pub(crate) fn too_new_error(version: u32) -> StoreError {
+    StoreError::TooNew(format!(
+        "its change journal is in format {version}, newer than this version of MailCraft reads \
+         ({JOURNAL_VERSION}); open it with the newer version, whose Exit saves everything into the snapshot"
+    ))
 }
 
 fn corrupt(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -320,10 +351,14 @@ pub struct Repair {
     pub torn_bytes_removed: u64,
     /// A complete last op missing only its newline was kept.
     pub newline_added: bool,
+    /// The journal was in this older format; its header now carries [`JOURNAL_VERSION`].
+    pub upgraded_from: Option<u32>,
 }
 
 /// Opens the journal for appending after crash repair: creates it if missing, discards it when older than the
-/// snapshot, removes a torn tail (or completes a valid tail missing its newline). Returns (handle, generation).
+/// snapshot, removes a torn tail (or completes a valid tail missing its newline), and rewrites the header of
+/// a journal in an older format to the current one (what is appended next is in the current format).
+/// Refuses a journal in a newer format ([`StoreError::TooNew`]). Returns (handle, generation).
 pub fn prepare_journal(dir: &Path, snapshot_gen: u64) -> Result<(File, u64, Repair)> {
     let path = dir.join(JOURNAL_FILE);
     let mut repair = Repair::default();
@@ -336,6 +371,7 @@ pub fn prepare_journal(dir: &Path, snapshot_gen: u64) -> Result<(File, u64, Repa
     let first_line = bytes.split(|&b| b == b'\n').next().unwrap_or(&[]);
     let header = JournalHeader::parse(first_line);
     if let Some(h) = &header {
+        h.check_version()?;
         if h.generation < snapshot_gen {
             log::warn!(
                 "journal generation {} predates snapshot generation {snapshot_gen}; discarding it",
@@ -347,7 +383,7 @@ pub fn prepare_journal(dir: &Path, snapshot_gen: u64) -> Result<(File, u64, Repa
     } else {
         log::warn!("journal has no valid header; replaying its lines against the snapshot");
     }
-    let generation = header.map_or(snapshot_gen, |h| h.generation);
+    let generation = header.as_ref().map_or(snapshot_gen, |h| h.generation);
     if bytes.last() != Some(&b'\n') {
         let keep = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
         let tail = bytes.get(keep..).unwrap_or(&[]);
@@ -369,13 +405,32 @@ pub fn prepare_journal(dir: &Path, snapshot_gen: u64) -> Result<(File, u64, Repa
             repair.torn_bytes_removed = u64::try_from(tail.len()).unwrap_or(0);
         }
     }
+    if let Some(h) = &header
+        && h.mailcraft_journal < JOURNAL_VERSION
+    {
+        upgrade_header(&path, generation)?;
+        repair.upgraded_from = Some(h.mailcraft_journal);
+    }
     Ok((OpenOptions::new().append(true).open(&path)?, generation, repair))
+}
+
+/// Rewrites the journal at `path` (atomically) with a current-format header and the same op lines.
+fn upgrade_header(path: &Path, generation: u64) -> Result<()> {
+    let bytes = read_capped(path, MAX_STATE_BYTES)?.unwrap_or_default();
+    let rest = bytes.iter().position(|&b| b == b'\n').and_then(|p| bytes.get(p + 1..)).unwrap_or(&[]);
+    let header = JournalHeader::new(generation).line();
+    write_atomic(path, |w| {
+        w.write_all(&header)?;
+        w.write_all(rest)
+    })
 }
 
 /// Result of reading the journal.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JournalScan {
     pub generation: Option<u64>,
+    /// The format in the header ([`JOURNAL_VERSION`]); `None` without a valid header.
+    pub version: Option<u32>,
     pub ops: Vec<Op>,
     /// Message content lines written before storage stage S5 carry inline: (index into `ops`, content).
     pub inline: Vec<(usize, crate::legacy::InlineOp)>,
@@ -385,7 +440,8 @@ pub struct JournalScan {
     pub torn_tail: bool,
 }
 
-/// Parses journal bytes. Never fails: unparseable lines are skipped with a warning.
+/// Parses journal bytes. Never fails: unparseable lines are skipped with a warning. A journal in a newer
+/// format than [`JOURNAL_VERSION`] yields its header only (`version` says which).
 pub fn scan_journal(bytes: &[u8]) -> JournalScan {
     let mut scan = JournalScan::default();
     let ends_with_newline = bytes.last() == Some(&b'\n');
@@ -400,6 +456,12 @@ pub fn scan_journal(bytes: &[u8]) -> JournalScan {
             && let Some(h) = JournalHeader::parse(line)
         {
             scan.generation = Some(h.generation);
+            scan.version = Some(h.mailcraft_journal);
+            if h.check_version().is_err() {
+                // Lines of an unknown format are not read at all (`load_report` refuses the journal).
+                log::warn!("journal format {} is newer than this build reads", h.mailcraft_journal);
+                return scan;
+            }
             continue;
         }
         match serde_json::from_slice::<Op>(line) {

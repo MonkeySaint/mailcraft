@@ -11,7 +11,9 @@
 //!
 //! **Safety net.** In debug builds and tests, `begin_changes` also keeps a full copy of the mailbox, and
 //! [`ChangeSet::ops`] checks that the ops it derives equal the old whole-mailbox comparison
-//! ([`crate::session::diff_ops`]). When they disagree a debug build logs it and journals the whole mailbox
+//! ([`crate::session::diff_ops`]) and that they replay onto the mailbox before into the mailbox now (the
+//! comparison shares `small_ops` with the record, so only the replay checks the configuration and sync
+//! ops). When either fails a debug build logs it and journals the whole mailbox
 //! instead (it never panics: an app run with `cargo run` must not lose open drafts over it); the engine's
 //! unit tests and the tests built with the `strict-change-check` feature (the engine's integration tests,
 //! `tests/fuzz.rs` among them, which runs every command with hostile parameters) fail. Release builds keep no
@@ -115,10 +117,11 @@ impl ChangeSet {
             None => vec![Op::Replace(Box::new(now.clone()))],
         };
         // A `Replace` (a lost record) is right whatever happened: only ops from a record are checked.
+        // The full copy is used up by the check (a change set's ops are taken once).
         #[cfg(any(test, debug_assertions))]
         if self.mail.is_some()
-            && let Some(full) = &self.full
-            && !check_ops(full, now, &ops)
+            && let Some(full) = self.full.take()
+            && !check_ops(*full, now, &ops)
         {
             return vec![Op::Replace(Box::new(now.clone()))];
         }
@@ -155,27 +158,30 @@ pub(crate) fn ops_for(before: &Mailbox, mail: &MailChanges, after: &Mailbox) -> 
     ops
 }
 
-/// Debug builds and tests: whether the ops from a change record equal the full comparison. A disagreement is
-/// logged (the caller then journals the whole mailbox) and fails a test build ([`strict_failure`]).
+/// Debug builds and tests: whether the ops from a change record equal the full comparison, and whether they
+/// replay onto the mailbox before into the mailbox now. The comparison alone cannot catch a mistake in the
+/// configuration and sync ops (`small_ops` builds them for both sides from the same input); the replay
+/// checks what the store will rebuild on the next start. A disagreement is logged (the caller then journals
+/// the whole mailbox) and fails a test build ([`strict_failure`]).
 #[cfg(any(test, debug_assertions))]
-fn check_ops(full: &Mailbox, now: &Mailbox, ops: &[Op]) -> bool {
-    let expected = crate::session::diff_ops(full, now);
-    let agree = expected.as_slice() == ops;
-    if !agree {
-        let names = |ops: &[Op]| -> Vec<String> {
-            ops.iter()
-                .map(|o| match o {
-                    Op::PutMail(m) => format!("PutMail({})", m.id.0),
-                    Op::RemoveMail(id) => format!("RemoveMail({})", id.0),
-                    Op::PutFolder(f) => format!("PutFolder({})", f.id.0),
-                    Op::RemoveFolder(id) => format!("RemoveFolder({})", id.0),
-                    Op::PutAccount(a) => format!("PutAccount({})", a.id.0),
-                    Op::PutSync(id, _) => format!("PutSync({})", id.0),
-                    Op::PutConfig(_) => "PutConfig".to_owned(),
-                    Op::Replace(_) => "Replace".to_owned(),
-                })
-                .collect()
-        };
+fn check_ops(full: Mailbox, now: &Mailbox, ops: &[Op]) -> bool {
+    let names = |ops: &[Op]| -> Vec<String> {
+        ops.iter()
+            .map(|o| match o {
+                Op::PutMail(m) => format!("PutMail({})", m.id.0),
+                Op::RemoveMail(id) => format!("RemoveMail({})", id.0),
+                Op::PutFolder(f) => format!("PutFolder({})", f.id.0),
+                Op::RemoveFolder(id) => format!("RemoveFolder({})", id.0),
+                Op::PutAccount(a) => format!("PutAccount({})", a.id.0),
+                Op::PutSync(id, _) => format!("PutSync({})", id.0),
+                Op::PutConfig(_) => "PutConfig".to_owned(),
+                Op::Replace(_) => "Replace".to_owned(),
+                Op::Batch(ops) => format!("Batch({})", ops.len()),
+            })
+            .collect()
+    };
+    let expected = crate::session::diff_ops(&full, now);
+    if expected.as_slice() != ops {
         let msg = format!(
             "change record and full comparison disagree: recorded {:?}, compared {:?}",
             names(ops),
@@ -183,8 +189,77 @@ fn check_ops(full: &Mailbox, now: &Mailbox, ops: &[Op]) -> bool {
         );
         log::error!("{msg}; saving the whole mailbox");
         strict_failure(&msg);
+        return false;
     }
-    agree
+    if let Some(what) = replay_mismatch(full, now, ops) {
+        let msg = format!("change record ops {:?} do not replay to the mailbox: {what}", names(ops));
+        log::error!("{msg}; saving the whole mailbox");
+        strict_failure(&msg);
+        return false;
+    }
+    true
+}
+
+/// Debug builds and tests: replays `ops` onto `before` (as the store does on the next start) and
+/// names the first part of the mailbox that comes out different from `now`; `None` when it all matches.
+/// `next_id` is not compared (replay only keeps it ahead of the ids it inserts), nor the view settings of a
+/// folder that was removed (`RemoveFolder` drops them on replay; a stray entry in memory is harmless).
+#[cfg(any(test, debug_assertions))]
+fn replay_mismatch(before: Mailbox, now: &Mailbox, ops: &[Op]) -> Option<&'static str> {
+    let mut replayed = before;
+    for op in ops.iter().cloned() {
+        let removed = match &op {
+            Op::RemoveFolder(id) => now.views.get(id).cloned().map(|v| (*id, v)),
+            _ => None,
+        };
+        op.apply(&mut replayed);
+        if let Some((id, v)) = removed {
+            replayed.views.insert(id, v);
+        }
+    }
+    replayed.next_id = now.next_id;
+    if replayed == *now {
+        return None;
+    }
+    // Exhaustive on purpose: a new Mailbox field fails to compile here until it is compared.
+    let Mailbox {
+        accounts,
+        categories,
+        rules,
+        quick_steps,
+        views,
+        signatures,
+        signature_defaults,
+        recent_recipients,
+        custom_dictionary,
+        junk,
+        folders,
+        mail,
+        next_id: _,
+        appointments,
+        contacts,
+        tasks,
+        notes,
+    } = now;
+    let parts: [(&'static str, bool); 16] = [
+        ("accounts", replayed.accounts == *accounts),
+        ("categories", replayed.categories == *categories),
+        ("rules", replayed.rules == *rules),
+        ("quick steps", replayed.quick_steps == *quick_steps),
+        ("views", replayed.views == *views),
+        ("signatures", replayed.signatures == *signatures),
+        ("signature defaults", replayed.signature_defaults == *signature_defaults),
+        ("recent recipients", replayed.recent_recipients == *recent_recipients),
+        ("custom dictionary", replayed.custom_dictionary == *custom_dictionary),
+        ("junk lists", replayed.junk == *junk),
+        ("folders", replayed.folders == *folders),
+        ("mail", replayed.mail == *mail),
+        ("appointments", replayed.appointments == *appointments),
+        ("contacts", replayed.contacts == *contacts),
+        ("tasks", replayed.tasks == *tasks),
+        ("notes", replayed.notes == *notes),
+    ];
+    Some(parts.iter().find(|(_, same)| !same).map_or("the mailbox", |(name, _)| *name))
 }
 
 /// Test builds (the engine's unit tests, and builds with the `strict-change-check` feature, which the
@@ -443,6 +518,46 @@ mod tests {
             }
         });
         assert!(matches!(ops.as_slice(), [Op::Replace(_)]), "{ops:?}");
+    }
+
+    /// Storage S4 review: the debug check also replays the ops, so a configuration or sync op that the
+    /// comparison agrees with (both sides come from `small_ops`) but that rebuilds a different mailbox is
+    /// caught: a part left out, an account's sync state lost, a `PutSync` for an account that is not there.
+    #[test]
+    fn the_check_replays_the_ops_onto_the_mailbox_before() {
+        let s = session();
+        let before = s.mailbox.clone();
+        let mut now = before.clone();
+        now.categories.push(mailcraft_model::Category { name: "Fresh".into(), ..Default::default() });
+        let account = now.accounts.first().map(|a| a.id).unwrap();
+        if let Some(a) = now.accounts.first_mut() {
+            a.sync.next_op = a.sync.next_op.wrapping_add(3);
+        }
+        let ops = crate::session::diff_ops(&before, &now);
+        assert_eq!(replay_mismatch(before.clone(), &now, &ops), None);
+        assert!(check_ops(before.clone(), &now, &ops));
+        // The new category left out of the configuration op.
+        let lost: Vec<Op> = ops.iter().filter(|o| !matches!(o, Op::PutConfig(_))).cloned().collect();
+        assert_eq!(replay_mismatch(before.clone(), &now, &lost), Some("categories"));
+        // The sync state change left out, or sent to an account that is not there.
+        let lost: Vec<Op> = ops.iter().filter(|o| !matches!(o, Op::PutSync(..))).cloned().collect();
+        assert_eq!(replay_mismatch(before.clone(), &now, &lost), Some("accounts"));
+        let elsewhere: Vec<Op> = ops
+            .iter()
+            .cloned()
+            .map(|o| match o {
+                Op::PutSync(id, sy) if id == account => Op::PutSync(mailcraft_model::AccountId(9_999), sy),
+                o => o,
+            })
+            .collect();
+        assert_eq!(replay_mismatch(before.clone(), &now, &elsewhere), Some("accounts"));
+        // A removed folder's view settings left in memory are no mismatch (replay drops them).
+        let mut now = before.clone();
+        let folder = now.folders.keys().next_back().copied().unwrap();
+        now.folders.remove(&folder);
+        now.views.insert(folder, Default::default());
+        let ops = crate::session::diff_ops(&before, &now);
+        assert_eq!(replay_mismatch(before, &now, &ops), None);
     }
 
     #[test]

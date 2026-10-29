@@ -152,13 +152,21 @@ fn journal_lines_are_byte_identical() {
     let mb = fixture();
     let first = mb.mail.items().next().cloned().unwrap();
     let mut store = Store::open(dir.path()).unwrap();
-    store.append(&[Op::PutMail(Box::new(first.clone())), Op::Replace(Box::new(mb.clone()))]).unwrap();
+    store.append(&[Op::PutMail(Box::new(first.clone()))]).unwrap();
+    store.append(&[Op::Replace(Box::new(mb.clone()))]).unwrap();
+    // Two ops appended together share a line (storage S4 review: a batch replays whole or not at all).
+    let both = [Op::PutMail(Box::new(first.clone())), Op::Replace(Box::new(mb.clone()))];
+    store.append(&both).unwrap();
     drop(store);
     let text = std::fs::read_to_string(dir.path().join(journal::JOURNAL_FILE)).unwrap();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 3, "header and two ops");
-    assert_eq!(lines[1], format!("{{\"PutMail\":{}}}", serde_json::to_string(&first).unwrap()));
-    assert_eq!(lines[2], format!("{{\"Replace\":{}}}", serde_json::to_string(&legacy(&mb)).unwrap()));
+    assert_eq!(lines.len(), 4, "header, two ops, one batch");
+    let put = format!("{{\"PutMail\":{}}}", serde_json::to_string(&first).unwrap());
+    let replace = format!("{{\"Replace\":{}}}", serde_json::to_string(&legacy(&mb)).unwrap());
+    assert_eq!(lines[1], put);
+    assert_eq!(lines[2], replace);
+    assert_eq!(lines[3], format!("{{\"Batch\":[{put},{replace}]}}"));
+    assert_eq!(lines[3], serde_json::to_string(&Op::Batch(both.to_vec())).unwrap());
     let back = Store::open(dir.path()).unwrap().load().unwrap();
     assert_eq!(back.mail, mb.mail);
 }

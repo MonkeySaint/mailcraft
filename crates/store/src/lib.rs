@@ -16,8 +16,10 @@
 //!   `{"mailcraft_snapshot":2,"generation":N,"bodies":2,"mailbox":{...}}` (format 1, written before storage
 //!   stage S5, is still read).
 //! - `journal.jsonl`: append-only [`Op`] log since the snapshot (header line carries the snapshot generation it
-//!   applies to); replayed on open; a torn last line is ignored (crash recovery), garbled middle lines are
-//!   skipped with a warning. Compacted into a new snapshot by [`Store::checkpoint`].
+//!   applies to, and its format, [`journal::JOURNAL_VERSION`]); replayed on open; a torn last line is ignored
+//!   (crash recovery), garbled middle lines are skipped with a warning. One append is one line (several ops
+//!   as an [`Op::Batch`]), so a crash keeps or loses a command's changes as a whole. Compacted into a new
+//!   snapshot by [`Store::checkpoint`].
 //! - `blobs/<aa>/<hash>-<len>.eml`: raw RFC 5322 sources, content-addressed (FNV-1a 64 hex + length,
 //!   collision-checked byte for byte; a true collision gets a `-<n>` suffix); `blobs/<aa>/<hash>-<len>.body`:
 //!   body records of items without a source or with a body changed here (storage stage S5,
@@ -38,7 +40,8 @@
 //! [`Store::journal_bytes`], [`Store::keep_alive`], [`Store::append_keyed`], [`MailRepo`] (storage stage S2),
 //! [`Op::PutSync`], [`Op::PutConfig`] and [`SmallState`] (storage stage S4), [`BodyStore`] and [`Content`]
 //! (storage stage S5: bodies and sources out of memory), [`StoreKind`], [`Store::open_with`],
-//! [`Store::body_store`], [`SqlRepo`], [`SqlStore`], [`MemRepo`] and the pack files (storage stage S6).
+//! [`Store::body_store`], [`SqlRepo`], [`SqlStore`], [`MemRepo`] and the pack files (storage stage S6),
+//! [`Op::Batch`] and [`StoreError::TooNew`] (storage stage S4 review).
 //!
 //! Size caps (issue #25): every file is written under the same cap its reader applies, so a profile can never
 //! hold a snapshot, journal or recoverable-items file it would refuse to open. A write past the cap fails with
@@ -94,6 +97,10 @@ pub enum StoreError {
     Corrupt(String),
     #[error("store is locked by another process")]
     Locked,
+    /// The data folder was written by a newer MailCraft in a format this build cannot read (opening it anyway
+    /// would lose what the newer build saved).
+    #[error("the data folder was written by a newer version of MailCraft: {0}")]
+    TooNew(String),
     /// A write was refused because the file would pass the size cap its reader applies (the file on disk is
     /// left as it was).
     #[error("{0}")]
@@ -141,12 +148,46 @@ pub enum Op {
     /// Replace the configuration parts that changed ([`SmallState`]: accounts without their sync state,
     /// categories, rules, quick steps, views, signatures, Auto-Complete, dictionary, junk lists).
     PutConfig(Box<SmallState>),
+    /// Several ops on one journal line, replayed in order: [`Store::append`] writes every batch of more than
+    /// one op this way, so a batch is replayed whole or not at all (a line torn by a crash is dropped whole,
+    /// never a prefix of the batch: an account removed while its folders and mail stay behind, or a server
+    /// change queued for a move that is not there). Journal format 2.
+    Batch(Vec<Op>),
 }
 
 impl Op {
     /// Applies this op to `mb`. Upserts keep `mb.next_id` ahead of every id they insert so later allocations
-    /// never collide with replayed items.
+    /// never collide with replayed items. A [`Op::Batch`] is unrolled without recursion (a nested batch from
+    /// a hostile journal cannot exhaust the stack).
     pub fn apply(self, mb: &mut Mailbox) {
+        let mut stack: Vec<std::vec::IntoIter<Op>> = vec![vec![self].into_iter()];
+        while let Some(top) = stack.last_mut() {
+            match top.next() {
+                None => {
+                    stack.pop();
+                }
+                Some(Op::Batch(ops)) => stack.push(ops.into_iter()),
+                Some(op) => op.apply_one(mb),
+            }
+        }
+    }
+
+    /// Calls `f` on this op, or on each op of a [`Op::Batch`] in order (nested batches unrolled without
+    /// recursion); `f` never sees a batch.
+    pub fn for_each_leaf<'a>(&'a self, mut f: impl FnMut(&'a Op)) {
+        let mut stack: Vec<std::slice::Iter<'a, Op>> = vec![std::slice::from_ref(self).iter()];
+        while let Some(top) = stack.last_mut() {
+            match top.next() {
+                None => {
+                    stack.pop();
+                }
+                Some(Op::Batch(ops)) => stack.push(ops.iter()),
+                Some(op) => f(op),
+            }
+        }
+    }
+
+    fn apply_one(self, mb: &mut Mailbox) {
         match self {
             Op::PutMail(item) => {
                 mb.next_id = mb.next_id.max(item.id.0);
@@ -170,6 +211,12 @@ impl Op {
             Op::Replace(new) => *mb = *new,
             Op::PutSync(id, sync) => config::put_sync(mb, id, *sync),
             Op::PutConfig(state) => state.apply(mb),
+            // `apply` unrolls batches before they get here; a batch is still applied whole if one does.
+            Op::Batch(ops) => {
+                for op in ops {
+                    op.apply(mb);
+                }
+            }
         }
     }
 }
@@ -316,6 +363,15 @@ pub struct Store {
     snapshot_cap: u64,
 }
 
+/// The error for a journal batch the writer refused: [`StoreError::TooLarge`] past the `cap`.
+fn append_error(e: std::io::Error, cap: u64) -> StoreError {
+    if journal::is_cap_error(&e) {
+        StoreError::TooLarge(format!("the journal would grow past the {cap} byte cap; checkpoint first"))
+    } else {
+        e.into()
+    }
+}
+
 impl Store {
     /// Opens (creating if missing) a store at `dir`, taking the lock. An existing profile opens in the
     /// storage it has; a new one gets legacy storage.
@@ -439,6 +495,9 @@ impl Store {
         if let Some(bytes) = journal_bytes {
             let scan = journal::scan_journal(&bytes);
             drop(bytes);
+            if let Some(v) = scan.version.filter(|v| *v > journal::JOURNAL_VERSION) {
+                return Err(journal::too_new_error(v));
+            }
             if scan.generation.is_some_and(|g| g < snap_gen) {
                 log::warn!("journal predates the snapshot; ignoring it");
                 report.stale_journal = true;
@@ -449,8 +508,9 @@ impl Store {
                 report.legacy_content |= !scan.inline.is_empty();
                 let mut inline = scan.inline.into_iter().peekable();
                 for (i, op) in scan.ops.into_iter().enumerate() {
-                    // What the op replaces loses the content an earlier line carried for it.
-                    match &op {
+                    // What the op replaces loses the content an earlier line carried for it (each op of a
+                    // batch in turn).
+                    op.for_each_leaf(|op| match op {
                         Op::PutMail(m) => {
                             pending.remove(&m.id);
                         }
@@ -459,7 +519,7 @@ impl Store {
                         }
                         Op::Replace(_) => pending.clear(),
                         _ => {}
-                    }
+                    });
                     while let Some((_, c)) = inline.next_if(|(at, _)| *at == i) {
                         match c {
                             legacy::InlineOp::Mail(id, c) => {
@@ -512,19 +572,24 @@ impl Store {
         // batch is serialised through a writer capped at the room left, so a refused batch (a whole-mailbox
         // `Replace` can be as large as the cap) is never built in memory first.
         let mut w = journal::CapWriter::new(Vec::new(), cap.saturating_sub(before));
-        for op in ops {
-            let res = serde_json::to_writer(&mut w, op)
-                .map_err(std::io::Error::from)
-                .and_then(|()| w.write_all(b"\n"));
-            match res {
-                Ok(()) => {}
-                Err(e) if journal::is_cap_error(&e) => {
-                    return Err(StoreError::TooLarge(format!(
-                        "the journal would grow past the {cap} byte cap; checkpoint first"
-                    )));
-                }
-                Err(e) => return Err(e.into()),
+        // More than one op go on one line, as an `Op::Batch` (its serde form, written op by op so the ops
+        // are not copied into one first): a crash mid-write then loses the whole batch, not a part of it.
+        let batch = ops.len() > 1;
+        if batch && let Err(e) = w.write_all(b"{\"Batch\":[") {
+            return Err(append_error(e, cap));
+        }
+        for (i, op) in ops.iter().enumerate() {
+            let sep: &[u8] = if batch && i > 0 { b"," } else { b"" };
+            let res = w
+                .write_all(sep)
+                .and_then(|()| serde_json::to_writer(&mut w, op).map_err(std::io::Error::from));
+            if let Err(e) = res {
+                return Err(append_error(e, cap));
             }
+        }
+        let end: &[u8] = if batch { b"]}\n" } else { b"\n" };
+        if let Err(e) = w.write_all(end) {
+            return Err(append_error(e, cap));
         }
         let buf = w.into_inner();
         let written = lf.journal.write_all(&buf).and_then(|()| lf.journal.sync_data());

@@ -75,7 +75,8 @@ fn journal_round_trip_keeps_content_keys() {
             .unwrap();
         let journal = fs::read_to_string(d.path().join(JOURNAL_FILE)).unwrap();
         assert!(!journal.contains("First body"));
-        assert_eq!(journal.lines().count(), 5, "header + 4 ops");
+        assert_eq!(journal.lines().count(), 2, "header + the 4 ops as one batch");
+        assert!(journal.lines().nth(1).unwrap().starts_with("{\"Batch\":[{\"PutFolder\""));
     }
     let store = Store::open(d.path()).unwrap();
     let loaded = store.load().unwrap();
@@ -1230,4 +1231,172 @@ fn autosave_keeps_the_batch_when_journal_and_snapshot_are_refused() {
     assert!(auto.record(&mut store, &mb, &[Op::PutMail(Box::new(item))]).is_err());
     assert_eq!(auto.pending(), 1, "nothing lost");
     assert_eq!(store.generation(), 0);
+}
+
+// ---- Storage S4 review: atomic batches, journal format -----------------------------------------------------
+
+/// The ops of one append are one journal line (`Op::Batch`): a crash partway through writing it leaves the
+/// state before the batch or after it, never a part of it. Here the batch removes an account with its folder
+/// and mail (the shape `accounts.remove` journals); every cut of the line reopens to one of the two states.
+#[test]
+fn a_batch_cut_anywhere_replays_whole_or_not_at_all() {
+    use mailcraft_model::{Account, AccountId};
+    let d = tmp();
+    let mut mb = base_mailbox();
+    mb.accounts.push(Account { id: AccountId(1), display_name: "Local".into(), ..Default::default() });
+    let mut gone = Account { id: AccountId(2), display_name: "Gone".into(), ..Default::default() };
+    gone.sync.next_op = 9;
+    mb.accounts.push(gone);
+    let folder =
+        Folder { id: FolderId(20), account: AccountId(2), name: "Inbox".into(), ..Default::default() };
+    mb.folders.insert(folder.id, folder);
+    for id in 21..=25 {
+        mb.mail.insert(ItemId(id), MailItem { folder: FolderId(20), ..mail(id, "theirs", None) });
+    }
+    mb.next_id = 25;
+    let mut after = mb.clone();
+    after.accounts.truncate(1);
+    after.folders.remove(&FolderId(20));
+    after.mail.retain(|_, m| m.folder != FolderId(20));
+    let mut ops = vec![Op::PutConfig(Box::new(SmallState {
+        accounts: Some(after.accounts.iter().map(Account::without_sync).collect()),
+        ..Default::default()
+    }))];
+    ops.extend((21..=25).map(|id| Op::RemoveMail(ItemId(id))));
+    ops.push(Op::RemoveFolder(FolderId(20)));
+    let path = d.path().join(JOURNAL_FILE);
+    let start = {
+        let mut store = Store::open(d.path()).unwrap();
+        store.checkpoint(&mb).unwrap();
+        let start = store.journal_bytes();
+        store.append(&ops).unwrap();
+        start
+    };
+    let full = fs::read(&path).unwrap();
+    assert_eq!(full.iter().filter(|&&b| b == b'\n').count(), 2, "header + one line");
+    let end = u64::try_from(full.len()).unwrap();
+    let (mut before_seen, mut after_seen) = (0, 0);
+    for cut in start..=end {
+        fs::write(&path, full.get(..usize::try_from(cut).unwrap()).unwrap()).unwrap();
+        let loaded = Store::open(d.path()).unwrap().load().unwrap();
+        if loaded == mb {
+            before_seen += 1;
+        } else {
+            assert_eq!(loaded, after, "cut at byte {cut} of {end}: neither before nor after");
+            after_seen += 1;
+        }
+    }
+    // Only the whole line (with or without its newline) replays it.
+    assert_eq!(after_seen, 2);
+    assert_eq!(before_seen, end - start - 1);
+}
+
+/// A batch nested in batches (only a hostile journal holds one) applies without recursion.
+#[test]
+fn nested_batches_apply_in_order_without_recursion() {
+    let mut op = Op::PutMail(Box::new(mail(2, "deep", None)));
+    for _ in 0..100_000 {
+        op = Op::Batch(vec![op]);
+    }
+    let mut mb = base_mailbox();
+    Op::Batch(vec![Op::PutMail(Box::new(mail(1, "first", None))), op, Op::RemoveMail(ItemId(1))])
+        .apply(&mut mb);
+    assert_eq!(mb.mail.ids().collect::<Vec<_>>(), [ItemId(2)]);
+    // From a journal, serde's nesting limit turns a deep line into a skipped one.
+    let deep = format!("{}{{\"RemoveMail\":1}}{}", "{\"Batch\":[".repeat(500), "]}".repeat(500));
+    let scan = crate::journal::scan_journal(format!("{deep}\n").as_bytes());
+    assert_eq!((scan.ops.len(), scan.skipped_lines.len()), (0, 1));
+}
+
+/// A batch written after content that a pre-S5 snapshot carries inline replaces or removes the items it
+/// names, the content with them: the old inline body never lands on the item the batch wrote.
+#[test]
+fn a_batch_supersedes_inline_content_from_before_s5() {
+    let d = tmp();
+    let item = |id: u64, text: &str| {
+        format!(
+            "\"{id}\":{{\"id\":{id},\"folder\":1,\"message_id\":null,\"in_reply_to\":[],\"references\":[],\
+             \"subject\":\"m{id}\",\"from\":null,\"sender\":null,\"to\":[],\"cc\":[],\"bcc\":[],\"reply_to\":[],\
+             \"sent\":null,\"received\":{{\"unix\":0,\"offset_min\":0}},\"size\":1,\"read\":false,\
+             \"importance\":\"Normal\",\"sensitivity\":\"Normal\",\"flag\":\"None\",\"categories\":[],\
+             \"attachments\":[],\"preview\":\"\",\"body\":{{\"format\":\"PlainText\",\"text\":{text},\"html\":null}},\
+             \"is_draft\":false,\"response\":\"None\",\"focus\":\"Focused\",\"conversation\":null,\
+             \"ignored\":false,\"remote_id\":null,\"blob\":null,\"raw\":null}}"
+        )
+    };
+    let items = [item(5, "\"Kept\""), item(8, "\"Old\""), item(9, "\"Gone\"")].join(",");
+    let mut mb_json = serde_json::to_value(base_mailbox()).unwrap();
+    mb_json["mail"] = serde_json::json!({});
+    let mb_text =
+        serde_json::to_string(&mb_json).unwrap().replace("\"mail\":{}", &format!("\"mail\":{{{items}}}"));
+    fs::write(
+        d.path().join(SNAPSHOT_FILE),
+        format!("{{\"mailcraft_snapshot\":1,\"generation\":3,\"mailbox\":{mb_text}}}"),
+    )
+    .unwrap();
+    let new8 = mail(8, "rewritten", None);
+    let batch = Op::Batch(vec![Op::PutMail(Box::new(new8.clone())), Op::RemoveMail(ItemId(9))]);
+    fs::write(
+        d.path().join(JOURNAL_FILE),
+        format!("{{\"mailcraft_journal\":2,\"generation\":3}}\n{}\n", serde_json::to_string(&batch).unwrap()),
+    )
+    .unwrap();
+    let store = Store::open(d.path()).unwrap();
+    let (mb, report) = store.load_report().unwrap();
+    assert!(report.legacy_content);
+    assert_eq!(report.migrated_bodies, 1, "only the item the batch left alone");
+    assert_eq!(mb.mail.get(ItemId(8)), Some(&new8), "the batch's item, without the old inline body");
+    assert!(mb.mail.get(ItemId(9)).is_none());
+    let bodies = BodyStore::on_disk(d.path());
+    let five = mb.mail.get(ItemId(5)).cloned().unwrap();
+    assert_eq!(bodies.body_of(&five).unwrap().and_then(|b| b.text.clone()).as_deref(), Some("Kept"));
+}
+
+/// A journal in a newer format than this build reads is refused, not replayed with its unknown lines
+/// skipped (the next snapshot would make that loss permanent). An older one is replayed, and its header is
+/// brought to the current format before anything is appended.
+#[test]
+fn journal_format_versions() {
+    use crate::journal::{JOURNAL_VERSION, JournalHeader};
+    let d = tmp();
+    {
+        let mut store = Store::open(d.path()).unwrap();
+        store.append(&[Op::PutMail(Box::new(mail(1, "a", None)))]).unwrap();
+    }
+    let path = d.path().join(JOURNAL_FILE);
+    let written = fs::read(&path).unwrap();
+    let header = written.split(|&b| b == b'\n').next().unwrap();
+    assert_eq!(JournalHeader::parse(header).unwrap().mailcraft_journal, JOURNAL_VERSION);
+    let body = written.get(header.len()..).unwrap().to_vec();
+    let with_header = |version: u32| {
+        let mut v = format!("{{\"mailcraft_journal\":{version},\"generation\":0}}").into_bytes();
+        v.extend_from_slice(&body);
+        v
+    };
+    // Newer: refused at open, and by a load that finds it written since.
+    fs::write(&path, with_header(JOURNAL_VERSION + 1)).unwrap();
+    let err = Store::open(d.path()).unwrap_err();
+    assert!(matches!(err, StoreError::TooNew(_)), "{err}");
+    assert!(err.to_string().contains("newer version of MailCraft"), "{err}");
+    assert_eq!(fs::read(&path).unwrap(), with_header(JOURNAL_VERSION + 1), "left as it was");
+    // Older: replayed, and the header upgraded.
+    fs::write(&path, with_header(1)).unwrap();
+    let mut store = Store::open(d.path()).unwrap();
+    assert_eq!(store.open_repair().upgraded_from, Some(1));
+    assert_eq!(fs::read(&path).unwrap(), with_header(JOURNAL_VERSION));
+    assert_eq!(store.load().unwrap().mail.len(), 1);
+    store.append(&[Op::PutMail(Box::new(mail(2, "b", None)))]).unwrap();
+    assert_eq!(store.load().unwrap().mail.len(), 2);
+    let now = fs::read(&path).unwrap();
+    let mut newer = with_header(JOURNAL_VERSION + 1);
+    newer.truncate(newer.len() - body.len());
+    newer.extend_from_slice(now.get(header.len()..).unwrap());
+    fs::write(&path, &newer).unwrap();
+    assert!(matches!(store.load_report(), Err(StoreError::TooNew(_))));
+    drop(store);
+    // The current format opens as it is.
+    fs::write(&path, &now).unwrap();
+    let store = Store::open(d.path()).unwrap();
+    assert_eq!(store.open_repair().upgraded_from, None);
+    assert_eq!(store.load().unwrap().mail.len(), 2);
 }
