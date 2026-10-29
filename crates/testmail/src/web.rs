@@ -3,6 +3,9 @@
 //! - autoconfig documents set with [`crate::TestServers::set_autoconfig`], at
 //!   `/autoconfig/<domain>/mail/config-v1.1.xml` (standing in for `https://autoconfig.<domain>/…`) and
 //!   `/<domain>/.well-known/autoconfig/mail/config-v1.1.xml`;
+//! - tenants' OpenID configurations set with [`crate::TestServers::set_tenant`], at
+//!   `/tenant/<domain>/v2.0/.well-known/openid-configuration` (standing in for the Microsoft identity
+//!   platform's), 400 `invalid_tenant` for other domains;
 //! - the OAuth 2.0 authorization server of [`crate::oauth`]: `POST /oauth/device` (device authorization),
 //!   `POST /oauth/token`, `GET /oauth/authorize` (answers with a redirect at once) and `GET /oauth/verify`.
 //!
@@ -25,6 +28,8 @@ use crate::server::Ctx;
 pub struct WebState {
     /// Documents by (domain, served at the `autoconfig.<domain>` location too).
     pub autoconfig: BTreeMap<String, (String, bool)>,
+    /// Tenant ids by domain.
+    pub tenants: BTreeMap<String, String>,
     pub requests: Vec<String>,
 }
 
@@ -104,6 +109,31 @@ fn handle(conn: &mut Conn, ctx: &Ctx, req: &Request) -> io::Result<()> {
             "text/plain",
             b"Test sign-in page: tests approve codes through TestServers.",
         ),
+        ("GET", p) if p.starts_with("/tenant/") => {
+            let domain = p
+                .strip_prefix("/tenant/")
+                .and_then(|r| r.strip_suffix("/v2.0/.well-known/openid-configuration"))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let tenant = ctx.web.lock().unwrap_or_else(|e| e.into_inner()).tenants.get(&domain).cloned();
+            match tenant {
+                Some(t) => json(
+                    conn,
+                    200,
+                    &serde_json::json!({
+                        "issuer": format!("{base}/{t}/v2.0"),
+                        "authorization_endpoint": format!("{base}/{t}/oauth2/v2.0/authorize"),
+                        "token_endpoint": format!("{base}/{t}/oauth2/v2.0/token"),
+                        "response_types_supported": ["code"],
+                    }),
+                ),
+                None => json(
+                    conn,
+                    400,
+                    &serde_json::json!({"error": "invalid_tenant", "error_description": "unknown tenant"}),
+                ),
+            }
+        }
         ("GET", p) => {
             let sub = p.strip_prefix("/autoconfig/").and_then(|r| r.strip_suffix("/mail/config-v1.1.xml"));
             let well_known = p

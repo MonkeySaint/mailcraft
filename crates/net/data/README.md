@@ -26,7 +26,8 @@ Notes on the listed providers (from their public documentation):
 
 - Google: the device flow does not allow the Gmail scope, so only the browser flow is offered. Google issues a
   client secret to desktop applications; it is entered by the user like the client id.
-- Microsoft: both flows work with the `common` tenant; `offline_access` is needed for refresh tokens.
+- Microsoft: both flows work with the `common` tenant (or the organization's own tenant, which account setup
+  finds from the domain); `offline_access` is needed for refresh tokens.
 
 ## Registering a client id, step by step
 
@@ -58,11 +59,22 @@ it as one:
 
 1. In the Azure portal (Microsoft Entra ID › App registrations) create a registration; supported account
    types: personal and work or school accounts, to match the `common` endpoints.
-2. Authentication › Add a platform › **Mobile and desktop applications**, redirect URI `http://localhost`
-   (Microsoft accepts any port and 127.0.0.1 for loopback redirects of public clients).
+2. Authentication › Add a platform › **Mobile and desktop applications**, and add **both** redirect URIs
+   `http://127.0.0.1` and `http://localhost`. MailCraft sends `http://127.0.0.1:<port>/` (a one-time port);
+   Microsoft ignores the port of loopback redirects for public clients, but only matches the host name that
+   is registered, so `http://localhost` alone is not enough.
 3. Authentication › **Allow public client flows: Yes** (needed for the device code flow).
 4. API permissions: `IMAP.AccessAsUser.All`, `POP.AccessAsUser.All`, `SMTP.Send` (Office 365 Exchange
    Online) and `offline_access`. No client secret is needed.
+5. Supported account types: a registration for your own organization only (*single tenant*) is fine. Account
+   setup finds the organization's tenant id from its domain and signs in at
+   `https://login.microsoftonline.com/<tenant>/…` instead of `common` (`"tenant"` in `accounts.oauthSignIn`).
+   A registration in one organization used by people of another needs consent by an administrator of theirs.
+
+Microsoft 365 mailboxes also need, on the organization's side: IMAP (or POP) and **Authenticated SMTP**
+turned on for the mailbox (both can be off per mailbox or for the whole organization), and, where users may
+not consent to apps themselves, an administrator's consent to the permissions above. Basic authentication
+(a password) is off for IMAP, POP and SMTP on Microsoft 365 and Outlook.com, so OAuth is the only way in.
 
 **Another provider** (`"provider": "custom"`): give its endpoints with the client id, for example
 

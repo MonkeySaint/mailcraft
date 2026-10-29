@@ -1,5 +1,6 @@
-//! End to end, account setup and download policy: server lookup for the Add Account wizard (autoconfig and
-//! DNS SRV against local fixtures), OAuth 2.0 device sign-in with XOAUTH2 IMAP/SMTP and token refresh, JMAP
+//! End to end, account setup and download policy: server lookup for the Add Account wizard (autoconfig, DNS
+//! SRV and MX, and the Microsoft 365 tenant against local fixtures), OAuth 2.0 device sign-in with XOAUTH2
+//! IMAP/SMTP and token refresh, JMAP
 //! push over the event source (and polling without it), the "download mail from the past N months" window,
 //! and On Slow Connections Download Only Headers. Against the local test servers only (`mailcraft-testmail`,
 //! 127.0.0.1, synthetic users); every wait has a timeout.
@@ -13,7 +14,7 @@ use mailcraft_engine::model::{AccountId, FolderId, FolderRole, ItemId, Mailbox};
 use mailcraft_engine::sync::{PushMode, cmds};
 use mailcraft_net::ConnectOptions;
 use mailcraft_net::discover::{DiscoverOptions, ResolverChoice};
-use mailcraft_testmail::{Config, DateTime, OAUTH_TEST_CLIENT, Srv, TestServers};
+use mailcraft_testmail::{Config, DateTime, Mx, OAUTH_TEST_CLIENT, Srv, TestServers};
 use serde_json::{Value, json};
 
 const ALICE: &str = "alice@example.com";
@@ -106,6 +107,7 @@ fn discover_finds_settings_from_autoconfig_and_dns() {
         dns_timeout: Duration::from_secs(2),
         autoconfig_urls: srv.autoconfig_url_templates(),
         http: ConnectOptions::trusting(srv.cert_der.clone()),
+        tenant_url: Some(srv.tenant_url_template()),
         allow_reserved: true,
     };
     srv.set_autoconfig(
@@ -152,6 +154,97 @@ fn discover_finds_settings_from_autoconfig_and_dns() {
     assert!(r["pop3"].is_null());
 
     assert!(s.run("accounts.discover", &json!({"address": "nonsense"})).is_err());
+}
+
+#[test]
+fn microsoft_365_found_by_mx_and_signed_in_with_its_tenant() {
+    const TENANT: &str = "6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f";
+    let srv = servers(Config::default());
+    let mut s = session();
+    s.sync.discovery = DiscoverOptions {
+        resolver: ResolverChoice::Fixed(srv.dns_addr()),
+        dns_timeout: Duration::from_secs(2),
+        autoconfig_urls: srv.autoconfig_url_templates(),
+        http: ConnectOptions::trusting(srv.cert_der.clone()),
+        tenant_url: Some(srv.tenant_url_template()),
+        allow_reserved: true,
+    };
+    // A domain on Microsoft 365: no autoconfig, no SRV records, the MX at Exchange Online.
+    srv.set_mx(
+        "m365.example.org",
+        vec![Mx { preference: 0, exchange: "m365-example-org.mail.protection.outlook.com".into() }],
+    );
+    srv.set_tenant("m365.example.org", Some(TENANT));
+    let address = "robin@m365.example.org";
+    let r = run(&mut s, "accounts.discover", json!({"address": address, "wait": true}));
+    assert_eq!(r["found"], true, "{r}");
+    assert_eq!(r["sources"], json!(["mx"]));
+    assert_eq!(r["provider"]["id"], "microsoft365");
+    assert_eq!(r["provider"]["detectedBy"], "mx");
+    assert_eq!(r["provider"]["oauthProvider"], "microsoft");
+    assert_eq!(r["provider"]["graph"], true);
+    assert!(
+        r["provider"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("Authenticated SMTP"))
+    );
+    assert_eq!(r["mx"], json!(["m365-example-org.mail.protection.outlook.com"]));
+    assert_eq!(r["tenant"], TENANT);
+    assert_eq!(
+        (r["imap"]["host"].as_str(), r["imap"]["port"].as_u64(), r["imap"]["security"].as_str()),
+        (Some("outlook.office365.com"), Some(993), Some("tls"))
+    );
+    assert_eq!(r["imap"]["oauthOnly"], true);
+    assert_eq!((r["pop3"]["port"].as_u64(), r["pop3"]["security"].as_str()), (Some(995), Some("tls")));
+    assert_eq!(
+        (r["smtp"]["host"].as_str(), r["smtp"]["port"].as_u64(), r["smtp"]["security"].as_str()),
+        (Some("smtp.office365.com"), Some(587), Some("starttls"))
+    );
+    // Only the domain went to the tenant lookup; nothing was guessed under the domain.
+    let reqs = srv.web_requests();
+    assert!(reqs.iter().filter(|q| q.contains("/tenant/")).all(|q| !q.contains("robin")), "{reqs:?}");
+
+    // The account takes those settings and signs in with the Microsoft provider in the tenant (browser flow:
+    // only the sign-in page address is made; nothing is contacted before the browser comes back).
+    let a = id_of(&run(
+        &mut s,
+        "accounts.add",
+        json!({"kind": "imap", "address": address,
+               "incoming": {"host": r["imap"]["host"], "port": r["imap"]["port"], "security": r["imap"]["security"]},
+               "outgoing": {"host": r["smtp"]["host"], "port": r["smtp"]["port"], "security": r["smtp"]["security"]}}),
+    ));
+    let st = run(
+        &mut s,
+        "accounts.oauthSignIn",
+        json!({"account": a.0, "provider": r["provider"]["oauthProvider"], "clientId": "registered-app",
+               "flow": "browser", "tenant": r["tenant"]}),
+    );
+    let url = st["authUrl"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        url.starts_with(&format!("https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize?")),
+        "{st}"
+    );
+    assert!(url.contains("client_id=registered-app"));
+    let o = mailcraft_engine::accounts::account_options(&s, a);
+    assert_eq!(
+        o.oauth.unwrap().token_endpoint,
+        format!("https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token")
+    );
+    run(&mut s, "accounts.oauthCancel", json!({"account": a.0}));
+    assert_eq!(run(&mut s, "accounts.oauthStatus", json!({"account": a.0}))["status"], "cancelled");
+
+    // A personal Outlook.com address needs no lookup at all.
+    let before = srv.web_requests().len();
+    let r = run(&mut s, "accounts.discover", json!({"address": "robin@hotmail.com", "wait": true}));
+    assert_eq!(
+        (r["provider"]["id"].as_str(), r["provider"]["detectedBy"].as_str()),
+        (Some("outlook.com"), Some("domain"))
+    );
+    assert_eq!(r["smtp"]["host"], "smtp-mail.outlook.com");
+    assert!(r["tenant"].is_null());
+    assert_eq!(srv.web_requests().len(), before);
 }
 
 #[test]

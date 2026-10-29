@@ -1,14 +1,29 @@
 //! Finding an account's servers from its address, before falling back to guessing:
 //!
+//! 0. **Consumer domains** of the big providers (`gmail.com`, `outlook.com`, `hotmail.co.uk` …): their public
+//!    settings from [`crate::providers`], with no lookup at all.
 //! 1. **Autoconfig**: the provider's `clientConfig` document over HTTPS on the mail domain
 //!    (`https://autoconfig.<domain>/mail/config-v1.1.xml?emailaddress=…`, then
 //!    `https://<domain>/.well-known/autoconfig/mail/config-v1.1.xml`), see [`crate::autoconfig`].
 //! 2. **DNS SRV** (RFC 6186, with the implicit-TLS records of RFC 8314 section 5.1 and JMAP's RFC 8620
 //!    section 2.2): `_imaps._tcp`, `_imap._tcp`, `_pop3s._tcp`, `_pop3._tcp`, `_submissions._tcp`,
 //!    `_submission._tcp` and `_jmap._tcp` under the domain, asked of the system resolver.
+//! 3. **DNS MX**: when the domain's preferred mail exchangers belong to a well-known provider (Microsoft 365,
+//!    Outlook.com, Google Workspace; see [`crate::providers`]), that provider's servers. Only the domain is
+//!    asked about, of the same resolver; the address is not sent anywhere.
+//! 4. **Microsoft 365 tenant**: the tenant's public OpenID configuration, asked by domain only (never the
+//!    address) at `login.microsoftonline.com`, when Microsoft 365 was recognised (for the tenant id, which
+//!    single-tenant app registrations need for OAuth), or when nothing else found anything and the MX records
+//!    were looked up and name a mail exchanger MailCraft does not know (a tenant whose mail passes through a
+//!    filtering service first has an MX record of that service). Without an MX answer (no resolver, as on
+//!    Windows; a failed lookup; no MX records) or with a null MX, the domain is not sent to Microsoft.
 //!
-//! Servers found through DNS outside the address's domain are marked unverified (RFC 6186 section 6): the
-//! account wizard shows them for confirmation like any other suggestion. Nothing here sends credentials.
+//! Servers found through DNS SRV outside the address's domain are marked unverified (RFC 6186 section 6):
+//! the account wizard shows them for confirmation like any other suggestion. A known provider's servers are
+//! its own hosts, whatever pointed at them, and count as verified, except when the provider is only known from
+//! the tenant: every domain verified in a Microsoft Entra tenant has one, wherever its mail is (an on-premises
+//! Exchange server, another host), so those servers are a probable match to be confirmed (unverified).
+//! Nothing here sends credentials.
 //!
 //! Domains reserved for documentation and testing (RFC 2606, RFC 6761: `example.com/.net/.org`, `.example`,
 //! `.test`, `.invalid`, `.localhost`) are never looked up unless [`DiscoverOptions::allow_reserved`] is set
@@ -22,7 +37,8 @@ use mailcraft_model::Security;
 use crate::autoconfig::{self, AutoConfig, Protocol, ServerConfig};
 use crate::dns::{Resolver, SrvRecord};
 use crate::error::{NetError, Result};
-use crate::http::{HttpClient, percent_encode};
+use crate::http::{HttpClient, Url, percent_encode};
+use crate::providers::{self, KnownProvider, ProviderId};
 use crate::transport::ConnectOptions;
 
 /// The autoconfig locations tried, in order. `{domain}` is the address's domain, `{address}` the
@@ -31,6 +47,14 @@ pub const AUTOCONFIG_URLS: [&str; 2] = [
     "https://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress={address}",
     "https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml",
 ];
+
+/// Where a Microsoft 365 tenant's public OpenID configuration is read; `{domain}` is the mail domain (only the
+/// domain is sent, never the address).
+pub const TENANT_URL: &str =
+    "https://login.microsoftonline.com/{domain}/v2.0/.well-known/openid-configuration";
+
+/// Largest OpenID configuration document read.
+const MAX_OPENID_DOCUMENT: usize = 64 * 1024;
 
 /// Which DNS server to ask.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,8 +74,10 @@ pub struct DiscoverOptions {
     pub dns_timeout: Duration,
     /// Autoconfig URL templates (see [`AUTOCONFIG_URLS`]); empty = no autoconfig.
     pub autoconfig_urls: Vec<String>,
-    /// HTTP options for the autoconfig requests.
+    /// HTTP options for the autoconfig and tenant requests.
     pub http: ConnectOptions,
+    /// Microsoft 365 tenant lookup URL template (see [`TENANT_URL`]); `None` = no tenant lookup.
+    pub tenant_url: Option<String>,
     /// Look up reserved test domains too (only for tests against local servers).
     pub allow_reserved: bool,
 }
@@ -67,6 +93,7 @@ impl Default for DiscoverOptions {
                 io_timeout: Duration::from_secs(10),
                 ..ConnectOptions::default()
             },
+            tenant_url: Some(TENANT_URL.to_owned()),
             allow_reserved: false,
         }
     }
@@ -75,8 +102,28 @@ impl Default for DiscoverOptions {
 impl DiscoverOptions {
     /// No network lookups at all (discovery always finds nothing).
     pub fn offline() -> DiscoverOptions {
-        DiscoverOptions { resolver: ResolverChoice::Off, autoconfig_urls: Vec::new(), ..Default::default() }
+        DiscoverOptions {
+            resolver: ResolverChoice::Off,
+            autoconfig_urls: Vec::new(),
+            tenant_url: None,
+            ..Default::default()
+        }
     }
+
+    /// True when discovery makes no network request at all with these options.
+    pub fn is_offline(&self) -> bool {
+        self.resolver == ResolverChoice::Off && self.autoconfig_urls.is_empty() && self.tenant_url.is_none()
+    }
+}
+
+/// A well-known provider recognised for the address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderMatch {
+    pub provider: &'static KnownProvider,
+    /// How it was recognised: `domain` (a consumer domain), `mx` (the domain's MX records), `servers` (the
+    /// servers another source found) or `tenant` (the domain has a Microsoft 365 tenant but its MX records
+    /// name another exchanger: a probable match, its servers unverified).
+    pub by: &'static str,
 }
 
 /// What discovery found. Each protocol has at most one server (the preferred one).
@@ -84,7 +131,8 @@ impl DiscoverOptions {
 pub struct Discovery {
     pub address: String,
     pub domain: String,
-    /// Where the settings came from, in order: "autoconfig", "dns".
+    /// Where the settings came from, in order: "provider" (a consumer domain), "autoconfig", "dns" (SRV),
+    /// "mx", "tenant".
     pub sources: Vec<String>,
     pub display_name: String,
     pub imap: Option<ServerConfig>,
@@ -92,6 +140,12 @@ pub struct Discovery {
     pub smtp: Option<ServerConfig>,
     /// JMAP session URL server (`host` is the URL).
     pub jmap: Option<ServerConfig>,
+    /// The well-known provider serving the address, if recognised.
+    pub provider: Option<ProviderMatch>,
+    /// The domain's mail exchangers (MX), most preferred first, when they were looked up.
+    pub mx: Vec<String>,
+    /// The Microsoft 365 tenant id (a GUID) of the domain, when it was looked up and found.
+    pub tenant: Option<String>,
     /// What was tried and why it did not help (for diagnostics).
     pub notes: Vec<String>,
 }
@@ -99,6 +153,36 @@ pub struct Discovery {
 impl Discovery {
     pub fn found_anything(&self) -> bool {
         self.imap.is_some() || self.pop3.is_some() || self.smtp.is_some() || self.jmap.is_some()
+    }
+
+    /// An incoming server and an outgoing one are known.
+    fn complete(&self) -> bool {
+        (self.imap.is_some() || self.pop3.is_some()) && self.smtp.is_some()
+    }
+
+    /// Fills the servers still missing from a known provider's; true when it filled any.
+    fn fill_from(&mut self, p: &KnownProvider) -> bool {
+        // A known provider's servers are not mixed into settings that already name another incoming server.
+        // Only a missing outgoing server is added, and only to the provider's own incoming servers.
+        if self.imap.is_some() || self.pop3.is_some() || self.jmap.is_some() {
+            let own = [&self.imap, &self.pop3].into_iter().flatten().any(|s| {
+                s.host.eq_ignore_ascii_case(p.imap.host) || s.host.eq_ignore_ascii_case(p.pop3.host)
+            });
+            if self.smtp.is_none() && own {
+                self.smtp = Some(p.smtp_for(&self.address));
+                return true;
+            }
+            return false;
+        }
+        self.imap = Some(p.imap_for(&self.address));
+        self.pop3 = Some(p.pop3_for(&self.address));
+        if self.smtp.is_none() {
+            self.smtp = Some(p.smtp_for(&self.address));
+        }
+        if self.display_name.is_empty() {
+            self.display_name = p.name.to_owned();
+        }
+        true
     }
 }
 
@@ -173,7 +257,18 @@ fn first_usable(records: &[SrvRecord]) -> Option<&SrvRecord> {
 
 /// SRV records of the mail services under `domain`. Stops early when the resolver does not answer.
 pub fn lookup_srv(address: &str, domain: &str, resolver: &Resolver, notes: &mut Vec<String>) -> Discovery {
+    srv_records(address, domain, resolver, notes).0
+}
+
+/// [`lookup_srv`], and whether the resolver kept answering.
+fn srv_records(
+    address: &str,
+    domain: &str,
+    resolver: &Resolver,
+    notes: &mut Vec<String>,
+) -> (Discovery, bool) {
     let mut d = Discovery::default();
+    let mut answering = true;
     // (service, protocol, security), preferred first within a protocol.
     let services: [(&str, Protocol, Security); 7] = [
         ("_imaps", Protocol::Imap, Security::Tls),
@@ -199,6 +294,7 @@ pub fn lookup_srv(address: &str, domain: &str, resolver: &Resolver, notes: &mut 
             Ok(r) => r,
             Err(e @ (NetError::Timeout(_) | NetError::Connect(_) | NetError::Io(_))) => {
                 notes.push(format!("{name}: {e}; DNS lookups stopped"));
+                answering = false;
                 break;
             }
             Err(e) => {
@@ -230,11 +326,121 @@ pub fn lookup_srv(address: &str, domain: &str, resolver: &Resolver, notes: &mut 
             verified,
         });
     }
-    d
+    (d, answering)
 }
 
-/// Discovers the servers for `address`: autoconfig first, then DNS SRV for whatever is still missing. Only
-/// an unusable address is an error; failed lookups are recorded in [`Discovery::notes`].
+/// What the MX lookup showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MxOutcome {
+    /// Not looked up, the lookup failed, or the domain has no MX records.
+    NoAnswer,
+    /// A null MX (RFC 7505): the domain accepts no mail.
+    NullMx,
+    /// Mail exchangers of no provider MailCraft knows.
+    Unknown,
+    /// A known provider's mail exchangers.
+    Known,
+}
+
+/// The domain's MX records: the provider they belong to fills the servers still missing.
+fn mx_step(d: &mut Discovery, resolver: &Resolver, notes: &mut Vec<String>) -> MxOutcome {
+    let domain = d.domain.clone();
+    let records = match resolver.lookup_mx(&domain) {
+        Ok(r) => r,
+        Err(e) => {
+            notes.push(format!("MX {domain}: {e}"));
+            return MxOutcome::NoAnswer;
+        }
+    };
+    d.mx = records.iter().filter(|r| !r.is_null()).take(16).map(|r| r.exchange.clone()).collect();
+    if d.mx.is_empty() && records.iter().any(crate::dns::MxRecord::is_null) {
+        notes.push(format!("{domain} accepts no mail (null MX record)"));
+        return MxOutcome::NullMx;
+    }
+    let Some(p) = providers::by_mx_records(&records) else {
+        let Some(first) = d.mx.first() else { return MxOutcome::NoAnswer };
+        notes.push(format!("MX {domain}: {first} is not a provider MailCraft knows"));
+        return MxOutcome::Unknown;
+    };
+    if d.fill_from(p) {
+        d.sources.push("mx".into());
+        d.provider = Some(ProviderMatch { provider: p, by: "mx" });
+        notes.push(format!("the MX records of {domain} point at {}", p.name));
+    } else {
+        notes.push(format!(
+            "the MX records of {domain} point at {}; the servers found first are kept",
+            p.name
+        ));
+    }
+    MxOutcome::Known
+}
+
+/// True for a GUID in its usual 8-4-4-4-12 hex form.
+pub fn is_guid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes()
+            .enumerate()
+            .all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() })
+}
+
+/// Reads the tenant id from an OpenID configuration fetched from `url`: the first path segment of its
+/// `issuer`, which must be a GUID on the same https host.
+pub fn parse_tenant(body: &[u8], url: &str) -> Result<String> {
+    if body.len() > MAX_OPENID_DOCUMENT {
+        return Err(NetError::TooLarge("OpenID configuration".into()));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| NetError::Protocol(format!("OpenID configuration: {e}")))?;
+    let issuer = v
+        .get("issuer")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NetError::Protocol("OpenID configuration without an issuer".into()))?;
+    let iu = Url::parse(issuer)?;
+    let lu = Url::parse(url)?;
+    if !iu.https || !iu.host.eq_ignore_ascii_case(&lu.host) {
+        return Err(NetError::Protocol(format!("unexpected issuer `{issuer}`")));
+    }
+    let tenant = iu.path.trim_start_matches('/').split('/').next().unwrap_or_default();
+    if !is_guid(tenant) {
+        return Err(NetError::Protocol(format!("the issuer `{issuer}` names no tenant id")));
+    }
+    Ok(tenant.to_ascii_lowercase())
+}
+
+/// The Microsoft 365 tenant id of `domain` from its public OpenID configuration ([`DiscoverOptions::tenant_url`];
+/// only the domain is sent). `None` when the domain belongs to no tenant or the lookup fails (noted).
+pub fn fetch_tenant(domain: &str, o: &DiscoverOptions, notes: &mut Vec<String>) -> Option<String> {
+    let template = o.tenant_url.as_deref()?;
+    let url = template.replace("{domain}", domain);
+    if !url.to_ascii_lowercase().starts_with("https://") {
+        notes.push(format!("{url}: skipped (the tenant is only looked up over HTTPS)"));
+        return None;
+    }
+    let mut http = HttpClient::new(o.http.clone());
+    http.max_body = MAX_OPENID_DOCUMENT;
+    match http.get(&url, &[("Accept", "application/json")]) {
+        Ok(r) if r.is_success() => match parse_tenant(&r.body, &url) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                notes.push(format!("{url}: {e}"));
+                None
+            }
+        },
+        Ok(r) => {
+            notes.push(format!("{url}: HTTP {} ({domain} is not a Microsoft 365 domain)", r.status));
+            None
+        }
+        Err(e) => {
+            notes.push(format!("{url}: {e}"));
+            None
+        }
+    }
+}
+
+/// Discovers the servers for `address`: a consumer domain's provider without any lookup; otherwise autoconfig
+/// first, then DNS SRV, then DNS MX for whatever is still missing, and the Microsoft 365 tenant (see the
+/// module documentation). Only an unusable address is an error; failed lookups are recorded in
+/// [`Discovery::notes`].
 pub fn discover(address: &str, o: &DiscoverOptions) -> Result<Discovery> {
     let address = address.trim().to_owned();
     let domain = address_domain(&address)?;
@@ -243,7 +449,15 @@ pub fn discover(address: &str, o: &DiscoverOptions) -> Result<Discovery> {
         d.notes.push(format!("{domain} is reserved for examples and tests; not looked up"));
         return Ok(d);
     }
+    if let Some(p) = providers::by_domain(&domain) {
+        d.fill_from(p);
+        d.sources.push("provider".into());
+        d.provider = Some(ProviderMatch { provider: p, by: "domain" });
+        d.notes.push(format!("{domain} is served by {}; nothing was looked up", p.name));
+        return Ok(d);
+    }
     let mut notes = Vec::new();
+    let mut mx = MxOutcome::NoAnswer;
     if let Some(c) = fetch_autoconfig(&address, &domain, o, &mut notes) {
         d.sources.push("autoconfig".into());
         d.display_name = c.display_name.clone();
@@ -251,18 +465,17 @@ pub fn discover(address: &str, o: &DiscoverOptions) -> Result<Discovery> {
         d.pop3 = c.incoming_of(Protocol::Pop3).cloned();
         d.smtp = c.outgoing.first().cloned();
     }
-    let complete = (d.imap.is_some() || d.pop3.is_some()) && d.smtp.is_some();
     let resolver = match &o.resolver {
         ResolverChoice::System => Resolver::system(),
         ResolverChoice::Fixed(a) => Some(Resolver::new(*a)),
         ResolverChoice::Off => None,
     };
     match resolver {
-        None => notes.push("no DNS resolver configured; SRV records not looked up".into()),
-        Some(_) if complete => {}
+        None => notes.push("no DNS resolver configured; SRV and MX records not looked up".into()),
+        Some(_) if d.complete() => {}
         Some(mut r) => {
             r.timeout = o.dns_timeout;
-            let srv = lookup_srv(&address, &domain, &r, &mut notes);
+            let (srv, answering) = srv_records(&address, &domain, &r, &mut notes);
             let mut used = false;
             for (slot, found) in [
                 (&mut d.imap, srv.imap),
@@ -278,6 +491,36 @@ pub fn discover(address: &str, o: &DiscoverOptions) -> Result<Discovery> {
             if used {
                 d.sources.push("dns".into());
             }
+            if answering && !d.complete() {
+                mx = mx_step(&mut d, &r, &mut notes);
+            }
+        }
+    }
+    if d.provider.is_none()
+        && let Some(p) =
+            [&d.imap, &d.pop3, &d.smtp].into_iter().flatten().find_map(|s| providers::by_host(&s.host))
+    {
+        d.provider = Some(ProviderMatch { provider: p, by: "servers" });
+    }
+    let microsoft = d.provider.is_some_and(|m| m.provider.id == ProviderId::Microsoft365);
+    // Only the domain of a known Microsoft 365 organization, or one whose mail goes to an exchanger nobody
+    // recognised (possibly a filtering service in front of Microsoft 365), is sent to Microsoft.
+    let fallback = d.provider.is_none() && !d.found_anything() && mx == MxOutcome::Unknown;
+    if (microsoft || fallback)
+        && let Some(t) = fetch_tenant(&domain, o, &mut notes)
+    {
+        d.tenant = Some(t);
+        if fallback && d.fill_from(&providers::MICROSOFT_365) {
+            // Every domain verified in a Microsoft Entra tenant has one, wherever its mail is: a probable
+            // match only, to be confirmed.
+            for s in [&mut d.imap, &mut d.pop3, &mut d.smtp].into_iter().flatten() {
+                s.verified = false;
+            }
+            d.sources.push("tenant".into());
+            d.provider = Some(ProviderMatch { provider: &providers::MICROSOFT_365, by: "tenant" });
+            notes.push(format!(
+                "{domain} has a Microsoft 365 tenant; its mail may be elsewhere (confirm these servers)"
+            ));
         }
     }
     d.notes = notes;
@@ -320,6 +563,55 @@ mod tests {
         let d = discover("kim@example.com", &o).unwrap();
         assert!(!d.found_anything() && d.sources.is_empty());
         assert!(discover("not an address", &o).is_err());
+    }
+
+    #[test]
+    fn consumer_domains_are_known_without_lookups() {
+        let d = discover("kim@Outlook.com", &DiscoverOptions::offline()).unwrap();
+        assert_eq!(d.sources, ["provider"]);
+        let m = d.provider.unwrap();
+        assert_eq!((m.provider.key, m.by), ("outlook.com", "domain"));
+        assert_eq!(d.imap.as_ref().unwrap().host, "outlook.office365.com");
+        assert_eq!(d.smtp.as_ref().unwrap().host, "smtp-mail.outlook.com");
+        assert_eq!(d.pop3.as_ref().unwrap().port, 995);
+        assert!(d.imap.unwrap().oauth_only());
+        let d = discover("kim@gmail.com", &DiscoverOptions::offline()).unwrap();
+        assert_eq!(d.provider.unwrap().provider.key, "google");
+        assert_eq!(d.display_name, "Google");
+        assert!(DiscoverOptions::offline().is_offline() && !DiscoverOptions::default().is_offline());
+    }
+
+    #[test]
+    fn tenant_ids_come_from_the_issuer_on_the_same_host() {
+        let url = "https://login.example.net/example.com/v2.0/.well-known/openid-configuration";
+        let doc = |issuer: &str| format!(r#"{{"issuer": "{issuer}", "token_endpoint": "x"}}"#);
+        let guid = "0F0E0D0C-1111-2222-3333-444455556666";
+        let t = parse_tenant(doc(&format!("https://login.example.net/{guid}/v2.0")).as_bytes(), url).unwrap();
+        assert_eq!(t, guid.to_ascii_lowercase());
+        for bad in [
+            format!("https://elsewhere.example.org/{guid}/v2.0"),
+            format!("http://login.example.net/{guid}/v2.0"),
+            "https://login.example.net/{tenantid}/v2.0".to_owned(),
+            "https://login.example.net/".to_owned(),
+            "not a url".to_owned(),
+        ] {
+            assert!(parse_tenant(doc(&bad).as_bytes(), url).is_err(), "{bad}");
+        }
+        assert!(parse_tenant(b"{}", url).is_err());
+        assert!(parse_tenant(b"\xff junk", url).is_err());
+        assert!(parse_tenant(&vec![b' '; MAX_OPENID_DOCUMENT + 1], url).is_err());
+        assert!(is_guid("00000000-0000-0000-0000-000000000000"));
+        assert!(
+            !is_guid("00000000-0000-0000-0000-00000000000g")
+                && !is_guid("0000000000000000000000000000000000-0")
+        );
+        let mut notes = Vec::new();
+        let o = DiscoverOptions {
+            tenant_url: Some("http://127.0.0.1:9/{domain}".into()),
+            ..DiscoverOptions::offline()
+        };
+        assert!(fetch_tenant("example.com", &o, &mut notes).is_none());
+        assert!(notes[0].contains("only looked up over HTTPS"));
     }
 
     #[test]

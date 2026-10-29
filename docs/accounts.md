@@ -9,6 +9,8 @@ and JMAP for both. Exchange (EWS) is not supported. Accounts are added with **Fi
 **Connect** in the Add Account wizard first looks the address up (`accounts.discover`), and only guesses
 `imap.<domain>` / `smtp.<domain>` when that finds nothing:
 
+0. **Big consumer domains** (`gmail.com`, `googlemail.com`, `outlook.com`, `hotmail.com`, `live.com`,
+   `msn.com` and their country variants): the provider's published settings, without any lookup.
 1. **Autoconfig.** The provider's `clientConfig` document over HTTPS:
    `https://autoconfig.<domain>/mail/config-v1.1.xml?emailaddress=<address>`, then
    `https://<domain>/.well-known/autoconfig/mail/config-v1.1.xml`. It gives the IMAP, POP3 and SMTP servers,
@@ -16,7 +18,31 @@ and JMAP for both. Exchange (EWS) is not supported. Accounts are added with **Fi
 2. **DNS SRV records** (RFC 6186, with the implicit-TLS records of RFC 8314): `_imaps._tcp`, `_imap._tcp`,
    `_pop3s._tcp`, `_pop3._tcp`, `_submissions._tcp`, `_submission._tcp` and `_jmap._tcp` (RFC 8620) under the
    domain, asked of the first name server in `/etc/resolv.conf`. Where there is no resolv.conf (Windows),
-   no SRV lookup is made. A target of `.` means the service is not offered.
+   no SRV or MX lookup is made. A target of `.` means the service is not offered.
+3. **DNS MX records** of the domain (only the domain is asked about; the address is not sent anywhere):
+   mail exchangers under `mail.protection.outlook.com` or `mx.microsoft` are **Microsoft 365**
+   (`outlook.office365.com` IMAP 993 / POP 995 with TLS, `smtp.office365.com` 587 with STARTTLS), under
+   `olc.protection.outlook.com` **Outlook.com**, and under `google.com` / `googlemail.com` (`aspmx.l.google.com`,
+   `smtp.google.com`) **Google Workspace** (`imap.gmail.com` 993, `pop.gmail.com` 995, `smtp.gmail.com` 465).
+   The most preferred exchangers decide.
+4. **Microsoft 365 tenant.** The tenant's public OpenID configuration,
+   `https://login.microsoftonline.com/<domain>/v2.0/.well-known/openid-configuration` (the domain only, never
+   the address). **This sends the domain to Microsoft**, and only in two cases: when Microsoft 365 was
+   already recognised (its MX records or servers are Microsoft's; the lookup reads the tenant id), and when
+   nothing else found anything and the domain's MX records name a mail exchanger MailCraft does not know (an
+   organization whose mail passes through a filtering service first). The domain is not sent when the MX
+   lookup gave no answer (no resolver, as on Windows; no MX records) or found a null MX, nor for consumer
+   domains or domains whose autoconfig, SRV or MX records found their servers. Every domain verified in a
+   Microsoft Entra tenant has a tenant, wherever its mail is (an on-premises Exchange server, another host),
+   so in the second case Microsoft 365 is only a probable match: its servers are marked unverified and the
+   settings page asks you to confirm them with your administrator.
+
+A well-known provider's settings page says how it was recognised and what may need switching on: Microsoft
+365 refuses passwords for IMAP, POP and SMTP (sign in with OAuth), the organization may have to turn on IMAP
+(or POP) and **Authenticated SMTP** for the mailbox, and an administrator may have to consent to the app's
+permissions. The OAuth section opens with the right provider chosen; for Microsoft 365 the sign-in goes to the
+organization's tenant, which single-tenant app registrations need. (A Microsoft Graph account kind, when there
+is one, is the alternative for Microsoft 365 and Outlook.com addresses: the lookup reports `provider.graph`.)
 
 The lookup runs in the background while the wizard says so (**Skip** stops waiting). The settings page then
 says where the settings came from; servers found in DNS outside the address's domain are pointed out and

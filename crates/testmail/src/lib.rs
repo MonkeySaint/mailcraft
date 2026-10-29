@@ -28,8 +28,9 @@
 //!
 //! - an OAuth 2.0 authorization server (device grant, authorization code with PKCE, refresh tokens) whose
 //!   access tokens sign in to IMAP and SMTP (XOAUTH2, OAUTHBEARER) and JMAP (Bearer), plus autoconfig
-//!   documents, both on a small web server (HTTP and HTTPS); and a fake DNS responder (UDP) answering SRV
-//!   questions from records the test sets. Nothing is ever forwarded to a real server.
+//!   documents and tenant OpenID configurations, all on a small web server (HTTP and HTTPS); and a fake DNS
+//!   responder (UDP) answering SRV and MX questions from records the test sets. Nothing is ever forwarded to
+//!   a real server.
 //!
 //! Each protocol listens on a plain port (with STARTTLS) and an implicit-TLS port. TLS uses a self-signed
 //! certificate for `localhost`/`127.0.0.1` generated at start; [`TestServers::cert_pem`] /
@@ -57,7 +58,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use date::DateTime;
-pub use dns::Srv;
+pub use dns::{Mx, Srv};
 /// The rustls version the servers use, for building test clients.
 pub use rustls;
 pub use store::{SpecialUse, StoredMessage, Submission};
@@ -317,14 +318,41 @@ impl TestServers {
 
     /// Sets the SRV records the fake DNS responder answers for `name` (e.g. `_imaps._tcp.example.com`).
     pub fn set_srv(&self, name: &str, records: Vec<Srv>) {
-        let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
-        self.inner.ctx.dns.lock().unwrap_or_else(|e| e.into_inner()).insert(key, Some(records));
+        self.dns_entry(name, |e| e.srv = records);
+    }
+
+    /// Sets the MX records the fake DNS responder answers for the domain `name` (an exchange of "" is the
+    /// RFC 7505 null MX).
+    pub fn set_mx(&self, name: &str, records: Vec<Mx>) {
+        self.dns_entry(name, |e| e.mx = records);
     }
 
     /// Makes the fake DNS responder answer `name` with a truncated (TC) empty message.
     pub fn set_srv_truncated(&self, name: &str) {
+        self.dns_entry(name, |e| e.truncated = true);
+    }
+
+    fn dns_entry(&self, name: &str, f: impl FnOnce(&mut dns::Entry)) {
         let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
-        self.inner.ctx.dns.lock().unwrap_or_else(|e| e.into_inner()).insert(key, None);
+        f(self.inner.ctx.dns.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default());
+    }
+
+    /// The tenant lookup URL template (`{domain}` placeholder) pointing at this server, standing in for
+    /// `https://login.microsoftonline.com/{domain}/v2.0/.well-known/openid-configuration`.
+    pub fn tenant_url_template(&self) -> String {
+        format!("{}/tenant/{{domain}}/v2.0/.well-known/openid-configuration", self.web_url())
+    }
+
+    /// Makes `domain` a Microsoft 365-style tenant's with the tenant id `tenant` (a GUID): its OpenID
+    /// configuration is served at [`Self::tenant_url_template`]. `None` removes it (the server then answers
+    /// 400 with an `invalid_tenant` error, as the real one does for unknown domains).
+    pub fn set_tenant(&self, domain: &str, tenant: Option<&str>) {
+        let mut w = self.inner.ctx.web.lock().unwrap_or_else(|e| e.into_inner());
+        let key = domain.trim().to_ascii_lowercase();
+        match tenant {
+            Some(t) => w.tenants.insert(key, t.to_owned()),
+            None => w.tenants.remove(&key),
+        };
     }
 
     /// OAuth endpoints of the test authorization server: (authorization, token, device authorization).

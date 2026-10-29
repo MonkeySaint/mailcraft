@@ -1908,19 +1908,33 @@ fn discovery_json(d: &mailcraft_net::discover::Discovery) -> Value {
         "pop3": server(&d.pop3),
         "smtp": server(&d.smtp),
         "jmap": d.jmap.as_ref().map(|j| json!({"url": j.host, "verified": j.verified})),
+        // A well-known provider (Microsoft 365, Outlook.com, Google): its OAuth provider, hints for the
+        // settings page, and whether a Microsoft Graph account kind could serve it (graph-mail, issue #4).
+        "provider": d.provider.map(|m| json!({
+            "id": m.provider.key,
+            "name": m.provider.name,
+            "detectedBy": m.by,
+            "oauthProvider": m.provider.oauth_provider,
+            "oauthOnly": m.provider.oauth_only,
+            "graph": m.provider.graph,
+            "notes": m.provider.notes,
+        })),
+        "mx": d.mx,
+        "tenant": d.tenant,
         "notes": d.notes,
     })
 }
 
-/// Finds the server settings of `address` (autoconfig on the mail domain, then DNS SRV records; see
-/// `mailcraft_net::discover`). The lookup runs on its own thread: the first call starts it and reports
-/// `"status": "running"`, later calls with the same address report the result (`wait` blocks for it, at most
-/// a minute). Results are remembered for the session; `refresh` looks up again. Lookups that need no network
-/// (reserved example domains) finish at once.
+/// Finds the server settings of `address` (a consumer domain's well-known provider; otherwise autoconfig on
+/// the mail domain, then DNS SRV and MX records and the Microsoft 365 tenant; see `mailcraft_net::discover`).
+/// The lookup runs on its own thread: the first call starts it and reports `"status": "running"`, later calls
+/// with the same address report the result (`wait` blocks for it, at most a minute). Results are remembered
+/// for the session; `refresh` looks up again. Lookups that need no network (reserved example domains, the big
+/// consumer domains) finish at once.
 pub(crate) fn discover(s: &mut Session, address: &str, wait: bool, refresh: bool) -> Result<Value, CmdError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use mailcraft_net::discover::{self as nd, ResolverChoice};
+        use mailcraft_net::discover as nd;
         let key = address.trim().to_ascii_lowercase();
         let domain = nd::address_domain(&key).map_err(|e| CmdError::Params(e.to_string()))?;
         if refresh {
@@ -1929,7 +1943,8 @@ pub(crate) fn discover(s: &mut Session, address: &str, wait: bool, refresh: bool
         if !s.sync.discoveries.contains_key(&key) {
             let opts = s.sync.discovery.clone();
             let offline = (nd::is_reserved_domain(&domain) && !opts.allow_reserved)
-                || (opts.resolver == ResolverChoice::Off && opts.autoconfig_urls.is_empty());
+                || mailcraft_net::providers::by_domain(&domain).is_some()
+                || opts.is_offline();
             let slot = if offline {
                 let d = nd::discover(address, &opts).map_err(|e| CmdError::Params(e.to_string()))?;
                 Discovering::Done(discovery_json(&d))
@@ -2428,6 +2443,22 @@ mod tests {
         }
         assert_eq!(s.sync.discoveries.len(), MAX_DISCOVERIES);
         assert!(matches!(discover(&mut s, "no-domain", false, false), Err(CmdError::Params(_))));
+        // The big consumer domains are known without any lookup, even with the default (network) options.
+        s.sync.discovery = mailcraft_net::discover::DiscoverOptions::default();
+        let v = discover(&mut s, "kim@outlook.com", false, true).unwrap();
+        assert_eq!((v["status"].as_str(), v["found"].as_bool()), (Some("done"), Some(true)), "{v}");
+        assert_eq!(v["provider"]["id"], "outlook.com");
+        assert_eq!(v["provider"]["oauthProvider"], "microsoft");
+        assert_eq!(v["provider"]["graph"], true);
+        assert_eq!(v["imap"]["oauthOnly"], true);
+        assert_eq!(v["smtp"]["host"], "smtp-mail.outlook.com");
+        let v = discover(&mut s, "kim@gmail.com", false, true).unwrap();
+        assert_eq!(
+            (v["provider"]["id"].as_str(), v["provider"]["detectedBy"].as_str()),
+            (Some("google"), Some("domain"))
+        );
+        assert_eq!(v["imap"]["oauth"], true);
+        assert_eq!(v["imap"]["oauthOnly"], false);
     }
 
     #[test]

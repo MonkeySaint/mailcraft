@@ -1,5 +1,6 @@
 //! Account setup against the in-process servers from `mailcraft-testmail` (127.0.0.1 only): discovery from
-//! autoconfig documents and DNS SRV records (fake responder), OAuth 2.0 device sign-in with XOAUTH2 /
+//! autoconfig documents, DNS SRV and MX records (fake responder) and tenant OpenID configurations (standing in
+//! for Microsoft's), OAuth 2.0 device sign-in with XOAUTH2 /
 //! OAUTHBEARER logins to IMAP and SMTP and token refresh, JMAP push, and the IMAP first-download window.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
@@ -12,10 +13,11 @@ use mailcraft_net::http::HttpClient;
 use mailcraft_net::imap::ImapClient;
 use mailcraft_net::jmap::{JmapAuth, JmapClient, StateChange};
 use mailcraft_net::oauth::{self, OAuthProvider};
+use mailcraft_net::providers::ProviderId;
 use mailcraft_net::smtp::{SmtpClient, SmtpSettings};
 use mailcraft_net::sync::{FolderState, ImapAccount, ImapSettings, months_before};
 use mailcraft_net::{ConnectOptions, Credentials, NetError, Security};
-use mailcraft_testmail::{Config, DateTime, OAUTH_TEST_CLIENT, Srv, TestServers};
+use mailcraft_testmail::{Config, DateTime, Mx, OAUTH_TEST_CLIENT, Srv, TestServers};
 
 const USER: &str = "alice@example.com";
 const PASS: &str = "alice-pw";
@@ -35,8 +37,161 @@ fn discover_opts(s: &TestServers) -> DiscoverOptions {
         dns_timeout: Duration::from_secs(2),
         autoconfig_urls: s.autoconfig_url_templates(),
         http: opts(s),
+        tenant_url: Some(s.tenant_url_template()),
         allow_reserved: true,
     }
+}
+
+const TENANT: &str = "6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f";
+
+fn mx(preference: u16, exchange: &str) -> Mx {
+    Mx { preference, exchange: exchange.into() }
+}
+
+fn tenant_requests(s: &TestServers) -> Vec<String> {
+    s.web_requests().into_iter().filter(|r| r.contains("/tenant/")).collect()
+}
+
+#[test]
+fn discovery_recognises_microsoft_365_google_and_consumer_domains() {
+    let s = servers(Config::default());
+
+    // 1. MX at Microsoft 365 (the owner's case: no autoconfig, no SRV; imap.<domain> does not exist).
+    s.set_mx("m365.example.net", vec![mx(0, "m365-example-net.mail.protection.outlook.com")]);
+    s.set_tenant("m365.example.net", Some(TENANT));
+    let d = discover("kim@m365.example.net", &discover_opts(&s)).unwrap();
+    assert_eq!(d.sources, ["mx"], "{:?}", d.notes);
+    let m = d.provider.unwrap();
+    assert_eq!((m.provider.id, m.by), (ProviderId::Microsoft365, "mx"));
+    assert_eq!(d.mx, ["m365-example-net.mail.protection.outlook.com"]);
+    assert_eq!(d.tenant.as_deref(), Some(TENANT));
+    let imap = d.imap.unwrap();
+    assert_eq!((imap.host.as_str(), imap.port, imap.security), ("outlook.office365.com", 993, Security::Tls));
+    assert_eq!(imap.username, "kim@m365.example.net");
+    assert!(imap.verified && imap.oauth_only());
+    let pop = d.pop3.unwrap();
+    assert_eq!((pop.host.as_str(), pop.port, pop.security), ("outlook.office365.com", 995, Security::Tls));
+    let smtp = d.smtp.unwrap();
+    assert_eq!(
+        (smtp.host.as_str(), smtp.port, smtp.security),
+        ("smtp.office365.com", 587, Security::StartTls)
+    );
+    // The tenant is asked about by domain only: the address never leaves for it.
+    let t = tenant_requests(&s);
+    assert_eq!(t, ["GET /tenant/m365.example.net/v2.0/.well-known/openid-configuration"]);
+
+    // 2. Google Workspace (the most preferred MX decides); no tenant lookup for it.
+    s.set_mx("workspace.example.org", vec![mx(10, "alt1.aspmx.l.google.com"), mx(1, "aspmx.l.google.com")]);
+    let d = discover("lee@workspace.example.org", &discover_opts(&s)).unwrap();
+    assert_eq!(d.sources, ["mx"]);
+    assert_eq!(d.provider.unwrap().provider.id, ProviderId::Google);
+    assert_eq!(d.mx, ["aspmx.l.google.com", "alt1.aspmx.l.google.com"]);
+    assert_eq!(d.imap.unwrap().host, "imap.gmail.com");
+    let smtp = d.smtp.unwrap();
+    assert_eq!((smtp.host.as_str(), smtp.port, smtp.security), ("smtp.gmail.com", 465, Security::Tls));
+    assert!(smtp.offers_oauth() && !smtp.oauth_only());
+    assert!(d.tenant.is_none());
+    assert_eq!(tenant_requests(&s).len(), 1);
+
+    // 3. An unknown MX (a filtering service in front of Microsoft 365, or mail hosted elsewhere by an
+    //    organization that also has a tenant): Microsoft 365 is only a probable match, its servers unverified.
+    s.set_mx("filtered.example.com", vec![mx(5, "inbound.filter.example.net")]);
+    s.set_tenant("filtered.example.com", Some(TENANT));
+    let d = discover("kim@filtered.example.com", &discover_opts(&s)).unwrap();
+    assert_eq!(d.sources, ["tenant"], "{:?}", d.notes);
+    assert_eq!(d.provider.unwrap().by, "tenant");
+    assert_eq!(d.tenant.as_deref(), Some(TENANT));
+    let (imap, smtp) = (d.imap.unwrap(), d.smtp.unwrap());
+    assert_eq!((imap.host.as_str(), smtp.host.as_str()), ("outlook.office365.com", "smtp.office365.com"));
+    assert!(!imap.verified && !smtp.verified && !d.pop3.unwrap().verified, "to be confirmed");
+    assert!(
+        d.notes.iter().any(|n| n.contains("inbound.filter.example.net is not a provider")),
+        "{:?}",
+        d.notes
+    );
+    assert!(d.notes.iter().any(|n| n.contains("its mail may be elsewhere")), "{:?}", d.notes);
+
+    // 4. Unknown MX and no tenant: nothing found (the wizard guesses), the reasons noted.
+    s.set_mx("plain.example.com", vec![mx(10, "mx.plain.example.com")]);
+    let d = discover("kim@plain.example.com", &discover_opts(&s)).unwrap();
+    assert!(!d.found_anything() && d.provider.is_none());
+    assert!(d.notes.iter().any(|n| n.contains("not a Microsoft 365 domain")), "{:?}", d.notes);
+
+    // 5. SRV records come first: the MX is not needed then.
+    s.set_srv(
+        "_imaps._tcp.both.example.org",
+        vec![Srv { priority: 0, weight: 0, port: 993, target: "imap.both.example.org".into() }],
+    );
+    s.set_srv(
+        "_submissions._tcp.both.example.org",
+        vec![Srv { priority: 0, weight: 0, port: 465, target: "smtp.both.example.org".into() }],
+    );
+    s.set_mx("both.example.org", vec![mx(0, "aspmx.l.google.com")]);
+    let d = discover("kim@both.example.org", &discover_opts(&s)).unwrap();
+    assert_eq!(d.sources, ["dns"]);
+    assert!(d.provider.is_none() && d.mx.is_empty());
+    assert_eq!(d.imap.unwrap().host, "imap.both.example.org");
+
+    // 6. SRV for submission only, MX at Google: Google's incoming servers, the domain's own SMTP kept.
+    s.set_srv(
+        "_submission._tcp.half.example.org",
+        vec![Srv { priority: 0, weight: 0, port: 587, target: "relay.half.example.org".into() }],
+    );
+    s.set_mx("half.example.org", vec![mx(0, "smtp.google.com")]);
+    let d = discover("kim@half.example.org", &discover_opts(&s)).unwrap();
+    assert_eq!(d.sources, ["dns", "mx"]);
+    assert_eq!(d.imap.unwrap().host, "imap.gmail.com");
+    assert_eq!(d.smtp.unwrap().host, "relay.half.example.org");
+
+    // 7. A null MX: the domain takes no mail, even with a tenant (not asked about at all).
+    s.set_mx("nomail.example.net", vec![mx(0, "")]);
+    s.set_tenant("nomail.example.net", Some(TENANT));
+    let before = tenant_requests(&s).len();
+    let d = discover("kim@nomail.example.net", &discover_opts(&s)).unwrap();
+    assert!(d.notes.iter().any(|n| n.contains("accepts no mail")), "{:?}", d.notes);
+    assert!(!d.found_anything() && d.provider.is_none() && d.tenant.is_none());
+    assert_eq!(tenant_requests(&s).len(), before);
+
+    // 7b. No MX answer (no resolver, as on Windows): the domain is not sent to Microsoft either.
+    s.set_tenant("nodns.example.org", Some(TENANT));
+    let o = DiscoverOptions { resolver: ResolverChoice::Off, ..discover_opts(&s) };
+    let d = discover("kim@nodns.example.org", &o).unwrap();
+    assert!(!d.found_anything() && d.provider.is_none() && d.tenant.is_none());
+    assert_eq!(tenant_requests(&s).len(), before);
+
+    // 8. Consumer domains: their settings at once, no request of any kind.
+    let before = s.web_requests().len();
+    for (address, id, smtp_host) in [
+        ("kim@outlook.com", ProviderId::OutlookCom, "smtp-mail.outlook.com"),
+        ("kim@hotmail.co.uk", ProviderId::OutlookCom, "smtp-mail.outlook.com"),
+        ("kim@gmail.com", ProviderId::Google, "smtp.gmail.com"),
+    ] {
+        let d = discover(address, &discover_opts(&s)).unwrap();
+        assert_eq!(d.sources, ["provider"]);
+        assert_eq!((d.provider.unwrap().provider.id, d.provider.unwrap().by), (id, "domain"));
+        assert_eq!(d.smtp.unwrap().host, smtp_host);
+        assert!(d.mx.is_empty());
+    }
+    assert_eq!(s.web_requests().len(), before);
+
+    // 9. An autoconfig document naming Microsoft's servers: recognised from the hosts (and the tenant read).
+    s.set_autoconfig(
+        "ac.example.com",
+        Some(
+            "<clientConfig version='1.1'><emailProvider id='ac.example.com'>\
+             <incomingServer type='imap'><hostname>outlook.office365.com</hostname><port>993</port>\
+             <socketType>SSL</socketType><username>%EMAILADDRESS%</username>\
+             <authentication>OAuth2</authentication></incomingServer>\
+             <outgoingServer type='smtp'><hostname>smtp.office365.com</hostname><port>587</port>\
+             <socketType>STARTTLS</socketType><username>%EMAILADDRESS%</username></outgoingServer>\
+             </emailProvider></clientConfig>",
+        ),
+    );
+    s.set_tenant("ac.example.com", Some(TENANT));
+    let d = discover("kim@ac.example.com", &discover_opts(&s)).unwrap();
+    assert_eq!(d.sources, ["autoconfig"]);
+    assert_eq!(d.provider.unwrap().by, "servers");
+    assert_eq!(d.tenant.as_deref(), Some(TENANT));
 }
 
 const AUTOCONFIG: &str = r#"<?xml version="1.0"?>

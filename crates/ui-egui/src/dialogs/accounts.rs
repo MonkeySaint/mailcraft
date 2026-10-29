@@ -6,17 +6,18 @@
 //! straight into the command params (the engine keeps them in its secret store) and are dropped with the
 //! dialog state; nothing here prints or stores them.
 //!
-//! Connect first looks the address up with `accounts.discover` (the provider's autoconfig document over
-//! HTTPS, then DNS SRV records, RFC 6186; it runs in the background while the page says so, and Skip stops
-//! waiting). Only when that finds nothing does the wizard guess `imap.<domain>` (or `pop.<domain>`) /
-//! `smtp.<domain>` with the standard ports. Either way the settings page is shown so they can be checked;
-//! servers found outside the address's domain are pointed out. Its More Settings section holds the
-//! per-account options (POP3 server copies, download mode, how far back the first download goes, headers only
-//! on slow connections, Send/Receive group membership and interval, push), and Sign in with OAuth 2.0 runs
-//! `accounts.oauthSignIn` with a client id the user registered (MailCraft ships none; see
-//! `crates/net/data/README.md`). **Test Account Settings**
-//! needs an account to test: in the Add wizard the first test adds the account, later tests update it, and
-//! Cancel removes it again.
+//! Connect first looks the address up with `accounts.discover` (the big consumer domains without a lookup;
+//! otherwise the provider's autoconfig document over HTTPS, DNS SRV records (RFC 6186), DNS MX records of
+//! Microsoft 365 and Google, and the Microsoft 365 tenant by domain; it runs in the background while the page
+//! says so, and Skip stops waiting). Only when that finds nothing does the wizard guess `imap.<domain>` (or
+//! `pop.<domain>`) / `smtp.<domain>` with the standard ports. Either way the settings page is shown so they
+//! can be checked; servers found outside the address's domain are pointed out, and a well-known provider's
+//! hints are shown (its OAuth sign-in is opened with that provider, and the tenant, chosen). Its More
+//! Settings section holds the per-account options (POP3 server copies, download mode, how far back the first
+//! download goes, headers only on slow connections, Send/Receive group membership and interval, push), and
+//! Sign in with OAuth 2.0 runs `accounts.oauthSignIn` with a client id the user registered (MailCraft ships
+//! none; see `crates/net/data/README.md`). **Test Account Settings** needs an account to test: in the Add
+//! wizard the first test adds the account, later tests update it, and Cancel removes it again.
 
 use egui::{Context, RichText, Ui};
 use serde_json::{Value, json};
@@ -607,7 +608,8 @@ struct Extra {
     keep_offline: bool,
     offline_window: usize,
     oauth_open: bool,
-    providers: Vec<(String, String, bool)>,
+    /// OAuth providers: (id, name, offers the device flow, mail domains it serves).
+    providers: Vec<(String, String, bool, Vec<String>)>,
     provider: usize,
     client_id: String,
     client_secret: String,
@@ -773,6 +775,18 @@ struct Wizard {
     found_in: String,
     /// Servers found outside the address's domain (to be confirmed).
     unverified: Vec<String>,
+    /// The well-known provider's hints for the settings page (what may need switching on).
+    provider_notes: Vec<String>,
+    /// The OAuth provider id the well-known provider signs in with.
+    oauth_hint: Option<String>,
+    /// The Microsoft 365 tenant id found for the domain.
+    tenant: Option<String>,
+    /// The lookup only made the provider probable (a Microsoft 365 tenant, the mail exchanger unknown): the
+    /// settings page asks for confirmation.
+    probable: bool,
+    /// A new lookup result: the OAuth section is opened (and its provider chosen) once for it, not again
+    /// each time the account type changes, so a user's own choice there stays.
+    oauth_preselect: bool,
     error: String,
 }
 
@@ -809,6 +823,10 @@ impl Wizard {
         self.guessed = true;
         self.found_in.clear();
         self.unverified.clear();
+        self.provider_notes.clear();
+        self.oauth_hint = None;
+        self.tenant = None;
+        self.probable = false;
         if let Some(d) = self.discovered.clone() {
             self.apply_discovered(&d);
         }
@@ -816,6 +834,7 @@ impl Wizard {
 
     /// Fills in what `accounts.discover` found for the chosen account type (over the guesses).
     fn apply_discovered(&mut self, d: &Value) {
+        let provider = d.get("provider").filter(|v| v.is_object());
         let incoming = if self.jmap {
             "jmap"
         } else if self.pop3 {
@@ -823,7 +842,24 @@ impl Wizard {
         } else {
             "imap"
         };
+        // The lookup found nothing for this account type: the guess stands, without the provider's hints.
         let Some(inc) = d.get(incoming).filter(|v| v.is_object()) else { return };
+        let preselect = std::mem::take(&mut self.oauth_preselect);
+        if let Some(p) = provider {
+            self.provider_notes = p
+                .get("notes")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                .unwrap_or_default();
+            self.oauth_hint = p.get("oauthProvider").and_then(Value::as_str).map(str::to_owned);
+            self.tenant = d.get("tenant").and_then(Value::as_str).map(str::to_owned);
+            // The well-known providers sign in with OAuth (Microsoft only so): the section opens with the
+            // provider chosen, once per lookup. Google app-password users close it again, and it stays closed.
+            if preselect {
+                self.extra.oauth_open = true;
+                self.pick_oauth_provider();
+            }
+        }
         let address = self.address.trim().to_owned();
         let user = |v: &Value| {
             v.get("username").and_then(Value::as_str).filter(|u| !u.is_empty()).unwrap_or(&address).to_owned()
@@ -863,9 +899,15 @@ impl Wizard {
                 }
                 note(out, host);
             }
-            if inc.get("oauthOnly").and_then(Value::as_bool) == Some(true) {
+            if preselect && inc.get("oauthOnly").and_then(Value::as_bool) == Some(true) {
                 self.extra.oauth_open = true;
             }
+        }
+        let by = provider.and_then(|p| p.get("detectedBy")).and_then(Value::as_str).unwrap_or_default();
+        // Known only from the tenant: one confirmation for the whole page, not one per server.
+        self.probable = by == "tenant";
+        if self.probable {
+            unverified.clear();
         }
         self.unverified = unverified;
         self.guessed = false;
@@ -874,14 +916,39 @@ impl Wizard {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        self.found_in = if sources.first() == Some(&"autoconfig") {
-            "These settings come from your email provider's configuration.".into()
-        } else {
-            "These settings come from your domain's DNS records.".into()
+        let name = provider.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or_default();
+        self.found_in = match by {
+            "domain" => format!("These are {name}'s settings for {} addresses.", self.domain()),
+            "mx" => format!("Your domain's mail (MX) records point at {name}; these are its settings."),
+            "tenant" => format!(
+                "{} has a {name} organization, so its mail is probably at {name}, but it may be elsewhere: \
+                 please confirm these settings with your administrator.",
+                self.domain()
+            ),
+            _ if sources.first() == Some(&"autoconfig") => {
+                "These settings come from your email provider's configuration.".into()
+            }
+            _ => "These settings come from your domain's DNS records.".into(),
         };
     }
 
-    /// The account type to start with when the lookup found something: IMAP, else POP, else JMAP.
+    /// Chooses the OAuth provider for the address: the well-known provider's, else the one serving its
+    /// domain (once the provider list is loaded).
+    fn pick_oauth_provider(&mut self) {
+        let domain = self.domain();
+        let hint = self.oauth_hint.clone();
+        let found = self.extra.providers.iter().position(|(id, _, _, domains)| match &hint {
+            Some(h) => id == h,
+            None => domains.iter().any(|d| d.eq_ignore_ascii_case(&domain)),
+        });
+        if let Some(i) = found {
+            self.extra.provider = i;
+        }
+    }
+
+    /// The account type to start with when the lookup found something: IMAP, else POP, else JMAP. (When a
+    /// Microsoft Graph account kind exists (graph-mail, issue #4), it is the one to offer where the lookup's
+    /// `provider.graph` is true: Microsoft 365 and Outlook.com.)
     fn kind_from_discovery(&mut self) {
         let has = |k: &str| self.discovered.as_ref().is_some_and(|d| d.get(k).is_some_and(Value::is_object));
         self.jmap = false;
@@ -899,6 +966,7 @@ impl Wizard {
     fn take_discovery(&mut self, v: Value) {
         self.discovering = false;
         self.discovered = v.get("found").and_then(Value::as_bool).unwrap_or(false).then_some(v);
+        self.oauth_preselect = self.discovered.is_some();
     }
 
     /// Standard incoming port: IMAP 993/143, POP3 995/110.
@@ -1279,7 +1347,9 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
         }
     });
     if st.change.is_none() {
-        if !st.found_in.is_empty() {
+        if st.probable {
+            ui.colored_label(app.theme.danger, &st.found_in);
+        } else if !st.found_in.is_empty() {
             muted(ui, app, &format!("{} Check them before you connect.", st.found_in));
         } else if st.guessed {
             muted(
@@ -1287,6 +1357,9 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
                 app,
                 "These settings were guessed from your address. Check them with your email provider.",
             );
+        }
+        for note in &st.provider_notes {
+            muted(ui, app, note);
         }
         for host in &st.unverified {
             ui.colored_label(
@@ -1569,30 +1642,29 @@ fn oauth_section(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Optio
         .show(ui, |ui| {
             if st.extra.providers.is_empty() {
                 let list = try_run(app, "accounts.oauthProviders", json!({})).unwrap_or_default();
-                let mut v: Vec<(String, String, bool)> = list
+                let mut v: Vec<(String, String, bool, Vec<String>)> = list
                     .get("providers")
                     .and_then(Value::as_array)
                     .map(|a| {
                         a.iter()
                             .filter_map(|p| {
                                 let device = p.get("flows").and_then(Value::as_array).is_some_and(|f| f.iter().any(|x| x == "device"));
-                                Some((p.get("id")?.as_str()?.to_owned(), p.get("name")?.as_str()?.to_owned(), device))
+                                let domains = p
+                                    .get("domains")
+                                    .and_then(Value::as_array)
+                                    .map(|d| d.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                                    .unwrap_or_default();
+                                Some((p.get("id")?.as_str()?.to_owned(), p.get("name")?.as_str()?.to_owned(), device, domains))
                             })
                             .collect()
                     })
                     .unwrap_or_default();
                 if v.is_empty() {
-                    v.push((String::new(), "(none available)".into(), false));
-                }
-                // The provider serving the address first.
-                let domain = st.domain();
-                if let Some(i) = v.iter().position(|(id, _, _)| {
-                    (id == "google" && (domain == "gmail.com" || domain == "googlemail.com"))
-                        || (id == "microsoft" && ["outlook.com", "hotmail.com", "live.com", "msn.com"].contains(&domain.as_str()))
-                }) {
-                    st.extra.provider = i;
+                    v.push((String::new(), "(none available)".into(), false, Vec::new()));
                 }
                 st.extra.providers = v;
+                // The provider serving the address first.
+                st.pick_oauth_provider();
             }
             muted(
                 ui,
@@ -1640,6 +1712,13 @@ fn oauth_section(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Optio
                                 && let Some(o) = p.as_object_mut()
                             {
                                 o.insert("clientSecret".into(), json!(e.client_secret));
+                            }
+                            // The organization's own tenant (single-tenant app registrations need it).
+                            if e.providers.get(e.provider).is_some_and(|x| x.0 == "microsoft")
+                                && let Some(t) = &st.tenant
+                                && let Some(o) = p.as_object_mut()
+                            {
+                                o.insert("tenant".into(), json!(t));
                             }
                             match try_run(app, "accounts.oauthSignIn", p) {
                                 Ok(v) => {
@@ -2097,6 +2176,82 @@ mod tests {
         assert_eq!((v["password"].as_str(), v["allowPlaintextAuth"].as_bool()), (Some("dav-pw"), Some(true)));
         e.fill_dav(Some(&mailcraft_model::DavSettings { allow_plaintext_auth: false, ..Default::default() }));
         assert!(e.dav_password.is_empty() && !e.dav_plain);
+    }
+
+    fn server(host: &str, port: u16, security: &str, verified: bool, oauth_only: bool) -> Value {
+        json!({"host": host, "port": port, "security": security, "username": "kim@x", "verified": verified,
+               "oauthOnly": oauth_only})
+    }
+
+    fn wizard(address: &str) -> Wizard {
+        let mut w = Wizard { address: address.into(), ..Wizard::default() };
+        w.extra.providers = vec![
+            ("microsoft".into(), "Microsoft".into(), true, Vec::new()),
+            ("google".into(), "Google".into(), true, vec!["gmail.com".into()]),
+        ];
+        w
+    }
+
+    #[test]
+    fn the_oauth_choice_survives_a_change_of_account_type() {
+        // Regression: each change of account type opened the OAuth section again and chose the provider
+        // again, undoing a Google user's choice of an app password.
+        let mut w = wizard("kim@gmail.com");
+        w.take_discovery(json!({
+            "found": true, "sources": ["provider"],
+            "imap": server("imap.gmail.com", 993, "tls", true, false),
+            "pop3": server("pop.gmail.com", 995, "tls", true, false),
+            "smtp": server("smtp.gmail.com", 465, "tls", true, false),
+            "provider": {"id": "google", "name": "Google", "detectedBy": "domain", "oauthProvider": "google",
+                         "notes": ["Use an app password, or sign in with OAuth."]},
+        }));
+        after_lookup(&mut w);
+        assert_eq!(w.in_host, "imap.gmail.com");
+        assert!(w.extra.oauth_open);
+        assert_eq!(w.extra.provider, 1);
+        // The user closes the section (or picks another provider), then switches to POP.
+        w.extra.oauth_open = false;
+        w.extra.provider = 0;
+        w.pop3 = true;
+        w.guess();
+        assert_eq!(w.in_host, "pop.gmail.com");
+        assert!(!w.extra.oauth_open && w.extra.provider == 0, "the user's choice stays");
+        assert_eq!(w.provider_notes.len(), 1);
+        // JMAP was not found: the guess, without the provider's hints over it.
+        w.pop3 = false;
+        w.jmap = true;
+        w.guess();
+        assert_eq!(w.in_host, "https://gmail.com/.well-known/jmap");
+        assert!(w.provider_notes.is_empty() && w.oauth_hint.is_none() && w.found_in.is_empty());
+        assert!(!w.extra.oauth_open && w.extra.provider == 0);
+    }
+
+    #[test]
+    fn a_provider_known_only_from_the_tenant_is_to_be_confirmed() {
+        let mut w = wizard("kim@filtered.example.com");
+        w.take_discovery(json!({
+            "found": true, "sources": ["tenant"], "tenant": "6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f",
+            "imap": server("outlook.office365.com", 993, "tls", false, true),
+            "smtp": server("smtp.office365.com", 587, "starttls", false, true),
+            "provider": {"id": "microsoft365", "name": "Microsoft 365", "detectedBy": "tenant",
+                         "oauthProvider": "microsoft", "notes": []},
+        }));
+        after_lookup(&mut w);
+        assert_eq!(w.in_host, "outlook.office365.com");
+        assert!(w.probable && w.found_in.contains("probably at Microsoft 365"), "{}", w.found_in);
+        assert!(w.unverified.is_empty(), "one confirmation for the page");
+        assert!(w.extra.oauth_open && w.extra.provider == 0);
+        // Found by MX instead: verified, no confirmation asked.
+        let mut w = wizard("kim@m365.example.net");
+        w.take_discovery(json!({
+            "found": true, "sources": ["mx"],
+            "imap": server("outlook.office365.com", 993, "tls", true, true),
+            "smtp": server("smtp.office365.com", 587, "starttls", true, true),
+            "provider": {"id": "microsoft365", "name": "Microsoft 365", "detectedBy": "mx",
+                         "oauthProvider": "microsoft", "notes": []},
+        }));
+        after_lookup(&mut w);
+        assert!(!w.probable && w.found_in.contains("(MX) records"));
     }
 
     #[test]

@@ -933,7 +933,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.discover",
             "Find server settings",
-            r#"{"address": string, "wait"?: bool (block until done), "refresh"?: bool (look up again)} → {"status": "running"|"done", "found", "sources", "imap"?, "pop3"?, "smtp"?, "jmap"?, "notes"} (autoconfig on the mail domain, then DNS SRV records, RFC 6186)"#,
+            r#"{"address": string, "wait"?: bool (block until done), "refresh"?: bool (look up again)} → {"status": "running"|"done", "found", "sources", "imap"?, "pop3"?, "smtp"?, "jmap"?, "provider"?: {"id": "microsoft365"|"outlook.com"|"google", "name", "detectedBy": "domain"|"mx"|"servers"|"tenant", "oauthProvider", "oauthOnly", "graph", "notes"}, "mx", "tenant"?, "notes"} (big consumer domains without a lookup; otherwise autoconfig on the mail domain, DNS SRV records (RFC 6186), DNS MX records of Microsoft 365 / Google, the Microsoft 365 tenant by domain)"#,
             false,
             always,
             discover,
@@ -958,7 +958,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.oauthSignIn",
             "Sign in with OAuth",
-            r#"{"account"?: number|string, "provider": string (id from accounts.oauthProviders, or "custom"), "clientId": string, "clientSecret"?: string, "flow"?: "device"|"browser", "authorizationEndpoint"?, "tokenEndpoint"?, "deviceAuthorizationEndpoint"?, "scopes"?: [string] (custom provider)}"#,
+            r#"{"account"?: number|string, "provider": string (id from accounts.oauthProviders, or "custom"), "clientId": string, "clientSecret"?: string, "flow"?: "device"|"browser", "tenant"?: string (microsoft: tenant id or domain, from accounts.discover, in place of "common"; needed by single-tenant app registrations), "authorizationEndpoint"?, "tokenEndpoint"?, "deviceAuthorizationEndpoint"?, "scopes"?: [string] (custom provider)}"#,
             false,
             has_server_account,
             oauth_sign_in,
@@ -1861,6 +1861,24 @@ fn oauth_binding(p: &Value) -> Result<OAuthBinding, CmdError> {
         b.device_authorization_endpoint = bp.device_authorization_endpoint.clone();
         b.scopes = bp.scopes.clone();
         b.extra_auth_params = bp.extra_auth_params.clone();
+        if let Some(t) = str_field(p, &["tenant"])?.map(str::trim).filter(|t| !t.is_empty()) {
+            if provider != "microsoft" {
+                return Err(CmdError::Params("`tenant` only applies to the microsoft provider".into()));
+            }
+            let t = t.to_ascii_lowercase();
+            let named = ["common", "organizations", "consumers"].contains(&t.as_str());
+            let domain = t.contains('.') && mailcraft_net::autoconfig::valid_host(&t);
+            if !(named || domain || mailcraft_net::discover::is_guid(&t)) {
+                return Err(CmdError::Params(format!(
+                    "`tenant` must be a tenant id (GUID) or domain name, not `{t}`"
+                )));
+            }
+            // The bundled endpoints name the `common` tenant; a single-tenant registration needs its own.
+            let swap = |u: &str| u.replacen("/common/", &format!("/{t}/"), 1);
+            b.authorization_endpoint = swap(&b.authorization_endpoint);
+            b.token_endpoint = swap(&b.token_endpoint);
+            b.device_authorization_endpoint = b.device_authorization_endpoint.as_deref().map(swap);
+        }
         Ok(b)
     }
     #[cfg(target_arch = "wasm32")]
@@ -2021,6 +2039,31 @@ mod tests {
             ),
             Err(CmdError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn microsoft_sign_in_takes_the_tenant() {
+        let p = |t: Value| json!({"provider": "microsoft", "clientId": "app", "tenant": t});
+        let guid = "6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f";
+        let b = oauth_binding(&p(json!(guid))).unwrap();
+        assert_eq!(
+            b.authorization_endpoint,
+            format!("https://login.microsoftonline.com/{guid}/oauth2/v2.0/authorize")
+        );
+        assert_eq!(b.token_endpoint, format!("https://login.microsoftonline.com/{guid}/oauth2/v2.0/token"));
+        assert_eq!(
+            b.device_authorization_endpoint.as_deref(),
+            Some(format!("https://login.microsoftonline.com/{guid}/oauth2/v2.0/devicecode").as_str())
+        );
+        let b = oauth_binding(&p(json!("Example.COM"))).unwrap();
+        assert!(b.token_endpoint.contains("/example.com/oauth2/"));
+        let b = oauth_binding(&p(json!(""))).unwrap();
+        assert!(b.token_endpoint.contains("/common/"), "empty = the bundled common tenant");
+        for bad in [json!("../evil"), json!("a b"), json!("x/y.example.com"), json!(7), json!("nodot")] {
+            assert!(oauth_binding(&p(bad.clone())).is_err(), "{bad}");
+        }
+        let g = json!({"provider": "google", "clientId": "app", "tenant": guid});
+        assert!(oauth_binding(&g).is_err(), "a tenant only for Microsoft");
     }
 
     #[test]

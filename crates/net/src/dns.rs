@@ -1,6 +1,7 @@
-//! A tiny DNS client for service (SRV) lookups: RFC 1035 messages over UDP with a TCP retry for truncated
-//! answers (RFC 7766), EDNS(0) for larger UDP answers (RFC 6891), SRV records (RFC 2782). Used for mail
-//! service discovery (RFC 6186, RFC 8314 section 5.1, RFC 8620 section 2.2).
+//! A tiny DNS client for service (SRV) and mail exchanger (MX) lookups: RFC 1035 messages over UDP with a TCP
+//! retry for truncated answers (RFC 7766), EDNS(0) for larger UDP answers (RFC 6891), SRV records (RFC 2782)
+//! and MX records (RFC 1035 section 3.3.9, the null MX of RFC 7505). Used for mail service discovery
+//! (RFC 6186, RFC 8314 section 5.1, RFC 8620 section 2.2) and to recognise well-known mail hosts by their MX.
 //!
 //! The resolver to ask comes from `/etc/resolv.conf` (Unix) or is given explicitly (tests use a local fake
 //! responder). Where no resolver is known, lookups are skipped rather than guessed. Every answer is hostile
@@ -16,6 +17,8 @@ use crate::error::{NetError, Result};
 
 /// RR type SRV.
 pub const TYPE_SRV: u16 = 33;
+/// RR type MX.
+pub const TYPE_MX: u16 = 15;
 /// RR type OPT (EDNS).
 const TYPE_OPT: u16 = 41;
 /// Class IN.
@@ -49,6 +52,27 @@ impl SrvRecord {
     }
 }
 
+/// One MX record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MxRecord {
+    pub preference: u16,
+    /// Mail exchanger host without the trailing dot; `"."` (RFC 7505 null MX: the domain accepts no mail) is
+    /// kept as an empty string.
+    pub exchange: String,
+}
+
+impl MxRecord {
+    /// RFC 7505: a "." exchange means the domain does not accept mail.
+    pub fn is_null(&self) -> bool {
+        self.exchange.is_empty()
+    }
+}
+
+/// Orders MX records by preference (lowest first), then by exchange name.
+pub fn sort_mx(records: &mut [MxRecord]) {
+    records.sort_by(|a, b| a.preference.cmp(&b.preference).then_with(|| a.exchange.cmp(&b.exchange)));
+}
+
 /// Orders records by priority (lowest first), then by weight (heaviest first), then by target, so the
 /// preferred server comes first. (RFC 2782's weighted random choice only matters for load spreading.)
 pub fn sort_srv(records: &mut [SrvRecord]) {
@@ -80,20 +104,32 @@ impl Resolver {
     /// SRV records for `name` (for example `_imaps._tcp.example.com`), sorted with [`sort_srv`]. A name that
     /// does not exist, or has no SRV records, gives an empty list.
     pub fn lookup_srv(&self, name: &str) -> Result<Vec<SrvRecord>> {
+        let mut out = self.lookup(name, TYPE_SRV, parse_response)?;
+        sort_srv(&mut out);
+        Ok(out)
+    }
+
+    /// MX records for `name` (a mail domain), sorted with [`sort_mx`]. A name that does not exist, or has no
+    /// MX records, gives an empty list.
+    pub fn lookup_mx(&self, name: &str) -> Result<Vec<MxRecord>> {
+        let mut out = self.lookup(name, TYPE_MX, parse_mx_response)?;
+        sort_mx(&mut out);
+        Ok(out)
+    }
+
+    /// Asks one question and reads the answer with `parse`, again over TCP when the UDP answer is truncated.
+    fn lookup<T>(&self, name: &str, qtype: u16, parse: ParseFn<T>) -> Result<Vec<T>> {
         let id = random_id()?;
-        let query = encode_query(id, name, TYPE_SRV)?;
+        let query = encode_query(id, name, qtype)?;
         let reply = self.exchange_udp(id, &query)?;
-        let msg = match parse_response(&reply, id, name, TYPE_SRV) {
+        match parse(&reply, id, name, qtype) {
             Err(NetError::TooLarge(_)) => {
                 // Truncated over UDP: ask again over TCP.
                 let reply = self.exchange_tcp(&query)?;
-                parse_response(&reply, id, name, TYPE_SRV)?
+                parse(&reply, id, name, qtype)
             }
-            other => other?,
-        };
-        let mut out = msg;
-        sort_srv(&mut out);
-        Ok(out)
+            other => other,
+        }
     }
 
     fn exchange_udp(&self, id: u16, query: &[u8]) -> Result<Vec<u8>> {
@@ -162,6 +198,9 @@ impl Resolver {
         Ok(msg)
     }
 }
+
+/// Reads the records of an answer: (message, id, name, qtype).
+type ParseFn<T> = fn(&[u8], u16, &str, u16) -> Result<Vec<T>>;
 
 fn random_id() -> Result<u16> {
     let mut b = [0u8; 2];
@@ -334,6 +373,54 @@ fn read_name(msg: &[u8], mut pos: usize) -> Result<(String, usize)> {
 /// no answers give an empty list; a truncated answer gives [`NetError::TooLarge`] (retry over TCP); a server
 /// failure or refusal is an error.
 pub fn parse_response(msg: &[u8], id: u16, name: &str, qtype: u16) -> Result<Vec<SrvRecord>> {
+    parse_records(msg, id, name, qtype, |msg, rtype, start, rdlen| {
+        if rtype != TYPE_SRV || qtype != TYPE_SRV {
+            return Ok(None);
+        }
+        if rdlen < 7 {
+            return Err(malformed("short SRV record"));
+        }
+        let mut rd = Reader { msg, pos: start };
+        let priority = rd.u16()?;
+        let weight = rd.u16()?;
+        let port = rd.u16()?;
+        let target = rd.name()?;
+        if rd.pos > start.saturating_add(rdlen) {
+            return Err(malformed("SRV target runs past its record"));
+        }
+        Ok(Some(SrvRecord { priority, weight, port, target }))
+    })
+}
+
+/// Parses an answer to `encode_query(id, name, TYPE_MX)`: the MX records of the answer section (records of
+/// other types, such as the CNAME chain a resolver puts first, are skipped). Errors as [`parse_response`].
+pub fn parse_mx_response(msg: &[u8], id: u16, name: &str, qtype: u16) -> Result<Vec<MxRecord>> {
+    parse_records(msg, id, name, qtype, |msg, rtype, start, rdlen| {
+        if rtype != TYPE_MX || qtype != TYPE_MX {
+            return Ok(None);
+        }
+        if rdlen < 3 {
+            return Err(malformed("short MX record"));
+        }
+        let mut rd = Reader { msg, pos: start };
+        let preference = rd.u16()?;
+        let exchange = rd.name()?;
+        if rd.pos > start.saturating_add(rdlen) {
+            return Err(malformed("MX exchange runs past its record"));
+        }
+        Ok(Some(MxRecord { preference, exchange }))
+    })
+}
+
+/// Checks the header and the question of an answer, then hands each answer record of class IN to `read`
+/// (message, record type, offset of the record data, its length); `None` skips the record.
+fn parse_records<T>(
+    msg: &[u8],
+    id: u16,
+    name: &str,
+    qtype: u16,
+    mut read: impl FnMut(&[u8], u16, usize, usize) -> Result<Option<T>>,
+) -> Result<Vec<T>> {
     let mut r = Reader { msg, pos: 0 };
     if r.u16()? != id {
         return Err(malformed("wrong id"));
@@ -380,19 +467,10 @@ pub fn parse_response(msg: &[u8], id: u16, name: &str, qtype: u16) -> Result<Vec
         if start.checked_add(rdlen).is_none_or(|e| e > msg.len()) {
             return Err(malformed("record data runs past the end"));
         }
-        if rtype == TYPE_SRV && class == CLASS_IN && qtype == TYPE_SRV {
-            if rdlen < 7 {
-                return Err(malformed("short SRV record"));
-            }
-            let mut rd = Reader { msg, pos: start };
-            let priority = rd.u16()?;
-            let weight = rd.u16()?;
-            let port = rd.u16()?;
-            let target = rd.name()?;
-            if rd.pos > start + rdlen {
-                return Err(malformed("SRV target runs past its record"));
-            }
-            out.push(SrvRecord { priority, weight, port, target });
+        if class == CLASS_IN
+            && let Some(rec) = read(msg, rtype, start, rdlen)?
+        {
+            out.push(rec);
         }
         r.pos = start;
         r.skip(rdlen)?;
@@ -403,6 +481,52 @@ pub fn parse_response(msg: &[u8], id: u16, name: &str, qtype: u16) -> Result<Vec
 /// Builds a response message (for tests and the local fake responder): the question plus SRV answers, or
 /// NXDOMAIN when `records` is `None`.
 pub fn encode_srv_response(query: &[u8], records: Option<&[SrvRecord]>) -> Result<Vec<u8>> {
+    let rdata = records
+        .map(|recs| {
+            recs.iter()
+                .map(|rec| {
+                    let mut rd = Vec::new();
+                    rd.extend_from_slice(&rec.priority.to_be_bytes());
+                    rd.extend_from_slice(&rec.weight.to_be_bytes());
+                    rd.extend_from_slice(&rec.port.to_be_bytes());
+                    push_target(&mut rd, &rec.target)?;
+                    Ok(rd)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    encode_response(query, TYPE_SRV, rdata)
+}
+
+/// Builds a response message with MX answers (or NXDOMAIN for `None`), like [`encode_srv_response`].
+pub fn encode_mx_response(query: &[u8], records: Option<&[MxRecord]>) -> Result<Vec<u8>> {
+    let rdata = records
+        .map(|recs| {
+            recs.iter()
+                .map(|rec| {
+                    let mut rd = rec.preference.to_be_bytes().to_vec();
+                    push_target(&mut rd, &rec.exchange)?;
+                    Ok(rd)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    encode_response(query, TYPE_MX, rdata)
+}
+
+/// A target name in record data; "" is the root (".").
+fn push_target(rd: &mut Vec<u8>, target: &str) -> Result<()> {
+    if target.is_empty() {
+        rd.push(0);
+        Ok(())
+    } else {
+        push_name(rd, target)
+    }
+}
+
+/// The question of `query` plus answers of type `rtype` (their record data given) when the query asks for
+/// that type; NXDOMAIN for `None`.
+fn encode_response(query: &[u8], rtype: u16, rdata: Option<Vec<Vec<u8>>>) -> Result<Vec<u8>> {
     let mut r = Reader { msg: query, pos: 0 };
     let id = r.u16()?;
     let _flags = r.u16()?;
@@ -415,8 +539,8 @@ pub fn encode_srv_response(query: &[u8], records: Option<&[SrvRecord]>) -> Resul
     let qtype = r.u16()?;
     let _qclass = r.u16()?;
     let question = query.get(qstart..r.pos).ok_or_else(|| malformed("question"))?;
-    let answers: &[SrvRecord] = if qtype == TYPE_SRV { records.unwrap_or_default() } else { &[] };
-    let rcode: u16 = if records.is_none() { 3 } else { 0 };
+    let rcode: u16 = if rdata.is_none() { 3 } else { 0 };
+    let answers: Vec<Vec<u8>> = if qtype == rtype { rdata.unwrap_or_default() } else { Vec::new() };
     let mut out = Vec::new();
     out.extend_from_slice(&id.to_be_bytes());
     out.extend_from_slice(&(0x8180u16 | rcode).to_be_bytes()); // QR, RD, RA
@@ -425,20 +549,11 @@ pub fn encode_srv_response(query: &[u8], records: Option<&[SrvRecord]>) -> Resul
     out.extend_from_slice(&an.to_be_bytes());
     out.extend_from_slice(&[0, 0, 0, 0]);
     out.extend_from_slice(question);
-    for rec in answers {
+    for rd in answers {
         out.extend_from_slice(&[0xC0, 12]); // the question's name
-        out.extend_from_slice(&TYPE_SRV.to_be_bytes());
+        out.extend_from_slice(&rtype.to_be_bytes());
         out.extend_from_slice(&CLASS_IN.to_be_bytes());
         out.extend_from_slice(&300u32.to_be_bytes());
-        let mut rd = Vec::new();
-        rd.extend_from_slice(&rec.priority.to_be_bytes());
-        rd.extend_from_slice(&rec.weight.to_be_bytes());
-        rd.extend_from_slice(&rec.port.to_be_bytes());
-        if rec.target.is_empty() {
-            rd.push(0);
-        } else {
-            push_name(&mut rd, &rec.target)?;
-        }
         let len = u16::try_from(rd.len()).map_err(|_| NetError::Invalid("record too long".into()))?;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&rd);
@@ -520,6 +635,57 @@ mod tests {
         m.extend_from_slice(&[0xC0, 12, 0, 33, 0, 1]);
         assert!(parse_response(&m, 1, "x.example", TYPE_SRV).is_err());
         assert!(read_name(&m, 12).is_err());
+    }
+
+    #[test]
+    fn mx_round_trip_null_mx_and_garbage() {
+        let name = "example.org";
+        let q = encode_query(11, name, TYPE_MX).unwrap();
+        let recs = [
+            MxRecord { preference: 20, exchange: "alt.example.org".into() },
+            MxRecord { preference: 10, exchange: "Mail.Example.ORG".into() },
+        ];
+        let a = encode_mx_response(&q, Some(&recs)).unwrap();
+        let mut got = parse_mx_response(&a, 11, name, TYPE_MX).unwrap();
+        sort_mx(&mut got);
+        assert_eq!(got[0], MxRecord { preference: 10, exchange: "mail.example.org".into() });
+        assert_eq!(got.len(), 2);
+        // An SRV answer read as MX (and the other way round) has no records of the wanted type.
+        assert!(parse_response(&a, 11, name, TYPE_MX).unwrap().is_empty());
+        let null =
+            encode_mx_response(&q, Some(&[MxRecord { preference: 0, exchange: String::new() }])).unwrap();
+        assert!(parse_mx_response(&null, 11, name, TYPE_MX).unwrap()[0].is_null());
+        assert!(
+            parse_mx_response(&encode_mx_response(&q, None).unwrap(), 11, name, TYPE_MX).unwrap().is_empty()
+        );
+        for n in 0..a.len() {
+            let _ = parse_mx_response(&a[..n], 11, name, TYPE_MX);
+        }
+        for b in 0..=255u8 {
+            let mut x = a.clone();
+            let i = usize::from(b) % x.len();
+            x[i] = b;
+            let _ = parse_mx_response(&x, 11, name, TYPE_MX);
+        }
+    }
+
+    #[test]
+    fn mx_lookup_over_udp() {
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = udp.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (n, peer) = udp.recv_from(&mut buf).unwrap();
+            let recs = [
+                MxRecord { preference: 5, exchange: "b.example.net".into() },
+                MxRecord { preference: 1, exchange: "a.example.net".into() },
+            ];
+            udp.send_to(&encode_mx_response(&buf[..n], Some(&recs)).unwrap(), peer).unwrap();
+        });
+        let got = Resolver::new(addr).lookup_mx("example.net").unwrap();
+        h.join().unwrap();
+        let names: Vec<&str> = got.iter().map(|r| r.exchange.as_str()).collect();
+        assert_eq!(names, ["a.example.net", "b.example.net"]);
     }
 
     #[test]

@@ -890,6 +890,7 @@ fn local_lookup(app: &mut App, servers: &mailcraft_testmail::TestServers) {
         dns_timeout: std::time::Duration::from_secs(2),
         autoconfig_urls: servers.autoconfig_url_templates(),
         http: ConnectOptions::trusting(servers.cert_der.clone()),
+        tenant_url: Some(servers.tenant_url_template()),
         allow_reserved: true,
     };
 }
@@ -1002,6 +1003,109 @@ fn add_account_points_out_servers_outside_the_domain_found_in_dns() {
     step(&mut h);
     assert_eq!(field_value(&h, "Server:"), "pop.example.org");
     assert!(h.query_by_label_contains("guessed from your address").is_some());
+}
+
+#[test]
+fn add_account_recognises_microsoft_365_by_mx_and_signs_in_with_oauth() {
+    const TENANT: &str = "6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f";
+    let servers = mailcraft_testmail::TestServers::start(mailcraft_testmail::Config::default()).unwrap();
+    servers.set_mx(
+        "m365.example.net",
+        vec![mailcraft_testmail::Mx {
+            preference: 0,
+            exchange: "m365-example-net.mail.protection.outlook.com".into(),
+        }],
+    );
+    servers.set_tenant("m365.example.net", Some(TENANT));
+    let mut app = sample_app();
+    app.s.view.work_offline = true;
+    local_lookup(&mut app, &servers);
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    let mut h = harness(app);
+    set_text(&mut h, "Email address:", "robin@m365.example.net");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    // Microsoft 365's servers, not imap.<domain> / smtp.<domain>.
+    assert!(h.query_by_label_contains("(MX) records point at Microsoft 365").is_some());
+    assert!(h.query_by_label_contains("guessed").is_none());
+    assert_eq!(field_value(&h, "Server:"), "outlook.office365.com");
+    assert_eq!(field_value(&h, "Port:"), "993");
+    assert_eq!(field_value(&h, "User name:"), "robin@m365.example.net");
+    assert_eq!(field_value(&h, "Outgoing server:"), "smtp.office365.com");
+    assert_eq!(field_value(&h, "Outgoing port:"), "587");
+    assert!(combo_shows(&h, "STARTTLS"));
+    assert!(h.query_by_label_contains("Authenticated SMTP").is_some());
+    assert!(h.query_by_label_contains("consent to the permissions").is_some());
+    assert!(h.query_by_label_contains("is not part of").is_none(), "a known provider's own servers");
+    // The OAuth section is open with the Microsoft provider; signing in uses the organization's tenant.
+    assert!(h.query_by_label_contains("no built-in registration").is_some());
+    assert!(combo_shows(&h, "Microsoft (personal and work or school accounts)"));
+    set_text(&mut h, "Client id:", "org-registered-app");
+    h.get_by_label("Browser").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Browser").click();
+    step(&mut h);
+    h.get_by_label("Sign In").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Sign In").click();
+    step(&mut h);
+    let id = {
+        let app = h.state();
+        let a = app.s.mailbox.accounts.iter().find(|a| a.address == "robin@m365.example.net").unwrap();
+        let inc = a.incoming.as_ref().unwrap();
+        assert_eq!(
+            (inc.host.as_str(), inc.port, inc.security),
+            ("outlook.office365.com", 993, Security::Tls)
+        );
+        let out = a.outgoing.as_ref().unwrap();
+        assert_eq!(
+            (out.host.as_str(), out.port, out.security),
+            ("smtp.office365.com", 587, Security::StartTls)
+        );
+        let flow = app.s.sync.oauth.get(&a.id).cloned().unwrap();
+        assert_eq!(flow.status, "waiting", "{:?}", flow.error);
+        let url = flow.auth_url.unwrap_or_default();
+        assert!(
+            url.starts_with(&format!("https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize")),
+            "{url}"
+        );
+        a.id
+    };
+    h.get_by_label("Cancel Sign-In").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Cancel Sign-In").click();
+    step(&mut h);
+    assert_eq!(h.state().s.sync.oauth.get(&id).unwrap().status, "cancelled");
+}
+
+#[test]
+fn add_account_knows_gmail_without_a_lookup() {
+    let mut app = sample_app();
+    app.s.view.work_offline = true;
+    // No test servers at all: a consumer domain needs none.
+    app.s.sync.discovery = mailcraft_engine::sync::DiscoverOptions::offline();
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    let mut h = harness(app);
+    set_text(&mut h, "Email address:", "kim@gmail.com");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    assert!(h.query_by_label_contains("These are Google's settings for gmail.com addresses").is_some());
+    assert_eq!(field_value(&h, "Server:"), "imap.gmail.com");
+    assert_eq!(field_value(&h, "Outgoing server:"), "smtp.gmail.com");
+    assert_eq!(field_value(&h, "Outgoing port:"), "465");
+    assert!(h.query_by_label_contains("app password").is_some());
+    assert!(combo_shows(&h, "Google"));
+    // POP instead: Google's POP server.
+    h.get_by_label("< Back").click();
+    step(&mut h);
+    h.get_by_label("Let me set up my account manually").click();
+    step(&mut h);
+    h.get_by_label("Connect").click();
+    step_until(&mut h, "Advanced setup", |h| h.query_by_label("Advanced setup").is_some());
+    h.get_by_label("POP").click();
+    step(&mut h);
+    assert_eq!(field_value(&h, "Server:"), "pop.gmail.com");
+    assert_eq!(field_value(&h, "Port:"), "995");
 }
 
 #[test]
