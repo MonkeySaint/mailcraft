@@ -1,0 +1,23 @@
+[package]
+name = "mailcraft-bench"
+description = "MailCraft storage benchmarks: synthetic profiles of 10k to 2M messages, open, list, search, sync and command timings (dev tool, not shipped)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "mailcraft-bench"
+path = "src/main.rs"
+
+[dependencies]
+mailcraft-engine.workspace = true
+mailcraft-store.workspace = true
+mailcraft-search.workspace = true
+mailcraft-net.workspace = true
+mailcraft-testmail.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -2633,6 +2633,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailcraft-bench"
+version = "0.3.0"
+dependencies = [
+ "mailcraft-engine",
+ "mailcraft-net",
+ "mailcraft-search",
+ "mailcraft-store",
+ "mailcraft-testmail",
+ "serde_json",
+]
+
+[[package]]
 name = "mailcraft-cli"
 version = "0.3.0"
 dependencies = [

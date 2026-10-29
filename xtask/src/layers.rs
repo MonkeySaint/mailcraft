@@ -30,6 +30,7 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("mailcraft-cli", 7),
     ("mailcraft-web", 7),
     ("mailcraft-testmail-app", 7),
+    ("mailcraft-bench", 7),
     ("xtask", 8),
     ("mailcraft-testmail", TEST_LAYER),
 ];

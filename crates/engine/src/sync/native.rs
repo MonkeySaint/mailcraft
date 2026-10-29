@@ -2036,6 +2036,19 @@ pub(super) fn cancel_oauth(s: &mut Session, id: AccountId) -> bool {
 // Applying results (session thread)
 // ---------------------------------------------------------------------------------------------------
 
+/// Queues synthetic results for IMAP account `account` (see [`super::SyntheticImap`]) on the channel its
+/// worker would use; `poll_events` applies them. False when the account is not an IMAP account.
+pub(super) fn queue_synthetic(s: &Session, account: AccountId, results: super::SyntheticImap) -> bool {
+    if !s.mailbox.account(account).is_some_and(|a| a.kind == AccountKind::Imap) {
+        return false;
+    }
+    let event = match results {
+        super::SyntheticImap::Delta { folder, delta } => Event::Delta { account, name: folder, delta },
+        super::SyntheticImap::Bodies { folder, msgs } => Event::Bodies { account, name: folder, msgs },
+    };
+    s.sync.rt.loose_events().send(event)
+}
+
 pub(super) fn poll_events(s: &mut Session) -> bool {
     let mut events = Vec::new();
     let mut received = false;

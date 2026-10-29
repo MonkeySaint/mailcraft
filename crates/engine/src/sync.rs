@@ -1649,6 +1649,28 @@ fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
     mailcraft_store::rebuild_message(m)
 }
 
+/// IMAP folder results made up without a server, for benchmarks (`apps/mailcraft-bench`) and tests: queued
+/// with [`Session::queue_imap_results`], they are applied by the next [`Session::poll_sync`] exactly like
+/// results a send/receive worker downloaded (rules, the Junk Email filter, journaling, undo tracking).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+pub enum SyntheticImap {
+    /// One sync round of the folder whose server name is `folder` (new messages, flag changes, vanished
+    /// UIDs, folder state).
+    Delta { folder: String, delta: mailcraft_net::sync::SyncDelta },
+    /// Whole messages for items of `folder` first downloaded as headers only.
+    Bodies { folder: String, msgs: Vec<mailcraft_net::sync::NewMessage> },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Session {
+    /// Queues `results` for IMAP account `account` as if its send/receive worker had sent them (see
+    /// [`SyntheticImap`]); nothing connects to a server. False when `account` is not an IMAP account.
+    pub fn queue_imap_results(&self, account: AccountId, results: SyntheticImap) -> bool {
+        native::queue_synthetic(self, account, results)
+    }
+}
+
 // =======================================================================================================
 // Native: workers, jobs and results
 // =======================================================================================================
@@ -2038,6 +2060,47 @@ mod tests {
             ]
         );
         assert!(s.mailbox.mail[&x].remote_id.is_none() && s.mailbox.mail[&z].remote_id.is_none());
+    }
+
+    #[test]
+    fn synthetic_imap_results_apply_like_worker_results() {
+        let (mb, a, inbox, _) = imap_mailbox();
+        let local = mb.default_account().map(|x| x.id).unwrap();
+        let mut s = Session::new(mb);
+        s.view.work_offline = true;
+        let msg = |uid: u32, headers_only: bool| {
+            mailcraft_net::sync::NewMessage {
+            uid,
+            raw: format!(
+                "From: a@example.com\r\nSubject: Synthetic {uid}\r\nMessage-ID: <syn{uid}@example.com>\r\n\r\n\
+                 Body {uid}\r\n"
+            )
+            .into_bytes(),
+            flags: vec![],
+            internal_date: None,
+            size: None,
+            headers_only,
+        }
+        };
+        let delta = mailcraft_net::sync::SyncDelta {
+            new: vec![msg(1, false), msg(2, true)],
+            state: mailcraft_net::sync::FolderState { uidvalidity: 7, uidnext: 3, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(!s.queue_imap_results(
+            local,
+            SyntheticImap::Delta { folder: "INBOX".into(), delta: delta.clone() }
+        ));
+        assert!(s.queue_imap_results(a, SyntheticImap::Delta { folder: "INBOX".into(), delta }));
+        assert!(s.poll_sync());
+        let items: Vec<&MailItem> = s.mailbox.items_in(inbox);
+        assert_eq!(items.len(), 2);
+        let header = items.iter().find(|m| m.remote_id.as_deref() == Some("2")).map(|m| m.id).unwrap();
+        assert!(s.mailbox.mail[&header].body.text.is_none(), "header only");
+        let bodies = SyntheticImap::Bodies { folder: "INBOX".into(), msgs: vec![msg(2, false)] };
+        assert!(s.queue_imap_results(a, bodies));
+        assert!(s.poll_sync());
+        assert!(s.mailbox.mail[&header].body.text.as_deref().is_some_and(|t| t.contains("Body 2")));
     }
 
     #[test]

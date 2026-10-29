@@ -3,6 +3,7 @@
 //! Every task works on the repository root: the parent of this package's directory, or `--root DIR`.
 
 mod assets;
+mod bench;
 mod ci;
 mod ico;
 mod layers;
@@ -26,6 +27,10 @@ Tasks:
   licences                   every dependency's licence is on the allowlist
   parity [--out FILE] [--check]
                              write docs/parity.md (--check: fail when stale or below xtask/parity-floor.txt)
+  bench --size 10k|100k|1m [--backend legacy|sqlite] [--small-bodies] [--out FILE]
+        [--seed N] [--sync N] [--bulk-move N] [--keep]
+                             storage benchmarks on a synthetic profile (apps/mailcraft-bench, release
+                             build); JSON report in target/scratch/bench/ unless --out
   stats                      lines of Rust, tests and commands per crate
   version show | bump X.Y.Z | check
                              show or bump the workspace version; check it against the CI tag
@@ -148,6 +153,7 @@ fn run(root: &Path, args: &[String]) -> TaskResult {
             let out = out.unwrap_or_else(|| root.join("docs").join("parity.md"));
             if check { parity::check(&out) } else { parity::write(&out) }
         }
+        "bench" => bench::run(root, rest),
         "stats" => {
             no_args(rest)?;
             stats::run(root)

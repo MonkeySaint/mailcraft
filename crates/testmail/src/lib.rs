@@ -48,6 +48,7 @@ mod pop3;
 mod server;
 mod smtp;
 mod store;
+pub mod synth;
 mod tls;
 mod web;
 

@@ -82,6 +82,9 @@ cargo run --release -p mailcraft
 
 # Local test mail servers for trying accounts without a real mailbox
 cargo run -p mailcraft-testmail-app -- --help
+
+# Storage benchmarks on a synthetic profile (JSON report in target/scratch/bench/)
+cargo xtask bench --size 10k
 ```
 
 Web build: see [apps/mailcraft-web/README.md](apps/mailcraft-web/README.md).
@@ -109,7 +112,7 @@ A running app can be driven over a local JSON control channel (`--control-port N
 | L4 | `engine` | session, undo, command registry, feature catalog, sync |
 | L5 | `mcp` | MCP server |
 | L6 | `ui-egui` | the Outlook-style user interface |
-| apps | `mailcraft`, `mailcraft-cli`, `mailcraft-web`, `mailcraft-testmail-app` | binaries |
+| apps | `mailcraft`, `mailcraft-cli`, `mailcraft-web`, `mailcraft-testmail-app`, `mailcraft-bench` | binaries (the last two are dev tools) |
 
 `cargo xtask ci` runs fmt, clippy, tests, the layer check, asset attribution, the licence allowlist, the parity
 floor and the wasm build. CI runs on GitHub Actions (`.github/workflows/`).
