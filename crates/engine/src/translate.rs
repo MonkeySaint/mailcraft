@@ -354,14 +354,14 @@ fn prefix(t: &str, max: usize) -> &str {
 /// The start of a message's text, enough for [`detect`]: the subject and the first [`DETECT_CHARS`]
 /// characters of the body. Only a bounded part of the body is read (the offer bar asks every frame), never
 /// the whole text or HTML of a large message.
-fn detect_sample(m: &mailcraft_model::MailItem) -> String {
+fn detect_sample(m: &mailcraft_model::MailItem, body: &mailcraft_model::Body) -> String {
     let mut out = String::with_capacity(m.subject.len().saturating_add(DETECT_CHARS));
     out.push_str(&m.subject);
     out.push('\n');
-    let text: String = m.body.text.as_deref().unwrap_or_default().chars().take(DETECT_CHARS).collect();
+    let text: String = body.text.as_deref().unwrap_or_default().chars().take(DETECT_CHARS).collect();
     if !text.trim().is_empty() {
         out.push_str(&text);
-    } else if let Some(h) = &m.body.html {
+    } else if let Some(h) = &body.html {
         let stripped = mailcraft_model::text::strip_html(prefix(h, DETECT_HTML_BYTES));
         out.extend(stripped.chars().take(DETECT_CHARS));
     } else {
@@ -383,7 +383,8 @@ pub fn offer(s: &Session, id: ItemId) -> Option<(&'static str, String)> {
         return None;
     }
     let m = s.mailbox.mail.get(id)?;
-    let from = detect(&detect_sample(m))?;
+    // Through the body cache: the offer bar asks every frame.
+    let from = detect(&detect_sample(m, &s.body_or_empty(m)))?;
     let to = s.settings.text("language.translateTo");
     (primary(from) != primary(&to)).then_some((from, to))
 }
@@ -651,9 +652,9 @@ mod tests {
     fn session_with(subject: &str, body: &str) -> (Session, ItemId) {
         let mut s = Session::new(Mailbox::new_local("Local Folders"));
         let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
-        let mut m = MailItem { folder: inbox, subject: subject.into(), ..Default::default() };
-        m.body.text = Some(body.into());
-        let id = s.mailbox.add_mail(m);
+        let m = MailItem { folder: inbox, subject: subject.into(), ..Default::default() };
+        let body = mailcraft_model::Body { text: Some(body.into()), ..Default::default() };
+        let id = s.add_message(m, &mailcraft_store::Content::body(body)).unwrap();
         s.selection.focus = Some(id);
         (s, id)
     }
@@ -863,14 +864,15 @@ mod tests {
     /// whole body was copied (or a whole HTML body stripped). Only the start of the body is read now.
     #[test]
     fn detection_reads_only_the_start_of_a_message() {
-        let mut m = MailItem { subject: "Projet".into(), ..Default::default() };
-        m.body.html = Some(format!("<p>{FRENCH}</p>{}", "<div>12345</div>".repeat(200_000)));
-        let sample = detect_sample(&m);
+        let m = MailItem { subject: "Projet".into(), ..Default::default() };
+        let html = Some(format!("<p>{FRENCH}</p>{}", "<div>12345</div>".repeat(200_000)));
+        let mut b = mailcraft_model::Body { html, ..Default::default() };
+        let sample = detect_sample(&m, &b);
         assert!(sample.chars().count() <= DETECT_CHARS + 10, "{}", sample.len());
         assert_eq!(detect(&sample), Some("fr"));
-        m.body.html = None;
-        m.body.text = Some(format!("{FRENCH} {}", "é".repeat(3_000_000)));
-        let sample = detect_sample(&m);
+        b.html = None;
+        b.text = Some(format!("{FRENCH} {}", "é".repeat(3_000_000)));
+        let sample = detect_sample(&m, &b);
         assert!(sample.chars().count() <= DETECT_CHARS + 10);
         assert_eq!(detect(&sample), Some("fr"));
         // Byte limits never split a character.
@@ -884,9 +886,9 @@ mod tests {
         let (url, seen) = fake_server(2);
         let (mut s, fr) = session_with("Projet", FRENCH);
         let inbox = s.mailbox.mail.get(fr).unwrap().folder;
-        let mut m = MailItem { folder: inbox, subject: "Report".into(), ..Default::default() };
-        m.body.text = Some(ENGLISH.into());
-        let en = s.mailbox.add_mail(m);
+        let m = MailItem { folder: inbox, subject: "Report".into(), ..Default::default() };
+        let body = mailcraft_model::Body { text: Some(ENGLISH.into()), ..Default::default() };
+        let en = s.add_message(m, &mailcraft_store::Content::body(body)).unwrap();
         s.run("options.translator", &json!({"url": url})).unwrap();
         // Ask (the default): an offer for the French message only.
         assert_eq!(offer(&s, fr), Some(("fr", "en".to_owned())));

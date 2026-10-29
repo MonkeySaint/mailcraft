@@ -1,13 +1,18 @@
 //! Local mailbox storage (layer L2).
 //!
 //! On-disk layout under the profile directory:
-//! - `mailbox.json`: full [`mailcraft_model::Mailbox`] snapshot without raw message sources (written atomically:
-//!   temp file + fsync + rename). Wrapped as `{"mailcraft_snapshot":1,"generation":N,"mailbox":{...}}`.
+//! - `mailbox.json`: full [`mailcraft_model::Mailbox`] snapshot without message bodies or sources (written
+//!   atomically: temp file + fsync + rename). Wrapped as
+//!   `{"mailcraft_snapshot":2,"generation":N,"bodies":2,"mailbox":{...}}` (format 1, written before storage
+//!   stage S5, is still read).
 //! - `journal.jsonl`: append-only [`Op`] log since the snapshot (header line carries the snapshot generation it
 //!   applies to); replayed on open; a torn last line is ignored (crash recovery), garbled middle lines are
 //!   skipped with a warning. Compacted into a new snapshot by [`Store::checkpoint`].
 //! - `blobs/<aa>/<hash>-<len>.eml`: raw RFC 5322 sources, content-addressed (FNV-1a 64 hex + length,
-//!   collision-checked byte for byte; a true collision gets a `-<n>` suffix).
+//!   collision-checked byte for byte; a true collision gets a `-<n>` suffix); `blobs/<aa>/<hash>-<len>.body`:
+//!   body records of items without a source or with a body changed here (storage stage S5,
+//!   [`bodies::BodyStore`]). Items refer to both by key; files written before S5 that carry content inline are
+//!   moved out when they are read ([`legacy`]).
 //! - `recoverable.json`: items deleted for good, kept for Recover Deleted Items
 //!   ([`mailcraft_model::RecoverBin`], raw sources in blobs), written atomically by [`Store::save_recoverable`].
 //! - `lock`: single-writer lock file holding the owner's pid and a timestamp. A lock whose process is gone
@@ -21,7 +26,8 @@
 //! [`export_mbox`]. Additions: [`Autosave`], [`Store::import_eml`], [`Store::export_mbox`],
 //! [`Store::checkpoint_mut`], [`Store::load_report`], [`Store::raw_of`], [`Store::gc_blobs`], [`Op::apply`],
 //! [`Store::journal_bytes`], [`Store::keep_alive`], [`Store::append_keyed`], [`MailRepo`] (storage stage S2),
-//! [`Op::PutSync`], [`Op::PutConfig`] and [`SmallState`] (storage stage S4).
+//! [`Op::PutSync`], [`Op::PutConfig`] and [`SmallState`] (storage stage S4), [`BodyStore`] and [`Content`]
+//! (storage stage S5: bodies and sources out of memory).
 //!
 //! Size caps (issue #25): every file is written under the same cap its reader applies, so a profile can never
 //! hold a snapshot, journal or recoverable-items file it would refuse to open. A write past the cap fails with
@@ -29,9 +35,11 @@
 
 pub mod autosave;
 pub mod blob;
+pub mod bodies;
 pub mod config;
 pub mod import;
 pub mod journal;
+pub mod legacy;
 pub mod lock;
 pub mod mbox;
 pub mod repo;
@@ -42,14 +50,17 @@ mod tests;
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use mailcraft_model::{DateTime, DeletedItem, FolderId, Importance, ItemId, MailItem, Mailbox, RecoverBin};
+use mailcraft_model::{
+    Body, DateTime, DeletedItem, FolderId, Importance, ItemId, MailItem, Mailbox, RecoverBin,
+};
 use serde::{Deserialize, Serialize};
 
 pub use autosave::Autosave;
 pub use blob::BlobKey;
+pub use bodies::{BodyStore, Content};
 pub use config::SmallState;
 pub use import::MaildirFlags;
 pub use journal::Repair;
@@ -88,7 +99,7 @@ pub const MAX_BLOB_BYTES: usize = mailcraft_mime::MAX_MESSAGE_BYTES;
 /// A journaled change. The engine emits these after each command; replay must be idempotent.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Op {
-    /// Upsert a mail item (blob stored separately).
+    /// Upsert a mail item (its source and body are in the body store, by key).
     PutMail(Box<MailItem>),
     RemoveMail(ItemId),
     /// Upsert the whole folder table entry.
@@ -155,6 +166,11 @@ pub struct LoadReport {
     pub stale_journal: bool,
     /// Repairs made when the store was opened.
     pub open_repair: Repair,
+    /// The snapshot or journal was written before storage stage S5 and carried message content inline: it was
+    /// moved to the body store, and the next snapshot should be written soon (it no longer holds it).
+    pub legacy_content: bool,
+    /// Items whose inline content was moved to the body store.
+    pub migrated_bodies: usize,
 }
 
 #[derive(Debug)]
@@ -198,48 +214,80 @@ impl Store {
         self.load_report().map(|(mb, _)| mb)
     }
 
-    /// [`Store::load`] plus what recovery did.
+    /// [`Store::load`] plus what recovery did. Message content that a snapshot or journal written before
+    /// storage stage S5 carries inline is moved to the profile's body store on the way (idempotent: the
+    /// content is keyed by its bytes), so the mailbox returned refers to it by key.
     pub fn load_report(&self) -> Result<(Mailbox, LoadReport)> {
-        let (snap_gen, mut mb) = journal::read_snapshot(&self.dir)?;
+        let snap = journal::read_snapshot_full(&self.dir)?;
+        let snap_gen = snap.generation;
+        let mut mb = snap.mailbox;
         let mut report = LoadReport {
             snapshot_generation: snap_gen,
             open_repair: self.repair.clone(),
+            legacy_content: snap.legacy.is_some(),
             ..Default::default()
         };
-        let Some(bytes) =
-            journal::read_capped(&self.dir.join(journal::JOURNAL_FILE), journal::MAX_STATE_BYTES)?
-        else {
-            return Ok((mb, report));
+        let mut pending = match &snap.legacy {
+            Some(bytes) => legacy::snapshot_inline(bytes)?,
+            None => std::collections::BTreeMap::new(),
         };
-        let scan = journal::scan_journal(&bytes);
-        if scan.generation.is_some_and(|g| g < snap_gen) {
-            log::warn!("journal predates the snapshot; ignoring it");
-            report.stale_journal = true;
-            return Ok((mb, report));
+        drop(snap.legacy);
+        let journal_bytes =
+            journal::read_capped(&self.dir.join(journal::JOURNAL_FILE), journal::MAX_STATE_BYTES)?;
+        if let Some(bytes) = journal_bytes {
+            let scan = journal::scan_journal(&bytes);
+            drop(bytes);
+            if scan.generation.is_some_and(|g| g < snap_gen) {
+                log::warn!("journal predates the snapshot; ignoring it");
+                report.stale_journal = true;
+            } else {
+                report.replayed = scan.ops.len();
+                report.skipped_lines = scan.skipped_lines;
+                report.torn_tail = scan.torn_tail;
+                report.legacy_content |= !scan.inline.is_empty();
+                let mut inline = scan.inline.into_iter().peekable();
+                for (i, op) in scan.ops.into_iter().enumerate() {
+                    // What the op replaces loses the content an earlier line carried for it.
+                    match &op {
+                        Op::PutMail(m) => {
+                            pending.remove(&m.id);
+                        }
+                        Op::RemoveMail(id) => {
+                            pending.remove(id);
+                        }
+                        Op::Replace(_) => pending.clear(),
+                        _ => {}
+                    }
+                    while let Some((_, c)) = inline.next_if(|(at, _)| *at == i) {
+                        match c {
+                            legacy::InlineOp::Mail(id, c) => {
+                                pending.insert(id, c);
+                            }
+                            legacy::InlineOp::Mailbox(map) => pending.extend(map),
+                        }
+                    }
+                    op.apply(&mut mb);
+                }
+            }
         }
-        report.replayed = scan.ops.len();
-        report.skipped_lines = scan.skipped_lines;
-        report.torn_tail = scan.torn_tail;
-        for op in scan.ops {
-            op.apply(&mut mb);
+        if report.legacy_content {
+            let mut bodies = BodyStore::on_disk(&self.dir);
+            report.migrated_bodies = legacy::apply(&mut mb, pending, &mut bodies)?;
+            let dated = legacy::fill_expiry(&mut mb, &bodies);
+            log::info!(
+                "moved the message content of {} item(s) out of the snapshot and journal ({dated} expiry \
+                 date(s) read from sources)",
+                report.migrated_bodies
+            );
         }
         Ok((mb, report))
     }
 
-    /// Appends ops to the journal (fsync'd).
-    ///
-    /// Raw sources inside the ops are moved to blobs first; the journal only ever holds blob keys.
+    /// Appends ops to the journal (fsync'd). Items in the ops refer to their content by key: whoever made it
+    /// stored it in the body store first, so the journal never names content that is not on disk.
     pub fn append(&mut self, ops: &[Op]) -> Result<()> {
-        self.append_keyed(ops).map(|_| ())
-    }
-
-    /// [`Store::append`] that also returns where the raw sources inside the ops went: (item, blob key) for
-    /// every mail item whose source the journal now refers to by key. The caller may then drop those
-    /// sources from memory ([`MailItem::raw`]), setting `blob` to the key.
-    pub fn append_keyed(&mut self, ops: &[Op]) -> Result<Vec<(ItemId, String)>> {
-        let mut keys = Vec::new();
         if ops.is_empty() {
-            return Ok(keys);
+            return Ok(());
         }
         if self.journal_stale {
             // A previous checkpoint wrote its snapshot but could not reset the journal.
@@ -251,8 +299,6 @@ impl Store {
         // `Replace` can be as large as the cap) is never built in memory first.
         let mut w = journal::CapWriter::new(Vec::new(), self.journal_cap.saturating_sub(before));
         for op in ops {
-            let stripped = self.externalize(op, &mut keys)?;
-            let op = stripped.as_ref().unwrap_or(op);
             let res = serde_json::to_writer(&mut w, op)
                 .map_err(std::io::Error::from)
                 .and_then(|()| w.write_all(b"\n"));
@@ -277,39 +323,16 @@ impl Store {
             return Err(e.into());
         }
         self.lock.refresh_if_due();
-        Ok(keys)
+        Ok(())
     }
 
-    /// Writes a fresh snapshot of `mb` and truncates the journal.
-    ///
-    /// Raw sources are written to blobs and left out of the snapshot (the snapshot copy gets `blob` set; use
-    /// [`Store::checkpoint_mut`] to also record the keys on `mb` itself).
+    /// Writes a fresh snapshot of `mb` and truncates the journal. Items hold no content, so the mailbox is
+    /// written as it is (no copy).
     pub fn checkpoint(&mut self, mb: &Mailbox) -> Result<()> {
-        let mut copy = mb.clone();
-        self.strip_raws(&mut copy)?;
-        self.write_checkpoint(&copy)
-    }
-
-    /// Like [`Store::checkpoint`] without cloning the mailbox: raw sources are moved to blobs, `item.blob` is set
-    /// on `mb`, and the raws are put back afterwards (or dropped when `drop_raw`).
-    pub fn checkpoint_mut(&mut self, mb: &mut Mailbox, drop_raw: bool) -> Result<()> {
-        let raws = self.strip_raws(mb)?;
-        let res = self.write_checkpoint(mb);
-        if !drop_raw {
-            for (id, raw) in raws {
-                if let Some(item) = mb.mail.get_mut(id) {
-                    item.raw = Some(raw);
-                }
-            }
-        }
-        res
-    }
-
-    fn write_checkpoint(&mut self, stripped: &Mailbox) -> Result<()> {
         let generation = self.generation.saturating_add(1);
         // Past the cap the snapshot is refused (the old snapshot and the journal stay as they are): `load`
         // could not read it back.
-        journal::write_snapshot_capped(&self.dir, generation, stripped, self.snapshot_cap)?;
+        journal::write_snapshot_capped(&self.dir, generation, mb, self.snapshot_cap)?;
         // The snapshot now holds everything; from here on the old journal is stale (open/load ignore it), so
         // nothing may be appended to it even if the reset below fails.
         self.generation = generation;
@@ -326,128 +349,13 @@ impl Store {
         Ok(())
     }
 
-    /// Moves every raw source in `mb` into blobs, setting `item.blob`; returns the removed raws.
-    fn strip_raws(&mut self, mb: &mut Mailbox) -> Result<Vec<(ItemId, Vec<u8>)>> {
-        let mut raws = Vec::new();
-        let mut failure = None;
-        for (id, item) in mb.mail.iter_mut() {
-            if let Some(raw) = item.raw.take() {
-                match self.blob_for(&raw, item.blob.as_deref()) {
-                    Ok(key) => item.blob = Some(key),
-                    Err(e) => {
-                        item.raw = Some(raw);
-                        failure = Some(e);
-                        break;
-                    }
-                }
-                raws.push((id, raw));
-            }
-        }
-        if let Some(e) = failure {
-            // Leave the caller's mailbox as it was.
-            for (id, raw) in raws {
-                if let Some(item) = mb.mail.get_mut(id) {
-                    item.raw = Some(raw);
-                }
-            }
-            return Err(e);
-        }
-        Ok(raws)
-    }
-
-    /// Op with raw sources moved to blobs, or `None` when `op` holds none. The (item, key) of every source
-    /// moved is added to `keys`.
-    fn externalize(&mut self, op: &Op, keys: &mut Vec<(ItemId, String)>) -> Result<Option<Op>> {
-        match op {
-            Op::PutMail(item) if item.raw.is_some() => {
-                let mut copy = (**item).clone();
-                if let Some(raw) = copy.raw.take() {
-                    let key = self.blob_for(&raw, copy.blob.as_deref())?;
-                    keys.push((copy.id, key.clone()));
-                    copy.blob = Some(key);
-                }
-                Ok(Some(Op::PutMail(Box::new(copy))))
-            }
-            Op::Replace(mb) if mb.mail.items().any(|m| m.raw.is_some()) => {
-                let mut copy = (**mb).clone();
-                let moved = self.strip_raws(&mut copy)?;
-                for (id, _) in moved {
-                    if let Some(key) = copy.mail.get(id).and_then(|m| m.blob.clone()) {
-                        keys.push((id, key));
-                    }
-                }
-                Ok(Some(Op::Replace(Box::new(copy))))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Reuses `existing` when it is the key of `raw` and its file is present with the right length (a cheap
-    /// check that catches truncation without re-reading every blob on every checkpoint); otherwise stores
-    /// `raw`, which verifies and repairs the file.
-    fn blob_for(&mut self, raw: &[u8], existing: Option<&str>) -> Result<String> {
-        if let Some(key) = existing.and_then(BlobKey::parse)
-            && key.matches(raw)
-            && fs::metadata(key.path(&self.dir)).is_ok_and(|m| m.is_file() && m.len() == key.len)
-        {
-            return Ok(key.to_string());
-        }
-        self.put_blob(raw)
-    }
-
     /// Stores a raw message; returns its blob key.
     pub fn put_blob(&mut self, raw: &[u8]) -> Result<String> {
-        if raw.len() > MAX_BLOB_BYTES {
-            return Err(StoreError::Io(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!("blob of {} bytes exceeds the {MAX_BLOB_BYTES} byte cap", raw.len()),
-            )));
-        }
-        let base = BlobKey::for_data(raw);
-        for probe in 0..=blob::MAX_PROBES {
-            let key = base.with_probe(probe);
-            let path = key.path(&self.dir);
-            // The key carries the length: a file of any other size is damaged (and may be too big to read).
-            let existing = match fs::metadata(&path) {
-                Ok(m) if m.is_file() && m.len() == key.len => journal::read_capped(&path, key.len)?,
-                Ok(_) => {
-                    log::warn!("blob {key} has the wrong size; rewriting it");
-                    None
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => None,
-                Err(e) => return Err(e.into()),
-            };
-            match existing {
-                Some(existing) if existing == raw => return Ok(key.to_string()),
-                Some(existing) if key.matches(&existing) => {
-                    log::warn!("blob hash collision on {key}; probing");
-                    continue;
-                }
-                Some(_) => {
-                    log::warn!("blob {key} was damaged; rewriting it");
-                }
-                None => {}
-            }
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            journal::write_atomic(&path, |w| w.write_all(raw))?;
-            return Ok(key.to_string());
-        }
-        Err(StoreError::Corrupt(format!("too many blob collisions for {base}")))
+        BodyStore::on_disk(&self.dir).put_source(raw)
     }
 
     pub fn get_blob(&self, key: &str) -> Result<Vec<u8>> {
-        let parsed = BlobKey::parse(key)
-            .ok_or_else(|| StoreError::Corrupt(format!("invalid blob key {:?}", trunc(key))))?;
-        let data =
-            journal::read_capped(&parsed.path(&self.dir), parsed.len.min(blob_cap()))?.ok_or_else(|| {
-                StoreError::Io(std::io::Error::new(ErrorKind::NotFound, format!("blob {parsed}")))
-            })?;
-        if !parsed.matches(&data) {
-            return Err(StoreError::Corrupt(format!("blob {parsed} does not match its key")));
-        }
-        Ok(data)
+        bodies::disk_get(&self.dir, key, bodies::SOURCE_EXT, MAX_BLOB_BYTES)
     }
 
     /// True when the blob exists on disk (not verified).
@@ -455,40 +363,20 @@ impl Store {
         BlobKey::parse(key).is_some_and(|k| k.path(&self.dir).is_file())
     }
 
-    /// The raw source of `item`: its in-memory `raw`, else its blob. `Ok(None)` when it has neither.
+    /// The raw source of `item` from its blob. `Ok(None)` when it has none.
     pub fn raw_of(&self, item: &MailItem) -> Result<Option<Vec<u8>>> {
-        if let Some(raw) = &item.raw {
-            return Ok(Some(raw.clone()));
-        }
         match &item.blob {
             Some(key) => self.get_blob(key).map(Some),
             None => Ok(None),
         }
     }
 
-    /// The first `cap` bytes of `item`'s raw source (its in-memory `raw`, else its blob), for a header scan
-    /// that should not read whole messages. Unlike [`Store::raw_of`] the bytes are not checked against the
-    /// blob key (that needs the whole file); a blob shorter than its key says is reported as corrupt.
-    /// `Ok(None)` when the item has no source.
+    /// The first `cap` bytes of `item`'s source, for a header scan that should not read whole messages.
+    /// Unlike [`Store::raw_of`] the bytes are not checked against the blob key (that needs the whole file); a
+    /// blob shorter than its key says is reported as corrupt. `Ok(None)` when the item has no source.
     pub fn head_of(&self, item: &MailItem, cap: usize) -> Result<Option<Vec<u8>>> {
-        if let Some(raw) = &item.raw {
-            return Ok(Some(raw.get(..raw.len().min(cap)).unwrap_or_default().to_vec()));
-        }
         let Some(key) = &item.blob else { return Ok(None) };
-        let parsed = BlobKey::parse(key)
-            .ok_or_else(|| StoreError::Corrupt(format!("invalid blob key {:?}", trunc(key))))?;
-        let f = match File::open(parsed.path(&self.dir)) {
-            Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let want = parsed.len.min(u64::try_from(cap).unwrap_or(u64::MAX));
-        let mut buf = Vec::with_capacity(usize::try_from(want).unwrap_or(0));
-        std::io::Read::read_to_end(&mut std::io::Read::take(f, want), &mut buf)?;
-        if u64::try_from(buf.len()).unwrap_or(u64::MAX) < want {
-            return Err(StoreError::Corrupt(format!("blob {parsed} is shorter than its key says")));
-        }
-        Ok(Some(buf))
+        bodies::disk_head(&self.dir, key, bodies::SOURCE_EXT, cap)
     }
 
     /// Current size of the journal file in bytes (0 when it cannot be read).
@@ -531,50 +419,48 @@ impl Store {
         &self.repair
     }
 
-    /// Imports one `.eml` file into `folder`: the raw source goes to the blob store (`item.blob` set, `item.raw`
-    /// kept). Not journaled: the caller appends `Op::PutMail` (or checkpoints) as for any other change.
+    /// Imports one `.eml` file into `folder`: the raw source goes to the profile's body store (`item.blob`
+    /// set). Not journaled: the caller appends `Op::PutMail` (or checkpoints) as for any other change.
     pub fn import_eml(&mut self, mb: &mut Mailbox, path: &Path, folder: FolderId) -> Result<ItemId> {
-        let mut item = import::read_eml(path, folder)?;
-        if let Some(raw) = &item.raw {
-            item.blob = Some(self.put_blob(raw)?);
-        }
-        import::insert_item(mb, item)
+        let mut bodies = BodyStore::on_disk(&self.dir);
+        import::import_eml(mb, &mut bodies, path, folder)
     }
 
-    /// [`export_mbox`] that also reads sources from the blob store.
+    /// [`export_mbox`] reading the content from the profile's body store.
     pub fn export_mbox(&self, items: &[&MailItem], file: &Path) -> Result<()> {
-        write_mbox(items, file, |item| match self.raw_of(item) {
-            Ok(raw) => raw,
-            Err(e) => {
-                log::warn!("export: source of item {:?} unavailable ({e}); rebuilding from fields", item.id);
-                None
-            }
-        })
+        export_mbox(items, &BodyStore::on_disk(&self.dir), file)
     }
 
-    /// Reads the recoverable-items bin (`Ok(default)` when there is none yet).
+    /// Reads the recoverable-items bin (`Ok(default)` when there is none yet). Content a bin written before
+    /// storage stage S5 carries inline is moved to the profile's body store on the way (the file itself is
+    /// rewritten by the next [`Store::save_recoverable`]).
     pub fn load_recoverable(&self) -> Result<RecoverBin> {
         let path = self.dir.join(RECOVERABLE_FILE);
-        match journal::read_capped(&path, MAX_RECOVERABLE_BYTES)? {
-            None => Ok(RecoverBin::default()),
-            Some(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| StoreError::Corrupt(format!("{}: {e}", path.display()))),
-        }
-    }
-
-    /// Writes the recoverable-items bin atomically. Raw message sources go to the blob store (the file keeps
-    /// blob keys only). Once the file is written, the mail entries of `bin` hold their blob key instead of
-    /// the source, so later saves do not store it again (a failed write leaves `bin` as it was).
-    pub fn save_recoverable(&mut self, bin: &mut RecoverBin) -> Result<()> {
-        let mut copy = bin.clone();
-        for e in &mut copy.items {
-            if let DeletedItem::Mail(m) = &mut e.item
-                && let Some(raw) = m.raw.take()
-            {
-                m.blob = Some(self.blob_for(&raw, m.blob.as_deref())?);
+        let Some(bytes) = journal::read_capped(&path, MAX_RECOVERABLE_BYTES)? else {
+            return Ok(RecoverBin::default());
+        };
+        let mut bin: RecoverBin = serde_json::from_slice(&bytes)
+            .map_err(|e| StoreError::Corrupt(format!("{}: {e}", path.display())))?;
+        if legacy::has_inline(&bytes) {
+            let inline = legacy::recoverable_inline(&bytes)?;
+            drop(bytes);
+            let mut bodies = BodyStore::on_disk(&self.dir);
+            for (i, id, content) in inline {
+                if let Some(e) = bin.items.get_mut(i)
+                    && let DeletedItem::Mail(m) = &mut e.item
+                    && m.id == id
+                {
+                    legacy::store_inline(m, content, &mut bodies)?;
+                }
             }
         }
-        let bytes = serde_json::to_vec(&copy).map_err(std::io::Error::other)?;
+        Ok(bin)
+    }
+
+    /// Writes the recoverable-items bin atomically. Its mail entries refer to their content in the body store
+    /// by key (the store's collection keeps what they refer to).
+    pub fn save_recoverable(&mut self, bin: &mut RecoverBin) -> Result<()> {
+        let bytes = serde_json::to_vec(&*bin).map_err(std::io::Error::other)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECOVERABLE_BYTES {
             return Err(StoreError::TooLarge(format!(
                 "the recoverable items would take {} bytes, past the {MAX_RECOVERABLE_BYTES} byte cap",
@@ -582,78 +468,23 @@ impl Store {
             )));
         }
         journal::write_atomic(&self.dir.join(RECOVERABLE_FILE), |w| w.write_all(&bytes))?;
-        // The file now references these blobs (so collection keeps them): the sources can leave memory.
-        for (e, saved) in bin.items.iter_mut().zip(copy.items) {
-            if let (DeletedItem::Mail(m), DeletedItem::Mail(saved)) = (&mut e.item, saved.item)
-                && m.raw.is_some()
-                && m.id == saved.id
-                && saved.blob.is_some()
-            {
-                m.raw = None;
-                m.blob = saved.blob;
-            }
-        }
         Ok(())
     }
 
-    /// Deletes blobs not referenced by `mb` (which must be the complete current state) or by the
-    /// recoverable-items bin, and leftover temp files. Returns the number of blobs removed.
-    pub fn gc_blobs(&mut self, mb: &Mailbox) -> Result<usize> {
+    /// Deletes stored content (sources and body records) referred to neither by `mb` (which must be the
+    /// complete current state), nor by the recoverable-items bin, nor by a key in `also` (the undo history),
+    /// and leftover temp files. Returns the number of files removed.
+    pub fn gc_blobs(&mut self, mb: &Mailbox, also: &BTreeSet<String>) -> Result<usize> {
         // A bin that cannot be read keeps every blob (nothing it may still need is removed).
         let bin = self.load_recoverable()?;
-        let mut live: BTreeSet<&str> = mb.mail.items().filter_map(|m| m.blob.as_deref()).collect();
-        live.extend(bin.items.iter().filter_map(|e| match &e.item {
-            DeletedItem::Mail(m) => m.blob.as_deref(),
+        let mut live = bodies::keys_of(mb.mail.items());
+        live.extend(bodies::keys_of(bin.items.iter().filter_map(|e| match &e.item {
+            DeletedItem::Mail(m) => Some(&**m),
             _ => None,
-        }));
-        // Items still holding their source may have been journaled or snapshotted with a blob key the caller
-        // never saw (`append` / `checkpoint` set it on their own copy): every probe of that content is live.
-        let live_content: BTreeSet<(u64, u64)> = mb
-            .mail
-            .items()
-            .filter_map(|m| m.raw.as_deref())
-            .map(|raw| {
-                let k = BlobKey::for_data(raw);
-                (k.hash, k.len)
-            })
-            .collect();
-        let mut removed = 0usize;
-        let root = self.dir.join(blob::BLOBS_DIR);
-        let fans = match fs::read_dir(&root) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e.into()),
-        };
-        for fan in fans {
-            let fan = fan?;
-            if !fan.file_type()?.is_dir() {
-                continue;
-            }
-            for entry in fs::read_dir(fan.path())? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') && name.contains(".tmp-") {
-                    let _ = fs::remove_file(entry.path());
-                    continue;
-                }
-                let Some(key) = name.strip_suffix(".eml") else { continue };
-                let Some(parsed) = BlobKey::parse(key) else { continue };
-                if !live.contains(key) && !live_content.contains(&(parsed.hash, parsed.len)) {
-                    fs::remove_file(entry.path())?;
-                    removed += 1;
-                }
-            }
-        }
-        Ok(removed)
+        })));
+        live.extend(also.iter().cloned());
+        BodyStore::on_disk(&self.dir).collect(&live)
     }
-}
-
-fn blob_cap() -> u64 {
-    u64::try_from(MAX_BLOB_BYTES).unwrap_or(u64::MAX)
-}
-
-fn trunc(s: &str) -> String {
-    s.chars().take(64).collect()
 }
 
 /// Removes temp files left by a crash during an atomic write (only our own naming pattern).
@@ -675,35 +506,49 @@ fn remove_temp_files(dir: &Path) {
 ///
 /// Reads `new/` (unread) and `cur/` (flags from the `:2,` info: S read, F flagged, R replied, P forwarded,
 /// D draft; T trashed messages are skipped). `received` is the delivery time from the unique file name, else
-/// the file's mtime. Items keep their `raw` source; a later checkpoint moves it to the blob store.
-/// Unreadable or oversized files are skipped; the import stops (with a warning) once
-/// [`import::MAX_IMPORT_BYTES`] of source is held.
-pub fn import_maildir(mb: &mut Mailbox, dir: &Path, folder: FolderId) -> Result<Vec<ItemId>> {
-    import::import_maildir(mb, dir, folder)
+/// the file's mtime. Each source goes straight to `bodies` (items hold its key, not the bytes). Unreadable or
+/// oversized files are skipped; the import stops (with a warning) after [`import::MAX_IMPORT_BYTES`] of
+/// source.
+pub fn import_maildir(
+    mb: &mut Mailbox,
+    bodies: &mut BodyStore,
+    dir: &Path,
+    folder: FolderId,
+) -> Result<Vec<ItemId>> {
+    import::import_maildir(mb, bodies, dir, folder)
 }
 
 /// Imports an MBOX file into `folder`; returns new item ids.
 ///
-/// `received` comes from the `From ` line date; `Status`/`X-Status` headers set read/flag/replied state.
-/// Messages over the size cap are skipped with a warning; the import stops (with a warning) after
-/// [`mbox::MAX_MESSAGES`] messages or once [`import::MAX_IMPORT_BYTES`] of source is held.
-pub fn import_mbox(mb: &mut Mailbox, file: &Path, folder: FolderId) -> Result<Vec<ItemId>> {
-    import::import_mbox(mb, file, folder)
-}
-
-/// Exports items (with `raw` when present, else rebuilt from fields) as mboxrd.
-pub fn export_mbox(items: &[&MailItem], file: &Path) -> Result<()> {
-    write_mbox(items, file, |item| item.raw.clone())
-}
-
-fn write_mbox(
-    items: &[&MailItem],
+/// `received` comes from the `From ` line date; `Status`/`X-Status` headers set read/flag/replied state. Each
+/// source goes straight to `bodies`. Messages over the size cap are skipped with a warning; the import stops
+/// (with a warning) after [`mbox::MAX_MESSAGES`] messages or [`import::MAX_IMPORT_BYTES`] of source.
+pub fn import_mbox(
+    mb: &mut Mailbox,
+    bodies: &mut BodyStore,
     file: &Path,
-    resolve: impl Fn(&MailItem) -> Option<Vec<u8>>,
-) -> Result<()> {
+    folder: FolderId,
+) -> Result<Vec<ItemId>> {
+    import::import_mbox(mb, bodies, file, folder)
+}
+
+/// Exports items as mboxrd: each item's source from `bodies`, else a message rebuilt from its fields and body.
+pub fn export_mbox(items: &[&MailItem], bodies: &BodyStore, file: &Path) -> Result<()> {
     journal::write_atomic(file, |w| {
         for item in items {
-            let data = resolve(item).unwrap_or_else(|| rebuild_message(item));
+            let data = match bodies.source_of(item) {
+                Ok(Some(raw)) => raw,
+                other => {
+                    if let Err(e) = other {
+                        log::warn!(
+                            "export: source of item {:?} unavailable ({e}); rebuilding from fields",
+                            item.id
+                        );
+                    }
+                    let body = bodies.body_of(item).ok().flatten();
+                    rebuild_message(item, body.as_deref())
+                }
+            };
             let sender = item.from.as_ref().or(item.sender.as_ref()).map(|m| m.addr.as_str()).unwrap_or("");
             let date =
                 if item.received.unix != 0 { item.received } else { item.sent.unwrap_or(item.received) };
@@ -713,8 +558,8 @@ fn write_mbox(
     })
 }
 
-/// Rebuilds RFC 5322 bytes from an item's fields (the message builder, with a minimal fallback).
-pub fn rebuild_message(item: &MailItem) -> Vec<u8> {
+/// Rebuilds RFC 5322 bytes from an item's fields and its body (the message builder, with a minimal fallback).
+pub fn rebuild_message(item: &MailItem, body: Option<&Body>) -> Vec<u8> {
     use mailcraft_mime::{Address, MessageBuilder};
     let addrs = |v: &[mailcraft_mime::Mailbox]| v.iter().cloned().map(Address::Mailbox).collect::<Vec<_>>();
     let builder = MessageBuilder {
@@ -734,13 +579,13 @@ pub fn rebuild_message(item: &MailItem) -> Vec<u8> {
             Importance::Low => Some("low".into()),
             Importance::Normal => None,
         },
-        text: item.body.text.clone(),
-        html: item.body.html.clone(),
+        text: body.and_then(|b| b.text.clone()),
+        html: body.and_then(|b| b.html.clone()),
         keep_bcc: true,
         ..Default::default()
     };
     let built = builder.build();
-    if built.is_empty() { minimal_message(item) } else { built }
+    if built.is_empty() { minimal_message(item, body) } else { built }
 }
 
 fn header_safe(s: &str) -> String {
@@ -748,7 +593,7 @@ fn header_safe(s: &str) -> String {
 }
 
 /// Plain UTF-8 message (RFC 6532 headers, 8bit body) used when the builder produced nothing.
-fn minimal_message(item: &MailItem) -> Vec<u8> {
+fn minimal_message(item: &MailItem, body: Option<&Body>) -> Vec<u8> {
     let list = |v: &[mailcraft_mime::Mailbox]| {
         v.iter().map(|m| header_safe(&m.to_display_string())).collect::<Vec<_>>().join(", ")
     };
@@ -768,7 +613,9 @@ fn minimal_message(item: &MailItem) -> Vec<u8> {
         out.push_str(&format!("Message-ID: <{}>\r\n", header_safe(id)));
     }
     out.push_str("MIME-Version: 1.0\r\n");
-    let (ctype, body) = match (&item.body.text, &item.body.html) {
+    let none = (None, None);
+    let parts = body.map_or(none, |b| (b.text.as_ref(), b.html.as_ref()));
+    let (ctype, body) = match parts {
         (Some(t), _) => ("text/plain", t.as_str()),
         (None, Some(h)) => ("text/html", h.as_str()),
         (None, None) => ("text/plain", item.preview.as_str()),

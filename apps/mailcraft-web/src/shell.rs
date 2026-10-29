@@ -4,12 +4,13 @@
 //! - **Clock.** `std::time::SystemTime::now()` is not available in the browser, so every frame sets the
 //!   session's clock (`Session::fixed_now`) from [`Host::now_ms`] (JavaScript `Date.now()`) before the UI runs.
 //! - **Storage.** Commands journal their changes into `Session::pending_ops`; with no store attached the shell
-//!   takes them as "the mailbox changed", and writes the whole mailbox ([`crate::persist`]) to
+//!   takes them as "the mailbox changed", and writes the whole mailbox and its message content
+//!   ([`crate::persist`]) to
 //!   [`Host::save`] [`SAVE_DELAY_MS`] after the first unsaved change, or at once when the page loses focus.
 //!
 //! Target-independent so it is unit-tested natively with an in-memory host.
 
-use mailcraft_engine::model::{DateTime, Mailbox};
+use mailcraft_engine::model::DateTime;
 use mailcraft_engine::{Notice, Session};
 use mailcraft_ui_egui::App;
 
@@ -45,14 +46,17 @@ pub fn datetime_from_ms(ms: f64) -> DateTime {
 /// be read.
 pub fn open_session(host: &impl Host) -> Session {
     let now = datetime_from_ms(host.now_ms());
-    let (mailbox, problem) = match host.load() {
+    let (mut s, problem) = match host.load() {
         Some(text) => match persist::decode(&text) {
-            Ok(mb) => (mb, None),
+            Ok((mailbox, bodies)) => {
+                let mut s = Session::new(mailbox);
+                s.bodies = bodies;
+                (s, None)
+            }
             Err(e) => (sample(now), Some(e)),
         },
         None => (sample(now), None),
     };
-    let mut s = Session::new(mailbox);
     s.fixed_now = Some(now);
     s.tz_offset_min = host.tz_offset_min().clamp(-MAX_TZ_MIN, MAX_TZ_MIN);
     if let Some(e) = problem {
@@ -61,8 +65,8 @@ pub fn open_session(host: &impl Host) -> Session {
     s
 }
 
-fn sample(now: DateTime) -> Mailbox {
-    mailcraft_engine::sample::sample_mailbox(now)
+fn sample(now: DateTime) -> Session {
+    mailcraft_engine::sample::sample_session_at(now)
 }
 
 /// The browser app: UI + host + autosave bookkeeping.
@@ -120,7 +124,8 @@ impl<H: Host> WebShell<H> {
         }
         // A failed save is not retried until the next change (a full storage quota will not empty itself).
         self.dirty_since = None;
-        let result = persist::encode(&self.app.s.mailbox).and_then(|text| self.host.save(&text));
+        let result =
+            persist::encode(&self.app.s.mailbox, &self.app.s.bodies).and_then(|text| self.host.save(&text));
         match result {
             Ok(()) => self.save_failed = false,
             Err(e) => {
@@ -186,7 +191,7 @@ mod tests {
         }
     }
 
-    fn replace(mb: &Mailbox) -> mailcraft_store::Op {
+    fn replace(mb: &mailcraft_engine::model::Mailbox) -> mailcraft_store::Op {
         mailcraft_store::Op::Replace(Box::new(mb.clone()))
     }
 
@@ -244,9 +249,13 @@ mod tests {
         assert_eq!(h.saves.get(), 1);
         assert!(!shell.dirty());
 
-        // A new page load opens what was saved.
+        // A new page load opens what was saved, message content included.
         let again = WebShell::new(h.clone());
         assert_eq!(again.app.s.mailbox, shell.app.s.mailbox);
+        for m in shell.app.s.mailbox.mail.items() {
+            assert_eq!(again.app.s.body_text(m), shell.app.s.body_text(m), "{}", m.subject);
+        }
+        assert!(shell.app.s.mailbox.mail.items().any(|m| !again.app.s.body_text(m).is_empty()));
     }
 
     #[test]

@@ -244,7 +244,7 @@ fn scheduling(s: &mut Session, ids: &[ItemId], report: &mut ArrivalReport) {
     if delete_plain {
         let gone: Vec<ItemId> = plain
             .into_iter()
-            .filter(|id| s.mailbox.mail.get(*id).is_some_and(|m| !has_comments(m)))
+            .filter(|id| s.mailbox.mail.get(*id).is_some_and(|m| !has_comments(s, m)))
             .collect();
         delete(s, &gone, report);
     }
@@ -271,7 +271,7 @@ fn tracking(s: &mut Session, ids: &[ItemId], report: &mut ArrivalReport) {
         if delete_plain
             && refers_to_mine(m)
             && crate::cmd::compose::raw_headers(&raw).text(crate::cmd::compose::VOTE_HEADER).is_some()
-            && !has_comments(m)
+            && !has_comments(s, m)
         {
             votes.push(*id);
             continue;
@@ -313,8 +313,8 @@ fn delete(s: &mut Session, ids: &[ItemId], report: &mut ArrivalReport) {
 
 /// Whether a response adds text of its own (the quoted original, from its "From:" header block or "> "
 /// lines on, does not count).
-fn has_comments(m: &MailItem) -> bool {
-    !crate::settings::new_text_of_reply(&m.body_text()).trim().is_empty()
+fn has_comments(s: &Session, m: &MailItem) -> bool {
+    !crate::settings::new_text_of_reply(&s.body_text(m)).trim().is_empty()
 }
 
 /// The Message-ID key the mail table matches by (no brackets, lower-case).
@@ -421,7 +421,7 @@ mod tests {
         let msg = mailcraft_mime::parse(raw.as_bytes()).unwrap();
         let mut item = MailItem::from_message(&msg, raw.as_bytes(), s.now());
         item.folder = role(s, FolderRole::Inbox);
-        s.mailbox.add_mail(item)
+        s.add_message(item, &mailcraft_store::Content::source(raw.as_bytes().to_vec())).unwrap()
     }
 
     /// A message I sent (in Sent Items) with Message-ID `<id>`.

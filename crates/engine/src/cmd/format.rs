@@ -2941,7 +2941,8 @@ fn message_matches(s: &Session, id: u64, needle: &str, match_case: bool) -> usiz
     if needle.is_empty() {
         return 0;
     }
-    let text = match (&m.body.html, &m.body.text) {
+    let body = s.body_or_empty(m);
+    let text = match (&body.html, &body.text) {
         (Some(h), _) if h.len() <= MAX_TEXT => mailcraft_html::html_to_text(h),
         (_, Some(t)) => t.chars().take(MAX_TEXT).collect(),
         _ => String::new(),
@@ -3362,7 +3363,7 @@ fn selection_pane(s: &mut Session, p: &Value) -> CmdResult {
             .mailbox
             .mail
             .get(mailcraft_model::ItemId(id))
-            .map(|m| doc_objects(&crate::cmd::mail::body_doc(m)))
+            .map(|m| doc_objects(&crate::cmd::mail::body_doc(&s.body_or_empty(m))))
             .unwrap_or_default();
         let names: Vec<&str> = objects.iter().map(|o| o.name.as_str()).collect();
         if let Some(n) = opt_u64(p, "select") {
@@ -4229,7 +4230,7 @@ mod tests {
         s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
         assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
         let m = s.mailbox.mail.items().filter(|m| !m.is_draft).max_by_key(|m| m.id).unwrap();
-        m.body.html.clone().unwrap()
+        s.body_now(m.id).html.clone().unwrap()
     }
 
     #[test]
@@ -4503,14 +4504,8 @@ mod tests {
         let cids: Vec<String> = c.inline_images.iter().map(|i| i.content_id.clone()).collect();
         s.run("compose.setTo", &json!({"value": "a@example.org"})).unwrap();
         s.run("compose.send", &json!({})).unwrap();
-        let out = s
-            .mailbox
-            .mail
-            .items()
-            .filter_map(|m| m.raw.as_ref())
-            .map(|r| String::from_utf8_lossy(r).into_owned())
-            .find(|r| r.contains("Content-ID"))
-            .unwrap();
+        let out =
+            s.mailbox.mail.items().map(|m| s.source_text(m.id)).find(|r| r.contains("Content-ID")).unwrap();
         for cid in &cids {
             assert!(out.contains(&format!("<{cid}>")), "{out}");
         }
@@ -5607,7 +5602,7 @@ mod pane_tests {
             .mail
             .items()
             .find_map(|m| {
-                let t = m.body.text.clone()?;
+                let t = s.body_now(m.id).text.clone()?;
                 let w = t
                     .split_whitespace()
                     .find(|w| w.len() > 4 && w.chars().all(char::is_alphabetic))?

@@ -783,8 +783,7 @@ fn pop3_job(
     let folders: BTreeSet<FolderId> =
         s.mailbox.folders.values().filter(|f| f.account == a.id).map(|f| f.id).collect();
     let prefs = &s.sync.prefs.data;
-    let header_only =
-        |m: &MailItem| prefs.headers_only.contains(&m.id.0) && m.raw.is_none() && m.blob.is_none();
+    let header_only = |m: &MailItem| prefs.headers_only.contains(&m.id.0) && m.blob.is_none();
     // Unique id → (item, downloaded in full).
     let mut local: BTreeMap<String, (ItemId, bool)> = BTreeMap::new();
     for m in s.mailbox.mail.items().filter(|m| folders.contains(&m.folder)) {
@@ -2298,13 +2297,19 @@ fn oauth_done(s: &mut Session, account: AccountId, result: Result<TokenSet, Stri
     }
 }
 
-/// Replaces a header-only item's content with the whole message, keeping its id, folder and state.
+/// Replaces a header-only item's content with the whole message, keeping its id, folder and state. The
+/// source goes to the body store first; when that fails the item stays as it was (false).
 fn fill_item(s: &mut Session, id: ItemId, raw: &[u8]) -> bool {
     let now = s.now();
     let Some(old) = s.mailbox.mail.get(id).cloned() else { return false };
     let mut full = mailcraft_store::import::item_from_raw(raw, old.folder, now);
+    if let Err(e) = s.store_source(&mut full, raw) {
+        log::error!("could not store the downloaded message {}: {e}", id.0);
+        return false;
+    }
     full.keep_local_state(&old);
     s.mailbox.mail.insert(id, full);
+    crate::offline::arrived(s, id);
     let p = crate::accounts::prefs(s);
     p.headers_only.remove(&id.0);
     p.marked.remove(&id.0);
@@ -2313,13 +2318,26 @@ fn fill_item(s: &mut Session, id: ItemId, raw: &[u8]) -> bool {
 
 /// A header-only download: the item shows its header; body, source and attachments come later.
 fn strip_to_header(s: &mut Session, item: &mut MailItem, size: Option<u64>) {
-    item.raw = None;
-    item.body = Default::default();
+    item.blob = None;
+    item.body_key = None;
     item.preview.clear();
     if let Some(n) = size {
         item.size = n;
     }
     let _ = s;
+}
+
+/// Stores the downloaded `raw` as `item`'s source; when the body store refuses it (a full disk), the item
+/// is kept as a header-only download instead (the server still has the message), and false comes back.
+fn store_downloaded(s: &mut Session, item: &mut MailItem, raw: &[u8], size: Option<u64>) -> bool {
+    match s.store_source(item, raw) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("could not store a downloaded message ({e}); keeping its header only");
+            strip_to_header(s, item, size);
+            false
+        }
+    }
 }
 
 /// The IMAP part of a server search for account `a`: the folders of the request that are on the server and
@@ -2443,6 +2461,14 @@ fn apply_pop3_new(
     item.remote_id = Some(format!("{POP3_PREFIX}{uidl}"));
     if headers_only {
         strip_to_header(s, &mut item, size);
+    } else if let Err(e) = s.store_source(&mut item, raw) {
+        // A POP3 server may delete what was downloaded: the message is not taken in, so the next run
+        // downloads it again.
+        log::error!("could not store a downloaded message ({e}); it is downloaded again next time");
+        if let Some(p) = crate::accounts::prefs(s).pop3.get_mut(&account.0) {
+            p.seen.remove(uidl);
+        }
+        return;
     }
     let id = s.mailbox.add_mail(item);
     if headers_only {
@@ -2594,14 +2620,17 @@ fn message_sent(s: &mut Session, account: AccountId, item: ItemId, result: Resul
                             let out = crate::cmd::compose::strip_submit_headers(&r);
                             (out.len() != r.len()).then_some(out)
                         });
-                    if let Some(m) = s.mailbox.mail.get_mut(item) {
+                    if let Some(mut m) = s.mailbox.mail.get(item).cloned() {
                         m.folder = sent;
                         m.read = true;
                         m.remote_id = None;
                         if let Some(r) = stripped {
-                            m.size = u64::try_from(r.len()).unwrap_or(m.size);
-                            m.raw = Some(r);
+                            match s.store_source(&mut m, &r) {
+                                Ok(()) => m.size = u64::try_from(r.len()).unwrap_or(m.size),
+                                Err(e) => log::warn!("the sent copy keeps its submission headers ({e})"),
+                            }
                         }
+                        s.mailbox.mail.insert(item, m);
                     }
                 }
                 // The server files its own copy (downloaded by the next update of Sent Items).
@@ -2633,10 +2662,15 @@ fn run_done(s: &mut Session, account: AccountId, error: Option<String>) {
             run.blocked_until = now.saturating_add(BLOCKED_RETRY_SECS.min(60));
         }
         None => {
-            if run.error.is_none() {
+            let ok = run.error.is_none();
+            if ok {
                 run.last_sync = Some(now);
             }
             run.blocked_until = 0;
+            if ok {
+                // The account is reachable: its offline window may take old bodies off (`offline.rs`).
+                crate::offline::note_run_done(s, account);
+            }
         }
     }
     if let Some(again) = s.sync.runs.get_mut(&account).and_then(|r| r.again.take())
@@ -2890,11 +2924,14 @@ pub(super) fn apply_delta(
         if let Some(size) = nm.size {
             item.size = size;
         }
-        if nm.headers_only {
+        let headers_only = if nm.headers_only {
             strip_to_header(s, &mut item, nm.size);
-        }
+            true
+        } else {
+            !store_downloaded(s, &mut item, &nm.raw, nm.size)
+        };
         let id = s.mailbox.add_mail(item);
-        if nm.headers_only {
+        if headers_only {
             crate::accounts::prefs(s).headers_only.insert(id.0);
         }
         s.sync.track.created.insert(id);
@@ -3147,7 +3184,7 @@ mod tests {
             }],
         );
         let id = find_pop3(&s, acct, "h1").unwrap();
-        assert!(s.mailbox.mail.get(id).unwrap().body.text.is_none(), "header only");
+        assert!(s.body_now(id).text.is_none(), "header only");
         s.run("mail.pin", &json!({"ids": [id.0], "on": true})).unwrap();
         let vote = mailcraft_model::VoteRecord {
             from: "bo@example.org".into(),
@@ -3161,7 +3198,7 @@ mod tests {
         // Mark to Download: the whole message arrives for the same item.
         apply_all(&mut s, vec![Event::Pop3Full { account: acct, uidl: "h1".into(), raw }]);
         let m = s.mailbox.mail.get(id).unwrap();
-        assert!(m.body.text.as_deref().is_some_and(|t| t.contains("Hi.")), "the body is filled in");
+        assert!(s.body_now(id).text.as_deref().is_some_and(|t| t.contains("Hi.")), "the body is filled in");
         assert!(m.pinned, "still pinned");
         assert_eq!(m.votes, [vote]);
         assert_eq!(m.categories, ["Blue"]);
@@ -3264,9 +3301,8 @@ mod tests {
                 "From: me@example.net\r\nTo: {to}\r\nSubject: Report\r\n{extra}\
                  Content-Type: text/plain\r\n\r\nBody\r\n"
             );
-            let mut item = mailcraft_store::import::item_from_raw(raw.as_bytes(), outbox, s.now());
-            item.raw = Some(raw.into_bytes());
-            s.mailbox.add_mail(item)
+            let item = mailcraft_store::import::item_from_raw(raw.as_bytes(), outbox, s.now());
+            s.add_message(item, &mailcraft_store::Content::source(raw.into_bytes())).unwrap()
         };
         let dropped = queued(&mut s, "X-MailCraft-Submit-Save-Sent: none\r\n", "bo@example.org");
         let filed =
@@ -3281,7 +3317,7 @@ mod tests {
         assert!(!s.mailbox.mail.contains(dropped), "Do Not Save");
         let m = s.mailbox.mail.get(filed).unwrap();
         assert_eq!(m.folder, sent_folder);
-        let raw = String::from_utf8(m.raw.clone().unwrap()).unwrap();
+        let raw = String::from_utf8(s.source(m.id).unwrap().unwrap()).unwrap();
         assert!(!raw.contains("X-MailCraft-Submit"), "{raw}");
         assert!(raw.contains("Subject: Report"));
         let safe = s.run("mail.junk", &json!({"action": "get"})).unwrap();
@@ -3299,9 +3335,8 @@ mod tests {
         let outbox = s.mailbox.role_folder(acct, FolderRole::Outbox).unwrap();
         let raw = "From: me@bücher.example\r\nTo: ann@例え.example, Ann@例え.example\r\n\
                    Cc: bo@example.org\r\nSubject: Hello\r\n\r\nBody\r\n";
-        let mut item = mailcraft_store::import::item_from_raw(raw.as_bytes(), outbox, s.now());
-        item.raw = Some(raw.as_bytes().to_vec());
-        s.mailbox.add_mail(item);
+        let item = mailcraft_store::import::item_from_raw(raw.as_bytes(), outbox, s.now());
+        s.add_message(item, &mailcraft_store::Content::source(raw.as_bytes().to_vec())).unwrap();
         let envelope = |s: &Session| {
             let a = s.mailbox.account(acct).unwrap();
             let out = outgoing_items(s, a, &Plan::all(), s.now().unix);
@@ -3586,8 +3621,8 @@ mod tests {
         crate::accounts::prefs(&mut s).headers_only.insert(id.0);
         let raw = b"From: a@example.com\r\nSubject: Headers only\r\n\r\nThe whole body\r\n";
         assert!(fill_item(&mut s, id, raw));
+        assert_eq!(s.body_now(id).text.as_deref().map(str::trim), Some("The whole body"));
         let m = s.mailbox.mail.get(id).unwrap();
-        assert_eq!(m.body.text.as_deref().map(str::trim), Some("The whole body"));
         assert!(m.no_auto_archive && m.ignored && m.read);
         assert_eq!(m.remote_id.as_deref(), Some("5"));
         assert!(!crate::sync::cmds::is_header_only(&s, id));

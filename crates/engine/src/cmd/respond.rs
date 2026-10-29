@@ -242,13 +242,15 @@ pub fn quoted_body_as(s: &Session, m: &MailItem, mode: OriginalText, prefix: &st
         return mailcraft_model::Doc { blocks, ..Default::default() };
     }
     let lines = header_lines(s, m);
-    if m.body.format == BodyFormat::PlainText {
+    // The body as it reads (the opened form of S/MIME mail).
+    let body = crate::smime::display_body(s, m);
+    if body.format == BodyFormat::PlainText {
         blocks.push(Block::text_paragraph(crate::intl::header_labels(&s.settings).original));
         for (label, value) in lines {
             blocks.push(Block::text_paragraph(&format!("{label} {value}")));
         }
         blocks.push(Block::text_paragraph(""));
-        let text = m.body.text.clone().unwrap_or_else(|| m.body_text());
+        let text = body.text.clone().unwrap_or_else(|| body.plain_text());
         let lead = match mode {
             OriginalText::Indent => "\t",
             OriginalText::Prefix => prefix,
@@ -279,7 +281,7 @@ pub fn quoted_body_as(s: &Session, m: &MailItem, mode: OriginalText, prefix: &st
             });
         }
         blocks.push(Block::text_paragraph(""));
-        let original = body_doc(m).blocks;
+        let original = body_doc(&body).blocks;
         match mode {
             OriginalText::Indent => blocks.push(Block::Container {
                 style: ParaStyle { indent_px: INDENT_PX, ..Default::default() },
@@ -319,7 +321,7 @@ fn eml_attachment(m: &MailItem, data: Vec<u8>) -> ComposeAttachment {
 /// keeps every original header (Received, Authentication-Results, DKIM-Signature); rebuilt from the
 /// stored fields only when no source is kept.
 fn received_source(s: &Session, m: &MailItem) -> Vec<u8> {
-    crate::cmd::compose::stored_raw(s, m).filter(|r| !r.is_empty()).unwrap_or_else(|| item_source(m))
+    item_source(s, m)
 }
 
 /// Most messages one forward attaches, and their largest total size.
@@ -343,7 +345,7 @@ pub fn build_response(s: &Session, id: ItemId, kind: ComposeKind, inline: bool) 
         // The opened form of an S/MIME message is what is attached; other mail goes as received.
         OriginalText::Attach => {
             let data = match &shown {
-                std::borrow::Cow::Owned(_) => item_source(m),
+                std::borrow::Cow::Owned(_) => crate::smime::open_source(s, m),
                 std::borrow::Cow::Borrowed(_) => received_source(s, m),
             };
             vec![eml_attachment(m, data)]
@@ -351,7 +353,8 @@ pub fn build_response(s: &Session, id: ItemId, kind: ComposeKind, inline: bool) 
         _ if forward => source_attachments(s, m),
         _ => Vec::new(),
     };
-    let inline_images = if m.body.format == BodyFormat::PlainText || !mode.quotes() {
+    let format = crate::smime::display_body(s, m).format;
+    let inline_images = if format == BodyFormat::PlainText || !mode.quotes() {
         Vec::new()
     } else {
         source_inline_images(s, m)
@@ -366,7 +369,7 @@ pub fn build_response(s: &Session, id: ItemId, kind: ComposeKind, inline: bool) 
         from: account_from(s, item_account(s, id)),
         subject,
         body: quoted_body_as(s, m, mode, &st.plain_prefix()),
-        format: m.body.format,
+        format,
         importance: Importance::Normal,
         attachments,
         inline_images,
@@ -447,6 +450,7 @@ fn forward_as_attachment(s: &mut Session, p: &Value) -> CmdResult {
     if usize::try_from(listed).map_or(true, |n| n > MAX_FORWARD_BYTES) {
         return Err(too_big());
     }
+    crate::sync::cmds::need_content(s, &ids, "forwarded as an attachment")?;
     let mut attachments = Vec::new();
     let mut subject = String::new();
     let mut total = 0usize;
@@ -499,7 +503,7 @@ fn reply_with_meeting(s: &mut Session, p: &Value) -> CmdResult {
         "source": id.0,
         "subject": m.subject,
         "attendees": attendees,
-        "body": m.body_text(),
+        "body": s.body_text(m),
     });
     open_dialog(s, "newMeeting", params)
 }
@@ -531,7 +535,8 @@ mod tests {
         let account = mb.default_account().map(|a| a.id).unwrap();
         let inbox = mb.role_folder(account, FolderRole::Inbox).unwrap();
         let t = DateTime { unix: SENT, offset_min: 0 };
-        let plain = mb.add_mail(MailItem {
+        let mut s = Session::new(mb);
+        let plain = MailItem {
             folder: inbox,
             subject: "URGENT: server room access".into(),
             from: Some(addr("Alice Rivera", "alice@example.com")),
@@ -540,28 +545,29 @@ mod tests {
             sent: Some(t),
             received: t,
             importance: Importance::High,
-            body: Body {
-                format: BodyFormat::PlainText,
-                text: Some("The badge reader is down. Please use the side door today.".into()),
-                html: None,
-            },
             ..Default::default()
-        });
-        let html = mb.add_mail(MailItem {
+        };
+        let body = Body {
+            format: BodyFormat::PlainText,
+            text: Some("The badge reader is down. Please use the side door today.".into()),
+            html: None,
+        };
+        let plain = s.add_message(plain, &mailcraft_store::Content::body(body)).unwrap();
+        let html = MailItem {
             folder: inbox,
             subject: "Re: Newsletter".into(),
             from: Some(addr("News Desk", "news@example.org")),
             to: vec![addr("Test User", "test.user@example.net"), addr("Dana", "dana@example.com")],
             sent: Some(t),
             received: t,
-            body: Body {
-                format: BodyFormat::Html,
-                text: None,
-                html: Some("<h1>Weekly</h1><p>Hello <b>there</b></p>".into()),
-            },
             ..Default::default()
-        });
-        let mut s = Session::new(mb);
+        };
+        let body = Body {
+            format: BodyFormat::Html,
+            text: None,
+            html: Some("<h1>Weekly</h1><p>Hello <b>there</b></p>".into()),
+        };
+        let html = s.add_message(html, &mailcraft_store::Content::body(body)).unwrap();
         s.selection.folder = inbox;
         s.selection.items = vec![plain];
         s.selection.focus = Some(plain);
@@ -757,7 +763,7 @@ The badge reader is down. Please use the side door today.";
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut item = MailItem::from_message(&msg, &raw, DateTime::default());
         item.folder = f.s.selection.folder;
-        let id = f.s.mailbox.add_mail(item);
+        let id = f.s.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap();
         let r = forward(&mut f.s, &json!({"ids": [id.0]})).unwrap();
         let c = &f.s.composes[&r["compose"].as_u64().unwrap()];
         assert_eq!(c.attachments.len(), 1);
@@ -822,8 +828,16 @@ The badge reader is down. Please use the side door today.";
         assert!(matches!(r, Err(CmdError::Failed(ref e)) if e.contains("too large")), "{r:?}");
         let big = vec![b'x'; MAX_FORWARD_BYTES / 2 + 1];
         let (b1, b2) = (
-            f.s.mailbox.add_mail(MailItem { folder, raw: Some(big.clone()), ..Default::default() }),
-            f.s.mailbox.add_mail(MailItem { folder, raw: Some(big), ..Default::default() }),
+            f.s.add_message(
+                MailItem { folder, ..Default::default() },
+                &mailcraft_store::Content::source(big.clone()),
+            )
+            .unwrap(),
+            f.s.add_message(
+                MailItem { folder, ..Default::default() },
+                &mailcraft_store::Content::source(big),
+            )
+            .unwrap(),
         );
         let r = forward_as_attachment(&mut f.s, &json!({"ids": [b1.0, b2.0]}));
         assert!(matches!(r, Err(CmdError::Failed(ref e)) if e.contains("too large")), "{r:?}");
@@ -869,16 +883,17 @@ The badge reader is down. Please use the side door today.";
     fn sending_fx(from: Address, cc: Vec<Address>) -> (Session, ItemId) {
         let mut s = crate::cmd::compose::tests::session();
         let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
-        let id = s.mailbox.add_mail(MailItem {
+        let item = MailItem {
             folder: inbox,
             subject: "Badges".into(),
             from: Some(from),
             to: vec![addr("Me Example", "me@example.com")],
             cc,
             message_id: Some("badges@example.com".into()),
-            body: Body { format: BodyFormat::PlainText, text: Some("Hi".into()), html: None },
             ..Default::default()
-        });
+        };
+        let body = Body { format: BodyFormat::PlainText, text: Some("Hi".into()), html: None };
+        let id = s.add_message(item, &mailcraft_store::Content::body(body)).unwrap();
         s.selection.folder = inbox;
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
@@ -955,7 +970,7 @@ The badge reader is down. Please use the side door today.";
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut item = MailItem::from_message(&msg, &raw, DateTime::default());
         item.folder = f.s.selection.folder;
-        let id = f.s.mailbox.add_mail(item);
+        let id = f.s.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap();
         for (run, kind) in [(reply as fn(&mut Session, &Value) -> CmdResult, "reply"), (forward, "forward")] {
             let r = run(&mut f.s, &json!({"ids": [id.0]})).unwrap();
             let c = &f.s.composes[&r["compose"].as_u64().unwrap()];

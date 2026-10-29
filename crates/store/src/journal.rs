@@ -1,8 +1,12 @@
 //! Snapshot and journal files.
 //!
-//! Snapshot (`mailbox.json`): `{"mailcraft_snapshot":1,"generation":N,"mailbox":{...}}`, the prefix written
-//! byte-for-byte so the generation can be peeked without parsing the whole file. A bare [`Mailbox`] JSON
-//! object is also accepted (generation 0).
+//! Snapshot (`mailbox.json`): `{"mailcraft_snapshot":2,"generation":N,"bodies":2,"mailbox":{...}}`, the
+//! prefix written byte-for-byte so the generation can be peeked without parsing the whole file. Format 2
+//! (and the `"bodies":2` marker) is a snapshot written since storage stage S5: its items carry no message
+//! content inline, they refer to the body store. Format 1 is still read; one without the marker may carry
+//! bodies and sources inline ([`crate::legacy`]). Older builds refuse format 2 ("unknown snapshot format")
+//! instead of opening the profile with every message empty and dropping the body keys on their next save. A
+//! bare [`Mailbox`] JSON object is also accepted (generation 0).
 //!
 //! Journal (`journal.jsonl`): first line `{"mailcraft_journal":1,"generation":N}`, then one [`Op`] per line.
 //! A journal whose generation is older than the snapshot's was already folded into that snapshot (a crash
@@ -22,13 +26,35 @@ pub const JOURNAL_FILE: &str = "journal.jsonl";
 /// Largest snapshot or journal this crate will read into memory.
 pub const MAX_STATE_BYTES: u64 = 1 << 30;
 
-const SNAPSHOT_PREFIX: &str = "{\"mailcraft_snapshot\":1,\"generation\":";
+/// The snapshot format written now ([`SNAPSHOT_PREFIX`]); [`SNAPSHOT_FORMAT_V1`] is still read.
+pub const SNAPSHOT_FORMAT: u32 = 2;
+/// The snapshot format written before storage stage S5.
+pub const SNAPSHOT_FORMAT_V1: u32 = 1;
+
+const SNAPSHOT_PREFIX: &str = "{\"mailcraft_snapshot\":2,\"generation\":";
+const SNAPSHOT_PREFIX_V1: &str = "{\"mailcraft_snapshot\":1,\"generation\":";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SnapshotFile {
     mailcraft_snapshot: u32,
     generation: u64,
+    /// [`BODIES_OUT_OF_LINE`] since storage stage S5; missing (0) before.
+    #[serde(default)]
+    bodies: u32,
     mailbox: Mailbox,
+}
+
+/// The `bodies` marker of a snapshot whose items carry no content inline.
+pub const BODIES_OUT_OF_LINE: u32 = 2;
+
+/// A snapshot as read: its generation and mailbox, and (written before storage stage S5) its bytes, for the
+/// inline message content a second parse moves out ([`crate::legacy`]).
+#[derive(Debug, Default)]
+pub struct SnapshotRead {
+    pub generation: u64,
+    pub mailbox: Mailbox,
+    /// The snapshot's bytes when it may carry message content inline.
+    pub legacy: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,29 +155,40 @@ pub fn peek_snapshot_generation(dir: &Path) -> Result<u64> {
 }
 
 pub fn parse_generation_prefix(head: &[u8]) -> Option<u64> {
-    let rest = head.strip_prefix(SNAPSHOT_PREFIX.as_bytes())?;
+    let rest = head
+        .strip_prefix(SNAPSHOT_PREFIX.as_bytes())
+        .or_else(|| head.strip_prefix(SNAPSHOT_PREFIX_V1.as_bytes()))?;
     let digits: Vec<u8> = rest.iter().copied().take_while(u8::is_ascii_digit).take(20).collect();
     std::str::from_utf8(&digits).ok()?.parse().ok()
 }
 
-/// Reads the snapshot: (generation, mailbox). Missing file = (0, empty mailbox).
+/// Reads the snapshot: (generation, mailbox). Missing file = (0, empty mailbox). Message content a snapshot
+/// written before storage stage S5 carries inline is not read (see [`read_snapshot_full`]).
 pub fn read_snapshot(dir: &Path) -> Result<(u64, Mailbox)> {
-    let Some(bytes) = read_capped(&dir.join(SNAPSHOT_FILE), MAX_STATE_BYTES)? else {
-        return Ok((0, Mailbox::default()));
-    };
-    if bytes.starts_with(b"{\"mailcraft_snapshot\"") {
-        let snap: SnapshotFile = serde_json::from_slice(&bytes).map_err(|e| corrupt("snapshot", e))?;
-        if snap.mailcraft_snapshot != 1 {
-            return Err(StoreError::Corrupt(format!("unknown snapshot format {}", snap.mailcraft_snapshot)));
-        }
-        Ok((snap.generation, snap.mailbox))
-    } else {
-        let mb: Mailbox = serde_json::from_slice(&bytes).map_err(|e| corrupt("snapshot", e))?;
-        Ok((0, mb))
-    }
+    read_snapshot_full(dir).map(|r| (r.generation, r.mailbox))
 }
 
-/// Writes a snapshot atomically. `mb` must already be stripped of raw sources.
+/// Reads the snapshot, keeping its bytes when it was written before storage stage S5.
+pub fn read_snapshot_full(dir: &Path) -> Result<SnapshotRead> {
+    let Some(bytes) = read_capped(&dir.join(SNAPSHOT_FILE), MAX_STATE_BYTES)? else {
+        return Ok(SnapshotRead::default());
+    };
+    let (generation, mailbox, marked) = if bytes.starts_with(b"{\"mailcraft_snapshot\"") {
+        let snap: SnapshotFile = serde_json::from_slice(&bytes).map_err(|e| corrupt("snapshot", e))?;
+        if snap.mailcraft_snapshot != SNAPSHOT_FORMAT && snap.mailcraft_snapshot != SNAPSHOT_FORMAT_V1 {
+            return Err(StoreError::Corrupt(format!("unknown snapshot format {}", snap.mailcraft_snapshot)));
+        }
+        let marked = snap.mailcraft_snapshot >= SNAPSHOT_FORMAT || snap.bodies >= BODIES_OUT_OF_LINE;
+        (snap.generation, snap.mailbox, marked)
+    } else {
+        let mb: Mailbox = serde_json::from_slice(&bytes).map_err(|e| corrupt("snapshot", e))?;
+        (0, mb, false)
+    };
+    let legacy = (!marked && crate::legacy::has_inline(&bytes)).then_some(bytes);
+    Ok(SnapshotRead { generation, mailbox, legacy })
+}
+
+/// Writes a snapshot atomically.
 ///
 /// Refused with [`StoreError::TooLarge`] when the snapshot would be larger than [`MAX_STATE_BYTES`], the most
 /// [`read_snapshot`] reads back: a snapshot that cannot be read must never replace one that can.
@@ -166,7 +203,7 @@ pub fn write_snapshot_capped(dir: &Path, generation: u64, mb: &Mailbox, cap: u64
     let res = write_atomic(&dir.join(SNAPSHOT_FILE), |w| {
         let mut w = CapWriter { inner: w, written: 0, cap };
         w.write_all(SNAPSHOT_PREFIX.as_bytes())?;
-        write!(w, "{generation},\"mailbox\":")?;
+        write!(w, "{generation},\"bodies\":{BODIES_OUT_OF_LINE},\"mailbox\":")?;
         // An I/O error (the cap marker included) comes back out of serde_json as it went in.
         serde_json::to_writer(&mut w, mb).map_err(std::io::Error::from)?;
         w.write_all(b"}")
@@ -303,6 +340,8 @@ pub fn prepare_journal(dir: &Path, snapshot_gen: u64) -> Result<(File, u64, Repa
 pub struct JournalScan {
     pub generation: Option<u64>,
     pub ops: Vec<Op>,
+    /// Message content lines written before storage stage S5 carry inline: (index into `ops`, content).
+    pub inline: Vec<(usize, crate::legacy::InlineOp)>,
     /// Lines that failed to parse and were skipped (1-based line numbers).
     pub skipped_lines: Vec<usize>,
     /// The last line was incomplete (no newline and not parseable).
@@ -327,7 +366,14 @@ pub fn scan_journal(bytes: &[u8]) -> JournalScan {
             continue;
         }
         match serde_json::from_slice::<Op>(line) {
-            Ok(op) => scan.ops.push(op),
+            Ok(op) => {
+                if matches!(op, Op::PutMail(_) | Op::Replace(_))
+                    && let Some(inline) = crate::legacy::journal_line_inline(line)
+                {
+                    scan.inline.push((scan.ops.len(), inline));
+                }
+                scan.ops.push(op);
+            }
             Err(e) => {
                 let is_last = idx + 1 == count;
                 if is_last && !ends_with_newline {

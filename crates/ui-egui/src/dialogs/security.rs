@@ -672,7 +672,7 @@ mod tests {
         let parsed = mailcraft_mime::parse(&raw).unwrap();
         let mut item = mailcraft_model::MailItem::from_message(&parsed, &raw, s.now());
         item.folder = s.selection.folder;
-        let id = s.mailbox.add_mail(item);
+        let id = s.add_message(item, &mailcraft_engine::Content::source(raw.clone())).unwrap();
         let mut app = App::new(s);
         app.run("mail.signatureDetails", json!({"id": id.0}));
         let mut h = harness(app);

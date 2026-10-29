@@ -1324,7 +1324,8 @@ pub fn merge_template(path: &str) -> Result<(String, String), CmdError> {
                 FolderId(0),
                 mailcraft_model::DateTime::default(),
             );
-            (item.subject.clone(), item.body_text())
+            let body = mailcraft_model::Body::from_source(&data).unwrap_or_default();
+            (item.subject.clone(), body.plain_text())
         }
         _ => {
             if data.iter().take(8_192).any(|b| *b == 0) {

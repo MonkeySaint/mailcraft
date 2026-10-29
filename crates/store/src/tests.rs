@@ -8,7 +8,9 @@ use mailcraft_model::{Folder, FolderId, FolderRole, ItemId, MailItem, Mailbox, R
 
 use crate::journal::{JOURNAL_FILE, SNAPSHOT_FILE};
 use crate::lock::LOCK_FILE;
-use crate::{Autosave, BlobKey, Op, SmallState, Store, StoreError, export_mbox, import_maildir, import_mbox};
+use crate::{
+    Autosave, BlobKey, BodyStore, Op, SmallState, Store, StoreError, export_mbox, import_maildir, import_mbox,
+};
 
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
@@ -24,22 +26,16 @@ fn base_mailbox() -> Mailbox {
     mb
 }
 
+/// An item whose source (when `raw` is given) is stored under its content key (items refer to content by
+/// key since storage stage S5; tests that read the source put it in a body store too).
 fn mail(id: u64, subject: &str, raw: Option<&[u8]>) -> MailItem {
     MailItem {
         id: ItemId(id),
         folder: FolderId(1),
         subject: subject.into(),
-        raw: raw.map(<[u8]>::to_vec),
+        blob: raw.map(|r| BlobKey::for_data(r).to_string()),
         ..Default::default()
     }
-}
-
-/// The form an item takes after the store moved its raw source to a blob.
-fn stored(mut item: MailItem) -> MailItem {
-    if let Some(raw) = item.raw.take() {
-        item.blob = Some(BlobKey::for_data(&raw).to_string());
-    }
-    item
 }
 
 const RAW1: &[u8] = b"From: a@example.com\r\nSubject: One\r\n\r\nFirst body\r\n";
@@ -61,13 +57,14 @@ fn open_creates_layout_and_lock() {
 }
 
 #[test]
-fn journal_round_trip_moves_raw_to_blobs() {
+fn journal_round_trip_keeps_content_keys() {
     let d = tmp();
     let mut mb = base_mailbox();
     let a = mail(10, "One", Some(RAW1));
     let b = mail(11, "Two", Some(RAW2));
     {
         let mut store = Store::open(d.path()).unwrap();
+        store.put_blob(RAW1).unwrap();
         store
             .append(&[
                 Op::PutFolder(Box::new(mb.folders.get(&FolderId(1)).cloned().unwrap())),
@@ -84,7 +81,7 @@ fn journal_round_trip_moves_raw_to_blobs() {
     let loaded = store.load().unwrap();
     assert_eq!(loaded.mail.len(), 1);
     let got = loaded.mail.get(ItemId(10)).cloned().unwrap();
-    assert_eq!(got, stored(a));
+    assert_eq!(got, a);
     assert_eq!(store.get_blob(got.blob.as_deref().unwrap()).unwrap(), RAW1);
     assert_eq!(store.raw_of(&got).unwrap().as_deref(), Some(RAW1));
     assert_eq!(loaded.next_id, 11, "replay keeps next_id ahead of replayed ids");
@@ -177,9 +174,9 @@ fn head_of_reads_the_start_of_the_source() {
     let d = tmp();
     let a = mail(10, "One", Some(RAW1));
     let mut store = Store::open(d.path()).unwrap();
+    store.put_blob(RAW1).unwrap();
     store.append(&[Op::PutMail(Box::new(a.clone()))]).unwrap();
-    assert_eq!(store.head_of(&a, 5).unwrap().as_deref(), Some(&RAW1[..5]), "kept raw");
-    let got = stored(a);
+    let got = a;
     assert_eq!(store.head_of(&got, 5).unwrap().as_deref(), Some(&RAW1[..5]), "from the blob");
     assert_eq!(store.head_of(&got, usize::MAX).unwrap().as_deref(), Some(RAW1), "capped by the blob");
     assert_eq!(store.head_of(&mail(11, "none", None), 5).unwrap(), None);
@@ -201,39 +198,124 @@ fn checkpoint_snapshot_excludes_raw_and_resets_journal() {
     store.checkpoint(&mb).unwrap();
     assert_eq!(store.generation(), 1);
     let snap = fs::read_to_string(d.path().join(SNAPSHOT_FILE)).unwrap();
-    assert!(snap.starts_with("{\"mailcraft_snapshot\":1,\"generation\":1,"));
-    assert!(!snap.contains("\"raw\":["), "raw sources stay out of the snapshot");
+    assert!(snap.starts_with("{\"mailcraft_snapshot\":2,\"generation\":1,\"bodies\":2,\"mailbox\":"));
+    assert!(!snap.contains("\"raw\"") && !snap.contains("\"body\""), "content stays out of the snapshot");
     let journal = fs::read_to_string(d.path().join(JOURNAL_FILE)).unwrap();
     assert_eq!(journal.lines().count(), 1);
-    assert!(mb.mail.get(ItemId(5)).and_then(|m| m.raw.as_ref()).is_some(), "caller's mailbox untouched");
     drop(store);
 
     let store = Store::open(d.path()).unwrap();
     let (loaded, report) = store.load_report().unwrap();
     assert_eq!(report.snapshot_generation, 1);
     assert_eq!(report.replayed, 0);
-    let mut expect = mb.clone();
-    for item in expect.mail.items_mut() {
-        *item = stored(item.clone());
-    }
-    assert_eq!(loaded, expect);
+    assert!(!report.legacy_content);
+    assert_eq!(loaded, mb);
 }
 
+/// Storage stage S5: a snapshot and journal written before it carry bodies and sources inline. Loading moves
+/// them to the body store (sources under the key the item had or gets, a body record only for a body its
+/// source does not give), reads expiry dates, and reports the old shape so the caller writes a fresh snapshot.
 #[test]
-fn checkpoint_mut_records_blob_keys() {
+fn legacy_inline_content_moves_to_the_body_store_on_load() {
     let d = tmp();
-    let mut mb = base_mailbox();
-    mb.mail.insert(ItemId(5), mail(5, "One", Some(RAW1)));
+    let raw1 = "Subject: One\r\nExpires: Fri, 09 Oct 2026 12:00:00 +0000\r\n\r\nFirst body\r\n";
+    let raw_json = |r: &str| serde_json::to_string(&r.as_bytes().to_vec()).unwrap();
+    // 5: source inline, its body the one the source gives; 6: a local draft (body only); 7: source and an
+    // edited body; 8: replaced by the journal line below; 9: removed by the journal.
+    let item = |id: u64, raw: Option<&str>, text: &str| {
+        let raw = raw.map_or("null".to_owned(), raw_json);
+        format!(
+            "\"{id}\":{{\"id\":{id},\"folder\":1,\"message_id\":null,\"in_reply_to\":[],\"references\":[],\
+             \"subject\":\"m{id}\",\"from\":null,\"sender\":null,\"to\":[],\"cc\":[],\"bcc\":[],\"reply_to\":[],\
+             \"sent\":null,\"received\":{{\"unix\":0,\"offset_min\":0}},\"size\":1,\"read\":false,\
+             \"importance\":\"Normal\",\"sensitivity\":\"Normal\",\"flag\":\"None\",\"categories\":[],\
+             \"attachments\":[],\"preview\":\"\",\"body\":{{\"format\":\"PlainText\",\"text\":{text},\"html\":null}},\
+             \"is_draft\":false,\"response\":\"None\",\"focus\":\"Focused\",\"conversation\":null,\
+             \"ignored\":false,\"remote_id\":null,\"blob\":null,\"raw\":{raw}}}"
+        )
+    };
+    let parsed = mailcraft_model::Body::from_source(raw1.as_bytes()).unwrap();
+    let first_body = serde_json::to_string(parsed.text.as_deref().unwrap()).unwrap();
+    let items = [
+        item(5, Some(raw1), &first_body),
+        item(6, None, "\"Draft text\""),
+        item(7, Some(raw1), "\"Edited here\""),
+        item(8, None, "\"Old\""),
+        item(9, None, "\"Gone\""),
+    ]
+    .join(",");
+    let mut mb_json = serde_json::to_value(base_mailbox()).unwrap();
+    mb_json["mail"] = serde_json::json!({});
+    let mb_text =
+        serde_json::to_string(&mb_json).unwrap().replace("\"mail\":{}", &format!("\"mail\":{{{items}}}"));
+    fs::write(
+        d.path().join(SNAPSHOT_FILE),
+        format!("{{\"mailcraft_snapshot\":1,\"generation\":3,\"mailbox\":{mb_text}}}"),
+    )
+    .unwrap();
+    let put8 = item(8, None, "\"New\"").replacen("\"8\":", "", 1);
+    fs::write(
+        d.path().join(JOURNAL_FILE),
+        format!(
+            "{{\"mailcraft_journal\":1,\"generation\":3}}\n{{\"PutMail\":{put8}}}\n{{\"RemoveMail\":9}}\n"
+        ),
+    )
+    .unwrap();
+    let store = Store::open(d.path()).unwrap();
+    let (mb, report) = store.load_report().unwrap();
+    assert!(report.legacy_content);
+    assert_eq!(report.migrated_bodies, 4);
+    assert_eq!(report.replayed, 2);
+    let bodies = BodyStore::on_disk(d.path());
+    let get = |id: u64| mb.mail.get(ItemId(id)).cloned().unwrap();
+    let text = |id: u64| bodies.body_of(&get(id)).unwrap().and_then(|b| b.text.clone());
+    let m5 = get(5);
+    assert_eq!(m5.blob, Some(BlobKey::for_data(raw1.as_bytes()).to_string()));
+    assert_eq!(m5.body_key, None, "the source gives this body");
+    assert_eq!(m5.expires.map(|e| e.unix), Some(1_791_547_200));
+    assert_eq!(bodies.source_of(&m5).unwrap().as_deref(), Some(raw1.as_bytes()));
+    assert_eq!(text(5), parsed.text);
+    let m6 = get(6);
+    assert!(m6.blob.is_none() && m6.body_key.is_some());
+    assert_eq!(text(6).as_deref(), Some("Draft text"));
+    assert!(get(7).blob.is_some() && get(7).body_key.is_some(), "an edited body gets its own record");
+    assert_eq!(text(7).as_deref(), Some("Edited here"));
+    assert_eq!(text(8).as_deref(), Some("New"), "the journal's line wins");
+    assert!(mb.mail.get(ItemId(9)).is_none());
+    // Loading again finds the same content (keyed by its bytes), and a fresh snapshot no longer has it.
+    let (again, _) = store.load_report().unwrap();
+    assert_eq!(again, mb);
+    drop(store);
     let mut store = Store::open(d.path()).unwrap();
-    store.checkpoint_mut(&mut mb, false).unwrap();
-    let item = mb.mail.get(ItemId(5)).cloned().unwrap();
-    assert_eq!(item.raw.as_deref(), Some(RAW1));
-    assert_eq!(item.blob, Some(BlobKey::for_data(RAW1).to_string()));
-    store.checkpoint_mut(&mut mb, true).unwrap();
-    assert_eq!(store.generation(), 2);
-    assert!(mb.mail.get(ItemId(5)).and_then(|m| m.raw.as_ref()).is_none());
-    let loaded = store.load().unwrap();
-    assert_eq!(loaded, mb);
+    store.checkpoint(&mb).unwrap();
+    let (fresh, report) = store.load_report().unwrap();
+    assert!(!report.legacy_content);
+    assert_eq!(fresh, mb);
+}
+
+/// A pre-S5 recoverable-items file carries its entries' bodies inline; reading it moves them out.
+#[test]
+fn legacy_recoverable_bodies_move_to_the_body_store() {
+    let d = tmp();
+    let mut store = Store::open(d.path()).unwrap();
+    let mut bin = mailcraft_model::RecoverBin::default();
+    bin.add(mailcraft_model::DeletedItem::Mail(Box::new(mail(7, "Gone", None))), "Inbox", 100);
+    let mut v = serde_json::to_value(&bin).unwrap();
+    v["items"][0]["item"]["item"]["body"] =
+        serde_json::json!({"format": "PlainText", "text": "Deleted draft", "html": null});
+    v["items"][0]["item"]["item"]["raw"] = serde_json::Value::Null;
+    fs::write(d.path().join(crate::RECOVERABLE_FILE), serde_json::to_vec(&v).unwrap()).unwrap();
+    let mut back = store.load_recoverable().unwrap();
+    let m = match back.items.first().map(|e| &e.item) {
+        Some(mailcraft_model::DeletedItem::Mail(m)) => m.clone(),
+        other => panic!("mail entry expected, got {other:?}"),
+    };
+    let body = BodyStore::on_disk(d.path()).body_of(&m).unwrap().unwrap();
+    assert_eq!(body.text.as_deref(), Some("Deleted draft"));
+    store.save_recoverable(&mut back).unwrap();
+    let text = fs::read_to_string(d.path().join(crate::RECOVERABLE_FILE)).unwrap();
+    assert!(!text.contains("Deleted draft"));
+    assert_eq!(store.gc_blobs(&base_mailbox(), &Default::default()).unwrap(), 0, "the bin keeps its record");
 }
 
 #[test]
@@ -335,6 +417,34 @@ fn bare_mailbox_snapshot_is_accepted() {
     assert_eq!(store.load().unwrap(), mb);
 }
 
+/// Regression: S5 snapshots kept format 1, so an older build opened the profile with every message empty and
+/// dropped the body keys on its next save. They are format 2 now (which older builds refuse); format 1 is
+/// still read, and a later format is refused here.
+#[test]
+fn snapshot_format_two_is_written_and_one_still_read() {
+    let d = tmp();
+    let mut store = Store::open(d.path()).unwrap();
+    store.checkpoint(&base_mailbox()).unwrap();
+    drop(store);
+    let snap = fs::read(d.path().join(SNAPSHOT_FILE)).unwrap();
+    assert!(snap.starts_with(b"{\"mailcraft_snapshot\":2,"));
+    assert_eq!(crate::journal::parse_generation_prefix(&snap), Some(1));
+    let mb_text = serde_json::to_string(&base_mailbox()).unwrap();
+    for (format, ok) in [(1, true), (2, true), (3, false), (0, false)] {
+        fs::write(
+            d.path().join(SNAPSHOT_FILE),
+            format!("{{\"mailcraft_snapshot\":{format},\"generation\":6,\"mailbox\":{mb_text}}}"),
+        )
+        .unwrap();
+        let _ = fs::remove_file(d.path().join(JOURNAL_FILE));
+        let store = Store::open(d.path()).unwrap();
+        if ok {
+            assert_eq!(store.generation(), 6, "format {format}");
+        }
+        assert_eq!(store.load().is_ok(), ok, "format {format}");
+    }
+}
+
 #[test]
 fn garbled_snapshot_is_corrupt_not_panic() {
     let d = tmp();
@@ -421,23 +531,41 @@ fn gc_removes_unreferenced_blobs() {
     let keep = store.put_blob(RAW1).unwrap();
     let drop_key = store.put_blob(RAW2).unwrap();
     let mut mb = base_mailbox();
-    mb.mail.insert(ItemId(2), MailItem { id: ItemId(2), blob: Some(keep.clone()), ..Default::default() });
-    assert_eq!(store.gc_blobs(&mb).unwrap(), 1);
+    let mut bodies = BodyStore::on_disk(d.path());
+    let record =
+        bodies.put_body(&mailcraft_model::Body { text: Some("kept".into()), ..Default::default() }).unwrap();
+    let pinned =
+        bodies.put_body(&mailcraft_model::Body { text: Some("undo".into()), ..Default::default() }).unwrap();
+    let stray =
+        bodies.put_body(&mailcraft_model::Body { text: Some("stray".into()), ..Default::default() }).unwrap();
+    mb.mail.insert(
+        ItemId(2),
+        MailItem {
+            id: ItemId(2),
+            blob: Some(keep.clone()),
+            body_key: Some(record.clone()),
+            ..Default::default()
+        },
+    );
+    let also = std::collections::BTreeSet::from([pinned.clone()]);
+    assert_eq!(store.gc_blobs(&mb, &also).unwrap(), 2);
     assert!(store.has_blob(&keep));
     assert!(!store.has_blob(&drop_key));
+    assert!(bodies.has_body(&record) && bodies.has_body(&pinned), "records referred to stay");
+    assert!(!bodies.has_body(&stray));
 }
 
 #[test]
-fn replace_op_strips_raws() {
+fn replace_op_keeps_content_keys() {
     let d = tmp();
     let mut mb = base_mailbox();
     mb.mail.insert(ItemId(4), mail(4, "x", Some(RAW2)));
     let mut store = Store::open(d.path()).unwrap();
     store.append(&[Op::Replace(Box::new(mb.clone()))]).unwrap();
     let journal = fs::read_to_string(d.path().join(JOURNAL_FILE)).unwrap();
-    assert!(!journal.contains("\"raw\":["));
+    assert!(!journal.contains("\"raw\"") && !journal.contains("\"body\""));
     let loaded = store.load().unwrap();
-    assert_eq!(loaded.mail.get(ItemId(4)).cloned(), Some(stored(mail(4, "x", Some(RAW2)))));
+    assert_eq!(loaded.mail.get(ItemId(4)).cloned(), Some(mail(4, "x", Some(RAW2))));
 }
 
 fn write_file(path: &Path, data: &[u8]) {
@@ -461,14 +589,15 @@ fn maildir_import_with_flags() {
     fs::create_dir_all(md.join("cur/subdir")).unwrap();
 
     let mut mb = base_mailbox();
-    let ids = import_maildir(&mut mb, &md, FolderId(1)).unwrap();
+    let mut bodies = BodyStore::in_memory();
+    let ids = import_maildir(&mut mb, &mut bodies, &md, FolderId(1)).unwrap();
     assert_eq!(ids.len(), 4);
     let items: Vec<&MailItem> = ids.iter().filter_map(|id| mb.mail.get(*id)).collect();
     assert_eq!(items.len(), 4);
     let first = items.first().copied().unwrap();
     assert!(!first.read);
     assert_eq!(first.received.unix, 1_791_433_800);
-    assert_eq!(first.raw.as_deref(), Some(&b"Subject: new one\n\nhello\n"[..]));
+    assert_eq!(bodies.source_of(first).unwrap().as_deref(), Some(&b"Subject: new one\n\nhello\n"[..]));
     assert!(items.get(1).unwrap().read);
     let flagged = items.get(2).copied().unwrap();
     assert!(flagged.is_flagged() && flagged.read);
@@ -477,9 +606,9 @@ fn maildir_import_with_flags() {
     assert!(items.iter().all(|m| m.folder == FolderId(1) && m.size > 0));
     assert!(items.iter().all(|m| !m.subject.is_empty()), "subject from parser or fallback scan");
 
-    assert!(import_maildir(&mut mb, &d.path().join("missing"), FolderId(1)).is_err());
+    assert!(import_maildir(&mut mb, &mut bodies, &d.path().join("missing"), FolderId(1)).is_err());
     fs::create_dir_all(d.path().join("empty")).unwrap();
-    assert!(import_maildir(&mut mb, &d.path().join("empty"), FolderId(1)).is_err());
+    assert!(import_maildir(&mut mb, &mut bodies, &d.path().join("empty"), FolderId(1)).is_err());
 }
 
 #[test]
@@ -499,15 +628,19 @@ X-Status: F\n\
 body two\n";
     write_file(&file, content);
     let mut mb = base_mailbox();
-    let ids = import_mbox(&mut mb, &file, FolderId(1)).unwrap();
+    let mut bodies = BodyStore::in_memory();
+    let ids = import_mbox(&mut mb, &mut bodies, &file, FolderId(1)).unwrap();
     assert_eq!(ids.len(), 2);
     let a = mb.mail.get(*ids.first().unwrap()).unwrap();
-    assert_eq!(a.raw.as_deref(), Some(&b"Subject: First\nStatus: RO\n\nFrom the archive\n"[..]));
+    assert_eq!(
+        bodies.source_of(a).unwrap().as_deref(),
+        Some(&b"Subject: First\nStatus: RO\n\nFrom the archive\n"[..])
+    );
     assert!(a.read);
     assert_eq!(a.received.unix, 1_791_433_800);
     let b = mb.mail.get(*ids.get(1).unwrap()).unwrap();
     assert!(!b.read && b.is_flagged());
-    assert!(import_mbox(&mut mb, &d.path().join("nope.mbox"), FolderId(1)).is_err());
+    assert!(import_mbox(&mut mb, &mut bodies, &d.path().join("nope.mbox"), FolderId(1)).is_err());
 }
 
 #[test]
@@ -516,25 +649,32 @@ fn mbox_export_import_round_trip() {
     let file = d.path().join("out.mbox");
     let raws: [&[u8]; 3] =
         [b"Subject: a\n\nFrom the top\n>From quoted\n", b"Subject: b\n\nplain\n", b"Subject: c\n\nlast\n\n"];
+    let mut bodies = BodyStore::in_memory();
     let items: Vec<MailItem> = raws
         .iter()
         .enumerate()
-        .map(|(i, r)| MailItem {
-            from: Some(mailcraft_mime::Mailbox::new(Some("A Person"), "a@example.com")),
-            received: mailcraft_model::DateTime { unix: 1_791_433_800 + i as i64, offset_min: 0 },
-            ..mail(i as u64 + 1, "s", Some(r))
+        .map(|(i, r)| {
+            bodies.put_source(r).unwrap();
+            MailItem {
+                from: Some(mailcraft_mime::Mailbox::new(Some("A Person"), "a@example.com")),
+                received: mailcraft_model::DateTime { unix: 1_791_433_800 + i as i64, offset_min: 0 },
+                ..mail(i as u64 + 1, "s", Some(r))
+            }
         })
         .collect();
     let refs: Vec<&MailItem> = items.iter().collect();
-    export_mbox(&refs, &file).unwrap();
+    export_mbox(&refs, &bodies, &file).unwrap();
     let text = fs::read_to_string(&file).unwrap();
     assert!(text.starts_with("From a@example.com Thu Oct  8 04:30:00 2026\n"));
     assert!(text.contains("\n>From the top\n>>From quoted\n"));
 
     let mut mb = base_mailbox();
-    let ids = import_mbox(&mut mb, &file, FolderId(1)).unwrap();
-    let back: Vec<Vec<u8>> =
-        ids.iter().filter_map(|id| mb.mail.get(*id).and_then(|m| m.raw.clone())).collect();
+    let mut back_bodies = BodyStore::in_memory();
+    let ids = import_mbox(&mut mb, &mut back_bodies, &file, FolderId(1)).unwrap();
+    let back: Vec<Vec<u8>> = ids
+        .iter()
+        .filter_map(|id| mb.mail.get(*id).and_then(|m| back_bodies.source_of(m).ok().flatten()))
+        .collect();
     assert_eq!(back, raws.iter().map(|r| r.to_vec()).collect::<Vec<_>>());
     let received: Vec<i64> = ids.iter().filter_map(|id| mb.mail.get(*id)).map(|m| m.received.unix).collect();
     assert_eq!(received, vec![1_791_433_800, 1_791_433_801, 1_791_433_802]);
@@ -544,19 +684,22 @@ fn mbox_export_import_round_trip() {
 fn export_rebuilds_items_without_source() {
     let d = tmp();
     let file = d.path().join("rebuilt.mbox");
-    let item = MailItem {
+    let mut item = MailItem {
         subject: "Hello there".into(),
         from: Some(mailcraft_mime::Mailbox::new(None, "me@example.com")),
         to: vec![mailcraft_mime::Mailbox::new(Some("You"), "you@example.com")],
-        body: mailcraft_model::Body { text: Some("Line one\nFrom line two".into()), ..Default::default() },
         ..Default::default()
     };
-    export_mbox(&[&item], &file).unwrap();
+    let mut bodies = BodyStore::in_memory();
+    let body = mailcraft_model::Body { text: Some("Line one\nFrom line two".into()), ..Default::default() };
+    bodies.store_body(&mut item, &body).unwrap();
+    export_mbox(&[&item], &bodies, &file).unwrap();
     let text = fs::read_to_string(&file).unwrap();
     assert!(text.starts_with("From me@example.com "));
     assert!(text.contains("Hello there"));
+    assert!(text.contains("Line one"), "the body record is exported");
     let mut mb = base_mailbox();
-    assert_eq!(import_mbox(&mut mb, &file, FolderId(1)).unwrap().len(), 1);
+    assert_eq!(import_mbox(&mut mb, &mut bodies, &file, FolderId(1)).unwrap().len(), 1);
 }
 
 #[test]
@@ -580,7 +723,6 @@ fn import_eml_stores_blob() {
     let id = store.import_eml(&mut mb, &eml, FolderId(1)).unwrap();
     let item = mb.mail.get(id).cloned().unwrap();
     assert_eq!(item.folder, FolderId(1));
-    assert_eq!(item.raw.as_deref(), Some(RAW1));
     assert_eq!(store.get_blob(item.blob.as_deref().unwrap()).unwrap(), RAW1);
     assert!(store.import_eml(&mut mb, &d.path().join("missing.eml"), FolderId(1)).is_err());
 }
@@ -617,11 +759,7 @@ fn autosave_batches_and_checkpoints() {
 
     let store = Store::open(d.path()).unwrap();
     let loaded = store.load().unwrap();
-    let mut expect = mb.clone();
-    for item in expect.mail.items_mut() {
-        *item = stored(item.clone());
-    }
-    assert_eq!(loaded, expect);
+    assert_eq!(loaded, mb);
     assert_eq!(Autosave::default().checkpoint_every, Autosave::DEFAULT_CHECKPOINT_EVERY);
 }
 
@@ -720,30 +858,26 @@ proptest::proptest! {
         }
         let store = Store::open(d.path()).unwrap();
         let loaded = store.load().unwrap();
-        let mut expect = mb;
-        for item in expect.mail.items_mut() {
-            *item = stored(item.clone());
-        }
-        proptest::prop_assert_eq!(loaded, expect);
+        proptest::prop_assert_eq!(loaded, mb);
     }
 }
 
 // ---- Review regressions -------------------------------------------------------------------------------------
 
-/// `gc_blobs` must not delete blobs that the journal or snapshot reference for items the caller still holds
-/// with `raw` set and `blob` unset (the normal state after `append` / `checkpoint(&mb)`).
+/// `gc_blobs` keeps the blobs the mailbox refers to, journaled or snapshotted.
 #[test]
-fn gc_keeps_blobs_of_items_still_holding_raw() {
+fn gc_keeps_blobs_the_mailbox_refers_to() {
     let d = tmp();
     let mut mb = base_mailbox();
     let item = mail(9, "kept", Some(RAW1));
     mb.mail.insert(item.id, item.clone());
     {
         let mut store = Store::open(d.path()).unwrap();
+        store.put_blob(RAW1).unwrap();
         store.append(&[Op::PutMail(Box::new(item))]).unwrap();
-        assert_eq!(store.gc_blobs(&mb).unwrap(), 0, "blob is live through the item's raw source");
+        assert_eq!(store.gc_blobs(&mb, &Default::default()).unwrap(), 0, "blob is live through the item");
         store.checkpoint(&mb).unwrap();
-        assert_eq!(store.gc_blobs(&mb).unwrap(), 0);
+        assert_eq!(store.gc_blobs(&mb, &Default::default()).unwrap(), 0);
     }
     let store = Store::open(d.path()).unwrap();
     let loaded = store.load().unwrap();
@@ -774,19 +908,17 @@ fn appends_survive_failed_journal_reset() {
     assert_eq!(loaded.mail.ids().collect::<Vec<_>>(), vec![ItemId(1), ItemId(2)]);
 }
 
-/// A damaged blob that an item still points at is rewritten from the in-memory source before the source is
-/// dropped, instead of being trusted because the key matches.
+/// A damaged blob is rewritten when the same source is stored again, instead of being trusted because the
+/// key matches.
 #[test]
-fn checkpoint_rewrites_damaged_blob_before_dropping_raw() {
+fn storing_a_source_again_repairs_a_damaged_blob() {
     let d = tmp();
-    let mut mb = base_mailbox();
-    mb.mail.insert(ItemId(5), mail(5, "One", Some(RAW1)));
     let mut store = Store::open(d.path()).unwrap();
-    store.checkpoint_mut(&mut mb, false).unwrap();
-    let key = mb.mail.get(ItemId(5)).and_then(|m| m.blob.clone()).unwrap();
+    let key = store.put_blob(RAW1).unwrap();
     let path = BlobKey::parse(&key).unwrap().path(d.path());
     fs::write(&path, &RAW1[..10]).unwrap();
-    store.checkpoint_mut(&mut mb, true).unwrap();
+    assert!(store.get_blob(&key).is_err());
+    assert_eq!(store.put_blob(RAW1).unwrap(), key);
     assert_eq!(store.get_blob(&key).unwrap(), RAW1);
 }
 
@@ -804,7 +936,7 @@ fn maildir_unreadable_file_is_skipped_not_fatal() {
         return; // running with privileges that ignore file modes
     }
     let mut mb = base_mailbox();
-    let ids = import_maildir(&mut mb, &md, FolderId(1)).unwrap();
+    let ids = import_maildir(&mut mb, &mut BodyStore::in_memory(), &md, FolderId(1)).unwrap();
     assert_eq!(ids.len(), 1);
     assert_eq!(mb.mail.len(), 1);
 }
@@ -935,11 +1067,13 @@ fn mbox_import_stops_at_byte_cap() {
     }
     write_file(&file, &content);
     let mut mb = base_mailbox();
-    let ids = crate::import::import_mbox_capped(&mut mb, &file, FolderId(1), 300).unwrap();
+    let mut bodies = BodyStore::in_memory();
+    let ids = crate::import::import_mbox_capped(&mut mb, &mut bodies, &file, FolderId(1), 300).unwrap();
     assert!(!ids.is_empty() && ids.len() < 10, "{}", ids.len());
-    let held: usize = mb.mail.items().filter_map(|m| m.raw.as_ref()).map(Vec::len).sum();
+    let held: usize =
+        mb.mail.items().filter_map(|m| bodies.source_of(m).ok().flatten()).map(|r| r.len()).sum();
     assert!(held <= 300);
-    let ids = import_mbox(&mut mb, &file, FolderId(1)).unwrap();
+    let ids = import_mbox(&mut mb, &mut bodies, &file, FolderId(1)).unwrap();
     assert_eq!(ids.len(), 10);
 }
 
@@ -952,7 +1086,9 @@ fn maildir_import_stops_at_byte_cap() {
         write_file(&md.join(format!("cur/17914338{i:02}.M{i}.host:2,S")), &[b'a'; 100]);
     }
     let mut mb = base_mailbox();
-    let ids = crate::import::import_maildir_capped(&mut mb, &md, FolderId(1), 350).unwrap();
+    let ids =
+        crate::import::import_maildir_capped(&mut mb, &mut BodyStore::in_memory(), &md, FolderId(1), 350)
+            .unwrap();
     assert_eq!(ids.len(), 3);
 }
 
@@ -975,30 +1111,18 @@ fn autosave_falls_back_to_checkpoint_when_append_is_refused() {
 }
 
 #[test]
-fn recoverable_bin_round_trips_with_raw_in_blobs() {
+fn recoverable_bin_round_trips_with_content_by_key() {
     let d = tmp();
     let mut store = Store::open(d.path()).unwrap();
     assert!(store.load_recoverable().unwrap().items.is_empty(), "no file yet");
+    let key1 = store.put_blob(RAW1).unwrap();
+    let key2 = store.put_blob(RAW2).unwrap();
     let mut bin = mailcraft_model::RecoverBin::default();
     bin.add(mailcraft_model::DeletedItem::Mail(Box::new(mail(7, "Gone", Some(RAW1)))), "Inbox", 100);
-    store.save_recoverable(&mut bin).unwrap();
-    let text = fs::read_to_string(d.path().join(crate::RECOVERABLE_FILE)).unwrap();
-    assert!(!text.contains("First body"), "raw sources live in blobs");
-    // The bin in memory now holds the blob key, not the source: the next save does not store it again.
-    let saved_key = match bin.items.first().map(|e| &e.item) {
-        Some(mailcraft_model::DeletedItem::Mail(m)) => {
-            assert!(m.raw.is_none(), "the source left memory");
-            m.blob.clone().unwrap()
-        }
-        other => panic!("mail entry expected, got {other:?}"),
-    };
-    // A second entry with a source: only it is stored; the first keeps its key.
     bin.add(mailcraft_model::DeletedItem::Mail(Box::new(mail(8, "Also gone", Some(RAW2)))), "Inbox", 101);
     store.save_recoverable(&mut bin).unwrap();
-    assert!(bin.items.iter().all(|e| matches!(&e.item, mailcraft_model::DeletedItem::Mail(m)
-        if m.raw.is_none() && m.blob.is_some())));
-    assert!(matches!(bin.items.first().map(|e| &e.item),
-        Some(mailcraft_model::DeletedItem::Mail(m)) if m.blob.as_deref() == Some(saved_key.as_str())));
+    let text = fs::read_to_string(d.path().join(crate::RECOVERABLE_FILE)).unwrap();
+    assert!(!text.contains("First body") && text.contains(&key1), "the file holds keys, not sources");
     bin.items.truncate(1);
     store.save_recoverable(&mut bin).unwrap();
     drop(store);
@@ -1009,12 +1133,12 @@ fn recoverable_bin_round_trips_with_raw_in_blobs() {
         other => panic!("mail entry expected, got {other:?}"),
     };
     assert_eq!(m.subject, "Gone");
-    let key = m.blob.clone().unwrap();
-    assert_eq!(store.get_blob(&key).unwrap(), RAW1);
+    assert_eq!(store.get_blob(m.blob.as_deref().unwrap()).unwrap(), RAW1);
     // The bin keeps its blob alive through a collection that only sees the (empty) mailbox; the blob of
     // the entry that left the bin goes.
-    assert_eq!(store.gc_blobs(&base_mailbox()).unwrap(), 1);
-    assert!(store.has_blob(&key));
+    assert_eq!(store.gc_blobs(&base_mailbox(), &Default::default()).unwrap(), 1);
+    assert!(store.has_blob(&key1));
+    assert!(!store.has_blob(&key2));
 }
 
 #[test]
@@ -1024,7 +1148,7 @@ fn garbled_recoverable_file_is_an_error_and_keeps_blobs() {
     let key = store.put_blob(RAW2).unwrap();
     fs::write(d.path().join(crate::RECOVERABLE_FILE), b"{not json").unwrap();
     assert!(matches!(store.load_recoverable(), Err(StoreError::Corrupt(_))));
-    assert!(store.gc_blobs(&base_mailbox()).is_err());
+    assert!(store.gc_blobs(&base_mailbox(), &Default::default()).is_err());
     assert!(store.has_blob(&key));
 }
 
@@ -1097,26 +1221,4 @@ fn autosave_keeps_the_batch_when_journal_and_snapshot_are_refused() {
     assert!(auto.record(&mut store, &mb, &[Op::PutMail(Box::new(item))]).is_err());
     assert_eq!(auto.pending(), 1, "nothing lost");
     assert_eq!(store.generation(), 0);
-}
-
-/// `append_keyed` names the blob each source went to, for single items and whole-mailbox replaces.
-#[test]
-fn append_keyed_reports_where_sources_went() {
-    let d = tmp();
-    let mut store = Store::open(d.path()).unwrap();
-    let a = mail(1, "A", Some(RAW1));
-    let mut mb = base_mailbox();
-    mb.mail.insert(ItemId(2), mail(2, "B", Some(RAW2)));
-    mb.mail.insert(ItemId(3), mail(3, "C", None));
-    let ops = [Op::PutMail(Box::new(a)), Op::RemoveMail(ItemId(9)), Op::Replace(Box::new(mb))];
-    let keys = store.append_keyed(&ops).unwrap();
-    let want = vec![
-        (ItemId(1), BlobKey::for_data(RAW1).to_string()),
-        (ItemId(2), BlobKey::for_data(RAW2).to_string()),
-    ];
-    assert_eq!(keys, want);
-    for (_, key) in &keys {
-        assert!(store.has_blob(key));
-    }
-    assert!(store.append_keyed(&[]).unwrap().is_empty());
 }

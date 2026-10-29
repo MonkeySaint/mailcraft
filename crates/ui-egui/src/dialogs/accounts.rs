@@ -26,6 +26,7 @@ use super::common::{
 };
 use crate::App;
 use mailcraft_engine::accounts::{AccountOptions, DownloadMode};
+use mailcraft_engine::offline::OfflineWindow;
 use mailcraft_engine::sync::{PushMode, TestReport};
 use mailcraft_model::{Account, AccountId, AccountKind, Security};
 
@@ -601,6 +602,10 @@ struct Extra {
     /// Index into [`PAST`].
     past: usize,
     slow_headers_only: bool,
+    /// IMAP: keep message bodies on this computer (the offline window), and for how long (an index into
+    /// [`OfflineWindow::ALL`]).
+    keep_offline: bool,
+    offline_window: usize,
     oauth_open: bool,
     providers: Vec<(String, String, bool)>,
     provider: usize,
@@ -646,6 +651,8 @@ impl Extra {
             download: download_index(o.download),
             past: past_index(o.download_months),
             slow_headers_only: o.slow_headers_only,
+            keep_offline: o.keep_offline,
+            offline_window: o.offline_window.index(),
             oauth_open: false,
             providers: Vec::new(),
             provider: 0,
@@ -990,6 +997,11 @@ impl Wizard {
         } else {
             o.insert("push".into(), json!(e.push));
         }
+        if !self.pop3 && !self.jmap {
+            o.insert("keepOffline".into(), json!(e.keep_offline));
+            let window = OfflineWindow::from_index(e.offline_window).unwrap_or_default();
+            o.insert("offlineWindow".into(), json!(window.key()));
+        }
     }
 
     /// Params for `accounts.add` (no `account`) or `accounts.edit` (with it). Empty passwords are left out
@@ -1332,6 +1344,9 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
                 });
             }
         }
+        if !st.pop3 && !st.jmap {
+            offline_settings(ui, app, st);
+        }
         more_settings(ui, app, st, uid);
         pim_server_settings(ui, app, st, uid);
         if let Some(o) = oauth_section(ui, app, st, uid) {
@@ -1380,6 +1395,33 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
         }
     });
     out
+}
+
+/// Accessible name of the offline window slider.
+pub(crate) const OFFLINE_SLIDER: &str = "Keep mail from the last";
+
+/// IMAP offline mail: whether message bodies are kept on this computer, and for how long. Headers are always
+/// kept; older bodies are taken off and downloaded again when the message is opened (`offline.rs`).
+fn offline_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard) {
+    common::heading(ui, app, "Offline mail");
+    let e = &mut st.extra;
+    ui.checkbox(&mut e.keep_offline, "Keep mail on this computer to read when offline");
+    ui.add_enabled_ui(e.keep_offline, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(format!("{OFFLINE_SLIDER}:"));
+            let labels: Vec<&str> = OfflineWindow::ALL.iter().map(|w| w.label()).collect();
+            egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                crate::widgets::stop_slider(ui, OFFLINE_SLIDER, &mut e.offline_window, &labels, 280.0);
+            });
+            let shown = OfflineWindow::from_index(e.offline_window).unwrap_or_default();
+            ui.label(RichText::new(shown.label()).strong());
+        });
+    });
+    muted(
+        ui,
+        app,
+        "Message headers are always kept. Older messages are downloaded again when you open them while connected.",
+    );
 }
 
 /// More Settings: POP3 server copies, download preference, Send/Receive group membership and interval, push.

@@ -249,8 +249,10 @@ impl MsgMessage {
         builder.build()
     }
 
-    /// A mailbox item for the message (its source is the [`MsgMessage::to_eml`] rendering).
-    pub fn to_mail_item(&self, folder: FolderId, now: DateTime) -> MailItem {
+    /// A mailbox item for the message and its content: the source is the [`MsgMessage::to_eml`] rendering,
+    /// the body the message's own (its format kept; the body store keeps a record only when that is not what
+    /// the source gives).
+    pub fn to_mail_item(&self, folder: FolderId, now: DateTime) -> (MailItem, mailcraft_store::Content) {
         let raw = self.to_eml();
         let mut item = mailcraft_store::import::item_from_raw(&raw, folder, now);
         item.received = self.received.or(self.sent).or(self.created).unwrap_or(now);
@@ -266,18 +268,28 @@ impl MsgMessage {
             // The builder invented an id; do not present it as the original.
             item.message_id = None;
         }
-        item.body.format = self.body_format;
-        item
+        let mut body = mailcraft_model::Body::from_source(&raw).unwrap_or_default();
+        body.format = self.body_format;
+        (item, mailcraft_store::Content { source: Some(raw), body: Some(body) })
     }
 
-    /// Builds a message from a mailbox item; attachment content comes from the item's source when kept.
-    pub fn from_mail_item(item: &MailItem) -> MsgMessage {
-        Self::from_mail_item_depth(item, 0)
+    /// Builds a message from a mailbox item, its `source` (attachment content comes from it) and its `body`.
+    pub fn from_mail_item(
+        item: &MailItem,
+        source: Option<&[u8]>,
+        body: Option<&mailcraft_model::Body>,
+    ) -> MsgMessage {
+        Self::from_mail_item_depth(item, source, body, 0)
     }
 
-    fn from_mail_item_depth(item: &MailItem, depth: usize) -> MsgMessage {
+    fn from_mail_item_depth(
+        item: &MailItem,
+        source: Option<&[u8]>,
+        body: Option<&mailcraft_model::Body>,
+        depth: usize,
+    ) -> MsgMessage {
         let mut attachments = Vec::new();
-        if let Some(raw) = &item.raw
+        if let Some(raw) = source
             && let Ok(msg) = mailcraft_mime::parse(raw)
         {
             for a in msg.attachments().into_iter().take(MAX_ATTACHMENTS) {
@@ -286,7 +298,13 @@ impl MsgMessage {
                     match mailcraft_mime::parse(&a.data) {
                         Ok(inner) => {
                             let sub = MailItem::from_message(&inner, &a.data, item.received);
-                            AttachmentContent::Message(Box::new(Self::from_mail_item_depth(&sub, depth + 1)))
+                            let sub_body = mailcraft_model::Body::from_message(&inner);
+                            AttachmentContent::Message(Box::new(Self::from_mail_item_depth(
+                                &sub,
+                                Some(&a.data),
+                                Some(&sub_body),
+                                depth + 1,
+                            )))
                         }
                         Err(_) => AttachmentContent::Data(a.data),
                     }
@@ -321,22 +339,30 @@ impl MsgMessage {
             read: item.read,
             unsent: item.is_draft,
             categories: item.categories.clone(),
-            body_text: item.body.text.clone(),
-            body_html: item.body.html.clone(),
+            body_text: body.and_then(|b| b.text.clone()),
+            body_html: body.and_then(|b| b.html.clone()),
             body_rtf: None,
-            body_format: item.body.format,
+            body_format: body.map(|b| b.format).unwrap_or_default(),
             transport_headers: None,
             attachments,
         }
     }
 }
 
-/// Reads a `.msg` file into a mailbox item.
-pub fn read_item(data: &[u8], folder: FolderId, now: DateTime) -> crate::Result<MailItem> {
+/// Reads a `.msg` file into a mailbox item and its content.
+pub fn read_item(
+    data: &[u8],
+    folder: FolderId,
+    now: DateTime,
+) -> crate::Result<(MailItem, mailcraft_store::Content)> {
     Ok(read(data)?.to_mail_item(folder, now))
 }
 
-/// Writes a mailbox item as `.msg` bytes.
-pub fn write_item(item: &MailItem) -> crate::Result<Vec<u8>> {
-    write(&MsgMessage::from_mail_item(item))
+/// Writes a mailbox item (with its source and body) as `.msg` bytes.
+pub fn write_item(
+    item: &MailItem,
+    source: Option<&[u8]>,
+    body: Option<&mailcraft_model::Body>,
+) -> crate::Result<Vec<u8>> {
+    write(&MsgMessage::from_mail_item(item, source, body))
 }

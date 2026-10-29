@@ -220,14 +220,14 @@ mod tests {
         let msg = mailcraft_mime::parse(raw.as_bytes()).unwrap();
         let mut item = MailItem::from_message(&msg, raw.as_bytes(), s.now());
         item.folder = role(s, FolderRole::Inbox);
-        s.mailbox.add_mail(item)
+        s.add_message(item, &mailcraft_store::Content::source(raw.into_bytes())).unwrap()
     }
 
     fn class(s: &mut Session, raw: &str) -> (FocusClass, Reason) {
         let id = arrive(s, raw);
         let k = known(s);
         let m = s.mailbox.mail.get(id).unwrap();
-        let raw = m.raw.clone().unwrap_or_default();
+        let raw = s.source(id).unwrap().unwrap_or_default();
         let head = crate::cmd::compose::raw_headers(&raw);
         classify(m, Some(&head), &k)
     }

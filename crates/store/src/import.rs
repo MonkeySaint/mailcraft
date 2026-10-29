@@ -6,19 +6,21 @@ use std::path::{Path, PathBuf};
 
 use mailcraft_model::{DateTime, FlagState, FolderId, ItemId, MailItem, Mailbox, ResponseState};
 
+use crate::bodies::{BodyStore, Content};
 use crate::journal::read_capped;
 use crate::mbox::{MAX_MESSAGE_BYTES, MboxReader};
 use crate::{Result, StoreError, time};
 
 /// Most entries scanned in one Maildir subdirectory.
 pub const MAX_MAILDIR_ENTRIES: usize = 1_000_000;
-/// Most message source (bytes) one import holds in memory; the rest of the input is left unread.
+/// Most message source (bytes) one import takes in; the rest of the input is left unread.
 pub const MAX_IMPORT_BYTES: u64 = 2 << 30;
 /// Flag label used for Maildir `F` (the default follow-up flag).
 pub const FOLLOW_UP_LABEL: &str = "Follow up";
 
 /// Builds an item from raw bytes. When the MIME parser rejects the message the item is still created from a
-/// minimal header scan so no message is ever lost on import.
+/// minimal header scan so no message is ever lost on import. The source itself is not kept on the item: the
+/// caller stores it ([`store_source`]).
 pub fn item_from_raw(raw: &[u8], folder: FolderId, now: DateTime) -> MailItem {
     let mut item = match mailcraft_mime::parse(raw) {
         Ok(msg) => MailItem::from_message(&msg, raw, now),
@@ -37,10 +39,15 @@ pub fn item_from_raw(raw: &[u8], folder: FolderId, now: DateTime) -> MailItem {
     if item.size == 0 {
         item.size = u64::try_from(raw.len()).unwrap_or(u64::MAX);
     }
-    if item.raw.is_none() {
-        item.raw = Some(raw.to_vec());
-    }
     item
+}
+
+/// Stores `raw` in `bodies` as the source of `item` (`item.blob` set, its expiry date read if it had none).
+pub fn store_source(bodies: &mut BodyStore, item: &mut MailItem, raw: &[u8]) -> Result<()> {
+    if item.expires.is_none() {
+        item.expires = crate::legacy::expiry_in(raw);
+    }
+    bodies.store(item, &Content { source: Some(raw.to_vec()), body: None })
 }
 
 /// Unfolded `(name, value)` header fields of `raw` (lossy UTF-8; stops at the first empty line).
@@ -236,13 +243,19 @@ fn list_maildir(dir: &Path) -> Result<Vec<MaildirEntry>> {
 }
 
 /// See [`crate::import_maildir`].
-pub fn import_maildir(mb: &mut Mailbox, dir: &Path, folder: FolderId) -> Result<Vec<ItemId>> {
-    import_maildir_capped(mb, dir, folder, MAX_IMPORT_BYTES)
+pub fn import_maildir(
+    mb: &mut Mailbox,
+    bodies: &mut BodyStore,
+    dir: &Path,
+    folder: FolderId,
+) -> Result<Vec<ItemId>> {
+    import_maildir_capped(mb, bodies, dir, folder, MAX_IMPORT_BYTES)
 }
 
-/// [`import_maildir`] holding at most `max_bytes` of message source.
+/// [`import_maildir`] taking in at most `max_bytes` of message source.
 pub fn import_maildir_capped(
     mb: &mut Mailbox,
+    bodies: &mut BodyStore,
     dir: &Path,
     folder: FolderId,
     max_bytes: u64,
@@ -274,6 +287,9 @@ pub fn import_maildir_capped(
             item.received = t;
         }
         flags.apply(&mut item);
+        // The source goes to the body store now (a failed import leaves only unreferenced content there,
+        // which collection removes).
+        store_source(bodies, &mut item, &raw)?;
         items.push(item);
     }
     insert_all(mb, items)
@@ -294,13 +310,19 @@ fn cap_u64() -> u64 {
 }
 
 /// See [`crate::import_mbox`].
-pub fn import_mbox(mb: &mut Mailbox, file: &Path, folder: FolderId) -> Result<Vec<ItemId>> {
-    import_mbox_capped(mb, file, folder, MAX_IMPORT_BYTES)
+pub fn import_mbox(
+    mb: &mut Mailbox,
+    bodies: &mut BodyStore,
+    file: &Path,
+    folder: FolderId,
+) -> Result<Vec<ItemId>> {
+    import_mbox_capped(mb, bodies, file, folder, MAX_IMPORT_BYTES)
 }
 
-/// [`import_mbox`] holding at most `max_bytes` of message source.
+/// [`import_mbox`] taking in at most `max_bytes` of message source.
 pub fn import_mbox_capped(
     mb: &mut Mailbox,
+    bodies: &mut BodyStore,
     file: &Path,
     folder: FolderId,
     max_bytes: u64,
@@ -327,6 +349,7 @@ pub fn import_mbox_capped(
         }
         // MBOX carries no read state of its own; honour the common Status / X-Status headers.
         apply_status_headers(&msg.data, &mut item);
+        store_source(bodies, &mut item, &msg.data)?;
         items.push(item);
     }
     if skipped > 0 {
@@ -358,8 +381,8 @@ pub fn apply_status_headers(raw: &[u8], item: &mut MailItem) {
     }
 }
 
-/// Reads one `.eml` file (capped) and builds its item.
-pub fn read_eml(path: &Path, folder: FolderId) -> Result<MailItem> {
+/// Reads one `.eml` file (capped): its item and its source.
+pub fn read_eml(path: &Path, folder: FolderId) -> Result<(MailItem, Vec<u8>)> {
     let raw = read_capped(path, cap_u64())?.ok_or_else(|| {
         StoreError::Io(std::io::Error::new(ErrorKind::NotFound, path.display().to_string()))
     })?;
@@ -370,7 +393,14 @@ pub fn read_eml(path: &Path, folder: FolderId) -> Result<MailItem> {
     if item.received == no_date {
         item.received = mtime(path).unwrap_or_else(time::now);
     }
-    Ok(item)
+    Ok((item, raw))
+}
+
+/// Imports one `.eml` file into `folder` (its source into `bodies`); returns the new item's id.
+pub fn import_eml(mb: &mut Mailbox, bodies: &mut BodyStore, path: &Path, folder: FolderId) -> Result<ItemId> {
+    let (mut item, raw) = read_eml(path, folder)?;
+    store_source(bodies, &mut item, &raw)?;
+    insert_item(mb, item)
 }
 
 #[cfg(test)]
@@ -443,7 +473,12 @@ mod tests {
         fn hostile_raw_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..1024)) {
             let item = item_from_raw(&data, FolderId(3), DateTime::default());
             proptest::prop_assert_eq!(item.folder, FolderId(3));
-            proptest::prop_assert_eq!(item.raw.as_deref(), Some(data.as_slice()));
+            proptest::prop_assert!(item.blob.is_none());
+            let mut bodies = BodyStore::in_memory();
+            let mut stored = item.clone();
+            if store_source(&mut bodies, &mut stored, &data).is_ok() && !data.is_empty() {
+                proptest::prop_assert_eq!(bodies.source_of(&stored).ok().flatten(), Some(data.clone()));
+            }
             let _ = MaildirFlags::parse(&String::from_utf8_lossy(&data));
             let _ = maildir_delivery_time(&String::from_utf8_lossy(&data));
         }

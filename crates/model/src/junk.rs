@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Address, MailItem};
+use crate::{Address, Body, MailItem};
 
 /// Most entries kept in one list (import and add stop there).
 pub const MAX_LIST_ENTRIES: usize = 10_000;
@@ -501,8 +501,9 @@ fn name_address(name: &str) -> Option<String> {
         .map(str::to_lowercase)
 }
 
-/// The transparent junk score of `item`: every signal that fired, with its points.
-pub fn score(item: &MailItem, input: &ScoreInput) -> Vec<Signal> {
+/// The transparent junk score of `item` whose body is `body` (`None` when it is not on this computer: the
+/// preview line stands in): every signal that fired, with its points.
+pub fn score(item: &MailItem, body: Option<&Body>, input: &ScoreInput) -> Vec<Signal> {
     let mut out = Vec::new();
     let mut push = |key: &str, points: i32, detail: String| {
         out.push(Signal { key: key.to_owned(), points, detail });
@@ -568,8 +569,8 @@ pub fn score(item: &MailItem, input: &ScoreInput) -> Vec<Signal> {
     }
 
     // Body signals (bounded scan).
-    let text = item.body.text.as_deref().map(|t| head(t, MAX_SCAN_BYTES)).unwrap_or("");
-    let html = item.body.html.as_deref().map(|t| head(t, MAX_SCAN_BYTES)).unwrap_or("");
+    let text = body.and_then(|b| b.text.as_deref()).map(|t| head(t, MAX_SCAN_BYTES)).unwrap_or("");
+    let html = body.and_then(|b| b.html.as_deref()).map(|t| head(t, MAX_SCAN_BYTES)).unwrap_or("");
     let text_lower =
         if text.is_empty() && html.is_empty() { item.preview.to_lowercase() } else { text.to_lowercase() };
     let html_lower = html.to_lowercase();
@@ -684,8 +685,8 @@ pub struct JunkContext {
     pub score: ScoreInput,
 }
 
-/// Decides whether `item` is junk under `settings`.
-pub fn classify(settings: &JunkSettings, item: &MailItem, ctx: &JunkContext) -> Verdict {
+/// Decides whether `item` (whose body is `body`, see [`score`]) is junk under `settings`.
+pub fn classify(settings: &JunkSettings, item: &MailItem, body: Option<&Body>, ctx: &JunkContext) -> Verdict {
     let verdict = |junk, reason| Verdict { junk, reason, score: 0, signals: Vec::new() };
     let from = item.from.as_ref().map(|a| a.addr.trim().to_lowercase()).unwrap_or_default();
 
@@ -726,7 +727,7 @@ pub fn classify(settings: &JunkSettings, item: &MailItem, ctx: &JunkContext) -> 
         JunkLevel::NoFiltering => verdict(false, JunkReason::Clean),
         JunkLevel::SafeListsOnly => verdict(true, JunkReason::NotOnSafeLists),
         JunkLevel::Low | JunkLevel::High => {
-            let signals = score(item, &ctx.score);
+            let signals = score(item, body, &ctx.score);
             let points = total(&signals);
             let threshold = settings.level.threshold().unwrap_or(LOW_THRESHOLD);
             let junk = points >= threshold;
@@ -790,17 +791,25 @@ pub const COMMON_ENCODINGS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Address, Body, BodyFormat, DateTime};
+    use crate::{Address, BodyFormat, DateTime};
 
-    fn item(from: &str, subject: &str, text: &str) -> MailItem {
-        MailItem {
+    fn item(from: &str, subject: &str, text: &str) -> (MailItem, Body) {
+        let m = MailItem {
             from: Some(Address::new(Some("Sender"), from)),
             to: vec![Address::new(None, "me@example.com")],
             subject: subject.into(),
             sent: Some(DateTime::default()),
-            body: Body { format: BodyFormat::PlainText, text: Some(text.into()), html: None },
             ..Default::default()
-        }
+        };
+        (m, Body { format: BodyFormat::PlainText, text: Some(text.into()), html: None })
+    }
+
+    fn judge(s: &JunkSettings, m: &(MailItem, Body), c: &JunkContext) -> Verdict {
+        classify(s, &m.0, Some(&m.1), c)
+    }
+
+    fn sc(m: &(MailItem, Body), i: &ScoreInput) -> Vec<Signal> {
+        score(&m.0, Some(&m.1), i)
     }
 
     fn ctx() -> JunkContext {
@@ -899,10 +908,10 @@ mod tests {
         let mut s = JunkSettings::default();
         s.add(JunkList::BlockedSenders, "@example.net").unwrap();
         s.add(JunkList::SafeSenders, "friend@example.net").unwrap();
-        let v = classify(&s, &item("friend@example.net", "Hi", "hello"), &ctx());
+        let v = judge(&s, &item("friend@example.net", "Hi", "hello"), &ctx());
         assert!(!v.junk);
         assert_eq!(v.reason, JunkReason::SafeSender("friend@example.net".into()));
-        let v = classify(&s, &item("stranger@example.net", "Hi", "hello"), &ctx());
+        let v = judge(&s, &item("stranger@example.net", "Hi", "hello"), &ctx());
         assert!(v.junk);
         assert_eq!(v.reason, JunkReason::BlockedSender("@example.net".into()));
     }
@@ -911,30 +920,30 @@ mod tests {
     fn blocked_lists_apply_with_no_automatic_filtering() {
         let mut s = JunkSettings { level: JunkLevel::NoFiltering, ..Default::default() };
         let spam = item("x@example.ru", "YOU HAVE WON A PRIZE!!!", "claim your prize, act now, 100% free");
-        assert!(!classify(&s, &spam, &ctx()).junk);
+        assert!(!judge(&s, &spam, &ctx()).junk);
         s.add(JunkList::BlockedTlds, "ru").unwrap();
-        assert_eq!(classify(&s, &spam, &ctx()).reason, JunkReason::BlockedTld("ru".into()));
+        assert_eq!(judge(&s, &spam, &ctx()).reason, JunkReason::BlockedTld("ru".into()));
         s.blocked_tlds.clear();
         s.add(JunkList::BlockedEncodings, "koi8-r").unwrap();
         let c = JunkContext { charsets: vec!["KOI8-R".into()], ..ctx() };
-        assert_eq!(classify(&s, &spam, &c).reason, JunkReason::BlockedEncoding("koi8-r".into()));
+        assert_eq!(judge(&s, &spam, &c).reason, JunkReason::BlockedEncoding("koi8-r".into()));
     }
 
     #[test]
     fn safe_lists_only_and_safe_recipients_and_contacts() {
         let mut s = JunkSettings { level: JunkLevel::SafeListsOnly, ..Default::default() };
         let m = item("colleague@example.com", "Lunch", "See you at noon");
-        assert_eq!(classify(&s, &m, &ctx()).reason, JunkReason::NotOnSafeLists);
+        assert_eq!(judge(&s, &m, &ctx()).reason, JunkReason::NotOnSafeLists);
         let c = JunkContext { contacts: vec!["colleague@example.com".into()], ..ctx() };
-        assert_eq!(classify(&s, &m, &c).reason, JunkReason::Contact);
+        assert_eq!(judge(&s, &m, &c).reason, JunkReason::Contact);
         s.trust_contacts = false;
-        assert!(classify(&s, &m, &c).junk);
+        assert!(judge(&s, &m, &c).junk);
         s.add(JunkList::SafeRecipients, "team@lists.example.org").unwrap();
         let c = JunkContext { list_address: Some("team@lists.example.org".into()), ..ctx() };
-        assert_eq!(classify(&s, &m, &c).reason, JunkReason::SafeRecipient("team@lists.example.org".into()));
+        assert_eq!(judge(&s, &m, &c).reason, JunkReason::SafeRecipient("team@lists.example.org".into()));
         let mut to_list = m.clone();
-        to_list.to.push(Address::new(None, "Team@Lists.Example.org"));
-        assert!(!classify(&s, &to_list, &ctx()).junk);
+        to_list.0.to.push(Address::new(None, "Team@Lists.Example.org"));
+        assert!(!judge(&s, &to_list, &ctx()).junk);
     }
 
     #[test]
@@ -943,15 +952,15 @@ mod tests {
         let high = JunkSettings { level: JunkLevel::High, ..Default::default() };
         let normal = item("alice@example.com", "Project kickoff", "Let's meet on Tuesday at 10.");
         for s in [&low, &high] {
-            let v = classify(s, &normal, &ctx());
+            let v = judge(s, &normal, &ctx());
             assert!(!v.junk, "{v:?}");
             assert_eq!(v.score, 0);
         }
         // Moderately spammy: caught by High only.
         let mut mild = item("deals@example.net", "Limited time offer", "Order now while stocks last.");
-        mild.reply_to = vec![Address::new(None, "replies@example.org")];
-        let lv = classify(&low, &mild, &ctx());
-        let hv = classify(&high, &mild, &ctx());
+        mild.0.reply_to = vec![Address::new(None, "replies@example.org")];
+        let lv = judge(&low, &mild, &ctx());
+        let hv = judge(&high, &mild, &ctx());
         assert!(!lv.junk && hv.junk, "low={lv:?} high={hv:?}");
         assert_eq!(hv.reason, JunkReason::Score);
         assert!(hv.signals.iter().any(|s| s.key == "reply-to-mismatch"));
@@ -961,7 +970,7 @@ mod tests {
             "YOU HAVE WON A PRIZE!!!",
             "Claim your prize: act now, 100% free. http://192.0.2.7/claim",
         );
-        let v = classify(&low, &obvious, &ctx());
+        let v = judge(&low, &obvious, &ctx());
         assert!(v.junk, "{v:?}");
         assert!(v.score >= LOW_THRESHOLD);
         let keys: Vec<&str> = v.signals.iter().map(|s| s.key.as_str()).collect();
@@ -974,28 +983,28 @@ mod tests {
     #[test]
     fn header_signals() {
         let mut m = item("billing@example.net", "Invoice", "Please see attached.");
-        m.from = Some(Address::new(Some("service@bank.example.com"), "billing@example.net"));
-        m.to.clear();
-        m.sent = None;
-        let sig = score(&m, &ScoreInput { has_message_id: false });
+        m.0.from = Some(Address::new(Some("service@bank.example.com"), "billing@example.net"));
+        m.0.to.clear();
+        m.0.sent = None;
+        let sig = sc(&m, &ScoreInput { has_message_id: false });
         let keys: Vec<&str> = sig.iter().map(|s| s.key.as_str()).collect();
         assert!(keys.contains(&"display-name-spoof"), "{keys:?}");
         assert!(
             keys.contains(&"no-message-id") && keys.contains(&"no-date") && keys.contains(&"no-recipients")
         );
         let links: String = (0..30).map(|i| format!("https://example.com/{i} ")).collect();
-        let sig = score(&item("a@example.com", "News", &links), &ScoreInput { has_message_id: true });
+        let sig = sc(&item("a@example.com", "News", &links), &ScoreInput { has_message_id: true });
         assert!(sig.iter().any(|s| s.key == "many-links" && s.points == 3));
         let mut empty = item("", "", "");
-        empty.from = None;
-        let sig = score(&empty, &ScoreInput::default());
+        empty.0.from = None;
+        let sig = sc(&empty, &ScoreInput::default());
         assert!(sig.iter().any(|s| s.key == "no-sender"));
     }
 
     #[test]
     fn phrase_points_are_capped() {
         let body = SPAM_PHRASES.join(" ");
-        let sig = score(&item("a@example.com", "x", &body), &ScoreInput { has_message_id: true });
+        let sig = sc(&item("a@example.com", "x", &body), &ScoreInput { has_message_id: true });
         let p = sig.iter().find(|s| s.key == "spam-phrases").unwrap();
         assert_eq!(p.points, PHRASE_CAP);
     }
@@ -1015,9 +1024,9 @@ mod tests {
         let s = JunkSettings { level: JunkLevel::High, ..Default::default() };
         let weird = "é\u{1F600}\0http://".repeat(100_000);
         let mut m = item("\u{1F600}@\u{1F600}", &weird, &weird);
-        m.body.html = Some(weird.clone());
-        m.reply_to = vec![Address::new(Some(&weird), "@")];
-        let _ = classify(&s, &m, &ctx());
+        m.1.html = Some(weird.clone());
+        m.0.reply_to = vec![Address::new(Some(&weird), "@")];
+        let _ = judge(&s, &m, &ctx());
         assert_eq!(head("éé", 1), "");
         assert_eq!(head("éé", 3), "é");
         assert!(!has_ip_link("http://"));

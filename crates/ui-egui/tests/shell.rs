@@ -269,23 +269,28 @@ fn bulk_folder_actions_and_ignore_ask_first() {
     let redundant = {
         let s = &mut h.state_mut().s;
         let now = s.now();
-        let item = |subject: &str, text: &str, unix: i64| MailItem {
+        let item = |subject: &str, unix: i64| MailItem {
             folder: inbox,
             subject: subject.into(),
             from: Some(Address::new(Some("Ann Lee"), "ann@example.com")),
             received: DateTime { unix, ..now },
             read: true,
-            body: Body { format: BodyFormat::PlainText, text: Some(text.into()), html: None },
             ..Default::default()
         };
-        let mut original = item("Picnic", "Shall we meet at noon by the lake?", now.unix - 120);
+        let text = |text: &str| {
+            mailcraft_engine::Content::body(Body {
+                format: BodyFormat::PlainText,
+                text: Some(text.into()),
+                html: None,
+            })
+        };
+        let mut original = item("Picnic", now.unix - 120);
         original.message_id = Some("picnic-1@example.com".into());
-        let mut reply =
-            item("RE: Picnic", "Yes, see you there.\n\n> Shall we meet at noon by the lake?", now.unix - 60);
+        let mut reply = item("RE: Picnic", now.unix - 60);
         reply.in_reply_to = vec!["picnic-1@example.com".into()];
         reply.references = vec!["picnic-1@example.com".into()];
-        let id = s.mailbox.add_mail(original);
-        s.mailbox.add_mail(reply);
+        let id = s.add_message(original, &text("Shall we meet at noon by the lake?")).unwrap();
+        s.add_message(reply, &text("Yes, see you there.\n\n> Shall we meet at noon by the lake?")).unwrap();
         id
     };
     let ids_in = |h: &Harness<'_, App>| {

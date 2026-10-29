@@ -23,16 +23,58 @@ use mailcraft_model::{AccountId, AccountKind, FolderId, ItemId, MailItem};
 /// Parameters of `sendReceive.preferences`.
 pub const PREFERENCES_PARAMS: &str = r#"{"account"?: number|string (default: every account, the All Accounts group), "mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool|"toggle" (on slow connections download only headers), "downloadMonths"?: number|null (first download: mail from the past N months; null = all), "include"?: bool (member of All Accounts: F9 and scheduled runs), "intervalMinutes"?: number|null (scheduled send/receive; null = Options › Advanced), "push"?: bool (new mail pushed with IMAP IDLE), "pollMinutes"?: number}"#;
 
-/// No body, no source, no stored blob: only the header was downloaded.
+/// No stored body and no stored source: only the header is on this computer (downloaded as headers only, or
+/// the body was taken off by the account's offline window).
 fn bodyless(m: &MailItem) -> bool {
-    m.body.text.is_none() && m.body.html.is_none() && m.raw.is_none() && m.blob.is_none()
+    m.body_key.is_none() && m.blob.is_none()
 }
 
-/// True when the item was downloaded as headers only and not yet in full.
+/// True when the item was downloaded as headers only and not yet in full, or its body was taken off this
+/// computer by the account's offline window.
 pub fn is_header_only(s: &Session, id: ItemId) -> bool {
-    s.mailbox.mail.get(id).is_some_and(|m| {
-        (s.sync.prefs.data.headers_only.contains(&id.0) && m.raw.is_none() && m.blob.is_none()) || bodyless(m)
-    })
+    s.mailbox
+        .mail
+        .get(id)
+        .is_some_and(|m| (s.sync.prefs.data.headers_only.contains(&id.0) && m.blob.is_none()) || bodyless(m))
+}
+
+/// True when the rest of the item is on its server only: header-only ([`is_header_only`]) and downloaded as
+/// headers only, taken off by the offline window, or a server copy (a server id in a synchronised folder). A
+/// local item that simply has no content is not.
+pub fn rest_on_server(s: &Session, id: ItemId) -> bool {
+    is_header_only(s, id)
+        && s.mailbox.mail.get(id).is_some_and(|m| {
+            m.body_evicted
+                || s.sync.prefs.data.headers_only.contains(&id.0)
+                || crate::sync::queue_account(&s.mailbox, m).is_some()
+        })
+}
+
+/// The error for work that needs the whole of messages only whose header is on this computer (`missing`,
+/// see [`rest_on_server`]): `doing` says what was refused ("moved out of their account", "copied"…). Their
+/// download starts now unless MailCraft works offline, so the same command works once they have arrived.
+pub(crate) fn not_downloaded(s: &mut Session, missing: &[ItemId], doing: &str) -> CmdError {
+    let started = !s.view.work_offline && download_now(s, missing).is_ok_and(|n| n > 0);
+    let (what, it) = match missing.len() {
+        1 => ("1 message has only its header".to_owned(), "it"),
+        n => (format!("{n} messages have only their headers"), "they"),
+    };
+    let next = if started {
+        "Downloading now: try again when the download has finished."
+    } else {
+        "Download the rest first (Download the rest of this message, or Mark to Download and Process Marked \
+         Headers) while the account is connected."
+    };
+    CmdError::Failed(format!(
+        "{what} on this computer (the rest is on the server), so {it} cannot be {doing} yet. {next}"
+    ))
+}
+
+/// Refuses work on `ids` that needs their whole content when the rest of any of them is on its server only
+/// (see [`rest_on_server`] and [`not_downloaded`]).
+pub(crate) fn need_content(s: &mut Session, ids: &[ItemId], doing: &str) -> Result<(), CmdError> {
+    let missing: Vec<ItemId> = ids.iter().copied().filter(|i| rest_on_server(s, *i)).collect();
+    if missing.is_empty() { Ok(()) } else { Err(not_downloaded(s, &missing, doing)) }
 }
 
 /// `Some(copy)` when the item is marked to download (`copy`: Mark to Download Message Copy).
@@ -310,8 +352,12 @@ mod tests {
     fn mark_unmark_and_preferences() {
         let (mut s, inbox, _) = session();
         let a = imap(&mut s);
-        let body =
-            s.mailbox.add_mail(MailItem { folder: inbox, raw: Some(b"x".to_vec()), ..Default::default() });
+        let body = s
+            .add_message(
+                MailItem { folder: inbox, ..Default::default() },
+                &mailcraft_store::Content::source(b"x".to_vec()),
+            )
+            .unwrap();
         let head = s.mailbox.add_mail(MailItem { folder: inbox, ..Default::default() });
         s.sync.prefs.data.headers_only.insert(head.0);
         let r = mark(&mut s, &json!({"ids": [body.0, head.0], "copy": true})).unwrap();
@@ -363,8 +409,12 @@ mod tests {
         let (mut s, inbox, _) = session();
         let gone = ItemId(9_999);
         s.sync.prefs.data.marked.insert(gone.0, false);
-        let full =
-            s.mailbox.add_mail(MailItem { folder: inbox, raw: Some(b"x".to_vec()), ..Default::default() });
+        let full = s
+            .add_message(
+                MailItem { folder: inbox, ..Default::default() },
+                &mailcraft_store::Content::source(b"x".to_vec()),
+            )
+            .unwrap();
         s.sync.prefs.data.marked.insert(full.0, false);
         let r = process_marked(&mut s, &json!({"allFolders": true})).unwrap();
         assert_eq!(r["requested"], 0);

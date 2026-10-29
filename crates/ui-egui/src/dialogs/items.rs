@@ -615,7 +615,7 @@ mod tests {
         let m = s.mailbox.mail.items().find(|m| m.subject == "Team lunch").expect("post saved");
         assert_eq!(m.folder, inbox);
         assert!(m.to.is_empty() && !m.is_draft);
-        assert_eq!(m.body.text.as_deref(), Some("Friday at noon."));
+        assert_eq!(s.body_or_empty(m).text.as_deref(), Some("Friday at noon."));
     }
 
     #[test]

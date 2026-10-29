@@ -55,7 +55,7 @@ fn target_text(s: &Session, p: &Value) -> Result<(Value, String), CmdError> {
     }
     let id = item.ok_or_else(|| CmdError::Disabled("select a message first".into()))?;
     let m = s.mailbox.mail.get(id).ok_or_else(|| CmdError::Disabled("select a message first".into()))?;
-    Ok((json!({"item": id.0}), m.body_text()))
+    Ok((json!({"item": id.0}), s.body_text(m)))
 }
 
 /// Suggestions computed per spelling issue.
@@ -1857,9 +1857,9 @@ mod tests {
         let mut s = session();
         assert!(s.run("review.readAloud", &json!({})).is_err(), "nothing to read");
         let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
-        let mut m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
-        m.body.text = Some("Hola mundo".into());
-        let mid = s.mailbox.add_mail(m);
+        let m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
+        let body = mailcraft_model::Body { text: Some("Hola mundo".into()), ..Default::default() };
+        let mid = s.add_message(m, &mailcraft_store::Content::body(body)).unwrap();
         s.selection.focus = Some(mid);
         let r = s.run("review.readAloud", &json!({})).unwrap();
         assert_eq!(r["text"], "Hola mundo");
@@ -1894,9 +1894,9 @@ mod tests {
     fn translator_hook_translates_received_messages_and_show_original_switches() {
         let mut s = session();
         let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
-        let mut m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
-        m.body.text = Some("hola mundo".into());
-        let mid = s.mailbox.add_mail(m);
+        let m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
+        let body = mailcraft_model::Body { text: Some("hola mundo".into()), ..Default::default() };
+        let mid = s.add_message(m, &mailcraft_store::Content::body(body)).unwrap();
         s.selection.focus = Some(mid);
         // No translator: the window explains, nothing is translated or kept.
         let r = s.run("review.translate", &json!({"id": mid.0})).unwrap();
@@ -1914,7 +1914,7 @@ mod tests {
         let shown = crate::translate::shown(&s, mid).unwrap();
         assert_eq!((shown.to.as_str(), shown.by.as_str()), ("fr", "Test translator"));
         // The message itself is not changed.
-        assert_eq!(s.mailbox.mail.get(mid).unwrap().body.text.as_deref(), Some("hola mundo"));
+        assert_eq!(s.body_now(mid).text.as_deref(), Some("hola mundo"));
         // Show Original switches to the message's own body and back.
         let r = s.run("review.translate", &json!({"id": mid.0, "showOriginal": true})).unwrap();
         assert_eq!(r["showOriginal"], true);
@@ -1963,9 +1963,9 @@ mod tests {
         let mut s = session();
         s.background_translate = true;
         let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
-        let mut m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
-        m.body.text = Some("hola mundo".into());
-        let mid = s.mailbox.add_mail(m);
+        let m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
+        let body = mailcraft_model::Body { text: Some("hola mundo".into()), ..Default::default() };
+        let mid = s.add_message(m, &mailcraft_store::Content::body(body)).unwrap();
         let (go, rx) = std::sync::mpsc::channel();
         crate::translate::set_translator(&mut s, Some(std::sync::Arc::new(Gated(std::sync::Mutex::new(rx)))));
 
@@ -2023,9 +2023,9 @@ mod tests {
         let mut s = session();
         let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
         let add = |s: &mut Session, text: &str| {
-            let mut m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
-            m.body.text = Some(text.into());
-            s.mailbox.add_mail(m)
+            let m = MailItem { folder: inbox, subject: "Hola".into(), ..Default::default() };
+            let body = mailcraft_model::Body { text: Some(text.into()), ..Default::default() };
+            s.add_message(m, &mailcraft_store::Content::body(body)).unwrap()
         };
         let (a, b) = (add(&mut s, "hola"), add(&mut s, "adios"));
         for id in [a, b] {

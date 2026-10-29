@@ -908,7 +908,7 @@ fn ctrl_v_pastes_the_html_flavour_and_offers_paste_options() {
 }
 
 fn voting_app() -> (App, ItemId) {
-    let mut mb = Mailbox::new_local("Local");
+    let mb = Mailbox::new_local("Local");
     let inbox = mb
         .folders
         .values()
@@ -923,8 +923,9 @@ fn voting_app() -> (App, ItemId) {
         DateTime::from_civil(2026, 10, 9, 12, 0, 0, 0).unwrap(),
     );
     item.folder = inbox;
-    let id = mb.add_mail(item);
-    (App::new(Session::new(mb)), id)
+    let mut s = Session::new(mb);
+    let id = s.add_message(item, &mailcraft_engine::Content::source(raw.clone())).unwrap();
+    (App::new(s), id)
 }
 
 #[test]

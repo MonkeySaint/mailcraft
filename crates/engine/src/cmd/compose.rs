@@ -676,11 +676,12 @@ pub(crate) fn safe_name(base: &str, fallback: &str, ext: &str) -> String {
     format!("{}.{ext}", if clean.is_empty() { fallback } else { clean })
 }
 
-/// RFC 5322 source of a stored message (kept raw source, else rebuilt from its fields).
-pub(crate) fn message_source(m: &MailItem) -> Vec<u8> {
-    if let Some(raw) = &m.raw {
-        return raw.clone();
+/// RFC 5322 source of a stored message (its stored source, else rebuilt from its fields and body).
+pub(crate) fn message_source(s: &Session, m: &MailItem) -> Vec<u8> {
+    if let Some(raw) = stored_raw(s, m).filter(|r| !r.is_empty()) {
+        return raw;
     }
+    let body = s.body_or_empty(m);
     let mut b = MessageBuilder::new();
     b.from = m.from.clone();
     b.to = m.to.iter().cloned().map(Address::Mailbox).collect();
@@ -688,8 +689,8 @@ pub(crate) fn message_source(m: &MailItem) -> Vec<u8> {
     b.subject = m.subject.clone();
     b.date = m.sent.or(Some(m.received));
     b.message_id = m.message_id.clone();
-    b.text = m.body.text.clone().or_else(|| m.body.html.as_deref().map(mailcraft_html::html_to_text));
-    b.html = m.body.html.clone();
+    b.text = body.text.clone().or_else(|| body.html.as_deref().map(mailcraft_html::html_to_text));
+    b.html = body.html.clone();
     b.keep_bcc = true;
     b.build()
 }
@@ -941,19 +942,19 @@ pub(crate) fn uuencode(name: &str, data: &[u8]) -> String {
     out
 }
 
-/// A stored item for a built message.
+/// An item for a built message, and its source (the caller stores it).
 fn item_from(b: &MessageBuilder, now: DateTime) -> (MailItem, Vec<u8>) {
     item_from_raw(b, b.build(), now)
 }
 
-/// A stored item for the finished message `raw` built from `b`.
+/// An item for the finished message `raw` built from `b`, and `raw` (the caller stores it).
 fn item_from_raw(b: &MessageBuilder, raw: Vec<u8>, now: DateTime) -> (MailItem, Vec<u8>) {
     let item = match mailcraft_mime::parse(&raw) {
         Ok(msg) => MailItem::from_message(&msg, &raw, now),
         Err(_) => MailItem {
             subject: b.subject.clone(),
             received: now,
-            raw: Some(raw.clone()),
+            size: u64::try_from(raw.len()).unwrap_or(u64::MAX),
             ..Default::default()
         },
     };
@@ -985,7 +986,7 @@ pub fn save_draft(s: &mut Session, cid: u64) -> Result<ItemId, CmdError> {
     };
     let now = s.now();
     let b = build_message(s, &c, account.as_ref(), true);
-    let (mut item, _) = if crate::smime::draft_must_be_encrypted(s, &c) {
+    let (mut item, raw) = if crate::smime::draft_must_be_encrypted(s, &c) {
         // To be encrypted, or answering an encrypted message: the draft is kept encrypted to the user's own
         // digital ID, so its text never reaches the mailbox, the journal or the server in the clear.
         let from = account.as_ref().map(|a| a.address.clone()).unwrap_or_default();
@@ -1004,7 +1005,10 @@ pub fn save_draft(s: &mut Session, cid: u64) -> Result<ItemId, CmdError> {
     item.categories = c.categories.clone();
     item.contacts = crate::cmd::util::split_names(&c.contacts);
     item.no_auto_archive = c.no_auto_archive;
-    item.body.format = c.format;
+    // The source gives the body; the compose format (plain text, rich text) is kept with it.
+    let mut body = mailcraft_model::Body::from_source(&raw).unwrap_or_default();
+    body.format = c.format;
+    s.store_content(&mut item, &mailcraft_store::Content { source: Some(raw), body: Some(body) })?;
     let id = match existing {
         Some((id, _)) => {
             item.id = id;
@@ -1115,7 +1119,7 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     }
     let now = s.now();
     let b = build_message(s, &c, Some(&account), false);
-    let (mut item, _) = if c.sign || c.encrypt {
+    let (mut item, raw) = if c.sign || c.encrypt {
         // S/MIME: Sign / Encrypt the finished message (may stop the send: no digital ID, or recipients
         // without certificates, which the user is asked about).
         let recipients: Vec<String> = [&b.to, &b.cc, &b.bcc]
@@ -1143,6 +1147,7 @@ fn send(s: &mut Session, p: &Value) -> CmdResult {
     item.categories = c.categories.clone();
     item.contacts = crate::cmd::util::split_names(&c.contacts);
     item.no_auto_archive = c.no_auto_archive;
+    s.store_source(&mut item, &raw)?;
     let id = s.mailbox.add_mail(item);
     // Auto-Complete list (most recently used first).
     s.mailbox.record_recipients(&c.recipients(), now);
@@ -1708,7 +1713,7 @@ fn item_as_text(s: &Session, id: ItemId) -> Option<String> {
         line("To", &m.to.iter().map(|a| a.to_display_string()).collect::<Vec<_>>().join("; "));
         line("Subject", &m.subject);
         out.push('\n');
-        out.push_str(&m.body_text());
+        out.push_str(&s.body_text(m));
     } else if let Some(c) = s.mailbox.contacts.get(&id) {
         line("Full name", &c.full_name());
         line("Company", &c.company);
@@ -1752,7 +1757,7 @@ fn attach_item(s: &mut Session, p: &Value) -> CmdResult {
         ComposeAttachment {
             filename: safe_name(&m.subject, "message", "eml"),
             mime_type: "message/rfc822".into(),
-            data: stored_raw(s, m).filter(|r| !r.is_empty()).unwrap_or_else(|| message_source(m)),
+            data: message_source(s, m),
         }
     } else if let Some(c) = s.mailbox.contacts.get(&id) {
         let name = if c.full_name().is_empty() { c.file_as.clone() } else { c.full_name() };
@@ -3109,33 +3114,26 @@ pub fn voting_choices(text: &str) -> Vec<String> {
     out
 }
 
-/// Raw source of a stored item: kept bytes, else the blob store.
+/// Raw source of a stored item, from the session's body store (`None` when it has none or it cannot be
+/// read, which is logged).
 pub(crate) fn stored_raw(s: &Session, m: &MailItem) -> Option<Vec<u8>> {
-    if let Some(r) = &m.raw {
-        return Some(r.clone());
-    }
-    s.store.as_ref().and_then(|st| st.raw_of(m).ok().flatten())
-}
-
-/// The first `cap` bytes of a stored item's source (for header scans): its kept bytes, else the start of
-/// its blob in the store (sources leave memory once stored, issue #25). `None` when it has no source.
-pub(crate) fn stored_head<'a>(
-    s: &Session,
-    m: &'a MailItem,
-    cap: usize,
-) -> Option<std::borrow::Cow<'a, [u8]>> {
-    use std::borrow::Cow;
-    if let Some(r) = &m.raw {
-        return Some(Cow::Borrowed(r.get(..r.len().min(cap)).unwrap_or_default()));
-    }
-    let store = s.store.as_ref()?;
-    match store.head_of(m, cap) {
-        Ok(head) => head.map(Cow::Owned),
+    match s.source_of(m) {
+        Ok(r) => r,
         Err(e) => {
             log::warn!("cannot read the source of message {}: {e}", m.id.0);
             None
         }
     }
+}
+
+/// The first `cap` bytes of a stored item's source (for header scans), from the session's body store.
+/// `None` when it has no source.
+pub(crate) fn stored_head<'a>(
+    s: &Session,
+    m: &'a MailItem,
+    cap: usize,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+    s.source_head(m, cap).map(std::borrow::Cow::Owned)
 }
 
 /// The header section of `raw` (up to, not including, the first empty line).
@@ -3205,14 +3203,19 @@ pub fn file_sent_copy(s: &mut Session, item: ItemId) -> bool {
             let Some(folder) = folder else {
                 return false;
             };
-            let Some(m) = s.mailbox.mail.get_mut(item) else {
+            let Some(mut m) = s.mailbox.mail.get(item).cloned() else {
                 return false;
             };
+            let stripped = strip_submit_headers(&raw);
+            if let Err(e) = s.store_source(&mut m, &stripped) {
+                log::error!("could not file the sent copy of message {}: {e}", item.0);
+                return false;
+            }
             m.folder = folder;
             m.read = true;
             m.remote_id = None;
-            m.raw = Some(strip_submit_headers(&raw));
-            m.size = m.raw.as_ref().map_or(m.size, |r| u64::try_from(r.len()).unwrap_or(u64::MAX));
+            m.size = u64::try_from(stripped.len()).unwrap_or(u64::MAX);
+            s.mailbox.mail.insert(item, m);
             true
         }
         None => false,
@@ -3837,6 +3840,7 @@ fn send_read_receipt(s: &mut Session, p: &Value) -> CmdResult {
     item.read = true;
     item.received = now;
     item.sent = Some(now);
+    s.store_source(&mut item, &raw)?;
     let rid = s.mailbox.add_mail(item);
     crate::sync::send_now(s, account.id);
     Ok(json!({"sent": true, "item": rid.0, "to": to}))
@@ -4419,11 +4423,11 @@ pub(crate) mod tests {
         assert_eq!(m.subject, "Hello");
         assert_eq!(m.to.len(), 2);
         assert_eq!(m.bcc.len(), 1);
-        let raw = String::from_utf8_lossy(m.raw.as_ref().unwrap()).to_string();
+        let raw = s.source_text(m.id);
         assert!(raw.contains("multipart/alternative"));
         assert!(raw.contains("Disposition-Notification-To"));
         assert!(!raw.to_ascii_lowercase().contains("\nbcc:"), "Bcc not transmitted");
-        assert!(m.body.html.as_deref().unwrap_or("").contains("Hi there"));
+        assert!(s.body_now(m.id).html.as_deref().unwrap_or("").contains("Hi there"));
     }
 
     #[test]
@@ -4448,7 +4452,7 @@ pub(crate) mod tests {
         let r = s.run("compose.send", &json!({})).unwrap();
         assert_eq!(r["sent"], true);
         let m = folder_items(&s, FolderRole::Outbox)[0];
-        assert!(m.body.html.is_none());
+        assert!(s.body_now(m.id).html.is_none());
         assert_eq!(m.in_reply_to, vec!["q@x".to_string()]);
         assert!(matches!(s.mailbox.mail.get(src).unwrap().response, ResponseState::Replied(_)));
     }
@@ -4530,7 +4534,7 @@ pub(crate) mod tests {
 
     fn outbox_raw(s: &Session) -> String {
         let m = folder_items(s, FolderRole::Outbox).into_iter().max_by_key(|m| m.id).unwrap();
-        String::from_utf8_lossy(m.raw.as_ref().unwrap()).into_owned()
+        s.source_text(m.id)
     }
 
     fn folder_of(s: &Session, role: FolderRole) -> mailcraft_model::FolderId {
@@ -4567,7 +4571,7 @@ pub(crate) mod tests {
         assert!(file_sent_copy(&mut s, id));
         let m = s.mailbox.mail.get(id).unwrap();
         assert_eq!(m.folder, archive);
-        assert!(!String::from_utf8_lossy(m.raw.as_ref().unwrap()).contains("X-MailCraft-Submit"));
+        assert!(!s.source_text(m.id).contains("X-MailCraft-Submit"));
 
         // Default: the caller files it in Sent Items.
         open(&mut s);
@@ -4597,7 +4601,7 @@ pub(crate) mod tests {
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut item = MailItem::from_message(&msg, &raw, s.now());
         item.folder = inbox;
-        s.mailbox.add_mail(item)
+        s.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap()
     }
 
     #[test]
@@ -5482,14 +5486,15 @@ mod depth_tests {
         assert!(s.run("compose.renameAttachment", &json!({"name": "scan.pdf"})).is_err(), "newName required");
         let acc = s.mailbox.default_account().map(|a| a.id).unwrap();
         let inbox = s.mailbox.role_folder(acc, FolderRole::Inbox).unwrap();
-        let mid = s.mailbox.add_mail(MailItem {
+        let item = MailItem {
             folder: inbox,
             subject: "Report".into(),
             from: Some(mailcraft_mime::Mailbox::new(Some("Ann"), "ann@example.org")),
-            body: mailcraft_model::Body { text: Some("Numbers inside.".into()), ..Default::default() },
             received: s.now(),
             ..Default::default()
-        });
+        };
+        let body = mailcraft_model::Body { text: Some("Numbers inside.".into()), ..Default::default() };
+        let mid = s.add_message(item, &mailcraft_store::Content::body(body)).unwrap();
         s.run("compose.attachItem", &json!({"itemId": mid.0})).unwrap();
         let c = s.composes[&id].clone();
         assert_eq!(c.attachments[1].mime_type, "message/rfc822");
@@ -5666,7 +5671,7 @@ mod options_tests {
 
     fn outbox_raw(s: &Session) -> String {
         let id = in_role(s, FolderRole::Outbox).into_iter().max().unwrap();
-        String::from_utf8_lossy(s.mailbox.mail.get(id).unwrap().raw.as_ref().unwrap()).into_owned()
+        s.source_text(id)
     }
 
     #[test]
@@ -5691,7 +5696,7 @@ mod options_tests {
         advance(&mut s, 3 * 60);
         s.run("compose.insertText", &json!({"text": "!"})).unwrap();
         assert!(!s.composes[&id].dirty, "saved while typing");
-        assert!(s.mailbox.mail.get(ItemId(draft)).unwrap().body_text().contains("Draft text more!"));
+        assert!(s.body_text(s.mailbox.mail.get(ItemId(draft)).unwrap()).contains("Draft text more!"));
         // Every minute when set to 1; never when off.
         set(&mut s, "mail.save.autoSaveMinutes", json!(1));
         s.run("compose.insertText", &json!({"text": "x"})).unwrap();
@@ -5949,7 +5954,7 @@ Original-Message-ID: <{mid}>\r\nDisposition: manual-action/MDN-sent-manually; di
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut item = MailItem::from_message(&msg, &raw, s.now());
         item.folder = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
-        s.mailbox.add_mail(item);
+        s.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap();
         assert!(tracking(&s, sent).unwrap().receipts.is_empty());
         set(&mut s, "mail.tracking.updateSentItem", json!(true));
         assert_eq!(tracking(&s, sent).unwrap().receipts.len(), 1);
@@ -6037,8 +6042,7 @@ Original-Message-ID: <{mid}>\r\nDisposition: manual-action/MDN-sent-manually; di
         // A drafted message carries no recipient flag headers.
         s.run("compose.followUp", &json!({"kind": "custom", "recipients": {"label": "Read"}})).unwrap();
         let draft = save_draft(&mut s, id).unwrap();
-        let raw =
-            String::from_utf8_lossy(s.mailbox.mail.get(draft).unwrap().raw.as_ref().unwrap()).into_owned();
+        let raw = s.source_text(draft);
         assert!(!raw.contains("X-Message-Flag"), "{raw}");
     }
 

@@ -440,6 +440,8 @@ pub struct SyncState {
     pub(crate) prefs: crate::accounts::PrefsSlot,
     /// Marked items to download in full with the account's next run.
     pub(crate) fetch: BTreeMap<AccountId, Vec<ItemId>>,
+    /// Offline-window passes and the downloads opening a message started (see `offline.rs`).
+    pub(crate) offline: crate::offline::OfflineState,
     /// Accounts whose next run downloads new messages as headers only (Download Headers).
     pub(crate) force_headers: BTreeSet<AccountId>,
     /// Last run of each user-defined Send/Receive group (lower-case name → Unix time; see `groups.rs`).
@@ -553,6 +555,12 @@ impl Session {
         }
     }
 
+    /// The error of account `id`'s last send/receive while none is in flight (`None` while one runs, or
+    /// when the last one worked).
+    pub(crate) fn last_run_error(&self, id: AccountId) -> Option<String> {
+        self.sync.runs.get(&id).filter(|r| r.busy.is_none()).and_then(|r| r.error.clone())
+    }
+
     /// The push (IDLE) state of an account and the last push error.
     pub fn push_state(&self, id: AccountId) -> (PushMode, Option<String>) {
         self.sync.runs.get(&id).map(|r| (r.push, r.push_error.clone())).unwrap_or_default()
@@ -571,8 +579,8 @@ impl Session {
         tick(self);
         groups::tick(self);
         crate::recover::tick(self);
-        // Sources the batch stored leave memory (issue #25).
-        self.release_sources();
+        crate::offline::tick(self);
+        crate::search_index::tick(self);
         if self.undo.undo.is_empty() && self.undo.redo.is_empty() && !self.sync.track.is_empty() {
             self.sync.track = Track::default();
         }
@@ -1089,6 +1097,54 @@ pub(crate) fn synced_account(mb: &Mailbox, folder: FolderId) -> Option<AccountId
     synced_folder(mb, folder).map(|(a, _)| a)
 }
 
+/// Messages the change recorded by `r` takes off their server while only their header is on this computer
+/// (downloaded as headers only, or the body taken off by the offline window): moved out of their server
+/// account (to a local folder, a data file or another account), or in a folder moved off the server. Their
+/// server copy would be expunged and the item kept without a body, so `Session::run` refuses such a change.
+pub(crate) fn header_only_leaving(s: &Session, r: &crate::changes::Recording) -> Vec<ItemId> {
+    let before = r.before_small();
+    let after = &s.mailbox;
+    let mut out: BTreeSet<ItemId> = BTreeSet::new();
+    for (id, b) in r.mail_so_far(after) {
+        let (Some(b), Some(a)) = (b, after.mail.get(id)) else { continue };
+        if a.folder == b.folder || uid_of(b).is_none() {
+            continue;
+        }
+        let Some((src, _)) = synced_folder(after, b.folder).or_else(|| synced_folder(before, b.folder))
+        else {
+            continue;
+        };
+        if synced_account(after, a.folder) != Some(src) && crate::sync::cmds::is_header_only(s, id) {
+            out.insert(id);
+        }
+    }
+    // Folders moved off the server (under a local folder, or to another account) take their items along.
+    let mut gone: BTreeSet<FolderId> = BTreeSet::new();
+    for f in after.folders.values() {
+        let Some(b) = before.folders.get(&f.id) else { continue };
+        if b.remote_name.is_none()
+            || !is_imap(before, b.account)
+            || (b.parent == f.parent && b.account == f.account)
+        {
+            continue;
+        }
+        if f.account != b.account || remote_path(after, f).is_none() {
+            gone.extend(after.subtree(f.id));
+        }
+    }
+    if !gone.is_empty() {
+        out.extend(
+            after
+                .mail
+                .items()
+                .filter(|m| gone.contains(&m.folder) && uid_of(m).is_some())
+                .map(|m| m.id)
+                .filter(|id| crate::sync::cmds::is_header_only(s, *id)),
+        );
+    }
+    out.into_iter().collect()
+}
+
 /// Server changes queued for `account`.
 pub(crate) fn pending_len(mb: &Mailbox, account: AccountId) -> usize {
     mb.account(account).map_or(0, |a| a.sync.pending.len())
@@ -1419,7 +1475,7 @@ fn item_changes(
             && a.response == b.response
             && a.remote_id == b.remote_id
             && a.is_draft == b.is_draft
-            && (!a.is_draft || a.raw == b.raw)
+            && (!a.is_draft || (a.blob == b.blob && a.body_key == b.body_key))
     };
     let ids: Vec<ItemId> = mail
         .iter()
@@ -1434,8 +1490,9 @@ fn item_changes(
         let b = mail.before(id).flatten();
         // What is needed of the item after the change (taken before `after` is adjusted).
         let Some((a_folder, a_uid, upload, words, draft_changed)) = after.mail.get(id).map(|a| {
-            let draft_changed =
-                b.is_some_and(|b| a.is_draft && b.is_draft && a.raw.is_some() && a.raw != b.raw);
+            let draft_changed = b.is_some_and(|b| {
+                a.is_draft && b.is_draft && a.blob.is_some() && (a.blob != b.blob || a.body_key != b.body_key)
+            });
             (a.folder, uid_of(a), upload_flags(a), flag_words(a), draft_changed)
         }) else {
             // Removed (permanent delete). Items of a deleted folder go with the folder.
@@ -1719,17 +1776,9 @@ fn local_copy(mb: &Mailbox, folder: FolderId, mid: &str) -> Option<ItemId> {
     })
 }
 
-/// Raw source of an item: kept bytes, else the blob store, else rebuilt from its fields.
+/// Raw source of an item: its stored source, else rebuilt from its fields and body.
 fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
-    if let Some(raw) = &m.raw {
-        return raw.clone();
-    }
-    if let Some(st) = &s.store
-        && let Ok(Some(raw)) = st.raw_of(m)
-    {
-        return raw;
-    }
-    mailcraft_store::rebuild_message(m)
+    crate::cmd::file::raw_source(s, m)
 }
 
 /// IMAP folder results made up without a server, for benchmarks (`apps/mailcraft-bench`) and tests: queued
@@ -2229,13 +2278,11 @@ mod tests {
         let items: Vec<&MailItem> = s.mailbox.items_in(inbox);
         assert_eq!(items.len(), 2);
         let header = items.iter().find(|m| m.remote_id.as_deref() == Some("2")).map(|m| m.id).unwrap();
-        assert!(s.mailbox.mail.get(header).unwrap().body.text.is_none(), "header only");
+        assert!(s.body_now(header).text.is_none(), "header only");
         let bodies = SyntheticImap::Bodies { folder: "INBOX".into(), msgs: vec![msg(2, false)] };
         assert!(s.queue_imap_results(a, bodies));
         assert!(s.poll_sync());
-        assert!(
-            s.mailbox.mail.get(header).unwrap().body.text.as_deref().is_some_and(|t| t.contains("Body 2"))
-        );
+        assert!(s.body_now(header).text.as_deref().is_some_and(|t| t.contains("Body 2")));
     }
 
     #[test]

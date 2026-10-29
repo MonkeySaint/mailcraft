@@ -26,9 +26,19 @@ pub fn sample_now() -> DateTime {
 /// A session over [`sample_mailbox`] with the clock fixed at [`sample_now`] (UTC display).
 pub fn sample_session() -> Session {
     let now = sample_now();
-    let mut s = Session::new(sample_mailbox(now));
+    let mut s = sample_session_at(now);
     s.fixed_now = Some(now);
     s.tz_offset_min = 0;
+    s
+}
+
+/// An in-memory session over the sample mailbox dated relative to `now` (the clock is not fixed), its
+/// message sources in the session's body store.
+pub fn sample_session_at(now: DateTime) -> Session {
+    let mut bodies = mailcraft_store::BodyStore::in_memory();
+    let mb = sample_mailbox(now, &mut bodies);
+    let mut s = Session::new(mb);
+    s.bodies = bodies;
     s
 }
 
@@ -386,8 +396,9 @@ fn messages() -> Vec<Msg> {
 
 /// The sample: local account "MailCraft Sample", ~40 messages over the last five weeks relative to `now`
 /// (unread, flagged, completed, high/low importance, categories, attachments, HTML newsletters, a reply
-/// thread, drafts, sent items, junk), plus a few appointments, contacts, tasks and notes.
-pub fn sample_mailbox(now: DateTime) -> Mailbox {
+/// thread, drafts, sent items, junk), plus a few appointments, contacts, tasks and notes. Each message's source
+/// goes to `bodies` (items refer to it by key).
+pub fn sample_mailbox(now: DateTime, bodies: &mut mailcraft_store::BodyStore) -> Mailbox {
     let mut mb = Mailbox::new_local(SAMPLE_ACCOUNT);
     let account = mb.default_account().map(|a| a.id).unwrap_or(AccountId(1));
     if let Some(a) = mb.accounts.iter_mut().find(|a| a.id == account) {
@@ -481,6 +492,9 @@ pub fn sample_mailbox(now: DateTime) -> Mailbox {
             Resp::Replied => ResponseState::Replied(DateTime::from_unix(t.saturating_add(2_820), 0)),
             Resp::Forwarded => ResponseState::Forwarded(DateTime::from_unix(t.saturating_add(1_200), 0)),
         };
+        if let Err(e) = mailcraft_store::import::store_source(bodies, &mut item, &raw) {
+            log::warn!("sample message {:?} keeps no source: {e}", item.subject);
+        }
         mb.add_mail(item);
     }
 
@@ -668,8 +682,8 @@ mod tests {
     #[test]
     fn sample_is_valid_and_deterministic() {
         let now = sample_now();
-        let a = sample_mailbox(now);
-        let b = sample_mailbox(now);
+        let a = sample_mailbox(now, &mut mailcraft_store::BodyStore::in_memory());
+        let b = sample_mailbox(now, &mut mailcraft_store::BodyStore::in_memory());
         assert_eq!(a, b);
         assert!(a.validate().is_empty(), "{:?}", a.validate());
         assert!((36..=45).contains(&a.mail.len()), "{}", a.mail.len());
@@ -683,7 +697,8 @@ mod tests {
 
     #[test]
     fn sample_covers_the_interesting_states() {
-        let mb = sample_mailbox(sample_now());
+        let mut bodies = mailcraft_store::BodyStore::in_memory();
+        let mb = sample_mailbox(sample_now(), &mut bodies);
         let mail: Vec<&MailItem> = mb.mail.items().collect();
         assert!(mail.iter().any(|m| !m.read));
         assert!(mail.iter().any(|m| m.is_flagged()));
@@ -692,12 +707,12 @@ mod tests {
         assert!(mail.iter().any(|m| m.importance == mailcraft_model::Importance::Low));
         assert!(mail.iter().any(|m| !m.categories.is_empty()));
         assert!(mail.iter().any(|m| m.has_attachments()));
-        assert!(mail.iter().any(|m| m.body.html.is_some()));
+        assert!(mail.iter().any(|m| bodies.body_of(m).unwrap().is_some_and(|b| b.html.is_some())));
         assert!(mail.iter().any(|m| !m.in_reply_to.is_empty()));
         assert!(mail.iter().any(|m| m.is_draft));
         assert!(mail.iter().any(|m| m.focus == FocusClass::Other));
         assert!(mail.iter().all(|m| m.received.unix <= sample_now().unix));
-        assert!(mail.iter().all(|m| m.raw.is_some()));
+        assert!(mail.iter().all(|m| bodies.source_of(m).unwrap().is_some()));
         let addrs: Vec<&str> = mail
             .iter()
             .flat_map(|m| m.from.iter().chain(m.to.iter()).chain(m.cc.iter()))

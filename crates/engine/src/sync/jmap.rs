@@ -722,6 +722,13 @@ fn apply_emails(s: &mut Session, account: AccountId, list: Vec<JEmail>, new_inbo
                     if let Some(n) = e.size {
                         item.size = n;
                     }
+                    if let Err(err) = s.store_source(&mut item, raw) {
+                        // Not taken in (nor remembered as seen): the next run downloads it again.
+                        log::error!(
+                            "could not store a downloaded message ({err}); it is downloaded again next time"
+                        );
+                        continue;
+                    }
                     let id = s.mailbox.add_mail(item);
                     s.sync.track.created.insert(id);
                     if Some(folder) == inbox {

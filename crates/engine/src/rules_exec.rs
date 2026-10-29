@@ -132,18 +132,13 @@ pub fn rule_env(s: &Session, item: &MailItem, contacts: &[String]) -> RuleEnv {
         }
         cur = f.parent;
     }
-    RuleEnv { folder_role: role, rss_feed, contacts: contacts.to_vec(), source_head: None }
+    RuleEnv { folder_role: role, rss_feed, contacts: contacts.to_vec(), source_head: None, body: None }
 }
 
-/// The start of `item`'s source read back from the store, for conditions that scan it when the item no
-/// longer keeps it in memory (sources leave memory once stored, issue #25). `None` when the item keeps its
-/// source (the conditions read that) or has none.
+/// The start of `item`'s source read from the body store, for conditions that scan it. `None` when it has
+/// none.
 fn stored_source_head(s: &Session, item: &MailItem) -> Option<Vec<u8>> {
-    if item.raw.is_some() {
-        return None;
-    }
-    crate::cmd::compose::stored_head(s, item, mailcraft_model::rule::SOURCE_SCAN_LIMIT)
-        .map(std::borrow::Cow::into_owned)
+    s.source_head(item, mailcraft_model::rule::SOURCE_SCAN_LIMIT)
 }
 
 fn contact_addresses(s: &Session) -> Vec<String> {
@@ -187,6 +182,10 @@ pub fn run_rules(s: &mut Session, ids: &[ItemId], rules: &[Rule]) -> RunReport {
             let mut env = rule_env(s, item, &run.contacts);
             if rule.needs_source() {
                 env.source_head = head.take().unwrap_or_else(|| stored_source_head(s, item));
+            }
+            if rule.needs_body() {
+                // Read on demand (through the body cache), only for rules whose conditions read it.
+                env.body = s.body_of(item).ok().flatten();
             }
             let matched = rule.matches_in(item, &ctx, &env);
             if rule.needs_source() {
@@ -294,6 +293,20 @@ fn finish(s: &mut Session, mut run: Run) -> RunReport {
 // ---------------------------------------------------------------------------------------------------------
 // Actions
 
+/// Whether moving item `id` to `to` (or copying it: `None`) would leave a message without its body: only
+/// its header is on this computer, and the move takes it out of its server account (its server copy would
+/// be expunged) or the copy would have no body.
+fn leaves_without_body(s: &Session, id: ItemId, to: Option<FolderId>) -> bool {
+    if !crate::sync::cmds::rest_on_server(s, id) {
+        return false;
+    }
+    let Some(to) = to else { return true };
+    match s.mailbox.mail.get(id).and_then(|m| crate::sync::queue_account(&s.mailbox, m)) {
+        Some(src) => crate::sync::synced_account(&s.mailbox, to) != Some(src),
+        None => false,
+    }
+}
+
 /// Runs the actions of `rule` on item `id`; returns true when no further rules should run for it (Stop
 /// Processing More Rules, or the item was deleted).
 fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> bool {
@@ -308,14 +321,24 @@ fn execute_actions(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId) -> b
         }
         match action {
             RuleAction::MoveTo(f) => {
-                if s.mailbox.folder(*f).is_some_and(|t| t.kind == FolderKind::Mail) {
+                if leaves_without_body(s, id, Some(*f)) {
+                    run.report.errors.push(format!(
+                        "{}: a message only whose header is on this computer is not moved off its server",
+                        rule.name
+                    ));
+                } else if s.mailbox.folder(*f).is_some_and(|t| t.kind == FolderKind::Mail) {
                     let _ = s.mailbox.move_items(&[id], *f);
                 } else {
                     run.report.errors.push(format!("{}: the folder to move to is gone", rule.name));
                 }
             }
             RuleAction::CopyTo(f) => {
-                if s.mailbox.folder(*f).is_some_and(|t| t.kind == FolderKind::Mail)
+                if leaves_without_body(s, id, None) {
+                    run.report.errors.push(format!(
+                        "{}: a message only whose header is on this computer is not copied",
+                        rule.name
+                    ));
+                } else if s.mailbox.folder(*f).is_some_and(|t| t.kind == FolderKind::Mail)
                     && let Some(mut copy) = s.mailbox.mail.get(id).cloned()
                 {
                     copy.folder = *f;
@@ -440,28 +463,23 @@ fn in_outbox(s: &Session, id: ItemId) -> bool {
     role_of(s, id) == Some(FolderRole::Outbox)
 }
 
-/// The item's source: its raw bytes, the stored blob, or one rebuilt from its fields.
+/// The item's source: its stored source, or one rebuilt from its fields and body.
 fn source_of(s: &Session, m: &MailItem) -> Vec<u8> {
-    if let Some(raw) = &m.raw {
-        return raw.clone();
-    }
-    if let Some(st) = &s.store
-        && let Ok(Some(raw)) = st.raw_of(m)
-    {
-        return raw;
-    }
-    mailcraft_store::rebuild_message(m)
+    crate::cmd::file::raw_source(s, m)
 }
 
-/// Rewrites the source of Outbox item `id` with `edit` (which gets and returns the raw bytes).
+/// Rewrites the source of Outbox item `id` with `edit` (which gets and returns the raw bytes). The new
+/// source goes to the body store; a failure there leaves the item as it was (logged).
 fn edit_source(s: &mut Session, id: ItemId, edit: impl FnOnce(Vec<u8>) -> Vec<u8>) {
     let Some(m) = s.mailbox.mail.get(id) else { return };
     let raw = edit(source_of(s, m));
-    if let Some(m) = s.mailbox.mail.get_mut(id) {
-        m.size = u64::try_from(raw.len()).unwrap_or(u64::MAX);
-        m.raw = Some(raw);
-        m.blob = None;
+    let Some(mut item) = s.mailbox.mail.get(id).cloned() else { return };
+    if let Err(e) = s.store_source(&mut item, &raw) {
+        log::error!("a rule could not change message {}: {e}", id.0);
+        return;
     }
+    item.size = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+    s.mailbox.mail.insert(id, item);
 }
 
 fn mark_sensitivity(s: &mut Session, id: ItemId, x: Sensitivity) {
@@ -700,7 +718,7 @@ fn redirect(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId, to: &[Strin
     )
     .into_bytes();
     raw.extend_from_slice(&source_of(s, &m));
-    let item = MailItem {
+    let mut item = MailItem {
         id: ItemId::default(),
         folder: outbox,
         to: rcpts,
@@ -715,9 +733,13 @@ fn redirect(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId, to: &[Strin
         categories: Vec::new(),
         remote_id: None,
         blob: None,
-        raw: Some(raw),
+        body_key: None,
         ..m
     };
+    if let Err(e) = s.store_source(&mut item, &raw) {
+        run.report.errors.push(format!("{}: the message could not be redirected: {e}", rule.name));
+        return;
+    }
     let new_id = s.mailbox.add_mail(item);
     filed(s, run, new_id);
 }
@@ -733,7 +755,7 @@ enum Reply<'a> {
 /// mail.
 fn no_auto_reply(s: &Session, m: &MailItem) -> bool {
     let env = RuleEnv { source_head: stored_source_head(s, m), ..Default::default() };
-    let source = m.raw.as_deref().or(env.source_head.as_deref());
+    let source = env.source_head.as_deref();
     if mailcraft_model::rule::is_automatic_reply_in(m, source) {
         return true;
     }
@@ -772,7 +794,8 @@ fn load_template(path: &str, now: DateTime) -> Result<Template, String> {
     };
     let msg = mailcraft_mime::parse(&bytes).map_err(|e| format!("the template is not a message: {e}"))?;
     let item = MailItem::from_message(&msg, &bytes, now);
-    let (body, format) = match (&item.body.html, &item.body.text) {
+    let content = mailcraft_model::Body::from_message(&msg);
+    let (body, format) = match (&content.html, &content.text) {
         (Some(h), _) if !h.trim().is_empty() => (mailcraft_html::html_to_doc(h), BodyFormat::Html),
         (_, Some(t)) => (Doc::from_plain_text(t), BodyFormat::PlainText),
         _ => (Doc::from_plain_text(""), BodyFormat::PlainText),
@@ -978,7 +1001,7 @@ mod tests {
         let msg = mailcraft_mime::parse(raw).unwrap();
         let mut item = MailItem::from_message(&msg, raw, s.now());
         item.folder = folder;
-        s.mailbox.add_mail(item)
+        s.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap()
     }
 
     fn rule(conditions: Vec<mailcraft_model::RuleCondition>, actions: Vec<RuleAction>) -> Rule {
@@ -1124,10 +1147,7 @@ mod tests {
         run_rules(&mut s, &[a], &[att]);
         let out = outbox_items(&s, acc);
         assert_eq!(out.len(), 2);
-        let raw = out
-            .iter()
-            .map(|m| String::from_utf8_lossy(m.raw.as_deref().unwrap()).to_string())
-            .collect::<Vec<_>>();
+        let raw = out.iter().map(|m| s.source_text(m.id)).collect::<Vec<_>>();
         assert!(raw.iter().any(|r| r.contains("message/rfc822")), "attached as .eml");
     }
 
@@ -1144,12 +1164,12 @@ mod tests {
         assert_eq!(m.from.as_ref().unwrap().addr, "bob@example.org", "the sender stays the original one");
         assert_eq!(m.to.len(), 1);
         assert_eq!(m.to[0].addr, "ap@example.net");
-        let raw = String::from_utf8_lossy(m.raw.as_deref().unwrap()).to_string();
+        let raw = s.source_text(m.id);
         assert!(raw.starts_with("Resent-From: Me Example <me@example.com>\r\nResent-Date: "), "{raw}");
         assert!(raw.contains("Resent-To: ap@example.net\r\n"));
         assert!(raw.contains("Resent-Message-ID: <"));
         assert!(raw.contains("From: Bob <bob@example.org>"));
-        assert!(mailcraft_mime::parse(m.raw.as_deref().unwrap()).is_ok());
+        assert!(mailcraft_mime::parse(raw.as_bytes()).is_ok());
     }
 
     #[test]
@@ -1232,7 +1252,7 @@ mod tests {
         let m = out[0];
         assert_eq!(m.subject, "Thanks for writing");
         assert_eq!(m.to[0].addr, "bob@example.org");
-        let raw = String::from_utf8_lossy(m.raw.as_deref().unwrap()).to_string();
+        let raw = s.source_text(m.id);
         assert!(raw.contains("I am away until Monday."), "{raw}");
         assert!(!raw.contains("Hello there."), "the original is not quoted");
         assert!(raw.contains("Auto-Submitted: auto-replied"));
@@ -1253,7 +1273,7 @@ mod tests {
         run_rules(&mut s, &[a], &[rule(vec![], vec![RuleAction::ServerReply("We got your order.".into())])]);
         let out = outbox_items(&s, acc);
         assert_eq!(out[0].subject, "RE: Order");
-        assert!(out[0].body_text().contains("We got your order."));
+        assert!(s.body_text(out[0]).contains("We got your order."));
     }
 
     #[test]
@@ -1293,7 +1313,7 @@ mod tests {
         assert_eq!(m.categories, vec!["Red category".to_string()]);
         assert_eq!(m.importance, Importance::High);
         assert_eq!(m.sensitivity, Sensitivity::Confidential);
-        let raw = m.raw.clone().unwrap();
+        let raw = s.source(m.id).unwrap().unwrap();
         assert_eq!(header_value(&raw, "Cc").as_deref(), Some("Boss <boss@example.net>"));
         assert_eq!(
             header_value(&raw, "Disposition-Notification-To").as_deref(),

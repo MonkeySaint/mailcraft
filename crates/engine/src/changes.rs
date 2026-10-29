@@ -46,6 +46,21 @@ pub(crate) struct Recording {
     full: Box<Mailbox>,
 }
 
+impl Recording {
+    /// Everything but the mail as it was when the record opened.
+    pub(crate) fn before_small(&self) -> &Mailbox {
+        &self.small
+    }
+
+    /// The mail before-images written so far (see [`mailcraft_model::MailTable::recorded`]).
+    pub(crate) fn mail_so_far<'a>(
+        &self,
+        now: &'a Mailbox,
+    ) -> Vec<(mailcraft_model::ItemId, Option<&'a mailcraft_model::MailItem>)> {
+        now.mail.recorded(self.token)
+    }
+}
+
 /// What changed between [`Session::begin_changes`] and [`Session::end_changes`].
 #[derive(Debug)]
 pub(crate) struct ChangeSet {

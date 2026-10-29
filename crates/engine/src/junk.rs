@@ -141,7 +141,8 @@ fn context_for(s: &Session, item: &MailItem, contacts: &[String]) -> JunkContext
 pub fn classify(s: &Session, id: ItemId) -> Option<Verdict> {
     let item = s.mailbox.mail.get(id)?;
     let contacts = contact_addresses(s);
-    Some(junk::classify(&s.mailbox.junk, item, &context_for(s, item, &contacts)))
+    let body = s.body_or_empty(item);
+    Some(junk::classify(&s.mailbox.junk, item, Some(&body), &context_for(s, item, &contacts)))
 }
 
 /// A verdict as JSON (reason, entry, score, signals).
@@ -189,7 +190,9 @@ pub fn filter_items(s: &mut Session, ids: &[ItemId]) -> FilterReport {
         }
         let Some(item) = s.mailbox.mail.get(id) else { continue };
         report.checked = report.checked.saturating_add(1);
-        let verdict = junk::classify(&s.mailbox.junk, item, &context_for(s, item, &contacts));
+        let body = s.body_of(item).ok().flatten();
+        let verdict =
+            junk::classify(&s.mailbox.junk, item, body.as_deref(), &context_for(s, item, &contacts));
         if !verdict.junk {
             continue;
         }
@@ -311,21 +314,22 @@ mod tests {
     fn deliver(s: &mut Session, from: &str, subject: &str, body: &str, raw: Option<&str>) -> ItemId {
         let id = ItemId(s.mailbox.alloc_id());
         let folder = inbox(s);
-        s.mailbox.mail.insert(
+        let mut item = MailItem {
             id,
-            MailItem {
-                id,
-                folder,
-                message_id: Some(format!("<{}@example.com>", id.0)),
-                from: Some(Address::new(None, from)),
-                to: vec![Address::new(None, "me@example.com")],
-                subject: subject.into(),
-                sent: Some(s.now()),
-                body: mailcraft_model::Body { text: Some(body.into()), ..Default::default() },
-                raw: raw.map(|r| r.as_bytes().to_vec()),
-                ..Default::default()
-            },
-        );
+            folder,
+            message_id: Some(format!("<{}@example.com>", id.0)),
+            from: Some(Address::new(None, from)),
+            to: vec![Address::new(None, "me@example.com")],
+            subject: subject.into(),
+            sent: Some(s.now()),
+            ..Default::default()
+        };
+        let content = mailcraft_store::Content {
+            source: raw.map(|r| r.as_bytes().to_vec()),
+            body: Some(mailcraft_model::Body { text: Some(body.into()), ..Default::default() }),
+        };
+        s.store_content(&mut item, &content).unwrap();
+        s.mailbox.mail.insert(id, item);
         id
     }
 

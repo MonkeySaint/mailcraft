@@ -3276,10 +3276,7 @@ pub fn calendar_data(s: &Session, m: &MailItem) -> Option<Vec<u8>> {
     if !m.attachments.iter().any(|a| is_calendar_type(&a.mime_type) || is_ics_name(&a.filename)) {
         return None;
     }
-    let raw = match &m.raw {
-        Some(r) => r.clone(),
-        None => s.store.as_ref().and_then(|st| st.raw_of(m).ok().flatten())?,
-    };
+    let raw = crate::cmd::compose::stored_raw(s, m)?;
     let msg = mailcraft_mime::parse(&raw).ok()?;
     let parts = msg.parts();
     let pick = parts
@@ -5370,7 +5367,7 @@ pub(crate) mod tests {
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut item = MailItem::from_message(&msg, &raw, to.now());
         item.folder = role(to, FolderRole::Inbox);
-        to.mailbox.add_mail(item)
+        to.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap()
     }
 
     pub(crate) fn invite(org: &mut Session) -> (ItemId, u64) {
@@ -5616,7 +5613,7 @@ pub(crate) mod tests {
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut item = MailItem::from_message(&msg, &raw, to.now());
         item.folder = role(to, FolderRole::Inbox);
-        to.mailbox.add_mail(item)
+        to.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap()
     }
 
     const SERIES: &str = "BEGIN:VEVENT\nUID:sync-1@example.com\nSEQUENCE:0\nDTSTART:20261012T150000Z\n\

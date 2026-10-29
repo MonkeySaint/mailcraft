@@ -215,7 +215,6 @@ fn synced_mail_leaves_its_source_in_the_store_and_counts_follow_sync() {
     assert_eq!((s.folder_counts(inbox).total, s.folder_counts(inbox).unread), (3, 2));
     let store = s.store.as_ref().unwrap();
     for m in s.mailbox.items_in(inbox) {
-        assert!(m.raw.is_none(), "{}: the source left memory", m.subject);
         let key = m.blob.as_deref().unwrap_or_else(|| panic!("{} has no blob", m.subject));
         let want = raws.iter().find(|r| String::from_utf8_lossy(r).contains(&m.subject)).unwrap();
         assert_eq!(&store.get_blob(key).unwrap(), want, "{}", m.subject);
@@ -237,13 +236,13 @@ fn synced_mail_leaves_its_source_in_the_store_and_counts_follow_sync() {
     sync(&mut s);
     assert_counts_right(&s, "second sync");
     assert_eq!((s.folder_counts(inbox).total, s.folder_counts(inbox).unread), (4, 2));
-    assert!(s.mailbox.items_in(inbox).iter().all(|m| m.raw.is_none() && m.blob.is_some()));
+    assert!(s.mailbox.items_in(inbox).iter().all(|m| m.blob.is_some()));
     run(&mut s, "app.undo", json!({}));
     assert_counts_right(&s, "undo after sync");
 }
 
-/// Imported mail keeps its source in the store only; a session without a store keeps it in memory (it has
-/// nowhere else to go).
+/// Imported mail keeps its source in the body store on disk; a session without a store keeps it in its memory
+/// body store (it has nowhere else to go).
 #[test]
 fn imported_mail_leaves_its_source_in_the_store() {
     let dir = tempdir();
@@ -274,7 +273,7 @@ fn imported_mail_leaves_its_source_in_the_store() {
     );
     assert_eq!(s.mailbox.items_in(inbox).len(), 3);
     for m in s.mailbox.items_in(inbox) {
-        assert!(m.raw.is_none() && m.blob.is_some(), "{}", m.subject);
+        assert!(m.blob.is_some(), "{}", m.subject);
     }
     assert_eq!(
         s.store.as_ref().unwrap().raw_of(s.mailbox.mail.get(id).unwrap()).unwrap().as_deref(),
@@ -299,9 +298,9 @@ fn imported_mail_leaves_its_source_in_the_store() {
     );
     let id = ItemId(r["ids"][0].as_u64().unwrap());
     assert_eq!(
-        mem.mailbox.mail.get(id).unwrap().raw.as_deref(),
+        mem.source(id).unwrap().as_deref(),
         Some(&raw[..]),
-        "no store: the source stays"
+        "no store: the source is in the memory body store"
     );
 }
 
@@ -362,7 +361,7 @@ fn source_readers_see_the_stored_source_after_it_left_memory() {
     let sealed = import_eml(&mut s, dir.path(), "sealed", &p7m("enveloped-data", "o2"), inbox);
     for id in [list, away, plain, offer, signed, sealed] {
         let m = s.mailbox.mail.get(id).unwrap();
-        assert!(m.raw.is_none() && m.blob.is_some(), "{} left memory", m.subject);
+        assert!(m.blob.is_some(), "{} is in the body store", m.subject);
     }
     // Another command in between: nothing brings the sources back.
     select(&mut s, &[plain]);
@@ -536,7 +535,6 @@ fn bench_folder_pane_and_undo_estimate() {
             subject: format!("Bench message {i}"),
             read: i % 5 != 0,
             preview: "x".repeat(200),
-            body: mailcraft_engine::model::Body { text: Some("y".repeat(3_000)), ..Default::default() },
             ..Default::default()
         });
     }
@@ -599,9 +597,9 @@ fn bench_folder_pane_and_undo_estimate() {
         json!({"action": "importMbox", "path": mbox.to_str().unwrap(), "folder": inbox.0}),
     );
     let took = t.elapsed();
-    let held: usize = p.mailbox.mail.items().filter_map(|m| m.raw.as_ref()).map(Vec::len).sum();
+    let held = p.bodies.cache_stats().bytes;
     println!(
-        "import of {count} messages ({} MiB of mbox) took {took:?}; sources held in memory afterwards: {held} bytes",
+        "import of {count} messages ({} MiB of mbox) took {took:?}; content cached in memory afterwards: {held} bytes",
         data.len() >> 20
     );
 }

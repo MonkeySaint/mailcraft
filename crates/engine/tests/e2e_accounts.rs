@@ -93,7 +93,7 @@ fn find(s: &Session, folder: FolderId, subject: &str) -> Option<ItemId> {
 }
 
 fn body(s: &Session, id: ItemId) -> String {
-    s.mailbox.mail.get(id).unwrap().body.text.clone().unwrap_or_default()
+    s.body(id).unwrap().and_then(|b| b.text.clone()).unwrap_or_default()
 }
 
 /// Polls the session until `done` holds (or panics after `WAIT`).

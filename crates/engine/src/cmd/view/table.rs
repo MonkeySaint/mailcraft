@@ -867,7 +867,7 @@ pub fn matches(s: &Session, it: Item<'_>, f: &CustomFilter) -> bool {
             hay.push('\n');
             match it {
                 Item::Task(t) => hay.push_str(&t.body.to_lowercase()),
-                Item::Mail(m) => hay.push_str(&m.body_text().to_lowercase()),
+                Item::Mail(m) => hay.push_str(&s.body_text(m).to_lowercase()),
                 Item::Contact(c) => hay.push_str(&c.notes.to_lowercase()),
             }
         }

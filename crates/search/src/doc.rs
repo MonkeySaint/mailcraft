@@ -224,8 +224,10 @@ fn cap(mut s: String) -> String {
 }
 
 impl Doc {
-    /// A mail item (body text from the text part, else the HTML with tags stripped).
-    pub fn from_mail(m: &MailItem) -> Doc {
+    /// A mail item whose body is `body` (body text from the text part, else the HTML with tags stripped;
+    /// `None` when the body is not on this computer: only the header fields are indexed). Items hold no body
+    /// since storage stage S5; the engine reads it from its body store when it (re)indexes the item.
+    pub fn from_mail(m: &MailItem, body: Option<&mailcraft_model::Body>) -> Doc {
         let mut from: Vec<Person> = m.from.iter().map(Person::of).collect();
         if let Some(s) = &m.sender
             && !m.from.iter().any(|f| f.addr.eq_ignore_ascii_case(&s.addr))
@@ -240,7 +242,7 @@ impl Doc {
             from,
             to: m.to.iter().map(Person::of).collect(),
             cc: m.cc.iter().map(Person::of).collect(),
-            body: cap(m.body_text()),
+            body: cap(body.map(mailcraft_model::Body::plain_text).unwrap_or_default()),
             attachments: m
                 .attachments
                 .iter()
@@ -255,7 +257,7 @@ impl Doc {
             flagged: matches!(m.flag, FlagState::Flagged { .. }),
             importance: m.importance.into(),
             has_attachments: m.has_attachments(),
-            expires: m.raw.as_deref().and_then(expiry_of),
+            expires: m.expires.map(|d| d.unix),
             props: mail_props(m),
             date_props: mail_dates(m),
         }

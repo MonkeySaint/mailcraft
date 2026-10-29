@@ -127,7 +127,7 @@ fn msg_write_read_round_trip() {
 #[test]
 fn msg_to_mail_item_and_back() {
     let m = sample();
-    let item = m.to_mail_item(FolderId(3), DateTime::default());
+    let (item, content) = m.to_mail_item(FolderId(3), DateTime::default());
     assert_eq!(item.subject, "RE: Quarterly plan");
     assert_eq!(item.folder, FolderId(3));
     assert_eq!(item.from, m.from);
@@ -139,12 +139,13 @@ fn msg_to_mail_item_and_back() {
     assert_eq!(item.received.unix, 1_791_000_100);
     assert!(item.read);
     assert_eq!(item.categories, m.categories);
-    assert_eq!(item.body.html, m.body_html);
+    let body = content.body.clone().unwrap();
+    assert_eq!(body.html, m.body_html);
     let names: Vec<&str> = item.attachments.iter().map(|a| a.filename.as_str()).collect();
     assert!(names.contains(&"report.pdf") && names.contains(&"Inner note.eml"));
     assert!(item.attachments.iter().any(|a| a.inline && a.content_id.as_deref() == Some("logo@x")));
     // Back to .msg via the kept source: attachment content and the embedded message survive.
-    let again = msg::read(&msg::write_item(&item).unwrap()).unwrap();
+    let again = msg::read(&msg::write_item(&item, content.source.as_deref(), Some(&body)).unwrap()).unwrap();
     assert_eq!(again.subject, m.subject);
     assert_eq!(again.to, m.to);
     assert_eq!(again.categories, m.categories);
@@ -156,7 +157,7 @@ fn msg_to_mail_item_and_back() {
     });
     assert_eq!(embedded.map(|s| s.subject.as_str()), Some("Inner note"));
     // read_item convenience.
-    let it = msg::read_item(&msg::write(&m).unwrap(), FolderId(1), DateTime::default()).unwrap();
+    let (it, _) = msg::read_item(&msg::write(&m).unwrap(), FolderId(1), DateTime::default()).unwrap();
     assert_eq!(it.subject, m.subject);
 }
 
@@ -166,14 +167,11 @@ fn mail_item_without_source_writes() {
         subject: "Draft".into(),
         to: vec![Mailbox::new(None, "x@example.com")],
         is_draft: true,
-        body: mailcraft_model::Body {
-            text: Some("draft text".into()),
-            format: BodyFormat::PlainText,
-            html: None,
-        },
         ..Default::default()
     };
-    let back = msg::read(&msg::write_item(&item).unwrap()).unwrap();
+    let body =
+        mailcraft_model::Body { text: Some("draft text".into()), format: BodyFormat::PlainText, html: None };
+    let back = msg::read(&msg::write_item(&item, None, Some(&body)).unwrap()).unwrap();
     assert!(back.unsent);
     assert_eq!(back.body_text.as_deref(), Some("draft text"));
     assert_eq!(back.to, item.to);
@@ -247,9 +245,15 @@ fn reads_8bit_strings_rtf_body_and_header_fallback() {
     assert_eq!(m.body_format, BodyFormat::RichText);
     assert_eq!(m.body_text.as_deref(), Some("Plain rich text\nnext"));
     assert!(m.body_rtf.is_some());
-    let item = m.to_mail_item(FolderId(1), DateTime::default());
-    assert_eq!(item.body.format, BodyFormat::RichText);
+    let (item, content) = m.to_mail_item(FolderId(1), DateTime::default());
+    assert_eq!(content.body.map(|b| b.format), Some(BodyFormat::RichText));
     assert!(item.is_draft);
+    // The rich-text format is not what the source gives, so the body store keeps a record of it.
+    let mut stored = item.clone();
+    let mut bodies = mailcraft_store::BodyStore::in_memory();
+    bodies.store(&mut stored, &m.to_mail_item(FolderId(1), DateTime::default()).1).unwrap();
+    assert!(stored.blob.is_some() && stored.body_key.is_some());
+    assert_eq!(bodies.body_of(&stored).unwrap().map(|b| b.format), Some(BodyFormat::RichText));
 }
 
 #[test]

@@ -361,7 +361,7 @@ pub(super) fn preview_text(app: &App, row: &Row, lines: u8) -> String {
         RowKind::Task => app.s.mailbox.tasks.get(&row.id).map(|t| t.body.clone()),
         RowKind::Mail => app.s.mailbox.mail.get(row.id).map(|m| {
             // Only the start of the body is read: this runs for every row on every frame.
-            let body = m.body_text_prefix(PREVIEW_BODY_BYTES);
+            let body = app.s.body_or_empty(m).text_prefix(PREVIEW_BODY_BYTES);
             if body.trim().is_empty() { m.preview.clone() } else { body }
         }),
         RowKind::Contact => app.s.mailbox.contacts.get(&row.id).map(|c| c.notes.clone()),
@@ -771,7 +771,7 @@ fn flagged_body(ui: &mut Ui, app: &App, row: &Row) {
             }
             ui.add_space(12.0);
             // Drawn every frame: only the start of the body is read, however large the message is.
-            let body = m.body_text_prefix(PANE_BODY_BYTES);
+            let body = app.s.body_or_empty(m).text_prefix(PANE_BODY_BYTES);
             let body = if body.trim().is_empty() { m.preview.clone() } else { body };
             if body.trim().is_empty() {
                 ui.label(RichText::new("This message has no text.").color(app.theme.text_muted));

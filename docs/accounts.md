@@ -44,6 +44,38 @@ limits the *first* download of each folder to mail that arrived in that period: 
 send/receive downloads all new mail. Changing the setting does not fetch older mail into folders already
 downloaded. POP3 has no dates before downloading and always takes everything.
 
+## Offline mail (how long bodies stay on this computer)
+
+An IMAP account keeps the bodies of its messages on this computer for a period chosen on its settings page
+(**Offline mail**): a check box, **Keep mail on this computer to read when offline**, and a slider,
+**Keep mail from the last**, with 11 stops (3 days, 1 week, 2 weeks, 1 month, 3 months, 6 months, 1 year,
+2 years, 3 years, 5 years, All). The default is 1 year. The slider works with the arrow keys (one stop),
+Page Up / Page Down (three stops) and Home / End, and screen readers get its value as text ("1 year").
+
+- Message headers, flags, categories and the preview line are always kept. A message received before the
+  window loses its source and body from the profile's body store; opening it while online downloads it
+  again (the reading pane offers **Download it now** if that did not work), and while working offline the
+  reading pane says why only the header is there.
+- A message whose body is not here (taken off, or downloaded as headers only) is not moved out of its
+  account (to a local folder, a data file or another account; its server copy would be removed), copied,
+  forwarded as an attachment, saved or exported: the command says so and starts its download, and works
+  once it has arrived. Moves within the account work as usual.
+- With the check box off, no bodies are kept: each one is downloaded when it is opened and taken off again
+  by the next pass.
+- Never taken off: drafts, mail in folders that are not on the server, mail without a server id, a body
+  changed here (Edit Message, View › Encoding), the messages selected or open (in the reading pane or a
+  read window), and content the undo history still needs. A source is removed only once the profile has
+  saved the change that took it off (on a full disk it stays until a later pass).
+- A pass runs after each successful send/receive (at most once an hour per account) and at once when the
+  setting changes. It takes at most 5,000 messages; the next pass continues. Its changes are not an undo
+  step and change nothing on the server.
+- Commands: `accounts.options {"account": …, "keepOffline": true, "offlineWindow": "1y"}` (`offlineWindow`
+  takes a key `3d` `1w` `2w` `1m` `3m` `6m` `1y` `2y` `3y` `5y` `all`, a label such as `"6 months"`, or
+  the slider stop 0–10) and `accounts.applyOfflineWindow {"account": …}` (run a pass now; every IMAP
+  account without `account`).
+- POP3 and JMAP accounts keep all their mail: a POP3 server may delete what was downloaded, and a single
+  JMAP message cannot be fetched again yet.
+
 ## POP3
 
 - Add with `kind: "pop3"` (the wizard's **POP** choice). Default ports: 995 (TLS) and 110 (STARTTLS).

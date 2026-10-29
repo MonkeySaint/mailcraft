@@ -117,7 +117,8 @@ fn signed_and_encrypted_mail_through_smtp_and_imap() {
     let sent = role(&alice, alice_acct, FolderRole::SentItems);
     let copy = find(&alice, sent, "RE: Signed hello").expect("filed in Sent Items");
     let shown = mailcraft_engine::smime::display_item(&alice, copy).unwrap();
-    assert!(shown.body_text().contains("blue"), "Alice can read her own sent copy");
+    let text = mailcraft_engine::smime::display_body(&alice, &shown).plain_text();
+    assert!(text.contains("blue"), "Alice can read her own sent copy");
 
     sync(&mut bob);
     let bob_inbox = role(&bob, bob_acct, FolderRole::Inbox);
@@ -127,7 +128,9 @@ fn signed_and_encrypted_mail_through_smtp_and_imap() {
     assert_eq!(sec.status, "valid", "{sec:?}");
     assert!(sec.signer.contains(ALICE));
     let shown = mailcraft_engine::smime::display_item(&bob, got).unwrap();
-    assert!(shown.body_text().contains("Secret answer: blue."));
-    // The stored item keeps the encrypted form: the text is not in the mailbox.
-    assert!(!bob.mailbox.mail.get(got).unwrap().body_text().contains("blue"));
+    assert!(
+        mailcraft_engine::smime::display_body(&bob, &shown).plain_text().contains("Secret answer: blue.")
+    );
+    // The stored item keeps the encrypted form: the text is not in the mailbox or its body store.
+    assert!(!bob.body_text(bob.mailbox.mail.get(got).unwrap()).contains("blue"));
 }

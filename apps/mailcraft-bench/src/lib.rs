@@ -266,7 +266,6 @@ fn skeleton() -> Result<(Mailbox, Vec<FolderId>)> {
 /// A mail item for a synthetic message (state from the generator, source in the store at `blob`).
 fn item_of(m: &synth::SynthMessage, folder: FolderId, now: DateTime) -> MailItem {
     let mut item = mailcraft_store::import::item_from_raw(&m.raw, folder, now);
-    item.raw = None;
     item.read = m.read;
     item.received = DateTime { unix: m.received, offset_min: 0 };
     if m.flagged {
@@ -320,7 +319,7 @@ pub fn generate(dir: &Path, opts: &Options) -> Result<Value> {
     }
     let approx = mb.approx_bytes();
     let t = Instant::now();
-    store.checkpoint_mut(&mut mb, true).map_err(|e| format!("cannot write the profile: {e}"))?;
+    store.checkpoint(&mb).map_err(|e| format!("cannot write the profile: {e}"))?;
     let snapshot = t.elapsed();
     drop(store);
     let n = opts.messages.max(1);
@@ -430,6 +429,7 @@ pub fn measure(dir: &Path, opts: &Options) -> Result<Value> {
     let folder_pane = json!({"ms": ms(t.elapsed()), "rows": folder_rows.len()});
     let switch = folder_switch(&mut s)?;
     let scroll = scroll(&mut s, opts)?;
+    let bodies = bodies(&s);
     let search = search(&mut s)?;
     let sync = sync_apply(&mut s, opts)?;
     let commands = commands(&mut s, opts)?;
@@ -439,6 +439,7 @@ pub fn measure(dir: &Path, opts: &Options) -> Result<Value> {
         "folder_pane": folder_pane,
         "folder_switch": switch,
         "scroll": scroll,
+        "bodies": bodies,
         "search": search,
         "sync": sync,
         "commands": commands,
@@ -523,10 +524,51 @@ fn scroll(s: &mut Session, opts: &Options) -> Result<Value> {
     }))
 }
 
+/// Bodies read the way the reading pane reads them (`Session::body`): the newest messages of the largest
+/// folder, cold (from the body store on disk) and again warm (from the decoded-body cache).
+fn bodies(s: &Session) -> Value {
+    const READS: usize = 500;
+    let Some((folder, _)) = largest_folder(s) else { return json!({}) };
+    let mut ids: Vec<(i64, mailcraft_engine::model::ItemId)> =
+        s.mailbox.mail.in_folder(folder).map(|m| (m.received.unix, m.id)).collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids.truncate(READS);
+    s.bodies.clear_cache();
+    let read_all = || {
+        let mut bytes = 0usize;
+        let mut missing = 0usize;
+        for (_, id) in &ids {
+            match s.body(*id) {
+                Ok(Some(b)) => bytes = bytes.saturating_add(b.approx_bytes()),
+                _ => missing += 1,
+            }
+        }
+        (bytes, missing)
+    };
+    let t = Instant::now();
+    let (bytes, missing) = read_all();
+    let cold = t.elapsed();
+    let t = Instant::now();
+    read_all();
+    let warm = t.elapsed();
+    let st = s.bodies.cache_stats();
+    let n = ids.len().max(1) as f64;
+    json!({
+        "reads": ids.len(),
+        "missing": missing,
+        "decoded_bytes": bytes,
+        "cold_ms": ms(cold),
+        "cold_per_body_us": ms(cold) * 1000.0 / n,
+        "warm_ms": ms(warm),
+        "warm_per_body_us": ms(warm) * 1000.0 / n,
+        "cache": {"entries": st.entries, "bytes": st.bytes, "cap": st.cap, "hits": st.hits, "misses": st.misses},
+    })
+}
+
 fn search(s: &mut Session) -> Result<Value> {
     let before = memory_json();
     let t = Instant::now();
-    s.search.ensure(&s.mailbox);
+    s.search.ensure(&s.mailbox, &s.bodies);
     let build = t.elapsed();
     let after_build = memory_json();
     let filter = mailcraft_search::Filter { folders: None, kinds: vec![mailcraft_search::DocKind::Mail] };
@@ -542,7 +584,7 @@ fn search(s: &mut Session) -> Result<Value> {
     let t = Instant::now();
     let c = search_index::search_folder_counts(s, FolderId(folder));
     let count = t.elapsed();
-    let stats = s.search.stats(&s.mailbox);
+    let stats = s.search.stats(&s.mailbox, &s.bodies);
     Ok(json!({
         "memory_before": before,
         "index_build_ms": ms(build),

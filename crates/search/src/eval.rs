@@ -408,11 +408,18 @@ mod tests {
         assert_eq!(expiry_of(&[0xff, 0xfe, b':', b'\n']), None);
         assert_eq!(expiry_of(b""), None);
         let m = mailcraft_model::MailItem {
-            raw: Some(b"Expires: Fri, 9 Oct 2026 12:00:00 +0000\r\n\r\nHi".to_vec()),
+            expires: Some(mailcraft_model::DateTime { unix: NOW, offset_min: 0 }),
             ..Default::default()
         };
-        assert_eq!(Doc::from_mail(&m).expires, Some(NOW));
-        assert_eq!(Doc::from_mail(&mailcraft_model::MailItem::default()).expires, None);
+        assert_eq!(Doc::from_mail(&m, None).expires, Some(NOW));
+        assert_eq!(Doc::from_mail(&mailcraft_model::MailItem::default(), None).expires, None);
+        let body =
+            mailcraft_model::Body { html: Some("<p>Hello <b>there</b></p>".into()), ..Default::default() };
+        assert_eq!(
+            Doc::from_mail(&m, Some(&body)).body.split_whitespace().collect::<Vec<_>>(),
+            ["Hello", "there"]
+        );
+        assert_eq!(Doc::from_mail(&m, None).body, "");
     }
 
     #[test]

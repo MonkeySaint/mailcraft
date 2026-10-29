@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 mailcraft-engine.workspace = true
 mailcraft-ui-egui.workspace = true
+mailcraft-store.workspace = true
 eframe.workspace = true
 log.workspace = true
 serde.workspace = true
@@ -21,9 +22,6 @@ wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys = { workspace = true, features = ["Document", "Element", "HtmlCanvasElement", "Location", "Storage", "Window"] }
-
-[dev-dependencies]
-mailcraft-store.workspace = true
 
 [lints]
 workspace = true

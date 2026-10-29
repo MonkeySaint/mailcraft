@@ -447,7 +447,9 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
                 Err(e) => out.errors.push(e.to_string()),
             },
             QuickStepAction::CopyTo(Some(f)) => {
-                if s.mailbox.folder(*f).is_some_and(|x| x.kind == FolderKind::Mail) {
+                if let Err(e) = crate::sync::cmds::need_content(s, &live, "copied") {
+                    out.errors.push(e.to_string());
+                } else if s.mailbox.folder(*f).is_some_and(|x| x.kind == FolderKind::Mail) {
                     for id in &live {
                         if let Some(mut copy) = s.mailbox.mail.get(*id).cloned() {
                             copy.folder = *f;
@@ -569,7 +571,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             QuickStepAction::CreateTask | QuickStepAction::CreateAppointment => {
                 for id in &live {
                     let Some(m) = s.mailbox.mail.get(*id) else { continue };
-                    let (subject, body) = (m.subject.clone(), m.body_text());
+                    let (subject, body) = (m.subject.clone(), s.body_text(m));
                     let r = if matches!(action, QuickStepAction::CreateTask) {
                         invoke(s, "tasks.new", &json!({"subject": subject, "body": body}))
                     } else {

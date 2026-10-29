@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Address, AttachmentMeta, FolderId, FolderRole, Importance, MailItem, Sensitivity};
+use crate::{Address, AttachmentMeta, Body, FolderId, FolderRole, Importance, MailItem, Sensitivity};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleCondition {
@@ -196,16 +196,23 @@ pub struct RuleEnv {
     pub rss_feed: Option<String>,
     /// E-mail addresses of the user's contacts (lower-case).
     pub contacts: Vec<String>,
-    /// The start of the item's stored source (at most [`SOURCE_SCAN_LIMIT`] bytes) when the item no longer
-    /// keeps it in memory ([`MailItem::raw`] is `None`): header, automatic-reply and message-class
-    /// conditions read it. Filled by the engine only for rules that need it (see [`Rule::needs_source`]).
+    /// The start of the item's stored source (at most [`SOURCE_SCAN_LIMIT`] bytes): header, automatic-reply
+    /// and message-class conditions read it. Filled by the engine only for rules that need it (see
+    /// [`Rule::needs_source`]).
     pub source_head: Option<Vec<u8>>,
+    /// The item's decoded body: body conditions read it. Filled by the engine only for rules that need it
+    /// (see [`Rule::needs_body`]); `None` reads as an empty body.
+    pub body: Option<std::sync::Arc<Body>>,
 }
 
 impl RuleEnv {
-    /// The source conditions scan: the item's kept bytes, else [`RuleEnv::source_head`].
-    fn source<'a>(&'a self, item: &'a MailItem) -> Option<&'a [u8]> {
-        item.raw.as_deref().or(self.source_head.as_deref())
+    /// The source conditions scan ([`RuleEnv::source_head`]).
+    fn source(&self) -> Option<&[u8]> {
+        self.source_head.as_deref()
+    }
+    /// Plain text of the body conditions read.
+    fn body_text(&self) -> String {
+        self.body.as_deref().map(Body::plain_text).unwrap_or_default()
     }
 }
 
@@ -214,6 +221,11 @@ impl Rule {
     /// MIME structure), so the engine must supply [`RuleEnv::source_head`] for items without a kept source.
     pub fn needs_source(&self) -> bool {
         self.conditions.iter().chain(&self.exceptions).any(RuleCondition::needs_source)
+    }
+    /// True when a condition or exception reads the message body, so the engine must supply
+    /// [`RuleEnv::body`].
+    pub fn needs_body(&self) -> bool {
+        self.conditions.iter().chain(&self.exceptions).any(RuleCondition::needs_body)
     }
     /// "(client-only)": an action only the client can do, or the "on this computer only" condition.
     pub fn is_client_only(&self) -> bool {
@@ -449,11 +461,11 @@ impl RuleCondition {
                 item.from.iter().chain(item.sender.iter()).any(|m| person_matches(m, list))
             }
             RuleCondition::SubjectContains(words) => any_word_in(&item.subject, words),
-            RuleCondition::BodyContains(words) => any_word_in(&item.body_text(), words),
+            RuleCondition::BodyContains(words) => any_word_in(&env.body_text(), words),
             RuleCondition::SubjectOrBodyContains(words) => {
-                any_word_in(&item.subject, words) || any_word_in(&item.body_text(), words)
+                any_word_in(&item.subject, words) || any_word_in(&env.body_text(), words)
             }
-            RuleCondition::HeaderContains(words) => any_word_in(&header_text(item, env.source(item)), words),
+            RuleCondition::HeaderContains(words) => any_word_in(&header_text(item, env.source()), words),
             RuleCondition::RecipientAddressContains(words) => {
                 item.to.iter().chain(&item.cc).chain(&item.bcc).any(|m| any_word_in(&m.addr, words))
             }
@@ -488,19 +500,18 @@ impl RuleCondition {
                 let (lo, hi) = if a <= b { (*a, *b) } else { (*b, *a) };
                 (lo..=hi).contains(&item.received.unix)
             }
-            RuleCondition::AutomaticReply => is_automatic_reply_in(item, env.source(item)),
+            RuleCondition::AutomaticReply => is_automatic_reply_in(item, env.source()),
             RuleCondition::MeetingInvitationOrUpdate => {
-                message_class_in(item, env.source(item)).starts_with("IPM.Schedule.Meeting")
+                message_class_in(item, env.source()).starts_with("IPM.Schedule.Meeting")
             }
             RuleCondition::UsesForm(name) => {
                 let name = name.trim();
-                !name.is_empty()
-                    && form_name(message_class_in(item, env.source(item))).eq_ignore_ascii_case(name)
+                !name.is_empty() && form_name(message_class_in(item, env.source())).eq_ignore_ascii_case(name)
             }
             RuleCondition::FormType(class) => {
                 let class = class.trim().to_ascii_lowercase();
                 !class.is_empty()
-                    && message_class_in(item, env.source(item)).to_ascii_lowercase().starts_with(&class)
+                    && message_class_in(item, env.source()).to_ascii_lowercase().starts_with(&class)
             }
             RuleCondition::FromRssFeedWithText(words) => {
                 env.rss_feed.as_deref().is_some_and(|feed| any_word_in(feed, words))
@@ -513,6 +524,11 @@ impl RuleCondition {
             }),
             RuleCondition::OnThisComputerOnly | RuleCondition::AfterSending => true,
         }
+    }
+
+    /// True for conditions that read the message body (see [`Rule::needs_body`]).
+    pub fn needs_body(&self) -> bool {
+        matches!(self, RuleCondition::BodyContains(_) | RuleCondition::SubjectOrBodyContains(_))
     }
 
     /// True for conditions that read the message source (see [`Rule::needs_source`]).
@@ -733,13 +749,8 @@ fn attachment_is(a: &AttachmentMeta, types: &[&str]) -> bool {
 
 /// The message class of an item, derived from its MIME structure: meeting requests/cancellations/responses
 /// (an iCalendar part, RFC 5546 METHOD), S/MIME (RFC 8551), delivery and read reports (RFC 3464, RFC 8098),
-/// else "IPM.Note". Reads the kept source only; see [`message_class_in`].
-pub fn message_class(item: &MailItem) -> &'static str {
-    message_class_in(item, item.raw.as_deref())
-}
-
-/// [`message_class`] scanning `source`: the item's source when it is not kept in memory (read back from the
-/// store), `None` for none.
+/// else "IPM.Note". `source` is (the start of) the item's stored source, `None` for none (its attachment list
+/// is all there is to go on).
 pub fn message_class_in(item: &MailItem, source: Option<&[u8]>) -> &'static str {
     let text = scan_text(item, source);
     let calendar = text.contains("text/calendar")
@@ -780,13 +791,8 @@ pub fn message_class_in(item: &MailItem, source: Option<&[u8]>) -> &'static str 
 }
 
 /// RFC 3834 automatic responses (`Auto-Submitted` other than "no"), the common `X-Autoreply` /
-/// `X-Autorespond` markers, and subjects starting "Automatic reply:" / "Auto:" / "Out of Office". Reads the
-/// kept source only; see [`is_automatic_reply_in`].
-pub fn is_automatic_reply(item: &MailItem) -> bool {
-    is_automatic_reply_in(item, item.raw.as_deref())
-}
-
-/// [`is_automatic_reply`] reading the header of `source` (the item's source when it is not kept in memory).
+/// `X-Autorespond` markers, and subjects starting "Automatic reply:" / "Auto:" / "Out of Office". `source` is
+/// (the start of) the item's stored source, `None` for none (the subject is all there is to go on).
 pub fn is_automatic_reply_in(item: &MailItem, source: Option<&[u8]>) -> bool {
     let subject = item.subject.trim_start().to_lowercase();
     if ["automatic reply:", "auto:", "autoreply:", "out of office"].iter().any(|p| subject.starts_with(p)) {
@@ -826,26 +832,40 @@ pub fn is_automatic_reply_in(item: &MailItem, source: Option<&[u8]>) -> bool {
 #[cfg(test)]
 mod depth_tests {
     use super::*;
-    use crate::{Body, DateTime};
+    use crate::DateTime;
 
-    fn item(subject: &str, raw: &str) -> MailItem {
-        MailItem {
+    /// An item and what the engine supplies for it: its source (empty: none) and its body.
+    struct T {
+        item: MailItem,
+        env: RuleEnv,
+    }
+
+    fn item(subject: &str, raw: &str) -> T {
+        let item = MailItem {
             subject: subject.into(),
             from: Some(Address::new(Some("Ann"), "ann@example.org")),
             to: vec![Address::new(None, "me@example.net")],
-            raw: (!raw.is_empty()).then(|| raw.as_bytes().to_vec()),
-            body: Body { text: Some("hello".into()), ..Default::default() },
             received: DateTime { unix: 1_000, offset_min: 0 },
             ..Default::default()
-        }
+        };
+        let env = RuleEnv {
+            source_head: (!raw.is_empty()).then(|| raw.as_bytes().to_vec()),
+            body: Some(std::sync::Arc::new(Body { text: Some("hello".into()), ..Default::default() })),
+            ..Default::default()
+        };
+        T { item, env }
     }
 
     fn ctx() -> RuleContext {
         RuleContext { my_addresses: vec!["me@example.net".into()], account_address: "me@example.net".into() }
     }
 
-    fn m(c: RuleCondition, i: &MailItem) -> bool {
-        Rule { conditions: vec![c], ..Default::default() }.matches(i, &ctx())
+    fn m(c: RuleCondition, t: &T) -> bool {
+        Rule { conditions: vec![c], ..Default::default() }.matches_in(&t.item, &ctx(), &t.env)
+    }
+
+    fn message_class(t: &T) -> &'static str {
+        message_class_in(&t.item, t.env.source())
     }
 
     const INVITE: &str = "From: ann@example.org\r\nSubject: Sync\r\nContent-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nx\r\n--b\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n--b--\r\n";
@@ -873,7 +893,10 @@ mod depth_tests {
         );
         // An attached .ics without a METHOD is still ordinary mail.
         let mut with_ics = item("ics", "");
-        with_ics.attachments.push(AttachmentMeta { mime_type: "text/calendar".into(), ..Default::default() });
+        with_ics
+            .item
+            .attachments
+            .push(AttachmentMeta { mime_type: "text/calendar".into(), ..Default::default() });
         assert_eq!(message_class(&with_ics), "IPM.Note");
         assert_eq!(form_name("IPM.Schedule.Meeting.Request"), "Meeting Request");
         assert_eq!(form_name("whatever"), "Message");
@@ -931,12 +954,12 @@ mod depth_tests {
             RuleCondition::SuspectedJunk,
             RuleCondition::SenderInContacts,
         ] {
-            assert!(c.matches_in(&i, &ctx(), &env), "{c:?}");
+            assert!(c.matches_in(&i.item, &ctx(), &env), "{c:?}");
         }
-        assert!(!RuleCondition::FromRssFeedWithText(vec![]).matches_in(&i, &ctx(), &env));
+        assert!(!RuleCondition::FromRssFeedWithText(vec![]).matches_in(&i.item, &ctx(), &env));
         // The marker in exceptions never cancels a rule.
         let r = Rule { exceptions: vec![RuleCondition::AfterSending], ..Default::default() };
-        assert!(r.matches(&i, &ctx()));
+        assert!(r.matches(&i.item, &ctx()));
     }
 
     #[test]
@@ -1058,19 +1081,17 @@ mod depth_tests {
         );
     }
 
-    /// Regression (issue #25 review): an item whose source left memory is matched against the stored source
-    /// the engine supplies, for every condition that reads the source.
+    /// Regression (issue #25 review, storage stage S5): items keep neither source nor body; the conditions that
+    /// read them see what the engine supplies, and nothing when it supplies nothing.
     #[test]
-    fn source_conditions_read_the_stored_source_when_none_is_kept() {
+    fn source_and_body_conditions_read_what_the_engine_supplies() {
         let raw = "From: ann@example.org\r\nList-Id: <team.lists.example.org>\r\nAuto-Submitted: auto-replied\r\n\r\nx";
-        let kept = item("Hello", raw);
-        let bare = MailItem { raw: None, ..kept.clone() };
+        let bare = item("Hello", raw).item;
         let env = RuleEnv { source_head: Some(raw.as_bytes().to_vec()), ..Default::default() };
-        let invite = MailItem { raw: None, ..item("Sync", INVITE) };
+        let invite = item("Sync", INVITE).item;
         let invite_env = RuleEnv { source_head: Some(INVITE.as_bytes().to_vec()), ..Default::default() };
         for c in [RuleCondition::HeaderContains(vec!["list-id".into()]), RuleCondition::AutomaticReply] {
             assert!(Rule { conditions: vec![c.clone()], ..Default::default() }.needs_source());
-            assert!(c.matches(&kept, &ctx()), "{c:?} kept");
             assert!(!c.matches(&bare, &ctx()), "{c:?} without a source");
             assert!(c.matches_in(&bare, &ctx(), &env), "{c:?} stored");
         }
@@ -1079,13 +1100,19 @@ mod depth_tests {
         assert!(meeting.matches_in(&invite, &ctx(), &invite_env));
         assert!(RuleCondition::FormType("IPM.Schedule".into()).matches_in(&invite, &ctx(), &invite_env));
         assert_eq!(message_class_in(&invite, Some(INVITE.as_bytes())), "IPM.Schedule.Meeting.Request");
-        assert!(
-            !Rule {
-                conditions: vec![RuleCondition::SubjectContains(vec!["x".into()])],
-                ..Default::default()
-            }
-            .needs_source()
-        );
+        let subject =
+            Rule { conditions: vec![RuleCondition::SubjectContains(vec!["x".into()])], ..Default::default() };
+        assert!(!subject.needs_source() && !subject.needs_body());
+        for c in [
+            RuleCondition::BodyContains(vec!["budget".into()]),
+            RuleCondition::SubjectOrBodyContains(vec!["budget".into()]),
+        ] {
+            assert!(Rule { conditions: vec![c.clone()], ..Default::default() }.needs_body());
+            assert!(!c.matches(&bare, &ctx()), "{c:?} without a body");
+            let body = Body { html: Some("<p>The <b>budget</b> is due</p>".into()), ..Default::default() };
+            let env = RuleEnv { body: Some(std::sync::Arc::new(body)), ..Default::default() };
+            assert!(c.matches_in(&bare, &ctx(), &env), "{c:?} with the body");
+        }
     }
 
     #[test]

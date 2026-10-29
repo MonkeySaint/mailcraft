@@ -940,10 +940,16 @@ fn add_account_uses_the_providers_autoconfig_before_guessing() {
     assert!(combo_shows(&h, "12 months"));
     h.get_by_label("Download mail from the past:").scroll_to_me();
     step(&mut h);
-    let combo = h
-        .query_all_by_role(egui::accesskit::Role::ComboBox)
-        .find(|n| n.value().as_deref() == Some("12 months"));
-    combo.unwrap().click();
+    let combo = "12 months";
+    h.query_all_by_role(egui::accesskit::Role::ComboBox)
+        .find(|n| n.value().as_deref() == Some(combo))
+        .unwrap()
+        .scroll_to_me();
+    step(&mut h);
+    h.query_all_by_role(egui::accesskit::Role::ComboBox)
+        .find(|n| n.value().as_deref() == Some(combo))
+        .unwrap()
+        .click();
     step(&mut h);
     h.get_by_label("3 months").click();
     step(&mut h);
@@ -1014,4 +1020,136 @@ fn add_account_name_never_comes_from_a_data_file() {
     crate::dialogs::open(&mut app, "addAccount", json!({}));
     let h = harness(app);
     assert_eq!(field_value(&h, "Your name:"), "Sam Example");
+}
+
+/// The slider of the offline window: value text, stop number, disabled.
+fn offline_slider(h: &Harness<'_, App>) -> (String, f64, bool) {
+    use egui_kittest::kittest::NodeT;
+    let n = h.get_by_label(crate::dialogs::accounts::OFFLINE_SLIDER);
+    let node = n.accesskit_node();
+    assert_eq!(node.role(), egui::accesskit::Role::Slider);
+    (n.value().unwrap_or_default(), node.numeric_value().unwrap_or(-1.0), node.is_disabled())
+}
+
+/// Sends a screen reader's `action` (with `data`) to the offline window slider.
+fn slider_action(
+    h: &mut Harness<'_, App>,
+    action: egui::accesskit::Action,
+    data: Option<egui::accesskit::ActionData>,
+) {
+    use egui_kittest::kittest::NodeT;
+    let (target_node, target_tree) =
+        h.get_by_label(crate::dialogs::accounts::OFFLINE_SLIDER).accesskit_node().locate();
+    h.event(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+        action,
+        target_tree,
+        target_node,
+        data,
+    }));
+    step(h);
+}
+
+#[test]
+fn imap_settings_offer_the_offline_window_and_save_it() {
+    let mut app = sample_app();
+    let id = add_local_imap(&mut app, "pat@example.net");
+    crate::dialogs::open(&mut app, "addAccount", json!({"change": id}));
+    let mut h = harness(app);
+    assert!(h.query_by_label("Offline mail").is_some());
+    let keep = "Keep mail on this computer to read when offline";
+    assert_eq!(offline_slider(&h), ("1 year".into(), 6.0, false), "one year by default");
+    h.get_by_label(crate::dialogs::accounts::OFFLINE_SLIDER).scroll_to_me();
+    step(&mut h);
+    // The keyboard moves it one stop, three stops, or to either end; the chosen value shows beside it.
+    h.get_by_label(crate::dialogs::accounts::OFFLINE_SLIDER).focus();
+    step(&mut h);
+    for (key, want, stop) in [
+        (Key::ArrowLeft, "6 months", 5.0),
+        (Key::End, "All", 10.0),
+        (Key::ArrowRight, "All", 10.0),
+        (Key::Home, "3 days", 0.0),
+        (Key::ArrowDown, "3 days", 0.0),
+        (Key::PageUp, "1 month", 3.0),
+        (Key::ArrowUp, "3 months", 4.0),
+    ] {
+        h.key_press(key);
+        step(&mut h);
+        assert_eq!(offline_slider(&h), (want.into(), stop, false), "after {key:?}");
+    }
+    assert!(h.query_by_label("3 months").is_some(), "the value is written beside the slider");
+    // Off: the slider is disabled.
+    h.get_by_label(keep).click();
+    step(&mut h);
+    assert!(offline_slider(&h).2, "disabled while mail is not kept");
+    h.get_by_label(keep).click();
+    step(&mut h);
+    assert!(!offline_slider(&h).2);
+    h.get_by_label("Save").click();
+    step(&mut h);
+    assert!(h.query_by_label("Account successfully updated").is_some(), "{:?}", h.state().ui.toast);
+    let o = mailcraft_engine::accounts::account_options(&h.state().s, AccountId(id));
+    assert!(o.keep_offline);
+    assert_eq!(o.offline_window, mailcraft_engine::offline::OfflineWindow::ThreeMonths);
+}
+
+#[test]
+fn the_offline_window_slider_follows_the_screen_reader_and_the_pointer() {
+    use egui::accesskit::{Action, ActionData};
+    let mut app = sample_app();
+    let id = add_local_imap(&mut app, "pat@example.net");
+    crate::dialogs::open(&mut app, "addAccount", json!({"change": id}));
+    let mut h = harness(app);
+    h.get_by_label(crate::dialogs::accounts::OFFLINE_SLIDER).scroll_to_me();
+    step(&mut h);
+    // Assistive technology: Increment, Decrement and Set Value (to the nearest stop).
+    slider_action(&mut h, Action::Increment, None);
+    assert_eq!(offline_slider(&h).0, "2 years");
+    slider_action(&mut h, Action::Decrement, None);
+    slider_action(&mut h, Action::Decrement, None);
+    assert_eq!(offline_slider(&h).0, "6 months");
+    slider_action(&mut h, Action::SetValue, Some(ActionData::NumericValue(1.4)));
+    assert_eq!(offline_slider(&h).0, "1 week");
+    slider_action(&mut h, Action::SetValue, Some(ActionData::NumericValue(f64::NAN)));
+    assert_eq!(offline_slider(&h).0, "1 week", "NaN is ignored");
+    slider_action(&mut h, Action::SetValue, Some(ActionData::NumericValue(1e300)));
+    assert_eq!(offline_slider(&h).0, "All", "out of range goes to the nearest end");
+    // The pointer: a click at the left end picks the first stop.
+    let rect = h.get_by_label(crate::dialogs::accounts::OFFLINE_SLIDER).rect();
+    let at = egui::pos2(rect.left() + 2.0, rect.center().y);
+    h.event(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        step(&mut h);
+    }
+    assert_eq!(offline_slider(&h).0, "3 days");
+}
+
+#[test]
+fn pop_accounts_have_no_offline_window() {
+    let mut app = sample_app();
+    let port = closed_port();
+    let v = app
+        .s
+        .run(
+            "accounts.add",
+            &json!({
+                "kind": "pop3",
+                "address": "lee@example.com",
+                "incoming": {"host": "127.0.0.1", "port": port, "security": "none", "allowPlaintextAuth": true},
+                "outgoing": {"host": "127.0.0.1", "port": port, "security": "none", "allowPlaintextAuth": true},
+                "password": "pw-local-only",
+            }),
+        )
+        .unwrap();
+    let id = v["account"].as_u64().unwrap();
+    crate::dialogs::open(&mut app, "addAccount", json!({"change": id}));
+    let h = harness(app);
+    assert!(h.query_by_label("POP Account Settings").is_some());
+    assert!(h.query_by_label("Offline mail").is_none());
+    assert!(h.query_by_label(crate::dialogs::accounts::OFFLINE_SLIDER).is_none());
 }

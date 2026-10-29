@@ -8,7 +8,7 @@
 //! Only part of this API is on the `MailRepo` trait (`mailcraft-store`) that a database-backed repository
 //! will implement: the targeted reads ([`MailTable::get`], [`MailTable::counts`], [`MailTable::all_counts`],
 //! [`MailTable::ids_in`], [`MailTable::by_message_id`], [`MailTable::by_remote_id`],
-//! [`MailTable::older_than`], [`MailTable::body`]), the streaming [`MailTable::scan`], the item writes
+//! [`MailTable::older_than`]), the streaming [`MailTable::scan`], the item writes
 //! ([`MailTable::insert`], [`MailTable::update`], [`MailTable::remove`]) and the change records
 //! ([`MailTable::begin`], [`MailTable::commit`], [`MailTable::rollback`]). The borrowing iterators
 //! ([`MailTable::items`], [`MailTable::iter`], [`MailTable::ids`], [`MailTable::in_folder`]) and the bulk
@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Body, FolderCounts, FolderId, ItemId, MailItem};
+use crate::{FolderCounts, FolderId, ItemId, MailItem};
 
 /// The mail items of a mailbox, keyed by id.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -445,11 +445,6 @@ impl MailTable {
             }
         }
     }
-    /// The decoded body of item `id`.
-    pub fn body(&self, id: ItemId) -> Option<&Body> {
-        self.map.get(&id).map(|m| &m.body)
-    }
-
     // ---- writes (each one recorded in the innermost open change record, if any) ----
 
     /// The item stored under `id`, to change in place. Recorded as touched even if the caller then changes
@@ -570,6 +565,19 @@ impl MailTable {
         let n = self.log.frames.len();
         self.log.frames.clear();
         n
+    }
+    /// The before-images record `token` holds so far, without closing it: `(id, before-image)` of every item
+    /// written since it opened (records opened after it and still open count too; the older image wins), in
+    /// id order. Empty when `token` is not open here.
+    pub fn recorded(&self, token: ChangeToken) -> Vec<(ItemId, Option<&MailItem>)> {
+        let Some(pos) = self.log.frames.iter().rposition(|f| f.token == token) else { return Vec::new() };
+        let mut out: BTreeMap<ItemId, Option<&MailItem>> = BTreeMap::new();
+        for frame in self.log.frames.iter().skip(pos) {
+            for (id, b) in frame.changes.iter() {
+                out.entry(id).or_insert(b);
+            }
+        }
+        out.into_iter().collect()
     }
     /// Closes record `token` and returns what was written since it opened. Records opened after it and left
     /// open are folded into it first. The enclosing record, if any, keeps a copy of the before-images it did

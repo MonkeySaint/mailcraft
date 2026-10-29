@@ -104,7 +104,8 @@ fn item_ids(s: &Session) -> Vec<u64> {
 
 fn all_docs(s: &Session) -> Vec<Doc> {
     let mb = &s.mailbox;
-    let mut out: Vec<Doc> = mb.mail.items().map(Doc::from_mail).collect();
+    let mut out: Vec<Doc> =
+        mb.mail.items().map(|m| Doc::from_mail(m, s.body(m.id).unwrap().as_deref())).collect();
     out.extend(mb.appointments.values().map(Doc::from_appointment));
     out.extend(mb.contacts.values().map(Doc::from_contact));
     out.extend(mb.tasks.values().map(Doc::from_task));
@@ -190,21 +191,31 @@ fn direct_edit(r: &mut Rng, s: &mut Session) {
     let ids: Vec<ItemId> = s.mailbox.mail.ids().collect();
     let Some(id) = r.pick(&ids).copied() else { return };
     let w = *r.pick(&VOCAB).unwrap_or(&"zeta");
-    if let Some(m) = s.mailbox.mail.get_mut(id) {
-        match r.below(4) {
-            0 => m.subject = format!("{} {w}", m.subject),
-            1 => m.read = !m.read,
-            2 => m.categories = vec!["Red category".into()],
-            _ => {
-                // Same length, past the preview: only a fingerprint of the whole body notices.
-                let filler = "x ".repeat(200);
-                let tail = if m.body.text.as_deref().is_some_and(|t| t.ends_with("alpha")) {
-                    "gamma"
-                } else {
-                    "alpha"
-                };
-                m.body.text = Some(format!("{filler}{tail}"));
+    match r.below(4) {
+        0 => {
+            if let Some(m) = s.mailbox.mail.get_mut(id) {
+                m.subject = format!("{} {w}", m.subject);
             }
+        }
+        1 => {
+            if let Some(m) = s.mailbox.mail.get_mut(id) {
+                m.read = !m.read;
+            }
+        }
+        2 => {
+            if let Some(m) = s.mailbox.mail.get_mut(id) {
+                m.categories = vec!["Red category".into()];
+            }
+        }
+        _ => {
+            // Same length, past the preview: the body record's key changes with it.
+            let filler = "x ".repeat(200);
+            s.edit_body(id, |b| {
+                let tail =
+                    if b.text.as_deref().is_some_and(|t| t.ends_with("alpha")) { "gamma" } else { "alpha" };
+                b.text = Some(format!("{filler}{tail}"));
+            })
+            .unwrap();
         }
     }
     s.search.invalidate();
@@ -240,7 +251,7 @@ fn check(s: &Session, extra: &[String], step: &str) {
             .mail
             .items()
             .filter(|m| folders.contains(&m.folder.0))
-            .map(Doc::from_mail)
+            .map(|m| Doc::from_mail(m, s.body(m.id).unwrap().as_deref()))
             .filter(|d| matches(&q, d, &ctx))
             .map(|d| d.id)
             .collect();

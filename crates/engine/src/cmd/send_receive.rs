@@ -575,7 +575,11 @@ mod tests {
     fn mark_finds_header_only_items() {
         let (mut s, inbox, _) = session();
         let id = s.mailbox.add_mail(MailItem { folder: inbox, ..Default::default() });
-        s.mailbox.mail.items_mut().filter(|m| m.id != id).for_each(|m| m.body.text = Some("x".into()));
+        let others: Vec<crate::model::ItemId> =
+            s.mailbox.mail.items().map(|m| m.id).filter(|m| *m != id).collect();
+        for o in others {
+            s.edit_body(o, |b| b.text = Some("x".into())).unwrap();
+        }
         s.selection.items = s.mailbox.items_in(inbox).iter().map(|m| m.id).collect();
         let r = s.run("sendReceive.markToDownload", &json!({"copy": true})).unwrap();
         assert_eq!(r["marked"], json!([id.0]));

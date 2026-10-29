@@ -295,7 +295,7 @@ fn search_tools(s: &mut Session, p: &Value) -> CmdResult {
         None => Ok(dialog(s, "searchTools", json!({}))),
         Some("indexingStatus") => {
             let before = s.search.pending(&s.mailbox);
-            let stats = s.search.stats(&s.mailbox);
+            let stats = s.search.stats(&s.mailbox, &s.bodies);
             // `stats` indexed everything that was waiting; the window keeps reporting while mail arrives.
             let mut params = search_index::indexing_status(s);
             if let Some(o) = params.as_object_mut() {
@@ -1000,7 +1000,7 @@ fn highlights(s: &mut Session, p: &Value) -> CmdResult {
                 Field::From => people(m.from.as_slice()),
                 Field::To => people(&m.to),
                 Field::Cc => people(&m.cc),
-                Field::Body => m.body_text(),
+                Field::Body => s.body_text(m),
                 Field::Attachments => {
                     m.attachments.iter().map(|a| a.filename.as_str()).collect::<Vec<_>>().join("; ")
                 }
@@ -1464,7 +1464,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        add(&mut s, MailItem { subject: "Lunch".into(), body: Default::default(), ..Default::default() });
+        add(&mut s, MailItem { subject: "Lunch".into(), ..Default::default() });
         assert_eq!(run(&mut s, "search.advancedFind", json!({}))["dialog"], "advancedFind");
         let r =
             run(&mut s, "search.advancedFind", json!({"words": "budget", "in": "subject", "from": "ann"}));

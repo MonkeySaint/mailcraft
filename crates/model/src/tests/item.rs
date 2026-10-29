@@ -46,11 +46,23 @@ fn from_plain_message() {
     assert_eq!(item.sent.map(|d| d.unix), Some(1_791_448_200));
     // Received header wins over Date (one minute later).
     assert_eq!(item.received.unix, 1_791_448_260);
-    assert_eq!(item.body.format, BodyFormat::PlainText);
     assert_eq!(item.preview, "The badge reader is down. Please use the side door today.");
     assert_eq!(item.size, PLAIN.len() as u64);
     assert!(!item.read);
-    assert_eq!(item.raw.as_deref(), Some(PLAIN.as_bytes()));
+    // Neither the source nor the body stays on the item (storage stage S5): the caller stores them.
+    assert!(item.blob.is_none() && item.body_key.is_none() && item.expires.is_none());
+    let body = Body::from_source(PLAIN.as_bytes()).unwrap();
+    assert_eq!(body.format, BodyFormat::PlainText);
+    assert_eq!(body.preview(), item.preview);
+}
+
+#[test]
+fn expiry_is_read_from_the_header() {
+    let raw = "Subject: Offer\r\nExpires: Fri, 09 Oct 2026 12:00:00 +0000\r\n\r\nUntil Friday";
+    assert_eq!(parse(raw).expires.map(|d| d.unix), Some(1_791_547_200));
+    let raw = "Subject: Offer\r\nExpiry-Date: Fri, 09 Oct 2026 12:00:00 +0000\r\n\r\nUntil Friday";
+    assert_eq!(parse(raw).expires.map(|d| d.unix), Some(1_791_547_200));
+    assert!(parse("Subject: x\r\nExpires: soon\r\n\r\nx").expires.is_none());
 }
 
 #[test]
@@ -62,7 +74,7 @@ Content-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n\
 --b1\r\nContent-Type: application/pdf; name=\"report.pdf\"\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\
 Content-Transfer-Encoding: base64\r\n\r\nJVBERi0=\r\n--b1--\r\n";
     let item = parse(raw);
-    assert_eq!(item.body.format, BodyFormat::Html);
+    assert_eq!(Body::from_source(raw.as_bytes()).map(|b| b.format), Some(BodyFormat::Html));
     assert_eq!(item.preview, "Hello there");
     assert_eq!(item.received, NOW, "no Received or Date header: falls back to now");
     assert!(item.has_attachments());
@@ -89,10 +101,11 @@ fn item_helpers() {
     assert_eq!(m.size_label(), "1 KB");
     m.size = 1025;
     assert_eq!(m.size_label(), "2 KB");
-    m.body = Body { html: Some("<b>Bold</b> text".into()), ..Default::default() };
-    assert_eq!(crate::text::collapse_whitespace(&m.body_text()), "Bold text");
-    m.refresh_preview();
-    assert_eq!(m.preview, "Bold text");
+    let body = Body { html: Some("<b>Bold</b> text".into()), ..Default::default() };
+    assert_eq!(crate::text::collapse_whitespace(&body.plain_text()), "Bold text");
+    assert_eq!(body.preview(), "Bold text");
+    assert!(!body.is_empty() && Body::default().is_empty());
+    assert!(body.approx_bytes() > "<b>Bold</b> text".len());
     m.attachments = vec![AttachmentMeta { inline: true, ..Default::default() }];
     assert!(!m.has_attachments());
     assert_eq!(BodyFormat::RichText.title_label(), "Rich Text");
@@ -120,29 +133,22 @@ proptest! {
 
 #[test]
 fn body_text_falls_back_to_html_when_text_is_blank() {
-    let m = MailItem {
-        body: Body {
-            text: Some(" \r\n ".into()),
-            html: Some("<p>Real body</p>".into()),
-            ..Default::default()
-        },
-        ..mail("x")
-    };
-    assert_eq!(crate::text::collapse_whitespace(&m.body_text()), "Real body");
-    let only_blank = MailItem { body: Body { text: Some("  ".into()), ..Default::default() }, ..mail("x") };
-    assert_eq!(only_blank.body_text(), "  ");
+    let m = Body { text: Some(" \r\n ".into()), html: Some("<p>Real body</p>".into()), ..Default::default() };
+    assert_eq!(crate::text::collapse_whitespace(&m.plain_text()), "Real body");
+    let only_blank = Body { text: Some("  ".into()), ..Default::default() };
+    assert_eq!(only_blank.plain_text(), "  ");
 }
 
 #[test]
 fn body_text_prefix_reads_only_the_start_of_a_huge_body() {
     let html = format!("<p>First line</p>{}", "<b>é</b>".repeat(500_000));
-    let m = MailItem { body: Body { html: Some(html), ..Default::default() }, ..mail("x") };
-    let short = m.body_text_prefix(1000);
+    let m = Body { html: Some(html), ..Default::default() };
+    let short = m.text_prefix(1000);
     assert!(short.contains("First line"));
     assert!(short.len() < 1000);
     // Text bodies are cut at a character boundary, never inside one.
-    let text = MailItem { body: Body { text: Some("é".repeat(10)), ..Default::default() }, ..mail("x") };
-    assert_eq!(text.body_text_prefix(5), "éé");
-    assert_eq!(text.body_text_prefix(1000), "é".repeat(10));
-    assert_eq!(MailItem { body: Body::default(), ..mail("x") }.body_text_prefix(10), "");
+    let text = Body { text: Some("é".repeat(10)), ..Default::default() };
+    assert_eq!(text.text_prefix(5), "éé");
+    assert_eq!(text.text_prefix(1000), "é".repeat(10));
+    assert_eq!(Body::default().text_prefix(10), "");
 }

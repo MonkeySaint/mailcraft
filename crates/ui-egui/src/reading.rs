@@ -244,6 +244,12 @@ pub fn space_read(ctx: &egui::Context, app: &mut App, back: bool) -> bool {
 /// Opened-message windows (secondary viewports) listed in `app.ui.read_windows`.
 pub fn read_windows(ctx: &egui::Context, app: &mut App) {
     let ids = app.ui.read_windows.clone();
+    // The engine keeps the bodies of open messages on this computer (the offline window passes them by).
+    if app.s.open_messages.len() != ids.len()
+        || ids.iter().any(|i| !app.s.open_messages.contains(&ItemId(*i)))
+    {
+        app.s.open_messages = ids.iter().copied().map(ItemId).collect();
+    }
     let mut closed: Vec<u64> = Vec::new();
     let after = app.s.settings.text("mail.other.afterMoveOrDelete");
     for (index, id) in ids.into_iter().enumerate() {
@@ -313,7 +319,7 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
                 ctx.data_mut(|d| d.insert_temp(neighbour_id(id), (prev, next)));
             }
         }
-        let title = window_title(&m.subject, m.body.format);
+        let title = window_title(&m.subject, mailcraft_engine::smime::display_body(&app.s, m).format);
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size(READ_WINDOW_SIZE)
@@ -777,6 +783,8 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     mailcraft_engine::smime::on_view(&mut app.s, ItemId(id));
     // A message a server search found (Include Older Results) downloads in full when it is opened.
     mailcraft_engine::sync::older::opened(&mut app.s, ItemId(id));
+    // A body the account's offline window took off this computer downloads again when it is opened online.
+    mailcraft_engine::offline::opened(&mut app.s, ItemId(id));
     // Options › Language › Always translate: a message in another language is translated when first shown.
     mailcraft_engine::translate::auto_translate(&mut app.s, ItemId(id));
     let Some(h) = queries::reading_header(&app.s, ItemId(id)) else {
@@ -799,7 +807,8 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
         hs.finish() | 1
     });
     if let Some(m) = mailcraft_engine::smime::display_item(&app.s, ItemId(id)) {
-        let sk = source_key(id, &m.body)
+        let shown_body = mailcraft_engine::smime::display_body(&app.s, &m);
+        let sk = source_key(id, &shown_body)
             ^ u64::from(plain)
             ^ (u64::from(unwrap) << 1)
             ^ translated_key.rotate_left(3);
@@ -810,7 +819,7 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             }
             let doc = match &translated {
                 Some(t) => Doc::from_plain_text(t),
-                None => body_doc(&m.body, plain, unwrap),
+                None => body_doc(&shown_body, plain, unwrap),
             };
             cache = MsgCache {
                 item: id,
@@ -1353,6 +1362,15 @@ fn translation_bar(ui: &mut Ui, app: &mut App, id: u64) {
 
 /// A message of which only the header was downloaded: say so, with a link that downloads the rest now.
 fn header_only_bar(ui: &mut Ui, app: &mut App, id: u64) {
+    // A body the offline window took off: say why, and offer the download unless working offline.
+    if let Some(text) = mailcraft_engine::offline::placeholder(&app.s, ItemId(id)) {
+        ui.add_space(6.0);
+        let link = (!app.s.view.work_offline).then_some("Download it now");
+        if info_bar(ui, app, "sync", &text, link) {
+            app.run("sendReceive.markToDownload", json!({"ids": [id], "now": true}));
+        }
+        return;
+    }
     if !queries::is_server_header_only(&app.s, ItemId(id)) {
         return;
     }
@@ -1656,7 +1674,8 @@ mod tests {
     #[test]
     fn mark_as_read_after_the_wait_and_space_bar_reading() {
         let s = sample_session();
-        let subject = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let subject =
+            s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).unwrap().subject.clone();
         let mut app = app_with(&subject);
         let id = app.s.selection.focus.unwrap();
         app.s.mailbox.set_read(&[id], false);
@@ -1690,7 +1709,8 @@ mod tests {
     #[test]
     fn inline_cid_pictures_reach_the_body() {
         let s = sample_session();
-        let subject = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let subject =
+            s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).unwrap().subject.clone();
         let mut app = app_with(&subject);
         let id = app.s.selection.focus.unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
@@ -1714,10 +1734,9 @@ mod tests {
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut built = mailcraft_model::MailItem::from_message(&msg, &raw, app.s.now());
         if let Some(m) = app.s.mailbox.mail.get_mut(id) {
-            m.body = built.body.clone();
             m.attachments = std::mem::take(&mut built.attachments);
-            m.raw = Some(raw);
         }
+        app.s.set_source(id, Some(&raw)).unwrap();
         let mut h = harness(app);
         h.run();
         assert_eq!(body::image_texture(&h.ctx, "cid:logo@example.org").map(|t| t.size()), Some([6, 4]));
@@ -1726,7 +1745,8 @@ mod tests {
     #[test]
     fn trust_center_and_background_options_render() {
         let s = sample_session();
-        let subject = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let subject =
+            s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).unwrap().subject.clone();
         let mut app = app_with(&subject);
         for (k, v) in
             [("trust.plainText", true), ("trust.blockImages", false), ("general.keepMessageBackground", true)]
@@ -1799,7 +1819,7 @@ mod tests {
         let parsed = mailcraft_mime::parse(&raw).unwrap();
         let mut item = mailcraft_model::MailItem::from_message(&parsed, &raw, s.now());
         item.folder = s.selection.folder;
-        let id = s.mailbox.add_mail(item);
+        let id = s.add_message(item, &mailcraft_engine::Content::source(raw.clone())).unwrap();
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         let mut h = harness(App::new(s));
@@ -1823,15 +1843,14 @@ mod tests {
     #[test]
     fn junk_info_bar_and_read_receipt_request() {
         let s = sample_session();
-        let subject = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap().subject.clone();
+        let subject =
+            s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).unwrap().subject.clone();
         let mut app = app_with(&subject);
         let id = app.s.selection.focus.unwrap();
         // A read-receipt request: the bar asks (Options › Mail › Tracking default), "never" hides it.
         let raw = b"From: Ann <ann@example.org>\r\nTo: me@example.com\r\nSubject: Hi\r\n\
                     Disposition-Notification-To: ann@example.org\r\n\r\nBody\r\n";
-        if let Some(m) = app.s.mailbox.mail.get_mut(id) {
-            m.raw = Some(raw.to_vec());
-        }
+        app.s.set_source(id, Some(raw)).unwrap();
         let mut h = harness(app);
         h.run_steps(2);
         assert!(h.query_by_label(crate::compose::READ_RECEIPT_REQUEST).is_some());
@@ -1853,12 +1872,13 @@ mod tests {
 
     fn app_with_text(text: &str) -> (App, u64) {
         let mut s = sample_session();
-        let id = s.mailbox.mail.items().find(|m| m.body.html.is_some()).map(|m| m.id).unwrap();
-        if let Some(m) = s.mailbox.mail.get_mut(id) {
-            m.body.html = None;
-            m.body.format = BodyFormat::PlainText;
-            m.body.text = Some(text.to_owned());
-        }
+        let id = s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).map(|m| m.id).unwrap();
+        s.edit_body(id, |b| {
+            b.html = None;
+            b.format = BodyFormat::PlainText;
+            b.text = Some(text.to_owned());
+        })
+        .unwrap();
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         (App::new(s), id.0)
@@ -1869,7 +1889,10 @@ mod tests {
     #[test]
     fn main_and_explorer_reading_panes_keep_their_own_caches() {
         let s = sample_session();
-        let mut bodies = s.mailbox.mail.items().filter(|m| m.body.html.is_some() || m.body.text.is_some());
+        let mut bodies = s.mailbox.mail.items().filter(|m| {
+            let b = s.body_or_empty(m);
+            b.html.is_some() || b.text.is_some()
+        });
         let (a, b) = (bodies.next().unwrap().id, bodies.next().unwrap().id);
         let mut app = App::new(s);
         let ctx = egui::Context::default();
@@ -2021,7 +2044,7 @@ mod tests {
     #[test]
     fn renders_html_message() {
         let s = sample_session();
-        let m = s.mailbox.mail.items().find(|m| m.body.html.is_some()).unwrap();
+        let m = s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).unwrap();
         let subject = m.subject.clone();
         let mut h = harness(app_with(&subject));
         h.run();
@@ -2036,10 +2059,13 @@ mod tests {
     #[test]
     fn renders_plain_message_and_attachment_and_reply() {
         let mut s = sample_session();
-        let m = s.mailbox.mail.items_mut().find(|m| m.subject == "Quarterly report draft").unwrap();
-        m.body.html = None;
-        m.body.format = BodyFormat::PlainText;
-        m.body.text = Some("Hi team,\nplease see the attached draft.\n".into());
+        let id = s.mailbox.mail.items().find(|m| m.subject == "Quarterly report draft").unwrap().id;
+        s.edit_body(id, |b| {
+            b.html = None;
+            b.format = BodyFormat::PlainText;
+            b.text = Some("Hi team,\nplease see the attached draft.\n".into());
+        })
+        .unwrap();
         let mut h = harness(app_with_session(s, "Quarterly report draft"));
         h.run();
         assert!(h.query_all_by_label_contains("please see the attached draft.").next().is_some());
@@ -2049,6 +2075,52 @@ mod tests {
         h.run();
         let app = h.state();
         assert!(app.s.composes.values().any(|c| c.inline));
+    }
+
+    /// A message whose body the offline window took off: the pane says so instead of showing an empty body,
+    /// and offers the download when MailCraft is online.
+    #[test]
+    fn a_body_taken_off_by_the_offline_window_shows_why() {
+        let mut s = sample_session();
+        let acct = s.mailbox.add_account(mailcraft_model::Account {
+            kind: mailcraft_model::AccountKind::Imap,
+            display_name: "Work".into(),
+            address: "me@example.com".into(),
+            incoming: Some(mailcraft_model::ServerSettings {
+                host: "127.0.0.1".into(),
+                port: 9,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        s.mailbox.create_default_folders(acct);
+        let inbox = s.mailbox.role_folder(acct, mailcraft_model::FolderRole::Inbox).unwrap();
+        s.mailbox.folders.get_mut(&inbox).unwrap().remote_name = Some("INBOX".into());
+        let item = mailcraft_model::MailItem {
+            folder: inbox,
+            subject: "Old report".into(),
+            remote_id: Some("5".into()),
+            received: mailcraft_model::DateTime::from_unix(s.now().unix - 800 * 86_400, 0),
+            ..Default::default()
+        };
+        let raw = b"From: ann@example.org\r\nSubject: Old report\r\n\r\nThe old figures\r\n".to_vec();
+        let id = s.add_message(item, &mailcraft_engine::Content::source(raw)).unwrap();
+        s.view.work_offline = true;
+        assert_eq!(mailcraft_engine::offline::pass(&mut s, acct).evicted, 1);
+        s.selection.folder = inbox;
+        s.selection.items = vec![id];
+        s.selection.focus = Some(id);
+        let mut h = harness(App::new(s));
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("only its header is here").is_some());
+        assert!(h.query_by_label_contains("working offline").is_some());
+        assert!(h.query_by_label("Download it now").is_none(), "nothing to offer while offline");
+        assert!(h.query_by_label("Download the rest of the message").is_none(), "one bar, not two");
+        // Online: opening it asks for the download, and the bar offers it again.
+        h.state_mut().s.view.work_offline = false;
+        h.run_steps(2);
+        assert!(h.state().s.mailbox.mail.get(id).unwrap().body_evicted);
+        assert!(h.query_by_label("Download it now").is_some());
     }
 
     fn app_with_session(mut s: mailcraft_engine::Session, subject: &str) -> App {
@@ -2546,7 +2618,7 @@ mod tests {
     fn f6_cycles_header_body_info_bar_and_ribbon_in_a_read_window() {
         let mut s = sample_session();
         // A message with an info bar (a follow-up flag).
-        let id = s.mailbox.mail.items().find(|m| m.body.html.is_some()).map(|m| m.id).unwrap();
+        let id = s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).map(|m| m.id).unwrap();
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         s.run("mail.flag", &json!({"ids": [id.0]})).unwrap();

@@ -350,7 +350,7 @@ fn memo_item(s: &Session, id: ItemId) -> Option<MemoItem> {
     let mb = &s.mailbox;
     let tz = s.tz_offset_min;
     if let Some(m) = mb.mail.get(id) {
-        return Some(mail_memo(m, tz));
+        return Some(mail_memo(m, &s.body_or_empty(m), tz));
     }
     if let Some(a) = mb.appointments.get(&id) {
         return Some(appointment_memo(a, tz));
@@ -365,15 +365,15 @@ fn memo_item(s: &Session, id: ItemId) -> Option<MemoItem> {
 }
 
 /// Body of a mail item as rich text (sanitised HTML, else plain text, else the preview line).
-pub fn mail_doc(m: &MailItem) -> Doc {
-    match (&m.body.html, &m.body.text) {
+pub fn mail_doc(m: &MailItem, body: &mailcraft_model::Body) -> Doc {
+    match (&body.html, &body.text) {
         (Some(h), _) => mailcraft_html::html_to_doc(h),
         (None, Some(t)) => Doc::from_plain_text(t),
         (None, None) => Doc::from_plain_text(&m.preview),
     }
 }
 
-fn mail_memo(m: &MailItem, tz: i32) -> MemoItem {
+fn mail_memo(m: &MailItem, body: &mailcraft_model::Body, tz: i32) -> MemoItem {
     let mut f = Vec::new();
     push(
         &mut f,
@@ -386,7 +386,7 @@ fn mail_memo(m: &MailItem, tz: i32) -> MemoItem {
     f.push(("Subject".into(), m.subject.clone()));
     let atts: Vec<String> = m.attachments.iter().filter(|a| !a.inline).map(|a| a.filename.clone()).collect();
     push(&mut f, "Attachments", atts.join("; "));
-    MemoItem { fields: f, body: mail_doc(m) }
+    MemoItem { fields: f, body: mail_doc(m, body) }
 }
 
 fn busy_label(b: BusyStatus) -> &'static str {

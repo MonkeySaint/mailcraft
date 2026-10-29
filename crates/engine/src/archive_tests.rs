@@ -325,7 +325,8 @@ fn expired_mail_is_deleted_when_asked() {
     let sent = role(&s, FolderRole::SentItems);
     let raw = |date: &str| format!("Expiry-Date: {date}\r\nSubject: Offer\r\n\r\nBody\r\n").into_bytes();
     let expiring = |s: &mut Session, folder: FolderId, date: &str| {
-        s.mailbox.add_mail(MailItem { folder, received: ago(1), raw: Some(raw(date)), ..Default::default() })
+        let item = MailItem { folder, received: ago(1), ..Default::default() };
+        s.add_message(item, &mailcraft_store::Content::source(raw(date))).unwrap()
     };
     let expired = expiring(&mut s, inbox, "Mon, 19 Oct 2026 10:00:00 +0000");
     let later = expiring(&mut s, inbox, "Sun, 1 Nov 2026 10:00:00 +0000");
@@ -470,13 +471,10 @@ fn scheduled_runs_queue_server_changes() {
     s.mailbox.create_default_folders(acct);
     let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
     s.mailbox.folders.get_mut(&inbox).unwrap().remote_name = Some("INBOX".into());
-    let id = s.mailbox.add_mail(MailItem {
-        folder: inbox,
-        received: ago(400),
-        remote_id: Some("42".into()),
-        body: mailcraft_model::item::Body { text: Some("Downloaded in full".into()), ..Default::default() },
-        ..Default::default()
-    });
+    let item =
+        MailItem { folder: inbox, received: ago(400), remote_id: Some("42".into()), ..Default::default() };
+    let body = mailcraft_model::item::Body { text: Some("Downloaded in full".into()), ..Default::default() };
+    let id = s.add_message(item, &mailcraft_store::Content::body(body)).unwrap();
     run(&mut s, "options.autoArchive", json!({"run": true}));
     s.fixed_now = Some(DateTime::from_unix(now_unix() + 15 * DAY, 0));
     assert!(poll(&mut s).due);
@@ -508,13 +506,13 @@ fn imap_inbox(s: &mut Session) -> (AccountId, FolderId) {
 /// Old server mail with UID `uid`, downloaded in full (`full`) or as headers only.
 fn server_mail(s: &mut Session, folder: FolderId, uid: usize, full: bool) -> ItemId {
     let text = full.then(|| "Downloaded in full".to_owned());
-    s.mailbox.add_mail(MailItem {
-        folder,
-        received: ago(400),
-        remote_id: Some(uid.to_string()),
-        body: mailcraft_model::item::Body { text, ..Default::default() },
-        ..Default::default()
-    })
+    let item =
+        MailItem { folder, received: ago(400), remote_id: Some(uid.to_string()), ..Default::default() };
+    s.add_message(
+        item,
+        &mailcraft_store::Content::body(mailcraft_model::item::Body { text, ..Default::default() }),
+    )
+    .unwrap()
 }
 
 fn expunges(s: &Session, acct: AccountId) -> usize {
@@ -550,7 +548,7 @@ fn header_only_server_mail_is_not_moved_out_of_the_server() {
         .unwrap();
     assert!(text.contains("2 messages with only their headers"), "{text}");
     // Downloaded later, it goes on the next run.
-    s.mailbox.mail.get_mut(head).unwrap().body.text = Some("Now in full".into());
+    s.edit_body(head, |b| b.text = Some("Now in full".into())).unwrap();
     s.sync.prefs.data.headers_only.remove(&head.0);
     run(&mut s, "file.archive", json!({"all": true}));
     assert_eq!(folder_of(&s, head).as_deref(), Some("Archives\\Inbox"));
@@ -627,8 +625,8 @@ fn expired_mail_is_found_in_the_store_after_a_restart() {
     let id = {
         let mut s = Session::open(dir.path()).unwrap();
         let inbox = role(&s, FolderRole::Inbox);
-        let item = MailItem { folder: inbox, received: ago(1), raw: Some(raw), ..Default::default() };
-        let id = s.mailbox.add_mail(item);
+        let item = MailItem { folder: inbox, received: ago(1), ..Default::default() };
+        let id = s.add_message(item, &mailcraft_store::Content::source(raw)).unwrap();
         let mb = s.mailbox.clone();
         s.journal(vec![mailcraft_store::Op::Replace(Box::new(mb))]);
         id
@@ -636,7 +634,7 @@ fn expired_mail_is_found_in_the_store_after_a_restart() {
     let mut s = Session::open(dir.path()).unwrap();
     s.fixed_now = Some(DateTime::from_unix(now_unix(), 0));
     let m = s.mailbox.mail.get(id).unwrap();
-    assert!(m.raw.is_none() && m.blob.is_some(), "the source is in a blob");
+    assert!(m.blob.is_some(), "the source is in a blob");
     set(&mut s, "advanced.autoArchive.deleteExpired", json!(true));
     let r = run(&mut s, "file.archive", json!({"all": true}));
     assert_eq!(r["expired"], 1, "{r}");

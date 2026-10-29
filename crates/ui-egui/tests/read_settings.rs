@@ -234,10 +234,7 @@ fn incomplete_search_notice_sits_above_the_results() {
     }
     let inbox = app.s.selection.folder;
     let m = app.s.mailbox.items_in(inbox)[0].id;
-    if let Some(item) = app.s.mailbox.mail.get_mut(m) {
-        item.body = mailcraft_engine::model::Body::default();
-        item.raw = None;
-    }
+    app.s.set_source(m, None).unwrap();
     app.run("search.query", json!({"text": "the"}));
     let mut h = build(app, 1600.0, 1000.0);
     assert!(has_part(&h, "Results might be incomplete"));

@@ -55,8 +55,9 @@ pub(crate) struct MsgEditor {
 impl MsgEditor {
     fn new(app: &App, item: u64) -> Option<MsgEditor> {
         let m = app.s.mailbox.mail.get(ItemId(item))?;
-        let plain = m.body.format == BodyFormat::PlainText || m.body.html.is_none();
-        let body: Doc = mailcraft_engine::cmd::mail::body_doc(m);
+        let stored = app.s.body_or_empty(m);
+        let plain = stored.format == BodyFormat::PlainText || stored.html.is_none();
+        let body: Doc = mailcraft_engine::cmd::mail::body_doc(&stored);
         let mut session = Session::new(Mailbox::new_local("Edit Message"));
         session.next_compose = EDITOR_ID_BASE.saturating_add(item.min(EDITOR_ID_BASE - 1));
         let c = ComposeState {
@@ -405,8 +406,14 @@ mod tests {
             .mailbox
             .mail
             .items()
-            .find(|m| m.body.html.as_deref().is_some_and(|h| h.contains("<b>") || h.contains("<strong>")))
-            .or_else(|| app.s.mailbox.mail.items().find(|m| m.body.html.is_some()))
+            .find(|m| {
+                app.s
+                    .body_or_empty(m)
+                    .html
+                    .as_deref()
+                    .is_some_and(|h| h.contains("<b>") || h.contains("<strong>"))
+            })
+            .or_else(|| app.s.mailbox.mail.items().find(|m| app.s.body_or_empty(m).html.is_some()))
             .map(|m| m.id.0)
             .unwrap()
     }
@@ -444,25 +451,27 @@ mod tests {
         app.run("mail.editMessage", p).unwrap();
         let m = app.s.mailbox.mail.get(ItemId(id)).unwrap();
         assert!(m.subject.ends_with("(annotated)"));
-        let stored = m.body.html.as_deref().unwrap();
+        let body = app.s.body_or_empty(m);
+        let stored = body.html.as_deref().unwrap();
         assert!(stored.contains("EDITED"), "{stored}");
         // The message is still HTML and its formatting survives (bold markup is kept).
         assert!(
             stored.contains("<b>") || stored.contains("<strong>") || stored.contains("font-weight"),
             "{stored}"
         );
-        assert!(m.body.text.as_deref().unwrap_or_default().contains("EDITED"));
+        assert!(body.text.as_deref().unwrap_or_default().contains("EDITED"));
     }
 
     #[test]
     fn plain_text_messages_save_as_text() {
         let mut s = sample_session();
         let id = s.mailbox.mail.items().next().map(|m| m.id).unwrap();
-        if let Some(m) = s.mailbox.mail.get_mut(id) {
-            m.body.format = BodyFormat::PlainText;
-            m.body.html = None;
-            m.body.text = Some("line one".into());
-        }
+        s.edit_body(id, |b| {
+            b.format = BodyFormat::PlainText;
+            b.html = None;
+            b.text = Some("line one".into());
+        })
+        .unwrap();
         let app = App::new(s);
         let mut ed = MsgEditor::new(&app, id.0).unwrap();
         assert!(ed.plain);

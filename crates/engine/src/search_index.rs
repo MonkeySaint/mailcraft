@@ -8,6 +8,14 @@
 //! made to the mailbox directly (tests, importers that bypass the journal) are caught when the item counts
 //! change, or by [`SearchState::invalidate`].
 //!
+//! Message bodies are read from the body store (storage stage S5), which costs far more than the headers. An
+//! update that would read more than [`BODIES_AT_ONCE`] of them indexes the headers of the rest at once and
+//! their bodies in slices: [`BODIES_PER_TICK`] at each [`tick`] (`Session::poll_sync`, so the front end keeps
+//! frames coming while [`indexing`]), up to [`BODIES_PER_SEARCH`] more for a search. Until then a search may
+//! miss words only those bodies hold (Indexing Status counts them as remaining), and the program never stops
+//! to read a whole mailbox's bodies: not at the first search, nor for the search folder counts of the folder
+//! pane at start-up.
+//!
 //! Queries go through [`hits`] (ranked), [`count`] (search folder counts) and [`item_matches`] (one item,
 //! no index). The scope of the active search comes from [`scope_filter`]; search folders use
 //! [`search_folder_filter`].
@@ -23,7 +31,7 @@ use mailcraft_model::{
 /// Fields of a mail item that search highlights apply to (for [`highlights`]).
 pub use mailcraft_search::Field;
 use mailcraft_search::{Context, Counts, Doc, DocKind, Filter, Hit, Index, Query, Stats};
-use mailcraft_store::Op;
+use mailcraft_store::{BodyStore, Op};
 
 use crate::{SearchScope, Session};
 
@@ -33,6 +41,12 @@ pub const MAX_RECENT: usize = 10;
 const MAX_RECENT_CHARS: usize = 512;
 /// Query results cached per index generation.
 const CACHE_SLOTS: usize = 8;
+/// Most message bodies one update of the index reads at once; the others come in slices (module docs).
+pub const BODIES_AT_ONCE: usize = 256;
+/// Message bodies indexed at each [`tick`].
+pub const BODIES_PER_TICK: usize = 64;
+/// Message bodies a search indexes first, when bodies are still waiting.
+pub const BODIES_PER_SEARCH: usize = 2_000;
 
 /// Item counts per kind (plus the id allocator): when they change behind the journal's back the index
 /// reconciles.
@@ -53,6 +67,8 @@ struct Inner {
     /// Reconcile every item at the next query.
     full: bool,
     dirty: BTreeSet<u64>,
+    /// Mail items indexed without their body yet (module docs).
+    bodies_pending: BTreeSet<u64>,
     stamps: HashMap<u64, u64>,
     shape: Shape,
     /// Bumped whenever the index (or anything a query reads) changes; keys the result cache.
@@ -70,30 +86,20 @@ pub struct SearchState {
     pub recent: Vec<String>,
     /// Search › Include Deleted Items: mailbox-wide scopes also search Deleted Items.
     pub include_deleted: bool,
-    /// Expiry dates of messages whose source left memory this session (issue #25): item -> (blob key of the
-    /// source it was read from, date). Only messages that carry one; read by [`SearchState::released_expiry`].
-    source_expiry: HashMap<u64, (String, mailcraft_model::DateTime)>,
 }
 
-/// The index document of mail item `m`; its expiry date comes from its kept source, else from the one noted
-/// when its source left memory.
-fn mail_doc(m: &MailItem, released: &HashMap<u64, (String, mailcraft_model::DateTime)>) -> Doc {
-    let mut doc = Doc::from_mail(m);
-    if doc.expires.is_none() {
-        doc.expires = released_expiry_in(released, m).map(|d| d.unix);
-    }
-    doc
-}
-
-fn released_expiry_in(
-    released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
-    m: &MailItem,
-) -> Option<mailcraft_model::DateTime> {
-    if m.raw.is_some() {
-        return None;
-    }
-    let (key, date) = released.get(&m.id.0)?;
-    (m.blob.as_deref() == Some(key.as_str())).then_some(*date)
+/// The index document of mail item `m`, its body read from `bodies` on demand (storage stage S5: items hold
+/// none; the decoded body passes through the store's byte-capped cache and is not kept by the index). A body
+/// that cannot be read is indexed as empty (logged).
+fn mail_doc(m: &MailItem, bodies: &BodyStore) -> Doc {
+    let body = match bodies.body_of(m) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("search: cannot read the body of message {}: {e}", m.id.0);
+            None
+        }
+    };
+    Doc::from_mail(m, body.as_deref())
 }
 
 impl std::fmt::Debug for SearchState {
@@ -119,8 +125,9 @@ fn stamp_mail(m: &MailItem) -> u64 {
     for a in &m.attachments {
         h(&mut st, a.filename.as_str());
     }
-    // The whole body: an edit past the preview that keeps the length must still re-index the item.
-    h(&mut st, &(body_hash(m.body.text.as_deref()), body_hash(m.body.html.as_deref())));
+    // The content keys: content is keyed by its bytes, so any change to the body (an edit past the preview
+    // that keeps the length included) changes a key, and an evicted or downloaded body changes them too.
+    h(&mut st, &(m.blob.as_deref(), m.body_key.as_deref(), m.expires.map(|d| d.unix)));
     // Form-field properties (`Doc::props`): sensitivity and the flag's state and dates.
     let flag = match &m.flag {
         FlagState::None => (0u8, None, None),
@@ -137,23 +144,6 @@ fn mix(stamp: u64, v: &impl Hash) -> u64 {
     h(&mut st, &stamp);
     h(&mut st, v);
     st.finish()
-}
-
-/// Fast fingerprint of a body (word-at-a-time multiply-rotate; several GB/s, so reconciling a large mailbox
-/// stays cheap). Not collision resistant, which a change detector does not need.
-fn body_hash(body: Option<&str>) -> u64 {
-    const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-    let Some(b) = body else { return 0 };
-    let bytes = b.as_bytes();
-    let mut x = (bytes.len() as u64).wrapping_mul(K) ^ 1;
-    let (chunks, rest) = bytes.as_chunks::<8>();
-    for c in chunks {
-        x = (x.rotate_left(5) ^ u64::from_le_bytes(*c)).wrapping_mul(K);
-    }
-    for b in rest {
-        x = (x.rotate_left(5) ^ u64::from(*b)).wrapping_mul(K);
-    }
-    x
 }
 
 fn stamp_text(kind: u8, folder: FolderId, parts: &[&str], cats: &[String], when: i64) -> u64 {
@@ -207,39 +197,46 @@ fn stamp_note(n: &Note) -> u64 {
     stamp_text(4, n.folder, &[&n.text], &n.categories, n.modified.unix)
 }
 
-/// Every searchable item of the mailbox as (id, fingerprint, doc builder).
-fn for_each_item(
-    mb: &Mailbox,
-    released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
-    mut f: impl FnMut(u64, u64, &dyn Fn() -> Doc),
-) {
+/// A doc builder: `true` reads a mail item's body, `false` indexes its headers only (other kinds ignore it).
+type MakeDoc<'a> = &'a dyn Fn(bool) -> Doc;
+
+/// Every searchable item of the mailbox as (id, fingerprint, whether it is mail, doc builder).
+fn for_each_item(mb: &Mailbox, bodies: &BodyStore, mut f: impl FnMut(u64, u64, bool, MakeDoc<'_>)) {
     for m in mb.mail.items() {
-        f(m.id.0, stamp_mail(m), &|| mail_doc(m, released));
+        f(m.id.0, stamp_mail(m), true, &|with_body| mail_doc_with(m, bodies, with_body));
     }
     for a in mb.appointments.values() {
-        f(a.id.0, stamp_appointment(a), &|| Doc::from_appointment(a));
+        f(a.id.0, stamp_appointment(a), false, &|_| Doc::from_appointment(a));
     }
     for c in mb.contacts.values() {
-        f(c.id.0, stamp_contact(c), &|| Doc::from_contact(c));
+        f(c.id.0, stamp_contact(c), false, &|_| Doc::from_contact(c));
     }
     for t in mb.tasks.values() {
-        f(t.id.0, stamp_task(t), &|| Doc::from_task(t));
+        f(t.id.0, stamp_task(t), false, &|_| Doc::from_task(t));
     }
     for n in mb.notes.values() {
-        f(n.id.0, stamp_note(n), &|| Doc::from_note(n));
+        f(n.id.0, stamp_note(n), false, &|_| Doc::from_note(n));
     }
 }
 
-/// Fingerprint and doc of one item, wherever it lives.
-fn doc_of(
-    mb: &Mailbox,
-    released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
-    id: u64,
-) -> Option<(u64, Doc)> {
+/// The doc of mail item `m`, with its body or (`with_body` false) its headers only.
+fn mail_doc_with(m: &MailItem, bodies: &BodyStore, with_body: bool) -> Doc {
+    if with_body { mail_doc(m, bodies) } else { Doc::from_mail(m, None) }
+}
+
+/// Fingerprint and doc of one item, wherever it lives (a mail item's body read when `with_body`), and
+/// whether it is mail.
+fn doc_of(mb: &Mailbox, bodies: &BodyStore, id: u64, with_body: bool) -> Option<(u64, Doc, bool)> {
     let id = ItemId(id);
     if let Some(m) = mb.mail.get(id) {
-        Some((stamp_mail(m), mail_doc(m, released)))
-    } else if let Some(a) = mb.appointments.get(&id) {
+        return Some((stamp_mail(m), mail_doc_with(m, bodies, with_body), true));
+    }
+    doc_of_other(mb, id).map(|(s, d)| (s, d, false))
+}
+
+/// Fingerprint and doc of an item that is not mail.
+fn doc_of_other(mb: &Mailbox, id: ItemId) -> Option<(u64, Doc)> {
+    if let Some(a) = mb.appointments.get(&id) {
         Some((stamp_appointment(a), Doc::from_appointment(a)))
     } else if let Some(c) = mb.contacts.get(&id) {
         Some((stamp_contact(c), Doc::from_contact(c)))
@@ -295,25 +292,6 @@ impl SearchState {
         inner.counts.clear();
     }
 
-    /// Notes the expiry date of `m` (which still holds its source) as its source leaves memory for the store
-    /// under blob `key`, so the index and the message list keep it ([`SearchState::released_expiry`]).
-    pub(crate) fn note_source_released(&mut self, m: &MailItem, key: &str) {
-        match crate::cmd::view::mail::expiry(m) {
-            Some(date) => {
-                self.source_expiry.insert(m.id.0, (key.to_owned(), date));
-            }
-            None => {
-                self.source_expiry.remove(&m.id.0);
-            }
-        }
-    }
-
-    /// The expiry date noted for `m` when its source left memory (`None` when it keeps its source, carries
-    /// no expiry date, or its source changed since). No file read: cheap enough for painting rows.
-    pub fn released_expiry(&self, m: &MailItem) -> Option<mailcraft_model::DateTime> {
-        released_expiry_in(&self.source_expiry, m)
-    }
-
     /// Re-checks every item at the next query (after direct mailbox edits that bypass the journal).
     pub fn invalidate(&mut self) {
         let inner = match self.inner.get_mut() {
@@ -326,21 +304,27 @@ impl SearchState {
         inner.counts.clear();
     }
 
-    /// Brings the index up to date with `mb`.
-    fn ensure_locked(
-        inner: &mut Inner,
-        mb: &Mailbox,
-        released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
-    ) {
+    /// Brings the index up to date with `mb` (bodies read from `bodies` for the items it (re)indexes).
+    fn ensure_locked(inner: &mut Inner, mb: &Mailbox, bodies: &BodyStore) {
         let now_shape = shape(mb);
         if !inner.built || inner.full || inner.shape != now_shape {
             let mut seen: HashSet<u64> = HashSet::with_capacity(inner.stamps.len());
             let mut changed = false;
-            let Inner { index, stamps, .. } = inner;
-            for_each_item(mb, released, |id, stamp, make| {
+            let mut read = 0usize;
+            let Inner { index, stamps, bodies_pending, .. } = inner;
+            for_each_item(mb, bodies, |id, stamp, mail, make| {
                 seen.insert(id);
                 if stamps.get(&id) != Some(&stamp) {
-                    index.upsert(&make());
+                    let with_body = !mail || read < BODIES_AT_ONCE;
+                    if mail && with_body {
+                        read = read.saturating_add(1);
+                    }
+                    index.upsert(&make(with_body));
+                    if with_body {
+                        bodies_pending.remove(&id);
+                    } else {
+                        bodies_pending.insert(id);
+                    }
                     stamps.insert(id, stamp);
                     changed = true;
                 }
@@ -349,6 +333,7 @@ impl SearchState {
             for id in gone {
                 stamps.remove(&id);
                 index.remove(id);
+                bodies_pending.remove(&id);
                 changed = true;
             }
             inner.built = true;
@@ -367,15 +352,26 @@ impl SearchState {
         }
         // Items the journal names changed: re-indexed unconditionally (the fingerprint is only a shortcut for
         // the full reconcile).
+        let mut read = 0usize;
         for id in std::mem::take(&mut inner.dirty) {
-            match doc_of(mb, released, id) {
-                Some((stamp, doc)) => {
+            let with_body = read < BODIES_AT_ONCE;
+            match doc_of(mb, bodies, id, with_body) {
+                Some((stamp, doc, mail)) => {
+                    if mail && with_body {
+                        read = read.saturating_add(1);
+                    }
                     inner.index.upsert(&doc);
                     inner.stamps.insert(id, stamp);
+                    if with_body || !mail {
+                        inner.bodies_pending.remove(&id);
+                    } else {
+                        inner.bodies_pending.insert(id);
+                    }
                 }
                 None => {
                     inner.stamps.remove(&id);
                     inner.index.remove(id);
+                    inner.bodies_pending.remove(&id);
                 }
             }
         }
@@ -384,10 +380,31 @@ impl SearchState {
         inner.counts.clear();
     }
 
-    /// Brings the index up to date with `mb` now (queries do this themselves).
-    pub fn ensure(&self, mb: &Mailbox) {
+    /// Indexes the bodies of up to `limit` mail items indexed without theirs so far (module docs). Returns
+    /// how many were done.
+    fn bodies_locked(inner: &mut Inner, mb: &Mailbox, bodies: &BodyStore, limit: usize) -> usize {
+        let mut done = 0usize;
+        while done < limit {
+            let Some(id) = inner.bodies_pending.pop_first() else { break };
+            if let Some(m) = mb.mail.get(ItemId(id)) {
+                inner.index.upsert(&mail_doc(m, bodies));
+                done = done.saturating_add(1);
+            }
+        }
+        if done > 0 {
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.cache.clear();
+            inner.counts.clear();
+        }
+        done
+    }
+
+    /// Brings the index up to date with `mb` now, every body included (queries do this themselves, reading
+    /// at most [`BODIES_PER_SEARCH`] bodies).
+    pub fn ensure(&self, mb: &Mailbox, bodies: &BodyStore) {
         let mut inner = self.lock();
-        Self::ensure_locked(&mut inner, mb, &self.source_expiry);
+        Self::ensure_locked(&mut inner, mb, bodies);
+        Self::bodies_locked(&mut inner, mb, bodies, usize::MAX);
     }
 
     /// Items waiting to be indexed (Indexing Status).
@@ -397,16 +414,16 @@ impl SearchState {
         if !inner.built {
             total
         } else if inner.full || inner.shape != shape(mb) {
-            total.abs_diff(inner.index.len()).max(1)
+            total.abs_diff(inner.index.len()).max(1).max(inner.bodies_pending.len())
         } else {
-            inner.dirty.len()
+            inner.dirty.len().saturating_add(inner.bodies_pending.len())
         }
     }
 
     /// Index size.
-    pub fn stats(&self, mb: &Mailbox) -> Stats {
+    pub fn stats(&self, mb: &Mailbox, bodies: &BodyStore) -> Stats {
         let mut inner = self.lock();
-        Self::ensure_locked(&mut inner, mb, &self.source_expiry);
+        Self::ensure_locked(&mut inner, mb, bodies);
         inner.index.stats()
     }
 
@@ -575,12 +592,29 @@ fn cache_key(query: &Query, ctx: &Context, filter: &Filter, generation: u64) -> 
     st.finish()
 }
 
+/// Indexes the next slice of message bodies still waiting (module docs; called by `Session::poll_sync`).
+/// Returns true when it did some.
+pub fn tick(s: &Session) -> bool {
+    let mut inner = s.search.lock();
+    if !inner.built || inner.bodies_pending.is_empty() {
+        return false;
+    }
+    SearchState::bodies_locked(&mut inner, &s.mailbox, &s.bodies, BODIES_PER_TICK) > 0
+}
+
+/// Whether message bodies are still waiting to be indexed (the front end keeps frames coming for [`tick`]).
+pub fn indexing(s: &Session) -> bool {
+    let inner = s.search.lock();
+    inner.built && !inner.bodies_pending.is_empty()
+}
+
 /// Items matching `query` within `filter`, best first.
 pub fn hits(s: &Session, query: &str, filter: &Filter) -> Vec<Hit> {
     let q = mailcraft_search::parse(query);
     let ctx = context(s);
     let mut inner = s.search.lock();
-    SearchState::ensure_locked(&mut inner, &s.mailbox, &s.search.source_expiry);
+    SearchState::ensure_locked(&mut inner, &s.mailbox, &s.bodies);
+    SearchState::bodies_locked(&mut inner, &s.mailbox, &s.bodies, BODIES_PER_SEARCH);
     let key = cache_key(&q, &ctx, filter, inner.generation);
     if let Some((_, v)) = inner.cache.iter().find(|(k, _)| *k == key) {
         return v.clone();
@@ -593,12 +627,16 @@ pub fn hits(s: &Session, query: &str, filter: &Filter) -> Vec<Hit> {
     v
 }
 
-/// Total and unread counts of `query` within `filter`.
+/// Total and unread counts of `query` within `filter` (drawn every frame: of the bodies still waiting, only a
+/// few are read here; while more wait the counts may miss words only those bodies hold).
 pub fn count(s: &Session, query: &str, filter: &Filter) -> Counts {
     let q = mailcraft_search::parse(query);
     let ctx = context(s);
     let mut inner = s.search.lock();
-    SearchState::ensure_locked(&mut inner, &s.mailbox, &s.search.source_expiry);
+    SearchState::ensure_locked(&mut inner, &s.mailbox, &s.bodies);
+    if inner.bodies_pending.len() <= BODIES_AT_ONCE {
+        SearchState::bodies_locked(&mut inner, &s.mailbox, &s.bodies, BODIES_AT_ONCE);
+    }
     let key = cache_key(&q, &ctx, filter, inner.generation);
     if let Some((_, c)) = inner.counts.iter().find(|(k, _)| *k == key) {
         return *c;
@@ -654,11 +692,7 @@ pub fn search_folder_counts(s: &Session, folder: FolderId) -> Counts {
 
 /// True when mail item `m` matches `query` (direct evaluation, no index).
 pub fn item_matches(s: &Session, m: &MailItem, query: &str) -> bool {
-    mailcraft_search::matches(
-        &mailcraft_search::parse(query),
-        &mail_doc(m, &s.search.source_expiry),
-        &context(s),
-    )
+    mailcraft_search::matches(&mailcraft_search::parse(query), &mail_doc(m, &s.bodies), &context(s))
 }
 
 /// Highlight ranges (byte offsets) of the active search's words in `text` shown as `field`.
@@ -833,8 +867,7 @@ mod tests {
         let a = add(&mut s, "Notes");
         let filler = "word ".repeat(80);
         let body = |tail: &str| format!("{filler}{tail}");
-        s.mailbox.mail.get_mut(a).unwrap().body.text = Some(body("alpha"));
-        s.mailbox.mail.get_mut(a).unwrap().refresh_preview();
+        s.edit_body(a, |b| b.text = Some(body("alpha"))).unwrap();
         s.search.invalidate();
         s.view.search_scope = SearchScope::CurrentFolder;
         s.view.search = "alpha".into();
@@ -847,11 +880,46 @@ mod tests {
         s.view.search = "gamma".into();
         assert_eq!(results(&s), [a]);
         // And a direct edit followed by `invalidate` (the full reconcile).
-        s.mailbox.mail.get_mut(a).unwrap().body.text = Some(body("delta"));
+        s.edit_body(a, |b| b.text = Some(body("delta"))).unwrap();
         s.search.invalidate();
         assert!(results(&s).is_empty());
         s.view.search = "delta".into();
         assert_eq!(results(&s), [a]);
+    }
+
+    /// Regression: the first full update of the index read every message body on the calling thread (the
+    /// search folder counts of the folder pane at start-up froze the program for a large mailbox). Past
+    /// `BODIES_AT_ONCE` bodies are indexed in slices; a search reads more of them first, the counts do not.
+    #[test]
+    fn a_large_mailbox_has_its_bodies_indexed_in_slices() {
+        let mut s = session();
+        let folder = inbox(&s);
+        let n = 2 * BODIES_AT_ONCE + 10;
+        let mut last = ItemId(0);
+        for i in 0..n {
+            let word = if i + 1 == n { "zanzibar" } else { "filler" };
+            let item = MailItem { folder, subject: format!("Message {i}"), ..Default::default() };
+            let body = mailcraft_model::Body { text: Some(format!("Body {word}")), ..Default::default() };
+            last = s.add_message(item, &mailcraft_store::Content::body(body)).unwrap();
+        }
+        let filter = Filter { folders: None, kinds: vec![DocKind::Mail] };
+        assert_eq!(count(&s, "message", &filter).total, n, "every header is indexed at once");
+        assert_eq!(count(&s, "zanzibar", &filter).total, 0, "the last bodies are still waiting");
+        assert!(indexing(&s));
+        assert_eq!(s.search.pending(&s.mailbox), n - BODIES_AT_ONCE);
+        // The ticks index them in slices of BODIES_PER_TICK.
+        assert!(tick(&s));
+        assert_eq!(s.search.pending(&s.mailbox), n - BODIES_AT_ONCE - BODIES_PER_TICK);
+        while tick(&s) {}
+        assert!(!indexing(&s));
+        assert_eq!(count(&s, "zanzibar", &filter).total, 1);
+        // A search reads the waiting bodies first (up to BODIES_PER_SEARCH).
+        s.search.invalidate();
+        let mut s2 = session();
+        std::mem::swap(&mut s2.mailbox, &mut s.mailbox);
+        s2.bodies = std::mem::take(&mut s.bodies);
+        assert_eq!(hits(&s2, "zanzibar", &filter).iter().map(|h| h.id).collect::<Vec<_>>(), [last.0]);
+        assert!(!indexing(&s2));
     }
 
     #[test]

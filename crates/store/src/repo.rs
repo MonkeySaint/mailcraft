@@ -6,8 +6,9 @@
 //! records they land in ([`MailRepo::begin`], [`MailRepo::commit`], [`MailRepo::rollback`]): a commit hands
 //! back the before-image of every item written since the matching begin ([`MailChanges`]), which is what the
 //! engine journals, queues for the server and keeps as an undo step. List windows (`view`, `page`) and
-//! persisted threads (`thread_members`) come with S7, message sources (`raw`) with S5, and a SQLite-backed
-//! implementation with S6.
+//! persisted threads (`thread_members`) come with S7, and a SQLite-backed implementation with S6. Bodies and
+//! sources are not in the repository: since S5 items refer to them by key, and the engine reads them from a
+//! [`crate::BodyStore`] (`Session::body`), with its own byte-capped cache.
 //!
 //! The trait has no borrowing iterator over every item. The engine and UI still walk the whole table through
 //! `MailTable::items`/`iter`/`ids`/`in_folder` in well over a hundred places; those move to [`MailRepo::scan`]
@@ -22,7 +23,7 @@ use std::ops::{ControlFlow, Deref};
 use std::sync::Arc;
 
 use mailcraft_model::{
-    Body, ChangeToken, FolderCounts, FolderId, ItemId, MailChanges, MailItem, MailTable, ScanFilter,
+    ChangeToken, FolderCounts, FolderId, ItemId, MailChanges, MailItem, MailTable, ScanFilter,
 };
 
 use crate::{Result, StoreError};
@@ -93,8 +94,6 @@ pub trait MailRepo {
     /// Streams every item `filter` admits to `visit`, in id order, until it breaks. The escape hatch for
     /// queries without a dedicated method; a database backend reads in batches.
     fn scan(&self, filter: &ScanFilter, visit: &mut dyn FnMut(&MailItem) -> ControlFlow<()>) -> Result<()>;
-    /// The decoded body of item `id` (`None` for an unknown id).
-    fn body(&self, id: ItemId) -> Result<Option<Shared<'_, Body>>>;
 
     // ---- writes (each recorded in the innermost open change record) ----
 
@@ -153,9 +152,6 @@ impl MailRepo for MailTable {
     fn scan(&self, filter: &ScanFilter, visit: &mut dyn FnMut(&MailItem) -> ControlFlow<()>) -> Result<()> {
         MailTable::scan(self, filter, visit);
         Ok(())
-    }
-    fn body(&self, id: ItemId) -> Result<Option<Shared<'_, Body>>> {
-        Ok(MailTable::body(self, id).map(Shared::Borrowed))
     }
     fn begin(&mut self) -> ChangeToken {
         MailTable::begin(self)

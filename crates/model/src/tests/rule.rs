@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 
 use super::{addr, mail};
-use crate::rule::RuleContext;
+use crate::rule::{RuleContext, RuleEnv};
 use crate::{
     AttachmentMeta, Body, DateTime, FlagState, FolderId, Importance, MailItem, Rule, RuleAction,
     RuleCondition, Sensitivity,
@@ -20,7 +20,6 @@ fn sample() -> MailItem {
         to: vec![addr("Test User", "Me@Example.net")],
         cc: vec![addr("Bob Chen", "bob.chen@example.org")],
         bcc: vec![addr("", "hidden@example.org")],
-        body: Body { text: Some("The badge reader is down.".into()), ..Default::default() },
         size: 5000,
         received: DateTime { unix: 1_000, offset_min: 0 },
         categories: vec!["Red category".into()],
@@ -28,8 +27,18 @@ fn sample() -> MailItem {
     }
 }
 
+/// What the engine supplies for [`sample`]: its body.
+fn sample_env() -> RuleEnv {
+    let body = Body { text: Some("The badge reader is down.".into()), ..Default::default() };
+    RuleEnv { body: Some(std::sync::Arc::new(body)), ..Default::default() }
+}
+
+fn source_env(raw: &[u8]) -> RuleEnv {
+    RuleEnv { source_head: Some(raw.to_vec()), ..Default::default() }
+}
+
 fn cond(c: RuleCondition) -> bool {
-    Rule { conditions: vec![c], ..Default::default() }.matches(&sample(), &ctx())
+    Rule { conditions: vec![c], ..Default::default() }.matches_in(&sample(), &ctx(), &sample_env())
 }
 
 fn words(w: &[&str]) -> Vec<String> {
@@ -58,32 +67,30 @@ fn text_conditions() {
 
 #[test]
 fn body_contains_uses_html_when_no_text() {
-    let item = MailItem {
-        body: Body {
-            html: Some("<p>Quarterly <b>numbers</b></p><style>.secret{}</style>".into()),
-            ..Default::default()
-        },
-        ..mail("x")
+    let item = mail("x");
+    let body = Body {
+        html: Some("<p>Quarterly <b>numbers</b></p><style>.secret{}</style>".into()),
+        ..Default::default()
     };
+    let env = RuleEnv { body: Some(std::sync::Arc::new(body)), ..Default::default() };
     let rule =
         |w: &str| Rule { conditions: vec![RuleCondition::BodyContains(words(&[w]))], ..Default::default() };
-    assert!(rule("numbers").matches(&item, &ctx()));
-    assert!(!rule("secret").matches(&item, &ctx()));
-    assert!(!rule("<b>").matches(&item, &ctx()));
+    assert!(rule("numbers").matches_in(&item, &ctx(), &env));
+    assert!(!rule("secret").matches_in(&item, &ctx(), &env));
+    assert!(!rule("<b>").matches_in(&item, &ctx(), &env));
+    assert!(!rule("numbers").matches(&item, &ctx()), "no body supplied");
 }
 
 #[test]
 fn header_contains_synthesised_and_raw() {
     assert!(cond(RuleCondition::HeaderContains(words(&["alice@example.com"]))));
     assert!(cond(RuleCondition::HeaderContains(words(&["subject: urgent"]))));
-    let raw_item = MailItem {
-        raw: Some(b"X-Spam-Flag: YES\r\nSubject: hi\r\n\r\nbody mentions X-Mailer-Body".to_vec()),
-        ..mail("hi")
-    };
+    let raw_item = mail("hi");
+    let env = source_env(b"X-Spam-Flag: YES\r\nSubject: hi\r\n\r\nbody mentions X-Mailer-Body");
     let r =
         |w: &str| Rule { conditions: vec![RuleCondition::HeaderContains(words(&[w]))], ..Default::default() };
-    assert!(r("x-spam-flag: yes").matches(&raw_item, &ctx()));
-    assert!(!r("X-Mailer-Body").matches(&raw_item, &ctx()));
+    assert!(r("x-spam-flag: yes").matches_in(&raw_item, &ctx(), &env));
+    assert!(!r("X-Mailer-Body").matches_in(&raw_item, &ctx(), &env));
 }
 
 #[test]
@@ -234,7 +241,7 @@ fn all_conditions_must_match_and_exceptions_cancel() {
     rule.exceptions = vec![RuleCondition::HasAttachment, RuleCondition::MyNameInCc];
     assert!(rule.matches(&sample(), &ctx()));
     rule.exceptions.push(RuleCondition::BodyContains(words(&["badge"])));
-    assert!(!rule.matches(&sample(), &ctx()));
+    assert!(!rule.matches_in(&sample(), &ctx(), &sample_env()));
 }
 
 #[test]
@@ -365,12 +372,11 @@ proptest! {
     #[test]
     fn matching_never_panics(subject in any::<String>(), body in any::<String>(), word in any::<String>(),
                              size in any::<u64>(), unix in any::<i64>(), a in any::<i64>(), b in any::<i64>()) {
-        let item = MailItem {
-            body: Body { html: Some(body), ..Default::default() },
-            size,
-            received: DateTime { unix, offset_min: 0 },
-            raw: Some(subject.clone().into_bytes()),
-            ..mail(&subject)
+        let item = MailItem { size, received: DateTime { unix, offset_min: 0 }, ..mail(&subject) };
+        let env = RuleEnv {
+            body: Some(std::sync::Arc::new(Body { html: Some(body), ..Default::default() })),
+            source_head: Some(subject.clone().into_bytes()),
+            ..Default::default()
         };
         for c in all_conditions().into_iter().chain([
             RuleCondition::SubjectOrBodyContains(vec![word.clone()]),
@@ -379,6 +385,7 @@ proptest! {
             RuleCondition::SizeBetween(a.unsigned_abs(), b.unsigned_abs()),
         ]) {
             let _ = c.matches(&item, &ctx());
+            let _ = c.matches_in(&item, &ctx(), &env);
             let _ = c.describe();
         }
     }
@@ -387,11 +394,12 @@ proptest! {
 #[test]
 fn header_contains_stops_at_first_blank_line() {
     // LF-only source whose body happens to contain a CRLF blank line: the body is not header text.
-    let item = MailItem { raw: Some(b"Subject: hi\nX-A: 1\n\nbody-word\r\n\r\nmore".to_vec()), ..mail("hi") };
+    let item = mail("hi");
+    let env = source_env(b"Subject: hi\nX-A: 1\n\nbody-word\r\n\r\nmore");
     let r =
         |w: &str| Rule { conditions: vec![RuleCondition::HeaderContains(words(&[w]))], ..Default::default() };
-    assert!(r("x-a: 1").matches(&item, &ctx()));
-    assert!(!r("body-word").matches(&item, &ctx()));
+    assert!(r("x-a: 1").matches_in(&item, &ctx(), &env));
+    assert!(!r("body-word").matches_in(&item, &ctx(), &env));
 }
 
 #[test]

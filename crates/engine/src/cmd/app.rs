@@ -281,6 +281,8 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
     if sources.is_empty() {
         return Err(CmdError::Disabled("nothing to paste".into()));
     }
+    let ids: Vec<ItemId> = sources.iter().map(|m| m.id).collect();
+    crate::sync::cmds::need_content(s, &ids, "pasted")?;
     let mut new_ids = Vec::new();
     for mut item in sources {
         item.folder = folder;

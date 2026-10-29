@@ -28,7 +28,8 @@ fn table(items: &[MailItem]) -> (MailTable, BTreeMap<ItemId, MailItem>) {
 fn serialises_like_the_map_it_replaces() {
     let mut odd = item(9, 2, false, 5);
     odd.subject = "Grüße \u{1F600} \"quoted\" \\ \n".into();
-    odd.raw = Some(vec![0, 1, 255]);
+    odd.blob = Some("0123456789abcdef-3".into());
+    odd.body_key = Some("fedcba9876543210-4".into());
     odd.message_id = Some("a@example.com".into());
     // Stored under a key other than its id: the format keeps the key as given.
     let (t, map) = table(&[item(1, 2, true, 10), odd, item(3, 4, false, 7)]);
@@ -86,8 +87,6 @@ fn targeted_reads() {
     assert_eq!(t.older_than(FolderId(10), 301, 1), vec![ItemId(2)]);
     assert!(t.older_than(FolderId(10), i64::MIN, 10).is_empty());
     assert!(t.older_than(FolderId(10), i64::MAX, 0).is_empty());
-    assert_eq!(t.body(ItemId(1)), Some(&t.get(ItemId(1)).unwrap().body));
-    assert!(t.body(ItemId(99)).is_none());
     let folder: Vec<ItemId> = t.in_folder(FolderId(10)).rev().map(|m| m.id).collect();
     assert_eq!(folder, vec![ItemId(4), ItemId(2), ItemId(1)]);
 }
@@ -237,4 +236,26 @@ proptest! {
         prop_assert_eq!(t.older_than(f, cutoff, limit), want_old);
         prop_assert_eq!(serde_json::to_vec(&t).unwrap(), serde_json::to_vec(&map).unwrap());
     }
+}
+
+#[test]
+fn recorded_peeks_at_an_open_record_without_closing_it() {
+    let (mut t, _) = table(&[item(1, 2, false, 10), item(2, 2, false, 20)]);
+    let outer = t.begin();
+    t.update(ItemId(1), |m| m.read = true);
+    let inner = t.begin();
+    t.update(ItemId(1), |m| m.folder = FolderId(3));
+    t.update(ItemId(2), |m| m.read = true);
+    t.insert(ItemId(5), item(5, 2, false, 30));
+    let seen = t.recorded(outer);
+    let ids: Vec<ItemId> = seen.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![ItemId(1), ItemId(2), ItemId(5)]);
+    // The oldest image wins: item 1 as it was when the outer record opened.
+    assert_eq!(seen.first().and_then(|(_, b)| *b).map(|m| (m.read, m.folder)), Some((false, FolderId(2))));
+    assert!(seen.last().is_some_and(|(_, b)| b.is_none()));
+    assert_eq!(t.recorded(inner).len(), 3);
+    assert!(t.is_open(outer) && t.is_open(inner));
+    let _ = t.commit(inner);
+    let _ = t.commit(outer);
+    assert!(t.recorded(outer).is_empty());
 }

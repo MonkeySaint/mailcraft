@@ -239,13 +239,8 @@ fn scheduler_waits_for_send_receive_when_the_server_queue_is_full() {
     app.s.mailbox.folders.get_mut(&inbox).unwrap().remote_name = Some("INBOX".into());
     let received = mailcraft_model::DateTime::from_unix(app.s.now().unix - 400 * 86_400, 0);
     let body = mailcraft_model::item::Body { text: Some("Downloaded".into()), ..Default::default() };
-    let old = app.s.mailbox.add_mail(MailItem {
-        folder: inbox,
-        received,
-        remote_id: Some("3".into()),
-        body,
-        ..Default::default()
-    });
+    let item = MailItem { folder: inbox, received, remote_id: Some("3".into()), ..Default::default() };
+    let old = app.s.add_message(item, &mailcraft_engine::Content::body(body)).unwrap();
     let full: Vec<PendingOp> = (1..=archive::QUEUE_ROOM)
         .map(|n| PendingOp {
             id: n as u64,

@@ -2472,14 +2472,19 @@ impl ComposeState {
         Ok(self.attachments.len().saturating_sub(1))
     }
 
-    /// Attaches a stored message as an item attachment (`message/rfc822`, "<subject>.eml").
-    pub fn attach_message(&mut self, m: &mailcraft_model::MailItem) -> Result<usize, String> {
+    /// Attaches a stored message whose RFC 5322 bytes are `source` as an item attachment (`message/rfc822`,
+    /// "<subject>.eml").
+    pub fn attach_message(
+        &mut self,
+        m: &mailcraft_model::MailItem,
+        source: Vec<u8>,
+    ) -> Result<usize, String> {
         // Slashes in a subject are not paths here.
         let subject: String =
             m.subject.trim().chars().map(|c| if matches!(c, '/' | '\\') { '_' } else { c }).collect();
         let name = clean_attachment_name(&format!("{subject}.eml"), "message.eml");
         let name = if name.eq_ignore_ascii_case(".eml") { "message.eml".to_owned() } else { name };
-        self.attach_bytes(&name, Some("message/rfc822"), crate::cmd::compose::message_source(m))
+        self.attach_bytes(&name, Some("message/rfc822"), source)
     }
 
     /// Renames attachment `index`; the MIME type follows a changed extension when it is a known one.
@@ -6645,7 +6650,12 @@ mod depth_tests {
         assert!(c.remove_attachment(2).is_none());
         assert_eq!(c.attachments_size(), 2);
         let m = mailcraft_model::MailItem { subject: "Q3: plan / budget?".into(), ..Default::default() };
-        let i = c.attach_message(&m).unwrap();
+        let i = c
+            .attach_message(
+                &m,
+                crate::cmd::compose::message_source(&crate::Session::new(Default::default()), &m),
+            )
+            .unwrap();
         assert_eq!(c.attachments[i].filename, "Q3_ plan _ budget_.eml");
         assert_eq!(c.attachments[i].mime_type, "message/rfc822");
         assert!(!c.attachments[i].data.is_empty());

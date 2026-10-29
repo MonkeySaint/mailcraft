@@ -120,8 +120,11 @@ pub struct CertBook {
 /// An opened S/MIME message.
 #[derive(Clone, Debug)]
 pub struct View {
-    /// The item as it reads once opened: its body, attachments and preview come from the opened message.
+    /// The item as it reads once opened: its attachments and preview come from the opened message. It
+    /// refers to no stored content (the opened message is never written to the body store).
     pub item: MailItem,
+    /// The opened message's body (in memory only, like the rest of the view).
+    pub body: Arc<Body>,
     /// The opened message (outer header fields with the innermost content).
     pub raw: Vec<u8>,
     pub security: Security,
@@ -823,13 +826,8 @@ pub fn is_encrypted(s: &Session, m: &MailItem) -> bool {
 }
 
 fn source_key(m: &MailItem) -> u64 {
-    let mut bytes = format!("{}:{}:{:?}", m.size, m.received.unix, m.blob).into_bytes();
-    if let Some(r) = &m.raw {
-        // The length and the end of the source: a re-saved draft of the same length still differs there (the
-        // signature or the ciphertext comes last).
-        bytes.extend_from_slice(format!(":{}:", r.len()).as_bytes());
-        bytes.extend_from_slice(r.get(r.len().saturating_sub(512)..).unwrap_or_default());
-    }
+    // Content keys follow the stored bytes: a re-saved draft of the same length gets a new one.
+    let bytes = format!("{}:{}:{:?}:{:?}", m.size, m.received.unix, m.blob, m.body_key).into_bytes();
     mailcraft_model::thread::fnv1a(&bytes)
 }
 
@@ -860,17 +858,18 @@ pub fn view(s: &Session, id: ItemId) -> Option<Arc<View>> {
 
 fn build_view(s: &Session, m: &MailItem, opened: Opened) -> View {
     let mut item = m.clone();
+    let mut body = Body::default();
     if opened.locked() {
-        item.body = Body { format: BodyFormat::PlainText, text: Some(LOCKED_TEXT.into()), html: None };
+        body = Body { format: BodyFormat::PlainText, text: Some(LOCKED_TEXT.into()), html: None };
         item.preview = "Encrypted message".into();
     } else if let Ok(msg) = mailcraft_mime::parse(&opened.message) {
         let fresh = MailItem::from_message(&msg, &opened.message, m.received);
-        item.body = fresh.body;
+        body = Body::from_message(&msg);
         item.attachments = fresh.attachments;
         item.preview = fresh.preview;
     }
-    item.raw = Some(opened.message.clone());
     item.blob = None;
+    item.body_key = None;
     let sender =
         m.from.as_ref().or(m.sender.as_ref()).map(|b| b.addr.trim().to_ascii_lowercase()).unwrap_or_default();
     let mut sec = Security { sender: sender.clone(), ..Security::default() };
@@ -910,7 +909,7 @@ fn build_view(s: &Session, m: &MailItem, opened: Opened) -> View {
             Layer::Signed(_) => {}
         }
     }
-    View { item, raw: opened.message, security: sec, signer }
+    View { item, body: Arc::new(body), raw: opened.message, security: sec, signer }
 }
 
 /// The item as it reads: the opened form of an S/MIME message, else the stored item.
@@ -918,6 +917,14 @@ pub fn display_item(s: &Session, id: ItemId) -> Option<std::borrow::Cow<'_, Mail
     match view(s, id) {
         Some(v) => Some(std::borrow::Cow::Owned(v.item.clone())),
         None => s.mailbox.mail.get(id).map(std::borrow::Cow::Borrowed),
+    }
+}
+
+/// The body of `m` as it reads: the opened message's for S/MIME mail (in memory only), else the stored one.
+pub fn display_body(s: &Session, m: &MailItem) -> Arc<Body> {
+    match view(s, m.id) {
+        Some(v) => v.body.clone(),
+        None => s.body_or_empty(m),
     }
 }
 
@@ -1336,7 +1343,7 @@ mod tests {
         let msg = mailcraft_mime::parse(raw).unwrap();
         let mut item = MailItem::from_message(&msg, raw, s.now());
         item.folder = inbox(s);
-        let id = s.mailbox.add_mail(item);
+        let id = s.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap();
         crate::sync::arrival::on_new_mail(s, &[id]);
         id
     }
@@ -1360,7 +1367,7 @@ mod tests {
     }
 
     fn raw_of(s: &Session, id: ItemId) -> Vec<u8> {
-        s.mailbox.mail.get(id).unwrap().raw.clone().unwrap()
+        s.source(id).unwrap().unwrap()
     }
 
     #[test]
@@ -1434,7 +1441,7 @@ mod tests {
         let sec = security(&me, out).unwrap();
         assert!(sec.encrypted && !sec.locked && sec.signed, "{sec:?}");
         assert_eq!(sec.status, "valid", "{sec:?}");
-        assert!(display_item(&me, out).unwrap().body_text().contains("old mill"));
+        assert!(display_body(&me, me.mailbox.mail.get(out).unwrap()).plain_text().contains("old mill"));
         // Bob receives it: decrypted, signed by Me, and Me's certificate is remembered.
         let got = deliver(&mut bob, &raw);
         let sec = security(&bob, got).unwrap();
@@ -1447,7 +1454,7 @@ mod tests {
         assert_eq!(lines[1].0, "ok", "{lines:?}");
         assert!(lines[1].1.starts_with("Signed by Me Example <me@example.com>"));
         let shown = display_item(&bob, got).unwrap();
-        assert!(shown.body_text().contains("old mill"));
+        assert!(display_body(&bob, &shown).plain_text().contains("old mill"));
         assert!(shown.attachments.is_empty(), "no smime.p7m chip once opened");
         assert_eq!(
             cert_for(&bob, "me@example.com"),
@@ -1476,7 +1483,10 @@ mod tests {
         let sec = security(&eve, stolen).unwrap();
         assert!(sec.locked && !sec.signed, "{sec:?}");
         assert!(sec.decrypt_error.contains("none of your digital IDs"));
-        assert_eq!(display_item(&eve, stolen).unwrap().body.text.as_deref(), Some(LOCKED_TEXT));
+        assert_eq!(
+            display_body(&eve, eve.mailbox.mail.get(stolen).unwrap()).text.as_deref(),
+            Some(LOCKED_TEXT)
+        );
         assert_eq!(info_lines(&sec)[0].0, "error");
         assert!(cert_for(&eve, "me@example.com").is_none());
     }
@@ -1529,7 +1539,7 @@ mod tests {
         assert!(text.contains("smime-type=signed-data") && !text.contains("old mill"), "{text}");
         let sec = security(&me, item).unwrap();
         assert_eq!((sec.status.as_str(), sec.clear_signed), ("valid", false));
-        assert!(display_item(&me, item).unwrap().body_text().contains("old mill"));
+        assert!(display_body(&me, me.mailbox.mail.get(item).unwrap()).plain_text().contains("old mill"));
     }
 
     #[test]
@@ -1591,7 +1601,7 @@ mod tests {
         let raw = raw_of(&me, item.unwrap());
         let (mut pat_s, _) = person("pat@example.org", "Pat Kim");
         let got = deliver(&mut pat_s, &raw);
-        assert!(display_item(&pat_s, got).unwrap().body_text().contains("old mill"));
+        assert!(display_body(&pat_s, pat_s.mailbox.mail.get(got).unwrap()).plain_text().contains("old mill"));
     }
 
     #[test]
@@ -1639,11 +1649,12 @@ mod tests {
     }
 
     /// True when `m` holds `secret` readably (body, preview or source).
-    fn holds(m: &MailItem, secret: &str) -> bool {
-        m.body_text().contains(secret)
-            || m.body.html.as_deref().is_some_and(|h| h.contains(secret))
+    fn holds(s: &Session, m: &MailItem, secret: &str) -> bool {
+        let body = s.body_or_empty(m);
+        body.plain_text().contains(secret)
+            || body.html.as_deref().is_some_and(|h| h.contains(secret))
             || m.preview.contains(secret)
-            || m.raw.as_deref().is_some_and(|r| String::from_utf8_lossy(r).contains(secret))
+            || s.source_of(m).unwrap().is_some_and(|r| String::from_utf8_lossy(&r).contains(secret))
     }
 
     #[test]
@@ -1672,26 +1683,26 @@ mod tests {
         assert!(stored.is_draft);
         assert!(String::from_utf8_lossy(&raw_of(&bob, draft)).contains("smime-type=enveloped-data"));
         for secret in ["old mill", "Noon works"] {
-            assert!(!holds(stored, secret), "the stored draft holds `{secret}`");
+            assert!(!holds(&bob, stored, secret), "the stored draft holds `{secret}`");
             for op in &bob.pending_ops {
                 let leaked = match op {
-                    mailcraft_store::Op::PutMail(m) => holds(m, secret),
-                    mailcraft_store::Op::Replace(mb) => mb.mail.items().any(|m| holds(m, secret)),
+                    mailcraft_store::Op::PutMail(m) => holds(&bob, m, secret),
+                    mailcraft_store::Op::Replace(mb) => mb.mail.items().any(|m| holds(&bob, m, secret)),
                     _ => false,
                 };
                 assert!(!leaked, "the journal holds `{secret}`");
             }
         }
         // Its writer can still read it.
-        assert!(display_item(&bob, draft).unwrap().body_text().contains("Noon works"));
+        assert!(display_body(&bob, bob.mailbox.mail.get(draft).unwrap()).plain_text().contains("Noon works"));
         // Saving explicitly, and Close All Items, keep it encrypted too.
         bob.run("compose.insertText", &json!({"compose": cid, "text": "See you."})).unwrap();
         bob.run("compose.saveDraft", &json!({"compose": cid})).unwrap();
-        assert!(!holds(bob.mailbox.mail.get(draft).unwrap(), "See you."));
+        assert!(!holds(&bob, bob.mailbox.mail.get(draft).unwrap(), "See you."));
         bob.run("compose.insertText", &json!({"compose": cid, "text": " Bye."})).unwrap();
         bob.run("app.closeAllItems", &json!({"save": true})).unwrap();
-        assert!(!holds(bob.mailbox.mail.get(draft).unwrap(), "Bye."));
-        assert!(display_item(&bob, draft).unwrap().body_text().contains("Bye."));
+        assert!(!holds(&bob, bob.mailbox.mail.get(draft).unwrap(), "Bye."));
+        assert!(display_body(&bob, bob.mailbox.mail.get(draft).unwrap()).plain_text().contains("Bye."));
 
         // Without a digital ID to keep it encrypted with, the draft is not saved at all (the window stays
         // open with the text).
@@ -1701,7 +1712,7 @@ mod tests {
         s.run("compose.encrypt", &json!({"compose": c, "on": true})).unwrap();
         let e = s.run("compose.saveDraft", &json!({"compose": c})).unwrap_err();
         assert!(e.to_string().contains("not saved"), "{e}");
-        assert!(s.mailbox.mail.items().all(|m| !holds(m, "Merger terms")));
+        assert!(s.mailbox.mail.items().all(|m| !holds(&s, m, "Merger terms")));
         assert!(s.composes[&c].dirty);
     }
 

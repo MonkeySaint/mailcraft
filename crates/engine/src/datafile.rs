@@ -54,8 +54,8 @@ use crate::{CmdError, Session};
 use mailcraft_model::account::{AccountSync, CredentialKind};
 use mailcraft_model::mailbox::MAX_FOLDER_NAME_CHARS;
 use mailcraft_model::{
-    Account, AccountId, AccountKind, Appointment, Contact, Folder, FolderId, ItemId, MailItem, Note, Task,
-    ViewSettings,
+    Account, AccountId, AccountKind, Appointment, Body, Contact, Folder, FolderId, ItemId, MailItem, Note,
+    Task, ViewSettings,
 };
 
 /// `format` field of a closed data file.
@@ -74,6 +74,34 @@ const MAX_ITEMS: usize = 5_000_000;
 /// Most closed data files kept in memory by a session without a store.
 const MAX_IN_MEMORY: usize = 64;
 
+/// A mail item of a data file, with its content inline (a data file is self-contained; in the profile the
+/// content lives in the body store). The JSON is the item's own fields plus `body` and `raw`, as every data
+/// file has had: `body` is always written (MailCraft before storage stage S5 needs it), `raw` is the source
+/// as a number array, or null.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DataMail {
+    #[serde(flatten)]
+    pub item: MailItem,
+    #[serde(default)]
+    pub body: Body,
+    #[serde(default)]
+    pub raw: Option<Vec<u8>>,
+}
+
+impl From<MailItem> for DataMail {
+    /// An item with no content of its own.
+    fn from(item: MailItem) -> DataMail {
+        DataMail { item, body: Body::default(), raw: None }
+    }
+}
+
+impl std::ops::Deref for DataMail {
+    type Target = MailItem;
+    fn deref(&self) -> &MailItem {
+        &self.item
+    }
+}
+
 /// A data file taken out of the mailbox.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -84,7 +112,7 @@ pub struct DataFileImage {
     #[serde(deserialize_with = "capped_folders")]
     pub folders: Vec<Folder>,
     #[serde(deserialize_with = "capped_items")]
-    pub mail: Vec<MailItem>,
+    pub mail: Vec<DataMail>,
     #[serde(deserialize_with = "capped_items")]
     pub appointments: Vec<Appointment>,
     #[serde(deserialize_with = "capped_items")]
@@ -227,8 +255,8 @@ pub struct ClosedEntry {
     pub bytes: u64,
 }
 
-/// The data file of `account` as an image; message sources kept in the store's blobs are inlined, because
-/// the blobs go once nothing in the mailbox refers to them.
+/// The data file of `account` as an image; message sources and bodies kept in the body store are inlined,
+/// because the store's content goes once nothing in the mailbox refers to it.
 pub fn image_of(s: &Session, account: AccountId) -> Result<DataFileImage, CmdError> {
     let Some(mut acct) = s.mailbox.account(account).cloned() else {
         return Err(CmdError::Params(format!("no such data file {}", account.0)));
@@ -239,23 +267,15 @@ pub fn image_of(s: &Session, account: AccountId) -> Result<DataFileImage, CmdErr
     let ids: BTreeSet<FolderId> = folders.iter().map(|f| f.id).collect();
     let mut mail = Vec::new();
     for m in s.mailbox.mail.items().filter(|m| ids.contains(&m.folder)) {
-        let mut m = m.clone();
-        if m.raw.is_none()
-            && m.blob.is_some()
-            && let Some(st) = &s.store
-        {
-            match st.raw_of(&m) {
-                Ok(raw) => m.raw = raw,
-                Err(e) => {
-                    return Err(CmdError::Failed(format!(
-                        "cannot read the source of \"{}\": {e}",
-                        m.subject
-                    )));
-                }
-            }
-        }
-        m.blob = None;
-        mail.push(m);
+        let unreadable =
+            |e: CmdError| CmdError::Failed(format!("cannot read the content of \"{}\": {e}", m.subject));
+        let raw = s.source_of(m).map_err(unreadable)?;
+        let body = s.body_of(m).map_err(unreadable)?.map(|b| (*b).clone()).unwrap_or_default();
+        let mut item = m.clone();
+        // Keys name content in this profile's store only.
+        item.blob = None;
+        item.body_key = None;
+        mail.push(DataMail { item, body, raw });
     }
     Ok(DataFileImage {
         format: FORMAT.to_owned(),
@@ -705,7 +725,7 @@ pub fn attach_report(s: &mut Session, image: DataFileImage) -> Result<(AccountId
     let mut mail_map: BTreeMap<ItemId, ItemId> = BTreeMap::new();
     let mut new_mail = Vec::with_capacity(mail.len());
     let mut orphan = 0usize;
-    for mut m in mail {
+    for DataMail { item: mut m, body, raw } in mail {
         let Some(folder) = map.get(&m.folder).copied() else {
             orphan = orphan.saturating_add(1);
             continue;
@@ -720,6 +740,15 @@ pub fn attach_report(s: &mut Session, image: DataFileImage) -> Result<(AccountId
         m.folder = folder;
         m.remote_id = None;
         m.blob = None;
+        m.body_key = None;
+        m.body_evicted = false;
+        // The content goes to this profile's body store (the source; a body record only for a body the
+        // source does not give).
+        let content = mailcraft_store::Content {
+            source: raw.filter(|r| !r.is_empty()),
+            body: (!body.is_empty()).then_some(body),
+        };
+        s.store_content(&mut m, &content)?;
         new_mail.push(m);
     }
     for mut m in new_mail {
@@ -1140,28 +1169,9 @@ fn content_digest(s: &Session, account: AccountId) -> Result<u64, CmdError> {
         h.put(f)?;
     }
     for m in s.mailbox.mail.items().filter(|m| ids.contains(&m.folder)) {
-        // The item without its source (a copy of one message at most), then the source itself.
-        let mut item = m.clone();
-        let raw = item.raw.take();
-        item.blob = None;
-        h.put(&item)?;
-        drop(item);
-        match raw {
-            Some(raw) => h.bytes(&raw),
-            None => match (&m.blob, &s.store) {
-                (Some(_), Some(st)) => match st.raw_of(m) {
-                    Ok(Some(raw)) => h.bytes(&raw),
-                    Ok(None) => h.bytes(b"-"),
-                    Err(e) => {
-                        return Err(CmdError::Failed(format!(
-                            "cannot read the source of \"{}\": {e}",
-                            m.subject
-                        )));
-                    }
-                },
-                _ => h.bytes(b"-"),
-            },
-        }
+        // The item with its content keys: content is keyed by its bytes (storage stage S5), so the keys stand
+        // for the source and the body without reading either.
+        h.put(m)?;
     }
     h.bytes(b"appointments");
     for x in s.mailbox.appointments.values().filter(|x| ids.contains(&x.folder)) {
@@ -1708,31 +1718,26 @@ pub(crate) mod tests {
         let file = dir.path().join("Notes.mcdata");
         let id = create_linked(&mut s, "Notes", &file, None).unwrap();
         let inbox = s.mailbox.role_folder(id, mailcraft_model::FolderRole::Inbox).unwrap();
-        let m = s.mailbox.add_mail(MailItem {
-            folder: inbox,
-            subject: "A".into(),
-            raw: Some(b"Subject: A\r\n\r\nbody one\r\n".to_vec()),
-            ..Default::default()
-        });
-        let inline = content_digest(&s, id).unwrap();
-        assert_eq!(content_digest(&s, id).unwrap(), inline, "the same every time");
-        // The source moves into the store's blobs: same contents, same digest.
-        s.store.as_mut().unwrap().checkpoint_mut(&mut s.mailbox, true).unwrap();
-        assert!(
-            s.mailbox.mail.get(m).unwrap().raw.is_none() && s.mailbox.mail.get(m).unwrap().blob.is_some()
-        );
-        assert_eq!(content_digest(&s, id).unwrap(), inline);
+        let mut item = MailItem { folder: inbox, subject: "A".into(), ..Default::default() };
+        s.store_source(&mut item, b"Subject: A\r\n\r\nbody one\r\n").unwrap();
+        let m = s.mailbox.add_mail(item);
+        let first = content_digest(&s, id).unwrap();
+        assert_eq!(content_digest(&s, id).unwrap(), first, "the same every time");
+        // The source is in the store's blobs; a checkpoint changes nothing.
+        s.store.as_mut().unwrap().checkpoint(&s.mailbox).unwrap();
+        assert!(s.mailbox.mail.get(m).unwrap().blob.is_some());
+        assert_eq!(content_digest(&s, id).unwrap(), first);
         // What Exit compares is that digest: written once with this message, then left alone.
         save_linked(&mut s, id).unwrap();
         let written = std::fs::read(&file).unwrap();
         assert!(!save_linked_as(&mut s, id, true).unwrap().1, "unchanged, not written again");
         assert_eq!(std::fs::read(&file).unwrap(), written);
         // Another source, another digest; the item itself counts as well.
-        let item = s.mailbox.mail.get_mut(m).unwrap();
-        item.raw = Some(b"Subject: A\r\n\r\nbody two\r\n".to_vec());
-        item.blob = None;
+        let mut item = s.mailbox.mail.get(m).cloned().unwrap();
+        s.store_source(&mut item, b"Subject: A\r\n\r\nbody two\r\n").unwrap();
+        s.mailbox.mail.insert(m, item);
         let other = content_digest(&s, id).unwrap();
-        assert_ne!(other, inline);
+        assert_ne!(other, first);
         s.mailbox.mail.get_mut(m).unwrap().subject = "B".into();
         assert_ne!(content_digest(&s, id).unwrap(), other);
         assert!(content_digest(&s, AccountId(9_999)).is_err());

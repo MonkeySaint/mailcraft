@@ -3122,7 +3122,7 @@ mod tests {
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut item = MailItem::from_message(&msg, &raw, to.now());
         item.folder = role(to, FolderRole::Inbox);
-        to.mailbox.add_mail(item)
+        to.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap()
     }
 
     fn assign_to_ann(org: &mut Session, subject: &str) -> (ItemId, u64) {

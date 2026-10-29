@@ -82,12 +82,62 @@ impl BodyFormat {
     }
 }
 
+/// A message body: its text and HTML parts. Bodies are not part of [`MailItem`] (storage stage S5): they live
+/// in the store's body store and are read on demand (the engine's `Session::body`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Body {
     pub format: BodyFormat,
     pub text: Option<String>,
     /// Sanitising happens at display time (`mailcraft-html`); the stored HTML is the original.
     pub html: Option<String>,
+}
+
+impl Body {
+    /// The body of a parsed message: its text and HTML parts (HTML format when it has an HTML part).
+    pub fn from_message(msg: &mailcraft_mime::Message) -> Body {
+        let text = msg.text_body();
+        let html = msg.html_body();
+        let format = if html.is_some() { BodyFormat::Html } else { BodyFormat::PlainText };
+        Body { format, text, html }
+    }
+    /// The body a message source gives (see [`Body::from_message`]); `None` when the source does not parse.
+    pub fn from_source(raw: &[u8]) -> Option<Body> {
+        mailcraft_mime::parse(raw).ok().map(|m| Body::from_message(&m))
+    }
+    /// Neither a text nor an HTML part.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none() && self.html.is_none()
+    }
+    /// Plain text of the body: the text part, else the HTML with tags stripped. A blank text part does not
+    /// hide the HTML (same choice as [`make_preview`]).
+    pub fn plain_text(&self) -> String {
+        match (&self.text, &self.html) {
+            (Some(t), _) if !t.trim().is_empty() => t.clone(),
+            (_, Some(h)) => crate::text::strip_html(h),
+            (Some(t), None) => t.clone(),
+            (None, None) => String::new(),
+        }
+    }
+    /// Like [`Body::plain_text`], but reading at most `max_bytes` of the body (cut at a character
+    /// boundary): bounded work for something drawn every frame, however large the message is.
+    pub fn text_prefix(&self, max_bytes: usize) -> String {
+        let cut = |s: &str| crate::text::truncate_at_char(s, max_bytes).to_owned();
+        match (&self.text, &self.html) {
+            (Some(t), _) if !t.trim().is_empty() => cut(t),
+            (_, Some(h)) => crate::text::strip_html(crate::text::truncate_at_char(h, max_bytes)),
+            (Some(t), None) => cut(t),
+            (None, None) => String::new(),
+        }
+    }
+    /// The list preview line of this body ([`make_preview`]).
+    pub fn preview(&self) -> String {
+        make_preview(self.text.as_deref(), self.html.as_deref())
+    }
+    /// A rough estimate of the memory this body takes (for byte caps; not exact).
+    pub fn approx_bytes(&self) -> usize {
+        let opt = |t: &Option<String>| t.as_ref().map_or(0, |t| t.len().saturating_add(16));
+        std::mem::size_of::<Body>().saturating_add(opt(&self.text)).saturating_add(opt(&self.html))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,7 +194,6 @@ pub struct MailItem {
     pub attachments: Vec<AttachmentMeta>,
     /// First ~255 chars of body text, whitespace collapsed (list preview line).
     pub preview: String,
-    pub body: Body,
     pub is_draft: bool,
     pub response: ResponseState,
     pub focus: FocusClass,
@@ -154,10 +203,22 @@ pub struct MailItem {
     pub ignored: bool,
     /// IMAP UID / JMAP id when synced.
     pub remote_id: Option<String>,
-    /// Blob key of the raw source in the store (`mailcraft-store`), when stored.
+    /// Key of the RFC 5322 source in the store's body store (`mailcraft-store`), when stored. The source is
+    /// read on demand (View Source, Forward as Attachment, export); the decoded body comes from it unless
+    /// [`MailItem::body_key`] is set.
     pub blob: Option<String>,
-    /// Original RFC 5322 source when kept (needed for Forward as Attachment, View Source, export).
-    pub raw: Option<Vec<u8>>,
+    /// Key of a body record in the store's body store when the body is not the one the source gives: an item
+    /// without a source (a local draft, a message made here) or one whose body was changed here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_key: Option<String>,
+    /// Expiry date of the message (`Expiry-Date` or `Expires`, RFC 4021), read from its source when the source
+    /// was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<DateTime>,
+    /// The account's offline window took this message's body off this computer (its header stays): it is
+    /// downloaded again when the message is opened while the account is online.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_evicted: bool,
     /// Pinned to the top of its folder's list (Quick Action Pin / Unpin, `mail.pin`). Local only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
@@ -177,8 +238,8 @@ pub struct MailItem {
 }
 
 impl MailItem {
-    /// A rough estimate of the memory this item takes: its fixed size plus the text and bytes it holds
-    /// (bodies, source, addresses, ids). For byte caps; not exact.
+    /// A rough estimate of the memory this item takes: its fixed size plus the text it holds (addresses, ids,
+    /// preview; bodies and sources live in the body store). For byte caps; not exact.
     pub fn approx_bytes(&self) -> usize {
         // Each heap allocation costs a little more than its length.
         const PER_ALLOC: usize = 16;
@@ -216,19 +277,19 @@ impl MailItem {
                 })
                 .fold(0usize, usize::saturating_add),
             s(&self.preview),
-            opt(&self.body.text),
-            opt(&self.body.html),
             opt(&self.remote_id),
             opt(&self.blob),
-            self.raw.as_ref().map_or(0, |r| r.len().saturating_add(PER_ALLOC)),
+            opt(&self.body_key),
             self.votes.len().saturating_mul(std::mem::size_of::<VoteRecord>().saturating_add(2 * PER_ALLOC)),
             strs(&self.contacts),
         ];
         parts.into_iter().fold(0usize, usize::saturating_add)
     }
 
-    /// Builds an item from a parsed message (subject, addresses, dates, importance, bodies, attachments
-    /// metadata, preview, ids). `received` falls back to the Date header, then to `now`.
+    /// Builds an item from a parsed message (subject, addresses, dates, importance, attachments metadata,
+    /// preview, ids, expiry) whose source is `raw` (its size). The body is [`Body::from_message`]; neither it
+    /// nor the source is kept on the item (the caller stores them). `received` falls back to the Date header,
+    /// then to `now`.
     pub fn from_message(msg: &mailcraft_mime::Message, raw: &[u8], now: DateTime) -> MailItem {
         let flatten = |list: Vec<mailcraft_mime::Address>| -> Vec<Mailbox> {
             list.iter().flat_map(mailcraft_mime::Address::mailboxes).collect()
@@ -240,10 +301,7 @@ impl MailItem {
             Some("low") => Importance::Low,
             _ => Importance::Normal,
         };
-        let text = msg.text_body();
-        let html = msg.html_body();
-        let format = if html.is_some() { BodyFormat::Html } else { BodyFormat::PlainText };
-        let preview = make_preview(text.as_deref(), html.as_deref());
+        let preview = Body::from_message(msg).preview();
         let attachments = msg
             .attachments()
             .into_iter()
@@ -282,6 +340,7 @@ impl MailItem {
             _ => FlagState::None,
         };
         let is_draft = header("X-Unsent").is_some_and(|v| v == "1");
+        let expires = date_header("Expiry-Date").or_else(|| date_header("Expires"));
         MailItem {
             message_id: msg.message_id().map(|id| clean_id(&id)).filter(|id| !id.is_empty()),
             in_reply_to: msg
@@ -307,9 +366,8 @@ impl MailItem {
             categories,
             attachments,
             preview,
-            body: Body { format, text, html },
             is_draft,
-            raw: (!raw.is_empty()).then(|| raw.to_vec()),
+            expires,
             ..Default::default()
         }
     }
@@ -322,31 +380,6 @@ impl MailItem {
     /// Size in KB as shown in the list (rounded up, minimum 1).
     pub fn size_kb(&self) -> u64 {
         self.size.div_ceil(1024).max(1)
-    }
-    /// Plain text of the body: the text part, else the HTML with tags stripped. A blank text part does not
-    /// hide the HTML (same choice as [`make_preview`]).
-    pub fn body_text(&self) -> String {
-        match (&self.body.text, &self.body.html) {
-            (Some(t), _) if !t.trim().is_empty() => t.clone(),
-            (_, Some(h)) => crate::text::strip_html(h),
-            (Some(t), None) => t.clone(),
-            (None, None) => String::new(),
-        }
-    }
-    /// Like [`MailItem::body_text`], but reading at most `max_bytes` of the body (cut at a character
-    /// boundary): bounded work for something drawn every frame, however large the message is.
-    pub fn body_text_prefix(&self, max_bytes: usize) -> String {
-        let cut = |s: &str| crate::text::truncate_at_char(s, max_bytes).to_owned();
-        match (&self.body.text, &self.body.html) {
-            (Some(t), _) if !t.trim().is_empty() => cut(t),
-            (_, Some(h)) => crate::text::strip_html(crate::text::truncate_at_char(h, max_bytes)),
-            (Some(t), None) => cut(t),
-            (None, None) => String::new(),
-        }
-    }
-    /// Recomputes `preview` from the body.
-    pub fn refresh_preview(&mut self) {
-        self.preview = make_preview(self.body.text.as_deref(), self.body.html.as_deref());
     }
     /// Size label as in the list/accessible name: "N KB" (rounded up, min 1).
     pub fn size_label(&self) -> String {
@@ -381,7 +414,6 @@ impl MailItem {
             categories,
             attachments: _,
             preview: _,
-            body: _,
             is_draft,
             response,
             focus,
@@ -389,7 +421,9 @@ impl MailItem {
             ignored,
             remote_id,
             blob: _,
-            raw: _,
+            body_key: _,
+            expires: _,
+            body_evicted: _,
             pinned,
             votes,
             no_auto_archive,

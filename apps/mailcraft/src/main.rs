@@ -115,7 +115,7 @@ fn default_profile() -> Option<PathBuf> {
 fn open_session(args: &Args) -> Session {
     if args.sample {
         let now = mailcraft_engine::model::DateTime::now_utc();
-        return Session::new(mailcraft_engine::sample::sample_mailbox(now));
+        return mailcraft_engine::sample::sample_session_at(now);
     }
     let Some(dir) = args.profile.clone().or_else(default_profile) else {
         let mut s = Session::new(mailcraft_engine::model::Mailbox::new_local(

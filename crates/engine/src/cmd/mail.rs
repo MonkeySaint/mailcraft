@@ -994,15 +994,18 @@ fn choose_form(s: &mut Session, p: &Value) -> CmdResult {
     let data = crate::cmd::rules::read_file_capped(&path, MAX_TEMPLATE_FILE)?;
     let folder = s.selection.folder;
     let is_eml = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("eml"));
-    let mut m = if is_eml {
+    let read = if is_eml {
         mailcraft_formats::eml::read(&data, folder, s.now())
+            .map(|m| (m, mailcraft_store::Content::source(data)))
     } else {
         mailcraft_formats::msg::read_item(&data, folder, s.now())
-    }
-    .map_err(|e| CmdError::Failed(format!("the template could not be read: {e}")))?;
-    if m.raw.is_none() && is_eml {
-        m.raw = Some(data);
-    }
+    };
+    let (m, content) = read.map_err(|e| CmdError::Failed(format!("the template could not be read: {e}")))?;
+    let body = content
+        .body
+        .clone()
+        .or_else(|| content.source.as_deref().and_then(mailcraft_model::Body::from_source))
+        .unwrap_or_default();
     let join = |l: &[mailcraft_model::Address]| {
         l.iter().map(crate::cmd::compose::field_mailbox).collect::<Vec<_>>().join("; ")
     };
@@ -1014,12 +1017,12 @@ fn choose_form(s: &mut Session, p: &Value) -> CmdResult {
         bcc: join(&m.bcc),
         show_bcc: !m.bcc.is_empty(),
         subject: m.subject.clone(),
-        body: body_doc(&m),
-        format: m.body.format,
+        body: body_doc(&body),
+        format: body.format,
         // The template's format is the message's format, whatever Options say for new messages.
         format_explicit: true,
         importance: m.importance,
-        attachments: source_attachments(s, &m),
+        attachments: content.source.as_deref().map(attachments_in).unwrap_or_default(),
         dirty: true,
         ..Default::default()
     };
@@ -1165,10 +1168,9 @@ fn new_post(s: &mut Session, p: &Value) -> CmdResult {
         received: now,
         size: u64::try_from(size).unwrap_or(u64::MAX),
         read: true,
-        body,
         ..Default::default()
     };
-    item.refresh_preview();
+    s.store_body(&mut item, &body)?;
     let id = s.mailbox.add_mail(item);
     journal(s, &[id]);
     Ok(json!({"id": id.0, "folder": folder.0, "post": true}))
@@ -1274,6 +1276,8 @@ fn copy_to_folder(s: &mut Session, p: &Value) -> CmdResult {
         Some(f) => return Err(CmdError::Failed(format!("mail items cannot be copied into \"{}\"", f.name))),
         None => return Err(CmdError::Params(format!("no such folder {}", folder.0))),
     }
+    // A copy of a message only whose header is here would have no body, wherever it goes.
+    crate::sync::cmds::need_content(s, &ids, "copied")?;
     let mut copies = Vec::new();
     for id in &ids {
         if let Some(item) = s.mailbox.mail.get(*id).cloned() {
@@ -2049,8 +2053,7 @@ pub fn ignore_arrivals(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
 }
 
 /// Body text normalised for "fully quoted" comparison: quote markers removed, whitespace collapsed.
-fn normalised_text(m: &MailItem) -> String {
-    let text = m.body_text();
+fn normalised_text(text: &str) -> String {
     let mut out = String::new();
     for line in text.lines() {
         let line = line.trim_start_matches(|c: char| c == '>' || c.is_whitespace());
@@ -2073,9 +2076,8 @@ fn is_signed(m: &MailItem) -> bool {
 
 /// Body lines normalised like [`normalised_text`] (quote markers removed, whitespace collapsed), empty lines
 /// left out.
-fn normalised_lines(m: &MailItem) -> Vec<String> {
-    m.body_text()
-        .lines()
+fn normalised_lines(text: &str) -> Vec<String> {
+    text.lines()
         .map(|l| {
             l.trim_start_matches(|c: char| c == '>' || c.is_whitespace())
                 .split_whitespace()
@@ -2116,7 +2118,10 @@ fn redundant_members(
         .items
         .iter()
         .filter_map(|id| s.mailbox.mail.get(*id))
-        .map(|m| (m, normalised_text(m), if opts.keep_original { Vec::new() } else { normalised_lines(m) }))
+        .map(|m| {
+            let text = s.body_text(m);
+            (m, normalised_text(&text), if opts.keep_original { Vec::new() } else { normalised_lines(&text) })
+        })
         .collect();
     let mut out = Vec::new();
     for (m, text, lines) in &members {
@@ -2872,28 +2877,33 @@ fn edit_message(s: &mut Session, p: &Value) -> CmdResult {
     {
         return Err(CmdError::Params("the edited message is too large".into()));
     }
-    let Some(m) = s.mailbox.mail.get_mut(focus) else {
+    let Some(m) = s.mailbox.mail.get(focus) else {
         return Err(CmdError::Failed("message not found".into()));
     };
-    if let Some(subj) = subject {
-        m.subject = subj.to_owned();
-    }
+    let mut body = (*s.body_or_empty(m)).clone();
+    let body_changes = text.is_some() || html.is_some();
     match (text, html) {
         (_, Some(h)) => {
-            m.body.html = Some(h.to_owned());
-            m.body.text = Some(text.map_or_else(|| mailcraft_html::html_to_text(h), str::to_owned));
+            body.html = Some(h.to_owned());
+            body.text = Some(text.map_or_else(|| mailcraft_html::html_to_text(h), str::to_owned));
         }
         (Some(t), None) => {
-            m.body.text = Some(t.to_owned());
-            if m.body.html.is_some() {
-                m.body.html = Some(mailcraft_html::text_to_html(t));
+            body.text = Some(t.to_owned());
+            if body.html.is_some() {
+                body.html = Some(mailcraft_html::text_to_html(t));
             }
         }
         (None, None) => {}
     }
-    m.refresh_preview();
-    // The stored source no longer matches the edited item.
-    m.raw = None;
+    let mut edited = m.clone();
+    if let Some(subj) = subject {
+        edited.subject = subj.to_owned();
+    }
+    if body_changes {
+        // A body record wins over the source, which stays for View Source, attachments and inline pictures.
+        s.store_body(&mut edited, &body)?;
+    }
+    s.mailbox.mail.insert(focus, edited);
     // Nor does a translation of it: the edited message shows again (Translate makes a new one).
     s.translations.remove(&focus);
     journal(s, &[focus]);
@@ -2940,13 +2950,9 @@ const MAX_HEADER_BYTES: usize = 256 * 1024;
 /// its blob in the store; a message without either gets the headers rebuilt from its fields). Unfolded
 /// lines are kept as they are; the text is capped at [`MAX_HEADER_BYTES`].
 pub(crate) fn internet_headers(s: &Session, m: &MailItem) -> String {
-    let stored = match &s.store {
-        Some(st) if m.raw.is_none() => st.head_of(m, MAX_HEADER_BYTES).ok().flatten(),
-        _ => m.raw.as_ref().map(|r| r.get(..r.len().min(MAX_HEADER_BYTES)).unwrap_or_default().to_vec()),
-    };
-    let raw = match stored {
+    let raw = match s.source_head(m, MAX_HEADER_BYTES) {
         Some(r) if !r.is_empty() => r,
-        _ => item_source(m),
+        _ => item_source(s, m),
     };
     header_block(&raw)
 }
@@ -2969,13 +2975,12 @@ fn header_block(raw: &[u8]) -> String {
     text.trim_end_matches('\n').to_owned()
 }
 
-/// RFC 5322 source of an item: the stored original, else one rebuilt from its fields.
-pub(crate) fn item_source(m: &MailItem) -> Vec<u8> {
-    if let Some(raw) = &m.raw
-        && !raw.is_empty()
-    {
-        return raw.clone();
+/// RFC 5322 source of an item: the stored original, else one rebuilt from its fields and body.
+pub(crate) fn item_source(s: &Session, m: &MailItem) -> Vec<u8> {
+    if let Some(raw) = crate::cmd::compose::stored_raw(s, m).filter(|r| !r.is_empty()) {
+        return raw;
     }
+    let body = s.body_or_empty(m);
     let mb = |list: &[mailcraft_model::Address]| {
         list.iter().cloned().map(mailcraft_mime::Address::Mailbox).collect::<Vec<_>>()
     };
@@ -2995,8 +3000,8 @@ pub(crate) fn item_source(m: &MailItem) -> Vec<u8> {
             Importance::Low => Some("low".into()),
             Importance::Normal => None,
         },
-        text: m.body.text.clone().or_else(|| m.body.html.is_none().then(String::new)),
-        html: m.body.html.clone(),
+        text: body.text.clone().or_else(|| body.html.is_none().then(String::new)),
+        html: body.html.clone(),
         ..Default::default()
     };
     b.build()
@@ -3009,8 +3014,7 @@ fn view_source(s: &mut Session, p: &Value) -> CmdResult {
     let Some(m) = s.mailbox.mail.get(focus) else {
         return Err(CmdError::Failed("message not found".into()));
     };
-    let kept = crate::cmd::compose::stored_raw(s, m).filter(|r| !r.is_empty());
-    let source = String::from_utf8_lossy(&kept.unwrap_or_else(|| item_source(m))).into_owned();
+    let source = String::from_utf8_lossy(&item_source(s, m)).into_owned();
     s.notify(Notice::OpenDialog("viewSource".into(), json!({"id": focus.0, "source": source})));
     Ok(json!({"dialog": "viewSource", "source": source}))
 }
@@ -3052,14 +3056,14 @@ fn encoding(s: &mut Session, p: &Value) -> CmdResult {
         .map_err(|e| CmdError::Failed(format!("the message cannot be read: {e}")))?;
     let (text, html) =
         if charset == "auto" { (msg.text_body(), msg.html_body()) } else { msg.bodies_as(&charset) };
-    let Some(m) = s.mailbox.mail.get_mut(focus) else {
+    let Some(m) = s.mailbox.mail.get(focus) else {
         return Err(CmdError::Failed("message not found".into()));
     };
-    let changed = m.body.text != text || m.body.html != html;
+    let current = s.body_or_empty(m);
+    let changed = current.text != text || current.html != html;
     if changed {
-        m.body.text = text;
-        m.body.html = html;
-        m.refresh_preview();
+        let body = mailcraft_model::Body { format: current.format, text, html };
+        s.set_body(focus, &body)?;
         journal(s, &[focus]);
     }
     Ok(json!({"id": focus.0, "charset": charset, "changed": changed}))
@@ -3086,7 +3090,8 @@ fn view_in_browser(s: &mut Session, p: &Value) -> CmdResult {
     // in plain text" shows the text body.
     let links_off = crate::junk::links_disabled(s, focus);
     let plain = links_off || s.settings.bool("trust.plainText");
-    let text_body = || match (&m.body.text, &m.body.html) {
+    let content = s.body_or_empty(m);
+    let text_body = || match (&content.text, &content.html) {
         (Some(t), _) => t.clone(),
         (None, Some(h)) => mailcraft_html::html_to_text(h),
         (None, None) => String::new(),
@@ -3097,7 +3102,7 @@ fn view_in_browser(s: &mut Session, p: &Value) -> CmdResult {
     } else if plain {
         mailcraft_html::text_to_html(&text_body())
     } else {
-        match (&m.body.html, &m.body.text) {
+        match (&content.html, &content.text) {
             (Some(h), _) => mailcraft_html::doc_to_html(&mailcraft_html::html_to_doc(h)),
             (None, Some(t)) => mailcraft_html::text_to_html(t),
             (None, None) => String::new(),
@@ -3188,13 +3193,14 @@ fn pin(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "on": on, "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>() }))
 }
 
-/// Attachments with their data, from the item's stored source (none when no source is kept).
+/// Attachments with their data, from the item's stored source (none when it has no source).
 pub(crate) fn source_attachments(s: &Session, m: &MailItem) -> Vec<crate::compose::ComposeAttachment> {
-    // The kept source, else the one in the store (sources leave memory once stored).
-    let Some(raw) = crate::cmd::compose::stored_raw(s, m) else {
-        return Vec::new();
-    };
-    let Ok(msg) = mailcraft_mime::parse(&raw) else {
+    crate::cmd::compose::stored_raw(s, m).map(|raw| attachments_in(&raw)).unwrap_or_default()
+}
+
+/// Attachments with their data, from the message source `raw` (none when it does not parse).
+pub(crate) fn attachments_in(raw: &[u8]) -> Vec<crate::compose::ComposeAttachment> {
+    let Ok(msg) = mailcraft_mime::parse(raw) else {
         return Vec::new();
     };
     msg.attachments()
@@ -3209,10 +3215,10 @@ pub(crate) fn source_attachments(s: &Session, m: &MailItem) -> Vec<crate::compos
 }
 
 /// A message body as a rich-text document: the HTML through `html_to_doc`, or the plain text.
-pub fn body_doc(m: &MailItem) -> mailcraft_model::Doc {
-    match (&m.body.format, &m.body.html) {
+pub fn body_doc(b: &mailcraft_model::Body) -> mailcraft_model::Doc {
+    match (&b.format, &b.html) {
         (BodyFormat::PlainText, _) | (_, None) => {
-            mailcraft_model::Doc::from_plain_text(m.body.text.as_deref().unwrap_or_default())
+            mailcraft_model::Doc::from_plain_text(b.text.as_deref().unwrap_or_default())
         }
         (_, Some(h)) => mailcraft_html::html_to_doc(h),
     }
@@ -3258,8 +3264,8 @@ fn resend(s: &mut Session, p: &Value) -> CmdResult {
         from: own_from
             .unwrap_or_else(|| m.from.as_ref().map(crate::cmd::compose::field_mailbox).unwrap_or_default()),
         subject: m.subject.clone(),
-        body: body_doc(m),
-        format: m.body.format,
+        body: body_doc(&s.body_or_empty(m)),
+        format: s.body_or_empty(m).format,
         importance: m.importance,
         attachments: source_attachments(s, m),
         ..Default::default()
@@ -3277,6 +3283,44 @@ mod tests {
     use super::*;
     use mailcraft_model::{Address, Mailbox};
 
+    /// A test message: the item, its body and (when set) its source, added with [`AddM::add_m`].
+    pub(crate) struct M(pub MailItem, pub mailcraft_model::Body, pub Option<Vec<u8>>);
+
+    impl std::ops::Deref for M {
+        type Target = MailItem;
+        fn deref(&self) -> &MailItem {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for M {
+        fn deref_mut(&mut self) -> &mut MailItem {
+            &mut self.0
+        }
+    }
+
+    impl M {
+        /// The message has this source (its body is the one the source gives).
+        pub(crate) fn source(mut self, raw: &[u8]) -> M {
+            self.2 = Some(raw.to_vec());
+            self
+        }
+    }
+
+    pub(crate) trait AddM {
+        fn add_m(&mut self, m: M) -> ItemId;
+    }
+
+    impl AddM for Session {
+        fn add_m(&mut self, m: M) -> ItemId {
+            let content = match m.2 {
+                Some(raw) => mailcraft_store::Content::source(raw),
+                None => mailcraft_store::Content::body(m.1),
+            };
+            self.add_message(m.0, &content).unwrap()
+        }
+    }
+
     pub(crate) struct Fx {
         pub s: Session,
         pub inbox: FolderId,
@@ -3289,21 +3333,21 @@ mod tests {
         DateTime { unix: day * DAY + hour * 3600, offset_min: 0 }
     }
 
-    fn msg(folder: FolderId, subject: &str, from: &str, text: &str, t: DateTime) -> MailItem {
-        MailItem {
+    fn msg(folder: FolderId, subject: &str, from: &str, text: &str, t: DateTime) -> M {
+        let item = MailItem {
             folder,
             subject: subject.into(),
             from: Some(Address::new(Some("Alice Rivera"), from)),
             to: vec![Address::new(Some("Test User"), "test.user@example.net")],
             received: t,
             sent: Some(t),
-            body: mailcraft_model::Body {
-                format: BodyFormat::PlainText,
-                text: Some(text.into()),
-                html: None,
-            },
             ..Default::default()
-        }
+        };
+        M(
+            item,
+            mailcraft_model::Body { format: BodyFormat::PlainText, text: Some(text.into()), html: None },
+            None,
+        )
     }
 
     /// Local mailbox: a, b, c in the Inbox (a newest). 2026-10-09 is a Friday (day 20735).
@@ -3315,16 +3359,16 @@ mod tests {
             acc.sender_name = "Test User".into();
         }
         let inbox = mb.role_folder(account, FolderRole::Inbox).unwrap();
-        let c = mb.add_mail(msg(inbox, "Lunch", "alice@example.com", "Shall we meet at noon?", at(20733, 9)));
-        let b = mb.add_mail(msg(
+        let mut s = Session::new(mb);
+        let c = s.add_m(msg(inbox, "Lunch", "alice@example.com", "Shall we meet at noon?", at(20733, 9)));
+        let b = s.add_m(msg(
             inbox,
             "RE: Lunch",
             "bob@example.org",
             "Noon works.\n\n> Shall we meet at noon?",
             at(20734, 9),
         ));
-        let a = mb.add_mail(msg(inbox, "Invoice", "carol@example.com", "Invoice attached.", at(20735, 8)));
-        let mut s = Session::new(mb);
+        let a = s.add_m(msg(inbox, "Invoice", "carol@example.com", "Invoice attached.", at(20735, 8)));
         s.fixed_now = Some(at(20735, 12));
         s.selection.folder = inbox;
         s.selection.items = vec![a];
@@ -3346,18 +3390,21 @@ mod tests {
                         Content-Type: text/plain; charset=utf-8\r\n\r\nGr"
             .to_vec();
         raw.extend_from_slice(&[0xFC, 0xDF, b'e', b'\r', b'\n']);
-        let id = f.s.mailbox.add_mail(mailcraft_store::import::item_from_raw(&raw, f.inbox, at(20735, 9)));
+        let item = mailcraft_store::import::item_from_raw(&raw, f.inbox, at(20735, 9));
+        let id = f.s.add_message(item, &mailcraft_store::Content::source(raw.clone())).unwrap();
         f.s.selection.items = vec![id];
         f.s.selection.focus = Some(id);
-        assert!(f.s.mailbox.mail.get(id).unwrap().body.text.as_deref().unwrap().contains('\u{FFFD}'));
+        let text = |s: &Session| s.body(id).unwrap().unwrap().text.clone().unwrap();
+        assert!(text(&f.s).contains('\u{FFFD}'));
         let r = f.s.run("mail.encoding", &json!({"charset": "ISO-8859-1"})).unwrap();
         assert_eq!(r["changed"], true);
-        assert_eq!(f.s.mailbox.mail.get(id).unwrap().body.text.as_deref(), Some("Grüße\n"));
+        assert_eq!(text(&f.s), "Grüße\n");
+        assert!(f.s.mailbox.mail.get(id).unwrap().blob.is_some(), "the source is not changed");
         f.s.run("app.undo", &json!({})).unwrap();
-        assert!(f.s.mailbox.mail.get(id).unwrap().body.text.as_deref().unwrap().contains('\u{FFFD}'));
+        assert!(text(&f.s).contains('\u{FFFD}'));
         f.s.run("mail.encoding", &json!({"charset": "windows-1252"})).unwrap();
         f.s.run("mail.encoding", &json!({"charset": "auto"})).unwrap();
-        assert!(f.s.mailbox.mail.get(id).unwrap().body.text.as_deref().unwrap().contains('\u{FFFD}'));
+        assert!(text(&f.s).contains('\u{FFFD}'));
         assert!(matches!(f.s.run("mail.encoding", &json!({"charset": "klingon"})), Err(CmdError::Params(_))));
         // A message without its source cannot be decoded again.
         f.s.selection.items = vec![f.a];
@@ -3368,9 +3415,10 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let dir = tempfile::tempdir_in(base).unwrap();
         f.s.browser_pages.dir(dir.path()).unwrap();
-        if let Some(m) = f.s.mailbox.mail.get_mut(f.a) {
-            m.body.html = Some("<p onclick=\"x()\">Hi<script>alert(1)</script><img src=\"https://img.example.com/t.png\"></p>".into());
-        }
+        f.s.edit_body(f.a, |b| {
+            b.html = Some("<p onclick=\"x()\">Hi<script>alert(1)</script><img src=\"https://img.example.com/t.png\"></p>".into());
+        })
+        .unwrap();
         let r = f.s.run("mail.viewInBrowser", &json!({})).unwrap();
         let path = r["path"].as_str().unwrap();
         assert!(r["url"].as_str().unwrap().starts_with("file:///"));
@@ -3446,15 +3494,16 @@ mod tests {
         f.s.browser_pages.dir(base.path()).unwrap();
         f.s.run("options.set", &json!({"key": "trust.blockImages", "value": false})).unwrap();
         let junk = role(&f.s, FolderRole::JunkEmail);
-        if let Some(m) = f.s.mailbox.mail.get_mut(f.a) {
-            m.folder = junk;
-            m.body.text = None;
-            m.body.html = Some(
+        f.s.mailbox.mail.get_mut(f.a).unwrap().folder = junk;
+        f.s.edit_body(f.a, |b| {
+            b.text = None;
+            b.html = Some(
                 "<p>Your account is locked. <a href=\"https://phish.example.net/login\">Sign in now</a></p>\
                  <img src=\"https://img.example.com/pixel.png\">"
                     .into(),
             );
-        }
+        })
+        .unwrap();
         assert!(crate::junk::links_disabled(&f.s, f.a));
         let view = |s: &mut Session| {
             let r = s.run("mail.viewInBrowser", &json!({"ids": [f.a.0]})).unwrap();
@@ -3518,7 +3567,7 @@ mod tests {
         assert!(std::fs::symlink_metadata(base.join("mailcraft-pages-link")).is_ok());
         // The session's own pages still work, in the profile's folder.
         let inbox = s.mailbox.folders.values().find(|f| f.role == Some(FolderRole::Inbox)).unwrap().id;
-        let id = s.mailbox.add_mail(msg(inbox, "Hi", "ann@example.com", "Hello.", at(20735, 9)));
+        let id = s.add_m(msg(inbox, "Hi", "ann@example.com", "Hello.", at(20735, 9)));
         s.selection.items = vec![id];
         s.selection.focus = Some(id);
         let r = s.run("mail.viewInBrowser", &json!({})).unwrap();
@@ -3672,17 +3721,11 @@ mod tests {
         let mut reply = msg(f.inbox, "RE: Lunch", "dee@example.com", "See you", at(20736, 9));
         reply.references = vec!["lunch-1@example.com".into()];
         f.s.mailbox.mail.get_mut(f.c).unwrap().message_id = Some("lunch-1@example.com".into());
-        let reply = f.s.mailbox.add_mail(reply);
-        let other = f.s.mailbox.add_mail(msg(
-            f.inbox,
-            "Lunch menu for the canteen",
-            "eve@example.com",
-            "x",
-            at(20736, 10),
-        ));
+        let reply = f.s.add_m(reply);
+        let other =
+            f.s.add_m(msg(f.inbox, "Lunch menu for the canteen", "eve@example.com", "x", at(20736, 10)));
         // Same subject, no header link to the conversation, another sender: not this conversation's mail.
-        let same_subject =
-            f.s.mailbox.add_mail(msg(f.inbox, "Lunch", "fay@example.net", "Menu inside", at(20736, 11)));
+        let same_subject = f.s.add_m(msg(f.inbox, "Lunch", "fay@example.net", "Menu inside", at(20736, 11)));
         assert_eq!(always_move_arrivals(&mut f.s, &[reply, other, same_subject]), vec![reply]);
         assert_eq!(folder_of(&f.s, reply), proj);
         assert_eq!(folder_of(&f.s, other), f.inbox);
@@ -3693,7 +3736,7 @@ mod tests {
         assert!(r["stopped"].as_u64().unwrap() >= 3);
         let mut later = msg(f.inbox, "RE: Lunch", "bob@example.org", "y", at(20737, 9));
         later.in_reply_to = vec!["<lunch-1@example.com>".into()];
-        let later = f.s.mailbox.add_mail(later);
+        let later = f.s.add_m(later);
         assert!(always_move_arrivals(&mut f.s, &[later]).is_empty());
         f.s.notices.clear();
         always_move_conversation(&mut f.s, &json!({"ids": [f.c.0]})).unwrap();
@@ -3863,9 +3906,9 @@ mod tests {
         assert!(!f.s.mailbox.mail.contains(id));
         // HTML posts keep their text too.
         let r = f.s.run("mail.newItem", &json!({"kind": "post", "html": "<p>Hi <b>all</b></p>"})).unwrap();
-        let m = &f.s.mailbox.mail.get(ItemId(r["id"].as_u64().unwrap())).unwrap();
-        assert_eq!(m.body.format, BodyFormat::Html);
-        assert!(m.body.text.as_deref().unwrap_or("").contains("Hi all"));
+        let b = f.s.body(ItemId(r["id"].as_u64().unwrap())).unwrap().unwrap();
+        assert_eq!(b.format, BodyFormat::Html);
+        assert!(b.text.as_deref().unwrap_or("").contains("Hi all"));
         // Only mail folders take posts.
         let cal = role(&f.s, FolderRole::Calendar);
         assert!(f.s.run("mail.newItem", &json!({"kind": "post", "folder": cal.0})).is_err());
@@ -3889,8 +3932,7 @@ mod tests {
         assert_eq!(r["persisted"], true);
         assert_eq!(other_senders(&f.s), vec!["alice@example.com".to_owned()]);
         // Later mail from the sender is classified Other on arrival.
-        let later =
-            f.s.mailbox.add_mail(msg(f.inbox, "Lunch again", "Alice@Example.com", "Tuesday?", at(20736, 9)));
+        let later = f.s.add_m(msg(f.inbox, "Lunch again", "Alice@Example.com", "Tuesday?", at(20736, 9)));
         let other = crate::sync::focus::on_new_mail(&mut f.s, &[later, f.a]);
         assert_eq!(other, vec![later]);
         assert_eq!(f.s.mailbox.mail.get(later).unwrap().focus, FocusClass::Other);
@@ -3903,9 +3945,9 @@ mod tests {
         assert!(other_senders(&f.s).is_empty());
         assert_eq!(focused_senders(&f.s), vec!["alice@example.com".to_owned()]);
         assert_eq!(f.s.mailbox.mail.get(f.c).unwrap().focus, FocusClass::Focused);
-        let mut bulk = msg(f.inbox, "Digest", "alice@example.com", "x", at(20736, 10));
-        bulk.raw = Some(b"From: alice@example.com\r\nList-Id: <l.example.com>\r\n\r\nx".to_vec());
-        let bulk = f.s.mailbox.add_mail(bulk);
+        let bulk = msg(f.inbox, "Digest", "alice@example.com", "x", at(20736, 10))
+            .source(b"From: alice@example.com\r\nList-Id: <l.example.com>\r\n\r\nx");
+        let bulk = f.s.add_m(bulk);
         assert!(crate::sync::focus::on_new_mail(&mut f.s, &[bulk]).is_empty());
         // And back again: one list at a time.
         f.s.run("mail.alwaysMoveToOther", &json!({"ids": [bulk.0]})).unwrap();
@@ -3942,8 +3984,7 @@ mod tests {
         assert_eq!(f.s.mailbox.mail.get(f.c).unwrap().focus, FocusClass::Focused);
         assert!(other_senders(&f.s).is_empty(), "the sender leaves the Other list");
         assert_eq!(focused_senders(&f.s), vec!["alice@example.com".to_owned()]);
-        let later =
-            f.s.mailbox.add_mail(msg(f.inbox, "Lunch again", "Alice@Example.com", "Tuesday?", at(20736, 9)));
+        let later = f.s.add_m(msg(f.inbox, "Lunch again", "Alice@Example.com", "Tuesday?", at(20736, 9)));
         f.s.mailbox.mail.get_mut(later).unwrap().focus = FocusClass::Other;
         assert!(crate::sync::focus::on_new_mail(&mut f.s, &[later]).is_empty(), "not sent to Other");
         assert_eq!(f.s.mailbox.mail.get(later).unwrap().focus, FocusClass::Focused);
@@ -4131,7 +4172,7 @@ mod tests {
     fn message_options_shows_the_received_headers() {
         let mut f = fx();
         let raw = b"Received: from mx.example.net by mail.example.org\r\n\tid 42; Thu, 8 Oct 2026 07:30:00 +0000\r\nFrom: Ann <ann@example.com>\r\nSubject: Hi\r\nX-Spam-Score: 0.1\r\n\r\nBody text\r\nFrom: not a header\r\n";
-        f.s.mailbox.mail.get_mut(f.a).unwrap().raw = Some(raw.to_vec());
+        f.s.set_source(f.a, Some(raw)).unwrap();
         message_options(&mut f.s, &json!({"ids": [f.a.0]})).unwrap();
         let Some(Notice::OpenDialog(name, p)) = f.s.notices.last() else { panic!("no dialog") };
         assert_eq!(name, "messageOptions");
@@ -4278,11 +4319,12 @@ mod tests {
     fn clean_up_moves_an_original_a_reply_modified_only_when_that_option_is_off() {
         let mut f = fx();
         // b answers inside the quote: every line of c is still there, with a comment between them.
-        let c = f.s.mailbox.mail.get_mut(f.c).unwrap();
-        c.body.text = Some("Shall we meet at noon?\nThe usual place.".into());
-        let b = f.s.mailbox.mail.get_mut(f.b).unwrap();
-        b.body.text =
-            Some("See below.\n\n> Shall we meet at noon?\nYes, noon.\n> The usual place.\nFine.".into());
+        f.s.edit_body(f.c, |c| c.text = Some("Shall we meet at noon?\nThe usual place.".into())).unwrap();
+        f.s.edit_body(f.b, |b| {
+            b.text =
+                Some("See below.\n\n> Shall we meet at noon?\nYes, noon.\n> The usual place.\nFine.".into());
+        })
+        .unwrap();
         f.s.selection.items = vec![f.b];
         f.s.selection.focus = Some(f.b);
         // On (default): the modified original stays.
@@ -4434,10 +4476,9 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         let msg = mailcraft_mime::parse(RAW).unwrap();
         let mut item = MailItem::from_message(&msg, RAW, s.now());
         item.folder = inbox;
-        item.raw = Some(RAW.to_vec());
-        let id = s.mailbox.add_mail(item);
-        s.store.as_mut().unwrap().checkpoint_mut(&mut s.mailbox, true).unwrap();
-        assert!(s.mailbox.mail.get(id).unwrap().raw.is_none(), "the source lives in the store now");
+        let id = s.add_message(item, &mailcraft_store::Content::source(RAW.to_vec())).unwrap();
+        s.store.as_mut().unwrap().checkpoint(&s.mailbox).unwrap();
+        assert!(s.mailbox.mail.get(id).unwrap().blob.is_some(), "the source lives in the store");
         s.settings.set(REPORT_ADDRESS, &json!("abuse@example.net")).unwrap();
         s.selection.folder = inbox;
         s.selection.items = vec![id];
@@ -4454,11 +4495,7 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         f.s.settings.set(REPORT_ADDRESS, &json!("abuse@example.net")).unwrap();
         let mut ids = vec![f.a.0];
         for i in 0..=crate::cmd::respond::MAX_FORWARD_ITEMS {
-            ids.push(
-                f.s.mailbox
-                    .add_mail(msg(f.inbox, &format!("Spam {i}"), "spam@example.org", "x", at(20735, 9)))
-                    .0,
-            );
+            ids.push(f.s.add_m(msg(f.inbox, &format!("Spam {i}"), "spam@example.org", "x", at(20735, 9))).0);
         }
         let r = report(&mut f.s, &json!({"ids": ids, "kind": "junk"})).unwrap();
         assert!(r["compose"].is_null());
@@ -4483,11 +4520,11 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         // The group: the first To address that is not mine, or the List-Post address.
         let r = f.s.run("mail.block", &json!({"ids": [f.c.0], "kind": "neverList"}));
         assert!(r.is_err(), "c is addressed only to me: {r:?}");
-        if let Some(m) = f.s.mailbox.mail.get_mut(f.c) {
-            m.raw = Some(
-                b"From: alice@example.com\r\nList-Post: <mailto:team@lists.example.org>\r\n\r\nx".to_vec(),
-            );
-        }
+        f.s.set_source(
+            f.c,
+            Some(b"From: alice@example.com\r\nList-Post: <mailto:team@lists.example.org>\r\n\r\nx"),
+        )
+        .unwrap();
         let r = f.s.run("mail.block", &json!({"ids": [f.c.0], "kind": "neverList"})).unwrap();
         assert_eq!(r["safe"], "team@lists.example.org");
         assert_eq!(f.s.mailbox.junk.safe_recipients, vec!["team@lists.example.org"]);
@@ -4503,8 +4540,8 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         let mut f = fx();
         if let Some(m) = f.s.mailbox.mail.get_mut(f.a) {
             m.cc = vec![Address::new(None, "colleague@example.org")];
-            m.raw = Some(b"From: carol@example.com\r\nCc: colleague@example.org\r\n\r\nx".to_vec());
         }
+        f.s.set_source(f.a, Some(b"From: carol@example.com\r\nCc: colleague@example.org\r\n\r\nx")).unwrap();
         assert_eq!(list_entry_of(&f.s, f.a), None);
         assert!(f.s.run("mail.block", &json!({"ids": [f.a.0], "kind": "neverList"})).is_err());
         assert!(f.s.mailbox.junk.safe_recipients.is_empty());
@@ -4515,16 +4552,19 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
                 Address::new(None, "dev@lists.example.org"),
             ];
             m.cc.clear();
-            m.raw =
-                Some(b"From: carol@example.com\r\nList-Id: Dev <dev.lists.example.org>\r\n\r\nx".to_vec());
         }
+        f.s.set_source(
+            f.a,
+            Some(b"From: carol@example.com\r\nList-Id: Dev <dev.lists.example.org>\r\n\r\nx"),
+        )
+        .unwrap();
         assert_eq!(list_entry_of(&f.s, f.a).as_deref(), Some("dev@lists.example.org"));
         // Sent by a group on the author's behalf, to the user only: the group (the Sender).
         if let Some(m) = f.s.mailbox.mail.get_mut(f.a) {
             m.to = vec![Address::new(None, "test.user@example.net")];
             m.sender = Some(Address::new(None, "staff@groups.example.com"));
-            m.raw = None;
         }
+        f.s.set_source(f.a, None).unwrap();
         assert_eq!(list_entry_of(&f.s, f.a).as_deref(), Some("staff@groups.example.com"));
     }
 
@@ -4550,8 +4590,8 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
                 Address::new(None, "test.user@example.net"),
                 Address::new(None, "colleague@example.org"),
             ];
-            m.raw = None;
         }
+        f.s.set_source(f.a, None).unwrap();
         assert_eq!(list_entry_of(&f.s, f.a), None);
         assert!(f.s.run("mail.block", &json!({"ids": [f.a.0], "kind": "neverList"})).is_err());
         assert!(f.s.mailbox.junk.safe_recipients.is_empty());
@@ -4565,12 +4605,15 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
             m.from = Some(Address::new(None, "carol@example.com"));
             m.sender = None;
             m.to = vec![Address::new(None, "alice@example.com"), Address::new(None, "dev@lists.example.org")];
-            m.raw = Some(
-                b"From: carol@example.com\r\nTo: alice@example.com, dev@lists.example.org\r\n\
-                  List-Id: Developers <dev.lists.example.org>\r\n\r\nx"
-                    .to_vec(),
-            );
         }
+        f.s.set_source(
+            f.a,
+            Some(
+                b"From: carol@example.com\r\nTo: alice@example.com, dev@lists.example.org\r\n\
+                  List-Id: Developers <dev.lists.example.org>\r\n\r\nx",
+            ),
+        )
+        .unwrap();
         assert_eq!(list_entry_of(&f.s, f.a).as_deref(), Some("dev@lists.example.org"));
         // The list reached the user by Bcc: the address comes from the List-Id, never from alice.
         if let Some(m) = f.s.mailbox.mail.get_mut(f.a) {
@@ -4578,11 +4621,11 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         }
         assert_eq!(list_entry_of(&f.s, f.a).as_deref(), Some("dev@lists.example.org"));
         // Only a List-Unsubscribe field (a newsletter to the user): no group to trust.
-        if let Some(m) = f.s.mailbox.mail.get_mut(f.a) {
-            m.raw = Some(
-                b"From: carol@example.com\r\nList-Unsubscribe: <mailto:off@example.com>\r\n\r\nx".to_vec(),
-            );
-        }
+        f.s.set_source(
+            f.a,
+            Some(b"From: carol@example.com\r\nList-Unsubscribe: <mailto:off@example.com>\r\n\r\nx"),
+        )
+        .unwrap();
         assert_eq!(list_entry_of(&f.s, f.a), None);
     }
 
@@ -4744,8 +4787,7 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
     #[test]
     fn find_related_sets_search() {
         let mut f = fx();
-        let other =
-            f.s.mailbox.add_mail(msg(f.inbox, "Lunch plans", "dan@example.com", "Friday?", at(20735, 9)));
+        let other = f.s.add_m(msg(f.inbox, "Lunch plans", "dan@example.com", "Friday?", at(20735, 9)));
         f.s.selection.focus = Some(f.b);
         find_related(&mut f.s, &json!({"kind": "conversation"})).unwrap();
         assert_eq!(f.s.view.search, "conversation:\"Lunch\"");
@@ -4843,8 +4885,8 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         f.s.run("nav.selectFolder", &json!({"folder": inbox.0})).unwrap();
         assert_eq!(crate::queries::unseen_in_view(&f.s), 0, "first visit: nothing unseen");
         f.s.run("nav.selectFolder", &json!({"folder": sent.0})).unwrap();
-        f.s.mailbox.add_mail(msg(inbox, "New one", "carol@example.com", "Hi", at(20740, 9)));
-        f.s.mailbox.add_mail(msg(inbox, "New two", "carol@example.com", "Hi", at(20740, 10)));
+        f.s.add_m(msg(inbox, "New one", "carol@example.com", "Hi", at(20740, 9)));
+        f.s.add_m(msg(inbox, "New two", "carol@example.com", "Hi", at(20740, 10)));
         f.s.run("nav.selectFolder", &json!({"folder": inbox.0})).unwrap();
         assert_eq!(crate::queries::unseen_in_view(&f.s), 2, "arrived since the last visit");
         f.s.run("nav.selectFolder", &json!({"folder": sent.0})).unwrap();
@@ -4899,19 +4941,51 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
         assert_eq!(m.subject, "Invoice 7");
         assert_eq!(m.preview, "Paid.");
         // The rich editor's document saved as HTML keeps its formatting (html_to_doc ⇄ doc_to_html).
-        let body = &mut f.s.mailbox.mail.get_mut(f.a).unwrap().body;
-        body.html = Some("<p>Due <b>Friday</b></p>".into());
-        body.format = BodyFormat::Html;
-        let mut doc = body_doc(f.s.mailbox.mail.get(f.a).unwrap());
+        f.s.edit_body(f.a, |body| {
+            body.html = Some("<p>Due <b>Friday</b></p>".into());
+            body.format = BodyFormat::Html;
+        })
+        .unwrap();
+        let mut doc = body_doc(&f.s.body(f.a).unwrap().unwrap());
         doc.blocks.insert(0, mailcraft_model::Doc::from_plain_text("Paid in full.").blocks.remove(0));
         let html = mailcraft_html::doc_to_html(&doc);
         edit_message(&mut f.s, &json!({"ids": [f.a.0], "html": html})).unwrap();
-        let m = f.s.mailbox.mail.get(f.a).unwrap();
-        let stored = m.body.html.as_deref().unwrap();
+        let b = f.s.body(f.a).unwrap().unwrap();
+        let stored = b.html.as_deref().unwrap();
         assert!(stored.contains("Paid in full."), "{stored}");
         assert!(mailcraft_html::html_to_doc(stored).to_plain_text().contains("Due Friday"), "{stored}");
         assert!(stored.contains("<b>") || stored.contains("<strong>") || stored.contains("bold"), "{stored}");
-        assert!(m.body.text.as_deref().is_some_and(|t| t.contains("Paid in full.")));
+        assert!(b.text.as_deref().is_some_and(|t| t.contains("Paid in full.")));
+    }
+
+    /// Regression: editing only the subject of a message with a source kept neither its source nor a body
+    /// record, so its body and attachments were gone; a body edit dropped the source too.
+    #[test]
+    fn edit_message_keeps_the_source() {
+        let mut f = fx();
+        let raw = b"From: Ann <ann@example.com>\r\nTo: me@example.net\r\nSubject: Report\r\n\
+                    MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+                    --b\r\nContent-Type: text/plain\r\n\r\nSee the notes.\r\n\
+                    --b\r\nContent-Type: text/plain; name=notes.txt\r\n\
+                    Content-Disposition: attachment; filename=notes.txt\r\n\r\nhello notes\r\n--b--\r\n";
+        let item = mailcraft_store::import::item_from_raw(raw, f.inbox, at(20735, 9));
+        let id = f.s.add_message(item, &mailcraft_store::Content::source(raw.to_vec())).unwrap();
+        let blob = f.s.mailbox.mail.get(id).unwrap().blob.clone();
+        assert!(blob.is_some());
+        edit_message(&mut f.s, &json!({"ids": [id.0], "subject": "Report (edited)"})).unwrap();
+        let m = f.s.mailbox.mail.get(id).unwrap();
+        assert_eq!(m.subject, "Report (edited)");
+        assert_eq!(m.blob, blob, "a subject edit keeps the source");
+        assert!(m.body_key.is_none(), "and writes no body record");
+        assert!(f.s.body_text(m).contains("See the notes."));
+        assert_eq!(source_attachments(&f.s, m).len(), 1);
+        // A body edit stores a body record over the source, which stays.
+        edit_message(&mut f.s, &json!({"ids": [id.0], "text": "Notes attached."})).unwrap();
+        let m = f.s.mailbox.mail.get(id).unwrap();
+        assert_eq!(m.blob, blob);
+        assert!(m.body_key.is_some());
+        assert!(f.s.body_text(m).contains("Notes attached."));
+        assert_eq!(source_attachments(&f.s, m).len(), 1);
     }
 
     #[test]
@@ -4963,7 +5037,7 @@ Subject: Verify now\r\nDate: Thu, 08 Oct 2026 07:30:00 +0000\r\nMessage-ID: <p1@
     #[test]
     fn sample_mailbox_commands_never_panic() {
         let now = at(20735, 12);
-        let mut s = Session::new(crate::sample::sample_mailbox(now));
+        let mut s = crate::sample::sample_session_at(now);
         s.fixed_now = Some(now);
         let ids: Vec<u64> = s.mailbox.mail.ids().take(3).map(|i| i.0).collect();
         if let Some(first) = s.mailbox.mail.items().next() {

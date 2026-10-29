@@ -309,7 +309,7 @@ fn invitation(a: &mut App) -> u64 {
     let mut item = mailcraft_model::MailItem::from_message(&msg, &raw, a.s.now());
     let acc = a.s.mailbox.default_account().unwrap().id;
     item.folder = a.s.mailbox.role_folder(acc, mailcraft_model::FolderRole::Inbox).unwrap();
-    a.s.mailbox.add_mail(item).0
+    a.s.add_message(item, &mailcraft_engine::Content::source(raw.clone())).unwrap().0
 }
 
 #[test]
@@ -1014,7 +1014,7 @@ fn task_mail(a: &mut App, from: (&str, &str), ics: &str) -> u64 {
     let mut item = mailcraft_model::MailItem::from_message(&msg, &raw, a.s.now());
     let acc = a.s.mailbox.default_account().unwrap().id;
     item.folder = a.s.mailbox.role_folder(acc, mailcraft_model::FolderRole::Inbox).unwrap();
-    a.s.mailbox.add_mail(item).0
+    a.s.add_message(item, &mailcraft_engine::Content::source(raw.clone())).unwrap().0
 }
 
 fn bar_harness(a: App, mail: u64) -> Harness<'static, App> {
@@ -1322,10 +1322,10 @@ fn todo_list_flagged_mail_rows_preview_and_show_their_text() {
         a.s.mailbox
             .mail
             .items()
-            .find(|m| m.is_flagged() && !linked.contains(&m.id) && !m.body_text().trim().is_empty())
+            .find(|m| m.is_flagged() && !linked.contains(&m.id) && !a.s.body_text(m).trim().is_empty())
             .cloned()
             .expect("the sample has a flagged message");
-    let first = m.body_text().lines().map(str::trim).find(|l| !l.is_empty()).unwrap().to_owned();
+    let first = a.s.body_text(&m).lines().map(str::trim).find(|l| !l.is_empty()).unwrap().to_owned();
     let mut h = harness(super::tasks, a, (1500.0, 900.0));
     assert!(!has_part(&h, &first), "no preview yet");
     run_cmd(&mut h, "view.messagePreview", json!({"lines": 1}));
@@ -1346,12 +1346,12 @@ fn todo_list_flagged_mail_with_a_huge_body_previews_its_start() {
     let linked: Vec<ItemId> = a.s.mailbox.tasks.values().filter_map(|t| t.from_mail).collect();
     let id =
         a.s.mailbox.mail.items().find(|m| m.is_flagged() && !linked.contains(&m.id)).map(|m| m.id).unwrap();
-    let subject = {
-        let m = a.s.mailbox.mail.get_mut(id).unwrap();
-        m.body.text = None;
-        m.body.html = Some(format!("<p>Opening words here</p>{}", "<div>filler text</div>".repeat(400_000)));
-        m.subject.clone()
-    };
+    a.s.edit_body(id, |b| {
+        b.text = None;
+        b.html = Some(format!("<p>Opening words here</p>{}", "<div>filler text</div>".repeat(400_000)));
+    })
+    .unwrap();
+    let subject = a.s.mailbox.mail.get(id).unwrap().subject.clone();
     let mut h = harness(super::tasks, a, (1500.0, 900.0));
     run_cmd(&mut h, "view.messagePreview", json!({"lines": 1}));
     assert!(has_part(&h, "Opening words here"), "the preview shows the start of the body");

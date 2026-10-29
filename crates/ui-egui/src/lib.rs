@@ -393,7 +393,10 @@ impl App {
         if self.s.poll_sync() {
             ctx.request_repaint();
         }
-        if self.s.sync_busy() || mailcraft_engine::translate::busy(&self.s) {
+        if self.s.sync_busy()
+            || mailcraft_engine::translate::busy(&self.s)
+            || mailcraft_engine::search_index::indexing(&self.s)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(SYNC_BUSY_REPAINT_MS));
         } else if !self.s.sync_status().accounts.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_secs(SYNC_IDLE_REPAINT_SECS));

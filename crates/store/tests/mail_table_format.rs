@@ -137,7 +137,8 @@ fn snapshot_file_is_byte_identical() {
     let mb = fixture();
     journal::write_snapshot(dir.path(), 7, &mb).unwrap();
     let written = std::fs::read(dir.path().join(journal::SNAPSHOT_FILE)).unwrap();
-    let mut want = b"{\"mailcraft_snapshot\":1,\"generation\":7,\"mailbox\":".to_vec();
+    // Since storage stage S5 the envelope marks that items carry no content inline.
+    let mut want = b"{\"mailcraft_snapshot\":2,\"generation\":7,\"bodies\":2,\"mailbox\":".to_vec();
     want.extend(serde_json::to_vec(&legacy(&mb)).unwrap());
     want.push(b'}');
     assert_eq!(written, want);
@@ -174,10 +175,8 @@ fn repo_trait_object_reads_what_the_table_reads() {
     for (id, m) in t {
         assert!(repo.contains(id));
         assert_eq!(repo.get(id).unwrap(), *m);
-        assert_eq!(repo.body(id).unwrap().unwrap(), m.body);
     }
     assert!(repo.get(ItemId(u64::MAX)).is_none() && !repo.contains(ItemId(u64::MAX)));
-    assert!(repo.body(ItemId(u64::MAX)).unwrap().is_none());
     assert_eq!(repo.counts(inbox), t.counts(inbox));
     assert_eq!(repo.counts(inbox).total, 2);
     assert_eq!(repo.all_counts(), t.all_counts());

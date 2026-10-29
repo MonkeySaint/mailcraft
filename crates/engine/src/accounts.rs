@@ -529,6 +529,11 @@ pub struct AccountOptions {
     /// POP3: remove the server copy when the message is deleted here for good.
     pub remove_when_deleted: bool,
     pub oauth: Option<OAuthBinding>,
+    /// Keep message bodies on this computer for reading offline (IMAP; see `offline.rs`). Off: bodies are
+    /// downloaded when a message is opened and not kept.
+    pub keep_offline: bool,
+    /// How far back message bodies are kept on this computer (headers always are).
+    pub offline_window: crate::offline::OfflineWindow,
 }
 
 impl Default for AccountOptions {
@@ -547,6 +552,8 @@ impl Default for AccountOptions {
             remove_after_days: Some(14),
             remove_when_deleted: false,
             oauth: None,
+            keep_offline: true,
+            offline_window: crate::offline::OfflineWindow::OneYear,
         }
     }
 }
@@ -725,6 +732,9 @@ fn options_json(o: &AccountOptions) -> Value {
         "leaveOnServer": o.leave_on_server,
         "removeAfterDays": o.remove_after_days,
         "removeWhenDeleted": o.remove_when_deleted,
+        "keepOffline": o.keep_offline,
+        "offlineWindow": o.offline_window.key(),
+        "offlineWindowLabel": o.offline_window.label(),
         "oauth": o.oauth.as_ref().map(|b| json!({
             "provider": b.provider,
             "name": b.name,
@@ -748,8 +758,8 @@ fn opt_minutes(p: &Value, key: &str, max: u64) -> Result<Option<Option<u32>>, Cm
 }
 
 /// Applies option params (`download`, `slowHeadersOnly`, `downloadMonths`, `include`, `intervalMinutes`,
-/// `push`, `pollMinutes`, `leaveOnServer`, `removeAfterDays`, `removeWhenDeleted`) to `o`. Validates
-/// everything before changing anything.
+/// `push`, `pollMinutes`, `leaveOnServer`, `removeAfterDays`, `removeWhenDeleted`, `keepOffline`,
+/// `offlineWindow`) to `o`. Validates everything before changing anything.
 pub(crate) fn apply_option_params(o: &mut AccountOptions, p: &Value) -> Result<bool, CmdError> {
     let download = match p.get("download").or_else(|| p.get("mode")) {
         None | Some(Value::Null) => None,
@@ -765,7 +775,25 @@ pub(crate) fn apply_option_params(o: &mut AccountOptions, p: &Value) -> Result<b
     }
     let keep = opt_minutes(p, "removeAfterDays", MAX_KEEP_DAYS)?;
     let months = opt_minutes(p, "downloadMonths", MAX_DOWNLOAD_MONTHS)?;
-    let bools = ["slowHeadersOnly", "include", "push", "leaveOnServer", "removeWhenDeleted"];
+    let window = match p.get("offlineWindow") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(w)) => Some(crate::offline::OfflineWindow::parse(w).ok_or_else(|| {
+            CmdError::Params(format!(
+                "unknown offline window `{}` (3d, 1w, 2w, 1m, 3m, 6m, 1y, 2y, 3y, 5y, all)",
+                w.chars().take(40).collect::<String>()
+            ))
+        })?),
+        Some(Value::Number(n)) => Some(
+            n.as_u64()
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(crate::offline::OfflineWindow::from_index)
+                .ok_or_else(|| {
+                    CmdError::Params("`offlineWindow` as a number is a slider stop from 0 to 10".into())
+                })?,
+        ),
+        Some(_) => return Err(CmdError::Params("`offlineWindow` must be a string or a number".into())),
+    };
+    let bools = ["slowHeadersOnly", "include", "push", "leaveOnServer", "removeWhenDeleted", "keepOffline"];
     for b in bools {
         if p.get(b).is_some_and(|v| !v.is_boolean() && !v.is_null()) {
             return Err(CmdError::Params(format!("`{b}` must be true or false")));
@@ -801,6 +829,12 @@ pub(crate) fn apply_option_params(o: &mut AccountOptions, p: &Value) -> Result<b
     }
     if let Some(b) = opt_bool(p, "removeWhenDeleted") {
         o.remove_when_deleted = b;
+    }
+    if let Some(b) = opt_bool(p, "keepOffline") {
+        o.keep_offline = b;
+    }
+    if let Some(w) = window {
+        o.offline_window = w;
     }
     Ok(*o != before)
 }
@@ -875,10 +909,18 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.options",
             "More Settings",
-            r#"{"account"?: number|string, "mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool, "downloadMonths"?: number|null (first download: mail from the past N months; null or 0 = all), "include"?: bool (in the All Accounts Send/Receive group), "intervalMinutes"?: number|null (null = Options › Advanced), "push"?: bool, "pollMinutes"?: number, "leaveOnServer"?: bool, "removeAfterDays"?: number|null, "removeWhenDeleted"?: bool} (no option given: returns the options)"#,
+            r#"{"account"?: number|string, "mode"?: "full"|"headersThenFull"|"headers", "slowHeadersOnly"?: bool, "downloadMonths"?: number|null (first download: mail from the past N months; null or 0 = all), "include"?: bool (in the All Accounts Send/Receive group), "intervalMinutes"?: number|null (null = Options › Advanced), "push"?: bool, "pollMinutes"?: number, "leaveOnServer"?: bool, "removeAfterDays"?: number|null, "removeWhenDeleted"?: bool, "keepOffline"?: bool (IMAP: keep message bodies on this computer), "offlineWindow"?: "3d"|"1w"|"2w"|"1m"|"3m"|"6m"|"1y"|"2y"|"3y"|"5y"|"all"|0..10 (IMAP: how far back bodies are kept; default 1y)} (no option given: returns the options)"#,
             false,
             has_server_account,
             options_cmd,
+        ),
+        spec(
+            "accounts.applyOfflineWindow",
+            "Apply Offline Window",
+            r#"{"account"?: number|string (default: every IMAP account)} → {"accounts": [{"account", "keepOffline", "window", "evicted", "removed", "more"}]} (takes the bodies of messages older than the account's offline window off this computer now; headers stay, and a message is downloaded again when opened online)"#,
+            false,
+            crate::offline::has_window_account,
+            crate::offline::apply_cmd,
         ),
         spec(
             "accounts.useKeyring",
@@ -1714,15 +1756,25 @@ fn options_cmd(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Disabled("a data file has no mail server".into()));
     }
     let mut o = account_options(s, id);
+    let before = o.clone();
     let changed = apply_option_params(&mut o, p)?;
+    let mut offline = None;
     if changed {
         update_options(s, id, |x| *x = o.clone());
         crate::sync::options_changed(s, id);
+        // A shorter offline window (or none) takes effect at once.
+        if (o.keep_offline, o.offline_window) != (before.keep_offline, before.offline_window) {
+            offline = Some(crate::offline::pass(s, id));
+        }
     }
     let mut v = options_json(&o);
     if let Some(m) = v.as_object_mut() {
         m.insert("account".into(), json!(id.0));
         m.insert("changed".into(), json!(changed));
+        m.insert("offlineWindowApplies".into(), json!(crate::offline::applies(s, id)));
+        if let Some(r) = offline {
+            m.insert("evicted".into(), json!(r.evicted));
+        }
     }
     Ok(v)
 }

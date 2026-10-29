@@ -288,13 +288,21 @@ impl CustomFilter {
 
     /// Whether `m` meets every condition.
     pub fn matches(&self, s: &Session, m: &MailItem) -> bool {
+        /// Tag of the body test of a word ([`Session::body_test`]).
+        const WORD_TEST: u8 = 2;
         if !self.words.trim().is_empty() {
-            let mut hay = m.subject.to_lowercase();
-            if self.in_body {
-                hay.push('\n');
-                hay.push_str(&m.body_text().to_lowercase());
-            }
-            if !self.words.split_whitespace().all(|w| hay.contains(&w.to_lowercase())) {
+            let subject = m.subject.to_lowercase();
+            // A word the subject lacks may be in the body (remembered per item and content, so the body is
+            // read once and not each time the list is built).
+            let found = |w: &str| {
+                let w = w.to_lowercase();
+                subject.contains(&w)
+                    || (self.in_body
+                        && s.body_test(m, crate::content::test_key(&(WORD_TEST, &w)), |b| {
+                            b.plain_text().to_lowercase().contains(&w)
+                        }))
+            };
+            if !self.words.split_whitespace().all(found) {
                 return false;
             }
         }
@@ -461,73 +469,27 @@ pub fn is_overdue(s: &Session, m: &MailItem) -> bool {
 }
 
 /// Longest header block scanned for an expiry date.
-pub const HEADER_SCAN: usize = 64 * 1024;
+pub const HEADER_SCAN: usize = mailcraft_store::legacy::HEADER_SCAN;
 
-/// The message's expiry date (`Expiry-Date` or `Expires`, RFC 4021) from its kept source, if any. Mail loaded
-/// from the store keeps its source in a blob; [`stored_expiry`] reads it from there.
+/// The message's expiry date (`Expiry-Date` or `Expires`, RFC 4021), read from its source when the source was
+/// stored (no file read: this paints rows).
 pub fn expiry(m: &MailItem) -> Option<DateTime> {
-    expiry_in(m.raw.as_deref()?)
+    m.expires
 }
 
 /// The expiry date of the message whose source is (or starts with) `raw`.
 pub fn expiry_in(raw: &[u8]) -> Option<DateTime> {
-    let head = raw.get(..raw.len().min(HEADER_SCAN))?;
-    // Only the header section is read (this runs for every message whose source leaves memory).
-    let end = head
-        .iter()
-        .enumerate()
-        .find_map(|(i, &b)| {
-            let next = head.get(i.saturating_add(1)..).unwrap_or_default();
-            (b == b'\n' && (next.starts_with(b"\n") || next.starts_with(b"\r\n"))).then_some(i)
-        })
-        .unwrap_or(head.len());
-    let text = String::from_utf8_lossy(head.get(..end).unwrap_or(head));
-    let mut value: Option<String> = None;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            break;
-        }
-        if let Some(v) = value.as_mut() {
-            if line.starts_with([' ', '\t']) {
-                v.push(' ');
-                v.push_str(line.trim());
-                continue;
-            }
-            break;
-        }
-        if let Some((name, rest)) = line.split_once(':') {
-            let name = name.trim();
-            if name.eq_ignore_ascii_case("expiry-date") || name.eq_ignore_ascii_case("expires") {
-                value = Some(rest.trim().to_owned());
-            }
-        }
-    }
-    DateTime::parse_rfc5322(value?.trim()).ok()
+    mailcraft_store::legacy::expiry_in(raw)
 }
 
-/// The message's expiry date read from its kept source, else from the start of its blob in the store (a file
-/// read: for batch work such as AutoArchive, not for painting rows).
-pub fn stored_expiry(s: &Session, m: &MailItem) -> Option<DateTime> {
-    if m.raw.is_some() {
-        return expiry(m);
-    }
-    if let Some(date) = s.search.released_expiry(m) {
-        return Some(date);
-    }
-    let store = s.store.as_ref()?;
-    match store.head_of(m, HEADER_SCAN) {
-        Ok(head) => expiry_in(&head?),
-        Err(e) => {
-            log::warn!("cannot read the source of message {}: {e}", m.id.0);
-            None
-        }
-    }
+/// The message's expiry date (see [`expiry`]; kept for batch callers such as AutoArchive).
+pub fn stored_expiry(_s: &Session, m: &MailItem) -> Option<DateTime> {
+    expiry(m)
 }
 
-/// The message carries an expiry date that has passed: read from its kept source, else the one noted when
-/// its source left memory this session (no file read; this paints rows).
+/// The message carries an expiry date that has passed.
 pub fn is_expired(s: &Session, m: &MailItem) -> bool {
-    expiry(m).or_else(|| s.search.released_expiry(m)).is_some_and(|d| d.unix <= s.now().unix)
+    expiry(m).is_some_and(|d| d.unix <= s.now().unix)
 }
 
 /// Font effects of the rules that match `m` (rules apply top to bottom; a later colour wins). `unread` is the
@@ -2068,14 +2030,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let expired = add(
-            &mut s,
-            MailItem {
-                read: true,
-                raw: Some(b"Subject: x\r\nExpiry-Date: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\nbody".to_vec()),
-                ..Default::default()
-            },
-        );
+        let expired = add(&mut s, MailItem { read: true, ..Default::default() });
+        s.set_source(expired, Some(b"Subject: x\r\nExpiry-Date: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\nbody"))
+            .unwrap();
         let boss = add(
             &mut s,
             MailItem {
@@ -2340,15 +2297,14 @@ mod tests {
 
     #[test]
     fn expiry_header_parsing() {
-        let m = |raw: &[u8]| MailItem { raw: Some(raw.to_vec()), ..Default::default() };
-        assert!(expiry(&m(b"Expires: Tue, 2 Jan 2024 10:00:00 +0000\r\n\r\n")).is_some());
-        assert!(expiry(&m(b"Expiry-Date:\r\n Tue, 2 Jan 2024 10:00:00 +0000\r\nX: y\r\n\r\n")).is_some());
+        assert!(expiry_in(b"Expires: Tue, 2 Jan 2024 10:00:00 +0000\r\n\r\n").is_some());
+        assert!(expiry_in(b"Expiry-Date:\r\n Tue, 2 Jan 2024 10:00:00 +0000\r\nX: y\r\n\r\n").is_some());
         assert!(
-            expiry(&m(b"Subject: x\r\n\r\nExpires: Tue, 2 Jan 2024 10:00:00 +0000")).is_none(),
+            expiry_in(b"Subject: x\r\n\r\nExpires: Tue, 2 Jan 2024 10:00:00 +0000").is_none(),
             "body ignored"
         );
-        assert!(expiry(&m(b"Expires: soon\r\n\r\n")).is_none());
-        assert!(expiry(&m(&[0xff, 0xfe, b':', b'\n'])).is_none());
+        assert!(expiry_in(b"Expires: soon\r\n\r\n").is_none());
+        assert!(expiry_in(&[0xff, 0xfe, b':', b'\n']).is_none());
         assert!(expiry(&MailItem::default()).is_none());
     }
 }

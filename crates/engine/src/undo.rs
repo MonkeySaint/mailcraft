@@ -68,6 +68,16 @@ pub struct UndoStack {
     pub max_bytes: usize,
 }
 
+impl UndoStack {
+    /// Every content key the item images of the undo and redo steps refer to (content collection keeps it, so
+    /// undoing a step finds the body and source it puts back).
+    pub fn content_keys(&self) -> std::collections::BTreeSet<String> {
+        mailcraft_store::bodies::keys_of(
+            self.undo.iter().chain(&self.redo).flat_map(|e| e.mail.iter().filter_map(|(_, m)| m)),
+        )
+    }
+}
+
 impl Default for UndoStack {
     fn default() -> Self {
         Self { undo: Vec::new(), redo: Vec::new(), limit: DEFAULT_LIMIT, max_bytes: DEFAULT_MAX_BYTES }
@@ -219,8 +229,8 @@ mod tests {
         for i in 0..20u64 {
             let item = MailItem {
                 id: ItemId(i),
-                body: mailcraft_model::Body { text: Some("x".repeat(10_000)), ..Default::default() },
-                raw: Some(vec![b'y'; 5_000]),
+                subject: "x".repeat(10_000),
+                preview: "y".repeat(5_000),
                 ..Default::default()
             };
             mail.record(item.id, Some(item));

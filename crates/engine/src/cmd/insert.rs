@@ -4251,7 +4251,7 @@ pub(crate) mod tests {
         s.run("compose.setTo", &json!({"value": "a@example.com"})).unwrap();
         assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
         let sent = s.mailbox.mail.items().find(|m| m.subject.is_empty() && !m.is_draft).unwrap();
-        assert!(String::from_utf8_lossy(sent.raw.as_ref().unwrap()).contains("Content-ID"));
+        assert!(s.source_text(sent.id).contains("Content-ID"));
     }
 
     #[test]
@@ -4860,7 +4860,7 @@ f 1 2 3 4\nf 5 6 7 8\nf 1 2 6 5\nf 2 3 7 6\nf 3 4 8 7\nf 4 1 5 8\n";
         s.run("compose.setTo", &json!({"value": "a@example.com"})).unwrap();
         assert_eq!(s.run("compose.send", &json!({})).unwrap()["sent"], true);
         let sent = s.mailbox.mail.items().find(|m| !m.is_draft && m.subject.is_empty()).unwrap();
-        let raw = String::from_utf8_lossy(sent.raw.as_ref().unwrap()).into_owned();
+        let raw = s.source_text(sent.id);
         assert!(!raw.contains("image/svg+xml"), "no SVG is sent");
         assert!(raw.matches("image/png").count() >= 3, "{raw}");
     }

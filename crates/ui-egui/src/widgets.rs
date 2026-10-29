@@ -380,3 +380,133 @@ pub fn pane_frame(theme: &crate::theme::Theme, fill: Color32) -> egui::Frame {
         .corner_radius(egui::CornerRadius::same(crate::theme::size::PANE_RADIUS))
         .stroke(egui::Stroke::new(if theme.dark { 0.0 } else { 1.0 }, theme.separator))
 }
+
+/// Width of one end of a [`stop_slider`] track (room for the thumb at the first and last stop).
+const STOP_PAD: f32 = 12.0;
+
+/// Index of `i` as a coordinate factor (stop lists are short; a longer one saturates).
+fn stop_f32(i: usize) -> f32 {
+    f32::from(u16::try_from(i).unwrap_or(u16::MAX))
+}
+
+/// A framed horizontal slider over a fixed list of evenly spaced stops; `labels` name the stops and `name` is
+/// its accessible name. The pointer picks the nearest stop (click or drag). Keyboard: Left/Down and Right/Up
+/// move one stop, Page Down/Page Up three, Home and End go to the ends. Screen readers get a slider whose
+/// number is the stop's index (0 to `labels.len() - 1`) and whose value text is the stop's label, and which
+/// takes their Increment, Decrement and Set Value actions. Returns the response, changed when the stop moved.
+pub fn stop_slider(ui: &mut Ui, name: &str, index: &mut usize, labels: &[&str], width: f32) -> Response {
+    use egui::{Key, accesskit::Action};
+    let last = labels.len().saturating_sub(1);
+    let old = (*index).min(last);
+    let mut idx = old;
+    let (rect, mut response) =
+        ui.allocate_exact_size(vec2(width.max(4.0 * STOP_PAD), 28.0), Sense::click_and_drag());
+    let enabled = ui.is_enabled();
+    let left = rect.left() + STOP_PAD;
+    let span = (rect.width() - 2.0 * STOP_PAD).max(1.0);
+    let x_of = |i: usize| if last == 0 { left } else { left + span * stop_f32(i) / stop_f32(last) };
+    if enabled {
+        if response.clicked() || response.drag_started() {
+            response.request_focus();
+        }
+        if (response.clicked() || response.dragged())
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            idx = (0..=last)
+                .min_by(|a, b| (x_of(*a) - pos.x).abs().total_cmp(&(x_of(*b) - pos.x).abs()))
+                .unwrap_or(idx);
+        }
+        let mut step = 0i64;
+        if response.has_focus() {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    },
+                );
+            });
+            let presses = |k: Key| ui.input(|i| i64::try_from(i.num_presses(k)).unwrap_or(0));
+            step += presses(Key::ArrowRight) + presses(Key::ArrowUp)
+                - presses(Key::ArrowLeft)
+                - presses(Key::ArrowDown);
+            step += 3 * (presses(Key::PageUp) - presses(Key::PageDown));
+            if presses(Key::Home) > 0 {
+                idx = 0;
+            }
+            if presses(Key::End) > 0 {
+                idx = last;
+            }
+        }
+        ui.input(|i| {
+            step +=
+                i64::try_from(i.num_accesskit_action_requests(response.id, Action::Increment)).unwrap_or(0);
+            step -=
+                i64::try_from(i.num_accesskit_action_requests(response.id, Action::Decrement)).unwrap_or(0);
+            for r in i.accesskit_action_requests(response.id, Action::SetValue) {
+                if let Some(egui::accesskit::ActionData::NumericValue(v)) = r.data
+                    && v.is_finite()
+                {
+                    // The nearest stop to the number asked for.
+                    let v = v.clamp(0.0, f64::from(stop_f32(last)));
+                    let off = |i: usize| (f64::from(stop_f32(i)) - v).abs();
+                    idx = (0..=last).min_by(|a, b| off(*a).total_cmp(&off(*b))).unwrap_or(idx);
+                }
+            }
+        });
+        if step != 0 {
+            let to = i64::try_from(idx)
+                .unwrap_or(0)
+                .saturating_add(step)
+                .clamp(0, i64::try_from(last).unwrap_or(0));
+            idx = usize::try_from(to).unwrap_or(idx);
+        }
+    }
+    let idx = idx.min(last);
+    if idx != old {
+        response.mark_changed();
+    }
+    *index = idx;
+    if ui.is_rect_visible(rect) {
+        let v = ui.visuals();
+        let w = ui.style().interact(&response);
+        let painter = ui.painter();
+        let frame =
+            if response.has_focus() { v.selection.stroke } else { v.widgets.noninteractive.bg_stroke };
+        painter.rect(rect, 3.0, v.extreme_bg_color, frame, egui::StrokeKind::Inside);
+        let y = rect.center().y;
+        let ink = if enabled { v.text_color() } else { v.weak_text_color() };
+        painter.line_segment([egui::pos2(left, y), egui::pos2(left + span, y)], egui::Stroke::new(2.0, ink));
+        for i in 0..=last {
+            let x = x_of(i);
+            painter
+                .line_segment([egui::pos2(x, y + 4.0), egui::pos2(x, y + 8.0)], egui::Stroke::new(1.0, ink));
+        }
+        let thumb = Rect::from_center_size(egui::pos2(x_of(idx), y), vec2(9.0, 18.0));
+        let fill = if enabled { w.bg_fill } else { v.widgets.inactive.weak_bg_fill };
+        painter.rect(thumb, 2.0, fill, egui::Stroke::new(1.0, ink), egui::StrokeKind::Inside);
+    }
+    let value = labels.get(idx).copied().unwrap_or_default().to_owned();
+    response.widget_info(|| {
+        let mut info = WidgetInfo::slider(enabled, stop_f32(idx).into(), name);
+        info.current_text_value = Some(value.clone());
+        info
+    });
+    ui.ctx().accesskit_node_builder(response.id, |b| {
+        b.set_min_numeric_value(0.0);
+        b.set_max_numeric_value(stop_f32(last).into());
+        b.set_numeric_value_step(1.0);
+        if enabled {
+            b.add_action(Action::SetValue);
+            if idx < last {
+                b.add_action(Action::Increment);
+            }
+            if idx > 0 {
+                b.add_action(Action::Decrement);
+            }
+        }
+    });
+    response
+}

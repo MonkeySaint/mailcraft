@@ -286,28 +286,25 @@ fn open_export(s: &mut Session, p: &Value) -> CmdResult {
     match action {
         "importEml" => {
             let folder = mail_folder(s, p)?;
-            let id = match s.store.as_mut() {
-                Some(st) => st.import_eml(&mut s.mailbox, &path, folder).map_err(store_err)?,
-                None => {
-                    let item = mailcraft_store::import::read_eml(&path, folder).map_err(store_err)?;
-                    mailcraft_store::import::insert_item(&mut s.mailbox, item).map_err(store_err)?
-                }
-            };
+            let id = mailcraft_store::import::import_eml(&mut s.mailbox, &mut s.bodies, &path, folder)
+                .map_err(store_err)?;
             Ok(json!({"imported": 1, "ids": [id.0], "folder": folder.0}))
         }
         "importMsg" => {
             let folder = mail_folder(s, p)?;
             let data = crate::cmd::rules::read_file_capped(&path, MAX_IMPORT_FILE)?;
-            let item = mailcraft_formats::msg::read_item(&data, folder, now).map_err(format_err)?;
+            let (mut item, content) =
+                mailcraft_formats::msg::read_item(&data, folder, now).map_err(format_err)?;
+            s.store_content(&mut item, &content)?;
             let id = mailcraft_store::import::insert_item(&mut s.mailbox, item).map_err(store_err)?;
             Ok(json!({"imported": 1, "ids": [id.0], "folder": folder.0}))
         }
         "importMbox" | "importMaildir" => {
             let folder = mail_folder(s, p)?;
             let ids = if action == "importMbox" {
-                mailcraft_store::import_mbox(&mut s.mailbox, &path, folder)
+                mailcraft_store::import_mbox(&mut s.mailbox, &mut s.bodies, &path, folder)
             } else {
-                mailcraft_store::import_maildir(&mut s.mailbox, &path, folder)
+                mailcraft_store::import_maildir(&mut s.mailbox, &mut s.bodies, &path, folder)
             }
             .map_err(store_err)?;
             Ok(json!({"imported": ids.len(), "folder": folder.0}))
@@ -363,13 +360,12 @@ fn open_export(s: &mut Session, p: &Value) -> CmdResult {
         }
         "exportMbox" => {
             let folder = mail_folder(s, p)?;
+            let ids: Vec<ItemId> = s.mailbox.items_in(folder).iter().map(|m| m.id).collect();
+            crate::sync::cmds::need_content(s, &ids, "exported")?;
             let mut items: Vec<&MailItem> = s.mailbox.items_in(folder);
             items.sort_by_key(|m| (m.received.unix, m.id));
             let n = items.len();
-            match s.store.as_ref() {
-                Some(st) => st.export_mbox(&items, &path).map_err(store_err)?,
-                None => mailcraft_store::export_mbox(&items, &path).map_err(store_err)?,
-            }
+            mailcraft_store::export_mbox(&items, &s.bodies, &path).map_err(store_err)?;
             Ok(json!({"exported": n, "path": path.display().to_string()}))
         }
         "exportIcs" => {
@@ -405,17 +401,12 @@ fn open_export(s: &mut Session, p: &Value) -> CmdResult {
     }
 }
 
-/// Raw RFC 5322 source of an item: kept bytes, else the blob store, else rebuilt from its fields.
+/// Raw RFC 5322 source of an item: its stored source, else rebuilt from its fields and body.
 pub(crate) fn raw_source(s: &Session, m: &MailItem) -> Vec<u8> {
-    if let Some(raw) = &m.raw {
-        return raw.clone();
-    }
-    if let Some(st) = &s.store
-        && let Ok(Some(raw)) = st.raw_of(m)
-    {
+    if let Some(raw) = crate::cmd::compose::stored_raw(s, m) {
         return raw;
     }
-    mailcraft_store::rebuild_message(m)
+    mailcraft_store::rebuild_message(m, Some(&s.body_or_empty(m)))
 }
 
 /// Safe file name from a subject ("Untitled" when empty).
@@ -472,11 +463,9 @@ fn save_headers(m: &MailItem) -> Vec<(&'static str, String)> {
 fn save_bytes(s: &Session, m: &MailItem, kind: &str) -> Result<Vec<u8>, CmdError> {
     Ok(match kind {
         "msg" => {
-            let mut item = m.clone();
-            if item.raw.is_none() {
-                item.raw = Some(raw_source(s, m));
-            }
-            mailcraft_formats::msg::write_item(&item).map_err(format_err)?
+            let raw = raw_source(s, m);
+            let body = s.body_or_empty(m);
+            mailcraft_formats::msg::write_item(m, Some(&raw), Some(&body)).map_err(format_err)?
         }
         "txt" => {
             let mut out = String::new();
@@ -484,13 +473,14 @@ fn save_bytes(s: &Session, m: &MailItem, kind: &str) -> Result<Vec<u8>, CmdError
                 out.push_str(&format!("{k}:\t{v}\r\n"));
             }
             out.push_str("\r\n");
-            out.push_str(&m.body_text().replace("\r\n", "\n").replace('\n', "\r\n"));
+            out.push_str(&s.body_text(m).replace("\r\n", "\n").replace('\n', "\r\n"));
             out.into_bytes()
         }
         "html" => {
-            let body = match &m.body.html {
+            let content = s.body_or_empty(m);
+            let body = match &content.html {
                 Some(h) => mailcraft_html::doc_to_html(&mailcraft_html::html_to_doc(h)),
-                None => mailcraft_html::text_to_html(&m.body_text()),
+                None => mailcraft_html::text_to_html(&content.plain_text()),
             };
             let mut out = format!(
                 "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>{}</title></head><body>\n<table>\n",
@@ -539,6 +529,10 @@ fn save_as(s: &mut Session, p: &Value) -> CmdResult {
     if path.is_dir() {
         path = unique_path(&path, &format!("{}.{kind}", file_stem(&m.subject)));
     }
+    crate::sync::cmds::need_content(s, &[id], "saved")?;
+    let Some(m) = s.mailbox.mail.get(id) else {
+        return Err(CmdError::Disabled("no message selected".into()));
+    };
     let data = save_bytes(s, m, &kind)?;
     write_file(&path, &data)?;
     Ok(json!({"path": path.display().to_string(), "bytes": data.len(), "type": kind}))
@@ -576,7 +570,7 @@ fn save_attachments(s: &mut Session, p: &Value) -> CmdResult {
     let mut missing = 0usize;
     for id in &ids {
         let Some(m) = s.mailbox.mail.get(*id) else { continue };
-        if m.raw.is_none() && m.blob.is_none() {
+        if m.blob.is_none() {
             missing = missing.saturating_add(1);
             continue;
         }
@@ -1420,17 +1414,29 @@ mod tests {
         let other_inbox = s.mailbox.role_folder(other, FolderRole::Inbox).unwrap();
         let secret = b"From: a@example.com\r\nSubject: Q\r\n\r\nTopsecret-body-7f3a\r\n".to_vec();
         let shared = b"From: b@example.org\r\nSubject: S\r\n\r\nShared-body-91c2\r\n".to_vec();
-        s.mailbox.add_mail(MailItem { folder: inbox, raw: Some(secret), ..Default::default() });
-        s.mailbox.add_mail(MailItem { folder: inbox, raw: Some(shared.clone()), ..Default::default() });
-        s.mailbox.add_mail(MailItem { folder: other_inbox, raw: Some(shared), ..Default::default() });
+        s.add_message(
+            MailItem { folder: inbox, ..Default::default() },
+            &mailcraft_store::Content::source(secret),
+        )
+        .unwrap();
+        s.add_message(
+            MailItem { folder: inbox, ..Default::default() },
+            &mailcraft_store::Content::source(shared.clone()),
+        )
+        .unwrap();
+        s.add_message(
+            MailItem { folder: other_inbox, ..Default::default() },
+            &mailcraft_store::Content::source(shared),
+        )
+        .unwrap();
         // A message deleted for good from the protected data file while it was open.
-        let deleted = MailItem {
+        let mut deleted = MailItem {
             id: ItemId(900_001),
             folder: inbox,
             subject: "Deleted-plan-55e1".into(),
-            raw: Some(b"Subject: D\r\n\r\nDeleted-src-55e1\r\n".to_vec()),
             ..Default::default()
         };
+        s.store_source(&mut deleted, b"Subject: D\r\n\r\nDeleted-src-55e1\r\n").unwrap();
         let now = s.now().unix;
         s.recover.bin.add(mailcraft_model::DeletedItem::Mail(Box::new(deleted)), "Inbox", now);
         s.store.as_mut().unwrap().save_recoverable(&mut s.recover.bin).unwrap();
@@ -1475,12 +1481,12 @@ mod tests {
         let id = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
         let inbox = s.mailbox.role_folder(id, FolderRole::Inbox).unwrap();
         let sub = s.mailbox.create_folder(inbox, "Plans").unwrap();
-        s.mailbox.add_mail(MailItem {
-            folder: sub,
-            subject: "Gone-plan-6b2d".into(),
-            raw: Some(b"Subject: G\r\n\r\nGone-src-6b2d\r\n".to_vec()),
-            ..Default::default()
-        });
+        let item = MailItem { folder: sub, subject: "Gone-plan-6b2d".into(), ..Default::default() };
+        s.add_message(
+            item,
+            &mailcraft_store::Content::source(b"Subject: G\r\n\r\nGone-src-6b2d\r\n".to_vec()),
+        )
+        .unwrap();
         s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
         // The folder goes to Deleted Items, then is deleted for good from there, message and all.
         s.selection.folder = sub;
@@ -1587,7 +1593,10 @@ mod tests {
                     subject: "Orphan".into(),
                     ..Default::default()
                 },
-            ],
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
             tasks: vec![Task { folder: FolderId(98), subject: "Orphan task".into(), ..Default::default() }],
             ..Default::default()
         };
@@ -1663,7 +1672,7 @@ mod tests {
         let copy = dir.path().join("Shared (copy).mcdata");
         let subjects = |path: &Path| -> Vec<String> {
             let plain = crate::datafile::unseal(&std::fs::read(path).unwrap(), "pw-1").unwrap();
-            crate::datafile::parse(&plain).unwrap().mail.into_iter().map(|m| m.subject).collect()
+            crate::datafile::parse(&plain).unwrap().mail.into_iter().map(|m| m.item.subject).collect()
         };
         assert_eq!(subjects(&file), ["From A"]);
         assert_eq!(subjects(&copy), ["From B"], "this side went to a copy, protected all the same");
@@ -1689,7 +1698,7 @@ mod tests {
         let copy = dir.path().join("Shared (copy).mcdata");
         let subjects = |path: &Path| -> Vec<String> {
             let image = crate::datafile::parse(&std::fs::read(path).unwrap()).unwrap();
-            let mut v: Vec<String> = image.mail.into_iter().map(|m| m.subject).collect();
+            let mut v: Vec<String> = image.mail.into_iter().map(|m| m.item.subject).collect();
             v.sort();
             v
         };
@@ -1844,15 +1853,10 @@ mod tests {
         let acct = AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
         let inbox = s.mailbox.role_folder(acct, FolderRole::Inbox).unwrap();
         let sub = s.mailbox.create_folder(inbox, "Receipts").unwrap();
-        let item = s.mailbox.add_mail(MailItem {
-            folder: sub,
-            subject: "Report: Q3/Q4".into(),
-            raw: Some(EML.to_vec()),
-            ..Default::default()
-        });
-        // The source moves to the blob store, as it does for downloaded mail.
-        s.store.as_mut().unwrap().checkpoint_mut(&mut s.mailbox, true).unwrap();
-        assert!(s.mailbox.mail.get(item).unwrap().raw.is_none());
+        let item = MailItem { folder: sub, subject: "Report: Q3/Q4".into(), ..Default::default() };
+        let item = s.add_message(item, &mailcraft_store::Content::source(EML.to_vec())).unwrap();
+        // The source is in the body store, as it is for downloaded mail.
+        assert!(s.mailbox.mail.get(item).unwrap().blob.is_some());
         let r = s.run("file.closeDataFile", &json!({"store": acct.0, "confirm": true})).unwrap();
         let path = std::path::PathBuf::from(r["path"].as_str().unwrap());
         assert!(path.starts_with(dir.path().join(crate::datafile::CLOSED_DIR)));
@@ -1870,7 +1874,7 @@ mod tests {
         assert_eq!(m.subject, "Report: Q3/Q4");
         // The source travels with the closed data file (back in the store, it leaves memory again).
         assert_eq!(crate::cmd::compose::stored_raw(&s, m).as_deref(), Some(EML));
-        assert!(m.raw.is_none() && m.blob.is_some());
+        assert!(m.blob.is_some());
         assert!(!path.exists(), "an opened file is not offered again");
         assert!(crate::datafile::closed_entries(&s).is_empty());
         assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
@@ -1912,7 +1916,10 @@ mod tests {
                     subject: "orphan".into(),
                     ..Default::default()
                 },
-            ],
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&image).unwrap();
@@ -2140,7 +2147,10 @@ mod tests {
                     subject: "Response".into(),
                     ..Default::default()
                 },
-            ],
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
             tasks: vec![
                 Task {
                     id: ItemId(20),
@@ -2386,22 +2396,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exit_keeps_pending_ops_when_the_write_fails() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (mut s, inbox, _) = session();
         s.store = Some(mailcraft_store::Store::open(dir.path()).unwrap());
-        // A raw message must go to the blob store, which is made read-only so the journal write fails.
-        let item =
-            MailItem { id: ItemId(9_999), folder: inbox, raw: Some(EML.to_vec()), ..Default::default() };
+        // A journal capped at one byte refuses the write.
+        let item = MailItem { id: ItemId(9_999), folder: inbox, ..Default::default() };
         s.pending_ops.push(mailcraft_store::Op::PutMail(Box::new(item)));
-        let blobs = dir.path().join("blobs");
-        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let r = s.run("file.exit", &json!({}));
-        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if r.is_ok() {
-            // Permissions are not enforced (running as root): nothing to check.
-            return;
-        }
+        s.store.as_mut().unwrap().set_journal_cap(1);
+        assert!(s.run("file.exit", &json!({})).is_err());
         assert_eq!(s.pending_ops.len(), 1, "unsaved changes must stay queued for the next attempt");
     }
 

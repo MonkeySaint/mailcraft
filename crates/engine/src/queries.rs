@@ -354,7 +354,7 @@ pub fn view_settings(s: &Session, folder: FolderId) -> ViewSettings {
 
 /// What marks me as mentioned in a message, lower-case: my addresses (for mailto links) and the "@" tokens
 /// that address me ("@" + each address's local part, "@" + each account's sender name).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash)]
 pub struct MentionNeedles {
     pub addresses: Vec<String>,
     pub tokens: Vec<String>,
@@ -510,16 +510,25 @@ fn html_mentions(html: &str, addresses: &[String]) -> bool {
 /// "@Name"; in text, "@" + my name or my address's local part as a word of its own. Only what the sender
 /// wrote counts: quoted reply history (where my address appears in every header block) is left out.
 pub fn mentions_me(s: &Session, item: &MailItem) -> bool {
-    mentions_with(&mention_needles(s), item)
+    let needles = mention_needles(s);
+    mentions_cached(s, &needles, crate::content::test_key(&(MENTION_TEST, &needles)), item)
 }
 
-fn mentions_with(needles: &MentionNeedles, item: &MailItem) -> bool {
-    if let Some(html) = &item.body.html
+/// Tag of the @Mentioned body test ([`Session::body_test`]).
+const MENTION_TEST: u8 = 1;
+
+/// [`mentions_with`] on `item`'s body, remembered per item and content (`key` from the needles).
+fn mentions_cached(s: &Session, needles: &MentionNeedles, key: u64, item: &MailItem) -> bool {
+    s.body_test(item, key, |b| mentions_with(needles, b))
+}
+
+fn mentions_with(needles: &MentionNeedles, body: &mailcraft_model::Body) -> bool {
+    if let Some(html) = &body.html
         && html_mentions(html, &needles.addresses)
     {
         return true;
     }
-    let text = item.body_text();
+    let text = body.plain_text();
     let text = scan_head(&text, MAX_MENTION_SCAN);
     let own = text.get(..history_start(text)).unwrap_or(text).to_lowercase();
     needles.tokens.iter().any(|t| has_token(&own, t))
@@ -553,7 +562,8 @@ fn view_items(s: &Session) -> (ViewSettings, Vec<&MailItem>) {
         ListFilter::Flagged => items.retain(|m| m.is_flagged()),
         ListFilter::Mentioned => {
             let needles = mention_needles(s);
-            items.retain(|m| mentions_with(&needles, m));
+            let key = crate::content::test_key(&(MENTION_TEST, &needles));
+            items.retain(|m| mentions_cached(s, &needles, key, m));
         }
     }
     // View Settings › Filter.
@@ -2302,16 +2312,16 @@ mod tests {
             let m = MailItem {
                 folder: inbox,
                 subject: if n == 0 { "Budget budget".into() } else { format!("Note {n}") },
-                body: mailcraft_model::Body {
-                    format: mailcraft_model::BodyFormat::PlainText,
-                    text: Some(text.into()),
-                    html: None,
-                },
                 received: DateTime::from_unix(now.unix - 86_400 * (10 - n), 0),
                 read: true,
                 ..Default::default()
             };
-            let id = s.mailbox.add_mail(m);
+            let body = mailcraft_model::Body {
+                format: mailcraft_model::BodyFormat::PlainText,
+                text: Some(text.into()),
+                html: None,
+            };
+            let id = s.add_message(m, &mailcraft_store::Content::body(body)).unwrap();
             if n == 0 {
                 best = id;
             }
@@ -2346,10 +2356,7 @@ mod tests {
         if let Some(a) = s.mailbox.accounts.first_mut() {
             a.kind = mailcraft_model::AccountKind::Imap;
         }
-        if let Some(m) = s.mailbox.mail.get_mut(best) {
-            m.body = mailcraft_model::Body::default();
-            m.raw = None;
-        }
+        s.set_source(best, None).unwrap();
         let notice = search_notice(&s).unwrap();
         assert!(notice.contains("1 message here was downloaded as headers only"), "{notice}");
         s.run("options.set", &serde_json::json!({"key": "search.notifyIncomplete", "value": false})).unwrap();
@@ -2429,9 +2436,8 @@ mod tests {
         let raw = b.build();
         let msg = mailcraft_mime::parse(&raw).unwrap();
         let mut item = MailItem::from_message(&msg, &raw, s.now());
-        item.raw = Some(raw);
         item.folder = s.selection.folder;
-        let id = s.mailbox.add_mail(item);
+        let id = s.add_message(item, &mailcraft_store::Content::source(raw)).unwrap();
         assert_eq!(inline_pictures(&s, id), vec![("cid:logo@example.com".to_owned(), png)]);
         // Messages without Content-IDs, and unknown ids, have none.
         let plain = s.mailbox.mail.ids().find(|k| *k != id).unwrap();
@@ -2647,12 +2653,9 @@ mod tests {
     fn mentions_ignore_quoted_history_and_plain_addresses() {
         let s = sample_session();
         let needles = mention_needles(&s);
-        let mail = |text: &str, html: Option<&str>| MailItem {
-            body: mailcraft_model::Body {
-                text: Some(text.into()),
-                html: html.map(str::to_owned),
-                ..Default::default()
-            },
+        let mail = |text: &str, html: Option<&str>| mailcraft_model::Body {
+            text: Some(text.into()),
+            html: html.map(str::to_owned),
             ..Default::default()
         };
         // A reply quoting a header block that names me is not a mention.
@@ -2688,14 +2691,48 @@ mod tests {
         );
     }
 
+    /// Regression: the @Mentioned filter and View Settings › Filter's words in the body read every body of
+    /// the folder from the body store each time the list was built. The results are remembered per item and
+    /// content now; a changed body is tested again.
+    #[test]
+    fn body_filters_read_each_body_once() {
+        let mut s = sample_session();
+        let ids: Vec<ItemId> =
+            s.mailbox.mail.items().filter(|m| m.blob.is_some()).map(|m| m.id).take(5).collect();
+        assert!(ids.len() >= 3);
+        s.bodies.set_cache_cap(1);
+        let words = crate::cmd::view::mail::CustomFilter {
+            words: "zyzzyva".into(),
+            in_body: true,
+            ..Default::default()
+        };
+        let round = |s: &Session| {
+            for id in &ids {
+                let m = s.mailbox.mail.get(*id).unwrap();
+                mentions_me(s, m);
+                words.matches(s, m);
+            }
+        };
+        round(&s);
+        let misses = s.bodies.cache_stats().misses;
+        round(&s);
+        assert_eq!(s.bodies.cache_stats().misses, misses, "no body read again");
+        // A body changed here is tested again.
+        let first = ids[0];
+        s.edit_body(first, |b| b.text = Some("Ask @jordan.lee about zyzzyva".into())).unwrap();
+        let m = s.mailbox.mail.get(first).unwrap();
+        assert!(mentions_me(&s, m) && words.matches(&s, m));
+    }
+
     /// Regression: hostile HTML (a megabyte of `mailto:` with no closing tag, a multibyte character at the
     /// scan cap) made the Mentioned filter quadratic and let the cap fall back to the whole body.
     #[test]
     fn mention_scan_is_bounded_on_hostile_bodies() {
         let s = sample_session();
         let needles = mention_needles(&s);
-        let mail = |text: &str, html: Option<String>| MailItem {
-            body: mailcraft_model::Body { text: Some(text.into()), html, ..Default::default() },
+        let mail = |text: &str, html: Option<String>| mailcraft_model::Body {
+            text: Some(text.into()),
+            html,
             ..Default::default()
         };
         let started = std::time::Instant::now();

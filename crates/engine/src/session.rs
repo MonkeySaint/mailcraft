@@ -217,6 +217,10 @@ pub struct Session {
     pub tz_offset_min: i32,
     /// Persistent store (None = in-memory session).
     pub store: Option<mailcraft_store::Store>,
+    /// Message bodies and sources (storage stage S5): on disk in the profile folder, in memory without one.
+    /// Items refer to their content by key; read it with [`Session::body`] and [`Session::source`]
+    /// (`content.rs`).
+    pub bodies: mailcraft_store::BodyStore,
     /// Ops not yet written to the store.
     pub pending_ops: Vec<mailcraft_store::Op>,
     /// The user's own addresses (lower-case) for "me" rules and Reply All.
@@ -241,8 +245,7 @@ pub struct Session {
     pub(crate) revision: u64,
     /// Folder counts memoised per [`Session::mailbox_revision`] (`counts.rs`).
     pub(crate) counts: crate::counts::CountsMemo,
-    /// Message sources the store now holds (item, blob key), not yet dropped from memory, and what the session
-    /// told the user about writes the store refused.
+    /// What the session told the user about writes the store refused.
     store_guard: StoreGuard,
     /// Mutating commands running (one may run others); server changes are queued by the outermost one.
     run_depth: u32,
@@ -291,6 +294,9 @@ pub struct Session {
     pub translations: BTreeMap<ItemId, crate::translate::Translation>,
     /// Zoom of read windows zoomed on their own (message → percent; the others use `view.zoom`).
     pub read_zoom: BTreeMap<ItemId, u16>,
+    /// Messages open in read windows (kept up to date by the front end): the offline window keeps their
+    /// bodies.
+    pub open_messages: std::collections::BTreeSet<ItemId>,
     /// Messages Options › Language › Always translate already tried to translate this session.
     pub translate_tried: std::collections::BTreeSet<ItemId>,
     /// Connection settings for the translation server (`None` = its defaults; tests trust a local server).
@@ -315,6 +321,8 @@ pub struct Session {
     /// a read window's message, [`Session::enabled_for`]): those items. [`Session::target_ids`] answers
     /// with them, so "is something selected?" checks look at the items the command will act on.
     check_scope: std::sync::Mutex<Option<Vec<ItemId>>>,
+    /// Body tests of the message list's filters, remembered per item and content ([`Session::body_test`]).
+    pub(crate) body_tests: std::sync::Mutex<crate::content::BodyTests>,
 }
 
 /// Clears [`Session::check_scope`] when dropped (also when an enabled check panics).
@@ -345,9 +353,6 @@ pub const UNSAVED_TOO_LARGE: &str = "Your latest changes could not be saved: you
 /// Bookkeeping for the store's guard rails (issue #25).
 #[derive(Debug, Default)]
 struct StoreGuard {
-    /// Sources the journal now refers to by blob key: (item, key). The live items drop their copy once the
-    /// outermost command (or sync batch) is done ([`Session::release_sources`]).
-    stored: Vec<(ItemId, String)>,
     /// The user was told the store refused a write for size; cleared once a write of that kind succeeds.
     snapshot_refused: bool,
     journal_refused: bool,
@@ -401,6 +406,7 @@ impl Session {
             fixed_now: None,
             tz_offset_min: 0,
             store: None,
+            bodies: mailcraft_store::BodyStore::in_memory(),
             pending_ops: Vec::new(),
             me: Vec::new(),
             next_compose: 0,
@@ -432,6 +438,7 @@ impl Session {
             translations: BTreeMap::new(),
             translate_tried: std::collections::BTreeSet::new(),
             read_zoom: BTreeMap::new(),
+            open_messages: std::collections::BTreeSet::new(),
             #[cfg(not(target_arch = "wasm32"))]
             translator_options: None,
             background_translate: false,
@@ -441,6 +448,7 @@ impl Session {
             settings_saved: None,
             params_name_items: false,
             check_scope: std::sync::Mutex::new(None),
+            body_tests: std::sync::Mutex::new(crate::content::BodyTests::default()),
         };
         s.refresh_me();
         s.select_default_folder();
@@ -452,9 +460,16 @@ impl Session {
     pub fn open(dir: &std::path::Path) -> Result<Session, CmdError> {
         let mut store = mailcraft_store::Store::open(dir)
             .map_err(|e| CmdError::Failed(format!("cannot open the data folder {}: {e}", dir.display())))?;
-        let mut mailbox = store
-            .load()
+        let (mut mailbox, report) = store
+            .load_report()
             .map_err(|e| CmdError::Failed(format!("cannot read the data folder {}: {e}", dir.display())))?;
+        if report.legacy_content {
+            // Written before storage stage S5: the content it carried inline is in the body store now; a
+            // fresh snapshot drops it from the files (and keeps the next open from reading it again).
+            if let Err(e) = store.checkpoint(&mailbox) {
+                log::error!("could not write the snapshot without inline message content: {e}");
+            }
+        }
         // Junk lists from disk may be unsorted, duplicated or over the cap (older or hand-edited files);
         // adding to a list relies on it being sorted.
         mailbox.junk.sanitize();
@@ -468,6 +483,7 @@ impl Session {
         }
         let mut s = Session::new(mailbox);
         s.store = Some(store);
+        s.bodies = mailcraft_store::BodyStore::on_disk(dir);
         // View in Browser pages a crashed session left behind (the profile's lock is held now, so no other
         // session is using them).
         let swept = crate::browser::sweep_leftovers(&crate::browser::profile_base(dir));
@@ -486,6 +502,10 @@ impl Session {
         }
         s.load_settings(dir);
         crate::recover::load(&mut s);
+        // Content nothing refers to any more: earlier versions of drafts saved again and of edited bodies,
+        // rolled-back imports, content whose undo steps went with the last session. The history is empty and
+        // the bin is loaded, so everything still in use is known.
+        s.collect_content();
         crate::smime::load(&mut s);
         crate::datafile::note_linked_files(&mut s);
         // A named calendar time zone (Calendar › Time Zones) sets the display offset for today's DST rules.
@@ -999,6 +1019,16 @@ impl Session {
                 Err(CmdError::Failed(format!("command `{id}` panicked: {msg}")))
             }
         };
+        // A change that takes header-only messages off their server would expunge the only full copy: it is
+        // refused (rolled back below) and their download starts, so the same command works once they arrive.
+        let mut stranded = Vec::new();
+        let result = match (&result, &recording) {
+            (Ok(_), Some(r)) if self.run_depth == 0 => {
+                stranded = crate::sync::header_only_leaving(self, r);
+                if stranded.is_empty() { result } else { Err(CmdError::Failed(String::new())) }
+            }
+            _ => result,
+        };
         if let (Some(ids), Ok(_)) = (read_on_delete, &result) {
             // Options › Mail › "Mark messages as read when deleted" (part of the delete's undo step).
             self.mailbox.set_read(&ids, true);
@@ -1068,6 +1098,11 @@ impl Session {
         if self.run_depth == 0 {
             self.undo_barrier = false;
         }
+        let result = if stranded.is_empty() {
+            result
+        } else {
+            Err(crate::sync::cmds::not_downloaded(self, &stranded, "moved off the server"))
+        };
         if self.pending_ops.len() > pending_before {
             // Ops a command queued directly (without a mailbox diff, e.g. view-only changes, or Open marking
             // the message read): the search index must hear of them like journaled ones.
@@ -1081,7 +1116,6 @@ impl Session {
             if std::mem::take(&mut self.checkpoint_after) && self.checkpoint_now() && purge {
                 self.purge_unused_blobs();
             }
-            self.release_sources();
         }
         self.tidy_selection();
         self.sync_settings_from_session();
@@ -1164,10 +1198,9 @@ impl Session {
         let Some(store) = self.store.as_mut() else { return };
         let guard = &mut self.store_guard;
         let mut notices = Vec::new();
-        match store.append_keyed(&self.pending_ops) {
-            Ok(keys) => {
+        match store.append(&self.pending_ops) {
+            Ok(()) => {
                 self.pending_ops.clear();
-                guard.stored.extend(keys);
                 guard.journal_refused = false;
             }
             Err(e) => {
@@ -1220,28 +1253,6 @@ impl Session {
         self.notices.extend(notices);
     }
 
-    /// Drops from memory the message sources the store now holds (the live item keeps the blob key), once
-    /// the outermost command or sync batch is done: nothing in it reads the in-memory copy any more, and
-    /// undo steps taken before it keep their own copies. Sources that changed since they were stored stay.
-    pub(crate) fn release_sources(&mut self) {
-        if self.run_depth > 0 || self.store_guard.stored.is_empty() {
-            return;
-        }
-        for (id, key) in std::mem::take(&mut self.store_guard.stored) {
-            let Some(item) = self.mailbox.mail.get_mut(id) else { continue };
-            let same = item
-                .raw
-                .as_deref()
-                .is_some_and(|raw| mailcraft_store::BlobKey::parse(&key).is_some_and(|k| k.matches(raw)));
-            if same {
-                // Facts read from the source while painting rows (no file read) are noted first.
-                self.search.note_source_released(item, &key);
-                item.raw = None;
-                item.blob = Some(key);
-            }
-        }
-    }
-
     /// Folds the journal into a fresh snapshot of the mailbox now (when a store is attached and every queued
     /// change is written), so items that left the mailbox leave the journal and snapshot too. Message sources
     /// (content-addressed files next to the snapshot) are not touched.
@@ -1272,12 +1283,15 @@ impl Session {
         }
     }
 
-    /// Deletes the message sources in the store's blobs that nothing refers to any more (the mailbox, which
-    /// was just checkpointed, and the recoverable-items bin), e.g. those of a protected data file that was
-    /// closed. A source another item shares by content stays.
+    /// Deletes the message content in the store's blobs that nothing refers to any more (the mailbox, which
+    /// was just checkpointed, the recoverable-items bin in memory and on disk, and the undo history), e.g.
+    /// that of a protected data file that was closed. Content another item shares stays.
     pub(crate) fn purge_unused_blobs(&mut self) {
+        // The bin in memory too: entries a failed save left out of the file still need their content.
+        let also = self.content_keys_in_use();
         if let Some(store) = self.store.as_mut() {
-            match store.gc_blobs(&self.mailbox) {
+            self.bodies.clear_cache();
+            match store.gc_blobs(&self.mailbox, &also) {
                 Ok(n) => log::info!("removed {n} message sources nothing refers to any more"),
                 Err(e) => {
                     log::error!("could not remove unused message sources: {e}");
@@ -1287,6 +1301,25 @@ impl Session {
                     )));
                 }
             }
+        }
+    }
+
+    /// Removes the profile's stored content that nothing in this session refers to (see
+    /// [`Session::content_keys_in_use`]; the bin on disk is read too). Not while changes are still queued for
+    /// the store: what it holds may still name content memory no longer does.
+    pub(crate) fn collect_content(&mut self) {
+        if !self.pending_ops.is_empty() {
+            return;
+        }
+        let live = self.content_keys_in_use();
+        let Some(store) = self.store.as_mut() else { return };
+        match store.gc_blobs(&self.mailbox, &live) {
+            Ok(0) => {}
+            Ok(n) => {
+                self.bodies.clear_cache();
+                log::info!("removed {n} stored message content files nothing refers to any more");
+            }
+            Err(e) => log::warn!("could not remove unused message content: {e}"),
         }
     }
 

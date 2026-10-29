@@ -359,17 +359,7 @@ fn include_older_results_searches_the_server() {
     assert_eq!(r["downloading"], true);
     assert!(s.wait_for_sync(WAIT));
     assert!(!cmds::is_header_only(&s, old_id));
-    assert!(
-        s.mailbox
-            .mail
-            .get(old_id)
-            .unwrap()
-            .body
-            .text
-            .as_deref()
-            .unwrap_or_default()
-            .contains("archived figures")
-    );
+    assert!(s.body_text(s.mailbox.mail.get(old_id).unwrap()).contains("archived figures"));
 
     // Off again; the downloaded message now matches locally on its body text.
     assert_eq!(run(&mut s, "search.includeOlderResults", json!({"on": false}))["on"], false);
