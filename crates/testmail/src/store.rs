@@ -101,6 +101,8 @@ impl Msg {
 
 #[derive(Clone, Debug)]
 pub struct Mailbox {
+    /// Stable id (kept across renames; the JMAP server's mailbox id).
+    pub id: u64,
     pub name: String,
     pub special: Option<SpecialUse>,
     pub subscribed: bool,
@@ -234,6 +236,7 @@ pub struct Store {
     /// [`OTHER_USERS_PREFIX`].
     grants: BTreeSet<(String, String)>,
     next_uidvalidity: u32,
+    next_mailbox_id: u64,
     pub submissions: Vec<Submission>,
     /// Grants and tokens of the OAuth test server (see `oauth.rs`).
     pub oauth: crate::oauth::OAuthState,
@@ -273,6 +276,7 @@ impl Store {
             shared_mailboxes: BTreeMap::new(),
             grants: BTreeSet::new(),
             next_uidvalidity: uidvalidity_seed.max(1),
+            next_mailbox_id: 1,
             submissions: Vec::new(),
             oauth: Default::default(),
         }
@@ -412,7 +416,10 @@ impl Store {
     }
 
     fn new_mailbox(&mut self, name: String, special: Option<SpecialUse>) -> Mailbox {
+        let id = self.next_mailbox_id;
+        self.next_mailbox_id = self.next_mailbox_id.saturating_add(1);
         Mailbox {
+            id,
             name,
             special,
             subscribed: true,

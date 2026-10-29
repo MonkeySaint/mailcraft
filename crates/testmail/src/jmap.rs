@@ -1,8 +1,9 @@
 //! JMAP server (RFC 8620 core, RFC 8621 mail) over HTTP/1.1, on the same in-memory store as IMAP and POP3:
-//! the session resource (`/.well-known/jmap`), the API endpoint with Mailbox/get, Mailbox/changes,
+//! the session resource (`/.well-known/jmap`), the API endpoint with Mailbox/get, Mailbox/set, Mailbox/changes,
 //! Email/query, Email/get, Email/changes, Email/set (keywords, mailboxIds, destroy), Email/import,
 //! Identity/get and EmailSubmission/set (with `onSuccessUpdateEmail`; delivery like the SMTP server), plus blob
-//! upload and download.
+//! upload and download. With [`crate::Config::jmap_pim`]: AddressBook/get, ContactCard/get, /query, /set
+//! (RFC 9610) and Calendar/get, CalendarEvent/get, /query, /set (JMAP for Calendars) on objects kept as given.
 //!
 //! One account (`A`) per user; HTTP Basic authentication with the user's password, or a Bearer token equal to
 //! it (test convenience). Email ids are a hash of the message source and its internal date, so they survive
@@ -35,12 +36,90 @@ struct Snapshot {
     mailboxes: BTreeMap<String, (String, Option<String>)>,
 }
 
-/// JMAP-only state shared by all connections: uploaded blobs and per-user snapshots.
+/// JMAP-only state shared by all connections: uploaded blobs, per-user snapshots, contacts and events.
 #[derive(Default)]
 pub struct JmapState {
     blobs: BTreeMap<String, Vec<u8>>,
     snaps: BTreeMap<String, Vec<(u64, Snapshot)>>,
     next_state: u64,
+    /// (user key, object type) → id → object.
+    objects: BTreeMap<(String, String), BTreeMap<String, Value>>,
+    next_object: u64,
+    /// Bumped on every change of contacts or events (their state strings).
+    object_state: u64,
+}
+
+/// The address book and calendar every user has (`Config::jmap_pim`).
+const ADDRESS_BOOK: &str = "AB1";
+const CALENDAR: &str = "CAL1";
+
+/// The membership property and collection of a contacts / calendars object type.
+fn object_kind(kind: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match kind {
+        "ContactCard" => Some(("addressBookIds", ADDRESS_BOOK, "inAddressBook")),
+        "CalendarEvent" => Some(("calendarIds", CALENDAR, "inCalendar")),
+        _ => None,
+    }
+}
+
+/// Applies a PatchObject (RFC 8620 section 5.3: JSON-pointer keys, `null` removes) to `obj`.
+fn apply_patch(obj: &mut Value, patch: &Map<String, Value>) -> bool {
+    fn set_path(v: &mut Value, segs: &[String], val: &Value) -> bool {
+        let Some((first, rest)) = segs.split_first() else { return false };
+        let Some(m) = v.as_object_mut() else { return false };
+        if rest.is_empty() {
+            if val.is_null() {
+                m.remove(first);
+            } else {
+                m.insert(first.clone(), val.clone());
+            }
+            true
+        } else {
+            m.get_mut(first).is_some_and(|next| set_path(next, rest, val))
+        }
+    }
+    patch.iter().all(|(path, v)| {
+        let segs: Vec<String> = path.split('/').map(|s| s.replace("~1", "/").replace("~0", "~")).collect();
+        set_path(obj, &segs, v)
+    })
+}
+
+impl JmapState {
+    fn key(user: &str, kind: &str) -> (String, String) {
+        (user.trim().to_ascii_lowercase(), kind.to_owned())
+    }
+
+    pub(crate) fn objects(&self, user: &str, kind: &str) -> Vec<Value> {
+        self.objects.get(&Self::key(user, kind)).map(|m| m.values().cloned().collect()).unwrap_or_default()
+    }
+
+    pub(crate) fn put_object(&mut self, user: &str, kind: &str, mut obj: Value) -> String {
+        self.next_object = self.next_object.saturating_add(1);
+        let id = format!("o{}", self.next_object);
+        if let (Some(m), Some((member, coll, _))) = (obj.as_object_mut(), object_kind(kind)) {
+            m.insert("id".into(), json!(id));
+            m.entry(member).or_insert_with(|| json!({ coll: true }));
+            m.entry("uid").or_insert_with(|| json!(format!("uid-{id}")));
+        }
+        self.objects.entry(Self::key(user, kind)).or_default().insert(id.clone(), obj);
+        self.object_state = self.object_state.saturating_add(1);
+        id
+    }
+
+    pub(crate) fn update_object(&mut self, user: &str, kind: &str, id: &str, patch: &Value) -> bool {
+        let Some(obj) = self.objects.get_mut(&Self::key(user, kind)).and_then(|m| m.get_mut(id)) else {
+            return false;
+        };
+        let ok = patch.as_object().is_some_and(|p| apply_patch(obj, p));
+        self.object_state = self.object_state.saturating_add(1);
+        ok
+    }
+
+    pub(crate) fn delete_object(&mut self, user: &str, kind: &str, id: &str) -> bool {
+        let gone = self.objects.get_mut(&Self::key(user, kind)).and_then(|m| m.remove(id)).is_some();
+        self.object_state = self.object_state.saturating_add(1);
+        gone
+    }
 }
 
 pub type SharedJmap = Arc<Mutex<JmapState>>;
@@ -54,8 +133,15 @@ fn fnv(data: &[u8]) -> u64 {
     h
 }
 
-fn mailbox_id(name: &str) -> String {
-    format!("m{:016x}", fnv(name.as_bytes()))
+/// A mailbox's JMAP id: its stable store id (kept when it is renamed or moved).
+fn mailbox_id(mb: &crate::store::Mailbox) -> String {
+    format!("m{:x}", mb.id)
+}
+
+/// The id of the parent of mailbox `name` of `u`.
+fn parent_id(u: &crate::store::User, name: &str) -> Option<String> {
+    let (p, _) = name.rsplit_once('/')?;
+    u.mailbox(p).map(mailbox_id)
 }
 
 fn email_id(raw: &[u8], date: &DateTime) -> String {
@@ -117,12 +203,12 @@ fn snapshot(store: &Store, user: &str) -> Snapshot {
     let mut s = Snapshot::default();
     let Some(u) = store.user(user) else { return s };
     for mb in &u.mailboxes {
-        let parent = mb.name.rsplit_once('/').map(|(p, _)| mailbox_id(p));
+        let parent = parent_id(u, &mb.name);
         let leaf = mb.name.rsplit_once('/').map_or(mb.name.as_str(), |(_, l)| l).to_owned();
-        s.mailboxes.insert(mailbox_id(&mb.name), (leaf, parent));
+        s.mailboxes.insert(mailbox_id(mb), (leaf, parent));
         for m in &mb.messages {
             let e = s.emails.entry(email_id(&m.raw, &m.internal_date)).or_default();
-            e.0.push(mailbox_id(&mb.name));
+            e.0.push(mailbox_id(mb));
             let mut k: Vec<String> = m.flags.iter().map(|f| flag_to_keyword(f)).collect();
             k.sort();
             e.1 = k;
@@ -233,7 +319,7 @@ fn handle(conn: &mut Conn, ctx: &Ctx, jmap: &SharedJmap, req: &Request) -> io::R
             } else {
                 ""
             };
-            let v = json!({
+            let mut v = json!({
                 "capabilities": {
                     "urn:ietf:params:jmap:core": {
                         "maxSizeUpload": ctx.config.max_message_size, "maxConcurrentUpload": 4,
@@ -256,6 +342,19 @@ fn handle(conn: &mut Conn, ctx: &Ctx, jmap: &SharedJmap, req: &Request) -> io::R
                 "eventSourceUrl": events,
                 "state": "s0",
             });
+            if ctx.config.jmap_pim {
+                for cap in ["urn:ietf:params:jmap:contacts", "urn:ietf:params:jmap:calendars"] {
+                    for (path, value) in [
+                        ("/capabilities".to_owned(), json!({})),
+                        (format!("/accounts/{ACCOUNT}/accountCapabilities"), json!({})),
+                        ("/primaryAccounts".to_owned(), json!(ACCOUNT)),
+                    ] {
+                        if let Some(m) = v.pointer_mut(&path).and_then(Value::as_object_mut) {
+                            m.insert(cap.to_owned(), value);
+                        }
+                    }
+                }
+            }
             respond_json(conn, "200 OK", &v)
         }
         ("GET", "/jmap/eventsource") if ctx.config.jmap_push => event_source(conn, ctx, jmap, &user, req),
@@ -397,12 +496,30 @@ fn api(ctx: &Ctx, jmap: &SharedJmap, user: &str, body: &Value) -> Value {
         let extra;
         let (rname, rargs) = match name.as_str() {
             "Mailbox/get" => (name.clone(), mailbox_get(ctx, jmap, user)),
+            "Mailbox/set" => (name.clone(), mailbox_set(ctx, jmap, user, &args)),
             "Mailbox/changes" | "Email/changes" => (name.clone(), changes(ctx, jmap, user, &name, &args)),
             "Email/query" => (name.clone(), email_query(ctx, jmap, user, &args)),
             "Email/get" => (name.clone(), email_get(ctx, jmap, user, &args)),
             "Email/set" => (name.clone(), email_set(ctx, jmap, user, &args)),
             "Email/import" => (name.clone(), email_import(ctx, jmap, user, &args)),
             "Quota/get" => (name.clone(), quota_get(ctx, user)),
+            "AddressBook/get" | "Calendar/get" if ctx.config.jmap_pim => {
+                let (id, label) = if name == "AddressBook/get" {
+                    (ADDRESS_BOOK, "Contacts")
+                } else {
+                    (CALENDAR, "Calendar")
+                };
+                (
+                    name.clone(),
+                    json!({"accountId": ACCOUNT, "state": "c0", "notFound": [],
+                        "list": [{"id": id, "name": label, "isDefault": true, "sortOrder": 0}]}),
+                )
+            }
+            n if ctx.config.jmap_pim
+                && (n.starts_with("ContactCard/") || n.starts_with("CalendarEvent/")) =>
+            {
+                (name.clone(), objects_call(jmap, user, n, &args))
+            }
             "Identity/get" => (
                 name.clone(),
                 json!({"accountId": ACCOUNT, "state": "i0", "notFound": [],
@@ -461,10 +578,10 @@ fn mailbox_get(ctx: &Ctx, jmap: &SharedJmap, user: &str) -> Value {
                 .iter()
                 .enumerate()
                 .map(|(i, mb)| {
-                    let parent = mb.name.rsplit_once('/').map(|(p, _)| mailbox_id(p));
+                    let parent = parent_id(u, &mb.name);
                     let leaf = mb.name.rsplit_once('/').map_or(mb.name.as_str(), |(_, l)| l);
                     json!({
-                        "id": mailbox_id(&mb.name), "name": leaf, "parentId": parent,
+                        "id": mailbox_id(mb), "name": leaf, "parentId": parent,
                         "role": role(&mb.name, mb.special), "sortOrder": i,
                         "totalEmails": mb.messages.len(), "unreadEmails": mb.unseen(),
                         "isSubscribed": mb.subscribed,
@@ -474,6 +591,226 @@ fn mailbox_get(ctx: &Ctx, jmap: &SharedJmap, user: &str) -> Value {
         })
         .unwrap_or_default();
     json!({"accountId": ACCOUNT, "state": state, "list": list, "notFound": []})
+}
+
+/// ContactCard/* and CalendarEvent/* (get, query, set) on the objects kept for `user`.
+fn objects_call(jmap: &SharedJmap, user: &str, name: &str, args: &Value) -> Value {
+    let Some((kind, method)) = name.split_once('/') else { return json!({"__error": "unknownMethod"}) };
+    let Some((member, coll, filter_key)) = object_kind(kind) else {
+        return json!({"__error": "unknownMethod"});
+    };
+    let mut st = jmap.lock().unwrap_or_else(|e| e.into_inner());
+    let old_state = format!("o{}", st.object_state);
+    match method {
+        "get" => {
+            let all = st.objects(user, kind);
+            let (list, not_found): (Vec<Value>, Vec<Value>) = match args.get("ids").and_then(Value::as_array)
+            {
+                None => (all, Vec::new()),
+                Some(ids) => {
+                    let mut list = Vec::new();
+                    let mut missing = Vec::new();
+                    for id in ids {
+                        match all.iter().find(|o| o.get("id") == Some(id)) {
+                            Some(o) => list.push(o.clone()),
+                            None => missing.push(id.clone()),
+                        }
+                    }
+                    (list, missing)
+                }
+            };
+            json!({"accountId": ACCOUNT, "state": old_state, "list": list, "notFound": not_found})
+        }
+        "query" => {
+            let want = args.get("filter").and_then(|f| f.get(filter_key)).and_then(Value::as_str);
+            let ids: Vec<Value> = st
+                .objects(user, kind)
+                .into_iter()
+                .filter(|o| want.is_none_or(|w| o.get(member).and_then(|m| m.get(w)).is_some()))
+                .filter_map(|o| o.get("id").cloned())
+                .collect();
+            let total = ids.len();
+            let pos = args.get("position").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(u64::MAX).min(10_000) as usize;
+            let page: Vec<Value> = ids.into_iter().skip(pos).take(limit).collect();
+            json!({"accountId": ACCOUNT, "queryState": old_state, "canCalculateChanges": false, "position": pos,
+                "ids": page, "total": total})
+        }
+        "set" => {
+            let mut created = Map::new();
+            let mut not_created = Map::new();
+            let mut updated = Map::new();
+            let mut not_updated = Map::new();
+            let mut destroyed = Vec::new();
+            let mut not_destroyed = Map::new();
+            for (cid, obj) in args.get("create").and_then(Value::as_object).cloned().unwrap_or_default() {
+                let in_coll =
+                    obj.get(member).and_then(|m| m.get(coll)).and_then(Value::as_bool) == Some(true);
+                if !obj.is_object() || !in_coll {
+                    not_created.insert(cid, json!({"type": "invalidProperties", "properties": [member]}));
+                    continue;
+                }
+                let id = st.put_object(user, kind, obj);
+                created.insert(cid, json!({"id": id}));
+            }
+            for (id, patch) in args.get("update").and_then(Value::as_object).cloned().unwrap_or_default() {
+                if st.update_object(user, kind, &id, &patch) {
+                    updated.insert(id, Value::Null);
+                } else {
+                    not_updated.insert(id, json!({"type": "notFound"}));
+                }
+            }
+            for id in args.get("destroy").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let id = id.as_str().unwrap_or("").to_owned();
+                if st.delete_object(user, kind, &id) {
+                    destroyed.push(id);
+                } else {
+                    not_destroyed.insert(id, json!({"type": "notFound"}));
+                }
+            }
+            json!({"accountId": ACCOUNT, "oldState": old_state, "newState": format!("o{}", st.object_state),
+                "created": created, "notCreated": not_created, "updated": updated, "notUpdated": not_updated,
+                "destroyed": destroyed, "notDestroyed": not_destroyed})
+        }
+        _ => json!({"__error": "unknownMethod"}),
+    }
+}
+
+/// The store name of the mailbox with JMAP id `id`.
+fn mailbox_name(store: &Store, user: &str, id: &str) -> Option<String> {
+    store.user(user)?.mailboxes.iter().find(|m| mailbox_id(m) == id).map(|m| m.name.clone())
+}
+
+/// Mailbox/set (RFC 8621 section 2.5): create (`name`, `parentId` (an id, or `#creationId` of a mailbox
+/// created earlier in the same call), `role`), update (`name`, `parentId`: renames and moves keep the id) and
+/// destroy (refused while the mailbox has children, or emails unless `onDestroyRemoveEmails`).
+fn mailbox_set(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value {
+    let (old_state, _) = current_state(ctx, jmap, user);
+    let mut created = Map::new();
+    let mut not_created = Map::new();
+    let mut updated = Map::new();
+    let mut not_updated = Map::new();
+    let mut destroyed = Vec::new();
+    let mut not_destroyed = Map::new();
+    let mut refs: BTreeMap<String, String> = BTreeMap::new();
+    let mut store = ctx.shared.lock();
+    let fail = |kind: &str| json!({"type": kind});
+    // A parentId value: `Ok(None)` top level, `Ok(Some(store name))`, `Err` an unknown mailbox.
+    let parent_of =
+        |store: &Store, refs: &BTreeMap<String, String>, v: &Value| -> Result<Option<String>, ()> {
+            match v {
+                Value::Null => Ok(None),
+                Value::String(id) => {
+                    let id =
+                        id.strip_prefix('#').and_then(|c| refs.get(c)).map_or(id.as_str(), String::as_str);
+                    mailbox_name(store, user, id).map(Some).ok_or(())
+                }
+                _ => Err(()),
+            }
+        };
+    let valid_leaf = |n: &str| !n.trim().is_empty() && !n.contains('/') && !n.chars().any(char::is_control);
+    if let Some(create) = args.get("create").and_then(Value::as_object) {
+        for (cid, c) in create {
+            let leaf = c.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+            let Ok(parent) = parent_of(&store, &refs, c.get("parentId").unwrap_or(&Value::Null)) else {
+                not_created.insert(cid.clone(), fail("invalidProperties"));
+                continue;
+            };
+            if !valid_leaf(&leaf)
+                || (ctx.config.jmap_refuse_roles && c.get("role").is_some_and(|r| !r.is_null()))
+            {
+                not_created.insert(cid.clone(), fail("invalidProperties"));
+                continue;
+            }
+            let special = match c.get("role").and_then(Value::as_str) {
+                Some("archive") => Some(SpecialUse::Archive),
+                Some("sent") => Some(SpecialUse::Sent),
+                Some("drafts") => Some(SpecialUse::Drafts),
+                Some("trash") => Some(SpecialUse::Trash),
+                Some("junk") => Some(SpecialUse::Junk),
+                _ => None,
+            };
+            let full = parent.map_or(leaf.clone(), |p| format!("{p}/{leaf}"));
+            match store.create_mailbox(user, &full, special) {
+                Ok(()) => {
+                    let id =
+                        store.user(user).and_then(|u| u.mailbox(&full)).map(mailbox_id).unwrap_or_default();
+                    refs.insert(cid.clone(), id.clone());
+                    created.insert(cid.clone(), json!({"id": id}));
+                }
+                Err(_) => {
+                    not_created.insert(cid.clone(), fail("invalidProperties"));
+                }
+            }
+        }
+    }
+    if let Some(update) = args.get("update").and_then(Value::as_object) {
+        for (id, patch) in update {
+            let Some(old) = mailbox_name(&store, user, id) else {
+                not_updated.insert(id.clone(), fail("notFound"));
+                continue;
+            };
+            let (cur_parent, cur_leaf) = match old.rsplit_once('/') {
+                Some((p, l)) => (Some(p.to_owned()), l.to_owned()),
+                None => (None, old.clone()),
+            };
+            let leaf = patch.get("name").and_then(Value::as_str).map_or(cur_leaf, str::to_owned);
+            let parent = match patch.get("parentId") {
+                Some(v) => match parent_of(&store, &refs, v) {
+                    Ok(p) => p,
+                    Err(()) => {
+                        not_updated.insert(id.clone(), fail("invalidProperties"));
+                        continue;
+                    }
+                },
+                None => cur_parent,
+            };
+            if !valid_leaf(&leaf) {
+                not_updated.insert(id.clone(), fail("invalidProperties"));
+                continue;
+            }
+            let full = parent.map_or(leaf.clone(), |p| format!("{p}/{leaf}"));
+            if full == old || store.rename_mailbox(user, &old, &full).is_ok() {
+                updated.insert(id.clone(), Value::Null);
+            } else {
+                not_updated.insert(id.clone(), fail("invalidProperties"));
+            }
+        }
+    }
+    let remove_emails = args.get("onDestroyRemoveEmails").and_then(Value::as_bool).unwrap_or(false);
+    for id in args.get("destroy").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let id = id.as_str().unwrap_or("").to_owned();
+        let Some(name) = mailbox_name(&store, user, &id) else {
+            not_destroyed.insert(id, fail("notFound"));
+            continue;
+        };
+        let (children, emails) = store
+            .user(user)
+            .map(|u| (u.has_children(&name), u.mailbox(&name).is_some_and(|m| !m.messages.is_empty())))
+            .unwrap_or((false, false));
+        let refusal = if children {
+            Some("mailboxHasChild")
+        } else if emails && !remove_emails {
+            Some("mailboxHasEmail")
+        } else {
+            None
+        };
+        match refusal {
+            Some(kind) => {
+                not_destroyed.insert(id, fail(kind));
+            }
+            None if store.delete_mailbox(user, &name).is_ok() => destroyed.push(id),
+            None => {
+                not_destroyed.insert(id, fail("forbidden"));
+            }
+        }
+    }
+    drop(store);
+    ctx.shared.notify();
+    let (new_state, _) = current_state(ctx, jmap, user);
+    json!({"accountId": ACCOUNT, "oldState": old_state, "newState": new_state, "created": created,
+        "notCreated": not_created, "updated": updated, "notUpdated": not_updated, "destroyed": destroyed,
+        "notDestroyed": not_destroyed})
 }
 
 fn changes(ctx: &Ctx, jmap: &SharedJmap, user: &str, name: &str, args: &Value) -> Value {
@@ -541,7 +878,7 @@ fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value 
     let mut seen = BTreeSet::new();
     if let Some(u) = store.user(user) {
         for mb in &u.mailboxes {
-            if in_mailbox.as_ref().is_some_and(|m| *m != mailbox_id(&mb.name)) {
+            if in_mailbox.as_ref().is_some_and(|m| *m != mailbox_id(mb)) {
                 continue;
             }
             for m in &mb.messages {
@@ -550,7 +887,7 @@ fn email_query(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value 
                     continue;
                 }
                 if let Some(f) = args.get("filter")
-                    && !filter_matches(f, m, &mailbox_id(&mb.name), 0)
+                    && !filter_matches(f, m, &mailbox_id(mb), 0)
                 {
                     continue;
                 }
@@ -660,7 +997,7 @@ fn email_get(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value {
             for mb in &u.mailboxes {
                 for m in &mb.messages {
                     if email_id(&m.raw, &m.internal_date) == id {
-                        mailboxes.insert(mailbox_id(&mb.name), json!(true));
+                        mailboxes.insert(mailbox_id(mb), json!(true));
                         found = Some((m.flags.clone(), m.raw.len(), m.internal_date.unix));
                     }
                 }
@@ -691,7 +1028,7 @@ fn update_email(store: &mut Store, user: &str, id: &str, patch: &Value) -> Resul
     let mut target: Option<String> = None;
     let names: BTreeMap<String, String> = store
         .user(user)
-        .map(|u| u.mailboxes.iter().map(|m| (mailbox_id(&m.name), m.name.clone())).collect())
+        .map(|u| u.mailboxes.iter().map(|m| (mailbox_id(m), m.name.clone())).collect())
         .unwrap_or_default();
     for (k, v) in obj {
         if k == "keywords" {
@@ -807,9 +1144,9 @@ fn email_import(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value
             .unwrap_or_default();
         let now = DateTime::now();
         let mut store = ctx.shared.lock();
-        let name = store.user(user).and_then(|u| {
-            u.mailboxes.iter().find(|m| Some(mailbox_id(&m.name)) == mb_id).map(|m| m.name.clone())
-        });
+        let name = store
+            .user(user)
+            .and_then(|u| u.mailboxes.iter().find(|m| Some(mailbox_id(m)) == mb_id).map(|m| m.name.clone()));
         let Some(name) = name else {
             not_created.insert(cid, json!({"type": "invalidProperties"}));
             continue;
@@ -950,8 +1287,6 @@ mod tests {
 
     #[test]
     fn ids_keywords_and_recipients() {
-        assert_eq!(mailbox_id("INBOX"), mailbox_id("INBOX"));
-        assert_ne!(mailbox_id("INBOX"), mailbox_id("Sent"));
         let d = DateTime::now();
         assert_eq!(email_id(b"x", &d), email_id(b"x", &d));
         assert_eq!(flag_to_keyword("\\Seen"), "$seen");

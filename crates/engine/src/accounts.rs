@@ -576,6 +576,15 @@ pub struct JmapShadow {
     pub keywords: Vec<String>,
 }
 
+/// What the client last knew of a JMAP mailbox without a role (to find local folder changes): its name as
+/// shown here and its parent mailbox.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct JmapFolderShadow {
+    pub name: String,
+    pub parent: Option<String>,
+}
+
 /// JMAP bookkeeping of one account.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -583,6 +592,8 @@ pub struct JmapState {
     pub email_state: String,
     pub mailbox_state: String,
     pub shadow: BTreeMap<String, JmapShadow>,
+    /// Mailbox id → what the client last knew of it (mailboxes without a role).
+    pub folders: BTreeMap<String, JmapFolderShadow>,
 }
 
 /// Everything in [`ACCOUNT_OPTIONS_FILE`].

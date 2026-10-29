@@ -16,6 +16,17 @@ pub const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 /// RFC 9425 quotas.
 pub const QUOTA: &str = "urn:ietf:params:jmap:quota";
+/// RFC 9610 contacts (JSContact cards in address books).
+pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
+/// JMAP for Calendars (JSCalendar events in calendars).
+pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
+
+/// Sets `key` of the JSON object `v` (nothing when `v` is not an object).
+fn set(v: &mut Value, key: &str, x: Value) {
+    if let Some(m) = v.as_object_mut() {
+        m.insert(key.to_owned(), x);
+    }
+}
 
 /// How to authenticate HTTP requests.
 #[derive(Clone, PartialEq, Eq)]
@@ -254,7 +265,8 @@ pub struct SetResult {
 }
 
 impl SetResult {
-    fn from_json(v: &Value) -> SetResult {
+    /// Reads a Foo/set response.
+    pub fn from_json(v: &Value) -> SetResult {
         let errors = |k: &str| -> BTreeMap<String, SetError> {
             v.get(k)
                 .and_then(Value::as_object)
@@ -363,14 +375,41 @@ impl JmapClient {
         &self.session.account_id
     }
 
-    /// Sends a request with several method calls; returns the method responses in order.
+    /// Sends a request with several method calls; returns the method responses in order. The capabilities
+    /// the request uses follow from the method names.
     pub fn call(&self, calls: &[Invocation]) -> Result<Vec<Invocation>> {
+        self.call_using(&[], calls)
+    }
+
+    /// One method call that also uses the capabilities `extra`; returns its arguments, or the method error.
+    pub fn call_with(&self, extra: &[&str], name: &str, args: Value) -> Result<Value> {
+        let responses = self.call_using(extra, &[Invocation::new(name, args, "c0")])?;
+        let r = responses
+            .into_iter()
+            .find(|r| r.id == "c0")
+            .ok_or_else(|| NetError::Protocol(format!("no response to {name}")))?;
+        Ok(r.into_result()?.args)
+    }
+
+    fn call_using(&self, extra: &[&str], calls: &[Invocation]) -> Result<Vec<Invocation>> {
         let mut using = vec![CORE, MAIL];
-        if calls.iter().any(|c| c.name.starts_with("EmailSubmission/") || c.name.starts_with("Identity/")) {
+        let any = |prefixes: &[&str]| calls.iter().any(|c| prefixes.iter().any(|p| c.name.starts_with(p)));
+        if any(&["EmailSubmission/", "Identity/"]) {
             using.push(SUBMISSION);
         }
-        if calls.iter().any(|c| c.name.starts_with("Quota/")) {
+        if any(&["Quota/"]) {
             using.push(QUOTA);
+        }
+        if any(&["AddressBook/", "ContactCard/"]) {
+            using.push(CONTACTS);
+        }
+        if any(&["Calendar/", "CalendarEvent/", "ParticipantIdentity/", "CalendarEventNotification/"]) {
+            using.push(CALENDARS);
+        }
+        for e in extra {
+            if !using.contains(e) {
+                using.push(e);
+            }
         }
         let body = json!({
             "using": using,
@@ -411,6 +450,61 @@ impl JmapClient {
             .find(|r| r.id == "c0")
             .ok_or_else(|| NetError::Protocol(format!("no response to {name}")))?;
         Ok(r.into_result()?.args)
+    }
+
+    /// The primary account for capability `cap` (the mail account when the session names none).
+    pub fn primary_account(&self, cap: &str) -> String {
+        self.session
+            .raw
+            .get("primaryAccounts")
+            .and_then(|p| p.get(cap))
+            .and_then(Value::as_str)
+            .unwrap_or(&self.session.account_id)
+            .to_owned()
+    }
+
+    /// Foo/get in `account` of `ids` (`None`: all objects), with the type's state string.
+    pub fn get_objects(
+        &self,
+        method: &str,
+        account: &str,
+        ids: Option<&[String]>,
+        properties: Option<&[&str]>,
+    ) -> Result<(Vec<Value>, String)> {
+        let mut args = json!({ "accountId": account, "ids": ids });
+        if let Some(p) = properties {
+            set(&mut args, "properties", json!(p));
+        }
+        let r = self.call_one(method, args)?;
+        Ok((
+            r.get("list").and_then(Value::as_array).cloned().unwrap_or_default(),
+            r.get("state").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        ))
+    }
+
+    /// Foo/set in `account`; `extra` holds further arguments (e.g. `onDestroyRemoveEmails`).
+    pub fn set_objects(
+        &self,
+        method: &str,
+        account: &str,
+        create: Map<String, Value>,
+        update: Map<String, Value>,
+        destroy: &[String],
+        extra: Map<String, Value>,
+    ) -> Result<SetResult> {
+        let mut args = extra;
+        args.insert("accountId".into(), Value::String(account.to_owned()));
+        if !create.is_empty() {
+            args.insert("create".into(), Value::Object(create));
+        }
+        if !update.is_empty() {
+            args.insert("update".into(), Value::Object(update));
+        }
+        if !destroy.is_empty() {
+            args.insert("destroy".into(), json!(destroy));
+        }
+        let r = self.call_one(method, Value::Object(args))?;
+        Ok(SetResult::from_json(&r))
     }
 
     fn with_account(&self, mut args: Value) -> Value {

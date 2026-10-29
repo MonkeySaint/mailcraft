@@ -877,6 +877,20 @@ impl ImapClient {
         self.run(cmd).map(|_| ())
     }
 
+    /// CREATE with an RFC 6154 special use (`\Archive`, …) when the server offers CREATE-SPECIAL-USE, else a
+    /// plain CREATE.
+    pub fn create_special_use(&mut self, mailbox: &str, special_use: &str) -> Result<()> {
+        let attr = special_use.trim();
+        let valid = attr
+            .strip_prefix('\\')
+            .is_some_and(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphabetic()));
+        if !valid || !self.has_capability("CREATE-SPECIAL-USE") {
+            return self.create(mailbox);
+        }
+        let cmd = self.mailbox_arg(Command::new("CREATE"), mailbox).raw(&format!("(USE ({attr}))"));
+        self.run(cmd).map(|_| ())
+    }
+
     pub fn delete(&mut self, mailbox: &str) -> Result<()> {
         let cmd = self.mailbox_arg(Command::new("DELETE"), mailbox);
         self.run(cmd).map(|_| ())

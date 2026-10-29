@@ -345,6 +345,10 @@ pub enum RemoteOp {
     },
     CreateFolder {
         name: String,
+        /// RFC 6154 special use to create it with (`\Archive`) when the server offers CREATE-SPECIAL-USE: a
+        /// default folder the server had no mailbox for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        special_use: Option<String>,
     },
     RenameFolder {
         from: String,
@@ -388,4 +392,10 @@ pub struct AccountSync {
     /// Other users' and shared mailboxes the server offers (RFC 2342), as last listed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub shared_roots: Vec<SharedRootInfo>,
+    /// A JMAP account's server offers contacts over JMAP (RFC 9610), as learned at the last send/receive.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub jmap_contacts: bool,
+    /// A JMAP account's server offers calendars over JMAP (JMAP for Calendars).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub jmap_calendars: bool,
 }

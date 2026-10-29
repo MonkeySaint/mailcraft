@@ -463,3 +463,63 @@ fn first_sync_status_counts_the_messages() {
     assert!(v["detail"].is_null() && v["accounts"][0]["detail"].is_null(), "{v}");
     assert!(v.as_object().unwrap().contains_key("detail"), "{v}");
 }
+
+/// Regression (live run): on a server without an archive mailbox, Archive moved the message into a folder
+/// kept on this computer only and expunged the server copy, so the mail left the server. The archive
+/// mailbox is now made there first (with the `\Archive` special use, RFC 6154 CREATE-SPECIAL-USE).
+#[test]
+fn archiving_on_a_server_without_an_archive_mailbox_makes_one() {
+    let srv = servers();
+    srv.delete_mailbox(ALICE, "Archive").unwrap();
+    srv.seed_message(ALICE, "INBOX", &message(BOB, ALICE, "Keep me", "keep"), &[]).unwrap();
+    let mut s = session();
+    let acct = add_alice(&mut s, &srv, ALICE_PW);
+    sync(&mut s);
+    let archive = role(&s, acct, FolderRole::Archive);
+    assert!(s.mailbox.folder(archive).unwrap().remote_name.is_none(), "the server has none yet");
+    let inbox = role(&s, acct, FolderRole::Inbox);
+    let keep = find(&s, inbox, "Keep me").unwrap();
+    select(&mut s, keep);
+    run(&mut s, "mail.archive", json!({"ids": [keep.0]}));
+    settle(&mut s);
+    assert_eq!(server_subjects(&srv, ALICE, "Archive"), ["Keep me"], "the message stays on the server");
+    assert!(server_subjects(&srv, ALICE, "INBOX").is_empty());
+    assert_eq!(srv.special_use(ALICE, "Archive"), Some(mailcraft_testmail::SpecialUse::Archive));
+    assert_eq!(s.mailbox.folder(archive).unwrap().remote_name.as_deref(), Some("Archive"));
+    sync(&mut s);
+    assert_eq!(count(&s, archive, "Keep me"), 1, "no second copy after the next run");
+    assert_eq!(s.mailbox.folders.values().filter(|f| f.account == acct && f.name == "Archive").count(), 1);
+    assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+}
+
+/// Regression (review): a server message moved into a folder below a default folder the server has no mailbox
+/// for (Archive/2024 on a server without an archive) was expunged there. The archive mailbox is made first,
+/// then the subfolder, and the message is moved into it.
+#[test]
+fn moving_into_a_folder_below_a_missing_archive_keeps_the_mail_on_the_server() {
+    let srv = servers();
+    srv.delete_mailbox(ALICE, "Archive").unwrap();
+    srv.seed_message(ALICE, "INBOX", &message(BOB, ALICE, "Keep me", "keep"), &[]).unwrap();
+    let mut s = session();
+    let acct = add_alice(&mut s, &srv, ALICE_PW);
+    sync(&mut s);
+    let archive = role(&s, acct, FolderRole::Archive);
+    assert!(s.mailbox.folder(archive).unwrap().remote_name.is_none(), "the server has none yet");
+    s.selection.folder = archive;
+    let sub = FolderId(run(&mut s, "folder.new", json!({"name": "2024"}))["folder"].as_u64().unwrap());
+    settle(&mut s);
+    assert!(s.mailbox.folder(sub).unwrap().remote_name.is_none(), "below a folder the server lacks");
+    let inbox = role(&s, acct, FolderRole::Inbox);
+    let keep = find(&s, inbox, "Keep me").unwrap();
+    select(&mut s, keep);
+    run(&mut s, "mail.move", json!({"ids": [keep.0], "folder": sub.0}));
+    settle(&mut s);
+    assert_eq!(server_subjects(&srv, ALICE, "Archive/2024"), ["Keep me"], "the message stays on the server");
+    assert!(server_subjects(&srv, ALICE, "INBOX").is_empty());
+    assert_eq!(srv.special_use(ALICE, "Archive"), Some(mailcraft_testmail::SpecialUse::Archive));
+    sync(&mut s);
+    assert_eq!(s.mailbox.mail.items().filter(|m| m.subject == "Keep me").count(), 1);
+    assert_eq!(s.mailbox.mail.get(keep).unwrap().folder, sub);
+    assert_eq!(s.mailbox.folders.values().filter(|f| f.account == acct && f.name == "2024").count(), 1);
+    assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());
+}

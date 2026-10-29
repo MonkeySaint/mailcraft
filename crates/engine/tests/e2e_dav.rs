@@ -677,6 +677,44 @@ fn a_collection_with_events_and_tasks_is_shared_by_calendar_and_tasks() {
     assert_eq!(srv.dav_items(ALICE, "calendar").len(), 2, "the task stays on the server");
 }
 
+/// Regression (live run): a server with one calendar for events and tasks (and no task list of its own) gave
+/// it to the Tasks folder on the first run, and the Calendar failed with "No calendar was found on the
+/// server".
+#[test]
+fn one_calendar_for_events_and_tasks_serves_both_folders_from_the_first_run() {
+    let srv = servers();
+    srv.set_single_dav_calendar(true);
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "contacts": false}));
+    let cal = role(&s, alice, FolderRole::Calendar);
+    let tasks = role(&s, alice, FolderRole::Tasks);
+    srv.put_dav_item(ALICE, "calendar", "todo-1.ics", TODO).unwrap();
+    srv.put_dav_item(ALICE, "calendar", "series-1.ics", SERIES).unwrap();
+    run(
+        &mut s,
+        "calendar.newAppointment",
+        json!({"folder": cal.0, "subject": "Dentist", "start": at(2026, 10, 14, 9), "end": at(2026, 10, 14, 10)}),
+    );
+    run(&mut s, "tasks.new", json!({"subject": "Book the room", "folder": tasks.0}));
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(s.sync_status().accounts.iter().find_map(|a| a.error.clone()), None);
+    assert_eq!(calendar_items(&s, cal).len(), 3, "the series, its exception and the local event");
+    assert!(s.mailbox.tasks.values().any(|t| t.folder == tasks && t.subject == "Order toner"));
+    let items = srv.dav_items(ALICE, "calendar");
+    assert_eq!(items.len(), 4, "{items:?}");
+    assert!(items.iter().any(|(_, d)| d.contains("SUMMARY:Dentist") && d.contains("VEVENT")));
+    assert!(items.iter().any(|(_, d)| d.contains("SUMMARY:Book the room") && d.contains("VTODO")));
+    // Neither folder takes the other's items, and a second run changes nothing.
+    let before = puts(&srv);
+    run(&mut s, "sendReceive.all", json!({}));
+    settle(&mut s);
+    assert_eq!(puts(&srv), before);
+    assert_eq!(srv.dav_items(ALICE, "calendar").len(), 4);
+    assert_eq!(calendar_items(&s, cal).len(), 3);
+    assert_eq!(s.mailbox.tasks.values().filter(|t| t.folder == tasks).count(), 2);
+}
+
 fn puts(srv: &TestServers) -> usize {
     srv.dav_requests().iter().filter(|r| r.starts_with("PUT")).count()
 }

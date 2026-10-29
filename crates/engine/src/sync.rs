@@ -374,6 +374,9 @@ pub(crate) struct Track {
     /// Contacts and tasks the contacts/tasks server added or removed.
     pim_created: BTreeSet<ItemId>,
     pim_removed: BTreeSet<ItemId>,
+    /// JMAP mailboxes (account, mailbox id) removed from the server meanwhile: a restored folder still
+    /// naming one is made there again.
+    mailboxes_gone: BTreeSet<(AccountId, String)>,
 }
 
 impl Track {
@@ -385,6 +388,7 @@ impl Track {
             && self.flags.is_empty()
             && self.folders_created.is_empty()
             && self.folders_removed.is_empty()
+            && self.mailboxes_gone.is_empty()
     }
 }
 
@@ -1325,7 +1329,7 @@ fn folder_changes(
                 if f.remote_name.is_none()
                     && let Some(path) = remote_path(after, &f)
                 {
-                    q.push((f.account, RemoteOp::CreateFolder { name: path.clone() }));
+                    q.push((f.account, RemoteOp::CreateFolder { name: path.clone(), special_use: None }));
                     if let Some(g) = after.folders.get_mut(&fid) {
                         g.remote_name = Some(path);
                     }
@@ -1525,6 +1529,15 @@ fn item_changes(
         };
         let src = synced_folder(after, b.folder).or_else(|| synced_folder(before, b.folder));
         let b_uid = uid_of(b).filter(|_| src.is_some());
+        // A server message moved into a default folder the server has no mailbox for (Archive on a server
+        // without one), or into a folder below one: the mailboxes are made there first, so the message stays
+        // on the server.
+        let dst = match (dst, &src) {
+            (None, Some((sa, _))) if a_folder != b.folder && b_uid.is_some() => {
+                server_folder_below_default(after, a_folder, *sa, q)
+            }
+            (dst, _) => dst,
+        };
         if a_folder != b.folder {
             set_remote_id(after, id, None);
             match (b_uid, src, dst) {
@@ -1565,6 +1578,107 @@ fn item_changes(
     }
 }
 
+/// Makes `folder`, a default folder (Archive, Deleted Items, Junk Email, Sent Items, Drafts) of IMAP account
+/// `account` that the server has no mailbox for, on the server: queues its creation and gives it its server
+/// name. Only once the account's folder list was read (else the server may well have it).
+fn server_default_folder(
+    after: &mut Mailbox,
+    folder: FolderId,
+    account: AccountId,
+    q: &mut Vec<(AccountId, RemoteOp)>,
+) -> Option<(AccountId, String)> {
+    use mailcraft_model::FolderRole as R;
+    let f = after.folders.get(&folder)?;
+    let special_use = match f.role {
+        Some(R::Archive) => "\\Archive",
+        Some(R::DeletedItems) => "\\Trash",
+        Some(R::JunkEmail) => "\\Junk",
+        Some(R::SentItems) => "\\Sent",
+        Some(R::Drafts) => "\\Drafts",
+        _ => return None,
+    };
+    if f.account != account
+        || f.kind != FolderKind::Mail
+        || f.remote_name.is_some()
+        || f.parent.is_some()
+        || !is_imap(after, account)
+        || after.account(account).is_none_or(|a| a.sync.delimiter.is_none() || a.shared.is_some())
+    {
+        return None;
+    }
+    let path = remote_path(after, f)?;
+    q.push((
+        account,
+        RemoteOp::CreateFolder { name: path.clone(), special_use: Some(special_use.to_owned()) },
+    ));
+    if let Some(g) = after.folders.get_mut(&folder) {
+        g.remote_name = Some(path.clone());
+    }
+    Some((account, path))
+}
+
+/// Makes `folder` of IMAP account `account` on the server when it is a default folder the server has no
+/// mailbox for ([`server_default_folder`]) or a folder below one (`Archive/2024`): the default folder first
+/// (when the server lacks it), then each folder down to `folder` that is not there yet. `None` (nothing
+/// queued) for any other folder that is not on the server.
+fn server_folder_below_default(
+    after: &mut Mailbox,
+    folder: FolderId,
+    account: AccountId,
+    q: &mut Vec<(AccountId, RemoteOp)>,
+) -> Option<(AccountId, String)> {
+    // `folder` and its parents, top level last.
+    let mut chain = vec![folder];
+    let mut cur = after.folders.get(&folder)?.parent;
+    while let Some(p) = cur {
+        if chain.len() > after.folders.len() || chain.contains(&p) {
+            return None;
+        }
+        chain.push(p);
+        cur = after.folders.get(&p)?.parent;
+    }
+    let top_id = *chain.last()?;
+    let top = after.folders.get(&top_id)?;
+    if top.role.is_none_or(|r| {
+        !matches!(
+            r,
+            mailcraft_model::FolderRole::Archive
+                | mailcraft_model::FolderRole::DeletedItems
+                | mailcraft_model::FolderRole::JunkEmail
+                | mailcraft_model::FolderRole::SentItems
+                | mailcraft_model::FolderRole::Drafts
+        )
+    }) {
+        return None;
+    }
+    // Every folder below the default folder must be a plain mail folder of the account.
+    if chain.iter().rev().skip(1).any(|f| {
+        after
+            .folders
+            .get(f)
+            .is_none_or(|f| f.account != account || f.kind != FolderKind::Mail || f.role.is_some())
+    }) {
+        return None;
+    }
+    if top.remote_name.is_none() {
+        server_default_folder(after, top_id, account, q)?;
+    } else if !is_imap(after, account) || top.account != account {
+        return None;
+    }
+    for fid in chain.iter().rev().skip(1) {
+        let f = after.folders.get(fid)?;
+        if f.remote_name.is_some() {
+            continue;
+        }
+        let path = remote_path(after, f)?;
+        q.push((account, RemoteOp::CreateFolder { name: path.clone(), special_use: None }));
+        if let Some(g) = after.folders.get_mut(fid) {
+            g.remote_name = Some(path);
+        }
+    }
+    synced_folder(after, folder)
+}
+
 /// Undo/redo put a step back (`s.mailbox` now): `changes` holds what was there instead (`changes.small`,
 /// everything but the mail, and the live versions of the mail items the step put back). Keep what
 /// synchronisation did meanwhile and queue the server changes that revert the undone command; the
@@ -1575,12 +1689,16 @@ pub(crate) fn after_restore(s: &mut Session, changes: &mut crate::changes::Chang
     crate::cmd::calendar::subscribe::carry_over(live, &mut s.mailbox);
     // Contacts and tasks keep what their server sent and their links to it.
     pim::carry_over(live, &mut s.mailbox, &s.sync.track.pim_created, &s.sync.track.pim_removed);
-    if !live.accounts.iter().any(|a| a.kind == AccountKind::Imap) {
+    // IMAP and JMAP accounts alike: without this, a JMAP folder or message the server added meanwhile would
+    // be missing from the restored mailbox and the next run would remove it from the server.
+    if !live.accounts.iter().any(|a| matches!(a.kind, AccountKind::Imap | AccountKind::Jmap)) {
         return;
     }
     let Some(live_mail) = changes.mail.as_ref() else { return };
     let token = s.mailbox.mail.begin();
     carry_over(live, live_mail, &mut s.mailbox, &s.sync.track);
+    #[cfg(not(target_arch = "wasm32"))]
+    jmap::after_restore(s);
     let more = s.mailbox.mail.commit(token);
     changes.absorb(more);
     queue_local_changes(s, changes);
@@ -1656,6 +1774,12 @@ fn carry_over(live: &Mailbox, live_mail: &MailChanges, restored: &mut Mailbox, t
             restored.mail.remove(*id);
         }
     }
+    // JMAP email ids stay the same when a message moves between mailboxes of its account (IMAP UIDs do not).
+    let jmap_account = |mb: &Mailbox, f: FolderId| {
+        mb.folder(f)
+            .map(|f| f.account)
+            .filter(|a| mb.account(*a).is_some_and(|a| a.kind == AccountKind::Jmap))
+    };
     let put_back: Vec<(ItemId, FolderId, Option<String>, bool, FlagState)> = live_mail
         .iter()
         .filter_map(|(id, l)| {
@@ -1665,13 +1789,14 @@ fn carry_over(live: &Mailbox, live_mail: &MailChanges, restored: &mut Mailbox, t
         .collect();
     for (id, folder, remote_id, read, flag) in put_back {
         let Some(m) = restored.mail.get(id) else { continue };
-        let same_folder = m.folder == folder;
+        let same_id = m.folder == folder
+            || jmap_account(restored, m.folder).is_some_and(|a| jmap_account(live, folder) == Some(a));
         let flags = track.flags.contains(&id);
-        if (!same_folder || m.remote_id == remote_id) && (!flags || (m.read == read && m.flag == flag)) {
+        if (!same_id || m.remote_id == remote_id) && (!flags || (m.read == read && m.flag == flag)) {
             continue;
         }
         restored.mail.update(id, |m| {
-            if same_folder {
+            if same_id {
                 m.remote_id = remote_id;
             }
             if flags {
@@ -1815,6 +1940,12 @@ pub mod focus;
 pub mod groups;
 #[cfg(not(target_arch = "wasm32"))]
 mod jmap;
+#[cfg(not(target_arch = "wasm32"))]
+mod jmap_pim;
+#[cfg(not(target_arch = "wasm32"))]
+mod jscalendar;
+#[cfg(not(target_arch = "wasm32"))]
+mod jscontact;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 pub mod older;
@@ -2122,7 +2253,10 @@ mod tests {
         let before = mb.clone();
         let f = mb.create_folder(inbox, "Projects").unwrap();
         queue_changes(&before, &mut mb, &none);
-        assert_eq!(pending(&mb, a).last(), Some(&RemoteOp::CreateFolder { name: "INBOX/Projects".into() }));
+        assert_eq!(
+            pending(&mb, a).last(),
+            Some(&RemoteOp::CreateFolder { name: "INBOX/Projects".into(), special_use: None })
+        );
         assert_eq!(mb.folders[&f].remote_name.as_deref(), Some("INBOX/Projects"));
         let before = mb.clone();
         mb.rename_folder(f, "Work").unwrap();
@@ -2383,7 +2517,7 @@ mod tests {
             ..Default::default()
         });
         change(&mut s, |mb| mb.mail.get_mut(x).unwrap().folder = b_trash);
-        push_op(&mut s.mailbox, a, RemoteOp::CreateFolder { name: "Z".into() });
+        push_op(&mut s.mailbox, a, RemoteOp::CreateFolder { name: "Z".into(), special_use: None });
         mark_inflight(&mut s, a);
         assert!(op_ids(&s, a).contains(&op_ids(&s, b)[1]), "the test needs colliding ids");
         // Moving it back before the move ran cancels the move and restores the UID.

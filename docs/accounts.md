@@ -54,6 +54,14 @@ Domains reserved for examples and tests (`example.com/.net/.org`, `.example`, `.
 ## IMAP
 
 - Folders and messages are synchronised both ways (CONDSTORE / QRESYNC when the server offers them).
+- A message from the server moved into a default folder the server has no mailbox for (Archive, Deleted
+  Items, Junk Email, Sent Items or Drafts; most often Archive), or into a folder below one (`Archive/2024`),
+  makes that mailbox on the server first, with its special use (RFC 6154 CREATE-SPECIAL-USE, when offered),
+  then the folders below it, so the message stays on the server. A JMAP account does the same with the
+  mailbox role; a JMAP server that refuses the role gets the mailbox without one, and a server that refuses
+  the mailbox shows the error in the account's status (the message stays where it was on the server). A
+  server mailbox without a special use or role is recognised by its name ("Archive", "Sent Items", …),
+  unless the server marks another mailbox with that role.
 - **Push.** After the first successful send/receive, the account keeps its connection open and waits on the
   Inbox with IMAP IDLE (RFC 2177). New mail starts an Inbox update without a Send/Receive. IDLE is renewed
   every 25 minutes and interrupted at once when another job comes in. A lost connection is retried with
@@ -116,6 +124,27 @@ Page Up / Page Down (three stops) and Home / End, and screen readers get its val
   download window above, newest first, page by page) and Email/changes after that. Flags, moves and
   deletions go back with Email/set; the Outbox is sent with EmailSubmission/set and the server files the
   Sent copy.
+- Folders made, renamed, moved or deleted here go back with Mailbox/set (a new folder is created before
+  mail is moved into it; a deleted folder goes into Deleted Items first, and its mailbox is removed when it
+  is deleted from there; a mailbox still holding mail this computer never downloaded is kept, and its
+  folder comes back). Folders below the Outbox, or below a default folder the server has no mailbox for,
+  stay on this computer until mail from the server is moved into them (see IMAP above). Undo and redo keep
+  what synchronisation brought meanwhile: a folder another client made is not removed from the server by
+  undoing an earlier command, and a folder brought back whose mailbox is gone is made there again.
+- **Contacts and calendars over JMAP.** When the server offers JMAP for Contacts (RFC 9610) and JMAP for
+  Calendars, the account's **Contacts** and **Calendar** folders synchronise with its address books and
+  calendars over JMAP, without any DAV settings; the rules are the ones below for CardDAV / CalDAV. Cards
+  are JSContact (RFC 9553) and events JSCalendar: a recurring series with its changed and removed
+  occurrences is one event (`recurrenceRule`, `recurrenceOverrides`). An edit writes only the properties
+  it changed: a property it did not touch stays on the server as it is, with what MailCraft does not show
+  inside it (further organizations, a photo stored as a blob, further alerts, extra locations), and so does
+  a property MailCraft does not map. A property the edit changed (the company, the reminder, the location)
+  is replaced by MailCraft's version of it, which holds what MailCraft shows. Events are written with
+  `sendSchedulingMessages: false` (the server never mails attendees for MailCraft). An account whose
+  settings name a CardDAV / CalDAV server keeps using it for all three folders; clear the DAV server to
+  move Contacts and Calendar to JMAP (items keep their UIDs, so the server's copies are matched rather than
+  uploaded again). JMAP has no task lists MailCraft uses: **Tasks** synchronise with a CalDAV server if one
+  is set in the account's settings.
 - **Push.** After the first successful send/receive the account keeps the server's event source open
   (RFC 8620 section 7.3, `text/event-stream`, a ping every 60 seconds) and starts an update when a
   `StateChange` names a new Email or Mailbox state. A lost stream is reopened with backoff (the Inbox is

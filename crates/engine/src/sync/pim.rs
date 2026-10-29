@@ -19,6 +19,12 @@
 //! uploads the resource again. A collection holding both events and tasks is shared by the Calendar and the
 //! Tasks folder: each takes its own kind of object and leaves the other's alone.
 //!
+//! **JMAP.** A JMAP account whose server offers contacts / calendars over JMAP (RFC 9610, JMAP for
+//! Calendars) and whose settings name no DAV server keeps its Contacts and Calendar there ([`via_jmap`];
+//! `jmap_pim.rs` makes the server's address books and calendars look like DAV collections at
+//! `https://jmap.invalid/…`, so the rules below are the same). With a DAV server set, all three folders keep
+//! using it. Tasks stay on the CalDAV server of its DAV settings, if any.
+//!
 //! **Rules.** Changed here and unchanged there: uploaded with `If-Match`. Changed there: the server copy
 //! replaces the local one unless the item was also changed here, in which case the local copy is uploaded
 //! over it on the next run (the newer edit wins; nothing is lost silently mid-run). New here: uploaded with
@@ -44,7 +50,7 @@ use crate::{Notice, Session};
 pub const MAX_ITEMS: usize = 20_000;
 
 /// What a synchronised folder holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PimKind {
     Contacts,
     Tasks,
@@ -794,14 +800,42 @@ pub enum PimEvent {
 // Session side: which folders, building jobs
 // ---------------------------------------------------------------------------------------------------------
 
-/// The folders of `account` that synchronise with its DAV server: the default Contacts / Tasks folders when
-/// turned on in the settings, plus every folder mapped to a collection.
+/// Origin of the addresses a JMAP account's address books, calendars and their objects get (see
+/// `jmap_pim.rs`; `.invalid` is reserved, RFC 2606, and never reaches the network).
+pub const JMAP_ORIGIN: &str = "https://jmap.invalid";
+
+/// True for an address of a JMAP address book, calendar or object (see [`JMAP_ORIGIN`]).
+pub fn is_jmap_url(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with(&format!("{JMAP_ORIGIN}/"))
+}
+
+/// True when `a` keeps `kind` on its JMAP server: a JMAP account whose server offers it and whose settings
+/// name no DAV server. An account with a DAV server keeps using it (its folders stay linked to what they
+/// synchronised with, and nothing is uploaded a second time where JMAP and DAV share one store); clearing
+/// the DAV server moves Contacts and Calendar to JMAP.
+pub fn via_jmap(a: &mailcraft_model::Account, kind: PimKind) -> bool {
+    let offered = match kind {
+        PimKind::Contacts => a.sync.jmap_contacts,
+        PimKind::Calendar => a.sync.jmap_calendars,
+        PimKind::Tasks => false,
+    };
+    a.kind == mailcraft_model::AccountKind::Jmap
+        && offered
+        && a.dav.as_ref().is_none_or(|d| d.url.trim().is_empty())
+}
+
+/// True when `a` synchronises `kind` at all (over JMAP or with its DAV server).
+pub fn kind_on(a: &mailcraft_model::Account, kind: PimKind) -> bool {
+    via_jmap(a, kind) || a.dav.as_ref().is_some_and(|d| !d.url.trim().is_empty() && kind.enabled(d))
+}
+
+/// The folders of `account` that synchronise with its DAV server (or its JMAP server, [`via_jmap`]): the
+/// default Contacts / Tasks folders when turned on in the settings, plus every folder mapped to a collection.
 pub fn synced_folders(mb: &Mailbox, account: AccountId) -> Vec<(FolderId, PimKind)> {
     let Some(a) = mb.account(account) else { return Vec::new() };
-    let Some(dav) = a.dav.as_ref().filter(|d| !d.url.trim().is_empty()) else { return Vec::new() };
     let mut out: Vec<(FolderId, PimKind)> = Vec::new();
     for kind in [PimKind::Contacts, PimKind::Tasks, PimKind::Calendar] {
-        if !kind.enabled(dav) {
+        if !kind_on(a, kind) {
             continue;
         }
         if let Some(f) = mb.role_folder(account, kind.role()) {
@@ -826,6 +860,10 @@ pub fn is_synced_folder(mb: &Mailbox, folder: FolderId) -> bool {
 /// The run's view of `folder`.
 pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKind) -> FolderJob {
     let state = s.mailbox.account(account).and_then(|a| a.sync.dav.get(&folder)).cloned();
+    // A collection of the other protocol (the account switched between DAV and JMAP) counts as none: the
+    // folder takes one of this protocol, and its items are matched with the server's like new ones.
+    let jmap = s.mailbox.account(account).is_some_and(|a| via_jmap(a, kind));
+    let state = state.filter(|st| st.collection.is_empty() || is_jmap_url(&st.collection) == jmap);
     let collection = state.as_ref().map(|st| st.collection.clone()).filter(|c| !c.is_empty());
     let known = state.map(|st| st.known).unwrap_or_default();
     let now = s.now();
@@ -859,12 +897,33 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
     let server = |linked: bool, r: &Option<RemoteRef>| -> Option<String> {
         r.as_ref().map(|r| r.raw.clone()).filter(|raw| linked && !raw.is_empty())
     };
+    // The UID of a server copy whose link does not count: the item keeps it when no other item of the folder
+    // uses it, so the same item on the new collection (the account moved between DAV and JMAP over one
+    // store, or the collection moved) is matched by its UID instead of going up again.
+    let dropped_uid =
+        |r: &Option<RemoteRef>| r.as_ref().map(|r| r.uid.trim().to_owned()).filter(|u| !u.is_empty());
     match kind {
         PimKind::Contacts => {
-            for c in s.mailbox.contacts.values().filter(|c| c.folder == folder) {
-                let remote = keep(&c.remote);
-                let uid = remote.as_ref().map(|r| r.uid.clone()).filter(|u| !u.is_empty());
-                let uid = uid.unwrap_or_else(|| new_uid(account, c.id, now.unix));
+            let list: Vec<(&Contact, Option<RemoteRef>)> = s
+                .mailbox
+                .contacts
+                .values()
+                .filter(|c| c.folder == folder)
+                .map(|c| (c, keep(&c.remote)))
+                .collect();
+            let mut claimed: BTreeSet<String> = list
+                .iter()
+                .filter_map(|(_, r)| r.as_ref().map(|r| r.uid.clone()))
+                .filter(|u| !u.is_empty())
+                .collect();
+            for (c, remote) in list {
+                let uid = match remote.as_ref().map(|r| r.uid.clone()).filter(|u| !u.is_empty()) {
+                    Some(u) => u,
+                    None => match dropped_uid(&c.remote).filter(|u| claimed.insert(u.clone())) {
+                        Some(u) => u,
+                        None => new_uid(account, c.id, now.unix),
+                    },
+                };
                 let fingerprint = contact_fingerprint(c);
                 let mut item = LocalItem { id: c.id, remote, uid, upload: None, fingerprint };
                 if item.changed() {
@@ -894,10 +953,10 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
                     Some(u) => u,
                     None => {
                         let own = t.uid.trim();
-                        if !own.is_empty() && claimed.insert(own.to_owned()) {
-                            own.to_owned()
-                        } else {
-                            new_uid(account, t.id, now.unix)
+                        match dropped_uid(&t.remote).filter(|u| claimed.insert(u.clone())) {
+                            Some(u) => u,
+                            None if !own.is_empty() && claimed.insert(own.to_owned()) => own.to_owned(),
+                            None => new_uid(account, t.id, now.unix),
                         }
                     }
                 };
@@ -1008,7 +1067,7 @@ fn map_collections(
     list: &[(String, String)],
 ) -> Vec<FolderId> {
     let Some(default) = s.mailbox.role_folder(account, kind.role()) else { return Vec::new() };
-    let on = s.mailbox.account(account).and_then(|a| a.dav.as_ref()).is_some_and(|d| kind.enabled(d));
+    let on = s.mailbox.account(account).is_some_and(|a| kind_on(a, kind));
     if !on || list.is_empty() {
         return Vec::new();
     }
@@ -1573,6 +1632,8 @@ pub(super) fn carry_over(
                 a.sync.dav = l.sync.dav.clone();
             }
             a.sync.shared_roots = l.sync.shared_roots.clone();
+            a.sync.jmap_contacts = l.sync.jmap_contacts;
+            a.sync.jmap_calendars = l.sync.jmap_calendars;
         }
     }
     let keeps_links: BTreeSet<FolderId> =
@@ -1811,6 +1872,67 @@ mod tests {
         assert_eq!(distinct.len(), 4, "{uids:?}");
         assert!(job.items.iter().skip(1).all(|i| i.remote.is_none()));
         assert!(!job.too_many);
+    }
+
+    /// Regression (review): a contact whose link was dropped because the account changed protocol (DAV to
+    /// JMAP) got a new UID, so the server's copy of it on the new collection could not be matched and it
+    /// went up a second time.
+    #[test]
+    fn items_keep_the_uid_of_a_dropped_link() {
+        let (mut s, account) = local_session();
+        let folder = s.mailbox.role_folder(account, FolderRole::Contacts).unwrap();
+        let tasks = s.mailbox.role_folder(account, FolderRole::Tasks).unwrap();
+        let old = "https://dav.example.com/c/";
+        if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
+            a.kind = mailcraft_model::AccountKind::Jmap;
+            a.dav = None;
+            a.sync.jmap_contacts = true;
+            a.sync.dav.insert(folder, DavFolderState { collection: old.into(), known: BTreeMap::new() });
+        }
+        assert!(via_jmap(s.mailbox.account(account).unwrap(), PimKind::Contacts));
+        let remote = |uid: &str| RemoteRef {
+            url: format!("{old}{uid}.vcf"),
+            etag: "\"1\"".into(),
+            uid: uid.into(),
+            synced: 1,
+            ..Default::default()
+        };
+        // Pat, a copy of Pat (the same link), and Robin.
+        for (n, r) in [(1, remote("pat-1")), (2, remote("pat-1")), (3, remote("robin-1"))] {
+            let id = ItemId(2000 + n);
+            s.mailbox.contacts.insert(id, Contact { id, folder, remote: Some(r), ..Default::default() });
+        }
+        let job = folder_job(&s, account, folder, PimKind::Contacts);
+        assert_eq!(job.collection, None, "the DAV collection does not count for JMAP");
+        let uids: Vec<&str> = job.items.iter().map(|i| i.uid.as_str()).collect();
+        assert_eq!(uids[0], "pat-1");
+        assert_eq!(uids[2], "robin-1");
+        assert!(uids[1] != "pat-1" && !uids[1].is_empty(), "the copy gets a UID of its own: {uids:?}");
+        assert!(job.items.iter().all(|i| i.remote.is_none()));
+
+        // Tasks: the dropped link's UID comes before the task's own.
+        let id = ItemId(3000);
+        let r = RemoteRef {
+            url: "https://dav.example.com/t/u9.ics".into(),
+            uid: "u9".into(),
+            ..Default::default()
+        };
+        s.mailbox.tasks.insert(
+            id,
+            Task { id, folder: tasks, uid: "other".into(), remote: Some(r), ..Default::default() },
+        );
+        let job = folder_job(&s, account, tasks, PimKind::Tasks);
+        assert_eq!(job.items.first().map(|i| i.uid.as_str()), Some("u9"));
+
+        // A DAV server in the settings keeps the account on DAV.
+        if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
+            a.dav = Some(mailcraft_model::DavSettings {
+                url: "https://dav.example.com/".into(),
+                contacts: true,
+                ..Default::default()
+            });
+        }
+        assert!(!via_jmap(s.mailbox.account(account).unwrap(), PimKind::Contacts));
     }
 
     #[test]

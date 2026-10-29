@@ -168,6 +168,7 @@ impl Session<'_> {
             "UNSELECT",
             "CHILDREN",
             "SPECIAL-USE",
+            "CREATE-SPECIAL-USE",
             "LIST-EXTENDED",
             "LIST-STATUS",
             "CONDSTORE",

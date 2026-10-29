@@ -1,13 +1,20 @@
 //! JMAP accounts (RFC 8620 core, RFC 8621 mail): folders from Mailbox/get and Mailbox/changes, mail from
 //! Email/query + Email/get on the first run (mail received in the account's "download mail from the past N
 //! months" window, newest first) and Email/changes afterwards (whole messages downloaded as blobs),
-//! local changes written back with Email/set (keywords, mailbox, destroy) and Email/import, and the Outbox
-//! sent with EmailSubmission/set (filed in Sent by the server).
+//! local changes written back with Email/set (keywords, mailbox, destroy), Email/import and Mailbox/set
+//! (folders created, renamed, moved and deleted here), and the Outbox sent with EmailSubmission/set (filed in
+//! Sent by the server).
 //!
 //! Folder `remote_name` = mailbox id; item `remote_id` = email id. JMAP has no change queue on the mailbox
 //! (its ids are strings): the account options keep a *shadow* of what the server last had for each email
-//! (mailbox and keywords), and each run sends what differs from it. An email in several mailboxes is shown in
-//! one folder (the first of its mailboxes in folder order).
+//! (mailbox and keywords) and for each mailbox without a role (name and parent), and each run sends what
+//! differs from it. An email in several mailboxes is shown in one folder (the first of its mailboxes in folder
+//! order).
+//!
+//! **New folders.** A folder made here (no role, its parent on the server or made in the same run) is created
+//! first in a run; until the server names it, the job refers to it as `#f<folder id>` (in parents, email
+//! moves and uploads), and the worker puts the new mailbox id in. Folders below a folder that stays local
+//! (the Outbox, a role folder the server lacks) stay local too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +25,7 @@ use serde_json::{Map, Value, json};
 
 use super::native::{Event, Events, Outgoing};
 use super::*;
-use crate::accounts::{JmapShadow, prefs};
+use crate::accounts::{JmapFolderShadow, JmapShadow, prefs};
 use mailcraft_model::{Account, FolderRole};
 
 /// Emails asked for per Email/query page of the first run.
@@ -78,6 +85,30 @@ pub(crate) struct JmapJob {
     destroy: Vec<String>,
     /// (item, mailbox id, keywords, source).
     imports: Vec<(ItemId, String, Vec<String>, Vec<u8>)>,
+    /// Folders to create, parents first: (folder, name, parent mailbox id or placeholder, JMAP role of a
+    /// default folder the server has no mailbox for).
+    folder_creates: Vec<(FolderId, String, Option<String>, Option<&'static str>)>,
+    /// (mailbox id, patch, shadow after it).
+    folder_updates: Vec<(String, Value, JmapFolderShadow)>,
+    /// Mailboxes of folders removed here, children first.
+    folder_destroys: Vec<String>,
+}
+
+/// Sets `key` of the JSON object `v` (nothing when `v` is not an object).
+fn set(v: &mut Value, key: &str, x: Value) {
+    if let Some(m) = v.as_object_mut() {
+        m.insert(key.to_owned(), x);
+    }
+}
+
+/// How the job names a folder the server has not created yet.
+fn placeholder(f: FolderId) -> String {
+    format!("#f{}", f.0)
+}
+
+/// The server's id for `m`: placeholders resolved from `created` (`None`: the folder could not be made).
+fn resolve(m: &str, created: &BTreeMap<String, String>) -> Option<String> {
+    if m.starts_with("#f") { created.get(m).cloned() } else { Some(m.to_owned()) }
 }
 
 /// A server search (Search › Include Older Results, see `older.rs`).
@@ -159,8 +190,28 @@ pub(crate) enum JmapEvent {
         id: String,
         shadow: JmapShadow,
     },
+    /// The server made the mailbox `id` for `folder` (`shadow`: what to compare later changes with; none for
+    /// a default folder).
+    FolderCreated {
+        folder: FolderId,
+        id: String,
+        shadow: Option<JmapFolderShadow>,
+    },
+    FolderUpdated {
+        id: String,
+        shadow: JmapFolderShadow,
+    },
+    /// Mailboxes gone from the server (destroyed by this run, or already gone).
+    FoldersDestroyed {
+        ids: Vec<String>,
+    },
     /// The server cannot report changes since our state: start over.
     Reset,
+    /// What the server offers over JMAP beyond mail: contacts, calendars.
+    Offers {
+        contacts: bool,
+        calendars: bool,
+    },
     /// Server search `generation` found these emails (old mail: no new-mail handling); `total` matched that
     /// were not here.
     Found {
@@ -219,6 +270,7 @@ pub(crate) fn build_job(
             .map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}T00:00:00Z")),
         ..Default::default()
     };
+    let target = folder_job(s, a, &st, outbox, &mut job);
     let mut here: BTreeSet<&str> = BTreeSet::new();
     for m in s.mailbox.mail.items() {
         let Some(f) = s.mailbox.folder(m.folder).filter(|f| f.account == a.id && f.kind == FolderKind::Mail)
@@ -228,7 +280,7 @@ pub(crate) fn build_job(
         if Some(f.id) == outbox {
             continue;
         }
-        let Some(mailbox) = f.remote_name.as_deref() else { continue };
+        let Some(mailbox) = target.get(&f.id).map(String::as_str) else { continue };
         let keywords = keywords_of(m);
         match m.remote_id.as_deref() {
             Some(eid) => {
@@ -250,10 +302,155 @@ pub(crate) fn build_job(
         }
     }
     job.destroy = st.shadow.keys().filter(|id| !here.contains(id.as_str())).cloned().collect();
-    if !job.receive && job.updates.is_empty() && job.destroy.is_empty() && job.imports.is_empty() {
+    if !job.receive
+        && job.updates.is_empty()
+        && job.destroy.is_empty()
+        && job.imports.is_empty()
+        && job.folder_creates.is_empty()
+        && job.folder_updates.is_empty()
+        && job.folder_destroys.is_empty()
+    {
         return None;
     }
     Some(job)
+}
+
+/// The JMAP role of a default folder MailCraft makes on the server when the server has none.
+fn creatable_role(r: FolderRole) -> Option<&'static str> {
+    match r {
+        FolderRole::Archive => Some("archive"),
+        FolderRole::DeletedItems => Some("trash"),
+        FolderRole::JunkEmail => Some("junk"),
+        FolderRole::SentItems => Some("sent"),
+        FolderRole::Drafts => Some("drafts"),
+        _ => None,
+    }
+}
+
+/// Depth of folder `f` (0 = top level).
+fn folder_depth(mb: &Mailbox, f: FolderId) -> usize {
+    let mut n = 0usize;
+    let mut cur = mb.folder(f).and_then(|x| x.parent);
+    while let Some(p) = cur {
+        n += 1;
+        if n > mb.folders.len() {
+            break;
+        }
+        cur = mb.folder(p).and_then(|x| x.parent);
+    }
+    n
+}
+
+/// The folder part of a job: folders to create, rename or move, and delete on the server. Returns, for every
+/// mail folder of the account that is (or will be) on the server, its mailbox id or placeholder.
+fn folder_job(
+    s: &Session,
+    a: &Account,
+    st: &crate::accounts::JmapState,
+    outbox: Option<FolderId>,
+    job: &mut JmapJob,
+) -> BTreeMap<FolderId, String> {
+    let mut folders: Vec<&Folder> = s
+        .mailbox
+        .folders
+        .values()
+        .filter(|f| f.account == a.id && f.kind == FolderKind::Mail && Some(f.id) != outbox)
+        .collect();
+    folders.sort_by_cached_key(|f| (folder_depth(&s.mailbox, f.id), f.id));
+    // Default folders the server has no mailbox for (an Archive on a server without one) are made there once
+    // mail from the server is moved into them or into a folder below them (else that mail would leave the
+    // server); their subfolders follow as new folders.
+    let listed = !st.mailbox_state.is_empty();
+    let mut holds_server_mail: BTreeSet<FolderId> = BTreeSet::new();
+    for m in s.mailbox.mail.items().filter(|m| m.remote_id.is_some()) {
+        let mut cur = Some(m.folder);
+        let mut steps = 0usize;
+        while let Some(f) = cur {
+            if !holds_server_mail.insert(f) || steps > s.mailbox.folders.len() {
+                break;
+            }
+            steps += 1;
+            cur = s.mailbox.folder(f).and_then(|x| x.parent);
+        }
+    }
+    let mut target: BTreeMap<FolderId, String> = BTreeMap::new();
+    for f in &folders {
+        if let Some(r) = &f.remote_name {
+            target.insert(f.id, r.clone());
+        } else if f.role.is_none() {
+            let parent = match f.parent {
+                None => Some(None),
+                Some(p) => target.get(&p).map(|t| Some(t.clone())),
+            };
+            // Below a folder that stays local: local too.
+            if let Some(parent) = parent {
+                job.folder_creates.push((f.id, f.name.clone(), parent, None));
+                target.insert(f.id, placeholder(f.id));
+            }
+        } else if let Some(role) = f.role.and_then(creatable_role)
+            && f.parent.is_none()
+            && listed
+            && holds_server_mail.contains(&f.id)
+        {
+            job.folder_creates.push((f.id, f.name.clone(), None, Some(role)));
+            target.insert(f.id, placeholder(f.id));
+        }
+    }
+    let mut has_plain = false;
+    for f in &folders {
+        let Some(r) = f.remote_name.as_ref().filter(|_| f.role.is_none()) else { continue };
+        has_plain = true;
+        let Some(sh) = st.folders.get(r) else { continue };
+        let parent = match f.parent {
+            None => Some(None),
+            Some(p) => target.get(&p).map(|t| Some(t.clone())),
+        };
+        // Moved below a folder that stays local: left where it is on the server.
+        let Some(parent) = parent else { continue };
+        if sh.name != f.name || sh.parent != parent {
+            let mut patch = Map::new();
+            if sh.name != f.name {
+                patch.insert("name".into(), json!(f.name));
+            }
+            if sh.parent != parent {
+                patch.insert("parentId".into(), json!(parent));
+            }
+            job.folder_updates.push((
+                r.clone(),
+                Value::Object(patch),
+                JmapFolderShadow { name: f.name.clone(), parent },
+            ));
+        }
+    }
+    // Mailboxes whose folder is gone here, children first.
+    let mapped: BTreeSet<&str> = s
+        .mailbox
+        .folders
+        .values()
+        .filter(|f| f.account == a.id)
+        .filter_map(|f| f.remote_name.as_deref())
+        .collect();
+    let depth = |id: &str| {
+        let mut n = 0usize;
+        let mut cur = st.folders.get(id).and_then(|x| x.parent.clone());
+        while let Some(p) = cur {
+            n += 1;
+            if n > st.folders.len() {
+                break;
+            }
+            cur = st.folders.get(&p).and_then(|x| x.parent.clone());
+        }
+        n
+    };
+    let mut gone: Vec<String> =
+        st.folders.keys().filter(|id| !mapped.contains(id.as_str())).cloned().collect();
+    gone.sort_by_cached_key(|id| std::cmp::Reverse(depth(id)));
+    job.folder_destroys = gone;
+    // Folders known only from before the shadow existed: list the mailboxes again to learn them.
+    if has_plain && st.folders.is_empty() {
+        job.mailbox_state.clear();
+    }
+    target
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -318,6 +515,104 @@ fn get_emails(
     Ok((out, state))
 }
 
+/// One Mailbox/set create of `props` (with `role`, when given): the new mailbox id, or why the server refused.
+fn create_mailbox(
+    c: &JmapClient,
+    mut props: Value,
+    role: Option<&str>,
+) -> Result<Result<String, String>, NetError> {
+    if let Some(r) = role {
+        set(&mut props, "role", json!(r));
+    }
+    let mut create = Map::new();
+    create.insert("k".into(), props);
+    let r = c.set_objects("Mailbox/set", c.account_id(), create, Map::new(), &[], Map::new())?;
+    Ok(match r.created.get("k").and_then(|v| v.get("id")).and_then(Value::as_str) {
+        Some(id) => Ok(id.to_owned()),
+        None => Err(r
+            .not_created
+            .get("k")
+            .map(|e| format!("{} {}", e.kind, e.description).trim().to_owned())
+            .unwrap_or_else(|| "no reason given".to_owned())),
+    })
+}
+
+/// Creates and updates the job's folders on the server (parents first). Returns placeholder → new mailbox id.
+fn folder_changes(
+    c: &JmapClient,
+    j: &JmapJob,
+    account: AccountId,
+    events: &Events,
+    cancel: &AtomicBool,
+) -> Result<BTreeMap<String, String>, NetError> {
+    let mut created: BTreeMap<String, String> = BTreeMap::new();
+    for (folder, name, parent, role) in &j.folder_creates {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        let parent = match parent {
+            Some(p) => match resolve(p, &created) {
+                Some(id) => Some(id),
+                // Its parent could not be made: neither can it (this run).
+                None => continue,
+            },
+            None => None,
+        };
+        let props = json!({ "name": name, "parentId": parent });
+        let mut made = create_mailbox(c, props.clone(), *role)?;
+        if made.is_err() && role.is_some() {
+            // A server that lets clients set no roles: the mailbox without one (its name, e.g. "Archive", is
+            // recognised as the default folder when the folder list is read).
+            made = create_mailbox(c, props, None)?;
+        }
+        match made {
+            Ok(id) => {
+                created.insert(placeholder(*folder), id.clone());
+                // A default folder is never renamed or removed on the server from here: no shadow.
+                let shadow =
+                    role.is_none().then(|| JmapFolderShadow { name: name.clone(), parent: parent.clone() });
+                send(events, cancel, account, JmapEvent::FolderCreated { folder: *folder, id, shadow });
+            }
+            Err(why) => {
+                log::warn!("jmap: folder {name:?} not created: {why}");
+                // Shown in the account's status: mail moved into it stays where it is on the server until the
+                // folder can be made.
+                events.send(Event::FolderFailed {
+                    account,
+                    name: name.clone(),
+                    error: format!("the server did not create this folder ({why})"),
+                });
+            }
+        }
+    }
+    let mut update = Map::new();
+    let mut shadows: Vec<(String, JmapFolderShadow)> = Vec::new();
+    for (id, patch, shadow) in &j.folder_updates {
+        let mut patch = patch.clone();
+        let mut shadow = shadow.clone();
+        if let Some(p) = shadow.parent.clone() {
+            let Some(real) = resolve(&p, &created) else { continue };
+            if patch.get("parentId").is_some() {
+                set(&mut patch, "parentId", json!(real));
+            }
+            shadow.parent = Some(real);
+        }
+        update.insert(id.clone(), patch);
+        shadows.push((id.clone(), shadow));
+    }
+    if !update.is_empty() {
+        let r = c.set_objects("Mailbox/set", c.account_id(), Map::new(), update, &[], Map::new())?;
+        for (id, shadow) in shadows {
+            if r.updated.contains(&id) {
+                send(events, cancel, account, JmapEvent::FolderUpdated { id, shadow });
+            } else if let Some(e) = r.not_updated.get(&id) {
+                log::warn!("jmap: mailbox {id} not changed: {} {}", e.kind, e.description);
+            }
+        }
+    }
+    Ok(created)
+}
+
 pub(crate) fn run(
     account: AccountId,
     conn: &JmapConn,
@@ -336,15 +631,37 @@ pub(crate) fn run(
         Ok(c) => c,
         Err(e) => return Some(e.to_string()),
     };
+    send(
+        events,
+        cancel,
+        account,
+        JmapEvent::Offers {
+            contacts: super::jmap_pim::offers(&c, super::pim::PimKind::Contacts),
+            calendars: super::jmap_pim::offers(&c, super::pim::PimKind::Calendar),
+        },
+    );
+    let mut boxes_changed_here = false;
     let res: Result<(), NetError> = (|| {
         // 1. Local changes.
         if let Some(j) = job {
-            if !j.updates.is_empty() {
+            let created = folder_changes(&c, j, account, events, cancel)?;
+            boxes_changed_here = !j.folder_creates.is_empty() || !j.folder_updates.is_empty();
+            let mut updates: Vec<(String, Value, JmapShadow)> = Vec::new();
+            for (id, patch, shadow) in &j.updates {
+                // A move into a folder the server could not make waits for the next run.
+                let Some(mailbox) = resolve(&shadow.mailbox, &created) else { continue };
+                let mut patch = patch.clone();
+                if patch.get("mailboxIds").is_some() {
+                    set(&mut patch, "mailboxIds", json!({ mailbox.clone(): true }));
+                }
+                updates.push((id.clone(), patch, JmapShadow { mailbox, keywords: shadow.keywords.clone() }));
+            }
+            if !updates.is_empty() {
                 progress("Updating the server…");
                 let update: Map<String, Value> =
-                    j.updates.iter().map(|(id, p, _)| (id.clone(), p.clone())).collect();
+                    updates.iter().map(|(id, p, _)| (id.clone(), p.clone())).collect();
                 let r = c.set_emails(Map::new(), update, &[])?;
-                for (id, _, shadow) in &j.updates {
+                for (id, _, shadow) in &updates {
                     if r.updated.contains(id) {
                         send(
                             events,
@@ -372,12 +689,37 @@ pub(crate) fn run(
                 if cancelled() {
                     break;
                 }
+                let Some(mailbox) = resolve(mailbox, &created) else { continue };
                 progress("Uploading…");
                 let blob = c.upload(raw, "message/rfc822")?;
                 let kws: Vec<&str> = keywords.iter().map(String::as_str).collect();
                 let id = c.import_email(&blob, &[mailbox.as_str()], &kws)?;
                 let shadow = JmapShadow { mailbox: mailbox.clone(), keywords: keywords.clone() };
                 send(events, cancel, account, JmapEvent::Imported { item: *item, id, shadow });
+            }
+            if !j.folder_destroys.is_empty() && !cancelled() {
+                // A mailbox still holding mail (that arrived meanwhile, or that was never downloaded here) is
+                // kept: the folder list is read again below and its folder comes back.
+                let mut extra = Map::new();
+                extra.insert("onDestroyRemoveEmails".into(), json!(false));
+                let r = c.set_objects(
+                    "Mailbox/set",
+                    c.account_id(),
+                    Map::new(),
+                    Map::new(),
+                    &j.folder_destroys,
+                    extra,
+                )?;
+                let mut gone: Vec<String> = r.destroyed.clone();
+                for (id, e) in &r.not_destroyed {
+                    if e.kind == "notFound" {
+                        gone.push(id.clone());
+                    } else {
+                        log::warn!("jmap: mailbox {id} not deleted: {} {}", e.kind, e.description);
+                        boxes_changed_here = true;
+                    }
+                }
+                send(events, cancel, account, JmapEvent::FoldersDestroyed { ids: gone });
             }
         }
         // 2. The Outbox.
@@ -450,7 +792,8 @@ pub(crate) fn run(
         // 3. Receive.
         let Some(j) = job.filter(|j| j.receive) else { return Ok(()) };
         progress("Updating the folder list…");
-        let boxes_changed = j.mailbox_state.is_empty()
+        let boxes_changed = boxes_changed_here
+            || j.mailbox_state.is_empty()
             || match c.changes("Mailbox", &j.mailbox_state, Some(MAX_CHANGES)) {
                 Ok(ch) => {
                     ch.has_more_changes
@@ -624,12 +967,18 @@ fn apply_mailboxes(s: &mut Session, account: AccountId, mut list: Vec<JmapMailbo
     };
     list.sort_by_cached_key(|b| (depth(&b.id), b.sort_order, b.name.clone()));
     let ids: BTreeSet<String> = list.iter().map(|b| b.id.clone()).collect();
+    let known = prefs(s).jmap.get(&account.0).map(|st| st.folders.clone()).unwrap_or_default();
+    let server_roles: BTreeSet<FolderRole> = list.iter().filter_map(JmapMailbox::folder_role).collect();
     for b in &list {
         let display = local_folder_name(&b.name);
         let parent = b.parent_id.as_deref().and_then(|p| folder_of(s, account, p));
         if let Some(fid) = folder_of(s, account, &b.id) {
+            // The server's name and place win when they changed there (a change made here and not sent yet
+            // stays).
+            let changed_there = known.get(&b.id).is_none_or(|k| k.name != display || k.parent != b.parent_id);
             if let Some(f) = s.mailbox.folders.get_mut(&fid)
                 && f.role.is_none()
+                && changed_there
                 && (f.name != display || f.parent != parent)
             {
                 f.name = display;
@@ -637,10 +986,39 @@ fn apply_mailboxes(s: &mut Session, account: AccountId, mut list: Vec<JmapMailbo
             }
             continue;
         }
-        if let Some(role) = b.folder_role()
+        // The server's role, else (a top-level mailbox without one) a common name for it, as for IMAP servers
+        // without SPECIAL-USE, unless a listed mailbox has that role (a user's own "Deleted Items" never takes
+        // the place of the server's trash, whatever the listing order).
+        let role = b.folder_role().or_else(|| {
+            (b.role.is_none() && b.parent_id.is_none())
+                .then(|| mailcraft_net::imap::role_from_name(&b.name))
+                .flatten()
+                .filter(|r| *r != FolderRole::Inbox && *r != FolderRole::Outbox && !server_roles.contains(r))
+        });
+        if let Some(role) = role
             && let Some(fid) = s.mailbox.role_folder(account, role)
             && s.mailbox.folder(fid).is_some_and(|f| f.remote_name.is_none())
         {
+            if let Some(f) = s.mailbox.folders.get_mut(&fid) {
+                f.remote_name = Some(b.id.clone());
+            }
+            continue;
+        }
+        // A folder made here under the same name and parent (its creation crossed this listing): adopt it.
+        let adopt = s
+            .mailbox
+            .folders
+            .values()
+            .find(|f| {
+                f.account == account
+                    && f.parent == parent
+                    && f.remote_name.is_none()
+                    && f.role.is_none()
+                    && f.kind == FolderKind::Mail
+                    && f.name.eq_ignore_ascii_case(&display)
+            })
+            .map(|f| f.id);
+        if let Some(fid) = adopt {
             if let Some(f) = s.mailbox.folders.get_mut(&fid) {
                 f.remote_name = Some(b.id.clone());
             }
@@ -671,6 +1049,9 @@ fn apply_mailboxes(s: &mut Session, account: AccountId, mut list: Vec<JmapMailbo
         .collect();
     let mut remove = Vec::new();
     for (fid, is_role) in gone {
+        if let Some(name) = s.mailbox.folder(fid).and_then(|f| f.remote_name.clone()) {
+            s.sync.track.mailboxes_gone.insert((account, name));
+        }
         if is_role {
             if let Some(f) = s.mailbox.folders.get_mut(&fid) {
                 f.remote_name = None;
@@ -680,10 +1061,56 @@ fn apply_mailboxes(s: &mut Session, account: AccountId, mut list: Vec<JmapMailbo
         }
     }
     if !remove.is_empty() {
+        let mut sub: BTreeSet<FolderId> = BTreeSet::new();
+        for f in &remove {
+            sub.extend(s.mailbox.subtree(*f));
+        }
+        let shadow = prefs(s).jmap.get(&account.0).map(|st| st.shadow.clone()).unwrap_or_default();
+        // Mail the server last had in a mailbox that is still listed (this folder's mailbox was out of date,
+        // e.g. a folder brought back by redo) goes back there instead of going with the folder.
+        let mut rescued = Vec::new();
+        for m in s.mailbox.mail.items().filter(|m| sub.contains(&m.folder)) {
+            let home = m
+                .remote_id
+                .as_ref()
+                .and_then(|e| shadow.get(e))
+                .filter(|sh| ids.contains(&sh.mailbox))
+                .and_then(|sh| folder_of(s, account, &sh.mailbox))
+                .filter(|f| !sub.contains(f));
+            if let Some(f) = home {
+                rescued.push((m.id, f));
+            }
+        }
+        for (id, f) in rescued {
+            s.mailbox.mail.update(id, |m| m.folder = f);
+        }
+        // The server copies of the rest are not removed from here (they went with their mailbox there, or the
+        // server reports where they are now): their shadows go, so no run destroys them.
+        let lost: Vec<String> = s
+            .mailbox
+            .mail
+            .items()
+            .filter(|m| sub.contains(&m.folder))
+            .filter_map(|m| m.remote_id.clone())
+            .collect();
         let items = remove_folders(&mut s.mailbox, &remove);
+        let st = prefs(s).jmap.entry(account.0).or_default();
+        for e in &lost {
+            st.shadow.remove(e);
+        }
         s.sync.track.removed.extend(items);
+        s.sync.track.folders_removed.extend(sub);
     }
-    prefs(s).jmap.entry(account.0).or_default().mailbox_state = state;
+    let folders: BTreeMap<String, JmapFolderShadow> = list
+        .iter()
+        .filter(|b| b.role.is_none())
+        .map(|b| {
+            (b.id.clone(), JmapFolderShadow { name: local_folder_name(&b.name), parent: b.parent_id.clone() })
+        })
+        .collect();
+    let st = prefs(s).jmap.entry(account.0).or_default();
+    st.mailbox_state = state;
+    st.folders = folders;
 }
 
 fn apply_emails(s: &mut Session, account: AccountId, list: Vec<JEmail>, new_inbox: &mut Vec<ItemId>) {
@@ -773,6 +1200,49 @@ pub(crate) fn apply(s: &mut Session, account: AccountId, ev: JmapEvent, new_inbo
                 prefs(s).jmap.entry(account.0).or_default().shadow.insert(id, shadow);
             }
         }
+        JmapEvent::FolderCreated { folder, id, shadow } => {
+            if let Some(f) = s.mailbox.folders.get_mut(&folder)
+                && f.account == account
+                && f.remote_name.is_none()
+            {
+                f.remote_name = Some(id.clone());
+            }
+            if let Some(shadow) = shadow {
+                prefs(s).jmap.entry(account.0).or_default().folders.insert(id, shadow);
+            }
+        }
+        JmapEvent::FolderUpdated { id, shadow } => {
+            prefs(s).jmap.entry(account.0).or_default().folders.insert(id, shadow);
+        }
+        JmapEvent::FoldersDestroyed { ids } => {
+            let st = prefs(s).jmap.entry(account.0).or_default();
+            for id in &ids {
+                st.folders.remove(id);
+            }
+            s.sync.track.mailboxes_gone.extend(ids.into_iter().map(|id| (account, id)));
+        }
+        JmapEvent::Offers { contacts, calendars } => {
+            let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) else { return };
+            let before = (a.sync.jmap_contacts, a.sync.jmap_calendars);
+            if before == (contacts, calendars) {
+                return;
+            }
+            a.sync.jmap_contacts = contacts;
+            a.sync.jmap_calendars = calendars;
+            if (contacts && !before.0) || (calendars && !before.1) {
+                // Newly offered: synchronise the contacts and calendar right after this run.
+                let folders: Vec<FolderId> = [FolderRole::Contacts, FolderRole::Calendar]
+                    .into_iter()
+                    .filter_map(|r| s.mailbox.role_folder(account, r))
+                    .collect();
+                let plan = Plan { send: false, receive: true, folders: Some(folders), user: false };
+                let run = s.sync.runs.entry(account).or_default();
+                match run.again.as_mut() {
+                    Some(again) => again.merge(&plan),
+                    None => run.again = Some(plan),
+                }
+            }
+        }
         JmapEvent::Reset => {
             let st = prefs(s).jmap.entry(account.0).or_default();
             st.email_state.clear();
@@ -788,10 +1258,39 @@ pub(crate) fn apply(s: &mut Session, account: AccountId, ev: JmapEvent, new_inbo
     }
 }
 
+/// After undo/redo (once the synchronised state was carried over): a restored folder naming a mailbox that
+/// was removed from the server meanwhile (the undone folder's, destroyed by a run; or one deleted there) loses
+/// that name, so the next run makes it there again (and moves its mail into it) instead of finding the mailbox
+/// gone and dropping the folder.
+pub(crate) fn after_restore(s: &mut Session) {
+    if s.sync.track.mailboxes_gone.is_empty() {
+        return;
+    }
+    let gone = &s.sync.track.mailboxes_gone;
+    let jmap: BTreeSet<AccountId> =
+        s.mailbox.accounts.iter().filter(|a| a.kind == AccountKind::Jmap).map(|a| a.id).collect();
+    for f in s.mailbox.folders.values_mut() {
+        if jmap.contains(&f.account)
+            && f.kind == FolderKind::Mail
+            && f.remote_name.as_ref().is_some_and(|n| gone.contains(&(f.account, n.clone())))
+        {
+            f.remote_name = None;
+        }
+    }
+}
+
 /// After a command: true when the change record (`before`: everything but the mail as it was; `mail`: the
 /// before-images of the items written) changed mail of the JMAP account `account` in a way the server should
-/// learn (folder, read, flag, response, new or removed items). Only the items in the record are looked at.
+/// learn (folder, read, flag, response, new or removed items; mail folders made, renamed, moved or removed).
+/// Only the items in the record are looked at.
 pub(crate) fn changed(before: &Mailbox, mail: &MailChanges, after: &Mailbox, account: AccountId) -> bool {
+    let mail_folder = |f: &&Folder| f.account == account && f.kind == FolderKind::Mail;
+    let folders = |mb: &Mailbox| -> BTreeMap<FolderId, (String, Option<FolderId>)> {
+        mb.folders.values().filter(mail_folder).map(|f| (f.id, (f.name.clone(), f.parent))).collect()
+    };
+    if folders(before) != folders(after) {
+        return true;
+    }
     let in_acct = |mb: &Mailbox, m: &MailItem| mb.folder(m.folder).is_some_and(|f| f.account == account);
     let same = |a: &MailItem, b: &MailItem| {
         a.folder == b.folder

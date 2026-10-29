@@ -141,6 +141,13 @@ pub struct Config {
     /// JMAP filter conditions (`text`, `subject`, …) that Email/query refuses with `unsupportedFilter`
     /// (RFC 8621 section 4.4), wherever they appear in the filter.
     pub jmap_unsupported_filters: Vec<String>,
+    /// JMAP offers contacts (RFC 9610: one address book `AB1`, ContactCard/get, /query, /set) and calendars
+    /// (JMAP for Calendars: one calendar `CAL1`, CalendarEvent/get, /query, /set). The objects are kept as
+    /// given (JSContact / JSCalendar JSON); tests read and change them through [`TestServers`].
+    pub jmap_pim: bool,
+    /// JMAP Mailbox/set refuses a create that sets a `role` (`invalidProperties`), as servers that leave
+    /// roles to themselves.
+    pub jmap_refuse_roles: bool,
 }
 
 impl Default for Config {
@@ -172,6 +179,8 @@ impl Default for Config {
             oauth_token_lifetime: Duration::from_secs(3600),
             jmap_push: true,
             jmap_unsupported_filters: Vec::new(),
+            jmap_pim: false,
+            jmap_refuse_roles: false,
         }
     }
 }
@@ -427,6 +436,29 @@ impl TestServers {
         Ok(())
     }
 
+    /// `user`'s JMAP contacts or events (`kind` = `ContactCard` or `CalendarEvent`), as stored (with their
+    /// `id`).
+    pub fn jmap_objects(&self, user: &str, kind: &str) -> Vec<serde_json::Value> {
+        self.inner.ctx.jmap.lock().unwrap_or_else(|e| e.into_inner()).objects(user, kind)
+    }
+
+    /// Stores a JMAP contact or event for `user` as another client would (its address book / calendar
+    /// membership is set to the only one when missing); returns its id.
+    pub fn put_jmap_object(&self, user: &str, kind: &str, obj: serde_json::Value) -> String {
+        self.inner.ctx.jmap.lock().unwrap_or_else(|e| e.into_inner()).put_object(user, kind, obj)
+    }
+
+    /// Replaces top-level properties of a stored JMAP object (`null` removes one). False when there is no
+    /// such object.
+    pub fn update_jmap_object(&self, user: &str, kind: &str, id: &str, patch: serde_json::Value) -> bool {
+        self.inner.ctx.jmap.lock().unwrap_or_else(|e| e.into_inner()).update_object(user, kind, id, &patch)
+    }
+
+    /// Removes a stored JMAP object. False when there was none.
+    pub fn delete_jmap_object(&self, user: &str, kind: &str, id: &str) -> bool {
+        self.inner.ctx.jmap.lock().unwrap_or_else(|e| e.into_inner()).delete_object(user, kind, id)
+    }
+
     /// Creates a mailbox (and missing parents, `/` separated) for `user`.
     pub fn create_mailbox(&self, user: &str, name: &str, special: Option<SpecialUse>) -> Result<()> {
         self.shared.lock().create_mailbox(user, name, special)?;
@@ -463,6 +495,18 @@ impl TestServers {
     /// Mailbox names of `user`, in creation order.
     pub fn mailboxes(&self, user: &str) -> Result<Vec<String>> {
         self.shared.lock().mailbox_names(user)
+    }
+
+    /// Deletes `user`'s mailbox `name` (with its messages), as a server set up without it would be.
+    pub fn delete_mailbox(&self, user: &str, name: &str) -> Result<()> {
+        self.shared.lock().delete_mailbox(user, name)?;
+        self.shared.notify();
+        Ok(())
+    }
+
+    /// The RFC 6154 special use of `user`'s mailbox `name` (`None`: none, or no such mailbox).
+    pub fn special_use(&self, user: &str, name: &str) -> Option<SpecialUse> {
+        self.shared.lock().user(user)?.mailbox(name)?.special
     }
 
     /// Every message the SMTP server accepted, oldest first.
@@ -550,6 +594,13 @@ impl TestServers {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .add_collection(user, name, kind, display);
+    }
+
+    /// Gives every user one calendar for events and tasks (`calendar`, taking VEVENT and VTODO) and no
+    /// `tasks` collection, as servers that set up one default calendar per user. Call before the users' DAV
+    /// collections are first used.
+    pub fn set_single_dav_calendar(&self, on: bool) {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).single_calendar = on;
     }
 
     /// Moves `user`'s DAV collection `from` to `to`, with its items; requests for `from` are then redirected

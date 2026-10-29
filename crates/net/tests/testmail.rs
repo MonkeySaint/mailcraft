@@ -209,7 +209,11 @@ fn write_back_operations() {
         assert_eq!(uid, drafts[0].uid);
     }
 
-    acc.create_folder("Clients/Acme").unwrap();
+    acc.create_folder("Clients/Acme", None).unwrap();
+    // RFC 6154 CREATE-SPECIAL-USE.
+    acc.create_folder("Saved", Some("\\Archive")).unwrap();
+    assert_eq!(s.special_use(USER, "Saved"), Some(mailcraft_testmail::SpecialUse::Archive));
+    acc.delete_folder("Saved").unwrap();
     acc.rename_folder("Clients/Acme", "Clients/Acme Ltd").unwrap();
     let names = s.mailboxes(USER).unwrap();
     assert!(names.iter().any(|n| n == "Clients/Acme Ltd"), "{names:?}");

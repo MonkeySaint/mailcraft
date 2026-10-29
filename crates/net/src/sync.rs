@@ -661,9 +661,14 @@ impl ImapAccount {
         })
     }
 
-    pub fn create_folder(&mut self, name: &str) -> Result<()> {
+    /// Creates (and subscribes to) a folder; with `special_use` (`\Archive`) it is created as that kind of
+    /// folder when the server offers CREATE-SPECIAL-USE (RFC 6154).
+    pub fn create_folder(&mut self, name: &str, special_use: Option<&str>) -> Result<()> {
         self.with_client(false, |c| {
-            c.create(name)?;
+            match special_use {
+                Some(u) => c.create_special_use(name, u)?,
+                None => c.create(name)?,
+            }
             let _ = c.subscribe(name);
             Ok(())
         })

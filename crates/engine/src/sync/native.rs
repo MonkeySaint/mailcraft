@@ -862,7 +862,11 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
     let slow = super::slow_headers_only(s, id);
     let window = opts.download_months.map(|m| mailcraft_net::sync::months_before(now, m));
     // Contacts, tasks and calendars go to the DAV server; the mail part only sees mail folders.
-    let dav = super::dav::build_job(s, &a, &plan).filter(|j| !j.is_empty());
+    let jmap_conn = match &conn.incoming {
+        Incoming::Jmap(c) => Some(c),
+        _ => None,
+    };
+    let dav = super::dav::build_job(s, &a, &plan, jmap_conn).filter(|j| !j.is_empty());
     let full_plan = plan;
     let plan = super::dav::mail_only(s, id, &full_plan);
     let outgoing = outgoing_items(s, &a, &plan, now);
@@ -1303,7 +1307,9 @@ fn exec_op(imap: &mut ImapAccount, op: &RemoteOp, raw: Option<&[u8]>) -> Result<
             None => Err(NetError::Invalid("the message to upload no longer exists".into())),
         },
         RemoteOp::Expunge { folder, uid } => imap.expunge(folder, &[*uid]).map(|()| OpOutcome::Done),
-        RemoteOp::CreateFolder { name } => imap.create_folder(name).map(|()| OpOutcome::Done),
+        RemoteOp::CreateFolder { name, special_use } => {
+            imap.create_folder(name, special_use.as_deref()).map(|()| OpOutcome::Done)
+        }
         RemoteOp::RenameFolder { from, to } => imap.rename_folder(from, to).map(|()| OpOutcome::Done),
         RemoteOp::DeleteFolder { name } => imap.delete_folder(name).map(|()| OpOutcome::Done),
     };
@@ -2799,7 +2805,7 @@ fn apply_folders(s: &mut Session, account: AccountId, mut list: Vec<RemoteFolder
                 .pending
                 .iter()
                 .filter_map(|p| match &p.op {
-                    RemoteOp::CreateFolder { name } => Some(name.clone()),
+                    RemoteOp::CreateFolder { name, .. } => Some(name.clone()),
                     RemoteOp::RenameFolder { to, .. } => Some(to.clone()),
                     _ => None,
                 })

@@ -72,6 +72,9 @@ pub struct DavState {
     pub refuse_once: Option<String>,
     /// An href added to every collection listing (a response naming something that is not a member).
     pub stray_href: Option<String>,
+    /// Users get one calendar for events and tasks (`calendar`, VEVENT and VTODO) and no `tasks` collection,
+    /// as servers that give each user one default calendar.
+    pub single_calendar: bool,
 }
 
 pub type SharedDav = Arc<Mutex<DavState>>;
@@ -92,6 +95,14 @@ impl DavState {
     /// Creates the default collections of `user` when missing.
     pub fn ensure(&mut self, user: &str) {
         for (name, kind, display) in DEFAULT_COLLECTIONS {
+            if self.single_calendar && name == "tasks" {
+                continue;
+            }
+            let kind = if self.single_calendar && name == "calendar" {
+                Kind::Calendar(&["VEVENT", "VTODO"])
+            } else {
+                kind
+            };
             self.collections.entry((Self::key(user), name.to_owned())).or_insert_with(|| Collection {
                 kind,
                 display: display.to_owned(),

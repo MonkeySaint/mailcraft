@@ -7,6 +7,10 @@
 //! does not make an item look deleted, while an escaped `/` or `.` keeps its escape and names exactly the
 //! resource the server listed.
 //!
+//! **JMAP.** A JMAP account keeps its contacts and calendar on its JMAP server when that server offers them
+//! ([`pim::via_jmap`]); those folders run through the same [`sync_folder`] against a [`jmap_pim::Store`]
+//! (see `jmap_pim.rs`) instead of the WebDAV client ([`PimStore`]).
+//!
 //! **Connections.** The DAV servers have their own connection settings (trusted certificate, plain-HTTP
 //! consent) in [`mailcraft_model::DavSettings`]; nothing is taken over from the incoming mail server. An OAuth
 //! account's access token goes only to its provider's own servers; any other DAV server needs a DAV
@@ -19,12 +23,15 @@ use std::time::Duration;
 
 use mailcraft_model::account::CredentialKind;
 use mailcraft_model::{Account, AccountId, FolderId, FolderKind, ItemId, RemoteRef};
-use mailcraft_net::dav::{DavAuth, DavClient, Precondition, Service};
+use mailcraft_net::dav::{DavAuth, DavClient, Fetched, Listing, Precondition, Resource, Service};
 use mailcraft_net::http::{Url, normalize_path};
+use mailcraft_net::jmap::JmapClient;
 use mailcraft_net::oauth::OAuthProvider;
 use mailcraft_net::{ConnectOptions, NetError};
 
 use super::Plan;
+use super::jmap::JmapConn;
+use super::jmap_pim;
 use super::native::{Event, Events, oauth_provider};
 use super::pim::{self, FolderJob, FolderOutcome, PimEvent, PimKind, PublishJob, legacy_key, stored_canon};
 use crate::Session;
@@ -37,8 +44,9 @@ pub(super) struct DavJob {
     start: String,
     /// Addresses whose origins get the credentials (the DAV server and the publishing location).
     trust: Vec<String>,
-    /// Collections (canonical) mapped to folders: a folder still looking for one never takes these.
-    held: BTreeSet<String>,
+    /// Collections (canonical) mapped to folders, per kind of folder: a folder still looking for one never
+    /// takes those of its kind (a collection of events and tasks serves one Calendar and one Tasks folder).
+    held: BTreeMap<PimKind, BTreeSet<String>>,
     auth: DavAuth,
     /// The account's mail sign-in token was kept from a DAV origin that is not its provider's.
     token_withheld: bool,
@@ -51,6 +59,108 @@ pub(super) struct DavJob {
     discover_calendars: bool,
     folders: Vec<FolderJob>,
     publish: Vec<PublishJob>,
+    /// Contacts and calendars kept on the account's JMAP server.
+    jmap: Option<JmapPimJob>,
+}
+
+/// The JMAP part of a [`DavJob`]: which kinds go to the JMAP server, and whether to list its address books /
+/// calendars first.
+#[derive(Clone, Debug)]
+pub(super) struct JmapPimJob {
+    conn: JmapConn,
+    contacts: bool,
+    calendars: bool,
+    discover_contacts: bool,
+    discover_calendars: bool,
+    tz_offset_min: i32,
+    now: mailcraft_model::DateTime,
+}
+
+impl JmapPimJob {
+    fn handles(&self, kind: PimKind) -> bool {
+        match kind {
+            PimKind::Contacts => self.contacts,
+            PimKind::Calendar => self.calendars,
+            PimKind::Tasks => false,
+        }
+    }
+}
+
+/// What the folder synchronisation needs of a server: a WebDAV collection ([`DavClient`]) or a JMAP address
+/// book or calendar seen as one ([`jmap_pim::Store`]).
+pub(super) trait PimStore {
+    fn listing(&self, collection: &str) -> Result<Listing, NetError>;
+    fn put(
+        &self,
+        collection: &str,
+        url: &str,
+        data: &[u8],
+        content_type: &str,
+        pre: &Precondition,
+    ) -> Result<Option<String>, NetError>;
+    fn delete(&self, url: &str, etag: Option<&str>) -> Result<(), NetError>;
+    fn multiget(&self, collection: &str, urls: &[String], service: Service)
+    -> Result<Vec<Fetched>, NetError>;
+    fn list(&self, collection: &str) -> Result<Vec<Resource>, NetError> {
+        Ok(self.listing(collection)?.resources)
+    }
+}
+
+impl PimStore for DavClient {
+    fn listing(&self, collection: &str) -> Result<Listing, NetError> {
+        DavClient::listing(self, collection)
+    }
+    fn put(
+        &self,
+        _collection: &str,
+        url: &str,
+        data: &[u8],
+        content_type: &str,
+        pre: &Precondition,
+    ) -> Result<Option<String>, NetError> {
+        DavClient::put(self, url, data, content_type, pre)
+    }
+    fn delete(&self, url: &str, etag: Option<&str>) -> Result<(), NetError> {
+        DavClient::delete(self, url, etag)
+    }
+    fn multiget(
+        &self,
+        collection: &str,
+        urls: &[String],
+        service: Service,
+    ) -> Result<Vec<Fetched>, NetError> {
+        DavClient::multiget(self, collection, urls, service)
+    }
+    fn list(&self, collection: &str) -> Result<Vec<Resource>, NetError> {
+        DavClient::list(self, collection)
+    }
+}
+
+impl PimStore for jmap_pim::Store<'_> {
+    fn listing(&self, collection: &str) -> Result<Listing, NetError> {
+        jmap_pim::Store::listing(self, collection)
+    }
+    fn put(
+        &self,
+        collection: &str,
+        url: &str,
+        data: &[u8],
+        _content_type: &str,
+        pre: &Precondition,
+    ) -> Result<Option<String>, NetError> {
+        jmap_pim::Store::put(self, collection, url, data, pre)
+    }
+    fn delete(&self, url: &str, etag: Option<&str>) -> Result<(), NetError> {
+        jmap_pim::Store::delete(self, url, etag)
+    }
+    fn multiget(
+        &self,
+        _collection: &str,
+        urls: &[String],
+        _service: Service,
+    ) -> Result<Vec<Fetched>, NetError> {
+        jmap_pim::Store::multiget(self, urls)
+    }
 }
 
 impl DavJob {
@@ -65,6 +175,9 @@ impl DavJob {
         if let DavAuth::Bearer(t) = &mut self.auth {
             token.clone_into(t);
         }
+        if let Some(j) = self.jmap.as_mut() {
+            j.conn.set_bearer(token);
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -73,6 +186,7 @@ impl DavJob {
             && !self.discover_contacts
             && !self.discover_tasks
             && !self.discover_calendars
+            && !self.jmap.as_ref().is_some_and(|j| j.discover_contacts || j.discover_calendars)
     }
 }
 
@@ -200,22 +314,37 @@ fn publish_jobs(s: &Session, account: AccountId, plan: &Plan) -> Vec<PublishJob>
     out
 }
 
-/// The DAV part of `a`'s run for `plan` (`None` when there is nothing to do).
-pub(super) fn build_job(s: &Session, a: &Account, plan: &Plan) -> Option<DavJob> {
+/// The DAV part of `a`'s run for `plan` (`None` when there is nothing to do). `jmap` is the account's JMAP
+/// connection (a JMAP account), for the contacts and calendars it keeps there.
+pub(super) fn build_job(s: &Session, a: &Account, plan: &Plan, jmap: Option<&JmapConn>) -> Option<DavJob> {
     let folders = pim::plan_folders(s, a.id, plan);
     let publish = publish_jobs(s, a.id, plan);
     let dav = a.dav.clone().unwrap_or_default();
     let full = plan.receive && plan.folders.is_none();
     let unmapped = |k: PimKind| folders.iter().any(|f| f.kind == k && f.collection.is_none());
     let start = dav.url.trim().to_owned();
-    let discover_contacts = !start.is_empty() && dav.contacts && (full || unmapped(PimKind::Contacts));
+    let jmap_contacts = jmap.is_some() && pim::via_jmap(a, PimKind::Contacts);
+    let jmap_calendars = jmap.is_some() && pim::via_jmap(a, PimKind::Calendar);
+    let discover_contacts =
+        !start.is_empty() && dav.contacts && !jmap_contacts && (full || unmapped(PimKind::Contacts));
     let discover_tasks = !start.is_empty() && dav.tasks && (full || unmapped(PimKind::Tasks));
-    let discover_calendars = !start.is_empty() && dav.calendar && (full || unmapped(PimKind::Calendar));
+    let discover_calendars =
+        !start.is_empty() && dav.calendar && !jmap_calendars && (full || unmapped(PimKind::Calendar));
+    let jmap = jmap.filter(|_| jmap_contacts || jmap_calendars).map(|conn| JmapPimJob {
+        conn: conn.clone(),
+        contacts: jmap_contacts,
+        calendars: jmap_calendars,
+        discover_contacts: jmap_contacts && (full || unmapped(PimKind::Contacts)),
+        discover_calendars: jmap_calendars && (full || unmapped(PimKind::Calendar)),
+        tz_offset_min: s.tz_offset_min,
+        now: s.now(),
+    });
     if folders.is_empty()
         && publish.is_empty()
         && !discover_contacts
         && !discover_tasks
         && !discover_calendars
+        && !jmap.as_ref().is_some_and(|j| j.discover_contacts || j.discover_calendars)
     {
         return None;
     }
@@ -245,7 +374,12 @@ pub(super) fn build_job(s: &Session, a: &Account, plan: &Plan) -> Option<DavJob>
         (None, None) => DavAuth::None,
     };
     let options = dav_options(&dav);
-    let held: BTreeSet<String> = a.sync.dav.values().map(|st| stored_canon(&st.collection)).collect();
+    let mut held: BTreeMap<PimKind, BTreeSet<String>> = BTreeMap::new();
+    for (f, st) in &a.sync.dav {
+        if let Some(kind) = s.mailbox.folder(*f).and_then(|f| PimKind::of(f.kind)) {
+            held.entry(kind).or_default().insert(stored_canon(&st.collection));
+        }
+    }
     Some(DavJob {
         start,
         trust,
@@ -259,6 +393,7 @@ pub(super) fn build_job(s: &Session, a: &Account, plan: &Plan) -> Option<DavJob>
         discover_calendars,
         folders,
         publish,
+        jmap,
     })
 }
 
@@ -396,11 +531,41 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &Ar
     };
     let mut error: Option<String> = None;
     let mut found: BTreeMap<&'static str, Vec<(String, String)>> = BTreeMap::new();
-    if job.discover_contacts || job.discover_tasks || job.discover_calendars {
+    // The JMAP server, for the contacts and calendars kept there.
+    let jmap: Option<Result<JmapClient, NetError>> = job.jmap.as_ref().map(|j| j.conn.connect());
+    let jmap_discover = job.jmap.as_ref().is_some_and(|j| j.discover_contacts || j.discover_calendars);
+    if job.discover_contacts || job.discover_tasks || job.discover_calendars || jmap_discover {
         progress("Looking for address books, task lists and calendars…");
         let mut contacts = None;
         let mut tasks = None;
         let mut calendars = None;
+        if let (Some(j), Some(c)) = (job.jmap.as_ref(), jmap.as_ref()) {
+            for (kind, wanted, key) in [
+                (PimKind::Contacts, j.discover_contacts, "contacts"),
+                (PimKind::Calendar, j.discover_calendars, "calendars"),
+            ] {
+                if !wanted || cancelled() {
+                    continue;
+                }
+                let list = match c {
+                    Ok(c) if jmap_pim::offers(c, kind) => jmap_pim::collections(c, kind),
+                    Ok(_) => Ok(Vec::new()),
+                    Err(e) => Err(e.clone()),
+                };
+                match list {
+                    Ok(l) => {
+                        found.insert(key, l.clone());
+                        if kind == PimKind::Contacts {
+                            contacts = Some(l);
+                        } else {
+                            calendars = Some(l);
+                        }
+                    }
+                    Err(e) if fatal(&e) => return end(&e),
+                    Err(e) => error = Some(format!("{}: {}", kind.label(), failed(&e))),
+                }
+            }
+        }
         if job.discover_contacts {
             match client.discover(&start_url(&job.start), Service::Contacts) {
                 Ok(list) => {
@@ -456,7 +621,9 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &Ar
             PimKind::Tasks => "tasks",
             PimKind::Calendar => "calendars",
         };
+        let via_jmap = job.jmap.as_ref().is_some_and(|j| j.handles(f.kind));
         let collection = match &f.collection {
+            Some(c) if via_jmap => Some(c.clone()),
             // Stored by an earlier version (decoded): the address discovery just found for it, when it ran.
             Some(c) => Some(
                 found
@@ -465,9 +632,10 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &Ar
                     .unwrap_or_else(|| stored_canon(c)),
             ),
             None => {
-                let free = found.get(kind_key).and_then(|l| free_collection(l, &held));
+                let mine = held.entry(f.kind).or_default();
+                let free = found.get(kind_key).and_then(|l| free_collection(l, mine));
                 if let Some(c) = &free {
-                    held.insert(c.clone());
+                    mine.insert(c.clone());
                 }
                 free
             }
@@ -483,7 +651,23 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &Ar
             continue;
         };
         progress(&format!("Updating {}…", f.kind.label()));
-        match sync_folder(&client, f, &collection) {
+        let result = if via_jmap {
+            match jmap.as_ref() {
+                Some(Ok(c)) => {
+                    let (tz, now) = job
+                        .jmap
+                        .as_ref()
+                        .map_or((0, mailcraft_model::DateTime::default()), |j| (j.tz_offset_min, j.now));
+                    let store = jmap_pim::Store::new(c, f.kind, tz, now);
+                    sync_folder(&store, f, &collection)
+                }
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(NetError::Protocol("no JMAP connection".into())),
+            }
+        } else {
+            sync_folder(&client, f, &collection)
+        };
+        match result {
             Ok(out) => send(PimEvent::Folder(Box::new(out))),
             Err(e) => {
                 let msg = failed(&e);
@@ -587,7 +771,7 @@ struct Unknown {
 }
 
 /// Synchronises one folder with `collection` (canonical URL).
-fn sync_folder(client: &DavClient, job: &FolderJob, collection: &str) -> Result<FolderOutcome, NetError> {
+fn sync_folder(client: &dyn PimStore, job: &FolderJob, collection: &str) -> Result<FolderOutcome, NetError> {
     let kind = job.kind;
     let service = match kind {
         PimKind::Contacts => Service::Contacts,
@@ -630,7 +814,7 @@ fn sync_folder(client: &DavClient, job: &FolderJob, collection: &str) -> Result<
         Failed,
     }
     let put = |url: &str, body: &str, pre: Precondition, out: &mut FolderOutcome| -> Result<Put, NetError> {
-        match client.put(url, body.as_bytes(), kind.content_type(), &pre) {
+        match client.put(&coll_wire, url, body.as_bytes(), kind.content_type(), &pre) {
             Ok(etag) => Ok(Put::Done(etag.unwrap_or_default())),
             Err(e) if fatal(&e) => Err(e),
             Err(NetError::Http { status: 412, .. }) => Ok(Put::Conflict),
@@ -825,7 +1009,7 @@ fn sync_folder(client: &DavClient, job: &FolderJob, collection: &str) -> Result<
 /// did not come back (gone meanwhile, or too large) is dropped from `known`, so the next run does not take
 /// it for an item removed here.
 fn download(
-    client: &DavClient,
+    client: &dyn PimStore,
     coll_wire: &str,
     service: Service,
     fetch: &[(Option<(ItemId, u64)>, String)],
@@ -1028,7 +1212,7 @@ mod tests {
         let job = DavJob {
             start: String::new(),
             trust: vec![base.clone()],
-            held: BTreeSet::new(),
+            held: BTreeMap::new(),
             auth: DavAuth::Basic { user: "me@example.com".into(), password: "pw".into() },
             token_withheld: false,
             publish_base: format!("{base}/p/"),
@@ -1037,6 +1221,7 @@ mod tests {
             discover_tasks: false,
             discover_calendars: false,
             folders: Vec::new(),
+            jmap: None,
             publish: vec![PublishJob {
                 folder: FolderId(7),
                 url: format!("{base}/p/cal.ics"),
@@ -1104,7 +1289,7 @@ mod tests {
         let job = DavJob {
             start: String::new(),
             trust: vec![base.clone()],
-            held: BTreeSet::new(),
+            held: BTreeMap::new(),
             auth: DavAuth::None,
             token_withheld: false,
             publish_base: format!("{base}/p/"),
@@ -1113,6 +1298,7 @@ mod tests {
             discover_tasks: false,
             discover_calendars: false,
             folders: Vec::new(),
+            jmap: None,
             publish: vec![PublishJob {
                 folder: FolderId(7),
                 url: format!("{base}/p/cal.ics"),
