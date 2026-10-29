@@ -472,7 +472,16 @@ pub fn expiry(m: &MailItem) -> Option<DateTime> {
 /// The expiry date of the message whose source is (or starts with) `raw`.
 pub fn expiry_in(raw: &[u8]) -> Option<DateTime> {
     let head = raw.get(..raw.len().min(HEADER_SCAN))?;
-    let text = String::from_utf8_lossy(head);
+    // Only the header section is read (this runs for every message whose source leaves memory).
+    let end = head
+        .iter()
+        .enumerate()
+        .find_map(|(i, &b)| {
+            let next = head.get(i.saturating_add(1)..).unwrap_or_default();
+            (b == b'\n' && (next.starts_with(b"\n") || next.starts_with(b"\r\n"))).then_some(i)
+        })
+        .unwrap_or(head.len());
+    let text = String::from_utf8_lossy(head.get(..end).unwrap_or(head));
     let mut value: Option<String> = None;
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -502,6 +511,9 @@ pub fn stored_expiry(s: &Session, m: &MailItem) -> Option<DateTime> {
     if m.raw.is_some() {
         return expiry(m);
     }
+    if let Some(date) = s.search.released_expiry(m) {
+        return Some(date);
+    }
     let store = s.store.as_ref()?;
     match store.head_of(m, HEADER_SCAN) {
         Ok(head) => expiry_in(&head?),
@@ -512,9 +524,10 @@ pub fn stored_expiry(s: &Session, m: &MailItem) -> Option<DateTime> {
     }
 }
 
-/// The message carries an expiry date that has passed.
+/// The message carries an expiry date that has passed: read from its kept source, else the one noted when
+/// its source left memory this session (no file read; this paints rows).
 pub fn is_expired(s: &Session, m: &MailItem) -> bool {
-    expiry(m).is_some_and(|d| d.unix <= s.now().unix)
+    expiry(m).or_else(|| s.search.released_expiry(m)).is_some_and(|d| d.unix <= s.now().unix)
 }
 
 /// Font effects of the rules that match `m` (rules apply top to bottom; a later colour wins). `unread` is the

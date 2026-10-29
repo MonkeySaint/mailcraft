@@ -15,6 +15,7 @@ pub mod browser;
 pub mod catalog;
 pub mod cmd;
 pub mod compose;
+pub mod counts;
 pub mod datafile;
 pub mod intl;
 pub mod junk;
@@ -38,8 +39,8 @@ use serde_json::Value;
 pub use accounts::{FileSecretStore, MemorySecretStore, SecretStore};
 pub use mailcraft_model as model;
 pub use session::{
-    DEFAULT_QUICK_ACCESS, Module, Notice, SearchScope, Selection, Session, TodoBar, ViewState,
-    recent_move_folders,
+    DEFAULT_QUICK_ACCESS, Module, Notice, SNAPSHOT_TOO_LARGE, SearchScope, Selection, Session, TodoBar,
+    UNSAVED_TOO_LARGE, ViewState, recent_move_folders,
 };
 pub use sync::{Connection, MailboxQuota, Plan, SyncStatus, TestReport};
 

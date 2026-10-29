@@ -99,9 +99,19 @@ pub fn declared_charsets(raw: &[u8]) -> Vec<String> {
     out
 }
 
+/// The start of a message's source (its kept bytes or its blob in the store), enough for the header scans
+/// below.
+fn source_head<'a>(s: &Session, item: &'a MailItem) -> Option<std::borrow::Cow<'a, [u8]>> {
+    crate::cmd::compose::stored_head(s, item, MAX_CHARSET_SCAN)
+}
+
 /// The mailing-list address of a message (List-Post `mailto:`), when it has one.
-pub fn list_address(item: &MailItem) -> Option<String> {
-    let raw = item.raw.as_deref()?;
+pub fn list_address(s: &Session, item: &MailItem) -> Option<String> {
+    list_address_in(&source_head(s, item)?)
+}
+
+/// [`list_address`] from the message's source (or its start).
+pub fn list_address_in(raw: &[u8]) -> Option<String> {
     let post = crate::rules_exec::header_value(raw, "List-Post")?;
     let lower = post.to_lowercase();
     let start = lower.find("mailto:")?.saturating_add("mailto:".len());
@@ -115,11 +125,12 @@ pub fn list_address(item: &MailItem) -> Option<String> {
 }
 
 /// Everything [`junk::classify`] needs about `item`.
-fn context_for(item: &MailItem, contacts: &[String]) -> JunkContext {
+fn context_for(s: &Session, item: &MailItem, contacts: &[String]) -> JunkContext {
+    let head = source_head(s, item);
     JunkContext {
         contacts: contacts.to_vec(),
-        charsets: item.raw.as_deref().map(declared_charsets).unwrap_or_default(),
-        list_address: list_address(item),
+        charsets: head.as_deref().map(declared_charsets).unwrap_or_default(),
+        list_address: head.as_deref().and_then(list_address_in),
         score: ScoreInput {
             has_message_id: item.message_id.as_deref().is_some_and(|m| !m.trim().is_empty()),
         },
@@ -130,7 +141,7 @@ fn context_for(item: &MailItem, contacts: &[String]) -> JunkContext {
 pub fn classify(s: &Session, id: ItemId) -> Option<Verdict> {
     let item = s.mailbox.mail.get(&id)?;
     let contacts = contact_addresses(s);
-    Some(junk::classify(&s.mailbox.junk, item, &context_for(item, &contacts)))
+    Some(junk::classify(&s.mailbox.junk, item, &context_for(s, item, &contacts)))
 }
 
 /// A verdict as JSON (reason, entry, score, signals).
@@ -178,7 +189,7 @@ pub fn filter_items(s: &mut Session, ids: &[ItemId]) -> FilterReport {
         }
         let Some(item) = s.mailbox.mail.get(&id) else { continue };
         report.checked = report.checked.saturating_add(1);
-        let verdict = junk::classify(&s.mailbox.junk, item, &context_for(item, &contacts));
+        let verdict = junk::classify(&s.mailbox.junk, item, &context_for(s, item, &contacts));
         if !verdict.junk {
             continue;
         }
@@ -418,7 +429,7 @@ mod tests {
         let raw = "From: b@example.org\r\nList-Post: <mailto:Team@Lists.Example.org?subject=x>\r\n\r\nhi\r\n";
         s.mailbox.junk.level = JunkLevel::SafeListsOnly;
         let id = deliver(&mut s, "b@example.org", "x", "hi", Some(raw));
-        assert_eq!(list_address(&s.mailbox.mail[&id]).as_deref(), Some("team@lists.example.org"));
+        assert_eq!(list_address(&s, &s.mailbox.mail[&id]).as_deref(), Some("team@lists.example.org"));
         assert!(classify(&s, id).unwrap().junk);
         s.mailbox.junk.add(JunkList::SafeRecipients, "team@lists.example.org").unwrap();
         assert!(!classify(&s, id).unwrap().junk);

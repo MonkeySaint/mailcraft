@@ -179,11 +179,12 @@ pub(crate) fn response_recipients(s: &Session, m: &MailItem, kind: ComposeKind) 
 
 /// Images embedded in an HTML original (parts referenced by `cid:` from its body), so the quoted original
 /// keeps showing them and the sent response carries them. Empty when no source is kept.
-fn source_inline_images(m: &MailItem) -> Vec<InlineImage> {
-    let Some(raw) = m.raw.as_deref() else {
+fn source_inline_images(s: &Session, m: &MailItem) -> Vec<InlineImage> {
+    // The kept source, else the one in the store (sources leave memory once stored).
+    let Some(raw) = crate::cmd::compose::stored_raw(s, m) else {
         return Vec::new();
     };
-    let Ok(msg) = mailcraft_mime::parse(raw) else {
+    let Ok(msg) = mailcraft_mime::parse(&raw) else {
         return Vec::new();
     };
     msg.attachments()
@@ -347,13 +348,13 @@ pub fn build_response(s: &Session, id: ItemId, kind: ComposeKind, inline: bool) 
             };
             vec![eml_attachment(m, data)]
         }
-        _ if forward => source_attachments(m),
+        _ if forward => source_attachments(s, m),
         _ => Vec::new(),
     };
     let inline_images = if m.body.format == BodyFormat::PlainText || !mode.quotes() {
         Vec::new()
     } else {
-        source_inline_images(m)
+        source_inline_images(s, m)
     };
     let save_sent = sent_copy_for(s, m, kind);
     Some(ComposeState {

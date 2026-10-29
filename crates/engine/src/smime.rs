@@ -757,7 +757,7 @@ pub(crate) fn protect_for_send(
 /// True when a draft of `c` must be stored encrypted: Encrypt is on, or it answers or forwards an encrypted
 /// message (its quoted text came from the opened message).
 pub(crate) fn draft_must_be_encrypted(s: &Session, c: &ComposeState) -> bool {
-    c.encrypt || c.source.and_then(|id| s.mailbox.mail.get(&id)).is_some_and(is_encrypted)
+    c.encrypt || c.source.and_then(|id| s.mailbox.mail.get(&id)).is_some_and(|m| is_encrypted(s, m))
 }
 
 /// The draft `raw` encrypted to the user's own digital ID for `from` (only the user can open it; nothing is
@@ -785,7 +785,7 @@ pub(crate) fn compose_defaults(s: &Session, c: &mut ComposeState) {
     c.sign |= s.settings.bool("trust.smime.sign");
     c.encrypt |= s.settings.bool("trust.smime.encrypt");
     if let Some(src) = c.source.and_then(|id| s.mailbox.mail.get(&id))
-        && is_encrypted(src)
+        && is_encrypted(s, src)
     {
         c.encrypt = true;
     }
@@ -807,11 +807,17 @@ pub fn is_smime(m: &MailItem) -> bool {
     })
 }
 
-/// True when the item looks encrypted (an `application/pkcs7-mime` part that is not signed data).
-pub fn is_encrypted(m: &MailItem) -> bool {
+/// Most bytes of a source read back from the store to tell opaque-signed from encrypted (the top-level
+/// header says which).
+const KIND_SCAN: usize = 64 * 1024;
+
+/// True when the item looks encrypted (an `application/pkcs7-mime` part that is not signed data). The
+/// source is read back from the store when the item no longer keeps it (issue #25), so an opaque-signed
+/// message never counts as encrypted.
+pub fn is_encrypted(s: &Session, m: &MailItem) -> bool {
     m.attachments.iter().any(|a| a.mime_type.to_ascii_lowercase().contains("pkcs7-mime"))
         && !m.attachments.iter().any(|a| a.mime_type.to_ascii_lowercase().contains("pkcs7-signature"))
-        && m.raw.as_deref().is_none_or(|r| {
+        && crate::cmd::compose::stored_head(s, m, KIND_SCAN).as_deref().is_none_or(|r| {
             !matches!(mailcraft_smime::mime::detect(r), Some(mailcraft_smime::mime::Kind::OpaqueSigned))
         })
 }

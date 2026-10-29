@@ -43,6 +43,24 @@ pub struct Mailbox {
     pub junk: crate::junk::JunkSettings,
 }
 
+/// Mail counts of one folder (the folder pane's badges and accessible names).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderCounts {
+    /// Mail items filed in the folder.
+    pub total: usize,
+    /// Those not read.
+    pub unread: usize,
+}
+
+impl FolderCounts {
+    fn add(&mut self, read: bool) {
+        self.total = self.total.saturating_add(1);
+        if !read {
+            self.unread = self.unread.saturating_add(1);
+        }
+    }
+}
+
 /// Longest folder name accepted.
 pub const MAX_FOLDER_NAME_CHARS: usize = 255;
 
@@ -589,35 +607,100 @@ impl Mailbox {
     pub fn total_count(&self, folder: FolderId) -> usize {
         self.mail.values().filter(|m| m.folder == folder).count()
     }
+    /// The mail counts of `folder` (one scan of all mail; [`Mailbox::folder_counts`] counts every folder in
+    /// one scan).
+    pub fn counts_of(&self, folder: FolderId) -> FolderCounts {
+        let mut c = FolderCounts::default();
+        for m in self.mail.values().filter(|m| m.folder == folder) {
+            c.add(m.read);
+        }
+        c
+    }
+    /// The mail counts of every folder holding mail, in one scan of all mail. Folders without mail are
+    /// missing (their counts are zero).
+    pub fn folder_counts(&self) -> BTreeMap<FolderId, FolderCounts> {
+        let mut out: BTreeMap<FolderId, FolderCounts> = BTreeMap::new();
+        for m in self.mail.values() {
+            out.entry(m.folder).or_default().add(m.read);
+        }
+        out
+    }
     /// Folder-pane badge text: "[8]" for a folder that counts every item (total-count roles, or Properties ›
     /// "Show total number of items") when non-zero, "778" unread for others, `None` when nothing to show.
     pub fn badge(&self, folder: FolderId) -> Option<String> {
+        self.folders.get(&folder)?;
+        self.badge_with(folder, self.counts_of(folder))
+    }
+    /// [`Mailbox::badge`] from counts the caller already has.
+    pub fn badge_with(&self, folder: FolderId, counts: FolderCounts) -> Option<String> {
         let f = self.folders.get(&folder)?;
         if f.counts_total() {
-            let n = self.total_count(folder);
+            let n = counts.total;
             return (n > 0).then(|| format!("[{n}]"));
         }
-        let n = self.unread_count(folder);
+        let n = counts.unread;
         (n > 0).then(|| n.to_string())
     }
     /// Accessible name of a folder row: "Inbox: 778 unread messages", "Drafts: 8 items", or just the name.
     pub fn folder_accessible_name(&self, folder: FolderId) -> String {
+        if !self.folders.contains_key(&folder) {
+            return String::new();
+        }
+        self.folder_accessible_name_with(folder, self.counts_of(folder))
+    }
+    /// [`Mailbox::folder_accessible_name`] from counts the caller already has.
+    pub fn folder_accessible_name_with(&self, folder: FolderId, counts: FolderCounts) -> String {
         let Some(f) = self.folders.get(&folder) else {
             return String::new();
         };
         if f.counts_total() {
-            match self.total_count(folder) {
+            match counts.total {
                 0 => f.name.clone(),
                 1 => format!("{}: 1 item", f.name),
                 n => format!("{}: {n} items", f.name),
             }
         } else {
-            match self.unread_count(folder) {
+            match counts.unread {
                 0 => f.name.clone(),
                 1 => format!("{}: 1 unread message", f.name),
                 n => format!("{}: {n} unread messages", f.name),
             }
         }
+    }
+    /// A rough estimate of the memory this mailbox takes (fixed sizes plus the text and bytes it holds),
+    /// for byte caps such as the undo history's. One pass over every item; not exact, never panics.
+    pub fn approx_bytes(&self) -> usize {
+        let s = |t: &String| t.len();
+        let list = |v: &[String]| v.iter().map(String::len).fold(0usize, usize::saturating_add);
+        let mut total = std::mem::size_of::<Mailbox>();
+        let mut add = |n: usize| total = total.saturating_add(n);
+        for m in self.mail.values() {
+            add(m.approx_bytes());
+        }
+        for a in self.appointments.values() {
+            add(std::mem::size_of_val(a));
+            add(s(&a.subject).saturating_add(s(&a.location)).saturating_add(s(&a.body)));
+            add(a.body_html.as_ref().map_or(0, String::len));
+            add(a.remote.as_ref().map_or(0, |r| r.raw.len()));
+        }
+        for c in self.contacts.values() {
+            add(std::mem::size_of_val(c));
+            add(s(&c.file_as).saturating_add(s(&c.notes)).saturating_add(list(&c.emails)));
+            add(c.picture.as_ref().map_or(0, |p| p.data.len()));
+            add(list(&c.certificates));
+            add(c.remote.as_ref().map_or(0, |r| r.raw.len()));
+        }
+        for t in self.tasks.values() {
+            add(std::mem::size_of_val(t));
+            add(s(&t.subject).saturating_add(s(&t.body)));
+        }
+        for n in self.notes.values() {
+            add(std::mem::size_of_val(n));
+            add(s(&n.text));
+        }
+        add(self.folders.len().saturating_mul(std::mem::size_of::<crate::Folder>().saturating_add(64)));
+        add(self.views.len().saturating_mul(std::mem::size_of::<ViewSettings>()));
+        total
     }
     /// Moves items; returns the ids actually moved.
     ///

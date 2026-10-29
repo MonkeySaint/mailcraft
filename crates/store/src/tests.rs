@@ -812,7 +812,14 @@ fn append_refuses_to_grow_journal_past_cap() {
     store.set_journal_cap(store.journal_bytes() + 200);
     let before = fs::read(d.path().join(JOURNAL_FILE)).unwrap();
     let big = "x".repeat(500);
-    assert!(store.append(&[Op::PutMail(Box::new(mail(2, &big, None)))]).is_err());
+    let err = store.append(&[Op::PutMail(Box::new(mail(2, &big, None)))]).unwrap_err();
+    assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
+    assert_eq!(fs::read(d.path().join(JOURNAL_FILE)).unwrap(), before, "journal untouched");
+    // A batch that fits only together with ops before it is refused as a whole.
+    let small = || Op::PutMail(Box::new(mail(3, "small", None)));
+    let err =
+        store.append(&[small(), small(), small(), Op::PutMail(Box::new(mail(4, &big, None)))]).unwrap_err();
+    assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
     assert_eq!(fs::read(d.path().join(JOURNAL_FILE)).unwrap(), before, "journal untouched");
     drop(store);
     let store = Store::open(d.path()).unwrap();
@@ -939,4 +946,97 @@ fn garbled_recoverable_file_is_an_error_and_keeps_blobs() {
     assert!(matches!(store.load_recoverable(), Err(StoreError::Corrupt(_))));
     assert!(store.gc_blobs(&base_mailbox()).is_err());
     assert!(store.has_blob(&key));
+}
+
+/// Issue #25: a snapshot past the size cap `load` applies is never written. The checkpoint fails, the old
+/// snapshot and the journal stay, and the store still opens with every change.
+#[test]
+fn checkpoint_past_snapshot_cap_is_refused_and_keeps_the_journal() {
+    let d = tmp();
+    let mut store = Store::open(d.path()).unwrap();
+    let mut mb = base_mailbox();
+    store.checkpoint(&mb).unwrap();
+    let snapshot = fs::read(d.path().join(SNAPSHOT_FILE)).unwrap();
+    let item = mail(1, &"s".repeat(4_000), Some(RAW1));
+    mb.mail.insert(item.id, item.clone());
+    store.append(&[Op::PutMail(Box::new(item))]).unwrap();
+    let journal = fs::read(d.path().join(JOURNAL_FILE)).unwrap();
+    store.set_snapshot_cap(1_000);
+    let err = store.checkpoint(&mb).unwrap_err();
+    assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
+    assert_eq!(store.generation(), 1, "no new generation");
+    assert_eq!(fs::read(d.path().join(SNAPSHOT_FILE)).unwrap(), snapshot, "old snapshot kept");
+    assert_eq!(fs::read(d.path().join(JOURNAL_FILE)).unwrap(), journal, "journal kept");
+    let leftovers = fs::read_dir(d.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+        .count();
+    assert_eq!(leftovers, 0, "no temp file left behind");
+    // Later changes still go to the journal.
+    store.append(&[Op::RemoveMail(ItemId(1))]).unwrap();
+    mb.mail.clear();
+    drop(store);
+    let store = Store::open(d.path()).unwrap();
+    assert_eq!(store.load().unwrap(), mb);
+}
+
+/// The snapshot writer and reader share one limit: exactly at the cap is written and read back, one byte
+/// over is refused before the file is replaced.
+#[test]
+fn snapshot_write_and_read_limits_agree() {
+    let d = tmp();
+    let mut mb = base_mailbox();
+    mb.mail.insert(ItemId(5), mail(5, "limit", None));
+    crate::journal::write_snapshot(d.path(), 3, &mb).unwrap();
+    let size = fs::metadata(d.path().join(SNAPSHOT_FILE)).unwrap().len();
+    assert!(crate::journal::write_snapshot_capped(d.path(), 4, &mb, size).is_ok());
+    assert_eq!(crate::journal::read_snapshot(d.path()).unwrap(), (4, mb.clone()));
+    let err = crate::journal::write_snapshot_capped(d.path(), 5, &mb, size - 1).unwrap_err();
+    assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
+    assert_eq!(crate::journal::read_snapshot(d.path()).unwrap().0, 4, "the readable snapshot stays");
+    // A cap above the reader's is lowered to it; both writers default to it.
+    let mut store = Store::open(d.path()).unwrap();
+    assert_eq!(store.snapshot_cap, crate::journal::MAX_STATE_BYTES);
+    assert_eq!(store.journal_cap, crate::journal::MAX_STATE_BYTES);
+    store.set_snapshot_cap(u64::MAX);
+    assert_eq!(store.snapshot_cap, crate::journal::MAX_STATE_BYTES);
+}
+
+/// When neither the journal nor a snapshot can take the state, autosave reports it and keeps the batch.
+#[test]
+fn autosave_keeps_the_batch_when_journal_and_snapshot_are_refused() {
+    let d = tmp();
+    let mut store = Store::open(d.path()).unwrap();
+    store.set_journal_cap(store.journal_bytes() + 50);
+    store.set_snapshot_cap(100);
+    let mut mb = base_mailbox();
+    let mut auto = Autosave::new(0);
+    let item = mail(1, &"w".repeat(200), None);
+    mb.mail.insert(item.id, item.clone());
+    assert!(auto.record(&mut store, &mb, &[Op::PutMail(Box::new(item))]).is_err());
+    assert_eq!(auto.pending(), 1, "nothing lost");
+    assert_eq!(store.generation(), 0);
+}
+
+/// `append_keyed` names the blob each source went to, for single items and whole-mailbox replaces.
+#[test]
+fn append_keyed_reports_where_sources_went() {
+    let d = tmp();
+    let mut store = Store::open(d.path()).unwrap();
+    let a = mail(1, "A", Some(RAW1));
+    let mut mb = base_mailbox();
+    mb.mail.insert(ItemId(2), mail(2, "B", Some(RAW2)));
+    mb.mail.insert(ItemId(3), mail(3, "C", None));
+    let ops = [Op::PutMail(Box::new(a)), Op::RemoveMail(ItemId(9)), Op::Replace(Box::new(mb))];
+    let keys = store.append_keyed(&ops).unwrap();
+    let want = vec![
+        (ItemId(1), BlobKey::for_data(RAW1).to_string()),
+        (ItemId(2), BlobKey::for_data(RAW2).to_string()),
+    ];
+    assert_eq!(keys, want);
+    for (_, key) in &keys {
+        assert!(store.has_blob(key));
+    }
+    assert!(store.append_keyed(&[]).unwrap().is_empty());
 }

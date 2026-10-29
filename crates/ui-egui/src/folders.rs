@@ -431,8 +431,10 @@ fn minimized_strip(ui: &mut Ui, app: &mut App, rect: Rect, auto: bool, st: &mut 
     if entries.is_empty() || app.s.view.module != Module::Mail {
         let sel = app.s.selection.folder;
         if let Some(f) = app.s.mailbox.folder(sel) {
-            let badge = app.s.mailbox.badge(sel).unwrap_or_default();
-            entries = vec![(sel, f.name.clone(), badge, true, app.s.mailbox.folder_accessible_name(sel))];
+            let counts = app.s.folder_counts(sel);
+            let badge = app.s.mailbox.badge_with(sel, counts).unwrap_or_default();
+            let name = app.s.mailbox.folder_accessible_name_with(sel, counts);
+            entries = vec![(sel, f.name.clone(), badge, true, name)];
         }
     }
     let mut y = b.bottom() + 12.0;

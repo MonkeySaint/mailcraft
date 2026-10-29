@@ -2094,6 +2094,7 @@ pub(super) fn poll_events(s: &mut Session) -> bool {
     if res.is_err() {
         log::error!("applying send/receive results panicked; the mailbox was restored");
         s.mailbox = before;
+        s.mailbox_changed();
         return false;
     }
     let ops = crate::session::diff_ops(&before, &s.mailbox);

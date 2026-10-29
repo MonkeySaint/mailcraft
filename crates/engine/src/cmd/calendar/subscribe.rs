@@ -172,6 +172,7 @@ pub fn apply_background(
         Err(_) => {
             log::error!("applying an internet calendar refresh panicked; the mailbox was restored");
             s.mailbox = before;
+            s.mailbox_changed();
             serde_json::json!({ "folder": folder.0, "error": "the calendar could not be updated" })
         }
     }

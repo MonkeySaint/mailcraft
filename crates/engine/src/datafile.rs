@@ -377,6 +377,19 @@ fn write_durable(
     Ok(())
 }
 
+/// A data file larger than `cap` ([`MAX_FILE_BYTES`], the most [`read_file`] reads back) is never written:
+/// it could not be opened again (issue #25).
+fn check_size(bytes: &[u8], cap: u64) -> Result<(), CmdError> {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if len > cap {
+        return Err(CmdError::Failed(format!(
+            "the data file would take {len} bytes, more than the {cap} bytes MailCraft can open again; move \
+             some of its mail to another data file first"
+        )));
+    }
+    Ok(())
+}
+
 /// Closes data file `account`: saves it as a closed data file, then removes it from the mailbox. Nothing is
 /// removed when the save fails. Returns where it went (`None`: kept in memory).
 pub fn detach(s: &mut Session, account: AccountId) -> Result<(Option<PathBuf>, usize), CmdError> {
@@ -384,6 +397,7 @@ pub fn detach(s: &mut Session, account: AccountId) -> Result<(Option<PathBuf>, u
     let name = image.account.display_name.clone();
     let bytes = serde_json::to_vec(&image)
         .map_err(|e| CmdError::Failed(format!("cannot write the closed data file: {e}")))?;
+    check_size(&bytes, MAX_FILE_BYTES)?;
     let path = match closed_dir(s) {
         Some(dir) => Some(write_new(&dir, &name, &bytes)?),
         None => {
@@ -1252,6 +1266,7 @@ pub(crate) fn save_linked_as(
     } else {
         &plain
     };
+    check_size(bytes, MAX_FILE_BYTES)?;
     let written = if changed_elsewhere {
         let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
         let stem = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1431,6 +1446,21 @@ pub(crate) mod tests {
             ..Default::default()
         };
         serde_json::to_vec(&image).unwrap()
+    }
+
+    /// Issue #25: the writer refuses what the reader would refuse, so a data file never becomes one that
+    /// cannot be opened again.
+    #[test]
+    fn data_file_write_and_read_limits_agree() {
+        let bytes = plain_file("x");
+        let len = u64::try_from(bytes.len()).unwrap();
+        assert!(check_size(&bytes, len).is_ok());
+        assert!(matches!(check_size(&bytes, len - 1), Err(CmdError::Failed(e)) if e.contains("open again")));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.mcdata");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_capped(&path, len).is_ok());
+        assert!(read_capped(&path, len - 1).is_err());
     }
 
     /// Regression: `is_sealed` looked for the format name anywhere in the first 256 bytes, so a plain data

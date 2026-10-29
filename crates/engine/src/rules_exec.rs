@@ -132,7 +132,18 @@ pub fn rule_env(s: &Session, item: &MailItem, contacts: &[String]) -> RuleEnv {
         }
         cur = f.parent;
     }
-    RuleEnv { folder_role: role, rss_feed, contacts: contacts.to_vec() }
+    RuleEnv { folder_role: role, rss_feed, contacts: contacts.to_vec(), source_head: None }
+}
+
+/// The start of `item`'s source read back from the store, for conditions that scan it when the item no
+/// longer keeps it in memory (sources leave memory once stored, issue #25). `None` when the item keeps its
+/// source (the conditions read that) or has none.
+fn stored_source_head(s: &Session, item: &MailItem) -> Option<Vec<u8>> {
+    if item.raw.is_some() {
+        return None;
+    }
+    crate::cmd::compose::stored_head(s, item, mailcraft_model::rule::SOURCE_SCAN_LIMIT)
+        .map(std::borrow::Cow::into_owned)
 }
 
 fn contact_addresses(s: &Session) -> Vec<String> {
@@ -168,11 +179,20 @@ pub fn run_rules(s: &mut Session, ids: &[ItemId], rules: &[Rule]) -> RunReport {
     let mut run = Run { contacts: contact_addresses(s), ..Default::default() };
     for &id in ids {
         let mut hit = false;
+        // The stored source, read once per item and only for rules whose conditions scan it.
+        let mut head: Option<Option<Vec<u8>>> = None;
         for rule in rules {
             let Some(item) = s.mailbox.mail.get(&id) else { break };
             let ctx = rule_context(s, item);
-            let env = rule_env(s, item, &run.contacts);
-            if !rule.matches_in(item, &ctx, &env) {
+            let mut env = rule_env(s, item, &run.contacts);
+            if rule.needs_source() {
+                env.source_head = head.take().unwrap_or_else(|| stored_source_head(s, item));
+            }
+            let matched = rule.matches_in(item, &ctx, &env);
+            if rule.needs_source() {
+                head = Some(env.source_head.take());
+            }
+            if !matched {
                 continue;
             }
             hit = true;
@@ -711,18 +731,20 @@ enum Reply<'a> {
 
 /// True for mail that must not be answered automatically (RFC 3834 §2): automatic replies, list and bulk
 /// mail.
-fn no_auto_reply(m: &MailItem) -> bool {
-    if mailcraft_model::rule::is_automatic_reply(m) {
+fn no_auto_reply(s: &Session, m: &MailItem) -> bool {
+    let env = RuleEnv { source_head: stored_source_head(s, m), ..Default::default() };
+    let source = m.raw.as_deref().or(env.source_head.as_deref());
+    if mailcraft_model::rule::is_automatic_reply_in(m, source) {
         return true;
     }
     let head = mailcraft_model::rule::RuleCondition::HeaderContains(vec!["list-id:".into()]);
     let ctx = RuleContext::default();
-    if head.matches(m, &ctx) {
+    if head.matches_in(m, &ctx, &env) {
         return true;
     }
-    ["precedence: bulk", "precedence: list", "precedence: junk"]
-        .iter()
-        .any(|p| mailcraft_model::rule::RuleCondition::HeaderContains(vec![(*p).into()]).matches(m, &ctx))
+    ["precedence: bulk", "precedence: list", "precedence: junk"].iter().any(|p| {
+        mailcraft_model::rule::RuleCondition::HeaderContains(vec![(*p).into()]).matches_in(m, &ctx, &env)
+    })
 }
 
 /// A reply template read from an .eml file: subject, body and attachments.
@@ -771,7 +793,7 @@ fn auto_reply(s: &mut Session, run: &mut Run, rule: &Rule, id: ItemId, reply: Re
     let Some(m) = s.mailbox.mail.get(&id) else { return };
     let Some(sender) = m.reply_to.first().or(m.from.as_ref()).or(m.sender.as_ref()) else { return };
     let key = sender.addr.trim().to_lowercase();
-    if key.is_empty() || from_me(s, m) || no_auto_reply(m) || run.replied.contains(&key) {
+    if key.is_empty() || from_me(s, m) || no_auto_reply(s, m) || run.replied.contains(&key) {
         return;
     }
     if !budget(run, rule) {

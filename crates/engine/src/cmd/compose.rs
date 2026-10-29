@@ -1751,7 +1751,7 @@ fn attach_item(s: &mut Session, p: &Value) -> CmdResult {
         ComposeAttachment {
             filename: safe_name(&m.subject, "message", "eml"),
             mime_type: "message/rfc822".into(),
-            data: message_source(m),
+            data: stored_raw(s, m).filter(|r| !r.is_empty()).unwrap_or_else(|| message_source(m)),
         }
     } else if let Some(c) = s.mailbox.contacts.get(&id) {
         let name = if c.full_name().is_empty() { c.file_as.clone() } else { c.full_name() };
@@ -2871,7 +2871,7 @@ pub(crate) fn commit_extras(s: &mut Session, before: mailcraft_model::Mailbox, l
     if before == s.mailbox || !crate::session::diff_ops(&before, &s.mailbox).is_empty() {
         return;
     }
-    s.undo.push(crate::undo::UndoEntry { label: label.to_owned(), before: Box::new(before) });
+    s.undo.push(crate::undo::UndoEntry::new(label, Box::new(before)));
     s.journal(vec![mailcraft_store::Op::Replace(Box::new(s.mailbox.clone()))]);
 }
 
@@ -3110,6 +3110,27 @@ pub(crate) fn stored_raw(s: &Session, m: &MailItem) -> Option<Vec<u8>> {
         return Some(r.clone());
     }
     s.store.as_ref().and_then(|st| st.raw_of(m).ok().flatten())
+}
+
+/// The first `cap` bytes of a stored item's source (for header scans): its kept bytes, else the start of
+/// its blob in the store (sources leave memory once stored, issue #25). `None` when it has no source.
+pub(crate) fn stored_head<'a>(
+    s: &Session,
+    m: &'a MailItem,
+    cap: usize,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+    use std::borrow::Cow;
+    if let Some(r) = &m.raw {
+        return Some(Cow::Borrowed(r.get(..r.len().min(cap)).unwrap_or_default()));
+    }
+    let store = s.store.as_ref()?;
+    match store.head_of(m, cap) {
+        Ok(head) => head.map(Cow::Owned),
+        Err(e) => {
+            log::warn!("cannot read the source of message {}: {e}", m.id.0);
+            None
+        }
+    }
 }
 
 /// The header section of `raw` (up to, not including, the first empty line).

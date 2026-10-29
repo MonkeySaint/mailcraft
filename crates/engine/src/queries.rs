@@ -201,13 +201,18 @@ fn folder_row(
         }
     } else if show_total {
         // The folder's own choice: the number of items, unread or not.
-        match s.mailbox.total_count(id) {
+        match s.folder_counts(id).total {
             0 => (String::new(), f.name.clone()),
             1 => ("[1]".to_owned(), format!("{}: 1 item", f.name)),
             n => (format!("[{n}]"), format!("{}: {n} items", f.name)),
         }
     } else {
-        (s.mailbox.badge(id).unwrap_or_default(), s.mailbox.folder_accessible_name(id))
+        // Counted once per mailbox change for every folder, not once per folder per frame (issue #25).
+        let counts = s.folder_counts(id);
+        (
+            s.mailbox.badge_with(id, counts).unwrap_or_default(),
+            s.mailbox.folder_accessible_name_with(id, counts),
+        )
     };
     Some(FolderRow {
         id: Some(id),

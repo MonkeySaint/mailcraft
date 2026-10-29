@@ -568,6 +568,8 @@ impl Session {
         tick(self);
         groups::tick(self);
         crate::recover::tick(self);
+        // Sources the batch stored leave memory (issue #25).
+        self.release_sources();
         if self.undo.undo.is_empty() && self.undo.redo.is_empty() && !self.sync.track.is_empty() {
             self.sync.track = Track::default();
         }

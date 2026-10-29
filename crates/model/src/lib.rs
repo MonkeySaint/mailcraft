@@ -45,7 +45,7 @@ pub use item::{
     Sensitivity, VoteRecord,
 };
 pub use junk::{JunkLevel, JunkList, JunkSettings};
-pub use mailbox::Mailbox;
+pub use mailbox::{FolderCounts, Mailbox};
 pub use note::{Note, NoteColor};
 pub use quickstep::{MessageAction, QuickStep, QuickStepAction};
 pub use recover::{DeletedItem, MAX_RECOVERABLE, RecoverBin, Recoverable};

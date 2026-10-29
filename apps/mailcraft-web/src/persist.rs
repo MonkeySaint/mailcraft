@@ -27,10 +27,24 @@ struct Envelope {
     mailbox: Mailbox,
 }
 
-/// The stored form of `mailbox`.
+/// The stored form of `mailbox`. Refused when [`decode`] would refuse it (larger than
+/// [`MAX_STORED_CHARS`]): the document already stored stays rather than being replaced by one that cannot be
+/// read back (issue #25).
 pub fn encode(mailbox: &Mailbox) -> Result<String, String> {
-    serde_json::to_string(&EnvelopeRef { format: FORMAT, mailbox })
-        .map_err(|e| format!("could not encode the mailbox: {e}"))
+    let text = serde_json::to_string(&EnvelopeRef { format: FORMAT, mailbox })
+        .map_err(|e| format!("could not encode the mailbox: {e}"))?;
+    check_size(&text, MAX_STORED_CHARS)?;
+    Ok(text)
+}
+
+fn check_size(text: &str, cap: usize) -> Result<(), String> {
+    if text.len() > cap {
+        return Err(format!(
+            "the mailbox is too large to keep in browser storage ({} bytes, at most {cap})",
+            text.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Reads a stored document back. Errors describe why it was not usable (too big, not JSON, other format).
@@ -79,5 +93,16 @@ mod tests {
         let text = encode(&sample_mailbox(sample_now())).unwrap();
         let cut = text.get(..text.len() / 2).unwrap();
         assert!(decode(cut).is_err());
+    }
+
+    /// The writer refuses what the reader refuses.
+    #[test]
+    fn write_and_read_limits_agree() {
+        let text = encode(&sample_mailbox(sample_now())).unwrap();
+        assert!(check_size(&text, text.len()).is_ok());
+        assert!(check_size(&text, text.len() - 1).is_err());
+        let huge = " ".repeat(MAX_STORED_CHARS + 1);
+        assert!(check_size(&huge, MAX_STORED_CHARS).is_err());
+        assert!(decode(&huge).is_err());
     }
 }

@@ -125,6 +125,11 @@ fn no_command_panics_on_hostile_params() {
                 let _ = mailcraft_engine::queries::list_rows(&s);
                 let _ = mailcraft_engine::queries::folder_rows(&s);
                 let _ = mailcraft_engine::queries::status_counts(&s);
+                // The memoised folder counts must follow whatever the command did (issue #25).
+                if *s.all_folder_counts() != s.mailbox.folder_counts() {
+                    failures.push(format!("{id} left stale folder counts"));
+                    break;
+                }
             }
         }
     }

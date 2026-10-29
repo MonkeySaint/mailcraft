@@ -1868,7 +1868,9 @@ mod tests {
         assert_eq!(kids.len(), 1);
         let m = s.mailbox.items_in(kids[0])[0];
         assert_eq!(m.subject, "Report: Q3/Q4");
-        assert_eq!(m.raw.as_deref(), Some(EML), "the source travels with the closed data file");
+        // The source travels with the closed data file (back in the store, it leaves memory again).
+        assert_eq!(crate::cmd::compose::stored_raw(&s, m).as_deref(), Some(EML));
+        assert!(m.raw.is_none() && m.blob.is_some());
         assert!(!path.exists(), "an opened file is not offered again");
         assert!(crate::datafile::closed_entries(&s).is_empty());
         assert!(s.mailbox.validate().is_empty(), "{:?}", s.mailbox.validate());

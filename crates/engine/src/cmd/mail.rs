@@ -1024,7 +1024,7 @@ fn choose_form(s: &mut Session, p: &Value) -> CmdResult {
         // The template's format is the message's format, whatever Options say for new messages.
         format_explicit: true,
         importance: m.importance,
-        attachments: source_attachments(&m),
+        attachments: source_attachments(s, &m),
         dirty: true,
         ..Default::default()
     };
@@ -2551,14 +2551,15 @@ fn junk(s: &mut Session, p: &Value) -> CmdResult {
 /// Recipients are never picked just for being there: a cross-posted copy or a delegate's message does not
 /// put a colleague on the Safe Recipients List.
 fn list_entry(s: &Session, item: &MailItem) -> Option<String> {
-    if let Some(a) = crate::junk::list_address(item) {
+    // The headers come from the kept source or, once it left memory, from the store (issue #25).
+    let head = crate::cmd::compose::stored_head(s, item, MAX_HEADER_BYTES);
+    if let Some(a) = head.as_deref().and_then(crate::junk::list_address_in) {
         return Some(a);
     }
     let mine = my_addresses(s);
     let own = |a: &str| a.is_empty() || mine.iter().any(|m| m == a);
     let from = item.from.as_ref().map(|a| a.addr.trim().to_lowercase()).unwrap_or_default();
-    let list_id = item
-        .raw
+    let list_id = head
         .as_deref()
         .and_then(|raw| crate::rules_exec::header_value(raw, "List-Id"))
         .and_then(|v| list_id_of(&v));
@@ -3018,7 +3019,8 @@ fn view_source(s: &mut Session, p: &Value) -> CmdResult {
     let Some(m) = s.mailbox.mail.get(&focus) else {
         return Err(CmdError::Failed("message not found".into()));
     };
-    let source = String::from_utf8_lossy(&item_source(m)).into_owned();
+    let kept = crate::cmd::compose::stored_raw(s, m).filter(|r| !r.is_empty());
+    let source = String::from_utf8_lossy(&kept.unwrap_or_else(|| item_source(m))).into_owned();
     s.notify(Notice::OpenDialog("viewSource".into(), json!({"id": focus.0, "source": source})));
     Ok(json!({"dialog": "viewSource", "source": source}))
 }
@@ -3052,7 +3054,8 @@ fn encoding(s: &mut Session, p: &Value) -> CmdResult {
         let shown: String = charset.chars().take(40).collect();
         return Err(CmdError::Params(format!("`{shown}` is not a character set MailCraft knows")));
     }
-    let Some(raw) = s.mailbox.mail.get(&focus).and_then(|m| m.raw.clone()).filter(|r| !r.is_empty()) else {
+    let raw = s.mailbox.mail.get(&focus).and_then(|m| crate::cmd::compose::stored_raw(s, m));
+    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
         return Err(CmdError::Failed("the source of this message is not available".into()));
     };
     let msg = mailcraft_mime::parse(&raw)
@@ -3196,11 +3199,12 @@ fn pin(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Attachments with their data, from the item's stored source (none when no source is kept).
-pub(crate) fn source_attachments(m: &MailItem) -> Vec<crate::compose::ComposeAttachment> {
-    let Some(raw) = m.raw.as_deref() else {
+pub(crate) fn source_attachments(s: &Session, m: &MailItem) -> Vec<crate::compose::ComposeAttachment> {
+    // The kept source, else the one in the store (sources leave memory once stored).
+    let Some(raw) = crate::cmd::compose::stored_raw(s, m) else {
         return Vec::new();
     };
-    let Ok(msg) = mailcraft_mime::parse(raw) else {
+    let Ok(msg) = mailcraft_mime::parse(&raw) else {
         return Vec::new();
     };
     msg.attachments()
@@ -3267,7 +3271,7 @@ fn resend(s: &mut Session, p: &Value) -> CmdResult {
         body: body_doc(m),
         format: m.body.format,
         importance: m.importance,
-        attachments: source_attachments(m),
+        attachments: source_attachments(s, m),
         ..Default::default()
     };
     let id = s.open_compose(c);

@@ -20,7 +20,11 @@
 //! Interface (frozen for commit 2): [`Store`], [`Op`], [`StoreError`], [`import_maildir`], [`import_mbox`],
 //! [`export_mbox`]. Additions: [`Autosave`], [`Store::import_eml`], [`Store::export_mbox`],
 //! [`Store::checkpoint_mut`], [`Store::load_report`], [`Store::raw_of`], [`Store::gc_blobs`], [`Op::apply`],
-//! [`Store::journal_bytes`], [`Store::keep_alive`].
+//! [`Store::journal_bytes`], [`Store::keep_alive`], [`Store::append_keyed`].
+//!
+//! Size caps (issue #25): every file is written under the same cap its reader applies, so a profile can never
+//! hold a snapshot, journal or recoverable-items file it would refuse to open. A write past the cap fails with
+//! [`StoreError::TooLarge`] and leaves the file on disk as it was.
 
 pub mod autosave;
 pub mod blob;
@@ -54,6 +58,10 @@ pub enum StoreError {
     Corrupt(String),
     #[error("store is locked by another process")]
     Locked,
+    /// A write was refused because the file would pass the size cap its reader applies (the file on disk is
+    /// left as it was).
+    #[error("{0}")]
+    TooLarge(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -132,6 +140,8 @@ pub struct Store {
     repair: Repair,
     /// Largest journal [`Store::append`] will produce (what `open` / `load` read back).
     journal_cap: u64,
+    /// Largest snapshot [`Store::checkpoint`] will write (what `open` / `load` read back).
+    snapshot_cap: u64,
 }
 
 impl Store {
@@ -151,6 +161,7 @@ impl Store {
             journal_stale: false,
             repair,
             journal_cap: journal::MAX_STATE_BYTES,
+            snapshot_cap: journal::MAX_STATE_BYTES,
         })
     }
 
@@ -191,32 +202,44 @@ impl Store {
     ///
     /// Raw sources inside the ops are moved to blobs first; the journal only ever holds blob keys.
     pub fn append(&mut self, ops: &[Op]) -> Result<()> {
+        self.append_keyed(ops).map(|_| ())
+    }
+
+    /// [`Store::append`] that also returns where the raw sources inside the ops went: (item, blob key) for
+    /// every mail item whose source the journal now refers to by key. The caller may then drop those
+    /// sources from memory ([`MailItem::raw`]), setting `blob` to the key.
+    pub fn append_keyed(&mut self, ops: &[Op]) -> Result<Vec<(ItemId, String)>> {
+        let mut keys = Vec::new();
         if ops.is_empty() {
-            return Ok(());
+            return Ok(keys);
         }
         if self.journal_stale {
             // A previous checkpoint wrote its snapshot but could not reset the journal.
             self.reset_journal()?;
         }
-        let mut buf = Vec::new();
-        for op in ops {
-            let stripped = self.externalize(op)?;
-            let op = stripped.as_ref().unwrap_or(op);
-            serde_json::to_writer(&mut buf, op).map_err(std::io::Error::other)?;
-            buf.push(b'\n');
-        }
         let before = self.journal.metadata()?.len();
-        let after = before.saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
-        if after > self.journal_cap {
-            // Open and load refuse a journal past the cap; writing it would make the whole store unopenable.
-            return Err(StoreError::Io(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "journal would grow to {after} bytes, past the {} byte cap; checkpoint first",
-                    self.journal_cap
-                ),
-            )));
+        // Open and load refuse a journal past the cap; writing it would make the whole store unopenable. The
+        // batch is serialised through a writer capped at the room left, so a refused batch (a whole-mailbox
+        // `Replace` can be as large as the cap) is never built in memory first.
+        let mut w = journal::CapWriter::new(Vec::new(), self.journal_cap.saturating_sub(before));
+        for op in ops {
+            let stripped = self.externalize(op, &mut keys)?;
+            let op = stripped.as_ref().unwrap_or(op);
+            let res = serde_json::to_writer(&mut w, op)
+                .map_err(std::io::Error::from)
+                .and_then(|()| w.write_all(b"\n"));
+            match res {
+                Ok(()) => {}
+                Err(e) if journal::is_cap_error(&e) => {
+                    return Err(StoreError::TooLarge(format!(
+                        "the journal would grow past the {} byte cap; checkpoint first",
+                        self.journal_cap
+                    )));
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
+        let buf = w.into_inner();
         let written = self.journal.write_all(&buf).and_then(|()| self.journal.sync_data());
         if let Err(e) = written {
             // Cut off a partial batch so the next append does not glue its first op onto a torn line.
@@ -226,7 +249,7 @@ impl Store {
             return Err(e.into());
         }
         self.lock.refresh_if_due();
-        Ok(())
+        Ok(keys)
     }
 
     /// Writes a fresh snapshot of `mb` and truncates the journal.
@@ -256,7 +279,9 @@ impl Store {
 
     fn write_checkpoint(&mut self, stripped: &Mailbox) -> Result<()> {
         let generation = self.generation.saturating_add(1);
-        journal::write_snapshot(&self.dir, generation, stripped)?;
+        // Past the cap the snapshot is refused (the old snapshot and the journal stay as they are): `load`
+        // could not read it back.
+        journal::write_snapshot_capped(&self.dir, generation, stripped, self.snapshot_cap)?;
         // The snapshot now holds everything; from here on the old journal is stale (open/load ignore it), so
         // nothing may be appended to it even if the reset below fails.
         self.generation = generation;
@@ -302,19 +327,27 @@ impl Store {
         Ok(raws)
     }
 
-    /// Op with raw sources moved to blobs, or `None` when `op` holds none.
-    fn externalize(&mut self, op: &Op) -> Result<Option<Op>> {
+    /// Op with raw sources moved to blobs, or `None` when `op` holds none. The (item, key) of every source
+    /// moved is added to `keys`.
+    fn externalize(&mut self, op: &Op, keys: &mut Vec<(ItemId, String)>) -> Result<Option<Op>> {
         match op {
             Op::PutMail(item) if item.raw.is_some() => {
                 let mut copy = (**item).clone();
                 if let Some(raw) = copy.raw.take() {
-                    copy.blob = Some(self.blob_for(&raw, copy.blob.as_deref())?);
+                    let key = self.blob_for(&raw, copy.blob.as_deref())?;
+                    keys.push((copy.id, key.clone()));
+                    copy.blob = Some(key);
                 }
                 Ok(Some(Op::PutMail(Box::new(copy))))
             }
             Op::Replace(mb) if mb.mail.values().any(|m| m.raw.is_some()) => {
                 let mut copy = (**mb).clone();
-                self.strip_raws(&mut copy)?;
+                let moved = self.strip_raws(&mut copy)?;
+                for (id, _) in moved {
+                    if let Some(key) = copy.mail.get(&id).and_then(|m| m.blob.clone()) {
+                        keys.push((id, key));
+                    }
+                }
                 Ok(Some(Op::Replace(Box::new(copy))))
             }
             _ => Ok(None),
@@ -448,6 +481,13 @@ impl Store {
         self.journal_cap = cap;
     }
 
+    /// Lowers the snapshot size cap ([`journal::MAX_STATE_BYTES`] by default, never above it): checkpoints
+    /// past it are refused. Tests use it to reach the cap with a small mailbox.
+    #[doc(hidden)]
+    pub fn set_snapshot_cap(&mut self, cap: u64) {
+        self.snapshot_cap = cap.min(journal::MAX_STATE_BYTES);
+    }
+
     #[cfg(test)]
     pub(crate) fn backdate_lock_refresh(&mut self) {
         self.lock.backdate_refresh();
@@ -508,9 +548,9 @@ impl Store {
         }
         let bytes = serde_json::to_vec(&copy).map_err(std::io::Error::other)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECOVERABLE_BYTES {
-            return Err(StoreError::Io(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!("the recoverable items would take {} bytes, past the cap", bytes.len()),
+            return Err(StoreError::TooLarge(format!(
+                "the recoverable items would take {} bytes, past the {MAX_RECOVERABLE_BYTES} byte cap",
+                bytes.len()
             )));
         }
         journal::write_atomic(&self.dir.join(RECOVERABLE_FILE), |w| w.write_all(&bytes))?;

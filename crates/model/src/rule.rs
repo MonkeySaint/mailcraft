@@ -196,9 +196,25 @@ pub struct RuleEnv {
     pub rss_feed: Option<String>,
     /// E-mail addresses of the user's contacts (lower-case).
     pub contacts: Vec<String>,
+    /// The start of the item's stored source (at most [`SOURCE_SCAN_LIMIT`] bytes) when the item no longer
+    /// keeps it in memory ([`MailItem::raw`] is `None`): header, automatic-reply and message-class
+    /// conditions read it. Filled by the engine only for rules that need it (see [`Rule::needs_source`]).
+    pub source_head: Option<Vec<u8>>,
+}
+
+impl RuleEnv {
+    /// The source conditions scan: the item's kept bytes, else [`RuleEnv::source_head`].
+    fn source<'a>(&'a self, item: &'a MailItem) -> Option<&'a [u8]> {
+        item.raw.as_deref().or(self.source_head.as_deref())
+    }
 }
 
 impl Rule {
+    /// True when a condition or exception reads the message source (its header, automatic-reply markers or
+    /// MIME structure), so the engine must supply [`RuleEnv::source_head`] for items without a kept source.
+    pub fn needs_source(&self) -> bool {
+        self.conditions.iter().chain(&self.exceptions).any(RuleCondition::needs_source)
+    }
     /// "(client-only)": an action only the client can do, or the "on this computer only" condition.
     pub fn is_client_only(&self) -> bool {
         self.actions.iter().any(RuleAction::is_client_only)
@@ -373,10 +389,11 @@ fn person_matches(m: &Address, list: &[String]) -> bool {
     })
 }
 
-/// Header block used for "with specific words in the message header": the raw source's header section
-/// when kept, else a synthesised one from the item's fields.
-fn header_text(item: &MailItem) -> String {
-    if let Some(raw) = &item.raw {
+/// Header block used for "with specific words in the message header": the header section of `source` (the
+/// item's source, kept or read back from the store) when there is one, else a synthesised one from the
+/// item's fields.
+fn header_text(item: &MailItem, source: Option<&[u8]>) -> String {
+    if let Some(raw) = source {
         let limit = raw.len().min(256 * 1024);
         let head = raw.get(..limit).unwrap_or(&[]);
         // The header section ends at the first blank line, whichever line-end style it uses.
@@ -436,7 +453,7 @@ impl RuleCondition {
             RuleCondition::SubjectOrBodyContains(words) => {
                 any_word_in(&item.subject, words) || any_word_in(&item.body_text(), words)
             }
-            RuleCondition::HeaderContains(words) => any_word_in(&header_text(item), words),
+            RuleCondition::HeaderContains(words) => any_word_in(&header_text(item, env.source(item)), words),
             RuleCondition::RecipientAddressContains(words) => {
                 item.to.iter().chain(&item.cc).chain(&item.bcc).any(|m| any_word_in(&m.addr, words))
             }
@@ -471,17 +488,19 @@ impl RuleCondition {
                 let (lo, hi) = if a <= b { (*a, *b) } else { (*b, *a) };
                 (lo..=hi).contains(&item.received.unix)
             }
-            RuleCondition::AutomaticReply => is_automatic_reply(item),
+            RuleCondition::AutomaticReply => is_automatic_reply_in(item, env.source(item)),
             RuleCondition::MeetingInvitationOrUpdate => {
-                message_class(item).starts_with("IPM.Schedule.Meeting")
+                message_class_in(item, env.source(item)).starts_with("IPM.Schedule.Meeting")
             }
             RuleCondition::UsesForm(name) => {
                 let name = name.trim();
-                !name.is_empty() && form_name(message_class(item)).eq_ignore_ascii_case(name)
+                !name.is_empty()
+                    && form_name(message_class_in(item, env.source(item))).eq_ignore_ascii_case(name)
             }
             RuleCondition::FormType(class) => {
                 let class = class.trim().to_ascii_lowercase();
-                !class.is_empty() && message_class(item).to_ascii_lowercase().starts_with(&class)
+                !class.is_empty()
+                    && message_class_in(item, env.source(item)).to_ascii_lowercase().starts_with(&class)
             }
             RuleCondition::FromRssFeedWithText(words) => {
                 env.rss_feed.as_deref().is_some_and(|feed| any_word_in(feed, words))
@@ -494,6 +513,18 @@ impl RuleCondition {
             }),
             RuleCondition::OnThisComputerOnly | RuleCondition::AfterSending => true,
         }
+    }
+
+    /// True for conditions that read the message source (see [`Rule::needs_source`]).
+    pub fn needs_source(&self) -> bool {
+        matches!(
+            self,
+            RuleCondition::HeaderContains(_)
+                | RuleCondition::AutomaticReply
+                | RuleCondition::MeetingInvitationOrUpdate
+                | RuleCondition::UsesForm(_)
+                | RuleCondition::FormType(_)
+        )
     }
 
     /// True for conditions that only make sense on messages the user receives.
@@ -681,17 +712,17 @@ pub fn form_name(class: &str) -> &'static str {
     FORMS.iter().find(|(_, c)| c.eq_ignore_ascii_case(class)).map_or("Message", |(n, _)| *n)
 }
 
-/// Most bytes of a raw message scanned for parts and headers.
-const SCAN_LIMIT: usize = 1024 * 1024;
+/// Most bytes of a raw message scanned for parts and headers (what [`RuleEnv::source_head`] needs to hold).
+pub const SOURCE_SCAN_LIMIT: usize = 1024 * 1024;
 
-/// Lower-cased start of the raw source (or the synthesised header block when no source is kept).
-fn scan_text(item: &MailItem) -> String {
-    match &item.raw {
+/// Lower-cased start of `source` (or the synthesised header block when there is no source).
+fn scan_text(item: &MailItem, source: Option<&[u8]>) -> String {
+    match source {
         Some(raw) => {
-            let head = raw.get(..raw.len().min(SCAN_LIMIT)).unwrap_or(&[]);
+            let head = raw.get(..raw.len().min(SOURCE_SCAN_LIMIT)).unwrap_or(&[]);
             String::from_utf8_lossy(head).to_lowercase()
         }
-        None => header_text(item).to_lowercase(),
+        None => header_text(item, None).to_lowercase(),
     }
 }
 
@@ -702,9 +733,15 @@ fn attachment_is(a: &AttachmentMeta, types: &[&str]) -> bool {
 
 /// The message class of an item, derived from its MIME structure: meeting requests/cancellations/responses
 /// (an iCalendar part, RFC 5546 METHOD), S/MIME (RFC 8551), delivery and read reports (RFC 3464, RFC 8098),
-/// else "IPM.Note".
+/// else "IPM.Note". Reads the kept source only; see [`message_class_in`].
 pub fn message_class(item: &MailItem) -> &'static str {
-    let text = scan_text(item);
+    message_class_in(item, item.raw.as_deref())
+}
+
+/// [`message_class`] scanning `source`: the item's source when it is not kept in memory (read back from the
+/// store), `None` for none.
+pub fn message_class_in(item: &MailItem, source: Option<&[u8]>) -> &'static str {
+    let text = scan_text(item, source);
     let calendar = text.contains("text/calendar")
         || item.attachments.iter().any(|a| attachment_is(a, &["text/calendar", "application/ics"]));
     if calendar {
@@ -743,13 +780,19 @@ pub fn message_class(item: &MailItem) -> &'static str {
 }
 
 /// RFC 3834 automatic responses (`Auto-Submitted` other than "no"), the common `X-Autoreply` /
-/// `X-Autorespond` markers, and subjects starting "Automatic reply:" / "Auto:" / "Out of Office".
+/// `X-Autorespond` markers, and subjects starting "Automatic reply:" / "Auto:" / "Out of Office". Reads the
+/// kept source only; see [`is_automatic_reply_in`].
 pub fn is_automatic_reply(item: &MailItem) -> bool {
+    is_automatic_reply_in(item, item.raw.as_deref())
+}
+
+/// [`is_automatic_reply`] reading the header of `source` (the item's source when it is not kept in memory).
+pub fn is_automatic_reply_in(item: &MailItem, source: Option<&[u8]>) -> bool {
     let subject = item.subject.trim_start().to_lowercase();
     if ["automatic reply:", "auto:", "autoreply:", "out of office"].iter().any(|p| subject.starts_with(p)) {
         return true;
     }
-    let head = header_text(item);
+    let head = header_text(item, source);
     let mut name = String::new();
     let mut value = String::new();
     let mut fields: Vec<(String, String)> = Vec::new();
@@ -880,6 +923,7 @@ mod depth_tests {
             folder_role: Some(FolderRole::JunkEmail),
             rss_feed: Some("Rust Blog".into()),
             contacts: vec!["ANN@example.org".into()],
+            ..Default::default()
         };
         for c in [
             RuleCondition::FromAnyRssFeed,
@@ -1011,6 +1055,36 @@ mod depth_tests {
         assert_eq!(
             RuleAction::ServerReply("Thanks, got it.\nMore".into()).describe(&names),
             "have server reply using \"Thanks, got it.…\""
+        );
+    }
+
+    /// Regression (issue #25 review): an item whose source left memory is matched against the stored source
+    /// the engine supplies, for every condition that reads the source.
+    #[test]
+    fn source_conditions_read_the_stored_source_when_none_is_kept() {
+        let raw = "From: ann@example.org\r\nList-Id: <team.lists.example.org>\r\nAuto-Submitted: auto-replied\r\n\r\nx";
+        let kept = item("Hello", raw);
+        let bare = MailItem { raw: None, ..kept.clone() };
+        let env = RuleEnv { source_head: Some(raw.as_bytes().to_vec()), ..Default::default() };
+        let invite = MailItem { raw: None, ..item("Sync", INVITE) };
+        let invite_env = RuleEnv { source_head: Some(INVITE.as_bytes().to_vec()), ..Default::default() };
+        for c in [RuleCondition::HeaderContains(vec!["list-id".into()]), RuleCondition::AutomaticReply] {
+            assert!(Rule { conditions: vec![c.clone()], ..Default::default() }.needs_source());
+            assert!(c.matches(&kept, &ctx()), "{c:?} kept");
+            assert!(!c.matches(&bare, &ctx()), "{c:?} without a source");
+            assert!(c.matches_in(&bare, &ctx(), &env), "{c:?} stored");
+        }
+        let meeting = RuleCondition::MeetingInvitationOrUpdate;
+        assert!(!meeting.matches(&invite, &ctx()));
+        assert!(meeting.matches_in(&invite, &ctx(), &invite_env));
+        assert!(RuleCondition::FormType("IPM.Schedule".into()).matches_in(&invite, &ctx(), &invite_env));
+        assert_eq!(message_class_in(&invite, Some(INVITE.as_bytes())), "IPM.Schedule.Meeting.Request");
+        assert!(
+            !Rule {
+                conditions: vec![RuleCondition::SubjectContains(vec!["x".into()])],
+                ..Default::default()
+            }
+            .needs_source()
         );
     }
 

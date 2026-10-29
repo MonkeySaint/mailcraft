@@ -70,6 +70,30 @@ pub struct SearchState {
     pub recent: Vec<String>,
     /// Search › Include Deleted Items: mailbox-wide scopes also search Deleted Items.
     pub include_deleted: bool,
+    /// Expiry dates of messages whose source left memory this session (issue #25): item -> (blob key of the
+    /// source it was read from, date). Only messages that carry one; read by [`SearchState::released_expiry`].
+    source_expiry: HashMap<u64, (String, mailcraft_model::DateTime)>,
+}
+
+/// The index document of mail item `m`; its expiry date comes from its kept source, else from the one noted
+/// when its source left memory.
+fn mail_doc(m: &MailItem, released: &HashMap<u64, (String, mailcraft_model::DateTime)>) -> Doc {
+    let mut doc = Doc::from_mail(m);
+    if doc.expires.is_none() {
+        doc.expires = released_expiry_in(released, m).map(|d| d.unix);
+    }
+    doc
+}
+
+fn released_expiry_in(
+    released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
+    m: &MailItem,
+) -> Option<mailcraft_model::DateTime> {
+    if m.raw.is_some() {
+        return None;
+    }
+    let (key, date) = released.get(&m.id.0)?;
+    (m.blob.as_deref() == Some(key.as_str())).then_some(*date)
 }
 
 impl std::fmt::Debug for SearchState {
@@ -184,9 +208,13 @@ fn stamp_note(n: &Note) -> u64 {
 }
 
 /// Every searchable item of the mailbox as (id, fingerprint, doc builder).
-fn for_each_item(mb: &Mailbox, mut f: impl FnMut(u64, u64, &dyn Fn() -> Doc)) {
+fn for_each_item(
+    mb: &Mailbox,
+    released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
+    mut f: impl FnMut(u64, u64, &dyn Fn() -> Doc),
+) {
     for m in mb.mail.values() {
-        f(m.id.0, stamp_mail(m), &|| Doc::from_mail(m));
+        f(m.id.0, stamp_mail(m), &|| mail_doc(m, released));
     }
     for a in mb.appointments.values() {
         f(a.id.0, stamp_appointment(a), &|| Doc::from_appointment(a));
@@ -203,10 +231,14 @@ fn for_each_item(mb: &Mailbox, mut f: impl FnMut(u64, u64, &dyn Fn() -> Doc)) {
 }
 
 /// Fingerprint and doc of one item, wherever it lives.
-fn doc_of(mb: &Mailbox, id: u64) -> Option<(u64, Doc)> {
+fn doc_of(
+    mb: &Mailbox,
+    released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
+    id: u64,
+) -> Option<(u64, Doc)> {
     let id = ItemId(id);
     if let Some(m) = mb.mail.get(&id) {
-        Some((stamp_mail(m), Doc::from_mail(m)))
+        Some((stamp_mail(m), mail_doc(m, released)))
     } else if let Some(a) = mb.appointments.get(&id) {
         Some((stamp_appointment(a), Doc::from_appointment(a)))
     } else if let Some(c) = mb.contacts.get(&id) {
@@ -258,6 +290,25 @@ impl SearchState {
         inner.counts.clear();
     }
 
+    /// Notes the expiry date of `m` (which still holds its source) as its source leaves memory for the store
+    /// under blob `key`, so the index and the message list keep it ([`SearchState::released_expiry`]).
+    pub(crate) fn note_source_released(&mut self, m: &MailItem, key: &str) {
+        match crate::cmd::view::mail::expiry(m) {
+            Some(date) => {
+                self.source_expiry.insert(m.id.0, (key.to_owned(), date));
+            }
+            None => {
+                self.source_expiry.remove(&m.id.0);
+            }
+        }
+    }
+
+    /// The expiry date noted for `m` when its source left memory (`None` when it keeps its source, carries
+    /// no expiry date, or its source changed since). No file read: cheap enough for painting rows.
+    pub fn released_expiry(&self, m: &MailItem) -> Option<mailcraft_model::DateTime> {
+        released_expiry_in(&self.source_expiry, m)
+    }
+
     /// Re-checks every item at the next query (after direct mailbox edits that bypass the journal).
     pub fn invalidate(&mut self) {
         let inner = match self.inner.get_mut() {
@@ -271,13 +322,17 @@ impl SearchState {
     }
 
     /// Brings the index up to date with `mb`.
-    fn ensure_locked(inner: &mut Inner, mb: &Mailbox) {
+    fn ensure_locked(
+        inner: &mut Inner,
+        mb: &Mailbox,
+        released: &HashMap<u64, (String, mailcraft_model::DateTime)>,
+    ) {
         let now_shape = shape(mb);
         if !inner.built || inner.full || inner.shape != now_shape {
             let mut seen: HashSet<u64> = HashSet::with_capacity(inner.stamps.len());
             let mut changed = false;
             let Inner { index, stamps, .. } = inner;
-            for_each_item(mb, |id, stamp, make| {
+            for_each_item(mb, released, |id, stamp, make| {
                 seen.insert(id);
                 if stamps.get(&id) != Some(&stamp) {
                     index.upsert(&make());
@@ -308,7 +363,7 @@ impl SearchState {
         // Items the journal names changed: re-indexed unconditionally (the fingerprint is only a shortcut for
         // the full reconcile).
         for id in std::mem::take(&mut inner.dirty) {
-            match doc_of(mb, id) {
+            match doc_of(mb, released, id) {
                 Some((stamp, doc)) => {
                     inner.index.upsert(&doc);
                     inner.stamps.insert(id, stamp);
@@ -327,7 +382,7 @@ impl SearchState {
     /// Brings the index up to date with `mb` now (queries do this themselves).
     pub fn ensure(&self, mb: &Mailbox) {
         let mut inner = self.lock();
-        Self::ensure_locked(&mut inner, mb);
+        Self::ensure_locked(&mut inner, mb, &self.source_expiry);
     }
 
     /// Items waiting to be indexed (Indexing Status).
@@ -346,7 +401,7 @@ impl SearchState {
     /// Index size.
     pub fn stats(&self, mb: &Mailbox) -> Stats {
         let mut inner = self.lock();
-        Self::ensure_locked(&mut inner, mb);
+        Self::ensure_locked(&mut inner, mb, &self.source_expiry);
         inner.index.stats()
     }
 
@@ -520,7 +575,7 @@ pub fn hits(s: &Session, query: &str, filter: &Filter) -> Vec<Hit> {
     let q = mailcraft_search::parse(query);
     let ctx = context(s);
     let mut inner = s.search.lock();
-    SearchState::ensure_locked(&mut inner, &s.mailbox);
+    SearchState::ensure_locked(&mut inner, &s.mailbox, &s.search.source_expiry);
     let key = cache_key(&q, &ctx, filter, inner.generation);
     if let Some((_, v)) = inner.cache.iter().find(|(k, _)| *k == key) {
         return v.clone();
@@ -538,7 +593,7 @@ pub fn count(s: &Session, query: &str, filter: &Filter) -> Counts {
     let q = mailcraft_search::parse(query);
     let ctx = context(s);
     let mut inner = s.search.lock();
-    SearchState::ensure_locked(&mut inner, &s.mailbox);
+    SearchState::ensure_locked(&mut inner, &s.mailbox, &s.search.source_expiry);
     let key = cache_key(&q, &ctx, filter, inner.generation);
     if let Some((_, c)) = inner.counts.iter().find(|(k, _)| *k == key) {
         return *c;
@@ -594,7 +649,11 @@ pub fn search_folder_counts(s: &Session, folder: FolderId) -> Counts {
 
 /// True when mail item `m` matches `query` (direct evaluation, no index).
 pub fn item_matches(s: &Session, m: &MailItem, query: &str) -> bool {
-    mailcraft_search::matches(&mailcraft_search::parse(query), &Doc::from_mail(m), &context(s))
+    mailcraft_search::matches(
+        &mailcraft_search::parse(query),
+        &mail_doc(m, &s.search.source_expiry),
+        &context(s),
+    )
 }
 
 /// Highlight ranges (byte offsets) of the active search's words in `text` shown as `field`.

@@ -177,6 +177,56 @@ pub struct MailItem {
 }
 
 impl MailItem {
+    /// A rough estimate of the memory this item takes: its fixed size plus the text and bytes it holds
+    /// (bodies, source, addresses, ids). For byte caps; not exact.
+    pub fn approx_bytes(&self) -> usize {
+        // Each heap allocation costs a little more than its length.
+        const PER_ALLOC: usize = 16;
+        let s = |t: &str| if t.is_empty() { 0 } else { t.len().saturating_add(PER_ALLOC) };
+        let opt = |t: &Option<String>| t.as_deref().map_or(0, s);
+        let addr = |a: &Mailbox| {
+            std::mem::size_of::<Mailbox>().saturating_add(s(&a.addr)).saturating_add(opt(&a.name))
+        };
+        let addrs = |v: &[Mailbox]| v.iter().map(addr).fold(0usize, usize::saturating_add);
+        let strs = |v: &[String]| {
+            v.iter()
+                .map(|t| s(t).saturating_add(std::mem::size_of::<String>()))
+                .fold(0usize, usize::saturating_add)
+        };
+        let parts = [
+            std::mem::size_of::<MailItem>(),
+            opt(&self.message_id),
+            strs(&self.in_reply_to),
+            strs(&self.references),
+            s(&self.subject),
+            self.from.as_ref().map_or(0, addr),
+            self.sender.as_ref().map_or(0, addr),
+            addrs(&self.to),
+            addrs(&self.cc),
+            addrs(&self.bcc),
+            addrs(&self.reply_to),
+            strs(&self.categories),
+            self.attachments
+                .iter()
+                .map(|a| {
+                    std::mem::size_of::<AttachmentMeta>()
+                        .saturating_add(s(&a.filename))
+                        .saturating_add(s(&a.mime_type))
+                        .saturating_add(opt(&a.content_id))
+                })
+                .fold(0usize, usize::saturating_add),
+            s(&self.preview),
+            opt(&self.body.text),
+            opt(&self.body.html),
+            opt(&self.remote_id),
+            opt(&self.blob),
+            self.raw.as_ref().map_or(0, |r| r.len().saturating_add(PER_ALLOC)),
+            self.votes.len().saturating_mul(std::mem::size_of::<VoteRecord>().saturating_add(2 * PER_ALLOC)),
+            strs(&self.contacts),
+        ];
+        parts.into_iter().fold(0usize, usize::saturating_add)
+    }
+
     /// Builds an item from a parsed message (subject, addresses, dates, importance, bodies, attachments
     /// metadata, preview, ids). `received` falls back to the Date header, then to `now`.
     pub fn from_message(msg: &mailcraft_mime::Message, raw: &[u8], now: DateTime) -> MailItem {

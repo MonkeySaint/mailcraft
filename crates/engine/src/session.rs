@@ -14,7 +14,7 @@ use crate::{CmdError, CmdResult, Registry};
 use mailcraft_model::{
     DateTime, FolderId, FolderKind, FolderPaneState, FolderRole, ItemId, Mailbox, ReadingPanePos,
 };
-use mailcraft_store::Op;
+use mailcraft_store::{Op, StoreError};
 
 /// Navigation modules (module rail order: Mail, Calendar, People, Tasks (To Do), Notes, Folders, Shortcuts).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -237,6 +237,13 @@ pub struct Session {
     pub checkpoint_bytes: u64,
     /// Number of [`Session::journal`] calls so far (lets `run` tell whether a failed command journaled).
     journal_calls: u64,
+    /// Goes up whenever the mailbox may have changed ([`Session::mailbox_revision`], `counts.rs`).
+    pub(crate) revision: u64,
+    /// Folder counts memoised per [`Session::mailbox_revision`] (`counts.rs`).
+    pub(crate) counts: crate::counts::CountsMemo,
+    /// Message sources the store now holds (item, blob key), not yet dropped from memory, and what the session
+    /// told the user about writes the store refused.
+    store_guard: StoreGuard,
     /// Mutating commands running (one may run others); server changes are queued by the outermost one.
     run_depth: u32,
     /// Automatic actions running ([`Session::run_automatic`]): their changes record no undo step.
@@ -325,6 +332,55 @@ pub const EXIT_SYNC_SECS: u64 = 30;
 /// Most ops kept in `pending_ops` while no store is attached; beyond that they collapse into one `Replace`.
 const MAX_PENDING_OPS: usize = 2_000;
 
+/// Told once when the store refuses a snapshot because the mailbox has grown past what it can read back.
+pub const SNAPSHOT_TOO_LARGE: &str = "Your mailbox has grown too large for MailCraft to save it as one file \
+    (the limit is 1 GB). Your changes are still being saved as a list of changes, but that list has a limit \
+    too: delete or archive mail you no longer need, and empty Deleted Items, to make room.";
+
+/// Told once when the store can take neither the latest changes nor a snapshot holding them.
+pub const UNSAVED_TOO_LARGE: &str = "Your latest changes could not be saved: your mailbox has grown past the \
+    largest size MailCraft can store (1 GB). Delete or archive mail you no longer need, and empty Deleted \
+    Items; MailCraft saves the changes as soon as there is room.";
+
+/// Bookkeeping for the store's guard rails (issue #25).
+#[derive(Debug, Default)]
+struct StoreGuard {
+    /// Sources the journal now refers to by blob key: (item, key). The live items drop their copy once the
+    /// outermost command (or sync batch) is done ([`Session::release_sources`]).
+    stored: Vec<(ItemId, String)>,
+    /// The user was told the store refused a write for size; cleared once a write of that kind succeeds.
+    snapshot_refused: bool,
+    journal_refused: bool,
+    /// After a refused snapshot, the journal size at which folding it is tried again (a snapshot of a
+    /// mailbox that is too large is not attempted on every write).
+    checkpoint_retry_at: u64,
+    /// While the journal and the fallback snapshot both refuse ([`StoreGuard::journal_refused`]): the
+    /// mailbox's estimated size ([`Mailbox::approx_bytes`]) when the snapshot was last refused, and the
+    /// flushes since. The snapshot (a clone of the mailbox and a write up to the cap) is tried again only once
+    /// the mailbox shrank or after [`FALLBACK_RETRY_FLUSHES`] flushes, not on every command.
+    fallback_refused_bytes: usize,
+    fallback_skips: u32,
+}
+
+/// Flushes after which a refused fallback snapshot is tried again even if the mailbox did not shrink.
+const FALLBACK_RETRY_FLUSHES: u32 = 256;
+
+impl StoreGuard {
+    /// Whether to try the fallback snapshot now (see [`StoreGuard::fallback_refused_bytes`]).
+    fn fallback_due(&mut self, mailbox: &Mailbox) -> bool {
+        if !self.journal_refused {
+            return true;
+        }
+        self.fallback_skips = self.fallback_skips.saturating_add(1);
+        if self.fallback_skips >= FALLBACK_RETRY_FLUSHES {
+            return true;
+        }
+        // Shrunk by at least 1/256 since the last refusal (deleting one message rarely makes room).
+        let floor = self.fallback_refused_bytes.saturating_sub(self.fallback_refused_bytes / 256);
+        mailbox.approx_bytes() < floor
+    }
+}
+
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session").field("selection", &self.selection).field("view", &self.view).finish()
@@ -354,6 +410,9 @@ impl Session {
             module_folders: Vec::new(),
             checkpoint_bytes: mailcraft_store::Autosave::DEFAULT_CHECKPOINT_BYTES,
             journal_calls: 0,
+            revision: 0,
+            counts: crate::counts::CountsMemo::default(),
+            store_guard: StoreGuard::default(),
             run_depth: 0,
             automatic_depth: 0,
             exit_sync_done: false,
@@ -829,7 +888,7 @@ impl Session {
         let ops = diff_ops(&before, &self.mailbox);
         if !ops.is_empty() {
             crate::recover::capture(self, &before);
-            self.undo.push(UndoEntry { label: "Empty Deleted Items".into(), before: Box::new(before) });
+            self.undo.push(UndoEntry::new("Empty Deleted Items", Box::new(before)));
             self.journal(ops);
             self.tidy_selection();
         }
@@ -933,6 +992,8 @@ impl Session {
             }
         }
         if let Some(before) = snapshot {
+            // The command may have changed the mailbox (or it is put back below): memoised views are stale.
+            self.mailbox_changed();
             if result.is_err() {
                 self.mailbox = before;
                 // Ops a failed command queued describe changes that were just rolled back.
@@ -964,7 +1025,7 @@ impl Session {
                 }
                 if !ops.is_empty() {
                     if self.automatic_depth == 0 && !self.undo_barrier {
-                        self.undo.push(UndoEntry { label: spec.label.to_owned(), before: Box::new(before) });
+                        self.undo.push(UndoEntry::new(spec.label, Box::new(before)));
                     }
                     self.journal(ops);
                 }
@@ -987,6 +1048,7 @@ impl Session {
             if std::mem::take(&mut self.checkpoint_after) && self.checkpoint_now() && purge {
                 self.purge_unused_blobs();
             }
+            self.release_sources();
         }
         self.tidy_selection();
         self.sync_settings_from_session();
@@ -1016,6 +1078,7 @@ impl Session {
             return;
         }
         self.journal_calls = self.journal_calls.wrapping_add(1);
+        self.mailbox_changed();
         self.search.note_ops(&ops);
         self.pending_ops.extend(ops);
         self.flush_pending();
@@ -1023,28 +1086,99 @@ impl Session {
 
     /// Writes queued ops to the store (when attached). A queued `Replace` supersedes everything before it, so
     /// the queue stays small even without a store.
+    ///
+    /// Guard rails (issue #25): when the journal refuses the batch for its size, the same state is saved as a
+    /// snapshot instead; a snapshot is never written past what the store reads back, and when it is refused
+    /// the journal is kept as it is and the user is told once (an error notice).
     pub fn flush_pending(&mut self) {
+        if self.pending_ops.is_empty() {
+            return;
+        }
+        // Queued ops describe changes to the mailbox (some commands queue them directly).
+        self.mailbox_changed();
         if let Some(last_replace) = self.pending_ops.iter().rposition(|o| matches!(o, Op::Replace(_))) {
             self.pending_ops.drain(..last_replace);
         }
         if self.pending_ops.len() > MAX_PENDING_OPS {
             self.pending_ops = vec![Op::Replace(Box::new(self.mailbox.clone()))];
         }
-        if let Some(store) = self.store.as_mut() {
-            match store.append(&self.pending_ops) {
-                Ok(()) => self.pending_ops.clear(),
-                Err(e) => {
-                    log::error!("could not write {} change(s) to the store: {e}", self.pending_ops.len())
+        let Some(store) = self.store.as_mut() else { return };
+        let guard = &mut self.store_guard;
+        let mut notices = Vec::new();
+        match store.append_keyed(&self.pending_ops) {
+            Ok(keys) => {
+                self.pending_ops.clear();
+                guard.stored.extend(keys);
+                guard.journal_refused = false;
+            }
+            Err(e) => {
+                log::error!("could not write {} change(s) to the store: {e}", self.pending_ops.len());
+                if matches!(e, StoreError::TooLarge(_)) && guard.fallback_due(&self.mailbox) {
+                    // The mailbox already holds every queued change: a snapshot saves the same state.
+                    match store.checkpoint(&self.mailbox) {
+                        Ok(()) => {
+                            self.pending_ops.clear();
+                            guard.snapshot_refused = false;
+                            guard.journal_refused = false;
+                            guard.checkpoint_retry_at = 0;
+                        }
+                        Err(e2) => {
+                            log::error!("could not save the changes as a snapshot either: {e2}");
+                            guard.fallback_refused_bytes = self.mailbox.approx_bytes();
+                            guard.fallback_skips = 0;
+                            if !std::mem::replace(&mut guard.journal_refused, true) {
+                                notices.push(Notice::Error(UNSAVED_TOO_LARGE.to_owned()));
+                            }
+                        }
+                    }
                 }
             }
-            if self.pending_ops.is_empty()
-                && self.checkpoint_bytes > 0
-                && store.journal_bytes() >= self.checkpoint_bytes
-            {
-                // The journal now leads to `self.mailbox`; a snapshot of it supersedes the journal.
-                if let Err(e) = store.checkpoint(&self.mailbox) {
-                    log::error!("could not fold the journal into a snapshot: {e}");
+        }
+        if self.pending_ops.is_empty()
+            && self.checkpoint_bytes > 0
+            && store.journal_bytes() >= self.checkpoint_bytes.max(guard.checkpoint_retry_at)
+        {
+            // The journal now leads to `self.mailbox`; a snapshot of it supersedes the journal.
+            match store.checkpoint(&self.mailbox) {
+                Ok(()) => {
+                    guard.snapshot_refused = false;
+                    guard.checkpoint_retry_at = 0;
                 }
+                Err(e) => {
+                    log::error!("could not fold the journal into a snapshot: {e}");
+                    if matches!(e, StoreError::TooLarge(_)) {
+                        // Try again once the journal has grown by another checkpoint's worth (the mailbox
+                        // may have shrunk by then), not on every write.
+                        guard.checkpoint_retry_at =
+                            store.journal_bytes().saturating_add(self.checkpoint_bytes.max(1));
+                        if !std::mem::replace(&mut guard.snapshot_refused, true) {
+                            notices.push(Notice::Error(SNAPSHOT_TOO_LARGE.to_owned()));
+                        }
+                    }
+                }
+            }
+        }
+        self.notices.extend(notices);
+    }
+
+    /// Drops from memory the message sources the store now holds (the live item keeps the blob key), once
+    /// the outermost command or sync batch is done: nothing in it reads the in-memory copy any more, and
+    /// undo snapshots taken before it keep their own. Sources that changed since they were stored stay.
+    pub(crate) fn release_sources(&mut self) {
+        if self.run_depth > 0 || self.store_guard.stored.is_empty() {
+            return;
+        }
+        for (id, key) in std::mem::take(&mut self.store_guard.stored) {
+            let Some(item) = self.mailbox.mail.get_mut(&id) else { continue };
+            let same = item
+                .raw
+                .as_deref()
+                .is_some_and(|raw| mailcraft_store::BlobKey::parse(&key).is_some_and(|k| k.matches(raw)));
+            if same {
+                // Facts read from the source while painting rows (no file read) are noted first.
+                self.search.note_source_released(item, &key);
+                item.raw = None;
+                item.blob = Some(key);
             }
         }
     }
@@ -1062,9 +1196,18 @@ impl Session {
             return false;
         }
         match store.checkpoint(&self.mailbox) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.store_guard.snapshot_refused = false;
+                self.store_guard.checkpoint_retry_at = 0;
+                true
+            }
             Err(e) => {
                 log::error!("could not fold the journal into a snapshot: {e}");
+                if matches!(e, StoreError::TooLarge(_))
+                    && !std::mem::replace(&mut self.store_guard.snapshot_refused, true)
+                {
+                    self.notify(Notice::Error(SNAPSHOT_TOO_LARGE.to_owned()));
+                }
                 false
             }
         }
@@ -1093,7 +1236,7 @@ impl Session {
         let entry = self.undo.undo.pop()?;
         let after = std::mem::replace(&mut self.mailbox, *entry.before);
         crate::sync::after_restore(self, &after);
-        self.undo.push_redo(UndoEntry { label: entry.label.clone(), before: Box::new(after) });
+        self.undo.push_redo(UndoEntry::new(entry.label.clone(), Box::new(after)));
         self.after_restore();
         Some(entry.label)
     }
@@ -1103,7 +1246,7 @@ impl Session {
         let entry = self.undo.redo.pop()?;
         let before = std::mem::replace(&mut self.mailbox, *entry.before);
         crate::sync::after_restore(self, &before);
-        self.undo.push_keep_redo(UndoEntry { label: entry.label.clone(), before: Box::new(before) });
+        self.undo.push_keep_redo(UndoEntry::new(entry.label.clone(), Box::new(before)));
         self.after_restore();
         Some(entry.label)
     }
@@ -1446,6 +1589,7 @@ mod tests {
             s.save_settings().unwrap();
             // The store cannot take the change (disk full, I/O error): settings.json keeps the old pins.
             s.store.as_mut().unwrap().set_journal_cap(1);
+            s.store.as_mut().unwrap().set_snapshot_cap(1);
             s.load_settings(dir.path());
             assert!(s.mailbox.mail[&msg].pinned, "pinned in memory");
             assert!(!s.pending_ops.is_empty());

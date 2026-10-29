@@ -152,13 +152,81 @@ pub fn read_snapshot(dir: &Path) -> Result<(u64, Mailbox)> {
 }
 
 /// Writes a snapshot atomically. `mb` must already be stripped of raw sources.
+///
+/// Refused with [`StoreError::TooLarge`] when the snapshot would be larger than [`MAX_STATE_BYTES`], the most
+/// [`read_snapshot`] reads back: a snapshot that cannot be read must never replace one that can.
 pub fn write_snapshot(dir: &Path, generation: u64, mb: &Mailbox) -> Result<()> {
-    write_atomic(&dir.join(SNAPSHOT_FILE), |w| {
+    write_snapshot_capped(dir, generation, mb, MAX_STATE_BYTES)
+}
+
+/// [`write_snapshot`] with a cap of `cap` bytes (never more than [`MAX_STATE_BYTES`]). Writing stops as soon
+/// as the cap is passed; the old snapshot stays in place.
+pub fn write_snapshot_capped(dir: &Path, generation: u64, mb: &Mailbox, cap: u64) -> Result<()> {
+    let cap = cap.min(MAX_STATE_BYTES);
+    let res = write_atomic(&dir.join(SNAPSHOT_FILE), |w| {
+        let mut w = CapWriter { inner: w, written: 0, cap };
         w.write_all(SNAPSHOT_PREFIX.as_bytes())?;
         write!(w, "{generation},\"mailbox\":")?;
-        serde_json::to_writer(&mut *w, mb).map_err(std::io::Error::other)?;
+        // An I/O error (the cap marker included) comes back out of serde_json as it went in.
+        serde_json::to_writer(&mut w, mb).map_err(std::io::Error::from)?;
         w.write_all(b"}")
-    })
+    });
+    match res {
+        Err(StoreError::Io(e)) if is_cap_error(&e) => Err(StoreError::TooLarge(format!(
+            "the mailbox snapshot would be larger than {cap} bytes, the most that can be read back"
+        ))),
+        other => other,
+    }
+}
+
+/// Payload of the I/O error [`CapWriter`] raises once its cap is passed.
+#[derive(Debug)]
+struct SizeCapExceeded(u64);
+
+impl std::fmt::Display for SizeCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the size cap of {} bytes was passed", self.0)
+    }
+}
+
+impl std::error::Error for SizeCapExceeded {}
+
+pub(crate) fn is_cap_error(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<SizeCapExceeded>())
+}
+
+/// Passes writes through until more than `cap` bytes would have been written, then fails (an I/O error
+/// [`is_cap_error`] recognises).
+pub(crate) struct CapWriter<W> {
+    inner: W,
+    written: u64,
+    cap: u64,
+}
+
+impl<W> CapWriter<W> {
+    pub(crate) fn new(inner: W, cap: u64) -> Self {
+        CapWriter { inner, written: 0, cap }
+    }
+
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CapWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let after = self.written.saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        if after > self.cap {
+            return Err(std::io::Error::other(SizeCapExceeded(self.cap)));
+        }
+        let n = self.inner.write(buf)?;
+        self.written = self.written.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Replaces the journal with an empty one carrying `generation`; returns the append handle.
