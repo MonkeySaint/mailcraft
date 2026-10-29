@@ -676,6 +676,7 @@ fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
         out.insert("undo_1_ms".into(), json!(ms(d)));
     }
     imap_commands(s, &mut out)?;
+    config_commands(s, &mut out)?;
     let journal = s.store.as_ref().map(mailcraft_store::Store::journal_bytes);
     out.insert("journal_bytes".into(), json!(journal));
     out.insert("undo_steps".into(), json!(s.undo.undo.len()));
@@ -684,6 +685,21 @@ fn commands(s: &mut Session, opts: &Options) -> Result<Value> {
     out.insert("small_state_bytes".into(), json!(s.mailbox.without_mail().approx_bytes()));
     out.insert("memory_after".into(), memory_json());
     Ok(Value::Object(out))
+}
+
+/// Configuration changes (storage stage S4 journals just the part that changed): rows `config_*`, with the
+/// journal bytes each one wrote.
+fn config_commands(s: &mut Session, out: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let mut timed = |s: &mut Session, key: &str, id: &str, params: Value| -> Result<()> {
+        let before = journal_now(s);
+        let (d, _) = run_cmd(s, id, params)?;
+        out.insert(format!("{key}_ms"), json!(ms(d)));
+        out.insert(format!("{key}_journal_bytes"), json!(journal_now(s).saturating_sub(before)));
+        Ok(())
+    };
+    timed(s, "config_new_category", "categories.new", json!({"name": "Bench category"}))?;
+    timed(s, "config_sort", "view.sortBy", json!({"field": "subject"}))?;
+    Ok(())
 }
 
 /// The journal's size now (0 without a store).

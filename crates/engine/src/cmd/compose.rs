@@ -5358,8 +5358,10 @@ mod depth_tests {
         s.run("compose.signatureCreate", &json!({"name": "Reply", "text": "-- me"})).unwrap();
         assert_eq!(s.mailbox.signatures.len(), 2);
         assert!(s.mailbox.signatures[0].default_new);
-        // Journaled (the store diff does not cover signatures) and undoable.
-        assert!(s.pending_ops.iter().any(|o| matches!(o, mailcraft_store::Op::Replace(_))));
+        // Journaled (as configuration, not the whole mailbox) and undoable.
+        let config = |o: &mailcraft_store::Op| matches!(o, mailcraft_store::Op::PutConfig(c) if c.signatures.is_some());
+        assert!(s.pending_ops.iter().any(config));
+        assert!(!s.pending_ops.iter().any(|o| matches!(o, mailcraft_store::Op::Replace(_))));
         assert_eq!(s.undo.undo.last().map(|e| e.label.as_str()), Some("New Signature"));
         let acc = s.mailbox.default_account().map(|a| a.id.0).unwrap();
         let r = s.run("compose.signatureDefaults", &json!({"account": acc, "replies": "Reply"})).unwrap();

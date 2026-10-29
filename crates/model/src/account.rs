@@ -222,6 +222,77 @@ impl Account {
             AccountKind::Jmap | AccountKind::Exchange => true,
         }
     }
+
+    /// Whether everything but the synchronisation bookkeeping ([`Account::sync`]) is the same. The store
+    /// journals the two apart: the settings as configuration, the sync state on its own.
+    pub fn eq_except_sync(&self, other: &Account) -> bool {
+        // Exhaustive on purpose: a new field fails to compile here until it is compared.
+        let Account {
+            id,
+            kind,
+            display_name,
+            address,
+            sender_name,
+            incoming,
+            outgoing,
+            is_default,
+            credential,
+            server_saves_sent,
+            sync: _,
+            dav,
+            shared,
+            data_file,
+        } = other;
+        self.id == *id
+            && self.kind == *kind
+            && self.display_name == *display_name
+            && self.address == *address
+            && self.sender_name == *sender_name
+            && self.incoming == *incoming
+            && self.outgoing == *outgoing
+            && self.is_default == *is_default
+            && self.credential == *credential
+            && self.server_saves_sent == *server_saves_sent
+            && self.dav == *dav
+            && self.shared == *shared
+            && self.data_file == *data_file
+    }
+
+    /// A copy without the synchronisation bookkeeping (`sync` left empty; it is not copied).
+    pub fn without_sync(&self) -> Account {
+        let Account {
+            id,
+            kind,
+            display_name,
+            address,
+            sender_name,
+            incoming,
+            outgoing,
+            is_default,
+            credential,
+            server_saves_sent,
+            sync: _,
+            dav,
+            shared,
+            data_file,
+        } = self;
+        Account {
+            id: *id,
+            kind: *kind,
+            display_name: display_name.clone(),
+            address: address.clone(),
+            sender_name: sender_name.clone(),
+            incoming: incoming.clone(),
+            outgoing: outgoing.clone(),
+            is_default: *is_default,
+            credential: *credential,
+            server_saves_sent: *server_saves_sent,
+            sync: AccountSync::default(),
+            dav: dav.clone(),
+            shared: shared.clone(),
+            data_file: data_file.clone(),
+        }
+    }
 }
 
 /// What kind of secret an account logs in with.

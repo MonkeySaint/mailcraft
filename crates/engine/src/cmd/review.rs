@@ -1266,7 +1266,11 @@ mod tests {
         let r = s.run("review.addToDictionary", &json!({"at": {"path": [1], "offset": 2}})).unwrap();
         assert_eq!(r["word"], "Zorbleflax");
         assert!(s.mailbox.in_dictionary("zorbleflax"));
-        assert!(s.pending_ops.iter().any(|o| matches!(o, mailcraft_store::Op::Replace(_))));
+        assert!(
+            s.pending_ops
+                .iter()
+                .any(|o| matches!(o, mailcraft_store::Op::PutConfig(c) if c.custom_dictionary.is_some()))
+        );
         s.run("compose.insertText", &json!({"text": " Zorbleflax"})).unwrap();
         let r = s.run("review.spelling", &json!({"grammar": false})).unwrap();
         assert_eq!(

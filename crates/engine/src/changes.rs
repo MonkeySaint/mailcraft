@@ -23,11 +23,13 @@
 //! whose record was lost cannot be rolled back: its changes stay and the whole mailbox is journaled, so the
 //! store keeps matching memory.
 //!
-//! **Accounts.** A command on synchronised mail appends to its account's queue of server changes, so the
-//! account changes with it. As long as no account is added, removed or reordered, that journals one
-//! `Op::PutAccount` per changed account next to the per-item ops. Anything else outside the mail and the
-//! folders (rules, categories, views, calendar, contacts, tasks, notes) still journals a whole-mailbox
-//! `Replace` until storage stage S4.
+//! **Accounts and configuration** (storage stage S4). A command on synchronised mail appends to its account's
+//! queue of server changes, so the account's sync state changes with it: that journals one `Op::PutSync` per
+//! changed account next to the per-item ops. Accounts are compared without their sync state; settings
+//! changed, accounts added, removed or reordered, and the other configuration (categories, rules, quick
+//! steps, views, signatures, Auto-Complete, dictionary, junk lists) journal one `Op::PutConfig` with the parts
+//! that changed. Only calendar, contact, task and note changes still journal a whole-mailbox `Replace`, until
+//! storage stage S12.
 
 use mailcraft_model::{ChangeToken, MailChanges, Mailbox};
 use mailcraft_store::Op;
@@ -109,13 +111,13 @@ impl ChangeSet {
     }
 }
 
-/// Store ops from a small "before", the mail before-images and the mailbox now: per-item and per-folder
-/// upserts and removals, or one `Replace` when anything else changed. Same order as `diff_ops`.
+/// Store ops from a small "before", the mail before-images and the mailbox now: configuration and sync state
+/// ops, then per-folder and per-item upserts and removals; or one `Replace` when the calendar, contacts, tasks
+/// or notes changed. Same order as `diff_ops`.
 pub(crate) fn ops_for(before: &Mailbox, mail: &MailChanges, after: &Mailbox) -> Vec<Op> {
-    if crate::session::other_changed(before, after) {
+    let Some(mut ops) = crate::session::small_ops(before, after) else {
         return vec![Op::Replace(Box::new(after.clone()))];
-    }
-    let mut ops = crate::session::account_ops(before, after);
+    };
     for (id, f) in &after.folders {
         if before.folders.get(id) != Some(f) {
             ops.push(Op::PutFolder(Box::new(f.clone())));
@@ -153,6 +155,8 @@ fn check_ops(full: &Mailbox, now: &Mailbox, ops: &[Op]) -> bool {
                     Op::PutFolder(f) => format!("PutFolder({})", f.id.0),
                     Op::RemoveFolder(id) => format!("RemoveFolder({})", id.0),
                     Op::PutAccount(a) => format!("PutAccount({})", a.id.0),
+                    Op::PutSync(id, _) => format!("PutSync({})", id.0),
+                    Op::PutConfig(_) => "PutConfig".to_owned(),
                     Op::Replace(_) => "Replace".to_owned(),
                 })
                 .collect()
@@ -339,10 +343,10 @@ mod tests {
         assert_eq!(s.mailbox.folders, memory.folders);
     }
 
-    /// A command on synchronised mail changes its account (the queue of server changes): that journals the
-    /// account, not the whole mailbox.
+    /// A command on synchronised mail changes its account's sync state (the queue of server changes): that
+    /// journals the sync state, not the account or the whole mailbox.
     #[test]
-    fn an_account_changed_in_place_journals_the_account() {
+    fn a_sync_state_change_journals_only_the_sync_state() {
         let mut s = session();
         let id = s.mailbox.mail.ids().next().unwrap();
         let r = s.begin_changes();
@@ -354,17 +358,76 @@ mod tests {
         }
         let ops = s.end_changes(r).ops(&s.mailbox);
         assert_eq!(ops, crate::session::diff_ops(&full, &s.mailbox));
-        assert!(matches!(ops.first(), Some(Op::PutAccount(a)) if a.id == account), "{}", ops.len());
-        assert!(!ops.iter().any(|o| matches!(o, Op::Replace(_))));
+        assert!(matches!(ops.first(), Some(Op::PutSync(a, _)) if *a == account), "{}", ops.len());
+        assert!(!ops.iter().any(|o| matches!(o, Op::Replace(_) | Op::PutConfig(_) | Op::PutAccount(_))));
         let mut replayed = full.clone();
         for op in ops {
             op.apply(&mut replayed);
         }
         assert_eq!(replayed, s.mailbox);
-        // Adding or removing an account still journals the whole mailbox.
+    }
+
+    /// Ops from a change record, checked against the full comparison and replayed onto the mailbox before.
+    fn recorded(s: &mut Session, change: impl FnOnce(&mut Mailbox)) -> Vec<Op> {
         let r = s.begin_changes();
-        s.mailbox.accounts.pop();
-        assert!(matches!(s.end_changes(r).ops(&s.mailbox).as_slice(), [Op::Replace(_)]));
+        let full = s.mailbox.clone();
+        change(&mut s.mailbox);
+        let ops = s.end_changes(r).ops(&s.mailbox);
+        assert_eq!(ops, crate::session::diff_ops(&full, &s.mailbox));
+        let mut replayed = full;
+        for op in ops.clone() {
+            op.apply(&mut replayed);
+        }
+        assert_eq!(replayed, s.mailbox);
+        ops
+    }
+
+    /// Accounts added, removed, reordered or with changed settings, and the rest of the configuration,
+    /// journal one `PutConfig` with just the parts that changed (accounts without their sync state).
+    #[test]
+    fn configuration_changes_journal_the_parts_that_changed() {
+        let mut s = session();
+        let ops = recorded(&mut s, |mb| {
+            mb.categories.push(mailcraft_model::Category { name: "Fresh".into(), ..Default::default() })
+        });
+        let [Op::PutConfig(state)] = ops.as_slice() else { panic!("{ops:?}") };
+        assert!(state.categories.is_some() && state.accounts.is_none() && state.rules.is_none());
+        // Settings of an account that keeps its place.
+        let ops = recorded(&mut s, |mb| {
+            if let Some(a) = mb.accounts.first_mut() {
+                a.sender_name = "Renamed".into();
+            }
+        });
+        let [Op::PutConfig(state)] = ops.as_slice() else { panic!("{ops:?}") };
+        let accounts = state.accounts.as_ref().unwrap();
+        assert!(accounts.iter().all(|a| a.sync == Default::default()), "carried without sync state");
+        // Removing and reordering keeps the others' sync state; a new account with sync state gets PutSync.
+        let ops = recorded(&mut s, |mb| {
+            if let Some(a) = mb.accounts.first_mut() {
+                a.sync.next_op = 41;
+            }
+            mb.accounts.reverse();
+            let gone = mb.accounts.pop();
+            let mut fresh = gone.unwrap_or_default();
+            fresh.id = mailcraft_model::AccountId(9_000);
+            fresh.sync.next_op = 5;
+            mb.accounts.push(fresh);
+        });
+        assert!(matches!(ops.first(), Some(Op::PutConfig(_))), "{ops:?}");
+        assert!(ops.iter().any(|o| matches!(o, Op::PutSync(id, sy) if id.0 == 9_000 && sy.next_op == 5)));
+        assert!(!ops.iter().any(|o| matches!(o, Op::Replace(_))));
+        // Calendar, contacts, tasks and notes still journal the whole mailbox (until stage S12).
+        let ops = recorded(&mut s, |mb| {
+            mb.notes.insert(ItemId(8_000_000), mailcraft_model::Note::default());
+        });
+        assert!(matches!(ops.as_slice(), [Op::Replace(_)]), "{ops:?}");
+        // Repeated account ids cannot be said per account.
+        let ops = recorded(&mut s, |mb| {
+            if let Some(a) = mb.accounts.first().cloned() {
+                mb.accounts.push(a);
+            }
+        });
+        assert!(matches!(ops.as_slice(), [Op::Replace(_)]), "{ops:?}");
     }
 
     #[test]

@@ -20,7 +20,8 @@
 //! Interface (frozen for commit 2): [`Store`], [`Op`], [`StoreError`], [`import_maildir`], [`import_mbox`],
 //! [`export_mbox`]. Additions: [`Autosave`], [`Store::import_eml`], [`Store::export_mbox`],
 //! [`Store::checkpoint_mut`], [`Store::load_report`], [`Store::raw_of`], [`Store::gc_blobs`], [`Op::apply`],
-//! [`Store::journal_bytes`], [`Store::keep_alive`], [`Store::append_keyed`], [`MailRepo`] (storage stage S2).
+//! [`Store::journal_bytes`], [`Store::keep_alive`], [`Store::append_keyed`], [`MailRepo`] (storage stage S2),
+//! [`Op::PutSync`], [`Op::PutConfig`] and [`SmallState`] (storage stage S4).
 //!
 //! Size caps (issue #25): every file is written under the same cap its reader applies, so a profile can never
 //! hold a snapshot, journal or recoverable-items file it would refuse to open. A write past the cap fails with
@@ -28,6 +29,7 @@
 
 pub mod autosave;
 pub mod blob;
+pub mod config;
 pub mod import;
 pub mod journal;
 pub mod lock;
@@ -48,6 +50,7 @@ use serde::{Deserialize, Serialize};
 
 pub use autosave::Autosave;
 pub use blob::BlobKey;
+pub use config::SmallState;
 pub use import::MaildirFlags;
 pub use journal::Repair;
 pub use mailcraft_model::{ChangeToken, MailChanges};
@@ -91,12 +94,20 @@ pub enum Op {
     /// Upsert the whole folder table entry.
     PutFolder(Box<mailcraft_model::Folder>),
     RemoveFolder(FolderId),
-    /// Replace one account, matched by id (appended when it is missing). Only for an account whose place in
-    /// the list stays: accounts added, removed or reordered go through `Replace`. Changing an account's sync
-    /// state or its queue of server changes (every command on synchronised mail) journals just this.
+    /// Replace one account, matched by id (appended when it is missing). No longer written (storage stage S4
+    /// journals an account's settings through `PutConfig` and its sync state through `PutSync`); still
+    /// replayed from journals written before.
     PutAccount(Box<mailcraft_model::Account>),
-    /// Replace the whole mailbox (used for big changes: rules, categories, views, accounts added or removed).
+    /// Replace the whole mailbox (a mailbox opened or replaced as a whole, and calendar, contact, task and
+    /// note changes until storage stage S12).
     Replace(Box<Mailbox>),
+    /// Replace one account's synchronisation bookkeeping (server folder states, the queue of server changes),
+    /// matched by id; skipped when the account is missing. Every command on synchronised mail journals this
+    /// next to its per-item ops.
+    PutSync(mailcraft_model::AccountId, Box<mailcraft_model::account::AccountSync>),
+    /// Replace the configuration parts that changed ([`SmallState`]: accounts without their sync state,
+    /// categories, rules, quick steps, views, signatures, Auto-Complete, dictionary, junk lists).
+    PutConfig(Box<SmallState>),
 }
 
 impl Op {
@@ -124,6 +135,8 @@ impl Op {
                 None => mb.accounts.push(*account),
             },
             Op::Replace(new) => *mb = *new,
+            Op::PutSync(id, sync) => config::put_sync(mb, id, *sync),
+            Op::PutConfig(state) => state.apply(mb),
         }
     }
 }

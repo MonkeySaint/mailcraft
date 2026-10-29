@@ -8,7 +8,7 @@ use mailcraft_model::{Folder, FolderId, FolderRole, ItemId, MailItem, Mailbox, R
 
 use crate::journal::{JOURNAL_FILE, SNAPSHOT_FILE};
 use crate::lock::LOCK_FILE;
-use crate::{Autosave, BlobKey, Op, Store, StoreError, export_mbox, import_maildir, import_mbox};
+use crate::{Autosave, BlobKey, Op, SmallState, Store, StoreError, export_mbox, import_maildir, import_mbox};
 
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
@@ -118,6 +118,58 @@ fn put_account_replaces_one_account_in_place() {
     assert_eq!(names, ["First", "Second, renamed", "Third"]);
     assert_eq!(loaded.accounts.get(1), Some(&second));
     assert_eq!(loaded.folders, mb.folders);
+}
+
+/// `PutSync` sets one account's sync state and `PutConfig` the configuration parts it carries: a new account
+/// list keeps each account's sync state, an account new to the list starts with none, an account missing
+/// for `PutSync` is skipped. Both replay from the journal.
+#[test]
+fn put_sync_and_put_config_replay_from_the_journal() {
+    use mailcraft_model::{Account, AccountId, Category};
+    let d = tmp();
+    let mut mb = base_mailbox();
+    for (id, name) in [(1, "First"), (2, "Second")] {
+        let mut a = Account { id: AccountId(id), display_name: name.into(), ..Default::default() };
+        a.sync.next_op = u64::from(id) * 10;
+        mb.accounts.push(a);
+    }
+    let mut sync = mb.accounts.get(1).map(|a| a.sync.clone()).unwrap();
+    sync.next_op = 77;
+    let mut renamed = mb.accounts.get(1).unwrap().without_sync();
+    renamed.display_name = "Second, renamed".into();
+    let third = Account { id: AccountId(3), display_name: "Third".into(), ..Default::default() };
+    let state = SmallState {
+        accounts: Some(vec![renamed, third, mb.accounts.first().unwrap().without_sync()]),
+        categories: Some(vec![Category { name: "Blue".into(), ..Default::default() }]),
+        ..Default::default()
+    };
+    let line = serde_json::to_string(&Op::PutConfig(Box::new(state.clone()))).unwrap();
+    assert!(!line.contains("rules") && !line.contains("junk"), "only the parts set: {line}");
+    {
+        let mut store = Store::open(d.path()).unwrap();
+        store.append(&[Op::Replace(Box::new(mb.clone()))]).unwrap();
+        store
+            .append(&[
+                Op::PutSync(AccountId(2), Box::new(sync.clone())),
+                Op::PutConfig(Box::new(state)),
+                Op::PutSync(AccountId(99), Box::default()),
+            ])
+            .unwrap();
+    }
+    let loaded = Store::open(d.path()).unwrap().load().unwrap();
+    let names: Vec<&str> = loaded.accounts.iter().map(|a| a.display_name.as_str()).collect();
+    assert_eq!(names, ["Second, renamed", "Third", "First"]);
+    let next: Vec<u64> = loaded.accounts.iter().map(|a| a.sync.next_op).collect();
+    assert_eq!(next, [77, 0, 10], "each account keeps its sync state");
+    assert_eq!(loaded.categories.len(), 1);
+    assert_eq!(loaded.rules, mb.rules);
+    assert_eq!(loaded.folders, mb.folders);
+    // An empty state changes nothing.
+    let mut again = loaded.clone();
+    Op::PutConfig(Box::default()).apply(&mut again);
+    assert_eq!(again, loaded);
+    assert!(SmallState::default().is_empty());
+    assert_eq!(SmallState::changed(&loaded, &again), None);
 }
 
 #[test]

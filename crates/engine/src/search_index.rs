@@ -282,7 +282,11 @@ impl SearchState {
                 }
                 // Folder names feed `folder:` and scopes: results may change without index changes. An
                 // account's queue and sync state hold no searchable text.
-                Op::PutFolder(_) | Op::RemoveFolder(_) | Op::PutAccount(_) => {}
+                Op::PutFolder(_)
+                | Op::RemoveFolder(_)
+                | Op::PutAccount(_)
+                | Op::PutSync(..)
+                | Op::PutConfig(_) => {}
                 Op::Replace(_) => inner.full = true,
             }
         }

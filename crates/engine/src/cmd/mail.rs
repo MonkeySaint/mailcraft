@@ -74,11 +74,6 @@ pub(crate) fn journal(s: &mut Session, ids: &[ItemId]) {
     }
 }
 
-/// Journals a whole-mailbox change (master category list, rules).
-fn journal_mailbox(s: &mut Session) {
-    s.pending_ops.push(mailcraft_store::Op::Replace(Box::new(s.mailbox.clone())));
-}
-
 /// Queues a dialog request and returns `{"dialog": name}`.
 pub(crate) fn open_dialog(s: &mut Session, name: &str, params: Value) -> CmdResult {
     s.notify(Notice::OpenDialog(name.to_owned(), params));
@@ -1245,9 +1240,9 @@ fn archive(s: &mut Session, p: &Value) -> CmdResult {
             && f.role.is_none()
             && f.kind == FolderKind::Mail
         {
+            // Journaled from the command's change record (PutFolder), as is the new category below.
             f.role = Some(FolderRole::Archive);
             remembered = true;
-            journal_mailbox(s);
         }
         let moved = move_and_reselect(s, &ids, folder)?;
         return Ok(json!({"moved": moved.len(), "folder": folder.0, "remembered": remembered}));
@@ -1845,7 +1840,6 @@ fn categorize(s: &mut Session, p: &Value) -> CmdResult {
                 color: CategoryColor::None,
                 shortcut: String::new(),
             });
-            journal_mailbox(s);
             name
         }
     };
@@ -1936,20 +1930,16 @@ fn private(s: &mut Session, p: &Value) -> CmdResult {
     }
     let on = !states.iter().all(|p| *p);
     let mut mail_changed = Vec::new();
-    let mut other_changed = false;
     for id in &ids {
         if let Some(m) = s.mailbox.mail.get_mut(*id) {
             m.sensitivity = if on { Sensitivity::Private } else { Sensitivity::Normal };
             mail_changed.push(*id);
         } else if let Some(a) = s.mailbox.appointments.get_mut(id) {
+            // Journaled from the command's change record.
             a.private = on;
-            other_changed = true;
         }
     }
     journal(s, &mail_changed);
-    if other_changed {
-        journal_mailbox(s);
-    }
     Ok(json!({"private": on}))
 }
 

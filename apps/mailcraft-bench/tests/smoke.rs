@@ -70,14 +70,22 @@ fn two_thousand_messages_smoke() {
         "imap_undo_1_ms",
         "imap_move_1_ms",
         "imap_undo_move_1_ms",
+        "config_new_category_ms",
+        "config_sort_ms",
         "undo_bytes",
         "small_state_bytes",
     ] {
         assert!(r["measure"]["commands"][k].is_number(), "{k}");
     }
-    // A command on synchronised mail journals the item and its account, not the whole mailbox.
+    // A command on synchronised mail journals the item and its sync state, a configuration change the part
+    // that changed: never the whole mailbox.
     let whole = num(&r, "/measure/open/mailbox_approx_bytes");
-    for k in ["imap_mark_read_1_journal_bytes", "imap_move_1_journal_bytes"] {
+    for k in [
+        "imap_mark_read_1_journal_bytes",
+        "imap_move_1_journal_bytes",
+        "config_new_category_journal_bytes",
+        "config_sort_journal_bytes",
+    ] {
         let wrote = num(&r, &format!("/measure/commands/{k}"));
         assert!(wrote > 0.0 && wrote < whole / 10.0, "{k}: {wrote} of {whole}");
     }

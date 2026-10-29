@@ -1057,6 +1057,9 @@ impl Session {
                     if self.automatic_depth == 0 && !self.undo_barrier {
                         self.record_undo(spec.label, changes);
                     }
+                    if self.journal_calls == journal_calls_before {
+                        self.drop_superseded(pending_before, &ops);
+                    }
                     self.journal(ops);
                 }
             }
@@ -1099,6 +1102,32 @@ impl Session {
         self.run_depth = self.run_depth.saturating_sub(1);
         self.automatic_depth = self.automatic_depth.saturating_sub(1);
         result
+    }
+
+    /// Drops the per-item ops a command queued directly (from `from` on, none written yet) for items its
+    /// change record journals anyway: `ops` come after them and hold each item's final state, so the item is
+    /// not written twice (a flag change on a message wrote the message twice before).
+    fn drop_superseded(&mut self, from: usize, ops: &[Op]) {
+        if self.pending_ops.len() <= from {
+            return;
+        }
+        let covered: std::collections::BTreeSet<ItemId> = ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::PutMail(m) => Some(m.id),
+                Op::RemoveMail(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if covered.is_empty() {
+            return;
+        }
+        let queued = self.pending_ops.split_off(from);
+        self.pending_ops.extend(queued.into_iter().filter(|o| match o {
+            Op::PutMail(m) => !covered.contains(&m.id),
+            Op::RemoveMail(id) => !covered.contains(id),
+            _ => true,
+        }));
     }
 
     /// Queues ops for the store and writes them when a store is attached (errors are logged; the command
@@ -1591,19 +1620,18 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Store ops turning `before` into `after`: per-item and per-folder upserts/removals, or one `Replace` when
-/// anything else changed (accounts and their sync queues, rules, categories, views, quick steps,
-/// calendar/contacts/tasks/notes, signatures, Auto-Complete, the dictionary).
+/// Store ops turning `before` into `after`: the configuration parts and account sync states that changed
+/// ([`small_ops`]), then per-folder and per-item upserts and removals; or one `Replace` when the calendar,
+/// contacts, tasks or notes changed (until storage stage S12).
 ///
 /// Compares every item, so it is O(mailbox). Commands, undo and sync use change records instead
 /// (`changes.rs`, which derives the same ops); this remains for the debug-build check that they agree and for
 /// tests (release builds leave it out).
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
-    if other_changed(before, after) {
+    let Some(mut ops) = small_ops(before, after) else {
         return vec![Op::Replace(Box::new(after.clone()))];
-    }
-    let mut ops = account_ops(before, after);
+    };
     for (id, f) in &after.folders {
         if before.folders.get(id) != Some(f) {
             ops.push(Op::PutFolder(Box::new(f.clone())));
@@ -1627,61 +1655,66 @@ pub(crate) fn diff_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
     ops
 }
 
-/// One `PutAccount` per account that changed in place ([`other_changed`] is false, so the accounts are the
-/// same ids in the same order), in list order.
-pub(crate) fn account_ops(before: &Mailbox, after: &Mailbox) -> Vec<Op> {
-    before
-        .accounts
-        .iter()
-        .zip(&after.accounts)
-        .filter(|(b, a)| b != a)
-        .map(|(_, a)| Op::PutAccount(Box::new(a.clone())))
-        .collect()
+/// The ops for everything but the folders and the mail (storage stage S4): one `PutConfig` with the
+/// configuration parts that changed (accounts compared and carried without their sync state), then one
+/// `PutSync` per account whose sync state changed, in list order. `None` when that cannot be said in those
+/// ops and the whole mailbox is journaled instead: the calendar, contacts, tasks or notes changed
+/// ([`pim_changed`]), or an account id appears twice.
+pub(crate) fn small_ops(before: &Mailbox, after: &Mailbox) -> Option<Vec<Op>> {
+    if pim_changed(before, after) || !unique_accounts(&before.accounts) || !unique_accounts(&after.accounts) {
+        return None;
+    }
+    let mut ops = Vec::new();
+    if let Some(state) = mailcraft_store::SmallState::changed(before, after) {
+        ops.push(Op::PutConfig(Box::new(state)));
+    }
+    let was: BTreeMap<mailcraft_model::AccountId, &mailcraft_model::account::AccountSync> =
+        before.accounts.iter().map(|a| (a.id, &a.sync)).collect();
+    let none = mailcraft_model::account::AccountSync::default();
+    for a in &after.accounts {
+        // An account new to the list starts with no sync state (`SmallState::apply`).
+        if **was.get(&a.id).unwrap_or(&&none) != a.sync {
+            ops.push(Op::PutSync(a.id, Box::new(a.sync.clone())));
+        }
+    }
+    Some(ops)
 }
 
-/// Whether the account list kept its accounts in their places (only their contents may differ).
-fn same_accounts(before: &[mailcraft_model::Account], after: &[mailcraft_model::Account]) -> bool {
-    before.len() == after.len() && before.iter().zip(after).all(|(b, a)| b.id == a.id)
+/// Whether no account id appears twice.
+fn unique_accounts(accounts: &[mailcraft_model::Account]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    accounts.iter().all(|a| seen.insert(a.id))
 }
 
-/// Whether anything but the folders, the mail, the contents of accounts that kept their place
-/// ([`account_ops`]) and `next_id` differs (the store journals that as a whole mailbox `Replace` until
-/// storage stage S4).
-pub(crate) fn other_changed(before: &Mailbox, after: &Mailbox) -> bool {
+/// Whether the calendar, contacts, tasks or notes differ (the store journals that as a whole-mailbox
+/// `Replace` until storage stage S12).
+pub(crate) fn pim_changed(before: &Mailbox, after: &Mailbox) -> bool {
     // Exhaustive on purpose: a new Mailbox field fails to compile here until it is journaled.
     let Mailbox {
-        accounts,
+        // Journaled by `small_ops` (PutConfig, PutSync).
+        accounts: _,
+        categories: _,
+        rules: _,
+        quick_steps: _,
+        views: _,
+        signatures: _,
+        signature_defaults: _,
+        recent_recipients: _,
+        custom_dictionary: _,
+        junk: _,
+        // Journaled per entry.
         folders: _,
         mail: _,
+        next_id: _,
         appointments,
         contacts,
         tasks,
         notes,
-        categories,
-        rules,
-        quick_steps,
-        views,
-        next_id: _,
-        signatures,
-        signature_defaults,
-        recent_recipients,
-        custom_dictionary,
-        junk,
     } = after;
-    !same_accounts(&before.accounts, accounts)
-        || before.categories != *categories
-        || before.rules != *rules
-        || before.quick_steps != *quick_steps
-        || before.views != *views
-        || before.appointments != *appointments
+    before.appointments != *appointments
         || before.contacts != *contacts
         || before.tasks != *tasks
         || before.notes != *notes
-        || before.signatures != *signatures
-        || before.signature_defaults != *signature_defaults
-        || before.recent_recipients != *recent_recipients
-        || before.custom_dictionary != *custom_dictionary
-        || before.junk != *junk
 }
 
 /// Whether command params name the items to act on ([`Session::params_name_items`]).
@@ -1699,13 +1732,13 @@ mod tests {
         let mb = Mailbox::new_local("Local");
         let mut after = mb.clone();
         after.custom_dictionary.push("mailcraft".into());
-        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::Replace(_)]));
+        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::PutConfig(_)]));
         let mut after = mb.clone();
         after.recent_recipients.push(Default::default());
-        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::Replace(_)]));
+        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::PutConfig(_)]));
         let mut after = mb.clone();
         after.signatures.push(Default::default());
-        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::Replace(_)]));
+        assert!(matches!(diff_ops(&mb, &after).as_slice(), [Op::PutConfig(_)]));
         assert!(diff_ops(&mb, &mb.clone()).is_empty());
     }
 
