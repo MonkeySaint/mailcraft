@@ -118,6 +118,8 @@ crc32fast = "1.5.2"
 cfb = "0.14"
 roxmltree = "0.20"
 miniz_oxide = "0.8"
+# PST files ([MS-PST], read only): Microsoft's MIT-licensed reference reader (byteorder, thiserror, tracing).
+outlook-pst = "1.2.0"
 
 # SVG rasterising: xtask ico, the UI (app icon, SVG pictures) and mailcraft-render (generated pictures to PNG)
 resvg = { version = "0.45.1", default-features = false }

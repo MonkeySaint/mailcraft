@@ -515,7 +515,7 @@ struct OpenDataState {
 }
 
 /// Open Data File: the data files closed in this profile (Remove keeps them), or a .mcdata file picked by
-/// path (`file.openDataFile`).
+/// path (`file.openDataFile`); a PST file (.pst) picked by path is imported into a new data file.
 fn open_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     let files: Vec<(String, u64)> = d
@@ -561,14 +561,18 @@ fn open_data_file(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 ui.horizontal(|ui| {
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut st.path)
-                            .hint_text("Path to a .mcdata file")
+                            .hint_text("Path to a .mcdata or .pst file")
                             .desired_width(280.0),
                     );
                     if r.changed() && !st.path.is_empty() {
                         st.sel = None;
                     }
                     if common::browse_button(ui, app) {
-                        let filters = [crate::FileFilter::new("MailCraft data file", &["mcdata"])];
+                        let filters = [
+                            crate::FileFilter::new("Data files", &["mcdata", "pst"]),
+                            crate::FileFilter::new("MailCraft data file", &["mcdata"]),
+                            crate::FileFilter::new("PST data file", &["pst"]),
+                        ];
                         if let Some(p) = common::browse_open(app, "Open Data File", &filters, &st.path) {
                             st.path = p;
                             st.sel = None;

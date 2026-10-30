@@ -272,6 +272,7 @@ pub const KNOWN: &[&str] = &[
     "confirmRemoveAccount",
     "mailboxCleanup",
     "importExport",
+    "pstProgress",
     "saveAs",
     "saveAttachments",
     "saveItemFile",

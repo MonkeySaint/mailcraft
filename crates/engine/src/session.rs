@@ -308,6 +308,8 @@ pub struct Session {
     pub background_translate: bool,
     /// Translations running on worker threads (see [`crate::translate`]).
     pub(crate) translate_jobs: crate::translate::Jobs,
+    /// The PST import that runs, or ran last (`pst.rs`).
+    pub(crate) pst: crate::pst::PstJobs,
     /// Pages View in Browser wrote this session (deleted with their message and when the session ends).
     pub browser_pages: crate::browser::BrowserPages,
     /// Profile folder holding `settings.json` (`None` = in-memory session: nothing is saved).
@@ -443,6 +445,7 @@ impl Session {
             translator_options: None,
             background_translate: false,
             translate_jobs: crate::translate::Jobs::default(),
+            pst: crate::pst::PstJobs::default(),
             browser_pages: crate::browser::BrowserPages::default(),
             settings_dir: None,
             settings_saved: None,

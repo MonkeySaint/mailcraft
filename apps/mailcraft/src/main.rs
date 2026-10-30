@@ -199,6 +199,16 @@ impl eframe::App for MailCraft {
 }
 
 fn main() -> ExitCode {
+    // PST files are read in a process of their own (see `mailcraft_engine::pst`): this program, started
+    // with `--pst-worker FILE`, is that reader.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some(mailcraft_engine::pst::WORKER_ARG) {
+        let code = mailcraft_engine::pst::worker_main(argv.get(2..).unwrap_or(&[]));
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        mailcraft_engine::pst::set_worker(exe);
+    }
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {

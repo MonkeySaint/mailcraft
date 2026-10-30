@@ -9,7 +9,7 @@
 //! storages (embedded messages as nested message storages), the named-property mapping storage, Unicode string
 //! properties and the STORE_UNICODE_OK support mask.
 
-mod props;
+pub(crate) mod props;
 pub mod read;
 pub mod rtf;
 pub mod rtfhtml;

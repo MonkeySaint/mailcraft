@@ -234,7 +234,45 @@ fn read_object(
         kids.iter().filter(|(n, s)| !s && n.starts_with(ATTACH_PREFIX)).map(|(n, _)| n).collect();
     recips.sort();
     attachs.sort();
+    let recipients: Vec<Props> = recips
+        .into_iter()
+        .take(MAX_RECIPIENTS)
+        .map(|r| read_props(cf, &format!("{base}/{r}"), HEADER_SUB, cp).0)
+        .collect();
+    let mut attachments = Vec::new();
+    for a in attachs.into_iter().take(MAX_ATTACHMENTS) {
+        let path = format!("{base}/{a}");
+        let (ap, _) = read_props(cf, &path, HEADER_SUB, cp);
+        let method = ap.int(PID_ATTACH_METHOD).unwrap_or(1);
+        let embedded_path = format!("{path}/{}", substg(PID_ATTACH_DATA, PT_OBJECT));
+        let embedded = if method == i64::from(ATTACH_EMBEDDED_MSG) && cf.cf.is_storage(&embedded_path) {
+            if depth >= MAX_EMBED_DEPTH {
+                continue;
+            }
+            Some(read_object(cf, &embedded_path, HEADER_EMBEDDED, depth + 1, keywords, cp))
+        } else {
+            None
+        };
+        attachments.push(RawAttachment { props: ap, embedded });
+    }
+    assemble(&p, keywords, recipients, attachments)
+}
 
+/// An attachment's properties, and its embedded message when it is one (read by the caller).
+pub(crate) struct RawAttachment {
+    pub props: Props,
+    pub embedded: Option<MsgMessage>,
+}
+
+/// A message from its properties ([MS-OXCMSG], [MS-OXOMSG]), its recipients' properties and its attachments.
+/// Shared by the `.msg` reader and the PST reader. `keywords` is the property id of the `Keywords` named
+/// property (categories) in this file, if it has one.
+pub(crate) fn assemble(
+    p: &Props,
+    keywords: Option<u16>,
+    recipients: Vec<Props>,
+    attachments: Vec<RawAttachment>,
+) -> MsgMessage {
     let mut m = MsgMessage {
         message_class: p.text(PID_MESSAGE_CLASS).unwrap_or_else(|| "IPM.Note".into()),
         subject: p.string(PID_SUBJECT).unwrap_or_default(),
@@ -256,9 +294,9 @@ fn read_object(
     if m.sender.as_ref().zip(m.from.as_ref()).is_some_and(|(s, f)| s.same_address(f)) {
         m.sender = None;
     }
-    m.sent = time(&p, PID_CLIENT_SUBMIT_TIME);
-    m.received = time(&p, PID_MESSAGE_DELIVERY_TIME);
-    m.created = time(&p, PID_CREATION_TIME).or_else(|| time(&p, PID_LAST_MODIFICATION_TIME));
+    m.sent = time(p, PID_CLIENT_SUBMIT_TIME);
+    m.received = time(p, PID_MESSAGE_DELIVERY_TIME);
+    m.created = time(p, PID_CREATION_TIME).or_else(|| time(p, PID_LAST_MODIFICATION_TIME));
     m.message_id = p.text(PID_INTERNET_MESSAGE_ID).map(|s| clean_id(&s)).filter(|s| !s.is_empty());
     m.in_reply_to =
         p.text(PID_IN_REPLY_TO).map(|s| mailcraft_mime::message::parse_msg_ids(&s)).unwrap_or_default();
@@ -316,8 +354,7 @@ fn read_object(
     }
 
     // Recipients.
-    for r in recips.into_iter().take(MAX_RECIPIENTS) {
-        let (rp, _) = read_props(cf, &format!("{base}/{r}"), HEADER_SUB, cp);
+    for rp in recipients.into_iter().take(MAX_RECIPIENTS) {
         let Some(mb) = mailbox(
             rp.text(PID_DISPLAY_NAME),
             rp.text(PID_SMTP_ADDRESS),
@@ -360,29 +397,15 @@ fn read_object(
     }
 
     // Attachments.
-    for a in attachs.into_iter().take(MAX_ATTACHMENTS) {
-        let path = format!("{base}/{a}");
-        let (ap, _) = read_props(cf, &path, HEADER_SUB, cp);
-        let method = ap.int(PID_ATTACH_METHOD).unwrap_or(1);
+    for RawAttachment { props: ap, embedded } in attachments.into_iter().take(MAX_ATTACHMENTS) {
         let filename = ap
             .text(PID_ATTACH_LONG_FILENAME)
             .or_else(|| ap.text(PID_ATTACH_FILENAME))
             .or_else(|| ap.text(PID_DISPLAY_NAME))
             .unwrap_or_default();
         let content_id = ap.text(PID_ATTACH_CONTENT_ID).map(|c| clean_id(&c)).filter(|c| !c.is_empty());
-        let embedded_path = format!("{path}/{}", substg(PID_ATTACH_DATA, PT_OBJECT));
-        let content = if method == i64::from(ATTACH_EMBEDDED_MSG) && cf.cf.is_storage(&embedded_path) {
-            if depth >= MAX_EMBED_DEPTH {
-                continue;
-            }
-            AttachmentContent::Message(Box::new(read_object(
-                cf,
-                &embedded_path,
-                HEADER_EMBEDDED,
-                depth + 1,
-                keywords,
-                cp,
-            )))
+        let content = if let Some(sub) = embedded {
+            AttachmentContent::Message(Box::new(sub))
         } else if let Some(d) = ap.binary(PID_ATTACH_DATA) {
             AttachmentContent::Data(d.to_vec())
         } else {

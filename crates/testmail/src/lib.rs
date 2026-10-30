@@ -56,6 +56,7 @@ mod jmap;
 mod mime;
 mod oauth;
 mod pop3;
+pub mod pst;
 mod server;
 mod smtp;
 mod store;

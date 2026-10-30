@@ -23,6 +23,7 @@ pub mod intl;
 pub mod junk;
 pub mod new_mail;
 pub mod offline;
+pub mod pst;
 pub mod queries;
 pub mod recover;
 pub mod reminders;

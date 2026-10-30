@@ -180,3 +180,69 @@ fn mcp_connect_failure_is_an_error() {
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("cannot connect"));
 }
+
+/// PST import from the CLI: the file is read by a second `mailcraft-cli` process (`--pst-worker`), its
+/// results come back over a pipe, and a damaged file ends the import with a report, never the CLI.
+#[test]
+fn pst_import_reads_the_file_in_a_reader_process() {
+    use mailcraft_testmail::pst::{ItemDef, PstBuilder, Value as P};
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = PstBuilder::new("CLI test");
+    let inbox = b.folder(None, "Inbox", "IPF.Note");
+    let kept = b.folder(None, "Kept", "IPF.Note");
+    for (folder, subject) in [(inbox, "From a PST file"), (kept, "Kept message")] {
+        b.item(
+            folder,
+            ItemDef::new("IPM.Note")
+                .tag(0x0037, P::Unicode(subject.into()))
+                .tag(0x5D02, P::Unicode("ada@example.com".into()))
+                .tag(0x1000, P::Unicode("Hello from a PST file.".into()))
+                .recipient(1, "Bo Example", "bo@example.org"),
+        );
+    }
+    let file = b.build().unwrap();
+    let path = dir.path().join("cli.pst");
+    std::fs::write(&path, &file).unwrap();
+    let cmd = format!(
+        "file.openExport={}",
+        json!({"action": "import", "path": path.to_str().unwrap(), "wait": true})
+    );
+    let r: Value =
+        serde_json::from_str(&ok(&["run", "--sample", "--cmd", &cmd, "--query", "folders"])).unwrap();
+    let res = &r["results"][0]["result"];
+    assert_eq!(res["counts"]["mail"], 2, "{r}");
+    assert_eq!(res["running"], false);
+    assert!(r["query"]["folders"].to_string().contains("Kept"), "{}", r["query"]["folders"]);
+
+    // The reader process itself: one JSON line per folder and item, then the report.
+    let out = cli(&["--pst-worker", path.to_str().unwrap(), "0", "0"]);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.iter().filter(|l| l["t"] == "folder").count(), 2);
+    assert_eq!(lines.iter().filter(|l| l["t"] == "mail").count(), 2);
+    assert_eq!(lines.last().unwrap()["t"], "done");
+    assert_eq!(cli(&["--pst-worker"]).status.code(), Some(2));
+
+    // Damaged copies: the import ends with a report or an error; the CLI never dies with them.
+    let mut seed = 0xfeed_beef_1234_5678u64;
+    for i in 0..12 {
+        let mut f = file.clone();
+        for _ in 0..6 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let at = 0x4600 + (seed as usize) % (f.len() - 0x4600);
+            f[at] = (seed >> 24) as u8;
+        }
+        let p = dir.path().join(format!("bad{i}.pst"));
+        std::fs::write(&p, &f).unwrap();
+        let cmd = format!(
+            "file.openExport={}",
+            json!({"action": "importPst", "path": p.to_str().unwrap(), "wait": true})
+        );
+        let o = cli(&["run", "--sample", "--cmd", &cmd]);
+        let r: Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert!(r["results"][0]["ok"].is_boolean(), "{r}");
+    }
+}

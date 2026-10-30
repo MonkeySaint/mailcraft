@@ -585,7 +585,8 @@ impl Session {
         self.drop_stray_records();
         let status_before = self.sync.status.clone();
         let translated = crate::translate::poll(self);
-        let mailbox_changed = poll_events(self) || translated;
+        let imported = crate::pst::poll(self);
+        let mailbox_changed = poll_events(self) || translated || imported;
         tick(self);
         groups::tick(self);
         crate::recover::tick(self);

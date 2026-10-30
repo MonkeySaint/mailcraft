@@ -745,7 +745,7 @@ fn open_export(ui: &mut Ui, app: &mut App, st: &mut PageState) {
         app,
         "folder-open",
         "Open Data File...",
-        "Open a data file you removed earlier, or a MailCraft data file from another profile.",
+        "Open a data file you removed earlier, a MailCraft data file from another profile, or a PST file (.pst).",
     ) {
         app.run("file.openDataFile", json!({}));
     }
@@ -754,9 +754,20 @@ fn open_export(ui: &mut Ui, app: &mut App, st: &mut PageState) {
         app,
         "sync",
         "Import/Export",
-        "Import mail (EML, MSG, MBOX, Maildir), calendars (iCalendar) or contacts (vCard, CSV), or export them.",
+        "Import mail (EML, MSG, MBOX, Maildir, PST files), calendars (iCalendar) or contacts (vCard, CSV), or export them.",
     ) {
         app.run("file.openExport", json!({}));
+    }
+    // The PST import that runs (its window may be hidden), or the report of the last one.
+    if let Some(st) = mailcraft_engine::pst::status(&app.s).filter(|st| st.get("job").is_some()) {
+        let desc = if st.get("running").and_then(Value::as_bool) == Some(true) {
+            "A PST file is being imported. See how far it is, or stop it.".to_owned()
+        } else {
+            format!("{} See what was left out, and why.", mailcraft_engine::pst::summary(&st))
+        };
+        if tile(ui, app, "sync", "PST Import", &desc) {
+            app.run("file.importProgress", json!({"show": true}));
+        }
     }
     tile_with(
         ui,

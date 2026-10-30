@@ -1,5 +1,5 @@
 //! File-side dialogs: Mailbox Cleanup, the Import and Export Wizard (EML, MSG, MBOX, Maildir, iCalendar,
-//! vCard, CSV), Save As (EML, MSG, text, HTML) and Save Attachments (Print: `print.rs`). Path fields get a Browse... button when the app installed file dialogs
+//! vCard, CSV, PST files) and the PST import's progress window, Save As (EML, MSG, text, HTML) and Save Attachments (Print: `print.rs`). Path fields get a Browse... button when the app installed file dialogs
 //! ([`crate::FileDialogs`]). Account dialogs live in `accounts`.
 
 use egui::{Context, RichText, Ui};
@@ -17,6 +17,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     Some(match d.name {
         "mailboxCleanup" => cleanup(ctx, app, d),
         "importExport" => import_export(ctx, app, d),
+        "pstProgress" => pst_progress(ctx, app, d),
         "saveAs" => save_as(ctx, app, d),
         "saveAttachments" => save_attachments(ctx, app, d),
         mailcraft_engine::cmd::calendar::SAVE_ITEM_FILE => save_item_file(ctx, app, d),
@@ -191,7 +192,7 @@ const CALENDAR_OR_TASKS: Pick = Pick::Kinds(&[FolderKind::Calendar, FolderKind::
 const CONTACTS: Pick = Pick::Kinds(&[FolderKind::Contacts]);
 
 /// Wizard actions, imports first (labels name the file types; formats from public specs).
-pub(crate) const IE_ACTIONS: [IeAction; 11] = [
+pub(crate) const IE_ACTIONS: [IeAction; 12] = [
     IeAction {
         key: "importEml",
         label: "Import an Internet message file (.eml)",
@@ -246,6 +247,16 @@ pub(crate) const IE_ACTIONS: [IeAction; 11] = [
         desc: "Adds contacts from a comma-separated values file; columns are matched by their names.",
         pick: CONTACTS,
         filter: ("Comma-separated values", &["csv"]),
+        suggested: "",
+    },
+    IeAction {
+        key: "importPst",
+        label: "Import a PST file (.pst)",
+        desc: "Adds the folders, messages, calendar items, contacts, tasks and notes of a PST data file (.pst). \
+               The file is only read. MailCraft does not write PST files: to take mail elsewhere, export it to \
+               MBOX, iCalendar or vCard, or keep it in a MailCraft data file.",
+        pick: MAIL,
+        filter: ("PST data file", &["pst"]),
         suggested: "",
     },
     IeAction {
@@ -330,6 +341,9 @@ pub(crate) fn ie_result_text(
     if action.export() {
         return format!("Exported {} {what} to {path}.", n("exported"));
     }
+    if v.get("started").and_then(Value::as_bool) == Some(true) {
+        return format!("Importing {path} in the background; the progress window shows how far it is.");
+    }
     let into = folder_path(app, v.get("folder").and_then(Value::as_u64).or(folder));
     let mut text = if action.key == "importIcs" {
         format!("Imported {} appointment(s) and {} task(s) into {into}.", n("appointments"), n("tasks"))
@@ -354,7 +368,16 @@ struct IeState {
     path: String,
     folder: Option<u64>,
     error: String,
+    /// PST import: every folder of the file goes beneath the chosen folder (else the file's default folders
+    /// merge into the chosen folder's account).
+    pst_beneath: bool,
+    /// PST import: items already in the target folder come in again.
+    pst_allow_duplicates: bool,
 }
+
+/// What the wizard tells about PST files and export.
+const NO_PST_EXPORT: &str = "PST files can be imported, not written. Export writes MBOX, iCalendar, vCard and CSV \
+     files; Save As writes .eml and .msg files; a MailCraft data file (.mcdata) keeps whole folders.";
 
 fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
@@ -387,6 +410,9 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                     });
                 ui.label(RichText::new("Description").strong());
                 muted(ui, app, action.desc);
+                if export {
+                    muted(ui, app, NO_PST_EXPORT);
+                }
             } else {
                 ui.label(RichText::new(action.label).strong());
                 ui.label(if export {
@@ -422,6 +448,19 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 });
                 ui.label(action.folder_prompt());
                 folder_tree(ui, app, &mut st.folder, action.pick, ("ie", uid), 180.0);
+                if action.key == "importPst" {
+                    ui.radio_value(
+                        &mut st.pst_beneath,
+                        false,
+                        "Put the file's Inbox, Calendar and other default folders into this folder's account",
+                    );
+                    ui.radio_value(
+                        &mut st.pst_beneath,
+                        true,
+                        "Put all of the file's folders beneath this folder",
+                    );
+                    ui.checkbox(&mut st.pst_allow_duplicates, "Import items that are already there again");
+                }
             }
             if !st.error.is_empty() {
                 ui.colored_label(app.theme.danger, &st.error);
@@ -439,11 +478,26 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 } else {
                     let ready = !st.path.trim().is_empty() && st.folder.is_some();
                     if primary(ui, app, ready, "Finish") {
-                        let res = app.run(
-                            "file.openExport",
-                            json!({"action": action.key, "path": st.path.trim(), "folder": st.folder}),
-                        );
+                        let mut params =
+                            json!({"action": action.key, "path": st.path.trim(), "folder": st.folder});
+                        if action.key == "importPst"
+                            && let Some(o) = params.as_object_mut()
+                        {
+                            o.insert(
+                                "into".into(),
+                                json!(if st.pst_beneath { "beneath" } else { "account" }),
+                            );
+                            o.insert(
+                                "duplicates".into(),
+                                json!(if st.pst_allow_duplicates { "allow" } else { "skip" }),
+                            );
+                        }
+                        let res = app.run("file.openExport", params);
                         match res {
+                            // A PST import runs in the background; its progress window opens by itself.
+                            Some(v) if v.get("started").and_then(Value::as_bool) == Some(true) => {
+                                out = Out::Close
+                            }
                             Some(v) => {
                                 let text = ie_result_text(app, &action, &v, st.path.trim(), st.folder);
                                 out = Out::close_open(
@@ -462,6 +516,94 @@ fn import_export(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
             });
             out
         })
+    })
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// PST import progress
+
+/// The running PST import (or the last one): how far it is, Stop, and when it ends what it did and what it
+/// left out.
+fn pst_progress(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let st = mailcraft_engine::pst::status(&app.s).unwrap_or_else(|| json!({"running": false}));
+    let running = st.get("running").and_then(Value::as_bool) == Some(true);
+    if running {
+        ctx.request_repaint_after(std::time::Duration::from_millis(150));
+    }
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    window(ctx, app, d, "Import PST File", 540.0, |ui, app| {
+        let file = st
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|p| std::path::Path::new(p).file_name().and_then(|f| f.to_str()).unwrap_or(p).to_owned())
+            .unwrap_or_default();
+        let account = st.get("accountName").and_then(Value::as_str).unwrap_or_default();
+        if st.get("job").is_none() {
+            muted(ui, app, "No PST file is being imported.");
+        } else if running {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(format!("Importing {file} into {account}..."));
+            });
+            let p = st.get("progress").cloned().unwrap_or(Value::Null);
+            let (done, total) = (n(&p, "items_done"), n(&p, "items_total"));
+            let fraction = if total > 0 {
+                done as f32 / total as f32
+            } else if n(&p, "file_bytes") > 0 {
+                (n(&p, "bytes_read") as f32 / n(&p, "file_bytes") as f32).min(1.0)
+            } else {
+                0.0
+            };
+            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).show_percentage());
+            muted(ui, app, &format!("{done} of {total} items read in {} folders", n(&p, "folders")));
+        } else {
+            ui.label(mailcraft_engine::pst::summary(&st));
+        }
+        if st.get("job").is_some() {
+            let c = st.get("counts").cloned().unwrap_or(Value::Null);
+            muted(
+                ui,
+                app,
+                &format!(
+                    "Messages: {}   Calendar items: {}   Contacts: {}   Tasks: {}   Notes: {}",
+                    n(&c, "mail"),
+                    n(&c, "appointments"),
+                    n(&c, "contacts"),
+                    n(&c, "tasks"),
+                    n(&c, "notes")
+                ),
+            );
+            if n(&st, "duplicates") > 0 {
+                muted(ui, app, &format!("Already there, left out: {}", n(&st, "duplicates")));
+            }
+        }
+        let skipped = st.get("skipped").and_then(Value::as_array).cloned().unwrap_or_default();
+        if !running && !skipped.is_empty() {
+            ui.label(RichText::new(format!("Not imported ({})", n(&st, "skippedCount"))).strong());
+            egui::ScrollArea::vertical().id_salt(("pst-skipped", d.uid)).max_height(180.0).show(ui, |ui| {
+                for k in skipped.iter().take(300) {
+                    let s = |key: &str| k.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+                    let place =
+                        [s("folder"), s("item")].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>();
+                    let place = if place.is_empty() { file.clone() } else { place.join(" › ") };
+                    ui.label(format!("{place}: {}", s("reason")));
+                }
+            });
+        }
+        let mut out = Out::Keep;
+        footer(ui, |ui| {
+            if running {
+                if btn(ui, "Stop") {
+                    app.run("file.importProgress", json!({"cancel": true}));
+                }
+                if btn(ui, "Hide") {
+                    out = Out::Close;
+                }
+            } else if primary(ui, app, true, "Close") {
+                out = Out::Close;
+            }
+        });
+        out
     })
 }
 

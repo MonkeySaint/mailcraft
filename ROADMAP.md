@@ -76,7 +76,7 @@ Two numbers, kept separate on purpose:
 | People | ~97 % | editor, groups, table and card views with sort, filter and conditional formatting, saved views, vCard/CSV, Mail Merge (e-mail, letters, labels, envelopes), CardDAV sync |
 | Tasks | ~98 % | editor, recurrence, task requests, table views with column sets and saved views, Tasks ribbon on flagged messages and contacts, CalDAV task sync, flagged mail previews in the To-Do List |
 | Notes | ~100 % | create/edit/colour, icon and table views, saved views, positions kept on the note |
-| Import/export and print | ~65 % | EML/MSG/MBOX/Maildir/ICS/VCF/CSV, PDF everywhere, CUPS; no PST, no Windows printing |
+| Import/export and print | ~75 % | EML/MSG/MBOX/Maildir/ICS/VCF/CSV, PST import and Open Data File (read only; export goes to MailCraft data files, EML, MBOX, ICS and VCF; attached messages inside PST files not yet), PDF everywhere, CUPS; no Windows printing |
 | Options dialog | ~90 % | every setting persists in the profile; 178 of 228 take effect, 29 are not applicable, 21 are shown or stored only (`settings::effect_counts`) |
 | Responsive behaviour | ~97 % | 29 of 30 observed behaviours (Classic Respond group at 1024 px) |
 | Keyboard | ~99 % | Space on a focused button; F6 cycles compose and read windows |

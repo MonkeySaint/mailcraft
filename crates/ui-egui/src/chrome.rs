@@ -1188,6 +1188,7 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
             app.run("view.reminderWindow", json!({}));
         }
     }
+    pst_import_status(ui, app);
     sync_status(ui, app, frame);
 
     // Right side: zoom percentage, zoom slider, view shortcuts, then the connection state.
@@ -1276,6 +1277,30 @@ fn outbox_waiting(app: &App) -> (usize, Option<u32>) {
 /// Left side of the status bar, after the item counts: what send/receive is doing ("Updating Inbox…", "All
 /// folders are up to date.") or its error with a Retry button, and the Outbox badge. Clicking the text opens
 /// Send/Receive Progress; the badge opens the Outbox.
+/// A PST import that runs in the background: how far it is; a click opens its window again (after Hide).
+fn pst_import_status(ui: &mut Ui, app: &mut App) {
+    if !mailcraft_engine::pst::running(&app.s) {
+        return;
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    let label = pst_import_label(mailcraft_engine::pst::status(&app.s).as_ref());
+    if ui.add(egui::Button::new(label).frame(false)).on_hover_text("Show the import's progress").clicked() {
+        app.run("file.importProgress", json!({"show": true}));
+    }
+}
+
+/// "Importing PST file" with the share of items read so far, when the file has announced them.
+fn pst_import_label(status: Option<&Value>) -> String {
+    let n = |k: &str| {
+        status.and_then(|s| s.get("progress")).and_then(|p| p.get(k)).and_then(Value::as_u64).unwrap_or(0)
+    };
+    let (done, total) = (n("items_done"), n("items_total"));
+    match done.min(total).saturating_mul(100).checked_div(total) {
+        Some(pct) => format!("Importing PST file: {pct}%"),
+        None => "Importing PST file".to_owned(),
+    }
+}
+
 fn sync_status(ui: &mut Ui, app: &mut App, frame: &Frame) {
     let st = app.s.sync_status().clone();
     if st.accounts.is_empty() {
@@ -1630,6 +1655,16 @@ fn save_pane_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pst_import_label_shows_how_far_it_is() {
+        assert_eq!(pst_import_label(None), "Importing PST file");
+        let st = json!({"progress": {"items_done": 30, "items_total": 120}});
+        assert_eq!(pst_import_label(Some(&st)), "Importing PST file: 25%");
+        // Damaged counters never go past 100 %.
+        let st = json!({"progress": {"items_done": 500, "items_total": 120}});
+        assert_eq!(pst_import_label(Some(&st)), "Importing PST file: 100%");
+    }
 
     /// Rectangles outlined with the accent keyboard-focus stroke in the last frame.
     fn focus_outlines(h: &egui_kittest::Harness<'_, App>) -> Vec<Rect> {

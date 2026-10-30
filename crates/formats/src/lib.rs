@@ -9,6 +9,8 @@
 //! - [`ics`]: iCalendar (RFC 5545) with recurrence expansion, time zones and iTIP methods (RFC 5546).
 //! - [`vcf`]: vCard 4.0 (RFC 6350) and 3.0 (RFC 2426), lenient with 2.1.
 //! - [`csv`]: RFC 4180 CSV and the contacts import/export column mapping.
+//! - [`pst`]: PST files per [MS-PST], read only (via the MIT-licensed `outlook-pst` crate), for import and
+//!   for opening one as a data file.
 //! - [`keep`]: server copies of vCards and iCalendar objects kept across an edit (what MailCraft does not
 //!   model goes back unchanged).
 //!
@@ -21,6 +23,7 @@ pub mod ics;
 pub mod keep;
 pub mod mbox;
 pub mod msg;
+pub mod pst;
 pub mod theme;
 pub mod vcf;
 

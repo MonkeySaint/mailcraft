@@ -1567,3 +1567,65 @@ fn backstage_exit_has_room_and_the_storage_bar_needs_a_limit() {
         storage_fill(Some(&MailboxQuota { used: 301_000, limit: 2_000_000_000, ..Default::default() }));
     assert!(tiny.is_some_and(|f| f < 0.01), "{tiny:?}");
 }
+
+#[test]
+fn import_export_wizard_imports_a_pst_file_and_shows_its_progress_and_report() {
+    use mailcraft_testmail::pst::{ItemDef, PstBuilder, Value as P};
+    let dir = scratch_dir("pst");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("old mail.pst");
+    let mut b = PstBuilder::new("Old mail");
+    let kept = b.folder(None, "Kept", "IPF.Note");
+    b.item(kept, ItemDef::new("IPM.Note").tag(0x0037, P::Unicode("From the wizard".into())));
+    b.item(kept, ItemDef::new("IPM.DistList").tag(0x0037, P::Unicode("A contact group".into())));
+    std::fs::write(&path, b.build().unwrap()).unwrap();
+    let mut app = sample_app();
+    app.run("file.openExport", json!({})).unwrap();
+    let mut h = harness(app);
+    h.get_by_label("Import a PST file (.pst)").click();
+    step(&mut h);
+    assert!(h.query_by_label_contains("does not write PST files").is_some());
+    h.get_by_label("Next >").click();
+    step(&mut h);
+    h.get_by_label("Put all of the file's folders beneath this folder").click();
+    step(&mut h);
+    h.get_by_role(egui::accesskit::Role::TextInput).focus();
+    step(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+    h.get_by_role(egui::accesskit::Role::TextInput).type_text(path.to_str().unwrap());
+    step(&mut h);
+    h.get_by_label("Finish").click();
+    step(&mut h);
+    assert_eq!(names(&h), ["pstProgress"], "{:?}", h.state().ui.toast);
+    // Regression: after Hide nothing opened the window again (no Stop, no report). The harness does not
+    // poll, so the import is still running here.
+    assert!(mailcraft_engine::pst::running(&h.state().s));
+    h.get_by_label("Hide").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    h.state_mut().ui.backstage = Some((Surface::Main, "openExport".into()));
+    step(&mut h);
+    assert!(h.query_by_label_contains("A PST file is being imported").is_some());
+    h.get_all_by_label_contains("PST Import").next().unwrap().click();
+    step(&mut h);
+    assert_eq!(names(&h), ["pstProgress"]);
+    h.state_mut().ui.backstage = None;
+    step(&mut h);
+    for _ in 0..2000 {
+        h.state_mut().s.poll_sync();
+        if !mailcraft_engine::pst::running(&h.state().s) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    step(&mut h);
+    assert!(h.query_by_label_contains("Imported 1 message from old mail.pst").is_some());
+    assert!(h.query_by_label_contains("contact groups are not imported").is_some());
+    let inbox = h.state().s.selection.folder;
+    let kept = h.state().s.mailbox.folders.values().find(|f| f.name == "Kept").cloned().unwrap();
+    assert_eq!(kept.parent, Some(inbox));
+    h.get_by_label("Close").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

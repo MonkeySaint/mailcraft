@@ -1,6 +1,6 @@
 [package]
 name = "mailcraft-formats"
-description = "MailCraft file formats: EML, MBOX, MSG item (.msg, MS-OXMSG over MS-CFB), iCalendar (RFC 5545), vCard (RFC 6350/2426), CSV contacts"
+description = "MailCraft file formats: EML, MBOX, MSG item (.msg, MS-OXMSG over MS-CFB), iCalendar (RFC 5545), vCard (RFC 6350/2426), CSV contacts, PST files (read only, MS-PST)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,8 +19,11 @@ cfb.workspace = true
 roxmltree.workspace = true
 # MIT/Zlib/Apache: DEFLATE for theme packages (.thmx).
 miniz_oxide.workspace = true
+# MIT: PST files ([MS-PST]) for import and Open Data File, read only.
+outlook-pst.workspace = true
 
 [dev-dependencies]
+mailcraft-testmail.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

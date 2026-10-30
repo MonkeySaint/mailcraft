@@ -63,7 +63,8 @@ where passwords are kept: [docs/accounts.md](docs/accounts.md).
 - **Accounts:** IMAP + SMTP with background sync, an offline queue, Outbox → Sent, Send/Receive.
 - **Organise:** rules (Rules Wizard, run on arrival or on demand), quick steps, colour categories.
 - **Calendar, People, To Do, Notes:** views, editors, meeting requests over iCalendar, reminders.
-- **Files:** import and export EML, MBOX, MSG, ICS, VCF, CSV; print and PDF.
+- **Files:** import and export EML, MBOX, MSG, ICS, VCF, CSV; import PST files or open one as a data file
+  (read only, [docs/pst.md](docs/pst.md)); print and PDF.
 
 ## Quick start
 

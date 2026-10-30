@@ -40,7 +40,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.openExport",
             "Import/Export",
             "File › Open & Export",
-            r#"{"action"?: "import" (by file type)|"importEml"|"importMsg"|"importMbox"|"importMaildir"|"importIcs"|"importVcf"|"importCsv"|"exportMbox"|"exportIcs"|"exportVcf"|"exportCsv", "path"?: string, "folder"?: number} (no action = open the wizard)"#,
+            r#"{"action"?: "import" (by file type)|"importEml"|"importMsg"|"importMbox"|"importMaildir"|"importIcs"|"importVcf"|"importCsv"|"importPst"|"exportMbox"|"exportIcs"|"exportVcf"|"exportCsv", "path"?: string, "folder"?: number, "into"?: "account" (importPst, default: the PST file's folders merge into the folder's account)|"beneath" (beneath the folder), "duplicates"?: "skip" (default)|"allow", "wait"?: bool (importPst: return when it is done, with the report; else it runs in the background, see file.importProgress), "timeoutSecs"?: number} (no action = open the wizard)"#,
             true,
             always,
             open_export,
@@ -115,7 +115,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.openDataFile",
             "Open Data File",
             "File › Open & Export",
-            r#"{"path"?: string (a .mcdata file; one outside this profile's closed data files stays linked to it), "password"?: string (a protected file), "name"?: string (a closed data file of this profile)} (neither = list the closed data files)"#,
+            r#"{"path"?: string (a .mcdata file; one outside this profile's closed data files stays linked to it; a PST file (.pst) is imported into a new data file named after it), "password"?: string (a protected file), "name"?: string (a closed data file of this profile), "wait"?: bool (a PST file: return when it is imported)} (neither = list the closed data files)"#,
             true,
             always,
             open_data_file,
@@ -137,6 +137,15 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             has_store,
             open_file_location,
+        ),
+        spec(
+            "file.importProgress",
+            "Import Progress",
+            "File › Open & Export",
+            r#"{"cancel"?: bool (stop the PST import that runs; what came in so far stays), "show"?: bool (open the progress window, also after an import ended: its report)}"#,
+            false,
+            always,
+            import_progress,
         ),
         spec("file.exit", "Close", "Window caption", "", false, always, exit),
     ]
@@ -270,6 +279,9 @@ fn format_err(e: mailcraft_formats::FormatError) -> CmdError {
 /// Action for `import` from the file's extension, else its first bytes.
 fn detect_import(path: &Path) -> Result<&'static str, CmdError> {
     use mailcraft_formats::Format;
+    if path.is_file() && crate::pst::is_pst(path) {
+        return Ok("importPst");
+    }
     let fmt = Format::from_path(path).or_else(|| {
         let head = crate::cmd::rules::read_file_capped(path, 64 * 1024).ok()?;
         Format::sniff(&head)
@@ -367,6 +379,30 @@ fn open_export(s: &mut Session, p: &Value) -> CmdResult {
                 mb.contacts.insert(id, c);
             }
             Ok(json!({"imported": n, "folder": contacts_folder.0, "unmappedColumns": unmapped}))
+        }
+        "importPst" => {
+            let folder = crate::cmd::util::opt_folder(p).unwrap_or(s.selection.folder);
+            let Some(f) = s.mailbox.folder(folder) else {
+                return Err(CmdError::Params(format!("no such folder {}", folder.0)));
+            };
+            let target = match opt_str(p, "into").unwrap_or("account") {
+                "account" => crate::pst::Target::Account(f.account),
+                "beneath" => {
+                    if matches!(f.kind, FolderKind::Search | FolderKind::SearchRoot) {
+                        return Err(CmdError::Params(
+                            "a PST file cannot be imported beneath search folders".into(),
+                        ));
+                    }
+                    crate::pst::Target::Beneath(folder)
+                }
+                other => return Err(CmdError::Params(format!("unknown `into` value `{other}`"))),
+            };
+            let skip = match opt_str(p, "duplicates").unwrap_or("skip") {
+                "skip" => true,
+                "allow" => false,
+                other => return Err(CmdError::Params(format!("unknown `duplicates` value `{other}`"))),
+            };
+            crate::pst::start(s, &path, target, false, skip, pst_wait(p))
         }
         "exportMbox" => {
             let folder = mail_folder(s, p)?;
@@ -789,6 +825,11 @@ fn close_data_file(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CmdError::Params("`store` (account id, name or address) required".into()));
     }
     let id = find_account(s, p, "store")?;
+    if crate::pst::importing_into(s, id) {
+        return Err(CmdError::Disabled(
+            "a PST file is being imported into this data file; stop the import first".into(),
+        ));
+    }
     let is_primary = s.mailbox.account(id).is_some_and(|a| a.is_default);
     if is_primary {
         return Err(CmdError::Disabled("the primary data file cannot be removed".into()));
@@ -888,10 +929,77 @@ fn close_data_file(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"removed": id.0, "folders": folders, "name": name, "path": path}))
 }
 
+/// How long a PST import may take when the caller waits for it (`wait`, `timeoutSecs`); `None` = in the
+/// background.
+fn pst_wait(p: &Value) -> Option<std::time::Duration> {
+    (opt_bool(p, "wait") == Some(true)).then(|| {
+        let secs = p.get("timeoutSecs").and_then(Value::as_u64).unwrap_or(24 * 3600).clamp(1, 7 * 24 * 3600);
+        std::time::Duration::from_secs(secs)
+    })
+}
+
+/// Open Data File with a PST file: a new data file named after the file, filled by an import.
+fn open_pst(s: &mut Session, path: &Path, p: &Value) -> CmdResult {
+    if s.mailbox.accounts.len() >= MAX_ACCOUNTS {
+        return Err(CmdError::Failed(format!("at most {MAX_ACCOUNTS} data files")));
+    }
+    if crate::pst::running(s) {
+        return Err(CmdError::Disabled(
+            "a PST file is being imported already; wait for it or stop it".into(),
+        ));
+    }
+    let stem: String = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .map(|n| n.chars().filter(|c| !c.is_control()).take(255).collect::<String>())
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "PST file".to_owned());
+    let name = free_name(s, &stem);
+    let id = s.mailbox.add_account(Account {
+        kind: AccountKind::Local,
+        display_name: name.clone(),
+        sender_name: String::new(),
+        is_default: false,
+        ..Default::default()
+    });
+    s.mailbox.create_default_folders(id);
+    let mut r = crate::pst::start(s, path, crate::pst::Target::Account(id), true, true, pst_wait(p))?;
+    // The data file fills in the background: an undo step would take it away under the import.
+    s.undo_barrier = true;
+    crate::pst::put(&mut r, "name", json!(name));
+    crate::pst::put(&mut r, "account", json!(id.0));
+    Ok(r)
+}
+
+/// The PST import's progress (or the last one's report); `cancel` stops it, `show` opens the progress window
+/// (the status bar and Open & Export reopen it after Hide).
+fn import_progress(s: &mut Session, p: &Value) -> CmdResult {
+    if opt_bool(p, "cancel") == Some(true) {
+        let stopping = crate::pst::cancel(s);
+        let mut v = crate::pst::status(s).unwrap_or_else(|| json!({"running": false}));
+        crate::pst::put(&mut v, "stopping", json!(stopping));
+        return Ok(v);
+    }
+    let v = crate::pst::status(s).unwrap_or_else(|| json!({"running": false}));
+    if opt_bool(p, "show") == Some(true) {
+        let job = v.get("job").cloned().unwrap_or(Value::Null);
+        s.notify(Notice::OpenDialog("pstProgress".into(), json!({"job": job})));
+    }
+    Ok(v)
+}
+
 /// Opens a closed data file again: from a path, or by name among this profile's closed data files; with
 /// neither, lists them (`openDataFile` dialog). A file from the profile's closed-data-files folder is renamed
 /// `<name>.mcdata.opened` once its contents are back, so it is not offered twice.
 fn open_data_file(s: &mut Session, p: &Value) -> CmdResult {
+    if let Some(path) = opt_str(p, "path").map(Path::new)
+        && path.is_file()
+        && crate::pst::is_pst(path)
+    {
+        let path = path.to_path_buf();
+        return open_pst(s, &path, p);
+    }
     let entries = crate::datafile::closed_entries(s);
     let password = password_param(p)?;
     let (bytes, from_dir, memory) = if let Some(path) = opt_str(p, "path") {

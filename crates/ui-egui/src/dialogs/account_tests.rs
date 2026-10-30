@@ -729,6 +729,7 @@ fn import_export_actions_cover_every_engine_format() {
         "importIcs",
         "importVcf",
         "importCsv",
+        "importPst",
         "exportMbox",
         "exportIcs",
         "exportVcf",
