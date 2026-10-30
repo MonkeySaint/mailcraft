@@ -2,7 +2,7 @@
 
 What changed in each MailCraft release. Help › What's New shows the newest entries from this file.
 
-## Unreleased
+## 0.5.1
 
 - Add Account: "(Not you?)", or another address after an account was added, now sets up a new account and
   leaves the one already added as it is (it used to change that account, and showed its sign-in state).
