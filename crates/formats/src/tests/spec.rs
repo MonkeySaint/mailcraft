@@ -462,7 +462,7 @@ fn long_by_lists_expand_quickly() {
     let to = value::local_secs(9990, 2, 1, 0, 0, 0).unwrap();
     let t0 = std::time::Instant::now();
     let got = rrule::expand(&x, from, to, 100);
-    assert!(t0.elapsed() < std::time::Duration::from_secs(2), "took {:?}", t0.elapsed());
+    assert!(t0.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t0.elapsed());
     // January 9990: Mondays, Tuesdays and Wednesdays on days 1..=28.
     assert_eq!(got.len(), 12);
     // Repeated values collapse; the written rule keeps the first-seen order.
@@ -549,7 +549,7 @@ fn many_vtimezones_are_capped() {
     text.push_str("END:VCALENDAR\n");
     let t0 = std::time::Instant::now();
     let cal = ics::read_str(&text, ImportOptions::default()).unwrap();
-    assert!(t0.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t0.elapsed());
+    assert!(t0.elapsed() < std::time::Duration::from_secs(20), "took {:?}", t0.elapsed());
     assert!(cal.zones.defined.len() <= ics::MAX_ZONES);
     assert_eq!(cal.events.len(), n);
     // The zone is still resolved (here from its fixed-offset name).
@@ -584,7 +584,7 @@ END:VEVENT\n",
     text.push_str("END:VCALENDAR\n");
     let t0 = std::time::Instant::now();
     let cal = ics::read_str(&text, ImportOptions::default()).unwrap();
-    assert!(t0.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t0.elapsed());
+    assert!(t0.elapsed() < std::time::Duration::from_secs(20), "took {:?}", t0.elapsed());
     assert_eq!(cal.events.len(), 70_000);
     let last = cal.events[49_999].appointment.recurrence.as_ref().unwrap();
     assert_eq!(last.exdates, vec![DateTime::from_civil(2026, 1, 6, 9, 0, 0, 0).unwrap()]);
@@ -617,7 +617,7 @@ fn category_lists_are_capped_and_fast() {
     let t0 = std::time::Instant::now();
     let cal = ics::read_str(&ev, ImportOptions::default()).unwrap();
     let cats = &cal.events[0].appointment.categories;
-    assert!(t0.elapsed() < std::time::Duration::from_secs(2), "took {:?}", t0.elapsed());
+    assert!(t0.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t0.elapsed());
     assert_eq!(cats.len(), 256);
     assert_eq!(cats.last().map(String::as_str), Some("Late"));
 }

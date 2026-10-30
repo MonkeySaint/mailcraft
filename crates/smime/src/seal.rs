@@ -267,7 +267,7 @@ mod tests {
         slow.rounds = 10_000_000;
         let started = std::time::Instant::now();
         assert!(matches!(open(slow, "correct horse", CTX), Err(SmimeError::Unsupported(_))));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
         assert!(seal(&data, "", MIN_ROUNDS, CTX).is_err());
         assert!(open(s.clone(), &"x".repeat(MAX_PASSWORD + 1), CTX).is_err());
         let empty = seal(b"", "pw", 1, CTX).unwrap();

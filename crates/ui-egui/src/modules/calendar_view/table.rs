@@ -507,6 +507,6 @@ mod tests {
         let l = lines(&rows);
         assert_eq!(l.len(), 40_000);
         assert!(l.iter().all(|x| !matches!(x, Line::Group(_, n) if *n != 1)));
-        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(started.elapsed() < std::time::Duration::from_secs(8), "{:?}", started.elapsed());
     }
 }

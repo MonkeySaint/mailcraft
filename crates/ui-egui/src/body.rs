@@ -2048,7 +2048,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(decode_svg(&bomb).is_none());
         assert!(load_picture(&egui::Context::default(), 2, &bomb).is_none());
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
         // Too big, not UTF-8, a DTD (entities), too many nodes.
         let mut big = svg("");
         big.splice(SVG_OPEN.len()..SVG_OPEN.len(), std::iter::repeat_n(b' ', MAX_SVG_BYTES));

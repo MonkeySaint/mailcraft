@@ -1627,7 +1627,14 @@ mod tests {
         s.run("compose.insertText", &json!({"text": "Hi wrold"})).unwrap();
         assert!(spelling_stale(&s, &s.composes[&id]));
         let sp = speller(&s);
-        spell_check(&sp, s.composes.get_mut(&id).unwrap(), false, 1);
+        // A dictionary another test reads in the background meanwhile (a process-wide generation) rightly makes
+        // a check out of date: check again then.
+        for _ in 0..10 {
+            spell_check(&sp, s.composes.get_mut(&id).unwrap(), false, 1);
+            if !spelling_stale(&s, &s.composes[&id]) {
+                break;
+            }
+        }
         assert!(!spelling_stale(&s, &s.composes[&id]));
         set(&mut s, "mail.editor.ignoreUppercase", json!(false));
         assert!(spelling_stale(&s, &s.composes[&id]));

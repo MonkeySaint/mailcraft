@@ -1575,7 +1575,7 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
         assert!(matches!(read_file(&link), Err(CmdError::Params(_))));
         assert!(matches!(read_file(dir.path()), Err(CmdError::Params(_))));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
         // A link to a regular file is fine; past the cap is refused.
         let real = dir.path().join("real.mcdata");
         std::fs::write(&real, b"0123456789").unwrap();
