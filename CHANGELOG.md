@@ -2,7 +2,7 @@
 
 What changed in each MailCraft release. Help › What's New shows the newest entries from this file.
 
-## Unreleased
+## 0.5.0
 
 - Microsoft 365 and Outlook.com accounts through Microsoft Graph: sign in with your Microsoft account; the
   folder tree, mail (kept up to date with delta queries), read state, flags, categories, importance, moves,
@@ -16,6 +16,19 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
   first open a note before the service sends them; answers that fail for a passing reason are tried again;
   all-day events keep their days east of UTC; fax numbers and anniversaries stay when a contact changes on
   the service.
+- Exchange accounts over EWS for on-premises Exchange servers: mail, folders, calendar, contacts and tasks
+  both ways, with Basic, NTLM or OAuth sign-in. Autodiscover finds the server from the address and only sends
+  the password to hosts in the address's own domain unless you confirm another. Meeting answers go through
+  the server, Automatic Replies (Out of Office) is in File › Info, and the Scheduling Assistant shows
+  attendees' busy times. Large messages and messages the server refuses no longer stop a sync.
+- PST files: File › Open & Export › Import/Export imports a PST file's mail, calendar, contacts, tasks and
+  notes into an account or a folder, and Open Data File opens a PST file as a data file. The import runs in
+  the background with a progress window you can hide and reopen, Stop keeps what came in, running it again
+  adds nothing twice, and a report lists what was left out. Damaged files are read in a separate process so
+  they cannot take the app down. MailCraft reads PST files but does not write them.
+- Microsoft 365 and Exchange accounts work side by side in one profile.
+- Folder names in Calendar, People, Tasks and Notes stay on one line and end in "…" when they are too long,
+  instead of being cut off at the top and bottom.
 
 ## 0.4.0
 

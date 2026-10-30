@@ -5,7 +5,7 @@ workflow. This file tracks what is done, what is next, and an honest estimate of
 Outlook. It is updated with every commit.
 
 Status: **pre-alpha** (2026-10-29). Repository: https://github.com/MonkeySaint/mailcraft. Tags: v0.1.0 (commit 23,
-unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release), v0.2.0 (after round 5), v0.3.0 (after round 7), v0.4.0 (storage redesign S0-S6).
+unpublished: its release run failed), v0.1.1 (commit 26, first GitHub release), v0.2.0 (after round 5), v0.3.0 (after round 7), v0.4.0 (storage redesign S0-S6), v0.5.0 (Microsoft Graph, Exchange EWS, PST import).
 
 ## Milestones
 
